@@ -4177,12 +4177,13 @@ class _D128InterleavedDispatch:
     sink_insts_to_avoid_spills: bool = False
     regclass_priority_trumps_globalness: bool = False
     reverse_local_assignment: bool = False
+    split_q: int = 1
     kv_splits: int = 1
     phase_iglp: int = -1
     peel_causal: bool = False
 
 
-def _select_d128_interleaved_dispatch(q_shape=None, k_shape=None, causal=False):
+def _select_original_d128_interleaved_dispatch(q_shape=None, k_shape=None, causal=False):
     regalloc = _d128_regalloc_options()
     main_entry = _attn_bwd_dkdv_dq_d128_gqa_kernel
     block_m = 16
@@ -4245,7 +4246,7 @@ def _attn_bwd_gqa_reduce_dkdv(
     tl.store(DV + idx, dv.to(DV.dtype.element_ty), idx < ELEMENTS)
 
 
-def _run_bwd_d128_gqa(
+def _run_bwd_d128_gqa_original(
     q,
     k,
     v,
@@ -4263,7 +4264,7 @@ def _run_bwd_d128_gqa(
     batch, hq, n_ctx, head_dim = q.shape
     hk = k.shape[1]
     assert _is_supported_gqa_shape((batch, hq, hk, n_ctx, head_dim))
-    dispatch = _select_d128_interleaved_dispatch(q.shape, k.shape, causal)
+    dispatch = _select_original_d128_interleaved_dispatch(q.shape, k.shape, causal)
     if dispatch.main_entry is _dense_bwd_dkdv_dq_bm32_kernel:
         assert not causal
         _run_bwd_d128_gqa_bm32(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, dispatch)
@@ -5126,8 +5127,22 @@ def fa_backward_is_deterministic(q, k, v, o, do, lse, sm_scale, causal):
     return not _is_supported_gqa_shape(gqa_signature)
 
 
-def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
+def fa_backward(q, k, v, o, do, lse, sm_scale, causal, *, split_q=None):
+    """Run backward, optionally splitting non-causal D128 query work.
+
+    split_q=None selects a bounded schedule for sparse workgroup grids;
+    split_q=1 forces the unsplit path. Larger positive integers explicitly
+    divide the query/head traversal and reduce FP32 dK/dV partials.
+    """
+    if split_q is not None:
+        _validate_split_q(split_q)
     _validate_inputs(q, k, v, o, do, lse, sm_scale, causal)
+    split_supported = not causal and _is_supported_gqa_shape(
+        (q.shape[0], q.shape[1], k.shape[1], q.shape[2], q.shape[3]))
+    if split_q is not None and split_q > 1 and not split_supported:
+        raise ValueError("split_q > 1 requires the non-causal D128 GQA specialization")
+    if split_supported and split_q is not None:
+        _validate_split_q(split_q, (q.shape[1] // k.shape[1]) * (q.shape[2] // 64))
     if _is_supported_d64_shape(tuple(q.shape), tuple(k.shape)):
         sm_scale = _validate_d64_sm_scale(sm_scale)
         dispatch = _select_d64_dispatch_for_device(q, k, v, o, do, lse, sm_scale, causal)
@@ -5159,14 +5174,20 @@ def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
         q.shape[3],
     )
     if _is_supported_gqa_shape(gqa_signature):
-        dq_acc = torch.zeros_like(q)
+        dq_acc = _allocate_dq_accumulator(q, k, causal=causal, split_q=split_q)
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         delta = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
-        # Match SCALE_LSE_IN_MAIN in the phase helper: equal heads are MHA.
+        dispatch = _select_d128_interleaved_dispatch(q.shape, k.shape, causal, split_q=split_q)
+        optimized = dispatch.main_entry in (
+            _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel,
+            _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel,
+        )
+        # Optimized kernels scale raw LSE in the main kernel.
+        # Original GQA kernels require pre-scaled log2 LSE.
         lse_for_main = lse
-        if q.shape[1] == k.shape[1]:
+        if q.shape[1] == k.shape[1] or optimized:
             _run_bwd_preprocess(o, do, delta)
         else:
             lse_for_main = torch.empty_like(lse)
@@ -5184,6 +5205,7 @@ def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
             dv,
             sm_scale,
             causal,
+            split_q=split_q,
         )
         return dq, dk, dv
     if q.shape[-1] == 128:
@@ -5483,6 +5505,4190 @@ def _validate_d64_dispatch(q_shape, k_shape, causal, dispatch):
                                             and (_batch * hkv) % 8 == 0):
         _invalid_d64_dispatch(dispatch, "cyclic_query_split requires a deep square XCD N-fast grid")
     require_valid_dq_launches()
+
+
+@triton.jit
+def _attn_bwd_gqa_issue_qdo_slice_async(q_dst, do_dst, lse_dst, delta_dst, Q, DO, LSE, Delta, off_h_kv, outer_step,
+                                        phase, HQ: tl.constexpr, HK: tl.constexpr, N: tl.constexpr, D: tl.constexpr,
+                                        Q_BATCH_FITS_BUFFER: tl.constexpr):
+    tl.static_assert(D == 128 and N % 64 == 0 and HQ % HK == 0)
+    tl.static_assert(q_dst.shape == (16, 128) and do_dst.shape == (16, 128))
+    tl.static_assert(lse_dst.shape == (64, ) and delta_dst.shape == (64, ))
+    # The caller completed all reads of this slice at the existing phase-end
+    # CTA barrier. Other phases occupy disjoint physical shared slices.
+    q_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+        stride=((8, 16, 32, 128, 64, 512, 256, 1024), (1, 2, 4)),
+    )
+    stats_layout: tl.constexpr = tlx.layout(shape=((64, 4), ()), stride=((1, 0), ()))
+    n_outer: tl.constexpr = N // 64
+    total: tl.constexpr = (HQ // HK) * n_outer
+    future = outer_step % total
+    off_h_q = off_h_kv * (HQ // HK) + future // n_outer
+    row = (future % n_outer) * 64 + phase * 16
+    rr = tl.arange(0, 16)
+    dd = tl.arange(0, D)
+    if Q_BATCH_FITS_BUFFER:
+        q_offsets = ((off_h_q * N + row + rr[:, None]) * D + dd[None, :]).to(tl.int32)
+    else:
+        tile_base = (off_h_q.to(tl.int64) * N + row) * D
+        stats_base = off_h_q.to(tl.int64) * N + row - phase * 16
+        Q = tl.multiple_of(Q + tile_base, 16)
+        DO = tl.multiple_of(DO + tile_base, 16)
+        LSE = tl.multiple_of(LSE + stats_base, 16)
+        Delta = tl.multiple_of(Delta + stats_base, 16)
+        q_offsets = (rr[:, None] * D + dd[None, :]).to(tl.int32)
+    q_offsets = tlx.require_layout(q_offsets, q_layout, pin=False)
+    tq = tlx.buffer_load_to_local(q_dst, Q, q_offsets)
+    tdo = tlx.buffer_load_to_local(do_dst, DO, q_offsets)
+    if phase == 3:
+        if Q_BATCH_FITS_BUFFER:
+            stats_offsets = (off_h_q * N + row - phase * 16 + tl.arange(0, 64)).to(tl.int32)
+        else:
+            stats_offsets = tl.arange(0, 64).to(tl.int32)
+        stats_offsets = tlx.require_layout(stats_offsets, stats_layout, pin=False)
+        tlse = tlx.buffer_load_to_local(lse_dst, LSE, stats_offsets)
+        td = tlx.buffer_load_to_local(delta_dst, Delta, stats_offsets)
+        tlx.async_load_commit_group([tq, tdo, tlse, td])
+    else:
+        tlx.async_load_commit_group([tq, tdo])
+
+
+@triton.jit
+def _attn_bwd_opt_gqa_dv_fragmented_half(
+    dv_lhs,
+    dv_rhs,
+    dv,
+    MMA_ND: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    FIRST_HALF: tl.constexpr,
+):
+    """Update four dV fragments while preserving the native VGPR bank."""
+    query_rows: tl.constexpr = dv_lhs.shape[1]
+    tl.static_assert(query_rows == 16 or query_rows == 32)
+    tl.static_assert(dv_lhs.shape == (256, query_rows))
+    tl.static_assert(dv_rhs.shape == (query_rows, 128))
+    dv_lhs = tlx.require_layout(dv_lhs, P_ND_LAYOUT, pin=False)
+    dv_rhs = tlx.require_layout(dv_rhs, Q_OUT_LAYOUT, pin=False)
+    dv = tlx.require_layout(dv, MMA_ND, pin=False)
+    lhs0 = tlx.extract_slice(dv_lhs, [128, query_rows], [0, 0])
+    lhs1 = tlx.extract_slice(dv_lhs, [128, query_rows], [128, 0])
+    rhs0 = tlx.extract_slice(dv_rhs, [query_rows, 32], [0, 0])
+    rhs1 = tlx.extract_slice(dv_rhs, [query_rows, 32], [0, 32])
+    rhs2 = tlx.extract_slice(dv_rhs, [query_rows, 32], [0, 64])
+    rhs3 = tlx.extract_slice(dv_rhs, [query_rows, 32], [0, 96])
+
+    c00 = tlx.extract_slice(dv, [128, 32], [0, 0])
+    c10 = tlx.extract_slice(dv, [128, 32], [128, 0])
+    c01 = tlx.extract_slice(dv, [128, 32], [0, 32])
+    c11 = tlx.extract_slice(dv, [128, 32], [128, 32])
+    c02 = tlx.extract_slice(dv, [128, 32], [0, 64])
+    c12 = tlx.extract_slice(dv, [128, 32], [128, 64])
+    c03 = tlx.extract_slice(dv, [128, 32], [0, 96])
+    c13 = tlx.extract_slice(dv, [128, 32], [128, 96])
+
+    # LLVM-visible MFMAs let the backend model operand/result hazards without
+    # the conservative padding needed by register-pinned inline assembly.
+    if FIRST_HALF:
+        c00 = tlx.amd_scheduled_mfma(
+            lhs0,
+            rhs0,
+            c00,
+            accumulator_role="transient",
+        )
+        c10 = tlx.amd_scheduled_mfma(
+            lhs1,
+            rhs0,
+            c10,
+            accumulator_role="transient",
+        )
+        c01 = tlx.amd_scheduled_mfma(
+            lhs0,
+            rhs1,
+            c01,
+            accumulator_role="transient",
+        )
+        c11 = tlx.amd_scheduled_mfma(
+            lhs1,
+            rhs1,
+            c11,
+            accumulator_role="transient",
+        )
+    else:
+        c02 = tlx.amd_scheduled_mfma(
+            lhs0,
+            rhs2,
+            c02,
+            accumulator_role="transient",
+        )
+        c12 = tlx.amd_scheduled_mfma(
+            lhs1,
+            rhs2,
+            c12,
+            accumulator_role="transient",
+        )
+        c03 = tlx.amd_scheduled_mfma(
+            lhs0,
+            rhs3,
+            c03,
+            accumulator_role="transient",
+        )
+        c13 = tlx.amd_scheduled_mfma(
+            lhs1,
+            rhs3,
+            c13,
+            accumulator_role="transient",
+        )
+
+    row0 = tl.cat(
+        tl.cat(c00, c01, dim=1),
+        tl.cat(c02, c03, dim=1),
+        dim=1,
+    )
+    row1 = tl.cat(
+        tl.cat(c10, c11, dim=1),
+        tl.cat(c12, c13, dim=1),
+        dim=1,
+    )
+    new_dv = tl.cat(row0, row1, dim=0)
+    return tlx.require_layout(new_dv, MMA_ND, pin=False)
+
+
+@triton.jit
+def _attn_bwd_gqa_front_stream(
+    k_buffer,
+    q_t,
+    v_operand,
+    do_t,
+    MMA_NM: tl.constexpr,
+    LEFT_LAYOUT: tl.constexpr,
+    RIGHT_LAYOUT: tl.constexpr,
+):
+    """Interleave independent score/dP chains in ascending K32 bands."""
+    tl.static_assert(k_buffer.shape == (256, 128))
+    tl.static_assert(q_t.shape == (128, 16))
+    tl.static_assert(do_t.shape == (128, 16))
+    tl.static_assert(v_operand.shape == (256, 128))
+    q_t = tlx.require_layout(q_t, RIGHT_LAYOUT, pin=False)
+    v_operand = tlx.require_layout(v_operand, LEFT_LAYOUT, pin=False)
+    do_t = tlx.require_layout(do_t, RIGHT_LAYOUT, pin=False)
+    s0 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    s1 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    s2 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    s3 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    p0 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    p1 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    p2 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    p3 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    for band in tl.static_range(4):
+        k_band = tlx.local_load(tlx.local_slice(k_buffer, [0, band * 32], [256, 32]), layout=LEFT_LAYOUT, relaxed=True)
+        right_q = tlx.require_layout(tlx.extract_slice(q_t, [32, 16], [band * 32, 0]), RIGHT_LAYOUT, pin=False)
+        right_do = tlx.require_layout(tlx.extract_slice(do_t, [32, 16], [band * 32, 0]), RIGHT_LAYOUT, pin=False)
+        left_k = tlx.require_layout(tlx.extract_slice(k_band, [64, 32], [0, 0]), LEFT_LAYOUT, pin=False)
+        s0 = tlx.amd_scheduled_mfma(left_k, right_q, s0, accumulator_role="transient", initialize=band == 0)
+        left_v = tlx.require_layout(tlx.extract_slice(v_operand, [64, 32], [0, band * 32]), LEFT_LAYOUT, pin=False)
+        p0 = tlx.amd_scheduled_mfma(left_v, right_do, p0, accumulator_role="transient", initialize=band == 0)
+        left_k = tlx.require_layout(tlx.extract_slice(k_band, [64, 32], [64, 0]), LEFT_LAYOUT, pin=False)
+        s1 = tlx.amd_scheduled_mfma(left_k, right_q, s1, accumulator_role="transient", initialize=band == 0)
+        left_v = tlx.require_layout(tlx.extract_slice(v_operand, [64, 32], [64, band * 32]), LEFT_LAYOUT, pin=False)
+        p1 = tlx.amd_scheduled_mfma(left_v, right_do, p1, accumulator_role="transient", initialize=band == 0)
+        left_k = tlx.require_layout(tlx.extract_slice(k_band, [64, 32], [128, 0]), LEFT_LAYOUT, pin=False)
+        s2 = tlx.amd_scheduled_mfma(left_k, right_q, s2, accumulator_role="transient", initialize=band == 0)
+        left_v = tlx.require_layout(tlx.extract_slice(v_operand, [64, 32], [128, band * 32]), LEFT_LAYOUT, pin=False)
+        p2 = tlx.amd_scheduled_mfma(left_v, right_do, p2, accumulator_role="transient", initialize=band == 0)
+        left_k = tlx.require_layout(tlx.extract_slice(k_band, [64, 32], [192, 0]), LEFT_LAYOUT, pin=False)
+        s3 = tlx.amd_scheduled_mfma(left_k, right_q, s3, accumulator_role="transient", initialize=band == 0)
+        left_v = tlx.require_layout(tlx.extract_slice(v_operand, [64, 32], [192, band * 32]), LEFT_LAYOUT, pin=False)
+        p3 = tlx.amd_scheduled_mfma(left_v, right_do, p3, accumulator_role="transient", initialize=band == 0)
+    s_result = tlx.require_layout(tl.cat(tl.cat(s0, s1, dim=0), tl.cat(s2, s3, dim=0), dim=0), MMA_NM, pin=False)
+    p_result = tlx.require_layout(tl.cat(tl.cat(p0, p1, dim=0), tl.cat(p2, p3, dim=0), dim=0), MMA_NM, pin=False)
+    return s_result, p_result
+
+
+@triton.jit
+def _attn_bwd_gqa_front_stream_cache64(
+    k_buffer,
+    k_score_cache,
+    q_t,
+    v_operand,
+    do_t,
+    MMA_NM: tl.constexpr,
+    LEFT_LAYOUT: tl.constexpr,
+    RIGHT_LAYOUT: tl.constexpr,
+):
+    """Use cached K rows 0–63 in the original streamed score and dP sequence."""
+    tl.static_assert(k_buffer.shape == (256, 128))
+    tl.static_assert(k_score_cache.shape == (64, 128))
+    tl.static_assert(q_t.shape == (128, 16))
+    tl.static_assert(do_t.shape == (128, 16))
+    tl.static_assert(v_operand.shape == (256, 128))
+    k_score_cache = tlx.require_layout(k_score_cache, LEFT_LAYOUT, pin=False)
+    q_t = tlx.require_layout(q_t, RIGHT_LAYOUT, pin=False)
+    v_operand = tlx.require_layout(v_operand, LEFT_LAYOUT, pin=False)
+    do_t = tlx.require_layout(do_t, RIGHT_LAYOUT, pin=False)
+    s0 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    s1 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    s2 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    s3 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    p0 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    p1 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    p2 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    p3 = tlx.zeros((64, 16), tl.float32, layout=MMA_NM)
+    for band in tl.static_range(4):
+        k0 = tlx.require_layout(tlx.extract_slice(k_score_cache, [64, 32], [0, band * 32]), LEFT_LAYOUT, pin=False)
+        k1 = tlx.local_load(tlx.local_slice(k_buffer, [64, band * 32], [64, 32]), layout=LEFT_LAYOUT, relaxed=True)
+        k2 = tlx.local_load(tlx.local_slice(k_buffer, [128, band * 32], [64, 32]), layout=LEFT_LAYOUT, relaxed=True)
+        k3 = tlx.local_load(tlx.local_slice(k_buffer, [192, band * 32], [64, 32]), layout=LEFT_LAYOUT, relaxed=True)
+        right_q = tlx.require_layout(tlx.extract_slice(q_t, [32, 16], [band * 32, 0]), RIGHT_LAYOUT, pin=False)
+        right_do = tlx.require_layout(tlx.extract_slice(do_t, [32, 16], [band * 32, 0]), RIGHT_LAYOUT, pin=False)
+        left_k = tlx.require_layout(k0, LEFT_LAYOUT, pin=False)
+        s0 = tlx.amd_scheduled_mfma(left_k, right_q, s0, accumulator_role="transient", initialize=band == 0)
+        left_v = tlx.require_layout(tlx.extract_slice(v_operand, [64, 32], [0, band * 32]), LEFT_LAYOUT, pin=False)
+        p0 = tlx.amd_scheduled_mfma(left_v, right_do, p0, accumulator_role="transient", initialize=band == 0)
+        left_k = tlx.require_layout(k1, LEFT_LAYOUT, pin=False)
+        s1 = tlx.amd_scheduled_mfma(left_k, right_q, s1, accumulator_role="transient", initialize=band == 0)
+        left_v = tlx.require_layout(tlx.extract_slice(v_operand, [64, 32], [64, band * 32]), LEFT_LAYOUT, pin=False)
+        p1 = tlx.amd_scheduled_mfma(left_v, right_do, p1, accumulator_role="transient", initialize=band == 0)
+        left_k = tlx.require_layout(k2, LEFT_LAYOUT, pin=False)
+        s2 = tlx.amd_scheduled_mfma(left_k, right_q, s2, accumulator_role="transient", initialize=band == 0)
+        left_v = tlx.require_layout(tlx.extract_slice(v_operand, [64, 32], [128, band * 32]), LEFT_LAYOUT, pin=False)
+        p2 = tlx.amd_scheduled_mfma(left_v, right_do, p2, accumulator_role="transient", initialize=band == 0)
+        left_k = tlx.require_layout(k3, LEFT_LAYOUT, pin=False)
+        s3 = tlx.amd_scheduled_mfma(left_k, right_q, s3, accumulator_role="transient", initialize=band == 0)
+        left_v = tlx.require_layout(tlx.extract_slice(v_operand, [64, 32], [192, band * 32]), LEFT_LAYOUT, pin=False)
+        p3 = tlx.amd_scheduled_mfma(left_v, right_do, p3, accumulator_role="transient", initialize=band == 0)
+    s_result = tlx.require_layout(tl.cat(tl.cat(s0, s1, dim=0), tl.cat(s2, s3, dim=0), dim=0), MMA_NM, pin=False)
+    p_result = tlx.require_layout(tl.cat(tl.cat(p0, p1, dim=0), tl.cat(p2, p3, dim=0), dim=0), MMA_NM, pin=False)
+    return s_result, p_result
+
+
+@triton.jit
+def _attn_bwd_mha_score_cache64(
+    k_buffer,
+    k_score_cache,
+    q_t,
+    MMA_NM: tl.constexpr,
+    K_NM_LAYOUT: tl.constexpr,
+):
+    """Keep native K ownership through ordered joins before one full score dot."""
+    tl.static_assert(k_buffer.shape == (256, 128))
+    tl.static_assert(k_score_cache.shape == (64, 128))
+    tl.static_assert(q_t.shape == (128, 16))
+    k0 = tlx.require_layout(k_score_cache, K_NM_LAYOUT, pin=True)
+    k1 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [64, 128]), layout=K_NM_LAYOUT, relaxed=True)
+    k1 = tlx.require_layout(k1, K_NM_LAYOUT, pin=True)
+    k2 = tlx.local_load(tlx.local_slice(k_buffer, [128, 0], [64, 128]), layout=K_NM_LAYOUT, relaxed=True)
+    k2 = tlx.require_layout(k2, K_NM_LAYOUT, pin=True)
+    k3 = tlx.local_load(tlx.local_slice(k_buffer, [192, 0], [64, 128]), layout=K_NM_LAYOUT, relaxed=True)
+    k3 = tlx.require_layout(k3, K_NM_LAYOUT, pin=True)
+    k01 = tlx.require_layout(tl.cat(k0, k1, can_reorder=False, dim=0), K_NM_LAYOUT, pin=True)
+    k23 = tlx.require_layout(tl.cat(k2, k3, can_reorder=False, dim=0), K_NM_LAYOUT, pin=True)
+    k_nm = tlx.require_layout(tl.cat(k01, k23, can_reorder=False, dim=0), K_NM_LAYOUT, pin=True)
+    return tl.dot(k_nm, q_t, tlx.zeros((256, 16), tl.float32, layout=MMA_NM))
+
+
+@triton.jit
+def _attn_bwd_opt_gqa_front(
+    dv,
+    q_slice,
+    do_slice,
+    k_buffer,
+    v_operand,
+    ds_stage,
+    lse_values,
+    delta_values,
+    pid_n,
+    step,
+    SM_SCALE: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    MMA_NM: tl.constexpr,
+    MMA_ND: tl.constexpr,
+    K_NM_LAYOUT: tl.constexpr,
+    QT_LAYOUT: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    UPDATE_DV_FIRST_HALF: tl.constexpr = True,
+    PIN_SCORES: tl.constexpr = True,
+    PIN_DP: tl.constexpr = True,
+    USE_STREAM: tl.constexpr = False,
+    CACHE_SCORE_K: tl.constexpr = False,
+    k_score_cache=None,
+):
+    """Publish current dS to LDS and optionally update the first dV fragments."""
+    dv = tlx.require_layout(dv, MMA_ND, pin=False)
+    v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
+    if not USE_STREAM and not CACHE_SCORE_K:
+        k_nm = tlx.local_load(
+            k_buffer,
+            layout=K_NM_LAYOUT,
+            relaxed=True,
+        )
+    q_t = tlx.local_load(
+        tlx.local_trans(q_slice),
+        layout=QT_LAYOUT,
+        relaxed=True,
+    )
+    if not USE_STREAM:
+        if CACHE_SCORE_K:
+            tl.static_assert(not IS_CAUSAL and BLOCK_M == 16 and BLOCK_N == 256
+                             and (N == 1024 or N == 2048 or N == 4096 or N == 8192 or N == 16384))
+            scores = _attn_bwd_mha_score_cache64(k_buffer, k_score_cache, q_t, MMA_NM, K_NM_LAYOUT)
+        else:
+            scores = tl.dot(
+                k_nm,
+                q_t,
+                tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
+            )
+    else:
+        do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
+        if CACHE_SCORE_K:
+            scores, dp = _attn_bwd_gqa_front_stream_cache64(k_buffer, k_score_cache, q_t, v_operand, do_t, MMA_NM,
+                                                            K_NM_LAYOUT, QT_LAYOUT)
+        else:
+            scores, dp = _attn_bwd_gqa_front_stream(k_buffer, q_t, v_operand, do_t, MMA_NM, K_NM_LAYOUT, QT_LAYOUT)
+    if PIN_SCORES:
+        scores = tlx.amd_register_resident(scores, register_class="vgpr", registers_per_group=16)
+    if IS_CAUSAL:
+        # Mask after scaling so custom zero or negative scales cannot turn an
+        # invalid raw-score sentinel into a NaN or a finite probability.
+        lse_log2 = tl.inline_asm_elementwise(
+            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+            "=v,v",
+            [lse_values],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        lse_full = tlx.require_layout(
+            tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
+            MMA_NM,
+            pin=False,
+        )
+        scale_full = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                SM_SCALE * 1.4426950408889634,
+                tl.float32,
+            ),
+            MMA_NM,
+            pin=False,
+        )
+        scaled_scores = scores * scale_full - lse_full
+        n_m_blocks: tl.constexpr = N // BLOCK_M
+        m_block = step % n_m_blocks
+        query_fragment = m_block - pid_n * (BLOCK_N // BLOCK_M)
+        if query_fragment < BLOCK_N // BLOCK_M:
+            offs_n = pid_n * BLOCK_N + tlx.rematerialized_range(0, BLOCK_N, 32, placement=step)
+            offs_m = m_block * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
+            valid = offs_n[:, None] <= offs_m[None, :]
+            valid = tlx.require_layout(valid, MMA_NM, pin=False)
+            neg_inf = tlx.require_layout(
+                tl.full((BLOCK_N, BLOCK_M), float("-inf"), dtype=tl.float32),
+                MMA_NM,
+                pin=False,
+            )
+            scaled_scores = tl.where(valid, scaled_scores, neg_inf)
+            scaled_scores = tlx.require_layout(scaled_scores, MMA_NM, pin=False)
+    if not USE_STREAM:
+        do_t = tlx.local_load(
+            tlx.local_trans(do_slice),
+            layout=QT_LAYOUT,
+            relaxed=True,
+        )
+        dp = tl.dot(
+            v_operand,
+            do_t,
+            tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
+        )
+    if PIN_DP:
+        dp = tlx.amd_register_resident(dp, register_class="vgpr", registers_per_group=16)
+
+    q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
+    if not USE_STREAM and IS_CAUSAL:
+        q_out = tlx.amd_register_resident(q_out, register_class="vgpr", registers_per_group=4)
+    do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
+    if not IS_CAUSAL:
+        # Keep LSE scaling on an independent scalar VALU chain.  Broadcasting
+        # the multiply lets LLVM pair an LSE lane with a score fragment in a
+        # packed multiply and creates a false cross-fragment dependency.
+        lse_log2 = tl.inline_asm_elementwise(
+            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+            "=v,v",
+            [lse_values],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        # These are soft requirements. Layout propagation does not yet infer
+        # the score MFMA layout for broadcast/full operands from elementwise users.
+        lse_full = tlx.require_layout(
+            tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
+            MMA_NM,
+            pin=False,
+        )
+        scale_full = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                SM_SCALE * 1.4426950408889634,
+                tl.float32,
+            ),
+            MMA_NM,
+            pin=False,
+        )
+        scaled_scores = scores * scale_full - lse_full
+    p = tl.math.exp2(scaled_scores)
+    delta_full = tlx.require_layout(
+        tl.broadcast_to(delta_values[None, :], (BLOCK_N, BLOCK_M)),
+        MMA_NM,
+        pin=False,
+    )
+    ds = p * (dp - delta_full)
+
+    p_nd = tl.reshape(p.to(tl.bfloat16), (2, 2, 2, 2, 16, BLOCK_M))
+    p_nd = tl.permute(p_nd, (0, 2, 3, 1, 4, 5))
+    p_nd = tl.reshape(p_nd, (BLOCK_N, BLOCK_M))
+    p_nd = tlx.require_layout(p_nd, P_ND_LAYOUT, pin=False)
+    if UPDATE_DV_FIRST_HALF:
+        dv = _attn_bwd_opt_gqa_dv_fragmented_half(
+            p_nd,
+            do_out,
+            dv,
+            MMA_ND,
+            P_ND_LAYOUT,
+            Q_OUT_LAYOUT,
+            True,
+        )
+
+    ds_bf16 = ds.to(tl.bfloat16)
+    tlx.local_store(ds_stage, tl.trans(ds_bf16))
+    ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
+    ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
+    ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
+    ds_nd = tlx.require_layout(ds_nd, P_ND_LAYOUT, pin=False)
+    return dv, ds_nd, q_out, p_nd, do_out
+
+
+@triton.jit
+def _attn_bwd_opt_gqa_store_dq_native(
+    dq,
+    DQ_ACC,
+    off_h_kv,
+    step,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    MMA_MD: tl.constexpr,
+    Q_BATCH_FITS_BUFFER: tl.constexpr,
+):
+    """Accumulate one dQ partial in the native MFMA ownership."""
+    tl.static_assert(BLOCK_M == 16 or BLOCK_M == 32)
+    tl.static_assert(D == 128 and dq.shape == (BLOCK_M, D))
+    buffer_base_alignment_bytes: tl.constexpr = 16
+    group_size: tl.constexpr = HQ // HK
+    n_m_blocks: tl.constexpr = N // BLOCK_M
+    group_idx = step // n_m_blocks
+    m_block = step % n_m_blocks
+    off_h_q = off_h_kv * group_size + group_idx
+    start_m = m_block * BLOCK_M
+
+    dq = tlx.require_layout(dq, MMA_MD, pin=False)
+    dq_scale = tlx.require_layout(
+        tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32),
+        MMA_MD,
+        pin=False,
+    )
+    dq = dq * dq_scale
+    local_m = tlx.rematerialized_range(0, BLOCK_M, 14, placement=step)
+    offs_d = tlx.rematerialized_range(0, D, 13, placement=step)
+    d_swizzled = ((offs_d & 1)
+                  | ((offs_d & 2) << 6)
+                  | ((offs_d & 12) << 3)
+                  | ((offs_d & 48) << 5)
+                  | ((offs_d & 64) << 2))
+    if Q_BATCH_FITS_BUFFER:
+        row_base = off_h_q * N + start_m
+        swizzled = (row_base * D + ((local_m[:, None] // 16) * 16 * D +
+                                    (((local_m[:, None] & 15) << 1) | d_swizzled[None, :]))).to(tl.int32)
+        swizzled = tl.max_contiguous(swizzled, [1, 2])
+        swizzled = tlx.require_layout(swizzled, MMA_MD, pin=False)
+        tlx.buffer_atomic_add(
+            DQ_ACC,
+            swizzled,
+            dq.to(tl.bfloat16),
+            sem="relaxed",
+            contiguity=2,
+        )
+    else:
+        dq_ptr = tl.multiple_of(
+            DQ_ACC + (off_h_q.to(tl.int64) * N + start_m) * D,
+            buffer_base_alignment_bytes,
+        )
+        swizzled = ((local_m[:, None] // 16) * 16 * D + (((local_m[:, None] & 15) << 1) | d_swizzled[None, :])).to(
+            tl.int32)
+        swizzled = tl.max_contiguous(swizzled, [1, 2])
+        swizzled = tlx.require_layout(swizzled, MMA_MD, pin=False)
+        tlx.buffer_atomic_add(
+            dq_ptr,
+            swizzled,
+            dq.to(tl.bfloat16),
+            sem="relaxed",
+            contiguity=2,
+        )
+
+
+@triton.jit
+def _attn_bwd_opt_gqa_dq_prefetched(
+    prev_ds,
+    ds0,
+    ds1,
+    k_buffer,
+    k_resident_lo,
+    k_resident_mid,
+    k_resident_band6,
+    v_resident,
+    MMA_MD: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    K_MD_LAYOUT: tl.constexpr,
+    V_LAYOUT: tl.constexpr,
+    COORDINATE_GROUP: tl.constexpr = None,
+    INTRINSIC_DQ: tl.constexpr = False,
+):
+    """Reduce eight K=32 bands into two independent native dQ chains."""
+    ds0 = tlx.require_layout(ds0, DS_MD_LAYOUT, pin=False)
+    ds1 = tlx.require_layout(ds1, DS_MD_LAYOUT, pin=False)
+    k_resident_lo = tlx.require_layout(k_resident_lo, K_MD_LAYOUT, pin=False)
+    k_resident_mid = tlx.require_layout(k_resident_mid, K_MD_LAYOUT, pin=False)
+    k_resident_band6 = tlx.require_layout(k_resident_band6, K_MD_LAYOUT, pin=False)
+    v_resident = tlx.require_layout(v_resident, V_LAYOUT, pin=False)
+    dq0 = tlx.zeros((16, 64), tl.float32, layout=MMA_MD)
+    dq1 = tlx.zeros((16, 64), tl.float32, layout=MMA_MD)
+
+    ds2 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 64], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    tl.static_assert(k_resident_band6.shape[0] == 32 or k_resident_band6.shape[0] == 64)
+    if k_resident_band6.shape[0] == 64:
+        k7 = tlx.extract_slice(k_resident_band6, [32, 128], [32, 0])
+    else:
+        k7 = tlx.local_load(
+            tlx.local_slice(k_buffer, [224, 0], [32, 128]),
+            layout=K_MD_LAYOUT,
+            relaxed=True,
+            rematerialize_coordinates_group=COORDINATE_GROUP,
+        )
+    k00 = tlx.extract_slice(k_resident_lo, [32, 64], [0, 0])
+    k01 = tlx.extract_slice(k_resident_lo, [32, 64], [0, 64])
+    k10 = tlx.extract_slice(k_resident_lo, [32, 64], [32, 0])
+    k11 = tlx.extract_slice(k_resident_lo, [32, 64], [32, 64])
+    dq0 = tlx.amd_scheduled_mfma(
+        ds0,
+        k00,
+        dq0,
+        resident_operand=1,
+        accumulator_role="transient",
+        initialize=True,
+    )
+    dq1 = tlx.amd_scheduled_mfma(
+        ds0,
+        k01,
+        dq1,
+        resident_operand=1,
+        accumulator_role="transient",
+        initialize=True,
+    )
+
+    ds3 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 96], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    dq0 = tlx.amd_scheduled_mfma(ds1, k10, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds1, k11, dq1, resident_operand=1, accumulator_role="transient")
+    k20 = tlx.extract_slice(k_resident_lo, [32, 64], [64, 0])
+    k21 = tlx.extract_slice(k_resident_lo, [32, 64], [64, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds2, k20, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds2, k21, dq1, resident_operand=1, accumulator_role="transient")
+
+    ds4 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 128], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    k30 = tlx.extract_slice(k_resident_lo, [32, 64], [96, 0])
+    k31 = tlx.extract_slice(k_resident_lo, [32, 64], [96, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds3, k30, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds3, k31, dq1, resident_operand=1, accumulator_role="transient")
+
+    ds5 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 160], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    k40 = tlx.extract_slice(k_resident_mid, [32, 64], [0, 0])
+    k41 = tlx.extract_slice(k_resident_mid, [32, 64], [0, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds4, k40, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds4, k41, dq1, resident_operand=1, accumulator_role="transient")
+
+    ds6 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 192], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    k50 = tlx.extract_slice(k_resident_mid, [32, 64], [32, 0])
+    k51 = tlx.extract_slice(k_resident_mid, [32, 64], [32, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds5, k50, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds5, k51, dq1, resident_operand=1, accumulator_role="transient")
+
+    ds7 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 224], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    k60 = tlx.extract_slice(k_resident_band6, [32, 64], [0, 0])
+    k61 = tlx.extract_slice(k_resident_band6, [32, 64], [0, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds6, k60, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds6, k61, dq1, resident_operand=1, accumulator_role="transient")
+    k70 = tlx.extract_slice(k7, [32, 64], [0, 0])
+    k71 = tlx.extract_slice(k7, [32, 64], [0, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds7, k70, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds7, k71, dq1, resident_operand=1, accumulator_role="transient")
+    if INTRINSIC_DQ:
+        # Transient dQ uses LLVM-visible MFMA intrinsics, so the backend
+        # models every result consumer. V remains a readonly dominating SSA
+        # value; no physical register alias or residency is promised here.
+        v_resident = tlx.require_layout(v_resident, V_LAYOUT, pin=False)
+    else:
+        dq0, dq1, v_resident = tlx.amd_mfma_commit((dq0, dq1), v_resident)
+    dq = tl.join(dq0, dq1)
+    dq = tl.permute(dq, (0, 2, 1))
+    dq = tl.reshape(dq, (16, 128))
+    dq = tlx.require_layout(dq, MMA_MD, pin=False)
+    return dq, v_resident
+
+
+@triton.jit
+def _attn_bwd_opt_gqa_dq(
+    prev_ds,
+    k_buffer,
+    k_resident_lo,
+    k_resident_mid,
+    k_resident_band6,
+    v_resident,
+    MMA_MD: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    K_MD_LAYOUT: tl.constexpr,
+    V_LAYOUT: tl.constexpr,
+    COORDINATE_GROUP: tl.constexpr = None,
+):
+    """Drain entry when no dK work is available to hide the first dS reads."""
+    ds0 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 0], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    ds1 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 32], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    return _attn_bwd_opt_gqa_dq_prefetched(
+        prev_ds,
+        ds0,
+        ds1,
+        k_buffer,
+        k_resident_lo,
+        k_resident_mid,
+        k_resident_band6,
+        v_resident,
+        MMA_MD,
+        DS_MD_LAYOUT,
+        K_MD_LAYOUT,
+        V_LAYOUT,
+        COORDINATE_GROUP,
+    )
+
+
+@triton.jit
+def _attn_bwd_opt_gqa_dk_fragmented_prefetch(
+    dk_lhs,
+    dk_rhs,
+    dk,
+    prev_ds,
+    MMA_ND: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    FRAGMENT_CHAIN: tl.constexpr = False,
+):
+    """Update fragmented dK while prefetching the first two dQ bands."""
+    query_rows: tl.constexpr = dk_lhs.shape[1]
+    tl.static_assert(query_rows == 16 or query_rows == 32)
+    tl.static_assert(dk_lhs.shape == (256, query_rows))
+    tl.static_assert(dk_rhs.shape == (query_rows, 128))
+    tl.static_assert(prev_ds.shape == (query_rows, 256))
+    dk_lhs = tlx.require_layout(dk_lhs, P_ND_LAYOUT, pin=False)
+    dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
+    if not FRAGMENT_CHAIN:
+        dk = tlx.require_layout(dk, MMA_ND, pin=False)
+    lhs0 = tlx.extract_slice(dk_lhs, [128, query_rows], [0, 0])
+    lhs1 = tlx.extract_slice(dk_lhs, [128, query_rows], [128, 0])
+    rhs0 = tlx.extract_slice(dk_rhs, [query_rows, 32], [0, 0])
+    rhs1 = tlx.extract_slice(dk_rhs, [query_rows, 32], [0, 32])
+    rhs2 = tlx.extract_slice(dk_rhs, [query_rows, 32], [0, 64])
+    rhs3 = tlx.extract_slice(dk_rhs, [query_rows, 32], [0, 96])
+
+    if FRAGMENT_CHAIN:
+        c00, c10, c01, c11, c02, c12, c03, c13 = dk
+        c00 = tlx.require_layout(c00, MMA_ND, pin=False)
+        c10 = tlx.require_layout(c10, MMA_ND, pin=False)
+        c01 = tlx.require_layout(c01, MMA_ND, pin=False)
+        c11 = tlx.require_layout(c11, MMA_ND, pin=False)
+        c02 = tlx.require_layout(c02, MMA_ND, pin=False)
+        c12 = tlx.require_layout(c12, MMA_ND, pin=False)
+        c03 = tlx.require_layout(c03, MMA_ND, pin=False)
+        c13 = tlx.require_layout(c13, MMA_ND, pin=False)
+    else:
+        c00 = tlx.extract_slice(dk, [128, 32], [0, 0])
+        c10 = tlx.extract_slice(dk, [128, 32], [128, 0])
+        c01 = tlx.extract_slice(dk, [128, 32], [0, 32])
+        c11 = tlx.extract_slice(dk, [128, 32], [128, 32])
+        c02 = tlx.extract_slice(dk, [128, 32], [0, 64])
+        c12 = tlx.extract_slice(dk, [128, 32], [128, 64])
+        c03 = tlx.extract_slice(dk, [128, 32], [0, 96])
+        c13 = tlx.extract_slice(dk, [128, 32], [128, 96])
+
+    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent")
+    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent")
+    ds0 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 0], [query_rows, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+    )
+    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent")
+    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent")
+    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent")
+    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent")
+    ds1 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 32], [query_rows, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+    )
+    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator_role="persistent")
+    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator_role="persistent")
+
+    if FRAGMENT_CHAIN:
+        return (c00, c10, c01, c11, c02, c12, c03, c13), ds0, ds1
+    else:
+        # Complete the independent AGPR chains together before concatenation.
+        # Each fresh fragment has one consumer, so post-RA hazard repair can use
+        # the actual schedule instead of draining every scheduled MFMA separately.
+        c00, c10, c01, c11, c02, c12, c03, c13 = tlx.amd_mfma_commit((c00, c10, c01, c11, c02, c12, c03, c13))
+
+        row0 = tl.cat(
+            tl.cat(c00, c01, dim=1),
+            tl.cat(c02, c03, dim=1),
+            dim=1,
+        )
+        row1 = tl.cat(
+            tl.cat(c10, c11, dim=1),
+            tl.cat(c12, c13, dim=1),
+            dim=1,
+        )
+        new_dk = tl.cat(row0, row1, dim=0)
+        new_dk = tlx.require_layout(new_dk, MMA_ND, pin=False)
+        return new_dk, ds0, ds1
+
+
+@triton.jit
+def _attn_bwd_opt_gqa_bridge(
+    prev_ds,
+    k_buffer,
+    k_resident_lo,
+    k_resident_mid,
+    k_resident_band6,
+    v_resident,
+    dk_lhs,
+    dk_rhs,
+    dk,
+    MMA_ND: tl.constexpr,
+    MMA_MD: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    K_MD_LAYOUT: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    V_LAYOUT: tl.constexpr,
+    FRAGMENT_CHAIN: tl.constexpr = False,
+):
+    """Interleave independent current-dK and previous-dQ chains."""
+    new_dk, ds0, ds1 = _attn_bwd_opt_gqa_dk_fragmented_prefetch(
+        dk_lhs,
+        dk_rhs,
+        dk,
+        prev_ds,
+        MMA_ND,
+        P_ND_LAYOUT,
+        Q_OUT_LAYOUT,
+        DS_MD_LAYOUT,
+        FRAGMENT_CHAIN,
+    )
+    dq, v_resident = _attn_bwd_opt_gqa_dq_prefetched(
+        prev_ds,
+        ds0,
+        ds1,
+        k_buffer,
+        k_resident_lo,
+        k_resident_mid,
+        k_resident_band6,
+        v_resident,
+        MMA_MD,
+        DS_MD_LAYOUT,
+        K_MD_LAYOUT,
+        V_LAYOUT,
+        INTRINSIC_DQ=FRAGMENT_CHAIN,
+    )
+    return new_dk, dq, v_resident
+
+
+@triton.jit
+def _attn_bwd_gqa_dkdv_braid_prefetch(
+    dk_lhs,
+    dk_rhs,
+    dk,
+    dv_lhs,
+    dv_rhs,
+    dv,
+    prev_ds,
+    MMA_ND: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+):
+    """Update persistent dK and transient dV pairs before the unchanged dQ."""
+    tl.static_assert(dk_lhs.shape == (256, 16))
+    tl.static_assert(dv_lhs.shape == (256, 16))
+    tl.static_assert(dk_rhs.shape == (16, 128))
+    tl.static_assert(dv_rhs.shape == (16, 128))
+    tl.static_assert(prev_ds.shape == (16, 256))
+    dk_lhs = tlx.require_layout(dk_lhs, P_ND_LAYOUT, pin=False)
+    dv_lhs = tlx.require_layout(dv_lhs, P_ND_LAYOUT, pin=False)
+    dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
+    dv_rhs = tlx.require_layout(dv_rhs, Q_OUT_LAYOUT, pin=False)
+    dv = tlx.require_layout(dv, MMA_ND, pin=False)
+    kl0 = tlx.extract_slice(dk_lhs, [128, 16], [0, 0])
+    kl1 = tlx.extract_slice(dk_lhs, [128, 16], [128, 0])
+    vl0 = tlx.extract_slice(dv_lhs, [128, 16], [0, 0])
+    vl1 = tlx.extract_slice(dv_lhs, [128, 16], [128, 0])
+    k00, k10, k01, k11, k02, k12, k03, k13 = dk
+    kr0 = tlx.extract_slice(dk_rhs, [16, 32], [0, 0])
+    vr0 = tlx.extract_slice(dv_rhs, [16, 32], [0, 0])
+    k00 = tlx.require_layout(k00, MMA_ND, pin=False)
+    v00 = tlx.extract_slice(dv, [128, 32], [0, 0])
+    k10 = tlx.require_layout(k10, MMA_ND, pin=False)
+    v10 = tlx.extract_slice(dv, [128, 32], [128, 0])
+    kr1 = tlx.extract_slice(dk_rhs, [16, 32], [0, 32])
+    vr1 = tlx.extract_slice(dv_rhs, [16, 32], [0, 32])
+    k01 = tlx.require_layout(k01, MMA_ND, pin=False)
+    v01 = tlx.extract_slice(dv, [128, 32], [0, 32])
+    k11 = tlx.require_layout(k11, MMA_ND, pin=False)
+    v11 = tlx.extract_slice(dv, [128, 32], [128, 32])
+    kr2 = tlx.extract_slice(dk_rhs, [16, 32], [0, 64])
+    vr2 = tlx.extract_slice(dv_rhs, [16, 32], [0, 64])
+    k02 = tlx.require_layout(k02, MMA_ND, pin=False)
+    v02 = tlx.extract_slice(dv, [128, 32], [0, 64])
+    k12 = tlx.require_layout(k12, MMA_ND, pin=False)
+    v12 = tlx.extract_slice(dv, [128, 32], [128, 64])
+    kr3 = tlx.extract_slice(dk_rhs, [16, 32], [0, 96])
+    vr3 = tlx.extract_slice(dv_rhs, [16, 32], [0, 96])
+    k03 = tlx.require_layout(k03, MMA_ND, pin=False)
+    v03 = tlx.extract_slice(dv, [128, 32], [0, 96])
+    k13 = tlx.require_layout(k13, MMA_ND, pin=False)
+    v13 = tlx.extract_slice(dv, [128, 32], [128, 96])
+    v00 = tlx.amd_scheduled_mfma(vl0, vr0, v00, accumulator_role="transient")
+    v10 = tlx.amd_scheduled_mfma(vl1, vr0, v10, accumulator_role="transient")
+    k00 = tlx.amd_scheduled_mfma(kl0, kr0, k00, accumulator_role="persistent")
+    k10 = tlx.amd_scheduled_mfma(kl1, kr0, k10, accumulator_role="persistent")
+    ds0 = tlx.local_load(tlx.local_slice(prev_ds, [0, 0], [16, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    v01 = tlx.amd_scheduled_mfma(vl0, vr1, v01, accumulator_role="transient")
+    v11 = tlx.amd_scheduled_mfma(vl1, vr1, v11, accumulator_role="transient")
+    k01 = tlx.amd_scheduled_mfma(kl0, kr1, k01, accumulator_role="persistent")
+    k11 = tlx.amd_scheduled_mfma(kl1, kr1, k11, accumulator_role="persistent")
+    v02 = tlx.amd_scheduled_mfma(vl0, vr2, v02, accumulator_role="transient")
+    v12 = tlx.amd_scheduled_mfma(vl1, vr2, v12, accumulator_role="transient")
+    k02 = tlx.amd_scheduled_mfma(kl0, kr2, k02, accumulator_role="persistent")
+    k12 = tlx.amd_scheduled_mfma(kl1, kr2, k12, accumulator_role="persistent")
+    ds1 = tlx.local_load(tlx.local_slice(prev_ds, [0, 32], [16, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    v03 = tlx.amd_scheduled_mfma(vl0, vr3, v03, accumulator_role="transient")
+    v13 = tlx.amd_scheduled_mfma(vl1, vr3, v13, accumulator_role="transient")
+    k03 = tlx.amd_scheduled_mfma(kl0, kr3, k03, accumulator_role="persistent")
+    k13 = tlx.amd_scheduled_mfma(kl1, kr3, k13, accumulator_role="persistent")
+    row0 = tl.cat(tl.cat(v00, v01, dim=1), tl.cat(v02, v03, dim=1), dim=1)
+    row1 = tl.cat(tl.cat(v10, v11, dim=1), tl.cat(v12, v13, dim=1), dim=1)
+    new_dv = tlx.require_layout(tl.cat(row0, row1, dim=0), MMA_ND, pin=False)
+    return (k00, k10, k01, k11, k02, k12, k03, k13), new_dv, ds0, ds1
+
+
+@triton.jit
+def _attn_bwd_opt_gqa_phase(
+    q_tiles,
+    do_tiles,
+    lse_tiles,
+    delta_tiles,
+    ds_buffers,
+    k_buffer,
+    k_resident_lo,
+    k_resident_mid,
+    k_resident_band6,
+    v_operand,
+    dk,
+    dv,
+    DQ_ACC,
+    off_h_kv,
+    pid_n,
+    outer_step,
+    phase,
+    dq_step_floor,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    MMA_NM: tl.constexpr,
+    MMA_ND: tl.constexpr,
+    MMA_MD: tl.constexpr,
+    K_NM_LAYOUT: tl.constexpr,
+    QT_LAYOUT: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    K_MD_LAYOUT: tl.constexpr,
+    DIRECT_DK: tl.constexpr,
+    REDIRECT_DUMMY_DQ: tl.constexpr,
+    UNROLL_PHASES: tl.constexpr,
+    Q_BATCH_FITS_BUFFER: tl.constexpr,
+    FRAGMENT_CHAIN: tl.constexpr = False,
+    SKIP_DUMMY_DQ: tl.constexpr = False,
+    CACHE_SCORE_K: tl.constexpr = False,
+    k_score_cache=None,
+):
+    """Run one absolute outer-step phase with direct dK or the lagged bridge.
+
+    ``REDIRECT_DUMMY_DQ`` seeds phase 0 for MHA and continuous short GQA.
+    Its zero dS produces a harmless dQ before a real previous phase exists.
+    """
+    tl.static_assert(not (DIRECT_DK and REDIRECT_DUMMY_DQ))
+    BRAID_DK_DV: tl.constexpr = FRAGMENT_CHAIN and HQ == 8 * HK and (N == 2048 or N == 4096)
+    tl.static_assert(not (DIRECT_DK and FRAGMENT_CHAIN))
+    tl.static_assert(not SKIP_DUMMY_DQ or (FRAGMENT_CHAIN and REDIRECT_DUMMY_DQ))
+    if not IS_CAUSAL and (REDIRECT_DUMMY_DQ or (HQ == HK and not UNROLL_PHASES)):
+        # Unrolled phases share one hint; rolled MHA needs a hint in each region.
+        tlx.amd_iglp_opt(2)
+    step = outer_step * 4 + phase
+    cur_stage = phase % 2
+    q_slice, do_slice = _attn_bwd_gqa_load_qdo_slice(
+        q_tiles,
+        do_tiles,
+        phase,
+    )
+    # Re-anchor lane/warp coordinates at the adjacent statistics loads and
+    # share the copy. The group number is only a local equivalence tag, not a
+    # tuning parameter. Entry coordinates otherwise cross the register-heavy
+    # phase; rematerializing each load independently duplicates the anchors.
+    stats_coordinate_group: tl.constexpr = 20
+    lse_values = tlx.local_load(
+        tlx.local_view(lse_tiles, phase),
+        relaxed=True,
+        rematerialize_coordinates_group=stats_coordinate_group,
+    )
+    delta_values = tlx.local_load(
+        tlx.local_view(delta_tiles, phase),
+        relaxed=True,
+        rematerialize_coordinates_group=stats_coordinate_group,
+    )
+    dv, dk_lhs, dk_rhs, dv_lhs, dv_rhs = _attn_bwd_opt_gqa_front(
+        dv,
+        q_slice,
+        do_slice,
+        k_buffer,
+        v_operand,
+        tlx.local_view(ds_buffers, cur_stage),
+        lse_values,
+        delta_values,
+        pid_n,
+        step,
+        SM_SCALE,
+        N,
+        BLOCK_M,
+        BLOCK_N,
+        IS_CAUSAL,
+        MMA_NM,
+        MMA_ND,
+        K_NM_LAYOUT,
+        QT_LAYOUT,
+        P_ND_LAYOUT,
+        Q_OUT_LAYOUT,
+        UPDATE_DV_FIRST_HALF=not BRAID_DK_DV,
+        PIN_SCORES=IS_CAUSAL,
+        PIN_DP=IS_CAUSAL,
+        USE_STREAM=HQ != HK and not IS_CAUSAL,
+        CACHE_SCORE_K=CACHE_SCORE_K,
+        k_score_cache=k_score_cache,
+    )
+    if not BRAID_DK_DV:
+        dv = _attn_bwd_opt_gqa_dv_fragmented_half(
+            dv_lhs,
+            dv_rhs,
+            dv,
+            MMA_ND,
+            P_ND_LAYOUT,
+            Q_OUT_LAYOUT,
+            False,
+        )
+    if DIRECT_DK:
+        dk_lhs = tlx.require_layout(dk_lhs, P_ND_LAYOUT, pin=False)
+        dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
+        dk = tlx.require_layout(dk, MMA_ND, pin=False)
+        dk = tl.dot(dk_lhs, dk_rhs, dk)
+        dk = tlx.require_layout(dk, MMA_ND, pin=False)
+    else:
+        prev_stage = 1 - cur_stage
+        if BRAID_DK_DV:
+            dk, dv, ds0, ds1 = _attn_bwd_gqa_dkdv_braid_prefetch(
+                dk_lhs,
+                dk_rhs,
+                dk,
+                dv_lhs,
+                dv_rhs,
+                dv,
+                tlx.local_view(ds_buffers, prev_stage),
+                MMA_ND,
+                P_ND_LAYOUT,
+                Q_OUT_LAYOUT,
+                DS_MD_LAYOUT,
+            )
+        if SKIP_DUMMY_DQ:
+            if not BRAID_DK_DV:
+                dk, unused_ds0, unused_ds1 = _attn_bwd_opt_gqa_dk_fragmented_prefetch(
+                    dk_lhs,
+                    dk_rhs,
+                    dk,
+                    tlx.local_view(ds_buffers, prev_stage),
+                    MMA_ND,
+                    P_ND_LAYOUT,
+                    Q_OUT_LAYOUT,
+                    DS_MD_LAYOUT,
+                    FRAGMENT_CHAIN,
+                )
+        else:
+            if BRAID_DK_DV:
+                dq, v_operand = _attn_bwd_opt_gqa_dq_prefetched(
+                    tlx.local_view(ds_buffers, prev_stage),
+                    ds0,
+                    ds1,
+                    k_buffer,
+                    k_resident_lo,
+                    k_resident_mid,
+                    k_resident_band6,
+                    v_operand,
+                    MMA_MD,
+                    DS_MD_LAYOUT,
+                    K_MD_LAYOUT,
+                    K_NM_LAYOUT,
+                    INTRINSIC_DQ=True,
+                )
+            else:
+                dk, dq, v_operand = _attn_bwd_opt_gqa_bridge(
+                    tlx.local_view(ds_buffers, prev_stage),
+                    k_buffer,
+                    k_resident_lo,
+                    k_resident_mid,
+                    k_resident_band6,
+                    v_operand,
+                    dk_lhs,
+                    dk_rhs,
+                    dk,
+                    MMA_ND,
+                    MMA_MD,
+                    DS_MD_LAYOUT,
+                    K_MD_LAYOUT,
+                    P_ND_LAYOUT,
+                    Q_OUT_LAYOUT,
+                    K_NM_LAYOUT,
+                    FRAGMENT_CHAIN,
+                )
+            if REDIRECT_DUMMY_DQ:
+                # Keep the seeded zero atomic inside this workgroup's interval.
+                dq_step = tl.maximum(step - 1, dq_step_floor)
+            else:
+                dq_step = step - 1
+            _attn_bwd_opt_gqa_store_dq_native(
+                dq,
+                DQ_ACC,
+                off_h_kv,
+                dq_step,
+                SM_SCALE,
+                HQ,
+                HK,
+                N,
+                D,
+                BLOCK_M,
+                MMA_MD,
+                Q_BATCH_FITS_BUFFER,
+            )
+    if not FRAGMENT_CHAIN:
+        dk = tlx.require_layout(dk, MMA_ND, pin=False)
+    dv = tlx.require_layout(dv, MMA_ND, pin=False)
+    v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
+    tl.debug_barrier()
+    return dk, dv, v_operand
+
+
+@triton.jit
+def _attn_bwd_gqa_outer_step(
+    dk,
+    dv,
+    v_operand,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    D: tl.constexpr,
+    DO,
+    DQ_ACC,
+    Delta,
+    FRAGMENT_CHAIN: tl.constexpr,
+    HK: tl.constexpr,
+    HQ: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    LSE,
+    N: tl.constexpr,
+    OUTER_M: tl.constexpr,
+    Q,
+    SM_SCALE: tl.constexpr,
+    active_outer_blocks,
+    continuous_bridge: tl.constexpr,
+    delta_buffers,
+    do_buffers,
+    ds_buffers,
+    ds_md_layout: tl.constexpr,
+    first_dq_step,
+    first_outer_block,
+    k_buffer,
+    k_md_layout: tl.constexpr,
+    k_nm_layout: tl.constexpr,
+    k_resident_band6,
+    k_resident_lo,
+    k_resident_mid,
+    lse_buffers,
+    mma_md: tl.constexpr,
+    mma_nd: tl.constexpr,
+    mma_nm: tl.constexpr,
+    n_outer_blocks: tl.constexpr,
+    off_h_kv,
+    outer_start,
+    outer_step,
+    p_nd_layout: tl.constexpr,
+    pid_n,
+    q_batch_fits_buffer: tl.constexpr,
+    q_buffers,
+    q_out_layout: tl.constexpr,
+    qdo_async_layout: tl.constexpr,
+    qdo_slice_smem_layout: tl.constexpr,
+    qt_layout: tl.constexpr,
+    slice_refill: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+    stats_slice_smem_layout: tl.constexpr,
+    unroll_phases: tl.constexpr,
+    SKIP_DUMMY_DQ: tl.constexpr = False,
+    CACHE_SCORE_K: tl.constexpr = False,
+    k_score_cache=None,
+):
+    outer_stage = (outer_step - outer_start) % 2
+    group_idx = outer_step // active_outer_blocks
+    outer_block = first_outer_block + outer_step % active_outer_blocks
+    global_outer_step = group_idx * n_outer_blocks + outer_block
+    q_outer = tlx.local_view(q_buffers, outer_stage)
+    do_outer = tlx.local_view(do_buffers, outer_stage)
+    lse_outer = tlx.local_view(lse_buffers, outer_stage)
+    delta_outer = tlx.local_view(delta_buffers, outer_stage)
+    q_tiles = tlx.local_reinterpret(
+        q_outer,
+        tl.bfloat16,
+        [4, BLOCK_M, D],
+        layout=qdo_slice_smem_layout,
+    )
+    do_tiles = tlx.local_reinterpret(
+        do_outer,
+        tl.bfloat16,
+        [4, BLOCK_M, D],
+        layout=qdo_slice_smem_layout,
+    )
+    lse_tiles = tlx.local_reinterpret(
+        lse_outer,
+        tl.float32,
+        [4, BLOCK_M],
+        layout=stats_slice_smem_layout,
+    )
+    delta_tiles = tlx.local_reinterpret(
+        delta_outer,
+        tl.float32,
+        [4, BLOCK_M],
+        layout=stats_slice_smem_layout,
+    )
+    # Phase 0 publishes stage 0. Continuous bridges consume seeded/prior
+    # stage 1; other GQA shapes use direct dK and drain at the boundary.
+    phase0: tl.constexpr = 0
+    dk, dv, v_operand = _attn_bwd_opt_gqa_phase(
+        q_tiles,
+        do_tiles,
+        lse_tiles,
+        delta_tiles,
+        ds_buffers,
+        k_buffer,
+        k_resident_lo,
+        k_resident_mid,
+        k_resident_band6,
+        v_operand,
+        dk,
+        dv,
+        DQ_ACC,
+        off_h_kv,
+        pid_n,
+        global_outer_step,
+        phase0,
+        first_dq_step,
+        SM_SCALE,
+        HQ,
+        HK,
+        N,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        IS_CAUSAL,
+        mma_nm,
+        mma_nd,
+        mma_md,
+        k_nm_layout,
+        qt_layout,
+        p_nd_layout,
+        q_out_layout,
+        ds_md_layout,
+        k_md_layout,
+        not continuous_bridge,
+        continuous_bridge,
+        unroll_phases,
+        q_batch_fits_buffer,
+        FRAGMENT_CHAIN,
+        SKIP_DUMMY_DQ=SKIP_DUMMY_DQ,
+        CACHE_SCORE_K=CACHE_SCORE_K,
+        k_score_cache=k_score_cache,
+    )
+    if slice_refill:
+        _attn_bwd_gqa_issue_qdo_slice_async(
+            tlx.local_view(q_tiles, phase0),
+            tlx.local_view(do_tiles, phase0),
+            lse_outer,
+            delta_outer,
+            Q,
+            DO,
+            LSE,
+            Delta,
+            off_h_kv,
+            outer_step + 2,
+            phase0,
+            HQ,
+            HK,
+            N,
+            D,
+            q_batch_fits_buffer,
+        )
+
+    for phase in tl.range(1, 4, loop_unroll_factor=3 if unroll_phases else 1):
+        dk, dv, v_operand = _attn_bwd_opt_gqa_phase(
+            q_tiles,
+            do_tiles,
+            lse_tiles,
+            delta_tiles,
+            ds_buffers,
+            k_buffer,
+            k_resident_lo,
+            k_resident_mid,
+            k_resident_band6,
+            v_operand,
+            dk,
+            dv,
+            DQ_ACC,
+            off_h_kv,
+            pid_n,
+            global_outer_step,
+            phase,
+            first_dq_step,
+            SM_SCALE,
+            HQ,
+            HK,
+            N,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            IS_CAUSAL,
+            mma_nm,
+            mma_nd,
+            mma_md,
+            k_nm_layout,
+            qt_layout,
+            p_nd_layout,
+            q_out_layout,
+            ds_md_layout,
+            k_md_layout,
+            False,
+            False,
+            unroll_phases,
+            q_batch_fits_buffer,
+            FRAGMENT_CHAIN,
+            CACHE_SCORE_K=CACHE_SCORE_K,
+            k_score_cache=k_score_cache,
+        )
+        if slice_refill:
+            _attn_bwd_gqa_issue_qdo_slice_async(
+                tlx.local_view(q_tiles, phase),
+                tlx.local_view(do_tiles, phase),
+                lse_outer,
+                delta_outer,
+                Q,
+                DO,
+                LSE,
+                Delta,
+                off_h_kv,
+                outer_step + 2,
+                phase,
+                HQ,
+                HK,
+                N,
+                D,
+                q_batch_fits_buffer,
+            )
+
+    if not slice_refill:
+        _attn_bwd_gqa_issue_qdo_async(
+            q_outer,
+            do_outer,
+            lse_outer,
+            delta_outer,
+            Q,
+            DO,
+            LSE,
+            Delta,
+            off_h_kv,
+            pid_n,
+            outer_step + 2,
+            HQ,
+            HK,
+            N,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            OUTER_M,
+            qdo_async_layout,
+            stats_async_layout,
+            q_batch_fits_buffer,
+            IS_CAUSAL,
+        )
+    if not continuous_bridge:
+        # Grouped-query reuse makes this drain useful work while the next
+        # Q/dO/stats refill is in flight.
+        dq, v_operand = _attn_bwd_opt_gqa_dq(
+            tlx.local_view(ds_buffers, 1),
+            k_buffer,
+            k_resident_lo,
+            k_resident_mid,
+            k_resident_band6,
+            v_operand,
+            mma_md,
+            ds_md_layout,
+            k_md_layout,
+            k_nm_layout,
+        )
+        _attn_bwd_opt_gqa_store_dq_native(
+            dq,
+            DQ_ACC,
+            off_h_kv,
+            global_outer_step * 4 + 3,
+            SM_SCALE,
+            HQ,
+            HK,
+            N,
+            D,
+            BLOCK_M,
+            mma_md,
+            q_batch_fits_buffer,
+        )
+    # The first iteration drains the two initial next-tile groups. Each
+    # later iteration drains the previous four slice-refill groups while
+    # leaving this iteration's four future groups in flight.
+    tlx.async_load_wait_group(4 if slice_refill else 2)
+    tl.debug_barrier()
+    return dk, dv, v_operand
+
+
+@triton.jit
+def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DQ_ACC,
+    DK,
+    DV,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BATCH: tl.constexpr = 1,
+    SPLIT_Q: tl.constexpr = 1,
+):
+    """Four-wave outer64 causal/full GQA backward bridge."""
+    tl.static_assert(D == 128)
+    tl.static_assert(BLOCK_M == 16)
+    tl.static_assert(BLOCK_N == 256)
+    tl.static_assert(N % 256 == 0)
+    tl.static_assert(HQ % HK == 0)
+
+    # Keep adjacent workgroups on different KV heads for the same batch and
+    # N tile to improve the dQ atomic/cache locality of the GQA bridge.
+    off_h_kv = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    OUTER_M: tl.constexpr = 64
+    n_outer_blocks: tl.constexpr = N // OUTER_M
+    first_outer_block = pid_n * (BLOCK_N // OUTER_M) if IS_CAUSAL else 0
+    active_outer_blocks = n_outer_blocks - first_outer_block
+    total_outer_steps = (HQ // HK) * active_outer_blocks
+    tl.static_assert(SPLIT_Q >= 1 and SPLIT_Q <= (HQ // HK) * (N // OUTER_M))
+    tl.static_assert(not IS_CAUSAL or SPLIT_Q == 1)
+    if SPLIT_Q == 1:
+        off_z = tl.program_id(2)
+        split_id = 0
+        outer_start = 0
+        outer_end = total_outer_steps
+    else:
+        off_z = tl.program_id(2) % BATCH
+        split_id = tl.program_id(2) // BATCH
+        # The products can exceed i32 even when each interval fits. Widen
+        # before multiplication, then keep the loop coordinates in i32.
+        outer_start = (total_outer_steps * split_id.to(tl.int64) // SPLIT_Q).to(tl.int32)
+        outer_end = (total_outer_steps * (split_id.to(tl.int64) + 1) // SPLIT_Q).to(tl.int32)
+    first_dq_step = pid_n * (BLOCK_N // BLOCK_M) if IS_CAUSAL else outer_start * 4
+
+    # AMD buffer instructions use signed 32-bit byte offsets. Rebase every
+    # global tensor to this program's batch with 64-bit pointer arithmetic;
+    # individual Q and KV tiles are rebased again below so large head counts
+    # cannot push a valid access past the 2-GiB buffer-offset boundary.
+    q_batch_base = off_z.to(tl.int64) * HQ * N * D
+    kv_batch_base = off_z.to(tl.int64) * HK * N * D
+    stats_batch_base = off_z.to(tl.int64) * HQ * N
+    Q = Q + q_batch_base
+    DO = DO + q_batch_base
+    if BATCH == 16 and HQ == 16 and HK == 16 and N == 16384 and not IS_CAUSAL and SPLIT_Q == 1:
+        dq_plane = (pid_n // (N // BLOCK_N // 2)).to(tl.int64)
+        DQ_ACC = DQ_ACC + dq_plane * BATCH * HQ * N * D
+    DQ_ACC = DQ_ACC + q_batch_base
+    LSE = LSE + stats_batch_base
+    Delta = Delta + stats_batch_base
+
+    # Buffer offsets are signed 32-bit byte offsets. Preserve the original
+    # batch-relative address schedule whenever a complete Q or KV batch fits;
+    # exceptionally large head counts use per-tile 64-bit pointer rebasing.
+    max_bf16_buffer_elements: tl.constexpr = (1 << 30) - 1
+    # Only the four measured unsplit MHA specializations use early V. The
+    # 8K specialization retains the original order after its measured loss.
+    EARLY_V: tl.constexpr = (HQ == HK and not IS_CAUSAL and SPLIT_Q == 1
+                             and (N == 1024 or N == 2048 or N == 4096 or N == 16384))
+    buffer_base_alignment_bytes: tl.constexpr = 16
+    q_batch_fits_buffer: tl.constexpr = HQ * N * D <= max_bf16_buffer_elements
+    kv_batch_fits_buffer: tl.constexpr = HK * N * D <= max_bf16_buffer_elements
+
+    # Native score/dP, persistent dK/dV, and delayed-dQ ownerships.
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_md: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    k_nm_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    qt_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    p_nd_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=8)
+    q_out_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=8)
+    ds_md_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_md, k_width=8)
+    k_md_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_md, k_width=8)
+
+    # Inverse producer layouts for one 64-row Q/dO outer tile and K tile.
+    qdo_async_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (8, 16, 32, 128, 64, 512, 256, 1024),
+            (1, 2, 4, 2048, 4096),
+        ),
+    )
+    stats_async_layout: tl.constexpr = tlx.layout(
+        shape=((64, 4), ()),
+        stride=((1, 0), ()),
+    )
+    # Native ownership after inverse-rotating the persistent dK/dV MFMA
+    # accumulators.  Store from this layout directly: converting back to the
+    # async-load layout lowers through a full LDS write/read transpose.
+    kv_native_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (128, 256, 512, 1024, 8192, 4, 2048, 4096),
+            (1, 2, 8, 16, 32, 64, 16384),
+        ),
+    )
+
+    qdo_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32), (1024, 16)],
+        [
+            [0, 0, 1],
+            [0, 0, 2],
+            [0, 0, 4],
+            [0, 0, 8],
+            [0, 0, 16],
+            [0, 0, 32],
+            [0, 1, 0],
+            [0, 0, 64],
+            [0, 4, 0],
+            [0, 2, 0],
+            [0, 8, 0],
+            [1, 0, 0],
+            [2, 0, 0],
+        ],
+        [OUTER_M // BLOCK_M, BLOCK_M, D],
+    ))
+    qdo_slice_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32), (1024, 16)],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [1, 0],
+            [0, 64],
+            [4, 0],
+            [2, 0],
+            [8, 0],
+        ],
+        [BLOCK_M, D],
+    ))
+    stats_smem_layout: tl.constexpr = (tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1],
+            [2],
+            [4],
+            [8],
+            [16],
+            [32],
+        ],
+        block_bases=[],
+        alignment=16,
+    ))
+    stats_slice_smem_layout: tl.constexpr = (tlx.shared_linear_layout_encoding(
+        offset_bases=[[1], [2], [4], [8]],
+        block_bases=[],
+        alignment=16,
+    ))
+    ds_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)],
+        [
+            [1, 0],
+            [2, 0],
+            [0, 1],
+            [0, 2],
+            [4, 0],
+            [0, 8],
+            [8, 0],
+            [0, 32],
+            [0, 16],
+            [0, 4],
+            [0, 64],
+            [0, 128],
+        ],
+        [BLOCK_M, BLOCK_N],
+    ))
+    # Preserve the existing TLX physical K image: a direct-to-LDS rank-3
+    # producer is reinterpreted as the bank-rotated rank-2 dQ consumer.
+    k_raw_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 0, 1],
+            [0, 0, 2],
+            [0, 0, 4],
+            [0, 1, 0],
+            [0, 2, 0],
+            [0, 4, 0],
+            [0, 8, 0],
+            [1, 0, 0],
+            [2, 0, 0],
+            [4, 0, 0],
+            [8, 0, 0],
+            [16, 0, 0],
+            [32, 0, 0],
+            [64, 0, 0],
+            [128, 0, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    k_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 64],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 64],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [128, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    k_raw_async_layout: tl.constexpr = tlx.layout(
+        shape=((64, 4), (8, 8, 2)),
+        stride=((8, 512), (1, 2048, 16384)),
+    )
+
+    k_raw_buffer = tlx.local_alloc(
+        (BLOCK_N, D // 8, 8),
+        tl.bfloat16,
+        1,
+        layout=k_raw_smem_layout,
+    )
+    k_buffer = tlx.local_reinterpret(
+        tlx.local_view(k_raw_buffer, 0),
+        tl.bfloat16,
+        [BLOCK_N, D],
+        layout=k_smem_layout,
+    )
+    q_buffers = tlx.local_alloc(
+        (OUTER_M // BLOCK_M, BLOCK_M, D),
+        tl.bfloat16,
+        2,
+        layout=qdo_smem_layout,
+    )
+    do_buffers = tlx.local_alloc(
+        (OUTER_M // BLOCK_M, BLOCK_M, D),
+        tl.bfloat16,
+        2,
+        layout=qdo_smem_layout,
+    )
+    lse_buffers = tlx.local_alloc(
+        (OUTER_M, ),
+        tl.float32,
+        2,
+        layout=stats_smem_layout,
+    )
+    delta_buffers = tlx.local_alloc(
+        (OUTER_M, ),
+        tl.float32,
+        2,
+        layout=stats_smem_layout,
+    )
+    ds_buffers = tlx.local_alloc(
+        (BLOCK_M, BLOCK_N),
+        tl.bfloat16,
+        2,
+        layout=ds_smem_layout,
+    )
+
+    # K direct-to-LDS group.
+    raw_n = tl.arange(0, BLOCK_N)
+    raw_dg = tl.arange(0, D // 8)
+    raw_v = tl.arange(0, 8)
+    k_phys = raw_n[:, None, None] * D + raw_dg[None, :, None] * 8
+    k_d_base = ((k_phys & 0x8) | (((k_phys >> 9) & 0x3) << 4) | ((((k_phys >> 4) ^ (k_phys >> 8)) & 0x1) << 6))
+    k_n = (((k_phys >> 5) & 0x7) | (((k_phys >> 8) & 0x1) << 3) | (((k_phys >> 11) & 0xf) << 4))
+    if kv_batch_fits_buffer:
+        K = K + kv_batch_base
+        V = V + kv_batch_base
+        if SPLIT_Q == 1:
+            DK = DK + kv_batch_base
+            DV = DV + kv_batch_base
+        kv_offset_base = off_h_kv * N * D
+        kv_tile_n = pid_n * BLOCK_N
+    else:
+        kv_program_base = kv_batch_base + (off_h_kv.to(tl.int64) * N + pid_n.to(tl.int64) * BLOCK_N) * D
+        # The tile offsets are aligned by D=128 elements. Preserve a concrete
+        # byte-alignment proof so direct-to-LDS vectorization remains legal.
+        K = tl.multiple_of(K + kv_program_base, buffer_base_alignment_bytes)
+        V = tl.multiple_of(V + kv_program_base, buffer_base_alignment_bytes)
+        if SPLIT_Q == 1:
+            DK = tl.multiple_of(DK + kv_program_base, buffer_base_alignment_bytes)
+            DV = tl.multiple_of(DV + kv_program_base, buffer_base_alignment_bytes)
+        kv_offset_base = 0
+        kv_tile_n = 0
+    k_offsets = kv_offset_base + (kv_tile_n + k_n) * D + k_d_base + raw_v[None, None, :]
+    k_offsets = tl.multiple_of(k_offsets, [1, 1, 8])
+    k_offsets = tl.max_contiguous(k_offsets, [1, 1, 8])
+    k_offsets = tlx.require_layout(k_offsets.to(tl.int32), k_raw_async_layout, pin=False)
+    k_token = tlx.buffer_load_to_local(tlx.local_view(k_raw_buffer, 0), K, k_offsets)
+    tlx.async_load_commit_group([k_token])
+
+    if EARLY_V:
+        offs_n = kv_tile_n + tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, D)
+        v_offsets = kv_offset_base + offs_n[:, None] * D + offs_d[None, :]
+        v_offsets = tlx.require_layout(v_offsets.to(tl.int32), k_nm_layout, pin=False)
+        v_operand = tlx.buffer_load(V, v_offsets)
+        v_operand = tlx.require_layout(v_operand, k_nm_layout, pin=False)
+
+    _attn_bwd_gqa_issue_qdo_async(
+        tlx.local_view(q_buffers, 0),
+        tlx.local_view(do_buffers, 0),
+        tlx.local_view(lse_buffers, 0),
+        tlx.local_view(delta_buffers, 0),
+        Q,
+        DO,
+        LSE,
+        Delta,
+        off_h_kv,
+        pid_n,
+        outer_start,
+        HQ,
+        HK,
+        N,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        OUTER_M,
+        qdo_async_layout,
+        stats_async_layout,
+        q_batch_fits_buffer,
+        IS_CAUSAL,
+    )
+    _attn_bwd_gqa_issue_qdo_async(
+        tlx.local_view(q_buffers, 1),
+        tlx.local_view(do_buffers, 1),
+        tlx.local_view(lse_buffers, 1),
+        tlx.local_view(delta_buffers, 1),
+        Q,
+        DO,
+        LSE,
+        Delta,
+        off_h_kv,
+        pid_n,
+        outer_start + 1,
+        HQ,
+        HK,
+        N,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        OUTER_M,
+        qdo_async_layout,
+        stats_async_layout,
+        q_batch_fits_buffer,
+        IS_CAUSAL,
+    )
+    initial_wait = tlx.async_load_wait_group(2)
+    tl.debug_barrier()
+
+    if not EARLY_V:
+        offs_n = kv_tile_n + tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, D)
+        v_offsets = kv_offset_base + offs_n[:, None] * D + offs_d[None, :]
+        v_offsets = tlx.require_layout(v_offsets.to(tl.int32), k_nm_layout, pin=False)
+        v_operand = tlx.buffer_load(V, v_offsets)
+        v_operand = tlx.require_layout(v_operand, k_nm_layout, pin=False)
+    k_resident_lo = tlx.local_load(
+        tlx.local_slice(k_buffer, [0, 0], [128, D]),
+        token=initial_wait,
+        layout=k_md_layout,
+        relaxed=True,
+    )
+    k_resident_mid = tlx.local_load(
+        tlx.local_slice(k_buffer, [128, 0], [64, D]),
+        token=initial_wait,
+        layout=k_md_layout,
+        relaxed=True,
+    )
+    k_resident_band6 = tlx.local_load(
+        # Full attention keeps the final K band in registers, avoiding its
+        # repeated LDS read in every delayed dQ phase.
+        tlx.local_slice(k_buffer, [192, 0], [64 if not IS_CAUSAL else 32, D]),
+        token=initial_wait,
+        layout=k_md_layout,
+        relaxed=True,
+    )
+    CACHE_SCORE_K: tl.constexpr = (BATCH == 16 and HQ == 16 and HK == 16 and
+                                   (N == 1024 or N == 2048 or N == 4096 or N == 8192 or N == 16384) and D == 128
+                                   and BLOCK_M == 16 and BLOCK_N == 256 and not IS_CAUSAL and SPLIT_Q == 1
+                                   or (BATCH == 16 and HQ == 64 and HK == 8 and
+                                       (N == 1024 or N == 2048 or N == 4096) and D == 128 and BLOCK_M == 16
+                                       and BLOCK_N == 256 and not IS_CAUSAL and SPLIT_Q == 1))
+    if CACHE_SCORE_K:
+        k_score_cache = tlx.local_load(
+            tlx.local_slice(k_buffer, [0, 0], [64, D]),
+            token=initial_wait,
+            layout=k_nm_layout,
+            relaxed=True,
+        )
+    else:
+        k_score_cache = None
+    # Chain dK fragments and peel the initial zero-dQ bridge for full MHA
+    # and short unsplit GQA. Each owned interval is nonempty.
+    FRAGMENT_CHAIN: tl.constexpr = not IS_CAUSAL and (HQ == HK or (N <= 4096 and SPLIT_Q == 1))
+    PEEL_ZERO_DQ_SEED: tl.constexpr = not IS_CAUSAL and (HQ == HK or (N <= 4096 and SPLIT_Q == 1))
+    if FRAGMENT_CHAIN:
+        dk = (
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+        )
+    else:
+        dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    # Carrying delayed dQ across outer/head boundaries helps short unsplit
+    # GQA. Published paired timings lose at 8K/16K, so keep their per-outer
+    # drain and preserve the bounded automatic split schedule.
+    continuous_gqa: tl.constexpr = HQ != HK and not IS_CAUSAL and N <= 4096 and SPLIT_Q == 1
+    continuous_bridge: tl.constexpr = HQ == HK or continuous_gqa
+    unroll_phases: tl.constexpr = continuous_gqa or (HQ == HK and not IS_CAUSAL)
+    # Each unrolled phase frees its consumed Q/dO slice at the existing CTA
+    # barrier. Refill that slice while later phases compute; phase3 alone
+    # refills the full64-row statistics used by all four phases.
+    slice_refill: tl.constexpr = unroll_phases
+    if continuous_bridge:
+        # Seed delayed dQ so phase 0 can use the steady bridge. The dummy
+        # zero dQ is redirected to the first tile and leaves it unchanged.
+        tlx.local_store(
+            tlx.local_view(ds_buffers, 1),
+            tl.zeros((BLOCK_M, BLOCK_N), tl.bfloat16),
+        )
+        tl.debug_barrier()
+
+    # MHA and short unsplit GQA carry delayed dQ across outer64 boundaries.
+    # Other GQA shapes drain per outer tile to overlap the next Q/dO refill.
+    if PEEL_ZERO_DQ_SEED:
+        # Skip only the initial known-zero delayed dQ, once per owned
+        # interval. Later query-head boundaries commit real previous-head dQ.
+        outer_step = outer_start
+        dk, dv, v_operand = _attn_bwd_gqa_outer_step(
+            dk,
+            dv,
+            v_operand,
+            BLOCK_M,
+            BLOCK_N,
+            D,
+            DO,
+            DQ_ACC,
+            Delta,
+            FRAGMENT_CHAIN,
+            HK,
+            HQ,
+            IS_CAUSAL,
+            LSE,
+            N,
+            OUTER_M,
+            Q,
+            SM_SCALE,
+            active_outer_blocks,
+            continuous_bridge,
+            delta_buffers,
+            do_buffers,
+            ds_buffers,
+            ds_md_layout,
+            first_dq_step,
+            first_outer_block,
+            k_buffer,
+            k_md_layout,
+            k_nm_layout,
+            k_resident_band6,
+            k_resident_lo,
+            k_resident_mid,
+            lse_buffers,
+            mma_md,
+            mma_nd,
+            mma_nm,
+            n_outer_blocks,
+            off_h_kv,
+            outer_start,
+            outer_step,
+            p_nd_layout,
+            pid_n,
+            q_batch_fits_buffer,
+            q_buffers,
+            q_out_layout,
+            qdo_async_layout,
+            qdo_slice_smem_layout,
+            qt_layout,
+            slice_refill,
+            stats_async_layout,
+            stats_slice_smem_layout,
+            unroll_phases,
+            SKIP_DUMMY_DQ=True,
+            CACHE_SCORE_K=CACHE_SCORE_K,
+            k_score_cache=k_score_cache,
+        )
+        for outer_step in tl.range(outer_start + 1, outer_end, loop_unroll_factor=1):
+            dk, dv, v_operand = _attn_bwd_gqa_outer_step(
+                dk,
+                dv,
+                v_operand,
+                BLOCK_M,
+                BLOCK_N,
+                D,
+                DO,
+                DQ_ACC,
+                Delta,
+                FRAGMENT_CHAIN,
+                HK,
+                HQ,
+                IS_CAUSAL,
+                LSE,
+                N,
+                OUTER_M,
+                Q,
+                SM_SCALE,
+                active_outer_blocks,
+                continuous_bridge,
+                delta_buffers,
+                do_buffers,
+                ds_buffers,
+                ds_md_layout,
+                first_dq_step,
+                first_outer_block,
+                k_buffer,
+                k_md_layout,
+                k_nm_layout,
+                k_resident_band6,
+                k_resident_lo,
+                k_resident_mid,
+                lse_buffers,
+                mma_md,
+                mma_nd,
+                mma_nm,
+                n_outer_blocks,
+                off_h_kv,
+                outer_start,
+                outer_step,
+                p_nd_layout,
+                pid_n,
+                q_batch_fits_buffer,
+                q_buffers,
+                q_out_layout,
+                qdo_async_layout,
+                qdo_slice_smem_layout,
+                qt_layout,
+                slice_refill,
+                stats_async_layout,
+                stats_slice_smem_layout,
+                unroll_phases,
+                SKIP_DUMMY_DQ=False,
+                CACHE_SCORE_K=CACHE_SCORE_K,
+                k_score_cache=k_score_cache,
+            )
+    else:
+        for outer_step in tl.range(outer_start, outer_end, loop_unroll_factor=1):
+            dk, dv, v_operand = _attn_bwd_gqa_outer_step(
+                dk,
+                dv,
+                v_operand,
+                BLOCK_M,
+                BLOCK_N,
+                D,
+                DO,
+                DQ_ACC,
+                Delta,
+                FRAGMENT_CHAIN,
+                HK,
+                HQ,
+                IS_CAUSAL,
+                LSE,
+                N,
+                OUTER_M,
+                Q,
+                SM_SCALE,
+                active_outer_blocks,
+                continuous_bridge,
+                delta_buffers,
+                do_buffers,
+                ds_buffers,
+                ds_md_layout,
+                first_dq_step,
+                first_outer_block,
+                k_buffer,
+                k_md_layout,
+                k_nm_layout,
+                k_resident_band6,
+                k_resident_lo,
+                k_resident_mid,
+                lse_buffers,
+                mma_md,
+                mma_nd,
+                mma_nm,
+                n_outer_blocks,
+                off_h_kv,
+                outer_start,
+                outer_step,
+                p_nd_layout,
+                pid_n,
+                q_batch_fits_buffer,
+                q_buffers,
+                q_out_layout,
+                qdo_async_layout,
+                qdo_slice_smem_layout,
+                qt_layout,
+                slice_refill,
+                stats_async_layout,
+                stats_slice_smem_layout,
+                unroll_phases,
+                SKIP_DUMMY_DQ=False,
+                CACHE_SCORE_K=CACHE_SCORE_K,
+                k_score_cache=k_score_cache,
+            )
+
+    if continuous_bridge:
+        # Only the final dS in this workgroup interval has no following dK.
+        # Re-anchor this standalone drain after the causal outer loop; 21 is
+        # only a local equivalence tag shared by its LDS loads.
+        dq, v_operand = _attn_bwd_opt_gqa_dq(
+            tlx.local_view(ds_buffers, 1),
+            k_buffer,
+            k_resident_lo,
+            k_resident_mid,
+            k_resident_band6,
+            v_operand,
+            mma_md,
+            ds_md_layout,
+            k_md_layout,
+            k_nm_layout,
+            21 if IS_CAUSAL else None,
+        )
+        _attn_bwd_opt_gqa_store_dq_native(
+            dq,
+            DQ_ACC,
+            off_h_kv,
+            N // BLOCK_M - 1 if IS_CAUSAL else outer_end * 4 - 1,
+            SM_SCALE,
+            HQ,
+            HK,
+            N,
+            D,
+            BLOCK_M,
+            mma_md,
+            q_batch_fits_buffer,
+        )
+    tlx.async_load_wait_group(0)
+
+    if FRAGMENT_CHAIN:
+        # Every native accumulator reaches only its next scheduled MFMA or
+        # this final all-FP32 commit; no concatenate/extract fanout in loop.
+        c00, c10, c01, c11, c02, c12, c03, c13 = tlx.amd_mfma_commit(dk)
+        row0 = tl.cat(tl.cat(c00, c01, dim=1), tl.cat(c02, c03, dim=1), dim=1)
+        row1 = tl.cat(tl.cat(c10, c11, dim=1), tl.cat(c12, c13, dim=1), dim=1)
+        dk = tlx.require_layout(tl.cat(row0, row1, dim=0), mma_nd, pin=False)
+
+    # Store the unique dK/dV tile after every query head in the group has
+    # contributed.
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    dk = tl.reshape(dk, (2, 2, 2, 2, 16, D))
+    dk = tl.permute(dk, (0, 3, 1, 2, 4, 5))
+    dk = tl.reshape(dk, (BLOCK_N, D))
+    dk = tlx.require_layout(dk, kv_native_layout, pin=False)
+    dk = dk * SM_SCALE
+    store_n = kv_tile_n + tlx.rematerialized_range(0, BLOCK_N, 30)
+    store_d = tlx.rematerialized_range(0, D, 31)
+    key_offsets = kv_offset_base + store_n[:, None] * D + store_d[None, :]
+    key_offsets = tlx.require_layout(key_offsets.to(tl.int32), kv_native_layout, pin=False)
+    if SPLIT_Q == 1:
+        tlx.buffer_store(dk.to(tl.bfloat16), DK, key_offsets)
+    else:
+        # FP32 partials have half the buffer-addressable element range of
+        # BF16 inputs. Rebase every output tile independently in 64 bits.
+        partial_base = (((split_id.to(tl.int64) * BATCH + off_z) * HK + off_h_kv) * N + pid_n * BLOCK_N) * D
+        DK = DK + partial_base
+        DV = DV + partial_base
+        key_offsets = tlx.require_layout(
+            (tlx.rematerialized_range(0, BLOCK_N, 32)[:, None] * D + store_d[None, :]).to(tl.int32),
+            kv_native_layout,
+            pin=False,
+        )
+        tlx.buffer_store(dk, DK, key_offsets)
+
+    # dK is dead before constructing the dV view, so its temporary registers
+    # are available to the dV epilogue.
+    dv = tl.reshape(dv, (2, 2, 2, 2, 16, D))
+    dv = tl.permute(dv, (0, 3, 1, 2, 4, 5))
+    dv = tl.reshape(dv, (BLOCK_N, D))
+    dv = tlx.require_layout(dv, kv_native_layout, pin=False)
+    if SPLIT_Q == 1:
+        tlx.buffer_store(dv.to(tl.bfloat16), DV, key_offsets)
+    else:
+        tlx.buffer_store(dv, DV, key_offsets)
+
+
+@triton.jit
+def _attn_bwd_dq_native_optimized_convert_kernel(
+    DQ_ACC,
+    DQ,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Restore the logical [M,D] order of native-swizzled BF16 dQ."""
+    native_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (256, 512, 1024, 8, 2, 2048, 16, 32),
+            (1, 128, 4, 64, 4096, 8192),
+        ),
+    )
+    store_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (256, 512, 1024, 8, 128, 2048, 16, 32),
+            (1, 2, 4, 64, 4096, 8192),
+        ),
+    )
+    pid_m = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    max_bf16_buffer_elements: tl.constexpr = (1 << 30) - 1
+    head_fits_buffer: tl.constexpr = N * D <= max_bf16_buffer_elements
+    tensor_base = batch_head.to(tl.int64) * N * D
+    if head_fits_buffer:
+        tile_m_base = pid_m * BLOCK_M
+    else:
+        tensor_base += pid_m.to(tl.int64) * BLOCK_M * D
+        tile_m_base = 0
+    DQ_ACC = DQ_ACC + tensor_base
+    DQ = DQ + tensor_base
+    native_m = tile_m_base + tl.arange(0, BLOCK_M)
+    native_d = tl.arange(0, D)
+    local_m = native_m & 15
+    tile_m = native_m - local_m
+    d_swizzled = ((native_d & 1)
+                  | ((native_d & 2) << 6)
+                  | ((native_d & 12) << 3)
+                  | ((native_d & 48) << 5)
+                  | ((native_d & 64) << 2))
+    native_offsets = (tile_m[:, None] * D + (local_m[:, None] << 1) + d_swizzled[None, :]).to(tl.int32)
+    native_offsets = tl.max_contiguous(native_offsets, [1, 4])
+    # Reading the swizzled accumulator needs native MFMA ownership, but this
+    # requirement may remain soft and be absorbed by layout propagation.
+    native_offsets = tlx.require_layout(native_offsets, native_layout, pin=False)
+    values = tlx.buffer_load(DQ_ACC, native_offsets, contiguity=4)
+    # Keep this one hard: softening the native-to-store conversion makes the
+    # current compiler materialize the transpose through 32 KiB of LDS.
+    values = tlx.require_layout(values, store_layout, pin=True)
+
+    store_m = tile_m_base + tl.arange(0, BLOCK_M)
+    store_d = tl.arange(0, D)
+    store_offsets = (store_m[:, None] * D + store_d[None, :]).to(tl.int32)
+    tl.store(DQ + store_offsets, values)
+
+
+@triton.jit
+def _attn_bwd_dq_native_planes2_convert_kernel(
+    DQ_ACC,
+    DQ,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    PLANE_ELEMENTS: tl.constexpr,
+):
+    """Merge native dQ storage and round the logical output to BF16."""
+    native_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (256, 512, 1024, 8, 2, 2048, 16, 32),
+            (1, 128, 4, 64, 4096, 8192),
+        ),
+    )
+    store_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (256, 512, 1024, 8, 128, 2048, 16, 32),
+            (1, 2, 4, 64, 4096, 8192),
+        ),
+    )
+    pid_m = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    max_buffer_elements: tl.constexpr = (1 << 30) - 1
+    head_fits_buffer: tl.constexpr = N * D <= max_buffer_elements
+    tensor_base = batch_head.to(tl.int64) * N * D
+    if head_fits_buffer:
+        tile_m_base = pid_m * BLOCK_M
+    else:
+        tensor_base += pid_m.to(tl.int64) * BLOCK_M * D
+        tile_m_base = 0
+    DQ_ACC = DQ_ACC + tensor_base
+    DQ = DQ + tensor_base
+    native_m = tile_m_base + tl.arange(0, BLOCK_M)
+    native_d = tl.arange(0, D)
+    local_m = native_m & 15
+    tile_m = native_m - local_m
+    d_swizzled = ((native_d & 1)
+                  | ((native_d & 2) << 6)
+                  | ((native_d & 12) << 3)
+                  | ((native_d & 48) << 5)
+                  | ((native_d & 64) << 2))
+    native_offsets = (tile_m[:, None] * D + (local_m[:, None] << 1) + d_swizzled[None, :]).to(tl.int32)
+    native_offsets = tl.max_contiguous(native_offsets, [1, 4])
+    # Reading the swizzled accumulator needs native MFMA ownership, but this
+    # requirement may remain soft and be absorbed by layout propagation.
+    native_offsets = tlx.require_layout(native_offsets, native_layout, pin=False)
+    values = tlx.buffer_load(DQ_ACC, native_offsets, contiguity=4).to(tl.float32)
+    for plane in tl.static_range(1, 2):
+        plane_base = tl.full((), plane * PLANE_ELEMENTS, tl.int64)
+        values += tlx.buffer_load(DQ_ACC + plane_base, native_offsets, contiguity=4).to(tl.float32)
+    # Preserve the existing logical output layout contract.
+    values = tlx.require_layout(values, store_layout, pin=True)
+
+    store_m = tile_m_base + tl.arange(0, BLOCK_M)
+    store_d = tl.arange(0, D)
+    store_offsets = (store_m[:, None] * D + store_d[None, :]).to(tl.int32)
+    tl.store(DQ + store_offsets, values.to(tl.bfloat16))
+
+
+@triton.jit
+def _attn_bwd_gqa_bm32_front(
+    dv,
+    q_slice,
+    do_slice,
+    k_buffer,
+    v_operand,
+    ds_stage,
+    lse_values,
+    delta_values,
+    pid_n,
+    step,
+    SM_SCALE: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    MMA_NM: tl.constexpr,
+    MMA_ND: tl.constexpr,
+    K_NM_LAYOUT: tl.constexpr,
+    QT_LAYOUT: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    UPDATE_DV_FIRST_HALF: tl.constexpr = True,
+    PIN_FRONT: tl.constexpr = True,
+):
+    """Publish current dS to LDS and optionally update the first dV fragments."""
+    dv = tlx.require_layout(dv, MMA_ND, pin=False)
+    v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
+    k_nm = tlx.local_load(
+        k_buffer,
+        layout=K_NM_LAYOUT,
+        relaxed=True,
+    )
+    q_t = tlx.local_load(
+        tlx.local_trans(q_slice),
+        layout=QT_LAYOUT,
+        relaxed=True,
+    )
+    scores = tl.dot(
+        k_nm,
+        q_t,
+        tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
+    )
+    if PIN_FRONT:
+        scores = tlx.amd_register_resident(scores, register_class="vgpr", registers_per_group=16)
+    if IS_CAUSAL:
+        # Mask after scaling so custom zero or negative scales cannot turn an
+        # invalid raw-score sentinel into a NaN or a finite probability.
+        lse_log2 = tl.inline_asm_elementwise(
+            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+            "=v,v",
+            [lse_values],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        lse_full = tlx.require_layout(
+            tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
+            MMA_NM,
+            pin=False,
+        )
+        scale_full = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                SM_SCALE * 1.4426950408889634,
+                tl.float32,
+            ),
+            MMA_NM,
+            pin=False,
+        )
+        scaled_scores = scores * scale_full - lse_full
+        n_m_blocks: tl.constexpr = N // BLOCK_M
+        m_block = step % n_m_blocks
+        query_fragment = m_block - pid_n * (BLOCK_N // BLOCK_M)
+        if query_fragment < BLOCK_N // BLOCK_M:
+            offs_n = pid_n * BLOCK_N + tlx.rematerialized_range(0, BLOCK_N, 32, placement=step)
+            offs_m = m_block * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
+            valid = offs_n[:, None] <= offs_m[None, :]
+            valid = tlx.require_layout(valid, MMA_NM, pin=False)
+            neg_inf = tlx.require_layout(
+                tl.full((BLOCK_N, BLOCK_M), float("-inf"), dtype=tl.float32),
+                MMA_NM,
+                pin=False,
+            )
+            scaled_scores = tl.where(valid, scaled_scores, neg_inf)
+            scaled_scores = tlx.require_layout(scaled_scores, MMA_NM, pin=False)
+    do_t = tlx.local_load(
+        tlx.local_trans(do_slice),
+        layout=QT_LAYOUT,
+        relaxed=True,
+    )
+    dp = tl.dot(
+        v_operand,
+        do_t,
+        tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
+    )
+    if PIN_FRONT:
+        dp = tlx.amd_register_resident(dp, register_class="vgpr", registers_per_group=16)
+
+    if not IS_CAUSAL:
+        # Keep LSE scaling on an independent scalar VALU chain.  Broadcasting
+        # the multiply lets LLVM pair an LSE lane with a score fragment in a
+        # packed multiply and creates a false cross-fragment dependency.
+        lse_log2 = tl.inline_asm_elementwise(
+            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+            "=v,v",
+            [lse_values],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        # These are soft requirements. Layout propagation does not yet infer
+        # the score MFMA layout for broadcast/full operands from elementwise users.
+        lse_full = tlx.require_layout(
+            tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
+            MMA_NM,
+            pin=False,
+        )
+        scale_full = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                SM_SCALE * 1.4426950408889634,
+                tl.float32,
+            ),
+            MMA_NM,
+            pin=False,
+        )
+        scaled_scores = scores * scale_full - lse_full
+    p = tl.math.exp2(scaled_scores)
+    delta_full = tlx.require_layout(
+        tl.broadcast_to(delta_values[None, :], (BLOCK_N, BLOCK_M)),
+        MMA_NM,
+        pin=False,
+    )
+    ds = p * (dp - delta_full)
+
+    p_nd = tl.reshape(p.to(tl.bfloat16), (2, 2, 2, 2, 16, BLOCK_M))
+    p_nd = tl.permute(p_nd, (0, 2, 3, 1, 4, 5))
+    p_nd = tl.reshape(p_nd, (BLOCK_N, BLOCK_M))
+    p_nd = tlx.require_layout(p_nd, P_ND_LAYOUT, pin=False)
+    do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
+    if UPDATE_DV_FIRST_HALF:
+        dv = _attn_bwd_opt_gqa_dv_fragmented_half(
+            p_nd,
+            do_out,
+            dv,
+            MMA_ND,
+            P_ND_LAYOUT,
+            Q_OUT_LAYOUT,
+            True,
+        )
+
+    ds_bf16 = ds.to(tl.bfloat16)
+    tlx.local_store(ds_stage, tl.trans(ds_bf16))
+    ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
+    ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
+    ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
+    ds_nd = tlx.require_layout(ds_nd, P_ND_LAYOUT, pin=False)
+    return dv, ds_nd, q_slice, p_nd, do_out
+
+
+@triton.jit
+def _attn_bwd_gqa_bm32_dq_prefetched(
+    prev_ds,
+    ds0,
+    ds1,
+    k_buffer,
+    k_resident_lo,
+    k_resident_mid,
+    k_resident_band6,
+    v_resident,
+    MMA_MD: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    K_MD_LAYOUT: tl.constexpr,
+    V_LAYOUT: tl.constexpr,
+    COORDINATE_GROUP: tl.constexpr = None,
+):
+    """Reduce eight K32 bands into one32x128 native dQ chain."""
+    ds0 = tlx.require_layout(ds0, DS_MD_LAYOUT, pin=False)
+    ds1 = tlx.require_layout(ds1, DS_MD_LAYOUT, pin=False)
+    k_resident_lo = tlx.require_layout(k_resident_lo, K_MD_LAYOUT, pin=False)
+    k_resident_mid = tlx.require_layout(k_resident_mid, K_MD_LAYOUT, pin=False)
+    k_resident_band6 = tlx.require_layout(k_resident_band6, K_MD_LAYOUT, pin=False)
+    v_resident = tlx.require_layout(v_resident, V_LAYOUT, pin=False)
+    dq = tlx.zeros((32, 128), tl.float32, layout=MMA_MD)
+    k0 = tlx.extract_slice(k_resident_lo, [32, 128], [0, 0])
+    dq = tlx.amd_scheduled_mfma(ds0, k0, dq, resident_operand=1, accumulator_role="transient", initialize=True)
+    k1 = tlx.extract_slice(k_resident_lo, [32, 128], [32, 0])
+    dq = tlx.amd_scheduled_mfma(ds1, k1, dq, resident_operand=1, accumulator_role="transient")
+    ds2 = tlx.local_load(tlx.local_slice(prev_ds, [0, 64], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
+                         rematerialize_coordinates_group=COORDINATE_GROUP)
+    k2 = tlx.extract_slice(k_resident_lo, [32, 128], [64, 0])
+    dq = tlx.amd_scheduled_mfma(ds2, k2, dq, resident_operand=1, accumulator_role="transient")
+    ds3 = tlx.local_load(tlx.local_slice(prev_ds, [0, 96], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
+                         rematerialize_coordinates_group=COORDINATE_GROUP)
+    k3 = tlx.extract_slice(k_resident_lo, [32, 128], [96, 0])
+    dq = tlx.amd_scheduled_mfma(ds3, k3, dq, resident_operand=1, accumulator_role="transient")
+    ds4 = tlx.local_load(tlx.local_slice(prev_ds, [0, 128], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
+                         rematerialize_coordinates_group=COORDINATE_GROUP)
+    k4 = tlx.local_load(tlx.local_slice(k_buffer, [128, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                        rematerialize_coordinates_group=COORDINATE_GROUP)
+    dq = tlx.amd_scheduled_mfma(ds4, k4, dq, resident_operand=1, accumulator_role="transient")
+    ds5 = tlx.local_load(tlx.local_slice(prev_ds, [0, 160], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
+                         rematerialize_coordinates_group=COORDINATE_GROUP)
+    k5 = tlx.local_load(tlx.local_slice(k_buffer, [160, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                        rematerialize_coordinates_group=COORDINATE_GROUP)
+    dq = tlx.amd_scheduled_mfma(ds5, k5, dq, resident_operand=1, accumulator_role="transient")
+    ds6 = tlx.local_load(tlx.local_slice(prev_ds, [0, 192], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
+                         rematerialize_coordinates_group=COORDINATE_GROUP)
+    k6 = tlx.local_load(tlx.local_slice(k_buffer, [192, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                        rematerialize_coordinates_group=COORDINATE_GROUP)
+    dq = tlx.amd_scheduled_mfma(ds6, k6, dq, resident_operand=1, accumulator_role="transient")
+    ds7 = tlx.local_load(tlx.local_slice(prev_ds, [0, 224], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
+                         rematerialize_coordinates_group=COORDINATE_GROUP)
+    k7 = tlx.local_load(tlx.local_slice(k_buffer, [224, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                        rematerialize_coordinates_group=COORDINATE_GROUP)
+    dq = tlx.amd_scheduled_mfma(ds7, k7, dq, resident_operand=1, accumulator_role="transient")
+    dq, v_resident = tlx.amd_mfma_commit((dq, ), v_resident)
+    return tlx.require_layout(dq, MMA_MD, pin=False), v_resident
+
+
+@triton.jit
+def _attn_bwd_gqa_bm32_dq(
+    prev_ds,
+    k_buffer,
+    k_resident_lo,
+    k_resident_mid,
+    k_resident_band6,
+    v_resident,
+    MMA_MD: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    K_MD_LAYOUT: tl.constexpr,
+    V_LAYOUT: tl.constexpr,
+    COORDINATE_GROUP: tl.constexpr = None,
+):
+    """Drain entry when no dK work is available to hide the first dS reads."""
+    ds0 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 0], [32, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    ds1 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 32], [32, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
+    )
+    return _attn_bwd_gqa_bm32_dq_prefetched(
+        prev_ds,
+        ds0,
+        ds1,
+        k_buffer,
+        k_resident_lo,
+        k_resident_mid,
+        k_resident_band6,
+        v_resident,
+        MMA_MD,
+        DS_MD_LAYOUT,
+        K_MD_LAYOUT,
+        V_LAYOUT,
+        COORDINATE_GROUP,
+    )
+
+
+@triton.jit
+def _attn_bwd_gqa_bm32_bridge_prefetch2(
+    prev_ds,
+    k_buffer,
+    k_resident_lo,
+    k_resident_mid,
+    k_resident_band6,
+    v_resident,
+    dk_lhs,
+    dk_rhs,
+    dk,
+    MMA_ND: tl.constexpr,
+    MMA_MD: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    K_MD_LAYOUT: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    V_LAYOUT: tl.constexpr,
+    FRAGMENT_CHAIN: tl.constexpr = False,
+):
+    """Alternate eight independent dK fragments with ascending previous-dQ bands."""
+    dk_lhs = tlx.require_layout(dk_lhs, P_ND_LAYOUT, pin=False)
+    dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
+    if not FRAGMENT_CHAIN:
+        dk = tlx.require_layout(dk, MMA_ND, pin=False)
+    k_resident_lo = tlx.require_layout(k_resident_lo, K_MD_LAYOUT, pin=False)
+    v_resident = tlx.require_layout(v_resident, V_LAYOUT, pin=False)
+    lhs0 = tlx.extract_slice(dk_lhs, [128, 32], [0, 0])
+    lhs1 = tlx.extract_slice(dk_lhs, [128, 32], [128, 0])
+    dq = tlx.zeros((32, 128), tl.float32, layout=MMA_MD)
+    rhs0 = tlx.extract_slice(dk_rhs, [32, 32], [0, 0])
+    rhs1 = tlx.extract_slice(dk_rhs, [32, 32], [0, 32])
+    rhs2 = tlx.extract_slice(dk_rhs, [32, 32], [0, 64])
+    rhs3 = tlx.extract_slice(dk_rhs, [32, 32], [0, 96])
+    if FRAGMENT_CHAIN:
+        c00, c10, c01, c11, c02, c12, c03, c13 = dk
+        c00 = tlx.require_layout(c00, MMA_ND, pin=False)
+        c10 = tlx.require_layout(c10, MMA_ND, pin=False)
+        c01 = tlx.require_layout(c01, MMA_ND, pin=False)
+        c11 = tlx.require_layout(c11, MMA_ND, pin=False)
+        c02 = tlx.require_layout(c02, MMA_ND, pin=False)
+        c12 = tlx.require_layout(c12, MMA_ND, pin=False)
+        c03 = tlx.require_layout(c03, MMA_ND, pin=False)
+        c13 = tlx.require_layout(c13, MMA_ND, pin=False)
+    else:
+        c00 = tlx.extract_slice(dk, [128, 32], [0, 0])
+        c10 = tlx.extract_slice(dk, [128, 32], [128, 0])
+        c01 = tlx.extract_slice(dk, [128, 32], [0, 32])
+        c11 = tlx.extract_slice(dk, [128, 32], [128, 32])
+        c02 = tlx.extract_slice(dk, [128, 32], [0, 64])
+        c12 = tlx.extract_slice(dk, [128, 32], [128, 64])
+        c03 = tlx.extract_slice(dk, [128, 32], [0, 96])
+        c13 = tlx.extract_slice(dk, [128, 32], [128, 96])
+    ds0 = tlx.local_load(tlx.local_slice(prev_ds, [0, 0], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    k0 = tlx.extract_slice(k_resident_lo, [32, 128], [0, 0])
+    ds1 = tlx.local_load(tlx.local_slice(prev_ds, [0, 32], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    k1 = tlx.extract_slice(k_resident_lo, [32, 128], [32, 0])
+    ds2 = tlx.local_load(tlx.local_slice(prev_ds, [0, 64], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    k2 = tlx.extract_slice(k_resident_lo, [32, 128], [64, 0])
+    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent")
+    dq = tlx.amd_scheduled_mfma(ds0, k0, dq, resident_operand=1, accumulator_role="transient", initialize=True)
+    ds3 = tlx.local_load(tlx.local_slice(prev_ds, [0, 96], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    k3 = tlx.extract_slice(k_resident_lo, [32, 128], [96, 0])
+    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent")
+    dq = tlx.amd_scheduled_mfma(ds1, k1, dq, resident_operand=1, accumulator_role="transient")
+    ds4 = tlx.local_load(tlx.local_slice(prev_ds, [0, 128], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    k4 = tlx.local_load(tlx.local_slice(k_buffer, [128, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent")
+    dq = tlx.amd_scheduled_mfma(ds2, k2, dq, resident_operand=1, accumulator_role="transient")
+    ds5 = tlx.local_load(tlx.local_slice(prev_ds, [0, 160], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    k5 = tlx.local_load(tlx.local_slice(k_buffer, [160, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent")
+    dq = tlx.amd_scheduled_mfma(ds3, k3, dq, resident_operand=1, accumulator_role="transient")
+    ds6 = tlx.local_load(tlx.local_slice(prev_ds, [0, 192], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    k6 = tlx.local_load(tlx.local_slice(k_buffer, [192, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent")
+    dq = tlx.amd_scheduled_mfma(ds4, k4, dq, resident_operand=1, accumulator_role="transient")
+    ds7 = tlx.local_load(tlx.local_slice(prev_ds, [0, 224], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
+    k7 = tlx.local_load(tlx.local_slice(k_buffer, [224, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent")
+    dq = tlx.amd_scheduled_mfma(ds5, k5, dq, resident_operand=1, accumulator_role="transient")
+    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator_role="persistent")
+    dq = tlx.amd_scheduled_mfma(ds6, k6, dq, resident_operand=1, accumulator_role="transient")
+    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator_role="persistent")
+    dq = tlx.amd_scheduled_mfma(ds7, k7, dq, resident_operand=1, accumulator_role="transient")
+    if not FRAGMENT_CHAIN:
+        c00, c10, c01, c11, c02, c12, c03, c13 = tlx.amd_mfma_commit((c00, c10, c01, c11, c02, c12, c03, c13))
+    dq, v_resident = tlx.amd_mfma_commit((dq, ), v_resident)
+    if FRAGMENT_CHAIN:
+        new_dk = (c00, c10, c01, c11, c02, c12, c03, c13)
+    else:
+        dk0 = tl.cat(tl.cat(c00, c01, dim=1), tl.cat(c02, c03, dim=1), dim=1)
+        dk1 = tl.cat(tl.cat(c10, c11, dim=1), tl.cat(c12, c13, dim=1), dim=1)
+        new_dk = tlx.require_layout(tl.cat(dk0, dk1, dim=0), MMA_ND, pin=False)
+    dq = tlx.require_layout(dq, MMA_MD, pin=False)
+    return new_dk, dq, v_resident
+
+
+@triton.jit
+def _attn_bwd_gqa_bm32_bridge(
+    prev_ds,
+    k_buffer,
+    k_resident_lo,
+    k_resident_mid,
+    k_resident_band6,
+    v_resident,
+    dk_lhs,
+    dk_rhs,
+    dk,
+    MMA_ND: tl.constexpr,
+    MMA_MD: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    K_MD_LAYOUT: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    V_LAYOUT: tl.constexpr,
+    FRAGMENT_CHAIN: tl.constexpr = False,
+):
+    """Interleave independent current-dK and previous-dQ chains."""
+    new_dk, ds0, ds1 = _attn_bwd_opt_gqa_dk_fragmented_prefetch(
+        dk_lhs,
+        dk_rhs,
+        dk,
+        prev_ds,
+        MMA_ND,
+        P_ND_LAYOUT,
+        Q_OUT_LAYOUT,
+        DS_MD_LAYOUT,
+        FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+    )
+    dq, v_resident = _attn_bwd_gqa_bm32_dq_prefetched(
+        prev_ds,
+        ds0,
+        ds1,
+        k_buffer,
+        k_resident_lo,
+        k_resident_mid,
+        k_resident_band6,
+        v_resident,
+        MMA_MD,
+        DS_MD_LAYOUT,
+        K_MD_LAYOUT,
+        V_LAYOUT,
+    )
+    return new_dk, dq, v_resident
+
+
+@triton.jit
+def _attn_bwd_gqa_bm32_issue_qdo_slice_async(q_dst, do_dst, lse_dst, delta_dst, Q, DO, LSE, Delta, off_h_kv, outer_step,
+                                             phase, HQ: tl.constexpr, HK: tl.constexpr, N: tl.constexpr,
+                                             D: tl.constexpr, Q_BATCH_FITS_BUFFER: tl.constexpr):
+    # Both phases finish current-slice reads at a pre-overwriteCTA; phase0
+    # adds this fence before its bridge. EndDSCTAs remain. Slices are disjoint.
+    q_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((8, 16, 32, 128, 64, 512, 256, 1024), (1, 2, 4, 2048)),
+    )
+    stats_layout: tl.constexpr = tlx.layout(shape=((64, 4), ()), stride=((1, 0), ()))
+    n_outer: tl.constexpr = N // 64
+    total: tl.constexpr = (HQ // HK) * n_outer
+    future = outer_step % total
+    off_h_q = off_h_kv * (HQ // HK) + future // n_outer
+    row = (future % n_outer) * 64 + phase * 32
+    rr = tl.arange(0, 32)
+    dd = tl.arange(0, D)
+    if Q_BATCH_FITS_BUFFER:
+        q_offsets = ((off_h_q * N + row + rr[:, None]) * D + dd[None, :]).to(tl.int32)
+    else:
+        tile_base = (off_h_q.to(tl.int64) * N + row) * D
+        stats_base = off_h_q.to(tl.int64) * N + row - phase * 32
+        Q = tl.multiple_of(Q + tile_base, 16)
+        DO = tl.multiple_of(DO + tile_base, 16)
+        LSE = tl.multiple_of(LSE + stats_base, 16)
+        Delta = tl.multiple_of(Delta + stats_base, 16)
+        q_offsets = (rr[:, None] * D + dd[None, :]).to(tl.int32)
+    q_offsets = tlx.require_layout(q_offsets, q_layout, pin=False)
+    tq = tlx.buffer_load_to_local(q_dst, Q, q_offsets)
+    tdo = tlx.buffer_load_to_local(do_dst, DO, q_offsets)
+    if phase == 1:
+        if Q_BATCH_FITS_BUFFER:
+            stats_offsets = (off_h_q * N + row - phase * 32 + tl.arange(0, 64)).to(tl.int32)
+        else:
+            stats_offsets = tl.arange(0, 64).to(tl.int32)
+        stats_offsets = tlx.require_layout(stats_offsets, stats_layout, pin=False)
+        tlse = tlx.buffer_load_to_local(lse_dst, LSE, stats_offsets)
+        td = tlx.buffer_load_to_local(delta_dst, Delta, stats_offsets)
+        tlx.async_load_commit_group([tq, tdo, tlse, td])
+    else:
+        tlx.async_load_commit_group([tq, tdo])
+
+
+@triton.jit
+def _attn_bwd_gqa_bm32_phase(
+    q_tiles,
+    do_tiles,
+    lse_tiles,
+    delta_tiles,
+    ds_buffers,
+    k_buffer,
+    k_resident_lo,
+    k_resident_mid,
+    k_resident_band6,
+    v_operand,
+    dk,
+    dv,
+    DQ_ACC,
+    off_h_kv,
+    pid_n,
+    outer_step,
+    phase,
+    dq_step_floor,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    MMA_NM: tl.constexpr,
+    MMA_ND: tl.constexpr,
+    MMA_MD: tl.constexpr,
+    K_NM_LAYOUT: tl.constexpr,
+    QT_LAYOUT: tl.constexpr,
+    P_ND_LAYOUT: tl.constexpr,
+    Q_OUT_LAYOUT: tl.constexpr,
+    DS_MD_LAYOUT: tl.constexpr,
+    K_MD_LAYOUT: tl.constexpr,
+    DIRECT_DK: tl.constexpr,
+    REDIRECT_DUMMY_DQ: tl.constexpr,
+    Q_BATCH_FITS_BUFFER: tl.constexpr,
+    Q,
+    DO,
+    LSE,
+    Delta,
+    q_outer,
+    do_outer,
+    lse_outer,
+    delta_outer,
+    outer_refill_step,
+    outer_has_next,
+    ASYNC_LAYOUT: tl.constexpr,
+    STATS_ASYNC_LAYOUT: tl.constexpr,
+    REFILL: tl.constexpr,
+    REFILL_IS_STATIC: tl.constexpr = False,
+    REFILL_HAS_NEXT: tl.constexpr = False,
+    SKIP_DUMMY_DQ: tl.constexpr = False,
+    FRAGMENT_CHAIN: tl.constexpr = False,
+):
+    """Run one absolute outer-step phase with direct dK or the lagged bridge.
+
+    ``REDIRECT_DUMMY_DQ`` keeps the first phase seeded zero dS contribution
+    within this owner query interval before a real previous phase exists.
+    """
+    tl.static_assert(not (DIRECT_DK and REDIRECT_DUMMY_DQ))
+    tl.static_assert(not (DIRECT_DK and FRAGMENT_CHAIN))
+    tl.static_assert(not SKIP_DUMMY_DQ or (REDIRECT_DUMMY_DQ and not DIRECT_DK))
+    if N == 16384 and phase == 0:
+        tlx.amd_iglp_opt(2)
+    step = outer_step * 2 + phase
+    cur_stage = step % 2
+    q_slice, do_slice = _attn_bwd_gqa_load_qdo_slice(
+        q_tiles,
+        do_tiles,
+        phase,
+    )
+    # Re-anchor lane/warp coordinates at the adjacent statistics loads and
+    # share the copy. The group number is only a local equivalence tag, not a
+    # tuning parameter. Entry coordinates otherwise cross the register-heavy
+    # phase; rematerializing each load independently duplicates the anchors.
+    stats_coordinate_group: tl.constexpr = 20
+    lse_values = tlx.local_load(
+        tlx.local_view(lse_tiles, phase),
+        relaxed=True,
+        rematerialize_coordinates_group=stats_coordinate_group,
+    )
+    delta_values = tlx.local_load(
+        tlx.local_view(delta_tiles, phase),
+        relaxed=True,
+        rematerialize_coordinates_group=stats_coordinate_group,
+    )
+    dv, dk_lhs, dk_rhs, dv_lhs, dv_rhs = _attn_bwd_gqa_bm32_front(
+        dv,
+        q_slice,
+        do_slice,
+        k_buffer,
+        v_operand,
+        tlx.local_view(ds_buffers, cur_stage),
+        lse_values,
+        delta_values,
+        pid_n,
+        step,
+        SM_SCALE,
+        N,
+        BLOCK_M,
+        BLOCK_N,
+        IS_CAUSAL,
+        MMA_NM,
+        MMA_ND,
+        K_NM_LAYOUT,
+        QT_LAYOUT,
+        P_ND_LAYOUT,
+        Q_OUT_LAYOUT,
+        PIN_FRONT=HQ == HK,
+    )
+    dv = _attn_bwd_opt_gqa_dv_fragmented_half(
+        dv_lhs,
+        dv_rhs,
+        dv,
+        MMA_ND,
+        P_ND_LAYOUT,
+        Q_OUT_LAYOUT,
+        False,
+    )
+    dk_rhs = tlx.local_load(dk_rhs, layout=Q_OUT_LAYOUT, relaxed=True)
+    dk_rhs = tlx.amd_register_resident(dk_rhs, register_class="vgpr", registers_per_group=4)
+    if N == 16384:
+        if REFILL_HAS_NEXT if REFILL_IS_STATIC else outer_has_next:
+            # Each current Q/dO/stat operand is in registers. Publish dS and
+            # finish these reads before the next producer reuses this half.
+            # Phase0 adds this fence; all existing endDS barriers remain.
+            tl.debug_barrier()
+            _attn_bwd_gqa_bm32_issue_qdo_slice_async(
+                q_slice,
+                do_slice,
+                lse_outer,
+                delta_outer,
+                Q,
+                DO,
+                LSE,
+                Delta,
+                off_h_kv,
+                outer_refill_step,
+                phase,
+                HQ,
+                HK,
+                N,
+                D,
+                Q_BATCH_FITS_BUFFER,
+            )
+    else:
+        if REFILL:
+            if outer_has_next:
+                # Each warp has loaded the final current Q/dO operands. Synchronize
+                # their shared-memory reads before the next producers reuse storage.
+                tl.debug_barrier()
+                _attn_bwd_gqa_issue_qdo_async(
+                    q_outer,
+                    do_outer,
+                    lse_outer,
+                    delta_outer,
+                    Q,
+                    DO,
+                    LSE,
+                    Delta,
+                    off_h_kv,
+                    pid_n,
+                    outer_refill_step,
+                    HQ,
+                    HK,
+                    N,
+                    D,
+                    BLOCK_M,
+                    BLOCK_N,
+                    64,
+                    ASYNC_LAYOUT,
+                    STATS_ASYNC_LAYOUT,
+                    Q_BATCH_FITS_BUFFER,
+                    IS_CAUSAL,
+                )
+    if DIRECT_DK:
+        dk_lhs = tlx.require_layout(dk_lhs, P_ND_LAYOUT, pin=False)
+        dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
+        dk = tlx.require_layout(dk, MMA_ND, pin=False)
+        dk = tl.dot(dk_lhs, dk_rhs, dk)
+        dk = tlx.require_layout(dk, MMA_ND, pin=False)
+    else:
+        prev_stage = 1 - cur_stage
+        if SKIP_DUMMY_DQ:
+            # Keep the query32 dK updates unchanged.
+            # Omit the initial known-zero dQ and its redirected atomic.
+            dk, unused_ds0, unused_ds1 = _attn_bwd_opt_gqa_dk_fragmented_prefetch(
+                dk_lhs,
+                dk_rhs,
+                dk,
+                tlx.local_view(ds_buffers, prev_stage),
+                MMA_ND,
+                P_ND_LAYOUT,
+                Q_OUT_LAYOUT,
+                DS_MD_LAYOUT,
+                FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+            )
+        else:
+            if N == 16384 and HQ == 8 * HK:
+                dk, dq, v_operand = _attn_bwd_gqa_bm32_bridge_prefetch2(
+                    tlx.local_view(ds_buffers, prev_stage),
+                    k_buffer,
+                    k_resident_lo,
+                    k_resident_mid,
+                    k_resident_band6,
+                    v_operand,
+                    dk_lhs,
+                    dk_rhs,
+                    dk,
+                    MMA_ND,
+                    MMA_MD,
+                    DS_MD_LAYOUT,
+                    K_MD_LAYOUT,
+                    P_ND_LAYOUT,
+                    Q_OUT_LAYOUT,
+                    K_NM_LAYOUT,
+                    FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+                )
+            else:
+                dk, dq, v_operand = _attn_bwd_gqa_bm32_bridge(
+                    tlx.local_view(ds_buffers, prev_stage),
+                    k_buffer,
+                    k_resident_lo,
+                    k_resident_mid,
+                    k_resident_band6,
+                    v_operand,
+                    dk_lhs,
+                    dk_rhs,
+                    dk,
+                    MMA_ND,
+                    MMA_MD,
+                    DS_MD_LAYOUT,
+                    K_MD_LAYOUT,
+                    P_ND_LAYOUT,
+                    Q_OUT_LAYOUT,
+                    K_NM_LAYOUT,
+                    FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+                )
+            if REDIRECT_DUMMY_DQ:
+                # Keep the seeded zero atomic inside this workgroup's interval.
+                dq_step = tl.maximum(step - 1, dq_step_floor)
+            else:
+                dq_step = step - 1
+            _attn_bwd_opt_gqa_store_dq_native(
+                dq,
+                DQ_ACC,
+                off_h_kv,
+                dq_step,
+                SM_SCALE,
+                HQ,
+                HK,
+                N,
+                D,
+                BLOCK_M,
+                MMA_MD,
+                Q_BATCH_FITS_BUFFER,
+            )
+    if not FRAGMENT_CHAIN:
+        dk = tlx.require_layout(dk, MMA_ND, pin=False)
+    dv = tlx.require_layout(dv, MMA_ND, pin=False)
+    v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
+    tl.debug_barrier()
+    return dk, dv, v_operand
+
+
+@triton.jit
+def _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DQ_ACC,
+    DK,
+    DV,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BATCH: tl.constexpr = 1,
+    SPLIT_Q: tl.constexpr = 1,
+):
+    """Four-wave unsplit full GQA backward with one 64-row Q/dO slot."""
+    tl.static_assert(D == 128)
+    tl.static_assert(BLOCK_M == 32)
+    tl.static_assert(HQ > HK and N >= 8192 and SPLIT_Q == 1)
+    tl.static_assert(not IS_CAUSAL)
+    tl.static_assert(BLOCK_N == 256)
+    tl.static_assert(N % 256 == 0)
+    tl.static_assert(HQ % HK == 0)
+
+    # Keep adjacent workgroups on different KV heads for the same batch and
+    # N tile to improve the dQ atomic/cache locality of the GQA bridge.
+    off_h_kv = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    OUTER_M: tl.constexpr = 64
+    n_outer_blocks: tl.constexpr = N // OUTER_M
+    first_outer_block = 0
+    active_outer_blocks = n_outer_blocks - first_outer_block
+    total_outer_steps = (HQ // HK) * active_outer_blocks
+    tl.static_assert(SPLIT_Q >= 1 and SPLIT_Q <= (HQ // HK) * (N // OUTER_M))
+    off_z = tl.program_id(2)
+    outer_start = 0
+    outer_end = total_outer_steps
+    first_dq_step = outer_start * 2
+
+    # AMD buffer instructions use signed 32-bit byte offsets. Rebase every
+    # global tensor to this program's batch with 64-bit pointer arithmetic;
+    # individual Q and KV tiles are rebased again below so large head counts
+    # cannot push a valid access past the 2-GiB buffer-offset boundary.
+    q_batch_base = off_z.to(tl.int64) * HQ * N * D
+    kv_batch_base = off_z.to(tl.int64) * HK * N * D
+    stats_batch_base = off_z.to(tl.int64) * HQ * N
+    Q = Q + q_batch_base
+    DO = DO + q_batch_base
+    DQ_ACC = DQ_ACC + q_batch_base
+    LSE = LSE + stats_batch_base
+    Delta = Delta + stats_batch_base
+
+    # Buffer offsets are signed 32-bit byte offsets. Preserve the original
+    # batch-relative address schedule whenever a complete Q or KV batch fits;
+    # exceptionally large head counts use per-tile 64-bit pointer rebasing.
+    max_bf16_buffer_elements: tl.constexpr = (1 << 30) - 1
+    buffer_base_alignment_bytes: tl.constexpr = 16
+    q_batch_fits_buffer: tl.constexpr = HQ * N * D <= max_bf16_buffer_elements
+    kv_batch_fits_buffer: tl.constexpr = HK * N * D <= max_bf16_buffer_elements
+
+    # Native score/dP, persistent dK/dV, and delayed-dQ ownerships.
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_md: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    k_nm_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    qt_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    p_nd_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=8)
+    q_out_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=8)
+    ds_md_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_md, k_width=8)
+    k_md_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_md, k_width=8)
+
+    # Inverse producer layouts for one 64-row Q/dO outer tile and K tile.
+    qdo_async_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (8, 16, 32, 128, 64, 512, 256, 1024),
+            (1, 2, 4, 2048, 4096),
+        ),
+    )
+    stats_async_layout: tl.constexpr = tlx.layout(
+        shape=((64, 4), ()),
+        stride=((1, 0), ()),
+    )
+    # Native ownership after inverse-rotating the persistent dK/dV MFMA
+    # accumulators.  Store from this layout directly: converting back to the
+    # async-load layout lowers through a full LDS write/read transpose.
+    kv_native_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (128, 256, 512, 1024, 8192, 4, 2048, 4096),
+            (1, 2, 8, 16, 32, 64, 16384),
+        ),
+    )
+
+    qdo_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32), (1024, 16)],
+        [
+            [0, 0, 1],
+            [0, 0, 2],
+            [0, 0, 4],
+            [0, 0, 8],
+            [0, 0, 16],
+            [0, 0, 32],
+            [0, 1, 0],
+            [0, 0, 64],
+            [0, 4, 0],
+            [0, 2, 0],
+            [0, 8, 0],
+            [0, 16, 0],
+            [1, 0, 0],
+        ],
+        [OUTER_M // BLOCK_M, BLOCK_M, D],
+    ))
+    qdo_slice_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32), (1024, 16)],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [1, 0],
+            [0, 64],
+            [4, 0],
+            [2, 0],
+            [8, 0],
+            [16, 0],
+        ],
+        [BLOCK_M, D],
+    ))
+    stats_smem_layout: tl.constexpr = (tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1],
+            [2],
+            [4],
+            [8],
+            [16],
+            [32],
+        ],
+        block_bases=[],
+        alignment=16,
+    ))
+    stats_slice_smem_layout: tl.constexpr = (tlx.shared_linear_layout_encoding(
+        offset_bases=[[1], [2], [4], [8], [16]],
+        block_bases=[],
+        alignment=16,
+    ))
+    ds_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)],
+        [
+            [1, 0],
+            [2, 0],
+            [0, 1],
+            [0, 2],
+            [4, 0],
+            [0, 8],
+            [8, 0],
+            [0, 32],
+            [0, 16],
+            [0, 4],
+            [0, 64],
+            [0, 128],
+            [16, 0],
+        ],
+        [BLOCK_M, BLOCK_N],
+    ))
+    # Preserve the existing TLX physical K image: a direct-to-LDS rank-3
+    # producer is reinterpreted as the bank-rotated rank-2 dQ consumer.
+    k_raw_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 0, 1],
+            [0, 0, 2],
+            [0, 0, 4],
+            [0, 1, 0],
+            [0, 2, 0],
+            [0, 4, 0],
+            [0, 8, 0],
+            [1, 0, 0],
+            [2, 0, 0],
+            [4, 0, 0],
+            [8, 0, 0],
+            [16, 0, 0],
+            [32, 0, 0],
+            [64, 0, 0],
+            [128, 0, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    k_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 64],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 64],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [128, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    k_raw_async_layout: tl.constexpr = tlx.layout(
+        shape=((64, 4), (8, 8, 2)),
+        stride=((8, 512), (1, 2048, 16384)),
+    )
+
+    k_raw_buffer = tlx.local_alloc(
+        (BLOCK_N, D // 8, 8),
+        tl.bfloat16,
+        1,
+        layout=k_raw_smem_layout,
+    )
+    k_buffer = tlx.local_reinterpret(
+        tlx.local_view(k_raw_buffer, 0),
+        tl.bfloat16,
+        [BLOCK_N, D],
+        layout=k_smem_layout,
+    )
+    q_buffers = tlx.local_alloc(
+        (OUTER_M // BLOCK_M, BLOCK_M, D),
+        tl.bfloat16,
+        1,
+        layout=qdo_smem_layout,
+    )
+    do_buffers = tlx.local_alloc(
+        (OUTER_M // BLOCK_M, BLOCK_M, D),
+        tl.bfloat16,
+        1,
+        layout=qdo_smem_layout,
+    )
+    lse_buffers = tlx.local_alloc(
+        (OUTER_M, ),
+        tl.float32,
+        1,
+        layout=stats_smem_layout,
+    )
+    delta_buffers = tlx.local_alloc(
+        (OUTER_M, ),
+        tl.float32,
+        1,
+        layout=stats_smem_layout,
+    )
+    ds_buffers = tlx.local_alloc(
+        (BLOCK_M, BLOCK_N),
+        tl.bfloat16,
+        2,
+        layout=ds_smem_layout,
+    )
+
+    # K direct-to-LDS group.
+    raw_n = tl.arange(0, BLOCK_N)
+    raw_dg = tl.arange(0, D // 8)
+    raw_v = tl.arange(0, 8)
+    k_phys = raw_n[:, None, None] * D + raw_dg[None, :, None] * 8
+    k_d_base = ((k_phys & 0x8) | (((k_phys >> 9) & 0x3) << 4) | ((((k_phys >> 4) ^ (k_phys >> 8)) & 0x1) << 6))
+    k_n = (((k_phys >> 5) & 0x7) | (((k_phys >> 8) & 0x1) << 3) | (((k_phys >> 11) & 0xf) << 4))
+    if kv_batch_fits_buffer:
+        K = K + kv_batch_base
+        V = V + kv_batch_base
+        DK = DK + kv_batch_base
+        DV = DV + kv_batch_base
+        kv_offset_base = off_h_kv * N * D
+        kv_tile_n = pid_n * BLOCK_N
+    else:
+        kv_program_base = kv_batch_base + (off_h_kv.to(tl.int64) * N + pid_n.to(tl.int64) * BLOCK_N) * D
+        # The tile offsets are aligned by D=128 elements. Preserve a concrete
+        # byte-alignment proof so direct-to-LDS vectorization remains legal.
+        K = tl.multiple_of(K + kv_program_base, buffer_base_alignment_bytes)
+        V = tl.multiple_of(V + kv_program_base, buffer_base_alignment_bytes)
+        DK = tl.multiple_of(DK + kv_program_base, buffer_base_alignment_bytes)
+        DV = tl.multiple_of(DV + kv_program_base, buffer_base_alignment_bytes)
+        kv_offset_base = 0
+        kv_tile_n = 0
+    k_offsets = kv_offset_base + (kv_tile_n + k_n) * D + k_d_base + raw_v[None, None, :]
+    k_offsets = tl.multiple_of(k_offsets, [1, 1, 8])
+    k_offsets = tl.max_contiguous(k_offsets, [1, 1, 8])
+    k_offsets = tlx.require_layout(k_offsets.to(tl.int32), k_raw_async_layout, pin=False)
+    k_token = tlx.buffer_load_to_local(tlx.local_view(k_raw_buffer, 0), K, k_offsets)
+    tlx.async_load_commit_group([k_token])
+
+    _attn_bwd_gqa_issue_qdo_async(
+        tlx.local_view(q_buffers, 0),
+        tlx.local_view(do_buffers, 0),
+        tlx.local_view(lse_buffers, 0),
+        tlx.local_view(delta_buffers, 0),
+        Q,
+        DO,
+        LSE,
+        Delta,
+        off_h_kv,
+        pid_n,
+        outer_start,
+        HQ,
+        HK,
+        N,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        OUTER_M,
+        qdo_async_layout,
+        stats_async_layout,
+        q_batch_fits_buffer,
+        IS_CAUSAL,
+    )
+    initial_wait = tlx.async_load_wait_group(0)
+    tl.debug_barrier()
+
+    offs_n = kv_tile_n + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    v_offsets = kv_offset_base + offs_n[:, None] * D + offs_d[None, :]
+    v_offsets = tlx.require_layout(v_offsets.to(tl.int32), k_nm_layout, pin=False)
+    v_operand = tlx.buffer_load(V, v_offsets)
+    v_operand = tlx.require_layout(v_operand, k_nm_layout, pin=False)
+
+    k_resident_lo = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [128, D]), token=initial_wait, layout=k_md_layout,
+                                   relaxed=True)
+    k_resident_mid = k_resident_lo
+    k_resident_band6 = k_resident_lo
+    # Peel the final16K outer so its refill is statically disabled; every
+    # steady outer refills exactly the next64rows before the delayedbridge.
+    PEEL_LAST: tl.constexpr = N == 16384
+    # Keep dK fragments across phases for the two GQA benchmark shapes.
+    FRAGMENT_CHAIN: tl.constexpr = (HQ == 64 and HK == 8 and not IS_CAUSAL and SPLIT_Q == 1
+                                    and ((BATCH == 16 and N == 8192) or (BATCH == 15 and N == 16384)))
+    if FRAGMENT_CHAIN:
+        dk = (
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+            tlx.zeros((128, 32), tl.float32, layout=mma_nd),
+        )
+    else:
+        dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    # Seed previous dS so the first32-row phase can use the steady bridge. The
+    # zero dQ is redirected to the first tile and leaves it unchanged.
+    tlx.local_store(
+        tlx.local_view(ds_buffers, 1),
+        tl.zeros((BLOCK_M, BLOCK_N), tl.bfloat16),
+    )
+    tl.debug_barrier()
+
+    # Carry previous-phase dQ across outer64 boundaries and grouped query heads.
+    PEEL_FIRST: tl.constexpr = N == 16384
+    if PEEL_FIRST:
+        outer_step = outer_start
+        outer_stage = 0
+        group_idx = outer_step // active_outer_blocks
+        outer_block = first_outer_block + outer_step % active_outer_blocks
+        global_outer_step = group_idx * n_outer_blocks + outer_block
+        q_outer = tlx.local_view(q_buffers, outer_stage)
+        do_outer = tlx.local_view(do_buffers, outer_stage)
+        lse_outer = tlx.local_view(lse_buffers, outer_stage)
+        delta_outer = tlx.local_view(delta_buffers, outer_stage)
+        q_tiles = tlx.local_reinterpret(
+            q_outer,
+            tl.bfloat16,
+            [2, BLOCK_M, D],
+            layout=qdo_slice_smem_layout,
+        )
+        do_tiles = tlx.local_reinterpret(
+            do_outer,
+            tl.bfloat16,
+            [2, BLOCK_M, D],
+            layout=qdo_slice_smem_layout,
+        )
+        lse_tiles = tlx.local_reinterpret(
+            lse_outer,
+            tl.float32,
+            [2, BLOCK_M],
+            layout=stats_slice_smem_layout,
+        )
+        delta_tiles = tlx.local_reinterpret(
+            delta_outer,
+            tl.float32,
+            [2, BLOCK_M],
+            layout=stats_slice_smem_layout,
+        )
+        # Phase0 publishes dS slot0 while reducing previous dS slot1 into dQ.
+        seed_phase0: tl.constexpr = 0
+        dk, dv, v_operand = _attn_bwd_gqa_bm32_phase(
+            q_tiles,
+            do_tiles,
+            lse_tiles,
+            delta_tiles,
+            ds_buffers,
+            k_buffer,
+            k_resident_lo,
+            k_resident_mid,
+            k_resident_band6,
+            v_operand,
+            dk,
+            dv,
+            DQ_ACC,
+            off_h_kv,
+            pid_n,
+            global_outer_step,
+            seed_phase0,
+            first_dq_step,
+            SM_SCALE,
+            HQ,
+            HK,
+            N,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            IS_CAUSAL,
+            mma_nm,
+            mma_nd,
+            mma_md,
+            k_nm_layout,
+            qt_layout,
+            p_nd_layout,
+            q_out_layout,
+            ds_md_layout,
+            k_md_layout,
+            False,
+            True,
+            q_batch_fits_buffer,
+            Q,
+            DO,
+            LSE,
+            Delta,
+            q_outer,
+            do_outer,
+            lse_outer,
+            delta_outer,
+            outer_step + 1,
+            outer_step + 1 < outer_end,
+            qdo_async_layout,
+            stats_async_layout,
+            False,
+            PEEL_LAST,
+            True,
+            SKIP_DUMMY_DQ=True,
+            FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+        )
+
+        for phase in tl.static_range(1, 2):
+            dk, dv, v_operand = _attn_bwd_gqa_bm32_phase(
+                q_tiles,
+                do_tiles,
+                lse_tiles,
+                delta_tiles,
+                ds_buffers,
+                k_buffer,
+                k_resident_lo,
+                k_resident_mid,
+                k_resident_band6,
+                v_operand,
+                dk,
+                dv,
+                DQ_ACC,
+                off_h_kv,
+                pid_n,
+                global_outer_step,
+                phase,
+                first_dq_step,
+                SM_SCALE,
+                HQ,
+                HK,
+                N,
+                D,
+                BLOCK_M,
+                BLOCK_N,
+                IS_CAUSAL,
+                mma_nm,
+                mma_nd,
+                mma_md,
+                k_nm_layout,
+                qt_layout,
+                p_nd_layout,
+                q_out_layout,
+                ds_md_layout,
+                k_md_layout,
+                False,
+                False,
+                q_batch_fits_buffer,
+                Q,
+                DO,
+                LSE,
+                Delta,
+                q_outer,
+                do_outer,
+                lse_outer,
+                delta_outer,
+                outer_step + 1,
+                outer_step + 1 < outer_end,
+                qdo_async_layout,
+                stats_async_layout,
+                True,
+                PEEL_LAST,
+                True,
+                FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+            )
+
+        tlx.async_load_wait_group(0)
+        tl.debug_barrier()
+
+    for outer_step in tl.range(outer_start + 1 if PEEL_FIRST else outer_start,
+                               outer_end - 1 if PEEL_LAST else outer_end, loop_unroll_factor=1):
+        outer_stage = 0
+        group_idx = outer_step // active_outer_blocks
+        outer_block = first_outer_block + outer_step % active_outer_blocks
+        global_outer_step = group_idx * n_outer_blocks + outer_block
+        q_outer = tlx.local_view(q_buffers, outer_stage)
+        do_outer = tlx.local_view(do_buffers, outer_stage)
+        lse_outer = tlx.local_view(lse_buffers, outer_stage)
+        delta_outer = tlx.local_view(delta_buffers, outer_stage)
+        q_tiles = tlx.local_reinterpret(
+            q_outer,
+            tl.bfloat16,
+            [2, BLOCK_M, D],
+            layout=qdo_slice_smem_layout,
+        )
+        do_tiles = tlx.local_reinterpret(
+            do_outer,
+            tl.bfloat16,
+            [2, BLOCK_M, D],
+            layout=qdo_slice_smem_layout,
+        )
+        lse_tiles = tlx.local_reinterpret(
+            lse_outer,
+            tl.float32,
+            [2, BLOCK_M],
+            layout=stats_slice_smem_layout,
+        )
+        delta_tiles = tlx.local_reinterpret(
+            delta_outer,
+            tl.float32,
+            [2, BLOCK_M],
+            layout=stats_slice_smem_layout,
+        )
+        # Phase0 publishes dS slot0 while reducing previous dS slot1 into dQ.
+        phase0: tl.constexpr = 0
+        dk, dv, v_operand = _attn_bwd_gqa_bm32_phase(
+            q_tiles,
+            do_tiles,
+            lse_tiles,
+            delta_tiles,
+            ds_buffers,
+            k_buffer,
+            k_resident_lo,
+            k_resident_mid,
+            k_resident_band6,
+            v_operand,
+            dk,
+            dv,
+            DQ_ACC,
+            off_h_kv,
+            pid_n,
+            global_outer_step,
+            phase0,
+            first_dq_step,
+            SM_SCALE,
+            HQ,
+            HK,
+            N,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            IS_CAUSAL,
+            mma_nm,
+            mma_nd,
+            mma_md,
+            k_nm_layout,
+            qt_layout,
+            p_nd_layout,
+            q_out_layout,
+            ds_md_layout,
+            k_md_layout,
+            False,
+            True,
+            q_batch_fits_buffer,
+            Q,
+            DO,
+            LSE,
+            Delta,
+            q_outer,
+            do_outer,
+            lse_outer,
+            delta_outer,
+            outer_step + 1,
+            outer_step + 1 < outer_end,
+            qdo_async_layout,
+            stats_async_layout,
+            False,
+            PEEL_LAST,
+            True,
+            FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+        )
+
+        for phase in tl.static_range(1, 2):
+            dk, dv, v_operand = _attn_bwd_gqa_bm32_phase(
+                q_tiles,
+                do_tiles,
+                lse_tiles,
+                delta_tiles,
+                ds_buffers,
+                k_buffer,
+                k_resident_lo,
+                k_resident_mid,
+                k_resident_band6,
+                v_operand,
+                dk,
+                dv,
+                DQ_ACC,
+                off_h_kv,
+                pid_n,
+                global_outer_step,
+                phase,
+                first_dq_step,
+                SM_SCALE,
+                HQ,
+                HK,
+                N,
+                D,
+                BLOCK_M,
+                BLOCK_N,
+                IS_CAUSAL,
+                mma_nm,
+                mma_nd,
+                mma_md,
+                k_nm_layout,
+                qt_layout,
+                p_nd_layout,
+                q_out_layout,
+                ds_md_layout,
+                k_md_layout,
+                False,
+                False,
+                q_batch_fits_buffer,
+                Q,
+                DO,
+                LSE,
+                Delta,
+                q_outer,
+                do_outer,
+                lse_outer,
+                delta_outer,
+                outer_step + 1,
+                outer_step + 1 < outer_end,
+                qdo_async_layout,
+                stats_async_layout,
+                True,
+                PEEL_LAST,
+                True,
+                FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+            )
+
+        tlx.async_load_wait_group(0)
+        tl.debug_barrier()
+
+    if PEEL_LAST:
+        # All outer64 tiles remain in ascending order. The penultimate
+        # steady outer prepared this final tile and waited before its reads.
+        outer_step = outer_end - 1
+        outer_stage = 0
+        group_idx = outer_step // active_outer_blocks
+        outer_block = first_outer_block + outer_step % active_outer_blocks
+        global_outer_step = group_idx * n_outer_blocks + outer_block
+        q_outer = tlx.local_view(q_buffers, outer_stage)
+        do_outer = tlx.local_view(do_buffers, outer_stage)
+        lse_outer = tlx.local_view(lse_buffers, outer_stage)
+        delta_outer = tlx.local_view(delta_buffers, outer_stage)
+        q_tiles = tlx.local_reinterpret(
+            q_outer,
+            tl.bfloat16,
+            [2, BLOCK_M, D],
+            layout=qdo_slice_smem_layout,
+        )
+        do_tiles = tlx.local_reinterpret(
+            do_outer,
+            tl.bfloat16,
+            [2, BLOCK_M, D],
+            layout=qdo_slice_smem_layout,
+        )
+        lse_tiles = tlx.local_reinterpret(
+            lse_outer,
+            tl.float32,
+            [2, BLOCK_M],
+            layout=stats_slice_smem_layout,
+        )
+        delta_tiles = tlx.local_reinterpret(
+            delta_outer,
+            tl.float32,
+            [2, BLOCK_M],
+            layout=stats_slice_smem_layout,
+        )
+        # Phase0 publishes dS slot0 while reducing previous dS slot1 into dQ.
+        phase0: tl.constexpr = 0
+        dk, dv, v_operand = _attn_bwd_gqa_bm32_phase(
+            q_tiles,
+            do_tiles,
+            lse_tiles,
+            delta_tiles,
+            ds_buffers,
+            k_buffer,
+            k_resident_lo,
+            k_resident_mid,
+            k_resident_band6,
+            v_operand,
+            dk,
+            dv,
+            DQ_ACC,
+            off_h_kv,
+            pid_n,
+            global_outer_step,
+            phase0,
+            first_dq_step,
+            SM_SCALE,
+            HQ,
+            HK,
+            N,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            IS_CAUSAL,
+            mma_nm,
+            mma_nd,
+            mma_md,
+            k_nm_layout,
+            qt_layout,
+            p_nd_layout,
+            q_out_layout,
+            ds_md_layout,
+            k_md_layout,
+            False,
+            True,
+            q_batch_fits_buffer,
+            Q,
+            DO,
+            LSE,
+            Delta,
+            q_outer,
+            do_outer,
+            lse_outer,
+            delta_outer,
+            outer_step + 1,
+            outer_step + 1 < outer_end,
+            qdo_async_layout,
+            stats_async_layout,
+            False,
+            True,
+            False,
+            FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+        )
+
+        for phase in tl.static_range(1, 2):
+            dk, dv, v_operand = _attn_bwd_gqa_bm32_phase(
+                q_tiles,
+                do_tiles,
+                lse_tiles,
+                delta_tiles,
+                ds_buffers,
+                k_buffer,
+                k_resident_lo,
+                k_resident_mid,
+                k_resident_band6,
+                v_operand,
+                dk,
+                dv,
+                DQ_ACC,
+                off_h_kv,
+                pid_n,
+                global_outer_step,
+                phase,
+                first_dq_step,
+                SM_SCALE,
+                HQ,
+                HK,
+                N,
+                D,
+                BLOCK_M,
+                BLOCK_N,
+                IS_CAUSAL,
+                mma_nm,
+                mma_nd,
+                mma_md,
+                k_nm_layout,
+                qt_layout,
+                p_nd_layout,
+                q_out_layout,
+                ds_md_layout,
+                k_md_layout,
+                False,
+                False,
+                q_batch_fits_buffer,
+                Q,
+                DO,
+                LSE,
+                Delta,
+                q_outer,
+                do_outer,
+                lse_outer,
+                delta_outer,
+                outer_step + 1,
+                outer_step + 1 < outer_end,
+                qdo_async_layout,
+                stats_async_layout,
+                True,
+                True,
+                False,
+                FRAGMENT_CHAIN=FRAGMENT_CHAIN,
+            )
+
+        tlx.async_load_wait_group(0)
+        tl.debug_barrier()
+
+    # The final32-row dS tile has no following dK to overlap its dQ chain.
+    dq, v_operand = _attn_bwd_gqa_bm32_dq(
+        tlx.local_view(ds_buffers, 1),
+        k_buffer,
+        k_resident_lo,
+        k_resident_mid,
+        k_resident_band6,
+        v_operand,
+        mma_md,
+        ds_md_layout,
+        k_md_layout,
+        k_nm_layout,
+        None,
+    )
+    _attn_bwd_opt_gqa_store_dq_native(
+        dq,
+        DQ_ACC,
+        off_h_kv,
+        outer_end * 2 - 1,
+        SM_SCALE,
+        HQ,
+        HK,
+        N,
+        D,
+        BLOCK_M,
+        mma_md,
+        q_batch_fits_buffer,
+    )
+    tlx.async_load_wait_group(0)
+
+    if FRAGMENT_CHAIN:
+        # Commit all eight FP32 dK fragments before the output store.
+        c00, c10, c01, c11, c02, c12, c03, c13 = tlx.amd_mfma_commit(dk)
+        row0 = tl.cat(tl.cat(c00, c01, dim=1), tl.cat(c02, c03, dim=1), dim=1)
+        row1 = tl.cat(tl.cat(c10, c11, dim=1), tl.cat(c12, c13, dim=1), dim=1)
+        dk = tlx.require_layout(tl.cat(row0, row1, dim=0), mma_nd, pin=False)
+
+    # Store the unique dK/dV tile after every query head in the group has
+    # contributed.
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    dk = tl.reshape(dk, (2, 2, 2, 2, 16, D))
+    dk = tl.permute(dk, (0, 3, 1, 2, 4, 5))
+    dk = tl.reshape(dk, (BLOCK_N, D))
+    dk = tlx.require_layout(dk, kv_native_layout, pin=False)
+    dk = dk * SM_SCALE
+    store_n = kv_tile_n + tlx.rematerialized_range(0, BLOCK_N, 30)
+    store_d = tlx.rematerialized_range(0, D, 31)
+    key_offsets = kv_offset_base + store_n[:, None] * D + store_d[None, :]
+    key_offsets = tlx.require_layout(key_offsets.to(tl.int32), kv_native_layout, pin=False)
+    tlx.buffer_store(dk.to(tl.bfloat16), DK, key_offsets)
+
+    # dK is dead before constructing the dV view, so its temporary registers
+    # are available to the dV epilogue.
+    dv = tl.reshape(dv, (2, 2, 2, 2, 16, D))
+    dv = tl.permute(dv, (0, 3, 1, 2, 4, 5))
+    dv = tl.reshape(dv, (BLOCK_N, D))
+    dv = tlx.require_layout(dv, kv_native_layout, pin=False)
+    tlx.buffer_store(dv.to(tl.bfloat16), DV, key_offsets)
+
+
+@triton.jit
+def _attn_bwd_split_q_reduce_kernel(
+    DK_PARTIAL,
+    DV_PARTIAL,
+    DK,
+    DV,
+    ELEMENTS: tl.constexpr,
+    SPLIT_Q: tl.constexpr,
+    BLOCK: tl.constexpr,
+    SPLIT_BLOCK: tl.constexpr,
+):
+    """Combine FP32 partials, rounding dK/dV only after all splits contribute."""
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    dk = tl.full((BLOCK, ), 0, tl.float32)
+    dv = tl.full((BLOCK, ), 0, tl.float32)
+    # Bound register use even for one-outer-tile chunks at long sequence lengths.
+    for start in range(tl.cdiv(SPLIT_Q, SPLIT_BLOCK)):
+        splits = start * SPLIT_BLOCK + tl.arange(0, SPLIT_BLOCK)
+        partial_offsets = splits.to(tl.int64)[:, None] * ELEMENTS + offsets[None, :]
+        mask = (splits[:, None] < SPLIT_Q) & (offsets[None, :] < ELEMENTS)
+        dk += tl.sum(tl.load(DK_PARTIAL + partial_offsets, mask=mask, other=0), axis=0)
+        dv += tl.sum(tl.load(DV_PARTIAL + partial_offsets, mask=mask, other=0), axis=0)
+    tl.store(DK + offsets, dk, offsets < ELEMENTS)
+    tl.store(DV + offsets, dv, offsets < ELEMENTS)
+
+
+def _validate_split_q(split_q, total_outer_steps=None):
+    if isinstance(split_q, bool) or not isinstance(split_q, int) or split_q < 1:
+        raise ValueError("split_q must be a positive integer")
+    if total_outer_steps is not None and split_q > total_outer_steps:
+        raise ValueError(f"split_q must be <= {total_outer_steps} outer64 steps")
+
+
+def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_q=None):
+    """Resolve a manual split or the conservative automatic schedule."""
+    if shape is not None and not _is_supported_gqa_shape(shape):
+        raise ValueError("split-query dispatch requires a supported D128 GQA shape")
+    total_outer_steps = None if shape is None else (shape[1] // shape[2]) * (shape[3] // 64)
+    if split_q is None:
+        split_q = 1
+        if shape is not None and not causal:
+            batch, hq, hk, n_ctx, head_dim = shape
+            base_workgroups = batch * hk * triton.cdiv(n_ctx, 256)
+            # Measured sparse grids benefit from about 256 workgroups. Limit
+            # automatic splitting to the measured occupancy range and bound
+            # the two FP32 partial-gradient buffers to 64 MiB. Keep at least
+            # four outer64 iterations per split to amortize launch/reduction work.
+            if base_workgroups <= 64:
+                target_workgroups = 256
+                max_splits = 32
+                max_workspace_bytes = 64 * 1024 * 1024
+                bytes_per_split = 2 * batch * hk * n_ctx * head_dim * 4
+                split_q = max(
+                    1,
+                    min(
+                        triton.cdiv(target_workgroups, base_workgroups),
+                        max_splits,
+                        max(1, total_outer_steps // 4),
+                        max_workspace_bytes // bytes_per_split,
+                    ))
+    _validate_split_q(split_q, total_outer_steps)
+    if causal and split_q != 1:
+        raise ValueError("split_q > 1 requires non-causal D128 attention")
+    long_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] >= 8192 and split_q == 1)
+    short_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] <= 4096 and split_q == 1)
+    long_8k = long_gqa and shape[3] == 8192
+    precise_mha16k = shape == (16, 16, 16, 16384, 128) and not causal and split_q == 1
+    regalloc = _d128_regalloc_options()
+    # Short GQA and the measured 16K MHA shape disable instruction sinking.
+    # The 8K GQA schedule also disables reverse assignment.
+    # Explicit environment overrides remain independent.
+    reverse_default = "0" if causal or long_8k else "1"
+    sink_default = "0" if (short_gqa or long_8k or
+                           (shape == (16, 16, 16, 16384, 128) and not causal and split_q == 1)) else "1"
+    regalloc["reverse_local_assignment"] = os.environ.get(_D128_REVERSE_LOCAL_ENV, reverse_default) == "1"
+    regalloc["sink_insts_to_avoid_spills"] = os.environ.get(_D128_SINK_INSTS_ENV, sink_default) == "1"
+    return _D128InterleavedDispatch(
+        main_entry=(_attn_bwd_dkdv_dq_d128_gqa_bm32_kernel
+                    if long_gqa else _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel),
+        block_m=32 if long_gqa else 16,
+        block_n=256,
+        num_warps=4,
+        num_stages=1,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        convert_entry=(_attn_bwd_dq_native_planes2_convert_kernel
+                       if precise_mha16k else _attn_bwd_dq_native_optimized_convert_kernel),
+        convert_block_m=128,
+        convert_num_warps=4,
+        split_q=split_q,
+        **regalloc,
+    )
+
+
+def _run_bwd_d128_gqa_optimized(
+    q,
+    k,
+    v,
+    do,
+    lse,
+    delta,
+    dq_acc,
+    dq,
+    dk,
+    dv,
+    sm_scale,
+    causal,
+    split_q=1,
+):
+    batch, hq, n_ctx, head_dim = q.shape
+    hk = k.shape[1]
+    assert _is_supported_gqa_shape((batch, hq, hk, n_ctx, head_dim))
+    dispatch = _select_optimized_d128_interleaved_dispatch((batch, hq, hk, n_ctx, head_dim), causal, split_q)
+    split_q = dispatch.split_q
+    precise_mha16k = dispatch.convert_entry is _attn_bwd_dq_native_planes2_convert_kernel
+    expected_shape = (2, *q.shape) if precise_mha16k else tuple(q.shape)
+    expected_dtype = q.dtype
+    if (tuple(dq_acc.shape) != expected_shape or dq_acc.dtype != expected_dtype or dq_acc.device != q.device
+            or not dq_acc.is_contiguous()):
+        raise ValueError("dQ accumulator shape, dtype, device, or strides do not match dispatch")
+    if split_q == 1:
+        dk_partial, dv_partial = dk, dv
+    else:
+        partial_shape = (split_q, batch, hk, n_ctx, head_dim)
+        dk_partial = torch.empty(partial_shape, device=q.device, dtype=torch.float32)
+        dv_partial = torch.empty_like(dk_partial)
+    dispatch.main_entry[(hk, triton.cdiv(n_ctx, dispatch.block_n), batch * split_q)](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dq_acc,
+        dk_partial,
+        dv_partial,
+        SM_SCALE=sm_scale,
+        BATCH=batch,
+        SPLIT_Q=split_q,
+        IS_CAUSAL=causal,
+        HQ=hq,
+        HK=hk,
+        N=n_ctx,
+        D=head_dim,
+        BLOCK_M=dispatch.block_m,
+        BLOCK_N=dispatch.block_n,
+        num_warps=dispatch.num_warps,
+        num_stages=dispatch.num_stages,
+        matrix_instr_nonkdim=dispatch.matrix_instr_nonkdim,
+        # The source bridge directly emits fragmented persistent current-dK
+        # and transient delayed-dQ MFMAs. The chains read different alternating
+        # dS stages, so they are independent and can be interleaved. No TTGIR
+        # dot preset is needed because the bridge contains scheduled fragments
+        # rather than a pair of ordinary tt.dot operations.
+        # Interleaved sinking is enabled by default; the environment can
+        # override it independently of the other register-allocation options.
+        reverse_local_assignment=dispatch.reverse_local_assignment,
+        sink_insts_to_avoid_spills=dispatch.sink_insts_to_avoid_spills,
+        regclass_priority_trumps_globalness=dispatch.regclass_priority_trumps_globalness,
+    )
+    if split_q > 1:
+        elements = batch * hk * n_ctx * head_dim
+        _attn_bwd_split_q_reduce_kernel[(triton.cdiv(elements, 1024), )](
+            dk_partial,
+            dv_partial,
+            dk,
+            dv,
+            ELEMENTS=elements,
+            SPLIT_Q=split_q,
+            BLOCK=1024,
+            SPLIT_BLOCK=min(16, triton.next_power_of_2(split_q)),
+            num_warps=4,
+        )
+    convert_kwargs = ({"PLANE_ELEMENTS": batch * hq * n_ctx * head_dim} if precise_mha16k else {})
+    dispatch.convert_entry[(triton.cdiv(n_ctx, dispatch.convert_block_m), batch * hq)](
+        dq_acc,
+        dq,
+        N=n_ctx,
+        D=head_dim,
+        BLOCK_M=dispatch.convert_block_m,
+        num_warps=dispatch.convert_num_warps,
+        matrix_instr_nonkdim=dispatch.matrix_instr_nonkdim,
+        **convert_kwargs,
+    )
+
+
+_PR2709_OPTIMIZED_SHAPES = frozenset({
+    (16, 64, 8, 1024, 128),
+    (16, 64, 8, 2048, 128),
+    (16, 64, 8, 4096, 128),
+    (16, 64, 8, 8192, 128),
+    (15, 64, 8, 16384, 128),
+    (16, 16, 16, 1024, 128),
+    (16, 16, 16, 2048, 128),
+    (16, 16, 16, 4096, 128),
+    (16, 16, 16, 8192, 128),
+    (16, 16, 16, 16384, 128),
+})
+
+
+def _select_d128_interleaved_dispatch(q_shape=None, k_shape=None, causal=False, *, split_q=None):
+    """Select optimized dense shapes and preserve the original fallback routes."""
+    if split_q is not None:
+        _validate_split_q(split_q)
+    shape = None
+    if q_shape is not None and k_shape is not None:
+        q_shape, k_shape = tuple(q_shape), tuple(k_shape)
+        if len(q_shape) == 4 and len(k_shape) == 4 and k_shape[0] == q_shape[0] and k_shape[2:] == q_shape[2:]:
+            shape = (q_shape[0], q_shape[1], k_shape[1], q_shape[2], q_shape[3])
+    supported = shape is not None and _is_supported_gqa_shape(shape)
+    sparse_grid = supported and shape[0] * shape[2] * triton.cdiv(shape[3], 256) <= 64
+    if supported and not causal and (split_q is not None or shape in _PR2709_OPTIMIZED_SHAPES or sparse_grid):
+        return _select_optimized_d128_interleaved_dispatch(shape, causal, split_q)
+    if split_q is not None and split_q != 1:
+        raise ValueError("split_q > 1 requires non-causal D128 attention")
+    return _select_original_d128_interleaved_dispatch(q_shape, k_shape, causal)
+
+
+def _allocate_dq_accumulator(q, k, causal=False, split_q=None):
+    """Allocate the storage required by the selected conversion kernel."""
+    dispatch = _select_d128_interleaved_dispatch(q.shape, k.shape, causal, split_q=split_q)
+    if dispatch.convert_entry is _attn_bwd_dq_native_planes2_convert_kernel:
+        return torch.zeros((2, *q.shape), device=q.device, dtype=q.dtype)
+    return torch.zeros_like(q)
+
+
+def _run_bwd_d128_gqa(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, causal, split_q=None):
+    dispatch = _select_d128_interleaved_dispatch(q.shape, k.shape, causal, split_q=split_q)
+    expected_shape = ((2, *q.shape)
+                      if dispatch.convert_entry is _attn_bwd_dq_native_planes2_convert_kernel else tuple(q.shape))
+    if (tuple(dq_acc.shape) != expected_shape or dq_acc.dtype != q.dtype or dq_acc.device != q.device
+            or not dq_acc.is_contiguous()):
+        raise ValueError("dQ accumulator shape, dtype, device, or strides do not match dispatch")
+    if dispatch.main_entry in (_attn_bwd_dkdv_dq_d128_gqa_optimized_kernel, _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel):
+        return _run_bwd_d128_gqa_optimized(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, causal,
+                                           dispatch.split_q)
+    return _run_bwd_d128_gqa_original(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, causal)
 
 
 def _validate_d64_sm_scale(sm_scale):
