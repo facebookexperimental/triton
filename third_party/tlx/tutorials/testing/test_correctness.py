@@ -78,6 +78,10 @@ from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (
     matmul as _amd_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel_split_m import (
     matmul as _amd_gemm_pingpong, )
+from triton.language.extra.tlx.tutorials.amd_bmm import (
+    bmm as _amd_bmm,
+    make_bmm_inputs as _amd_bmm_inputs,
+)
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     matmul as _amd_mxfp_gemm_tdm_pipelined,
     pack_scale as _amd_mxfp_pack_scale,
@@ -1517,6 +1521,21 @@ def test_amd_gemm_pingpong(dtype):
 def test_amd_gemm_pipelined(dtype):
     # Autotuned kernel: no fixed config (config=None).
     Gemm.run_test(_amd_gemm_pipelined, None, dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires AMD gfx950 (CDNA4)")
+def test_amd_bmm(dtype):
+    # a16w16 batched GEMM (col-major B). Covers both load paths of the single kernel:
+    # aligned K (K % 32 == 0) -> direct-to-LDS; odd / unaligned K -> register path.
+    # K=264 is the boundary case: 8-aligned but NOT BLOCK_K-aligned, so it must take
+    # the register path -- the direct path does no K-tail masking and would over-read.
+    for M, N, K, B in [(256, 256, 256, 8), (395, 256, 320, 8), (262, 256, 294, 8), (176, 256, 257, 8),
+                       (256, 256, 264, 8)]:
+        a, b = _amd_bmm_inputs(B, M, N, K, DEVICE, dtype=dtype)
+        out = _amd_bmm(a, b)
+        ref = torch.bmm(a, b)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
 # =============================================================================
