@@ -703,6 +703,34 @@ class TestTLXTemplates(TestCase):
             self.assertFalse(heuristic.should_run(_KernelInputs()))
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("mode", ("allow", "force"))
+    @parametrize("shape,strides,accepted", (
+        ((37, 192, 129), ((192, 1), (1, 192)), False),
+        ((37, 192, 129), ((192, 1), (129, 1)), False),
+        ((37, 192, 192), ((1, 37), (192, 1)), False),
+        ((192, 258, 192), ((1, 192), (192, 1)), True),
+        ((37, 192, 192), ((192, 1), (1, 192)), True),
+    ))
+    def test_tlx_matmul_ws_tma_alignment(self, mode, shape, strides, accepted):
+        from torch._inductor.kernel_inputs import MMKernelInputs
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        m, k, n = shape
+        device = torch.device("cuda")
+        inputs = MMKernelInputs([
+            ir.Buffer(name="a", layout=ir.FixedLayout(device, torch.bfloat16, [m, k], strides[0])),
+            ir.Buffer(name="b", layout=ir.FixedLayout(device, torch.bfloat16, [k, n], strides[1])),
+        ])
+        graph = mock.Mock(sizevars=SizeVarAllocator(), unaligned_buffers=set())
+        heuristic = object.__new__(_tlx_registry.BlackwellGemmWSConfigHeuristic)
+        with (
+                V.set_graph_handler(graph),
+                mock.patch("torch.utils._triton.has_triton_tma_device", return_value=True),
+                config.patch({"triton.tlx_mode": mode}),
+        ):
+            self.assertEqual(heuristic.should_run(inputs), accepted)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_amd_mm_template_is_registered_once(self):
         from torch._inductor.kernel.mm import mm_template
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
@@ -937,6 +965,73 @@ class TestTLXTemplates(TestCase):
             # Non-split-K configs use TMA epilogue stores when SMEM permits;
             # 1-CTA configs may fall back to tl.store if TMA doesn't fit.
             pass  # Both TMA and tl.store paths are valid
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("shape,layout,mode", (
+        ((37, 192, 129), "nn", "allow"),
+        ((37, 192, 129), "nt", "allow"),
+        ((192, 258, 192), "tn", "allow"),
+        ((192, 258, 192), "tn", "force"),
+    ))
+    def test_tlx_matmul_ws_selce_shapes(self, mode, shape, layout):
+        m, k, n = shape
+        a = (torch.randn(k, m, device=GPU_TYPE, dtype=torch.bfloat16).t() if layout[0] == "t" else torch.randn(
+            m, k, device=GPU_TYPE, dtype=torch.bfloat16))
+        b = (torch.randn(n, k, device=GPU_TYPE, dtype=torch.bfloat16).t() if layout[1] == "t" else torch.randn(
+            k, n, device=GPU_TYPE, dtype=torch.bfloat16))
+        expected = (a.float() @ b.float()).to(torch.bfloat16)
+
+        with config.patch({
+                "triton.tlx_mode": mode,
+                "force_disable_caches": True,
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
+
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        if mode == "force":
+            self.assertIn("triton_tem_fused_tlx_mm", "\n".join(code))
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_matmul_ws_small_m_configs(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        heuristic = _tlx_registry.BlackwellGemmWSConfigHeuristic
+        get_configs = heuristic._get_template_configs_impl
+        configs = []
+
+        def capture_configs(instance, kernel_inputs, op_name):
+            for kwargs in get_configs(instance, kernel_inputs, op_name):
+                configs.append(kwargs)
+                yield kwargs
+
+        a = torch.randn(37, 192, device=GPU_TYPE, dtype=torch.bfloat16)
+        b = torch.randn(192, 192, device=GPU_TYPE, dtype=torch.bfloat16).t()
+        expected = (a.float() @ b.float()).to(torch.bfloat16)
+        with (
+                config.patch({
+                    "triton.tlx_mode": "allow",
+                    "force_disable_caches": True,
+                    "enable_caching_generated_triton_templates": False,
+                }),
+                tlx_config.patch(use_heuristic_config=False),
+                mock.patch.object(heuristic, "_get_template_configs_impl", capture_configs),
+        ):
+            actual, _ = run_and_get_code(torch.compile(torch.mm), a, b)
+
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertTrue(configs)
+        self.assertTrue(any(kwargs["BLOCK_M"] == 64 for kwargs in configs))
+        for kwargs in configs:
+            self.assertIn(kwargs["BLOCK_M_SPLIT"], (64, 128), kwargs)
 
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
@@ -4006,7 +4101,10 @@ class TestResourceModel(TestCase):
 
         rules = BLACKWELL_WS_GEMM.check_tile_rules
         self.assertTrue(rules(self._tile()))
-        # Rule 1: more than 128 rows per MMA group.
+        self.assertTrue(rules(self._tile(block_m=64)))
+        self.assertTrue(rules(self._tile(block_m=128, num_mma_groups=2)))
+        self.assertFalse(rules(self._tile(block_m=64, num_mma_groups=2)))
+        self.assertFalse(rules(self._tile(block_m=32)))
         self.assertFalse(rules(self._tile(block_m=256)))
         # Rule 1b: pair-CTA MMA requires exactly 128 rows per group.
         self.assertFalse(rules(self._tile(block_m=128, num_mma_groups=2, num_ctas=2)))
