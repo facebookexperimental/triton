@@ -11,22 +11,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-TLX HSTU cross attention targeting the gfx950 (AMD MI350X) architecture.
+"""gfx950 HSTU cross attention -- the ``tlx.ops.hstu_cross_attn`` backend.
 
-Standalone OSS copy of the Hammer v2 kernel at D120435766. The kernel and
-variant bodies are preserved; only fbcode imports and custom-op dispatch are
-replaced with sibling tutorial helpers and a direct Python call.
+Promoted from ``tutorials/hstu_cross_attn`` together with the optimizations
+made to the kernel after that snapshot:
 
-Extracted from `hammer/v2/ops/triton/template/triton_bw_cross_attention.py`,
-the v3 cross attention kernel; the previous diff landed that as a forward-only,
-TMA-free copy plus deletions. This is the optimization pass: the KV load path
-is staged through LDS, following what D114539697 did to the self attention
-kernel and D118162155 did to the v2 cross attention kernel.
+  - split-KV for launches with too few q tiles to fill the GPU, with a merge
+    kernel that combines the fp32 partials (lse-weighted for softmax, summed
+    for silu), and a split heuristic that counts every (sequence, head) pair
+    as at least one tile;
+  - longest-KV-first launch order and the XCD regroup gate;
+  - KV address arithmetic hoisted out of the KV loop;
+  - 16-byte direct-to-LDS K/V loads for the shared-KV HEAD_DIM=128 path.
 
-The load path is backported from the TLX tutorial
-`third-party/triton/beta/triton/third_party/tlx/tutorials/amd_hstu_attn.py` by
-way of `tlx_gfx950_hstu_attention.py`:
+A lazy softmax rescale is intentionally not included: on gfx950 the
+packed-FP32 subtract it relies on can read a wrong operand while another wave
+on the same SIMD runs ``v_mfma_f32_16x16x32_f16``, producing NaN/Inf rows at
+two waves per SIMD.
+
+The custom ops live in the ``tlx`` namespace, the environment knobs are
+prefixed ``TLX_HSTU_CROSS_ATTN_``, and ``space="smoke"`` selects one config per
+kernel for correctness tests.
+
+Design notes on the forward follow.
+
+The kernel derives from the Triton HSTU cross attention
+(``tutorials/hstu_cross_attn/triton_bw_cross_attention.py``) as a forward-only,
+TMA-free copy, with the KV load path staged through LDS as in the TLX HSTU
+self attention:
 
   - **K and V are staged through LDS.** `lds_k` / `lds_v` are
     `tlx.local_alloc`'d once outside the KV loop; each block runs
@@ -35,16 +47,15 @@ way of `tlx_gfx950_hstu_attention.py`:
     latencies overlap instead of being paid back to back.
   - **K is transposed in LDS.** It is fetched row-major `(BLOCK_N, HEAD_DIM)`
     and transposed with `tlx.local_trans`, a metadata-only view, replacing the
-    register-level `tl.trans(k)`. Note this is a smaller lever here than it was
-    on the v2 kernel: there, K came through a block pointer with
-    `shape=(BLOCK_D_Q, seq_len_kv), strides=(1, stride_kn)`, so the staging
-    also turned a strided transposed global read into a contiguous one. v3
-    already read K contiguously, so what LDS buys on this base is the register
-    round trip, not the access pattern.
+    register-level `tl.trans(k)`. The source already read K contiguously, so
+    what LDS buys here is the register round trip, not the access pattern.
   - **XCD remapping.** The grid becomes 1-D
-    (`cdiv(max_q_len, BLOCK_M) * Z * H`) and `remap_xcd` regroups tiles so they
+    (`cdiv(max_q_len, BLOCK_M) * Z * H`) and, when there are at least 8
+    (sequence, head) pairs per XCD, `remap_xcd` regroups tiles so they
     are contiguous within each of the 8 XCDs instead of round-robin across
-    them. Adds a `MAX_Q_LEN` runtime arg for the in-kernel tile count, and
+    them. With fewer pairs the round-robin order is kept, since grouping
+    whole sequences per XCD then leaves XCDs idle. Adds a `MAX_Q_LEN`
+    runtime arg for the in-kernel tile count, and
     moves the program-id decode out of `_compute_offsets`, which now takes
     `off_z` / `off_h` as arguments.
 
@@ -64,20 +75,44 @@ All 144 configs in the AMD list set it False, so `TRANS=True` was unreachable
 on gfx950, and staging it would have meant a second copy of the load sequence
 for a path nothing selects. `SHARED_KV` and `IS_DYNAMIC` are kept.
 
-`SHARED_KV` no longer specialises the staging. The source reuses the
-register-resident K tile as the PV operand; through LDS that would mean reading
-one `local_alloc` through both a `tlx.local_trans`'d and an untransposed
-consumer, which TLX cannot express -- `TlxPropagateLayout` fails the module. V
-is staged unconditionally instead, and under `SHARED_KV` both copies read one
-address, so the second is an L2 hit rather than a second trip to DRAM. The
-constexpr is left unread here; it stays in the signature for `shared_kv` one
-level up and for the backward port.
+Under `SHARED_KV` the tile is staged once and read back through both
+orientations, so the KV loop issues one `async_load` per block instead of two.
+Layout inference cannot give a single `local_alloc` both a `tlx.local_trans`'d
+and an untransposed consumer -- it widens the two to `UNKNOWN` and
+`TlxPropagateLayout` then fails the module -- so the layout is pinned
+explicitly, which skips inference. A padded layout at `(128, 16)` is what makes
+the pair cheap; the choice is not smooth, and `(128, 4)` is 100% slower while
+intervals below 128 fail to lower at all.
+
+Halving the fetches is not where most of the win is. What the single fetch buys
+is the room to double-buffer: the KV loop keeps two staged tiles and issues the
+fetch for block i+1 before block i's dots, so the global latency overlaps the
+MFMA chain instead of serialising behind it. Single-buffering cannot do that
+here, because under `SHARED_KV` the PV dot reads the same buffer as the QK dot,
+so the tile stays live to the end of the block and `async_load_wait_group(0)`
+has to drain before the next fetch can start. The two buffers put LDS back to
+what the distinct-K/V path already used, so this is not a new occupancy cost.
+
+Double-buffering needs a workgroup barrier per iteration, and it is
+load-bearing rather than defensive: iteration i+1 fetches into the buffer
+iteration i has just finished reading, and waves within the workgroup are free
+to skew, so without the rendezvous a fast wave can overwrite a tile a slow wave
+is still consuming. The tail is drained with an explicit
+`async_load_wait_group(0)` before buffer 0 is reused for the masked last block,
+so the unconsumed prefetch cannot land on top of it.
+
+The pin is gated on `SHARED_KV` because it is a cost on its own: forcing it
+with distinct K and V, where each buffer would otherwise get its own inferred
+layout, measures ~3% slower. Reusing the tile is worth more than that, so the
+two together are a net win -- see the test plan.
 
 Output is no longer bit-identical to the upstream kernel, and cannot be:
 `local_trans` changes the MFMA operand layout, which changes the accumulation
 order.
 """
 
+import functools
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -90,20 +125,13 @@ import triton.language as tl
 
 # @manual=//triton:triton
 import triton.language.extra.tlx as tlx
-from stubs import (
-    autotune_max_seq_len,
-    maybe_register_custom_op,
-    next_power_of_2,
-    triton_autotune,
-)
-from tlx_gfx950_cross_attention_v3_baseline import (
-    _tlx_gfx950_cross_attn_v3_ttgir_bwd, )
-from triton_attention_utils import (
+from ..hstu_attn._stubs import triton_autotune
+from ..hstu_attn._util import (
     backward_softmax_activation_scaled_alpha,
     fast_silu,
     forward_softmax_activation_scaled_alpha,
 )
-from triton_hstu_cross_attention import (
+from ._util import (
     _attn_bwd_preprocess,
     backward_common_preprocess,
     backward_d_silu_activation,
@@ -120,15 +148,97 @@ from triton_hstu_cross_attention import (
 
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
-    """Pack only the innermost dimension without replacing writable outputs."""
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        # Tell Dynamo this data-dependent value is in the range (0, 10**9)
+        torch._check(x.size(0) > 0)
+        torch._check(x.size(0) < 10**9)
     if x.stride(-1) == 1:
         return x
     return x.contiguous()
 
 
+def next_power_of_2(n: int) -> int:
+    """Return the smallest power of 2 greater than or equal to n"""
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    n += 1
+    return n
+
+
+def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
+    # Largest power of 2 <= runtime_max_seq_len (0 stays 0).
+    out = next_power_of_2(runtime_max_seq_len)
+    return out // 2 if out > runtime_max_seq_len else out
+
+
+class _PlainFuncWrapper:
+    """Stand-in for a custom op under AOTI_LOWER, so export traces through it."""
+
+    def __init__(self, func):
+        self._func = func
+        functools.update_wrapper(self, func)
+
+    def __call__(self, *args, **kwargs):
+        return self._func(*args, **kwargs)
+
+    def register_fake(self, fn):
+        return fn
+
+    def register_kernel(self, *args, **kwargs):
+        return lambda fn: fn
+
+
+def maybe_register_custom_op(op_name, mutates_args):
+
+    def decorator(func):
+        if os.environ.get("AOTI_LOWER"):
+            return _PlainFuncWrapper(func)
+        return torch.library.custom_op(op_name, func, mutates_args=mutates_args)
+
+    return decorator
+
+
+# "full" autotunes over the whole config list; "smoke" runs one config per
+# kernel, for correctness tests. Set by `hstu_cross_attn` before each launch.
+_SPACE: str = "full"
+
+
+class _SpaceAutotuner:
+    """Launches the full-space or smoke-space autotuner of one JIT kernel."""
+
+    def __init__(self, full, smoke):
+        self.full = full
+        self.smoke = smoke
+
+    def __getitem__(self, grid):
+        return (self.full if _SPACE == "full" else self.smoke)[grid]
+
+
+def _space_autotune(configs, smoke_configs, key):
+    assert len(smoke_configs) == 1, smoke_configs
+
+    def decorator(fn):
+        return _SpaceAutotuner(
+            triton_autotune(configs=configs, key=key)(fn),
+            triton_autotune(configs=smoke_configs, key=key)(fn),
+        )
+
+    return decorator
+
+
 # MI300X/MI350X expose 8 XCDs; round-robin pid assignment across them hurts L2
 # reuse, so tiles are re-grouped to be contiguous within an XCD.
 NUM_XCDS: tl.constexpr = tl.constexpr(8)
+# Grouping hands each XCD whole (sequence, head) pairs, so with few pairs one
+# long sequence sets the time for its XCD while the others idle. Measured on
+# MI350X: at Z*H <= 32 the regrouped grid is up to 2.3x slower than the
+# round-robin one, at Z*H >= 64 it is up to 1.45x faster.
+MIN_PAIRS_PER_XCD_FOR_REMAP: tl.constexpr = tl.constexpr(8)
 
 # `autotune_max_seq_len` is the wrong quantizer for the q-length autotune key:
 # its runtime path is `prev_power_of_2`, which rounds *down* and so merges
@@ -155,6 +265,71 @@ SPLIT_SOFTMAX_DQ_MATRIX_INSTR_NONKDIM: int = 16
 SPLIT_SOFTMAX_DQ_WAVES_PER_EU: int = 1
 SPLIT_SOFTMAX_DQ_NUM_STAGES: int = 1
 
+# Split-KV: when there are too few q tiles to fill the GPU (e.g. H=1 with a
+# handful of long-KV sequences and ~1 wave of tiles on 256 CUs), each q tile's KV range is
+# split across several programs and their partial results merged afterwards.
+# Splitting is off unless the q tiles fall short of this many waves.
+KV_SPLIT_MIN_TILE_WAVES: int = 2
+# Aim for this many work items per CU once splitting.
+KV_SPLIT_TARGET_ITEMS_PER_CU: int = 4
+# Do not split below this many KV tokens per split: a short split pays the
+# q load, epilogue and partial store for little MFMA work.
+KV_SPLIT_MIN_KV_PER_SPLIT: int = 1024
+KV_SPLIT_MAX_SPLITS: int = 8
+# The split count is chosen for a nominal tile height; the autotuned BLOCK_M
+# only changes how many tiles each split runs over.
+KV_SPLIT_NOMINAL_BLOCK_M: int = 128
+# `auto` (default) uses the heuristic below; an integer forces that many splits
+# (1 disables). For benchmarking and A/B tests.
+KV_SPLITS_ENV: str = "TLX_HSTU_CROSS_ATTN_KV_SPLITS"
+
+# Below the XCD regroup threshold, launch the tiles of the longest-KV
+# sequences first (longest-processing-time order): with ~3 waves of tiles of
+# uneven length, launching in sequence order leaves CUs idle behind the long
+# sequences at the end. Each program ranks the Z KV lengths itself, so the
+# kernel signature is unchanged; needs Z <= SEQ_SORT_MAX_Z. Read once at import.
+SEQ_SORT_MAX_Z: tl.constexpr = tl.constexpr(64)
+# Only with ~2+ waves of programs, where the end-of-launch tail matters; on
+# small launches the ranking is pure overhead (~2% on the production shape).
+SEQ_SORT_MIN_PROGRAMS: tl.constexpr = tl.constexpr(512)
+FWD_SORT_BY_KV: tl.constexpr = tl.constexpr(os.environ.get("TLX_HSTU_CROSS_ATTN_SORT_BY_KV", "1") == "1")
+
+
+@functools.lru_cache(maxsize=None)
+def _num_cus(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _num_kv_splits(
+    device: torch.device,
+    total_q: int,
+    total_kv: int,
+    Z: int,
+    H: int,
+    causal: bool,
+) -> int:
+    # Causal tiles own different KV ranges, and truncation changes each
+    # sequence's KV range; splitting either is not implemented.
+    if causal or Z == 0:
+        return 1
+    env = os.environ.get(KV_SPLITS_ENV, "auto")
+    if env != "auto":
+        return max(1, int(env))
+    num_cus = _num_cus(device.index if device.index is not None else 0)
+    # Every (sequence, head) pair is at least one tile, however short its q:
+    # with many short-q sequences (training: 1024 x 2 pairs, mean q ~16) the
+    # q-token estimate alone undercounts the tiles ~8x and splits a launch
+    # that already fills the GPU (3 splits there cost 11%).
+    tiles = max(triton.cdiv(total_q, KV_SPLIT_NOMINAL_BLOCK_M), Z) * H
+    if tiles >= KV_SPLIT_MIN_TILE_WAVES * num_cus:
+        return 1
+    splits = min(
+        triton.cdiv(KV_SPLIT_TARGET_ITEMS_PER_CU * num_cus, tiles),
+        (total_kv // Z) // KV_SPLIT_MIN_KV_PER_SPLIT,
+        KV_SPLIT_MAX_SPLITS,
+    )
+    return max(1, splits)
+
 
 @triton.jit
 def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr):
@@ -170,6 +345,25 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr):
     else:
         pid = (tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
     return pid
+
+
+@triton.jit
+def _seq_by_kv_rank(rank, Z, seq_offsets):
+    """Index of the sequence with the `rank`-th longest KV (ties by index).
+
+    One scalar pass over the Z lengths with a SEQ_SORT_MAX_Z-wide vector of
+    ranks; a Z x Z comparison tile costs enough registers to slow the main
+    loop of the register-tight configs.
+    """
+    idx = tl.arange(0, SEQ_SORT_MAX_Z)
+    valid = idx < Z
+    length = tl.load(seq_offsets + idx + 1, mask=valid, other=0) - tl.load(seq_offsets + idx, mask=valid, other=0)
+    ranks = tl.zeros([SEQ_SORT_MAX_Z], dtype=tl.int32)
+    for j in range(Z):
+        length_j = tl.load(seq_offsets + j + 1) - tl.load(seq_offsets + j)
+        ahead = (length_j > length) | ((length_j == length) & (j < idx))
+        ranks += ahead.to(tl.int32)
+    return tl.sum(tl.where(valid & (ranks == rank), idx, 0), axis=0)
 
 
 @triton.jit
@@ -206,68 +400,60 @@ def _compute_offsets(
 
 
 @triton.jit
-def _tlx_gfx950_cross_attn_fwd_one_block(
+def _tlx_gfx950_cross_attn_fwd_issue_kv(
+    start_n,
+    seq_len_kv,
+    offs_n_0,
+    K_base,
+    k_offs,
+    stride_kn,
+    buf,
+    MASKED: tl.constexpr,
+):
+    """Issue the async fetch of one KV tile into `buf` and commit it as a group.
+
+    `k_offs` is the tile-relative element offset, built once by the caller, so
+    per tile only the scalar base advances instead of every lane recomputing
+    its address.
+    """
+    k_ptrs = K_base + tl.cast(start_n, tl.int64) * stride_kn + k_offs
+    if MASKED:
+        tok = tlx.async_load(k_ptrs, buf, mask=(offs_n_0 < seq_len_kv - start_n)[:, None])
+    else:
+        tok = tlx.async_load(k_ptrs, buf)
+    tlx.async_load_commit_group([tok])
+
+
+@triton.jit
+def _tlx_gfx950_cross_attn_fwd_consume_kv(
+    wait_tok,
+    k_buf,
+    v_buf,
     start_n,
     seq_len_q,
     seq_len_kv,
     offs_m,
     offs_n_0,
     q,
-    K_base,
-    V_base,
-    stride_kn,
-    stride_vn,
-    lds_k,
-    lds_v,
     acc,
     m_i,
     l_i,
     alpha,
     uih_len_q,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_D_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    SHARED_KV: tl.constexpr,
     IS_SOFTMAX: tl.constexpr,
     MASKED: tl.constexpr,
     HAS_CAUSAL: tl.constexpr,
 ):
-    start_n = tl.multiple_of(start_n, BLOCK_N)
-    offs_n = offs_n_0 + start_n
-    offs_d_q = tl.arange(0, HEAD_DIM)
-    offs_d_v = tl.arange(0, BLOCK_D_V)
-    mask_n = offs_n < seq_len_kv
+    """Both dots for one KV tile.
 
-    # K and V are copied straight into LDS instead of being read into registers
-    # and handed to the MFMA from there. Unlike the self-attention kernel, the
-    # global read this replaces was already contiguous -- v3 fetches K row-major
-    # and transposes in registers -- so what LDS buys here is the register-file
-    # round trip and the `tl.trans`, not a strided access.
-    #
-    # Both copies go into one async group. V's address does not depend on the
-    # QK dot, so issuing it here costs the block one global latency rather than
-    # two. Only the LDS->register read of V is deferred to its use, to keep the
-    # tile out of registers across the activation.
-    k_ptrs = K_base + offs_n.to(tl.int64)[:, None] * stride_kn + offs_d_q[None, :]
-    k_local = tlx.local_view(lds_k, 0)
-    v_local = tlx.local_view(lds_v, 0)
-    # Staged the same way whether or not V aliases K -- see the note on
-    # SHARED_KV in the module docstring.
-    v_ptrs = V_base + offs_n.to(tl.int64)[:, None] * stride_vn + offs_d_v[None, :]
-    if MASKED:
-        tok_k = tlx.async_load(k_ptrs, k_local, mask=mask_n[:, None])
-        tok_v = tlx.async_load(v_ptrs, v_local, mask=mask_n[:, None])
-    else:
-        tok_k = tlx.async_load(k_ptrs, k_local)
-        tok_v = tlx.async_load(v_ptrs, v_local)
-    tlx.async_load_commit_group([tok_k, tok_v])
-    # The wait token is threaded into both `local_load`s below. Without it AMD
-    # lowering keeps its own conservative producer-to-consumer wait-count
-    # tracking on top of this explicit wait.
-    # pyrefly: ignore [bad-argument-type]
-    wait_tok = tlx.async_load_wait_group(0)
-    kt_local = tlx.local_trans(k_local)
+    Under `SHARED_KV` the caller passes the same buffer as `k_buf` and `v_buf`,
+    so the tile is read back through both orientations; on the distinct path
+    they are the two separate staging buffers.
+    """
+    offs_n = offs_n_0 + start_n
+    kt_local = tlx.local_trans(k_buf)
     k_dot_op = tlx.local_load(kt_local, token=wait_tok)
 
     qk = tl.dot(q, k_dot_op)
@@ -275,9 +461,6 @@ def _tlx_gfx950_cross_attn_fwd_one_block(
     if MASKED:
         valid_mask = forward_valid_mask(offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
     elif HAS_CAUSAL:
-        # Interior blocks are wholly inside seq_len_kv, so only the causal cut
-        # can bite. q rows past seq_len_q are left unmasked because the store
-        # and the `M` write are both masked on them.
         shifted_offs_m = offs_m + seq_len_kv - uih_len_q
         valid_mask = shifted_offs_m[:, None] >= offs_n[None, :]
     else:
@@ -291,11 +474,277 @@ def _tlx_gfx950_cross_attn_fwd_one_block(
         # pyrefly: ignore [bad-argument-type]
         act_qk = fast_silu(qk, MULT_BY_X=True)
 
-    v = tlx.local_load(v_local, token=wait_tok)
-
+    v = tlx.local_load(v_buf, token=wait_tok)
     act_qk = act_qk.to(v.dtype)
     acc = tl.dot(act_qk, v, acc)
     return acc, l_i, m_i
+
+
+@triton.jit
+def _tlx_gfx950_cross_attn_fwd_one_block(
+    start_n,
+    seq_len_q,
+    seq_len_kv,
+    offs_m,
+    offs_n_0,
+    q,
+    K_base,
+    V_base,
+    k_offs,
+    v_offs,
+    stride_kn,
+    stride_vn,
+    lds_k,
+    lds_v,
+    acc,
+    m_i,
+    l_i,
+    alpha,
+    uih_len_q,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SHARED_KV: tl.constexpr,
+    IS_SOFTMAX: tl.constexpr,
+    MASKED: tl.constexpr,
+    HAS_CAUSAL: tl.constexpr,
+):
+    start_n = tl.multiple_of(start_n, BLOCK_N)
+    mask_n = offs_n_0 < seq_len_kv - start_n
+
+    # K and V are copied straight into LDS instead of being read into registers
+    # and handed to the MFMA from there. Unlike the self-attention kernel, the
+    # global read this replaces was already contiguous -- the source fetches K row-major
+    # and transposes in registers -- so what LDS buys here is the register-file
+    # round trip and the `tl.trans`, not a strided access.
+    #
+    # Both copies go into one async group. V's address does not depend on the
+    # QK dot, so issuing it here costs the block one global latency rather than
+    # two. Only the LDS->register read of V is deferred to its use, to keep the
+    # tile out of registers across the activation.
+    k_ptrs = K_base + tl.cast(start_n, tl.int64) * stride_kn + k_offs
+    k_local = tlx.local_view(lds_k, 0)
+    v_local = tlx.local_view(lds_v, 0)
+    if SHARED_KV:
+        # V aliases K: fetch the tile once and read it back through two layouts.
+        if MASKED:
+            tok_k = tlx.async_load(k_ptrs, k_local, mask=mask_n[:, None])
+        else:
+            tok_k = tlx.async_load(k_ptrs, k_local)
+        tlx.async_load_commit_group([tok_k])
+    else:
+        v_ptrs = V_base + tl.cast(start_n, tl.int64) * stride_vn + v_offs
+        if MASKED:
+            tok_k = tlx.async_load(k_ptrs, k_local, mask=mask_n[:, None])
+            tok_v = tlx.async_load(v_ptrs, v_local, mask=mask_n[:, None])
+        else:
+            tok_k = tlx.async_load(k_ptrs, k_local)
+            tok_v = tlx.async_load(v_ptrs, v_local)
+        tlx.async_load_commit_group([tok_k, tok_v])
+    # The wait token is threaded into both `local_load`s in the consumer below.
+    # Without it AMD lowering keeps its own conservative producer-to-consumer
+    # wait-count tracking on top of this explicit wait.
+    # pyrefly: ignore [bad-argument-type]
+    wait_tok = tlx.async_load_wait_group(0)
+    if SHARED_KV:
+        v_buf = k_local
+    else:
+        v_buf = v_local
+    return _tlx_gfx950_cross_attn_fwd_consume_kv(
+        wait_tok,
+        k_local,
+        v_buf,
+        start_n,
+        seq_len_q,
+        seq_len_kv,
+        offs_m,
+        offs_n_0,
+        q,
+        acc,
+        m_i,
+        l_i,
+        alpha,
+        uih_len_q,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        IS_SOFTMAX=IS_SOFTMAX,
+        MASKED=MASKED,
+        HAS_CAUSAL=HAS_CAUSAL,
+    )
+
+
+@triton.jit
+def _tlx_gfx950_cross_attn_fwd_issue_distinct_kv(
+    start_n,
+    seq_len_kv,
+    offs_n_0,
+    K_base,
+    V_base,
+    k_offs,
+    v_offs,
+    stride_kn,
+    stride_vn,
+    k_buf,
+    v_buf,
+):
+    # See _issue_kv: the tile-relative offsets are loop invariant.
+    k_ptrs = K_base + tl.cast(start_n, tl.int64) * stride_kn + k_offs
+    v_ptrs = V_base + tl.cast(start_n, tl.int64) * stride_vn + v_offs
+    mask_n = (offs_n_0 < seq_len_kv - start_n)[:, None]
+    tok_k = tlx.async_load(k_ptrs, k_buf, mask=mask_n)
+    tok_v = tlx.async_load(v_ptrs, v_buf, mask=mask_n)
+    tlx.async_load_commit_group([tok_k, tok_v])
+
+
+@triton.jit
+def _tlx_gfx950_cross_attn_fwd_compute_distinct_pipeline(
+    acc,
+    alpha,
+    q,
+    K,
+    V,
+    offs_m,
+    offs_n_0,
+    off_h,
+    off_h_kv,
+    seq_start_kv,
+    seq_len_kv,
+    seq_start_q,
+    seq_len_q,
+    attn_scale,
+    stride_kn,
+    stride_kh,
+    stride_vn,
+    stride_vh,
+    stride_mm,
+    m_i,
+    l_i,
+    M,
+    start_m,
+    uih_len_q,
+    num_softmax_heads: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    SHARED_KV: tl.constexpr,
+    IS_SOFTMAX: tl.constexpr,
+    HAS_CAUSAL: tl.constexpr,
+):
+    # Distinct-KV double-buffered pipeline covering both softmax and silu.
+    # Called only when not SHARED_KV and NUM_STAGES >= 2 (see dispatcher).
+    tl.static_assert(not SHARED_KV)
+    if HAS_CAUSAL:
+        high = start_m + BLOCK_M + seq_len_kv - uih_len_q
+        high = tl.cdiv(min(high, seq_len_kv), BLOCK_N) * BLOCK_N
+        last_block_start_n = tl.maximum(0, (tl.cdiv(high, BLOCK_N) - 1) * BLOCK_N)
+    else:
+        last_block_start_n = tl.maximum(0, (tl.cdiv(seq_len_kv, BLOCK_N) - 1) * BLOCK_N)
+    if IS_SOFTMAX:
+        alpha = alpha * 1.44269504
+    K_base = K + seq_start_kv.to(tl.int64) * stride_kn + off_h_kv * stride_kh
+    V_base = V + seq_start_kv.to(tl.int64) * stride_vn + off_h_kv * stride_vh
+    # Two physical slots, separately inferred per tensor. Selected by
+    # NUM_STAGES >= 2 in the dispatcher; NUM_STAGES == 1 falls through to the
+    # single-buffered _one_block path so stages=1/2 are not duplicates.
+    lds_k = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(K), 2)
+    lds_v = tlx.local_alloc((BLOCK_N, BLOCK_D_V), tlx.dtype_of(V), 2)
+    k_offs = offs_n_0[:, None] * stride_kn + tl.arange(0, HEAD_DIM)[None, :]
+    v_offs = offs_n_0[:, None] * stride_vn + tl.arange(0, BLOCK_D_V)[None, :]
+    _tlx_gfx950_cross_attn_fwd_issue_distinct_kv(
+        0,
+        seq_len_kv,
+        offs_n_0,
+        K_base,
+        V_base,
+        k_offs,
+        v_offs,
+        stride_kn,
+        stride_vn,
+        tlx.local_view(lds_k, 0),
+        tlx.local_view(lds_v, 0),
+    )
+    for start_n in tl.range(0, last_block_start_n, BLOCK_N):
+        slot = (start_n // BLOCK_N) % 2
+        _tlx_gfx950_cross_attn_fwd_issue_distinct_kv(
+            start_n + BLOCK_N,
+            seq_len_kv,
+            offs_n_0,
+            K_base,
+            V_base,
+            k_offs,
+            v_offs,
+            stride_kn,
+            stride_vn,
+            tlx.local_view(lds_k, 1 - slot),
+            tlx.local_view(lds_v, 1 - slot),
+        )
+        wait_tok = tlx.async_load_wait_group(1)
+        acc, l_i, m_i = _tlx_gfx950_cross_attn_fwd_consume_kv(
+            wait_tok,
+            tlx.local_view(lds_k, slot),
+            tlx.local_view(lds_v, slot),
+            start_n,
+            seq_len_q,
+            seq_len_kv,
+            offs_m,
+            offs_n_0,
+            q,
+            acc,
+            m_i,
+            l_i,
+            alpha,
+            uih_len_q,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            IS_SOFTMAX=IS_SOFTMAX,
+            MASKED=False,
+            HAS_CAUSAL=HAS_CAUSAL,
+        )
+        # Readers in every wave must finish before the next slot reuse.
+        tl.debug_barrier()
+    last_slot = (last_block_start_n // BLOCK_N) % 2
+    wait_tok = tlx.async_load_wait_group(0)
+    acc, l_i, m_i = _tlx_gfx950_cross_attn_fwd_consume_kv(
+        wait_tok,
+        tlx.local_view(lds_k, last_slot),
+        tlx.local_view(lds_v, last_slot),
+        last_block_start_n,
+        seq_len_q,
+        seq_len_kv,
+        offs_m,
+        offs_n_0,
+        q,
+        acc,
+        m_i,
+        l_i,
+        alpha,
+        uih_len_q,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        IS_SOFTMAX=IS_SOFTMAX,
+        MASKED=True,
+        HAS_CAUSAL=HAS_CAUSAL,
+    )
+    if IS_SOFTMAX:
+        # Same epilogue as _tlx_gfx950_cross_attn_fwd_compute: normalize by l_i
+        # and publish M. m_i/l_i were threaded through _consume_kv above.
+        acc = forward_epilogue(
+            acc,
+            l_i,
+            m_i,
+            offs_m,
+            seq_start_q,
+            stride_mm,
+            seq_len_q,
+            M,
+            off_h,
+            num_softmax_heads,
+        )
+        return acc
+    # Preserve scalar attn_scale after fp32 PV reduction and before output cast.
+    scale = tl.load(attn_scale).to(tl.float32)
+    return acc * scale
 
 
 @triton.jit
@@ -334,6 +783,47 @@ def _tlx_gfx950_cross_attn_fwd_compute(
     IS_SOFTMAX: tl.constexpr,
     HAS_CAUSAL: tl.constexpr,
 ):
+    # The runtime head branch compiles both specializations, even for zero heads.
+    # Distinct-KV double buffering is selected by NUM_STAGES >= 2 so the
+    # stages=1/2 autotune axis is not a duplicate; single-buffering keeps the
+    # NUM_STAGES == 1 behavior for low-LDS configs.
+    if not SHARED_KV:
+        if NUM_STAGES >= 2:
+            return _tlx_gfx950_cross_attn_fwd_compute_distinct_pipeline(
+                acc,
+                alpha,
+                q,
+                K,
+                V,
+                offs_m,
+                offs_n_0,
+                off_h,
+                off_h_kv,
+                seq_start_kv,
+                seq_len_kv,
+                seq_start_q,
+                seq_len_q,
+                attn_scale,
+                stride_kn,
+                stride_kh,
+                stride_vn,
+                stride_vh,
+                stride_mm,
+                m_i,
+                l_i,
+                M,
+                start_m,
+                uih_len_q,
+                num_softmax_heads,
+                HEAD_DIM,
+                BLOCK_D_V,
+                BLOCK_M,
+                BLOCK_N,
+                NUM_STAGES,
+                SHARED_KV,
+                IS_SOFTMAX,
+                HAS_CAUSAL,
+            )
     if HAS_CAUSAL:
         high = start_m + BLOCK_M + seq_len_kv - uih_len_q
         high = tl.cdiv(min(high, seq_len_kv), BLOCK_N) * BLOCK_N
@@ -349,17 +839,245 @@ def _tlx_gfx950_cross_attn_fwd_compute(
     # rather than repeated per block.
     K_base = K + seq_start_kv.to(tl.int64) * stride_kn + off_h_kv * stride_kh
     V_base = V + seq_start_kv.to(tl.int64) * stride_vn + off_h_kv * stride_vh
+    # Tile-relative element offsets, loop invariant: per KV tile only the
+    # scalar base advances.
+    k_offs = offs_n_0[:, None] * stride_kn + tl.arange(0, HEAD_DIM)[None, :]
+    v_offs = offs_n_0[:, None] * stride_vn + tl.arange(0, BLOCK_D_V)[None, :]
 
-    # Single-buffered LDS staging, reserved once and reused by every KV block.
-    # pyrefly: ignore [bad-argument-type]
-    lds_k = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(K), 1)
-    # pyrefly: ignore [bad-argument-type]
-    lds_v = tlx.local_alloc((BLOCK_N, BLOCK_D_V), tlx.dtype_of(V), 1)
+    # LDS staging, reserved once outside the KV loop. Double-buffered under
+    # SHARED_KV so the next tile's fetch can overlap the current tile's dots;
+    # on the distinct path NUM_STAGES >= 2 takes the double-buffered pipeline
+    # above, while NUM_STAGES == 1 stays single-buffered here.
+    if SHARED_KV:
+        # `lds_v` aliases `lds_k`, which is HEAD_DIM wide, so a narrower
+        # BLOCK_D_V would hand the PV dot a wrong-width operand and corrupt
+        # `acc` silently. The two cannot diverge today -- the wrapper
+        # substitutes `v = k` before the launch, so DimV is DimQ -- but
+        # nothing downstream enforces that, so fail at compile time if it
+        # ever stops being true.
+        tl.static_assert(BLOCK_D_V == HEAD_DIM)
+        # V aliases K, so one buffer serves both dots. That means one
+        # allocation read through two orientations, which layout inference
+        # cannot reconcile, so the layout is pinned explicitly. The pin is
+        # gated on SHARED_KV: with distinct K and V each buffer keeps its own
+        # inferred layout, which is better for them.
+        # The padding interval sets the width of the global->LDS copy: without
+        # direct-to-LDS scatter, padding may only fall between whole wave
+        # writes, so the copy is at most interval / 64 elements per lane.
+        # Padding every 128 elements caps it at 4 bytes; every 512 allows
+        # 16-byte copies (4x fewer loads and address ops per tile). The rows
+        # are permuted (0, 16, 32, 48, 1, ...) as in tlx's gfx950 flash
+        # attention: with identity rows the same 512-element padding measured
+        # 10-25% slower, while this order matches the old layout's LDS bank
+        # conflict counts for both the K^T and the V read of the buffer.
+        if HEAD_DIM == 128:
+            if BLOCK_N == 64:
+                # pyrefly: ignore [missing-attribute]
+                kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+                    [(512, 16)],
+                    [
+                        [0, 1],
+                        [0, 2],
+                        [0, 4],
+                        [0, 8],
+                        [0, 16],
+                        [0, 32],
+                        [0, 64],
+                        [16, 0],
+                        [32, 0],
+                        [1, 0],
+                        [2, 0],
+                        [4, 0],
+                        [8, 0],
+                    ],
+                    [BLOCK_N, HEAD_DIM],
+                )
+            else:
+                tl.static_assert(BLOCK_N == 32)
+                # pyrefly: ignore [missing-attribute]
+                kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+                    [(512, 16)],
+                    [
+                        [0, 1],
+                        [0, 2],
+                        [0, 4],
+                        [0, 8],
+                        [0, 16],
+                        [0, 32],
+                        [0, 64],
+                        [16, 0],
+                        [8, 0],
+                        [1, 0],
+                        [2, 0],
+                        [4, 0],
+                    ],
+                    [BLOCK_N, HEAD_DIM],
+                )
+        else:
+            kv_layout: tl.constexpr = (
+                # pyrefly: ignore [missing-attribute]
+                tlx.padded_shared_layout_encoding.with_identity_for([(128, 16)], [BLOCK_N, HEAD_DIM], [1, 0]))
+        lds_k = tlx.local_alloc(
+            (BLOCK_N, HEAD_DIM),
+            tlx.dtype_of(K),
+            # pyrefly: ignore [bad-argument-type]
+            2,
+            # pyrefly: ignore [bad-argument-type]
+            layout=kv_layout,
+        )
+        lds_v = lds_k
+    else:
+        # pyrefly: ignore [bad-argument-type]
+        lds_k = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(K), 1)
+        # pyrefly: ignore [bad-argument-type]
+        lds_v = tlx.local_alloc((BLOCK_N, BLOCK_D_V), tlx.dtype_of(V), 1)
 
-    # Main loop - no masking needed for non-last kv blocks
-    for start_n in tl.range(0, last_block_start_n, BLOCK_N):
+    if SHARED_KV:
+        # Double-buffered: the fetch for tile i+1 is issued before tile i's
+        # dots, so the global latency overlaps the MFMAs instead of serialising
+        # behind them. Single-buffering cannot do this -- under SHARED_KV the
+        # PV dot reads the same buffer as the QK dot, so the tile is live until
+        # late in the block.
+        #
+        # The barrier is load-bearing, not decorative. Iteration i+1
+        # issues into the buffer iteration i just finished reading, and waves
+        # in the workgroup are free to skew, so without the rendezvous a fast
+        # wave can overwrite a tile a slow wave is still consuming.
+        if last_block_start_n > 0:
+            _tlx_gfx950_cross_attn_fwd_issue_kv(
+                0,
+                seq_len_kv,
+                offs_n_0,
+                K_base,
+                k_offs,
+                stride_kn,
+                tlx.local_view(lds_k, 0),
+                # pyrefly: ignore [bad-argument-type]
+                MASKED=False,
+            )
+        for start_n in tl.range(0, last_block_start_n, BLOCK_N):
+            slot = (start_n // BLOCK_N) % 2
+            # The prefetch is unmasked, so it must never name the last block:
+            # that tile can extend past `seq_len_kv` and the fetch would read
+            # out of bounds. On the tail iteration re-fetch the current block
+            # instead -- interior block starts are wholly inside `seq_len_kv`,
+            # and the copy is discarded either way.
+            nxt_is_interior = start_n + BLOCK_N < last_block_start_n
+            nxt_start = tl.where(nxt_is_interior, start_n + BLOCK_N, start_n)
+            _tlx_gfx950_cross_attn_fwd_issue_kv(
+                nxt_start,
+                seq_len_kv,
+                offs_n_0,
+                K_base,
+                k_offs,
+                stride_kn,
+                tlx.local_view(lds_k, 1 - slot),
+                # pyrefly: ignore [bad-argument-type]
+                MASKED=False,
+            )
+            # One group (the prefetch just issued) may stay outstanding.
+            # pyrefly: ignore [bad-argument-type]
+            wait_tok = tlx.async_load_wait_group(1)
+            acc, l_i, m_i = _tlx_gfx950_cross_attn_fwd_consume_kv(
+                wait_tok,
+                tlx.local_view(lds_k, slot),
+                tlx.local_view(lds_k, slot),
+                start_n,
+                seq_len_q,
+                seq_len_kv,
+                offs_m,
+                offs_n_0,
+                q,
+                acc,
+                m_i,
+                l_i,
+                alpha,
+                uih_len_q,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                IS_SOFTMAX=IS_SOFTMAX,
+                # pyrefly: ignore [bad-argument-type]
+                MASKED=False,
+                HAS_CAUSAL=HAS_CAUSAL,
+            )
+            tl.debug_barrier()
+
+        # Drain the unconsumed tail prefetch before reusing buffer 0, so that
+        # stale copy cannot land on top of the masked tile fetched below.
+        # pyrefly: ignore [bad-argument-type]
+        _ = tlx.async_load_wait_group(0)
+        tl.debug_barrier()
+        _tlx_gfx950_cross_attn_fwd_issue_kv(
+            last_block_start_n,
+            seq_len_kv,
+            offs_n_0,
+            K_base,
+            k_offs,
+            stride_kn,
+            tlx.local_view(lds_k, 0),
+            # pyrefly: ignore [bad-argument-type]
+            MASKED=True,
+        )
+        # pyrefly: ignore [bad-argument-type]
+        wait_tok = tlx.async_load_wait_group(0)
+        acc, l_i, m_i = _tlx_gfx950_cross_attn_fwd_consume_kv(
+            wait_tok,
+            tlx.local_view(lds_k, 0),
+            tlx.local_view(lds_k, 0),
+            last_block_start_n,
+            seq_len_q,
+            seq_len_kv,
+            offs_m,
+            offs_n_0,
+            q,
+            acc,
+            m_i,
+            l_i,
+            alpha,
+            uih_len_q,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            IS_SOFTMAX=IS_SOFTMAX,
+            # pyrefly: ignore [bad-argument-type]
+            MASKED=True,
+            HAS_CAUSAL=HAS_CAUSAL,
+        )
+    else:
+        # Main loop - no masking needed for non-last kv blocks
+        for start_n in tl.range(0, last_block_start_n, BLOCK_N):
+            acc, l_i, m_i = _tlx_gfx950_cross_attn_fwd_one_block(
+                start_n=start_n,
+                seq_len_q=seq_len_q,
+                seq_len_kv=seq_len_kv,
+                offs_m=offs_m,
+                offs_n_0=offs_n_0,
+                q=q,
+                K_base=K_base,
+                V_base=V_base,
+                k_offs=k_offs,
+                v_offs=v_offs,
+                stride_kn=stride_kn,
+                stride_vn=stride_vn,
+                lds_k=lds_k,
+                lds_v=lds_v,
+                acc=acc,
+                m_i=m_i,
+                l_i=l_i,
+                alpha=alpha,
+                uih_len_q=uih_len_q,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                SHARED_KV=SHARED_KV,
+                IS_SOFTMAX=IS_SOFTMAX,
+                # pyrefly: ignore [bad-argument-type]
+                MASKED=False,
+                HAS_CAUSAL=HAS_CAUSAL,
+            )
+
+        # Last kv block - needs masking for out-of-bounds elements;
+        # q masking is not needed here because we mask when storing results.
         acc, l_i, m_i = _tlx_gfx950_cross_attn_fwd_one_block(
-            start_n=start_n,
+            start_n=last_block_start_n,
             seq_len_q=seq_len_q,
             seq_len_kv=seq_len_kv,
             offs_m=offs_m,
@@ -367,6 +1085,8 @@ def _tlx_gfx950_cross_attn_fwd_compute(
             q=q,
             K_base=K_base,
             V_base=V_base,
+            k_offs=k_offs,
+            v_offs=v_offs,
             stride_kn=stride_kn,
             stride_vn=stride_vn,
             lds_k=lds_k,
@@ -376,47 +1096,14 @@ def _tlx_gfx950_cross_attn_fwd_compute(
             l_i=l_i,
             alpha=alpha,
             uih_len_q=uih_len_q,
-            HEAD_DIM=HEAD_DIM,
-            BLOCK_D_V=BLOCK_D_V,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             SHARED_KV=SHARED_KV,
             IS_SOFTMAX=IS_SOFTMAX,
             # pyrefly: ignore [bad-argument-type]
-            MASKED=False,
+            MASKED=True,
             HAS_CAUSAL=HAS_CAUSAL,
         )
-
-    # Last kv block - needs masking for out-of-bounds elements;
-    # q masking is not needed here because we mask when storing results.
-    acc, l_i, m_i = _tlx_gfx950_cross_attn_fwd_one_block(
-        start_n=last_block_start_n,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        offs_m=offs_m,
-        offs_n_0=offs_n_0,
-        q=q,
-        K_base=K_base,
-        V_base=V_base,
-        stride_kn=stride_kn,
-        stride_vn=stride_vn,
-        lds_k=lds_k,
-        lds_v=lds_v,
-        acc=acc,
-        m_i=m_i,
-        l_i=l_i,
-        alpha=alpha,
-        uih_len_q=uih_len_q,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_D_V=BLOCK_D_V,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        SHARED_KV=SHARED_KV,
-        IS_SOFTMAX=IS_SOFTMAX,
-        # pyrefly: ignore [bad-argument-type]
-        MASKED=True,
-        HAS_CAUSAL=HAS_CAUSAL,
-    )
 
     # epilogue
     if IS_SOFTMAX:
@@ -604,8 +1291,17 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
     return configs
 
 
-@triton_autotune(
+def _fwd_smoke_configs() -> List[triton.Config]:
+    return [
+        c for c in get_fwd_triton_spec_configs()
+        if c.kwargs["BLOCK_M"] == 64 and c.kwargs["BLOCK_N"] == 64 and c.num_stages == 1 and c.num_warps == 4
+        and c.kwargs["matrix_instr_nonkdim"] == 16 and c.kwargs["waves_per_eu"] == 2
+    ]
+
+
+@_space_autotune(
     configs=get_fwd_triton_spec_configs(),
+    smoke_configs=_fwd_smoke_configs(),
     key=[
         "AUTOTUNE_Z",
         "HEAD_DIM",
@@ -667,11 +1363,17 @@ def _tlx_gfx950_cross_attn_fwd(
     # workgroups that share K/V across all 8 L2s.
     tpid = tl.program_id(0)
     num_tiles = tl.cdiv(MAX_Q_LEN, BLOCK_M)
-    tpid = remap_xcd(tpid, num_tiles * Z * H, NUM_XCDS)
+    if Z * H >= MIN_PAIRS_PER_XCD_FOR_REMAP * NUM_XCDS:
+        tpid = remap_xcd(tpid, num_tiles * Z * H, NUM_XCDS)
     off_h = tpid % H
     off_nz = tpid // H
     start_m = (off_nz % num_tiles) * BLOCK_M
     off_z = off_nz // num_tiles
+    if FWD_SORT_BY_KV:
+        if Z * H < MIN_PAIRS_PER_XCD_FOR_REMAP * NUM_XCDS:
+            if Z <= SEQ_SORT_MAX_Z:
+                if num_tiles * Z * H >= SEQ_SORT_MIN_PROGRAMS:
+                    off_z = _seq_by_kv_rank(off_z, Z, seq_offsets)
     (
         off_h_kv,
         seq_start_kv,
@@ -771,7 +1473,342 @@ def _tlx_gfx950_cross_attn_fwd(
     )
 
 
-@maybe_register_custom_op("hammer::tlx_gfx950_cross_attn_v2_fwd", mutates_args=())
+@_space_autotune(
+    configs=get_fwd_triton_spec_configs(),
+    smoke_configs=_fwd_smoke_configs(),
+    key=[
+        "AUTOTUNE_Z",
+        "HEAD_DIM",
+        "AUTOTUNE_MAX_Q_LEN",
+        "AUTOTUNE_MAX_SEQ_LEN",
+        "num_softmax_heads",
+        "NUM_SPLITS",
+    ],
+)
+@triton.jit
+def _tlx_gfx950_cross_attn_fwd_split_kv(
+    alpha,
+    Z,
+    H,
+    G,
+    Q,
+    K,
+    V,
+    PartAcc,
+    PartLse,
+    seq_offsets_q,
+    seq_offsets,
+    max_seq_len,
+    attn_scale,
+    stride_qm,
+    stride_qh,
+    stride_kn,
+    stride_kh,
+    stride_vn,
+    stride_vh,
+    stride_ps,
+    stride_pm,
+    stride_ph,
+    stride_ls,
+    stride_lm,
+    NUM_SPLITS,
+    MAX_Q_LEN,
+    AUTOTUNE_Z,
+    AUTOTUNE_MAX_Q_LEN,
+    AUTOTUNE_MAX_SEQ_LEN,
+    num_softmax_heads: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    NUM_STAGES1: tl.constexpr,
+    SHARED_KV: tl.constexpr,
+    IS_DYNAMIC: tl.constexpr,
+    TRUNCATE_METHOD: tl.constexpr,
+):
+    """One q tile over one contiguous KV chunk, non-causal only.
+
+    Writes the chunk's partial result for `_tlx_gfx950_cross_attn_split_kv_merge`:
+    softmax heads store the chunk-normalized output and its log2-sum-exp
+    (the same `m + log2(l)` the unsplit epilogue writes to `M`), silu heads
+    store the scaled partial sum, which is linear in KV. Chunks are a multiple
+    of BLOCK_N, so only the last block of each chunk is masked.
+    """
+    pid = tl.program_id(0)
+    split = pid % NUM_SPLITS
+    tpid = pid // NUM_SPLITS
+    num_tiles = tl.cdiv(MAX_Q_LEN, BLOCK_M)
+    off_h = tpid % H
+    off_nz = tpid // H
+    start_m = (off_nz % num_tiles) * BLOCK_M
+    off_z = off_nz // num_tiles
+    (
+        off_h_kv,
+        seq_start_kv,
+        seq_len_kv,
+        seq_start_q,
+        seq_len_q,
+    ) = _compute_offsets(off_z, off_h, G, seq_offsets_q, seq_offsets, max_seq_len, TRUNCATE_METHOD)
+    if start_m < seq_len_q:
+        chunk = tl.cdiv(tl.cdiv(seq_len_kv, NUM_SPLITS), BLOCK_N) * BLOCK_N
+        kv_lo = split * chunk
+        kv_len = tl.minimum(tl.maximum(seq_len_kv - kv_lo, 0), chunk)
+        offs_m = start_m + tl.arange(0, BLOCK_M)
+        offs_n_0 = tl.arange(0, BLOCK_N)
+        offs_d_q = tl.arange(0, HEAD_DIM)
+        offs_d_v = tl.arange(0, BLOCK_D_V)
+        row_ok = offs_m < seq_len_q
+        q_ptrs = (Q + (seq_start_q + offs_m).to(tl.int64)[:, None] * stride_qm +
+                  (off_h * stride_qh + offs_d_q)[None, :])
+        q = tl.load(q_ptrs, mask=row_ok[:, None], other=0.0)
+        m_i, l_i = forward_softmax_common_preprocess(off_h, num_softmax_heads, BLOCK_M)
+        acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
+        part_lse = PartLse + split * stride_ls
+        if kv_len > 0:
+            if off_h < num_softmax_heads:
+                acc = _tlx_gfx950_cross_attn_fwd_compute(
+                    acc,
+                    alpha,
+                    q,
+                    K,
+                    V,
+                    offs_m,
+                    offs_n_0,
+                    off_h,
+                    off_h_kv,
+                    seq_start_kv + kv_lo,
+                    kv_len,
+                    seq_start_q,
+                    seq_len_q,
+                    attn_scale,
+                    stride_kn,
+                    stride_kh,
+                    stride_vn,
+                    stride_vh,
+                    stride_lm,
+                    m_i,
+                    l_i,
+                    part_lse,
+                    start_m,
+                    seq_len_q,
+                    num_softmax_heads,
+                    HEAD_DIM,
+                    BLOCK_D_V,
+                    BLOCK_M,
+                    BLOCK_N,
+                    NUM_STAGES,
+                    SHARED_KV,
+                    # pyrefly: ignore [bad-argument-type]
+                    IS_SOFTMAX=True,
+                    # pyrefly: ignore [bad-argument-type]
+                    HAS_CAUSAL=False,
+                )
+            else:
+                acc = _tlx_gfx950_cross_attn_fwd_compute(
+                    acc,
+                    alpha,
+                    q,
+                    K,
+                    V,
+                    offs_m,
+                    offs_n_0,
+                    off_h,
+                    off_h_kv,
+                    seq_start_kv + kv_lo,
+                    kv_len,
+                    seq_start_q,
+                    seq_len_q,
+                    attn_scale,
+                    stride_kn,
+                    stride_kh,
+                    stride_vn,
+                    stride_vh,
+                    stride_lm,
+                    m_i,
+                    l_i,
+                    part_lse,
+                    start_m,
+                    seq_len_q,
+                    num_softmax_heads,
+                    HEAD_DIM,
+                    BLOCK_D_V,
+                    BLOCK_M,
+                    BLOCK_N,
+                    NUM_STAGES,
+                    SHARED_KV,
+                    # pyrefly: ignore [bad-argument-type]
+                    IS_SOFTMAX=False,
+                    # pyrefly: ignore [bad-argument-type]
+                    HAS_CAUSAL=False,
+                )
+        elif off_h < num_softmax_heads:
+            # An empty chunk carries no probability mass.
+            lse_ptrs = part_lse + (seq_start_q + offs_m) * stride_lm + off_h
+            tl.store(
+                lse_ptrs,
+                tl.full([BLOCK_M], float("-inf"), dtype=tl.float32),
+                mask=row_ok,
+            )
+        acc_ptrs = (PartAcc + split.to(tl.int64) * stride_ps +
+                    (seq_start_q + offs_m).to(tl.int64)[:, None] * stride_pm + (off_h * stride_ph + offs_d_v)[None, :])
+        tl.store(acc_ptrs, acc, mask=row_ok[:, None])
+
+
+@triton.jit
+def _tlx_gfx950_cross_attn_split_kv_merge(
+    PartAcc,
+    PartLse,
+    Out,
+    M,
+    total_q,
+    stride_ps,
+    stride_pm,
+    stride_ph,
+    stride_ls,
+    stride_lm,
+    stride_om,
+    stride_oh,
+    stride_mm,
+    NUM_SPLITS,
+    num_softmax_heads: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
+):
+    """Combine split-KV partials into `Out` (and `M` for softmax heads).
+
+    Softmax: out = sum_s 2^(lse_s - lse) * out_s with lse = log2 sum_s 2^lse_s,
+    which is also the `m + log2(l)` the backward reads from `M`. Silu: the
+    partials are a plain sum. A row whose chunks are all empty (KV length 0)
+    gets zeros, matching the unsplit kernel.
+    """
+    off_h = tl.program_id(1)
+    offs_t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    offs_d = tl.arange(0, BLOCK_D_V)
+    t_ok = offs_t < total_q
+    part_ptrs = (PartAcc + offs_t.to(tl.int64)[:, None] * stride_pm + (off_h * stride_ph + offs_d)[None, :])
+    acc = tl.zeros([BLOCK_T, BLOCK_D_V], dtype=tl.float32)
+    if off_h < num_softmax_heads:
+        lse_ptrs = PartLse + offs_t * stride_lm + off_h
+        lse_max = tl.full([BLOCK_T], float("-inf"), dtype=tl.float32)
+        for s in range(NUM_SPLITS):
+            lse_s = tl.load(lse_ptrs + s * stride_ls, mask=t_ok, other=float("-inf"))
+            lse_max = tl.maximum(lse_max, lse_s)
+        has_mass = lse_max > float("-inf")
+        lse_ref = tl.where(has_mass, lse_max, 0.0)
+        denom = tl.zeros([BLOCK_T], dtype=tl.float32)
+        for s in range(NUM_SPLITS):
+            lse_s = tl.load(lse_ptrs + s * stride_ls, mask=t_ok, other=float("-inf"))
+            w = tl.math.exp2(lse_s - lse_ref)
+            part = tl.load(
+                part_ptrs + s * stride_ps,
+                mask=t_ok[:, None] & (w > 0)[:, None],
+                other=0.0,
+            )
+            acc += w[:, None] * part
+            denom += w
+        acc = acc / tl.where(has_mass, denom, 1.0)[:, None]
+        lse_out = tl.where(has_mass, lse_ref + tl.math.log2(denom), float("-inf"))
+        tl.store(M + offs_t * stride_mm + off_h, lse_out, mask=t_ok)
+    else:
+        for s in range(NUM_SPLITS):
+            acc += tl.load(part_ptrs + s * stride_ps, mask=t_ok[:, None], other=0.0)
+    out_ptrs = (Out + offs_t.to(tl.int64)[:, None] * stride_om + (off_h * stride_oh + offs_d)[None, :])
+    tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=t_ok[:, None])
+
+
+def _tlx_gfx950_cross_attn_fwd_split_kv_launch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    M: torch.Tensor,
+    stride_mm: int,
+    seq_offsets: torch.Tensor,
+    seq_offsets_q: torch.Tensor,
+    max_seq_len: int,
+    max_q_len: int,
+    alpha: float,
+    attn_scale: torch.Tensor,
+    G: int,
+    shared_kv: bool,
+    num_softmax_heads: int,
+    truncate_method: str,
+    num_splits: int,
+) -> None:
+    Z = seq_offsets.numel() - 1
+    total_q, H, DimQ = q.shape
+    DimV = v.shape[2]
+    part_acc = torch.empty((num_splits, total_q, H, DimV), device=q.device, dtype=torch.float32)
+    part_lse = torch.empty(
+        (num_splits, total_q, max(num_softmax_heads, 1)),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    grid = lambda meta: (  # noqa E731
+        triton.cdiv(max_q_len, meta["BLOCK_M"]) * Z * H * num_splits, )
+    _tlx_gfx950_cross_attn_fwd_split_kv[grid](
+        alpha=alpha,
+        Z=Z,
+        H=H,
+        G=G,
+        Q=q,
+        K=k,
+        V=v,
+        PartAcc=part_acc,
+        PartLse=part_lse,
+        seq_offsets_q=seq_offsets_q,
+        seq_offsets=seq_offsets,
+        max_seq_len=max_seq_len,
+        attn_scale=attn_scale,
+        stride_qm=q.stride(0),
+        stride_qh=q.stride(1),
+        stride_kn=k.stride(0),
+        stride_kh=k.stride(1),
+        stride_vn=v.stride(0),
+        stride_vh=v.stride(1),
+        stride_ps=part_acc.stride(0),
+        stride_pm=part_acc.stride(1),
+        stride_ph=part_acc.stride(2),
+        stride_ls=part_lse.stride(0),
+        stride_lm=part_lse.stride(1),
+        NUM_SPLITS=num_splits,
+        MAX_Q_LEN=max_q_len,
+        AUTOTUNE_Z=next_power_of_2(Z),
+        AUTOTUNE_MAX_Q_LEN=triton.cdiv(max_q_len, AUTOTUNE_Q_LEN_GRANULARITY) * AUTOTUNE_Q_LEN_GRANULARITY,
+        AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
+        num_softmax_heads=num_softmax_heads,
+        HEAD_DIM=DimQ,
+        BLOCK_D_V=DimV,
+        SHARED_KV=shared_kv,
+        TRUNCATE_METHOD=truncate_method,
+    )
+    block_t = 32
+    _tlx_gfx950_cross_attn_split_kv_merge[(triton.cdiv(total_q, block_t), H)](
+        PartAcc=part_acc,
+        PartLse=part_lse,
+        Out=out,
+        M=M,
+        total_q=total_q,
+        stride_ps=part_acc.stride(0),
+        stride_pm=part_acc.stride(1),
+        stride_ph=part_acc.stride(2),
+        stride_ls=part_lse.stride(0),
+        stride_lm=part_lse.stride(1),
+        stride_om=out.stride(0),
+        stride_oh=out.stride(1),
+        stride_mm=stride_mm,
+        NUM_SPLITS=num_splits,
+        num_softmax_heads=num_softmax_heads,
+        BLOCK_T=block_t,
+        BLOCK_D_V=DimV,
+        num_warps=4,
+    )
+
+
+@maybe_register_custom_op("tlx::hstu_cross_attn_gfx950_fwd", mutates_args=())
 def tlx_gfx950_cross_attn_fwd(
     max_seq_len: int,
     alpha: float,
@@ -791,6 +1828,15 @@ def tlx_gfx950_cross_attn_fwd(
     causal: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert not enable_tma, "TMA is CUDA-only and not supported on gfx950"
+    # Under `shared_kv` the kernel takes the PV operand from K's staged tile
+    # and never reads `V`, so a `v` that is not `k` would be ignored rather
+    # than rejected -- wrong output, no error. `AttentionFunction.forward`
+    # substitutes `v = k`, but this op is registered and can be called
+    # directly. Checked before the conversions below: they would turn a single
+    # non-contiguous tensor passed as both into two separate copies, which
+    # still computes the right answer but no longer compares equal here.
+    assert not shared_kv or (v.data_ptr() == k.data_ptr() and v.shape == k.shape and v.stride()
+                             == k.stride()), "shared_kv=True requires v to alias k; a distinct v would be ignored"
     q = switch_to_contiguous_if_needed(q)
     k = switch_to_contiguous_if_needed(k)
     v = switch_to_contiguous_if_needed(v)
@@ -820,6 +1866,29 @@ def tlx_gfx950_cross_attn_fwd(
     else:
         M = torch.empty(0, device=q.device, dtype=torch.float32)
         stride_mm = 0
+
+    num_splits = _num_kv_splits(q.device, total_seq_len_q, k.shape[0], Z, H, causal or truncate_method != "none")
+    if num_splits > 1:
+        _tlx_gfx950_cross_attn_fwd_split_kv_launch(
+            q,
+            k,
+            v,
+            out,
+            M,
+            stride_mm,
+            seq_offsets,
+            seq_offsets_q,
+            max_seq_len,
+            max_q_len,
+            alpha,
+            attn_scale,
+            G,
+            shared_kv,
+            num_softmax_heads,
+            truncate_method,
+            num_splits,
+        )
+        return out, M
 
     _tlx_gfx950_cross_attn_fwd[grid](
         alpha=alpha,
@@ -942,6 +2011,13 @@ def _get_bw_redq_configs() -> List[triton.Config]:
     return configs
 
 
+def _bwd_smoke_configs() -> List[triton.Config]:
+    return [
+        c for c in _get_bw_redq_configs()
+        if c.kwargs["BLOCK_M"] == 32 and c.kwargs["BLOCK_N"] == 64 and c.kwargs["waves_per_eu"] == 1
+    ]
+
+
 @triton.jit
 def _bwd_load_2d(
     BASE,
@@ -1058,19 +2134,46 @@ def _tlx_gfx950_cross_attn_bwd_inner(  # noqa C901
         low_q = max(0, start_n + uih_len_q - seq_len_kv)
     else:
         low_q = 0
+
+    # Single-buffered LDS staging for the two tiles the q loop reloads every
+    # iteration. k and v are loop-invariant and stay on `tl.load`: staging them
+    # too would reach 64KB at BLOCK_M=64 / BLOCK_N=128 with DimQ=DimV=128,
+    # which is where the autotuner would start trading block size for LDS.
+    #
+    # The transposes stay in registers. Both tiles are consumed in both
+    # orientations -- q as `k @ q.T` and then `dqk.T @ q`, do as `act_qk.T @ do`
+    # and then `v @ do.T` -- and serving both from one staged buffer via
+    # `tlx.local_trans` fails in `TlxPropagateLayout`, because the two
+    # `local_load`s want different MFMA operand layouts out of the same shared
+    # allocation. The forward avoids this: each buffer there has a single
+    # consumer orientation. So what staging buys the backward is the
+    # global-to-LDS copy and the one-group overlap of the q and do loads, not
+    # the transposes.
+    # pyrefly: ignore [bad-argument-type]
+    lds_q = tlx.local_alloc((BLOCK_M, DimQ), tlx.dtype_of(Q), 1)
+    # pyrefly: ignore [bad-argument-type]
+    lds_do = tlx.local_alloc((BLOCK_M, DimV), tlx.dtype_of(DO), 1)
+
     for start_m in tl.range(low_q, seq_len_q, BLOCK_M):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mask_m = offs_m < seq_len_q
         q_offset = seq_start_q + start_m
-        q = _bwd_load_2d(
-            Q,
-            q_offset,
-            off_h * stride_qh,
-            stride_qm,
-            end_dq,
-            BLOCK=BLOCK_M,
-            DIM=DimQ,
-        )
+        offs_r_m = q_offset + tl.arange(0, BLOCK_M)
+        mask_r_m = (offs_r_m < end_dq)[:, None]
+        q_ptrs = (Q + offs_r_m.to(tl.int64)[:, None] * stride_qm.to(tl.int64) +
+                  (off_h * stride_qh + tl.arange(0, DimQ))[None, :])
+        do_ptrs = (DO + offs_r_m.to(tl.int64)[:, None] * stride_dom.to(tl.int64) +
+                   (off_h * stride_doh + tl.arange(0, DimV))[None, :])
+        q_local = tlx.local_view(lds_q, 0)
+        do_local = tlx.local_view(lds_do, 0)
+        # One async group: do's address does not depend on the QK dot, so
+        # issuing it here costs the iteration one global latency, not two.
+        tok_q = tlx.async_load(q_ptrs, q_local, mask=mask_r_m)
+        tok_do = tlx.async_load(do_ptrs, do_local, mask=mask_r_m)
+        tlx.async_load_commit_group([tok_q, tok_do])
+        # pyrefly: ignore [bad-argument-type]
+        wait_tok = tlx.async_load_wait_group(0)
+        q = tlx.local_load(q_local, token=wait_tok)
         qk_trans = tl.dot(
             k,
             tl.trans(q),
@@ -1099,15 +2202,7 @@ def _tlx_gfx950_cross_attn_bwd_inner(  # noqa C901
             )
         else:
             qk_trans, act_qk_trans, pT = backward_silu_activation(qk_trans, alpha, valid_mask_trans, k.dtype, scale)
-        do = _bwd_load_2d(
-            DO,
-            q_offset,
-            off_h * stride_doh,
-            stride_dom,
-            end_dq,
-            BLOCK=BLOCK_M,
-            DIM=DimV,
-        )
+        do = tlx.local_load(do_local, token=wait_tok)
 
         if SHARED_KV:
             dk = tl.dot(act_qk_trans, do, dk, allow_tf32=ALLOW_TF32)
@@ -1193,8 +2288,9 @@ def _tlx_gfx950_cross_attn_bwd_inner(  # noqa C901
         tl.store(dk_ptrs, dk.to(DK.dtype.element_ty), mask=mask_n[:, None])
 
 
-@triton_autotune(
+@_space_autotune(
     configs=_get_bw_redq_configs(),
+    smoke_configs=_bwd_smoke_configs(),
     key=[
         "AUTOTUNE_Z",
         "H",
@@ -1287,6 +2383,15 @@ def _tlx_gfx950_cross_attn_bwd(  # noqa C901
         offs_v_d = tl.arange(0, DimV)
         scale = tl.load(attn_scale).to(tl.float32)
 
+        # Same staging as `_tlx_gfx950_cross_attn_bwd_inner`: the q loop reloads
+        # q and do every iteration, so both are copied into LDS once per
+        # iteration and issued as a single async group. k and v are
+        # loop-invariant and stay on `tl.load`.
+        # pyrefly: ignore [bad-argument-type]
+        lds_q = tlx.local_alloc((BLOCK_M, DimQ), tlx.dtype_of(Q), 1)
+        # pyrefly: ignore [bad-argument-type]
+        lds_do = tlx.local_alloc((BLOCK_M, DimV), tlx.dtype_of(DO), 1)
+
         # pyrefly: ignore [bad-argument-type]
         for start_n in tl.range(0, seq_len_kv, BLOCK_N, num_stages=1):
             offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -1330,24 +2435,21 @@ def _tlx_gfx950_cross_attn_bwd(  # noqa C901
                     mask_m = offs_m < seq_len_q
                     valid_mask_trans = backward_valid_mask(offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
                     q_offset = (seq_start_q + start_m).to(tl.int32)
-                    q = _bwd_load_2d(
-                        Q,
-                        q_offset,
-                        off_h * stride_qh,
-                        stride_qm,
-                        end_dq,
-                        BLOCK=BLOCK_M,
-                        DIM=DimQ,
-                    )
-                    do = _bwd_load_2d(
-                        DO,
-                        q_offset,
-                        off_h * stride_doh,
-                        stride_dom,
-                        end_dq,
-                        BLOCK=BLOCK_M,
-                        DIM=DimV,
-                    )
+                    offs_r_m = q_offset + tl.arange(0, BLOCK_M)
+                    mask_r_m = (offs_r_m < end_dq)[:, None]
+                    q_ptrs = (Q + offs_r_m.to(tl.int64)[:, None] * stride_qm.to(tl.int64) +
+                              (off_h * stride_qh + offs_qk_d)[None, :])
+                    do_ptrs = (DO + offs_r_m.to(tl.int64)[:, None] * stride_dom.to(tl.int64) +
+                               (off_h * stride_doh + offs_v_d)[None, :])
+                    q_local = tlx.local_view(lds_q, 0)
+                    do_local = tlx.local_view(lds_do, 0)
+                    tok_q = tlx.async_load(q_ptrs, q_local, mask=mask_r_m)
+                    tok_do = tlx.async_load(do_ptrs, do_local, mask=mask_r_m)
+                    tlx.async_load_commit_group([tok_q, tok_do])
+                    # pyrefly: ignore [bad-argument-type]
+                    wait_tok = tlx.async_load_wait_group(0)
+                    q = tlx.local_load(q_local, token=wait_tok)
+                    do = tlx.local_load(do_local, token=wait_tok)
                     qk_trans = tl.dot(k, tl.trans(q), allow_tf32=ALLOW_TF32)
                     if off_h < num_softmax_heads:
                         qk_trans, act_qk_trans, pT = (backward_softmax_activation_scaled_alpha(
@@ -1702,6 +2804,7 @@ def _tlx_gfx950_cross_attn_bwd_split_softmax_dq(  # noqa: TR001
     )
 
 
+@torch.library.custom_op("tlx::hstu_cross_attn_gfx950_bwd", mutates_args=())
 def tlx_gfx950_cross_attn_bwd(  # noqa C901
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1723,7 +2826,7 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
     stride_mm: int = 0,
     truncate_method: str = "none",
     enable_tma: bool = False,
-    v3_ttgir_variant: Optional[str] = None,
+    bwd_variant: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not enable_tma, "TMA is CUDA-only and not supported on gfx950"
     if max_q_len is None:
@@ -1731,7 +2834,7 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
         assert seq_offsets_q is None
         seq_offsets_q = seq_offsets
 
-    # redq only. The v3 source picks between three backward kernels through
+    # redq only. The Triton source picks between three backward kernels through
     # `BwdVariant`; this port carries the reduce-dq one alone, so the dtype
     # choice the source spreads across four branches collapses: dq is reduced
     # through memory and is always fp32, and dk/dv are each written once by the
@@ -1770,7 +2873,7 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
     # so reshape dout back to the saved-q layout before deriving DO strides.
     dout = dout.reshape(total_seq_len_q, H, dout.shape[-1])
 
-    if v3_ttgir_variant == "split_softmax":
+    if bwd_variant == "split_softmax":
         torch._assert(G == 1, "Split-softmax requires G=1")
         torch._assert(H == 1, "Split-softmax requires one attention head")
         torch._assert(
@@ -1875,139 +2978,6 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
             torch.empty(0, dtype=v.dtype, device=v.device),
         )
 
-    if v3_ttgir_variant is not None:
-        assert v3_ttgir_variant in (
-            "v3_ttgir",
-            "v3_ttgir_direct_dq",
-            "v3_ttgir_atomic_dq",
-            "v3_ttgir_bf16_dq",
-            "v3_ttgir_bf16_prefetch_dq",
-            "v3_ttgir_bf16_stage_qdo",
-            "v3_ttgir_fp32_stage_qdo",
-            "v3_ttgir_fp32_stage_qdo_prefetch_dq",
-            "v3_ttgir_fp32_pipeline_qdo",
-        )
-        torch._assert(G == 1, "V3 TTGIR baseline requires G=1")
-        torch._assert(
-            H == 1 and k.shape[1] == 1 and v.shape[1] == 1,
-            "V3 TTGIR baseline requires one Q/K/V head",
-        )
-        torch._assert(
-            DimQ == 128 and DimV == 128,
-            "V3 TTGIR baseline requires D=128",
-        )
-        torch._assert(
-            q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16
-            and dout.dtype == torch.bfloat16,
-            "V3 TTGIR baseline requires BF16 tensors",
-        )
-        torch._assert(max_q_len == 256, "V3 TTGIR baseline requires max Q=256")
-        torch._assert(
-            num_softmax_heads == 1,
-            "V3 TTGIR baseline requires one softmax head",
-        )
-        torch._assert(not causal, "V3 TTGIR baseline is non-causal")
-        torch._assert(
-            attn_scale.ndim == 0,
-            "V3 TTGIR baseline requires scalar attention scale",
-        )
-        torch._assert(shared_kv, "V3 TTGIR baseline requires shared K/V")
-        torch._assert(
-            k.data_ptr() == v.data_ptr(),
-            "V3 TTGIR baseline requires aliased K/V storage",
-        )
-        torch._assert(
-            num_targets is not None,
-            "V3 TTGIR baseline requires target counts",
-        )
-        torch._assert(
-            seq_offsets_q is not None,
-            "V3 TTGIR baseline requires query offsets",
-        )
-        if v3_ttgir_variant in (
-                "v3_ttgir_atomic_dq",
-                "v3_ttgir_bf16_dq",
-                "v3_ttgir_bf16_prefetch_dq",
-                "v3_ttgir_bf16_stage_qdo",
-        ):
-            dq_v3 = torch.empty_like(q)
-        elif v3_ttgir_variant != "v3_ttgir":
-            dq_v3 = torch.empty_like(q, dtype=torch.float32)
-        else:
-            dq_v3 = torch.zeros_like(q, dtype=torch.float32)
-        dk_v3 = torch.empty_like(k)
-        dv_v3 = torch.empty((0, v.shape[1], v.shape[2]), dtype=v.dtype, device=v.device)
-        _tlx_gfx950_cross_attn_v3_ttgir_bwd[(Z * H, 1)](
-            q,
-            k,
-            v,
-            dout,
-            q.shape[0],
-            k.shape[0],
-            seq_offsets,
-            seq_offsets_q,
-            dq_v3,
-            dk_v3,
-            dv_v3,
-            q.stride(0),
-            q.stride(1),
-            k.stride(0),
-            k.stride(1),
-            v.stride(0),
-            v.stride(1),
-            dout.stride(0),
-            dout.stride(1),
-            dq_v3.stride(0),
-            dq_v3.stride(1),
-            dk_v3.stride(0),
-            dk_v3.stride(1),
-            dv_v3.stride(0),
-            dv_v3.stride(1),
-            alpha,
-            max_seq_len,
-            attn_scale,
-            M,
-            Delta,
-            num_targets,
-            Z,
-            triton.next_power_of_2(Z),
-            max_q_len,
-            autotune_max_seq_len(max_seq_len),
-            # pyrefly: ignore [bad-argument-type]
-            DIRECT_FIRST_DQ_STORE=v3_ttgir_variant != "v3_ttgir",
-            # pyrefly: ignore [bad-argument-type]
-            ATOMIC_DQ=v3_ttgir_variant == "v3_ttgir_atomic_dq",
-            # pyrefly: ignore [bad-argument-type]
-            PREFETCH_DQ=v3_ttgir_variant in (
-                "v3_ttgir_bf16_prefetch_dq",
-                "v3_ttgir_bf16_stage_qdo",
-                "v3_ttgir_fp32_stage_qdo_prefetch_dq",
-                "v3_ttgir_fp32_pipeline_qdo",
-            ),
-            # pyrefly: ignore [bad-argument-type]
-            STAGE_QDO=v3_ttgir_variant in (
-                "v3_ttgir_bf16_stage_qdo",
-                "v3_ttgir_fp32_stage_qdo",
-                "v3_ttgir_fp32_stage_qdo_prefetch_dq",
-                "v3_ttgir_fp32_pipeline_qdo",
-            ),
-            # pyrefly: ignore [bad-argument-type]
-            PIPELINE_QDO=v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo",
-            # pyrefly: ignore [unexpected-keyword]
-            num_warps=4,
-            # pyrefly: ignore [unexpected-keyword]
-            num_stages=1,
-            # pyrefly: ignore [unexpected-keyword]
-            matrix_instr_nonkdim=16,
-            # pyrefly: ignore [unexpected-keyword]
-            waves_per_eu=1,
-        )
-        return (
-            dq_v3.to(q.dtype),
-            dk_v3,
-            dv_v3,
-        )
-
     if use_per_kv_head:
         H_kv = H // G
         grid = lambda meta: (Z * H_kv, )  # noqa E731
@@ -2061,17 +3031,47 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
         PER_KV_HEAD=use_per_kv_head,
     )
 
-    # When shared_kv=True, dv aliases dk. Return a placeholder so the autograd
-    # wrapper can expose the combined K/V gradient through the K input only.
+    # When shared_kv=True, dv aliases dk. Return a placeholder to avoid aliasing
+    # in return which is required by torch.library.custom_op.
     if shared_kv:
         dv = torch.empty(0)
     return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 
+@tlx_gfx950_cross_attn_bwd.register_fake
+def _tlx_gfx950_cross_attn_bwd_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    attn_scale: torch.Tensor,
+    max_seq_len: int,
+    alpha: float,
+    max_q_len: Optional[int],
+    seq_offsets_q: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    causal: bool,
+    shared_kv: bool,
+    G: int,
+    num_softmax_heads: int = 0,
+    M: Optional[torch.Tensor] = None,
+    Delta: Optional[torch.Tensor] = None,
+    stride_mm: int = 0,
+    truncate_method: str = "none",
+    enable_tma: bool = False,
+    bwd_variant: Optional[str] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(q),
+        torch.empty_like(k),
+        torch.empty_like(v) if not shared_kv else torch.empty(0),
+    )
+
+
 class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
 
     @staticmethod
-    # pyrefly: ignore [bad-override]
     def forward(
         ctx,
         max_seq_len: int,
@@ -2089,7 +3089,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         truncate_method: str,
         num_targets: Optional[torch.Tensor] = None,
         causal: bool = False,
-        v3_ttgir_variant: Optional[str] = None,
+        bwd_variant: Optional[str] = None,
     ):
         q = switch_to_contiguous_if_needed(q)
         k = switch_to_contiguous_if_needed(k)
@@ -2121,7 +3121,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         assert HEAD_DIM_V in {16, 32, 64, 128, 256}
 
-        if v3_ttgir_variant == "split_softmax":
+        if bwd_variant == "split_softmax":
             torch._assert(
                 truncate_method == "none",
                 "Split-softmax does not support truncation",
@@ -2135,7 +3135,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
                 "Split-softmax query lengths must fit max_q_len",
             )
 
-        ctx.v3_ttgir_variant = v3_ttgir_variant
+        ctx.bwd_variant = bwd_variant
         out, M = tlx_gfx950_cross_attn_fwd(
             max_seq_len=max_seq_len,
             alpha=alpha,
@@ -2179,7 +3179,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         return out.view(total_seq_len_q, H, DimV)
 
     @staticmethod
-    # pyrefly: ignore [bad-override]
+    # pyre-ignore[14]
     def backward(  # noqa C901
         ctx, dout: torch.Tensor) -> Tuple[
             None,
@@ -2226,8 +3226,8 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
             pre_grid = (triton.cdiv(out.shape[0], 128), num_softmax_heads)
             _attn_bwd_preprocess[pre_grid](
                 out, dout, Delta, out.shape[0], H=out.shape[1], softmax_heads=num_softmax_heads,
-                BLOCK_M=128,  # pyrefly: ignore [bad-argument-type]
-                HEAD_DIM=out.shape[2],  # pyrefly: ignore [bad-argument-type]
+                BLOCK_M=128,  # pyre-ignore [6]
+                HEAD_DIM=out.shape[2],  # pyre-ignore [6]
             )
         else:
             M = torch.empty(0, device=q.device, dtype=torch.float32)
@@ -2237,7 +3237,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
             idx += 1
         else:
             num_targets = None
-        dq, dk, dv = tlx_gfx950_cross_attn_bwd(
+        dq, dk, dv = torch.ops.tlx.hstu_cross_attn_gfx950_bwd(
             dout=dout,
             q=q,
             k=k,
@@ -2258,7 +3258,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
             G=ctx.G,
             truncate_method=ctx.truncate_method,
             enable_tma=ctx.enable_tma,
-            v3_ttgir_variant=ctx.v3_ttgir_variant,
+            bwd_variant=ctx.bwd_variant,
         )
         dq = dq.view(ctx.total_seq_len_q, ctx.H, -1)
         return (
@@ -2301,12 +3301,10 @@ def tlx_gfx950_cross_attn_mha(
     enable_tma: bool = False,
     actual_max_seq_len: int = 0,
     truncate_method: str = "none",
-    v3_ttgir_variant: Optional[str] = None,
+    bwd_variant: Optional[str] = None,
 ) -> torch.Tensor:
-    # Self-attention-style usage: q and kv are the same sequence. The v3 source
-    # resolves this in its backward op, which this forward-only copy drops, so
-    # it has to be resolved here instead -- `tlx_gfx950_cross_attention_v1.py`,
-    # whose public name this file took over, did the same in its forward.
+    # Self-attention-style usage: q and kv are the same sequence. The Triton source
+    # resolves this in its backward op, so it has to be resolved here instead.
     if max_q_len is None:
         max_q_len = max_seq_len
         assert seq_offsets_q is None
@@ -2333,7 +3331,7 @@ def tlx_gfx950_cross_attn_mha(
         truncate_method,
         num_targets,
         causal,
-        v3_ttgir_variant,
+        bwd_variant,
     )
 
 
@@ -2355,9 +3353,9 @@ def tlx_gfx950_cross_attn_mha_wrapper(
     enable_tma: bool = False,
     actual_max_seq_len: int = 0,
     truncate_method: str = "none",
-    v3_ttgir_variant: Optional[str] = None,
+    bwd_variant: Optional[str] = None,
 ) -> torch.Tensor:
-    assert not sort_by_length, ("sort_by_length not supported by the v3 cross attention kernel")
+    assert not sort_by_length, ("sort_by_length not supported by the cross attention kernel")
     return tlx_gfx950_cross_attn_mha(
         max_seq_len=max_seq_len,
         alpha=alpha,
@@ -2376,7 +3374,7 @@ def tlx_gfx950_cross_attn_mha_wrapper(
         enable_tma=enable_tma,
         actual_max_seq_len=actual_max_seq_len,
         truncate_method=truncate_method,
-        v3_ttgir_variant=v3_ttgir_variant,
+        bwd_variant=bwd_variant,
     )
 
 
@@ -2404,11 +3402,49 @@ def _tlx_gfx950_cross_attn_fwd_fake(
     if num_softmax_heads > 0:
         M = torch.empty((L, num_softmax_heads), dtype=torch.float32, device=v.device)
     else:
-        # The real op returns a 0-element M here. The v3 source's fake returns
+        # The real op returns a 0-element M here. The Triton source's fake returns
         # `torch.empty(1)`, which reports the wrong size to `torch.compile` /
         # `torch.export` and fails `torch.library.opcheck`.
         M = torch.empty(0, dtype=torch.float32, device=v.device)
     return (
         torch.empty(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype),
         M,
+    )
+
+
+def hstu_cross_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    seq_offsets_q: torch.Tensor,
+    max_seq_len: int,
+    max_q_len: int,
+    attn_scale: torch.Tensor,
+    alpha: float,
+    num_softmax_heads: int = 0,
+    num_targets: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    shared_kv: bool = False,
+    *,
+    space: str = "full",
+) -> torch.Tensor:
+    if space not in ("full", "smoke"):
+        raise ValueError(f"hstu_cross_attn does not provide space={space!r}")
+    global _SPACE
+    _SPACE = space
+    return tlx_gfx950_cross_attn_mha(
+        max_seq_len=max_seq_len,
+        alpha=alpha,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=seq_offsets,
+        attn_scale=attn_scale,
+        max_q_len=max_q_len,
+        seq_offsets_q=seq_offsets_q,
+        num_softmax_heads=num_softmax_heads,
+        num_targets=num_targets,
+        causal=causal,
+        shared_kv=shared_kv,
     )
