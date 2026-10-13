@@ -926,7 +926,9 @@ public:
     // However, MMA_K = 64 with MN-major fp4 is not supported. In this case,
     // the fp4 operand must be padded and MMA_K = 32 must be used.
     // MMA_K = 64 is also not supported when BLOCK_M = 64.
-    auto blockK = dotOp.getA().getType().getShape().back() * (isAFP4 ? 2 : 1);
+    // An MN-packed fp4 A is packed along M, so its last dim is already K.
+    auto blockK = dotOp.getA().getType().getShape().back() *
+                  (isAFP4 && dotOp.getLhsKPack() ? 2 : 1);
     auto blockM = dotOp.getA().getType().getShape()[0];
     bool hasMNMajorFp4Operand =
         isFp4MMA && (!dotOp.getLhsKPack() || !dotOp.getRhsKPack());
@@ -942,6 +944,10 @@ public:
     bool hasUE5M3Scale =
         (aScaleElemType.isInteger(8) && isBlock16Scale(aScaleType)) ||
         (bScaleElemType.isInteger(8) && isBlock16Scale(bScaleType));
+    // UE5M3 scales are native only on sm107; sm100/sm103 trap, so decompose.
+    if (hasUE5M3Scale && !nvidia_gpu::TargetFeatures(computeCapability)
+                              .supportsUE5M3Tcgen05MMA())
+      return failure();
     // mxf4nvf4 supports UE4M3/UE5M3 scales but not MN-major operands, while
     // the mxf8f6f4 fallback for MN-major FP4 only supports E8M0 scales.
     if (hasMNMajorFp4Operand && (hasUE4M3Scale || hasUE5M3Scale))
@@ -1186,11 +1192,21 @@ public:
 
     patterns.add<BlockedToMMA>(context, computeCapability, benefitDefault);
     patterns.add<ScaledBlockedToMMA>(context, computeCapability, benefitSM120);
-    populateDecomposeScaledBlockedPatterns(patterns, benefitDefault);
+    populateDecomposeScaledBlockedPatterns(patterns, benefitDefault,
+                                           /*allowUE5M3Scales=*/true);
     patterns.add<BlockedToMMAv5, ScaledBlockedToMMAv5>(
         context, computeCapability, benefitMMAv5);
 
-    if (applyPatternsGreedily(m, std::move(patterns)).failed())
+    // A pattern that rejects an op emits a named error and fails to match,
+    // which still lets the greedy driver converge. Fail the pass on any
+    // error so the rejected op never reaches downstream passes.
+    bool emittedError = false;
+    ScopedDiagnosticHandler errorHandler(context, [&](Diagnostic &diag) {
+      if (diag.getSeverity() == DiagnosticSeverity::Error)
+        emittedError = true;
+      return failure();
+    });
+    if (applyPatternsGreedily(m, std::move(patterns)).failed() || emittedError)
       return signalPassFailure();
     // Now that we have picked the mma type, decompose dot that are not natively
     // supported.
