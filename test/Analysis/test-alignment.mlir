@@ -593,6 +593,65 @@ tt.func @signed_partial_div_rem_is_conservative(
 
 // -----
 
+// Full contiguous inputs may start at a negative divisor multiple.
+tt.func @signed_full_div_rem_is_conservative(
+    %lhs: tensor<128xi32> {tt.contiguity = 128 : i32, tt.divisibility = 64 : i32}) {
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = 64}}
+  %positive = arith.constant dense<64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = -64}}
+  %negative = arith.constant dense<-64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %quotient_positive = arith.divsi %lhs, %positive : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %quotient_negative = arith.divsi %lhs, %negative : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %remainder_positive = arith.remsi %lhs, %positive : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %remainder_negative = arith.remsi %lhs, %negative : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_negative_range_div_rem() {
+  // expected-remark @below {{contiguity = [128], divisibility = [64], constancy = [1], constant_value = <none>}}
+  %range = tt.make_range {start = -64 : i32, end = 64 : i32} : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = -64}}
+  %divisor = arith.constant dense<-64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %quotient = arith.divsi %range, %divisor : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %remainder = arith.remsi %range, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_remainder_preserves_element_divisibility(
+    %lhs: tensor<128xi32> {tt.divisibility = 16 : i32}) {
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = -64}}
+  %divisor = arith.constant dense<-64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [16], constancy = [1], constant_value = <none>}}
+  %remainder = arith.remsi %lhs, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+// A divisor that changes within the dimension does not preserve group bases.
+tt.func @remainder_partial_divisor_constancy(
+    %rhs: tensor<128xi32> {tt.constancy = 2 : i32, tt.divisibility = 4 : i32}) {
+  // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
+  %range = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %signed = arith.remsi %range, %rhs : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %unsigned = arith.remui %range, %rhs : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
 tt.func @expanddims() {
   // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
   %0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
