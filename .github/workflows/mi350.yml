@@ -205,25 +205,39 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v3
-      - name: Checkout Tritonbench
-        uses: actions/checkout@v3
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
         with:
-          repository: meta-pytorch/tritonbench
-          path: tritonbench
-          submodules: recursive
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/fbtriton-ccache
-          key: ccache-${{ github.job }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-
-            ccache-
-      - name: Setup Tritonbench environment
-        working-directory: tritonbench
+          enable-cache: false
+      - name: Set up TLX test environment
+        timeout-minutes: 30
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
+          # The TLX tests need Python 3.12 (the prebuilt wheel is cp312), the
+          # ROCm PyTorch nightly, and pytest. TritonBench's setup-env.sh also
+          # clones PyTorch source and installs TritonBench, which this job
+          # never runs. Keep its venv and SETUP_SCRIPT layout so the steps
+          # below are unchanged.
+          sudo mkdir -p "${WORKSPACE_DIR}"
+          sudo chown -R "$(id -un):$(id -gn)" "${WORKSPACE_DIR}"
+          VENV="${UV_VENV_DIR}/${CONDA_ENV}"
+          uv venv "${VENV}" --python 3.12 --managed-python --clear
+          echo ". '${VENV}/bin/activate'" > "${SETUP_SCRIPT}"
+          if [ -e /opt/rocm/lib ]; then
+            echo 'export LD_LIBRARY_PATH=/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}' >> "${SETUP_SCRIPT}"
+          fi
+          . "${SETUP_SCRIPT}"
+          uv pip install --pre --no-cache torch --index-url https://download.pytorch.org/whl/nightly/rocm10.0
+          # torch pulls in triton-rocm, which owns the same `triton` package
+          # as the fbtriton wheel installed below.
+          uv pip uninstall triton triton-rocm pytorch-triton-rocm || true
+          uv pip install numpy pytest
+          python - <<'PY'
+          import torch
+
+          print(f"torch -> {torch.__version__} (hip {torch.version.hip})")
+          assert torch.cuda.is_available(), "torch sees no GPU"
+          PY
       - name: Download prebuilt Triton wheel from GitHub artifacts
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
         uses: actions/download-artifact@v4
@@ -261,7 +275,7 @@ jobs:
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
-          uv pip install pytest
+          uv pip install pytest pytest-xdist
           shopt -s nullglob
           FILES=(
             python/test/unit/language/test_tlx_*_any.py
@@ -286,7 +300,31 @@ jobs:
           echo "mi350 collects:" "${FILES[@]}"
           # Forkserver children must import the test module by its importlib name
           # (python.test.unit.tlx_ops.*), not just its helpers from tlx_ops.
-          PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" --import-mode=importlib -v --junitxml=/tmp/tlx-core.xml
+          # Kernel compilation dominates these tests (a cold Triton cache was ~4x
+          # slower than a warm one on a 343-test subset), so overlap compiles across four xdist
+          # workers sharing the runner's single GPU. worksteal rebalances the
+          # few multi-minute cases instead of stranding them behind a static split.
+          # Record CPU count, the container memory limit, and peak host / GPU memory
+          # while the workers run, to size -n against this runner.
+          echo "nproc: $(nproc)  cgroup memory limit: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)"
+          free -m
+          (
+            set +x
+            while :; do
+              host_mb=$(free -m | awk '/^Mem:/{print $3}')
+              vram_mb=$(rocm-smi --showmeminfo vram --csv 2>/dev/null | awk -F, 'NR>1 && $3+0>m {m=$3+0} END {print int(m/1048576)}')
+              echo "$(date +%s) ${host_mb} ${vram_mb:-0}"
+              sleep 15
+            done
+          ) > /tmp/tlx-core-mem.log 2>&1 &
+          MEM_SAMPLER=$!
+          set +e
+          PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" --import-mode=importlib -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-core.xml
+          rc=$?
+          set -e
+          kill "${MEM_SAMPLER}" 2>/dev/null || true
+          awk '{if ($2>h) h=$2; if ($3>v) v=$3} END {printf "peak host memory used: %d MiB, peak GPU VRAM used: %d MiB (%d samples)\n", h, v, NR}' /tmp/tlx-core-mem.log
+          exit "${rc}"
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
@@ -312,7 +350,7 @@ jobs:
         timeout-minutes: 60
         run: |
           . "${SETUP_SCRIPT}"
-          pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib \
+          pytest python/test/tlx_benchmark/test_ops_perf.py \
             -k "not torchtlx" -v --junitxml=/tmp/tlx-perf.xml
       - name: Upload TLX perf artifacts
         if: always() && github.event_name == 'schedule'
