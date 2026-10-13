@@ -66,6 +66,29 @@ struct CondBarrierOpConversion
   }
 };
 
+struct AssumeUniformOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::AssumeUniformOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::AssumeUniformOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value src = adaptor.getSrc();
+    if (isa<LLVM::LLVMPointerType>(src.getType())) {
+      Value asInt = b.ptrtoint(i64_ty, src);
+      Value uniform =
+          ROCDL::ReadfirstlaneOp::create(rewriter, loc, i64_ty, asInt);
+      rewriter.replaceOp(op, b.inttoptr(src.getType(), uniform));
+    } else {
+      rewriter.replaceOp(op, ROCDL::ReadfirstlaneOp::create(
+                                 rewriter, loc, src.getType(), src));
+    }
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::triton::AMD::populateSPMDOpToLLVMPattern(
@@ -74,4 +97,5 @@ void mlir::triton::AMD::populateSPMDOpToLLVMPattern(
   patterns.add<GetNumProgramsOpConversion>(typeConverter, benefit);
   patterns.add<Clock64OpConversion>(typeConverter, benefit);
   patterns.add<CondBarrierOpConversion>(typeConverter, benefit);
+  patterns.add<AssumeUniformOpConversion>(typeConverter, benefit);
 }
