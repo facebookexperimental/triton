@@ -151,3 +151,41 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.thr
     tt.return
  }
 }
+
+// -----
+
+// CHECK-LABEL: llvm.func @scheduled_mfma_source_control
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=a,0"
+// CHECK: %[[ZERO:[0-9]+]] = llvm.mlir.constant(dense<0.000000e+00> : vector<4xf32>)
+// CHECK: rocdl.mfma.f32.16x16x32.bf16 {{.*}}, {{.*}}, %[[ZERO]], 0, 0, 0
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "s_nop 5"
+// CHECK-SAME: "=v,=a,0,1,~{memory}"
+// CHECK-NOT: amdg.
+
+#scheduled_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_mma, kWidth = 8}>
+#scheduled_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scheduled_mfma_source_control(
+      %a: tensor<16x32xbf16, #scheduled_lhs>,
+      %b: tensor<32x16xbf16, #scheduled_rhs>) {
+    %resident_b = amdg.register_resident %b class "agpr" groups 4
+        : tensor<32x16xbf16, #scheduled_rhs>
+    %acc = arith.constant dense<7.000000e+00> :
+        tensor<16x16xf32, #scheduled_mma>
+    %result = amdg.scheduled_mfma %a, %resident_b, %acc
+        resident "rhs" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #scheduled_lhs>,
+          tensor<32x16xbf16, #scheduled_rhs>,
+          tensor<16x16xf32, #scheduled_mma>
+          -> tensor<16x16xf32, #scheduled_mma>
+    %committed, %preserved = amdg.mfma_commit %result, %resident_b
+        : tensor<16x16xf32, #scheduled_mma>,
+          tensor<32x16xbf16, #scheduled_rhs>
+    tt.return
+  }
+}

@@ -53,6 +53,9 @@ public:
                     Value ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
 
+  Value rematerializeDistributedCoordinate(RewriterBase &rewriter, Location loc,
+                                           Value coordinate) const override;
+
   // Describes the parameters of ds_read_tr for a particular data type.
   using TileKind = amdgpu::TargetFeatures::TileKind;
   using LDSTransLoadParams = amdgpu::TargetFeatures::LDSTransLoadParams;

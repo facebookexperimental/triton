@@ -1,5 +1,6 @@
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include <numeric>
 
 namespace mlir::triton::AMD {
@@ -58,11 +59,32 @@ public:
     return isa<amdgpu::ExtractSliceOp>(op);
   }
 };
+
+class RematerializedRangeOpAxisInfoVisitor : public AxisInfoVisitor {
+public:
+  using AxisInfoVisitor::AxisInfoVisitor;
+
+  AxisInfo
+  getAxisInfo(Operation *op,
+              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) final {
+    auto range = cast<amdgpu::RematerializedRangeOp>(op);
+    int64_t start = range.getStart();
+    int64_t end = range.getEnd();
+    return AxisInfo(/*contiguity=*/{end - start},
+                    /*divisibility=*/{highestPowOf2Divisor(start)},
+                    /*constancy=*/{1});
+  }
+
+  bool match(Operation *op) final {
+    return isa<amdgpu::RematerializedRangeOp>(op);
+  }
+};
 } // namespace
 
 AxisInfoAnalysisExt::AxisInfoAnalysisExt(DataFlowSolver &solver)
     : triton::AxisInfoAnalysis(solver) {
-  visitors.append<ExtractSliceOpAxisInfoVisitor>();
+  visitors.append<ExtractSliceOpAxisInfoVisitor,
+                  RematerializedRangeOpAxisInfoVisitor>();
 }
 
 triton::AxisInfoAnalysis *
