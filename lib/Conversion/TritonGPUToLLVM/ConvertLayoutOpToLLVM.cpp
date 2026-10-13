@@ -165,7 +165,8 @@ struct ConvertLayoutOpConversion
     std::pair<Value, Value> coordinates = distributedCoordinates
                                               ? *distributedCoordinates
                                               : getLaneAndWarpId(rewriter, loc);
-    auto [laneId, warpId] = coordinates;
+    Value laneId = coordinates.first;
+    Value warpId = coordinates.second;
     auto elemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
     smemBase = b.bitcast(smemBase, elemPtrTy);
 
