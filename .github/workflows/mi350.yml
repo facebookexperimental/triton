@@ -76,11 +76,7 @@ env:
   # Import test files by path, not by prepending their directories to
   # sys.path, so same-named test modules in different directories do not
   # collide (the perf suite failed with ImportError without it, #4001).
-  # Kernel compilation dominates the test suites (a cold Triton cache was ~4x
-  # slower than a warm one on a 343-test subset), so overlap compiles across
-  # four xdist workers sharing the runner's single GPU (pod memory peaked at
-  # ~44 of 100 GiB); worksteal rebalances the few multi-minute cases.
-  PYTEST_ADDOPTS: --import-mode=importlib -n 4 --dist worksteal
+  PYTEST_ADDOPTS: --import-mode=importlib
 
 jobs:
   mi350-build:
@@ -245,10 +241,14 @@ jobs:
           echo "mi350 collects:" "${FILES[@]}"
           # Log runner size and the pod's memory peak, pass or fail, to size -n.
           trap 'echo "runner: nproc=$(nproc) memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) memory.peak_mib=$(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 ))"' EXIT
-          # -n 4 --dist worksteal come from PYTEST_ADDOPTS. Forkserver children
-          # must import the test module by its importlib name
-          # (python.test.unit.tlx_ops.*), not just its helpers from tlx_ops.
-          PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" -v --durations=25 --junitxml=/tmp/tlx-core.xml
+          # Forkserver children must import the test module by its importlib
+          # name (python.test.unit.tlx_ops.*), not just its helpers from tlx_ops.
+          # Kernel compilation dominates these tests (a cold Triton cache was
+          # ~4x slower than a warm one on a 343-test subset), so overlap
+          # compiles across four xdist workers sharing the runner's single GPU
+          # (pod memory peaked at ~44 of 100 GiB). worksteal rebalances the few
+          # multi-minute cases instead of stranding them behind a static split.
+          PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
@@ -272,8 +272,7 @@ jobs:
         if: always() && github.event_name == 'schedule'
         timeout-minutes: 60
         run: |
-          # Serial: benchmarks sharing the GPU would measure each other.
-          python -m pytest python/test/tlx_benchmark/test_ops_perf.py -n 0 \
+          python -m pytest python/test/tlx_benchmark/test_ops_perf.py \
             -k "not torchtlx" -v --junitxml=/tmp/tlx-perf.xml
       - name: Upload TLX perf artifacts
         if: always() && github.event_name == 'schedule'
@@ -308,7 +307,7 @@ jobs:
       MAX_JOBS: 16
       CCACHE_DIR: /tmp/fbtriton-ccache
       CCACHE_MAXSIZE: 2G
-      # Its own venv has no pytest-xdist; keep pytest's defaults here.
+      # This job has always run with pytest's default import mode.
       PYTEST_ADDOPTS: ""
     timeout-minutes: 180
     permissions:
@@ -452,7 +451,7 @@ jobs:
         with:
           backend: rocm
           arch: gfx950
-          packages: numpy pytest pytest-xdist expecttest
+          packages: numpy pytest expecttest
       - name: Install prebuilt Triton
         if: steps.gluon.outputs.run == 'true'
         uses: ./.github/actions/install-prebuilt-triton
