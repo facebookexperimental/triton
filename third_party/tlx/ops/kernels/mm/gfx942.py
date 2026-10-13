@@ -209,13 +209,11 @@ def _load_lds_ring_operands_gfx942(
 ):
     """Load a full K tile with the direct path's addressing contracts."""
     if USE_I64_A_OFFSETS:
-        a_offsets = (reg_m.to(tl.int64)[:, None] * stride_am +
-                     (k + offs_k[None, :]).to(tl.int64) * stride_ak)
+        a_offsets = (reg_m.to(tl.int64)[:, None] * stride_am + (k + offs_k[None, :]).to(tl.int64) * stride_ak)
     else:
         a_offsets = reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
     if USE_I64_B_OFFSETS:
-        b_offsets = ((k + offs_k[:, None]).to(tl.int64) * stride_bk +
-                     reg_n.to(tl.int64)[None, :] * stride_bn)
+        b_offsets = ((k + offs_k[:, None]).to(tl.int64) * stride_bk + reg_n.to(tl.int64)[None, :] * stride_bn)
     else:
         b_offsets = (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
     if USE_BUFFER_A:
@@ -242,15 +240,15 @@ def _store_n_edge_panel_gfx942(c_ptr, acc, rows, base_n, N: tl.constexpr, WIDTH:
     mask = (gather_cols < WIDTH) & (base_n + gather_cols < N)
     tl.store(c_ptr + offsets, shifted, mask=mask)
     first = tl.reshape(
-        tl.gather(values, tl.full((256, 1), 0, tl.int32), axis=1), (256,),
+        tl.gather(values, tl.full((256, 1), 0, tl.int32), axis=1),
+        (256, ),
     )
     tl.store(c_ptr + rows * N + base_n, first, mask=(shift == 1) & (base_n < N))
 
 
 @triton.jit
-def _n_edge_panels_kernel_gfx942(a_ptr, b_ptr, c_ptr, pid_m, pid_n,
-                                N: tl.constexpr, K: tl.constexpr,
-                                SECOND_WIDTH: tl.constexpr = 64):
+def _n_edge_panels_kernel_gfx942(a_ptr, b_ptr, c_ptr, pid_m, pid_n, N: tl.constexpr, K: tl.constexpr,
+                                 SECOND_WIDTH: tl.constexpr = 64):
     """Share each A tile across two independently accumulated N panels."""
     tl.static_assert(SECOND_WIDTH == 64 or SECOND_WIDTH == 128)
     rows = pid_m * 256 + tl.arange(0, 256).to(tl.int32)
@@ -262,10 +260,12 @@ def _n_edge_panels_kernel_gfx942(a_ptr, b_ptr, c_ptr, pid_m, pid_n,
     load_cols1 = cols1 % N
     rk = tl.arange(0, 64).to(tl.int32)
     packed_a: tl.constexpr = tlx.layout(
-        shape=((8, 8, 8), (8, 4)), stride=((8, 64, 512), (1, 4096)),
+        shape=((8, 8, 8), (8, 4)),
+        stride=((8, 64, 512), (1, 4096)),
     )
     packed_b0: tl.constexpr = tlx.layout(
-        shape=((8, 8, 8), (8, 2)), stride=((1024, 1, 8), (128, 64)),
+        shape=((8, 8, 8), (8, 2)),
+        stride=((1024, 1, 8), (128, 64)),
     )
     packed_b1: tl.constexpr = tlx.layout(
         shape=((8, 8, 8), (8, SECOND_WIDTH // 64)),
@@ -289,12 +289,9 @@ def _n_edge_panels_kernel_gfx942(a_ptr, b_ptr, c_ptr, pid_m, pid_n,
     # Preserve the incumbent's K=16 zero-filled tail and increasing K order.
     tail_k = tl.arange(0, 16).to(tl.int32)
     tail_mask = tail_k < K - k_main
-    a = tl.load(a_ptr + rows[:, None] * K + k_main + tail_k[None, :],
-                mask=tail_mask[None, :], other=0.0)
-    b0 = tl.load(b_ptr + k_main + tail_k[:, None] + load_cols0[None, :] * K,
-                 mask=tail_mask[:, None], other=0.0)
-    b1 = tl.load(b_ptr + k_main + tail_k[:, None] + load_cols1[None, :] * K,
-                 mask=tail_mask[:, None], other=0.0)
+    a = tl.load(a_ptr + rows[:, None] * K + k_main + tail_k[None, :], mask=tail_mask[None, :], other=0.0)
+    b0 = tl.load(b_ptr + k_main + tail_k[:, None] + load_cols0[None, :] * K, mask=tail_mask[:, None], other=0.0)
+    b1 = tl.load(b_ptr + k_main + tail_k[:, None] + load_cols1[None, :] * K, mask=tail_mask[:, None], other=0.0)
     acc0 = tl.dot(a, b0, acc0, allow_tf32=False, out_dtype=tl.float32)
     acc1 = tl.dot(a, b1, acc1, allow_tf32=False, out_dtype=tl.float32)
     _store_n_edge_panel_gfx942(c_ptr, acc0, rows, base_n, N, 128)
@@ -360,18 +357,15 @@ def _direct_matmul_kernel_gfx942(
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
 
-    EDGE_PANELS: tl.constexpr = (
-        USE_N_EDGE_PANELS and M == 262144 and N == 1195 and K == 2373
-        and a_ptr.dtype.element_ty == tl.float16 and b_ptr.dtype.element_ty == tl.float16
-        and c_ptr.dtype.element_ty == tl.float16 and not ADD_BIAS
-        and stride_am == K and stride_ak == 1 and stride_bk == 1 and stride_bn == K
-        and stride_cm == N and stride_cn == 1
-        and not USE_I64_A_OFFSETS and not USE_I64_B_OFFSETS and not USE_I64_C_OFFSETS
-        and BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 64
-        and GROUP_M == 1 and NUM_XCDS == 8 and XCD_CHUNK == 8
-        and USE_PACKED_K_LOADS and ALIGN_FP16_STORES and not PACK_FP16_STORES
-        and not SPLIT_M_128_32 and not SPLIT_M_128_64 and not USE_LDS_RING
-    )
+    EDGE_PANELS: tl.constexpr = (USE_N_EDGE_PANELS and M == 262144 and N == 1195 and K == 2373
+                                 and a_ptr.dtype.element_ty == tl.float16 and b_ptr.dtype.element_ty == tl.float16
+                                 and c_ptr.dtype.element_ty == tl.float16 and not ADD_BIAS and stride_am == K
+                                 and stride_ak == 1 and stride_bk == 1 and stride_bn == K and stride_cm == N
+                                 and stride_cn == 1 and not USE_I64_A_OFFSETS and not USE_I64_B_OFFSETS
+                                 and not USE_I64_C_OFFSETS and BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 64
+                                 and GROUP_M == 1 and NUM_XCDS == 8 and XCD_CHUNK == 8 and USE_PACKED_K_LOADS
+                                 and ALIGN_FP16_STORES and not PACK_FP16_STORES and not SPLIT_M_128_32
+                                 and not SPLIT_M_128_64 and not USE_LDS_RING)
     # The XCD permutation remains a bijection. Only the last N tile changes
     # its internal panels; the guarded shape has no partial M tiles.
     if EDGE_PANELS and pid_n == grid_n - 1:
@@ -384,7 +378,14 @@ def _direct_matmul_kernel_gfx942(
         # async operation or manually managed barrier is introduced: tl.dot's
         # compiler-managed conversions retain all cross-wave visibility fences.
         _n_edge_panels_kernel_gfx942(
-            a_ptr, b_ptr, c_ptr, pid_m, pid_n, N, K, SECOND_WIDTH=128,
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            pid_m,
+            pid_n,
+            N,
+            K,
+            SECOND_WIDTH=128,
         )
     elif SPLIT_M_128_32 or SPLIT_M_128_64:
         # Two power-of-two row panels consume the same B registers before
@@ -499,8 +500,7 @@ def _direct_matmul_kernel_gfx942(
                                       and ((K - 1) * stride_bk + (N - 1) * stride_bn + 1) *
                                       (b_ptr.dtype.element_ty.primitive_bitwidth // 8) <= 0x7ffffffe)
         PACKED_K_LOADS: tl.constexpr = (USE_PACKED_K_LOADS and USE_BUFFER_A and USE_BUFFER_B
-                                        and a_ptr.dtype.element_ty == tl.float16
-                                        and stride_ak == 1 and stride_bk == 1
+                                        and a_ptr.dtype.element_ty == tl.float16 and stride_ak == 1 and stride_bk == 1
                                         and BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 64)
         if PACKED_K_LOADS:
             # Each of 512 threads owns four independent groups of eight K
@@ -519,9 +519,8 @@ def _direct_matmul_kernel_gfx942(
         acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
         even_k = K % BLOCK_K == 0
         k_main = K if even_k else (K // BLOCK_K) * BLOCK_K
-        if (USE_LDS_RING and a_ptr.dtype.element_ty == tl.float16 and
-                BLOCK_M == 128 and BLOCK_N == 256 and BLOCK_K == 32 and
-                k_main >= BLOCK_K):
+        if (USE_LDS_RING and a_ptr.dtype.element_ty == tl.float16 and BLOCK_M == 128 and BLOCK_N == 256
+                and BLOCK_K == 32 and k_main >= BLOCK_K):
             # A synchronous LDS slot holds tile t while VGPR loads fetch t+1.
             # Shapes and logical B[K,N] ownership remain unchanged. Conservative
             # local ops let membar analysis order stores before all readers,
@@ -531,18 +530,40 @@ def _direct_matmul_kernel_gfx942(
             a_slot = tlx.local_view(smem_a, 0)
             b_slot = tlx.local_view(smem_b, 0)
             first_a, first_b = _load_lds_ring_operands_gfx942(
-                a_ptr, b_ptr, reg_m, reg_n, offs_k, 0,
-                stride_am, stride_ak, stride_bk, stride_bn,
-                USE_I64_A_OFFSETS, USE_I64_B_OFFSETS, USE_BUFFER_A, USE_BUFFER_B,
+                a_ptr,
+                b_ptr,
+                reg_m,
+                reg_n,
+                offs_k,
+                0,
+                stride_am,
+                stride_ak,
+                stride_bk,
+                stride_bn,
+                USE_I64_A_OFFSETS,
+                USE_I64_B_OFFSETS,
+                USE_BUFFER_A,
+                USE_BUFFER_B,
             )
             tlx.local_store(a_slot, first_a)
             tlx.local_store(b_slot, first_b)
             # Software staging owns prefetch; disable compiler staging.
             for tile in tl.range(1, k_main // BLOCK_K, num_stages=1):
                 next_a, next_b = _load_lds_ring_operands_gfx942(
-                    a_ptr, b_ptr, reg_m, reg_n, offs_k, tile * BLOCK_K,
-                    stride_am, stride_ak, stride_bk, stride_bn,
-                    USE_I64_A_OFFSETS, USE_I64_B_OFFSETS, USE_BUFFER_A, USE_BUFFER_B,
+                    a_ptr,
+                    b_ptr,
+                    reg_m,
+                    reg_n,
+                    offs_k,
+                    tile * BLOCK_K,
+                    stride_am,
+                    stride_ak,
+                    stride_bk,
+                    stride_bn,
+                    USE_I64_A_OFFSETS,
+                    USE_I64_B_OFFSETS,
+                    USE_BUFFER_A,
+                    USE_BUFFER_B,
                 )
                 a = tlx.local_load(a_slot)
                 b = tlx.local_load(b_slot)
@@ -558,11 +579,13 @@ def _direct_matmul_kernel_gfx942(
         else:
             for k in range(0, k_main, BLOCK_K):
                 if USE_I64_A_OFFSETS:
-                    a_offsets = (reg_m.to(tl.int64)[:, None] * stride_am + (k + offs_k[None, :]).to(tl.int64) * stride_ak)
+                    a_offsets = (reg_m.to(tl.int64)[:, None] * stride_am +
+                                 (k + offs_k[None, :]).to(tl.int64) * stride_ak)
                 else:
                     a_offsets = reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
                 if USE_I64_B_OFFSETS:
-                    b_offsets = ((k + offs_k[:, None]).to(tl.int64) * stride_bk + reg_n.to(tl.int64)[None, :] * stride_bn)
+                    b_offsets = ((k + offs_k[:, None]).to(tl.int64) * stride_bk +
+                                 reg_n.to(tl.int64)[None, :] * stride_bn)
                 else:
                     b_offsets = (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
                 if PACKED_K_LOADS:
@@ -622,9 +645,8 @@ def _direct_matmul_kernel_gfx942(
             c_offsets = idx_m.to(tl.int64) * stride_cm + idx_n.to(tl.int64) * stride_cn
         else:
             c_offsets = idx_m * stride_cm + idx_n * stride_cn
-        if (PACK_FP16_STORES and c_ptr.dtype.element_ty == tl.float16 and
-                stride_cn == 1 and stride_cm % 2 == 1 and BLOCK_N == 256 and
-                not USE_I64_C_OFFSETS):
+        if (PACK_FP16_STORES and c_ptr.dtype.element_ty == tl.float16 and stride_cn == 1 and stride_cm % 2 == 1
+                and BLOCK_N == 256 and not USE_I64_C_OFFSETS):
             # Pack two already-rounded FP16 values into each physical dword.
             # A pair owns both elements only when both are inside this tile
             # and the output. Unpaired first/last elements have scalar owners.
@@ -639,33 +661,29 @@ def _direct_matmul_kernel_gfx942(
                      (high.to(tl.uint16, bitcast=True).to(tl.uint32) << 16))
             aligned_base = tl.multiple_of(rows * stride_cm + shift, 2)
             word_offsets = (aligned_base[:, None] + pid_n * BLOCK_N) // 2 + pairs[None, :]
-            pair_mask = ((rows[:, None] < M) & (high_cols < BLOCK_N) &
-                         (pid_n * BLOCK_N + high_cols < N))
+            pair_mask = ((rows[:, None] < M) & (high_cols < BLOCK_N) & (pid_n * BLOCK_N + high_cols < N))
             word_ptr = c_ptr.to(tl.pointer_type(tl.uint32))
             tl.store(word_ptr + word_offsets, words, mask=pair_mask)
 
             first = tl.reshape(
                 tl.gather(values, tl.full((BLOCK_M, 1), 0, tl.int32), axis=1),
-                (BLOCK_M,),
+                (BLOCK_M, ),
             )
             tl.store(c_ptr + rows * stride_cm + pid_n * BLOCK_N, first,
                      mask=(rows < M) & (shift == 1) & (pid_n * BLOCK_N < N))
             valid_width = tl.minimum(BLOCK_N, N - pid_n * BLOCK_N)
             last_col = valid_width - 1
             last = tl.reshape(
-                tl.gather(values, tl.full((BLOCK_M, 1), 0, tl.int32) +
-                          tl.maximum(last_col, 0), axis=1),
-                (BLOCK_M,),
+                tl.gather(values,
+                          tl.full((BLOCK_M, 1), 0, tl.int32) + tl.maximum(last_col, 0), axis=1),
+                (BLOCK_M, ),
             )
             # The last element is scalar exactly when it starts an incomplete
             # pair. Exclude the column-zero scalar owner's singleton case.
-            last_mask = ((rows < M) & (last_col >= shift) &
-                         (((last_col - shift) & 1) == 0))
-            tl.store(c_ptr + rows * stride_cm + pid_n * BLOCK_N + last_col,
-                     last, mask=last_mask)
-        elif (ALIGN_FP16_STORES and c_ptr.dtype.element_ty == tl.float16 and
-                stride_cn == 1 and stride_cm % 2 == 1 and BLOCK_N == 256 and
-                not USE_I64_C_OFFSETS):
+            last_mask = ((rows < M) & (last_col >= shift) & (((last_col - shift) & 1) == 0))
+            tl.store(c_ptr + rows * stride_cm + pid_n * BLOCK_N + last_col, last, mask=last_mask)
+        elif (ALIGN_FP16_STORES and c_ptr.dtype.element_ty == tl.float16 and stride_cn == 1 and stride_cm % 2 == 1
+              and BLOCK_N == 256 and not USE_I64_C_OFFSETS):
             # Narrow before the epilogue permutation. Odd rows skip column
             # zero in the vector path so every row base is half2 aligned.
             # The skipped value has one separate, masked scalar owner.
@@ -681,11 +699,10 @@ def _direct_matmul_kernel_gfx942(
             tl.store(c_ptr + aligned_offsets, shifted, mask=shifted_mask)
             first = tl.reshape(
                 tl.gather(values, tl.full((BLOCK_M, 1), 0, tl.int32), axis=1),
-                (BLOCK_M,),
+                (BLOCK_M, ),
             )
             first_offsets = rows * stride_cm + pid_n * BLOCK_N
-            tl.store(c_ptr + first_offsets, first,
-                     mask=(rows < M) & (shift == 1) & (pid_n * BLOCK_N < N))
+            tl.store(c_ptr + first_offsets, first, mask=(rows < M) & (shift == 1) & (pid_n * BLOCK_N < N))
         else:
             tl.store(c_ptr + c_offsets, acc, mask=mask)
 
@@ -887,28 +904,42 @@ def _configs():
             num_warps,
             waves_per_eu=waves_per_eu,
         ) for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in candidates
-    ] + [_config(128, 128, 64, 16, 4, kpack=2),
-         _config(64, 64, 256, 4, 8, kpack=2),
-         # Match an incumbent tile; change only its operand staging mechanism.
-         triton.Config(
-             {
-                 "BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32,
-                 "GROUP_M": 16, "NUM_XCDS": 8, "XCD_CHUNK": 8,
-                 "waves_per_eu": 2, "kpack": 1, "USE_LDS_RING": True,
-             },
-             num_warps=4,
-             num_stages=1,
-         ),
-         # Preserve the winning tile and staging; test packed K load ownership.
-         triton.Config(
-             {
-                 "BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64,
-                 "GROUP_M": 1, "NUM_XCDS": 8, "XCD_CHUNK": 8,
-                 "waves_per_eu": 0, "kpack": 1, "USE_PACKED_K_LOADS": True,
-             },
-             num_warps=8,
-             num_stages=2,
-         )]
+    ] + [
+        _config(128, 128, 64, 16, 4, kpack=2),
+        _config(64, 64, 256, 4, 8, kpack=2),
+        # Match an incumbent tile; change only its operand staging mechanism.
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 256,
+                "BLOCK_K": 32,
+                "GROUP_M": 16,
+                "NUM_XCDS": 8,
+                "XCD_CHUNK": 8,
+                "waves_per_eu": 2,
+                "kpack": 1,
+                "USE_LDS_RING": True,
+            },
+            num_warps=4,
+            num_stages=1,
+        ),
+        # Preserve the winning tile and staging; test packed K load ownership.
+        triton.Config(
+            {
+                "BLOCK_M": 256,
+                "BLOCK_N": 256,
+                "BLOCK_K": 64,
+                "GROUP_M": 1,
+                "NUM_XCDS": 8,
+                "XCD_CHUNK": 8,
+                "waves_per_eu": 0,
+                "kpack": 1,
+                "USE_PACKED_K_LOADS": True,
+            },
+            num_warps=8,
+            num_stages=2,
+        )
+    ]
 
 
 CONFIGS = _configs
@@ -1014,65 +1045,103 @@ def _candidate_configs(shape, enable_local_split_u=False):
     configs = CONFIGS()
     if shape == (262144, 1195, 2373):
         # Append the two-panel decomposition without removing incumbents.
-        configs.append(triton.Config(
-            {
-                "BLOCK_M": 192, "BLOCK_N": 256, "BLOCK_K": 64,
-                "GROUP_M": 1, "NUM_XCDS": 8, "XCD_CHUNK": 8,
-                "waves_per_eu": 0, "kpack": 1, "SPLIT_M_128_64": True,
-            },
-            num_warps=8,
-            num_stages=2,
-        ))
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_M": 192,
+                    "BLOCK_N": 256,
+                    "BLOCK_K": 64,
+                    "GROUP_M": 1,
+                    "NUM_XCDS": 8,
+                    "XCD_CHUNK": 8,
+                    "waves_per_eu": 0,
+                    "kpack": 1,
+                    "SPLIT_M_128_64": True,
+                },
+                num_warps=8,
+                num_stages=2,
+            ))
     if shape == (262144, 1195, 2373):
         # Retain all incumbents; test only the parity-aligned FP16 epilogue.
-        configs.append(triton.Config(
-            {
-                "BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64,
-                "GROUP_M": 1, "NUM_XCDS": 8, "XCD_CHUNK": 8,
-                "waves_per_eu": 0, "kpack": 1, "USE_PACKED_K_LOADS": True,
-                "ALIGN_FP16_STORES": True,
-            },
-            num_warps=8,
-            num_stages=2,
-        ))
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 256,
+                    "BLOCK_K": 64,
+                    "GROUP_M": 1,
+                    "NUM_XCDS": 8,
+                    "XCD_CHUNK": 8,
+                    "waves_per_eu": 0,
+                    "kpack": 1,
+                    "USE_PACKED_K_LOADS": True,
+                    "ALIGN_FP16_STORES": True,
+                },
+                num_warps=8,
+                num_stages=2,
+            ))
     if shape == (262144, 1195, 2373):
         # Test explicit dword stores without changing incumbent load ownership.
-        configs.append(triton.Config(
-            {
-                "BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64,
-                "GROUP_M": 1, "NUM_XCDS": 8, "XCD_CHUNK": 8,
-                "waves_per_eu": 0, "kpack": 1, "USE_PACKED_K_LOADS": True,
-                "ALIGN_FP16_STORES": True, "PACK_FP16_STORES": True,
-            },
-            num_warps=8,
-            num_stages=2,
-        ))
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 256,
+                    "BLOCK_K": 64,
+                    "GROUP_M": 1,
+                    "NUM_XCDS": 8,
+                    "XCD_CHUNK": 8,
+                    "waves_per_eu": 0,
+                    "kpack": 1,
+                    "USE_PACKED_K_LOADS": True,
+                    "ALIGN_FP16_STORES": True,
+                    "PACK_FP16_STORES": True,
+                },
+                num_warps=8,
+                num_stages=2,
+            ))
     if shape == (262144, 1195, 2373):
         # Retain the square incumbent; opt in only to reduced right-edge work.
-        configs.append(triton.Config(
-            {
-                "BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64,
-                "GROUP_M": 1, "NUM_XCDS": 8, "XCD_CHUNK": 8,
-                "waves_per_eu": 0, "kpack": 1, "USE_PACKED_K_LOADS": True,
-                "ALIGN_FP16_STORES": True, "USE_N_EDGE_PANELS": True,
-            },
-            num_warps=8,
-            num_stages=2,
-        ))
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 256,
+                    "BLOCK_K": 64,
+                    "GROUP_M": 1,
+                    "NUM_XCDS": 8,
+                    "XCD_CHUNK": 8,
+                    "waves_per_eu": 0,
+                    "kpack": 1,
+                    "USE_PACKED_K_LOADS": True,
+                    "ALIGN_FP16_STORES": True,
+                    "USE_N_EDGE_PANELS": True,
+                },
+                num_warps=8,
+                num_stages=2,
+            ))
     if shape == (262144, 1195, 2373):
         # Extend the shared-A N-panel decomposition to full interior tiles.
         # All existing configurations and the 128+64 right edge remain intact.
-        configs.append(triton.Config(
-            {
-                "BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64,
-                "GROUP_M": 1, "NUM_XCDS": 8, "XCD_CHUNK": 8,
-                "waves_per_eu": 0, "kpack": 1, "USE_PACKED_K_LOADS": True,
-                "ALIGN_FP16_STORES": True, "USE_N_EDGE_PANELS": True,
-                "USE_N_INTERIOR_PANELS": True,
-            },
-            num_warps=8,
-            num_stages=2,
-        ))
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 256,
+                    "BLOCK_K": 64,
+                    "GROUP_M": 1,
+                    "NUM_XCDS": 8,
+                    "XCD_CHUNK": 8,
+                    "waves_per_eu": 0,
+                    "kpack": 1,
+                    "USE_PACKED_K_LOADS": True,
+                    "ALIGN_FP16_STORES": True,
+                    "USE_N_EDGE_PANELS": True,
+                    "USE_N_INTERIOR_PANELS": True,
+                },
+                num_warps=8,
+                num_stages=2,
+            ))
     if enable_local_split_u:
         configs.append(_local_split_u_config(_FULL_LOCAL_SPLIT_U_PLANS[shape]))
     incumbent = heuristic_config(*shape)[0]
