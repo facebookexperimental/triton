@@ -83,7 +83,7 @@ jobs:
           rm -rf /tmp/tlx_benchmark
           # TorchTLX benches need Meta's Inductor patches; the per-platform
           # *-torchtlx-test jobs already run them.
-          "${RUNNER_TEMP}/bench-venv/bin/python" -m pytest python/test/tlx_benchmark/test_ops_perf.py \
+          "${RUNNER_TEMP}/bench-venv/bin/python" -m pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib \
             -k "not torchtlx" -v -s --junitxml="${RUNNER_TEMP}/tlx-ops-bench.xml"
       - name: Upload results
         if: always()
