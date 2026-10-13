@@ -7840,8 +7840,11 @@ def _attn_bwd_gqa_bm32_front(
     Q_OUT_LAYOUT: tl.constexpr,
     UPDATE_DV_FIRST_HALF: tl.constexpr = True,
     PIN_FRONT: tl.constexpr = True,
+    GQA8K_FRONT: tl.constexpr = False,
 ):
     """Publish current dS to LDS and optionally update the first dV fragments."""
+    # Use four-register VGPR tuples for the measured GQA8K front.
+    GQA8K_FRONT_REGISTERS_PER_GROUP: tl.constexpr = 4
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
     v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
     k_nm = tlx.local_load(
@@ -7860,7 +7863,11 @@ def _attn_bwd_gqa_bm32_front(
         tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
     )
     if PIN_FRONT:
-        scores = tlx.amd_register_resident(scores, register_class="vgpr", registers_per_group=16)
+        scores = tlx.amd_register_resident(
+            scores,
+            register_class="vgpr",
+            registers_per_group=GQA8K_FRONT_REGISTERS_PER_GROUP if GQA8K_FRONT else 16,
+        )
     if IS_CAUSAL:
         # Mask after scaling so custom zero or negative scales cannot turn an
         # invalid raw-score sentinel into a NaN or a finite probability.
@@ -7913,20 +7920,36 @@ def _attn_bwd_gqa_bm32_front(
         tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
     )
     if PIN_FRONT:
-        dp = tlx.amd_register_resident(dp, register_class="vgpr", registers_per_group=16)
+        dp = tlx.amd_register_resident(
+            dp,
+            register_class="vgpr",
+            registers_per_group=GQA8K_FRONT_REGISTERS_PER_GROUP if GQA8K_FRONT else 16,
+        )
 
     if not IS_CAUSAL:
-        # Keep LSE scaling on an independent scalar VALU chain.  Broadcasting
-        # the multiply lets LLVM pair an LSE lane with a score fragment in a
-        # packed multiply and creates a false cross-fragment dependency.
-        lse_log2 = tl.inline_asm_elementwise(
-            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-            "=v,v",
-            [lse_values],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        if GQA8K_FRONT:
+            # Use native LSE scaling for the selected specialization.
+            # The empty pin keeps each result in one VGPR.
+            lse_log2 = tl.inline_asm_elementwise(
+                "",
+                "=v,0",
+                [lse_values * 1.4426950408889634],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            # Keep LSE scaling on an independent scalar VALU chain.  Broadcasting
+            # the multiply lets LLVM pair an LSE lane with a score fragment in a
+            # packed multiply and creates a false cross-fragment dependency.
+            lse_log2 = tl.inline_asm_elementwise(
+                "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+                "=v,v",
+                [lse_values],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
         # These are soft requirements. Layout propagation does not yet infer
         # the score MFMA layout for broadcast/full operands from elementwise users.
         lse_full = tlx.require_layout(
@@ -7996,22 +8019,39 @@ def _attn_bwd_gqa_bm32_dq_prefetched(
     """Reduce eight K32 bands into one32x128 native dQ chain."""
     ds0 = tlx.require_layout(ds0, DS_MD_LAYOUT, pin=False)
     ds1 = tlx.require_layout(ds1, DS_MD_LAYOUT, pin=False)
-    k_resident_lo = tlx.require_layout(k_resident_lo, K_MD_LAYOUT, pin=False)
-    k_resident_mid = tlx.require_layout(k_resident_mid, K_MD_LAYOUT, pin=False)
-    k_resident_band6 = tlx.require_layout(k_resident_band6, K_MD_LAYOUT, pin=False)
+    if k_resident_lo is not None:
+        k_resident_lo = tlx.require_layout(k_resident_lo, K_MD_LAYOUT, pin=False)
+        k_resident_mid = tlx.require_layout(k_resident_mid, K_MD_LAYOUT, pin=False)
+        k_resident_band6 = tlx.require_layout(k_resident_band6, K_MD_LAYOUT, pin=False)
     v_resident = tlx.require_layout(v_resident, V_LAYOUT, pin=False)
     dq = tlx.zeros((32, 128), tl.float32, layout=MMA_MD)
-    k0 = tlx.extract_slice(k_resident_lo, [32, 128], [0, 0])
+    if k_resident_lo is None:
+        k0 = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                            rematerialize_coordinates_group=COORDINATE_GROUP)
+    else:
+        k0 = tlx.extract_slice(k_resident_lo, [32, 128], [0, 0])
     dq = tlx.amd_scheduled_mfma(ds0, k0, dq, resident_operand=1, accumulator_role="transient", initialize=True)
-    k1 = tlx.extract_slice(k_resident_lo, [32, 128], [32, 0])
+    if k_resident_lo is None:
+        k1 = tlx.local_load(tlx.local_slice(k_buffer, [32, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                            rematerialize_coordinates_group=COORDINATE_GROUP)
+    else:
+        k1 = tlx.extract_slice(k_resident_lo, [32, 128], [32, 0])
     dq = tlx.amd_scheduled_mfma(ds1, k1, dq, resident_operand=1, accumulator_role="transient")
     ds2 = tlx.local_load(tlx.local_slice(prev_ds, [0, 64], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
                          rematerialize_coordinates_group=COORDINATE_GROUP)
-    k2 = tlx.extract_slice(k_resident_lo, [32, 128], [64, 0])
+    if k_resident_lo is None:
+        k2 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                            rematerialize_coordinates_group=COORDINATE_GROUP)
+    else:
+        k2 = tlx.extract_slice(k_resident_lo, [32, 128], [64, 0])
     dq = tlx.amd_scheduled_mfma(ds2, k2, dq, resident_operand=1, accumulator_role="transient")
     ds3 = tlx.local_load(tlx.local_slice(prev_ds, [0, 96], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
                          rematerialize_coordinates_group=COORDINATE_GROUP)
-    k3 = tlx.extract_slice(k_resident_lo, [32, 128], [96, 0])
+    if k_resident_lo is None:
+        k3 = tlx.local_load(tlx.local_slice(k_buffer, [96, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                            rematerialize_coordinates_group=COORDINATE_GROUP)
+    else:
+        k3 = tlx.extract_slice(k_resident_lo, [32, 128], [96, 0])
     dq = tlx.amd_scheduled_mfma(ds3, k3, dq, resident_operand=1, accumulator_role="transient")
     ds4 = tlx.local_load(tlx.local_slice(prev_ds, [0, 128], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
                          rematerialize_coordinates_group=COORDINATE_GROUP)
@@ -8384,7 +8424,8 @@ def _attn_bwd_gqa_bm32_phase(
         QT_LAYOUT,
         P_ND_LAYOUT,
         Q_OUT_LAYOUT,
-        PIN_FRONT=HQ == HK,
+        PIN_FRONT=HQ == HK or (FRAGMENT_CHAIN and N == 8192),
+        GQA8K_FRONT=FRAGMENT_CHAIN and N == 8192,
     )
     dv = _attn_bwd_opt_gqa_dv_fragmented_half(
         dv_lhs,
@@ -8395,6 +8436,9 @@ def _attn_bwd_gqa_bm32_phase(
         Q_OUT_LAYOUT,
         False,
     )
+    # Keep the Q RHS load after the front to shorten its register lifetime.
+    if FRAGMENT_CHAIN and N == 8192:
+        tlx.amd_sched_barrier(0)
     dk_rhs = tlx.local_load(dk_rhs, layout=Q_OUT_LAYOUT, relaxed=True)
     dk_rhs = tlx.amd_register_resident(dk_rhs, register_class="vgpr", registers_per_group=4)
     if N == 16384:
@@ -8893,16 +8937,20 @@ def _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel(
     v_operand = tlx.buffer_load(V, v_offsets)
     v_operand = tlx.require_layout(v_operand, k_nm_layout, pin=False)
 
-    k_resident_lo = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [128, D]), token=initial_wait, layout=k_md_layout,
-                                   relaxed=True)
+    FRAGMENT_CHAIN: tl.constexpr = (HQ == 64 and HK == 8 and not IS_CAUSAL and SPLIT_Q == 1
+                                    and ((BATCH == 16 and N == 8192) or (BATCH == 15 and N == 16384)))
+    # Reload the first 128 K rows at dQ use to reduce register pressure.
+    if FRAGMENT_CHAIN and N == 8192:
+        k_resident_lo = None
+    else:
+        k_resident_lo = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [128, D]), token=initial_wait,
+                                       layout=k_md_layout, relaxed=True)
     k_resident_mid = k_resident_lo
     k_resident_band6 = k_resident_lo
     # Peel the final16K outer so its refill is statically disabled; every
     # steady outer refills exactly the next64rows before the delayedbridge.
     PEEL_LAST: tl.constexpr = N == 16384
     # Keep dK fragments across phases for the two GQA benchmark shapes.
-    FRAGMENT_CHAIN: tl.constexpr = (HQ == 64 and HK == 8 and not IS_CAUSAL and SPLIT_Q == 1
-                                    and ((BATCH == 16 and N == 8192) or (BATCH == 15 and N == 16384)))
     if FRAGMENT_CHAIN:
         dk = (
             tlx.zeros((128, 32), tl.float32, layout=mma_nd),
@@ -9519,12 +9567,14 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
     long_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] >= 8192 and split_q == 1)
     short_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] <= 4096 and split_q == 1)
     long_8k = long_gqa and shape[3] == 8192
+    measured_gqa8k = shape == (16, 64, 8, 8192, 128) and not causal and split_q == 1
     precise_mha16k = shape == (16, 16, 16, 16384, 128) and not causal and split_q == 1
     regalloc = _d128_regalloc_options()
     # Short GQA and the measured 16K MHA shape disable instruction sinking.
-    # The 8K GQA schedule also disables reverse assignment.
+    # The measured GQA8K shape enables reverse assignment.
+    # Other GQA8K shapes keep reverse assignment disabled.
     # Explicit environment overrides remain independent.
-    reverse_default = "0" if causal or long_8k else "1"
+    reverse_default = "0" if causal or (long_8k and not measured_gqa8k) else "1"
     sink_default = "0" if (short_gqa or long_8k or
                            (shape == (16, 16, 16, 16384, 128) and not causal and split_q == 1)) else "1"
     regalloc["reverse_local_assignment"] = os.environ.get(_D128_REVERSE_LOCAL_ENV, reverse_default) == "1"
