@@ -26,6 +26,31 @@ def _verify_buffer_ops(ptr, offsets, mask=None, other=None):
 
 
 @tl.builtin
+def assume_uniform(value, _semantic=None):
+    """
+    Assert that a scalar holds the same value in every lane of the wave.
+
+    Returns `value` unchanged. On AMD this emits amdg.assume_uniform, lowered to
+    `v_readfirstlane`. On other backends it is a no-op.
+
+    AMD buffer ops keep their base pointer in the scalar (SGPR) resource
+    descriptor, so it has to be wave-uniform. When the backend cannot prove that
+    it is (most commonly because the pointer was loaded from memory), it falls
+    back to a per-lane waterfall loop around every access.
+
+    Args:
+        value: Scalar pointer, or a 16/32/64-bit integer or float. Narrower
+            types are not supported by `v_readfirstlane`.
+    """
+    ty = value.type
+    assert ty.is_ptr() or ty.primitive_bitwidth >= 16, \
+        f"assume_uniform expects a scalar pointer or a 16/32/64-bit value, got {ty}"
+    if _semantic.builder.options.backend_name != "hip":
+        return value
+    return tl.tensor(_semantic.builder.create_assume_uniform(value.handle), ty)
+
+
+@tl.builtin
 def buffer_load(
     ptr,
     offsets,
