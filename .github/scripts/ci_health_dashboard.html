@@ -1,0 +1,207 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI health · facebookexperimental/triton</title>
+<style>
+.viz-root{color-scheme:light;--page:#f9f9f7;--surface-1:#fcfcfb;--text-primary:#0b0b0b;--text-secondary:#52514e;--text-muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--series-4:#eda100;--neutral:#c3c2b7;--critical:#d03b3b;--good:#0ca30c;--warning:#fab219;--serious:#ec835a;--wash:rgba(11,11,11,.04)}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) .viz-root{color-scheme:dark;--page:#0d0d0d;--surface-1:#1a1a19;--text-primary:#fff;--text-secondary:#c3c2b7;--text-muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--series-4:#c98500;--neutral:#4a4a46;--wash:rgba(255,255,255,.05)}}
+:root[data-theme="dark"] .viz-root{color-scheme:dark;--page:#0d0d0d;--surface-1:#1a1a19;--text-primary:#fff;--text-secondary:#c3c2b7;--text-muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--series-4:#c98500;--neutral:#4a4a46;--wash:rgba(255,255,255,.05)}
+*{box-sizing:border-box}body{margin:0}
+.viz-root{background:var(--page);color:var(--text-primary);min-height:100vh;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:28px 20px 64px}
+.wrap{max-width:1040px;margin:0 auto}
+header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}
+h1{font-size:23px;margin:0 0 2px;font-weight:650}h2{font-size:16px;margin:0;font-weight:620}h3{font-size:13px;margin:0 0 4px;font-weight:620;color:var(--text-secondary)}
+.sub{color:var(--text-secondary);margin:0}.muted{color:var(--text-muted);font-size:12px}
+.mockbanner{margin:12px 0 0;padding:8px 12px;border:1px dashed var(--axis);border-radius:8px;color:var(--text-secondary);font-size:13px}
+.filters{display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin:16px 0 4px;font-size:13px;color:var(--text-secondary)}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.seg button{background:var(--surface-1);border:0;padding:5px 11px;font:inherit;color:var(--text-secondary);cursor:pointer;border-right:1px solid var(--border)}
+.seg button:last-child{border-right:0}.seg button[aria-pressed="true"]{background:var(--wash);color:var(--text-primary);font-weight:600}
+.seg button:disabled{color:var(--text-muted);cursor:default}
+button.theme{background:var(--surface-1);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer;font:inherit;font-size:12px}
+.card{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-top:16px}
+.chead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pill{display:inline-block;font-size:11px;font-weight:500;color:var(--text-muted);border:1px solid var(--border);border-radius:999px;padding:0 7px;white-space:nowrap}
+.src{margin-left:auto}.src.mock{border-style:dashed;color:var(--serious)}
+.takeaway{margin:6px 0 10px;color:var(--text-secondary)}
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin:6px 0 4px;font-size:12px;color:var(--text-secondary)}
+.legend span{display:inline-flex;align-items:center;gap:6px}.legend i{width:10px;height:10px;border-radius:3px;display:inline-block}
+svg{display:block;width:100%;height:auto;overflow:visible}svg text{fill:var(--text-muted);font-size:11px;font-family:inherit}
+svg text.lab{fill:var(--text-secondary);font-size:11.5px}svg text.val{fill:var(--text-primary);font-size:11.5px;font-weight:600}
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+@media (max-width:820px){.grid2,.grid3{grid-template-columns:1fr}}
+.tile{background:var(--page);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+.tile .big{font-size:20px;font-weight:650}.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.chip{font-size:11.5px;border:1px solid var(--border);border-radius:6px;padding:1px 6px;color:var(--text-secondary);white-space:nowrap}
+table{border-collapse:collapse;width:100%;font-size:12.5px;margin-top:6px}th,td{text-align:left;padding:5px 7px;border-bottom:1px solid var(--grid);vertical-align:top}
+th{color:var(--text-secondary);font-weight:600}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+code{font-size:11.5px;background:var(--wash);padding:1px 4px;border-radius:4px}
+details{margin-top:8px}summary{cursor:pointer;color:var(--text-muted);font-size:12px}
+.tip{position:fixed;pointer-events:none;background:var(--surface-1);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;padding:7px 9px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.12);opacity:0;z-index:10;max-width:340px}
+.tip .row{display:flex;gap:10px;justify-content:space-between}.tip i{width:8px;height:8px;border-radius:2px;display:inline-block;margin-right:5px}
+.strip td{padding:2px 0;text-align:center;font-size:13px;border-bottom:1px solid var(--grid)}.strip td.gl{text-align:left;padding-right:8px;font-size:12px;color:var(--text-secondary);white-space:nowrap}
+.strip th{font-weight:500;color:var(--text-muted);font-size:11px;text-align:center}
+.st-pass{color:var(--good)}.st-fail{color:var(--critical)}.st-crash{color:var(--critical)}.st-infra{color:var(--serious)}.st-na{color:var(--text-muted)}
+.unassigned{color:var(--critical);font-weight:600}
+.cl{font-size:12.5px;color:var(--text-secondary);margin:6px 0 0;padding-left:18px}.cl li{margin:2px 0}
+.sec{margin:26px 0 0;font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--text-muted)}
+.ot{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:12px 14px}.ot h3{margin:0 0 6px}
+.ot .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 8px;font-size:12.5px;color:var(--text-secondary);align-items:baseline}
+.ot .kv b{font-size:17px;color:var(--text-primary);font-weight:650;text-align:right;font-variant-numeric:tabular-nums}
+.ot .kv>span:not(.d){white-space:nowrap}.ot .d{font-size:11px;color:var(--text-muted);text-align:right;grid-column:1 / span 2;margin-top:-4px}
+.age{font-size:13px;font-weight:500;color:var(--text-muted);margin-left:4px}.age.stale{color:var(--critical)}
+.tile .line{font-size:13px;display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}.tile .lk{display:inline-block;min-width:58px;color:var(--text-muted);font-size:12px}.tile .ttl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+details.about{margin-top:6px}details.about>summary{font-size:12px;color:var(--text-muted);cursor:pointer;list-style:none}details.about>summary::before{content:"ⓘ About this block"}details.about[open]>summary::before{content:"ⓘ Hide"}details.about>summary::-webkit-details-marker{display:none}
+.pt{margin-top:8px;font-size:12px}.pt th,.pt td{padding:2px 6px;border-bottom:1px solid var(--grid)}.pt th{font-weight:500;color:var(--text-muted)}.pt td:first-child,.pt th{white-space:nowrap}.pt td:not(:first-child),.pt th:not(:first-child){text-align:center;width:17%}
+.up{color:var(--good)}.down{color:var(--critical)}
+</style></head><body><div class="viz-root"><div class="wrap">
+<header><div><h1>CI health: facebookexperimental/triton</h1>
+<p class="sub">MI350 · B200 · H100 GPU workflows · data as of <b id="asof">…</b> · refreshed every 3 h</p></div>
+<button class="theme" id="themeBtn" type="button">Toggle theme</button></header>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="card"><div class="chead"><h2>Latest status <span id="now-age" class="age"></span></h2><span class="pill">green is better</span></div>
+<div class="grid3" id="now"></div>
+<p class="muted">PR, 24 h = every PR run started in the last 24 h; a red PR run is often the PR’s own fault, so this is a summary, not the latest run. Green only when every finished run passed; the test / infra split is detail, explained in the trend views below. The purpose table counts every run where that test step finished, including runs later cancelled, so it can show a failure the run-level count does not. – = not run for that trigger (TLX perf runs only on nightlies). Push = the newest run triggered by a land on <code>main</code> (PR-scope test selection does not apply; it runs the full job set its paths filter allows). Nightly = the newest scheduled run, every 6 h. Ages count from when the run started. Only nightly ages turn red (after 7 h): pushes depend on what lands and on path filters, so long gaps are normal. Groups come from step names via <code>groups.yml</code>: TLX core = <code>Run TLX core tests</code>, Tutorial correctness = <code>Run TLX tutorial correctness tests</code>, TLX codegen = <code>Run device-agnostic TLX codegen tests</code>, TritonBench = <code>*-tritonbench-test</code> (formerly <code>*-meta-triton-test</code>), Gluon = <code>Run Gluon tests (python/test/gluon)</code>, Runtime = <code>Run runtime unit tests</code>, TLX perf = <code>Run host-default TLX L2 perf</code>.</p></div>
+<div class="sec">Usage</div>
+<div class="card"><div class="chead"><h2>Runner minutes per successful PR run, by job</h2><span class="pill">↓ lower is better</span></div>
+<p class="takeaway">Average job time per successful PR run, by ISO week (Monday start), over every successful PR run that week. Build runs on a CPU runner; the rest on GPU runners. Reporting jobs are left out.</p>
+<div class="legend" id="lg-rt"></div><div id="ch-rt"></div></div>
+<div class="card"><div class="chead"><h2>GPU hours per day, by run outcome</h2><span class="pill">↓ lower is better; failed + cancelled hours are waste</span></div>
+<p class="takeaway">Sum of job start-to-finish times on GPU runners (labels without <code>ubuntu</code>), split by how the run ended. The wheel build runs on a CPU runner and is left out.</p>
+<div class="legend" id="lg-gh"></div><div class="grid3" id="ch-gh"></div></div>
+
+<div class="sec">Status</div>
+
+<div class="card"><div class="chead"><h2>Pass rate by workflow and trigger</h2><span class="pill">↑ higher is better</span></div>
+<p class="takeaway">One line per trigger, never blended: a red nightly and a red PR mean different things. Pass rate = passed ÷ (passed + failed); cancelled runs are left out. Dashed lines mark commits on <code>main</code> that changed the GPU workflow files.</p>
+<div class="legend" id="lg-pr"></div><div id="ch-pr"></div></div>
+<div class="card"><div class="chead"><h2>Why runs failed, per day</h2><span class="pill">↓ fewer is better; infra and perf should reach 0</span></div>
+<p class="takeaway">Failed runs by cause, all triggers combined. Classified from the failed step names: infra = setup, wheel download or install, credentials, runner lost; config = <code>startup_failure</code>; perf = only perf steps failed; test = any test step failed.</p>
+<div class="legend" id="lg-cause"></div><div id="ch-cause"></div><details><summary>Show data table</summary><div id="tb-cause"></div></details></div>
+<div class="card"><div class="chead"><h2>Every nightly on <code>main</code>, last 14 days</h2><span class="pill">more ✓ is better</span></div>
+<p class="takeaway">Each column is one scheduled run (every 6 h); each row a test group, mapped from step names. A grey rule marks the first nightly after a commit that changed the GPU workflow files.</p>
+<div id="strip"></div>
+<p class="muted" id="strip-leg"></p></div>
+<p class="muted" style="margin-top:22px">Rebuilt every 3 h from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
+</div><div class="tip" id="tip"></div></div>
+<script>
+let DATA=null,DAYS=[],MARKS=[],ASOF=null;
+const NS="http://www.w3.org/2000/svg", el=(t,a={},p)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);if(p)p.appendChild(e);return e};
+const tip=document.getElementById("tip");
+const showTip=(h,ev)=>{tip.innerHTML=h;tip.style.opacity=1;let x=ev.clientX+14,y=ev.clientY+14;if(x+tip.offsetWidth>innerWidth-8)x=ev.clientX-tip.offsetWidth-14;if(y+tip.offsetHeight>innerHeight-8)y=ev.clientY-tip.offsetHeight-14;tip.style.left=x+"px";tip.style.top=y+"px"};
+const hideTip=()=>tip.style.opacity=0;
+const legend=(id,items)=>document.getElementById(id).innerHTML=items.map(([c,l])=>`<span><i style="background:var(${c})"></i>${l}</span>`).join("");
+const table=(id,head,rows,num=[])=>document.getElementById(id).innerHTML=`<table><thead><tr>${head.map((h,i)=>`<th class="${num.includes(i)?"n":""}">${h}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map((c,i)=>`<td class="${num.includes(i)?"n":""}">${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+document.getElementById("themeBtn").onclick=()=>{const r=document.documentElement;r.dataset.theme=(r.dataset.theme==="dark"||(!r.dataset.theme&&matchMedia("(prefers-color-scheme: dark)").matches))?"light":"dark";if(DATA)render()};
+const short=d=>d.slice(5);
+const WF=[["mi350.yml","MI350"],["b200.yml","B200"],["h100.yml","H100"]];
+const EVS=[["PR","--series-1"],["push","--series-2"],["nightly","--series-3"]];
+const CAUSES=[["test","--series-1","Test"],["infra","--series-2","Infra"],["perf","--series-4","TLX perf"],["config","--neutral","Config"],["unknown","--axis","Unknown"]];
+let EVSEL="all";
+const SYM={pass:["✓","st-pass","Pass"],fail:["✗","st-fail","Failed"],crash:["⊘","st-crash","Perf crashed at setup (ImportError)"],infra:["!","st-infra","Infra"],notrun:["·","st-na","Not run (earlier step failed)"],cancelled:["–","st-na","Cancelled"],running:["…","st-na","Running"],nodata:["?","st-na","No data for this group"],na:["○","st-na","Not applicable (skipped by condition)"]};
+const norm=c=>c;
+const when=t=>{let d=new Date(ASOF.getUTCFullYear()+"-"+t.replace(" ","T")+":00Z");if(d>ASOF)d=new Date((ASOF.getUTCFullYear()-1)+"-"+t.replace(" ","T")+":00Z");return d};
+const ago=t=>{const m=Math.round((ASOF-when(t))/6e4);return m<60?m+" m ago":Math.floor(m/60)+" h "+String(m%60).padStart(2,"0")+" m ago"};
+const ageMin=t=>(ASOF-when(t))/6e4;
+function purposeTable(wf){const cell=c=>{const m={pass:["✓","st-pass"],fail:["✗","st-fail"],infra:["!","st-infra"],notrun:["·","st-na"],na:["–","st-na"],cancelled:["–","st-na"],running:["…","st-na"]}[c]||["–","st-na"];return `<td class="${m[1]}">${m[0]}</td>`};
+ return `<table class="pt"><thead><tr><th>Purpose</th><th>PR 24 h</th><th>Push</th><th>Nightly</th></tr></thead><tbody>`+DATA.by_purpose[wf].map(x=>{const [p,f]=x.pr;
+  const prc=p+f?`<td class="${f?"st-fail":"st-pass"}">${p}/${p+f}</td>`:'<td class="st-na">–</td>';return `<tr><td>${x.group}</td>${prc}${cell(x.push)}${cell(x.nightly)}</tr>`}).join("")+"</tbody></table>"}
+function now(){const box=document.getElementById("now");box.innerHTML="";let newest=null;for(const g of ["MI350","B200","H100"]){const grp=DATA.strip[g];const t=DATA.latest_nightly[g];const last=Object.values(grp)[0].findIndex(x=>x.t===t);if(!newest||t>newest)newest=t;
+ const res=Object.entries(grp).map(([k,v])=>[k,norm(v[last].c)]);const bad=res.filter(([,c])=>!["pass","na"].includes(c)).length;
+ const wf={MI350:"mi350.yml",B200:"b200.yml",H100:"h100.yml"}[g];const lp=DATA.latest_push[wf];const lpt=lp.t.slice(5,16).replace("T"," ");
+ const pushOk=lp.c==="success",pushRun=false;const verdict=(!pushOk&&!pushRun)?"bad":(bad?"warn":"ok");
+ const q=DATA.pr24[wf];const fin=q.passed+q.failed;const li=q.last_infra?q.last_infra.slice(5,16).replace("T"," "):null;
+ const failing=res.filter(([,c])=>!["pass","na"].includes(c));
+ const prTip=`${q.passed} passed, ${q.test} test failures, ${q.infra} infra, ${q.cancelled} cancelled, ${q.running} running (last 24 h)`;
+ box.insertAdjacentHTML("beforeend",`<div class="tile"><h3>${g}</h3>
+ <div class="line" title="${prTip}"><span class="lk">PR 24 h</span><span class="${q.failed?"st-fail":"st-pass"}">${q.failed?"✗":"✓"} ${q.passed}/${fin} passed</span><span class="muted">· ${q.test} test · ${q.infra} infra${q.other?" · "+q.other+" other":""}${li?" · infra "+ago(li):""}</span></div>
+ <div class="line" title="${lp.title}"><span class="lk">Push</span><span class="${pushOk?"st-pass":pushRun?"st-na":"st-fail"}">${pushOk?"✓":pushRun?"…":"✗"} <a href="${lp.url}"><code>${lp.sha}</code></a></span><span class="muted">· ${ago(lpt)}</span>${lp.failed.length?`<span class="st-fail">· ${lp.failed.length} job failed</span>`:""}</div>
+ <div class="line" title="${res.map(([k,c])=>SYM[c][0]+" "+k).join("  ")}"><span class="lk">Nightly</span><span class="${failing.length?"st-fail":"st-pass"}">${failing.length?"✗ "+failing.map(([k,c])=>k+(c==="crash"?" (crash)":"")).join(", "):"✓ all "+res.length+" groups"}</span><span class="${ageMin(t)>420?"age stale":"muted"}">· ${ago(t)}</span></div>${purposeTable(wf)}</div>`)}
+ const newestNightly=newest;Object.values(DATA.latest_push).forEach(lp=>{const t=lp.t.slice(5,16).replace("T"," ");if(t>newest)newest=t});
+ const el2=document.getElementById("now-age");el2.textContent="· latest check started "+ago(newest);el2.className="age"+(ageMin(newestNightly)>420?" stale":"");el2.title="Nightlies run every 6 h; red after 7 h without a new one"}
+function lines(){const box=document.getElementById("ch-pr");box.innerHTML="";const W=1000,rowH=118,m={l:170,r:80,t:10,b:24},iw=W-m.l-m.r,H=m.t+m.b+WF.length*rowH;
+ const svg=el("svg",{viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":"Pass rate per workflow and trigger"},box);const x=i=>m.l+i/(DAYS.length-1)*iw;
+ MARKS.forEach(([d,l])=>{const i=DAYS.indexOf(d);if(i<0)return;el("line",{x1:x(i),x2:x(i),y1:m.t,y2:H-m.b,stroke:"var(--axis)","stroke-dasharray":"3 4"},svg);el("text",{x:x(i)+3,y:m.t+8},svg).textContent=l});
+ DAYS.forEach((d,i)=>{if(i%2===0)el("text",{x:x(i),y:H-6,"text-anchor":"middle"},svg).textContent=short(d)});
+ WF.forEach(([wf,name],r)=>{const y0=m.t+r*rowH+8,ih=rowH-30,y=v=>y0+ih-v/100*ih;
+  el("text",{x:0,y:y0+ih/2+4,class:"lab"},svg).textContent=name;
+  [0,50,100].forEach(v=>{el("line",{x1:m.l,x2:m.l+iw,y1:y(v),y2:y(v),stroke:v?"var(--grid)":"var(--axis)"},svg);el("text",{x:m.l-4,y:y(v)+4,"text-anchor":"end"},svg).textContent=v+"%"});
+  const ends=[];EVS.forEach(([ev,c])=>{const s=(DATA.agg[wf]||{})[ev]||{};let d="",pen=false,last=null;DAYS.forEach((day,i)=>{const a=s[day];const n=a?a.pass+a.fail:0;if(n<1){pen=false;return}const v=100*a.pass/n;d+=(pen?"L":"M")+x(i)+","+y(v);pen=true;last=[i,v]});
+   if(d){el("path",{d,fill:"none",stroke:`var(${c})`,"stroke-width":2,"stroke-linejoin":"round"},svg);if(last)ends.push({t:`${ev} ${Math.round(last[1])}%`,y:y(last[1])})}});
+  ends.sort((a,b)=>a.y-b.y);for(let k=1;k<ends.length;k++)if(ends[k].y-ends[k-1].y<13)ends[k].y=ends[k-1].y+13;
+  ends.forEach(e=>{el("text",{x:m.l+iw+6,y:e.y+4,class:"lab"},svg).textContent=e.t});
+  const hit=el("rect",{x:m.l,y:y0,width:iw,height:ih,fill:"transparent"},svg);
+  hit.addEventListener("mousemove",ev=>{const p=svg.createSVGPoint();p.x=ev.clientX;p.y=ev.clientY;const q=p.matrixTransform(svg.getScreenCTM().inverse());const i=Math.max(0,Math.min(DAYS.length-1,Math.round((q.x-m.l)/iw*(DAYS.length-1))));
+   showTip(`<b>${name} · ${DAYS[i]}</b>`+EVS.map(([e,c])=>{const a=((DATA.agg[wf]||{})[e]||{})[DAYS[i]];return `<div class="row"><span><i style="background:var(${c})"></i>${e}</span><span>${a&&a.pass+a.fail?Math.round(100*a.pass/(a.pass+a.fail))+"% ("+a.pass+"/"+(a.pass+a.fail)+", "+a.cancelled+" cancelled)":"no runs"}</span></div>`}).join(""),ev)});
+  hit.addEventListener("mouseleave",hideTip)});legend("lg-pr",EVS.map(([e,c])=>[c,e]))}
+function causes(){const box=document.getElementById("ch-cause");box.innerHTML="";const W=1000,rowH=92,m={l:150,r:20,t:6,b:24},iw=W-m.l-m.r,H=m.t+m.b+WF.length*rowH,bw=iw/DAYS.length;
+ const svg=el("svg",{viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":"Failed runs per day by cause"},box);const evs=EVSEL==="all"?EVS.map(e=>e[0]):[EVSEL];
+ const get=(wf,day)=>{const o={};CAUSES.forEach(([k])=>o[k]=0);evs.forEach(e=>{const a=((DATA.agg[wf]||{})[e]||{})[day];if(a)CAUSES.forEach(([k])=>o[k]+=a[k])});return o};
+ const max=Math.max(5,...WF.flatMap(([wf])=>DAYS.map(d=>Object.values(get(wf,d)).reduce((s,v)=>s+v,0))));
+ DAYS.forEach((d,i)=>{if(i%2===0)el("text",{x:m.l+i*bw+bw/2,y:H-6,"text-anchor":"middle"},svg).textContent=short(d)});
+ const rows=[];WF.forEach(([wf,name],r)=>{const y0=m.t+r*rowH+6,ih=rowH-22;el("text",{x:0,y:y0+ih/2+4,class:"lab"},svg).textContent=name;
+  el("line",{x1:m.l,x2:m.l+iw,y1:y0+ih,y2:y0+ih,stroke:"var(--axis)"},svg);
+  DAYS.forEach((d,i)=>{const o=get(wf,d);let yy=y0+ih;const tot=Object.values(o).reduce((s,v)=>s+v,0);rows.push([name,short(d),...CAUSES.map(([k])=>o[k]),tot]);
+   CAUSES.forEach(([k,c])=>{if(!o[k])return;const h=o[k]/max*ih;el("rect",{x:m.l+i*bw+2,y:yy-h,width:bw-4,height:Math.max(h-1.5,1),fill:`var(${c})`,rx:1.5},svg);yy-=h});
+   const hit=el("rect",{x:m.l+i*bw,y:y0,width:bw,height:ih,fill:"transparent"},svg);hit.addEventListener("mousemove",ev=>showTip(`<b>${name} · ${d}</b>`+CAUSES.filter(([k])=>o[k]).map(([k,c,l])=>`<div class="row"><span><i style="background:var(${c})"></i>${l}</span><span>${o[k]}</span></div>`).join("")+`<div class="row"><span>Total failed</span><span>${tot}</span></div>`,ev));hit.addEventListener("mouseleave",hideTip)});
+  el("text",{x:m.l+iw,y:y0+8,"text-anchor":"end"},svg).textContent=`max ${max}/day`});
+ legend("lg-cause",CAUSES.map(([k,c,l])=>[c,l]));table("tb-cause",["Workflow","Day",...CAUSES.map(c=>c[2]),"Total"],rows,[2,3,4,5,6,7])}
+function strip(){const out=[];for(const g of ["MI350","B200","H100"]){const grp=DATA.strip[g];const runs=Object.values(grp)[0];
+ const days=[...new Set(runs.map(r=>r.t.slice(0,5)))];const marks=DATA.changelog.map(c=>c.t.slice(5)).sort();const markIdx=new Set(marks.map(m=>runs.findIndex(r=>r.t>=m)).filter(i=>i>0));
+ let h=`<table class="strip"><thead><tr><th style="text-align:left">${g}</th>${days.map(d=>`<th colspan="${runs.filter(r=>r.t.startsWith(d)).length}">${d}</th>`).join("")}</tr></thead><tbody>`;
+ for(const [k,v] of Object.entries(grp)){h+=`<tr><td class="gl">${k}</td>`+v.map((r,i)=>{const c=norm(r.c);const s=SYM[c]||SYM.running;return `<td class="${s[1]}" title="${g} ${r.t} UTC · ${k}: ${s[2]}" style="${markIdx.has(i)?"border-left:2px solid var(--axis)":""}">${s[0]}</td>`}).join("")+"</tr>"}
+ out.push(h+"</tbody></table>")}document.getElementById("strip").innerHTML=out.join('<div style="height:10px"></div>');
+ document.getElementById("strip-leg").innerHTML=Object.values(SYM).map(([s,c,l])=>`<span class="${c}">${s}</span> ${l}`).join(" · ")+". Hover a cell for details."}
+function gpuh(){const box=document.getElementById("ch-gh");box.innerHTML="";const OUT=[["success","--neutral","Passed"],["failed","--series-2","Failed"],["cancelled","--series-4","Cancelled"]];
+ for(const [wf,name] of WF.slice(0,3)){const s=DATA.gpu_hours[wf];const W=320,H=170,m={l:30,r:6,t:18,b:22},iw=W-m.l-m.r,ih=H-m.t-m.b,bw=iw/s.length;const max=Math.max(...s.map(r=>r.success+r.failed+r.cancelled));
+  const d=document.createElement("div");d.innerHTML=`<h3>${name}</h3>`;box.appendChild(d);const svg=el("svg",{viewBox:`0 0 ${W} ${H}`},d);
+  [0,.5,1].forEach(f=>{el("line",{x1:m.l,x2:m.l+iw,y1:m.t+ih-f*ih,y2:m.t+ih-f*ih,stroke:f?"var(--grid)":"var(--axis)"},svg);el("text",{x:m.l-4,y:m.t+ih-f*ih+4,"text-anchor":"end"},svg).textContent=Math.round(f*max)});
+  s.forEach((r,i)=>{let yy=m.t+ih;OUT.forEach(([k,c])=>{const h=r[k]/max*ih;if(h<=0)return;el("rect",{x:m.l+i*bw+1,y:yy-h,width:bw-2,height:Math.max(h-1.5,.5),fill:`var(${c})`},svg);yy-=h});
+   const hit=el("rect",{x:m.l+i*bw,y:m.t,width:bw,height:ih,fill:"transparent"},svg);const tot=r.success+r.failed+r.cancelled;
+   hit.addEventListener("mousemove",ev=>showTip(`<b>${name} · ${r.day}</b>`+OUT.map(([k,c,l])=>`<div class="row"><span><i style="background:var(${c})"></i>${l}</span><span>${r[k].toFixed(1)} h</span></div>`).join("")+`<div class="row"><span>Waste</span><span>${Math.round(100*(r.failed+r.cancelled)/tot)}%</span></div>`,ev));hit.addEventListener("mouseleave",hideTip)});
+  [0,s.length-1].forEach(i=>el("text",{x:m.l+i*bw+bw/2,y:H-6,"text-anchor":"middle"},svg).textContent=short(s[i].day))}
+ legend("lg-gh",OUT.map(([k,c,l])=>[c,l]))}
+let RT_ALL=false;function rt(){const RM=DATA.runner_min,JOBS=[["TLX","--series-1"],["TritonBench","--series-2"],["Gluon","--series-3"],["Runtime","--series-4"],["Build","--neutral"]];
+ const ALLW=[...new Set(Object.values(RM).flatMap(v=>v.map(r=>r.week)))].sort().reverse();const WKS=RT_ALL?ALLW:ALLW.slice(0,2);const ROWS=[];
+ WKS.forEach(w=>["MI350","H100","B200"].forEach((g,k)=>{const r=RM[g].find(x=>x.week===w);if(r)ROWS.push([w,g,r,k===0])}));
+ const box=document.getElementById("ch-rt");box.innerHTML="";const W=1000,rh=16,gp=4,gg=12,m={l:150,r:170,t:4,b:24};
+ const H=m.t+m.b+ROWS.length*(rh+gp)+WKS.length*gg,iw=W-m.l-m.r,mx=Math.ceil(Math.max(100,...ROWS.map(r=>r[2].avg))/50)*50,X=v=>m.l+v/mx*iw;
+ const svg=el("svg",{viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":"Runner minutes per successful PR run, weekly"},box);
+ [...Array(mx/50+1).keys()].map(k=>k*50).forEach(v=>{el("line",{x1:X(v),x2:X(v),y1:m.t,y2:H-m.b,stroke:v?"var(--grid)":"var(--axis)"},svg);el("text",{x:X(v),y:H-6,"text-anchor":"middle"},svg).textContent=v+" min"});
+ let gi=-1,prev=null;ROWS.forEach(([w,g,r,first],i)=>{if(w!==prev){gi++;prev=w}const y=m.t+i*(rh+gp)+gi*gg;
+  if(w!==(ROWS[i-1]||[])[0]){el("text",{x:0,y:y+rh/2+4,class:"lab"},svg).textContent="week of "+w.slice(5);if(w===WKS[0])el("text",{x:0,y:y+rh/2+18},svg).textContent="(partial)"}
+  el("text",{x:m.l-10,y:y+rh/2+4,"text-anchor":"end",class:"lab"},svg).textContent=g;const l=w;
+  let x0=m.l;JOBS.filter(([j])=>r.jobs[j]).forEach(([j,c])=>{const w=r.jobs[j]/mx*iw;el("rect",{x:x0,y,width:Math.max(w-2,1),height:rh,fill:`var(${c})`,rx:2},svg);x0+=w});
+  el("text",{x:x0+6,y:y+rh/2+4,class:"val"},svg).textContent=`${r.avg} avg · ${r.median} med · n=${r.n}`;
+  const hit=el("rect",{x:0,y,width:W,height:rh,fill:"transparent"},svg);hit.addEventListener("mousemove",ev=>showTip(`<b>${g}, week of ${r.week}</b><div class="muted">${r.n} successful PR runs</div>`+JOBS.filter(([j])=>r.jobs[j]).map(([j,c])=>`<div class="row"><span><i style="background:var(${c})"></i>${j}</span><span>${r.jobs[j]} min</span></div>`).join(""),ev));hit.addEventListener("mouseleave",hideTip)});
+ legend("lg-rt",JOBS.map(([j,c])=>[c,j]));
+ if(ALLW.length>2)box.insertAdjacentHTML("beforeend",`<button class="theme" style="margin-top:6px" onclick="RT_ALL=!RT_ALL;rt()">${RT_ALL?"Show last 2 weeks":"Show all "+ALLW.length+" weeks"}</button>`)}
+function collapseNotes(){document.querySelectorAll(".card").forEach(card=>{const notes=[...card.children].filter(e=>e.matches("p.takeaway, p.muted"));if(!notes.length)return;
+ const d=document.createElement("details");d.className="about";d.appendChild(document.createElement("summary"));notes.forEach(n=>d.appendChild(n));card.appendChild(d)});
+}
+function changelog(){document.getElementById("cl").innerHTML=DATA.changelog.map(c=>`<li><b>${c.t.slice(5)}</b> <code>${c.sha}</code> ${c.pr?`<a href="https://github.com/facebookexperimental/triton/pull/${c.pr}">#${c.pr}</a> `:""}${c.subject.replace(/\s*\(#\d+\)\s*$/,"").slice(0,110)}</li>`).join("")}
+function render(){now();lines();causes();strip();gpuh();rt()}const BLOCKS=["now","ch-rt","ch-gh","ch-pr","ch-cause","strip"];
+function placeholder(html){BLOCKS.forEach(id=>{const e=document.getElementById(id);if(e)e.innerHTML=`<p class="muted">${html}</p>`})}
+function initFromData(){DAYS=DATA.days;ASOF=new Date(DATA.asof);
+ MARKS=Object.entries(DATA.changelog.filter(c=>c.pr).reduce((a,c)=>{(a[c.t.slice(0,10)]??=[]).push("#"+c.pr);return a},{})).map(([d,l])=>[d,l.length>1?l[l.length-1]+" +"+(l.length-1):l[0]]);
+ const a=document.getElementById("asof");a.textContent=DATA.asof.slice(0,16).replace("T"," ")+" UTC";
+ if(Date.now()-ASOF>6*36e5){a.classList.add("st-fail");a.title="The collector has not refreshed the data for over 6 h";a.textContent+=" (stale)"}}
+async function load(){placeholder("Loading…");
+ try{const r=await fetch("data.json",{cache:"no-cache"});if(!r.ok)throw new Error(r.status+" "+r.statusText);DATA=await r.json()}
+ catch(e){placeholder(`Could not load data.json (${e.message}). <a href="#" onclick="load();return false">Retry</a>`);return}
+ if(!DATA.asof){placeholder("No data collected yet.");return}
+ initFromData();render();if(!document.querySelector("details.about"))collapseNotes()}
+load();
+</script></body></html>
