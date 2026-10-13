@@ -258,9 +258,34 @@ jobs:
           WHEEL_URL: ${{ needs.mi350-build.outputs.wheel_url }}
           WHEEL_FILENAME: ${{ needs.mi350-build.outputs.wheel_filename }}
         run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}"
           mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
-          curl --fail --location --retry 3 \
-            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
+          # A single S3 stream sometimes runs at ~1 MB/s (6.5 min for the
+          # wheel), so fetch it as 16 parallel byte ranges.
+          SIZE=$(curl --fail --silent --head --location --retry 3 "${WHEEL_URL}" \
+            | awk 'tolower($1)=="content-length:" {n=$2} END {print n+0}')
+          PARTS=16
+          if [ "${SIZE}" -lt $((PARTS * 1048576)) ]; then
+            curl --fail --location --retry 3 --output "${OUT}" "${WHEEL_URL}"
+          else
+            CHUNK=$(( (SIZE + PARTS - 1) / PARTS ))
+            pids=()
+            for i in $(seq 0 $((PARTS - 1))); do
+              start=$((i * CHUNK)); end=$((start + CHUNK - 1))
+              [ "${end}" -ge "${SIZE}" ] && end=$((SIZE - 1))
+              curl --fail --silent --show-error --location --retry 3 \
+                --range "${start}-${end}" --output "${OUT}.part${i}" "${WHEEL_URL}" &
+              pids+=($!)
+            done
+            for p in "${pids[@]}"; do wait "${p}"; done
+            for i in $(seq 0 $((PARTS - 1))); do cat "${OUT}.part${i}"; done > "${OUT}"
+            rm -f "${OUT}".part*
+          fi
+          [ "$(stat -c %s "${OUT}")" -eq "${SIZE}" ] || [ "${SIZE}" -eq 0 ]
+          . "${SETUP_SCRIPT}"
+          python -m zipfile -t "${OUT}" > /dev/null
+          echo "downloaded ${OUT} ($(stat -c %s "${OUT}") bytes)"
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
