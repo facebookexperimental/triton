@@ -1,6 +1,6 @@
 # Owner(s): ["module: inductor"]
 # Regression (gfx950 / AMD MI350X): a partially masked tlx.async_load must lower and
-# preserve the valid values. The synchronous tail-load fallback remains covered too.
+# preserve valid values and zero-fill masked lanes. The synchronous fallback is covered too.
 import unittest
 
 import torch
@@ -41,13 +41,19 @@ if has_tlx():
         USE_MASK: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        OTHER: tl.constexpr = None,
     ):
         offs_m = tl.arange(0, BLOCK_M)
         offs_k = tl.arange(0, BLOCK_K)
         offs = offs_m[:, None] * BLOCK_K + offs_k[None, :]
         smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 1)
         if USE_MASK:
-            tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0), mask=offs_k[None, :] < VALID_K)
+            poison = tl.full((BLOCK_M, BLOCK_K), 7.0, tlx.dtype_of(a_ptr))
+            tlx.local_store(tlx.local_view(smem, 0), poison)
+            if OTHER is None:
+                tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0), mask=offs_k[None, :] < VALID_K)
+            else:
+                tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0), mask=offs_k[None, :] < VALID_K, other=OTHER)
         else:
             tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0))
         tlx.async_load_commit_group([tok])
@@ -122,6 +128,23 @@ class TlxAsyncLoadPartialMaskTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(out[:, :5], a[:, :5])
+        torch.testing.assert_close(out[:, 5:], torch.zeros_like(out[:, 5:]))
+
+    def test_async_load_partial_mask_explicit_other(self):
+        a, out = self._a_out()
+        _async_load_kernel[(1, )](
+            a,
+            out,
+            VALID_K=5,
+            USE_MASK=True,
+            BLOCK_M=self.BLOCK_M,
+            BLOCK_K=self.BLOCK_K,
+            OTHER=3.0,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out[:, :5], a[:, :5])
+        torch.testing.assert_close(out[:, 5:], torch.full_like(out[:, 5:], 3.0))
 
     def test_sync_load_partial_mask_fix_ok(self):
         # THE FIX: the same partial mask via a synchronous tl.load compiles and is correct.
