@@ -38,7 +38,7 @@ from torch._inductor.template_heuristics.triton import (
     TMATemplateConfigMixin,
 )
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
-from torch._inductor.utils import get_num_sms, tma_inner_dim
+from torch._inductor.utils import can_use_tma, get_num_sms, tma_inner_dim
 
 from ..hw import resources
 from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
@@ -963,12 +963,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         num_ctas: int,
         epilogue_subtile: int,
     ) -> bool:
-        """Like _is_valid_config but with a safety margin on SMEM.
-
-        SMEM only: every caller has already run the structural rules and the
-        TMEM check, either via ``_is_valid_config`` when the autotuning pool
-        was built or via ``_fix_config_if_needed`` on the heuristic config.
-        """
+        """Validate the final tile's structural rules and SMEM with a safety margin."""
         return validate_config(
             cls._tile(
                 block_m,
@@ -982,7 +977,6 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             ),
             charge_epilogue=True,
             smem_margin=cls._SMEM_SAFETY_MARGIN,
-            check_rules=False,
             check_tmem=False,
         )
 
@@ -1005,9 +999,15 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             return False
 
         strides = kernel_inputs.strides_hinted()
-        return any(
+        if any(
             tma_inner_dim(strides[idx]) is None
             for idx in (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)
+        ):
+            return True
+
+        return not can_use_tma(
+            *kernel_inputs.mat1mat2(),
+            output_layout=kernel_inputs.output_layout(flexible=False),
         )
 
     def _get_template_configs_impl(
@@ -2305,12 +2305,11 @@ class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuri
         Override to allow TLX templates to run without max_autotune when tlx_mode is set,
         and to decline operands the template's TMA descriptors cannot describe.
 
-        Both descriptor forms in the template hardcode a unit innermost stride, so an
-        operand that is neither row- nor column-major has no valid form and is declined
-        rather than described with a stride it does not have.
+        The input descriptors and the contiguous output descriptor must satisfy
+        TMA's size, stride, and pointer alignment requirements.
         """
         if self._has_unsupported_layout(inputs):
-            log.debug("TLX blackwell_gemm_ws declined: operand is neither row- nor column-major")
+            log.debug("TLX blackwell_gemm_ws declined: unsupported TMA layout")
             return False
         if config.triton.tlx_mode in ("allow", "force"):
             return True
