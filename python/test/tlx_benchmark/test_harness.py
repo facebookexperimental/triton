@@ -1,9 +1,13 @@
 import inspect
 import json
 import os
+import pathlib
+import sys
 
 import pytest
 import triton
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from _harness import (COLD_COMPILE_CAP_S, DEFAULT_REPLICATES, DEFAULT_WARMUP_ITERS, MAX_CLOCK_IDR, MAX_CV,
                       MAX_REPLICATE_DEVIATION, MIN_TOTAL_SAMPLES, MIN_SPEEDUP, SCHEMA_VERSION, Case, ClockTrace,

@@ -199,6 +199,12 @@ GPU latency can be recovered from `flop_count / TFLOP/s`, both in the artifact.
 
 `pytest .` runs both, so it starts a benchmark.
 
+With an editable install (`pip install -e .`), plain `pytest` works. Against a
+separately installed wheel, add `--import-mode=importlib`; otherwise
+`python/conftest.py` puts `python/` on `sys.path` and `import triton` loads the
+source tree instead of the wheel. Use a wheel built from the same commit as the
+checkout, or tests that need newer `triton.tlx.ops` code fail.
+
 ## shapes
 
 1. Synthetic (general): hardware-agnostic shapes included in L1.
