@@ -334,30 +334,11 @@ jobs:
           # Forkserver children must import the test module by its importlib name
           # (python.test.unit.tlx_ops.*), not just its helpers from tlx_ops.
           # Kernel compilation dominates these tests (a cold Triton cache was ~4x
-          # slower than a warm one on a 343-test subset), so overlap compiles across four xdist
-          # workers sharing the runner's single GPU. worksteal rebalances the
-          # few multi-minute cases instead of stranding them behind a static split.
-          # Record CPU count, the container memory limit, and peak host / GPU memory
-          # while the workers run, to size -n against this runner.
-          echo "nproc: $(nproc)  cgroup memory limit: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)"
-          (
-            set +x
-            while :; do
-              host_mb=$(( $(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0) / 1048576 ))
-              vram_mb=$(rocm-smi --showmeminfo vram --csv 2>/dev/null | awk -F, 'NR>1 && $3+0>m {m=$3+0} END {print int(m/1048576)}')
-              echo "$(date +%s) ${host_mb} ${vram_mb:-0}"
-              sleep 15
-            done
-          ) > /tmp/tlx-core-mem.log 2>&1 &
-          MEM_SAMPLER=$!
-          set +e
+          # slower than a warm one on a 343-test subset), so overlap compiles
+          # across four xdist workers sharing the runner's single GPU (pod
+          # memory peaked at ~44 of 100 GiB). worksteal rebalances the few
+          # multi-minute cases instead of stranding them behind a static split.
           PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" --import-mode=importlib -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-core.xml
-          rc=$?
-          set -e
-          kill "${MEM_SAMPLER}" 2>/dev/null || true
-          echo "cgroup memory.peak: $(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 )) MiB"
-          awk '{if ($2+0>h) h=$2+0; if ($3+0>v) v=$3+0} END {printf "peak sampled pod memory: %d MiB, peak GPU VRAM used: %d MiB (%d samples)\n", h, v, NR}' /tmp/tlx-core-mem.log
-          exit "${rc}"
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
