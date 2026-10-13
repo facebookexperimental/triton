@@ -266,7 +266,7 @@ jobs:
             esac
           fi
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py ${K[@]+"${K[@]}"} \
-            -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
+            -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-correctness.xml
       - name: Run host-default TLX L2 perf
         id: run_perf_tests
         if: always() && github.event_name == 'schedule'
