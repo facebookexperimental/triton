@@ -659,6 +659,16 @@ private:
   }
 };
 
+static bool isNonNegativeDividend(Value value) {
+  APInt constant;
+  if (matchPattern(value, m_ConstantInt(&constant)))
+    return !constant.isNegative();
+  if (auto range = value.getDefiningOp<MakeRangeOp>())
+    return range.getStartAttr().getInt() >= 0;
+  // Axis facts alone do not constrain the sign of group bases.
+  return false;
+}
+
 template <typename OpTy>
 class DivOpAxisInfoVisitor final : public BinaryOpVisitorImpl<OpTy> {
 public:
@@ -680,22 +690,9 @@ private:
     if (!resTy)
       return constancy;
     auto shape = resTy.getShape();
-    // Case: lhs contiguous, rhs constant.
-    // lhs: d_lhs * k, d_lhs * k + 1, ..., d_lhs * k + n
-    // rhs: d_rhs * p, d_rhs * p, ..., d_rhs * p
-    // lhs / rhs = d_lhs * k / (d_rhs * p), (d_lhs * k + 1) / (d_rhs * p),
-    // ..., (d_lhs * k + n) / (d_rhs * p)
-    // Because d_lhs % d_rhs = 0 || d_rhs % d_lhs = 0,
-    // the minimal constancy is gcd(d_lhs, d_rhs).
-    // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
-    // we need to use another gcd to get the actual constancy.
-    // Full-dimension contiguity is not required for unsigned division. A
-    // partially contiguous numerator still produces constant runs when the
-    // run boundaries are aligned to the divisor. Signed division cannot use
-    // this relaxation without a non-negativity proof because it truncates
-    // toward zero. Preserve the pre-existing full-dimension inference there.
+    // Signed truncation breaks constant groups at negative multiples.
     constexpr bool isUnsigned = std::is_same_v<OpTy, arith::DivUIOp>;
-    if ((isUnsigned || AxisInfoVisitor::isContiguousDim(lhs, shape, dim)) &&
+    if ((isUnsigned || isNonNegativeDividend(op.getLhs())) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       constancy = std::max(constancy,
                            gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
@@ -741,16 +738,9 @@ private:
       return BinaryOpVisitorImpl<OpTy>::getContiguity(op, lhs, rhs, dim);
     auto shape = resTy.getShape();
     int64_t contiguity = 1;
-    // lhs contiguous, rhs constant
-    // lhs: d_lhs * k, d_lhs * k + 1, ..., d_lhs * k + n
-    // rhs: d_rhs * p, d_rhs * p, ..., d_rhs * p
-    // lhs % rhs = d_lhs * k % (d_rhs * p), (d_lhs * k + 1) % (d_rhs * p),
-    // ..., (d_lhs * k + n) % (d_rhs * p)
-    // Because d_lhs % d_rhs = 0 || d_rhs % d_lhs = 0,
-    // The minimal contiguity is gcd(d_lhs, d_rhs).
-    // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
-    // we need to use another gcd to get the actual contiguity.
-    if (AxisInfoVisitor::isContiguousDim(lhs, shape, dim) &&
+    // Signed remainder jumps after a negative multiple: [0, -3, -2, -1].
+    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
+    if ((isUnsigned || isNonNegativeDividend(op.getLhs())) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       contiguity = gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
                        rhs.getDivisibility(dim));
