@@ -31,7 +31,7 @@ buy back the tuned configs, which are worth up to ~4x on small shapes. The
 gfx950 implementation currently provides only `"heuristic"`.
 
 Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
-kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
+hstu_cross_attn, kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can follow
 `mm`. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
@@ -57,9 +57,9 @@ from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_ba
 
 __all__ = [
     "mm", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
-    "flash_attn_varlen", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
-    "InvalidInput"
+    "flash_attn_varlen", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
+    "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
+    "UnsupportedBackward", "InvalidInput"
 ]
 
 
@@ -581,6 +581,30 @@ def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, cau
     return fn(q, k, v, seq_offsets, max_seq_len, alpha if alpha is not None else 1.0 / q.shape[-1], causal=causal,
               attn_scale=attn_scale, num_targets=num_targets, max_attn_len=max_attn_len,
               contextual_seq_len=contextual_seq_len, space=space)
+
+
+def hstu_cross_attn(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, seq_offsets_q=None, max_q_len=None,
+                    num_softmax_heads=0, num_targets=None, causal=False, shared_kv=False, *, space="full"):
+    """HSTU cross attention over jagged `q` `(total_q, H, D)` and `k`/`v` `(total_kv, H_kv, D/V)`. Differentiable.
+
+    `seq_offsets` are the `(B + 1,)` KV prefix offsets and `seq_offsets_q` the
+    query ones; both default to self-attention style (queries are the KV
+    sequence). The first `num_softmax_heads` heads use softmax, the rest SiLU
+    scaled by the scalar `attn_scale`. `alpha` defaults to `HEAD_DIM ** -0.5`.
+    `shared_kv=True` requires `v is k`.
+    """
+    if (seq_offsets_q is None) != (max_q_len is None):
+        raise InvalidInput("tlx.ops.hstu_cross_attn takes seq_offsets_q and max_q_len together")
+    if seq_offsets_q is None:
+        seq_offsets_q, max_q_len = seq_offsets, max_seq_len
+    fn, spec = impl_for("hstu_cross_attn", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
+    check_backward(spec, q, k, v)
+    import torch
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, seq_offsets, seq_offsets_q, max_seq_len, max_q_len, attn_scale,
+                  alpha if alpha is not None else q.shape[-1]**-0.5, num_softmax_heads=num_softmax_heads,
+                  num_targets=num_targets, causal=causal, shared_kv=shared_kv, space=space)
 
 
 def kimi_delta_attention(q, k, v, g, beta, *, scale=1.0, cu_seqlens=None, cu_seqlens_cpu=None, space="full"):

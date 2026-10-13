@@ -12,7 +12,7 @@ One shot command with extreme simplicity
 python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
-`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `kda`,
+`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
 `kda_prefill`, `kda_decode`.
 
 ```
@@ -58,6 +58,7 @@ options:
 | `flash_attn_mxfp8` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `flash_attn_varlen` | `F.scaled_dot_product_attention` on the padded batch, masked | speedup >= 0.9x | heuristic |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
+| `hstu_cross_attn` | `tutorials/hstu_cross_attn/triton_bw_cross_attention.py` (Triton) | speedup >= 0.9x | full |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
 | `kda_decode` | none | absolute floor, currently unset -> reports only | heuristic |
