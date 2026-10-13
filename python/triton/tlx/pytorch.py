@@ -50,8 +50,8 @@ _D128_HEAD_SPLIT_CONFIG = (*_D128_INTERLEAVED_CONFIG[:-4], 4, -1, False, 1)
 _D128_BM32_CONFIG = (_D128_BM32_ENTRY, 32, *_D128_INTERLEAVED_CONFIG[2:])
 # These configurations preserve the measured compiler options for PR2709.
 _D128_OPTIMIZED_MHA_CONFIG = (
-    _D128_OPTIMIZED_ENTRY,
-    16,
+    _D128_INTERLEAVED_BM32_ENTRY,
+    32,
     256,
     4,
     1,

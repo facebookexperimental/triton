@@ -5912,17 +5912,26 @@ def _attn_bwd_opt_gqa_front(
         q_out = tlx.amd_register_resident(q_out, register_class="vgpr", registers_per_group=4)
     do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
     if not IS_CAUSAL:
-        # Keep LSE scaling on an independent scalar VALU chain.  Broadcasting
-        # the multiply lets LLVM pair an LSE lane with a score fragment in a
-        # packed multiply and creates a false cross-fragment dependency.
-        lse_log2 = tl.inline_asm_elementwise(
-            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-            "=v,v",
-            [lse_values],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        if CACHE_SCORE_K:
+            # Keep native FP32 LSE scaling visible to LLVM.
+            # The empty scalar VGPR pin contains no instruction.
+            lse_log2 = tl.inline_asm_elementwise(
+                "",
+                "=v,0",
+                [lse_values * 1.4426950408889634],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            lse_log2 = tl.inline_asm_elementwise(
+                "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+                "=v,v",
+                [lse_values],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
         # These are soft requirements. Layout propagation does not yet infer
         # the score MFMA layout for broadcast/full operands from elementwise users.
         lse_full = tlx.require_layout(
@@ -7840,11 +7849,13 @@ def _attn_bwd_gqa_bm32_front(
     Q_OUT_LAYOUT: tl.constexpr,
     UPDATE_DV_FIRST_HALF: tl.constexpr = True,
     PIN_FRONT: tl.constexpr = True,
-    GQA8K_FRONT: tl.constexpr = False,
+    NATIVE_FRONT: tl.constexpr = False,
+    DELAY_FRONT_PINS: tl.constexpr = False,
 ):
     """Publish current dS to LDS and optionally update the first dV fragments."""
-    # Use four-register VGPR tuples for the measured GQA8K front.
-    GQA8K_FRONT_REGISTERS_PER_GROUP: tl.constexpr = 4
+    tl.static_assert(not DELAY_FRONT_PINS or (PIN_FRONT and NATIVE_FRONT and not IS_CAUSAL and N == 16384))
+    # Use four-register VGPR tuples for the selected native front.
+    NATIVE_FRONT_REGISTERS_PER_GROUP: tl.constexpr = 4
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
     v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
     k_nm = tlx.local_load(
@@ -7862,11 +7873,11 @@ def _attn_bwd_gqa_bm32_front(
         q_t,
         tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
     )
-    if PIN_FRONT:
+    if PIN_FRONT and not DELAY_FRONT_PINS:
         scores = tlx.amd_register_resident(
             scores,
             register_class="vgpr",
-            registers_per_group=GQA8K_FRONT_REGISTERS_PER_GROUP if GQA8K_FRONT else 16,
+            registers_per_group=NATIVE_FRONT_REGISTERS_PER_GROUP if NATIVE_FRONT else 16,
         )
     if IS_CAUSAL:
         # Mask after scaling so custom zero or negative scales cannot turn an
@@ -7919,15 +7930,15 @@ def _attn_bwd_gqa_bm32_front(
         do_t,
         tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
     )
-    if PIN_FRONT:
+    if PIN_FRONT and not DELAY_FRONT_PINS:
         dp = tlx.amd_register_resident(
             dp,
             register_class="vgpr",
-            registers_per_group=GQA8K_FRONT_REGISTERS_PER_GROUP if GQA8K_FRONT else 16,
+            registers_per_group=NATIVE_FRONT_REGISTERS_PER_GROUP if NATIVE_FRONT else 16,
         )
 
     if not IS_CAUSAL:
-        if GQA8K_FRONT:
+        if NATIVE_FRONT:
             # Use native LSE scaling for the selected specialization.
             # The empty pin keeps each result in one VGPR.
             lse_log2 = tl.inline_asm_elementwise(
@@ -7966,6 +7977,12 @@ def _attn_bwd_gqa_bm32_front(
             MMA_NM,
             pin=False,
         )
+        if PIN_FRONT and DELAY_FRONT_PINS:
+            scores = tlx.amd_register_resident(
+                scores,
+                register_class="vgpr",
+                registers_per_group=NATIVE_FRONT_REGISTERS_PER_GROUP if NATIVE_FRONT else 16,
+            )
         scaled_scores = scores * scale_full - lse_full
     p = tl.math.exp2(scaled_scores)
     delta_full = tlx.require_layout(
@@ -7973,6 +7990,12 @@ def _attn_bwd_gqa_bm32_front(
         MMA_NM,
         pin=False,
     )
+    if PIN_FRONT and DELAY_FRONT_PINS:
+        dp = tlx.amd_register_resident(
+            dp,
+            register_class="vgpr",
+            registers_per_group=NATIVE_FRONT_REGISTERS_PER_GROUP if NATIVE_FRONT else 16,
+        )
     ds = p * (dp - delta_full)
 
     p_nd = tl.reshape(p.to(tl.bfloat16), (2, 2, 2, 2, 16, BLOCK_M))
@@ -8042,12 +8065,18 @@ def _attn_bwd_gqa_bm32_dq_prefetched(
     if k_resident_lo is None:
         k2 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
                             rematerialize_coordinates_group=COORDINATE_GROUP)
+    elif k_resident_lo.shape[0] == 64:
+        k2 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                            rematerialize_coordinates_group=COORDINATE_GROUP)
     else:
         k2 = tlx.extract_slice(k_resident_lo, [32, 128], [64, 0])
     dq = tlx.amd_scheduled_mfma(ds2, k2, dq, resident_operand=1, accumulator_role="transient")
     ds3 = tlx.local_load(tlx.local_slice(prev_ds, [0, 96], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True,
                          rematerialize_coordinates_group=COORDINATE_GROUP)
     if k_resident_lo is None:
+        k3 = tlx.local_load(tlx.local_slice(k_buffer, [96, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
+                            rematerialize_coordinates_group=COORDINATE_GROUP)
+    elif k_resident_lo.shape[0] == 64:
         k3 = tlx.local_load(tlx.local_slice(k_buffer, [96, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True,
                             rematerialize_coordinates_group=COORDINATE_GROUP)
     else:
@@ -8146,7 +8175,8 @@ def _attn_bwd_gqa_bm32_bridge_prefetch2(
     dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
     if not FRAGMENT_CHAIN:
         dk = tlx.require_layout(dk, MMA_ND, pin=False)
-    k_resident_lo = tlx.require_layout(k_resident_lo, K_MD_LAYOUT, pin=False)
+    if k_resident_lo is not None:
+        k_resident_lo = tlx.require_layout(k_resident_lo, K_MD_LAYOUT, pin=False)
     v_resident = tlx.require_layout(v_resident, V_LAYOUT, pin=False)
     lhs0 = tlx.extract_slice(dk_lhs, [128, 32], [0, 0])
     lhs1 = tlx.extract_slice(dk_lhs, [128, 32], [128, 0])
@@ -8175,15 +8205,31 @@ def _attn_bwd_gqa_bm32_bridge_prefetch2(
         c03 = tlx.extract_slice(dk, [128, 32], [0, 96])
         c13 = tlx.extract_slice(dk, [128, 32], [128, 96])
     ds0 = tlx.local_load(tlx.local_slice(prev_ds, [0, 0], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
-    k0 = tlx.extract_slice(k_resident_lo, [32, 128], [0, 0])
+    if k_resident_lo is None:
+        k0 = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    else:
+        k0 = tlx.extract_slice(k_resident_lo, [32, 128], [0, 0])
     ds1 = tlx.local_load(tlx.local_slice(prev_ds, [0, 32], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
-    k1 = tlx.extract_slice(k_resident_lo, [32, 128], [32, 0])
+    if k_resident_lo is None:
+        k1 = tlx.local_load(tlx.local_slice(k_buffer, [32, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    else:
+        k1 = tlx.extract_slice(k_resident_lo, [32, 128], [32, 0])
     ds2 = tlx.local_load(tlx.local_slice(prev_ds, [0, 64], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
-    k2 = tlx.extract_slice(k_resident_lo, [32, 128], [64, 0])
+    if k_resident_lo is None:
+        k2 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    elif k_resident_lo.shape[0] == 64:
+        k2 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    else:
+        k2 = tlx.extract_slice(k_resident_lo, [32, 128], [64, 0])
     c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent")
     dq = tlx.amd_scheduled_mfma(ds0, k0, dq, resident_operand=1, accumulator_role="transient", initialize=True)
     ds3 = tlx.local_load(tlx.local_slice(prev_ds, [0, 96], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
-    k3 = tlx.extract_slice(k_resident_lo, [32, 128], [96, 0])
+    if k_resident_lo is None:
+        k3 = tlx.local_load(tlx.local_slice(k_buffer, [96, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    elif k_resident_lo.shape[0] == 64:
+        k3 = tlx.local_load(tlx.local_slice(k_buffer, [96, 0], [32, 128]), layout=K_MD_LAYOUT, relaxed=True)
+    else:
+        k3 = tlx.extract_slice(k_resident_lo, [32, 128], [96, 0])
     c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent")
     dq = tlx.amd_scheduled_mfma(ds1, k1, dq, resident_operand=1, accumulator_role="transient")
     ds4 = tlx.local_load(tlx.local_slice(prev_ds, [0, 128], [32, 32]), layout=DS_MD_LAYOUT, relaxed=True)
@@ -8424,8 +8470,9 @@ def _attn_bwd_gqa_bm32_phase(
         QT_LAYOUT,
         P_ND_LAYOUT,
         Q_OUT_LAYOUT,
-        PIN_FRONT=HQ == HK or (FRAGMENT_CHAIN and N == 8192),
-        GQA8K_FRONT=FRAGMENT_CHAIN and N == 8192,
+        PIN_FRONT=HQ == HK or (FRAGMENT_CHAIN),
+        NATIVE_FRONT=FRAGMENT_CHAIN,
+        DELAY_FRONT_PINS=FRAGMENT_CHAIN and HQ > HK and N == 16384,
     )
     dv = _attn_bwd_opt_gqa_dv_fragmented_half(
         dv_lhs,
@@ -8437,7 +8484,7 @@ def _attn_bwd_gqa_bm32_phase(
         False,
     )
     # Keep the Q RHS load after the front to shorten its register lifetime.
-    if FRAGMENT_CHAIN and N == 8192:
+    if FRAGMENT_CHAIN:
         tlx.amd_sched_barrier(0)
     dk_rhs = tlx.local_load(dk_rhs, layout=Q_OUT_LAYOUT, relaxed=True)
     dk_rhs = tlx.amd_register_resident(dk_rhs, register_class="vgpr", registers_per_group=4)
@@ -8607,10 +8654,13 @@ def _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel(
     BATCH: tl.constexpr = 1,
     SPLIT_Q: tl.constexpr = 1,
 ):
-    """Four-wave unsplit full GQA backward with one 64-row Q/dO slot."""
+    """Compute dense D128 backward with 32-row query tiles."""
     tl.static_assert(D == 128)
     tl.static_assert(BLOCK_M == 32)
-    tl.static_assert(HQ > HK and N >= 8192 and SPLIT_Q == 1)
+    MHA_BM32: tl.constexpr = (BATCH == 16 and HQ == 16 and HK == 16 and D == 128
+                              and (N == 1024 or N == 2048 or N == 4096 or N == 8192 or N == 16384) and not IS_CAUSAL
+                              and SPLIT_Q == 1)
+    tl.static_assert((HQ > HK and N >= 8192 and SPLIT_Q == 1) or MHA_BM32)
     tl.static_assert(not IS_CAUSAL)
     tl.static_assert(BLOCK_N == 256)
     tl.static_assert(N % 256 == 0)
@@ -8640,6 +8690,9 @@ def _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel(
     stats_batch_base = off_z.to(tl.int64) * HQ * N
     Q = Q + q_batch_base
     DO = DO + q_batch_base
+    if MHA_BM32 and N == 16384:
+        dq_plane = (pid_n // (N // BLOCK_N // 2)).to(tl.int64)
+        DQ_ACC = DQ_ACC + dq_plane * BATCH * HQ * N * D
     DQ_ACC = DQ_ACC + q_batch_base
     LSE = LSE + stats_batch_base
     Delta = Delta + stats_batch_base
@@ -8937,10 +8990,13 @@ def _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel(
     v_operand = tlx.buffer_load(V, v_offsets)
     v_operand = tlx.require_layout(v_operand, k_nm_layout, pin=False)
 
-    FRAGMENT_CHAIN: tl.constexpr = (HQ == 64 and HK == 8 and not IS_CAUSAL and SPLIT_Q == 1
-                                    and ((BATCH == 16 and N == 8192) or (BATCH == 15 and N == 16384)))
-    # Reload the first 128 K rows at dQ use to reduce register pressure.
-    if FRAGMENT_CHAIN and N == 8192:
+    FRAGMENT_CHAIN: tl.constexpr = (MHA_BM32 or (HQ == 64 and HK == 8 and not IS_CAUSAL and SPLIT_Q == 1 and
+                                                 ((BATCH == 16 and N == 8192) or (BATCH == 15 and N == 16384))))
+    # Cache K0/K1 for MHA and selected GQA16K. Reload the other K bands.
+    if MHA_BM32 or (FRAGMENT_CHAIN and N == 16384):
+        k_resident_lo = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [64, D]), token=initial_wait,
+                                       layout=k_md_layout, relaxed=True)
+    elif FRAGMENT_CHAIN:
         k_resident_lo = None
     else:
         k_resident_lo = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [128, D]), token=initial_wait,
@@ -8950,7 +9006,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel(
     # Peel the final16K outer so its refill is statically disabled; every
     # steady outer refills exactly the next64rows before the delayedbridge.
     PEEL_LAST: tl.constexpr = N == 16384
-    # Keep dK fragments across phases for the two GQA benchmark shapes.
+    # Keep dK fragments across phases for the selected dense shapes.
     if FRAGMENT_CHAIN:
         dk = (
             tlx.zeros((128, 32), tl.float32, layout=mma_nd),
@@ -9565,6 +9621,8 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
     if causal and split_q != 1:
         raise ValueError("split_q > 1 requires non-causal D128 attention")
     long_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] >= 8192 and split_q == 1)
+    measured_mha_bm32 = (shape in ((16, 16, 16, 1024, 128), (16, 16, 16, 2048, 128), (16, 16, 16, 4096, 128),
+                                   (16, 16, 16, 8192, 128), (16, 16, 16, 16384, 128)) and not causal and split_q == 1)
     short_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] <= 4096 and split_q == 1)
     long_8k = long_gqa and shape[3] == 8192
     measured_gqa8k = shape == (16, 64, 8, 8192, 128) and not causal and split_q == 1
@@ -9581,8 +9639,8 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
     regalloc["sink_insts_to_avoid_spills"] = os.environ.get(_D128_SINK_INSTS_ENV, sink_default) == "1"
     return _D128InterleavedDispatch(
         main_entry=(_attn_bwd_dkdv_dq_d128_gqa_bm32_kernel
-                    if long_gqa else _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel),
-        block_m=32 if long_gqa else 16,
+                    if long_gqa or measured_mha_bm32 else _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel),
+        block_m=32 if long_gqa or measured_mha_bm32 else 16,
         block_n=256,
         num_warps=4,
         num_stages=1,
