@@ -107,9 +107,6 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v4
-      # TEMPORARY (remove before landing): is a persistent uv cache possible?
-      - name: Probe runner storage
-        run: bash .github/scripts/probe_runner_storage.sh
       - name: Resolve TritonBench ref from PR body (X-link)
         id: tritonbench_pr
         if: github.event_name == 'pull_request'
@@ -194,9 +191,6 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v4
-      # TEMPORARY (remove before landing): is a persistent uv cache possible?
-      - name: Probe runner storage
-        run: bash .github/scripts/probe_runner_storage.sh
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
@@ -426,9 +420,6 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v4
-      # TEMPORARY (remove before landing): is a persistent uv cache possible?
-      - name: Probe runner storage
-        run: bash .github/scripts/probe_runner_storage.sh
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
