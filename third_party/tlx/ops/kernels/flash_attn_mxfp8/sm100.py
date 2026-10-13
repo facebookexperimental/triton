@@ -179,6 +179,9 @@ def _expcast_e4m3x4(x, addend, mult):
     # code + 1024 lies in [1024, 2048) where f16 ulp is 1: the f16 cvt rounds to the integer code in the
     # low byte, and max with 1024 maps negative and -inf to code 0. max.f16x2 also maps NaN to code 0, so a
     # NaN in S yields a finite but wrong output row where the exp2 path yields a NaN row.
+    # The clamp floor is code 0 (exact 0.0), not the min subnormal, so masked keys get exactly zero weight. It
+    # flushes below ~2^-6.9 * 2^e (baseline: ~2^-10 * 2^e), >= 15.7 binades under the block max.
+    # pack=4 returns 4 E4M3 bytes in one b32, as in tlx.mxfp8_utils._cvt_e4m3x4_f32.
     return tl.inline_asm_elementwise(
         """
         {
@@ -305,7 +308,8 @@ def _softmax_inner_loop(
             p_fp8_3d = _expcast_e4m3x4(qk_reshaped, tl.reshape(addend, [BLOCK_M_SPLIT, NUM_BLOCKS, 1]), qk_scale * 8.0)
             e_int = e_blk.to(tl.int32)
             p_scale = (e_int + 127).to(tl.uint8)
-            # l sums the decoded P, keeping numerator and denominator consistent.
+            # l sums the decoded P, keeping numerator and denominator consistent. e_blk = -127 decodes to 0.0,
+            # not 2^-127; such blocks are fully masked (all codes 0) or > ~118 binades under the row max.
             blk_sum = tl.sum(p_fp8_3d.to(tl.float32), 2)
             l_ij = tl.sum(blk_sum * ((e_int + 127) << 23).to(tl.float32, bitcast=True), 1)
 
