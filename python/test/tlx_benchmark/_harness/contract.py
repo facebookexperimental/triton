@@ -178,3 +178,11 @@ def artifact(results: Sequence[Result], env: dict[str, Any]) -> dict:
         "env": env,
         "results": [r.to_dict() for r in results],
     }
+
+
+def require_schema(doc: dict) -> dict:
+    """Reject artifacts from another schema; their ratios are not comparable."""
+    version = doc.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise ValueError(f"artifact schema_version {version!r} != {SCHEMA_VERSION}; re-run instead of comparing")
+    return doc

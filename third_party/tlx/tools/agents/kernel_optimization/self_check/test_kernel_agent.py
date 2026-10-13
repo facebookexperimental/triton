@@ -54,6 +54,7 @@ from ..decision_maker.policy import (
     preflight_decision,
     weighted_geometric_speedup,
 )
+from ..decision_maker.optimization_suites import GFX942_MM_OPTIMIZATION_SUITES
 from ..decision_maker.orchestrator import KernelOptimizer, _profile_log_parts
 from ..decision_maker.tuning import (
     _parity_summary,
@@ -64,6 +65,7 @@ from ..decision_maker.tuning import (
 )
 from ..decision_maker.profiling import ProfileRequest
 from ..optimizer.agent import (
+    AgentDiagnosticRequest,
     AgentSourceResearchRequest,
     CandidateContext,
     CandidateProposal,
@@ -1372,6 +1374,11 @@ class CliTest(unittest.TestCase):
         self.assertEqual(_resolve_task(args), "tuning")
 
     def test_gfx942_kernel_authoring_groups_are_disjoint(self) -> None:
+        # Each group targets one structural bottleneck and drives its own
+        # authoring run. A shared shape could get conflicting kernel changes on
+        # one dispatch path and be credited by both runs. Exact counts force a
+        # new shape into one group on purpose. The group_b_* slices overlap
+        # group_b by design and are not checked.
         groups = {
             name: production_cases("mm", name)
             for name in (
@@ -1393,6 +1400,13 @@ class CliTest(unittest.TestCase):
             for case in cases
         ]
         self.assertEqual(len(case_ids), len(set(case_ids)))
+
+    @unittest.skipUnless(importlib.util.find_spec("triton"), "production shapes require triton")
+    def test_gfx942_kernel_authoring_groups_come_from_production_shapes(self) -> None:
+        production = {case.case_id for case in production_cases("mm", "gfx942_all")}
+        for name in GFX942_MM_OPTIMIZATION_SUITES:
+            cohort = {case.case_id for case in production_cases("mm", name)}
+            self.assertLessEqual(cohort, production, name)
 
     def test_tune_after_authoring_is_explicit_and_infers_authoring(self) -> None:
         args = _parse_args(
@@ -2057,6 +2071,58 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(len(contexts[1].research_evidence), 1)
         self.assertTrue(result.success)
         self.assertEqual(result.best_kernel, candidate_source)
+
+    def test_diagnostic_budgets_are_charged_per_tool(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        contexts = []
+
+        class Provider:
+            def propose(self, request, context):
+                del request
+                contexts.append(context)
+                if not context.diagnostic_evidence:
+                    return AgentDiagnosticRequest(
+                        tool="proton",
+                        source_digest=source_digest(context.current_source),
+                        case_ids=("a", ),
+                        question="Which role waits longest?",
+                        rationale="Wait time is unattributed.",
+                        proton_passes=("role", "wait"),
+                    )
+                return CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster")
+
+        harness_path = Path(__file__).with_name("fixtures") / "fake_harness.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            KernelOptimizer(Provider()).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=harness_path,
+                    cases=(InputCase("a", {}), ),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=root / "out",
+                )
+            )
+
+        budget = OptimizationBudget()
+        self.assertEqual(len(contexts), 2)
+        self.assertEqual(
+            contexts[1].remaining_diagnostic_actions,
+            budget.max_diagnostic_actions_per_candidate - 1,
+        )
+        self.assertEqual(
+            contexts[1].remaining_ncu_collections,
+            budget.max_diagnostic_ncu_collections,
+        )
+        self.assertEqual(
+            contexts[1].remaining_proton_passes,
+            budget.max_diagnostic_proton_passes - 2,
+        )
 
     def test_parity_tuning_refines_from_best_intermediate_tree(self) -> None:
         def performance(parity: float) -> PerformanceSummary:

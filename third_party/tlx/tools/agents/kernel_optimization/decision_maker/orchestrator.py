@@ -146,20 +146,17 @@ class DecisionMaker:
                     "required native profiler produced no usable duration for: "
                     + ", ".join(missing_profiles)
                 )
-        if bool(
-            request.target.evaluation_policy.get(
-                "require_aten_att_comparison", False
-            )
-        ):
-            missing_comparisons = [
+        if bool(request.target.evaluation_policy.get("require_roofline", False)):
+            missing_rooflines = [
                 evaluation.case_id
                 for evaluation in baseline.cases
-                if not bool(evaluation.profile.get("aten_comparison", {}).get("valid"))
+                if not bool(evaluation.profile.get("roofline", {}).get("valid"))
+                and not bool(evaluation.profile.get("roofline", {}).get("exceeds_roofline"))
             ]
-            if missing_comparisons:
+            if missing_rooflines:
                 raise HarnessExecutionError(
-                    "required paired ATen/TLX ATT comparison was unavailable for: "
-                    + ", ".join(missing_comparisons)
+                    "required roofline evidence was unavailable for: "
+                    + ", ".join(missing_rooflines)
                 )
         if request.diagnostic_proton_intra_kernel:
             baseline_diagnostics = _collect_diagnostic_profiles(
@@ -234,6 +231,8 @@ class DecisionMaker:
                     research_evidence = []
                     proposal = None
                     diagnostic_actions = 0
+                    ncu_collections = 0
+                    proton_passes = 0
                     research_actions = 0
                     for action_index in range(
                         request.budget.max_agent_actions_per_candidate
@@ -260,12 +259,12 @@ class DecisionMaker:
                                 remaining_ncu_collections=max(
                                     0,
                                     request.budget.max_diagnostic_ncu_collections
-                                    - diagnostic_actions,
+                                    - ncu_collections,
                                 ),
                                 remaining_proton_passes=max(
                                     0,
                                     request.budget.max_diagnostic_proton_passes
-                                    - diagnostic_actions,
+                                    - proton_passes,
                                 ),
                                 remaining_source_research_actions=min(
                                     request.budget.max_source_research_actions_per_candidate
@@ -312,6 +311,14 @@ class DecisionMaker:
                         if isinstance(action, AgentDiagnosticRequest):
                             if diagnostic_actions >= request.budget.max_diagnostic_actions_per_candidate:
                                 raise ValueError("diagnostic action budget exhausted")
+                            requested_passes = len(action.proton_passes)
+                            if action.tool == "ncu" and ncu_collections >= request.budget.max_diagnostic_ncu_collections:
+                                raise ValueError("NCU collection budget exhausted")
+                            if (
+                                action.tool == "proton"
+                                and proton_passes + requested_passes > request.budget.max_diagnostic_proton_passes
+                            ):
+                                raise ValueError("Proton pass budget exhausted")
                             selected_ids = set(action.case_ids)
                             selected_cases = tuple(
                                 case for case in request.cases if case.case_id in selected_ids
@@ -363,6 +370,10 @@ class DecisionMaker:
                                 )
                             )
                             diagnostic_actions += 1
+                            if action.tool == "ncu":
+                                ncu_collections += 1
+                            else:
+                                proton_passes += requested_passes
                             continue
                         raise TypeError(f"unsupported candidate action {type(action).__name__}")
                     if proposal is None:

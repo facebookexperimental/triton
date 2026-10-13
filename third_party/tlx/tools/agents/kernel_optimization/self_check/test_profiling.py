@@ -11,10 +11,7 @@ from unittest import mock
 from unittest.mock import patch
 
 from ..decision_maker.profiling import rocm_profiler as rocm_profiler_module
-from ..decision_maker.profiling.amd_att import (
-    collect_amd_att,
-    compare_amd_att_profiles,
-)
+from ..decision_maker.profiling.amd_att import collect_amd_att
 from ..decision_maker.profiling.amdgcn_isa import analyze_amdgcn, collect_amdgcn_isa
 from ..decision_maker.profiling import (
     ProfileRequest,
@@ -748,10 +745,14 @@ class ProfileParsingTest(unittest.TestCase):
                 "tool": "rocprofv3",
                 "summary": {"duration_us": 12.0, "dominant_kernel": "gemm"},
             }
-            with patch.object(mm, "collect_rocprofv3", return_value=expected) as collect:
+            properties = mock.Mock(multi_processor_count=304)
+            with (
+                patch.object(mm, "collect_rocprofv3", return_value=expected) as collect,
+                patch.object(mm.torch.cuda, "get_device_properties", return_value=properties),
+            ):
                 profile = mm.profile(
                     artifact,
-                    {"case_id": "shape", "parameters": {}},
+                    {"case_id": "shape", "parameters": {"m": 128, "n": 128, "k": 128}},
                     {
                         "tools": ["rocprofv3"],
                         "level": "deep",
@@ -759,6 +760,7 @@ class ProfileParsingTest(unittest.TestCase):
                     },
                 )
             self.assertEqual(profile["rocprofv3"], expected)
+            self.assertEqual(profile["roofline"]["limiter"], "memory")
             workload = collect.call_args.args[0]
             self.assertIn("--winner", workload)
             self.assertIn("gfx942", workload)
@@ -809,47 +811,40 @@ class ProfileParsingTest(unittest.TestCase):
             self.assertEqual(profile["iteration_range"], "[4]")
             self.assertEqual(len(profile["artifacts"]["ui_directories"]), 1)
 
-    def test_compares_numeric_stats_from_validated_att_bundles(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            tlx_stats = root / "tlx.csv"
-            aten_stats = root / "aten.csv"
-            tlx_stats.write_text("metric,cycles,waves\ngemm,120,8\n")
-            aten_stats.write_text("metric,cycles,waves\naten,100,4\n")
-            comparison = compare_amd_att_profiles(
-                {
-                    "valid": True,
-                    "validation": {"stats_files": [str(tlx_stats)]},
-                },
-                {
-                    "valid": True,
-                    "validation": {"stats_files": [str(aten_stats)]},
-                },
-            )
-        self.assertTrue(comparison["valid"])
-        self.assertEqual(comparison["tlx_over_aten"]["cycles"], 1.2)
-        self.assertEqual(comparison["tlx_over_aten"]["waves"], 2.0)
+    def _roofline(self, m: int, n: int, k: int, duration_us: float, arch: str = "gfx942"):
+        from ..decision_maker.tuning_harnesses import mm
 
-    def test_summarizes_actionable_tlx_versus_aten_deltas(self) -> None:
-        from ..decision_maker.tuning_harnesses.mm import _compare_with_aten
+        case = {"parameters": {"m": m, "n": n, "k": k}}
+        rocprof = {"summary": {"duration_us": duration_us}}
+        properties = mock.Mock(multi_processor_count=304)
+        with patch.object(mm.torch.cuda, "get_device_properties", return_value=properties):
+            return mm._roofline(case, rocprof, arch, "cuda:0")
 
-        comparison = _compare_with_aten(
-            {
-                "summary": {"duration_us": 120.0},
-                "counters": {"MfmaUtil": 40.0, "MemUnitStalled": 8.0},
-                "kernels": [{"resources": {"vgpr_count": 96.0}}],
-            },
-            {
-                "summary": {"duration_us": 100.0},
-                "counters": {"MfmaUtil": 80.0, "MemUnitStalled": 2.0},
-                "kernels": [{"resources": {"vgpr_count": 48.0}}],
-            },
-            {"valid": True, "tlx_over_aten": {"Latency": 1.5}},
-        )
-        self.assertTrue(comparison["valid"])
-        self.assertEqual(comparison["tlx_over_aten_duration"], 1.2)
-        self.assertEqual(comparison["tlx_over_aten_counters"]["MfmaUtil"], 0.5)
-        self.assertEqual(comparison["tlx_over_aten_resources"]["vgpr_count"], 2.0)
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "mm tuning harness requires torch")
+    def test_roofline_reports_compute_limiter_and_headroom(self) -> None:
+        roofline = self._roofline(4096, 4096, 4096, 150.0)
+        self.assertTrue(roofline["valid"])
+        self.assertEqual(roofline["limiter"], "compute")
+        self.assertAlmostEqual(roofline["peak_tflops"], 1307.4)
+        self.assertAlmostEqual(roofline["roofline_us"], 2 * 4096**3 / 1307.4e12 * 1e6)
+        self.assertAlmostEqual(roofline["fraction_of_roofline"], roofline["roofline_us"] / 150.0)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "mm tuning harness requires torch")
+    def test_roofline_reports_memory_limiter_for_skinny_gemm(self) -> None:
+        roofline = self._roofline(294912, 128, 128, 40.0)
+        self.assertTrue(roofline["valid"])
+        self.assertEqual(roofline["limiter"], "memory")
+        min_bytes = 2 * (294912 * 128 + 128 * 128 + 294912 * 128)
+        self.assertAlmostEqual(roofline["roofline_us"], min_bytes / 5.3e12 * 1e6)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "mm tuning harness requires torch")
+    def test_roofline_rejects_unusable_durations_and_unknown_arch(self) -> None:
+        self.assertFalse(self._roofline(4096, 4096, 4096, 0.0)["valid"])
+        beats = self._roofline(4096, 4096, 4096, 1.0)
+        self.assertIn("beats", beats["error"])
+        self.assertTrue(beats["exceeds_roofline"])
+        self.assertNotIn("exceeds_roofline", self._roofline(4096, 4096, 4096, 0.0))
+        self.assertFalse(self._roofline(4096, 4096, 4096, 150.0, arch="gfx950")["valid"])
 
     def test_compact_profile_summary_omits_raw_blobs(self) -> None:
         compact = compact_profile_summary(

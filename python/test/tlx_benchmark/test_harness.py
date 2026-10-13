@@ -12,8 +12,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _harness import (COLD_COMPILE_CAP_S, DEFAULT_REPLICATES, DEFAULT_WARMUP_ITERS, MAX_CLOCK_IDR, MAX_CV,
                       MAX_REPLICATE_DEVIATION, MIN_TOTAL_SAMPLES, MIN_SPEEDUP, SCHEMA_VERSION, Case, ClockTrace,
                       CompileStat, GpuState, Result, Status, artifact, decode_event_reasons, fresh_triton_cache,
-                      parse_cpulist, reject_outliers_iqr, relative_interdecile_range, resolve_warmup_and_rep, summarize,
-                      to_tflops)
+                      parse_cpulist, reject_outliers_iqr, relative_interdecile_range, require_schema,
+                      resolve_warmup_and_rep, summarize, to_tflops)
 
 # --------------------------------------------------------------------------
 # measure: sizing the window
@@ -209,6 +209,15 @@ def test_artifact_is_json_serializable_and_versioned():
     # Schema 2: the throughput lives in the Stat and only there.
     assert doc["results"][0]["tlx"]["unit"] == "tflops"
     assert "tlx_tflops" not in doc["results"][0]
+
+
+def test_require_schema_rejects_other_versions():
+    doc = artifact([], env={})
+    assert require_schema(doc) is doc
+    with pytest.raises(ValueError, match="schema_version 3"):
+        require_schema({**doc, "schema_version": 3})
+    with pytest.raises(ValueError, match="schema_version None"):
+        require_schema({"results": []})
 
 
 def test_report_groups_notes_after_the_table(tmp_path):
@@ -1308,7 +1317,8 @@ def test_gpu_events_retries_started_batches_and_discards_their_samples(monkeypat
     timing, calls = _fake_gpu_queue(monkeypatch, [True, False])
     samples = timing._gpu_event_samples(lambda: calls.append("launch"), 2)
     assert samples == [1.0, 1.0]  # only the second attempt's events are timed
-    assert [call for call in calls if isinstance(call, int)] == [timing._GATE_CYCLES, timing._GATE_CYCLES * 2]
+    gates = [call for call in calls if isinstance(call, int)]
+    assert gates == [timing._GATE_CYCLES, timing._GATE_CYCLES * timing._GATE_GROWTH]
     assert calls.count("clear") == calls.count("launch") == 4
     assert calls.index("query") < calls.index("sync", 1)
     assert calls.count("elapsed") == 2

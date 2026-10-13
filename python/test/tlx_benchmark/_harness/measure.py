@@ -230,8 +230,11 @@ def host_overhead_us(fn: Callable, iters: int = 300) -> float:
 LATENCY_MODES = ("wallclock", "gpu_events")
 
 #: The gate must cover the entire enqueue, including slow Python wrappers.
-#: Cycles are only an initial guess; the event query below validates each batch.
-_GATE_CYCLES = 200_000_000
+#: Cycles are only an initial guess; the event query below validates each batch
+#: and each retry quadruples the gate. The gate runs before the first timed
+#: event, so it costs wall time but never enters a sample.
+_GATE_CYCLES = 20_000_000
+_GATE_GROWTH = 4
 _GATE_MAX_ATTEMPTS = 4
 
 
@@ -245,7 +248,7 @@ def _gpu_event_samples(fn: Callable, iters: int, grad_to_none: Optional[Iterable
     for attempt in range(_GATE_MAX_ATTEMPTS):
         starts = [di.Event(enable_timing=True) for _ in range(iters)]
         ends = [di.Event(enable_timing=True) for _ in range(iters)]
-        torch.cuda._sleep(_GATE_CYCLES * 2**attempt)
+        torch.cuda._sleep(_GATE_CYCLES * _GATE_GROWTH**attempt)
         for i in range(iters):
             if grad_to_none is not None:
                 for x in grad_to_none:

@@ -104,6 +104,15 @@ def profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
         parts.append(f"{profiler_name.lower()}.duration_us={profiler_duration:.3f}")
     else:
         parts.append("native_profiler=unavailable")
+    roofline = compact.get("roofline")
+    if isinstance(roofline, Mapping):
+        if roofline.get("valid"):
+            parts.append(
+                f"roofline.limiter={roofline['limiter']} "
+                f"roofline.fraction={float(roofline['fraction_of_roofline']):.3f}"
+            )
+        elif roofline.get("error"):
+            parts.append(f"roofline.error={roofline['error']}")
     att = compact.get("amd_att")
     if isinstance(att, Mapping):
         valid = att.get("valid")

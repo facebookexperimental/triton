@@ -6,7 +6,6 @@ import os
 import sqlite3
 import subprocess
 import tempfile
-import statistics
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -14,9 +13,6 @@ from typing import Any
 from .rocm_profiler import find_rocprofv3
 
 _DECODER_PATTERNS = ("librocprof-trace-decoder.so*", "libatt_decoder_trace.so")
-_ATT_IDENTIFIER_COLUMNS = frozenset(
-    {"agent", "codeobj", "dispatch", "pc", "se", "simd", "vaddr", "wave"}
-)
 
 
 def find_amd_att(
@@ -195,61 +191,6 @@ def _att_command(
         "--",
         *(str(argument) for argument in workload),
     ]
-
-
-def compare_amd_att_profiles(
-    tlx_profile: Mapping[str, Any], aten_profile: Mapping[str, Any]
-) -> dict[str, Any]:
-    """Build a compact, prompt-safe comparison from two validated ATT bundles."""
-    tlx_stats = _att_numeric_stats(tlx_profile)
-    aten_stats = _att_numeric_stats(aten_profile)
-    common = sorted(tlx_stats.keys() & aten_stats.keys())
-    ratios = {
-        name: tlx_stats[name] / aten_stats[name]
-        for name in common
-        if aten_stats[name] != 0.0
-    }
-    return {
-        "valid": bool(tlx_profile.get("valid")) and bool(aten_profile.get("valid")),
-        "tlx_stats": tlx_stats,
-        "aten_stats": aten_stats,
-        "tlx_over_aten": ratios,
-        "diagnostics": (
-            []
-            if common
-            else ["validated ATT bundles had no common numeric stats columns"]
-        ),
-    }
-
-
-def _att_numeric_stats(profile: Mapping[str, Any]) -> dict[str, float]:
-    validation = profile.get("validation", {})
-    if not isinstance(validation, Mapping):
-        return {}
-    paths = validation.get("stats_files", ())
-    if not isinstance(paths, Sequence) or isinstance(paths, (str, bytes)):
-        return {}
-    values: dict[str, list[float]] = {}
-    for raw_path in paths:
-        try:
-            with Path(str(raw_path)).open(newline="") as stream:
-                reader = csv.DictReader(stream)
-                for row in reader:
-                    for name, raw_value in row.items():
-                        if str(name).lower().replace("_", "") in _ATT_IDENTIFIER_COLUMNS:
-                            continue
-                        try:
-                            value = float(str(raw_value).replace(",", ""))
-                        except (TypeError, ValueError):
-                            continue
-                        values.setdefault(str(name), []).append(value)
-        except (OSError, csv.Error):
-            continue
-    return {
-        name: statistics.median(samples)
-        for name, samples in sorted(values.items())
-        if samples
-    }
 
 
 def _validate_bundle(root: Path) -> dict[str, Any]:

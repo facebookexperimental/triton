@@ -34,13 +34,13 @@ if str(_AGENT_ROOT) not in sys.path:
 
 from policy_source import frozen_source_digest, validate_branch_comments  # noqa: E402
 try:  # noqa: E402
-    from ..profiling.amd_att import collect_amd_att, compare_amd_att_profiles
+    from ..profiling.amd_att import collect_amd_att
     from ..profiling.rocm_profiler import collect_rocprofv3
 except ImportError:  # pragma: no cover - direct profile-workload execution
     _DECISION_MAKER_ROOT = _AGENT_ROOT / "decision_maker"
     if str(_DECISION_MAKER_ROOT) not in sys.path:
         sys.path.insert(0, str(_DECISION_MAKER_ROOT))
-    from profiling.amd_att import collect_amd_att, compare_amd_att_profiles
+    from profiling.amd_att import collect_amd_att
     from profiling.rocm_profiler import collect_rocprofv3
 
 
@@ -156,21 +156,17 @@ def benchmark(artifact: dict[str, Any], case: dict[str, Any], repetitions: int) 
     # between search and steady-state paths for very short kernels.
     # Searches may run concurrently on exclusive GPUs, but short steady-state
     # measurements contend on the host when eight worker processes benchmark
-    # at once. Serialize only the final fixed-winner and reference timings.
+    # at once. Serialize only the final fixed-winner timing.
     with _oracle_winner(artifact, a, b, full_best_config) as full, _exclusive_measurement():
         full()
         torch.cuda.synchronize()
         full_samples = _measure(full, repetitions)
-        aten_samples = _measure(lambda: torch.matmul(a, b), repetitions)
     full_median = statistics.median(full_samples)
-    aten_median = statistics.median(aten_samples)
 
     metrics: dict[str, Any] = {
         "full_config_count": full_config_count,
         "full_best_config": full_best_config,
         "full_median_us": full_median,
-        "aten_median_us": aten_median,
-        "aten_parity": aten_median / full_median,
         "top_full_configs": config_rows[:8],
     }
     if artifact["phase"] in {"search_space", "full"}:
@@ -252,7 +248,6 @@ def profile(
         artifact["device"],
         str(artifact["arch"]),
         winner,
-        implementation="tlx",
     )
     level = str(request.get("level", "summary"))
     if "rocprofv3" in tools:
@@ -278,97 +273,55 @@ def profile(
             if kernel_filter
             else {"error": "AMD ATT requires a dominant rocprofv3 kernel"}
         )
-        aten_workload = _profile_workload_command(
-            Path(artifact["source_path"]),
-            case_path,
-            artifact["device"],
-            str(artifact["arch"]),
-            winner,
-            implementation="aten",
-        )
-        aten_artifacts = artifacts_path / "aten_baseline"
-        aten_rocprof = collect_rocprofv3(
-            aten_workload,
-            aten_artifacts,
-            level=level,
-            sample_count=5,
-            timeout_seconds=300.0,
-        )
-        aten_summary = (
-            aten_rocprof.get("summary", {})
-            if isinstance(aten_rocprof, Mapping)
-            else {}
-        )
-        aten_filter = str(aten_summary.get("dominant_kernel", "")).removesuffix(".kd")
-        aten_att = (
-            collect_amd_att(
-                aten_workload,
-                aten_artifacts,
-                kernel_filter=aten_filter,
-                iteration=3,
-                timeout_seconds=300.0,
-            )
-            if aten_filter
-            else {"error": "ATen ATT requires a dominant rocprofv3 kernel"}
-        )
-        record["aten_baseline"] = {
-            "rocprofv3": aten_rocprof,
-            "amd_att": aten_att,
-        }
-        record["att_comparison"] = compare_amd_att_profiles(
-            record["amd_att"], aten_att
-        )
-        record["aten_comparison"] = _compare_with_aten(
-            record.get("rocprofv3", {}),
-            aten_rocprof,
-            record["att_comparison"],
-        )
+    if "rocprofv3" in tools:
+        record["roofline"] = _roofline(case, record["rocprofv3"], str(artifact["arch"]), artifact["device"])
     return record
 
 
-def _compare_with_aten(
-    tlx_rocprof: Mapping[str, Any],
-    aten_rocprof: Mapping[str, Any],
-    att_comparison: Mapping[str, Any],
-) -> dict[str, Any]:
-    tlx_summary = tlx_rocprof.get("summary", {})
-    aten_summary = aten_rocprof.get("summary", {})
-    tlx_duration = float(tlx_summary.get("duration_us", 0.0))
-    aten_duration = float(aten_summary.get("duration_us", 0.0))
-    tlx_counters = tlx_rocprof.get("counters", {})
-    aten_counters = aten_rocprof.get("counters", {})
-    counter_ratios = {
-        name: float(tlx_counters[name]) / float(aten_counters[name])
-        for name in sorted(tlx_counters.keys() & aten_counters.keys())
-        if float(aten_counters[name]) != 0.0
-    }
-    tlx_resources = _dominant_resources(tlx_rocprof)
-    aten_resources = _dominant_resources(aten_rocprof)
-    resource_ratios = {
-        name: float(tlx_resources[name]) / float(aten_resources[name])
-        for name in sorted(tlx_resources.keys() & aten_resources.keys())
-        if float(aten_resources[name]) != 0.0
-    }
+# Dense fp16/bf16 MFMA FLOP/s per CU and HBM bytes/s (MI300X datasheet:
+# 1307.4 TFLOP/s on 304 CUs, 5.3 TB/s). CU count comes from the device, so
+# MI300A scales; MI325X HBM (6.0 TB/s) is understated.
+_ROOFLINE_PEAKS = {"gfx942": (1307.4e12 / 304, 5.3e12)}
+
+
+def _roofline(case: Mapping[str, Any], rocprof: Any, arch: str, device: str) -> dict[str, Any]:
+    peaks = _ROOFLINE_PEAKS.get(arch)
+    summary = rocprof.get("summary", {}) if isinstance(rocprof, Mapping) else {}
+    measured_us = float(summary.get("duration_us", 0.0) or 0.0)
+    if peaks is None:
+        return {"valid": False, "error": f"no roofline peaks for {arch}"}
+    if measured_us <= 0.0:
+        return {"valid": False, "error": "rocprofv3 reported no kernel duration"}
+    flops_per_cu, bandwidth = peaks
+    peak_flops = flops_per_cu * torch.cuda.get_device_properties(torch.device(device)).multi_processor_count
+    parameters = case["parameters"]
+    m, n, k = (int(parameters[name]) for name in ("m", "n", "k"))
+    flops = 2.0 * m * n * k
+    # Compulsory traffic: each operand read once, output written once.
+    min_bytes = 2.0 * (m * k + k * n + m * n)
+    compute_us = flops / peak_flops * 1e6
+    memory_us = min_bytes / bandwidth * 1e6
+    bound_us = max(compute_us, memory_us)
+    if bound_us > 1.05 * measured_us:
+        # rocprofv3 replays launches, so operands can stay in MI300X Infinity Cache and beat the HBM roofline.
+        return {
+            "valid": False,
+            "exceeds_roofline": True,
+            "error": f"rocprofv3 duration {measured_us:.3f} us beats the {bound_us:.3f} us roofline",
+        }
     return {
-        "valid": bool(att_comparison.get("valid"))
-        and tlx_duration > 0.0
-        and aten_duration > 0.0,
-        "duration_us": {"tlx": tlx_duration, "aten": aten_duration},
-        "tlx_over_aten_duration": (
-            tlx_duration / aten_duration if aten_duration > 0.0 else None
-        ),
-        "tlx_over_aten_counters": counter_ratios,
-        "tlx_over_aten_resources": resource_ratios,
-        "att_stats": dict(att_comparison),
+        "valid": True,
+        "limiter": "compute" if compute_us >= memory_us else "memory",
+        "measured_us": measured_us,
+        "roofline_us": bound_us,
+        "fraction_of_roofline": bound_us / measured_us,
+        "arithmetic_intensity": flops / min_bytes,
+        "ridge_point": peak_flops / bandwidth,
+        "achieved_tflops": flops / measured_us * 1e-6,
+        "achieved_min_traffic_tbps": min_bytes / measured_us * 1e-6,
+        "peak_tflops": peak_flops * 1e-12,
+        "peak_tbps": bandwidth * 1e-12,
     }
-
-
-def _dominant_resources(profile: Mapping[str, Any]) -> Mapping[str, Any]:
-    kernels = profile.get("kernels", ())
-    if not isinstance(kernels, Sequence) or not kernels:
-        return {}
-    first = kernels[0]
-    return first.get("resources", {}) if isinstance(first, Mapping) else {}
 
 
 def _profile_workload_command(
@@ -377,8 +330,6 @@ def _profile_workload_command(
     device: str,
     arch: str,
     winner: str,
-    *,
-    implementation: str,
 ) -> list[str]:
     return [
         sys.executable,
@@ -394,25 +345,19 @@ def _profile_workload_command(
         arch,
         "--winner",
         winner,
-        "--implementation",
-        implementation,
     ]
 
 
 def _run_profile_workload(arguments: argparse.Namespace) -> int:
     case = json.loads(arguments.case_json.read_text())
     a, b = _inputs(case, arguments.device)
-    if arguments.implementation == "aten":
-        winner = contextlib.nullcontext(lambda: torch.matmul(a, b))
-    else:
-        module = _load_module(arguments.candidate, arguments.arch)
-        artifact = {
-            "module": module,
-            "op": _install_candidate(module, arguments.arch),
-            "device": arguments.device,
-        }
-        winner = _oracle_winner(artifact, a, b, arguments.winner)
-    with winner as launch:
+    module = _load_module(arguments.candidate, arguments.arch)
+    artifact = {
+        "module": module,
+        "op": _install_candidate(module, arguments.arch),
+        "device": arguments.device,
+    }
+    with _oracle_winner(artifact, a, b, arguments.winner) as launch:
         for _ in range(3):
             launch()
         torch.cuda.synchronize()
@@ -430,7 +375,6 @@ def _parse_profile_arguments() -> argparse.Namespace:
     parser.add_argument("--device", required=True)
     parser.add_argument("--arch", required=True)
     parser.add_argument("--winner", required=True)
-    parser.add_argument("--implementation", choices=("tlx", "aten"), required=True)
     return parser.parse_args()
 
 

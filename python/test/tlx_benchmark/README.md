@@ -145,7 +145,7 @@ ok: everything else
 Each batch is queued behind a GPU gate. Before synchronizing, the harness
 checks that the first timing event has not completed, proving that the entire
 batch was submitted before its timed work began. If the gate expired during
-enqueue, the batch is discarded and retried with twice the gate duration.
+enqueue, the batch is discarded and retried with four times the gate duration.
 After four failed attempts the case reports an error; invalid timing samples
 never produce a performance verdict.
 
@@ -167,6 +167,10 @@ Schema version 4 stores GPU throughput in `tlx`/`ref` and the GPU throughput
 ratio in `speedup`. CPU submission cost is `tlx_host_us`/`ref_host_us`.
 Earlier artifacts used eager throughput in `tlx`/`ref` by default, so their
 headline ratios must not be compared directly with version 4 GPU ratios.
+Every artifact carries `schema_version`; readers must pass it through
+`require_schema`, which rejects any other version. There is no conversion:
+version 3 never recorded GPU-event timing, so the only backfill is to re-run
+the suite at version 4.
 
 GPU-event timing is not a profiler. There is no per-kernel breakdown here; use
 `ir-debugging` or nsys for that.

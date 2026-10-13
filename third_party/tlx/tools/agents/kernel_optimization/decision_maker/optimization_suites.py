@@ -14,6 +14,10 @@ class OptimizationShape(NamedTuple):
     dtype: str
 
 
+# Every shape is copied from the `gfx942_all` focus suite in
+# triton/tlx/ops/kernels/mm/_shapes.py (MI300 production requests), regrouped
+# by structural bottleneck. self_check/test_kernel_agent.py enforces the
+# subset and the disjointness.
 GFX942_MM_OPTIMIZATION_SUITES = {
     "gfx942_correctness_narrow": (
         OptimizationShape(344064, 32, 527, (527, 1), (1, 527), "fp16"),
