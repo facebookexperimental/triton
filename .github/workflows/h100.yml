@@ -278,7 +278,7 @@ jobs:
         timeout-minutes: 60
         run: |
           . "${SETUP_SCRIPT}"
-          python -m pytest python/test/tlx_benchmark/test_ops_perf.py \
+          python -m pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib \
             -k "not torchtlx" -v --junitxml=/tmp/tlx-perf.xml
       - name: Upload TLX perf artifacts
         if: always() && github.event_name == 'schedule'
