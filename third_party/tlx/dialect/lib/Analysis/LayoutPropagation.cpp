@@ -600,8 +600,9 @@ LogicalResult LayoutForwardPropagation::visitOperation(
     return visitRegion(op);
 
   if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-           ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
-           ttng::TMEMSubSliceOp, ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
+           ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+           ttg::MemDescTransOp, ttg::MemDescReshapeOp, ttng::TMEMSubSliceOp,
+           ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
     return success();
 
   for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {
