@@ -15,12 +15,15 @@ from .evaluation import (
     profiles_by_case as _profiles_by_case,
 )
 from .harness import HarnessExecutionError, SubprocessHarness
+from .profiling import extract_native_profiler_duration_us
 from ..contracts import (
     AutoCommitResult,
     BlastRadius,
     CandidateSubmission,
     Decision,
     DecisionStatus,
+    DiagnosticEvidence,
+    DiagnosticResult,
     ExperimentKind,
     ExperimentSummary,
     JsonValue,
@@ -47,8 +50,20 @@ from .reporting import (
     report_candidate_summary as _report_candidate_summary,
     report_performance as _report_performance,
 )
-from ..optimizer.agent import CandidateContext, CandidateProvider, CodexCandidateProvider
+from ..optimizer.agent import (
+    AgentDiagnosticRequest,
+    AgentSourceResearchRequest,
+    CandidateContext,
+    CandidateProposal,
+    CandidateProvider,
+    CodexCandidateProvider,
+)
 from ..optimizer.source import source_digest
+from ..source_research import (
+    CodexSourceResearchProvider,
+    SourceResearchContext,
+    SourceResearchProvider,
+)
 
 
 def _experiment_request(proposal: CandidateSubmission) -> dict[str, JsonValue]:
@@ -72,8 +87,15 @@ class PromotionCommitter(Protocol):
 
 
 class DecisionMaker:
-    def __init__(self, provider: CandidateProvider | None = None) -> None:
+    def __init__(
+        self,
+        provider: CandidateProvider | None = None,
+        source_research_provider: SourceResearchProvider | None = None,
+    ) -> None:
         self._provider = provider or CodexCandidateProvider()
+        self._source_research_provider = (
+            source_research_provider or CodexSourceResearchProvider()
+        )
 
     def optimize(
         self,
@@ -113,6 +135,32 @@ class DecisionMaker:
                 "baseline failed one or more protected correctness cases"
             )
         baseline = replace(baseline, aggregate_speedup=1.0)
+        if bool(request.target.evaluation_policy.get("require_native_profiler", False)):
+            missing_profiles = [
+                evaluation.case_id
+                for evaluation in baseline.cases
+                if extract_native_profiler_duration_us(evaluation.profile)[1] is None
+            ]
+            if missing_profiles:
+                raise HarnessExecutionError(
+                    "required native profiler produced no usable duration for: "
+                    + ", ".join(missing_profiles)
+                )
+        if bool(
+            request.target.evaluation_policy.get(
+                "require_aten_att_comparison", False
+            )
+        ):
+            missing_comparisons = [
+                evaluation.case_id
+                for evaluation in baseline.cases
+                if not bool(evaluation.profile.get("aten_comparison", {}).get("valid"))
+            ]
+            if missing_comparisons:
+                raise HarnessExecutionError(
+                    "required paired ATen/TLX ATT comparison was unavailable for: "
+                    + ", ".join(missing_comparisons)
+                )
         if request.diagnostic_proton_intra_kernel:
             baseline_diagnostics = _collect_diagnostic_profiles(
                 harness,
@@ -159,6 +207,10 @@ class DecisionMaker:
         seen_experiments: set[str] = set()
         stopping_reason = "round_budget_exhausted"
         exhausted = False
+        local_search_failure_streak = 0
+        remaining_source_research_total = (
+            request.budget.max_source_research_actions_total
+        )
 
         for round_index in range(1, request.budget.max_rounds + 1):
             if time.monotonic() - start_time >= request.budget.max_total_seconds:
@@ -178,16 +230,143 @@ class DecisionMaker:
                 experiment_payload_path = None
                 try:
                     _report_performance(experiment_id, "generating", None)
-                    proposal = self._provider.propose(
-                        request,
-                        CandidateContext(
-                            round_index=round_index,
-                            candidate_index=candidate_index,
-                            current_source=parent_source,
-                            current_performance=best_performance,
-                            previous_diagnostics=tuple(diagnostics),
-                        ),
-                    )
+                    diagnostic_evidence: list[DiagnosticEvidence] = []
+                    research_evidence = []
+                    proposal = None
+                    diagnostic_actions = 0
+                    research_actions = 0
+                    for action_index in range(
+                        request.budget.max_agent_actions_per_candidate
+                    ):
+                        action = self._provider.propose(
+                            request,
+                            CandidateContext(
+                                round_index=round_index,
+                                candidate_index=candidate_index,
+                                current_source=parent_source,
+                                current_performance=best_performance,
+                                previous_diagnostics=tuple(diagnostics),
+                                action_index=action_index,
+                                current_source_digest=source_digest(parent_source),
+                                remaining_agent_actions=(
+                                    request.budget.max_agent_actions_per_candidate
+                                    - action_index
+                                ),
+                                remaining_diagnostic_actions=max(
+                                    0,
+                                    request.budget.max_diagnostic_actions_per_candidate
+                                    - diagnostic_actions,
+                                ),
+                                remaining_ncu_collections=max(
+                                    0,
+                                    request.budget.max_diagnostic_ncu_collections
+                                    - diagnostic_actions,
+                                ),
+                                remaining_proton_passes=max(
+                                    0,
+                                    request.budget.max_diagnostic_proton_passes
+                                    - diagnostic_actions,
+                                ),
+                                remaining_source_research_actions=min(
+                                    request.budget.max_source_research_actions_per_candidate
+                                    - research_actions,
+                                    remaining_source_research_total,
+                                ),
+                                diagnostic_evidence=tuple(diagnostic_evidence),
+                                research_evidence=tuple(research_evidence),
+                                local_search_failure_streak=local_search_failure_streak,
+                                source_research_saturation_threshold=(
+                                    request.budget.source_research_saturation_threshold
+                                ),
+                            ),
+                        )
+                        if isinstance(action, CandidateProposal):
+                            proposal = action
+                            break
+                        if isinstance(action, AgentSourceResearchRequest):
+                            if (
+                                research_actions
+                                >= request.budget.max_source_research_actions_per_candidate
+                                or remaining_source_research_total <= 0
+                            ):
+                                raise ValueError("source research action budget exhausted")
+                            if request.repository_root is None or request.kernel_path is None:
+                                raise ValueError(
+                                    "source research requires repository_root and kernel_path"
+                                )
+                            research = self._source_research_provider.research(
+                                action,
+                                SourceResearchContext(
+                                    action_id=f"{experiment_id}-a{action_index:02d}",
+                                    repository_root=request.repository_root,
+                                    kernel_path=request.kernel_path,
+                                    current_source=parent_source,
+                                    target=request.target,
+                                    timeout_seconds=request.budget.max_candidate_seconds,
+                                ),
+                            )
+                            research_evidence.append(research)
+                            research_actions += 1
+                            remaining_source_research_total -= 1
+                            continue
+                        if isinstance(action, AgentDiagnosticRequest):
+                            if diagnostic_actions >= request.budget.max_diagnostic_actions_per_candidate:
+                                raise ValueError("diagnostic action budget exhausted")
+                            selected_ids = set(action.case_ids)
+                            selected_cases = tuple(
+                                case for case in request.cases if case.case_id in selected_ids
+                            )
+                            started = time.monotonic()
+                            measured = harness.evaluate(
+                                parent_source,
+                                selected_cases,
+                                request.target,
+                                request.budget.benchmark_repetitions,
+                                profile=_profile_request(
+                                    artifacts_dir,
+                                    f"{experiment_id}-a{action_index:02d}",
+                                    level=(action.ncu_level or "deep"),
+                                    reason="agent_diagnostic",
+                                ),
+                            )
+                            summary = {
+                                evaluation.case_id: dict(evaluation.profile)
+                                for evaluation in measured.cases
+                            }
+                            diagnostic_evidence.append(
+                                DiagnosticEvidence(
+                                    action_id=f"{experiment_id}-a{action_index:02d}",
+                                    status="collected",
+                                    source_digest=source_digest(parent_source),
+                                    target_identity=(
+                                        f"{request.target.backend}:{request.target.architecture}"
+                                    ),
+                                    tool=action.tool,
+                                    case_ids=action.case_ids,
+                                    canonical_key=(
+                                        f"{action.tool}:{','.join(action.case_ids)}:"
+                                        f"{action.ncu_level or ','.join(action.proton_passes)}"
+                                    ),
+                                    question=action.question,
+                                    rationale=action.rationale,
+                                    level=action.ncu_level,
+                                    focus=action.ncu_focus,
+                                    passes=action.proton_passes,
+                                    expected_regions=action.expected_regions,
+                                    result=DiagnosticResult(
+                                        available=True,
+                                        summary=summary,
+                                    ),
+                                    collection_duration_seconds=(
+                                        time.monotonic() - started
+                                    ),
+                                )
+                            )
+                            diagnostic_actions += 1
+                            continue
+                        raise TypeError(f"unsupported candidate action {type(action).__name__}")
+                    if proposal is None:
+                        raise RuntimeError("agent action budget ended without a candidate")
                     _report_candidate_summary(experiment_id, proposal)
                     candidate_artifacts = store.write_candidate_artifacts(
                         experiment_id,
@@ -355,6 +534,10 @@ class DecisionMaker:
                             DecisionStatus.RETRY: "rejected",
                             DecisionStatus.RECORD_SIGNAL: "signal_recorded",
                         }[decision.status]
+                        if decision.status is DecisionStatus.PROMOTE:
+                            local_search_failure_streak = 0
+                        elif not proposal.research_evidence_ids:
+                            local_search_failure_streak += 1
                         experiment = ExperimentSummary(
                             experiment_id=experiment_id,
                             round_index=round_index,

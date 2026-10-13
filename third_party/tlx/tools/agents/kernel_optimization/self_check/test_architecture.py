@@ -81,4 +81,13 @@ def test_platform_registries_select_knowledge_and_profiler() -> None:
 
     amd_paths = knowledge_paths(KernelTarget(backend="hip", architecture="gfx950"))
     assert any("knowledge/amd/common" in str(path) for path in amd_paths)
+    gfx942_paths = knowledge_paths(
+        KernelTarget(
+            backend="hip",
+            architecture="gfx942",
+            optimization_skills=("optimize-amd-gemm", ),
+        )
+    )
+    assert any("knowledge/amd/cdna3" in str(path) for path in gfx942_paths)
+    assert any("knowledge/amd/gemm" in str(path) for path in gfx942_paths)
     assert native_profiler_for_backend("hip") == "rocprofv3"

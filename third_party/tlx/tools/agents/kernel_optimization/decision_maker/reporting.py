@@ -104,18 +104,18 @@ def profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
         parts.append(f"{profiler_name.lower()}.duration_us={profiler_duration:.3f}")
     else:
         parts.append("native_profiler=unavailable")
-    att = compact.get("fb_att")
+    att = compact.get("amd_att")
     if isinstance(att, Mapping):
         valid = att.get("valid")
         if isinstance(valid, bool):
-            parts.append(f"fb_att.valid={str(valid).lower()}")
+            parts.append(f"amd_att.valid={str(valid).lower()}")
         att_artifacts = att.get("artifacts")
         if isinstance(att_artifacts, Mapping):
             ui_directories = att_artifacts.get("ui_directories")
             if isinstance(ui_directories, list) and ui_directories:
-                parts.append(f"fb_att.ui={ui_directories[0]}")
+                parts.append(f"amd_att.ui={ui_directories[0]}")
         if att.get("error"):
-            parts.append(f"fb_att.error={att['error']}")
+            parts.append(f"amd_att.error={att['error']}")
     diagnostic = compact.get(DIAGNOSTIC_PROFILE_KEY)
     if not isinstance(diagnostic, Mapping):
         diagnostic = profile.get(DIAGNOSTIC_PROFILE_KEY)

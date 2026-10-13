@@ -33,8 +33,8 @@ options:
   --fwd-only            skip the backward cases
   --bwd-only            skip the forward cases
   --latency-measure-mode {wallclock,gpu_events}
-                        'wallclock' (default) times each call as a caller sees it; 'gpu_events'
-                        pre-enqueues the batch behind a blocked stream to isolate device time
+                        legacy selector (default gpu_events); measurements always use
+                        verified queued GPU events
   --cold-compile {all,first,none}
                         how often to time a first call on a fresh cache; the default is each
                         op's own (mm: all, everything else: first)
@@ -98,11 +98,12 @@ different amounts of work do not belong in one TFLOP/s column. `--fwd-only` /
 
 1. Input info (varying between ops), e.g. for mm:
    `((), {'dtype': 'bf16', 'strides': '[[32768, 1], [12800, 1]]', 'M': '2304', 'N': '12800', 'K': '32768'})`
-2. Core metrics: ref (TFLOP/s), TLX (TFLOP/s), speedup, compile time
+2. Core metrics: ref GPU (TFLOP/s), TLX GPU (TFLOP/s), GPU speedup, compile time
 3. Additional stats: samples, CV%, p50, p95, p99 (all based on TFLOP/s)
-4. Op-specific columns, if the op declared any (see below)
-5. status: ok/pip/noisy/error/...
-6. best config: the config each autotuned kernel the case launched actually ran,
+4. Separate ref/TLX CPU submission cost (microseconds)
+5. Op-specific columns, if the op declared any (see below)
+6. status: ok/pip/noisy/error/...
+7. best config: the config each autotuned kernel the case launched actually ran,
    abbreviated (`BM=` for `BLOCK_M`/`BLOCK_SIZE_M`, `w`/`s` for warps/stages).
    With a single-config space that is the shape-picked config; otherwise it is
    the autotune winner. An op launching several autotuned kernels gets one entry
@@ -140,25 +141,34 @@ ok: everything else
 
 ## How a call is timed
 
-`wallclock`, the default, is `triton.testing.do_bench`: CUDA events around each
-`fn()`, dispatched from the host one call at a time. It is the authoritative
-mode here for two reasons. It measures what a caller actually gets -- if the
-host cannot keep the GPU fed, that is a real cost of using the op, and
-`tlx_host_us` sits in the artifact to say how much of the number it is. And it
-is what every existing figure in this suite was taken with, so switching the
-default would silently invalidate comparisons against them.
+`gpu_events` is the default and the kernel-performance verdict metric.
+Each batch is queued behind a GPU gate. Before synchronizing, the harness
+checks that the first timing event has not completed, proving that the entire
+batch was submitted before its timed work began. If the gate expired during
+enqueue, the batch is discarded and retried with twice the gate duration.
+After four failed attempts the case reports an error; invalid timing samples
+never produce a performance verdict.
 
-`gpu_events` is tritonbench's `--latency-measure-mode=gpu_events`: the whole
-batch is enqueued behind a blocked stream so the host runs far ahead, and the
-measured interval contains no dispatch gaps. Use it when the question is about
-the kernels rather than the end-to-end path -- most usefully on the
-multi-kernel backward passes (`flash_attn`, `hstu_attn`, `kda`), where a
-wallclock reading folds in several launches' worth of host work. It flatters
-both providers, so `speedup` moves much less than either absolute number; a
-large gap between the two modes for one case is itself the finding, and it will
-agree with a large `tlx_host_us`.
+Both TLX and the reference clear the same benchmark cache before every timed
+call. Timing includes all device work in the operation, including multiple
+kernel launches, but excludes host submission gaps. It does not change the
+operation's autotuning policy or reselect configurations with GPU-event timing.
 
-Neither mode is a profiler. There is no per-kernel breakdown here; use
+CPU submission costs are collected separately for both providers. CPU time
+must not be subtracted from event latency or added to it: these intervals can
+overlap.
+
+The legacy `--latency-measure-mode wallclock` spelling remains accepted, but
+measurements always use GPU events. The artifact records
+`latency_mode="gpu_events"`, the requested legacy mode, and the common
+cold-cache policy.
+
+Schema version 4 stores GPU throughput in `tlx`/`ref` and the GPU throughput
+ratio in `speedup`. CPU submission cost is `tlx_host_us`/`ref_host_us`.
+Earlier artifacts used eager throughput in `tlx`/`ref` by default, so their
+headline ratios must not be compared directly with version 4 GPU ratios.
+
+GPU-event timing is not a profiler. There is no per-kernel breakdown here; use
 `ir-debugging` or nsys for that.
 
 ## Compile time
@@ -178,8 +188,8 @@ percentiles ascend: p99 is the best case, `min` (artifact only) the worst.
 
 speedup = TLX / ref. >1 means TLX is faster.
 
-Latency is not reported: it is `flop_count / TFLOP/s`, both in the artifact.
-`tlx_host_us` stays in microseconds — host launch cost is not device work.
+GPU latency can be recovered from `flop_count / TFLOP/s`, both in the artifact.
+`tlx_host_us` and `ref_host_us` stay in microseconds; they measure CPU submission.
 
 ## Tests
 

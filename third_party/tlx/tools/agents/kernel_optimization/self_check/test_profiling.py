@@ -11,7 +11,10 @@ from unittest import mock
 from unittest.mock import patch
 
 from ..decision_maker.profiling import rocm_profiler as rocm_profiler_module
-from ..decision_maker.profiling.amd_att import collect_fb_att
+from ..decision_maker.profiling.amd_att import (
+    collect_amd_att,
+    compare_amd_att_profiles,
+)
 from ..decision_maker.profiling.amdgcn_isa import analyze_amdgcn, collect_amdgcn_isa
 from ..decision_maker.profiling import (
     ProfileRequest,
@@ -127,7 +130,7 @@ class ProfileRequestTest(unittest.TestCase):
             {"backend": "hip"},
         )
         assert deep is not None
-        self.assertEqual(deep["tools"], ["fb_att", "rocprofv3", "amdgcn_isa"])
+        self.assertEqual(deep["tools"], ["amd_att", "rocprofv3", "amdgcn_isa"])
         self.assertNotIn("amdgcn_isa", cuda["tools"])
 
     def test_per_case_profile_request_expands_absolute_dir(self) -> None:
@@ -506,7 +509,7 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertEqual(ncu_regression_diagnostic(normalized, old_flat), "")
 
         rocprof_baseline = {"rocprofv3": {"summary": {"duration_us": 10.0}}}
-        rocprof_candidate = {"rocprofv3": {"summary": {"duration_us": 10.2}}}
+        rocprof_candidate = {"rocprofv3": {"summary": {"duration_us": 10.6}}}
         self.assertEqual(
             extract_native_profiler_duration_us(rocprof_baseline),
             ("rocprofv3", 10.0),
@@ -517,6 +520,13 @@ class ProfileParsingTest(unittest.TestCase):
         )
         self.assertEqual(
             native_profiler_regression_diagnostic(old_flat, rocprof_candidate),
+            "",
+        )
+        self.assertEqual(
+            native_profiler_regression_diagnostic(
+                rocprof_baseline,
+                {"rocprofv3": {"summary": {"duration_us": 10.2}}},
+            ),
             "",
         )
         self.assertEqual(
@@ -716,38 +726,130 @@ class ProfileParsingTest(unittest.TestCase):
                 repetitions=3,
             )
 
-    def test_collects_fb_att_without_rocprof_separator(self) -> None:
+    def test_production_mm_profile_invokes_native_profiler_for_selected_winner(self) -> None:
+        from ..decision_maker.tuning_harnesses import mm
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            profiler = root / "fb_att"
+            source = root / "candidate.py"
+            source.write_text("def mm():\n    pass\n")
+            artifact = {
+                "records": {
+                    "shape": {
+                        "full_best_config": "kernel: BLOCK_M=64 num_warps=4 num_stages=2",
+                        "full_config_timings": [],
+                    }
+                },
+                "source_path": source,
+                "device": "cuda",
+                "arch": "gfx942",
+            }
+            expected = {
+                "tool": "rocprofv3",
+                "summary": {"duration_us": 12.0, "dominant_kernel": "gemm"},
+            }
+            with patch.object(mm, "collect_rocprofv3", return_value=expected) as collect:
+                profile = mm.profile(
+                    artifact,
+                    {"case_id": "shape", "parameters": {}},
+                    {
+                        "tools": ["rocprofv3"],
+                        "level": "deep",
+                        "artifacts_dir": str(root / "artifacts"),
+                    },
+                )
+            self.assertEqual(profile["rocprofv3"], expected)
+            workload = collect.call_args.args[0]
+            self.assertIn("--winner", workload)
+            self.assertIn("gfx942", workload)
+
+    def test_collects_and_validates_rocprofv3_att_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profiler = root / "rocprofv3"
             profiler.write_text(
                 "#!/usr/bin/python3\n"
-                "import sys\n"
+                "import sqlite3, sys\n"
                 "from pathlib import Path\n"
                 "args = sys.argv[1:]\n"
-                "assert '--' not in args\n"
-                "assert args[args.index('--att-perfcounter-ctrl') + 1] == '3'\n"
-                "output_dir = Path(args[args.index('--fb-output-directory') + 1])\n"
-                "ui_dir = output_dir / 'fbrocrof_1' / 'gemm_0_ui'\n"
+                "if '--help' in args:\n"
+                "    print('--att --rocm-root')\n"
+                "    raise SystemExit(0)\n"
+                "assert '--' in args\n"
+                "assert args[args.index('--att-activity') + 1] == '8'\n"
+                "output_dir = Path(args[args.index('-d') + 1])\n"
+                "output_dir.mkdir(parents=True)\n"
+                "db = sqlite3.connect(output_dir / 'tlx_att_results.db')\n"
+                "db.execute('create table trace(id integer)')\n"
+                "db.commit(); db.close()\n"
+                "(output_dir / 'trace.att').write_text('trace')\n"
+                "(output_dir / 'gfx942_code_object_id_1.out').write_text('code')\n"
+                "(output_dir / 'stats_ui_output_agent_0_dispatch_4.csv').write_text('name,value\\ngemm,1\\n')\n"
+                "ui_dir = output_dir / 'ui_output_agent_0_dispatch_4'\n"
                 "ui_dir.mkdir(parents=True)\n"
-                "(ui_dir / 'wstates0.json').write_text('{}')\n"
+                "for name in ('code.json', 'filenames.json', 'occupancy.json', 'wstates0.json', 'se0_sm0_sl0_wv0.json'):\n"
+                "    (ui_dir / name).write_text('{}')\n"
             )
             profiler.chmod(0o755)
+            decoder = root / "librocprof-trace-decoder.so"
+            decoder.write_text("decoder")
 
-            profile = collect_fb_att(
+            profile = collect_amd_att(
                 ("/usr/bin/python3", "-c", "pass"),
                 root / "artifacts",
                 kernel_filter="gemm",
-                counters=("SQ_LDS_BANK_CONFLICT",),
-                environment={"TLX_FB_ATT": str(profiler)},
+                environment={
+                    "TLX_ROCPROFV3": str(profiler),
+                    "ROCPROF_ATT_LIBRARY_PATH": str(root),
+                },
             )
 
             self.assertTrue(profile["valid"])
             self.assertEqual(profile["kernel_filter"], "gemm")
-            self.assertEqual(profile["iteration_range"], "[4-4]")
-            self.assertEqual(profile["perfcounter_control"], 3)
+            self.assertEqual(profile["iteration_range"], "[4]")
             self.assertEqual(len(profile["artifacts"]["ui_directories"]), 1)
-            self.assertTrue(Path(profile["artifacts"]["wstates"][0]).exists())
+
+    def test_compares_numeric_stats_from_validated_att_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tlx_stats = root / "tlx.csv"
+            aten_stats = root / "aten.csv"
+            tlx_stats.write_text("metric,cycles,waves\ngemm,120,8\n")
+            aten_stats.write_text("metric,cycles,waves\naten,100,4\n")
+            comparison = compare_amd_att_profiles(
+                {
+                    "valid": True,
+                    "validation": {"stats_files": [str(tlx_stats)]},
+                },
+                {
+                    "valid": True,
+                    "validation": {"stats_files": [str(aten_stats)]},
+                },
+            )
+        self.assertTrue(comparison["valid"])
+        self.assertEqual(comparison["tlx_over_aten"]["cycles"], 1.2)
+        self.assertEqual(comparison["tlx_over_aten"]["waves"], 2.0)
+
+    def test_summarizes_actionable_tlx_versus_aten_deltas(self) -> None:
+        from ..decision_maker.tuning_harnesses.mm import _compare_with_aten
+
+        comparison = _compare_with_aten(
+            {
+                "summary": {"duration_us": 120.0},
+                "counters": {"MfmaUtil": 40.0, "MemUnitStalled": 8.0},
+                "kernels": [{"resources": {"vgpr_count": 96.0}}],
+            },
+            {
+                "summary": {"duration_us": 100.0},
+                "counters": {"MfmaUtil": 80.0, "MemUnitStalled": 2.0},
+                "kernels": [{"resources": {"vgpr_count": 48.0}}],
+            },
+            {"valid": True, "tlx_over_aten": {"Latency": 1.5}},
+        )
+        self.assertTrue(comparison["valid"])
+        self.assertEqual(comparison["tlx_over_aten_duration"], 1.2)
+        self.assertEqual(comparison["tlx_over_aten_counters"]["MfmaUtil"], 0.5)
+        self.assertEqual(comparison["tlx_over_aten_resources"]["vgpr_count"], 2.0)
 
     def test_compact_profile_summary_omits_raw_blobs(self) -> None:
         compact = compact_profile_summary(
@@ -763,7 +865,7 @@ class ProfileParsingTest(unittest.TestCase):
                     "summary": {"duration_us": 2.0},
                     "raw_metrics": {"huge": "blob"},
                 },
-                "fb_att": {
+                "amd_att": {
                     "valid": True,
                     "artifacts": {"ui_directories": ["/tmp/gemm_0_ui"]},
                 },
@@ -788,7 +890,7 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertNotIn("raw_metrics", compact["ncu"])
         self.assertEqual(compact["rocprofv3"]["summary"]["duration_us"], 2.0)
         self.assertNotIn("raw_metrics", compact["rocprofv3"])
-        self.assertTrue(compact["fb_att"]["valid"])
+        self.assertTrue(compact["amd_att"]["valid"])
         self.assertEqual(compact["amdgcn_isa"]["resources"]["vgpr_spills"], 37)
         self.assertEqual(compact["amdgcn_isa"]["findings"], ["37 VGPR + 41 SGPR spills"])
         self.assertIn("native_profiler", compact)

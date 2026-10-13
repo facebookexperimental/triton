@@ -25,6 +25,7 @@ from ..optimizer.agent import CandidateProvider
 from ..policy_source import frozen_source_digest
 from .benchmark_environment import canonical_arch
 from .harness import SubprocessHarness
+from .optimization_suites import GFX942_MM_OPTIMIZATION_SUITES
 from .orchestrator import KernelOptimizer
 from .policy import is_acceptable_winner
 from .vcs import commit_winner, prepare_auto_commit
@@ -40,8 +41,14 @@ def infer_kernel_path(repository: Path, op: str, arch: str) -> Path:
 
 
 def production_cases(op: str, suite: str) -> tuple[InputCase, ...]:
-    shapes = importlib.import_module(f"triton.tlx.ops.kernels.{op}._shapes")
-    entries = shapes.FOCUS.resolved_shapes(suite)
+    optimization_entries = (
+        GFX942_MM_OPTIMIZATION_SUITES.get(suite) if op == "mm" else None
+    )
+    if optimization_entries is None:
+        shapes = importlib.import_module(f"triton.tlx.ops.kernels.{op}._shapes")
+        entries = shapes.FOCUS.resolved_shapes(suite)
+    else:
+        entries = optimization_entries
     cases = []
     for entry in entries:
         parameters = dict(entry._asdict())
@@ -338,6 +345,7 @@ def _tuning_target(op: str, arch: str) -> KernelTarget:
         backend = "cuda"
     else:
         raise SystemExit(f"cannot infer GPU backend from --arch {arch!r}")
+    is_amd_mm = backend == "hip" and op == "mm"
     return KernelTarget(
         backend=backend,
         architecture=architecture,
@@ -345,7 +353,17 @@ def _tuning_target(op: str, arch: str) -> KernelTarget:
         environment={"TLX_AGENT_OP": op},
         optimization_guidance=(
             f"Tune the production {architecture} tlx.ops.{op} implementation from measured evidence. "
-            "Preserve correctness, public entry points, and every incumbent configuration."),
+            "Preserve correctness, public entry points, and every incumbent configuration. "
+            "Use the paired TLX-versus-ATen native-profiler and ATT comparison to identify "
+            "the bottleneck and cite the measured delta behind each optimization direction. "
+            "After two rejected parameter-only hypotheses, use profiler evidence and repository "
+            "research to propose a structural kernel hypothesis."),
+        optimization_skills=(("optimize-amd-gemm", ) if is_amd_mm else ()),
+        evaluation_policy={
+            "require_native_profiler": architecture == "gfx942" and op == "mm",
+            "require_aten_att_comparison": architecture == "gfx942" and op == "mm",
+            "parameter_hypothesis_limit": 2,
+        },
         supported_experiment_kinds=(ExperimentKind.PROMOTABLE, ExperimentKind.HUMAN_REVIEW),
     )
 
