@@ -1,0 +1,64 @@
+name: Install prebuilt Triton
+description: >
+  Fetch the wheel the build job produced and install it into the venv that
+  $SETUP_SCRIPT activates. Fork PRs read it from the run's GitHub artifacts;
+  everything else reads it from S3 as 16 parallel byte ranges, since a single
+  S3 stream sometimes runs at ~1 MB/s (6.5 min for the wheel).
+inputs:
+  wheel-url:
+    description: "needs.<build job>.outputs.wheel_url"
+    required: false
+    default: ""
+  wheel-filename:
+    description: "needs.<build job>.outputs.wheel_filename"
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Download prebuilt Triton wheel from GitHub artifacts
+      if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+      uses: actions/download-artifact@v4
+      with:
+        name: run_${{ github.run_id }}
+        path: ${{ runner.temp }}/prebuilt-wheel
+    - name: Download prebuilt Triton wheel from S3
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      shell: bash
+      env:
+        WHEEL_URL: ${{ inputs.wheel-url }}
+        WHEEL_FILENAME: ${{ inputs.wheel-filename }}
+      run: |
+        set -euo pipefail
+        OUT="${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}"
+        mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
+        T0=$(date +%s.%N)
+        SIZE=$(curl --fail --silent --head --location --retry 3 "${WHEEL_URL}" \
+          | awk 'tolower($1)=="content-length:" {n=$2} END {print n+0}')
+        PARTS=16
+        if [ "${SIZE}" -lt $((PARTS * 1048576)) ]; then
+          curl --fail --location --retry 3 --output "${OUT}" "${WHEEL_URL}"
+        else
+          CHUNK=$(( (SIZE + PARTS - 1) / PARTS ))
+          pids=()
+          for i in $(seq 0 $((PARTS - 1))); do
+            start=$((i * CHUNK)); end=$((start + CHUNK - 1))
+            [ "${end}" -ge "${SIZE}" ] && end=$((SIZE - 1))
+            curl --fail --silent --show-error --location --retry 3 \
+              --range "${start}-${end}" --output "${OUT}.part${i}" "${WHEEL_URL}" &
+            pids+=($!)
+          done
+          for p in "${pids[@]}"; do wait "${p}"; done
+          for i in $(seq 0 $((PARTS - 1))); do cat "${OUT}.part${i}"; done > "${OUT}"
+          rm -f "${OUT}".part*
+        fi
+        [ "$(stat -c %s "${OUT}")" -eq "${SIZE}" ] || [ "${SIZE}" -eq 0 ]
+        . "${SETUP_SCRIPT}"
+        python -m zipfile -t "${OUT}" > /dev/null
+        awk -v b="$(stat -c %s "${OUT}")" -v t0="${T0}" -v t1="$(date +%s.%N)" -v f="${OUT##*/}" \
+          'BEGIN {t = t1 - t0; printf "downloaded %s: %d bytes in %.1fs (%.1f MB/s)\n", f, b, t, b / t / 1e6}'
+    - name: Install Triton
+      shell: bash
+      run: |
+        . "${SETUP_SCRIPT}"
+        uv pip install --force-reinstall --no-deps "${RUNNER_TEMP}"/prebuilt-wheel/*.whl

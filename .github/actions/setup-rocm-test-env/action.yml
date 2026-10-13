@@ -1,0 +1,65 @@
+name: Set up ROCm test environment
+description: >
+  Create a uv venv at $UV_VENV_DIR/$CONDA_ENV with the ROCm PyTorch nightly
+  and the given test packages, and write $SETUP_SCRIPT to activate it, the
+  layout TritonBench's setup-env.sh produces. Unlike setup-env.sh it skips the
+  PyTorch source clone and the TritonBench install, and installs device code
+  for one GPU architecture instead of all of them.
+inputs:
+  gpu-arch:
+    description: ROCm device code to keep, e.g. gfx950
+    required: true
+  packages:
+    description: Extra packages to install, space separated
+    required: false
+    default: numpy pytest
+  torch-index-url:
+    description: Package index for the ROCm PyTorch nightly
+    required: false
+    default: https://download.pytorch.org/whl/nightly/rocm10.0
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: false
+    - name: Create the venv and install PyTorch
+      shell: bash
+      env:
+        GPU_ARCH: ${{ inputs.gpu-arch }}
+        PACKAGES: ${{ inputs.packages }}
+        IDX: ${{ inputs.torch-index-url }}
+      run: |
+        set -eux
+        # The prebuilt Triton wheel is cp312.
+        sudo mkdir -p "${WORKSPACE_DIR}"
+        sudo chown -R "$(id -un):$(id -gn)" "${WORKSPACE_DIR}"
+        VENV="${UV_VENV_DIR}/${CONDA_ENV}"
+        uv venv "${VENV}" --python 3.12 --managed-python --clear
+        echo ". '${VENV}/bin/activate'" > "${SETUP_SCRIPT}"
+        if [ -e /opt/rocm/lib ]; then
+          echo 'export LD_LIBRARY_PATH=/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}' >> "${SETUP_SCRIPT}"
+        fi
+        . "${SETUP_SCRIPT}"
+        # torch requires rocm[device-all]: device code for every GPU
+        # architecture, ~6 GiB of the ~8.6 GiB download. Override all but
+        # GPU_ARCH away, and triton-rocm, which owns the same `triton` package
+        # as the fbtriton wheel installed later.
+        echo torch | uv pip compile - --pre --index-url "${IDX}" --no-header --no-annotate -q \
+          | grep -oE '^(rocm-sdk-device-gfx[0-9a-z]+|triton-rocm)' \
+          | grep -vx "rocm-sdk-device-${GPU_ARCH}" \
+          | sed "s/\$/ ; sys_platform == 'never'/" > /tmp/rocm-overrides.txt
+        cat /tmp/rocm-overrides.txt
+        T0=$(date +%s)
+        uv pip install --pre --no-cache torch --index-url "${IDX}" --overrides /tmp/rocm-overrides.txt
+        echo "torch install: $(( $(date +%s) - T0 ))s"
+        uv pip uninstall triton triton-rocm pytorch-triton-rocm || true
+        # shellcheck disable=SC2086
+        uv pip install ${PACKAGES}
+        python - <<'PY'
+        import torch
+
+        print(f"torch -> {torch.__version__} (hip {torch.version.hip})")
+        assert torch.cuda.is_available(), "torch sees no GPU"
+        PY
