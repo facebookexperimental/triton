@@ -435,3 +435,105 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // CHECK-LABEL: buffer_load_mask_positive_zero_bf16
+  tt.func @buffer_load_mask_positive_zero_bf16(
+      %ptr: !tt.ptr<bf16> {tt.divisibility = 16 : i32},
+      %offset: tensor<256xi32, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 8 : i32},
+      %mask: tensor<256xi1, #blocked> {tt.constancy = 8 : i32}) {
+    %other = arith.constant dense<0.0> : tensor<256xbf16, #blocked>
+    // CHECK: %[[OFFSET:.*]] = llvm.select
+    // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[OFFSET]]{{.*}} : vector<4xi32>
+    // CHECK-NOT: llvm.select {{.*}} : i1, vector<
+    // CHECK: llvm.return
+    %ret = amdg.buffer_load %ptr[%offset], %mask, %other : tensor<256xbf16, #blocked>
+    tt.return
+  }
+}
+
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // CHECK-LABEL: buffer_load_mask_positive_zero_f16
+  tt.func @buffer_load_mask_positive_zero_f16(
+      %ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %offset: tensor<256xi32, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 8 : i32},
+      %mask: tensor<256xi1, #blocked> {tt.constancy = 8 : i32}) {
+    %other = arith.constant dense<0.0> : tensor<256xf16, #blocked>
+    // CHECK: %[[OFFSET:.*]] = llvm.select
+    // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[OFFSET]]{{.*}} : vector<4xi32>
+    // CHECK-NOT: llvm.select {{.*}} : i1, vector<
+    // CHECK: llvm.return
+    %ret = amdg.buffer_load %ptr[%offset], %mask, %other : tensor<256xf16, #blocked>
+    tt.return
+  }
+}
+
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // CHECK-LABEL: buffer_load_mask_zero_i32
+  tt.func @buffer_load_mask_zero_i32(
+      %ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+      %offset: tensor<128xi32, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 4 : i32},
+      %mask: tensor<128xi1, #blocked> {tt.constancy = 4 : i32}) {
+    %other = arith.constant dense<0> : tensor<128xi32, #blocked>
+    // CHECK: %[[OFFSET:.*]] = llvm.select
+    // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[OFFSET]]{{.*}} : vector<4xi32>
+    // CHECK-NOT: llvm.select {{.*}} : i1, vector<
+    // CHECK: llvm.return
+    %ret = amdg.buffer_load %ptr[%offset], %mask, %other : tensor<128xi32, #blocked>
+    tt.return
+  }
+}
+
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // Negative zero must retain its sign rather than use the hardware +0 fill.
+  // CHECK-LABEL: buffer_load_mask_negative_zero
+  tt.func @buffer_load_mask_negative_zero(
+      %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+      %offset: tensor<128xi32, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 4 : i32},
+      %mask: tensor<128xi1, #blocked> {tt.constancy = 4 : i32}) {
+    %other = arith.constant dense<-0.0> : tensor<128xf32, #blocked>
+    // CHECK: %[[OFFSET:.*]] = llvm.select
+    // CHECK: %[[LOADED:.*]] = rocdl.raw.ptr.buffer.load {{.*}}, %[[OFFSET]]
+    // CHECK: %[[CAST:.*]] = llvm.bitcast %[[LOADED]] : vector<4xf32> to vector<4xf32>
+    // CHECK: llvm.select {{.*}}, %[[CAST]], {{.*}} : i1, vector<4xf32>
+    // CHECK: llvm.return
+    %ret = amdg.buffer_load %ptr[%offset], %mask, %other : tensor<128xf32, #blocked>
+    tt.return
+  }
+}
+
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // CHECK-LABEL: buffer_load_mask_dynamic_other
+  tt.func @buffer_load_mask_dynamic_other(
+      %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+      %offset: tensor<128xi32, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 4 : i32},
+      %mask: tensor<128xi1, #blocked> {tt.constancy = 4 : i32},
+      %other: tensor<128xf32, #blocked>) {
+    // CHECK: %[[OFFSET:.*]] = llvm.select
+    // CHECK: %[[LOADED:.*]] = rocdl.raw.ptr.buffer.load {{.*}}, %[[OFFSET]]
+    // CHECK: %[[CAST:.*]] = llvm.bitcast %[[LOADED]] : vector<4xf32> to vector<4xf32>
+    // CHECK: llvm.select {{.*}}, %[[CAST]], {{.*}} : i1, vector<4xf32>
+    // CHECK: llvm.return
+    %ret = amdg.buffer_load %ptr[%offset], %mask, %other : tensor<128xf32, #blocked>
+    tt.return
+  }
+}
