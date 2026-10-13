@@ -270,22 +270,25 @@ bool isUsedAsBarrier(Value v) {
   });
 }
 
-// toLinearLayout and toLinearLayoutIgnoringPadding require power-of-two dims.
-// Pipelined kernels legitimately use NPOT shared/TMEM shapes (e.g. barrier
-// arrays like memdesc<3xi64> and TMEM subviews), so detect them up front and
-// let callers degrade to Unknown instead of reaching the assert.
-bool hasNPOTMemDescDims(Type type) {
+// toLinearLayout asserts that every dim is a power of two
+// (LinearLayoutConversions.cpp). BufferRegion only ever passes it the
+// allocation shape with pipelining dims dropped
+// (dropPipeliningDim(allocShape, encoding)), so a leading NPOT stage or page
+// dim never reaches the assert: pipelined kernels legitimately use NPOT
+// logical shapes (e.g. memdesc<3x32x32> subviews or multibuffered
+// memdesc<5x1x2x1x2x256xi8> allocs) whose layout-relevant suffix is still all
+// powers of two. Degrade to Unknown only when the dims that actually reach
+// toLinearLayout are NPOT. Padded encodings take the paddedLinearLayout path
+// and distributed encodings bypass the assert, so neither needs the guard.
+bool reachesNPOTLinearLayoutAssert(Type type) {
   auto ty = cast<ttg::MemDescType>(type);
-  auto isPOT = [](int64_t dim) {
-    return dim > 0 && llvm::isPowerOf2_64(static_cast<uint64_t>(dim));
-  };
-  for (int64_t dim : ty.getShape())
-    if (!isPOT(dim))
-      return true;
-  for (int64_t dim : ty.getAllocShape())
-    if (!isPOT(dim))
-      return true;
-  return false;
+  auto encoding = ty.getEncoding();
+  if (isa<ttg::DistributedEncodingTrait>(encoding) ||
+      ttg::isPaddedEncoding(encoding))
+    return false;
+  return !llvm::all_of(
+      ttg::dropPipeliningDim(ty.getAllocShape(), encoding),
+      llvm::isPowerOf2_64);
 }
 
 struct MemDescSubsliceOffsets {
@@ -657,7 +660,7 @@ LogicalResult BufferRegionAnalysis::visitOperation(
         getAllocationOffsets(localAllocOp);
     if (failed(offsets))
       return failure();
-    if (hasNPOTMemDescDims(localAllocOp.getResult().getType()))
+    if (reachesNPOTLinearLayoutAssert(localAllocOp.getResult().getType()))
       return propagateRegions(RegionInfo::getPessimisticValueState());
     ArrayRef<uint32_t> partitionBases = offsets->size() > 1
                                             ? ArrayRef<uint32_t>(*offsets)
@@ -669,7 +672,7 @@ LogicalResult BufferRegionAnalysis::visitOperation(
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(op)) {
     uint64_t storageBase = getAllocationOffset(tmemAllocOp);
     assert(storageBase <= std::numeric_limits<uint32_t>::max());
-    if (hasNPOTMemDescDims(tmemAllocOp.getResult().getType()))
+    if (reachesNPOTLinearLayoutAssert(tmemAllocOp.getResult().getType()))
       return propagateRegions(RegionInfo::getPessimisticValueState());
     regionInfo.views.insert(getAllocView(tmemAllocOp.getResult(),
                                          static_cast<uint32_t>(storageBase)));
@@ -679,7 +682,7 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
-    if (hasNPOTMemDescDims(memdescIndexOp.getType()))
+    if (reachesNPOTLinearLayoutAssert(memdescIndexOp.getType()))
       return propagateRegions(RegionInfo::getPessimisticValueState());
     int numSubBuffers =
         cast<ttg::MemDescType>(memdescIndexOp.getSrc().getType()).getShape()[0];
@@ -707,8 +710,8 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
-    if (hasNPOTMemDescDims(memdescSubsliceOp.getSrc().getType()) ||
-        hasNPOTMemDescDims(memdescSubsliceOp.getType()))
+    if (reachesNPOTLinearLayoutAssert(memdescSubsliceOp.getSrc().getType()) ||
+        reachesNPOTLinearLayoutAssert(memdescSubsliceOp.getType()))
       return propagateRegions(RegionInfo::getPessimisticValueState());
     MemDescSubsliceOffsets relativeOffset =
         getMemDescSubsliceUnpaddedOffsets(memdescSubsliceOp);
@@ -729,8 +732,8 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
-    if (hasNPOTMemDescDims(tmemSubsliceOp.getSrc().getType()) ||
-        hasNPOTMemDescDims(tmemSubsliceOp.getType()))
+    if (reachesNPOTLinearLayoutAssert(tmemSubsliceOp.getSrc().getType()) ||
+        reachesNPOTLinearLayoutAssert(tmemSubsliceOp.getType()))
       return propagateRegions(RegionInfo::getPessimisticValueState());
     uint32_t relativeOffset = ttng::getTMemSubSliceOffset(
         tmemSubsliceOp.getSrc().getType(), tmemSubsliceOp.getOffset(),
@@ -751,7 +754,7 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
-    if (hasNPOTMemDescDims(reinterpretOp.getType()))
+    if (reachesNPOTLinearLayoutAssert(reinterpretOp.getType()))
       return propagateRegions(RegionInfo::getPessimisticValueState());
     for (const BufferRegionView &view : in.views)
       regionInfo.views.insert(getSubView(reinterpretOp.getType(), view));
