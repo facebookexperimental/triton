@@ -3810,6 +3810,44 @@ def test_dense_bwd_d256_dispatches_cover_retained_topologies(monkeypatch):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("zero_dq", [False, True], ids=["delta-only", "zero-dq"])
+def test_dense_bwd_preprocess_scaled_lse_tail_gfx950(zero_dq):
+    batch, heads, n_ctx, head_dim = 2, 3, 70, 128
+    rows = batch * heads * n_ctx
+    shape = (batch, heads, n_ctx, head_dim)
+    elements = torch.arange(rows * head_dim, device="cuda", dtype=torch.float32).reshape(shape)
+    # Dyadic inputs keep the delta reduction exact; distinct row patterns also
+    # expose a missing batch/head offset. N=70 exercises the final 64-row tile.
+    out = ((elements % 17 - 8) / 8).to(torch.bfloat16)
+    grad_out = ((elements % 13 - 6) / 8).to(torch.bfloat16)
+    lse = (torch.arange(rows, device="cuda", dtype=torch.float32).reshape(shape[:-1]) - rows // 2) / 8
+    original_lse = lse.clone()
+    expected_delta = (out.float() * grad_out.float()).sum(dim=-1)
+    baseline_delta = torch.full_like(lse, float("nan"))
+    amd_fa_bwd._run_bwd_preprocess(out, grad_out, baseline_delta)
+
+    # The guard catches writes from inactive rows in the final preprocess tile.
+    guard_rows = 64
+    lse_storage = torch.full((rows + guard_rows, ), -123.0, device="cuda", dtype=torch.float32)
+    scaled_lse = lse_storage[:rows].reshape(shape[:-1])
+    scaled_lse.fill_(float("nan"))
+    delta = torch.full_like(lse, float("nan"))
+    dq_acc = torch.full_like(out, float("nan"), dtype=torch.float32) if zero_dq else None
+    # Keep dq_acc in its existing fourth positional slot when enabling LSE work.
+    amd_fa_bwd._run_bwd_preprocess(out, grad_out, delta, dq_acc, lse=lse, lse_log2=scaled_lse)
+
+    log2e = torch.tensor(1.4426950408889634, device="cuda", dtype=torch.float32)
+    torch.testing.assert_close(scaled_lse, original_lse * log2e, atol=0, rtol=0)
+    torch.testing.assert_close(lse, original_lse, atol=0, rtol=0)
+    torch.testing.assert_close(baseline_delta, expected_delta, atol=0, rtol=0)
+    torch.testing.assert_close(delta, expected_delta, atol=0, rtol=0)
+    torch.testing.assert_close(delta, baseline_delta, atol=0, rtol=0)
+    torch.testing.assert_close(lse_storage[rows:], torch.full_like(lse_storage[rows:], -123.0), atol=0, rtol=0)
+    if zero_dq:
+        torch.testing.assert_close(dq_acc, torch.zeros_like(dq_acc), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 @pytest.mark.parametrize(
     "shape",
@@ -3866,6 +3904,8 @@ def test_dense_bwd_unmeasured_dispatch_is_unchanged(hq, hk, n, causal):
         pytest.param("causal_mha", 2, id="causal_mha"),
         pytest.param("head_split", 1, id="head_split-hkv1"),
         pytest.param("head_split", 2, id="head_split-hkv2"),
+        pytest.param("head_split_all", 1, id="head_split_all-hkv1"),
+        pytest.param("head_split_all", 2, id="head_split_all-hkv2"),
         pytest.param("bm32", 1, id="bm32-hkv1"),
         pytest.param("bm32", 2, id="bm32-hkv2"),
     ],
@@ -3873,13 +3913,16 @@ def test_dense_bwd_unmeasured_dispatch_is_unchanged(hq, hk, n, causal):
 @pytest.mark.parametrize("n", [256, 768])
 @pytest.mark.parametrize("sm_scale", [128**-0.5, 0.0, -0.125])
 def test_dense_bwd_optimized_routes_gfx950(route, hk, n, sm_scale, monkeypatch):
-    grouped = route in ("head_split", "bm32")
-    causal = route in ("causal_mha", "head_split")
+    grouped = route in ("head_split", "head_split_all", "bm32")
+    causal = route in ("causal_mha", "head_split", "head_split_all")
     # Preserve GQA ratio eight while covering addressing across original KV heads.
     hq = 8 * hk if grouped else hk
     measured_n = 8192 if route == "bm32" else 4096
     measured = amd_fa_bwd._select_d128_interleaved_dispatch((16, 64 if grouped else 16, measured_n, 128),
                                                             (16, 8 if grouped else 16, measured_n, 128), causal)
+    if route == "head_split_all":
+        # One query head per owner still requires pre-scaled GQA LSE.
+        measured = replace(measured, kv_splits=8)
     monkeypatch.setattr(amd_fa_bwd, "_select_d128_interleaved_dispatch", lambda *args: measured)
     case = _make_dense_gqa_reference_case((2, hq, hk, n, 128), causal=causal, seed=2026, sm_scale=sm_scale)
     actual = fa_backward(*case.kernel_args)
@@ -3930,8 +3973,9 @@ def test_dense_bwd_optimized_graph_replay_gfx950(route, hk, monkeypatch):
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 @pytest.mark.parametrize("sm_scale", [0.0, -0.125], ids=["zero-scale", "negative-scale"])
-def test_dense_bwd_gqa_causal_scale_edges_gfx950(sm_scale):
-    case = _make_dense_gqa_reference_case((1, 2, 1, 256, 128), causal=True, seed=17, sm_scale=sm_scale)
+@pytest.mark.parametrize("shape", [(1, 1, 1, 256, 128), (1, 2, 1, 256, 128)], ids=["mha", "gqa2"])
+def test_dense_bwd_gqa_causal_scale_edges_gfx950(shape, sm_scale):
+    case = _make_dense_gqa_reference_case(shape, causal=True, seed=17, sm_scale=sm_scale)
     actual_grads = fa_backward(*case.kernel_args)
     for actual, expected in zip(actual_grads, case.grads, strict=True):
         assert torch.isfinite(actual).all()
@@ -3973,6 +4017,40 @@ def test_dense_bwd_d128_causal_tail_is_repeatable_gfx950(monkeypatch):
     }
     case = _make_dense_reference_case((16, 27, 200, 128), True, seed=21)
     with mock.patch.dict(os.environ, options):
+        for _ in range(5):
+            actual_grads = fa_backward(*case.kernel_args)
+            for actual, expected in zip(actual_grads, case.grads, strict=True):
+                assert torch.isfinite(actual).all()
+                assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_dense_bwd_d128_noncausal_rectangular_tail_is_repeatable_gfx950(monkeypatch):
+    options = {
+        amd_fa_bwd._D128_EXACT_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_SINK_INSTS_ENV: "0",
+        amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV: "0",
+        amd_fa_bwd._D128_REVERSE_LOCAL_ENV: "0",
+    }
+    case = _make_dense_reference_case((16, 27, 200, 128), False, seed=21)
+
+    def poison_allocation(allocate):
+
+        def allocate_and_poison(*args, **kwargs):
+            result = allocate(*args, **kwargs)
+            if result.is_floating_point():
+                result.fill_(float("nan"))
+            return result
+
+        return allocate_and_poison
+
+    # Poison newly allocated gradients and delta while running the real public
+    # path. N=200 reuses the BM32 Q/dO ring before its final eight valid rows.
+    with mock.patch.dict(os.environ, options), monkeypatch.context() as allocations:
+        allocations.setattr(torch, "empty", poison_allocation(torch.empty))
+        allocations.setattr(torch, "empty_like", poison_allocation(torch.empty_like))
         for _ in range(5):
             actual_grads = fa_backward(*case.kernel_args)
             for actual, expected in zip(actual_grads, case.grads, strict=True):

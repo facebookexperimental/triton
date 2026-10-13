@@ -38,8 +38,9 @@ STATUS_CODE = {"ok": "o", "noisy": "n", "pip": "p", "error": "e"}
 #: Each op's bench script under python/test/tlx_benchmark/, which ranks as that op's harness among suspect commits.
 BENCH_SCRIPT = {
     "mm": "bench_mm.py", "addmm": "bench_addmm.py", "flash_attn": "bench_flash_attn.py", "flash_attn_mxfp8":
-    "bench_flash_attn_mxfp8.py", "hstu_attn_dev": "bench_hstu_attn.py", "kimi_delta_attention": "bench_kda.py",
-    "kda_paged_prefill": "bench_kda_prefill.py", "kda_recurrent_decode": "bench_kda_decode.py"
+    "bench_flash_attn_mxfp8.py", "hstu_attn_dev": "bench_hstu_attn.py", "hstu_cross_attn": "bench_hstu_cross_attn.py",
+    "kimi_delta_attention": "bench_kda.py", "kda_paged_prefill": "bench_kda_prefill.py", "kda_recurrent_decode":
+    "bench_kda_decode.py"
 }
 #: Per-platform fields the page shows in its version panel, taken from the latest night.
 PLATFORM_FIELDS = ("gpu", "driver", "torch", "runtime", "triton", "governed", "timing", "version", "sha")
@@ -58,8 +59,8 @@ ARCH_TAGS = ("sm90", "sm100", "gfx942", "gfx950")
 #: Each op's kernel directory under third_party/tlx/ops/kernels/.
 KERNEL_DIR = {
     "mm": "mm", "addmm": "addmm", "bmm": "bmm", "flash_attn": "flash_attn", "flash_attn_mxfp8": "flash_attn_mxfp8",
-    "hstu_attn_dev": "hstu_attn", "kimi_delta_attention": "kda", "kda_paged_prefill": "kda", "kda_recurrent_decode":
-    "kda"
+    "hstu_attn_dev": "hstu_attn", "hstu_cross_attn": "hstu_cross_attn", "kimi_delta_attention": "kda",
+    "kda_paged_prefill": "kda", "kda_recurrent_decode": "kda"
 }
 DISPATCH = ("third_party/tlx/ops/__init__.py", "third_party/tlx/ops/_catalog.py",
             "third_party/tlx/ops/kernels/__init__.py", "third_party/tlx/language/tlx/hw/target.py")
