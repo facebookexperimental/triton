@@ -14,7 +14,8 @@ Python-only: no rebuild needed. Each kernel file is self-contained with its own 
 Available kernels: `blackwell_gemm_clc`, `blackwell_gemm_pipelined`, `blackwell_gemm_2cta`, `blackwell_fa_ws`, `blackwell_fa_ws_persistent`, `blackwell_fa_ws_pipelined`, `blackwell_fa_clc`, `hopper_gemm_pipelined`, `hopper_gemm_ws`, `hopper_fa_ws_pipelined_pingpong`
 
 One smoke case per kernel -- a sanity check, not the authoritative suite. Ops
-promoted into `tlx.ops` (`mm`, `flash_attn`, `hstu_attn`, `kimi_delta_attention`)
+promoted into `tlx.ops` (`mm`, `flash_attn`, `hstu_attn`, `hstu_cross_attn`,
+`kimi_delta_attention`)
 are tested in `python/test/unit/tlx_ops/` instead.
 
 - For other kernels: `pytest third_party/tlx/tutorials/<KERNEL.py>`

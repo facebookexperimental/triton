@@ -1,4 +1,5 @@
 #include "triton/Analysis/Allocation.h"
+#include "triton/Analysis/BufferRegion.h"
 #include "triton/Analysis/Membar.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -30,61 +31,19 @@ namespace nvidia_gpu {
 
 namespace {
 
-bool isAsyncProxyWrite(Operation *op) {
-  return isa<triton::nvidia_gpu::TMALoadLikeOpInterface,
-             triton::nvidia_gpu::CLCTryCancelOp>(op);
-}
-
-Value getSmemDest(Operation *op) {
-  if (auto tmaLoad = dyn_cast<triton::nvidia_gpu::TMALoadLikeOpInterface>(op)) {
-    return tmaLoad.getResult();
-  }
-  if (auto clcTryCancelOp = dyn_cast<triton::nvidia_gpu::CLCTryCancelOp>(op)) {
-    return clcTryCancelOp.getResult();
-  }
-  return Value();
-}
-
-bool isAsyncProxyRead(Operation *op) {
-  // Adopt upstream's interface-based classification (MMAv5OpInterface covers
-  // the tcgen5 MMA ops; TMAStoreLikeOpInterface covers
-  // scatter/reduce/local-to-global). Preserve beta's conservative divergence:
-  // the global-to-local TMA load is also treated as an async-proxy read so the
-  // post-allocation safety net fences it.
-  return isa<triton::nvidia_gpu::WarpGroupDotOp,
-             triton::nvidia_gpu::MMAv5OpInterface,
-             triton::nvidia_gpu::TMEMCopyOp,
-             triton::nvidia_gpu::TMAStoreLikeOpInterface,
-             triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op);
-}
-
-bool isAsyncProxyReadSource(Operation *op, Value value) {
-  auto memDescType = dyn_cast<triton::gpu::MemDescType>(value.getType());
-  if (!memDescType ||
-      !isa<triton::gpu::SharedMemorySpaceAttr>(memDescType.getMemorySpace()))
-    return false;
-  if (auto tmaStore =
-          dyn_cast<triton::nvidia_gpu::TMAStoreLikeOpInterface>(op)) {
-    return value == tmaStore.getSrc();
-  }
-  if (auto warpGroupDotOp = dyn_cast<triton::nvidia_gpu::WarpGroupDotOp>(op)) {
-    return value == warpGroupDotOp.getA() || value == warpGroupDotOp.getB();
-  }
-  if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(op)) {
-    return value == mma.getA() || value == mma.getB();
-  }
-  if (auto tmemCopyOp = dyn_cast<triton::nvidia_gpu::TMEMCopyOp>(op)) {
-    return value == tmemCopyOp.getSrc();
-  }
-  return false;
-}
+using gpu::SharedKind;
 
 bool ignoreOpForProxyFence(Operation *op) {
-  return isAsyncProxyRead(op) || isAsyncProxyWrite(op) ||
-         isa<triton::nvidia_gpu::ArriveBarrierOp,
-             triton::nvidia_gpu::TMEMCopyOp, triton::nvidia_gpu::WaitBarrierOp,
-             triton::nvidia_gpu::InitBarrierOp,
-             triton::nvidia_gpu::InvalBarrierOp>(op);
+  // Invalidation ends the barrier lifetime but still writes its backing
+  // shared memory. If a later async op reuses those bytes as payload, the
+  // invalidation needs the same proxy ordering as any other generic write.
+  if (isa<triton::nvidia_gpu::InvalBarrierOp>(op))
+    return false;
+  return (!hasSharedAccess(op, SharedKind::Generic) && hasSharedAccess(op)) ||
+         isa<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
+             triton::nvidia_gpu::ArriveBarrierOp,
+             triton::nvidia_gpu::WaitBarrierOp,
+             triton::nvidia_gpu::InitBarrierOp>(op);
 }
 
 bool filterFn(Operation *op, Operation *other, bool /*opIsRead*/,
@@ -112,6 +71,28 @@ ProxyFenceScope getProxyFenceScope(Operation *op) {
       triton::gpu::lookupNumCTAs(op) > 1)
     return ProxyFenceScope::Cluster;
   return ProxyFenceScope::CTA;
+}
+
+Interval<size_t> getPhysicalInterval(Value value, Allocation::BufferId bufferId,
+                                     Allocation &allocation) {
+  auto interval = allocation.getAllocatedInterval(bufferId);
+  // The shared-memory allocator may have already assigned a physical offset.
+  // Re-running Allocation here can choose a different one, notably because it
+  // keeps initialized barriers live through the entire function even when an
+  // inval_barrier releases their storage. Use the recorded offset for a single
+  // explicit buffer so an invalidated barrier can order a later async reuse.
+  if (auto alloc = value.getDefiningOp<triton::gpu::LocalAllocOp>()) {
+    if (allocation.getBufferIds(value).size() == 1) {
+      if (auto offset =
+              alloc->getAttrOfType<IntegerAttr>("allocation.offset")) {
+        if (offset.getInt() >= 0) {
+          size_t start = offset.getInt();
+          return {start, start + interval.size()};
+        }
+      }
+    }
+  }
+  return interval;
 }
 
 //===----------------------------------------------------------------------===//
@@ -149,7 +130,11 @@ void ProxyFenceAnalysis<scope>::update(Operation *op, BlockInfo *blockInfo,
   }
   BlockInfo curBlockInfo;
   BlockInfo proxyBlockInfo;
-  bool isProxyOp = (isAsyncProxyWrite(op) || isAsyncProxyRead(op)) &&
+  auto accesses = getMemoryAccesses(op);
+  // Retain beta's conservative TMA-load safety net if an effect description
+  // omits its async-proxy shared-memory read.
+  bool isTmaLoad = isa<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op);
+  bool isProxyOp = (hasSharedAccess(op, SharedKind::Async) || isTmaLoad) &&
                    getProxyFenceScope(op) == scope;
 
   auto scratchBufferId = Allocation::InvalidBufferId;
@@ -161,36 +146,30 @@ void ProxyFenceAnalysis<scope>::update(Operation *op, BlockInfo *blockInfo,
       curBlockInfo = funcMap->lookup(callee);
   } else {
     // Intra-function dependencies
-    if (auto memoryEffectOpInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
-      // Explicit buffer
-      SmallVector<SideEffects::EffectInstance<MemoryEffects::Effect>>
-          effectInstances;
-      memoryEffectOpInterface.getEffects(effectInstances);
-      for (auto effectInstance : effectInstances) {
-        if (auto value = effectInstance.getValue()) {
-          for (auto bufferId : allocation.getAllBufferIdsWithAliases(value)) {
-            if (bufferId != Allocation::InvalidBufferId) {
-              auto interval = allocation.getAllocatedInterval(bufferId);
-              auto slice = AllocationSlice(value, interval, bufferId);
-
-              if (isAsyncProxyWrite(op) && value == getSmemDest(op)) {
-                if (isProxyOp)
-                  proxyBlockInfo.syncWriteSlices[slice].insert(op);
-              } else if (isAsyncProxyRead(op) &&
-                         isAsyncProxyReadSource(op, value)) {
-                // Safe fallback for async-proxy reads from shared memory when
-                // the earlier FenceInsertionPass did not place a fence.
-                if (isProxyOp)
-                  proxyBlockInfo.syncReadSlices[slice].insert(op);
-              } else if (isa<MemoryEffects::Write>(
-                             effectInstance.getEffect())) {
-                curBlockInfo.syncWriteSlices[slice].insert(op);
-              } else if (isa<MemoryEffects::Read>(effectInstance.getEffect())) {
-                curBlockInfo.syncReadSlices[slice].insert(op);
-              }
-            }
-          }
-        }
+    // Explicit buffers are classified by their memory effects rather than
+    // operation-specific proxy lists.
+    for (const auto &access : accesses) {
+      // Model barrier invalidation as a generic write to the released
+      // storage. Other barrier effects stay excluded: they synchronize the
+      // barrier, not ordinary payload bytes.
+      if (!access.isShared() || (access.isShared(SharedKind::Barrier) &&
+                                 !isa<triton::nvidia_gpu::InvalBarrierOp>(op)))
+        continue;
+      for (auto bufferId :
+           allocation.getAllBufferIdsWithAliases(access.value)) {
+        if (bufferId == Allocation::InvalidBufferId)
+          continue;
+        auto interval = getPhysicalInterval(access.value, bufferId, allocation);
+        auto slice = AllocationSlice(access.value, interval, bufferId);
+        bool async =
+            access.isShared(SharedKind::Async) || (isTmaLoad && access.isRead);
+        BlockInfo &effects = async ? proxyBlockInfo : curBlockInfo;
+        if (async && !isProxyOp)
+          continue;
+        if (access.isWrite)
+          effects.syncWriteSlices[slice].insert(op);
+        if (access.isRead)
+          effects.syncReadSlices[slice].insert(op);
       }
     }
     scratchBufferId = allocation.getBufferId(op);

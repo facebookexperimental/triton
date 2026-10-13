@@ -53,6 +53,27 @@ static Interval<size_t> narrowIntervalForSubview(Value value,
   return Interval<size_t>(newStart, newStart + stride);
 }
 
+// Index expressions describe a slot of their original allocation, not of an
+// arbitrary allocation whose bytes alias the value. Only attach one when the
+// indexed root owns exactly the buffer id being recorded. Physical intervals
+// still conservatively track views with multiple or uncertain alias owners.
+static bool isOwnBufferIndex(Value value, Allocation::BufferId bufferId,
+                             Allocation &allocation) {
+  while (Operation *def = value.getDefiningOp()) {
+    if (auto index = dyn_cast<triton::gpu::MemDescIndexOp>(def)) {
+      auto alloc = index.getSrc().getDefiningOp<triton::gpu::LocalAllocOp>();
+      if (!alloc)
+        return false;
+      auto ids = allocation.getBufferIds(alloc.getResult());
+      return ids.size() == 1 && ids.front() == bufferId;
+    }
+    if (!isa<triton::gpu::MemDescSubsliceOp, triton::gpu::MemDescTransOp>(def))
+      return false;
+    value = def->getOperand(0);
+  }
+  return false;
+}
+
 static bool isConstantInt(Value value, int64_t expected) {
   APInt constant;
   return matchPattern(value, m_ConstantInt(&constant)) && constant == expected;
@@ -356,6 +377,9 @@ AllocationSlice AllocationSlice::enterStageLoop(Value induction,
   result.stage.offset =
       stageResidue(static_cast<int64_t>(result.stage.offset) - initialValue,
                    result.stage.numStages);
+  // The index expression describes the original SSA value, not the lifted
+  // induction-relative stage that subsequent loop iterations will access.
+  result.bufferIndexExpr = nullptr;
   // A lifted entry access now denotes any physical stage. Keeping its old
   // constant interval would incorrectly prove later-iteration accesses
   // disjoint.
@@ -372,6 +396,7 @@ AllocationSlice AllocationSlice::advanceStageLoop(Value induction) const {
   // old iv = new iv - 1 for the recognized +1 latch. Normalize so the set of
   // symbolic states is finite, independent of the loop's trip count.
   result.stage.offset = stage.offset ? stage.offset - 1 : stage.numStages - 1;
+  result.bufferIndexExpr = nullptr;
   return result;
 }
 
@@ -380,6 +405,7 @@ AllocationSlice AllocationSlice::forgetStageLoop() const {
   if (stage.basis) {
     result.allocationInterval = stage.parentInterval;
     result.stage = {};
+    result.bufferIndexExpr = nullptr;
   }
   return result;
 }
@@ -395,6 +421,12 @@ bool AllocationSlice::intersects(const AllocationSlice &other) const {
       stage.stride == other.stage.stride && bufferId == other.bufferId &&
       stage.numStages == other.stage.numStages &&
       stage.offset != other.stage.offset)
+    return false;
+
+  // For slices of the same allocation, compare dynamic buffer indices to prove
+  // that different slots do not overlap.
+  if (bufferId == other.bufferId && bufferId != Allocation::InvalidBufferId &&
+      areBufferIndicesProvablyDifferent(*this, other))
     return false;
 
   // If access types are unknown, assume intersection
@@ -739,6 +771,20 @@ static bool hasSyncPointBeforeMemoryEffect(Operation *op,
   return false;
 }
 
+void MembarAnalysis::updateSuccessor(Operation *terminator, Block *successor,
+                                     BlockInfo *blockInfo) {
+  if (bufferIndexAnalysis.isBackedgeSuccessor(terminator, successor))
+    bufferIndexAnalysis.invalidateBufferIndices(*blockInfo);
+}
+
+void MembarAnalysis::updateExitState(BlockInfo *blockInfo) {
+  // Function summaries are reused at every call site, so per-function SSA
+  // index and loop-coordinate identities are no longer meaningful.
+  *blockInfo = blockInfo->mapSlices(
+      [](const AllocationSlice &slice) { return slice.forgetStageLoop(); });
+  bufferIndexAnalysis.invalidateBufferIndices(*blockInfo);
+}
+
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                             FuncMapT *funcMap, OpBuilder *builder) {
   // Replace any provisional decision whenever this operation is revisited.
@@ -813,6 +859,10 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                 auto interval = allocation.getAllocatedInterval(bufferId);
                 auto slice = AllocationSlice(value, interval, bufferId,
                                              &allocation, getStageBasis(op));
+                if (isOwnBufferIndex(value, bufferId, allocation))
+                  slice.bufferIndexExpr =
+                      bufferIndexAnalysis.makeSlice(value, interval, bufferId)
+                          .bufferIndexExpr;
 
                 if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
                   curBlockInfo.syncWriteSlices[slice].insert(op);

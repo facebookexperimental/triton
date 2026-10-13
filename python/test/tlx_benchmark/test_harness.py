@@ -1,9 +1,13 @@
 import inspect
 import json
 import os
+import pathlib
+import sys
 
 import pytest
 import triton
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from _harness import (COLD_COMPILE_CAP_S, DEFAULT_REPLICATES, DEFAULT_WARMUP_ITERS, MAX_CLOCK_IDR, MAX_CV,
                       MAX_REPLICATE_DEVIATION, MIN_TOTAL_SAMPLES, MIN_SPEEDUP, SCHEMA_VERSION, Case, ClockTrace,
@@ -702,6 +706,7 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes",
         "triton.tlx.ops.kernels.flash_attn_varlen._shapes",
         "triton.tlx.ops.kernels.hstu_attn._shapes",
+        "triton.tlx.ops.kernels.hstu_cross_attn._shapes",
         "triton.tlx.ops.kernels.kda._shapes",
         "triton.tlx.ops.kernels.kda._prefill_shapes",
         "triton.tlx.ops.kernels.kda._decode_shapes",
@@ -740,6 +745,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "sm100": ("sm100_1", ),
             "gfx950": (),
         },
+        "triton.tlx.ops.kernels.hstu_cross_attn._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.kda._shapes": {"sm100": ("sm100_1", )},
         "triton.tlx.ops.kernels.kda._prefill_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
@@ -769,6 +775,9 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
 
     flash_attn = importlib.import_module("triton.tlx.ops.kernels.flash_attn._shapes").FOCUS
     assert flash_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
+
+    hstu_cross_attn = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn._shapes").FOCUS
+    assert hstu_cross_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 
 def test_flash_attn_mxfp8_gfx950_benchmark_is_forward_only(monkeypatch):
@@ -811,6 +820,7 @@ BENCH_MODULES = (
     "bench_flash_attn_mxfp8",
     "bench_flash_attn_varlen",
     "bench_hstu_attn",
+    "bench_hstu_cross_attn",
     "bench_kda",
     "bench_kda_decode",
     "bench_kda_prefill",

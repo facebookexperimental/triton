@@ -1326,8 +1326,8 @@ LogicalResult ScheduledMfmaOp::verify() {
            << "accumulator_register_class \"" << getAccumulatorRegisterClass()
            << "\" is not yet supported on CDNA3 for a \""
            << getAccumulatorRole()
-           << "\" accumulator: the accumulator read is not ordered against the "
-              "MFMA drain. Use \"vgpr\".";
+           << "\" accumulator: CDNA3 scheduled MFMA currently requires VGPR "
+              "accumulators. Use \"vgpr\".";
   return success();
 }
 

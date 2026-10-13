@@ -14,8 +14,6 @@ import functools
 import warnings
 from pathlib import Path
 
-from .amdgc_hazard_repair import insert_scheduled_mfma_hazard_nops
-
 MAX_INT_32 = 2**31 - 1
 
 
@@ -231,15 +229,11 @@ def is_consan_supported(arch):
     return arch in ["gfx1250"]
 
 
-def disable_real_true16_feature(arch):
-    return '-real-true16' if arch.startswith('gfx11') else ''
-
-
 _MATRIX_INTRINSIC_RE = re.compile(r"@llvm\.amdgcn\.(?:mfma|smfmac|wmma)\.")
 
 
 def get_amdgpu_codegen_features(arch, llvm_ir, disable_packed_fp32_ops=False):
-    features = [disable_real_true16_feature(arch)]
+    features = []
     if disable_packed_fp32_ops and arch == "gfx950" and _MATRIX_INTRINSIC_RE.search(llvm_ir):
         features.append("-packed-fp32-ops")
     return ",".join(feature for feature in features if feature)
@@ -765,6 +759,8 @@ class HIPBackend(BaseBackend):
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
         passes.convert.add_reconcile_unrealized_casts(pm)
+        # Share operand pins through CSE, then retain their ordering in LLVM.
+        amd.passes.ttgpuir.add_finalize_scheduled_mfma_operands(pm)
         try:
             pm.run(mod, "make_llir")
         finally:
@@ -962,7 +958,6 @@ class HIPBackend(BaseBackend):
                 dump_ir=knobs.getenv_bool("LLVM_IR_ENABLE_DUMP", False),
                 enable_timing=knobs.getenv_bool("LLVM_ENABLE_TIMING", False),
             )
-        amdgcn = insert_scheduled_mfma_hazard_nops(amdgcn, options.arch)
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
@@ -973,8 +968,6 @@ class HIPBackend(BaseBackend):
         target_features = []
         if knobs.compilation.enable_asan:
             target_features.append("+xnack")
-        if true16 := disable_real_true16_feature(options.arch):
-            target_features.append(true16)
         hsaco = assemble_amdgcn(src, options.arch, ",".join(target_features))
         with tempfile.NamedTemporaryFile() as tmp_out:
             with tempfile.NamedTemporaryFile() as tmp_in:

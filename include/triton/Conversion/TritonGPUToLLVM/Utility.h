@@ -17,6 +17,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
+#include <functional>
 #include <optional>
 
 #define DEBUG_TYPE "ttgpu_to_llvm"
@@ -681,10 +682,18 @@ Value applyPadding(Location loc, RewriterBase &rewriter, Value baseOffset,
 uint32_t applyPadding(uint32_t baseOffset,
                       ArrayRef<std::pair<unsigned, unsigned>> shifts);
 
+using LowerLdStCallback = std::function<SmallVector<Value>(
+    RewriterBase &, Location, ArrayRef<Value>, Value, int, VectorType, Value)>;
+
+LowerLdStCallback makeSharedStoreEmitter(const TargetInfoBase &targetInfo,
+                                         Value pred);
+LowerLdStCallback makeSharedLoadEmitter(const TargetInfoBase &targetInfo,
+                                        Operation *localLoadOp = nullptr);
+
 // Close cousin of lowerLdStMatrix in MemoryOpToLLVM.cpp
 // We might want to merge them at some point, but having to support
 // ldmatrix.trans makes the code in lowerLdStMatrix a bit specific
-// Lowers to st when valArrays is empty, and to ld when it is not,
+// Lowers to st when valsArray is nonempty, and to ld when it is empty,
 // and returns the output values.
 // `paddingShifts` encodes shared memory padding if any.
 SmallVector<Value> lowerLdStShared(
@@ -706,19 +715,16 @@ SmallVector<Value> lowerLdStShared(
 // and computes a new offset (mlir::Value) by applying padding based on
 // shared memory layout.
 // cvt: Maps (reg, lane, warp, block) → (offset[, partition]).
-SmallVector<Value> lowerLdSt(
-    Location loc, MLIRContext *ctx, LinearLayout cvt,
-    ArrayRef<Value> valsArray, // Input for store, output for load
-    Type llvmElemTy, ArrayRef<Value> smemBases,
-    ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
-    uint64_t maskSpanAffineOffset, Value affineBlockOffset,
-    uint64_t maskSpanAffineBlock, Value laneId, Value warpId,
-    RewriterBase &rewriter, const TargetInfoBase &targetInfo,
-    std::optional<int> maybeMaxVecElems,
-    std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
-                                     Value, int, VectorType, Value)>
-        lowerInst,
-    std::optional<Value> barrierPtr = {});
+SmallVector<Value>
+lowerLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
+          ArrayRef<Value> valsArray, // Input for store, output for load
+          Type llvmElemTy, ArrayRef<Value> smemBases,
+          ArrayRef<std::pair<unsigned, unsigned>> paddingShifts,
+          Value affineOffset, uint64_t maskSpanAffineOffset,
+          Value affineBlockOffset, uint64_t maskSpanAffineBlock, Value laneId,
+          Value warpId, RewriterBase &rewriter,
+          const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems,
+          LowerLdStCallback lowerInst, std::optional<Value> barrierPtr = {});
 
 // Lower local_load/local_store via ld.shared/st.shared
 SmallVector<Value> lowerLocalLdSt(
@@ -729,7 +735,17 @@ SmallVector<Value> lowerLocalLdSt(
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
     std::optional<Value> barrierPtr = {},
-    std::optional<std::pair<Value, Value>> distributedCoordinates = {});
+    std::optional<std::pair<Value, Value>> distributedCoordinates = {},
+    LowerLdStCallback lowerInst = {});
+
+// The callback form is used by target-independent lowering when the target
+// supplies its own load or store emission.
+SmallVector<Value>
+lowerLocalLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
+               ArrayRef<Value> valsArray, Type llvmElemTy,
+               triton::gpu::MemDescType srcTy, SharedMemoryObject smemObj,
+               RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+               LowerLdStCallback lowerInst);
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                     RewriterBase &rewriter);

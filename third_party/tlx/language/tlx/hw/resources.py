@@ -336,11 +336,11 @@ class BlackwellWSGemmModel:
     def check_tile_rules(tile: BlackwellWSGemmConfig) -> bool:
         """Structural validity of a tile, independent of memory footprint.
 
-        Rule 1:  each MMA group's tile must fit the hardware MMA (M <= 128).
+        Rule 1:  each MMA group's tile must have M=64 or M=128.
         Rule 1b: pair-CTA MMA requires exactly M=128 per MMA group.
         Rule 2:  ``EPILOGUE_SUBTILE`` must evenly divide ``BLOCK_N``.
         """
-        if tile.block_m_per_group > 128:
+        if tile.block_m_per_group not in (64, 128):
             return False
         if tile.num_ctas == 2 and tile.block_m_per_group < 128:
             return False

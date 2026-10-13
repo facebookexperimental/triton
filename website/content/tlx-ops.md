@@ -43,6 +43,7 @@ flash_attn_mxfp8/sm100.py
 flash_attn_mxfp8/gfx950.py
 flash_attn_varlen/gfx950.py
 hstu_attn/sm100.py
+hstu_cross_attn/gfx950.py
 kda/sm100.py
 ```
 
@@ -59,6 +60,7 @@ kernels/
     flash_attn_varlen/    gfx950.py                     (forward only)
     hstu_attn/            sm100.py  gfx942.py
                           _util.py  _stubs.py  _reference.py
+    hstu_cross_attn/      gfx950.py                     (fwd + bwd, split-KV)
     kda/                  sm100.py
     gdpa/                 sm100.py  gfx950.py
     grouped_gemm/         sm100.py  gfx950.py

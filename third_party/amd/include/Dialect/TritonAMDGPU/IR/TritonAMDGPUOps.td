@@ -33,6 +33,7 @@ include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUOpInterfaces.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUMemoryEffects.td"
 
 include "mlir/IR/EnumAttr.td"
 include "mlir/Dialect/LLVMIR/LLVMOpBase.td"
@@ -42,6 +43,7 @@ include "TritonAMDGPUDialect.td"
 include "TritonAMDGPUAttrDefs.td"
 include "TritonAMDGPUOpInterfaces.td"
 
+
 class TT_AMDGPU_Op<string mnemonic, list<Trait> traits = []>
     : Op<TritonAMDGPU_Dialect, mnemonic, !listconcat(traits, [])>;
 
@@ -49,7 +51,6 @@ class TT_AMDGPU_Op<string mnemonic, list<Trait> traits = []>
 // Interfaces
 //
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
-def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
 def L2Cache : Resource<"::mlir::triton::amd::L2Cache">;
 
 //===----------------------------------------------------------------------===//
@@ -369,7 +370,7 @@ def BufferLoadToLocalOp
   let arguments =
       (ins Arg<
            TTG_MemDescType,
-           "Shared memory slice to write to", [MemWrite<SharedMemory>]>:$dest,
+           "Shared memory slice to write to", GenericSharedWrite>:$dest,
           Arg<TT_Ptr, "Global memory scalar base pointer to load from",
               [MemRead<GlobalMemory>]>:$ptr,
           I32Tensor:$offsets, Optional<TT_BoolTensor>:$mask,
@@ -724,7 +725,7 @@ def LocalLoadPackedTransposedOp
       The packing change will change the shape of the tensor by doubling the M/N dimension and halving the K dimension.
       For example if A is 16x64 in shared memory, the result of this operation will be 32x32.
     }];
-  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+  let arguments = (ins Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
       Optional<TTG_AsyncToken>:$token);
   let results = (outs TT_Tensor:$result);
 
@@ -882,14 +883,14 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
 //===----------------------------------------------------------------------===//
 
 def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
-  let summary = "Execute source-scheduled independent native MFMA fragments";
+  let summary = "Execute native MFMA fragments with explicit lifetime contracts";
   let description = [{
-    Computes the full per-wave Cartesian product of the native
-    fragments in `a` and `b`, replacing every corresponding fragment in `acc`.
-    Native instructions are emitted in
-    K-major, N-major, M-minor order. This round-robins each K slice over the
-    independent output fragments before returning to an accumulator dependency
-    chain, while preserving one SSA chain per output fragment.
+    Computes the full per-wave Cartesian product of the native fragments in
+    `a` and `b`, replacing every corresponding fragment in `acc`. Native
+    MFMA intrinsics are created in K-major, N-major, M-minor order. This
+    round-robins each K slice over the independent output fragments before
+    returning to an accumulator dependency chain, while preserving one SSA
+    chain per output fragment. LLVM determines the final instruction schedule.
 
     On the persistent lowering path, `resident_operand` is `none`, `lhs`, or
     `rhs` and selects an input to constrain to AGPRs; the other input uses
@@ -902,15 +903,14 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     selects AGPRs, while an explicit class supports kernels whose persistent
     accumulator sets intentionally occupy complementary register classes. The
     transient intrinsic path leaves physical accumulator placement to LLVM.
-    On CDNA3 the compiler-generated AGPR read is not ordered against the MFMA
-    drain, so any AGPR accumulator request is rejected, including persistent
-    `auto`: a persistent accumulator must request `vgpr`.
-    `initialize` starts the updated native accumulators from zero.
-    To interleave work between output subtiles, use separate operations with
-    explicit input panels and independent accumulator tensors. Commit those
-    chains before joining their results into a larger output tile.
-    Completion of transient result fragments is represented separately by
-    `mfma_commit`.
+    CDNA3 retains its VGPR-only accumulator contract and rejects any AGPR
+    accumulator request, including persistent `auto`: a persistent accumulator
+    must request `vgpr`.
+    `initialize` starts the native accumulators from zero. To interleave work
+    between output subtiles, use separate operations with explicit input panels
+    and independent accumulator tensors. Commit those chains before joining
+    their results into a larger output tile. Completion of transient result
+    fragments is represented separately by `mfma_commit`.
 
     An AGPR-resident accumulator must not reach an `mfma_commit` that also
     carries a live dot operand: that boundary constrains its F32 results to
@@ -918,9 +918,31 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     boundary's hazard padding. Lowering reports this whenever the producing
     `scheduled_mfma` is visible from the commit.
 
-    All active lanes of a wave must execute this operation uniformly. This is
-    an explicit source contract because LLVM inline assembly cannot represent
-    a convergent-call attribute on the pinned compiler revision.
+    Both accumulator roles lower arithmetic to native ROCDL MFMA intrinsics.
+    Persistent operand register classes are constrained with inline
+    assembly. Persistent accumulator tuples are pinned after all K updates;
+    nonconstant input accumulators are also pinned before the updates when
+    `initialize` is false. These side-effecting accumulator pins constrain
+    compiler-side ordering. Kernel chains with only native consumers and no
+    calls retain empty pins that provide no hardware wait. If a persistent
+    result reaches opaque inline assembly or an unmodeled escape, including
+    through potentially aliasing memory reloads, without a sufficient explicit
+    `mfma_commit`, affected result pins include a target-specific completion
+    wait. Non-kernel helpers and functions with remaining calls conservatively
+    complete every persistent result at its pin, including unused fragments.
+
+    Functions containing persistent MFMAs also prefix nonempty opaque inline
+    assembly with the largest required completion delay in that function. This
+    includes pure assembly and writers unrelated to the result: register reuse
+    can otherwise overlap an MFMA's in-flight accesses after a result becomes
+    dead or partially unused. Keeping the delay inside the assembly preserves
+    it through LLVM scheduling. Empty register pins and compiler-owned commits
+    retain their separate handling. These conservative rules may add redundant
+    waits around opaque code; MFMA arithmetic remains native, and the waits are
+    not memory fences.
+
+    All active lanes of a wave must execute this operation uniformly. This
+    source contract covers the native arithmetic and register-pinning boundaries.
 
     The contract supports BF16 or F16 inputs and F32 accumulators on CDNA3 and
     CDNA4. Operands and accumulator must have matching rank two or three.
@@ -972,7 +994,7 @@ def AsyncCopyLocalToGlobalOp
     This allows op to use async_copy_local_to_global even if the alignment cannot be proven based on IR.
   }];
 
-  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+  let arguments = (ins Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
       Arg<TT_PtrTensor, "", [MemWrite<GlobalMemory>]>:$dst,
       Optional<I1Tensor>:$mask,
       DefaultValuedAttr<TT_CacheModifierAttr,
@@ -994,8 +1016,7 @@ def AsyncCopyLocalToGlobalOp
 // InitBarrierOp
 //===----------------------------------------------------------------------===//
 def InitBarrierOp
-    : TT_AMDGPU_Op<"init_barrier", [MemoryEffects<[MemWrite<SharedMemory>]>,
-                                    DeclareOpInterfaceMethods<
+    : TT_AMDGPU_Op<"init_barrier", [DeclareOpInterfaceMethods<
                                         MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "Initialize a barrier in the given shared memory allocation.";
   let description = [{
@@ -1006,7 +1027,7 @@ def InitBarrierOp
   }];
 
   let arguments =
-      (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$alloc,
+      (ins Arg<TTG_MemDescType, "", GenericSharedWrite>:$alloc,
           I32Attr:$count);
   let assemblyFormat =
       "$alloc `,` $count attr-dict `:` qualified(type($alloc))";
@@ -1084,8 +1105,8 @@ def AsyncTDMCopyGlobalToLocalOp
 
   let arguments =
       (ins Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
-          Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
-          Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
+          Arg<TTG_MemDescType, "", GenericSharedWrite>:$result,
+          Arg<Optional<TTG_MemDescType>, "", BarrierSharedWrite>:$barrier,
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "triton::CacheModifier::NONE">:$cache,
           OptionalAttr<I32Attr>:$warp_used_hint);
@@ -1142,7 +1163,7 @@ def AsyncTDMFusedCopyGlobalToLocalOp
 
   let arguments = (ins
     Arg<Variadic<TT_TensorDescType>, "", [MemRead<GlobalMemory>]>:$descs,
-    Arg<Variadic<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$dests,
+    Arg<Variadic<TTG_MemDescType>, "", GenericSharedWrite>:$dests,
     Variadic<I32>:$multicast_masks,
     DenseI32ArrayAttr:$warp_used_hints,
     DefaultValuedAttr<TT_CacheModifierAttr,
@@ -1184,8 +1205,8 @@ def AsyncTDMCopyLocalToGlobalOp
 
   let arguments =
       (ins Arg<TT_TensorDescType, "", [MemWrite<GlobalMemory>]>:$desc,
-          Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-          Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
+          Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
+          Arg<Optional<TTG_MemDescType>, "", BarrierSharedWrite>:$barrier,
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "triton::CacheModifier::NONE">:$cache);
 
@@ -1230,8 +1251,8 @@ def AsyncTDMScatterOp
   let arguments = (ins Arg<TT_TensorDescType,
                            "", [MemWrite<GlobalMemory>]>:$desc,
       TensorOf<[I16, I32]>:$dst_row_indices,
-      Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-      Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier);
+      Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
+      Arg<Optional<TTG_MemDescType>, "", BarrierSharedWrite>:$barrier);
   let results = (outs TTG_AsyncToken:$retToken);
 
   let assemblyFormat = [{
@@ -1274,8 +1295,8 @@ def AsyncTDMGatherOp
   let arguments = (ins Arg<TT_TensorDescType,
                            "", [MemRead<GlobalMemory>]>:$desc,
       TensorOf<[I16, I32]>:$src_row_indices,
-      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
-      Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier);
+      Arg<TTG_MemDescType, "", GenericSharedWrite>:$dst,
+      Arg<Optional<TTG_MemDescType>, "", BarrierSharedWrite>:$barrier);
   let results = (outs TTG_AsyncToken:$token);
 
   let builders = [OpBuilder<
@@ -1492,6 +1513,7 @@ def MemoryCounterWaitOp : TT_AMDGPU_Op<"memory_counter_wait"> {
 }
 
 //===----------------------------------------------------------------------===//
+
 // WaitBarrierOp
 //===----------------------------------------------------------------------===//
 
@@ -1507,7 +1529,7 @@ def WaitBarrierOp
 
   let arguments =
       (ins Arg<TTG_MemDescType,
-               "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+               "", BarrierSharedReadWrite>:$alloc,
           I32:$phase);
 
   let assemblyFormat = [{
@@ -1539,7 +1561,7 @@ def ArriveBarrierOp
 
   let arguments =
       (ins Arg<TTG_MemDescType,
-               "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+               "", BarrierSharedReadWrite>:$alloc,
           I32Attr:$count);
 
   let results = (outs I32:$result);
@@ -1567,7 +1589,7 @@ def AsyncCopyMbarrierArriveOp
   }];
   let arguments =
       (ins Arg<TTG_MemDescType,
-               "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$barrier);
+               "", BarrierSharedReadWrite>:$barrier);
   let assemblyFormat = "$barrier attr-dict `:` qualified(type($barrier))";
   let hasVerifier = 1;
 }
