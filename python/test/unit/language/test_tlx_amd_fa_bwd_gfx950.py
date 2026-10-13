@@ -3944,7 +3944,7 @@ def test_dense_bwd_gqa_supported_shapes_end_to_end_gfx950(shape, causal):
 
 @pytest.mark.parametrize(
     ("hq", "hk", "n", "causal", "bm", "splits", "iglp", "peel"),
-    [(16, 16, 4096, False, 16, 1, -1, False), (16, 16, 4096, True, 16, 1, 3, True),
+    [(16, 16, 4096, False, 32, 1, -1, False), (16, 16, 4096, True, 16, 1, 3, True),
      (16, 16, 8192, True, 16, 1, 3, True), (16, 16, 16384, True, 16, 1, 3, True), (64, 8, 2048, True, 16, 4, -1, False),
      (64, 8, 4096, True, 16, 4, -1, False), (64, 8, 8192, False, 32, 1, -1, False)],
 )
@@ -3977,7 +3977,7 @@ def test_dense_bwd_unmeasured_dispatch_is_unchanged(hq, hk, n, causal):
         pytest.param((1, 8, 1, 1024, 128), False, None, "optimized", 32, False, id="automatic-query-split"),
         pytest.param((16, 64, 8, 7936, 128), False, None, "original", 1, True, id="original-gqa-fallback"),
         pytest.param((16, 64, 8, 1024, 128), True, None, "original", 1, True, id="original-causal-gqa"),
-        pytest.param((16, 16, 16, 16384, 128), False, None, "optimized", 1, False, id="optimized-mha"),
+        pytest.param((16, 16, 16, 16384, 128), False, None, "bm32", 1, False, id="optimized-mha"),
         pytest.param((16, 16, 16, 7936, 128), False, None, "original", 1, False, id="original-mha"),
     ],
 )
@@ -4120,6 +4120,9 @@ def test_dense_bwd_optimized_routes_gfx950(route, hk, n, sm_scale, monkeypatch):
     measured_n = 8192 if route == "bm32" else 4096
     measured = amd_fa_bwd._select_d128_interleaved_dispatch((16, 64 if grouped else 16, measured_n, 128),
                                                             (16, 8 if grouped else 16, measured_n, 128), causal)
+    if route == "mha":
+        # Check the BM16 fallback on small shapes outside the exact MHA BM32 contract.
+        measured = replace(measured, main_entry=amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_optimized_kernel, block_m=16)
     if route == "head_split_all":
         # One query head per owner still requires pre-scaled GQA LSE.
         measured = replace(measured, kv_splits=8)
@@ -5499,7 +5502,7 @@ def test_dense_bwd_mha16k_sink_default_guard(monkeypatch):
         ((16, 64, 8, 8192, 128), False, 2, 16, 2),
         ((1, 4, 2, 8192, 128), False, None, 16, 4),
         ((16, 64, 8, 8192, 128), True, None, 16, 1),
-        ((16, 16, 16, 8192, 128), False, 1, 16, 1),
+        ((16, 16, 16, 8192, 128), False, 1, 32, 1),
     ],
 )
 def test_dense_bwd_gqa_long_dispatch_guard(shape, causal, split_q, expected_block_m, expected_split, monkeypatch):
@@ -5531,6 +5534,45 @@ def test_dense_bwd_gqa_long_dispatch_guard(shape, causal, split_q, expected_bloc
         assert overridden.main_entry is expected_entry
         assert overridden.sink_insts_to_avoid_spills is (value == "1")
         assert overridden.reverse_local_assignment is (value == "1")
+
+
+@pytest.mark.parametrize("n_ctx", [1024, 2048, 4096, 8192, 16384])
+@pytest.mark.parametrize("mode", ["default", "unsplit", "causal", "split2", "batch15", "heads17"])
+def test_dense_bwd_mha_bm32_dispatch_guard_host(n_ctx, mode, monkeypatch):
+    for name in (amd_fa_bwd._D128_SINK_INSTS_ENV, amd_fa_bwd._D128_REVERSE_LOCAL_ENV,
+                 amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV):
+        monkeypatch.delenv(name, raising=False)
+    batch = 15 if mode == "batch15" else 16
+    heads = 17 if mode == "heads17" else 16
+    shape = (batch, heads, heads, n_ctx, 128)
+    causal = mode == "causal"
+    split_q = None if mode == "default" else 2 if mode == "split2" else 1
+    selected = mode in ("default", "unsplit")
+    dispatch = _select_d128_shape_dispatch(shape, causal=causal, split_q=split_q)
+    expected_entry = (amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_bm32_kernel
+                      if selected else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_kernel
+                      if causal else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_optimized_kernel)
+    assert dispatch.main_entry is expected_entry
+    assert dispatch.block_m == (32 if selected else 16)
+    assert dispatch.block_n == 256
+    assert dispatch.split_q == (2 if mode == "split2" else 1)
+    assert dispatch.num_warps == 4 and dispatch.num_stages == 1
+    assert dispatch.convert_block_m == 128 and dispatch.convert_num_warps == 4
+    expected_converter = (amd_fa_bwd._attn_bwd_dq_native_planes2_convert_kernel
+                          if selected and n_ctx == 16384 else amd_fa_bwd._attn_bwd_dq_native_optimized_convert_kernel)
+    if not causal:
+        assert dispatch.convert_entry is expected_converter
+    if causal:
+        return
+    for value in ("0", "1"):
+        monkeypatch.setenv(amd_fa_bwd._D128_REVERSE_LOCAL_ENV, value)
+        monkeypatch.setenv(amd_fa_bwd._D128_SINK_INSTS_ENV, value)
+        override = _select_d128_shape_dispatch(shape, causal=causal, split_q=split_q)
+        assert override.main_entry is dispatch.main_entry
+        assert override.block_m == dispatch.block_m
+        assert override.convert_entry is dispatch.convert_entry
+        assert override.reverse_local_assignment is (value == "1")
+        assert override.sink_insts_to_avoid_spills is (value == "1")
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -5610,6 +5652,54 @@ def test_dense_bwd_gqa_long_refill_analytic_gfx950(n_ctx, group_size, sm_scale, 
     pytest.param((15, 64, 8, 16384, 128), id="fragment-chain-16k-batch15"),
 ])
 def test_dense_bwd_gqa_exact_fragment_chain_analytic_gfx950(shape, monkeypatch):
+    _check_dense_bwd_exact_bm32_fragment_chain_analytic(shape, monkeypatch)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("shape", [
+    pytest.param((16, 16, 16, 2048, 128), id="mha-bm32-2k"),
+    pytest.param((16, 16, 16, 16384, 128), id="mha-bm32-16k-two-planes"),
+])
+def test_dense_bwd_mha_exact_bm32_fragment_chain_analytic_gfx950(shape, monkeypatch):
+    _check_dense_bwd_exact_bm32_fragment_chain_analytic(shape, monkeypatch)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("pin_front,native_front,causal,n_ctx", [
+    pytest.param(False, True, False, 16384, id="missing-front-pin"),
+    pytest.param(True, False, False, 16384, id="missing-native-front"),
+    pytest.param(True, True, True, 16384, id="causal-front"),
+    pytest.param(True, True, False, 8192, id="wrong-query-length"),
+])
+def test_dense_bwd_bm32_delayed_front_invalid_contract_gfx950(pin_front, native_front, causal, n_ctx):
+    from triton.compiler.errors import CompileTimeAssertionFailure
+
+    # Compilation stops at the contract check before any placeholder operand is used.
+    with pytest.raises(CompileTimeAssertionFailure, match="DELAY_FRONT_PINS"):
+        amd_fa_bwd._attn_bwd_gqa_bm32_front.warmup(
+            *([None] * 8),
+            0,
+            0,
+            SM_SCALE=0.0625,
+            N=n_ctx,
+            BLOCK_M=32,
+            BLOCK_N=256,
+            IS_CAUSAL=causal,
+            MMA_NM=None,
+            MMA_ND=None,
+            K_NM_LAYOUT=None,
+            QT_LAYOUT=None,
+            P_ND_LAYOUT=None,
+            Q_OUT_LAYOUT=None,
+            PIN_FRONT=pin_front,
+            NATIVE_FRONT=native_front,
+            DELAY_FRONT_PINS=True,
+            grid=(1, ),
+            num_warps=4,
+        )
+
+
+def _check_dense_bwd_exact_bm32_fragment_chain_analytic(shape, monkeypatch):
     for name in (
             amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV,
             amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV,
@@ -5626,6 +5716,16 @@ def test_dense_bwd_gqa_exact_fragment_chain_analytic_gfx950(shape, monkeypatch):
     launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_bwd, "_attn_bwd_dkdv_dq_d128_gqa_bm32_kernel")
 
     batch, query_heads, kv_heads, n_ctx, head_dim = shape
+    dq_accumulators = []
+    if query_heads == kv_heads and n_ctx == 16384:
+        allocate_dq = amd_fa_bwd._allocate_dq_accumulator
+
+        def capture_dq_accumulator(*args, **kwargs):
+            accumulator = allocate_dq(*args, **kwargs)
+            dq_accumulators.append(accumulator)
+            return accumulator
+
+        monkeypatch.setattr(amd_fa_bwd, "_allocate_dq_accumulator", capture_dq_accumulator)
     group_size = query_heads // kv_heads
     sm_scale = 1.0 / 16.0
     q = torch.zeros((batch, query_heads, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
@@ -5698,7 +5798,32 @@ def test_dense_bwd_gqa_exact_fragment_chain_analytic_gfx950(shape, monkeypatch):
     assert any(line.count("tensor<128x32xf32") == 8 for line in loop_headers), loop_headers
     assert "amdg.scheduled_mfma" in ttir
     assert "amdg.mfma_commit" in ttir
-    if n_ctx == 8192:
+    if query_heads == kv_heads:
+        # The selected MHA route caches 64 K rows and reloads the other rows.
+        assert "tensor<128x128xbf16" not in ttir
+        assert re.search(
+            r"ttg\.local_load .*token %initial_wait[^\n]*memdesc<64x128xbf16[^\n]*"
+            r"-> tensor<64x128xbf16", ttir)
+        assert "call void @llvm.amdgcn.sched.barrier(i32 0)" in compiled.asm["llir"]
+        assert compiled.name == "_attn_bwd_dkdv_dq_d128_gqa_bm32_kernel"
+        assert launch_kwargs["reverse_local_assignment"] is True
+        assert launch_kwargs["sink_insts_to_avoid_spills"] is (n_ctx != 16384)
+        assert launch_kwargs["regclass_priority_trumps_globalness"] is False
+        assert compiled.metadata.reverse_local_assignment is launch_kwargs["reverse_local_assignment"]
+        assert compiled.metadata.sink_insts_to_avoid_spills is launch_kwargs["sink_insts_to_avoid_spills"]
+        if n_ctx == 2048:
+            # Require zero scratch after the measured MHA2K route passes this gate.
+            _assert_scratch_free(compiled.name, compiled)
+        else:
+            assert len(dq_accumulators) == 1
+            accumulator = dq_accumulators[0]
+            assert accumulator.shape == (2, *q.shape)
+            assert dispatch.convert_entry is amd_fa_bwd._attn_bwd_dq_native_planes2_convert_kernel
+            # The inverse K/V amplitudes give equal nonzero contributions in both owner planes.
+            assert torch.count_nonzero(accumulator[0]).item() > 0
+            assert torch.count_nonzero(accumulator[1]).item() > 0
+            torch.testing.assert_close(accumulator[0], accumulator[1], rtol=0.0, atol=0.0)
+    elif n_ctx == 8192:
         # The GQA8K path reloads low K bands and schedules Q loads after the front.
         assert "tensor<128x128xbf16" not in ttir
         assert "call void @llvm.amdgcn.sched.barrier(i32 0)" in compiled.asm["llir"]
@@ -5708,8 +5833,19 @@ def test_dense_bwd_gqa_exact_fragment_chain_analytic_gfx950(shape, monkeypatch):
         assert compiled.metadata.reverse_local_assignment is True
         _assert_scratch_free(compiled.name, compiled)
     else:
-        assert "tensor<128x128xbf16" in ttir
-        assert "llvm.amdgcn.sched.barrier" not in compiled.asm["llir"]
+        # The exact GQA16K route caches 64 K rows and delays its front pins.
+        assert "tensor<128x128xbf16" not in ttir
+        assert re.search(
+            r"ttg\.local_load .*token %initial_wait[^\n]*memdesc<64x128xbf16[^\n]*"
+            r"-> tensor<64x128xbf16", ttir)
+        assert "call void @llvm.amdgcn.sched.barrier(i32 0)" in compiled.asm["llir"]
+        assert launch_kwargs["reverse_local_assignment"] is True
+        assert launch_kwargs["sink_insts_to_avoid_spills"] is True
+        assert launch_kwargs["regclass_priority_trumps_globalness"] is False
+        assert compiled.metadata.reverse_local_assignment is True
+        assert compiled.metadata.sink_insts_to_avoid_spills is True
+        assert compiled.metadata.regclass_priority_trumps_globalness is False
+        _assert_scratch_free(compiled.name, compiled)
 
     for name, actual_gradient in zip(("dQ", "dK", "dV"), actual_grads, strict=True):
         signal_energy = torch.zeros((), device=q.device)
