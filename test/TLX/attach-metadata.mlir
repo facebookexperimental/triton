@@ -272,6 +272,43 @@ module attributes {
 
 //--- amd.mlir
 
+// CHECK-DAG: #[[$DECODER_MMA:.*]] = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [16, 16, 32], isTransposed = true}>
+// CHECK-DAG: #[[$DECODER_TRANSPOSE:.*]] = #ttg.linear<
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [16, 16, 32], isTransposed = true}>
+#a = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#b = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module {
+  // CHECK-LABEL: tt.func @mfma_dot_scale_transpose(
+  // CHECK-SAME: %[[DECODER_MASK:[^:]+]]: tensor<16x16xi1>)
+  tt.func @mfma_dot_scale_transpose(%a: tensor<16x128xbf16, #a>, %b: tensor<128x16xbf16, #b>, %acc: tensor<16x16xf32, #mma>, %mask: tensor<16x16xi1>) {
+    %required_acc = tlx.require_layout %acc : tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    // CHECK: %[[QK:.*]] = tt.dot
+    // CHECK-SAME: -> tensor<16x16xf32, #[[$DECODER_MMA]]>
+    %qk = tt.dot %a, %b, %acc : tensor<16x128xbf16, #a> * tensor<128x16xbf16, #b> -> tensor<16x16xf32, #mma>
+    %scale = arith.constant dense<0.500000e+00> : tensor<16x16xf32>
+    // CHECK: %[[SCALE_EDGE:.*]] = tlx.require_layout
+    // CHECK-SAME: tensor<16x16xf32> -> tensor<16x16xf32, #[[$DECODER_MMA]]>
+    // CHECK: %[[SCALED:.*]] = arith.mulf %[[QK]], %[[SCALE_EDGE]]
+    // CHECK-SAME: tensor<16x16xf32, #[[$DECODER_MMA]]>
+    %scaled = "arith.mulf"(%qk, %scale) : (tensor<16x16xf32, #mma>, tensor<16x16xf32>) -> tensor<16x16xf32, #mma>
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
+    // CHECK: %[[MASK_EDGE:.*]] = tlx.require_layout %[[DECODER_MASK]]
+    // CHECK-SAME: tensor<16x16xi1> -> tensor<16x16xi1, #[[$DECODER_MMA]]>
+    // CHECK: %[[SELECTED:.*]] = arith.select %[[MASK_EDGE]], %[[SCALED]], %{{[^ ,:]+}}
+    // CHECK-SAME: tensor<16x16xf32, #[[$DECODER_MMA]]>
+    %selected = "arith.select"(%mask, %scaled, %zero) : (tensor<16x16xi1>, tensor<16x16xf32, #mma>, tensor<16x16xf32>) -> tensor<16x16xf32, #mma>
+    // CHECK: %[[BF16:.*]] = arith.truncf %[[SELECTED]]
+    // CHECK-SAME: tensor<16x16xf32, #[[$DECODER_MMA]]> to tensor<16x16xbf16, #[[$DECODER_MMA]]>
+    %bf16 = "arith.truncf"(%selected) : (tensor<16x16xf32, #mma>) -> tensor<16x16xbf16>
+    // CHECK: tt.trans %[[BF16]]
+    // CHECK-SAME: -> tensor<16x16xbf16, #[[$DECODER_TRANSPOSE]]>
+    %transposed = "tt.trans"(%bf16) <{order = array<i32: 1, 0>}> : (tensor<16x16xbf16>) -> tensor<16x16xbf16>
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK-DAG: #[[$BUFFER_MMA:.*]] = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [16, 16, 32], isTransposed = true}>
 // CHECK-DAG: #[[$BUFFER_USER:.*]] = #tlx.user_layout<#[[$BUFFER_MMA]]>
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [16, 16, 32], isTransposed = true}>

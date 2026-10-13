@@ -112,9 +112,13 @@ the re-sync.
 
     Permutes the dimensions of a tensor.
 
-- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])` **[Hopper+, MI300+]**
+- `buffer = tlx.local_slice(buffer, offset=[m, n], shape=[M, N])` **[Hopper+, MI300+]**
 
-    Slice a `M x N` tensor at a `m x n` offset.
+    Slice a tensor at the given logical offset. On MI300+, SMEM offsets may be
+    runtime scalar i32 tensors; `shape` remains constexpr. The caller must keep
+    a runtime-offset view within the allocation and satisfy the same
+    tile-alignment contract as a static slice; violating either condition is
+    undefined behavior.
 
 #### Buffer Reuse
 
@@ -1068,6 +1072,14 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
     pin survived to the final TTGIR.
 
+- `x = tlx.release_layout(x)` **[Hopper+, MI300+]**
+
+    End an explicit register-layout requirement without changing the tensor's
+    value. Downstream layout propagation may select a layout preferred by the
+    consumer, for example when a dot-operand layout feeds a reduction. This is
+    not a conversion request; use another `require_layout` when the replacement
+    layout is part of the algorithm.
+
 - `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
 
     Compile-time assertion that two layouts are equivalent after layout
@@ -1219,6 +1231,32 @@ def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
 
 For the async global-to-shared variant, see the warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`).
 
+## Wave Uniformity (AMD)
+
+### `tlx.assume_uniform`
+
+Assert that a scalar holds the same value in every lane of the wave.
+
+```python
+value = tlx.assume_uniform(value)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `value` | scalar pointer, or 16/32/64-bit int or float | Value asserted to be wave-uniform. Narrower types are not supported. |
+
+**Returns**: `value`, unchanged.
+
+The main use is buffer operations, which keep their base pointer in the scalar (SGPR) resource descriptor, so it has to be wave-uniform. When the backend cannot prove that it is — most commonly because the pointer was loaded from memory — it falls back to a per-lane waterfall loop around every access. `tlx.assume_uniform` tells the backend to take uniformity as given:
+
+```python
+base = tl.load(ptr_array + gid).to(tl.pointer_type(tl.float16))
+base = tlx.assume_uniform(base)
+data = tlx.buffer_load(base, offsets)
+```
+
+Lowers to `amdg.assume_uniform`, which is eventually lowered to `llvm.amdgcn.readfirstlane` — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.
+
 ## Explicit MFMA Scheduling (AMD)
 
 > **[MI350]** — the source-scheduled operations are restricted to CDNA4
@@ -1232,7 +1270,14 @@ For the async global-to-shared variant, see the warp-pipeline GEMM example (`thi
   inexpensive distributed coordinates near a use instead of carrying them
   through a long software pipeline.
 - `tlx.amd_register_resident(value, register_class="agpr", registers_per_group=1)`
-  keeps a distributed value in allocator-visible native register tuples.
+  keeps every native-register group in one allocator-visible whole-tensor
+  residency interval.
+- `tlx.amd_register_handoff(value, register_class="vgpr")` starts an
+  independent allocation interval for each 32-bit native register value,
+  shortening a local live range without requiring simultaneous whole-tensor
+  residency. Both register-boundary operations accept `"vgpr"` or `"agpr"`;
+  `amd_register_resident` additionally accepts a power-of-two
+  `registers_per_group` from 1 through 32.
 - `tlx.amd_scheduled_mfma(...)` exposes independent native MFMA accumulator
   chains in deterministic N-major, M-minor, K-reduction source order.
 - `tlx.amd_mfma_commit(value, preserve)` applies the CDNA4 MFMA result hazard

@@ -49,11 +49,14 @@ NUM_WARPS = 8
 
 # Coalesced SIMD register layout for the [HALF_M, BLOCK_N] = [128, 256] fp16
 # epilogue store (num_warps=8, warp_size=64): each thread holds 8 contiguous N
-# -> 128-bit buffer_store_dwordx4. Pinned on the store via tlx.require_layout so
-# tritongpu-coalesce commits this #linear and AMD OptimizeEpilogue leaves it
-# alone, keeping the wide store WITHOUT any backend store-layout-selection
-# change. N-doubled analog of the a16w16 [128,128] store layout.
-_C_STORE_SIMD_LAYOUT = tlx.layout(shape=((32, 2, 8), (8, 8)), stride=((8, 256, 512), (1, 4096)))
+# -> 128-bit buffer_store_dwordx4. Keep the highest warp bit on M4 to preserve
+# the two 256-thread warp-pipeline groups during the MFMA-to-store conversion.
+# Pinned on the store via tlx.require_layout so tritongpu-coalesce commits this
+# #linear and AMD OptimizeEpilogue leaves it alone.
+_C_STORE_SIMD_LAYOUT = tlx.layout(
+    shape=((32, 2, 4, 2), (8, 2, 4)),
+    stride=((8, 256, 512, 4096), (1, 2048, 8192)),
+)
 
 
 @triton.jit
