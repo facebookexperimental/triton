@@ -1948,8 +1948,13 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
   // getTmemLoadLayoutSplitLongM layouts. Fall back to checking if the current
   // layout matches any of the compatible layouts enumerated by
   // getTmemCompatibleLayouts.
-  SmallVector<DistributedEncodingTrait> layouts =
-      getTmemCompatibleLayouts(op, type, memdesc);
+  SmallVector<DistributedEncodingTrait> layouts;
+  // Compatible layouts only exist for a power-of-two warp count >= 4;
+  // with anything else there is nothing to enumerate, so go straight to
+  // the error below instead of crashing.
+  if (int numWarps = lookupNumWarps(op);
+      numWarps >= 4 && llvm::isPowerOf2_32(numWarps))
+    layouts = getTmemCompatibleLayouts(op, type, memdesc);
   auto encoding =
       dyn_cast<triton::gpu::LayoutEncodingTrait>(type.getEncoding());
   if (encoding) {

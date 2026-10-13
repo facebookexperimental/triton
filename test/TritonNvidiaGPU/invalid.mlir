@@ -1979,3 +1979,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A 2-warp TMEM load has no compatible distributed layout. The verifier
+// must reject it with a diagnostic instead of crashing.
+#b2v = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 1], order = [1, 0]}>
+#tmemv = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @verify_two_warps(%src: !ttg.memdesc<128x128xf32, #tmemv, #ttng.tensor_memory, mutable>) -> tensor<128x128xf32, #b2v> {
+    // expected-error @below {{'ttng.tmem_load' op result}}
+    // expected-note @below {{Got: }}
+    %loaded = ttng.tmem_load %src : !ttg.memdesc<128x128xf32, #tmemv, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #b2v>
+    tt.return %loaded : tensor<128x128xf32, #b2v>
+  }
+}
