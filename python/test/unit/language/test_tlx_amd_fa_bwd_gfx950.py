@@ -5462,8 +5462,10 @@ def test_dense_bwd_mha16k_sink_default_guard(monkeypatch):
         ((16, 64, 8, 4096, 128), False, None, False, True),
         ((16, 64, 8, 4096, 128), False, 1, False, True),
         ((16, 64, 8, 4096, 128), True, 1, False, False),
-        ((16, 64, 8, 8192, 128), False, None, False, False),
-        ((16, 64, 8, 8192, 128), False, 1, False, False),
+        ((16, 64, 8, 8192, 128), False, None, False, True),
+        ((16, 64, 8, 8192, 128), False, 1, False, True),
+        ((15, 64, 8, 8192, 128), False, 1, False, False),
+        ((16, 32, 4, 8192, 128), False, 1, False, False),
         ((16, 64, 8, 8192, 128), False, 2, True, True),
         ((16, 64, 8, 8192, 128), True, 1, False, False),
         ((15, 64, 8, 16384, 128), False, None, True, True),
@@ -5691,10 +5693,23 @@ def test_dense_bwd_gqa_exact_fragment_chain_analytic_gfx950(shape, monkeypatch):
             }
     assert launch_kwargs["IS_CAUSAL"] is False
     # FRAGMENT_CHAIN carries eight dK fragments through the outer loop.
-    loop_headers = [line for line in compiled.asm["ttir"].splitlines() if "scf.for" in line and "iter_args" in line]
+    ttir = compiled.asm["ttir"]
+    loop_headers = [line for line in ttir.splitlines() if "scf.for" in line and "iter_args" in line]
     assert any(line.count("tensor<128x32xf32") == 8 for line in loop_headers), loop_headers
-    assert "amdg.scheduled_mfma" in compiled.asm["ttir"]
-    assert "amdg.mfma_commit" in compiled.asm["ttir"]
+    assert "amdg.scheduled_mfma" in ttir
+    assert "amdg.mfma_commit" in ttir
+    if n_ctx == 8192:
+        # The GQA8K path reloads low K bands and schedules Q loads after the front.
+        assert "tensor<128x128xbf16" not in ttir
+        assert "call void @llvm.amdgcn.sched.barrier(i32 0)" in compiled.asm["llir"]
+        assert launch_kwargs["reverse_local_assignment"] is True
+        assert launch_kwargs["sink_insts_to_avoid_spills"] is False
+        assert launch_kwargs["regclass_priority_trumps_globalness"] is False
+        assert compiled.metadata.reverse_local_assignment is True
+        _assert_scratch_free(compiled.name, compiled)
+    else:
+        assert "tensor<128x128xbf16" in ttir
+        assert "llvm.amdgcn.sched.barrier" not in compiled.asm["llir"]
 
     for name, actual_gradient in zip(("dQ", "dK", "dV"), actual_grads, strict=True):
         signal_energy = torch.zeros((), device=q.device)
