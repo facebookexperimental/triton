@@ -817,6 +817,16 @@ public:
       return failure();
     }
 
+    // UE5M3 (int8 block-16) scales have no native sm120 lowering: the MMAv2
+    // backend keys the scale kind off the element type alone and would
+    // encode them as UE8M0/2X, reading the bytes wrong. Fail so the op falls
+    // back to the UE5M3-aware decompose path.
+    if (scaleElemType.isInteger(8) && dotOp.deduceScaleFactor() == 16) {
+      return rewriter.notifyMatchFailure(
+          dotOp, "sm120 native scaled dot does not support UE5M3 (int8 "
+                 "block-16) scales");
+    }
+
     // Common MMA encoding creation
     auto mmaResult =
         createMMAEncodingForDot(dotOp, rewriter, computeCapability, 2);
