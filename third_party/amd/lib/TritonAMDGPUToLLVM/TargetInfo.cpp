@@ -165,6 +165,20 @@ Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
   return ROCDL::BallotOp::create(rewriter, loc, type, cmp);
 }
 
+Value TargetInfo::rematerializeDistributedCoordinate(RewriterBase &rewriter,
+                                                     Location loc,
+                                                     Value coordinate) const {
+  auto *ctx = rewriter.getContext();
+  auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
+  auto operandAttrs = ArrayAttr::get(ctx, {});
+  auto inlineAsm = LLVM::InlineAsmOp::create(
+      rewriter, loc, coordinate.getType(), ValueRange{coordinate}, "", "=v,0",
+      /*has_side_effects=*/true,
+      /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
+      operandAttrs);
+  return inlineAsm->getResult(0);
+}
+
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          triton::gpu::AddrSpace targets) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
