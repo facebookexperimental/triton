@@ -117,7 +117,8 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
       triton::tlx::DumpLayoutOp, triton::amdgpu::BufferLoadOp,
-      triton::amdgpu::BufferStoreOp, triton::amdgpu::BufferLoadToLocalOp>(
+      triton::amdgpu::BufferStoreOp, triton::amdgpu::BufferLoadToLocalOp,
+      triton::amdgpu::BufferAtomicRMWOp, triton::amdgpu::RematerializedRangeOp>(
       [&](Operation *op) -> bool {
         // make sure every RankedTensorType operand has encoding
         for (auto operandType : op->getOperandTypes()) {

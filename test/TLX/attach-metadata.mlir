@@ -1,5 +1,11 @@
 
-// RUN: triton-opt -split-input-file -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:90 num-ctas=1 threads-per-warp=32})' %s| FileCheck %s
+// RUN: split-file %s %t
+// RUN: triton-opt -split-input-file -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:90 num-ctas=1 threads-per-warp=32})' %t/cuda.mlir | FileCheck %t/cuda.mlir
+// RUN: triton-opt -split-input-file --mlir-very-unsafe-disable-verifier-on-parsing --verify-each -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:90 num-ctas=1 threads-per-warp=32})' %t/cuda-helper-abi.mlir | FileCheck %t/cuda-helper-abi.mlir
+// RUN: triton-opt -split-input-file --mlir-very-unsafe-disable-verifier-on-parsing --verify-each -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=hip:gfx950 num-ctas=1 threads-per-warp=64})' %t/amd.mlir | FileCheck %t/amd.mlir
+// RUN: not triton-opt --mlir-very-unsafe-disable-verifier-on-parsing --verify-each -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=hip:gfx950 num-ctas=1 threads-per-warp=64})' %t/amd-buffer-conflict.mlir 2>&1 | FileCheck %t/amd-buffer-conflict.mlir
+
+//--- cuda.mlir
 
 // CHECK: module attributes {
 // CHECK-DAG: triton.skip_generic_pipeline
@@ -234,6 +240,90 @@ module {
     partition0() num_warps(1) {
       ttg.warp_return
     } : () -> ()
+    tt.return
+  }
+}
+//--- cuda-helper-abi.mlir
+
+// Frontend helper signatures have no tensor encodings.
+// CHECK-DAG: #[[$LAYOUT:.*]] = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [4, 8], warpsPerCTA = [2, 4], order = [1, 0]}>
+#layout = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [4, 8], warpsPerCTA = [2, 4], order = [1, 0]}>
+module attributes {
+  "ttg.num-ctas" = 1 : i32,
+  "ttg.num-warps" = 8 : i32,
+  ttg.target = "cuda:90",
+  "ttg.threads-per-warp" = 32 : i32
+} {
+  // CHECK-LABEL: tt.func private @compute_dq_tail()
+  // CHECK-SAME: -> tensor<16x128xf32, #[[$LAYOUT]]>
+  // CHECK: tt.return %{{.*}} : tensor<16x128xf32, #[[$LAYOUT]]>
+  tt.func private @compute_dq_tail() -> tensor<16x128xf32> {
+    %value = arith.constant dense<0.000000e+00> : tensor<16x128xf32, #layout>
+    %layout_marker = tlx.require_layout %value : tensor<16x128xf32, #layout> -> tensor<16x128xf32, #layout>
+    tt.return %value : tensor<16x128xf32, #layout>
+  }
+  // CHECK-LABEL: tt.func @dq_tail_helpers(
+  // CHECK: %[[DQ:.*]] = tt.call @compute_dq_tail() : () -> tensor<16x128xf32, #[[$LAYOUT]]>
+  tt.func @dq_tail_helpers(%value: tensor<16x128xf32>) {
+    %dq = tt.call @compute_dq_tail() : () -> tensor<16x128xf32>
+    tt.return
+  }
+}
+
+//--- amd.mlir
+
+// CHECK-DAG: #[[$BUFFER_MMA:.*]] = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [16, 16, 32], isTransposed = true}>
+// CHECK-DAG: #[[$BUFFER_USER:.*]] = #tlx.user_layout<#[[$BUFFER_MMA]]>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [16, 16, 32], isTransposed = true}>
+#pin = #tlx.no_verify_layout<#tlx.user_layout<#mma>>
+module {
+  // CHECK-LABEL: tt.func private @buffer_tail_previous(
+  // CHECK-SAME: -> tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+  tt.func private @buffer_tail_previous(%ptr: !tt.ptr<f32>, %offsets: tensor<16x128xi32>, %mask: tensor<16x128xi1>) -> tensor<16x128xf32, #pin> {
+    // CHECK: %[[BUFFER_OFFSETS:.*]] = tlx.require_layout %arg1
+    %pinned_offsets = tlx.require_layout %offsets : tensor<16x128xi32> -> tensor<16x128xi32, #pin>
+    // CHECK: %[[BUFFER_MASK:.*]] = tlx.require_layout %arg2
+    %pinned_mask = tlx.require_layout %mask : tensor<16x128xi1> -> tensor<16x128xi1, #pin>
+    // CHECK: %[[BUFFER_ZERO:.*]] = arith.constant dense<0.000000e+00> : tensor<16x128xf32, #[[$BUFFER_MMA]]>
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x128xf32, #mma>
+    // CHECK: %[[BUFFER_OTHER:.*]] = tlx.require_layout %[[BUFFER_ZERO]] : tensor<16x128xf32, #[[$BUFFER_MMA]]> -> tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+    // CHECK: amdg.buffer_load %arg0[%[[BUFFER_OFFSETS]]], %[[BUFFER_MASK]], %[[BUFFER_OTHER]]
+    // CHECK-SAME: contiguity = 2 : i32
+    // CHECK-SAME: tlx.preserve_layout
+    // CHECK-SAME: tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+    %previous = "amdg.buffer_load"(%ptr, %pinned_offsets, %pinned_mask, %zero) <{cache = 1 : i32, contiguity = 2 : i32, operandSegmentSizes = array<i32: 1, 1, 0, 1, 1>}> {tlx.preserve_layout} : (!tt.ptr<f32>, tensor<16x128xi32, #pin>, tensor<16x128xi1, #pin>, tensor<16x128xf32, #mma>) -> tensor<16x128xf32, #pin>
+    // CHECK: arith.addf %[[BUFFER_ZERO]], %[[BUFFER_ZERO]] : tensor<16x128xf32, #[[$BUFFER_MMA]]>
+    %bare_use = arith.addf %zero, %zero : tensor<16x128xf32, #mma>
+    // CHECK: %[[BUFFER_STRIDE:.*]] = arith.constant 512 : i32
+    %stride = arith.constant 512 : i32
+    // CHECK: %[[BUFFER_STRIDED_OTHER:.*]] = tlx.require_layout %[[BUFFER_ZERO]] : tensor<16x128xf32, #[[$BUFFER_MMA]]> -> tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+    // CHECK: %[[BUFFER_STRIDED_LOAD:.*]] = amdg.buffer_load %arg0[%[[BUFFER_OFFSETS]]], %[[BUFFER_MASK]], %[[BUFFER_STRIDED_OTHER]] stride = %[[BUFFER_STRIDE]]
+    // CHECK-SAME: contiguity = 2 : i32
+    // CHECK-SAME: tlx.preserve_layout
+    %strided_previous = "amdg.buffer_load"(%ptr, %pinned_offsets, %stride, %pinned_mask, %zero) <{cache = 1 : i32, contiguity = 2 : i32, operandSegmentSizes = array<i32: 1, 1, 1, 1, 1>}> {tlx.preserve_layout} : (!tt.ptr<f32>, tensor<16x128xi32, #pin>, i32, tensor<16x128xi1, #pin>, tensor<16x128xf32, #mma>) -> tensor<16x128xf32, #pin>
+    // CHECK: tt.return %[[BUFFER_STRIDED_LOAD]] : tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+    tt.return %strided_previous : tensor<16x128xf32, #pin>
+  }
+  // CHECK-LABEL: tt.func @buffer_tail_previous_caller(
+  // CHECK: tt.call @buffer_tail_previous
+  // CHECK-SAME: -> tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+  tt.func @buffer_tail_previous_caller(%ptr: !tt.ptr<f32>, %offsets: tensor<16x128xi32>, %mask: tensor<16x128xi1>) {
+    %previous = tt.call @buffer_tail_previous(%ptr, %offsets, %mask) : (!tt.ptr<f32>, tensor<16x128xi32>, tensor<16x128xi1>) -> tensor<16x128xf32, #pin>
+    tt.return
+  }
+}
+
+//--- amd-buffer-conflict.mlir
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [16, 16, 32], isTransposed = true}>
+#other_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [16, 16, 32], isTransposed = false}>
+#pin = #tlx.no_verify_layout<#tlx.user_layout<#mma>>
+#other_pin = #tlx.no_verify_layout<#tlx.user_layout<#other_mma>>
+module {
+  tt.func @buffer_load_pinned_fallback_conflict(%ptr: !tt.ptr<f32>, %offsets: tensor<16x128xi32>, %mask: tensor<16x128xi1, #pin>, %other: tensor<16x128xf32, #other_pin>) {
+    %pinned_offsets = tlx.require_layout %offsets : tensor<16x128xi32> -> tensor<16x128xi32, #pin>
+    // CHECK: error: conflicting user-pinned layouts meet on this operation
+    %value = "amdg.buffer_load"(%ptr, %pinned_offsets, %mask, %other) <{cache = 1 : i32, contiguity = 2 : i32, operandSegmentSizes = array<i32: 1, 1, 0, 1, 1>}> {tlx.preserve_layout} : (!tt.ptr<f32>, tensor<16x128xi32, #pin>, tensor<16x128xi1, #pin>, tensor<16x128xf32, #other_pin>) -> tensor<16x128xf32, #pin>
     tt.return
   }
 }

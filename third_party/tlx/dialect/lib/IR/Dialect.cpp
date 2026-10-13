@@ -406,8 +406,13 @@ SmallVector<unsigned> mlir::triton::tlx::UserLayoutAttr::getRepOrder() const {
 ::mlir::triton::LinearLayout mlir::triton::tlx::UserLayoutAttr::toLinearLayout(
     ArrayRef<int64_t> shape) const {
   // Dispatch on the concrete inner layout (works for both distributed and
-  // shared encodings) rather than re-entering through this wrapper.
-  return ttg::toLinearLayout(shape, getLayout());
+  // shared encodings) rather than re-entering through this wrapper. Padded
+  // shared layouts are intentionally excluded from ttg::toLinearLayout
+  // because their holes require the padded-aware conversion.
+  Attribute inner = getLayout();
+  if (ttg::isPaddedEncoding(inner))
+    return ttg::paddedLinearLayout(shape, inner);
+  return ttg::toLinearLayout(shape, inner);
 }
 
 int32_t mlir::triton::tlx::UserLayoutAttr::getAlignment() const {
