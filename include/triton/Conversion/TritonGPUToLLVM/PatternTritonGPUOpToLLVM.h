@@ -5,6 +5,8 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "triton/Analysis/AxisInfo.h"
 
+#include <memory>
+
 using namespace mlir;
 using namespace mlir::triton;
 
@@ -14,6 +16,8 @@ LogicalResult convertFMADot(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                             ConversionPatternRewriter &rewriter);
 namespace mlir {
 namespace triton {
+
+class DistributedCoordinateGroups;
 
 constexpr int patternBenefitDefault = 1;
 constexpr int patternBenefitPrioritizeOverLLVMConversions = 10;
@@ -30,10 +34,10 @@ void populateElementwiseOpToLLVMPatterns(
 // callback receives 1) the current source op, 2) the number of issued LLVM
 // instructions and 3) their input types. Each MLIR backend can provide a
 // callback and, thus, handle backend-specific behaviors.
-void populateMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
-                                    const TargetInfoBase &targetInfo,
-                                    RewritePatternSet &patterns,
-                                    PatternBenefit benefit);
+void populateMemoryOpToLLVMPatterns(
+    LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
+    RewritePatternSet &patterns, PatternBenefit benefit,
+    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups = nullptr);
 
 void populateAssertOpToLLVMPattern(LLVMTypeConverter &typeConverter,
                                    RewritePatternSet &patterns,

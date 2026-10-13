@@ -8,6 +8,7 @@
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
+#include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -118,6 +119,297 @@ static bool retypeWithEncoding(Value v, Attribute enc) {
   return true;
 }
 
+static void privatizeHelperForCall(::mlir::triton::CallOp call,
+                                   ::mlir::triton::FuncOp callee,
+                                   StringRef suffix) {
+  OpBuilder b(callee);
+  auto clone = cast<::mlir::triton::FuncOp>(b.clone(*callee.getOperation()));
+  std::string base = (callee.getSymName() + suffix).str();
+  std::string name = base;
+  unsigned n = 0;
+  while (SymbolTable::lookupNearestSymbolFrom(
+      call, StringAttr::get(callee.getContext(), name)))
+    name = base + "_" + std::to_string(n++);
+  clone.setSymName(name);
+  SymbolTable::setSymbolVisibility(clone, SymbolTable::Visibility::Private);
+  call.setCalleeAttr(FlatSymbolRefAttr::get(callee.getContext(), name));
+}
+
+// Frontend helper signatures omit encodings that TLX tensor values carry.
+static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod) {
+  auto isConcreteDistributed = [](Type ty) {
+    auto tensorTy = dyn_cast<RankedTensorType>(ty);
+    Attribute enc = tensorTy ? tensorTy.getEncoding() : Attribute();
+    return enc && !hasNoVerifyLayout(enc) &&
+           isa<ttg::DistributedEncodingTrait>(enc);
+  };
+
+  bool changed = true;
+  unsigned iteration = 0;
+  constexpr unsigned kMaxIterations = 64;
+  while (changed) {
+    changed = false;
+    if (++iteration > kMaxIterations)
+      return mod.emitError(
+          "TLX concrete helper-ABI synchronization did not converge");
+
+    // Shared helpers may receive different concrete layouts at each call site.
+    SmallVector<std::pair<::mlir::triton::CallOp, ::mlir::triton::FuncOp>>
+        concreteClones;
+    mod.walk([&](::mlir::triton::CallOp call) {
+      if (!llvm::any_of(call.getOperandTypes(), isConcreteDistributed))
+        return;
+      auto callee =
+          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+              call, call.getCalleeAttr());
+      if (!callee || callee.getBody().empty())
+        return;
+      auto uses = SymbolTable::getSymbolUses(callee, mod);
+      if (!uses)
+        return;
+      unsigned useCount = 0;
+      for (const auto &use : *uses) {
+        (void)use;
+        ++useCount;
+      }
+      if (useCount > 1)
+        concreteClones.emplace_back(call, callee);
+    });
+    for (auto [call, callee] : concreteClones) {
+      privatizeHelperForCall(call, callee, "_tlxabi");
+      changed = true;
+    }
+
+    bool inputConflict = false;
+    mod.walk([&](::mlir::triton::CallOp call) {
+      auto callee =
+          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+              call, call.getCalleeAttr());
+      if (!callee || callee.getBody().empty())
+        return;
+
+      SmallVector<Type> inputTypes(callee.getFunctionType().getInputs().begin(),
+                                   callee.getFunctionType().getInputs().end());
+      Block &entry = callee.getBody().front();
+      bool signatureChanged = false;
+      for (unsigned i = 0; i < call.getNumOperands() && i < inputTypes.size() &&
+                           i < entry.getNumArguments();
+           ++i) {
+        Type actual = call.getOperand(i).getType();
+        Type expected = inputTypes[i];
+        Type target =
+            isConcreteDistributed(actual)
+                ? actual
+                : (isConcreteDistributed(expected) ? expected : Type());
+        if (!target)
+          continue;
+
+        auto targetTy = cast<RankedTensorType>(target);
+        auto actualTy = dyn_cast<RankedTensorType>(actual);
+        auto expectedTy = dyn_cast<RankedTensorType>(expected);
+        if (!actualTy || !expectedTy ||
+            actualTy.getShape() != targetTy.getShape() ||
+            actualTy.getElementType() != targetTy.getElementType() ||
+            expectedTy.getShape() != targetTy.getShape() ||
+            expectedTy.getElementType() != targetTy.getElementType()) {
+          call.emitError() << "helper argument " << i
+                           << " has inconsistent tensor payload type";
+          inputConflict = true;
+          return;
+        }
+        if ((isConcreteDistributed(actual) && actual != target) ||
+            (isConcreteDistributed(expected) && expected != target)) {
+          call.emitError() << "conflicting concrete layouts for helper "
+                              "argument "
+                           << i;
+          inputConflict = true;
+          return;
+        }
+
+        // Other uses of a producer retain their original type.
+        if (actual != target) {
+          OpBuilder b(call);
+          Value converted = RequireLayoutOp::create(b, call.getLoc(), target,
+                                                    call.getOperand(i));
+          call.setOperand(i, converted);
+          changed = true;
+        }
+        if (entry.getArgument(i).getType() != target) {
+          entry.getArgument(i).setType(target);
+          changed = true;
+        }
+        if (inputTypes[i] != target) {
+          inputTypes[i] = target;
+          signatureChanged = true;
+        }
+      }
+      if (signatureChanged) {
+        callee.setType(
+            FunctionType::get(callee.getContext(), inputTypes,
+                              callee.getFunctionType().getResults()));
+        changed = true;
+      }
+    });
+    if (inputConflict)
+      return failure();
+
+    SmallVector<::mlir::triton::FuncOp> funcs;
+    mod.walk([&](::mlir::triton::FuncOp func) { funcs.push_back(func); });
+    for (auto func : funcs) {
+      SmallVector<::mlir::triton::ReturnOp> returns;
+      func.walk([&](::mlir::triton::ReturnOp ret) { returns.push_back(ret); });
+      if (returns.empty() || func.getFunctionType().getNumResults() == 0)
+        continue;
+
+      SmallVector<Type> resultTypes(func.getFunctionType().getResults().begin(),
+                                    func.getFunctionType().getResults().end());
+      for (unsigned i = 0; i < resultTypes.size(); ++i) {
+        Type target =
+            isConcreteDistributed(resultTypes[i]) ? resultTypes[i] : Type();
+        for (auto ret : returns) {
+          if (i >= ret.getNumOperands())
+            continue;
+          Type candidate = ret.getOperand(i).getType();
+          if (!isConcreteDistributed(candidate))
+            continue;
+          if (target && target != candidate)
+            return ret.emitError()
+                   << "conflicting concrete layouts for helper result " << i;
+          target = candidate;
+        }
+        if (!target)
+          continue;
+
+        if (resultTypes[i] != target) {
+          resultTypes[i] = target;
+          changed = true;
+        }
+        auto targetTy = cast<RankedTensorType>(target);
+        for (auto ret : returns) {
+          if (i >= ret.getNumOperands())
+            continue;
+          Value operand = ret.getOperand(i);
+          auto operandTy = dyn_cast<RankedTensorType>(operand.getType());
+          if (!operandTy)
+            continue;
+          if (operandTy.getShape() != targetTy.getShape() ||
+              operandTy.getElementType() != targetTy.getElementType())
+            return ret.emitError() << "helper result " << i
+                                   << " has inconsistent shape or element type";
+          if (isConcreteDistributed(operandTy) && operandTy != targetTy)
+            return ret.emitError()
+                   << "conflicting concrete layouts for helper result " << i;
+          if (operandTy != targetTy) {
+            // A value may also feed a result with a different encoding.
+            OpBuilder b(ret);
+            Value converted =
+                RequireLayoutOp::create(b, ret.getLoc(), targetTy, operand);
+            ret.setOperand(i, converted);
+            changed = true;
+          }
+        }
+      }
+
+      if (func.getFunctionType().getResults() != ArrayRef<Type>(resultTypes)) {
+        func.setType(FunctionType::get(func.getContext(),
+                                       func.getFunctionType().getInputs(),
+                                       resultTypes));
+        changed = true;
+      }
+    }
+
+    mod.walk([&](::mlir::triton::CallOp call) {
+      auto callee =
+          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+              call, call.getCalleeAttr());
+      if (!callee)
+        return;
+      auto calleeResults = callee.getFunctionType().getResults();
+      if (calleeResults.size() != call.getNumResults())
+        return;
+      for (unsigned i = 0; i < calleeResults.size(); ++i) {
+        if (call.getResult(i).getType() != calleeResults[i]) {
+          call.getResult(i).setType(calleeResults[i]);
+          changed = true;
+        }
+      }
+    });
+
+    // Loop-carried values share one type across init, iter-arg, yield and result.
+    bool loopConflict = false;
+    SmallVector<scf::ForOp> loops;
+    mod.walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
+    for (scf::ForOp forOp : loops) {
+      auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      for (unsigned i = 0; i < forOp.getNumRegionIterArgs(); ++i) {
+        SmallVector<Value> linked{
+            forOp.getInitArgs()[i],
+            forOp.getRegionIterArg(i),
+            yield.getOperand(i),
+            forOp.getResult(i),
+        };
+        Type target;
+        for (Value value : linked) {
+          Type candidate = value.getType();
+          if (!isConcreteDistributed(candidate))
+            continue;
+          if (target && target != candidate) {
+            forOp.emitError()
+                << "conflicting concrete layouts for loop-carried value " << i;
+            loopConflict = true;
+            break;
+          }
+          target = candidate;
+        }
+        if (loopConflict || !target)
+          continue;
+
+        auto targetTy = cast<RankedTensorType>(target);
+        for (Value value : linked) {
+          auto valueTy = dyn_cast<RankedTensorType>(value.getType());
+          if (!valueTy || valueTy.getShape() != targetTy.getShape() ||
+              valueTy.getElementType() != targetTy.getElementType()) {
+            forOp.emitError() << "loop-carried value " << i
+                              << " has inconsistent tensor payload type";
+            loopConflict = true;
+            break;
+          }
+        }
+        if (loopConflict)
+          continue;
+
+        Value init = forOp.getInitArgs()[i];
+        if (init.getType() != target) {
+          OpBuilder b(forOp);
+          Value converted =
+              RequireLayoutOp::create(b, forOp.getLoc(), target, init);
+          forOp.setOperand(forOp.getNumControlOperands() + i, converted);
+          changed = true;
+        }
+        if (forOp.getRegionIterArg(i).getType() != target) {
+          forOp.getRegionIterArg(i).setType(target);
+          changed = true;
+        }
+        Value yielded = yield.getOperand(i);
+        if (yielded.getType() != target) {
+          OpBuilder b(yield);
+          Value converted =
+              RequireLayoutOp::create(b, yield.getLoc(), target, yielded);
+          yield.setOperand(i, converted);
+          changed = true;
+        }
+        if (forOp.getResult(i).getType() != target) {
+          forOp.getResult(i).setType(target);
+          changed = true;
+        }
+      }
+    }
+    if (loopConflict)
+      return failure();
+  }
+  return success();
+}
+
 static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
   bool conflict = false;
   // Find a placeholder encoding among a set of linked values (values an op
@@ -200,6 +492,19 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
           bool isSelectCond = isSelect && en.index() == 0;
           bridgeOrRetype(en.value(), enc, op, en.index(), isSelectCond);
         }
+        return;
+      }
+      // A buffer-load fallback follows the result pin at this use.
+      if (auto load = dyn_cast<::mlir::triton::amdgpu::BufferLoadOp>(op)) {
+        Attribute enc = load.getType().getEncoding();
+        if (!load.getOther() || !isPlaceholderEncoding(enc))
+          return;
+        findPlaceholder({load.getResult(), load.getOther()}, op);
+        if (conflict)
+          return;
+        bridgeOrRetype(load.getOther(), enc, op,
+                       load->getNumOperands() - 1,
+                       /*forceBridge=*/true);
         return;
       }
       // tt.store: value / ptr / mask must share one encoding
@@ -429,11 +734,16 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
             newResults[i] = target;
             sigChanged = true;
           }
-          for (auto r : rets)
+          for (auto r : rets) {
             if (i < r.getNumOperands() && r.getOperand(i).getType() != target) {
-              r.getOperand(i).setType(target);
+              // Other uses and constant value attributes retain their types.
+              OpBuilder b(r);
+              Value converted = RequireLayoutOp::create(b, r.getLoc(), target,
+                                                        r.getOperand(i));
+              r.setOperand(i, converted);
               changed = true;
             }
+          }
         }
         if (sigChanged) {
           callee.setType(
@@ -452,19 +762,7 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
               callOp, callOp.getCalleeAttr());
       if (!callee)
         continue;
-      OpBuilder b(callee);
-      auto cloneOp =
-          cast<::mlir::triton::FuncOp>(b.clone(*callee.getOperation()));
-      std::string base = (callee.getSymName() + "_tlxpin").str();
-      std::string name = base;
-      unsigned n = 0;
-      while (SymbolTable::lookupNearestSymbolFrom(
-          callOp, StringAttr::get(callee.getContext(), name)))
-        name = base + "_" + std::to_string(n++);
-      cloneOp.setSymName(name);
-      SymbolTable::setSymbolVisibility(cloneOp,
-                                       SymbolTable::Visibility::Private);
-      callOp.setCalleeAttr(FlatSymbolRefAttr::get(callee.getContext(), name));
+      privatizeHelperForCall(callOp, callee, "_tlxpin");
       changed = true;
     }
     if (conflict)
@@ -681,6 +979,8 @@ public:
     // accepts the module. Runs after the ttg.num-warps metadata above is set,
     // since validating the pinned #linear layout needs it. Concrete layouts are
     // resolved later in make_ttgir.
+    if (failed(synchronizeConcreteHelperABI(mod)))
+      return signalPassFailure();
     if (failed(propagatePlaceholderLayouts(mod)))
       return signalPassFailure();
   }

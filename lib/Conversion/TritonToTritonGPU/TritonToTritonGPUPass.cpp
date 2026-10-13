@@ -659,6 +659,9 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
                                                                 context);
   patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadToLocalOp>>(
       typeConverter, context);
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferAtomicRMWOp>,
+               GenericOpPattern<triton::amdgpu::RematerializedRangeOp>>(
+      typeConverter, context);
 }
 
 //

@@ -62,7 +62,8 @@ bool isOneOperandElementwiseOp(Operation *op) {
 // Returns null store op if not suitable.
 static triton::StoreOp
 usePermlaneSwapToOptimizeStore(PatternRewriter &rewriter, Value ptr, Value val,
-                               Value mask, triton::StoreOp oldStoreOp) {
+                               Value mask, triton::StoreOp oldStoreOp,
+                               bool rematerializeCoordinates) {
   auto ptrType = cast<RankedTensorType>(ptr.getType());
   auto valType = cast<RankedTensorType>(val.getType());
 
@@ -80,8 +81,10 @@ usePermlaneSwapToOptimizeStore(PatternRewriter &rewriter, Value ptr, Value val,
                                                       newPtrType, ptr);
 
   auto newValType = valType.cloneWithEncoding(newEncoding);
-  Value newVal = triton::gpu::ConvertLayoutOp::create(rewriter, val.getLoc(),
-                                                      newValType, val);
+  auto newVal = triton::gpu::ConvertLayoutOp::create(rewriter, val.getLoc(),
+                                                     newValType, val);
+  if (rematerializeCoordinates)
+    newVal->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
 
   Value newMask = mask;
   if (mask) {
@@ -160,6 +163,8 @@ public:
     auto cvtOp = val.getDefiningOp<triton::gpu::ConvertLayoutOp>();
     if (!cvtOp)
       return mlir::failure();
+    bool rematerializeCoordinates =
+        cvtOp->hasAttr("tlx.rematerialize_coordinates");
 
     auto encoding = cvtOp.getSrc().getType().getEncoding();
     if (!isa<triton::gpu::MmaEncodingTrait>(encoding))
@@ -195,8 +200,8 @@ public:
       newMask = triton::gpu::ConvertLayoutOp::create(rewriter, mask.getLoc(),
                                                      newMaskType, mask);
     }
-    triton::StoreOp newStoreOp =
-        usePermlaneSwapToOptimizeStore(rewriter, newPtr, newVal, newMask, stOp);
+    triton::StoreOp newStoreOp = usePermlaneSwapToOptimizeStore(
+        rewriter, newPtr, newVal, newMask, stOp, rematerializeCoordinates);
     if (!newStoreOp) {
       newStoreOp =
           triton::StoreOp::create(rewriter, stOp.getLoc(), newPtr, newVal,
