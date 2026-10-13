@@ -227,9 +227,17 @@ jobs:
             echo 'export LD_LIBRARY_PATH=/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}' >> "${SETUP_SCRIPT}"
           fi
           . "${SETUP_SCRIPT}"
-          uv pip install --pre --no-cache torch --index-url https://download.pytorch.org/whl/nightly/rocm10.0
-          # torch pulls in triton-rocm, which owns the same `triton` package
-          # as the fbtriton wheel installed below.
+          IDX=https://download.pytorch.org/whl/nightly/rocm10.0
+          # torch requires rocm[device-all]: device code for every GPU
+          # architecture, ~6 GiB of the ~8.6 GiB download. Override all but
+          # gfx950 (MI350) away, and triton-rocm, which owns the same `triton`
+          # package as the fbtriton wheel installed below.
+          echo torch | uv pip compile - --pre --index-url "${IDX}" --no-header --no-annotate -q \
+            | grep -oE '^(rocm-sdk-device-gfx[0-9a-z]+|triton-rocm)' \
+            | grep -vx rocm-sdk-device-gfx950 \
+            | sed "s/\$/ ; sys_platform == 'never'/" > /tmp/rocm-overrides.txt
+          cat /tmp/rocm-overrides.txt
+          uv pip install --pre --no-cache torch --index-url "${IDX}" --overrides /tmp/rocm-overrides.txt
           uv pip uninstall triton triton-rocm pytorch-triton-rocm || true
           uv pip install numpy pytest
           python - <<'PY'
