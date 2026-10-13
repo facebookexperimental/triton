@@ -1,7 +1,11 @@
-"""Perf and compile-time reporting for ``tlx.ops.flash_attn_mxfp8``."""
+"""Perf and compile-time reporting for ``tlx.ops.flash_attn_mxfp8``.
+
+TLX_FA_MXFP8_EXPCAST=1 benchmarks the ExpCast-FP8 forward P encode (``p_expcast=True``) instead of exp2.
+"""
 
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -21,6 +25,7 @@ DEFAULT_SPACE = "full"
 EXTRA_COLUMNS = ()
 COLD_COMPILE = "first"
 COMPILE_CAP_S = 900.0
+P_EXPCAST = os.environ.get("TLX_FA_MXFP8_EXPCAST") == "1"
 
 DTYPES = {"bf16": torch.bfloat16}
 DIRECTIONS = ("fwd", "bwd")
@@ -75,7 +80,8 @@ def prepare(case: Case, space: str) -> Prepared:
     dtype = getattr(torch, case.dtype)
     q, k, v = qkv(batch, heads, context, head_dim, dtype, requires_grad=backward)
 
-    tlx_fwd = lambda: flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=0.5, space=space)  # noqa: E731
+    tlx_fwd = lambda: flash_attn_mxfp8(  # noqa: E731
+        q, k, v, causal=causal, sm_scale=0.5, space=space, p_expcast=P_EXPCAST)
     ref_fwd = lambda: F.scaled_dot_product_attention(  # noqa: E731
         q, k, v, is_causal=causal, scale=0.5)
 
