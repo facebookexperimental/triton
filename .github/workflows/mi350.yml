@@ -237,7 +237,9 @@ jobs:
             | grep -vx rocm-sdk-device-gfx950 \
             | sed "s/\$/ ; sys_platform == 'never'/" > /tmp/rocm-overrides.txt
           cat /tmp/rocm-overrides.txt
+          T0=$(date +%s)
           uv pip install --pre --no-cache torch --index-url "${IDX}" --overrides /tmp/rocm-overrides.txt
+          echo "torch install: $(( $(date +%s) - T0 ))s"
           uv pip uninstall triton triton-rocm pytorch-triton-rocm || true
           uv pip install numpy pytest
           python - <<'PY'
@@ -261,6 +263,7 @@ jobs:
           set -euo pipefail
           OUT="${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}"
           mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
+          T0=$(date +%s.%N)
           # A single S3 stream sometimes runs at ~1 MB/s (6.5 min for the
           # wheel), so fetch it as 16 parallel byte ranges.
           SIZE=$(curl --fail --silent --head --location --retry 3 "${WHEEL_URL}" \
@@ -285,7 +288,8 @@ jobs:
           [ "$(stat -c %s "${OUT}")" -eq "${SIZE}" ] || [ "${SIZE}" -eq 0 ]
           . "${SETUP_SCRIPT}"
           python -m zipfile -t "${OUT}" > /dev/null
-          echo "downloaded ${OUT} ($(stat -c %s "${OUT}") bytes)"
+          awk -v b="$(stat -c %s "${OUT}")" -v t0="${T0}" -v t1="$(date +%s.%N)" -v f="${OUT##*/}" \
+            'BEGIN {t = t1 - t0; printf "downloaded %s: %d bytes in %.1fs (%.1f MB/s)\n", f, b, t, b / t / 1e6}'
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
@@ -338,6 +342,8 @@ jobs:
           # across four xdist workers sharing the runner's single GPU (pod
           # memory peaked at ~44 of 100 GiB). worksteal rebalances the few
           # multi-minute cases instead of stranding them behind a static split.
+          # Log runner size and the pod's memory peak, pass or fail, to size -n.
+          trap 'echo "runner: nproc=$(nproc) memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) memory.peak_mib=$(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 ))"' EXIT
           PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" --import-mode=importlib -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
