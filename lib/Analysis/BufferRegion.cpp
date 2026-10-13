@@ -607,6 +607,9 @@ LogicalResult BufferRegionAnalysis::visitOperation(
           view.affineCTAOffset ^ relativeOffset.ctaOffset));
     return propagateRegions(regionInfo);
   }
+  // Runtime offsets can select any region of the source allocation.
+  if (isa<ttg::MemDescDynamicSubsliceOp>(op))
+    return propagateRegions(operands[0]->getValue());
   if (auto tmemSubsliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
