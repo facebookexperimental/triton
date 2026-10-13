@@ -177,7 +177,8 @@ def _apply_causal_mask(qk, col_limit, BLOCK_N: tl.constexpr, TRANSPOSED: tl.cons
 def _expcast_e4m3x4(x, addend, mult):
     """E4M3 code = RNE(x * mult + addend - 1024), clamped below at 0, packed 4 per register (no MUFU, no F2FP.E4M3)."""
     # code + 1024 lies in [1024, 2048) where f16 ulp is 1: the f16 cvt rounds to the integer code in the
-    # low byte, and max with 1024 maps negative, -inf and NaN to code 0.
+    # low byte, and max with 1024 maps negative and -inf to code 0. max.f16x2 also maps NaN to code 0, so a
+    # NaN in S yields a finite but wrong output row where the exp2 path yields a NaN row.
     return tl.inline_asm_elementwise(
         """
         {
@@ -295,6 +296,9 @@ def _softmax_inner_loop(
             # ~8*log2(v) + 56, so code = RNE(8*(u - e) + 56 + beta) with u = log2(p) and e the block's E8M0
             # exponent. beta = -0.3443 centres the error of 1 + f vs 2^f; per-element ratio to exact p is in
             # [0.929, 1.075]. e = ceil(u_max - log2(448)) matches the baseline RCEIL scale and keeps code <= 126.
+            # NaN in S is encoded as P = 0. NaN detection is left to model-level guards; in training the bwd
+            # still yields NaN grads since it recomputes P with exp2. Debug builds (TRITON_DEBUG=1) assert here.
+            tl.device_assert(qk == qk, "NaN in S: ExpCast encodes it as P = 0")
             block_u = block_maxes * qk_scale - m_scaled[:, None]
             e_blk = tl.minimum(tl.maximum(tl.math.ceil(block_u - 8.807354922057604), -127.0), 127.0)
             addend = (1079.6557 - 8.0 * m_scaled[:, None]) - 8.0 * e_blk
