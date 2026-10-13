@@ -50,6 +50,12 @@ def test_cause_priority_is_config_test_infra_perf():
     assert r.classify(run(jobs=[perf]))[0] == "perf"
 
 
+def test_mi350_environment_steps_are_infra():
+    for step in ("Set up test environment", "Install prebuilt Triton", "Resolve TritonBench ref from PR body (X-link)",
+                 "Install TritonBench dependencies"):
+        assert r.classify(run(jobs=[job("mi350-tlx-test", "failure", (step, "failure"))]))[0] == "infra", step
+
+
 def test_group_results_distinguish_blocked_gated_and_infra():
     g = r.group_results(
         run(jobs=[
