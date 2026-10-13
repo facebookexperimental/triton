@@ -286,9 +286,8 @@ bool reachesNPOTLinearLayoutAssert(Type type) {
   if (isa<ttg::DistributedEncodingTrait>(encoding) ||
       ttg::isPaddedEncoding(encoding))
     return false;
-  return !llvm::all_of(
-      ttg::dropPipeliningDim(ty.getAllocShape(), encoding),
-      llvm::isPowerOf2_64);
+  return !llvm::all_of(ttg::dropPipeliningDim(ty.getAllocShape(), encoding),
+                       llvm::isPowerOf2_64);
 }
 
 struct MemDescSubsliceOffsets {
