@@ -81,7 +81,7 @@ tt.func @local_atomic_scratch_size(
   // CHECK: %[[ATOMIC_DST:.*]] = ttg.local_alloc {allocation.offset = 0 : i32}
   %dst = ttg.local_alloc
       : () -> !ttg.memdesc<1xi32, #atomic_shared, #atomic_smem, mutable>
-  // CHECK: ttg.local_atomic_scatter_rmw {{.*}} {allocation.offset = 128 : i32, axis = 0 : i32}
+  // CHECK: ttg.local_atomic_scatter_rmw {{.*}} {allocation.offset = 128 : i32, allocation.size = 4 : i32, axis = 0 : i32}
   %old = ttg.local_atomic_scatter_rmw add, %dst[%indices], %values {axis = 0 : i32}
       : (!ttg.memdesc<1xi32, #atomic_shared, #atomic_smem, mutable>,
          tensor<1xi32, #atomic_blocked>, tensor<1xi32, #atomic_blocked>)
@@ -124,7 +124,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 // CHECK-LABEL: @reduce_scratch_size
 tt.func @reduce_scratch_size(%arg0: tensor<1x256xf32, #reduce>) {
   // CHECK: "tt.reduce"
-  // CHECK: }) {allocation.offset = 0 : i32}
+  // CHECK: }) {allocation.offset = 0 : i32, allocation.size = 16 : i32}
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%lhs: f32, %rhs: f32):
     %sum = arith.addf %lhs, %rhs : f32
@@ -145,7 +145,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // CHECK-LABEL: @convert_layout_scratch_size
 tt.func @convert_layout_scratch_size(%arg0: tensor<128xi32, #src>) {
-  // CHECK: ttg.convert_layout {{.*}} {allocation.offset = 0 : i32}
+  // CHECK: ttg.convert_layout {{.*}} {allocation.offset = 0 : i32, allocation.size = 512 : i32}
   %0 = ttg.convert_layout %arg0 : tensor<128xi32, #src> -> tensor<128xi32, #dst>
   tt.return
 }
