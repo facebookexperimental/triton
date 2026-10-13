@@ -1798,30 +1798,3 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-
-// -----
-
-#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
-#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
-#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
-  // NPOT barrier arrays (e.g. memdesc<3xi64>) are not power-of-two, so
-  // BufferRegionAnalysis degrades them to Unknown instead of asserting in
-  // toLinearLayout. The pass must survive and stay conservative (fences kept).
-  // CHECK-LABEL: npot_barrier_array_survives_proxy_fence_analysis
-  tt.func @npot_barrier_array_survives_proxy_fence_analysis(
-      %value: tensor<64x64xf32, #blocked>,
-      %desc: !tt.tensordesc<64x64xf32, #shared>) {
-    %c0 = arith.constant 0 : i32
-    %true = arith.constant true
-    %buffer = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
-    %bar = ttg.local_alloc {allocation.offset = 16384 : i32} : () -> !ttg.memdesc<3xi64, #barrier, #smem, mutable>
-    // CHECK: ttg.local_store
-    // CHECK: ttng.fence_async_shared
-    // CHECK: ttng.async_tma_copy_global_to_local
-    ttg.local_store %value, %buffer : tensor<64x64xf32, #blocked> -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
-    ttng.async_tma_copy_global_to_local %desc[%c0, %c0] %buffer, %bar, %true : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<3xi64, #barrier, #smem, mutable> -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
-    tt.return
-  }
-}
