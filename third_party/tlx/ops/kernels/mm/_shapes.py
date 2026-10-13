@@ -44,7 +44,7 @@ SYNTHETIC: tuple[MMShape, ...] = (
 
 FOCUS_SUITES = (
     FocusSuite(
-        name="sm90_baseline",
+        name="sm90_1",
         op="mm",
         shapes=(
             MMShape(2176, 2176, 2176, (2176, 1), (2176, 1), "fp16"),
@@ -643,7 +643,7 @@ FOCUS_SUITES = (
 )
 
 DEFAULT_SUITES = {
-    "sm90": ("sm90_baseline", ),
+    "sm90": ("sm90_1", ),
     "sm100": ("sm100_1", ),
     "gfx950": ("gfx950_all", ),
     "gfx942": ("gfx942_all", ),

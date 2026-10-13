@@ -750,6 +750,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.kda._prefill_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.mm._shapes": {
+            "sm90": ("sm90_1", ),
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),
             "gfx942": ("gfx942_all", ),
