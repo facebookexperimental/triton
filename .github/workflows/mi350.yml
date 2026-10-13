@@ -72,10 +72,15 @@ on:
     - cron: '0 */6 * * *'
 
 env:
-  MAX_JOBS: 16
-  CCACHE_DIR: /tmp/fbtriton-ccache
-  CCACHE_MAXSIZE: 2G
   TORCHINDUCTOR_TLX_MODE: "off"
+  # Import test files by path, not by prepending their directories to
+  # sys.path, so same-named test modules in different directories do not
+  # collide (the perf suite failed with ImportError without it, #4001).
+  # Kernel compilation dominates the test suites (a cold Triton cache was ~4x
+  # slower than a warm one on a 343-test subset), so overlap compiles across
+  # four xdist workers sharing the runner's single GPU (pod memory peaked at
+  # ~44 of 100 GiB); worksteal rebalances the few multi-minute cases.
+  PYTEST_ADDOPTS: --import-mode=importlib -n 4 --dist worksteal
 
 jobs:
   mi350-build:
@@ -91,11 +96,6 @@ jobs:
     needs: mi350-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-fb-triton-mi350-1
-    env:
-      WORKSPACE_DIR: /workspace
-      CONDA_ENV: meta-triton
-      UV_VENV_DIR: /workspace/uv_venvs
-      SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 180
     permissions:
       id-token: write
@@ -110,8 +110,11 @@ jobs:
           echo "mi350-build result: ${{ needs.mi350-build.result }}"
           exit 1
       - name: Checkout
-        uses: actions/checkout@v3
-      - name: Checkout TritonBench (Optional)
+        uses: actions/checkout@v4
+      # TEMPORARY (remove before landing): is a persistent uv cache possible?
+      - name: Probe runner storage
+        run: bash .github/scripts/probe_runner_storage.sh
+      - name: Resolve TritonBench ref from PR body (X-link)
         id: tritonbench_pr
         if: github.event_name == 'pull_request'
         env:
@@ -120,57 +123,52 @@ jobs:
           PR_BODY_FILE="$(mktemp)"
           printf '%s' "${PR_BODY}" > "${PR_BODY_FILE}"
           bash ./.ci/tritonbench/checkout.sh "${PR_BODY_FILE}" --ref-only
-      - name: Checkout Tritonbench
-        uses: actions/checkout@v3
+      - name: Checkout TritonBench
+        uses: actions/checkout@v4
         with:
           repository: meta-pytorch/tritonbench
           path: tritonbench
           ref: ${{ steps.tritonbench_pr.outputs.ref }}
           submodules: recursive
-      - name: Set up ROCm test environment
-        timeout-minutes: 30
-        uses: ./.github/actions/setup-rocm-test-env
-        with:
-          gpu-arch: gfx950
-      - name: Install prebuilt Triton
-        uses: ./.github/actions/install-prebuilt-triton
-        with:
-          wheel-url: ${{ needs.mi350-build.outputs.wheel_url }}
-          wheel-filename: ${{ needs.mi350-build.outputs.wheel_filename }}
-      - name: Install TritonBench dependencies
-        working-directory: tritonbench
-        run: |
-          set -eux
-          . "${SETUP_SCRIPT}"
-          # What TritonBench's `install.py --all` installs on HIP. Pin torch
-          # and numpy so nothing replaces them, and drop any `triton`
-          # requirement: the prebuilt wheel is the `fbtriton` distribution,
-          # and an upstream `triton` would overwrite its `triton` package.
-          # TritonBench itself runs from this checkout.
-          python - > /tmp/tritonbench-constraints.txt <<'PY'
-          import importlib.metadata as md
-
-          for pkg in ("torch", "numpy"):
-              print(f"{pkg}=={md.version(pkg)}")
-          PY
-          echo "triton ; sys_platform == 'never'" > /tmp/tritonbench-overrides.txt
-          PIN=(-c /tmp/tritonbench-constraints.txt --overrides /tmp/tritonbench-overrides.txt)
-          uv pip install --group dev-amd "${PIN[@]}"
-          uv pip install liger-kernel-nightly --no-deps
-          uv pip install pandas -e submodules/aiter "${PIN[@]}"
-          python -c 'import importlib.metadata as md; assert md.version("fbtriton"); print("triton package still from fbtriton")'
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/select-kernel-tests
+      # Everything below is skipped when no TritonBench source references the
+      # changed kernels, so a skipped run does not pay for setup.
+      - name: Set up test environment
+        if: steps.select.outputs.run_tritonbench != 'false'
+        timeout-minutes: 30
+        uses: ./.github/actions/setup-test-env
+        with:
+          backend: rocm
+          arch: gfx950
+      - name: Install TritonBench dependencies
+        if: steps.select.outputs.run_tritonbench != 'false'
+        working-directory: tritonbench
+        run: |
+          set -eux
+          # TritonBench owns its dependency list; on HIP, --all installs its
+          # AMD dependency group, liger and aiter into the active venv, pinning
+          # torch and numpy. TritonBench itself runs from this checkout.
+          # Must run after setup-test-env: with no torch in the venv,
+          # install.py installs its default PyTorch nightly instead, with
+          # device code for every GPU architecture. Triton is installed after
+          # it, so the prebuilt wheel's files are the ones the tests use.
+          python install.py --all
+      - name: Install prebuilt Triton
+        if: steps.select.outputs.run_tritonbench != 'false'
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.mi350-build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.mi350-build.outputs.wheel_filename }}
       - name: Run TritonBench
         id: tritonbench
-        if: ${{ steps.select.outputs.run_tritonbench != 'false' }}
+        if: steps.select.outputs.run_tritonbench != 'false'
         env:
           TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
           TRITONBENCH_ROOT: ${{ github.workspace }}/tritonbench
         run: |
-          . "${SETUP_SCRIPT}"
           bash ./.ci/tritonbench/test-gpu.sh
       - name: Collect nightly failure (TritonBench)
         id: collect
@@ -185,11 +183,6 @@ jobs:
     needs: mi350-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-fb-triton-mi350-1
-    env:
-      WORKSPACE_DIR: /workspace
-      CONDA_ENV: pytorch
-      UV_VENV_DIR: /workspace/uv_venvs
-      SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 240
     permissions:
       id-token: write
@@ -204,36 +197,30 @@ jobs:
           echo "mi350-build result: ${{ needs.mi350-build.result }}"
           exit 1
       - name: Checkout
-        uses: actions/checkout@v3
-      - name: Set up ROCm test environment
+        uses: actions/checkout@v4
+      # TEMPORARY (remove before landing): is a persistent uv cache possible?
+      - name: Probe runner storage
+        run: bash .github/scripts/probe_runner_storage.sh
+      - name: Select kernel-affected tests
+        id: select
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/select-kernel-tests
+      - name: Set up test environment
         timeout-minutes: 30
-        uses: ./.github/actions/setup-rocm-test-env
+        uses: ./.github/actions/setup-test-env
         with:
-          gpu-arch: gfx950
+          backend: rocm
+          arch: gfx950
       - name: Install prebuilt Triton
         uses: ./.github/actions/install-prebuilt-triton
         with:
           wheel-url: ${{ needs.mi350-build.outputs.wheel_url }}
           wheel-filename: ${{ needs.mi350-build.outputs.wheel_filename }}
-      - name: Install torchao
-        timeout-minutes: 10
-        run: |
-          . "${SETUP_SCRIPT}"
-          uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/rocm7.2
-          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
-      - name: Select kernel-affected tests
-        id: select
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/select-kernel-tests
       - name: Run TLX core tests
         id: run_core_tests
         timeout-minutes: 90
-        env:
-          PYTEST_ADDOPTS: --import-mode=importlib
         run: |
           set -eux
-          . "${SETUP_SCRIPT}"
-          uv pip install pytest pytest-xdist
           shopt -s nullglob
           FILES=(
             python/test/unit/language/test_tlx_*_any.py
@@ -256,42 +243,37 @@ jobs:
             [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
           fi
           echo "mi350 collects:" "${FILES[@]}"
-          # Forkserver children must import the test module by its importlib name
-          # (python.test.unit.tlx_ops.*), not just its helpers from tlx_ops.
-          # Kernel compilation dominates these tests (a cold Triton cache was ~4x
-          # slower than a warm one on a 343-test subset), so overlap compiles
-          # across four xdist workers sharing the runner's single GPU (pod
-          # memory peaked at ~44 of 100 GiB). worksteal rebalances the few
-          # multi-minute cases instead of stranding them behind a static split.
           # Log runner size and the pod's memory peak, pass or fail, to size -n.
           trap 'echo "runner: nproc=$(nproc) memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) memory.peak_mib=$(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 ))"' EXIT
-          PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" --import-mode=importlib -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-core.xml
+          # -n 4 --dist worksteal come from PYTEST_ADDOPTS. Forkserver children
+          # must import the test module by its importlib name
+          # (python.test.unit.tlx_ops.*), not just its helpers from tlx_ops.
+          PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" -v --durations=25 --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
+        env:
+          KERNEL_ONLY: ${{ steps.select.outputs.kernel_only }}
+          CORRECTNESS_MODE: ${{ steps.select.outputs.correctness_mode }}
+          CORRECTNESS_K: ${{ steps.select.outputs.correctness_k }}
         run: |
           set -eux
-          . "${SETUP_SCRIPT}"
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
-            MODE="${{ steps.select.outputs.correctness_mode }}"
-            if [ "$MODE" = "skip" ]; then
-              echo "kernel-only PR: no tutorial correctness tests touch the changed kernel(s); skipping"
-              exit 0
-            fi
-            if [ "$MODE" = "filtered" ]; then
-              echo "kernel-only PR: correctness filter: ${{ steps.select.outputs.correctness_k }}"
-              pytest third_party/tlx/tutorials/testing/test_correctness.py -k "${{ steps.select.outputs.correctness_k }}" -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
-              exit 0
-            fi
+          K=()
+          if [ "${KERNEL_ONLY}" = true ]; then
+            case "${CORRECTNESS_MODE}" in
+              skip) echo "kernel-only PR: no tutorial correctness tests touch the changed kernel(s); skipping"; exit 0 ;;
+              filtered) K=(-k "${CORRECTNESS_K}") ;;
+            esac
           fi
-          pytest third_party/tlx/tutorials/testing/test_correctness.py -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
+          python -m pytest third_party/tlx/tutorials/testing/test_correctness.py ${K[@]+"${K[@]}"} \
+            -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
       - name: Run host-default TLX L2 perf
         id: run_perf_tests
         if: always() && github.event_name == 'schedule'
         timeout-minutes: 60
         run: |
-          . "${SETUP_SCRIPT}"
-          pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib \
+          # Serial: benchmarks sharing the GPU would measure each other.
+          python -m pytest python/test/tlx_benchmark/test_ops_perf.py -n 0 \
             -k "not torchtlx" -v --junitxml=/tmp/tlx-perf.xml
       - name: Upload TLX perf artifacts
         if: always() && github.event_name == 'schedule'
@@ -304,7 +286,6 @@ jobs:
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
-          . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
           if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_perf_tests.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket mi350-tlx-job-failed"
@@ -323,6 +304,12 @@ jobs:
     env:
       TORCHINDUCTOR_TLX_MODE: "allow"
       TORCHTLX_ARCH: gfx950
+      # This job builds Triton from source.
+      MAX_JOBS: 16
+      CCACHE_DIR: /tmp/fbtriton-ccache
+      CCACHE_MAXSIZE: 2G
+      # Its own venv has no pytest-xdist; keep pytest's defaults here.
+      PYTEST_ADDOPTS: ""
     timeout-minutes: 180
     permissions:
       id-token: write
@@ -331,7 +318,7 @@ jobs:
       failures: ${{ steps.parse.outputs.failures }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -425,11 +412,6 @@ jobs:
     needs: mi350-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-fb-triton-mi350-1
-    env:
-      WORKSPACE_DIR: /workspace
-      CONDA_ENV: pytorch
-      UV_VENV_DIR: /workspace/uv_venvs
-      SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 60
     permissions:
       id-token: write
@@ -444,38 +426,50 @@ jobs:
           echo "mi350-build result: ${{ needs.mi350-build.result }}"
           exit 1
       - name: Checkout
-        uses: actions/checkout@v3
-      - name: Set up ROCm test environment
-        timeout-minutes: 30
-        uses: ./.github/actions/setup-rocm-test-env
-        with:
-          gpu-arch: gfx950
-          packages: numpy pytest expecttest
-      - name: Install prebuilt Triton
-        uses: ./.github/actions/install-prebuilt-triton
-        with:
-          wheel-url: ${{ needs.mi350-build.outputs.wheel_url }}
-          wheel-filename: ${{ needs.mi350-build.outputs.wheel_filename }}
+        uses: actions/checkout@v4
+      # TEMPORARY (remove before landing): is a persistent uv cache possible?
+      - name: Probe runner storage
+        run: bash .github/scripts/probe_runner_storage.sh
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/select-kernel-tests
+      - name: Decide whether Gluon tests run
+        id: gluon
+        env:
+          KERNEL_ONLY: ${{ steps.select.outputs.kernel_only }}
+        run: |
+          if [ "${KERNEL_ONLY}" = true ] && ! grep -q "^python/test/gluon/" /tmp/affected.txt; then
+            echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up test environment
+        if: steps.gluon.outputs.run == 'true'
+        timeout-minutes: 30
+        uses: ./.github/actions/setup-test-env
+        with:
+          backend: rocm
+          arch: gfx950
+          packages: numpy pytest pytest-xdist expecttest
+      - name: Install prebuilt Triton
+        if: steps.gluon.outputs.run == 'true'
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.mi350-build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.mi350-build.outputs.wheel_filename }}
       - name: Run Gluon tests (python/test/gluon)
         id: run_gluon
+        if: steps.gluon.outputs.run == 'true'
         timeout-minutes: 50
         run: |
           set -eux
-          . "${SETUP_SCRIPT}"
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ] && ! grep -q "^python/test/gluon/" /tmp/affected.txt; then
-            echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
-            exit 0
-          fi
-          pytest python/test/gluon/ --import-mode=importlib -v --junitxml=/tmp/gluon.xml
+          python -m pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
       - name: Collect nightly failures (Gluon)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
-          . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
           if [[ "${{ steps.run_gluon.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket mi350-gluon-job-failed"

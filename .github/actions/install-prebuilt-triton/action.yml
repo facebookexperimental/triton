@@ -1,7 +1,7 @@
 name: Install prebuilt Triton
 description: >
-  Fetch the wheel the build job produced and install it into the venv that
-  $SETUP_SCRIPT activates. Fork PRs read it from the run's GitHub artifacts;
+  Fetch the wheel the build job produced and install it into the active venv
+  (see setup-test-env). Fork PRs read it from the run's GitHub artifacts;
   everything else reads it from S3 as 16 parallel byte ranges, since a single
   S3 stream sometimes runs at ~1 MB/s (6.5 min for the wheel).
 inputs:
@@ -53,12 +53,21 @@ runs:
           rm -f "${OUT}".part*
         fi
         [ "$(stat -c %s "${OUT}")" -eq "${SIZE}" ] || [ "${SIZE}" -eq 0 ]
-        . "${SETUP_SCRIPT}"
         python -m zipfile -t "${OUT}" > /dev/null
         awk -v b="$(stat -c %s "${OUT}")" -v t0="${T0}" -v t1="$(date +%s.%N)" -v f="${OUT##*/}" \
           'BEGIN {t = t1 - t0; printf "downloaded %s: %d bytes in %.1fs (%.1f MB/s)\n", f, b, t, b / t / 1e6}'
     - name: Install Triton
       shell: bash
       run: |
-        . "${SETUP_SCRIPT}"
         uv pip install --force-reinstall --no-deps "${RUNNER_TEMP}"/prebuilt-wheel/*.whl
+        # The wheel is the `fbtriton` distribution. Fail if any other
+        # distribution also provides `triton` (torch's or a dependency's), whose
+        # files could shadow it. Install this action after the job's other
+        # dependencies so the wheel's files are the last written.
+        python - <<'PY'
+        import importlib.metadata as md
+
+        owners = md.packages_distributions().get("triton")
+        assert owners == ["fbtriton"], f"`triton` is provided by {owners}, expected only fbtriton"
+        print(f"triton package from fbtriton {md.version('fbtriton')}")
+        PY

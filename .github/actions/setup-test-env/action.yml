@@ -1,0 +1,98 @@
+name: Set up test environment
+description: >
+  Provide a uv venv at `venv` and activate it for every later step of the job
+  (VIRTUAL_ENV and PATH). If `venv` already holds one (the TritonBench image on
+  B200/H100), reuse it. Otherwise create it with the PyTorch nightly for the
+  backend, without the torch-bundled `triton` (the prebuilt fbtriton wheel
+  replaces it) and, on ROCm, with device code for one GPU architecture instead
+  of all of them. Then install the job's packages.
+inputs:
+  venv:
+    description: Path of the venv to reuse or create; defaults to $RUNNER_TEMP/venv
+    required: false
+    default: ""
+  backend:
+    description: "rocm or cuda; picks the PyTorch index and overrides when creating the venv"
+    required: true
+  arch:
+    description: "ROCm device code to keep when creating the venv, e.g. gfx950; unused on cuda"
+    required: false
+    default: ""
+  packages:
+    description: Extra packages to install, space separated
+    required: false
+    default: numpy pytest pytest-xdist
+  reuse-existing:
+    description: "Reuse a venv already on the runner; 'false' always creates a fresh one"
+    required: false
+    default: "true"
+  torch-index-url:
+    description: PyTorch index override; defaults to the backend's nightly
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: false
+    - name: Provide the venv
+      shell: bash
+      env:
+        BACKEND: ${{ inputs.backend }}
+        ARCH: ${{ inputs.arch }}
+        PACKAGES: ${{ inputs.packages }}
+        REUSE: ${{ inputs.reuse-existing }}
+        VENV: ${{ inputs.venv }}
+        IDX: ${{ inputs.torch-index-url }}
+      run: |
+        set -eux
+        VENV="${VENV:-${RUNNER_TEMP}/venv}"
+        if [ "${REUSE}" = true ] && [ -x "${VENV}/bin/python" ]; then
+          echo "reusing ${VENV}"
+        else
+          case "${BACKEND}" in
+            rocm)
+              [ -n "${ARCH}" ] || { echo "arch is required for backend rocm"; exit 1; }
+              IDX="${IDX:-https://download.pytorch.org/whl/nightly/rocm10.0}" ;;
+            cuda)
+              IDX="${IDX:-https://download.pytorch.org/whl/nightly/cu128}" ;;
+            *)
+              echo "unknown backend: ${BACKEND}"; exit 1 ;;
+          esac
+          # The prebuilt Triton wheel is cp312.
+          uv venv "${VENV}" --python 3.12 --managed-python --clear
+          export VIRTUAL_ENV="${VENV}" PATH="${VENV}/bin:${PATH}"
+          # Override away the torch-bundled triton, which owns the same
+          # `triton` package as fbtriton. On ROCm, torch also requires
+          # rocm[device-all], device code for every GPU architecture (~6 GiB
+          # of the ~8.6 GiB download), so keep only ARCH.
+          echo torch | uv pip compile - --pre --index-url "${IDX}" --no-header --no-annotate -q \
+            | grep -oE '^[A-Za-z0-9_.-]+' \
+            | grep -E '^((pytorch-)?triton(-rocm)?|rocm-sdk-device-gfx[0-9a-z]+)$' \
+            | grep -vx "rocm-sdk-device-${ARCH:-none}" \
+            | sed "s/\$/ ; sys_platform == 'never'/" > /tmp/torch-overrides.txt
+          cat /tmp/torch-overrides.txt
+          T0=$(date +%s)
+          uv pip install --pre --no-cache torch --index-url "${IDX}" --overrides /tmp/torch-overrides.txt
+          echo "torch install: $(( $(date +%s) - T0 ))s"
+        fi
+        # Activate for this step and every later step of the job.
+        export VIRTUAL_ENV="${VENV}" PATH="${VENV}/bin:${PATH}"
+        echo "VIRTUAL_ENV=${VENV}" >> "${GITHUB_ENV}"
+        echo "${VENV}/bin" >> "${GITHUB_PATH}"
+        if [ "${BACKEND}" = rocm ] && [ -e /opt/rocm/lib ]; then
+          export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "${GITHUB_ENV}"
+        fi
+        # shellcheck disable=SC2086
+        uv pip install ${PACKAGES}
+        python - <<'PY'
+        import torch
+
+        backend = f"hip {torch.version.hip}" if torch.version.hip else f"cuda {torch.version.cuda}"
+        print(f"torch -> {torch.__version__} ({backend})")
+        assert torch.cuda.is_available(), "torch sees no GPU"
+        print(f"device -> {torch.cuda.get_device_name(0)}")
+        PY
