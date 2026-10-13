@@ -370,6 +370,8 @@ LogicalResult lowerLdStMatrix(
                    {{kOffset, reps.getOutDimSize(kOffset)}}, false);
   // Compute the bits that are moved by one instruction
   // Compute elements for which we can swap the xor by an add
+  // Pass the full ldmatrix/stmatrix vector width because the shared helper
+  // classifies its low register bases as one indivisible instruction group.
   auto [nAdditive, permStrides] = actionAdditiveStrides(
       reps, addrLayout, maskSpanAffineOffset, fullTileVec.getInDimSize(kReg));
   reps = permStrides.apply(reps);

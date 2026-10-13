@@ -1,5 +1,30 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions | FileCheck %s
 
+// Trusted contiguity belongs to the load's register ownership. A requested
+// output layout must remain a physical conversion instead of retagging the load.
+// CHECK-DAG: #[[$TRUSTED:.*]] = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+// CHECK-DAG: #[[$OUTPUT:.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+// CHECK-LABEL: @buffer_load_preserves_trusted_contiguity
+// CHECK: %[[LOADED:.*]] = amdg.buffer_load
+// CHECK-SAME: contiguity = 2 : i32
+// CHECK-SAME: tlx.preserve_layout
+// CHECK-SAME: : tensor<1024xbf16, #[[$TRUSTED]]>
+// CHECK: %[[CONVERTED:.*]] = ttg.convert_layout %[[LOADED]] : tensor<1024xbf16, #[[$TRUSTED]]> -> tensor<1024xbf16, #[[$OUTPUT]]>
+// CHECK: tt.return %[[CONVERTED]]
+
+#trusted = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#output = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @buffer_load_preserves_trusted_contiguity(%ptr: !tt.ptr<bf16>) -> tensor<1024xbf16, #output> {
+    %offsets = tt.make_range {start = 0 : i32, end = 1024 : i32} : tensor<1024xi32, #trusted>
+    %loaded = amdg.buffer_load %ptr[%offsets] {contiguity = 2 : i32, tlx.preserve_layout} : tensor<1024xbf16, #trusted>
+    %converted = ttg.convert_layout %loaded : tensor<1024xbf16, #trusted> -> tensor<1024xbf16, #output>
+    tt.return %converted : tensor<1024xbf16, #output>
+  }
+}
+
+// -----
+
 // Test that redundant layout conversion after local_load is removed
 
 // CHECK: #[[$COALESCED:.*]] = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>

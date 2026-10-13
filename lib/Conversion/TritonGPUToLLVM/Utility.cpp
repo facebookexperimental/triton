@@ -580,6 +580,47 @@ std::pair<Value, Value> getLaneAndWarpId(OpBuilder &rewriter, Location loc) {
   return {laneId, warpId};
 }
 
+std::pair<Value, Value> DistributedCoordinateGroups::getOrCreate(
+    Operation *op, int64_t group, bool rematerializeLane,
+    bool rematerializeWarp, RewriterBase &rewriter,
+    const TargetInfoBase &targetInfo) {
+  Block *block = op->getBlock();
+  auto &entry = groups[block][group];
+  if (entry.lane && entry.warp &&
+      (!rematerializeLane || entry.laneRematerialized) &&
+      (!rematerializeWarp || entry.warpRematerialized))
+    return {entry.lane, entry.warp};
+
+  Operation *anchor = op;
+  for (Operation &candidate : *block) {
+    auto candidateGroup = candidate.getAttrOfType<IntegerAttr>(
+        "tlx.rematerialize_coordinates_group");
+    if (candidateGroup && candidateGroup.getInt() == group) {
+      anchor = &candidate;
+      break;
+    }
+  }
+
+  RewriterBase::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(anchor);
+  auto [lane, warp] = getLaneAndWarpId(rewriter, anchor->getLoc());
+  if (!entry.lane)
+    entry.lane = lane;
+  if (!entry.warp)
+    entry.warp = warp;
+  if (rematerializeLane && !entry.laneRematerialized) {
+    entry.lane = targetInfo.rematerializeDistributedCoordinate(
+        rewriter, anchor->getLoc(), lane);
+    entry.laneRematerialized = true;
+  }
+  if (rematerializeWarp && !entry.warpRematerialized) {
+    entry.warp = targetInfo.rematerializeDistributedCoordinate(
+        rewriter, anchor->getLoc(), warp);
+    entry.warpRematerialized = true;
+  }
+  return {entry.lane, entry.warp};
+}
+
 Value getLaneId(OpBuilder &rewriter, Location loc) {
   return getLaneAndWarpId(rewriter, loc).first;
 }
@@ -915,7 +956,8 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 Value affineOffset, uint64_t maskSpanAffineOffset,
                 RewriterBase &rewriter, const TargetInfoBase &targetInfo,
                 std::optional<int> maybeMaxVecElems, Operation *localLoadOp,
-                std::optional<Value> ctaRank, std::optional<Value> barrierPtr) {
+                std::optional<Value> ctaRank, std::optional<Value> barrierPtr,
+                std::optional<std::pair<Value, Value>> distributedCoordinates) {
 
   bool isStore = !valsArray.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -964,7 +1006,21 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
       return unpackLLVector(loc, valsVec, rewriter);
     }
   };
-  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+  std::pair<Value, Value> coordinates = distributedCoordinates
+                                            ? *distributedCoordinates
+                                            : getLaneAndWarpId(rewriter, loc);
+  auto [laneId, warpId] = coordinates;
+  if (localLoadOp && localLoadOp->hasAttr("tlx.rematerialize_coordinates")) {
+    auto outDims = to_vector(cvt.getOutDimNames());
+    auto kLane = str_attr("lane");
+    auto kWarp = str_attr("warp");
+    if (cvt.hasInDim(kLane) && !cvt.sublayoutIsZero({kLane}, outDims))
+      laneId =
+          targetInfo.rematerializeDistributedCoordinate(rewriter, loc, laneId);
+    if (cvt.hasInDim(kWarp) && !cvt.sublayoutIsZero({kWarp}, outDims))
+      warpId =
+          targetInfo.rematerializeDistributedCoordinate(rewriter, loc, warpId);
+  }
   return lowerLdSt(loc, ctx, cvt, valsArray, llvmElemTy, smemBases,
                    paddingShifts, affineOffset, maskSpanAffineOffset, laneId,
                    warpId, rewriter, targetInfo, maybeMaxVecElems, emitLdSt,
@@ -1189,7 +1245,8 @@ SmallVector<Value> lowerLocalLdSt(
     Type llvmElemTy, triton::gpu::MemDescType srcTy, SharedMemoryObject smemObj,
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     Operation *localLoadOp, std::optional<Value> ctaRank,
-    std::optional<Value> barrierPtr) {
+    std::optional<Value> barrierPtr,
+    std::optional<std::pair<Value, Value>> distributedCoordinates) {
   auto kOffset = str_attr("offset");
   auto kBlock = str_attr("block");
   auto kPartition = str_attr("partition");
@@ -1207,9 +1264,9 @@ SmallVector<Value> lowerLocalLdSt(
     if (isStore) {
       inVals = removeBroadcastSrc.apply(inVals);
     }
-    auto outVals =
-        lowerLocalLdSt(loc, ctx, prmtCvt, inVals, llvmElemTy, srcTy, smemObj,
-                       rewriter, targetInfo, localLoadOp, ctaRank, barrierPtr);
+    auto outVals = lowerLocalLdSt(loc, ctx, prmtCvt, inVals, llvmElemTy, srcTy,
+                                  smemObj, rewriter, targetInfo, localLoadOp,
+                                  ctaRank, barrierPtr, distributedCoordinates);
     if (!isStore) {
       outVals = broadcastAs(outVals, cvt);
     }
@@ -1237,7 +1294,7 @@ SmallVector<Value> lowerLocalLdSt(
   return lowerLdStShared(loc, ctx, cvt, valsArray, llvmElemTy, smemBases,
                          paddingShifts, affineOffset, maskSpanAffineOffset,
                          rewriter, targetInfo, maybeMaxVecElems, localLoadOp,
-                         ctaRank, barrierPtr);
+                         ctaRank, barrierPtr, distributedCoordinates);
 }
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
@@ -1256,6 +1313,28 @@ SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
     results[i] = b.extract_val(type, llvmStruct, i);
   }
   return results;
+}
+
+SmallVector<Value> unpackUniqueTensorElements(Location loc, Value llvmStruct,
+                                              RewriterBase &rewriter) {
+  return unpackLLElements(loc, llvmStruct, rewriter);
+}
+
+SmallVector<Value> unpackTensorElements(Location loc, Value llvmStruct,
+                                        RewriterBase &rewriter,
+                                        Type originalType) {
+  SmallVector<Value> values =
+      unpackUniqueTensorElements(loc, llvmStruct, rewriter);
+  if (auto tensorTy = dyn_cast<RankedTensorType>(originalType)) {
+    LinearLayout layout = triton::gpu::toLinearLayout(tensorTy);
+    StringAttr kRegister = StringAttr::get(rewriter.getContext(), "register");
+    // The current tensor ABI normally materializes every register, including
+    // broadcast duplicates.  Keep that representation when it is already
+    // present; only expand an ABI that actually stores unique registers.
+    if (values.size() != layout.getInDimSize(kRegister))
+      return broadcastAs(values, layout);
+  }
+  return values;
 }
 
 Value packLLElements(Location loc, const LLVMTypeConverter *typeConverter,
@@ -1290,6 +1369,38 @@ Value packLLElements(Location loc, const LLVMTypeConverter *typeConverter,
     llvmStruct = b.insert_val(structType, llvmStruct, value, i);
   }
   return llvmStruct;
+}
+
+Value packUniqueTensorElements(Location loc,
+                               const LLVMTypeConverter *typeConverter,
+                               ValueRange resultVals, RewriterBase &rewriter,
+                               Type type) {
+  return packLLElements(loc, typeConverter, resultVals, rewriter, type);
+}
+
+Value packTensorElements(Location loc, const LLVMTypeConverter *typeConverter,
+                         ValueRange resultVals, RewriterBase &rewriter,
+                         Type type) {
+  if (auto tensorTy = dyn_cast<RankedTensorType>(type)) {
+    auto convertedTy = typeConverter->convertType(type);
+    size_t abiElements =
+        isa<LLVM::LLVMStructType>(convertedTy)
+            ? cast<LLVM::LLVMStructType>(convertedTy).getBody().size()
+            : 1;
+    // Do not discard broadcast duplicates when they are part of the converted
+    // tensor ABI.  Some future/target-specific ABIs may store only unique
+    // registers, so retain that path when its tuple size matches instead.
+    if (resultVals.size() == abiElements)
+      return packUniqueTensorElements(loc, typeConverter, resultVals, rewriter,
+                                      type);
+    auto uniqueResultVals =
+        actionRemoveBroadcastedRegs(triton::gpu::toLinearLayout(tensorTy))
+            .apply(resultVals);
+    if (uniqueResultVals.size() == abiElements)
+      return packUniqueTensorElements(loc, typeConverter, uniqueResultVals,
+                                      rewriter, type);
+  }
+  return packLLElements(loc, typeConverter, resultVals, rewriter, type);
 }
 
 SmallVector<Value> unpackLLVector(Location loc, Value llvmVec,

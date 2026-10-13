@@ -231,6 +231,118 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#nondistributed = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @register_resident_requires_distributed_encoding(
+      %arg0: tensor<16x16xbf16, #nondistributed>) {
+    // expected-error @+1 {{requires a distributed tensor encoding}}
+    %0 = amdg.register_resident %arg0 class "agpr" groups 1
+        : tensor<16x16xbf16, #nondistributed>
+    tt.return
+  }
+}
+
+// -----
+
+#distributed = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @register_resident_rejects_pointer_elements(
+      %arg0: tensor<64x!tt.ptr<f32>, #distributed>) {
+    // expected-error @+1 {{requires an integer or floating-point element type}}
+    %0 = amdg.register_resident %arg0 class "agpr" groups 1
+        : tensor<64x!tt.ptr<f32>, #distributed>
+    tt.return
+  }
+}
+
+// -----
+
+#distributed = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_atomic_rmw_rejects_i16(
+      %ptr: !tt.ptr<i16>, %offsets: tensor<64xi32, #distributed>,
+      %values: tensor<64xi16, #distributed>) {
+    // expected-error @+1 {{supports only f16, bf16, f32, f64, i32, and i64 values}}
+    %0 = amdg.buffer_atomic_rmw add, relaxed, gpu, %values, %ptr[%offsets]
+        : tensor<64xi16, #distributed>
+    tt.return
+  }
+}
+
+// -----
+
+#nondistributed = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @extract_slice_requires_distributed_encoding(
+      %arg0: tensor<16x16xbf16, #nondistributed>) {
+    // expected-error @+1 {{requires a distributed source layout}}
+    %0 = amdg.extract_slice %arg0 [0, 0]
+        : tensor<16x16xbf16, #nondistributed>
+          to tensor<16x8xbf16, #nondistributed>
+    tt.return
+  }
+}
+
+// -----
+
+#distributed = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
+#nondistributed = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @extract_slice_requires_distributed_result_encoding(
+      %arg0: tensor<16x16xbf16, #distributed>) {
+    // expected-error @+1 {{requires a distributed result layout}}
+    %0 = amdg.extract_slice %arg0 [0, 0]
+        : tensor<16x16xbf16, #distributed>
+          to tensor<16x8xbf16, #nondistributed>
+    tt.return
+  }
+}
+
+// -----
+
+#nondistributed = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_load_requires_distributed_encoding(
+      %ptr: !tt.ptr<bf16>, %offsets: tensor<64xi32, #nondistributed>) {
+    // expected-error @+1 {{requires a distributed tensor encoding}}
+    %0 = amdg.buffer_load %ptr[%offsets]
+        : tensor<64xbf16, #nondistributed>
+    tt.return
+  }
+}
+
+// -----
+
+#scheduled_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_mma, kWidth = 8}>
+#scheduled_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_mma, kWidth = 8}>
+#half_register_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 4], isTransposed = true}>
+#half_register_lhs = #ttg.dot_op<{opIdx = 0, parent = #half_register_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_partial_register_fragment(
+      %a: tensor<16x32xbf16, #scheduled_lhs>,
+      %b: tensor<32x16xbf16, #scheduled_rhs>,
+      %dependency: tensor<16x4xbf16, #half_register_lhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #scheduled_mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #scheduled_lhs>,
+          tensor<32x16xbf16, #scheduled_rhs>,
+          tensor<16x16xf32, #scheduled_mma>
+          -> tensor<16x16xf32, #scheduled_mma>
+    // expected-error @+1 {{input 1 native dot fragment must occupy a positive integral number of 32-bit registers}}
+    %committed, %preserved = amdg.mfma_commit %result, %dependency
+        : tensor<16x16xf32, #scheduled_mma>,
+          tensor<16x4xbf16, #half_register_lhs>
+    tt.return
+  }
+}
+
+// -----
+
 // Gather with an index layout that distributes values across lanes (invalid).
 // parent blocked: threadsPerWarp = [32, 1] → lanes map to dim 0.
 // slice dim 1 → 1D tensor where each lane holds a different value.
@@ -664,6 +776,149 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   ) {
     // expected-error @+1 {{is inconsistent with the shared memory allocation layout}}
     %token = amdg.async_tdm_copy_global_to_local %tensorDesc into %memDesc : !tt.tensordesc<64x64xf16, #load_desc> -> !ttg.memdesc<64x64xf16, #load_alloc, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @rematerialized_range_rank(%placement: i32) {
+    // expected-error @+1 {{requires a rank-one i32 tensor result}}
+    %range = amdg.rematerialized_range 0 to 16 identity 1 at %placement : tensor<4x4xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @rematerialized_range_element_type(%placement: i32) {
+    // expected-error @+1 {{requires a rank-one i32 tensor result}}
+    %range = amdg.rematerialized_range 0 to 16 identity 1 at %placement : tensor<16xf32>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @rematerialized_range_empty(%placement: i32) {
+    // expected-error @+1 {{requires end to be greater than start}}
+    %range = amdg.rematerialized_range 16 to 16 identity 1 at %placement : tensor<16xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @rematerialized_range_extent(%placement: i32) {
+    // expected-error @+1 {{result extent must equal end - start (16)}}
+    %range = amdg.rematerialized_range 0 to 16 identity 1 at %placement : tensor<32xi32>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_load_contiguity_not_power_of_two(%ptr: !tt.ptr<f32>, %offsets: tensor<512xi32, #blocked>) {
+    // expected-error @+1 {{contiguity must be a positive power-of-two integer}}
+    %value = amdg.buffer_load %ptr[%offsets] {contiguity = 3 : i32} : tensor<512xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_load_contiguity_exceeds_thread_ownership(%ptr: !tt.ptr<f32>, %offsets: tensor<512xi32, #blocked>) {
+    // expected-error @+1 {{contiguity 4 must divide the 2 elements owned by each thread}}
+    %value = amdg.buffer_load %ptr[%offsets] {contiguity = 4 : i32} : tensor<512xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 4], instrShape = [16, 16, 32], isTransposed = true}>
+#pinned = #tlx.no_verify_layout<#tlx.user_layout<#mma>>
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_load_contiguity_pinned_mfma(
+    %ptr: !tt.ptr<f32>,
+    %offsets: tensor<16x128xi32, #pinned>,
+    %mask: tensor<16x128xi1, #pinned>,
+    %other: tensor<16x128xf32, #pinned>
+  ) {
+    %value = amdg.buffer_load %ptr[%offsets], %mask, %other {contiguity = 2 : i32} : tensor<16x128xf32, #pinned>
+    tt.return
+  }
+}
+
+// -----
+
+#padded = #ttg.padded_shared<[512:+16] {shape = [16, 128], order = [1, 0]}>
+#user = #tlx.user_layout<#padded>
+#smem = #ttg.shared_memory
+module {
+  tt.func @memdesc_subslice_pinned_padded_shared(%src: !ttg.memdesc<16x128xbf16, #user, #smem, mutable>) {
+    %first = ttg.memdesc_subslice %src [0, 0] : !ttg.memdesc<16x128xbf16, #user, #smem, mutable> -> !ttg.memdesc<16x64xbf16, #user, #smem, mutable, 16x128>
+    %tail = ttg.memdesc_subslice %src [0, 64] : !ttg.memdesc<16x128xbf16, #user, #smem, mutable> -> !ttg.memdesc<16x32xbf16, #user, #smem, mutable, 16x128>
+    tt.return
+  }
+}
+
+// -----
+
+#padded = #ttg.padded_shared<[512:+16] {shape = [16, 128], order = [1, 0]}>
+#user = #tlx.user_layout<#padded>
+#smem = #ttg.shared_memory
+module {
+  tt.func @memdesc_subslice_pinned_padded_shared_offset_alignment(%src: !ttg.memdesc<16x128xbf16, #user, #smem, mutable>) {
+    // expected-error @+1 {{The split offset may not touch the tile}}
+    %slice = ttg.memdesc_subslice %src [0, 48] : !ttg.memdesc<16x128xbf16, #user, #smem, mutable> -> !ttg.memdesc<16x32xbf16, #user, #smem, mutable, 16x128>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 16, order = [0, 1]}>
+#smem = #ttg.shared_memory
+module {
+  tt.func @memdesc_subslice_concrete_swizzling_pattern(%src: !ttg.memdesc<8x16xf32, #shared, #smem>) {
+    // expected-error @+1 {{swizzling pattern}}
+    %slice = ttg.memdesc_subslice %src [0, 0] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<8x4xf32, #shared, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#distributed = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_atomic_rmw_rejects_i16(
+      %ptr: !tt.ptr<i16>, %offsets: tensor<64xi32, #distributed>,
+      %values: tensor<64xi16, #distributed>) {
+    // expected-error @+1 {{supports only f16, bf16, f32, f64, i32, and i64 values}}
+    %0 = amdg.buffer_atomic_rmw add, relaxed, gpu, %values, %ptr[%offsets]
+        : tensor<64xi16, #distributed>
+    tt.return
+  }
+}
+
+// -----
+
+#nondistributed = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_load_requires_distributed_encoding(
+      %ptr: !tt.ptr<bf16>, %offsets: tensor<64xi32, #nondistributed>) {
+    // expected-error @+1 {{requires a distributed tensor encoding}}
+    %0 = amdg.buffer_load %ptr[%offsets]
+        : tensor<64xbf16, #nondistributed>
     tt.return
   }
 }
