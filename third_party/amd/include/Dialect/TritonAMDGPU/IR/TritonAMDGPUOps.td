@@ -768,20 +768,50 @@ def RegisterResidentOp : TT_AMDGPU_Op<"register_resident", [
 }
 
 //===----------------------------------------------------------------------===//
+// RegisterHandoffOp
+//===----------------------------------------------------------------------===//
+
+def RegisterHandoffOp : TT_AMDGPU_Op<"register_handoff", [
+    SameOperandsAndResultType]> {
+  let summary = "Start independent native AMD register-allocation intervals";
+  let description = [{
+    Returns `input` unchanged while passing each per-thread 32-bit native
+    register value through an independent tied register constraint. This starts
+    local allocation intervals without requiring the complete tensor to be
+    resident at one point.
+
+    Use `register_resident` when simultaneous whole-tensor residency is the
+    software-pipeline contract. Neither operation prescribes physical register
+    numbers or changes numerical results. The operation is intentionally
+    side-effecting: distinct source occurrences are distinct allocation
+    boundaries and must not be merged by CSE or moved out of their surrounding
+    software-pipeline stage.
+  }];
+
+  let arguments = (ins TT_Tensor:$input, StrAttr:$register_class);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $input `class` $register_class attr-dict `:` type($input)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // MfmaCommitOp
 //===----------------------------------------------------------------------===//
 
 def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
-    DeclareOpInterfaceMethods<InferTypeOpInterface>,
-    AllTypesMatch<["inputs", "outputs"]>]> {
+    DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Commit native vector MFMA fragments with live dependencies";
   let description = [{
     Returns every input unchanged after applying the architecture-defined MFMA
-    result hazard. One or more inputs must be direct transient
-    `scheduled_mfma` results. Additional dot operands are non-numerical live
-    dependencies, and their corresponding outputs may be consumed by the
-    following source stage. Multiple independent native results can therefore
-    share one completion boundary without first assembling a logical tensor.
+    result hazard. Inputs may be direct transient `scheduled_mfma` results
+    followed by dot-operand live dependencies, or a set of direct persistent
+    results at an epilogue boundary. Multiple independent native results can
+    therefore share one completion boundary without first assembling a
+    logical tensor.
 
     Distributed MFMA and dot layouts determine storage roles and native
     fragment widths. Source code does not provide physical register classes,
@@ -808,9 +838,10 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
   let description = [{
     Computes the full per-wave Cartesian product of the native fragments in
     `a` and `b`, replacing every corresponding fragment in `acc`. Native
-    instructions are emitted in N-major, M-minor, K-reduction order, so each
-    output fragment remains an independent dependency chain while consecutive
-    native K fragments stay on that chain.
+    instructions are emitted in K-major, N-major, M-minor order. This
+    round-robins each K slice over the independent output fragments before
+    returning to an accumulator dependency chain, while preserving one SSA
+    chain per output fragment.
 
     `resident_operand` is `none`, `lhs`, or `rhs` and identifies an input
     intentionally carried through the surrounding software pipeline.
@@ -826,7 +857,7 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     an explicit source contract because LLVM inline assembly cannot represent
     a convergent-call attribute on the pinned compiler revision.
 
-    The initial contract supports CDNA4 BF16 inputs, F32 accumulators, one or
+    The contract supports CDNA4 BF16 or F16 inputs, F32 accumulators, one or
     more K fragments per wave, and native 32x32x16 or 16x16x32 instruction
     shapes.
   }];

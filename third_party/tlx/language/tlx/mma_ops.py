@@ -86,11 +86,36 @@ def amd_register_resident(
     """
     register_class = tl._unwrap_if_constexpr(register_class)
     registers_per_group = tl._unwrap_if_constexpr(registers_per_group)
-    assert isinstance(value, tl.tensor), "value must be a distributed tensor"
+    assert isinstance(value, tl.tensor) and value.type.is_block(), "value must be a distributed tensor"
+    assert value.dtype.is_int() or value.dtype.is_floating(), "value elements must be integer or floating-point"
+    assert value.dtype.primitive_bitwidth in (16, 32), "value elements must be 16 or 32 bits"
     assert register_class in ("agpr", "vgpr"), ('register_class must be either "agpr" or "vgpr"')
     assert (isinstance(registers_per_group, int) and not isinstance(registers_per_group, bool) and registers_per_group
             in (1, 2, 4, 8, 16, 32)), "registers_per_group must be a power of two between 1 and 32"
     handle = _semantic.builder.create_amd_register_resident(value.handle, register_class, registers_per_group)
+    return tl.tensor(handle, value.type)
+
+
+@tl.builtin
+def amd_register_handoff(
+    value,
+    register_class: tl.constexpr = "vgpr",
+    _semantic=None,
+):
+    """Start a new AMD register-allocation interval for a tensor value.
+
+    Each 32-bit native register value is passed unchanged through an independent
+    tied register constraint, so this expresses a local allocation/scheduling
+    handoff without requiring the complete tensor to be resident at one point.
+    Use :func:`amd_register_resident` when simultaneous whole-tensor residency
+    is the intended software-pipeline contract.
+    """
+    register_class = tl._unwrap_if_constexpr(register_class)
+    assert isinstance(value, tl.tensor) and value.type.is_block(), "value must be a distributed tensor"
+    assert value.dtype.is_int() or value.dtype.is_floating(), "value elements must be integer or floating-point"
+    assert value.dtype.primitive_bitwidth in (16, 32), "value elements must be 16 or 32 bits"
+    assert register_class in ("agpr", "vgpr"), ('register_class must be either "agpr" or "vgpr"')
+    handle = _semantic.builder.create_amd_register_handoff(value.handle, register_class)
     return tl.tensor(handle, value.type)
 
 
@@ -150,22 +175,25 @@ def amd_scheduled_mfma(
 
 
 @tl.builtin
-def amd_mfma_commit(value, preserve, _semantic=None):
-    """Commit transient MFMA results and thread a live dot operand.
+def amd_mfma_commit(value, preserve=None, _semantic=None):
+    """Commit MFMA results and optionally thread a live dot operand.
 
     ``value`` may be one tensor or a tuple of independent transient
     ``amd_scheduled_mfma`` results. The returned copy of ``preserve`` can be
-    consumed by the next source stage to make its residency explicit.
+    consumed by the next source stage to make its residency explicit. With no
+    ``preserve``, the values form one persistent-AGPR epilogue boundary.
     """
     single_value = isinstance(value, tl.tensor)
     values = (value, ) if single_value else value
     assert isinstance(values,
                       (tuple, tl.tuple)) and len(values) > 0, ("value must be a tensor or nonempty tensor tuple")
     assert all(isinstance(item, tl.tensor) for item in values), ("value must contain only tensors")
-    assert isinstance(preserve, tl.tensor), "preserve must be a tensor"
-    inputs = tuple(values) + (preserve, )
+    assert preserve is None or isinstance(preserve, tl.tensor), ("preserve must be None or a tensor")
+    inputs = tuple(values) + (() if preserve is None else (preserve, ))
     handles = _semantic.builder.create_amd_mfma_commit([item.handle for item in inputs])
     outputs = tuple(tl.tensor(handle, item.type) for handle, item in zip(handles, inputs))
+    if preserve is None:
+        return outputs[0] if single_value else outputs
     if single_value:
         return outputs[0], outputs[-1]
     return outputs
@@ -204,6 +232,18 @@ def require_layout(
         pin=pin,
         late_address_compute=late_address_compute,
     )
+    return tl.tensor(handle, x.type)
+
+
+@tl.builtin
+def release_layout(x, _semantic=None):
+    """Release a register tensor's explicit layout for a flexible consumer.
+
+    Layout propagation may select a new encoding after this point without
+    changing the tensor values.
+    """
+    assert isinstance(x, tl.tensor) and x.type.is_block(), "x must be a distributed tensor"
+    handle = _semantic.builder.create_release_layout(x.handle)
     return tl.tensor(handle, x.type)
 
 

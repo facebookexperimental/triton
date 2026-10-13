@@ -527,6 +527,23 @@ module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.n
 
 // -----
 
+// CHECK-LABEL: dynamic_subslice_shared_layout
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @dynamic_subslice_shared_layout(%arg0: tensor<8x16xf16, #blocked>, %row: i32) {
+    %zero = arith.constant 0 : i32
+    %buffer = ttg.local_alloc %arg0 : (tensor<8x16xf16, #blocked>) -> !ttg.memdesc<8x16xf16, #shared, #smem, mutable>
+    // CHECK: llvm.add %{{.*}}, %{{.*}} : i32
+    // CHECK-NOT: ttg.memdesc_dynamic_subslice
+    %view = ttg.memdesc_dynamic_subslice %buffer[%row, %zero] : !ttg.memdesc<8x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<1x16xf16, #shared, #smem, mutable, 8x16>
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK-LABEL: padded_shared_layout
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
 #shared = #ttg.padded_shared<[128:+4, 256:+8] {order = [1, 0], shape = [64, 64]}>
@@ -881,5 +898,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // COMMON: llvm.return {{.*}} : !llvm.struct<(i32, i32, i32, i32)>
     %range = amdg.rematerialized_range 16 to 32 identity 2 at %placement : tensor<16xi32, #linear>
     tt.return %range : tensor<16xi32, #linear>
+  }
+}
+
+// -----
+
+#shared = #ttg.shared_linear<{offset = [[1], [2], [4], [8], [16], [32], [64], [128], [256]], block = []}, alignment = 16>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // GFX950-LABEL: @memdesc_dynamic_subslice_accumulated_offset
+  // GFX950-SAME: (%[[SRC:[^:]+]]: !llvm.struct<(ptr<3>, i32)>, %[[OFFSET:[^:]+]]: i32,
+  tt.func private @memdesc_dynamic_subslice_accumulated_offset(%src: !ttg.memdesc<512xf32, #shared, #smem, mutable>, %offset: i32) -> !ttg.memdesc<16xf32, #shared, #smem, mutable, 512> {
+    // GFX950: %[[BASE:.+]] = llvm.extractvalue %[[SRC]][0] : !llvm.struct<(ptr<3>, i32)>
+    // GFX950: %[[OLD_OFFSET:.+]] = llvm.extractvalue %[[SRC]][1] : !llvm.struct<(ptr<3>, i32)>
+    // GFX950: %[[C256:.+]] = llvm.mlir.constant(256 : i32)
+    // GFX950: %[[STATIC_OFFSET:.+]] = llvm.add %[[OLD_OFFSET]], %[[C256]] : i32
+    // GFX950: %[[STATIC_BASE:.+]] = llvm.insertvalue %[[BASE]], %{{.+}}[0] : !llvm.struct<(ptr<3>, i32)>
+    // GFX950: %[[STATIC_DESC:.+]] = llvm.insertvalue %[[STATIC_OFFSET]], %[[STATIC_BASE]][1] : !llvm.struct<(ptr<3>, i32)>
+    // GFX950: %[[VIEW_BASE:.+]] = llvm.extractvalue %[[STATIC_DESC]][0] : !llvm.struct<(ptr<3>, i32)>
+    // GFX950: %[[VIEW_OFFSET:.+]] = llvm.extractvalue %[[STATIC_DESC]][1] : !llvm.struct<(ptr<3>, i32)>
+    // GFX950: %[[DYNAMIC_OFFSET:.+]] = llvm.add %[[VIEW_OFFSET]], %[[OFFSET]] : i32
+    // GFX950: %[[RESULT_BASE:.+]] = llvm.insertvalue %[[VIEW_BASE]], %{{.+}}[0] : !llvm.struct<(ptr<3>, i32)>
+    // GFX950: %[[RESULT:.+]] = llvm.insertvalue %[[DYNAMIC_OFFSET]], %[[RESULT_BASE]][1] : !llvm.struct<(ptr<3>, i32)>
+    // GFX950: llvm.return %[[RESULT]] : !llvm.struct<(ptr<3>, i32)>
+    %static = ttg.memdesc_subslice %src [256] : !ttg.memdesc<512xf32, #shared, #smem, mutable> -> !ttg.memdesc<256xf32, #shared, #smem, mutable, 512>
+    %dynamic = ttg.memdesc_dynamic_subslice %static [%offset] : !ttg.memdesc<256xf32, #shared, #smem, mutable, 512> -> !ttg.memdesc<16xf32, #shared, #smem, mutable, 512>
+    tt.return %dynamic : !ttg.memdesc<16xf32, #shared, #smem, mutable, 512>
   }
 }
