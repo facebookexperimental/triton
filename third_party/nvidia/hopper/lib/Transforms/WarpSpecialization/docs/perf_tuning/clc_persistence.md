@@ -31,7 +31,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 | `DynamicPersistent1DScheduler` with `two_ctas` | requires | `ClcTileScheduler`: the atomic scheduler has no cluster-level tile claim, so both CTAs would advance the counter independently. Nothing rejects the combination at compile time | [DynamicPersistentAutoWSGaps.md, "2-CTA Status"](../DynamicPersistentAutoWSGaps.md#2-cta-status) |
 | loop `num_stages` on a dynamic or CLC outer `while` | silently ignored | Software pipelining is `scf.for`-only; the stages belong on the K loop | [AutoWSAnnotations.md, "`num_stages` / pipelining on a `while`: not applicable"](../AutoWSAnnotations.md#num_stages--pipelining-on-a-while-not-applicable) |
 | a replicated atomic in the WS loop that is not a scalar, while-carried value mapped to every partition | silently ignored | Warp specialization is dropped for the function. Only that shape can be owned by one partition and broadcast | `WS/WSAtomicBroadcast.cpp` (`AtomicWSCase::Reject`); [DynamicPersistentAutoWSGaps.md, "Atomic Broadcast Restrictions"](../DynamicPersistentAutoWSGaps.md#atomic-broadcast-restrictions) |
-| `pingpongAutoWS` with a dynamic or CLC outer `while` | silently ignored | Ping-pong regions need an enclosing `scf.for` (see `pingpong.md`) | `WS/PingPong.cpp`, `doPingPongPrep` |
+| `pingpongAutoWS` with a dynamic or CLC outer `while` | silently ignored | Ping-pong regions need an enclosing `scf.for` (see [pingpong.md](pingpong.md)) | `WS/PingPong.cpp`, `doPingPongPrep` |
 
 ## Mechanism
 
@@ -80,7 +80,7 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 - tile scheduler × `data_partition_factor` (see [data_partitioning.md](data_partitioning.md))
 - tile scheduler × `separate_epilogue_store` / `EPILOGUE_SUBTILE`
 - tile scheduler × loop `num_stages`
-- tile scheduler × `pingpongAutoWS` (see `pingpong.md`)
+- tile scheduler × `pingpongAutoWS` (see [pingpong.md](pingpong.md))
 - tile scheduler × TMA multicast (see `multicast.md`)
 - tile scheduler × `TRITON_WS_TILE_PREFETCH_DEPTH`
 - tile scheduler × `merge_*` / SMEM-TMEM allocation knobs
