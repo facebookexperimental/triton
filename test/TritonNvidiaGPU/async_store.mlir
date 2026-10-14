@@ -1,6 +1,6 @@
 // RUN: triton-opt --split-input-file %s | FileCheck %s
 // RUN: triton-opt --split-input-file --allocate-shared-memory-nv --tritongpu-allocate-warp-groups --convert-triton-gpu-to-llvm=compute-capability=90 --convert-nv-gpu-to-llvm %s | FileCheck %s --check-prefix=CHECK-LLVM
-// RUN: triton-opt --split-input-file --triton-nvidia-gpu-plan-cta --mlir-print-local-scope %s | FileCheck %s --check-prefix=CHECK-CTA
+// RUN: triton-opt --split-input-file --triton-nvidia-gpu-assign-cga-layouts --tritongpu-remove-layout-conversions --triton-nvidia-gpu-optimize-cta-locality --tritongpu-remove-layout-conversions --mlir-print-local-scope %s | FileCheck %s --check-prefix=CHECK-CTA
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -50,18 +50,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 
-// Test PlanCTA with tt.store inside a warp_specialize partition with 1 warp.
-// PlanCTA must use per-op numWarps (1 for partition0), not function-level
-// numWarps (4). Without the fix, the store layout would get warpsPerCTA=[4],
-// which is incorrect for a 1-warp partition.
+// Test the CTA layout pipeline with tt.store inside a warp_specialize
+// partition with 1 warp. Layout assignment must use per-op numWarps
+// (1 for partition0), not function-level numWarps (4). Otherwise the store
+// layout would get warpsPerCTA=[4], which is incorrect for a 1-warp partition.
 
 #blocked2 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[1]]}>
 #blocked_ws = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0], CGALayout = [[1]]}>
 
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-CTA-LABEL: store_ws_plan_cta
-  tt.func @store_ws_plan_cta(%ptr: !tt.ptr<f32>) {
+  // CHECK-CTA-LABEL: store_ws_cga_layouts
+  tt.func @store_ws_cga_layouts(%ptr: !tt.ptr<f32>) {
     ttg.warp_specialize(%ptr)
     default {
       // Default partition (4 warps): store with warpsPerCTA=[4]

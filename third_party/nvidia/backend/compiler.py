@@ -921,9 +921,10 @@ class CUDABackend(BaseBackend):
         tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
-        nvidia.passes.ttnvgpuir.add_plan_cta(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+        nvidia.passes.ttnvgpuir.add_assign_cga_layouts(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm)
+        nvidia.passes.ttnvgpuir.add_optimize_cta_locality(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
@@ -933,7 +934,7 @@ class CUDABackend(BaseBackend):
             nvidia.passes.hopper.add_analyze_2cta_dependencies(pm)
         # 2-CTA: Split B descriptor loads before optimize_descriptor_encoding
         # so the cloned half-width descriptor gets its encoding set properly.
-        # NOT gated on use_meta_ws: the ctas_per_cga approach bypasses PlanCTA
+        # NOT gated on use_meta_ws: the ctas_per_cga approach bypasses AssignCGALayouts
         # (num_ctas=1), so Transform2CTALoads is the only B splitting path.
         # Cross-CTA sync is handled separately: Insert2CTASync for Meta WS,
         # MMAv5.cpp's inline ClusterArriveOp for non-WS.
