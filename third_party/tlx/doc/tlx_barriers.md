@@ -293,6 +293,92 @@ while !done:
   | tlx.barrier_wait | ttng::WaitBarrierOp | [<u>mbarrier.try_wait</u>](http://mbarrier.try_wait) |
   | tlx.barrier_arrive | ttng::ArriveBarrierOp | [<u>mbarrier.arrive</u>](http://mbarrier.arrive) |
 
+### Cluster-Scoped Initialization (NVIDIA SM90+)
+
+Use `tlx.alloc_barriers(num_barriers, arrive_count=1, scope="cluster")` when a
+barrier needs initialization visibility across CTAs. The returned object is
+still an mbarrier handle. Scope does not change its storage/layout, arrival
+count, phase protocol, or launch dimensions, and it does not create a cluster.
+The default is `scope="cta"`, which preserves legacy compiler synchronization
+for recognized remote/multicast and paired-MMA consumers.
+
+#### Compiler-Owned Initialization Region
+
+A local `mbarrier.init` is not enough for safe remote arrival: the initializing
+thread must publish initialization and the cluster must rendezvous before
+remote use. Explicit cluster scope requests that guarantee independently of
+which consumers appear in the IR. The initialization "region" is a designated
+kernel-entry prologue segment constructed by the compiler, not a new user-facing
+region API.
+
+![Compiler-owned entry initialization followed by TMEM setup and barrier use, with covered-init and WS integration](../../../website/assets/cluster-barrier-initialization.svg)
+
+With multiple physical CTAs, any eligible cluster-scoped entry initialization
+triggers a batch of all eligible entry initializations, including CTA/default
+scope. Safe dependencies and initialization operations retain their original
+block order and move before the first TMEM allocation/setup operation. The
+compiler performs this transformation before shared-memory allocation analysis,
+so liveness reflects the actual entry schedule. One initialization release
+fence and one relaxed cluster arrive/wait sequence protect the whole batch.
+A single physical CTA needs no cluster rendezvous, under either the logical or
+physical cluster model.
+
+After inlining, initialization must be unconditional in the kernel entry block
+and before effectful execution. The compiler rejects cluster initialization in
+branches, loops, or WS tasks, later-phase initialization, reinitialization, and
+dependencies that cannot be safely hoisted. It does not pull later local
+pipeline initialization into the entry batch. Barrier consumers may still be
+inside loops or WS tasks.
+
+#### Compiler Versus User Responsibility
+
+Initialization and application communication are different synchronization
+requirements. Cluster scope makes the barrier ready for remote use; it does
+not decide when application data or later barrier phases are ready.
+
+| Synchronization requirement | Owner | Guarantee or required action |
+|---|---|---|
+| Entry mbarrier initialization visibility | Compiler | `scope="cluster"` supplies the initialization fence and cluster rendezvous for multiple physical CTAs. |
+| Internal synchronization of compiler-managed cross-CTA operations and scratch dependencies | Compiler | Supported lowering and dependency analysis arrange internal synchronization; this is not a guarantee for arbitrary user-written remote accesses. |
+| Expected-byte and application data-ready publication | User | Establish the required ordering before a remote sender can start or complete its transaction. |
+| Asynchronous completion and pipeline phases | User | Arrange the arrive/expect/wait protocol. `cluster_barrier()` alone is not an asynchronous completion wait. |
+| Remote shared-memory reuse or owner exit | User | Confirm remote use has completed before reuse or exit, using a cluster rendezvous or a completion/acknowledgment protocol as needed. |
+
+For example, after setting `barrier_expect_bytes()` on a receiving CTA, an
+application may still need `cluster_barrier()` to publish that readiness before
+a peer issues an asynchronous remote store/copy. The receiver then uses
+`barrier_wait()` before consuming the data. A final cluster rendezvous or
+acknowledgment may be needed to keep remote shared-memory owners alive. Generic
+stores consumed by the asynchronous proxy still require the appropriate proxy
+fence. The relaxed initialization rendezvous replaces none of these later
+application requirements.
+
+#### Integration With Existing Compiler Infrastructure
+
+TLX owns the initialization-region boundary, batching, and placement policy.
+It expresses synchronization through existing Triton NVIDIA fence/arrive/wait
+IR and lowering, rather than calling the Gluon Python API or implementing a
+separate hardware barrier path. This does not mean upstream already provides
+the TLX scope contract or the TLX bootstrap participation scheme.
+
+The bootstrap returns an exact `coveredInitOps` set to the later allocation-backed
+`runCrossCTAMBarrierInitSyncInsertion` analysis. That analysis skips only
+initializations already protected by the entry batch and remains responsible
+for other initializations it recognizes. Independent DSM-hazard and runtime
+synchronization analysis stay active; the bootstrap does not disable them at
+module scope.
+
+For WS, the existing TLX header makes non-default worker warps contribute one
+bootstrap arrive. Default warps perform initialization, the release fence,
+arrive, and wait. Workers do not gain an additional bootstrap cluster wait.
+The module kernel-init marker enables header participation; per-operation
+`tlx.cluster_sync_bootstrap` tags identify only this initialization sequence.
+Those operations bypass ordinary all-warps synthetic-WS wrapping because
+header participation is already arranged. Wrapping again would duplicate
+worker arrivals and could deadlock. Later synchronization retains its normal
+lowering; WS-aware execution does not infer the application's communication
+protocol.
+
 ### Workgroup Barriers (AMD)
 
 - **Note:** Workgroup barriers are only supported on AMD (CDNA).

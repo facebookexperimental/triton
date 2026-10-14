@@ -492,6 +492,14 @@ void mlir::triton::tlx::setClusterSyncKernelInitOnMod(Operation *op,
                   BoolAttr::get(module->getContext(), value));
 }
 
+bool mlir::triton::tlx::isClusterSyncBootstrap(Operation *op) {
+  return op->hasAttrOfType<UnitAttr>(AttrClusterSyncBootstrapName);
+}
+
+void mlir::triton::tlx::setClusterSyncBootstrap(Operation *op) {
+  op->setAttr(AttrClusterSyncBootstrapName, UnitAttr::get(op->getContext()));
+}
+
 bool mlir::triton::tlx::hasClusterSyncKernelCleanup(Operation *op) {
   assert(op != nullptr &&
          "expecting nonnull op for checking cluster sync kernel cleanup");
