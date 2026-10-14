@@ -83,6 +83,71 @@ two would route ordinary completion to the pair leader while computing its
 expected byte count with per-CTA semantics. `optimizeTMALoads` asserts this
 invariant before materializing the shared barrier.
 
+### 2-CTA Cooperative Loads and `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS`
+
+**Files**: `Transform2CTALoads.cpp` (marking), `WSLowerMem.cpp`
+(`optimizeTMALoads`, lowering), `LoadStoreOpToLLVM.cpp` (PTX)
+
+In a 2-CTA kernel (`ctas_per_cga=(2,1,1)`, MMAs with `two_ctas`), each CTA
+issues its own TMA copies into its own SMEM: its A tile, and its half of B
+after `Transform2CTALoads` halves the B descriptor. What differs between the
+two protocols below is only how copy completion is tracked. Data destinations
+and coordinates are the same in both.
+
+**Marking.** At the end of `Transform2CTALoads::runOnOperation`, the pass
+adds the `two_cta_load` unit attribute (`ttng::AttrTwoCTALoadName`) to every
+`tt.descriptor_load` whose result is rank 2. This happens only when all of the
+following hold:
+
+- The module is a physical cluster.
+- The module is not a TLX kernel.
+- The module contains at least one MMAv5 op with `two_ctas`.
+
+The marking is module-wide. It covers every rank-2 tile load, including A
+operands and rank-2 epilogue loads, not only the B operand. Rank-1 loads stay
+unmarked.
+
+**Lowering.** `optimizeTMALoads` reads the attribute per barrier group:
+
+| | Per-CTA (unmarked) | Cooperative (`two_cta_load`) |
+|---|---|---|
+| Completion barrier | The CTA's own ready barrier | The pair leader's ready barrier (`mapBarrierTo2CTALeader`; leader = even cluster rank) |
+| `BarrierExpectOp` | Every CTA expects its own bytes | Only the leader expects, and it expects `2 ×` the summed `txCount` |
+| TMA copy | `AsyncTMACopyGlobalToLocalOp` | Same op with `twoCta` set: `cp.async.bulk.tensor ... .shared::cluster ... .cta_group::2` |
+| Consumer wait | One `WaitBarrierOp` per consumer task | Leader waits. It then relays to the follower with `FenceAsyncSharedOp` plus an `ArriveBarrierOp` on the follower's barrier (`mapBarrierTo2CTAPeer`), and the follower waits on its own barrier. |
+
+The relay uses a remote arrive rather than a cluster barrier because only the
+consuming partition takes part in the handoff.
+
+**The knob.** If `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` is set,
+`Transform2CTALoads` skips the marking step entirely, so every load in the
+module takes the per-CTA column. The B-halving transform itself still runs.
+
+| Property | Behavior |
+|---|---|
+| How it is set | Process environment variable, read with `triton::tools::getBoolEnv`. |
+| Legal values | `1`, `true`, or `on` (case-insensitive) disable cooperative loads. Any other value, or unset, leaves them enabled. |
+| Default | Unset: cooperative loads are on for every 2-CTA module. |
+| Granularity | Whole module. There is no per-load or per-config control. |
+| Cache key | Listed in `CACHE_INVALIDATING_ENV_VARS` (`include/triton/Tools/Sys/GetEnv.h`). |
+| Resources | No SMEM, TMEM, warp, or barrier-count change. The cooperative path adds the leader-to-follower relay instructions (fence, remote arrive, extra wait) in each consumer partition. |
+
+The code comment in `Transform2CTALoads` describes cooperative marking as a
+performance choice, not a correctness requirement: both protocols wait for all
+bytes the consumer reads. The cross-CTA MMA rendezvous that `Insert2CTASync`
+inserts does not read the attribute, so it is the same in both modes.
+
+Fallbacks and failure modes:
+
+- Only the Meta WS lowering (`optimizeTMALoads`) reads `two_cta_load`. If a
+  load does not go through that path, the attribute has no effect, and setting
+  or clearing the variable changes nothing for that load.
+- A barrier group that mixes marked and unmarked loads is a compile error
+  (`TMA barrier fusion cannot mix cooperative and per-CTA loads`). It is never
+  silently miscounted. A group can mix only when a rank-1 load is fused with
+  rank-2 loads. With the variable set nothing is marked, so this error cannot
+  occur.
+
 ### Where It's Called
 
 `optimizeTMALoads` is called from `insertAsyncComm` in `WSCodePartition.cpp`
