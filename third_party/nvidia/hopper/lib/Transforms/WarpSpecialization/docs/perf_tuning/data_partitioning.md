@@ -32,26 +32,17 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 ## Mechanism
 
 **What it changes.**
-- **The accumulator is split into dp slices,** along M when `BLOCK_M/dp` >= 64 and the slice keeps the TMEM `blockM`. If an M split is tried and skipped (it would change `blockM`), partitioning is dropped without trying N; an N split (`BLOCK_N/dp` >= 128) is tried only when no M split was attempted. Each slice gets its own MMA and its own consumer (epilogue/computation) group, and the operand loads that feed the split dimension are sliced too ([DataPartition.md, "Algorithm"](../DataPartition.md#algorithm)).
-- In practice the useful case is `BLOCK_M=256`, dp=2: two 128-row groups.
-- **DP0 runs before DP1.** After slicing, the pass rebuilds straight-line blocks so the whole DP0 chain precedes DP1 (`WS/WSDataPartition.cpp`, `serializeDataPartitionedOps`).
+- **The accumulator is split into dp slices,** along M when `BLOCK_M/dp` >= 64 and the slice keeps the TMEM `blockM`; along N (`BLOCK_N/dp` >= 128) only when no M split was attempted (an M split skipped because it would change `blockM` drops partitioning without trying N). Each slice gets its own MMA and consumer (epilogue/computation) group; operand loads feeding the split dimension are sliced too ([DataPartition.md, "Algorithm"](../DataPartition.md#algorithm)). At `BLOCK_M=256`, dp=2 gives two 128-row groups.
+- **DP0 runs before DP1:** the pass rebuilds straight-line blocks so the whole DP0 chain precedes DP1 (`WS/WSDataPartition.cpp`, `serializeDataPartitionedOps`).
 
 **What it relieves.**
-- Each consumer group handles `BLOCK_M/dp` rows, so the per-thread epilogue live set (TMEM → registers → SMEM) shrinks by dp at a fixed `num_warps`.
-- A 256-row tile can be expressed without 2-CTA and without one 256-row epilogue.
+- Each consumer group handles `BLOCK_M/dp` rows, so the per-thread epilogue live set (TMEM → registers → SMEM) shrinks by dp at fixed `num_warps`.
+- A 256-row tile without 2-CTA and without one 256-row epilogue.
 
 **What it costs.**
-- **TMEM is the same as the undivided tile:** `dp · (BLOCK_M/dp) · BLOCK_N` fp32, i.e. `2·BLOCK_N` columns at `BLOCK_M=256`. The planner raises accumulator copies round-robin only while the total stays within 512 columns (`WS/WSMemoryPlanner.cpp`, the TMEM `buffer.copy` post-processing with `tmemColLimit`). At `BLOCK_N=256` that leaves one accumulator copy, so the epilogue of tile i cannot overlap the MMAs of tile i+1.
-- **Extra consumer groups:** one per slice. In the GEMM layouts both sit in the default region.
-- **With `disallow_acc_multi_buffer`,** every TMA-fed SMEM operand of the MMA is floored at the full `num_stages` (`WS/WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor`). When that floor does not fit, the planner gives it back one copy at a time (`relaxCopySafetyFloorToBudget`). The floor matters: a relaxed floor with a TMA-loaded epilogue input hangs once a CTA runs several tiles (reproduced; [hazards.md](hazards.md#relaxed-operand-copy-floor-with-a-tma-loaded-epilogue-input-several-tiles-per-cta)).
-
-## When to try it (depends on the problem)
-
-`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
-
-- **IF** `BLOCK_M=256`, dp=2, **THEN** skip `BLOCK_N=256` and keep `BLOCK_N=128`, **BECAUSE** 256x256 leaves one accumulator copy (`floor(512 / (BLOCK_N * ceil(BLOCK_M/128)))`), so the epilogue of tile i cannot overlap the MMAs of tile i+1; the gap grows with K. [measured: --regime dp_k, loses on every shape in the regime]
-- **IF** `BLOCK_M=256` 1-CTA, **THEN** skip dp=1, **BECAUSE** dp=1 puts all 256 rows in one epilogue live set. [measured: --regime dp, loses on every shape in the regime]
-- **IF** 2-CTA is legal for the kernel, **THEN** skip 1-CTA `BLOCK_M=256` (dp=1 and dp=2) in favour of 2-CTA 128-row tiles, **BECAUSE** 2-CTA halves the B fill per CTA without a 256-row epilogue. [measured: --regime dp, loses on every shape in the regime]
+- **TMEM same as the undivided tile:** `dp · (BLOCK_M/dp) · BLOCK_N` fp32, i.e. `2·BLOCK_N` columns at `BLOCK_M=256`. Accumulator copies are raised round-robin only within 512 columns (`WS/WSMemoryPlanner.cpp`, the TMEM `buffer.copy` post-processing with `tmemColLimit`); at `BLOCK_N=256` that leaves one copy, so tile i's epilogue cannot overlap tile i+1's MMAs.
+- **One extra consumer group per slice;** in the GEMM layouts both sit in the default region.
+- **With `disallow_acc_multi_buffer`,** every TMA-fed SMEM operand of the MMA is floored at the full `num_stages` (`WS/WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor`), given back one copy at a time when it does not fit (`relaxCopySafetyFloorToBudget`); a relaxed floor with a TMA-loaded epilogue input hangs once a CTA runs several tiles (reproduced; [hazards.md](hazards.md#relaxed-operand-copy-floor-with-a-tma-loaded-epilogue-input-several-tiles-per-cta)).
 
 ## Interactions
 
