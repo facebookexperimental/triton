@@ -23,6 +23,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 | `BLOCK_M=64`, dp=2, `BLOCK_N` < 256 | compile error | No M slice >= 64 and no N slice >= 128 exists, so `computePartitionScheme` fails and the pass signals failure | `WS/WSDataPartition.cpp`, `computePartitionScheme`, `doDataPartition` |
 | different `data_partition_factor` on two annotated loops of one function | silently ignored | Release builds keep the last loop's value. The check is an assert ("data partition factor mismatch") | `WS/WSDataPartition.cpp`, `NVGPUWSDataPartitionPass::runOnFuncOp` |
 | a host `TensorDescType` kernel argument passed as a loop init arg | compile error | The descriptor slicing does not update loop iter-arg types; `doDataPartition` bails ("used as loop init arg; not supported yet") | `WS/WSDataPartition.cpp`, `doDataPartition` |
+| dp > 1 with a TMA-loaded epilogue input, a `num_stages` whose full operand ring does not fit (the copy-safety floor is relaxed), and several tiles per CTA | hangs (reproduced) | Root cause not yet located. See [hazards.md](hazards.md#relaxed-operand-copy-floor-with-a-tma-loaded-epilogue-input-several-tiles-per-cta) | `WS/WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor`, `relaxCopySafetyFloorToBudget` |
 | MMAs that accumulate into one TMEM tile land in dp groups with no common partition | compile error | "warp specialization assigned accumulator-chained MMAs with no common partition"; concurrent accumulating MMAs would race | `WS/PartitionSchedulingMeta.cpp` (accumulator-chain backstop) |
 | the warp estimate (default partition `num_warps` plus each other partition's minimum) exceeds 16 | silently ignored | Warp specialization is dropped for the whole function. "Warp budget exceeded. Skipping warp specialization." (debug log only). Under `two_ctas` this hangs instead (see [2cta.md](2cta.md#never-try-any-problem)). In the GEMM layouts both data-partition halves sit in the default region and the workers are 1 warp each, so dp=2 does not push a GEMM over the cap (`BLOCK_M=256`, dp=2, `num_warps=8` keeps WS with 12 warps) | `WS/PartitionSchedulingMeta.cpp` (`kMaxWarps`); `include/triton/Dialect/TritonNvidiaGPU/IR/Dialect.h`, `getMinWarpsForOp` |
 | total TMEM above 512 columns | requires | Total TMEM must fit 512 columns; otherwise `OutOfResources("tensor memory")` is raised when the kernel is loaded, not at compile time | `python/triton/compiler/compiler.py`, `CompiledKernel._init_handles` (`max_tmem_size`) |
@@ -46,13 +47,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 
 ## When to try it (depends on the problem)
 
-- **IF** `BLOCK_M=128`, **THEN** skip dp=2, **BECAUSE** it compiles to the dp=1 kernel.
-- **IF** `BLOCK_M=64`, **THEN** only try dp=2 with `BLOCK_N=256` (N split), **BECAUSE** every other `BLOCK_N` fails to compile.
-- **IF** `BLOCK_M=256`, **THEN** try dp=1 and dp=2, **BECAUSE** dp=2 is the only way to split a 256-row tile into two 128-row consumer groups without 2-CTA.
-- **IF** dp=2 and `BLOCK_N=256`, **THEN** prefer configs whose epilogue does not depend on cross-tile overlap, or keep a dp=1 / smaller-`BLOCK_N` candidate, **BECAUSE** TMEM holds only one accumulator copy.
-- **IF** dp > 1 and the epilogue has a TMA-loaded input, **THEN** only try `num_stages` whose full operand ring fits the SMEM budget (this removes the rest), **BECAUSE** a relaxed copy-safety floor hangs once a CTA runs several tiles (reproduced).
-- **IF** dp=1, **THEN** skip `disallow_acc_multi_buffer=True` (this removes it), **BECAUSE** it is a duplicate config of `False`.
-- **IF** a kernel has more than one annotated loop, **THEN** use one `data_partition_factor` for all of them, **BECAUSE** mismatches are not diagnosed in release builds.
+- IF `BLOCK_M=256` and `BLOCK_N=256`, THEN also keep a `BLOCK_N=128` candidate, BECAUSE accumulator copies are `floor(512 / (BLOCK_N * ceil(BLOCK_M/128)))`: 1 at 256x256 (epilogue of tile i cannot overlap the MMAs of tile i+1), 2 at 256x128. [mechanism] (TMEM `buffer.copy` post-processing, `tmemColLimit`)
 
 ## Interactions
 
