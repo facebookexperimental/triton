@@ -60,6 +60,25 @@ Reported but not located in code, so not in [hazards.md](hazards.md). Each needs
 | Two K steps per loop body over a shared operand | todo | **Trigger:** two TMA loads of the same operand and two MMAs per loop body, with a deferred reduction. **Symptom:** sparse, large corruption at larger shapes. |
 | Data partitioning with generated subtiled regions and a subtiled scale | todo | **Trigger:** `data_partition_factor=2`, `generate_subtiled_region` on, and a per-subtile scale in the epilogue. **Symptom:** a hang. |
 
+## Measured hypotheses pending (autows_gemm.py campaign)
+
+Each row becomes a [measured] rule in its file when the benchmark verdict for its family arrives (`python/test/microbenchmark/autows_gemm.py`): a confirmed threshold becomes skip/only try, a moved threshold becomes prefer, an unsupported one is dropped.
+
+| Family | Lands in | Hypothesis | State |
+|--------|----------|------------|-------|
+| H-RIDGE | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | Calibrate ridge in: **IF** `AI_min >= ridge`, **THEN** prefer tiles in decreasing `I_t = BM*BN/(BM + BN')` (`BN' = BN/2` under 2-CTA): 2-CTA 128x256 and 1-CTA 256x256 dp=2 (128) > 128x256, 256x128, 2-CTA 128x128 (85) > 128x128 (64) > 64x256 (51) > 64x128 (43), **BECAUSE** operand SMEM fill per FLOP is `1/I_t` (slot sizes in "Mechanism"). | todo |
+| H-TILE | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | **IF** `AI_min >= ridge`, `W(128x256) >= 4` and `E_tail(128x256) >= 0.85`, **THEN** skip tiles with `I_t < 64`. | todo |
+| H-TILE | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | **IF** `AI_min >= ridge` and a tile with `I_t >= 64` already gives `T >= P`, **THEN** skip tiles with `I_t < 43` (BN <= 32, or BM=64 with BN <= 128), **BECAUSE** every SM is busy, so smaller tiles only add operand bytes per FLOP. | todo |
+| H-TILE | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | Calibrate 0.8 in: **IF** a tile has `E_tail < 0.8`, **THEN** also try the legal tile with the smallest `S_prog = ceil(T/P)*BM*BN`, **BECAUSE** the busiest program sets the time under static persistence (1152x12800: 128x256 `E_tail` 0.76, `S_prog` 128k; 128x128 112k). | todo |
+| H-MTAIL | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | Calibrate 0.15 in: **IF** `w(BM=128) >= 0.15` and `w(BM=64) < w(BM=128)` (M=192: 0.25 vs 0; M=320: 0.17 vs 0), **THEN** try BM=64, **BECAUSE** padded M rows cost full MMA work. | todo |
+| H-MTAIL | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | **IF** `w(BM=128) < 0.05` and `T(BM=128) >= P`, **THEN** skip BM=64. | todo |
+| H-BK | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | **IF** `k_iters(BK=128) >= 4` and `d_fit(BK=128) >= 3`, **THEN** skip BK <= 64 at that BM/BN. | todo |
+| H-BK | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | **IF** `k_iters(BK=64) >= 4`, **THEN** skip BK in {16, 32}, **BECAUSE** each K step pays a fixed barrier round trip and MMA issue that a larger BK amortizes. | todo |
+| H-STAGES | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | Calibrate skip in: **IF** `k_iters >= 2` or `T > P`, **THEN** prefer `num_stages >= 2`, **BECAUSE** one slot serializes load(k+1) behind MMA(k)'s release. | todo |
+| H-STAGES | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | **IF** `k_iters >= 8`, **THEN** only try `num_stages` in {`d_fit`, `d_fit - 1`}. | todo |
+| H-STAGES | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | **IF** `k_iters <= 2` and `T > P`, **THEN** only try `num_stages` in {2, `d_fit`}, **BECAUSE** the persistent producer runs ahead across tiles. | todo |
+| H-STG | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | Calibrate whether it ever wins in: **IF** a deeper operand ring is wanted at a fixed tile, **THEN** free staging first: `c` fewer staging copies free `c*BM*(BN/ES)*out_bytes`, which buys `floor(that / slot_bytes)` operand levels (worked example in [resources.md](resources.md#worked-example-bf16-in-and-out-fp32-accumulator-1-cta)). | todo |
+
 ## Fixes to existing docs
 
 | Doc | State | Note |
@@ -73,8 +92,8 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 
 | Knob | Rules in | State |
 |------|----------|-------|
-| `BLOCK_M` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
-| `BLOCK_N` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
+| `BLOCK_M` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
+| `BLOCK_N` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `BLOCK_K` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `num_stages` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `num_stages` (per loop) | — | mentioned |
@@ -103,12 +122,12 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `generate_subtiled_region` | — | todo |
 | `early_tma_store_lowering` | — | todo |
 | `tma_store_pipelining` | — | todo |
-| `TRITON_WS_STAGING_COPIES` | [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | covered |
+| `TRITON_WS_STAGING_COPIES` | — | mentioned |
 | `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | — | todo |
 | `num_warps` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `maxnreg` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `maxnreg` | — | mentioned |
 | `sched4reg`, `enable_tree_reduction` | — | todo |
 | `tmem_alloc_algo` | — | todo |
 | `smem_alloc_algo` | — | todo |
@@ -128,3 +147,4 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 |------|-------|------|
 | Inductor reference definition | todo | Definition pending. Until then `knobs.md` has no column for what Inductor sets. |
 | Leaves outside AutoWS | todo | cuBLAS or non-WS leaves; later. |
+| Multicast rules once lowering lands | todo | `multicast.md` has no when-to-try rules while multicast is inert; re-derive them from the planner conditions when the lowering is implemented. |
