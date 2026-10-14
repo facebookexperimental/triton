@@ -38,8 +38,9 @@ Code paths are relative to the repository root.
 
 ## When to try it (depends on the problem)
 
-- **IF** tuning an autoWS GEMM in this tree, **THEN** skip `multicast=True` and any cluster shape chosen only to enable multicast, **BECAUSE** the generated code is identical to `multicast=False` (duplicate config).
-- **IF** multicast lowering lands later, **THEN** re-derive these rules from the planner conditions above, **BECAUSE** a static persistent loop bounded by `program_id(0)` would still be rejected under an x-dimension cluster.
+None: compiler-directed multicast produces the same kernel as `multicast=False` on every problem in this tree (see "Never try (any problem)").
+
+No rules yet; the pending hypotheses for this file are listed in [TRACKER.md](TRACKER.md#measured-hypotheses-pending-autows_gemmpy-campaign).
 
 ## Interactions
 
