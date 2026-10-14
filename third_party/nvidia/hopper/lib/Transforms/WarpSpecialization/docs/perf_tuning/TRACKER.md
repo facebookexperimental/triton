@@ -24,7 +24,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`data_partitioning.md`](data_partitioning.md) | done | `data_partition_factor`. Open: its "Not yet established" items. |
 | [`clc_persistence.md`](clc_persistence.md) | done | Static persistent vs dynamic and CLC persistent. Open: its "Not yet established" items. |
 | [`tma_loads.md`](tma_loads.md) | done | TMA vs pointer operand loads. Open: its "Not yet established" items. |
-| `tma_stores.md` | todo | TMA vs pointer output stores. |
+| [`tma_stores.md`](tma_stores.md) | done | TMA vs pointer output stores. Open: its "Not yet established" items. |
 | `large_k.md` | todo | K iterations far above `num_stages`, including split-K style K splitting. |
 | `pingpong.md` | todo | Ping-pong scheduling. |
 | `multicast.md` | todo | TMA multicast. |
