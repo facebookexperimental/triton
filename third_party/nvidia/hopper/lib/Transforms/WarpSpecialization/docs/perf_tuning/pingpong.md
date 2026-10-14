@@ -49,8 +49,8 @@ Every condition below leaves the kernel unchanged with no diagnostic (debug log 
 
 - **IF** the kernel is a GEMM/addmm with no SFU math in the epilogue, **THEN** skip `pingpongAutoWS=True`, **BECAUSE** no region forms and it is a duplicate config.
 - **IF** `data_partition_factor` is 1, **THEN** skip `pingpongAutoWS=True`, **BECAUSE** a GEMM has no second consumer partition to alternate with.
-- **IF** the tile schedule is CLC or dynamic (outer `scf.while`), **THEN** skip `pingpongAutoWS=True`, **BECAUSE** the epilogue has no enclosing `scf.for`.
-- **IF** dp=2 and the epilogue applies SFU math (`exp`, `tanh`, `rsqrt`, ...) to 2-D tiles under a static persistent schedule, **THEN** try `pingpongAutoWS` on and off, **BECAUSE** it only trades SFU contention against serialization.
+- **IF** the tile schedule is CLC or dynamic (outer `scf.while`) and the SFU math is in the epilogue, **THEN** skip `pingpongAutoWS=True` (this removes it), **BECAUSE** the epilogue has no enclosing `scf.for`. SFU math inside the K loop can still form a region.
+- **IF** dp=2 and the epilogue applies SFU math (`exp`, `tanh`, `rsqrt`, ...) to 2-D tiles under a static persistent schedule, **THEN** try `pingpongAutoWS` on and off (this keeps both), **BECAUSE** it only trades SFU contention against serialization.
 
 ## Interactions
 

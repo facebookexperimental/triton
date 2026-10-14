@@ -24,13 +24,14 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 | different `data_partition_factor` on two annotated loops of one function | silently ignored | Release builds keep the last loop's value. The check is an assert ("data partition factor mismatch") | `WS/WSDataPartition.cpp`, `NVGPUWSDataPartitionPass::runOnFuncOp` |
 | a host `TensorDescType` kernel argument passed as a loop init arg | compile error | The descriptor slicing does not update loop iter-arg types; `doDataPartition` bails ("used as loop init arg; not supported yet") | `WS/WSDataPartition.cpp`, `doDataPartition` |
 | MMAs that accumulate into one TMEM tile land in dp groups with no common partition | compile error | "warp specialization assigned accumulator-chained MMAs with no common partition"; concurrent accumulating MMAs would race | `WS/PartitionSchedulingMeta.cpp` (accumulator-chain backstop) |
-| the warp estimate (default partition `num_warps` plus each other partition's minimum) exceeds 16 | silently ignored | Warp specialization is dropped for the whole function. "Warp budget exceeded. Skipping warp specialization." (debug log only). Every dp group is an extra partition, and a partition holding TMEM ops needs at least 4 warps | `WS/PartitionSchedulingMeta.cpp` (`kMaxWarps`); `include/triton/Dialect/TritonNvidiaGPU/IR/Dialect.h`, `getMinWarpsForOp` |
-| total TMEM above 512 columns | compile error | `OutOfResources` ("tensor memory"), raised after compilation so the autotuner can drop the config | `python/triton/compiler/compiler.py` (`max_tmem_size`) |
+| the warp estimate (default partition `num_warps` plus each other partition's minimum) exceeds 16 | silently ignored | Warp specialization is dropped for the whole function. "Warp budget exceeded. Skipping warp specialization." (debug log only). Under `two_ctas` this hangs instead (see [2cta.md](2cta.md#never-try-any-problem)). In the GEMM layouts both data-partition halves sit in the default region and the workers are 1 warp each, so dp=2 does not push a GEMM over the cap (`BLOCK_M=256`, dp=2, `num_warps=8` keeps WS with 12 warps) | `WS/PartitionSchedulingMeta.cpp` (`kMaxWarps`); `include/triton/Dialect/TritonNvidiaGPU/IR/Dialect.h`, `getMinWarpsForOp` |
+| total TMEM above 512 columns | requires | Total TMEM must fit 512 columns; otherwise `OutOfResources("tensor memory")` is raised when the kernel is loaded, not at compile time | `python/triton/compiler/compiler.py`, `CompiledKernel._init_handles` (`max_tmem_size`) |
+| `disallow_acc_multi_buffer` at dp=1 | duplicate config (reproduced) | Under Meta WS the SMEM planner reads the attribute only when `data_partition_factor` > 1; the TTGIR is identical apart from the attribute | `WS/WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor` |
 
 ## Mechanism
 
 **What it changes.**
-- **The accumulator is split into dp slices,** along M when `BLOCK_M/dp` >= 64 and the slice keeps the TMEM `blockM`, otherwise along N when `BLOCK_N/dp` >= 128. Each slice gets its own MMA and its own consumer (epilogue/computation) group, and the operand loads that feed the split dimension are sliced too ([DataPartition.md, "Algorithm"](../DataPartition.md#algorithm)).
+- **The accumulator is split into dp slices,** along M when `BLOCK_M/dp` >= 64 and the slice keeps the TMEM `blockM`. If an M split is tried and skipped (it would change `blockM`), partitioning is dropped without trying N; an N split (`BLOCK_N/dp` >= 128) is tried only when no M split was attempted. Each slice gets its own MMA and its own consumer (epilogue/computation) group, and the operand loads that feed the split dimension are sliced too ([DataPartition.md, "Algorithm"](../DataPartition.md#algorithm)).
 - In practice the useful case is `BLOCK_M=256`, dp=2: two 128-row groups.
 - **DP0 runs before DP1.** After slicing, the pass rebuilds straight-line blocks so the whole DP0 chain precedes DP1 (`WS/WSDataPartition.cpp`, `serializeDataPartitionedOps`).
 
@@ -40,8 +41,8 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 
 **What it costs.**
 - **TMEM is the same as the undivided tile:** `dp · (BLOCK_M/dp) · BLOCK_N` fp32, i.e. `2·BLOCK_N` columns at `BLOCK_M=256`. The planner raises accumulator copies round-robin only while the total stays within 512 columns (`WS/WSMemoryPlanner.cpp`, the TMEM `buffer.copy` post-processing with `tmemColLimit`). At `BLOCK_N=256` that leaves one accumulator copy, so the epilogue of tile i cannot overlap the MMAs of tile i+1.
-- **Extra partitions:** one consumer group per slice, each counted in the 16-warp estimate.
-- **With `disallow_acc_multi_buffer`,** every TMA-fed SMEM operand of the MMA is floored at the full `num_stages` (`WS/WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor`). The planner can then no longer trade operand depth for fit.
+- **Extra consumer groups:** one per slice. In the GEMM layouts both sit in the default region.
+- **With `disallow_acc_multi_buffer`,** every TMA-fed SMEM operand of the MMA is floored at the full `num_stages` (`WS/WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor`). When that floor does not fit, the planner gives it back one copy at a time (`relaxCopySafetyFloorToBudget`), so the effect is a preference for full operand depth, not a hard floor.
 
 ## When to try it (depends on the problem)
 
@@ -49,15 +50,15 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 - **IF** `BLOCK_M=64`, **THEN** only try dp=2 with `BLOCK_N=256` (N split), **BECAUSE** every other `BLOCK_N` fails to compile.
 - **IF** `BLOCK_M=256`, **THEN** try dp=1 and dp=2, **BECAUSE** dp=2 is the only way to split a 256-row tile into two 128-row consumer groups without 2-CTA.
 - **IF** dp=2 and `BLOCK_N=256`, **THEN** prefer configs whose epilogue does not depend on cross-tile overlap, or keep a dp=1 / smaller-`BLOCK_N` candidate, **BECAUSE** TMEM holds only one accumulator copy.
-- **IF** dp=2, **THEN** skip `num_warps` values that push the warp estimate past 16, **BECAUSE** warp specialization is silently dropped.
-- **IF** dp > 1 with `disallow_acc_multi_buffer`, **THEN** only try `num_stages` whose full operand ring fits the SMEM budget, **BECAUSE** the planner cannot shrink the operand depth below `num_stages`.
+- **IF** dp > 1 with `disallow_acc_multi_buffer`, **THEN** prefer (ranks first; removes nothing) `num_stages` whose full operand ring fits the SMEM budget, **BECAUSE** the planner floors operand depth at `num_stages` and only gives the floor back when it does not fit.
+- **IF** dp=1, **THEN** skip `disallow_acc_multi_buffer=True` (this removes it), **BECAUSE** it is a duplicate config of `False`.
 - **IF** a kernel has more than one annotated loop, **THEN** use one `data_partition_factor` for all of them, **BECAUSE** mismatches are not diagnosed in release builds.
 
 ## Interactions
 
 See [interactions.md](interactions.md). Pairs these rules depend on:
 - `data_partition_factor` × `BLOCK_M` / `BLOCK_N`
-- `data_partition_factor` × `num_warps` (16-warp estimate)
+- `data_partition_factor` × `num_warps` (both halves in the default region)
 - `data_partition_factor` × `disallow_acc_multi_buffer`
 - `data_partition_factor` × accumulator copies (TMEM)
 - `data_partition_factor` × `EPILOGUE_SUBTILE` / `generate_subtiled_region`
