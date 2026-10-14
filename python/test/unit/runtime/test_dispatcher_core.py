@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 from triton import knobs
-from triton._internal_testing import is_cuda
+from triton._internal_testing import is_cuda, is_hopper_or_newer
 
 
 @contextlib.contextmanager
@@ -71,7 +71,7 @@ def test_dispatcher_core_add_numerics():
     torch.testing.assert_close(out, x + y)
 
 
-@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Concurrency sanitizer requires Hopper or newer")
 def test_dispatcher_core_uses_default_profile_allocator(fresh_knobs):
     from triton.runtime import _allocation
 
