@@ -27,20 +27,14 @@ Code paths are relative to the repository root.
 ## Mechanism
 
 **What the planner would select.** It plans only when all of these hold (`TMAMulticast.cpp`, `analyzeTMAMulticast`, `TMAClusterGeometry::get`):
-- the load is a tiled `tt.descriptor_load` in a single-block kernel;
-- the cluster dimensions are powers of two, with 2 to 16 CTAs in total;
-- the load's indices and descriptor are provably the same along a cluster axis;
-- no enclosing `for`/`while`/`if` control value depends on a cluster axis of size > 1. A static persistent loop starting at `program_id(0)` under a `(2,1,1)` cluster fails this check. Only the validity bit of a CLC result counts as cluster-uniform; its tile coordinates do not (`ProgramIdDependencyAnalysis`).
+- a tiled `tt.descriptor_load` in a single-block kernel;
+- power-of-two cluster dimensions, 2 to 16 CTAs in total;
+- the load's indices and descriptor provably the same along a cluster axis;
+- no enclosing `for`/`while`/`if` control value depending on a cluster axis of size > 1. A static persistent loop starting at `program_id(0)` under a `(2,1,1)` cluster fails this; only a CLC result's validity bit counts as cluster-uniform, not its tile coordinates (`ProgramIdDependencyAnalysis`).
 
-**What multicast would relieve.** L2-to-SM traffic for an A or B tile that several CTAs of a cluster load. One elected CTA issues the copy and every recipient's barrier completes.
+**What multicast would relieve.** L2-to-SM traffic for an A or B tile that several CTAs of a cluster load: one elected CTA issues the copy and every recipient's barrier completes.
 
 **What it would cost.** A cluster launch, cluster-wide barriers around each multicast transaction, and a schedule that keeps the loads cluster-uniform.
-
-## When to try it (depends on the problem)
-
-None: compiler-directed multicast produces the same kernel as `multicast=False` on every problem in this tree (see "Never try (any problem)").
-
-No rules yet; the pending hypotheses for this file are listed in [TRACKER.md](TRACKER.md#measured-hypotheses-pending-autows_gemmpy-campaign).
 
 ## Interactions
 

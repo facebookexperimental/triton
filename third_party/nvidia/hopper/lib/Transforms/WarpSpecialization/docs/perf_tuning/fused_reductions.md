@@ -30,30 +30,21 @@ Epilogue side inputs are covered in [epilogue_prologue_tma_loads.md](epilogue_pr
 ## Mechanism
 
 **Cross-lane reductions: fp32 max/min are one instruction, fp32 sum is a shuffle tree.**
-- **What changes:** on sm_100-family targets, a reduction across all 32 lanes of a warp with an fp32 max or min combiner lowers to a single `redux.sync`. fp32 add has no `redux` form (`redux` add is integer-only, up to 32 bits), so it lowers to a log2(32) = 5-step shuffle tree. Partial-lane reductions always use shuffles.
-- **What it costs:** an fp32 sum across lanes costs about 5x the cross-lane instructions of an fp32 max.
-- Accumulator rows map to threads in the TMEM register layout. So a reduction over N (a row statistic) is mostly within a thread, while a reduction over M (a column statistic) crosses lanes and warps.
+- **What changes:** on sm_100-family targets, a full 32-lane warp reduction with an fp32 max or min combiner lowers to one `redux.sync`. fp32 add has no `redux` form (`redux` add is integer-only, up to 32 bits), so it lowers to a log2(32) = 5-step shuffle tree. Partial-lane reductions always use shuffles.
+- **What it costs:** an fp32 cross-lane sum costs about 5x the cross-lane instructions of an fp32 max.
+- In the TMEM register layout accumulator rows map to threads, so a reduction over N (row statistic) is mostly within a thread, while one over M (column statistic) crosses lanes and warps.
 - Code: `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.cpp`, `matchReduxKind` and `TargetInfo::warpReduce`.
 
 **Cross-tile reductions must use an op the partition scheduler places.**
-- **What changes:**
-  - A TMA reduce (`DescriptorReduceOp` / `AsyncTMAReduceOp`) is categorized as `TMAReduction`. It is scheduled into a dedicated `reduction` partition, and its completion wait stays in the same partition as the reduce.
-  - A pointer `tl.atomic_*` gets no such category. If its operands do not depend on the accumulator, it is unreached and dropped (reproduced). If it is replicated to several partitions, the code strips WS (not reproduced in testing).
+- **What changes:** a TMA reduce (`DescriptorReduceOp` / `AsyncTMAReduceOp`) is categorized as `TMAReduction` and scheduled into a dedicated `reduction` partition, with its completion wait in the same partition. A pointer `tl.atomic_*` gets no category (dropped or WS stripped; see "Never try (any problem)").
 - **What it relieves:** the cross-tile accumulation is issued asynchronously from the reduction partition.
-- **What it costs:**
-  - one more partition;
-  - a TMA-reduce staging ring, sized by `TRITON_WS_TMA_REDUCE_STAGING_COPIES` (default: min(`num_stages`, `TRITON_WS_STAGING_COPIES`)).
+- **What it costs:** one more partition, and a TMA-reduce staging ring sized by `TRITON_WS_TMA_REDUCE_STAGING_COPIES` (default: min(`num_stages`, `TRITON_WS_STAGING_COPIES`)).
 - Code: `PartitionSchedulingMeta.cpp`, `categorizeTMAReductions`, `isReduceTokenWait` and `createPartitionLayout`; `WSMemoryPlanner.cpp`, `getTmaReduceStagingCopies`.
 
 **Per-subtile reductions read each subtile twice.**
-- **What changes:** with `EPILOGUE_SUBTILE >= 2`, a reduction placed next to the stored output reads each accumulator subtile from TMEM once for the store and once for the reduction. `InterleaveTMem` sinks each read to its first use, and keeps the accumulator wait and arrive around both reads by bounding barrier moves with the pre-reorder block order (`buildOriginalBlockOrder`).
+- **What changes:** with `EPILOGUE_SUBTILE >= 2`, a reduction next to the stored output reads each accumulator subtile from TMEM once for the store and once for the reduction. `InterleaveTMem` sinks each read to its first use and keeps the accumulator wait and arrive around both reads by bounding barrier moves with the pre-reorder block order (`buildOriginalBlockOrder`).
 - **What it costs:** two TMEM reads per subtile.
 - Code: `InterleaveTMem.cpp`, `processBlock`, `buildOriginalBlockOrder`; [TMEMInterleave.md](../TMEMInterleave.md), section "Load Sinking"; [BarrierConstraints.md](../BarrierConstraints.md), section "Barrier Reordering".
-
-## When to try it (depends on the problem)
-
-- IF a fused fp32 reduction is over M (a column statistic) on sm_100 and the math allows max/min, THEN prefer the max/min form, BECAUSE a 32-lane fp32 max/min is one `redux.sync` while fp32 add is a 5-step shuffle tree (`matchReduxKind`, `TargetInfo::warpReduce`). [mechanism]
-- IF a reduced statistic is needed over the full K sum (e.g. a row norm of the GEMM output), THEN skip split-K ([split_k.md](split_k.md#when-to-try-it-depends-on-the-problem)), BECAUSE the statistic is nonlinear in the partials. [mechanism]
 
 ## Interactions
 
