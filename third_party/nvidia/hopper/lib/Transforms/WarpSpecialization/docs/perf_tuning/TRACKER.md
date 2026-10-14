@@ -26,7 +26,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`clc_persistence.md`](clc_persistence.md) | done | Static persistent vs dynamic and CLC persistent. Open: its "Not yet established" items. |
 | [`tma_loads.md`](tma_loads.md) | done | TMA vs pointer operand loads. Open: its "Not yet established" items. |
 | [`tma_stores.md`](tma_stores.md) | done | TMA vs pointer output stores. Open: its "Not yet established" items. |
-| `split_k.md` | todo | Splitting one output tile's K reduction (split-K, decomposeK, stream-K) and the single-K-tile path. |
+| [`split_k.md`](split_k.md) | done | Splitting one output tile's K reduction (split-K, decomposeK, stream-K) and the single-K-tile path. Open: its "Not yet established" items. |
 | `pingpong.md` | todo | Ping-pong scheduling. |
 | `multicast.md` | todo | TMA multicast. |
 | `epilogue_prologue_tma_loads.md` | todo | TMA loads of extra epilogue/prologue inputs. |
@@ -99,6 +99,9 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 | H-SCHED | [clc_persistence.md § When to try it](clc_persistence.md#when-to-try-it-depends-on-the-problem) | IF tiles are uniform (dense mm/addmm/bmm) and `T > P`, THEN skip CLC. | todo |
 | H-SCHED | [clc_persistence.md § When to try it](clc_persistence.md#when-to-try-it-depends-on-the-problem) | IF `T > P`, THEN pin `GROUP_M=8`. | todo |
 | H-SES | [tma_stores.md § When to try it](tma_stores.md#when-to-try-it-depends-on-the-problem) | IF the epilogue is a TMA store on a 1-CTA kernel, THEN prefer `separate_epilogue_store=True`; IF `two_ctas=True`, THEN pin it at the default (flat). | todo |
+| H-SPLITK | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | IF `T <= P/4` and `k_iters >= 32`, THEN split-K wins; IF `T >= P/2`, THEN skip split-K. | todo |
+| H-SPLITK, H-RIDGE | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | the fraction of SMs that saturates HBM is | todo |
+| H-RIDGE | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | IF `AI_min < ridge`, THEN the problem is memory bound, with `ridge` the AI at which the best autoWS arm and cuBLAS stop improving with K. | todo |
 
 ## Fixes to existing docs
 
@@ -127,10 +130,10 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `merge_epilogue` | — | mentioned |
 | `merge_epilogue_to_computation`, `merge_correction` | — | mentioned |
 | `pingpongAutoWS` | [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
-| `multi_cta` | — | todo |
+| `multi_cta` | [split_k.md](split_k.md#never-try-any-problem) | covered |
 | `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem); [tma_stores.md](tma_stores.md#never-try-any-problem) | covered |
 | `allowDependentTwoCTA` | [2cta.md](2cta.md#never-try-any-problem) | covered |
-| `ctas_per_cga` | [2cta.md](2cta.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
+| `ctas_per_cga` | [2cta.md](2cta.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem); [split_k.md](split_k.md#never-try-any-problem) | covered |
 | Tile scheduler | [2cta.md](2cta.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
 | `clc` | [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
 | `tt.autows` stage/order | — | todo |
