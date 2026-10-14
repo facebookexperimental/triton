@@ -115,7 +115,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 | staging copies × separate store partition | works | Any count up to the cap. Cross-partition staging rotates on a continuous mbarrier counter | same |
 | `TRITON_WS_STAGING_COPIES` × `num_stages` | duplicate config | Above `num_stages`: the bump target is min(`num_stages`, cap); only `TRITON_WS_TMA_REDUCE_STAGING_COPIES` may exceed `num_stages` | `WS/WSMemoryPlanner.cpp`, `getStagingCopiesCap`, `getTmaReduceStagingCopies` |
 | `ES` × partition warps | works | An 8-warp epilogue partition can drop to 4: warp halving sizes from the largest single tensor, which shrinks as `ES` grows | `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/OptimizePartitionWarps.cpp`, `optimizePartitionNumWarps` |
-| `ES` >= 2 × epilogue that reads one accumulator slice twice (fused reduction) | wrong answer | On builds whose `InterleaveTMem` does not keep duplicate subtile reads inside the accumulator wait/arrive (no `buildOriginalBlockOrder`). See [hazards.md](hazards.md#accumulator-subtile-read-twice-in-the-epilogue) | `lib/Dialect/TritonNvidiaGPU/Transforms/InterleaveTMem.cpp`, `buildOriginalBlockOrder`, `optimizeWSBarrierLocations` |
+| `ES` >= 2 × epilogue that reads one accumulator slice twice (fused reduction) | works | `InterleaveTMem` keeps both reads of a subtile inside the accumulator wait/arrive: barrier moves are bounded by the pre-reorder block order | `lib/Dialect/TritonNvidiaGPU/Transforms/InterleaveTMem.cpp`, `buildOriginalBlockOrder`, `processBlock` |
 
 ## Not yet established
 
