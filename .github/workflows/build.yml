@@ -74,6 +74,8 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ github.workflow_sha }}
+          # Keep sparse-checkout state out of the full source checkout below.
+          path: .wheel-ci-tooling
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             .github/scripts/wheel_cache.py
@@ -82,8 +84,8 @@ jobs:
       - name: Preserve build tooling outside the source checkout
         run: |
           mkdir -p "${RUNNER_TEMP}/wheel-ci/scripts" "${RUNNER_TEMP}/wheel-ci/workflows"
-          cp .github/scripts/wheel_cache.py "${RUNNER_TEMP}/wheel-ci/scripts/"
-          cp .github/workflows/build.yml "${RUNNER_TEMP}/wheel-ci/workflows/"
+          cp .wheel-ci-tooling/.github/scripts/wheel_cache.py "${RUNNER_TEMP}/wheel-ci/scripts/"
+          cp .wheel-ci-tooling/.github/workflows/build.yml "${RUNNER_TEMP}/wheel-ci/workflows/"
           echo "WHEEL_CACHE_SCRIPT=${RUNNER_TEMP}/wheel-ci/scripts/wheel_cache.py" >> "$GITHUB_ENV"
 
       - name: Checkout

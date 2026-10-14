@@ -233,6 +233,69 @@ def test_cache_identity_uses_workflow_tooling_for_old_source_refs(tmp_path, monk
     assert wheel_cache.build_identity()["recipe"] != before["recipe"]
 
 
+def test_build_source_checkout_after_sparse_tooling(tmp_path, monkeypatch):
+    workflow = yaml.load((ROOT / ".github/workflows/build.yml").read_text(), Loader=yaml.BaseLoader)
+    steps = {step["name"]: step for step in workflow["jobs"]["build"]["steps"]}
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(directory, *args):
+        return subprocess.run(["git", *args], cwd=directory, check=True, text=True, capture_output=True).stdout.strip()
+
+    # A real Git checkout is needed: sparse state persists across action calls.
+    files = {
+        ".github/scripts/wheel_cache.py": "# tooling\n",
+        ".github/workflows/build.yml": "# recipe\n",
+        "cmake/llvm-info.json": '{"llvm_hash": "test"}\n',
+        "cmake/amd-llvm-info.json": '{"llvm_hash": "test-amd"}\n',
+        "python/requirements.txt": "setuptools\n",
+        "pyproject.toml": "[build-system]\n",
+    }
+    for name, content in files.items():
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    git(source, "init", "-q")
+    git(source, "add", ".")
+    git(source, "-c", "user.name=CI test", "-c", "user.email=ci@example.invalid", "-c", "commit.gpgsign=false",
+        "commit", "-qm", "fixture")
+    sha = git(source, "rev-parse", "HEAD")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+    monkeypatch.setenv("GITHUB_ENV", str(runner_temp / "env"))
+
+    def checkout(step):
+        settings = step["with"]
+        directory = workspace / settings.get("path", ".")
+        directory.mkdir(parents=True, exist_ok=True)
+        if not (directory / ".git").exists():
+            git(directory, "init", "-q")
+            git(directory, "remote", "add", "origin", str(source))
+        git(directory, "fetch", "--depth=1", "origin", sha)
+        if "sparse-checkout" in settings:
+            assert settings["sparse-checkout-cone-mode"] == "false"
+            git(directory, "config", "core.sparseCheckout", "true")
+            (directory / ".git/info/sparse-checkout").write_text(settings["sparse-checkout"])
+        else:
+            # actions/checkout@v6 disables sparse checkout, then unsets this
+            # extension. Reusing a non-cone checkout reactivates its old config.
+            git(directory, "sparse-checkout", "disable")
+            git(directory, "config", "--local", "--unset-all", "extensions.worktreeConfig")
+        git(directory, "checkout", "--force", sha)
+
+    checkout(steps["Checkout build tooling"])
+    subprocess.run(["bash", "-e", "-c", steps["Preserve build tooling outside the source checkout"]["run"]],
+                   cwd=workspace, check=True)
+    checkout(steps["Checkout"])
+    for name, content in files.items():
+        assert (workspace / name).read_text() == content
+    assert (runner_temp / "wheel-ci/scripts/wheel_cache.py").read_text() == files[".github/scripts/wheel_cache.py"]
+    assert (runner_temp / "wheel-ci/workflows/build.yml").read_text() == files[".github/workflows/build.yml"]
+
+
 @pytest.mark.parametrize("results,selected,success", [
     ({"select": "success", "build": "skipped", "h100": "skipped"}, False, True),
     ({"select": "success", "build": "failure", "h100": "skipped"}, True, False),
