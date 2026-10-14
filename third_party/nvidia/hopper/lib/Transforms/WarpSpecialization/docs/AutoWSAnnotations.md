@@ -148,11 +148,12 @@ It sees the unrolled one, with these consequences:
   and store. Partition scheduling, channel creation, and the memory planner
   treat each copy as a separate op. Each copied descriptor load is its own
   channel with its own SMEM buffer, multi-buffered against `smemBudget`.
-- **Remainder loop.** The pass removes only `tt.loop_unroll_factor`; the
-  main loop keeps every other attribute, including `tt.warp_specialize`.
-  Whether a remainder loop also inherits them depends on MLIR's
-  `loopUnrollByFactor`, which is not part of this repository. The pass does
-  pin any remainder loop to one pipeline stage.
+- **Remainder loop.** The pass removes only `tt.loop_unroll_factor`. Both the
+  unrolled loop and the remainder loop keep every other attribute, including
+  `tt.warp_specialize`. The pass pins the remainder loop to one pipeline stage.
+- **Persistent WS loops: compile error (reproduced).** `loop_unroll_factor=2`
+  on a persistent warp-specialized loop fails in code partitioning with "SMEM
+  circular reuse group is ill-formed" (`WSCodePartition.cpp`).
 - **Not forwarded.** The attribute is registered as `NotForwarded` in
   `DiscardableAttributes.cpp` (`kAutoWSLoopAttrs`), so the non-persistent
   single-trip-while rewrite does not copy it onto inner loops. By then it has
