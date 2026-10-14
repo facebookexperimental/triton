@@ -20,7 +20,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`tiles_and_stages.md`](tiles_and_stages.md) | done | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages`. Open: its "Not yet established" items (how `BLOCK_M=32` fails under autoWS; extra stages at one or two K tiles; 2-CTA stage counts; asymmetric A/B depth; tile size vs ring depth). |
 | [`warps_and_registers.md`](warps_and_registers.md) | done | `num_warps` and the AutoWS register budgets. Open: its "Not yet established" items (`num_warps=8` with `data_partition_factor=2` vs the 16-warp estimate; 4 vs 8 warps by kernel; actual partition register budgets; 8-warp mbarrier arrive cost). |
 | [`epilogue.md`](epilogue.md) | done | Epilogue subtiling, separate epilogue store, store placement. Open: its "Not yet established" items (runtime across `ES`; best `ES` per tile and 2-CTA; per-slice register savings; per-slice scaling bitwise; `early_tma_store_lowering=False` accounting; per-slice layout conversions). |
-| `2cta.md` | todo | 1-CTA vs 2-CTA (`two_ctas`). |
+| [`2cta.md`](2cta.md) | done | 1-CTA vs 2-CTA (`two_ctas`). Open: its "Not yet established" items (`BLOCK_M=64` 2-CTA; `BLOCK_N=64` 2-CTA compile; when 2-CTA beats 1-CTA; cost of one staging copy; stage counts; cooperative vs per-CTA loads). |
 | `data_partitioning.md` | todo | `data_partition_factor`. |
 | `clc_persistence.md` | todo | Static persistent vs CLC dynamic persistent. |
 | `tma_loads.md` | todo | TMA vs pointer operand loads. |
@@ -59,6 +59,9 @@ Reported but not located in code, so not in [hazards.md](hazards.md). Each needs
 | Two K steps per loop body over a shared operand | todo | **Trigger:** two TMA loads of the same operand and two MMAs per loop body, with a deferred reduction. **Symptom:** sparse, large corruption at larger shapes. |
 | 2-CTA without warp specialization | todo | **Trigger:** `tl.dot(..., two_ctas=True)` launched with WS off. **Symptom:** a GPU hang. |
 | Data partitioning with generated subtiled regions and a subtiled scale | todo | **Trigger:** `data_partition_factor=2`, `generate_subtiled_region` on, and a per-subtile scale in the epilogue. **Symptom:** a hang. |
+| 2-CTA B not a descriptor load, or `BLOCK_N` < 32 | todo | Suspected from code, not reproduced: the B split in `Transform2CTALoads.cpp` is skipped with only a debug log, while the MMA lowering still reads a half-width B. |
+| 2-CTA with the atomic dynamic tile scheduler | todo | Suspected from code, not reproduced: no cluster-level tile claim and no compile-time rejection. |
+| 2-CTA with `smem_alloc_algo=0` | todo | Suspected from code, not reproduced: the one-copy staging pin (`increaseFusedEpilogueCopies`) lives only in the default planner. |
 
 ## Fixes to existing docs
 
