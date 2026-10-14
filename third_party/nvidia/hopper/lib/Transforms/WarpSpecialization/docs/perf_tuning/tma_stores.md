@@ -5,7 +5,7 @@ Scope: the GEMM output epilogue under Meta WS (`TRITON_USE_META_WS=1`) on Blackw
 - the SMEM staging ring that feeds the TMA store;
 - how store waits are drained.
 
-Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). Extra epilogue inputs are covered in `epilogue_prologue_tma_loads.md`.
+Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). Extra epilogue inputs are covered in [epilogue_prologue_tma_loads.md](epilogue_prologue_tma_loads.md).
 
 ## Knobs
 

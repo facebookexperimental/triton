@@ -1,6 +1,6 @@
 # TMA operand loads
 
-Scope: how GEMM operands (A, B) reach SMEM under Meta WS (`TRITON_USE_META_WS=1`) on Blackwell. Covered here: descriptor loads versus pointer loads, operands consumed by more than one partition, and `auto_tma` promotion. Epilogue and prologue side inputs loaded with TMA are covered in `epilogue_prologue_tma_loads.md`. Operand ring depth is covered in [tiles_and_stages.md](tiles_and_stages.md).
+Scope: how GEMM operands (A, B) reach SMEM under Meta WS (`TRITON_USE_META_WS=1`) on Blackwell. Covered here: descriptor loads versus pointer loads, operands consumed by more than one partition, and `auto_tma` promotion. Epilogue and prologue side inputs loaded with TMA are covered in [epilogue_prologue_tma_loads.md](epilogue_prologue_tma_loads.md). Operand ring depth is covered in [tiles_and_stages.md](tiles_and_stages.md).
 
 ## Knobs
 

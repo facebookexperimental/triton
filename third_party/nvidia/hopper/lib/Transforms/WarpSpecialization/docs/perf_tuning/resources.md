@@ -50,7 +50,7 @@ Facts these rules depend on, all in `WS/WSMemoryPlanner.cpp`, `allocateSmemBuffe
 
 **Closed-form operand depth.**
 `d_fit = min(num_stages, floor((232448 - aux - S_stg) / slot))`
-- `slot = (BM + BN') * BK * in_bytes`, `BN' = BN/2` under 2-CTA; add `BN * BK * in_bytes` for a multi-consumer B ([tma_loads.md](tma_loads.md#mechanism)) and one landing buffer per TMA side input (`epilogue_prologue_tma_loads.md`).
+- `slot = (BM + BN') * BK * in_bytes`, `BN' = BN/2` under 2-CTA; add `BN * BK * in_bytes` for a multi-consumer B ([tma_loads.md](tma_loads.md#mechanism)) and one landing buffer per TMA side input ([epilogue_prologue_tma_loads.md](epilogue_prologue_tma_loads.md#mechanism)).
 - `S_stg = BM * (BN/ES) * out_bytes * staging copies` (one copy when `ES=1` or 2-CTA); since staging is raised first, an uncapped staging ring reduces operand depth.
 - `aux` = `estimateAuxiliarySmemBytes` (barriers, captures, tensor maps, op scratch); kernel-dependent.
 - `d_fit` is the balanced A/B depth; Phase 4 may give the first-used operand one more copy (worked example).
