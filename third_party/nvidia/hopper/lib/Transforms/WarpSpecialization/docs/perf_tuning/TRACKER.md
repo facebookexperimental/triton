@@ -73,6 +73,7 @@ Reported but not located in code, so not in [hazards.md](hazards.md). Each needs
 | [triton_tma_multicast.md](../../../../../../../../docs/design/triton_tma_multicast.md) | done | Multicast lowering is planned, not implemented. |
 | [BarrierFusion.md](../BarrierFusion.md) | done | `optimizeTMALoads` mixed-group behavior. |
 | [DynamicPersistentAutoWSGaps.md](../DynamicPersistentAutoWSGaps.md) | done | CLC flash-attention stage default is two. |
+| [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md) | done | Staging-merge and Phase 3.7 statements. |
 
 ## Knob coverage
 
