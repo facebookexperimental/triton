@@ -22,7 +22,6 @@ The regime that routes here is long K with few output tiles: many `K / BLOCK_K` 
 |---|---|---|---|
 | `multi_cta=True` on a GEMM K loop (accumulator carried by `tl.dot`) with a cluster of more than 1 CTA | compile error | The loop must yield `arith.addf`/`arith.addi` of its own iter_arg; a dot-carried accumulator is rejected ("only additive accumulation ... is supported"). | `MultiCTAReduction.cpp`, `verifyAdditiveAccumulation` |
 | `multi_cta=True` without a cluster (`ctas_per_cga` unset or 1) | silently ignored | The attribute is removed and the loop runs on one CTA. | `MultiCTAReduction.cpp`, `transformMultiCTALoop` |
-| Source-level split-K where some split gets zero K tiles | hangs | The warp-specialized inner loop runs zero iterations, and producer and consumer wait on barriers that are never armed. The caller must guarantee `cdiv(k_tiles, SPLIT_K) * (SPLIT_K - 1) < k_tiles`. | `test_tutorial09_warp_specialization.py`, `matmul_kernel_tma_persistent_ws_splitk` (documented precondition) |
 
 ## Mechanism
 
@@ -47,7 +46,7 @@ The regime that routes here is long K with few output tiles: many `K / BLOCK_K` 
 - **What changes:** each stage of the A/B ring is a descriptor-block-sized buffer (BLOCK_M x BLOCK_K and BLOCK_N x BLOCK_K). When K < BLOCK_K, TMA zero-fills the extra K columns. The MMA over the padded K is correct, but the SMEM, the TMA bytes and the MMA work are still paid at every stage.
 - Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` (buffer type from the descriptor block); `python/triton/tools/tensor_descriptor.py`, `TensorDescriptor` (`padding="zero"`).
 
-**K <= BLOCK_K takes a separate compile path.**
+**No K loop takes a separate compile path.** This needs K to be a compile-time constant (`tl.constexpr`) <= BLOCK_K, so that the IR has no K loop; a runtime K launched with K <= BLOCK_K keeps its loop.
 - **What changes:** there is no K loop, so:
   - `CombineDotAddFPattern` folds an additive epilogue such as a bias into the dot's accumulator initialization;
   - the per-tile TMEM accumulator, written by a `tmem_store` at the top of every tile iteration, is multi-buffered across tiles by the memory planner.
@@ -59,7 +58,6 @@ The regime that routes here is long K with few output tiles: many `K / BLOCK_K` 
 - IF K < BLOCK_K, THEN skip every BLOCK_K above the smallest legal BLOCK_K that covers K, BECAUSE a larger BLOCK_K pays SMEM and MMA work for zero-filled columns at every stage.
 - IF tuning a GEMM K loop, THEN skip `multi_cta`, BECAUSE it rejects dot-carried accumulators (with a cluster) or is removed (without one).
 - IF the epilogue applies a per-row or nonlinear function of the full K sum, THEN skip split-K for that kernel, BECAUSE partial sums cannot be combined after the epilogue.
-- IF writing split-K for a WS kernel, THEN only try SPLIT_K values that leave every split at least one K tile, BECAUSE an empty split hangs the warp-specialized inner loop.
 - IF the problem has fewer output tiles than SMs and many K steps, THEN include a split-K formulation in the search, not only deeper stages, BECAUSE autoWS reduces K serially per tile and deeper stages do not add parallelism.
 
 ## Interactions
@@ -79,7 +77,6 @@ Reported but not yet located in code (row in [TRACKER.md](TRACKER.md#reported-wr
 ## Not yet established
 
 Tracked in [TRACKER.md](TRACKER.md).
-
 
 - How the autoWS gap to the best non-WS kernel changes with K for fused epilogues. The observation so far is that per-output-tile epilogue wins shrink as K grows.
 - Whether source-level split-K with a WS mainloop beats Inductor's decompose-K for skinny-N, huge-K shapes.
