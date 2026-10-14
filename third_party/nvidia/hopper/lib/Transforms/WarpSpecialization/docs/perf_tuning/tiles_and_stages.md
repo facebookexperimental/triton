@@ -39,7 +39,7 @@ Budget numbers are in [resources.md](resources.md). Code paths are relative to `
 **What tile shape changes.** The three tile dimensions set:
 - the A slot (`BLOCK_M × BLOCK_K`) and the B slot (`BLOCK_N × BLOCK_K`), in the operand element type;
 - TMEM columns per accumulator copy (`BLOCK_N × ceil(BLOCK_M/128)` for fp32), and from that the number of accumulator copies (see [resources.md](resources.md));
-- the epilogue tile, in combination with `EPILOGUE_SUBTILE` (see `epilogue.md`).
+- the epilogue tile, in combination with `EPILOGUE_SUBTILE` (see [epilogue.md](epilogue.md)).
 
 The MMA instruction shape follows from the tile: instruction M is 128 when `BLOCK_M` >= 128 and 64 otherwise, instruction N is `min(BLOCK_N, 256)`, and instruction K is 256 / operand bit width; larger tiles are issued as several MMAs (`lib/Dialect/TritonGPU/Transforms/Utility.cpp`, `mmaVersionToInstrShape`).
 

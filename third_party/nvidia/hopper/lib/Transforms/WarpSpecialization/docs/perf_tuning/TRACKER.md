@@ -20,7 +20,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 |------|-------|------|
 | [`tiles_and_stages.md`](tiles_and_stages.md) | done | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages`. Open: its "Not yet established" items. |
 | [`warps_and_registers.md`](warps_and_registers.md) | done | `num_warps` and the AutoWS register budgets. Open: its "Not yet established" items. |
-| `epilogue.md` | todo | Epilogue subtiling, separate epilogue store, store placement. |
+| [`epilogue.md`](epilogue.md) | done | Epilogue subtiling, separate epilogue store, store placement. Open: its "Not yet established" items. |
 | `2cta.md` | todo | 1-CTA vs 2-CTA (`two_ctas`). |
 | `data_partitioning.md` | todo | `data_partition_factor`. |
 | `clc_persistence.md` | todo | Static persistent vs dynamic and CLC persistent. |
@@ -82,6 +82,10 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 | H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** the epilogue is a cast + store, or + a pointer-loaded bias (plain mm/addmm), **THEN** only try `num_warps=4`. | todo |
 | H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** the epilogue does per-element register math beyond a bias (fused) and `R(num_warps=4) > 64`, **THEN** keep `num_warps=8` alongside 4. | todo |
 | H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** no rule above sets `minRegAutoWS`, `maxRegAutoWS` or `maxnreg`, **THEN** leave them at their defaults. | todo |
+| H-WES | [epilogue.md § When to try it](epilogue.md#when-to-try-it-depends-on-the-problem) | **IF** a config fits at `ES = e` with `R <= 128`, **THEN** skip every `ES > e`, **BECAUSE** past fit and register relief, more slices only add TMA stores, barrier rounds and layout conversions. | todo |
+| H-SES | [epilogue.md § When to try it](epilogue.md#when-to-try-it-depends-on-the-problem) | **IF** 1-CTA with a TMA store, **THEN** only try `separate_epilogue_store=True`; **IF** 2-CTA, **THEN** pin it to `True`, **BECAUSE** the store wait and staging handshake leave the TMEM-draining partition. | todo |
+| H-STG | [epilogue.md § When to try it](epilogue.md#when-to-try-it-depends-on-the-problem) | **IF** `separate_epilogue_store=True` and `d_fit >= 3`, **THEN** leave `TRITON_WS_STAGING_COPIES` unset. | todo |
+| — | [epilogue.md § When to try it](epilogue.md#when-to-try-it-depends-on-the-problem) | **IF** none of the rules above applies, **THEN** leave `generate_subtiled_region`, `early_tma_store_lowering`, `tma_store_pipelining` and `merge_epilogue*` at their defaults. | todo |
 
 ## Fixes to existing docs
 
@@ -99,19 +103,19 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `BLOCK_M` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `BLOCK_N` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `BLOCK_K` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
-| `num_stages` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
+| `num_stages` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem) | covered |
 | `num_stages` (per loop) | — | mentioned |
 | `flatten` | — | todo |
 | `disallow_acc_multi_buffer` | — | mentioned |
 | `loop_unroll_factor`, `disable_licm` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `warp_specialize` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `data_partition_factor` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
-| `separate_epilogue_store` | [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | covered |
+| `separate_epilogue_store` | [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem); [epilogue.md](epilogue.md#never-try-any-problem) | covered |
 | `merge_epilogue` | — | mentioned |
 | `merge_epilogue_to_computation`, `merge_correction` | — | mentioned |
 | `pingpongAutoWS` | — | todo |
 | `multi_cta` | — | todo |
-| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
+| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem) | covered |
 | `allowDependentTwoCTA` | — | todo |
 | `ctas_per_cga` | — | mentioned |
 | Tile scheduler | — | todo |
@@ -122,19 +126,19 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `multicast` | — | todo |
 | `auto_tma` / `auto_tma_device` | — | todo |
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | — | todo |
-| Epilogue subtiling (ES) | [resources.md](resources.md#when-to-try-it-depends-on-the-problem); [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem); [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | covered |
-| `generate_subtiled_region` | — | todo |
-| `early_tma_store_lowering` | — | todo |
-| `tma_store_pipelining` | — | todo |
-| `TRITON_WS_STAGING_COPIES` | — | mentioned |
-| `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | — | todo |
+| Epilogue subtiling (ES) | [resources.md](resources.md#when-to-try-it-depends-on-the-problem); [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem); [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem); [epilogue.md](epilogue.md#never-try-any-problem) | covered |
+| `generate_subtiled_region` | — | mentioned |
+| `early_tma_store_lowering` | — | mentioned |
+| `tma_store_pipelining` | — | mentioned |
+| `TRITON_WS_STAGING_COPIES` | [epilogue.md](epilogue.md#never-try-any-problem) | covered |
+| `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | [epilogue.md](epilogue.md#never-try-any-problem) | covered |
 | `num_warps` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `maxnreg` | [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `sched4reg`, `enable_tree_reduction` | — | todo |
 | `tmem_alloc_algo` | — | todo |
-| `smem_alloc_algo` | — | todo |
+| `smem_alloc_algo` | [epilogue.md](epilogue.md#never-try-any-problem) | covered |
 | `smem_budget` | — | mentioned |
 | `smem_circular_reuse` | — | todo |
 | `tt.autows` channels | — | todo |
