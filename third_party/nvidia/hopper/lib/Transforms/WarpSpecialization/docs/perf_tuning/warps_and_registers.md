@@ -8,52 +8,32 @@ Hardware limits are in [resources.md](resources.md). Code paths are relative to 
 
 ## Knobs
 
-| Knob | How set | What it does | Existing doc |
-|---|---|---|---|
-| `num_warps` | kernel compile option | Warps of the default region; also the starting warp count of every other partition | [default_partition_selection.md, "Per-op minimum warps"](../../../../../../../../docs/design/modulo_schedule/default_partition_selection.md#per-op-minimum-warps) |
-| `minRegAutoWS` | kernel compile option | Per-thread registers requested by partitions that hold no tensors (default 24) | [RegisterBudgets.md](../RegisterBudgets.md); [Overview.md, "Register Budgets"](../Overview.md#register-budgets) |
-| `maxRegAutoWS` | kernel compile option | When set, per-thread registers requested by non-default tensor partitions; the default region gets the leftover share | [RegisterBudgets.md](../RegisterBudgets.md); [Overview.md, "Register Budgets"](../Overview.md#register-budgets) |
-| `maxnreg` | kernel compile option | Replaces the computed per-thread register ceiling (`ttg.maxnreg`) | [RegisterBudgets.md](../RegisterBudgets.md) |
-| `merge_epilogue`, `merge_epilogue_to_computation`, `separate_epilogue_store` | `tl.range(...)` kwargs | Add or remove partitions, which changes the worker warp total | [PartitionSchedulingMeta.md, "Target Partition Layouts"](../PartitionSchedulingMeta.md#target-partition-layouts) |
+| Knob | Set via | Legal values | Default | Priority | Applies when | Prereqs |
+|---|---|---|---|---|---|---|
+| `warp_specialize` | `tl.range` kwarg | True | False | P0 | Every autoWS kernel. Silently dropped when `num_warps` < 4, when no partition forms, or when the WS warp estimate exceeds 16. | `TRITON_USE_META_WS=1`; `num_warps` in {4, 8}. |
+| `num_warps` | compile option | 4 or 8 | 4 | P0 | Every kernel. Other values get no tcgen05 MMA; below 4, warp specialization is dropped. | — |
+| `minRegAutoWS` | compile option | multiple of 8 | 24 | P1 | Every WS kernel. Requests that do not fit are silently not applied. | — |
+| `maxRegAutoWS` | compile option | multiple of 8 | None | P1 | Only non-default tensor partitions; in these GEMM layouts the epilogue is the default region. | — |
+| `maxnreg` | compile option | int | None | P2 | Every kernel. Requests that do not fit are silently dropped. | — |
 
-## Never try (any problem)
+## Pruning ruleset
 
-| Condition | Status | Why | Code |
-|---|---|---|---|
-| `num_warps` < 4 | silently ignored | The kernel runs without WS: "Warp specialization requires at least 4 warps". Under `two_ctas` this hangs instead (see `2cta.md`) | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnFuncOp` |
-| `num_warps` not 4 or 8 | silently ignored | `supportMMA` for MMAv5 accepts only 4 or 8 warps (the TMEM load/store layouts), so the dot falls back to mma.sync and there is no gemm partition | `lib/Analysis/Utility.cpp`, `supportMMA`; `lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, `getMMAVersionSafe` |
-| WS warp estimate > 16 | silently ignored | All WS metadata is removed. Estimate = `num_warps` + Σ over other partitions of their minimum warps (4 for partitions holding TMEM load/store/alloc, 2 for gather/scatter, else 1). Under `two_ctas` this hangs instead (see `2cta.md`) | `WS/PartitionSchedulingMeta.cpp`, "Warp budget exceeded. Skipping warp specialization."; `include/triton/Dialect/TritonNvidiaGPU/IR/Dialect.h`, `getMinWarpsForOp` |
-| `minRegAutoWS` or `maxRegAutoWS` not a multiple of 8 | compile error | Requests are emitted per warp group in steps of 8 | `third_party/nvidia/backend/compiler.py`, `_check_reg_auto_ws_alignment` |
-| Register requests that do not fit `maxnreg` × total warps, or a shared share below 24 | silently ignored | `AllocateWarpGroups` returns without setting actual registers, so there is no per-partition register split. Without a user `maxnreg` every warp keeps the uniform ceiling; with one, the lowering still emits a register reallocation to `maxnreg` (`ConvertWarpSpecializeToLLVM.cpp`) | `lib/Conversion/TritonGPUToLLVM/AllocateWarpGroups.cpp`, register allocation in `runOnOperation` |
+| Condition | Status | Why |
+|---|---|---|
+| `num_warps` < 4 | silently ignored | The kernel runs without WS: "Warp specialization requires at least 4 warps". |
+| `num_warps` not 4 or 8 | silently ignored | `supportMMA` for MMAv5 accepts only 4 or 8 warps (the TMEM load/store layouts), so the dot falls back to mma.sync and there is no gemm partition. |
+| WS warp estimate > 16 | silently ignored | All WS metadata is removed. |
+| `minRegAutoWS` or `maxRegAutoWS` not a multiple of 8 | compile error | Requests are emitted per warp group in steps of 8. |
+| Register requests that do not fit `maxnreg` × total warps, or a shared share below 24 | silently ignored | `AllocateWarpGroups` returns without setting actual registers, so there is no per-partition register split. |
 
 ## Mechanism
 
-**Warp counts:**
-1. The default region gets `num_warps` (`WS/PartitionSchedulingMeta.cpp`, warp budget estimate); every other partition is created with `num_warps` too (`WS/WSSpecialize.cpp`, construction of `ttg.warp_specialize`).
-2. `optimizePartitionNumWarps` (`lib/Dialect/TritonGPU/Transforms/WarpSpecialization/OptimizePartitionWarps.cpp`) then shrinks them:
-   - no tensors: 1 warp;
-   - TMEM ops: stays >= 4 (`getMinWarpsForOp`);
-   - other tensor partitions halve while 2 × (registers of the largest single tensor) fits the per-thread share 65,536 / 32 / (total warps after halving); tensors live at the same time are not counted.
-3. With both a "reduction" and a "computation" partition and no cluster (no 2-CTA attribute), the computation partition is set to 8 warps.
-
-In the partition scheduler's GEMM layouts, the epilogue and, under `data_partition_factor=2`, both data-partition halves sit in the default region, which is never shrunk; the workers (load, MMA issue, store) are 1 warp each. So the 16-warp cap and halving do not come into play for a plain or epilogue-subtiled GEMM: `BLOCK_M=256`, dp=2, `num_warps=8` keeps WS with 12 total warps, and `EPILOGUE_SUBTILE` does not change worker warps.
-
-Which logical partition is the default region: [PartitionSchedulingMeta.md, "Phase 2: Partition Layout (`createPartitionLayout`)"](../PartitionSchedulingMeta.md#phase-2-partition-layout-createpartitionlayout) and [default_partition_selection.md, "Hardware mechanism: the default partition is the register sink"](../../../../../../../../docs/design/modulo_schedule/default_partition_selection.md#hardware-mechanism-the-default-partition-is-the-register-sink).
-
-**Warp groups and registers** (`lib/Conversion/TritonGPUToLLVM/AllocateWarpGroups.cpp`; persistent kernels only, one CTA per SM, so occupancy does not enter):
-- Registers are assigned per 4-warp group; per-thread floor `kMinLegalRegisters` = 24.
-- `padToMaxWarpGroups` pads worker warps to whole warp groups with partitions that only return; each padding warp requests `kMinLegalRegisters` = 24 and does no work. Total launched warps = `num_warps` + 4 × ceil(worker warps / 4), recorded as `ttg.total-num-warps`.
-- Per-thread ceiling: `maxnreg` if set, else 65,536 / total warps / 32, rounded down to a multiple of 8.
-- Each warp group requests the maximum over its partitions with a positive estimate, rounded up to 8:
-  - without `maxRegAutoWS`: non-tensor partitions request `minRegAutoWS`; tensor partitions and the default region take an even share of the rest. Tensor partitions carry a share sentinel that is skipped, so a group of one-warp partitions requests `minRegAutoWS` (default 24);
-  - with `maxRegAutoWS`: non-default tensor partitions request it; the default region takes the leftover share.
-- Full mechanics: [RegisterBudgets.md](../RegisterBudgets.md).
-
-**Reading metadata.** `metadata["num_warps"]` of a compiled WS kernel is `ttg.total-num-warps` (workers plus padding; `third_party/nvidia/backend/compiler.py`). Relaunching from TTGIR reads `ttg.num-warps`, the default-region count (`python/triton/compiler/compiler.py`, `parse_options`).
-
-**Change → relief → cost:**
-- **Raising `num_warps`:** relieves: more threads and a smaller per-thread share of each tensor in the default region and every tensor partition that does not shrink; costs: a lower ceiling for all threads, and the warp estimate counts the default region at full size.
-- **Adding a partition:** relieves: separates work so it can overlap; costs: a whole warp group once worker warps cross a multiple of 4, lowering the ceiling for every thread.
+- **Partition warp counts:** the default region gets `num_warps` (`WS/PartitionSchedulingMeta.cpp`, warp budget estimate) and every other partition is created with `num_warps` too (`WS/WSSpecialize.cpp`, construction of `ttg.warp_specialize`); `optimizePartitionNumWarps` (`lib/Dialect/TritonGPU/Transforms/WarpSpecialization/OptimizePartitionWarps.cpp`) then shrinks them: no tensors -> 1 warp, TMEM ops -> stays >= 4 (`getMinWarpsForOp`), other tensor partitions halve while 2 × (registers of the largest single tensor) fits the per-thread share 65,536 / 32 / (total warps after halving), not counting tensors live at the same time; then, with both a "reduction" and a "computation" partition and no cluster (no 2-CTA attribute), the computation partition is set to 8 warps.
+- **GEMM layouts:** in the partition scheduler's GEMM layouts the epilogue and, under `data_partition_factor=2`, both data-partition halves sit in the default region, which is never shrunk, and the workers (load, MMA issue, store) are 1 warp each, so the 16-warp cap and halving do not come into play for a plain or epilogue-subtiled GEMM: `BLOCK_M=256`, dp=2, `num_warps=8` keeps WS with 12 total warps, and `EPILOGUE_SUBTILE` does not change worker warps (which logical partition is the default region: [PartitionSchedulingMeta.md, "Phase 2: Partition Layout (`createPartitionLayout`)"](../PartitionSchedulingMeta.md#phase-2-partition-layout-createpartitionlayout), [default_partition_selection.md, "Hardware mechanism: the default partition is the register sink"](../../../../../../../../docs/design/modulo_schedule/default_partition_selection.md#hardware-mechanism-the-default-partition-is-the-register-sink)).
+- **Warp groups and register ceiling:** in `lib/Conversion/TritonGPUToLLVM/AllocateWarpGroups.cpp` (persistent kernels only, one CTA per SM, so occupancy does not enter) registers are assigned per 4-warp group with per-thread floor `kMinLegalRegisters` = 24; `padToMaxWarpGroups` pads worker warps to whole warp groups with partitions that only return, each padding warp requesting 24 and doing no work, so total launched warps = `num_warps` + 4 × ceil(worker warps / 4), recorded as `ttg.total-num-warps` (which is what `metadata["num_warps"]` of a compiled WS kernel reports, `third_party/nvidia/backend/compiler.py`; relaunching from TTGIR reads `ttg.num-warps`, the default-region count, `python/triton/compiler/compiler.py`, `parse_options`); the per-thread ceiling is `maxnreg` if set, else 65,536 / total warps / 32, rounded down to a multiple of 8.
+- **Per-group register requests:** each warp group requests the maximum over its partitions with a positive estimate, rounded up to 8; without `maxRegAutoWS`, non-tensor partitions request `minRegAutoWS` and tensor partitions and the default region take an even share of the rest (tensor partitions carry a share sentinel that is skipped, so a group of one-warp partitions requests `minRegAutoWS`, default 24); with `maxRegAutoWS`, non-default tensor partitions request it and the default region takes the leftover share ([RegisterBudgets.md](../RegisterBudgets.md)).
+- **Raising `num_warps`:** changes the thread count of the default region and every tensor partition that does not shrink -> relieves: more threads and a smaller per-thread share of each tensor -> costs: a lower ceiling for all threads, and the warp estimate counts the default region at full size.
+- **Adding a partition:** changes the work split -> relieves: separated work can overlap -> costs: a whole warp group once worker warps cross a multiple of 4, lowering the ceiling for every thread.
 
 ## Interactions
 
