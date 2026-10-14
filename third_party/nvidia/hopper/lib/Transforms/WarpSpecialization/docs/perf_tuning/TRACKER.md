@@ -8,7 +8,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 
 | File | State | Note |
 |------|-------|------|
-| [`knobs.md`](knobs.md) | done | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it. |
+| [`knobs.md`](knobs.md) | done | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it.  |
 | [`resources.md`](resources.md) | done | SMEM, TMEM and register budgets as pruning rules; links to the existing SMEM/TMEM/register docs for the mechanics. Open: its "Not yet established" items. |
 | `interactions.md` | todo | Feature-pair table grouped by feature: pair \| status ("works", "compile error", "silently ignored", "duplicate config", "hangs", "wrong answer", "requires") \| mechanism + code location. |
 | `hazards.md` | todo | Open wrong-answer and hang conditions, each with its trigger and code location. Entries are deleted when fixed. |
@@ -17,15 +17,15 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 
 | File | State | Note |
 |------|-------|------|
-| `tiles_and_stages.md` | todo | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages` against tile count and K iterations. |
+| `tiles_and_stages.md` | todo | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages`. |
 | `warps_and_registers.md` | todo | `num_warps` and the AutoWS register budgets. |
 | `epilogue.md` | todo | Epilogue subtiling, separate epilogue store, store placement. |
 | `2cta.md` | todo | 1-CTA vs 2-CTA (`two_ctas`). |
 | `data_partitioning.md` | todo | `data_partition_factor`. |
-| `clc_persistence.md` | todo | Static persistent vs CLC dynamic persistent. |
+| `clc_persistence.md` | todo | Static persistent vs dynamic and CLC persistent. |
 | `tma_loads.md` | todo | TMA vs pointer operand loads. |
 | `tma_stores.md` | todo | TMA vs pointer output stores. |
-| `large_k.md` | todo | K iterations far above `num_stages`, including decomposeK-style K splitting. |
+| `large_k.md` | todo | K iterations far above `num_stages`, including split-K style K splitting. |
 | `pingpong.md` | todo | Ping-pong scheduling. |
 | `multicast.md` | todo | TMA multicast. |
 | `epilogue_prologue_tma_loads.md` | todo | TMA loads of extra epilogue/prologue inputs. |
@@ -38,11 +38,11 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 
 | Knob | State | Note |
 |------|-------|------|
-| `auto_tma` | todo | `TRITON_AUTO_TMA`, `python/triton/knobs.py`. |
-| `TRITON_WS_STAGING_COPIES` | todo | Read in `WSMemoryPlanner.cpp`. |
-| `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | todo | Read in `Transform2CTALoads.cpp`. |
-| `maxnreg` under WS | todo | `CUDAOptions.maxnreg`, `third_party/nvidia/backend/compiler.py`. |
-| `disallow_acc_multi_buffer` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; listed in [AutoWSAnnotations.md](../AutoWSAnnotations.md) "Annotation → IR attribute → consumer" without a when/why explanation. |
+| `auto_tma` | done | `TRITON_AUTO_TMA`, `python/triton/knobs.py`. Documented in [AutoTMAPromotion.md](../AutoTMAPromotion.md). |
+| `TRITON_WS_STAGING_COPIES` | done | Read in `WSMemoryPlanner.cpp`. Documented in [TMAStoreWaitPipeline.md § `TRITON_WS_STAGING_COPIES`](../TMAStoreWaitPipeline.md#triton_ws_staging_copies-capping-the-phase-37-target). |
+| `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | done | Read in `Transform2CTALoads.cpp`. Documented in [BarrierFusion.md § 2-CTA Cooperative Loads](../BarrierFusion.md#2-cta-cooperative-loads-and-triton_disable_2cta_cooperative_loads). |
+| `maxnreg` under WS | done | `CUDAOptions.maxnreg`, `third_party/nvidia/backend/compiler.py`. Documented in [RegisterBudgets.md](../RegisterBudgets.md). |
+| `disallow_acc_multi_buffer` | done | `AutoWSLoopOptions` in `python/triton/language/core.py`. Documented in [AutoWSAnnotations.md § `disallow_acc_multi_buffer`](../AutoWSAnnotations.md#disallow_acc_multi_buffer). |
 | `loop_unroll_factor`, `disable_licm` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; generic loop transforms, not WS-specific. |
 | Descriptor loads/stores (kernel pattern) | todo | `tl.make_tensor_descriptor` or host `TensorDescriptor` with `desc.load` / `desc.store`: why autoWS expects TMA producer and store partitions. |
 
