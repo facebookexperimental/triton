@@ -63,7 +63,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 |---|---|---|---|
 | pingpong × plain GEMM / addmm epilogue | silently ignored | On sm_100 only SFU math (`exp`, `exp2`, `sin`, `cos`, `tanh`, `sqrt`, `rsqrt`, or SFU `.approx` asm) with a rank > 1 result is "expensive"; MMAs are never pingponged | `WS/PingPong.cpp`, expensive-op classification (`case 100`) |
 | pingpong × capability other than 90 or 100 | silently ignored | Only those two capabilities have a classification | `WS/PingPong.cpp` |
-| pingpong × `data_partition_factor` | requires | For a GEMM epilogue, pingpong needs dp=2: a region needs exactly 2 partitions holding the same SFU op | `WS/PingPong.cpp`, `doPingPongPrep`; [PingPongScheduling.md § Step 2: Validate and Assign `pingpong_id`](../PingPongScheduling.md#step-2-validate-and-assign-pingpong_id) |
+| pingpong × GEMM (any `data_partition_factor`, SFU epilogue, static persistent) | duplicate config (reproduced) | Both data-partition halves' SFU ops land in one partition, so no region has two partitions; the TTGIR is identical with pingpong on or off | `WS/PingPong.cpp`, `doPingPongPrep`; `WS/PartitionSchedulingMeta.cpp` |
 | pingpong × CLC / dynamic `scf.while` tile loop | silently ignored | A region needs an enclosing `scf.for`; epilogue ops directly under a `while` tile loop have none. SFU math inside an inner `scf.for` (e.g. the K loop) can still form a region | `WS/PingPong.cpp`, `doPingPongPrep` |
 
 ## TMA multicast
@@ -131,7 +131,6 @@ Tracked in [TRACKER.md](TRACKER.md).
 - `two_ctas` × `smem_alloc_algo=0`: the one-copy staging pin is only on the default allocator path (not reproduced in testing: staging stayed one copy).
 - dp=2 × `BLOCK_M=64`, `BLOCK_N=256` (N split): correctness not run.
 - dp=2 × generated subtiled region × per-slice scaling: hang observed.
-- pingpong × GEMM epilogue with SFU math at dp=2: no data.
 - CLC / dynamic `while` × `merge_*`, SMEM/TMEM allocation options, register budgets, pingpong: no end-to-end contract.
 - `early_tma_store_lowering=False` × staging knobs: whether staging leaves the planner's accounting.
 - `ES` × runtime once a config fits; best `ES` per tile and 2-CTA setting.
