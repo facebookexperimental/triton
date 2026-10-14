@@ -64,10 +64,16 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 
 ## When to try it (depends on the problem)
 
+`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
+
 - IF `T <= P`, THEN skip CLC and the atomic dynamic scheduler, BECAUSE every program gets one tile, so there is nothing to rebalance and each claim (`clc_advance` or the atomic) is pure cost. [mechanism] (`ClcTileScheduler`, `DynamicPersistent1DScheduler`)
 - IF `T <= P`, THEN skip the `GROUP_M` / tile-order axis, BECAUSE all tiles are co-resident, so tile order cannot change L2 reuse. [mechanism] (`StaticPersistent1DScheduler`)
 - IF per-tile work is uneven (grouped or jagged problems) and `T > P`, THEN prefer CLC over static persistent, BECAUSE hardware cancellation rebalances the uneven tiles without a software counter, while static persistence fixes each program's tiles up front. [mechanism]
 Tail effects under static persistence (idle SMs in the last wave): see the tail-efficiency rule in [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem).
+- **IF** `T <= P`, **THEN** keep only one of static persistent and non-persistent, **BECAUSE** both assign the same tile to each program. [measured: --regime sched, flat within noise]
+- **IF** `T > P`, **THEN** skip non-persistent, **BECAUSE** every extra wave pays a launch and loses the cross-tile overlap. [measured: --regime sched, loses on every shape in the regime]
+- **IF** uniform tiles and `T > P`, **THEN** pin static persistent (CLC is within about 3%), and prefer static over the atomic dynamic scheduler, **BECAUSE** there is nothing to rebalance. [measured: --regime sched, flat within noise]
+- **IF** 1-CTA and `T > P`, **THEN** prefer `GROUP_M=1` over 8 (16 is flat or worse); **IF** 2-CTA, **THEN** pin `GROUP_M=8` (odd values are a wrong answer), **BECAUSE** the grouping only changes L2 reuse order. [measured: --regime sched, wins on a majority of shapes]
 
 ## Interactions
 
