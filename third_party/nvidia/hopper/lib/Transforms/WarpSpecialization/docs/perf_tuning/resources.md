@@ -33,7 +33,7 @@ Mechanics (link, don't repeat):
 Facts these rules depend on, all in `WS/WSMemoryPlanner.cpp`, `allocateSmemBuffers`:
 1. **Staging comes first.** TMA output staging is reserved before the operand rings: `increaseFusedEpilogueCopies` runs before the Phase 4 operand copy increase.
 2. **The operand depth cap is `num_stages`.** Phase 4 raises the innermost operand buffers, in the order they are first used, one level at a time. It stops when nothing fits or the level would pass `num_stages`. It never uses free SMEM beyond `num_stages`.
-3. **Correctness floors are never dropped.** A plan that still exceeds the budget after the discretionary reuse step only produces the warning "exceeding configured smem-budget". The hardware check at launch is the backstop.
+3. **The cross-stage floor is never dropped.** A plan that still exceeds the budget after the discretionary reuse step only produces the warning "exceeding configured smem-budget". The hardware check at launch is the backstop. The copy-safety floor (dp > 1 with `disallow_acc_multi_buffer`) is different: it is given back one copy at a time when it does not fit (`relaxCopySafetyFloorToBudget`).
 4. **Under budget pressure, staging can alias operand rings.** Innermost operand buffers are never aliased (`findReuseCandidate`).
 
 ## TMEM
@@ -44,9 +44,10 @@ Accumulator copies (`WS/WSMemoryPlanner.cpp`, the "TMEM multi-buffering post-pro
 - After placement, the heuristic TMEM planner raises `buffer.copy` round-robin on every loop-carried MMA accumulator. A per-iteration accumulator overwritten by a `tmem_store` at the top of the body also counts as loop-carried.
 - It stops when the next copy would pass 512 columns minus the columns reserved for scaled-MMA scales.
 - No user knob bounds this; `num_stages` does not either.
+- A kernel whose total TMEM exceeds 512 columns is not rejected at compile time: it raises `OutOfResources("tensor memory")` when it is loaded (`python/triton/compiler/compiler.py`, `CompiledKernel._init_handles`).
 
 Columns per accumulator copy (fp32) = `BLOCK_N × ceil(BLOCK_M / 128)`:
-- Instruction M is 128 whenever `BLOCK_M` >= 128 (`lib/Dialect/TritonGPU/Transforms/Utility.cpp`, `mmaVersionToInstrShape`), and TMEM has 128 lanes.
+- Instruction M is 128 whenever `BLOCK_M` >= 128 (and 64 below that), instruction N is `min(BLOCK_N, 256)` and instruction K is 256 / operand bit width (`lib/Dialect/TritonGPU/Transforms/Utility.cpp`, `mmaVersionToInstrShape`). TMEM has 128 lanes.
 - So `BLOCK_M=128` gives 4 copies at `BLOCK_N=128` and 2 copies at `BLOCK_N=256`.
 - `BLOCK_M=256, BLOCK_N=256` gives 1 copy, so tile i+1's mainloop cannot overlap tile i's epilogue.
 
@@ -65,22 +66,21 @@ Facts:
 
 ## Never try (any problem)
 
-| Condition | Result | Why | Code |
+| Condition | Status | Why | Code |
 |---|---|---|---|
 | Auxiliary SMEM estimate >= budget | compile error | "estimated auxiliary shared-memory allocation ... exhausts the shared-memory budget" | `WS/WSMemoryPlanner.cpp`, `doMemoryPlanner` |
-| Plan larger than the hardware limit after floors and reuse | compile error | Raised at launch as `OutOfResources`: floors are never dropped for budget, so the planner only warns | `WS/WSMemoryPlanner.cpp`, "exceeding configured smem-budget" warning |
-| `num_stages` above the depth that fits | duplicate config | The planner stops at the budget; the extra stages are never allocated | `WS/WSMemoryPlanner.cpp`, `allocateSmemBuffers` Phase 4 |
-| `num_warps` < 4 | silently ignored | WS bails out before partitioning, so the kernel runs without WS | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnFuncOp` |
+| Plan larger than the hardware limit after floors and reuse | requires | The plan must fit the hardware limit; otherwise `OutOfResources` is raised at launch, not at compile time. The cross-stage floor is never dropped for budget, so the planner only warns | `WS/WSMemoryPlanner.cpp`, "exceeding configured smem-budget" warning |
+| `num_warps` < 4 | silently ignored | WS bails out before partitioning, so the kernel runs without WS. Under `two_ctas` this hangs instead (see `2cta.md`) | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnFuncOp` |
 | `num_warps` not 4 or 8 | silently ignored | `supportMMA` for MMAv5 accepts only 4 or 8 warps, so there is no tcgen05 and no gemm partition | `lib/Analysis/Utility.cpp`, `supportMMA`; `lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, `getMMAVersionSafe` |
-| WS warp estimate > 16 | silently ignored | All WS metadata is removed. Estimate = `num_warps` + Σ per-partition minimum warps (TMEM ops count as 4) | `WS/PartitionSchedulingMeta.cpp`, "Warp budget exceeded. Skipping warp specialization." |
+| WS warp estimate > 16 | silently ignored | All WS metadata is removed. Estimate = `num_warps` + Σ per-partition minimum warps (TMEM ops count as 4, gather/scatter as 2; `getMinWarpsForOp`). Under `two_ctas` this hangs instead (see `2cta.md`) | `WS/PartitionSchedulingMeta.cpp`, "Warp budget exceeded. Skipping warp specialization." |
 | `minRegAutoWS` / `maxRegAutoWS` not a multiple of 8 | compile error | Register requests are emitted per warp group in steps of 8 | `third_party/nvidia/backend/compiler.py`, `_check_reg_auto_ws_alignment` |
 | `num_stages` < 1 | compile error | "nvgpu-warp-specialization requires num-stages >= 1" | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnOperation` |
 
 ## When to try it (depends on the problem)
 
 - **IF** `num_warps` is not 4 or 8, **THEN** skip the config, **BECAUSE** it never produces a tcgen05 autoWS GEMM.
-- **IF** two configs differ only in `num_stages` and both are at or above the depth that fits, **THEN** keep one, **BECAUSE** the planner allocates the same plan for both.
-- **IF** a config uses `TRITON_WS_SMEM_PLAN_SEARCH=1`, **THEN** do not compare it against heuristic-planner configs for epilogue overlap, **BECAUSE** the plan search pins every TMEM `buffer.copy` to 1. The exceptions are kernels with scaled MMA or a `SubtiledRegionOp`, which fall back to the heuristic planner (`WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch`).
+- **IF** two configs differ only in `num_stages`, both are at or above the operand depth that fits, and output staging is single-copy (`EPILOGUE_SUBTILE=1` or `two_ctas`), **THEN** keep one (this removes the other), **BECAUSE** the operand plan is the same; only barrier bytes and the loop schedule differ. With `EPILOGUE_SUBTILE` >= 2 staging deepens with `num_stages`, so the plans differ (see the worked example).
+- **IF** a config uses `TRITON_WS_SMEM_PLAN_SEARCH=1`, **THEN** do not compare it against heuristic-planner configs for epilogue overlap, and skip it for kernels with no K loop and more tiles than SMs, **BECAUSE** the plan search pins every TMEM `buffer.copy` to 1, which also bypasses the per-iteration accumulator multi-buffering that guards a cross-tile race (`hazards.md`, GPU check pending). The exceptions are kernels with scaled MMA or a `SubtiledRegionOp`, which fall back to the heuristic planner (`WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch`).
 - **IF** `BLOCK_M × BLOCK_N` fp32 already takes all 512 TMEM columns, **THEN** expect no accumulator overlap across tiles, and add no TMEM-resident loop state, **BECAUSE** the accumulator has exactly one copy.
 - **IF** a worker partition would push worker warps past a multiple of 4, **THEN** count it as costing registers for every thread, **BECAUSE** padding adds a whole warp group, which lowers the base `maxnreg`.
 
@@ -110,10 +110,13 @@ Both staging subtiles share one buffer id, so staging costs one slot × copies.
 | 2 | 2 | 1 | 196,608 | yes |
 | 2 | 2 | 2 | 229,376 | only if the auxiliary estimate is <= 3,072 B |
 | 3 | 3 | 2 | 245,760 | no (> 232,448) |
+| 3 (if B=2 did not fit) | 3 | 1 | 212,992 | only if the auxiliary estimate is <= 19,456 B |
 
-The result is A=2 / B=2, or A=2 / B=1 if the auxiliary estimate is larger.
+Phase 4 keeps raising any buffer that still fits, so the result is A=2 / B=2 when the auxiliary estimate is <= 3,072 B, and A=3 / B=1 when it is between 3,072 and 19,456 B.
 
 **With `TRITON_WS_STAGING_COPIES=2`**, staging takes 65,536 B and the operands reach A=4 / B=3. That totals 229,376 B under the same condition. The choice is between staging depth and operand depth, under the same total.
+
+**`num_stages` is not a duplicate here.** Staging took 4 copies because `num_stages=4`; at `num_stages=3` staging takes 3 copies (98,304 B) and the operands get the freed 32 KiB.
 
 **TMEM:** 256 columns per accumulator copy, so 2 copies (512 columns).
 
