@@ -9,38 +9,25 @@ The MMA operands themselves are covered in [tma_loads.md](tma_loads.md). The out
 
 ## Knobs
 
-| Knob | How set | One line | Existing doc |
-|---|---|---|---|
-| TMA side-input load | `desc.load(...)` for the side input in place of a pointer `tl.load` | Turns the side input into a planner-owned SMEM buffer that feeds registers. | [BufferAllocation.md](../BufferAllocation.md), section "Step 4: separateLocalAllocWithSrc"; [MemoryLowering.md](../MemoryLowering.md), section "Entry Points" |
-| descriptor rank and box | descriptor shape, e.g. rank-1 `[BLOCK_N]` versus 2-D `[1, BLOCK_N]` for a bias | Sets the landing-buffer size per subtile. | none |
-| descriptor `padding` | `TensorDescriptor(..., padding="zero"\|"nan")` | Out-of-bounds fill, `"zero"` by default. This is what makes a pad prologue exact. | none |
-| `EPILOGUE_SUBTILE` | kernel constexpr | Splits the side input into per-subtile loads, each with its own landing buffer. | [epilogue.md](epilogue.md); [SubtileOperator.md](../SubtileOperator.md), section "Motivation" |
+| Knob | Set via | Legal values | Default | Priority | Applies when | Prereqs |
+|---|---|---|---|---|---|---|
+| Epilogue/prologue TMA loads | kernel pattern (`desc.load` of a side input read in registers) | — | — | P1 | Kernels with a side input read in registers (bias, residual, scale, cast prologue). | #3938 (no-K-loop TMA addend), #3939 (sub-128 B landing buffers), #3940 (proxy fence), all OPEN. A B-side prologue under `two_ctas` gives a wrong answer. |
 
-## Never try (any problem)
+## Pruning ruleset
 
-| Condition | Status | Why | Code ref |
-|---|---|---|---|
-| No K loop in the IR (K a compile-time constant <= BLOCK_K) with a TMA-loaded bias, or any `[M, N]` addend of the GEMM result | wrong answer (reproduced) | The addend is folded into the accumulator init, and its commit lands in the MMA partition. A runtime K launched with K <= BLOCK_K keeps its K loop and is not affected. See [hazards.md](hazards.md#single-k-tile-with-an-additive-epilogue-loaded-by-tma). | `Combine.cpp`, `CombineDotAddFPattern`, `CombineDotAddIPattern`; `WSCodePartition.cpp`, `insertAsyncComm` |
-| A side-input landing buffer per subtile that is not a multiple of 128 bytes, at `EPILOGUE_SUBTILE >= 2` | requires | A single copy, or a box of at least 128 bytes: subtile buffers form a group that the planner may multi-buffer, and the planner never checks TMA alignment. See [hazards.md](hazards.md#tma-landing-buffer-smaller-than-128-bytes-multi-buffered). | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
-| A prologue on B under `two_ctas`: B TMA-loaded, then scaled or cast in registers before the dot | wrong answer (reproduced) | B is no longer a direct descriptor load, so the 2-CTA B split is skipped with only a debug log. A prologue on A is fine (A is promoted to TMEM). See [hazards.md](hazards.md#2-cta-with-an-unsplit-b) | `third_party/nvidia/hopper/lib/Transforms/Transform2CTALoads.cpp`, `runOnOperation` ("B not from descriptor load") |
+| Condition | Status | Why |
+|---|---|---|
+| No K loop in the IR (K a compile-time constant <= BLOCK_K) with a TMA-loaded bias, or any `[M, N]` addend of the GEMM result | wrong answer | The addend is folded into the accumulator init, and its commit lands in the MMA partition. |
+| A side-input landing buffer per subtile that is not a multiple of 128 bytes, at `EPILOGUE_SUBTILE >= 2` | requires | A single copy, or a box of at least 128 bytes: subtile buffers form a group that the planner may multi-buffer, and the planner never checks TMA alignment. |
+| A prologue on B under `two_ctas`: B TMA-loaded, then scaled or cast in registers before the dot | wrong answer | B is no longer a direct descriptor load, so the 2-CTA B split is skipped with only a debug log. |
 
 ## Mechanism
 
-**Every TMA side input is staged through SMEM.**
-- **What changes:** each side-input `desc.load` becomes an `nvws.descriptor_load` into its own descriptor-layout SMEM buffer, which is also the cross-partition channel; register consumers read it with a `local_load` tagged with the consumer partitions. The planner counts each such buffer against the SMEM budget and may give it several copies. A pointer `tl.load` of the same input, issued in the partition that uses it, takes no planner SMEM.
-- **What it relieves:** the producer partition issues the load asynchronously, off the epilogue's critical path.
-- **What it costs:** N side inputs cost N landing buffers x copies x the box size; every release is a partition-wide barrier ([tma_loads.md](tma_loads.md#mechanism)); an unreproduced code-inspection hazard: the release back to the TMA producer emits no proxy fence ([hazards.md](hazards.md#tma-tile-read-into-registers-released-without-a-proxy-fence)).
-- Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` (register-consumed path).
-
-**A cast prologue keeps WS; on B it doubles the operand's SMEM.**
-- **What changes:** an operand loaded wide (e.g. fp32) and cast for the MMA is register-consumed, so it gets a wide landing buffer. The narrow MMA copy goes to TMEM for A on sm100 (`PromoteLHSToTMem.cpp`, `LHSToTMem`), or to a second, register-written SMEM buffer for B (or for A when promotion is blocked). An MMA that consumes the wide type directly (e.g. TF32) needs only the landing buffer.
-- **What it costs:** for B, SMEM per stage is `BLOCK_N x BLOCK_K x (wide + narrow element size)`, shrinking the legal stage or tile set. Under 2-CTA a B prologue is a wrong answer (see "Never try (any problem)").
-- Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS`; `WSCodePartition.cpp`, `isChannelAnchorOp`.
-
-**A pad prologue is exact.**
-- **What changes:** with `padding="zero"`, TMA returns zeros past the descriptor's global extent, so zero-padding M or K is expressed by setting the descriptor shape to the unpadded extent: no pad kernel, no extra buffer.
-- **What it costs:** nothing beyond the normal operand load. **Limit:** only replaces a pad; a prologue that computes anything else still needs a register path.
-- Code: `python/triton/tools/tensor_descriptor.py`, `TensorDescriptor`.
+- **TMA side input staged through SMEM:** each side-input `desc.load` becomes an `nvws.descriptor_load` into its own descriptor-layout SMEM buffer, which is also the cross-partition channel, and register consumers read it with a `local_load` tagged with the consumer partitions (`WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS`, register-consumed path) -> the producer partition issues the load asynchronously, off the epilogue's critical path -> the planner counts each buffer against the SMEM budget and may give it several copies, so N side inputs cost N landing buffers x copies x the box size, and every release is a partition-wide barrier ([tma_loads.md](tma_loads.md#mechanism)).
+- **Pointer load of a side input:** a pointer `tl.load` of the same input, issued in the partition that uses it, takes no planner SMEM.
+- **Release without proxy fence:** an unreproduced code-inspection hazard: the release of a side-input buffer back to the TMA producer emits no proxy fence ([hazards.md](hazards.md#tma-tile-read-into-registers-released-without-a-proxy-fence)).
+- **Cast prologue keeps WS:** an operand loaded wide (e.g. fp32) and cast for the MMA is register-consumed, so it gets a wide landing buffer; the narrow MMA copy goes to TMEM for A on sm100 (`PromoteLHSToTMem.cpp`, `LHSToTMem`) or to a second, register-written SMEM buffer for B (or for A when promotion is blocked), and an MMA that consumes the wide type directly (e.g. TF32) needs only the landing buffer (`WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS`; `WSCodePartition.cpp`, `isChannelAnchorOp`) -> for B, SMEM per stage is `BLOCK_N x BLOCK_K x (wide + narrow element size)`, shrinking the legal stage or tile set; under 2-CTA a B prologue is a wrong answer (see "Pruning ruleset").
+- **Pad prologue is exact:** with `padding="zero"`, TMA returns zeros past the descriptor's global extent, so zero-padding M or K is expressed by setting the descriptor shape to the unpadded extent, with no pad kernel and no extra buffer (`python/triton/tools/tensor_descriptor.py`, `TensorDescriptor`) -> costs nothing beyond the normal operand load; it only replaces a pad, and a prologue that computes anything else still needs a register path.
 
 ## Interactions
 

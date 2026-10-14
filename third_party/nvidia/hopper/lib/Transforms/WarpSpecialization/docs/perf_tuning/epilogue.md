@@ -9,51 +9,35 @@ Budget numbers are in [resources.md](resources.md). Code paths are relative to `
 
 ## Knobs
 
-| Knob | How set | What it does | Existing doc |
-|---|---|---|---|
-| Epilogue subtile count `ES` | kernel source (accumulator split into `ES` slices of `BLOCK_M × BLOCK_N/ES`) | Number of staging slices per tile and the size of each `tmem_load` | [SubtileOperator.md, "Motivation"](../SubtileOperator.md#motivation) |
-| `generate_subtiled_region` / `TRITON_GENERATE_SUBTILED_REGION` | compile option / env | Represents the subtiled epilogue as a `SubtiledRegionOp` | [SubtileOperator.md, "Compiler Option"](../SubtileOperator.md#compiler-option) |
-| `separate_epilogue_store` | `tl.range(...)` kwarg | Moves TMA epilogue stores into their own one-warp partition | [PartitionSchedulingMeta.md, "Target Partition Layouts"](../PartitionSchedulingMeta.md#target-partition-layouts) |
-| `merge_epilogue`, `merge_epilogue_to_computation` | `tl.range(...)` kwargs | Route non-store epilogue ops into an existing partition instead of a separate epilogue partition | [PartitionSchedulingMeta.md, "Tuning Knobs"](../PartitionSchedulingMeta.md#tuning-knobs) |
-| `TRITON_WS_STAGING_COPIES` | env | Caps output-staging copies at min(`num_stages`, value). The same cap applies to other Phase 3.7 epilogue groups and, unless `TRITON_WS_TMA_REDUCE_STAGING_COPIES` is set, to TMA-reduce staging | [TMAStoreWaitPipeline.md, `TRITON_WS_STAGING_COPIES`](../TMAStoreWaitPipeline.md#triton_ws_staging_copies-capping-the-phase-37-target) |
-| `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | env | Copy target for TMA-reduce staging; may exceed `num_stages` | same |
-| `early_tma_store_lowering` | compile option (on unless set to `False`) | Lowers TMA stores to staging allocations before the WS planner runs | [TMAStoreWaitPipeline.md, "Memory Planner: `buffer.tmaStaging` Handling"](../TMAStoreWaitPipeline.md#memory-planner-buffertmastaging-handling) |
-| `tma_store_pipelining` | compile option (default on) | Annotates and reorders TMA store waits | [TMAStoreWaitPipeline.md, "Wait Annotation and Reordering Pipeline"](../TMAStoreWaitPipeline.md#wait-annotation-and-reordering-pipeline) |
+| Knob | Set via | Legal values | Default | Priority | Applies when | Prereqs |
+|---|---|---|---|---|---|---|
+| `separate_epilogue_store` | `tl.range` kwarg | bool | False | P0 | Kernels with a TMA output store. With a pointer `tl.store` it is a duplicate config. | A TMA output store. |
+| Epilogue subtiling (ES) | kernel pattern (accumulator split into ES column slices) | 1 / 2 / 4 / 8 | 1 | P0 | Every kernel with a subtiled epilogue store. | A side-input slice under 128 B at ES >= 2 needs #3939 (OPEN). |
+| `TRITON_WS_STAGING_COPIES` | env var | int K >= 1 | unset (no cap) | P0 | 1-CTA, ES >= 2, TMA store. At ES=1 it is a duplicate config; under `two_ctas` it is silently ignored. | Legal ring depths for same-partition staging: #3571 (OPEN). |
+| `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | env var | int >= 1 | unset (min(`num_stages`, staging cap)) | P0 | Only kernels with a TMA-reduce output (`desc.atomic_add` / `store_reduce`). | A TMA-reduce output. |
+| `merge_epilogue` | `tl.range` kwarg | bool | False | P1 | Kernels with a correction or reduction partition; otherwise epilogue ops already go to computation. | — |
+| `generate_subtiled_region` | compile option, or env `TRITON_GENERATE_SUBTILED_REGION`‡ | bool | False | P1 | Only an ES >= 2 split; with no split there is nothing to wrap. | Not with dp=2 + a per-subtile scale (TRACKER: hang). |
+| `merge_epilogue_to_computation`, `merge_correction` | `tl.range` kwargs | bool | False | P2 | Route epilogue or correction ops into computation; a GEMM without a correction partition has nothing for `merge_correction` to move. | — |
 
-## Never try (any problem)
+## Pruning ruleset
 
-| Condition | Status | Why | Code |
-|---|---|---|---|
-| `separate_epilogue_store=True` with pointer (`tl.store`) epilogue stores | duplicate config | Only `descriptor_store`, `async_tma_copy_local_to_global` and TMA store waits count as epilogue stores; with none, no store partition is created | `WS/PartitionSchedulingMeta.cpp`, `isEpilogueStoreOp`, `createPartitionLayout` |
-| `TRITON_WS_STAGING_COPIES` with `ES=1` | duplicate config | A staging group with fewer than 2 slices is never bumped, and Phase 4 never raises staging | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` ("only ... buffer(s) in group, skipping"), `allocateSmemBuffers` (Phase 4 never raises staging) |
-| Staging copies under `two_ctas` | silently ignored | Staging is held at one copy: 2-CTA TMA stores have one completion phase per CTA-pair tile | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
-| A correctness floor needing > 1 staging copy under `two_ctas` | compile error | "2CTA ordinary TMA output staging requires one copy; the correctness floor requires N" | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
-| Same-partition store (`separate_epilogue_store=False`) with a staging cap that does not divide `ES` | duplicate config | Rounded down to the largest divisor of `ES` that fits: the wait_group-drained ring is correct only when copies divide the slice count | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` (`K | S` check) |
-| Staging cap above `num_stages` (store staging) | duplicate config | Capped at `num_stages`: the bump target is min(`num_stages`, cap); only TMA-reduce staging may exceed it | `WS/WSMemoryPlanner.cpp`, `getStagingCopiesCap`, `increaseFusedEpilogueCopies` |
+| Condition | Status | Why |
+|---|---|---|
+| `separate_epilogue_store=True` with pointer (`tl.store`) epilogue stores | duplicate config | Only `descriptor_store`, `async_tma_copy_local_to_global` and TMA store waits count as epilogue stores; with none, no store partition is created. |
+| `TRITON_WS_STAGING_COPIES` with `ES=1` | duplicate config | A staging group with fewer than 2 slices is never bumped, and Phase 4 never raises staging. |
+| Staging copies under `two_ctas` | silently ignored | Staging is held at one copy: 2-CTA TMA stores have one completion phase per CTA-pair tile. |
+| A correctness floor needing > 1 staging copy under `two_ctas` | compile error | "2CTA ordinary TMA output staging requires one copy; the correctness floor requires N". |
+| Same-partition store (`separate_epilogue_store=False`) with a staging cap that does not divide `ES` | duplicate config | Rounded down to the largest divisor of `ES` that fits: the wait_group-drained ring is correct only when copies divide the slice count. |
+| Staging cap above `num_stages` (store staging) | duplicate config | Capped at `num_stages`: the bump target is min(`num_stages`, cap); only TMA-reduce staging may exceed it. |
 
 ## Mechanism
 
-**Staging footprint.** The `ES` staging slices of one store (same descriptor, source accumulator and block) share one buffer id, so the footprint is one slice × copies, not `ES` slices × copies (`fuseEpilogueWSBuffers`, `computeTotalSmem` in `WS/WSMemoryPlanner.cpp`):
-> staging SMEM = `BLOCK_M × (BLOCK_N/ES) × output element size × copies`
-
-Mechanics: [TMAStoreWaitPipeline.md, "Phase 3.5: TMA Staging Fusion"](../TMAStoreWaitPipeline.md#phase-35-tma-staging-fusion).
-
-**Staging depth.** Raised before operand copies (`increaseFusedEpilogueCopies` runs before Phase 4), up to min(`num_stages`, `TRITON_WS_STAGING_COPIES`) and the budget. Legal counts depend on where the store runs:
-- **own partition** (`separate_epilogue_store=True`): any count; slot and phase come from a continuous producer/consumer mbarrier rotation;
-- **epilogue partition**: only divisors of `ES`; the ring is drained by `cp.async.bulk.wait_group(K-1)`.
-
-Mechanics: [TMAStoreWaitPipeline.md, "`K | S` cap for same-partition (wait_group-drained) staging"](../TMAStoreWaitPipeline.md#k--s-cap-for-same-partition-wait_group-drained-staging) and [AccumulationCounters.md, "What Is an Accumulation Counter?"](../AccumulationCounters.md#what-is-an-accumulation-counter).
-
-**Registers.** One slice's `tmem_load` holds `BLOCK_M × (BLOCK_N/ES) / (32 × warps)` 32-bit values per thread for an fp32 accumulator (warps = the loading partition's count); at `BLOCK_M=128, BLOCK_N=256` with 4 warps, an `ES=2` slice is 128 registers per thread and `ES=4` is 64. In the GEMM layouts the epilogue runs in the default region, which partition-warp halving never shrinks (see [warps_and_registers.md](warps_and_registers.md#mechanism)), so `ES` does not change the epilogue's warp count.
-
-**Store placement** (`WS/PartitionSchedulingMeta.cpp`, `createPartitionLayout`): `separate_epilogue_store` adds an `epilogue_store` partition (one warp after `optimizePartitionNumWarps`) when TMA epilogue stores exist; `merge_epilogue` / `merge_epilogue_to_computation` suppress the separate `epilogue` partition.
-
-**Plan search.** A `SubtiledRegionOp` makes the TMEM plan search fall back to the heuristic planner (`WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch`), so accumulator multi-buffering stays on for subtiled-region kernels even under `TRITON_WS_SMEM_PLAN_SEARCH=1`.
-
-**Change → relief → cost:**
-- **Raising `ES`:** relieves per-copy staging SMEM and per-slice epilogue registers; costs more TMA stores and barrier rounds per tile, and with a same-partition store the legal copy counts become the divisors of the new `ES`.
-- **Raising staging copies:** relieves: stores of consecutive slices or tiles can overlap; costs operand ring depth, since staging is reserved first.
-- **`separate_epilogue_store=True`:** relieves: frees staging depth from the divisor rule and takes TMA issue out of the epilogue partition; costs one more worker warp, which can cost a whole warp group of registers (see [warps_and_registers.md](warps_and_registers.md)), and with `ES` >= 2 and `TRITON_WS_STAGING_COPIES` unset, staging may take up to `num_stages` copies before the operands, which starves the B ring (see the rules below).
+- **`EPILOGUE_SUBTILE` (`ES`):** changes the staging footprint: the `ES` staging slices of one store (same descriptor, source accumulator and block) share one buffer id, so staging SMEM = `BLOCK_M × (BLOCK_N/ES) × output element size × copies`, one slice × copies rather than `ES` slices × copies (`fuseEpilogueWSBuffers`, `computeTotalSmem` in `WS/WSMemoryPlanner.cpp`; [TMAStoreWaitPipeline.md, "Phase 3.5: TMA Staging Fusion"](../TMAStoreWaitPipeline.md#phase-35-tma-staging-fusion)) -> relieves per-copy staging SMEM and per-slice epilogue registers -> costs more TMA stores and barrier rounds per tile, and with a same-partition store the legal copy counts become the divisors of the new `ES`.
+- **Epilogue registers:** one slice's `tmem_load` holds `BLOCK_M × (BLOCK_N/ES) / (32 × warps)` 32-bit values per thread for an fp32 accumulator (warps = the loading partition's count); at `BLOCK_M=128, BLOCK_N=256` with 4 warps, an `ES=2` slice is 128 registers per thread and `ES=4` is 64; in the GEMM layouts the epilogue runs in the default region, which partition-warp halving never shrinks (see [warps_and_registers.md](warps_and_registers.md#mechanism)), so `ES` does not change the epilogue's warp count.
+- **Staging copies:** changes staging depth, raised before operand copies (`increaseFusedEpilogueCopies` runs before Phase 4) up to min(`num_stages`, `TRITON_WS_STAGING_COPIES`) and the budget; with the store in its own partition any count is legal (slot and phase come from a continuous producer/consumer mbarrier rotation), in the epilogue partition only divisors of `ES` (the ring is drained by `cp.async.bulk.wait_group(K-1)`) ([TMAStoreWaitPipeline.md, "`K | S` cap for same-partition (wait_group-drained) staging"](../TMAStoreWaitPipeline.md#k--s-cap-for-same-partition-wait_group-drained-staging), [AccumulationCounters.md, "What Is an Accumulation Counter?"](../AccumulationCounters.md#what-is-an-accumulation-counter)) -> relieves: stores of consecutive slices or tiles can overlap -> costs operand ring depth, since staging is reserved first.
+- **Store placement:** in `WS/PartitionSchedulingMeta.cpp` (`createPartitionLayout`), `merge_epilogue` / `merge_epilogue_to_computation` suppress the separate `epilogue` partition.
+- **`separate_epilogue_store=True`:** changes placement by adding an `epilogue_store` partition (one warp after `optimizePartitionNumWarps`) when TMA epilogue stores exist -> relieves: frees staging depth from the divisor rule and takes TMA issue out of the epilogue partition -> costs one more worker warp, which can cost a whole warp group of registers (see [warps_and_registers.md](warps_and_registers.md)), and with `ES` >= 2 and `TRITON_WS_STAGING_COPIES` unset, staging may take up to `num_stages` copies before the operands, which starves the B ring (see the rules below).
+- **Plan search:** `generate_subtiled_region` wraps the `ES` copies in a `SubtiledRegionOp` ([SubtileOperator.md, "Compiler Option"](../SubtileOperator.md#compiler-option)); a `SubtiledRegionOp` makes the TMEM plan search fall back to the heuristic planner (`WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch`), so accumulator multi-buffering stays on for subtiled-region kernels even under `TRITON_WS_SMEM_PLAN_SEARCH=1`.
 
 ## Interactions
 
