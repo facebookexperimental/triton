@@ -499,14 +499,17 @@ def TTNG_InitBarrierOp
   let description = [{
       Initializes a shared memory allocation with mbarrier information.
       `alloc` is a descriptor to the shared memory allocation. `count` is the
-      number of arrives expected by the barrier.
+      number of arrives expected by the barrier. `bCluster` requests compiler-owned
+      kernel-entry initialization visibility and rendezvous on SM90+ clusters.
+      It does not change storage, arrival counts, or transaction semantics.
 
       This lowers to PTX mbarrier.init.shared::cta.b64.
   }];
 
   let arguments =
       (ins Arg<TTG_MemDescType, "", GenericSharedWrite>:$alloc,
-          I32Attr:$count);
+          I32Attr:$count, DefaultValuedAttr<BoolAttr, "false">:$bCluster);
+  // ODS defaults the trailing attribute in both generated builder forms.
   let assemblyFormat =
       "$alloc `,` $count attr-dict `:` qualified(type($alloc))";
   let hasVerifier = 1;

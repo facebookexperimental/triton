@@ -1085,7 +1085,7 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
                 reference.float())
             self.assertLess(relative_l2.item(), max_relative_l2)
 
-    def _assert_misaligned_query_uses_native(self, query_shape, key_shape, *, causal, enable_gqa, seed):
+    def _assert_misaligned_query_uses_native(self, query_shape, key_shape, *, causal, seed):
         generator = torch.Generator(device="cuda").manual_seed(seed)
         query_storage = torch.randn(
             torch.Size(query_shape).numel() + 1,
@@ -1099,14 +1099,38 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
         key = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
         value = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
         grad_out = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        state = torch.ops.aten._scaled_dot_product_flash_attention.default(query, key, value, 0.0, causal, False)
+        out, lse, cum_q, cum_k, max_q, max_k, rng_seed, rng_offset, _ = state
+        out = out.contiguous()
+        lse = lse.contiguous()
 
-        expected = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+        # SDPA can align query before saving it for backward.
+        # Call backward directly to preserve the misaligned query.
+        def backward():
+            return torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+                grad_out,
+                query,
+                key,
+                value,
+                out,
+                lse,
+                cum_q,
+                cum_k,
+                max_q,
+                max_k,
+                0.0,
+                causal,
+                rng_seed,
+                rng_offset,
+            )
+
+        expected = backward()
         with _activated_tlx_flash_attention_provider(), mock.patch.object(
                 amd_fa_bwd,
                 "fa_backward",
                 wraps=amd_fa_bwd.fa_backward,
         ) as tlx_backward:
-            actual = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+            actual = backward()
         tlx_backward.assert_not_called()
         for result, reference in zip(actual, expected, strict=True):
             torch.testing.assert_close(result, reference)
@@ -1219,7 +1243,6 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
             (4, 48, 1024, 64),
             (4, 6, 1024, 64),
             causal=True,
-            enable_gqa=True,
             seed=3643,
         )
 
@@ -1228,7 +1251,6 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
             (16, 64, 1024, 128),
             (16, 8, 1024, 128),
             causal=False,
-            enable_gqa=True,
             seed=3644,
         )
 
