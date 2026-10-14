@@ -16,7 +16,7 @@ Code paths are relative to the repository root.
 | `multicast=` on a load | `desc.load(offsets, multicast=None/True/False)` | Per-load override of the kernel default | [triton_tma_multicast.md, "Per-load policy"](../../../../../../../../docs/design/triton_tma_multicast.md#per-load-policy) |
 | `ctas_per_cga` | compile option | The cluster that multicast would broadcast within | [triton_tma_multicast.md, "Cluster geometry and program IDs under `ctas_per_cga`"](../../../../../../../../docs/design/triton_tma_multicast.md#cluster-geometry-and-program-ids-under-ctas_per_cga) |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Status | Why | Code |
 |---|---|---|---|
@@ -36,7 +36,7 @@ Code paths are relative to the repository root.
 
 **What it would cost.** A cluster launch, cluster-wide barriers around each multicast transaction, and a schedule that keeps the loads cluster-uniform.
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - **IF** tuning an autoWS GEMM in this tree, **THEN** skip `multicast=True` and any cluster shape chosen only to enable multicast, **BECAUSE** the generated code is identical to `multicast=False` (duplicate config).
 - **IF** multicast lowering lands later, **THEN** re-derive these rules from the planner conditions above, **BECAUSE** a static persistent loop bounded by `program_id(0)` would still be rejected under an x-dimension cluster.

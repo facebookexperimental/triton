@@ -13,7 +13,7 @@ This page lists every knob that changes generated code for an autoWS GEMM on B20
 - `env` = environment variable, or the matching `triton.knobs.nvidia.*` field in `nvidia_knobs` (`python/triton/knobs.py`).
 - `pattern` = a way of writing the kernel, not a single setting.
 
-**Doc links:** relative to this folder. "No doc yet" means the knob is a gap tracked in [TRACKER](TRACKER.md).
+**Doc links:** relative to this folder.
 
 Prerequisite for everything below: `TRITON_USE_META_WS=1` (env; in the cache key). It switches warp specialization from the upstream pass to Meta's partition scheduler plus the WS pipeline.
 
@@ -25,7 +25,7 @@ Prerequisite for everything below: `TRITON_USE_META_WS=1` (env; in the cache key
 | `num_stages` (per loop) | tl.range | int | Overrides the kernel-level `num_stages` for one loop. Has no effect on a dynamic or CLC `while`. | [AutoWSAnnotations: `num_stages` / pipelining on a `while`](../AutoWSAnnotations.md#num_stages--pipelining-on-a-while-not-applicable) |
 | `flatten` | tl.range | bool, default False | Fuses the tile loop and the K loop into one loop. The WS mark is carried onto the fused loop (`FuseNestedLoops.cpp`). | [AutoWSAnnotations: Annotation → IR attribute → consumer](../AutoWSAnnotations.md#annotation--ir-attribute--consumer) (table row only) |
 | `disallow_acc_multi_buffer` | tl.range | bool, default False | Under Meta WS it does not cap TMEM accumulator copies. It changes the MMA latency the software pipeliner assigns (`AssignLatencies.cpp`), and when dp > 1 it floors every TMA-fed SMEM operand of the MMA at `num_stages` (`getStaticSmemCopySafetyFloor`). | [AutoWSAnnotations: `disallow_acc_multi_buffer`](../AutoWSAnnotations.md#disallow_acc_multi_buffer) |
-| `loop_unroll_factor`, `disable_licm` | tl.range | int / bool | Generic loop transforms: IR-level unrolling, and turning off loop-invariant hoisting. Not specific to WS. | No doc yet: see [TRACKER](TRACKER.md) |
+| `loop_unroll_factor`, `disable_licm` | tl.range | int / bool | Generic loop transforms: IR-level unrolling, and turning off loop-invariant hoisting. Not specific to WS. | [AutoWSAnnotations: `loop_unroll_factor` and `disable_licm`](../AutoWSAnnotations.md#loop_unroll_factor-and-disable_licm) |
 
 ## Partitioning and scheduling
 
@@ -47,7 +47,7 @@ Prerequisite for everything below: `TRITON_USE_META_WS=1` (env; in the cache key
 
 | Knob | Set via | Values | What it does | Doc |
 |---|---|---|---|---|
-| Descriptor loads/stores | pattern (`tl.make_tensor_descriptor` or host `TensorDescriptor`; `desc.load` / `desc.store`) | — | TMA producer and store partitions are the shape autoWS expects. Pointer stores do not form an epilogue-store partition. | No doc yet: see [TRACKER](TRACKER.md) |
+| Descriptor loads/stores | pattern (`tl.make_tensor_descriptor` or host `TensorDescriptor`; `desc.load` / `desc.store`) | — | TMA producer and store partitions are the shape autoWS expects. Pointer stores do not form an epilogue-store partition. | [TMADescriptors](../TMADescriptors.md) |
 | `multicast` (per load) | op (`desc.load(multicast=)`) | None / True / False | Gives permission for compiler-selected TMA multicast within the cluster. Silently falls back to per-CTA loads. | [triton_tma_multicast: Current implementation](../../../../../../../../docs/design/triton_tma_multicast.md#current-implementation) |
 | `multicast` | option | bool, default False | Default multicast policy for descriptor loads in the kernel. | [triton_tma_multicast: Decision summary](../../../../../../../../docs/design/triton_tma_multicast.md#decision-summary) |
 | `auto_tma` / `auto_tma_device` | option, or env `TRITON_AUTO_TMA`‡ / `TRITON_AUTO_TMA_DEVICE`‡ (OR'd together) | bool | Rewrites pointer loads as TMA (`add_promote_load_to_tma`, `PromoteLoadToTMA.cpp`), using host or device descriptors. | [AutoTMAPromotion](../AutoTMAPromotion.md) |
