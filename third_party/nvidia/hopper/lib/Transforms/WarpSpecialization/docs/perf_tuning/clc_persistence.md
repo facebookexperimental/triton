@@ -64,14 +64,10 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 
 ## When to try it (depends on the problem)
 
-- **IF** tiles < number of SMs, **THEN** prefer (ranks first; removes nothing) a non-persistent or static persistent candidate over CLC/dynamic, **BECAUSE** there is nothing to rebalance and every program runs at most one tile.
-- **IF** tiles are uniform (dense GEMM), **THEN** prefer (ranks first; removes nothing) static persistent, **BECAUSE** dynamic schedules only buy rebalancing, and static keeps every loop annotation effective.
-- **IF** per-tile work is uneven (grouped or jagged problems), **THEN** try CLC, **BECAUSE** hardware cancellation rebalances without a software counter.
-- **IF** `two_ctas` and a dynamic schedule are both wanted, **THEN** only try `ClcTileScheduler` (this removes the atomic dynamic scheduler), **BECAUSE** the atomic scheduler with `two_ctas` gives a wrong answer or hangs.
-- **IF** the schedule is CLC or dynamic, **THEN** skip sweeping loop `num_stages` on the outer loop, the `merge_*` knobs, the SMEM/TMEM allocation options and `pingpongAutoWS`, **BECAUSE** they are ignored or have no end-to-end contract on an outer `while`.
-- **IF** the kernel uses autoWS, **THEN** skip `clc=True`, **BECAUSE** it is a compile error; use `tl.clc_tile_scheduler()`.
-- **IF** tiles mod SMs is small relative to the SM count under static persistence, **THEN** prefer (ranks first; removes nothing) a tile shape that changes the tile count, **BECAUSE** the last wave's idle SMs are a fixed cost that no in-tile knob removes.
-- **IF** clustered CLC is used with a padded tile grid, **THEN** let padded tiles run (TMA clips them) instead of exiting early, **BECAUSE** inactive cluster members are unsupported.
+- IF `T <= P`, THEN skip CLC and the atomic dynamic scheduler, BECAUSE every program gets one tile, so there is nothing to rebalance and each claim (`clc_advance` or the atomic) is pure cost. [mechanism] (`ClcTileScheduler`, `DynamicPersistent1DScheduler`)
+- IF `T <= P`, THEN skip the `GROUP_M` / tile-order axis, BECAUSE all tiles are co-resident, so tile order cannot change L2 reuse. [mechanism] (`StaticPersistent1DScheduler`)
+- IF per-tile work is uneven (grouped or jagged problems) and `T > P`, THEN prefer CLC over static persistent, BECAUSE hardware cancellation rebalances the uneven tiles without a software counter, while static persistence fixes each program's tiles up front. [mechanism]
+Tail effects under static persistence (idle SMs in the last wave): see the tail-efficiency rule in [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem).
 
 ## Interactions
 
