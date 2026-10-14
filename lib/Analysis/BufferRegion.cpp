@@ -270,6 +270,26 @@ bool isUsedAsBarrier(Value v) {
   });
 }
 
+// toLinearLayout asserts that every dim is a power of two
+// (LinearLayoutConversions.cpp). BufferRegion only ever passes it the
+// allocation shape with pipelining dims dropped
+// (dropPipeliningDim(allocShape, encoding)), so a leading NPOT stage or page
+// dim never reaches the assert: pipelined kernels legitimately use NPOT
+// logical shapes (e.g. memdesc<3x32x32> subviews or multibuffered
+// memdesc<5x1x2x1x2x256xi8> allocs) whose layout-relevant suffix is still all
+// powers of two. Degrade to Unknown only when the dims that actually reach
+// toLinearLayout are NPOT. Padded encodings take the paddedLinearLayout path
+// and distributed encodings bypass the assert, so neither needs the guard.
+bool reachesNPOTLinearLayoutAssert(Type type) {
+  auto ty = cast<ttg::MemDescType>(type);
+  auto encoding = ty.getEncoding();
+  if (isa<ttg::DistributedEncodingTrait>(encoding) ||
+      ttg::isPaddedEncoding(encoding))
+    return false;
+  return !llvm::all_of(ttg::dropPipeliningDim(ty.getAllocShape(), encoding),
+                       llvm::isPowerOf2_64);
+}
+
 struct MemDescSubsliceOffsets {
   uint32_t byteOffset = 0;
   uint32_t partitionOffset = 0;
@@ -388,6 +408,20 @@ AddressSet AddressSet::translated(uint32_t delta) const {
            "translated address set exceeds 32-bit address space");
     result.set(translated);
   }
+  return result;
+}
+
+BufferRegionView
+BufferRegionView::translated(uint32_t offset,
+                             uint32_t newAllocationFrame) const {
+  BufferRegionView result = *this;
+  result.region.baseOffset += offset;
+  for (auto &[cta, addresses] : result.region.ctaAddresses)
+    addresses = addresses.translated(offset);
+  result.storageBase += offset;
+  for (uint32_t &base : result.partitionBases)
+    base += offset;
+  result.allocationFrame = newAllocationFrame;
   return result;
 }
 
@@ -576,6 +610,28 @@ LogicalResult BufferRegionAnalysis::initialize(Operation *top) {
   return success();
 }
 
+SmallVector<BufferRegionAccess>
+BufferRegionAnalysis::getAccessRegions(Value value) {
+  const RegionInfo &info = getRegionInfo(value);
+  if (info.kind != RegionInfo::Kind::Exact || info.views.empty())
+    return {std::nullopt};
+  SmallVector<BufferRegionAccess> accesses;
+  for (const BufferRegionView &view : info.views)
+    accesses.push_back(view);
+  return accesses;
+}
+
+BufferRegionAccess BufferRegionAnalysis::translateToCallsite(
+    BufferRegionAccess view, CallOpInterface call, FunctionOpInterface caller,
+    FunctionOpInterface callee) const {
+  uint32_t calleeFrame = getOperationId(callee.getOperation());
+  if (!view || view->allocationFrame != calleeFrame)
+    return view;
+  auto offset = call->getAttrOfType<IntegerAttr>("allocation.offset");
+  return view->translated(offset ? offset.getInt() : 0,
+                          getOperationId(caller.getOperation()));
+}
+
 LogicalResult BufferRegionAnalysis::visitOperation(
     Operation *op,
     llvm::ArrayRef<const dataflow::Lattice<RegionInfo> *> operands,
@@ -603,6 +659,8 @@ LogicalResult BufferRegionAnalysis::visitOperation(
         getAllocationOffsets(localAllocOp);
     if (failed(offsets))
       return failure();
+    if (reachesNPOTLinearLayoutAssert(localAllocOp.getResult().getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     ArrayRef<uint32_t> partitionBases = offsets->size() > 1
                                             ? ArrayRef<uint32_t>(*offsets)
                                             : ArrayRef<uint32_t>();
@@ -613,6 +671,8 @@ LogicalResult BufferRegionAnalysis::visitOperation(
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(op)) {
     uint64_t storageBase = getAllocationOffset(tmemAllocOp);
     assert(storageBase <= std::numeric_limits<uint32_t>::max());
+    if (reachesNPOTLinearLayoutAssert(tmemAllocOp.getResult().getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     regionInfo.views.insert(getAllocView(tmemAllocOp.getResult(),
                                          static_cast<uint32_t>(storageBase)));
     return propagateRegions(regionInfo);
@@ -621,6 +681,8 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
+    if (reachesNPOTLinearLayoutAssert(memdescIndexOp.getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     int numSubBuffers =
         cast<ttg::MemDescType>(memdescIndexOp.getSrc().getType()).getShape()[0];
     int firstSubBuffer = 0;
@@ -647,6 +709,9 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
+    if (reachesNPOTLinearLayoutAssert(memdescSubsliceOp.getSrc().getType()) ||
+        reachesNPOTLinearLayoutAssert(memdescSubsliceOp.getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     MemDescSubsliceOffsets relativeOffset =
         getMemDescSubsliceUnpaddedOffsets(memdescSubsliceOp);
     for (const BufferRegionView &view : in.views)
@@ -666,6 +731,9 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
+    if (reachesNPOTLinearLayoutAssert(tmemSubsliceOp.getSrc().getType()) ||
+        reachesNPOTLinearLayoutAssert(tmemSubsliceOp.getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     uint32_t relativeOffset = ttng::getTMemSubSliceOffset(
         tmemSubsliceOp.getSrc().getType(), tmemSubsliceOp.getOffset(),
         tmemSubsliceOp.getDim());
@@ -685,6 +753,8 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
+    if (reachesNPOTLinearLayoutAssert(reinterpretOp.getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     for (const BufferRegionView &view : in.views)
       regionInfo.views.insert(getSubView(reinterpretOp.getType(), view));
     return propagateRegions(regionInfo);
