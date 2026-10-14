@@ -1,16 +1,25 @@
 """
 Fixed-config timing for Meta AutoWS GEMMs on Blackwell.
 
-Times one GEMM kernel across fixed (not autotuned) AutoWS configurations so that
-the "[measured]" rules in
-third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/perf_tuning/
-can be re-run on any build. Each named regime is a set of shapes and configs
-that one rule cites, e.g.
+Times one GEMM kernel across fixed (not autotuned) AutoWS configurations, to
+gather evidence for the knobs described in
+third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/perf_tuning/.
+Modes:
 
-    TRITON_USE_META_WS=1 python python/test/microbenchmark/autows_gemm.py --regime stages --json out.json
-    TRITON_USE_META_WS=1 python python/test/microbenchmark/autows_gemm.py --list
-    TRITON_USE_META_WS=1 python python/test/microbenchmark/autows_gemm.py --shape 4096,4096,4096 \
-        --config bm=128,bn=256,bk=64,ns=4,es=2
+    # one-off configs on one shape
+    autows_gemm.py --shape 4096,4096,4096 --config bm=128,bn=256,ns=4,es=2
+    # a preset (a fixed list of shapes x configs); --list shows them
+    autows_gemm.py --preset stages --json out.json
+    # problems: sweep a knob space per problem (M,N,K,dtype,op[,epilogue]); report the
+    # best fused config, fusion gain, and (with --baseline-json from another build)
+    # compiler-upgrade gain as separate columns
+    autows_gemm.py --problem 1152,12800,1024,bf16,addmm --sweep "bn=128,256 ns=0,3,4 two=0,1" --json p.json
+    autows_gemm.py --problems problems.txt --json p.json   # one spec per line, '#' comments
+    # reuse a previously chosen config on a new shape or build and check that it is
+    # still profitable against this point's best
+    autows_gemm.py --reuse-config p.json --shape 2048,12800,1024 --sweep "bn=128,256 two=0,1"
+
+Run every mode with TRITON_USE_META_WS=1.
 
 Every arm is checked before it is timed: bitwise against torch on integer-valued
 inputs, and with torch.testing.assert_close (bf16 rtol 1.6e-2, atol 1e-2) on
@@ -31,6 +40,8 @@ import subprocess
 import sys
 from typing import NamedTuple
 
+import itertools
+
 import torch
 
 import triton
@@ -40,6 +51,7 @@ from triton.language.extra.subtile_ops import _split_n_2D
 SMEM_BYTES = 232448  # sm100 opt-in limit used by the WS memory planner
 AUX_BOUND = 4096  # upper bound used for the planner's auxiliary reservation
 NUM_SMS = 148
+IN_DTYPE = torch.bfloat16  # set per problem
 
 
 class _TileArgs(NamedTuple):
@@ -177,7 +189,7 @@ def resolve(M, N, K, c):
     return dataclasses.replace(c, es=es, ns=ns), q
 
 
-# Shapes from the evidence plan (M, N, K).
+# Named shapes for the presets (M, N, K).
 SHAPES = {
     "R1a": (8192, 8192, 8192), "R1b": (4096, 4096, 4096), "R1c": (5139, 4096, 2048), "R2a": (1152, 12800, 1024),
     "R2b": (512, 9472, 4096), "R3a": (256, 256, 65536), "R3b": (1024, 1024, 16384), "R3c": (2048, 2048, 8192),
@@ -194,7 +206,7 @@ TILES = {
 }
 
 
-def _regime(shapes, configs):
+def _preset(shapes, configs):
     return [(s, c) for s in shapes for c in configs]
 
 
@@ -207,48 +219,48 @@ def _all_ns(cfgs):
 
 
 T = TILES
-REGIMES = {
-    "tile": _regime(["R1a", "R1b", "R1c", "R2a", "R2b"],
+PRESETS = {
+    "tile": _preset(["R1a", "R1b", "R1c", "R2a", "R2b"],
                     _ns_pair([T[k] for k in ("128x128x64", "128x128x128", "128x256x64", "64x256x64", "256x128x64dp2",
                                              "2cta128x256x64", "2cta128x256x128", "2cta128x128x64")])),
-    "tile_small": _regime(["R1a", "R1b", "R2a"], [
+    "tile_small": _preset(["R1a", "R1b", "R2a"], [
         C(bm=bm, bn=bn, bk=64) for bm, bn in ((128, 16), (128, 32), (64, 32), (64, 64), (128, 64))
     ] + [T["128x128x64"]]),
-    "bk_small": _regime(["R1a", "R1b", "R2a", "R4b"],
+    "bk_small": _preset(["R1a", "R1b", "R2a", "R4b"],
                         [dataclasses.replace(c, bk=bk) for c in (T["128x128x64"], T["128x256x64"]) for bk in (16, 32, 64)]),
-    "mtail": _regime(["R6a", "R6b", "R1c", "R2b"],
+    "mtail": _preset(["R6a", "R6b", "R1c", "R2b"],
                      _ns_pair([T[k] for k in ("64x256x64", "128x256x64", "64x128x64", "128x128x64")])),
-    "stages": _regime(["R1a", "R1b", "R2a", "R3c", "R4a", "R4b"],
+    "stages": _preset(["R1a", "R1b", "R2a", "R3c", "R4a", "R4b"],
                       _all_ns([T["128x256x64"], T["128x128x128"], T["2cta128x256x128"]])),
-    "bk": _regime(["R1a", "R1b", "R2a", "R4b", "R3b"],
+    "bk": _preset(["R1a", "R1b", "R2a", "R4b", "R3b"],
                   _ns_pair([dataclasses.replace(c, bk=bk) for c in (T["128x128x64"], T["128x256x64"], T["2cta128x256x64"])
                             for bk in (64, 128)])),
-    "wes": _regime(["R1a", "R1b", "R2a"], [
+    "wes": _preset(["R1a", "R1b", "R2a"], [
         dataclasses.replace(c, nw=nw, es=es) for c in (T["128x128x64"], T["128x256x64"], T["256x128x64dp2"],
                                                        T["2cta128x256x64"]) for nw in (4, 8) for es in (1, 2, 4, 8)
         if c.bn // es >= 32
-    ]) + _regime(["R1b"], [C(bias=1, nw=nw, es=es) for nw in (4, 8) for es in (1, 2, 4)]),
-    "ses": _regime(["R1a", "R1b", "R2a"], [
+    ]) + _preset(["R1b"], [C(bias=1, nw=nw, es=es) for nw in (4, 8) for es in (1, 2, 4)]),
+    "ses": _preset(["R1a", "R1b", "R2a"], [
         dataclasses.replace(c, ses=ses, staging=st) for c in (C(es=2), C(es=4), C(bm=128, bn=128, bk=128, es=2),
                                                              C(two=1, es=4)) for ses in (0, 1) for st in (0, 1, 2)
         if not (st and c.two) and not (st == 2 and ses == 0 and c.es % 2)
     ]),
-    "2cta": _regime(["R2b", "R3b", "R3c"],
+    "2cta": _preset(["R2b", "R3b", "R3c"],
                     _ns_pair([T["128x256x64"], T["2cta128x256x64"], T["128x128x128"], T["2cta128x128x64"]])),
-    "dp": _regime(["R1a", "R1b", "R2a", "R4a", "R3c"],
+    "dp": _preset(["R1a", "R1b", "R2a", "R4a", "R3c"],
                   _ns_pair([C(bm=256, bn=128, dp=1), T["256x128x64dp2"], T["256x256x64dp2"], T["2cta128x256x64"],
                             T["2cta128x128x64"]])),
     "dp_k": [(f"M8192xN8192xK{k}", c) for k in (256, 1024, 4096, 16384) for c in (T["256x256x64dp2"], T["256x128x64dp2"])],
-    "sched": _regime(["R1a", "R1b", "R2a", "R2b", "R3b", "R3c", "R6a"], [
+    "sched": _preset(["R1a", "R1b", "R2a", "R2b", "R3b", "R3c", "R6a"], [
         dataclasses.replace(c, sched=s, gm=g) for c in (T["128x256x64"], T["2cta128x256x64"])
         for s, g in (("nonpers", 8), ("static", 8), ("static", 1), ("static", 16), ("clc", 8))
-    ]) + _regime(["R1b", "R2a", "R3b", "R6a"], [C(sched="dynamic")]),
-    "splitk": _regime(["R3a", "R3b", "R3c", "R5a", "R5b", "R1b"],
+    ]) + _preset(["R1b", "R2a", "R3b", "R6a"], [C(sched="dynamic")]),
+    "splitk": _preset(["R3a", "R3b", "R3c", "R5a", "R5b", "R1b"],
                       [dataclasses.replace(c, splitk=s) for c in (T["128x128x64"], T["128x256x64"], T["64x128x64"])
                        for s in (1, 2, 4, 8, 16, 32)]),
     "ridge": [(f"M8192xN8192xK{k}", C()) for k in (128, 256, 512, 1024, 2048, 4096, 8192)] +
     [(f"M16384xN{n}xK4096", C(bn=min(n, 256))) for n in (128, 256, 512, 1024, 2048, 4096)],
-    "pingpong": _regime(["R1b", "R2a"], [C(bm=256, bn=128, dp=2, bias=1, epi="tanh", pingpong=p) for p in (0, 1)]),
+    "pingpong": _preset(["R1b", "R2a"], [C(bm=256, bn=128, dp=2, bias=1, epi="tanh", pingpong=p) for p in (0, 1)]),
 }
 
 
@@ -260,7 +272,7 @@ def shape_of(name):
 
 
 def skip_reason(M, N, K, c, q):
-    """Arms the plan excludes up front (never-try rows and the split-K bound)."""
+    """Arms skipped up front: never-try combinations, configs that cannot fit, and an out-of-scope split-K bound."""
     if c.splitk > 1 and (q["T"] // c.splitk * (c.splitk - 1) >= NUM_SMS or q["k_iters"] < 4):
         return "split-K outside T*(S-1) < P and k_iters/S >= 4"
     if c.two and c.gm % 2:
@@ -313,14 +325,14 @@ class Arm:
 
 def make_inputs(M, N, K, integer):
     if integer:
-        a = torch.randint(-3, 4, (M, K), device="cuda").to(torch.bfloat16)
-        b = torch.randint(-3, 4, (N, K), device="cuda").to(torch.bfloat16)
-        bias = torch.randint(-3, 4, (N, ), device="cuda").to(torch.bfloat16)
+        a = torch.randint(-3, 4, (M, K), device="cuda").to(IN_DTYPE)
+        b = torch.randint(-3, 4, (N, K), device="cuda").to(IN_DTYPE)
+        bias = torch.randint(-3, 4, (N, ), device="cuda").to(IN_DTYPE)
     else:
         # Unit-variance outputs, so one absolute tolerance fits every K.
-        a = (torch.randn((M, K), device="cuda") * K**-0.25).to(torch.bfloat16)
-        b = (torch.randn((N, K), device="cuda") * K**-0.25).to(torch.bfloat16)
-        bias = torch.randn((N, ), device="cuda", dtype=torch.bfloat16)
+        a = (torch.randn((M, K), device="cuda") * K**-0.25).to(IN_DTYPE)
+        b = (torch.randn((N, K), device="cuda") * K**-0.25).to(IN_DTYPE)
+        bias = torch.randn((N, ), device="cuda").to(IN_DTYPE)
     return a, b, bias
 
 
@@ -336,7 +348,7 @@ def reference(a, b, bias, cfg):
 def check(arm):
     """Bitwise on integer inputs (exact while 9*K < 2^24), then assert_close (bf16 rtol, atol 1e-2) on randn."""
     cfg = arm.cfg
-    out_dtype = torch.float32 if cfg.splitk > 1 else torch.bfloat16
+    out_dtype = torch.float32 if cfg.splitk > 1 else IN_DTYPE
     a, b, bias = make_inputs(arm.M, arm.N, arm.K, integer=True)
     ref = reference(a, b, bias, cfg).to(out_dtype)
     for _ in range(3):
@@ -405,7 +417,17 @@ def gpu_state():
     return dict(sm_mhz=int(out[0]), power_w=float(out[1]), reasons=out[2]) if len(out) == 3 else {}
 
 
-def run_shape(shape_name, cfgs, rounds, compile_only=False):
+def torch_epilogue(c, bias, epi, has_bias):
+    """The unfused epilogue: what an extra elementwise kernel after the GEMM does."""
+    if has_bias:
+        c.add_(bias)
+    if epi == "tanh":
+        torch.tanh(c, out=c)
+
+
+def run_shape(shape_name, cfgs, rounds, compile_only=False, unfused=None):
+    """Check, dedupe and time `cfgs` on one shape. With unfused=(epi, has_bias), also time every
+    plain (epilogue-free) arm followed by that epilogue in torch, and cuBLAS + the same epilogue."""
     M, N, K = shape_of(shape_name)
     results, arms, seen = [], [], {}
     for i, cfg in enumerate(cfgs):
@@ -445,7 +467,7 @@ def run_shape(shape_name, cfgs, rounds, compile_only=False):
     a, b, bias = make_inputs(M, N, K, integer=False)
     cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
     flush = lambda: triton.runtime.driver.active.clear_cache(cache)
-    c16 = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    c16 = torch.empty((M, N), device="cuda", dtype=IN_DTYPE)
     c32 = torch.empty((M, N), device="cuda", dtype=torch.float32)
     cublas = dict(shape=shape_name, M=M, N=N, K=K, config="cublas", status="timed", times_ms=[])
     results.append(cublas)
@@ -454,21 +476,131 @@ def run_shape(shape_name, cfgs, rounds, compile_only=False):
         for arm, rec in arms:
             fn = lambda arm=arm: arm.launch(a, b, c32 if arm.cfg.splitk > 1 else c16, bias)
             rec["times_ms"].append(time_graph(fn, flush))
+            if unfused and not arm.cfg.bias and arm.cfg.epi == "none" and arm.cfg.splitk == 1:
+                ufn = lambda arm=arm: (arm.launch(a, b, c16, bias), torch_epilogue(c16, bias, *unfused))
+                rec.setdefault("unfused_times_ms", []).append(time_graph(ufn, flush))
         cublas["times_ms"].append(time_graph(lambda: torch.matmul(a, b.T, out=c16), flush))
+        if unfused:
+            cfn = lambda: (torch.matmul(a, b.T, out=c16), torch_epilogue(c16, bias, *unfused))
+            cublas.setdefault("unfused_times_ms", []).append(time_graph(cfn, flush))
         state1 = gpu_state()
         for _, rec in arms + [(None, cublas)]:
             rec.setdefault("gpu_state", []).append([state0, state1])
     for _, rec in arms + [(None, cublas)]:
         ts = sorted(rec["times_ms"])
         rec["median_ms"] = ts[len(ts) // 2]
+        rec["spread"] = (ts[-1] - ts[0]) / ts[0]
         rec["tflops"] = 2 * M * N * K / rec["median_ms"] / 1e9
+        if rec.get("unfused_times_ms"):
+            rec["unfused_median_ms"] = sorted(rec["unfused_times_ms"])[len(rec["unfused_times_ms"]) // 2]
     return results
+
+
+DEFAULT_SWEEP = "bm=128,256 bn=128,256 bk=64,128 ns=0,3,4 two=0,1 dp=1,2"
+
+
+def sweep_configs(spec, base=Config()):
+    """Cartesian product of "key=v1,v2 key=v3 ..." over Config fields; drops dp=2 without BM=256 (duplicate or compile error)."""
+    axes = []
+    for item in spec.split():
+        k, vs = item.split("=")
+        axes.append([(k, v if k in ("sched", "epi") else int(v)) for v in vs.split(",")])
+    out = []
+    for combo in itertools.product(*axes):
+        c = dataclasses.replace(base, **dict(combo))
+        if c.dp == 2 and c.bm != 256:  # never-try: dp=2 needs BM=256 here
+            continue
+        out.append(c)
+    return out
+
+
+def best(results, pred=lambda r: True, key="median_ms"):
+    rs = [r for r in results if r.get(key) and r["config"] != "cublas" and pred(r)]
+    return min(rs, key=lambda r: r[key]) if rs else None
+
+
+def noise(*recs):
+    return max([0.02] + [r.get("spread", 0) for r in recs if r])
+
+
+def run_problem(spec, args):
+    """Sweep the knob space for one problem spec; report the best fused config, fusion gain and compiler-upgrade gain."""
+    global IN_DTYPE
+    parts = spec.split(",")
+    M, N, K = (int(x) for x in parts[:3])
+    dtype, op = parts[3], parts[4]
+    epi = parts[5] if len(parts) > 5 else "none"
+    IN_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
+    has_bias = op == "addmm"
+    if op not in ("mm", "addmm") or epi not in ("none", "tanh"):
+        sys.exit(f"{spec}: supported ops are mm|addmm, epilogues none|tanh")
+    fused_cfgs = [dataclasses.replace(c, bias=int(has_bias), epi=epi) for c in sweep_configs(args.sweep)]
+    plain_cfgs = [dataclasses.replace(c, bias=0, epi="none") for c in fused_cfgs] if (has_bias or epi != "none") else []
+    shape = f"M{M}xN{N}xK{K}"
+    results = run_shape(shape, fused_cfgs + plain_cfgs, args.rounds, unfused=(epi, has_bias) if plain_cfgs else None)
+    is_fused = lambda r: r.get("resolved", {}).get("bias") == int(has_bias) and r.get("resolved", {}).get("epi") == epi
+    bf = best(results, is_fused)
+    summary = dict(problem=spec, shape=shape, dtype=dtype, op=op, epilogue=epi,
+                   best_fused_config=bf and bf["config"], best_fused_us=bf and bf["median_ms"] * 1e3)
+    cublas = next(r for r in results if r["config"] == "cublas")
+    summary["cublas_us"] = cublas["median_ms"] * 1e3
+    if plain_cfgs and bf:
+        bu = best(results, key="unfused_median_ms")
+        summary.update(best_unfused_config=bu and bu["config"], best_unfused_us=bu and bu["unfused_median_ms"] * 1e3,
+                       cublas_unfused_us=cublas["unfused_median_ms"] * 1e3)
+        summary["fusion_gain"] = bu["unfused_median_ms"] / bf["median_ms"] if bu else None
+        summary["fusion_gain_vs_cublas_unfused"] = cublas["unfused_median_ms"] / bf["median_ms"]
+    if args.baseline_json and bf:
+        base = json.load(open(args.baseline_json))
+        bres = base["results"]
+        bbest = best(bres, lambda r: r.get("shape") == shape and is_fused(r))
+        same = next((r for r in bres if r.get("shape") == shape and r["config"] == bf["config"] and r.get("median_ms")), None)
+        summary.update(baseline_build=base["meta"].get("build"), baseline_best_us=bbest and bbest["median_ms"] * 1e3,
+                       upgrade_gain_best=bbest and bbest["median_ms"] / bf["median_ms"],
+                       upgrade_gain_same_config=same and same["median_ms"] / bf["median_ms"])
+    return results, summary
+
+
+def reuse(args):
+    """Re-time a previously chosen config on --shape (or the same shape on a new build) next to a fresh sweep."""
+    global IN_DTYPE
+    prev = json.load(open(args.reuse_config))
+    sums = prev.get("summary") or {}
+    sums = [sums] if isinstance(sums, dict) else sums
+    if sums and sums[0].get("dtype"):
+        IN_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16}[sums[0]["dtype"]]
+    name = args.reuse_name
+    if name == "best":
+        name = (sums[0].get("best_fused_config") if sums else None) or best(prev["results"])["config"]
+    old = next(r for r in prev["results"] if r["config"] == name)
+    cfg = Config(**{k: v for k, v in old["resolved"].items() if k in {f.name for f in dataclasses.fields(Config)}})
+    # The reused config keeps its resolved ES/num_stages; the sweep resolves defaults for the new shape.
+    M, N, K = (int(x) for x in (args.shape or f"{old['M']},{old['N']},{old['K']}").split(","))
+    sweep = [dataclasses.replace(c, bias=cfg.bias, epi=cfg.epi) for c in sweep_configs(args.sweep)]
+    results = run_shape(f"M{M}xN{N}xK{K}", [cfg] + sweep, args.rounds)
+    reused = next((r for r in results if r["config"] == cfg.name()), None)
+    bp = best(results)
+    summary = dict(reused_config=cfg.name(), reused_from=args.reuse_config, shape=f"M{M}xN{N}xK{K}",
+                   reused_status=reused and reused["status"], point_best_config=bp and bp["config"])
+    if reused and reused.get("median_ms") and bp:
+        ratio = reused["median_ms"] / bp["median_ms"]
+        summary.update(reused_us=reused["median_ms"] * 1e3, point_best_us=bp["median_ms"] * 1e3, reused_over_best=ratio,
+                       still_profitable=ratio - 1 <= noise(reused, bp))
+    return results, summary
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--regime", help="named regime (see --list)")
-    p.add_argument("--shapes", help="comma-separated shape ids to restrict a regime to")
+    p.add_argument("--preset", help="named preset of shapes x configs (see --list)")
+    p.add_argument("--shapes", help="comma-separated shape ids to restrict a preset to")
+    p.add_argument("--problem", action="append", default=[],
+                   help="M,N,K,dtype,op[,epilogue] with dtype bf16|fp16, op mm|addmm, epilogue none|tanh")
+    p.add_argument("--problems", help="file with one --problem spec per line ('#' starts a comment)")
+    p.add_argument("--sweep", default=DEFAULT_SWEEP, help=f'knob space for problems and --reuse-config (default "{DEFAULT_SWEEP}")')
+    p.add_argument("--baseline-json", help="problems JSON from another build: adds compiler-upgrade gain")
+    p.add_argument("--reuse-config", help="JSON from an earlier run whose chosen config is re-timed (see --reuse-name)")
+    p.add_argument("--reuse-name", default="best", help="config name in --reuse-config, or 'best'")
+    p.add_argument("--build", default="", help="label for this build (commit, beta/3.8) recorded in the JSON")
     p.add_argument("--shape", help="M,N,K for a one-off run")
     p.add_argument("--config", action="append", default=[], help="one-off config, e.g. bm=128,bn=256,ns=4")
     p.add_argument("--rounds", type=int, default=5)
@@ -477,31 +609,47 @@ def main():
     p.add_argument("--list", action="store_true")
     args = p.parse_args()
     if args.list:
-        for name, arms in REGIMES.items():
+        for name, arms in PRESETS.items():
             print(f"{name}: {len(arms)} arms over {sorted(set(s for s, _ in arms))}")
         return
     if os.environ.get("TRITON_USE_META_WS") != "1":
         sys.exit("set TRITON_USE_META_WS=1")
     triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
-    if args.shape:
-        work = {"M{}xN{}xK{}".format(*args.shape.split(",")): [parse_config(c) for c in args.config or ["bm=128"]]}
+    summary = None
+    specs = list(args.problem)
+    if args.problems:
+        specs += [ln.split("#")[0].strip() for ln in open(args.problems) if ln.split("#")[0].strip()]
+    if specs:
+        results, summary = [], []
+        for spec in specs:
+            r, sm = run_problem(spec, args)
+            results += r
+            summary.append(sm)
+    elif args.reuse_config:
+        results, summary = reuse(args)
+        summary = [summary]
     else:
-        work = {}
-        for s, c in REGIMES[args.regime]:
-            if not args.shapes or s in args.shapes.split(","):
-                work.setdefault(s, []).append(c)
-    results = []
-    for shape_name, cfgs in work.items():
-        results += run_shape(shape_name, cfgs, args.rounds, args.compile_only)
-        for r in results:
-            if r["shape"] == shape_name:
-                t = f"{r['median_ms'] * 1e3:9.1f} us" if "median_ms" in r else f"{r['status']:>12}"
-                print(f"{shape_name:>20} {r['config']:<48} {t} {r.get('reason', '')}", flush=True)
-    meta = dict(triton=triton.__version__, commit=os.environ.get("AUTOWS_GEMM_COMMIT", ""), gpu_state=gpu_state(),
-                regime=args.regime)
+        if args.shape:
+            work = {"M{}xN{}xK{}".format(*args.shape.split(",")): [parse_config(c) for c in args.config or ["bm=128"]]}
+        else:
+            work = {}
+            for s, c in PRESETS[args.preset]:
+                if not args.shapes or s in args.shapes.split(","):
+                    work.setdefault(s, []).append(c)
+        results = []
+        for shape_name, cfgs in work.items():
+            results += run_shape(shape_name, cfgs, args.rounds, args.compile_only)
+    for r in results:
+        t = f"{r['median_ms'] * 1e3:9.1f} us" if "median_ms" in r else f"{r['status']:>12}"
+        u = f"  unfused {r['unfused_median_ms'] * 1e3:9.1f} us" if "unfused_median_ms" in r else ""
+        print(f"{r['shape']:>20} {r['config']:<48} {t}{u} {r.get('reason', '')}", flush=True)
+    if summary:
+        print(json.dumps(summary, indent=1))
+    meta = dict(triton=triton.__version__, build=args.build, gpu_state=gpu_state(), preset=args.preset,
+                problems=specs or None, sweep=args.sweep if (specs or args.reuse_config) else None)
     if args.json:
         with open(args.json, "w") as f:
-            json.dump(dict(meta=meta, results=results), f, indent=1)
+            json.dump(dict(meta=meta, summary=summary, results=results), f, indent=1)
 
 
 if __name__ == "__main__":
