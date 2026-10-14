@@ -63,7 +63,7 @@ Each step narrows the candidate set. Later PRs fill in one branch each; see
    - `I_t = BM*BN / (BM + BN')`, with `BN' = BN/2` under 2-CTA and `BN`
      otherwise: FLOP per byte of operand SMEM fill.
    - `d_fit`: the planner's operand depth, closed form in
-     `resources.md`.
+     [resources.md](resources.md#when-to-try-it-depends-on-the-problem).
 3. **Never try (any problem).** Drop configs that give a compile error, are
    silently ignored, are a duplicate config, hang, or give a wrong answer.
 4. **Resource limits.** Drop configs whose SMEM, TMEM or register demand does
