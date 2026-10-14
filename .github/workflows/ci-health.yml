@@ -1,0 +1,78 @@
+name: CI Health
+# Collects runs, jobs and steps of mi350/b200/h100.yml into the 'ci-health'
+# release, for the /ci/ dashboard that pages.yml renders after each successful
+# collection. Never deploys. On pull requests it only runs the dashboard's tests.
+on:
+  schedule:
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      since:
+        description: 'Re-collect runs created at or after this ISO time, e.g. 2026-10-01T00:00:00Z (blank = from the saved cursor)'
+        required: false
+  pull_request:
+    paths:
+      - '.github/scripts/ci_health.py'
+      - '.github/scripts/ci_health_rules.py'
+      - '.github/scripts/ci_health_dashboard.html'
+      - '.github/scripts/test_ci_health.py'
+      - '.github/scripts/test_ci_health_rules.py'
+      - '.github/workflows/ci-health.yml'
+      - '.github/workflows/mi350.yml'
+      - '.github/workflows/b200.yml'
+      - '.github/workflows/h100.yml'
+
+permissions:
+  contents: read
+
+# One collection at a time; never cancel one mid-upload.
+concurrency:
+  group: ci-health-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'collect' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install pytest
+      # Also checks that every test step in the GPU workflows maps to a dashboard group.
+      - name: Run dashboard tests
+        working-directory: .github/scripts
+        run: python3 -m pytest -q test_ci_health.py test_ci_health_rules.py
+
+  collect:
+    if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # upload to the ci-health release
+      actions: read     # list runs and jobs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download stored data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          gh release view ci-health >/dev/null 2>&1 \
+            || gh release create ci-health --prerelease --latest=false --title "CI health data" \
+                 --notes "Runs, jobs and steps of mi350/b200/h100.yml behind the /ci/ dashboard." \
+            || gh release view ci-health >/dev/null
+          gh release download ci-health --dir data --pattern '*' || echo "no stored data yet"
+      - name: Collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SINCE: ${{ inputs.since }}
+        run: python3 .github/scripts/ci_health.py collect data ${SINCE:+--since "$SINCE"}
+      - name: Upload changed data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          gh release upload ci-health data/state.json $(cat data/changed.txt) --clobber

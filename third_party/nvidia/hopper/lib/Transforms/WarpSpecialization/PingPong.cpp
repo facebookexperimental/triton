@@ -28,7 +28,6 @@
 #include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/Location.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -220,146 +219,60 @@ static unsigned getLoopDepth(Operation *op) {
   return depth;
 }
 
-static Value castToI64(OpBuilder &builder, Location loc, Value value) {
-  Type type = value.getType();
-  if (type.isIndex())
-    return arith::IndexCastOp::create(builder, loc, builder.getI64Type(),
-                                      value);
-  unsigned width = cast<IntegerType>(type).getWidth();
-  if (width == 64)
-    return value;
-  if (width < 64)
-    return arith::ExtUIOp::create(builder, loc, builder.getI64Type(), value);
-  return arith::TruncIOp::create(builder, loc, builder.getI64Type(), value);
-}
-
-// The phase math below divides `iv - lb` and `ub - lb` with an *unsigned*
-// division, and widens with a zero-extension. `scf.for` permits a negative
-// step, which makes both subtractions negative and wraps them into very large
-// values, so `iteration % 2` stops tracking the real parity and the wait is
-// silently mis-phased. Only accept a step we can see is positive.
-// Resolve the capture first: the step is routinely passed into the partition
-// as a `ttg.warp_specialize` operand, so it arrives as a block argument and
-// would not match a constant on its own.
-static bool hasProvablyPositiveStep(scf::ForOp loop) {
-  APInt step;
-  return matchPattern(ttg::resolveWarpSpecializeCapture(loop.getStep()),
-                      m_ConstantInt(&step)) &&
-         step.isStrictlyPositive();
-}
-
-// Enclosing scf.for loops, innermost first.
-static SmallVector<scf::ForOp> getEnclosingLoops(Operation *op) {
-  SmallVector<scf::ForOp> nest;
-  for (scf::ForOp loop = op->getParentOfType<scf::ForOp>(); loop;
-       loop = loop->getParentOfType<scf::ForOp>())
-    nest.push_back(loop);
-  return nest;
-}
-
-static bool isDefinedInsideNest(Value value, ArrayRef<scf::ForOp> nest) {
-  for (Region *region = value.getParentRegion(); region;
-       region = region->getParentOp()->getParentRegion()) {
-    if (llvm::any_of(
-            nest, [&](scf::ForOp loop) { return &loop.getRegion() == region; }))
-      return true;
-  }
-  return false;
-}
-
-// `getBarrierPhase` walks every enclosing loop, so each one has to qualify,
-// not just the innermost. The phase also linearizes nested iterations as
-// outerIter * innerTrip + innerIter, which equals the true arrival ordinal
-// only when each inner loop's trip count is the same for every outer
-// iteration. Bounds defined inside any enclosing loop may depend on an outer
-// iv (triangular nest) and would silently mis-phase the wait, so reject them.
-static bool hasProvablePhaseLoops(Operation *op) {
-  SmallVector<scf::ForOp> nest = getEnclosingLoops(op);
+// Thread a 0-based iteration counter through `nest` (innermost first, as
+// collected by `collectDirectLoopNest`) and return the value visible inside
+// the innermost loop. The innermost loop advances it, each enclosing loop
+// carries out what its inner loop produced, and each inner loop resumes from
+// the value its parent is carrying -- so the count runs across the whole nest
+// rather than restarting.
+//
+// This replaces deriving the count from the induction variables. Doing that
+// arithmetically needs the loop bounds to cooperate: it divides `iv - lb`
+// unsigned (wrong for the negative step `scf.for` permits) and multiplies by a
+// trip count read once (wrong when an inner bound depends on an outer
+// induction variable, as in a causal/triangular nest). A carried counter is
+// exact for any bounds, and it is what the rest of warp specialization already
+// does -- see `getAccumCount` in `CodePartitionUtility.cpp`, which reads its
+// count out of a loop-carried argument for exactly this reason.
+static Value createIterationCounter(SmallVector<scf::ForOp> nest) {
   if (nest.empty())
-    return false;
-  for (scf::ForOp loop : nest)
-    if (!hasProvablyPositiveStep(loop))
-      return false;
-  for (scf::ForOp loop : nest) {
-    for (Value bound : {loop.getLowerBound(), loop.getUpperBound()}) {
-      if (isDefinedInsideNest(ttg::resolveWarpSpecializeCapture(bound), nest))
-        return false;
-    }
-  }
-  return true;
-}
-
-// Both sides derive their wait phase from their own loop nest, and an mbarrier
-// phase must track the true arrival count: if the nests disagree on depth or
-// bounds, one side's waits silently observe stale phases instead of pairing
-// with the other side's arrivals. Require identical nests up front. Bounds
-// compare after capture resolution since both partitions routinely capture the
-// same outer values.
-static bool haveMatchingPhaseNests(Operation *pingOp, Operation *pongOp) {
-  SmallVector<scf::ForOp> pingNest = getEnclosingLoops(pingOp);
-  SmallVector<scf::ForOp> pongNest = getEnclosingLoops(pongOp);
-  if (pingNest.size() != pongNest.size())
-    return false;
-  auto sameBound = [](Value lhs, Value rhs) {
-    return ttg::resolveWarpSpecializeCapture(lhs) ==
-           ttg::resolveWarpSpecializeCapture(rhs);
-  };
-  for (auto [pingLoop, pongLoop] : llvm::zip(pingNest, pongNest)) {
-    if (!sameBound(pingLoop.getLowerBound(), pongLoop.getLowerBound()) ||
-        !sameBound(pingLoop.getUpperBound(), pongLoop.getUpperBound()) ||
-        !sameBound(pingLoop.getStep(), pongLoop.getStep()))
-      return false;
-  }
-  return true;
-}
-
-static Value getLoopIteration(OpBuilder &builder, Location loc,
-                              scf::ForOp loop) {
-  Value offset = arith::SubIOp::create(builder, loc, loop.getInductionVar(),
-                                       loop.getLowerBound());
-  return castToI64(
-      builder, loc,
-      arith::DivUIOp::create(builder, loc, offset, loop.getStep()));
-}
-
-static Value getLoopTripCount(OpBuilder &builder, Location loc,
-                              scf::ForOp loop) {
-  Value step = loop.getStep();
-  Value one =
-      step.getType().isIndex()
-          ? Value(arith::ConstantIndexOp::create(builder, loc, 1))
-          : Value(arith::ConstantIntOp::create(
-                builder, loc, 1, cast<IntegerType>(step.getType()).getWidth()));
-  Value distance = arith::SubIOp::create(builder, loc, loop.getUpperBound(),
-                                         loop.getLowerBound());
-  Value numerator = arith::AddIOp::create(
-      builder, loc, distance, arith::SubIOp::create(builder, loc, step, one));
-  return castToI64(builder, loc,
-                   arith::DivUIOp::create(builder, loc, numerator, step));
-}
-
-static Value getBarrierPhase(OpBuilder &builder, Location loc, Operation *op) {
-  scf::ForOp loop = op->getParentOfType<scf::ForOp>();
-  // Sibling paths here skip a region they cannot handle rather than assuming
-  // it, so this precondition is not guaranteed. Return null instead of relying
-  // on the assert, which is compiled out in release builds and would leave
-  // getLoopIteration dereferencing a null loop.
-  if (!loop)
     return {};
-  Value iteration = getLoopIteration(builder, loc, loop);
-  Value stride = getLoopTripCount(builder, loc, loop);
-  for (loop = loop->getParentOfType<scf::ForOp>(); loop;
-       loop = loop->getParentOfType<scf::ForOp>()) {
-    Value outerIteration = getLoopIteration(builder, loc, loop);
-    iteration = arith::AddIOp::create(
-        builder, loc,
-        arith::MulIOp::create(builder, loc, outerIteration, stride), iteration);
-    stride = arith::MulIOp::create(builder, loc, stride,
-                                   getLoopTripCount(builder, loc, loop));
+  std::reverse(nest.begin(), nest.end());
+
+  // Give every loop a counter, seeded with zero for now. Rewriting a loop
+  // moves its body rather than cloning it, so the inner entries stay valid.
+  SmallVector<BlockArgument> counters;
+  for (scf::ForOp &loop : nest) {
+    OpBuilder builder(loop);
+    Value zero = arith::ConstantIntOp::create(builder, loop.getLoc(), 0, 32);
+    loop = addIterArgsToLoop(builder, loop, {zero});
+    counters.push_back(loop.getRegionIterArgs().back());
   }
-  Value two = arith::ConstantIntOp::create(builder, loc, 2, 64);
-  Value parity = arith::RemUIOp::create(builder, loc, iteration, two);
-  return arith::TruncIOp::create(builder, loc, builder.getI32Type(), parity);
+
+  // Now wire the counters together, innermost first: only the innermost loop
+  // increments, and an inner loop's starting value is its parent's counter.
+  for (int i = nest.size() - 1; i >= 0; --i) {
+    scf::ForOp loop = nest[i];
+    if (i + 1 == static_cast<int>(nest.size())) {
+      OpBuilder builder(loop.getBody()->getTerminator());
+      Value one = arith::ConstantIntOp::create(builder, loop.getLoc(), 1, 32);
+      appendToForOpYield(loop, {arith::AddIOp::create(builder, loop.getLoc(),
+                                                      counters[i], one)});
+    } else {
+      appendToForOpYield(loop, {nest[i + 1].getResults().back()});
+    }
+    if (i > 0)
+      loop.getInitArgsMutable()[loop.getInitArgs().size() - 1].set(
+          counters[i - 1]);
+  }
+  return counters.back();
+}
+
+// The mbarrier flips once per arrival, and each iteration arrives once, so the
+// phase a wait expects is the parity of the iteration count.
+static Value getBarrierPhase(OpBuilder &builder, Location loc, Value counter) {
+  Value one = arith::ConstantIntOp::create(builder, loc, 1, 32);
+  return arith::AndIOp::create(builder, loc, counter, one);
 }
 
 static unsigned captureInPartitions(ttg::WarpSpecializeOp wsOp, Value value) {
@@ -391,6 +304,35 @@ static Region *getPartitionRegion(Operation *op) {
     region = parent->getParentRegion();
   }
   return nullptr;
+}
+
+// The scf.for loops enclosing `op`, innermost first. Empty when no loop
+// encloses `op`, when the chain crosses the partition region boundary, or
+// when any enclosing region op is not a loop: a guard can skip arrivals on
+// one side, and threading a counter through it can violate dominance.
+static SmallVector<scf::ForOp> collectDirectLoopNest(Operation *op) {
+  Region *partition = getPartitionRegion(op);
+  if (!partition)
+    return {};
+  for (Operation *parent = op->getParentOp();
+       parent != partition->getParentOp(); parent = parent->getParentOp()) {
+    if (!isa<scf::ForOp>(parent))
+      return {};
+  }
+  SmallVector<scf::ForOp> nest;
+  for (auto loop = op->getParentOfType<scf::ForOp>(); loop;
+       loop = loop->getParentOfType<scf::ForOp>())
+    nest.push_back(loop);
+  if (nest.empty())
+    return nest;
+  for (size_t i = 1; i < nest.size(); ++i)
+    if (nest[i - 1]->getBlock() != nest[i].getBody())
+      return {};
+  // The nest must stay inside the partition region, which is isolated from
+  // above: a loop outside it cannot carry a counter into it.
+  if (getPartitionRegion(nest.back()) != partition)
+    return {};
+  return nest;
 }
 
 /// Return a map of loop depth to the loop ops in the partition.
@@ -809,20 +751,26 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
       continue;
     }
 
-    // Both phases are derived from the enclosing loops. Check that up front,
-    // alongside the region guards above: everything below mutates the IR, so
-    // discovering it at getBarrierPhase would leave a half-built rendezvous.
-    if (!hasProvablePhaseLoops(pingStart) ||
-        !hasProvablePhaseLoops(pongStart)) {
-      LDBG("Ping-pong region has no enclosing loop, a loop whose step is not "
-           "provably positive, or a loop bound defined inside an enclosing "
-           "loop.");
+    // Both phases come from a loop-carried counter, so both sides need a
+    // directly-nested loop chain inside their partition to carry it. Check
+    // that before touching anything: everything below mutates the IR, and
+    // bailing partway would leave a half-built rendezvous.
+    SmallVector<scf::ForOp> pingNest = collectDirectLoopNest(pingStart);
+    SmallVector<scf::ForOp> pongNest = collectDirectLoopNest(pongStart);
+    if (pingNest.empty() || pongNest.empty()) {
+      LDBG("No directly-nested enclosing loop for the ping-pong region.");
       continue;
     }
-    if (!haveMatchingPhaseNests(pingStart, pongStart)) {
-      LDBG("Ping-pong region partitions have different enclosing loop nests.");
+    // Exact counters on each side are not enough if one side executes fewer
+    // iterations: the other side would eventually wait on a missing arrival.
+    if (!ttg::haveEquivalentWarpSpecializeLoopNests(pingNest, pongNest)) {
+      LDBG("Ping-pong partitions have different enclosing loop nests.");
       continue;
     }
+    // Thread the counters first -- this rewrites the loops, and everything
+    // below inserts into them.
+    Value pingCounter = createIterationCounter(pingNest);
+    Value pongCounter = createIterationCounter(pongNest);
 
     Value barrierAlloc = triton::createBarrierAlloc(wsOp, 2, 1);
     OpBuilder allocBuilder(wsOp);
@@ -843,7 +791,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     ttng::ArriveBarrierOp::create(builder, pingRegionLoc, pongBarrierInPing,
                                   1u);
     builder.setInsertionPoint(pingStart);
-    Value pingPhase = getBarrierPhase(builder, pingStart->getLoc(), pingStart);
+    Value pingPhase =
+        getBarrierPhase(builder, pingStart->getLoc(), pingCounter);
     ttng::WaitBarrierOp::create(builder, pingStart->getLoc(), pingBarrierInPing,
                                 pingPhase);
     // Insert AFTER the pingEnd op
@@ -855,7 +804,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     Block &pongRegionBlock = pongRegion->front();
     OpBuilder builder2(&pongRegionBlock, pongRegionBlock.begin());
     builder2.setInsertionPoint(pongStart);
-    Value pongPhase = getBarrierPhase(builder2, pongStart->getLoc(), pongStart);
+    Value pongPhase =
+        getBarrierPhase(builder2, pongStart->getLoc(), pongCounter);
     ttng::WaitBarrierOp::create(builder2, pongStart->getLoc(),
                                 pongBarrierInPong, pongPhase);
     // Insert AFTER the pongEnd op

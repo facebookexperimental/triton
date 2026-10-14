@@ -66,7 +66,7 @@ def test_gfx950_matrix_intrinsic_packed_f32_option(intrinsic):
     assert amd_compiler.get_amdgpu_codegen_features("gfx950", llvm_ir) == ""
     assert amd_compiler.get_amdgpu_codegen_features("gfx950", llvm_ir, True) == "-packed-fp32-ops"
     assert amd_compiler.get_amdgpu_codegen_features("gfx942", llvm_ir, True) == ""
-    assert amd_compiler.get_amdgpu_codegen_features("gfx1100", llvm_ir, True) == "-real-true16"
+    assert amd_compiler.get_amdgpu_codegen_features("gfx1100", llvm_ir, True) == ""
     assert amd_compiler.get_amdgpu_codegen_features("gfx950", "fadd float %a, %b", True) == ""
 
 

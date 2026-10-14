@@ -16,6 +16,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.runtime.driver import driver
 
 from ..._catalog import InvalidInput
 
@@ -2105,6 +2106,7 @@ def _wg_swizzled_offset_bases(shape, contiguous_dim):
 _wg_A_BASES_64X32 = tl.constexpr(_wg_swizzled_offset_bases((64, 32), 1))
 _wg_A_BASES_64X64 = tl.constexpr(_wg_swizzled_offset_bases((64, 64), 1))
 _wg_A_BASES_128X64 = tl.constexpr(_wg_swizzled_offset_bases((128, 64), 1))
+_wg_N_BASES_64X128 = tl.constexpr(_wg_swizzled_offset_bases((64, 128), 1))
 _wg_B_BASES_32X128 = tl.constexpr(_wg_swizzled_offset_bases((32, 128), 0))
 _wg_B_BASES_32X16 = tl.constexpr(_wg_swizzled_offset_bases((32, 16), 0))
 _wg_B_BASES_32X64 = tl.constexpr(_wg_swizzled_offset_bases((32, 64), 0))
@@ -2152,6 +2154,18 @@ _wg_B_BASES_64X128_COMPACT = tl.constexpr([
 _wg_A_OFFSET_LAYOUT_64X32 = tlx.layout(
     shape=((8, 32), (8, )),
     stride=((8, 64), (1, )),
+)
+_wg_N_CONTIG_OFFSET_LAYOUT_64X64_4W = tlx.layout(
+    shape=((8, 4, 8), (8, 2)),
+    stride=((8, 1024, 64), (1, 512)),
+)
+_wg_N_CONTIG_OFFSET_LAYOUT_64X128_4W = tlx.layout(
+    shape=((16, 4, 4), (8, 4)),
+    stride=((8, 2048, 128), (1, 512)),
+)
+_wg_N_CONTIG_OFFSET_LAYOUT_64X128_8W = tlx.layout(
+    shape=((16, 4, 8), (8, 2)),
+    stride=((8, 2048, 128), (1, 1024)),
 )
 _wg_B_OFFSET_LAYOUT_32X128 = tlx.layout(
     shape=((4, 16, 4), (8, 2)),
@@ -4014,7 +4028,6 @@ def _wg_logical_rect_k64_direct_pgr2_step(
     direct_group_count: tl.constexpr = (((a_direct_load_count + 3) // 4 +
                                          (b_direct_load_count + 3) // 4) if direct_chunk == 32 and len(a_local) == 1
                                         and len(b_local) == 1 else direct_load_count)
-
     # A positive refill/read window selects the merged steady-state schedule
     # below. Retire K(t+1) before issuing K(t+2), then use one
     # barrier both to publish K(t+1) and to prove that current_stage is no
@@ -4168,7 +4181,6 @@ def _wg_logical_rect_k64_direct_pgr2_step(
             dot_b,
             initialize=initialize,
         )
-
     # K(t+1) was the older set of async groups. Retire those groups but
     # leave K(t+2) in flight, then read K(t+1).kh0 while the remaining
     # K(t).kh1 MFMAs execute.
@@ -4715,6 +4727,7 @@ def _wg_logical_rect_k64_allocate_direct_operand(
     pack_chunks: tl.constexpr,
     is_a: tl.constexpr,
     element_type: tl.constexpr,
+    n_contiguous: tl.constexpr = False,
     _semantic=None,
 ):
     """Allocate one A or B axis using the common direct-LDS backing rules."""
@@ -4722,7 +4735,10 @@ def _wg_logical_rect_k64_allocate_direct_operand(
     direct_chunk = tl.core._unwrap_if_constexpr(direct_chunk)
     pack_chunks = tl.core._unwrap_if_constexpr(pack_chunks)
     is_a = tl.core._unwrap_if_constexpr(is_a)
+    n_contiguous = tl.core._unwrap_if_constexpr(n_contiguous)
     assert isinstance(is_a, bool)
+    assert isinstance(n_contiguous, bool)
+    assert not n_contiguous or not is_a
     if is_a:
         shape128: tl.constexpr = [128, 64]
         shape256: tl.constexpr = [256, 64]
@@ -4736,9 +4752,21 @@ def _wg_logical_rect_k64_allocate_direct_operand(
         shape256: tl.constexpr = [64, 256]
         shape64: tl.constexpr = [64, 64]
         shape32: tl.constexpr = [64, 32]
-        order: tl.constexpr = [0, 1]
+        order: tl.constexpr = [1, 0] if n_contiguous else [0, 1]
         bases128: tl.constexpr = _wg_B_BASES_64X128
         bases64: tl.constexpr = _wg_B_BASES_64X64
+
+    if (is_a and logical_extent > 128 and logical_extent < 192 and logical_extent % 32 == 0 and not pack_chunks
+            and _semantic.builder.options.num_warps == 4):
+        tail_extent: tl.constexpr = logical_extent - 128
+        tail_shape: tl.constexpr = [tail_extent, 64]
+        main_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], bases128, shape128)
+        tail_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(512, 16)], tail_shape,
+                                                                                        order=order)
+        return tl.tuple([
+            tlx.local_alloc(shape128, element_type, local_stages, layout=main_layout, _semantic=_semantic),
+            tlx.local_alloc(tail_shape, element_type, local_stages, layout=tail_layout, _semantic=_semantic),
+        ])
 
     if logical_extent <= 128:
         if pack_chunks:
@@ -4780,7 +4808,9 @@ def _wg_logical_rect_k64_allocate_direct_operand(
             ) for _ in range(8)
         ])
 
-    layout64: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases([(512, 16)], bases64, shape64))
+    layout64: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases([(512, 16)], _wg_A_BASES_64X64, shape64) if
+                              n_contiguous else tlx.padded_shared_layout_encoding.with_bases([(512,
+                                                                                               16)], bases64, shape64))
     if logical_extent == 256 and direct_chunk == 64:
         return tl.tuple([
             tlx.local_alloc(
@@ -4792,7 +4822,9 @@ def _wg_logical_rect_k64_allocate_direct_operand(
             ) for _ in range(4)
         ])
 
-    layout128: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases([(512, 16)], bases128, shape128))
+    layout128: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases([(512, 16)], _wg_N_BASES_64X128, shape128)
+                               if n_contiguous else tlx.padded_shared_layout_encoding.with_bases([(512, 16)], bases128,
+                                                                                                 shape128))
     if logical_extent == 192:
         return tl.tuple([
             tlx.local_alloc(
@@ -5027,7 +5059,10 @@ def _wg_logical_rect_k64_direct_load_extent(
             offsets = (reduction[:, None] * stride_k + outer[None, :] * stride_outer)
         else:
             offsets = ((kb * 64 + reduction[:, None]) * stride_k + outer[None, :] * stride_outer)
-        offsets = tl.max_contiguous(tl.multiple_of(offsets, (8, 1)), (8, 1))
+        if stride_outer == 1:
+            offsets = tl.max_contiguous(tl.multiple_of(offsets, (1, 8)), (1, 8))
+        else:
+            offsets = tl.max_contiguous(tl.multiple_of(offsets, (8, 1)), (8, 1))
     if offset_layout is not None:
         offsets = tlx.require_layout(offsets, offset_layout)
     # The M279/N8192 production plan reuses its compact A working set across
@@ -5108,10 +5143,17 @@ def _wg_logical_rect_k64_direct_load_packed_chunk(
         )
     else:
         offsets = (reduction[:, None] * stride_k + outer[None, :] * stride_outer)
-        offsets = tl.max_contiguous(tl.multiple_of(offsets, (8, 1)), (8, 1))
+        if stride_outer == 1:
+            offsets = tl.max_contiguous(tl.multiple_of(offsets, (1, 8)), (1, 8))
+        else:
+            offsets = tl.max_contiguous(tl.multiple_of(offsets, (8, 1)), (8, 1))
         if chunk_extent == 32:
-            offset_layout: tl.constexpr = (_wg_B_OFFSET_LAYOUT_64X32_8W
-                                           if warps_per_cta == 8 else _wg_B_OFFSET_LAYOUT_64X32_4W)
+            if stride_outer == 1:
+                tl.static_assert(warps_per_cta == 4)
+                offset_layout: tl.constexpr = _wg_A_OFFSET_LAYOUT_64X32
+            else:
+                offset_layout: tl.constexpr = (_wg_B_OFFSET_LAYOUT_64X32_8W
+                                               if warps_per_cta == 8 else _wg_B_OFFSET_LAYOUT_64X32_4W)
         elif chunk_extent == 64:
             offset_layout: tl.constexpr = (_wg_B_OFFSET_LAYOUT_64X64_8W
                                            if warps_per_cta == 8 else _wg_B_OFFSET_LAYOUT_64X64_4W)
@@ -5191,6 +5233,9 @@ def _wg_logical_rect_k64_direct_load_chunk(
             # Fine 32-wide backing is selected only for deep K. Moving the
             # common K coordinate into the scalar resource base removes one
             # repeated vector add per lane and per backing chunk.
+            offset_layout: tl.constexpr = ((
+                _wg_A_OFFSET_LAYOUT_32X64_8W if warps_per_cta == 8 else _wg_A_OFFSET_LAYOUT_64X32)
+                                           if stride_bn == 1 else _wg_B_OFFSET_LAYOUT_64X32_4W)
             _wg_logical_rect_k64_direct_load_extent(
                 b_ptr,
                 pid_n,
@@ -5202,13 +5247,13 @@ def _wg_logical_rect_k64_direct_load_chunk(
                 stride_bn,
                 stride_bk,
                 n,
-                _wg_B_OFFSET_LAYOUT_64X32_4W,
+                offset_layout,
                 False,
                 True,
             )
         elif b_chunk_count == 4:
-            offset_layout: tl.constexpr = (_wg_B_OFFSET_LAYOUT_64X64_8W
-                                           if warps_per_cta == 8 else _wg_B_OFFSET_LAYOUT_64X64_4W)
+            offset_layout: tl.constexpr = (_wg_N_CONTIG_OFFSET_LAYOUT_64X64_4W if stride_bn == 1 else (
+                _wg_B_OFFSET_LAYOUT_64X64_8W if warps_per_cta == 8 else _wg_B_OFFSET_LAYOUT_64X64_4W))
             _wg_logical_rect_k64_direct_load_extent(
                 b_ptr,
                 pid_n,
@@ -5241,8 +5286,10 @@ def _wg_logical_rect_k64_direct_load_chunk(
                 False,
             )
         else:
-            offset_layout: tl.constexpr = (_wg_B_OFFSET_LAYOUT_64X128_8W
-                                           if warps_per_cta == 8 else _wg_B_OFFSET_LAYOUT_64X128_4W)
+            offset_layout: tl.constexpr = (
+                (_wg_N_CONTIG_OFFSET_LAYOUT_64X128_8W if warps_per_cta == 8 else _wg_N_CONTIG_OFFSET_LAYOUT_64X128_4W)
+                if stride_bn == 1 else
+                (_wg_B_OFFSET_LAYOUT_64X128_8W if warps_per_cta == 8 else _wg_B_OFFSET_LAYOUT_64X128_4W))
             _wg_logical_rect_k64_direct_load_extent(
                 b_ptr,
                 pid_n,
@@ -5310,16 +5357,22 @@ def _wg_logical_rect_k64_direct_load_chunk(
                 offset_layout,
                 True,
             )
-        elif block_m == 192 and a_chunk == 1:
-            offset_layout: tl.constexpr = (_wg_A_OFFSET_LAYOUT_64X64_8W
-                                           if warps_per_cta == 8 else _wg_A_OFFSET_LAYOUT_64X64_4W)
+        elif (block_m > 128 and block_m <= 192 and block_m % 32 == 0 and a_chunk == 1
+              and (block_m == 192 or warps_per_cta == 4)):
+            tail_extent: tl.constexpr = block_m - 128
+            if tail_extent == 32:
+                tl.static_assert(warps_per_cta == 4)
+                offset_layout: tl.constexpr = _wg_A_OFFSET_LAYOUT_32X64_4W
+            else:
+                offset_layout: tl.constexpr = (_wg_A_OFFSET_LAYOUT_64X64_8W
+                                               if warps_per_cta == 8 else _wg_A_OFFSET_LAYOUT_64X64_4W)
             _wg_logical_rect_k64_direct_load_extent(
                 a_ptr,
                 pid_m,
                 kb,
                 a_local[1][stage],
                 128,
-                64,
+                tail_extent,
                 block_m,
                 stride_am,
                 stride_ak,
@@ -12328,6 +12381,7 @@ def _wg_store_mi16_wave_grid_output(
     accumulators_committed: tl.constexpr = False,
 ):
     """Commit and store one regular MI16 accumulator grid."""
+    use_wide_epilogue: tl.constexpr = wide_epilogue and stride_cn == 1
     if not row_wise:
         if not accumulators_committed:
             accumulators = tlx.amd_mfma_commit(
@@ -12348,7 +12402,7 @@ def _wg_store_mi16_wave_grid_output(
         else:
             row_values = tl.tuple([accumulators[row * b_group_count + group] for group in range(b_group_count)])
         rows = (pid_m * block_m + row * a_group_m + tl.arange(0, a_group_m))
-        if wide_epilogue:
+        if use_wide_epilogue:
             tl.static_assert(a_group_m == TILE)
             tl.static_assert(b_group_n == TILE)
             for wide_group in tl.static_range(b_group_count // N_GROUP_FRAGMENTS):
@@ -12395,7 +12449,7 @@ def _wg_store_mi16_wave_grid_output(
                 else:
                     tlx.buffer_store(value, c_base, offsets, contiguity=8)
         for group in tl.static_range(
-            (b_group_count // N_GROUP_FRAGMENTS * N_GROUP_FRAGMENTS if wide_epilogue else 0),
+            (b_group_count // N_GROUP_FRAGMENTS * N_GROUP_FRAGMENTS if use_wide_epilogue else 0),
                 b_group_count,
         ):
             cols = (pid_n * block_n + group * b_group_n + tl.arange(0, b_group_n))
@@ -12821,6 +12875,7 @@ def _wg_kernel_regular_mi16_wave_grid(
                 PACK_DIRECT_CHUNKS,
                 False,
                 b_element_type,
+                stride_bn == 1,
             )
         elif PGR2_OPERANDS:
             tl.static_assert(LOCAL_STAGES == 1 or LOCAL_STAGES == 2)
@@ -14019,9 +14074,10 @@ def _wg_matmul(
     if selected_plan is None:
         raise ValueError("no gfx950 wave-grid GEMM plan for the supplied operands")
     row_major_b_candidate = (_candidate_plan is not None and b.ndim == 2 and b.stride(1) == 1
-                             and selected_plan.get("kind") == "regular_mi16_wave_grid"
-                             and selected_plan.get("pgr2_operands", False)
-                             and not selected_plan.get("direct_to_lds", False))
+                             and selected_plan.get("kind") == "regular_mi16_wave_grid" and
+                             (selected_plan.get("pgr2_operands", False) or selected_plan.get("direct_to_lds", False))
+                             and (not selected_plan.get("direct_to_lds", False)
+                                  or selected_plan.get("row_major_b_lds", False)))
     if _candidate_plan is not None and (a.ndim != 2 or b.ndim != 2 or a.dtype not in (torch.float16, torch.bfloat16)
                                         or b.dtype != a.dtype or not a.is_cuda or a.device != b.device
                                         or a.shape[1] != b.shape[0] or a.stride(1) != 1 or
@@ -14089,6 +14145,35 @@ def _wg_matmul(
         out.stride(0),
         out.stride(1),
     )
+    compiled_key = None
+    if (plan["kind"] == "regular_mi16_wave_grid" and _split_k == 1 and not plan.get("persistent_program_count", 0)
+            and _can_use_wave_grid_compiled_cache()):
+        kernel = _wg_kernel_regular_mi16_wave_grid
+        try:
+            compiled_key = (
+                id(kernel),
+                kernel.cache_key,
+                a.device,
+                a.dtype,
+                m,
+                n,
+                k,
+                a.stride(),
+                b.stride(),
+                out.stride(),
+                a.data_ptr() % 16,
+                b.data_ptr() % 16,
+                out.data_ptr() % 16,
+                tuple((key, tuple(value) if isinstance(value, list) else value) for key, value in sorted(plan.items())),
+            )
+            cached = _WAVE_GRID_COMPILED_CACHE.get(compiled_key)
+        except TypeError:
+            compiled_key = None
+            cached = None
+        if cached is not None:
+            compiled, grid, constants = cached
+            _run_range_register_compiled(compiled, grid, (*operands, *constants))
+            return out
     if plan["kind"] == "register_fragmented_m":
         block_m = sum(extent for _, extent in plan["m_fragments"])
         block_n = plan["block_n"]
@@ -14230,8 +14315,7 @@ def _wg_matmul(
                 disable_unclustered_high_rp_reschedule=plan.get("disable_unclustered_high_rp_reschedule", False),
             )
             return out
-        _wg_kernel_regular_mi16_wave_grid[grid](
-            *kernel_operands,
+        launch_options = dict(
             MI_WAVE_TILE_M=plan["mi_wave_tile_m"],
             MI_WAVE_TILE_N=plan["mi_wave_tile_n"],
             WARPS_M=plan["warps_m"],
@@ -14267,6 +14351,13 @@ def _wg_matmul(
             sched_group_barrier_mfma_per_dwordx4=plan.get("sched_group_barrier_mfma_per_dwordx4", 4),
             llvm_fn_attrs=plan.get("llvm_fn_attrs", ""),
         )
+        compiled = _wg_kernel_regular_mi16_wave_grid[grid](*kernel_operands, **launch_options)
+        if compiled_key is not None and compiled is not None:
+            kernel = _wg_kernel_regular_mi16_wave_grid
+            constants = tuple(launch_options[name] for name in kernel.arg_names[len(kernel_operands):])
+            if len(_WAVE_GRID_COMPILED_CACHE) >= _WAVE_GRID_COMPILED_CACHE_LIMIT:
+                _WAVE_GRID_COMPILED_CACHE.pop(next(iter(_WAVE_GRID_COMPILED_CACHE)))
+            _WAVE_GRID_COMPILED_CACHE[compiled_key] = compiled, grid, constants
         if _split_k > 1:
             rbm, rbn = _reduce_tile
             _reduce_k_kernel[(triton.cdiv(m, rbm), triton.cdiv(n, rbn))](
@@ -14949,6 +15040,113 @@ _FP16_TUNED_SHAPE_CONFIGS = {
 
 
 @triton.jit
+def _short_k_register_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+):
+    """Direct-register GEMM for one masked K64 tile."""
+    block_m: tl.constexpr = 64
+    block_n: tl.constexpr = 64
+    block_k: tl.constexpr = 64
+    grid_n: tl.constexpr = tl.cdiv(N, block_n)
+    pid = tl.program_id(0).to(tl.int32)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+
+    rows = pid_m * block_m + tl.arange(0, block_m).to(tl.int32)
+    cols = pid_n * block_n + tl.arange(0, block_n).to(tl.int32)
+    input_rows = rows if M % block_m == 0 else tl.where(rows < M, rows, 0)
+    input_cols = cols if N % block_n == 0 else tl.where(cols < N, cols, 0)
+    reduction = tl.arange(0, block_k).to(tl.int32)
+    reg_m = tl.max_contiguous(tl.multiple_of(input_rows, block_m), block_m)
+    reg_n = tl.max_contiguous(tl.multiple_of(input_cols, block_n), block_n)
+    reduction_mask = reduction < K
+    a = tl.load(
+        a_ptr + reg_m[:, None] * stride_am + reduction[None, :] * stride_ak,
+        mask=reduction_mask[None, :],
+        other=0.0,
+    )
+    b = tl.load(
+        b_ptr + reduction[:, None] * stride_bk + reg_n[None, :] * stride_bn,
+        mask=reduction_mask[:, None],
+        other=0.0,
+    )
+    acc = tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+    output_ptrs = (c_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn)
+    if M % block_m == 0 and N % block_n == 0:
+        tl.store(output_ptrs, acc)
+    else:
+        tl.store(
+            output_ptrs,
+            acc,
+            mask=(rows[:, None] < M) & (cols[None, :] < N),
+        )
+
+
+def _launch_short_k_register(a, b, *, out=None):
+    """Launch the bounded one-K64 direct-register family."""
+    m, k = a.shape
+    b_k, n = b.shape
+    if k != b_k or not 0 < k <= 64:
+        raise ValueError("short-K register GEMM requires matching 0 < K <= 64")
+    if out is None:
+        out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    grid = (triton.cdiv(m, 64) * triton.cdiv(n, 64), )
+    _short_k_register_kernel[grid](
+        a,
+        b,
+        out,
+        m,
+        n,
+        k,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        out.stride(0),
+        out.stride(1),
+        num_warps=1,
+        num_stages=1,
+        matrix_instr_nonkdim=32,
+        waves_per_eu=0,
+    )
+    return out
+
+
+@triton.jit
+def _load_paired_strided_b(b_ptr, rows, cols, k: tl.constexpr, n: tl.constexpr, stride_bk: tl.constexpr,
+                           cache_cg: tl.constexpr, padded: tl.constexpr = False):
+    offsets = rows[:, None] * (stride_bk // 2) + cols[None, :]
+    if padded:
+        packed_ptr = b_ptr.to(tl.pointer_type(tl.uint32))
+        if cache_cg:
+            pairs = tl.load(packed_ptr + offsets, mask=rows[:, None] < k, other=0, cache_modifier=".cg")
+        else:
+            pairs = tl.load(packed_ptr + offsets, mask=rows[:, None] < k, other=0)
+        return (pairs & 65535).to(tl.uint16).to(b_ptr.dtype.element_ty, bitcast=True)
+    last = (rows[:, None] == k - 1) & (cols[None, :] == n - 1)
+    mask = (rows[:, None] < k) & ~last
+    packed_ptr = b_ptr.to(tl.pointer_type(tl.uint32))
+    if cache_cg:
+        pairs = tl.load(packed_ptr + offsets, mask=mask, other=0, cache_modifier=".cg")
+    else:
+        pairs = tl.load(packed_ptr + offsets, mask=mask, other=0)
+    value = (pairs & 65535).to(tl.uint16).to(b_ptr.dtype.element_ty, bitcast=True)
+    final = tl.load(b_ptr + rows[:, None] * stride_bk + cols[None, :] * 2, mask=last, other=0)
+    return tl.where(last, final, value)
+
+
+@triton.jit
 # Triton TR001: callers select either a measured fixed plan or an autotuned one.
 def _register_kernel_impl(  # noqa: TR001
     a_ptr,
@@ -14976,6 +15174,10 @@ def _register_kernel_impl(  # noqa: TR001
     ADD_BIAS: tl.constexpr,
     WRITE_STATS: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
+    CACHE_A_CG: tl.constexpr = False,
+    CACHE_B_CG: tl.constexpr = False,
+    PACK_B_PAIRS: tl.constexpr = False,
+    B_PAIRS_PADDED: tl.constexpr = False,
 ):
     pid = tl.program_id(0).to(tl.int32)
     grid_m = (M + BLOCK_M - 1) // BLOCK_M
@@ -15015,17 +15217,14 @@ def _register_kernel_impl(  # noqa: TR001
         k = k_idx * BLOCK_K
         a_ptrs = (a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak)
         b_ptrs = (b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn)
-        # Tall transposed grids stream distinct A rows while reusing a compact
-        # B operand. Bypass L1 for A so B survives across neighboring M tiles.
-        if ((M == 25600 and N == 256 and K == 256) or (M == 56768 and N == 128 and K == 64)
+        if (CACHE_A_CG or (M == 25600 and N == 256 and K == 256) or (M == 56768 and N == 128 and K == 64)
                 or (M == 65462 and N == 128 and K == 96)):
             a = tl.load(a_ptrs, cache_modifier=".cg")
         else:
             a = tl.load(a_ptrs)
-        # These single-M-tile production shapes reuse A across a wide N grid,
-        # while every B tile is consumed once.  Keep streaming B out of L1 so
-        # the shared A rows remain resident across neighboring workgroups.
-        if ((M == 128 and N == 2688 and K == 4416) or (M == 128 and N == 3456 and K == 2560)):
+        if PACK_B_PAIRS:
+            b = _load_paired_strided_b(b_ptr, k + offs_k, reg_n, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
+        elif (CACHE_B_CG or (M == 128 and N == 2688 and K == 4416) or (M == 128 and N == 3456 and K == 2560)):
             b = tl.load(b_ptrs, cache_modifier=".cg")
         else:
             b = tl.load(b_ptrs)
@@ -15036,13 +15235,10 @@ def _register_kernel_impl(  # noqa: TR001
         a_ptrs = (a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak)
         b_ptrs = (b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn)
         a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
-        if M == 128 and N == 2688 and K == 4416:
-            b = tl.load(
-                b_ptrs,
-                mask=k_mask[:, None],
-                other=0.0,
-                cache_modifier=".cg",
-            )
+        if PACK_B_PAIRS:
+            b = _load_paired_strided_b(b_ptr, k + offs_k, reg_n, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
+        elif CACHE_B_CG or (M == 128 and N == 2688 and K == 4416):
+            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0, cache_modifier=".cg")
         else:
             b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
         acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
@@ -15268,6 +15464,455 @@ def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False
     return out
 
 
+_RANGE_REGISTER_COMPILED_CACHE = None
+_RANGE_REGISTER_COMPILED_CACHE_LIMIT = 64
+
+
+def _range_register_compiled_cache():
+    global _RANGE_REGISTER_COMPILED_CACHE
+    if _RANGE_REGISTER_COMPILED_CACHE is None:
+        _RANGE_REGISTER_COMPILED_CACHE = {}
+    return _RANGE_REGISTER_COMPILED_CACHE
+
+
+def _can_use_range_register_compiled_cache():
+    """Keep instrumentation and forced compilation on the normal JIT path."""
+    return not (triton.knobs.compilation.always_compile or _register_kernel_impl.pre_run_hooks
+                or _register_kernel_impl.used_global_vals or triton.knobs.runtime.add_stages_inspection_hook is not None
+                or triton.knobs.runtime.launch_enter_hook or triton.knobs.runtime.launch_exit_hook
+                or _register_kernel_impl.launch_metadata or os.environ.get("TRITON_DUMP_TLX_BENCHMARK")
+                or os.environ.get("TRITON_COMPILE_IQ_COLLECT"))
+
+
+def _range_register_cache_key(a, b, out, config, launch_options):
+    m, k = a.shape
+    n = b.shape[1]
+    return (
+        a.device,
+        a.dtype,
+        m,
+        n,
+        k,
+        a.stride(),
+        b.stride(),
+        out.stride(),
+        a.data_ptr() % 16,
+        b.data_ptr() % 16,
+        out.data_ptr() % 16,
+        tuple(sorted(config.items())),
+        tuple(sorted(launch_options.items())),
+    )
+
+
+def _run_range_register_compiled(compiled, grid, compiled_args):
+    device = driver.active.get_current_device()
+    stream = driver.active.get_current_stream(device)
+    compiled.run(
+        grid[0],
+        1,
+        1,
+        stream,
+        compiled.function,
+        compiled.packed_metadata,
+        None,
+        None,
+        None,
+        *compiled_args,
+    )
+
+
+def _remember_range_register_compiled(cache_key, compiled):
+    cache = _range_register_compiled_cache()
+    if len(cache) >= _RANGE_REGISTER_COMPILED_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    cache[cache_key] = compiled
+
+
+def _launch_range_register_plan(a, b, *, config, out=None, _use_compiled_cache=None):
+    """Launch one unsplit register configuration from the supported range."""
+    m, k = a.shape
+    n = b.shape[1]
+    if out is None:
+        out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
+    runtime_args = (
+        a,
+        b,
+        out,
+        out,
+        out,
+        out,
+        m,
+        n,
+        k,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        0,
+        0,
+        out.stride(0),
+        out.stride(1),
+    )
+    launch_options = _range_register_launch_options(a, b, config)
+    compiled_args = runtime_args + (
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        config["BLOCK_K"],
+        config["GROUP_M"],
+        config["NUM_XCDS"],
+        False,
+        False,
+        False,
+        launch_options.get("CACHE_A_CG", False),
+        config.get("CACHE_B_CG", False),
+        launch_options.get("PACK_B_PAIRS", False),
+        launch_options.get("B_PAIRS_PADDED", False),
+    )
+    use_compiled_cache = (_can_use_range_register_compiled_cache()
+                          if _use_compiled_cache is None else _use_compiled_cache)
+    cache_key = None
+    if use_compiled_cache:
+        cache_key = _range_register_cache_key(a, b, out, config, launch_options)
+        compiled = _range_register_compiled_cache().get(cache_key)
+        if compiled is not None:
+            _run_range_register_compiled(compiled, grid, compiled_args)
+            return out
+    compiled = _register_kernel_impl[grid](
+        *runtime_args,
+        ADD_BIAS=False,
+        WRITE_STATS=False,
+        IS_RMS_NORM=False,
+        **dict(config, **launch_options),
+    )
+    if use_compiled_cache:
+        _remember_range_register_compiled(cache_key, compiled)
+    return out
+
+
+def _column_major_range_candidates(m, n, k, dtype, element_size, a_strides, b_strides):
+    """Select unsplit tiles for dense-A, K-contiguous-B GEMMs."""
+    if (dtype != torch.bfloat16 or a_strides != (k, 1) or b_strides[0] != 1 or b_strides[1] < k or b_strides[1] % 8
+            or not 512 <= k <= 4096 or k % 128):
+        return ()
+
+    def register(bm, bn, bk, group, xcds, warps, stages, cache_b=False):
+        config = _fixed_register_plan(bm, bn, bk, group, xcds, warps, stages)
+        if cache_b:
+            config = MappingProxyType(dict(config, CACHE_B_CG=True))
+        return "range_register", config
+
+    def wave_grid(bm, bn, *, transposed=False, mapping=8, merged=False):
+        mi_m, mi_n, warps_m, warps_n = _wg_wave_grid(bm, bn)
+        plan = _wg_regular_wave_grid_plan(mi_m, mi_n, warps_m, warps_n, 64, local_stages=2, pgr2_operands=True,
+                                          direct_to_lds=True, direct_chunk=32 if merged else 128,
+                                          pack_direct_chunks=merged, refill_read_window=1 if merged else 0,
+                                          read_cover_sixteenths=12 if merged else 8, row_wise_epilogue=not transposed,
+                                          num_xcds=8, workgroup_mapping=mapping, sink_insts_to_avoid_spills=True,
+                                          disable_unclustered_high_rp_reschedule=True)
+        return ("transposed_wave_grid" if transposed else "wave_grid"), plan
+
+    streamed_b = n >= 8 * k and n * k * element_size >= 64 * 1024**2
+    if m <= 128:
+        if not streamed_b:
+            return ()
+        if m <= 32:
+            candidates = (register(16, 32, 256, 1, 8, 2, 3, True), register(16, 16, 256, 1, 4, 2, 3))
+        else:
+            bm = 64 if m <= 64 else 128
+            candidates = (wave_grid(bm, 256 if bm == 64 else 128, mapping=1), wave_grid(bm, 128),
+                          wave_grid(128, bm, transposed=True), register(64, 64, 256, 8, 8, 4, 2, True))
+        if (17 <= m <= 64 and b_strides[1] == k and n >= 512 * _NUM_CU and n * k * element_size >= 512 * 1024**2):
+            plan = _wg_regular_wave_grid_plan(8, 2, 2, 2, 64, local_stages=1, pgr2_operands=True, num_xcds=8,
+                                              workgroup_mapping=1, sink_insts_to_avoid_spills=True,
+                                              disable_unclustered_high_rp_reschedule=True)
+            candidates = (("transposed_wave_grid", plan),
+                          ("transposed_wave_grid", dict(plan, num_xcds=4, workgroup_mapping=4))) + candidates
+        return candidates
+
+    incumbent = _dispatch_plan(m, n, k, dtype, element_size)
+    if (n < 512 or incumbent is None or incumbent[0] != "lds" or _strong_lds_plan(m, n, k) is not None
+            or (m < 1024 and n < 8 * k)):
+        return ()
+    incumbent = "lds", (incumbent[1][0], incumbent[1][1], 1)
+    candidates = (incumbent, ) + tuple(
+        wave_grid(bm, bn, transposed=True) for bm, bn in ((128, 96), (192, 128), (128, 192), (256, 160)))
+    if n < 8 * k:
+
+        def cost(dispatch):
+            path, plan = dispatch
+            if path == "lds":
+                bm, bn, _ = plan
+            else:
+                bn = 16 * plan["mi_wave_tile_m"] * plan["warps_m"]
+                bm = 16 * plan["mi_wave_tile_n"] * plan["warps_n"]
+            grid = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+            work = (bm * bn * k / 8_388_608 + (bm + bn) * k / 4_608 + 45 * k / (8 * 64) + bm * bn / 320)
+            efficiency = (0.9 if bm == 256 else 1.4) if path == "lds" else 1
+            return triton.cdiv(grid, _NUM_CU) * work * efficiency
+
+        candidates = tuple(sorted(candidates, key=cost))
+    merged = tuple(
+        wave_grid(bm, bn, transposed=True, merged=True)
+        for bm, bn in ((256, 160), (256, 192), (192, 256), (256, 256))) + (
+            wave_grid(256, 160, transposed=True, mapping=4, merged=True),
+            wave_grid(256, 256, transposed=True, mapping=16, merged=True),
+        )
+    if candidates[0][0] == "transposed_wave_grid":
+        plan = candidates[0][1]
+        bm = 16 * plan["mi_wave_tile_m"] * plan["warps_m"]
+        bn = 16 * plan["mi_wave_tile_n"] * plan["warps_n"]
+        if bm == 256 and bn == 160:
+            candidates = (merged[0], ) + candidates
+    return candidates + tuple(dispatch for dispatch in merged if dispatch not in candidates) + (register(
+        128, 64, 64, 4, 1, 4, 3), )
+
+
+@lru_cache(maxsize=None)
+def _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides):
+    """Return bounded unsplit candidates for contiguous-A GEMM families."""
+    if (dtype not in (torch.float16, torch.bfloat16) or min(m, n, k) <= 0 or a_strides[1] != 1
+            or min(*a_strides, *b_strides) <= 0):
+        return ()
+    if _supports_short_k_register(m, n, k, dtype):
+        return (("short_k_register", None), )
+    max_offset = max((m - 1) * a_strides[0] + k - 1, (k - 1) * b_strides[0] + (n - 1) * b_strides[1], m * n)
+    if not 128 <= k <= 4096 or n < 128 or max_offset * element_size >= 2**31:
+        return ()
+    column_major = _column_major_range_candidates(m, n, k, dtype, element_size, a_strides, b_strides)
+    if column_major:
+        return column_major
+
+    def register(bm, bn, bk, group, xcds, warps, stages, waves=0):
+        return ("range_register", _fixed_register_plan(bm, bn, bk, group, xcds, warps, stages, waves_per_eu=waves))
+
+    if dtype == torch.bfloat16 and m <= 32:
+        return (register(16, 16, 256, 1, 4, 2, 3), register(32, 32, 256, 4, 8, 4, 3, 2))
+    if dtype == torch.bfloat16 and m <= 128:
+        return (register(32, 32, 256, 4, 8, 4, 3, 2), register(64, 32, 256, 4, 8, 4, 3, 2))
+    if dtype == torch.bfloat16 and k % 64:
+        return (register(64, 128, 64, 4, 1, 8, 3), register(128, 64, 64, 4, 1, 4, 3))
+    if b_strides[1] != 1:
+        if dtype == torch.bfloat16 and b_strides[0] != 1:
+            fallback = (register(128, 64, 64, 4, 1, 4, 3), register(64, 128, 64, 4, 1, 8, 3))
+            if (b_strides[1] == 2 and b_strides[0] % 2 == 0 and m >= 1024 and n >= 512 and k % 256 == 0
+                    and triton.cdiv(m, 128) * triton.cdiv(n, 64) <= _NUM_CU):
+                paired = MappingProxyType(dict(_fixed_register_plan(128, 64, 256, 4, 8, 4, 2), PACK_B_PAIRS=True))
+                if n % 64 == 0:
+                    padded = MappingProxyType(
+                        dict(_fixed_register_plan(128, 64, 128, 4, 8, 4, 2, matrix_instr_nonkdim=32), PACK_B_PAIRS=True,
+                             B_PAIRS_PADDED=True))
+                    return (("range_register", padded), ("range_register", paired)) + fallback
+                return (("range_register", paired), ) + fallback
+            return fallback
+        return ()
+    if dtype == torch.float16:
+        if not (256 <= m < 8192 and 256 <= n <= 8192 and 512 <= k and k % 64 == 0):
+            return ()
+        return (register(128, 128, 64, 16, 8, 4, 2), register(256, 256, 64, 8, 8, 8, 2))
+
+    square = register(256, 256, 64, min(triton.cdiv(m, 256), 256) if n % 256 == 0 else 8, 1, 8, 2)
+    compact = register(128, 128, 64, 16, 8, 4, 3)
+    direct_legal = (k % 128 == 0 and k >= 512 and n % 8 == 0 and a_strides[0] % 8 == 0 and b_strides[0] % 8 == 0)
+    if not direct_legal:
+        return (compact, square)
+    if (240 <= n <= 256 and k >= 1024 and a_strides == (k, 1) and b_strides == (n, 1)
+            and _NUM_CU // 2 <= triton.cdiv(m, 160) <= _NUM_CU):
+        narrow_direct = _wg_regular_wave_grid_plan(5, 8, 2, 2, 64, local_stages=2, pgr2_operands=True,
+                                                   direct_to_lds=True, direct_chunk=64, row_major_b_lds=True,
+                                                   row_wise_epilogue=True, num_xcds=1, workgroup_mapping=1,
+                                                   reverse_local_assignment=True, sink_insts_to_avoid_spills=True,
+                                                   disable_unclustered_high_rp_reschedule=True, waves_per_eu=1)
+        return (("wave_grid", narrow_direct), compact, square)
+    if n <= 256 and m >= 16 * n:
+        mi_n = min(8, triton.next_power_of_2(triton.cdiv(n, 32)))
+        if n % (32 * mi_n):
+            return (compact, square)
+        narrow = _wg_regular_wave_grid_plan(5, mi_n, 2, 2, 64, local_stages=1, pgr2_operands=True,
+                                            row_wise_epilogue=True, num_xcds=1, workgroup_mapping=1,
+                                            reverse_local_assignment=True, sink_insts_to_avoid_spills=True,
+                                            disable_unclustered_high_rp_reschedule=True, waves_per_eu=1)
+        return (("wave_grid", narrow), compact, square)
+    wide = _wg_regular_wave_grid_plan(8, 8, 2, 2, 64, local_stages=2, pgr2_operands=True, direct_to_lds=True,
+                                      direct_chunk=128, row_major_b_lds=True, row_wise_epilogue=True,
+                                      wide_epilogue=True, num_xcds=8, workgroup_mapping=6,
+                                      reverse_local_assignment=False, sink_insts_to_avoid_spills=True,
+                                      disable_unclustered_high_rp_reschedule=True)
+    if m >= 8 * n and n % 256 == 0:
+        return (square, ("wave_grid", wide), compact)
+    return (("wave_grid", wide), square, compact)
+
+
+def _range_prefers_family(m, n, k, dtype, b_strides):
+    if dtype == torch.float16:
+        return m >= 1024
+    if m <= 128:
+        return n <= 8192
+    if k < 512:
+        return False
+    if k % 64:
+        return m < 4096
+    if b_strides[1] != 1:
+        return True
+    if m >= 8 * n:
+        return k >= 1024
+    return m >= 1024 and n >= 8 * k
+
+
+@lru_cache(maxsize=64)
+def _range_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides, *, include_incumbent=True):
+    candidates = _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides)
+    if not candidates or candidates[0][0] == "short_k_register":
+        return candidates
+    prefer_family = _range_prefers_family(m, n, k, dtype, b_strides)
+    if prefer_family and not include_incumbent:
+        return candidates
+    genuinely_strided = a_strides[1] != 1 or (b_strides[0] != 1 and b_strides[1] != 1)
+    if genuinely_strided or (b_strides[0] != 1 and m < 1024):
+        config = _unsplit_register_config_for_shape(m, n, k, None if genuinely_strided else dtype)
+        incumbent = "register", config or _intermediate_register_config(m, n, k)
+    else:
+        incumbent = _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides)
+    if incumbent is None or incumbent[0] != "register":
+        return candidates
+    if prefer_family:
+        return candidates + (incumbent, )
+    return (incumbent, ) + candidates
+
+
+def _range_dispatch_for(a, b):
+    if (a.ndim != 2 or b.ndim != 2 or a.dtype != b.dtype or not a.is_cuda or a.device != b.device
+            or a.shape[1] != b.shape[0] or _device_arch(a.device) != "gfx950"):
+        return None
+    candidates = _range_dispatch_candidates(a.shape[0], b.shape[1], a.shape[1], a.dtype, a.element_size(), a.stride(),
+                                            b.stride(), include_incumbent=False)
+    for path, plan in candidates:
+        if path == "range_register" and plan.get("PACK_B_PAIRS", False) and b.data_ptr() % 4:
+            continue
+        if path == "range_register" and plan.get("B_PAIRS_PADDED", False) and not _paired_b_has_padding(b):
+            continue
+        if path in ("wave_grid", "transposed_wave_grid", "lds") and (a.data_ptr() % 16 or b.data_ptr() % 16):
+            continue
+        return path, plan
+    return None
+
+
+def _paired_b_has_padding(b):
+    if b.stride(1) != 2 or b.stride(0) % 2:
+        return False
+    end = b.storage_offset() + (b.shape[0] - 1) * b.stride(0) + (b.shape[1] - 1) * 2 + 2
+    return end * b.element_size() <= b.untyped_storage().nbytes()
+
+
+def _range_register_launch_options(a, b, config):
+    options = {}
+    if a.dtype == torch.bfloat16 and config["BLOCK_K"] == 64:
+        options["llvm_fn_attrs"] = (("amdgpu-agpr-alloc", "0,0"), )
+        if (config["BLOCK_M"] >= 128 and b.shape[1] % config["BLOCK_N"] != 0 and b.stride(1) == 1
+                and a.shape[0] >= 8 * b.shape[1]):
+            options["CACHE_A_CG"] = True
+        if config["BLOCK_M"] == config["BLOCK_N"] == 256:
+            grid_m = triton.cdiv(a.shape[0], 256)
+            grid_n = triton.cdiv(b.shape[1], 256)
+            if grid_m >= 2 * grid_n:
+                if b.shape[1] % 256:
+                    options["reverse_local_assignment"] = True
+                else:
+                    options["disable_unclustered_high_rp_reschedule"] = True
+    options["PACK_B_PAIRS"] = (config.get("PACK_B_PAIRS", False) and a.dtype == torch.bfloat16 and b.stride(1) == 2
+                               and b.stride(0) % 2 == 0 and b.data_ptr() % 4 == 0)
+    options["B_PAIRS_PADDED"] = (options["PACK_B_PAIRS"] and config.get("B_PAIRS_PADDED", False)
+                                 and _paired_b_has_padding(b))
+    return options
+
+
+_RANGE_TUNED_PLAN_CACHE = {}
+_RANGE_TUNED_PLAN_CACHE_LIMIT = 64
+
+
+def _range_tuned_plan_cache_key(a, b, out):
+    return (a.device, a.dtype, tuple(a.shape), tuple(b.shape), a.stride(), b.stride(), out.stride(), a.data_ptr() % 16,
+            b.data_ptr() % 16, out.data_ptr() % 16, _paired_b_has_padding(b))
+
+
+def _launch_range_autotuned(a, b, out, candidates):
+    """Benchmark legal range candidates and cache the selected dispatch."""
+    from triton import testing
+
+    use_cache = _can_use_range_register_compiled_cache()
+    key = _range_tuned_plan_cache_key(a, b, out)
+    selected = _RANGE_TUNED_PLAN_CACHE.get(key) if use_cache else None
+    if selected is None:
+        executable = []
+        for dispatch in candidates:
+            if dispatch[0] == "range_register" and dispatch[1].get("PACK_B_PAIRS", False) and b.data_ptr() % 4:
+                continue
+            if dispatch[0] == "range_register" and dispatch[1].get("B_PAIRS_PADDED",
+                                                                   False) and not _paired_b_has_padding(b):
+                continue
+            if dispatch[0] in ("wave_grid", "transposed_wave_grid", "lds") and (a.data_ptr() % 16 or b.data_ptr() % 16):
+                continue
+            try:
+                _launch_dispatch(a, b, out, dispatch)
+            except triton.OutOfResources:
+                continue
+            executable.append(dispatch)
+        if not executable:
+            raise InvalidInput("no executable gfx950 GEMM candidate in the selected range")
+        timings = [[] for _ in executable]
+        m, k = a.shape
+        column_candidates = (_column_major_range_candidates(m, b.shape[1], k, a.dtype, a.element_size(), a.stride(),
+                                                            b.stride()) if use_cache and m > 128 else ())
+        if column_candidates:
+            graphs = []
+            with torch.cuda.device(a.device):
+                for dispatch in executable:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        for _ in range(64):
+                            _launch_dispatch(a, b, out, dispatch)
+                    graphs.append(graph)
+                for _ in range(3):
+                    for graph in graphs:
+                        graph.replay()
+                torch.cuda.synchronize()
+                for round_index in range(3):
+                    offset = round_index % len(executable)
+                    order = list(range(offset, len(executable))) + list(range(offset))
+                    if round_index % 2:
+                        order.reverse()
+                    for index in order:
+                        start = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        start.record()
+                        graphs[index].replay()
+                        end.record()
+                        end.synchronize()
+                        timings[index].append(start.elapsed_time(end) / 64)
+        else:
+            for round_index in range(3 if use_cache else 1):
+                offset = round_index % len(executable)
+                for index in list(range(offset, len(executable))) + list(range(offset)):
+
+                    def launch(dispatch=executable[index]):
+                        return _launch_dispatch(a, b, out, dispatch)
+
+                    if use_cache:
+                        elapsed = testing.do_bench_cudagraph(launch, rep=10, return_mode="median")
+                    else:
+                        elapsed = testing.do_bench(launch, warmup=5, rep=10, return_mode="median")
+                    timings[index].append(elapsed)
+        winner = min(range(len(executable)), key=lambda index: sorted(timings[index])[len(timings[index]) // 2])
+        if winner and not _range_winner_is_stable(a, b, out, executable, timings, winner, use_cache):
+            winner = 0
+        selected = executable[winner]
+        if use_cache:
+            if len(_RANGE_TUNED_PLAN_CACHE) >= _RANGE_TUNED_PLAN_CACHE_LIMIT:
+                _RANGE_TUNED_PLAN_CACHE.pop(next(iter(_RANGE_TUNED_PLAN_CACHE)))
+            _RANGE_TUNED_PLAN_CACHE[key] = selected
+    return _launch_dispatch(a, b, out, selected)
+
+
 def _register_split_k_for(grid_mn, k):
     min_ks = _MIN_KTILES_PER_SPLIT * _BLOCK_K
     best = 1
@@ -15403,8 +16048,8 @@ def _intermediate_register_config(m, n, k):
     }
 
 
-def _register_plan_for_shape(m, n, k, dtype=None):
-    """Return the bounded register plan selected by the gfx950 geometry."""
+def _unsplit_register_config_for_shape(m, n, k, dtype=None):
+    """Select a register configuration without estimating Split-K coverage."""
     shape = (m, n, k)
     tuned = _TUNED_SHAPE_CONFIGS.get(shape)
     if dtype == torch.float16:
@@ -15421,6 +16066,14 @@ def _register_plan_for_shape(m, n, k, dtype=None):
     config = _tall_skinny_short_k_register_config(m, n, k)
     if config is not None:
         return MappingProxyType(config)
+    return None
+
+
+def _register_plan_for_shape(m, n, k, dtype=None):
+    """Return the bounded register plan selected by the gfx950 geometry."""
+    config = _unsplit_register_config_for_shape(m, n, k, dtype)
+    if config is not None:
+        return config
 
     block_m = _default_lds_block_m(m, n, k)
     padded_m = triton.cdiv(m, block_m) * block_m
@@ -15681,6 +16334,8 @@ def _launch_register(a, b, bias=None, config=None, out=None):
         b,
         bias_ptr,
         out,
+        out,
+        out,
         M,
         N,
         K,
@@ -15697,6 +16352,8 @@ def _launch_register(a, b, bias=None, config=None, out=None):
     _register_kernel[grid](
         *args,
         ADD_BIAS=bias is not None,
+        WRITE_STATS=False,
+        IS_RMS_NORM=False,
         **launch_options,
     )
     return out
@@ -21319,16 +21976,24 @@ _FP16_TRANSPOSED_REGISTER_PLANS = {
 }
 
 
+def _supports_short_k_register(m, n, k, dtype):
+    """Select the one-K64 register kernel for sufficiently parallel BF16 GEMMs."""
+    return (dtype == torch.bfloat16 and 0 < k <= 64 and m >= 256 and n >= 256)
+
+
 @lru_cache(maxsize=None)
 def _dispatch_plan(m, n, k, dtype, element_size):
+    shape = (m, n, k)
     wave_grid_plan = _wave_grid_plan_for_shape(m, n, k, dtype)
     if dtype == torch.bfloat16:
-        streamk_plan = _BF16_STREAMK_PROMOTIONS.get((m, n, k))
+        streamk_plan = _BF16_STREAMK_PROMOTIONS.get(shape)
         if streamk_plan is not None:
             return "streamk", streamk_plan
-        promotion = _BF16_INTER_WAVE_PROMOTIONS.get((m, n, k))
-        if promotion is not None or (m, n, k) in _BF16_INTER_WAVE_PROMOTIONS:
+        promotion = _BF16_INTER_WAVE_PROMOTIONS.get(shape)
+        if promotion is not None or shape in _BF16_INTER_WAVE_PROMOTIONS:
             return "inter_wave", promotion
+        if _supports_short_k_register(m, n, k, dtype):
+            return "short_k_register", None
     if dtype == torch.bfloat16 and wave_grid_plan is not None:
         return "wave_grid", wave_grid_plan
     if dtype == torch.float16:
@@ -21383,7 +22048,7 @@ def _dispatch_plan(m, n, k, dtype, element_size):
     return "lds", (block_m, block_n, split_k)
 
 
-def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
+def _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
     """Return one production plan selected from measured gfx950 families."""
 
     def register(block_m, block_n, block_k, group_m, num_xcds, waves_per_eu, num_warps, num_stages):
@@ -21399,6 +22064,9 @@ def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
             "num_warps": num_warps,
             "num_stages": num_stages,
         }
+
+    if _supports_short_k_register(m, n, k, dtype):
+        return "short_k_register", None
 
     # Only genuinely strided operands retain the generic register fallback; either dense B orientation is eligible below.
     if a_strides[1] != 1 or (b_strides[0] != 1 and b_strides[1] != 1):
@@ -21483,7 +22151,19 @@ def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
     return register(128, 128, 64, 8, 8, 0, 4, 2)
 
 
+def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
+    """Return one gfx950 plan from the geometry default or incumbent policy."""
+    candidates = _range_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides, include_incumbent=False)
+    if candidates:
+        return candidates[0]
+    return _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides)
+
+
 def _dispatch_for(a, b):
+    if a.dtype == torch.bfloat16:
+        ranged = _range_dispatch_for(a, b)
+        if ranged is not None:
+            return ranged
     if (a.ndim == 2 and b.ndim == 2 and a.dtype == torch.float16 and b.dtype == a.dtype and a.is_cuda
             and a.device == b.device and a.shape[1] == b.shape[0] and a.stride(1) == 1 and b.stride(1) == 1
             and _wg_device_arch(a.device) == "gfx950"):
@@ -21501,7 +22181,7 @@ def _dispatch_for(a, b):
             return "row_major_direct", plan
     problem = _problem_for(a, b)
     if problem is None:
-        return None
+        return _range_dispatch_for(a, b)
     return _dispatch_plan(*problem, a.dtype, a.element_size())
 
 
@@ -21546,6 +22226,8 @@ def _launch_production_wave_grid(a, b, out, plan):
 
 def _launch_dispatch(a, b, out, dispatch):
     path, plan = dispatch
+    if path == "short_k_register":
+        return _launch_short_k_register(a, b, out=out)
     if path == "row_major_direct":
         return _launch_row_major_direct(a, b, out, plan)
     if path == "hybrid_n160":
@@ -21575,6 +22257,8 @@ def _launch_dispatch(a, b, out, dispatch):
         return _launch_production_wave_grid(a, b, out, plan)
     if path == "persistent":
         return _launch_persistent(a, b, out=out)
+    if path == "range_register":
+        return _launch_range_register_plan(a, b, config=plan, out=out)
     if path == "register":
         return _launch_register_plan(
             a,
@@ -21593,6 +22277,27 @@ def _launch_dispatch(a, b, out, dispatch):
             out=out,
         )
     return _launch_validated(a, b, out, plan)
+
+
+_WAVE_GRID_COMPILED_CACHE = {}
+_WAVE_GRID_COMPILED_CACHE_LIMIT = 64
+_WAVE_GRID_MISSING_GLOBAL = object()
+
+
+def _can_use_wave_grid_compiled_cache():
+    kernel = _wg_kernel_regular_mi16_wave_grid
+    if (type(kernel) is not triton.runtime.jit.JITFunction or triton.knobs.compilation.always_compile
+            or kernel.pre_run_hooks or kernel.debug or triton.knobs.runtime.debug
+            or triton.knobs.runtime.sanitize_overflow or triton.knobs.compilation.instrumentation_mode
+            or triton.knobs.compilation.fpsan_homomorphic_casts
+            or triton.knobs.runtime.add_stages_inspection_hook is not None or triton.knobs.runtime.launch_enter_hook
+            or triton.knobs.runtime.launch_exit_hook or kernel.launch_metadata
+            or os.environ.get("TRITON_DUMP_TLX_BENCHMARK") or os.environ.get("TRITON_COMPILE_IQ_COLLECT")):
+        return False
+    for (name, _), (value, namespace) in kernel.used_global_vals.items():
+        if namespace.get(name, _WAVE_GRID_MISSING_GLOBAL) != value:
+            return False
+    return True
 
 
 def matmul(a, b, out=None):
@@ -21621,6 +22326,47 @@ def matmul(a, b, out=None):
     return _launch_dispatch(a, b, out, dispatch)
 
 
+def _range_winner_is_stable(a, b, out, candidates, timings, winner, use_cache):
+    m, k = a.shape
+    column_candidates = (_column_major_range_candidates(m, b.shape[1], k, a.dtype, a.element_size(), a.stride(),
+                                                        b.stride()) if use_cache and m > 128 else ())
+    if max(timings[winner]) >= min(timings[0]):
+        if not column_candidates:
+            return False
+        if (sorted(timings[winner])[len(timings[winner]) // 2] >= sorted(timings[0])[len(timings[0]) // 2]):
+            return False
+    if not use_cache:
+        return True
+    import torch
+
+    estimated_ms = max(sorted(timings[index])[len(timings[index]) // 2] for index in (0, winner))
+    repeats = 64 if column_candidates else max(1, min(64, int(10 / max(estimated_ms, 1e-6))))
+    graphs = []
+    with torch.cuda.device(a.device):
+        for index in (0, winner):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for _ in range(repeats):
+                    _launch_dispatch(a, b, out, candidates[index])
+            graphs.append(graph)
+        for _ in range(3):
+            for graph in graphs:
+                graph.replay()
+        torch.cuda.synchronize()
+        samples = [[], []]
+        for round_index in range(9):
+            for index in (round_index % 2, (round_index + 1) % 2):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                graphs[index].replay()
+                end.record()
+                end.synchronize()
+                samples[index].append(start.elapsed_time(end) / repeats)
+    medians = [[sorted(values[offset:offset + 3])[1] for offset in range(0, 9, 3)] for values in samples]
+    return max(medians[1]) < min(medians[0])
+
+
 def mm(a, b, *, out=None, space="heuristic"):
     """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation."""
     if space not in ("full", "heuristic"):
@@ -21644,35 +22390,47 @@ def mm(a, b, *, out=None, space="heuristic"):
     elif out.device != a.device:
         raise InvalidInput(f"gfx950 mm output device must be {a.device}; "
                            f"got {out.device}")
+    dispatch = None
+    use_compiled_cache = None
     if space == "full":
-        return _launch_register(a, b, out=out)
-    # Preserve the measured family selector for dense TN inputs.  The broader
-    # master heuristic remains the fallback for layouts such as row-major B
-    # that are outside the promoted selector's validated domain.
-    # Catalog validation already established the device, dtype, rank, and
-    # matching reduction extent.  Dense TN is the production hot path, so skip
-    # the generic architecture/layout probe and consult the cached geometry
-    # selector directly.
-    if a.stride(1) == 1 and b.stride(0) == 1:
-        dispatch = _dispatch_plan(m, n, k, a.dtype, a.element_size())
+        if k >= 128:
+            use_compiled_cache = _can_use_range_register_compiled_cache()
+            if use_compiled_cache:
+                dispatch = _RANGE_TUNED_PLAN_CACHE.get(_range_tuned_plan_cache_key(a, b, out))
+        if dispatch is None:
+            candidates = _range_dispatch_candidates(m, n, k, a.dtype, a.element_size(), a.stride(), b.stride())
+            if len(candidates) == 1:
+                dispatch = candidates[0]
+            elif candidates:
+                return _launch_range_autotuned(a, b, out, candidates)
+            else:
+                return _launch_register(a, b, out=out)
     else:
-        dispatch = _dispatch_for(a, b)
-    if dispatch is None:
-        dispatch = heuristic_config(
-            m,
-            n,
-            k,
-            a.dtype,
-            a.element_size(),
-            a.stride(),
-            b.stride(),
-        )
+        # Preserve the measured family selector for dense TN inputs.  The broader
+        # master heuristic remains the fallback for layouts such as row-major B
+        # that are outside the promoted selector's validated domain.
+        if a.dtype == torch.float16 and a.stride(1) == 1 and b.stride(0) == 1:
+            dispatch = _dispatch_plan(m, n, k, a.dtype, a.element_size())
+        else:
+            dispatch = _dispatch_for(a, b)
+        if dispatch is None:
+            dispatch = heuristic_config(
+                m,
+                n,
+                k,
+                a.dtype,
+                a.element_size(),
+                a.stride(),
+                b.stride(),
+            )
     if dispatch is None:
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     # Keep this catalog hot path inline: ``tlx.ops.mm`` already validated the
     # inputs, and another Python call is material for the small-M kernels.
     path, plan = dispatch
+    if path == "short_k_register":
+        return _launch_short_k_register(a, b, out=out)
     if path == "row_major_direct":
         return _launch_row_major_direct(a, b, out, plan)
     if path == "hybrid_n160":
@@ -21702,6 +22460,8 @@ def mm(a, b, *, out=None, space="heuristic"):
         return _launch_production_wave_grid(a, b, out, plan)
     if path == "persistent":
         return _launch_persistent(a, b, out=out)
+    if path == "range_register":
+        return _launch_range_register_plan(a, b, config=plan, out=out, _use_compiled_cache=use_compiled_cache)
     if path == "register":
         return _launch_register_plan(
             a,

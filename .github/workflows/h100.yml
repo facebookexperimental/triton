@@ -218,6 +218,7 @@ jobs:
         run: |
           mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
           curl --fail --location --retry 3 \
+            --write-out 'downloaded %{size_download} bytes in %{time_total}s (%{speed_download} B/s)\n' \
             --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
       - name: Install Triton
         run: |
@@ -253,7 +254,9 @@ jobs:
             [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
           fi
           echo "h100 collects:" "${FILES[@]}"
-          PYTHONPATH="${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" python -m pytest "${FILES[@]}" --import-mode=importlib -v --junitxml=/tmp/tlx-core.xml
+          # Log runner size and the pod's memory peak, pass or fail.
+          trap 'echo "runner: nproc=$(nproc) memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) memory.peak_mib=$(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 ))"' EXIT
+          PYTHONPATH="${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" python -m pytest "${FILES[@]}" --import-mode=importlib -v --durations=25 --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
