@@ -36,62 +36,32 @@ Budget numbers are in [resources.md](resources.md). Code paths are relative to `
 
 ## Mechanism
 
-**What tile shape changes.** The three tile dimensions set:
-- the A slot (`BLOCK_M × BLOCK_K`) and the B slot (`BLOCK_N × BLOCK_K`), in the operand element type;
-- TMEM columns per accumulator copy (`BLOCK_N × ceil(BLOCK_M/128)` for fp32), and from that the number of accumulator copies (see [resources.md](resources.md));
-- the epilogue tile, in combination with `EPILOGUE_SUBTILE` (see `epilogue.md`).
+**Tile shape changes:**
+- the A slot (`BLOCK_M × BLOCK_K`) and B slot (`BLOCK_N × BLOCK_K`), in the operand element type;
+- TMEM columns per accumulator copy (`BLOCK_N × ceil(BLOCK_M/128)` for fp32), hence the accumulator copy count ([resources.md](resources.md));
+- the epilogue tile, with `EPILOGUE_SUBTILE` (`epilogue.md`);
+- the MMA instruction shape: M = 128 when `BLOCK_M` >= 128, else 64; N = `min(BLOCK_N, 256)`; K = 256 / operand bit width; larger tiles issue several MMAs (`lib/Dialect/TritonGPU/Transforms/Utility.cpp`, `mmaVersionToInstrShape`).
 
-The MMA instruction shape follows from the tile: instruction M is 128 when `BLOCK_M` >= 128 and 64 otherwise, instruction N is `min(BLOCK_N, 256)`, and instruction K is 256 / operand bit width; larger tiles are issued as several MMAs (`lib/Dialect/TritonGPU/Transforms/Utility.cpp`, `mmaVersionToInstrShape`).
+SMEM is sized from these compile-time shapes alone (`WS/WSMemoryPlanner.cpp`, `getSmemAllocSizeBytes`); a smaller problem never makes a config fit.
 
-SMEM is sized from these compile-time shapes alone (`WS/WSMemoryPlanner.cpp`, `getSmemAllocSizeBytes`). A smaller problem never makes a config fit.
-
-**What `num_stages` changes.** It is the planner's `numBuffers`:
-- Phase 4 raises the innermost operand buffers, TMA-fed first, then non-TMA, in the order they are first used, one copy at a time;
-- it stops when the next copy would exceed the budget or `num_stages`;
-- output staging was already raised, up to the same cap, before Phase 4 ran (`increaseFusedEpilogueCopies`).
+**`num_stages` changes** the planner's `numBuffers` cap:
+- output staging is raised first, up to that cap (`increaseFusedEpilogueCopies`);
+- then Phase 4 adds one copy at a time to the innermost operand buffers (TMA-fed first, then non-TMA, in first-use order) until the next copy would exceed the budget or `num_stages`.
 
 Mechanics: [SmemAllocationDesign.md, "Phase 4: Iterative Copy Increase"](../SmemAllocationDesign.md#phase-4-iterative-copy-increase) and [TMAStoreWaitPipeline.md, "Phase 3.7: Epilogue Group Copy Increase"](../TMAStoreWaitPipeline.md#phase-37-epilogue-group-copy-increase).
 
 **Resulting operand depth:**
 > depth = the largest d <= `num_stages` such that floors + staging + d·(A slot + B slot) fits the budget, plus possibly one more copy of the operand used first.
-- With equal-size A and B slots, the two depths differ by at most 1.
-- With unequal slots, the smaller operand keeps rising after the larger one stops, so the gap can be larger.
+- Equal A/B slots: the two depths differ by at most 1. Unequal slots: the smaller operand keeps rising after the larger stops, so the gap can be larger.
 
 **What it relieves:** deeper operand rings let the load partition run further ahead of the MMA.
 
-**What it costs:** every operand copy is SMEM that staging could have used, and the reverse. Deeper rings also add barrier slots to the auxiliary reservation (`estimateAuxiliarySmemBytes` scales barrier bytes by depth).
+**What it costs:** operand copies and staging compete for the same SMEM; deeper rings add barrier slots to the auxiliary reservation (`estimateAuxiliarySmemBytes` scales barrier bytes by depth).
 
-**Floors:**
-- Correctness floors (cross-stage depth, copy-safety floor) can force copies above `num_stages`.
-- In particular, under `data_partition_factor` > 1 with `disallow_acc_multi_buffer`, every TMA operand of the MMA is floored at `num_stages` (`getStaticSmemCopySafetyFloor`).
-- That copy-safety floor is given back when it does not fit (`relaxCopySafetyFloorToBudget`). The cross-stage floor is never given back.
-- Asymmetric A/B depths beyond ±1 at equal slot sizes need annotated channel copies (`tl.dot(attrs={"channels": ...})`), never below the cross-stage depth: the unannotated planner raises A and B in lockstep.
-
-## When to try it (depends on the problem)
-
-`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
-
-Quantities (`T`, `W`, `E_tail`, `S_prog`, `k_iters`, `w`, `AI_min`, `I_t`, `d_fit`) are defined in [README.md](README.md#decision-tree-skeleton) step 2; `d_fit` is the closed form in [resources.md](resources.md#when-to-try-it-depends-on-the-problem). `P` = 148.
-
-**Tile shape**
-- **IF** `AI_min >= 300` FLOP/B (`ridge`), **THEN** prefer tiles in decreasing `I_t = BM*BN/(BM + BN')` (`BN' = BN/2` under 2-CTA): 2-CTA 128x256 and 1-CTA 256x256 dp=2 (128) > 128x256, 256x128, 2-CTA 128x128 (85) > 128x128 (64) > 64x256 (51) > 64x128 (43), **BECAUSE** operand SMEM fill per FLOP is `1/I_t` (slot sizes in "Mechanism"). [mechanism]
-- **IF** 1-CTA with a separate store, `ES=2` and uncapped staging, **THEN** also try 128x128 next to 128x256 (this keeps both), **BECAUSE** at that default 128x256 loses B ring depth to staging (see `epilogue.md`); the tile's `E_tail` is not what decides it. [measured: --regime tile, wins on every shape]
-- **IF** `w(BM=128) < 0.05`, or `BLOCK_N=256`, **THEN** skip BM=64, **BECAUSE** padded rows are few, or the 64-row tile's lower `I_t` costs more than the padding saves. [measured: --regime mtail, loses on every shape in the regime]
-
-**BLOCK_K**
-- **IF** `K <= 128` (bf16), **THEN** only try `BK = max(16, next_pow2(K))`, **BECAUSE** a larger BK pays SMEM, TMA bytes and MMA work on zero-filled columns at every stage (dominance). [mechanism]
-
-**num_stages**
-- **IF** `T <= P`, **THEN** skip `num_stages > max(k_iters, staging copies)`, **BECAUSE** with no next tile the producer cannot run ahead past this tile's K steps, so the extra slots are unused SMEM (dominance). Example: 1024x1024x256, 128x128x64: `T` 64, `k_iters` 4, so `num_stages <= 4`. [mechanism]
-- **IF** output staging is single-copy (`ES=1` or `two_ctas`), **THEN** only try `num_stages <= d_fit + 1`, **BECAUSE** above `d_fit` the planner allocates the same operand plan ([resources.md](resources.md#when-to-try-it-depends-on-the-problem)). [mechanism]
-- **IF** any shape (the regime covers `k_iters` 1-2 with `T > P` too), **THEN** skip `num_stages=1`, **BECAUSE** one slot serializes load(k+1) behind MMA(k)'s release. [measured: --regime stages, loses on every shape in the regime]
-- **IF** a deeper operand ring is wanted at a fixed tile, **THEN** free staging first: `c` fewer staging copies free `c*BM*(BN/ES)*out_bytes`, which buys `floor(that / slot_bytes)` operand levels (worked example in [resources.md](resources.md#worked-example-bf16-in-and-out-fp32-accumulator-1-cta)). [mechanism]
-- **IF** `AI_min >= 300` FLOP/B (`ridge`) (the regime's shapes), **THEN** skip tiles with `I_t < 64` (64-row tiles, `BN` <= 64), **BECAUSE** operand SMEM fill per FLOP is `1/I_t`. [measured: --regime tile, loses on every shape in the regime]
-- **IF** `BLOCK_N=128` and `w(BM=128) >= 0.25`, **THEN** also try BM=64 (this keeps both), **BECAUSE** a quarter of the 128-row MMA work is padding. [measured: --regime mtail, wins on every shape]
-- **IF** `k_iters(BK=64) >= 4`, **THEN** skip BK in {16, 32}, **BECAUSE** each K step pays a fixed barrier round trip and MMA issue that a larger BK amortizes. [measured: --regime bk_small, loses on every shape in the regime]
-- **IF** 1-CTA 128x256, **THEN** prefer BK=128; **IF** 1-CTA 128x128 or 2-CTA 128x256, **THEN** prefer BK=64; **IF** `k_iters` <= 2, **THEN** pin BK=64, **BECAUSE** the larger K step only pays where the B slot is wide enough to amortize it. [measured: --regime bk, wins on a majority of shapes]
-- **IF** 1-CTA, **THEN** prefer `num_stages = d_fit + 1`, **BECAUSE** the measured auxiliary reservation for a GEMM is about 0.7 KB, not the 4 KiB bound in `d_fit`, so the real operand depth is usually one higher. **IF** 2-CTA with BK=128, **THEN** pin `num_stages=3` (3-6 are flat). **IF** `k_iters` <= 4, **THEN** prefer `num_stages=2` at BK=128 and 4 at BK=64. [measured: --regime stages, wins on a majority of shapes]
-- **IF** `num_stages` is above the operand depth that actually fits and staging is single-copy, **THEN** skip it, **BECAUSE** it compiles to the same TTGIR (duplicate config; e.g. 128x128x128 at `num_stages` 4-6 equals 3). [measured: --regime stages, flat within noise]
+**Floors** (correctness floors can force copies above `num_stages`):
+- cross-stage depth: never given back;
+- copy-safety floor: in particular, under `data_partition_factor` > 1 with `disallow_acc_multi_buffer`, every TMA operand of the MMA is floored at `num_stages` (`getStaticSmemCopySafetyFloor`); given back when it does not fit (`relaxCopySafetyFloorToBudget`).
+- The unannotated planner raises A and B in lockstep, so A/B depths more than ±1 apart at equal slot sizes need annotated channel copies (`tl.dot(attrs={"channels": ...})`), never below the cross-stage depth.
 
 ## Interactions
 
