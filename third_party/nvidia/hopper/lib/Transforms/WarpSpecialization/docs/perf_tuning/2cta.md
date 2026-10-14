@@ -82,7 +82,7 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 - `two_ctas` × `num_stages`
 - `two_ctas` × `num_warps` with a reduction partition
 - `two_ctas` × `tl.dot_scaled`
-- `two_ctas` × CLC tile scheduler (see `clc_persistence.md`)
+- `two_ctas` × CLC tile scheduler (see [clc_persistence.md](clc_persistence.md))
 - `two_ctas` × atomic dynamic tile scheduler
 - `two_ctas` × `smem_alloc_algo`
 - `two_ctas` × TMA multicast (see `multicast.md`)
