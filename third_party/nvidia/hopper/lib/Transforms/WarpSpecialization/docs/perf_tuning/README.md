@@ -58,8 +58,10 @@ Each step narrows the candidate set. Later PRs fill in one branch each; see
    - `k_iters = ceil(K / (BK * SPLIT_K))`.
    - `w = 1 - M*N / (ceil(M/BM)*BM * ceil(N/BN)*BN)`: M/N padding waste.
    - `AI_min = 2*M*N*K / bytes(A, B, C)`, each operand read once and the output
-     written once. `ridge` is the `AI_min` above which a GEMM is compute bound;
-     its B200 value is a pending measurement (see TRACKER).
+     written once. `ridge` = 300 FLOP/B: below it, treat a GEMM as memory bound.
+     The measured autoWS ridge is about 415 FLOP/B at a 900 MHz lock (cuBLAS
+     about 347) and about 350 at 1852 MHz, so 300 is the conservative value
+     [measured: --regime ridge].
    - `I_t = BM*BN / (BM + BN')`, with `BN' = BN/2` under 2-CTA and `BN`
      otherwise: FLOP per byte of operand SMEM fill.
    - `d_fit`: the planner's operand depth, closed form in
