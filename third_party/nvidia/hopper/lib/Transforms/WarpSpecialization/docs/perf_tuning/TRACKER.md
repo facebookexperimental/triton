@@ -24,8 +24,8 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`2cta.md`](2cta.md) | done | 1-CTA vs 2-CTA (`two_ctas`). Open: its "Not yet established" items. |
 | [`data_partitioning.md`](data_partitioning.md) | done | `data_partition_factor`. Open: its "Not yet established" items. |
 | [`clc_persistence.md`](clc_persistence.md) | done | Static persistent vs dynamic and CLC persistent. Open: its "Not yet established" items. |
-| `tma_loads.md` | todo | TMA vs pointer operand loads. |
-| `tma_stores.md` | todo | TMA vs pointer output stores. |
+| [`tma_loads.md`](tma_loads.md) | done | TMA vs pointer operand loads. Open: its "Not yet established" items. |
+| [`tma_stores.md`](tma_stores.md) | done | TMA vs pointer output stores. Open: its "Not yet established" items. |
 | `split_k.md` | todo | Splitting one output tile's K reduction (split-K, decomposeK, stream-K) and the single-K-tile path. |
 | `pingpong.md` | todo | Ping-pong scheduling. |
 | `multicast.md` | todo | TMA multicast. |
@@ -73,29 +73,29 @@ One row per entry in [knobs.md](knobs.md), with its priority (P0 highest, P2 low
 
 | Knob | Priority | Covered in | State |
 |------|----------|------------|-------|
-| `BLOCK_M` | P0 | [resources.md](resources.md#tmem); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#mechanism); [epilogue.md](epilogue.md#mechanism); [2cta.md](2cta.md#pruning-ruleset); [data_partitioning.md](data_partitioning.md#pruning-ruleset) | covered |
-| `BLOCK_N` | P0 | [resources.md](resources.md#tmem); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#mechanism); [2cta.md](2cta.md#pruning-ruleset); [data_partitioning.md](data_partitioning.md#pruning-ruleset) | covered |
-| `BLOCK_K` | P0 | [resources.md](resources.md#pruning-ruleset); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [2cta.md](2cta.md#mechanism) | covered |
-| `num_stages` | P0 | [resources.md](resources.md#pruning-ruleset); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#pruning-ruleset); [2cta.md](2cta.md#mechanism); [data_partitioning.md](data_partitioning.md#pruning-ruleset); [clc_persistence.md](clc_persistence.md#pruning-ruleset) | covered |
+| `BLOCK_M` | P0 | [resources.md](resources.md#tmem); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#mechanism); [epilogue.md](epilogue.md#mechanism); [2cta.md](2cta.md#pruning-ruleset); [data_partitioning.md](data_partitioning.md#pruning-ruleset); [tma_loads.md](tma_loads.md#mechanism); [tma_stores.md](tma_stores.md#mechanism) | covered |
+| `BLOCK_N` | P0 | [resources.md](resources.md#tmem); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#mechanism); [2cta.md](2cta.md#pruning-ruleset); [data_partitioning.md](data_partitioning.md#pruning-ruleset); [tma_loads.md](tma_loads.md#mechanism); [tma_stores.md](tma_stores.md#mechanism) | covered |
+| `BLOCK_K` | P0 | [resources.md](resources.md#pruning-ruleset); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [2cta.md](2cta.md#mechanism); [tma_loads.md](tma_loads.md#mechanism) | covered |
+| `num_stages` | P0 | [resources.md](resources.md#pruning-ruleset); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#pruning-ruleset); [2cta.md](2cta.md#mechanism); [data_partitioning.md](data_partitioning.md#pruning-ruleset); [clc_persistence.md](clc_persistence.md#pruning-ruleset); [tma_stores.md](tma_stores.md#mechanism) | covered |
 | `flatten` | P0 | [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset) | covered |
-| `warp_specialize` | P0 | [resources.md](resources.md#registers-and-warps); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#mechanism); [2cta.md](2cta.md#pruning-ruleset) | covered |
+| `warp_specialize` | P0 | [resources.md](resources.md#registers-and-warps); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#mechanism); [2cta.md](2cta.md#pruning-ruleset); [tma_stores.md](tma_stores.md#mechanism) | covered |
 | `data_partition_factor` | P0 | [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#mechanism); [data_partitioning.md](data_partitioning.md#pruning-ruleset); [clc_persistence.md](clc_persistence.md#mechanism) | covered |
-| `separate_epilogue_store` | P0 | [epilogue.md](epilogue.md#pruning-ruleset); [clc_persistence.md](clc_persistence.md#mechanism) | covered |
-| `two_ctas` | P0 | [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#pruning-ruleset); [2cta.md](2cta.md#pruning-ruleset); [clc_persistence.md](clc_persistence.md#pruning-ruleset) | covered |
+| `separate_epilogue_store` | P0 | [epilogue.md](epilogue.md#pruning-ruleset); [clc_persistence.md](clc_persistence.md#mechanism); [tma_stores.md](tma_stores.md#pruning-ruleset) | covered |
+| `two_ctas` | P0 | [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#pruning-ruleset); [2cta.md](2cta.md#pruning-ruleset); [clc_persistence.md](clc_persistence.md#pruning-ruleset); [tma_stores.md](tma_stores.md#pruning-ruleset) | covered |
 | `ctas_per_cga` | P0 | [2cta.md](2cta.md#pruning-ruleset); [clc_persistence.md](clc_persistence.md#pruning-ruleset) | covered |
 | Tile scheduler | P0 (static persistent); P1 (CLC, dynamic) | [2cta.md](2cta.md#pruning-ruleset); [clc_persistence.md](clc_persistence.md#pruning-ruleset) | covered |
-| Descriptor loads/stores | P0 | — | todo |
-| Epilogue subtiling (ES) | P0 | [resources.md](resources.md#smem); [tiles_and_stages.md](tiles_and_stages.md#mechanism); [warps_and_registers.md](warps_and_registers.md#mechanism); [epilogue.md](epilogue.md#pruning-ruleset); [2cta.md](2cta.md#pruning-ruleset) | covered |
-| `early_tma_store_lowering` | P0 | — | mentioned |
-| `tma_store_pipelining` | P0 | — | todo |
-| `TRITON_WS_STAGING_COPIES` | P0 | [epilogue.md](epilogue.md#pruning-ruleset); [2cta.md](2cta.md#pruning-ruleset) | covered |
+| Descriptor loads/stores | P0 | [tma_loads.md](tma_loads.md#mechanism) | covered |
+| Epilogue subtiling (ES) | P0 | [resources.md](resources.md#smem); [tiles_and_stages.md](tiles_and_stages.md#mechanism); [warps_and_registers.md](warps_and_registers.md#mechanism); [epilogue.md](epilogue.md#pruning-ruleset); [2cta.md](2cta.md#pruning-ruleset); [tma_stores.md](tma_stores.md#pruning-ruleset) | covered |
+| `early_tma_store_lowering` | P0 | [tma_stores.md](tma_stores.md#mechanism) | covered |
+| `tma_store_pipelining` | P0 | [tma_stores.md](tma_stores.md#mechanism) | covered |
+| `TRITON_WS_STAGING_COPIES` | P0 | [epilogue.md](epilogue.md#pruning-ruleset); [2cta.md](2cta.md#pruning-ruleset); [tma_stores.md](tma_stores.md#pruning-ruleset) | covered |
 | `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | P0 | — | todo |
 | `num_warps` | P0 | [resources.md](resources.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#pruning-ruleset); [2cta.md](2cta.md#pruning-ruleset); [data_partitioning.md](data_partitioning.md#pruning-ruleset) | covered |
 | `num_stages` (per loop) | P1 | [clc_persistence.md](clc_persistence.md#pruning-ruleset) | covered |
 | `disallow_acc_multi_buffer` | P1 | [tiles_and_stages.md](tiles_and_stages.md#mechanism); [data_partitioning.md](data_partitioning.md#pruning-ruleset) | covered |
-| `merge_epilogue` | P1 | [epilogue.md](epilogue.md#mechanism) | covered |
-| `multicast` (per load) | P1 | — | mentioned |
-| `multicast` | P1 | — | mentioned |
+| `merge_epilogue` | P1 | [epilogue.md](epilogue.md#mechanism); [tma_stores.md](tma_stores.md#mechanism) | covered |
+| `multicast` (per load) | P1 | [tma_loads.md](tma_loads.md#pruning-ruleset) | covered |
+| `multicast` | P1 | [tma_loads.md](tma_loads.md#pruning-ruleset) | covered |
 | `generate_subtiled_region` | P1 | [epilogue.md](epilogue.md#mechanism) | covered |
 | `minRegAutoWS` | P1 | [resources.md](resources.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#pruning-ruleset) | covered |
 | `maxRegAutoWS` | P1 | [resources.md](resources.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#pruning-ruleset) | covered |
@@ -107,7 +107,7 @@ One row per entry in [knobs.md](knobs.md), with its priority (P0 highest, P2 low
 | `allowDependentTwoCTA` | P2 | [2cta.md](2cta.md#pruning-ruleset) | covered |
 | `clc` | P2 | [clc_persistence.md](clc_persistence.md#pruning-ruleset) | covered |
 | `tt.autows` stage/order | P2 | — | todo |
-| `auto_tma` / `auto_tma_device` | P2 | — | todo |
+| `auto_tma` / `auto_tma_device` | P2 | [tma_loads.md](tma_loads.md#pruning-ruleset) | covered |
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | P2 | [2cta.md](2cta.md#mechanism) | covered |
 | `maxnreg` | P2 | [resources.md](resources.md#registers-and-warps); [warps_and_registers.md](warps_and_registers.md#pruning-ruleset) | covered |
 | `sched4reg`, `enable_tree_reduction` | P2 | — | todo |
