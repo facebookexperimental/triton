@@ -55,9 +55,13 @@ The regime that routes here is long K with few output tiles: many `K / BLOCK_K` 
 
 ## When to try it (depends on the problem)
 
+`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
+
 - IF the epilogue applies a per-row or nonlinear function of the full K sum, THEN skip split-K, BECAUSE the epilogue is not linear in the partial sums. [mechanism]
 - IF `T >= P` at S = 1, THEN skip split-K; IF `T < P`, THEN try only S with `T*(S-1) < P` and `k_iters/S >= 4`, BECAUSE each one-wave split shortens the serial K chain (one CTA accumulates its whole K range in TMEM), while every extra split costs `S*M*N*ws_bytes` written and read again by the reduce kernel. [mechanism]
 - IF `AI_min < ridge`, THEN prefer configs with `T >= P` (smaller tiles or split-K) over larger tiles, BECAUSE a memory-bound GEMM needs every SM issuing loads to reach HBM bandwidth. [mechanism]
+- **IF** `T <= 64` and `k_iters >= 32`, **THEN** only try split-K formulations, **BECAUSE** the shorter serial K chain outweighs the workspace round trip. [measured: --regime splitk, wins on every shape]
+- **IF** `T >= 128`, **THEN** prefer no split-K (the crossing is near `T` = 100-128, not `P/2`), **BECAUSE** with most SMs busy the workspace round trip dominates. [measured: --regime splitk, wins on a majority of shapes]
 
 ## Interactions
 
