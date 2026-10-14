@@ -21,7 +21,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 | `clc` | compile option (`triton.Config(clc=True)`) | Upstream single-CTA CLC path; not the autoWS path | — |
 | tile order (`GROUP_M`, group-by-N) | kernel code mapping the linear tile id to `(pid_m, pid_n)` | Which tiles are co-resident across programs | — |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Status | Why | Code |
 |---|---|---|---|
@@ -62,7 +62,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 
 **Tile order** does not change the work done; it changes which tiles are co-resident across the P programs, and so the L2 reuse of A and B tiles.
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - **IF** tiles < number of SMs, **THEN** prefer a non-persistent or static persistent candidate over CLC/dynamic, **BECAUSE** there is nothing to rebalance and every program runs at most one tile.
 - **IF** tiles are uniform (dense GEMM), **THEN** prefer static persistent, **BECAUSE** dynamic schedules only buy rebalancing, and static keeps every loop annotation effective.
