@@ -16,12 +16,12 @@ The MMA operands themselves are covered in [tma_loads.md](tma_loads.md). The out
 | descriptor `padding` | `TensorDescriptor(..., padding="zero"\|"nan")` | Out-of-bounds fill, `"zero"` by default. This is what makes a pad prologue exact. | none |
 | `EPILOGUE_SUBTILE` | kernel constexpr | Splits the side input into per-subtile loads, each with its own landing buffer. | [epilogue.md](epilogue.md); [SubtileOperator.md](../SubtileOperator.md), section "Motivation" |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Status | Why | Code ref |
 |---|---|---|---|
 | Any TMA-loaded side input that is read into registers | wrong answer | The release back to the TMA producer emits no `fence.proxy.async`, so the next TMA write can overtake the register reads. See [hazards.md](hazards.md#tma-tile-read-into-registers-released-without-a-proxy-fence). | `WSLowerToken.cpp`, `processConsumerReleaseOp` |
-| K <= BLOCK_K with a TMA-loaded bias, or any addend of the GEMM result | wrong answer | The addend is folded into the accumulator init, and its commit lands in the MMA partition. See [hazards.md](hazards.md#single-k-tile-with-an-additive-epilogue-loaded-by-tma). | `Combine.cpp`, `CombineDotAddFPattern`; `WSCodePartition.cpp`, `insertAsyncComm` |
+| K <= BLOCK_K (no K loop) with a TMA-loaded bias, or any `[M, N]` addend of the GEMM result | wrong answer (reproduced) | The addend is folded into the accumulator init, and its commit lands in the MMA partition. See [hazards.md](hazards.md#single-k-tile-with-an-additive-epilogue-loaded-by-tma). | `Combine.cpp`, `CombineDotAddFPattern`; `WSCodePartition.cpp`, `insertAsyncComm` |
 | A side-input landing buffer per subtile that is not a multiple of 128 bytes, at `EPILOGUE_SUBTILE >= 2` | requires | A single copy, or a box of at least 128 bytes: subtile buffers form a group that the planner may multi-buffer, and the planner never checks TMA alignment. See [hazards.md](hazards.md#tma-landing-buffer-smaller-than-128-bytes-multi-buffered). | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
 
 ## Mechanism
@@ -49,7 +49,7 @@ The MMA operands themselves are covered in [tma_loads.md](tma_loads.md). The out
 - **Limit:** this only replaces a pad. A prologue that computes anything else still needs a register path.
 - Code: `python/triton/tools/tensor_descriptor.py`, `TensorDescriptor`.
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - IF the kernel reads a TMA-loaded side input in registers, THEN only try pointer `tl.load` for that input until the proxy-fence hazard is fixed, BECAUSE the TMA form can give a wrong answer.
 - IF K <= BLOCK_K and the epilogue adds a tensor to the GEMM result, THEN skip TMA for that tensor, BECAUSE the folded accumulator init lands in the wrong partition.
