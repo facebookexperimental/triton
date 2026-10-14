@@ -54,7 +54,7 @@ references. Name the reference with every comparison.
    - `I_t = BM*BN / (BM + BN')`, with `BN' = BN/2` under 2-CTA and `BN`
      otherwise: FLOP per byte of operand SMEM fill.
    - `d_fit`: the planner's operand depth, closed form in
-     `resources.md`.
+     [resources.md](resources.md#smem).
 3. **Pruning ruleset.** Drop configs that give a compile error, are silently
    ignored, are a duplicate config, hang, give a wrong answer, or miss a
    required knob value.
