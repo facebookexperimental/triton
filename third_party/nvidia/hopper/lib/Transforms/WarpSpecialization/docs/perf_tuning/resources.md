@@ -45,7 +45,7 @@ Mechanics (link, don't repeat):
 Facts these rules depend on, all in `WS/WSMemoryPlanner.cpp`, `allocateSmemBuffers`:
 1. **Staging comes first:** `increaseFusedEpilogueCopies` reserves TMA output staging before the Phase 4 operand copy increase.
 2. **The operand depth cap is `num_stages`:** Phase 4 raises the innermost operand buffers one level at a time, in first-use order, until nothing fits or the level would pass `num_stages`; it never uses free SMEM beyond `num_stages`.
-3. **The cross-stage floor is never dropped:** an over-budget plan after the discretionary reuse step only warns "exceeding configured smem-budget"; the hardware check at launch is the backstop. The copy-safety floor (dp > 1) is given back one copy at a time when it does not fit (`relaxCopySafetyFloorToBudget`); a relaxed floor with a TMA-loaded epilogue input hangs when a CTA processes several tiles (reproduced; `hazards.md`).
+3. **The cross-stage floor is never dropped:** an over-budget plan after the discretionary reuse step only warns "exceeding configured smem-budget"; the hardware check at launch is the backstop. The copy-safety floor (dp > 1) is given back one copy at a time when it does not fit (`relaxCopySafetyFloorToBudget`); a relaxed floor with a TMA-loaded epilogue input hangs when a CTA processes several tiles (reproduced; [hazards.md](hazards.md#relaxed-operand-copy-floor-with-a-tma-loaded-epilogue-input-several-tiles-per-cta)).
 4. **Under budget pressure, staging can alias operand rings;** innermost operand buffers are never aliased (`findReuseCandidate`).
 
 **Closed-form operand depth.**
@@ -155,7 +155,7 @@ See [interactions.md](interactions.md). Pairs where these limits decide the outc
 
 ## Hazards
 
-None in `hazards.md`.
+None in [hazards.md](hazards.md).
 
 ## Not yet established
 
