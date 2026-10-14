@@ -60,18 +60,23 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 
 | Knob | Rules in | State |
 |------|----------|-------|
+| `BLOCK_M` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `BLOCK_N` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `BLOCK_K` | — | mentioned |
 | `num_stages` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `num_stages` (per loop) | — | todo |
 | `flatten` | — | todo |
-| `disallow_acc_multi_buffer` | — | todo |
+| `disallow_acc_multi_buffer` | — | mentioned |
 | `loop_unroll_factor`, `disable_licm` | — | todo |
 | `warp_specialize` | — | mentioned |
 | `data_partition_factor` | — | mentioned |
 | `separate_epilogue_store` | — | mentioned |
 | `merge_epilogue` | — | todo |
+| `merge_epilogue_to_computation`, `merge_correction` | — | todo |
 | `pingpongAutoWS` | — | todo |
 | `multi_cta` | — | todo |
-| `two_ctas` | — | todo |
+| `two_ctas` | [resources.md](resources.md#never-try-any-problem) | covered |
+| `allowDependentTwoCTA` | — | todo |
 | `ctas_per_cga` | — | todo |
 | Tile scheduler | — | todo |
 | `clc` | — | todo |
@@ -81,7 +86,7 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `multicast` | — | todo |
 | `auto_tma` / `auto_tma_device` | — | todo |
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | — | todo |
-| Epilogue subtiling (ES) | — | mentioned |
+| Epilogue subtiling (ES) | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
 | `generate_subtiled_region` | — | todo |
 | `early_tma_store_lowering` | — | todo |
 | `tma_store_pipelining` | — | todo |
@@ -91,6 +96,7 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `maxnreg` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `sched4reg`, `enable_tree_reduction` | — | todo |
 | `tmem_alloc_algo` | — | todo |
 | `smem_alloc_algo` | — | todo |
 | `smem_budget` | — | mentioned |
@@ -101,6 +107,7 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | — | todo |
 | `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | — | todo |
 | Alternative schedulers: `TRITON_USE_MODULO_SCHEDULE` (+ `TRITON_MODULO_*`), `TRITON_USE_JOINT_SCHEDULE`‡, `TRITON_USE_LLM_SCHEDULE`‡, `TRITON_USE_LIST_SCHEDULE` | — | todo |
+| `list_schedule_pick` | — | todo |
 
 ## Other
 
