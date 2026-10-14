@@ -58,4 +58,12 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 |------|-------|------|
 | Inductor reference definition | todo | Definition pending. Until then `knobs.md` has no column for what Inductor sets. |
 | Leaves outside AutoWS | todo | cuBLAS or non-WS leaves; later. |
-| Multicast rules once lowering lands | todo | `multicast.md` has no when-to-try rules while multicast is inert; re-derive them from the planner conditions when the lowering is implemented. |
+| Multicast once lowering lands | todo | Multicast is inert in this tree; revisit `multicast.md` when the lowering is implemented. |
+
+## Experiments
+
+| Experiment | State | Note |
+|------------|-------|------|
+| Config reuse | todo | Reuse the same config instead of re-tuning, and check whether the reused config is still profitable. |
+| Separate the gains | todo | Report a fusion gain and a compiler-upgrade gain as separate steps (e.g. same config before and after an upgrade). |
+| Empty padding warps | todo | Worker warps are padded to whole warp groups and each padding warp still gets the minimum register budget; explore using them for work. |
