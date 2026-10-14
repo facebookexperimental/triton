@@ -22,14 +22,15 @@ Budget numbers are in [resources.md](resources.md). Code paths are relative to `
 
 ## Never try (any problem)
 
-| Condition | Result | Why | Code |
+| Condition | Status | Why | Code |
 |---|---|---|---|
 | `separate_epilogue_store=True` with pointer (`tl.store`) epilogue stores | duplicate config | Only `descriptor_store`, `async_tma_copy_local_to_global` and TMA store waits count as epilogue stores; with none, no store partition is created | `WS/PartitionSchedulingMeta.cpp`, `isEpilogueStoreOp`, `createPartitionLayout` |
-| `TRITON_WS_STAGING_COPIES` with `ES=1` | duplicate config | A staging group with fewer than 2 slices is never bumped, and Phase 4 never raises staging | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` ("only ... buffer(s) in group, skipping"), `allocateSmemBuffers` ("P2 is never increased") |
-| Staging copies under `two_ctas` | duplicate config | Staging is held at one copy: 2-CTA TMA stores have one completion phase per CTA-pair tile | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
+| `TRITON_WS_STAGING_COPIES` with `ES=1` | duplicate config | A staging group with fewer than 2 slices is never bumped, and Phase 4 never raises staging | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` ("only ... buffer(s) in group, skipping"), `allocateSmemBuffers` (Phase 4 never raises staging) |
+| Staging copies under `two_ctas` | silently ignored | Staging is held at one copy: 2-CTA TMA stores have one completion phase per CTA-pair tile | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
 | A correctness floor needing > 1 staging copy under `two_ctas` | compile error | "2CTA ordinary TMA output staging requires one copy; the correctness floor requires N" | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
 | Same-partition store (`separate_epilogue_store=False`) with a staging cap that does not divide `ES` | duplicate config | Rounded down to the largest divisor of `ES` that fits: the wait_group-drained ring is correct only when copies divide the slice count | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` (`K | S` check) |
 | Staging cap above `num_stages` (store staging) | duplicate config | Capped at `num_stages`: the bump target is min(`num_stages`, cap); only TMA-reduce staging may exceed it | `WS/WSMemoryPlanner.cpp`, `getStagingCopiesCap`, `increaseFusedEpilogueCopies` |
+| `TRITON_WS_STAGING_COPIES` or `TRITON_WS_TMA_REDUCE_STAGING_COPIES` with `smem_alloc_algo=0` | silently ignored | Both are read only by the default planner's Phase 3.7 | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
 
 ## Mechanism
 
@@ -47,7 +48,8 @@ Mechanics: [TMAStoreWaitPipeline.md, "`K | S` cap for same-partition (wait_group
 
 **Registers.**
 - One slice's `tmem_load` holds `BLOCK_M × (BLOCK_N/ES) / (32 × warps)` 32-bit values per thread for an fp32 accumulator, where warps is the count of the partition doing the load.
-- Partition warp halving (`optimizePartitionNumWarps`, see [warps_and_registers.md](warps_and_registers.md)) sizes from the largest single tensor. A larger `ES` makes a smaller largest tensor, so an 8-warp epilogue partition can be halved to 4. Example: at `BLOCK_M=128, BLOCK_N=256` an `ES=4` slice needs 128 registers per thread at 4 warps, which can fit the share after halving. An `ES=2` slice needs 256, which cannot.
+- Example: at `BLOCK_M=128, BLOCK_N=256` with 4 warps, an `ES=2` slice is 128 registers per thread and an `ES=4` slice is 64.
+- In the GEMM layouts the epilogue runs in the default region, which partition-warp halving never shrinks (see [warps_and_registers.md](warps_and_registers.md#mechanism)), so `ES` does not change the epilogue's warp count.
 
 **Store placement** (`WS/PartitionSchedulingMeta.cpp`, `createPartitionLayout`):
 - `separate_epilogue_store` adds an `epilogue_store` partition (one warp after `optimizePartitionNumWarps`) when TMA epilogue stores exist.
@@ -68,12 +70,11 @@ Mechanics: [TMAStoreWaitPipeline.md, "`K | S` cap for same-partition (wait_group
 
 ## When to try it (depends on the problem)
 
-- **IF** the epilogue uses pointer stores, **THEN** skip `separate_epilogue_store=True` variants, **BECAUSE** they duplicate `False`.
+- **IF** the epilogue uses pointer stores, **THEN** skip `separate_epilogue_store=True` variants (this removes them), **BECAUSE** they are duplicate configs of `False`.
 - **IF** `ES=1` or `two_ctas=True`, **THEN** skip staging-copy variants, **BECAUSE** staging stays at one copy.
 - **IF** `separate_epilogue_store=False`, **THEN** only try staging caps that divide `ES`, **BECAUSE** other caps round down to a divisor.
-- **IF** two configs differ only in `ES` and the larger `ES` is what makes the config fit, **THEN** prefer the larger `ES`, **BECAUSE** total staging SMEM falls as `BLOCK_N/ES` shrinks at equal copies.
+- **IF** two configs differ only in `ES` and the larger `ES` is what makes the config fit, **THEN** prefer the larger `ES` (this removes the smaller-`ES` variant that does not fit), **BECAUSE** total staging SMEM falls as `BLOCK_N/ES` shrinks at equal copies.
 - **IF** total staging SMEM is compared across `ES` values, **THEN** compute it as slice × copies with copies bounded as above, **BECAUSE** it does not shrink monotonically with `ES`: copies can rise toward min(`num_stages`, `ES`) for a same-partition store, or `num_stages` for a separate store.
-- **IF** `num_warps=8` and `ES` makes one slice small enough for the halving test, **THEN** expect the epilogue partition to run with 4 warps, **BECAUSE** `optimizePartitionNumWarps` ignores co-live slices.
 
 ## Interactions
 
@@ -83,23 +84,19 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 - staging copies × `num_stages`
 - staging copies × `two_ctas`
 - `separate_epilogue_store` × pointer vs TMA store
-- `ES` × `num_warps` (partition halving)
 - `ES` × `generate_subtiled_region`
 - `generate_subtiled_region` × `TRITON_WS_SMEM_PLAN_SEARCH`
 - `merge_epilogue` × `separate_epilogue_store`
 
 ## Hazards
 
-None in [hazards.md](hazards.md). Reported but not yet located in code (rows in [TRACKER.md](TRACKER.md)):
+None in [hazards.md](hazards.md). Reported but not yet located in code (rows in [TRACKER.md](TRACKER.md#reported-wrong-answers--hangs-needing-repro--code-root-cause)):
 - rank-1 TMA bias loads in a subtiled epilogue;
 - `data_partition_factor=2` with a subtiled region and per-slice scaling.
-
-The `ES` × partition warp halving effect is a performance interaction, listed above.
 
 ## Not yet established
 
 Tracked in [TRACKER.md](TRACKER.md).
-
 
 - Whether runtime is flat across `ES` once a config fits. This has been observed for plain GEMM but not shown in general.
 - The best `ES` per tile and 2-CTA setting. Observed results are not shape-stable.
