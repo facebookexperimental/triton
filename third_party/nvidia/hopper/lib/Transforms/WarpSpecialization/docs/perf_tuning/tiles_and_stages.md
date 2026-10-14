@@ -69,12 +69,14 @@ Mechanics: [SmemAllocationDesign.md, "Phase 4: Iterative Copy Increase"](../Smem
 
 ## When to try it (depends on the problem)
 
+`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
+
 Quantities (`T`, `W`, `E_tail`, `S_prog`, `k_iters`, `w`, `AI_min`, `I_t`, `d_fit`) are defined in [README.md](README.md#decision-tree-skeleton) step 2; `d_fit` is the closed form in [resources.md](resources.md#when-to-try-it-depends-on-the-problem). `P` = 148.
 
 **Tile shape**
 - **IF** `AI_min >= ridge`, **THEN** prefer tiles in decreasing `I_t = BM*BN/(BM + BN')` (`BN' = BN/2` under 2-CTA): 2-CTA 128x256 and 1-CTA 256x256 dp=2 (128) > 128x256, 256x128, 2-CTA 128x128 (85) > 128x128 (64) > 64x256 (51) > 64x128 (43), **BECAUSE** operand SMEM fill per FLOP is `1/I_t` (slot sizes in "Mechanism"). [mechanism]
-- **IF** a tile has `E_tail < 0.8`, **THEN** also try the legal tile with the smallest `S_prog = ceil(T/P)*BM*BN`, **BECAUSE** the busiest program sets the time under static persistence (1152x12800: 128x256 `E_tail` 0.76, `S_prog` 128k; 128x128 112k). [mechanism]
-- **IF** `w(BM=128) >= 0.15` and `w(BM=64) < w(BM=128)` (M=192: 0.25 vs 0; M=320: 0.17 vs 0), **THEN** try BM=64, **BECAUSE** padded M rows cost full MMA work. [mechanism]
+- **IF** 1-CTA with a separate store, `ES=2` and uncapped staging, **THEN** also try 128x128 next to 128x256 (this keeps both), **BECAUSE** at that default 128x256 loses B ring depth to staging (see `epilogue.md`); the tile's `E_tail` is not what decides it. [measured: --regime tile, wins on every shape]
+- **IF** `w(BM=128) < 0.05`, or `BLOCK_N=256`, **THEN** skip BM=64, **BECAUSE** padded rows are few, or the 64-row tile's lower `I_t` costs more than the padding saves. [measured: --regime mtail, loses on every shape in the regime]
 
 **BLOCK_K**
 - **IF** `K <= 128` (bf16), **THEN** only try `BK = max(16, next_pow2(K))`, **BECAUSE** a larger BK pays SMEM, TMA bytes and MMA work on zero-filled columns at every stage (dominance). [mechanism]
@@ -82,8 +84,14 @@ Quantities (`T`, `W`, `E_tail`, `S_prog`, `k_iters`, `w`, `AI_min`, `I_t`, `d_fi
 **num_stages**
 - **IF** `T <= P`, **THEN** skip `num_stages > max(k_iters, staging copies)`, **BECAUSE** with no next tile the producer cannot run ahead past this tile's K steps, so the extra slots are unused SMEM (dominance). Example: 1024x1024x256, 128x128x64: `T` 64, `k_iters` 4, so `num_stages <= 4`. [mechanism]
 - **IF** output staging is single-copy (`ES=1` or `two_ctas`), **THEN** only try `num_stages <= d_fit + 1`, **BECAUSE** above `d_fit` the planner allocates the same operand plan ([resources.md](resources.md#when-to-try-it-depends-on-the-problem)). [mechanism]
-- **IF** `k_iters >= 2` or `T > P`, **THEN** prefer `num_stages >= 2`, **BECAUSE** one slot serializes load(k+1) behind MMA(k)'s release. [mechanism]
+- **IF** any shape (the regime covers `k_iters` 1-2 with `T > P` too), **THEN** skip `num_stages=1`, **BECAUSE** one slot serializes load(k+1) behind MMA(k)'s release. [measured: --regime stages, loses on every shape in the regime]
 - **IF** a deeper operand ring is wanted at a fixed tile, **THEN** free staging first: `c` fewer staging copies free `c*BM*(BN/ES)*out_bytes`, which buys `floor(that / slot_bytes)` operand levels (worked example in [resources.md](resources.md#worked-example-bf16-in-and-out-fp32-accumulator-1-cta)). [mechanism]
+- **IF** `AI_min >= ridge` (the regime's shapes), **THEN** skip tiles with `I_t < 64` (64-row tiles, `BN` <= 64), **BECAUSE** operand SMEM fill per FLOP is `1/I_t`. [measured: --regime tile, loses on every shape in the regime]
+- **IF** `BLOCK_N=128` and `w(BM=128) >= 0.25`, **THEN** also try BM=64 (this keeps both), **BECAUSE** a quarter of the 128-row MMA work is padding. [measured: --regime mtail, wins on every shape]
+- **IF** `k_iters(BK=64) >= 4`, **THEN** skip BK in {16, 32}, **BECAUSE** each K step pays a fixed barrier round trip and MMA issue that a larger BK amortizes. [measured: --regime bk_small, loses on every shape in the regime]
+- **IF** 1-CTA 128x256, **THEN** prefer BK=128; **IF** 1-CTA 128x128 or 2-CTA 128x256, **THEN** prefer BK=64; **IF** `k_iters` <= 2, **THEN** pin BK=64, **BECAUSE** the larger K step only pays where the B slot is wide enough to amortize it. [measured: --regime bk, wins on a majority of shapes]
+- **IF** 1-CTA, **THEN** prefer `num_stages = d_fit + 1`, **BECAUSE** the measured auxiliary reservation for a GEMM is about 0.7 KB, not the 4 KiB bound in `d_fit`, so the real operand depth is usually one higher. **IF** 2-CTA with BK=128, **THEN** pin `num_stages=3` (3-6 are flat). **IF** `k_iters` <= 4, **THEN** prefer `num_stages=2` at BK=128 and 4 at BK=64. [measured: --regime stages, wins on a majority of shapes]
+- **IF** `num_stages` is above the operand depth that actually fits and staging is single-copy, **THEN** skip it, **BECAUSE** it compiles to the same TTGIR (duplicate config; e.g. 128x128x128 at `num_stages` 4-6 equals 3). [measured: --regime stages, flat within noise]
 
 ## Interactions
 
