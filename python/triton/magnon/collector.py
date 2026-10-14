@@ -24,11 +24,21 @@ import os
 import pickle
 
 from triton.backends.nvidia.compiler import get_ptxas
+from triton.runtime.jit import _compile_iq_state, _compile_iq_suppress_competition
 
 from . import ptx_launch
 from .store import dlog, ptx_sha256
 
 _PICKLE_MAX_BYTES = 1 << 20
+
+
+def benchmarking():
+    """Context manager marking launches inside it as autotuning benchmark runs.
+
+    Frameworks that benchmark candidate kernels outside Triton's autotuner (e.g. Inductor) enter it
+    so that only the winning config is collected, on its first launch outside benchmarking. Shares
+    the flag Triton's autotuner sets around do_bench, which also defers the ACF A/B."""
+    return _compile_iq_suppress_competition()
 
 
 def task_root() -> str:
@@ -128,12 +138,14 @@ def wrap_launcher(kernel, run):
 
     Covers kernels compiled with triton.compile() and launched through CompiledKernel.run (e.g.
     Inductor's generated launchers), which never reach the JITFunction.run hook. Callers may hold on
-    to the returned function, so it stays installed and only the first launch collects."""
+    to the returned function, so it stays installed and only the first launch collects. Launches
+    inside benchmarking() are skipped, so autotune candidates that never run outside a benchmark are
+    never collected."""
     collected = False
 
     def launcher(grid_0, grid_1, grid_2, stream, function, metadata, launch_metadata, enter_hook, exit_hook, *args):
         nonlocal collected
-        if not collected:
+        if not collected and not getattr(_compile_iq_state, "suppressed", False):
             collected = True
             src = kernel.src
             fn = getattr(src, "fn", None)
