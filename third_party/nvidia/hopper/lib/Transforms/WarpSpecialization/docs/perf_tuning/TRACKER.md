@@ -24,7 +24,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`2cta.md`](2cta.md) | done | 1-CTA vs 2-CTA (`two_ctas`). Open: its "Not yet established" items. |
 | [`data_partitioning.md`](data_partitioning.md) | done | `data_partition_factor`. Open: its "Not yet established" items. |
 | [`clc_persistence.md`](clc_persistence.md) | done | Static persistent vs dynamic and CLC persistent. Open: its "Not yet established" items. |
-| `tma_loads.md` | todo | TMA vs pointer operand loads. |
+| [`tma_loads.md`](tma_loads.md) | done | TMA vs pointer operand loads. Open: its "Not yet established" items. |
 | `tma_stores.md` | todo | TMA vs pointer output stores. |
 | `split_k.md` | todo | Splitting one output tile's K reduction (split-K, decomposeK, stream-K) and the single-K-tile path. |
 | `pingpong.md` | todo | Ping-pong scheduling. |
@@ -133,10 +133,10 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | Tile scheduler | [2cta.md](2cta.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
 | `clc` | [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
 | `tt.autows` stage/order | — | todo |
-| Descriptor loads/stores | — | todo |
-| `multicast` (per load) | — | mentioned |
-| `multicast` | — | mentioned |
-| `auto_tma` / `auto_tma_device` | — | todo |
+| Descriptor loads/stores | — | mentioned |
+| `multicast` (per load) | [tma_loads.md](tma_loads.md#never-try-any-problem) | covered |
+| `multicast` | [tma_loads.md](tma_loads.md#never-try-any-problem) | covered |
+| `auto_tma` / `auto_tma_device` | [tma_loads.md](tma_loads.md#never-try-any-problem) | covered |
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | — | mentioned |
 | Epilogue subtiling (ES) | [resources.md](resources.md#when-to-try-it-depends-on-the-problem); [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem); [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem) | covered |
 | `generate_subtiled_region` | — | mentioned |
