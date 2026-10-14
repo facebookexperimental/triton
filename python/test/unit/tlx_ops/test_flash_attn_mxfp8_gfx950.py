@@ -73,7 +73,23 @@ def test_flash_attn_mxfp8_quantizers_match_blackwell():
     assert torch.equal(scale, ref_scale)
 
 
-def test_flash_attn_mxfp8_fast_exp_bound():
+# The public op quantizes Q, K and V in one launch. 544 rows leave the last
+# 64-row tile partial on the loop kernel's layout.
+@pytest.mark.parametrize("pingpong,n_ctx", [(True, 512), (False, 544)])
+def test_flash_attn_mxfp8_fused_quantizer(pingpong, n_ctx):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950
+
+    torch.manual_seed(20)
+    q, k, v = _qkv((2, 3, n_ctx, 128))
+    q8, qs = gfx950.quantize_mxfp8_head(q)
+    k8, ks = gfx950.quantize_mxfp8_head(k, pack_k=pingpong)
+    v8, vs = gfx950.quantize_mxfp8_v(v, transposed=pingpong)
+    for fused, separate in zip(gfx950._quantize_qkv(q, k, v, pingpong), (q8, k8, v8, qs, ks, vs)):
+        assert torch.equal(fused.view(torch.uint8), separate.view(torch.uint8))
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_mxfp8_fast_exp_bound(causal):
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950
 
     torch.manual_seed(20)
@@ -81,13 +97,13 @@ def test_flash_attn_mxfp8_fast_exp_bound():
     # A flat softmax, where the bit-trick exp2 errs the most against the rest
     # of the MXFP8 error (about 9% more error here, 0-6% at sharper ones).
     sm_scale = 128**-0.5
-    assert gfx950._default_config(False, q.shape[2])["pingpong"]
+    assert gfx950._default_config(causal, q.shape[2])["pingpong"]
     q8, qs = gfx950.quantize_mxfp8_head(q)
     k8, ks = gfx950.quantize_mxfp8_head(k, pack_k=True)
     v8, vs = gfx950.quantize_mxfp8_v(v, transposed=True)
-    fast = gfx950._launch_quantized(q8, k8, v8, qs, ks, vs, False, sm_scale).float()
-    exact = gfx950._launch_quantized(q8, k8, v8, qs, ks, vs, False, sm_scale, fast_exp=False).float()
-    ref = _sdpa(q.float(), k.float(), v.float(), False, sm_scale)
+    fast = gfx950._launch_quantized(q8, k8, v8, qs, ks, vs, causal, sm_scale).float()
+    exact = gfx950._launch_quantized(q8, k8, v8, qs, ks, vs, causal, sm_scale, fast_exp=False).float()
+    ref = _sdpa(q.float(), k.float(), v.float(), causal, sm_scale)
 
     def rms(t):
         return t.pow(2).mean().sqrt().item()
@@ -105,6 +121,19 @@ def test_flash_attn_mxfp8_fwd_multiple_cta_waves(causal):
     out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke")
     ref = _sdpa(q, k, v, causal, scale)
     torch.testing.assert_close(out, ref, atol=0.15, rtol=0)
+
+
+# Causal ping-pong takes Q tiles in pairs from one head when N_CTX % 512 == 0:
+# a single pair, and a pair count that skips the XCD remap. 768 takes the loop
+# kernel.
+@pytest.mark.parametrize("shape", [(1, 1, 512, 128), (1, 3, 1536, 128), (1, 2, 768, 128)])
+def test_flash_attn_mxfp8_fwd_causal_tile_pairs(shape):
+    from triton.tlx.ops import flash_attn_mxfp8
+
+    torch.manual_seed(20)
+    q, k, v = _qkv(shape)
+    out = flash_attn_mxfp8(q, k, v, causal=True, sm_scale=0.5, space="smoke")
+    torch.testing.assert_close(out, _sdpa(q, k, v, True, 0.5), atol=0.2, rtol=0)
 
 
 def test_flash_attn_mxfp8_rejects_backward():
