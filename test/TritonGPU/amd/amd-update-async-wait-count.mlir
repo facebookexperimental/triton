@@ -772,6 +772,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     scf.for %i = %c0 to %n step %c1 {
+      rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "load"}
       %copy0 = ttg.async_copy_global_to_local %src, %buf0 : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
       %group0 = ttg.async_commit_group tokens %copy0
       %copy1 = ttg.async_copy_global_to_local %src, %buf1 : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
@@ -779,6 +780,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       rocdl.sched.barrier none {triton.warp_pipeline.border = "load"}
       // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
       %wait0 = ttg.async_wait %group0 {num = 1 : i32}
+      rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "compute"}
       %value = tt.load %out : !tt.ptr<f32>
       tt.store %out, %value : !tt.ptr<f32>
       rocdl.sched.barrier none {triton.warp_pipeline.border = "compute"}

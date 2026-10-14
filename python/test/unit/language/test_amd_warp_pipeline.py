@@ -337,7 +337,7 @@ def _fa_warp_pipeline_kernel(Q, K, V, O, N: tl.constexpr, CAUSAL: tl.constexpr):
 @pytest.mark.parametrize("n", [256, 512])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fa_warp_pipeline_layout_inputs(causal, n, dtype):
-    """Layout inputs before a wait must join the next pipeline stage."""
+    """Place the accumulator conversion in its consuming PV stage."""
     torch.manual_seed(42)
     d = 64
     q, k, v = [torch.randn((n, d), device="cuda", dtype=dtype) for _ in range(3)]
@@ -350,8 +350,12 @@ def test_fa_warp_pipeline_layout_inputs(causal, n, dtype):
     expected = torch.softmax(scores, dim=-1) @ v.float()
     tolerance = 2e-3 if dtype == torch.float16 else 2e-2
     torch.testing.assert_close(out.float(), expected, atol=tolerance, rtol=tolerance)
-    assert re.search(r'ttg.async_wait[^\n]*\n[^\n]*scf.execute_region[^\n]*\n[^\n]*ttg.convert_layout',
-                     compiled.asm['ttgir'])
+    ttgir = compiled.asm['ttgir']
+    stages = dict((label, body) for body, label in re.findall(
+        r'scf.execute_region[^\n]*\n(.*?)\n      }[^\n]*triton.warp_pipeline.stage = "([^"]+)"', ttgir, re.DOTALL))
+    assert set(stages) == {"qk", "softmax", "value", "pv"}
+    assert "ttg.convert_layout" not in stages["qk"]
+    assert re.match(r'\s*%[^=]+ = ttg.convert_layout', stages["pv"])
     assert 'triton.warp_pipeline.pipelined_for' in compiled.asm['ttgir']
     assert 's_setprio' in compiled.asm['amdgcn']
 
