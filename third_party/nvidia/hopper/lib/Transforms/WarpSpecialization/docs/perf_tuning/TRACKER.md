@@ -9,7 +9,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | File | State | Note |
 |------|-------|------|
 | [`knobs.md`](knobs.md) | done | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it. |
-| `resources.md` | todo | SMEM, TMEM and register budgets as pruning rules; links to the existing SMEM/TMEM/register docs for the mechanics. |
+| [`resources.md`](resources.md) | done | SMEM, TMEM and register budgets as pruning rules; links to the existing SMEM/TMEM/register docs for the mechanics. Open: its "Not yet established" items. |
 | `interactions.md` | todo | Feature-pair table grouped by feature: pair \| status ("works", "compile error", "silently ignored", "duplicate config", "hangs", "wrong answer", "requires") \| mechanism + code location. |
 | `hazards.md` | todo | Open wrong-answer and hang conditions, each with its trigger and code location. Entries are deleted when fixed. |
 
@@ -45,6 +45,12 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 | `disallow_acc_multi_buffer` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; listed in [AutoWSAnnotations.md](../AutoWSAnnotations.md) "Annotation → IR attribute → consumer" without a when/why explanation. |
 | `loop_unroll_factor`, `disable_licm` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; generic loop transforms, not WS-specific. |
 | Descriptor loads/stores (kernel pattern) | todo | `tl.make_tensor_descriptor` or host `TensorDescriptor` with `desc.load` / `desc.store`: why autoWS expects TMA producer and store partitions. |
+
+## Fixes to existing docs
+
+| Doc | State | Note |
+|-----|-------|------|
+| [TMEMAllocationHeuristics.md](../TMEMAllocationHeuristics.md) "All TMEM buffers get `buffer.copy = 1`" | todo | Out of date: the heuristic planner's TMEM multi-buffering post-processing (`WSMemoryPlanner.cpp`) raises accumulator copies. |
 
 ## Other
 
