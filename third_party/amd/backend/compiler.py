@@ -425,6 +425,44 @@ class HIPBackend(BaseBackend):
             metadata.shared,
         )
 
+    def make_launch_metadata(self, metadata, src):
+        """Describe the HIP launch contract without changing the regular launcher."""
+
+        def get(key, default=None):
+            return metadata.get(key, default) if isinstance(metadata, dict) else getattr(metadata, key, default)
+
+        names = getattr(getattr(src, "fn", None), "arg_names", None)
+        constants = getattr(src, "constants", {})
+        constant_keys = set()
+        for key in constants:
+            if isinstance(key, str) and names is not None:
+                key = names.index(key)
+            constant_keys.add(key if isinstance(key, tuple) else (key, ))
+        args = []
+        for index, (key, ty) in enumerate(src.signature.items()):
+            parameter_index = names.index(key) if names is not None and isinstance(key, str) else index
+            if (parameter_index, ) in constant_keys or ty == "constexpr":
+                continue
+            name = key if isinstance(key, str) else names[index] if names else str(index)
+            args.append({"name": name, "type": str(ty), "index": index})
+        cluster = get("ctas_per_cga")
+        return {
+            "abi_version": 1,
+            "backend": "hip",
+            "entry_name": get("name", ""),
+            "num_warps": get("num_warps"),
+            "num_ctas": get("num_ctas", 1),
+            "warp_size": get("warp_size", self.target.warp_size),
+            "shared_mem": get("shared", 0),
+            "ctas_per_cga": list(cluster) if cluster is not None else None,
+            "launch_cooperative_grid": get("launch_cooperative_grid", False),
+            "global_scratch_size": get("global_scratch_size", 0),
+            "global_scratch_align": get("global_scratch_align", 128),
+            "profile_scratch_size": get("profile_scratch_size", 0),
+            "profile_scratch_align": get("profile_scratch_align", 1),
+            "args": args,
+        }
+
     def get_codegen_implementation(self, options):
 
         def post_ast_lowering(mod):
