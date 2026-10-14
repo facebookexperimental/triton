@@ -61,17 +61,6 @@ Two general rules apply to every entry:
   - `WSAtomicBroadcast.cpp`, `classifyAtomic`: atomics with at most one task ID pass through unchanged.
   - `WSSpecialize.cpp`, `SpecializeOp`: an op that has no task ID and that no partition needs is not cloned into any partition, and the original loop is erased.
 
-### Accumulator subtile read twice in the epilogue
-
-- **Trigger:** all of the following hold:
-  - `EPILOGUE_SUBTILE >= 2`;
-  - the epilogue reads the same accumulator subtile twice, e.g. a fused column reduction or RMSNorm next to the stored output;
-  - the build's `InterleaveTMem` does not keep duplicate subtile reads inside the accumulator wait/arrive, i.e. it has no `buildOriginalBlockOrder` handling that bounds barrier moves by the pre-reorder block order.
-- **Symptom:** nondeterministic wrong values in the GEMM output. The reduction itself is correct.
-- **Code:**
-  - `InterleaveTMem.cpp`, `processBlock`: `tmem_load` sinking can move one of the two reads outside the accumulator wait/arrive pair.
-  - Builds that have the handling record the order with `InterleaveTMem.cpp`, `buildOriginalBlockOrder`, and pass it to `WSBarrierReorder.h`, `optimizeWSBarrierLocations`. Check for `buildOriginalBlockOrder` in the build before trusting fused-reduction results at `EPILOGUE_SUBTILE >= 2`.
-
 ### Same-partition TMA staging floor that does not divide the subtile count (from code inspection; no reproducer yet)
 
 - **Trigger:** TMA-store staging is drained in the same partition with K copies, and S subtiles rotate through those copies. The planner's cross-stage correctness floor already forces K > 1, and S is not a multiple of K.
