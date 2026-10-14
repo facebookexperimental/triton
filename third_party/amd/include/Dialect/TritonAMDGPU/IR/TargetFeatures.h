@@ -86,6 +86,7 @@ public:
   bool supportsPermlaneSwap() const;
   bool supportsCvtPkScalePk8() const;
   bool supportsHwScaledUpcast() const;
+  bool supportsHwScaledDowncast() const;
 
   bool supportBitwidth16Elementwise() const;
   bool supportBitwidth32Elementwise() const;

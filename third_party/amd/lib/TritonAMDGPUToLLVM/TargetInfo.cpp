@@ -856,6 +856,10 @@ bool TargetInfo::supportsHwScaledUpcast() const {
   return targetFeatures.supportsHwScaledUpcast();
 }
 
+bool TargetInfo::supportsHwScaledDowncast() const {
+  return targetFeatures.supportsHwScaledDowncast();
+}
+
 void TargetInfo::localLoadOpAnnotation(triton::gpu::LocalLoadOp localLoadOp,
                                        Operation *llLoadOp) const {
   if (requiresAliasInfoForAsyncOps())

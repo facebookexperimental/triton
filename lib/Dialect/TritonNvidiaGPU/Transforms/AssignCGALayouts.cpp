@@ -160,7 +160,7 @@ private:
           if (failed(layout))
             return failure();
           srcEncoding = *layout;
-        } else if (auto cast = dyn_cast<ttg::UpcastFpOpInterface>(op)) {
+        } else if (auto cast = dyn_cast<ttg::CastFpOpInterface>(op)) {
           srcEncoding = cast.inferSrcEncoding(i, encoding);
         } else {
           srcEncoding = inferSrcEncoding(op, encoding);
