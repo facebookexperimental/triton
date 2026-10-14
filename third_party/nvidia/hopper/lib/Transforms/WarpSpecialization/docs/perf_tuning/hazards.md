@@ -104,9 +104,19 @@ Two general rules apply to every entry:
 
 ### Plan search pins TMEM accumulator copies to 1
 
-- **Status:** from code inspection; GPU check pending.
-- **Trigger:** `TRITON_WS_SMEM_PLAN_SEARCH=1` on a persistent kernel whose accumulator is written fresh every tile iteration with no K loop (K <= BLOCK_K as a compile-time constant), with more tiles than SMs. Kernels with scaled MMA or a `SubtiledRegionOp` fall back to the heuristic planner and are not affected.
-- **Symptom (expected):** the per-iteration accumulator gets one TMEM copy while the loop scheduler can place its initialization and its epilogue load in different stages, the condition under which the heuristic planner multi-buffers it to avoid a cross-tile race.
-- **Code:** `WSMemoryPlanner.cpp`: `allocateTmemBuffersViaSearch` stamps `buffer.copy=1` on every TMEM alloc. The heuristic allocator's TMEM multi-buffering post-processing gives such per-iteration accumulators one slot per in-flight iteration; plan search skips that step.
+- **Status:** reproduced. The in-tree test `test_autows_addmm_pointer_bias_single_k_tile` fails under plan search and passes without it; with K = 2 x BLOCK_K it passes either way.
+- **Trigger:** `TRITON_WS_SMEM_PLAN_SEARCH=1` on a persistent kernel with no K loop (K == BLOCK_K as a compile-time constant) and an epilogue input, with more tiles than SMs. Kernels with scaled MMA or a `SubtiledRegionOp` fall back to the heuristic planner and are not affected.
+- **Symptom:** a silent wrong answer on every run.
+- **Code:** `WSMemoryPlanner.cpp`: `allocateTmemBuffersViaSearch` stamps `buffer.copy=1` on every TMEM alloc. The heuristic allocator's TMEM multi-buffering post-processing gives a per-iteration accumulator one slot per in-flight iteration, because the loop scheduler can place its initialization and its epilogue load in different stages; plan search skips that step.
+
+### Relaxed operand-copy floor with a TMA-loaded epilogue input, several tiles per CTA
+
+- **Status:** reproduced. One tile per CTA is exact, and relaxed plans without the TMA-loaded epilogue input are exact. Root cause not yet located.
+- **Trigger:** all of the following, under Meta WS:
+  - `data_partition_factor` > 1, where the static copy-safety floor applies, and the planner relaxes that floor below `num_stages` because it does not fit (e.g. `EPILOGUE_SUBTILE=2`, `num_stages=3`, ending at A=2/2 and B=1 copies after the auxiliary reservation), with or without `disallow_acc_multi_buffer`;
+  - an epilogue input (e.g. a bias) loaded with a TMA descriptor;
+  - a CTA processes several tiles (more tiles than CTAs).
+- **Symptom:** the kernel hangs.
+- **Code:** `WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor` and `relaxCopySafetyFloorToBudget`.
 
 Reported wrong answers and hangs whose root cause is not yet located in code are tracked in [TRACKER.md](TRACKER.md#reported-wrong-answers--hangs-needing-repro--code-root-cause), not here.
