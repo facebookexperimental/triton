@@ -2,7 +2,7 @@
 
 Scope: when `pingpongAutoWS` can change a GEMM kernel on B200, which configs
 it silently leaves unchanged, and what it trades. How regions are formed and
-synchronized is in [PingPongScheduling.md](../PingPongScheduling.md).
+synchronized is in [PingPongScheduling.md](../PingPongScheduling.md). Ping-pong only matters for fusions with transcendental (SFU) ops, such as softmax or attention epilogues; it has no effect on a raw GEMM and is out of scope for v0.
 
 Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/` (`WS/`) unless they start at the repository root.
 
@@ -29,23 +29,16 @@ Every condition below leaves the kernel unchanged with no diagnostic (debug log 
 ## Mechanism
 
 **What it changes.**
-- Each accepted region gets a two-element mbarrier group in SMEM. The two partitions wait/arrive around their critical regions so only one executes the expensive op at a time, with wait phases derived from the enclosing loops ([PingPongScheduling.md, "Barrier Allocation"](../PingPongScheduling.md#barrier-allocation); `WS/PingPong.cpp`, `doPingPongSync`).
+- Each accepted region gets a two-element mbarrier group in SMEM; the two partitions wait/arrive around their critical regions so only one executes the expensive op at a time, with wait phases derived from the enclosing loops ([PingPongScheduling.md, "Barrier Allocation"](../PingPongScheduling.md#barrier-allocation); `WS/PingPong.cpp`, `doPingPongSync`).
 - For SFU ops the region extends forward to the next op with memory effects ([PingPongScheduling.md, "Expensive Op Identification"](../PingPongScheduling.md#expensive-op-identification)).
 
 **What it relieves.** Contention between two consumer partitions issuing SFU work at the same time.
 
-**What it costs.**
-- The two partitions' critical regions are serialized.
-- Each region crossing adds a barrier wait/arrive per iteration.
-- Two barriers of SMEM per region.
+**What it costs.** Serialized critical regions; a barrier wait/arrive per region crossing per iteration; two barriers of SMEM per region.
 
 **Where a GEMM can trigger it.**
-- In a GEMM, a second consumer partition comes from `data_partition_factor=2`, which gives two computation groups (see [data_partitioning.md](data_partitioning.md)).
-- The documented conditions for a region in a GEMM are: dp=2, SFU math on 2-D tiles in both groups, inside an `scf.for` (static persistent). On this build they are not enough: both data-partition halves sit in the default region (see [warps_and_registers.md](warps_and_registers.md#mechanism)), so their SFU ops are in one partition and no region forms.
-
-## When to try it (depends on the problem)
-
-No rules: `pingpongAutoWS` is always a duplicate config for a GEMM on this build (see "Never try (any problem)").
+- A GEMM's second consumer partition comes from `data_partition_factor=2` (two computation groups; see [data_partitioning.md](data_partitioning.md)).
+- Documented conditions: dp=2, SFU math on 2-D tiles in both groups, inside an `scf.for` (static persistent). Not enough on this build: both data-partition halves sit in the default region (see [warps_and_registers.md](warps_and_registers.md#mechanism)), so their SFU ops share one partition and no region forms.
 
 ## Interactions
 
