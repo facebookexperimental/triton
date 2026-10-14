@@ -22,8 +22,8 @@ Epilogue side inputs are covered in [epilogue_prologue_tma_loads.md](epilogue_pr
 
 | Condition | Status | Why | Code ref |
 |---|---|---|---|
-| `tl.atomic_*` on a tensor, or a scalar atomic that is not a loop-carried tile counter, replicated to more than one partition inside the WS loop | silently ignored | Warp specialization is stripped from the whole kernel. The atomic is classified as unsupported, so `doDynamicTileBroadcast` fails and the WS metadata is removed. The kernel compiles without warp specialization. | `WSAtomicBroadcast.cpp`, `classifyAtomic` and `doDynamicTileBroadcast`; `WarpSpecialization.cpp`, `runOnFuncOp` (`bailOut`) |
-| `tl.atomic_*` inside the WS loop that no partition reaches (e.g. its result is unused) | wrong answer | The atomic is dropped. See [hazards.md](hazards.md#atomic-inside-the-warp-specialized-tile-loop-with-no-partition). | `PartitionSchedulingMeta.cpp`, `runOnOperation`; `WSSpecialize.cpp`, `SpecializeOp` |
+| `tl.atomic_*` (`AtomicRMWOp`) on a tensor, or a scalar atomic that is not a loop-carried tile counter, replicated to more than one partition inside the WS loop | silently ignored | Per the code, warp specialization is stripped from the whole kernel: the atomic is classified as unsupported, so `doDynamicTileBroadcast` fails and the WS metadata is removed. Not reproduced in testing. Under `two_ctas`, stripping WS hangs (see [2cta.md](2cta.md#never-try-any-problem)). | `WSAtomicBroadcast.cpp`, `classifyAtomic` and `doDynamicTileBroadcast`; `WarpSpecialization.cpp`, `runOnFuncOp` (`bailOut`) |
+| `tl.atomic_*` inside the WS loop whose operands do not depend on the accumulator (e.g. a counter `atomic_add(cnt, 1)`, or a constant added to a column) | wrong answer (reproduced) | No partition reaches it, so the atomic is removed from the TTGIR and its result stays 0, while WS is still applied. Atomics of accumulator-derived values are kept and exact. See [hazards.md](hazards.md#atomic-inside-the-warp-specialized-tile-loop-with-no-partition). | `PartitionSchedulingMeta.cpp`, `runOnOperation`; `WSSpecialize.cpp`, `SpecializeOp` |
 | `multi_cta` on a loop whose downstream `tl.reduce` has a defined reduction ordering, or whose combiner is not an add | compile error | Partial results are combined across CTAs by addition, which is only valid for an unordered add. | `MultiCTAReduction.cpp`, `transformMultiCTALoop` and `verifyReduceCombinerIsAdd` |
 
 ## Mechanism
@@ -37,11 +37,11 @@ Epilogue side inputs are covered in [epilogue_prologue_tma_loads.md](epilogue_pr
 **Cross-tile reductions must use an op the partition scheduler places.**
 - **What changes:**
   - A TMA reduce (`DescriptorReduceOp` / `AsyncTMAReduceOp`) is categorized as `TMAReduction`. It is scheduled into a dedicated `reduction` partition, and its completion wait stays in the same partition as the reduce.
-  - A pointer `tl.atomic_*` gets no such category. Either it is replicated, and WS is stripped, or it is unreached, and dropped.
+  - A pointer `tl.atomic_*` gets no such category. If its operands do not depend on the accumulator, it is unreached and dropped (reproduced). If it is replicated to several partitions, the code strips WS (not reproduced in testing).
 - **What it relieves:** the cross-tile accumulation is issued asynchronously from the reduction partition.
 - **What it costs:**
   - one more partition;
-  - a TMA-reduce staging ring, sized by `TRITON_WS_TMA_REDUCE_STAGING_COPIES` (default: the loop depth).
+  - a TMA-reduce staging ring, sized by `TRITON_WS_TMA_REDUCE_STAGING_COPIES` (default: min(`num_stages`, `TRITON_WS_STAGING_COPIES`)).
 - Code: `PartitionSchedulingMeta.cpp`, `categorizeTMAReductions`, `isReduceTokenWait` and `createPartitionLayout`; `WSMemoryPlanner.cpp`, `getTmaReduceStagingCopies`.
 
 **Per-subtile reductions read each subtile twice.**
@@ -51,8 +51,8 @@ Epilogue side inputs are covered in [epilogue_prologue_tma_loads.md](epilogue_pr
 
 ## When to try it (depends on the problem)
 
-- IF the fusion needs a sum across output tiles, THEN only try a TMA reduce (`desc.atomic_add` / `store_reduce="add"`), or a per-CTA partial stored inside the loop plus a finishing kernel, BECAUSE a pointer atomic in the WS loop either strips warp specialization or is dropped.
-- IF a fused reduction is over M (column), THEN prefer max/min-type statistics where the math allows, and expect sum over M to cost more cross-lane work, BECAUSE only fp32 max/min have a single-instruction warp reduction.
+- IF the fusion needs a sum across output tiles, THEN only try a TMA reduce (`desc.atomic_add` / `store_reduce="add"`), or a per-CTA partial stored inside the loop plus a finishing kernel, BECAUSE a pointer atomic that does not depend on the accumulator is dropped (reproduced), and a replicated one strips warp specialization per the code.
+- IF a fused reduction is over M (column), THEN prefer (ranks first; removes nothing) max/min-type statistics where the math allows, and expect sum over M to cost more cross-lane work, BECAUSE only fp32 max/min have a single-instruction warp reduction.
 - IF a reduced statistic is needed after the K loop over the full K sum, e.g. a row norm of the GEMM output, THEN skip split-K for that kernel ([split_k.md](split_k.md#when-to-try-it-depends-on-the-problem)), BECAUSE the statistic is nonlinear in the partials.
 
 ## Interactions
@@ -72,7 +72,6 @@ Reported but not yet located in code (rows in [TRACKER.md](TRACKER.md#reported-w
 ## Not yet established
 
 Tracked in [TRACKER.md](TRACKER.md).
-
 
 - Carrying a `(BLOCK_M, 8)` partial across the K loop with one cross-lane reduce per tile, and pairwise reduction trees: the gains and their numerics.
 - How much of a fused kernel's time the reduction itself takes (ablation bound), compared with the mainloop gap to cuBLAS.
