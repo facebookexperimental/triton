@@ -67,7 +67,7 @@ Reported but not located in code, so not in [hazards.md](hazards.md). Each needs
 
 | Doc | State | Note |
 |-----|-------|------|
-| [TMEMAllocationHeuristics.md](../TMEMAllocationHeuristics.md) "All TMEM buffers get `buffer.copy = 1`" | todo | Out of date: the heuristic planner's TMEM multi-buffering post-processing (`WSMemoryPlanner.cpp`) raises accumulator copies. |
+| [TMEMAllocationHeuristics.md](../TMEMAllocationHeuristics.md) "All TMEM buffers get `buffer.copy = 1`" | done | Out of date: the heuristic planner's TMEM multi-buffering post-processing (`WSMemoryPlanner.cpp`) raises accumulator copies. |
 | [2cta-autoWS-sync.md](../../../../../../../../docs/design/2cta-autoWS-sync.md) "Current Limitations" | done | `BLOCK_M` fallback threshold is 64, not 128. |
 | [Overview.md](../Overview.md) | done | Ping-pong uses an mbarrier pair, not named barriers. |
 | [triton_tma_multicast.md](../../../../../../../../docs/design/triton_tma_multicast.md) | done | Multicast lowering is planned, not implemented. |
