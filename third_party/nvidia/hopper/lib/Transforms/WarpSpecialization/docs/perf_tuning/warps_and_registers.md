@@ -16,7 +16,7 @@ Hardware limits are in [resources.md](resources.md). Code paths are relative to 
 | `maxnreg` | kernel compile option | Replaces the computed per-thread register ceiling (`ttg.maxnreg`) | [RegisterBudgets.md](../RegisterBudgets.md) |
 | `merge_epilogue`, `merge_epilogue_to_computation`, `separate_epilogue_store` | `tl.range(...)` kwargs | Add or remove partitions, which changes the worker warp total | [PartitionSchedulingMeta.md, "Target Partition Layouts"](../PartitionSchedulingMeta.md#target-partition-layouts) |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Result | Why | Code |
 |---|---|---|---|
@@ -58,7 +58,7 @@ Which logical partition is the default region: [PartitionSchedulingMeta.md, "Pha
   - relieves: separates work so it can overlap;
   - costs: a whole warp group once worker warps cross a multiple of 4, which lowers the ceiling for every thread.
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - **IF** `num_warps` is not 4 or 8, **THEN** skip, **BECAUSE** no tcgen05 autoWS GEMM is generated.
 - **IF** `num_warps` + 4 × (number of non-default partitions holding TMEM ops) + (other non-default partitions) > 16, **THEN** skip, **BECAUSE** WS is stripped and the config duplicates a non-WS kernel.
