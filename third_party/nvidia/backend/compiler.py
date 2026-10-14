@@ -1117,8 +1117,6 @@ class CUDABackend(BaseBackend):
         nvidia.passes.hopper.add_multi_cta_reduction(pm)
         # TODO: Find the optimal place in the pipeline for this pass.
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
-        if knobs.nvidia.promote_mbarrier_to_named_barrier:
-            nvidia.passes.ttnvgpuir.add_promote_mbarrier_to_named_barrier(pm)
         if knobs.nvidia.enable_interleave_tmem:
             nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         if knobs.nvidia.enable_unify_ws_barrier_locations:
@@ -1131,6 +1129,8 @@ class CUDABackend(BaseBackend):
         # that any local loads eliminated by TMA lowering do not inflate them.
         if capability // 10 >= 9 and knobs.nvidia.use_meta_ws:
             passes.ttgpuir.add_optimize_partition_warps(pm)
+        if knobs.nvidia.promote_mbarrier_to_named_barrier:
+            nvidia.passes.ttnvgpuir.add_promote_mbarrier_to_named_barrier(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
         passes.common.add_sccp(pm)

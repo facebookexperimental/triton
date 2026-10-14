@@ -1,12 +1,14 @@
 #ifndef TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 #define TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
 #include <numeric>
@@ -23,7 +25,14 @@ class StoreOp;
 class FuncOp;
 namespace gpu {
 class SwizzledSharedEncodingAttr;
-}
+
+// Prove that two partition-local loop nests execute the same iterations.
+// Both arrays are ordered innermost first. Compare from the outside in so
+// corresponding induction variables can stand in for one another in inner
+// bounds, including triangular nests; resolve warp-specialize captures.
+bool haveEquivalentWarpSpecializeLoopNests(ArrayRef<scf::ForOp> lhs,
+                                           ArrayRef<scf::ForOp> rhs);
+} // namespace gpu
 } // namespace triton
 
 // Return a tuple of two or three entries representing the shape of the
