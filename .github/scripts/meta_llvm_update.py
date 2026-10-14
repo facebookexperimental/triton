@@ -3,7 +3,9 @@
 
 Reads everything through the GitHub API, so --dry-run works from any machine.
 Without --dry-run it must run in a checkout of the target branch: it commits
-the new file to the bot branch, force-pushes it, and opens or updates one PR.
+the new file to the bot branch and force-pushes it. If a person already opened
+the branch's PR it updates that PR; otherwise it opens or updates a tracking
+issue with the command to open it (the Meta CLA check rejects bot-authored PRs).
 
 Emits status=no-meta|pin-moved|no-release|incomplete|current|bump to GITHUB_OUTPUT.
 pin-moved exits 1: the fork has to be rebuilt on OAI's new pin by hand.
@@ -16,7 +18,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from meta_llvm_bump import (commit_message, decide, oai_pins, parse_sha256_file, release_for, render,  # noqa: E402
+from meta_llvm_bump import (commit_message, decide, issue_body, issue_marker, oai_pins, parse_sha256_file, release_for,
+                            render,  # noqa: E402
                             same_tree_chain, variants)
 
 META_PATH = "cmake/meta-llvm-info.json"
@@ -84,22 +87,69 @@ def emit(**kv):
                 f.write(f"{key}={value}\n")
 
 
-def open_pr(repo, target, title, message):
+def bot_branch_for(target):
     # scratch/** is excluded from the "Meta CLA Enforcement" ruleset, whose required
     # "Meta CLA Check" cannot exist on a commit before its first push.
-    bot_branch = "scratch/meta-llvm-bump/" + target.replace("/", "-")
+    return "scratch/meta-llvm-bump/" + target.replace("/", "-")
+
+
+def tracking_issue(repo, target):
+    """The open tracking issue for target, or None."""
+    for issue in gh_json(f"repos/{repo}/issues?state=open&per_page=100"):
+        if "pull_request" not in issue and issue_marker(target) in (issue.get("body") or ""):
+            return issue
+    return None
+
+
+def close_tracking_issue(repo, target, reason):
+    issue = tracking_issue(repo, target)
+    if issue:
+        run("gh", "issue", "close", str(issue["number"]), "--repo", repo, "--comment", reason)
+
+
+def publish(repo, target, title, message):
+    """Push the bot branch, then update its PR if a person opened one, else the tracking issue."""
+    bot_branch = bot_branch_for(target)
     run("git", "checkout", "-B", bot_branch)
     run("git", "add", META_PATH)
     run("git", "commit", "-m", message)
-    run("git", "push", "--force", "origin", f"HEAD:refs/heads/{bot_branch}", capture=False)
-    body = message.split("\n", 2)[2]  # The PR title carries the first line.
-    existing = gh_json(f"repos/{repo}/pulls?head={repo.split('/')[0]}:{bot_branch}&base={target}&state=open")
-    if existing:
-        number = existing[0]["number"]
-        run("gh", "pr", "edit", str(number), "--repo", repo, "--title", title, "--body", body)
-        return existing[0]["html_url"]
-    return run("gh", "pr", "create", "--repo", repo, "--base", target, "--head", bot_branch, "--title", title, "--body",
-               body).strip()
+    try:
+        remote_tree = gh_json(f"repos/{repo}/branches/{bot_branch}")["commit"]["commit"]["tree"]["sha"]
+    except RuntimeError:
+        remote_tree = None
+    changed = remote_tree != run("git", "rev-parse", "HEAD^{tree}").strip()
+    if changed:
+        run("git", "push", "--force", "origin", f"HEAD:refs/heads/{bot_branch}", capture=False)
+    # Same tree: same target tip and same pin, so the last build check still applies.
+    emit(changed=str(changed).lower(), sha=run("git", "rev-parse", "HEAD").strip())
+    prs = gh_json(f"repos/{repo}/pulls?head={repo.split('/')[0]}:{bot_branch}&base={target}&state=open")
+    if prs:
+        body = message.split("\n", 2)[2]  # The PR title carries the first line.
+        run("gh", "pr", "edit", str(prs[0]["number"]), "--repo", repo, "--title", title, "--body", body)
+        return prs[0]["html_url"]
+    issue_title = f"[Meta LLVM] Bump ready: {target}"
+    body = issue_body(repo, target, bot_branch, title, message)
+    issue = tracking_issue(repo, target)
+    if issue:
+        run("gh", "issue", "edit", str(issue["number"]), "--repo", repo, "--title", issue_title, "--body", body)
+        return issue["html_url"]
+    return run("gh", "issue", "create", "--repo", repo, "--title", issue_title, "--body", body).strip()
+
+
+def report(repo, target, result, run_url):
+    """Comment the build check's outcome on the bot branch's PR, else on the tracking issue."""
+    bot_branch = bot_branch_for(target)
+    sha = gh_json(f"repos/{repo}/branches/{bot_branch}")["commit"]["sha"]
+    verdict = {"success": "passed", "failure": "failed", "cancelled": "was cancelled"}.get(result, f"ended: {result}")
+    comment = (f"Build check for `{sha[:12]}` {verdict}: cp312 wheels (x86_64, aarch64) built by `wheels_fb.yml` "
+               f"against the new pin. Run: {run_url}")
+    prs = gh_json(f"repos/{repo}/pulls?head={repo.split('/')[0]}:{bot_branch}&base={target}&state=open")
+    if prs:
+        run("gh", "pr", "comment", str(prs[0]["number"]), "--repo", repo, "--body", comment)
+        return
+    issue = tracking_issue(repo, target)
+    if issue:
+        run("gh", "issue", "comment", str(issue["number"]), "--repo", repo, "--body", comment)
 
 
 def main():
@@ -107,10 +157,17 @@ def main():
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "facebookexperimental/triton"))
     parser.add_argument("--target", required=True, help="Triton branch to bump, e.g. release/3.8.x")
     parser.add_argument("--fork", default="facebookexperimental/llvm-project")
-    parser.add_argument("--fork-branch", required=True, help="Fork branch the target tracks, e.g. triton_3.8.x")
+    parser.add_argument("--fork-branch", help="Fork branch the target tracks, e.g. triton_3.8.x")
     parser.add_argument("--require", default=DEFAULT_REQUIRED, help="Platforms a release must publish")
     parser.add_argument("--dry-run", action="store_true", help="Print the new file and PR body; push nothing")
+    parser.add_argument("--report", metavar="RESULT", help="Comment a build check result (success|failure|...)")
+    parser.add_argument("--run-url", help="Build check run URL, with --report")
     args = parser.parse_args()
+    if args.report:
+        report(args.repo, args.target, args.report, args.run_url)
+        return
+    if not args.fork_branch:
+        parser.error("--fork-branch is required unless --report is given")
 
     meta = read_json(args.repo, META_PATH, args.target)
     if meta is None:
@@ -126,6 +183,8 @@ def main():
     emit(status=status)
     if status == "pin-moved":
         sys.exit(1)
+    if status == "current" and not args.dry_run:
+        close_tracking_issue(args.repo, args.target, f"{args.target} now pins this release ({detail}).")
     if status != "bump":
         return
 
@@ -137,14 +196,17 @@ def main():
     message = commit_message(title, args.repo, args.target, args.fork, args.fork_branch, meta, new, log)
     content = json.dumps(new, indent=2) + "\n"
     if args.dry_run:
-        print(f"--- {META_PATH} ---\n{content}--- commit message and PR description ---\n{message}")
+        print(
+            f"--- {META_PATH} ---\n{content}--- commit message and PR description ---\n{message}\n"
+            f"--- tracking issue ---\n{issue_body(args.repo, args.target, bot_branch_for(args.target), title, message)}"
+        )
         return
     remote_tip = gh_json(f"repos/{args.repo}/branches/{args.target}")["commit"]["sha"]
     if run("git", "rev-parse", "HEAD").strip() != remote_tip:
         sys.exit(f"checkout is not at {args.target} tip {remote_tip[:12]}; the pin was read from there")
     with open(META_PATH, "w") as f:
         f.write(content)
-    print(open_pr(args.repo, args.target, title, message))
+    print(publish(args.repo, args.target, title, message))
 
 
 if __name__ == "__main__":

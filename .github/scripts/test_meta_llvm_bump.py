@@ -1,5 +1,5 @@
-from meta_llvm_bump import (commit_message, decide, oai_pins, parse_sha256_file, release_for, render, same_tree_chain,
-                            variants)
+from meta_llvm_bump import (commit_message, decide, issue_body, issue_marker, oai_pins, parse_sha256_file, release_for,
+                            render, same_tree_chain, variants)
 
 OLD = "1889ed344a2ea019320c1a49fc5b7103d0d9468d"
 NEW = "3dd0e43fed8836e77165a4f066b983efe1f13a82"
@@ -111,3 +111,17 @@ def test_commit_message_plain_wrapped_bare_labels():
     assert "facebookexperimental/llvm-project@triton_3.8.x" in body
     assert "Fork changes in this bump (1889ed344a2e...3dd0e43fed88):" in lines
     assert "  3dd0e43fed88 [triton][3.8][LLVM] Cap SLSR candidate-basis SCEV diff..." in lines
+
+
+def test_issue_body_has_marker_command_and_message():
+    body = issue_body("facebookexperimental/triton", "release/3.8.x", "scratch/meta-llvm-bump/release-3.8.x",
+                      "[Meta LLVM] Bump release/3.8.x to llvm-3dd0e43f-1", "TITLE\n\nSummary:\nbody text")
+    assert body.startswith(issue_marker("release/3.8.x"))
+    assert ("gh pr create -R facebookexperimental/triton --base release/3.8.x "
+            "--head scratch/meta-llvm-bump/release-3.8.x") in body
+    # The PR body comes from the branch's own commit message, minus the title line.
+    assert ("gh api repos/facebookexperimental/triton/commits/scratch/meta-llvm-bump/release-3.8.x "
+            "-q .commit.message | tail -n +3") in body
+    assert "compare/release/3.8.x...scratch/meta-llvm-bump/release-3.8.x" in body
+    assert "Summary:\nbody text" in body
+    assert issue_marker("main") != issue_marker("release/3.8.x")

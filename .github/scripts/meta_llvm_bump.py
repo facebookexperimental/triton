@@ -142,3 +142,40 @@ def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width
     ]
     lines += [entry(sha, subject) for sha, subject in log] or ["  (none)"]
     return "\n".join(lines)
+
+
+def issue_marker(target):
+    """Hidden tag that identifies a target's tracking issue."""
+    return f"<!-- meta-llvm-bump {target} -->"
+
+
+def issue_body(repo, target, bot_branch, title, message):
+    """Tracking issue: where the bump is and the command a person runs to open its PR.
+
+    A person opens the PR because the Meta CLA check and the fbsource importer accept only
+    PR authors with a CLA on file; the bot account has none.
+    """
+    gh_cmd = (f'gh pr create -R {repo} --base {target} --head {bot_branch} \\\n'
+              f'  --title "{title}" \\\n'
+              f'  --body "$(gh api repos/{repo}/commits/{bot_branch} -q .commit.message | tail -n +3)"')
+    return "\n".join([
+        issue_marker(target),
+        f"A Meta LLVM bump for `{target}` is ready on `{bot_branch}` "
+        f"([view the change](https://github.com/{repo}/compare/{target}...{bot_branch})).",
+        "",
+        "Open its PR (a person must open it, since the Meta CLA check reads the PR author), then import and "
+        "land it as usual:",
+        "",
+        "```",
+        gh_cmd,
+        "```",
+        "",
+        f"The bot keeps the branch, and the PR once it exists, up to date. This issue closes when `{target}` pins "
+        "the release.",
+        "",
+        "Commit message and PR description:",
+        "",
+        "```",
+        message,
+        "```",
+    ])

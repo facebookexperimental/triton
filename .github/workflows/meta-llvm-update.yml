@@ -1,11 +1,12 @@
 name: Meta LLVM update
-# Opens one PR per release line when the Meta LLVM fork
-# (facebookexperimental/llvm-project) publishes a release newer than that line's
-# cmake/meta-llvm-info.json pin. Reads the fork anonymously; never lands anything.
-# Each PR is imported and landed through the usual flow.
+# Prepares a bump when the Meta LLVM fork (facebookexperimental/llvm-project)
+# publishes a release newer than a release line's cmake/meta-llvm-info.json pin:
+# pushes scratch/meta-llvm-bump/<line>, builds wheels from it, and reports on a
+# tracking issue with the command a person runs to open the PR. The Meta CLA
+# check rejects bot-authored PRs, so the bot never opens one. Never lands anything.
 #
 # Scheduled workflows run from the default branch, so this one file serves every
-# target branch: it checks out main for the scripts and the target for the edit.
+# release line; _meta-llvm-line.yml does the work for one line.
 on:
   schedule:
     - cron: '23 * * * *'
@@ -16,7 +17,7 @@ on:
         required: false
         default: ''
       dry_run:
-        description: 'Print the new pin and PR body without pushing'
+        description: 'Print the new pin, message and issue without pushing'
         type: boolean
         default: false
   pull_request:
@@ -25,6 +26,7 @@ on:
       - '.github/scripts/meta_llvm_update.py'
       - '.github/scripts/test_meta_llvm_bump.py'
       - '.github/workflows/meta-llvm-update.yml'
+      - '.github/workflows/_meta-llvm-line.yml'
 
 permissions:
   contents: read
@@ -47,56 +49,27 @@ jobs:
         working-directory: .github/scripts
         run: python3 -m pytest -q test_meta_llvm_bump.py
 
-  update:
-    if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: main
-            fork_branch: triton_beta
-          - target: release/3.8.x
-            fork_branch: triton_3.8.x
-    steps:
-      - name: Skip unrequested target
-        id: gate
-        run: echo "run=${{ inputs.target == '' || inputs.target == matrix.target }}" >> "$GITHUB_OUTPUT"
+  main:
+    if: >-
+      github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental' &&
+      (inputs.target == '' || inputs.target == 'main')
+    # read-all: the build check reuses wheels_fb.yml, which declares it.
+    permissions: read-all
+    uses: ./.github/workflows/_meta-llvm-line.yml
+    with:
+      target: main
+      fork_branch: triton_beta
+      dry_run: ${{ inputs.dry_run == true }}
+    secrets: inherit
 
-      - name: Mint app token
-        if: steps.gate.outputs.run == 'true'
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
-      - name: Check out updater scripts (default branch)
-        if: steps.gate.outputs.run == 'true'
-        uses: actions/checkout@v4
-        with:
-          path: updater
-          sparse-checkout: .github/scripts
-
-      - name: Check out target branch
-        if: steps.gate.outputs.run == 'true'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ matrix.target }}
-          path: target
-          token: ${{ steps.app-token.outputs.token }}
-          sparse-checkout: cmake
-
-      - name: Bump pin
-        if: steps.gate.outputs.run == 'true'
-        working-directory: target
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          python3 ../updater/.github/scripts/meta_llvm_update.py \
-            --target "${{ matrix.target }}" \
-            --fork-branch "${{ matrix.fork_branch }}" \
-            ${{ inputs.dry_run && '--dry-run' || '' }}
+  release-3-8:
+    if: >-
+      github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental' &&
+      (inputs.target == '' || inputs.target == 'release/3.8.x')
+    permissions: read-all
+    uses: ./.github/workflows/_meta-llvm-line.yml
+    with:
+      target: release/3.8.x
+      fork_branch: triton_3.8.x
+      dry_run: ${{ inputs.dry_run == true }}
+    secrets: inherit
