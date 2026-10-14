@@ -123,7 +123,7 @@ The result is A=2 / B=2, or A=2 / B=1 if the auxiliary estimate is larger.
 
 ## Interactions
 
-See `interactions.md`. Pairs where these limits decide the outcome:
+See [interactions.md](interactions.md). Pairs where these limits decide the outcome:
 - staging copies × `num_stages`
 - `EPILOGUE_SUBTILE` × staging copies
 - `BLOCK_M`/`BLOCK_N` × accumulator copies
