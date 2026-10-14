@@ -129,10 +129,8 @@ jobs:
             bash .ci/tritonbench/setup-nvidia-path.sh
           fi
           python install.py
-          # Dependencies may install a competing Triton distribution. The
-          # benchmark must use the wheel produced by this side's build job.
-          uv pip uninstall triton fbtriton pytorch-triton pytorch-triton-rocm triton-rocm
-          uv pip install --no-deps "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}/${WHEEL_FILENAME}"
+          uv pip install --group ci
+          # Print the pytorch, triton, and GPU name for debugging
           python - <<'PY'
           import torch
           import triton
