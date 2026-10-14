@@ -65,7 +65,6 @@ Reported but not located in code, so not in [hazards.md](hazards.md). Each needs
 | Doc | State | Note |
 |-----|-------|------|
 | [TMEMAllocationHeuristics.md](../TMEMAllocationHeuristics.md) "All TMEM buffers get `buffer.copy = 1`" | todo | Out of date: the heuristic planner's TMEM multi-buffering post-processing (`WSMemoryPlanner.cpp`) raises accumulator copies. |
-| [BarrierFusion.md](../BarrierFusion.md) | done | `optimizeTMALoads` mixed-group behavior. |
 
 ## Knob coverage
 
