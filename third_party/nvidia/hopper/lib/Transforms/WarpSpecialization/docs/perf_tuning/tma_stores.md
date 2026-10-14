@@ -31,32 +31,21 @@ Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). 
 ## Mechanism
 
 **Store partition placement.**
-- **What changes:**
-  - With `separate_epilogue_store`, partition layout creates a dedicated `epilogue_store` partition, and TMA stores, together with any op whose input comes from that partition, are scheduled into it.
-  - Without it, stores follow the epilogue target: the `epilogue` partition, or the merged partition when a `merge_epilogue*` attribute is set.
-  - Per-loop `tt.separate_epilogue_store` / `tt.merge_epilogue` attributes override the pass options.
-- **What it relieves:** the store wait and the staging handshake move off the partition that drains TMEM and does epilogue math.
+- **What changes:** with `separate_epilogue_store`, partition layout creates an `epilogue_store` partition and schedules TMA stores, plus any op whose input comes from that partition, into it. Without it, stores follow the epilogue target: the `epilogue` partition, or the merged partition when a `merge_epilogue*` attribute is set. Per-loop `tt.separate_epilogue_store` / `tt.merge_epilogue` attributes override the pass options.
+- **What it relieves:** the store wait and staging handshake move off the partition that drains TMEM and does epilogue math.
 - **What it costs:** one more partition (1 warp at minimum producer register budget), plus a cross-partition staging channel with full/empty barriers.
 - Code: `PartitionSchedulingMeta.cpp`, `createPartitionLayout` and `schedulePostLoopOps`.
 
 **Every annotated loop is partitioned on its own.**
-- **What changes:** partition scheduling walks every `scf.for` or `scf.while` that carries `warp_specialize`, including a loop nested inside another annotated loop. It schedules each one separately, inner loop first.
-- **What it costs:** if the inner K loop of a persistent GEMM also carries `warp_specialize=True`, it is partitioned before the outer tile loop. The outer loop's epilogue placement then works around a loop that is already partitioned.
+- **What changes:** partition scheduling separately schedules every `scf.for` or `scf.while` carrying `warp_specialize`, inner loop first, including one nested inside another annotated loop.
+- **What it costs:** if a persistent GEMM's inner K loop also carries `warp_specialize=True`, it is partitioned first, and the outer tile loop's epilogue placement works around an already-partitioned loop.
 - Code: `PartitionSchedulingMeta.cpp`, `runOnOperation`.
 
-**Staging ring and store waits.**
-- **What changes:** each TMA store is fed from an SMEM staging buffer the size of the stored tile (BLOCK_M x BLOCK_N / EPILOGUE_SUBTILE x output element size per copy). The subtile buffers of one store are fused into one ring.
-  - The planner grows the ring's copy count K in Phase 3.7, up to `min(num_stages, TRITON_WS_STAGING_COPIES)`, while it fits the SMEM budget.
-  - When the store is drained in the same partition, each wait lowers to `cp.async.bulk.wait_group(K-1)`, and K must divide the subtile count S. When it is drained in a different partition, it uses an mbarrier rotation and any K works.
-- **What it relieves:** with K > 1, the next subtile's `local_store` can proceed while earlier TMA stores drain.
-- **What it costs:** K x the subtile staging size of SMEM, taken from the same budget as the operand ring.
+**Staging ring and store waits** (shared mechanics in [epilogue.md](epilogue.md#mechanism)).
+- **What changes:** each TMA store is fed from a staging ring of BLOCK_M x BLOCK_N / EPILOGUE_SUBTILE x output element size per copy (one store's subtile buffers fused). Phase 3.7 grows its copy count K up to `min(num_stages, TRITON_WS_STAGING_COPIES)` within the SMEM budget. Same-partition drain: each wait is `cp.async.bulk.wait_group(K-1)` and K must divide the subtile count S. Different-partition drain: mbarrier rotation, any K.
+- **What it relieves:** with K > 1, the next subtile's `local_store` proceeds while earlier TMA stores drain.
+- **What it costs:** K x the subtile staging size of SMEM, from the same budget as the operand ring.
 - Code: `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` and `getStagingCopiesCap`; `WSTMAStoreLowering.cpp` (planned pending count = K-1). Background: [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), sections "Phase 3.5: TMA Staging Fusion" and "Phase 3.7: Epilogue Group Copy Increase".
-
-## When to try it (depends on the problem)
-
-- IF the kernel is a persistent GEMM, THEN prefer `warp_specialize=True` on the outer tile loop only, BECAUSE `PartitionSchedulingMeta::runOnOperation` walks annotated loops post-order, so an annotated inner K loop is partitioned first and on its own. [mechanism]
-
-Whether to use a separate store and how many staging copies to allow: measured rules in [epilogue.md](epilogue.md#when-to-try-it-depends-on-the-problem).
 
 ## Interactions
 
