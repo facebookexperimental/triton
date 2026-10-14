@@ -27,6 +27,10 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 | `two_ctas` × rhs-only scaled `tl.dot_scaled` | silently ignored | The dot is transposed, so 2-CTA is dropped with a warning | `AccelerateMatmul.cpp`, `ScaledBlockedToMMAv5` ("two_ctas=True is not supported when only the rhs ...") |
 | `two_ctas` × B from a descriptor (TMA) load | requires | Only a descriptor-loaded B is split into per-CTA halves (`BLOCK_N/2` each); other B operands skip the split with a debug log only. See `hazards.md` for the unsplit-B case | `third_party/nvidia/hopper/lib/Transforms/Transform2CTALoads.cpp` |
 | `two_ctas` × TMA (descriptor) output store, under Meta WS | requires | Pointer-store epilogues do not form the Meta WS epilogue partition; only descriptor stores and TMA copies count as epilogue stores | design doc: [2cta-autoWS-sync.md § Current Limitations](../../../../../../../../docs/design/2cta-autoWS-sync.md#current-limitations); `WS/PartitionSchedulingMeta.cpp`, `isEpilogueStoreOp` |
+| `two_ctas` × `BLOCK_N/2` < 16 | wrong answer (reproduced) | The B split is skipped with only a debug log while the MMA still reads half-width B; silent. See `hazards.md` | `third_party/nvidia/hopper/lib/Transforms/Transform2CTALoads.cpp`, `transformBLoad`, `transformSplitBLoad` |
+| `two_ctas` × pointer-loaded B, under Meta WS | compile error | "pipeliner doesn't know how to predicate this op" | `lib/Dialect/TritonGPU/Transforms/Pipeliner/PipeliningUtility.cpp`, `predicateOp` |
+| `two_ctas` × Meta WS off | wrong answer (reproduced) | A persistent non-WS 2-CTA GEMM is wrong on every run with a pointer-loaded B and on most runs with a descriptor-loaded B. See `hazards.md` | `third_party/nvidia/hopper/lib/Transforms/Insert2CTASync.cpp`; `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv5.cpp`, `convertDotImpl` |
+| `two_ctas` × `warp_specialize=False`, under Meta WS | hangs (reproduced) | The first iteration completes, then the kernel hangs. See `hazards.md` | same |
 | `two_ctas` × output staging copies (`TRITON_WS_STAGING_COPIES`, or depth from `num_stages`) | duplicate config | Ordinary TMA output staging is held at one copy under 2-CTA | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
 | `two_ctas` × a staging correctness floor > 1 | compile error | "2CTA ordinary TMA output staging requires one copy; the correctness floor requires N" | `WS/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
 | `two_ctas` × `num_stages` | works | The cross-CTA rendezvous barrier is multi-buffered to the MMA operand depth and indexed by the same slot and phase | `third_party/nvidia/hopper/lib/Transforms/Insert2CTASync.cpp`, `getOperandPipelineDepth`; design doc: [2cta-autoWS-sync.md § Current Limitations](../../../../../../../../docs/design/2cta-autoWS-sync.md#current-limitations) |
@@ -123,8 +127,6 @@ Tracked in [TRACKER.md](TRACKER.md).
 
 - `two_ctas` × `BLOCK_M=64` (`TwoCTA_RHS`): correctness not run.
 - `two_ctas` × `BLOCK_N=64`: an LLVM abort was observed; it may no longer reproduce now that the halved tile's swizzle is re-derived.
-- `two_ctas` × WS off or WS stripped, under Meta WS: a hang was observed; candidate cause is both 2-CTA sync protocols being applied.
-- `two_ctas` × non-descriptor B or `BLOCK_N/2` < 16: the B split is skipped, but the MMA still reads half-width B. Suspected wrong answer.
 - `two_ctas` × atomic dynamic scheduler: documented as unsupported (no cluster tile-claim protocol); not rejected in code; failure mode unknown.
 - `two_ctas` × `smem_alloc_algo=0`: the one-copy staging pin is only on the default allocator path.
 - dp=2 × `BLOCK_M=64`, `BLOCK_N=256` (N split): correctness not run.

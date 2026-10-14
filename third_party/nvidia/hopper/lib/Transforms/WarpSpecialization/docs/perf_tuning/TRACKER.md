@@ -9,9 +9,10 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | File | State | Note |
 |------|-------|------|
 | [`knobs.md`](knobs.md) | done | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it.  |
-| [`resources.md`](resources.md) | done | SMEM, TMEM and register budgets as pruning rules; links to the existing SMEM/TMEM/register docs for the mechanics. Open: its "Not yet established" items. |
+| [`resources.md`](resources.md) | done | SMEM, TMEM and register budgets as rules; links to the existing SMEM/TMEM/register docs for the mechanics. Open: its "Not yet established" items. |
 | [`interactions.md`](interactions.md) | done | Feature-pair table grouped by feature: pair \| status ("works", "compile error", "silently ignored", "duplicate config", "hangs", "wrong answer", "requires") \| mechanism + code location. Open: its "Not yet established" items. |
 | `hazards.md` | todo | Open wrong-answer and hang conditions, each with its trigger and code location. Entries are deleted when fixed. |
+| `shape_regimes.md` | todo | Routing index from derived shape quantities to the rules that key on them; no rules of its own. |
 
 ## Feature files
 
@@ -25,7 +26,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | `clc_persistence.md` | todo | Static persistent vs dynamic and CLC persistent. |
 | `tma_loads.md` | todo | TMA vs pointer operand loads. |
 | `tma_stores.md` | todo | TMA vs pointer output stores. |
-| `large_k.md` | todo | K iterations far above `num_stages`, including split-K style K splitting. |
+| `split_k.md` | todo | Splitting one output tile's K reduction (split-K, decomposeK, stream-K) and the single-K-tile path. |
 | `pingpong.md` | todo | Ping-pong scheduling. |
 | `multicast.md` | todo | TMA multicast. |
 | `epilogue_prologue_tma_loads.md` | todo | TMA loads of extra epilogue/prologue inputs. |
@@ -43,14 +44,63 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | done | Read in `Transform2CTALoads.cpp`. Documented in [BarrierFusion.md § 2-CTA Cooperative Loads](../BarrierFusion.md#2-cta-cooperative-loads-and-triton_disable_2cta_cooperative_loads). |
 | `maxnreg` under WS | done | `CUDAOptions.maxnreg`, `third_party/nvidia/backend/compiler.py`. Documented in [RegisterBudgets.md](../RegisterBudgets.md). |
 | `disallow_acc_multi_buffer` | done | `AutoWSLoopOptions` in `python/triton/language/core.py`. Documented in [AutoWSAnnotations.md § `disallow_acc_multi_buffer`](../AutoWSAnnotations.md#disallow_acc_multi_buffer). |
-| `loop_unroll_factor`, `disable_licm` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; generic loop transforms, not WS-specific. |
-| Descriptor loads/stores (kernel pattern) | todo | `tl.make_tensor_descriptor` or host `TensorDescriptor` with `desc.load` / `desc.store`: why autoWS expects TMA producer and store partitions. |
+| `loop_unroll_factor`, `disable_licm` | done | `AutoWSLoopOptions` in `python/triton/language/core.py`; generic loop transforms, not WS-specific. Documented in [AutoWSAnnotations.md § `loop_unroll_factor` and `disable_licm`](../AutoWSAnnotations.md#loop_unroll_factor-and-disable_licm). |
+| Descriptor loads/stores (kernel pattern) | done | `tl.make_tensor_descriptor` or host `TensorDescriptor` with `desc.load` / `desc.store`. Documented in [TMADescriptors.md](../TMADescriptors.md). |
 
 ## Fixes to existing docs
 
 | Doc | State | Note |
 |-----|-------|------|
 | [TMEMAllocationHeuristics.md](../TMEMAllocationHeuristics.md) "All TMEM buffers get `buffer.copy = 1`" | todo | Out of date: the heuristic planner's TMEM multi-buffering post-processing (`WSMemoryPlanner.cpp`) raises accumulator copies. |
+| [BarrierFusion.md](../BarrierFusion.md) | done | `optimizeTMALoads` mixed-group behavior. |
+
+## Knob coverage
+
+One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `covered` = named in a "Never try" or "When to try it" section of the linked files; `mentioned` = named elsewhere in a rules file only; `todo` = no rules yet.
+
+| Knob | Rules in | State |
+|------|----------|-------|
+| `num_stages` | [resources.md](resources.md#never-try-any-problem) | covered |
+| `num_stages` (per loop) | — | todo |
+| `flatten` | — | todo |
+| `disallow_acc_multi_buffer` | — | todo |
+| `loop_unroll_factor`, `disable_licm` | — | todo |
+| `warp_specialize` | — | mentioned |
+| `data_partition_factor` | — | mentioned |
+| `separate_epilogue_store` | — | mentioned |
+| `merge_epilogue` | — | todo |
+| `pingpongAutoWS` | — | todo |
+| `multi_cta` | — | todo |
+| `two_ctas` | — | todo |
+| `ctas_per_cga` | — | todo |
+| Tile scheduler | — | todo |
+| `clc` | — | todo |
+| `tt.autows` stage/order | — | todo |
+| Descriptor loads/stores | — | todo |
+| `multicast` (per load) | — | todo |
+| `multicast` | — | todo |
+| `auto_tma` / `auto_tma_device` | — | todo |
+| `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | — | todo |
+| Epilogue subtiling (ES) | — | mentioned |
+| `generate_subtiled_region` | — | todo |
+| `early_tma_store_lowering` | — | todo |
+| `tma_store_pipelining` | — | todo |
+| `TRITON_WS_STAGING_COPIES` | — | mentioned |
+| `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | — | todo |
+| `num_warps` | [resources.md](resources.md#never-try-any-problem) | covered |
+| `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
+| `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
+| `maxnreg` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `tmem_alloc_algo` | — | todo |
+| `smem_alloc_algo` | — | todo |
+| `smem_budget` | — | mentioned |
+| `smem_circular_reuse` | — | todo |
+| `tt.autows` channels | — | todo |
+| `mem_plan_pick` + `TRITON_WS_MEM_PLAN_TOPK` / `_PICK` | — | todo |
+| `TRITON_WS_SMEM_PLAN_SEARCH` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | — | todo |
+| `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | — | todo |
+| Alternative schedulers: `TRITON_USE_MODULO_SCHEDULE` (+ `TRITON_MODULO_*`), `TRITON_USE_JOINT_SCHEDULE`‡, `TRITON_USE_LLM_SCHEDULE`‡, `TRITON_USE_LIST_SCHEDULE` | — | todo |
 
 ## Other
 
