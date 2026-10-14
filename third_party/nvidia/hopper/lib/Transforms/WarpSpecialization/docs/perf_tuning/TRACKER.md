@@ -9,9 +9,10 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | File | State | Note |
 |------|-------|------|
 | `knobs.md` | todo | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it. |
-| `resources.md` | todo | SMEM, TMEM and register budgets as pruning rules; links to the existing SMEM/TMEM/register docs for the mechanics. |
+| `resources.md` | todo | SMEM, TMEM and register budgets as rules; links to the existing SMEM/TMEM/register docs for the mechanics. |
 | `interactions.md` | todo | Feature-pair table grouped by feature: pair \| status ("works", "compile error", "silently ignored", "duplicate config", "hangs", "wrong answer", "requires") \| mechanism + code location. |
 | `hazards.md` | todo | Open wrong-answer and hang conditions, each with its trigger and code location. Entries are deleted when fixed. |
+| `shape_regimes.md` | todo | Routing index from derived shape quantities to the rules that key on them; no rules of its own. |
 
 ## Feature files
 
@@ -25,7 +26,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | `clc_persistence.md` | todo | Static persistent vs dynamic and CLC persistent. |
 | `tma_loads.md` | todo | TMA vs pointer operand loads. |
 | `tma_stores.md` | todo | TMA vs pointer output stores. |
-| `large_k.md` | todo | K iterations far above `num_stages`, including split-K style K splitting. |
+| `split_k.md` | todo | Splitting one output tile's K reduction (split-K, decomposeK, stream-K) and the single-K-tile path. |
 | `pingpong.md` | todo | Ping-pong scheduling. |
 | `multicast.md` | todo | TMA multicast. |
 | `epilogue_prologue_tma_loads.md` | todo | TMA loads of extra epilogue/prologue inputs. |
@@ -43,13 +44,14 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | done | Read in `Transform2CTALoads.cpp`. Documented in [BarrierFusion.md § 2-CTA Cooperative Loads](../BarrierFusion.md#2-cta-cooperative-loads-and-triton_disable_2cta_cooperative_loads). |
 | `maxnreg` under WS | done | `CUDAOptions.maxnreg`, `third_party/nvidia/backend/compiler.py`. Documented in [RegisterBudgets.md](../RegisterBudgets.md). |
 | `disallow_acc_multi_buffer` | done | `AutoWSLoopOptions` in `python/triton/language/core.py`. Documented in [AutoWSAnnotations.md § `disallow_acc_multi_buffer`](../AutoWSAnnotations.md#disallow_acc_multi_buffer). |
-| `loop_unroll_factor`, `disable_licm` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; generic loop transforms, not WS-specific. |
-| Descriptor loads/stores (kernel pattern) | todo | `tl.make_tensor_descriptor` or host `TensorDescriptor` with `desc.load` / `desc.store`: why autoWS expects TMA producer and store partitions. |
+| `loop_unroll_factor`, `disable_licm` | done | `AutoWSLoopOptions` in `python/triton/language/core.py`; generic loop transforms, not WS-specific. Documented in [AutoWSAnnotations.md § `loop_unroll_factor` and `disable_licm`](../AutoWSAnnotations.md#loop_unroll_factor-and-disable_licm). |
+| Descriptor loads/stores (kernel pattern) | done | `tl.make_tensor_descriptor` or host `TensorDescriptor` with `desc.load` / `desc.store`. Documented in [TMADescriptors.md](../TMADescriptors.md). |
 
 ## Fixes to existing docs
 
 | Doc | State | Note |
 |-----|-------|------|
+| [BarrierFusion.md](../BarrierFusion.md) | done | `optimizeTMALoads` mixed-group behavior. |
 
 ## Other
 
