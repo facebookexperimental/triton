@@ -11,7 +11,7 @@ Two general rules apply to every entry:
 - These hazards are races or depend on layout, so a single passing run does not rule them out.
 - compute-sanitizer's racecheck and synccheck do not model mbarrier, TMA or tcgen05 ordering. They do not catch these hazards. See [DebuggingAccuracyAndDeadlocks.md](../DebuggingAccuracyAndDeadlocks.md), section "Process".
 
-### TMA tile read into registers, released without a proxy fence
+## TMA tile read into registers, released without a proxy fence
 
 - **Status:** from code inspection; not reproduced in testing. The IR does show the release arrive with no fence.
 - **Trigger:** a TMA-loaded SMEM buffer is read into registers in one partition (`local_load`) and then handed back to the TMA producer. The hand-back is either a token release or the release attached to a TMA-store wait. Typical sources:
@@ -24,7 +24,7 @@ Two general rules apply to every entry:
   - For comparison, `LowerAref.cpp`, `rewriteGetExitOp` emits the fence when a generic-proxy consumer releases a TMA-produced buffer.
   - `ProxyFenceInsertion.cpp` analyses one region at a time, so it never sees the reader and the writer, which sit in different partitions.
 
-### Single K tile with an additive epilogue loaded by TMA
+## Single K tile with an additive epilogue loaded by TMA
 
 - **Status:** reproduced. The same kernel is exact with a pointer-loaded epilogue input, with a K loop, or with warp specialization off.
 - **Trigger:** all of the following hold, under Meta WS:
@@ -36,15 +36,16 @@ Two general rules apply to every entry:
   - `Combine.cpp`, `CombineDotAddFPattern` (and `CombineDotAddIPattern` for integers) folds `dot(a, b, 0) + d` into `dot(a, b, d)` when the dot feeds the add directly. The addend therefore becomes an accumulator-init `tmem_store` in a different task from the MMA.
   - `WSCodePartition.cpp`, `insertAsyncComm`, operand-D guard-channel path: the builder's task IDs are left on the MMA's task. The plain `ProducerCommitOp` that follows is created without resetting them to the producer (`relation.first`), so the commit lands in the MMA partition.
 
-### TMA landing buffer smaller than 128 bytes, multi-buffered
+## TMA landing buffer smaller than 128 bytes, multi-buffered
 
+- **Status:** from code inspection; no reproducer yet.
 - **Trigger:** a descriptor load whose per-copy SMEM size is not a multiple of 128 bytes gets more than one copy from the planner. Example: a `[1, BLOCK_N / EPILOGUE_SUBTILE]` bf16 bias slice narrower than 64 elements, at `EPILOGUE_SUBTILE >= 2`.
 - **Symptom:** a misaligned-address fault at runtime.
 - **Code:**
   - `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` (Phase 3.7) and the copy assignment in `allocateSmemBuffers` never check the 128-byte TMA alignment.
   - The non-WS pipeliner does check it: `PipeliningUtility.cpp`, `canPipelineTMALoad` (`TMA_ALIGN`).
 
-### Atomic inside the warp-specialized tile loop with no partition
+## Atomic inside the warp-specialized tile loop with no partition
 
 - **Status:** reproduced.
 - **Trigger:** a `tl.atomic_*` (an `AtomicRMWOp`) inside the WS loop whose operands do not depend on the accumulator, so no partition reaches it, e.g. a counter `atomic_add(cnt, 1)` or adding a constant to a column. Atomics of accumulator-derived values (a column sum, a scalar sum) are kept and are exact.
@@ -55,7 +56,7 @@ Two general rules apply to every entry:
   - `WSAtomicBroadcast.cpp`, `classifyAtomic`: atomics with at most one task ID pass through unchanged.
   - `WSSpecialize.cpp`, `SpecializeOp`: an op that has no task ID and that no partition needs is not cloned into any partition, and the original loop is erased.
 
-### 2-CTA with an unsplit B
+## 2-CTA with an unsplit B
 
 - **Status:** reproduced. The same kernels as 1-CTA, and `BLOCK_N=32` as 2-CTA, are exact. A register-modified A is exact under 2-CTA, because A is promoted to TMEM (`PromoteLHSToTMem.cpp`, `LHSToTMem`).
 - **Trigger:** `tl.dot(..., two_ctas=True)` where the B split is skipped:
@@ -64,14 +65,14 @@ Two general rules apply to every entry:
 - **Symptom:** a silent wrong answer on every run, with no error or warning.
 - **Code:** `third_party/nvidia/hopper/lib/Transforms/Transform2CTALoads.cpp`: `runOnOperation` skips an MMA whose B is not from a descriptor load ("B not from descriptor load"), and `transformBLoad` / `transformSplitBLoad` skip when `halfN < 16` ("too small, skipping"). Both are debug logs only. The MMA lowering still reads a half-width B per CTA (`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv5.cpp`, `convertDotImpl`).
 
-### 2-CTA with the atomic dynamic tile scheduler
+## 2-CTA with the atomic dynamic tile scheduler
 
 - **Status:** reproduced. Static persistent + 2-CTA and dynamic + 1-CTA are exact.
 - **Trigger:** `DynamicPersistent1DScheduler` with `tl.dot(..., two_ctas=True)` under Meta WS.
 - **Symptom:** compiles silently, then a wrong answer or a hang at runtime.
 - **Code:** `python/triton/language/schedule.py`, `DynamicPersistent1DScheduler`: the tile claim is a per-CTA global atomic with no cluster-level claim, so the two CTAs of a pair can take different tiles; nothing rejects the combination at compile time. Design doc: [DynamicPersistentAutoWSGaps.md § 2-CTA Status](../DynamicPersistentAutoWSGaps.md#2-cta-status).
 
-### 2-CTA without warp specialization
+## 2-CTA without warp specialization
 
 - **Status:** reproduced.
 - **Trigger and symptom:**
@@ -80,14 +81,14 @@ Two general rules apply to every entry:
 - **Code:** without warp specialization, two 2-CTA synchronization schemes apply at once: the cross-CTA rendezvous inserted by `third_party/nvidia/hopper/lib/Transforms/Insert2CTASync.cpp` (`insertSyncBeforeMMA`; gated only on Meta WS, so it also runs after WS is stripped) and the cluster arrive the MMA lowering emits when the MMA is not inside a `ttg.warp_specialize` (`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv5.cpp`, `convertDotImpl`). Without Meta WS, `make_ttgir` never warp-specializes a cluster kernel (`third_party/nvidia/backend/compiler.py`).
 - **Also applies to:** any condition that silently strips warp specialization from a 2-CTA kernel (`num_warps` < 4, warp estimate > 16, a rejected replicated atomic).
 
-### Same-partition TMA staging floor that does not divide the subtile count
+## Same-partition TMA staging floor that does not divide the subtile count
 
 - **Status:** from code inspection; no reproducer yet.
 - **Trigger:** TMA-store staging is drained in the same partition with K copies, and S subtiles rotate through those copies. The planner's cross-stage correctness floor already forces K > 1, and S is not a multiple of K.
 - **Symptom:** a store can overwrite a staging slot before its TMA store has drained, giving a wrong answer.
 - **Code:** `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies`. It logs a debug-only warning ("wait_group rotation may be unsafe") and continues. The copy count can only be raised to values that divide S (see [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Phase 3.7: Epilogue Group Copy Increase"); a floor that already violates this is left alone.
 
-### auto_tma promotion drops the load mask
+## auto_tma promotion drops the load mask
 
 - **Status:** reproduced for all three cases below: each gives wrong elements with `auto_tma=True`, while `auto_tma=False` is exact.
 - **Trigger:** `auto_tma=True` (or `TRITON_AUTO_TMA=1`) promotes a pointer `tl.load` to a TMA descriptor load. Three cases are unsafe:
@@ -102,14 +103,14 @@ Two general rules apply to every entry:
   - `match1DOffset` peels a `remsi` by a kernel argument as the out-of-bounds idiom.
   - `findShapeArgForDim` falls back to a kernel-wide search for the first matching bound.
 
-### Plan search pins TMEM accumulator copies to 1
+## Plan search pins TMEM accumulator copies to 1
 
 - **Status:** reproduced. The in-tree test `test_autows_addmm_pointer_bias_single_k_tile` fails under plan search and passes without it; with K = 2 x BLOCK_K it passes either way.
 - **Trigger:** `TRITON_WS_SMEM_PLAN_SEARCH=1` on a persistent kernel with no K loop (K == BLOCK_K as a compile-time constant) and an epilogue input, with more tiles than SMs. Kernels with scaled MMA or a `SubtiledRegionOp` fall back to the heuristic planner and are not affected.
 - **Symptom:** a silent wrong answer on every run.
 - **Code:** `WSMemoryPlanner.cpp`: `allocateTmemBuffersViaSearch` stamps `buffer.copy=1` on every TMEM alloc. The heuristic allocator's TMEM multi-buffering post-processing gives a per-iteration accumulator one slot per in-flight iteration, because the loop scheduler can place its initialization and its epilogue load in different stages; plan search skips that step.
 
-### Relaxed operand-copy floor with a TMA-loaded epilogue input, several tiles per CTA
+## Relaxed operand-copy floor with a TMA-loaded epilogue input, several tiles per CTA
 
 - **Status:** reproduced. One tile per CTA is exact, and relaxed plans without the TMA-loaded epilogue input are exact. Root cause not yet located.
 - **Trigger:** all of the following, under Meta WS:
