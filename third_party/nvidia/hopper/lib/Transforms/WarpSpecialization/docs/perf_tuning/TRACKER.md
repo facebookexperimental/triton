@@ -111,6 +111,7 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 | [TMEMAllocationHeuristics.md](../TMEMAllocationHeuristics.md) "All TMEM buffers get `buffer.copy = 1`" | todo | Out of date: the heuristic planner's TMEM multi-buffering post-processing (`WSMemoryPlanner.cpp`) raises accumulator copies. |
 | [2cta-autoWS-sync.md](../../../../../../../../docs/design/2cta-autoWS-sync.md) "Current Limitations" | done | `BLOCK_M` fallback threshold is 64, not 128. |
 | [Overview.md](../Overview.md) | done | Ping-pong uses an mbarrier pair, not named barriers. |
+| [triton_tma_multicast.md](../../../../../../../../docs/design/triton_tma_multicast.md) | done | Multicast lowering is planned, not implemented. |
 | [BarrierFusion.md](../BarrierFusion.md) | done | `optimizeTMALoads` mixed-group behavior. |
 
 ## Knob coverage
