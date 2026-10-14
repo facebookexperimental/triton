@@ -24,42 +24,28 @@ Scope: how GEMM operands (A, B) reach SMEM under Meta WS (`TRITON_USE_META_WS=1`
 ## Mechanism
 
 **Single-use operand: TMA writes straight into the MMA buffer.**
-- **What changes:** when a descriptor load's only user is the MMA operand's `local_alloc` and its encoding is TMA-writable, `doConvertDescriptorLoadsToNVWS` makes the TMA write directly into that buffer.
-- **What it relieves:** there is no register traffic, no extra SMEM, and no consumer-side release barrier.
+- **What changes:** if a descriptor load's only user is the MMA operand's `local_alloc` and its encoding is TMA-writable, TMA writes directly into that buffer.
+- **What it relieves:** no register traffic, no extra SMEM, no consumer-side release barrier.
 - **What it costs:** one SMEM buffer per copy, sized from the descriptor block (BLOCK_M x BLOCK_K for A, BLOCK_N x BLOCK_K for B), not from K.
 - Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` and `getTMAWritableEncoding`.
 
 **Operand also read in registers (multi-consumer) pays for an extra buffer.**
-- **What changes:** when a descriptor load has any second user, for example a row reduction over A alongside the MMA, the load gets its own NVMMA landing buffer. Each register consumer reads it with a `local_load`.
-  - The MMA's copy is then fed from registers. For B (and for A when it cannot be promoted) it is a separate SMEM buffer written with generic stores in a compute partition. On sm100 a register-sourced A is normally promoted to TMEM instead (`PromoteLHSToTMem.cpp`, `LHSToTMem`), so no second SMEM buffer is needed for A.
-- **What it costs:**
-  - for B: two SMEM buffers per stage for that operand;
-  - a full register round trip;
-  - a partition-wide barrier on every release (next item).
-  - The register read of the TMA tile is the trigger for an unreproduced code-inspection hazard ([hazards.md](hazards.md#tma-tile-read-into-registers-released-without-a-proxy-fence)). Under 2-CTA, a register-modified B is not split and gives a wrong answer ([hazards.md](hazards.md#2-cta-with-an-unsplit-b)).
+- **What changes:** any second user (e.g. a row reduction over A alongside the MMA) gives the load its own NVMMA landing buffer, read by each register consumer with a `local_load`. The MMA's copy is then fed from registers: for B (and for A when it cannot be promoted) a separate SMEM buffer written with generic stores in a compute partition; on sm100 a register-sourced A is normally promoted to TMEM instead (`PromoteLHSToTMem.cpp`, `LHSToTMem`), so A needs no second SMEM buffer.
+- Same path for an operand cast in-kernel after a TMA load, e.g. fp32 loaded and truncated to bf16 for the MMA.
+- **What it costs:** for B, two SMEM buffers per stage; a full register round trip; a partition-wide barrier on every release (next item).
+- Hazards: the register read of the TMA tile triggers an unreproduced code-inspection hazard ([hazards.md](hazards.md#tma-tile-read-into-registers-released-without-a-proxy-fence)); under 2-CTA a register-modified B is not split and gives a wrong answer ([hazards.md](hazards.md#2-cta-with-an-unsplit-b)).
 - Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` (register-consumed path); `WSCodePartition.cpp`, `isChannelAnchorOp` (a `local_alloc` with a register source is a channel producer).
-- The same path applies to an operand that is cast in-kernel after a TMA load, e.g. fp32 loaded and truncated to bf16 for the MMA.
 
 **Each register-side release is a partition barrier.**
-- **What changes:** a consumer release and a producer commit both lower to a non-per-thread mbarrier arrive. That arrive is preceded by a `bar.sync` across the issuing partition, and then a leader thread arrives.
-- **What it costs:** every register-consumed TMA buffer adds one partition-wide barrier per release, i.e. per K step for an operand ring.
+- **What changes:** consumer release and producer commit both lower to a non-per-thread mbarrier arrive: a `bar.sync` across the issuing partition, then a leader-thread arrive.
+- **What it costs:** one partition-wide barrier per release (per K step for an operand ring) for every register-consumed TMA buffer.
 - Code: `WSLowerToken.cpp`, `processConsumerReleaseOp` and `processProducerCommitOp`; `BarrierOpToLLVM.cpp`, `ArriveBarrierOpConversion` (`perThread=false` path).
 
-**Pointer-loaded operands get no producer pipelining.**
-- **What changes:** the partition scheduler puts only `DescriptorLoadOp`/`DescriptorGatherOp` in the load partition. A pointer load runs in whichever compute partition uses it, and its SMEM copy becomes a register-written channel.
-- **What it relieves:** nothing. **What it costs:** that load issues and waits inside the consumer partition.
-- Code: `PartitionSchedulingMeta.cpp`, `categorizeLoads`.
+**Pointer-loaded operands get no producer pipelining.** Only `DescriptorLoadOp`/`DescriptorGatherOp` go to the load partition; a pointer load issues and waits inside the compute partition that uses it, and its SMEM copy becomes a register-written channel. Code: `PartitionSchedulingMeta.cpp`, `categorizeLoads`.
 
-**`auto_tma` turns eligible pointer loads into descriptor loads before warp specialization.** The promoted load then goes through the paths above. Eligibility, host versus device descriptors and the silent fallbacks are in [AutoTMAPromotion.md](../AutoTMAPromotion.md). The global `knobs.nvidia.auto_tma` is not in the compile cache key, so set `auto_tma=` per launch when comparing configs.
+**`auto_tma` turns eligible pointer loads into descriptor loads before warp specialization**, which then take the paths above. Eligibility, host versus device descriptors and silent fallbacks: [AutoTMAPromotion.md](../AutoTMAPromotion.md). The global `knobs.nvidia.auto_tma` is not in the compile cache key, so set `auto_tma=` per launch when comparing configs.
 
-**Out-of-bounds TMA reads return the descriptor's padding value.**
-- With the default `padding="zero"`, an operand tile that runs past M, N or K reads zeros. Masking M/N/K tails for TMA operands is therefore unnecessary for correctness. The output tail is discarded by the TMA store's bounds.
-- Code: `python/triton/tools/tensor_descriptor.py`, `TensorDescriptor`.
-
-## When to try it (depends on the problem)
-
-- IF B is read by both the MMA and register code, THEN size its stage as `slot_bytes = (BM + 2*BN)*BK*in_bytes` in the operand-depth fit ([tiles_and_stages.md](tiles_and_stages.md#mechanism), "Resulting operand depth"), and drop tiles whose depth comes out below 1, BECAUSE the MMA copy is a second, register-written B buffer per stage (`doConvertDescriptorLoadsToNVWS`, register-consumed path). [mechanism]
-- IF an operand is read by both the MMA and register code and the math allows moving that consumer onto the accumulator or the epilogue, THEN prefer the moved form, BECAUSE it removes the second buffer, the register round trip, and one partition `bar.sync` per release (`processConsumerReleaseOp`, non-per-thread arrive). [mechanism]
+**Out-of-bounds TMA reads return the descriptor's padding value.** With the default `padding="zero"`, operand tiles past M, N or K read zeros, so M/N/K tail masks on TMA operands are unnecessary for correctness; the output tail is discarded by the TMA store's bounds. Code: `python/triton/tools/tensor_descriptor.py`, `TensorDescriptor`.
 
 ## Interactions
 
