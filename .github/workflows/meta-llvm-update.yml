@@ -1,0 +1,102 @@
+name: Meta LLVM update
+# Opens one PR per release line when the Meta LLVM fork
+# (facebookexperimental/llvm-project) publishes a release newer than that line's
+# cmake/meta-llvm-info.json pin. Reads the fork anonymously; never lands anything.
+# Each PR is imported and landed through the usual flow.
+#
+# Scheduled workflows run from the default branch, so this one file serves every
+# target branch: it checks out main for the scripts and the target for the edit.
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target branch to check (blank = all)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Print the new pin and PR body without pushing'
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - '.github/scripts/meta_llvm_bump.py'
+      - '.github/scripts/meta_llvm_update.py'
+      - '.github/scripts/test_meta_llvm_bump.py'
+      - '.github/workflows/meta-llvm-update.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: meta-llvm-update-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'run' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install pytest
+      - name: Run updater tests
+        working-directory: .github/scripts
+        run: python3 -m pytest -q test_meta_llvm_bump.py
+
+  update:
+    if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: main
+            fork_branch: triton_beta
+          - target: release/3.8.x
+            fork_branch: triton_3.8.x
+    steps:
+      - name: Skip unrequested target
+        id: gate
+        run: echo "run=${{ inputs.target == '' || inputs.target == matrix.target }}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint app token
+        if: steps.gate.outputs.run == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Check out updater scripts (default branch)
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: updater
+          sparse-checkout: .github/scripts
+
+      - name: Check out target branch
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.target }}
+          path: target
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: cmake
+
+      - name: Bump pin
+        if: steps.gate.outputs.run == 'true'
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 ../updater/.github/scripts/meta_llvm_update.py \
+            --target "${{ matrix.target }}" \
+            --fork-branch "${{ matrix.fork_branch }}" \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
