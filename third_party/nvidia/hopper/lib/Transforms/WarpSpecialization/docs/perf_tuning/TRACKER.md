@@ -55,58 +55,58 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 
 ## Knob coverage
 
-One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `covered` = named in a "Never try" or "When to try it" section of the linked files; `mentioned` = named elsewhere in a rules file only; `todo` = no rules yet.
+One row per entry in [knobs.md](knobs.md). Priority (proposed, pending sign-off): explore P1 knobs first, then P1 + P2; "out of v0" knobs stay at their defaults for v0. Covered in: the files whose "Never try" or "Mechanism" section names the knob. `covered` = named there; `mentioned` = named elsewhere in a feature file only; `todo` = not covered yet.
 
-| Knob | Rules in | State |
-|------|----------|-------|
-| `BLOCK_M` | — | mentioned |
-| `BLOCK_N` | — | mentioned |
-| `BLOCK_K` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `num_stages` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `num_stages` (per loop) | — | todo |
-| `flatten` | — | todo |
-| `disallow_acc_multi_buffer` | — | todo |
-| `loop_unroll_factor`, `disable_licm` | — | todo |
-| `warp_specialize` | — | mentioned |
-| `data_partition_factor` | — | mentioned |
-| `separate_epilogue_store` | — | mentioned |
-| `merge_epilogue` | — | todo |
-| `merge_epilogue_to_computation`, `merge_correction` | — | todo |
-| `pingpongAutoWS` | — | todo |
-| `multi_cta` | — | todo |
-| `two_ctas` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `allowDependentTwoCTA` | — | todo |
-| `ctas_per_cga` | — | todo |
-| Tile scheduler | — | todo |
-| `clc` | — | todo |
-| `tt.autows` stage/order | — | todo |
-| Descriptor loads/stores | — | todo |
-| `multicast` (per load) | — | todo |
-| `multicast` | — | todo |
-| `auto_tma` / `auto_tma_device` | — | todo |
-| `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | — | todo |
-| Epilogue subtiling (ES) | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
-| `generate_subtiled_region` | — | todo |
-| `early_tma_store_lowering` | — | todo |
-| `tma_store_pipelining` | — | todo |
-| `TRITON_WS_STAGING_COPIES` | — | mentioned |
-| `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | — | todo |
-| `num_warps` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `maxnreg` | — | mentioned |
-| `sched4reg`, `enable_tree_reduction` | — | todo |
-| `tmem_alloc_algo` | — | todo |
-| `smem_alloc_algo` | — | todo |
-| `smem_budget` | — | mentioned |
-| `smem_circular_reuse` | — | todo |
-| `tt.autows` channels | — | todo |
-| `mem_plan_pick` + `TRITON_WS_MEM_PLAN_TOPK` / `_PICK` | — | todo |
-| `TRITON_WS_SMEM_PLAN_SEARCH` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | — | todo |
-| `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | — | todo |
-| Alternative schedulers: `TRITON_USE_MODULO_SCHEDULE` (+ `TRITON_MODULO_*`), `TRITON_USE_JOINT_SCHEDULE`‡, `TRITON_USE_LLM_SCHEDULE`‡, `TRITON_USE_LIST_SCHEDULE` | — | todo |
-| `list_schedule_pick` | — | todo |
+| Knob | Priority | Covered in | State |
+|------|----------|------------|-------|
+| `BLOCK_M` | P1 | — | mentioned |
+| `BLOCK_N` | P1 | — | mentioned |
+| `BLOCK_K` | P1 | [resources.md](resources.md#never-try-any-problem) | covered |
+| `num_stages` | P1 | [resources.md](resources.md#never-try-any-problem) | covered |
+| `num_stages` (per loop) | P2 | — | todo |
+| `flatten` | P1 | — | todo |
+| `disallow_acc_multi_buffer` | P2 | — | todo |
+| `loop_unroll_factor`, `disable_licm` | out of v0 | — | todo |
+| `warp_specialize` | P1 | — | mentioned |
+| `data_partition_factor` | P1 | — | mentioned |
+| `separate_epilogue_store` | P2 | — | mentioned |
+| `merge_epilogue` | P2 | — | todo |
+| `merge_epilogue_to_computation`, `merge_correction` | P2 | — | todo |
+| `pingpongAutoWS` | out of v0 | — | todo |
+| `multi_cta` | out of v0 | — | todo |
+| `two_ctas` | P1 | [resources.md](resources.md#never-try-any-problem) | covered |
+| `allowDependentTwoCTA` | out of v0 | — | todo |
+| `ctas_per_cga` | P1 | — | todo |
+| Tile scheduler | P1 | — | todo |
+| `clc` | out of v0 | — | todo |
+| `tt.autows` stage/order | out of v0 | — | todo |
+| Descriptor loads/stores | P1 | — | todo |
+| `multicast` (per load) | P2 | — | todo |
+| `multicast` | P2 | — | todo |
+| `auto_tma` / `auto_tma_device` | P2 | — | todo |
+| `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | out of v0 | — | todo |
+| Epilogue subtiling (ES) | P1 | — | mentioned |
+| `generate_subtiled_region` | P2 | — | todo |
+| `early_tma_store_lowering` | P2 | — | todo |
+| `tma_store_pipelining` | P2 | — | todo |
+| `TRITON_WS_STAGING_COPIES` | P2 | — | mentioned |
+| `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | P2 | — | todo |
+| `num_warps` | P1 | [resources.md](resources.md#never-try-any-problem) | covered |
+| `minRegAutoWS` | P2 | [resources.md](resources.md#never-try-any-problem) | covered |
+| `maxRegAutoWS` | P2 | [resources.md](resources.md#never-try-any-problem) | covered |
+| `maxnreg` | P2 | — | mentioned |
+| `sched4reg`, `enable_tree_reduction` | out of v0 | — | todo |
+| `tmem_alloc_algo` | out of v0 | — | todo |
+| `smem_alloc_algo` | out of v0 | — | todo |
+| `smem_budget` | P2 | — | mentioned |
+| `smem_circular_reuse` | out of v0 | — | todo |
+| `tt.autows` channels | out of v0 | — | todo |
+| `mem_plan_pick` + `TRITON_WS_MEM_PLAN_TOPK` / `_PICK` | out of v0 | — | todo |
+| `TRITON_WS_SMEM_PLAN_SEARCH` | out of v0 | [resources.md](resources.md#never-try-any-problem) | covered |
+| `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | out of v0 | — | todo |
+| `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | P2 | — | todo |
+| Alternative schedulers: `TRITON_USE_MODULO_SCHEDULE` (+ `TRITON_MODULO_*`), `TRITON_USE_JOINT_SCHEDULE`‡, `TRITON_USE_LLM_SCHEDULE`‡, `TRITON_USE_LIST_SCHEDULE` | out of v0 | — | todo |
+| `list_schedule_pick` | out of v0 | — | todo |
 
 ## Other
 
@@ -114,4 +114,12 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 |------|-------|------|
 | Inductor reference definition | todo | Definition pending. Until then `knobs.md` has no column for what Inductor sets. |
 | Leaves outside AutoWS | todo | cuBLAS or non-WS leaves; later. |
-| Multicast rules once lowering lands | todo | `multicast.md` has no when-to-try rules while multicast is inert; re-derive them from the planner conditions when the lowering is implemented. |
+| Multicast once lowering lands | todo | Multicast is inert in this tree; revisit `multicast.md` when the lowering is implemented. |
+
+## Experiments
+
+| Experiment | State | Note |
+|------------|-------|------|
+| Config reuse | todo | Reuse the same config instead of re-tuning, and check whether the reused config is still profitable. |
+| Separate the gains | todo | Report a fusion gain and a compiler-upgrade gain as separate steps (e.g. same config before and after an upgrade). |
+| Empty padding warps | todo | Worker warps are padded to whole warp groups and each padding warp still gets the minimum register budget; explore using them for work. |
