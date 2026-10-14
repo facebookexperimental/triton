@@ -72,6 +72,7 @@ Reported but not located in code, so not in [hazards.md](hazards.md). Each needs
 | [Overview.md](../Overview.md) | done | Ping-pong uses an mbarrier pair, not named barriers. |
 | [triton_tma_multicast.md](../../../../../../../../docs/design/triton_tma_multicast.md) | done | Multicast lowering is planned, not implemented. |
 | [BarrierFusion.md](../BarrierFusion.md) | done | `optimizeTMALoads` mixed-group behavior. |
+| [DynamicPersistentAutoWSGaps.md](../DynamicPersistentAutoWSGaps.md) | done | CLC flash-attention stage default is two. |
 
 ## Knob coverage
 

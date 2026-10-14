@@ -239,10 +239,16 @@ allow both CTAs to advance the global counter independently.
 The hardware CLC scheduler does provide cluster-level ownership. Clustered CLC
 state is now hoisted before the enclosing AutoWS operation and explicitly
 captured by all isolated worker regions. A 2-CTA outer-while matmul is covered
-end to end. The FA-forward integration is correct with one inner pipeline stage,
-but two or more stages currently fail synccheck with a missing wait on the QK
-MMA completion barrier. Until that pipeline carry/drain issue is fixed, the CLC
-FA configuration defaults both compiler and KV staging to one.
+end to end. The FA-forward integration is also covered with pipelined inner
+stages. The cross-CTA MMA rendezvous barrier's phase is linearized across the
+persistent `scf.while` and its nested loops. `computeLinearBarrierIter` in
+`Insert2CTASync.cpp` takes the while's iteration from the after-region counter
+that `findWhileIterationCounter` identifies as advancing by one per iteration,
+so the phase no longer restarts on each CLC tile. The CLC FA configuration in
+`third_party/tlx/tutorials/fused_attention_ws_device_tma.py` defaults both
+compiler and KV staging to two (`_FWD_CLC_SAFE_STAGES`; the non-CLC default is
+four). Both can be overridden with `AUTOWS_FWD_NUM_STAGES` and
+`AUTOWS_FWD_KV_NUM_STAGES`.
 
 ## Frontend and Configuration Gaps
 
