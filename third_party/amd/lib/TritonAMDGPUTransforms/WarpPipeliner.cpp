@@ -253,44 +253,45 @@ static bool canPlaceInStage(Operation *op) {
   return false;
 }
 
-// This is a cold compiler path. Plan placement before changing the block.
-// Reverse SSA order gives each unassigned user a stage before its producers.
-// In a straight-line scope, the earliest use sets the latest legal stage.
-// A fixed use (for example a wait) requires the producer's stage to end before
-// that use. Loop yields are uses at the end of this iteration, not backedges.
-static LogicalResult normalizeStageInputs(Operation *begin, Operation *end,
-                                          bool hasOwner) {
-  SmallVector<Stage> stages;
-  if (failed(collectStages(begin, end, stages)))
-    return failure();
-  if (stages.empty())
+// Owner recovery removes annotations when folding leaves one iteration.
+// Such a scope does not execute as a pipeline and needs no placement.
+static bool isSingleIterationOwner(Operation *begin, ArrayRef<Stage> stages,
+                                   bool hasOwner) {
+  if (!hasOwner)
+    return false;
+  auto originalCount =
+      begin->getPrevNode()->getAttrOfType<IntegerAttr>(kOwnerStageCountAttr);
+  return originalCount && stages.size() == originalCount.getInt();
+}
+
+static LogicalResult selectStageInputScope(Operation *&begin, Operation *&end,
+                                           ArrayRef<Stage> stages,
+                                           bool hasOwner) {
+  if (hasOwner || isa<scf::ForOp>(begin->getParentOp()))
     return success();
+  if (!isa<tt::FuncOp>(begin->getParentOp()))
+    return stages.front().begin->emitError(
+        "warp_pipeline_stage requires a loop body or a function block");
+  // Explicit boundaries keep a flat pipeline's prologue and epilogue out.
+  begin = stages.front().begin;
+  end = stages.back().end->getNextNode();
+  return success();
+}
 
-  if (hasOwner) {
-    auto originalCount =
-        begin->getPrevNode()->getAttrOfType<IntegerAttr>(kOwnerStageCountAttr);
-    // Owner recovery removes annotations when folding leaves one iteration.
-    // Such a scope does not execute as a pipeline and needs no placement.
-    if (originalCount && stages.size() == originalCount.getInt())
-      return success();
-  }
-
-  if (!hasOwner && !isa<scf::ForOp>(begin->getParentOp())) {
-    if (!isa<tt::FuncOp>(begin->getParentOp()))
-      return stages.front().begin->emitError(
-          "warp_pipeline_stage requires a loop body or a function block");
-    // Explicit boundaries keep a flat pipeline's prologue and epilogue out.
-    begin = stages.front().begin;
-    end = stages.back().end->getNextNode();
-  }
-
+static DenseMap<Operation *, unsigned>
+getFixedStagePlacement(ArrayRef<Stage> stages) {
   DenseMap<Operation *, unsigned> placement;
   for (auto [index, stage] : llvm::enumerate(stages))
     for (Operation *op = stage.begin; op != stage.end->getNextNode();
          op = op->getNextNode())
       placement[op] = index;
+  return placement;
+}
 
-  SmallVector<Operation *> inputs;
+static LogicalResult
+collectStageInputs(Operation *begin, Operation *end,
+                   const DenseMap<Operation *, unsigned> &placement,
+                   SmallVectorImpl<Operation *> &inputs) {
   for (Operation *op = begin; op && op != end; op = op->getNextNode()) {
     if (placement.contains(op) || canSitBetweenStages(op) ||
         op->hasTrait<OpTrait::IsTerminator>())
@@ -302,47 +303,69 @@ static LogicalResult normalizeStageInputs(Operation *begin, Operation *end,
           "layout conversion");
     inputs.push_back(op);
   }
+  return success();
+}
 
-  Block *block = begin->getBlock();
-  for (Operation *op : llvm::reverse(inputs)) {
-    unsigned latest = stages.size() - 1;
-    Operation *limitingUser = nullptr;
-    for (Operation *user : op->getUsers()) {
-      Operation *ancestor = block->findAncestorOpInBlock(*user);
-      if (!ancestor)
-        continue; // A use outside the scope follows it by SSA dominance.
-      auto it = placement.find(ancestor);
-      if (it != placement.end()) {
-        if (it->second <= latest) {
-          latest = it->second;
-          limitingUser = ancestor;
-        }
-      } else {
-        // Fixed operations cannot move. Find the last stage before this use.
-        while (!stages[latest].end->isBeforeInBlock(ancestor)) {
-          if (latest == 0) {
-            auto diag = op->emitError("no legal warp-pipeline stage for input");
-            diag.attachNote(user->getLoc())
-                << "this fixed use precedes every available stage";
-            return failure();
-          }
-          --latest;
-        }
+// In a straight-line scope, the earliest use sets the latest legal stage.
+// A fixed use (for example a wait) requires the producer's stage to end before
+// that use. Loop yields are uses at the end of this iteration, not backedges.
+static FailureOr<unsigned>
+findLatestInputStage(Operation *op, ArrayRef<Stage> stages,
+                     const DenseMap<Operation *, unsigned> &placement) {
+  unsigned latest = stages.size() - 1;
+  Operation *limitingUser = nullptr;
+  for (Operation *user : op->getUsers()) {
+    Operation *ancestor = op->getBlock()->findAncestorOpInBlock(*user);
+    if (!ancestor)
+      continue; // A use outside the scope follows it by SSA dominance.
+    auto it = placement.find(ancestor);
+    if (it != placement.end()) {
+      if (it->second <= latest) {
+        latest = it->second;
         limitingUser = ancestor;
       }
+    } else {
+      // Fixed operations cannot move. Find the last stage before this use.
+      while (!stages[latest].end->isBeforeInBlock(ancestor)) {
+        if (latest == 0) {
+          auto diag = op->emitError("no legal warp-pipeline stage for input");
+          diag.attachNote(user->getLoc())
+              << "this fixed use precedes every available stage";
+          return failure();
+        }
+        --latest;
+      }
+      limitingUser = ancestor;
     }
-    // Sink only. This preserves operand dominance and execution multiplicity.
-    // Producers assigned to the same stage will retain their original order.
-    if (!op->isBeforeInBlock(stages[latest].begin)) {
-      auto diag = op->emitError("no legal warp-pipeline stage for input");
-      if (limitingUser)
-        diag.attachNote(limitingUser->getLoc())
-            << "this use requires a stage before the input's original position";
-      return failure();
-    }
-    placement[op] = latest;
   }
+  // Sink only. This preserves operand dominance and execution multiplicity.
+  // Producers assigned to the same stage will retain their original order.
+  if (!op->isBeforeInBlock(stages[latest].begin)) {
+    auto diag = op->emitError("no legal warp-pipeline stage for input");
+    if (limitingUser)
+      diag.attachNote(limitingUser->getLoc())
+          << "this use requires a stage before the input's original position";
+    return failure();
+  }
+  return latest;
+}
 
+// Reverse SSA order gives each unassigned user a stage before its producers.
+static LogicalResult
+planStageInputs(ArrayRef<Operation *> inputs, ArrayRef<Stage> stages,
+                DenseMap<Operation *, unsigned> &placement) {
+  for (Operation *op : llvm::reverse(inputs)) {
+    FailureOr<unsigned> stage = findLatestInputStage(op, stages, placement);
+    if (failed(stage))
+      return failure();
+    placement[op] = *stage;
+  }
+  return success();
+}
+
+static void moveStageInputs(ArrayRef<Operation *> inputs,
+                            ArrayRef<Stage> stages,
+                            const DenseMap<Operation *, unsigned> &placement) {
   SmallVector<Operation *> anchors;
   for (Stage stage : stages)
     anchors.push_back(stage.begin);
@@ -351,6 +374,26 @@ static LogicalResult normalizeStageInputs(Operation *begin, Operation *end,
     op->moveAfter(anchor);
     anchor = op;
   }
+}
+
+// This is a cold compiler path. Plan placement before changing the block.
+static LogicalResult normalizeStageInputs(Operation *begin, Operation *end,
+                                          bool hasOwner) {
+  SmallVector<Stage> stages;
+  if (failed(collectStages(begin, end, stages)))
+    return failure();
+  if (stages.empty() || isSingleIterationOwner(begin, stages, hasOwner))
+    return success();
+  if (failed(selectStageInputScope(begin, end, stages, hasOwner)))
+    return failure();
+
+  DenseMap<Operation *, unsigned> placement = getFixedStagePlacement(stages);
+  SmallVector<Operation *> inputs;
+  if (failed(collectStageInputs(begin, end, placement, inputs)))
+    return failure();
+  if (failed(planStageInputs(inputs, stages, placement)))
+    return failure();
+  moveStageInputs(inputs, stages, placement);
   return success();
 }
 
