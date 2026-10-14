@@ -5,7 +5,7 @@ Scope: techniques that split one output tile's K reduction across more than one 
 - what source-level split-K looks like under warp specialization;
 - the K-dimension facts that decide whether splitting is legal or useful, including the separate compile path taken when K fits in one tile.
 
-The regime that routes here is long K with few output tiles: many `K / BLOCK_K` iterations and fewer output tiles than SMs. See `shape_regimes.md`. Inductor's decompose-K (a cuBLAS bmm plus a reduction, chosen above a K threshold) lives outside this directory and is not described here. Stream-K has no compiler support (see Mechanism).
+The regime that routes here is long K with few output tiles: many `K / BLOCK_K` iterations and fewer output tiles than SMs. See [shape_regimes.md](shape_regimes.md). Inductor's decompose-K (a cuBLAS bmm plus a reduction, chosen above a K threshold) lives outside this directory and is not described here. Stream-K has no compiler support (see Mechanism).
 
 ## Knobs
 
