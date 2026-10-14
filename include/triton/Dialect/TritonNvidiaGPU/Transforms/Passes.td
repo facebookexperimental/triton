@@ -386,6 +386,25 @@ def TritonNvidiaGPUPromoteMBarrierToNamedBarrierPass
   ];
 }
 
+def TritonNvidiaGPUVerifyNamedBarrierCountsPass
+    : Pass<"triton-nvidia-gpu-verify-named-barrier-counts", "mlir::ModuleOp"> {
+  let summary = "Verify compiler-allocated named barrier participant counts";
+
+  let description = [{
+    Recomputes the expected participant count of every compiler-allocated
+    named barrier from its arrive/wait use sites and the current task sizes,
+    failing compilation on mismatch. Catches counts baked before partition
+    warp sizes were final, which would otherwise deadlock at `bar.sync`.
+    User-allocated barriers and dynamically selected handles are skipped.
+  }];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-cta", "mlir::ModuleOp"> {
   let summary = "Verify legal and consistent two_ctas usage across matmuls";
 

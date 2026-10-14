@@ -1141,4 +1141,80 @@ public:
   }
 };
 
+#define GEN_PASS_DEF_TRITONNVIDIAGPUVERIFYNAMEDBARRIERCOUNTSPASS
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
+
+class TritonNvidiaGPUVerifyNamedBarrierCountsPass
+    : public impl::TritonNvidiaGPUVerifyNamedBarrierCountsPassBase<
+          TritonNvidiaGPUVerifyNamedBarrierCountsPass> {
+public:
+  using TritonNvidiaGPUVerifyNamedBarrierCountsPassBase::
+      TritonNvidiaGPUVerifyNamedBarrierCountsPassBase;
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(module);
+
+    WalkResult result = module.walk([&](ttg::WarpSpecializeOp wsOp) {
+      // Compiler ids are module-unique, so grouping within one
+      // warp_specialize op recovers each promoted barrier exactly.
+      DenseMap<int32_t, SmallVector<Operation *>> groups;
+      wsOp.walk([&](Operation *op) {
+        Value bar;
+        if (auto arrive = dyn_cast<ttng::NamedBarrierArriveOp>(op))
+          bar = arrive.getBar();
+        else if (auto wait = dyn_cast<ttng::NamedBarrierWaitOp>(op))
+          bar = wait.getBar();
+        else
+          return;
+        auto idOp = bar.getDefiningOp<ttng::CompilerNamedBarrierIdOp>();
+        if (!idOp)
+          return;
+        APInt id;
+        if (!matchPattern(idOp.getValue(), m_ConstantInt(&id)))
+          return;
+        groups[static_cast<int32_t>(id.getSExtValue())].push_back(op);
+      });
+
+      for (auto &[id, ops] : groups) {
+        (void)id;
+        llvm::SmallDenseSet<Region *, 4> tasks;
+        bool allInTasks = true;
+        for (Operation *op : ops) {
+          Region *task = getWarpSpecializeTaskRegion(op);
+          if (!task) {
+            allInTasks = false;
+            break;
+          }
+          tasks.insert(task);
+        }
+        if (!allInTasks)
+          continue;
+        unsigned expected = 0;
+        for (Region *task : tasks)
+          expected += ttg::lookupNumWarps(task) * threadsPerWarp;
+        for (Operation *op : ops) {
+          Value count =
+              isa<ttng::NamedBarrierArriveOp>(op)
+                  ? cast<ttng::NamedBarrierArriveOp>(op).getNumThreads()
+                  : cast<ttng::NamedBarrierWaitOp>(op).getNumThreads();
+          APInt baked;
+          if (!matchPattern(count, m_ConstantInt(&baked)))
+            continue;
+          if (baked.getZExtValue() == expected)
+            continue;
+          op->emitOpError()
+              << "named barrier participant count mismatch: baked "
+              << baked.getZExtValue() << " threads but participating tasks "
+              << "now require " << expected;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      signalPassFailure();
+  }
+};
+
 } // namespace mlir::triton::nvidia_gpu
