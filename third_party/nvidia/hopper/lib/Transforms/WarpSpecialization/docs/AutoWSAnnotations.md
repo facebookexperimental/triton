@@ -47,7 +47,7 @@ AutoWS inventory.
 | `num_stages` | `tt.num_stages` | `AssignLatencies`, `SoftwarePipeliner` | software-pipeline depth |
 | `warp_specialize` | `tt.warp_specialize` | `ScheduleLoops` → `PartitionSchedulingMeta` | marks the loop for WS |
 | `data_partition_factor` | `tt.data_partition_factor` | `PartitionSchedulingMeta`, `WSDataPartition` | # consumer slices along M/N |
-| `loop_unroll_factor` | `tt.loop_unroll_factor` | `LoopUnroll` (TTIR) | IR-level unroll |
+| `loop_unroll_factor` | `tt.loop_unroll_factor` | `LoopUnroll` (TTIR) | IR-level unroll; see [below](#loop_unroll_factor-and-disable_licm) |
 | `flatten` | `tt.flatten` | `FuseNestedLoops` | flatten a loop nest |
 | `disallow_acc_multi_buffer` | `tt.disallow_acc_multi_buffer` | `AssignLatencies`, `WSMemoryPlanner` (SMEM floor), upstream WS | keep acc single-buffered; see [below](#disallow_acc_multi_buffer) |
 | `multi_cta` | `tt.multi_cta` | multi-CTA reduction | cluster-level reduction |
@@ -55,7 +55,7 @@ AutoWS inventory.
 | `separate_epilogue_store` | `tt.separate_epilogue_store` | `PartitionSchedulingMeta` | epilogue store gets own partition |
 | `tmem_alloc_algo` / `smem_alloc_algo` / `smem_budget` / `smem_circular_reuse` | `tt.{tmem,smem}_alloc_algo`, `tt.smem_budget`, `tt.smem_circular_reuse` | `WSMemoryPlanner` | allocation heuristics |
 | `list_schedule_pick` / `mem_plan_pick` | `tt.list_schedule_pick` / `tt.mem_plan_pick` | list scheduler / `WSMemoryPlanner` | ranked schedule and memory-plan selection |
-| `disable_licm` | `llvm.loop_annotation` | LICM | suppress hoisting |
+| `disable_licm` | `llvm.loop_annotation` | LLVM LICM (not `triton-licm`) | suppress hoisting; see [below](#loop_unroll_factor-and-disable_licm) |
 
 See `PartitionSchedulingMeta.md` for how the `merge_*` / `separate_epilogue_store`
 knobs shape the partition layout.
@@ -115,6 +115,85 @@ Fallbacks:
   `smemBudget`, `relaxCopySafetyFloorToBudget` gives the copies back one at a
   time, largest buffer first. It never goes below the pre-floor count. The
   only record is an `LDBG` line under `-debug-only=nvgpu-ws-memory-planner`.
+
+## `loop_unroll_factor` and `disable_licm`
+
+Neither knob is specific to warp specialization. Both are generic loop
+transforms that act on the loop before or after AutoWS sees it, so this
+section only covers how they interact with AutoWS.
+
+### `loop_unroll_factor`
+
+| Property | Behavior |
+|---|---|
+| How it is set | `tl.range(..., loop_unroll_factor=N)` or the same kwarg on `tl.condition`. |
+| IR | `tt.loop_unroll_factor` (int32). Only emitted when the value is not `None`. |
+| Legal values | Any int. Values `<= 1` mean "do not unroll". |
+| Default | `None` (no unroll). |
+| Consumer | `LoopUnrollPass` (`lib/Dialect/Triton/Transforms/LoopUnroll.cpp`), added by `make_ttir` as the last TTIR pass (`add_loop_unroll`). |
+
+The pass handles `scf.for` only. On a `tl.condition` loop it takes effect only
+if `triton-uplift-while-to-for`, which runs earlier in `make_ttir` and copies
+the loop's discardable attributes onto the new `scf.for`, could prove the loop
+countable. Otherwise the attribute is ignored.
+
+For each annotated loop, the pass removes `tt.loop_unroll_factor` and calls
+MLIR's `loopUnrollByFactor`. If that produces a remainder loop, the pass sets
+`tt.num_stages = 1` on it.
+
+Because unrolling happens at TTIR time, AutoWS never sees the original loop.
+It sees the unrolled one, with these consequences:
+
+- **Larger loop body.** The unrolled body holds `N` copies of each load, MMA
+  and store. Partition scheduling, channel creation, and the memory planner
+  treat each copy as a separate op. Each copied descriptor load is its own
+  channel with its own SMEM buffer, multi-buffered against `smemBudget`.
+- **Remainder loop.** The pass removes only `tt.loop_unroll_factor`. Both the
+  unrolled loop and the remainder loop keep every other attribute, including
+  `tt.warp_specialize`. The pass pins the remainder loop to one pipeline stage.
+- **Persistent WS loops: compile error (reproduced).** `loop_unroll_factor=2`
+  on a persistent warp-specialized loop fails in code partitioning with "SMEM
+  circular reuse group is ill-formed" (`WSCodePartition.cpp`).
+- **Not forwarded.** The attribute is registered as `NotForwarded` in
+  `DiscardableAttributes.cpp` (`kAutoWSLoopAttrs`), so the non-persistent
+  single-trip-while rewrite does not copy it onto inner loops. By then it has
+  already been consumed anyway.
+
+Resources: SMEM, through the extra per-copy channels and buffers. Registers,
+through the larger body in each partition. No direct TMEM or warp-count
+effect.
+
+### `disable_licm`
+
+| Property | Behavior |
+|---|---|
+| How it is set | `tl.range(..., disable_licm=True)` or the same kwarg on `tl.condition`. |
+| IR | `llvm.loop_annotation` holding an `LLVM::LoopAnnotationAttr` with LICM disabled (`get_disable_loop_licm_attr` in `python/src/ir.cc`). Only emitted when `True`. |
+| Default | `False` |
+| Consumer | LLVM: `fixUpLoopAnnotation` (`lib/Conversion/TritonGPUToLLVM/Utility.cpp`) re-attaches the annotation to the lowered branch, which becomes `llvm.licm.disable` loop metadata in the LLVM IR. |
+
+The Triton TTIR LICM pass (`triton-licm`,
+`lib/Dialect/Triton/Transforms/LoopInvariantCodeMotion.cpp`) does not read the
+annotation. Loop-invariant code is still hoisted at TTIR/TTGIR time, including
+by the `add_triton_licm` calls that run before AutoWS. The knob only stops
+LLVM's LICM on the final loop.
+
+Interaction with AutoWS:
+
+- **Copied to every partition.** When `specializeRegion` clones a loop into
+  each partition (`WSSpecialize.cpp`, the `scf.for` and `scf.while` cloning
+  paths), it copies every attribute except `async_task_id`. Each partition's
+  copy of the loop therefore keeps the annotation.
+- **Not forwarded to inner loops.** It is `NotForwarded` in
+  `kAutoWSLoopAttrs`, so the non-persistent single-trip-while rewrite does not
+  move it to the inner `scf.for`.
+- **Already on for the WS dispatch loop.** Independent of this knob,
+  `lowerWarpSpecializeCommon` (`WarpSpecializeUtility.cpp`, `disableLICM`)
+  always puts LICM-disable metadata on the switch loop that dispatches warps
+  to partitions.
+
+Resources: registers only. Code that LLVM would have hoisted is no longer kept
+live across the loop.
 
 ## Operation scheduling annotations
 
