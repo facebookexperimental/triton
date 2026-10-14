@@ -62,11 +62,11 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 |------|----------|-------|
 | `BLOCK_M` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
 | `BLOCK_N` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
-| `BLOCK_K` | — | mentioned |
+| `BLOCK_K` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `num_stages` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `num_stages` (per loop) | — | todo |
 | `flatten` | — | todo |
-| `disallow_acc_multi_buffer` | — | mentioned |
+| `disallow_acc_multi_buffer` | — | todo |
 | `loop_unroll_factor`, `disable_licm` | — | todo |
 | `warp_specialize` | — | mentioned |
 | `data_partition_factor` | — | mentioned |
@@ -103,7 +103,7 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `smem_circular_reuse` | — | todo |
 | `tt.autows` channels | — | todo |
 | `mem_plan_pick` + `TRITON_WS_MEM_PLAN_TOPK` / `_PICK` | — | todo |
-| `TRITON_WS_SMEM_PLAN_SEARCH` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `TRITON_WS_SMEM_PLAN_SEARCH` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | — | todo |
 | `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | — | todo |
 | Alternative schedulers: `TRITON_USE_MODULO_SCHEDULE` (+ `TRITON_MODULO_*`), `TRITON_USE_JOINT_SCHEDULE`‡, `TRITON_USE_LLM_SCHEDULE`‡, `TRITON_USE_LIST_SCHEDULE` | — | todo |
