@@ -60,14 +60,6 @@ Reported but not located in code, so not in [hazards.md](hazards.md). Each needs
 | Two K steps per loop body over a shared operand | todo | **Trigger:** two TMA loads of the same operand and two MMAs per loop body, with a deferred reduction. **Symptom:** sparse, large corruption at larger shapes. |
 | Data partitioning with generated subtiled regions and a subtiled scale | todo | **Trigger:** `data_partition_factor=2`, `generate_subtiled_region` on, and a per-subtile scale in the epilogue. **Symptom:** a hang. |
 
-## Measured hypotheses pending (autows_gemm.py campaign)
-
-Each row becomes a [measured] rule in its file when the benchmark verdict for its family arrives (`python/test/microbenchmark/autows_gemm.py`): a confirmed threshold becomes skip/only try, a moved threshold becomes prefer, an unsupported one is dropped.
-
-| Family | Lands in | Hypothesis | State |
-|--------|----------|------------|-------|
-| H-RIDGE | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | Calibrate ridge in: **IF** `AI_min >= ridge`, **THEN** prefer tiles in decreasing `I_t = BM*BN/(BM + BN')` (`BN' = BN/2` under 2-CTA): 2-CTA 128x256 and 1-CTA 256x256 dp=2 (128) > 128x256, 256x128, 2-CTA 128x128 (85) > 128x128 (64) > 64x256 (51) > 64x128 (43), **BECAUSE** operand SMEM fill per FLOP is `1/I_t` (slot sizes in "Mechanism"). | todo |
-
 ## Fixes to existing docs
 
 | Doc | State | Note |
