@@ -17,7 +17,7 @@ on:
         type: string
 
 env:
-  NIGHTLY_WORKFLOW_NAME: Meta Triton B200 Tests
+  GPU_WORKFLOW_NAME: Meta Triton B200 Tests
   MAX_JOBS: 32
   TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
@@ -120,7 +120,7 @@ jobs:
         if: always() && github.event_name == 'schedule' && failure()
         run: |
           BUCKET="b200-tritonbench"
-          TITLE="[nightly] ${NIGHTLY_WORKFLOW_NAME} / b200-tritonbench-test / ${BUCKET}"
+          TITLE="[nightly] ${GPU_WORKFLOW_NAME} / b200-tritonbench-test / ${BUCKET}"
           FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"b200-tritonbench-test","summary":"TritonBench tests failed on B200 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
@@ -253,7 +253,7 @@ jobs:
           python3 .github/scripts/parse_junit_failures.py \
             --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml /tmp/tlx-codegen.xml \
             --budget /tmp/tlx-core.xml=90 --budget /tmp/tlx-correctness.xml=30 --budget /tmp/tlx-codegen.xml=30 \
-            --workflow "${NIGHTLY_WORKFLOW_NAME}" \
+            --workflow "${GPU_WORKFLOW_NAME}" \
             --job "b200-tlx-test" \
             ${FAILED_FLAG}
 
@@ -361,7 +361,7 @@ jobs:
           fi
           python3 .github/scripts/parse_junit_failures.py \
             --junit /tmp/torchtlx.xml /tmp/torchtlx_perf.xml \
-            --workflow "${NIGHTLY_WORKFLOW_NAME}" \
+            --workflow "${GPU_WORKFLOW_NAME}" \
             --job "b200-torchtlx-test" \
             ${FAILED_FLAG}
 
@@ -440,7 +440,7 @@ jobs:
           python3 .github/scripts/parse_junit_failures.py \
             --junit /tmp/gluon.xml \
             --budget /tmp/gluon.xml=50 \
-            --workflow "${NIGHTLY_WORKFLOW_NAME}" \
+            --workflow "${GPU_WORKFLOW_NAME}" \
             --job "b200-gluon-test" \
             ${FAILED_FLAG}
 
