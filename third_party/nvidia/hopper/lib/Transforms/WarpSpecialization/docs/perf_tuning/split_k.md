@@ -26,42 +26,23 @@ The regime that routes here is long K with few output tiles: many `K / BLOCK_K` 
 ## Mechanism
 
 **Within autoWS, K is reduced serially per output tile (no compiler split-K or stream-K).**
-- **What changes:** nothing in the WS pipeline splits K. No split-K or stream-K exists in the warp-specialization passes. Each output tile's whole K range is accumulated by one CTA, one MMA per K step, into one TMEM accumulator.
-- **What it costs:**
-  - latency per tile grows linearly with `cdiv(K, BLOCK_K)`;
-  - when tiles are fewer than SMs, the extra SMs stay idle;
-  - accumulation error grows with the number of serial K steps.
-- Code: absence in `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/` and `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/`.
+- **What changes:** nothing; the warp-specialization passes have no split-K or stream-K. One CTA accumulates each output tile's whole K range, one MMA per K step, into one TMEM accumulator. Code: absence in `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/` and `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/`.
+- **What it costs:** latency per tile grows linearly with `cdiv(K, BLOCK_K)`; when tiles are fewer than SMs, the extra SMs stay idle; accumulation error grows with the number of serial K steps.
 
 **Source-level split-K under warp specialization.**
-- **What changes:** the persistent tile loop runs over `SPLIT_K x (M/BLOCK_M) x (N/BLOCK_N)` tiles. Each tile accumulates a K slice and TMA-stores its partial into a `(SPLIT_K * M, N)` workspace. A second, non-WS kernel sums the slabs.
-- **What it relieves:** K-bound skinny problems get SPLIT_K times more tiles to fill the SMs, and each tile's serial K chain is shorter.
-- **What it costs:**
-  - a workspace of `SPLIT_K x M x N` elements;
-  - a second kernel launch and its memory traffic;
-  - every split pays the full epilogue.
-- It is legal only when the epilogue is linear in the accumulator. A per-row normalization or nonlinearity applied over the full K sum cannot be split.
+- **What changes:** the persistent tile loop runs over `SPLIT_K x (M/BLOCK_M) x (N/BLOCK_N)` tiles; each accumulates a K slice and TMA-stores its partial into a `(SPLIT_K * M, N)` workspace; a second, non-WS kernel sums the slabs.
+- **What it relieves:** K-bound skinny problems get SPLIT_K times more tiles to fill the SMs, and a shorter serial K chain per tile.
+- **What it costs:** a workspace of `SPLIT_K x M x N` elements; a second kernel launch and its memory traffic; the full epilogue in every split.
+- Legal only when the epilogue is linear in the accumulator: a per-row normalization or nonlinearity over the full K sum cannot be split.
 
 **Operand SMEM is sized by BLOCK_K, not by K.**
-- **What changes:** each stage of the A/B ring is a descriptor-block-sized buffer (BLOCK_M x BLOCK_K and BLOCK_N x BLOCK_K). When K < BLOCK_K, TMA zero-fills the extra K columns. The MMA over the padded K is correct, but the SMEM, the TMA bytes and the MMA work are still paid at every stage.
+- **What changes:** each A/B ring stage is a descriptor-block-sized buffer (BLOCK_M x BLOCK_K, BLOCK_N x BLOCK_K). When K < BLOCK_K, TMA zero-fills the extra K columns: the MMA is correct, but the SMEM, TMA bytes and MMA work are still paid at every stage.
 - Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` (buffer type from the descriptor block); `python/triton/tools/tensor_descriptor.py`, `TensorDescriptor` (`padding="zero"`).
 
-**No K loop takes a separate compile path.** This needs K to be a compile-time constant (`tl.constexpr`) <= BLOCK_K, so that the IR has no K loop; a runtime K launched with K <= BLOCK_K keeps its loop.
-- **What changes:** there is no K loop, so:
-  - `CombineDotAddFPattern` folds an additive epilogue such as a bias into the dot's accumulator initialization;
-  - the per-tile TMEM accumulator, written by a `tmem_store` at the top of every tile iteration, is multi-buffered across tiles by the memory planner.
-- **What it costs:** this path has its own hazards, listed below. Correctness sweeps must include `k_tiles = 1` in addition to `k_tiles > 1`.
+**No K loop takes a separate compile path.** Needs a compile-time K (`tl.constexpr`) <= BLOCK_K, so the IR has no K loop; a runtime K launched with K <= BLOCK_K keeps its loop.
+- **What changes:** `CombineDotAddFPattern` folds an additive epilogue (e.g. a bias) into the dot's accumulator initialization; the per-tile TMEM accumulator, written by a `tmem_store` at the top of every tile iteration, is multi-buffered across tiles by the memory planner.
+- **What it costs:** its own hazards, listed below; correctness sweeps must include `k_tiles = 1` as well as `k_tiles > 1`.
 - Code: `Combine.cpp`, `CombineDotAddFPattern`; `WSMemoryPlanner.cpp`, TMEM copy assignment for accumulators whose first access in the body is a `tmem_store`.
-
-## When to try it (depends on the problem)
-
-`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
-
-- IF the epilogue applies a per-row or nonlinear function of the full K sum, THEN skip split-K, BECAUSE the epilogue is not linear in the partial sums. [mechanism]
-- IF `T >= P` at S = 1, THEN skip split-K; IF `T < P`, THEN try only S with `T*(S-1) < P` and `k_iters/S >= 4`, BECAUSE each one-wave split shortens the serial K chain (one CTA accumulates its whole K range in TMEM), while every extra split costs `S*M*N*ws_bytes` written and read again by the reduce kernel. [mechanism]
-- IF `AI_min < 300` FLOP/B (`ridge`), THEN prefer configs with `T >= P` (smaller tiles or split-K) over larger tiles, BECAUSE a memory-bound GEMM needs every SM issuing loads to reach HBM bandwidth. [mechanism]
-- **IF** `T <= 64` and `k_iters >= 32`, **THEN** only try split-K formulations, **BECAUSE** the shorter serial K chain outweighs the workspace round trip. [measured: --regime splitk, wins on every shape]
-- **IF** `T >= 128`, **THEN** prefer no split-K (the crossing is near `T` = 100-128, not `P/2`), **BECAUSE** with most SMs busy the workspace round trip dominates. [measured: --regime splitk, wins on a majority of shapes]
 
 ## Interactions
 

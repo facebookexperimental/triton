@@ -36,44 +36,22 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 ## Mechanism
 
 **Static persistent.**
-- Grid = min(programs, tiles). Program p walks tiles p, p+P, p+2P, ... (`StaticPersistent1DScheduler`).
-- The outer `while` is uplifted to an `scf.for`, so every loop annotation takes effect ([AutoWSAnnotations.md, "Status on `scf.while` (current gaps)"](../AutoWSAnnotations.md#status-on-scfwhile-current-gaps)).
-- **Relieves:** launch cost per tile. It also lets the accumulator double buffer and the store partition overlap tile i's epilogue with tile i+1's mainloop.
-- **Costs:** a fixed tail. The slowest program runs ceil(tiles/P) tiles, so when tiles mod P is small, the last wave leaves SMs idle. Uneven per-tile work is not rebalanced.
+- Grid = min(programs, tiles); program p walks tiles p, p+P, p+2P, ... (`StaticPersistent1DScheduler`). The outer `while` is uplifted to an `scf.for`, so every loop annotation takes effect ([AutoWSAnnotations.md, "Status on `scf.while` (current gaps)"](../AutoWSAnnotations.md#status-on-scfwhile-current-gaps)).
+- **Relieves:** launch cost per tile; lets the accumulator double buffer and the store partition overlap tile i's epilogue with tile i+1's mainloop.
+- **Costs:** a fixed tail: the slowest program runs ceil(tiles/P) tiles, so a small tiles mod P leaves SMs idle in the last wave. Uneven per-tile work is not rebalanced.
 
 **Dynamic (atomic) persistent.**
-- Each program claims its next tile from a global atomic counter (`DynamicPersistent1DScheduler`). Under autoWS one partition owns the claim and broadcasts the tile id to the others. The owner is the partition with the TMA load if there is one (`WS/WSAtomicBroadcast.cpp`, `doDynamicTileBroadcast`).
+- Each program claims its next tile from a global atomic counter (`DynamicPersistent1DScheduler`). Under autoWS one partition (the one with the TMA load, if any) owns the claim and broadcasts the tile id to the others (`WS/WSAtomicBroadcast.cpp`, `doDynamicTileBroadcast`).
 - **Relieves:** imbalance from uneven tiles.
-- **Costs:**
-  - one atomic per tile;
-  - partitions held in lockstep at the claim (broadcast depth 1);
-  - an outer `scf.while` that is not software-pipelined;
-  - a host-allocated counter.
+- **Costs:** one atomic per tile; partitions held in lockstep at the claim (broadcast depth 1); an outer `scf.while` that is not software-pipelined; a host-allocated counter.
 
 **CLC.**
-- The grid is oversubscribed, one CTA per logical tile. A CTA that finishes cancels a pending cluster and takes over its tile (`ClcTileScheduler`; [triton-clc-tile-scheduler.md, "PTX cluster grouping contract"](../../../../../../../../docs/design/triton-clc-tile-scheduler.md#ptx-cluster-grouping-contract)).
-- The cancel is issued from one producer partition and hoisted for overlap. Its result is broadcast to the other partitions.
-- The outer loop stays an `scf.while`. End-to-end coverage there exists for `data_partition_factor`, `separate_epilogue_store`, generated subtiled regions and broadcast depth. The `merge_*` knobs, the SMEM/TMEM allocation options, register budgets and ping-pong have no contract ([DynamicPersistentAutoWSGaps.md, "Frontend and Configuration Gaps"](../DynamicPersistentAutoWSGaps.md#frontend-and-configuration-gaps)).
-- **Relieves:** imbalance without a software counter. It provides cluster-level ownership, so it is the dynamic schedule that works with `two_ctas`.
-- **Costs:**
-  - one CLC request per tile;
-  - the `while`-loop knob restrictions above;
-  - the clustered contract (divisible grid, no inactive CTAs).
+- Oversubscribed grid, one CTA per logical tile; a CTA that finishes cancels a pending cluster and takes over its tile (`ClcTileScheduler`; [triton-clc-tile-scheduler.md, "PTX cluster grouping contract"](../../../../../../../../docs/design/triton-clc-tile-scheduler.md#ptx-cluster-grouping-contract)). The cancel is issued from one producer partition, hoisted for overlap, and its result broadcast to the other partitions.
+- The outer loop stays an `scf.while`. End-to-end coverage there: `data_partition_factor`, `separate_epilogue_store`, generated subtiled regions, broadcast depth. No contract: the `merge_*` knobs, the SMEM/TMEM allocation options, register budgets, ping-pong ([DynamicPersistentAutoWSGaps.md, "Frontend and Configuration Gaps"](../DynamicPersistentAutoWSGaps.md#frontend-and-configuration-gaps)).
+- **Relieves:** imbalance without a software counter; its cluster-level ownership makes it the dynamic schedule that works with `two_ctas`.
+- **Costs:** one CLC request per tile; the `while`-loop knob restrictions above; the clustered contract (divisible grid, no inactive CTAs).
 
 **Tile order** does not change the work done; it changes which tiles are co-resident across the P programs, and so the L2 reuse of A and B tiles.
-
-## When to try it (depends on the problem)
-
-`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
-
-- IF `T <= P`, THEN skip CLC and the atomic dynamic scheduler, BECAUSE every program gets one tile, so there is nothing to rebalance and each claim (`clc_advance` or the atomic) is pure cost. [mechanism] (`ClcTileScheduler`, `DynamicPersistent1DScheduler`)
-- IF `T <= P`, THEN skip the `GROUP_M` / tile-order axis, BECAUSE all tiles are co-resident, so tile order cannot change L2 reuse. [mechanism] (`StaticPersistent1DScheduler`)
-- IF per-tile work is uneven (grouped or jagged problems) and `T > P`, THEN prefer CLC over static persistent, BECAUSE hardware cancellation rebalances the uneven tiles without a software counter, while static persistence fixes each program's tiles up front. [mechanism]
-Tail effects under static persistence (idle SMs in the last wave): see the tail-efficiency rule in [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem).
-- **IF** `T <= P`, **THEN** keep only one of static persistent and non-persistent, **BECAUSE** both assign the same tile to each program. [measured: --regime sched, flat within noise]
-- **IF** `T > P`, **THEN** skip non-persistent, **BECAUSE** every extra wave pays a launch and loses the cross-tile overlap. [measured: --regime sched, loses on every shape in the regime]
-- **IF** uniform tiles and `T > P`, **THEN** pin static persistent (CLC is within about 3%), and prefer static over the atomic dynamic scheduler, **BECAUSE** there is nothing to rebalance. [measured: --regime sched, flat within noise]
-- **IF** 1-CTA and `T > P`, **THEN** prefer `GROUP_M=1` over 8 (16 is flat or worse); **IF** 2-CTA, **THEN** pin `GROUP_M=8` (odd values are a wrong answer), **BECAUSE** the grouping only changes L2 reuse order. [measured: --regime sched, wins on a majority of shapes]
 
 ## Interactions
 
