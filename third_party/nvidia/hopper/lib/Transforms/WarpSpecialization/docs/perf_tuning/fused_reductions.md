@@ -24,7 +24,6 @@ Epilogue side inputs are covered in [epilogue_prologue_tma_loads.md](epilogue_pr
 |---|---|---|---|
 | `tl.atomic_*` on a tensor, or a scalar atomic that is not a loop-carried tile counter, replicated to more than one partition inside the WS loop | silently ignored | Warp specialization is stripped from the whole kernel. The atomic is classified as unsupported, so `doDynamicTileBroadcast` fails and the WS metadata is removed. The kernel compiles without warp specialization. | `WSAtomicBroadcast.cpp`, `classifyAtomic` and `doDynamicTileBroadcast`; `WarpSpecialization.cpp`, `runOnFuncOp` (`bailOut`) |
 | `tl.atomic_*` inside the WS loop that no partition reaches (e.g. its result is unused) | wrong answer | The atomic is dropped. See [hazards.md](hazards.md#atomic-inside-the-warp-specialized-tile-loop-with-no-partition). | `PartitionSchedulingMeta.cpp`, `runOnOperation`; `WSSpecialize.cpp`, `SpecializeOp` |
-| A fused reduction that reads an accumulator subtile a second time, at `EPILOGUE_SUBTILE >= 2`, on a build whose InterleaveTMem does not bound barrier moves by the original block order | wrong answer | See [hazards.md](hazards.md#accumulator-subtile-read-twice-in-the-epilogue). | `InterleaveTMem.cpp`, `processBlock`, `buildOriginalBlockOrder`; `WSBarrierReorder.h`, `optimizeWSBarrierLocations` |
 | `multi_cta` on a loop whose downstream `tl.reduce` has a defined reduction ordering, or whose combiner is not an add | compile error | Partial results are combined across CTAs by addition, which is only valid for an unordered add. | `MultiCTAReduction.cpp`, `transformMultiCTALoop` and `verifyReduceCombinerIsAdd` |
 
 ## Mechanism
@@ -46,21 +45,20 @@ Epilogue side inputs are covered in [epilogue_prologue_tma_loads.md](epilogue_pr
 - Code: `PartitionSchedulingMeta.cpp`, `categorizeTMAReductions`, `isReduceTokenWait` and `createPartitionLayout`; `WSMemoryPlanner.cpp`, `getTmaReduceStagingCopies`.
 
 **Per-subtile reductions read each subtile twice.**
-- **What changes:** with `EPILOGUE_SUBTILE >= 2`, a reduction placed next to the stored output reads each accumulator subtile from TMEM once for the store and once for the reduction. `InterleaveTMem` sinks each read to its first use. When `InterleaveTMem` has the `buildOriginalBlockOrder` handling, the accumulator wait and arrive stay around both reads.
-- **What it costs:** two TMEM reads per subtile. Without that handling, a wrong answer (see the hard prunes).
-- Code: `InterleaveTMem.cpp`, `processBlock`; [TMEMInterleave.md](../TMEMInterleave.md), section "Load Sinking"; [BarrierConstraints.md](../BarrierConstraints.md), section "Barrier Reordering".
+- **What changes:** with `EPILOGUE_SUBTILE >= 2`, a reduction placed next to the stored output reads each accumulator subtile from TMEM once for the store and once for the reduction. `InterleaveTMem` sinks each read to its first use, and keeps the accumulator wait and arrive around both reads by bounding barrier moves with the pre-reorder block order (`buildOriginalBlockOrder`).
+- **What it costs:** two TMEM reads per subtile.
+- Code: `InterleaveTMem.cpp`, `processBlock`, `buildOriginalBlockOrder`; [TMEMInterleave.md](../TMEMInterleave.md), section "Load Sinking"; [BarrierConstraints.md](../BarrierConstraints.md), section "Barrier Reordering".
 
 ## Pruning rules
 
 - IF the fusion needs a sum across output tiles, THEN only try a TMA reduce (`desc.atomic_add` / `store_reduce="add"`), or a per-CTA partial stored inside the loop plus a finishing kernel, BECAUSE a pointer atomic in the WS loop either strips warp specialization or is dropped.
 - IF a fused reduction is over M (column), THEN prefer max/min-type statistics where the math allows, and expect sum over M to cost more cross-lane work, BECAUSE only fp32 max/min have a single-instruction warp reduction.
-- IF the build lacks the InterleaveTMem order fix (no `buildOriginalBlockOrder` in `InterleaveTMem.cpp`), THEN only try `EPILOGUE_SUBTILE=1` for kernels that read a subtile twice, BECAUSE higher subtiling gives a wrong answer there.
 - IF a reduced statistic is needed after the K loop over the full K sum, e.g. a row norm of the GEMM output, THEN skip split-K for that kernel ([large_k.md](large_k.md#pruning-rules)), BECAUSE the statistic is nonlinear in the partials.
 
 ## Interactions
 
 See [interactions.md](interactions.md). Pairs this file expects to hold:
-- **Fused reduction x epilogue subtiling:** duplicate subtile reads; wrong answer when `InterleaveTMem` lacks the `buildOriginalBlockOrder` handling.
+- **Fused reduction x epilogue subtiling:** duplicate subtile reads, both kept inside the accumulator wait/arrive.
 - **Fused reduction x TMA store:** TMA-reduce waits stay with the reduce, and store waits stay in the epilogue-store partition.
 - **Fused reduction x data partitioning:** each data partition reduces its own accumulator half.
 - **Cross-tile reduction x CLC / dynamic persistence:** a tile-claim atomic is the one supported replicated atomic. Any other atomic strips WS.
@@ -68,7 +66,6 @@ See [interactions.md](interactions.md). Pairs this file expects to hold:
 ## Hazards
 
 - [Atomic inside the warp-specialized tile loop with no partition](hazards.md#atomic-inside-the-warp-specialized-tile-loop-with-no-partition)
-- [Accumulator subtile read twice in the epilogue](hazards.md#accumulator-subtile-read-twice-in-the-epilogue)
 
 Reported but not yet located in code (rows in [TRACKER.md](TRACKER.md#reported-wrong-answers--hangs-needing-repro--code-root-cause)): store of a loop-carried value after the WS loop; two K steps per loop body over a shared operand.
 
