@@ -17,15 +17,15 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 
 | File | State | Note |
 |------|-------|------|
-| `tiles_and_stages.md` | todo | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages` against tile count and K iterations. |
+| `tiles_and_stages.md` | todo | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages`. |
 | `warps_and_registers.md` | todo | `num_warps` and the AutoWS register budgets. |
 | `epilogue.md` | todo | Epilogue subtiling, separate epilogue store, store placement. |
 | `2cta.md` | todo | 1-CTA vs 2-CTA (`two_ctas`). |
 | `data_partitioning.md` | todo | `data_partition_factor`. |
-| `clc_persistence.md` | todo | Static persistent vs CLC dynamic persistent. |
+| `clc_persistence.md` | todo | Static persistent vs dynamic and CLC persistent. |
 | `tma_loads.md` | todo | TMA vs pointer operand loads. |
 | `tma_stores.md` | todo | TMA vs pointer output stores. |
-| `large_k.md` | todo | K iterations far above `num_stages`, including decomposeK-style K splitting. |
+| `large_k.md` | todo | K iterations far above `num_stages`, including split-K style K splitting. |
 | `pingpong.md` | todo | Ping-pong scheduling. |
 | `multicast.md` | todo | TMA multicast. |
 | `epilogue_prologue_tma_loads.md` | todo | TMA loads of extra epilogue/prologue inputs. |
@@ -42,11 +42,18 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 | `TRITON_WS_STAGING_COPIES` | todo | Read in `WSMemoryPlanner.cpp`. |
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | todo | Read in `Transform2CTALoads.cpp`. |
 | `maxnreg` under WS | todo | `CUDAOptions.maxnreg`, `third_party/nvidia/backend/compiler.py`. |
-| `disallow_acc_multi_buffer` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; listed in [AutoWSAnnotations.md](../AutoWSAnnotations.md) "Annotation → IR attribute → consumer" without a when/why explanation. |
+| `disallow_acc_multi_buffer` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`. |
+| `loop_unroll_factor`, `disable_licm` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; generic loop transforms, not WS-specific. |
+| Descriptor loads/stores (kernel pattern) | todo | `tl.make_tensor_descriptor` or host `TensorDescriptor` with `desc.load` / `desc.store`: why autoWS expects TMA producer and store partitions. |
+
+## Fixes to existing docs
+
+| Doc | State | Note |
+|-----|-------|------|
 
 ## Other
 
 | Item | State | Note |
 |------|-------|------|
-| Inductor reference definition | todo | Definition pending. |
+| Inductor reference definition | todo | Definition pending. Until then `knobs.md` has no column for what Inductor sets. |
 | Leaves outside AutoWS | todo | cuBLAS or non-WS leaves; later. |
