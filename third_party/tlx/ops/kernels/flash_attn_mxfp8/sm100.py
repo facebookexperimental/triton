@@ -174,6 +174,46 @@ def _apply_causal_mask(qk, col_limit, BLOCK_N: tl.constexpr, TRANSPOSED: tl.cons
 
 
 @triton.jit
+def _expcast_e4m3x4(x, addend, mult):
+    """E4M3 code = RNE(x * mult + addend - 1024), clamped below at 0, packed 4 per register (no MUFU, no F2FP.E4M3)."""
+    # code + 1024 lies in [1024, 2048) where f16 ulp is 1: the f16 cvt rounds to the integer code in the
+    # low byte, and max with 1024 maps negative and -inf to code 0. max.f16x2 also maps NaN to code 0, so a
+    # NaN in S yields a finite but wrong output row where the exp2 path yields a NaN row.
+    # The clamp floor is code 0 (exact 0.0), not the min subnormal, so masked keys get exactly zero weight. It
+    # flushes below ~2^-6.9 * 2^e (baseline: ~2^-10 * 2^e), >= 15.7 binades under the block max.
+    # pack=4 returns 4 E4M3 bytes in one b32, as in tlx.mxfp8_utils._cvt_e4m3x4_f32.
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 xc_a01, xc_a23, xc_c01, xc_c23, xc_m2, xc_z01, xc_z23;
+            .reg .f32 xc_z0, xc_z1, xc_z2, xc_z3;
+            .reg .b32 xc_h01, xc_h23, xc_lo;
+            mov.b64 xc_a01, {$1, $2};
+            mov.b64 xc_a23, {$3, $4};
+            mov.b64 xc_c01, {$5, $6};
+            mov.b64 xc_c23, {$7, $8};
+            mov.b64 xc_m2, {$9, $9};
+            fma.rn.f32x2 xc_z01, xc_a01, xc_m2, xc_c01;
+            fma.rn.f32x2 xc_z23, xc_a23, xc_m2, xc_c23;
+            mov.b64 {xc_z0, xc_z1}, xc_z01;
+            mov.b64 {xc_z2, xc_z3}, xc_z23;
+            cvt.rn.f16x2.f32 xc_h01, xc_z1, xc_z0;
+            cvt.rn.f16x2.f32 xc_h23, xc_z3, xc_z2;
+            mov.b32 xc_lo, 0x64006400;
+            max.f16x2 xc_h01, xc_h01, xc_lo;
+            max.f16x2 xc_h23, xc_h23, xc_lo;
+            prmt.b32 $0, xc_h01, xc_h23, 0x6420;
+        }
+        """,
+        "=r,f,f,f,f,f,f,f,f,f,f,f,f",
+        [x, addend, mult],
+        dtype=tl.float8e4nv,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
 def _softmax_inner_loop(
     qk_empties,
     qk_fulls,
@@ -200,9 +240,12 @@ def _softmax_inner_loop(
     STAGE: tl.constexpr,
     SHARE_SCALE_BUFFERS: tl.constexpr = False,
     RESCALE_OPT: tl.constexpr = False,
+    P_EXPCAST: tl.constexpr = False,
 ):
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
     NUM_BLOCKS: tl.constexpr = BLOCK_N // VEC_SIZE
+    if P_EXPCAST:
+        tl.static_assert(out_dtype == tl.float8e4nv)
 
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
@@ -251,28 +294,52 @@ def _softmax_inner_loop(
             m_scaled = m_ij * qk_scale
         else:
             m_scaled = m_ij
-        qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
-        p_i = tl.math.exp2(qk)
+        if P_EXPCAST:
+            # ExpCast-FP8 (arXiv 2609.15810) with the MX block scale kept: the E4M3 byte read as an integer is
+            # ~8*log2(v) + 56, so code = RNE(8*(u - e) + 56 + beta) with u = log2(p) and e the block's E8M0
+            # exponent. beta = -0.3443 centres the error of 1 + f vs 2^f; per-element ratio to exact p is in
+            # [0.929, 1.075]. e = ceil(u_max - log2(448)) matches the baseline RCEIL scale and keeps code <= 126.
+            # NaN in S is encoded as P = 0. NaN detection is left to model-level guards; in training the bwd
+            # still yields NaN grads since it recomputes P with exp2. Debug builds (TRITON_DEBUG=1) assert here.
+            tl.device_assert(qk == qk, "NaN in S: ExpCast encodes it as P = 0")
+            block_u = block_maxes * qk_scale - m_scaled[:, None]
+            e_blk = tl.minimum(tl.maximum(tl.math.ceil(block_u - 8.807354922057604), -127.0), 127.0)
+            addend = (1079.6557 - 8.0 * m_scaled[:, None]) - 8.0 * e_blk
+            p_fp8_3d = _expcast_e4m3x4(qk_reshaped, tl.reshape(addend, [BLOCK_M_SPLIT, NUM_BLOCKS, 1]), qk_scale * 8.0)
+            e_int = e_blk.to(tl.int32)
+            p_scale = (e_int + 127).to(tl.uint8)
+            # l sums the decoded P, keeping numerator and denominator consistent. e_blk = -127 decodes to 0.0,
+            # not 2^-127; such blocks are fully masked (all codes 0) or > ~118 binades under the row max.
+            blk_sum = tl.sum(p_fp8_3d.to(tl.float32), 2)
+            l_ij = tl.sum(blk_sum * ((e_int + 127) << 23).to(tl.float32, bitcast=True), 1)
 
-        # Derive block amax from pre-computed block maxes via monotonicity
-        # of exp2: max(exp2(x)) == exp2(max(x)), avoiding 128 max(abs())
-        # ops per row in the MXFP8 conversion.
-        block_amax = tl.math.exp2(block_maxes * qk_scale - m_scaled[:, None])
+            tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
+            tlx.local_store(tlx.local_view(p_tiles, cid), tl.reshape(p_fp8_3d, [BLOCK_M_SPLIT, BLOCK_N]))
+            tlx.local_store(tlx.local_view(p_scale_tiles, cid), p_scale)
+            tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
+        else:
+            qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
+            p_i = tl.math.exp2(qk)
 
-        # Compute row sum before p_empties wait: if MMA is still doing the
-        # previous PV GEMM, the wait stalls — fill that time with the sum.
-        l_ij = tl.sum(p_i, 1)
+            # Derive block amax from pre-computed block maxes via monotonicity
+            # of exp2: max(exp2(x)) == exp2(max(x)), avoiding 128 max(abs())
+            # ops per row in the MXFP8 conversion.
+            block_amax = tl.math.exp2(block_maxes * qk_scale - m_scaled[:, None])
 
-        tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
-        p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
-            p_i,
-            block_amax,
-            VEC_SIZE,
-            out_dtype,
-        )
-        tlx.local_store(tlx.local_view(p_tiles, cid), p_fp8)
-        tlx.local_store(tlx.local_view(p_scale_tiles, cid), p_scale)
-        tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
+            # Compute row sum before p_empties wait: if MMA is still doing the
+            # previous PV GEMM, the wait stalls — fill that time with the sum.
+            l_ij = tl.sum(p_i, 1)
+
+            tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
+            p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
+                p_i,
+                block_amax,
+                VEC_SIZE,
+                out_dtype,
+            )
+            tlx.local_store(tlx.local_view(p_tiles, cid), p_fp8)
+            tlx.local_store(tlx.local_view(p_scale_tiles, cid), p_scale)
+            tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
 
         l_i = l_i * alpha + l_ij
         m_i = m_ij
@@ -315,6 +382,7 @@ def _softmax_task_tile(
     GROUP_SIZE_N: tl.constexpr,
     SHARE_SCALE_BUFFERS: tl.constexpr,
     RESCALE_OPT: tl.constexpr,
+    P_EXPCAST: tl.constexpr = False,
 ):
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
     start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
@@ -360,6 +428,7 @@ def _softmax_task_tile(
             STAGE=4 - STAGE,
             SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
             RESCALE_OPT=RESCALE_OPT,
+            P_EXPCAST=P_EXPCAST,
         )
 
     if STAGE & 2:
@@ -389,6 +458,7 @@ def _softmax_task_tile(
             STAGE=2,
             SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
             RESCALE_OPT=RESCALE_OPT,
+            P_EXPCAST=P_EXPCAST,
         )
 
     _, phase = get_bufidx_phase(tile_count, 1)
@@ -554,6 +624,7 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                       GROUP_SIZE_N: tl.constexpr,  #
                       RESCALE_OPT: tl.constexpr,  #
                       UNROLL_KV: tl.constexpr = False,  #
+                      P_EXPCAST: tl.constexpr = False,  #
                       ):
     """
     This kernel is adapted from the Blackwell FA kernel for MXFP8.
@@ -870,6 +941,7 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                     GROUP_SIZE_N=GROUP_SIZE_N,
                     SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
                     RESCALE_OPT=RESCALE_OPT,
+                    P_EXPCAST=P_EXPCAST,
                 )
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
@@ -3231,7 +3303,7 @@ def _quantize_mxfp8_operand(ref, transpose_for_reduction=False):
     return data, scale
 
 
-def _forward_prequantized_with_lse(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal):
+def _forward_prequantized_with_lse(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, p_expcast=False):
     """Launch MXFP8 forward and return its BF16 output and FP32 logsumexp."""
     Z, H, N_CTX, HEAD_DIM = q.shape
     y_dim = Z * H * N_CTX
@@ -3275,6 +3347,7 @@ def _forward_prequantized_with_lse(q, k, v, q_scale, k_scale, v_scale, sm_scale,
         N_CTX=N_CTX,
         HEAD_DIM=HEAD_DIM,
         STAGE=3 if causal else 1,
+        P_EXPCAST=p_expcast,
     )
     return o, m_tensor
 
@@ -3282,7 +3355,7 @@ def _forward_prequantized_with_lse(q, k, v, q_scale, k_scale, v_scale, sm_scale,
 class _MXFP8Attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale, causal):
+    def forward(ctx, q, k, v, sm_scale, causal, p_expcast):
         q_fp8, q_scale, q_scale_dk = _quantize_mxfp8_32x32_operand(q)
         k_fp8, k_scale, k_scale_dq = _quantize_mxfp8_32x32_operand(k)
         v_fp8, v_scale = _quantize_mxfp8_operand(v, transpose_for_reduction=True)
@@ -3295,6 +3368,7 @@ class _MXFP8Attention(torch.autograd.Function):
             v_scale,
             sm_scale,
             causal,
+            p_expcast,
         )
         ctx.save_for_backward(
             v,
@@ -3353,13 +3427,17 @@ class _MXFP8Attention(torch.autograd.Function):
             dv.to(ctx.input_dtype),
             None,
             None,
+            None,
         )
 
 
-def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
-    """Differentiable Blackwell MXFP8 attention over BF16 master tensors."""
+def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_expcast=False):
+    """Differentiable Blackwell MXFP8 attention over BF16 master tensors.
+
+    ``p_expcast`` encodes the forward P with ExpCast-FP8 instead of exp2; see _softmax_inner_loop.
+    """
     if space not in ("full", "smoke"):
         raise ValueError(f"space must be 'full' or 'smoke', got {space!r}")
     if sm_scale is None:
         sm_scale = q.shape[-1]**-0.5
-    return _MXFP8Attention.apply(q, k, v, sm_scale, causal)
+    return _MXFP8Attention.apply(q, k, v, sm_scale, causal, p_expcast)
