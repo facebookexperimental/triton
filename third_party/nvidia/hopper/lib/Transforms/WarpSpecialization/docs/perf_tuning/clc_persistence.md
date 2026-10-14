@@ -28,10 +28,10 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 | `clc=True` with `TRITON_USE_META_WS=1` | compile error | "clc=True does not support Meta AutoWS; use tl.clc_tile_scheduler()" | `third_party/nvidia/backend/compiler.py`, `CUDABackend.parse_options`, `CUDABackend.make_ttgir` |
 | `clc=True` with a physical cluster (`ctas_per_cga`, `cluster_dims`) | compile error | "clc=True requires num_ctas=1 and no physical cluster" | `third_party/nvidia/backend/compiler.py`, `CUDAOptions.__post_init__` |
 | `ClcTileScheduler` with `ctas_per_cga` where a grid dimension is not divisible by the cluster dimension, or a cluster member skips `advance()` (e.g. an early-exit bounds guard on a padded tile) | requires | A divisible grid and uniform `advance()`: the CLC reservation is collective for the physical cluster; "Inactive padded CTAs are unsupported" | `python/triton/language/schedule.py`, `ClcTileScheduler`; [triton-clc-tile-scheduler.md, "PTX cluster grouping contract"](../../../../../../../../docs/design/triton-clc-tile-scheduler.md#ptx-cluster-grouping-contract) |
-| `DynamicPersistent1DScheduler` with `two_ctas` | requires | `ClcTileScheduler`: the atomic scheduler has no cluster-level tile claim, so both CTAs would advance the counter independently. Nothing rejects the combination at compile time | [DynamicPersistentAutoWSGaps.md, "2-CTA Status"](../DynamicPersistentAutoWSGaps.md#2-cta-status) |
+| `DynamicPersistent1DScheduler` with `two_ctas` | wrong answer (reproduced); hangs (reproduced) | Compiles silently, then gives a wrong answer or hangs: the atomic scheduler has no cluster-level tile claim, so both CTAs advance the counter independently. Use `ClcTileScheduler` for a dynamic 2-CTA schedule. See [hazards.md](hazards.md#2-cta-with-the-atomic-dynamic-tile-scheduler) | [DynamicPersistentAutoWSGaps.md, "2-CTA Status"](../DynamicPersistentAutoWSGaps.md#2-cta-status) |
 | loop `num_stages` on a dynamic or CLC outer `while` | silently ignored | Software pipelining is `scf.for`-only; the stages belong on the K loop | [AutoWSAnnotations.md, "`num_stages` / pipelining on a `while`: not applicable"](../AutoWSAnnotations.md#num_stages--pipelining-on-a-while-not-applicable) |
-| a replicated atomic in the WS loop that is not a scalar, while-carried value mapped to every partition | silently ignored | Warp specialization is dropped for the function. Only that shape can be owned by one partition and broadcast | `WS/WSAtomicBroadcast.cpp` (`AtomicWSCase::Reject`); [DynamicPersistentAutoWSGaps.md, "Atomic Broadcast Restrictions"](../DynamicPersistentAutoWSGaps.md#atomic-broadcast-restrictions) |
-| `pingpongAutoWS` with a dynamic or CLC outer `while` | silently ignored | Ping-pong regions need an enclosing `scf.for` (see `pingpong.md`) | `WS/PingPong.cpp`, `doPingPongPrep` |
+| a replicated atomic in the WS loop that is not a scalar, while-carried value mapped to every partition | silently ignored | Per the code, warp specialization is dropped for the function (not reproduced in testing). Only that shape can be owned by one partition and broadcast. Under `two_ctas`, stripping WS hangs (see [2cta.md](2cta.md#never-try-any-problem)) | `WS/WSAtomicBroadcast.cpp` (`AtomicWSCase::Reject`); [DynamicPersistentAutoWSGaps.md, "Atomic Broadcast Restrictions"](../DynamicPersistentAutoWSGaps.md#atomic-broadcast-restrictions) |
+| `pingpongAutoWS` with a dynamic or CLC outer `while`, for SFU math in the epilogue | silently ignored | Ping-pong regions need an enclosing `scf.for`; epilogue ops directly under the `while` have none (SFU math inside the K loop still can) (see `pingpong.md`) | `WS/PingPong.cpp`, `doPingPongPrep` |
 
 ## Mechanism
 
@@ -64,13 +64,13 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 
 ## When to try it (depends on the problem)
 
-- **IF** tiles < number of SMs, **THEN** prefer a non-persistent or static persistent candidate over CLC/dynamic, **BECAUSE** there is nothing to rebalance and every program runs at most one tile.
-- **IF** tiles are uniform (dense GEMM), **THEN** prefer static persistent, **BECAUSE** dynamic schedules only buy rebalancing, and static keeps every loop annotation effective.
+- **IF** tiles < number of SMs, **THEN** prefer (ranks first; removes nothing) a non-persistent or static persistent candidate over CLC/dynamic, **BECAUSE** there is nothing to rebalance and every program runs at most one tile.
+- **IF** tiles are uniform (dense GEMM), **THEN** prefer (ranks first; removes nothing) static persistent, **BECAUSE** dynamic schedules only buy rebalancing, and static keeps every loop annotation effective.
 - **IF** per-tile work is uneven (grouped or jagged problems), **THEN** try CLC, **BECAUSE** hardware cancellation rebalances without a software counter.
-- **IF** `two_ctas` and a dynamic schedule are both wanted, **THEN** only try `ClcTileScheduler`, **BECAUSE** the atomic scheduler has no cluster tile claim.
+- **IF** `two_ctas` and a dynamic schedule are both wanted, **THEN** only try `ClcTileScheduler` (this removes the atomic dynamic scheduler), **BECAUSE** the atomic scheduler with `two_ctas` gives a wrong answer or hangs.
 - **IF** the schedule is CLC or dynamic, **THEN** skip sweeping loop `num_stages` on the outer loop, the `merge_*` knobs, the SMEM/TMEM allocation options and `pingpongAutoWS`, **BECAUSE** they are ignored or have no end-to-end contract on an outer `while`.
 - **IF** the kernel uses autoWS, **THEN** skip `clc=True`, **BECAUSE** it is a compile error; use `tl.clc_tile_scheduler()`.
-- **IF** tiles mod SMs is small relative to the SM count under static persistence, **THEN** prefer a tile shape that changes the tile count, **BECAUSE** the last wave's idle SMs are a fixed cost that no in-tile knob removes.
+- **IF** tiles mod SMs is small relative to the SM count under static persistence, **THEN** prefer (ranks first; removes nothing) a tile shape that changes the tile count, **BECAUSE** the last wave's idle SMs are a fixed cost that no in-tile knob removes.
 - **IF** clustered CLC is used with a padded tile grid, **THEN** let padded tiles run (TMA clips them) instead of exiting early, **BECAUSE** inactive cluster members are unsupported.
 
 ## Interactions
@@ -88,7 +88,7 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 
 ## Hazards
 
-None in [hazards.md](hazards.md). Suspected from code, not reproduced (row in [TRACKER.md](TRACKER.md#reported-wrong-answers--hangs-needing-repro--code-root-cause)): `DynamicPersistent1DScheduler` with `two_ctas` has no compile-time rejection.
+- [2-CTA with the atomic dynamic tile scheduler](hazards.md#2-cta-with-the-atomic-dynamic-tile-scheduler)
 
 ## Not yet established
 
