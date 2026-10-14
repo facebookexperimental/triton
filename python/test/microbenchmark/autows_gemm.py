@@ -159,6 +159,7 @@ def quantities(M, N, K, c, es=None):
     staging = c.bm * (c.bn // es) * (4 if c.splitk > 1 else 2)
     return dict(T=tiles, W=tiles / NUM_SMS, E_tail=tiles / (NUM_SMS * math.ceil(tiles / NUM_SMS)),
                 S_prog=math.ceil(tiles / NUM_SMS) * c.bm * c.bn, k_iters=math.ceil(K / (c.bk * c.splitk)),
+                I_t=c.bm * c.bn / (c.bm + (c.bn / 2 if c.two else c.bn)),
                 pad_waste=1 - M * N / (math.ceil(M / c.bm) * c.bm * math.ceil(N / c.bn) * c.bn),
                 AI_min=2 * M * N * K / (2 * (M * K + N * K + M * N)), d_fit=(SMEM_BYTES - AUX_BOUND - staging) // slot,
                 R=c.bm // c.dp * (c.bn // es) // (32 * c.nw))
@@ -168,8 +169,9 @@ def resolve(M, N, K, c):
     """Fill in ES and num_stages defaults (d_fit-based)."""
     es = c.es
     if es == 0:
-        es = next((e for e in (1, 2, 4, 8) if c.bn // e >= 32 and quantities(M, N, K, c, e)["R"] <= 128
-                   and quantities(M, N, K, c, e)["d_fit"] >= 2), 8)
+        legal = [e for e in (1, 2, 4, 8) if c.bn // e >= 32] or [1]
+        es = next((e for e in legal
+                   if quantities(M, N, K, c, e)["R"] <= 128 and quantities(M, N, K, c, e)["d_fit"] >= 2), legal[-1])
     q = quantities(M, N, K, c, es)
     ns = c.ns if c.ns > 0 else max(1, q["d_fit"] + c.ns)
     return dataclasses.replace(c, es=es, ns=ns), q
@@ -209,6 +211,11 @@ REGIMES = {
     "tile": _regime(["R1a", "R1b", "R1c", "R2a", "R2b"],
                     _ns_pair([T[k] for k in ("128x128x64", "128x128x128", "128x256x64", "64x256x64", "256x128x64dp2",
                                              "2cta128x256x64", "2cta128x256x128", "2cta128x128x64")])),
+    "tile_small": _regime(["R1a", "R1b", "R2a"], [
+        C(bm=bm, bn=bn, bk=64) for bm, bn in ((128, 16), (128, 32), (64, 32), (64, 64), (128, 64))
+    ] + [T["128x128x64"]]),
+    "bk_small": _regime(["R1a", "R1b", "R2a", "R4b"],
+                        [dataclasses.replace(c, bk=bk) for c in (T["128x128x64"], T["128x256x64"]) for bk in (16, 32, 64)]),
     "mtail": _regime(["R6a", "R6b", "R1c", "R2b"],
                      _ns_pair([T[k] for k in ("64x256x64", "128x256x64", "64x128x64", "128x128x64")])),
     "stages": _regime(["R1a", "R1b", "R2a", "R3c", "R4a", "R4b"],
@@ -256,6 +263,8 @@ def skip_reason(M, N, K, c, q):
     """Arms the plan excludes up front (never-try rows and the split-K bound)."""
     if c.splitk > 1 and (q["T"] // c.splitk * (c.splitk - 1) >= NUM_SMS or q["k_iters"] < 4):
         return "split-K outside T*(S-1) < P and k_iters/S >= 4"
+    if c.two and c.gm % 2:
+        return "2-CTA with odd GROUP_M breaks the CTA-pair contract (wrong answer)"
     if c.two and c.sched == "dynamic":
         return "2-CTA with the atomic dynamic scheduler (never try)"
     if q["d_fit"] < 1:
