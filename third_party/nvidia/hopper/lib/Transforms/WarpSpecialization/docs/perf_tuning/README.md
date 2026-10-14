@@ -154,12 +154,14 @@ Every rule ends with one evidence tag.
   on a step-2 quantity, never as a timing:
   `IF <quantity> <op> <threshold> THEN <verb> <values> BECAUSE <mechanism>. [measured: --regime <name>, <outcome>]`
   where `<outcome>` is one of "loses on every shape in the regime", "wins on
-  every shape", or "flat within noise". Requirements:
+  every shape", "wins on a majority of shapes", "flat within noise", or
+  "never wins (loses or flat within noise on every shape)". Shapes are those of
+  the regime that meet the rule's IF condition. Requirements:
   - The regime's shape set has shapes on both sides of the threshold; the rule
     is not extrapolated past the tested range, which the regime prints.
   - **skip** needs "loses on every shape in the regime"; **prefer** needs a
-    majority; "flat within noise" becomes "pin at the default value" (it
-    removes the axis).
+    majority; "flat within noise" and "never wins" become "pin at the default
+    value" (they remove the axis).
   - A [measured] rule with no known mechanism may only **prefer**.
   - All [measured] rules in this folder were run on one build and one clock
     setting, named once in `MEASURED_ON` (commit + locked SM clock). When the
