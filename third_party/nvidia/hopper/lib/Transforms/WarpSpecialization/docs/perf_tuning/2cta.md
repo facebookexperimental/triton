@@ -71,7 +71,7 @@ So 2-CTA lets a wide logical tile (e.g. `BLOCK_N=256`), or a deeper operand ring
 
 ## Interactions
 
-Rows to add to `interactions.md` (not written yet; see [TRACKER.md](TRACKER.md)). Pairs these rules depend on:
+See [interactions.md](interactions.md). Pairs these rules depend on:
 - `two_ctas` × `ctas_per_cga`
 - `two_ctas` × `BLOCK_M` (64 uses the RHS-split TMEM mode; below 64 falls back)
 - `two_ctas` × `BLOCK_N` (half-B width, swizzle)
@@ -82,10 +82,10 @@ Rows to add to `interactions.md` (not written yet; see [TRACKER.md](TRACKER.md))
 - `two_ctas` × `num_stages`
 - `two_ctas` × `num_warps` with a reduction partition
 - `two_ctas` × `tl.dot_scaled`
-- `two_ctas` × CLC tile scheduler (see `clc_persistence.md`, not written yet)
+- `two_ctas` × CLC tile scheduler (see `clc_persistence.md`)
 - `two_ctas` × atomic dynamic tile scheduler
 - `two_ctas` × `smem_alloc_algo`
-- `two_ctas` × TMA multicast (see `multicast.md`, not written yet)
+- `two_ctas` × TMA multicast (see `multicast.md`)
 
 ## Hazards
 
