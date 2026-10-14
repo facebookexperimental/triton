@@ -62,8 +62,7 @@ jobs:
       WORKSPACE_DIR: /workspace
       CONDA_ENV: triton-side-${{ inputs.side }}
       RUNNER_TYPE: ${{ inputs.device }}
-      TORCH_VERSION: '2.14.0'
-      TORCH_INDEX: ${{ inputs.device == 'mi350' && 'https://download.pytorch.org/whl/rocm7.2' || 'https://download.pytorch.org/whl/cu130' }}
+      TORCH_INDEX: ${{ inputs.device == 'mi350' && 'https://download.pytorch.org/whl/nightly/rocm7.2' || 'https://download.pytorch.org/whl/nightly/cu130' }}
       TRITONBENCH_TRITON_REPO: ${{ inputs.triton_repository }}
       TRITONBENCH_TRITON_COMMIT: ${{ inputs.triton_commit }}
       TRITONBENCH_TRITON_COMMIT_HASH: ${{ inputs.triton_commit }}
@@ -76,6 +75,7 @@ jobs:
       BENCHMARK_DEVICE: ${{ inputs.device }}
     steps:
       - name: Checkout TritonBench
+        if: contains(inputs.benchmarks, 'tritonbench')
         uses: actions/checkout@v6
         with:
           repository: meta-pytorch/tritonbench
@@ -109,7 +109,7 @@ jobs:
           printf 'source %q/bin/activate\n' "${VIRTUAL_ENV}" > "${SETUP_SCRIPT}"
           # shellcheck source=/dev/null
           . "${SETUP_SCRIPT}"
-          uv pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX}"
+          uv pip install --pre torch -i "${TORCH_INDEX}"
           uv pip install numpy
           mkdir -p "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}"
           curl --fail --location --retry 3 \
@@ -118,6 +118,7 @@ jobs:
           uv pip install --no-deps "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}/${WHEEL_FILENAME}"
 
       - name: Set up TritonBench dependencies
+        if: contains(inputs.benchmarks, 'tritonbench')
         run: |
           set -eo pipefail
           # shellcheck source=/dev/null
@@ -127,10 +128,7 @@ jobs:
           else
             bash .ci/tritonbench/setup-nvidia-path.sh
           fi
-          bash .ci/tritonbench/install-pytorch-source.sh
-          # shellcheck source=/dev/null
-          . "${SETUP_SCRIPT}"
-          python install.py --all
+          python install.py
           # Dependencies may install a competing Triton distribution. The
           # benchmark must use the wheel produced by this side's build job.
           uv pip uninstall triton fbtriton pytorch-triton pytorch-triton-rocm triton-rocm
@@ -173,7 +171,10 @@ jobs:
               "triton_commit": os.environ["TRITONBENCH_TRITON_COMMIT_HASH"],
               "triton_version": triton.__version__,
               "wheel_url": os.environ["WHEEL_URL"],
-              "tritonbench_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "tritonbench_commit": (
+                  subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+                  if "tritonbench" in os.environ["BENCHMARKS"].lower() else None
+              ),
               "torch_version": torch.__version__,
               "gpu": torch.cuda.get_device_name(),
               "benchmarks": os.environ["BENCHMARKS"],
