@@ -4,48 +4,28 @@ Scope: how GEMM operands (A, B) reach SMEM under Meta WS (`TRITON_USE_META_WS=1`
 
 ## Knobs
 
-| Knob | How set | One line | Existing doc |
-|---|---|---|---|
-| TMA descriptor load | `TensorDescriptor` (host) or `tl.make_tensor_descriptor` (device), then `desc.load(...)` | The only load form that the partition scheduler routes to the producer (load) partition. | [MemoryLowering.md](../MemoryLowering.md), section "Entry Points"; [BufferAllocation.md](../BufferAllocation.md), section "Step 4: separateLocalAllocWithSrc" |
-| `auto_tma` | compile option `auto_tma=True` or env `TRITON_AUTO_TMA=1` (sm_90+) | Promotes eligible pointer `tl.load`s to host TMA descriptors before warp specialization. In a WS kernel it also promotes eligible stores. | [AutoTMAPromotion.md](../AutoTMAPromotion.md) |
-| `auto_tma_device` | compile option or env `TRITON_AUTO_TMA_DEVICE=1` | Makes `auto_tma` build device-side descriptors instead of host recipes. Loads that a host recipe cannot express switch to device mode on their own. | [AutoTMAPromotion.md](../AutoTMAPromotion.md#host-recipes-versus-device-descriptors) |
-| descriptor `padding` | `TensorDescriptor(..., padding="zero"\|"nan")` | Out-of-bounds fill value. The default is `"zero"`. | none |
-| `desc.load(multicast=True)` / `multicast` option | kernel source / compile option | Plans multicast axes only. See "Never try (any problem)" below. | `docs/design/triton_tma_multicast.md` |
+| Knob | Set via | Legal values | Default | Priority | Applies when | Prereqs |
+|---|---|---|---|---|---|---|
+| Descriptor loads/stores | kernel pattern (`tl.make_tensor_descriptor` or host `TensorDescriptor`; `desc.load` / `desc.store`) | — | — | P0 | Every autoWS GEMM. Only descriptor loads go to the load partition; a pointer-loaded B under `two_ctas` is a compile error. | 16-byte-aligned base and strides; inner dim >= 16 B. |
+| `auto_tma` / `auto_tma_device` | compile option, or env `TRITON_AUTO_TMA`‡ / `TRITON_AUTO_TMA_DEVICE`‡ | bool | False | P2 | 16-byte-aligned pointer loads with `other=0`; otherwise promotion is silently skipped. A non-rectangular mask, a real `% arg` wraparound or a non-argument bound gives a wrong answer. | Paused; mask-drop hazard open. |
 
-## Never try (any problem)
+## Pruning ruleset
 
-| Condition | Status | Why | Code ref |
-|---|---|---|---|
-| Pointer `tl.load` feeding `tl.dot` in a WS loop | requires | A TMA descriptor (or `auto_tma`). Only descriptor loads and gathers go to the load partition, so a pointer load gets no producer pipelining. A pointer-loaded B under 2-CTA is a compile error. | `PartitionSchedulingMeta.cpp`, `categorizeLoads` |
-| `multicast=True` on a descriptor load, or the `multicast` compile option | silently ignored | `TMAMulticast.cpp` only attaches `tt.multicast_axes`. No TMA lowering reads that attribute, so no `.multicast::cluster` copy is emitted. | `TMAMulticast.cpp` (sets `kMulticastAxesAttrName`); `WSLowerMem.cpp`, `optimizeTMALoads` (no multicast operand) |
-| `auto_tma` on a load with a non-rectangular mask (`other=0` plus an extra predicate), a real `% arg` wraparound, or a mask bound that is not a bare kernel argument | wrong answer (reproduced) | The promotion drops the load mask. See [hazards.md](hazards.md#auto_tma-promotion-drops-the-load-mask). | `PromoteLoadToTMA.cpp`, `isTMAEligible`, `match1DOffset`, `findShapeArgForDim` |
-| `auto_tma` on a load whose strides or base pointer are not provably 16-byte aligned, or whose `other` is non-zero | silently ignored | Promotion is skipped and the pointer load stays. | `PromoteLoadToTMA.cpp`, `isTMAEligible`, `dimStrideIs16BAligned`, `argIs16BAligned` |
+| Condition | Status | Why |
+|---|---|---|
+| Pointer `tl.load` feeding `tl.dot` in a WS loop | requires | A TMA descriptor (or `auto_tma`). |
+| `multicast=True` on a descriptor load, or the `multicast` compile option | silently ignored | `TMAMulticast.cpp` only attaches `tt.multicast_axes`. |
+| `auto_tma` on a load with a non-rectangular mask (`other=0` plus an extra predicate), a real `% arg` wraparound, or a mask bound that is not a bare kernel argument | wrong answer | The promotion drops the load mask. |
+| `auto_tma` on a load whose strides or base pointer are not provably 16-byte aligned, or whose `other` is non-zero | silently ignored | Promotion is skipped and the pointer load stays. |
 
 ## Mechanism
 
-**Single-use operand: TMA writes straight into the MMA buffer.**
-- **What changes:** if a descriptor load's only user is the MMA operand's `local_alloc` and its encoding is TMA-writable, TMA writes directly into that buffer.
-- **What it relieves:** no register traffic, no extra SMEM, no consumer-side release barrier.
-- **What it costs:** one SMEM buffer per copy, sized from the descriptor block (BLOCK_M x BLOCK_K for A, BLOCK_N x BLOCK_K for B), not from K.
-- Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` and `getTMAWritableEncoding`.
-
-**Operand also read in registers (multi-consumer) pays for an extra buffer.**
-- **What changes:** any second user (e.g. a row reduction over A alongside the MMA) gives the load its own NVMMA landing buffer, read by each register consumer with a `local_load`. The MMA's copy is then fed from registers: for B (and for A when it cannot be promoted) a separate SMEM buffer written with generic stores in a compute partition; on sm100 a register-sourced A is normally promoted to TMEM instead (`PromoteLHSToTMem.cpp`, `LHSToTMem`), so A needs no second SMEM buffer.
-- Same path for an operand cast in-kernel after a TMA load, e.g. fp32 loaded and truncated to bf16 for the MMA.
-- **What it costs:** for B, two SMEM buffers per stage; a full register round trip; a partition-wide barrier on every release (next item).
-- Hazards: the register read of the TMA tile triggers an unreproduced code-inspection hazard ([hazards.md](hazards.md#tma-tile-read-into-registers-released-without-a-proxy-fence)); under 2-CTA a register-modified B is not split and gives a wrong answer ([hazards.md](hazards.md#2-cta-with-an-unsplit-b)).
-- Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` (register-consumed path); `WSCodePartition.cpp`, `isChannelAnchorOp` (a `local_alloc` with a register source is a channel producer).
-
-**Each register-side release is a partition barrier.**
-- **What changes:** consumer release and producer commit both lower to a non-per-thread mbarrier arrive: a `bar.sync` across the issuing partition, then a leader-thread arrive.
-- **What it costs:** one partition-wide barrier per release (per K step for an operand ring) for every register-consumed TMA buffer.
-- Code: `WSLowerToken.cpp`, `processConsumerReleaseOp` and `processProducerCommitOp`; `BarrierOpToLLVM.cpp`, `ArriveBarrierOpConversion` (`perThread=false` path).
-
-**Pointer-loaded operands get no producer pipelining.** Only `DescriptorLoadOp`/`DescriptorGatherOp` go to the load partition; a pointer load issues and waits inside the compute partition that uses it, and its SMEM copy becomes a register-written channel. Code: `PartitionSchedulingMeta.cpp`, `categorizeLoads`.
-
-**`auto_tma` turns eligible pointer loads into descriptor loads before warp specialization**, which then take the paths above. Eligibility, host versus device descriptors and silent fallbacks: [AutoTMAPromotion.md](../AutoTMAPromotion.md). The global `knobs.nvidia.auto_tma` is not in the compile cache key, so set `auto_tma=` per launch when comparing configs.
-
-**Out-of-bounds TMA reads return the descriptor's padding value.** With the default `padding="zero"`, operand tiles past M, N or K read zeros, so M/N/K tail masks on TMA operands are unnecessary for correctness; the output tail is discarded by the TMA store's bounds. Code: `python/triton/tools/tensor_descriptor.py`, `TensorDescriptor`.
+- **Single-use operand:** changes the load so that, if a descriptor load's only user is the MMA operand's `local_alloc` and its encoding is TMA-writable, TMA writes directly into that buffer (`WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` and `getTMAWritableEncoding`) -> relieves register traffic, extra SMEM and a consumer-side release barrier -> costs one SMEM buffer per copy, sized from the descriptor block (BLOCK_M x BLOCK_K for A, BLOCK_N x BLOCK_K for B), not from K.
+- **Operand also read in registers (multi-consumer, or cast in-kernel after a TMA load, e.g. fp32 truncated to bf16 for the MMA):** changes the load so any second user (e.g. a row reduction over A alongside the MMA) gets its own NVMMA landing buffer read with a `local_load`, and the MMA's copy is fed from registers: for B (and for A when it cannot be promoted) a separate SMEM buffer written with generic stores in a compute partition, while on sm100 a register-sourced A is normally promoted to TMEM instead (`PromoteLHSToTMem.cpp`, `LHSToTMem`) so A needs no second SMEM buffer (`WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` register-consumed path; `WSCodePartition.cpp`, `isChannelAnchorOp`: a `local_alloc` with a register source is a channel producer) -> costs, for B, two SMEM buffers per stage, a full register round trip and a partition-wide barrier on every release (next bullet); hazards: the register read of the TMA tile triggers an unreproduced code-inspection hazard ([hazards.md](hazards.md#tma-tile-read-into-registers-released-without-a-proxy-fence)), and under 2-CTA a register-modified B is not split and gives a wrong answer ([hazards.md](hazards.md#2-cta-with-an-unsplit-b)).
+- **Register-side release:** changes consumer release and producer commit to lower to a non-per-thread mbarrier arrive, a `bar.sync` across the issuing partition then a leader-thread arrive (`WSLowerToken.cpp`, `processConsumerReleaseOp` and `processProducerCommitOp`; `BarrierOpToLLVM.cpp`, `ArriveBarrierOpConversion` `perThread=false` path) -> costs one partition-wide barrier per release (per K step for an operand ring) for every register-consumed TMA buffer.
+- **Pointer-loaded operands:** get no producer pipelining, since only `DescriptorLoadOp`/`DescriptorGatherOp` go to the load partition; a pointer load issues and waits inside the compute partition that uses it, and its SMEM copy becomes a register-written channel (`PartitionSchedulingMeta.cpp`, `categorizeLoads`).
+- **`auto_tma`:** turns eligible pointer loads into descriptor loads before warp specialization, which then take the paths above (eligibility, host versus device descriptors and silent fallbacks: [AutoTMAPromotion.md](../AutoTMAPromotion.md)); the global `knobs.nvidia.auto_tma` is not in the compile cache key, so set `auto_tma=` per launch when comparing configs.
+- **Out-of-bounds TMA reads:** return the descriptor's padding value; with the default `padding="zero"`, operand tiles past M, N or K read zeros, so M/N/K tail masks on TMA operands are unnecessary for correctness, and the output tail is discarded by the TMA store's bounds (`python/triton/tools/tensor_descriptor.py`, `TensorDescriptor`).
 
 ## Interactions
 
