@@ -46,6 +46,24 @@ Each step narrows the candidate set. Later PRs fill in one branch each; see
      pipeline ever reaches steady state;
    - arithmetic intensity `2*M*N*K / bytes(A, B, C)`: memory bound or compute
      bound.
+
+   Exact definitions used by the "When to try it" rules (`P` = 148 SMs on
+   B200):
+   - `T` = output tiles = `ceil(M/BM) * ceil(N/BN) * batch * SPLIT_K`; 2-CTA
+     does not change `T` (each CTA still owns one `BM x BN` tile). `W = T/P`
+     waves.
+   - `E_tail = T / (P * ceil(T/P))`: tail efficiency under static persistence
+     (1.0 = no idle SMs in the last wave). `S_prog = ceil(T/P) * BM * BN`: the
+     busiest program's work per K step.
+   - `k_iters = ceil(K / (BK * SPLIT_K))`.
+   - `w = 1 - M*N / (ceil(M/BM)*BM * ceil(N/BN)*BN)`: M/N padding waste.
+   - `AI_min = 2*M*N*K / bytes(A, B, C)`, each operand read once and the output
+     written once. `ridge` is the `AI_min` above which a GEMM is compute bound;
+     its B200 value is a pending measurement (see TRACKER).
+   - `I_t = BM*BN / (BM + BN')`, with `BN' = BN/2` under 2-CTA and `BN`
+     otherwise: FLOP per byte of operand SMEM fill.
+   - `d_fit`: the planner's operand depth, closed form in
+     [resources.md](resources.md#when-to-try-it-depends-on-the-problem).
 3. **Never try (any problem).** Drop configs that give a compile error, are
    silently ignored, are a duplicate config, hang, or give a wrong answer.
 4. **Resource limits.** Drop configs whose SMEM, TMEM or register demand does
@@ -97,27 +115,66 @@ Every feature file has the same sections, in this order.
 5. **When to try it (depends on the problem).** Derived from the mechanism, written as
    `IF <regime / other knobs> THEN skip | only try | prefer <values> BECAUSE
    <mechanism>`. "skip" and "only try" remove configs; "prefer" only orders
-   them and removes nothing. A rule that does something else says so.
+   them and removes nothing. A rule that does something else says so. Each
+   rule ends with exactly one evidence tag: `[code]`, `[mechanism]` or
+   `[measured: ...]` (see "Evidence").
 6. **Interactions.** Links to rows in `interactions.md`.
 7. **Hazards.** Links to entries in `hazards.md`.
 8. **Not yet established.** Links to rows in [TRACKER.md](TRACKER.md).
 
 ## Citation rules
 
-- Every rule rests on a fact that can be checked in this tree. Facts that
-  cannot be checked in code become TRACKER todos or are dropped.
+- Every rule rests on evidence of one of the kinds in "Evidence" below.
+  Anything else becomes a TRACKER todo or is dropped.
 - Cite code by repo-relative file plus symbol (function, pass, option, env
   var or diagnostic string). Cite docs by file plus section heading.
-- No line numbers, no PR or issue numbers, and no dated performance numbers.
-  State mechanisms ("X relieves Y at the cost of Z"), not results ("X wins").
+- No line numbers, no PR or issue numbers, and no performance numbers.
+  "Never try (any problem)" rows state mechanisms, not results. "When to try
+  it" rules may rest on measurements only as described under [measured].
 - A rule that depends on a bug (hang, wrong answer) is deleted when the bug is
   fixed.
+
+## Evidence
+
+Every rule ends with one evidence tag.
+
+- **[code]**: a fact checkable in this tree at a file + symbol (a diagnostic,
+  a planner formula, a pass gate). Every "Never try (any problem)" row and
+  every "requires" constraint is [code]. "(reproduced)" may be added when a run
+  also showed it.
+- **[mechanism]**: an inference from [code] facts plus resource arithmetic
+  (bytes, TMEM columns, registers, tiles vs SMs, K iterations vs stages). The
+  rule writes the arithmetic and names the facts it uses. A [mechanism] rule
+  may **skip** a value only by dominance: the skipped config does the same work
+  and pays a strict superset of a cost (idle SMs by construction, unused SMEM,
+  zero-filled MMA columns, an extra synchronization) for no resource the regime
+  can use. Otherwise it may only **prefer** (rank).
+- **[measured]**: a comparison of run times, reproducible with the in-repo
+  benchmark `python/test/microbenchmark/autows_gemm.py`. Stated as a threshold
+  on a step-2 quantity, never as a timing:
+  `IF <quantity> <op> <threshold> THEN <verb> <values> BECAUSE <mechanism>. [measured: --regime <name>, <outcome>]`
+  where `<outcome>` is one of "loses on every shape in the regime", "wins on
+  every shape", or "flat within noise". Requirements:
+  - The regime's shape set has shapes on both sides of the threshold; the rule
+    is not extrapolated past the tested range, which the regime prints.
+  - **skip** needs "loses on every shape in the regime"; **prefer** needs a
+    majority; "flat within noise" becomes "pin at the default value" (it
+    removes the axis).
+  - A [measured] rule with no known mechanism may only **prefer**.
+  - All [measured] rules in this folder were run on one build and one clock
+    setting, named once in `MEASURED_ON` (commit + locked SM clock). When the
+    minimum build changes, `--rules` re-runs every regime and a rule whose
+    outcome changes is restated or deleted.
+
+Results tables do not go in these docs. The benchmark writes them to a JSON
+artifact.
 
 ## Out of scope
 
 - Explaining what knobs and passes do (see `../`, starting at
   [Overview.md](../Overview.md)).
-- Measurement methodology and search or hill-climbing procedures.
+- Measurement methodology beyond the [measured] rule format, and search or
+  hill-climbing procedures.
 - Ops outside the GEMM family, and GPUs other than B200.
 - Leaves outside AutoWS (cuBLAS or non-WS configs), for now; tracked in
   [TRACKER.md](TRACKER.md).
