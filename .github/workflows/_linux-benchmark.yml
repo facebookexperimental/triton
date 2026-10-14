@@ -12,7 +12,7 @@ on:
         type: string
         required: true
       benchmarks:
-        description: Comma-separated benchmark names under benchmarks/<name>/run.py
+        description: Comma-separated benchmark names under benchmarks/<name>/run.py in the selected Triton revision
         type: string
         required: true
       benchmark_arguments:
@@ -82,13 +82,8 @@ jobs:
           ref: ${{ inputs.tritonbench_ref }}
           submodules: recursive
 
-      - name: Checkout benchmark runners
-        uses: actions/checkout@v6
-        with:
-          path: benchmark-runner
-          sparse-checkout: benchmarks
-
-      # TritonBench uses the source checkout for commit metadata, not building.
+      # This checkout supplies benchmark runners and commit metadata.
+      # Triton itself is installed from the prebuilt wheel.
       - name: Checkout benchmarked Triton commit
         uses: actions/checkout@v6
         with:
@@ -206,7 +201,7 @@ jobs:
           if not any(benchmarks):
               sys.exit("No benchmarks specified")
           arguments = shlex.split(os.environ["BENCHMARK_ARGUMENTS"])
-          benchmark_root = Path(os.environ["GITHUB_WORKSPACE"]) / "benchmark-runner" / "benchmarks"
+          benchmark_root = Path(os.environ["GITHUB_WORKSPACE"]) / "triton" / "benchmarks"
           status = 0
           for name in benchmarks:
               runner = benchmark_root / name / "run.py"

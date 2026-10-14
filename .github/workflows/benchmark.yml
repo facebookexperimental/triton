@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       benchmarks:
-        description: Comma-separated benchmark names under benchmarks/<name>/run.py
+        description: Comma-separated benchmark names under benchmarks/<name>/run.py in each selected Triton revision
         type: string
         required: true
         default: tritonbench
