@@ -3,10 +3,10 @@
 ## Purpose
 
 This folder is context for pruning the AutoWS config space. Given one GEMM
-problem on B200, it should let an agent or a human prune every config
-combination that is infeasible or inadvisable for that problem, so that only
-the configs worth trying remain. The remaining candidates differ in structure
-(tile shape, 1-CTA vs 2-CTA, pipeline depth), not only in flat knob values.
+problem on B200, it gives a structure that prunes every infeasible config
+combination ("Never try (any problem)") and every inadvisable one for that
+problem ("When to try it (depends on the problem)"). The candidate set is
+whatever survives, of any size.
 
 These docs say **when** to use which knob values. They do not explain what a
 knob or pass is: that lives in the sibling docs in `../`, and these docs link
@@ -53,8 +53,8 @@ Each step narrows the candidate set. Later PRs fill in one branch each; see
 5. **Feature branches.** One branch per feature (tiles and stages, 2-CTA, data
    partitioning, epilogue subtiling, TMA loads/stores, persistence, ...).
 6. **Fusion branches.** What the epilogue or prologue fusion adds or rules out.
-7. **Leaves.** The AutoWS configs that survive every step above, grouped by
-   structure.
+7. **Leaves.** The AutoWS configs that survive every step above, however
+   many there are.
 
 ## Rule format
 
@@ -88,12 +88,16 @@ Every feature file has the same sections, in this order.
    code ref (file + symbol). Status is one of "compile error", "silently
    ignored", "duplicate config", "hangs", "wrong answer" or "requires" (needs
    another knob value). "(reproduced)" after a status means it was also
-   confirmed by running the kernel.
+   confirmed by running the kernel. A cell lists two statuses when runs differ
+   (e.g. "wrong answer (reproduced); hangs (reproduced)"). "silently ignored"
+   means the knob is dropped; "duplicate config" means the config compiles to
+   the same kernel as another one.
 4. **Mechanism.** What the feature changes -> what it relieves -> what it
    costs, with code refs.
 5. **When to try it (depends on the problem).** Derived from the mechanism, written as
    `IF <regime / other knobs> THEN skip | only try | prefer <values> BECAUSE
-   <mechanism>`.
+   <mechanism>`. "skip" and "only try" remove configs; "prefer" only orders
+   them and removes nothing. A rule that does something else says so.
 6. **Interactions.** Links to rows in `interactions.md`.
 7. **Hazards.** Links to entries in `hazards.md`.
 8. **Not yet established.** Links to rows in [TRACKER.md](TRACKER.md).
