@@ -40,7 +40,7 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 | Knob | State | Note |
 |------|-------|------|
 | `auto_tma` | todo | `TRITON_AUTO_TMA`, `python/triton/knobs.py`. |
-| `TRITON_WS_STAGING_COPIES` | todo | Read in `WSMemoryPlanner.cpp`. |
+| `TRITON_WS_STAGING_COPIES` | done | Read in `WSMemoryPlanner.cpp`. Documented in [TMAStoreWaitPipeline.md § `TRITON_WS_STAGING_COPIES`](../TMAStoreWaitPipeline.md#triton_ws_staging_copies-capping-the-phase-37-target). |
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | todo | Read in `Transform2CTALoads.cpp`. |
 | `maxnreg` under WS | todo | `CUDAOptions.maxnreg`, `third_party/nvidia/backend/compiler.py`. |
 | `disallow_acc_multi_buffer` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`. |
