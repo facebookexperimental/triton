@@ -73,6 +73,26 @@ Every rule is one of two kinds.
 - Code: <file + symbol>; Doc: <file + section heading>
 ```
 
+## Feature file layout
+
+Every feature file has the same sections, in this order.
+
+1. **Title and scope.** One paragraph.
+2. **Knobs.** Table: knob | how it is set | one line | link to the existing
+   doc section.
+3. **Hard prunes.** Table: condition | code | why (one line) | code ref (file +
+   symbol). Codes: `ERR` (compile error), `IGN` (silently ignored), `HANG`,
+   `WRONG` (wrong answer), `REQ` (requires another knob value), `DUP`
+   (duplicate of another config).
+4. **Mechanism.** What the feature changes -> what it relieves -> what it
+   costs, with code refs.
+5. **Pruning rules.** Derived from the mechanism, written as
+   `IF <regime / other knobs> THEN skip | only try | prefer <values> BECAUSE
+   <mechanism>`.
+6. **Interactions.** Links to rows in `interactions.md`.
+7. **Hazards.** Links to entries in `hazards.md`.
+8. **Not yet established.** Links to rows in [TRACKER.md](TRACKER.md).
+
 ## Citation rules
 
 - Every rule rests on a fact that can be checked in this tree. Facts that
