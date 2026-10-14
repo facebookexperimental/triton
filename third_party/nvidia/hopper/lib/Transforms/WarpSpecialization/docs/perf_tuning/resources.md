@@ -70,9 +70,9 @@ Facts:
 |---|---|---|---|
 | Auxiliary SMEM estimate >= budget | compile error | "estimated auxiliary shared-memory allocation ... exhausts the shared-memory budget" | `WS/WSMemoryPlanner.cpp`, `doMemoryPlanner` |
 | Plan larger than the hardware limit after floors and reuse | requires | The plan must fit the hardware limit; otherwise `OutOfResources` is raised at launch, not at compile time. The cross-stage floor is never dropped for budget, so the planner only warns | `WS/WSMemoryPlanner.cpp`, "exceeding configured smem-budget" warning |
-| `num_warps` < 4 | silently ignored | WS bails out before partitioning, so the kernel runs without WS. Under `two_ctas` this hangs instead (see `2cta.md`) | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnFuncOp` |
+| `num_warps` < 4 | silently ignored | WS bails out before partitioning, so the kernel runs without WS. Under `two_ctas` this hangs instead (see [2cta.md](2cta.md#never-try-any-problem)) | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnFuncOp` |
 | `num_warps` not 4 or 8 | silently ignored | `supportMMA` for MMAv5 accepts only 4 or 8 warps, so there is no tcgen05 and no gemm partition | `lib/Analysis/Utility.cpp`, `supportMMA`; `lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, `getMMAVersionSafe` |
-| WS warp estimate > 16 | silently ignored | All WS metadata is removed. Estimate = `num_warps` + Σ per-partition minimum warps (TMEM ops count as 4, gather/scatter as 2; `getMinWarpsForOp`). Under `two_ctas` this hangs instead (see `2cta.md`) | `WS/PartitionSchedulingMeta.cpp`, "Warp budget exceeded. Skipping warp specialization." |
+| WS warp estimate > 16 | silently ignored | All WS metadata is removed. Estimate = `num_warps` + Σ per-partition minimum warps (TMEM ops count as 4, gather/scatter as 2; `getMinWarpsForOp`). Under `two_ctas` this hangs instead (see [2cta.md](2cta.md#never-try-any-problem)) | `WS/PartitionSchedulingMeta.cpp`, "Warp budget exceeded. Skipping warp specialization." |
 | `minRegAutoWS` / `maxRegAutoWS` not a multiple of 8 | compile error | Register requests are emitted per warp group in steps of 8 | `third_party/nvidia/backend/compiler.py`, `_check_reg_auto_ws_alignment` |
 | `TRITON_WS_SMEM_PLAN_SEARCH=1` with no K loop (K == BLOCK_K as a compile-time constant) and more tiles than SMs | wrong answer (reproduced) | Plan search pins every TMEM accumulator to one copy, bypassing the per-iteration accumulator multi-buffering. See [hazards.md](hazards.md#plan-search-pins-tmem-accumulator-copies-to-1) | `WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch` |
 | `num_stages` < 1 | compile error | "nvgpu-warp-specialization requires num-stages >= 1" | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnOperation` |
@@ -134,7 +134,7 @@ Phase 4 keeps raising any buffer that still fits, so the result is A=2 / B=2 whe
 
 - 128x256x64, `ES=1`, 1-CTA: `S_stg` 65,536, slot 49,152 -> `d_fit = floor(162,816 / 49,152) = 3`. `num_stages` 5 and 6 are duplicates of 4.
 - 128x256x64, `ES=2`, separate store, `num_stages=4` (the config above): staging 4 x 32,768 -> `floor(97,280 / 49,152) = 1` balanced level; Phase 4 then adds A copies (A=3 / B=1 at a 4 KiB auxiliary bound, as in the table).
-- 128x256x128, `ES=2`: 1-CTA slot 98,304 -> `d_fit` 1; 2-CTA slot 65,536 -> `d_fit` 2. This is the case where `2cta.md` keeps only the 2-CTA variant.
+- 128x256x128, `ES=2`: 1-CTA slot 98,304 -> `d_fit` 1; 2-CTA slot 65,536 -> `d_fit` 2. This is the case where [2cta.md](2cta.md#when-to-try-it-depends-on-the-problem) keeps only the 2-CTA variant.
 
 ## Interactions
 

@@ -49,7 +49,7 @@ Two general rules apply to every entry:
 - **Status:** reproduced.
 - **Trigger:** a `tl.atomic_*` (an `AtomicRMWOp`) inside the WS loop whose operands do not depend on the accumulator, so no partition reaches it, e.g. a counter `atomic_add(cnt, 1)` or adding a constant to a column. Atomics of accumulator-derived values (a column sum, a scalar sum) are kept and are exact.
 - **Symptom:** the atomic is removed from the TTGIR, so its result stays 0 on every run, while warp specialization is still applied.
-  - Per the code, an atomic replicated to more than one partition instead makes the atomic broadcast reject and strips warp specialization from the kernel; that variant was not reproduced in testing. Under `two_ctas`, stripping WS hangs (see `2cta.md`).
+  - Per the code, an atomic replicated to more than one partition instead makes the atomic broadcast reject and strips warp specialization from the kernel; that variant was not reproduced in testing. Under `two_ctas`, stripping WS hangs (see [2cta.md](2cta.md#never-try-any-problem)).
 - **Code:**
   - `PartitionSchedulingMeta.cpp`, `runOnOperation`: the fix-up that schedules unreachable stores handles `tt.store` only and explicitly leaves atomics alone.
   - `WSAtomicBroadcast.cpp`, `classifyAtomic`: atomics with at most one task ID pass through unchanged.
