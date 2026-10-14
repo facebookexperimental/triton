@@ -114,6 +114,7 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 | [triton_tma_multicast.md](../../../../../../../../docs/design/triton_tma_multicast.md) | done | Multicast lowering is planned, not implemented. |
 | [BarrierFusion.md](../BarrierFusion.md) | done | `optimizeTMALoads` mixed-group behavior. |
 | [DynamicPersistentAutoWSGaps.md](../DynamicPersistentAutoWSGaps.md) | done | CLC flash-attention stage default is two. |
+| [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md) | done | Staging-merge and Phase 3.7 statements. |
 
 ## Knob coverage
 
