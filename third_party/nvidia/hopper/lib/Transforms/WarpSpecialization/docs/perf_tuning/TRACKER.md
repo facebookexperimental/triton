@@ -22,7 +22,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`warps_and_registers.md`](warps_and_registers.md) | done | `num_warps` and the AutoWS register budgets. Open: its "Not yet established" items. |
 | [`epilogue.md`](epilogue.md) | done | Epilogue subtiling, separate epilogue store, store placement. Open: its "Not yet established" items. |
 | [`2cta.md`](2cta.md) | done | 1-CTA vs 2-CTA (`two_ctas`). Open: its "Not yet established" items. |
-| `data_partitioning.md` | todo | `data_partition_factor`. |
+| [`data_partitioning.md`](data_partitioning.md) | done | `data_partition_factor`. Open: its "Not yet established" items. |
 | `clc_persistence.md` | todo | Static persistent vs dynamic and CLC persistent. |
 | `tma_loads.md` | todo | TMA vs pointer operand loads. |
 | `tma_stores.md` | todo | TMA vs pointer output stores. |
@@ -91,6 +91,9 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 | H-2CTA | [2cta.md § When to try it](2cta.md#when-to-try-it-depends-on-the-problem) | IF `d_fit(1-CTA) < 3` for a tile, THEN only try that tile as 2-CTA. | todo |
 | H-2CTA | [2cta.md § When to try it](2cta.md#when-to-try-it-depends-on-the-problem) | IF `T < P/2`, THEN skip 2-CTA unless the first rule forces it, BECAUSE SMEM depth is not the limiter there and the per-MMA cross-CTA rendezvous is pure cost. | todo |
 | H-2CTA | [2cta.md § When to try it](2cta.md#when-to-try-it-depends-on-the-problem) | IF plain mm/addmm, `AI_min >= ridge`, `T >= P` and 2-CTA `BLOCK_N=256` has `d_fit >= 3`, THEN skip 1-CTA `BLOCK_N=256`. Fused epilogues keep both. | todo |
+| H-DP | [data_partitioning.md § When to try it](data_partitioning.md#when-to-try-it-depends-on-the-problem) | IF `BLOCK_M=256` 1-CTA, THEN keep dp=2 and keep dp=1 only at the `EPILOGUE_SUBTILE`/`num_warps` values with `R(dp=1) <= 128`, BECAUSE dp=1 puts all 256 rows in one epilogue live set. | todo |
+| H-DP | [data_partitioning.md § When to try it](data_partitioning.md#when-to-try-it-depends-on-the-problem) | IF 2-CTA is legal for the kernel (TMA store, pair-aligned schedule), THEN skip 1-CTA `BLOCK_M=256` (dp=1 and dp=2) in favour of 2-CTA 128-row tiles. | todo |
+| H-DP | [data_partitioning.md § When to try it](data_partitioning.md#when-to-try-it-depends-on-the-problem) | IF `BLOCK_M=256`, `BLOCK_N=256` and `k_iters >= K*`, THEN the one-accumulator-copy cost is under noise and the `BLOCK_N=128` candidate can be dropped. | todo |
 
 ## Fixes to existing docs
 
@@ -105,22 +108,22 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 
 | Knob | Rules in | State |
 |------|----------|-------|
-| `BLOCK_M` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem) | covered |
-| `BLOCK_N` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem) | covered |
+| `BLOCK_M` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
+| `BLOCK_N` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `BLOCK_K` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
-| `num_stages` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem) | covered |
+| `num_stages` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `num_stages` (per loop) | — | mentioned |
 | `flatten` | — | todo |
-| `disallow_acc_multi_buffer` | — | mentioned |
+| `disallow_acc_multi_buffer` | [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `loop_unroll_factor`, `disable_licm` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `warp_specialize` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem) | covered |
-| `data_partition_factor` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
+| `data_partition_factor` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `separate_epilogue_store` | [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem); [epilogue.md](epilogue.md#never-try-any-problem) | covered |
 | `merge_epilogue` | — | mentioned |
 | `merge_epilogue_to_computation`, `merge_correction` | — | mentioned |
-| `pingpongAutoWS` | — | todo |
+| `pingpongAutoWS` | — | mentioned |
 | `multi_cta` | — | todo |
-| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem) | covered |
+| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `allowDependentTwoCTA` | [2cta.md](2cta.md#never-try-any-problem) | covered |
 | `ctas_per_cga` | [2cta.md](2cta.md#never-try-any-problem) | covered |
 | Tile scheduler | [2cta.md](2cta.md#never-try-any-problem) | covered |
@@ -137,7 +140,7 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `tma_store_pipelining` | — | mentioned |
 | `TRITON_WS_STAGING_COPIES` | [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem) | covered |
 | `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | [epilogue.md](epilogue.md#never-try-any-problem) | covered |
-| `num_warps` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem) | covered |
+| `num_warps` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `maxnreg` | [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
