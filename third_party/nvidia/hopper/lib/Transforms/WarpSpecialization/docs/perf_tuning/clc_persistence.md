@@ -81,7 +81,7 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 - tile scheduler × `separate_epilogue_store` / `EPILOGUE_SUBTILE`
 - tile scheduler × loop `num_stages`
 - tile scheduler × `pingpongAutoWS` (see [pingpong.md](pingpong.md))
-- tile scheduler × TMA multicast (see `multicast.md`)
+- tile scheduler × TMA multicast (see [multicast.md](multicast.md))
 - tile scheduler × `TRITON_WS_TILE_PREFETCH_DEPTH`
 - tile scheduler × `merge_*` / SMEM-TMEM allocation knobs
 - `clc` × `TRITON_USE_META_WS`
