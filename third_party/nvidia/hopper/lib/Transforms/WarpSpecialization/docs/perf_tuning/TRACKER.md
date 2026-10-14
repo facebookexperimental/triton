@@ -60,8 +60,8 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 
 | Knob | Rules in | State |
 |------|----------|-------|
-| `BLOCK_M` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
-| `BLOCK_N` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `BLOCK_M` | — | mentioned |
+| `BLOCK_N` | — | mentioned |
 | `BLOCK_K` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `num_stages` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `num_stages` (per loop) | — | todo |
@@ -95,7 +95,7 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `num_warps` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
 | `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `maxnreg` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `maxnreg` | — | mentioned |
 | `sched4reg`, `enable_tree_reduction` | — | todo |
 | `tmem_alloc_algo` | — | todo |
 | `smem_alloc_algo` | — | todo |
@@ -115,3 +115,4 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 |------|-------|------|
 | Inductor reference definition | todo | Definition pending. Until then `knobs.md` has no column for what Inductor sets. |
 | Leaves outside AutoWS | todo | cuBLAS or non-WS leaves; later. |
+| Multicast rules once lowering lands | todo | `multicast.md` has no when-to-try rules while multicast is inert; re-derive them from the planner conditions when the lowering is implemented. |
