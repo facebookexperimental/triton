@@ -23,7 +23,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`epilogue.md`](epilogue.md) | done | Epilogue subtiling, separate epilogue store, store placement. Open: its "Not yet established" items. |
 | [`2cta.md`](2cta.md) | done | 1-CTA vs 2-CTA (`two_ctas`). Open: its "Not yet established" items. |
 | [`data_partitioning.md`](data_partitioning.md) | done | `data_partition_factor`. Open: its "Not yet established" items. |
-| `clc_persistence.md` | todo | Static persistent vs dynamic and CLC persistent. |
+| [`clc_persistence.md`](clc_persistence.md) | done | Static persistent vs dynamic and CLC persistent. Open: its "Not yet established" items. |
 | `tma_loads.md` | todo | TMA vs pointer operand loads. |
 | `tma_stores.md` | todo | TMA vs pointer output stores. |
 | `split_k.md` | todo | Splitting one output tile's K reduction (split-K, decomposeK, stream-K) and the single-K-tile path. |
@@ -94,6 +94,10 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 | H-DP | [data_partitioning.md § When to try it](data_partitioning.md#when-to-try-it-depends-on-the-problem) | IF `BLOCK_M=256` 1-CTA, THEN keep dp=2 and keep dp=1 only at the `EPILOGUE_SUBTILE`/`num_warps` values with `R(dp=1) <= 128`, BECAUSE dp=1 puts all 256 rows in one epilogue live set. | todo |
 | H-DP | [data_partitioning.md § When to try it](data_partitioning.md#when-to-try-it-depends-on-the-problem) | IF 2-CTA is legal for the kernel (TMA store, pair-aligned schedule), THEN skip 1-CTA `BLOCK_M=256` (dp=1 and dp=2) in favour of 2-CTA 128-row tiles. | todo |
 | H-DP | [data_partitioning.md § When to try it](data_partitioning.md#when-to-try-it-depends-on-the-problem) | IF `BLOCK_M=256`, `BLOCK_N=256` and `k_iters >= K*`, THEN the one-accumulator-copy cost is under noise and the `BLOCK_N=128` candidate can be dropped. | todo |
+| H-SCHED | [clc_persistence.md § When to try it](clc_persistence.md#when-to-try-it-depends-on-the-problem) | IF `T <= P`, THEN keep only one of static persistent and non-persistent (both assign the same tile to each program). | todo |
+| H-SCHED | [clc_persistence.md § When to try it](clc_persistence.md#when-to-try-it-depends-on-the-problem) | IF `T < T_np`, THEN prefer non-persistent over static persistent. | todo |
+| H-SCHED | [clc_persistence.md § When to try it](clc_persistence.md#when-to-try-it-depends-on-the-problem) | IF tiles are uniform (dense mm/addmm/bmm) and `T > P`, THEN skip CLC. | todo |
+| H-SCHED | [clc_persistence.md § When to try it](clc_persistence.md#when-to-try-it-depends-on-the-problem) | IF `T > P`, THEN pin `GROUP_M=8`. | todo |
 
 ## Fixes to existing docs
 
@@ -111,8 +115,8 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `BLOCK_M` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `BLOCK_N` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `BLOCK_K` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
-| `num_stages` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
-| `num_stages` (per loop) | — | mentioned |
+| `num_stages` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
+| `num_stages` (per loop) | [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
 | `flatten` | — | todo |
 | `disallow_acc_multi_buffer` | [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `loop_unroll_factor`, `disable_licm` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
@@ -121,13 +125,13 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `separate_epilogue_store` | [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem); [epilogue.md](epilogue.md#never-try-any-problem) | covered |
 | `merge_epilogue` | — | mentioned |
 | `merge_epilogue_to_computation`, `merge_correction` | — | mentioned |
-| `pingpongAutoWS` | — | mentioned |
+| `pingpongAutoWS` | [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
 | `multi_cta` | — | todo |
-| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
+| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
 | `allowDependentTwoCTA` | [2cta.md](2cta.md#never-try-any-problem) | covered |
-| `ctas_per_cga` | [2cta.md](2cta.md#never-try-any-problem) | covered |
-| Tile scheduler | [2cta.md](2cta.md#never-try-any-problem) | covered |
-| `clc` | — | mentioned |
+| `ctas_per_cga` | [2cta.md](2cta.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
+| Tile scheduler | [2cta.md](2cta.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
+| `clc` | [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
 | `tt.autows` stage/order | — | todo |
 | Descriptor loads/stores | — | todo |
 | `multicast` (per load) | — | mentioned |
@@ -153,7 +157,7 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `mem_plan_pick` + `TRITON_WS_MEM_PLAN_TOPK` / `_PICK` | — | todo |
 | `TRITON_WS_SMEM_PLAN_SEARCH` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | — | todo |
-| `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | — | todo |
+| `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | — | mentioned |
 | Alternative schedulers: `TRITON_USE_MODULO_SCHEDULE` (+ `TRITON_MODULO_*`), `TRITON_USE_JOINT_SCHEDULE`‡, `TRITON_USE_LLM_SCHEDULE`‡, `TRITON_USE_LIST_SCHEDULE` | — | todo |
 | `list_schedule_pick` | — | todo |
 
