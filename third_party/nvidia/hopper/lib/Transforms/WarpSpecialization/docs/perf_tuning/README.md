@@ -1,0 +1,118 @@
+# AutoWS Perf Tuning Context (GEMM family, B200)
+
+## Purpose
+
+This folder is context for pruning the AutoWS config space. Given one GEMM
+problem on B200, it should let an agent or a human cut the config space down to
+2-3 structurally distinct candidate configs. Candidates differ in structure
+(tile shape, 1-CTA vs 2-CTA, pipeline depth), not only in flat knob values.
+
+These docs say **when** to use which knob values. They do not explain what a
+knob or pass is: that lives in the sibling docs in `../`, and these docs link
+to them by file and section heading instead of repeating them.
+
+Scope: the GEMM family (`tl.dot` based mm, addmm, bmm, grouped mm and their
+fused epilogues/prologues) on B200, compiled with the Meta WS backend
+(`TRITON_USE_META_WS=1`). For now the leaves of the tree are AutoWS configs
+only.
+
+## Points of reference
+
+A candidate is always compared against one of four mutually exclusive
+references. Name the reference with every comparison.
+
+| Reference | Definition |
+|-----------|------------|
+| cuBLAS | The cuBLAS baseline for the same op, shapes, dtypes and layouts. |
+| Inductor | Inductor with its Triton AutoWS template forced. TBD: definition pending. |
+| AutoWS | The kernel, including any fusion, written purely in Triton and compiled with AutoWS. |
+| TLX | The kernel written purely in TLX, possibly translated Triton -> TTGIR -> TLX. |
+
+## Decision tree (skeleton)
+
+Each step narrows the candidate set. Later PRs fill in one branch each; see
+[TRACKER.md](TRACKER.md).
+
+1. **Problem description.** Op; dtypes (inputs, accumulator, output);
+   M, N, K and batch; operand layouts (row/column major, strides); epilogue
+   and fusion (what is applied to the accumulator before the store, and any
+   prologue on the operands).
+2. **Regime, from derived quantities** rather than "small" or "large":
+   - output tile count `ceil(M/BLOCK_M) * ceil(N/BLOCK_N) * batch` against the
+     SM count (148 on B200): fewer tiles than SMs, about one wave, or many
+     waves;
+   - K iterations `ceil(K/BLOCK_K)` against `num_stages`: whether the
+     pipeline ever reaches steady state;
+   - arithmetic intensity `2*M*N*K / bytes(A, B, C)`: memory bound or compute
+     bound.
+3. **Hard prunes.** Drop configs that give a compile error, are silently
+   ignored, are a duplicate config, hang, or give a wrong answer.
+4. **Resource limits.** Drop configs whose SMEM, TMEM or register demand does
+   not fit.
+5. **Feature branches.** One branch per feature (tiles and stages, 2-CTA, data
+   partitioning, epilogue subtiling, TMA loads/stores, persistence, ...).
+6. **Fusion branches.** What the epilogue or prologue fusion adds or rules out.
+7. **Leaves.** 2-3 structurally distinct AutoWS candidate configs.
+
+## Rule format
+
+Every rule is one of two kinds.
+
+- **Hard prune.** The config gives a compile error, is silently ignored, is a
+  duplicate config, hangs, gives a wrong answer, or requires another knob
+  value. State the condition and the code that enforces or exhibits it.
+- **Mechanism.** State what the knob changes, what that relieves, what it
+  costs, and the pruning that follows.
+
+```
+### <short rule name>
+- Kind: hard prune | mechanism
+- When: <condition on the problem description or derived quantities>
+- Rule: <keep / drop / prefer which knob values>
+- Why: <hard prune: what goes wrong. Mechanism: changes -> relieves -> costs -> prune>
+- Code: <file + symbol>; Doc: <file + section heading>
+```
+
+## Feature file layout
+
+Every feature file has the same sections, in this order.
+
+1. **Title and scope.** One paragraph.
+2. **Knobs.** Table: knob | how it is set | one line | link to the existing
+   doc section.
+3. **Hard prunes.** Table: condition | status | why (one line) | code ref
+   (file + symbol). Status is one of "compile error", "silently ignored",
+   "duplicate config", "hangs", "wrong answer" or "requires" (needs another
+   knob value).
+4. **Mechanism.** What the feature changes -> what it relieves -> what it
+   costs, with code refs.
+5. **Pruning rules.** Derived from the mechanism, written as
+   `IF <regime / other knobs> THEN skip | only try | prefer <values> BECAUSE
+   <mechanism>`.
+6. **Interactions.** Links to rows in `interactions.md`.
+7. **Hazards.** Links to entries in `hazards.md`.
+8. **Not yet established.** Links to rows in [TRACKER.md](TRACKER.md).
+
+## Citation rules
+
+- Every rule rests on a fact that can be checked in this tree. Facts that
+  cannot be checked in code become TRACKER todos or are dropped.
+- Cite code by repo-relative file plus symbol (function, pass, option, env
+  var or diagnostic string). Cite docs by file plus section heading.
+- No line numbers, no PR or issue numbers, and no dated performance numbers.
+  State mechanisms ("X relieves Y at the cost of Z"), not results ("X wins").
+- A rule that depends on a bug (hang, wrong answer) is deleted when the bug is
+  fixed.
+
+## Out of scope
+
+- Explaining what knobs and passes do (see `../`, starting at
+  [Overview.md](../Overview.md)).
+- Measurement methodology and search or hill-climbing procedures.
+- Ops outside the GEMM family, and GPUs other than B200.
+- Leaves outside AutoWS (cuBLAS or non-WS configs), for now; tracked in
+  [TRACKER.md](TRACKER.md).
+
+## Files
+
+The planned files and their status are listed in [TRACKER.md](TRACKER.md).
