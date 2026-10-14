@@ -23,6 +23,7 @@ Every condition below leaves the kernel unchanged with no diagnostic (debug log 
 | the expensive-op group spans 1 or more than 2 partitions | silently ignored | "Only handle pingpong for the case of 2 different partitions" | `WS/PingPong.cpp`, `doPingPongPrep` |
 | the expensive ops have no enclosing `scf.for` (e.g. an epilogue directly in a dynamic or CLC outer `while`) | silently ignored | "No parent ForOp found, skipping this critical region" | `WS/PingPong.cpp`, `doPingPongPrep` |
 | the ops differ in op name, sit in different blocks or across control flow, or have a real memory effect between them in one partition | silently ignored | The ops are not grouped (group formation rules) | `WS/PingPong.cpp`, `doPingPongPrep`; [PingPongScheduling.md, "Step 1: Group Expensive Ops"](../PingPongScheduling.md#step-1-group-expensive-ops) |
+| `pingpongAutoWS=True` on a GEMM, even with every condition below met (static persistent loop, dp=2 at `BLOCK_M=256`, a pure SFU op with a 2-D result, any `merge_epilogue` × `separate_epilogue_store` combination) | duplicate config (reproduced) | Both data-partition halves' SFU ops land in one partition, so no region has two partitions and the TTGIR is identical with pingpong on or off | `WS/PingPong.cpp`, `doPingPongPrep`; `WS/PartitionSchedulingMeta.cpp` |
 | the two partitions' ops do not alternate cleanly in the loop schedule | silently ignored | "Skipping group due to invalid pingpong schedule pattern" | `WS/PingPong.cpp`, `arrivesFirst`, `doPingPongPrep` |
 
 ## Mechanism
@@ -40,14 +41,11 @@ Every condition below leaves the kernel unchanged with no diagnostic (debug log 
 
 **Where a GEMM can trigger it.**
 - In a GEMM, a second consumer partition comes from `data_partition_factor=2`, which gives two computation groups (see [data_partitioning.md](data_partitioning.md)).
-- So a GEMM can only form a region when all of these hold:
-  - dp=2;
-  - an epilogue (or fused prologue) applies SFU math to 2-D tiles in both groups;
-  - that code sits inside an `scf.for`, i.e. a static persistent schedule.
+- The documented conditions for a region in a GEMM are: dp=2, SFU math on 2-D tiles in both groups, inside an `scf.for` (static persistent). On this build they are not enough: both data-partition halves sit in the default region (see [warps_and_registers.md](warps_and_registers.md#mechanism)), so their SFU ops are in one partition and no region forms.
 
 ## When to try it (depends on the problem)
 
-No rules yet; the pending hypotheses for this file are listed in [TRACKER.md](TRACKER.md#measured-hypotheses-pending-autows_gemmpy-campaign).
+No rules: `pingpongAutoWS` is always a duplicate config for a GEMM on this build (see "Never try (any problem)").
 
 ## Interactions
 
