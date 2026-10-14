@@ -42,7 +42,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 **What it costs.**
 - **TMEM is the same as the undivided tile:** `dp · (BLOCK_M/dp) · BLOCK_N` fp32, i.e. `2·BLOCK_N` columns at `BLOCK_M=256`. The planner raises accumulator copies round-robin only while the total stays within 512 columns (`WS/WSMemoryPlanner.cpp`, the TMEM `buffer.copy` post-processing with `tmemColLimit`). At `BLOCK_N=256` that leaves one accumulator copy, so the epilogue of tile i cannot overlap the MMAs of tile i+1.
 - **Extra consumer groups:** one per slice. In the GEMM layouts both sit in the default region.
-- **With `disallow_acc_multi_buffer`,** every TMA-fed SMEM operand of the MMA is floored at the full `num_stages` (`WS/WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor`). When that floor does not fit, the planner gives it back one copy at a time (`relaxCopySafetyFloorToBudget`), so the effect is a preference for full operand depth, not a hard floor.
+- **With `disallow_acc_multi_buffer`,** every TMA-fed SMEM operand of the MMA is floored at the full `num_stages` (`WS/WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor`). When that floor does not fit, the planner gives it back one copy at a time (`relaxCopySafetyFloorToBudget`). The floor matters: a relaxed floor with a TMA-loaded epilogue input hangs once a CTA runs several tiles (reproduced; [hazards.md](hazards.md#relaxed-operand-copy-floor-with-a-tma-loaded-epilogue-input-several-tiles-per-cta)).
 
 ## When to try it (depends on the problem)
 
@@ -50,7 +50,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 - **IF** `BLOCK_M=64`, **THEN** only try dp=2 with `BLOCK_N=256` (N split), **BECAUSE** every other `BLOCK_N` fails to compile.
 - **IF** `BLOCK_M=256`, **THEN** try dp=1 and dp=2, **BECAUSE** dp=2 is the only way to split a 256-row tile into two 128-row consumer groups without 2-CTA.
 - **IF** dp=2 and `BLOCK_N=256`, **THEN** prefer configs whose epilogue does not depend on cross-tile overlap, or keep a dp=1 / smaller-`BLOCK_N` candidate, **BECAUSE** TMEM holds only one accumulator copy.
-- **IF** dp > 1 with `disallow_acc_multi_buffer`, **THEN** prefer (ranks first; removes nothing) `num_stages` whose full operand ring fits the SMEM budget, **BECAUSE** the planner floors operand depth at `num_stages` and only gives the floor back when it does not fit.
+- **IF** dp > 1 and the epilogue has a TMA-loaded input, **THEN** only try `num_stages` whose full operand ring fits the SMEM budget (this removes the rest), **BECAUSE** a relaxed copy-safety floor hangs once a CTA runs several tiles (reproduced).
 - **IF** dp=1, **THEN** skip `disallow_acc_multi_buffer=True` (this removes it), **BECAUSE** it is a duplicate config of `False`.
 - **IF** a kernel has more than one annotated loop, **THEN** use one `data_partition_factor` for all of them, **BECAUSE** mismatches are not diagnosed in release builds.
 
