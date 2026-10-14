@@ -141,7 +141,7 @@ Phase 4 keeps raising any buffer that still fits, so the result is A=2 / B=2 whe
 
 - 128x256x64, `ES=1`, 1-CTA: `S_stg` 65,536, slot 49,152 -> `d_fit = floor(162,816 / 49,152) = 3`. `num_stages` above the fit adds no operand copies.
 - 128x256x64, `ES=2`, separate store, `num_stages=4` (the config above): staging 4 x 32,768 -> `floor(97,280 / 49,152) = 1` balanced level; Phase 4 then adds A copies (A=3 / B=1 at a 4 KiB auxiliary bound, as in the table).
-- 128x256x128, `ES=2`: 1-CTA slot 98,304 -> `d_fit` 1; 2-CTA slot 65,536 -> `d_fit` 2. Only the 2-CTA variant double-buffers the operand ring here (`2cta.md`).
+- 128x256x128, `ES=2`: 1-CTA slot 98,304 -> `d_fit` 1; 2-CTA slot 65,536 -> `d_fit` 2. Only the 2-CTA variant double-buffers the operand ring here ([2cta.md](2cta.md#mechanism)).
 
 ## Interactions
 
