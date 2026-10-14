@@ -28,7 +28,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`large_k.md`](large_k.md) | done | K iterations far above `num_stages`, including split-K style K splitting. Open: its "Not yet established" items. |
 | [`pingpong.md`](pingpong.md) | done | Ping-pong scheduling. Open: its "Not yet established" items. |
 | [`multicast.md`](multicast.md) | done | TMA multicast. Open: its "Not yet established" items. |
-| `epilogue_prologue_tma_loads.md` | todo | TMA loads of extra epilogue/prologue inputs. |
+| [`epilogue_prologue_tma_loads.md`](epilogue_prologue_tma_loads.md) | done | TMA loads of extra epilogue/prologue inputs. Open: its "Not yet established" items. |
 | `fused_reductions.md` | todo | Reductions fused into the epilogue. |
 
 ## Docs for undocumented knobs
