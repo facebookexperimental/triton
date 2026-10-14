@@ -22,7 +22,7 @@ Code paths are relative to the repository root.
 |---|---|---|---|
 | any use of `multicast=True` / the `multicast` option in this tree | silently ignored | The planning pass records its choice only as the `tt.multicast_axes` attribute, and nothing reads it. Every descriptor-load lowering creates the TMA copy without multicast targets: the Meta WS load lowering, the non-WS TMA lowering and the software pipeliner | `lib/Dialect/TritonNvidiaGPU/Transforms/TMAMulticast.cpp`, `TritonNvidiaGPUTMAMulticastPass`; `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSLowerMem.cpp`, `optimizeTMALoads`; `lib/Dialect/TritonNvidiaGPU/Transforms/TMALowering.cpp`, `TMALoadLowering`; `lib/Dialect/TritonGPU/Transforms/Pipeliner/LowerLoops.cpp`, `createTMAAsyncLoad` |
 
-[triton_tma_multicast.md, "Current implementation"](../../../../../../../../docs/design/triton_tma_multicast.md#current-implementation) describes lowering steps (recipient masks, `.multicast::cluster` PTX) that the code does not perform yet. The same doc gives conflicting statements on Meta AutoWS support; with no lowering, neither applies.
+[triton_tma_multicast.md, "Current implementation"](../../../../../../../../docs/design/triton_tma_multicast.md#current-implementation) marks the lowering steps (recipient masks, `.multicast::cluster` PTX) as planned, not implemented.
 
 ## Mechanism
 
