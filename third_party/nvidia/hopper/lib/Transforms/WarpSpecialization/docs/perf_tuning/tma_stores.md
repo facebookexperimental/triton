@@ -9,43 +9,27 @@ Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). 
 
 ## Knobs
 
-| Knob | How set | One line | Existing doc |
-|---|---|---|---|
-| TMA store | `desc.store(...)` on a tensor descriptor (or a pointer store promoted by `auto_tma` in a WS kernel) | The only store form the partition scheduler treats as an epilogue store. | [MemoryLowering.md](../MemoryLowering.md), section "TMA Store Lowering" |
-| `separate_epilogue_store` | `tl.range(..., separate_epilogue_store=True)` (loop attribute `tt.separate_epilogue_store`; also a pass option) | Gives TMA stores their own 1-warp `epilogue_store` partition. | [PartitionSchedulingMeta.md](../PartitionSchedulingMeta.md), sections "Epilogue Terminology" and "Target Partition Layouts" |
-| `merge_epilogue` / `merge_epilogue_to_computation` | `tl.range(...)` loop attributes `tt.merge_epilogue` / `tt.merge_epilogue_to_computation` | Puts the post-loop epilogue in an existing partition instead of a separate `epilogue` partition. | [PartitionSchedulingMeta.md](../PartitionSchedulingMeta.md), section "Target Partition Layouts" |
-| `TRITON_WS_STAGING_COPIES` | env var | Caps the depth of the TMA-store staging ring that the planner may grow to. It also caps other Phase 3.7 epilogue groups and, unless `TRITON_WS_TMA_REDUCE_STAGING_COPIES` is set, TMA-reduce staging. | [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md#triton_ws_staging_copies-capping-the-phase-37-target), section "`TRITON_WS_STAGING_COPIES`: capping the Phase 3.7 target" |
-| `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | env var | Copy target for TMA-reduce staging. It is independent of `num_stages`. | [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Phase 3.7: Epilogue Group Copy Increase" |
-| `tma_store_pipelining` | compile option, on by default | Annotates and reorders TMA store waits so that staging slots can be reused. | [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Wait Annotation and Reordering Pipeline" |
+| Knob | Set via | Legal values | Default | Priority | Applies when | Prereqs |
+|---|---|---|---|---|---|---|
+| `early_tma_store_lowering` | compile option | None (= True) / False | True | P0 | Kernels with TMA stores. | — |
+| `tma_store_pipelining` | compile option | None (= True) / False | True | P0 | Kernels with TMA stores. | — |
 
-## Never try (any problem)
+## Pruning ruleset
 
-| Condition | Status | Why | Code ref |
-|---|---|---|---|
-| `separate_epilogue_store=True` with a pointer `tl.store` epilogue (no TMA store) | duplicate config | The epilogue-store category contains only `DescriptorStoreOp`, `AsyncTMACopyLocalToGlobalOp` and `TMAStoreTokenWaitOp`. A pointer store goes to the partition of the loop's other stores, or to the default partition. | `PartitionSchedulingMeta.cpp`, `isEpilogueStoreOp`; the unreachable-store fix-up in `runOnOperation` |
-| `TRITON_WS_STAGING_COPIES` at `EPILOGUE_SUBTILE=1` | duplicate config | Phase 3.7 only deepens staging groups that hold 2 or more subtile buffers. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
-| `TRITON_WS_STAGING_COPIES` with `two_ctas=True` | silently ignored | Ordinary 2-CTA TMA output staging is kept at one copy. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` (2-CTA branch) |
-| 2-CTA TMA output staging whose correctness floor needs more than one copy | compile error | The planner emits "2CTA ordinary TMA output staging requires one copy" and marks the plan invalid. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
-| A staging copy count, for staging drained in the same partition, that does not divide the subtile count | duplicate config | The planner skips that depth: store waits drain a fixed in-flight count, so same-slot stores must be exactly K apart in issue order. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies`; [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Phase 3.7: Epilogue Group Copy Increase" |
+| Condition | Status | Why |
+|---|---|---|
+| `separate_epilogue_store=True` with a pointer `tl.store` epilogue (no TMA store) | duplicate config | The epilogue-store category contains only `DescriptorStoreOp`, `AsyncTMACopyLocalToGlobalOp` and `TMAStoreTokenWaitOp`. |
+| `TRITON_WS_STAGING_COPIES` at `EPILOGUE_SUBTILE=1` | duplicate config | Phase 3.7 only deepens staging groups that hold 2 or more subtile buffers. |
+| `TRITON_WS_STAGING_COPIES` with `two_ctas=True` | silently ignored | Ordinary 2-CTA TMA output staging is kept at one copy. |
+| 2-CTA TMA output staging whose correctness floor needs more than one copy | compile error | The planner emits "2CTA ordinary TMA output staging requires one copy" and marks the plan invalid. |
+| A staging copy count, for staging drained in the same partition, that does not divide the subtile count | duplicate config | The planner skips that depth: store waits drain a fixed in-flight count, so same-slot stores must be exactly K apart in issue order. |
 
 ## Mechanism
 
-**Store partition placement.**
-- **What changes:** with `separate_epilogue_store`, partition layout creates an `epilogue_store` partition and schedules TMA stores, plus any op whose input comes from that partition, into it. Without it, stores follow the epilogue target: the `epilogue` partition, or the merged partition when a `merge_epilogue*` attribute is set. Per-loop `tt.separate_epilogue_store` / `tt.merge_epilogue` attributes override the pass options.
-- **What it relieves:** the store wait and staging handshake move off the partition that drains TMEM and does epilogue math.
-- **What it costs:** one more partition (1 warp at minimum producer register budget), plus a cross-partition staging channel with full/empty barriers.
-- Code: `PartitionSchedulingMeta.cpp`, `createPartitionLayout` and `schedulePostLoopOps`.
-
-**Every annotated loop is partitioned on its own.**
-- **What changes:** partition scheduling separately schedules every `scf.for` or `scf.while` carrying `warp_specialize`, inner loop first, including one nested inside another annotated loop.
-- **What it costs:** if a persistent GEMM's inner K loop also carries `warp_specialize=True`, it is partitioned first, and the outer tile loop's epilogue placement works around an already-partitioned loop.
-- Code: `PartitionSchedulingMeta.cpp`, `runOnOperation`.
-
-**Staging ring and store waits** (shared mechanics in [epilogue.md](epilogue.md#mechanism)).
-- **What changes:** each TMA store is fed from a staging ring of BLOCK_M x BLOCK_N / EPILOGUE_SUBTILE x output element size per copy (one store's subtile buffers fused). Phase 3.7 grows its copy count K up to `min(num_stages, TRITON_WS_STAGING_COPIES)` within the SMEM budget. Same-partition drain: each wait is `cp.async.bulk.wait_group(K-1)` and K must divide the subtile count S. Different-partition drain: mbarrier rotation, any K.
-- **What it relieves:** with K > 1, the next subtile's `local_store` proceeds while earlier TMA stores drain.
-- **What it costs:** K x the subtile staging size of SMEM, from the same budget as the operand ring.
-- Code: `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` and `getStagingCopiesCap`; `WSTMAStoreLowering.cpp` (planned pending count = K-1). Background: [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), sections "Phase 3.5: TMA Staging Fusion" and "Phase 3.7: Epilogue Group Copy Increase".
+- **Store partition placement:** changes, with `separate_epilogue_store`, the partition layout to create an `epilogue_store` partition and schedule TMA stores, plus any op whose input comes from that partition, into it; without it, stores follow the epilogue target (the `epilogue` partition, or the merged partition when a `merge_epilogue*` attribute is set), and per-loop `tt.separate_epilogue_store` / `tt.merge_epilogue` attributes override the pass options (`PartitionSchedulingMeta.cpp`, `createPartitionLayout` and `schedulePostLoopOps`) -> relieves by moving the store wait and staging handshake off the partition that drains TMEM and does epilogue math -> costs one more partition (1 warp at minimum producer register budget) plus a cross-partition staging channel with full/empty barriers.
+- **Every annotated loop is partitioned on its own:** partition scheduling separately schedules every `scf.for` or `scf.while` carrying `warp_specialize`, inner loop first, including one nested inside another annotated loop (`PartitionSchedulingMeta.cpp`, `runOnOperation`) -> costs: if a persistent GEMM's inner K loop also carries `warp_specialize=True`, it is partitioned first, and the outer tile loop's epilogue placement works around an already-partitioned loop.
+- **Staging ring and store waits (shared mechanics in [epilogue.md](epilogue.md#mechanism)):** changes each TMA store to be fed from a staging ring of BLOCK_M x BLOCK_N / EPILOGUE_SUBTILE x output element size per copy (one store's subtile buffers fused), whose copy count K Phase 3.7 grows up to `min(num_stages, TRITON_WS_STAGING_COPIES)` within the SMEM budget; same-partition drain waits with `cp.async.bulk.wait_group(K-1)` and K must divide the subtile count S, different-partition drain uses mbarrier rotation with any K (`WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` and `getStagingCopiesCap`; `WSTMAStoreLowering.cpp`, planned pending count = K-1; background: [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), sections "Phase 3.5: TMA Staging Fusion" and "Phase 3.7: Epilogue Group Copy Increase") -> relieves, with K > 1, by letting the next subtile's `local_store` proceed while earlier TMA stores drain -> costs K x the subtile staging size of SMEM, from the same budget as the operand ring.
+- **`early_tma_store_lowering` and `tma_store_pipelining`:** the first (default on) sets `ttg.early_tma_store_lowering`, so TMA stores are lowered to staging allocations before the WS memory planner runs and the planner can size them (`third_party/nvidia/backend/compiler.py`, `make_ttgir`; `WSTMAStoreLowering.cpp`); the second (default on) is passed to the WS pass and annotates, validates and reorders TMA store waits so staging slots can be reused (`doAnnotateTMAStoreWaits`, `doTMAStoreWaitReorder`) -> relieves staging reuse -> costs nothing when off except the reuse ([TMAStoreWaitPipeline.md, "Wait Annotation and Reordering Pipeline"](../TMAStoreWaitPipeline.md#wait-annotation-and-reordering-pipeline)).
 
 ## Interactions
 
