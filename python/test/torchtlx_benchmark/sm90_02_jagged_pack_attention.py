@@ -1,15 +1,17 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 """Jagged -> padded pack feeding a per-row RMSNorm (shared K=V) and learned-query attention.
 
-Baseline: stock Inductor (gather fused into the norm kernel, bf16 K written, stock flex
-template reads it). Candidate: the same model with torchTLX on, the slot for an sm90 TLX
-flex template that gathers and normalizes K in its load path. Padded rows are RMSNorm(pos)
+Baseline: SDPA with torchTLX off. Candidate: flex attention with torchTLX allowed
+to gather and normalize K in its load path. Padded rows are RMSNorm(pos)
 keys, so attention stays dense. FILL is the mean jagged length / kv_len.
 """
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
+
+from torchtlx_benchmark.run_torchtlx_fusions import attention
 
 if TYPE_CHECKING:
     import torch
@@ -68,18 +70,20 @@ def _gather_pack(values, offsets, max_len):
     return values[idx] * (pos < lengths[:, None]).unsqueeze(-1)
 
 
-def _attention(q_seed, wq, padded, pos):
-    from torch.nn.attention.flex_attention import flex_attention
-
+def _attention(q_seed, wq, padded, pos, use_flex):
     rms_norm = torch.nn.functional.rms_norm
     q = torch.nn.functional.linear(rms_norm(q_seed, (HEAD_DIM, ), eps=EPS).bfloat16(), wq)
     q = q.expand(padded.shape[0], -1, -1).unsqueeze(1)
     k = rms_norm(padded + pos, (HEAD_DIM, ), eps=EPS).bfloat16().unsqueeze(1)
-    return flex_attention(q.contiguous(), k, k)
+    return attention(q.contiguous(), k, k, use_flex=use_flex)
 
 
-def model(q_seed, wq, values, offsets, pos) -> torch.Tensor:
-    return _attention(q_seed, wq, _gather_pack(values, offsets, KV_LEN), pos)
+def model(q_seed, wq, values, offsets, pos, *, use_flex=False) -> torch.Tensor:
+    return _attention(q_seed, wq, _gather_pack(values, offsets, KV_LEN), pos, use_flex)
+
+
+def comparison_models():
+    return model, partial(model, use_flex=True)
 
 
 def make_inputs() -> tuple[torch.Tensor, ...]:
