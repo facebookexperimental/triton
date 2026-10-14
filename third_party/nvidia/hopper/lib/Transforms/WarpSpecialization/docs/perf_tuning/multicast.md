@@ -30,7 +30,7 @@ Code paths are relative to the repository root.
 - the load is a tiled `tt.descriptor_load` in a single-block kernel;
 - the cluster dimensions are powers of two, with 2 to 16 CTAs in total;
 - the load's indices and descriptor are provably the same along a cluster axis;
-- no enclosing `for`/`while`/`if` control value depends on a cluster axis of size > 1. A static persistent loop starting at `program_id(0)` under a `(2,1,1)` cluster fails this check; CLC results count as cluster-uniform.
+- no enclosing `for`/`while`/`if` control value depends on a cluster axis of size > 1. A static persistent loop starting at `program_id(0)` under a `(2,1,1)` cluster fails this check. Only the validity bit of a CLC result counts as cluster-uniform; its tile coordinates do not (`ProgramIdDependencyAnalysis`).
 
 **What multicast would relieve.** L2-to-SM traffic for an A or B tile that several CTAs of a cluster load. One elected CTA issues the copy and every recipient's barrier completes.
 

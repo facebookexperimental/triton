@@ -359,8 +359,9 @@ the current implementation, permission only drives planning, and no load is
 lowered to multicast yet (see "Current implementation"). The planner considers
 tiled descriptor loads with an exact `ctas_per_cga` shape. It records no plan
 for gather, im2col, preferred/fallback cluster shapes, atomic work-stealing tile
-IDs, or other schedules whose program-ID dependencies it cannot prove. CLC tile
-IDs are modeled as cluster-uniform. The plan is computed before warp
+IDs, or other schedules whose program-ID dependencies it cannot prove. Only the validity bit
+of a CLC result is modeled as cluster-uniform; its tile coordinates depend on the
+program-ID axes. The plan is computed before warp
 specialization, so it is recorded the same way for native and Meta AutoWS
 schedules. Native `tl.range(..., warp_specialize=True)` schedules are planned
 when their load indices and surrounding control flow satisfy the static

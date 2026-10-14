@@ -206,19 +206,18 @@ When `dotOp.getTwoCtas()` is true, AccelerateMatmul takes the user-driven path:
 if (dotOp.getTwoCtas()) {
     // User-driven 2-CTA (ctas_per_cga): no splitBOperand needed.
     // Transform2CTALoads will handle B splitting later.
-    if (clusterDimX < 2 || blockM < 128) {
-        // Unsupported or unsafe for the current compiler implementation.
+    if (clusterDimX < 2 || blockM < 64) {
         // Warn and lower as a normal 1-CTA MMA instead of failing compilation.
         useTwoCTAs = false;
     } else {
         useTwoCTAs = true;
+        if (blockM == 64)
+            tmemCTAMode = TensorMemoryCTAMode::TwoCTA_RHS;
     }
 } else {
-    // Compiler-driven 2-CTA (PlanCTA heuristic): split B at IR level.
-    useTwoCTAs = canUseTwoCTAs(dotOp);
-    if (useTwoCTAs) {
-        b = splitBOperand(b, rewriter);
-    }
+    // Compiler-driven 2-CTA is disabled: PTX requires one CTA mode for every
+    // tcgen05 instruction in a kernel.
+    useTwoCTAs = false;
 }
 // ...
 mma.setTwoCtas(useTwoCTAs);  // Propagates to TCGen5MMAOp
@@ -578,9 +577,11 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    established, warn and fall back to 1-CTA instead of compiling an unsafe 2-CTA
    kernel.
 
-3. **Support `TwoCTA_LHS` for the m=64 instruction shape**: `BLOCK_M = 64`
-   currently always uses `TensorMemoryCTAMode::TwoCTA_RHS`; the user-driven path
-   in `BlockedToMMAv5` never selects `TwoCTA_LHS`.
+3. **Support `BLOCK_M < 64`**: a power-of-2 `BLOCK_M` below 64 gets no tcgen05
+   MMA at all (`isMmaOutputShapeSupported`), and a non-power-of-2 one falls back
+   to 1-CTA with a warning. `BLOCK_M = 64` already compiles as 2-CTA: the
+   accumulator uses `TensorMemoryCTAMode::TwoCTA_RHS`, and a TMEM-promoted A
+   uses `TwoCTA_LHS` (`PromoteLHSToTMem.cpp`).
 
 4. **Evaluate `.cta_group::2` TMA loads**: D96323995 added `.cta_group::2`
    support for TMA loads, which routes barrier arrivals to the leader CTA in
