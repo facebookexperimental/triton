@@ -79,11 +79,15 @@ Facts:
 
 ## When to try it (depends on the problem)
 
-- **IF** `num_warps` is not 4 or 8, **THEN** skip the config, **BECAUSE** it never produces a tcgen05 autoWS GEMM.
-- **IF** two configs differ only in `num_stages`, both are at or above the operand depth that fits, and output staging is single-copy (`EPILOGUE_SUBTILE=1` or `two_ctas`), **THEN** keep one (this removes the other), **BECAUSE** the operand plan is the same; only barrier bytes and the loop schedule differ. With `EPILOGUE_SUBTILE` >= 2 staging deepens with `num_stages`, so the plans differ (see the worked example).
-- **IF** a config uses `TRITON_WS_SMEM_PLAN_SEARCH=1`, **THEN** do not compare it against heuristic-planner configs for epilogue overlap, and skip it for kernels with no K loop and more tiles than SMs, **BECAUSE** the plan search pins every TMEM `buffer.copy` to 1, which also bypasses the per-iteration accumulator multi-buffering that guards a cross-tile race (wrong answer, reproduced: [hazards.md](hazards.md#plan-search-pins-tmem-accumulator-copies-to-1)). The exceptions are kernels with scaled MMA or a `SubtiledRegionOp`, which fall back to the heuristic planner (`WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch`).
-- **IF** `BLOCK_M × BLOCK_N` fp32 already takes all 512 TMEM columns, **THEN** expect no accumulator overlap across tiles, and add no TMEM-resident loop state, **BECAUSE** the accumulator has exactly one copy.
-- **IF** a worker partition would push worker warps past a multiple of 4, **THEN** count it as costing registers for every thread, **BECAUSE** padding adds a whole warp group, which lowers the base `maxnreg`.
+Closed-form operand depth (used by every feature file):
+`d_fit = min(num_stages, floor((232448 - 4096 - S_stg) / slot))`
+  - `slot = (BM + BN') * BK * in_bytes`, `BN' = BN/2` under 2-CTA; add `BN * BK * in_bytes` for a multi-consumer B (`tma_loads.md`) and one landing buffer per TMA side input (`epilogue_prologue_tma_loads.md`).
+  - `S_stg = BM * (BN/ES) * out_bytes * staging copies` (one copy when `ES=1` or 2-CTA).
+  - 4096 B bounds the auxiliary reservation (`estimateAuxiliarySmemBytes`); a remainder under 4 KiB makes `d_fit + 1` possible. `d_fit` is the balanced A/B depth: Phase 4 may give the first-used operand one more copy (worked example).
+
+- **IF** output staging is single-copy (`ES=1` or `two_ctas`), **THEN** keep only `num_stages <= d_fit + 1`, **BECAUSE** above it the operand plan is the same; only barrier bytes and the loop schedule differ. With `ES >= 2`, `num_stages` also sets staging copies, so the plans differ (worked example). [mechanism]
+- **IF** `BN * ceil(BM/128) > 256` (fp32 accumulator, e.g. 256x256 at 1-CTA), **THEN** the accumulator gets one copy (`floor(512 / cols)`): expect no epilogue/mainloop overlap across tiles and add no TMEM-resident loop state. 128x128 gets 4 copies, 128x256 gets 2. [mechanism]
+- **IF** a worker partition pushes worker warps past a multiple of 4, **THEN** count the register cost as in [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem). [mechanism]
 
 ## Worked example (bf16 in and out, fp32 accumulator, 1-CTA)
 
@@ -124,6 +128,13 @@ Phase 4 keeps raising any buffer that still fits, so the result is A=2 / B=2 whe
 **Registers:** one epilogue subtile is a 128 × 128 fp32 `tmem_load`. Across 4 warps that is 128 registers per thread.
 
 **Warps (illustrative):** worker partitions totalling 3 warps are padded to 4. That gives 8 warps in all and a base `maxnreg` of 256.
+
+
+**Applying `d_fit`.**
+
+- 128x256x64, `ES=1`, 1-CTA: `S_stg` 65,536, slot 49,152 -> `d_fit = floor(162,816 / 49,152) = 3`. `num_stages` 5 and 6 are duplicates of 4.
+- 128x256x64, `ES=2`, separate store, `num_stages=4` (the config above): staging 4 x 32,768 -> `floor(97,280 / 49,152) = 1` balanced level; Phase 4 then adds A copies (A=3 / B=1 at a 4 KiB auxiliary bound, as in the table).
+- 128x256x128, `ES=2`: 1-CTA slot 98,304 -> `d_fit` 1; 2-CTA slot 65,536 -> `d_fit` 2. This is the case where `2cta.md` keeps only the 2-CTA variant.
 
 ## Interactions
 
