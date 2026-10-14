@@ -27,7 +27,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`tma_loads.md`](tma_loads.md) | done | TMA vs pointer operand loads. Open: its "Not yet established" items. |
 | [`tma_stores.md`](tma_stores.md) | done | TMA vs pointer output stores. Open: its "Not yet established" items. |
 | [`split_k.md`](split_k.md) | done | Splitting one output tile's K reduction (split-K, decomposeK, stream-K) and the single-K-tile path. Open: its "Not yet established" items. |
-| `pingpong.md` | todo | Ping-pong scheduling. |
+| [`pingpong.md`](pingpong.md) | done | Ping-pong scheduling. Open: its "Not yet established" items. |
 | `multicast.md` | todo | TMA multicast. |
 | `epilogue_prologue_tma_loads.md` | todo | TMA loads of extra epilogue/prologue inputs. |
 | `fused_reductions.md` | todo | Reductions fused into the epilogue. |
@@ -102,6 +102,7 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 | H-SPLITK | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | IF `T <= P/4` and `k_iters >= 32`, THEN split-K wins; IF `T >= P/2`, THEN skip split-K. | todo |
 | H-SPLITK, H-RIDGE | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | the fraction of SMs that saturates HBM is | todo |
 | H-RIDGE | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | IF `AI_min < ridge`, THEN the problem is memory bound, with `ridge` the AI at which the best autoWS arm and cuBLAS stop improving with K. | todo |
+| H-PP | [pingpong.md § When to try it](pingpong.md#when-to-try-it-depends-on-the-problem) | IF dp=2, static persistent, and the epilogue applies SFU math (`exp`, `tanh`, `rsqrt`, ...) to 2-D tiles in both groups, THEN try `pingpongAutoWS` on and off; if flat within noise, pin it off. | todo |
 
 ## Fixes to existing docs
 
@@ -160,7 +161,7 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `tt.autows` channels | — | todo |
 | `mem_plan_pick` + `TRITON_WS_MEM_PLAN_TOPK` / `_PICK` | — | todo |
 | `TRITON_WS_SMEM_PLAN_SEARCH` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
-| `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | — | todo |
+| `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | — | mentioned |
 | `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | — | mentioned |
 | Alternative schedulers: `TRITON_USE_MODULO_SCHEDULE` (+ `TRITON_MODULO_*`), `TRITON_USE_JOINT_SCHEDULE`‡, `TRITON_USE_LLM_SCHEDULE`‡, `TRITON_USE_LIST_SCHEDULE` | — | todo |
 | `list_schedule_pick` | — | todo |

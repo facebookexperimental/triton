@@ -59,7 +59,7 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 - `data_partition_factor` × `EPILOGUE_SUBTILE` / `generate_subtiled_region`
 - `data_partition_factor` × `two_ctas` (see [2cta.md](2cta.md))
 - `data_partition_factor` × CLC / dynamic `while` (see [clc_persistence.md](clc_persistence.md))
-- `data_partition_factor` × `pingpongAutoWS` (see `pingpong.md`)
+- `data_partition_factor` × `pingpongAutoWS` (see [pingpong.md](pingpong.md))
 - `data_partition_factor` × host-side TMA descriptors
 
 ## Hazards
