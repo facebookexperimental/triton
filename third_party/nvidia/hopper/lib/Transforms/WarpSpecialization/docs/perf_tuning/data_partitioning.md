@@ -15,7 +15,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 | `data_partition_factor` | `tl.range(..., data_partition_factor=)` | Splits the accumulator and its consumers into dp consumer groups | [DataPartition.md, "Step 2: Compute Partition Scheme (`computePartitionScheme`)"](../DataPartition.md#step-2-compute-partition-scheme-computepartitionscheme) |
 | `disallow_acc_multi_buffer` | `tl.range(..., disallow_acc_multi_buffer=True)` | Under Meta WS, floors every TMA-fed SMEM operand of the MMA at `num_stages` when dp > 1; it does not cap TMEM accumulator copies | [AutoWSAnnotations.md, "`disallow_acc_multi_buffer`"](../AutoWSAnnotations.md#disallow_acc_multi_buffer) |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Status | Why | Code |
 |---|---|---|---|
@@ -43,7 +43,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 - **Extra partitions:** one consumer group per slice, each counted in the 16-warp estimate.
 - **With `disallow_acc_multi_buffer`,** every TMA-fed SMEM operand of the MMA is floored at the full `num_stages` (`WS/WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor`). The planner can then no longer trade operand depth for fit.
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - **IF** `BLOCK_M=128`, **THEN** skip dp=2, **BECAUSE** it compiles to the dp=1 kernel.
 - **IF** `BLOCK_M=64`, **THEN** only try dp=2 with `BLOCK_N=256` (N split), **BECAUSE** every other `BLOCK_N` fails to compile.

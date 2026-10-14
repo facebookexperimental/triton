@@ -14,11 +14,11 @@ Epilogue side inputs are covered in [epilogue_prologue_tma_loads.md](epilogue_pr
 | in-tile reduction | `tl.sum` / `tl.max` / `tl.reduce` on the accumulator, or on a subtile, in the epilogue | Reduces within the tile in registers, after the TMEM load. | none |
 | TMA reduce | `desc.atomic_add(...)` or `desc.store(..., store_reduce="add")` | Accumulates a tile into global memory with a TMA reduction. It is scheduled into the reduction partition. | [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Memory Planner: `buffer.tmaStaging` Handling" |
 | `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | env var | Copy target for the TMA-reduce staging ring, independent of `num_stages`. | [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Phase 3.7: Epilogue Group Copy Increase" |
-| pointer atomics | `tl.atomic_add(ptr, ...)` | See the hard prunes below; do not use inside the WS tile loop. | [CrossPartitionAtomicSupport.md](../CrossPartitionAtomicSupport.md), section "Pass: `doDynamicTileBroadcast`" |
-| `multi_cta` | `tl.range(..., multi_cta=True)` plus `ctas_per_cga` | Splits a purely additive loop across cluster CTAs and combines downstream `tl.sum`/`tl.reduce` results through distributed shared memory. | [large_k.md](large_k.md#knobs) |
+| pointer atomics | `tl.atomic_add(ptr, ...)` | See "Never try (any problem)" below; do not use inside the WS tile loop. | [CrossPartitionAtomicSupport.md](../CrossPartitionAtomicSupport.md), section "Pass: `doDynamicTileBroadcast`" |
+| `multi_cta` | `tl.range(..., multi_cta=True)` plus `ctas_per_cga` | Splits a purely additive loop across cluster CTAs and combines downstream `tl.sum`/`tl.reduce` results through distributed shared memory. | [split_k.md](split_k.md#knobs) |
 | `EPILOGUE_SUBTILE` | kernel constexpr | Reducing per subtile means the same accumulator subtile is read once for the store and once for the reduction. | [epilogue.md](epilogue.md) |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Status | Why | Code ref |
 |---|---|---|---|
@@ -49,11 +49,11 @@ Epilogue side inputs are covered in [epilogue_prologue_tma_loads.md](epilogue_pr
 - **What it costs:** two TMEM reads per subtile.
 - Code: `InterleaveTMem.cpp`, `processBlock`, `buildOriginalBlockOrder`; [TMEMInterleave.md](../TMEMInterleave.md), section "Load Sinking"; [BarrierConstraints.md](../BarrierConstraints.md), section "Barrier Reordering".
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - IF the fusion needs a sum across output tiles, THEN only try a TMA reduce (`desc.atomic_add` / `store_reduce="add"`), or a per-CTA partial stored inside the loop plus a finishing kernel, BECAUSE a pointer atomic in the WS loop either strips warp specialization or is dropped.
 - IF a fused reduction is over M (column), THEN prefer max/min-type statistics where the math allows, and expect sum over M to cost more cross-lane work, BECAUSE only fp32 max/min have a single-instruction warp reduction.
-- IF a reduced statistic is needed after the K loop over the full K sum, e.g. a row norm of the GEMM output, THEN skip split-K for that kernel ([large_k.md](large_k.md#pruning-rules)), BECAUSE the statistic is nonlinear in the partials.
+- IF a reduced statistic is needed after the K loop over the full K sum, e.g. a row norm of the GEMM output, THEN skip split-K for that kernel ([split_k.md](split_k.md#when-to-try-it-depends-on-the-problem)), BECAUSE the statistic is nonlinear in the partials.
 
 ## Interactions
 

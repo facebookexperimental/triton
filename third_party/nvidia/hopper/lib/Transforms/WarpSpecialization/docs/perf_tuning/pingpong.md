@@ -12,7 +12,7 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 |---|---|---|---|
 | `pingpongAutoWS` | compile option (`triton.Config(pingpongAutoWS=True)`, default False) | Makes two consumer partitions take turns on an "expensive" op | [PingPongScheduling.md, "Pipeline Integration"](../PingPongScheduling.md#pipeline-integration) |
 
-## Hard prunes
+## Never try (any problem)
 
 Every condition below leaves the kernel unchanged with no diagnostic (debug log only).
 
@@ -45,7 +45,7 @@ Every condition below leaves the kernel unchanged with no diagnostic (debug log 
   - an epilogue (or fused prologue) applies SFU math to 2-D tiles in both groups;
   - that code sits inside an `scf.for`, i.e. a static persistent schedule.
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - **IF** the kernel is a GEMM/addmm with no SFU math in the epilogue, **THEN** skip `pingpongAutoWS=True`, **BECAUSE** no region forms and it is a duplicate config.
 - **IF** `data_partition_factor` is 1, **THEN** skip `pingpongAutoWS=True`, **BECAUSE** a GEMM has no second consumer partition to alternate with.

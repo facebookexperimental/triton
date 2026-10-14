@@ -1,11 +1,11 @@
-# Large K, split-K and the single-K-tile case
+# Split-K, decomposeK and stream-K
 
-Scope: how Meta WS (`TRITON_USE_META_WS=1`) GEMMs handle the K dimension on Blackwell. Covered here:
+Scope: techniques that split one output tile's K reduction across more than one CTA or kernel, applied to Meta WS (`TRITON_USE_META_WS=1`) GEMMs on Blackwell. Covered here:
 - what the compiler does and does not do to parallelize K;
 - what source-level split-K looks like under warp specialization;
-- the special compile path taken when K fits in one tile.
+- the K-dimension facts that decide whether splitting is legal or useful, including the separate compile path taken when K fits in one tile.
 
-Inductor's decompose-K (a cuBLAS bmm plus a reduction, chosen above a K threshold) is outside this directory and not described here.
+The regime that routes here is long K with few output tiles: many `K / BLOCK_K` iterations and fewer output tiles than SMs. See `shape_regimes.md`. Inductor's decompose-K (a cuBLAS bmm plus a reduction, chosen above a K threshold) lives outside this directory and is not described here. Stream-K has no compiler support (see Mechanism).
 
 ## Knobs
 
@@ -16,7 +16,7 @@ Inductor's decompose-K (a cuBLAS bmm plus a reduction, chosen above a K threshol
 | source-level split-K | kernel structure: tile id over `SPLIT_K x tiles`, partial tile to a workspace, separate reduce kernel | The only way to spread one output tile's K range over several CTAs under warp specialization. | none (example: `python/test/unit/language/test_tutorial09_warp_specialization.py`, `matmul_kernel_tma_persistent_ws_splitk`) |
 | `multi_cta` | `tl.range(..., multi_cta=True)` plus `ctas_per_cga` at launch | Partitions the iterations of a purely additive loop across the CTAs of a cluster, and combines downstream `tl.sum`/`tl.reduce` results through distributed shared memory. | `docs/design/multi_cta_grid_requirements.md`; `python/triton/language/core.py`, `range` docstring |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Status | Why | Code ref |
 |---|---|---|---|
@@ -26,7 +26,7 @@ Inductor's decompose-K (a cuBLAS bmm plus a reduction, chosen above a K threshol
 
 ## Mechanism
 
-**Within autoWS, K is reduced serially per output tile.**
+**Within autoWS, K is reduced serially per output tile (no compiler split-K or stream-K).**
 - **What changes:** nothing in the WS pipeline splits K. No split-K or stream-K exists in the warp-specialization passes. Each output tile's whole K range is accumulated by one CTA, one MMA per K step, into one TMEM accumulator.
 - **What it costs:**
   - latency per tile grows linearly with `cdiv(K, BLOCK_K)`;
@@ -54,7 +54,7 @@ Inductor's decompose-K (a cuBLAS bmm plus a reduction, chosen above a K threshol
 - **What it costs:** this path has its own hazards, listed below. Correctness sweeps must include `k_tiles = 1` in addition to `k_tiles > 1`.
 - Code: `Combine.cpp`, `CombineDotAddFPattern`; `WSMemoryPlanner.cpp`, TMEM copy assignment for accumulators whose first access in the body is a `tmem_store`.
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - IF K < BLOCK_K, THEN skip every BLOCK_K above the smallest legal BLOCK_K that covers K, BECAUSE a larger BLOCK_K pays SMEM and MMA work for zero-filled columns at every stage.
 - IF tuning a GEMM K loop, THEN skip `multi_cta`, BECAUSE it rejects dot-carried accumulators (with a cluster) or is removed (without one).
