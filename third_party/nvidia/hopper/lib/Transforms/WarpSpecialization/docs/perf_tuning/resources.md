@@ -14,6 +14,18 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 | Registers | 65,536 per SM; `setmaxnreg` values in [24, 256] in steps of 8 | `lib/Conversion/TritonGPUToLLVM/AllocateWarpGroups.cpp`, `kMinLegalRegisters` and the `maxnreg` computation; `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/OptimizePartitionWarps.cpp`, `nTotalRegs` |
 | Warps | WS needs `num_warps` >= 4; the WS warp estimate must be <= 16; tcgen05 needs `num_warps` of 4 or 8 | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp` ("Warp specialization requires at least 4 warps"); `WS/PartitionSchedulingMeta.cpp`, `kMaxWarps`; `lib/Analysis/Utility.cpp`, `supportMMA` |
 
+## Knobs
+
+| Knob | Set via | Legal values | Default | Priority | Applies when | Prereqs |
+|---|---|---|---|---|---|---|
+| `tmem_alloc_algo` | `tl.range` kwarg | 1 (greedy) or other (backtracking) | 1 | P1 | Every WS kernel with TMEM allocations. | — |
+| `smem_alloc_algo` | `tl.range` kwarg | 1 (WSBuffer) or 0 (legacy) | 1 | P2 | `=0` only; under 0, `tt.autows` channel pins are ignored. | — |
+| `smem_budget` | `tl.range` kwarg | bytes | device opt-in maximum | P2 | Every WS kernel. | — |
+| `smem_circular_reuse` | `tl.range` kwarg | bool / None | None | P2 | Only with exactly 2 candidate buffers. | — |
+| `tt.autows` channels | `tl.dot(attrs={"channels": [...]})` | `"operand,smem\|tmem,copies,id[,offset]"` | unset | P2 | Only with `smem_alloc_algo=1`. | Not below a buffer's cross-stage depth (hangs). |
+| `mem_plan_pick` + `TRITON_WS_MEM_PLAN_TOPK` / `_PICK` | `tl.range` kwarg + env vars | rank int; TOPK int | 0; TOPK 1 | P2 | Plans are enumerated when TOPK > 1 or the pick is > 0. | — |
+| `TRITON_WS_SMEM_PLAN_SEARCH` | env var | 0 / 1 | 0 | P2 | Every WS kernel. With no K loop, an epilogue input and more tiles than SMs it gives a wrong answer. | — |
+
 ## SMEM
 
 Budget = the target's opt-in maximum (or the loop's `tt.smem_budget`) minus `estimateAuxiliarySmemBytes`, which counts:
@@ -50,6 +62,7 @@ Mechanics: [TMEMAllocationHeuristics.md, "TMEM Allocation Overview"](../TMEMAllo
 Accumulator copies (`WS/WSMemoryPlanner.cpp`, the "TMEM multi-buffering post-processing" step at the end of the heuristic TMEM allocator's `run`):
 - After placement, `buffer.copy` is raised round-robin on every loop-carried MMA accumulator (including a per-iteration accumulator overwritten by a `tmem_store` at the top of the body), until the next copy would pass 512 columns minus the columns reserved for scaled-MMA scales.
 - No user knob bounds this, `num_stages` included.
+- Packing algorithm: `tmem_alloc_algo` 1 (default) = greedy (`allocateTMemAllocs`), any other value = backtracking (`allocateTMemAllocs2`); see [TMEMAllocationHeuristics.md, "Algorithm Selection"](../TMEMAllocationHeuristics.md#algorithm-selection).
 - Total TMEM above 512 columns is not rejected at compile time: it raises `OutOfResources("tensor memory")` at load (`python/triton/compiler/compiler.py`, `CompiledKernel._init_handles`).
 
 Columns per accumulator copy (fp32) = `BLOCK_N × ceil(BLOCK_M / 128)`:
@@ -70,18 +83,18 @@ Facts:
    - non-tensor partitions request `minRegAutoWS` (default 24); tensor partitions share the rest;
    - if those requests do not fit, the register split is silently skipped.
 
-## Never try (any problem)
+## Pruning ruleset
 
-| Condition | Status | Why | Code |
-|---|---|---|---|
-| Auxiliary SMEM estimate >= budget | compile error | "estimated auxiliary shared-memory allocation ... exhausts the shared-memory budget" | `WS/WSMemoryPlanner.cpp`, `doMemoryPlanner` |
-| Plan larger than the hardware limit after floors and reuse | requires | The plan must fit the hardware limit; otherwise `OutOfResources` is raised at launch, not at compile time. The cross-stage floor is never dropped for budget, so the planner only warns | `WS/WSMemoryPlanner.cpp`, "exceeding configured smem-budget" warning |
-| `num_warps` < 4 | silently ignored | WS bails out before partitioning, so the kernel runs without WS. Under `two_ctas` this hangs instead (see [2cta.md](2cta.md#never-try-any-problem)) | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnFuncOp` |
-| `num_warps` not 4 or 8 | silently ignored | `supportMMA` for MMAv5 accepts only 4 or 8 warps, so there is no tcgen05 and no gemm partition | `lib/Analysis/Utility.cpp`, `supportMMA`; `lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, `getMMAVersionSafe` |
-| WS warp estimate > 16 | silently ignored | All WS metadata is removed. Estimate = `num_warps` + Σ per-partition minimum warps (TMEM ops count as 4, gather/scatter as 2; `getMinWarpsForOp`). Under `two_ctas` this hangs instead (see [2cta.md](2cta.md#never-try-any-problem)) | `WS/PartitionSchedulingMeta.cpp`, "Warp budget exceeded. Skipping warp specialization." |
-| `minRegAutoWS` / `maxRegAutoWS` not a multiple of 8 | compile error | Register requests are emitted per warp group in steps of 8 | `third_party/nvidia/backend/compiler.py`, `_check_reg_auto_ws_alignment` |
-| `TRITON_WS_SMEM_PLAN_SEARCH=1` with no K loop (K == BLOCK_K as a compile-time constant) and more tiles than SMs | wrong answer (reproduced) | Plan search pins every TMEM accumulator to one copy, bypassing the per-iteration accumulator multi-buffering. See [hazards.md](hazards.md#plan-search-pins-tmem-accumulator-copies-to-1) | `WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch` |
-| `num_stages` < 1 | compile error | "nvgpu-warp-specialization requires num-stages >= 1" | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnOperation` |
+| Condition | Status | Why |
+|---|---|---|
+| Auxiliary SMEM estimate >= budget | compile error | "estimated auxiliary shared-memory allocation ... |
+| Plan larger than the hardware limit after floors and reuse | requires | The plan must fit the hardware limit; otherwise `OutOfResources` is raised at launch, not at compile time. |
+| `num_warps` < 4 | silently ignored | WS bails out before partitioning, so the kernel runs without WS. |
+| `num_warps` not 4 or 8 | silently ignored | `supportMMA` for MMAv5 accepts only 4 or 8 warps, so there is no tcgen05 and no gemm partition. |
+| WS warp estimate > 16 | silently ignored | All WS metadata is removed. |
+| `minRegAutoWS` / `maxRegAutoWS` not a multiple of 8 | compile error | Register requests are emitted per warp group in steps of 8. |
+| `TRITON_WS_SMEM_PLAN_SEARCH=1` with no K loop (K == BLOCK_K as a compile-time constant) and more tiles than SMs | wrong answer | Plan search pins every TMEM accumulator to one copy, bypassing the per-iteration accumulator multi-buffering. |
+| `num_stages` < 1 | compile error | "nvgpu-warp-specialization requires num-stages >= 1". |
 
 ## Worked example (bf16 in and out, fp32 accumulator, 1-CTA)
 
