@@ -17,7 +17,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 
 | File | State | Note |
 |------|-------|------|
-| `tiles_and_stages.md` | todo | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages` against tile count and K iterations. |
+| [`tiles_and_stages.md`](tiles_and_stages.md) | done | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages`. Open: its "Not yet established" items (how `BLOCK_M=32` fails under autoWS; extra stages at one or two K tiles; 2-CTA stage counts; asymmetric A/B depth; tile size vs ring depth). |
 | `warps_and_registers.md` | todo | `num_warps` and the AutoWS register budgets. |
 | `epilogue.md` | todo | Epilogue subtiling, separate epilogue store, store placement. |
 | `2cta.md` | todo | 1-CTA vs 2-CTA (`two_ctas`). |
