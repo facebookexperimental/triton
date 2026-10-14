@@ -3,7 +3,8 @@ from triton.backends.amd import compiler
 
 def test_fp_fusion():
     arch = "gfx1250"
-    triple = compiler.amd.get_target_triple(arch)
+    # Beta bindings predate amd.get_target_triple; TARGET_TRIPLE is the same value.
+    triple = compiler.amd.TARGET_TRIPLE
     source = f'''
 target triple = "{triple}"
 
@@ -32,7 +33,8 @@ define amdgpu_kernel void @fusion_kernel(ptr addrspace(1) %out, float %a, float 
 
 def test_legacy_named_barrier_address_space():
     arch = "gfx1250"
-    triple = compiler.amd.get_target_triple(arch)
+    # Beta bindings predate amd.get_target_triple; TARGET_TRIPLE is the same value.
+    triple = compiler.amd.TARGET_TRIPLE
     source = f'''
 target triple = "{triple}"
 
