@@ -20,6 +20,7 @@ AMD CDNA 5
 
     buffer_load
     buffer_store
+    get_scaled_upcast_fp4_scale_layout
     get_wmma_scale_layout
     make_partitioned_dot_layouts
     scaled_upcast

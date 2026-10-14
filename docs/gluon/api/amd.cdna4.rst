@@ -25,5 +25,7 @@ AMD CDNA 4
     buffer_atomic_xchg
     buffer_atomic_xor
     get_mfma_scale_layout
+    get_scaled_upcast_fp4_scale_layout
+    load_shared_fp4_repacked
     mfma
     mfma_scaled
