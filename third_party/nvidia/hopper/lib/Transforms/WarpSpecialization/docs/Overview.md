@@ -115,7 +115,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
 | `WSAtomicBroadcast.cpp` | `doDynamicTileBroadcast` | Cross-partition run-once "claim next tile" support: run a dynamic-persistent tile-id producer once and broadcast it, for both a `tt.atomic_rmw` counter and a CLC tile-scheduler fetch (`ttng.clc_read`) — or gracefully reject unsupported shapes. See [CrossPartitionAtomicSupport.md](CrossPartitionAtomicSupport.md) |
 | `WSDataPartition.cpp` | `doDataPartition` / `nvgpu-ws-data-partition` | Splits ops along M/N dimensions across warp groups |
-| `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
+| `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | mbarrier-pair insertion for ping-pong scheduling |
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
@@ -156,7 +156,7 @@ recognizes the `scf.while` outer loop (same doc).
 | **Reuse Group** | A set of channels sharing a single physical buffer (`buffer.id`). See [ReuseGroups.md](ReuseGroups.md). |
 | **Multi-buffering** | Allocating N copies of a buffer so the producer can fill copy N+1 while the consumer reads copy N. Controlled by `buffer.copy`. |
 | **Operand D** | The MMA accumulator — the TMEM allocation that both receives MMA output and carries accumulated results across loop iterations. |
-| **Ping-pong** | Named-barrier-based mutual exclusion between two consumer partitions executing expensive ops. |
+| **Ping-pong** | mbarrier-pair-based mutual exclusion between two consumer partitions executing expensive ops. |
 | **Stage / Phase** | Pipeline stage index (which buffer slot) and phase (parity bit for mbarrier wait/arrive). |
 | **Token** | Abstract synchronization primitive (`CreateTokenOp`) that is lowered to hardware mbarrier pairs. |
 | **AccumCnt** | Accumulation counter — a loop-carried value that tracks the current buffer slot for multi-buffered channels. |
@@ -187,7 +187,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [WS Barrier Ordered Region Tracking](WSBarrierOrderedRegionTracking.md) — V2 ordered-region metadata for overlapping channel graphs
 - [WS Barrier Location Unification](WSBarrierLocationUnification.md) — post-interleave co-location of related TMA-ready and TMEM-ready waits
 - [Reuse Groups](ReuseGroups.md) — buffer sharing mechanics
-- [Ping-Pong Scheduling](PingPongScheduling.md) — named barrier insertion for expensive ops
+- [Ping-Pong Scheduling](PingPongScheduling.md) — mbarrier-pair insertion for expensive ops
 - [Utilities](Utilities.md) — `OpBuilderWithAsyncTaskIds`, task ID helpers, location utilities
 - [Memory Planner Visualization](MemoryPlannerVisualization.md) — debug DOT graph tools
 - [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md) — annotation, reordering, and lowering of TMA store waits

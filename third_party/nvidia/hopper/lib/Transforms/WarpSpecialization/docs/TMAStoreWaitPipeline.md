@@ -105,8 +105,8 @@ below).
 
 ### Phase 3.7: Epilogue Group Copy Increase
 
-Each fused P2_Other group (including TMA staging groups) is treated as
-an epilogue group. `increaseFusedEpilogueCopies` iteratively bumps
+Each fused group in the `P2_InnerTMAStaging`, `P3_OuterTMAStaging`, or
+`P4_Other` tier is treated as an epilogue group, in that tier order. `increaseFusedEpilogueCopies` iteratively bumps
 `numCopies` from the current value up to `numBuffers`, accepting each
 bump as long as `computeTotalSmem ≤ smemBudget`.
 
@@ -161,17 +161,15 @@ are *correct* — depends on the channel's producer/consumer topology:
 Phase 3.7 therefore detects same-partition staging via
 `getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp())` and, for
 those groups, only accepts a `tryCopies` that divides S (others are skipped).
-This is a **defensive backstop**: in all shipped configs `num_stages = 2` and
-`S ∈ {2,4}`, so `K | S` already holds and the cap is a no-op — it exists to
-keep a future `num_stages`/subtile combination from silently violating the
-rotation invariant. The cross-stage floor (`WSBuffer::minCopies`) is a hard
+The check matters whenever the bump target exceeds a divisor of S: for
+example, with `num_stages = 3` and `S = 4`, depth 3 is skipped and the group
+stays at its largest accepted divisor. The cross-stage floor (`WSBuffer::minCopies`) is a hard
 correctness floor and is never reduced; if it itself violates `K | S` for a
 wait_group ring the pass emits an `LDBG` warning rather than dropping below it.
 
 `computeTotalSmem` accounts for the active `buffer.id` groups using
 `max(size) × copies` per ID. For TMA store staging groups this matches the
-planner's reuse model, but the downstream physical allocation still leaves
-each staging alloc as a separate op.
+physical result: see [Combined SMEM Cost](#combined-smem-cost).
 
 #### `TRITON_WS_STAGING_COPIES`: capping the Phase 3.7 target
 
@@ -235,13 +233,25 @@ the `Phase 3.7` lines of `-debug-only=nvgpu-ws-memory-planner`, or in the
 
 ### Combined SMEM Cost
 
-If the planner needs an exact hardware-SMEM accounting pass for TMA store
-staging, the cost needs per-entry accounting because the allocs are NOT merged
-into one physical alloc downstream:
+Staging allocs that share a `buffer.id` are merged into one physical
+allocation downstream, so the cost of a fused staging group is
 
 ```
-tmaStoreSmem = numEntries * size * copies
+tmaStoreSmem = size * copies
 ```
+
+and not `numEntries * size * copies`. In `doCodePartition`, channels with the
+same `buffer.id` form a `ReuseGroup`. `replaceBufferReuse` then redirects every
+non-representative SMEM alloc of the group to the representative's alloc and
+erases it. The subtile stores index slots of that one buffer (see
+[Reuse Groups](ReuseGroups.md), case A3).
+
+The merge applies only when the member alloc types match.
+`replaceBufferReuse` skips an SMEM member whose type differs from the
+representative and leaves it as a separate allocation. That shows up only as
+an `LDBG` line, and `computeTotalSmem` undercounts it. Subtiles of one
+descriptor store have identical types, so the usual epilogue staging group is
+merged.
 
 ### Phase 6: Hoist Before Outermost Loop
 
