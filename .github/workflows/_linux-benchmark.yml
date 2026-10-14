@@ -44,6 +44,9 @@ on:
 permissions:
   contents: read
 
+# Benchmark code does not need access to the Actions cache.
+cache-mode: none
+
 jobs:
   benchmark:
     runs-on: ${{ fromJSON('{"h100":"linux-gcp-h100","b200":"nvidia-dgx-b200","mi350":"linux-fb-triton-mi350-1"}')[inputs.device] }}

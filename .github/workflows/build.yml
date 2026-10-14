@@ -19,6 +19,11 @@ on:
         type: string
         required: false
         default: ''
+      skip_cache_save:
+        description: Skip cache-save steps when the caller restricts cache access
+        type: boolean
+        required: false
+        default: false
     outputs:
       commit:
         description: Resolved Git commit used to build the wheel
@@ -75,7 +80,8 @@ jobs:
           python3 -m pip install --upgrade uv
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        id: restore-ccache
+        uses: actions/cache/restore@v4
         with:
           path: /tmp/fbtriton-ccache
           key: ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-${{ inputs.repository || github.repository }}-${{ steps.checkout.outputs.commit }}
@@ -132,6 +138,7 @@ jobs:
           ls -lh dist/
 
       - name: Save build dependencies
+        if: ${{ !inputs.skip_cache_save && steps.restore-build-deps-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
@@ -225,3 +232,10 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"wheel_url={url}\n")
           PY
+
+      - name: Save ccache
+        if: ${{ !inputs.skip_cache_save && steps.restore-ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/fbtriton-ccache
+          key: ${{ steps.restore-ccache.outputs.cache-primary-key }}

@@ -62,6 +62,9 @@ permissions:
   contents: read
   id-token: write
 
+# Inputs can select untrusted code. Cap cache access in every called workflow.
+cache-mode: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -74,6 +77,7 @@ jobs:
       repository: ${{ inputs.side_a_triton }}
       ref: ${{ inputs.side_a_commit }}
       build_id: side-a
+      skip_cache_save: true
 
   build-side-b:
     name: Build side B
@@ -83,6 +87,7 @@ jobs:
       repository: ${{ inputs.side_b_triton || inputs.side_a_triton }}
       ref: ${{ inputs.side_b_commit || 'main' }}
       build_id: side-b
+      skip_cache_save: true
 
   benchmark-side-a:
     name: Benchmark side A
