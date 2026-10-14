@@ -68,13 +68,9 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 
 | Family | Lands in | Hypothesis | State |
 |--------|----------|------------|-------|
-| H-RIDGE | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | Calibrate ridge in: **IF** `AI_min >= ridge`, **THEN** prefer tiles in decreasing `I_t = BM*BN/(BM + BN')` (`BN' = BN/2` under 2-CTA): 2-CTA 128x256 and 1-CTA 256x256 dp=2 (128) > 128x256, 256x128, 2-CTA 128x128 (85) > 128x128 (64) > 64x256 (51) > 64x128 (43), **BECAUSE** operand SMEM fill per FLOP is `1/I_t` (slot sizes in "Mechanism"). | todo |
 | H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** the epilogue does per-element register math beyond a bias (fused) and `R(num_warps=4) > 64`, **THEN** keep `num_warps=8` alongside 4. | todo |
 | H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** no rule above sets `minRegAutoWS`, `maxRegAutoWS` or `maxnreg`, **THEN** leave them at their defaults. | todo |
 | — | [epilogue.md § When to try it](epilogue.md#when-to-try-it-depends-on-the-problem) | **IF** none of the rules above applies, **THEN** leave `generate_subtiled_region`, `early_tma_store_lowering`, `tma_store_pipelining` and `merge_epilogue*` at their defaults. | todo |
-| H-SPLITK, H-RIDGE | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | the fraction of SMs that saturates HBM is | todo |
-| H-RIDGE | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | IF `AI_min < ridge`, THEN the problem is memory bound, with `ridge` the AI at which the best autoWS arm and cuBLAS stop improving with K. | todo |
-| H-PP | [pingpong.md § When to try it](pingpong.md#when-to-try-it-depends-on-the-problem) | IF dp=2, static persistent, and the epilogue applies SFU math (`exp`, `tanh`, `rsqrt`, ...) to 2-D tiles in both groups, THEN try `pingpongAutoWS` on and off; if flat within noise, pin it off. | todo |
 
 ## Fixes to existing docs
 
@@ -88,7 +84,7 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 
 | Knob | Rules in | State |
 |------|----------|-------|
-| `BLOCK_M` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
+| `BLOCK_M` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem); [pingpong.md](pingpong.md#never-try-any-problem) | covered |
 | `BLOCK_N` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
 | `BLOCK_K` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [epilogue_prologue_tma_loads.md](epilogue_prologue_tma_loads.md#never-try-any-problem) | covered |
 | `num_stages` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem); [epilogue_prologue_tma_loads.md](epilogue_prologue_tma_loads.md#when-to-try-it-depends-on-the-problem) | covered |
@@ -98,10 +94,10 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `loop_unroll_factor`, `disable_licm` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `warp_specialize` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [tma_stores.md](tma_stores.md#when-to-try-it-depends-on-the-problem) | covered |
 | `data_partition_factor` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem) | covered |
-| `separate_epilogue_store` | [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem); [epilogue.md](epilogue.md#never-try-any-problem); [tma_stores.md](tma_stores.md#never-try-any-problem) | covered |
-| `merge_epilogue` | — | mentioned |
+| `separate_epilogue_store` | [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem); [epilogue.md](epilogue.md#never-try-any-problem); [tma_stores.md](tma_stores.md#never-try-any-problem); [pingpong.md](pingpong.md#never-try-any-problem) | covered |
+| `merge_epilogue` | [pingpong.md](pingpong.md#never-try-any-problem) | covered |
 | `merge_epilogue_to_computation`, `merge_correction` | — | mentioned |
-| `pingpongAutoWS` | [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
+| `pingpongAutoWS` | [clc_persistence.md](clc_persistence.md#never-try-any-problem); [pingpong.md](pingpong.md#never-try-any-problem) | covered |
 | `multi_cta` | [split_k.md](split_k.md#never-try-any-problem); [fused_reductions.md](fused_reductions.md#never-try-any-problem) | covered |
 | `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem); [tma_stores.md](tma_stores.md#never-try-any-problem); [epilogue_prologue_tma_loads.md](epilogue_prologue_tma_loads.md#never-try-any-problem); [fused_reductions.md](fused_reductions.md#never-try-any-problem) | covered |
 | `allowDependentTwoCTA` | [2cta.md](2cta.md#never-try-any-problem) | covered |
