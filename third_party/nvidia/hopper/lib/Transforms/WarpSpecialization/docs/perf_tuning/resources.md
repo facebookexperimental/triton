@@ -83,11 +83,13 @@ Closed-form operand depth (used by every feature file):
 `d_fit = min(num_stages, floor((232448 - 4096 - S_stg) / slot))`
   - `slot = (BM + BN') * BK * in_bytes`, `BN' = BN/2` under 2-CTA; add `BN * BK * in_bytes` for a multi-consumer B (`tma_loads.md`) and one landing buffer per TMA side input (`epilogue_prologue_tma_loads.md`).
   - `S_stg = BM * (BN/ES) * out_bytes * staging copies` (one copy when `ES=1` or 2-CTA).
-  - 4096 B bounds the auxiliary reservation (`estimateAuxiliarySmemBytes`); a remainder under 4 KiB makes `d_fit + 1` possible. `d_fit` is the balanced A/B depth: Phase 4 may give the first-used operand one more copy (worked example).
+  - 4096 B bounds the auxiliary reservation (`estimateAuxiliarySmemBytes`); the measured reservation for a GEMM is about 0.7 KB, so `d_fit + 1` is often the real depth (see `tiles_and_stages.md`). `d_fit` is the balanced A/B depth: Phase 4 may give the first-used operand one more copy (worked example).
 
 - **IF** output staging is single-copy (`ES=1` or `two_ctas`), **THEN** keep only `num_stages <= d_fit + 1`, **BECAUSE** above it the operand plan is the same; only barrier bytes and the loop schedule differ. With `ES >= 2`, `num_stages` also sets staging copies, so the plans differ (worked example). [mechanism]
 - **IF** `BN * ceil(BM/128) > 256` (fp32 accumulator, e.g. 256x256 at 1-CTA), **THEN** the accumulator gets one copy (`floor(512 / cols)`): expect no epilogue/mainloop overlap across tiles and add no TMEM-resident loop state. 128x128 gets 4 copies, 128x256 gets 2. [mechanism]
 - **IF** a worker partition pushes worker warps past a multiple of 4, **THEN** count the register cost as in `warps_and_registers.md`. [mechanism]
+
+Staging copies are raised before operand copies, so an uncapped staging ring can starve B: the measured cap rule is in `epilogue.md`.
 
 ## Worked example (bf16 in and out, fp32 accumulator, 1-CTA)
 
