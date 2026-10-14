@@ -20,7 +20,7 @@ Budget numbers are in [resources.md](resources.md). Code paths are relative to `
 | `early_tma_store_lowering` | compile option (on unless set to `False`) | Lowers TMA stores to staging allocations before the WS planner runs | [TMAStoreWaitPipeline.md, "Memory Planner: `buffer.tmaStaging` Handling"](../TMAStoreWaitPipeline.md#memory-planner-buffertmastaging-handling) |
 | `tma_store_pipelining` | compile option (default on) | Annotates and reorders TMA store waits | [TMAStoreWaitPipeline.md, "Wait Annotation and Reordering Pipeline"](../TMAStoreWaitPipeline.md#wait-annotation-and-reordering-pipeline) |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Result | Why | Code |
 |---|---|---|---|
@@ -66,7 +66,7 @@ Mechanics: [TMAStoreWaitPipeline.md, "`K | S` cap for same-partition (wait_group
   - relieves: frees staging depth from the divisor rule and takes TMA issue out of the epilogue partition;
   - costs: one more worker warp, which can cost a whole warp group of registers (see [warps_and_registers.md](warps_and_registers.md)).
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - **IF** the epilogue uses pointer stores, **THEN** skip `separate_epilogue_store=True` variants, **BECAUSE** they duplicate `False`.
 - **IF** `ES=1` or `two_ctas=True`, **THEN** skip staging-copy variants, **BECAUSE** staging stays at one copy.
