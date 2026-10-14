@@ -13,11 +13,10 @@
 2. [Problem Statement](#problem-statement)
 3. [Design](#design)
 4. [Implementation](#implementation)
-5. [Generated TTGIR Example](#generated-ttgir-example)
-6. [Files Changed](#files-changed)
-7. [How to Test](#how-to-test)
-8. [Known Limitations and Future Work](#known-limitations-and-future-work)
-9. [Auto-WS + 2-CTA Integration](#auto-ws--2-cta-integration)
+5. [Files Changed](#files-changed)
+6. [How to Test](#how-to-test)
+7. [Known Limitations and Future Work](#known-limitations-and-future-work)
+8. [Auto-WS + 2-CTA Integration](#auto-ws--2-cta-integration)
 
 ---
 
@@ -460,11 +459,11 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    boundary and break the B-sharing contract. The compiler currently cannot
    prove arbitrary user tile schedulers are pair-aligned.
 
-3. **`BLOCK_M < 128` falls back to 1-CTA**: When `BLOCK_M < 128`, the TMEM
-   instruction shape is 64, which requires `TensorMemoryCTAMode::TwoCTA_LHS` or
-   `TensorMemoryCTAMode::TwoCTA_RHS` instead of `DEFAULT`. The compiler currently
-   emits a warning and falls back to 1-CTA MMA if `two_ctas=True` with
-   `BLOCK_M < 128`.
+3. **`BLOCK_M < 64` falls back to 1-CTA**: `BlockedToMMAv5` in
+   `AccelerateMatmul.cpp` emits a warning ("two_ctas=True with BLOCK_M < 64 is
+   not supported") and falls back to 1-CTA MMA if `two_ctas=True` with
+   `BLOCK_M < 64`. For `BLOCK_M = 64` the TMEM instruction shape is 64, and the
+   compiler selects `TensorMemoryCTAMode::TwoCTA_RHS` instead of `DEFAULT`.
 
 4. **Scaled 2-CTA MMA does not support dependent chains**: `Transform2CTALoads`
    and `Insert2CTASync` both reach `TCGen5MMAScaledOp` through
@@ -579,9 +578,9 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    established, warn and fall back to 1-CTA instead of compiling an unsafe 2-CTA
    kernel.
 
-3. **Support `BLOCK_M < 128`**: Plumb the required
-   `TensorMemoryCTAMode::TwoCTA_LHS` / `TwoCTA_RHS` mode for the m=64
-   instruction shape instead of falling back to 1-CTA.
+3. **Support `TwoCTA_LHS` for the m=64 instruction shape**: `BLOCK_M = 64`
+   currently always uses `TensorMemoryCTAMode::TwoCTA_RHS`; the user-driven path
+   in `BlockedToMMAv5` never selects `TwoCTA_LHS`.
 
 4. **Evaluate `.cta_group::2` TMA loads**: D96323995 added `.cta_group::2`
    support for TMA loads, which routes barrier arrivals to the leader CTA in
