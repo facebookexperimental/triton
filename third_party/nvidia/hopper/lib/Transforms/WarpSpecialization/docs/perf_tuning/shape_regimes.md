@@ -19,10 +19,9 @@ Tile count is `ceil(M/BLOCK_M) * ceil(N/BLOCK_N) * batch`, compared with 148 SMs
 
 K iterations are `ceil(K/BLOCK_K)`.
 
-- [split_k.md, Never try (any problem)](split_k.md#never-try-any-problem): source-level split-K hangs if any split gets zero K tiles.
 - [split_k.md, When to try it (depends on the problem)](split_k.md#when-to-try-it-depends-on-the-problem): when K < BLOCK_K, skip BLOCK_K values above the smallest one that covers K.
-- [split_k.md, Mechanism](split_k.md#mechanism): K <= BLOCK_K takes a separate compile path, so correctness sweeps need `k_tiles = 1`.
-- [epilogue_prologue_tma_loads.md, Never try (any problem)](epilogue_prologue_tma_loads.md#never-try-any-problem): K <= BLOCK_K with a TMA-loaded addend gives a wrong answer.
+- [split_k.md, Mechanism](split_k.md#mechanism): no K loop (K a compile-time constant <= BLOCK_K) takes a separate compile path, so correctness sweeps need `k_tiles = 1`.
+- [epilogue_prologue_tma_loads.md, Never try (any problem)](epilogue_prologue_tma_loads.md#never-try-any-problem): no K loop with a TMA-loaded addend gives a wrong answer (reproduced).
 - [epilogue_prologue_tma_loads.md, When to try it (depends on the problem)](epilogue_prologue_tma_loads.md#when-to-try-it-depends-on-the-problem): skip TMA for the addend when K <= BLOCK_K.
 - [hazards.md](hazards.md#single-k-tile-with-an-additive-epilogue-loaded-by-tma): the single-K-tile hazard entry.
 - [TRACKER.md](TRACKER.md#reported-wrong-answers--hangs-needing-repro--code-root-cause): the few-K-tiles failure of the single-copy register copy of a multi-consumer operand (reported, not located in code).
