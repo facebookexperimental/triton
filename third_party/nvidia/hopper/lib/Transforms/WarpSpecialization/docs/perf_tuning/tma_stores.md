@@ -22,11 +22,11 @@ Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). 
 
 | Condition | Status | Why | Code ref |
 |---|---|---|---|
-| `separate_epilogue_store=True` with a pointer `tl.store` epilogue (no TMA store) | silently ignored | The epilogue-store category contains only `DescriptorStoreOp`, `AsyncTMACopyLocalToGlobalOp` and `TMAStoreTokenWaitOp`. A pointer store goes to the partition of the loop's other stores, or to the default partition. | `PartitionSchedulingMeta.cpp`, `isEpilogueStoreOp`; the unreachable-store fix-up in `runOnOperation` |
-| `TRITON_WS_STAGING_COPIES` at `EPILOGUE_SUBTILE=1` | silently ignored | Phase 3.7 only deepens staging groups that hold 2 or more subtile buffers. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
+| `separate_epilogue_store=True` with a pointer `tl.store` epilogue (no TMA store) | duplicate config | The epilogue-store category contains only `DescriptorStoreOp`, `AsyncTMACopyLocalToGlobalOp` and `TMAStoreTokenWaitOp`. A pointer store goes to the partition of the loop's other stores, or to the default partition. | `PartitionSchedulingMeta.cpp`, `isEpilogueStoreOp`; the unreachable-store fix-up in `runOnOperation` |
+| `TRITON_WS_STAGING_COPIES` at `EPILOGUE_SUBTILE=1` | duplicate config | Phase 3.7 only deepens staging groups that hold 2 or more subtile buffers. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
 | `TRITON_WS_STAGING_COPIES` with `two_ctas=True` | silently ignored | Ordinary 2-CTA TMA output staging is kept at one copy. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` (2-CTA branch) |
 | 2-CTA TMA output staging whose correctness floor needs more than one copy | compile error | The planner emits "2CTA ordinary TMA output staging requires one copy" and marks the plan invalid. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
-| A staging copy count, for staging drained in the same partition, that does not divide the subtile count | silently ignored | The planner skips that depth: store waits drain a fixed in-flight count, so same-slot stores must be exactly K apart in issue order. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies`; [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Phase 3.7: Epilogue Group Copy Increase" |
+| A staging copy count, for staging drained in the same partition, that does not divide the subtile count | duplicate config | The planner skips that depth: store waits drain a fixed in-flight count, so same-slot stores must be exactly K apart in issue order. | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies`; [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Phase 3.7: Epilogue Group Copy Increase" |
 
 ## Mechanism
 
@@ -56,8 +56,8 @@ Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). 
 
 - IF the epilogue uses a pointer `tl.store`, THEN skip the `separate_epilogue_store` axis, BECAUSE it forms no store partition.
 - IF `EPILOGUE_SUBTILE=1` or `two_ctas=True`, THEN skip sweeping `TRITON_WS_STAGING_COPIES`, BECAUSE the staging ring is not deepened in either case.
-- IF sweeping `TRITON_WS_STAGING_COPIES`, THEN only try values that divide `EPILOGUE_SUBTILE` and are at most `num_stages`, BECAUSE the planner rounds anything else down to the largest legal depth, which makes duplicates.
-- IF the kernel is a persistent GEMM, THEN only try `warp_specialize=True` on the outer tile loop, BECAUSE an annotated inner K loop is partitioned separately and first.
+- IF sweeping `TRITON_WS_STAGING_COPIES`, THEN only try values that are at most `num_stages` and, when the store is drained in the same partition (`separate_epilogue_store=False`), divide `EPILOGUE_SUBTILE`; this removes the others, BECAUSE the planner rounds them down to the largest legal depth, which makes duplicates. A separate store partition accepts any count.
+- IF the kernel is a persistent GEMM, THEN prefer (ranks first; removes nothing) `warp_specialize=True` on the outer tile loop, BECAUSE an annotated inner K loop is partitioned separately and first.
 - IF a 2-CTA config is in the search, THEN only try it with a TMA store epilogue, BECAUSE 2-CTA requires one (see [2cta.md](2cta.md)).
 
 ## Interactions
@@ -70,12 +70,11 @@ See [interactions.md](interactions.md). Pairs this file expects to hold:
 
 ## Hazards
 
-- [Same-partition TMA staging floor that does not divide the subtile count](hazards.md#same-partition-tma-staging-floor-that-does-not-divide-the-subtile-count-from-code-inspection-no-reproducer-yet)
+- [Same-partition TMA staging floor that does not divide the subtile count](hazards.md#same-partition-tma-staging-floor-that-does-not-divide-the-subtile-count)
 
 ## Not yet established
 
 Tracked in [TRACKER.md](TRACKER.md).
-
 
 - The size of the gain from a separate store partition, and whether 2-CTA kernels see it as 1-CTA kernels do.
 - Whether `separate_epilogue_store` matters for fused 1-CTA kernels, given that it ties on plain 2-CTA addmm.
