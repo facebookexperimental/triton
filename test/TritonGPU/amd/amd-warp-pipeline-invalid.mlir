@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file -tritonamdgpu-warp-pipeline -verify-diagnostics
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-normalize-warp-pipeline -tritonamdgpu-warp-pipeline -verify-diagnostics
 
 // Loops are not allowed inside a warp_pipeline_stage region; see isLoopOp
 // in WarpPipeliner.cpp for the rationale (no scheduling benefit, opaque to
@@ -113,5 +113,25 @@ tt.func @flat_form_for_in_cluster(%n: index, %ptr: !tt.ptr<f32>) {
   rocdl.sched.barrier none {triton.warp_pipeline.border = "stage1"}
   tt.store %ptr, %v0 : !tt.ptr<f32>
 
+  tt.return
+}
+
+// -----
+
+// An async token producer cannot move past the wait that consumes it.
+// Normalization must leave this malformed stage for the constructor to reject.
+tt.func @wait_token_producer_inside_stage(%n: index, %token: !ttg.async.token, %ptr: !tt.ptr<i32>, %value: i32) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  scf.for %i = %c0 to %n step %c1 {
+    %next = arith.addi %value, %value : i32
+    %group = ttg.async_commit_group tokens %token
+    // expected-error @+1 {{barrier or wait op cannot appear inside a warp_pipeline_stage region}}
+    ttg.async_wait %group {num = 0 : i32}
+    tt.store %ptr, %next : !tt.ptr<i32>
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "first"}
+    tt.store %ptr, %value : !tt.ptr<i32>
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "second"}
+  }
   tt.return
 }

@@ -1,4 +1,7 @@
-// RUN: triton-opt %s -split-input-file -tritonamdgpu-warp-pipeline | FileCheck %s
+// RUN: triton-opt %s -split-input-file -triton-loop-unroll | FileCheck %s --check-prefix=UNROLLED
+// RUN: triton-opt %s -split-input-file -triton-loop-unroll -tritonamdgpu-normalize-warp-pipeline -tritonamdgpu-warp-pipeline | FileCheck %s --check-prefix=UNROLL-PIPE
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-normalize-warp-pipeline | FileCheck %s --check-prefix=NORM
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-normalize-warp-pipeline -tritonamdgpu-warp-pipeline | FileCheck %s
 
 #linear = #ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 4]], lane = [[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16]], warp = [[0, 1], [0, 2], [0, 8]], block = []}>
 #linear1 = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [4, 0]], lane = [[0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [16, 0]], warp = [[1, 0], [2, 0], [8, 0]], block = []}>
@@ -242,6 +245,11 @@ tt.func @unroll_iv_remap_sunk_past_async_wait(%n: index, %ptr: !tt.ptr<f32>) {
   tt.return
 }
 
+// NORM-LABEL: tt.func @unroll_iv_remap_sunk_past_async_wait(
+// NORM: triton.warp_pipeline.border = "stage2"
+// NORM-NEXT: ttg.async_wait
+// NORM-NEXT: %[[IV:.*]] = arith.addi
+// NORM-NEXT: arith.muli %[[IV]]
 // CHECK-LABEL: tt.func @unroll_iv_remap_sunk_past_async_wait(
 // CHECK: scf.for
 // iter 0: async_wait, stage1 region, stage2 region.
@@ -264,6 +272,13 @@ tt.func @unroll_iv_remap_sunk_past_async_wait(%n: index, %ptr: !tt.ptr<f32>) {
 // CHECK: tt.return
 
 // Layout cleanup can put accumulator conversions before the first wait.
+// NORM-LABEL: tt.func @loop_layout_inputs_past_wait(
+// NORM: scf.for
+// NORM-NEXT: ttg.async_wait
+// NORM-NEXT: %[[MMA:.*]] = ttg.convert_layout
+// NORM-NEXT: %[[LINEAR:.*]] = ttg.convert_layout %[[MMA]]
+// NORM-NEXT: arith.addf %[[LINEAR]]
+// NORM-NEXT: rocdl.sched.barrier none {triton.warp_pipeline.border = "first"}
 // CHECK-LABEL: tt.func @loop_layout_inputs_past_wait(
 // CHECK: scf.for
 // CHECK-NEXT: ttg.async_wait
@@ -288,6 +303,68 @@ tt.func @loop_layout_inputs_past_wait(%n: index, %input: tensor<256x32xf32, #lin
   tt.return
 }
 
+// Without stage borders, normalization must not move inputs past a wait.
+// NORM-LABEL: tt.func @no_pipeline_layout_input(
+// NORM: scf.for
+// NORM-NEXT: %[[INPUT:.*]] = ttg.convert_layout
+// NORM-NEXT: ttg.async_wait
+// NORM-NEXT: %[[RESULT:.*]] = ttg.convert_layout %[[INPUT]]
+// NORM-NEXT: scf.yield %[[RESULT]]
+// CHECK-LABEL: tt.func @no_pipeline_layout_input(
+// CHECK-NOT: scf.execute_region
+// CHECK: tt.return
+tt.func @no_pipeline_layout_input(%n: index, %input: tensor<256x32xf32, #linear>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %result = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %input) -> tensor<256x32xf32, #linear> {
+    %converted = ttg.convert_layout %acc : tensor<256x32xf32, #linear> -> tensor<256x32xf32, #mma>
+    ttg.async_wait {num = 0 : i32}
+    %result = ttg.convert_layout %converted : tensor<256x32xf32, #mma> -> tensor<256x32xf32, #linear>
+    scf.yield %result : tensor<256x32xf32, #linear>
+  }
+  tt.return
+}
+
+// Unowned flat stages also need normalization after loop unrolling. Keep
+// operations before the first wait and after the last border in place.
+// NORM-LABEL: tt.func @flat_inputs_past_wait(
+// NORM-NEXT: %[[PRE:.*]] = arith.addi
+// NORM-NEXT: ttg.async_wait
+// NORM-NEXT: tt.store {{.*}}, %[[PRE]]
+// NORM-NEXT: rocdl.sched.barrier none
+// NORM-NEXT: ttg.async_wait
+// NORM-NEXT: %[[NEXT:.*]] = arith.addi %[[PRE]]
+// NORM-NEXT: tt.store {{.*}}, %[[NEXT]]
+// NORM-NEXT: rocdl.sched.barrier none
+// NORM-NEXT: %[[POST:.*]] = arith.addi %[[NEXT]]
+// NORM-NEXT: ttg.async_wait
+// NORM-NEXT: tt.store {{.*}}, %[[POST]]
+// CHECK-LABEL: tt.func @flat_inputs_past_wait(
+// CHECK: arith.addi
+// CHECK-NEXT: ttg.async_wait
+// CHECK-NEXT: scf.execute_region
+// CHECK: triton.warp_pipeline.stage = "first"
+// CHECK-NEXT: ttg.async_wait
+// CHECK-NEXT: {{.*}}scf.execute_region
+// CHECK-NEXT: arith.addi
+// CHECK: triton.warp_pipeline.stage = "second"
+// CHECK-NEXT: arith.addi
+// CHECK-NEXT: ttg.async_wait
+tt.func @flat_inputs_past_wait(%value: i32, %ptr: !tt.ptr<i32>) {
+  %pre = arith.addi %value, %value : i32
+  ttg.async_wait {num = 0 : i32}
+  tt.store %ptr, %pre : !tt.ptr<i32>
+  rocdl.sched.barrier none {triton.warp_pipeline.border = "first"}
+  %next = arith.addi %pre, %value : i32
+  ttg.async_wait {num = 0 : i32}
+  tt.store %ptr, %next : !tt.ptr<i32>
+  rocdl.sched.barrier none {triton.warp_pipeline.border = "second"}
+  %post = arith.addi %next, %value : i32
+  ttg.async_wait {num = 0 : i32}
+  tt.store %ptr, %post : !tt.ptr<i32>
+  tt.return
+}
+
 // -- Negative: no border → no structuring ----
 tt.func @no_split_example(%n: index) {
   %c0  = arith.constant 0 : index
@@ -307,3 +384,43 @@ tt.func @no_split_example(%n: index) {
 // CHECK-NOT: scf.execute_region
 // CHECK-NOT: pipelined_for
 // CHECK: tt.return
+
+// -----
+
+// Use the real loop unroller. A dynamic step requires both multiplication
+// and addition for the second iteration's induction variable.
+tt.func @loop_unroller_stage_inputs(%ptr: !tt.ptr<f32>, %n: i32, %step: i32) {
+  %c0 = arith.constant 0 : i32
+  scf.for %i = %c0 to %n step %step : i32 {
+    ttg.async_wait {num = 0 : i32}
+    %p = tt.addptr %ptr, %i : !tt.ptr<f32>, i32
+    %v = tt.load %p : !tt.ptr<f32>
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "load"}
+    tt.store %p, %v : !tt.ptr<f32>
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "store"}
+  } {tt.loop_unroll_factor = 2 : i32}
+  tt.return
+}
+
+// UNROLLED-LABEL: tt.func @loop_unroller_stage_inputs
+// UNROLLED: scf.for
+// UNROLLED: triton.warp_pipeline.border = "store"
+// UNROLLED-NEXT: %[[ONE:.*]] = arith.constant 1 : i32
+// UNROLLED-NEXT: %[[OFFSET:.*]] = arith.muli {{.*}}, %[[ONE]]
+// UNROLLED-NEXT: %[[IV:.*]] = arith.addi {{.*}}, %[[OFFSET]]
+// UNROLLED-NEXT: ttg.async_wait
+// UNROLLED-NEXT: tt.addptr {{.*}}, %[[IV]]
+
+// UNROLL-PIPE-LABEL: tt.func @loop_unroller_stage_inputs
+// UNROLL-PIPE: scf.for
+// UNROLL-PIPE: triton.warp_pipeline.stage = "load"
+// UNROLL-PIPE: triton.warp_pipeline.stage = "store"
+// UNROLL-PIPE-NEXT: ttg.async_wait
+// UNROLL-PIPE-NEXT: {{.*}}scf.execute_region
+// UNROLL-PIPE-NEXT: %[[ONE:.*]] = arith.constant 1 : i32
+// UNROLL-PIPE-NEXT: %[[OFFSET:.*]] = arith.muli {{.*}}, %[[ONE]]
+// UNROLL-PIPE-NEXT: %[[IV:.*]] = arith.addi {{.*}}, %[[OFFSET]]
+// UNROLL-PIPE-NEXT: tt.addptr {{.*}}, %[[IV]]
+// UNROLL-PIPE: triton.warp_pipeline.stage = "load"
+// UNROLL-PIPE: triton.warp_pipeline.stage = "store"
+// UNROLL-PIPE: triton.warp_pipeline.pipelined_for

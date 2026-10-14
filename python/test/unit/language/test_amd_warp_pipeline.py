@@ -8,6 +8,9 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd.cdna4 import async_copy
 from triton._internal_testing import is_hip, is_hip_cdna4
 
 # --- Runtime test: simple GEMM with warp pipeline ---
@@ -350,6 +353,45 @@ def test_fa_warp_pipeline_layout_inputs(causal, n, dtype):
     assert re.search(r'ttg.async_wait[^\n]*\n[^\n]*scf.execute_region[^\n]*\n[^\n]*ttg.convert_layout',
                      compiled.asm['ttgir'])
     assert 'triton.warp_pipeline.pipelined_for' in compiled.asm['ttgir']
+    assert 's_setprio' in compiled.asm['amdgcn']
+
+
+@gluon.jit
+def _warp_pipeline_unroll_kernel(X, Y, TILES: gl.constexpr, UNROLL: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [8], [0])
+    offsets = gl.arange(0, 512, layout=layout)
+    buffers = gl.allocate_shared_memory(gl.float32, [2, 512], gl.SwizzledSharedLayout(1, 1, 1, [0]))
+    async_copy.global_load_to_shared(buffers.index(0), X + offsets)
+    async_copy.commit_group()
+    for tile in tl.range(0, TILES, loop_unroll_factor=UNROLL):
+        async_copy.wait_group(0)
+        with gl.amd.warp_pipeline_stage("load"):
+            value = async_copy.load_shared_relaxed(buffers.index(tile % 2), layout)
+        with gl.amd.warp_pipeline_stage("store", priority=1):
+            gl.store(Y + tile * 512 + offsets, value + tile)
+            future = (tile + 1) % TILES
+            async_copy.global_load_to_shared(buffers.index((tile + 1) % 2), X + future * 512 + offsets)
+            async_copy.commit_group()
+    async_copy.wait_group(0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("unroll", [2, 4])
+def test_warp_pipeline_unroll_stage_inputs(unroll):
+    """Move index arithmetic from loop unrolling past the next async wait."""
+    torch.manual_seed(42)
+    x = torch.randn((8, 512), device="cuda", dtype=torch.float32)
+    out = torch.empty_like(x)
+    compiled = _warp_pipeline_unroll_kernel[(1, )](x, out, 8, unroll, num_warps=8)
+    expected = x + torch.arange(8, device="cuda")[:, None]
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count('triton.warp_pipeline.stage = "load"') == unroll
+    assert ttgir.count('triton.warp_pipeline.stage = "store"') == unroll
+    assert re.search(
+        r'ttg.async_wait[^\n]*\n[^\n]*scf.execute_region[^\n]*\n[^\n]*arith.constant[^\n]*'
+        r'\n[^\n]*arith.muli[^\n]*\n[^\n]*arith.addi', ttgir)
+    assert 'triton.warp_pipeline.pipelined_for' in ttgir
     assert 's_setprio' in compiled.asm['amdgcn']
 
 

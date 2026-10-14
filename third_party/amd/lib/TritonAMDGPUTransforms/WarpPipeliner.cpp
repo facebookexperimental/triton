@@ -24,6 +24,7 @@ namespace tt = mlir::triton;
 namespace mlir {
 
 #define GEN_PASS_DEF_TRITONAMDGPUPRESERVEWARPPIPELINEOWNERS
+#define GEN_PASS_DEF_TRITONAMDGPUNORMALIZEWARPPIPELINE
 #define GEN_PASS_DEF_TRITONAMDGPUWARPPIPELINE
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
@@ -200,6 +201,20 @@ static void createClusterOp(OpBuilder &b, Location loc,
   return;
 }
 
+// Without an owner marker, a flat pipeline starts after the nearest loop or
+// synchronization operation before its first border.
+static Operation *getFlatPipelineStart(Operation *firstBorder) {
+  Operation *start = firstBorder;
+  for (Operation *op = firstBorder->getPrevNode(); op; op = op->getPrevNode()) {
+    if (isLoopOp(op) || isa<tt::amdgpu::CondBarrierOp>(op) ||
+        canSitBetweenStages(op) || op->hasAttr(kOwnerBeginAttr) ||
+        op->hasAttr(kOwnerEndAttr))
+      break;
+    start = op;
+  }
+  return start;
+}
+
 // Place stage inputs after independent waits. This does not validate
 // cross-wave communication inside the next stage.
 static void sinkStageInputsIntoNextStage(Operation *begin, Operation *end) {
@@ -220,7 +235,7 @@ static void sinkStageInputsIntoNextStage(Operation *begin, Operation *end) {
     }
     if (canSitBetweenStages(op) && !pending.empty()) {
       Operation *anchor = op;
-      while (anchor->getNextNode() &&
+      while (anchor->getNextNode() && anchor->getNextNode() != end &&
              canSitBetweenStages(anchor->getNextNode()))
         anchor = anchor->getNextNode();
       bool conflict = false;
@@ -241,6 +256,57 @@ static void sinkStageInputsIntoNextStage(Operation *begin, Operation *end) {
   }
 }
 
+// Normalize only ranges that contain stage borders. Owner markers bound the
+// range even when loop folding moves the body into a persistent outer loop.
+static void normalizeStageInputs(Operation *begin, Operation *end,
+                                 bool hasOwner) {
+  Operation *firstBorder = nullptr;
+  Operation *lastBorder = nullptr;
+  for (Operation *op = begin; op && op != end; op = op->getNextNode()) {
+    if (isPipelineBorder(op)) {
+      if (!firstBorder)
+        firstBorder = op;
+      lastBorder = op;
+    }
+  }
+  if (!firstBorder)
+    return;
+
+  if (!hasOwner && !isa<scf::ForOp>(begin->getParentOp())) {
+    // Unbounded flat pipelines are supported in function blocks. Keep their
+    // prologue and epilogue outside the range, as stage construction does.
+    if (!isa<tt::FuncOp>(begin->getParentOp()))
+      return;
+    begin = getFlatPipelineStart(firstBorder);
+    end = lastBorder->getNextNode();
+  }
+  sinkStageInputsIntoNextStage(begin, end);
+}
+
+struct TritonAMDGPUNormalizeWarpPipelinePass
+    : impl::TritonAMDGPUNormalizeWarpPipelineBase<
+          TritonAMDGPUNormalizeWarpPipelinePass> {
+  using Base::Base;
+
+  void runOnOperation() override {
+    getOperation().walk([](Block *block) {
+      if (block->empty())
+        return;
+      Operation *begin = &block->front();
+      bool hasOwner = false;
+      for (Operation &op : llvm::make_early_inc_range(*block)) {
+        bool isBegin = op.hasAttr(kOwnerBeginAttr);
+        if (!isBegin && !op.hasAttr(kOwnerEndAttr))
+          continue;
+        normalizeStageInputs(begin, &op, hasOwner);
+        begin = op.getNextNode();
+        hasOwner = isBegin;
+      }
+      normalizeStageInputs(begin, nullptr, hasOwner);
+    });
+  }
+};
+
 // Turns a partitioned region into the warp-pipelined clusters.  Returns
 // NotApplicable when the loop has no border markers (user opted out), Created
 // on success, or Malformed when border markers are present but the loop body
@@ -258,8 +324,6 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
   SmallVector<BorderMarker> clusterMarkers;
   SmallVector<SmallVector<Operation *>> clusters;
   auto ctx = forOp.getContext();
-
-  sinkStageInputsIntoNextStage(&blk.front(), /*end=*/nullptr);
 
   // One pass over the body; collect clusters split by explicit borders.
   for (Operation &opRef : llvm::make_early_inc_range(blk)) {
@@ -373,23 +437,8 @@ static PipelineResult createFlatPipeline(OpBuilder &b, Block &block,
 
   // 2. For flat pipelines, stage 0 may include the ops immediately before the
   //    first border.  Stop at ops that must stay outside this pipeline.
-  Operation *regionStart = nullptr;
-  if (scopeBegin) {
-    regionStart = firstInScope;
-  } else {
-    regionStart = firstBorder;
-    for (Operation *op = firstBorder->getPrevNode(); op;
-         op = op->getPrevNode()) {
-      if (isLoopOp(op) || isa<tt::amdgpu::CondBarrierOp>(op) ||
-          canSitBetweenStages(op))
-        break;
-      regionStart = op;
-    }
-  }
-
-  sinkStageInputsIntoNextStage(regionStart, scopeEnd);
-  if (scopeBegin)
-    regionStart = scopeBegin->getNextNode();
+  Operation *regionStart =
+      scopeBegin ? firstInScope : getFlatPipelineStart(firstBorder);
 
   // 3. Sweep forward from regionStart, splitting ops into clusters at each
   //    border.  Mirrors createPipeline's main loop, but bounded by lastBorder

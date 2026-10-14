@@ -652,6 +652,7 @@ class HIPBackend(BaseBackend):
         # conversion. Placed at the TTGIR stage (so it does not double-run for gluon
         # kernels) and as the last pass before pm.run so the cleanup passes above do
         # not strip the priority markers before the pipeliner consumes them.
+        amd.passes.ttgpuir.add_normalize_warp_pipeline(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         # Consume explicit tlx.warp_pipeline_stage(scope="intra_wave")
         # regions. This pass is
@@ -687,6 +688,7 @@ class HIPBackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttir.add_loop_unroll(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+        amd.passes.ttgpuir.add_normalize_warp_pipeline(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
 

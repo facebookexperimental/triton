@@ -36,7 +36,7 @@ _VERSION_SKEW_FILES = {
 }
 
 # Individual frontend/layout cases that don't pass on the pinned build:
-#  - nv_tma_descriptor_{load,store} and amd mfma/wmma_scaled/warp_pipeline emit IR that
+#  - nv_tma_descriptor_{load,store} and amd mfma/wmma_scaled emit IR that
 #    legitimately differs per parametrized target, so a single `assert_expected_inline`
 #    golden cannot match every param (needs per-target goldens / upstream test change);
 #  - amd_mbarrier hits a `create_lds_barrier_wait` pybind signature mismatch (needs a
@@ -47,7 +47,6 @@ _KNOWN_FAIL_SUBSTRINGS = (
     "test_frontend.py::test_nv_tma_descriptor_store_kernel[",
     "test_frontend.py::test_amd_mfma[",
     "test_frontend.py::test_amd_wmma_scaled_scalar[",
-    "test_frontend.py::test_amd_warp_pipeline[",
     "test_frontend.py::test_amd_mbarrier[",
     "test_layout_format_view.py::test_format_view_kernel",
 )
