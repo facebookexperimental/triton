@@ -62,7 +62,7 @@ references. Name the reference with every comparison.
    not fit.
 5. **Feature branches and leaves.** The configs that survive, with each
    feature's mechanism in its feature file. Knob priorities (P0, then P1, then
-   P2) are in `knobs.md`.
+   P2) are in [knobs.md](knobs.md).
 
 ## Rule format
 

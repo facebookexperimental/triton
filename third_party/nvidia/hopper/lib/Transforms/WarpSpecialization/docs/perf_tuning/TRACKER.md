@@ -8,7 +8,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 
 | File | State | Note |
 |------|-------|------|
-| `knobs.md` | todo | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it. |
+| [`knobs.md`](knobs.md) | done | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it.  |
 | `resources.md` | todo | SMEM, TMEM and register budgets as rules; links to the existing SMEM/TMEM/register docs for the mechanics. |
 | `interactions.md` | todo | Feature-pair table grouped by feature: pair \| status ("works", "compile error", "silently ignored", "duplicate config", "hangs", "wrong answer", "requires") \| mechanism + code location. |
 | `hazards.md` | todo | Open wrong-answer and hang conditions, each with its trigger and code location. Entries are deleted when fixed. |
@@ -51,6 +51,61 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 
 | Doc | State | Note |
 |-----|-------|------|
+
+## Knob coverage
+
+One row per entry in [knobs.md](knobs.md), with its priority (P0 highest, P2 lowest). Covered in: the files whose "Pruning ruleset" or "Mechanism" section names the knob. `covered` = named there; `mentioned` = named elsewhere in a feature file only; `todo` = not covered yet.
+
+| Knob | Priority | Covered in | State |
+|------|----------|------------|-------|
+| `BLOCK_M` | P0 | — | todo |
+| `BLOCK_N` | P0 | — | todo |
+| `BLOCK_K` | P0 | — | todo |
+| `num_stages` | P0 | — | todo |
+| `flatten` | P0 | — | todo |
+| `warp_specialize` | P0 | — | todo |
+| `data_partition_factor` | P0 | — | todo |
+| `separate_epilogue_store` | P0 | — | todo |
+| `two_ctas` | P0 | — | todo |
+| `ctas_per_cga` | P0 | — | todo |
+| Tile scheduler | P0 (static persistent); P1 (CLC, dynamic) | — | todo |
+| Descriptor loads/stores | P0 | — | todo |
+| Epilogue subtiling (ES) | P0 | — | todo |
+| `early_tma_store_lowering` | P0 | — | todo |
+| `tma_store_pipelining` | P0 | — | todo |
+| `TRITON_WS_STAGING_COPIES` | P0 | — | todo |
+| `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | P0 | — | todo |
+| `num_warps` | P0 | — | todo |
+| `num_stages` (per loop) | P1 | — | todo |
+| `disallow_acc_multi_buffer` | P1 | — | todo |
+| `merge_epilogue` | P1 | — | todo |
+| `multicast` (per load) | P1 | — | todo |
+| `multicast` | P1 | — | todo |
+| `generate_subtiled_region` | P1 | — | todo |
+| `minRegAutoWS` | P1 | — | todo |
+| `maxRegAutoWS` | P1 | — | todo |
+| `tmem_alloc_algo` | P1 | — | todo |
+| `loop_unroll_factor`, `disable_licm` | P2 | — | todo |
+| `merge_epilogue_to_computation`, `merge_correction` | P2 | — | todo |
+| `pingpongAutoWS` | P2 | — | todo |
+| `multi_cta` | P2 | — | todo |
+| `allowDependentTwoCTA` | P2 | — | todo |
+| `clc` | P2 | — | todo |
+| `tt.autows` stage/order | P2 | — | todo |
+| `auto_tma` / `auto_tma_device` | P2 | — | todo |
+| `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | P2 | — | todo |
+| `maxnreg` | P2 | — | todo |
+| `sched4reg`, `enable_tree_reduction` | P2 | — | todo |
+| `smem_alloc_algo` | P2 | — | todo |
+| `smem_budget` | P2 | — | todo |
+| `smem_circular_reuse` | P2 | — | todo |
+| `tt.autows` channels | P2 | — | todo |
+| `mem_plan_pick` + `TRITON_WS_MEM_PLAN_TOPK` / `_PICK` | P2 | — | todo |
+| `TRITON_WS_SMEM_PLAN_SEARCH` | P2 | — | todo |
+| `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | P2 | — | todo |
+| `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | P2 | — | todo |
+| Alternative schedulers: `TRITON_USE_MODULO_SCHEDULE` (+ `TRITON_MODULO_*`), `TRITON_USE_JOINT_SCHEDULE`‡, `TRITON_USE_LLM_SCHEDULE`‡, `TRITON_USE_LIST_SCHEDULE` | P2 | — | todo |
+| `list_schedule_pick` | P2 | — | todo |
 
 ## Other
 
