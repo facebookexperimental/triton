@@ -68,12 +68,9 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 
 | Family | Lands in | Hypothesis | State |
 |--------|----------|------------|-------|
-| H-RIDGE | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | Calibrate ridge in: **IF** `AI_min >= ridge`, **THEN** prefer tiles in decreasing `I_t = BM*BN/(BM + BN')` (`BN' = BN/2` under 2-CTA): 2-CTA 128x256 and 1-CTA 256x256 dp=2 (128) > 128x256, 256x128, 2-CTA 128x128 (85) > 128x128 (64) > 64x256 (51) > 64x128 (43), **BECAUSE** operand SMEM fill per FLOP is `1/I_t` (slot sizes in "Mechanism"). | todo |
 | H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** the epilogue does per-element register math beyond a bias (fused) and `R(num_warps=4) > 64`, **THEN** keep `num_warps=8` alongside 4. | todo |
 | H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** no rule above sets `minRegAutoWS`, `maxRegAutoWS` or `maxnreg`, **THEN** leave them at their defaults. | todo |
 | — | [epilogue.md § When to try it](epilogue.md#when-to-try-it-depends-on-the-problem) | **IF** none of the rules above applies, **THEN** leave `generate_subtiled_region`, `early_tma_store_lowering`, `tma_store_pipelining` and `merge_epilogue*` at their defaults. | todo |
-| H-SPLITK, H-RIDGE | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | the fraction of SMs that saturates HBM is | todo |
-| H-RIDGE | [split_k.md § When to try it](split_k.md#when-to-try-it-depends-on-the-problem) | IF `AI_min < ridge`, THEN the problem is memory bound, with `ridge` the AI at which the best autoWS arm and cuBLAS stop improving with K. | todo |
 
 ## Fixes to existing docs
 
