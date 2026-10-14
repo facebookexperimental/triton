@@ -167,6 +167,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [Code Specialization](CodeSpecialization.md) — how ops are cloned into WarpSpecializeOp regions
 - [Partition Loop Peeling](PartitionLoopPeeling.md) — masked-prefix control-flow peeling after physical specialization
 - [Memory Lowering](MemoryLowering.md) — async copy creation and TMA store lowering
+- [Auto-TMA Promotion](AutoTMAPromotion.md) — `auto_tma`: TTIR rewrite of pointer loads/stores into TMA descriptor ops before AutoWS
 - [Token & Barrier Lowering](TokenBarrierLowering.md) — lowering abstract tokens to hardware mbarriers
 - [Buffer Allocation](BufferAllocation.md) — channel discovery and SMEM/TMEM allocation hoisting
 - [Accumulation Counters](AccumulationCounters.md) — accumulation counter infrastructure for multi-buffering
