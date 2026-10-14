@@ -10,9 +10,9 @@ Scope: how GEMM operands (A, B) reach SMEM under Meta WS (`TRITON_USE_META_WS=1`
 | `auto_tma` | compile option `auto_tma=True` or env `TRITON_AUTO_TMA=1` (sm_90+) | Promotes eligible pointer `tl.load`s to host TMA descriptors before warp specialization. In a WS kernel it also promotes eligible stores. | [AutoTMAPromotion.md](../AutoTMAPromotion.md) |
 | `auto_tma_device` | compile option or env `TRITON_AUTO_TMA_DEVICE=1` | Makes `auto_tma` build device-side descriptors instead of host recipes. Loads that a host recipe cannot express switch to device mode on their own. | [AutoTMAPromotion.md](../AutoTMAPromotion.md#host-recipes-versus-device-descriptors) |
 | descriptor `padding` | `TensorDescriptor(..., padding="zero"\|"nan")` | Out-of-bounds fill value. The default is `"zero"`. | none |
-| `desc.load(multicast=True)` / `multicast` option | kernel source / compile option | Plans multicast axes only. See the hard prunes below. | `docs/design/triton_tma_multicast.md` |
+| `desc.load(multicast=True)` / `multicast` option | kernel source / compile option | Plans multicast axes only. See "Never try (any problem)" below. | `docs/design/triton_tma_multicast.md` |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Status | Why | Code ref |
 |---|---|---|---|
@@ -61,7 +61,7 @@ Scope: how GEMM operands (A, B) reach SMEM under Meta WS (`TRITON_USE_META_WS=1`
 - With the default `padding="zero"`, an operand tile that runs past M, N or K reads zeros. Masking M/N/K tails for TMA operands is therefore unnecessary for correctness. The output tail is discarded by the TMA store's bounds.
 - Code: `python/triton/tools/tensor_descriptor.py`, `TensorDescriptor`.
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - IF an MMA operand is pointer-loaded under Meta WS, THEN only try configs that load it with a TMA descriptor (or `auto_tma`), BECAUSE pointer loads are not routed to the load partition (`categorizeLoads`).
 - IF an operand is read by both the MMA and register code, THEN count two SMEM buffers per stage for it when judging whether a tile and depth fit, BECAUSE the MMA copy is a separate register-written buffer.
