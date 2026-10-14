@@ -67,13 +67,19 @@ Mechanics: [TMAStoreWaitPipeline.md, "`K | S` cap for same-partition (wait_group
 - **`separate_epilogue_store=True`:**
   - relieves: frees staging depth from the divisor rule and takes TMA issue out of the epilogue partition;
   - costs: one more worker warp, which can cost a whole warp group of registers (see [warps_and_registers.md](warps_and_registers.md)).
+  - also costs: with `ES` >= 2 and `TRITON_WS_STAGING_COPIES` unset, staging may take up to `num_stages` copies before the operands, which starves the B ring (see the rules below).
 
 ## When to try it (depends on the problem)
+
+`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
 
 Staging SMEM = `BM * (BN/ES) * out_bytes * copies`, with copies <= `min(num_stages, ES)` for a same-partition store or <= `num_stages` for a separate store (see "Mechanism"). `R` and `d_fit` as in [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem) and [resources.md](resources.md#when-to-try-it-depends-on-the-problem).
 
 - **IF** `d_fit < 1` at `ES = e` (one operand level does not fit next to one staging copy of `BM * (BN/e) * out_bytes`), **THEN** drop that `ES`, **BECAUSE** the plan exceeds SMEM. Example: 128x256x128 1-CTA bf16: `ES=1` staging 64 KiB + slot 96 KiB fits once (`d_fit` 1); 256x256x128 `ES=1` (128 KiB + 128 KiB) does not. [mechanism]
 - **IF** comparing total staging across `ES`, **THEN** compute slice x copies with the bounds above, **BECAUSE** copies can rise as `ES` grows, so total staging is not monotone in `ES`. [mechanism]
+- **IF** `separate_epilogue_store=True` and `ES` >= 2, **THEN** prefer `TRITON_WS_STAGING_COPIES=1` or `2` (they are flat against each other) over leaving it unset, **BECAUSE** unset, staging takes up to `num_stages` copies before the operands and starves the B ring (e.g. 128x256, `ES=2`, `num_stages=3`: 3 staging copies and B=2; capped: B=3). [measured: --regime ses, wins on a majority of shapes]
+- **IF** 1-CTA, `ES=2` and staging uncapped, **THEN** skip `separate_epilogue_store=True`, **BECAUSE** a same-partition store caps staging copies at divisors of `ES`, so B keeps its depth. [measured: --regime ses, loses on every shape in the regime]
+- **IF** 2-CTA, or `ES=4`, **THEN** pin `separate_epilogue_store` at its default, **BECAUSE** staging is already single-copy (2-CTA) or small. [measured: --regime ses, flat within noise]
 
 ## Interactions
 

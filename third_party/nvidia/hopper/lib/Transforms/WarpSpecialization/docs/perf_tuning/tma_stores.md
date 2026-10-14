@@ -56,6 +56,8 @@ Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). 
 
 - IF the kernel is a persistent GEMM, THEN prefer `warp_specialize=True` on the outer tile loop only, BECAUSE `PartitionSchedulingMeta::runOnOperation` walks annotated loops post-order, so an annotated inner K loop is partitioned first and on its own. [mechanism]
 
+Whether to use a separate store and how many staging copies to allow: measured rules in [epilogue.md](epilogue.md#when-to-try-it-depends-on-the-problem).
+
 ## Interactions
 
 See [interactions.md](interactions.md). Pairs this file expects to hold:
