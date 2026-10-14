@@ -45,8 +45,8 @@ Each step narrows the candidate set. Later PRs fill in one branch each; see
      pipeline ever reaches steady state;
    - arithmetic intensity `2*M*N*K / bytes(A, B, C)`: memory bound or compute
      bound.
-3. **Hard prunes.** Drop configs that are illegal, silently ignored,
-   duplicates of another config, or known to hang or give a wrong answer.
+3. **Hard prunes.** Drop configs that give a compile error, are silently
+   ignored, are a duplicate config, hang, or give a wrong answer.
 4. **Resource limits.** Drop configs whose SMEM, TMEM or register demand does
    not fit.
 5. **Feature branches.** One branch per feature (tiles and stages, 2-CTA, data
@@ -58,9 +58,9 @@ Each step narrows the candidate set. Later PRs fill in one branch each; see
 
 Every rule is one of two kinds.
 
-- **Hard prune.** The config is illegal, silently ignored, a duplicate of
-  another config, hangs, or gives a wrong answer. State the condition and the
-  code that enforces or exhibits it.
+- **Hard prune.** The config gives a compile error, is silently ignored, is a
+  duplicate config, hangs, gives a wrong answer, or requires another knob
+  value. State the condition and the code that enforces or exhibits it.
 - **Mechanism.** State what the knob changes, what that relieves, what it
   costs, and the pruning that follows.
 
@@ -80,10 +80,10 @@ Every feature file has the same sections, in this order.
 1. **Title and scope.** One paragraph.
 2. **Knobs.** Table: knob | how it is set | one line | link to the existing
    doc section.
-3. **Hard prunes.** Table: condition | code | why (one line) | code ref (file +
-   symbol). Codes: `ERR` (compile error), `IGN` (silently ignored), `HANG`,
-   `WRONG` (wrong answer), `REQ` (requires another knob value), `DUP`
-   (duplicate of another config).
+3. **Hard prunes.** Table: condition | status | why (one line) | code ref
+   (file + symbol). Status is one of "compile error", "silently ignored",
+   "duplicate config", "hangs", "wrong answer" or "requires" (needs another
+   knob value).
 4. **Mechanism.** What the feature changes -> what it relieves -> what it
    costs, with code refs.
 5. **Pruning rules.** Derived from the mechanism, written as

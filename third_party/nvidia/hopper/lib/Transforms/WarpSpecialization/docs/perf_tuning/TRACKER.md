@@ -10,7 +10,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 |------|-------|------|
 | `knobs.md` | todo | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it. |
 | `resources.md` | todo | SMEM, TMEM and register budgets as pruning rules; links to the existing SMEM/TMEM/register docs for the mechanics. |
-| `interactions.md` | todo | Feature-pair table grouped by feature: pair \| code (`OK`/`ERR`/`IGN`/`HANG`/`WRONG`/`REQ`) \| mechanism + code location. |
+| `interactions.md` | todo | Feature-pair table grouped by feature: pair \| status ("works", "compile error", "silently ignored", "duplicate config", "hangs", "wrong answer", "requires") \| mechanism + code location. |
 | `hazards.md` | todo | Open wrong-answer and hang conditions, each with its trigger and code location. Entries are deleted when fixed. |
 
 ## Feature files
