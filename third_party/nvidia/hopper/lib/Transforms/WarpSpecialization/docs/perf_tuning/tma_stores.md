@@ -18,7 +18,7 @@ Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). 
 | `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | env var | Copy target for TMA-reduce staging. It is independent of `num_stages`. | [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Phase 3.7: Epilogue Group Copy Increase" |
 | `tma_store_pipelining` | compile option, on by default | Annotates and reorders TMA store waits so that staging slots can be reused. | [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), section "Wait Annotation and Reordering Pipeline" |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Status | Why | Code ref |
 |---|---|---|---|
@@ -52,7 +52,7 @@ Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). 
 - **What it costs:** K x the subtile staging size of SMEM, taken from the same budget as the operand ring.
 - Code: `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` and `getStagingCopiesCap`; `WSTMAStoreLowering.cpp` (planned pending count = K-1). Background: [TMAStoreWaitPipeline.md](../TMAStoreWaitPipeline.md), sections "Phase 3.5: TMA Staging Fusion" and "Phase 3.7: Epilogue Group Copy Increase".
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - IF the epilogue uses a pointer `tl.store`, THEN skip the `separate_epilogue_store` axis, BECAUSE it forms no store partition.
 - IF `EPILOGUE_SUBTILE=1` or `two_ctas=True`, THEN skip sweeping `TRITON_WS_STAGING_COPIES`, BECAUSE the staging ring is not deepened in either case.

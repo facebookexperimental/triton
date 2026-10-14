@@ -172,6 +172,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [Partition Loop Peeling](PartitionLoopPeeling.md) — masked-prefix control-flow peeling after physical specialization
 - [Memory Lowering](MemoryLowering.md) — async copy creation and TMA store lowering
 - [Register Budgets](RegisterBudgets.md) — `minRegAutoWS` / `maxRegAutoWS` / `maxnreg` → per-partition `setmaxnreg`
+- [TMA Descriptors](TMADescriptors.md) — host-side `TensorDescriptor` vs device-side `tl.make_tensor_descriptor` under AutoWS
 - [Auto-TMA Promotion](AutoTMAPromotion.md) — `auto_tma`: TTIR rewrite of pointer loads/stores into TMA descriptor ops before AutoWS
 - [Token & Barrier Lowering](TokenBarrierLowering.md) — lowering abstract tokens to hardware mbarriers
 - [Buffer Allocation](BufferAllocation.md) — channel discovery and SMEM/TMEM allocation hoisting
