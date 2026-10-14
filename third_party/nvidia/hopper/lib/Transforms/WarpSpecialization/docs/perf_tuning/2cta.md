@@ -64,7 +64,7 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 - `two_ctas` × `tl.dot_scaled`
 - `two_ctas` × CLC tile scheduler (see [clc_persistence.md](clc_persistence.md))
 - `two_ctas` × atomic dynamic tile scheduler
-- `two_ctas` × TMA multicast (see `multicast.md`)
+- `two_ctas` × TMA multicast (see [multicast.md](multicast.md))
 
 ## Hazards
 
