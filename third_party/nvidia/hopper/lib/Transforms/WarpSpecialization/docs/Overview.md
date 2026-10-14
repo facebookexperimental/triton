@@ -185,3 +185,4 @@ recognizes the `scf.while` outer loop (same doc).
 - [Memory Planner Visualization](MemoryPlannerVisualization.md) — debug DOT graph tools
 - [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md) — annotation, reordering, and lowering of TMA store waits
 - [Debugging Accuracy / Deadlocks](DebuggingAccuracyAndDeadlocks.md) — triage process for AutoWS wrong-results / hang bugs (tools, skills, methodology)
+- [Perf Tuning Context](perf_tuning/README.md) — when to use which knob values for GEMMs on B200 (config-space pruning)
