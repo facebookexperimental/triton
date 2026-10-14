@@ -61,11 +61,10 @@ Which logical partition is the default region: [PartitionSchedulingMeta.md, "Pha
 
 ## When to try it (depends on the problem)
 
-- **IF** `num_warps` is not 4 or 8, **THEN** skip, **BECAUSE** no tcgen05 autoWS GEMM is generated.
-- **IF** `num_warps` + 4 × (number of non-default partitions holding TMEM ops) + (other non-default partitions) > 16, **THEN** skip, **BECAUSE** WS is stripped and the config duplicates a non-WS kernel (or hangs under `two_ctas`). In the GEMM layouts the epilogue and data-partition halves are in the default region, so this needs extra non-default TMEM partitions to trigger.
-- **IF** you set `minRegAutoWS`/`maxRegAutoWS`, **THEN** use multiples of 8 and check that requests × warps fit the ceiling, **BECAUSE** otherwise compilation fails or the split is silently dropped.
-- **IF** a config adds a one-warp partition and worker warps are already at a multiple of 4, **THEN** count it as a full warp group of register cost, **BECAUSE** padding adds 4 warps.
-- **IF** you compare register use across configs, **THEN** read `setmaxnreg` per partition in the PTX, **BECAUSE** the uniform ceiling and the per-partition budgets differ.
+`R` = epilogue registers per thread for one slice = `(BM/dp) * (BN/ES) / (32 * num_warps)` fp32 values: the epilogue runs in the default region, which gets `num_warps` (see "Mechanism"). Example: 128x256 at 4 warps: `ES=1` gives 256, `ES=2` 128, `ES=4` 64.
+
+- **IF** worker warps would go from `4k` to `4k+1` (e.g. adding `separate_epilogue_store`), **THEN** count total warps as `num_warps + 4(k+1)` and the base ceiling as `floor(65536 / (32 * total) / 8) * 8` (8 warps -> 256, 12 -> 168) when comparing configs, **BECAUSE** `padToMaxWarpGroups` pads to whole warp groups. [mechanism]
+- **IF** `R(num_warps=4) > 128`, **THEN** prefer raising `ES` over `num_warps=8` (both halve `R`; `ES` does it without lowering every thread's ceiling), and skip `(num_warps=4, ES)` at that `R`. [mechanism]
 
 ## Interactions
 
