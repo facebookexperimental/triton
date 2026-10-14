@@ -20,7 +20,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 |------|-------|------|
 | [`tiles_and_stages.md`](tiles_and_stages.md) | done | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages`. Open: its "Not yet established" items. |
 | [`warps_and_registers.md`](warps_and_registers.md) | done | `num_warps` and the AutoWS register budgets. Open: its "Not yet established" items. |
-| `epilogue.md` | todo | Epilogue subtiling, separate epilogue store, store placement. |
+| [`epilogue.md`](epilogue.md) | done | Epilogue subtiling, separate epilogue store, store placement. Open: its "Not yet established" items. |
 | `2cta.md` | todo | 1-CTA vs 2-CTA (`two_ctas`). |
 | `data_partitioning.md` | todo | `data_partition_factor`. |
 | `clc_persistence.md` | todo | Static persistent vs dynamic and CLC persistent. |
@@ -72,35 +72,35 @@ One row per entry in [knobs.md](knobs.md), with its priority (P0 highest, P2 low
 
 | Knob | Priority | Covered in | State |
 |------|----------|------------|-------|
-| `BLOCK_M` | P0 | [resources.md](resources.md#tmem); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#mechanism) | covered |
-| `BLOCK_N` | P0 | [resources.md](resources.md#tmem); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset) | covered |
+| `BLOCK_M` | P0 | [resources.md](resources.md#tmem); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#mechanism); [epilogue.md](epilogue.md#mechanism) | covered |
+| `BLOCK_N` | P0 | [resources.md](resources.md#tmem); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#mechanism) | covered |
 | `BLOCK_K` | P0 | [resources.md](resources.md#pruning-ruleset); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset) | covered |
-| `num_stages` | P0 | [resources.md](resources.md#pruning-ruleset); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset) | covered |
+| `num_stages` | P0 | [resources.md](resources.md#pruning-ruleset); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#pruning-ruleset) | covered |
 | `flatten` | P0 | [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset) | covered |
 | `warp_specialize` | P0 | [resources.md](resources.md#registers-and-warps); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#mechanism) | covered |
 | `data_partition_factor` | P0 | [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#mechanism) | covered |
-| `separate_epilogue_store` | P0 | — | mentioned |
-| `two_ctas` | P0 | [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset) | covered |
+| `separate_epilogue_store` | P0 | [epilogue.md](epilogue.md#pruning-ruleset) | covered |
+| `two_ctas` | P0 | [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#pruning-ruleset) | covered |
 | `ctas_per_cga` | P0 | — | mentioned |
 | Tile scheduler | P0 (static persistent); P1 (CLC, dynamic) | — | todo |
 | Descriptor loads/stores | P0 | — | todo |
-| Epilogue subtiling (ES) | P0 | [resources.md](resources.md#smem); [tiles_and_stages.md](tiles_and_stages.md#mechanism); [warps_and_registers.md](warps_and_registers.md#mechanism) | covered |
-| `early_tma_store_lowering` | P0 | — | todo |
+| Epilogue subtiling (ES) | P0 | [resources.md](resources.md#smem); [tiles_and_stages.md](tiles_and_stages.md#mechanism); [warps_and_registers.md](warps_and_registers.md#mechanism); [epilogue.md](epilogue.md#pruning-ruleset) | covered |
+| `early_tma_store_lowering` | P0 | — | mentioned |
 | `tma_store_pipelining` | P0 | — | todo |
-| `TRITON_WS_STAGING_COPIES` | P0 | — | mentioned |
+| `TRITON_WS_STAGING_COPIES` | P0 | [epilogue.md](epilogue.md#pruning-ruleset) | covered |
 | `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | P0 | — | todo |
 | `num_warps` | P0 | [resources.md](resources.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#pruning-ruleset) | covered |
 | `num_stages` (per loop) | P1 | — | mentioned |
 | `disallow_acc_multi_buffer` | P1 | [tiles_and_stages.md](tiles_and_stages.md#mechanism) | covered |
-| `merge_epilogue` | P1 | — | mentioned |
+| `merge_epilogue` | P1 | [epilogue.md](epilogue.md#mechanism) | covered |
 | `multicast` (per load) | P1 | — | todo |
 | `multicast` | P1 | — | todo |
-| `generate_subtiled_region` | P1 | — | todo |
+| `generate_subtiled_region` | P1 | [epilogue.md](epilogue.md#mechanism) | covered |
 | `minRegAutoWS` | P1 | [resources.md](resources.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#pruning-ruleset) | covered |
 | `maxRegAutoWS` | P1 | [resources.md](resources.md#pruning-ruleset); [warps_and_registers.md](warps_and_registers.md#pruning-ruleset) | covered |
 | `tmem_alloc_algo` | P1 | [resources.md](resources.md#tmem) | covered |
 | `loop_unroll_factor`, `disable_licm` | P2 | [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset) | covered |
-| `merge_epilogue_to_computation`, `merge_correction` | P2 | — | todo |
+| `merge_epilogue_to_computation`, `merge_correction` | P2 | [epilogue.md](epilogue.md#mechanism) | covered |
 | `pingpongAutoWS` | P2 | — | todo |
 | `multi_cta` | P2 | — | todo |
 | `allowDependentTwoCTA` | P2 | — | todo |
@@ -115,7 +115,7 @@ One row per entry in [knobs.md](knobs.md), with its priority (P0 highest, P2 low
 | `smem_circular_reuse` | P2 | — | todo |
 | `tt.autows` channels | P2 | — | todo |
 | `mem_plan_pick` + `TRITON_WS_MEM_PLAN_TOPK` / `_PICK` | P2 | — | todo |
-| `TRITON_WS_SMEM_PLAN_SEARCH` | P2 | [resources.md](resources.md#pruning-ruleset); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset) | covered |
+| `TRITON_WS_SMEM_PLAN_SEARCH` | P2 | [resources.md](resources.md#pruning-ruleset); [tiles_and_stages.md](tiles_and_stages.md#pruning-ruleset); [epilogue.md](epilogue.md#mechanism) | covered |
 | `TRITON_ENABLE_INTERLEAVE_TMEM`‡, `TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS`‡, `TRITON_DISABLE_WSBARRIER_REORDER`, `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` | P2 | — | todo |
 | `TRITON_WS_TILE_PREFETCH_DEPTH`‡ | P2 | — | todo |
 | Alternative schedulers: `TRITON_USE_MODULO_SCHEDULE` (+ `TRITON_MODULO_*`), `TRITON_USE_JOINT_SCHEDULE`‡, `TRITON_USE_LLM_SCHEDULE`‡, `TRITON_USE_LIST_SCHEDULE` | P2 | — | todo |
