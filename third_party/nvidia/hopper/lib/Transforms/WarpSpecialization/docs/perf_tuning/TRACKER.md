@@ -28,7 +28,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`tma_stores.md`](tma_stores.md) | done | TMA vs pointer output stores. Open: its "Not yet established" items. |
 | [`split_k.md`](split_k.md) | done | Splitting one output tile's K reduction (split-K, decomposeK, stream-K) and the single-K-tile path. Open: its "Not yet established" items. |
 | [`pingpong.md`](pingpong.md) | done | Ping-pong scheduling. Open: its "Not yet established" items. |
-| `multicast.md` | todo | TMA multicast. |
+| [`multicast.md`](multicast.md) | done | TMA multicast. Open: its "Not yet established" items. |
 | `epilogue_prologue_tma_loads.md` | todo | TMA loads of extra epilogue/prologue inputs. |
 | `fused_reductions.md` | todo | Reductions fused into the epilogue. |
 
@@ -139,8 +139,8 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `clc` | [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
 | `tt.autows` stage/order | — | todo |
 | Descriptor loads/stores | — | mentioned |
-| `multicast` (per load) | [tma_loads.md](tma_loads.md#never-try-any-problem) | covered |
-| `multicast` | [tma_loads.md](tma_loads.md#never-try-any-problem) | covered |
+| `multicast` (per load) | [tma_loads.md](tma_loads.md#never-try-any-problem); [multicast.md](multicast.md#never-try-any-problem) | covered |
+| `multicast` | [tma_loads.md](tma_loads.md#never-try-any-problem); [multicast.md](multicast.md#never-try-any-problem) | covered |
 | `auto_tma` / `auto_tma_device` | [tma_loads.md](tma_loads.md#never-try-any-problem) | covered |
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | — | mentioned |
 | Epilogue subtiling (ES) | [resources.md](resources.md#when-to-try-it-depends-on-the-problem); [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem); [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [tma_stores.md](tma_stores.md#never-try-any-problem) | covered |
