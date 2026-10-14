@@ -61,10 +61,13 @@ Which logical partition is the default region: [PartitionSchedulingMeta.md, "Pha
 
 ## When to try it (depends on the problem)
 
+`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
+
 `R` = epilogue registers per thread for one slice = `(BM/dp) * (BN/ES) / (32 * num_warps)` fp32 values: the epilogue runs in the default region, which gets `num_warps` (see "Mechanism"). Example: 128x256 at 4 warps: `ES=1` gives 256, `ES=2` 128, `ES=4` 64.
 
 - **IF** worker warps would go from `4k` to `4k+1` (e.g. adding `separate_epilogue_store`), **THEN** count total warps as `num_warps + 4(k+1)` and the base ceiling as `floor(65536 / (32 * total) / 8) * 8` (8 warps -> 256, 12 -> 168) when comparing configs, **BECAUSE** `padToMaxWarpGroups` pads to whole warp groups. [mechanism]
-- **IF** `R(num_warps=4) > 128`, **THEN** prefer raising `ES` over `num_warps=8` (both halve `R`; `ES` does it without lowering every thread's ceiling), and skip `(num_warps=4, ES)` at that `R`. [mechanism]
+- **IF** `R(num_warps=4) > 128` at an `ES`, **THEN** skip that `(num_warps=4, ES)` and raise `ES` instead (e.g. 128x256: skip `ES=1`), **BECAUSE** both `ES` and `num_warps=8` halve `R`, and `ES` does it without lowering every thread's ceiling. [measured: --regime wes, loses on every shape in the regime]
+- **IF** the epilogue is a cast + store, or + a pointer-loaded bias (plain mm/addmm), **THEN** pin `num_warps=4`, **BECAUSE** `num_warps=8` lowers every thread's register ceiling and gives the default region nothing it needs here. [measured: --regime wes, never wins (loses or flat within noise on every shape)]
 
 ## Interactions
 
