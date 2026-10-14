@@ -1,6 +1,6 @@
 # Feature interactions (autoWS GEMM, sm100)
 
-Scope: what happens when two autoWS GEMM features or knobs are combined. Each row is one pair. For what a single feature does, follow the links in the feature files ([resources.md](resources.md), [tiles_and_stages.md](tiles_and_stages.md), `warps_and_registers.md`, `epilogue.md`).
+Scope: what happens when two autoWS GEMM features or knobs are combined. Each row is one pair. For what a single feature does, follow the links in the feature files ([resources.md](resources.md), [tiles_and_stages.md](tiles_and_stages.md), [warps_and_registers.md](warps_and_registers.md), `epilogue.md`).
 
 Status is one of:
 - **works**

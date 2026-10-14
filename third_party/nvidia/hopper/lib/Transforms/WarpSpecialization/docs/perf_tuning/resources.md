@@ -87,7 +87,7 @@ Closed-form operand depth (used by every feature file):
 
 - **IF** output staging is single-copy (`ES=1` or `two_ctas`), **THEN** keep only `num_stages <= d_fit + 1`, **BECAUSE** above it the operand plan is the same; only barrier bytes and the loop schedule differ. With `ES >= 2`, `num_stages` also sets staging copies, so the plans differ (worked example). [mechanism]
 - **IF** `BN * ceil(BM/128) > 256` (fp32 accumulator, e.g. 256x256 at 1-CTA), **THEN** the accumulator gets one copy (`floor(512 / cols)`): expect no epilogue/mainloop overlap across tiles and add no TMEM-resident loop state. 128x128 gets 4 copies, 128x256 gets 2. [mechanism]
-- **IF** a worker partition pushes worker warps past a multiple of 4, **THEN** count the register cost as in `warps_and_registers.md`. [mechanism]
+- **IF** a worker partition pushes worker warps past a multiple of 4, **THEN** count the register cost as in [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem). [mechanism]
 
 ## Worked example (bf16 in and out, fp32 accumulator, 1-CTA)
 

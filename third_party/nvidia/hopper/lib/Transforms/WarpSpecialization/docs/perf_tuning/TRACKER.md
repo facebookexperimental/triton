@@ -19,7 +19,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | File | State | Note |
 |------|-------|------|
 | [`tiles_and_stages.md`](tiles_and_stages.md) | done | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages`. Open: its "Not yet established" items. |
-| `warps_and_registers.md` | todo | `num_warps` and the AutoWS register budgets. |
+| [`warps_and_registers.md`](warps_and_registers.md) | done | `num_warps` and the AutoWS register budgets. Open: its "Not yet established" items. |
 | `epilogue.md` | todo | Epilogue subtiling, separate epilogue store, store placement. |
 | `2cta.md` | todo | 1-CTA vs 2-CTA (`two_ctas`). |
 | `data_partitioning.md` | todo | `data_partition_factor`. |
@@ -78,6 +78,10 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 | H-STAGES | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | **IF** `k_iters >= 8`, **THEN** only try `num_stages` in {`d_fit`, `d_fit - 1`}. | todo |
 | H-STAGES | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | **IF** `k_iters <= 2` and `T > P`, **THEN** only try `num_stages` in {2, `d_fit`}, **BECAUSE** the persistent producer runs ahead across tiles. | todo |
 | H-STG | [tiles_and_stages.md § When to try it](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | Calibrate whether it ever wins in: **IF** a deeper operand ring is wanted at a fixed tile, **THEN** free staging first: `c` fewer staging copies free `c*BM*(BN/ES)*out_bytes`, which buys `floor(that / slot_bytes)` operand levels (worked example in [resources.md](resources.md#worked-example-bf16-in-and-out-fp32-accumulator-1-cta)). | todo |
+| H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | Calibrate skip threshold 128 in: **IF** `R(num_warps=4) > 128`, **THEN** prefer raising `ES` over `num_warps=8` (both halve `R`; `ES` does it without lowering every thread's ceiling), and skip `(num_warps=4, ES)` at that `R`. | todo |
+| H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** the epilogue is a cast + store, or + a pointer-loaded bias (plain mm/addmm), **THEN** only try `num_warps=4`. | todo |
+| H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** the epilogue does per-element register math beyond a bias (fused) and `R(num_warps=4) > 64`, **THEN** keep `num_warps=8` alongside 4. | todo |
+| H-WES | [warps_and_registers.md § When to try it](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | **IF** no rule above sets `minRegAutoWS`, `maxRegAutoWS` or `maxnreg`, **THEN** leave them at their defaults. | todo |
 
 ## Fixes to existing docs
 
@@ -102,14 +106,14 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `loop_unroll_factor`, `disable_licm` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `warp_specialize` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `data_partition_factor` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
-| `separate_epilogue_store` | — | mentioned |
-| `merge_epilogue` | — | todo |
-| `merge_epilogue_to_computation`, `merge_correction` | — | todo |
+| `separate_epilogue_store` | [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | covered |
+| `merge_epilogue` | — | mentioned |
+| `merge_epilogue_to_computation`, `merge_correction` | — | mentioned |
 | `pingpongAutoWS` | — | todo |
 | `multi_cta` | — | todo |
-| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
+| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `allowDependentTwoCTA` | — | todo |
-| `ctas_per_cga` | — | todo |
+| `ctas_per_cga` | — | mentioned |
 | Tile scheduler | — | todo |
 | `clc` | — | todo |
 | `tt.autows` stage/order | — | todo |
@@ -118,16 +122,16 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `multicast` | — | todo |
 | `auto_tma` / `auto_tma_device` | — | todo |
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | — | todo |
-| Epilogue subtiling (ES) | [resources.md](resources.md#when-to-try-it-depends-on-the-problem); [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | covered |
+| Epilogue subtiling (ES) | [resources.md](resources.md#when-to-try-it-depends-on-the-problem); [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem); [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem) | covered |
 | `generate_subtiled_region` | — | todo |
 | `early_tma_store_lowering` | — | todo |
 | `tma_store_pipelining` | — | todo |
 | `TRITON_WS_STAGING_COPIES` | — | mentioned |
 | `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | — | todo |
-| `num_warps` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `maxnreg` | — | mentioned |
+| `num_warps` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
+| `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
+| `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
+| `maxnreg` | [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `sched4reg`, `enable_tree_reduction` | — | todo |
 | `tmem_alloc_algo` | — | todo |
 | `smem_alloc_algo` | — | todo |
