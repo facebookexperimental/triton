@@ -51,7 +51,6 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 
 | Doc | State | Note |
 |-----|-------|------|
-| [BarrierFusion.md](../BarrierFusion.md) | done | `optimizeTMALoads` mixed-group behavior. |
 
 ## Knob coverage
 
