@@ -11,9 +11,9 @@ Hardware limits are in [resources.md](resources.md). Code paths are relative to 
 | Knob | How set | What it does | Existing doc |
 |---|---|---|---|
 | `num_warps` | kernel compile option | Warps of the default region; also the starting warp count of every other partition | [default_partition_selection.md, "Per-op minimum warps"](../../../../../../../../docs/design/modulo_schedule/default_partition_selection.md#per-op-minimum-warps) |
-| `minRegAutoWS` | kernel compile option | Per-thread registers requested by partitions that hold no tensors (default 24) | [Overview.md, "Register Budgets"](../Overview.md#register-budgets) |
-| `maxRegAutoWS` | kernel compile option | When set, per-thread registers requested by tensor partitions; the default region gets the rest | [Overview.md, "Register Budgets"](../Overview.md#register-budgets) |
-| `maxnreg` | kernel compile option | Replaces the computed per-thread register ceiling (`ttg.maxnreg`) | — |
+| `minRegAutoWS` | kernel compile option | Per-thread registers requested by partitions that hold no tensors (default 24) | [RegisterBudgets.md](../RegisterBudgets.md); [Overview.md, "Register Budgets"](../Overview.md#register-budgets) |
+| `maxRegAutoWS` | kernel compile option | When set, per-thread registers requested by non-default tensor partitions; the default region gets the leftover share | [RegisterBudgets.md](../RegisterBudgets.md); [Overview.md, "Register Budgets"](../Overview.md#register-budgets) |
+| `maxnreg` | kernel compile option | Replaces the computed per-thread register ceiling (`ttg.maxnreg`) | [RegisterBudgets.md](../RegisterBudgets.md) |
 | `merge_epilogue`, `merge_epilogue_to_computation`, `separate_epilogue_store` | `tl.range(...)` kwargs | Add or remove partitions, which changes the worker warp total | [PartitionSchedulingMeta.md, "Target Partition Layouts"](../PartitionSchedulingMeta.md#target-partition-layouts) |
 
 ## Hard prunes
@@ -45,7 +45,7 @@ Which logical partition is the default region: [PartitionSchedulingMeta.md, "Pha
 - The per-thread ceiling is `maxnreg` if set. Otherwise it is 65,536 / total warps / 32, rounded down to a multiple of 8.
 - Each warp group requests the maximum of its partitions' requests, rounded up to 8:
   - without `maxRegAutoWS`, non-tensor partitions request `minRegAutoWS` and tensor partitions take an even share of what is left, together with the default region;
-  - with `maxRegAutoWS`, tensor partitions request it and the default region takes the rest.
+  - with `maxRegAutoWS`, non-default tensor partitions request it and the default region takes the leftover share.
 - One-warp partitions that share a warp group with a tensor partition get that partition's larger request.
 
 **Reading metadata.** `metadata["num_warps"]` of a compiled WS kernel is `ttg.total-num-warps` (workers plus padding; `third_party/nvidia/backend/compiler.py`). Relaunching from TTGIR reads `ttg.num-warps`, the default-region count (`python/triton/compiler/compiler.py`, `parse_options`).
@@ -68,7 +68,7 @@ Which logical partition is the default region: [PartitionSchedulingMeta.md, "Pha
 
 ## Interactions
 
-Rows to add to `interactions.md` (not written yet; see [TRACKER.md](TRACKER.md)). Pairs these rules depend on:
+See [interactions.md](interactions.md). Pairs these rules depend on:
 - `num_warps` × `data_partition_factor` (two TMEM-holding consumer partitions)
 - `num_warps` × `separate_epilogue_store`
 - `num_warps` × `merge_epilogue`
