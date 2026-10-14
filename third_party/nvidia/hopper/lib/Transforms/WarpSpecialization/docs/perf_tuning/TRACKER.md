@@ -113,6 +113,7 @@ Each row becomes a [measured] rule in its file when the benchmark verdict for it
 | [Overview.md](../Overview.md) | done | Ping-pong uses an mbarrier pair, not named barriers. |
 | [triton_tma_multicast.md](../../../../../../../../docs/design/triton_tma_multicast.md) | done | Multicast lowering is planned, not implemented. |
 | [BarrierFusion.md](../BarrierFusion.md) | done | `optimizeTMALoads` mixed-group behavior. |
+| [DynamicPersistentAutoWSGaps.md](../DynamicPersistentAutoWSGaps.md) | done | CLC flash-attention stage default is two. |
 
 ## Knob coverage
 
