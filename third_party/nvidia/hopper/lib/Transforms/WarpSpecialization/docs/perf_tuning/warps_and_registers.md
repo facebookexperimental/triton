@@ -1,0 +1,92 @@
+# Warps and registers (autoWS GEMM, sm100)
+
+Scope:
+- how `num_warps` and the register knobs become per-partition warp counts and `setmaxnreg` budgets;
+- which settings are illegal or silently drop warp specialization.
+
+Hardware limits are in [resources.md](resources.md). Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/` (`WS/`) unless they start at the repository root.
+
+## Knobs
+
+| Knob | How set | What it does | Existing doc |
+|---|---|---|---|
+| `num_warps` | kernel compile option | Warps of the default region; also the starting warp count of every other partition | [default_partition_selection.md, "Per-op minimum warps"](../../../../../../../../docs/design/modulo_schedule/default_partition_selection.md#per-op-minimum-warps) |
+| `minRegAutoWS` | kernel compile option | Per-thread registers requested by partitions that hold no tensors (default 24) | [Overview.md, "Register Budgets"](../Overview.md#register-budgets) |
+| `maxRegAutoWS` | kernel compile option | When set, per-thread registers requested by tensor partitions; the default region gets the rest | [Overview.md, "Register Budgets"](../Overview.md#register-budgets) |
+| `maxnreg` | kernel compile option | Replaces the computed per-thread register ceiling (`ttg.maxnreg`) | — |
+| `merge_epilogue`, `merge_epilogue_to_computation`, `separate_epilogue_store` | `tl.range(...)` kwargs | Add or remove partitions, which changes the worker warp total | [PartitionSchedulingMeta.md, "Target Partition Layouts"](../PartitionSchedulingMeta.md#target-partition-layouts) |
+
+## Hard prunes
+
+| Condition | Result | Why | Code |
+|---|---|---|---|
+| `num_warps` < 4 | silently ignored | The kernel runs without WS: "Warp specialization requires at least 4 warps" | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnFuncOp` |
+| `num_warps` not 4 or 8 | silently ignored | `supportMMA` for MMAv5 accepts only 4 or 8 warps (the TMEM load/store layouts), so the dot falls back to mma.sync and there is no gemm partition | `lib/Analysis/Utility.cpp`, `supportMMA`; `lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, `getMMAVersionSafe` |
+| WS warp estimate > 16 | silently ignored | All WS metadata is removed. Estimate = `num_warps` + Σ over other partitions of their minimum warps (4 for partitions holding TMEM load/store/alloc, else 1) | `WS/PartitionSchedulingMeta.cpp`, "Warp budget exceeded. Skipping warp specialization."; `include/triton/Dialect/TritonNvidiaGPU/IR/Dialect.h`, `getMinWarpsForOp` |
+| `minRegAutoWS` or `maxRegAutoWS` not a multiple of 8 | compile error | Requests are emitted per warp group in steps of 8 | `third_party/nvidia/backend/compiler.py`, `_check_reg_auto_ws_alignment` |
+| Register requests that do not fit `maxnreg` × total warps, or a shared share below 24 | silently ignored | `AllocateWarpGroups` returns without setting actual registers, so there is no per-partition `setmaxnreg` and every warp keeps the uniform ceiling | `lib/Conversion/TritonGPUToLLVM/AllocateWarpGroups.cpp`, register allocation in `runOnOperation` |
+
+## Mechanism
+
+**Warp counts.** The steps, in order:
+1. The default region gets `num_warps` (`WS/PartitionSchedulingMeta.cpp`, warp budget estimate).
+2. Every other partition is also created with `num_warps` (`WS/WSSpecialize.cpp`, construction of `ttg.warp_specialize`).
+3. `optimizePartitionNumWarps` (`lib/Dialect/TritonGPU/Transforms/WarpSpecialization/OptimizePartitionWarps.cpp`) then shrinks them:
+   - partitions without tensors go to 1 warp;
+   - partitions holding TMEM ops stay at >= 4 (`getMinWarpsForOp`);
+   - any other tensor partition halves while 2 × (registers of its largest single tensor) fits the per-thread share 65,536 / 32 / (total warps after halving).
+4. The estimate sees only the largest tensor, not tensors that are live at the same time.
+5. When the schedule has both a "reduction" and a "computation" partition and the kernel is not 2-CTA, the computation partition is set to 8 warps.
+
+Which logical partition is the default region: [PartitionSchedulingMeta.md, "Phase 2: Partition Layout (`createPartitionLayout`)"](../PartitionSchedulingMeta.md#phase-2-partition-layout-createpartitionlayout) and [default_partition_selection.md, "Hardware mechanism: the default partition is the register sink"](../../../../../../../../docs/design/modulo_schedule/default_partition_selection.md#hardware-mechanism-the-default-partition-is-the-register-sink).
+
+**Warp groups and registers** (`lib/Conversion/TritonGPUToLLVM/AllocateWarpGroups.cpp`):
+- `padToMaxWarpGroups` pads worker warps to whole warp groups. Total launched warps = `num_warps` + 4 × ceil(worker warps / 4), recorded as `ttg.total-num-warps`.
+- The per-thread ceiling is `maxnreg` if set. Otherwise it is 65,536 / total warps / 32, rounded down to a multiple of 8.
+- Each warp group requests the maximum of its partitions' requests, rounded up to 8:
+  - without `maxRegAutoWS`, non-tensor partitions request `minRegAutoWS` and tensor partitions take an even share of what is left, together with the default region;
+  - with `maxRegAutoWS`, tensor partitions request it and the default region takes the rest.
+- One-warp partitions that share a warp group with a tensor partition get that partition's larger request.
+
+**Reading metadata.** `metadata["num_warps"]` of a compiled WS kernel is `ttg.total-num-warps` (workers plus padding; `third_party/nvidia/backend/compiler.py`). Relaunching from TTGIR reads `ttg.num-warps`, the default-region count (`python/triton/compiler/compiler.py`, `parse_options`).
+
+**Change → relief → cost:**
+- **Raising `num_warps`:**
+  - relieves: more threads and a smaller per-thread share of each tensor in the default region and in every tensor partition that does not shrink;
+  - costs: a lower ceiling for all threads, and the warp estimate counts the default region at full size.
+- **Adding a partition:**
+  - relieves: separates work so it can overlap;
+  - costs: a whole warp group once worker warps cross a multiple of 4, which lowers the ceiling for every thread.
+
+## Pruning rules
+
+- **IF** `num_warps` is not 4 or 8, **THEN** skip, **BECAUSE** no tcgen05 autoWS GEMM is generated.
+- **IF** `num_warps` + 4 × (number of non-default partitions holding TMEM ops) + (other non-default partitions) > 16, **THEN** skip, **BECAUSE** WS is stripped and the config duplicates a non-WS kernel.
+- **IF** you set `minRegAutoWS`/`maxRegAutoWS`, **THEN** use multiples of 8 and check that requests × warps fit the ceiling, **BECAUSE** otherwise compilation fails or the split is silently dropped.
+- **IF** a config adds a one-warp partition and worker warps are already at a multiple of 4, **THEN** count it as a full warp group of register cost, **BECAUSE** padding adds 4 warps.
+- **IF** you compare register use across configs, **THEN** read `setmaxnreg` per partition in the PTX, **BECAUSE** the uniform ceiling and the per-partition budgets differ.
+
+## Interactions
+
+Rows to add to `interactions.md` (not written yet; see [TRACKER.md](TRACKER.md)). Pairs these rules depend on:
+- `num_warps` × `data_partition_factor` (two TMEM-holding consumer partitions)
+- `num_warps` × `separate_epilogue_store`
+- `num_warps` × `merge_epilogue`
+- `EPILOGUE_SUBTILE` × partition warp halving
+- `two_ctas` × reduction/computation warp override
+- `maxnreg` × `minRegAutoWS`/`maxRegAutoWS`
+
+## Hazards
+
+None in [hazards.md](hazards.md). The `EPILOGUE_SUBTILE` × partition warp halving effect is a performance interaction, listed above.
+
+## Not yet established
+
+Tracked in [TRACKER.md](TRACKER.md).
+
+
+- Whether `num_warps=8` with `data_partition_factor=2` exceeds the 16-warp estimate for the GEMM templates. It depends on which partition becomes the default region; one TTGIR check settles it.
+- Whether `num_warps=4` or `8` is better for plain GEMM versus epilogue-heavy fusions. This has been observed to depend on the kernel.
+- The register budgets partitions actually get in a GEMM (the computation-partition range).
+- The cost of single-thread mbarrier arrives in 8-warp partitions.
+- Whether PyTorch Inductor's register-spill filter, which assumes the accumulator is in registers, prunes valid autoWS configs in practice.
