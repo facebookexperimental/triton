@@ -58,3 +58,4 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 |------|-------|------|
 | Inductor reference definition | todo | Definition pending. Until then `knobs.md` has no column for what Inductor sets. |
 | Leaves outside AutoWS | todo | cuBLAS or non-WS leaves; later. |
+| Multicast rules once lowering lands | todo | `multicast.md` has no when-to-try rules while multicast is inert; re-derive them from the planner conditions when the lowering is implemented. |
