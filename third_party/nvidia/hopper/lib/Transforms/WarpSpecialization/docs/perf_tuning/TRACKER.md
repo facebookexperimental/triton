@@ -30,7 +30,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`pingpong.md`](pingpong.md) | done | Ping-pong scheduling. Open: its "Not yet established" items. |
 | [`multicast.md`](multicast.md) | done | TMA multicast. Open: its "Not yet established" items. |
 | [`epilogue_prologue_tma_loads.md`](epilogue_prologue_tma_loads.md) | done | TMA loads of extra epilogue/prologue inputs. Open: its "Not yet established" items. |
-| `fused_reductions.md` | todo | Reductions fused into the epilogue. |
+| [`fused_reductions.md`](fused_reductions.md) | done | Reductions fused into the epilogue. Open: its "Not yet established" items. |
 
 ## Docs for undocumented knobs
 
@@ -131,8 +131,8 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `merge_epilogue` | — | mentioned |
 | `merge_epilogue_to_computation`, `merge_correction` | — | mentioned |
 | `pingpongAutoWS` | [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
-| `multi_cta` | [split_k.md](split_k.md#never-try-any-problem) | covered |
-| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem); [tma_stores.md](tma_stores.md#never-try-any-problem); [epilogue_prologue_tma_loads.md](epilogue_prologue_tma_loads.md#never-try-any-problem) | covered |
+| `multi_cta` | [split_k.md](split_k.md#never-try-any-problem); [fused_reductions.md](fused_reductions.md#never-try-any-problem) | covered |
+| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem); [epilogue.md](epilogue.md#never-try-any-problem); [2cta.md](2cta.md#never-try-any-problem); [data_partitioning.md](data_partitioning.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem); [tma_stores.md](tma_stores.md#never-try-any-problem); [epilogue_prologue_tma_loads.md](epilogue_prologue_tma_loads.md#never-try-any-problem); [fused_reductions.md](fused_reductions.md#never-try-any-problem) | covered |
 | `allowDependentTwoCTA` | [2cta.md](2cta.md#never-try-any-problem) | covered |
 | `ctas_per_cga` | [2cta.md](2cta.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem); [split_k.md](split_k.md#never-try-any-problem) | covered |
 | Tile scheduler | [2cta.md](2cta.md#never-try-any-problem); [clc_persistence.md](clc_persistence.md#never-try-any-problem) | covered |
