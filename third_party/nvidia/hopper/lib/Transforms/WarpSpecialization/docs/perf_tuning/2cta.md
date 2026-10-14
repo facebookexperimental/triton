@@ -22,7 +22,7 @@ or to the repository root.
 
 | Condition | Status | Why | Code |
 |---|---|---|---|
-| `two_ctas=True` without a cluster of x-dimension >= 2 (`ctas_per_cga` unset) | silently ignored | Falls back to 1-CTA MMA with only a warning: "two_ctas=True requires ctas_per_cga=(2,1,1) or larger ... Falling back to 1-CTA MMA." | `lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, `BlockedToMMAv5`, `ScaledBlockedToMMAv5` |
+| `two_ctas=True` with module attribute `ttg.cluster-dim-x` < 2 (e.g. `ctas_per_cga` unset); check it in the TTGIR module header | silently ignored | Falls back to 1-CTA MMA with only a warning: "two_ctas=True requires ctas_per_cga=(2,1,1) or larger ... Falling back to 1-CTA MMA." | `lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, `BlockedToMMAv5`, `ScaledBlockedToMMAv5` |
 | `two_ctas=True` with `BLOCK_M` < 64 | silently ignored | A power-of-2 `BLOCK_M` below 64 gets no tcgen05 MMA at all, 1-CTA or 2-CTA (see [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem)). The "two_ctas=True with BLOCK_M < 64 is not supported" warning in `BlockedToMMAv5` is reached only by non-power-of-2 M. `BLOCK_M=64` compiles as real 2-CTA (`TwoCTA_RHS`) | `lib/Analysis/Utility.cpp`, `isMmaOutputShapeSupported`; `AccelerateMatmul.cpp`, `BlockedToMMAv5` |
 | `two_ctas=True` on a `tl.dot_scaled` with only the rhs scaled | silently ignored | Falls back to 1-CTA MMA with only a warning: "two_ctas=True is not supported when only the rhs ..." (the dot is transposed) | `AccelerateMatmul.cpp`, `transposeDotOp` (called from `transposeDots`) |
 | `two_ctas` differs between dots in one kernel | compile error | "inconsistent two_ctas setting across matmuls"; PTX requires one `cta_group` for every tcgen05 op in a kernel | `lib/Dialect/TritonNvidiaGPU/Transforms/CheckMatmulTwoCTAs.cpp` |
@@ -42,36 +42,25 @@ or to the repository root.
 ## Mechanism
 
 **What it changes.**
-- **B is halved per CTA.** Each CTA's B descriptor load is rewritten to half width (`BLOCK_K x BLOCK_N/2`); host-side descriptor argument types are rewritten too. The swizzle is re-derived for the half tile (`hopper/Transform2CTALoads.cpp`, `transformBLoad`, `transformSplitBLoad`, `shrinkSwizzleForShape`).
-- **One MMA covers the pair.** It computes a `2*BLOCK_M x BLOCK_N` tile. Only the even-rank (leader) CTA issues it; the lowering predicates the MMA on the CTA rank (`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv5.cpp`, `convertDotImpl`).
-- **A rendezvous gates every MMA.** Both CTAs arrive on the leader's barrier, and the leader waits before the MMA. The barrier is multi-buffered to the MMA's operand pipeline depth, so any `num_stages` works (`hopper/Insert2CTASync.cpp`, `getOperandPipelineDepth`, `insertSyncBeforeMMA`; [2cta-autoWS-sync.md, "Insert2CTASync: "Arrive Remote, Wait Local" Pattern"](../../../../../../../../docs/design/2cta-autoWS-sync.md#insert2ctasync-arrive-remote-wait-local-pattern)).
+- **B halved per CTA:** each CTA's B descriptor load (and the host-side descriptor argument types) is rewritten to `BLOCK_K x BLOCK_N/2`, with the swizzle re-derived for the half tile (`hopper/Transform2CTALoads.cpp`, `transformBLoad`, `transformSplitBLoad`, `shrinkSwizzleForShape`).
+- **One MMA per pair:** it computes a `2*BLOCK_M x BLOCK_N` tile; the lowering predicates it on the CTA rank so only the even-rank (leader) CTA issues it (`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv5.cpp`, `convertDotImpl`).
+- **Rendezvous before every MMA:** both CTAs arrive on the leader's barrier; the leader waits. The barrier is multi-buffered to the MMA's operand pipeline depth, so any `num_stages` works (`hopper/Insert2CTASync.cpp`, `getOperandPipelineDepth`, `insertSyncBeforeMMA`; [2cta-autoWS-sync.md, "Insert2CTASync: "Arrive Remote, Wait Local" Pattern"](../../../../../../../../docs/design/2cta-autoWS-sync.md#insert2ctasync-arrive-remote-wait-local-pattern)).
 - **Ordinary TMA output staging is one copy** (see "Never try (any problem)").
-- **Cooperative TMA is the default.** Rank-2 descriptor loads are marked as cooperative pair transactions unless `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` is set (`Transform2CTALoads.cpp`, `AttrTwoCTALoadName`).
+- **Cooperative TMA by default:** rank-2 descriptor loads are marked as cooperative pair transactions unless `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` is set (`Transform2CTALoads.cpp`, `AttrTwoCTALoadName`).
 
 **What it relieves.**
-- SMEM per operand stage drops from `(BLOCK_M + BLOCK_N)·BLOCK_K·elt` to `(BLOCK_M + BLOCK_N/2)·BLOCK_K·elt`.
+- SMEM per operand stage: `(BLOCK_M + BLOCK_N)·BLOCK_K·elt` -> `(BLOCK_M + BLOCK_N/2)·BLOCK_K·elt`.
 - B global/L2 traffic per CTA halves.
-
-So 2-CTA lets a wide logical tile (e.g. `BLOCK_N=256`), or a deeper operand ring at a fixed tile, fit where 1-CTA does not.
+- So a wide logical tile (e.g. `BLOCK_N=256`), or a deeper operand ring at a fixed tile, fits where 1-CTA does not.
 
 **What it costs.**
 - One cross-CTA rendezvous per MMA.
-- One output staging copy. The epilogue cannot rotate staging slots across tiles, so store overlap comes only from subtiling inside a tile.
+- One output staging copy: the epilogue cannot rotate staging slots across tiles, so store overlap comes only from subtiling inside a tile.
 - A cluster of 2 that the tile schedule must pair-align.
 
-**Partition and schedule differences from a kernel without a cluster.** Both are keyed on the cluster (`ctas_per_cga`), not on the `two_ctas` value, so they also apply to `two_ctas=False` cluster kernels:
-- The rule that gives the computation partition 8 warps when a reduction partition exists is skipped when the module carries the 2-CTA attribute, which `CheckMatmulTwoCTAs.cpp` sets whenever a cluster is present (`lib/Dialect/TritonGPU/Transforms/WarpSpecialization/OptimizePartitionWarps.cpp`, `optimizePartitionNumWarps`, `AttrTwoCTAsName`).
-- Loop scheduling is re-run after warp specialization when `max(cluster_dims) >= 2` (`third_party/nvidia/backend/compiler.py`, `make_ttgir`).
-
-## When to try it (depends on the problem)
-
-`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
-
-- IF `d_fit(1-CTA) < 2 <= d_fit(2-CTA)` for a tile, THEN only try that tile as 2-CTA, BECAUSE halving the B slot is what lets the operand ring double-buffer (e.g. 128x256x128 bf16, ES=2: `d_fit` 1 vs 2). [mechanism] (`transformBLoad` half-width B; operand-depth fit)
-- IF `AI_min >= 300` FLOP/B (`ridge`) (compute bound), THEN rank 2-CTA 128x256 above 1-CTA 128x256 / 256x128, BECAUSE each CTA fills only half of B per stage (`I_t` 128 vs 85). [mechanism]
-- IF `ceil(M/BM)` is odd under 2-CTA static persistence, THEN use `T = 2*ceil(ceil(M/BM)/2) * ceil(N/BN)` in every wave and tail rule, BECAUSE the padded M tile is launched and runs (TMA clips it). [mechanism] (pair-aligned schedule, Never-try "wrong answer" row)
-- **IF** 2-CTA is legal for the kernel (TMA store, pair-aligned schedule) and the problem is compute bound, **THEN** skip 1-CTA `BLOCK_N=256`, **BECAUSE** each CTA fills only half of B per stage and the 1-CTA tile loses ring depth. [measured: --regime 2cta, loses on every shape in the regime]
-- **IF** `BLOCK_N=256`, **THEN** prefer 2-CTA at every `T`, including `T < P/2`; **IF** `BLOCK_N=128` and `T(1-CTA) >= 900`, **THEN** prefer 1-CTA, **BECAUSE** the per-MMA rendezvous only outweighs the halved B fill once there are many waves. [measured: --regime 2cta, wins on a majority of shapes]
+**Partition and schedule differences from a kernel without a cluster.** Keyed on the cluster (`ctas_per_cga`), not on `two_ctas`, so they also apply to `two_ctas=False` cluster kernels:
+- The rule giving the computation partition 8 warps when a reduction partition exists is skipped when the module carries the 2-CTA attribute, which `CheckMatmulTwoCTAs.cpp` sets whenever a cluster is present (`lib/Dialect/TritonGPU/Transforms/WarpSpecialization/OptimizePartitionWarps.cpp`, `optimizePartitionNumWarps`, `AttrTwoCTAsName`).
+- Loop scheduling re-runs after warp specialization when `max(cluster_dims) >= 2` (`third_party/nvidia/backend/compiler.py`, `make_ttgir`).
 
 ## Interactions
 
@@ -88,7 +77,6 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 - `two_ctas` × `tl.dot_scaled`
 - `two_ctas` × CLC tile scheduler (see `clc_persistence.md`)
 - `two_ctas` × atomic dynamic tile scheduler
-- `two_ctas` × `smem_alloc_algo`
 - `two_ctas` × TMA multicast (see `multicast.md`)
 
 ## Hazards
@@ -97,7 +85,7 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 - [2-CTA without warp specialization](hazards.md#2-cta-without-warp-specialization)
 - [2-CTA with the atomic dynamic tile scheduler](hazards.md#2-cta-with-the-atomic-dynamic-tile-scheduler)
 
-Suspected from code, not reproduced in testing (rows in [TRACKER.md](TRACKER.md#reported-wrong-answers--hangs-needing-repro--code-root-cause)): `two_ctas` with `smem_alloc_algo=0`; a register-written SMEM operand read by a 2-CTA MMA without a cluster-scope fence.
+Suspected from code, not reproduced in testing (rows in [TRACKER.md](TRACKER.md#reported-wrong-answers--hangs-needing-repro--code-root-cause)): a register-written SMEM operand read by a 2-CTA MMA without a cluster-scope fence.
 
 ## Not yet established
 
