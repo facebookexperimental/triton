@@ -18,7 +18,7 @@ or to the repository root.
 | `ctas_per_cga` | compile option (`triton.Config(ctas_per_cga=(2,1,1))`) | Physical cluster shape; without it `two_ctas` is dropped | [2cta-autoWS-sync.md, "Supported Configurations"](../../../../../../../../docs/design/2cta-autoWS-sync.md#supported-configurations) |
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | env var | Each CTA issues its own TMA instead of one cooperative pair transaction | [2cta-autoWS-sync.md, "Transform2CTALoads Pass"](../../../../../../../../docs/design/2cta-autoWS-sync.md#transform2ctaloads-pass) |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Status | Why | Code |
 |---|---|---|---|
@@ -32,6 +32,10 @@ or to the repository root.
 | tile schedule where the two CTAs of a cluster (`program_id(0)` = 2k, 2k+1) get different `pid_n`, or non-adjacent `pid_m` | wrong answer | The pair shares one B tile. The compiler cannot prove a schedule pair-aligned and does not check it | [2cta-autoWS-sync.md, "Current Limitations"](../../../../../../../../docs/design/2cta-autoWS-sync.md#current-limitations) |
 | `TRITON_WS_STAGING_COPIES` > 1 | silently ignored | TMA output staging stays at one copy: "Ordinary 2CTA TMA stores have one completion phase per paired-CTA tile" | `hopper/WarpSpecialization/WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
 | the output staging correctness floor needs more than one copy | compile error | "2CTA ordinary TMA output staging requires one copy" | `WSMemoryPlanner.cpp`, `increaseFusedEpilogueCopies` |
+| `BLOCK_N/2` < 16 (e.g. `BLOCK_N=16`) | wrong answer (reproduced) | The B split is skipped with only a debug log, but the MMA still reads a half-width B per CTA; no error or warning. See [hazards.md](hazards.md#2-cta-with-block_n2-below-the-b-split-minimum) | `hopper/Transform2CTALoads.cpp`, `transformBLoad`, `transformSplitBLoad` (`halfN < 16`) |
+| pointer-loaded (non-descriptor) B under Meta WS | compile error | "pipeliner doesn't know how to predicate this op" | `lib/Dialect/TritonGPU/Transforms/Pipeliner/PipeliningUtility.cpp`, `predicateOp` |
+| Meta WS off (`TRITON_USE_META_WS` unset), persistent 2-CTA GEMM | wrong answer (reproduced) | Wrong on every run with a pointer-loaded B, on most runs with a descriptor-loaded B. See [hazards.md](hazards.md#2-cta-without-warp-specialization) | `hopper/Insert2CTASync.cpp`, `insertSyncBeforeMMA`; `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv5.cpp`, `convertDotImpl` |
+| Meta WS on, loop not warp-specialized (`warp_specialize=False`) | hangs (reproduced) | The first iteration completes, then the kernel hangs. See [hazards.md](hazards.md#2-cta-without-warp-specialization) | same |
 
 ## Mechanism
 
@@ -39,7 +43,7 @@ or to the repository root.
 - **B is halved per CTA.** Each CTA's B descriptor load is rewritten to half width (`BLOCK_K x BLOCK_N/2`); host-side descriptor argument types are rewritten too. The swizzle is re-derived for the half tile (`hopper/Transform2CTALoads.cpp`, `transformBLoad`, `transformSplitBLoad`, `shrinkSwizzleForShape`).
 - **One MMA covers the pair.** It computes a `2*BLOCK_M x BLOCK_N` tile. Only the even-rank (leader) CTA issues it; the lowering predicates the MMA on the CTA rank (`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv5.cpp`, `convertDotImpl`).
 - **A rendezvous gates every MMA.** Both CTAs arrive on the leader's barrier, and the leader waits before the MMA. The barrier is multi-buffered to the MMA's operand pipeline depth, so any `num_stages` works (`hopper/Insert2CTASync.cpp`, `getOperandPipelineDepth`, `insertSyncBeforeMMA`; [2cta-autoWS-sync.md, "Insert2CTASync: "Arrive Remote, Wait Local" Pattern"](../../../../../../../../docs/design/2cta-autoWS-sync.md#insert2ctasync-arrive-remote-wait-local-pattern)).
-- **Ordinary TMA output staging is one copy** (see Hard prunes).
+- **Ordinary TMA output staging is one copy** (see "Never try (any problem)").
 - **Cooperative TMA is the default.** Rank-2 descriptor loads are marked as cooperative pair transactions unless `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` is set (`Transform2CTALoads.cpp`, `AttrTwoCTALoadName`).
 
 **What it relieves.**
@@ -57,8 +61,9 @@ So 2-CTA lets a wide logical tile (e.g. `BLOCK_N=256`), or a deeper operand ring
 - The rule that gives the computation partition 8 warps when a reduction partition exists is skipped for 2-CTA (`lib/Dialect/TritonGPU/Transforms/WarpSpecialization/OptimizePartitionWarps.cpp`, `optimizePartitionNumWarps`).
 - 2-CTA re-runs loop scheduling after warp specialization; 1-CTA does not (`third_party/nvidia/backend/compiler.py`, `make_ttgir`).
 
-## Pruning rules
+## When to try it (depends on the problem)
 
+- **IF** warp specialization is off for the loop (Meta WS off, or `warp_specialize=False`), **THEN** skip `two_ctas=True`, **BECAUSE** it gives a wrong answer or hangs.
 - **IF** the launch has no `ctas_per_cga=(2,1,1)`, **THEN** skip every `two_ctas=True` config, **BECAUSE** each compiles as the 1-CTA kernel (duplicate config).
 - **IF** `BLOCK_M` < 64, **THEN** skip `two_ctas=True`, **BECAUSE** it falls back to 1-CTA.
 - **IF** any dot in the kernel cannot be 2-CTA (e.g. an rhs-only scaled `dot_scaled`), **THEN** skip 2-CTA for the whole kernel, **BECAUSE** every tcgen05 op must use one `cta_group`.
@@ -89,9 +94,10 @@ See [interactions.md](interactions.md). Pairs these rules depend on:
 
 ## Hazards
 
-None in [hazards.md](hazards.md) yet. Suspected from code but not reproduced, so tracked as rows in [TRACKER.md](TRACKER.md):
-- `two_ctas` when warp specialization is off or silently stripped (e.g. the warp estimate exceeds 16). Two sync protocols apply at once: the rendezvous from `Insert2CTASync` and the inline cluster arrive from `convertDotImpl`.
-- `two_ctas` whose B is not a descriptor load, or `BLOCK_N` < 32: the B split is skipped with only a debug log, while the MMA lowering still reads a half-width B.
+- [2-CTA with `BLOCK_N/2` below the B-split minimum](hazards.md#2-cta-with-block_n2-below-the-b-split-minimum)
+- [2-CTA without warp specialization](hazards.md#2-cta-without-warp-specialization)
+
+Suspected from code but not reproduced (rows in [TRACKER.md](TRACKER.md#reported-wrong-answers--hangs-needing-repro--code-root-cause)):
 - `two_ctas` with the atomic dynamic tile scheduler: there is no cluster-level tile claim, and no compile-time rejection.
 - `two_ctas` with `smem_alloc_algo=0`: the one-copy staging pin lives only in the default planner.
 
