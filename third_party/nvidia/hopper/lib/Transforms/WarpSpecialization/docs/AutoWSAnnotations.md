@@ -49,7 +49,7 @@ AutoWS inventory.
 | `data_partition_factor` | `tt.data_partition_factor` | `PartitionSchedulingMeta`, `WSDataPartition` | # consumer slices along M/N |
 | `loop_unroll_factor` | `tt.loop_unroll_factor` | `LoopUnroll` (TTIR) | IR-level unroll |
 | `flatten` | `tt.flatten` | `FuseNestedLoops` | flatten a loop nest |
-| `disallow_acc_multi_buffer` | `tt.disallow_acc_multi_buffer` | pipeliner | keep acc single-buffered |
+| `disallow_acc_multi_buffer` | `tt.disallow_acc_multi_buffer` | `AssignLatencies`, `WSMemoryPlanner` (SMEM floor), upstream WS | keep acc single-buffered; see [below](#disallow_acc_multi_buffer) |
 | `multi_cta` | `tt.multi_cta` | multi-CTA reduction | cluster-level reduction |
 | `merge_epilogue` / `merge_epilogue_to_computation` / `merge_correction` | `tt.merge_*` | `PartitionSchedulingMeta` (`SchedulingOptions`) | epilogue/correction routing |
 | `separate_epilogue_store` | `tt.separate_epilogue_store` | `PartitionSchedulingMeta` | epilogue store gets own partition |
@@ -59,6 +59,62 @@ AutoWS inventory.
 
 See `PartitionSchedulingMeta.md` for how the `merge_*` / `separate_epilogue_store`
 knobs shape the partition layout.
+
+## `disallow_acc_multi_buffer`
+
+`tl.range(..., disallow_acc_multi_buffer=True)` (or the same kwarg on
+`tl.condition`) adds the unit attribute `tt.disallow_acc_multi_buffer` to the
+loop. The kwarg defaults to `False`, and `False` emits nothing: every consumer
+tests only whether the attribute is present (`getDisallowAccMultiBuffer` in
+`PipeliningUtility.cpp`). The attribute is also moved by two loop rewrites:
+
+- `FuseNestedLoops` puts it on the fused loop if any loop in the nest had it.
+- `NormalizeWSWhileLoops` moves it from an inner warp-specialized `scf.for` to
+  the enclosing CLC `scf.while`.
+
+Which loop carries the attribute matters, because consumers look in different
+places:
+
+| Path | Consumer (file, symbol) | Where it looks | Effect when present |
+|---|---|---|---|
+| Software pipeliner, any WS mode | `AssignLatencies.cpp`, `AssignMMALatencies::run` | The `scf.for` whose body directly contains the MMA | Matters only when the MMA's accumulator is read inside that same loop (`requiresAccMultiBuffering`). The MMA then does not get the extra latency stage. In a non-WS loop its users stay in the MMA's stage, so `lowerMMA` does not multi-buffer the TMEM accumulator across stages. In a WS loop the MMA's latency is 1 instead of 2. |
+| Meta WS memory planner | `WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor` | Any ancestor of an MMAv5 consumer that carries both this attribute and `tt.data_partition_factor > 1` | Every TMA-fed SMEM operand of that MMA gets a copy floor equal to the configured `num_stages`. With `data_partition_factor` 1 or unset, the SMEM planner ignores the attribute (see [TMAStoreWaitPipeline.md, Phase 3.7](TMAStoreWaitPipeline.md#phase-37-epilogue-group-copy-increase) and [MemoryPlannerSearch.md](MemoryPlannerSearch.md)). |
+| Upstream WS (`TRITON_USE_META_WS` unset) | `LoadMMASpecialization.cpp`; `InsertTmemAref.cpp` (NVWS) | The WS loop (`getOuterWSLoop` for the aref path) | The accumulator's TMEM allocation or aref gets 1 stage instead of 2. |
+
+What it does **not** control under Meta WS: TMEM accumulator copies. The
+heuristic TMEM planner (`MemoryPlannerTmem::run`, post-processing) raises
+`buffer.copy` round-robin on every loop-carried accumulator until the
+512-column budget, minus reserved scale columns, is used. That code never
+reads `tt.disallow_acc_multi_buffer`. On the plan-search path
+(`allocateTmemBuffersViaSearch`) TMEM copies are always 1. With
+`TRITON_USE_META_WS=1`, setting the attribute therefore does not reduce TMEM
+columns. Its Meta WS effects are the two rows above: MMA latency and the SMEM
+operand floor.
+
+Resources affected:
+
+- **TMEM.** On the upstream-WS and non-WS software-pipeliner paths, it removes
+  the second accumulator buffer: one accumulator tile's columns, e.g. BN
+  columns for a BM=128 fp32 tile.
+- **SMEM.** On Meta WS with `data_partition_factor > 1`, the operand rings are
+  raised to `num_stages` copies before Phase 3.7 output staging and Phase 4
+  discretionary copies, so less budget remains for those.
+- **Registers and warps.** No effect.
+
+Fallbacks:
+
+- **Wrong loop.** In a non-flattened persistent GEMM the annotated
+  `tl.range` is usually the outer tile loop, while the MMA sits in the inner K
+  loop. `AssignLatencies` checks only the MMA's own loop, so it does not see an
+  outer-loop attribute. The memory-planner floor walks ancestors and does see
+  it.
+- **No default scheduler.** When `use_modulo_schedule`, `use_llm_schedule`,
+  `use_joint_schedule`, or `use_list_schedule` is set, `make_ttgir` skips
+  `AssignLatencies`, and the latency effect disappears.
+- **SMEM floor relaxed.** If the pinned operand floor makes the plan exceed
+  `smemBudget`, `relaxCopySafetyFloorToBudget` gives the copies back one at a
+  time, largest buffer first. It never goes below the pre-floor count. The
+  only record is an `LDBG` line under `-debug-only=nvgpu-ws-memory-planner`.
 
 ## Operation scheduling annotations
 
