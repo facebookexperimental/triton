@@ -16,6 +16,7 @@ Scope: how GEMM operands (A, B) reach SMEM under Meta WS (`TRITON_USE_META_WS=1`
 
 | Condition | Status | Why | Code ref |
 |---|---|---|---|
+| Pointer `tl.load` feeding `tl.dot` in a WS loop | requires | A TMA descriptor (or `auto_tma`). Only descriptor loads and gathers go to the load partition, so a pointer load gets no producer pipelining. A pointer-loaded B under 2-CTA is a compile error. | `PartitionSchedulingMeta.cpp`, `categorizeLoads` |
 | `multicast=True` on a descriptor load, or the `multicast` compile option | silently ignored | `TMAMulticast.cpp` only attaches `tt.multicast_axes`. No TMA lowering reads that attribute, so no `.multicast::cluster` copy is emitted. | `TMAMulticast.cpp` (sets `kMulticastAxesAttrName`); `WSLowerMem.cpp`, `optimizeTMALoads` (no multicast operand) |
 | `auto_tma` on a load with a non-rectangular mask (`other=0` plus an extra predicate), a real `% arg` wraparound, or a mask bound that is not a bare kernel argument | wrong answer (reproduced) | The promotion drops the load mask. See [hazards.md](hazards.md#auto_tma-promotion-drops-the-load-mask). | `PromoteLoadToTMA.cpp`, `isTMAEligible`, `match1DOffset`, `findShapeArgForDim` |
 | `auto_tma` on a load whose strides or base pointer are not provably 16-byte aligned, or whose `other` is non-zero | silently ignored | Promotion is skipped and the pointer load stays. | `PromoteLoadToTMA.cpp`, `isTMAEligible`, `dimStrideIs16BAligned`, `argIs16BAligned` |
@@ -57,11 +58,8 @@ Scope: how GEMM operands (A, B) reach SMEM under Meta WS (`TRITON_USE_META_WS=1`
 
 ## When to try it (depends on the problem)
 
-- IF an MMA operand is pointer-loaded under Meta WS, THEN only try configs that load it with a TMA descriptor (or `auto_tma`); this removes the pointer-load configs, BECAUSE pointer loads are not routed to the load partition (`categorizeLoads`), so they get no producer pipelining, and a pointer-loaded B is a compile error under 2-CTA.
-- IF an operand is read by both the MMA and register code, THEN, for B, count two SMEM buffers per stage when judging whether a tile and depth fit, BECAUSE the MMA copy is a separate register-written buffer.
-- IF an operand is read by both the MMA and register code, THEN prefer (ranks first; removes nothing) moving the register consumer onto the accumulator or the epilogue when the math allows it, BECAUSE that removes the second buffer, the register round trip and the per-release partition barrier.
-- IF tuning on Blackwell under Meta WS, THEN skip the `multicast` axis, BECAUSE it changes no generated code.
-- IF `auto_tma` is enabled on a kernel whose loads use masks other than per-dimension `offs < extent` bounds, or that use `%` for real broadcasting, THEN skip `auto_tma` for that kernel, BECAUSE the promoted load drops the mask.
+- IF B is read by both the MMA and register code, THEN size its stage as `slot_bytes = (BM + 2*BN)*BK*in_bytes` in the operand-depth fit ([tiles_and_stages.md](tiles_and_stages.md#mechanism), "Resulting operand depth"), and drop tiles whose depth comes out below 1, BECAUSE the MMA copy is a second, register-written B buffer per stage (`doConvertDescriptorLoadsToNVWS`, register-consumed path). [mechanism]
+- IF an operand is read by both the MMA and register code and the math allows moving that consumer onto the accumulator or the epilogue, THEN prefer the moved form, BECAUSE it removes the second buffer, the register round trip, and one partition `bar.sync` per release (`processConsumerReleaseOp`, non-per-thread arrive). [mechanism]
 
 ## Interactions
 
