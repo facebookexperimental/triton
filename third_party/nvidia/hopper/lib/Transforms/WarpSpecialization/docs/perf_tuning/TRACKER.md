@@ -8,7 +8,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 
 | File | State | Note |
 |------|-------|------|
-| `knobs.md` | todo | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it. |
+| [`knobs.md`](knobs.md) | done | Index of the GEMM knobs: one line per knob plus a link to the doc that explains it. |
 | `resources.md` | todo | SMEM, TMEM and register budgets as pruning rules; links to the existing SMEM/TMEM/register docs for the mechanics. |
 | `interactions.md` | todo | Feature-pair table grouped by feature: pair \| status ("works", "compile error", "silently ignored", "duplicate config", "hangs", "wrong answer", "requires") \| mechanism + code location. |
 | `hazards.md` | todo | Open wrong-answer and hang conditions, each with its trigger and code location. Entries are deleted when fixed. |
@@ -43,10 +43,12 @@ These go in the existing docs folder (`../`), not in `perf_tuning/`, so that
 | `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` | todo | Read in `Transform2CTALoads.cpp`. |
 | `maxnreg` under WS | todo | `CUDAOptions.maxnreg`, `third_party/nvidia/backend/compiler.py`. |
 | `disallow_acc_multi_buffer` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; listed in [AutoWSAnnotations.md](../AutoWSAnnotations.md) "Annotation → IR attribute → consumer" without a when/why explanation. |
+| `loop_unroll_factor`, `disable_licm` | todo | `AutoWSLoopOptions` in `python/triton/language/core.py`; generic loop transforms, not WS-specific. |
+| Descriptor loads/stores (kernel pattern) | todo | `tl.make_tensor_descriptor` or host `TensorDescriptor` with `desc.load` / `desc.store`: why autoWS expects TMA producer and store partitions. |
 
 ## Other
 
 | Item | State | Note |
 |------|-------|------|
-| Inductor reference definition | todo | Definition pending. |
+| Inductor reference definition | todo | Definition pending. Until then `knobs.md` has no column for what Inductor sets. |
 | Leaves outside AutoWS | todo | cuBLAS or non-WS leaves; later. |
