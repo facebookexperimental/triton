@@ -75,6 +75,8 @@ This pass runs during TTGIR→LLVM conversion.
    among the partitions it contains, rounded up to a multiple of 8. A
    partition containing `tt.assert`/`tt.print`, or any partition when
    instrumentation is on, is raised to at least 32 (`minRegistersForRegion`).
+   This also applies to a tensor partition's share sentinel, so such a tensor
+   partition gets a fixed 32-register request instead of a share.
    Fixed requests are subtracted from the pool.
 6. **Even split.** What remains is split evenly, rounded down to a multiple of
    8, across the default region and every warp group whose request is the
