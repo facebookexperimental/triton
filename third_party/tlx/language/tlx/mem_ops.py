@@ -713,6 +713,10 @@ def remote_shmem_store(
 ) -> tl.tensor:
     """
     Store a distributed tensor into a buffer into the remote shared memory of a cluster.
+
+    Uses PTX ``st.shared::cluster`` in the generic proxy. Before an async-proxy
+    bulk copy reads these writes, establish cross-CTA synchronization and issue
+    ``tlx.fence("async_shared_cluster")`` in the CTA performing the copy.
     """
     storage = dst.type.storage
     assert storage == tlx.storage_kind.smem, (
@@ -739,6 +743,11 @@ def async_remote_shmem_store(
 
     NOTE: this will increase the lifetime of
     the SMEM buffers involved to entire program, and potentially increase SMEM pressure.
+
+    The regular store uses PTX ``st.async.shared::cluster.mbarrier::complete_tx::bytes``
+    in the generic proxy. Asynchronous completion does not imply use of the async
+    proxy. Waiting for the store's mbarrier does not replace a proxy fence before
+    a subsequent async-proxy bulk copy reads the destination buffer.
 
     Args:
         dst: The destination buffer in local shared memory (will be internally mapped to remote CTA)
@@ -777,6 +786,11 @@ def async_remote_shmem_copy(
     the SMEM buffers involved to entire program, and potentially increase SMEM pressure.
 
     Uses PTX: cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes
+
+    This shared-memory bulk copy uses the async proxy, unlike the generic-proxy
+    register store ``async_remote_shmem_store``. After generic-proxy writes to
+    the source, establish completion and cross-CTA visibility as needed, then
+    issue ``tlx.fence("async_shared_cluster")`` in the CTA performing this copy.
 
     Args:
         dst: The destination buffer in local shared memory (will be internally mapa'd to remote CTA)
@@ -2229,21 +2243,25 @@ def fence(scope: tl.constexpr, _semantic=None) -> None:
         scope: "gpu" for device-scope fence ordering global/shared
                    memory writes visible to all GPU threads.
                "sys" for system-scope fence also visible to host CPU.
-               "async_shared" for proxy fence ordering async shared memory
-                   operations (e.g. between local_store and TMA store).
+               "async_shared" for CTA-scope proxy fence ordering async shared
+                   memory operations (e.g. between local_store and TMA store).
+               "async_shared_cluster" for cluster-scope proxy fence ordering
+                   cross-CTA async shared memory operations.
 
     PTX equivalents:
-        scope="gpu"          → fence.acq_rel.gpu
-        scope="sys"          → fence.acq_rel.sys
-        scope="async_shared" → fence.proxy.async.shared::cta
+        scope="gpu"                  → fence.acq_rel.gpu
+        scope="sys"                  → fence.acq_rel.sys
+        scope="async_shared"         → fence.proxy.async.shared::cta
+        scope="async_shared_cluster" → fence.proxy.async.shared::cluster
     """
     scope = tl._unwrap_if_constexpr(scope)
-    if scope == "async_shared":
-        _semantic.builder.create_fence_async_shared(False)
+    if scope in ("async_shared", "async_shared_cluster"):
+        _semantic.builder.create_fence_async_shared(scope == "async_shared_cluster")
     elif scope in ("gpu", "sys"):
         _semantic.builder.create_threadfence(scope)
     else:
-        raise ValueError(f"fence scope must be 'gpu', 'sys', or 'async_shared', got '{scope}'")
+        raise ValueError("fence scope must be 'gpu', 'sys', 'async_shared', or "
+                         f"'async_shared_cluster', got '{scope}'")
 
 
 @tl.builtin

@@ -30,6 +30,7 @@
 <a class="sub" href="#cluster-initialization-ownership">Cluster initialization ownership</a>
 <a class="sub" href="#scheduling-barriers">Scheduling barriers</a>
 <a class="sub" href="#memory-fences">Memory fences</a>
+<a class="sub" href="#nvidia-dsm-memory-proxies">NVIDIA DSM Memory Proxies</a>
 <a href="warp-specialization.html">Warp specialization</a>
 <a href="clusters.html">Clusters and Cluster Launch Control</a>
 <a href="layouts.html">Layout control and diagnostics</a>
@@ -83,11 +84,13 @@
 <p>Prevents selected AMD machine-instruction classes from crossing a source boundary. It is a scheduling marker, not a workgroup barrier or memory fence.</p>
 <h2 id="memory-fences">Memory fences</h2>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.fence(scope)</code> <strong>[sm90+]</strong> issues a memory fence. The <code>scope</code> argument is required:</div></div>
-<table><thead><tr><th>Scope</th><th>PTX</th><th>Description</th></tr></thead><tbody><tr><td><code>&quot;gpu&quot;</code></td><td><code>fence.acq_rel.gpu</code></td><td>Device-scope fence. Orders prior global/shared memory writes to be visible to all GPU threads.</td></tr><tr><td><code>&quot;sys&quot;</code></td><td><code>fence.acq_rel.sys</code></td><td>System-scope fence. Like <code>&quot;gpu&quot;</code> but also visible to the host CPU.</td></tr><tr><td><code>&quot;async_shared&quot;</code></td><td><code>fence.proxy.async.shared::cta</code></td><td>Proxy fence for async shared memory. Required between <code>local_store</code> and a subsequent TMA store (<code>async_descriptor_store</code>) to the same shared memory.</td></tr></tbody></table>
-<p>Example:</p>
+<table><thead><tr><th>Scope</th><th>PTX</th><th>Description</th></tr></thead><tbody><tr><td><code>&quot;gpu&quot;</code></td><td><code>fence.acq_rel.gpu</code></td><td>Device-scope fence. Orders prior global/shared memory writes to be visible to all GPU threads.</td></tr><tr><td><code>&quot;sys&quot;</code></td><td><code>fence.acq_rel.sys</code></td><td>System-scope fence. Like <code>&quot;gpu&quot;</code> but also visible to the host CPU.</td></tr><tr><td><code>&quot;async_shared&quot;</code></td><td><code>fence.proxy.async.shared::cta</code></td><td>CTA-scope proxy fence for async shared memory. Required between <code>local_store</code> and a subsequent TMA store (<code>async_descriptor_store</code>) to the same shared memory.</td></tr><tr><td><code>&quot;async_shared_cluster&quot;</code></td><td><code>fence.proxy.async.shared::cluster</code></td><td>Cluster-scope proxy fence for DSMEM and cross-CTA async/generic handoff.</td></tr></tbody></table>
+<p>Examples:</p>
 <pre><code class="language-python">  tlx.local_store(smem_buf, data)
   tlx.fence(&quot;async_shared&quot;)
-  tlx.async_descriptor_store(desc, smem_buf, offsets)</code></pre>
+  tlx.async_descriptor_store(desc, smem_buf, offsets)
+
+  tlx.fence(&quot;async_shared_cluster&quot;)</code></pre>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.fence_mbarrier_init_cluster()</code> <strong>[sm90+]</strong> publishes mbarrier initialization to the cluster. It does not wait for other CTAs to initialize their barriers. Use <code>scope=&quot;cluster&quot;</code> allocation for compiler-owned initialization synchronization, or provide the fence and rendezvous manually for low-level/default-scope code.</div></div>
 <p>Manual initialization example:</p>
 <pre><code class="language-python">  bars = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
@@ -95,7 +98,21 @@
   tlx.cluster_barrier()
 
   # now bars is ready for cross CTA use
-  tlx.barrier_arrive(bar=bars[0], remote_cta_rank=1)</code></pre></article>
+  tlx.barrier_arrive(bar=bars[0], remote_cta_rank=1)</code></pre>
+<h2 id="nvidia-dsm-memory-proxies">NVIDIA DSM Memory Proxies</h2>
+<p>An operation's asynchronous completion does not determine its memory proxy. For NVIDIA SM90+ cluster shared memory, the following APIs use distinct paths:</p>
+<table><thead><tr><th>API</th><th>Source</th><th>PTX instruction</th><th>Memory proxy</th></tr></thead><tbody><tr><td><code>tlx.remote_shmem_store</code></td><td>Register tensor</td><td><code>st.shared::cluster</code></td><td>Generic</td></tr><tr><td><code>tlx.async_remote_shmem_store</code> (regular store)</td><td>Register tensor</td><td><code>st.async.shared::cluster.mbarrier::complete_tx::bytes</code></td><td>Generic</td></tr><tr><td><code>tlx.async_remote_shmem_copy</code></td><td>Local shared-memory buffer</td><td><code>cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes</code></td><td>Async</td></tr></tbody></table>
+<p><code>st.async</code> is a non-blocking store in the <strong>generic proxy</strong>, including its mbarrier completion access. It is not a shared-memory bulk copy. In contrast, <code>cp.async.bulk</code> reads the source buffer through the <strong>async proxy</strong>. See the <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html" target="_blank" rel="noreferrer">NVIDIA PTX ISA</a> for the instruction semantics.</p>
+<p>Before <code>async_remote_shmem_copy</code> reads a source buffer written through the generic proxy, establish the handoff with <code>tlx.fence(&quot;async_shared_cluster&quot;)</code>. If another CTA produced the data, first establish completion and cross-CTA visibility, then issue the proxy fence in the CTA performing the bulk copy.</p>
+<p>These mechanisms have different responsibilities:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.barrier_wait</code> observes the completion of transactions tracked by an</div></div>
+<p>mbarrier. Waiting for <code>st.async</code> to finish does not itself establish generic-to-async proxy ordering.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.cluster_barrier</code> provides a cluster rendezvous and cross-CTA memory</div></div>
+<p>synchronization. It does not replace the proxy fence.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.fence(&quot;async_shared_cluster&quot;)</code> establishes ordering between the generic</div></div>
+<p>and async proxies for cluster shared memory. It does not wait for the bulk copy to complete; keep the source and destination alive until completion.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.alloc_barriers(scope=&quot;cluster&quot;)</code> provides compiler-owned mbarrier</div></div>
+<p>initialization synchronization. Its initialization fence and bootstrap rendezvous do not replace a proxy fence for later payload writes.</p></article>
 <footer class="pager"><a href="async-compute.html">← Tensor core operations</a><a class="next" href="warp-specialization.html">Warp specialization →</a></footer>
     </main>
   </div>
