@@ -51,11 +51,9 @@ The MMA operands themselves are covered in [tma_loads.md](tma_loads.md). The out
 
 ## When to try it (depends on the problem)
 
-- IF the kernel reads a TMA-loaded side input in registers, THEN prefer (ranks first; removes nothing) a pointer `tl.load` for that input, BECAUSE the TMA form's release has no proxy fence (code inspection; not reproduced in testing).
-- IF the kernel has no K loop (K a compile-time constant <= BLOCK_K) and the epilogue adds a tensor to the GEMM result, THEN skip TMA for that tensor, BECAUSE the folded accumulator init lands in the wrong partition.
-- IF a side input's per-subtile box is under 128 bytes (e.g. a bf16 bias slice of fewer than 64 elements), THEN skip TMA for it, BECAUSE its landing buffer can be multi-buffered at a misaligned offset.
-- IF judging SMEM fit with TMA side inputs, THEN add one landing buffer per input per copy to the operand ring and staging, BECAUSE the planner allocates each one.
-- IF a prologue is a pure zero pad of M or K, THEN prefer (ranks first; removes nothing) folding it into the descriptor extent, BECAUSE TMA zero-fill makes it exact and free.
+- IF the kernel reads a TMA-loaded side input in registers, THEN prefer a pointer `tl.load` for that input, BECAUSE the TMA form's release emits no proxy fence (`processConsumerReleaseOp`; code inspection, not reproduced). [code]
+- IF judging SMEM fit with N TMA side inputs, THEN add `sum_i box_bytes_i * copies_i` to the staging term of the operand-depth fit ([tiles_and_stages.md](tiles_and_stages.md#mechanism), "Resulting operand depth"), with copies up to `num_stages`, BECAUSE the planner allocates and may multi-buffer one landing buffer per input (`doConvertDescriptorLoadsToNVWS`). [mechanism]
+- IF a prologue is a pure zero pad of M or K, THEN prefer setting the descriptor extent to the unpadded size, BECAUSE `padding="zero"` makes the out-of-bounds reads exact and the pad kernel and its buffer disappear. [mechanism]
 
 ## Interactions
 
