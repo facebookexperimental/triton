@@ -10,58 +10,41 @@ Budget numbers are in [resources.md](resources.md). Code paths are relative to `
 
 ## Knobs
 
-| Knob | How set | What it does | Existing doc |
-|---|---|---|---|
-| `BLOCK_M`, `BLOCK_N`, `BLOCK_K` | kernel constexprs (tile shape of `tl.dot`) | Size every operand slot, the accumulator, and the epilogue tile | — |
-| `num_stages` | kernel compile option (`triton.Config(num_stages=...)`) | Upper bound on the copies of every innermost operand buffer and of output staging | [SmemAllocationDesign.md, "Phase 4: Iterative Copy Increase"](../SmemAllocationDesign.md#phase-4-iterative-copy-increase) |
-| loop `num_stages` | `tl.range(..., num_stages=)` | Software-pipeline depth of that loop; inert on a dynamic or CLC `while` | [AutoWSAnnotations.md, "`num_stages` / pipelining on a `while`: not applicable"](../AutoWSAnnotations.md#num_stages--pipelining-on-a-while-not-applicable) |
-| per-operand copies | `tl.dot(..., attrs={"channels": ["opndA,smem,<copies>,<id>", ...]})` | Pins one operand's buffer depth and id | [AnnotationBasedBufferPreAssignment.md, "User-Facing API"](../AnnotationBasedBufferPreAssignment.md#user-facing-api) |
-| `smem_budget` | `tl.range(..., smem_budget=)` | Replaces the target SMEM limit as the planner's starting budget | [AutoWSAnnotations.md, "Annotation → IR attribute → consumer"](../AutoWSAnnotations.md#annotation--ir-attribute--consumer) |
+| Knob | Set via | Legal values | Default | Priority | Applies when | Prereqs |
+|---|---|---|---|---|---|---|
+| `BLOCK_M` | kernel constexpr (M extent of the `tl.dot` tile) | power of 2, >= 64 | — | P0 | Every tcgen05 GEMM. A power of 2 below 64 gets no tcgen05 MMA and no gemm partition. | — |
+| `BLOCK_N` | kernel constexpr (N extent of the `tl.dot` tile) | power of 2, multiple of 8 | — | P0 | Every tcgen05 GEMM. Otherwise there is no tcgen05 MMA. | Under `two_ctas`, `BLOCK_N/2` >= 16. |
+| `BLOCK_K` | kernel constexpr (K step of the inner loop) | power of 2, >= 256 / operand bit width | — | P0 | Every tcgen05 GEMM. Below 256 / bit width (16 bf16, 32 fp8) there is no tcgen05 MMA. | — |
+| `num_stages` | compile option | int >= 1 | 3 | P0 | Every WS loop. Below 1 is a compile error; above the depth that fits the SMEM budget no operand copies are added. | — |
+| `flatten` | `tl.range` kwarg | False | False | P0 | `flatten=False` only: `flatten=True` drops warp specialization. | — |
+| `num_stages` (per loop) | `tl.range` kwarg | int >= 1 | kernel `num_stages` | P1 | `scf.for` loops only; silently ignored on a dynamic or CLC `while`. | — |
+| `loop_unroll_factor`, `disable_licm` | `tl.range` kwargs | int / bool | None / False | P2 | `loop_unroll_factor` on a persistent WS loop is a compile error. `disable_licm` is not WS-specific. | — |
 
-## Never try (any problem)
+## Pruning ruleset
 
-| Condition | Status | Why | Code |
-|---|---|---|---|
-| `BLOCK_M` a power of 2 below 64 (e.g. 32) | silently ignored | MMAv5 needs a power-of-2 M that is a multiple of 64, so the dot lowers to mma.sync and autoWS has no gemm partition | `lib/Analysis/Utility.cpp`, `isMmaOutputShapeSupported` / `supportMMA`; `lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, `getMMAVersionSafe` |
-| `BLOCK_N` not a power of 2 | silently ignored | Same check: N must be a power of 2 and a multiple of 8, so there is no tcgen05 | `lib/Analysis/Utility.cpp`, `isMmaOutputShapeSupported` |
-| `BLOCK_K` < 256 / operand bit width (16 for bf16, 32 for fp8) | silently ignored | No tcgen05: "If k size is smaller than the native mma size, we cannot use MMA" | `lib/Analysis/Utility.cpp`, `supportMMA` |
-| fp32 × fp32 dot with `input_precision="ieee"` | silently ignored | No tensor-core MMA: `supportMMA` rejects fp32 operands. `"tf32"`, `"tf32x3"`, `"bf16x3"` and `"bf16x6"` all reach tcgen05, because `F32DotTC` rewrites the multi-pass forms into tf32 or bf16 dots before `AccelerateMatmul` | `lib/Analysis/Utility.cpp`, `supportMMA`; `lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp`; `third_party/nvidia/backend/compiler.py`, `make_ttgir` (`add_f32_dot_tc` before `add_accelerate_matmul`) |
-| `BLOCK_M=128` with `data_partition_factor=2` | duplicate config | Runs as dp=1. A 64-row M slice would change TMEM `blockM`, so the pass warns "skipping M-dimension data partitioning" and drops partitioning. It does not fall back to an N split, even when `BLOCK_N/2` >= 128 | `WS/WSDataPartition.cpp`, `DataPartitionScheme::partitionIsCompatible`, `computePartitionScheme` |
-| `BLOCK_M=64` with `data_partition_factor=2` and `BLOCK_N` < 256 | compile error | Neither an M slice >= 64 nor an N slice >= 128 exists, so `computePartitionScheme` fails and the pass signals failure | `WS/WSDataPartition.cpp`, `computePartitionScheme`, `doDataPartition` |
-| `tl.dot(two_ctas=True)` with `BLOCK_M` < 64 | silently ignored | Covered by the first row: no tcgen05 at all. `BLOCK_M=64` with `two_ctas` compiles as real 2-CTA | `lib/Analysis/Utility.cpp`, `isMmaOutputShapeSupported` |
-| `TRITON_WS_SMEM_PLAN_SEARCH=1` with no K loop (K == BLOCK_K as a compile-time constant) and more tiles than SMs | wrong answer (reproduced) | Plan search keeps TMEM accumulator copies at 1, bypassing the per-iteration accumulator multi-buffering. See [hazards.md](hazards.md#plan-search-pins-tmem-accumulator-copies-to-1) | `WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch` |
-| `loop_unroll_factor` >= 2 on a persistent warp-specialized loop | compile error | "SMEM circular reuse group is ill-formed": both the unrolled loop and the remainder loop keep `tt.warp_specialize`. See [AutoWSAnnotations.md § `loop_unroll_factor`](../AutoWSAnnotations.md#loop_unroll_factor) | `WS/WSCodePartition.cpp`; `lib/Dialect/Triton/Transforms/LoopUnroll.cpp` |
-| `num_stages` < 1 | compile error | "nvgpu-warp-specialization requires num-stages >= 1" | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnOperation` |
-| Annotated `numCopies` below the buffer's cross-stage depth | hangs | Inferred from the planner, not reproduced: it keeps the annotation and only warns, and its own rationale for never lowering a cross-stage floor is that a lower depth "deadlocks at runtime"; annotations bypass that floor | `WS/WSMemoryPlanner.cpp`, `allocateSmemBuffers` Phase 2 ("annotated cross-stage SMEM buffer has buffer.copy=...") |
+| Condition | Status | Why |
+|---|---|---|
+| `BLOCK_M` a power of 2 below 64 (e.g. 32) | silently ignored | MMAv5 needs a power-of-2 M that is a multiple of 64, so the dot lowers to mma.sync and autoWS has no gemm partition. |
+| `BLOCK_N` not a power of 2 | silently ignored | Same check: N must be a power of 2 and a multiple of 8, so there is no tcgen05. |
+| `BLOCK_K` < 256 / operand bit width (16 for bf16, 32 for fp8) | silently ignored | No tcgen05: "If k size is smaller than the native mma size, we cannot use MMA". |
+| fp32 × fp32 dot with `input_precision="ieee"` | silently ignored | No tensor-core MMA: `supportMMA` rejects fp32 operands. |
+| `BLOCK_M=128` with `data_partition_factor=2` | duplicate config | Runs as dp=1. |
+| `BLOCK_M=64` with `data_partition_factor=2` and `BLOCK_N` < 256 | compile error | Neither an M slice >= 64 nor an N slice >= 128 exists, so `computePartitionScheme` fails and the pass signals failure. |
+| `tl.dot(two_ctas=True)` with `BLOCK_M` < 64 | silently ignored | Covered by the first row: no tcgen05 at all. |
+| `TRITON_WS_SMEM_PLAN_SEARCH=1` with no K loop (K == BLOCK_K as a compile-time constant) and more tiles than SMs | wrong answer | Plan search keeps TMEM accumulator copies at 1, bypassing the per-iteration accumulator multi-buffering. |
+| `loop_unroll_factor` >= 2 on a persistent warp-specialized loop | compile error | "SMEM circular reuse group is ill-formed": both the unrolled loop and the remainder loop keep `tt.warp_specialize`. |
+| `flatten=True` | silently ignored | Flattening drops warp specialization from the loop. |
+| `num_stages` < 1 | compile error | "nvgpu-warp-specialization requires num-stages >= 1". |
+| Annotated `numCopies` below the buffer's cross-stage depth | hangs | The planner keeps the annotation with only a warning, and a depth below the cross-stage floor deadlocks. |
 
 ## Mechanism
 
-**Tile shape changes:**
-- the A slot (`BLOCK_M × BLOCK_K`) and B slot (`BLOCK_N × BLOCK_K`), in the operand element type;
-- TMEM columns per accumulator copy (`BLOCK_N × ceil(BLOCK_M/128)` for fp32), hence the accumulator copy count ([resources.md](resources.md));
-- the epilogue tile, with `EPILOGUE_SUBTILE` (`epilogue.md`);
-- the MMA instruction shape: M = 128 when `BLOCK_M` >= 128, else 64; N = `min(BLOCK_N, 256)`; K = 256 / operand bit width; larger tiles issue several MMAs (`lib/Dialect/TritonGPU/Transforms/Utility.cpp`, `mmaVersionToInstrShape`).
-
-SMEM is sized from these compile-time shapes alone (`WS/WSMemoryPlanner.cpp`, `getSmemAllocSizeBytes`); a smaller problem never makes a config fit.
-
-**`num_stages` changes** the planner's `numBuffers` cap:
-- output staging is raised first, up to that cap (`increaseFusedEpilogueCopies`);
-- then Phase 4 adds one copy at a time to the innermost operand buffers (TMA-fed first, then non-TMA, in first-use order) until the next copy would exceed the budget or `num_stages`.
-
-Mechanics: [SmemAllocationDesign.md, "Phase 4: Iterative Copy Increase"](../SmemAllocationDesign.md#phase-4-iterative-copy-increase) and [TMAStoreWaitPipeline.md, "Phase 3.7: Epilogue Group Copy Increase"](../TMAStoreWaitPipeline.md#phase-37-epilogue-group-copy-increase).
-
-**Resulting operand depth:**
-> depth = the largest d <= `num_stages` such that floors + staging + d·(A slot + B slot) fits the budget, plus possibly one more copy of the operand used first.
-- Equal A/B slots: the two depths differ by at most 1. Unequal slots: the smaller operand keeps rising after the larger stops, so the gap can be larger.
-
-**What it relieves:** deeper operand rings let the load partition run further ahead of the MMA.
-
-**What it costs:** operand copies and staging compete for the same SMEM; deeper rings add barrier slots to the auxiliary reservation (`estimateAuxiliarySmemBytes` scales barrier bytes by depth).
-
-**Floors** (correctness floors can force copies above `num_stages`):
-- cross-stage depth: never given back;
-- copy-safety floor: in particular, under `data_partition_factor` > 1 with `disallow_acc_multi_buffer`, every TMA operand of the MMA is floored at `num_stages` (`getStaticSmemCopySafetyFloor`); given back when it does not fit (`relaxCopySafetyFloorToBudget`).
-- The unannotated planner raises A and B in lockstep, so A/B depths more than ±1 apart at equal slot sizes need annotated channel copies (`tl.dot(attrs={"channels": ...})`), never below the cross-stage depth.
+- **Tile shape (`BLOCK_M`, `BLOCK_N`, `BLOCK_K`):** changes the A slot (`BLOCK_M × BLOCK_K`) and B slot (`BLOCK_N × BLOCK_K`) in the operand element type, the TMEM columns per accumulator copy (`BLOCK_N × ceil(BLOCK_M/128)` for fp32, hence the accumulator copy count; [resources.md](resources.md)), and the epilogue tile, with `EPILOGUE_SUBTILE` (`epilogue.md`); SMEM is sized from these compile-time shapes alone (`WS/WSMemoryPlanner.cpp`, `getSmemAllocSizeBytes`), so a smaller problem never makes a config fit.
+- **MMA instruction shape:** M = 128 when `BLOCK_M` >= 128, else 64; N = `min(BLOCK_N, 256)`; K = 256 / operand bit width; larger tiles issue several MMAs (`lib/Dialect/TritonGPU/Transforms/Utility.cpp`, `mmaVersionToInstrShape`).
+- **`num_stages`:** changes the planner's `numBuffers` cap: output staging is raised first, up to that cap (`increaseFusedEpilogueCopies`), then Phase 4 adds one copy at a time to the innermost operand buffers (TMA-fed first, then non-TMA, in first-use order) until the next copy would exceed the budget or `num_stages` ([SmemAllocationDesign.md, "Phase 4: Iterative Copy Increase"](../SmemAllocationDesign.md#phase-4-iterative-copy-increase), [TMAStoreWaitPipeline.md, "Phase 3.7: Epilogue Group Copy Increase"](../TMAStoreWaitPipeline.md#phase-37-epilogue-group-copy-increase)) -> relieves: deeper operand rings let the load partition run further ahead of the MMA -> costs: operand copies and staging compete for the same SMEM, and deeper rings add barrier slots to the auxiliary reservation (`estimateAuxiliarySmemBytes` scales barrier bytes by depth).
+- **Resulting operand depth:** depth = the largest d <= `num_stages` such that floors + staging + d·(A slot + B slot) fits the budget, plus possibly one more copy of the operand used first; with equal A/B slots the two depths differ by at most 1, with unequal slots the smaller operand keeps rising after the larger stops, so the gap can be larger.
+- **Correctness floors:** can force copies above `num_stages`; the cross-stage depth is never given back; the copy-safety floor (in particular, under `data_partition_factor` > 1 with `disallow_acc_multi_buffer`, every TMA operand of the MMA is floored at `num_stages`; `getStaticSmemCopySafetyFloor`) is given back when it does not fit (`relaxCopySafetyFloorToBudget`).
+- **Annotated channel copies:** the unannotated planner raises A and B in lockstep, so A/B depths more than ±1 apart at equal slot sizes need annotated channel copies (`tl.dot(attrs={"channels": ...})`), never below the cross-stage depth.
 
 ## Interactions
 
