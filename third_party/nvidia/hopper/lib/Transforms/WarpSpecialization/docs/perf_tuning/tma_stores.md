@@ -54,11 +54,7 @@ Subtiling choice (`EPILOGUE_SUBTILE`) is covered in [epilogue.md](epilogue.md). 
 
 ## When to try it (depends on the problem)
 
-- IF the epilogue uses a pointer `tl.store`, THEN skip the `separate_epilogue_store` axis, BECAUSE it forms no store partition.
-- IF `EPILOGUE_SUBTILE=1` or `two_ctas=True`, THEN skip sweeping `TRITON_WS_STAGING_COPIES`, BECAUSE the staging ring is not deepened in either case.
-- IF sweeping `TRITON_WS_STAGING_COPIES`, THEN only try values that are at most `num_stages` and, when the store is drained in the same partition (`separate_epilogue_store=False`), divide `EPILOGUE_SUBTILE`; this removes the others, BECAUSE the planner rounds them down to the largest legal depth, which makes duplicates. A separate store partition accepts any count.
-- IF the kernel is a persistent GEMM, THEN prefer (ranks first; removes nothing) `warp_specialize=True` on the outer tile loop, BECAUSE an annotated inner K loop is partitioned separately and first.
-- IF a 2-CTA config is in the search, THEN only try it with a TMA store epilogue, BECAUSE 2-CTA requires one (see [2cta.md](2cta.md)).
+- IF the kernel is a persistent GEMM, THEN prefer `warp_specialize=True` on the outer tile loop only, BECAUSE `PartitionSchedulingMeta::runOnOperation` walks annotated loops post-order, so an annotated inner K loop is partitioned first and on its own. [mechanism]
 
 ## Interactions
 
