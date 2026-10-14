@@ -1,4 +1,4 @@
-# B200 resource limits as pruning rules (autoWS GEMM)
+# B200 resource limits (autoWS GEMM)
 
 Scope: the shared-memory (SMEM), tensor-memory (TMEM), register and warp limits that decide whether an autoWS GEMM config on sm100 compiles, does what was asked, or is silently changed. The rules below cover only what follows from those limits. For how the planners work, follow the links.
 
@@ -63,7 +63,7 @@ Facts:
    - non-tensor partitions request `minRegAutoWS` (default 24), and tensor partitions share the rest;
    - if those requests do not fit, the register split is silently skipped.
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Result | Why | Code |
 |---|---|---|---|
@@ -76,7 +76,7 @@ Facts:
 | `minRegAutoWS` / `maxRegAutoWS` not a multiple of 8 | compile error | Register requests are emitted per warp group in steps of 8 | `third_party/nvidia/backend/compiler.py`, `_check_reg_auto_ws_alignment` |
 | `num_stages` < 1 | compile error | "nvgpu-warp-specialization requires num-stages >= 1" | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnOperation` |
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - **IF** `num_warps` is not 4 or 8, **THEN** skip the config, **BECAUSE** it never produces a tcgen05 autoWS GEMM.
 - **IF** two configs differ only in `num_stages` and both are at or above the depth that fits, **THEN** keep one, **BECAUSE** the planner allocates the same plan for both.
