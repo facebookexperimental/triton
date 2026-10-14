@@ -34,11 +34,12 @@ Two general rules apply to every entry:
 
 ### Single K tile with an additive epilogue loaded by TMA
 
-- **Trigger:** all of the following hold:
-  - K <= BLOCK_K, so there is no K loop;
-  - the GEMM result is summed with a tensor, e.g. a bias;
-  - that tensor is loaded with a TMA descriptor.
-- **Symptom:** wrong GEMM output.
+- **Status:** reproduced. The same kernel is exact with a pointer-loaded epilogue input, with a K loop, or with warp specialization off.
+- **Trigger:** all of the following hold, under Meta WS:
+  - a persistent kernel with no K loop: a single `tl.dot`, K <= BLOCK_K;
+  - the GEMM result is combined with an `[M, N]` epilogue input, e.g. a bias or residual added to it;
+  - that input is loaded with a TMA descriptor.
+- **Symptom:** wrong GEMM output on every run.
 - **Code:**
   - `Combine.cpp`, `CombineDotAddFPattern` folds `dot(a, b, 0) + d` into `dot(a, b, d)`. The addend therefore becomes an accumulator-init `tmem_store` in a different task from the MMA.
   - `WSCodePartition.cpp`, `insertAsyncComm`, operand-D guard-channel path: the builder's task IDs are left on the MMA's task. The plain `ProducerCommitOp` that follows is created without resetting them to the producer (`relation.first`), so the commit lands in the MMA partition.
@@ -60,6 +61,21 @@ Two general rules apply to every entry:
   - `PartitionSchedulingMeta.cpp`, `runOnOperation`: the fix-up that schedules unreachable stores handles `tt.store` only and explicitly leaves atomics alone.
   - `WSAtomicBroadcast.cpp`, `classifyAtomic`: atomics with at most one task ID pass through unchanged.
   - `WSSpecialize.cpp`, `SpecializeOp`: an op that has no task ID and that no partition needs is not cloned into any partition, and the original loop is erased.
+
+### 2-CTA with `BLOCK_N/2` below the B-split minimum
+
+- **Status:** reproduced. The same `BLOCK_N` as 1-CTA, and the next legal `BLOCK_N` as 2-CTA, are exact.
+- **Trigger:** `tl.dot(..., two_ctas=True)` with `BLOCK_N/2` < 16 (e.g. `BLOCK_N=16`).
+- **Symptom:** a silent wrong answer on every run, with no error or warning.
+- **Code:** `third_party/nvidia/hopper/lib/Transforms/Transform2CTALoads.cpp`, `transformBLoad` and `transformSplitBLoad`: when `halfN < 16` the B split is skipped with only a debug log ("too small, skipping"), while the 2-CTA MMA lowering still reads a half-width B per CTA.
+
+### 2-CTA without warp specialization
+
+- **Status:** reproduced.
+- **Trigger and symptom:**
+  - Meta WS off (`TRITON_USE_META_WS` unset): a persistent 2-CTA GEMM gives a wrong answer. With a pointer-loaded B it is wrong on every run; with a descriptor-loaded B it is wrong on most runs (a race).
+  - Meta WS on but the loop not warp-specialized (`warp_specialize=False`): the first iteration is correct, then the kernel hangs.
+- **Code (root cause not yet located):** two 2-CTA synchronization schemes can apply at once without warp specialization: the cross-CTA rendezvous inserted by `third_party/nvidia/hopper/lib/Transforms/Insert2CTASync.cpp` (`insertSyncBeforeMMA`) and the inline cluster arrive in the MMA lowering (`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv5.cpp`, `convertDotImpl`).
 
 ### Same-partition TMA staging floor that does not divide the subtile count (from code inspection; no reproducer yet)
 

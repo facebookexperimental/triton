@@ -18,7 +18,7 @@ Budget numbers are in [resources.md](resources.md). Code paths are relative to `
 | per-operand copies | `tl.dot(..., attrs={"channels": ["opndA,smem,<copies>,<id>", ...]})` | Pins one operand's buffer depth and id | [AnnotationBasedBufferPreAssignment.md, "User-Facing API"](../AnnotationBasedBufferPreAssignment.md#user-facing-api) |
 | `smem_budget` | `tl.range(..., smem_budget=)` | Replaces the target SMEM limit as the planner's starting budget | [AutoWSAnnotations.md, "Annotation → IR attribute → consumer"](../AutoWSAnnotations.md#annotation--ir-attribute--consumer) |
 
-## Hard prunes
+## Never try (any problem)
 
 | Condition | Result | Why | Code |
 |---|---|---|---|
@@ -63,7 +63,7 @@ Mechanics: [SmemAllocationDesign.md, "Phase 4: Iterative Copy Increase"](../Smem
 - In particular, under `data_partition_factor` > 1 with `disallow_acc_multi_buffer`, every TMA operand of the MMA is floored at `num_stages` (`getStaticSmemCopySafetyFloor`).
 - That copy-safety floor is given back when it does not fit (`relaxCopySafetyFloorToBudget`). The cross-stage floor is never given back.
 
-## Pruning rules
+## When to try it (depends on the problem)
 
 - **IF** `BLOCK_M` < 64, or `BLOCK_N` is not a power of 2, or `BLOCK_K` < 256/bits, **THEN** skip, **BECAUSE** no tcgen05 MMA is generated.
 - **IF** `BLOCK_M=128` and `data_partition_factor=2`, **THEN** skip, **BECAUSE** it compiles to the same kernel as dp=1.
