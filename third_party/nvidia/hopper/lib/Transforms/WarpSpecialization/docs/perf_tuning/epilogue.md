@@ -70,11 +70,10 @@ Mechanics: [TMAStoreWaitPipeline.md, "`K | S` cap for same-partition (wait_group
 
 ## When to try it (depends on the problem)
 
-- **IF** the epilogue uses pointer stores, **THEN** skip `separate_epilogue_store=True` variants (this removes them), **BECAUSE** they are duplicate configs of `False`.
-- **IF** `ES=1` or `two_ctas=True`, **THEN** skip staging-copy variants, **BECAUSE** staging stays at one copy.
-- **IF** `separate_epilogue_store=False`, **THEN** only try staging caps that divide `ES`, **BECAUSE** other caps round down to a divisor.
-- **IF** two configs differ only in `ES` and the larger `ES` is what makes the config fit, **THEN** prefer the larger `ES` (this removes the smaller-`ES` variant that does not fit), **BECAUSE** total staging SMEM falls as `BLOCK_N/ES` shrinks at equal copies.
-- **IF** total staging SMEM is compared across `ES` values, **THEN** compute it as slice × copies with copies bounded as above, **BECAUSE** it does not shrink monotonically with `ES`: copies can rise toward min(`num_stages`, `ES`) for a same-partition store, or `num_stages` for a separate store.
+Staging SMEM = `BM * (BN/ES) * out_bytes * copies`, with copies <= `min(num_stages, ES)` for a same-partition store or <= `num_stages` for a separate store (see "Mechanism"). `R` and `d_fit` as in [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem) and [resources.md](resources.md#when-to-try-it-depends-on-the-problem).
+
+- **IF** `d_fit < 1` at `ES = e` (one operand level does not fit next to one staging copy of `BM * (BN/e) * out_bytes`), **THEN** drop that `ES`, **BECAUSE** the plan exceeds SMEM. Example: 128x256x128 1-CTA bf16: `ES=1` staging 64 KiB + slot 96 KiB fits once (`d_fit` 1); 256x256x128 `ES=1` (128 KiB + 128 KiB) does not. [mechanism]
+- **IF** comparing total staging across `ES`, **THEN** compute slice x copies with the bounds above, **BECAUSE** copies can rise as `ES` grows, so total staging is not monotone in `ES`. [mechanism]
 
 ## Interactions
 
