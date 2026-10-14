@@ -16,14 +16,14 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 
 ## SMEM
 
-The planner's budget is the target's opt-in maximum, or `tt.smem_budget` if the loop sets one, minus `estimateAuxiliarySmemBytes`. That estimate counts:
+Budget = the target's opt-in maximum (or the loop's `tt.smem_budget`) minus `estimateAuxiliarySmemBytes`, which counts:
 - barrier slots, scaled by buffer depth and CTA count;
 - barrier-array metadata;
 - captured kernel arguments and allocations;
 - tensor maps;
 - the largest single op scratch before the last WS loop, such as a layout conversion (`estimateOpScratchBytes`).
 
-The estimate depends on the kernel, so no single "planner budget" number holds for every kernel. Buffers are multiples of 16 KiB for bf16 GEMM tiles, so bf16 plans often total exactly 229,376 B (14 × 16 KiB). That total is a result of the buffer sizes, not a constant in the code.
+The estimate depends on the kernel, so no single "planner budget" number holds. bf16 GEMM tile buffers are multiples of 16 KiB, so bf16 plans often total exactly 229,376 B (14 × 16 KiB): a result of buffer sizes, not a constant in the code.
 
 Mechanics (link, don't repeat):
 - Phases, priorities and the copy-increase loop: [SmemAllocationDesign.md, "Algorithm"](../SmemAllocationDesign.md#algorithm).
@@ -31,37 +31,43 @@ Mechanics (link, don't repeat):
 - Plan-space search: [MemoryPlannerSearch.md, "9. The plan-space beam search"](../MemoryPlannerSearch.md#9-the-plan-space-beam-search-wsmemoryplansearchhcpp).
 
 Facts these rules depend on, all in `WS/WSMemoryPlanner.cpp`, `allocateSmemBuffers`:
-1. **Staging comes first.** TMA output staging is reserved before the operand rings: `increaseFusedEpilogueCopies` runs before the Phase 4 operand copy increase.
-2. **The operand depth cap is `num_stages`.** Phase 4 raises the innermost operand buffers, in the order they are first used, one level at a time. It stops when nothing fits or the level would pass `num_stages`. It never uses free SMEM beyond `num_stages`.
-3. **The cross-stage floor is never dropped.** A plan that still exceeds the budget after the discretionary reuse step only produces the warning "exceeding configured smem-budget". The hardware check at launch is the backstop. The copy-safety floor (dp > 1) is different: it is given back one copy at a time when it does not fit (`relaxCopySafetyFloorToBudget`). A relaxed floor combined with a TMA-loaded epilogue input hangs when a CTA processes several tiles (reproduced; [hazards.md](hazards.md#relaxed-operand-copy-floor-with-a-tma-loaded-epilogue-input-several-tiles-per-cta)).
-4. **Under budget pressure, staging can alias operand rings.** Innermost operand buffers are never aliased (`findReuseCandidate`).
+1. **Staging comes first:** `increaseFusedEpilogueCopies` reserves TMA output staging before the Phase 4 operand copy increase.
+2. **The operand depth cap is `num_stages`:** Phase 4 raises the innermost operand buffers one level at a time, in first-use order, until nothing fits or the level would pass `num_stages`; it never uses free SMEM beyond `num_stages`.
+3. **The cross-stage floor is never dropped:** an over-budget plan after the discretionary reuse step only warns "exceeding configured smem-budget"; the hardware check at launch is the backstop. The copy-safety floor (dp > 1) is given back one copy at a time when it does not fit (`relaxCopySafetyFloorToBudget`); a relaxed floor with a TMA-loaded epilogue input hangs when a CTA processes several tiles (reproduced; [hazards.md](hazards.md#relaxed-operand-copy-floor-with-a-tma-loaded-epilogue-input-several-tiles-per-cta)).
+4. **Under budget pressure, staging can alias operand rings;** innermost operand buffers are never aliased (`findReuseCandidate`).
+
+**Closed-form operand depth.**
+`d_fit = min(num_stages, floor((232448 - aux - S_stg) / slot))`
+- `slot = (BM + BN') * BK * in_bytes`, `BN' = BN/2` under 2-CTA; add `BN * BK * in_bytes` for a multi-consumer B ([tma_loads.md](tma_loads.md#mechanism)) and one landing buffer per TMA side input (`epilogue_prologue_tma_loads.md`).
+- `S_stg = BM * (BN/ES) * out_bytes * staging copies` (one copy when `ES=1` or 2-CTA); since staging is raised first, an uncapped staging ring reduces operand depth.
+- `aux` = `estimateAuxiliarySmemBytes` (barriers, captures, tensor maps, op scratch); kernel-dependent.
+- `d_fit` is the balanced A/B depth; Phase 4 may give the first-used operand one more copy (worked example).
 
 ## TMEM
 
 Mechanics: [TMEMAllocationHeuristics.md, "TMEM Allocation Overview"](../TMEMAllocationHeuristics.md#tmem-allocation-overview) and [MemoryPlannerSearch.md, "2. Mental model"](../MemoryPlannerSearch.md#2-mental-model).
 
 Accumulator copies (`WS/WSMemoryPlanner.cpp`, the "TMEM multi-buffering post-processing" step at the end of the heuristic TMEM allocator's `run`):
-- After placement, the heuristic TMEM planner raises `buffer.copy` round-robin on every loop-carried MMA accumulator. A per-iteration accumulator overwritten by a `tmem_store` at the top of the body also counts as loop-carried.
-- It stops when the next copy would pass 512 columns minus the columns reserved for scaled-MMA scales.
-- No user knob bounds this; `num_stages` does not either.
-- A kernel whose total TMEM exceeds 512 columns is not rejected at compile time: it raises `OutOfResources("tensor memory")` when it is loaded (`python/triton/compiler/compiler.py`, `CompiledKernel._init_handles`).
+- After placement, `buffer.copy` is raised round-robin on every loop-carried MMA accumulator (including a per-iteration accumulator overwritten by a `tmem_store` at the top of the body), until the next copy would pass 512 columns minus the columns reserved for scaled-MMA scales.
+- No user knob bounds this, `num_stages` included.
+- Total TMEM above 512 columns is not rejected at compile time: it raises `OutOfResources("tensor memory")` at load (`python/triton/compiler/compiler.py`, `CompiledKernel._init_handles`).
 
 Columns per accumulator copy (fp32) = `BLOCK_N × ceil(BLOCK_M / 128)`:
-- Instruction M is 128 whenever `BLOCK_M` >= 128 (and 64 below that), instruction N is `min(BLOCK_N, 256)` and instruction K is 256 / operand bit width (`lib/Dialect/TritonGPU/Transforms/Utility.cpp`, `mmaVersionToInstrShape`). TMEM has 128 lanes.
-- So `BLOCK_M=128` gives 4 copies at `BLOCK_N=128` and 2 copies at `BLOCK_N=256`.
-- `BLOCK_M=256, BLOCK_N=256` gives 1 copy, so tile i+1's mainloop cannot overlap tile i's epilogue.
+- TMEM has 128 lanes; instruction M is 128 whenever `BLOCK_M` >= 128 (64 below), N is `min(BLOCK_N, 256)`, K is 256 / operand bit width (`lib/Dialect/TritonGPU/Transforms/Utility.cpp`, `mmaVersionToInstrShape`).
+- `BLOCK_M=128`: 4 copies at `BLOCK_N=128`, 2 at `BLOCK_N=256`.
+- `BLOCK_M=256, BLOCK_N=256`: 1 copy, so tile i+1's mainloop cannot overlap tile i's epilogue.
 
 ## Registers and warps
 
 Mechanics: [default_partition_selection.md, "Hardware mechanism: the default partition is the register sink"](../../../../../../../../docs/design/modulo_schedule/default_partition_selection.md#hardware-mechanism-the-default-partition-is-the-register-sink) and [Overview.md, "Register Budgets"](../Overview.md#register-budgets).
 
 Facts:
-1. **Starting warp counts.** The default region gets `num_warps`. Every other partition is created with `num_warps` too (`WS/WSSpecialize.cpp`, construction of the `ttg.warp_specialize` op).
-2. **Shrinking (`optimizePartitionNumWarps`).** Partitions without tensors drop to 1 warp. Partitions holding TMEM loads, stores or allocs stay at 4 or more (`getMinWarpsForOp`). Other tensor partitions halve while twice their largest single tensor still fits the even per-thread register share.
-3. **Padding (`padToMaxWarpGroups`, `AllocateWarpGroups.cpp`).** Worker warps are padded to whole warp groups:
+1. **Starting warp counts:** the default region and every other partition start at `num_warps` (`WS/WSSpecialize.cpp`, construction of the `ttg.warp_specialize` op).
+2. **Shrinking (`optimizePartitionNumWarps`):** no tensors → 1 warp; TMEM loads, stores or allocs → stays >= 4 (`getMinWarpsForOp`); other tensor partitions halve while twice their largest single tensor fits the even per-thread register share.
+3. **Padding (`padToMaxWarpGroups`, `AllocateWarpGroups.cpp`):** worker warps are padded to whole warp groups:
    - total launched warps = `num_warps` + 4 × ceil(worker warps / 4) (`ttg.total-num-warps`);
    - base `maxnreg` = 65,536 / total warps / 32, rounded down to a multiple of 8;
-   - non-tensor partitions request `minRegAutoWS` (default 24), and tensor partitions share the rest;
+   - non-tensor partitions request `minRegAutoWS` (default 24); tensor partitions share the rest;
    - if those requests do not fit, the register split is silently skipped.
 
 ## Never try (any problem)
@@ -76,20 +82,6 @@ Facts:
 | `minRegAutoWS` / `maxRegAutoWS` not a multiple of 8 | compile error | Register requests are emitted per warp group in steps of 8 | `third_party/nvidia/backend/compiler.py`, `_check_reg_auto_ws_alignment` |
 | `TRITON_WS_SMEM_PLAN_SEARCH=1` with no K loop (K == BLOCK_K as a compile-time constant) and more tiles than SMs | wrong answer (reproduced) | Plan search pins every TMEM accumulator to one copy, bypassing the per-iteration accumulator multi-buffering. See [hazards.md](hazards.md#plan-search-pins-tmem-accumulator-copies-to-1) | `WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch` |
 | `num_stages` < 1 | compile error | "nvgpu-warp-specialization requires num-stages >= 1" | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnOperation` |
-
-## When to try it (depends on the problem)
-
-Closed-form operand depth (used by every feature file):
-`d_fit = min(num_stages, floor((232448 - 4096 - S_stg) / slot))`
-  - `slot = (BM + BN') * BK * in_bytes`, `BN' = BN/2` under 2-CTA; add `BN * BK * in_bytes` for a multi-consumer B ([tma_loads.md](tma_loads.md#mechanism)) and one landing buffer per TMA side input (`epilogue_prologue_tma_loads.md`).
-  - `S_stg = BM * (BN/ES) * out_bytes * staging copies` (one copy when `ES=1` or 2-CTA).
-  - 4096 B bounds the auxiliary reservation (`estimateAuxiliarySmemBytes`); the measured reservation for a GEMM is about 0.7 KB, so `d_fit + 1` is often the real depth (see [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem)). `d_fit` is the balanced A/B depth: Phase 4 may give the first-used operand one more copy (worked example).
-
-- **IF** output staging is single-copy (`ES=1` or `two_ctas`), **THEN** keep only `num_stages <= d_fit + 1`, **BECAUSE** above it the operand plan is the same; only barrier bytes and the loop schedule differ. With `ES >= 2`, `num_stages` also sets staging copies, so the plans differ (worked example). [mechanism]
-- **IF** `BN * ceil(BM/128) > 256` (fp32 accumulator, e.g. 256x256 at 1-CTA), **THEN** the accumulator gets one copy (`floor(512 / cols)`): expect no epilogue/mainloop overlap across tiles and add no TMEM-resident loop state. 128x128 gets 4 copies, 128x256 gets 2. [mechanism]
-- **IF** a worker partition pushes worker warps past a multiple of 4, **THEN** count the register cost as in [warps_and_registers.md](warps_and_registers.md#when-to-try-it-depends-on-the-problem). [mechanism]
-
-Staging copies are raised before operand copies, so an uncapped staging ring can starve B: the measured cap rule is in [epilogue.md](epilogue.md#when-to-try-it-depends-on-the-problem).
 
 ## Worked example (bf16 in and out, fp32 accumulator, 1-CTA)
 
@@ -132,11 +124,11 @@ Phase 4 keeps raising any buffer that still fits, so the result is A=2 / B=2 whe
 **Warps (illustrative):** worker partitions totalling 3 warps are padded to 4. That gives 8 warps in all and a base `maxnreg` of 256.
 
 
-**Applying `d_fit`.**
+**Applying `d_fit`** (with `aux` = 4 KiB).
 
-- 128x256x64, `ES=1`, 1-CTA: `S_stg` 65,536, slot 49,152 -> `d_fit = floor(162,816 / 49,152) = 3`. `num_stages` 5 and 6 are duplicates of 4.
+- 128x256x64, `ES=1`, 1-CTA: `S_stg` 65,536, slot 49,152 -> `d_fit = floor(162,816 / 49,152) = 3`. `num_stages` above the fit adds no operand copies.
 - 128x256x64, `ES=2`, separate store, `num_stages=4` (the config above): staging 4 x 32,768 -> `floor(97,280 / 49,152) = 1` balanced level; Phase 4 then adds A copies (A=3 / B=1 at a 4 KiB auxiliary bound, as in the table).
-- 128x256x128, `ES=2`: 1-CTA slot 98,304 -> `d_fit` 1; 2-CTA slot 65,536 -> `d_fit` 2. This is the case where [2cta.md](2cta.md#when-to-try-it-depends-on-the-problem) keeps only the 2-CTA variant.
+- 128x256x128, `ES=2`: 1-CTA slot 98,304 -> `d_fit` 1; 2-CTA slot 65,536 -> `d_fit` 2. Only the 2-CTA variant double-buffers the operand ring here ([2cta.md](2cta.md#mechanism)).
 
 ## Interactions
 
