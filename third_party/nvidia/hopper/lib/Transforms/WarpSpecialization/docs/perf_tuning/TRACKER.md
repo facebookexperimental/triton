@@ -18,7 +18,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | File | State | Note |
 |------|-------|------|
 | [`tiles_and_stages.md`](tiles_and_stages.md) | done | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages`. Open: its "Not yet established" items (how `BLOCK_M=32` fails under autoWS; extra stages at one or two K tiles; 2-CTA stage counts; asymmetric A/B depth; tile size vs ring depth). |
-| `warps_and_registers.md` | todo | `num_warps` and the AutoWS register budgets. |
+| [`warps_and_registers.md`](warps_and_registers.md) | done | `num_warps` and the AutoWS register budgets. Open: its "Not yet established" items (`num_warps=8` with `data_partition_factor=2` vs the 16-warp estimate; 4 vs 8 warps by kernel; actual partition register budgets; 8-warp mbarrier arrive cost). |
 | `epilogue.md` | todo | Epilogue subtiling, separate epilogue store, store placement. |
 | `2cta.md` | todo | 1-CTA vs 2-CTA (`two_ctas`). |
 | `data_partitioning.md` | todo | `data_partition_factor`. |
