@@ -33,7 +33,7 @@ Mechanics (link, don't repeat):
 Facts these rules depend on, all in `WS/WSMemoryPlanner.cpp`, `allocateSmemBuffers`:
 1. **Staging comes first.** TMA output staging is reserved before the operand rings: `increaseFusedEpilogueCopies` runs before the Phase 4 operand copy increase.
 2. **The operand depth cap is `num_stages`.** Phase 4 raises the innermost operand buffers, in the order they are first used, one level at a time. It stops when nothing fits or the level would pass `num_stages`. It never uses free SMEM beyond `num_stages`.
-3. **The cross-stage floor is never dropped.** A plan that still exceeds the budget after the discretionary reuse step only produces the warning "exceeding configured smem-budget". The hardware check at launch is the backstop. The copy-safety floor (dp > 1) is different: it is given back one copy at a time when it does not fit (`relaxCopySafetyFloorToBudget`). A relaxed floor combined with a TMA-loaded epilogue input hangs when a CTA processes several tiles (reproduced; `hazards.md`).
+3. **The cross-stage floor is never dropped.** A plan that still exceeds the budget after the discretionary reuse step only produces the warning "exceeding configured smem-budget". The hardware check at launch is the backstop. The copy-safety floor (dp > 1) is different: it is given back one copy at a time when it does not fit (`relaxCopySafetyFloorToBudget`). A relaxed floor combined with a TMA-loaded epilogue input hangs when a CTA processes several tiles (reproduced; [hazards.md](hazards.md#relaxed-operand-copy-floor-with-a-tma-loaded-epilogue-input-several-tiles-per-cta)).
 4. **Under budget pressure, staging can alias operand rings.** Innermost operand buffers are never aliased (`findReuseCandidate`).
 
 ## TMEM
@@ -74,7 +74,7 @@ Facts:
 | `num_warps` not 4 or 8 | silently ignored | `supportMMA` for MMAv5 accepts only 4 or 8 warps, so there is no tcgen05 and no gemm partition | `lib/Analysis/Utility.cpp`, `supportMMA`; `lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, `getMMAVersionSafe` |
 | WS warp estimate > 16 | silently ignored | All WS metadata is removed. Estimate = `num_warps` + Σ per-partition minimum warps (TMEM ops count as 4, gather/scatter as 2; `getMinWarpsForOp`). Under `two_ctas` this hangs instead (see `2cta.md`) | `WS/PartitionSchedulingMeta.cpp`, "Warp budget exceeded. Skipping warp specialization." |
 | `minRegAutoWS` / `maxRegAutoWS` not a multiple of 8 | compile error | Register requests are emitted per warp group in steps of 8 | `third_party/nvidia/backend/compiler.py`, `_check_reg_auto_ws_alignment` |
-| `TRITON_WS_SMEM_PLAN_SEARCH=1` with no K loop (K == BLOCK_K as a compile-time constant) and more tiles than SMs | wrong answer (reproduced) | Plan search pins every TMEM accumulator to one copy, bypassing the per-iteration accumulator multi-buffering. See `hazards.md` | `WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch` |
+| `TRITON_WS_SMEM_PLAN_SEARCH=1` with no K loop (K == BLOCK_K as a compile-time constant) and more tiles than SMs | wrong answer (reproduced) | Plan search pins every TMEM accumulator to one copy, bypassing the per-iteration accumulator multi-buffering. See [hazards.md](hazards.md#plan-search-pins-tmem-accumulator-copies-to-1) | `WS/WSMemoryPlanner.cpp`, `allocateTmemBuffersViaSearch` |
 | `num_stages` < 1 | compile error | "nvgpu-warp-specialization requires num-stages >= 1" | `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp`, `runOnOperation` |
 
 ## When to try it (depends on the problem)
@@ -148,7 +148,7 @@ See [interactions.md](interactions.md). Pairs where these limits decide the outc
 
 ## Hazards
 
-None in `hazards.md`.
+None in [hazards.md](hazards.md).
 
 ## Not yet established
 
