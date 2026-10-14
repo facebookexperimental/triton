@@ -81,6 +81,10 @@ Relay partitions contain no register-resident tensors, so they use the same
 `minRegAutoWS` budget as other non-tensor partitions. A separate relay-specific
 tuning knob can be added if future performance measurements justify one.
 
+How these knobs and the `maxnreg` compile option turn into per-partition
+`setmaxnreg` values, and when that allocation silently does not happen, is
+described in [Register Budgets](RegisterBudgets.md).
+
 ## Persistent loops (`scf.for` and `scf.while`)
 
 A static-persistent kernel's outer (tile) loop may be either an `scf.for` or an
@@ -167,6 +171,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [Code Specialization](CodeSpecialization.md) — how ops are cloned into WarpSpecializeOp regions
 - [Partition Loop Peeling](PartitionLoopPeeling.md) — masked-prefix control-flow peeling after physical specialization
 - [Memory Lowering](MemoryLowering.md) — async copy creation and TMA store lowering
+- [Register Budgets](RegisterBudgets.md) — `minRegAutoWS` / `maxRegAutoWS` / `maxnreg` → per-partition `setmaxnreg`
 - [Auto-TMA Promotion](AutoTMAPromotion.md) — `auto_tma`: TTIR rewrite of pointer loads/stores into TMA descriptor ops before AutoWS
 - [Token & Barrier Lowering](TokenBarrierLowering.md) — lowering abstract tokens to hardware mbarriers
 - [Buffer Allocation](BufferAllocation.md) — channel discovery and SMEM/TMEM allocation hoisting
