@@ -27,33 +27,20 @@ The MMA operands themselves are covered in [tma_loads.md](tma_loads.md). The out
 ## Mechanism
 
 **Every TMA side input is staged through SMEM.**
-- **What changes:** each `desc.load` of a side input becomes an `nvws.descriptor_load` into its own descriptor-layout SMEM buffer. Its register consumers read that buffer with a `local_load` tagged with the consumer partitions, and the buffer itself serves as the cross-partition channel.
-  - The planner counts every such buffer against the SMEM budget and may give it several copies.
-  - A pointer `tl.load` of the same input, issued in the partition that uses it, takes no planner SMEM.
-- **What it relieves:** the load is issued asynchronously by the producer partition, off the epilogue's critical path.
-- **What it costs:**
-  - N side inputs cost N landing buffers x copies x the box size;
-  - every release is a partition-wide barrier ([tma_loads.md](tma_loads.md#mechanism));
-  - an unreproduced code-inspection hazard: the release back to the TMA producer emits no proxy fence ([hazards.md](hazards.md#tma-tile-read-into-registers-released-without-a-proxy-fence)).
+- **What changes:** each side-input `desc.load` becomes an `nvws.descriptor_load` into its own descriptor-layout SMEM buffer, which is also the cross-partition channel; register consumers read it with a `local_load` tagged with the consumer partitions. The planner counts each such buffer against the SMEM budget and may give it several copies. A pointer `tl.load` of the same input, issued in the partition that uses it, takes no planner SMEM.
+- **What it relieves:** the producer partition issues the load asynchronously, off the epilogue's critical path.
+- **What it costs:** N side inputs cost N landing buffers x copies x the box size; every release is a partition-wide barrier ([tma_loads.md](tma_loads.md#mechanism)); an unreproduced code-inspection hazard: the release back to the TMA producer emits no proxy fence ([hazards.md](hazards.md#tma-tile-read-into-registers-released-without-a-proxy-fence)).
 - Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS` (register-consumed path).
 
 **A cast prologue keeps WS; on B it doubles the operand's SMEM.**
-- **What changes:** an operand loaded wide (e.g. fp32) and cast for the MMA is register-consumed, so it gets a wide landing buffer. The narrow copy for the MMA goes to TMEM for A on sm100 (`PromoteLHSToTMem.cpp`, `LHSToTMem`), and to a second, register-written SMEM buffer for B (or for A when promotion is blocked).
-- **What it costs:** for B, SMEM per stage is `BLOCK_N x BLOCK_K x (wide + narrow element size)`, which shrinks the legal stage or tile set. Under 2-CTA a B prologue is a wrong answer (see "Never try (any problem)").
-- An MMA that consumes the wide type directly (e.g. TF32) needs only the landing buffer.
+- **What changes:** an operand loaded wide (e.g. fp32) and cast for the MMA is register-consumed, so it gets a wide landing buffer. The narrow MMA copy goes to TMEM for A on sm100 (`PromoteLHSToTMem.cpp`, `LHSToTMem`), or to a second, register-written SMEM buffer for B (or for A when promotion is blocked). An MMA that consumes the wide type directly (e.g. TF32) needs only the landing buffer.
+- **What it costs:** for B, SMEM per stage is `BLOCK_N x BLOCK_K x (wide + narrow element size)`, shrinking the legal stage or tile set. Under 2-CTA a B prologue is a wrong answer (see "Never try (any problem)").
 - Code: `WSLowerMem.cpp`, `doConvertDescriptorLoadsToNVWS`; `WSCodePartition.cpp`, `isChannelAnchorOp`.
 
 **A pad prologue is exact.**
-- **What changes:** with `padding="zero"`, TMA returns zeros past the descriptor's global extent. Zero-padding M or K can therefore be expressed by setting the descriptor shape to the unpadded extent, with no pad kernel and no extra buffer.
-- **What it costs:** nothing beyond the normal operand load.
-- **Limit:** this only replaces a pad. A prologue that computes anything else still needs a register path.
+- **What changes:** with `padding="zero"`, TMA returns zeros past the descriptor's global extent, so zero-padding M or K is expressed by setting the descriptor shape to the unpadded extent: no pad kernel, no extra buffer.
+- **What it costs:** nothing beyond the normal operand load. **Limit:** only replaces a pad; a prologue that computes anything else still needs a register path.
 - Code: `python/triton/tools/tensor_descriptor.py`, `TensorDescriptor`.
-
-## When to try it (depends on the problem)
-
-- IF the kernel reads a TMA-loaded side input in registers, THEN prefer a pointer `tl.load` for that input, BECAUSE the TMA form's release emits no proxy fence (`processConsumerReleaseOp`; code inspection, not reproduced). [code]
-- IF judging SMEM fit with N TMA side inputs, THEN add `sum_i box_bytes_i * copies_i` to the staging term of the operand-depth fit ([tiles_and_stages.md](tiles_and_stages.md#mechanism), "Resulting operand depth"), with copies up to `num_stages`, BECAUSE the planner allocates and may multi-buffer one landing buffer per input (`doConvertDescriptorLoadsToNVWS`). [mechanism]
-- IF a prologue is a pure zero pad of M or K, THEN prefer setting the descriptor extent to the unpadded size, BECAUSE `padding="zero"` makes the out-of-bounds reads exact and the pad kernel and its buffer disappear. [mechanism]
 
 ## Interactions
 
