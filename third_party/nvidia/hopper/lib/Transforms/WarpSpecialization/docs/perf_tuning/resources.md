@@ -123,7 +123,7 @@ The result is A=2 / B=2, or A=2 / B=1 if the auxiliary estimate is larger.
 
 ## Interactions
 
-Rows to add to `interactions.md` (not written yet; see [TRACKER.md](TRACKER.md)). Pairs where these limits decide the outcome:
+See [interactions.md](interactions.md). Pairs where these limits decide the outcome:
 - staging copies × `num_stages`
 - `EPILOGUE_SUBTILE` × staging copies
 - `BLOCK_M`/`BLOCK_N` × accumulator copies
@@ -133,7 +133,7 @@ Rows to add to `interactions.md` (not written yet; see [TRACKER.md](TRACKER.md))
 
 ## Hazards
 
-Entry for `hazards.md` (not written yet; see [TRACKER.md](TRACKER.md)): planner aliasing of staging onto operand rings under budget pressure (`findReuseCandidate`).
+None in `hazards.md`.
 
 ## Not yet established
 
