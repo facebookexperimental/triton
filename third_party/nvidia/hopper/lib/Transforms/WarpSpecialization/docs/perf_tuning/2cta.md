@@ -65,9 +65,13 @@ So 2-CTA lets a wide logical tile (e.g. `BLOCK_N=256`), or a deeper operand ring
 
 ## When to try it (depends on the problem)
 
+`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
+
 - IF `d_fit(1-CTA) < 2 <= d_fit(2-CTA)` for a tile, THEN only try that tile as 2-CTA, BECAUSE halving the B slot is what lets the operand ring double-buffer (e.g. 128x256x128 bf16, ES=2: `d_fit` 1 vs 2). [mechanism] (`transformBLoad` half-width B; operand-depth fit)
 - IF `AI_min >= ridge` (compute bound), THEN rank 2-CTA 128x256 above 1-CTA 128x256 / 256x128, BECAUSE each CTA fills only half of B per stage (`I_t` 128 vs 85). [mechanism]
 - IF `ceil(M/BM)` is odd under 2-CTA static persistence, THEN use `T = 2*ceil(ceil(M/BM)/2) * ceil(N/BN)` in every wave and tail rule, BECAUSE the padded M tile is launched and runs (TMA clips it). [mechanism] (pair-aligned schedule, Never-try "wrong answer" row)
+- **IF** 2-CTA is legal for the kernel (TMA store, pair-aligned schedule) and the problem is compute bound, **THEN** skip 1-CTA `BLOCK_N=256`, **BECAUSE** each CTA fills only half of B per stage and the 1-CTA tile loses ring depth. [measured: --regime 2cta, loses on every shape in the regime]
+- **IF** `BLOCK_N=256`, **THEN** prefer 2-CTA at every `T`, including `T < P/2`; **IF** `BLOCK_N=128` and `T(1-CTA) >= 900`, **THEN** prefer 1-CTA, **BECAUSE** the per-MMA rendezvous only outweighs the halved B fill once there are many waves. [measured: --regime 2cta, wins on a majority of shapes]
 
 ## Interactions
 
