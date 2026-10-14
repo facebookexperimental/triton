@@ -128,7 +128,6 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 
 Tracked in [TRACKER.md](TRACKER.md).
 
-- `two_ctas` × `smem_alloc_algo=0`: the one-copy staging pin is only on the default allocator path (not reproduced in testing: staging stayed one copy).
 - dp=2 × `BLOCK_M=64`, `BLOCK_N=256` (N split): correctness not run.
 - dp=2 × generated subtiled region × per-slice scaling: hang observed.
 - CLC / dynamic `while` × `merge_*`, SMEM/TMEM allocation options, register budgets, pingpong: no end-to-end contract.
