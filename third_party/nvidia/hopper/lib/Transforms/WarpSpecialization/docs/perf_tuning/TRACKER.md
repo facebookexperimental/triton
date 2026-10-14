@@ -29,7 +29,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | [`pingpong.md`](pingpong.md) | done | Ping-pong scheduling. Open: its "Not yet established" items. |
 | [`multicast.md`](multicast.md) | done | TMA multicast. Open: its "Not yet established" items. |
 | [`epilogue_prologue_tma_loads.md`](epilogue_prologue_tma_loads.md) | done | TMA loads of extra epilogue/prologue inputs. Open: its "Not yet established" items. |
-| `fused_reductions.md` | todo | Reductions fused into the epilogue. |
+| [`fused_reductions.md`](fused_reductions.md) | done | Reductions fused into the epilogue. Open: its "Not yet established" items. |
 
 ## Docs for undocumented knobs
 
