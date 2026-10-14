@@ -3,8 +3,9 @@
 ## Purpose
 
 This folder is context for pruning the AutoWS config space. Given one GEMM
-problem on B200, it should let an agent or a human cut the config space down to
-2-3 structurally distinct candidate configs. Candidates differ in structure
+problem on B200, it should let an agent or a human prune every config
+combination that is infeasible or inadvisable for that problem, so that only
+the configs worth trying remain. The remaining candidates differ in structure
 (tile shape, 1-CTA vs 2-CTA, pipeline depth), not only in flat knob values.
 
 These docs say **when** to use which knob values. They do not explain what a
@@ -45,31 +46,34 @@ Each step narrows the candidate set. Later PRs fill in one branch each; see
      pipeline ever reaches steady state;
    - arithmetic intensity `2*M*N*K / bytes(A, B, C)`: memory bound or compute
      bound.
-3. **Hard prunes.** Drop configs that give a compile error, are silently
-   ignored, are a duplicate config, hang, or give a wrong answer.
+3. **Never try (any problem).** Drop configs that give a compile error, are
+   silently ignored, are a duplicate config, hang, or give a wrong answer.
 4. **Resource limits.** Drop configs whose SMEM, TMEM or register demand does
    not fit.
 5. **Feature branches.** One branch per feature (tiles and stages, 2-CTA, data
    partitioning, epilogue subtiling, TMA loads/stores, persistence, ...).
 6. **Fusion branches.** What the epilogue or prologue fusion adds or rules out.
-7. **Leaves.** 2-3 structurally distinct AutoWS candidate configs.
+7. **Leaves.** The AutoWS configs that survive every step above, grouped by
+   structure.
 
 ## Rule format
 
 Every rule is one of two kinds.
 
-- **Hard prune.** The config gives a compile error, is silently ignored, is a
-  duplicate config, hangs, gives a wrong answer, or requires another knob
-  value. State the condition and the code that enforces or exhibits it.
-- **Mechanism.** State what the knob changes, what that relieves, what it
-  costs, and the pruning that follows.
+- **Never try (any problem).** The config gives a compile error, is silently
+  ignored, is a duplicate config, hangs, gives a wrong answer, or requires
+  another knob value, whatever the problem. State the condition and the code
+  that enforces or exhibits it.
+- **When to try it (depends on the problem).** Derived from the mechanism:
+  state what the knob changes, what that relieves and what it costs, and the
+  problems for which that makes it worth trying or not.
 
 ```
 ### <short rule name>
-- Kind: hard prune | mechanism
+- Kind: never try | when to try it
 - When: <condition on the problem description or derived quantities>
 - Rule: <keep / drop / prefer which knob values>
-- Why: <hard prune: what goes wrong. Mechanism: changes -> relieves -> costs -> prune>
+- Why: <never try: what goes wrong. When to try it: changes -> relieves -> costs>
 - Code: <file + symbol>; Doc: <file + section heading>
 ```
 
@@ -80,13 +84,14 @@ Every feature file has the same sections, in this order.
 1. **Title and scope.** One paragraph.
 2. **Knobs.** Table: knob | how it is set | one line | link to the existing
    doc section.
-3. **Hard prunes.** Table: condition | status | why (one line) | code ref
-   (file + symbol). Status is one of "compile error", "silently ignored",
-   "duplicate config", "hangs", "wrong answer" or "requires" (needs another
-   knob value).
+3. **Never try (any problem).** Table: condition | status | why (one line) |
+   code ref (file + symbol). Status is one of "compile error", "silently
+   ignored", "duplicate config", "hangs", "wrong answer" or "requires" (needs
+   another knob value). "(reproduced)" after a status means it was also
+   confirmed by running the kernel.
 4. **Mechanism.** What the feature changes -> what it relieves -> what it
    costs, with code refs.
-5. **Pruning rules.** Derived from the mechanism, written as
+5. **When to try it (depends on the problem).** Derived from the mechanism, written as
    `IF <regime / other knobs> THEN skip | only try | prefer <values> BECAUSE
    <mechanism>`.
 6. **Interactions.** Links to rows in `interactions.md`.
