@@ -148,6 +148,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerTritonAMDGPUCoalesceAsyncCopy();
   mlir::registerTritonAMDGPUCoalesceBufferOps();
   mlir::registerTritonAMDGPUUpdateAsyncWaitCount();
+  mlir::registerTritonAMDGPUPreserveWarpPipelineOwners();
   mlir::registerTritonAMDGPUWarpPipeline();
   mlir::registerTritonAMDFoldTrueCmpI();
   mlir::registerTritonAMDGPUFpSanitizer();
