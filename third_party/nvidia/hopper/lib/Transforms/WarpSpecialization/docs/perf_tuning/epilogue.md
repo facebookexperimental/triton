@@ -15,7 +15,7 @@ Budget numbers are in [resources.md](resources.md). Code paths are relative to `
 | `generate_subtiled_region` / `TRITON_GENERATE_SUBTILED_REGION` | compile option / env | Represents the subtiled epilogue as a `SubtiledRegionOp` | [SubtileOperator.md, "Compiler Option"](../SubtileOperator.md#compiler-option) |
 | `separate_epilogue_store` | `tl.range(...)` kwarg | Moves TMA epilogue stores into their own one-warp partition | [PartitionSchedulingMeta.md, "Target Partition Layouts"](../PartitionSchedulingMeta.md#target-partition-layouts) |
 | `merge_epilogue`, `merge_epilogue_to_computation` | `tl.range(...)` kwargs | Route non-store epilogue ops into an existing partition instead of a separate epilogue partition | [PartitionSchedulingMeta.md, "Tuning Knobs"](../PartitionSchedulingMeta.md#tuning-knobs) |
-| `TRITON_WS_STAGING_COPIES` | env | Caps output-staging copies at min(`num_stages`, value) | [TMAStoreWaitPipeline.md, "Phase 3.7: Epilogue Group Copy Increase"](../TMAStoreWaitPipeline.md#phase-37-epilogue-group-copy-increase) |
+| `TRITON_WS_STAGING_COPIES` | env | Caps output-staging copies at min(`num_stages`, value). The same cap applies to other Phase 3.7 epilogue groups and, unless `TRITON_WS_TMA_REDUCE_STAGING_COPIES` is set, to TMA-reduce staging | [TMAStoreWaitPipeline.md, `TRITON_WS_STAGING_COPIES`](../TMAStoreWaitPipeline.md#triton_ws_staging_copies-capping-the-phase-37-target) |
 | `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | env | Copy target for TMA-reduce staging; may exceed `num_stages` | same |
 | `early_tma_store_lowering` | compile option (on unless set to `False`) | Lowers TMA stores to staging allocations before the WS planner runs | [TMAStoreWaitPipeline.md, "Memory Planner: `buffer.tmaStaging` Handling"](../TMAStoreWaitPipeline.md#memory-planner-buffertmastaging-handling) |
 | `tma_store_pipelining` | compile option (default on) | Annotates and reorders TMA store waits | [TMAStoreWaitPipeline.md, "Wait Annotation and Reordering Pipeline"](../TMAStoreWaitPipeline.md#wait-annotation-and-reordering-pipeline) |
@@ -77,7 +77,7 @@ Mechanics: [TMAStoreWaitPipeline.md, "`K | S` cap for same-partition (wait_group
 
 ## Interactions
 
-Rows to add to `interactions.md` (not written yet; see [TRACKER.md](TRACKER.md)). Pairs these rules depend on:
+See [interactions.md](interactions.md). Pairs these rules depend on:
 - `ES` × `separate_epilogue_store`
 - `ES` × staging copies
 - staging copies × `num_stages`
