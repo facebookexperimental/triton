@@ -47,7 +47,11 @@ Code paths are relative to `third_party/nvidia/hopper/lib/Transforms/WarpSpecial
 
 ## When to try it (depends on the problem)
 
-- IF `BLOCK_M=256` and `BLOCK_N=256`, THEN also keep a `BLOCK_N=128` candidate, BECAUSE accumulator copies are `floor(512 / (BLOCK_N * ceil(BLOCK_M/128)))`: 1 at 256x256 (epilogue of tile i cannot overlap the MMAs of tile i+1), 2 at 256x128. [mechanism] (TMEM `buffer.copy` post-processing, `tmemColLimit`)
+`MEASURED_ON`: fb-triton 3bb5d39370 with `python/test/microbenchmark/autows_gemm.py` as added in this stack; B200 SM clock locked at 900 MHz (direction checked at 1852 MHz).
+
+- **IF** `BLOCK_M=256`, dp=2, **THEN** skip `BLOCK_N=256` and keep `BLOCK_N=128`, **BECAUSE** 256x256 leaves one accumulator copy (`floor(512 / (BLOCK_N * ceil(BLOCK_M/128)))`), so the epilogue of tile i cannot overlap the MMAs of tile i+1; the gap grows with K. [measured: --regime dp_k, loses on every shape in the regime]
+- **IF** `BLOCK_M=256` 1-CTA, **THEN** skip dp=1, **BECAUSE** dp=1 puts all 256 rows in one epilogue live set. [measured: --regime dp, loses on every shape in the regime]
+- **IF** 2-CTA is legal for the kernel, **THEN** skip 1-CTA `BLOCK_M=256` (dp=1 and dp=2) in favour of 2-CTA 128-row tiles, **BECAUSE** 2-CTA halves the B fill per CTA without a 256-row epilogue. [measured: --regime dp, loses on every shape in the regime]
 
 ## Interactions
 
