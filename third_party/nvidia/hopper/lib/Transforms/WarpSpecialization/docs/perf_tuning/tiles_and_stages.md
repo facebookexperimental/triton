@@ -65,15 +65,25 @@ Mechanics: [SmemAllocationDesign.md, "Phase 4: Iterative Copy Increase"](../Smem
 - Correctness floors (cross-stage depth, copy-safety floor) can force copies above `num_stages`.
 - In particular, under `data_partition_factor` > 1 with `disallow_acc_multi_buffer`, every TMA operand of the MMA is floored at `num_stages` (`getStaticSmemCopySafetyFloor`).
 - That copy-safety floor is given back when it does not fit (`relaxCopySafetyFloorToBudget`). The cross-stage floor is never given back.
+- Asymmetric A/B depths beyond ±1 at equal slot sizes need annotated channel copies (`tl.dot(attrs={"channels": ...})`), never below the cross-stage depth: the unannotated planner raises A and B in lockstep.
 
 ## When to try it (depends on the problem)
 
-- **IF** `BLOCK_M` < 64, or `BLOCK_N` is not a power of 2, or `BLOCK_K` < 256/bits, **THEN** skip, **BECAUSE** no tcgen05 MMA is generated.
-- **IF** `BLOCK_M=128` and `data_partition_factor=2`, **THEN** skip, **BECAUSE** it is a duplicate config of dp=1.
-- **IF** `BLOCK_M=64` and `data_partition_factor=2`, **THEN** only try `BLOCK_N=256`, **BECAUSE** every other `BLOCK_N` fails to compile.
-- **IF** two configs differ only in `num_stages`, both are at or above the operand depth that fits, and output staging is single-copy (`EPILOGUE_SUBTILE=1` or `two_ctas`), **THEN** keep the smaller (this removes the larger), **BECAUSE** the operand plan is the same; only the barrier reservation and the loop schedule differ. With `EPILOGUE_SUBTILE` >= 2, a larger `num_stages` deepens staging (Phase 3.7, `increaseFusedEpilogueCopies`) and makes the operand ring shallower, so it is a different config.
-- **IF** the goal is a deeper operand ring at a fixed tile, **THEN** lower staging copies first (`TRITON_WS_STAGING_COPIES`, or `EPILOGUE_SUBTILE` with a same-partition store), **BECAUSE** staging is reserved before operands under the same cap.
-- **IF** you want asymmetric A/B depths beyond ±1 at equal slot sizes, **THEN** annotate the channel copies, and never below the cross-stage depth, **BECAUSE** the unannotated planner raises A and B in lockstep.
+Quantities (`T`, `W`, `E_tail`, `S_prog`, `k_iters`, `w`, `AI_min`, `I_t`, `d_fit`) are defined in [README.md](README.md#decision-tree-skeleton) step 2; `d_fit` is the closed form in [resources.md](resources.md#when-to-try-it-depends-on-the-problem). `P` = 148.
+
+**Tile shape**
+- **IF** `AI_min >= ridge`, **THEN** prefer tiles in decreasing `I_t = BM*BN/(BM + BN')` (`BN' = BN/2` under 2-CTA): 2-CTA 128x256 and 1-CTA 256x256 dp=2 (128) > 128x256, 256x128, 2-CTA 128x128 (85) > 128x128 (64) > 64x256 (51) > 64x128 (43), **BECAUSE** operand SMEM fill per FLOP is `1/I_t` (slot sizes in "Mechanism"). [mechanism]
+- **IF** a tile has `E_tail < 0.8`, **THEN** also try the legal tile with the smallest `S_prog = ceil(T/P)*BM*BN`, **BECAUSE** the busiest program sets the time under static persistence (1152x12800: 128x256 `E_tail` 0.76, `S_prog` 128k; 128x128 112k). [mechanism]
+- **IF** `w(BM=128) >= 0.15` and `w(BM=64) < w(BM=128)` (M=192: 0.25 vs 0; M=320: 0.17 vs 0), **THEN** try BM=64, **BECAUSE** padded M rows cost full MMA work. [mechanism]
+
+**BLOCK_K**
+- **IF** `K <= 128` (bf16), **THEN** only try `BK = max(16, next_pow2(K))`, **BECAUSE** a larger BK pays SMEM, TMA bytes and MMA work on zero-filled columns at every stage (dominance). [mechanism]
+
+**num_stages**
+- **IF** `T <= P`, **THEN** skip `num_stages > max(k_iters, staging copies)`, **BECAUSE** with no next tile the producer cannot run ahead past this tile's K steps, so the extra slots are unused SMEM (dominance). Example: 1024x1024x256, 128x128x64: `T` 64, `k_iters` 4, so `num_stages <= 4`. [mechanism]
+- **IF** output staging is single-copy (`ES=1` or `two_ctas`), **THEN** only try `num_stages <= d_fit + 1`, **BECAUSE** above `d_fit` the planner allocates the same operand plan ([resources.md](resources.md#when-to-try-it-depends-on-the-problem)). [mechanism]
+- **IF** `k_iters >= 2` or `T > P`, **THEN** prefer `num_stages >= 2`, **BECAUSE** one slot serializes load(k+1) behind MMA(k)'s release. [mechanism]
+- **IF** a deeper operand ring is wanted at a fixed tile, **THEN** free staging first: `c` fewer staging copies free `c*BM*(BN/ES)*out_bytes`, which buys `floor(that / slot_bytes)` operand levels (worked example in [resources.md](resources.md#worked-example-bf16-in-and-out-fp32-accumulator-1-cta)). [mechanism]
 
 ## Interactions
 
