@@ -100,7 +100,7 @@ read `allocation.reuseTarget` directly — it sees the staging alloc as
 a request for its own region. Realizing the reuse therefore requires
 an extra step in `doCodePartition` that rewrites the staging alloc
 into a reinterpret view of the host alloc (see
-[CodePartition: Realizing `allocation.reuseTarget`](#code-partition-realizing-allocationreuetarget)
+[CodePartition: Realizing `allocation.reuseTarget`](#code-partition-realizing-allocationreusetarget)
 below).
 
 ### Phase 3.7: Epilogue Group Copy Increase
@@ -172,6 +172,66 @@ wait_group ring the pass emits an `LDBG` warning rather than dropping below it.
 `max(size) × copies` per ID. For TMA store staging groups this matches the
 planner's reuse model, but the downstream physical allocation still leaves
 each staging alloc as a separate op.
+
+#### `TRITON_WS_STAGING_COPIES`: capping the Phase 3.7 target
+
+**Read by**: `getStagingCopiesCap` in `WSMemoryPlanner.cpp`, applied once at
+the top of `increaseFusedEpilogueCopies`.
+
+`TRITON_WS_STAGING_COPIES=K` lowers the copy target that Phase 3.7 bumps
+groups toward. Without it, the target is `numBuffers`, which is the
+`nvgpu-warp-specialization` pass option `num-stages`, i.e. the kernel's
+`num_stages` compile option. With it, the target is `min(num_stages, K)`.
+
+| Property | Behavior |
+|---|---|
+| How it is set | Process environment variable. There is no per-kernel or per-config equivalent; it applies to every kernel compiled while it is set. |
+| Legal values | A positive integer. The value is parsed with `std::atoi`, so unset, empty, `0`, negative, or non-numeric values all mean "no cap". |
+| Default | Unset (no cap). |
+| Cache key | Listed in `CACHE_INVALIDATING_ENV_VARS` (`include/triton/Tools/Sys/GetEnv.h`), so changing it produces a new compile. |
+| Resource | SMEM only. One copy of a group costs the group's largest member (`computeTotalSmem`); for a subtiled epilogue that is one subtile's staging buffer. |
+
+What the cap applies to:
+
+- **Every Phase 3.7 tier**, not only TMA store staging: `P2_InnerTMAStaging`,
+  `P3_OuterTMAStaging`, and `P4_Other` groups (for example epilogue-load
+  buffers merged by Phase 3.5).
+- **TMA-reduce staging by default.** The reduce target
+  (`tmaStaging == 2`) starts from the capped value. It is replaced by
+  `TRITON_WS_TMA_REDUCE_STAGING_COPIES` only when that variable is also set.
+
+How the applied depth is chosen: Phase 3.7 still walks `tryCopies` upward from
+the group's current copy count to the target. Within that walk the existing
+rules all still apply: it skips depths that violate `K | S` for same-partition
+staging, and it stops at the first depth that exceeds `smemBudget` or a Phase
+3.6 reuse host's capacity. The applied depth is the largest depth that walk
+accepts, so it can be below `K`.
+
+The cap only limits bumps. It never lowers a group below its current copy
+count or its cross-stage floor (`WSBuffer::minCopies`): if the floor is above
+`K`, the floor is kept. SMEM that the cap leaves unclaimed stays in the budget
+for the Phase 4 `P0`/`P1` operand copy increase, which runs after Phase 3.7.
+Downstream, the resulting `buffer.copy` becomes `can_rotate_by_buffer_count`
+in `doAnnotateTMAStoreWaits` (see [Step 1](#step-1-doannotatetmastorewaits)),
+so fewer copies means each TMA store wait is placed after fewer subsequent
+stores.
+
+Cases where the variable has no effect:
+
+- **2-CTA modules** (`ttng.two-ctas`): ordinary TMA store staging
+  (`tmaStaging == 1`) is held at one copy before the cap is consulted.
+- **Groups with fewer than two members**, for example a single unsubtiled
+  store. Phase 3.7 skips these entirely.
+- **`TRITON_WS_SMEM_PLAN_SEARCH`**, when `allocateSmemBuffersViaSearch` does not
+  fall back to the heuristic. That path pins staging blocks to their floor and
+  never calls `increaseFusedEpilogueCopies`. It falls back, and the cap applies
+  again, when any staging buffer has more than one TMA store user.
+- **`smem_alloc_algo = 0`**: the original `MemoryPlanner` does not read the
+  variable.
+
+Nothing reports that the cap changed a copy count. The decisions appear only in
+the `Phase 3.7` lines of `-debug-only=nvgpu-ws-memory-planner`, or in the
+`buffer.copy` attributes in the IR after the memory planner.
 
 ### Combined SMEM Cost
 

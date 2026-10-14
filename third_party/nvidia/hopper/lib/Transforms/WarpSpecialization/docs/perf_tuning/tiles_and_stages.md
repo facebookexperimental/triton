@@ -38,7 +38,7 @@ Budget numbers are in [resources.md](resources.md). Code paths are relative to `
 **What tile shape changes.** The three tile dimensions set:
 - the A slot (`BLOCK_M × BLOCK_K`) and the B slot (`BLOCK_N × BLOCK_K`), in the operand element type;
 - TMEM columns per accumulator copy (`BLOCK_N × ceil(BLOCK_M/128)` for fp32), and from that the number of accumulator copies (see [resources.md](resources.md));
-- the epilogue tile, in combination with `EPILOGUE_SUBTILE` (see `epilogue.md`, not written yet).
+- the epilogue tile, in combination with `EPILOGUE_SUBTILE` (see `epilogue.md`).
 
 SMEM is sized from these compile-time shapes alone (`WS/WSMemoryPlanner.cpp`, `getSmemAllocSizeBytes`). A smaller problem never makes a config fit.
 
@@ -74,7 +74,7 @@ Mechanics: [SmemAllocationDesign.md, "Phase 4: Iterative Copy Increase"](../Smem
 
 ## Interactions
 
-Rows to add to `interactions.md` (not written yet; see [TRACKER.md](TRACKER.md)). Pairs these rules depend on:
+See [interactions.md](interactions.md). Pairs these rules depend on:
 - `BLOCK_M` × `data_partition_factor`
 - `BLOCK_M` × `two_ctas`
 - `num_stages` × `TRITON_WS_STAGING_COPIES`
@@ -85,9 +85,7 @@ Rows to add to `interactions.md` (not written yet; see [TRACKER.md](TRACKER.md))
 
 ## Hazards
 
-Candidate entries for `hazards.md` (not written yet; see [TRACKER.md](TRACKER.md)):
-- small `K` relative to `num_stages` with a one-copy operand bridge;
-- planner aliasing under budget pressure.
+None in [hazards.md](hazards.md). Reported but not yet located in code (row in [TRACKER.md](TRACKER.md#reported-wrong-answers--hangs-needing-repro--code-root-cause)): single-copy register copy of a multi-consumer operand, with few K tiles.
 
 ## Not yet established
 
