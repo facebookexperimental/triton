@@ -966,6 +966,89 @@ def test_grouped_gemm_list_ragged_m(block_m, block_n, depth, staging, cross, k):
         torch.testing.assert_close(out.cpu(), packed[offsets[index]:offsets[index + 1]], atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("staging,cross", [(0, False), (0, True), (1, True)])
+def test_grouped_gemm_list_gfx950_metadata(staging, cross):
+    from triton.tlx.ops.kernels.grouped_gemm import gfx950
+
+    torch.manual_seed(456)
+    n, k = 256, 512
+    cpu_a = [torch.randn((m, k), dtype=torch.float16) for m in (256, 512, 256)]
+    cpu_b = [torch.randn((n, k), dtype=torch.float16) for _ in cpu_a]
+    group_a = [a.cuda() for a in cpu_a]
+    group_b = [b.cuda().T for b in cpu_b]
+    # Reuse the actual gfx950 builder's five device tables and outputs, with
+    # no gfx1250 metadata builder, prefix sum, repacking, or host N argument.
+    a_ptrs, b_ptrs, c_ptrs, sizes, lds, groups, _, outputs = gfx950._make_grouped_gemm_args(group_a, group_b)
+    _gfx1250_grouped.grouped_gemm_tdm_list_kernel[(2, )](a_ptrs, b_ptrs, c_ptrs, sizes, lds, groups, K=k,
+                                                         NUM_PROGRAMS=2, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128,
+                                                         GROUP_M=4, NUM_BUFFERS=2, L2_PREFETCH_DISTANCE=0,
+                                                         C_STAGING_MODE=staging, CROSS_TILE_PREFETCH=cross,
+                                                         XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, num_warps=4,
+                                                         waves_per_eu=1)
+    for output, a, b in zip(outputs, cpu_a, cpu_b):
+        torch.testing.assert_close(output.cpu(), (a.float() @ b.float().T).half(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("staging,cross", [(0, False), (0, True), (1, True)])
+def test_grouped_gemm_list_device_metadata_updates(staging, cross):
+    torch.manual_seed(789)
+    n, k, capacity = 256, 512, 512
+    # Force lookahead beyond its four-group window, including leading,
+    # interior and trailing empty groups. M changes without replacing any
+    # device table. Different strides also catch using the current group's
+    # strides for a prefetched group's descriptors.
+    shapes = [(0, 256, 0, 0, 0, 0, 512, 256, 0), (256, 0, 0, 0, 0, 256, 0, 0, 512)]
+    groups = len(shapes[0])
+    cpu_a, cpu_b, group_a, group_b, outputs = [], [], [], [], []
+    strides = []
+    for g in range(groups):
+        lda, ldb, ldc = k + 8 * g, k + 16 * g, n + 8 * g
+        a = torch.randn((capacity, lda), dtype=torch.float16)
+        b = torch.randn((n, ldb), dtype=torch.float16)
+        cpu_a.append(a[:, :k])
+        cpu_b.append(b[:, :k])
+        group_a.append(a.cuda())
+        group_b.append(b.cuda())
+        outputs.append(torch.empty((capacity, ldc), dtype=torch.float16, device="cuda"))
+        strides.append((lda, ldb, ldc))
+    ptrs = [
+        torch.tensor([x.data_ptr()
+                      for x in tensors], dtype=torch.int64, device="cuda")
+        for tensors in (group_a, group_b, outputs)
+    ]
+    sizes = torch.tensor([[m, n, k] for m in shapes[0]], dtype=torch.int32, device="cuda")
+    lds = torch.tensor(strides, dtype=torch.int32, device="cuda")
+
+    def launch():
+        return _gfx1250_grouped.grouped_gemm_tdm_list_kernel[(2, )](*ptrs, sizes, lds, groups, K=k, NUM_PROGRAMS=2,
+                                                                    BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4,
+                                                                    NUM_BUFFERS=2, L2_PREFETCH_DISTANCE=0,
+                                                                    C_STAGING_MODE=staging, CROSS_TILE_PREFETCH=cross,
+                                                                    XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2,
+                                                                    num_warps=4, waves_per_eu=1)
+
+    launch()  # Compile and initialize the launcher before checking allocations.
+    torch.cuda.synchronize()
+    for ms in shapes:
+        sizes.copy_(torch.tensor([[m, n, k] for m in ms], dtype=torch.int32))
+        for output in outputs:
+            output.fill_(float("nan"))
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        launch()
+        torch.cuda.synchronize()
+        assert torch.cuda.max_memory_allocated() == allocated
+        for m, output, a, b in zip(ms, outputs, cpu_a, cpu_b):
+            actual = output.cpu()
+            expected = (a[:m].float() @ b.float().T).half()
+            torch.testing.assert_close(actual[:m, :n], expected, atol=1e-2, rtol=1e-2)
+            assert torch.isnan(actual[m:]).all()
+            assert torch.isnan(actual[:m, n:]).all()
+
+
 @pytest.mark.parametrize("dimension", ["N", "K"])
 def test_grouped_gemm_list_rejects_ragged_nk(dimension):
     shapes = [(128, 256, 256), (256, 384 if dimension == "N" else 256, 384 if dimension == "K" else 256)]

@@ -42,8 +42,33 @@ kernel's tile-alignment and minimum-K restrictions still apply.
 
 The result is a list of row-major `[M_g, N]` tensors. An optional third
 argument, `group_c`, supplies output buffers. The wrapper uploads pointer
-tables and group offsets without copying the matrix data. It exposes the
-same tuning and benchmark arguments as `grouped_gemm_tdm`.
+tables and gfx950-style size/stride tables without copying the matrix data.
+It exposes the same tuning and benchmark arguments as `grouped_gemm_tdm`.
+
+The low-level `grouped_gemm_tdm_list_kernel` accepts the same six leading
+arguments as the gfx950 grouped GEMM kernel:
+
+```text
+group_a_ptrs, group_b_ptrs, group_c_ptrs: int64 [G]
+group_gemm_sizes: int32 [G, 3] containing M_g, N, K
+g_lds: int32 [G, 3] containing lda_g, ldb_g, ldc_g
+group_size: G
+```
+
+The metadata tables may also be flat, as in the gfx950 argument builder.
+Pass these buffers directly to the JIT kernel, followed by the gfx1250 tuning
+arguments and the common compile-time `K`. N is read from the size table.
+The caller must validate common N/K, full tiles, and the pipeline/cluster
+restrictions. The low-level kernel also supports padded leading strides
+divisible by 8, with 16-byte-aligned matrix base pointers; the list wrapper
+continues to require canonical strides.
+
+With prepared device tables and output buffers, the warmed-up kernel launch
+needs no new metadata allocation, prefix sum, descriptor buffer, host readback,
+or matrix repacking. M sizes and strides are read on device, including during
+cross-group prefetch. The convenience list wrapper still allocates/uploads
+metadata on each call and allocates outputs when `group_c` is omitted. Both
+eager and graph benchmark modes time only launches after this setup.
 
 `grouped_gemm_tdm_kernel` and `grouped_gemm_tdm_list_kernel` are separate
 JIT entry points. A shared implementation specializes group addressing

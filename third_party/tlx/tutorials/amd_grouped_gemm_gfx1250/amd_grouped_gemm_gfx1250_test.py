@@ -519,12 +519,15 @@ def _grouped_gemm_tdm_impl(
     CLUSTER_SIZE: tl.constexpr = 1,
     CLUSTER_MULTICAST: tl.constexpr = True,
     POINTER_TABLES: tl.constexpr = False,
+    group_lds=None,
 ):
     """Shared packed/list ragged-M scheduler and TDM compute pipeline.
 
     With POINTER_TABLES, the first three arguments hold per-group FP16 matrix
-    addresses. Otherwise they are packed A, B, and C tensors. Both paths load
-    B as [BLOCK_N, BLOCK_K] and transpose locally before ``tl.dot``.
+    addresses, group_offsets holds gfx950-style [M, N, K] rows, and group_lds
+    holds [lda, ldb, ldc] rows. Otherwise inputs are packed tensors and
+    group_offsets holds cumulative M offsets. Both paths load B as
+    [BLOCK_N, BLOCK_K] and transpose locally before ``tl.dot``.
     """
     tl.static_assert(NUM_BUFFERS >= 2, "NUM_BUFFERS must be at least 2")
     tl.static_assert(C_STAGING_MODE == 0 or C_STAGING_MODE == 1, "C_STAGING_MODE must be 0 or 1")
@@ -588,11 +591,20 @@ def _grouped_gemm_tdm_impl(
     if CROSS_GROUP_PREFETCH:
         # Keep four upcoming boundaries available across output stores. Refill
         # the window in a tile's tail so group entry needs no metadata load.
-        carried_m_start = tl.load(group_offsets)
-        carried_m_end = tl.load(group_offsets + 1, mask=group_size > 0, other=0)
-        carried_following_m_end = tl.load(group_offsets + tl.minimum(2, group_size))
-        carried_third_m_end = tl.load(group_offsets + tl.minimum(3, group_size))
-        carried_fourth_m_end = tl.load(group_offsets + tl.minimum(4, group_size))
+        if POINTER_TABLES:
+            # Pointer-table matrices start at row zero. Carry their M sizes
+            # instead of packed boundaries; no prefix-sum buffer is needed.
+            carried_m_start = tl.full((), 0, tl.int32)
+            carried_m_end = tl.load(group_offsets, mask=group_size > 0, other=0)
+            carried_following_m_end = tl.load(group_offsets + 3, mask=group_size > 1, other=0)
+            carried_third_m_end = tl.load(group_offsets + 6, mask=group_size > 2, other=0)
+            carried_fourth_m_end = tl.load(group_offsets + 9, mask=group_size > 3, other=0)
+        else:
+            carried_m_start = tl.load(group_offsets)
+            carried_m_end = tl.load(group_offsets + 1, mask=group_size > 0, other=0)
+            carried_following_m_end = tl.load(group_offsets + tl.minimum(2, group_size))
+            carried_third_m_end = tl.load(group_offsets + tl.minimum(3, group_size))
+            carried_fourth_m_end = tl.load(group_offsets + tl.minimum(4, group_size))
     for g in range(group_size):
         if CROSS_GROUP_PREFETCH:
             m_start, m_end = carried_m_start, carried_m_end
@@ -600,15 +612,24 @@ def _grouped_gemm_tdm_impl(
             third_m_end = carried_third_m_end
             fourth_m_end = carried_fourth_m_end
             prefetched_boundary = g + 4 >= group_size
+        elif POINTER_TABLES:
+            m_start = tl.full((), 0, tl.int32)
+            m_end = tl.load(group_offsets + 3 * g)
         else:
             m_start = tl.load(group_offsets + g)
             m_end = tl.load(group_offsets + g + 1)
         gm = m_end - m_start
+        if POINTER_TABLES:
+            group_stride_am = tl.multiple_of(tl.load(group_lds + 3 * g), 8)
+            group_stride_bn = tl.multiple_of(tl.load(group_lds + 3 * g + 1), 8)
+            group_stride_cm = tl.multiple_of(tl.load(group_lds + 3 * g + 2), 8)
+        else:
+            group_stride_am, group_stride_bn, group_stride_cm = stride_am, stride_bn, stride_cm
 
         num_m_tiles = tl.cdiv(gm, BLOCK_M)
         num_tiles = num_m_tiles * num_n_tiles
-        group_base_m = m_start.to(tl.int64) * stride_am
-        group_base_c = m_start.to(tl.int64) * stride_cm
+        group_base_m = m_start.to(tl.int64) * group_stride_am
+        group_base_c = m_start.to(tl.int64) * group_stride_cm
         group_base_b = g.to(tl.int64) * stride_bg
         a_group = _grouped_gemm_matrix_pointer(a_packed, g, group_base_m, POINTER_TABLES)
         b_group = _grouped_gemm_matrix_pointer(b_t, g, group_base_b, POINTER_TABLES)
@@ -619,27 +640,27 @@ def _grouped_gemm_tdm_impl(
             # The launcher validates exact BLOCK_K coverage. Keeping the K
             # extent static avoids rebuilding dynamic bounds at every TDM issue.
             shape=[gm, K],
-            strides=[stride_am, tl.constexpr(1)],
+            strides=[group_stride_am, tl.constexpr(1)],
             block_shape=[BLOCK_M, BLOCK_K],
         )
         b_desc_base = tl.make_tensor_descriptor(
             b_group,
             shape=[N, K],
-            strides=[stride_bn, tl.constexpr(1)],
+            strides=[group_stride_bn, tl.constexpr(1)],
             block_shape=[BLOCK_N, BLOCK_K],
         )
         if USE_FULL_C_TILE:
             c_desc_base = tl.make_tensor_descriptor(
                 c_group,
                 shape=[gm, N],
-                strides=[stride_cm, tl.constexpr(1)],
+                strides=[group_stride_cm, tl.constexpr(1)],
                 block_shape=[32 if HYBRID_TILE_PREFETCH else BLOCK_M, BLOCK_N],
             )
         else:
             c_desc_base = tl.make_tensor_descriptor(
                 c_group,
                 shape=[gm, N],
-                strides=[stride_cm, tl.constexpr(1)],
+                strides=[group_stride_cm, tl.constexpr(1)],
                 # Match the BLOCK_K-wide LDS alias above: when a full C tile
                 # cannot legally alias the A ring, store its two halves. This
                 # is an aliasing constraint, not a store-efficiency choice.
@@ -789,7 +810,10 @@ def _grouped_gemm_tdm_impl(
 
                 if CROSS_GROUP_PREFETCH:
                     if not prefetched_boundary:
-                        carried_fourth_m_end = tl.load(group_offsets + g + 5)
+                        if POINTER_TABLES:
+                            carried_fourth_m_end = tl.load(group_offsets + 3 * (g + 4))
+                        else:
+                            carried_fourth_m_end = tl.load(group_offsets + g + 5)
                         prefetched_boundary = True
                     # Discover the next tile only after the steady K loop, so its
                     # descriptors are not live through the main matrix schedule.
@@ -803,13 +827,16 @@ def _grouped_gemm_tdm_impl(
                     next_num_m_tiles = num_m_tiles
                     while next_tile_idx >= next_group_end and next_group + 1 < group_size:
                         next_group += 1
-                        next_m_start += next_gm
+                        if not POINTER_TABLES:
+                            next_m_start += next_gm
                         if next_group == g + 1:
                             next_m_end = following_m_end
                         elif next_group == g + 2:
                             next_m_end = third_m_end
                         elif next_group == g + 3:
                             next_m_end = fourth_m_end
+                        elif POINTER_TABLES:
+                            next_m_end = tl.load(group_offsets + 3 * next_group)
                         else:
                             next_m_end = tl.load(group_offsets + next_group + 1)
                         next_gm = next_m_end - next_m_start
@@ -829,14 +856,20 @@ def _grouped_gemm_tdm_impl(
                                                                    next_num_m_tiles, num_n_tiles, GROUP_M, BLOCK_M,
                                                                    BLOCK_N)
                     next_a_group = _grouped_gemm_matrix_pointer(a_packed, next_group,
-                                                                next_m_start.to(tl.int64) * stride_am, POINTER_TABLES)
+                                                                next_m_start.to(tl.int64) * group_stride_am,
+                                                                POINTER_TABLES)
                     next_b_group = _grouped_gemm_matrix_pointer(b_t, next_group,
                                                                 next_group.to(tl.int64) * stride_bg, POINTER_TABLES)
+                    if POINTER_TABLES:
+                        next_stride_am = tl.multiple_of(tl.load(group_lds + 3 * next_group), 8)
+                        next_stride_bn = tl.multiple_of(tl.load(group_lds + 3 * next_group + 1), 8)
+                    else:
+                        next_stride_am, next_stride_bn = group_stride_am, group_stride_bn
                     next_a_desc = tl.make_tensor_descriptor(next_a_group, shape=[next_gm, K],
-                                                            strides=[stride_am,
+                                                            strides=[next_stride_am,
                                                                      tl.constexpr(1)], block_shape=[BLOCK_M, BLOCK_K])
                     next_b_desc = tl.make_tensor_descriptor(next_b_group, shape=[N, K],
-                                                            strides=[stride_bn,
+                                                            strides=[next_stride_bn,
                                                                      tl.constexpr(1)], block_shape=[BLOCK_N, BLOCK_K])
                     next_load_m, next_load_n = next_off_m, next_off_n
                     group_primed = has_next
@@ -931,10 +964,10 @@ def _grouped_gemm_tdm_impl(
                 cols = off_n + tl.arange(0, BLOCK_N)
                 if POINTER_TABLES:
                     rows = off_m.to(tl.int64) + tl.arange(0, BLOCK_M)
-                    c_ptrs = c_group + rows[:, None] * stride_cm + cols[None, :]
+                    c_ptrs = c_group + rows[:, None] * group_stride_cm + cols[None, :]
                 else:
                     rows = (m_start + off_m).to(tl.int64) + tl.arange(0, BLOCK_M)
-                    c_ptrs = c_packed + rows[:, None] * stride_cm + cols[None, :]
+                    c_ptrs = c_packed + rows[:, None] * group_stride_cm + cols[None, :]
                 c = acc.to(c_dtype)
                 tlx.amd_sched_barrier()
                 tl.store(c_ptrs, c)
@@ -969,8 +1002,15 @@ def _grouped_gemm_tdm_impl(
         if CROSS_GROUP_PREFETCH:
             if not prefetched_boundary:
                 # Groups with no tile still advance the boundary pipeline.
-                carried_fourth_m_end = tl.load(group_offsets + g + 5)
-            carried_m_start, carried_m_end = m_end, following_m_end
+                if POINTER_TABLES:
+                    carried_fourth_m_end = tl.load(group_offsets + 3 * (g + 4))
+                else:
+                    carried_fourth_m_end = tl.load(group_offsets + g + 5)
+            if POINTER_TABLES:
+                carried_m_start = tl.full((), 0, tl.int32)
+            else:
+                carried_m_start = m_end
+            carried_m_end = following_m_end
             carried_following_m_end, carried_third_m_end = third_m_end, fourth_m_end
 
     # At kernel exit, rely on s_endpgm to drain the final async TDM
@@ -1043,9 +1083,9 @@ def grouped_gemm_tdm_list_kernel(
     group_a_ptrs,
     group_b_ptrs,
     group_c_ptrs,
-    group_offsets,
+    group_gemm_sizes,
+    g_lds,
     group_size,
-    N,
     K: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -1065,13 +1105,19 @@ def grouped_gemm_tdm_list_kernel(
     """Ragged-M GEMM over independently allocated A/B/C matrices.
 
     A is row-major [M_g, K], B is column-major [K, N], and C is row-major
-    [M_g, N]. N and K, and therefore the leading strides, are shared.
+    [M_g, N]. The first six arguments match gfx950 grouped_gemm_kernel:
+    three int64 pointer tables, int32 [G, 3] sizes (M, N, K), int32 [G, 3]
+    leading strides (lda, ldb, ldc), and the group count. Flat tables work too.
+    The caller must validate common N/K, K matching the constexpr argument,
+    full tiles, 16-byte-aligned matrix bases, and strides divisible by 8.
+    No offsets, descriptor buffers, or matrix repacking are required.
     """
+    N = tl.load(group_gemm_sizes + 1)
     _grouped_gemm_tdm_impl(
         group_a_ptrs,
         group_b_ptrs,
         group_c_ptrs,
-        group_offsets,
+        group_gemm_sizes,
         group_size,
         N,
         K,
@@ -1094,6 +1140,7 @@ def grouped_gemm_tdm_list_kernel(
         CLUSTER_SIZE,
         CLUSTER_MULTICAST,
         POINTER_TABLES=True,
+        group_lds=g_lds,
     )
 
 
@@ -1311,10 +1358,7 @@ def _make_grouped_gemm_tdm_list_args(group_a, group_b, group_c=None):
 
     if torch.is_grad_enabled() and any(t.requires_grad for t in (*group_a, *group_b)):
         raise ValueError("the TDM list kernel is forward-only; use torch.no_grad()")
-    offsets = [0]
-    for m in m_list:
-        offsets.append(offsets[-1] + m)
-    if offsets[-1] >= 1 << 31:
+    if sum(m_list) >= 1 << 31:
         raise ValueError("the TDM scheduler requires sum(M) to fit in int32")
     outputs = ([torch.empty((m, n), device=device, dtype=torch.float16)
                 for m in m_list] if group_c is None else list(group_c))
@@ -1330,8 +1374,10 @@ def _make_grouped_gemm_tdm_list_args(group_a, group_b, group_c=None):
                       for tensor in group], dtype=torch.int64, device=device)
         for group in (group_a, group_b, outputs)
     ]
-    group_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
-    return (*pointers, group_offsets, outputs, m_list, n, k)
+    group_sizes = torch.tensor([[m, n, k] for m in m_list], dtype=torch.int32, device=device)
+    group_lds = torch.tensor([[a.stride(0), b.stride(1), c.stride(0)] for a, b, c in zip(group_a, group_b, outputs)],
+                             dtype=torch.int32, device=device)
+    return (*pointers, group_sizes, group_lds, outputs, m_list, n, k)
 
 
 def grouped_gemm_tdm_list(
@@ -1361,12 +1407,14 @@ def grouped_gemm_tdm_list(
 
     A[g] is row-major [M_g, K] and B[g] is a column-major [K, N] view.
     N and K must be shared by all groups. Matrices can have independent
-    allocations; only their pointers and group offsets are copied to device.
+    allocations; only their pointers and gfx950-style size/stride tables are
+    copied to device. Call grouped_gemm_tdm_list_kernel directly to reuse
+    already-prepared device tables and outputs without allocating metadata.
     This retains the packed kernel's full-tile and pipeline restrictions.
     Benchmarking measures the kernel launch after metadata and output setup.
     """
     args = _make_grouped_gemm_tdm_list_args(group_a, group_b, group_c)
-    a_ptrs, b_ptrs, c_ptrs, group_offsets, outputs, m_list, n, k = args
+    a_ptrs, b_ptrs, c_ptrs, group_sizes, group_lds, outputs, m_list, n, k = args
     device = group_a[0].device
     model_sms = max(1, int(num_programs)) if num_programs is not None else _active_num_cus(device)
     if auto_config:
@@ -1413,9 +1461,9 @@ def grouped_gemm_tdm_list(
             a_ptrs,
             b_ptrs,
             c_ptrs,
-            group_offsets,
+            group_sizes,
+            group_lds,
             kernel_group_size,
-            n,
             K=k,
             NUM_PROGRAMS=num_programs,
             BLOCK_M=block_m,
@@ -1497,17 +1545,16 @@ def _grouped_gemm_tdm_list_compile_signature() -> dict[str, str]:
         "group_a_ptrs": "*i64",
         "group_b_ptrs": "*i64",
         "group_c_ptrs": "*i64",
-        "group_offsets": "*i32",
+        "group_gemm_sizes": "*i32",
+        "g_lds": "*i32",
         "group_size": "i32",
-        "N": "i32",
     }
 
 
 def _grouped_gemm_tdm_list_compile_attrs() -> dict[tuple[int, ...], list[list[int | str]]]:
     names = grouped_gemm_tdm_list_kernel.arg_names
     attrs = {(names.index(name), ): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
-             for name in ("group_a_ptrs", "group_b_ptrs", "group_c_ptrs", "group_offsets")}
-    attrs[(names.index("N"), )] = [["tt.divisibility", 16]]
+             for name in ("group_a_ptrs", "group_b_ptrs", "group_c_ptrs", "group_gemm_sizes", "g_lds")}
     return attrs
 
 
