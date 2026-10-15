@@ -1843,13 +1843,18 @@ Attribute AMDWmmaEncodingAttr::parse(AsmParser &parser, Type type) {
   auto kReg = StringAttr::get(ctx, "register");
   Attribute value = dictWarpLay.get(kReg);
   if (!value) {
-    ctaLL = parseLinearLayout(dictWarpLay, parser, {"warp"}, rank).value();
+    auto maybeLL = parseLinearLayout(dictWarpLay, parser, {"warp"}, rank);
+    if (!maybeLL.has_value())
+      return {};
     auto outDims = standardOutDimNames(ctx, rank);
     auto regsLL = LinearLayout::identity1D(1, kReg, outDims[rank - 1]);
-    ctaLL = regsLL * ctaLL;
+    ctaLL = regsLL * *maybeLL;
   } else {
-    ctaLL = parseLinearLayout(dictWarpLay, parser, {"register", "warp"}, rank)
-                .value();
+    auto maybeLL =
+        parseLinearLayout(dictWarpLay, parser, {"register", "warp"}, rank);
+    if (!maybeLL.has_value())
+      return {};
+    ctaLL = std::move(*maybeLL);
   }
 
   std::optional<CGAEncodingAttr> CGALayout =
