@@ -198,12 +198,8 @@ What the cap applies to:
   (`tmaStaging == 2`) starts from the capped value. It is replaced by
   `TRITON_WS_TMA_REDUCE_STAGING_COPIES` only when that variable is also set.
 
-How the applied depth is chosen: Phase 3.7 still walks `tryCopies` upward from
-the group's current copy count to the target. Within that walk the existing
-rules all still apply: it skips depths that violate `K | S` for same-partition
-staging, and it stops at the first depth that exceeds `smemBudget` or a Phase
-3.6 reuse host's capacity. The applied depth is the largest depth that walk
-accepts, so it can be below `K`.
+The walk's existing rules (`K | S`, budget, reuse-host capacity) still apply,
+so the applied depth can be below `K`.
 
 The cap only limits bumps. It never lowers a group below its current copy
 count or its cross-stage floor (`WSBuffer::minCopies`): if the floor is above
@@ -227,9 +223,7 @@ Cases where the variable has no effect:
 - **`smem_alloc_algo = 0`**: the original `MemoryPlanner` does not read the
   variable.
 
-Nothing reports that the cap changed a copy count. The decisions appear only in
-the `Phase 3.7` lines of `-debug-only=nvgpu-ws-memory-planner`, or in the
-`buffer.copy` attributes in the IR after the memory planner.
+Nothing reports the cap's effect.
 
 ### Combined SMEM Cost
 
@@ -240,18 +234,11 @@ allocation downstream, so the cost of a fused staging group is
 tmaStoreSmem = size * copies
 ```
 
-and not `numEntries * size * copies`. In `doCodePartition`, channels with the
-same `buffer.id` form a `ReuseGroup`. `replaceBufferReuse` then redirects every
-non-representative SMEM alloc of the group to the representative's alloc and
-erases it. The subtile stores index slots of that one buffer (see
-[Reuse Groups](ReuseGroups.md), case A3).
-
-The merge applies only when the member alloc types match.
-`replaceBufferReuse` skips an SMEM member whose type differs from the
-representative and leaves it as a separate allocation. That shows up only as
-an `LDBG` line, and `computeTotalSmem` undercounts it. Subtiles of one
-descriptor store have identical types, so the usual epilogue staging group is
-merged.
+Allocs sharing a `buffer.id` collapse onto one representative
+(`replaceBufferReuse`; [Reuse Groups](ReuseGroups.md) case A3), unless their
+types differ. A mismatched member stays separate and `computeTotalSmem`
+undercounts it. Subtiles of one descriptor store have identical types, so the
+usual epilogue staging group is merged.
 
 ### Phase 6: Hoist Before Outermost Loop
 

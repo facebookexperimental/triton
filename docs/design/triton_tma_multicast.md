@@ -233,13 +233,9 @@ axis-aligned recipient groups; it does not yet symbolically compare arbitrary
 tile expressions between CTA ranks.
 
 **Status: planning only.** Steps 1 and 2 below are implemented. Steps 3 and 4
-are the planned lowering and are not implemented yet: no pass reads
-`tt.multicast_axes`, and every descriptor-load lowering creates
-`ttng.async_tma_copy_global_to_local` without `multicastTargets`. This covers
-`TMALoadLowering` in `TMALowering.cpp`, `createTMAAsyncLoad` in the software
-pipeliner's `LowerLoops.cpp`, and `optimizeTMALoads` in the Meta
-warp-specialized `WSLowerMem.cpp`. Setting `multicast=True` therefore changes
-no generated code today.
+are the planned lowering and are not implemented yet: no descriptor-load
+lowering reads `tt.multicast_axes` or sets `multicastTargets`, so
+`multicast=True` changes no generated code today.
 
 The compiler flow is as follows:
 
@@ -354,9 +350,7 @@ tile = desc.load(offsets, multicast=True)   # permit for this load
 tile = desc.load(offsets, multicast=False)  # prohibit for this load
 ```
 
-`True` grants permission; it does not guarantee that multicast is emitted. In
-the current implementation, permission only drives planning, and no load is
-lowered to multicast yet (see "Current implementation"). The planner considers
+`True` grants permission; it does not guarantee that multicast is emitted. The planner considers
 tiled descriptor loads with an exact `ctas_per_cga` shape. It records no plan
 for gather, im2col, preferred/fallback cluster shapes, atomic work-stealing tile
 IDs, or other schedules whose program-ID dependencies it cannot prove. For a CLC
@@ -369,8 +363,8 @@ dependency analysis.
 
 The initial profitability rule selects every legal equivalence group with more
 than one recipient. The planner records the compiler-derived broadcast axes on
-the load. *(Planned, not implemented.)* The backend elects the lowest-ranked CTA
-in each group and derives the 16-bit target mask; standard Triton does not
+the load. The backend will elect the lowest-ranked CTA
+in each group and derive the 16-bit target mask; standard Triton does not
 expose that mask to users.
 
 ### Global opt-in

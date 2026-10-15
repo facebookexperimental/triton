@@ -80,10 +80,9 @@ to their sum, a single barrier wait covers all loads.
 Fused loads must also agree on their issue protocol: a barrier group is either
 entirely ordinary per-CTA loads or entirely cooperative 2-CTA loads. Mixing the
 two would route ordinary completion to the pair leader while computing its
-expected byte count with per-CTA semantics. `optimizeTMALoads` checks this
-invariant before materializing the shared barrier: a mixed group emits the
-error `TMA barrier fusion cannot mix cooperative and per-CTA loads` and the
-function returns `nullptr`.
+expected byte count with per-CTA semantics. `optimizeTMALoads` rejects a mixed
+group with an error (see the fallbacks under
+[2-CTA Cooperative Loads](#2-cta-cooperative-loads-and-triton_disable_2cta_cooperative_loads)).
 
 ### 2-CTA Cooperative Loads and `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS`
 
@@ -118,9 +117,6 @@ unmarked.
 | TMA copy | `AsyncTMACopyGlobalToLocalOp` | Same op with `twoCta` set: `cp.async.bulk.tensor ... .shared::cluster ... .cta_group::2` |
 | Consumer wait | One `WaitBarrierOp` per consumer task | Leader waits. It then relays to the follower with `FenceAsyncSharedOp` plus an `ArriveBarrierOp` on the follower's barrier (`mapBarrierTo2CTAPeer`), and the follower waits on its own barrier. |
 
-The relay uses a remote arrive rather than a cluster barrier because only the
-consuming partition takes part in the handoff.
-
 **The knob.** If `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` is set,
 `Transform2CTALoads` skips the marking step entirely, so every load in the
 module takes the per-CTA column. The B-halving transform itself still runs.
@@ -134,9 +130,8 @@ module takes the per-CTA column. The B-halving transform itself still runs.
 | Cache key | Listed in `CACHE_INVALIDATING_ENV_VARS` (`include/triton/Tools/Sys/GetEnv.h`). |
 | Resources | No SMEM, TMEM, warp, or barrier-count change. The cooperative path adds the leader-to-follower relay instructions (fence, remote arrive, extra wait) in each consumer partition. |
 
-The code comment in `Transform2CTALoads` describes cooperative marking as a
-performance choice, not a correctness requirement: both protocols wait for all
-bytes the consumer reads. The cross-CTA MMA rendezvous that `Insert2CTASync`
+Both protocols are correct; cooperative marking is a performance choice. The
+cross-CTA MMA rendezvous that `Insert2CTASync`
 inserts does not read the attribute, so it is the same in both modes.
 
 Fallbacks and failure modes:
@@ -144,11 +139,11 @@ Fallbacks and failure modes:
 - Only the Meta WS lowering (`optimizeTMALoads`) reads `two_cta_load`. If a
   load does not go through that path, the attribute has no effect, and setting
   or clearing the variable changes nothing for that load.
-- A barrier group that mixes marked and unmarked loads is a compile error
-  (`TMA barrier fusion cannot mix cooperative and per-CTA loads`). It is never
-  silently miscounted. A group can mix only when a rank-1 load is fused with
-  rank-2 loads. With the variable set nothing is marked, so this error cannot
-  occur.
+- A barrier group that mixes marked and unmarked loads emits the error
+  `TMA barrier fusion cannot mix cooperative and per-CTA loads`. The caller in
+  `WSCodePartition.cpp` ignores the returned `nullptr`, so the error does not by
+  itself stop the pass. A group can mix only when a rank-1 load is fused with
+  rank-2 loads. Setting the variable avoids it.
 
 ### Where It's Called
 

@@ -164,12 +164,6 @@ within the owner's row space. For example:
 This is implemented through `buffer.offset` and later materialized by
 `sliceAndReinterpretMDTMEM` in code partitioning.
 
-### `buffer.copy` during placement
-
-Both placement algorithms assign every TMEM allocation `buffer.copy = 1`.
-Copies above 1 come only from the post-processing step described in
-[Accumulator Multi-Buffering](#accumulator-multi-buffering).
-
 ## Algorithm 2: Backtracking (`allocateTMemAllocs2`)
 
 A more sophisticated algorithm using recursive backtracking search.
@@ -265,31 +259,21 @@ Determines where a candidate fits within an owner's column space:
 **Code**: `MemoryPlannerTmem::run` in `WSMemoryPlanner.cpp`, the
 post-processing block after placement.
 
-After algorithm 1 or 2 has placed every allocation, `MemoryPlannerTmem::run`
-raises `buffer.copy` on accumulators so that a persistent kernel can run the
-next tile's MMA while the previous tile's epilogue still reads TMEM. The
-steps are:
+After placement, `MemoryPlannerTmem::run` raises `buffer.copy` on accumulators
+so that a persistent kernel can run the next tile's MMA while the previous
+tile's epilogue still reads TMEM:
 
-1. **Budget.** `tmemCopyLimit` = 512 columns minus `getMinFutureScaleTmemCols`.
-   That function returns the largest TMEM scale footprint that MMA lowering
-   will later add for any `TCGen5MMAScaledOp` whose scales are still in SMEM.
-2. **Current usage.** It sums `numCols × buffer.copy` over owner allocations.
-   Allocations with `buffer.offset` reuse an owner and are skipped.
-3. **Candidates.** An allocation is eligible only if, for a user inside an
-   `scf.for`, either:
-   - `hasLoopCarriedAccToken(alloc, forOp)` holds, i.e. it is a loop-carried
-     MMA accumulator, or
-   - it is the accumulator of an MMAv5 sitting directly in that loop body, and
-     the first access to it in the body is a `ttng.tmem_store`, so its value is
-     dead across iterations (for example a single-K-tile GEMM).
-
-   Other TMEM allocations stay at one copy.
-4. **Round-robin fill.** While usage is below the limit, each candidate in
-   turn gets one more copy if its `numCols` still fits. The loop stops when no
-   candidate fits.
-5. **Record.** The resulting counts are written back as `buffer.copy`.
-   `createBufferForAllocs` then materializes them as a leading buffer
-   dimension and rotates through them with the loop's accumulation counter.
+1. **Budget.** 512 columns minus `getMinFutureScaleTmemCols` (the largest TMEM
+   scale footprint MMA lowering will later add for a `TCGen5MMAScaledOp` whose
+   scales are still in SMEM), less the columns owners already use.
+2. **Candidates.** For a user inside an `scf.for`, either a loop-carried MMA
+   accumulator (`hasLoopCarriedAccToken`), or the accumulator of an MMAv5 in
+   that loop body whose first access in the body is a `ttng.tmem_store` (dead
+   across iterations, e.g. a single-K-tile GEMM). Other allocations stay at one
+   copy.
+3. **Round-robin fill.** Each candidate in turn gets one more copy while its
+   `numCols` still fits. The counts become `buffer.copy`, a leading buffer
+   dimension rotated by the loop's accumulation counter.
 
 Example: a 128×128 fp32 accumulator (128 columns) with nothing else in TMEM
 ends at 4 copies. A 128×256 one ends at 2.

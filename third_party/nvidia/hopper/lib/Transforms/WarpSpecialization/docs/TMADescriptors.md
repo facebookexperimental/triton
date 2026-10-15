@@ -75,16 +75,13 @@ allocates global scratch, emits `ttng.tensormap_create` and
   counted in the capture estimate. A device descriptor is not a function
   argument, so it is not counted there.
 
-`auto_tma` with device mode, or with any op that needs a per-program base
-offset, produces device descriptors. It hoists them above enclosing loops
-while their operands stay loop-invariant.
+`auto_tma` device mode produces device descriptors
+([Auto-TMA Promotion](AutoTMAPromotion.md)).
 
 ## Resources
 
 - **SMEM.** The operand rings and staging buffers are the same for both
-  forms. Device descriptors add 128 B of SMEM op scratch per
-  `ttng.tensormap_create` that the planner does not reserve.
-- **Global memory.** Device descriptors use 128 B of global scratch each.
+  forms.
 - **Launch.** Host descriptors are encoded on the host at every launch.
   Device descriptors are built and fenced in the kernel.
 - **Registers, TMEM, warps.** No difference.

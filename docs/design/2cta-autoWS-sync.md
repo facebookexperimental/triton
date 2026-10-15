@@ -577,30 +577,24 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    established, warn and fall back to 1-CTA instead of compiling an unsafe 2-CTA
    kernel.
 
-3. **Support `BLOCK_M < 64`**: a power-of-2 `BLOCK_M` below 64 gets no tcgen05
-   MMA at all (`isMmaOutputShapeSupported`), and a non-power-of-2 one falls back
-   to 1-CTA with a warning. `BLOCK_M = 64` already compiles as 2-CTA: the
-   accumulator uses `TensorMemoryCTAMode::TwoCTA_RHS`, and a TMEM-promoted A
-   uses `TwoCTA_LHS` (`PromoteLHSToTMem.cpp`).
-
-4. **Evaluate `.cta_group::2` TMA loads**: D96323995 added `.cta_group::2`
+3. **Evaluate `.cta_group::2` TMA loads**: D96323995 added `.cta_group::2`
    support for TMA loads, which routes barrier arrivals to the leader CTA in
    hardware. A future optimization could use this on B-operand TMA loads and
    potentially eliminate the explicit cross-CTA sync inserted by `Insert2CTASync`.
 
-5. **Support larger even-X CGAs**: `two_ctas=True` should be compatible with
+4. **Support larger even-X CGAs**: `two_ctas=True` should be compatible with
    larger even-sized CGA-X shapes such as `ctas_per_cga=(4,1,1)`. Requiring
    Y/Z == 1 is reasonable, but extending beyond `(2,1,1)` remains future work.
 
-6. **Improve diagnostics**: Replace internal asserts for unsupported 2-CTA
+5. **Improve diagnostics**: Replace internal asserts for unsupported 2-CTA
    patterns with user-facing compiler diagnostics if those cases can be reached
    from normal user code.
 
-7. **Improve pointer-store epilogue support**: Either expand Meta WS
+6. **Improve pointer-store epilogue support**: Either expand Meta WS
    `isEpilogueStoreOp` to recognize pointer stores, or handle the same-partition
    producer case gracefully.
 
-8. **Evaluate the `BtAt` transposed-matmul trick**: The current `AB` 2-CTA path
+7. **Evaluate the `BtAt` transposed-matmul trick**: The current `AB` 2-CTA path
    pairs CTAs along original output rows: same `pid_n`, adjacent `pid_m`.
    Computing `AB` as `(B^T A^T)^T` would transpose the logical output tile grid,
    so the safe pairing would need to become same original `pid_m`, adjacent
