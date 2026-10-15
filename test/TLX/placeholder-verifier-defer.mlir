@@ -27,6 +27,26 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32,
 
 // -----
 
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [8, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#result = #tlx.no_verify_layout<#tlx.user_layout<#mma>>
+#operand_a = #tlx.no_verify_layout<#tlx.user_layout<#ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>>
+module attributes {"ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32} {
+  // Helper ABI reconciliation can temporarily expose a pinned operand and
+  // accumulator beside an unresolved operand. The no_verify result defers dot
+  // compatibility until placeholder resolution gives all three concrete types.
+  // CHECK-LABEL: @dot_placeholder_with_unresolved_operand
+  tt.func @dot_placeholder_with_unresolved_operand(
+      %a: tensor<256x64xbf16, #operand_a>,
+      %b: tensor<64x64xbf16>,
+      %c: tensor<256x64xf32, #result>) -> tensor<256x64xf32, #result> {
+    // CHECK: tt.dot
+    %dot = tt.dot %a, %b, %c : tensor<256x64xbf16, #operand_a> * tensor<64x64xbf16> -> tensor<256x64xf32, #result>
+    tt.return %dot : tensor<256x64xf32, #result>
+  }
+}
+
+// -----
+
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
 #ph = #tlx.no_verify_layout<#tlx.user_layout<#linear>>
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
@@ -63,20 +83,19 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32,
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
 #ph = #tlx.no_verify_layout<#tlx.user_layout<#linear>>
 #slice = #ttg.slice<{dim = 1, parent = #ph}>
-#deferred_slice = #tlx.no_verify_layout<#slice>
 module {
-  // The nested placeholder keeps canonical slice-parent inference stable. The
-  // outer placeholder defers verification of the complete slice while frontend
-  // IR has no ttg.num-warps context and keeps later inference in the TLX dialect.
+  // The nested placeholder keeps canonical slice-parent inference stable and
+  // recursively defers verification while frontend IR has no ttg.num-warps
+  // context.
   // CHECK-LABEL: @nested_placeholder_slice
-  tt.func @nested_placeholder_slice(%x: tensor<128x128xf32, #ph>) -> tensor<128xf32, #deferred_slice> {
+  tt.func @nested_placeholder_slice(%x: tensor<128x128xf32, #ph>) -> tensor<128xf32, #slice> {
     // CHECK: "tt.reduce"
     %m = "tt.reduce"(%x) <{axis = 1 : i32}> ({
     ^bb0(%lhs: f32, %rhs: f32):
       %max = arith.maxnumf %lhs, %rhs : f32
       tt.reduce.return %max : f32
-    }) : (tensor<128x128xf32, #ph>) -> tensor<128xf32, #deferred_slice>
-    tt.return %m : tensor<128xf32, #deferred_slice>
+    }) : (tensor<128x128xf32, #ph>) -> tensor<128xf32, #slice>
+    tt.return %m : tensor<128xf32, #slice>
   }
 }
 

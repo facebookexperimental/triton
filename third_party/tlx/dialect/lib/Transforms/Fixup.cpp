@@ -17,6 +17,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/LogicalResult.h"
 
 namespace ttg = mlir::triton::gpu;
@@ -472,12 +473,50 @@ static SmallVector<Value> collectForwardedValues(Value root) {
   return visited;
 }
 
-static bool flowsToValue(Value root, Value target) {
-  return llvm::is_contained(collectForwardedValues(root), target);
+static bool flowsPreservingEncodingToValue(Value root, Value target) {
+  SmallVector<Value> worklist{root};
+  SmallVector<Value> visited;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (llvm::is_contained(visited, value))
+      continue;
+    visited.push_back(value);
+    if (value == target)
+      return true;
+
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (isa<scf::YieldOp, scf::ForOp>(user)) {
+        appendForwardedValues(use, worklist);
+        continue;
+      }
+      if (!isEncodingUniformArithOp(user) &&
+          !hasSameOperandsAndResultEncodingTrait(user))
+        continue;
+      for (Value result : user->getResults())
+        if (isa<RankedTensorType>(result.getType()))
+          worklist.push_back(result);
+    }
+  }
+  return false;
 }
 
-static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
+static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
   bool conflict = false;
+  // Explicit requirements and MFMA accumulators determine arithmetic layouts.
+  llvm::DenseSet<Value> concreteLayoutAnchors;
+  mod.walk([&](RequireLayoutOp op) {
+    auto type = dyn_cast<RankedTensorType>(op.getType());
+    if (type && type.getEncoding() &&
+        !isPlaceholderEncoding(type.getEncoding()))
+      concreteLayoutAnchors.insert(op.getResult());
+  });
+  mod.walk([&](::mlir::triton::DotOp op) {
+    auto type = op.getType();
+    Attribute encoding = type.getEncoding();
+    if (encoding && isa<ttg::AMDMfmaEncodingAttr>(encoding))
+      concreteLayoutAnchors.insert(op.getResult());
+  });
   // Find a placeholder encoding among a set of linked values (values an op
   // requires to share one encoding). If two of them carry *different* pinned
   // placeholders, that is a user error (two conflicting tlx.local_load(layout=)
@@ -497,6 +536,25 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
           if (!enc)
             enc = t.getEncoding();
         }
+    return enc;
+  };
+
+  auto findConcreteAnchor = [&](ArrayRef<Value> vs,
+                                Operation *op) -> Attribute {
+    Attribute enc;
+    for (Value v : vs) {
+      if (!concreteLayoutAnchors.contains(v))
+        continue;
+      auto type = cast<RankedTensorType>(v.getType());
+      Attribute candidate = type.getEncoding();
+      if (enc && enc != candidate) {
+        op->emitError("conflicting explicit layouts meet on this operation; "
+                      "insert tlx.release_layout before combining them");
+        conflict = true;
+        return {};
+      }
+      enc = candidate;
+    }
     return enc;
   };
 
@@ -531,10 +589,97 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
   while (changed) {
     changed = false;
     if (++iter > kMaxIter) {
-      mod.emitError(
-          "TLX placeholder layout propagation exceeded iteration limit");
+      mod.emitError("TLX verifier layout reconciliation exceeded iteration "
+                    "limit");
       return failure();
     }
+    // Helpers can return a layout pin without receiving pinned arguments.
+    SmallVector<::mlir::triton::FuncOp> funcs;
+    mod.walk([&](::mlir::triton::FuncOp func) { funcs.push_back(func); });
+    for (auto func : funcs) {
+      SmallVector<::mlir::triton::ReturnOp> returns;
+      func.walk([&](::mlir::triton::ReturnOp ret) { returns.push_back(ret); });
+      if (returns.empty() || func.getFunctionType().getNumResults() == 0)
+        continue;
+
+      SmallVector<Type> resultTypes(func.getFunctionType().getResults().begin(),
+                                    func.getFunctionType().getResults().end());
+      bool signatureChanged = false;
+      for (unsigned i = 0; i < resultTypes.size(); ++i) {
+        SmallVector<Value> candidates;
+        for (auto ret : returns)
+          if (i < ret.getNumOperands())
+            candidates.push_back(ret.getOperand(i));
+        Attribute enc = findPlaceholder(candidates, func);
+        if (!enc)
+          continue;
+
+        auto declared = dyn_cast<RankedTensorType>(resultTypes[i]);
+        if (!declared) {
+          func.emitError() << "pinned helper result " << i
+                           << " is not a ranked tensor";
+          conflict = true;
+          continue;
+        }
+        Type target = RankedTensorType::get(declared.getShape(),
+                                            declared.getElementType(), enc);
+        for (auto ret : returns) {
+          if (i >= ret.getNumOperands())
+            continue;
+          Value operand = ret.getOperand(i);
+          auto type = dyn_cast<RankedTensorType>(operand.getType());
+          if (!type || type.getShape() != declared.getShape() ||
+              type.getElementType() != declared.getElementType()) {
+            ret.emitError() << "pinned helper result " << i
+                            << " has inconsistent tensor payload type";
+            conflict = true;
+            continue;
+          }
+          if (type.getEncoding() && type.getEncoding() != enc) {
+            ret.emitError()
+                << "conflicting layout for pinned helper result " << i;
+            conflict = true;
+            continue;
+          }
+          if (type != target) {
+            OpBuilder b(ret);
+            Value converted =
+                RequireLayoutOp::create(b, ret.getLoc(), target, operand);
+            ret.setOperand(i, converted);
+            changed = true;
+          }
+        }
+        if (resultTypes[i] != target) {
+          resultTypes[i] = target;
+          signatureChanged = true;
+        }
+      }
+      if (signatureChanged) {
+        func.setType(FunctionType::get(func.getContext(),
+                                       func.getFunctionType().getInputs(),
+                                       resultTypes));
+        changed = true;
+      }
+    }
+    if (conflict)
+      return failure();
+
+    mod.walk([&](::mlir::triton::CallOp call) {
+      auto callee =
+          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+              call, call.getCalleeAttr());
+      if (!callee)
+        return;
+      auto results = callee.getFunctionType().getResults();
+      if (results.size() != call.getNumResults())
+        return;
+      for (unsigned i = 0; i < results.size(); ++i)
+        if (call.getResult(i).getType() != results[i]) {
+          call.getResult(i).setType(results[i]);
+          changed = true;
+        }
+    });
+
     // tt.calls whose shared helper callee must be privatized (cloned) before it
     // can be specialized. Collected during the walk and applied afterwards, so
     // we never insert into the module while traversing it.
@@ -546,18 +691,48 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
         SmallVector<Value> linked(op->getOperands());
         linked.append(op->getResults().begin(), op->getResults().end());
         Attribute enc = findPlaceholder(linked, op);
-        if (!enc)
+        if (enc) {
+          for (Value v : op->getResults())
+            changed |= retypeWithEncoding(v, enc);
+          bool isSelect = isa<arith::SelectOp>(op);
+          for (auto en : llvm::enumerate(op->getOperands())) {
+            // arith.select's condition (operand 0) must carry the encoding too,
+            // but its producer may be un-retypeable (e.g. a tt.call mask), so
+            // force a require_layout bridge for it.
+            bool isSelectCond = isSelect && en.index() == 0;
+            bridgeOrRetype(en.value(), enc, op, en.index(), isSelectCond);
+          }
           return;
+        }
+
+        enc = findConcreteAnchor(linked, op);
+        if (!enc) {
+          // Same-shape casts inherit their operand's register ownership.
+          if (isa<arith::ExtFOp, arith::TruncFOp, arith::ExtUIOp,
+                  arith::ExtSIOp, arith::TruncIOp, arith::SIToFPOp,
+                  arith::FPToSIOp, arith::BitcastOp>(op)) {
+            auto source =
+                dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+            if (source && source.getEncoding()) {
+              for (Value result : op->getResults()) {
+                auto type = dyn_cast<RankedTensorType>(result.getType());
+                if (type && !type.getEncoding())
+                  changed |= retypeWithEncoding(result, source.getEncoding());
+              }
+            }
+          }
+          return;
+        }
+
+        // Shared operand producers keep their own layout contracts.
         for (Value v : op->getResults())
           changed |= retypeWithEncoding(v, enc);
-        bool isSelect = isa<arith::SelectOp>(op);
-        for (auto en : llvm::enumerate(op->getOperands())) {
-          // arith.select's condition (operand 0) must carry the encoding too,
-          // but its producer may be un-retypeable (e.g. a tt.call mask), so
-          // force a require_layout bridge for it.
-          bool isSelectCond = isSelect && en.index() == 0;
-          bridgeOrRetype(en.value(), enc, op, en.index(), isSelectCond);
-        }
+        for (Value v : op->getResults())
+          if (isa<RankedTensorType>(v.getType()))
+            concreteLayoutAnchors.insert(v);
+        for (auto en : llvm::enumerate(op->getOperands()))
+          bridgeOrRetype(en.value(), enc, op, en.index(),
+                         /*forceBridge=*/true);
         return;
       }
       // A buffer-load fallback follows the result pin at this use.
@@ -588,6 +763,14 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
             if (isa<RankedTensorType>(result.getType()))
               linked.push_back(result);
         Attribute enc = findPlaceholder(linked, op);
+        if (!enc)
+          if (auto store = dyn_cast<::mlir::triton::StoreOp>(op))
+            if (auto type =
+                    dyn_cast<RankedTensorType>(store.getValue().getType())) {
+              Attribute valueEncoding = type.getEncoding();
+              if (valueEncoding && isa<ttg::AMDMfmaEncodingAttr>(valueEncoding))
+                enc = valueEncoding;
+            }
         if (enc) {
           if (sameOperandsAndResults)
             for (Value result : op->getResults())
@@ -613,16 +796,28 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
           Value resV = forOp.getResult(i);
           Attribute enc =
               findPlaceholder({initV, iterArg, yieldV, resV}, forOp);
-          if (!enc)
-            continue;
+          bool concreteAccumulator = false;
+          if (!enc) {
+            enc = findConcreteAnchor({initV, iterArg, yieldV, resV}, forOp);
+            if (!enc || !isa<ttg::AMDMfmaEncodingAttr>(enc))
+              continue;
+            concreteAccumulator = true;
+          }
           // init is an external operand and the yield operand is loop-body
           // produced -- either may be an arith.constant (tl.zeros) or a tt.call
           // result, so bridge those; the iter-arg and result are the loop's own
           // SSA values and are retyped in place.
-          bridgeOrRetype(initV, enc, forOp, forOp.getNumControlOperands() + i);
+          bridgeOrRetype(initV, enc, forOp, forOp.getNumControlOperands() + i,
+                         concreteAccumulator);
           changed |= retypeWithEncoding(iterArg, enc);
-          bridgeOrRetype(yieldV, enc, yield, i);
+          bridgeOrRetype(yieldV, enc, yield, i, concreteAccumulator);
           changed |= retypeWithEncoding(resV, enc);
+          if (concreteAccumulator) {
+            // Accumulator authority must reach earlier loop-body operations.
+            for (Value value : {forOp.getInitArgs()[i], iterArg,
+                                yield.getOperand(i), resV})
+              changed |= concreteLayoutAnchors.insert(value).second;
+          }
         }
         return;
       }
@@ -828,7 +1023,8 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
               if (!argT || !isPlaceholderEncoding(argT.getEncoding()) ||
                   argT.getShape() != callRt.getShape() ||
                   argIdx >= entry.getNumArguments() ||
-                  !flowsToValue(entry.getArgument(argIdx), retV))
+                  !flowsPreservingEncodingToValue(entry.getArgument(argIdx),
+                                                  retV))
                 continue;
               target = RankedTensorType::get(callRt.getShape(),
                                              callRt.getElementType(),
@@ -1085,15 +1281,17 @@ public:
         setUserPostWsSyncOnMod(mod, /*value=*/true);
     }
 
-    // Make placeholder (no_verify) layouts pinned by tlx.local_load(layout=...)
-    // consistent across arith/math elementwise, select and scf region-carried
-    // values, so make_ttir's verifier (arith verifiers don't honor no_verify)
-    // accepts the module. Runs after the ttg.num-warps metadata above is set,
-    // since validating the pinned #linear layout needs it. Concrete layouts are
-    // resolved later in make_ttgir.
+    // First specialize helper ABIs carrying concrete distributed values, then
+    // reconcile explicit layouts across verifier-uniform operations so
+    // make_ttir's verifier accepts the module. Placeholder (no_verify) layouts
+    // pinned by tlx.local_load(layout=...) propagate through linked producer
+    // graphs; concrete require_layout anchors constrain only their local
+    // arithmetic chain and bridge mismatched inputs at the consuming use. Runs
+    // after the ttg.num-warps metadata above is set, since validating a pinned
+    // #linear layout needs it. Concrete conversions resolve in make_ttgir.
     if (failed(synchronizeConcreteHelperABI(mod)))
       return signalPassFailure();
-    if (failed(propagatePlaceholderLayouts(mod)))
+    if (failed(reconcileVerifierLayouts(mod)))
       return signalPassFailure();
   }
 };

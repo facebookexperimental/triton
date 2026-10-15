@@ -225,7 +225,10 @@ def require_layout(
     assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
     assert isinstance(late_address_compute, bool), ("late_address_compute must be a constexpr bool, got "
                                                     f"{type(late_address_compute).__name__}")
-    enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    if isinstance(layout, tlx.layout):
+        enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    else:
+        enc = layout.to_ir(_semantic.builder)
     handle = _semantic.builder.create_require_layout(
         x.handle,
         enc,

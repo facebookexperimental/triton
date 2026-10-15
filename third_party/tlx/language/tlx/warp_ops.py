@@ -1,13 +1,32 @@
 """
 TLX Warp-Level Operations
 
-This module provides warp-level synchronization and voting primitives
-for NVIDIA GPUs.
+This module provides GPU warp-level synchronization and voting primitives.
 """
 
 import triton
 import triton.language as tl_module
 import triton.language.core as tl
+
+
+def _warp_vote(pred: tl.tensor, kind: tl.constexpr, _semantic=None) -> tl.tensor:
+    if pred.dtype != tl.int1:
+        pred = pred != 0
+    if not pred.type.is_block():
+        raise TypeError(f"warp_{kind} expects a distributed tensor predicate")
+    return _semantic.tensor(_semantic.builder.create_warp_vote(pred.handle, kind), tl.int1)
+
+
+@tl.builtin
+def warp_all(pred: tl.tensor, _semantic=None) -> tl.tensor:
+    """Return whether every physical lane's predicate is true."""
+    return _warp_vote(pred, "all", _semantic=_semantic)
+
+
+@tl.builtin
+def warp_any(pred: tl.tensor, _semantic=None) -> tl.tensor:
+    """Return whether any physical lane's predicate is true."""
+    return _warp_vote(pred, "any", _semantic=_semantic)
 
 
 @triton.jit
