@@ -6,6 +6,8 @@
   "release_base_url": "https://github.com/facebookexperimental/llvm-project/releases/download/llvm-a6533ab0-1",
   "sha256sum": {
     "almalinux-arm64": "b487d28900db7c9f34be56e43bafa2920f8efd22468b85dce10032e687511966",
-    "almalinux-x64": "84a21892ea603715fdbf2d97cdd2d0c154f7402fe0d07e4c700d9f8d5b3a37b7"
+    "almalinux-x64": "84a21892ea603715fdbf2d97cdd2d0c154f7402fe0d07e4c700d9f8d5b3a37b7",
+    "ubuntu-arm64": "fb27811e321421567a8f9b3b166b3eb6d0b8b6bdf390b776fd215f680876dbfb",
+    "ubuntu-x64": "ea30dc6616ceb9951ad37675acece7ba4664f2798e01245b776d4e50a040fa4e"
   }
 }
