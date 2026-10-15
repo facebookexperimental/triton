@@ -1,0 +1,88 @@
+name: Meta LLVM update (one line)
+# Called by meta-llvm-update.yml once per release line. update pushes the bump
+# branch and tracking issue; verify builds wheels from that branch only when its
+# content changed; report comments the outcome on the issue, or on the PR once a
+# person has opened it.
+on:
+  workflow_call:
+    inputs:
+      target:      { type: string, required: true }
+      fork_branch: { type: string, required: true }
+      dry_run:     { type: boolean, required: false, default: false }
+
+permissions: read-all
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.bump.outputs.changed }}
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Check out updater scripts (default branch)
+        uses: actions/checkout@v4
+        with:
+          path: updater
+          sparse-checkout: .github/scripts
+
+      - name: Check out target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target }}
+          path: target
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: cmake
+
+      - name: Prepare bump
+        id: bump
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 ../updater/.github/scripts/meta_llvm_update.py \
+            --target "${{ inputs.target }}" \
+            --fork-branch "${{ inputs.fork_branch }}" \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+  verify:
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    uses: ./.github/workflows/wheels_fb.yml
+    with:
+      ref: ${{ needs.update.outputs.sha }}
+      pythons: '["cp312"]'
+
+  report:
+    needs: [update, verify]
+    if: always() && needs.update.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Check out updater scripts (default branch)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Report build check
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          python3 .github/scripts/meta_llvm_update.py --target "${{ inputs.target }}" \
+            --report "${{ needs.verify.result }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
