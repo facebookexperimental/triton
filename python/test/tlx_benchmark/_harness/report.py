@@ -55,6 +55,10 @@ def _fmt_config(result) -> str:
     return result.best_config or "-"
 
 
+def _fmt_us(value) -> str:
+    return "-" if value is None else f"{value:.2f}"
+
+
 def table(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str:
     """The common columns, then whichever op-specific ones the op asked for.
 
@@ -68,8 +72,9 @@ def table(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str
     heads = "".join(f" {head:>{w}}" for (head, _), w in zip(extra_columns, extra_widths))
     lines = [
         f"{'input':<{width}} {'ref TF/s':>9} {'tlx TF/s':>9} {'speedup':>8} {'compile':>8} "
-        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p95 TF/s':>9} {'p99 TF/s':>9}{heads}  status  best config",
-        "-" * (width + 97 + sum(w + 1 for w in extra_widths)),
+        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p95 TF/s':>9} {'p99 TF/s':>9} "
+        f"{'ref CPU us':>10} {'tlx CPU us':>10}{heads}  status  best config",
+        "-" * (width + 119 + sum(w + 1 for w in extra_widths)),
     ]
     for r in results:
         cells = "".join(f" {_fmt_extra(r, key):>{w}}" for (_, key), w in zip(extra_columns, extra_widths))
@@ -81,7 +86,9 @@ def table(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str
                      f"{_fmt_cv(r):>6} "
                      f"{_tf(_stat(r.tlx, 'p50'))} "
                      f"{_tf(_stat(r.tlx, 'p95'))} "
-                     f"{_tf(_stat(r.tlx, 'p99'))}{cells}  {_MARK[r.status]:<6}  {_fmt_config(r)}")
+                     f"{_tf(_stat(r.tlx, 'p99'))} "
+                     f"{_fmt_us(r.ref_host_us):>10} {_fmt_us(r.tlx_host_us):>10}{cells}  "
+                     f"{_MARK[r.status]:<6}  {_fmt_config(r)}")
     return "\n".join(lines)
 
 
@@ -132,7 +139,10 @@ def tables(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> st
 
 def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None,
            extra_columns: Sequence[tuple] = ()) -> str:
-    out = [tables(results, extra_columns), ""]
+    out = [
+        "Kernel throughput: GPU events, cold cache. CPU submission is a separate diagnostic.",
+        tables(results, extra_columns), ""
+    ]
     if json_path:
         out.append(f"artifact: {write_json(results, env, json_path)}")
     out.append(summary(results))

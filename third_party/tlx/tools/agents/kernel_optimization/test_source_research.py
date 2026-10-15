@@ -101,6 +101,38 @@ class SourceResearchTest(unittest.TestCase):
                     duration_seconds=0.0,
                 )
 
+    def test_omits_oversized_excerpt_without_losing_research(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository, _ = self._repository(Path(directory))
+            reference = repository / "kernels" / "reference.py"
+            reference.write_text("\n".join("x = " + "1" * 40 for _ in range(40)))
+            payload = {
+                "schema_version": 2,
+                "findings": ["The reference uses a structural schedule."],
+                "excerpts": [{
+                    "path": "kernels/reference.py",
+                    "start_line": 1,
+                    "end_line": 40,
+                    "symbol": "reference",
+                }],
+                "inspected_paths": ["kernels/reference.py"],
+                "limitations": [],
+            }
+
+            evidence = _parse_research_output(
+                json.dumps(payload),
+                action_id="r001-c000-a00",
+                source_digest="a" * 64,
+                question="question",
+                rationale="rationale",
+                repository_root=repository,
+                duration_seconds=0.0,
+            )
+
+            self.assertEqual(evidence.findings, ("The reference uses a structural schedule.",))
+            self.assertEqual(evidence.excerpts, ())
+            self.assertIn("Omitted oversized excerpt", evidence.limitations[0])
+
     def test_rejects_research_arrays_over_their_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository, _ = self._repository(Path(directory))

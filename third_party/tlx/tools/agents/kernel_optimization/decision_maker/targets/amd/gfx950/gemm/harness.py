@@ -18,7 +18,7 @@ _AGENT_DIR = Path(__file__).resolve().parents[4]
 if str(_AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(_AGENT_DIR))
 
-from profiling.amd_att import collect_fb_att  # noqa: E402
+from profiling.amd_att import collect_amd_att  # noqa: E402
 from profiling.amdgcn_isa import collect_amdgcn_isa  # noqa: E402
 from profiling.rocm_profiler import (  # noqa: E402
     collect_rocprofv3,
@@ -136,7 +136,7 @@ def profile(
     if not bool(case.get("parameters", {}).get("profile", True)):
         result["diagnostics"] = ["rocprofv3 skipped for this case"]
         return result
-    if not {"rocprofv3", "fb_att", "amdgcn_isa"}.intersection(tools):
+    if not {"rocprofv3", "amd_att", "amdgcn_isa"}.intersection(tools):
         result["diagnostics"] = ["no supported AMD profiler was requested"]
         return result
     artifacts_dir_raw = request.get("artifacts_dir")
@@ -175,9 +175,9 @@ def profile(
         case.get("parameters", {}).get("profile_kernel", "")
         or summary.get("dominant_kernel", "")
     ).removesuffix(".kd")
-    if "fb_att" in tools:
+    if "amd_att" in tools:
         if kernel_filter:
-            result["fb_att"] = collect_fb_att(
+            result["amd_att"] = collect_amd_att(
                 _profile_workload_command(
                     source_path,
                     case_path,
@@ -192,8 +192,8 @@ def profile(
                 timeout_seconds=180.0,
             )
         else:
-            result["fb_att"] = {
-                "error": "fb_att requires a dominant kernel from rocprofv3"
+            result["amd_att"] = {
+                "error": "AMD ATT requires a dominant kernel from rocprofv3"
             }
     if "amdgcn_isa" in tools:
         if kernel_filter:
