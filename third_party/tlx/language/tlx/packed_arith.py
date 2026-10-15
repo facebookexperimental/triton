@@ -127,3 +127,28 @@ def packed_mul4(lhs, rhs, dtype=None, _semantic=None):
 def packed_fma4(lhs, rhs, acc, dtype=None, _semantic=None):
     """Fused multiply-add four packed FP8/FP4 lanes with an SM103+ PTX 9.4 instruction."""
     return _packed_arith("fma", (lhs, rhs, acc), dtype, _semantic)
+
+
+@tl.builtin
+def add_f32_mixed(acc, x, _semantic=None):
+    """Return ``acc + float32(x)`` for fp32 ``acc`` and fp16/bf16 ``x``.
+
+    Lowers to SM100+ ``add.rn.f32.{f16,bf16}``: one instruction per element
+    instead of ``cvt`` + ``add``.
+    """
+    capability = int(cuda_parse_arch(_semantic.builder.options.arch))
+    assert capability >= 100, f"tlx.add_f32_mixed requires compute capability >= 100, current capability: {capability}"
+    acc = _semantic.to_tensor(acc)
+    x = _semantic.to_tensor(x)
+    assert acc.dtype == tl.float32, f"tlx.add_f32_mixed requires a float32 accumulator, got {acc.dtype}"
+    assert x.dtype in (tl.float16, tl.bfloat16), f"tlx.add_f32_mixed requires float16 or bfloat16 x, got {x.dtype}"
+    ty = "f16" if x.dtype == tl.float16 else "bf16"
+    return tl.inline_asm_elementwise(
+        f"add.rn.f32.{ty} $0, $2, $1;",
+        "=f,f,h",
+        [acc, x.to(tl.int16, bitcast=True, _semantic=_semantic)],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+        _semantic=_semantic,
+    )

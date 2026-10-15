@@ -222,3 +222,26 @@ def test_stoch_round_entropy_quality(device):
     different_count = (b1.float() != b2.float()).sum().item()
     assert different_count > SIZE * 0.1, (
         f"Different seeds should produce different results, but only {different_count}/{SIZE} values differ")
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("x_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("SIZE", [256, 100])
+def test_add_f32_mixed(x_dtype, SIZE, device):
+
+    @triton.jit
+    def add_f32_mixed_kernel(acc_ptr, x_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        acc = tl.load(acc_ptr + offsets, mask=mask)
+        x = tl.load(x_ptr + offsets, mask=mask)
+        tl.store(out_ptr + offsets, tlx.add_f32_mixed(acc, x), mask=mask)
+
+    acc = torch.randn([SIZE], dtype=torch.float32, device=device)
+    x = torch.randn([SIZE], dtype=torch.float32, device=device).to(x_dtype)
+    out = torch.empty_like(acc)
+    kernel = add_f32_mixed_kernel[(1, )](acc, x, out, SIZE, BLOCK_SIZE=triton.next_power_of_2(SIZE), num_warps=1)
+
+    torch.testing.assert_close(out, acc + x.float(), atol=0, rtol=0)
+    ty = "f16" if x_dtype == torch.float16 else "bf16"
+    assert f"add.rn.f32.{ty}" in kernel.asm["ptx"]
