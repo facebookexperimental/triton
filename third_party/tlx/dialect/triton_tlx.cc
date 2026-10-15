@@ -1390,6 +1390,10 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<ttag::BufferAtomicRMWOp>(
                  value.getType(), op, ptr, offsets, value, Value() /*stride*/,
                  sem, scope, mask.value_or(Value()), contiguity);
+           })
+      .def("create_assume_uniform",
+           [](TritonOpBuilder &self, Value value) -> Value {
+             return self.create<ttag::AssumeUniformOp>(value.getType(), value);
            });
 }
 
