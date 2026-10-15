@@ -164,15 +164,23 @@ def _wmma(version, a, b, acc, semantic):
 def _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, scale_fn, semantic):
     """ Shared implementation for AMD WMMA scaled and MFMA scaled operation. """
 
+    def _unpacked_k(packed_k, format):
+        if format == "e2m1":
+            return packed_k * 2
+        if format in ("e2m3", "e3m2"):
+            # fp6 pads the K dim to the unpacked width; packed_k is unpacked.
+            assert packed_k % 4 == 0
+            return packed_k
+        return packed_k
+
     def _get_scale_shape(op_idx, operand, format, scale_factor):
         operand_shape = [s for s in operand.type.shape]
         scale_shape = operand_shape
-        unpack_factor = 2 if format == "e2m1" else 1
         if op_idx == 0:
-            k = scale_shape[-1] * unpack_factor
+            k = _unpacked_k(scale_shape[-1], format)
             scale_shape[-1] = k // scale_factor
         else:
-            k = scale_shape[-2] * unpack_factor
+            k = _unpacked_k(scale_shape[-2], format)
             scale_shape[-2] = k // scale_factor
             scale_shape[-2], scale_shape[-1] = scale_shape[-1], scale_shape[-2]
         return scale_shape
