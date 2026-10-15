@@ -4,32 +4,32 @@ Source design: [Named Barrier API Changes](https://docs.google.com/document/d/12
 
 ## 1. Problem statement
 
-A named-barrier ID has no first-class representation in the Triton stack. The
-barrier operand of `ttng.wait_barrier_named` and
-`ttng.arrive_barrier_named` is an `i32`. In practice, it is usually a folded
-`arith.constant`, but the IR has no type, attribute, symbol, wrapper, or
-allocation that identifies the value as a hardware named-barrier ID.
+Before this stack, a named-barrier ID had no first-class representation in the
+Triton stack. The barrier operand of `ttng.wait_barrier_named` and
+`ttng.arrive_barrier_named` was an `i32`, usually a folded `arith.constant`,
+but the IR had no type, attribute, symbol, wrapper, or allocation that
+identified the value as a hardware named-barrier ID.
 
-Named-barrier IDs currently come from two independent sources that do not
-share a namespace:
+Named-barrier IDs came from two independent sources that did not share a
+namespace:
 
-- The user/TLX path lowers the literal supplied to
+- The user/TLX path lowered the literal supplied to
   `tlx.named_barrier_wait` or `tlx.named_barrier_arrive` directly to an
   `arith.constant i32`.
-- Compiler passes assign IDs with local counters and materialize them as
-  constants. `PingPong.cpp` allocates two IDs per critical region starting at
-  7. `ConvertWarpSpecializeToLLVM` reserves IDs 1 and 2 for fixed lowering
+- Compiler passes assigned IDs with local counters and materialized them as
+  constants. `PingPong.cpp` allocated two IDs per critical region starting at
+  7. `ConvertWarpSpecializeToLLVM` reserved IDs 1 and 2 for fixed lowering
   paths.
 
-The raw-`i32` representation has four problems:
+The raw-`i32` representation had four problems:
 
-- There is no validation that an ID is in the hardware range `[0, 15]`, and
+- There was no validation that an ID was in the hardware range `[0, 15]`, and
   no protection for IDs with reserved semantics.
-- User-selected and compiler-selected IDs can silently collide.
-- A bare integer operand does not communicate that it names a hardware
+- User-selected and compiler-selected IDs could silently collide.
+- A bare integer operand did not communicate that it named a hardware
   barrier.
-- The IR does not distinguish a compile-time ID from a runtime value, which
-  prevents compiler allocation when the existing IDs cannot be proven.
+- The IR did not distinguish a compile-time ID from a runtime value, which
+  prevented compiler allocation when existing IDs could not be proven.
 
 ## 2. Goals and non-goals
 
@@ -53,8 +53,9 @@ The raw-`i32` representation has four problems:
 
 ## 3. IR change
 
-Introduce explicit user and compiler named-barrier ID wrappers. The wrapper is
-created during IR translation and remains opaque to the source-level user.
+The implementation introduces explicit user and compiler named-barrier ID
+wrappers. Each wrapper is created during IR translation and remains opaque to
+the source-level user.
 Both wrappers carry an integer SSA value, but only compiler-created IDs must be
 constant.
 
@@ -97,20 +98,22 @@ pool, so the verifier cannot require pool membership here.
 
 ## 4. Compiler named-barrier allocation
 
-Named barriers can currently be introduced in several places:
+Before the unified allocator and the PingPong refactor, named barriers could
+be introduced in several places:
 
-- NVVM barrier lowering uses ID 0 when no ID is specified.
-- `ConvertWarpSpecializeToLLVM` uses IDs 1 and 2 for fixed lowering paths.
-- Ping-pong synchronization allocates two IDs per critical region from a
-  hard-coded 7 through 15 range. It does not inspect existing named-barrier
-  use, so it will hand out an ID a user has already reserved.
+- NVVM barrier lowering used ID 0 when no ID was specified.
+- `ConvertWarpSpecializeToLLVM` used IDs 1 and 2 for fixed lowering paths.
+- Ping-pong synchronization allocated two IDs per critical region from a
+  hard-coded 7 through 15 range. It did not inspect existing named-barrier
+  use, so it could hand out an ID a user had already reserved.
 
-These local policies do not protect against collisions when the compiler and
-user both need named barriers. Allocation must instead be centralized.
+These local policies did not protect against collisions when the compiler and
+user both needed named barriers. Allocation is now centralized; PingPong emits
+mbarriers instead of allocating named-barrier IDs itself (§6).
 
 ### 4.1 Unified named-barrier pool
 
-Create a compiler-owned pool initialized with IDs `[3, 15]`. IDs 0, 1, and 2
+The compiler-owned pool starts with IDs `[3, 15]`. IDs 0, 1, and 2
 remain reserved until the corresponding fixed lowerings are migrated to the
 same API.
 
@@ -131,59 +134,68 @@ implementation does not recycle IDs based on liveness.
 
 ## 5. mbarrier-to-named-barrier promotion
 
-Triton source generally should not expose barriers directly, but compiler
-generated mbarriers can sometimes be replaced with named barriers. Promotion
-removes shared-memory allocation, barrier initialization, shared-memory
-communication, and phase computation. A dedicated pass provides one policy
-for both ordinary Triton and TLX instead of teaching every producer pass to
-allocate named barriers independently.
+Compiler-generated Triton mbarriers can sometimes be replaced with named
+barriers. `TritonNvidiaGPUPromoteMBarrierToNamedBarrierPass` runs in the NVIDIA
+TTGIR pipeline after TMA lowering and optional partition-warp optimization,
+before fence insertion and MMA lowering, when
+`TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER` is enabled (off by default). A successful
+promotion replaces each arrive/wait with a named-barrier operation and erases
+the now-unused shared-memory allocation, initialization, invalidation, views,
+and captures. TLX's explicit named-barrier APIs and their ID validation remain
+independent of this optional promotion.
 
-The pass is disabled by default. End-to-end coverage must exercise all three
-configurations:
-
-1. Regular AutoWS Triton.
-2. TLX without source-level named barriers.
-3. TLX with source-level named barriers that reserve IDs from the shared pool.
+The pass applies to **Triton-generated** barriers, not TLX-authored ones.
+`triton-tlx-fixup` examines source-level TTIR immediately after AST lowering
+and sets the module's `triton.skip_generic_pipeline` attribute when it finds
+TLX dialect ops, explicit local-memory/TMEM operations, manually written
+`ttg.warp_specialize` ops, or TLX 2-CTA MMA. The promotion pass checks that
+attribute first and returns **before allocating named-barrier IDs**. Checking
+for surviving TLX ops in late TTGIR would miss kernels expressed solely with
+manual warp specialization or whose TLX ops have already been lowered. This
+source marker conservatively excludes any other module with these explicitly
+authored GPU constructs as well; it does not disable unrelated TLX passes or
+user-authored named barriers.
 
 ### 5.1 Promotion safety
 
-The current single-slot pass checks structural eligibility:
+The implemented pass collects complete `1xi64` or `Kx1xi64` local-alloc
+barrier groups. Every physical slot must have exactly one initialization (and,
+if present, one invalidation); all uses must be recognized barrier operations,
+memdesc views, partition captures, or deallocations. No partial promotion of
+an allocation is attempted. For an eligible group, it checks:
 
-1. There is one initialization, one static arrival, and one static wait, with
-   only supported views, captures, and lifecycle uses. Asynchronous byte
-   tracking, predicates, per-thread or multicast arrivals, and wait
-   dependencies are excluded. The initialization count must equal the arrival
-   count. A count above one is allowed: initialization with count `N` followed
-   by one arrival with count `N` completes one phase.
-2. The arrival and wait execute uniformly across distinct partitions of the
-   same warp-specialize operation. Their enclosing `scf.for` nests have
-   equivalent bounds and steps. The participant count comes from both
-   partitions' warp counts; unsupported control flow is rejected.
-3. The actual barrier descriptors are CTA-local. Ordinary shared memory can
-   contain a cross-CTA broadcast barrier, so its memory-space attribute alone
-   is insufficient to establish locality.
-4. A compiler-owned named-barrier ID is available after reservations. If
-   reservation fails, this optional pass leaves the mbarriers unchanged
-   without emitting a diagnostic or failing compilation at this pass.
+1. Arrivals are neither per-thread nor multicast, have no nonconstant-true
+   predicate, and execute uniformly within their task. Waits have no async
+   dependencies, have a recognized phase, and likewise execute uniformly.
+   Only `scf.for`, `scf.if`, and provably uniform `scf.while` ancestors are
+   allowed. Matching guard chains must choose the same `if` branches and
+   `while` iterations across **every** arrival and wait task; matching loop
+   nests must have equivalent iteration spaces. Unprovable or divergent
+   control flow is rejected.
+2. For each slot, producer tasks are distinct from consumer tasks. The sum
+   of producer arrival counts equals its initialization count; a producer
+   task can have one looped arrival and, where the schedule permits, one
+   unlooped priming arrival, but not two looped arrivals. A consumer task has
+   **at most one wait site per slot**. This matters after software pipelining:
+   two waits can legally observe the same completed mbarrier phase, whereas
+   two named-barrier waits participate in successive generations and may
+   hang. Dynamic indices are conservatively counted as potentially touching
+   every slot; two waits for different *static* slots are allowed.
+3. The barriers are CTA-local (including the descriptor's shape and memory
+   space), all active slots belong to the same warp-specialize operation, and
+   each slot has the same participant thread count. Named-barrier arrivals and
+   waits use the sum of the producer and consumer task warp counts, not the
+   mbarrier initialization count.
+4. The shared named-barrier allocator can reserve one ID per active slot
+   without colliding with other compiler or user reservations. Allocation
+   failure leaves the candidate as an mbarrier without failing compilation.
 
-These checks are necessary, but do not prove general synchronization
-equivalence. The producing transformation or workload validation must also
-establish that each dynamic wait observes the distinct phase completed by its
-corresponding arrival and the surrounding synchronization prevents premature
-reuse. The pass does not currently prove these phase-progression or lifetime
-properties.
-
-For example, one arrival can complete phase 0 and two mbarrier waits can
-validly observe that same completed phase. The second wait is redundant;
-replacing it with a named-barrier wait can hang because it participates in a
-new synchronization round. Matching loop nests rejects a single arrival
-paired with a two-iteration wait loop. Equal execution counts alone still do
-not prove that each wait observes a different phase in a larger protocol.
-
-Failed eligibility checks leave the mbarrier unchanged. Passing them does
-not validate the protocol assumptions above. Promotion remains disabled by
-default behind `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER`; enable it only for
-protocols whose equivalence has been established.
+These are deliberately recognizable schedule shapes, not a proof of arbitrary
+mbarrier protocols. In particular, the pass does not establish that two
+syntactically different pipelined wait sites each correspond to a distinct
+generation, nor does it prove lifetime/reuse for an arbitrary source-written
+barrier. Unsupported schedules remain mbarriers; keep the promotion knob off
+unless the producing protocol has been validated.
 
 ### 5.2 Phase-offset and backward-edge barriers
 
@@ -195,107 +207,82 @@ from an earlier iteration. A named barrier has no initial parity state, so an
 unconditional named-barrier wait would introduce a synchronization that was
 not present in the original program.
 
-Such a barrier may be promoted only when the pass can statically prove the
-complete arrival-to-wait schedule for every physical barrier slot:
+The implementation recognizes only these wait-phase and slot schedules:
 
-1. The loop iteration can be normalized from statically understood induction
-   variables, bounds, and steps.
-2. The slot-selection expression and the distance between the producer
-   arrival and its corresponding consumer wait are statically known. For a
-   circular buffer, this is typically a fixed distance `K`, with
-   `slot = iteration mod K` and the wait in iteration `i` consuming the arrival
-   from iteration `i - K`. The arrivals for `i - K < 0` are priming arrivals:
-   statically placed prologue arrivals that execute before the loop and
-   establish the initial phases the first waits observe. A fixed-distance
-   schedule without its priming arrivals leaves the first `K` waits satisfied
-   with no paired arrival, which item 3 rejects.
-3. Every wait executes unconditionally: its predicate must be provably
-   always-true, and no generation may skip the wait. Waits that begin
-   satisfied with no paired priming arrival (initially-skipped phases), waits
-   predicated on a loop-nonempty condition (peeled prologues), and any other
-   schedule whose enabling condition cannot be proven true on entry and every
-   iteration are rejected (see §5.3).
-4. Every wait is paired with exactly one arrival in the same named
-   barrier generation. No data-dependent exit, divergent branch, dynamic trip
-   count, or task-local iteration skew may cause the producer and consumer to
-   advance different numbers of generations.
-5. Arrivals outside the steady-state pairing need static placement. A
-   trailing arrival with no later wait is allowed only when it is statically
-   terminal and the named-barrier ID cannot be reused afterward. A leading
-   (priming) arrival with no earlier wait is allowed only when it executes
-   at most once, before the loop it primes. Otherwise, the candidate is
-   rejected.
+- A constant phase zero, provided the wait is unconditionally executed and
+  its producer and consumer loop nests and guard chains match.
+- A counter-derived parity, `(iteration & 1)` or
+  `((iteration / K) & 1)` (also accepting modulo-two and the compiler's
+  equivalent division/multiplication/subtraction form of modulo). The
+  iteration must be a positive-step normalized `scf.for` induction count or
+  a nonnegative, loop-carried counter incremented by a positive constant.
+  The accepted dynamic schedules start at iteration zero, advance once per
+  iteration, have no phase offset, and use the same counter and equivalent
+  iteration spaces in producer and consumer tasks. For a dynamic `K`-slot
+  group, both sides select `iteration % K` and phase
+  `(iteration / K) % 2`.
+- A separate static-slot pattern: exactly one wait loop per static slot,
+  phase `iteration % 2`, and matching looped arrivals per slot. A producer
+  may also make one unlooped priming arrival *before* its matching loop in
+  the same task. A phase that starts satisfied without a matching arrival is
+  not promotable.
 
-The participant count remains the sum of all producer and consumer threads.
-Named-barrier arrivals have no producer or consumer identity, so every counted
-thread must arrive every generation; this is why predicated participation is
-excluded rather than approximated with a reduced thread count.
-
-For multi-buffer groups, the proof applies to the group as a whole. Every slot
-must have a consistent fixed-distance schedule and a provably aligned first
-use. If any slot or control-flow path cannot be resolved simply and
-statically, the entire group remains an mbarrier group.
+The pass rejects a mix of constant and counter-derived waits (for example,
+a peeled prologue), nonconstant-true wait predicates, missing required priming
+arrivals, and schedules whose guards, slot indices, or per-task sites cannot
+be matched. A warp-uniform dynamic loop bound is permitted when producer and
+consumer bounds are provably equivalent; dynamic exit conditions that cannot
+be proved equal are not. Named-barrier waits do not observe an mbarrier phase
+passively: each participating warp enters the next named-barrier generation.
+The per-task, per-slot site check (§5.1) deliberately leaves SWP-expanded
+multiple-arrive/wait patterns as mbarriers even if their individual phase
+expressions look valid.
 
 ### 5.3 Profitability
 
-The initial profitability policy is deliberately conservative:
+The implemented policy is deliberately conservative:
 
 - Promote an entire multi-buffer group or none of it. Partial promotion does
   not eliminate the group's allocation and phase-management cost.
 - Do not promote per-thread-arrival barriers. Independent arrival is an
   mbarrier advantage and removing it may require extra synchronization.
 - Do not promote predicated, initially-skipped, or loop-peeled schedules.
-  These are rejected on safety grounds first (§5.2 item 3): their enabling
-  conditions cannot be proven, so no sound unconditional named-barrier
-  program exists for them. They would additionally be unprofitable: the
-  compiler could generate predicated named-barrier waits for these shapes,
-  but the predicate computation and extra control flow cost more than the
-  mbarrier savings in every case observed so far. Rejected candidates keep
-  working mbarriers.
+  They fail the current safety and phase-shape checks (§5.2). Synthesizing
+  control flow to make them eligible is outside this pass; rejected candidates
+  retain their mbarriers.
 
-The profitability-driven restrictions above can be relaxed after evaluation
-provides a stronger cost model. That does not apply to the §5.2 safety
-rules. Admitting predicated or initially-skipped schedules would first
-require a soundness proof (for example, predicated named-barrier waits with
-proven generation alignment), and only then a cost argument.
+A stronger cost model cannot relax the §5.2 safety rules. Admitting predicated
+or initially-skipped schedules would first require a soundness proof (for
+example, predicated named-barrier waits with proven generation alignment),
+and only then a cost argument.
 
 ### 5.4 Priority
 
-When there are fewer named-barrier IDs than promotable groups, rank candidates
-with these initial rules:
-
-1. Exclude candidates that require additional synchronization, including
-   every-thread mbarriers.
-2. Prefer candidates used at greater loop depth as a proxy for execution
-   frequency.
-3. Prefer groups requiring fewer named-barrier IDs so complete groups are more
-   likely to be promoted.
-
-Tie-breaking must be deterministic. A future model may include critical-path
-or bottleneck information.
+After reserving warp-specialize IDs, the pass validates candidates before
+rewriting any of them. It sorts eligible allocations by descending
+partition-relative `scf.for` depth, then ascending number of active slots
+(IDs required), and finally original IR walk order for deterministic ties.
+If the allocator cannot supply the whole group's IDs, that group is skipped.
+A future model may include critical-path or bottleneck information.
 
 ## 6. Ping-pong-to-mbarrier refactor
 
-After promotion is available, refactor PingPong to generate mbarriers and let
-the promotion pass decide whether named barriers are profitable and available.
-This removes its independent ID allocator and makes promotion the single
-source of truth.
-
-Before enabling this path by default, evaluate:
-
-- Whether ping-pong remains profitable when only some or none of its
-  mbarriers can be promoted.
-- Whether the pass needs a configurable barrier limit in addition to the
-  hardware limit enforced by the shared pool.
+PingPong now allocates an mbarrier pair and emits arrive/wait operations with
+loop-carried phases, including a priming arrival for the first ping-pong
+round. It first checks that the two task loops have equivalent iteration
+spaces. The optional promotion pass can turn an eligible pair into named
+barriers, but the generated protocol remains valid as mbarriers when the knob
+is off, IDs are unavailable, or eligibility fails. TLX-marked modules keep
+their mbarriers because the promotion pass exits before analyzing them.
 
 ## Testing requirements
 
-Each implementation change must include focused lit coverage for its IR
-contract, verifier failures, allocator behavior, safety analysis, candidate
-ranking, and rewrites. Final end-to-end tests must expose the
-disabled-by-default promotion knob and demonstrate correct execution and code
-generation for regular AutoWS Triton, TLX without named barriers, and TLX with
-named barriers. Phase-offset coverage must include positive fixed-distance
-schedules and rejection cases for predicated waits, initially-skipped
-generations, peeled prologues, dynamic distance, divergent predication,
-mismatched trip counts, and unmatched non-terminal generations.
+Focused lit coverage in `test/TritonNvidiaGPU/promote-mbarrier-to-named-barrier.mlir`
+checks eligible Triton rewrites, multibuffer/phase schedules, guard and
+participant rejection, SWP-duplicated wait-site rejection, and preservation
+of an otherwise-promotable TLX-marked module (including its barrier-ID state).
+`test/TLX/attach-metadata.mlir` verifies that TLX fixup attaches the source
+marker even for manually warp-specialized kernels with no TLX dialect ops.
+The Blackwell AutoWS and Hopper PingPong tests exercise enabled promotion
+for Triton. TLX correctness tests should validate their native mbarrier and
+named-barrier protocols unchanged, **not** require TLX promotion.

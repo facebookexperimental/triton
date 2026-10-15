@@ -208,19 +208,14 @@ def test_tlx_mbarrier_promotion(promote, device):
     torch.testing.assert_close(output, torch.arange(32, dtype=torch.int32, device=device))
     ttgir = kernel.asm["ttgir"]
     ptx = kernel.asm["ptx"]
-    if promote:
-        assert "ttng.init_barrier" not in ttgir, f"TTGIR {ttgir}"
-        assert "ttng.compiler_named_barrier_id" in ttgir, f"TTGIR {ttgir}"
-        assert "ttng.wait_barrier_named" in ttgir, f"TTGIR {ttgir}"
-        assert "ttng.arrive_barrier_named" in ttgir, f"TTGIR {ttgir}"
-        assert re.search(r"bar\.sync\s+4,\s*64;", ptx), f"PTX {ptx}"
-        assert re.search(r"bar\.arrive\s+4,\s*64;", ptx), f"PTX {ptx}"
-    else:
-        assert "ttng.init_barrier" in ttgir, f"TTGIR {ttgir}"
-        assert "ttng.wait_barrier " in ttgir, f"TTGIR {ttgir}"
-        assert "ttng.arrive_barrier " in ttgir, f"TTGIR {ttgir}"
-        assert "ttng.compiler_named_barrier_id" not in ttgir, f"TTGIR {ttgir}"
-        assert "mbarrier.init.shared::cta.b64" in ptx, f"PTX {ptx}"
+    # TLX-marked modules skip mbarrier promotion entirely (the source marker
+    # survives lowering that erases TLX dialect ops), so the knob has no effect
+    # here either way: the mbarrier survives and no compiler barrier ID appears.
+    assert "ttng.init_barrier" in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.wait_barrier " in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.arrive_barrier " in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.compiler_named_barrier_id" not in ttgir, f"TTGIR {ttgir}"
+    assert "mbarrier.init.shared::cta.b64" in ptx, f"PTX {ptx}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -234,20 +229,19 @@ def test_tlx_mbarrier_promotion_avoids_user_named_barrier(device):
 
     torch.testing.assert_close(output, torch.arange(32, dtype=torch.int32, device=device))
     ttgir = kernel.asm["ttgir"]
-    assert "ttng.init_barrier" not in ttgir, f"TTGIR {ttgir}"
+    # TLX-marked modules skip mbarrier promotion entirely, so the explicit
+    # user barrier is preserved while no compiler barrier ID is allocated.
+    assert "ttng.init_barrier" in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.compiler_named_barrier_id" not in ttgir, f"TTGIR {ttgir}"
     # Tie each constant to the barrier-id op that consumes it: a bare
     # `arith.constant` substring also matches unrelated constants.
     user_id = re.search(r"ttng\.user_named_barrier_id (%\S+)", ttgir)
     assert user_id, f"TTGIR {ttgir}"
     assert re.search(re.escape(user_id.group(1)) + r" = arith\.constant 9 : i32", ttgir), f"TTGIR {ttgir}"
-    compiler_id = re.search(r"ttng\.compiler_named_barrier_id (%\S+)", ttgir)
-    assert compiler_id, f"TTGIR {ttgir}"
-    assert re.search(re.escape(compiler_id.group(1)) + r" = arith\.constant 4 : i32", ttgir), f"TTGIR {ttgir}"
     ptx = kernel.asm["ptx"]
     assert re.search(r"bar\.sync\s+9,\s*64;", ptx), f"PTX {ptx}"
     assert re.search(r"bar\.arrive\s+9,\s*64;", ptx), f"PTX {ptx}"
-    assert re.search(r"bar\.sync\s+4,\s*64;", ptx), f"PTX {ptx}"
-    assert re.search(r"bar\.arrive\s+4,\s*64;", ptx), f"PTX {ptx}"
+    assert "mbarrier.init.shared::cta.b64" in ptx, f"PTX {ptx}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -261,13 +255,14 @@ def test_tlx_multi_partition_mbarrier_promotion(device):
 
     torch.testing.assert_close(output, torch.arange(32, dtype=torch.int32, device=device))
     ttgir = kernel.asm["ttgir"]
-    assert "ttng.init_barrier" not in ttgir, f"TTGIR {ttgir}"
-    assert ttgir.count("ttng.compiler_named_barrier_id") == 3, f"TTGIR {ttgir}"
-    assert ttgir.count("ttng.arrive_barrier_named") == 2, f"TTGIR {ttgir}"
-    assert ttgir.count("ttng.wait_barrier_named") == 1, f"TTGIR {ttgir}"
+    # TLX-marked modules skip mbarrier promotion entirely: the mbarriers
+    # survive in every partition and no compiler barrier ID is allocated.
+    assert "ttng.init_barrier" in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.compiler_named_barrier_id" not in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.arrive_barrier " in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.wait_barrier " in ttgir, f"TTGIR {ttgir}"
     ptx = kernel.asm["ptx"]
-    assert len(re.findall(r"bar\.arrive\s+4,\s*192;", ptx)) == 2, f"PTX {ptx}"
-    assert len(re.findall(r"bar\.sync\s+4,\s*192;", ptx)) == 1, f"PTX {ptx}"
+    assert "mbarrier.init.shared::cta.b64" in ptx, f"PTX {ptx}"
 
 
 @triton.jit
