@@ -768,7 +768,8 @@ def test_tdm_fused_multicast_distributed_correctness(device, num_ctas, split_m, 
 
 @pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
 @pytest.mark.parametrize("group_size", [1, 2])
-def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size):
+@pytest.mark.parametrize("interface", ["packed", "list"])
+def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size, interface):
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
     from triton import knobs
@@ -776,12 +777,17 @@ def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size):
     constants = dict(NUM_PROGRAMS=16, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, NUM_BUFFERS=2,
                      L2_PREFETCH_DISTANCE=0, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=2, NUM_XCDS=8,
                      XCD_CHUNK=2, K=512, group_size=group_size, CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=multicast)
-    source = ASTSource(
-        _gfx1250_grouped.grouped_gemm_tdm_kernel, signature={
-            k: v
-            for k, v in _gfx1250_grouped._grouped_gemm_tdm_compile_signature().items()
-            if k not in constants
-        }, constexprs=constants, attrs=_gfx1250_grouped._grouped_gemm_tdm_compile_attrs())
+    if interface == "packed":
+        kernel = _gfx1250_grouped.grouped_gemm_tdm_kernel
+        signature = _gfx1250_grouped._grouped_gemm_tdm_compile_signature()
+        attrs = _gfx1250_grouped._grouped_gemm_tdm_compile_attrs()
+    else:
+        kernel = _gfx1250_grouped.grouped_gemm_tdm_list_kernel
+        signature = _gfx1250_grouped._grouped_gemm_tdm_list_compile_signature()
+        attrs = _gfx1250_grouped._grouped_gemm_tdm_list_compile_attrs()
+    source = ASTSource(kernel, signature={k: v
+                                          for k, v in signature.items()
+                                          if k not in constants}, constexprs=constants, attrs=attrs)
     assert knobs.runtime.add_stages_inspection_hook is None
     compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32),
                               options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1)))
@@ -885,7 +891,8 @@ def test_amd_independent_cluster_launch_grid_and_cache():
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
 @pytest.mark.parametrize("group_size", [1, 2])
-def test_grouped_gemm_multicast_correctness(cluster_size, multicast, group_size):
+@pytest.mark.parametrize("interface", ["packed", "list"])
+def test_grouped_gemm_multicast_correctness(cluster_size, multicast, group_size, interface):
     # Distinct CPU inputs detect sharing the wrong tile; two persistent tiles
     # per program exercise ring reuse, and G=2 also exercises a group boundary.
     torch.manual_seed(123)
@@ -893,9 +900,132 @@ def test_grouped_gemm_multicast_correctness(cluster_size, multicast, group_size)
     a = torch.randn((group_size * m, k), dtype=torch.float16)
     b = torch.randn((group_size, n, k), dtype=torch.float16)
     offsets = torch.arange(group_size + 1, dtype=torch.int32) * m
-    out = _gfx1250_grouped.grouped_gemm_tdm(a.cuda(), b.cuda(), offsets.cuda(), block_m=256, block_n=256,
-                                            num_programs=16, cross_tile_prefetch=True, xcd_remap_mode="chunked",
-                                            cluster_size=cluster_size, cluster_multicast=multicast).cpu()
+    config = dict(block_m=256, block_n=256, num_programs=16, cross_tile_prefetch=True, xcd_remap_mode="chunked",
+                  cluster_size=cluster_size, cluster_multicast=multicast)
+    if interface == "packed":
+        out = _gfx1250_grouped.grouped_gemm_tdm(a.cuda(), b.cuda(), offsets.cuda(), **config).cpu()
+        outputs = list(out.split(m))
+    else:
+        # Separate allocations prevent an accidental dependence on packed
+        # group strides from passing this check.
+        group_a = [value.cuda() for value in a.split(m)]
+        group_b = [value.cuda().T for value in b.unbind()]
+        outputs = _gfx1250_grouped.grouped_gemm_tdm_list(group_a, group_b, **config)
     for group in range(group_size):
         expected = (a[group * m:(group + 1) * m].float() @ b[group].float().T).half()
-        torch.testing.assert_close(out[group * m:(group + 1) * m], expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(outputs[group].cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("block_m,block_n,depth,staging,cross,k", [
+    (128, 128, 2, 0, False, 256),
+    (128, 128, 3, 0, False, 384),
+    (128, 128, 4, 0, False, 512),
+    (128, 256, 2, 1, True, 512),
+    (256, 128, 2, 1, True, 512),
+    (256, 256, 2, 0, False, 384),
+    (256, 256, 2, 0, True, 512),
+    (256, 256, 2, 1, True, 512),
+])
+def test_grouped_gemm_list_ragged_m(block_m, block_n, depth, staging, cross, k):
+    torch.manual_seed(321)
+    # Alternating sizes exercise successive group transitions and within-group
+    # persistent reuse. B is shared by two groups, which pointer tables allow.
+    m_list = [block_m, 3 * block_m, 2 * block_m]
+    n = 2 * block_n
+    cpu_a = [torch.randn((m, k), dtype=torch.float16) for m in m_list]
+    cpu_b = [torch.randn((n, k), dtype=torch.float16) for _ in m_list]
+    cpu_b[2] = cpu_b[0]
+    group_a = []
+    group_b = []
+    group_c = []
+    for index, (a, b, m) in enumerate(zip(cpu_a, cpu_b, m_list)):
+        # Aligned offset views expose assumptions about allocation bases.
+        shift = 8 * (index + 1)
+        a_storage = torch.empty(a.numel() + shift, device="cuda", dtype=torch.float16)
+        a_view = a_storage[shift:].view_as(a)
+        a_view.copy_(a)
+        group_a.append(a_view)
+        group_b.append(b.cuda().T)
+        c_storage = torch.empty(m * n + shift, device="cuda", dtype=torch.float16)
+        group_c.append(c_storage[shift:].view(m, n))
+    group_b[2] = group_b[0]
+    config = dict(block_m=block_m, block_n=block_n, tdm_pipeline_depth=depth, c_staging_mode=staging,
+                  cross_tile_prefetch=cross, num_programs=2)
+    actual = _gfx1250_grouped.grouped_gemm_tdm_list(tuple(group_a), tuple(group_b), group_c, **config)
+    offsets = [0]
+    for m in m_list:
+        offsets.append(offsets[-1] + m)
+    packed = _gfx1250_grouped.grouped_gemm_tdm(
+        torch.cat(cpu_a).cuda(),
+        torch.stack(cpu_b).cuda(), torch.tensor(offsets, dtype=torch.int32, device="cuda"), **config).cpu()
+    for index, (out, a, b) in enumerate(zip(actual, cpu_a, cpu_b)):
+        assert out is group_c[index]
+        expected = (a.float() @ b.float().T).half()
+        torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(out.cpu(), packed[offsets[index]:offsets[index + 1]], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dimension", ["N", "K"])
+def test_grouped_gemm_list_rejects_ragged_nk(dimension):
+    shapes = [(128, 256, 256), (256, 384 if dimension == "N" else 256, 384 if dimension == "K" else 256)]
+    group_a = [torch.empty((m, k), dtype=torch.float16) for m, n, k in shapes]
+    group_b = [torch.empty((n, k), dtype=torch.float16).T for m, n, k in shapes]
+    with pytest.raises(ValueError, match="same N and K"):
+        _gfx1250_grouped.grouped_gemm_tdm_list(group_a, group_b)
+
+
+@pytest.mark.parametrize("m,n,k,match", [
+    (129, 256, 256, "full tiles"),
+    (128, 264, 256, "full tiles"),
+    (128, 256, 264, "full tiles"),
+    (128, 256, 128, "fill the TDM pipeline"),
+])
+def test_grouped_gemm_list_rejects_unsupported_tiles(m, n, k, match):
+    a = torch.empty((m, k), dtype=torch.float16)
+    b = torch.empty((n, k), dtype=torch.float16).T
+    with pytest.raises(ValueError, match=match):
+        _gfx1250_grouped.grouped_gemm_tdm_list([a], [b], num_programs=2)
+
+
+@pytest.mark.parametrize("condition", ["row_major_b", "padded_a", "unaligned_a", "empty_k"])
+def test_grouped_gemm_list_rejects_layout(condition):
+    a = torch.empty((128, 256), dtype=torch.float16)
+    b = torch.empty((256, 256), dtype=torch.float16).T
+    match = "canonical strides"
+    if condition == "row_major_b":
+        b = b.T
+    elif condition == "padded_a":
+        a = torch.empty((128, 264), dtype=torch.float16)[:, :256]
+    elif condition == "unaligned_a":
+        a = torch.empty(128 * 256 + 1, dtype=torch.float16)[1:].view(128, 256)
+        match = "16-byte aligned"
+    else:
+        a = a[:, :0]
+        b = b[:0]
+        match = "positive"
+    with pytest.raises(ValueError, match=match):
+        _gfx1250_grouped.grouped_gemm_tdm_list([a], [b])
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("block_m,staging,cross", [(128, 0, False), (256, 0, True), (256, 1, True)])
+@pytest.mark.parametrize("m_tiles", [[0, 1, 0, 0, 0, 0, 2, 0], [0, 0, 0]])
+def test_grouped_gemm_list_empty_m(block_m, staging, cross, m_tiles):
+    torch.manual_seed(123)
+    n, k = 512, 512
+    cpu_a = [torch.randn((tiles * block_m, k), dtype=torch.float16) for tiles in m_tiles]
+    cpu_b = [torch.randn((n, k), dtype=torch.float16) for _ in m_tiles]
+    outputs = _gfx1250_grouped.grouped_gemm_tdm_list(
+        [a.cuda() for a in cpu_a],
+        [b.cuda().T for b in cpu_b],
+        block_m=block_m,
+        block_n=256,
+        num_programs=2,
+        c_staging_mode=staging,
+        cross_tile_prefetch=cross,
+    )
+    assert len(outputs) == len(m_tiles)
+    for out, a, b in zip(outputs, cpu_a, cpu_b):
+        expected = (a.float() @ b.float().T).half()
+        torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)

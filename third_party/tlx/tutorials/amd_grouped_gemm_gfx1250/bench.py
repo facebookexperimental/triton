@@ -97,6 +97,8 @@ def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
     command = [
         sys.executable,
         str(kernel),
+        "--kernel",
+        args.kernel,
         "--m_list",
         case.m_list,
         "-N",
@@ -209,6 +211,8 @@ def _write_csv(path: Path, results: list[BenchResult]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark the gfx1250 grouped GEMM shape sweep")
+    parser.add_argument("--kernel", choices=("packed", "list"), default="packed",
+                        help="select the packed or pointer-table TDM kernel (default: packed)")
     parser.add_argument(
         "--case",
         action="append",

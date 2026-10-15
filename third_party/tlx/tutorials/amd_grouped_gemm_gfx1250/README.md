@@ -6,7 +6,7 @@ its correctness and compile tests, and a regular-shape benchmark sweep.
 ## Files
 
 - `amd_grouped_gemm_gfx1250_test.py`: pointer-table baseline, optimized TDM
-  kernel, tests, and single-shape benchmark CLI.
+  packed and list kernels, tests, and single-shape benchmark CLI.
 - `bench.py`: multi-shape benchmark runner with process isolation and CSV
   output.
 
@@ -24,6 +24,31 @@ group_offsets: [G + 1]
 
 It is a full-tile path. Every `M_g` must be divisible by `BLOCK_M`, and `N`
 and `K` must be divisible by `BLOCK_N` and `BLOCK_K`.
+
+The second optimized entry point, `grouped_gemm_tdm_list`, accepts the list
+interface:
+
+```python
+outputs = grouped_gemm_tdm_list(group_a, group_b)
+```
+
+Each `group_a[g]` is FP16 row-major `[M_g, K]` with strides `(K, 1)`.
+Each `group_b[g]` is FP16 column-major `[K, N]` with strides `(1, K)`, such
+as `weights_g.T` for contiguous `[N, K]` weights. Inputs can have independent
+allocations or share storage. All matrices must be on one device and have
+16-byte-aligned base pointers. N and K must be identical across groups;
+varying N/K raises `ValueError`. Zero-row groups are supported. The packed
+kernel's tile-alignment and minimum-K restrictions still apply.
+
+The result is a list of row-major `[M_g, N]` tensors. An optional third
+argument, `group_c`, supplies output buffers. The wrapper uploads pointer
+tables and group offsets without copying the matrix data. It exposes the
+same tuning and benchmark arguments as `grouped_gemm_tdm`.
+
+`grouped_gemm_tdm_kernel` and `grouped_gemm_tdm_list_kernel` are separate
+JIT entry points. A shared implementation specializes group addressing
+at compile time and reuses the TDM pipeline, prefetch, output staging,
+and multicast schedules. The original packed entry point remains the default.
 
 ## Configurations
 
@@ -184,6 +209,17 @@ Run the default regular-shape sweep:
 
 ```bash
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py
+```
+
+Use `--kernel list` to run the second kernel with the same cases and launch
+configuration. Both variants time only kernel launches, excluding metadata
+and output allocation:
+
+```bash
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --kernel packed --csv packed.csv
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --kernel list --csv list.csv
 ```
 
 Each tuple is `(G, M_per_group, N, K)`. The default cases cover the requested
