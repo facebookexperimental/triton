@@ -10,7 +10,9 @@ from typing import Any, Optional, Sequence
 #: 3: multi-op. ``Case.direction`` (an op with a backward has two cases per
 #: shape), ``Result.extra`` (op-specific derived metrics), and ``env["ref"]``
 #: (which reference was raced -- not every op races torch).
-SCHEMA_VERSION = 3
+#: 4: tlx/ref and speedup use verified queued GPU timing; CPU submission
+#: cost is a separate diagnostic for both providers.
+SCHEMA_VERSION = 4
 
 
 class Status(str, enum.Enum):
@@ -176,3 +178,11 @@ def artifact(results: Sequence[Result], env: dict[str, Any]) -> dict:
         "env": env,
         "results": [r.to_dict() for r in results],
     }
+
+
+def require_schema(doc: dict) -> dict:
+    """Reject artifacts from another schema; their ratios are not comparable."""
+    version = doc.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise ValueError(f"artifact schema_version {version!r} != {SCHEMA_VERSION}; re-run instead of comparing")
+    return doc

@@ -1,0 +1,75 @@
+name: Meta LLVM update
+# Prepares a bump when the Meta LLVM fork (facebookexperimental/llvm-project)
+# publishes a release newer than a release line's cmake/meta-llvm-info.json pin:
+# pushes scratch/meta-llvm-bump/<line>, builds wheels from it, and reports on a
+# tracking issue with the command a person runs to open the PR. The Meta CLA
+# check rejects bot-authored PRs, so the bot never opens one. Never lands anything.
+#
+# Scheduled workflows run from the default branch, so this one file serves every
+# release line; _meta-llvm-line.yml does the work for one line.
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target branch to check (blank = all)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Print the new pin, message and issue without pushing'
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - '.github/scripts/meta_llvm_bump.py'
+      - '.github/scripts/meta_llvm_update.py'
+      - '.github/scripts/test_meta_llvm_bump.py'
+      - '.github/workflows/meta-llvm-update.yml'
+      - '.github/workflows/_meta-llvm-line.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: meta-llvm-update-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'run' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install pytest
+      - name: Run updater tests
+        working-directory: .github/scripts
+        run: python3 -m pytest -q test_meta_llvm_bump.py
+
+  main:
+    if: >-
+      github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental' &&
+      (inputs.target == '' || inputs.target == 'main')
+    # read-all: the build check reuses wheels_fb.yml, which declares it.
+    permissions: read-all
+    uses: ./.github/workflows/_meta-llvm-line.yml
+    with:
+      target: main
+      fork_branch: triton_beta
+      dry_run: ${{ inputs.dry_run == true }}
+    secrets: inherit
+
+  release-3-8:
+    if: >-
+      github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental' &&
+      (inputs.target == '' || inputs.target == 'release/3.8.x')
+    permissions: read-all
+    uses: ./.github/workflows/_meta-llvm-line.yml
+    with:
+      target: release/3.8.x
+      fork_branch: triton_3.8.x
+      dry_run: ${{ inputs.dry_run == true }}
+    secrets: inherit

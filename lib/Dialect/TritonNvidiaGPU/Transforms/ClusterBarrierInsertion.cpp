@@ -181,10 +181,9 @@ static bool hasWarpSpecializeOp(FunctionOpInterface funcOp) {
       .wasInterrupted();
 }
 
-static LogicalResult
-insertCrossCTAMBarrierInitSyncForFunction(FunctionOpInterface funcOp,
-                                          Allocation *allocation, int numCTAs,
-                                          OpBuilder &builder) {
+static LogicalResult insertCrossCTAMBarrierInitSyncForFunction(
+    FunctionOpInterface funcOp, Allocation *allocation, int numCTAs,
+    OpBuilder &builder, ArrayRef<Operation *> coveredInitOps) {
   if (!funcOp || funcOp->getNumRegions() != 1) {
     return funcOp.emitOpError(
         "cross-CTA mbarrier init sync insertion requires a single function "
@@ -197,6 +196,8 @@ insertCrossCTAMBarrierInitSyncForFunction(FunctionOpInterface funcOp,
   // Find all cross-CTA mbarrier.init ops and map each
   // one to the containing top-level op that bounds the insertion window.
   funcOp.walk([&](ttng::InitBarrierOp initBarrierOp) {
+    if (llvm::is_contained(coveredInitOps, initBarrierOp.getOperation()))
+      return;
     if (!requiresCrossCTAMBarrierInitSync(initBarrierOp, funcOp, allocation,
                                           numCTAs))
       return;
@@ -462,7 +463,8 @@ void runClusterBarrierInsertion(ModuleAllocation &moduleAllocation,
 
 LogicalResult
 runCrossCTAMBarrierInitSyncInsertion(ModuleAllocation &moduleAllocation,
-                                     int computeCapability) {
+                                     int computeCapability,
+                                     ArrayRef<Operation *> coveredInitOps) {
   ModuleOp mod = moduleAllocation.getModuleOp();
   if (computeCapability < 90)
     return success();
@@ -479,7 +481,7 @@ runCrossCTAMBarrierInitSyncInsertion(ModuleAllocation &moduleAllocation,
         auto *allocation = moduleAllocation.getFuncData(funcOp);
         OpBuilder builder(funcOp);
         if (failed(insertCrossCTAMBarrierInitSyncForFunction(
-                funcOp, allocation, numCTAs, builder))) {
+                funcOp, allocation, numCTAs, builder, coveredInitOps))) {
           status = failure();
         }
       });

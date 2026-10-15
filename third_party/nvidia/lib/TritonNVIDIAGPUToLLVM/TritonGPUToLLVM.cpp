@@ -13,6 +13,8 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -20,6 +22,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
@@ -133,22 +136,73 @@ private:
                                  LLVMTypeConverter &typeConverter);
   void finalizeModule(ModuleOp mod);
 
+  static bool isMovableInitDependency(Operation *op) {
+    if (auto alloc = dyn_cast<triton::gpu::LocalAllocOp>(op))
+      return !alloc.getSrc();
+    return op->getNumRegions() == 0 && isPure(op);
+  }
+
+  static bool isEntryInitPrologueOp(Operation *op) {
+    if (isa<ttng::InitBarrierOp, ttng::TCGen5GlobalAllocOp>(op))
+      return true;
+    if (auto alloc = dyn_cast<ttng::TMEMAllocOp>(op))
+      return !alloc.getSrc();
+    return isMovableInitDependency(op);
+  }
+
+  LogicalResult validateExplicitEntryBarInit(ttng::InitBarrierOp init) {
+    Block *entry = init->getBlock();
+    SetVector<Operation *> dependencies;
+    SmallVector<Value> worklist(init->getOperands());
+    while (!worklist.empty()) {
+      Value value = worklist.pop_back_val();
+      if (auto arg = dyn_cast<BlockArgument>(value)) {
+        if (arg.getOwner() != entry)
+          return init.emitOpError("explicit cluster initialization has a "
+                                  "non-entry dependency");
+        continue;
+      }
+      Operation *def = value.getDefiningOp();
+      if (!dependencies.insert(def))
+        continue;
+      if (def->getBlock() != entry || !isMovableInitDependency(def))
+        return init.emitOpError("explicit cluster initialization cannot safely "
+                                "hoist an effectful or non-entry dependency");
+      llvm::append_range(worklist, def->getOperands());
+    }
+    for (Operation &op : *entry) {
+      if (&op == init.getOperation())
+        break;
+      if (!isEntryInitPrologueOp(&op))
+        return init.emitOpError(
+            "explicit cluster initialization must precede "
+            "effectful execution; later-phase initialization "
+            "is unsupported");
+      if (auto previous = dyn_cast<ttng::InitBarrierOp>(op);
+          previous && previous.getAlloc() == init.getAlloc())
+        return init.emitOpError("explicit cluster barrier reinitialization "
+                                "is unsupported");
+    }
+    return success();
+  }
+
   // Push entry-block mbarrier init ops early enough to preserve the
   // mbarrier-init -> cluster-sync -> TMEM-alloc sequence. Barrier init ops in
   // WS partition bodies are local pipeline barriers; they do not participate in
   // this kernel-entry cluster synchronization point.
   LogicalResult ensureEarlyEntryBarInit(ModuleOp &mod,
-                                        SetVector<Operation *> &barInitOps) {
-    triton::FuncOp funcOp = nullptr;
-    mod.walk([&](triton::FuncOp op) {
-      if (triton::isKernel(op)) {
+                                        SetVector<Operation *> &barInitOps,
+                                        bool validateMotion) {
+    FunctionOpInterface funcOp = nullptr;
+    mod.walk([&](FunctionOpInterface op) {
+      if (triton::isKernel(op) && !op.isExternal()) {
         funcOp = op;
         return WalkResult::interrupt();
       }
       return WalkResult::advance();
     });
     assert(funcOp && "Expecting to find a kernel func but got none.");
-    Block *entryBlock = &funcOp.front();
+    Block *entryBlock = &funcOp.getFunctionBody().front();
 
     // Move all mbar init ops (and their deps) to the beginning of the block
     SetVector<Operation *> opsToMove;
@@ -159,6 +213,10 @@ private:
         continue;
       for (Value operand : op->getOperands()) {
         if (auto *defOp = operand.getDefiningOp()) {
+          if (validateMotion && (defOp->getBlock() != entryBlock ||
+                                 !isMovableInitDependency(defOp)))
+            return op->emitOpError("cluster initialization cannot safely hoist "
+                                   "an effectful or non-entry dependency");
           if (defOp->getBlock() == entryBlock)
             worklist.push_back(defOp);
         }
@@ -286,61 +344,92 @@ private:
 
   // If the kernel is clustered, insert cluster sync properly to
   // bootstrap remote bars or tmem
-  LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
-    if (!triton::gpu::isPhysicalCluster(mod)) {
+  LogicalResult maybeInsertClusterSync(ModuleOp &mod,
+                                       SetVector<Operation *> &coveredInitOps) {
+    SetVector<Operation *> explicitInitOps;
+    LogicalResult status = success();
+    mod.walk([&](ttng::InitBarrierOp init) {
+      if (!init.getBCluster())
+        return;
+      explicitInitOps.insert(init);
+      auto func = init->getParentOfType<triton::FuncOp>();
+      if (computeCapability < 90) {
+        init.emitOpError(
+            "explicit cluster initialization requires NVIDIA SM90+");
+        status = failure();
+      } else if (!func || !triton::isKernel(func) ||
+                 init->getBlock() != &func.front()) {
+        init.emitOpError(
+            "explicit cluster initialization requires unconditional "
+            "kernel-entry placement after inlining");
+        status = failure();
+      } else if (failed(validateExplicitEntryBarInit(init))) {
+        status = failure();
+      }
+    });
+    if (failed(status))
+      return failure();
+    if (triton::gpu::lookupPhysicalNumCTAs(mod) <= 1) {
       return success();
     }
 
-    bool hasRemoteBar = false;
-    bool hasMulticastArrive = false;
-    // Find if we have a remote bar or multicast arrive.
-    mod.walk([&](Operation *op) {
-      if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op);
-          arrive && arrive.isMulticast()) {
-        hasMulticastArrive = true;
-        return WalkResult::interrupt();
-      }
-      SetVector<Operation *> ops;
-      auto remoteBar = getRemoteBarrier(op);
-      if (remoteBar.has_value()) {
-        hasRemoteBar = true;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-    // If we have remote mbar/SMEM access, a multicast arrive, or 2cta TMEM
-    // allocation, we need a cluster sync after mbar init and before use.
-    bool shouldInsert =
-        hasRemoteBar || hasMulticastArrive || tlx::tlxEnablePairedMMA(mod);
-    if (!shouldInsert) {
-      return success();
+    // Explicit cluster scope owns the bootstrap independently of consumers.
+    // Only default-scope kernels need the legacy consumer-based inference.
+    if (explicitInitOps.empty()) {
+      bool hasRemoteBar = false;
+      bool hasMulticastArrive = false;
+      mod.walk([&](Operation *op) {
+        if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op);
+            arrive && arrive.isMulticast()) {
+          hasMulticastArrive = true;
+          return WalkResult::interrupt();
+        }
+        if (getRemoteBarrier(op).has_value()) {
+          hasRemoteBar = true;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (!hasRemoteBar && !hasMulticastArrive && !tlx::tlxEnablePairedMMA(mod))
+        return success();
     }
 
     // Find the kernel entry block and collect entry-block barrier inits.
     // Only entry-block barriers need the cluster fence+sync for cross-CTA
     // visibility. Barriers inside WS partition bodies are local pipeline
     // barriers that don't participate in cross-CTA communication.
-    triton::FuncOp funcOp = nullptr;
-    mod.walk([&](triton::FuncOp op) {
-      if (triton::isKernel(op)) {
+    // Legacy lowering tests can already contain LLVM kernels.
+    FunctionOpInterface funcOp = nullptr;
+    mod.walk([&](FunctionOpInterface op) {
+      if (triton::isKernel(op) && !op.isExternal()) {
         funcOp = op;
         return WalkResult::interrupt();
       }
       return WalkResult::advance();
     });
     assert(funcOp && "Expecting to find a kernel func.");
-    Block *entryBlock = &funcOp.front();
+    Block *entryBlock = &funcOp.getFunctionBody().front();
 
     SetVector<Operation *> entryBarInitOps;
     for (auto &op : *entryBlock) {
+      // Do not pull later local initialization into an explicit bootstrap.
+      // Legacy callers retain their existing entry-block selection behavior.
+      if (!explicitInitOps.empty() && !isEntryInitPrologueOp(&op))
+        break;
       if (isa<ttng::InitBarrierOp>(op))
         entryBarInitOps.insert(&op);
     }
 
+    for (Operation *init : explicitInitOps) {
+      if (!entryBarInitOps.contains(init))
+        return init->emitOpError("explicit cluster initialization requires the "
+                                 "designated kernel-entry bootstrap owner");
+    }
     if (entryBarInitOps.empty())
       return success();
 
-    if (failed(ensureEarlyEntryBarInit(mod, entryBarInitOps)))
+    if (failed(ensureEarlyEntryBarInit(mod, entryBarInitOps,
+                                       !explicitInitOps.empty())))
       return failure();
 
     ttng::InitBarrierOp lastBarInitOp;
@@ -355,14 +444,18 @@ private:
     OpBuilder builder(lastBarInitOp);
     builder.setInsertionPointAfter(lastBarInitOp);
     // need to insert fence to make mbar init visible to cluster
-    ttng::FenceMBarrierInitReleaseClusterOp::create(builder,
-                                                    lastBarInitOp.getLoc());
+    auto fence = ttng::FenceMBarrierInitReleaseClusterOp::create(
+        builder, lastBarInitOp.getLoc());
+    tlx::setClusterSyncBootstrap(fence);
     // need to insert cluster arrive and wait to prevent CTA_X from arriving
     // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
-    ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
-                                  /*relaxed*/ true);
-    ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
+    auto arrive = ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
+                                                /*relaxed=*/true);
+    auto wait = ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
+    tlx::setClusterSyncBootstrap(arrive);
+    tlx::setClusterSyncBootstrap(wait);
+    coveredInitOps.insert(entryBarInitOps.begin(), entryBarInitOps.end());
     // mark mod attr so that WS lowering is aware of this cluster sync point
     tlx::setClusterSyncKernelInitOnMod(mod, true);
     return success();
@@ -413,19 +506,30 @@ LogicalResult ConvertTritonGPUToLLVM::prepareModule(ModuleOp mod,
           mod, barrierAllocator)))
     return failure();
 
+  // Hoisting must precede allocation so liveness sees the entry prologue.
+  SetVector<Operation *> coveredInitOps;
+  if (failed(maybeInsertClusterSync(mod, coveredInitOps)))
+    return failure();
+
+  // Ordinary later cluster syncs may introduce synthetic WS regions during
+  // lowering. Reserve dispatch state before allocation, even if the original
+  // kernel had only one WS region.
+  if (!coveredInitOps.empty())
+    mod->removeAttr("ttg.single-warp-specialize");
+
   ModuleAllocation allocation(
       mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
                targetInfo));
+  if (!coveredInitOps.empty())
+    triton::gpu::attachAllocationSizeAndOffsetAttr(mod, allocation);
   mlir::triton::nvidia_gpu::runClusterBarrierInsertion(allocation,
                                                        computeCapability);
   if (failed(mlir::triton::nvidia_gpu::runCrossCTAMBarrierInitSyncInsertion(
-          allocation, computeCapability)))
+          allocation, computeCapability, coveredInitOps.getArrayRef())))
     return failure();
 
   ModuleMembarAnalysis membarPass(allocation, canSkipBarSync);
   membarPass.run();
-  if (failed(maybeInsertClusterSync(mod)))
-    return failure();
 
   if (enableConcurrencySanitizer) {
     auto hooks = mlir::triton::instrument::createConSanHooks("nvidia");

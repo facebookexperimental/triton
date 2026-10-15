@@ -113,8 +113,8 @@ def TritonGPUProxyFenceInsertion : Pass<"triton-nvidia-gpu-proxy-fence-insertion
   let summary = "Insert fences across generic and async proxy";
 
   let description = [{
-    This pass is to insert memory fences to ensure that memory operations are
-    properly ordered across generic and async operations.
+    Insert shared-memory fences between generic and asynchronous proxy
+    operations using fine-grained physical buffer-region alias analysis.
   }];
 
   let dependentDialects = [
@@ -377,6 +377,25 @@ def TritonNvidiaGPUPromoteMBarrierToNamedBarrierPass
     equivalence. The CUDA pipeline leaves it disabled unless
     TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER is enabled. Validate the workload's
     phase protocol before enabling it.
+  }];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def TritonNvidiaGPUVerifyNamedBarrierCountsPass
+    : Pass<"triton-nvidia-gpu-verify-named-barrier-counts", "mlir::ModuleOp"> {
+  let summary = "Verify compiler-allocated named barrier participant counts";
+
+  let description = [{
+    Recomputes the expected participant count of every compiler-allocated
+    named barrier from its arrive/wait use sites and the current task sizes,
+    failing compilation on mismatch. Catches counts baked before partition
+    warp sizes were final, which would otherwise deadlock at `bar.sync`.
+    User-allocated barriers and dynamically selected handles are skipped.
   }];
 
   let dependentDialects = [

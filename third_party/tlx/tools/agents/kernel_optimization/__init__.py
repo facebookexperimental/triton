@@ -30,7 +30,7 @@ from .decision_maker import (
     SubprocessHarness,
     KernelOptimizer,
 )
-from .decision_maker.profiling.amd_att import collect_fb_att, find_fb_att
+from .decision_maker.profiling.amd_att import collect_amd_att, find_amd_att
 from .decision_maker.profiling.rocm_profiler import collect_rocprofv3, find_rocprofv3
 from .decision_maker.policy import per_case_speedups, weighted_geometric_speedup
 from .optimizer import (
@@ -57,7 +57,7 @@ __all__ = [
     "CaseEvaluation",
     "ChangeScope",
     "CodexCandidateProvider",
-    "collect_fb_att",
+    "collect_amd_att",
     "collect_rocprofv3",
     "Decision",
     "DecisionMaker",
@@ -65,7 +65,7 @@ __all__ = [
     "ExperimentSummary",
     "ExperimentKind",
     "ExperimentHarness",
-    "find_fb_att",
+    "find_amd_att",
     "find_rocprofv3",
     "FixedCandidateProvider",
     "HarnessExecutionError",

@@ -908,53 +908,58 @@ void init_triton_tlx_ir(py::module_ &m) {
              return outputs;
            })
       // Barrier Ops
-      .def("create_alloc_barriers",
-           [](TritonOpBuilder &self, int numBarriers, int arriveCount,
-              Attribute barrierEncoding, int numCTAs) -> mlir::Value {
-             auto context = self.getBuilder().getContext();
-             auto module = self.getBuilder()
-                               .getInsertionBlock()
-                               ->getParentOp()
-                               ->getParentOfType<ModuleOp>();
-             module->setAttr(ttg::AttrNumCTAsName,
-                             self.getBuilder().getI32IntegerAttr(numCTAs));
-             auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
-             SmallVector<int64_t> barriersShape = {numBarriers};
-             SmallVector<int64_t> singleBarrierShape = {1};
-             if (numCTAs > 1) {
-               barriersShape.push_back(numCTAs);
-               singleBarrierShape = {numCTAs};
-             }
-             auto barriersMemDescType = ttg::MemDescType::get(
-                 barriersShape, self.getBuilder().getI64Type(), barrierEncoding,
-                 memorySpace, /*mutableMemory=*/true);
+      .def(
+          "create_alloc_barriers",
+          [](TritonOpBuilder &self, int numBarriers, int arriveCount,
+             Attribute barrierEncoding, int numCTAs,
+             bool bCluster) -> mlir::Value {
+            auto context = self.getBuilder().getContext();
+            auto module = self.getBuilder()
+                              .getInsertionBlock()
+                              ->getParentOp()
+                              ->getParentOfType<ModuleOp>();
+            module->setAttr(ttg::AttrNumCTAsName,
+                            self.getBuilder().getI32IntegerAttr(numCTAs));
+            auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+            SmallVector<int64_t> barriersShape = {numBarriers};
+            SmallVector<int64_t> singleBarrierShape = {1};
+            if (numCTAs > 1) {
+              barriersShape.push_back(numCTAs);
+              singleBarrierShape = {numCTAs};
+            }
+            auto barriersMemDescType = ttg::MemDescType::get(
+                barriersShape, self.getBuilder().getI64Type(), barrierEncoding,
+                memorySpace, /*mutableMemory=*/true);
 
-             auto singleBarrierMemDescType = ttg::MemDescType::get(
-                 singleBarrierShape, self.getBuilder().getI64Type(),
-                 barrierEncoding, barriersMemDescType.getMemorySpace(),
-                 /*mutableMemory=*/true);
+            auto singleBarrierMemDescType = ttg::MemDescType::get(
+                singleBarrierShape, self.getBuilder().getI64Type(),
+                barrierEncoding, barriersMemDescType.getMemorySpace(),
+                /*mutableMemory=*/true);
 
-             // Allocate buffer in shared memory
-             mlir::Value bufferViews =
-                 self.create<ttg::LocalAllocOp>(barriersMemDescType);
+            // Allocate buffer in shared memory
+            mlir::Value bufferViews =
+                self.create<ttg::LocalAllocOp>(barriersMemDescType);
 
-             //  Init barrier in each slot
-             for (auto i = 0; i < numBarriers; i++) {
-               // Obtain the single buffer view
-               Value idx = arith::ConstantIntOp::create(
-                   self.getBuilder(), bufferViews.getLoc(), i, 32);
-               mlir::Value buf = self.create<ttg::MemDescIndexOp>(
-                   singleBarrierMemDescType, bufferViews, idx);
+            //  Init barrier in each slot
+            for (auto i = 0; i < numBarriers; i++) {
+              // Obtain the single buffer view
+              Value idx = arith::ConstantIntOp::create(
+                  self.getBuilder(), bufferViews.getLoc(), i, 32);
+              mlir::Value buf = self.create<ttg::MemDescIndexOp>(
+                  singleBarrierMemDescType, bufferViews, idx);
 
-               // Initialize mbarrier at buf view
-               self.create<ttng::InitBarrierOp>(buf,
-                                                /*number of arrives*/
-                                                arriveCount);
-             }
+              // Initialize mbarrier at buf view
+              self.create<ttng::InitBarrierOp>(buf,
+                                               /*number of arrives*/
+                                               arriveCount, bCluster);
+            }
 
-             // Return mlir::Value
-             return bufferViews;
-           })
+            // Return mlir::Value
+            return bufferViews;
+          },
+          py::arg("num_barriers"), py::arg("arrive_count"),
+          py::arg("barrier_encoding"), py::arg("num_ctas"),
+          py::arg("bCluster") = false)
       .def("create_barrier_wait",
            [](TritonOpBuilder &self, Value mbarrerLoc, Value phase,
               Value pred) -> void {

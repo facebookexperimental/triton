@@ -1,77 +1,23 @@
 name: Meta Triton MI350 Tests
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!docs/**'
-      - '!website/**'
-      - '!test/**'
-      - '!python/test/unit/language/test_tlx_codegen.py'
-      - '!third_party/nvidia/**'
-      - '!include/triton/Dialect/TritonNvidiaGPU/**'
-      - '!lib/Dialect/TritonNvidiaGPU/**'
-      - '!third_party/tlx/tutorials/blackwell*/**'
-      - '!third_party/tlx/tutorials/blackwell*'
-      - '!third_party/tlx/tutorials/testing/test_correctness_autows.py'
-      - '!python/test/unit/cuda/**'
-      - '!python/test/unit/language/test_tlx_*_sm90.py'
-      - 'python/test/unit/language/test_tlx_dot_hip_or_sm90.py'
-      - '!python/test/unit/language/test_tlx_*_sm90up.py'
-      - '!python/test/unit/language/test_tlx_*_sm100.py'
-      - '!python/test/unit/tlx_ops/*_sm90.py'
-      - '!python/test/unit/tlx_ops/*_sm100.py'
-      - '!python/test/unit/tlx_ops/*_gfx942.py'
-      - '!python/test/unit/tlx_ops/*_gfx1250.py'
-      - '!third_party/tlx/ops/kernels/**/sm*.py'
-      - '!third_party/tlx/ops/kernels/**/gfx942*.py'
-      - '!third_party/tlx/ops/kernels/**/gfx1250*.py'
-      - '!third_party/proton/test/**'
-      # Agent instructions and skills do not affect generated code.
-      - '!.agents/**'
-      - '!.claude/**'
-      - '!.llms/**'
-      - '!AGENTS.md'
-      - '!third_party/tlx/tools/agents/skills/**'
-  pull_request:
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!docs/**'
-      - '!website/**'
-      - '!test/**'
-      - '!python/test/unit/language/test_tlx_codegen.py'
-      - '!third_party/nvidia/**'
-      - '!include/triton/Dialect/TritonNvidiaGPU/**'
-      - '!lib/Dialect/TritonNvidiaGPU/**'
-      - '!third_party/tlx/tutorials/blackwell*/**'
-      - '!third_party/tlx/tutorials/blackwell*'
-      - '!third_party/tlx/tutorials/testing/test_correctness_autows.py'
-      - '!python/test/unit/cuda/**'
-      - '!python/test/unit/language/test_tlx_*_sm90.py'
-      - 'python/test/unit/language/test_tlx_dot_hip_or_sm90.py'
-      - '!python/test/unit/language/test_tlx_*_sm90up.py'
-      - '!python/test/unit/language/test_tlx_*_sm100.py'
-      - '!python/test/unit/tlx_ops/*_sm90.py'
-      - '!python/test/unit/tlx_ops/*_sm100.py'
-      - '!python/test/unit/tlx_ops/*_gfx942.py'
-      - '!python/test/unit/tlx_ops/*_gfx1250.py'
-      - '!third_party/tlx/ops/kernels/**/sm*.py'
-      - '!third_party/tlx/ops/kernels/**/gfx942*.py'
-      - '!third_party/tlx/ops/kernels/**/gfx1250*.py'
-      - '!third_party/proton/test/**'
-      # Agent instructions and skills do not affect generated code.
-      - '!.agents/**'
-      - '!.claude/**'
-      - '!.llms/**'
-      - '!AGENTS.md'
-      - '!third_party/tlx/tools/agents/skills/**'
-  schedule:
-    - cron: '0 */6 * * *'
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit used to build the wheel
+        required: true
+        type: string
+      wheel_url:
+        required: true
+        type: string
+      wheel_filename:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
 
 env:
+  GPU_WORKFLOW_NAME: Meta Triton MI350 Tests
   TORCHINDUCTOR_TLX_MODE: "off"
   # Import test files by path, not by prepending their directories to
   # sys.path, so same-named test modules in different directories do not
@@ -79,17 +25,7 @@ env:
   PYTEST_ADDOPTS: --import-mode=importlib
 
 jobs:
-  mi350-build:
-    if: github.repository_owner == 'facebookexperimental'
-    permissions:
-      id-token: write
-      contents: read
-    uses: ./.github/workflows/build.yml
-    with:
-      ref: ${{ github.sha }}
-
   mi350-tritonbench-test:
-    needs: mi350-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 180
@@ -100,13 +36,10 @@ jobs:
     outputs:
       failures: ${{ steps.collect.outputs.failures }}
     steps:
-      - name: Fail if the build job did not succeed
-        if: needs.mi350-build.result != 'success'
-        run: |
-          echo "mi350-build result: ${{ needs.mi350-build.result }}"
-          exit 1
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: Resolve TritonBench ref from PR body (X-link)
         id: tritonbench_pr
         if: github.event_name == 'pull_request'
@@ -153,8 +86,9 @@ jobs:
         if: steps.select.outputs.run_tritonbench != 'false'
         uses: ./.github/actions/install-prebuilt-triton
         with:
-          wheel-url: ${{ needs.mi350-build.outputs.wheel_url }}
-          wheel-filename: ${{ needs.mi350-build.outputs.wheel_filename }}
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Run TritonBench
         id: tritonbench
         if: steps.select.outputs.run_tritonbench != 'false'
@@ -168,12 +102,11 @@ jobs:
         if: always() && github.event_name == 'schedule' && failure()
         run: |
           BUCKET="amd-tritonbench"
-          TITLE="[nightly] ${GITHUB_WORKFLOW} / mi350-tritonbench-test / ${BUCKET}"
+          TITLE="[nightly] ${GPU_WORKFLOW_NAME} / mi350-tritonbench-test / ${BUCKET}"
           FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-tritonbench-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   mi350-tlx-test:
-    needs: mi350-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 240
@@ -184,13 +117,10 @@ jobs:
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
     steps:
-      - name: Fail if the build job did not succeed
-        if: needs.mi350-build.result != 'success'
-        run: |
-          echo "mi350-build result: ${{ needs.mi350-build.result }}"
-          exit 1
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
@@ -204,8 +134,9 @@ jobs:
       - name: Install prebuilt Triton
         uses: ./.github/actions/install-prebuilt-triton
         with:
-          wheel-url: ${{ needs.mi350-build.outputs.wheel_url }}
-          wheel-filename: ${{ needs.mi350-build.outputs.wheel_filename }}
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Run TLX core tests
         id: run_core_tests
         timeout-minutes: 90
@@ -261,32 +192,18 @@ jobs:
           fi
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py ${K[@]+"${K[@]}"} \
             -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-correctness.xml
-      - name: Run host-default TLX L2 perf
-        id: run_perf_tests
-        if: always() && github.event_name == 'schedule'
-        timeout-minutes: 60
-        run: |
-          python -m pytest python/test/tlx_benchmark/test_ops_perf.py \
-            -k "not torchtlx" -v --junitxml=/tmp/tlx-perf.xml
-      - name: Upload TLX perf artifacts
-        if: always() && github.event_name == 'schedule'
-        uses: actions/upload-artifact@v4
-        with:
-          name: mi350-tlx-perf
-          path: /tmp/tlx_benchmark/*.json
-          if-no-files-found: ignore
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           FAILED_FLAG=""
-          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_perf_tests.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket mi350-tlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml /tmp/tlx-perf.xml \
-            --budget /tmp/tlx-core.xml=90 --budget /tmp/tlx-correctness.xml=30 --budget /tmp/tlx-perf.xml=60 \
-            --workflow "${GITHUB_WORKFLOW}" \
+            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml \
+            --budget /tmp/tlx-core.xml=90 --budget /tmp/tlx-correctness.xml=30 \
+            --workflow "${GPU_WORKFLOW_NAME}" \
             --job "mi350-tlx-test" \
             ${FAILED_FLAG}
 
@@ -312,6 +229,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -397,12 +316,11 @@ jobs:
           fi
           python3 .github/scripts/parse_junit_failures.py \
             --junit /tmp/torchtlx.xml /tmp/torchtlx_perf.xml \
-            --workflow "${GITHUB_WORKFLOW}" \
+            --workflow "${GPU_WORKFLOW_NAME}" \
             --job "mi350-torchtlx-test" \
             ${FAILED_FLAG}
 
   mi350-gluon-test:
-    needs: mi350-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 60
@@ -413,13 +331,10 @@ jobs:
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
     steps:
-      - name: Fail if the build job did not succeed
-        if: needs.mi350-build.result != 'success'
-        run: |
-          echo "mi350-build result: ${{ needs.mi350-build.result }}"
-          exit 1
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
@@ -447,8 +362,9 @@ jobs:
         if: steps.gluon.outputs.run == 'true'
         uses: ./.github/actions/install-prebuilt-triton
         with:
-          wheel-url: ${{ needs.mi350-build.outputs.wheel_url }}
-          wheel-filename: ${{ needs.mi350-build.outputs.wheel_filename }}
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Run Gluon tests (python/test/gluon)
         id: run_gluon
         if: steps.gluon.outputs.run == 'true'
@@ -467,7 +383,7 @@ jobs:
           python3 .github/scripts/parse_junit_failures.py \
             --junit /tmp/gluon.xml \
             --budget /tmp/gluon.xml=50 \
-            --workflow "${GITHUB_WORKFLOW}" \
+            --workflow "${GPU_WORKFLOW_NAME}" \
             --job "mi350-gluon-test" \
             ${FAILED_FLAG}
 
@@ -487,11 +403,11 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton MI350 Tests
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
+      sha: ${{ inputs.ref }}
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
@@ -516,11 +432,11 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton MI350 Tests
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
+      sha: ${{ inputs.ref }}
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
@@ -545,11 +461,11 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton MI350 Tests
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
+      sha: ${{ inputs.ref }}
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
@@ -571,11 +487,11 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton MI350 Tests
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
+      sha: ${{ inputs.ref }}
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
@@ -592,7 +508,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton MI350 Tests
       job_name: mi350-tritonbench-test
       failures: ${{ needs.mi350-tritonbench-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -605,7 +521,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton MI350 Tests
       job_name: mi350-tlx-test
       failures: ${{ needs.mi350-tlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -618,7 +534,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton MI350 Tests
       job_name: mi350-torchtlx-test
       failures: ${{ needs.mi350-torchtlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -631,11 +547,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton MI350 Tests
       job_name: mi350-gluon-test
       failures: ${{ needs.mi350-gluon-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'pull_request' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}

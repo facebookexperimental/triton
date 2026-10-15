@@ -8,6 +8,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/OperationSupport.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -17,6 +19,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "ttg-utility"
@@ -29,6 +33,59 @@ namespace ttng = mlir::triton::nvidia_gpu;
 namespace mlir {
 
 using namespace triton;
+
+namespace {
+bool sameWarpSpecializeLoopBound(Value lhs, Value rhs,
+                                 const DenseMap<Value, Value> &inductionVars,
+                                 unsigned depth = 0) {
+  lhs = ttg::resolveWarpSpecializeCapture(lhs);
+  rhs = ttg::resolveWarpSpecializeCapture(rhs);
+  if (lhs == rhs)
+    return true;
+  if (auto it = inductionVars.find(lhs); it != inductionVars.end())
+    return it->second == rhs;
+  if (lhs.getType() != rhs.getType() || depth > 8)
+    return false;
+
+  Operation *lhsDef = lhs.getDefiningOp();
+  Operation *rhsDef = rhs.getDefiningOp();
+  if (!lhsDef || !rhsDef || lhsDef->getNumRegions() ||
+      rhsDef->getNumRegions() || !isMemoryEffectFree(lhsDef) ||
+      !isMemoryEffectFree(rhsDef) ||
+      cast<OpResult>(lhs).getResultNumber() !=
+          cast<OpResult>(rhs).getResultNumber())
+    return false;
+  return OperationEquivalence::isEquivalentTo(
+      lhsDef, rhsDef,
+      [&](Value lhsOperand, Value rhsOperand) {
+        return success(sameWarpSpecializeLoopBound(lhsOperand, rhsOperand,
+                                                   inductionVars, depth + 1));
+      },
+      /*markEquivalent=*/nullptr, OperationEquivalence::IgnoreLocations);
+}
+} // namespace
+
+bool triton::gpu::haveEquivalentWarpSpecializeLoopNests(
+    ArrayRef<scf::ForOp> lhs, ArrayRef<scf::ForOp> rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+
+  DenseMap<Value, Value> inductionVars;
+  for (auto [lhsRef, rhsRef] :
+       llvm::zip(llvm::reverse(lhs), llvm::reverse(rhs))) {
+    scf::ForOp lhsLoop = lhsRef;
+    scf::ForOp rhsLoop = rhsRef;
+    if (!sameWarpSpecializeLoopBound(lhsLoop.getLowerBound(),
+                                     rhsLoop.getLowerBound(), inductionVars) ||
+        !sameWarpSpecializeLoopBound(lhsLoop.getUpperBound(),
+                                     rhsLoop.getUpperBound(), inductionVars) ||
+        !sameWarpSpecializeLoopBound(lhsLoop.getStep(), rhsLoop.getStep(),
+                                     inductionVars))
+      return false;
+    inductionVars[lhsLoop.getInductionVar()] = rhsLoop.getInductionVar();
+  }
+  return true;
+}
 
 bool containsPinnedEncoding(Attribute encoding) {
   if (!encoding)
@@ -655,7 +712,7 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
       return {};
   }
 
-  if (isa<triton::gpu::UpcastFpOpInterface>(op))
+  if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
 
   if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
@@ -691,7 +748,7 @@ Attribute inferDstEncoding(Operation *op, Attribute encoding) {
     if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
       return {};
   }
-  if (isa<triton::gpu::UpcastFpOpInterface>(op))
+  if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
 
   if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
@@ -1268,9 +1325,8 @@ LogicalResult getConvertBackwardSlice(
       }
       for (auto [i, operand] : llvm::enumerate(definingOp->getOpOperands())) {
         Attribute srcEncoding;
-        if (auto upcast =
-                dyn_cast<triton::gpu::UpcastFpOpInterface>(definingOp)) {
-          srcEncoding = upcast.inferSrcEncoding(i, encoding);
+        if (auto cast = dyn_cast<triton::gpu::CastFpOpInterface>(definingOp)) {
+          srcEncoding = cast.inferSrcEncoding(i, encoding);
         } else {
           srcEncoding = inferSrcEncoding(definingOp, encoding);
         }

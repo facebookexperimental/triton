@@ -305,9 +305,14 @@ complete candidate source that exports `matmul(a, b)`.
 AMD timing uses `rocprofv3 --kernel-trace` device timestamps after a 20-second
 steady-state burn. A conservative 3x-IQR filter removes only extreme system-noise samples;
 raw traces and samples remain in the profile artifacts. Summary and deep profile requests
-also collect supported PMC groups. Deep profiles additionally run `fb_att` for one selected
-dispatch of the dominant kernel. Set `TLX_ROCPROFV3` or `TLX_FB_ATT` when those tools are
-not on `PATH`.
+also collect supported PMC groups. Deep profiles additionally run rocprofv3 ATT for one selected
+dispatch of the dominant kernel. Production gfx942 MM tuning optimizes each kernel standalone:
+every baseline case must carry a roofline record (binding limiter, roofline time, and measured
+fraction of it) derived from the rocprofv3 duration, and the agent cites that headroom with ATT
+evidence. A case that beats its HBM roofline by more than 5% (operands cached across rocprofv3
+replays) records `exceeds_roofline` and stays in the baseline without a limiter. No vendor-library baseline enters the decision loop. The raw viewer bundles remain
+separate artifacts. Set `TLX_ROCPROFV3` when rocprofv3 is not on `PATH` and
+`ROCPROF_ATT_LIBRARY_PATH` when its matching decoder is not discoverable.
 
 For an initial AMD smoke run, disable automatic commits and use a small search budget:
 

@@ -1705,31 +1705,31 @@ def test_atomic_poll_waits_for_remote_cta(device):
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "op, dtype_x_str, mode, sem",
-    itertools.chain.from_iterable([[
-        ("add", "bfloat16", mode, sem),
-        ("add", "float16", mode, sem),
-        ("add", "uint32", mode, sem),
-        ("add", "int32", mode, sem),
-        ("add", "float32", mode, sem),
-        ("add", "uint64", mode, sem),
-        ("add", "int64", mode, sem),
-        ("add", "float64", mode, sem),
-        ("max", "uint32", mode, sem),
-        ("max", "int32", mode, sem),
-        ("max", "float32", mode, sem),
-        ("max", "uint64", mode, sem),
-        ("max", "int64", mode, sem),
-        ("max", "float64", mode, sem),
-        ("min", "uint32", mode, sem),
-        ("min", "int32", mode, sem),
-        ("min", "float32", mode, sem),
-        ("min", "uint64", mode, sem),
-        ("min", "int64", mode, sem),
-        ("min", "float64", mode, sem),
-    ]
-                                   for mode in ["all_neg", "all_pos", "min_neg", "max_pos"]
-                                   for sem in [None, "acquire", "release", "acq_rel", "relaxed"]]),
-)
+    list(
+        itertools.chain.from_iterable([[
+            ("add", "bfloat16", mode, sem),
+            ("add", "float16", mode, sem),
+            ("add", "uint32", mode, sem),
+            ("add", "int32", mode, sem),
+            ("add", "float32", mode, sem),
+            ("add", "uint64", mode, sem),
+            ("add", "int64", mode, sem),
+            ("add", "float64", mode, sem),
+            ("max", "uint32", mode, sem),
+            ("max", "int32", mode, sem),
+            ("max", "float32", mode, sem),
+            ("max", "uint64", mode, sem),
+            ("max", "int64", mode, sem),
+            ("max", "float64", mode, sem),
+            ("min", "uint32", mode, sem),
+            ("min", "int32", mode, sem),
+            ("min", "float32", mode, sem),
+            ("min", "uint64", mode, sem),
+            ("min", "int64", mode, sem),
+            ("min", "float64", mode, sem),
+        ]
+                                       for mode in ["all_neg", "all_pos", "min_neg", "max_pos"]
+                                       for sem in [None, "acquire", "release", "acq_rel", "relaxed"]])))
 def test_atomic_rmw(op, dtype_x_str, mode, sem, device):
     check_type_supported(dtype_x_str, device)
     if is_interpreter():
@@ -2129,7 +2129,7 @@ def test_atomic_cas(sem, num_ctas, dtype_str, device):
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
                     reason="num_ctas > 1 requires NVIDIA SM90+ (Hopper)")
-@pytest.mark.skipif(is_sm12x(), reason="scalar multi-CTA atomic_cas is not supported on sm120 (consumer Blackwell)")
+@pytest.mark.skipif(is_sm12x(), reason="scalar multi-CTA atomic_cas is not supported on sm12x (consumer Blackwell)")
 def test_scalar_atomic_cas_multicta_result(device):
 
     @triton.jit
@@ -5085,7 +5085,10 @@ def test_dot(
         if capability[0] == 9 and M >= 64 and N >= 8:
             assert "wgmma.mma_async.sync.aligned.m64n128k32.f32.e5m2.e5m2" in ptx
         elif capability[0] >= 8 and M < 64:
-            assert "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32" in ptx
+            if capability == (8, 9) or capability[0] == 12:
+                assert "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32" in ptx
+            else:
+                assert "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32" in ptx
     elif in_dtype == "float8e4nv" and out_dtype == tl.float32:
         if capability[0] == 9 and M >= 64 and N >= 8:
             assert "wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3" in ptx
@@ -8726,7 +8729,7 @@ def test_indirect_store(dtype, device):
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "dtype",
-    map(tl.dtype, tl.dtype.SINT_TYPES + tl.dtype.UINT_TYPES + tl.dtype.STANDARD_FP_TYPES),
+    list(map(tl.dtype, tl.dtype.SINT_TYPES + tl.dtype.UINT_TYPES + tl.dtype.STANDARD_FP_TYPES)),
 )
 def test_dtype_tensor(device, dtype):
 

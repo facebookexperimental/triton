@@ -2,14 +2,16 @@
 """Learned-query cross-attention whose shared K=V comes from a per-row RMSNorm chain.
 
 K = V = RMSNorm(x + g * w * RMSNorm(c) + pos), Q = Linear(RMSNorm(seed)) broadcast
-over the batch, then flex attention. Baseline: stock Inductor (norm kernel writes bf16 K,
-stock flex template reads it). Candidate: the same model with torchTLX on, the slot for
-an sm90 TLX flex template (native D=80/96 tiles, RMSNorm applied in the K load path).
+over the batch. Baseline: SDPA with torchTLX off. Candidate: flex attention with
+torchTLX allowed to fuse the RMSNorm producer into the attention template.
 """
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
+
+from torchtlx_benchmark.run_torchtlx_fusions import attention
 
 if TYPE_CHECKING:
     import torch
@@ -68,11 +70,13 @@ def _project(seed, wq, bq, x, c, w, g, pos):
     return q, k
 
 
-def model(*inputs) -> torch.Tensor:
-    from torch.nn.attention.flex_attention import flex_attention
-
+def model(*inputs, use_flex=False) -> torch.Tensor:
     q, k = _project(*inputs)
-    return flex_attention(q.contiguous(), k, k)
+    return attention(q.contiguous(), k, k, use_flex=use_flex)
+
+
+def comparison_models():
+    return model, partial(model, use_flex=True)
 
 
 def make_inputs() -> tuple[torch.Tensor, ...]:

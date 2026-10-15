@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -224,6 +225,27 @@ def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
             max_cv=float(payload.get("max_cv", args.max_cv)),
             benchmark_repetitions=int(
                 payload.get("benchmark_repetitions", args.benchmark_repetitions)
+            ),
+            max_diagnostic_proton_passes=int(
+                payload.get("max_diagnostic_proton_passes", 10)
+            ),
+            max_diagnostic_ncu_collections=int(
+                payload.get("max_diagnostic_ncu_collections", 2)
+            ),
+            max_agent_actions_per_candidate=int(
+                payload.get("max_agent_actions_per_candidate", 3)
+            ),
+            max_diagnostic_actions_per_candidate=int(
+                payload.get("max_diagnostic_actions_per_candidate", 2)
+            ),
+            max_source_research_actions_per_candidate=int(
+                payload.get("max_source_research_actions_per_candidate", 1)
+            ),
+            max_source_research_actions_total=int(
+                payload.get("max_source_research_actions_total", 4)
+            ),
+            source_research_saturation_threshold=int(
+                payload.get("source_research_saturation_threshold", 1)
             ),
         )
     return OptimizationBudget(
@@ -579,16 +601,20 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
             governed_benchmark_devices,
         )
 
-        if task == "tuning":
+        if task == "tuning" or production_authoring:
             with governed_benchmark_devices(
                 repository,
                 args.arch,
                 args.device,
                 govern=args.govern,
             ) as devices:
-                args._tuning_device_environments = tuple(
+                environments = tuple(
                     device_environment(device) for device in devices
                 )
+                if task == "tuning":
+                    args._tuning_device_environments = environments
+                else:
+                    args._production_device_environments = environments
                 return _run_task(args, environment_ready=True)
         else:
             with governed_benchmark_device(
@@ -647,6 +673,18 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
         harness_path = Path(__file__).with_name("tuning_harnesses") / f"{args.op}.py"
         cases = production_cases(args.op, args.suite)
         target = _tuning_target(args.op, args.arch)
+        device_environments = getattr(args, "_production_device_environments", ())
+        if device_environments:
+            target = replace(
+                target,
+                environment={
+                    **target.environment,
+                    "TLX_AGENT_DEVICE_POOL": json.dumps(device_environments),
+                    "TLX_AGENT_CHECKPOINT_DIR": str(
+                        (args.output_dir / "case_checkpoints").resolve()
+                    ),
+                },
+            )
     else:
         harness_path, cases_path, target_path = _resolve_harness_paths(
             args.kernel,
@@ -742,6 +780,8 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
         output_dir=args.output_dir,
         diagnostic_proton_intra_kernel=args.diagnostic_proton_intra_kernel,
         prior_run_evidence=prior_run_evidence,
+        kernel_path=kernel_path,
+        repository_root=repository,
     )
     promotion_committer = None
     if commit_snapshot is not None:
