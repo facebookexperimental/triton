@@ -95,3 +95,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// On AMD, int8 scales are E8M0 at any block size: block-16 int8 scales take
+// the E8M0 decode (extui/shli/bitcast), never the NV-only UE5M3 decode.
+// CHECK-LABEL: mfma_dot_scaled_block16_int8_stays_e8m0
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @mfma_dot_scaled_block16_int8_stays_e8m0(
+      %arg0: tensor<32x64x!tt.ptr<bf16>, #blocked2>,
+      %arg1: tensor<32x32x!tt.ptr<i8>, #blocked>,
+      %arg2: tensor<32x4x!tt.ptr<i8>, #blocked1>,
+      %arg3: tensor<32x32x!tt.ptr<f32>, #blocked>
+    ) {
+    // CHECK: %[[ES:.*]] = arith.extui
+    // CHECK-NOT: arith.shrui
+    // CHECK-NOT: arith.andi
+    // CHECK: %[[SHS:.*]] = arith.shli %[[ES]]
+    // CHECK: tt.bitcast %[[SHS]] : tensor<4x32xi16, #linear{{.*}}> -> tensor<4x32xbf16, #linear{{.*}}>
+    %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
+    %1 = tt.load %arg0 : tensor<32x64x!tt.ptr<bf16>, #blocked2>
+    %2 = tt.load %arg1 : tensor<32x32x!tt.ptr<i8>, #blocked>
+    %3 = tt.load %arg2 : tensor<32x4x!tt.ptr<i8>, #blocked1>
+    %4 = tt.dot_scaled %1, %2 scale %3, %cst lhs = bf16 rhs = e2m1 {fastMath = true} : tensor<32x64xbf16, #blocked2> * tensor<32x32xi8, #blocked>, tensor<32x4xi8, #blocked1> -> tensor<32x32xf32, #blocked>
+    tt.store %arg3, %4 : tensor<32x32x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}

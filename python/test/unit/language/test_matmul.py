@@ -1811,8 +1811,11 @@ def nvfp4_ue5m3_matmul(a_ptr, b_ptr, output_ptr, a_scale, b_scale, M, N, K, stri
     tl.store(output_ptrs, accumulator, mask=mask)
 
 
-@pytest.mark.skipif(not is_rubin(), reason="Requires Rubin")
-def test_nvfp4_ue5m3_matmul():
+@pytest.mark.skipif(not (is_cuda() and torch.cuda.get_device_capability()[0] == 10),
+                    reason="Requires Blackwell 10.x or Rubin")
+# 0x01 is the smallest subnormal (2^-17); 0xFE is the largest finite value (114688).
+@pytest.mark.parametrize("scale_byte", [None, 0x01, 0xFE], ids=["random", "0x01", "0xFE"])
+def test_nvfp4_ue5m3_matmul(scale_byte):
 
     def ue5m3_to_float32(data):
         data = data.to(torch.uint8)
@@ -1831,6 +1834,8 @@ def test_nvfp4_ue5m3_matmul():
         exp = torch.randint(13, 16, size=size, dtype=torch.uint8, device=device)
         mant = torch.zeros(size, dtype=torch.uint8, device=device)
         data = (exp << 3) | mant
+        if scale_byte is not None:
+            data = torch.full_like(data, scale_byte)
         return data, ue5m3_to_float32(data)
 
     m, n, k = 1024, 1024, 1024
@@ -1879,5 +1884,7 @@ def test_nvfp4_ue5m3_matmul():
     if is_compile_warmup():
         return
     ref = torch.matmul(a_ref * a_scale_ref, b_ref * b_scale_ref)
-    torch.testing.assert_close(ref, out, atol=1e-3, rtol=1e-3)
-    assert "kind::mxf4nvf4.block_scale.block16" in kernel.asm["ptx"]
+    # atol scales with the output so the subnormal case is not vacuous.
+    torch.testing.assert_close(ref, out, atol=1e-3 * ref.abs().max().item(), rtol=1e-3)
+    # Native UE5M3 MMA is Rubin-only; other Blackwell targets decompose.
+    assert ("kind::mxf4nvf4.block_scale.block16" in kernel.asm["ptx"]) == is_rubin()

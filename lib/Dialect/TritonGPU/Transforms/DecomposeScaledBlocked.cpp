@@ -23,6 +23,18 @@ SmallVector<int, 2> DecomposeScaledBlocked::getTransposeOrder(int rank) {
   return transOrder;
 }
 
+// NV-only classification, mirroring getScaleKind's native-path rule in
+// MMAv5.cpp: int8 scales with a block factor of 16 are UE5M3. Callers must
+// additionally gate on allowUE5M3Scales: AMD treats int8 scales as E8M0 at
+// any block size.
+static bool isUE5M3ScaleTensor(DotScaledOp dotOp, Value scale) {
+  return scale &&
+         cast<RankedTensorType>(scale.getType())
+             .getElementType()
+             .isInteger(8) &&
+         dotOp.deduceScaleFactor() == 16;
+}
+
 LogicalResult
 DecomposeScaledBlocked::matchAndRewrite(DotScaledOp scaledDotOp,
                                         PatternRewriter &rewriter) const {
@@ -33,6 +45,17 @@ DecomposeScaledBlocked::matchAndRewrite(DotScaledOp scaledDotOp,
   // Types
   auto computeType = getComputeType(scaledDotOp.getAElemType(),
                                     scaledDotOp.getBElemType(), rewriter);
+
+  // UE5M3 scales reach 114688 and overflow f16 (max 65504) at decode time,
+  // even when scale * value would fit. Name-reject FP16-compute UE5M3 dots
+  // instead of producing silent inf. This is NV-only (allowUE5M3Scales):
+  // AMD classifies int8 scales as E8M0 and is unaffected.
+  if (allowUE5M3Scales && computeType == rewriter.getF16Type() &&
+      (isUE5M3ScaleTensor(scaledDotOp, scaledDotOp.getAScale()) ||
+       isUE5M3ScaleTensor(scaledDotOp, scaledDotOp.getBScale())))
+    return scaledDotOp.emitError(
+        "cannot decompose dot_scaled with UE5M3 (int8 block-16) scales and "
+        "f16 compute type: scales up to 114688 overflow f16");
 
   auto scaledA = scaleArg(rewriter, scaledDotOp, 0, computeType);
   scaledA = cvtDotOperand(rewriter, scaledDotOp, 0, scaledA);
@@ -53,6 +76,76 @@ DecomposeScaledBlocked::getComputeType(ScaleDotElemType aType,
   if (aType == ScaleDotElemType::FP16 || bType == ScaleDotElemType::FP16)
     return rewriter.getF16Type();
   return rewriter.getBF16Type();
+}
+
+TypedValue<RankedTensorType>
+DecomposeScaledBlocked::decodeUE5M3To16(PatternRewriter &rewriter,
+                                        TypedValue<RankedTensorType> scale,
+                                        FloatType computeType) const {
+  // Decode a UE5M3 (unsigned E5M3, NVFP4 block-16) scale byte to a 16-bit
+  // float: exponent bits [7:3] with bias 15, mantissa bits [2:0]. Matches
+  // the ue5m3_to_float32 reference in test_nvfp4_ue5m3_matmul: exp == 0 is
+  // subnormal (mant * 2^-17), 0xFF (exp == 31, mant == 7) is NaN, otherwise
+  // normal ((1 + mant/8) * 2^(exp-15)), including 0xF8-0xFE as finite
+  // (1+m/8)*2^16. 0xFF additionally matches maskNan's byte comparison, so
+  // both agree on the NaN byte.
+  // Compute type is always bf16 here: UE5M3 scales reach 114688 and overflow
+  // f16, so f16-compute UE5M3 dots are name-rejected in matchAndRewrite.
+  assert(computeType == rewriter.getBF16Type() &&
+         "UE5M3 decode requires bf16 compute type");
+  auto loc = scale.getLoc();
+  auto scaleTy = scale.getType();
+  auto f32Type = rewriter.getF32Type();
+  auto i32Type = rewriter.getI32Type();
+
+  auto splatI32 = [&](int32_t v) {
+    auto cst = arith::ConstantIntOp::create(rewriter, loc, v, 32);
+    return SplatOp::create(rewriter, loc, scaleTy.clone(i32Type), cst);
+  };
+
+  // exp = (byte >> 3) & 0x1F, mant = byte & 0x7.
+  auto x = arith::ExtUIOp::create(rewriter, loc, scaleTy.clone(i32Type), scale);
+  auto shr3 = arith::ShRUIOp::create(rewriter, loc, x, splatI32(3));
+  auto exp = arith::AndIOp::create(rewriter, loc, shr3, splatI32(0x1F));
+  auto mant = arith::AndIOp::create(rewriter, loc, x, splatI32(0x7));
+
+  // Subnormal (exp == 0): mant * 2^-17, exact in f32 (power-of-two scaling
+  // far from overflow/underflow).
+  auto mantF32 =
+      arith::UIToFPOp::create(rewriter, loc, scaleTy.clone(f32Type), mant);
+  auto twoNeg17 =
+      SplatOp::create(rewriter, loc, scaleTy.clone(f32Type),
+                      arith::ConstantOp::create(
+                          rewriter, loc, rewriter.getF32FloatAttr(0x1p-17)));
+  auto sub = arith::MulFOp::create(rewriter, loc, mantF32, twoNeg17);
+
+  // Normal: f32 bits ((exp + 112) << 23) | (mant << 20). The f32 exponent
+  // field is exp - 15 + 127 = exp + 112. Exact by construction.
+  auto f32Exp = arith::AddIOp::create(rewriter, loc, exp, splatI32(112));
+  auto expBits = arith::ShLIOp::create(rewriter, loc, f32Exp, splatI32(23));
+  auto mantBits = arith::ShLIOp::create(rewriter, loc, mant, splatI32(20));
+  auto normalBits = arith::OrIOp::create(rewriter, loc, expBits, mantBits);
+  auto normal =
+      BitcastOp::create(rewriter, loc, scaleTy.clone(f32Type), normalBits);
+
+  // 0xFF only: quiet NaN. 0xF8-0xFE take the normal path above, which
+  // yields (1+m/8)*2^16 for exp == 31.
+  auto nan = BitcastOp::create(rewriter, loc, scaleTy.clone(f32Type),
+                               splatI32(static_cast<int32_t>(0x7FC00000)));
+
+  auto isSub = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
+                                     exp, splatI32(0));
+  auto isFF = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, x,
+                                    splatI32(0xFF));
+  auto notSub = arith::SelectOp::create(rewriter, loc, isFF, nan, normal);
+  auto scaleF32 = arith::SelectOp::create(rewriter, loc, isSub, sub, notSub);
+
+  // Every UE5M3 value is exactly representable in bf16 (3-bit mantissa,
+  // exponent range [-17, 16]), so the truncation is exact.
+  return cast<TypedValue<RankedTensorType>>(
+      arith::TruncFOp::create(rewriter, loc, scaleTy.clone(computeType),
+                              scaleF32)
+          .getResult());
 }
 
 TypedValue<RankedTensorType>
@@ -260,8 +353,11 @@ TypedValue<RankedTensorType> DecomposeScaledBlocked::extendAndBroadcastScale(
     scale = TransOp::create(rewriter, loc, scale, order);
   }
 
-  // 1) Cast scale to compute type (fp16/bf16)
-  auto scale16 = scaleTo16(rewriter, scale, computeType);
+  // 1) Cast scale to compute type (fp16/bf16). On NV, int8 block-16
+  // scales are UE5M3, not E8M0, and need their own decode.
+  auto scale16 = allowUE5M3Scales && isUE5M3ScaleTensor(scaledDotOp, scale)
+                     ? decodeUE5M3To16(rewriter, scale, computeType)
+                     : scaleTo16(rewriter, scale, computeType);
 
   // 2) Broadcast scale to the same shape as v and convert the layout
   return broadcastScale(rewriter, scaledDotOp, scale16, kDim,
@@ -282,8 +378,10 @@ DecomposeScaledBlocked::cvtDotOperand(PatternRewriter &rewriter,
 }
 
 void populateDecomposeScaledBlockedPatterns(RewritePatternSet &patterns,
-                                            int benefit) {
-  patterns.add<DecomposeScaledBlocked>(patterns.getContext(), benefit);
+                                            int benefit,
+                                            bool allowUE5M3Scales) {
+  patterns.add<DecomposeScaledBlocked>(patterns.getContext(), benefit,
+                                       allowUE5M3Scales);
 }
 
 } // namespace mlir::triton::gpu
