@@ -59,9 +59,7 @@ def gfx950_addmm_warppipe_compute_async(
         next_buf = ((tile_id + 1) % NUM_BUFFERS).to(tl.int32)
         k_prefetch = (k_lo + tile_id + NUM_BUFFERS) * BLOCK_K
 
-        # The loop-tail wait prevents the leading wave from refilling LDS while
-        # another wave still consumes the current buffer.
-        tlx.async_load_wait_group(NUM_BUFFERS - 2)
+        tlx.async_load_wait_group(0)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(
                 a_tile,
