@@ -85,8 +85,13 @@ int getContextualMaxNReg(Operation *op) {
       if (auto actRegisters = partitions.getParentOp().getActualRegisters())
         return (*actRegisters)[1 + idx];
       if (auto requestedRegisters =
-              partitions.getParentOp().getRequestedRegisters())
-        return (*requestedRegisters)[idx];
+              partitions.getParentOp().getRequestedRegisters()) {
+        // A requested value of -1 is AutoWS' "give me an even share of the
+        // leftover registers" sentinel, only resolved into `actualRegisters`
+        // by AllocateWarpGroups. It is not a register limit.
+        if (int32_t requested = (*requestedRegisters)[idx]; requested > 0)
+          return requested;
+      }
       return {};
     }
 
