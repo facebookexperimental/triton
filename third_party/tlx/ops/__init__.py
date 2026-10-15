@@ -24,7 +24,7 @@ from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 __all__ = ["mm", "flash_attn", "hstu_attn", "UnsupportedOp", "InvalidInput"]
 
 
-def mm(a, b, *, arch=None, space="full"):
+def mm(a, b, *, out=None, arch=None, space="full"):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major."""
     fn, spec = impl_for("mm", arch)
     # Mirror the kernel's operand prep: a non-contiguous operand is fed to its
@@ -33,7 +33,9 @@ def mm(a, b, *, arch=None, space="full"):
     b_src = b if b.is_contiguous() else b.T
     check_inputs(spec, dtype=a.dtype, row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]),
                  elem_bytes=a.element_size())
-    return fn(a, b, space=space)
+    if out is None:
+        return fn(a, b, space=space)
+    return fn(a, b, out=out, space=space)
 
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, arch=None, space="full"):
