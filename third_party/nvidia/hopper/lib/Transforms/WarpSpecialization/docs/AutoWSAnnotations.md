@@ -78,7 +78,7 @@ places:
 | Path | Consumer (file, symbol) | Where it looks | Effect when present |
 |---|---|---|---|
 | Software pipeliner, any WS mode | `AssignLatencies.cpp`, `AssignMMALatencies::run` | The `scf.for` whose body directly contains the MMA | Matters only when the MMA's accumulator is read inside that same loop (`requiresAccMultiBuffering`). The MMA then does not get the extra latency stage. In a non-WS loop its users stay in the MMA's stage, so `lowerMMA` does not multi-buffer the TMEM accumulator across stages. In a WS loop the MMA's latency is 1 instead of 2. |
-| Meta WS memory planner | `WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor` | Any ancestor of an MMAv5 consumer that carries both this attribute and `tt.data_partition_factor > 1` | Every TMA-fed SMEM operand of that MMA gets a copy floor equal to the configured `num_stages`. With `data_partition_factor` 1 or unset, the SMEM planner ignores the attribute (see [TMAStoreWaitPipeline.md, Phase 3.7](TMAStoreWaitPipeline.md#phase-37-epilogue-group-copy-increase) and [MemoryPlannerSearch.md](MemoryPlannerSearch.md)). |
+| Meta WS memory planner | `WSMemoryPlanner.cpp`, `getStaticSmemCopySafetyFloor` | Any ancestor of an MMAv5 consumer that carries both this attribute and `tt.data_partition_factor > 1` | Every TMA-fed SMEM operand of that MMA gets a copy floor equal to the configured `num_stages`. With `data_partition_factor` 1 or unset, the SMEM planner ignores the attribute. |
 | Upstream WS (`TRITON_USE_META_WS` unset) | `LoadMMASpecialization.cpp`; `InsertTmemAref.cpp` (NVWS) | The WS loop (`getOuterWSLoop` for the aref path) | The accumulator's TMEM allocation or aref gets 1 stage instead of 2. |
 
 What it does **not** control under Meta WS: TMEM accumulator copies. The
@@ -103,24 +103,19 @@ Resources affected:
 
 Fallbacks:
 
-- **Wrong loop.** In a non-flattened persistent GEMM the annotated
-  `tl.range` is usually the outer tile loop, while the MMA sits in the inner K
-  loop. `AssignLatencies` checks only the MMA's own loop, so it does not see an
-  outer-loop attribute. The memory-planner floor walks ancestors and does see
-  it.
+- **Wrong loop.** If the annotated `tl.range` is the outer tile loop and the
+  MMA sits in the inner K loop, `AssignLatencies` ignores it; the
+  memory-planner floor still applies.
 - **No default scheduler.** When `use_modulo_schedule`, `use_llm_schedule`,
   `use_joint_schedule`, or `use_list_schedule` is set, `make_ttgir` skips
   `AssignLatencies`, and the latency effect disappears.
 - **SMEM floor relaxed.** If the pinned operand floor makes the plan exceed
   `smemBudget`, `relaxCopySafetyFloorToBudget` gives the copies back one at a
-  time, largest buffer first. It never goes below the pre-floor count. The
-  only record is an `LDBG` line under `-debug-only=nvgpu-ws-memory-planner`.
+  time, largest buffer first. It never goes below the pre-floor count.
 
 ## `loop_unroll_factor` and `disable_licm`
 
-Neither knob is specific to warp specialization. Both are generic loop
-transforms that act on the loop before or after AutoWS sees it, so this
-section only covers how they interact with AutoWS.
+Both are generic loop transforms; this covers their AutoWS interaction only.
 
 ### `loop_unroll_factor`
 
@@ -151,13 +146,9 @@ It sees the unrolled one, with these consequences:
 - **Remainder loop.** The pass removes only `tt.loop_unroll_factor`. Both the
   unrolled loop and the remainder loop keep every other attribute, including
   `tt.warp_specialize`. The pass pins the remainder loop to one pipeline stage.
-- **Persistent WS loops: compile error (reproduced).** `loop_unroll_factor=2`
+- **Persistent WS loops: compile error.** `loop_unroll_factor=2`
   on a persistent warp-specialized loop fails in code partitioning with "SMEM
   circular reuse group is ill-formed" (`WSCodePartition.cpp`).
-- **Not forwarded.** The attribute is registered as `NotForwarded` in
-  `DiscardableAttributes.cpp` (`kAutoWSLoopAttrs`), so the non-persistent
-  single-trip-while rewrite does not copy it onto inner loops. By then it has
-  already been consumed anyway.
 
 Resources: SMEM, through the extra per-copy channels and buffers. Registers,
 through the larger body in each partition. No direct TMEM or warp-count

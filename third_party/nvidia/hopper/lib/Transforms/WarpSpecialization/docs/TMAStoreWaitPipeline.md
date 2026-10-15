@@ -200,12 +200,8 @@ What the cap applies to:
   (`tmaStaging == 2`) starts from the capped value. It is replaced by
   `TRITON_WS_TMA_REDUCE_STAGING_COPIES` only when that variable is also set.
 
-How the applied depth is chosen: Phase 3.7 still walks `tryCopies` upward from
-the group's current copy count to the target. Within that walk the existing
-rules all still apply: it skips depths that violate `K | S` for same-partition
-staging, and it stops at the first depth that exceeds `smemBudget` or a Phase
-3.6 reuse host's capacity. The applied depth is the largest depth that walk
-accepts, so it can be below `K`.
+The walk's existing rules (`K | S`, budget, reuse-host capacity) still apply,
+so the applied depth can be below `K`.
 
 The cap only limits bumps. It never lowers a group below its current copy
 count or its cross-stage floor (`WSBuffer::minCopies`): if the floor is above
@@ -229,9 +225,7 @@ Cases where the variable has no effect:
 - **`smem_alloc_algo = 0`**: the original `MemoryPlanner` does not read the
   variable.
 
-Nothing reports that the cap changed a copy count. The decisions appear only in
-the `Phase 3.7` lines of `-debug-only=nvgpu-ws-memory-planner`, or in the
-`buffer.copy` attributes in the IR after the memory planner.
+Nothing reports the cap's effect.
 
 ### Combined SMEM Cost
 
