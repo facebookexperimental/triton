@@ -111,6 +111,28 @@ def test_flash_attn_mxfp8_fast_exp_bound(causal):
     assert rms(fast - ref) < 1.15 * rms(exact - ref)
 
 
+# A zero sm_scale weighs all visible keys equally: the output is the mean of V
+# over them. With V = 1 only NaNs show; V growing with the key also shows keys
+# missing from the mean.
+@pytest.mark.parametrize("fast_exp", [True, False])
+@pytest.mark.parametrize("causal,n_ctx,v_kind", [(True, 512, "ones"), (False, 1024, "key"), (True, 1024, "key")])
+def test_flash_attn_mxfp8_zero_scale(causal, n_ctx, v_kind, fast_exp):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950
+
+    torch.manual_seed(20)
+    shape = (1, 2, n_ctx, 128)
+    if v_kind == "ones":
+        q = k = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+        v = torch.ones_like(q)
+    else:
+        q, k, _ = _qkv(shape)
+        v = (torch.arange(n_ctx, device="cuda") / n_ctx)[:, None].expand(shape).to(torch.bfloat16).contiguous()
+    assert gfx950._default_config(causal, n_ctx)["pingpong"]
+    out = gfx950._launch_quantized(*gfx950._quantize_qkv(q, k, v, True), causal, 0.0, fast_exp=fast_exp)
+    ref = _sdpa(q.float(), k.float(), v.float(), causal, 0.0)
+    torch.testing.assert_close(out.float(), ref, atol=0.02, rtol=0)
+
+
 @pytest.mark.parametrize("causal", [False, True])
 def test_flash_attn_mxfp8_fwd_multiple_cta_waves(causal):
     from triton.tlx.ops import flash_attn_mxfp8
