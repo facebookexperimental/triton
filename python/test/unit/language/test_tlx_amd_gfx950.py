@@ -3055,3 +3055,57 @@ def test_amd_scheduled_mfma_single_subtile_mapping_gfx950(initialize):
         selected += initial[16:32, 0:16]
     expected[16:32, 0:16] = selected
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@triton.jit
+def _stoch_round_kernel_gfx950(x_ptr, rbits_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offsets)
+    rbits = tl.load(rbits_ptr + offsets)
+    y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
+    tl.store(y_ptr + offsets, y)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "dst_dtype, expected_inst",
+    [
+        ("float8_e5m2", "v_cvt_sr_bf8_f32"),
+        ("float8_e4m3fn", "v_cvt_sr_fp8_f32"),
+        ("float16", "v_cvt_sr_f16_f32"),
+        ("bfloat16", "v_cvt_sr_bf16_f32"),
+    ],
+)
+def test_stoch_round_gfx950(dst_dtype, expected_inst):
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float8_e5m2": torch.float8_e5m2,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+    }
+    dst_dtype_torch = dtype_map[dst_dtype]
+
+    SIZE = 256
+    a = torch.randn([SIZE], dtype=torch.float32, device="cuda")
+    rbits = ((torch.arange(SIZE, device="cuda", dtype=torch.int64) * 2654435761) % 2**32).to(torch.int32)
+    b = torch.empty([SIZE], dtype=torch.float32, device="cuda").to(dst_dtype_torch)
+    kernel = _stoch_round_kernel_gfx950[(1, )](a, rbits, b, BLOCK_SIZE=SIZE, num_warps=1)
+    assert expected_inst in kernel.asm["amdgcn"]
+
+    a_f32 = a.float()
+    b_back = b.float()
+    assert not torch.isnan(b_back).any(), "Stochastic rounding produced NaN"
+    assert not torch.isinf(b_back).any(), "Stochastic rounding produced Inf"
+
+    exact_mask = b_back == a_f32
+    if exact_mask.any():
+        b_ref = a_f32.to(dst_dtype_torch)
+        assert torch.equal(b[exact_mask], b_ref[exact_mask])
+
+    needs_rounding = ~exact_mask
+    if needs_rounding.any():
+        max_expected_diff = 100.0
+        diff = torch.abs(b_back[needs_rounding] - a_f32[needs_rounding])
+        assert (diff < max_expected_diff).all(), (
+            f"Stochastic rounding produced unreasonably large errors: max diff = {diff.max()}, "
+            f"expected < {max_expected_diff}")
