@@ -562,6 +562,7 @@ class CompiledKernel:
         # because it involves doing runtime things
         # (e.g., checking amount of shared memory on current device)
         self.module = None
+        self._module_pid = None
         self.function = None
         self._run = None
         self._unload_module = None
@@ -576,13 +577,16 @@ class CompiledKernel:
 
     def __del__(self):
 
-        if self.module is not None:
+        # Forked children inherit module handles that are still owned by the
+        # parent's GPU runtime and must not unload them.
+        if self.module is not None and self._module_pid == os.getpid():
             if knobs.runtime.kernel_unload_hook is not None:
                 knobs.runtime.kernel_unload_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 
             if self._unload_module is not None:
                 self._unload_module(self.module)
             self.module = None
+            self._module_pid = None
 
     def _init_handles(self):
         if self.module is not None:
@@ -605,6 +609,11 @@ class CompiledKernel:
             # Used by external runtimes such as NativeRT.
             self.asm["launcher.so"] = run.launcher_bytes
         self._run = run
+        # compile_iq: dump a collection task on the first launch through `run`. Gated by
+        # TRITON_COMPILE_IQ_COLLECT; reaches kernels that bypass the JITFunction.run hook.
+        if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
+            from triton.magnon.collector import wrap_launcher
+            self._run = wrap_launcher(self, run)
         # not enough shared memory to run the kernel
         max_shared = _max_shared_mem(device, utils)
         if self.metadata.shared > max_shared:
@@ -622,6 +631,7 @@ class CompiledKernel:
         self._unload_module = utils.unload_module
         self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = utils.load_binary(
             self.name, self.kernel, self.metadata.shared, device)
+        self._module_pid = os.getpid()
         warp_size = active_driver.get_current_target().warp_size
         if self.metadata.num_warps * warp_size > self.n_max_threads:
             raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))

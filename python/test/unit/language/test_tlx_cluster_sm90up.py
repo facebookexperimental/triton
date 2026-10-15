@@ -89,6 +89,67 @@ def test_ctas_per_cga_regroups_grid_without_multiplying(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")
+def test_fence_async_shared_cluster(device):
+
+    @triton.jit
+    def fence_kernel(output_ptr):
+        tlx.fence("async_shared_cluster")
+        tl.store(output_ptr + tl.program_id(0), 1)
+
+    output = torch.zeros(2, dtype=torch.int32, device=device)
+    kernel = fence_kernel[(2, )](output, ctas_per_cga=(2, 1, 1), num_warps=1)
+
+    assert "ttng.fence_async_shared {bCluster = true}" in kernel.asm["ttgir"]
+    assert "fence.proxy.async.shared::cluster" in kernel.asm["ptx"]
+    torch.testing.assert_close(output, torch.ones_like(output))
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer for DSM")
+@pytest.mark.parametrize("N", [128, 1024])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_fence_async_shared_cluster_dsm_handoff(device, N, num_warps):
+    """Remote generic stores feed an async bulk copy through the cluster fence."""
+
+    @triton.jit
+    def handoff_kernel(input_ptr, output_ptr, N: tl.constexpr):
+        source = tlx.local_alloc((N, ), tl.int32, 1)
+        destination = tlx.local_alloc((N, ), tl.int32, 1)
+        barriers = tlx.alloc_barriers(num_barriers=1, scope="cluster")
+        cta_rank = tlx.cluster_cta_rank()
+        offsets = tl.arange(0, N)
+
+        if cta_rank == 0:
+            tlx.barrier_expect_bytes(barriers[0], N * tlx.size_of(tl.int32))
+            values = tl.load(input_ptr + offsets)
+            tlx.remote_shmem_store(dst=source[0], src=values, remote_cta_rank=1)
+
+        # Publish the generic DSM writes before CTA 1 bridges to its async proxy.
+        tlx.cluster_barrier()
+        if cta_rank == 1:
+            tlx.fence("async_shared_cluster")
+            tlx.async_remote_shmem_copy(dst=destination[0], src=source[0], remote_cta_rank=0, barrier=barriers[0])
+
+        if cta_rank == 0:
+            tlx.barrier_wait(barriers[0], phase=0)
+            tl.store(output_ptr + offsets, tlx.local_load(destination[0]))
+        # Keep both CTAs' shared memory alive until the bulk copy has completed.
+        tlx.cluster_barrier()
+
+    input_tensor = torch.arange(N, dtype=torch.int32, device=device) * 17 + 3
+    output = torch.full_like(input_tensor, -1)
+    kernel = handoff_kernel[(2, )](input_tensor, output, N=N, num_warps=num_warps, ctas_per_cga=(2, 1, 1))
+
+    ptx = kernel.asm["ptx"]
+    assert "ttng.fence_async_shared {bCluster = true}" in kernel.asm["ttgir"]
+    assert "st.shared::cluster" in ptx
+    assert ptx.count("fence.mbarrier_init.release.cluster") == 1
+    assert ptx.count("fence.proxy.async.shared::cluster") == 1
+    assert "fence.proxy.async.shared::cta" not in ptx
+    assert "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes" in ptx
+    torch.testing.assert_close(output, input_tensor, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")
 def test_cluster_size_1d(device):
 
     @triton.jit

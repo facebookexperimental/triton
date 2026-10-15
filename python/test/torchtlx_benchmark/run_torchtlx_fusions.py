@@ -11,6 +11,9 @@ import statistics
 import sys
 import types
 
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention
+
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 REL_L2_TOL = 1e-2
@@ -25,6 +28,10 @@ def load_runtime(case) -> None:
     torch = torch_module
     triton = triton_module
     case.torch = torch_module
+
+
+def attention(q, k, v, *, use_flex=False):
+    return flex_attention(q, k, v) if use_flex else F.scaled_dot_product_attention(q, k, v)
 
 
 def discover_cases() -> dict[str, object]:
@@ -102,9 +109,14 @@ def gate(case, label, output, reference) -> None:
 def compile_variant(case, inputs, variant):
     config = case.BASELINE_CONFIG if variant == "baseline" else case.CANDIDATE_CONFIG
     compile_context = getattr(case, "compile_context", contextlib.nullcontext)
+    models = getattr(case, "comparison_models", lambda: (case.model, case.model))()
+    model = models[variant == "candidate"]
     with torch._inductor.config.patch(config), compile_context(variant):
-        model = types.FunctionType(case.model.__code__.replace(co_name=variant), case.model.__globals__, variant,
-                                   case.model.__defaults__, case.model.__closure__)
+        if isinstance(model, types.FunctionType):
+            original = model
+            model = types.FunctionType(original.__code__.replace(co_name=variant), original.__globals__, variant,
+                                       original.__defaults__, original.__closure__)
+            model.__kwdefaults__ = original.__kwdefaults__
         compiled = torch.compile(model, fullgraph=True, options=config)
         output = compiled(*inputs)
     torch.cuda.synchronize()
