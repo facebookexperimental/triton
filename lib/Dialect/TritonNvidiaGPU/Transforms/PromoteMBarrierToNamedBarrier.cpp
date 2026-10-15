@@ -1252,7 +1252,15 @@ std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
     llvm::SmallDenseSet<Region *> waitTaskSet;
     for (Operation *wait : waits) {
       Region *task = getWarpSpecializeTaskRegion(wait);
-      if (!task || arriveTaskSet.contains(task))
+      // An mbarrier phase can be waited on more than once, but every named
+      // barrier wait participates in a new generation. SWP may clone a wait
+      // into several sites with different phase/slot expressions; matching
+      // each site to an arrive loop does not prove one wait per generation.
+      // Count sites per slot, not per allocation: separate static slots can
+      // legitimately have a wait in the same task. Dynamic indices were
+      // conservatively mapped to every slot by mapUsesToSlots above.
+      if (!task || arriveTaskSet.contains(task) ||
+          !waitTaskSet.insert(task).second)
         return std::nullopt;
       for (Region *producer : arriveTaskSet) {
         if (llvm::none_of(arrives, [&](Operation *arrive) {
@@ -1261,7 +1269,6 @@ std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
             }))
           return std::nullopt;
       }
-      waitTaskSet.insert(task);
     }
 
     unsigned slotThreads = 0;
