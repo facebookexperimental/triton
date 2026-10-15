@@ -136,7 +136,10 @@ def add_f32_mixed(acc, x, _semantic=None):
     Lowers to SM100+ ``add.rn.f32.{f16,bf16}``: one instruction per element
     instead of ``cvt`` + ``add``.
     """
-    capability = int(cuda_parse_arch(_semantic.builder.options.arch))
+    arch = _semantic.builder.options.arch
+    assert isinstance(
+        arch, str) and arch.startswith("sm"), (f"tlx.add_f32_mixed requires an NVIDIA GPU, got architecture {arch}")
+    capability = cuda_parse_arch(arch)
     assert capability >= 100, f"tlx.add_f32_mixed requires compute capability >= 100, current capability: {capability}"
     acc = _semantic.to_tensor(acc)
     x = _semantic.to_tensor(x)
