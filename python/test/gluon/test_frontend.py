@@ -4494,7 +4494,7 @@ def test_amd_wmma_scale_layout_for_multicta(target):
                 transposed=True,
                 warp_bases=[[0, 1], [1, 0]],
                 instr_shape=[16, 16, 64],
-                cga_layout=[[0, 0], [1, 0]],
+                cga_layout=[[0, 1], [1, 0]],
             ),  #
             k_width=16,
         )
@@ -4503,13 +4503,8 @@ def test_amd_wmma_scale_layout_for_multicta(target):
 
         b_layout: ttgl.constexpr = ttgl.DotOperandLayout(
             operand_index=1,  #
-            parent=ttgl.amd.AMDWMMALayout(
-                version=3,
-                transposed=True,
-                warp_bases=[[0, 1], [1, 0]],
-                instr_shape=[16, 16, 64],
-                cga_layout=[[1, 0], [0, 0]],
-            ),  #
+            parent=ttgl.amd.AMDWMMALayout(version=3, transposed=True, warp_bases=[[0, 1], [1, 0]],
+                                          instr_shape=[16, 16, 64], cga_layout=[[0, 1], [1, 0]]),  #
             k_width=16,
         )
         b_scale_layout: ttgl.constexpr = ttgl.amd.cdna5.get_wmma_scale_layout(b_layout, [64, 4])
