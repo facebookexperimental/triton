@@ -378,6 +378,133 @@ def test_compile_only_dot_mxfp() -> None:
     assert k.asm["cubin"] != b""
 
 
+@triton.jit
+def simple_dot_mxfp6(
+    a_base,
+    b_base,
+    a_scale,
+    b_scale,
+    out,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    PACKED_BLOCK_K: tl.constexpr = BLOCK_K  # padded to the unpacked width
+    a_ptr = (a_base + tl.arange(0, BLOCK_M)[:, None] * PACKED_BLOCK_K + tl.arange(0, PACKED_BLOCK_K)[None, :])
+    b_ptr = (b_base + tl.arange(0, PACKED_BLOCK_K)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :])
+
+    SCALE_BLOCK_K: tl.constexpr = BLOCK_K // 32
+    scale_a_ptr = (a_scale + tl.arange(0, BLOCK_M)[:, None] * SCALE_BLOCK_K + tl.arange(0, SCALE_BLOCK_K)[None, :])
+    scale_b_ptr = (b_scale + tl.arange(0, BLOCK_N)[:, None] * SCALE_BLOCK_K + tl.arange(0, SCALE_BLOCK_K)[None, :])
+
+    a = tl.load(a_ptr)
+    b = tl.load(b_ptr)
+    a_scale = tl.load(scale_a_ptr)
+    b_scale = tl.load(scale_b_ptr)
+    c = tl.dot_scaled(a, a_scale, "e2m3", b, b_scale, "e3m2")
+    out_ptr = (out + tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :])
+    tl.store(out_ptr, c)
+
+
+@pytest.mark.parametrize("block_k", [64, 128])
+def test_compile_only_dot_mxfp6_sm100(block_k: int, monkeypatch) -> None:
+    # MXFP6 (e2m3/e3m2) scaled dot decomposes to a plain bf16 dot on sm100:
+    # native mxf8f6f4 tcgen05 cannot tile the factor-3 packed K. The packed K
+    # dim is padded to the unpacked width, so all codegen shapes stay POT.
+    #
+    # The unpacked single-block kernel sends LLVM's SLP vectorizer into a
+    # compile-time blowup, so disable just that pass (same knob class as the
+    # sm80 SLP workaround in the NV backend).
+    monkeypatch.setenv("TRITON_DISABLE_SLPVECTORIZATION", "1")
+
+    k = triton.compile(
+        triton.compiler.ASTSource(
+            fn=simple_dot_mxfp6,
+            signature={
+                "a_base": "*u8",
+                "b_base": "*u8",
+                "a_scale": "*u8",
+                "b_scale": "*u8",
+                "out": "*fp32",
+                "BLOCK_M": "constexpr",
+                "BLOCK_N": "constexpr",
+                "BLOCK_K": "constexpr",
+            },
+            constexprs={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": block_k},
+        ),
+        target=GPUTarget("cuda", 100, 32),
+    )
+    ttgir = str(k.asm["ttgir"])
+    # Decompose must have replaced the scaled dot with a plain dot, which the
+    # NV backend then accelerates to unscaled tc_gen5_mma.
+    assert "tc_gen5_mma" in ttgir, "The TTGIR does not contain tc_gen5_mma."
+    assert "tc_gen5_mma_scaled" not in ttgir, "The TTGIR unexpectedly kept native scaled MMA."
+
+    ptx = str(k.asm["ptx"])
+    assert re.search(r"tcgen05\.mma", ptx), "The PTX does not contain tcgen05.mma."
+    assert "mxf8f6f4" not in ptx, "The PTX unexpectedly uses the native mxf8f6f4 kind."
+    assert k.asm["cubin"] != b""
+
+
+@pytest.mark.parametrize("nonkdim", [16, 32])
+def test_compile_only_dot_mxfp6_gfx950(nonkdim: int) -> None:
+    # MXFP6 decomposes to a plain bf16 dot on gfx950: native
+    # v_mfma_scale_*_f8f6f4 cannot tile the factor-3 packed K. The kernel must
+    # still reach plain v_mfma_f32 instructions. The packed K dim is padded to
+    # the unpacked width, so all codegen shapes stay POT.
+
+    k = triton.compile(
+        triton.compiler.ASTSource(
+            fn=simple_dot_mxfp6,
+            signature={
+                "a_base": "*u8",
+                "b_base": "*u8",
+                "a_scale": "*u8",
+                "b_scale": "*u8",
+                "out": "*fp32",
+                "BLOCK_M": "constexpr",
+                "BLOCK_N": "constexpr",
+                "BLOCK_K": "constexpr",
+            },
+            constexprs={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128},
+        ),
+        target=GPUTarget("hip", "gfx950", 64),
+        options={"matrix_instr_nonkdim": nonkdim},
+    )
+    amdgcn = k.asm["amdgcn"]
+    assert re.search(r"v_mfma_f32_", amdgcn), "The AMDGCN does not contain plain v_mfma_f32 instructions."
+    assert "f8f6f4" not in amdgcn, "The AMDGCN unexpectedly uses the native f8f6f4 instruction."
+
+
+def test_compile_only_dot_mxfp6_gfx1250(monkeypatch) -> None:
+    # MXFP6 decomposes to a plain bf16 dot on gfx1250 (see gfx950 note).
+    #
+    # The unpacked kernel hangs LLVM's gfx1250-default co-exec scheduler, so
+    # compile with the default scheduler instead.
+    monkeypatch.setenv("TRITON_HIP_USE_COEXEC_SCHEDULER", "0")
+
+    k = triton.compile(
+        triton.compiler.ASTSource(
+            fn=simple_dot_mxfp6,
+            signature={
+                "a_base": "*u8",
+                "b_base": "*u8",
+                "a_scale": "*u8",
+                "b_scale": "*u8",
+                "out": "*fp32",
+                "BLOCK_M": "constexpr",
+                "BLOCK_N": "constexpr",
+                "BLOCK_K": "constexpr",
+            },
+            constexprs={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128},
+        ),
+        target=GPUTarget("hip", "gfx1250", 64),
+    )
+    amdgcn = k.asm["amdgcn"]
+    assert re.search(r"v_wmma_f32_", amdgcn), "The AMDGCN does not contain plain v_wmma_f32 instructions."
+    assert "f8f6f4" not in amdgcn, "The AMDGCN unexpectedly uses the native f8f6f4 instruction."
+
+
 def test_signature_ordering():
     """
     Checks that ASTSource always uses the argument order from

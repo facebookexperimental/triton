@@ -5438,6 +5438,125 @@ def test_scaled_dot(
         assert re.search(r"v_cvt_scalef32_pk_.*?(fp4|fp8|bf8).*?op_sel", amdgcn)
 
 
+def _pack_fp6_torch(codes, axis=-1):
+    # Dense LSB-first packing: 4 6-bit codes per 3 bytes, code i in bits
+    # [6*i, 6*i+6) of the byte stream. Packs along `axis` (the K axis: the
+    # last dim for lhs [M, K], dim 0 for rhs [K, N]) and pads the packed dim
+    # to the unpacked width; the trailing quarter is ignored padding.
+    assert codes.dtype == torch.uint8 and bool((codes < 64).all()) and codes.shape[axis] % 4 == 0
+    k = codes.shape[axis]
+    codes = codes.moveaxis(axis, -1)
+    grouped = codes.reshape(*codes.shape[:-1], -1, 4).to(torch.int32)
+    e0, e1, e2, e3 = grouped[..., 0], grouped[..., 1], grouped[..., 2], grouped[..., 3]
+    b0 = (e0 | (e1 << 6)) & 0xFF
+    b1 = ((e1 >> 2) | (e2 << 4)) & 0xFF
+    b2 = ((e2 >> 4) | (e3 << 2)) & 0xFF
+    packed = torch.stack([b0, b1, b2], dim=-1)
+    packed = packed.reshape(*codes.shape[:-1], -1).to(torch.uint8)
+    pad_shape = list(packed.shape)
+    pad_shape[-1] = k // 4
+    packed = torch.cat([packed, torch.zeros(pad_shape, dtype=torch.uint8)], dim=-1)
+    return packed.moveaxis(-1, axis)
+
+
+def _decode_fp6_torch(codes, e_bits, bias):
+    # Exact OCP MX FP6 decode to f32 (no Inf/NaN; subnormals supported).
+    codes = codes.to(torch.int32)
+    m_bits = 5 - e_bits
+    sign = torch.where(codes >> 5 != 0, -1.0, 1.0)
+    exp = (codes >> m_bits) & ((1 << e_bits) - 1)
+    mant = (codes & ((1 << m_bits) - 1)).float()
+    normal = exp != 0
+    values = torch.where(
+        normal,
+        (1.0 + mant / (1 << m_bits)) * torch.pow(2.0, (exp - bias).float()),
+        (mant / (1 << m_bits)) * 2.0**(1 - bias),
+    )
+    return sign * values
+
+
+def _decode_e8m0_torch(scales):
+    return torch.pow(2.0, scales.to(torch.int32).float() - 127.0)
+
+
+@triton.jit
+def _fp6_dot_kernel(a_base, stride_a0, stride_a1, a_scale, b_base, stride_b0, stride_b1, b_scale, out, M, N, K,
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, TYPE_A: tl.constexpr,
+                    TYPE_B: tl.constexpr):
+    PACKED_K: tl.constexpr = BLOCK_K  # padded to the unpacked width
+    a_ptrs = a_base + tl.arange(0, BLOCK_M)[:, None] * stride_a0 + tl.arange(0, PACKED_K)[None, :] * stride_a1
+    b_ptrs = b_base + tl.arange(0, PACKED_K)[:, None] * stride_b0 + tl.arange(0, BLOCK_N)[None, :] * stride_b1
+    SCALE_K: tl.constexpr = BLOCK_K // 32
+    sa_ptrs = a_scale + tl.arange(0, BLOCK_M)[:, None] * SCALE_K + tl.arange(0, SCALE_K)[None, :]
+    sb_ptrs = b_scale + tl.arange(0, BLOCK_N)[:, None] * SCALE_K + tl.arange(0, SCALE_K)[None, :]
+    a = tl.load(a_ptrs)
+    b = tl.load(b_ptrs)
+    sa = tl.load(sa_ptrs)
+    sb = tl.load(sb_ptrs)
+    c = tl.dot_scaled(a, sa, TYPE_A, b, sb, TYPE_B)
+    out_ptrs = out + tl.arange(0, BLOCK_M)[:, None] * N + tl.arange(0, BLOCK_N)[None, :]
+    tl.store(out_ptrs, c)
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("M, N, K", [(64, 64, 64), (64, 64, 128), (128, 128, 64), (128, 128, 128)])
+@pytest.mark.parametrize("type_a, type_b", [("e2m3", "e2m3"), ("e3m2", "e3m2"), ("e2m3", "e3m2")])
+@pytest.mark.parametrize("mma", [16, 32] if is_hip() else [16])
+def test_scaled_dot_fp6(M, N, K, type_a, type_b, mma, device):
+    if is_cuda():
+        capability = torch.cuda.get_device_capability()
+        if capability < (10, 0):
+            pytest.skip("mxfp6 needs sm100+")
+        if M < 128:
+            pytest.skip("tcgen05 scaled MMA needs M >= 128")
+    if is_hip() and not (is_hip_cdna4() or is_hip_gfx1250()):
+        pytest.skip("mxfp6 needs gfx950 (MFMA) or gfx1250 (WMMA)")
+    if is_hip() and mma == 16 and K == 64:
+        pytest.skip("K too small for the 16x16x128 instruction")
+    if is_hip_gfx1250() and K == 64:
+        pytest.skip("fp6 scaled WMMA requires logical K >= 128")
+
+    torch.manual_seed(0)
+    e_bits_a, bias_a = {"e2m3": (2, 1), "e3m2": (3, 3)}[type_a]
+    e_bits_b, bias_b = {"e2m3": (2, 1), "e3m2": (3, 3)}[type_b]
+    a_codes = torch.randint(0, 64, (M, K), dtype=torch.uint8)
+    b_codes = torch.randint(0, 64, (K, N), dtype=torch.uint8)
+    a = _pack_fp6_torch(a_codes).to(device)
+    b = _pack_fp6_torch(b_codes, axis=0).to(device)
+    a_scales = torch.randint(122, 134, (M, K // 32), dtype=torch.uint8).to(device)
+    b_scales = torch.randint(122, 134, (N, K // 32), dtype=torch.uint8).to(device)
+    out = torch.empty((M, N), dtype=torch.float32, device=device)
+
+    kernel_kwargs = {"num_warps": 4}
+    if is_hip():
+        kernel_kwargs["matrix_instr_nonkdim"] = mma
+        kernel_kwargs["kpack"] = 1
+    pgm = _fp6_dot_kernel[(1, )](a, a.stride(0), a.stride(1), a_scales, b, b.stride(0), b.stride(1), b_scales, out, M,
+                                 N, K, M, N, K, type_a, type_b, **kernel_kwargs)
+
+    a_ref = _decode_fp6_torch(a_codes, e_bits_a, bias_a) * _decode_e8m0_torch(a_scales.cpu()).repeat_interleave(
+        32, dim=1)
+    b_ref = _decode_fp6_torch(b_codes, e_bits_b, bias_b) * _decode_e8m0_torch(b_scales.cpu()).repeat_interleave(
+        32, dim=1).t()
+    z_ref = torch.matmul(a_ref, b_ref)
+    torch.testing.assert_close(out.cpu(), z_ref, atol=1e-2, rtol=1e-2)
+
+    if is_interpreter():
+        return
+    if is_hip_cdna4():
+        amdgcn = pgm.asm["amdgcn"]
+        assert re.search(r"v_mfma_f32_", amdgcn), "missing plain v_mfma_f32 in amdgcn"
+        assert "f8f6f4" not in amdgcn, "unexpected native f8f6f4 instruction in amdgcn"
+    if is_hip_gfx1250():
+        amdgcn = pgm.asm["amdgcn"]
+        assert re.search(r"v_wmma_f32_", amdgcn), "missing plain v_wmma_f32 in amdgcn"
+        assert "f8f6f4" not in amdgcn, "unexpected native f8f6f4 instruction in amdgcn"
+    if is_cuda():
+        ptx = pgm.asm["ptx"]
+        assert re.search(r"tcgen05\.mma", ptx), "missing tcgen05.mma in ptx"
+        assert "mxf8f6f4" not in ptx, "unexpected native mxf8f6f4 kind in ptx"
+
+
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str",
