@@ -1252,3 +1252,100 @@ def test_pinned_loop_carried_dot_operand_amd():
     assert "#ttg.amd_mfma" in ttgir
     _assert_no_layout_residue(ttgir)
     assert compiled.asm.get("amdgcn")
+
+
+@triton.jit
+def _fa_pin_helper_result(value, layout: tl.constexpr):
+    # The pin originates inside the helper, so its return operand is the only
+    # authoritative layout witness for the helper result ABI.
+    return tlx.require_layout(value, layout)
+
+
+@triton.jit
+def _fa_workitems_to_mfma_rows(workitems):
+    rows, _ = workitems.reshape([8, 2, 32]).permute(0, 2, 1).split()
+    return rows.reshape([256])
+
+
+@triton.jit
+def _fa_mfma_rows_to_workitems(rows):
+    per_warp_rows = rows.reshape([8, 32])
+    return tl.broadcast_to(per_warp_rows[:, None, :], (8, 2, 32)).reshape([512])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_cute_layout_with_standard_casts_on_cdna4():
+    physical = tlx.layout(
+        shape=((64, ), ()),
+        stride=((1, ), ()),
+    )
+
+    @triton.jit
+    def kernel(X, Y, Bits, PHYSICAL: tl.constexpr):
+        offsets = tl.arange(0, 64)
+        values = tl.load(X + offsets)
+        pinned = tlx.require_layout(values, PHYSICAL)
+        narrowed = pinned.to(tl.bfloat16)
+        widened = narrowed.to(tl.float32)
+        bits = pinned.to(tl.int32, bitcast=True)
+        tl.store(Y + offsets, widened)
+        tl.store(Bits + offsets, bits)
+
+    x = torch.linspace(-3.0, 3.0, 64, device=DEVICE, dtype=torch.float32)
+    y = torch.empty_like(x)
+    bits = torch.empty(64, device=DEVICE, dtype=torch.int32)
+    compiled = kernel.warmup(x, y, bits, physical, grid=(1, ), num_warps=1)
+    kernel[(1, )](x, y, bits, physical, num_warps=1)
+
+    torch.testing.assert_close(y, x.to(torch.bfloat16).float(), atol=0, rtol=0)
+    torch.testing.assert_close(bits, x.view(torch.int32), atol=0, rtol=0)
+    assert "#ttg.linear" in compiled.asm["ttir"]
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_internally_pinned_helper_result_specializes_abi_on_cdna4():
+    layout = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+
+    @triton.jit
+    def kernel(Y, LAYOUT: tl.constexpr):
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        value = tl.full((256, 32), 3.0, tl.float32)
+        pinned = _fa_pin_helper_result(value, LAYOUT)
+        tl.store(Y + row[:, None] * 32 + col[None, :], pinned)
+
+    y = torch.empty((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(y, layout, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, layout, num_warps=8)
+    torch.testing.assert_close(y, torch.full_like(y, 3.0), atol=0, rtol=0)
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    store = tlx.layout(
+        shape=((64, 8), (16, )),
+        stride=((16, 1024), (1, )),
+    )
+
+    @triton.jit
+    def kernel(Y, MMA: tl.constexpr, STORE: tl.constexpr):
+        acc = tlx.require_layout(tl.full((256, 32), 2.0, tl.float32), MMA)
+        source_rows = tl.arange(0, 256).to(tl.float32) + 1.0
+        workitems = _fa_mfma_rows_to_workitems(source_rows)
+        rows = _fa_workitems_to_mfma_rows(workitems)
+        out = (acc * rows[:, None]).to(tl.bfloat16)
+        out = tlx.require_layout(out, STORE)
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        tl.store(Y + row[:, None] * 32 + col[None, :], out)
+
+    y = torch.full((256 * 32, ), float("nan"), device=DEVICE, dtype=torch.bfloat16)
+    compiled = kernel.warmup(y, mma, store, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, mma, store, num_warps=8)
+    expected = (2 * torch.arange(1, 257, device=DEVICE, dtype=torch.float32)).to(torch.bfloat16)
+    expected = expected[:, None].broadcast_to((256, 32)).flatten()
+    torch.testing.assert_close(y, expected, atol=0, rtol=0)
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
