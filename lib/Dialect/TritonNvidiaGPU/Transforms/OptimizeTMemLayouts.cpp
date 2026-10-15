@@ -107,6 +107,9 @@ public:
     // Create the two TMEM subslices and their corresponding loads.
     Value tmem = tmemLoad.getSrc(); // Could itself be a subslice.
     int numWarps = ttg::lookupNumWarps(tmemLoad);
+    // The TMEM load-layout helper needs a power-of-two warp count >= 4.
+    if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
+      return failure();
     rewriter.setInsertionPoint(tmemLoad);
 
     auto createSliceLoad =
@@ -179,6 +182,9 @@ public:
     Location loc = storeOp.getLoc();
     Value tmem = storeOp.getDst();
     int numWarps = ttg::lookupNumWarps(storeOp);
+    // The TMEM load-layout helper needs a power-of-two warp count >= 4.
+    if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
+      return failure();
     Value truePred = arith::ConstantOp::create(b, loc, b.getBoolAttr(true));
 
     auto createSlice = [&](TypedValue<RankedTensorType> input, int offset) {
@@ -274,6 +280,9 @@ public:
     if (!tmemEnc)
       return failure();
     int numWarps = ttg::lookupNumWarps(tmemStoreOp);
+    // The TMEM load-layout helper needs a power-of-two warp count >= 4.
+    if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
+      return failure();
     // Compute the alternative layout.
     std::optional<LinearLayout> ll =
         nvidia_gpu::getDistributedLayoutForTmemLdSt(
@@ -346,6 +355,9 @@ public:
     if (!tmemEnc)
       return failure();
     int numWarps = ttg::lookupNumWarps(tmemLoadOp);
+    // The TMEM load-layout helper needs a power-of-two warp count >= 4.
+    if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
+      return failure();
     auto oldType = tmemLoadOp.getType();
     auto memType = cast<gpu::MemDescType>(tmemLoadOp.getSrc().getType());
     // Compute the alternative layout.

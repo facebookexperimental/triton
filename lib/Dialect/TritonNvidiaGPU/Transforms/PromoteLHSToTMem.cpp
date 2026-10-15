@@ -77,6 +77,10 @@ public:
     if (localAllocOp->getParentRegion() != tcGen5MMAOp->getParentRegion())
       return failure();
     Value src = localAllocOp.getSrc();
+    // A source-less operand A has no register source to promote. Decline
+    // instead of crashing on the null value below.
+    if (!src)
+      return failure();
     // Check tt.autows annotation for explicit opndA memory type.
     // If annotated as "smem", skip promotion. If "tmem", promote directly
     // (skip the transposed-shared-source heuristic). If no annotation,

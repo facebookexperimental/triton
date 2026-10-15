@@ -279,4 +279,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %res_f16 = arith.truncf %res : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
     tt.return %res_f16 : tensor<128x128xf16, #blocked1>
   }
+
+  // A source-less operand A has no register source to promote: decline
+  // gracefully (no tmem_alloc for A) instead of crashing on the null
+  // value.
+  // CHECK-LABEL: @promote_lhs_sourceless_declined
+  // CHECK: %[[A_SH:.+]] = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16,
+  // CHECK: ttng.tc_gen5_mma %[[A_SH]],
+  tt.func public @promote_lhs_sourceless_declined(%arg3: i32) -> tensor<128x128xf16, #blocked1> {
+    %true = arith.constant true
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %B_multibuf = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res = scf.for %i = %c0_i32 to %arg3 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked1>)  : i32 {
+      %A_sh = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %B_sh = ttg.memdesc_index %B_multibuf[%c0_i32] : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %acc_tm = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %true, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc_res = ttng.tmem_load %acc_tm : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1>
+      scf.yield %acc_res : tensor<128x128xf32, #blocked1>
+    }
+    ttg.local_dealloc %B_multibuf : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res_f16 = arith.truncf %res : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
+    tt.return %res_f16 : tensor<128x128xf16, #blocked1>
+  }
 }
