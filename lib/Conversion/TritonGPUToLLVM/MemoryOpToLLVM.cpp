@@ -15,23 +15,6 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
-static std::pair<LinearLayout, LinearLayout>
-getPhysicalLayouts(LinearLayout regLayout, MemDescType memDescTy) {
-  auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
-  if (!regLayout.isModular())
-    return {std::move(regLayout), std::move(sharedLayout)};
-
-  auto allocShape = getAllocationShapePerCTA(memDescTy);
-  sharedLayout =
-      toLinearLayoutIgnoringPadding(allocShape, memDescTy.getEncoding());
-  SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
-  for (auto dim : regLayout.getOutDimNames())
-    paddedOutDims.push_back({dim, sharedLayout.getOutDimSize(dim)});
-  regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
-                           /*requireSurjective=*/false);
-  return {std::move(regLayout), std::move(sharedLayout)};
-}
-
 // Helper for LocalGather/ScatterOpConversion.
 // For gather: storeVals is empty, returns loaded values.
 // For scatter: storeVals contains values to store, returns empty.
@@ -411,6 +394,10 @@ public:
   LogicalResult
   matchAndRewrite(triton::gpu::AsyncRemoteShmemStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (op.getStoreReduce() != DescriptorReduceKind::NONE)
+      return rewriter.notifyMatchFailure(
+          op, "async remote shared-memory reduction requires a supported "
+              "NVIDIA lowering");
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
     Value memDescVal = op.getDst();

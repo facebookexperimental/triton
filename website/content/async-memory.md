@@ -109,24 +109,38 @@
    ```
 
 
-- `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)` **[sm90+]**
+- `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier, store_reduce="")` **[NVIDIA sm90+]**
 
-   Store a distributed tensor into a buffer in the remote shared memory of a cluster asynchronously. Signals the provided mbarrier when the store completes.
+   Asynchronously store a register-source distributed tensor into cluster shared memory, or atomically reduce it with `store_reduce="add"`, `"min"`, `"max"`, `"and"`, `"or"`, `"xor"`, `"inc"`, or `"dec"`. The default `store_reduce=""` preserves the regular store behavior. ADD, MIN, MAX, AND, OR, and XOR support `int32` and `uint32`; INC and DEC support only `uint32`. Source/destination shapes and element types must match, and the destination must be mutable.
+
+   MIN/MAX use signed comparisons for `int32` and unsigned comparisons for `uint32`. For INC/DEC, each source value is a bound `b`, not an amount to add or subtract: `inc(old, b)` returns zero when `old >= b`, otherwise `old + 1`; `dec(old, b)` returns `b` when `old == 0` or `old > b`, otherwise `old - 1`.
+
+   Reductions require a cluster containing at least two physical CTAs, configured through either `num_ctas` or `ctas_per_cga`. A physical two-CTA launch with logical `num_ctas=1` is supported. `remote_cta_rank` may name a peer CTA or the executing CTA itself; destination and completion barrier are mapped to the same rank.
+
+   Regular stores use `st.async`; reductions use scalar `red.async.relaxed.cluster.shared::cluster.mbarrier::complete_tx::bytes.<op>.<type>`. ADD uses `.add.u32` for both signed and unsigned inputs because their 32-bit sums have the same bit-level result. MIN/MAX use `.s32` or `.u32`; bitwise operations use `.b32`; INC/DEC use `.u32`. These instructions use the **generic proxy**, not the async proxy: asynchronous completion alone does not require `fence("async_shared_cluster")`.
+
+   Each executed reduction completes **4 bytes per unique logical element** on the receiving mbarrier, without an additional arrival. Allocate barriers with `scope="cluster"` for compiler-owned initialization visibility; this does not replace application-owned destination initialization, expected-byte registration, data-ready synchronization, completion waits, or storage lifetime protection. Expected-byte registration can follow transaction completion, but barrier initialization must precede remote use. Wait on the receiving barrier before consuming the result. Keep every participating CTA's destination and barrier storage alive until all remote operations finish, including a final cluster rendezvous before exit or storage reuse.
 
    **Parameters:**
    - `dst`: The destination buffer in local shared memory (will be internally mapped to the remote CTA)
-   - `src`: The source distributed tensor to store
+   - `src`: The register-source distributed tensor; for INC/DEC, each element is a bound
    - `remote_cta_rank`: The rank (unique ID) of the remote CTA within the cluster
-   - `barrier`: mbarrier to signal when the store completes
+   - `barrier`: Mutable local shared-memory mbarrier mapped to the same CTA as `dst` for completion
+   - `store_reduce`: `""` for a regular store, or `"add"`, `"min"`, `"max"`, `"and"`, `"or"`, `"xor"`, `"inc"`, or `"dec"` for a 32-bit integer reduction
 
    **Example:**
    ```python
    # Allocate shared memory buffer and barrier
    buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
-   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1, scope="cluster")
 
    # Store to remote CTA's shared memory
    tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])
+
+   # Integer register-source reduction after initialization, expected-byte
+   # registration, and a cluster rendezvous (int_buffer matches src_i32).
+   tlx.async_remote_shmem_store(int_buffer[0], src_i32, remote_cta_rank=1,
+                                barrier=barrier[0], store_reduce="add")
    ```
 - `tlx.remote_shmem_copy(dst, src, remote_cta_rank)` **[sm90+]**
 

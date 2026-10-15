@@ -467,12 +467,20 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<ttg::RemoteShmemStoreOp>(regValues, dst,
                                                   remoteCTARank);
            })
-      .def("create_async_remote_store",
-           [](TritonOpBuilder &self, Value &dst, Value &regValues,
-              Value remoteCTARank, Value barrier) -> void {
-             self.create<ttg::AsyncRemoteShmemStoreOp>(regValues, dst,
-                                                       remoteCTARank, barrier);
-           })
+      .def(
+          "create_async_remote_store",
+          [](TritonOpBuilder &self, Value &dst, Value &regValues,
+             Value remoteCTARank, Value barrier,
+             tt::DescriptorReduceKind storeReduce,
+             bool storeReduceSigned) -> void {
+            self.create<ttg::AsyncRemoteShmemStoreOp>(
+                regValues, dst, remoteCTARank, barrier, storeReduce,
+                storeReduceSigned);
+          },
+          py::arg("dst"), py::arg("regValues"), py::arg("remoteCTARank"),
+          py::arg("barrier"),
+          py::arg("store_reduce") = tt::DescriptorReduceKind::NONE,
+          py::arg("store_reduce_signed") = false)
       .def("create_async_remote_copy",
            [](TritonOpBuilder &self, Value &src, Value &dst,
               Value remoteCTARank, Value barrier) -> void {
