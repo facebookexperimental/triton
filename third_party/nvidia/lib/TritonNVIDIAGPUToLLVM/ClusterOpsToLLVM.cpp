@@ -177,7 +177,7 @@ LogicalResult lowerClusterSyncForAllWarps(Operation *op,
   //      participates). The warp split already happened, so every warp of the
   //      current region executes it; wrapping again would form an illegal
   //      nested ttg.warp_specialize. OR
-  //  (b) the kernel carries the cluster-sync-kernel-init marker -- the
+  //  (b) this operation carries the designated bootstrap marker -- the
   //      entry-block cluster sync inserted by maybeInsertClusterSync. For that
   //      sync, ConvertWarpSpecializeToLLVM already emits the non-default warps'
   //      "@!isDefault barrier.cluster.arrive" at WS entry. Wrapping here too
@@ -185,7 +185,7 @@ LogicalResult lowerClusterSyncForAllWarps(Operation *op,
   //      imbalances the cluster barrier (deadlock) and adds a spurious worker
   //      wait.
   if (op->getParentOfType<triton::gpu::WarpSpecializeOp>() ||
-      mlir::triton::tlx::hasClusterSyncKernelInit(op)) {
+      mlir::triton::tlx::isClusterSyncBootstrap(op)) {
     rewriter.setInsertionPoint(op);
     emit(rewriter);
     rewriter.eraseOp(op);

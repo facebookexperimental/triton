@@ -1,14 +1,17 @@
 #ifndef TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 #define TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
+#include <functional>
 #include <numeric>
 #include <utility>
 
@@ -23,7 +26,14 @@ class StoreOp;
 class FuncOp;
 namespace gpu {
 class SwizzledSharedEncodingAttr;
-}
+
+// Prove that two partition-local loop nests execute the same iterations.
+// Both arrays are ordered innermost first. Compare from the outside in so
+// corresponding induction variables can stand in for one another in inner
+// bounds, including triangular nests; resolve warp-specialize captures.
+bool haveEquivalentWarpSpecializeLoopNests(ArrayRef<scf::ForOp> lhs,
+                                           ArrayRef<scf::ForOp> rhs);
+} // namespace gpu
 } // namespace triton
 
 // Return a tuple of two or three entries representing the shape of the
@@ -203,6 +213,9 @@ bool isExpensiveLoadOrStore(Operation *op);
 
 bool isExpensiveLocalLoad(Operation *op);
 
+// Return true if an operation may be cloned by layout rematerialization.
+bool canBeRematerialized(Operation *op);
+
 // Return true if the op can use the target encoding for its result.
 bool canUseResultEncoding(Operation *op, Attribute targetEncoding);
 
@@ -340,6 +353,15 @@ void populateForOpDeadArgumentElimination(
     RewritePatternSet &patterns,
     const DenseSet<Operation *> &opsCanBeTriviallyDead = {});
 
+/// Like getConvertBackwardSlice, but requires the resulting slice to be
+/// non-empty and fully rematerializable.
+LogicalResult getRematerializableSlice(
+    OpOperand &root, SetVector<Value> &slice, Attribute rootEncoding,
+    DenseMap<Value, Attribute> &layout,
+    std::function<bool(Operation *)> stopPropagation = nullptr,
+    std::function<Value(OpOperand &, Attribute)> getExistingConversion =
+        nullptr);
+
 /// Run a dataflow analysis over \p top to identify block arguments to loops
 /// that are dead, and replace their usage with the corresponding init value.
 void runDeadIterArgElimination(Operation *top);
@@ -382,8 +404,18 @@ bool canUseUnalignedVectorizedLoad(Operation *op, StringRef targetArch);
 std::optional<mlir::triton::gpu::SwizzledSharedEncodingAttr>
 getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible);
 
+// Replace the CGA layout while preserving intra-CTA layout choices and
+// recursing through Slice and DotOperand parents. For example, a blocked
+// layout with threadsPerWarp=[1, 32] keeps that value under the new CGA layout.
+FailureOr<Attribute> cloneWithCGALayout(RankedTensorType tensorTy,
+                                        triton::gpu::CGAEncodingAttr cgaLayout);
+
+// Whether the operand follows the operation's distributed data encoding.
+// Descriptor gather/scatter offsets have an independent encoding.
+bool isDistributedOpEncodingOperand(OpOperand &operand);
+
 // Convert \param op to use \param encoding attribute.
-// Skips operands if they're in shared encoding.
+// Leaves descriptor indices and non-tensor operands unchanged.
 Operation *convertDistributedOpEncoding(Attribute encoding, Operation *op);
 
 // Returns the original memory allocation for a memdesc value
