@@ -4,7 +4,7 @@ The phase-0 baseline accepts fully ragged FP16 A_i @ B_i products with
 row-major inputs and masked tails. The optimized TDM entry points share a
 persistent ragged-M pipeline: grouped_gemm_tdm takes packed tensors, while
 grouped_gemm_tdm_list accepts lists of row-major A and column-major B views.
-Both optimized paths require common N/K and full tiles.
+Both optimized paths require common N/K. The list path also supports M/N tails.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def _cdiv_int(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int):
+def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int, *, allow_mn_tails=False):
     num_sms = max(1, int(num_sms))
     useful = sum(m * n * k for m in m_list)
     ranked = []
@@ -61,10 +61,10 @@ def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int):
         bm = int(cfg["block_m"])
         bn = int(cfg["block_n"])
         bk = int(cfg["block_k"])
-        if n % bn != 0 or k % bk != 0 or any(m % bm != 0 for m in m_list):
+        if k % bk != 0 or (not allow_mn_tails and (n % bn != 0 or any(m % bm != 0 for m in m_list))):
             continue
 
-        group_tiles = [(m // bm) * (n // bn) for m in m_list]
+        group_tiles = [_cdiv_int(m, bm) * _cdiv_int(n, bn) for m in m_list]
         total_tiles = sum(group_tiles)
         if total_tiles == 0:
             continue
@@ -89,10 +89,10 @@ def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int):
     return ranked
 
 
-def _pick_grouped_gemm_config(m_list: list[int], n: int, k: int, num_sms: int):
-    ranked = _rank_grouped_gemm_configs(m_list, n, k, num_sms)
+def _pick_grouped_gemm_config(m_list: list[int], n: int, k: int, num_sms: int, *, allow_mn_tails=False):
+    ranked = _rank_grouped_gemm_configs(m_list, n, k, num_sms, allow_mn_tails=allow_mn_tails)
     if not ranked:
-        raise ValueError("no validated gfx1250 grouped GEMM config supports these full-tile shapes")
+        raise ValueError("no validated gfx1250 grouped GEMM config supports these shapes")
     top_score = ranked[0][0]
     near_top = [entry for entry in ranked if entry[0] >= 0.9 * top_score]
     return dict(max(near_top, key=lambda entry: (entry[1], entry[2]))[3])
@@ -520,6 +520,7 @@ def _grouped_gemm_tdm_impl(
     CLUSTER_MULTICAST: tl.constexpr = True,
     POINTER_TABLES: tl.constexpr = False,
     group_lds=None,
+    ALLOW_MN_TAILS: tl.constexpr = False,
 ):
     """Shared packed/list ragged-M scheduler and TDM compute pipeline.
 
@@ -535,6 +536,8 @@ def _grouped_gemm_tdm_impl(
                      "alias-C cross-tile prefetch requires a 256x256 tile")
     tl.static_assert(not CROSS_TILE_PREFETCH or NUM_BUFFERS == 2, "cross-tile prefetch currently requires depth 2")
     tl.static_assert(NUM_XCDS >= 1, "NUM_XCDS must be positive")
+    tl.static_assert(not ALLOW_MN_TAILS or (POINTER_TABLES and CLUSTER_SIZE == 1),
+                     "M/N tails require pointer tables and cluster size 1")
     # The square tile uses one third fewer LDS reads per WMMA than 128x256.
     # Limit operand lifetimes and K-loop scope to keep it free of scratch spills.
     OPTIMIZE_CROSS_TILE: tl.constexpr = CROSS_TILE_PREFETCH and BLOCK_M == 256 and BLOCK_N == 256
@@ -622,7 +625,10 @@ def _grouped_gemm_tdm_impl(
         if POINTER_TABLES:
             group_stride_am = tl.multiple_of(tl.load(group_lds + 3 * g), 8)
             group_stride_bn = tl.multiple_of(tl.load(group_lds + 3 * g + 1), 8)
-            group_stride_cm = tl.multiple_of(tl.load(group_lds + 3 * g + 2), 8)
+            if ALLOW_MN_TAILS:
+                group_stride_cm = tl.load(group_lds + 3 * g + 2)
+            else:
+                group_stride_cm = tl.multiple_of(tl.load(group_lds + 3 * g + 2), 8)
         else:
             group_stride_am, group_stride_bn, group_stride_cm = stride_am, stride_bn, stride_cm
 
@@ -677,14 +683,32 @@ def _grouped_gemm_tdm_impl(
                     tlx.async_amd_descriptor_wait(0)
                 first_off_m, first_off_n = _grouped_tile_offsets(tile_idx, last_problem_end, num_m_tiles, num_n_tiles,
                                                                  GROUP_M, BLOCK_M, BLOCK_N)
+                if ALLOW_MN_TAILS and DIRECT_LOAD_OFFSETS:
+                    # Keep the group address and fold tile offsets into each
+                    # load, as in the full-tile path. Only bounds vary per tile.
+                    prime_a_desc = tlx.update_tensor_descriptor(a_desc_base,
+                                                                set_bounds=[tl.maximum(gm - first_off_m, 0), K])
+                    prime_b_desc = tlx.update_tensor_descriptor(b_desc_base,
+                                                                set_bounds=[tl.maximum(N - first_off_n, 0), K])
+                    prime_m, prime_n = first_off_m, first_off_n
+                elif ALLOW_MN_TAILS:
+                    # Clamp once at tile entry, keeping K-loop updates address-only.
+                    prime_a_desc = tlx.update_tensor_descriptor(a_desc_base, add_offsets=[first_off_m, 0],
+                                                                clamp_bounds=True)
+                    prime_b_desc = tlx.update_tensor_descriptor(b_desc_base, add_offsets=[first_off_n, 0],
+                                                                clamp_bounds=True)
+                    prime_m, prime_n = 0, 0
+                else:
+                    prime_a_desc, prime_b_desc = a_desc_base, b_desc_base
+                    prime_m, prime_n = first_off_m, first_off_n
                 _tdm_issue_loads_unpredicated(
-                    a_desc_base,
-                    b_desc_base,
+                    prime_a_desc,
+                    prime_b_desc,
                     a_buf,
                     b_buf,
                     0,
-                    first_off_m,
-                    first_off_n,
+                    prime_m,
+                    prime_n,
                     BLOCK_K,
                     NUM_BUFFERS,
                     CLUSTER_SIZE,
@@ -692,7 +716,10 @@ def _grouped_gemm_tdm_impl(
                 )
                 # Fold the tile position into each fused load to shorten
                 # descriptor lifetimes. L2 prefetch retains the positioned path.
-                if DIRECT_LOAD_OFFSETS:
+                if ALLOW_MN_TAILS:
+                    first_a_desc, first_b_desc = prime_a_desc, prime_b_desc
+                    first_load_m, first_load_n = prime_m, prime_n
+                elif DIRECT_LOAD_OFFSETS:
                     first_a_desc, first_b_desc = a_desc_base, b_desc_base
                     first_load_m, first_load_n = first_off_m, first_off_n
                 else:
@@ -719,10 +746,13 @@ def _grouped_gemm_tdm_impl(
                                                  BLOCK_N)
             if DIRECT_LOAD_OFFSETS:
                 a_desc, b_desc = a_desc_base, b_desc_base
+                if ALLOW_MN_TAILS:
+                    a_desc = tlx.update_tensor_descriptor(a_desc, set_bounds=[tl.maximum(gm - off_m, 0), K])
+                    b_desc = tlx.update_tensor_descriptor(b_desc, set_bounds=[tl.maximum(N - off_n, 0), K])
                 load_off_m, load_off_n = off_m, off_n
             else:
-                a_desc = tlx.update_tensor_descriptor(a_desc_base, add_offsets=[off_m, 0])
-                b_desc = tlx.update_tensor_descriptor(b_desc_base, add_offsets=[off_n, 0])
+                a_desc = tlx.update_tensor_descriptor(a_desc_base, add_offsets=[off_m, 0], clamp_bounds=ALLOW_MN_TAILS)
+                b_desc = tlx.update_tensor_descriptor(b_desc_base, add_offsets=[off_n, 0], clamp_bounds=ALLOW_MN_TAILS)
                 load_off_m, load_off_n = 0, 0
 
             producer = 0
@@ -774,8 +804,10 @@ def _grouped_gemm_tdm_impl(
                         next_a_desc, next_b_desc = a_desc_base, b_desc_base
                         next_load_m, next_load_n = next_off_m, next_off_n
                     else:
-                        next_a_desc = tlx.update_tensor_descriptor(a_desc_base, add_offsets=[next_off_m, 0])
-                        next_b_desc = tlx.update_tensor_descriptor(b_desc_base, add_offsets=[next_off_n, 0])
+                        next_a_desc = tlx.update_tensor_descriptor(a_desc_base, add_offsets=[next_off_m, 0],
+                                                                   clamp_bounds=ALLOW_MN_TAILS)
+                        next_b_desc = tlx.update_tensor_descriptor(b_desc_base, add_offsets=[next_off_n, 0],
+                                                                   clamp_bounds=ALLOW_MN_TAILS)
                         next_load_m, next_load_n = 0, 0
 
                 steady_end = K_ITERS - NUM_BUFFERS
@@ -887,6 +919,22 @@ def _grouped_gemm_tdm_impl(
                     next_load_m, next_load_n = next_off_m, next_off_n
                     tlx.amd_sched_barrier()
 
+                if ALLOW_MN_TAILS and OPTIMIZE_CROSS_TILE:
+                    # Both within-group and cross-group lookahead need the next
+                    # tile's remaining extents, not the current tile's bounds.
+                    if DIRECT_LOAD_OFFSETS:
+                        next_rows = next_gm if CROSS_GROUP_PREFETCH else gm
+                        next_a_desc = tlx.update_tensor_descriptor(
+                            next_a_desc, set_bounds=[tl.maximum(next_rows - next_off_m, 0), K])
+                        next_b_desc = tlx.update_tensor_descriptor(next_b_desc,
+                                                                   set_bounds=[tl.maximum(N - next_off_n, 0), K])
+                    else:
+                        next_a_desc = tlx.update_tensor_descriptor(next_a_desc, add_offsets=[next_off_m, 0],
+                                                                   clamp_bounds=True)
+                        next_b_desc = tlx.update_tensor_descriptor(next_b_desc, add_offsets=[next_off_n, 0],
+                                                                   clamp_bounds=True)
+                        next_load_m, next_load_n = 0, 0
+
                 # Peel one full ring rotation. Once a current-tile slot has
                 # been read into registers, recycle it for the matching K
                 # block of the next tile handled by this persistent program.
@@ -952,7 +1000,8 @@ def _grouped_gemm_tdm_impl(
                     c_part = _tdm_c_store_chunk(acc, part)
                     c_part = c_part.to(c_dtype)
                     c_view = c_buf[part % 2]
-                    c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=[off_m + part * 32, off_n])
+                    c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=[off_m + part * 32, off_n],
+                                                          clamp_bounds=ALLOW_MN_TAILS)
                     tlx.local_store(c_view, c_part)
                     tlx.async_amd_descriptor_store(c_desc, c_view, [0, 0], clamp_bounds=False)
                 # The last two output stores overlap the next tile's entry.
@@ -970,7 +1019,10 @@ def _grouped_gemm_tdm_impl(
                     c_ptrs = c_packed + rows[:, None] * group_stride_cm + cols[None, :]
                 c = acc.to(c_dtype)
                 tlx.amd_sched_barrier()
-                tl.store(c_ptrs, c)
+                if ALLOW_MN_TAILS:
+                    tl.store(c_ptrs, c, mask=(rows[:, None] < gm) & (cols[None, :] < N))
+                else:
+                    tl.store(c_ptrs, c)
 
             else:
                 c_view = c_buf[0]
@@ -980,7 +1032,8 @@ def _grouped_gemm_tdm_impl(
                 # loop. Keep it in the epilogue to avoid an extra gfx1250 VGPR-MSB
                 # mode transition in the steady body.
                 tlx.amd_sched_barrier()
-                c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=[off_m, off_n])
+                c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=[off_m, off_n],
+                                                      clamp_bounds=ALLOW_MN_TAILS)
                 tlx.amd_sched_barrier()
                 if USE_FULL_C_TILE:
                     tlx.local_store(c_view, c)
@@ -994,7 +1047,7 @@ def _grouped_gemm_tdm_impl(
                     # still required; the second-half store is drained lazily.
                     tlx.async_amd_descriptor_wait(0)
                     tlx.local_store(c_view, c1)
-                    tlx.async_amd_descriptor_store(c_desc, c_view, [0, BLOCK_K], clamp_bounds=False)
+                    tlx.async_amd_descriptor_store(c_desc, c_view, [0, BLOCK_K], clamp_bounds=ALLOW_MN_TAILS)
 
             tile_idx += NUM_PROGRAMS
 
@@ -1101,6 +1154,7 @@ def grouped_gemm_tdm_list_kernel(
     XCD_CHUNK: tl.constexpr,
     CLUSTER_SIZE: tl.constexpr = 1,
     CLUSTER_MULTICAST: tl.constexpr = True,
+    ALLOW_MN_TAILS: tl.constexpr = True,
 ):
     """Ragged-M GEMM over independently allocated A/B/C matrices.
 
@@ -1109,7 +1163,10 @@ def grouped_gemm_tdm_list_kernel(
     three int64 pointer tables, int32 [G, 3] sizes (M, N, K), int32 [G, 3]
     leading strides (lda, ldb, ldc), and the group count. Flat tables work too.
     The caller must validate common N/K, K matching the constexpr argument,
-    full tiles, 16-byte-aligned matrix bases, and strides divisible by 8.
+    full K tiles covering NUM_BUFFERS, 16-byte-aligned matrix bases, and A/B
+    leading strides divisible by 8. M/N tails and arbitrary C leading strides
+    are supported with cluster size 1. Set ALLOW_MN_TAILS=False only when M/N
+    cover full tiles and ldc is divisible by 8; clustering requires this mode.
     No offsets, descriptor buffers, or matrix repacking are required.
     """
     N = tl.load(group_gemm_sizes + 1)
@@ -1141,6 +1198,7 @@ def grouped_gemm_tdm_list_kernel(
         CLUSTER_MULTICAST,
         POINTER_TABLES=True,
         group_lds=g_lds,
+        ALLOW_MN_TAILS=ALLOW_MN_TAILS,
     )
 
 
@@ -1410,7 +1468,9 @@ def grouped_gemm_tdm_list(
     allocations; only their pointers and gfx950-style size/stride tables are
     copied to device. Call grouped_gemm_tdm_list_kernel directly to reuse
     already-prepared device tables and outputs without allocating metadata.
-    This retains the packed kernel's full-tile and pipeline restrictions.
+    M/N may be smaller than a tile or have tails; K must still cover full
+    tiles and fill the pipeline. Tails require cluster_size=1. Aligned shapes
+    automatically use the full-tile specialization. Tile sizes are unchanged.
     Benchmarking measures the kernel launch after metadata and output setup.
     """
     args = _make_grouped_gemm_tdm_list_args(group_a, group_b, group_c)
@@ -1418,7 +1478,7 @@ def grouped_gemm_tdm_list(
     device = group_a[0].device
     model_sms = max(1, int(num_programs)) if num_programs is not None else _active_num_cus(device)
     if auto_config:
-        selected = _pick_grouped_gemm_config(m_list, n, k, model_sms)
+        selected = _pick_grouped_gemm_config(m_list, n, k, model_sms, allow_mn_tails=True)
         block_m, block_n, block_k = (int(selected[key]) for key in ("block_m", "block_n", "block_k"))
         group_m = int(selected["group_m"])
         tdm_pipeline_depth = int(selected["tdm_pipeline_depth"])
@@ -1429,8 +1489,9 @@ def grouped_gemm_tdm_list(
         raise ValueError("TDM requires positive M/N tile sizes and group_m, and block_k=128")
     if tdm_pipeline_depth not in (2, 3, 4) or c_staging_mode not in (0, 1):
         raise ValueError("TDM requires pipeline depth 2/3/4 and c_staging_mode 0/1")
-    if n % block_n or k % block_k or any(m % block_m for m in m_list):
-        raise ValueError("TDM requires full tiles: each M, N, and K must be divisible by its block size")
+    if k % block_k:
+        raise ValueError("TDM requires full K tiles: K must be divisible by block_k")
+    allow_mn_tails = bool(n % block_n or any(m % block_m for m in m_list))
     if k // block_k < tdm_pipeline_depth:
         raise ValueError("K must contain enough blocks to fill the TDM pipeline")
     if cross_tile_prefetch:
@@ -1442,7 +1503,9 @@ def grouped_gemm_tdm_list(
         raise ValueError("invalid XCD remapping configuration")
     if cluster_size not in (1, 2, 4):
         raise ValueError("cluster_size must be 1, 2, or 4")
-    total_tiles = sum((m // block_m) * (n // block_n) for m in m_list)
+    if allow_mn_tails and cluster_size != 1:
+        raise ValueError("M/N tails require cluster_size=1")
+    total_tiles = sum(_cdiv_int(m, block_m) * _cdiv_int(n, block_n) for m in m_list)
     if total_tiles == 0:
         return outputs
     num_programs = max(1, min(model_sms, total_tiles))
@@ -1479,6 +1542,7 @@ def grouped_gemm_tdm_list(
             XCD_CHUNK=xcd_chunk,
             CLUSTER_SIZE=cluster_size,
             CLUSTER_MULTICAST=cluster_multicast,
+            ALLOW_MN_TAILS=allow_mn_tails,
             num_warps=4,
             waves_per_eu=1,
             ctas_per_cga=(cluster_size, 1, 1),
@@ -1957,7 +2021,7 @@ if __name__ == "__main__":
 
     if args.auto_config:
         model_sms = args.num_programs if args.num_programs is not None else _active_num_cus(device)
-        selected = _pick_grouped_gemm_config(m_list, args.N, args.K, model_sms)
+        selected = _pick_grouped_gemm_config(m_list, args.N, args.K, model_sms, allow_mn_tails=args.kernel == "list")
         print("selected config:", selected["name"], f"BM={selected['block_m']}", f"BN={selected['block_n']}",
               f"cross_tile_prefetch={selected['cross_tile_prefetch']}")
 

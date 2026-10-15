@@ -37,8 +37,10 @@ Each `group_b[g]` is FP16 column-major `[K, N]` with strides `(1, K)`, such
 as `weights_g.T` for contiguous `[N, K]` weights. Inputs can have independent
 allocations or share storage. All matrices must be on one device and have
 16-byte-aligned base pointers. N and K must be identical across groups;
-varying N/K raises `ValueError`. Zero-row groups are supported. The packed
-kernel's tile-alignment and minimum-K restrictions still apply.
+varying N/K raises `ValueError`. Zero-row groups and arbitrary M/N sizes,
+including sizes smaller than a tile, are supported with `cluster_size=1`.
+K must remain divisible by `BLOCK_K` and cover the pipeline depth. Tile sizes
+are unchanged: partial tiles still perform full-tile matrix operations.
 
 The result is a list of row-major `[M_g, N]` tensors. An optional third
 argument, `group_c`, supplies output buffers. The wrapper uploads pointer
@@ -58,10 +60,23 @@ group_size: G
 The metadata tables may also be flat, as in the gfx950 argument builder.
 Pass these buffers directly to the JIT kernel, followed by the gfx1250 tuning
 arguments and the common compile-time `K`. N is read from the size table.
-The caller must validate common N/K, full tiles, and the pipeline/cluster
-restrictions. The low-level kernel also supports padded leading strides
-divisible by 8, with 16-byte-aligned matrix base pointers; the list wrapper
-continues to require canonical strides.
+The caller must validate common N/K, full K tiles, and the pipeline/cluster
+restrictions. The low-level kernel supports A/B leading strides divisible
+by 8 and arbitrary C leading strides, with 16-byte-aligned matrix base
+pointers; the list wrapper continues to require canonical strides.
+
+The low-level kernel defaults to `ALLOW_MN_TAILS=True`. It retains the selected
+tile, pipeline, and output-staging configuration. Input and output descriptor
+bounds handle partial tiles in the LDS-to-TDM paths; the existing direct-store
+configuration masks its stores. Odd N does not require padded output rows.
+The square cross-tile path without L2 prefetch sets the remaining M/N input
+bounds once per tile and keeps the full-tile path's folded address offsets.
+The steady K loop only advances addresses; it does not recompute M/N bounds.
+For full M/N tiles and C leading strides divisible by 8,
+`ALLOW_MN_TAILS=False` selects the original fast path.
+The list wrapper selects that specialization automatically for aligned
+shapes. Clustered launches require the full-tile specialization and retain
+their existing shape restrictions.
 
 With prepared device tables and output buffers, the warmed-up kernel launch
 needs no new metadata allocation, prefix sum, descriptor buffer, host readback,
