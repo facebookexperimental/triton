@@ -93,6 +93,14 @@ jobs:
           path: triton
           fetch-depth: 0
 
+      # The benchmarked commit may predate the action.
+      - name: Checkout workflow actions
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-actions
+          sparse-checkout: .github/actions/install-torchao
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -111,12 +119,19 @@ jobs:
           # shellcheck source=/dev/null
           . "${SETUP_SCRIPT}"
           uv pip install --pre torch -i "${TORCH_INDEX}"
-          uv pip install numpy
+          uv pip install pytest numpy
           mkdir -p "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}"
           curl --fail --location --retry 3 \
             --output "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}/${WHEEL_FILENAME}" "${WHEEL_URL}"
           uv pip uninstall triton fbtriton pytorch-triton pytorch-triton-rocm triton-rocm
           uv pip install --no-deps "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}/${WHEEL_FILENAME}"
+
+      - name: Install torchao
+        timeout-minutes: 10
+        uses: ./.workflow-actions/.github/actions/install-torchao
+        with:
+          platform: ${{ inputs.device }}
+          python: ${{ runner.temp }}/benchmark-${{ inputs.side }}-venv/bin/python
 
       - name: Set up TritonBench dependencies
         if: contains(inputs.benchmarks, 'tritonbench')

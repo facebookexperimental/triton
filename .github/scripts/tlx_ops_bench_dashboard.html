@@ -878,7 +878,8 @@ uv pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/${amd 
 uv pip uninstall triton pytorch-triton pytorch-triton-rocm
 uv pip install --pre --no-deps fbtriton==${p.version} \\
   --index-url https://${OWNER}.github.io/${NAME}/nightly/simple/
-uv pip install pytest numpy torchao`],
+uv pip install pytest numpy
+uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/${amd ? "rocm7.2" : "cu134"}`],
       ["2. Check out the suite at the wheel's commit", "The bench scripts must match the wheel: shape suites and kernels move together.",
         `git clone ${REPO}.git fbtriton && cd fbtriton
 git checkout ${p.sha}`],

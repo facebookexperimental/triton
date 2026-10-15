@@ -1,0 +1,37 @@
+name: Install torchao
+description: Install nightly torchao for NVIDIA or AMD and verify its MXFP8 quantization API.
+inputs:
+  platform:
+    description: "h100 or b200 for CUDA 13.4; mi350 or amd for ROCm 7.2"
+    required: true
+  python:
+    description: Python executable in the target environment; uv must be available
+    required: false
+    default: python
+  setup-script:
+    description: Optional environment activation script to source before installing
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install and verify torchao
+      shell: bash
+      env:
+        TORCHAO_PLATFORM: ${{ inputs.platform }}
+        TORCHAO_PYTHON: ${{ inputs.python }}
+        TORCHAO_SETUP_SCRIPT: ${{ inputs.setup-script }}
+      run: |
+        set -eo pipefail
+        case "${TORCHAO_PLATFORM}" in
+          h100|b200) TORCHAO_INDEX=cu134 ;;
+          mi350|amd) TORCHAO_INDEX=rocm7.2 ;;
+          *) echo "Unsupported torchao platform: ${TORCHAO_PLATFORM}" >&2; exit 1 ;;
+        esac
+        if [[ -n "${TORCHAO_SETUP_SCRIPT}" ]]; then
+          # shellcheck source=/dev/null
+          . "${TORCHAO_SETUP_SCRIPT}"
+        fi
+        uv pip install --python "${TORCHAO_PYTHON}" --pre torchao \
+          --index-url "https://download.pytorch.org/whl/nightly/${TORCHAO_INDEX}"
+        "${TORCHAO_PYTHON}" -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
