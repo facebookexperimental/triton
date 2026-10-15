@@ -19,9 +19,7 @@ load partition issues as an asynchronous TMA copy (see
 also promotes eligible `tt.store` and relaxed `tt.atomic_rmw` add operations
 to `tt.descriptor_store` / `tt.descriptor_reduce`.
 
-The pass is not part of AutoWS itself. It runs at TTIR time, before AutoWS
-sees the kernel, and decides whether AutoWS gets descriptor loads to work
-with.
+It runs at TTIR time, before AutoWS.
 
 ## Enabling it
 
@@ -145,8 +143,6 @@ staging buffers ([TMA Store Wait Pipeline](TMAStoreWaitPipeline.md)).
   depends on TMA: a load partition for descriptor loads and an
   `epilogue_store` partition for TMA stores (see
   [PartitionSchedulingMeta](PartitionSchedulingMeta.md)).
-- **Kernel ABI.** Host mode adds one hidden descriptor argument per promoted
-  op. Device mode adds in-kernel descriptor construction.
 
 ## Semantics the rewrite does not preserve
 
@@ -177,8 +173,5 @@ Nothing diagnoses these cases.
 
 ## Silent fallbacks
 
-Every eligibility failure leaves the op as an ordinary pointer load or store
-with no message. To see what was promoted, look for `tt.descriptor_load`,
-`tt.descriptor_store`, and `tt.descriptor_reduce` in the TTIR, or check the
-`tt.auto_tma` arguments and `auto_tma_recipes` metadata. The pass emits an
-error only for a module containing more than one kernel function.
+Every eligibility failure leaves the op unpromoted, with no message. The pass
+errors only on a module with more than one kernel.

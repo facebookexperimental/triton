@@ -132,9 +132,6 @@ multiple of 8. It emits nothing when the value does not change.
   three options, through `actualRegisters` and `setmaxnreg`.
 - **TMEM load vectorization.** Fewer registers mean narrower `tcgen05.ld`
   messages and more of them.
-- **Warps.** These options do not change warp counts.
-  `OptimizePartitionWarps` shrinks warps using its own even-split estimate,
-  independently of them.
 
 ## Silent fallbacks
 
@@ -154,7 +151,3 @@ multiple of 8. It emits nothing when the value does not change.
   clamps it to the nearest legal value.
 - **TLX kernels with manual warp specialization** skip `OptimizePartitionWarps`.
   For them, `minRegAutoWS` and `maxRegAutoWS` have no effect.
-
-The chosen values are visible in the TTGIR as `requestedRegisters` /
-`actualRegisters` on `ttg.warp_specialize` and as `ttg.maxnreg` on the module,
-and in PTX as `setmaxnreg` instructions.
