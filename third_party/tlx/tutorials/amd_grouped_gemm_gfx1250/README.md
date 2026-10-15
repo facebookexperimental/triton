@@ -205,15 +205,16 @@ flush, and group transition.
 
 ## Benchmark Sweep
 
-Run the default regular-shape sweep:
+Run the default regular-shape sweep for both packed and list kernels:
 
 ```bash
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py
 ```
 
-Use `--kernel list` to run the second kernel with the same cases and launch
-configuration. Both variants time only kernel launches, excluding metadata
-and output allocation:
+For each shape, the sweep runs packed then list with the same launch
+configuration. The summary and CSV include a `kernel` column. Both variants
+time only kernel launches, excluding metadata and output allocation.
+Use `--kernel packed` or `--kernel list` to run just one variant:
 
 ```bash
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
