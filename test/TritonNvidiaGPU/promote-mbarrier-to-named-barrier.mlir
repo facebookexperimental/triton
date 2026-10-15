@@ -1554,7 +1554,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
   // CHECK-LABEL: @reject_multicast
   // CHECK: ttng.init_barrier
   // CHECK: partition0
-  // CHECK: ttng.arrive_barrier {{.*}} {ctaMask = 1 : i32}
+  // CHECK: ttng.arrive_barrier {{.*}} {multicastCTA = 1 : i32}
   // CHECK: partition1
   // CHECK: ttng.wait_barrier {{.*}} :
   // CHECK-NOT: ttng.wait_barrier_named
@@ -1569,7 +1569,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
       ttg.warp_yield
     }
     partition0(%arg0: !ttg.memdesc<2xi64, #barrier, #smem, mutable>) num_warps(1) {
-      ttng.arrive_barrier %arg0, 1 {ctaMask = 1 : i32} : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
+      ttng.arrive_barrier %arg0, 1 {multicastCTA = 1 : i32} : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
       ttg.warp_return
     }
     partition1(%arg0: !ttg.memdesc<2xi64, #barrier, #smem, mutable>) num_warps(1) {
