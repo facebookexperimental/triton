@@ -628,12 +628,14 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
 
     auto supportsTypes = [](ScaleDotElemType elemType) {
       return elemType == ScaleDotElemType::E2M1 ||
+             elemType == ScaleDotElemType::E2M3 ||
+             elemType == ScaleDotElemType::E3M2 ||
              elemType == ScaleDotElemType::E4M3 ||
              elemType == ScaleDotElemType::E5M2;
     };
 
     if (!supportsTypes(aElemType) || !supportsTypes(bElemType)) {
-      llvm::report_fatal_error("NYI: mxfp6\n");
+      llvm::report_fatal_error("NYI: unsupported mx type\n");
     }
 
     int64_t kDimOperandSize = aTensorTy.getShape().back();
@@ -657,8 +659,19 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     StringRef intrinsicName = maybeMfmaIntrinsic->name;
     unsigned kBase = maybeMfmaIntrinsic->kBase;
     // Two fp4 are packed into an uint8.
-    unsigned aKBase = aElemType == ScaleDotElemType::E2M1 ? kBase / 2 : kBase;
-    unsigned bKBase = bElemType == ScaleDotElemType::E2M1 ? kBase / 2 : kBase;
+    auto packedKBase = [](ScaleDotElemType elemType, unsigned kBase) {
+      if (elemType == ScaleDotElemType::E2M1)
+        return kBase / 2;
+      if (elemType == ScaleDotElemType::E2M3 ||
+          elemType == ScaleDotElemType::E3M2) {
+        // fp6 packs 4 values per 3 bytes.
+        assert(kBase % 4 == 0);
+        return kBase * 3 / 4;
+      }
+      return kBase;
+    };
+    unsigned aKBase = packedKBase(aElemType, kBase);
+    unsigned bKBase = packedKBase(bElemType, kBase);
 
     int aKWidth = aKBase;
     int bKWidth = bKBase;
