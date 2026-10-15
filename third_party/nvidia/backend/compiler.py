@@ -921,9 +921,10 @@ class CUDABackend(BaseBackend):
         tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
-        nvidia.passes.ttnvgpuir.add_plan_cta(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+        nvidia.passes.ttnvgpuir.add_assign_cga_layouts(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm)
+        nvidia.passes.ttnvgpuir.add_optimize_cta_locality(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
@@ -933,7 +934,7 @@ class CUDABackend(BaseBackend):
             nvidia.passes.hopper.add_analyze_2cta_dependencies(pm)
         # 2-CTA: Split B descriptor loads before optimize_descriptor_encoding
         # so the cloned half-width descriptor gets its encoding set properly.
-        # NOT gated on use_meta_ws: the ctas_per_cga approach bypasses PlanCTA
+        # NOT gated on use_meta_ws: the ctas_per_cga approach bypasses AssignCGALayouts
         # (num_ctas=1), so Transform2CTALoads is the only B splitting path.
         # Cross-CTA sync is handled separately: Insert2CTASync for Meta WS,
         # MMAv5.cpp's inline ClusterArriveOp for non-WS.
@@ -1117,8 +1118,6 @@ class CUDABackend(BaseBackend):
         nvidia.passes.hopper.add_multi_cta_reduction(pm)
         # TODO: Find the optimal place in the pipeline for this pass.
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
-        if knobs.nvidia.promote_mbarrier_to_named_barrier:
-            nvidia.passes.ttnvgpuir.add_promote_mbarrier_to_named_barrier(pm)
         if knobs.nvidia.enable_interleave_tmem:
             nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         if knobs.nvidia.enable_unify_ws_barrier_locations:
@@ -1131,6 +1130,10 @@ class CUDABackend(BaseBackend):
         # that any local loads eliminated by TMA lowering do not inflate them.
         if capability // 10 >= 9 and knobs.nvidia.use_meta_ws:
             passes.ttgpuir.add_optimize_partition_warps(pm)
+        # Promote only after partition warps are final: the baked count is
+        # derived from task sizes, which optimize-partition-warps shrinks.
+        if knobs.nvidia.promote_mbarrier_to_named_barrier:
+            nvidia.passes.ttnvgpuir.add_promote_mbarrier_to_named_barrier(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
         passes.common.add_sccp(pm)
@@ -1168,6 +1171,12 @@ class CUDABackend(BaseBackend):
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
         # the ops. Runs last so the reported layouts reflect all optimizations.
         tlx.tlx_passes.add_tlx_dump_layout(pm)
+
+        if knobs.nvidia.promote_mbarrier_to_named_barrier:
+            # Verify compiler-allocated named barrier counts against final
+            # task sizes. Fails compilation instead of emitting a deadlocked
+            # barrier.
+            nvidia.passes.ttnvgpuir.add_verify_named_barrier_counts(pm)
 
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
