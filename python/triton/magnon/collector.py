@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import pickle
+import re
 
 from triton.backends.nvidia.compiler import get_ptxas
 from triton.runtime.jit import _compile_iq_state, _compile_iq_suppress_competition
@@ -94,6 +95,12 @@ def _ordered_args(bound_args, constexpr_names, blobs):
 def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
     """Best-effort, source-free task dump. Never raises into the user's launch path."""
     try:
+        kernel_name = getattr(kernel.metadata, "name", getattr(jitfn, "__name__", "kernel"))
+        # e.g. "^triton_tem_" keeps Inductor's final template kernels and drops its autotune candidates.
+        pattern = os.environ.get("TRITON_COMPILE_IQ_COLLECT_KERNELS")
+        if pattern and not re.search(pattern, kernel_name):
+            dlog("collector", f"skip {kernel_name} (no match for TRITON_COMPILE_IQ_COLLECT_KERNELS)")
+            return
         ptx = kernel.asm["ptx"]
         sha = ptx_sha256(ptx)
         tdir = os.path.join(task_root(), sha[:16])
@@ -115,7 +122,7 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
                                      _ordered_args(bound_args, constexpr_names, blobs), ptxas.path, ptxas.version)
         spec.update(
             ptx_sha256=sha,
-            kernel_name=getattr(kernel.metadata, "name", getattr(jitfn, "__name__", "kernel")),
+            kernel_name=kernel_name,
             fn_name=getattr(jitfn, "__name__", None),
         )
 
