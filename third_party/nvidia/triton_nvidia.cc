@@ -186,6 +186,12 @@ createCheckMatmulTwoCTAWrapper(bool allowDependentChains) {
   return ttng::createTritonNvidiaGPUCheckMatmulTwoCTAPass(options);
 }
 
+static std::unique_ptr<mlir::Pass> createTLXBarrierHotspotReportWrapper() {
+  ttng::TritonNvidiaGPUPromoteMBarrierToNamedBarrierPassOptions options;
+  options.reportLikelyBarrierPerfLocations = true;
+  return ttng::createTritonNvidiaGPUPromoteMBarrierToNamedBarrierPass(options);
+}
+
 void init_triton_nvidia_passes_ttnvgpuir(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_assign_cga_layouts",
                      ttng::createTritonNvidiaGPUAssignCGALayoutsPass);
@@ -241,6 +247,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module_ &m) {
       ttng::createTritonNvidiaGPUPromoteMBarrierToNamedBarrierPass);
   ADD_PASS_WRAPPER_0("add_verify_named_barrier_counts",
                      ttng::createTritonNvidiaGPUVerifyNamedBarrierCountsPass);
+  ADD_PASS_WRAPPER_0("add_report_tlx_barrier_hotspots",
+                     createTLXBarrierHotspotReportWrapper);
   ADD_PASS_WRAPPER_0("add_clc_split", ttng::createTritonNvidiaGPUCLCSplitPass);
   ADD_PASS_WRAPPER_0("add_clc_hoist", ttng::createTritonNvidiaGPUCLCHoistPass);
   ADD_PASS_WRAPPER_0("add_clc_materialize",

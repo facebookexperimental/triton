@@ -339,45 +339,26 @@ def TritonNvidiaGPUPruneUnusedBarriersPass
 
 def TritonNvidiaGPUPromoteMBarrierToNamedBarrierPass
     : Pass<"triton-nvidia-gpu-promote-mbarrier-to-named-barrier", "mlir::ModuleOp"> {
-  let summary = "Promote eligible mbarriers to hardware named barriers";
+  let summary = "Promote eligible Triton mbarriers or report TLX barrier hotspots";
 
   let description = [{
-    Replaces eligible CTA-local mbarriers with named barriers after reserving
-    user and warp-specialization IDs from the unified named-barrier pool.
+    The default pass promotes eligible compiler-generated Triton mbarriers to
+    named barriers. It skips modules marked triton.skip_generic_pipeline by
+    TLX fixup. Promotion is opt-in with TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER.
 
-    Enforced eligibility checks:
-    - One initialization, one static arrive, and one static wait for a
-      single-slot allocation, with no unknown synchronization uses. The
-      initialization and arrival counts must match; they may exceed one.
-    - Unpredicated, warp-uniform arrive and wait in distinct partitions of
-      the same warp-specialize operation. Enclosing for-loop nests must have
-      equivalent bounds and steps; other nested control flow is rejected.
-    - CTA locality of the actual barrier descriptors. Ordinary shared-memory
-      barriers broadcast across CTAs are rejected along with cluster memory.
-    - No asynchronous byte tracking, per-thread or multicast arrival, wait
-      dependencies, or other unsupported uses.
-
-    Protocol assumptions, not proved by these checks:
-    - Each dynamic wait observes a distinct phase completed by the
-      corresponding arrival. Wait phases must implement that correspondence.
-    - The surrounding synchronization and barrier lifetime prevent reuse
-      from advancing past a phase that a consumer still needs to observe.
-
-    An mbarrier wait observes phase completion; a named-barrier wait also
-    participates in a synchronization round. Two waits may validly observe
-    the same completed mbarrier phase without a second arrival. Replacing
-    them with two named waits can deadlock. Matching loop nests rejects the
-    one-arrival/two-wait case, but does not prove arbitrary phase sequencing
-    or that a wait cannot be redundant in a larger protocol.
-
-    If named-barrier IDs cannot be reserved, promotion is skipped without
-    emitting a diagnostic or failing this pass.
-
-    This is an opt-in optimization, not a general proof of synchronization
-    equivalence. The CUDA pipeline leaves it disabled unless
-    TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER is enabled. Validate the workload's
-    phase protocol before enabling it.
+    With report-likely-barrier-perf-locations, the pass instead emits remarks
+    at looped mbarrier and named-barrier waits in TLX-marked modules. This
+    report-only mode never rewrites IR, allocates named-barrier IDs, or claims
+    that replacing a wait is safe: mbarriers can track async memory completion
+    and repeated phase observations, unlike named-barrier rendezvous. The
+    NVIDIA pipeline enables it independently with TRITON_REPORT_BARRIER_HOTSPOTS.
   }];
+
+  let options = [
+    Option<"reportLikelyBarrierPerfLocations",
+           "report-likely-barrier-perf-locations", "bool", "false",
+           "Report looped TLX barrier waits without promoting them">
+  ];
 
   let dependentDialects = [
     "mlir::arith::ArithDialect",

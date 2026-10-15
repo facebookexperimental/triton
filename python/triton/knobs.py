@@ -643,6 +643,8 @@ class nvidia_knobs(base_knobs):
     modulo_strict_error: env_bool = env_bool("TRITON_MODULO_STRICT_ERROR")
     disable_wsbarrier_reorder: env_bool = env_bool("TRITON_DISABLE_WSBARRIER_REORDER")
     promote_mbarrier_to_named_barrier: env_bool = env_bool("TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER")
+    # Read-only TLX looped-barrier remarks; does not enable barrier promotion.
+    report_tlx_barrier_hotspots: env_bool = env_bool("TRITON_REPORT_BARRIER_HOTSPOTS")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
     # Default ON; opt out with TRITON_USE_C_DISPATCHER=0.
     use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER", True)

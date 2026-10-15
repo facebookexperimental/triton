@@ -1132,6 +1132,8 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_partition_warps(pm)
         # Promote only after partition warps are final: the baked count is
         # derived from task sizes, which optimize-partition-warps shrinks.
+        if knobs.nvidia.report_tlx_barrier_hotspots:
+            nvidia.passes.ttnvgpuir.add_report_tlx_barrier_hotspots(pm)
         if knobs.nvidia.promote_mbarrier_to_named_barrier:
             nvidia.passes.ttnvgpuir.add_promote_mbarrier_to_named_barrier(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
