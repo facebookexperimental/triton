@@ -1245,14 +1245,16 @@ def _needs_i64_offsets(tensor):
     return max_element_offset * tensor.element_size() > (1 << 31) - 1
 
 
-def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
+def _gemm(a, b, bias=None, *, out=None, space="heuristic", bitwise_equivalent=False):
     M, N, K = _validate_operands(a, b, out)
     bias_strides = _bias_strides(bias, M, N, a) if bias is not None else (0, 0)
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    enable_local_split_u = _precheck_local_split_u(a, b, bias)
-    if space == "heuristic" and (M, N, K) in _MEASURED_LOCAL_SPLIT_U_PLANS:
+    # `bitwise_equivalent` prunes the LocalSplitU schedules; the standard
+    # direct-load configs reduce K sequentially.
+    enable_local_split_u = _precheck_local_split_u(a, b, bias) and not bitwise_equivalent
+    if space == "heuristic" and not bitwise_equivalent and (M, N, K) in _MEASURED_LOCAL_SPLIT_U_PLANS:
         plan = _MEASURED_LOCAL_SPLIT_U_PLANS[(M, N, K)]
         return _launch_local_split_u(a, b, out, plan)
 
@@ -1270,7 +1272,7 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
         fast_configs = getattr(kernel, "_tlx_fast_configs", None)
         if fast_configs is None:
             fast_configs = kernel._tlx_fast_configs = {}
-        fast_key = (_full_config_key(a, b), bias is not None, bias_strides)
+        fast_key = (_full_config_key(a, b), bias is not None, bias_strides, bitwise_equivalent)
         cached = fast_configs.get(fast_key)
         if cached is not None and cached[1]:
             config = cached[0]
@@ -1318,9 +1320,9 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
     return out
 
 
-def mm(a, b, *, out=None, space="heuristic"):
+def mm(a, b, *, out=None, space="heuristic", bitwise_equivalent=False):
     """Compute ``a @ b`` using the gfx942 direct-load GEMM kernel."""
-    return _gemm(a, b, out=out, space=space)
+    return _gemm(a, b, out=out, space=space, bitwise_equivalent=bitwise_equivalent)
 
 
 # Compatibility entry point used by the kernel-optimization agent.

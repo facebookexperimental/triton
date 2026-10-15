@@ -11,7 +11,7 @@ import pytest
 import torch
 import triton
 from triton._internal_testing import is_hip_cdna3
-from mm_test_utils import run_mm_case, shapes
+from mm_test_utils import run_mm_bitwise_equivalent_case, run_mm_case, shapes
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942")
 
@@ -76,6 +76,33 @@ def test_full_space_adds_local_split_u_candidate(shape):
     assert local_configs[0].kwargs["BLOCK_N"] == plan.tile_n
     assert local_configs[0].kwargs["BLOCK_K"] == plan.wave_k
     assert local_configs[0].num_warps == plan.local_split_u
+
+
+def test_heuristic_space_prunes_measured_local_split_u(monkeypatch):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    shape = (7, 8192, 2048)
+    out = object()
+    monkeypatch.setattr(gfx942, "_validate_operands", lambda *args: shape)
+    monkeypatch.setattr(gfx942, "_precheck_local_split_u", lambda *args: True)
+
+    def launch(*args):
+        raise AssertionError("measured LocalSplitU plan must be pruned under bitwise_equivalent")
+
+    monkeypatch.setattr(gfx942, "_launch_local_split_u", launch)
+
+    class AutotunerReached(Exception):
+        pass
+
+    def tuned(requested_space, shape_arg, enable_local_split_u):
+        assert requested_space == "heuristic"
+        assert shape_arg == shape
+        assert not enable_local_split_u
+        raise AutotunerReached
+
+    monkeypatch.setattr(gfx942, "_tuned", tuned)
+    with pytest.raises(AutotunerReached):
+        gfx942._gemm(object(), object(), out=out, space="heuristic", bitwise_equivalent=True)
 
 
 def test_heuristic_space_launches_local_split_u_directly(monkeypatch):
@@ -190,3 +217,16 @@ def test_mm_small_k_tail(K, block_k, dtype, add_bias):
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", shapes())
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     run_mm_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)
+
+
+_BITWISE_EQUIVALENT_SHAPES = [
+    # LocalSplitU shape: the flag prunes the measured LSU plan.
+    (7, 8192, 2048, (2048, 1), (8192, 1), "fp16"),
+    (1024, 1024, 1024, (1024, 1), (1024, 1), "bf16"),
+]
+
+
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _BITWISE_EQUIVALENT_SHAPES)
+def test_mm_bitwise_equivalent(M, N, K, a_strides, b_strides, dtype_name):
+    """`bitwise_equivalent=True` gives exact M-slice equality."""
+    run_mm_bitwise_equivalent_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)

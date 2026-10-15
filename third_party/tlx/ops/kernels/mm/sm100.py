@@ -27,7 +27,7 @@ def _get_num_sms():
     return torch.cuda.get_device_properties("cuda").multi_processor_count
 
 
-def get_heuristic_config(M, N, K, num_sms=148):
+def get_heuristic_config(M, N, K, num_sms=148, *, bitwise_equivalent=False):
     """
     Select optimal GEMM config based on problem shape characteristics.
 
@@ -39,6 +39,8 @@ def get_heuristic_config(M, N, K, num_sms=148):
     Args:
         M, N, K: GEMM dimensions (A is MxK, B is KxN, C is MxN)
         num_sms: Number of SMs on the GPU (default 148 for B200)
+        bitwise_equivalent: prune split-K candidates so the K reduction
+            stays sequential.
 
     Returns:
         dict: Configuration parameters for the TLX GEMM kernel
@@ -133,7 +135,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 }
 
     # Characteristic 2: Undersaturated GPU needs Split-K for parallelism
-    if is_undersaturated:
+    if is_undersaturated and not bitwise_equivalent:
         # Use MN product to determine tile size - larger MN benefits from wider tiles
         mn_product = M * N
         is_large_output = mn_product >= 1_000_000  # ~1M elements in output
@@ -301,7 +303,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
         num_tiles_n = math.ceil(N / bn)
         num_mn_tiles = num_tiles_m * num_tiles_n
 
-        if num_mn_tiles < num_sms:
+        if num_mn_tiles < num_sms and not bitwise_equivalent:
             k_tiles = math.ceil(K / bk)
             # Try split-K values (higher first), each split must have enough K tiles
             for sk in [8, 4, 2]:
@@ -1252,9 +1254,9 @@ def _smoke_configs():
 SMOKE_CONFIGS = _smoke_configs
 
 
-def heuristic_config(M, N, K):
+def heuristic_config(M, N, K, *, bitwise_equivalent=False):
     """The shape-picked config as a one-element space, or None if it declines."""
-    cfg = get_heuristic_config(M, N, K, _get_num_sms())
+    cfg = get_heuristic_config(M, N, K, _get_num_sms(), bitwise_equivalent=bitwise_equivalent)
     if cfg is None:
         return None
     cfg = dict(cfg)
@@ -1280,27 +1282,39 @@ def _widen_on_empty(prune, full_space):
     return pruned
 
 
+def _sequential_configs(configs):
+    """Drop split-K candidates; the autotuner and its hooks are unchanged."""
+    return [c for c in configs if c.kwargs.get("SPLIT_K", 1) == 1]
+
+
 @functools.lru_cache(maxsize=None)
-def _tuned(space, shape=None):
+def _tuned(space, shape=None, *, bitwise_equivalent=False):
     """Autotuned kernel per search space; `shape` keys only the heuristic one."""
     if space == "heuristic":
-        configs = heuristic_config(*shape) or SMOKE_CONFIGS()
+        configs = heuristic_config(*shape, bitwise_equivalent=bitwise_equivalent) or SMOKE_CONFIGS()
     else:
         configs = {"full": CONFIGS, "smoke": SMOKE_CONFIGS}[space]()
+    full_space = CONFIGS
+    if bitwise_equivalent:
+        configs = _sequential_configs(configs)
+        full_space = lambda: _sequential_configs(CONFIGS())
     return triton.autotune(
         configs=configs,
         key=["M", "N", "K"],
-        prune_configs_by={"early_config_prune": _widen_on_empty(preprocess_configs, CONFIGS)},
+        prune_configs_by={"early_config_prune": _widen_on_empty(preprocess_configs, full_space)},
         post_hook=reduce_post_hook,
     )(matmul_kernel_tma_ws_blackwell)
 
 
-def mm(a, b, *, out=None, space="full"):
+def mm(a, b, *, out=None, space="full", bitwise_equivalent=False):
     """Matrix multiply ``a @ b`` on Blackwell.
 
     `space` selects the search space -- "full" for perf, "heuristic" (one
     config) for correctness, "smoke" for path coverage. Not exposed on
     `tlx.ops.mm`.
+
+    `bitwise_equivalent` prunes split-K candidates from every space so the
+    K reduction stays sequential; the autotuner itself is unchanged.
     """
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
@@ -1333,7 +1347,7 @@ def mm(a, b, *, out=None, space="full"):
         num_pid_n = triton.cdiv(N, META["BLOCK_SIZE_N"])
         return (num_pid_m * num_pid_n * META["SPLIT_K"], )
 
-    kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
+    kernel = _tuned(space, (M, N, K) if space == "heuristic" else None, bitwise_equivalent=bitwise_equivalent)
     kernel[grid](
         a_desc,
         b_desc,

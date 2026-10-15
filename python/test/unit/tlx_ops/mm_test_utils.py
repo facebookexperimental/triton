@@ -36,6 +36,42 @@ def _reference_mm(a, b, arch):
     return ref
 
 
+def run_mm_bitwise_equivalent_case(
+    arch,
+    M,
+    N,
+    K,
+    a_strides,
+    b_strides,
+    dtype_name,
+):
+    """Check `bitwise_equivalent=True`: exact M-slice equality + torch-closeness.
+
+    Unlike `run_mm_case`, declined shapes fail loudly: the flag must work on
+    every listed shape.
+    """
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_name]
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = operand(M, K, a_strides, dtype)
+    b = operand(K, N, b_strides, dtype)
+    _assert_strides(a, a_strides)
+    _assert_strides(b, b_strides)
+
+    sub = max(M // 2, 1)
+    full = tlx_mm(a, b, space="heuristic", bitwise_equivalent=True)
+    rerun = tlx_mm(a[:sub], b, space="heuristic", bitwise_equivalent=True)
+    assert torch.equal(full[:sub], rerun), (f"mm({M}x{N}x{K}, {dtype}) with bitwise_equivalent=True is not "
+                                            f"batch invariant: rows differ between full-M and sliced runs")
+
+    ref = _reference_mm(a, b, arch)
+    precision = REL_PRECISION[dtype]
+    torch.testing.assert_close(full, ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+    del a, b, full, rerun, ref
+    torch.cuda.empty_cache()
+
+
 def run_mm_case(
     arch,
     M,
