@@ -115,28 +115,158 @@ bool isWarpUniformValue(Value value, llvm::SmallDenseSet<Value> &visiting) {
   return false;
 }
 
+// A value is CTA-uniform if every thread in the CTA computes the same value.
+// Loop-carried values are accepted only under the induction hypothesis in
+// `assumedUniform` (see proveWhileUniform); anything else unprovable --
+// thread-indexed values, loads, non-induction scf.for carriers -- returns
+// false. Conservative: rejection only misses promotions, never miscompiles.
+bool isCTAUniformValue(Value value, llvm::SmallDenseSet<Value> &visiting,
+                       const llvm::SmallDenseSet<Value> &assumedUniform) {
+  if (!visiting.insert(value).second)
+    return true;
+  if (assumedUniform.contains(value))
+    return true;
+  if (Operation *def = value.getDefiningOp()) {
+    if (def->hasTrait<OpTrait::ConstantLike>())
+      return true;
+    if (def->getName().getDialectNamespace() == "arith")
+      return llvm::all_of(def->getOperands(), [&](Value operand) {
+        return isCTAUniformValue(operand, visiting, assumedUniform);
+      });
+    return isa<triton::GetProgramIdOp, triton::GetNumProgramsOp>(def);
+  }
+
+  auto arg = dyn_cast<BlockArgument>(value);
+  if (!arg)
+    return false;
+  Operation *parent = arg.getOwner()->getParentOp();
+  if (auto partitions = dyn_cast<ttg::WarpSpecializePartitionsOp>(parent))
+    return isCTAUniformValue(
+        partitions.getExplicitCaptures()[arg.getArgNumber()], visiting,
+        assumedUniform);
+  if (isa<triton::FuncOp>(parent))
+    return true;
+  if (auto loop = dyn_cast<scf::ForOp>(parent)) {
+    if (arg != loop.getInductionVar())
+      return false;
+    return isCTAUniformValue(loop.getLowerBound(), visiting, assumedUniform) &&
+           isCTAUniformValue(loop.getUpperBound(), visiting, assumedUniform) &&
+           isCTAUniformValue(loop.getStep(), visiting, assumedUniform);
+  }
+  return false;
+}
+
+// Prove an scf.while executes uniformly (same trip count on every warp) by
+// induction over its loop-carried values: the inits are uniform with no
+// assumptions (base case); the forwarded values, the yielded updates and the
+// condition are uniform assuming the carried values are (inductive step).
+// After-region args are justified by the forwarded values proven just above:
+// they are exactly the condition's operands, and dominance guarantees the
+// before region cannot reference after-region args. On success the carried
+// values and results are added to `provenUniform`: they are warp-uniform on
+// every iteration and may be used by enclosing guards.
+bool proveWhileUniform(scf::WhileOp loop,
+                       llvm::SmallDenseSet<Value> &provenUniform) {
+  auto condOp =
+      dyn_cast<scf::ConditionOp>(loop.getBefore().front().getTerminator());
+  auto yieldOp =
+      dyn_cast<scf::YieldOp>(loop.getAfter().front().getTerminator());
+  if (!condOp || !yieldOp ||
+      loop.getBeforeArguments().size() != loop.getInits().size() ||
+      loop.getAfterArguments().size() != condOp.getArgs().size() ||
+      yieldOp.getResults().size() != loop.getInits().size())
+    return false;
+
+  llvm::SmallDenseSet<Value> assumed = provenUniform;
+  for (Value arg : loop.getBeforeArguments())
+    assumed.insert(arg);
+  for (Value arg : loop.getAfterArguments())
+    assumed.insert(arg);
+
+  for (Value init : loop.getInits()) {
+    llvm::SmallDenseSet<Value> visiting;
+    if (!isCTAUniformValue(init, visiting, provenUniform))
+      return false;
+  }
+  for (Value forwarded : condOp.getArgs()) {
+    llvm::SmallDenseSet<Value> visiting;
+    if (!isCTAUniformValue(forwarded, visiting, assumed))
+      return false;
+  }
+  for (Value updated : yieldOp.getResults()) {
+    llvm::SmallDenseSet<Value> visiting;
+    if (!isCTAUniformValue(updated, visiting, assumed))
+      return false;
+  }
+  {
+    llvm::SmallDenseSet<Value> visiting;
+    if (!isCTAUniformValue(condOp.getCondition(), visiting, assumed))
+      return false;
+  }
+  for (Value arg : loop.getBeforeArguments())
+    provenUniform.insert(arg);
+  for (Value arg : loop.getAfterArguments())
+    provenUniform.insert(arg);
+  for (Value result : loop.getResults())
+    provenUniform.insert(result);
+  return true;
+}
+
 bool isWarpUniform(Operation *op) {
   Region *taskRegion = getWarpSpecializeTaskRegion(op);
   if (!taskRegion)
     return false;
+  // First pass, outside in: prove every enclosing scf.while by induction,
+  // outermost first so inner inits may reference proven outer carriers (an
+  // outer loop's inits are defined before it and can never use inner
+  // results). Carried uniformity is what lets enclosing guards reference loop
+  // counters.
+  llvm::SmallDenseSet<Value> provenUniform;
+  SmallVector<scf::WhileOp> whileAncestors;
   for (Operation *parent = op->getParentOp();
        parent && parent != taskRegion->getParentOp();
        parent = parent->getParentOp()) {
-    // Only a loop is entered by every warp in the partition; anything else --
-    // scf.if, scf.while, scf.index_switch, an unstructured cf.cond_br region --
-    // may run for a subset, and a promoted named barrier would then wait on
-    // warps that never arrive. Allow-list rather than deny-list: a deny-list
-    // silently over-promotes every time a new region op appears.
-    auto loop = dyn_cast<scf::ForOp>(parent);
-    if (!loop)
+    if (auto loop = dyn_cast<scf::WhileOp>(parent))
+      whileAncestors.push_back(loop);
+  }
+  for (scf::WhileOp loop : llvm::reverse(whileAncestors)) {
+    if (!proveWhileUniform(loop, provenUniform))
       return false;
-    // The trip count must also be the same for every warp, or the arrivals
-    // will not pair up across iterations.
-    llvm::SmallDenseSet<Value> visiting;
-    if (!isWarpUniformValue(loop.getLowerBound(), visiting) ||
-        !isWarpUniformValue(loop.getUpperBound(), visiting) ||
-        !isWarpUniformValue(loop.getStep(), visiting))
-      return false;
+  }
+  // Second pass: every ancestor must preserve uniform execution. scf.for
+  // repeats uniformly with uniform bounds; scf.if runs one branch uniformly
+  // with a uniform condition; scf.while was proven above. Anything else --
+  // scf.index_switch, an unstructured cf.cond_br region -- may run for a
+  // subset, and a promoted named barrier would then wait on warps that never
+  // arrive. Allow-list rather than deny-list: a deny-list silently
+  // over-promotes every time a new region op appears.
+  //
+  // Uniformity here is intra-task only: a guard uniform within each task may
+  // still take different branches across tasks. Cross-task agreement is
+  // proven separately by guardsAgree, not here.
+  for (Operation *parent = op->getParentOp();
+       parent && parent != taskRegion->getParentOp();
+       parent = parent->getParentOp()) {
+    if (auto loop = dyn_cast<scf::ForOp>(parent)) {
+      // The trip count must also be the same for every warp, or the arrivals
+      // will not pair up across iterations. Cross-task trip agreement comes
+      // from the iteration-space equivalence proof, not from here.
+      llvm::SmallDenseSet<Value> visiting;
+      if (!isCTAUniformValue(loop.getLowerBound(), visiting, provenUniform) ||
+          !isCTAUniformValue(loop.getUpperBound(), visiting, provenUniform) ||
+          !isCTAUniformValue(loop.getStep(), visiting, provenUniform))
+        return false;
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
+      llvm::SmallDenseSet<Value> visiting;
+      if (!isCTAUniformValue(ifOp.getCondition(), visiting, provenUniform))
+        return false;
+      continue;
+    }
+    if (isa<scf::WhileOp>(parent))
+      continue;
+    return false;
   }
   return true;
 }
@@ -150,10 +280,11 @@ bool haveMatchingLoopNests(Operation *arrive, Operation *wait) {
     return false;
 
   auto getLoops = [](Operation *op, Region *partition) {
-    SmallVector<scf::ForOp> loops;
+    SmallVector<Operation *> loops;
     for (Operation *parent = op->getParentOp();
          parent != partition->getParentOp(); parent = parent->getParentOp())
-      loops.push_back(cast<scf::ForOp>(parent));
+      if (isa<scf::ForOp, scf::WhileOp>(parent))
+        loops.push_back(parent);
     return loops;
   };
   auto arriveLoops = getLoops(arrive, arrivePartition);
@@ -161,7 +292,21 @@ bool haveMatchingLoopNests(Operation *arrive, Operation *wait) {
   // Repeated waits may observe one completed mbarrier phase. A named wait
   // consumes a new arrival, so uniform execution alone does not establish
   // matching numbers of arrivals and waits.
-  return ttg::haveEquivalentWarpSpecializeLoopNests(arriveLoops, waitLoops);
+  if (arriveLoops.size() != waitLoops.size())
+    return false;
+  SmallVector<scf::ForOp> arriveForLoops;
+  SmallVector<scf::ForOp> waitForLoops;
+  for (auto [arriveParent, waitParent] : llvm::zip(arriveLoops, waitLoops)) {
+    if (arriveParent->getName() != waitParent->getName())
+      return false;
+    // The guard-chain check separately proves while-condition equivalence.
+    if (isa<scf::WhileOp>(arriveParent))
+      continue;
+    arriveForLoops.push_back(cast<scf::ForOp>(arriveParent));
+    waitForLoops.push_back(cast<scf::ForOp>(waitParent));
+  }
+  return ttg::haveEquivalentWarpSpecializeLoopNests(arriveForLoops,
+                                                    waitForLoops);
 }
 
 // Null (unpredicated) counts as always-true, preserving the previous behavior
@@ -296,7 +441,110 @@ std::optional<CounterExpression> matchCounterExpression(Value value) {
   return CounterExpression{*iteration, value, offset};
 }
 
-bool areEquivalentLoopValues(Value lhs, Value rhs, unsigned depth = 0) {
+bool areEquivalentLoopValues(
+    Value lhs, Value rhs,
+    llvm::SmallVectorImpl<std::pair<Value, Value>> &assumed, unsigned depth,
+    const llvm::DenseMap<Value, Value> *positionalIVs = nullptr);
+
+// Loop-carried values in different loops are equivalent when the loops
+// produce the same value sequences: same bounds for scf.for induction
+// variables; same inits, forwarded values and updates (by induction) for
+// scf.while carriers. Pairs under comparison are recorded in `assumed` so
+// the recursion terminates. Only same-role, same-index pairs are considered:
+// cross-role pairs carry different values in general.
+bool areEquivalentLoopCarriedValues(
+    BlockArgument lhs, BlockArgument rhs,
+    llvm::SmallVectorImpl<std::pair<Value, Value>> &assumed, unsigned depth,
+    const llvm::DenseMap<Value, Value> *positionalIVs = nullptr) {
+  if (llvm::is_contained(assumed, std::make_pair(Value(lhs), Value(rhs))))
+    return true;
+  auto lhsFor = dyn_cast<scf::ForOp>(lhs.getOwner()->getParentOp());
+  auto rhsFor = dyn_cast<scf::ForOp>(rhs.getOwner()->getParentOp());
+  if (lhsFor && rhsFor) {
+    if (lhs != lhsFor.getInductionVar() || rhs != rhsFor.getInductionVar())
+      return false;
+    // With a positional map (guard comparison), equal bounds are not enough:
+    // counters from different nest positions fire different numbers of times
+    // (an outer-loop guard fires per inner iteration; triangular inner bounds
+    // skew the counts further), so the induction variables must correspond
+    // positionally. Counters outside the map only agree when identical, which
+    // the lhs == rhs check in areEquivalentLoopValues already handled.
+    if (positionalIVs && positionalIVs->lookup(lhs) != rhs)
+      return false;
+    return areEquivalentLoopValues(lhsFor.getLowerBound(),
+                                   rhsFor.getLowerBound(), assumed, depth + 1,
+                                   positionalIVs) &&
+           areEquivalentLoopValues(lhsFor.getUpperBound(),
+                                   rhsFor.getUpperBound(), assumed, depth + 1,
+                                   positionalIVs) &&
+           areEquivalentLoopValues(lhsFor.getStep(), rhsFor.getStep(), assumed,
+                                   depth + 1, positionalIVs);
+  }
+  auto lhsWhile = dyn_cast<scf::WhileOp>(lhs.getOwner()->getParentOp());
+  auto rhsWhile = dyn_cast<scf::WhileOp>(rhs.getOwner()->getParentOp());
+  if (!lhsWhile || !rhsWhile)
+    return false;
+  bool lhsBefore = lhs.getOwner() == &lhsWhile.getBefore().front();
+  bool rhsBefore = rhs.getOwner() == &rhsWhile.getBefore().front();
+  bool lhsAfter = lhs.getOwner() == &lhsWhile.getAfter().front();
+  bool rhsAfter = rhs.getOwner() == &rhsWhile.getAfter().front();
+  if (lhs.getArgNumber() != rhs.getArgNumber() || lhsBefore != rhsBefore ||
+      lhsAfter != rhsAfter || (!lhsBefore && !lhsAfter) ||
+      lhsWhile.getInits().size() != rhsWhile.getInits().size())
+    return false;
+  auto lhsCond =
+      dyn_cast<scf::ConditionOp>(lhsWhile.getBefore().front().getTerminator());
+  auto rhsCond =
+      dyn_cast<scf::ConditionOp>(rhsWhile.getBefore().front().getTerminator());
+  auto lhsYield =
+      dyn_cast<scf::YieldOp>(lhsWhile.getAfter().front().getTerminator());
+  auto rhsYield =
+      dyn_cast<scf::YieldOp>(rhsWhile.getAfter().front().getTerminator());
+  if (!lhsCond || !rhsCond || !lhsYield || !rhsYield ||
+      lhsCond.getArgs().size() != rhsCond.getArgs().size() ||
+      lhsYield.getResults().size() != rhsYield.getResults().size() ||
+      lhsCond.getArgs().size() != lhsWhile.getInits().size() ||
+      lhsYield.getResults().size() != lhsWhile.getInits().size())
+    return false;
+  // The induction hypothesis is scoped to this proof: `assumed` is shared by
+  // reference across the whole top-level query, so hypotheses left behind --
+  // by a failed proof or a successful one -- would short-circuit unrelated
+  // later comparisons to true.
+  size_t assumedSize = assumed.size();
+  for (unsigned i = 0, e = lhsWhile.getInits().size(); i < e; ++i) {
+    assumed.push_back(
+        {lhsWhile.getBeforeArguments()[i], rhsWhile.getBeforeArguments()[i]});
+    assumed.push_back(
+        {lhsWhile.getAfterArguments()[i], rhsWhile.getAfterArguments()[i]});
+  }
+  auto equivalent = [&](Value lhsValue, Value rhsValue) {
+    return areEquivalentLoopValues(lhsValue, rhsValue, assumed, depth + 1,
+                                   positionalIVs);
+  };
+  bool result =
+      llvm::all_of(llvm::zip(lhsWhile.getInits(), rhsWhile.getInits()),
+                   [&](auto operands) {
+                     return equivalent(std::get<0>(operands),
+                                       std::get<1>(operands));
+                   }) &&
+      llvm::all_of(llvm::zip(lhsCond.getArgs(), rhsCond.getArgs()),
+                   [&](auto operands) {
+                     return equivalent(std::get<0>(operands),
+                                       std::get<1>(operands));
+                   }) &&
+      llvm::all_of(llvm::zip(lhsYield.getResults(), rhsYield.getResults()),
+                   [&](auto operands) {
+                     return equivalent(std::get<0>(operands),
+                                       std::get<1>(operands));
+                   });
+  assumed.resize(assumedSize);
+  return result;
+}
+
+bool areEquivalentLoopValues(
+    Value lhs, Value rhs,
+    llvm::SmallVectorImpl<std::pair<Value, Value>> &assumed, unsigned depth,
+    const llvm::DenseMap<Value, Value> *positionalIVs) {
   if (depth > 32)
     return false;
   lhs = resolveWarpSpecializeCapture(lhs);
@@ -308,9 +556,18 @@ bool areEquivalentLoopValues(Value lhs, Value rhs, unsigned depth = 0) {
 
   auto lhsArg = dyn_cast<BlockArgument>(lhs);
   auto rhsArg = dyn_cast<BlockArgument>(rhs);
-  if (lhsArg || rhsArg)
+  if (lhsArg || rhsArg) {
+    if (lhsArg && rhsArg &&
+        areEquivalentLoopCarriedValues(lhsArg, rhsArg, assumed, depth,
+                                       positionalIVs))
+      return true;
+    // Same block as well as same op: an scf.while's before[i] and after[i]
+    // share a parent op and argument number but carry different values (the
+    // before region also executes one extra time).
     return lhsArg && rhsArg && lhsArg.getArgNumber() == rhsArg.getArgNumber() &&
+           lhsArg.getOwner() == rhsArg.getOwner() &&
            lhsArg.getOwner()->getParentOp() == rhsArg.getOwner()->getParentOp();
+  }
 
   Operation *lhsDef = lhs.getDefiningOp();
   Operation *rhsDef = rhs.getDefiningOp();
@@ -331,16 +588,28 @@ bool areEquivalentLoopValues(Value lhs, Value rhs, unsigned depth = 0) {
     return rhsNumPrograms &&
            lhsNumPrograms.getAxis() == rhsNumPrograms.getAxis();
   }
-  if (!isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
-           arith::DivUIOp>(lhsDef))
+  if (auto lhsCmp = dyn_cast<arith::CmpIOp>(lhsDef)) {
+    auto rhsCmp = cast<arith::CmpIOp>(rhsDef);
+    if (lhsCmp.getPredicate() != rhsCmp.getPredicate())
+      return false;
+  } else if (!isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
+                  arith::DivUIOp>(lhsDef)) {
     return false;
+  }
 
   return llvm::all_of(llvm::zip(lhsDef->getOperands(), rhsDef->getOperands()),
                       [&](auto operands) {
-                        return areEquivalentLoopValues(std::get<0>(operands),
-                                                       std::get<1>(operands),
-                                                       depth + 1);
+                        return areEquivalentLoopValues(
+                            std::get<0>(operands), std::get<1>(operands),
+                            assumed, depth + 1, positionalIVs);
                       });
+}
+
+bool areEquivalentLoopValues(
+    Value lhs, Value rhs, unsigned depth = 0,
+    const llvm::DenseMap<Value, Value> *positionalIVs = nullptr) {
+  llvm::SmallVector<std::pair<Value, Value>, 4> assumed;
+  return areEquivalentLoopValues(lhs, rhs, assumed, depth, positionalIVs);
 }
 
 bool haveEquivalentIterationSpaces(scf::ForOp lhs, scf::ForOp rhs) {
@@ -578,11 +847,9 @@ bool mapUsesToSlots(const RangeT &uses, unsigned numBarriers,
   return true;
 }
 
-// An arrive with no matching wait is only safe as a priming arrive: with no
-// enclosing loop between it and its task region it executes exactly once, so
-// its single extra arrival matches the mbarrier phase it pre-completes. A
-// loop-nested unmatched arrive would contribute a trip-count-dependent number
-// of extra arrivals and over-release the named barrier.
+// An arrive with no enclosing loop executes at most once per task execution,
+// like a priming arrive. (A warp-uniform guard may still skip it, but then it
+// is skipped the same way before and after promotion.)
 static bool isPrimingArrive(Operation *arrive) {
   Region *task = getWarpSpecializeTaskRegion(arrive);
   if (!task)
@@ -606,6 +873,91 @@ bool hasWarpUniformPredicate(Value predicate) {
     return true;
   llvm::SmallDenseSet<Value> visiting;
   return isWarpUniformValue(predicate, visiting);
+}
+
+// One gating ancestor (scf.if / scf.while) between an arrive/wait and its
+// task: the op kind, which region holds the op, and the gating condition.
+// scf.for repeats but never gates, so loops are skipped: trip agreement is
+// the iteration-space equivalence proof's job, not this one's.
+struct GuardEdge {
+  OperationName name;
+  unsigned regionNumber;
+  Value condition;
+};
+
+std::optional<SmallVector<GuardEdge>> getGuardChain(Operation *op) {
+  Region *taskRegion = getWarpSpecializeTaskRegion(op);
+  if (!taskRegion)
+    return std::nullopt;
+  SmallVector<GuardEdge> chain;
+  for (Operation *child = op, *parent = op->getParentOp();
+       parent && parent != taskRegion->getParentOp();
+       child = parent, parent = parent->getParentOp()) {
+    if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
+      chain.push_back({parent->getName(),
+                       child->getParentRegion()->getRegionNumber(),
+                       ifOp.getCondition()});
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(parent)) {
+      // The before region always executes, so its condition is not a gate in
+      // the strict sense -- but the edge still marks trip counts (once per
+      // iteration plus the exit check). Dropping it would admit unbalanced
+      // before-vs-bare pairings, so before-region ops keep their edge.
+      auto condOp = dyn_cast<scf::ConditionOp>(
+          whileOp.getBefore().front().getTerminator());
+      if (!condOp)
+        return std::nullopt;
+      chain.push_back({parent->getName(),
+                       child->getParentRegion()->getRegionNumber(),
+                       condOp.getCondition()});
+    }
+  }
+  return chain;
+}
+
+// The scf.for loops enclosing `op` up to the task boundary, innermost first.
+// Used to map guard induction variables positionally across tasks.
+SmallVector<scf::ForOp> getEnclosingForChain(Operation *op) {
+  SmallVector<scf::ForOp> chain;
+  Region *taskRegion = getWarpSpecializeTaskRegion(op);
+  Operation *stop = taskRegion ? taskRegion->getParentOp() : nullptr;
+  for (Operation *parent = op->getParentOp(); parent && parent != stop;
+       parent = parent->getParentOp())
+    if (auto forOp = dyn_cast<scf::ForOp>(parent))
+      chain.push_back(forOp);
+  return chain;
+}
+
+// Positional guard agreement: same number of gating ancestors, same op kind
+// and region at each position, provably equal conditions. Same values imply
+// same branches and trip counts, so agreeing ops execute in lockstep across
+// tasks. Runs after the per-op uniformity checks, which have already
+// rejected thread-dependent conditions and non-allow-listed ancestors.
+//
+// Guard conditions may reference loop counters, which are compared
+// positionally: the enclosing for nests map outermost-first (like
+// haveEquivalentWarpSpecializeLoopNests), and counters correspond only at the
+// same position. Equal bounds alone would equate counters from different
+// loops whose guards fire different numbers of times. Only same-size nests
+// map; anything else (including counters captured from outside the task)
+// agrees only when identical. Cross-task pairs with different nest sizes are
+// rejected downstream by haveMatchingLoopNests regardless.
+bool guardsAgree(Operation *lhsOp, ArrayRef<GuardEdge> lhs, Operation *rhsOp,
+                 ArrayRef<GuardEdge> rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+  SmallVector<scf::ForOp> lhsFors = getEnclosingForChain(lhsOp);
+  SmallVector<scf::ForOp> rhsFors = getEnclosingForChain(rhsOp);
+  llvm::DenseMap<Value, Value> positionalIVs;
+  if (lhsFors.size() == rhsFors.size())
+    for (auto [lhsLoop, rhsLoop] :
+         llvm::zip(llvm::reverse(lhsFors), llvm::reverse(rhsFors)))
+      positionalIVs[lhsLoop.getInductionVar()] = rhsLoop.getInductionVar();
+  return llvm::all_of(llvm::zip(lhs, rhs), [&](const auto &pair) {
+    const auto &[l, r] = pair;
+    return l.name == r.name && l.regionNumber == r.regionNumber &&
+           areEquivalentLoopValues(l.condition, r.condition, /*depth=*/0,
+                                   &positionalIVs);
+  });
 }
 
 bool hasProvenStaticSlotSchedule(const BarrierCandidate &candidate,
@@ -753,6 +1105,45 @@ std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
       return std::nullopt;
     waitPhases.push_back(*phasePlan);
   }
+  // Cross-task guard agreement: intra-task uniformity does not imply that
+  // guards take the same branches in different tasks. Every arrive and every
+  // wait must agree with all the others: a named barrier releases only when
+  // every counted thread rendezvouses, and the count includes the waiting
+  // tasks' threads, so a skipped wait (or two waits under disagreeing guards)
+  // starves the barrier just as surely as a missing arrival. In particular
+  // there is no exemption for unguarded arrives: unlike an mbarrier phase,
+  // which a stray arrival merely advances, a named-barrier generation
+  // accumulates arrivals toward the thread count, so an arrival without its
+  // paired wait skews the generation.
+  SmallVector<std::pair<Operation *, SmallVector<GuardEdge>>> arriveGuards;
+  for (const auto &use : candidate.arrives) {
+    std::optional<SmallVector<GuardEdge>> chain = getGuardChain(use.op);
+    if (!chain)
+      return std::nullopt;
+    arriveGuards.push_back({use.op, std::move(*chain)});
+  }
+  SmallVector<std::pair<Operation *, SmallVector<GuardEdge>>> waitGuards;
+  for (const auto &use : candidate.waits) {
+    std::optional<SmallVector<GuardEdge>> chain = getGuardChain(use.op);
+    if (!chain)
+      return std::nullopt;
+    waitGuards.push_back({use.op, std::move(*chain)});
+  }
+  for (unsigned i = 0; i < arriveGuards.size(); ++i)
+    for (unsigned j = i + 1; j < arriveGuards.size(); ++j)
+      if (!guardsAgree(arriveGuards[i].first, arriveGuards[i].second,
+                       arriveGuards[j].first, arriveGuards[j].second))
+        return std::nullopt;
+  for (unsigned i = 0; i < waitGuards.size(); ++i)
+    for (unsigned j = i + 1; j < waitGuards.size(); ++j)
+      if (!guardsAgree(waitGuards[i].first, waitGuards[i].second,
+                       waitGuards[j].first, waitGuards[j].second))
+        return std::nullopt;
+  for (const auto &waitChain : waitGuards)
+    for (const auto &arriveChain : arriveGuards)
+      if (!guardsAgree(waitChain.first, waitChain.second, arriveChain.first,
+                       arriveChain.second))
+        return std::nullopt;
   if (!hasProvenDynamicSchedule(candidate, waitPhases))
     return std::nullopt;
 
@@ -773,29 +1164,6 @@ std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
       (!arriveIndex.allEqual || !waitIndex.allEqual || arriveIndex.hasStatic ||
        waitIndex.hasStatic || arriveIndex.first != waitIndex.first))
     return std::nullopt;
-
-  auto isCompatiblePair = [&](const auto &arriveUse, const auto &waitUse) {
-    auto arriveSlot = getStaticSlot(arriveUse.index, candidate.numBarriers);
-    auto waitSlot = getStaticSlot(waitUse.index, candidate.numBarriers);
-    return (!arriveSlot || !waitSlot || arriveSlot == waitSlot) &&
-           haveMatchingLoopNests(arriveUse.op, waitUse.op);
-  };
-
-  for (const auto &waitUse : candidate.waits) {
-    if (llvm::none_of(candidate.arrives, [&](const auto &arriveUse) {
-          return isCompatiblePair(arriveUse, waitUse);
-        }))
-      return std::nullopt;
-  }
-
-  for (const auto &arriveUse : candidate.arrives) {
-    bool hasMatchingWait =
-        llvm::any_of(candidate.waits, [&](const auto &waitUse) {
-          return isCompatiblePair(arriveUse, waitUse);
-        });
-    if (!hasMatchingWait && !isPrimingArrive(arriveUse.op))
-      return std::nullopt;
-  }
 
   SmallVector<uint32_t> initCounts(candidate.numBarriers);
   for (const auto &use : candidate.inits) {
@@ -886,6 +1254,13 @@ std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
       Region *task = getWarpSpecializeTaskRegion(wait);
       if (!task || arriveTaskSet.contains(task))
         return std::nullopt;
+      for (Region *producer : arriveTaskSet) {
+        if (llvm::none_of(arrives, [&](Operation *arrive) {
+              return getWarpSpecializeTaskRegion(arrive) == producer &&
+                     haveMatchingLoopNests(arrive, wait);
+            }))
+          return std::nullopt;
+      }
       waitTaskSet.insert(task);
     }
 
