@@ -2434,14 +2434,15 @@ struct FpToFpOpConversion
 
   // Lower fp32 -> fp8/fp16/bf16 with stochastic rounding
   // (RoundingMode::RS) using the CDNA stochastic-rounding conversion
-  // instructions, where SEED is a per-element 32-bit random value:
+  // instructions:
   //   - V_CVT_SR_FP8_F32 / V_CVT_SR_BF8_F32 convert one f32 to an fp8 byte
-  //     selected by byteSel. The fp8 encoding follows the architecture:
-  //     FNUZ on CDNA3, OCP on CDNA4+.
-  //   - V_CVT_SR_F16_F32 / V_CVT_SR_BF16_F32 (CDNA4 only) convert one f32 to
-  //     an f16/bf16 word selected by wordSel.
-  // Unlike Blackwell's packed cvt.rs, each instruction converts a single
-  // element with its own seed, so no entropy mixing is required.
+  //     selected by byteSel, with a per-element 32-bit seed. The fp8 encoding
+  //     follows the architecture: FNUZ on CDNA3, OCP on CDNA4+.
+  //   - V_CVT_SR_F16_F32 / V_CVT_SR_BF16_F32 (CDNA4) convert one f32 to an
+  //     f16/bf16 word selected by wordSel, with a per-element seed.
+  //   - V_CVT_SR_PK_F16_F32 / V_CVT_SR_PK_BF16_F32 (CDNA5, i.e. gfx1250)
+  //     convert two f32 to a packed f16/bf16 pair with a single seed split
+  //     16/16 between them.
   SmallVector<Value>
   lowerFpToFpWithStochRounding(triton::FpToFpOp op, OpAdaptor /*adaptor*/,
                                ConversionPatternRewriter &rewriter, Type elemTy,
@@ -2463,8 +2464,10 @@ struct FpToFpOpConversion
 
     bool isE4M3 = isa<Float8E4M3FNType, Float8E4M3FNUZType>(dstElementType);
     bool isE5M2 = isa<Float8E5M2Type, Float8E5M2FNUZType>(dstElementType);
-    if (isa<Float8E4M3FNType, Float8E5M2Type>(dstElementType) &&
-        !isCDNA4OrHigher(isaFamily)) {
+    bool isOCPFp8HW = isCDNA4OrHigher(isaFamily);
+    bool isFp16SRHW =
+        isaFamily == ISAFamily::CDNA4 || isaFamily == ISAFamily::GFX1250;
+    if (isa<Float8E4M3FNType, Float8E5M2Type>(dstElementType) && !isOCPFp8HW) {
       op->emitError("Stochastic rounding to OCP fp8 requires CDNA4 or higher");
       return {};
     }
@@ -2473,9 +2476,9 @@ struct FpToFpOpConversion
       op->emitError("Stochastic rounding to FNUZ fp8 requires CDNA3");
       return {};
     }
-    if ((dstElementType.isF16() || dstElementType.isBF16()) &&
-        isaFamily != ISAFamily::CDNA4) {
-      op->emitError("Stochastic rounding to fp16/bf16 requires CDNA4");
+    if ((dstElementType.isF16() || dstElementType.isBF16()) && !isFp16SRHW) {
+      op->emitError(
+          "Stochastic rounding to fp16/bf16 requires CDNA4 or higher");
       return {};
     }
     if (!isE4M3 && !isE5M2 && !dstElementType.isF16() &&
@@ -2525,27 +2528,47 @@ struct FpToFpOpConversion
       return outVals;
     }
 
-    // Convert 2 elements at a time into one <2 x f16/bf16>, chaining the
-    // word-selecting SR intrinsics. No ROCDL dialect op exists for these.
-    StringRef intrinsic = dstElementType.isF16()
-                              ? "llvm.amdgcn.cvt.sr.f16.f32"
-                              : "llvm.amdgcn.cvt.sr.bf16.f32";
+    // Convert 2 elements at a time into one <2 x f16/bf16>. No ROCDL
+    // dialect ops exist for these; call the intrinsics directly.
     Type v2Ty = vec_ty(elemTy, 2);
     while (srcVals.size() % 2 != 0) {
       srcVals.push_back(b.undef(f32_ty));
       seedVals.push_back(b.undef(i32_ty));
     }
     SmallVector<Value> outVals;
+    // CDNA5 (gfx1250) converts both elements with one packed instruction
+    // fed by a single seed split 16/16; CDNA4 chains two word-selecting
+    // converts with one seed each.
+    bool usePk = isaFamily == ISAFamily::GFX1250;
+    StringRef intrinsic;
+    if (dstElementType.isF16())
+      intrinsic = usePk ? "llvm.amdgcn.cvt.sr.pk.f16.f32"
+                        : "llvm.amdgcn.cvt.sr.f16.f32";
+    else
+      intrinsic = usePk ? "llvm.amdgcn.cvt.sr.pk.bf16.f32"
+                        : "llvm.amdgcn.cvt.sr.bf16.f32";
     for (size_t i = 0; i < srcVals.size(); i += 2) {
-      Value acc = b.undef(v2Ty);
-      acc = LLVM::createLLVMIntrinsicCallOp(
-                rewriter, loc, intrinsic, v2Ty,
-                ValueRange{acc, srcVals[i], seedVals[i], b.false_val()})
-                ->getResult(0);
-      acc = LLVM::createLLVMIntrinsicCallOp(
+      Value acc;
+      if (usePk) {
+        Value lo = b.and_(i32_ty, seedVals[i], b.i32_val(0xffff));
+        Value hi = b.and_(i32_ty, seedVals[i + 1], b.i32_val(0xffff));
+        Value seed = b.or_(i32_ty, lo, b.shl(i32_ty, hi, b.i32_val(16)));
+        acc = LLVM::createLLVMIntrinsicCallOp(
+                  rewriter, loc, intrinsic, v2Ty,
+                  ValueRange{srcVals[i], srcVals[i + 1], seed})
+                  ->getResult(0);
+      } else {
+        acc = b.undef(v2Ty);
+        acc = LLVM::createLLVMIntrinsicCallOp(
+                  rewriter, loc, intrinsic, v2Ty,
+                  ValueRange{acc, srcVals[i], seedVals[i], b.false_val()})
+                  ->getResult(0);
+        acc =
+            LLVM::createLLVMIntrinsicCallOp(
                 rewriter, loc, intrinsic, v2Ty,
                 ValueRange{acc, srcVals[i + 1], seedVals[i + 1], b.true_val()})
                 ->getResult(0);
+      }
       outVals.push_back(b.extract_element(elemTy, acc, b.i32_val(0)));
       outVals.push_back(b.extract_element(elemTy, acc, b.i32_val(1)));
     }
