@@ -1,5 +1,7 @@
+import ctypes
 import itertools
 import re
+import time
 from collections import Counter
 
 import numpy as np
@@ -60,14 +62,29 @@ def _hex_float_values(output: bytes) -> Counter:
                                                   ])
 def test_print(func_type: str, data_type: str, device: str, capfd):
     print_helper.test_print(func_type, data_type, device)
-    output = capfd.readouterr()
-    stdout = output.out.encode("utf-8")
+    # Device printf reaches stdout through buffered C stdio; the old
+    # subprocess isolation flushed it at process exit, but in-process capfd
+    # capture sees only flushed bytes (missing tail on HIP). Flush libc
+    # buffers, then settle for any late-arriving output before asserting.
+    ctypes.CDLL(None).fflush(None)
+    out_parts = []
+    err_parts = []
+    for _ in range(11):
+        output = capfd.readouterr()
+        out_parts.append(output.out)
+        err_parts.append(output.err)
+        if not output.out and not output.err:
+            break
+        time.sleep(0.1)
+    full_out = "".join(out_parts)
+    full_err = "".join(err_parts)
+    stdout = full_out.encode("utf-8")
 
     # The total number of elements in the 1-D tensor to print.
     N = 128
 
     if is_interpreter():
-        assert output.err == ""
+        assert full_err == ""
 
     if func_type == "device_print_hex" and data_type.startswith("float"):
         float_type = getattr(np, data_type)
@@ -84,7 +101,7 @@ def test_print(func_type: str, data_type: str, device: str, capfd):
         # Interpreter uses a different format for device_print.
         return
 
-    outs = [line for line in output.out.splitlines() if line]
+    outs = [line for line in full_out.splitlines() if line]
 
     # Constant for testing the printing of scalar values
     SCALAR_VAL = 42
