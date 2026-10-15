@@ -47,37 +47,21 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Download prebuilt Triton wheel from GitHub artifacts
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        uses: actions/download-artifact@v4
-        with:
-          name: run_${{ github.run_id }}
-          path: ${{ runner.temp }}/prebuilt-wheel
-      - name: Download prebuilt Triton wheel from S3
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          WHEEL_URL: ${{ inputs.wheel_url }}
-          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
-        run: |
-          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
-          curl --fail --location --retry 3 \
-            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
-      - name: Verify prebuilt Triton wheel
-        env:
-          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
-          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
-        run: |
-          printf '%s  %s\n' "${WHEEL_SHA256}" "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" | sha256sum --check
-      - name: Install Triton
-        run: |
-          . "${SETUP_SCRIPT}"
-          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
       - name: Install torchao
         timeout-minutes: 10
         run: |
           . "${SETUP_SCRIPT}"
           uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          # Activate the runner environment in each composite-action shell.
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Export TritonBench env
         run: |
           . "${SETUP_SCRIPT}"
@@ -147,32 +131,9 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Download prebuilt Triton wheel from GitHub artifacts
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        uses: actions/download-artifact@v4
-        with:
-          name: run_${{ github.run_id }}
-          path: ${{ runner.temp }}/prebuilt-wheel
-      - name: Download prebuilt Triton wheel from S3
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          WHEEL_URL: ${{ inputs.wheel_url }}
-          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
-        run: |
-          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
-          curl --fail --location --retry 3 \
-            --write-out 'downloaded %{size_download} bytes in %{time_total}s (%{speed_download} B/s)\n' \
-            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
-      - name: Verify prebuilt Triton wheel
-        env:
-          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
-          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
-        run: |
-          printf '%s  %s\n' "${WHEEL_SHA256}" "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" | sha256sum --check
-      - name: Install Triton
+      - name: Install test dependencies
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
           uv pip install pytest
       - name: Install torchao
         timeout-minutes: 10
@@ -180,6 +141,15 @@ jobs:
           . "${SETUP_SCRIPT}"
           uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          # Activate the runner environment in each composite-action shell.
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
@@ -388,32 +358,19 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Download prebuilt Triton wheel from GitHub artifacts
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        uses: actions/download-artifact@v4
-        with:
-          name: run_${{ github.run_id }}
-          path: ${{ runner.temp }}/prebuilt-wheel
-      - name: Download prebuilt Triton wheel from S3
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          WHEEL_URL: ${{ inputs.wheel_url }}
-          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
-        run: |
-          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
-          curl --fail --location --retry 3 \
-            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
-      - name: Verify prebuilt Triton wheel
-        env:
-          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
-          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
-        run: |
-          printf '%s  %s\n' "${WHEEL_SHA256}" "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" | sha256sum --check
-      - name: Install Triton
+      - name: Install test dependencies
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
           uv pip install pytest expecttest
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          # Activate the runner environment in each composite-action shell.
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
