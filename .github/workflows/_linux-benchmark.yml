@@ -59,6 +59,7 @@ jobs:
       run:
         shell: bash
     env:
+      JOB_NAME: fbtriton_benchmark
       WORKSPACE_DIR: /workspace
       CONDA_ENV: triton-side-${{ inputs.side }}
       RUNNER_TYPE: ${{ inputs.device }}
