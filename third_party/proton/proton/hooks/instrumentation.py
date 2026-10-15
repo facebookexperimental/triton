@@ -268,8 +268,10 @@ class InstrumentationHook(Hook):
         stream = metadata.data.get("stream")
         alloc_size = 0 if self.buffer is None else self.buffer.element_size() * self.buffer.numel()
         libproton.enter_instrumented_op(stream, func, self._data_ptr(), alloc_size)
-        if InstrumentationHook.enable_host_buffer:
-            InstrumentationHook.host_buffer = None
+        # Do NOT reset host_buffer here: a session may launch several kernels
+        # (e.g. an auxiliary reduction after the profiled kernel) and the
+        # snapshot must survive kernels that contribute no profiling data.
+        # Freshness across sessions is handled by deactivate().
 
     def exit(self, metadata: LazyDict) -> None:
         func = metadata.data.get("function")
@@ -306,6 +308,17 @@ class InstrumentationHook(Hook):
             uid_num = total_unit if self.mode.sampling_strategy == triton_proton.SAMPLING_STRATEGY.NONE else len(
                 sampled_warps)
             block_num = alloc_size // scratch_mem_size if scratch_mem_size else 0
+
+            # Never clobber a valid snapshot with one that carries no profiling
+            # data. This hook fires on every kernel exit in the session,
+            # including trailing auxiliary kernels compiled without
+            # instrumentation (scratch size zero, e.g. split-K reductions or
+            # backward pre/postprocess kernels). Overwriting a valid snapshot
+            # with an empty one makes downstream consumers (e.g. MPP
+            # barrier-deps decode) silently see no data. Still publish when no
+            # snapshot exists yet so single-kernel sessions keep working.
+            if block_num == 0 and InstrumentationHook.host_buffer is not None:
+                return
 
             # Binary trace layout:
             # +------------------+
