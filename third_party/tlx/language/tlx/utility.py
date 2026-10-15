@@ -268,7 +268,7 @@ def stoch_round(
     """
     Hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions.
 
-    Requires Blackwell GPU (compute capability >= 100), or CDNA3/CDNA4 on AMD.
+    Requires Blackwell GPU (compute capability >= 100), or CDNA3/CDNA4/CDNA5 on AMD.
 
     Semantics:
         y = tlx.stoch_round(src, dst_ty, rand_bits)
@@ -279,17 +279,19 @@ def stoch_round(
 
     Maps to GCN (on AMD):
         v_cvt_sr_fp8_f32 / v_cvt_sr_bf8_f32  (for FP8, one element per seed)
-        v_cvt_sr_f16_f32 / v_cvt_sr_bf16_f32 (for F16/BF16, CDNA4 only)
+        v_cvt_sr_f16_f32 / v_cvt_sr_bf16_f32 (for F16/BF16 on CDNA4)
+        v_cvt_sr_pk_f16_f32 / v_cvt_sr_pk_bf16_f32 (for F16/BF16 on CDNA5,
+            i.e. gfx1250; packed pairs sharing one seed)
     The fp8 encoding follows the architecture: FNUZ on CDNA3 (gfx942),
-    OCP on CDNA4 (gfx950).
+    OCP on CDNA4 (gfx950) and CDNA5 (gfx1250).
 
     Args:
         src:
             Source FP32 tensor. Shape defines output shape.
         dst_ty:
             Destination dtype. On CUDA: tl.float8e5, tl.float8e4nv, tl.float16,
-            or tl.bfloat16. On CDNA4: the same four. On CDNA3: tl.float8e4b8
-            or tl.float8e5b16 (FNUZ fp8 only).
+            or tl.bfloat16. On CDNA4/CDNA5: the same four. On CDNA3:
+            tl.float8e4b8 or tl.float8e5b16 (FNUZ fp8 only).
         rand_bits:
             Random bits (uint32 tensor) for entropy, must match src shape
 
@@ -300,18 +302,19 @@ def stoch_round(
         dst_ty = dst_ty.value
     arch = _semantic.builder.options.arch
     if isinstance(arch, str) and arch.startswith("gfx"):
-        # CDNA3 (gfx942) converts to FNUZ fp8 only; CDNA4 (gfx950) converts
-        # to OCP fp8/f16/bf16. Older CDNA has no stochastic-rounding support.
+        # CDNA3 (gfx942) converts to FNUZ fp8 only; CDNA4 (gfx950) and CDNA5
+        # (gfx1250) convert to OCP fp8/f16/bf16. Older CDNA has no
+        # stochastic-rounding support.
         # Strip any ":feature" suffix (e.g. "gfx942:sramecc+:xnack-") before
         # matching the version.
         gfx_version = arch.split(":")[0].removeprefix("gfx")
-        if gfx_version == "950":
+        if gfx_version in ("950", "1250"):
             supported_dst = [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16]
         elif gfx_version == "942":
             supported_dst = [tl.float8e4b8, tl.float8e5b16]
         else:
-            raise AssertionError(f"stoch_round requires gfx942 (CDNA3, FNUZ fp8 only) or gfx950 (CDNA4), "
-                                 f"got arch {arch}")
+            raise AssertionError(f"stoch_round requires gfx942 (CDNA3, FNUZ fp8 only), gfx950 (CDNA4), or "
+                                 f"gfx1250 (CDNA5), got arch {arch}")
     else:
         capability = int(cuda_parse_arch(arch))
         assert capability >= 100, (f"stoch_round requires compute capability >= 100 (Blackwell GPU), "
