@@ -2,12 +2,17 @@
 TRITON_COMPILE_IQ_COLLECT) that, when a kernel is compiled, dumps a self-contained, SOURCE-FREE
 "compileIQ task" to disk for the offline (PTX-direct) factory.
 
-A task dir ($COMPILE_IQ_TASK_DIR/<ptx_sha[:16]>/) contains exactly:
-    kernel.ptx   the emitted PTX (the ACF is tuned for this; ptxas assembles it -> SASS)
-    spec.json    the source-free launch description -- identity, arch, entry, block/grid, shared,
-                 and the post-specialization kernel-param layout (see ptx_launch.build_spec)
-    <sha256>.pkl the pre-launch data of each tensor arg under 1MB (a pickled CPU torch.Tensor),
-                 named by the sha256 of the file and referenced by spec.json's "pickle_sha256"
+A task dir ($COMPILE_IQ_TASK_DIR/<ptx_sha[:16]>/) contains:
+    kernel.ptx            the emitted PTX (the ACF is tuned for this; ptxas assembles it -> SASS)
+    spec.json             the source-free launch description -- identity, arch, entry, block/grid,
+                          shared, and the post-specialization kernel-param layout (see
+                          ptx_launch.build_spec)
+    <sha256>.pkl          the pre-launch data of each tensor arg under 1MB (a pickled CPU
+                          torch.Tensor), named by the sha256 of the file and referenced by
+                          spec.json's "pickle_sha256"
+    launch_metadata.json  (optional) the compiler's Level 0 launch schema (asm["launch_metadata"])
+    launcher.c            (optional) the compiler-generated launcher (asm["launcher_src"]) that the
+                          factory can compile + drive via launch.h (see ptx_anneal.level1)
 
 NO source.py is dumped: the factory never recompiles from source, it only runs ptxas (PTX->SASS)
 and launches the cubin via the CUDA driver API, so the Python source is not needed. The store key
@@ -24,11 +29,21 @@ import os
 import pickle
 
 from triton.backends.nvidia.compiler import get_ptxas
+from triton.runtime.jit import _compile_iq_state, _compile_iq_suppress_competition
 
 from . import ptx_launch
 from .store import dlog, ptx_sha256
 
 _PICKLE_MAX_BYTES = 1 << 20
+
+
+def benchmarking():
+    """Context manager marking launches inside it as autotuning benchmark runs.
+
+    Frameworks that benchmark candidate kernels outside Triton's autotuner (e.g. Inductor) enter it
+    so that only the winning config is collected, on its first launch outside benchmarking. Shares
+    the flag Triton's autotuner sets around do_bench, which also defers the ACF A/B."""
+    return _compile_iq_suppress_competition()
 
 
 def task_root() -> str:
@@ -117,7 +132,53 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
         dlog(
             "collector", f"collected {sha[:16]} {spec['arch']} entry={spec['entry']} grid={spec['grid']} "
             f"tensors={len(spec['tensors'])} args={len(spec['args'])} -> {tdir}")
+
+        # Level 1 (prototype): additionally capture the compiler-owned launcher + Level 0 schema when
+        # the backend emits them, so the factory can drive triton_launch_<kernel>() (launch.h) rather
+        # than the hand-rolled PTX-direct launcher (see ptx_anneal.level1). Best-effort and additive:
+        # absence just means the factory falls back to spec.json. Isolated so it can never perturb the
+        # already-written spec.json / kernel.ptx.
+        try:
+            asm = kernel.asm
+            lm = asm["launch_metadata"] if "launch_metadata" in asm else None
+            if lm is not None:
+                with open(os.path.join(tdir, "launch_metadata.json"), "w") as f:
+                    f.write(lm if isinstance(lm, str) else json.dumps(lm))
+            ls = asm["launcher_src"] if "launcher_src" in asm else None
+            if ls is not None:
+                with open(os.path.join(tdir, "launcher.c"), "w") as f:
+                    f.write(ls)
+            if lm is not None or ls is not None:
+                dlog(
+                    "collector", f"captured level1 {sha[:16]} "
+                    f"(launch_metadata={lm is not None}, launcher_src={ls is not None})")
+        except Exception as e:
+            dlog("collector", f"level1 capture skipped: {type(e).__name__}: {e}")
     except NotImplementedError as e:
         dlog("collector", f"skip (unsupported by PTX-direct spec): {e}")
     except Exception as e:  # collection must never break the user's run
         dlog("collector", f"capture failed: {type(e).__name__}: {e}")
+
+
+def wrap_launcher(kernel, run):
+    """Wrap a CompiledKernel's launcher so its first launch dumps a task.
+
+    Covers kernels compiled with triton.compile() and launched through CompiledKernel.run (e.g.
+    Inductor's generated launchers), which never reach the JITFunction.run hook. Callers may hold on
+    to the returned function, so it stays installed and only the first launch collects. Launches
+    inside benchmarking() are skipped, so autotune candidates that never run outside a benchmark are
+    never collected."""
+    collected = False
+
+    def launcher(grid_0, grid_1, grid_2, stream, function, metadata, launch_metadata, enter_hook, exit_hook, *args):
+        nonlocal collected
+        if not collected and not getattr(_compile_iq_state, "suppressed", False):
+            collected = True
+            src = kernel.src
+            fn = getattr(src, "fn", None)
+            if fn is not None:
+                capture(jitfn=fn, kernel=kernel, bound_args=dict(zip(fn.arg_names, args)), signature=src.signature,
+                        constexprs=src.constants, grid=(grid_0, grid_1, grid_2))
+        return run(grid_0, grid_1, grid_2, stream, function, metadata, launch_metadata, enter_hook, exit_hook, *args)
+
+    return launcher

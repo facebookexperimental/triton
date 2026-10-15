@@ -1,7 +1,7 @@
 import triton.language.core as tl
 from . import types as tlx
 from .mem_ops import remote_view
-from .utility import is_hip
+from .utility import cuda_parse_arch, is_hip
 
 
 def _physical_num_ctas(_semantic):
@@ -94,6 +94,8 @@ def alloc_barriers(
         num_barriers: tl.constexpr,
         arrive_count: tl.constexpr = tl.constexpr(1),
         _semantic=None,
+        *,
+        scope: tl.constexpr = tl.constexpr("cta"),
 ) -> tlx.mbarrier:
     """
     Allocates a buffer in shared memory and initializes mbarriers with arrive counts.
@@ -101,7 +103,24 @@ def alloc_barriers(
     Input:
     - `num_barriers`: The number of barriers to allocate.
     - `arrive_count`: The number of threads that need to arrive at the barrier before it can be released.
+    - `scope`: Compile-time initialization scope, "cta" (default) or "cluster".
+      On NVIDIA sm90+, "cluster" requests compiler-owned initialization fencing
+      and a cluster rendezvous. With multiple physical CTAs, if any entry
+      barrier has cluster scope, all eligible entry barrier initializations
+      (including CTA scope) are batched
+      before TMEM allocation, followed by one fence and rendezvous. Allocate
+      these barriers unconditionally at kernel entry, before use. This does not
+      change arrival counts, storage layout, or launch dimensions, and does not
+      synchronize later pipeline phases.
+      A single physical CTA needs no cluster rendezvous. The default preserves
+      existing behavior, including legacy compiler-inserted synchronization.
     """
+
+    scope = tl._unwrap_if_constexpr(scope)
+    assert isinstance(scope, str) and scope in ("cta", "cluster"), "scope must be 'cta' or 'cluster'"
+    if scope == "cluster":
+        assert _semantic.builder.options.backend_name == "cuda", "cluster barrier scope requires NVIDIA sm90+"
+        assert cuda_parse_arch(_semantic.builder.options.arch) >= 90, "cluster barrier scope requires NVIDIA sm90+"
 
     layout, layout_handle = _make_mbarrier_layout_handle(_semantic)
     return tlx.mbarrier(
@@ -110,6 +129,7 @@ def alloc_barriers(
             arrive_count.value,
             layout_handle,
             _semantic.builder.options.num_ctas,
+            scope == "cluster",
         ),
         num_barriers,
         layout,

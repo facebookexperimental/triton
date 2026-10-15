@@ -1,11 +1,9 @@
 #include "mlir/IR/Matchers.h"
-#include "mlir/IR/OperationSupport.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/NamedBarrier.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
@@ -143,35 +141,6 @@ bool isWarpUniform(Operation *op) {
   return true;
 }
 
-bool sameLoopBound(Value lhs, Value rhs,
-                   const DenseMap<Value, Value> &inductionVars,
-                   unsigned depth = 0) {
-  lhs = ttg::resolveWarpSpecializeCapture(lhs);
-  rhs = ttg::resolveWarpSpecializeCapture(rhs);
-  if (lhs == rhs)
-    return true;
-  if (auto it = inductionVars.find(lhs); it != inductionVars.end())
-    return it->second == rhs;
-  if (lhs.getType() != rhs.getType() || depth > 8)
-    return false;
-
-  Operation *lhsDef = lhs.getDefiningOp();
-  Operation *rhsDef = rhs.getDefiningOp();
-  if (!lhsDef || !rhsDef || lhsDef->getNumRegions() ||
-      rhsDef->getNumRegions() || !isMemoryEffectFree(lhsDef) ||
-      !isMemoryEffectFree(rhsDef) ||
-      cast<OpResult>(lhs).getResultNumber() !=
-          cast<OpResult>(rhs).getResultNumber())
-    return false;
-  return OperationEquivalence::isEquivalentTo(
-      lhsDef, rhsDef,
-      [&](Value lhsOperand, Value rhsOperand) {
-        return success(
-            sameLoopBound(lhsOperand, rhsOperand, inductionVars, depth + 1));
-      },
-      /*markEquivalent=*/nullptr, OperationEquivalence::IgnoreLocations);
-}
-
 bool haveMatchingLoopNests(Operation *arrive, Operation *wait) {
   Region *arrivePartition = getWarpSpecializeTaskRegion(arrive);
   Region *waitPartition = getWarpSpecializeTaskRegion(wait);
@@ -189,24 +158,10 @@ bool haveMatchingLoopNests(Operation *arrive, Operation *wait) {
   };
   auto arriveLoops = getLoops(arrive, arrivePartition);
   auto waitLoops = getLoops(wait, waitPartition);
-  if (arriveLoops.size() != waitLoops.size())
-    return false;
-
   // Repeated waits may observe one completed mbarrier phase. A named wait
   // consumes a new arrival, so uniform execution alone does not establish
   // matching numbers of arrivals and waits.
-  DenseMap<Value, Value> inductionVars;
-  for (auto [arriveLoop, waitLoop] :
-       llvm::zip(llvm::reverse(arriveLoops), llvm::reverse(waitLoops))) {
-    if (!sameLoopBound(arriveLoop.getLowerBound(), waitLoop.getLowerBound(),
-                       inductionVars) ||
-        !sameLoopBound(arriveLoop.getUpperBound(), waitLoop.getUpperBound(),
-                       inductionVars) ||
-        !sameLoopBound(arriveLoop.getStep(), waitLoop.getStep(), inductionVars))
-      return false;
-    inductionVars[arriveLoop.getInductionVar()] = waitLoop.getInductionVar();
-  }
-  return true;
+  return ttg::haveEquivalentWarpSpecializeLoopNests(arriveLoops, waitLoops);
 }
 
 // Null (unpredicated) counts as always-true, preserving the previous behavior
@@ -217,6 +172,294 @@ bool isAlwaysTrue(Value pred) {
   auto constant = pred.getDefiningOp<arith::ConstantOp>();
   auto value = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : nullptr;
   return value && !value.getValue().isZero();
+}
+
+bool matchConstantInt(Value value, int64_t expected) {
+  APInt constant;
+  return matchPattern(value, m_ConstantInt(&constant)) && expected >= 0 &&
+         constant.getLimitedValue() == expected;
+}
+
+Value stripIntegerCasts(Value value) {
+  while (Operation *def = value.getDefiningOp()) {
+    if (!isa<arith::ExtUIOp, arith::TruncIOp, arith::IndexCastOp>(def))
+      break;
+    value = def->getOperand(0);
+  }
+  return value;
+}
+
+Value matchBinaryOperandWithConstant(Operation *op, int64_t expected) {
+  if (matchConstantInt(op->getOperand(0), expected))
+    return op->getOperand(1);
+  if (matchConstantInt(op->getOperand(1), expected))
+    return op->getOperand(0);
+  return {};
+}
+
+struct IterationCounter {
+  scf::ForOp loop;
+  Value value;
+  uint64_t initialValue;
+  uint64_t increment;
+};
+
+std::optional<IterationCounter> matchIterationCounter(Value counter) {
+  counter = stripIntegerCasts(counter);
+  if (auto div = counter.getDefiningOp<arith::DivUIOp>()) {
+    auto sub = stripIntegerCasts(div.getLhs()).getDefiningOp<arith::SubIOp>();
+    if (!sub)
+      return std::nullopt;
+    Value induction = stripIntegerCasts(sub.getLhs());
+    auto arg = dyn_cast<BlockArgument>(induction);
+    auto loop = arg ? dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp())
+                    : scf::ForOp();
+    if (!loop || induction != loop.getInductionVar() ||
+        stripIntegerCasts(sub.getRhs()) !=
+            stripIntegerCasts(loop.getLowerBound()) ||
+        stripIntegerCasts(div.getRhs()) != stripIntegerCasts(loop.getStep()))
+      return std::nullopt;
+    // (iv - lb) / step counts 0, 1, 2, ... only for a positive step: scf.for
+    // permits a negative step, for which iv - lb is negative and the unsigned
+    // division wraps instead of tracking the iteration.
+    APInt step;
+    if (!matchPattern(resolveWarpSpecializeCapture(loop.getStep()),
+                      m_ConstantInt(&step)) ||
+        !step.isStrictlyPositive())
+      return std::nullopt;
+    return IterationCounter{loop, counter, /*initialValue=*/0,
+                            /*increment=*/1};
+  }
+
+  auto arg = dyn_cast<BlockArgument>(counter);
+  if (!arg)
+    return std::nullopt;
+  auto loop = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+  if (!loop)
+    return std::nullopt;
+
+  auto iterArgs = loop.getRegionIterArgs();
+  auto it = llvm::find(iterArgs, counter);
+  if (it == iterArgs.end())
+    return std::nullopt;
+  unsigned index = std::distance(iterArgs.begin(), it);
+  APInt initialValue;
+  if (!matchPattern(loop.getInitArgs()[index], m_ConstantInt(&initialValue)) ||
+      initialValue.isNegative() || initialValue.getActiveBits() > 32)
+    return std::nullopt;
+
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  auto add = yield.getResults()[index].getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return std::nullopt;
+  Value incrementValue;
+  if (add.getLhs() == counter)
+    incrementValue = add.getRhs();
+  else if (add.getRhs() == counter)
+    incrementValue = add.getLhs();
+  else
+    return std::nullopt;
+  APInt increment;
+  if (!matchPattern(incrementValue, m_ConstantInt(&increment)) ||
+      increment.isZero() || increment.isNegative() ||
+      increment.getActiveBits() > 32)
+    return std::nullopt;
+  return IterationCounter{loop, counter, initialValue.getZExtValue(),
+                          increment.getZExtValue()};
+}
+
+struct CounterExpression {
+  IterationCounter counter;
+  Value value;
+  uint64_t offset;
+};
+
+std::optional<CounterExpression> matchCounterExpression(Value value) {
+  value = stripIntegerCasts(value);
+  Value counter = value;
+  uint64_t offset = 0;
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    APInt constant;
+    if (matchPattern(add.getLhs(), m_ConstantInt(&constant)))
+      counter = add.getRhs();
+    else if (matchPattern(add.getRhs(), m_ConstantInt(&constant)))
+      counter = add.getLhs();
+    else
+      return std::nullopt;
+    if (constant.isNegative() || constant.getActiveBits() > 32)
+      return std::nullopt;
+    offset = constant.getZExtValue();
+  }
+  std::optional<IterationCounter> iteration = matchIterationCounter(counter);
+  if (!iteration)
+    return std::nullopt;
+  return CounterExpression{*iteration, value, offset};
+}
+
+bool areEquivalentLoopValues(Value lhs, Value rhs, unsigned depth = 0) {
+  if (depth > 32)
+    return false;
+  lhs = resolveWarpSpecializeCapture(lhs);
+  rhs = resolveWarpSpecializeCapture(rhs);
+  if (lhs == rhs)
+    return true;
+  if (lhs.getType() != rhs.getType())
+    return false;
+
+  auto lhsArg = dyn_cast<BlockArgument>(lhs);
+  auto rhsArg = dyn_cast<BlockArgument>(rhs);
+  if (lhsArg || rhsArg)
+    return lhsArg && rhsArg && lhsArg.getArgNumber() == rhsArg.getArgNumber() &&
+           lhsArg.getOwner()->getParentOp() == rhsArg.getOwner()->getParentOp();
+
+  Operation *lhsDef = lhs.getDefiningOp();
+  Operation *rhsDef = rhs.getDefiningOp();
+  if (!lhsDef || !rhsDef || lhsDef->getName() != rhsDef->getName() ||
+      lhsDef->getNumOperands() != rhsDef->getNumOperands())
+    return false;
+
+  if (auto lhsConstant = dyn_cast<arith::ConstantOp>(lhsDef)) {
+    auto rhsConstant = dyn_cast<arith::ConstantOp>(rhsDef);
+    return rhsConstant && lhsConstant.getValue() == rhsConstant.getValue();
+  }
+  if (auto lhsProgramId = dyn_cast<triton::GetProgramIdOp>(lhsDef)) {
+    auto rhsProgramId = dyn_cast<triton::GetProgramIdOp>(rhsDef);
+    return rhsProgramId && lhsProgramId.getAxis() == rhsProgramId.getAxis();
+  }
+  if (auto lhsNumPrograms = dyn_cast<triton::GetNumProgramsOp>(lhsDef)) {
+    auto rhsNumPrograms = dyn_cast<triton::GetNumProgramsOp>(rhsDef);
+    return rhsNumPrograms &&
+           lhsNumPrograms.getAxis() == rhsNumPrograms.getAxis();
+  }
+  if (!isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
+           arith::DivUIOp>(lhsDef))
+    return false;
+
+  return llvm::all_of(llvm::zip(lhsDef->getOperands(), rhsDef->getOperands()),
+                      [&](auto operands) {
+                        return areEquivalentLoopValues(std::get<0>(operands),
+                                                       std::get<1>(operands),
+                                                       depth + 1);
+                      });
+}
+
+bool haveEquivalentIterationSpaces(scf::ForOp lhs, scf::ForOp rhs) {
+  return areEquivalentLoopValues(lhs.getLowerBound(), rhs.getLowerBound()) &&
+         areEquivalentLoopValues(lhs.getUpperBound(), rhs.getUpperBound()) &&
+         areEquivalentLoopValues(lhs.getStep(), rhs.getStep());
+}
+
+std::optional<Value> findIterationCounter(scf::ForOp loop,
+                                          uint64_t initialValue,
+                                          uint64_t increment) {
+  Value result;
+  for (Value iterArg : loop.getRegionIterArgs()) {
+    std::optional<IterationCounter> counter = matchIterationCounter(iterArg);
+    if (!counter || counter->loop != loop ||
+        counter->initialValue != initialValue ||
+        counter->increment != increment)
+      continue;
+    if (result)
+      return std::nullopt;
+    result = iterArg;
+  }
+  if (!result)
+    return std::nullopt;
+  return result;
+}
+
+std::optional<Value> matchSlotCounter(Value index, unsigned numBarriers) {
+  if (!index)
+    return std::nullopt;
+  index = stripIntegerCasts(resolveWarpSpecializeCapture(index));
+  if (auto rem = index.getDefiningOp<arith::RemUIOp>()) {
+    if (matchConstantInt(rem.getRhs(), numBarriers))
+      return stripIntegerCasts(rem.getLhs());
+    return std::nullopt;
+  }
+
+  auto sub = index.getDefiningOp<arith::SubIOp>();
+  if (!sub)
+    return std::nullopt;
+  Value counter = stripIntegerCasts(sub.getLhs());
+  auto mul = stripIntegerCasts(sub.getRhs()).getDefiningOp<arith::MulIOp>();
+  if (!mul)
+    return std::nullopt;
+  Value quotient = matchBinaryOperandWithConstant(mul, numBarriers);
+  if (!quotient)
+    return std::nullopt;
+  auto div = stripIntegerCasts(quotient).getDefiningOp<arith::DivUIOp>();
+  if (!div || !matchConstantInt(div.getRhs(), numBarriers) ||
+      stripIntegerCasts(div.getLhs()) != counter)
+    return std::nullopt;
+  return counter;
+}
+
+struct WaitPhasePlan {
+  ttng::WaitBarrierOp wait;
+  Value iteration;
+  Value loopCounter;
+  scf::ForOp loop;
+  unsigned iterationsPerGeneration = 0;
+  unsigned initialIteration = 0;
+  unsigned iterationIncrement = 0;
+  unsigned iterationOffset = 0;
+  std::optional<unsigned> constantPhase;
+};
+
+Value getWaitPredicate(const WaitPhasePlan &plan) {
+  ttng::WaitBarrierOp wait = plan.wait;
+  return wait.getPred();
+}
+
+std::optional<WaitPhasePlan> getWaitPhasePlan(ttng::WaitBarrierOp wait) {
+  APInt constant;
+  if (matchPattern(wait.getPhase(), m_ConstantInt(&constant))) {
+    if (constant.getActiveBits() > 1)
+      return std::nullopt;
+    WaitPhasePlan plan{wait};
+    plan.constantPhase = constant.getZExtValue();
+    return plan;
+  }
+
+  Value phase = stripIntegerCasts(wait.getPhase());
+  Value generation;
+  if (auto andOp = phase.getDefiningOp<arith::AndIOp>()) {
+    generation = matchBinaryOperandWithConstant(andOp, 1);
+  } else if (auto remOp = phase.getDefiningOp<arith::RemUIOp>()) {
+    if (!matchConstantInt(remOp.getRhs(), 2))
+      return std::nullopt;
+    generation = remOp.getLhs();
+  }
+  if (!generation)
+    return std::nullopt;
+
+  generation = stripIntegerCasts(generation);
+  unsigned iterationsPerGeneration = 1;
+  std::optional<CounterExpression> iteration =
+      matchCounterExpression(generation);
+  if (!iteration) {
+    auto divOp = generation.getDefiningOp<arith::DivUIOp>();
+    if (!divOp)
+      return std::nullopt;
+    APInt divisor;
+    if (!matchPattern(divOp.getRhs(), m_ConstantInt(&divisor)) ||
+        divisor.isZero() || divisor.getActiveBits() > 32)
+      return std::nullopt;
+    iterationsPerGeneration = divisor.getZExtValue();
+    generation = stripIntegerCasts(divOp.getLhs());
+    iteration = matchCounterExpression(generation);
+  }
+  if (!iteration || wait->getBlock() != iteration->counter.loop.getBody())
+    return std::nullopt;
+  return WaitPhasePlan{wait,
+                       iteration->value,
+                       iteration->counter.value,
+                       iteration->counter.loop,
+                       iterationsPerGeneration,
+                       static_cast<unsigned>(iteration->counter.initialValue),
+                       static_cast<unsigned>(iteration->counter.increment),
+                       static_cast<unsigned>(iteration->offset)};
 }
 
 void traceBarrierUses(Value value, Value index, BarrierCandidate &candidate) {
@@ -294,15 +537,16 @@ bool coversEverySlot(const RangeT &uses, unsigned numBarriers) {
   return slots.size() == numBarriers;
 }
 
-// Accepts either one constant-indexed use per slot or a single
-// dynamically-indexed use. One dynamic use suffices because promotion rewrites
-// it to a runtime select over the constant named-barrier handles, covering
-// every slot as long as the index stays in range -- which holds since it
-// already indexes the same N-slot mbarrier allocation.
+struct DynamicIndexSummary {
+  Value first;
+  bool allEqual = true;
+  bool hasStatic = false;
+};
+
 template <typename RangeT>
 bool mapUsesToSlots(const RangeT &uses, unsigned numBarriers,
                     SmallVectorImpl<SmallVector<Operation *>> &slotOps,
-                    Value &dynamicIndex) {
+                    DynamicIndexSummary &dynamicIndex) {
   slotOps.clear();
   slotOps.resize(numBarriers);
   SmallVector<Operation *> dynamicOps;
@@ -311,8 +555,7 @@ bool mapUsesToSlots(const RangeT &uses, unsigned numBarriers,
     auto typedOp = use.op;
     Operation *op = typedOp.getOperation();
     if (slot) {
-      if (dynamicIndex)
-        return false;
+      dynamicIndex.hasStatic = true;
       slotOps[*slot].push_back(op);
       continue;
     }
@@ -322,15 +565,13 @@ bool mapUsesToSlots(const RangeT &uses, unsigned numBarriers,
     if (!use.index)
       return false;
     Value resolvedIndex = resolveWarpSpecializeCapture(use.index);
-    if (!dynamicIndex)
-      dynamicIndex = resolvedIndex;
-    else if (dynamicIndex != resolvedIndex)
-      return false;
+    if (!dynamicIndex.first)
+      dynamicIndex.first = resolvedIndex;
+    else if (dynamicIndex.first != resolvedIndex)
+      dynamicIndex.allEqual = false;
     dynamicOps.push_back(op);
   }
   if (!dynamicOps.empty()) {
-    if (llvm::any_of(slotOps, [](const auto &ops) { return !ops.empty(); }))
-      return false;
     for (auto &ops : slotOps)
       ops.append(dynamicOps);
   }
@@ -360,6 +601,134 @@ struct BarrierPlan {
   SmallVector<unsigned> activeSlots;
 };
 
+bool hasWarpUniformPredicate(Value predicate) {
+  if (!predicate)
+    return true;
+  llvm::SmallDenseSet<Value> visiting;
+  return isWarpUniformValue(predicate, visiting);
+}
+
+bool hasProvenStaticSlotSchedule(const BarrierCandidate &candidate,
+                                 ArrayRef<WaitPhasePlan> waitPhases) {
+  SmallVector<scf::ForOp> waitLoops(candidate.numBarriers);
+  for (auto [use, plan] : llvm::zip(candidate.waits, waitPhases)) {
+    std::optional<unsigned> slot =
+        getStaticSlot(use.index, candidate.numBarriers);
+    if (!slot || waitLoops[*slot] || !plan.iteration ||
+        plan.iterationsPerGeneration != 1 || plan.initialIteration != 0 ||
+        plan.iterationIncrement != 1 || plan.iterationOffset != 0 ||
+        !isAlwaysTrue(getWaitPredicate(plan)))
+      return false;
+    waitLoops[*slot] = plan.loop;
+  }
+
+  SmallVector<SmallVector<std::pair<Region *, scf::ForOp>>> loopArrives(
+      candidate.numBarriers);
+  SmallVector<std::pair<ttng::ArriveBarrierOp, unsigned>> initialArrives;
+  for (const auto &use : candidate.arrives) {
+    std::optional<unsigned> slot =
+        getStaticSlot(use.index, candidate.numBarriers);
+    if (!slot || !waitLoops[*slot])
+      return false;
+    Region *task = getWarpSpecializeTaskRegion(use.op);
+    if (!task)
+      return false;
+    scf::ForOp loop = use.op->getParentOfType<scf::ForOp>();
+    if (!loop) {
+      if (use.op->getParentRegion() != task ||
+          llvm::any_of(initialArrives, [&](const auto &entry) {
+            return entry.second == *slot &&
+                   getWarpSpecializeTaskRegion(entry.first) == task;
+          }))
+        return false;
+      initialArrives.push_back({use.op, *slot});
+      continue;
+    }
+    if (use.op->getBlock() != loop.getBody() ||
+        !haveEquivalentIterationSpaces(loop, waitLoops[*slot]) ||
+        llvm::any_of(loopArrives[*slot],
+                     [task](const auto &entry) { return entry.first == task; }))
+      return false;
+    loopArrives[*slot].push_back({task, loop});
+  }
+
+  for (unsigned slot = 0; slot < candidate.numBarriers; ++slot) {
+    if (waitLoops[slot] && loopArrives[slot].empty())
+      return false;
+  }
+  for (auto [arrive, slot] : initialArrives) {
+    Region *task = getWarpSpecializeTaskRegion(arrive);
+    auto loopIt = llvm::find_if(loopArrives[slot], [&](const auto &entry) {
+      return entry.first == task;
+    });
+    if (loopIt == loopArrives[slot].end() ||
+        arrive->getBlock() != loopIt->second->getBlock() ||
+        !arrive->isBeforeInBlock(loopIt->second))
+      return false;
+  }
+  return true;
+}
+
+bool hasProvenDynamicSchedule(const BarrierCandidate &candidate,
+                              ArrayRef<WaitPhasePlan> waitPhases) {
+  if (hasProvenStaticSlotSchedule(candidate, waitPhases))
+    return true;
+
+  auto firstDynamic = llvm::find_if(
+      waitPhases, [](const WaitPhasePlan &plan) { return plan.iteration; });
+  if (firstDynamic == waitPhases.end()) {
+    return llvm::all_of(waitPhases, [](const WaitPhasePlan &plan) {
+      return plan.constantPhase == 0 && isAlwaysTrue(getWaitPredicate(plan));
+    });
+  }
+  // A mix of constant-phase (peeled prologue) and dynamic-phase waits is a
+  // conditional schedule: reject it (see the phase-offset design doc).
+  if (llvm::any_of(waitPhases,
+                   [](const WaitPhasePlan &plan) { return !plan.iteration; }))
+    return false;
+
+  if (firstDynamic->initialIteration != 0 ||
+      firstDynamic->iterationIncrement != 1 ||
+      firstDynamic->iterationOffset != 0)
+    return false;
+
+  for (auto [use, plan] : llvm::zip(candidate.waits, waitPhases)) {
+    if (plan.iterationsPerGeneration != candidate.numBarriers ||
+        plan.initialIteration != firstDynamic->initialIteration ||
+        plan.iterationIncrement != firstDynamic->iterationIncrement ||
+        plan.iterationOffset != firstDynamic->iterationOffset ||
+        plan.loopCounter != firstDynamic->loopCounter ||
+        !isAlwaysTrue(getWaitPredicate(plan)) ||
+        !haveEquivalentIterationSpaces(plan.loop, firstDynamic->loop))
+      return false;
+    if (candidate.numBarriers > 1) {
+      std::optional<Value> slotCounter =
+          matchSlotCounter(use.index, candidate.numBarriers);
+      if (!slotCounter || stripIntegerCasts(*slotCounter) != plan.iteration)
+        return false;
+    }
+  }
+  for (const auto &use : candidate.arrives) {
+    scf::ForOp loop = use.op->getParentOfType<scf::ForOp>();
+    if (!loop || use.op->getBlock() != loop.getBody() ||
+        !haveEquivalentIterationSpaces(loop, firstDynamic->loop))
+      return false;
+    std::optional<Value> counter;
+    if (candidate.numBarriers == 1)
+      counter = findIterationCounter(loop, /*initialValue=*/0,
+                                     /*increment=*/1);
+    else
+      counter = matchSlotCounter(use.index, candidate.numBarriers);
+    if (!counter)
+      return false;
+    std::optional<IterationCounter> iteration = matchIterationCounter(*counter);
+    if (!iteration || iteration->loop != loop || iteration->initialValue != 0 ||
+        iteration->increment != 1)
+      return false;
+  }
+  return true;
+}
+
 std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
   if (candidate.hasUnknownUse ||
       !coversEverySlot(candidate.inits, candidate.numBarriers) ||
@@ -373,30 +742,36 @@ std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
         !isAlwaysTrue(arrive.getPred()) || !isWarpUniform(arrive))
       return std::nullopt;
   }
+  SmallVector<WaitPhasePlan> waitPhases;
   for (const auto &use : candidate.waits) {
     ttng::WaitBarrierOp wait = use.op;
-    APInt phase;
-    // A nonzero constant phase is initially satisfied and does not rendezvous
-    // with the first arrive, so replacing it with a named barrier can deadlock.
-    // Resolve the capture first: a phase defined outside the partition arrives
-    // as a block argument, which would not match and would let exactly that
-    // deadlock through.
-    Value waitPhase = resolveWarpSpecializeCapture(wait.getPhase());
-    if (!isAlwaysTrue(wait.getPred()) || !wait.getDeps().empty() ||
-        !isWarpUniform(wait) ||
-        (matchPattern(waitPhase, m_ConstantInt(&phase)) && !phase.isZero()))
+    if (!wait.getDeps().empty() || !isWarpUniform(wait) ||
+        !hasWarpUniformPredicate(wait.getPred()))
       return std::nullopt;
+    std::optional<WaitPhasePlan> phasePlan = getWaitPhasePlan(wait);
+    if (!phasePlan)
+      return std::nullopt;
+    waitPhases.push_back(*phasePlan);
   }
+  if (!hasProvenDynamicSchedule(candidate, waitPhases))
+    return std::nullopt;
 
   SmallVector<SmallVector<Operation *>> arrivesBySlot;
   SmallVector<SmallVector<Operation *>> waitsBySlot;
-  Value arriveIndex;
-  Value waitIndex;
+  DynamicIndexSummary arriveIndex;
+  DynamicIndexSummary waitIndex;
+  bool hasDynamicPhase = llvm::any_of(
+      waitPhases, [](const WaitPhasePlan &plan) { return plan.iteration; });
   if (!mapUsesToSlots(candidate.arrives, candidate.numBarriers, arrivesBySlot,
                       arriveIndex) ||
       !mapUsesToSlots(candidate.waits, candidate.numBarriers, waitsBySlot,
                       waitIndex) ||
-      arriveIndex != waitIndex)
+      static_cast<bool>(arriveIndex.first) !=
+          static_cast<bool>(waitIndex.first))
+    return std::nullopt;
+  if (!hasDynamicPhase && arriveIndex.first &&
+      (!arriveIndex.allEqual || !waitIndex.allEqual || arriveIndex.hasStatic ||
+       waitIndex.hasStatic || arriveIndex.first != waitIndex.first))
     return std::nullopt;
 
   auto isCompatiblePair = [&](const auto &arriveUse, const auto &waitUse) {
@@ -689,6 +1064,9 @@ void promoteBarrier(BarrierCandidate &candidate,
                                                  idsBySlot, use.index);
     Value count =
         arith::ConstantIntOp::create(builder, wait.getLoc(), numThreads, 32);
+    // Every promoted wait is unconditional: the schedule provers only accept
+    // waits whose predicate is provably always-true, and phase plans with an
+    // initial skip are never built.
     ttng::NamedBarrierWaitOp::create(builder, wait.getLoc(), namedId, count);
     wait.erase();
   }
@@ -760,6 +1138,82 @@ public:
         idsBySlot[slot] = id;
       promoteBarrier(ranked.candidate, idsBySlot, ranked.numThreads);
     }
+  }
+};
+
+#define GEN_PASS_DEF_TRITONNVIDIAGPUVERIFYNAMEDBARRIERCOUNTSPASS
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
+
+class TritonNvidiaGPUVerifyNamedBarrierCountsPass
+    : public impl::TritonNvidiaGPUVerifyNamedBarrierCountsPassBase<
+          TritonNvidiaGPUVerifyNamedBarrierCountsPass> {
+public:
+  using TritonNvidiaGPUVerifyNamedBarrierCountsPassBase::
+      TritonNvidiaGPUVerifyNamedBarrierCountsPassBase;
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(module);
+
+    WalkResult result = module.walk([&](ttg::WarpSpecializeOp wsOp) {
+      // Compiler ids are module-unique, so grouping within one
+      // warp_specialize op recovers each promoted barrier exactly.
+      DenseMap<int32_t, SmallVector<Operation *>> groups;
+      wsOp.walk([&](Operation *op) {
+        Value bar;
+        if (auto arrive = dyn_cast<ttng::NamedBarrierArriveOp>(op))
+          bar = arrive.getBar();
+        else if (auto wait = dyn_cast<ttng::NamedBarrierWaitOp>(op))
+          bar = wait.getBar();
+        else
+          return;
+        auto idOp = bar.getDefiningOp<ttng::CompilerNamedBarrierIdOp>();
+        if (!idOp)
+          return;
+        APInt id;
+        if (!matchPattern(idOp.getValue(), m_ConstantInt(&id)))
+          return;
+        groups[static_cast<int32_t>(id.getSExtValue())].push_back(op);
+      });
+
+      for (auto &[id, ops] : groups) {
+        (void)id;
+        llvm::SmallDenseSet<Region *, 4> tasks;
+        bool allInTasks = true;
+        for (Operation *op : ops) {
+          Region *task = getWarpSpecializeTaskRegion(op);
+          if (!task) {
+            allInTasks = false;
+            break;
+          }
+          tasks.insert(task);
+        }
+        if (!allInTasks)
+          continue;
+        unsigned expected = 0;
+        for (Region *task : tasks)
+          expected += ttg::lookupNumWarps(task) * threadsPerWarp;
+        for (Operation *op : ops) {
+          Value count =
+              isa<ttng::NamedBarrierArriveOp>(op)
+                  ? cast<ttng::NamedBarrierArriveOp>(op).getNumThreads()
+                  : cast<ttng::NamedBarrierWaitOp>(op).getNumThreads();
+          APInt baked;
+          if (!matchPattern(count, m_ConstantInt(&baked)))
+            continue;
+          if (baked.getZExtValue() == expected)
+            continue;
+          op->emitOpError()
+              << "named barrier participant count mismatch: baked "
+              << baked.getZExtValue() << " threads but participating tasks "
+              << "now require " << expected;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      signalPassFailure();
   }
 };
 
