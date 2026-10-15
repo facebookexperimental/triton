@@ -898,6 +898,14 @@ public:
       return failure();
     if (retShapePerCTA[0] < 128 || retShapePerCTA[1] < 16)
       return failure();
+    // fp6 (4 values per 3 bytes) cannot tile the tcgen05 K dimension today;
+    // route it to the decompose (upcast) path instead of native MMAv5.
+    if (dotOp.getAElemType() == ScaleDotElemType::E2M3 ||
+        dotOp.getAElemType() == ScaleDotElemType::E3M2 ||
+        dotOp.getBElemType() == ScaleDotElemType::E2M3 ||
+        dotOp.getBElemType() == ScaleDotElemType::E3M2) {
+      return rewriter.notifyMatchFailure(dotOp, "fp6 uses decompose upcast");
+    }
     Location loc = dotOp.getLoc();
     // operands
     Value a = dotOp.getA();
@@ -926,7 +934,14 @@ public:
     // However, MMA_K = 64 with MN-major fp4 is not supported. In this case,
     // the fp4 operand must be padded and MMA_K = 32 must be used.
     // MMA_K = 64 is also not supported when BLOCK_M = 64.
-    auto blockK = dotOp.getA().getType().getShape().back() * (isAFP4 ? 2 : 1);
+    int64_t blockK = dotOp.getA().getType().getShape().back();
+    if (isAFP4) {
+      blockK *= 2;
+    } else if (dotOp.getAElemType() == ScaleDotElemType::E2M3 ||
+               dotOp.getAElemType() == ScaleDotElemType::E3M2) {
+      // fp6 pads the K dim to the unpacked width; blockK is already unpacked.
+      assert(blockK % 4 == 0);
+    }
     auto blockM = dotOp.getA().getType().getShape()[0];
     bool hasMNMajorFp4Operand =
         isFp4MMA && (!dotOp.getLhsKPack() || !dotOp.getRhsKPack());

@@ -617,23 +617,26 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
 
   unsigned kInstrSize = mnkDim[2];
 
+  auto packedKDim = [](triton::ScaleDotElemType elemType, int kInstrSize) {
+    if (elemType == triton::ScaleDotElemType::E2M1)
+      return kInstrSize / 2;
+    if (elemType == triton::ScaleDotElemType::E2M3 ||
+        elemType == triton::ScaleDotElemType::E3M2) {
+      // fp6 packs 4 values per 3 bytes.
+      assert(kInstrSize % 4 == 0);
+      return kInstrSize * 3 / 4;
+    }
+    return kInstrSize;
+  };
+
   auto aElemType = op.getAElemType();
-  bool isFp4A = aElemType == triton::ScaleDotElemType::E2M1;
-  int kDimA = isFp4A ? kInstrSize / 2 : kInstrSize;
+  int kDimA = packedKDim(aElemType, kInstrSize);
 
   auto bElemType = op.getBElemType();
-  bool isFp4B = bElemType == triton::ScaleDotElemType::E2M1;
-  int kDimB = isFp4B ? kInstrSize / 2 : kInstrSize;
+  int kDimB = packedKDim(bElemType, kInstrSize);
 
   unsigned scaleFactor = op.deduceScaleFactor();
   int kDimScale = kInstrSize / scaleFactor;
-
-  bool isFp6A = (aElemType == triton::ScaleDotElemType::E2M3) ||
-                (aElemType == triton::ScaleDotElemType::E3M2);
-  bool isFp6B = (bElemType == triton::ScaleDotElemType::E2M3) ||
-                (bElemType == triton::ScaleDotElemType::E3M2);
-  if (isFp6A || isFp6B)
-    return op.emitError("NYI: FP6 scaled dot");
 
   Type scaledAElemType =
       LLVM::AMD::scaleDotElemTypeToMLIRType(op.getContext(), op.getAElemType());
