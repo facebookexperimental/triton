@@ -125,6 +125,9 @@ import triton.language as tl
 
 # @manual=//triton:triton
 import triton.language.extra.tlx as tlx
+from ._backward_pipeline import _tlx_gfx950_cross_attn_v3_ttgir_bwd
+from ._backward_small import coarse_softmax_backward, compact_softmax_backward, small_softmax_backward
+from ._backward_retained import retained_softmax_backward
 from ..hstu_attn._stubs import triton_autotune
 from ..hstu_attn._util import (
     backward_softmax_activation_scaled_alpha,
@@ -2804,8 +2807,16 @@ def _tlx_gfx950_cross_attn_bwd_split_softmax_dq(  # noqa: TR001
     )
 
 
-@torch.library.custom_op("tlx::hstu_cross_attn_gfx950_bwd", mutates_args=())
-def tlx_gfx950_cross_attn_bwd(  # noqa C901
+def _validate_backward_variant(bwd_variant, truncate_method):
+    torch._assert(
+        bwd_variant in (None, "redq", "split_softmax", "v3_ttgir", "fp32_pipeline_qdo", "v3_ttgir_fp32_pipeline_qdo"),
+        "Unsupported HSTU cross-attention backward variant",
+    )
+    if bwd_variant not in (None, "redq", "split_softmax"):
+        torch._assert(truncate_method == "none", "Pipeline backward does not support truncation")
+
+
+def _tlx_gfx950_cross_attn_bwd_impl(  # noqa C901
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2827,32 +2838,22 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
     truncate_method: str = "none",
     enable_tma: bool = False,
     bwd_variant: Optional[str] = None,
+    OUT: Optional[torch.Tensor] = None,
+    backward_route: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not enable_tma, "TMA is CUDA-only and not supported on gfx950"
+    _validate_backward_variant(bwd_variant, truncate_method)
     if max_q_len is None:
         max_q_len = max_seq_len
         assert seq_offsets_q is None
         seq_offsets_q = seq_offsets
 
-    # redq only. The Triton source picks between three backward kernels through
-    # `BwdVariant`; this port carries the reduce-dq one alone, so the dtype
-    # choice the source spreads across four branches collapses: dq is reduced
-    # through memory and is always fp32, and dk/dv are each written once by the
-    # program that owns them, so they stay in k's dtype for both G == 1 (no
-    # collision) and G > 1 (PER_KV_HEAD groups the query heads in registers).
-    use_per_kv_head = G > 1
-    dq = torch.empty_like(q, dtype=torch.float32)
-    dk = torch.empty_like(k, dtype=k.dtype)
-    if shared_kv:
-        dv = dk
-    else:
-        dv = torch.empty_like(v, dtype=k.dtype)
-
-    dout = switch_to_contiguous_if_needed(dout)
-    dq = switch_to_contiguous_if_needed(dq)
-    dk = switch_to_contiguous_if_needed(dk)
-    if not shared_kv:
-        dv = switch_to_contiguous_if_needed(dv)
+    q = switch_to_contiguous_if_needed(q)
+    k = switch_to_contiguous_if_needed(k)
+    v = k if shared_kv else switch_to_contiguous_if_needed(v)
+    if num_targets is not None:
+        num_targets = num_targets.contiguous()
+    dout = dout.contiguous()
 
     # Validate dtype consistency: q, k, v must have matching dtypes for
     # correct type casting in kernels (e.g., dk.to(q.dtype))
@@ -2863,7 +2864,8 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
     assert attn_scale.ndim == 0, ("per-row attn_scale is not supported; pass a 0-dim tensor")
 
     if dout.shape[0] == 0:
-        return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
+        dv = torch.empty(0, dtype=v.dtype, device=v.device) if shared_kv else torch.zeros_like(v)
+        return torch.zeros_like(q), torch.zeros_like(k), dv
     Z = seq_offsets.numel() - 1
     total_seq_len_q, H, DimQ = q.shape
     _, _, DimV = v.shape
@@ -2872,6 +2874,68 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
     # forward saves q as [total * G, H_kv, D] but returns out as [total, H, D],
     # so reshape dout back to the saved-q layout before deriving DO strides.
     dout = dout.reshape(total_seq_len_q, H, dout.shape[-1])
+
+    seq_offsets = seq_offsets.contiguous()
+    seq_offsets_q = seq_offsets_q.contiguous()
+    if backward_route is not None:
+        assert backward_route in ("retained", "coarse", "coarse_cached", "compact", "small")
+        # Saved-tensor hooks can return equal values with different strides.
+        q = q.contiguous()
+        k = k.contiguous()
+        v = k if shared_kv else v.contiguous()
+        eligible = (G == 1 and max_q_len == 256 and H == k.shape[1] == v.shape[1] == num_softmax_heads
+                    and DimQ == DimV == 128 and not causal and not enable_tma and truncate_method == "none"
+                    and q.dtype == k.dtype == v.dtype == dout.dtype == torch.bfloat16 and M is not None
+                    and OUT is not None and seq_offsets.dtype == seq_offsets_q.dtype
+                    and seq_offsets.dtype in (torch.int32, torch.int64)
+                    and (backward_route != "retained" or seq_offsets.dtype == torch.int64)
+                    and seq_offsets.ndim == seq_offsets_q.ndim == 1 and seq_offsets.numel() == seq_offsets_q.numel())
+        if eligible:
+            M = M.contiguous()
+            OUT = OUT.contiguous()
+            if backward_route == "retained":
+                assert shared_kv and H == 1 and Z >= 256 and max_seq_len in (256, 512, 1024, 2048)
+                dq_fast, dk_fast = retained_softmax_backward(q, k, dout, M, OUT, seq_offsets_q, seq_offsets, alpha)
+                dv_fast = None
+            elif backward_route in ("coarse", "coarse_cached"):
+                assert shared_kv and H == 1 and 4 < Z <= 64 and 384 <= max_seq_len <= 2048
+                dq_fast, dk_fast, dv_fast = coarse_softmax_backward(q, k, dout, M, OUT, seq_offsets_q, seq_offsets,
+                                                                    alpha,
+                                                                    cache_delta=backward_route == "coarse_cached")
+            elif backward_route == "compact":
+                assert 0 < Z <= 4 and 0 < max_seq_len <= 2048
+                dq_fast, dk_fast, dv_fast = compact_softmax_backward(q, k, v, dout, M, OUT, seq_offsets_q, seq_offsets,
+                                                                     max_seq_len, alpha, shared_kv)
+            else:
+                assert 0 < Z <= 64 and 0 < max_seq_len <= 2048
+                dq_fast, dk_fast, dv_fast = small_softmax_backward(q, k, v, dout, M, OUT, seq_offsets_q, seq_offsets,
+                                                                   max_seq_len, alpha, shared_kv)
+            if shared_kv:
+                dv_fast = torch.empty(0, dtype=v.dtype, device=v.device)
+            return dq_fast, dk_fast, dv_fast
+
+    if num_softmax_heads > 0:
+        assert M is not None
+        M = M.contiguous()
+        stride_mm = M.stride(0)
+        if Delta is None:
+            assert OUT is not None, "Softmax backward requires Delta or the saved output"
+            OUT = OUT.contiguous()
+            Delta = torch.empty_like(M)
+            pre_grid = (triton.cdiv(OUT.shape[0], 128), num_softmax_heads)
+            _attn_bwd_preprocess[pre_grid](OUT, dout, Delta, OUT.shape[0], H=OUT.shape[1],
+                                           softmax_heads=num_softmax_heads, BLOCK_M=128, HEAD_DIM=OUT.shape[2])
+        else:
+            Delta = Delta.contiguous()
+    else:
+        # The SiLU fallback still forms pointer expressions for both placeholders.
+        if M is None:
+            M = torch.empty(0, dtype=torch.float32, device=q.device)
+        if Delta is None:
+            Delta = torch.empty(0, dtype=torch.float32, device=q.device)
+
+    if bwd_variant == "fp32_pipeline_qdo":
+        bwd_variant = "v3_ttgir_fp32_pipeline_qdo"
 
     if bwd_variant == "split_softmax":
         torch._assert(G == 1, "Split-softmax requires G=1")
@@ -2978,6 +3042,113 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
             torch.empty(0, dtype=v.dtype, device=v.device),
         )
 
+    if bwd_variant not in (None, "redq"):
+        torch._assert(
+            seq_offsets.dtype == seq_offsets_q.dtype == torch.int64,
+            "FP32 pipeline requires int64 sequence offsets",
+        )
+        torch._assert(G == 1, "V3 TTGIR baseline requires G=1")
+        torch._assert(
+            H == 1 and k.shape[1] == 1 and v.shape[1] == 1,
+            "V3 TTGIR baseline requires one Q/K/V head",
+        )
+        torch._assert(
+            DimQ == 128 and DimV == 128,
+            "V3 TTGIR baseline requires D=128",
+        )
+        torch._assert(
+            q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16
+            and dout.dtype == torch.bfloat16,
+            "V3 TTGIR baseline requires BF16 tensors",
+        )
+        torch._assert(max_q_len == 256, "V3 TTGIR baseline requires max Q=256")
+        torch._assert(
+            num_softmax_heads == 1,
+            "V3 TTGIR baseline requires one softmax head",
+        )
+        torch._assert(not causal, "V3 TTGIR baseline is non-causal")
+        torch._assert(
+            attn_scale.ndim == 0,
+            "V3 TTGIR baseline requires scalar attention scale",
+        )
+        torch._assert(shared_kv, "V3 TTGIR baseline requires shared K/V")
+        torch._assert(
+            k.data_ptr() == v.data_ptr(),
+            "V3 TTGIR baseline requires aliased K/V storage",
+        )
+        torch._assert(
+            num_targets is not None,
+            "V3 TTGIR baseline requires target counts",
+        )
+        torch._assert(
+            seq_offsets_q is not None,
+            "V3 TTGIR baseline requires query offsets",
+        )
+        single_kv_tile = bwd_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len == 128
+        if single_kv_tile:
+            # The single-tile path writes final dQ without FP32 scratch.
+            dq_v3 = torch.empty_like(q)
+        elif bwd_variant == "v3_ttgir_fp32_pipeline_qdo":
+            dq_v3 = torch.empty_like(q, dtype=torch.float32)
+        else:
+            dq_v3 = torch.zeros_like(q, dtype=torch.float32)
+        dq_final = (dq_v3 if single_kv_tile else
+                    torch.empty_like(dq_v3, dtype=q.dtype) if bwd_variant == "v3_ttgir_fp32_pipeline_qdo" else None)
+        dk_v3 = torch.empty_like(k)
+        dv_v3 = torch.empty((0, v.shape[1], v.shape[2]), dtype=v.dtype, device=v.device)
+        _tlx_gfx950_cross_attn_v3_ttgir_bwd[(Z * H, 1)](
+            q,
+            k,
+            dout,
+            q.shape[0],
+            seq_offsets,
+            seq_offsets_q,
+            dq_v3,
+            dk_v3,
+            q.stride(0),
+            k.stride(0),
+            dout.stride(0),
+            dq_v3.stride(0),
+            dk_v3.stride(0),
+            alpha,
+            M,
+            Delta,
+            # pyrefly: ignore [bad-argument-type]
+            PIPELINE_QDO=bwd_variant == "v3_ttgir_fp32_pipeline_qdo",
+            DQ_FINAL=dq_final,
+            EARLY_TAIL_QDO=(bwd_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len <= 128),
+            SINGLE_KV_TILE=single_kv_tile,
+            # Packed Q lengths are at most 256, so equality proves every length is 256.
+            PACKED_FIXED_Q=(single_kv_tile or (bwd_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len == 384))
+            and total_seq_len_q == Z * 256,
+            FIXED_KV=(384 if bwd_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len == 384
+                      and total_seq_len_q == Z * 256 and k.shape[0] == Z * 384 else 0),
+            NATIVE_Q_SCORE=(bwd_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len == 384
+                            and total_seq_len_q == Z * 256),
+            CACHE_K=(bwd_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len >= 1024),
+            # pyrefly: ignore [unexpected-keyword]
+            num_warps=4,
+            # pyrefly: ignore [unexpected-keyword]
+            num_stages=1,
+            # pyrefly: ignore [unexpected-keyword]
+            matrix_instr_nonkdim=16,
+            # pyrefly: ignore [unexpected-keyword]
+            waves_per_eu=1,
+            # pyrefly: ignore [unexpected-keyword]
+            regclass_priority_trumps_globalness=bwd_variant == "v3_ttgir_fp32_pipeline_qdo",
+        )
+        return (
+            dq_final if dq_final is not None else dq_v3.to(q.dtype),
+            dk_v3,
+            dv_v3.reshape(-1),
+        )
+
+    # The generic kernel reduces dQ through FP32 memory.
+    use_per_kv_head = G > 1
+    dq = switch_to_contiguous_if_needed(torch.empty_like(q, dtype=torch.float32))
+    dk = switch_to_contiguous_if_needed(torch.empty_like(k, dtype=k.dtype))
+    dv = dk if shared_kv else switch_to_contiguous_if_needed(torch.empty_like(v, dtype=k.dtype))
+
     if use_per_kv_head:
         H_kv = H // G
         grid = lambda meta: (Z * H_kv, )  # noqa E731
@@ -3031,14 +3202,69 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
         PER_KV_HEAD=use_per_kv_head,
     )
 
-    # When shared_kv=True, dv aliases dk. Return a placeholder to avoid aliasing
-    # in return which is required by torch.library.custom_op.
+    # The functional operator schema requires distinct output storage.
+    # Shared KV uses one combined gradient and an empty dv placeholder.
     if shared_kv:
-        dv = torch.empty(0)
+        dv = torch.empty(0, dtype=v.dtype, device=v.device)
     return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 
-@tlx_gfx950_cross_attn_bwd.register_fake
+def _tlx_gfx950_cross_attn_double_backward(ctx, *grads):
+    raise RuntimeError("Trying to backward through tlx.hstu_cross_attn_gfx950_bwd.default but no autograd "
+                       "formula was registered. Please use register_autograd to add one.")
+
+
+# Extra dispatch keys require the standard backend dispatch path.
+_HSTU_BWD_EAGER_KEYSETS = tuple(
+    (torch._C.DispatchKeySet(backend) | torch._C.DispatchKeySet(autograd)).raw_repr()
+    for backend, autograd in ((torch._C.DispatchKey.CPU, torch._C.DispatchKey.AutogradCPU),
+                              (torch._C.DispatchKey.CUDA, torch._C.DispatchKey.AutogradCUDA)))
+
+
+def _tlx_gfx950_cross_attn_bwd_dispatch(keyset, *args):
+    unsafe = keyset.raw_repr() not in _HSTU_BWD_EAGER_KEYSETS
+    # Forward AD dual tensors can have ordinary dispatch keys.
+    unsafe = unsafe or getattr(torch.autograd.forward_ad, "_current_level", 0) >= 0
+    unsafe = unsafe or any(isinstance(arg, torch.Tensor) and type(arg) is not torch.Tensor for arg in args)
+    if unsafe:
+        with torch._C._AutoDispatchBelowAutograd():
+            return tlx_gfx950_cross_attn_bwd.redispatch(keyset & torch._C._after_autograd_keyset, *args)
+    return _tlx_gfx950_cross_attn_bwd_impl(*args)
+
+
+class _TlxGfx950CrossAttentionBackwardAutogradFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, keyset, *args):
+        return _tlx_gfx950_cross_attn_bwd_dispatch(keyset, *args)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        return _tlx_gfx950_cross_attn_double_backward(ctx, *grads)
+
+
+def _tlx_gfx950_cross_attn_bwd_autograd(keyset, *args):
+    if torch.is_grad_enabled() and torch._C._any_requires_grad(*args):
+        return _TlxGfx950CrossAttentionBackwardAutogradFunction.apply(keyset, *args)
+    return _tlx_gfx950_cross_attn_bwd_dispatch(keyset, *args)
+
+
+# Keep the library alive for the lifetime of its dispatcher registrations.
+_hstu_cross_attn_bwd_library = torch.library.Library("tlx", "FRAGMENT")
+_hstu_cross_attn_bwd_library.define(
+    "hstu_cross_attn_gfx950_bwd" + torch.library.infer_schema(_tlx_gfx950_cross_attn_bwd_impl, mutates_args=()),
+    tags=(torch.Tag.pt2_compliant_tag, ),
+)
+# The implementation allocates distinct outputs and does not mutate inputs.
+# Direct registration avoids custom_op's runtime alias-check wrapper.
+_hstu_cross_attn_bwd_library.impl("hstu_cross_attn_gfx950_bwd", _tlx_gfx950_cross_attn_bwd_impl,
+                                  "CompositeExplicitAutograd")
+_hstu_cross_attn_bwd_library.impl("hstu_cross_attn_gfx950_bwd", _tlx_gfx950_cross_attn_bwd_autograd, "Autograd",
+                                  with_keyset=True)
+tlx_gfx950_cross_attn_bwd = torch.ops.tlx.hstu_cross_attn_gfx950_bwd.default
+
+
+@torch.library.register_fake("tlx::hstu_cross_attn_gfx950_bwd", lib=_hstu_cross_attn_bwd_library)
 def _tlx_gfx950_cross_attn_bwd_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -3061,11 +3287,13 @@ def _tlx_gfx950_cross_attn_bwd_fake(
     truncate_method: str = "none",
     enable_tma: bool = False,
     bwd_variant: Optional[str] = None,
+    OUT: Optional[torch.Tensor] = None,
+    backward_route: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q),
         torch.empty_like(k),
-        torch.empty_like(v) if not shared_kv else torch.empty(0),
+        torch.empty_like(v) if not shared_kv else torch.empty(0, dtype=v.dtype, device=v.device),
     )
 
 
@@ -3091,6 +3319,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         causal: bool = False,
         bwd_variant: Optional[str] = None,
     ):
+        _validate_backward_variant(bwd_variant, truncate_method)
         q = switch_to_contiguous_if_needed(q)
         k = switch_to_contiguous_if_needed(k)
         if not shared_kv:
@@ -3171,11 +3400,45 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         ctx.shared_kv = shared_kv
         ctx.enable_tma = enable_tma
         ctx.num_softmax_heads = num_softmax_heads
-        ctx.stride_mm = M.stride(0)
         ctx.total_seq_len_q = total_seq_len_q
         ctx.G = G
         ctx.H = H
         ctx.H_kv = H_kv
+        batch = seq_offsets.numel() - 1
+        ctx.use_small_backward = (bwd_variant in (None, "fp32_pipeline_qdo", "v3_ttgir_fp32_pipeline_qdo")
+                                  and 0 < batch <= 64 and 0 < max_seq_len <= 2048 and max_q_len == 256 and H > 0
+                                  and H == H_kv and k.shape[1] == H and num_softmax_heads == H and DimQ == 128
+                                  and DimV == 128 and not causal and not enable_tma and truncate_method == "none"
+                                  and q.dtype == k.dtype == v.dtype == torch.bfloat16 and q.is_contiguous()
+                                  and k.is_contiguous() and v.is_contiguous() and attn_scale.ndim == 0)
+        ctx.use_retained_backward = (
+            bwd_variant in (None, "fp32_pipeline_qdo", "v3_ttgir_fp32_pipeline_qdo") and batch >= 256
+            and max_seq_len in (256, 512, 1024, 2048) and max_q_len == 256 and shared_kv
+            and H == H_kv == num_softmax_heads == 1 and DimQ == DimV == 128 and not causal and not enable_tma
+            and truncate_method == "none" and q.dtype == k.dtype == torch.bfloat16 and q.is_contiguous()
+            and k.is_contiguous() and q.device.type == "cuda" and q.device == k.device
+            and seq_offsets.ndim == seq_offsets_q.ndim == 1 and seq_offsets.numel() == seq_offsets_q.numel()
+            and seq_offsets.dtype == seq_offsets_q.dtype == torch.int64
+            and seq_offsets.device == seq_offsets_q.device == q.device and seq_offsets.is_contiguous()
+            and seq_offsets_q.is_contiguous() and attn_scale.ndim == 0 and torch.version.hip is not None
+            and torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0] == "gfx950")
+        # Limit default pipeline dispatch to the validated B2048 KV128/KV384 workloads.
+        ctx.use_pipeline_backward = (
+            bwd_variant is None and batch == 2048 and max_seq_len in (128, 384) and max_q_len == 256 and shared_kv
+            and H == H_kv == num_softmax_heads == 1 and DimQ == DimV == 128 and not causal and not enable_tma
+            and truncate_method == "none" and q.dtype == k.dtype == torch.bfloat16 and q.is_contiguous()
+            and k.is_contiguous() and q.device.type == "cuda" and q.device == k.device
+            and seq_offsets.ndim == seq_offsets_q.ndim == 1 and seq_offsets.numel() == seq_offsets_q.numel()
+            and seq_offsets.dtype == seq_offsets_q.dtype == torch.int64
+            and seq_offsets.device == seq_offsets_q.device == q.device and seq_offsets.is_contiguous()
+            and seq_offsets_q.is_contiguous() and num_targets is not None and attn_scale.ndim == 0
+            and torch.version.hip is not None
+            and torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0] == "gfx950")
+        if ctx.use_pipeline_backward:
+            ctx.bwd_variant = "fp32_pipeline_qdo"
+        ctx.use_coarse_backward = ctx.use_small_backward and batch > 4 and max_seq_len >= 384 and H == 1 and shared_kv
+        ctx.cache_coarse_delta = ctx.use_coarse_backward and max_seq_len >= 1024
+        ctx.use_compact_backward = (ctx.use_small_backward and batch <= 4 and (max_seq_len <= 1024 or shared_kv))
         return out.view(total_seq_len_q, H, DimV)
 
     @staticmethod
@@ -3201,6 +3464,18 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         ]:
         saved_tensors = ctx.saved_tensors
         q, k, v, seq_offsets, attn_scale, seq_offsets_q = saved_tensors[:6]
+        # Keep JIT launchers inside the custom backward op.
+        if ctx.use_retained_backward:
+            backward_route = "retained"
+        elif ctx.use_coarse_backward:
+            backward_route = "coarse_cached" if ctx.cache_coarse_delta else "coarse"
+        elif ctx.use_compact_backward:
+            backward_route = "compact"
+        elif ctx.use_small_backward:
+            backward_route = "small"
+        else:
+            backward_route = None
+        dout = dout.contiguous()
         idx = 6
         num_softmax_heads = ctx.num_softmax_heads
         # Reshape dout from [T, H, DimV] to folded [T*G, H_kv, DimV].
@@ -3218,47 +3493,44 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         if (ctx.H > 1 and ctx.H_kv == 1 and (num_softmax_heads == 0 or num_softmax_heads == ctx.H) and not ctx.causal):
             dout = dout.view(ctx.total_seq_len_q * ctx.H, -1, dout.shape[-1])
         if num_softmax_heads > 0:
-            M = saved_tensors[idx]
+            M = saved_tensors[idx].contiguous()
             idx += 1
-            out = saved_tensors[idx]
+            out = saved_tensors[idx].contiguous()
             idx += 1
-            Delta = torch.empty_like(M)
-            pre_grid = (triton.cdiv(out.shape[0], 128), num_softmax_heads)
-            _attn_bwd_preprocess[pre_grid](
-                out, dout, Delta, out.shape[0], H=out.shape[1], softmax_heads=num_softmax_heads,
-                BLOCK_M=128,  # pyre-ignore [6]
-                HEAD_DIM=out.shape[2],  # pyre-ignore [6]
-            )
+            Delta = None
         else:
             M = torch.empty(0, device=q.device, dtype=torch.float32)
-            Delta = torch.empty(0, device=q.device, dtype=torch.float32)
+            Delta = None
+            out = None
         if ctx.has_num_targets:
-            num_targets = saved_tensors[idx]
+            num_targets = saved_tensors[idx].contiguous()
             idx += 1
         else:
             num_targets = None
-        dq, dk, dv = torch.ops.tlx.hstu_cross_attn_gfx950_bwd(
-            dout=dout,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            attn_scale=attn_scale,
-            max_seq_len=ctx.max_seq_len,
-            alpha=ctx.alpha,
-            max_q_len=ctx.max_q_len,
-            seq_offsets_q=seq_offsets_q,
-            num_targets=num_targets,
-            causal=ctx.causal,
-            shared_kv=ctx.shared_kv,
-            num_softmax_heads=num_softmax_heads,
-            M=M,
-            Delta=Delta,
-            stride_mm=ctx.stride_mm,
-            G=ctx.G,
-            truncate_method=ctx.truncate_method,
-            enable_tma=ctx.enable_tma,
-            bwd_variant=ctx.bwd_variant,
+        dq, dk, dv = torch.ops.tlx.hstu_cross_attn_gfx950_bwd.default(
+            dout,
+            q,
+            k,
+            v,
+            seq_offsets,
+            attn_scale,
+            ctx.max_seq_len,
+            ctx.alpha,
+            ctx.max_q_len,
+            seq_offsets_q,
+            num_targets,
+            ctx.causal,
+            ctx.shared_kv,
+            ctx.G,
+            num_softmax_heads,
+            M,
+            Delta,
+            0,  # stride_mm
+            ctx.truncate_method,
+            ctx.enable_tma,
+            ctx.bwd_variant,
+            out,
+            backward_route,
         )
         dq = dq.view(ctx.total_seq_len_q, ctx.H, -1)
         return (
