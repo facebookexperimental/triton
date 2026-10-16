@@ -536,7 +536,8 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
     }
 
     llStore(rewriter, loc, ldsAddr, storeVal, b.icmp_ne(mask, b.true_val()),
-            CacheModifier::NONE, targetInfo.requiresAliasInfoForAsyncOps());
+            CacheModifier::NONE, triton::EvictionPolicy::NORMAL,
+            targetInfo.requiresAliasInfoForAsyncOps());
   }
 };
 
@@ -623,8 +624,9 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
             rewriter, this->getTypeConverter(), loc, cast<VectorType>(vecTy),
             otherElems, vecStart);
 
-      Value loadVal = llLoad(rewriter, loc, ptr, vecTy, pred, falseVal,
-                             multicastMask, cacheMod, op.getIsVolatile());
+      Value loadVal =
+          llLoad(rewriter, loc, ptr, vecTy, pred, falseVal, multicastMask,
+                 cacheMod, op.getEvict(), op.getIsVolatile());
       for (size_t ii = 0; ii < vec; ++ii) {
         Value vecIdx = createIndexAttrConstant(
             rewriter, loc, getTypeConverter()->getIndexType(), ii);
@@ -715,8 +717,9 @@ struct BufferLoadOpConversion
         falseVal = packElementRangeIntoVector(
             rewriter, this->getTypeConverter(), loc, cast<VectorType>(vecTy),
             otherElems, vecStart);
-      Value loadVal = bufferEmitter.emitLoad(
-          vecTy, rsrcDesc, offsetElems[vecStart], pred, falseVal, cacheMod);
+      Value loadVal =
+          bufferEmitter.emitLoad(vecTy, rsrcDesc, offsetElems[vecStart], pred,
+                                 falseVal, cacheMod, op.getEvict());
       for (size_t ii = 0; ii < vec; ++ii) {
         Value vecIdx = createIndexAttrConstant(
             rewriter, loc, getTypeConverter()->getIndexType(), ii);
@@ -869,7 +872,7 @@ struct BufferLoadToLocalOpConversion
             selectLdsAddressForPredicate(b, threadPred, shmemAddr);
         auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
             vecTy, vecBytesVal, rsrcDesc, offsetElem, predicatedAddress,
-            maybeSwizzledMaskElem, op.getCache());
+            maybeSwizzledMaskElem, op.getCache(), op.getEvict());
         if (targetInfo.requiresAliasInfoForAsyncOps())
           AMD::addAsyncCopyAliasScope(bufferLoadToLds);
       } else {
@@ -878,7 +881,8 @@ struct BufferLoadToLocalOpConversion
 
         auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
             vecTy, vecBytesVal, rsrcDesc, offsetElem, shmemAddr,
-            hasOther ? b.true_val() : maybeSwizzledMaskElem, op.getCache());
+            hasOther ? b.true_val() : maybeSwizzledMaskElem, op.getCache(),
+            op.getEvict());
         if (targetInfo.requiresAliasInfoForAsyncOps())
           AMD::addAsyncCopyAliasScope(bufferLoadToLds);
 
@@ -1029,14 +1033,15 @@ struct AsyncCopyGlobalToLocalOpConversion
             selectLdsAddressForPredicate(b, cond, shmemAddr);
 
         emitAsyncLoad(rewriter, loc, targetInfo, vecBits, srcElem,
-                      predicatedAddress, op.getCache(), multicastMask);
+                      predicatedAddress, op.getCache(), op.getEvict(),
+                      multicastMask);
       } else {
         // For architectures not supporting per lane LDS addresses we need to
         // emit a branch.
         auto [loadBlock, afterLoadBlock] = emitBranch(rewriter, loc, cond);
 
         emitAsyncLoad(rewriter, loc, targetInfo, vecBits, srcElem, shmemAddr,
-                      op.getCache(), multicastMask);
+                      op.getCache(), op.getEvict(), multicastMask);
 
         rewriter.setInsertionPointToStart(afterLoadBlock);
       }
@@ -1068,11 +1073,11 @@ struct AsyncCopyGlobalToLocalOpConversion
   void emitAsyncLoad(RewriterBase &rewriter, Location loc,
                      AMD::TargetInfo targetInfo, int vecBits, Value srcPtr,
                      Value shmemAddr, triton::CacheModifier cacheMod,
-                     Value multicastMask) const {
+                     triton::EvictionPolicy evict, Value multicastMask) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     int32_t cacheModifiers =
         mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
-            cacheMod, /*isLoad=*/true, targetInfo);
+            cacheMod, evict, /*isLoad=*/true, targetInfo);
     auto auxAttr = rewriter.getI32IntegerAttr(cacheModifiers);
     if (targetInfo.useAsyncMarks()) {
       // Use the async intrinsic so LLVM tracks these via asyncmark
@@ -1193,7 +1198,7 @@ struct AsyncCopyLocalToGlobalOpConversion
       auto [storeBlock, afterStoreBlock] = emitBranch(rewriter, loc, cond);
 
       emitAsyncStore(rewriter, loc, targetInfo, vecBits, dstElem, shmemAddr,
-                     op.getCache());
+                     op.getCache(), op.getEvict());
 
       rewriter.setInsertionPointToStart(afterStoreBlock);
 
@@ -1217,11 +1222,12 @@ struct AsyncCopyLocalToGlobalOpConversion
 
   void emitAsyncStore(RewriterBase &rewriter, Location loc,
                       AMD::TargetInfo targetInfo, int vecBits, Value dstPtr,
-                      Value shmemAddr, triton::CacheModifier cacheMod) const {
+                      Value shmemAddr, triton::CacheModifier cacheMod,
+                      triton::EvictionPolicy evict) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     int32_t cacheModifiers =
         mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
-            cacheMod, /*isLoad=*/false, targetInfo);
+            cacheMod, evict, /*isLoad=*/false, targetInfo);
 
     auto emitStore = [&](int bits, Value dst, Value shmem) {
       std::string intrinsic =
@@ -1361,8 +1367,10 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
       warpUsedHint = static_cast<uint32_t>(hintAttr.getInt());
 
     auto cacheMod = op.getCache();
+    // TDM ops predate eviction policies; the descriptor path carries no
+    // eviction hint yet.
     auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
-        cacheMod, /*isLoad*/ true, targetInfo);
+        cacheMod, triton::EvictionPolicy::NORMAL, /*isLoad*/ true, targetInfo);
 
     // Placeholder: the copy inherits pred from the descriptor.
     Value pred = b.i32_val(1);
@@ -1452,7 +1460,8 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
     }
 
     int32_t auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
-        op.getCache(), /*isLoad=*/true, targetInfo);
+        op.getCache(), triton::EvictionPolicy::NORMAL, /*isLoad=*/true,
+        targetInfo);
     mlir::LLVM::AMD::emitTDMLoadFused(rewriter, loc, getTypeConverter(),
                                       members, numWarps, ctaId, auxBits,
                                       memberHints);
@@ -1529,7 +1538,7 @@ struct AsyncTDMCopyLocalToGlobalOpConversion
     auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
     auto cacheMod = op.getCache();
     auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
-        cacheMod, /*isLoad*/ false, targetInfo);
+        cacheMod, triton::EvictionPolicy::NORMAL, /*isLoad*/ false, targetInfo);
 
     // Placeholder: the copy inherits pred from the descriptor.
     Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
@@ -1813,7 +1822,7 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
       Value storeVal = packElementRangeIntoVector(
           rewriter, this->getTypeConverter(), loc, cast<VectorType>(vecTy),
           valueElems, vecStart);
-      llStore(rewriter, loc, ptr, storeVal, pred, cacheMod);
+      llStore(rewriter, loc, ptr, storeVal, pred, cacheMod, op.getEvict());
     } // end vec
     rewriter.eraseOp(op);
     return success();
@@ -2168,7 +2177,7 @@ struct BufferStoreOpConversion
           rewriter, this->getTypeConverter(), loc, cast<VectorType>(vecTy),
           valueElems, vecStart);
       bufferEmitter.emitStore(rsrcDesc, offsetElems[vecStart], storeVal, pred,
-                              cacheMod);
+                              cacheMod, op.getEvict());
     } // end vec
 
     rewriter.eraseOp(op);
