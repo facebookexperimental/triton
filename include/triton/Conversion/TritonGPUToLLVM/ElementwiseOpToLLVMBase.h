@@ -1,12 +1,15 @@
 #ifndef TRITON_CONVERSION_TRITONGPU_TO_ELEMENTWISE_OP_H
 #define TRITON_CONVERSION_TRITONGPU_TO_ELEMENTWISE_OP_H
 
+#include <algorithm>
+
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/Support/MathExtras.h" // Log2_64
 
 using namespace mlir;
@@ -89,16 +92,41 @@ public:
     auto inv = ll.pseudoinvert();
     auto invReg = inv.sublayout(dims, {kReg});
     auto bases_inv = invReg.getBases();
-    for (auto [c, d] : llvm::zip(constancy, dims)) {
+    SmallVector<unsigned> contigPerThread;
+    if (rtType.getElementType().isInteger(1)) {
+      Operation *rawOp = op.getOperation();
+      ModuleOp mod = rawOp->getParentOfType<ModuleOp>();
+      auto target =
+          mod ? mod->getAttrOfType<StringAttr>(AttrTargetName) : StringAttr();
+      StringRef targetName = target ? target.getValue() : StringRef();
+      int arch = 0;
+      if (targetName.consume_front("cuda:") &&
+          !targetName.getAsInteger(10, arch) && arch >= 90) {
+        // Keep predicate reuse within per-thread register runs on Hopper+.
+        contigPerThread = GenericLinearEncodingAttr::get(ctx, std::move(ll))
+                              .getContigPerThread();
+      }
+    }
+    size_t numDims = std::min(constancy.size(), dims.size());
+    if (!contigPerThread.empty() && contigPerThread.size() < numDims)
+      return resultVals;
+    for (size_t i = 0; i < numDims; ++i) {
+      int64_t c = constancy[i];
+      StringAttr d = dims[i];
       // Clamp constancy to its largest pow2 divisor (c & -c) before Log2; NPOT
       // constancy (e.g. 48) would mis-floor. c is a multiple of it, so the
       // zeroed low bits never cross a constancy block boundary. Pow2 c: no-op.
       if (c == 0)
         continue; // Log2_64(0) is UB; nothing to dedup
       int64_t pow2C = c & (-c);
-      for (int i = 0; i < llvm::Log2_64(pow2C); i++) {
-        bases_inv[d][i][0] = 0;
+      if (!contigPerThread.empty()) {
+        unsigned cap = contigPerThread[i];
+        if (cap == 0)
+          return resultVals;
+        pow2C = std::min(pow2C, static_cast<int64_t>(cap & -cap));
       }
+      for (int bit = 0; bit < llvm::Log2_64(pow2C); ++bit)
+        bases_inv[d][bit][0] = 0;
     }
     auto invBroadcast = LinearLayout(std::move(bases_inv), invReg.getOutDims(),
                                      /*isSurjective=*/false);
