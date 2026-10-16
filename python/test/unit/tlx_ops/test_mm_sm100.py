@@ -35,6 +35,25 @@ ARCH = "sm100"
 _LONG_K_BF16_SKIP_REASON = "Long-K BF16 output currently exceeds the numerical tolerance"
 
 
+def test_mm_default_space_is_full(monkeypatch):
+    """`space=None` on sm100 dispatches to the tuned space, not the heuristic."""
+    import triton.tlx.ops as tlx_ops
+    from triton.tlx.ops._catalog import impl_for
+
+    _, spec = impl_for("mm", ARCH)
+    seen = {}
+
+    def record(a, b, *, out=None, space):
+        seen["space"] = space
+        return torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=a.dtype)
+
+    monkeypatch.setattr(tlx_ops, "_mm_impl_for_device", lambda device: (record, spec))
+    a = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    tlx_ops.mm(a, b)
+    assert seen["space"] == "full"
+
+
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", CORRECTNESS_SHAPES)
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     if (M, N, K, a_strides, b_strides, dtype_name) == (384, 384, 19459, (1, 384), (384, 1), "bf16"):
@@ -275,3 +294,109 @@ def test_mm_rejects_unsupported_backward():
     with torch.no_grad():
         out = tlx_mm(a, b)
     assert not out.requires_grad
+
+
+@contextlib.contextmanager
+def _pinned_explicit(cfg):
+    """Force ``space="heuristic"`` to run exactly ``cfg``."""
+    original = sm100.heuristic_config
+    num_ctas = cfg.get("NUM_CTAS", 1)
+
+    def one_config(M, N, K):
+        return [
+            triton.Config(cfg, num_warps=4, num_stages=1, pre_hook=sm100.matmul_tma_set_block_size_hook,
+                          ctas_per_cga=(num_ctas, 1, 1) if num_ctas > 1 else None)
+        ]
+
+    sm100.heuristic_config = one_config
+    sm100._tuned.cache_clear()
+    try:
+        yield
+    finally:
+        sm100.heuristic_config = original
+        sm100._tuned.cache_clear()
+
+
+# Each N is fit by the non-power-of-two BLOCK_SIZE_N with less padding than by
+# its largest power-of-two piece, which the pruner requires to keep the config.
+NPOT_BLOCK_N_CASES = [
+    # (M, N, K, NUM_CTAS, BLOCK_SIZE_N, EPILOGUE_SUBTILE, NUM_MMA_GROUPS, SPLIT_K, b_row_major)
+    (512, 784, 512, 2, 160, 4, 1, 1, False),  # 128 + 32; 784 = 4.9 x 160
+    (512, 784, 512, 2, 160, 4, 1, 1, True),
+    (512, 784, 512, 2, 208, 8, 1, 1, False),  # 128 + 64 + 16, 2-CTA (8 B rows of the 16 piece per CTA)
+    (384, 296, 256, 1, 208, 8, 2, 1, True),  # 1-CTA, 2 groups, ragged N
+    (384, 296, 256, 1, 96, 2, 1, 1, False),  # 64 + 32
+    (256, 144, 256, 1, 144, 8, 2, 1, True),  # 128 + 16 = 144 exactly
+    (256, 784, 4096, 2, 224, 4, 1, 4, False),  # 128 + 64 + 32, split-K through the workspace
+]
+
+
+@pytest.mark.parametrize("M, N, K, NUM_CTAS, BLOCK_N, EPILOGUE_SUBTILE, NUM_MMA_GROUPS, SPLIT_K, b_row_major",
+                         NPOT_BLOCK_N_CASES)
+def test_npot_block_n_matches_reference(M, N, K, NUM_CTAS, BLOCK_N, EPILOGUE_SUBTILE, NUM_MMA_GROUPS, SPLIT_K,
+                                        b_row_major):
+    """A non-power-of-two BLOCK_SIZE_N (run as power-of-two MMAs) computes ``a @ b``."""
+    from triton.tlx.ops import mm as tlx_mm
+
+    cfg = {
+        "BLOCK_SIZE_M": 128 * NUM_MMA_GROUPS,
+        "BLOCK_SIZE_N": BLOCK_N,
+        "BLOCK_SIZE_K": 128 if BLOCK_N <= 160 else 64,
+        "GROUP_SIZE_M": 8,
+        "NUM_SMEM_BUFFERS": 2,
+        "NUM_TMEM_BUFFERS": 1,
+        "NUM_MMA_GROUPS": NUM_MMA_GROUPS,
+        "EPILOGUE_SUBTILE": EPILOGUE_SUBTILE,
+        "NUM_CTAS": NUM_CTAS,
+        "SPLIT_K": SPLIT_K,
+        "INTERLEAVE_EPILOGUE": 0,
+        "USE_WARP_BARRIER": False,
+    }
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, generator=gen)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16, generator=gen)
+    if not b_row_major:
+        b = b.t().contiguous().t()
+    with _pinned_explicit(cfg):
+        out = tlx_mm(a, b, space="heuristic")
+        chosen = sm100._tuned("heuristic", (M, N, K)).best_config.kwargs
+        assert chosen["BLOCK_SIZE_N"] == BLOCK_N, f"pin was defeated by config pruning; ran {chosen}"
+    ref = a.float() @ b.float()
+    torch.testing.assert_close(out.float(), ref, atol=REL_PRECISION[torch.bfloat16] * ref.abs().max().item(),
+                               rtol=0)
+
+
+def _npot_config(block_n, epilogue_subtile=4, num_ctas=1):
+    return triton.Config({
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 8,
+        "NUM_SMEM_BUFFERS": 2,
+        "NUM_TMEM_BUFFERS": 1,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": epilogue_subtile,
+        "NUM_CTAS": num_ctas,
+        "SPLIT_K": 1,
+        "INTERLEAVE_EPILOGUE": 0,
+    })
+
+
+def test_n_piece_decomposition():
+    assert [sm100._n_piece(208, i) for i in range(4)] == [128, 64, 16, 0]
+    assert [sm100._n_piece(256, i) for i in range(2)] == [256, 0]
+
+
+def test_preprocess_drops_npot_block_n_that_does_not_reduce_padding():
+    """N = 1024 is fit exactly by 128; 160 only adds padding."""
+    assert sm100.preprocess_configs([_npot_config(160)], {"M": 1024, "N": 1024, "K": 4096}) == []
+
+
+def test_preprocess_drops_unsupported_npot_block_n():
+    shape = {"M": 1024, "N": 784, "K": 4096}
+    assert sm100.preprocess_configs([_npot_config(208, epilogue_subtile=8)], shape)
+    # 240 = 128 + 64 + 32 + 16: more than three pieces.
+    assert sm100.preprocess_configs([_npot_config(240, epilogue_subtile=8)], shape) == []
+    # The 16-wide piece is narrower than a 32-wide epilogue slice.
+    assert sm100.preprocess_configs([_npot_config(208, epilogue_subtile=4)], shape) == []
+
