@@ -1,0 +1,81 @@
+"""Perf and compile-time guardrail for `tlx.ops.mm`, against `torch.matmul`."""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+import torch
+
+from triton.tlx.ops.kernels.mm._shapes import FOCUS as SHAPE_SUITES
+from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, flops, label, operand
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from _harness import Case, Prepared, close_enough, driver  # noqa: E402
+
+OP = "mm"
+REF_NAME = "torch.matmul (hipBLASLt)" if torch.version.hip is not None else "torch.matmul"
+#: mm has a shape heuristic, so its default is a single analytically chosen
+#: config and a first call stays under a second.
+DEFAULT_SPACE = "heuristic"
+EXTRA_COLUMNS = ()
+
+DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+
+#: Relative tolerance for the accuracy check, per dtype. Same values the L1
+#: correctness suite uses, so a case cannot pass there and fail here.
+REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
+
+# L2 intentionally benchmarks every registered shape; keep this placeholder for
+# future benchmark-only exclusions.
+FAILED_SHAPES = set()
+
+
+def shapes(synthetic: bool = False, suites=None) -> list:
+    entries = SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites)
+    return [entry for entry in entries if tuple(entry) not in FAILED_SHAPES]
+
+
+def cases(synthetic: bool = False, suites=None) -> list[Case]:
+    # dtype is a Case field, so it is dropped from `shape` -- carrying it in
+    # both duplicates it in the key and in the report.
+    return [
+        Case(
+            op=OP,
+            arch=driver.arch(),
+            dtype=str(DTYPES[entry[5]]).removeprefix("torch."),
+            shape=tuple(entry[:5]),
+            label=label(*entry),
+        ) for entry in shapes(synthetic, suites)
+    ]
+
+
+def prepare(case: Case, space: str) -> Prepared:
+    from triton.tlx.ops import mm as tlx_mm
+
+    if torch.version.hip is not None:
+        # Pin the production AMD matmul backend instead of inheriting a process-
+        # global preference that could silently switch the reference to rocBLAS.
+        torch.backends.cuda.preferred_blas_library("hipblaslt")
+
+    M, N, K, a_strides, b_strides = case.shape
+    dtype = getattr(torch, case.dtype)
+    a, b = operand(M, K, a_strides, dtype), operand(K, N, b_strides, dtype)
+    tlx_out = torch.empty((M, N), device=a.device, dtype=dtype)
+    ref_out = torch.empty_like(tlx_out)
+
+    tlx_fn = lambda: tlx_mm(a, b, out=tlx_out, space=space)  # noqa: E731
+    ref_fn = lambda: torch.matmul(a, b, out=ref_out)  # noqa: E731
+    return Prepared(
+        tlx_fn=tlx_fn,
+        ref_fn=ref_fn,
+        flop_count=flops(M, N, K),
+        check=lambda: close_enough(tlx_fn(), ref_fn(), REL_PRECISION[case.dtype]),
+    )
+
+
+supported, default_json, run, main = driver.bind(sys.modules[__name__])
+
+if __name__ == "__main__":
+    raise SystemExit(main())
