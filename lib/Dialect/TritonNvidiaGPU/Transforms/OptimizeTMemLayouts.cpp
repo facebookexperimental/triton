@@ -101,6 +101,15 @@ public:
     if (mDim != 64 && mDim != 128)
       return failure();
     int splitNSize = shape[2];
+    // A BLOCK_M=64 2-CTA accumulator (TwoCTA_RHS) keeps the right half of
+    // each blockN block in TMEM rows 64-127, so a slice narrower than blockN
+    // is not a column window of the buffer and tmem_subslice cannot express
+    // it. Split in registers instead.
+    auto tmemEnc = dyn_cast<TensorMemoryEncodingAttr>(
+        tmemLoad.getSrc().getType().getEncoding());
+    if (tmemEnc && tmemEnc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS &&
+        splitNSize % tmemEnc.getBlockN() != 0)
+      return failure();
     if (splitNSize < 8)
       return failure();
 

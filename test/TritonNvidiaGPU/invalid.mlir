@@ -2047,3 +2047,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
     tt.return %loaded : tensor<128x128xf32, #b2v>
   }
 }
+
+// -----
+
+// A BLOCK_M=64 2-CTA accumulator keeps the right half of each blockN block in
+// TMEM rows 64-127, so a slice narrower than blockN is not a column window.
+#tmem_2cta_rhs = #ttng.tensor_memory_encoding<blockM = 64, blockN = 256, colStride = 1, twoCTAs = true, ctaMode = twocta_rhs>
+#tmem_2cta_rhs_half = #ttng.tensor_memory_encoding<blockM = 64, blockN = 128, colStride = 1, twoCTAs = true, ctaMode = twocta_rhs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @tmem_subslice_twocta_rhs_n_half(%arg0: !ttg.memdesc<64x256xf32, #tmem_2cta_rhs, #ttng.tensor_memory, mutable>) {
+    // expected-error @below {{cannot take an N subslice of a two-CTA (twocta_rhs) accumulator}}
+    %sub = ttng.tmem_subslice %arg0 {offset = 128 : i32} : !ttg.memdesc<64x256xf32, #tmem_2cta_rhs, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x128xf32, #tmem_2cta_rhs_half, #ttng.tensor_memory, mutable, 64x256>
+    tt.return
+  }
+}
