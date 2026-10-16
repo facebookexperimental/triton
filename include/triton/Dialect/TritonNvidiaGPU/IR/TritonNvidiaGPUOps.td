@@ -543,13 +543,23 @@ def TTNG_BarrierExpectOp
   let description = [{
     This signals the barrier that `size` bytes are expected to be copied. The
     associated barrier wait will block until the expected number of bytes has
-    been copied.
+    been copied. The optional `fromCTA` attribute is a CTA-ID
+    basis-selection mask: set bits are preserved and unset bits are zeroed
+    when selecting the CTA that routes the arrival to each per-CTA barrier.
   }];
 
   let hasVerifier = 1;
+  let hasCanonicalizeMethod = 1;
   let arguments =
       (ins Arg<TTG_MemDescType, "", BarrierSharedWrite>:$alloc,
-          I32Attr:$size, I1:$pred);
+          I32Attr:$size, I1:$pred, OptionalAttr<I32Attr>:$fromCTA);
+
+  let builders = [
+    OpBuilder<(ins "Value":$alloc, "uint32_t":$size, "Value":$pred), [{
+      build($_builder, $_state, alloc, $_builder.getI32IntegerAttr(size), pred,
+            /*fromCTA=*/IntegerAttr());
+    }]>
+  ];
 
   let assemblyFormat = [{
     $alloc `,` $size attr-dict `,` $pred `:` qualified(type($alloc))
@@ -619,30 +629,36 @@ def TTNG_ArriveBarrierOp
     of at least 1 and decreases the pending arrival count of the mbarrier by
     the specified count.
 
-    When `ctaMask` is non-zero, the arrive is multicast across the cluster.
+    When `multicastCTA` is non-zero, the arrive is multicast across the cluster.
     Each bit set in the mask identifies a CTA ID dimension to multicast
     along. CTA IDs `a` and `b` belong to the same equivalence class iff
-    `a & ~ctaMask == b & ~ctaMask`; all CTAs in a class multicast to each
-    other. Multicast requires `numCTAs > 1`, `0 < ctaMask <= numCTAs - 1`,
+    `a & ~multicastCTA == b & ~multicastCTA`; all CTAs in a class multicast to each
+    other. Multicast requires `numCTAs > 1`, `0 < multicastCTA <= numCTAs - 1`,
     and the barrier must have the identity CGA layout `[[1], [2], ...]`. The
-    default value of `ctaMask` is 0 (no multicast).
+    default value of `multicastCTA` is 0 (no multicast).
 
-    The operation accepts an optional predicate.
+    The operation accepts an optional predicate and `fromCTA` attribute. The
+    latter is a CTA-ID basis-selection mask: set bits are preserved and unset
+    bits are zeroed when selecting the CTA that routes the arrival to each
+    per-CTA barrier. A non-identity `fromCTA` cannot be combined with
+    multicast.
 
     Example:
 
     ```mlir
     ttng.arrive_barrier %barrier, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.arrive_barrier %barrier, 1, %pred : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    ttng.arrive_barrier %barrier, 1 {ctaMask = 1 : i32} : !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %barrier, 1 {multicastCTA = 1 : i32} : !ttg.memdesc<2xi64, #shared, #smem, mutable>
     ```
   }];
 
   let arguments =
       (ins Arg<TTG_MemDescType,
                "", BarrierSharedReadWrite>:$alloc,
-          I32Attr:$count, DefaultValuedOptionalAttr<I32Attr, "0">:$ctaMask,
-          Optional<I1>:$pred, UnitAttr:$perThread,
+          I32Attr:$count, Optional<I1>:$pred,
+          OptionalAttr<I32Attr>:$fromCTA,
+          DefaultValuedOptionalAttr<I32Attr, "0">:$multicastCTA,
+          UnitAttr:$perThread,
           OptionalAttr<DictionaryAttr>:$constraints);
 
   let assemblyFormat = [{
@@ -651,35 +667,41 @@ def TTNG_ArriveBarrierOp
 
   let builders =
       [OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
-       OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "uint32_t":$ctaMask,
+       OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "uint32_t":$multicastCTA,
                      "Value":$pred),
                  [{
-      return build($_builder, $_state, alloc, count, ctaMask, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), multicastCTA, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+    }]>,
+       OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
+                     "IntegerAttr":$fromCTA, "uint32_t":$multicastCTA),
+                 [{
+      return build($_builder, $_state, alloc, count, pred, fromCTA, multicastCTA, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "bool":$perThread), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), perThread, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, perThread, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread),
                  [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, perThread, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread, "DictionaryAttr":$constraints),
                  [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, constraints);
+      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, perThread, constraints);
     }]>];
 
   let extraClassDeclaration = [{
-    bool isMulticast() { return getCtaMask() != 0; }
+    bool isMulticast() { return getMulticastCTA() != 0; }
   }];
 
   let hasVerifier = 1;
+  let hasCanonicalizeMethod = 1;
 }
 
 def TTNG_AsyncCopyMbarrierArriveOp

@@ -32,6 +32,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/Support/MathExtras.h"
 
 #include "Utility.h"
 #include <type_traits>
@@ -100,6 +101,47 @@ Value getElectWarp0OrThread0(const NVIDIA::TargetInfo &targetInfo,
     auto tid = getThreadId(*b.builder, b.loc);
     return b.icmp_eq(tid, b.i32_val(0));
   }
+}
+
+struct FromCTALowering {
+  Value pred;
+  Value barrierPtr;
+  Value multicastMask;
+};
+
+FromCTALowering getFromCTALowering(Location loc,
+                                   ConversionPatternRewriter &rewriter,
+                                   Value barrierPtr, uint32_t fromCTA,
+                                   bool supportsMBarrierMulticast) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  uint32_t broadcastMask =
+      (triton::gpu::lookupNumCTAs(rewriter) - 1) & ~fromCTA;
+  Type i32Ty = rewriter.getIntegerType(32);
+
+  Value id = getThreadId(rewriter, loc);
+  Value pred =
+      supportsMBarrierMulticast
+          ? b.icmp_eq(id, b.i32_val(0))
+          : b.icmp_ult(id, b.i32_val(1u << llvm::popcount(broadcastMask)));
+  Value ctaId = NVVM::ClusterId::create(rewriter, loc, i32Ty);
+  Value sourceCTA = b.and_(ctaId, b.i32_val(broadcastMask));
+  pred = b.and_(pred, b.icmp_eq(sourceCTA, b.i32_val(0)));
+
+  if (supportsMBarrierMulticast)
+    return {pred, barrierPtr,
+            LLVM::NVIDIA::createTMAMulticastMask(loc, rewriter, broadcastMask)};
+
+  Value peerOffset = b.i32_val(0);
+  unsigned srcBit = 0;
+  for (uint32_t mask = broadcastMask; mask; mask &= mask - 1, ++srcBit) {
+    unsigned dstBit = llvm::countr_zero(mask);
+    Value bit = b.and_(id, b.i32_val(1u << srcBit));
+    peerOffset = b.or_(peerOffset, b.shl(bit, b.i32_val(dstBit + 24 - srcBit)));
+  }
+  Value barrierInt = b.ptrtoint(i32Ty, barrierPtr);
+  Value peerBarrierInt = b.xor_(barrierInt, peerOffset);
+  Value peerBarrierPtr = b.inttoptr(barrierPtr.getType(), peerBarrierInt);
+  return {pred, peerBarrierPtr, {}};
 }
 
 struct FenceAsyncSharedOpConversion
@@ -254,7 +296,12 @@ struct InvalBarrierOpConversion
 
 struct BarrierExpectConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::BarrierExpectOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+  bool supportsMBarrierMulticast;
+  BarrierExpectConversion(LLVMTypeConverter &typeConverter,
+                          PatternBenefit benefit,
+                          bool supportsMBarrierMulticast)
+      : ConvertOpToLLVMPattern(typeConverter, benefit),
+        supportsMBarrierMulticast(supportsMBarrierMulticast) {}
 
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::BarrierExpectOp op, OpAdaptor adaptor,
@@ -273,20 +320,36 @@ struct BarrierExpectConversion
     // than an elect: LOP3.LUT vs. ELECT + ISETP.EQ.U32.AND.
     Value id = getThreadId(rewriter, loc);
     Value pred = b.icmp_eq(id, b.i32_val(0));
-    pred = b.and_(pred, adaptor.getPred());
-    bool crossCluster = LLVM::NVIDIA::getCGABroadcastMask(barrierTy) != 0;
-    Value leaderBarrierPtr = LLVM::NVIDIA::getLeaderAddress(
+    bool isCrossClusterBarrier =
+        LLVM::NVIDIA::getCGABroadcastMask(barrierTy) != 0;
+    Value barrierPtr = LLVM::NVIDIA::getLeaderAddress(
         loc, rewriter, smemObj.getBase(), barrierTy);
+    Value multicastMask;
+    if (std::optional<uint32_t> fromCTA = op.getFromCTA()) {
+      FromCTALowering lowering =
+          getFromCTALowering(loc, rewriter, smemObj.getBase(), *fromCTA,
+                             supportsMBarrierMulticast);
+      pred = lowering.pred;
+      barrierPtr = lowering.barrierPtr;
+      multicastMask = lowering.multicastMask;
+      isCrossClusterBarrier = true;
+    }
+    pred = b.and_(pred, adaptor.getPred());
 
     ::mlir::triton::PTXBuilder expectPtxBuilder;
     const std::string expectPtx =
         "@$0 mbarrier.arrive.expect_tx." +
-        std::string(crossCluster ? "shared::cluster" : "shared::cta") +
-        ".b64 _, [$1], " + std::to_string(op.getSize()) + ";";
+        std::string(isCrossClusterBarrier ? "shared::cluster" : "shared::cta") +
+        std::string(multicastMask ? ".multicast::cluster::32b" : "") +
+        ".b64 _, [$1], " + std::to_string(op.getSize()) +
+        std::string(multicastMask ? ", $2" : "") + ";";
     auto &expectOp = *expectPtxBuilder.create(expectPtx);
-    expectOp({expectPtxBuilder.newOperand(pred, "b"),
-              expectPtxBuilder.newOperand(leaderBarrierPtr, "r")},
-             /*onlyAttachMLIRArgs=*/true);
+    SmallVector<PTXBuilder::Operand *, 3> operands = {
+        expectPtxBuilder.newOperand(pred, "b"),
+        expectPtxBuilder.newOperand(barrierPtr, "r")};
+    if (multicastMask)
+      operands.push_back(expectPtxBuilder.newOperand(multicastMask, "r"));
+    expectOp(operands, /*onlyAttachMLIRArgs=*/true);
     auto voidTy = void_ty(op->getContext());
     expectPtxBuilder.launch(rewriter, loc, voidTy);
 
@@ -403,12 +466,14 @@ struct WaitBarrierOpConversion
 struct ArriveBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ArriveBarrierOp> {
   const NVIDIA::TargetInfo *targetInfo;
+  bool supportsMBarrierMulticast;
 
   ArriveBarrierOpConversion(LLVMTypeConverter &typeConverter,
                             PatternBenefit benefit,
-                            const NVIDIA::TargetInfo &targetInfo)
-      : ConvertOpToLLVMPattern(typeConverter, benefit),
-        targetInfo(&targetInfo) {}
+                            const NVIDIA::TargetInfo &targetInfo,
+                            bool supportsMBarrierMulticast)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(&targetInfo),
+        supportsMBarrierMulticast(supportsMBarrierMulticast) {}
 
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::ArriveBarrierOp op, OpAdaptor adaptor,
@@ -484,6 +549,24 @@ struct ArriveBarrierOpConversion
 
       Value id = getThreadId(rewriter, loc);
       Value pred = b.icmp_eq(id, b.i32_val(0));
+      Value fromCTAMulticastMask;
+      // An identity fromCTA (num_ctas - 1) is a no-op that canonicalization
+      // removes; treat it as absent here so a coexisting multicastCTA (which
+      // the verifier permits only in this identity case) is not dropped by
+      // the fromCTA branch below.
+      std::optional<uint32_t> fromCTA = op.getFromCTA();
+      if (fromCTA &&
+          *fromCTA == static_cast<uint32_t>(triton::gpu::lookupNumCTAs(op) - 1))
+        fromCTA = std::nullopt;
+      if (fromCTA) {
+        FromCTALowering lowering =
+            getFromCTALowering(loc, rewriter, smemObj.getBase(), *fromCTA,
+                               supportsMBarrierMulticast && !op.isMulticast());
+        pred = lowering.pred;
+        barrierPtr = lowering.barrierPtr;
+        fromCTAMulticastMask = lowering.multicastMask;
+        isCrossClusterBarrier = true;
+      }
       if (op.getPred())
         pred = b.and_(pred, adaptor.getPred());
 
@@ -513,14 +596,16 @@ struct ArriveBarrierOpConversion
         ptxBuilder.launch(rewriter, loc, void_ty(getContext()));
       };
 
-      if (op.isMulticast() && targetInfo->supportsMbarrierMulticast()) {
+      if (fromCTA) {
+        emitArrive(barrierPtr, fromCTAMulticastMask);
+      } else if (op.isMulticast() && targetInfo->supportsMbarrierMulticast()) {
         int physicalNumCTAs = triton::gpu::lookupPhysicalNumCTAs(op);
         Value mask = LLVM::NVIDIA::createTMAMulticastMask(
-            loc, rewriter, static_cast<uint16_t>(op.getCtaMask()), Value(),
+            loc, rewriter, static_cast<uint16_t>(op.getMulticastCTA()), Value(),
             physicalNumCTAs);
         emitArrive(barrierPtr, mask);
       } else if (op.isMulticast()) {
-        uint32_t broadcastMask = op.getCtaMask();
+        uint32_t broadcastMask = op.getMulticastCTA();
         Value ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
         Value classBase =
             b.and_(ctaId, b.i32_val(static_cast<int32_t>(~broadcastMask)));
@@ -943,6 +1028,11 @@ struct CLCGetProgramIdOpConversion
 void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit, NVIDIA::TargetInfo &targetInfo) {
+  // Beta gates fromCTA hardware multicast on PTX 9.3+ (Rubin) rather than
+  // upstream's compute-capability-only check, so PTX87 configs exercise the
+  // software peer-offset fallback while PTX93/94 use hardware multicast.
+  bool supportsMBarrierMulticast = targetInfo.getComputeCapability() == 107 &&
+                                   targetInfo.getPtxVersion() >= 93;
   patterns.add<FenceAsyncSharedOpConversion>(typeConverter, benefit);
   patterns.add<FenceOpConversion>(typeConverter, benefit);
   patterns.add<
@@ -954,8 +1044,10 @@ void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
   patterns.add<InitBarrierOpConversion, InvalBarrierOpConversion>(
       typeConverter, benefit, targetInfo);
   patterns.add<WaitBarrierOpConversion>(typeConverter, benefit, targetInfo);
-  patterns.add<BarrierExpectConversion>(typeConverter, benefit);
-  patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit, targetInfo);
+  patterns.add<BarrierExpectConversion>(typeConverter, benefit,
+                                        supportsMBarrierMulticast);
+  patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit, targetInfo,
+                                          supportsMBarrierMulticast);
   // Meta Triton CLC + named-barrier + vote-ballot patterns
   patterns.add<NamedBarrierIdOpConversion<ttng::UserNamedBarrierIdOp>,
                NamedBarrierIdOpConversion<ttng::CompilerNamedBarrierIdOp>>(
