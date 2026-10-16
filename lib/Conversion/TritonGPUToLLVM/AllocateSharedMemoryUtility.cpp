@@ -2,6 +2,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include <cstdlib>
 #include <string>
@@ -138,6 +139,32 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
   mod->setAttr("ttg.shared",
                mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 32),
                                       allocation.getSharedMemorySize()));
+}
+
+LogicalResult verifyNpotModularOpsSupported(ModuleOp mod) {
+  if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+    return success();
+  auto isNpot = [](Type type) {
+    auto tensorTy = dyn_cast<RankedTensorType>(type);
+    return tensorTy && hasNpotShape(tensorTy);
+  };
+  bool rejected = false;
+  mod.walk([&](Operation *op) {
+    if (!isa<triton::ReduceOp, triton::ScanOp, triton::HistogramOp,
+             triton::GatherOp>(op))
+      return;
+    // A histogram gates on its input only: NPOT bins over a power-of-two
+    // input are exact.
+    if (llvm::none_of(op->getOperandTypes(), isNpot) &&
+        (isa<triton::HistogramOp>(op) ||
+         llvm::none_of(op->getResultTypes(), isNpot)))
+      return;
+    op->emitError() << "NPOT " << op->getName()
+                    << " operations are not yet supported with modular "
+                       "tensor layouts";
+    rejected = true;
+  });
+  return failure(rejected);
 }
 
 } // namespace mlir::triton::gpu

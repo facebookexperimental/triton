@@ -24,6 +24,8 @@ struct AllocateAMDGPUSharedMemory
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    if (failed(mlir::triton::gpu::verifyNpotModularOpsSupported(mod)))
+      return signalPassFailure();
 
     std::string archGenerationName = this->arch;
     AMD::TargetInfo targetInfo(archGenerationName);
