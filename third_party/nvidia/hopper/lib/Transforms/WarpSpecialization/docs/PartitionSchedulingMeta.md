@@ -367,6 +367,10 @@ before `propagatePartitions`):
 
 - **Epilogue store ops** → `epilogue_store` partition (when it exists), else
   follow the same routing as regular epilogue ops.
+- **TMA reduce token waits** (`isReduceTokenWait`) → the partition of the
+  reduce whose token they consume, not `epilogue_store`. A wait placed apart
+  from its reduce makes `doCodePartition` clone the reduce into the wait's
+  partition, so the value is reduced into global memory twice.
 - **Epilogue ops** (non-store) → routing depends on tuning knobs:
   - `mergeEpilogueToComputation`: → computation[dpId] directly
   - `mergeEpilogue`: → correction (if exists) → reduction → computation[dpId]
