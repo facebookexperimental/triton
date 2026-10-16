@@ -1,0 +1,36 @@
+name: Meta LLVM verify done
+# When a GPU run on a Meta LLVM bump branch completes, start meta-llvm-update.yml
+# for that line so its issue is filed now rather than on the next hourly run.
+# Decides nothing and writes no issues; a lost start just waits for the hourly run.
+on:
+  workflow_run:
+    workflows:
+      - Meta Triton GPU Tests    # main: gpu-tests.yml
+      - Meta Triton H100 Tests   # release/3.8.x runs these three directly
+      - Meta Triton B200 Tests
+      - Meta Triton MI350 Tests
+    types: [completed]
+    branches: ['scratch/meta-llvm-bump/**']
+
+permissions:
+  actions: write
+
+jobs:
+  kick:
+    if: github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start the updater for this line
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          # Inverse of bot_branch_for() in meta_llvm_bump.py.
+          line="${BRANCH#scratch/meta-llvm-bump/}"
+          case "$line" in
+            main) target=main ;;
+            release-*) target="release/${line#release-}" ;;
+            *) echo "unknown bump branch $BRANCH"; exit 1 ;;
+          esac
+          gh workflow run meta-llvm-update.yml -R "$GITHUB_REPOSITORY" -f target="$target"
