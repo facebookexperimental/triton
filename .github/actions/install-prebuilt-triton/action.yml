@@ -17,10 +17,6 @@ inputs:
     description: Expected SHA256 of the wheel, when provided by the build
     required: false
     default: ""
-  remove_installed_triton:
-    description: Uninstall the triton distribution before installing the prebuilt wheel
-    required: false
-    default: "false"
 runs:
   using: composite
   steps:
@@ -74,12 +70,8 @@ runs:
         printf '%s  %s\n' "${WHEEL_SHA256}" "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" | sha256sum --check
     - name: Install Triton
       shell: bash
-      env:
-        REMOVE_INSTALLED_TRITON: ${{ inputs.remove_installed_triton == 'true' }}
       run: |
-        if [ "${REMOVE_INSTALLED_TRITON}" = "true" ]; then
-          uv pip uninstall triton
-        fi
+        uv pip uninstall triton
         uv pip install --force-reinstall --no-deps "${RUNNER_TEMP}"/prebuilt-wheel/*.whl
         # The wheel is the `fbtriton` distribution. Fail if any other
         # distribution also provides `triton` (torch's or a dependency's), whose

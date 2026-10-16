@@ -62,7 +62,6 @@ jobs:
           wheel-url: ${{ inputs.wheel_url }}
           wheel-filename: ${{ inputs.wheel_filename }}
           wheel-sha256: ${{ inputs.wheel_sha256 }}
-          remove_installed_triton: "true"
       - name: Export TritonBench env
         run: |
           . "${SETUP_SCRIPT}"
@@ -151,7 +150,6 @@ jobs:
           wheel-url: ${{ inputs.wheel_url }}
           wheel-filename: ${{ inputs.wheel_filename }}
           wheel-sha256: ${{ inputs.wheel_sha256 }}
-          remove_installed_triton: "true"
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
@@ -373,7 +371,6 @@ jobs:
           wheel-url: ${{ inputs.wheel_url }}
           wheel-filename: ${{ inputs.wheel_filename }}
           wheel-sha256: ${{ inputs.wheel_sha256 }}
-          remove_installed_triton: "true"
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
