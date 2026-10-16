@@ -32,6 +32,8 @@ runs:
           # shellcheck source=/dev/null
           . "${TORCHAO_SETUP_SCRIPT}"
         fi
+        # Resolve the executable so uv does not interpret "python" as the repo's python/ directory.
+        TORCHAO_PYTHON="$("${TORCHAO_PYTHON}" -c 'import sys; print(sys.executable)')"
         uv pip install --python "${TORCHAO_PYTHON}" --pre torchao \
           --index-url "https://download.pytorch.org/whl/nightly/${TORCHAO_INDEX}"
         "${TORCHAO_PYTHON}" -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
