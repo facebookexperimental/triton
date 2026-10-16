@@ -77,8 +77,6 @@ jobs:
           packages: numpy pytest torchao
           # Keep the release torch on its bundled ROCm libraries.
           rocm-lib-path: ""
-          # Always a fresh venv, so the Python and torch pins above apply.
-          reuse-existing: "false"
       - name: Install prebuilt Triton
         uses: ./.ci/.github/actions/install-prebuilt-triton
         with:
