@@ -607,6 +607,9 @@ class nvidia_knobs(base_knobs):
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
+    # Re-issue tcgen05 MMAs that share operand A so A is read once through the
+    # collector buffer (see triton-nvidia-mma-collector-reuse).
+    disable_mma_collector_reuse: env_bool = env_bool("TRITON_DISABLE_MMA_COLLECTOR_REUSE")
 
     # Environment used to spawn the NVIDIA tools above. `None` inherits the
     # current environment. Packagers whose interpreter runs with an environment
