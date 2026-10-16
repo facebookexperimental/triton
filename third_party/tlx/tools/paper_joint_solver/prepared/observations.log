@@ -1,0 +1,8 @@
+observation label=fwd_subtiled_prep1 outcome=completed
+observation label=fwd_prep1 outcome=completed
+observation label=bwd_prep1 outcome=completed
+observation label=bwd_lr4096_prep1 outcome=completed
+observation label=ablation.warps_minus_one outcome=completed
+observation label=ablation.warps_half outcome=completed
+observation label=ablation.no_subtiling outcome=completed
+observation label=ablation.no_cross_warp outcome=completed

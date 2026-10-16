@@ -1,0 +1,1 @@
+env -u LD_LIBRARY_PATH LD_LIBRARY_PATH="$SOLVER_LIB_PATH" /usr/local/fbcode/platform010-aarch64/bin/python3.12 -m skc scaffold --ir solutions/fwd_v7_ir.json --handoff solutions/fwd_v7_handoff.json --out-dir solutions/fwd_v7_manual 
