@@ -219,6 +219,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module_ &m) {
                      ttng::createTritonNvidiaGPUPromoteLHSToTMemPass);
   ADD_PASS_WRAPPER_0("add_remove_tmem_tokens",
                      ttng::createTritonNvidiaGPURemoveTMEMTokensPass);
+  ADD_PASS_WRAPPER_0("add_mma_collector_reuse",
+                     ttng::createTritonNvidiaGPUMMACollectorReusePass);
   ADD_PASS_WRAPPER_1("add_check_matmul_two_cta", createCheckMatmulTwoCTAWrapper,
                      bool);
   ADD_PASS_WRAPPER_0("add_nvgpu_to_llvm",

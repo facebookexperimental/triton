@@ -9,6 +9,7 @@ add_triton_library(TritonNvidiaGPUTransforms
   FuseTMemLoadReduce.cpp
   GenerateSubtiledRegion.cpp
   InterleaveTMem.cpp
+  MMACollectorReuse.cpp
   MMALowering.cpp
   OptimizeCTALocality.cpp
   OptimizeDescriptorEncoding.cpp
