@@ -115,6 +115,18 @@ static bool isPlaceholderEncoding(Attribute enc) {
   return found;
 }
 
+static bool haveSamePhysicalLayout(RankedTensorType lhs, RankedTensorType rhs) {
+  return lhs.getShape() == rhs.getShape() &&
+         ttg::toLinearLayout(lhs) == ttg::toLinearLayout(rhs);
+}
+
+static bool isConcreteDistributed(Type ty) {
+  auto tensorTy = dyn_cast<RankedTensorType>(ty);
+  Attribute enc = tensorTy ? tensorTy.getEncoding() : Attribute();
+  return enc && !hasNoVerifyLayout(enc) &&
+         isa<ttg::DistributedEncodingTrait>(enc);
+}
+
 static bool retypeWithEncoding(Value v, Attribute enc) {
   auto t = dyn_cast<RankedTensorType>(v.getType());
   if (!t || t.getEncoding() == enc)
@@ -149,12 +161,6 @@ static void privatizeHelperForCall(::mlir::triton::CallOp call,
 
 // Frontend helper signatures omit encodings that TLX tensor values carry.
 static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod) {
-  auto isConcreteDistributed = [](Type ty) {
-    auto tensorTy = dyn_cast<RankedTensorType>(ty);
-    Attribute enc = tensorTy ? tensorTy.getEncoding() : Attribute();
-    return enc && !hasNoVerifyLayout(enc) &&
-           isa<ttg::DistributedEncodingTrait>(enc);
-  };
 
   bool changed = true;
   unsigned iteration = 0;
@@ -459,6 +465,158 @@ static void appendForwardedValues(OpOperand &use,
       worklist.push_back(result);
 }
 
+static LogicalResult reconcileEncodingUniformOps(ModuleOp mod, bool &changed) {
+  // A concrete tensor entering an encoding-uniform arith/math op fixes the
+  // encoding of every same-shape tensor operand and result. The Python
+  // frontend may have inferred those result types before a helper argument or
+  // region edge acquired its concrete layout, so repair the op before MLIR's
+  // SameOperandsAndResultType-style verifier compares the types. Bridge
+  // operands per use rather than retyping their producers: one value may
+  // intentionally feed consumers in different layout domains.
+  bool elementwiseConflict = false;
+  SmallVector<Operation *> encodingUniformOps;
+  mod.walk([&](Operation *op) {
+    if (isEncodingUniformArithOp(op))
+      encodingUniformOps.push_back(op);
+  });
+  for (Operation *op : encodingUniformOps) {
+    Attribute targetEncoding;
+    auto inspectType = [&](Type type) {
+      auto tensorTy = dyn_cast<RankedTensorType>(type);
+      if (!tensorTy || !isConcreteDistributed(tensorTy))
+        return;
+      Attribute candidate = tensorTy.getEncoding();
+      if (targetEncoding && targetEncoding != candidate) {
+        op->emitError(
+            "conflicting concrete layouts on encoding-uniform operation");
+        elementwiseConflict = true;
+        return;
+      }
+      targetEncoding = candidate;
+    };
+    for (Type type : op->getOperandTypes())
+      inspectType(type);
+    for (Type type : op->getResultTypes())
+      inspectType(type);
+    if (elementwiseConflict || !targetEncoding)
+      continue;
+
+    for (OpResult result : op->getResults()) {
+      auto tensorTy = dyn_cast<RankedTensorType>(result.getType());
+      if (!tensorTy || tensorTy.getEncoding() == targetEncoding)
+        continue;
+      result.setType(RankedTensorType::get(
+          tensorTy.getShape(), tensorTy.getElementType(), targetEncoding));
+      changed = true;
+    }
+    for (OpOperand &operand : op->getOpOperands()) {
+      auto tensorTy = dyn_cast<RankedTensorType>(operand.get().getType());
+      if (!tensorTy || tensorTy.getEncoding() == targetEncoding)
+        continue;
+      OpBuilder b(op);
+      Type targetType = RankedTensorType::get(
+          tensorTy.getShape(), tensorTy.getElementType(), targetEncoding);
+      Value converted =
+          RequireLayoutOp::create(b, op->getLoc(), targetType, operand.get());
+      operand.set(converted);
+      changed = true;
+    }
+  }
+  if (elementwiseConflict)
+    return failure();
+
+  // Triton operations with an explicit same-encoding trait need the same
+  // early repair. This notably covers tt.load/tt.store, whose pointer, value,
+  // mask, and (for loads) result encodings must agree even though their
+  // element types differ. Operand-only traits intentionally exclude results:
+  // a reduction result, for example, has an inferred slice layout.
+  bool traitConflict = false;
+  SmallVector<Operation *> sameEncodingOps;
+  mod.walk([&](Operation *op) {
+    if (hasSameOperandsEncodingTrait(op) ||
+        hasSameOperandsAndResultEncodingTrait(op))
+      sameEncodingOps.push_back(op);
+  });
+  for (Operation *op : sameEncodingOps) {
+    bool includeResults = hasSameOperandsAndResultEncodingTrait(op);
+    Attribute targetEncoding;
+    auto inspectType = [&](Type type) {
+      auto tensorTy = dyn_cast<RankedTensorType>(type);
+      if (!tensorTy || !isConcreteDistributed(tensorTy))
+        return;
+      Attribute candidate = tensorTy.getEncoding();
+      if (targetEncoding && targetEncoding != candidate) {
+        op->emitError(
+            "conflicting concrete layouts on same-encoding operation");
+        traitConflict = true;
+        return;
+      }
+      targetEncoding = candidate;
+    };
+    for (Type type : op->getOperandTypes())
+      inspectType(type);
+    if (includeResults)
+      for (Type type : op->getResultTypes())
+        inspectType(type);
+    if (traitConflict || !targetEncoding)
+      continue;
+
+    if (includeResults) {
+      for (OpResult result : op->getResults()) {
+        auto tensorTy = dyn_cast<RankedTensorType>(result.getType());
+        if (!tensorTy || tensorTy.getEncoding() == targetEncoding)
+          continue;
+        result.setType(RankedTensorType::get(
+            tensorTy.getShape(), tensorTy.getElementType(), targetEncoding));
+        changed = true;
+      }
+    }
+    for (OpOperand &operand : op->getOpOperands()) {
+      auto tensorTy = dyn_cast<RankedTensorType>(operand.get().getType());
+      if (!tensorTy || tensorTy.getEncoding() == targetEncoding)
+        continue;
+      OpBuilder b(op);
+      Type targetType = RankedTensorType::get(
+          tensorTy.getShape(), tensorTy.getElementType(), targetEncoding);
+      Value converted =
+          RequireLayoutOp::create(b, op->getLoc(), targetType, operand.get());
+      operand.set(converted);
+      changed = true;
+    }
+  }
+  return success(!traitConflict);
+}
+
+static LogicalResult reconcileDotLayouts(ModuleOp mod, bool &changed) {
+  // A concrete accumulator fixes a tt.dot result's layout. The Python
+  // frontend constructs both with encoding-free types, so a helper or
+  // predicated region may specialize C before D and trip DotOp's exact type
+  // verifier. Mirror the accumulator type here; operand requirements are
+  // synthesized later by TLXInsertRequireLayout.
+  bool conflict = false;
+  mod.walk([&](::mlir::triton::DotOp dot) {
+    Type target = dot.getC().getType();
+    if (!isConcreteDistributed(target) || dot.getType() == target)
+      return;
+    auto targetTy = cast<RankedTensorType>(target);
+    auto resultTy = dyn_cast<RankedTensorType>(dot.getType());
+    if (!resultTy || resultTy.getShape() != targetTy.getShape() ||
+        resultTy.getElementType() != targetTy.getElementType()) {
+      dot.emitError("dot result has inconsistent accumulator payload type");
+      conflict = true;
+      return;
+    }
+    if (isConcreteDistributed(resultTy) && resultTy != targetTy) {
+      dot.emitError("dot result conflicts with concrete accumulator layout");
+      conflict = true;
+      return;
+    }
+    dot.getResult().setType(targetTy);
+    changed = true;
+  });
+  return success(!conflict);
+}
+
 static SmallVector<Value> collectForwardedValues(Value root) {
   SmallVector<Value> worklist{root};
   SmallVector<Value> visited;
@@ -517,24 +675,29 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
     if (encoding && isa<ttg::AMDMfmaEncodingAttr>(encoding))
       concreteLayoutAnchors.insert(op.getResult());
   });
+  SymbolTableCollection symbolTables;
   // Find a placeholder encoding among a set of linked values (values an op
   // requires to share one encoding). If two of them carry *different* pinned
   // placeholders, that is a user error (two conflicting tlx.local_load(layout=)
   // pins meeting on one op) -- report it instead of silently retagging one.
   auto findPlaceholder = [&](ArrayRef<Value> vs, Operation *op) -> Attribute {
     Attribute enc;
+    RankedTensorType selectedType;
     for (Value v : vs)
       if (auto t = dyn_cast<RankedTensorType>(v.getType()))
         if (isPlaceholderEncoding(t.getEncoding())) {
-          if (enc && enc != t.getEncoding()) {
+          if (enc && enc != t.getEncoding() &&
+              !haveSamePhysicalLayout(selectedType, t)) {
             op->emitError("conflicting user-pinned layouts meet on this "
                           "operation; insert tlx.release_layout to reconcile "
                           "them before combining");
             conflict = true;
             return enc;
           }
-          if (!enc)
+          if (!enc) {
             enc = t.getEncoding();
+            selectedType = t;
+          }
         }
     return enc;
   };
@@ -593,7 +756,13 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
                     "limit");
       return failure();
     }
-    // Helpers can return a layout pin without receiving pinned arguments.
+    // A helper can establish a pin internally and return it without receiving
+    // any pinned argument. The frontend still gives that helper and its call
+    // sites encoding-free result types. Synchronize those result ABIs from
+    // the return operands before walking calls, including flattened aggregate
+    // results and unreachable poison returns. Input-driven call
+    // specialization below cannot discover this case because there is no
+    // placeholder on the call operands.
     SmallVector<::mlir::triton::FuncOp> funcs;
     mod.walk([&](::mlir::triton::FuncOp func) { funcs.push_back(func); });
     for (auto func : funcs) {
@@ -664,9 +833,11 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
     if (conflict)
       return failure();
 
+    // Mirror repaired helper result types onto every call before result users
+    // participate in this fixpoint iteration.
     mod.walk([&](::mlir::triton::CallOp call) {
       auto callee =
-          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+          symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
               call, call.getCalleeAttr());
       if (!callee)
         return;
@@ -1291,6 +1462,24 @@ public:
     // #linear layout needs it. Concrete conversions resolve in make_ttgir.
     if (failed(synchronizeConcreteHelperABI(mod)))
       return signalPassFailure();
+    // Repair concrete mismatches the helper-ABI pass leaves behind, before
+    // the verifier runs: encoding-uniform arith/math ops, tt.dot results,
+    // and same-encoding trait ops (tt.load/tt.store).
+    {
+      bool changed = true;
+      unsigned iteration = 0;
+      constexpr unsigned kMaxIterations = 64;
+      while (changed) {
+        changed = false;
+        if (++iteration > kMaxIterations) {
+          mod.emitError("TLX concrete layout reconciliation did not converge");
+          return signalPassFailure();
+        }
+        if (failed(reconcileEncodingUniformOps(mod, changed)) ||
+            failed(reconcileDotLayouts(mod, changed)))
+          return signalPassFailure();
+      }
+    }
     if (failed(reconcileVerifierLayouts(mod)))
       return signalPassFailure();
   }

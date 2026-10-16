@@ -54,11 +54,11 @@ _BY_KEY = {(s.op, s.arch): s for s in CATALOG}
 assert len(_BY_KEY) == len(CATALOG), "duplicate (op, arch) in CATALOG"
 
 
-def _target():
+def _target(device=None):
     # Lazy: hw.target imports torch.
-    from triton.language.extra.tlx.hw.target import current_target
+    from triton.language.extra.tlx.hw.target import current_target, target_for_device
 
-    return current_target()
+    return current_target() if device is None else target_for_device(device)
 
 
 def _capabilities(target) -> frozenset:
@@ -92,22 +92,27 @@ def has_impl(op: str, arch: str) -> bool:
     return (op, arch) in _BY_KEY
 
 
-def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], OpSpec]:
+def impl_for(op: str, arch: Optional[str] = None, *, device=None) -> tuple[Callable[..., Any], OpSpec]:
     """The blessed callable for `op`, plus its spec.
 
     Raises rather than falling back: a silent fallback turns "TLX is not
     running here" into an unexplained performance cliff.
 
-    An explicit `arch` pins the entry instead of detecting one. The capability
-    check is then skipped -- the caller has asserted the target, and checking a
-    pinned arch against the running device would reject the very case pinning
-    exists for.
+    Public op wrappers pass the input tensor's `device`, so dispatch follows
+    the device that will execute the kernel rather than an ambient current
+    device. An explicit `arch` pins the entry instead of detecting one. The
+    capability check is then skipped -- the caller has asserted the target,
+    and checking a pinned arch against the running device would reject the
+    very case pinning exists for.
     """
+    if arch is not None and device is not None:
+        raise ValueError("impl_for accepts either arch or device, not both")
     available = ", ".join(_arches_for(op)) or "(nothing yet)"
     if arch is None:
-        target = _target()
+        target = _target(device)
         if not target.key:
-            raise UnsupportedOp(f"tlx.ops.{op}: no GPU visible. Available on: {available}")
+            location = f" for device={device}" if device is not None else ""
+            raise UnsupportedOp(f"tlx.ops.{op}: no GPU visible{location}. Available on: {available}")
         spec = _BY_KEY.get((op, target.key))
         if spec is None:
             raise UnsupportedOp(f"tlx.ops.{op} has no implementation for {target.key}. "
