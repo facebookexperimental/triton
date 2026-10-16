@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from meta_llvm_bump import (commit_message, decide, issue_body, issue_title, oai_pins, parse_sha256_file,  # noqa: E402
-                            pick_tracking, release_for, render, same_tree_chain, variants)
+                            pick_tracking, pr_body, release_for, render, same_tree_chain, variants)
 
 META_PATH = "cmake/meta-llvm-info.json"
 DEFAULT_REQUIRED = "almalinux-arm64,almalinux-x64,ubuntu-arm64,ubuntu-x64"
@@ -113,7 +113,7 @@ def close_tracking_issue(repo, target, reason):
         run("gh", "issue", "close", str(issue["number"]), "--repo", repo, "--comment", reason)
 
 
-def publish(repo, target, title, message, release):
+def publish(repo, target, title, message, body, release):
     """Push the bot branch, then update its PR if a person opened one, else the tracking issue."""
     bot_branch = bot_branch_for(target)
     run("git", "checkout", "-B", bot_branch)
@@ -130,22 +130,22 @@ def publish(repo, target, title, message, release):
     emit(changed=str(changed).lower(), sha=run("git", "rev-parse", "HEAD").strip())
     prs = gh_json(f"repos/{repo}/pulls?head={repo.split('/')[0]}:{bot_branch}&base={target}&state=open")
     if prs:
-        body = message.split("\n", 2)[2]  # The PR title carries the first line.
         run("gh", "pr", "edit", str(prs[0]["number"]), "--repo", repo, "--title", title, "--body", body)
         return prs[0]["html_url"]
-    body = issue_body(repo, target, bot_branch, title, message, release)
+    issue_text = issue_body(repo, target, bot_branch, title, body, release)
     issue = tracking_issue(repo, target)
     if issue:
         moved = release["tag_name"] not in issue["body"]
         run("gh", "issue", "edit", str(issue["number"]), "--repo", repo, "--title", issue_title(target, release),
-            "--body", body)
+            "--body", issue_text)
         if moved:  # Edits notify no one; a comment tells subscribers the bump moved.
             run(
                 "gh", "issue", "comment", str(issue["number"]), "--repo", repo, "--body",
                 f"Moved `{bot_branch}` to `{release['tag_name']}` (fork commit "
                 f"`{release['target_commitish'][:12]}`, published {release['published_at'][:10]}).")
         return issue["url"]
-    return run("gh", "issue", "create", "--repo", repo, "--title", issue_title(target, release), "--body", body).strip()
+    return run("gh", "issue", "create", "--repo", repo, "--title", issue_title(target, release), "--body",
+               issue_text).strip()
 
 
 def report(repo, target, result, run_url):
@@ -206,18 +206,19 @@ def main():
     title = f"[Meta LLVM] Bump {args.target} to {release['tag_name']}"
     log = fork_log(args.fork, meta["llvm_hash"], new["llvm_hash"])
     message = commit_message(title, args.repo, args.target, args.fork, args.fork_branch, meta, new, log)
+    body = pr_body(args.repo, args.target, args.fork, args.fork_branch, meta, new, log)
     content = json.dumps(new, indent=2) + "\n"
     if args.dry_run:
-        print(f"--- {META_PATH} ---\n{content}--- commit message and PR description ---\n{message}\n"
+        print(f"--- {META_PATH} ---\n{content}--- commit message ---\n{message}\n"
               f"--- tracking issue: {issue_title(args.target, release)} ---\n"
-              f"{issue_body(args.repo, args.target, bot_branch_for(args.target), title, message, release)}")
+              f"{issue_body(args.repo, args.target, bot_branch_for(args.target), title, body, release)}")
         return
     remote_tip = gh_json(f"repos/{args.repo}/branches/{args.target}")["commit"]["sha"]
     if run("git", "rev-parse", "HEAD").strip() != remote_tip:
         sys.exit(f"checkout is not at {args.target} tip {remote_tip[:12]}; the pin was read from there")
     with open(META_PATH, "w") as f:
         f.write(content)
-    print(publish(args.repo, args.target, title, message, release))
+    print(publish(args.repo, args.target, title, message, body, release))
 
 
 if __name__ == "__main__":

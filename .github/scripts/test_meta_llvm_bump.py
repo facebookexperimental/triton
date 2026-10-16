@@ -1,5 +1,5 @@
 from meta_llvm_bump import (commit_message, decide, issue_body, issue_marker, issue_title, oai_pins, pick_tracking,
-                            parse_sha256_file, release_for, render, same_tree_chain, variants)
+                            pr_body, parse_sha256_file, release_for, render, same_tree_chain, variants)
 
 OLD = "1889ed344a2ea019320c1a49fc5b7103d0d9468d"
 NEW = "3dd0e43fed8836e77165a4f066b983efe1f13a82"
@@ -118,17 +118,32 @@ RELEASE = {
 }
 
 
-def test_issue_body_has_marker_command_and_message():
+def test_pr_body_markdown_unwrapped_full_subjects():
+    release = _release(NEW, 1, ["almalinux-x64"])
+    new = render(META, release, {"almalinux-x64": "e" * 64}, "facebookexperimental/llvm-project")
+    long_subject = "[triton][3.8][LLVM] Cap SLSR candidate-basis SCEV differences per function (#13)"
+    body = pr_body("facebookexperimental/triton", "release/3.8.x", "facebookexperimental/llvm-project", "triton_3.8.x",
+                   META, new, [(NEW, long_subject)])
+    lines = body.splitlines()
+    assert lines[:4] == ["# Summary:", "", "**Problem**", ""]
+    assert "# Test Plan:" in lines
+    # One line per paragraph: GitHub renders every newline as a hard break.
+    assert any(
+        line.startswith("facebookexperimental/triton@release/3.8.x tracks") and line.endswith("release.")
+        for line in lines)
+    assert lines[-3:] == ["```", f"3dd0e43fed88 {long_subject}", "```"]
+
+
+def test_issue_body_has_marker_and_self_contained_command():
     body = issue_body("facebookexperimental/triton", "release/3.8.x", "scratch/meta-llvm-bump/release-3.8.x",
-                      "[Meta LLVM] Bump release/3.8.x to llvm-3dd0e43f-1", "TITLE\n\nSummary:\nbody text", RELEASE)
+                      "[Meta LLVM] Bump release/3.8.x to llvm-3dd0e43f-1", "# Summary:\n\n```\nlog\n```", RELEASE)
     assert body.startswith(issue_marker("release/3.8.x"))
     assert ("gh pr create -R facebookexperimental/triton --base release/3.8.x "
             "--head scratch/meta-llvm-bump/release-3.8.x") in body
-    # The PR body comes from the branch's own commit message, minus the title line.
-    assert ("gh api repos/facebookexperimental/triton/commits/scratch/meta-llvm-bump/release-3.8.x "
-            "-q .commit.message | tail -n +3") in body
+    # The PR body rides in a quoted heredoc, inside a fence longer than the body's own fences.
+    assert "--body-file - <<'PR_BODY'\n# Summary:\n\n```\nlog\n```\nPR_BODY\n````" in body
+    assert "\n````\ngh pr create" in body
     assert "compare/release/3.8.x...scratch/meta-llvm-bump/release-3.8.x" in body
-    assert "Summary:\nbody text" in body
     assert issue_marker("main") != issue_marker("release/3.8.x")
     assert "Release: `llvm-3dd0e43f-1`, built from fork commit `3dd0e43fed88`, published 2026-10-15 07:12:30 UTC." in body
 

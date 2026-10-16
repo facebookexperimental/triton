@@ -107,11 +107,22 @@ def decide(meta, pins, chain, release, required):
     return "bump", release["tag_name"]
 
 
-def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width=72):
-    """Commit message and PR description: bare Summary:/Test Plan: labels, wrapped at width."""
+def _bump_text(repo, target, fork, fork_branch, meta, new):
+    """(problem, solution, test plan, log header) prose shared by the commit message and the PR body."""
     old_tag = meta["release_base_url"].rsplit("/", 1)[-1]
     tip, base = new["llvm_hash"], new["based_on_oai_llvm_hash"]
     tag = new["release_base_url"].rsplit("/", 1)[-1]
+    return (f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
+            "fork branch has a newer published release.",
+            f"This points cmake/meta-llvm-info.json at {tag}, built from fork tip {tip[:12]} on the same OAI pin "
+            f"{base[:12]}.", "The pinned digests match the release's .sha256 assets and GitHub's asset digests "
+            f"({', '.join(sorted(new['sha256sum']))}).",
+            f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):")
+
+
+def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width=72):
+    """Commit message: bare Summary:/Test Plan: labels, wrapped at width for git log."""
+    problem, solution, test, log_header = _bump_text(repo, target, fork, fork_branch, meta, new)
 
     def para(text):
         return textwrap.fill(text, width)
@@ -121,27 +132,24 @@ def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width
         return line if len(line) <= width else line[:width - 3] + "..."
 
     lines = [
-        title,
-        "",
-        "Summary:",
-        "**Problem**",
-        "",
-        para(f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
-             "fork branch has a newer published release."),
-        "",
-        "**Solution**",
-        "",
-        para(f"This points cmake/meta-llvm-info.json at {tag}, built from fork tip {tip[:12]} on the same OAI pin "
-             f"{base[:12]}."),
-        "",
-        "Test Plan:",
-        para("The pinned digests match the release's .sha256 assets and GitHub's asset digests "
-             f"({', '.join(sorted(new['sha256sum']))})."),
-        "",
-        f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):",
+        title, "", "Summary:", "**Problem**", "",
+        para(problem), "", "**Solution**", "",
+        para(solution), "", "Test Plan:",
+        para(test), "", log_header
     ]
     lines += [entry(sha, subject) for sha, subject in log] or ["  (none)"]
     return "\n".join(lines)
+
+
+def pr_body(repo, target, fork, fork_branch, meta, new, log):
+    """PR description: markdown headings, unwrapped paragraphs (GitHub turns each newline into a break), and the
+    fork log in a fence with full subjects."""
+    problem, solution, test, log_header = _bump_text(repo, target, fork, fork_branch, meta, new)
+    entries = [f"{sha[:12]} {subject}" for sha, subject in log] or ["(none)"]
+    return "\n".join([
+        "# Summary:", "", "**Problem**", "", problem, "", "**Solution**", "", solution, "", "# Test Plan:", "", test,
+        "", log_header, "", "```", *entries, "```"
+    ])
 
 
 def issue_marker(target):
@@ -164,15 +172,14 @@ def issue_title(target, release):
     return f"[Meta LLVM] Bump ready: {target} to {release['tag_name']} ({release['published_at'][:10]})"
 
 
-def issue_body(repo, target, bot_branch, title, message, release):
+def issue_body(repo, target, bot_branch, title, body, release):
     """Tracking issue: where the bump is and the command a person runs to open its PR.
 
     A person opens the PR because the Meta CLA check and the fbsource importer accept only
     PR authors with a CLA on file; the bot account has none.
     """
-    gh_cmd = (f'gh pr create -R {repo} --base {target} --head {bot_branch} \\\n'
-              f'  --title "{title}" \\\n'
-              f'  --body "$(gh api repos/{repo}/commits/{bot_branch} -q .commit.message | tail -n +3)"')
+    gh_cmd = (f"gh pr create -R {repo} --base {target} --head {bot_branch} \\\n"
+              f"  --title '{title}' --body-file - <<'PR_BODY'\n{body}\nPR_BODY")
     return "\n".join([
         issue_marker(target),
         f"A Meta LLVM bump for `{target}` is ready on `{bot_branch}` "
@@ -184,16 +191,10 @@ def issue_body(repo, target, bot_branch, title, message, release):
         "Open its PR (a person must open it, since the Meta CLA check reads the PR author), then import and "
         "land it as usual:",
         "",
-        "```",
+        "````",  # Four backticks: the PR body inside has its own fences.
         gh_cmd,
-        "```",
+        "````",
         "",
         f"When the fork publishes a newer release, the bot moves the branch (and the PR once it exists) to it and "
         f"comments here. This issue closes when `{target}` pins the release.",
-        "",
-        "Commit message and PR description:",
-        "",
-        "```",
-        message,
-        "```",
     ])
