@@ -412,7 +412,9 @@ def get_cuda_autotune_config():
             ctas_per_cga=(num_ctas, 1, 1) if num_ctas > 1 else None,
         )
         for BM in [64, 128, 256]
-        for BN in [64, 128, 256]
+        # A non-power-of-two BN is split into power-of-two MMAs (see _n_piece);
+        # pruning keeps it only where it cuts N padding.
+        for BN in [64, 96, 128, 160, 192, 208, 224, 256]
         for BK in [64, 128]
         for s in [2, 3, 4, 5, 6, 7, 8]
         for t in [1, 2, 3]
@@ -423,7 +425,22 @@ def get_cuda_autotune_config():
         for interleave in [0, 1]
         for g in [1, 2, 8, 64]
         for uwb in [False, True]
+        if BN & (BN - 1) == 0 or not interleave
     ]
+
+
+@triton.constexpr_function
+def _n_piece(n, i):
+    """i-th power-of-two piece of a tile N, largest first (0 past the last).
+
+    TLX buffers and MMAs need power-of-two N, so a tile of any N is split
+    into its binary pieces, e.g. 208 -> 128, 64, 16.
+    """
+    pieces = []
+    while n:
+        pieces.append(1 << (n.bit_length() - 1))
+        n -= pieces[-1]
+    return pieces[i] if i < len(pieces) else 0
 
 
 def _padded_num_pid_m(M, BLOCK_SIZE_M, NUM_CTAS):
@@ -441,20 +458,26 @@ def matmul_tma_set_block_size_hook(nargs):
     NUM_MMA_GROUPS = nargs.get("NUM_MMA_GROUPS", 1)
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
     NUM_CTAS = nargs.get("NUM_CTAS", 1)
-    BLOCK_N_PER_CTA = BLOCK_N // NUM_CTAS
+    N0, N1, N2 = (_n_piece(BLOCK_N, i) for i in range(3))
     # For column-major inputs, TMA descriptor block shape matches the transposed view
     if nargs.get("A_ROW_MAJOR", True):
         nargs["a_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_K]
     else:
         nargs["a_desc"].block_shape = [BLOCK_K, BLOCK_M_SPLIT]
-    if nargs.get("B_ROW_MAJOR", True):
-        nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N_PER_CTA]
-    else:
-        nargs["b_desc"].block_shape = [BLOCK_N_PER_CTA, BLOCK_K]
+    # One B descriptor per power-of-two N piece, NUM_CTAS-split; an unused
+    # piece's descriptor is never read, so give it the main piece's box.
+    for piece, desc_name in ((N0, "b_desc"), (N1, "b_tail_desc"), (N2, "b_tail2_desc")):
+        if desc_name not in nargs:
+            continue
+        per_cta = (piece or N0) // NUM_CTAS
+        if nargs.get("B_ROW_MAJOR", True):
+            nargs[desc_name].block_shape = [BLOCK_K, per_cta]
+        else:
+            nargs[desc_name].block_shape = [per_cta, BLOCK_K]
     EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", 1)
     nargs["c_desc"].block_shape = [
         BLOCK_M // NUM_MMA_GROUPS,
-        BLOCK_N // EPILOGUE_SUBTILE,
+        N0 // EPILOGUE_SUBTILE,
     ]
     SPLIT_K = nargs.get("SPLIT_K", 1)
     if SPLIT_K > 1:
@@ -471,7 +494,7 @@ def matmul_tma_set_block_size_hook(nargs):
         nargs["workspace_desc"].shape = list(nargs["c_desc"].base.shape)
     nargs["workspace_desc"].block_shape = [
         BLOCK_M // NUM_MMA_GROUPS,
-        BLOCK_N // EPILOGUE_SUBTILE,
+        N0 // EPILOGUE_SUBTILE,
     ]
 
 
@@ -500,6 +523,19 @@ def preprocess_configs(configs, named_args, **kwargs):
         EPILOGUE_SUBTILE = conf.kwargs["EPILOGUE_SUBTILE"]
         INTERLEAVE_EPILOGUE = conf.kwargs.get("INTERLEAVE_EPILOGUE", 0)
         GROUP_SIZE_M = conf.kwargs["GROUP_SIZE_M"]
+        # A non-power-of-two BLOCK_N runs as power-of-two pieces (_n_piece).
+        N0 = _n_piece(BLOCK_N, 0)
+        if BLOCK_N != N0:
+            pieces = [_n_piece(BLOCK_N, i) for i in range(4)]
+            # At most three pieces, each splitting evenly over the CTA pair
+            # into multiples of 8 rows, stored in whole epilogue slices; the
+            # interleaved epilogue is power-of-two only.
+            if (pieces[3] or pieces[2] and pieces[2] < 8 * NUM_CTAS or pieces[1] < 8 * NUM_CTAS
+                    or INTERLEAVE_EPILOGUE or any(p % (N0 // EPILOGUE_SUBTILE) for p in pieces)):
+                continue
+            # Only keep a non-power-of-two N when it cuts N padding.
+            if math.ceil(N / BLOCK_N) * BLOCK_N >= math.ceil(N / N0) * N0:
+                continue
 
         # Filter out invalid config that causes wrong hardware MMA
         if BLOCK_M // NUM_MMA_GROUPS > 128:
@@ -514,8 +550,8 @@ def preprocess_configs(configs, named_args, **kwargs):
         if GROUP_SIZE_M % NUM_CTAS != 0:
             continue
 
-        # EPILOGUE_SUBTILE must evenly divide BLOCK_N
-        if BLOCK_N % EPILOGUE_SUBTILE != 0:
+        # EPILOGUE_SUBTILE must evenly divide the main N piece
+        if N0 % EPILOGUE_SUBTILE != 0:
             continue
 
         # Interleaved epilogue requires NUM_MMA_GROUPS == 2
@@ -561,7 +597,7 @@ def preprocess_configs(configs, named_args, **kwargs):
         epilogue_elem_bytes = 4 if SPLIT_K > 1 else 2
         num_epilogue_buffers = max(NUM_MMA_GROUPS, 2)
         block_m_split = BLOCK_M // NUM_MMA_GROUPS
-        smem_epilog = (block_m_split * (BLOCK_N // EPILOGUE_SUBTILE) * epilogue_elem_bytes * num_epilogue_buffers)
+        smem_epilog = (block_m_split * (N0 // EPILOGUE_SUBTILE) * epilogue_elem_bytes * num_epilogue_buffers)
         smem_barriers = NUM_SMEM_BUFFERS * NUM_MMA_GROUPS * MBARRIER_SIZE
         if NUM_CTAS == 2:
             smem_barriers += NUM_SMEM_BUFFERS * NUM_MMA_GROUPS * MBARRIER_SIZE
@@ -683,6 +719,25 @@ def preprocess_configs(configs, named_args, **kwargs):
 
 
 @triton.jit
+def _store_acc_slices(acc_tmem, tmem_empty_bar, out_desc, c_smem_buffers, row, col0, slot0,
+                      NUM_SLICES: tl.constexpr, SLICE: tl.constexpr, BLOCK_M_SPLIT: tl.constexpr,
+                      NUM_CTAS: tl.constexpr):
+    """Store NUM_SLICES SLICE-wide column slices of an accumulator through the
+    two alternating epilogue SMEM buffers; ``slot0`` keeps the alternation
+    continuous with the slices stored before."""
+    for j in tl.static_range(NUM_SLICES):
+        result = tlx.local_load(tlx.local_slice(acc_tmem, [0, j * SLICE], [BLOCK_M_SPLIT, SLICE]))
+        if NUM_CTAS == 2:
+            tlx.barrier_arrive(tmem_empty_bar, 1, remote_cta_rank=0)
+        else:
+            tlx.barrier_arrive(tmem_empty_bar, 1)
+        c_smem = c_smem_buffers[(slot0 + j) % 2]
+        tlx.async_descriptor_store_wait(1)
+        tlx.local_store(c_smem, result.to(tlx.dtype_of(out_desc)))
+        tlx.async_descriptor_store(out_desc, c_smem, [row, col0 + j * SLICE], eviction_policy="evict_first")
+
+
+@triton.jit
 def _process_tile_epilogue_inner(
     tile_id,
     num_pid_in_group,
@@ -705,14 +760,24 @@ def _process_tile_epilogue_inner(
     cur_tmem_buf,
     tmem_read_phase,
     NUM_CTAS: tl.constexpr,
+    N_TAIL: tl.constexpr = 0,
+    tmem_buffers_tail=None,
+    N_TAIL2: tl.constexpr = 0,
+    tmem_buffers_tail2=None,
 ):
-    """Process epilogue for a single tile."""
+    """Process epilogue for a single tile.
+
+    ``BLOCK_SIZE_N`` is the main power-of-two N piece; the ``N_TAIL`` and
+    ``N_TAIL2`` pieces are stored after it in slices of the same width through
+    the same descriptor and SMEM buffers.
+    """
     mn_tile_id = tile_id if SPLIT_K == 1 else tile_id % num_mn_tiles
     pid_m, pid_n = _core._compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-    offs_bn = pid_n * BLOCK_SIZE_N
+    offs_bn = pid_n * (BLOCK_SIZE_N + N_TAIL + N_TAIL2)
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
 
     slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+    SLICES_PER_GROUP: tl.constexpr = (BLOCK_SIZE_N + N_TAIL + N_TAIL2) // slice_size
     if SPLIT_K > 1:
         split_id = tile_id // num_mn_tiles
         out_desc = workspace_desc
@@ -828,7 +893,7 @@ def _process_tile_epilogue_inner(
                 else:
                     tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
                 c = result.to(tlx.dtype_of(out_desc))
-                c_smem = c_smem_buffers[(group_id * EPILOGUE_SUBTILE + slice_id) % 2]
+                c_smem = c_smem_buffers[(group_id * SLICES_PER_GROUP + slice_id) % 2]
                 tlx.async_descriptor_store_wait(1)
                 tlx.local_store(c_smem, c)
                 tlx.async_descriptor_store(
@@ -837,6 +902,16 @@ def _process_tile_epilogue_inner(
                     [row_base + offs_am, offs_bn + slice_id * slice_size],
                     eviction_policy="evict_first",
                 )
+            if N_TAIL > 0:
+                _store_acc_slices(tmem_buffers_tail[buf_idx], tmem_empty_bars[buf_idx], out_desc, c_smem_buffers,
+                                  row_base + offs_am, offs_bn + BLOCK_SIZE_N,
+                                  group_id * SLICES_PER_GROUP + EPILOGUE_SUBTILE, N_TAIL // slice_size, slice_size,
+                                  BLOCK_M_SPLIT, NUM_CTAS)
+            if N_TAIL2 > 0:
+                _store_acc_slices(tmem_buffers_tail2[buf_idx], tmem_empty_bars[buf_idx], out_desc, c_smem_buffers,
+                                  row_base + offs_am, offs_bn + BLOCK_SIZE_N + N_TAIL,
+                                  group_id * SLICES_PER_GROUP + EPILOGUE_SUBTILE + N_TAIL // slice_size,
+                                  N_TAIL2 // slice_size, slice_size, BLOCK_M_SPLIT, NUM_CTAS)
 
     # Wait for all TMA stores to complete
     tlx.async_descriptor_store_wait(0)
@@ -922,6 +997,8 @@ def matmul_kernel_tma_ws_blackwell(
     b_desc,
     c_desc,
     workspace_desc,
+    b_tail_desc,
+    b_tail2_desc,
     M,
     N,
     K,
@@ -942,6 +1019,15 @@ def matmul_kernel_tma_ws_blackwell(
     B_ROW_MAJOR: tl.constexpr = True,
     USE_WARP_BARRIER: tl.constexpr = False,
 ):
+    # The tile's N, BLOCK_SIZE_N, need not be a power of two: it runs as up to
+    # three power-of-two pieces (e.g. 208 = 128 + 64 + 16), each with its own
+    # B and accumulator buffers and its own MMA per K step.
+    BLOCK_N_TILE: tl.constexpr = BLOCK_SIZE_N
+    BLOCK_N0: tl.constexpr = _n_piece(BLOCK_SIZE_N, 0)
+    N_TAIL: tl.constexpr = _n_piece(BLOCK_SIZE_N, 1)
+    N_TAIL2: tl.constexpr = _n_piece(BLOCK_SIZE_N, 2)
+    tl.static_assert(_n_piece(BLOCK_SIZE_N, 3) == 0)
+    tl.static_assert(N_TAIL == 0 or not INTERLEAVE_EPILOGUE)
     # allocate NUM_SMEM_BUFFERS buffers
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
     if not A_ROW_MAJOR:
@@ -958,23 +1044,55 @@ def matmul_kernel_tma_ws_blackwell(
         )
     # In 2-CTA mode, each CTA only needs to load BLOCK_N // NUM_CTAS of B.
     if not B_ROW_MAJOR:
-        buffers_B = tlx.local_alloc((BLOCK_SIZE_N // NUM_CTAS, BLOCK_SIZE_K), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
+        buffers_B = tlx.local_alloc((BLOCK_N0 // NUM_CTAS, BLOCK_SIZE_K), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
     else:
-        buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N // NUM_CTAS), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
+        buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_N0 // NUM_CTAS), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
     # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
-    # Each buffer holds one subtile: BLOCK_M_SPLIT x BLOCK_SIZE_N
+    # Each buffer holds one subtile: BLOCK_M_SPLIT x BLOCK_N0
     # Total buffers: NUM_TMEM_BUFFERS * NUM_MMA_GROUPS
     tmem_buffers = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_SIZE_N),
+        (BLOCK_M_SPLIT, BLOCK_N0),
         tl.float32,
         NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
         tlx.storage_kind.tmem,
     )
+    if N_TAIL > 0:
+        if not B_ROW_MAJOR:
+            buffers_B_tail = tlx.local_alloc((N_TAIL // NUM_CTAS, BLOCK_SIZE_K), tlx.dtype_of(b_desc),
+                                             NUM_SMEM_BUFFERS)
+        else:
+            buffers_B_tail = tlx.local_alloc((BLOCK_SIZE_K, N_TAIL // NUM_CTAS), tlx.dtype_of(b_desc),
+                                             NUM_SMEM_BUFFERS)
+        tmem_buffers_tail = tlx.local_alloc(
+            (BLOCK_M_SPLIT, N_TAIL),
+            tl.float32,
+            NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem,
+        )
+    else:
+        buffers_B_tail = None
+        tmem_buffers_tail = None
+    if N_TAIL2 > 0:
+        if not B_ROW_MAJOR:
+            buffers_B_tail2 = tlx.local_alloc((N_TAIL2 // NUM_CTAS, BLOCK_SIZE_K), tlx.dtype_of(b_desc),
+                                              NUM_SMEM_BUFFERS)
+        else:
+            buffers_B_tail2 = tlx.local_alloc((BLOCK_SIZE_K, N_TAIL2 // NUM_CTAS), tlx.dtype_of(b_desc),
+                                              NUM_SMEM_BUFFERS)
+        tmem_buffers_tail2 = tlx.local_alloc(
+            (BLOCK_M_SPLIT, N_TAIL2),
+            tl.float32,
+            NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem,
+        )
+    else:
+        buffers_B_tail2 = None
+        tmem_buffers_tail2 = None
 
     # Allocate SMEM buffers for epilogue TMA store (at least 2 for multi-buffering).
     # workspace_desc is fp32 for split-K and aliases c_desc otherwise.
     NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr = NUM_MMA_GROUPS if NUM_MMA_GROUPS > 2 else 2
-    slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+    slice_size: tl.constexpr = BLOCK_N0 // EPILOGUE_SUBTILE
     c_smem_buffers = tlx.local_alloc(
         (BLOCK_M_SPLIT, slice_size),
         tlx.dtype_of(workspace_desc),
@@ -998,7 +1116,8 @@ def matmul_kernel_tma_ws_blackwell(
         B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
     # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
-    tmem_empty_arrivals: tl.constexpr = EPILOGUE_SUBTILE * NUM_CTAS
+    # One arrival per stored slice, the N tail pieces' slices included.
+    tmem_empty_arrivals: tl.constexpr = BLOCK_SIZE_N // slice_size * NUM_CTAS
     if USE_WARP_BARRIER:
         tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=4,
                                                  num_arrivals=tmem_empty_arrivals)
@@ -1028,7 +1147,7 @@ def matmul_kernel_tma_ws_blackwell(
                 N,
                 K,
                 BLOCK_SIZE_M,
-                BLOCK_SIZE_N,
+                BLOCK_N_TILE,
                 BLOCK_SIZE_K,
                 GROUP_SIZE_M,
                 SPLIT_K,
@@ -1055,7 +1174,7 @@ def matmul_kernel_tma_ws_blackwell(
                         num_mn_tiles=num_mn_tiles,
                         GROUP_SIZE_M=GROUP_SIZE_M,
                         BLOCK_SIZE_M=BLOCK_SIZE_M,
-                        BLOCK_SIZE_N=BLOCK_SIZE_N,
+                        BLOCK_SIZE_N=BLOCK_N0,
                         EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
                         NUM_MMA_GROUPS=NUM_MMA_GROUPS,
                         NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
@@ -1070,6 +1189,10 @@ def matmul_kernel_tma_ws_blackwell(
                         cur_tmem_buf=cur_tmem_buf,
                         tmem_read_phase=tmem_read_phase,
                         NUM_CTAS=NUM_CTAS,
+                        N_TAIL=N_TAIL,
+                        tmem_buffers_tail=tmem_buffers_tail,
+                        N_TAIL2=N_TAIL2,
+                        tmem_buffers_tail2=tmem_buffers_tail2,
                     )
                     tmem_accum_cnt += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=NUM_CTAS == 2)
@@ -1089,7 +1212,7 @@ def matmul_kernel_tma_ws_blackwell(
                 N,
                 K,
                 BLOCK_SIZE_M,
-                BLOCK_SIZE_N,
+                BLOCK_N_TILE,
                 BLOCK_SIZE_K,
                 GROUP_SIZE_M,
                 SPLIT_K,
@@ -1133,6 +1256,12 @@ def matmul_kernel_tma_ws_blackwell(
                             NUM_CTAS=NUM_CTAS,
                             A_ROW_MAJOR=A_ROW_MAJOR,
                             B_ROW_MAJOR=B_ROW_MAJOR,
+                            buffers_B_tail=buffers_B_tail,
+                            tmem_buffers_tail=tmem_buffers_tail,
+                            N_TAIL=N_TAIL,
+                            buffers_B_tail2=buffers_B_tail2,
+                            tmem_buffers_tail2=tmem_buffers_tail2,
+                            N_TAIL2=N_TAIL2,
                         )
                     else:
                         # Keep CTA1's ring-buffer position aligned with CTA0 so
@@ -1159,7 +1288,7 @@ def matmul_kernel_tma_ws_blackwell(
                 N,
                 K,
                 BLOCK_SIZE_M,
-                BLOCK_SIZE_N,
+                BLOCK_N_TILE,
                 BLOCK_SIZE_K,
                 GROUP_SIZE_M,
                 SPLIT_K,
@@ -1182,7 +1311,7 @@ def matmul_kernel_tma_ws_blackwell(
                         num_mn_tiles=num_mn_tiles,
                         GROUP_SIZE_M=GROUP_SIZE_M,
                         BLOCK_SIZE_M=BLOCK_SIZE_M,
-                        BLOCK_SIZE_N=BLOCK_SIZE_N,
+                        BLOCK_SIZE_N=BLOCK_N0,
                         BLOCK_SIZE_K=BLOCK_SIZE_K,
                         NUM_MMA_GROUPS=NUM_MMA_GROUPS,
                         k_tile_start=k_tile_start,
@@ -1201,6 +1330,12 @@ def matmul_kernel_tma_ws_blackwell(
                         SPLIT_K=SPLIT_K,
                         A_ROW_MAJOR=A_ROW_MAJOR,
                         B_ROW_MAJOR=B_ROW_MAJOR,
+                        b_tail_desc=b_tail_desc,
+                        buffers_B_tail=buffers_B_tail,
+                        N_TAIL=N_TAIL,
+                        b_tail2_desc=b_tail2_desc,
+                        buffers_B_tail2=buffers_B_tail2,
+                        N_TAIL2=N_TAIL2,
                     )
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=NUM_CTAS == 2)
                 clc_phase_consumer ^= 1
@@ -1327,6 +1462,9 @@ def mm(a, b, *, out=None, space="full"):
 
     # Dummy workspace; the pre_hook sizes a real one once SPLIT_K is known.
     workspace_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+    # B descriptors for the N tail pieces (narrower boxes); set by the pre_hook.
+    b_tail_desc = TensorDescriptor(b_src, b_src.shape, b_src.stride(), dummy_block)
+    b_tail2_desc = TensorDescriptor(b_src, b_src.shape, b_src.stride(), dummy_block)
 
     def grid(META):
         num_pid_m = _padded_num_pid_m(M, META["BLOCK_SIZE_M"], META["NUM_CTAS"])
@@ -1339,6 +1477,8 @@ def mm(a, b, *, out=None, space="full"):
         b_desc,
         c_desc,
         workspace_desc,
+        b_tail_desc,
+        b_tail2_desc,
         M,
         N,
         K,
