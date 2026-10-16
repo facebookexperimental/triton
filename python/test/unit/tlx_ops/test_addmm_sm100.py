@@ -19,7 +19,15 @@ def test_addmm(m, n, k, a_strides, b_strides, bias_strides, dtype_name):
     expected = torch.addmm(bias, a, b)
 
     assert actual is out
-    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+    # Summation noise over K unit-variance products grows with the output
+    # magnitude (std ~ sqrt(K)): the extreme-K focus shapes (e.g. K=242432
+    # with outputs ~ N(0, 490)) exceed any fixed absolute tolerance on every
+    # backend, including the cuBLAS reference itself. Scale atol with the
+    # reference range like the mm tests (REL_PRECISION), floored at 0.05 so
+    # small shapes keep their current checks.
+    precision = {torch.float16: 1e-3, torch.bfloat16: 8e-3}[dtype]
+    atol = max(0.05, precision * expected.abs().max().item())
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=0.05)
 
     del bias, a, b, out, actual, expected
     torch.cuda.empty_cache()

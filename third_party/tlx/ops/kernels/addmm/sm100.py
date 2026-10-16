@@ -41,8 +41,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 # (default task, full num_warps=4) + store (1 warp) threads; recount if
 # the task warp layout changes. slice_full stays an mbarrier: it hands
 # smem data to the store's TMA (async proxy ordering).
-_SLICE_EMPTY_BAR_BASE = 3
-_SLICE_EMPTY_BAR_COUNT = (4 + 1) * 32
+_SLICE_EMPTY_BAR_BASE = tl.constexpr(3)
+_SLICE_EMPTY_BAR_COUNT = tl.constexpr((4 + 1) * 32)
 
 
 @triton.jit
