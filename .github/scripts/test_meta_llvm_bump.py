@@ -157,12 +157,6 @@ def test_issue_body_has_markers_result_and_self_contained_command():
     assert "Release: `llvm-3dd0e43f-1`, built from fork commit `3dd0e43fed88`, published 2026-10-15 07:12:30 UTC." in body
 
 
-def test_ready_body_without_gpu_workflows_says_unverified():
-    body = issue_body("r", "release/3.8.x", "T", "B", RELEASE, SHA, {})
-    assert "Not GPU-verified" in body and "skips the GPU suites" not in body and "gh pr create" in body
-    assert verify_state([], [], 0, 8)[0] == "done" and verdict({}) == "ready"
-
-
 def test_failed_and_timeout_bodies_have_no_pr_command():
     failed = {"gpu-tests.yml": {**RUN, "conclusion": "failure"}}
     body = failed_body("r", "main", RELEASE, SHA, failed, ["b200 / b200-tlx-test"])

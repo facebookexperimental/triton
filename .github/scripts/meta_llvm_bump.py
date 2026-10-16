@@ -245,19 +245,17 @@ def issue_body(repo, target, title, body, release, sha, latest):
     lines = [
         issue_marker(target),
         result_marker("ready", sha),
-        f"A Meta LLVM bump for `{target}` is ready on `{bot_branch}` at `{sha[:12]}` "
+        f"A Meta LLVM bump for `{target}` passed GPU verification on `{bot_branch}` at `{sha[:12]}` "
         f"([view the change](https://github.com/{repo}/compare/{target}...{bot_branch})).",
         "",
         _release_line(release),
         "",
-        f"GPU runs: {_runs_line(latest)}."
-        if latest else f"Not GPU-verified: `{target}` has no push-triggered GPU workflows for this branch yet.",
+        f"GPU runs: {_runs_line(latest)}.",
     ]
-    skip = " The PR skips the GPU suites, since this commit already passed them." if latest else ""
     return "\n".join(lines + [
         "",
         "Open its PR (a person must open it, since the Meta CLA check reads the PR author), then import and "
-        f"land it as usual.{skip}",
+        "land it as usual. The PR skips the GPU suites, since this commit already passed them:",
         "",
         "````",  # Four backticks: the PR body inside has its own fences.
         gh_cmd,

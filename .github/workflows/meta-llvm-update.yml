@@ -75,7 +75,6 @@ jobs:
     with:
       target: release/3.8.x
       fork_branch: triton_3.8.x
-      # None yet: release/3.8.x's GPU workflows do not run on push to its bump branch.
-      verify_workflows: ''
+      verify_workflows: h100.yml,b200.yml,mi350.yml
       dry_run: ${{ inputs.dry_run == true }}
     secrets: inherit
