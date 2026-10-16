@@ -1,9 +1,9 @@
 name: Nightly TLX.ops Bench
 # Runs the tlx.ops perf suite (python/test/tlx_benchmark) on B200, H100 and
 # MI350 for the commit each published nightly selects, which already passed the
-# correctness checks the nightly is gated on. It installs that commit's
-# build.yml wheel, the one its GPU tests ran on; build.yml's wheel cache returns
-# it without rebuilding.
+# correctness checks the nightly is gated on. It installs the wheel build.yml
+# makes for that commit: usually the cached one its GPU tests ran on, rebuilt
+# from the same commit if the cache has expired or the build recipe changed.
 on:
   workflow_run:
     workflows: ["Nightly fbtriton"]

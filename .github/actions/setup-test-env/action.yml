@@ -82,11 +82,15 @@ runs:
           # `triton` package as fbtriton. On ROCm, torch also requires
           # rocm[device-all], device code for every GPU architecture (~6 GiB
           # of the ~8.6 GiB download), so keep only ARCH.
-          echo "${TORCH}" | uv pip compile - ${PRE} --index-url "${IDX}" --no-header --no-annotate -q \
-            | grep -oE '^[A-Za-z0-9_.-]+' \
-            | grep -E '^((pytorch-)?triton(-rocm)?|rocm-sdk-device-gfx[0-9a-z]+)$' \
-            | grep -vx "rocm-sdk-device-${ARCH:-none}" \
-            | sed "s/\$/ ; sys_platform == 'never'/" > /tmp/torch-overrides.txt
+          # Resolve on its own so resolver errors fail the step; the filter
+          # below may legitimately match nothing.
+          echo "${TORCH}" | uv pip compile - ${PRE} --index-url "${IDX}" --no-header --no-annotate -q > /tmp/torch-deps.txt
+          awk -v keep="rocm-sdk-device-${ARCH:-none}" -v q="'" '
+            match($0, /^[A-Za-z0-9_.-]+/) {
+              name = substr($0, 1, RLENGTH)
+              if (name ~ /^((pytorch-)?triton(-rocm)?|rocm-sdk-device-gfx[0-9a-z]+)$/ && name != keep)
+                print name " ; sys_platform == " q "never" q
+            }' /tmp/torch-deps.txt > /tmp/torch-overrides.txt
           cat /tmp/torch-overrides.txt
           T0=$(date +%s)
           # shellcheck disable=SC2086

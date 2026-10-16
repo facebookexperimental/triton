@@ -872,7 +872,8 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       + (pageOnly ? ` The ${pageOnly} filters only narrow this page; the scripts run every shape in the op's suites.` : "");
     const steps = [
       ["1. Install the nightly wheel", "A clean Python 3.12 venv. torch pulls in its own Triton, which ships the same triton "
-        + "package, so remove it before installing fbtriton.",
+        + "package, so remove it before installing fbtriton. The nightly job benches the wheel CI's build.yml made for this "
+        + "commit; this nightly wheel is a separate build of the same commit, so numbers can differ slightly.",
         `uv venv --python 3.12 .venv-bench && source .venv-bench/bin/activate
 uv pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/${amd ? "rocm7.2" : "cu130"}
 uv pip uninstall triton pytorch-triton pytorch-triton-rocm
