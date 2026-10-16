@@ -237,8 +237,14 @@ def _tuned(space, shape=None):
     )(matmul_kernel_tma_ws_hopper_cooperative)
 
 
-def mm(a, b, *, out=None, space="full"):
-    """Compute ``a @ b`` with the Hopper cooperative persistent GEMM."""
+def mm(a, b, *, out=None, space="full", bitwise_equivalent=False):
+    """Compute ``a @ b`` with the Hopper cooperative persistent GEMM.
+
+    `bitwise_equivalent` is accepted for API uniformity; sm90 has no
+    K-splitting schedules (the kernel reduces K sequentially), so it is
+    otherwise ignored.
+    """
+    del bitwise_equivalent
     M, K = a.shape
     _, N = b.shape
 

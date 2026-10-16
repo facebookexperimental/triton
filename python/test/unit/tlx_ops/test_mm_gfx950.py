@@ -939,7 +939,7 @@ def test_mm_caches_public_catalog_lookup(monkeypatch):
         calls += 1
         assert op == "mm"
         assert device == a.device
-        return (lambda _a, _b, *, out, space: out), spec
+        return (lambda _a, _b, *, out, space, bitwise_equivalent=False: out), spec
 
     monkeypatch.setattr(tlx_ops, "impl_for", counting_impl_for)
     tlx_ops._mm_impl_for_device.cache_clear()
@@ -1954,3 +1954,95 @@ def test_mm_matches_aten_for_cancellation(n, k, pattern_period, segment_k):
     actual = matmul(a, b)
     expected = torch.matmul(a, b)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+_BITWISE_EQUIVALENT_SHAPES = [
+    (64, 1920, 1536, (1536, 1), (1920, 1), "bf16"),
+    (2048, 1024, 1000, (1000, 1), (1024, 1), "bf16"),
+    (512, 512, 48, (48, 1), (512, 1), "bf16"),
+    (7, 8192, 2048, (2048, 1), (8192, 1), "fp16"),
+    # TN persistent specialization: full-M run uses the persistent kernel.
+    (1024, 6144, 4096, (4096, 1), (1, 4096), "fp16"),
+    # Unaligned K keeps a sequential range fallback instead of raising.
+    (2048, 512, 1001, (1001, 1), (1, 1001), "bf16"),
+]
+
+
+@pytest.mark.parametrize("m,n,k,a_strides,b_strides,dtype_name", _BITWISE_EQUIVALENT_SHAPES)
+def test_mm_bitwise_equivalent(m, n, k, a_strides, b_strides, dtype_name):
+    """`bitwise_equivalent=True` gives exact M-slice equality (public `tlx.ops.mm`)."""
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = operand(m, k, a_strides, dtype)
+    b = operand(k, n, b_strides, dtype)
+    _assert_strides(a, a_strides)
+    _assert_strides(b, b_strides)
+
+    sub = max(m // 2, 1)
+    full = tlx_mm(a, b, space="heuristic", bitwise_equivalent=True)
+    rerun = tlx_mm(a[:sub], b, space="heuristic", bitwise_equivalent=True)
+    assert torch.equal(full[:sub], rerun), (f"mm({m}x{n}x{k}, {dtype}) with bitwise_equivalent=True is not "
+                                            f"batch invariant: rows differ between full-M and sliced runs")
+
+    expected = torch.matmul(a, b)
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(
+        full,
+        expected,
+        atol=tolerance * expected.abs().max().item(),
+        rtol=tolerance,
+    )
+
+
+def _assert_sequential_dispatch(dispatch):
+    """Reject every K-splitting plan `bitwise_equivalent` must prune."""
+    assert dispatch is not None
+    path, plan = dispatch
+    assert path not in ("local_split_u", "streamk", "ragged_n", "m192n256")
+    if path == "lds":
+        assert plan[2] == 1
+    if path == "inter_wave":
+        assert plan is not None and plan["SPLIT_K"] == 1
+    if path == "wave_grid":
+        assert _gfx950._wave_grid_is_sequential(plan)
+
+
+def test_heuristic_prunes_split_k():
+    """`bitwise_equivalent` prunes K-splitting plans from the dispatch (no launch)."""
+    # (7, 8192, 2048) fp16 selects a LocalSplitU plan by default.
+    default = _gfx950._dispatch_plan(7, 8192, 2048, torch.float16, 2)
+    assert default[0] == "local_split_u"
+    pruned = _gfx950._dispatch_plan(7, 8192, 2048, torch.float16, 2, bitwise_equivalent=True)
+    _assert_sequential_dispatch(pruned)
+    # (677, 4096, 8192) bf16 selects a split-K LDS plan by default.
+    default = _gfx950._dispatch_plan(677, 4096, 8192, torch.bfloat16, 2)
+    assert default == ("lds", (192, 256, 4))
+    pruned = _gfx950._dispatch_plan(677, 4096, 8192, torch.bfloat16, 2, bitwise_equivalent=True)
+    _assert_sequential_dispatch(pruned)
+    # Persistent shapes stay eligible: the kernel reduces K sequentially
+    # within one program per output tile.
+    pruned = _gfx950._dispatch_plan(1024, 6144, 4096, torch.float16, 2, bitwise_equivalent=True)
+    assert pruned == ("persistent", "mt224x128_k4096")
+
+
+def test_heuristic_unaligned_k_keeps_sequential_fallback():
+    """Unaligned K keeps a sequential range fallback under the flag (no launch)."""
+    strides_a, strides_b = (1001, 1), (1, 1001)
+    default = _gfx950.heuristic_config(2048, 512, 1001, torch.bfloat16, 2, strides_a, strides_b)
+    assert default[0] == "range_register"
+    pruned = _gfx950.heuristic_config(2048, 512, 1001, torch.bfloat16, 2, strides_a, strides_b,
+                                      bitwise_equivalent=True)
+    assert pruned == default
+
+
+def test_heuristic_split_k_inter_wave_promotion_stays_sequential(monkeypatch):
+    """A split-K inter-wave promotion stays sequential under the flag (no launch)."""
+    shape = (2048, 25408, 10240)
+    monkeypatch.setitem(_gfx950._BF16_INTER_WAVE_PROMOTIONS, shape, {"TILE": (256, 256), "SPLIT_K": 4})
+    _gfx950._dispatch_plan.cache_clear()
+    try:
+        pruned = _gfx950._dispatch_plan(*shape, torch.bfloat16, 2, bitwise_equivalent=True)
+    finally:
+        _gfx950._dispatch_plan.cache_clear()
+    _assert_sequential_dispatch(pruned)

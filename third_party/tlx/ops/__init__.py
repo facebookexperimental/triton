@@ -69,7 +69,7 @@ def _mm_impl_for_device(device):
     return impl_for("mm", device=device)
 
 
-def mm(a, b, *, out=None, space=None):
+def mm(a, b, *, out=None, space=None, bitwise_equivalent=False):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
 
     This op is currently forward-only.
@@ -78,6 +78,12 @@ def mm(a, b, *, out=None, space=None):
     a single analytically chosen config so the first call stays interactive.
     Pass `space="full"` to implementations that expose a full autotune space;
     unsupported spaces raise `InvalidInput`. See the module docstring.
+
+    `bitwise_equivalent` prunes K-splitting schedules (split-K, Stream-K,
+    LocalSplitU) on all hardware, so every output row is computed by one
+    program with a sequential K reduction and rows are bit-identical across
+    batch sizes. Standard GEMM autotuning and dispatch are otherwise
+    unchanged. Defaults to False, which preserves current dispatch.
     """
     if a.ndim != 2 or b.ndim != 2:
         raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
@@ -102,8 +108,8 @@ def mm(a, b, *, out=None, space=None):
     if space is None:
         space = spec.default_space
     if out is None:
-        return fn(a, b, space=space)
-    return fn(a, b, out=out, space=space)
+        return fn(a, b, space=space, bitwise_equivalent=bitwise_equivalent)
+    return fn(a, b, out=out, space=space, bitwise_equivalent=bitwise_equivalent)
 
 
 def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):

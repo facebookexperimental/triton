@@ -9,7 +9,7 @@ from triton.tlx.ops import InvalidInput
 from triton.tlx.ops.kernels.mm import sm90
 from triton.tlx.ops.kernels.mm._shapes import SM90_FOCUS, SYNTHETIC
 
-from mm_test_utils import REL_PRECISION, run_mm_case
+from mm_test_utils import REL_PRECISION, run_mm_bitwise_equivalent_case, run_mm_case
 
 pytestmark = pytest.mark.skipif(not is_hopper(), reason="Requires sm90")
 
@@ -136,3 +136,15 @@ def test_cooperative_config(block_m, block_n, num_stages):
         actual = tlx_mm(a, b, space="full")
 
     _assert_close(actual, torch.matmul(a, b))
+
+
+_BITWISE_EQUIVALENT_SHAPES = [
+    (1024, 1024, 1024, (1024, 1), (1024, 1), "bf16"),
+    (512, 2048, 512, (512, 1), (2048, 1), "bf16"),
+]
+
+
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _BITWISE_EQUIVALENT_SHAPES)
+def test_mm_bitwise_equivalent(M, N, K, a_strides, b_strides, dtype_name):
+    """`bitwise_equivalent=True` is accepted and gives exact M-slice equality."""
+    run_mm_bitwise_equivalent_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)

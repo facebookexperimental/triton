@@ -26,7 +26,7 @@ from triton._internal_testing import is_blackwell
 from triton.tlx.ops.kernels.mm import sm100
 from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
 
-from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case
+from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_bitwise_equivalent_case, run_mm_case
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires sm100")
 
@@ -193,7 +193,7 @@ def _pinned_config(overrides):
     """Force ``space="heuristic"`` to compile exactly one config."""
     original = sm100.heuristic_config
 
-    def one_config(M, N, K):
+    def one_config(M, N, K, *, bitwise_equivalent=False):
         cfg = sm100.get_heuristic_config(M, N, K, sm100._get_num_sms())
         assert cfg is not None, f"no heuristic config for {M}x{N}x{K}"
         cfg = dict(cfg)
@@ -275,3 +275,30 @@ def test_mm_rejects_unsupported_backward():
     with torch.no_grad():
         out = tlx_mm(a, b)
     assert not out.requires_grad
+
+
+_BITWISE_EQUIVALENT_SHAPES = [
+    # Undersaturated: the default heuristic selects split-K here.
+    (1024, 256, 16384, (16384, 1), (256, 1), "bf16"),
+    (2048, 2048, 2048, (2048, 1), (2048, 1), "bf16"),
+]
+
+
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _BITWISE_EQUIVALENT_SHAPES)
+def test_mm_bitwise_equivalent(M, N, K, a_strides, b_strides, dtype_name):
+    """`bitwise_equivalent=True` gives exact M-slice equality."""
+    run_mm_bitwise_equivalent_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)
+
+
+def test_heuristic_prunes_split_k():
+    """`bitwise_equivalent` prunes split-K from the heuristic config (no launch)."""
+    default = sm100.get_heuristic_config(1024, 256, 16384, num_sms=148)
+    assert default["SPLIT_K"] > 1
+    pruned = sm100.get_heuristic_config(1024, 256, 16384, num_sms=148, bitwise_equivalent=True)
+    assert pruned["SPLIT_K"] == 1
+
+
+def test_sequential_configs_filter():
+    """The full-space split-K filter keeps sequential configs only (no launch)."""
+    cfgs = [triton.Config({"SPLIT_K": sk}, num_warps=4) for sk in (1, 2, 4)]
+    assert [c.kwargs["SPLIT_K"] for c in sm100._sequential_configs(cfgs)] == [1]
