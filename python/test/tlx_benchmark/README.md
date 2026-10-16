@@ -143,12 +143,14 @@ ok: everything else
 ## How a call is timed
 
 `gpu_events` is the default and the kernel-performance verdict metric.
-Each batch is queued behind a GPU gate. Before synchronizing, the harness
-checks that the first timing event has not completed, proving that the entire
-batch was submitted before its timed work began. If the gate expired during
-enqueue, the batch is discarded and retried with four times the gate duration.
-After four failed attempts the case reports an error; invalid timing samples
-never produce a performance verdict.
+The samples are taken in batches of up to 100 calls, each queued behind a GPU
+gate. Batches stay small because the host can only run so far ahead of a
+blocked stream: CUDA stops accepting work at about 1024 pending operations.
+Before synchronizing, the harness checks that the batch's first timing event
+has not completed, proving that the entire batch was submitted before its timed
+work began. If it has, the batch is discarded and retried at half the size with
+four times the gate duration. After four failed attempts in a row the case
+reports an error; invalid timing samples never produce a performance verdict.
 
 Both TLX and the reference clear the same benchmark cache before every timed
 call. Timing includes all device work in the operation, including multiple

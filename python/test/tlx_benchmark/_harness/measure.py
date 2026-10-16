@@ -237,19 +237,29 @@ _GATE_CYCLES = 20_000_000
 _GATE_GROWTH = 4
 _GATE_MAX_ATTEMPTS = 4
 
+#: Iterations per gated batch. The host can only run so far ahead of a blocked
+#: stream: CUDA stops accepting work at about 1024 pending operations, and a
+#: one-kernel iteration queues four (cache clear, two events, the kernel). On a
+#: B200, 250 iterations fit and 300 did not. A batch that still overflows, such
+#: as a multi-kernel backward, is halved on retry.
+_GATE_BATCH = 100
+
 
 def _gpu_event_samples(fn: Callable, iters: int, grad_to_none: Optional[Iterable] = None) -> list[float]:
-    """Per-iteration ms, with timed GPU work held off until the batch is queued."""
+    """Per-iteration ms, with timed GPU work held off until each batch is queued."""
     import torch
 
     di = triton.runtime.driver.active.get_device_interface()
     cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
+    samples: list[float] = []
+    batch, failures = min(iters, _GATE_BATCH), 0
     di.synchronize()
-    for attempt in range(_GATE_MAX_ATTEMPTS):
-        starts = [di.Event(enable_timing=True) for _ in range(iters)]
-        ends = [di.Event(enable_timing=True) for _ in range(iters)]
-        torch.cuda._sleep(_GATE_CYCLES * _GATE_GROWTH**attempt)
-        for i in range(iters):
+    while len(samples) < iters:
+        n = min(batch, iters - len(samples))
+        starts = [di.Event(enable_timing=True) for _ in range(n)]
+        ends = [di.Event(enable_timing=True) for _ in range(n)]
+        torch.cuda._sleep(_GATE_CYCLES * _GATE_GROWTH**failures)
+        for i in range(n):
             if grad_to_none is not None:
                 for x in grad_to_none:
                     x.grad = None
@@ -262,8 +272,16 @@ def _gpu_event_samples(fn: Callable, iters: int, grad_to_none: Optional[Iterable
         fully_queued = not starts[0].query()
         di.synchronize()
         if fully_queued:
-            return [s.elapsed_time(e) for s, e in zip(starts, ends)]
-    raise RuntimeError("GPU timing batch started before complete host enqueue; no valid samples")
+            samples += [s.elapsed_time(e) for s, e in zip(starts, ends)]
+            failures = 0
+            continue
+        failures += 1
+        if failures == _GATE_MAX_ATTEMPTS:
+            raise RuntimeError("GPU timing batch started before complete host enqueue; no valid samples")
+        # The gate drained before a slow host finished, or the batch overflowed
+        # the launch queue. The event cannot tell which, so address both.
+        batch = max(1, batch // 2)
+    return samples
 
 
 def measure(fn: Callable, *, flop_count: Optional[float] = None, warmup: Optional[int] = None,

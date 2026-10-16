@@ -1320,14 +1320,83 @@ def _fake_gpu_queue(monkeypatch, query_results):
 
 
 def test_gpu_events_retries_started_batches_and_discards_their_samples(monkeypatch):
-    timing, calls = _fake_gpu_queue(monkeypatch, [True, False])
+    timing, calls = _fake_gpu_queue(monkeypatch, [True, False, False])
     samples = timing._gpu_event_samples(lambda: calls.append("launch"), 2)
-    assert samples == [1.0, 1.0]  # only the second attempt's events are timed
+    assert samples == [1.0, 2.0]  # the started batch is discarded; the retry runs halved batches
     gates = [call for call in calls if isinstance(call, int)]
-    assert gates == [timing._GATE_CYCLES, timing._GATE_CYCLES * timing._GATE_GROWTH]
+    # The gate grows for the retry and resets once a batch queues cleanly.
+    assert gates == [timing._GATE_CYCLES, timing._GATE_CYCLES * timing._GATE_GROWTH, timing._GATE_CYCLES]
     assert calls.count("clear") == calls.count("launch") == 4
     assert calls.index("query") < calls.index("sync", 1)
     assert calls.count("elapsed") == 2
+
+
+def _fake_launch_queue(monkeypatch, capacity):
+    """A device whose host blocks once `capacity` operations are pending.
+
+    That is how a CUDA stream behaves behind the gate: past the launch-queue
+    depth the host waits for the GPU, so the gate drains before the batch is
+    fully queued and the first timed event has already started.
+    """
+    import types
+    import torch
+    import importlib
+
+    timing = importlib.import_module("_harness.measure")
+    pending = [0]
+    batches = []
+
+    def enqueue():
+        pending[0] += 1
+
+    class Event:
+
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self):
+            enqueue()
+
+        def query(self):
+            return pending[0] > capacity
+
+        def elapsed_time(self, end):
+            return 1.0
+
+    def sleep(cycles):
+        batches.append(cycles)
+        enqueue()
+
+    def synchronize():
+        pending[0] = 0
+
+    active = types.SimpleNamespace(
+        get_device_interface=lambda: types.SimpleNamespace(Event=Event, synchronize=synchronize),
+        get_empty_cache_for_benchmark=lambda: "cache",
+        clear_cache=lambda cache: enqueue(),
+    )
+    monkeypatch.setattr(triton.runtime.driver, "_active", active)
+    monkeypatch.setattr(torch.cuda, "_sleep", sleep)
+    return timing, enqueue, batches
+
+
+def test_gpu_events_sample_quota_survives_a_bounded_launch_queue(monkeypatch):
+    # One kernel per call: clear + start + kernel + end is four entries per
+    # iteration, so a single 500-iteration batch needs 2000 against a
+    # 1024-deep queue. Measured on B200: 250 iterations queue, 300 do not.
+    timing, launch, _ = _fake_launch_queue(monkeypatch, capacity=1024)
+    assert len(timing._gpu_event_samples(launch, 500)) == 500
+
+
+def test_gpu_events_shrinks_batches_for_calls_that_launch_many_kernels(monkeypatch):
+    timing, launch, batches = _fake_launch_queue(monkeypatch, capacity=1024)
+
+    def backward():  # a multi-kernel call, like an attention backward
+        for _ in range(20):
+            launch()
+
+    assert len(timing._gpu_event_samples(backward, 500)) == 500
+    assert len(batches) > 500 // timing._GATE_BATCH  # some batches were split
 
 
 def test_gpu_events_fails_without_a_fully_queued_batch(monkeypatch):
