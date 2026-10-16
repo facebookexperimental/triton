@@ -1,4 +1,9 @@
 // RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s --check-prefix=COORD
+
+// The partition-1 A load shifts only its M coordinate, not the shared %c0_i32 K coordinate.
+// COORD: tt.descriptor_load %{{.*}}[%c0_i32, %c0_i32] {{.*}} : !tt.tensordesc<64x64xf16>
+// COORD: tt.descriptor_load %{{.*}}[%c64_i32, %c0_i32] {{.*}} : !tt.tensordesc<64x64xf16>
 
 // Regression test for B-14-F1 / T273489733.
 // Data partitioning is driven by dots with multiple consumer task ids. An

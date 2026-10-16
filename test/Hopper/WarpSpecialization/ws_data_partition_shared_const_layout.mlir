@@ -1,4 +1,11 @@
 // RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=1 | FileCheck %s --check-prefix=COORD
+
+// Both indices use the same SSA value; partition 1 shifts only the M index.
+// COORD: tt.descriptor_load %{{.*}}[%[[K:[0-9]+]], %[[K]]] : !tt.tensordesc<128x64xbf16
+// COORD: tt.descriptor_load %{{.*}}[%[[KS:[0-9]+]], %[[K]]] : !tt.tensordesc<128x64xbf16
+// COORD: tt.descriptor_store %{{.*}}[%[[K]], %[[K]]]
+// COORD: tt.descriptor_store %{{.*}}[%[[KS2:[0-9]+]], %[[K]]]
 
 // Regression test distilled from a persistent gate_mm_sigmoid2x kernel
 // (P2418648199) with tt.data_partition_factor = 2 (M: 256 -> 128).

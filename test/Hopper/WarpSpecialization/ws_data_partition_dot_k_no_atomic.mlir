@@ -1,8 +1,13 @@
 // RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s --check-prefix=COORD
 // Regression test for B-14-F3 / T273489833.
 // If partitioning a dot result through another dot's K operand is not backed
 // by an atomic store/reduce, the pass should reject that trial direction
 // deterministically and choose the legal N-dimension direction here.
+
+// The partition-1 B load shifts only its N coordinate, not the shared %c0_i32 K coordinate.
+// COORD: tt.descriptor_load %{{.*}}[%c0_i32, %c0_i32] {{.*}} : !tt.tensordesc<64x128xf16>
+// COORD: tt.descriptor_load %{{.*}}[%c0_i32, %c128_i32] {{.*}} : !tt.tensordesc<64x128xf16>
 
 // CHECK-LABEL: @dot_k_operand_without_atomic_store
 // Each partition's whole chain (both dots plus its store) is emitted before the
