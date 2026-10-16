@@ -35,6 +35,25 @@ ARCH = "sm100"
 _LONG_K_BF16_SKIP_REASON = "Long-K BF16 output currently exceeds the numerical tolerance"
 
 
+def test_mm_default_space_is_full(monkeypatch):
+    """`space=None` on sm100 dispatches to the tuned space, not the heuristic."""
+    import triton.tlx.ops as tlx_ops
+    from triton.tlx.ops._catalog import impl_for
+
+    _, spec = impl_for("mm", ARCH)
+    seen = {}
+
+    def record(a, b, *, out=None, space):
+        seen["space"] = space
+        return torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=a.dtype)
+
+    monkeypatch.setattr(tlx_ops, "_mm_impl_for_device", lambda device: (record, spec))
+    a = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    tlx_ops.mm(a, b)
+    assert seen["space"] == "full"
+
+
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", CORRECTNESS_SHAPES)
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     if (M, N, K, a_strides, b_strides, dtype_name) == (384, 384, 19459, (1, 384), (384, 1), "bf16"):

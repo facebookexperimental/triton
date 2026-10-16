@@ -360,7 +360,7 @@ void createGen5MMA(ConversionPatternRewriter &rewriter, Location loc,
                    ttng::TCGen5MMAOp op, MemDescOperand a, Value b,
                    MemDescOperand d, Value pred, Value instDescriptor,
                    Value useInitAcc, bool aInTMem, bool twoCTAs,
-                   std::string collectorB) {
+                   std::string collector) {
   PTXBuilder ptxBuilder;
   std::string opcode =
       "tcgen05.mma.cta_group::" + std::to_string(twoCTAs ? 2 : 1) + ".kind::";
@@ -378,7 +378,7 @@ void createGen5MMA(ConversionPatternRewriter &rewriter, Location loc,
   } else {
     assert(0 && "Unsupported type.");
   }
-  opcode += collectorB;
+  opcode += collector;
   auto *accOp = ptxBuilder.newAddrOperand(d.base, "r", *d.offset);
   assert(a.offset.has_value() == aInTMem);
   auto *aOp = aInTMem ? ptxBuilder.newAddrOperand(a.base, "r", *a.offset)
@@ -772,9 +772,16 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
     Value instDescriptor =
         createInstDescriptor(rewriter, op, mmaSizeM, mmaSizeN, desc.transA,
                              desc.transB, dot.mmaSizeK);
-    auto collectorB = getCollectorBModifer(reuseB);
+    std::string collector = getCollectorBModifer(reuseB);
+    if (auto usage = op->getAttrOfType<StringAttr>(ttng::kCollectorAAttrName)) {
+      // The reuse pass only tags ops that lower to one instruction; an A
+      // collector hint on any other shape would pair the wrong A slices.
+      assert(desc.repShape.numRepM == 1 && desc.repShape.numRepN == 1 &&
+             desc.repShape.numRepK == 1 && !desc.aInTmem && collector.empty());
+      collector = (".collector::a::" + usage.getValue()).str();
+    }
     createGen5MMA(rewriter, loc, op, a, b, accAddress, pred, instDescriptor,
-                  useInitAcc, desc.aInTmem, twoCTAs, collectorB);
+                  useInitAcc, desc.aInTmem, twoCTAs, collector);
   };
 
   return convertDotImpl(
