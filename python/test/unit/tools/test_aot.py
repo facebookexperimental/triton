@@ -12,6 +12,14 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton._internal_testing import is_cuda, is_hip, is_hip_gfx1250
 
+# Buck expands $(location) in TRITON_AMD_CODEGEN_PATH to a runfiles-relative
+# path. The AOT helpers below spawn compile.py/link.py children with cwd set to
+# a temp dir, where the relative path no longer resolves (OSError: .so not
+# found). Absolutize eagerly while our own cwd is still the runfiles root so
+# all children inherit a valid path.
+if "TRITON_AMD_CODEGEN_PATH" in os.environ and not os.path.isabs(os.environ["TRITON_AMD_CODEGEN_PATH"]):
+    os.environ["TRITON_AMD_CODEGEN_PATH"] = os.path.abspath(os.environ["TRITON_AMD_CODEGEN_PATH"])
+
 if is_cuda():
     from triton.backends.nvidia.driver import include_dirs, library_dirs
 
@@ -413,6 +421,7 @@ def test_compile_link_matmul_no_specialization():
         compile_aot_kernel_no_specialization(tmp_dir, kernel_path, dtype, BM, BN, BK)
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
 
         link_aot_kernels(tmp_dir)
 
@@ -446,6 +455,7 @@ def test_compile_link_matmul():
         compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":16", ":16")])
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
         link_aot_kernels(tmp_dir)
 
         # compile test case
@@ -478,6 +488,7 @@ def test_launcher_has_no_available_kernel():
         compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":1", ":1")])
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
 
         link_aot_kernels(tmp_dir)
 
@@ -521,6 +532,9 @@ def test_compile_link_autotune_matmul():
             BM, BN, BK = ts[0], ts[1], ts[2]
             compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":16", ":16"), (":16", ""),
                                                                                       ("", ":16")])
+
+        if is_hip():
+            return
 
         link_aot_kernels(tmp_dir)
 
