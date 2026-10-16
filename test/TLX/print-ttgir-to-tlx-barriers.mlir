@@ -176,13 +176,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
 
   // CHECK-LABEL: def multicast_arrive(
-  // CHECK: # unsupported: multicast arrive_barrier (ctaMask=1)
+  // CHECK: # unsupported: multicast arrive_barrier (multicastCTA=1)
   // CHECK-NOT: tlx.barrier_arrive(
   tt.func public @multicast_arrive() attributes {noinline = false} {
     %bar = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
     ttng.init_barrier %bar, 1 : !ttg.memdesc<2xi64, #shared, #smem, mutable>
     // expected-error @+1 {{multicast arrive_barrier does not round-trip to TLX}}
-    ttng.arrive_barrier %bar, 1 {ctaMask = 1 : i32} : !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 1 {multicastCTA = 1 : i32} : !ttg.memdesc<2xi64, #shared, #smem, mutable>
     tt.return
   }
 }

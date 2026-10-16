@@ -182,6 +182,7 @@ class HIPUtils(object):
         self.unload_module = mod.unload_module
         self.get_device_properties = mod.get_device_properties
         self.create_tdm_descriptor = mod.create_tdm_descriptor
+        self._TritonDispatcher = mod._TritonDispatcher
         self.launch = mod.launch
         self.build_signature_metadata = mod.build_signature_metadata
         global PyTDMDescriptor

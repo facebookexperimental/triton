@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-promote-mbarrier-to-named-barrier | FileCheck %s
+// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-promote-mbarrier-to-named-barrier='report-likely-barrier-perf-locations=true' --verify-diagnostics > /dev/null
 
 #barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -1553,7 +1554,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
   // CHECK-LABEL: @reject_multicast
   // CHECK: ttng.init_barrier
   // CHECK: partition0
-  // CHECK: ttng.arrive_barrier {{.*}} {ctaMask = 1 : i32}
+  // CHECK: ttng.arrive_barrier {{.*}} {multicastCTA = 1 : i32}
   // CHECK: partition1
   // CHECK: ttng.wait_barrier {{.*}} :
   // CHECK-NOT: ttng.wait_barrier_named
@@ -1568,7 +1569,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
       ttg.warp_yield
     }
     partition0(%arg0: !ttg.memdesc<2xi64, #barrier, #smem, mutable>) num_warps(1) {
-      ttng.arrive_barrier %arg0, 1 {ctaMask = 1 : i32} : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
+      ttng.arrive_barrier %arg0, 1 {multicastCTA = 1 : i32} : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
       ttg.warp_return
     }
     partition1(%arg0: !ttg.memdesc<2xi64, #barrier, #smem, mutable>) num_warps(1) {
@@ -3138,6 +3139,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
       }
       ttg.warp_return
     } : (!ttg.memdesc<1xi64, #barrier, #smem, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {triton.skip_generic_pipeline, tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @report_tlx_looped_barriers
+  // CHECK: ttng.wait_barrier
+  // CHECK: ttng.wait_barrier_named
+  tt.func public @report_tlx_looped_barriers() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %mem = ttg.local_alloc : () -> !ttg.memdesc<1xf32, #barrier, #smem, mutable>
+    %phase = arith.constant 0 : i32
+    %id = arith.constant 9 : i32
+    %count = arith.constant 128 : i32
+    %named = ttng.user_named_barrier_id %id : i32
+    %lb = arith.constant 0 : index
+    %ub = arith.constant 4 : index
+    %step = arith.constant 1 : index
+    scf.for %i = %lb to %ub step %step {
+      // expected-remark@+1 {{likely barrier perf location: looped mbarrier wait (loop depth 1); phase observation may also order async memory completion; profile before changing it; explicit memory dependencies present}}
+      ttng.wait_barrier %bar, %phase deps %mem : !ttg.memdesc<1xi64, #barrier, #smem, mutable>, !ttg.memdesc<1xf32, #barrier, #smem, mutable>
+      // expected-remark@+1 {{likely barrier perf location: looped named-barrier wait (loop depth 1); participating warps rendezvous here; profile before changing it}}
+      ttng.wait_barrier_named %named, %count : !ttng.named_barrier_id, i32
+    }
     tt.return
   }
 }

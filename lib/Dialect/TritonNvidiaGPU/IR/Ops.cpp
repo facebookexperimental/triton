@@ -593,11 +593,46 @@ LogicalResult ClusterBarrierOp::verify() {
 
 TypedValue<MemDescType> InvalBarrierOp::getBarrier() { return getAlloc(); }
 
+static LogicalResult verifyBarrierFromCTA(Operation *op, Value barrier,
+                                          std::optional<uint32_t> fromCTA) {
+  if (!fromCTA)
+    return success();
+
+  auto barrierTy = cast<MemDescType>(barrier.getType());
+  uint32_t numCTAs = gpu::lookupNumCTAs(op);
+  if (*fromCTA >= numCTAs)
+    return op->emitOpError("fromCTA must be in the range [0, num_ctas - 1]");
+
+  auto expectedCGALayout =
+      CGAEncodingAttr::get1DLayout(op->getContext(), numCTAs);
+  if (barrierTy.getRank() != 1 || barrierTy.getNumElements() != numCTAs ||
+      getCGALayout(barrierTy.getEncoding()) != expectedCGALayout)
+    return op->emitOpError("fromCTA requires a 1D barrier with one element "
+                           "per CTA and canonical CGA layout");
+  return success();
+}
+
+template <typename BarrierOp>
+static LogicalResult canonicalizeBarrierFromCTA(BarrierOp op,
+                                                PatternRewriter &rewriter) {
+  if (op.getFromCTA() != gpu::lookupNumCTAs(op) - 1)
+    return failure();
+  rewriter.modifyOpInPlace(op, [&] { op.setFromCTAAttr(IntegerAttr()); });
+  return success();
+}
+
 // -- BarrierExpectOp --
 LogicalResult BarrierExpectOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
     return failure();
+  if (failed(verifyBarrierFromCTA(*this, getAlloc(), getFromCTA())))
+    return failure();
   return success();
+}
+
+LogicalResult BarrierExpectOp::canonicalize(BarrierExpectOp op,
+                                            PatternRewriter &rewriter) {
+  return canonicalizeBarrierFromCTA(op, rewriter);
 }
 
 Value BarrierExpectOp::getPredicateOperand() { return getPred(); }
@@ -653,12 +688,12 @@ LogicalResult ArriveBarrierOp::verify() {
     if (!llvm::isPowerOf2_32(physicalNumCTAs))
       return emitOpError(
           "multicast arrive requires a power-of-two physical cluster size");
-    uint32_t ctaMask = getCtaMask();
+    uint32_t multicastCTA = getMulticastCTA();
     for (int ctaRank = 0; ctaRank < physicalNumCTAs; ++ctaRank) {
-      if ((static_cast<uint32_t>(ctaRank) | ctaMask) >=
+      if ((static_cast<uint32_t>(ctaRank) | multicastCTA) >=
           static_cast<uint32_t>(physicalNumCTAs))
         return emitOpError(
-            "ctaMask selects a CTA outside the physical cluster");
+            "multicastCTA selects a CTA outside the physical cluster");
     }
     // Logical multi-CTA programs distribute a barrier across their CTAs.
     // ctas_per_cga instead runs one program per CTA, so each barrier stays
@@ -670,7 +705,17 @@ LogicalResult ArriveBarrierOp::verify() {
                                       "multicast barrier")))
       return failure();
   }
+  if (failed(verifyBarrierFromCTA(*this, getAlloc(), getFromCTA())))
+    return failure();
+  if (isMulticast() && getFromCTA() &&
+      *getFromCTA() != gpu::lookupNumCTAs(getOperation()) - 1)
+    return emitOpError("fromCTA cannot be combined with multicast arrive");
   return success();
+}
+
+LogicalResult ArriveBarrierOp::canonicalize(ArriveBarrierOp op,
+                                            PatternRewriter &rewriter) {
+  return canonicalizeBarrierFromCTA(op, rewriter);
 }
 
 Value ArriveBarrierOp::getPredicateOperand() { return getPred(); }
@@ -1948,8 +1993,13 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
   // getTmemLoadLayoutSplitLongM layouts. Fall back to checking if the current
   // layout matches any of the compatible layouts enumerated by
   // getTmemCompatibleLayouts.
-  SmallVector<DistributedEncodingTrait> layouts =
-      getTmemCompatibleLayouts(op, type, memdesc);
+  SmallVector<DistributedEncodingTrait> layouts;
+  // Compatible layouts only exist for a power-of-two warp count >= 4;
+  // with anything else there is nothing to enumerate, so go straight to
+  // the error below instead of crashing.
+  if (int numWarps = lookupNumWarps(op);
+      numWarps >= 4 && llvm::isPowerOf2_32(numWarps))
+    layouts = getTmemCompatibleLayouts(op, type, memdesc);
   auto encoding =
       dyn_cast<triton::gpu::LayoutEncodingTrait>(type.getEncoding());
   if (encoding) {

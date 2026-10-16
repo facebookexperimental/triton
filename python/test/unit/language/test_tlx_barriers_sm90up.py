@@ -615,7 +615,7 @@ def test_barrier_arrive_cta_mask_lowers_on_sm103up(capability, ptx_target):
     compiled = _compile_cta_mask_barrier(capability)
     assert '"ttg.num-ctas" = 1 : i32' in compiled["ttgir"]
     assert '"ttg.cluster-dim-x" = 2 : i32' in compiled["ttgir"]
-    assert "ctaMask = 1" in compiled["ttgir"]
+    assert "multicastCTA = 1" in compiled["ttgir"]
     assert ".version 9.4" in compiled["ptx"]
     assert f".target {ptx_target}" in compiled["ptx"]
     if capability == 107:

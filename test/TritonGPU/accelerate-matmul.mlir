@@ -966,6 +966,39 @@ module attributes {"ttg.target" = "cuda:120", "ttg.num-ctas" = 1 : i32, "ttg.num
 
 // -----
 
+// Verify that for SM_120, FP4xFP4 with int8 block-16 (UE5M3) scales falls
+// back to decomposition: the sm120 native backend would encode them as
+// UE8M0/2X and read them wrong.
+#blocked4 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#blocked4_k = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [0, 1]}>
+
+module attributes {"ttg.target" = "cuda:120", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @sm120_dot_scaled_ue5m3_fallback
+  // CHECK-NOT: tt.dot_scaled
+  // CHECK: ttg.fp4_to_fp
+  // CHECK: arith.shrui
+  // CHECK: arith.andi
+  // CHECK: arith.truncf
+  // CHECK: tt.dot
+  // CHECK-NOT: tt.dot_scaled
+  // CHECK: tt.return
+  tt.func public @sm120_dot_scaled_ue5m3_fallback(
+    %a: tensor<128x32xi8, #blocked4_k>,
+    %scale_a: tensor<128x4xi8, #blocked4>,
+    %b: tensor<32x128xi8, #blocked4>,
+    %scale_b: tensor<128x4xi8, #blocked4>
+  ) -> tensor<128x128xf32, #blocked4> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked4>
+    %d = tt.dot_scaled %a scale %scale_a, %b scale %scale_b, %cst lhs = e2m1 rhs = e2m1 {fastMath = false}
+      : tensor<128x32xi8, #blocked4_k>, tensor<128x4xi8, #blocked4>
+        * tensor<32x128xi8, #blocked4>, tensor<128x4xi8, #blocked4>
+        -> tensor<128x128xf32, #blocked4>
+    tt.return %d : tensor<128x128xf32, #blocked4>
+  }
+}
+
+// -----
+
 // Verify that for SM_100 (Blackwell), tt.dot_scaled uses the specialized
 // MMAv5 path with tensor memory and tc_gen5_mma_scaled instruction.
 
@@ -1292,6 +1325,66 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     // expected-warning @+1 {{two_ctas=True is not supported when only the rhs is scaled, because the dot is transposed here. Falling back to 1-CTA scaled MMA.}}
     %d = tt.dot_scaled %a, %b scale %scale_b, %cst lhs = bf16 rhs = e2m1 {fastMath = false, two_ctas} : tensor<128x64xbf16, #blocked2> * tensor<32x128xi8, #blocked>, tensor<128x2xi8, #blocked1> -> tensor<128x128xf32, #blocked>
     // CHECK-NOT: two_ctas
+    tt.return %d : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// UE5M3 (int8 block-16) scales have no native MMAv5 lowering below Rubin:
+// on any non-107 target the op must decompose (plain tc_gen5_mma) instead of
+// selecting tc_gen5_mma_scaled, whose idesc scaleType=2 traps.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sm100_ue5m3_decomposes
+  // CHECK-NOT: tt.dot_scaled
+  // CHECK: ttg.fp4_to_fp
+  // CHECK: arith.shrui
+  // CHECK: arith.andi
+  // CHECK: arith.truncf
+  // CHECK-NOT: ttng.tc_gen5_mma_scaled
+  // CHECK: ttng.tc_gen5_mma
+  // CHECK-NOT: tt.dot_scaled
+  // CHECK: tt.return
+  tt.func public @sm100_ue5m3_decomposes(%a: tensor<128x64xi8, #blocked2>, %scale_a: tensor<128x8xi8, #blocked1>, %b: tensor<64x128xi8, #blocked>, %scale_b: tensor<128x8xi8, #blocked1>) -> tensor<128x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %d = tt.dot_scaled %a scale %scale_a, %b scale %scale_b, %cst lhs = e2m1 rhs = e2m1 {fastMath = false, lhs_k_pack = true, rhs_k_pack = true} : tensor<128x64xi8, #blocked2>, tensor<128x8xi8, #blocked1> * tensor<64x128xi8, #blocked>, tensor<128x8xi8, #blocked1> -> tensor<128x128xf32, #blocked>
+    tt.return %d : tensor<128x128xf32, #blocked>
+  }
+  // MN-packed B (rhs_k_pack = false) takes the same UE5M3 decode.
+  // CHECK-LABEL: sm100_ue5m3_mn_packed_decodes
+  // CHECK: arith.extui {{.*}} to tensor<8x128xi32
+  // CHECK: arith.shli {{.*}} : tensor<8x128xi32
+  // CHECK: tt.bitcast {{.*}} : tensor<8x128xi32, {{.*}}> -> tensor<8x128xf32
+  tt.func public @sm100_ue5m3_mn_packed_decodes(%a: tensor<128x64xi8, #blocked2>, %scale_a: tensor<128x8xi8, #blocked1>, %b: tensor<128x64xi8, #blocked2>, %scale_b: tensor<128x8xi8, #blocked1>) -> tensor<128x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %d = tt.dot_scaled %a scale %scale_a, %b scale %scale_b, %cst lhs = e2m1 rhs = e2m1 {fastMath = false, lhs_k_pack = true, rhs_k_pack = false} : tensor<128x64xi8, #blocked2>, tensor<128x8xi8, #blocked1> * tensor<128x64xi8, #blocked2>, tensor<128x8xi8, #blocked1> -> tensor<128x128xf32, #blocked>
+    tt.return %d : tensor<128x128xf32, #blocked>
+  }
+  // CHECK-LABEL: sm100_ue5m3_mn_packed_a_decodes
+  // CHECK: arith.extui {{.*}} to tensor<128x8xi32
+  // CHECK: arith.shli {{.*}} : tensor<128x8xi32
+  // CHECK: tt.bitcast {{.*}} : tensor<128x8xi32, {{.*}}> -> tensor<128x8xf32
+  tt.func public @sm100_ue5m3_mn_packed_a_decodes(%a: tensor<64x128xi8, #blocked2>, %scale_a: tensor<128x8xi8, #blocked1>, %b: tensor<64x128xi8, #blocked>, %scale_b: tensor<128x8xi8, #blocked1>, %c: tensor<128x128xf32, #blocked>) -> tensor<128x128xf32, #blocked> {
+    %d = tt.dot_scaled %a scale %scale_a, %b scale %scale_b, %c lhs = e2m1 rhs = e2m1 {fastMath = false, lhs_k_pack = false, rhs_k_pack = true} : tensor<64x128xi8, #blocked2>, tensor<128x8xi8, #blocked1> * tensor<64x128xi8, #blocked>, tensor<128x8xi8, #blocked1> -> tensor<128x128xf32, #blocked>
+    tt.return %d : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// On sm107 (Rubin) the same op stays native.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:107", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sm107_ue5m3_stays_native
+  // CHECK: ttng.tc_gen5_mma_scaled
+  tt.func public @sm107_ue5m3_stays_native(%a: tensor<128x64xi8, #blocked2>, %scale_a: tensor<128x8xi8, #blocked1>, %b: tensor<64x128xi8, #blocked>, %scale_b: tensor<128x8xi8, #blocked1>) -> tensor<128x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %d = tt.dot_scaled %a scale %scale_a, %b scale %scale_b, %cst lhs = e2m1 rhs = e2m1 {fastMath = false, lhs_k_pack = true, rhs_k_pack = true} : tensor<128x64xi8, #blocked2>, tensor<128x8xi8, #blocked1> * tensor<64x128xi8, #blocked>, tensor<128x8xi8, #blocked1> -> tensor<128x128xf32, #blocked>
     tt.return %d : tensor<128x128xf32, #blocked>
   }
 }

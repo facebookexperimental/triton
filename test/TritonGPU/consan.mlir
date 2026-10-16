@@ -82,8 +82,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
     // CHECK: %[[TWO_SHIFT:.*]] = arith.shli %[[TWO_PATTERN]], {{.*}} : i32
     // CHECK: %[[TWO_RECIPIENTS:.*]] = arith.ori {{.*}}, %[[TWO_SHIFT]] : i32
     // CHECK: tt.call @__triton_consan_verify_and_update_barrier_state{{.*}}({{.*}}%[[TWO_RECIPIENTS]])
-    // CHECK: ttng.arrive_barrier {{.*}}ctaMask = 1 : i32
-    ttng.arrive_barrier %bar, 1 {ctaMask = 1 : i32} : !ttg.memdesc<2xi64, #barrier_multicast_two, #smem_multicast_two, mutable>
+    // CHECK: ttng.arrive_barrier {{.*}}multicastCTA = 1 : i32
+    ttng.arrive_barrier %bar, 1 {multicastCTA = 1 : i32} : !ttg.memdesc<2xi64, #barrier_multicast_two, #smem_multicast_two, mutable>
     tt.return
   }
 }
@@ -101,16 +101,16 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
     ttng.init_barrier %bar0, 2 : !ttg.memdesc<4xi64, #barrier_multicast_four, #smem_multicast_four, mutable>
     // CHECK: ttng.init_barrier
     ttng.init_barrier %bar1, 2 : !ttg.memdesc<4xi64, #barrier_multicast_four, #smem_multicast_four, mutable>
-    // ctaMask=1 reaches {0,1} or {2,3}.
+    // multicastCTA=1 reaches {0,1} or {2,3}.
     // CHECK: %[[LOW_FIXED:.*]] = arith.constant 2 : i32
     // CHECK: %[[LOW_BASE:.*]] = arith.andi {{.*}}, %[[LOW_FIXED]] : i32
     // CHECK: %[[LOW_PATTERN:.*]] = arith.constant 3 : i32
     // CHECK: %[[LOW_SHIFT:.*]] = arith.shli %[[LOW_PATTERN]], %[[LOW_BASE]] : i32
     // CHECK: %[[LOW_RECIPIENTS:.*]] = arith.ori {{.*}}, %[[LOW_SHIFT]] : i32
     // CHECK: tt.call @__triton_consan_verify_and_update_barrier_state{{.*}}({{.*}}%[[LOW_RECIPIENTS]])
-    // CHECK: ttng.arrive_barrier {{.*}}ctaMask = 1 : i32
-    ttng.arrive_barrier %bar0, 1 {ctaMask = 1 : i32} : !ttg.memdesc<4xi64, #barrier_multicast_four, #smem_multicast_four, mutable>
-    // ctaMask=2 reaches {0,2} or {1,3}.
+    // CHECK: ttng.arrive_barrier {{.*}}multicastCTA = 1 : i32
+    ttng.arrive_barrier %bar0, 1 {multicastCTA = 1 : i32} : !ttg.memdesc<4xi64, #barrier_multicast_four, #smem_multicast_four, mutable>
+    // multicastCTA=2 reaches {0,2} or {1,3}.
     // CHECK: arith.constant 0 : i32
     // CHECK-NEXT: %[[HIGH_FIXED:.*]] = arith.constant 1 : i32
     // CHECK-NEXT: %[[HIGH_BASE:.*]] = arith.andi {{.*}}, %[[HIGH_FIXED]] : i32
@@ -118,8 +118,45 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
     // CHECK: %[[HIGH_SHIFT:.*]] = arith.shli %[[HIGH_PATTERN]], %[[HIGH_BASE]] : i32
     // CHECK: %[[HIGH_RECIPIENTS:.*]] = arith.ori {{.*}}, %[[HIGH_SHIFT]] : i32
     // CHECK: tt.call @__triton_consan_verify_and_update_barrier_state{{.*}}({{.*}}%[[HIGH_RECIPIENTS]])
-    // CHECK: ttng.arrive_barrier {{.*}}ctaMask = 2 : i32
-    ttng.arrive_barrier %bar1, 1 {ctaMask = 2 : i32} : !ttg.memdesc<4xi64, #barrier_multicast_four, #smem_multicast_four, mutable>
+    // CHECK: ttng.arrive_barrier {{.*}}multicastCTA = 2 : i32
+    ttng.arrive_barrier %bar1, 1 {multicastCTA = 2 : i32} : !ttg.memdesc<4xi64, #barrier_multicast_four, #smem_multicast_four, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#barrier_fromCTA = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1], [2], [4]]}>
+#smem_fromCTA = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 64 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
+  // CHECK-LABEL: @mbarrier_fromCTA_basis_mask
+  tt.func public @mbarrier_fromCTA_basis_mask() {
+    %true = arith.constant true
+    %bar = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<8xi64, #barrier_fromCTA, #smem_fromCTA, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<8xi64, #barrier_fromCTA, #smem_fromCTA, mutable>
+
+    // fromCTA=5 preserves CTA-ID bits 0 and 2, selects CTA0, CTA1, CTA4,
+    // and CTA5 as issuers, and sends to CTA groups with matching fixed bits.
+    // CHECK: ttng.init_barrier
+    // CHECK: %[[EXPECT_CTA:.*]] = tti.experimental_cluster_cta_id : i32
+    // CHECK-NEXT: %[[EXPECT_OMITTED:.*]] = arith.constant 2 : i32
+    // CHECK-NEXT: %[[EXPECT_NON_ISSUER:.*]] = arith.andi %[[EXPECT_CTA]], %[[EXPECT_OMITTED]] : i32
+    // CHECK-NEXT: %[[EXPECT_ZERO:.*]] = arith.constant 0 : i32
+    // CHECK-NEXT: %[[EXPECT_ISSUER:.*]] = arith.cmpi eq, %[[EXPECT_NON_ISSUER]], %[[EXPECT_ZERO]] : i32
+    // CHECK-NEXT: %[[EXPECT_PRED:.*]] = arith.andi %true, %[[EXPECT_ISSUER]] : i1
+    // CHECK: arith.shli
+    // CHECK: %[[EXPECT_RECIPIENT_CTA:.*]] = tti.experimental_cluster_cta_id : i32
+    // CHECK: %[[EXPECT_FIXED:.*]] = arith.constant 5 : i32
+    // CHECK: %[[EXPECT_BASE:.*]] = arith.andi %[[EXPECT_RECIPIENT_CTA]], %[[EXPECT_FIXED]] : i32
+    // CHECK: %[[EXPECT_PATTERN:.*]] = arith.constant 5 : i32
+    // CHECK: %[[EXPECT_RECIPIENTS:.*]] = arith.shli %[[EXPECT_PATTERN]], %[[EXPECT_BASE]] : i32
+    // CHECK: tt.call @__triton_consan_verify_and_update_barrier_state{{.*}}({{.*}}%[[EXPECT_PRED]]{{.*}}%[[EXPECT_RECIPIENTS]])
+    // CHECK: ttng.barrier_expect
+    ttng.barrier_expect %bar, 16 {fromCTA = 5 : i32}, %true : !ttg.memdesc<8xi64, #barrier_fromCTA, #smem_fromCTA, mutable>
+
+    // CHECK: tt.call @__triton_consan_verify_and_update_barrier_state
+    // CHECK: ttng.arrive_barrier
+    ttng.arrive_barrier %bar, 1, %true {fromCTA = 5 : i32} : !ttg.memdesc<8xi64, #barrier_fromCTA, #smem_fromCTA, mutable>
     tt.return
   }
 }

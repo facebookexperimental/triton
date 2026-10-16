@@ -735,11 +735,22 @@ def async_remote_shmem_store(
     src: tl.tensor,
     remote_cta_rank: int | tl.constexpr,
     barrier: tlx.mbarrier,
+    store_reduce: str = "",
     _semantic=None,
 ) -> tl.tensor:
     """
-    Store a distributed tensor into a buffer into the remote shared memory of a cluster asynchronously.
-    Signals the provided mbarrier when the store completes.
+    Asynchronously store or reduce a register tensor into cluster shared memory.
+    The destination and completion mbarrier are mapped to remote_cta_rank,
+    which may name the executing CTA itself.
+
+    Reductions support matching int32/uint32 tensors on NVIDIA SM90+ with at
+    least two physical CTAs in the cluster. "inc" and "dec" require uint32;
+    each source element is a bound, not an increment/decrement amount.
+    For old destination x and source bound b, "inc" writes 0 if x >= b,
+    otherwise x + 1; "dec" writes b if x == 0 or x > b, otherwise x - 1.
+    Each unique element completes four bytes on the mbarrier without an
+    additional arrival.
+    Both st.async and red.async use the generic proxy, not the async proxy.
 
     NOTE: this will increase the lifetime of
     the SMEM buffers involved to entire program, and potentially increase SMEM pressure.
@@ -753,8 +764,44 @@ def async_remote_shmem_store(
         dst: The destination buffer in local shared memory (will be internally mapped to remote CTA)
         src: The source tensor to store
         remote_cta_rank: The rank of the remote CTA within the cluster
-        barrier: mbarrier to signal when the store completes
+        barrier: Local mbarrier mapped to the same CTA as dst for completion
+        store_reduce: "" for a regular store (default), or "add", "min", "max",
+            "and", "or", "xor", "inc", or "dec" for an integer reduction.
+            MIN/MAX use the source dtype's signedness.
     """
+    store_reduce = tl._unwrap_if_constexpr(store_reduce)
+    reduce_kind_map = {
+        "add": ir.DESCRIPTOR_REDUCE_KIND.ADD,
+        "min": ir.DESCRIPTOR_REDUCE_KIND.MIN,
+        "max": ir.DESCRIPTOR_REDUCE_KIND.MAX,
+        "and": ir.DESCRIPTOR_REDUCE_KIND.AND,
+        "or": ir.DESCRIPTOR_REDUCE_KIND.OR,
+        "xor": ir.DESCRIPTOR_REDUCE_KIND.XOR,
+        "inc": ir.DESCRIPTOR_REDUCE_KIND.INC,
+        "dec": ir.DESCRIPTOR_REDUCE_KIND.DEC,
+    }
+    assert store_reduce == "" or store_reduce in reduce_kind_map, (
+        f"store_reduce must be '', 'add', 'min', 'max', 'and', 'or', 'xor', 'inc', or 'dec', got {store_reduce!r}")
+    reduce_kind = ir.DESCRIPTOR_REDUCE_KIND.NONE
+    reduce_signed = False
+    if store_reduce:
+        options = _semantic.builder.options
+        assert options.backend_name != "hip", "async remote reduction requires an NVIDIA backend"
+        assert cuda_parse_arch(options.arch) >= 90, "async remote reduction requires NVIDIA SM90+"
+        cluster_dims = options.ctas_per_cga or (options.num_ctas, 1, 1)
+        assert cluster_dims[0] * cluster_dims[1] * cluster_dims[2] > 1, (
+            "async remote reduction requires at least two physical CTAs in the cluster")
+        assert isinstance(src, tl.tensor) and src.type.is_block(), "async remote reduction requires a register tensor"
+        assert src.dtype in (tl.int32, tl.uint32), "async remote reduction supports only int32 or uint32"
+        if store_reduce in ("inc", "dec"):
+            assert src.dtype == tl.uint32, "async remote INC/DEC supports only uint32"
+        assert src.dtype == dst.dtype, "async remote reduction source and destination types must match"
+        assert _shape_as_ints(src.shape) == _shape_as_ints(
+            dst.shape), ("async remote reduction source and destination shapes must match")
+        assert isinstance(barrier, tlx.mbarrier) and barrier.type.storage == storage_kind.smem, (
+            "async remote reduction requires a local shared-memory mbarrier")
+        reduce_kind = reduce_kind_map[store_reduce]
+        reduce_signed = src.dtype.is_int_signed()
     storage = dst.type.storage
     if storage == tlx.storage_kind.smemCluster:
         print("tlx.async_remote_shmem_store only supports smem dst, it internally calls mapa(dst)")
@@ -765,7 +812,8 @@ def async_remote_shmem_store(
     assert barrier is not None, "barrier is required for async_remote_shmem_store"
     remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
     return tl.tensor(
-        _semantic.builder.create_async_remote_store(dst.handle, src.handle, remote_cta_rank_handle, barrier.handle),
+        _semantic.builder.create_async_remote_store(dst.handle, src.handle, remote_cta_rank_handle, barrier.handle,
+                                                    reduce_kind, reduce_signed),
         tl.void,
     )
 

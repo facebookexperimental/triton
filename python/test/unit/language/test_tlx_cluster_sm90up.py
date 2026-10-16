@@ -104,49 +104,188 @@ def test_fence_async_shared_cluster(device):
     torch.testing.assert_close(output, torch.ones_like(output))
 
 
+_ASYNC_REMOTE_REDUCE_CASES = [
+    ("add", "int32", "add.u32"),
+    ("add", "uint32", "add.u32"),
+    ("min", "int32", "min.s32"),
+    ("min", "uint32", "min.u32"),
+    ("max", "int32", "max.s32"),
+    ("max", "uint32", "max.u32"),
+    ("and", "int32", "and.b32"),
+    ("and", "uint32", "and.b32"),
+    ("or", "int32", "or.b32"),
+    ("or", "uint32", "or.b32"),
+    ("xor", "int32", "xor.b32"),
+    ("xor", "uint32", "xor.b32"),
+    ("inc", "uint32", "inc.u32"),
+    ("dec", "uint32", "dec.u32"),
+]
+
+
+def _async_remote_reduce_inputs(N, dtype, store_reduce, device):
+    if store_reduce in ("inc", "dec"):
+        initial_bits = [0, 3, 4, 5, 0, 1, 0xFFFFFFFF, 0xFFFFFFFF]
+        operand_bits = [4, 4, 4, 4, 0, 0, 0xFFFFFFFF, 2]
+    else:
+        initial_bits = [0, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x7FFFFFFF, 0xFFFFFFFF, 0x80000000, 0xAAAAAAAA]
+        operand_bits = [0xFFFFFFFF, 0x80000000, 1, 0x7FFFFFFF, 1, 1, 0x80000000, 0x55555555]
+    indices = torch.arange(N, dtype=torch.int64, device=device) % len(initial_bits)
+    torch_dtype = getattr(torch, dtype)
+    initial = torch.tensor(initial_bits, dtype=torch.int64, device=device)[indices].to(torch_dtype)
+    operand = torch.tensor(operand_bits, dtype=torch.int64, device=device)[indices].to(torch_dtype)
+    # Wide arithmetic preserves unsigned comparisons and explicit 32-bit wrapping.
+    lhs, rhs = initial.to(torch.int64), operand.to(torch.int64)
+    if store_reduce == "add":
+        expected = lhs + rhs
+    elif store_reduce == "min":
+        expected = torch.minimum(lhs, rhs)
+    elif store_reduce == "max":
+        expected = torch.maximum(lhs, rhs)
+    elif store_reduce == "and":
+        expected = lhs & rhs
+    elif store_reduce == "or":
+        expected = lhs | rhs
+    elif store_reduce == "xor":
+        expected = lhs ^ rhs
+    elif store_reduce == "inc":
+        expected = torch.where(lhs >= rhs, 0, lhs + 1)
+    elif store_reduce == "dec":
+        expected = torch.where((lhs == 0) | (lhs > rhs), rhs, lhs - 1)
+    else:
+        raise ValueError(f"Unexpected reduction {store_reduce}")
+    expected = expected & 0xFFFFFFFF
+    if dtype == "int32":
+        expected = torch.where(expected >= 0x80000000, expected - 0x100000000, expected)
+    return initial, operand, expected.to(torch_dtype)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer for DSM")
-@pytest.mark.parametrize("N", [128, 1024])
+@pytest.mark.parametrize("N", [4, 128, 1024])
 @pytest.mark.parametrize("num_warps", [1, 4])
-def test_fence_async_shared_cluster_dsm_handoff(device, N, num_warps):
-    """Remote generic stores feed an async bulk copy through the cluster fence."""
+@pytest.mark.parametrize("store_reduce,dtype,ptx_suffix", _ASYNC_REMOTE_REDUCE_CASES)
+@pytest.mark.parametrize("destination_rank", [0, 1])
+def test_async_remote_shmem_reduce(device, N, num_warps, store_reduce, dtype, ptx_suffix, destination_rank):
+    """Register-source red.async uses the generic proxy, including for a self target."""
 
     @triton.jit
-    def handoff_kernel(input_ptr, output_ptr, N: tl.constexpr):
-        source = tlx.local_alloc((N, ), tl.int32, 1)
-        destination = tlx.local_alloc((N, ), tl.int32, 1)
+    def remote_reduce_kernel(initial_ptr, operand_ptr, output_ptr, N: tl.constexpr, DESTINATION_RANK: tl.constexpr,
+                             STORE_REDUCE: tl.constexpr):
+        destination = tlx.local_alloc((N, ), tlx.dtype_of(initial_ptr), 1)
         barriers = tlx.alloc_barriers(num_barriers=1, scope="cluster")
         cta_rank = tlx.cluster_cta_rank()
         offsets = tl.arange(0, N)
-
+        if cta_rank == DESTINATION_RANK:
+            tlx.barrier_expect_bytes(barriers[0], N * 4)
         if cta_rank == 0:
-            tlx.barrier_expect_bytes(barriers[0], N * tlx.size_of(tl.int32))
-            values = tl.load(input_ptr + offsets)
-            tlx.remote_shmem_store(dst=source[0], src=values, remote_cta_rank=1)
-
-        # Publish the generic DSM writes before CTA 1 bridges to its async proxy.
+            tlx.remote_shmem_store(destination[0], tl.load(initial_ptr + offsets), DESTINATION_RANK)
+        # Publish generic initialization; red.async does not need a proxy fence.
         tlx.cluster_barrier()
-        if cta_rank == 1:
-            tlx.fence("async_shared_cluster")
-            tlx.async_remote_shmem_copy(dst=destination[0], src=source[0], remote_cta_rank=0, barrier=barriers[0])
-
         if cta_rank == 0:
+            tlx.async_remote_shmem_store(destination[0], tl.load(operand_ptr + offsets), DESTINATION_RANK, barriers[0],
+                                         store_reduce=STORE_REDUCE)
+        if cta_rank == DESTINATION_RANK:
             tlx.barrier_wait(barriers[0], phase=0)
             tl.store(output_ptr + offsets, tlx.local_load(destination[0]))
-        # Keep both CTAs' shared memory alive until the bulk copy has completed.
         tlx.cluster_barrier()
 
-    input_tensor = torch.arange(N, dtype=torch.int32, device=device) * 17 + 3
-    output = torch.full_like(input_tensor, -1)
-    kernel = handoff_kernel[(2, )](input_tensor, output, N=N, num_warps=num_warps, ctas_per_cga=(2, 1, 1))
-
+    initial, operand, expected = _async_remote_reduce_inputs(N, dtype, store_reduce, device)
+    output = torch.empty_like(initial)
+    kernel = remote_reduce_kernel[(2, )](initial, operand, output, N=N, DESTINATION_RANK=destination_rank,
+                                         STORE_REDUCE=store_reduce, num_warps=num_warps, ctas_per_cga=(2, 1, 1))
     ptx = kernel.asm["ptx"]
-    assert "ttng.fence_async_shared {bCluster = true}" in kernel.asm["ttgir"]
-    assert "st.shared::cluster" in ptx
+    assert f"red.async.relaxed.cluster.shared::cluster.mbarrier::complete_tx::bytes.{ptx_suffix}" in ptx
+    assert "st.async" not in ptx
+    assert "fence.proxy.async" not in ptx
+    assert "bCluster = true" in kernel.asm["ttgir"]
     assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    assert ptx.count("fence.proxy.async.shared::cluster") == 1
+    assert ptx.index("fence.mbarrier_init.release.cluster") < ptx.index("red.async")
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer for DSM")
+@pytest.mark.parametrize("N", [4, 128, 1024])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("store_reduce,dtype,ptx_suffix", _ASYNC_REMOTE_REDUCE_CASES)
+def test_fence_async_shared_cluster_after_remote_reduce(device, N, num_warps, store_reduce, dtype, ptx_suffix):
+    """Order generic red.async and async bulk-copy writes to the same remote DSM."""
+
+    @triton.jit
+    def reduce_then_copy_kernel(initial_ptr, operand_ptr, copy_ptr, output_ptr, N: tl.constexpr,
+                                STORE_REDUCE: tl.constexpr):
+        destination = tlx.local_alloc((N, ), tlx.dtype_of(initial_ptr), 1)
+        source = tlx.local_alloc((N, ), tlx.dtype_of(initial_ptr), 1)
+        barriers = tlx.alloc_barriers(num_barriers=2, scope="cluster")
+        cta_rank = tlx.cluster_cta_rank()
+        offsets = tl.arange(0, N)
+        if cta_rank == 1:
+            tlx.barrier_expect_bytes(barriers[0], N * 4)
+            tlx.barrier_expect_bytes(barriers[1], N * 4)
+        if cta_rank == 0:
+            tlx.remote_shmem_store(destination[0], tl.load(initial_ptr + offsets), 1)
+        tlx.cluster_barrier()
+        if cta_rank == 0:
+            tlx.async_remote_shmem_store(destination[0], tl.load(operand_ptr + offsets), 1, barriers[0],
+                                         store_reduce=STORE_REDUCE)
+        if cta_rank == 1:
+            tlx.barrier_wait(barriers[0], phase=0)
+            tl.store(output_ptr + offsets, tlx.local_load(destination[0]))
+        # Completion and rendezvous do not replace generic-to-async proxy ordering.
+        tlx.cluster_barrier()
+        if cta_rank == 0:
+            tlx.local_store(source[0], tl.load(copy_ptr + offsets))
+            # Covers the local source and the remote WAW target of the bulk copy.
+            tlx.fence("async_shared_cluster")
+            tlx.async_remote_shmem_copy(destination[0], source[0], 1, barriers[1])
+        if cta_rank == 1:
+            tlx.barrier_wait(barriers[1], phase=0)
+            tl.store(output_ptr + N + offsets, tlx.local_load(destination[0]))
+        tlx.cluster_barrier()
+
+    initial, operand, expected = _async_remote_reduce_inputs(N, dtype, store_reduce, device)
+    copy_values = (torch.arange(N, dtype=torch.int64, device=device) * 5 + 100).to(getattr(torch, dtype))
+    output = torch.empty((2 * N, ), dtype=getattr(torch, dtype), device=device)
+    kernel = reduce_then_copy_kernel[(2, )](initial, operand, copy_values, output, N=N, STORE_REDUCE=store_reduce,
+                                            num_warps=num_warps, ctas_per_cga=(2, 1, 1))
+    ptx = kernel.asm["ptx"]
+    reduction = f"red.async.relaxed.cluster.shared::cluster.mbarrier::complete_tx::bytes.{ptx_suffix}"
+    fence = "fence.proxy.async.shared::cluster"
+    copy = "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes"
+    assert "ttng.fence_async_shared {bCluster = true}" in kernel.asm["ttgir"]
+    assert ptx.count("fence.mbarrier_init.release.cluster") == 1
+    assert ptx.index("fence.mbarrier_init.release.cluster") < ptx.index(reduction)
+    assert ptx.count(fence) == 1
     assert "fence.proxy.async.shared::cta" not in ptx
-    assert "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes" in ptx
-    torch.testing.assert_close(output, input_tensor, rtol=0, atol=0)
+    assert ptx.index(reduction) < ptx.index(fence) < ptx.index(copy)
+    torch.testing.assert_close(output[:N], expected, rtol=0, atol=0)
+    torch.testing.assert_close(output[N:], copy_values, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer for DSM")
+@pytest.mark.parametrize("dtype,store_reduce,cluster_size,message", [
+    (torch.float32, "add", 2, "int32 or uint32"),
+    (torch.float32, "min", 2, "int32 or uint32"),
+    (torch.int16, "xor", 2, "int32 or uint32"),
+    (torch.int64, "add", 2, "int32 or uint32"),
+    (torch.int32, "inc", 2, "uint32"),
+    (torch.int32, "dec", 2, "uint32"),
+    (torch.int32, "invalid", 2, "store_reduce"),
+    (torch.int32, "add", 1, "at least two physical CTAs"),
+    (torch.int32, "min", 1, "at least two physical CTAs"),
+    (torch.uint32, "inc", 1, "at least two physical CTAs"),
+])
+def test_async_remote_shmem_reduce_invalid(device, dtype, store_reduce, cluster_size, message):
+
+    @triton.jit
+    def invalid_kernel(input_ptr, STORE_REDUCE: tl.constexpr):
+        destination = tlx.local_alloc((4, ), tlx.dtype_of(input_ptr), 1)
+        barriers = tlx.alloc_barriers(num_barriers=1, scope="cluster")
+        values = tl.load(input_ptr + tl.arange(0, 4))
+        tlx.async_remote_shmem_store(destination[0], values, 0, barriers[0], store_reduce=STORE_REDUCE)
+
+    values = torch.empty((4, ), dtype=dtype, device=device)
+    with pytest.raises(triton.CompilationError, match=message):
+        invalid_kernel.warmup(values, STORE_REDUCE=store_reduce, grid=(cluster_size, ), num_warps=1,
+                              ctas_per_cga=(cluster_size, 1, 1))
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")

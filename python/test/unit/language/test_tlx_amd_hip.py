@@ -631,8 +631,10 @@ def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_c
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     # Spill/private goldens admit d26ff26 values; see test_a4w4_inter_wave_256tile_codegen_gfx950.
-    assert ".private_segment_fixed_size: 0" in amdgcn or ".private_segment_fixed_size: 16" in amdgcn or ".private_segment_fixed_size: 136" in amdgcn
-    assert ".vgpr_spill_count: 0" in amdgcn or ".vgpr_spill_count: 3" in amdgcn or ".vgpr_spill_count: 40" in amdgcn
+    # CodeGen built on the Meta LLVM fork core (a6533ab0, based on 1df311a6)
+    # spills one VGPR here (private 8).
+    assert ".private_segment_fixed_size: 0" in amdgcn or ".private_segment_fixed_size: 8" in amdgcn or ".private_segment_fixed_size: 16" in amdgcn or ".private_segment_fixed_size: 136" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn or ".vgpr_spill_count: 1" in amdgcn or ".vgpr_spill_count: 3" in amdgcn or ".vgpr_spill_count: 40" in amdgcn
 
 
 def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache):

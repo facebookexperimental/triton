@@ -12,15 +12,26 @@ Covers:
 """
 
 import os
+from pathlib import Path
+import subprocess
+import sys
 import unittest
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import triton
 import triton.language as tl
-from triton._C.libtriton import native_fast_dispatch_insert
-from triton.runtime.jit import _hash_fc_opts
+from triton import knobs
+from triton._C.libtriton import (
+    native_autotune_proxy_insert,
+    native_autotune_proxy_set_grid,
+    native_create_autotune_proxy,
+    native_create_jit_proxy,
+    native_fast_dispatch,
+    native_fast_dispatch_insert,
+)
+from triton.runtime.jit import _KernelCache, _bind_fc_args, _hash_fc_opts
 
 
 def is_cuda():
@@ -384,6 +395,606 @@ class TestMixedKwargsPositional(TestCase):
             2,
             "kwargs with different constexpr value should produce new cache entry",
         )
+
+
+class TestJITProxyOptionBinding(TestCase):
+    """Check native binding without a GPU launch."""
+
+    def setUp(self):
+        for group in (knobs.runtime, knobs.compilation, knobs.nvidia, knobs.autotuning, knobs.amd):
+            scope = group.scope()
+            scope.__enter__()
+            self.addCleanup(scope.__exit__, None, None, None)
+        knobs.nvidia.use_triton_dispatcher = True
+        knobs.nvidia.use_autotune_c_cache = True
+        knobs.autotuning.listener = None
+        knobs.runtime.debug = False
+        knobs.runtime.sanitize_overflow = False
+        knobs.compilation.always_compile = False
+        knobs.compilation.instrumentation_mode = ""
+        knobs.compilation.fpsan_homomorphic_casts = False
+
+    def _create_proxy(self, options=None, required=False):
+        if required:
+
+            @triton.jit(c_cache=True)
+            def kernel(N, SCALE: tl.constexpr = 3):
+                pass
+        else:
+
+            @triton.jit(c_cache=True)
+            def kernel(N=32, SCALE: tl.constexpr = 3):
+                pass
+
+        kernel._fc_tensor_size_threshold = 0
+        kernel._fc_device_key = 0
+        kernel._fc_backend = "synthetic"
+        dispatch = Mock(return_value=None)
+        cached = object()
+        fallback = object()
+        kernel.run = Mock(return_value=fallback)
+        options_hash = _hash_fc_opts(options) if options else 0
+        native_fast_dispatch_insert(kernel, (32, 3), kernel.params, options_hash, cached, dispatch, None)
+        proxy = native_create_jit_proxy(kernel, (1, ), kernel.params, 0, lambda _: 7, lambda: 0)
+        return kernel, proxy, cached, fallback, dispatch
+
+    def _create_autotune_proxy(self):
+        kernel, _, cached, fallback, dispatch = self._create_proxy()
+        fallback_run = Mock(return_value=fallback)
+        proxy = native_create_autotune_proxy(kernel, [0], [], kernel.params, 2, lambda _: 7, lambda: 0, fallback_run)
+        native_autotune_proxy_insert(proxy, [32], [3], [1], 0, None)
+        native_autotune_proxy_set_grid(proxy, (1, ))
+        return kernel, proxy, cached, fallback, dispatch, fallback_run
+
+    def test_held_autotune_proxy_rechecks_launch_state(self):
+        states = (
+            ("jit", "c_cache", False),
+            ("jit", "pre_run_hooks", [lambda *args, **kwargs: None]),
+            ("jit", "launch_metadata", lambda *args, **kwargs: None),
+            (knobs.runtime, "launch_enter_hook", lambda *args, **kwargs: None),
+            (knobs.runtime, "launch_exit_hook", lambda *args, **kwargs: None),
+            (knobs.runtime, "add_stages_inspection_hook", lambda: None),
+            (knobs.runtime, "debug", True),
+            (knobs.runtime, "sanitize_overflow", True),
+            (knobs.compilation, "always_compile", True),
+            (knobs.compilation, "instrumentation_mode", "fpsan"),
+            (knobs.compilation, "fpsan_homomorphic_casts", True),
+            (knobs.nvidia, "use_triton_dispatcher", False),
+            (knobs.nvidia, "use_autotune_c_cache", False),
+            (knobs.autotuning, "listener", lambda *args, **kwargs: None),
+        )
+        for owner, name, value in states:
+            with self.subTest(option=name):
+                kernel, proxy, cached, fallback, dispatch, fallback_run = self._create_autotune_proxy()
+                self.assertIs(proxy(32), cached)
+                group = kernel if owner == "jit" else owner
+                previous = getattr(group, name)
+                try:
+                    setattr(group, name, value)
+                    self.assertIs(proxy(32), fallback)
+                finally:
+                    setattr(group, name, previous)
+                self.assertIs(proxy(32), cached)
+                self.assertEqual(dispatch.call_count, 2)
+                fallback_run.assert_called_once()
+
+    def test_held_autotune_proxy_preserves_global_checks(self):
+        kernel, proxy, cached, fallback, dispatch, fallback_run = self._create_autotune_proxy()
+        self.assertIs(proxy(32), cached)
+        kernel.used_global_vals[("scale", 0)] = (3, {"scale": 4})
+        self.assertIs(proxy(32), fallback)
+        self.assertEqual(dispatch.call_count, 1)
+        fallback_run.assert_called_once()
+
+    def test_late_jit_callbacks_recheck_launch_state(self):
+        for callback in ("device", "stream", "option_hash"):
+            with self.subTest(callback=callback):
+                options = {"num_warps": 4} if callback == "option_hash" else None
+                kernel, _, cached, fallback, dispatch = self._create_proxy(options)
+                calls = []
+
+                def enable_hook():
+                    calls.append(callback)
+                    kernel.pre_run_hooks.append(lambda *args, **kwargs: None)
+
+                def device_getter():
+                    if callback == "device":
+                        enable_hook()
+                    return 0
+
+                def stream_getter(device):
+                    if callback == "stream":
+                        enable_hook()
+                    return 7
+
+                class Option(int):
+
+                    def __hash__(self):
+                        enable_hook()
+                        return int.__hash__(self)
+
+                proxy = native_create_jit_proxy(kernel, (1, ), kernel.params, 0, stream_getter, device_getter)
+                result = proxy(32, num_warps=Option(4)) if callback == "option_hash" else proxy(32)
+                self.assertIs(result, fallback)
+                self.assertEqual(calls, [callback])
+                dispatch.assert_not_called()
+                kernel.run.assert_called_once()
+
+    def test_late_autotune_callbacks_recheck_launch_state(self):
+        for callback in ("device", "stream", "key_hash", "pre_hook", "grid", "false_listener"):
+            with self.subTest(callback=callback):
+                kernel, _, _, fallback, dispatch = self._create_proxy()
+                fallback_run = Mock(return_value=fallback)
+                calls = []
+
+                class FalseListener:
+
+                    def __bool__(self):
+                        return False
+
+                    def __call__(self, *args, **kwargs):
+                        pass
+
+                def change_state():
+                    calls.append(callback)
+                    if callback == "false_listener":
+                        knobs.autotuning.listener = FalseListener()
+                    else:
+                        kernel.pre_run_hooks.append(lambda *args, **kwargs: None)
+
+                def device_getter():
+                    if callback == "device":
+                        change_state()
+                    return 0
+
+                def stream_getter(device):
+                    if callback == "stream":
+                        change_state()
+                    return 7
+
+                def pre_hook(named_args):
+                    change_state()
+
+                def grid(named_args):
+                    change_state()
+                    return (1, )
+
+                class Key(int):
+
+                    def __hash__(self):
+                        change_state()
+                        return int.__hash__(self)
+
+                proxy = native_create_autotune_proxy(kernel, [0], [], kernel.params, 2, stream_getter, device_getter,
+                                                     fallback_run)
+                native_autotune_proxy_insert(proxy, [32], [3], [1], 0, pre_hook if callback == "pre_hook" else None)
+                native_autotune_proxy_set_grid(proxy, grid if callback in ("grid", "false_listener") else (1, ))
+                self.assertIs(proxy(Key(32) if callback == "key_hash" else 32), fallback)
+                self.assertEqual(calls, [callback])
+                dispatch.assert_not_called()
+                fallback_run.assert_called_once()
+
+    def test_scalar_options_match_python_hash(self):
+        options = {"num_warps": 4, "num_stages": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}
+        kernel, proxy, cached, _, dispatch = self._create_proxy(options)
+        self.assertIs(proxy(32, SCALE=3, **options), cached)
+        self.assertIs(proxy(SCALE=3, N=32, **dict(reversed(list(options.items())))), cached)
+        self.assertEqual(dispatch.call_count, 2)
+        kernel.run.assert_not_called()
+
+    def test_changed_options_use_a_distinct_entry(self):
+        kernel, proxy, cached, _, dispatch = self._create_proxy({"num_warps": 4})
+        changed = object()
+        native_fast_dispatch_insert(kernel, (32, 3), kernel.params, _hash_fc_opts({"num_warps": 8}), changed, dispatch,
+                                    None)
+        self.assertIs(proxy(num_warps=4), cached)
+        self.assertIs(proxy(num_warps=8), changed)
+        kernel.run.assert_not_called()
+
+    def test_defaults_match_explicit_arguments(self):
+        kernel, proxy, cached, _, dispatch = self._create_proxy()
+        self.assertIs(proxy(), cached)
+        self.assertIs(proxy(SCALE=3), cached)
+        self.assertEqual(dispatch.call_args.args, (1, 1, 1, 7, 32))
+        self.assertEqual(_bind_fc_args(kernel.params, kernel._param_name_to_idx, (), {}), (32, 3))
+        kernel.run.assert_not_called()
+
+    def test_duplicate_and_missing_arguments_use_standard_binding(self):
+        kernel, proxy, _, fallback, dispatch = self._create_proxy(required=True)
+        self.assertIs(proxy(32, N=32), fallback)
+        self.assertIs(proxy(SCALE=3), fallback)
+        self.assertIsNone(_bind_fc_args(kernel.params, kernel._param_name_to_idx, (32, ), {"N": 32}))
+        self.assertIsNone(_bind_fc_args(kernel.params, kernel._param_name_to_idx, (), {"SCALE": 3}))
+        self.assertEqual(kernel.run.call_count, 2)
+        dispatch.assert_not_called()
+
+    def test_container_options_use_standard_hashing(self):
+        options = {"extern_libs": {"lib": "/dev/null"}}
+        kernel, proxy, _, fallback, dispatch = self._create_proxy(options)
+        self.assertIs(proxy(**options), fallback)
+        kernel.run.assert_called_once()
+        dispatch.assert_not_called()
+
+    def test_held_proxy_checks_new_pre_run_hook(self):
+        kernel, proxy, cached, fallback, dispatch = self._create_proxy()
+        self.assertIs(proxy(), cached)
+        kernel.pre_run_hooks.append(lambda *args, **kwargs: None)
+        self.assertIs(proxy(), fallback)
+        self.assertEqual(dispatch.call_count, 1)
+        kernel.run.assert_called_once()
+
+    def test_held_proxy_checks_runtime_options(self):
+        for group, name, value in ((knobs.runtime, "debug", True), (knobs.runtime, "sanitize_overflow",
+                                                                    True), (knobs.compilation, "always_compile", True),
+                                   (knobs.compilation, "instrumentation_mode",
+                                    "fpsan"), (knobs.compilation, "fpsan_homomorphic_casts",
+                                               True), (knobs.nvidia, "use_triton_dispatcher", False)):
+            with self.subTest(option=name):
+                kernel, proxy, cached, fallback, dispatch = self._create_proxy()
+                self.assertIs(proxy(), cached)
+                previous = getattr(group, name)
+                try:
+                    setattr(group, name, value)
+                    self.assertIs(proxy(), fallback)
+                    self.assertEqual(dispatch.call_count, 1)
+                    kernel.run.assert_called_once()
+                finally:
+                    setattr(group, name, previous)
+
+    def test_device_changes_select_distinct_entries(self):
+        kernel, _, cached, fallback, dispatch = self._create_proxy()
+        current_device = [0]
+        streams = []
+
+        def get_stream(device):
+            streams.append(device)
+            return 7 + device
+
+        proxy = native_create_jit_proxy(kernel, (1, ), kernel.params, 0, get_stream, lambda: current_device[0])
+        self.assertIs(proxy(), cached)
+        current_device[0] = 1
+        self.assertIs(proxy(), fallback)
+        other = object()
+        native_fast_dispatch_insert(kernel, (32, 3), kernel.params, 0, other, dispatch, None, 1)
+        self.assertIs(proxy(), other)
+        current_device[0] = 0
+        self.assertIs(proxy(), cached)
+        self.assertEqual(streams, [0, 1, 1, 0])
+        self.assertEqual(dispatch.call_count, 3)
+        kernel.run.assert_called_once()
+
+    def test_empty_argument_projection_passes_no_kernel_arguments(self):
+        kernel, proxy, cached, _, dispatch = self._create_proxy()
+        native_fast_dispatch_insert(kernel, (32, 3), kernel.params, 0, cached, dispatch, (), 0)
+        self.assertIs(proxy(), cached)
+        self.assertIs(native_fast_dispatch(kernel, (32, 3), kernel.params, 0, (1, ), 7, 0), cached)
+        self.assertEqual(dispatch.call_args_list, [unittest.mock.call(1, 1, 1, 7)] * 2)
+        kernel.run.assert_not_called()
+
+    def test_reentrant_cache_clear_preserves_dispatch_result(self):
+        for use_proxy in (False, True):
+            with self.subTest(use_proxy=use_proxy):
+                kernel, proxy, cached, _, dispatch = self._create_proxy()
+                dispatch.side_effect = lambda *args: kernel.device_caches.clear()
+                if use_proxy:
+                    result = proxy()
+                else:
+                    result = native_fast_dispatch(kernel, (32, 3), kernel.params, 0, (1, ), 7, 0)
+                self.assertIs(result, cached)
+                dispatch.assert_called_once()
+                self.assertFalse(hasattr(kernel, "_fc_cache"))
+                kernel.run.assert_not_called()
+
+    def test_reentrant_stream_lookup_cannot_use_a_deleted_cache(self):
+        kernel, _, _, fallback, dispatch = self._create_proxy()
+
+        def get_stream(device):
+            kernel.device_caches.clear()
+            return 7
+
+        proxy = native_create_jit_proxy(kernel, (1, ), kernel.params, 0, get_stream, lambda: 0)
+        self.assertIs(proxy(), fallback)
+        dispatch.assert_not_called()
+        kernel.run.assert_called_once()
+
+    def test_storage_span_controls_tensor_specialization(self):
+        kernel, _, _, _, dispatch = self._create_proxy()
+        kernel.device_caches.clear()
+        kernel._fc_tensor_size_threshold = 128
+        small = torch.empty(16, dtype=torch.float32)
+        large_storage = torch.empty(256, dtype=torch.float32)
+        large_view = large_storage[:16]
+        self.assertEqual(small.shape, large_view.shape)
+        self.assertLessEqual(small.untyped_storage().size(), 128)
+        self.assertGreater(large_view.untyped_storage().size(), 128)
+        small_kernel = object()
+        large_kernel = object()
+        native_fast_dispatch_insert(kernel, (small, 3), kernel.params, 0, small_kernel, dispatch, (0, ), 0)
+        native_fast_dispatch_insert(kernel, (large_view, 3), kernel.params, 0, large_kernel, dispatch, (0, ), 0)
+        proxy = native_create_jit_proxy(kernel, (1, ), kernel.params, 0, lambda _: 7, lambda: 0)
+        self.assertIs(proxy(small), small_kernel)
+        self.assertIs(proxy(large_view), large_kernel)
+        self.assertEqual(dispatch.call_count, 2)
+        kernel.run.assert_not_called()
+
+    def test_custom_constexpr_hash_never_runs_in_native_cache(self):
+        kernel, proxy, _, fallback, dispatch = self._create_proxy()
+        hash_calls = []
+
+        class CustomConstant:
+
+            def __hash__(self):
+                hash_calls.append(1)
+                kernel.device_caches.clear()
+                return 3
+
+        value = CustomConstant()
+        native_fast_dispatch_insert(kernel, (32, value), kernel.params, 0, object(), dispatch, None, 0)
+        self.assertIs(proxy(32, SCALE=(3, value)), fallback)
+        self.assertEqual(hash_calls, [])
+        dispatch.assert_not_called()
+        kernel.run.assert_called_once()
+
+    def test_tensor_metadata_callback_cannot_use_a_deleted_cache(self):
+        from triton.runtime.jit import _torch_bridge_loaded
+        if _torch_bridge_loaded:
+            self.skipTest("Requires metadata fallback without the Torch bridge")
+        kernel, _, _, fallback, dispatch = self._create_proxy()
+        kernel.device_caches.clear()
+        kernel._fc_tensor_size_threshold = 128
+        tensor = torch.empty(16, dtype=torch.float32)
+        cached = object()
+        native_fast_dispatch_insert(kernel, (tensor, 3), kernel.params, 0, cached, dispatch, (0, ), 0)
+        storage = tensor.untyped_storage()
+
+        def get_storage():
+            kernel.device_caches.clear()
+            return storage
+
+        tensor.untyped_storage = get_storage
+        proxy = native_create_jit_proxy(kernel, (1, ), kernel.params, 0, lambda _: 7, lambda: 0)
+        self.assertIs(proxy(tensor), fallback)
+        dispatch.assert_not_called()
+        kernel.run.assert_called_once()
+
+    def test_implicit_one_subclass_never_runs_native_equality(self):
+        kernel, proxy, cached, fallback, dispatch = self._create_proxy()
+        callbacks = []
+
+        class CustomOne(int):
+
+            def __eq__(self, other):
+                callbacks.append("eq")
+                kernel.device_caches.clear()
+                return True
+
+            def __hash__(self):
+                callbacks.append("hash")
+                return 1
+
+        native_fast_dispatch_insert(kernel, (1, 3), kernel.params, 0, cached, dispatch, (), 0)
+        self.assertIs(proxy(1), cached)
+        value = CustomOne(1)
+        native_fast_dispatch_insert(kernel, (value, 3), kernel.params, 0, object(), dispatch, (), 0)
+        self.assertIs(proxy(value), fallback)
+        self.assertEqual(callbacks, [])
+        self.assertEqual(dispatch.call_count, 1)
+        kernel.run.assert_called_once()
+
+    def test_native_cache_initializes_attributes_in_a_fresh_process(self):
+        script = f"""
+import importlib.util
+spec = importlib.util.spec_from_file_location('cold_cache_cases', {str(Path(__file__).resolve())!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+case = module.TestJITProxyOptionBinding()
+case.setUp()
+try:
+    case.test_implicit_one_subclass_never_runs_native_equality()
+finally:
+    case.doCleanups()
+"""
+        subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True,
+                       env=dict(os.environ, HIP_VISIBLE_DEVICES="", CUDA_VISIBLE_DEVICES=""))
+
+    def test_held_hip_proxy_rechecks_buffer_ops_state(self):
+        kernel, proxy, cached, fallback, dispatch = self._create_proxy()
+        kernel._fc_backend = "hip"
+        kernel._fc_tensor_size_threshold = 2147483647
+        knobs.amd.use_buffer_ops = True
+        self.assertIs(proxy(), cached)
+        knobs.amd.use_buffer_ops = False
+        self.assertIs(proxy(), fallback)
+        knobs.amd.use_buffer_ops = True
+        self.assertIs(proxy(), cached)
+        self.assertEqual(dispatch.call_count, 2)
+        kernel.run.assert_called_once()
+
+    def test_removed_kernel_entries_invalidate_a_held_proxy(self):
+        for mode in ("kernel_clear", "kernel_pop", "kernel_delete", "device_pop", "device_delete"):
+            with self.subTest(mode=mode):
+                kernel, proxy, cached, fallback, dispatch = self._create_proxy()
+                cache = _KernelCache(kernel)
+                cache["entry"] = cached
+                kernel.device_caches[0] = (cache, )
+                self.assertIs(proxy(), cached)
+                if mode == "kernel_clear":
+                    cache.clear()
+                elif mode == "kernel_pop":
+                    cache.pop("entry")
+                elif mode == "kernel_delete":
+                    del cache["entry"]
+                elif mode == "device_pop":
+                    kernel.device_caches.pop(0)
+                else:
+                    del kernel.device_caches[0]
+                self.assertIs(proxy(), fallback)
+                self.assertEqual(dispatch.call_count, 1)
+                kernel.run.assert_called_once()
+
+    def test_replaced_cache_entries_invalidate_held_proxies(self):
+        for autotune in (False, True):
+            for device_cache in (False, True):
+                for operation in ("assign", "update", "union"):
+                    with self.subTest(autotune=autotune, device_cache=device_cache, operation=operation):
+                        created = self._create_autotune_proxy() if autotune else self._create_proxy()
+                        kernel, proxy, cached, fallback, dispatch = created[:5]
+                        fallback_run = created[5] if autotune else kernel.run
+                        kernels = _KernelCache(kernel)
+                        kernels["entry"] = cached
+                        kernel.device_caches[0] = (kernels, )
+                        kernel._jit_proxy_cache = {"held": proxy}
+                        self.assertIs(proxy(32), cached)
+                        cache = kernel.device_caches if device_cache else kernels
+                        key = 0 if device_cache else "entry"
+                        replacement = (_KernelCache(kernel), ) if device_cache else object()
+                        if operation == "assign":
+                            cache[key] = replacement
+                        elif operation == "update":
+                            cache.update({key: replacement})
+                        else:
+                            cache |= {key: replacement}
+                        self.assertIs(cache[key], replacement)
+                        self.assertFalse(hasattr(kernel, "_fc_cache"))
+                        self.assertFalse(kernel._jit_proxy_cache)
+                        self.assertIs(proxy(32), fallback)
+                        self.assertEqual(dispatch.call_count, 1)
+                        fallback_run.assert_called_once()
+
+    def test_unchanged_and_new_cache_entries_preserve_held_proxies(self):
+        for autotune in (False, True):
+            for device_cache in (False, True):
+                for new_entry in (False, True):
+                    for operation in ("assign", "update", "union"):
+                        with self.subTest(autotune=autotune, device_cache=device_cache, new_entry=new_entry,
+                                          operation=operation):
+                            created = self._create_autotune_proxy() if autotune else self._create_proxy()
+                            kernel, proxy, cached, _, dispatch = created[:5]
+                            kernels = _KernelCache(kernel)
+                            kernels["entry"] = cached
+                            device_entry = (kernels, )
+                            kernel.device_caches[0] = device_entry
+                            kernel._jit_proxy_cache = {"held": proxy}
+                            self.assertIs(proxy(32), cached)
+                            capsule = kernel._fc_cache
+                            cache = kernel.device_caches if device_cache else kernels
+                            key = (1 if new_entry else 0) if device_cache else ("new" if new_entry else "entry")
+                            value = device_entry if device_cache else cached
+                            if operation == "assign":
+                                cache[key] = value
+                            elif operation == "update":
+                                cache.update({key: value})
+                            else:
+                                cache |= {key: value}
+                            self.assertIs(kernel._fc_cache, capsule)
+                            self.assertEqual(kernel._jit_proxy_cache, {"held": proxy})
+                            self.assertIs(proxy(32), cached)
+                            self.assertEqual(dispatch.call_count, 2)
+                            kernel.run.assert_not_called()
+                            if autotune:
+                                created[5].assert_not_called()
+
+    def test_held_proxy_checks_added_globals(self):
+        kernel, proxy, cached, fallback, dispatch = self._create_proxy()
+        self.assertIs(proxy(), cached)
+        kernel.used_global_vals[("scale", 0)] = (3, {"scale": 3})
+        self.assertIs(proxy(), fallback)
+        self.assertEqual(dispatch.call_count, 1)
+        kernel.run.assert_called_once()
+
+
+@unittest.skipUnless(torch.cuda.is_available() and torch.version.hip, "Requires a HIP GPU")
+class TestHIPJITProxyOptions(TestCase):
+    """Check compiler options through the shared HIP proxy."""
+
+    def test_hip_buffer_ops_switch_preserves_compilation_state(self):
+
+        @triton.jit(c_cache=True)
+        def write(out, value):
+            tl.store(out, value)
+
+        with knobs.nvidia.scope(), knobs.amd.scope():
+            knobs.nvidia.use_triton_dispatcher = True
+            knobs.amd.use_buffer_ops = True
+            out = torch.empty(1, device=_get_device(), dtype=torch.int32)
+            first = write[(1, )](out, 3)
+            proxy = write[(1, )]
+            knobs.amd.use_buffer_ops = False
+            changed = proxy(out, 5)
+            self.assertIsNot(changed, first)
+            torch.testing.assert_close(out, torch.full_like(out, 5))
+            knobs.amd.use_buffer_ops = True
+            with patch.object(write, "run", side_effect=AssertionError("Unexpected restored-state fallback")):
+                self.assertIs(proxy(out, 7), first)
+            torch.testing.assert_close(out, torch.full_like(out, 7))
+
+    def test_hip_stages_hook_does_not_replace_default_native_entry(self):
+        self._check_stages_hook_isolation(activate_from_pre_run=False)
+
+    def test_hip_pre_run_hook_does_not_replace_default_native_entry(self):
+        self._check_stages_hook_isolation(activate_from_pre_run=True)
+
+    def _check_stages_hook_isolation(self, activate_from_pre_run):
+
+        @triton.jit(c_cache=True)
+        def write(out, value):
+            tl.store(out, value)
+
+        def inspect_stages(self=None, stages=None, options=None, language=None, capability=None):
+            if stages is None:
+                return "hip_native_cache_isolation", "hip_native_cache_isolation_hash"
+
+        with knobs.nvidia.scope(), knobs.runtime.scope():
+            knobs.nvidia.use_triton_dispatcher = True
+            knobs.runtime.add_stages_inspection_hook = None
+            out = torch.empty(1, device=_get_device(), dtype=torch.int32)
+            first = write[(1, )](out, 3)
+            proxy = write[(1, )]
+            if activate_from_pre_run:
+
+                def enable_inspection(*args, **kwargs):
+                    knobs.runtime.add_stages_inspection_hook = inspect_stages
+
+                write.add_pre_run_hook(enable_inspection)
+            else:
+                knobs.runtime.add_stages_inspection_hook = inspect_stages
+            hooked = proxy(out, 5)
+            self.assertIsNot(hooked, first)
+            torch.testing.assert_close(out, torch.full_like(out, 5))
+            write.pre_run_hooks.clear()
+            knobs.runtime.add_stages_inspection_hook = None
+            restored = proxy(out, 7)
+            self.assertIs(restored, first)
+            torch.testing.assert_close(out, torch.full_like(out, 7))
+
+    def test_hip_options_defaults_and_invalid_arguments(self):
+
+        @triton.jit(c_cache=True)
+        def options_kernel(out, SCALE: tl.constexpr = 3):
+            tl.store(out, SCALE)
+
+        with knobs.nvidia.scope():
+            knobs.nvidia.use_triton_dispatcher = True
+            out = torch.empty(1, device=_get_device(), dtype=torch.int32)
+            options = {"num_warps": 4, "num_stages": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}
+            first = options_kernel[(1, )](out, **options)
+            self.assertIsNotNone(first._dispatcher)
+            proxy = options_kernel[(1, )]
+            self.assertEqual(type(proxy).__name__, "_JITCacheProxy")
+            with patch.object(options_kernel, "run", side_effect=AssertionError("Unexpected proxy fallback")):
+                self.assertIs(proxy(out, SCALE=3, **options), first)
+            torch.testing.assert_close(out, torch.full_like(out, 3))
+            changed = options_kernel[(1, )](out, SCALE=5, num_warps=8, num_stages=1, waves_per_eu=2,
+                                            matrix_instr_nonkdim=16)
+            self.assertEqual(changed.metadata.num_warps, 8)
+            self.assertEqual(changed.metadata.waves_per_eu, 2)
+            torch.testing.assert_close(out, torch.full_like(out, 5))
+            with self.assertRaises(TypeError):
+                proxy(out, 3, SCALE=3, **options)
+            with self.assertRaises(TypeError):
+                proxy(SCALE=3, **options)
+            with self.assertRaises(KeyError):
+                proxy(out, unknown_option=1)
 
 
 class TestUnalignedTensor(TestCase):

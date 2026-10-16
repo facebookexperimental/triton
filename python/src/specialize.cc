@@ -39,6 +39,7 @@ specialize_arg(PyObject *backend, PyObject *arg, bool is_const,
                bool specialize_value, bool align);
 
 static bool init_called = false;
+static bool interned_strings_initialized = false;
 
 const char *unicode_as_utf8(PyObject *obj);
 
@@ -235,6 +236,8 @@ PyObject *import_from(const char *module_name, const char *var_name) {
 }
 
 void init_interned_strings() {
+  if (interned_strings_initialized)
+    return;
   i32_str = intern_from_string("i32");
   i64_str = intern_from_string("i64");
   u64_str = intern_from_string("u64");
@@ -259,6 +262,7 @@ void init_interned_strings() {
 
   align_kwarg = py::make_tuple("align").release().ptr();
   tma_desc_cpu_ptr_attr = intern_from_string("tma_desc_cpu_ptr");
+  interned_strings_initialized = true;
 }
 
 void init_type_handler_cache();
@@ -797,9 +801,11 @@ struct FCCacheKey {
   ArgKeySlot slots[FC_MAX_ARGS];
   uint16_t n_args;
   uint64_t options_hash;
+  int64_t device_key;
 
   bool operator==(const FCCacheKey &other) const {
-    if (n_args != other.n_args || options_hash != other.options_hash)
+    if (n_args != other.n_args || options_hash != other.options_hash ||
+        device_key != other.device_key)
       return false;
     return memcmp(slots, other.slots, n_args * sizeof(ArgKeySlot)) == 0;
   }
@@ -815,6 +821,8 @@ struct FCCacheKeyHash {
       hash *= 1099511628211ULL;
     }
     hash ^= k.options_hash;
+    hash *= 1099511628211ULL;
+    hash ^= static_cast<uint64_t>(k.device_key);
     hash *= 1099511628211ULL;
     return hash;
   }
@@ -839,7 +847,7 @@ struct FCEntry {
   int *constexpr_positions;
   int n_constexpr;
   int *dispatch_arg_indices; // Indices into call_args for dispatcher (or NULL)
-  int n_dispatch_args;       // Length of dispatch_arg_indices (0 = legacy path)
+  int n_dispatch_args;       // Argument count; -1 means the legacy projection
   bool occupied;
 };
 
@@ -965,7 +973,7 @@ struct FastCache {
         entry->dispatcher = dispatcher;
         free(entry->dispatch_arg_indices);
         entry->dispatch_arg_indices = nullptr;
-        entry->n_dispatch_args = 0;
+        entry->n_dispatch_args = -1;
         return entry;
       }
     }
@@ -1052,7 +1060,7 @@ struct FastCache {
     table[idx].constexpr_positions = positions;
     table[idx].n_constexpr = n_ce;
     table[idx].dispatch_arg_indices = nullptr;
-    table[idx].n_dispatch_args = 0;
+    table[idx].n_dispatch_args = -1;
     table[idx].occupied = true;
     count++;
     return &table[idx];
@@ -1144,16 +1152,78 @@ slow_path:
   return is_const ? (TC_PTR_CONST_BASE + code) : (TC_PTR_BASE + code);
 }
 
+// Reuse attribute names to avoid filling CPython's type cache with copies.
+static PyObject *fc_intern_name(const char *name) {
+  static std::unordered_map<std::string, PyObject *> names;
+  auto entry = names.find(name);
+  if (entry != names.end())
+    return entry->second;
+  PyObject *value = PyUnicode_InternFromString(name);
+  if (value)
+    names.emplace(name, value);
+  return value;
+}
+
+static PyObject *fc_get_attr(PyObject *object, const char *name) {
+  PyObject *key = fc_intern_name(name);
+  return key ? PyObject_GetAttr(object, key) : nullptr;
+}
+
+static PyObject *fc_call_method(PyObject *object, const char *name) {
+  PyObject *key = fc_intern_name(name);
+  return key ? PyObject_CallMethodObjArgs(object, key, nullptr) : nullptr;
+}
+
+// Match the HIP backend storage-size predicate without the optional bridge.
+static bool fc_extract_torch_metadata(PyObject *arg, uint64_t &ptr,
+                                      uint64_t &storage_size) {
+  static PyObject *tensor_type = nullptr;
+  static PyObject *storage_type = nullptr;
+  if (!tensor_type || !storage_type) {
+    PyObject *torch_module = PyImport_ImportModule("torch");
+    if (!torch_module)
+      return false;
+    tensor_type = PyObject_GetAttrString(torch_module, "Tensor");
+    storage_type = PyObject_GetAttrString(torch_module, "UntypedStorage");
+    Py_DECREF(torch_module);
+    if (!tensor_type || !storage_type)
+      return false;
+  }
+  if (Py_TYPE(arg) != reinterpret_cast<PyTypeObject *>(tensor_type))
+    return false;
+  PyObject *storage = fc_call_method(arg, "untyped_storage");
+  if (!storage)
+    return false;
+  if (Py_TYPE(storage) != reinterpret_cast<PyTypeObject *>(storage_type)) {
+    Py_DECREF(storage);
+    return false;
+  }
+  PyObject *size = fc_call_method(storage, "size");
+  Py_DECREF(storage);
+  if (!size)
+    return false;
+  storage_size = PyLong_AsUnsignedLongLong(size);
+  Py_DECREF(size);
+  if (PyErr_Occurred())
+    return false;
+  PyObject *data_ptr = fc_call_method(arg, "data_ptr");
+  if (!data_ptr)
+    return false;
+  ptr = PyLong_AsUnsignedLongLong(data_ptr);
+  Py_DECREF(data_ptr);
+  return !PyErr_Occurred();
+}
+
 static int fc_get_tensor_specialization(PyObject *arg, uint64_t threshold,
                                         bool align) {
   int size_bit = 0;
   if (threshold) {
-    // Unknown size cannot be keyed safely; use Python specialization.
-    if (!g_tensor_api || !g_tensor_api->extract_tensor_metadata)
-      return -1;
     uint64_t ptr;
     uint64_t storage_size;
-    if (g_tensor_api->extract_tensor_metadata(arg, &ptr, &storage_size) < 0)
+    bool extracted =
+        g_tensor_api && g_tensor_api->extract_tensor_metadata &&
+        g_tensor_api->extract_tensor_metadata(arg, &ptr, &storage_size) == 0;
+    if (!extracted && !fc_extract_torch_metadata(arg, ptr, storage_size))
       return -1;
     size_bit = storage_size <= threshold ? 2 : 0;
     if (!align)
@@ -1325,12 +1395,44 @@ static Py_hash_t fc_hash_tensordesc(PyObject *arg) {
   return combined == -1 ? -2 : combined; // -1 is reserved for error
 }
 
+// Builtin constexpr values cannot run user hash or equality callbacks.
+static bool fc_is_safe_constexpr(PyObject *arg) {
+  if (Py_IsNone(arg) || PyBool_Check(arg) || PyLong_CheckExact(arg) ||
+      PyFloat_CheckExact(arg) || PyUnicode_CheckExact(arg) ||
+      PyBytes_CheckExact(arg))
+    return true;
+  if (!PyTuple_CheckExact(arg))
+    return false;
+  if (Py_EnterRecursiveCall(" in native cache constexpr") != 0)
+    return false;
+  bool supported = true;
+  Py_ssize_t count = PyTuple_Size(arg);
+  for (Py_ssize_t i = 0; supported && i < count; i++) {
+    PyObject *value = PyTuple_GetItem(arg, i);
+    supported = value && fc_is_safe_constexpr(value);
+  }
+  Py_LeaveRecursiveCall();
+  return supported;
+}
+
+static bool fc_cache_is_current(PyObject *jit_fn, PyObject *owner) {
+  PyObject *current = PyObject_GetAttr(jit_fn, fc_cache_capsule_attr);
+  if (!current) {
+    PyErr_Clear();
+    return false;
+  }
+  bool unchanged = current == owner;
+  Py_DECREF(current);
+  return unchanged;
+}
+
 // Build cache key from args. Returns false if unsupported arg type encountered.
 static bool fc_build_key(FCCacheKey &key, FastCache *cache,
                          PyObject *const *call_args, int n_args,
-                         uint64_t opts_hash) {
+                         uint64_t opts_hash, int64_t device_key) {
   key.n_args = (uint16_t)n_args;
   key.options_hash = opts_hash;
+  key.device_key = device_key;
   memset(key.slots, 0, n_args * sizeof(ArgKeySlot));
 
   for (int i = 0; i < n_args; i++) {
@@ -1340,6 +1442,8 @@ static bool fc_build_key(FCCacheKey &key, FastCache *cache,
     ParamMeta &meta = cache->param_meta[i];
 
     if (meta.is_constexpr) {
+      if (!fc_is_safe_constexpr(arg))
+        return false;
       key.slots[i].type_code = TC_CONSTEXPR;
       Py_hash_t h = PyObject_Hash(arg);
       if (h == -1) {
@@ -1350,7 +1454,7 @@ static bool fc_build_key(FCCacheKey &key, FastCache *cache,
     } else if (PyBool_Check(arg)) {
       key.slots[i].type_code = TC_U1;
       key.slots[i].align_bit = 255;
-    } else if (PyLong_Check(arg)) {
+    } else if (PyLong_CheckExact(arg)) {
       bool spec = !meta.do_not_specialize;
       bool align = !meta.do_not_specialize_on_alignment;
       int overflow;
@@ -1380,7 +1484,7 @@ static bool fc_build_key(FCCacheKey &key, FastCache *cache,
           key.slots[i].align_bit = 255;
         }
       }
-    } else if (PyFloat_Check(arg)) {
+    } else if (PyFloat_CheckExact(arg)) {
       key.slots[i].type_code =
           meta.has_annotation ? meta.annotation_type_code : TC_FP32;
       key.slots[i].align_bit = 255;
@@ -1466,17 +1570,30 @@ static bool fc_build_key(FCCacheKey &key, FastCache *cache,
   return true;
 }
 
+// Older internal callers omit the device argument after a JIT launch.
+static bool fc_get_device_key(PyObject *jit_fn, PyObject *explicit_device,
+                              int64_t &device_key) {
+  PyObject *value =
+      explicit_device ? explicit_device : fc_get_attr(jit_fn, "_fc_device_key");
+  if (!value)
+    return false;
+  device_key = PyLong_AsLongLong(value);
+  if (!explicit_device)
+    Py_DECREF(value);
+  return !PyErr_Occurred();
+}
+
 // native_fast_dispatch(jit_fn, args_tuple, params_list, options_hash,
-// grid_tuple, stream) On cache hit with dispatcher: calls dispatcher(grid_0,
+// grid_tuple, stream[, device]) On a hit, call dispatcher(grid_0,
 // grid_1, grid_2, stream, *args)
 //   and returns kernel.
 // On cache hit without dispatcher: returns kernel (Python handles
 // launch_metadata path). On miss: returns None.
 PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
                                Py_ssize_t nargs) {
-  if (nargs != 6) {
+  if (nargs < 6 || nargs > 7) {
     PyErr_SetString(PyExc_TypeError,
-                    "native_fast_dispatch expects 6 arguments");
+                    "native_fast_dispatch expects 6 or 7 arguments");
     return nullptr;
   }
 
@@ -1486,6 +1603,11 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
   PyObject *options_hash_obj = args[3];
   PyObject *grid_tuple = args[4];
   PyObject *stream_obj = args[5];
+  int64_t device_key;
+  if (!fc_get_device_key(jit_fn, nargs == 7 ? args[6] : nullptr, device_key)) {
+    PyErr_Clear();
+    Py_RETURN_NONE;
+  }
 
   if (!PyTuple_Check(call_args_tuple))
     Py_RETURN_NONE;
@@ -1508,6 +1630,13 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
     Py_RETURN_NONE;
   }
 
+  auto cache_owner =
+      from_new_ref(PyObject_GetAttr(jit_fn, fc_cache_capsule_attr));
+  if (!cache_owner) {
+    PyErr_Clear();
+    Py_RETURN_NONE;
+  }
+
   // If cache is empty, skip key building — nothing to match against.
   // Python will handle this call and insert later.
   if (!cache->table || cache->count == 0)
@@ -1521,8 +1650,11 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
     if (!ca[i])
       return nullptr;
   }
-  if (!fc_build_key(key, cache, ca, (int)n, opts_hash))
+  if (!fc_build_key(key, cache, ca, (int)n, opts_hash, device_key) ||
+      !fc_cache_is_current(jit_fn, cache_owner.ptr())) {
+    PyErr_Clear();
     Py_RETURN_NONE;
+  }
 
   // Lookup: returns entry on hit, nullptr on miss
   FCEntry *entry = cache->lookup(key, ca);
@@ -1541,7 +1673,7 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
       return nullptr;
     // Determine kernel args count and build vectorcall args
     int n_kernel_args = 0;
-    if (entry->n_dispatch_args > 0) {
+    if (entry->n_dispatch_args >= 0) {
       n_kernel_args = entry->n_dispatch_args;
     } else {
       for (Py_ssize_t i = 0; i < n && i < cache->n_params; i++) {
@@ -1558,7 +1690,7 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
     if (!vc_args[0] || !vc_args[1] || !vc_args[2])
       return nullptr;
     vc_args[3] = stream_obj;
-    if (entry->n_dispatch_args > 0) {
+    if (entry->n_dispatch_args >= 0) {
       // Use stored dispatch_arg_indices to select only the args the dispatcher
       // expects
       for (int j = 0; j < entry->n_dispatch_args; j++)
@@ -1577,15 +1709,18 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
       PyErr_Clear();
       return nullptr;
     }
+    // Keep dispatch objects alive after a reentrant cache clear.
+    Py_INCREF(kernel);
+    Py_INCREF(dispatcher);
     PyObject *result =
         PyObject_Vectorcall(dispatcher, vc_args, vc_nargs, nullptr);
+    Py_DECREF(dispatcher);
     if (!result) {
-      // Dispatcher vectorcall failed — propagate the error rather than
-      // silently falling back (the caller would not re-launch the kernel).
+      // Propagate errors after a possible launch.
+      Py_DECREF(kernel);
       return nullptr;
     }
     Py_DECREF(result);
-    Py_INCREF(kernel);
     return kernel;
   }
 
@@ -1595,12 +1730,12 @@ PyObject *native_fast_dispatch(PyObject *self, PyObject *const *args,
 }
 
 // native_fast_dispatch_insert(jit_fn, args_tuple, params_list, options_hash,
-// kernel, dispatcher, dispatch_indices)
+// kernel, dispatcher, dispatch_indices[, device])
 PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
                                       Py_ssize_t nargs) {
-  if (nargs != 7) {
+  if (nargs < 7 || nargs > 8) {
     PyErr_SetString(PyExc_TypeError,
-                    "native_fast_dispatch_insert expects 7 arguments");
+                    "native_fast_dispatch_insert expects 7 or 8 arguments");
     return nullptr;
   }
 
@@ -1611,6 +1746,11 @@ PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
   PyObject *kernel = args[4];
   PyObject *dispatcher = args[5];
   PyObject *dispatch_indices = args[6];
+  int64_t device_key;
+  if (!fc_get_device_key(jit_fn, nargs == 8 ? args[7] : nullptr, device_key)) {
+    PyErr_Clear();
+    Py_RETURN_NONE;
+  }
 
   if (!PyTuple_Check(call_args_tuple))
     Py_RETURN_NONE;
@@ -1633,11 +1773,17 @@ PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
     Py_RETURN_NONE;
   }
 
+  auto cache_owner =
+      from_new_ref(PyObject_GetAttr(jit_fn, fc_cache_capsule_attr));
+  if (!cache_owner) {
+    PyErr_Clear();
+    Py_RETURN_NONE;
+  }
+
   // Binding precedes insertion, so the threshold is available by the time the
   // first entry is built. Before then, lookups skip key construction entirely.
   if (cache->count == 0) {
-    PyObject *value =
-        PyObject_GetAttrString(jit_fn, "_fc_tensor_size_threshold");
+    PyObject *value = fc_get_attr(jit_fn, "_fc_tensor_size_threshold");
     if (!value) {
       PyErr_Clear();
       Py_RETURN_NONE;
@@ -1657,8 +1803,11 @@ PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
     if (!ca[i])
       return nullptr;
   }
-  if (!fc_build_key(key, cache, ca, (int)n, opts_hash))
+  if (!fc_build_key(key, cache, ca, (int)n, opts_hash, device_key) ||
+      !fc_cache_is_current(jit_fn, cache_owner.ptr())) {
+    PyErr_Clear();
     Py_RETURN_NONE;
+  }
 
   PyObject *disp = (dispatcher == Py_None) ? nullptr : dispatcher;
   FCEntry *entry = cache->insert(key, kernel, disp, ca, (int)n);
@@ -1668,7 +1817,9 @@ PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
     Py_ssize_t n_indices = PyTuple_Size(dispatch_indices);
     if (n_indices < 0)
       return nullptr;
-    if (n_indices > 0) {
+    if (n_indices == 0 && entry) {
+      cache->set_dispatch_indices(entry, nullptr, 0);
+    } else if (n_indices > 0) {
       int *indices = (int *)malloc(n_indices * sizeof(int));
       if (indices) {
         for (Py_ssize_t i = 0; i < n_indices; i++) {
@@ -1705,6 +1856,12 @@ typedef struct {
   PyObject *device_getter;     // driver.active.get_current_device
   PyObject *param_name_to_idx; // dict: param_name → positional index
   PyObject *kernel_name;       // interned _fn_name for stats (may be NULL)
+  PyObject *param_defaults;
+  PyObject *empty_default;
+  PyObject *runtime_knobs;
+  PyObject *compilation_knobs;
+  PyObject *nvidia_knobs;
+  PyObject *amd_knobs;
   uint64_t options_hash;
   int n_params;
 } JITCacheProxy;
@@ -1714,77 +1871,196 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
                                           PyObject *kwnames);
 static void JITCacheProxy_dealloc(PyObject *o);
 
+// Read mutable launch state before a held proxy dispatches a cache hit.
+static bool fc_attr_has_truth(PyObject *object, const char *name,
+                              bool expected) {
+  PyObject *value = fc_get_attr(object, name);
+  if (!value)
+    return false;
+  int truth = PyObject_IsTrue(value);
+  Py_DECREF(value);
+  return truth >= 0 && (truth != 0) == expected;
+}
+
+static bool fc_attr_is_none(PyObject *object, const char *name) {
+  PyObject *value = fc_get_attr(object, name);
+  if (!value)
+    return false;
+  bool is_none = value == Py_None;
+  Py_DECREF(value);
+  return is_none;
+}
+
+static bool fc_can_bypass_python(PyObject *jit_fn, PyObject *runtime_knobs,
+                                 PyObject *compilation_knobs,
+                                 PyObject *nvidia_knobs, PyObject *amd_knobs) {
+  if (!fc_attr_has_truth(jit_fn, "c_cache", true) ||
+      !fc_attr_has_truth(jit_fn, "used_global_vals", false) ||
+      !fc_attr_has_truth(jit_fn, "pre_run_hooks", false) ||
+      !fc_attr_has_truth(jit_fn, "launch_metadata", false) ||
+      !fc_attr_has_truth(jit_fn, "debug", false) ||
+      !fc_attr_has_truth(runtime_knobs, "debug", false) ||
+      !fc_attr_has_truth(runtime_knobs, "sanitize_overflow", false) ||
+      !fc_attr_has_truth(runtime_knobs, "launch_enter_hook", false) ||
+      !fc_attr_has_truth(runtime_knobs, "launch_exit_hook", false) ||
+      !fc_attr_has_truth(compilation_knobs, "always_compile", false) ||
+      !fc_attr_has_truth(compilation_knobs, "instrumentation_mode", false) ||
+      !fc_attr_has_truth(compilation_knobs, "fpsan_homomorphic_casts", false) ||
+      !fc_attr_has_truth(nvidia_knobs, "use_triton_dispatcher", true))
+    return false;
+  PyObject *backend = fc_get_attr(jit_fn, "_fc_backend");
+  if (!backend)
+    return false;
+  int is_hip = PyUnicode_CompareWithASCIIString(backend, "hip");
+  Py_DECREF(backend);
+  if (PyErr_Occurred())
+    return false;
+  if (is_hip == 0) {
+    PyObject *threshold = fc_get_attr(jit_fn, "_fc_tensor_size_threshold");
+    if (!threshold)
+      return false;
+    int threshold_enabled = PyObject_IsTrue(threshold);
+    Py_DECREF(threshold);
+    if (threshold_enabled < 0 ||
+        !fc_attr_has_truth(amd_knobs, "use_buffer_ops", threshold_enabled != 0))
+      return false;
+  }
+  return fc_attr_is_none(runtime_knobs, "add_stages_inspection_hook");
+}
+
+// Match hash(tuple(sorted(opts.items()))) for flat, hashable options.
+// Container options use the standard JIT path and its _make_hashable helper.
+static bool fc_hash_flat_options(PyObject *options, uint64_t &result) {
+  Py_ssize_t position = 0;
+  PyObject *name = nullptr, *value = nullptr;
+  while (PyDict_Next(options, &position, &name, &value)) {
+    if (PyDict_Check(value) || PyList_Check(value) || PyAnySet_Check(value))
+      return false;
+  }
+  PyObject *items = PyDict_Items(options);
+  if (!items)
+    return false;
+  if (PyList_Sort(items) < 0) {
+    Py_DECREF(items);
+    return false;
+  }
+  PyObject *key = PyList_AsTuple(items);
+  Py_DECREF(items);
+  if (!key)
+    return false;
+  Py_hash_t hash = PyObject_Hash(key);
+  Py_DECREF(key);
+  if (hash == -1 && PyErr_Occurred())
+    return false;
+  result = static_cast<uint64_t>(hash);
+  return true;
+}
+
 static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
                                           PyObject *const *args, size_t nargsf,
                                           PyObject *kwnames) {
   JITCacheProxy *self = (JITCacheProxy *)callable;
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  PyObject **merged_args = nullptr;
-  PyObject *const *effective_args = args;
-  int effective_nargs = (int)nargs;
   Py_ssize_t nkw = kwnames ? PyTuple_Size(kwnames) : 0;
   if (nkw < 0)
     return nullptr;
+  PyObject *merged_args[FC_MAX_ARGS];
+  PyObject *const *effective_args = merged_args;
+  int effective_nargs = self->n_params;
+  uint64_t options_hash = self->options_hash;
+  PyObject *device = nullptr;
+  PyObject *stream_obj = nullptr;
+  int64_t device_key;
 
-  // When kwargs are present, merge them into positional args in C.
-  // This mirrors the Python-side logic in jit.py run() c_cache path.
+  if (self->n_params > FC_MAX_ARGS || nargs > self->n_params ||
+      !fc_can_bypass_python(self->jit_fn, self->runtime_knobs,
+                            self->compilation_knobs, self->nvidia_knobs,
+                            self->amd_knobs))
+    goto fallback;
+  for (int i = 0; i < self->n_params; i++)
+    merged_args[i] = i < nargs ? args[i] : nullptr;
+
   if (nkw > 0) {
-    if (!self->param_name_to_idx) {
+    if (!self->param_name_to_idx)
       goto fallback;
-    }
-    int total = self->n_params;
-    // Allocate merged array on stack (max ~64 params for typical kernels)
-    merged_args = (PyObject **)alloca(total * sizeof(PyObject *));
-    // Copy positional args
-    for (int i = 0; i < total; i++)
-      merged_args[i] = (i < (int)nargs) ? (PyObject *)args[i] : Py_None;
-    // Merge kwargs by name lookup
+    PyObject *options = PyDict_New();
+    if (!options)
+      return nullptr;
     for (Py_ssize_t ki = 0; ki < nkw; ki++) {
       PyObject *name = PyTuple_GetItem(kwnames, ki);
-      if (!name)
+      PyObject *idx_obj =
+          name ? PyDict_GetItemWithError(self->param_name_to_idx, name)
+               : nullptr;
+      if (PyErr_Occurred()) {
+        Py_DECREF(options);
         return nullptr;
-      PyObject *idx_obj = PyDict_GetItem(self->param_name_to_idx, name);
-      if (idx_obj) {
-        int idx = (int)PyLong_AsLong(idx_obj);
-        if (idx >= 0 && idx < total)
-          merged_args[idx] = (PyObject *)args[nargs + ki];
       }
-      // kwargs not in param_name_to_idx are "options" — affect hash only.
-      // For now, treat them as cache-miss (different options_hash) and
-      // fallback.
-      else
-        goto fallback;
+      if (idx_obj) {
+        long idx = PyLong_AsLong(idx_obj);
+        if (PyErr_Occurred()) {
+          Py_DECREF(options);
+          return nullptr;
+        }
+        if (idx < 0 || idx >= self->n_params || merged_args[idx]) {
+          Py_DECREF(options);
+          goto fallback;
+        }
+        merged_args[idx] = args[nargs + ki];
+      } else if (!name || PyDict_SetItem(options, name, args[nargs + ki]) < 0) {
+        Py_DECREF(options);
+        return nullptr;
+      }
     }
-    effective_args = merged_args;
-    effective_nargs = total;
-  } else if (nargs > self->n_params) {
-    goto fallback;
-  } else if (nargs < self->n_params) {
-    // Pad missing trailing args (constexpr params not passed positionally)
-    // with Py_None to match the FastCache insertion key.
-    int total = self->n_params;
-    merged_args = (PyObject **)alloca(total * sizeof(PyObject *));
-    for (int i = 0; i < (int)nargs; i++)
-      merged_args[i] = (PyObject *)args[i];
-    for (int i = (int)nargs; i < total; i++)
-      merged_args[i] = Py_None;
-    effective_args = merged_args;
-    effective_nargs = total;
+    bool hash_ok = PyDict_Size(options) == 0 ||
+                   fc_hash_flat_options(options, options_hash);
+    Py_DECREF(options);
+    if (!hash_ok)
+      goto fallback;
   }
+  for (int i = 0; i < self->n_params; i++) {
+    if (!merged_args[i]) {
+      PyObject *value = PyTuple_GetItem(self->param_defaults, i);
+      if (!value)
+        return nullptr;
+      if (value == self->empty_default)
+        goto fallback;
+      merged_args[i] = value;
+    }
+  }
+
+  device = PyObject_CallNoArgs(self->device_getter);
+  if (!device || !fc_get_device_key(self->jit_fn, device, device_key))
+    goto fallback;
+  stream_obj =
+      PyObject_CallFunctionObjArgs(self->stream_getter, device, nullptr);
+  Py_CLEAR(device);
+  if (!stream_obj)
+    goto fallback;
 
   {
     FastCache *cache =
         fc_get_or_create(self->jit_fn, self->params_list, self->n_params);
     if (!cache || !cache->table || cache->count == 0)
       goto fallback;
+    auto cache_owner =
+        from_new_ref(PyObject_GetAttr(self->jit_fn, fc_cache_capsule_attr));
+    if (!cache_owner)
+      goto fallback;
 
     FCCacheKey key;
-    if (!fc_build_key(key, cache, effective_args, effective_nargs,
-                      self->options_hash))
+    if (!fc_build_key(key, cache, effective_args, effective_nargs, options_hash,
+                      device_key) ||
+        !fc_cache_is_current(self->jit_fn, cache_owner.ptr()))
       goto fallback;
 
     FCEntry *entry = cache->lookup(key, effective_args);
     if (!entry)
+      goto fallback;
+    // Argument and driver callbacks can change launch state after entry.
+    if (!fc_can_bypass_python(self->jit_fn, self->runtime_knobs,
+                              self->compilation_knobs, self->nvidia_knobs,
+                              self->amd_knobs) ||
+        !fc_cache_is_current(self->jit_fn, cache_owner.ptr()))
       goto fallback;
 
     PyObject *kernel = entry->kernel;
@@ -1793,24 +2069,10 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     if (!dispatcher)
       goto fallback;
 
-    // Get stream
-    PyObject *dev = PyObject_CallNoArgs(self->device_getter);
-    if (!dev) {
-      PyErr_Clear();
-      goto fallback;
-    }
-    PyObject *stream_obj =
-        PyObject_CallFunctionObjArgs(self->stream_getter, dev, nullptr);
-    Py_DECREF(dev);
-    if (!stream_obj) {
-      PyErr_Clear();
-      goto fallback;
-    }
-
     // Build dispatcher vectorcall args: grid0, grid1, grid2, stream,
     // *kernel_args
     int n_kernel_args = 0;
-    if (entry->n_dispatch_args > 0) {
+    if (entry->n_dispatch_args >= 0) {
       n_kernel_args = entry->n_dispatch_args;
     } else {
       for (int i = 0; i < effective_nargs && i < cache->n_params; i++) {
@@ -1824,7 +2086,7 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     vc_args[1] = self->grid_py[1];
     vc_args[2] = self->grid_py[2];
     vc_args[3] = stream_obj;
-    if (entry->n_dispatch_args > 0) {
+    if (entry->n_dispatch_args >= 0) {
       for (int j = 0; j < entry->n_dispatch_args; j++)
         vc_args[4 + j] = effective_args[entry->dispatch_arg_indices[j]];
     } else {
@@ -1840,25 +2102,30 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     // "returned a result with an exception set".
     if (PyErr_Occurred()) {
       PyErr_Clear();
-      Py_DECREF(stream_obj);
       goto fallback;
     }
+    // The dispatcher can release the GIL or clear the cache.
+    Py_INCREF(kernel);
+    Py_INCREF(dispatcher);
     PyObject *result =
         PyObject_Vectorcall(dispatcher, vc_args, vc_nargs, nullptr);
-    Py_DECREF(stream_obj);
+    Py_DECREF(dispatcher);
+    Py_CLEAR(stream_obj);
     if (!result) {
-      // Propagate error — dispatcher may have partially launched.
-      // Do NOT fallback (would risk double-launch).
+      // Propagate errors after a possible launch.
+      Py_DECREF(kernel);
       return nullptr;
     }
     Py_DECREF(result);
-    Py_INCREF(kernel);
     if (g_cache_stats)
       cache_stats_record(self->kernel_name, "jit_proxy_hit");
     return kernel;
   }
 
 fallback:
+  Py_XDECREF(device);
+  Py_XDECREF(stream_obj);
+  PyErr_Clear();
   // Fall through to Python: self.run(*args, grid=grid, warmup=False, **kwargs)
   // Use Vectorcall to preserve any keyword arguments from kwnames.
   if (g_cache_stats)
@@ -1950,6 +2217,12 @@ static void JITCacheProxy_dealloc(PyObject *o) {
   Py_XDECREF(self->device_getter);
   Py_XDECREF(self->param_name_to_idx);
   Py_XDECREF(self->kernel_name);
+  Py_XDECREF(self->param_defaults);
+  Py_XDECREF(self->empty_default);
+  Py_XDECREF(self->runtime_knobs);
+  Py_XDECREF(self->compilation_knobs);
+  Py_XDECREF(self->nvidia_knobs);
+  Py_XDECREF(self->amd_knobs);
 #ifdef Py_LIMITED_API
   PyTypeObject *type = Py_TYPE(o);
   PyObject_GC_Del(o);
@@ -1971,6 +2244,12 @@ static int JITCacheProxy_traverse(PyObject *o, visitproc visit, void *arg) {
   Py_VISIT(self->device_getter);
   Py_VISIT(self->param_name_to_idx);
   Py_VISIT(self->kernel_name);
+  Py_VISIT(self->param_defaults);
+  Py_VISIT(self->empty_default);
+  Py_VISIT(self->runtime_knobs);
+  Py_VISIT(self->compilation_knobs);
+  Py_VISIT(self->nvidia_knobs);
+  Py_VISIT(self->amd_knobs);
   return 0;
 }
 
@@ -1981,6 +2260,12 @@ static int JITCacheProxy_clear(PyObject *o) {
   Py_CLEAR(self->run_partial);
   Py_CLEAR(self->param_name_to_idx);
   Py_CLEAR(self->kernel_name);
+  Py_CLEAR(self->param_defaults);
+  Py_CLEAR(self->empty_default);
+  Py_CLEAR(self->runtime_knobs);
+  Py_CLEAR(self->compilation_knobs);
+  Py_CLEAR(self->nvidia_knobs);
+  Py_CLEAR(self->amd_knobs);
   Py_CLEAR(self->grid_py[0]);
   Py_CLEAR(self->grid_py[1]);
   Py_CLEAR(self->grid_py[2]);
@@ -2127,12 +2412,69 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
     return nullptr;
   }
 
-  JITCacheProxy *proxy =
-      (JITCacheProxy *)PyObject_GC_New(JITCacheProxy, JITCacheProxyType);
-  if (!proxy) {
+  PyObject *inspect_mod = PyImport_ImportModule("inspect");
+  PyObject *parameter =
+      inspect_mod ? PyObject_GetAttrString(inspect_mod, "Parameter") : nullptr;
+  Py_XDECREF(inspect_mod);
+  PyObject *empty_default =
+      parameter ? PyObject_GetAttrString(parameter, "empty") : nullptr;
+  Py_XDECREF(parameter);
+  PyObject *param_defaults = empty_default ? PyTuple_New(n_params) : nullptr;
+  if (!param_defaults) {
+    Py_XDECREF(empty_default);
     Py_DECREF(run_partial);
     return nullptr;
   }
+  for (int i = 0; i < n_params; i++) {
+    PyObject *param = PyList_GetItem(params_list, i);
+    PyObject *value =
+        param ? PyObject_GetAttrString(param, "default") : nullptr;
+    if (!value || PyTuple_SetItem(param_defaults, i, value) < 0) {
+      Py_DECREF(param_defaults);
+      Py_DECREF(empty_default);
+      Py_DECREF(run_partial);
+      return nullptr;
+    }
+  }
+  PyObject *knobs_mod = PyImport_ImportModule("triton.knobs");
+  PyObject *runtime_knobs =
+      knobs_mod ? PyObject_GetAttrString(knobs_mod, "runtime") : nullptr;
+  PyObject *compilation_knobs =
+      runtime_knobs ? PyObject_GetAttrString(knobs_mod, "compilation")
+                    : nullptr;
+  PyObject *nvidia_knobs =
+      compilation_knobs ? PyObject_GetAttrString(knobs_mod, "nvidia") : nullptr;
+  PyObject *amd_knobs =
+      nvidia_knobs ? PyObject_GetAttrString(knobs_mod, "amd") : nullptr;
+  Py_XDECREF(knobs_mod);
+  if (!amd_knobs) {
+    Py_XDECREF(nvidia_knobs);
+    Py_XDECREF(runtime_knobs);
+    Py_XDECREF(compilation_knobs);
+    Py_DECREF(param_defaults);
+    Py_DECREF(empty_default);
+    Py_DECREF(run_partial);
+    return nullptr;
+  }
+
+  JITCacheProxy *proxy =
+      (JITCacheProxy *)PyObject_GC_New(JITCacheProxy, JITCacheProxyType);
+  if (!proxy) {
+    Py_DECREF(amd_knobs);
+    Py_DECREF(nvidia_knobs);
+    Py_DECREF(compilation_knobs);
+    Py_DECREF(runtime_knobs);
+    Py_DECREF(param_defaults);
+    Py_DECREF(empty_default);
+    Py_DECREF(run_partial);
+    return nullptr;
+  }
+  proxy->param_defaults = param_defaults;
+  proxy->empty_default = empty_default;
+  proxy->runtime_knobs = runtime_knobs;
+  proxy->compilation_knobs = compilation_knobs;
+  proxy->nvidia_knobs = nvidia_knobs;
+  proxy->amd_knobs = amd_knobs;
   proxy->vectorcall = JITCacheProxy_vectorcall;
   proxy->jit_fn = jit_fn;
   Py_INCREF(jit_fn);
@@ -2329,7 +2671,12 @@ typedef struct {
   PyObject *grid_fn;           // callable grid, or NULL for static
   PyObject *grid_static;       // static grid tuple, or NULL for callable
   PyObject *param_name_to_idx; // dict for kwargs→positional merging (or NULL)
-  int *key_indices;            // positions in args for autotuner key
+  PyObject *runtime_knobs;
+  PyObject *compilation_knobs;
+  PyObject *nvidia_knobs;
+  PyObject *autotuning_knobs;
+  PyObject *amd_knobs;
+  int *key_indices; // positions in args for autotuner key
   int n_key_indices;
   int *dtype_indices; // positions of tensor args (for dtype in key)
   int n_dtype_indices;
@@ -2356,8 +2703,12 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
                                                size_t nargsf,
                                                PyObject *kwnames) {
   AutotuneCacheProxy *self = (AutotuneCacheProxy *)callable;
+  py::object cache_owner;
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
   PyObject *e_pre_hook = nullptr; // owned ref, cleaned up at fallback
+  PyObject *device = nullptr;
+  PyObject *stream_obj = nullptr;
+  int64_t device_key;
 
   // Handle kwargs: merge into positional array using param_name_to_idx
   PyObject *const *effective_args = args;
@@ -2366,6 +2717,13 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
   Py_ssize_t nkw = kwnames ? PyTuple_Size(kwnames) : 0;
   if (nkw < 0)
     return nullptr;
+  if (!fc_can_bypass_python(self->jit_fn, self->runtime_knobs,
+                            self->compilation_knobs, self->nvidia_knobs,
+                            self->amd_knobs) ||
+      !fc_attr_has_truth(self->nvidia_knobs, "use_autotune_c_cache", true))
+    goto fallback;
+  if (!fc_attr_is_none(self->autotuning_knobs, "listener"))
+    goto fallback;
   if (nkw > 0) {
     if (!self->param_name_to_idx) {
       goto fallback;
@@ -2598,33 +2956,45 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
     }
 
     // 6. Dispatch via native_fast_dispatch (reuse existing JIT C cache)
-    FastCache *cache =
-        fc_get_or_create(self->jit_fn, self->params_list, self->n_params);
+    FastCache *cache = nullptr;
+    FCCacheKey fc_key;
+    device = PyObject_CallNoArgs(self->device_getter);
+    if (!device || !fc_get_device_key(self->jit_fn, device, device_key)) {
+      PyErr_Clear();
+      goto grid_cleanup;
+    }
+    stream_obj =
+        PyObject_CallFunctionObjArgs(self->stream_getter, device, nullptr);
+    Py_CLEAR(device);
+    if (!stream_obj) {
+      PyErr_Clear();
+      goto grid_cleanup;
+    }
+    cache = fc_get_or_create(self->jit_fn, self->params_list, self->n_params);
     if (!cache)
       goto grid_cleanup;
-
-    FCCacheKey fc_key;
-    if (!fc_build_key(fc_key, cache, full_args, full_nargs, e_options_hash))
+    cache_owner =
+        from_new_ref(PyObject_GetAttr(self->jit_fn, fc_cache_capsule_attr));
+    if (!cache_owner)
+      goto grid_cleanup;
+    if (!fc_build_key(fc_key, cache, full_args, full_nargs, e_options_hash,
+                      device_key) ||
+        !fc_cache_is_current(self->jit_fn, cache_owner.ptr()))
       goto grid_cleanup;
 
     {
       FCEntry *fc_entry = cache->lookup(fc_key, full_args);
       if (!fc_entry || !fc_entry->dispatcher)
         goto grid_cleanup;
-
-      // Get stream
-      PyObject *dev = PyObject_CallNoArgs(self->device_getter);
-      if (!dev) {
-        PyErr_Clear();
+      // Autotune hooks, grids, and driver callbacks can change launch state.
+      if (!fc_can_bypass_python(self->jit_fn, self->runtime_knobs,
+                                self->compilation_knobs, self->nvidia_knobs,
+                                self->amd_knobs) ||
+          !fc_attr_has_truth(self->nvidia_knobs, "use_autotune_c_cache",
+                             true) ||
+          !fc_attr_is_none(self->autotuning_knobs, "listener") ||
+          !fc_cache_is_current(self->jit_fn, cache_owner.ptr()))
         goto grid_cleanup;
-      }
-      PyObject *stream_obj =
-          PyObject_CallFunctionObjArgs(self->stream_getter, dev, nullptr);
-      Py_DECREF(dev);
-      if (!stream_obj) {
-        PyErr_Clear();
-        goto grid_cleanup;
-      }
 
       // Extract grid values
       Py_ssize_t gs = PyTuple_Check(grid_tuple) ? PyTuple_Size(grid_tuple) : 0;
@@ -2645,7 +3015,7 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
       // Use dispatch_arg_indices when available (handles None pointer args
       // correctly by only passing args the dispatcher actually needs).
       int n_kernel_args = 0;
-      if (fc_entry->n_dispatch_args > 0) {
+      if (fc_entry->n_dispatch_args >= 0) {
         n_kernel_args = fc_entry->n_dispatch_args;
       } else {
         for (int i = 0; i < full_nargs && i < cache->n_params; i++) {
@@ -2659,7 +3029,7 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
       vc_args[1] = g1;
       vc_args[2] = g2;
       vc_args[3] = stream_obj;
-      if (fc_entry->n_dispatch_args > 0) {
+      if (fc_entry->n_dispatch_args >= 0) {
         // Use stored dispatch_arg_indices to select only the args the
         // dispatcher expects (skips None pointers, TMA shadow slots, etc.)
         for (int j = 0; j < fc_entry->n_dispatch_args; j++)
@@ -2676,33 +3046,43 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
       // SystemError ("returned a result with an exception set") in td_get_ptr.
       if (PyErr_Occurred()) {
         PyErr_Clear();
-        Py_DECREF(stream_obj);
         goto grid_cleanup;
       }
+      PyObject *kernel = fc_entry->kernel;
+      PyObject *dispatcher = fc_entry->dispatcher;
+      // Keep dispatch objects alive after a reentrant cache clear.
+      Py_INCREF(kernel);
+      Py_INCREF(dispatcher);
       PyObject *result =
-          PyObject_Vectorcall(fc_entry->dispatcher, vc_args, vc_nargs, nullptr);
-      Py_DECREF(stream_obj);
+          PyObject_Vectorcall(dispatcher, vc_args, vc_nargs, nullptr);
+      Py_DECREF(dispatcher);
+      Py_CLEAR(stream_obj);
       if (grid_needs_decref)
         Py_DECREF(grid_tuple);
       if (!result) {
+        Py_DECREF(kernel);
         Py_XDECREF(e_pre_hook);
         return nullptr;
       }
       Py_DECREF(result);
       Py_XDECREF(e_pre_hook);
-      Py_INCREF(fc_entry->kernel);
       if (g_cache_stats)
         cache_stats_record(self->kernel_name, "autotune_proxy_hit");
-      return fc_entry->kernel;
+      return kernel;
     }
 
   grid_cleanup:
+    Py_CLEAR(device);
+    Py_CLEAR(stream_obj);
     if (grid_needs_decref)
       Py_DECREF(grid_tuple);
   }
 
 fallback:
+  Py_XDECREF(device);
+  Py_XDECREF(stream_obj);
   Py_XDECREF(e_pre_hook);
+  PyErr_Clear();
   if (g_cache_stats)
     cache_stats_record(self->kernel_name, "autotune_proxy_fallback");
   return PyObject_Vectorcall(self->fallback_run, args, nargsf, kwnames);
@@ -2727,6 +3107,11 @@ static void AutotuneCacheProxy_dealloc(PyObject *o) {
   Py_XDECREF(self->grid_fn);
   Py_XDECREF(self->grid_static);
   Py_XDECREF(self->param_name_to_idx);
+  Py_XDECREF(self->runtime_knobs);
+  Py_XDECREF(self->compilation_knobs);
+  Py_XDECREF(self->nvidia_knobs);
+  Py_XDECREF(self->amd_knobs);
+  Py_XDECREF(self->autotuning_knobs);
   Py_XDECREF(self->kernel_name);
   free(self->key_indices);
   free(self->dtype_indices);
@@ -2758,6 +3143,11 @@ static int AutotuneCacheProxy_traverse(PyObject *o, visitproc visit,
   Py_VISIT(self->grid_fn);
   Py_VISIT(self->grid_static);
   Py_VISIT(self->param_name_to_idx);
+  Py_VISIT(self->runtime_knobs);
+  Py_VISIT(self->compilation_knobs);
+  Py_VISIT(self->nvidia_knobs);
+  Py_VISIT(self->amd_knobs);
+  Py_VISIT(self->autotuning_knobs);
   Py_VISIT(self->kernel_name);
   for (size_t i = 0; i < self->at_table.size(); i++) {
     if (self->at_table[i].occupied) {
@@ -2782,6 +3172,11 @@ static int AutotuneCacheProxy_clear(PyObject *o) {
   Py_CLEAR(self->grid_fn);
   Py_CLEAR(self->grid_static);
   Py_CLEAR(self->param_name_to_idx);
+  Py_CLEAR(self->runtime_knobs);
+  Py_CLEAR(self->compilation_knobs);
+  Py_CLEAR(self->nvidia_knobs);
+  Py_CLEAR(self->amd_knobs);
+  Py_CLEAR(self->autotuning_knobs);
   Py_CLEAR(self->kernel_name);
   for (size_t i = 0; i < self->at_table.size(); i++) {
     if (self->at_table[i].occupied) {
@@ -2904,14 +3299,47 @@ PyObject *native_create_autotune_proxy(PyObject *self_unused,
     return nullptr;
   }
 
-  AutotuneCacheProxy *proxy = (AutotuneCacheProxy *)PyObject_GC_New(
-      AutotuneCacheProxy, AutotuneCacheProxyType);
-  if (!proxy) {
+  PyObject *knobs_mod = PyImport_ImportModule("triton.knobs");
+  PyObject *runtime_knobs =
+      knobs_mod ? PyObject_GetAttrString(knobs_mod, "runtime") : nullptr;
+  PyObject *compilation_knobs =
+      runtime_knobs ? PyObject_GetAttrString(knobs_mod, "compilation")
+                    : nullptr;
+  PyObject *nvidia_knobs =
+      compilation_knobs ? PyObject_GetAttrString(knobs_mod, "nvidia") : nullptr;
+  PyObject *autotuning_knobs =
+      nvidia_knobs ? PyObject_GetAttrString(knobs_mod, "autotuning") : nullptr;
+  PyObject *amd_knobs =
+      autotuning_knobs ? PyObject_GetAttrString(knobs_mod, "amd") : nullptr;
+  Py_XDECREF(knobs_mod);
+  if (!amd_knobs) {
+    Py_XDECREF(autotuning_knobs);
+    Py_XDECREF(runtime_knobs);
+    Py_XDECREF(compilation_knobs);
+    Py_XDECREF(nvidia_knobs);
     free(key_indices);
     free(dtype_indices);
     return nullptr;
   }
 
+  AutotuneCacheProxy *proxy = (AutotuneCacheProxy *)PyObject_GC_New(
+      AutotuneCacheProxy, AutotuneCacheProxyType);
+  if (!proxy) {
+    Py_DECREF(amd_knobs);
+    Py_DECREF(runtime_knobs);
+    Py_DECREF(compilation_knobs);
+    Py_DECREF(nvidia_knobs);
+    Py_DECREF(autotuning_knobs);
+    free(key_indices);
+    free(dtype_indices);
+    return nullptr;
+  }
+
+  proxy->runtime_knobs = runtime_knobs;
+  proxy->compilation_knobs = compilation_knobs;
+  proxy->nvidia_knobs = nvidia_knobs;
+  proxy->autotuning_knobs = autotuning_knobs;
+  proxy->amd_knobs = amd_knobs;
   proxy->vectorcall = AutotuneCacheProxy_vectorcall;
   proxy->jit_fn = jit_fn;
   Py_INCREF(jit_fn);
@@ -3267,6 +3695,8 @@ static PyMethodDef module_methods[] = {
 } // anonymous namespace
 
 void init_native_specialize(nanobind::module_ &m) {
+  // Native cache entry points can precede regular JIT specialization.
+  init_interned_strings();
   // Initialize JITCacheProxy type
   if (_init_jit_cache_proxy_type() < 0)
     return;

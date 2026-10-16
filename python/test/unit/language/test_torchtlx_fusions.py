@@ -828,6 +828,71 @@ class TestTorchTLXEpilogueFusion(TestCase):
 
     @unittest.skipIf(
         not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template fusion codegen API (old ROCm nightly)",
+    )
+    @parametrize("case", GEMM_NORM_TEST_CASES)
+    def test_tlx_matmul_norm_is_fused_with_dynamic_batch(
+        self,
+        case: tuple[str, tuple[int, int, int]],
+    ):
+        """A dynamic batch dim must still build the direct-to-LDS fused plans.
+
+        The register-resident GEMM takes M as a constexpr and cannot serve a
+        symbolic M; the LDS path must, including its split-K plans.
+        """
+        norm_kind, (m, k, n) = case
+        dtype = torch.bfloat16
+        x = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
+        weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype)
+        gemm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        scale = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        norm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+
+        def matmul_norm(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            gemm_bias: torch.Tensor,
+            scale: torch.Tensor,
+            norm_bias: torch.Tensor,
+        ) -> torch.Tensor:
+            gemm = torch.addmm(gemm_bias, x, weight.t())
+            return _normalize(gemm, scale, norm_bias, norm_kind)
+
+        torch._dynamo.mark_dynamic(x, 0)
+        with torch.no_grad():
+            expected = matmul_norm(x, weight, gemm_bias, scale, norm_bias)
+            with config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+            }):
+                actual, code = run_and_get_code(
+                    torch.compile(matmul_norm, fullgraph=True),
+                    x,
+                    weight,
+                    gemm_bias,
+                    scale,
+                    norm_bias,
+                )
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        generated_code = "\n".join(code)
+        self.assertIn("a16w16_8wave", generated_code)
+        self.assertTrue(
+            any(marker in generated_code for marker in (
+                "tlx_gfx950_apply_norm",
+                "tlx_gfx950_addmm_norm_row_reduce",
+            )))
+
+    @unittest.skipIf(
+        not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX GEMM + normalization kernels",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")

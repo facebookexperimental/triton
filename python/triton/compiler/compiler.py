@@ -46,7 +46,7 @@ arg_type_pattern = {
 
 
 def _target_supports_triton_dispatcher(target) -> bool:
-    return getattr(target, "backend", None) == "cuda"
+    return getattr(target, "backend", None) in ("cuda", "hip")
 
 
 def convert_type_repr(x):
@@ -651,7 +651,10 @@ class CompiledKernel:
         if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
                 and "launch_metadata" in self.asm):
             try:
-                from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
+                if self.metadata.target.backend == "hip":
+                    from triton.backends.amd.triton_dispatcher_factory import make_triton_dispatcher
+                else:
+                    from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
                 schema = json.loads(self.asm["launch_metadata"])
                 # Build both values before assigning to self so that a failure
                 # in either step leaves both attributes as None (atomic assignment).
@@ -755,8 +758,34 @@ class CompiledKernel:
     def __getitem__(self, grid):
         self._init_handles()
 
+        if self.metadata.target.backend == "hip":
+            grid_tuple = tuple(grid) + (1, ) * (3 - len(grid))
+
+            def runner(*args, stream=None):
+                if stream is None:
+                    device = driver.active.get_current_device()
+                    stream = driver.active.get_current_stream(device)
+                dispatcher = self._dispatcher
+                if (knobs.nvidia.use_triton_dispatcher and dispatcher is not None
+                        and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook
+                        and len(args) == len(self.src.signature)):
+                    dispatcher(*grid_tuple, stream, *(args[index] for index in self._dispatch_arg_indices))
+                else:
+                    launch_metadata = self.launch_metadata(grid_tuple, stream, *args)
+                    self.run(*grid_tuple, stream, self.function, self.packed_metadata, launch_metadata,
+                             knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
+
+            if knobs.nvidia.use_triton_dispatcher and self._dispatcher is None:
+                warnings.warn(
+                    f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
+                    f"falling back to Python runner",
+                    stacklevel=2,
+                )
+            return runner
+
         dispatcher = getattr(self, '_dispatcher', None)
-        if dispatcher is not None and not callable(grid):
+        if (knobs.nvidia.use_triton_dispatcher and dispatcher is not None and not callable(grid)
+                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook):
             # Try to create a _TritonJITRunner for maximum speed
             try:
                 from triton.backends.nvidia.triton_dispatcher_factory import _load_module

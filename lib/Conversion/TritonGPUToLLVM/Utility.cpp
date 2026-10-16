@@ -975,6 +975,23 @@ LowerLdStCallback makeSharedLoadEmitter(const TargetInfoBase &targetInfo,
   };
 }
 
+std::pair<LinearLayout, LinearLayout>
+getPhysicalLayouts(LinearLayout regLayout, triton::gpu::MemDescType memDescTy) {
+  auto sharedLayout = triton::gpu::toLinearLayoutIgnoringPadding(memDescTy);
+  if (!regLayout.isModular())
+    return {std::move(regLayout), std::move(sharedLayout)};
+
+  auto allocShape = triton::gpu::getAllocationShapePerCTA(memDescTy);
+  sharedLayout = triton::gpu::toLinearLayoutIgnoringPadding(
+      allocShape, memDescTy.getEncoding());
+  SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
+  for (auto dim : regLayout.getOutDimNames())
+    paddedOutDims.push_back({dim, sharedLayout.getOutDimSize(dim)});
+  regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
+                           /*requireSurjective=*/false);
+  return {std::move(regLayout), std::move(sharedLayout)};
+}
+
 SmallVector<Value>
 lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 ArrayRef<Value> valsArray, // Input for store, output for load
@@ -985,7 +1002,8 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 RewriterBase &rewriter, const TargetInfoBase &targetInfo,
                 std::optional<int> maybeMaxVecElems, Operation *localLoadOp,
                 std::optional<Value> ctaRank, std::optional<Value> barrierPtr,
-                std::optional<std::pair<Value, Value>> distributedCoordinates) {
+                std::optional<std::pair<Value, Value>> distributedCoordinates,
+                ScalarSharedStoreEmitter scalarStoreEmitter) {
 
   bool isStore = !valsArray.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -996,9 +1014,6 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
     auto length = vecTy.getNumElements();
     Value targetCtaId = ctaId ? ctaId : ctaRank.value_or(Value());
     if (isStore) {
-      Value valsVec =
-          packLLVector(loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
-
       Value pred = b.true_val();
       if (targetCtaId) {
         auto kLane = str_attr("lane");
@@ -1023,8 +1038,15 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
         pred = b.and_(isRepLane, isRepWarp);
       }
 
-      targetInfo.storeDShared(rewriter, loc, shmemAddr, targetCtaId, valsVec,
-                              pred, barrierPtr);
+      if (scalarStoreEmitter) {
+        assert(length == 1 && "scalar store emitter requires scalar values");
+        scalarStoreEmitter(rewriter, loc, shmemAddr, targetCtaId, vals[idx],
+                           pred);
+      } else {
+        Value valsVec = packLLVector(loc, vals.slice(idx, length), rewriter);
+        targetInfo.storeDShared(rewriter, loc, shmemAddr, targetCtaId, valsVec,
+                                pred, barrierPtr);
+      }
       return {};
     } else {
       assert(vals.empty());
@@ -1048,6 +1070,10 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
     if (cvt.hasInDim(kWarp) && !cvt.sublayoutIsZero({kWarp}, outDims))
       warpId =
           targetInfo.rematerializeDistributedCoordinate(rewriter, loc, warpId);
+  }
+  if (scalarStoreEmitter) {
+    assert(isStore && "scalar store emitter cannot be used for loads");
+    maybeMaxVecElems = 1;
   }
   return lowerLdSt(loc, ctx, cvt, valsArray, llvmElemTy, smemBases,
                    paddingShifts, affineOffset, maskSpanAffineOffset,
@@ -1297,7 +1323,7 @@ SmallVector<Value> lowerLocalLdSt(
     Operation *localLoadOp, std::optional<Value> ctaRank,
     std::optional<Value> barrierPtr,
     std::optional<std::pair<Value, Value>> distributedCoordinates,
-    LowerLdStCallback lowerInst) {
+    ScalarSharedStoreEmitter scalarStoreEmitter, LowerLdStCallback lowerInst) {
   auto kOffset = str_attr("offset");
   auto kBlock = str_attr("block");
   auto kPartition = str_attr("partition");
@@ -1318,7 +1344,7 @@ SmallVector<Value> lowerLocalLdSt(
     auto outVals =
         lowerLocalLdSt(loc, ctx, prmtCvt, inVals, llvmElemTy, srcTy, smemObj,
                        rewriter, targetInfo, localLoadOp, ctaRank, barrierPtr,
-                       distributedCoordinates, lowerInst);
+                       distributedCoordinates, scalarStoreEmitter, lowerInst);
     if (!isStore) {
       outVals = broadcastAs(outVals, cvt);
     }
@@ -1350,7 +1376,8 @@ SmallVector<Value> lowerLocalLdSt(
                            paddingShifts, affineOffset, maskSpanAffineOffset,
                            affineBlockOffset, maskSpanAffineBlock, rewriter,
                            targetInfo, maybeMaxVecElems, localLoadOp, ctaRank,
-                           barrierPtr, distributedCoordinates);
+                           barrierPtr, distributedCoordinates,
+                           scalarStoreEmitter);
 
   auto [laneId, warpId] = distributedCoordinates
                               ? *distributedCoordinates
@@ -1371,7 +1398,8 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
   return lowerLocalLdSt(loc, ctx, cvt, valsArray, llvmElemTy, srcTy, smemObj,
                         rewriter, targetInfo, /*localLoadOp=*/nullptr,
                         /*ctaRank=*/{}, /*barrierPtr=*/{},
-                        /*distributedCoordinates=*/{}, lowerInst);
+                        /*distributedCoordinates=*/{},
+                        /*scalarStoreEmitter=*/{}, lowerInst);
 }
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,

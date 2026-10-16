@@ -86,6 +86,26 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="addmm",
+        arch="sm90",
+        variant="tma_ws",
+        impl="triton.tlx.ops.kernels.addmm.sm90:addmm",
+        dtypes=_FP16,
+        # Warp-specialized TMA kernel with a direct-load fallback, so no
+        # alignment rule to fail and no TMA requirement.
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="addmm",
+        arch="sm100",
+        variant="tma_ws",
+        impl="triton.tlx.ops.kernels.addmm.sm100:addmm",
+        dtypes=_FP16,
+        # Warp-specialized TMA kernel with a direct-load fallback, so no
+        # alignment rule to fail and no TMA/TMEM requirement.
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="mm",
         arch="gfx950",
         variant="heuristic",

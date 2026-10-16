@@ -1456,6 +1456,43 @@ void promoteBarrier(BarrierCandidate &candidate,
   eraseBarrierStorage(candidate);
 }
 
+// A static lead for profiling, not a promotion recommendation. TLX barriers
+// can encode async memory completion or multiple observations of one phase;
+// even an apparently balanced arrive/wait pair may need its mbarrier semantics.
+void reportTLXBarrierHotspots(ModuleOp module) {
+  auto loopDepth = [](Operation *op) {
+    unsigned depth = 0;
+    for (Operation *parent = op->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (isa<scf::ForOp, scf::WhileOp>(parent))
+        ++depth;
+    return depth;
+  };
+
+  module.walk([&](ttng::WaitBarrierOp wait) {
+    unsigned depth = loopDepth(wait);
+    if (!depth)
+      return;
+    auto remark = wait.emitRemark();
+    remark << "likely barrier perf location: looped mbarrier wait (loop depth "
+           << depth
+           << "); phase observation may also order async memory "
+              "completion; profile before changing it";
+    if (!wait.getDeps().empty())
+      remark << "; explicit memory dependencies present";
+  });
+  module.walk([&](ttng::NamedBarrierWaitOp wait) {
+    unsigned depth = loopDepth(wait);
+    if (!depth)
+      return;
+    wait.emitRemark() << "likely barrier perf location: looped named-barrier "
+                         "wait (loop depth "
+                      << depth
+                      << "); participating warps rendezvous here; "
+                         "profile before changing it";
+  });
+}
+
 } // namespace
 
 class TritonNvidiaGPUPromoteMBarrierToNamedBarrierPass
@@ -1467,6 +1504,13 @@ public:
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    if (reportLikelyBarrierPerfLocations) {
+      // Reporting is opt-in and read-only; only TLX's source marker enables
+      // the TLX workflow. In particular, do not touch the named-barrier pool.
+      if (module->hasAttr(triton::kSkipGenericPipelineAttrName))
+        reportTLXBarrierHotspots(module);
+      return;
+    }
     // TLX fixup marks modules with source-level TLX ops, explicit memory
     // accesses, or manual warp specialization before any of those ops are
     // lowered. Their barriers have source-defined synchronization semantics;

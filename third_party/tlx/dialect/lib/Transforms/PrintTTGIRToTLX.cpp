@@ -2466,11 +2466,11 @@ void printSimplifiedOp(
   if (opName == "ttng.arrive_barrier") {
     // A multicast arrive has no TLX spelling; leave a marker instead of an
     // arrive that would look local but mean something else.
-    auto ctaMask = op->getAttrOfType<IntegerAttr>("ctaMask");
-    if (ctaMask && ctaMask.getInt() != 0) {
+    auto multicastCTA = op->getAttrOfType<IntegerAttr>("multicastCTA");
+    if (multicastCTA && multicastCTA.getInt() != 0) {
       op->emitError("multicast arrive_barrier does not round-trip to TLX");
-      os << "# unsupported: multicast arrive_barrier (ctaMask="
-         << ctaMask.getInt() << ")";
+      os << "# unsupported: multicast arrive_barrier (multicastCTA="
+         << multicastCTA.getInt() << ")";
       printLocComment(op, os);
       return;
     }

@@ -243,6 +243,176 @@ private:
   const NVIDIA::TargetInfo &targetInfo;
 };
 
+static Value mapSharedToCluster(Location loc, Value ptr, Value ctaId,
+                                ConversionPatternRewriter &rewriter) {
+  auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
+  assert(ptrTy.getAddressSpace() == 3 &&
+         "st.async.shared expects a shared-memory pointer");
+  return NVVM::MapaOp::create(rewriter, loc, ptr_ty(rewriter.getContext(), 7),
+                              ptr, ctaId);
+}
+
+// Axis constancy is not a proof of cross-CTA uniformity. Recognize common
+// ranks conservatively; in particular, never infer uniformity for self rank,
+// device-function arguments, loads, or arbitrary inline assembly.
+static bool isBlockUniformRank(Value rank, unsigned depth = 16) {
+  if (!depth || !rank.getType().isIntOrIndex())
+    return false;
+  if (matchPattern(rank, m_Constant()))
+    return true;
+  if (auto arg = dyn_cast<BlockArgument>(rank)) {
+    auto func = dyn_cast<FunctionOpInterface>(arg.getOwner()->getParentOp());
+    return func && triton::isKernel(func) &&
+           arg.getOwner() == &func.getFunctionBody().front();
+  }
+  auto *def = rank.getDefiningOp();
+  if (!def || def->getNumOperands() == 0 || def->getNumRegions() != 0)
+    return false;
+  bool isArithmetic =
+      def->getName().getDialectNamespace() == "arith" ||
+      isa<LLVM::AddOp, LLVM::SubOp, LLVM::MulOp, LLVM::AndOp, LLVM::OrOp,
+          LLVM::XOrOp, LLVM::ShlOp, LLVM::LShrOp, LLVM::AShrOp, LLVM::ZExtOp,
+          LLVM::SExtOp, LLVM::TruncOp, LLVM::ICmpOp, LLVM::SelectOp,
+          LLVM::UDivOp, LLVM::SDivOp, LLVM::URemOp, LLVM::SRemOp>(def);
+  return isArithmetic && llvm::all_of(def->getOperands(), [&](Value operand) {
+           return isBlockUniformRank(operand, depth - 1);
+         });
+}
+
+struct AsyncRemoteShmemReduceOpConversion
+    : public ConvertOpToLLVMPattern<AsyncRemoteShmemStoreOp> {
+  AsyncRemoteShmemReduceOpConversion(const LLVMTypeConverter &converter,
+                                     const NVIDIA::TargetInfo &targetInfo,
+                                     PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit), targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(AsyncRemoteShmemStoreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    const char *opcode;
+    const char *type;
+    switch (op.getStoreReduce()) {
+    case DescriptorReduceKind::ADD:
+      opcode = "add";
+      // Signed and unsigned i32 ADD have identical modulo-2^32 semantics.
+      type = "u32";
+      break;
+    case DescriptorReduceKind::MIN:
+      opcode = "min";
+      type = op.getStoreReduceSigned() ? "s32" : "u32";
+      break;
+    case DescriptorReduceKind::MAX:
+      opcode = "max";
+      type = op.getStoreReduceSigned() ? "s32" : "u32";
+      break;
+    case DescriptorReduceKind::AND:
+      opcode = "and";
+      type = "b32";
+      break;
+    case DescriptorReduceKind::OR:
+      opcode = "or";
+      type = "b32";
+      break;
+    case DescriptorReduceKind::XOR:
+      opcode = "xor";
+      type = "b32";
+      break;
+    case DescriptorReduceKind::INC:
+    case DescriptorReduceKind::DEC:
+      if (op.getStoreReduceSigned())
+        return rewriter.notifyMatchFailure(
+            op,
+            "async remote INC/DEC reduction requires unsigned 32-bit integers");
+      opcode = op.getStoreReduce() == DescriptorReduceKind::INC ? "inc" : "dec";
+      type = "u32";
+      break;
+    default:
+      return failure();
+    }
+    auto module = op->getParentOfType<ModuleOp>();
+    if (!module || targetInfo.getComputeCapability() < 90 ||
+        (!isPhysicalCluster(module) &&
+         TritonGPUDialect::getNumCTAs(module) <= 1))
+      return rewriter.notifyMatchFailure(
+          op,
+          "async remote reduction requires SM90+ and multiple physical CTAs");
+
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    auto regTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto dstTy = cast<MemDescType>(op.getDst().getType());
+    if (!regTy.getElementType().isInteger(32) ||
+        dstTy.getElementType() != regTy.getElementType())
+      return rewriter.notifyMatchFailure(
+          op, "async remote reduction requires matching 32-bit integers");
+    auto *typeConverter = getTypeConverter();
+    auto llvmElemTy = typeConverter->convertType(dstTy.getElementType());
+    auto dstObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getDst(),
+                                                        llvmElemTy, rewriter);
+    auto regLayout =
+        toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
+    auto [physicalRegLayout, sharedLayout] =
+        getPhysicalLayouts(regLayout, dstTy);
+    auto cvt = invertAndComposeBlockLocal(sharedLayout, physicalRegLayout);
+    auto vals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+
+    auto barrierTy = cast<MemDescType>(op.getBarrier().getType());
+    auto barrierElemTy = typeConverter->convertType(barrierTy.getElementType());
+    auto barrierObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getBarrier(), barrierElemTy, rewriter);
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    // Include subslice offsets before mapping both addresses to the same rank.
+    Value barrierOffset = b.shl(
+        barrierObj.getShmemOffset(loc, rewriter, barrierTy), b.i32_val(3));
+    if (isPaddedEncoding(barrierTy.getEncoding()))
+      barrierOffset =
+          applyPadding(loc, rewriter, barrierOffset,
+                       getPaddedSharedShifts(barrierTy.getEncoding(), 64,
+                                             /*offsetInBytes=*/true));
+    Value barrierPtr = b.gep(barrierObj.getBase().getType(), i8_ty,
+                             barrierObj.getBase(), barrierOffset);
+    Value rank = adaptor.getCtaRank();
+    Value mbarrier = mapSharedToCluster(loc, barrierPtr, rank, rewriter);
+    Value blockPred;
+    if (TritonGPUDialect::getNumCTAs(module) > 1 &&
+        (isBlockUniformRank(op.getCtaRank()) || isBlockUniformRank(rank))) {
+      // Logical CTA replicas writing a common target must complete each
+      // element only once. Physical num-ctas=1 programs are not replicas.
+      llvm::MapVector<StringAttr, int32_t> blockMasks;
+      blockMasks[str_attr("block")] =
+          regLayout.getFreeVariableMasks().lookup(str_attr("block"));
+      blockPred = triton::gpu::emitRedundantThreadPredicate(
+          blockMasks, rewriter, loc, targetInfo);
+    }
+    auto emitReduce = [&](RewriterBase &, Location emitLoc, Value ptr,
+                          Value /*ctaId*/, Value value, Value pred) {
+      Value dst = mapSharedToCluster(emitLoc, ptr, rank, rewriter);
+      PTXBuilder builder;
+      auto &red = *builder.create("red.async");
+      red.o("relaxed")
+          .o("cluster")
+          .o("shared::cluster")
+          .o("mbarrier::complete_tx::bytes")
+          .o(opcode)
+          .o(type);
+      // INC/DEC use the source value as the unsigned bound.
+      auto *dstOpr = builder.newAddrOperand(dst, "r");
+      auto *valueOpr = builder.newOperand(value, "r");
+      auto *barrierOpr = builder.newAddrOperand(mbarrier, "r");
+      pred = triton::gpu::maybeAnd(rewriter, emitLoc, pred, blockPred);
+      red(dstOpr, valueOpr, barrierOpr).predicate(pred, "b");
+      builder.launch(rewriter, emitLoc, void_ty(ctx));
+    };
+    lowerLocalLdSt(loc, ctx, cvt, vals, llvmElemTy, dstTy, dstObj, rewriter,
+                   targetInfo, nullptr, rank, {}, {}, emitReduce);
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  const NVIDIA::TargetInfo &targetInfo;
+};
+
 struct AsyncSharedStoreOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::AsyncSharedStoreOp> {
   AsyncSharedStoreOpConversion(const LLVMTypeConverter &converter,
@@ -420,6 +590,8 @@ void mlir::triton::NVIDIA::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
     RewritePatternSet &patterns, PatternBenefit benefit) {
   // Backend optimized memory ops get higher benefit
+  patterns.add<AsyncRemoteShmemReduceOpConversion>(typeConverter, targetInfo,
+                                                   benefit.getBenefit() + 1);
   patterns.add<LocalAllocOpConversion>(typeConverter, targetInfo,
                                        benefit.getBenefit() + 1);
   patterns.add<LocalStoreOpConversion>(typeConverter, targetInfo,

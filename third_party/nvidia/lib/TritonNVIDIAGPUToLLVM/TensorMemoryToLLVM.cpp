@@ -468,8 +468,12 @@ lowerTMemLdStFromInfo(Location loc, ConversionPatternRewriter &rewriter,
   return {outVals, redvalVals};
 }
 
-// Returns {resultVals, redvalVals} where redvalVals is empty if no reduction
-static std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdStFromTypes(
+// Returns {resultVals, redvalVals} where redvalVals is empty if no reduction.
+// Fails when the register layout cannot lower to a TMEM ld/st encoding (the
+// verifier normally rejects such layouts, but no_verify_layout inputs bypass
+// verification, so lowering must decline gracefully instead of asserting).
+static FailureOr<std::pair<SmallVector<Value>, SmallVector<Value>>>
+lowerTMemLdStFromTypes(
     Location loc, ConversionPatternRewriter &rewriter, RankedTensorType regTy,
     MemDescType memTy, Value tmemBase, int maxnreg, Value pred, Type llvmElemTy,
     ArrayRef<Value> vals,
@@ -478,8 +482,8 @@ static std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdStFromTypes(
   auto diag = [loc]() { return emitError(loc); };
   auto encodingInfoOr =
       computeTMemLdStEncodingInfo(regTy, memTy, maxnreg, diag);
-  assert(succeeded(encodingInfoOr) &&
-         "TMEM layout verification should catch invalid layouts");
+  if (failed(encodingInfoOr))
+    return failure();
   return lowerTMemLdStFromInfo(loc, rewriter, *encodingInfoOr, pred, llvmElemTy,
                                vals, tmemBase, redOp, useAbs, useNaN);
 }
@@ -538,9 +542,12 @@ struct TensorMemoryLoadOpConversion
 
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto maxnreg = getContextualMaxNReg(op);
-    auto [resultVals, redvalVals] = lowerTMemLdStFromTypes(
-        loc, rewriter, regTy, memTy, tmemBase, maxnreg, b.i1_val(true),
-        llvmElemTy, {}, redOp, useAbs, useNaN);
+    auto valsOr = lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, tmemBase,
+                                         maxnreg, b.i1_val(true), llvmElemTy,
+                                         {}, redOp, useAbs, useNaN);
+    if (failed(valsOr))
+      return failure();
+    auto [resultVals, redvalVals] = *std::move(valsOr);
 
     Value resultStruct = packUniqueTensorElements(
         loc, getTypeConverter(), resultVals, rewriter, op.getType());
@@ -584,8 +591,9 @@ struct TensorMemoryStoreOpConversion
     SmallVector<Value> srcValues =
         unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
     auto maxnreg = getContextualMaxNReg(op);
-    lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, tmemBase, maxnreg, pred,
-                           llvmElemTy, srcValues);
+    if (failed(lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, tmemBase,
+                                      maxnreg, pred, llvmElemTy, srcValues)))
+      return failure();
     NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::STORE);
 
     rewriter.eraseOp(op);
@@ -623,8 +631,10 @@ struct TensorMemoryAllocOpConversion
       SmallVector<Value> srcValues =
           unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
       Value ptr = b.inttoptr(base.getType(), allocAddress);
-      lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, ptr, maxnreg,
-                             b.i1_val(true), llvmElemTy, srcValues);
+      if (failed(lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, ptr,
+                                        maxnreg, b.i1_val(true), llvmElemTy,
+                                        srcValues)))
+        return failure();
       NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::STORE);
     }
     // Cast to address space 3 as the shared memory object uses 3.
