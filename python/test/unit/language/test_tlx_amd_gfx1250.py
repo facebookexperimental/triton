@@ -1137,7 +1137,7 @@ def test_grouped_gemm_list_rejects_ragged_nk(dimension):
     ({"BLOCK_SIZE_K": 64}, 512, "BLOCK_SIZE_K"),
     ({"num_warps": 8}, 512, "num_warps"),
     ({"waves_per_eu": 2}, 512, "waves_per_eu"),
-    ({"CLUSTER_SIZE": 4}, 512, "CLUSTER_SIZE"),
+    ({"CLUSTER_SIZE": 3}, 512, "CLUSTER_SIZE"),
     ({"NUM_BUFFERS": 1}, 512, "NUM_BUFFERS"),
     ({"NUM_BUFFERS": 3}, 512, "cross-tile prefetch requires depth 2"),
     ({"NUM_BUFFERS": 3, "C_STAGING_MODE": 1, "CROSS_TILE_PREFETCH": False}, 512, "full C buffer"),
@@ -1240,6 +1240,97 @@ def test_grouped_gemm_interface_rejects_other_arch(monkeypatch):
         _gfx1250_grouped._require_grouped_gemm_gfx1250(torch.device("cuda"))
 
 
+def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
+    import sys
+    from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import bench
+
+    checked = []
+
+    def check_case(args, case, kernel_variant, index, total):
+        cfg = _gfx1250_grouped._grouped_gemm_interface_launch_config(
+            _gfx1250_grouped._grouped_gemm_interface_config(None, case.k), [case.m] * case.groups, case.n, case.k, 256,
+            auto_cluster=True)
+        for key, value in dict(
+                BLOCK_SIZE_M=args.block_m,
+                BLOCK_SIZE_N=args.block_n,
+                BLOCK_SIZE_K=args.block_k,
+                GROUP_SIZE_M=args.group_m,
+                NUM_BUFFERS=args.tdm_pipeline_depth,
+                L2_PREFETCH_DISTANCE=args.l2_prefetch_distance,
+                C_STAGING_MODE=int(args.dedicated_c_buffer),
+                CROSS_TILE_PREFETCH=args.cross_tile_prefetch,
+                XCD_REMAP_MODE=_gfx1250_grouped._XCD_REMAP_MODES[args.xcd_remap],
+                NUM_XCDS=args.num_xcds,
+                XCD_CHUNK=args.xcd_chunk,
+                CLUSTER_SIZE=args.cluster_size,
+                CLUSTER_MULTICAST=args.cluster_multicast,
+        ).items():
+            assert cfg[key] == value, (case, key)
+        assert cfg["ALLOW_MN_TAILS"] is False
+        assert cfg["NUM_SM"] == 256
+        checked.append(case)
+        return bench.BenchResult(case, kernel_variant, case.tensor_gib, 0, None, None)
+
+    monkeypatch.setattr(sys, "argv", ["bench.py", "--dry-run"])
+    monkeypatch.setattr(bench, "_run_case", check_case)
+    monkeypatch.setattr(bench, "_print_summary", lambda results: None)
+    assert bench.main() == 0
+    assert len(checked) == 2 * len(bench.DEFAULT_CASES)
+
+
+@pytest.mark.parametrize("ms,n,num_sm,config,expected", [
+    ([2048, 2048], 1024, 16, {}, 4),
+    ([2048, 2048], 1024, 16, {"CLUSTER_SIZE": 1}, 1),
+    ([2048, 2048], 1024, 16, {"CLUSTER_SIZE": 2}, 2),
+    ([2048, 2048], 1024, 16, {"CLUSTER_SIZE": 4}, 4),
+    ([2048, 2048], 1024, 16, {"CROSS_TILE_PREFETCH": False}, 1),
+    ([2048, 2048], 1024, 16, {"C_STAGING_MODE": 1}, 1),
+    ([2048, 2048], 1024, 16, {"XCD_REMAP_MODE": 0}, 1),
+    ([2048, 2048], 1024, 24, {}, 1),
+    ([3072, 3072], 1024, 32, {}, 1),
+    ([2048, 1024], 1024, 16, {}, 1),
+    ([0, 2048], 1024, 16, {}, 1),
+    ([0, 0], 1024, 16, {}, 1),
+    ([257, 513], 257, 16, {}, 1),
+    ([1024], 512, 32, {}, 1),
+])
+def test_grouped_gemm_interface_selects_cluster(ms, n, num_sm, config, expected):
+    cfg = _gfx1250_grouped._grouped_gemm_interface_launch_config(
+        _gfx1250_grouped._grouped_gemm_interface_config(config, 512), ms, n, 512, num_sm, auto_cluster="CLUSTER_SIZE"
+        not in config)
+    assert cfg["CLUSTER_SIZE"] == expected
+    if expected == 1 and "CLUSTER_SIZE" not in config:
+        explicit = dict(config, CLUSTER_SIZE=4)
+        with pytest.raises(ValueError, match="clustering requires"):
+            _gfx1250_grouped._grouped_gemm_interface_launch_config(
+                _gfx1250_grouped._grouped_gemm_interface_config(explicit, 512), ms, n, 512, num_sm, auto_cluster=False)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("cluster_size", [None, 2, 1])
+def test_grouped_gemm_interface_multicast_launch(cluster_size, monkeypatch):
+    torch.manual_seed(1250)
+    m, n, k = 2048, 1024, 256
+    cpu_a = [torch.randn((m, k), dtype=torch.float16) for _ in range(2)]
+    cpu_b = [torch.randn((n, k), dtype=torch.float16) for _ in range(2)]
+    a, b = [x.cuda() for x in cpu_a], [x.cuda().T for x in cpu_b]
+    config = {} if cluster_size is None else dict(CLUSTER_SIZE=cluster_size)
+    monkeypatch.setattr(_gfx1250_grouped, "_active_num_cus", lambda device: 16)
+    *launch_args, outputs = _gfx1250_grouped._make_grouped_gemm_args(a, b, config)
+    assert launch_args[-1]["CLUSTER_SIZE"] == (4 if cluster_size is None else cluster_size)
+    assert launch_args[-1]["NUM_SM"] == 16
+    assert launch_args[-1]["ALLOW_MN_TAILS"] is False
+    _gfx1250_grouped._perf_fn(*launch_args)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    _gfx1250_grouped._perf_fn(*launch_args)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() == allocated
+    for out, x, w in zip(outputs, cpu_a, cpu_b):
+        torch.testing.assert_close(out.cpu(), (x.float() @ w.float().T).half(), atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("ms,n", [([0, 1, 255, 257], 257), ([256, 512], 256), ([0, 0], 1)])
 def test_grouped_gemm_interface_list_api(ms, n):
@@ -1271,6 +1362,7 @@ def test_grouped_gemm_interface_prepared_launch(config, k, monkeypatch):
     assert len(args) == 8
     assert [tuple(t.shape) for t in args[:5]] == [(2, ), (2, ), (2, ), (6, ), (6, )]
     assert args[6]["NUM_SM"] == 2
+    assert args[6]["CLUSTER_SIZE"] == 1
     assert args[6]["ALLOW_MN_TAILS"] is True
     assert args[0].cpu().tolist() == [x.data_ptr() for x in a]
     assert args[1].cpu().tolist() == [x.data_ptr() for x in b]
@@ -1301,12 +1393,14 @@ def test_grouped_gemm_interface_prepared_launch(config, k, monkeypatch):
     ("count", "positive int32 group count"),
     ("config", "cfg must include"),
     ("tail_flag", "ALLOW_MN_TAILS must be a bool"),
+    ("cluster_tails", "clustered launches require ALLOW_MN_TAILS=False"),
+    ("cluster_grid", "positive and divisible by 16"),
     ("device", "requires an AMD gfx1250"),
 ])
 def test_grouped_gemm_interface_rejects_metadata(condition, match):
     tables = [torch.empty(2, dtype=torch.int64) for _ in range(3)]
     tables += [torch.empty(6, dtype=torch.int32) for _ in range(2)]
-    g, cfg = 2, dict(K=512, NUM_SM=2, ALLOW_MN_TAILS=True)
+    g, cfg = 2, dict(K=512, NUM_SM=2, ALLOW_MN_TAILS=True, CLUSTER_SIZE=1)
     if condition == "dtype":
         tables[0] = tables[0].int()
     elif condition == "shape":
@@ -1319,6 +1413,10 @@ def test_grouped_gemm_interface_rejects_metadata(condition, match):
         cfg = {}
     elif condition == "tail_flag":
         cfg["ALLOW_MN_TAILS"] = 1
+    elif condition == "cluster_tails":
+        cfg.update(CLUSTER_SIZE=4, NUM_SM=16)
+    elif condition == "cluster_grid":
+        cfg.update(CLUSTER_SIZE=4, ALLOW_MN_TAILS=False)
     with pytest.raises(ValueError, match=match):
         _gfx1250_grouped._perf_fn(*tables, g, cfg)
 

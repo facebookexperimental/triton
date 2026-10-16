@@ -34,9 +34,12 @@ Inputs must be FP16 on one gfx1250 device, with 16-byte-aligned bases and
 common positive N/K. Ragged M, zero-row groups, and partial M/N tiles are
 supported. The interface is forward-only.
 
-The default uses 256x256x128 tiles, depth 2, within-group hybrid prefetch,
-`C_STAGING_MODE=0`, chunked XCD remapping, four warps, and cluster size 1.
-It requires K divisible by 256. Other supported schedules require K divisible
+The default matches `bench.py`: 256x256x128 tiles, depth 2, within-group hybrid
+prefetch, `C_STAGING_MODE=0`, chunked XCD remapping, four warps, and four-workgroup
+multicast when the cluster requirements below hold. Otherwise it uses cluster
+size 1 with the same schedule. Explicit `CLUSTER_SIZE` requests must satisfy
+the cluster requirements or raise `ValueError`.
+The default requires K divisible by 256. Other supported schedules require K divisible
 by 128 and enough K blocks to fill the pipeline; K=384 can use
 `config={"CROSS_TILE_PREFETCH": False}`. `NUM_SM` caps persistent programs at
 the number of output tiles.
@@ -50,8 +53,8 @@ Unsupported requests raise `ValueError`. Config uses common gfx950 keys
 
 Prepared launches perform no device allocation, readback, or matrix repacking.
 Keep inputs, tables, and outputs alive through completion. In-place metadata
-updates must preserve the validated restrictions and selected tail
-specialization; `_perf_fn` trusts table contents.
+updates must preserve the validated restrictions, cluster configuration, and
+selected tail specialization; `_perf_fn` trusts table contents.
 
 ## Other entry points
 

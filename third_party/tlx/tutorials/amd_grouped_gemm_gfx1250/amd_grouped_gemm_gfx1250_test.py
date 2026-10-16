@@ -1568,7 +1568,7 @@ def grouped_gemm_tdm_list(
 
 _GROUPED_GEMM_INTERFACE_CONFIG = dict(BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=128, GROUP_SIZE_M=4,
                                       NUM_BUFFERS=2, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, L2_PREFETCH_DISTANCE=0,
-                                      XCD_REMAP_MODE=2, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
+                                      XCD_REMAP_MODE=2, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=4, CLUSTER_MULTICAST=True,
                                       num_warps=4, waves_per_eu=1)
 
 # Validated (BM, BN, depth, C staging, cross-tile prefetch) schedules. In
@@ -1608,7 +1608,7 @@ def _grouped_gemm_interface_config(config, k):
             "NUM_BUFFERS": (2, 3, 4),
             "C_STAGING_MODE": (0, 1),
             "XCD_REMAP_MODE": (0, 1, 2),
-            "CLUSTER_SIZE": (1, ),
+            "CLUSTER_SIZE": (1, 2, 4),
             "num_warps": (4, ),
             "waves_per_eu": (1, ),
     }.items():
@@ -1650,14 +1650,40 @@ def _require_grouped_gemm_gfx1250(device):
         raise ValueError(f"the TDM grouped GEMM interface requires gfx1250; got {arch}")
 
 
+def _grouped_gemm_interface_launch_config(cfg, m_list, n, k, num_sms, *, auto_cluster):
+    """Use bench.py's multicast default whenever the existing contract allows it."""
+    cfg = dict(cfg)
+    total_tiles = sum(_cdiv_int(m, cfg["BLOCK_SIZE_M"]) * _cdiv_int(n, cfg["BLOCK_SIZE_N"]) for m in m_list)
+    num_sm = min(num_sms, total_tiles)
+    if total_tiles + num_sm >= 1 << 31:
+        raise ValueError("gfx1250 grouped GEMM tile count plus NUM_SM must fit in int32")
+    if cfg["CLUSTER_SIZE"] > 1:
+        try:
+            _validate_grouped_gemm_cluster_config(
+                m_list, n, num_sm, block_m=cfg["BLOCK_SIZE_M"], block_n=cfg["BLOCK_SIZE_N"],
+                block_k=cfg["BLOCK_SIZE_K"], group_m=cfg["GROUP_SIZE_M"], tdm_pipeline_depth=cfg["NUM_BUFFERS"],
+                l2_prefetch_distance=cfg["L2_PREFETCH_DISTANCE"], c_staging_mode=cfg["C_STAGING_MODE"],
+                cross_tile_prefetch=cfg["CROSS_TILE_PREFETCH"], auto_config=False,
+                xcd_remap_mode=next(name for name, value in _XCD_REMAP_MODES.items() if value == cfg["XCD_REMAP_MODE"]),
+                num_xcds=cfg["NUM_XCDS"], xcd_chunk=cfg["XCD_CHUNK"])
+        except ValueError:
+            if not auto_cluster:
+                raise
+            cfg["CLUSTER_SIZE"] = 1
+    cfg.update(K=k, NUM_SM=num_sm, ALLOW_MN_TAILS=bool(n % cfg["BLOCK_SIZE_N"]
+                                                       or any(m % cfg["BLOCK_SIZE_M"] for m in m_list)))
+    return cfg
+
+
 def _make_grouped_gemm_args(group_A, group_B, config=None):
     """gfx950-compatible setup: return five tables, G, cfg, and output list.
 
     A is canonical row-major FP16 [M_g, K], B canonical column-major FP16
     [K, N]. Only M may vary across groups. No input packing is performed.
     Config uses gfx950's common tuning names plus TDM-specific options;
-    gfx950-only options are rejected. The default is the 256x256 hybrid with
-    depth 2 and cluster size 1. All validation precedes device allocation.
+    gfx950-only options are rejected. The default is bench.py's 256x256 hybrid
+    with depth 2 and cluster size 4 when shapes/grid permit it, otherwise 1.
+    Explicit cluster requests are validated. All validation precedes allocation.
     Keep inputs, returned tables, and outputs alive through the launch.
     """
     m_list, n, k, device = _validate_grouped_gemm_tdm_list_inputs(group_A, group_B)
@@ -1667,12 +1693,9 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
     if cfg["GROUP_SIZE_M"] * _cdiv_int(n, cfg["BLOCK_SIZE_N"]) >= 1 << 31:
         raise ValueError("GROUP_SIZE_M * number of N tiles must fit in int32")
     _require_grouped_gemm_gfx1250(device)
-    total_tiles = sum(_cdiv_int(m, cfg["BLOCK_SIZE_M"]) * _cdiv_int(n, cfg["BLOCK_SIZE_N"]) for m in m_list)
-    num_sm = min(cfg["NUM_SM"] if "NUM_SM" in cfg else _active_num_cus(device), total_tiles)
-    if total_tiles + num_sm >= 1 << 31:
-        raise ValueError("gfx1250 grouped GEMM tile count plus NUM_SM must fit in int32")
-    cfg.update(K=k, NUM_SM=num_sm, ALLOW_MN_TAILS=bool(n % cfg["BLOCK_SIZE_N"]
-                                                       or any(m % cfg["BLOCK_SIZE_M"] for m in m_list)))
+    cfg = _grouped_gemm_interface_launch_config(cfg, m_list, n, k,
+                                                cfg["NUM_SM"] if "NUM_SM" in cfg else _active_num_cus(device),
+                                                auto_cluster=config is None or "CLUSTER_SIZE" not in config)
     a, b, c, sizes, lds, outputs, _, _, _ = _make_grouped_gemm_tdm_list_args(group_A, group_B)
     # gfx950 emits flat size/stride tables. Views preserve the same allocation.
     return a, b, c, sizes.view(-1), lds.view(-1), len(m_list), cfg, outputs
@@ -1683,11 +1706,11 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
 
     Use the config returned by _make_grouped_gemm_args. Device table contents
     are trusted: any in-place updates must preserve common N/K, canonical
-    layouts, alignment, scheduler limits, and the chosen tail specialization.
+    layouts, alignment, scheduler/cluster limits, and the chosen tail specialization.
     The raw JIT entry remains available for padded leading strides.
     """
-    if not isinstance(cfg, dict) or not {"K", "NUM_SM", "ALLOW_MN_TAILS"} <= cfg.keys():
-        raise ValueError("cfg must include K, NUM_SM, and ALLOW_MN_TAILS from _make_grouped_gemm_args")
+    if not isinstance(cfg, dict) or not {"K", "NUM_SM", "ALLOW_MN_TAILS", "CLUSTER_SIZE"} <= cfg.keys():
+        raise ValueError("cfg must include K, NUM_SM, ALLOW_MN_TAILS, and CLUSTER_SIZE from _make_grouped_gemm_args")
     if type(G) is not int or G <= 0 or 3 * G >= 1 << 31:
         raise ValueError("G must be a positive int32 group count with 3 * G fitting in int32")
     if type(cfg["NUM_SM"]) is not int or not 0 <= cfg["NUM_SM"] < 1 << 31:
@@ -1698,6 +1721,11 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
         {key: value
          for key, value in cfg.items()
          if key not in ("K", "NUM_SM", "ALLOW_MN_TAILS")}, cfg["K"])
+    if tuning["CLUSTER_SIZE"] > 1:
+        if cfg["ALLOW_MN_TAILS"]:
+            raise ValueError("clustered launches require ALLOW_MN_TAILS=False")
+        if cfg["NUM_SM"] == 0 or cfg["NUM_SM"] % 16:
+            raise ValueError("clustered launches require NUM_SM to be positive and divisible by 16")
     tables = (d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds)
     if not all(isinstance(t, torch.Tensor) for t in tables):
         raise ValueError("grouped GEMM metadata must be tensors")
@@ -1721,7 +1749,8 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
             CROSS_TILE_PREFETCH=tuning["CROSS_TILE_PREFETCH"], XCD_REMAP_MODE=tuning["XCD_REMAP_MODE"],
             NUM_XCDS=tuning["NUM_XCDS"], XCD_CHUNK=tuning["XCD_CHUNK"], CLUSTER_SIZE=tuning["CLUSTER_SIZE"],
             CLUSTER_MULTICAST=tuning["CLUSTER_MULTICAST"], ALLOW_MN_TAILS=cfg["ALLOW_MN_TAILS"],
-            num_warps=tuning["num_warps"], waves_per_eu=tuning["waves_per_eu"], ctas_per_cga=(1, 1, 1))
+            num_warps=tuning["num_warps"], waves_per_eu=tuning["waves_per_eu"], ctas_per_cga=(tuning["CLUSTER_SIZE"], 1,
+                                                                                              1))
 
 
 def grouped_gemm(group_a, group_b):
@@ -1730,7 +1759,9 @@ def grouped_gemm(group_a, group_b):
     Supports ragged M and partial M/N tiles. Requires common N/K, K divisible
     by 256 for the default cross-tile pipeline, canonical input strides, and
     16-byte-aligned bases on gfx1250. Returns one row-major output per group.
-    Unsupported inputs raise ValueError; there is no fallback or repacking.
+    Uses four-workgroup multicast when cluster requirements hold, otherwise
+    ordinary workgroups with the same hybrid schedule. Unsupported inputs
+    raise ValueError; there is no repacking.
     """
     *args, outputs = _make_grouped_gemm_args(group_a, group_b)
     _perf_fn(*args)
