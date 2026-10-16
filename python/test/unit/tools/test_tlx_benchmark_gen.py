@@ -5,6 +5,7 @@ test-script generation logic.  All tests are CPU-only unless marked with
 @pytest.mark.skipif (GPU-dependent tests are gated on CUDA availability).
 """
 
+import dataclasses
 import json
 import os
 from collections import OrderedDict
@@ -201,6 +202,44 @@ def test_capture_kernel_args_constexprs(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# capture_kernel_args — launch options
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _FakeOptions:
+    num_warps: int = 4
+    num_stages: int = 3
+    matrix_instr_nonkdim: int = 0
+    arch: str = ""
+    supported_fp8_dtypes: tuple = ("fp8e5", )
+
+
+def test_capture_kernel_args_launch_options(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_TLX_DUMP_DIR", str(tmp_path))
+    bound_args = OrderedDict([("x", 1.0)])
+    signature = {"x": "fp32"}
+    options = _FakeOptions(num_warps=8, matrix_instr_nonkdim=16, arch="gfx942",
+                           supported_fp8_dtypes=("fp8e4nv", "fp8e5"))
+
+    capture_kernel_args(bound_args, signature, {}, None, options)
+
+    with open(tmp_path / "_kernel_args.json") as f:
+        meta = json.load(f)
+    # Defaults, the target arch and non-scalar capability lists are all omitted.
+    assert meta["launch_options"] == {"num_warps": 8, "matrix_instr_nonkdim": 16}
+
+
+def test_capture_kernel_args_no_options(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_TLX_DUMP_DIR", str(tmp_path))
+    capture_kernel_args(OrderedDict([("x", 1.0)]), {"x": "fp32"}, {})
+
+    with open(tmp_path / "_kernel_args.json") as f:
+        meta = json.load(f)
+    assert meta["launch_options"] == {}
+
+
+# ---------------------------------------------------------------------------
 # capture_grid
 # ---------------------------------------------------------------------------
 
@@ -336,7 +375,7 @@ def test_generate_standalone_test_with_source(tmp_path):
     assert "BLOCK_" in content
     assert "user_kwargs" in content
     # Constexprs should NOT be passed to TLX kernel
-    assert "*kernel_args)" in content
+    assert "*kernel_args, **launch_opts)" in content
     # The generated script should be valid Python syntax
     compile(content, str(test_path), "exec")
 
@@ -411,4 +450,4 @@ def test_e2e_capture_and_generate(monkeypatch, tmp_path):
     # Verify it reads the JSON
     assert "_kernel_args.json" in content
     # Verify it creates the kernel call
-    assert "_my_kernel[grid](*kernel_args)" in content
+    assert "_my_kernel[grid](*kernel_args, **launch_opts)" in content
