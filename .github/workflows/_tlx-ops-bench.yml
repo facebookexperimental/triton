@@ -1,6 +1,7 @@
 name: tlx-ops-bench
-# One platform of nightly-tlx-ops-bench.yml: install an fbtriton nightly into a
-# clean venv, run the tlx.ops perf suite, and file/close nightly issues from it.
+# One platform of nightly-tlx-ops-bench.yml: install a commit's build.yml wheel
+# into a clean venv, run the tlx.ops perf suite, and file/close nightly issues
+# from it.
 on:
   workflow_call:
     inputs:
@@ -21,7 +22,15 @@ on:
         required: true
         type: string
       wheel_url:
-        description: "Release asset URL of that version's cp313 x86_64 wheel"
+        description: "URL of the wheel build.yml made for sha"
+        required: true
+        type: string
+      wheel_filename:
+        description: "File name of that wheel"
+        required: true
+        type: string
+      wheel_sha256:
+        description: "SHA256 of that wheel"
         required: true
         type: string
       sha:
@@ -49,31 +58,31 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha }}
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+      # The setup actions come from this workflow's own revision, not from the
+      # benched commit, so every commit is benched in the same environment.
+      - name: Checkout CI actions
+        uses: actions/checkout@v4
         with:
-          enable-cache: false
-      - name: Install torch and the fbtriton nightly
-        run: |
-          set -eux
-          uv venv --python 3.13 "${RUNNER_TEMP}/bench-venv"
-          PY="${RUNNER_TEMP}/bench-venv/bin/python"
-          uv pip install --python "${PY}" "torch==${TORCH_VERSION}" --index-url "${{ inputs.torch_index }}"
-          # torch depends on its own Triton build, which installs the same
-          # `triton` package the fbtriton wheel does.
-          uv pip uninstall --python "${PY}" triton pytorch-triton pytorch-triton-rocm triton-rocm || true
-          uv pip install --python "${PY}" --no-deps "${{ inputs.wheel_url }}"
+          ref: ${{ github.sha }}
+          path: .ci
+          sparse-checkout: .github/actions
+      - name: Set up test environment
+        uses: ./.ci/.github/actions/setup-test-env
+        with:
+          backend: ${{ contains(inputs.torch_index, 'rocm') && 'rocm' || 'cuda' }}
+          arch: ${{ inputs.platform == 'mi350' && 'gfx950' || '' }}
+          torch: torch==${{ env.TORCH_VERSION }}
+          torch-index-url: ${{ inputs.torch_index }}
           # torchao: flash_attn_mxfp8 quantizes its inputs with it.
-          uv pip install --python "${PY}" pytest numpy torchao
-          "${PY}" - <<'PY'
-          import torch
-          import triton
-          import triton.tlx.ops
-
-          print(f"torch  -> {torch.__version__} ({torch.__file__})")
-          print(f"triton -> {triton.__version__} ({triton.__file__})")
-          assert torch.cuda.is_available(), "torch sees no GPU"
-          PY
+          packages: numpy pytest torchao
+          # Keep the release torch on its bundled ROCm libraries.
+          rocm-lib-path: ""
+      - name: Install prebuilt Triton
+        uses: ./.ci/.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Run tlx.ops perf suite
         id: run_bench
         timeout-minutes: 120
@@ -83,7 +92,7 @@ jobs:
           rm -rf /tmp/tlx_benchmark
           # TorchTLX benches need Meta's Inductor patches; the per-platform
           # *-torchtlx-test jobs already run them.
-          "${RUNNER_TEMP}/bench-venv/bin/python" -m pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib \
+          python -m pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib \
             -k "not torchtlx" -v -s --junitxml="${RUNNER_TEMP}/tlx-ops-bench.xml"
       - name: Upload results
         if: always()

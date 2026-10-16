@@ -18,6 +18,10 @@ inputs:
     description: "ROCm device code to keep when creating the venv, e.g. gfx950; unused on cuda"
     required: false
     default: ""
+  torch:
+    description: "torch requirement, e.g. torch==2.14.0; the default takes the newest on the index"
+    required: false
+    default: torch
   packages:
     description: Extra packages to install, space separated
     required: false
@@ -30,6 +34,10 @@ inputs:
     description: PyTorch index override; defaults to the backend's nightly
     required: false
     default: ""
+  rocm-lib-path:
+    description: "Prepended to LD_LIBRARY_PATH on rocm; empty leaves LD_LIBRARY_PATH alone"
+    required: false
+    default: /opt/rocm/lib
 runs:
   using: composite
   steps:
@@ -43,6 +51,8 @@ runs:
         BACKEND: ${{ inputs.backend }}
         ARCH: ${{ inputs.arch }}
         PACKAGES: ${{ inputs.packages }}
+        TORCH: ${{ inputs.torch }}
+        ROCM_LIB: ${{ inputs.rocm-lib-path }}
         REUSE: ${{ inputs.reuse-existing }}
         VENV: ${{ inputs.venv }}
         IDX: ${{ inputs.torch-index-url }}
@@ -61,6 +71,10 @@ runs:
             *)
               echo "unknown backend: ${BACKEND}"; exit 1 ;;
           esac
+          # Only nightly indexes need --pre; on a release index it would let
+          # torch's dependencies resolve to release candidates.
+          PRE=""
+          case "${IDX}" in */nightly/*) PRE=--pre ;; esac
           # The prebuilt Triton wheel is cp312.
           uv venv "${VENV}" --python 3.12 --managed-python --clear
           export VIRTUAL_ENV="${VENV}" PATH="${VENV}/bin:${PATH}"
@@ -68,22 +82,23 @@ runs:
           # `triton` package as fbtriton. On ROCm, torch also requires
           # rocm[device-all], device code for every GPU architecture (~6 GiB
           # of the ~8.6 GiB download), so keep only ARCH.
-          echo torch | uv pip compile - --pre --index-url "${IDX}" --no-header --no-annotate -q \
+          echo "${TORCH}" | uv pip compile - ${PRE} --index-url "${IDX}" --no-header --no-annotate -q \
             | grep -oE '^[A-Za-z0-9_.-]+' \
             | grep -E '^((pytorch-)?triton(-rocm)?|rocm-sdk-device-gfx[0-9a-z]+)$' \
             | grep -vx "rocm-sdk-device-${ARCH:-none}" \
             | sed "s/\$/ ; sys_platform == 'never'/" > /tmp/torch-overrides.txt
           cat /tmp/torch-overrides.txt
           T0=$(date +%s)
-          uv pip install --pre --no-cache torch --index-url "${IDX}" --overrides /tmp/torch-overrides.txt
+          # shellcheck disable=SC2086
+          uv pip install ${PRE} --no-cache "${TORCH}" --index-url "${IDX}" --overrides /tmp/torch-overrides.txt
           echo "torch install: $(( $(date +%s) - T0 ))s"
         fi
         # Activate for this step and every later step of the job.
         export VIRTUAL_ENV="${VENV}" PATH="${VENV}/bin:${PATH}"
         echo "VIRTUAL_ENV=${VENV}" >> "${GITHUB_ENV}"
         echo "${VENV}/bin" >> "${GITHUB_PATH}"
-        if [ "${BACKEND}" = rocm ] && [ -e /opt/rocm/lib ]; then
-          export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        if [ "${BACKEND}" = rocm ] && [ -n "${ROCM_LIB}" ] && [ -e "${ROCM_LIB}" ]; then
+          export LD_LIBRARY_PATH="${ROCM_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
           echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "${GITHUB_ENV}"
         fi
         # shellcheck disable=SC2086
