@@ -49,6 +49,7 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
 // -----
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#bridge = #ttg.linear<{register = [], lane = [[32], [16], [8], [4], [2], [1]], warp = [], block = []}>
 #predicate_register_order = #ttg.linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
 #carried_register_order = #ttg.linear<{register = [[2], [1]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
 module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.target" = "hip:gfx950"} {
@@ -73,6 +74,32 @@ llvm.func @lower_warp_predicate(
   // AMD: cf.br ^[[MERGE]](%{{.*}} : !llvm.struct<(i32)>)
   // AMD: ^[[MERGE]](%{{.*}}: !llvm.struct<(i32)>):
   // AMD-NOT: ttg.warp_predicate
+  llvm.return %result_struct : !llvm.struct<(i32)>
+}
+
+// Partial conversion can add a tensor-to-tensor bridge on top of the LLVM
+// bridge when layout propagation retags a carried value. Lowering must walk the
+// complete chain to recover the false-path LLVM value.
+// AMD-LABEL: llvm.func @lower_bridged_warp_predicate
+// AMD: cf.cond_br %{{.*}}, ^[[BODY:bb[0-9]+]], ^[[MERGE:bb[0-9]+]](%{{.*}} : !llvm.struct<(i32)>)
+// AMD: ^[[BODY]]:
+// AMD: cf.br ^[[MERGE]](%{{.*}} : !llvm.struct<(i32)>)
+// AMD: ^[[MERGE]](%{{.*}}: !llvm.struct<(i32)>):
+// AMD-NOT: ttg.warp_predicate
+llvm.func @lower_bridged_warp_predicate(
+    %predicate_struct: !llvm.struct<(i1)>,
+    %init_struct: !llvm.struct<(i32)>) -> !llvm.struct<(i32)> {
+  %predicate = builtin.unrealized_conversion_cast %predicate_struct : !llvm.struct<(i1)> to tensor<64xi1, #blocked>
+  %init_bridge = builtin.unrealized_conversion_cast %init_struct : !llvm.struct<(i32)> to tensor<64xi32, #bridge>
+  %init = builtin.unrealized_conversion_cast %init_bridge : tensor<64xi32, #bridge> to tensor<64xi32, #blocked>
+  %result = ttg.warp_predicate %predicate (%init) {
+    %two = llvm.mlir.constant(2 : i32) : i32
+    %yield_undef = llvm.mlir.undef : !llvm.struct<(i32)>
+    %yield_struct = llvm.insertvalue %two, %yield_undef[0] : !llvm.struct<(i32)>
+    %yield = builtin.unrealized_conversion_cast %yield_struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+    ttg.predicate_yield %yield : tensor<64xi32, #blocked>
+  } : (tensor<64xi1, #blocked>, tensor<64xi32, #blocked>) -> tensor<64xi32, #blocked>
+  %result_struct = builtin.unrealized_conversion_cast %result : tensor<64xi32, #blocked> to !llvm.struct<(i32)>
   llvm.return %result_struct : !llvm.struct<(i32)>
 }
 

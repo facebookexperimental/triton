@@ -19,10 +19,31 @@ namespace mlir {
 namespace triton {
 namespace tlx {
 
+static bool containsUserLayout(Attribute attr) {
+  if (!attr)
+    return false;
+  if (isa<UserLayoutAttr>(attr))
+    return true;
+  bool found = false;
+  attr.walkImmediateSubElements(
+      [&](Attribute a) { found |= containsUserLayout(a); }, [&](Type t) {});
+  return found;
+}
+
+static bool containsUserLayout(Type type) {
+  if (!type)
+    return false;
+  bool found = false;
+  type.walkImmediateSubElements(
+      [&](Attribute a) { found |= containsUserLayout(a); },
+      [&](Type t) { found |= containsUserLayout(t); });
+  return found;
+}
+
 //-- RequireLayoutOp --
 
 OpFoldResult RequireLayoutOp::fold(FoldAdaptor) {
-  if (getType() == getSrc().getType()) {
+  if (getType() == getSrc().getType() && !containsUserLayout(getType())) {
     // no-op
     return getSrc();
   }
