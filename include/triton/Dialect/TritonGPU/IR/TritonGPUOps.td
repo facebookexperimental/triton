@@ -513,21 +513,38 @@ def TTG_RemoteShmemStoreOp : TTG_Op<"remote_shmem_store"> {
   }];
 }
 
-def TTG_AsyncRemoteShmemStoreOp : TTG_Op<"async_remote_shmem_store"> {
+def TTG_AsyncRemoteShmemStoreOp
+    : TTG_Op<"async_remote_shmem_store",
+             [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Store a distributed tensor into remote shared memory with "
                 "barrier completion";
   let description = [{
     Store a distributed tensor into a buffer in remote shared memory with barrier completion signaling.
-    Uses PTX instruction: st.async.shared::cluster.mbarrier::complete_tx::bytes
+    The default `store_reduce = NONE` uses st.async. ADD, MIN, MAX, AND, OR,
+    XOR, INC, and DEC reduce matching 32-bit integer elements using scalar
+    red.async on NVIDIA SM90+ in a cluster with at least two physical CTAs.
+    `store_reduce_signed` selects signed MIN/MAX comparisons; ADD and bitwise
+    reductions operate on the same bits for signed and unsigned integers.
+    INC/DEC require unsigned elements (`store_reduce_signed = false`) and
+    interpret each source element as a bound b. For old destination x, INC
+    writes 0 if x >= b, otherwise x + 1; DEC writes b if x == 0 or x > b,
+    otherwise x - 1. Both instructions use the generic proxy. Each reduction
+    completes four bytes per unique element on the mbarrier without an
+    additional arrival.
 
     `$ctaRank` refers to the unique CTA id in a cluster across all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
     will be 0~7.
-    `$barrier` is a mandatory mbarrier in local shared memory that will be signaled when the remote store completes.
+    `$barrier` is a mandatory mbarrier in local shared memory. Both `$dst`
+    and `$barrier` are mapped to `$ctaRank`, which may name the executing CTA.
+    The caller must register expected bytes, synchronize initialization and
+    consumption, and keep all participating CTAs' storage alive until completion.
   }];
-  let arguments = (ins TT_Tensor:$src,
-      Arg<TTG_MemDescType, "", AsyncSharedWrite>:$dst, I32:$ctaRank,
-      Arg<TTG_MemDescType, "", BarrierSharedWrite>:$barrier);
-  let hasVerifier = 0;
+  let arguments = (ins TT_Tensor:$src, TTG_MemDescType:$dst, I32:$ctaRank,
+      TTG_MemDescType:$barrier,
+      DefaultValuedAttr<TT_DescriptorReduceKindAttr,
+                       "::mlir::triton::DescriptorReduceKind::NONE">:$store_reduce,
+      DefaultValuedAttr<BoolAttr, "false">:$store_reduce_signed);
+  let hasVerifier = 1;
   let assemblyFormat = [{
     $src `,` `rank` $ctaRank `,` $dst `barrier` $barrier attr-dict `:` type($src) `->` qualified(type($dst)) `barrier_ty` qualified(type($barrier))
   }];

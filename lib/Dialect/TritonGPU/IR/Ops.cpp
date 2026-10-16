@@ -291,7 +291,8 @@ struct CanonicalizeConvertAsyncRemoteShmemStore
     if (!convert)
       return failure();
     rewriter.replaceOpWithNewOp<triton::gpu::AsyncRemoteShmemStoreOp>(
-        op, convert.getSrc(), op.getDst(), op.getCtaRank(), op.getBarrier());
+        op, convert.getSrc(), op.getDst(), op.getCtaRank(), op.getBarrier(),
+        op.getStoreReduce(), op.getStoreReduceSigned());
     return mlir::success();
   }
 };
@@ -1024,6 +1025,88 @@ LogicalResult LocalStoreOp::verify() {
                                     getDst().getType(), "source")))
     return failure();
   return verifyMemoryOpTypes(*this, getSrc().getType(), getDst().getType());
+}
+
+void AsyncRemoteShmemStoreOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  bool isReduce = getStoreReduce() != DescriptorReduceKind::NONE;
+  auto dstKind = SharedKindAttr::get(
+      getContext(), isReduce ? SharedKind::Generic : SharedKind::Async);
+  if (isReduce)
+    effects.emplace_back(MemoryEffects::Read::get(), &getDstMutable(), dstKind,
+                         SharedMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getDstMutable(), dstKind,
+                       SharedMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getBarrierMutable(),
+                       SharedKindAttr::get(getContext(), SharedKind::Barrier),
+                       SharedMemory::get());
+}
+
+LogicalResult AsyncRemoteShmemStoreOp::verify() {
+  if (getStoreReduce() == DescriptorReduceKind::NONE)
+    return success();
+  switch (getStoreReduce()) {
+  case DescriptorReduceKind::ADD:
+  case DescriptorReduceKind::MIN:
+  case DescriptorReduceKind::MAX:
+  case DescriptorReduceKind::AND:
+  case DescriptorReduceKind::OR:
+  case DescriptorReduceKind::XOR:
+    break;
+  case DescriptorReduceKind::INC:
+  case DescriptorReduceKind::DEC:
+    if (getStoreReduceSigned())
+      return emitOpError(
+          "INC/DEC supports only unsigned 32-bit integer elements");
+    break;
+  default:
+    return emitOpError(
+        "store_reduce must be NONE, ADD, MIN, MAX, AND, OR, XOR, "
+        "INC, or DEC");
+  }
+
+  auto srcTy = getSrc().getType();
+  auto dstTy = getDst().getType();
+  auto barrierTy = getBarrier().getType();
+  if (!srcTy.getElementType().isInteger(32))
+    return emitOpError("reduction supports only 32-bit integer elements");
+  if (failed(verifyMemoryOpTypes(*this, srcTy, dstTy)))
+    return failure();
+  if (!isa<SharedMemorySpaceAttr>(dstTy.getMemorySpace()))
+    return emitOpError("reduction destination must be local shared memory");
+  if (!dstTy.getMutableMemory())
+    return emitOpError("cannot reduce into immutable memory");
+  if (!isa<SharedMemorySpaceAttr>(barrierTy.getMemorySpace()) ||
+      !barrierTy.getMutableMemory() ||
+      !barrierTy.getElementType().isInteger(64) || barrierTy.getRank() != 1 ||
+      barrierTy.getDimSize(0) < 1)
+    return emitOpError(
+        "reduction barrier must be a mutable local shared-memory "
+        "descriptor of Nxi64 type");
+
+  // Layouts may still be unresolved during frontend construction.
+  if (auto module = (*this)->getParentOfType<ModuleOp>()) {
+    // Physical cluster dimensions are attached after the layout-free TTIR
+    // passes. Its logical num_ctas=1 alone does not describe the launch.
+    bool hasClusterContext =
+        module->hasAttr(AttrTargetName) || module->hasAttr(AttrClusterDimX) ||
+        module->hasAttr(AttrClusterDimY) || module->hasAttr(AttrClusterDimZ);
+    if (hasClusterContext && lookupPhysicalNumCTAs(getOperation()) <= 1)
+      return emitOpError(
+          "reduction requires at least two physical CTAs in the cluster");
+    if (barrierTy.getDimSize(0) > lookupNumCTAs(getOperation()))
+      return emitOpError(
+          "reduction barrier must have N <= logical number of CTAs");
+    if (auto target = module->getAttrOfType<StringAttr>(AttrTargetName)) {
+      StringRef targetName = target.getValue();
+      int capability = 0;
+      if (!targetName.consume_front("cuda:") ||
+          targetName.getAsInteger(10, capability) || capability < 90)
+        return emitOpError("reduction requires an NVIDIA SM90+ target");
+    }
+  }
+  return success();
 }
 
 // LocalLoadOp

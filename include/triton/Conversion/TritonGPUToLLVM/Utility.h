@@ -690,6 +690,15 @@ LowerLdStCallback makeSharedStoreEmitter(const TargetInfoBase &targetInfo,
 LowerLdStCallback makeSharedLoadEmitter(const TargetInfoBase &targetInfo,
                                         Operation *localLoadOp = nullptr);
 
+// Match modular register layouts to the physical shared allocation shape.
+std::pair<LinearLayout, LinearLayout>
+getPhysicalLayouts(LinearLayout regLayout, triton::gpu::MemDescType memDescTy);
+
+// Scalar stores reuse shared addressing and the unique lane/warp predicate.
+using ScalarSharedStoreEmitter =
+    std::function<void(RewriterBase &, Location, Value /*ptr*/, Value /*ctaId*/,
+                       Value /*value*/, Value /*pred*/)>;
+
 // Close cousin of lowerLdStMatrix in MemoryOpToLLVM.cpp
 // We might want to merge them at some point, but having to support
 // ldmatrix.trans makes the code in lowerLdStMatrix a bit specific
@@ -706,7 +715,8 @@ SmallVector<Value> lowerLdStShared(
     const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
     std::optional<Value> barrierPtr = {},
-    std::optional<std::pair<Value, Value>> distributedCoordinates = {});
+    std::optional<std::pair<Value, Value>> distributedCoordinates = {},
+    ScalarSharedStoreEmitter scalarStoreEmitter = {});
 
 // Lower an ld/st-like operation given a layout and a callback that creates the
 // PTX instruction Lowers to st when valArrays is empty, and to ld when it is
@@ -736,6 +746,7 @@ SmallVector<Value> lowerLocalLdSt(
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
     std::optional<Value> barrierPtr = {},
     std::optional<std::pair<Value, Value>> distributedCoordinates = {},
+    ScalarSharedStoreEmitter scalarStoreEmitter = {},
     LowerLdStCallback lowerInst = {});
 
 // The callback form is used by target-independent lowering when the target
