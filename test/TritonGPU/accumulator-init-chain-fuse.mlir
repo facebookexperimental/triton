@@ -292,4 +292,76 @@ tt.func public @branch_accessor_keeps_src(
   tt.return %v0 : tensor<128x128xf32, #blocked>
 }
 
+// CHECK-LABEL: @chain_accumulator_convert_layout_fuse
+// A single-use convert_layout in the init chain is elementwise identity, so
+// the chain still fuses onto one tile and the conversion is erased.
+// CHECK:       scf.for
+// CHECK:         %[[ACCC:.*]], %[[TKC0:.*]] = ttng.tmem_alloc %arg
+// CHECK:         %[[TKC1:.*]] = ttng.tc_gen5_mma {{.*}} %[[ACCC]][%[[TKC0]]]
+// CHECK-NOT:     ttng.tmem_alloc
+// CHECK-NOT:     ttng.tmem_load
+// CHECK-NOT:     ttg.convert_layout
+// CHECK:         %[[TKC2:.*]] = ttng.tc_gen5_mma {{.*}} %[[ACCC]][%[[TKC1]]], %true
+// CHECK:         ttng.tmem_load %[[ACCC]][%[[TKC2]]]
+tt.func public @chain_accumulator_convert_layout_fuse(
+    %a0: !ttg.memdesc<128x64xf16, #shared, #smem>,
+    %b0: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+    %a1: !ttg.memdesc<128x64xf16, #shared, #smem>,
+    %b1: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+    %n: i32) {
+  %true = arith.constant true
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+  %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked>) : i32 {
+    %t1, %tok1 = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %m1 = ttng.tc_gen5_mma %a0, %b0, %t1[%tok1], %true, %true : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %v1, %ld1 = ttng.tmem_load %t1[%m1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    %cv = ttg.convert_layout %v1 : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #linearTMEM>
+    %t2, %tok2 = ttng.tmem_alloc %cv : (tensor<128x128xf32, #linearTMEM>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %m2 = ttng.tc_gen5_mma %a1, %b1, %t2[%tok2], %true, %true : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %v2, %ld2 = ttng.tmem_load %t2[%m2] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    scf.yield %v2 : tensor<128x128xf32, #blocked>
+  }
+  tt.return
+}
+
+// CHECK-LABEL: @chain_accumulator_transpose_no_fuse
+// A square-tile transpose in the init chain changes values (both tiles share
+// the same tensor_memory_encoding), so the pattern must NOT fuse: both tiles,
+// both read-outs, the transpose, and the conversion back to a TMEM-compatible
+// layout all survive.
+// CHECK:       scf.for
+// CHECK:         ttng.tmem_alloc
+// CHECK:         ttng.tc_gen5_mma
+// CHECK:         ttng.tmem_load
+// CHECK:         tt.trans
+// CHECK:         ttg.convert_layout
+// CHECK:         ttng.tmem_alloc
+// CHECK:         ttng.tc_gen5_mma
+// CHECK:         ttng.tmem_load
+tt.func public @chain_accumulator_transpose_no_fuse(
+    %a0: !ttg.memdesc<128x64xf16, #shared, #smem>,
+    %b0: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+    %a1: !ttg.memdesc<128x64xf16, #shared, #smem>,
+    %b1: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+    %n: i32) {
+  %true = arith.constant true
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+  %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked>) : i32 {
+    %t1, %tok1 = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %m1 = ttng.tc_gen5_mma %a0, %b0, %t1[%tok1], %true, %true : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %v1, %ld1 = ttng.tmem_load %t1[%m1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    %vt = tt.trans %v1 {order = array<i32: 1, 0>} : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #blockedT>
+    %cvt = ttg.convert_layout %vt : tensor<128x128xf32, #blockedT> -> tensor<128x128xf32, #blocked>
+    %t2, %tok2 = ttng.tmem_alloc %cvt : (tensor<128x128xf32, #blocked>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %m2 = ttng.tc_gen5_mma %a1, %b1, %t2[%tok2], %true, %true : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %v2, %ld2 = ttng.tmem_load %t2[%m2] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    scf.yield %v2 : tensor<128x128xf32, #blocked>
+  }
+  tt.return
+}
+
 }
