@@ -1427,14 +1427,17 @@ void init_triton_tlx_ir(py::module &&m) {
                  resultType, ptr, offsets, Value() /*stride*/, cache,
                  mask.value_or(Value()), other.value_or(Value()), contiguity);
            })
-      .def("create_buffer_store",
-           [](TritonOpBuilder &self, Value storedValue, Value ptr,
-              Value offsets, std::optional<Value> mask, tt::CacheModifier cache,
-              uint32_t contiguity) {
-             self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
-                                              Value() /*stride*/, cache,
-                                              mask.value_or(Value()), contiguity);
-           })
+      .def(
+          "create_buffer_store",
+          [](TritonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
+             std::optional<Value> mask, tt::CacheModifier cache,
+             uint32_t contiguity) -> OpState {
+            return self.create<ttag::BufferStoreOp>(
+                storedValue, ptr, offsets, Value() /*stride*/, cache,
+                mask.value_or(Value()), contiguity);
+          },
+          py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
+          py::arg("mask").none(), py::arg("cache"), py::arg("contiguity"))
       .def("create_buffer_load_to_local",
            [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
               std::optional<Value> mask, std::optional<Value> other,
