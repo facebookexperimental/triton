@@ -37,7 +37,18 @@ _FP16 = frozenset({"float16", "bfloat16"})
 # A static table, not decorator self-registration: `impl` stays a string so
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
 # A missing (op, arch) is deferred, not an error -- the op raises on that arch.
-CATALOG: tuple[OpSpec, ...] = ()
+CATALOG: tuple[OpSpec, ...] = (
+    OpSpec(
+        op="mm",
+        arch="gfx950",
+        variant="heuristic",
+        impl="kernels.mm.gfx950:mm",
+        # LocalSplitU and persistent plans remain FP16-only; the register and
+        # general LDS paths also support BF16 and validate their own plans.
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+)
 
 _BY_KEY = {(s.op, s.arch): s for s in CATALOG}
 assert len(_BY_KEY) == len(CATALOG), "duplicate (op, arch) in CATALOG"
