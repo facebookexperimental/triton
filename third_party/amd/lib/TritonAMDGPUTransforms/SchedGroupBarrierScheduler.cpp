@@ -539,9 +539,12 @@ countIntraWaveStage(const IntraWaveStage &stage,
       return failure();
     }
     if (isa<triton::gpu::AsyncCommitGroupOp>(op)) {
-      op->emitError(
-          "intra-wave pipeline stage does not support async commit groups");
-      return failure();
+      if (!stage.pair) {
+        op->emitError("async commit groups require a paired intra-wave "
+                      "memory stage");
+        return failure();
+      }
+      continue;
     }
     auto priced = priceIntraWaveOp(op, axisInfo);
     if (!priced) {
@@ -558,6 +561,40 @@ countIntraWaveStage(const IntraWaveStage &stage,
       continue;
     }
     counts.memory += count;
+  }
+  return success();
+}
+
+static LogicalResult
+validateAsyncCommitGroups(const IntraWaveStage &memoryStage,
+                          const IntraWaveStage &computeStage,
+                          triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
+  for (Operation *op : computeStage.ops) {
+    if (isa<triton::gpu::AsyncCommitGroupOp>(op)) {
+      op->emitError("async commit groups require a paired intra-wave memory "
+                    "stage");
+      return failure();
+    }
+  }
+
+  bool hasUncommittedAsyncMemory = false;
+  for (Operation *op : memoryStage.ops) {
+    if (isa<triton::gpu::AsyncCommitGroupOp>(op)) {
+      if (!hasUncommittedAsyncMemory) {
+        op->emitError("async commit group must follow schedulable memory work "
+                      "in a paired intra-wave memory stage");
+        return failure();
+      }
+      hasUncommittedAsyncMemory = false;
+      continue;
+    }
+    // At this point the stage is already proven memory-only. Track its priced
+    // memory anchors rather than one source op kind: canonicalization can
+    // represent a Direct-to-LDS producer as a TTG async copy or an AMD buffer
+    // load, and the commit must stay attached to whichever anchor survives.
+    auto priced = priceIntraWaveOp(op, axisInfo);
+    if (priced && priced->first != kMaskMFMA)
+      hasUncommittedAsyncMemory = true;
   }
   return success();
 }
@@ -1076,6 +1113,9 @@ materializeIntraWaveWindows(ModuleOp mod,
 
       IntraWaveStage *computeStage = compute == &firstCounts ? &first : &second;
       IntraWaveStage *memoryStage = memory == &firstCounts ? &first : &second;
+      if (failed(
+              validateAsyncCommitGroups(*memoryStage, *computeStage, axisInfo)))
+        return failure();
       if (failed(materializeIntraWaveWindow(*memoryStage, *computeStage,
                                             *compute, second.end, window,
                                             nextSyncId, axisInfo)))

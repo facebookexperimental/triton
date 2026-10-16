@@ -121,6 +121,22 @@ unsigned getElementBitWidth(RankedTensorType type) {
   return typeForMem.getIntOrFloatBitWidth();
 }
 
+bool containsPinnedEncoding(Attribute encoding) {
+  if (!encoding)
+    return false;
+  if (isa<triton::gpu::PinnedEncodingTrait>(encoding))
+    return true;
+
+  bool pinned = false;
+  encoding.walkImmediateSubElements(
+      [&](Attribute nested) {
+        if (!pinned)
+          pinned = containsPinnedEncoding(nested);
+      },
+      [](Type) {});
+  return pinned;
+}
+
 static std::optional<unsigned>
 getAtomicWriteElementsPerThreadCap(Operation *op) {
   if (isa<triton::AtomicCASOp>(op))
