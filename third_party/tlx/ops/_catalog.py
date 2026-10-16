@@ -65,6 +65,10 @@ CATALOG: tuple[OpSpec, ...] = (
         # descriptor transposed, which moves the constraint to another dim.
         accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma", "tmem"}),
+        # The heuristic config trails the tuned space (up to ~4x on small shapes,
+        # ~5% on 784x3272x147456), so default to the tuned configs; callers opt
+        # into "heuristic" for a fast first call.
+        default_space="full",
     ),
     OpSpec(
         op="mm",
