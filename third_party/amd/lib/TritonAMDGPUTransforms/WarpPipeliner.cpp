@@ -264,18 +264,13 @@ static bool isSingleIterationOwner(Operation *begin, ArrayRef<Stage> stages,
   return originalCount && stages.size() == originalCount.getInt();
 }
 
-static LogicalResult selectStageInputScope(Operation *&begin, Operation *&end,
-                                           ArrayRef<Stage> stages,
-                                           bool hasOwner) {
+static void selectStageInputScope(Operation *&begin, Operation *&end,
+                                  ArrayRef<Stage> stages, bool hasOwner) {
   if (hasOwner || isa<scf::ForOp>(begin->getParentOp()))
-    return success();
-  if (!isa<tt::FuncOp>(begin->getParentOp()))
-    return stages.front().begin->emitError(
-        "warp_pipeline_stage requires a loop body or a function block");
+    return;
   // Explicit boundaries keep a flat pipeline's prologue and epilogue out.
   begin = stages.front().begin;
   end = stages.back().end->getNextNode();
-  return success();
 }
 
 static DenseMap<Operation *, unsigned>
@@ -379,13 +374,17 @@ static void moveStageInputs(ArrayRef<Operation *> inputs,
 // This is a cold compiler path. Plan placement before changing the block.
 static LogicalResult normalizeStageInputs(Operation *begin, Operation *end,
                                           bool hasOwner) {
+  // Match stage construction: only loops, explicit owner scopes, and function
+  // blocks form pipelines. Unowned markers in conditional tails stay in place.
+  if (!begin ||
+      (!hasOwner && !isa<scf::ForOp, tt::FuncOp>(begin->getParentOp())))
+    return success();
   SmallVector<Stage> stages;
   if (failed(collectStages(begin, end, stages)))
     return failure();
   if (stages.empty() || isSingleIterationOwner(begin, stages, hasOwner))
     return success();
-  if (failed(selectStageInputScope(begin, end, stages, hasOwner)))
-    return failure();
+  selectStageInputScope(begin, end, stages, hasOwner);
 
   DenseMap<Operation *, unsigned> placement = getFixedStagePlacement(stages);
   SmallVector<Operation *> inputs;

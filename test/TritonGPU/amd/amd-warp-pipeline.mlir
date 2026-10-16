@@ -390,6 +390,40 @@ tt.func @flat_inputs_past_wait(%value: i32, %ptr: !tt.ptr<i32>) {
   tt.return
 }
 
+// A conditional tail has no pipeline owner. Keep its stage markers and
+// scalar inputs in place, as stage construction does for this scope.
+// NORM-LABEL: tt.func @conditional_tail(
+// NORM: scf.if
+// NORM-NEXT: rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "first"}
+// NORM-NEXT: tt.store
+// NORM-NEXT: rocdl.sched.barrier none {triton.warp_pipeline.border = "first"}
+// NORM-NEXT: %[[NEXT:.*]] = arith.addi
+// NORM-NEXT: ttg.async_wait
+// NORM-NEXT: rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "second"}
+// NORM-NEXT: tt.store {{.*}}, %[[NEXT]]
+// CHECK-LABEL: tt.func @conditional_tail(
+// CHECK: scf.if
+// CHECK-NEXT: rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "first"}
+// CHECK-NEXT: tt.store
+// CHECK-NEXT: rocdl.sched.barrier none {triton.warp_pipeline.border = "first"}
+// CHECK-NEXT: %[[NEXT:.*]] = arith.addi
+// CHECK-NEXT: ttg.async_wait
+// CHECK-NEXT: rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "second"}
+// CHECK-NEXT: tt.store {{.*}}, %[[NEXT]]
+tt.func @conditional_tail(%condition: i1, %value: i32, %ptr: !tt.ptr<i32>) {
+  scf.if %condition {
+    rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "first"}
+    tt.store %ptr, %value : !tt.ptr<i32>
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "first"}
+    %next = arith.addi %value, %value : i32
+    ttg.async_wait {num = 0 : i32}
+    rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "second"}
+    tt.store %ptr, %next : !tt.ptr<i32>
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "second"}
+  }
+  tt.return
+}
+
 // -- Negative: no border → no structuring ----
 tt.func @no_split_example(%n: index) {
   %c0  = arith.constant 0 : index
