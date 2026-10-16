@@ -233,6 +233,11 @@ struct TmemAllocChannel : Channel {
 constexpr static char kWarpSpecializeGeneratedBarrierAttrName[] =
     "ttg.ws_generated_barrier";
 
+// Sorted `buffer.id`s of the buffers guarded by a token (`nvws.create_token`)
+// or barrier alloc. Stamped by code partition so the WS buffer-barrier
+// verifier can group sync ops per buffer without re-deriving channels.
+constexpr static char kWSBufferIdsAttrName[] = "ttg.ws_buffer_ids";
+
 bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
 bool enclosing(scf::WhileOp whileOp, Operation *op);

@@ -1005,6 +1005,50 @@ static bool taskUsesOnlyGen5Consumers(ArrayRef<Channel *> channels,
   return true;
 }
 
+// Record which buffers each token and barrier alloc guards. Tokens and
+// barrier allocs are shared across the channels of a consumer group (and
+// across reuse-group members), so each sync op accumulates the `buffer.id`s
+// of every channel mapped to it. Channels whose buffer is missing from
+// `bufferMap` or lacks a `buffer.id` contribute nothing.
+static void stampBufferBarrierAssociation(
+    const DenseMap<Channel *, CommChannel> &tokenMap,
+    const DenseMap<Channel *, Value> &bufferMap) {
+  DenseMap<Operation *, SmallVector<int>> idsPerSyncOp;
+  auto noteBuffer = [&](Channel *channel, Operation *syncOp) {
+    if (!syncOp)
+      return;
+    auto bufIt = bufferMap.find(channel);
+    if (bufIt == bufferMap.end() || !bufIt->second)
+      return;
+    Operation *bufferOp = bufIt->second.getDefiningOp();
+    if (!bufferOp)
+      return;
+    if (auto id = bufferOp->getAttrOfType<IntegerAttr>("buffer.id"))
+      idsPerSyncOp[syncOp].push_back(static_cast<int>(id.getInt()));
+  };
+  for (auto &entry : tokenMap) {
+    Channel *channel = entry.first;
+    const CommChannel &comm = entry.second;
+    for (auto &tokenEntry : comm.tokens)
+      noteBuffer(channel, tokenEntry.second.getDefiningOp());
+    if (comm.producerBarrier)
+      noteBuffer(channel, comm.producerBarrier->getDefiningOp());
+    for (auto &barEntry : comm.consumerBarriers)
+      noteBuffer(channel, barEntry.second.getDefiningOp());
+  }
+  for (auto &entry : idsPerSyncOp) {
+    SmallVector<int> &ids = entry.second;
+    llvm::sort(ids);
+    ids.erase(llvm::unique(ids), ids.end());
+    if (ids.empty())
+      continue;
+    SmallVector<int32_t> sorted(ids.begin(), ids.end());
+    entry.first->setAttr(
+        kWSBufferIdsAttrName,
+        DenseI32ArrayAttr::get(entry.first->getContext(), sorted));
+  }
+}
+
 void createToken(
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
@@ -6045,6 +6089,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
   DenseMap<Channel *, CommChannel> tokenMap;
   createToken(channelsGroupedByConsumers, orderedChannels, funcOp, copyOpMap,
               tokenMap, &config);
+  stampBufferBarrierAssociation(tokenMap, bufferMap);
   LLVM_DEBUG({
     LDBG("\n\nafter createToken");
     funcOp.dump();
