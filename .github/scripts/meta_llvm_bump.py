@@ -149,7 +149,22 @@ def issue_marker(target):
     return f"<!-- meta-llvm-bump {target} -->"
 
 
-def issue_body(repo, target, bot_branch, title, message):
+def pick_tracking(issues, target):
+    """(newest open tracking issue for target or None, older duplicates newest first).
+
+    issues: [{"number": int, "body": str, ...}, ...] open issues in any order.
+    """
+    matches = sorted((i for i in issues if issue_marker(target) in (i.get("body") or "")), key=lambda i: i["number"],
+                     reverse=True)
+    return (matches[0] if matches else None), matches[1:]
+
+
+def issue_title(target, release):
+    """Tracking issue title; names the release and the day it was published."""
+    return f"[Meta LLVM] Bump ready: {target} to {release['tag_name']} ({release['published_at'][:10]})"
+
+
+def issue_body(repo, target, bot_branch, title, message, release):
     """Tracking issue: where the bump is and the command a person runs to open its PR.
 
     A person opens the PR because the Meta CLA check and the fbsource importer accept only
@@ -163,6 +178,9 @@ def issue_body(repo, target, bot_branch, title, message):
         f"A Meta LLVM bump for `{target}` is ready on `{bot_branch}` "
         f"([view the change](https://github.com/{repo}/compare/{target}...{bot_branch})).",
         "",
+        f"Release: `{release['tag_name']}`, built from fork commit `{release['target_commitish'][:12]}`, "
+        f"published {release['published_at'].replace('T', ' ').rstrip('Z')} UTC.",
+        "",
         "Open its PR (a person must open it, since the Meta CLA check reads the PR author), then import and "
         "land it as usual:",
         "",
@@ -170,8 +188,8 @@ def issue_body(repo, target, bot_branch, title, message):
         gh_cmd,
         "```",
         "",
-        f"The bot keeps the branch, and the PR once it exists, up to date. This issue closes when `{target}` pins "
-        "the release.",
+        f"When the fork publishes a newer release, the bot moves the branch (and the PR once it exists) to it and "
+        f"comments here. This issue closes when `{target}` pins the release.",
         "",
         "Commit message and PR description:",
         "",

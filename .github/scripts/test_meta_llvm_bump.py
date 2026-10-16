@@ -1,5 +1,5 @@
-from meta_llvm_bump import (commit_message, decide, issue_body, issue_marker, oai_pins, parse_sha256_file, release_for,
-                            render, same_tree_chain, variants)
+from meta_llvm_bump import (commit_message, decide, issue_body, issue_marker, issue_title, oai_pins, pick_tracking,
+                            parse_sha256_file, release_for, render, same_tree_chain, variants)
 
 OLD = "1889ed344a2ea019320c1a49fc5b7103d0d9468d"
 NEW = "3dd0e43fed8836e77165a4f066b983efe1f13a82"
@@ -113,9 +113,14 @@ def test_commit_message_plain_wrapped_bare_labels():
     assert "  3dd0e43fed88 [triton][3.8][LLVM] Cap SLSR candidate-basis SCEV diff..." in lines
 
 
+RELEASE = {
+    "tag_name": "llvm-3dd0e43f-1", "target_commitish": "3dd0e43fed88" + "0" * 28, "published_at": "2026-10-15T07:12:30Z"
+}
+
+
 def test_issue_body_has_marker_command_and_message():
     body = issue_body("facebookexperimental/triton", "release/3.8.x", "scratch/meta-llvm-bump/release-3.8.x",
-                      "[Meta LLVM] Bump release/3.8.x to llvm-3dd0e43f-1", "TITLE\n\nSummary:\nbody text")
+                      "[Meta LLVM] Bump release/3.8.x to llvm-3dd0e43f-1", "TITLE\n\nSummary:\nbody text", RELEASE)
     assert body.startswith(issue_marker("release/3.8.x"))
     assert ("gh pr create -R facebookexperimental/triton --base release/3.8.x "
             "--head scratch/meta-llvm-bump/release-3.8.x") in body
@@ -125,3 +130,19 @@ def test_issue_body_has_marker_command_and_message():
     assert "compare/release/3.8.x...scratch/meta-llvm-bump/release-3.8.x" in body
     assert "Summary:\nbody text" in body
     assert issue_marker("main") != issue_marker("release/3.8.x")
+    assert "Release: `llvm-3dd0e43f-1`, built from fork commit `3dd0e43fed88`, published 2026-10-15 07:12:30 UTC." in body
+
+
+def test_issue_title_dates_the_release():
+    assert issue_title("main", RELEASE) == "[Meta LLVM] Bump ready: main to llvm-3dd0e43f-1 (2026-10-15)"
+
+
+def test_pick_tracking_keeps_newest_and_returns_duplicates():
+    issues = [{"number": n, "body": issue_marker(t) + "\nbody"}
+              for n, t in [(4133, "main"), (4134, "release/3.8.x"), (4139, "main"), (4136, "main")]]
+    issues.append({"number": 4126, "body": None})
+    keep, dups = pick_tracking(issues, "main")
+    assert keep["number"] == 4139
+    assert [d["number"] for d in dups] == [4136, 4133]
+    assert pick_tracking(issues, "release/3.8.x")[0]["number"] == 4134
+    assert pick_tracking(issues[-1:], "main") == (None, [])
