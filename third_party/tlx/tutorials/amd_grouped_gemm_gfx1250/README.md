@@ -90,6 +90,59 @@ JIT entry points. A shared implementation specializes group addressing
 at compile time and reuses the TDM pipeline, prefetch, output staging,
 and multicast schedules. The original packed entry point remains the default.
 
+## gfx950-compatible host interface
+
+The tutorial also provides the same host call signatures and setup return
+structure as `ops/kernels/grouped_gemm/gfx950.py`:
+
+```python
+from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
+    amd_grouped_gemm_gfx1250_test as gfx1250,
+)
+
+outputs = gfx1250.grouped_gemm(group_a, group_b)
+
+# Prepare once, then time or replay only the launch.
+args = gfx1250._make_grouped_gemm_args(group_a, group_b, config={"NUM_SM": 8})
+a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_count, cfg, outputs = args
+gfx1250._perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_count, cfg)
+```
+
+The three pointer tables are int64 `[G]`; sizes and strides are flat int32
+`[3*G]`, matching gfx950. Setup validates inputs and tuning before allocating
+outputs and tables. Prepared launches check table metadata and tuning without
+copying inputs, allocating device memory, or reading device values back.
+Keep inputs, tables, and outputs alive through kernel completion. In-place
+table updates must preserve the validated shape/layout restrictions and the
+selected tail specialization; `_perf_fn` trusts the table contents.
+
+The default is the existing 256x256x128 tile, depth 2, within-group hybrid
+prefetch, C_STAGING_MODE=0, chunked XCD remapping, four warps, and cluster size
+1. Aligned M/N selects the full-tile specialization. `NUM_SM` caps the number
+of persistent programs and is limited to the number of output tiles.
+
+Unsupported requests raise `ValueError`, with no fallback or automatic change
+to the requested schedule. Restrictions are:
+
+- AMD gfx1250, FP16, forward-only, canonical A/B strides, aligned matrix bases,
+  and common positive N/K. Ragged M, zero-row groups, and M/N tails are allowed.
+- The default cross-tile schedule requires positive K divisible by 256.
+  Other supported schedules require K divisible by 128 and enough K blocks
+  for their pipeline. K=384, for example, requires an explicit compatible
+  configuration such as `{"CROSS_TILE_PREFETCH": False}`.
+- Config uses common gfx950 keys such as `BLOCK_SIZE_M`, `BLOCK_SIZE_N`,
+  `BLOCK_SIZE_K`, `GROUP_SIZE_M`, and `NUM_BUFFERS`, together with the TDM
+  options in `_GROUPED_GEMM_INTERFACE_CONFIG`. gfx950-specific keys such as
+  `TILE_MODE` and `HAS_K_TAIL`, unknown keys, invalid types, and unsupported
+  tile/pipeline/staging combinations are rejected. Config dictionaries are
+  architecture-specific; use the cfg returned by this setup function.
+- This interface supports cluster size 1 and the validated schedules listed
+  in `_GROUPED_GEMM_INTERFACE_SCHEDULES`. Other clustered configurations and
+  padded leading strides remain available through the existing tutorial
+  entry points under their documented restrictions.
+
+These entry points live in the tutorial; `tlx.ops` dispatch is unchanged.
+
 ## Configurations
 
 Large-tile default:

@@ -1380,14 +1380,12 @@ def grouped_gemm_tdm(
     return c_packed
 
 
-def _make_grouped_gemm_tdm_list_args(group_a, group_b, group_c=None):
-    """Validate the list contract and construct metadata without packing inputs."""
+def _validate_grouped_gemm_tdm_list_inputs(group_a, group_b):
+    """Check tensor metadata without allocating outputs or device tables."""
     if not isinstance(group_a, (list, tuple)) or not isinstance(group_b, (list, tuple)):
         raise ValueError("group_a and group_b must be lists or tuples")
     if not group_a or len(group_a) != len(group_b):
         raise ValueError("group_a and group_b must have the same nonzero length")
-    if group_c is not None and (not isinstance(group_c, (list, tuple)) or len(group_c) != len(group_a)):
-        raise ValueError("group_c must have one output tensor per group")
 
     m_list = []
     device = None
@@ -1418,6 +1416,14 @@ def _make_grouped_gemm_tdm_list_args(group_a, group_b, group_c=None):
         raise ValueError("the TDM list kernel is forward-only; use torch.no_grad()")
     if sum(m_list) >= 1 << 31:
         raise ValueError("the TDM scheduler requires sum(M) to fit in int32")
+    return m_list, n, k, device
+
+
+def _make_grouped_gemm_tdm_list_args(group_a, group_b, group_c=None):
+    """Validate the list contract and construct metadata without packing inputs."""
+    m_list, n, k, device = _validate_grouped_gemm_tdm_list_inputs(group_a, group_b)
+    if group_c is not None and (not isinstance(group_c, (list, tuple)) or len(group_c) != len(group_a)):
+        raise ValueError("group_c must have one output tensor per group")
     outputs = ([torch.empty((m, n), device=device, dtype=torch.float16)
                 for m in m_list] if group_c is None else list(group_c))
     for index, (c, m) in enumerate(zip(outputs, m_list)):
@@ -1557,6 +1563,177 @@ def grouped_gemm_tdm_list(
             print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
         else:
             run_kernel()
+    return outputs
+
+
+_GROUPED_GEMM_INTERFACE_CONFIG = dict(BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=128, GROUP_SIZE_M=4,
+                                      NUM_BUFFERS=2, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, L2_PREFETCH_DISTANCE=0,
+                                      XCD_REMAP_MODE=2, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
+                                      num_warps=4, waves_per_eu=1)
+
+# Validated (BM, BN, depth, C staging, cross-tile prefetch) schedules. In
+# particular, larger rings/full dedicated C tiles can exceed the LDS budget.
+_GROUPED_GEMM_INTERFACE_SCHEDULES = {
+    (128, 128, 2, 0, False),
+    (128, 128, 3, 0, False),
+    (128, 128, 4, 0, False),
+    (128, 256, 2, 1, True),
+    (128, 256, 3, 0, False),
+    (256, 128, 2, 1, True),
+    (256, 256, 2, 0, False),
+    (256, 256, 2, 0, True),
+    (256, 256, 2, 1, True),
+}
+
+
+def _grouped_gemm_interface_config(config, k):
+    """Validate gfx1250 tuning without silently replacing requested settings."""
+    if config is not None and not isinstance(config, dict):
+        raise ValueError("gfx1250 grouped GEMM config must be a dict or None")
+    config = {} if config is None else config
+    unknown = config.keys() - (_GROUPED_GEMM_INTERFACE_CONFIG.keys() | {"NUM_SM"})
+    if unknown:
+        raise ValueError(f"unsupported gfx1250 grouped GEMM config keys: {sorted(map(str, unknown))}")
+    cfg = dict(_GROUPED_GEMM_INTERFACE_CONFIG, **config)
+    for key, value in cfg.items():
+        if key in ("CROSS_TILE_PREFETCH", "CLUSTER_MULTICAST"):
+            if type(value) is not bool:
+                raise ValueError(f"{key} must be a bool")
+        elif type(value) is not int:
+            raise ValueError(f"{key} must be an int")
+    for key, allowed in {
+            "BLOCK_SIZE_M": (128, 256),
+            "BLOCK_SIZE_N": (128, 256),
+            "BLOCK_SIZE_K": (128, ),
+            "NUM_BUFFERS": (2, 3, 4),
+            "C_STAGING_MODE": (0, 1),
+            "XCD_REMAP_MODE": (0, 1, 2),
+            "CLUSTER_SIZE": (1, ),
+            "num_warps": (4, ),
+            "waves_per_eu": (1, ),
+    }.items():
+        if cfg[key] not in allowed:
+            raise ValueError(f"unsupported gfx1250 {key}={cfg[key]}; supported values: {allowed}")
+    for key in ("GROUP_SIZE_M", "NUM_XCDS", "XCD_CHUNK", "NUM_SM"):
+        if key in cfg and not 0 < cfg[key] < 1 << 31:
+            raise ValueError(f"{key} must be a positive int32")
+    if not 0 <= cfg["L2_PREFETCH_DISTANCE"] < 1 << 31:
+        raise ValueError("L2_PREFETCH_DISTANCE must be a nonnegative int32")
+    if cfg["NUM_XCDS"] * cfg["XCD_CHUNK"] >= 1 << 31:
+        raise ValueError("NUM_XCDS * XCD_CHUNK must fit in int32")
+    if type(k) is not int or not 0 < k < 1 << 31 or k % cfg["BLOCK_SIZE_K"]:
+        raise ValueError("gfx1250 grouped GEMM requires full K tiles: positive int32 K divisible by 128")
+    depth = cfg["NUM_BUFFERS"]
+    if k // 128 < depth:
+        raise ValueError("K must contain enough blocks to fill the TDM pipeline")
+    if cfg["C_STAGING_MODE"] == 1 and (depth * 128) % cfg["BLOCK_SIZE_N"]:
+        raise ValueError("dedicated C staging requires a full C buffer (NUM_BUFFERS * 128 divisible by BLOCK_SIZE_N)")
+    if cfg["CROSS_TILE_PREFETCH"]:
+        if depth != 2 or (k // 128) % 2:
+            raise ValueError("cross-tile prefetch requires depth 2 and an even number of K blocks")
+        if cfg["C_STAGING_MODE"] == 0 and (cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"]) != (256, 256):
+            raise ValueError("alias-C cross-tile prefetch requires a 256x256 tile")
+    schedule = tuple(cfg[key] for key in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "NUM_BUFFERS", "C_STAGING_MODE",
+                                          "CROSS_TILE_PREFETCH"))
+    if schedule not in _GROUPED_GEMM_INTERFACE_SCHEDULES:
+        raise ValueError(f"unsupported gfx1250 TDM schedule (BM, BN, depth, C staging, cross-tile): {schedule}")
+    if cfg["L2_PREFETCH_DISTANCE"] > k // 128:
+        raise ValueError("L2_PREFETCH_DISTANCE must not exceed the number of K blocks")
+    return cfg
+
+
+def _require_grouped_gemm_gfx1250(device):
+    if device.type != "cuda" or not torch.version.hip:
+        raise ValueError("the TDM grouped GEMM interface requires an AMD gfx1250 device")
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+    if arch != "gfx1250":
+        raise ValueError(f"the TDM grouped GEMM interface requires gfx1250; got {arch}")
+
+
+def _make_grouped_gemm_args(group_A, group_B, config=None):
+    """gfx950-compatible setup: return five tables, G, cfg, and output list.
+
+    A is canonical row-major FP16 [M_g, K], B canonical column-major FP16
+    [K, N]. Only M may vary across groups. No input packing is performed.
+    Config uses gfx950's common tuning names plus TDM-specific options;
+    gfx950-only options are rejected. The default is the 256x256 hybrid with
+    depth 2 and cluster size 1. All validation precedes device allocation.
+    Keep inputs, returned tables, and outputs alive through the launch.
+    """
+    m_list, n, k, device = _validate_grouped_gemm_tdm_list_inputs(group_A, group_B)
+    if n >= 1 << 31 or 3 * len(m_list) >= 1 << 31:
+        raise ValueError("gfx1250 grouped GEMM requires N and 3 * group count to fit in int32")
+    cfg = _grouped_gemm_interface_config(config, k)
+    if cfg["GROUP_SIZE_M"] * _cdiv_int(n, cfg["BLOCK_SIZE_N"]) >= 1 << 31:
+        raise ValueError("GROUP_SIZE_M * number of N tiles must fit in int32")
+    _require_grouped_gemm_gfx1250(device)
+    total_tiles = sum(_cdiv_int(m, cfg["BLOCK_SIZE_M"]) * _cdiv_int(n, cfg["BLOCK_SIZE_N"]) for m in m_list)
+    num_sm = min(cfg["NUM_SM"] if "NUM_SM" in cfg else _active_num_cus(device), total_tiles)
+    if total_tiles + num_sm >= 1 << 31:
+        raise ValueError("gfx1250 grouped GEMM tile count plus NUM_SM must fit in int32")
+    cfg.update(K=k, NUM_SM=num_sm, ALLOW_MN_TAILS=bool(n % cfg["BLOCK_SIZE_N"]
+                                                       or any(m % cfg["BLOCK_SIZE_M"] for m in m_list)))
+    a, b, c, sizes, lds, outputs, _, _, _ = _make_grouped_gemm_tdm_list_args(group_A, group_B)
+    # gfx950 emits flat size/stride tables. Views preserve the same allocation.
+    return a, b, c, sizes.view(-1), lds.view(-1), len(m_list), cfg, outputs
+
+
+def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
+    """Launch prepared gfx950-style arguments without allocation or readback.
+
+    Use the config returned by _make_grouped_gemm_args. Device table contents
+    are trusted: any in-place updates must preserve common N/K, canonical
+    layouts, alignment, scheduler limits, and the chosen tail specialization.
+    The raw JIT entry remains available for padded leading strides.
+    """
+    if not isinstance(cfg, dict) or not {"K", "NUM_SM", "ALLOW_MN_TAILS"} <= cfg.keys():
+        raise ValueError("cfg must include K, NUM_SM, and ALLOW_MN_TAILS from _make_grouped_gemm_args")
+    if type(G) is not int or G <= 0 or 3 * G >= 1 << 31:
+        raise ValueError("G must be a positive int32 group count with 3 * G fitting in int32")
+    if type(cfg["NUM_SM"]) is not int or not 0 <= cfg["NUM_SM"] < 1 << 31:
+        raise ValueError("NUM_SM must be a nonnegative int32")
+    if type(cfg["ALLOW_MN_TAILS"]) is not bool:
+        raise ValueError("ALLOW_MN_TAILS must be a bool")
+    tuning = _grouped_gemm_interface_config(
+        {key: value
+         for key, value in cfg.items()
+         if key not in ("K", "NUM_SM", "ALLOW_MN_TAILS")}, cfg["K"])
+    tables = (d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds)
+    if not all(isinstance(t, torch.Tensor) for t in tables):
+        raise ValueError("grouped GEMM metadata must be tensors")
+    device = d_a_ptrs.device
+    for index, table in enumerate(tables):
+        dtype = torch.int64 if index < 3 else torch.int32
+        shapes = ((G, ), ) if index < 3 else ((3 * G, ), (G, 3))
+        if table.device != device or table.dtype != dtype or tuple(
+                table.shape) not in shapes or not table.is_contiguous():
+            raise ValueError(f"metadata table {index} must be contiguous {dtype}, shape in {shapes}, on {device}")
+    _require_grouped_gemm_gfx1250(device)
+    if cfg["NUM_SM"] == 0:
+        return
+    specialize_groups = tuning["CROSS_TILE_PREFETCH"] and tuning["BLOCK_SIZE_M"] == tuning["BLOCK_SIZE_N"] == 256
+    with torch.cuda.device(device):
+        grouped_gemm_tdm_list_kernel[(cfg["NUM_SM"], )](
+            *tables, tl.constexpr(G) if specialize_groups else G, K=cfg["K"], NUM_PROGRAMS=cfg["NUM_SM"],
+            BLOCK_M=tuning["BLOCK_SIZE_M"], BLOCK_N=tuning["BLOCK_SIZE_N"], BLOCK_K=tuning["BLOCK_SIZE_K"],
+            GROUP_M=tuning["GROUP_SIZE_M"], NUM_BUFFERS=tuning["NUM_BUFFERS"],
+            L2_PREFETCH_DISTANCE=tuning["L2_PREFETCH_DISTANCE"], C_STAGING_MODE=tuning["C_STAGING_MODE"],
+            CROSS_TILE_PREFETCH=tuning["CROSS_TILE_PREFETCH"], XCD_REMAP_MODE=tuning["XCD_REMAP_MODE"],
+            NUM_XCDS=tuning["NUM_XCDS"], XCD_CHUNK=tuning["XCD_CHUNK"], CLUSTER_SIZE=tuning["CLUSTER_SIZE"],
+            CLUSTER_MULTICAST=tuning["CLUSTER_MULTICAST"], ALLOW_MN_TAILS=cfg["ALLOW_MN_TAILS"],
+            num_warps=tuning["num_warps"], waves_per_eu=tuning["waves_per_eu"], ctas_per_cga=(1, 1, 1))
+
+
+def grouped_gemm(group_a, group_b):
+    """gfx950-compatible FP16 list GEMM with explicit gfx1250 restrictions.
+
+    Supports ragged M and partial M/N tiles. Requires common N/K, K divisible
+    by 256 for the default cross-tile pipeline, canonical input strides, and
+    16-byte-aligned bases on gfx1250. Returns one row-major output per group.
+    Unsupported inputs raise ValueError; there is no fallback or repacking.
+    """
+    *args, outputs = _make_grouped_gemm_args(group_a, group_b)
+    _perf_fn(*args)
     return outputs
 
 
