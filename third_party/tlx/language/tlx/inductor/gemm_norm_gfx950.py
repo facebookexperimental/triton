@@ -115,7 +115,7 @@ def tlx_gfx950_addmm_norm_stats(
         mask=cols < N,
         other=0.0,
     )
-    value = (acc + gemm_bias[None, :]).to(tl.bfloat16)
+    value = (acc + gemm_bias[None, :]).to(raw_ptr.dtype.element_ty)
     raw_offsets = rows[:, None] * stride_raw_m + cols[None, :] * stride_raw_n
     tl.store(raw_ptr + raw_offsets, value, mask=mask)
 
@@ -404,7 +404,6 @@ def _launch_gfx950_addmm_norm(
             BLOCK_K=block_k,
             GROUP_SIZE_M=group_size_m,
             NUM_XCDS=num_xcds,
-            GRID_MN=grid_mn,
             SPLIT_K=split_k,
             ADD_BIAS=split_k == 1,
             HAS_REGISTER_TAIL=(
@@ -414,7 +413,8 @@ def _launch_gfx950_addmm_norm(
             USE_I64_B_OFFSETS=False,
             USE_I64_C_OFFSETS=False,
             UNEVEN_SPLIT_K=uneven_split_k,
-            HAS_M_TAIL=m % block_m != 0,
+            # A dynamic batch dim cannot feed a constexpr; the masked tail is exact for any M.
+            HAS_M_TAIL=(m % block_m != 0) if isinstance(m, int) else True,
             HAS_N_TAIL=n % block_n != 0,
             PIN_OFFSET_LAYOUT=False,
             DEFER_EPILOGUE=split_k > 1,
@@ -559,7 +559,8 @@ def _has_supported_semantics(
     if any(value.ndim != 1 for value in vector_inputs):
         return False
     try:
-        m = int(x.shape[0])
+        # Never specialize a dynamic batch dim: the LDS plans serve any M.
+        m = x.shape[0]
         k = int(x.shape[1])
         weight_k = int(weight.shape[0])
         n = int(weight.shape[1])
@@ -570,7 +571,9 @@ def _has_supported_semantics(
     except (IndexError, TypeError, ValueError):
         return False
 
-    if (m, k, n) != expected_shape or weight_k != k:
+    if weight_k != k or (k, n) != expected_shape[1:]:
+        return False
+    if not isinstance(m, torch.SymInt) and int(m) != expected_shape[0]:
         return False
     if any(size != n for size in vector_sizes):
         return False
