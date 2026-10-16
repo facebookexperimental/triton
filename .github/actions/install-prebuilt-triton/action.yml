@@ -39,17 +39,34 @@ runs:
         T0=$(date +%s.%N)
         SIZE=$(curl --fail --silent --head --location --retry 3 "${WHEEL_URL}" \
           | awk 'tolower($1)=="content-length:" {n=$2} END {print n+0}')
+        # On mi350 runners an S3 stream sometimes stalls at a few KB/s without
+        # erroring, so --retry never fires and one range holds the download
+        # for over an hour. Healthy ranges stay above ~180 KB/s even at peak
+        # hours, so the first three attempts abort below 50 KB/s for 30s and
+        # retry on a new connection; the last attempt runs unbounded.
+        fetch() {  # fetch <output> [byte-range]
+          local out=$1 attempt
+          local range=()
+          [ -n "${2:-}" ] && range=(--range "$2")
+          for attempt in 1 2 3; do
+            curl --fail --silent --show-error --location \
+              --speed-limit 51200 --speed-time 30 \
+              "${range[@]}" --output "${out}" "${WHEEL_URL}" && return 0
+            echo "${out##*/}: attempt ${attempt} failed or stalled; retrying" >&2
+          done
+          curl --fail --silent --show-error --location --retry 3 \
+            "${range[@]}" --output "${out}" "${WHEEL_URL}"
+        }
         PARTS=16
         if [ "${SIZE}" -lt $((PARTS * 1048576)) ]; then
-          curl --fail --location --retry 3 --output "${OUT}" "${WHEEL_URL}"
+          fetch "${OUT}"
         else
           CHUNK=$(( (SIZE + PARTS - 1) / PARTS ))
           pids=()
           for i in $(seq 0 $((PARTS - 1))); do
             start=$((i * CHUNK)); end=$((start + CHUNK - 1))
             [ "${end}" -ge "${SIZE}" ] && end=$((SIZE - 1))
-            curl --fail --silent --show-error --location --retry 3 \
-              --range "${start}-${end}" --output "${OUT}.part${i}" "${WHEEL_URL}" &
+            fetch "${OUT}.part${i}" "${start}-${end}" &
             pids+=($!)
           done
           for p in "${pids[@]}"; do wait "${p}"; done
