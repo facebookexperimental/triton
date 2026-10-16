@@ -361,9 +361,10 @@ def BufferLoadToLocalOp
   let summary =
       "Load from a scalar base pointer and a tensor offset to shared memory";
   let description = [{
-      AMD Buffer load operation. Similar to amdg.buffer_load op but directly wirtes to shared memory instead of into registers.
-      Contiguity is the maximum number of elements that can be loaded in a single vector with the given layout and mask.
-      This allows to use buffer_load_to_local even if the alignment cannot be proven based on IR.
+      AMD Buffer load operation. Similar to amdg.buffer_load op but directly writes to shared memory instead of into registers.
+      Contiguity is a trusted positive power-of-two lower bound on consecutive
+      elements available in the final offsets and mask layout. This allows
+      buffer_load_to_local to vectorize when alignment or mask uniformity cannot be proven from the IR.
     }];
   let arguments =
       (ins Arg<
@@ -733,8 +734,9 @@ def LocalLoadPackedTransposedOp
 // RematerializedRangeOp
 //===----------------------------------------------------------------------===//
 
-def RematerializedRangeOp : TT_AMDGPU_Op<"rematerialized_range", [
-    SameOperandsAndResultEncoding, Pure]> {
+def RematerializedRangeOp
+    : TT_AMDGPU_Op<"rematerialized_range", [SameOperandsAndResultEncoding,
+                                            Pure]> {
   let summary = "Prefer rematerializing a distributed range at this point";
   let description = [{
     Produces the same logical values as a rank-one `tt.make_range`, with fresh
@@ -763,8 +765,8 @@ def RematerializedRangeOp : TT_AMDGPU_Op<"rematerialized_range", [
 // RegisterResidentOp
 //===----------------------------------------------------------------------===//
 
-def RegisterResidentOp : TT_AMDGPU_Op<"register_resident", [
-    Pure, SameOperandsAndResultType]> {
+def RegisterResidentOp
+    : TT_AMDGPU_Op<"register_resident", [Pure, SameOperandsAndResultType]> {
   let summary = "Keep a distributed tensor in native AMD register tuples";
   let description = [{
     Returns `input` unchanged while assigning its packed per-thread values to
@@ -795,8 +797,8 @@ def RegisterResidentOp : TT_AMDGPU_Op<"register_resident", [
 // RegisterHandoffOp
 //===----------------------------------------------------------------------===//
 
-def RegisterHandoffOp : TT_AMDGPU_Op<"register_handoff", [
-    SameOperandsAndResultType]> {
+def RegisterHandoffOp
+    : TT_AMDGPU_Op<"register_handoff", [SameOperandsAndResultType]> {
   let summary = "Start independent native AMD register-allocation intervals";
   let description = [{
     Returns `input` unchanged while passing each per-thread 32-bit native
@@ -826,8 +828,9 @@ def RegisterHandoffOp : TT_AMDGPU_Op<"register_handoff", [
 // MfmaCommitOp
 //===----------------------------------------------------------------------===//
 
-def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
-    DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+def MfmaCommitOp
+    : TT_AMDGPU_Op<
+          "mfma_commit", [DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Commit native vector MFMA fragments with live dependencies";
   let description = [{
     Returns every input unchanged after applying the architecture-defined MFMA
