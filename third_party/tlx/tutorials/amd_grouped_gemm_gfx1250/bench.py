@@ -1,9 +1,10 @@
 """Run the regular gfx1250 grouped GEMM benchmark shape sweep.
 
 Each shape is ``(G, M_per_group, N, K)``. Every group has the same M.
-Each case runs in a separate process so its large GPU allocations are released
-before the next case starts. Subprocesses use the current Python interpreter
-and inherit its environment.
+Both packed and list kernels run for each shape by default. Each run uses a
+separate process so its large GPU allocations are released before the next
+run starts. Subprocesses use the current Python interpreter and inherit its
+environment.
 
 The standard sweep uses the within-group hybrid with cross-tile prefetch enabled
 and chunked XCD remapping with four-workgroup input multicast. With
@@ -68,6 +69,7 @@ class BenchCase:
 @dataclass
 class BenchResult:
     case: BenchCase
+    kernel: str
     tensor_gib: float
     returncode: int
     ms: float | None
@@ -92,11 +94,13 @@ def _parse_case(value: str) -> BenchCase:
     return BenchCase(groups, m, n, k)
 
 
-def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
+def _build_command(args: argparse.Namespace, case: BenchCase, kernel_variant: str) -> list[str]:
     kernel = Path(__file__).with_name("amd_grouped_gemm_gfx1250_test.py")
     command = [
         sys.executable,
         str(kernel),
+        "--kernel",
+        kernel_variant,
         "--m_list",
         case.m_list,
         "-N",
@@ -145,13 +149,13 @@ def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
     return command
 
 
-def _run_case(args: argparse.Namespace, case: BenchCase, index: int, total: int) -> BenchResult:
-    command = _build_command(args, case)
+def _run_case(args: argparse.Namespace, case: BenchCase, kernel_variant: str, index: int, total: int) -> BenchResult:
+    command = _build_command(args, case, kernel_variant)
     print()
-    print(f"[{index}/{total}] {case.label}  estimated tensors: {case.tensor_gib:.1f} GiB")
+    print(f"[{index}/{total}] {kernel_variant} {case.label}  estimated tensors: {case.tensor_gib:.1f} GiB")
     print(f"$ {shlex.join(command)}")
     if args.dry_run:
-        return BenchResult(case, case.tensor_gib, 0, None, None)
+        return BenchResult(case, kernel_variant, case.tensor_gib, 0, None, None)
 
     process = subprocess.Popen(
         command,
@@ -170,18 +174,18 @@ def _run_case(args: argparse.Namespace, case: BenchCase, index: int, total: int)
             ms = float(match.group(1))
             tflops = float(match.group(2))
     returncode = process.wait()
-    return BenchResult(case, case.tensor_gib, returncode, ms, tflops)
+    return BenchResult(case, kernel_variant, case.tensor_gib, returncode, ms, tflops)
 
 
 def _print_summary(results: list[BenchResult]) -> None:
     print()
     print("Summary")
-    print(f"{'G':>4} {'M/group':>9} {'N':>7} {'K':>7} {'GiB':>7} {'ms':>12} {'TFLOPS':>12}  status")
+    print(f"{'kernel':>6} {'G':>4} {'M/group':>9} {'N':>7} {'K':>7} {'GiB':>7} {'ms':>12} {'TFLOPS':>12}  status")
     for result in results:
         ms = "-" if result.ms is None else f"{result.ms:.4f}"
         tflops = "-" if result.tflops is None else f"{result.tflops:.2f}"
         case = result.case
-        print(f"{case.groups:4d} {case.m:9d} {case.n:7d} {case.k:7d} "
+        print(f"{result.kernel:>6} {case.groups:4d} {case.m:9d} {case.n:7d} {case.k:7d} "
               f"{result.tensor_gib:7.1f} {ms:>12} {tflops:>12}  {result.status}")
 
 
@@ -190,12 +194,13 @@ def _write_csv(path: Path, results: list[BenchResult]) -> None:
     with path.open("w", newline="") as output:
         writer = csv.DictWriter(
             output,
-            fieldnames=("groups", "m_per_group", "n", "k", "tensor_gib", "ms", "tflops", "status"),
+            fieldnames=("kernel", "groups", "m_per_group", "n", "k", "tensor_gib", "ms", "tflops", "status"),
         )
         writer.writeheader()
         for result in results:
             case = result.case
             writer.writerow({
+                "kernel": result.kernel,
                 "groups": case.groups,
                 "m_per_group": case.m,
                 "n": case.n,
@@ -209,6 +214,8 @@ def _write_csv(path: Path, results: list[BenchResult]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark the gfx1250 grouped GEMM shape sweep")
+    parser.add_argument("--kernel", choices=("both", "packed", "list"), default="both",
+                        help="select the packed or pointer-table TDM kernel, or both (default: both)")
     parser.add_argument(
         "--case",
         action="append",
@@ -245,9 +252,11 @@ def main() -> int:
     args = parser.parse_args()
 
     cases = args.cases or [BenchCase(*case) for case in DEFAULT_CASES]
+    kernels = ("packed", "list") if args.kernel == "both" else (args.kernel, )
+    runs = [(case, kernel) for case in cases for kernel in kernels]
     results = []
-    for index, case in enumerate(cases, start=1):
-        result = _run_case(args, case, index, len(cases))
+    for index, (case, kernel) in enumerate(runs, start=1):
+        result = _run_case(args, case, kernel, index, len(runs))
         results.append(result)
         if args.fail_fast and not args.dry_run and result.status != "ok":
             break
