@@ -24,6 +24,7 @@
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
+#include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -1031,6 +1032,9 @@ public:
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
+    // Reject before the ModuleAllocation below, as the allocation passes do.
+    if (failed(mlir::triton::gpu::verifyNpotModularOpsSupported(m)))
+      return signalPassFailure();
 
     mlir::triton::AMD::TargetInfo targetInfo(gfxArch.getValue());
     size_t partitionSize = targetInfo.getSharedMemoryPartitionSize();
