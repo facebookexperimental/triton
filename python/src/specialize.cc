@@ -1860,7 +1860,7 @@ typedef struct {
   PyObject *empty_default;
   PyObject *runtime_knobs;
   PyObject *compilation_knobs;
-  PyObject *nvidia_knobs;
+  PyObject *dispatcher_knobs;
   PyObject *amd_knobs;
   uint64_t options_hash;
   int n_params;
@@ -1893,7 +1893,8 @@ static bool fc_attr_is_none(PyObject *object, const char *name) {
 
 static bool fc_can_bypass_python(PyObject *jit_fn, PyObject *runtime_knobs,
                                  PyObject *compilation_knobs,
-                                 PyObject *nvidia_knobs, PyObject *amd_knobs) {
+                                 PyObject *dispatcher_knobs,
+                                 PyObject *amd_knobs) {
   if (!fc_attr_has_truth(jit_fn, "c_cache", true) ||
       !fc_attr_has_truth(jit_fn, "used_global_vals", false) ||
       !fc_attr_has_truth(jit_fn, "pre_run_hooks", false) ||
@@ -1906,7 +1907,7 @@ static bool fc_can_bypass_python(PyObject *jit_fn, PyObject *runtime_knobs,
       !fc_attr_has_truth(compilation_knobs, "always_compile", false) ||
       !fc_attr_has_truth(compilation_knobs, "instrumentation_mode", false) ||
       !fc_attr_has_truth(compilation_knobs, "fpsan_homomorphic_casts", false) ||
-      !fc_attr_has_truth(nvidia_knobs, "use_triton_dispatcher", true))
+      !fc_attr_has_truth(dispatcher_knobs, "use_triton_dispatcher", true))
     return false;
   PyObject *backend = fc_get_attr(jit_fn, "_fc_backend");
   if (!backend)
@@ -1974,7 +1975,7 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
 
   if (self->n_params > FC_MAX_ARGS || nargs > self->n_params ||
       !fc_can_bypass_python(self->jit_fn, self->runtime_knobs,
-                            self->compilation_knobs, self->nvidia_knobs,
+                            self->compilation_knobs, self->dispatcher_knobs,
                             self->amd_knobs))
     goto fallback;
   for (int i = 0; i < self->n_params; i++)
@@ -2058,7 +2059,7 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
       goto fallback;
     // Argument and driver callbacks can change launch state after entry.
     if (!fc_can_bypass_python(self->jit_fn, self->runtime_knobs,
-                              self->compilation_knobs, self->nvidia_knobs,
+                              self->compilation_knobs, self->dispatcher_knobs,
                               self->amd_knobs) ||
         !fc_cache_is_current(self->jit_fn, cache_owner.ptr()))
       goto fallback;
@@ -2221,7 +2222,7 @@ static void JITCacheProxy_dealloc(PyObject *o) {
   Py_XDECREF(self->empty_default);
   Py_XDECREF(self->runtime_knobs);
   Py_XDECREF(self->compilation_knobs);
-  Py_XDECREF(self->nvidia_knobs);
+  Py_XDECREF(self->dispatcher_knobs);
   Py_XDECREF(self->amd_knobs);
 #ifdef Py_LIMITED_API
   PyTypeObject *type = Py_TYPE(o);
@@ -2248,7 +2249,7 @@ static int JITCacheProxy_traverse(PyObject *o, visitproc visit, void *arg) {
   Py_VISIT(self->empty_default);
   Py_VISIT(self->runtime_knobs);
   Py_VISIT(self->compilation_knobs);
-  Py_VISIT(self->nvidia_knobs);
+  Py_VISIT(self->dispatcher_knobs);
   Py_VISIT(self->amd_knobs);
   return 0;
 }
@@ -2264,7 +2265,7 @@ static int JITCacheProxy_clear(PyObject *o) {
   Py_CLEAR(self->empty_default);
   Py_CLEAR(self->runtime_knobs);
   Py_CLEAR(self->compilation_knobs);
-  Py_CLEAR(self->nvidia_knobs);
+  Py_CLEAR(self->dispatcher_knobs);
   Py_CLEAR(self->amd_knobs);
   Py_CLEAR(self->grid_py[0]);
   Py_CLEAR(self->grid_py[1]);
@@ -2442,13 +2443,13 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
   PyObject *compilation_knobs =
       runtime_knobs ? PyObject_GetAttrString(knobs_mod, "compilation")
                     : nullptr;
-  PyObject *nvidia_knobs =
-      compilation_knobs ? PyObject_GetAttrString(knobs_mod, "nvidia") : nullptr;
+  PyObject *dispatcher_knobs =
+      runtime_knobs ? PyObject_GetAttrString(knobs_mod, "runtime") : nullptr;
   PyObject *amd_knobs =
-      nvidia_knobs ? PyObject_GetAttrString(knobs_mod, "amd") : nullptr;
+      compilation_knobs ? PyObject_GetAttrString(knobs_mod, "amd") : nullptr;
   Py_XDECREF(knobs_mod);
   if (!amd_knobs) {
-    Py_XDECREF(nvidia_knobs);
+    Py_XDECREF(dispatcher_knobs);
     Py_XDECREF(runtime_knobs);
     Py_XDECREF(compilation_knobs);
     Py_DECREF(param_defaults);
@@ -2461,7 +2462,7 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
       (JITCacheProxy *)PyObject_GC_New(JITCacheProxy, JITCacheProxyType);
   if (!proxy) {
     Py_DECREF(amd_knobs);
-    Py_DECREF(nvidia_knobs);
+    Py_DECREF(dispatcher_knobs);
     Py_DECREF(compilation_knobs);
     Py_DECREF(runtime_knobs);
     Py_DECREF(param_defaults);
@@ -2473,7 +2474,7 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
   proxy->empty_default = empty_default;
   proxy->runtime_knobs = runtime_knobs;
   proxy->compilation_knobs = compilation_knobs;
-  proxy->nvidia_knobs = nvidia_knobs;
+  proxy->dispatcher_knobs = dispatcher_knobs;
   proxy->amd_knobs = amd_knobs;
   proxy->vectorcall = JITCacheProxy_vectorcall;
   proxy->jit_fn = jit_fn;
@@ -2673,7 +2674,7 @@ typedef struct {
   PyObject *param_name_to_idx; // dict for kwargs→positional merging (or NULL)
   PyObject *runtime_knobs;
   PyObject *compilation_knobs;
-  PyObject *nvidia_knobs;
+  PyObject *dispatcher_knobs;
   PyObject *autotuning_knobs;
   PyObject *amd_knobs;
   int *key_indices; // positions in args for autotuner key
@@ -2718,9 +2719,9 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
   if (nkw < 0)
     return nullptr;
   if (!fc_can_bypass_python(self->jit_fn, self->runtime_knobs,
-                            self->compilation_knobs, self->nvidia_knobs,
+                            self->compilation_knobs, self->dispatcher_knobs,
                             self->amd_knobs) ||
-      !fc_attr_has_truth(self->nvidia_knobs, "use_autotune_c_cache", true))
+      !fc_attr_has_truth(self->dispatcher_knobs, "use_autotune_c_cache", true))
     goto fallback;
   if (!fc_attr_is_none(self->autotuning_knobs, "listener"))
     goto fallback;
@@ -2988,9 +2989,9 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
         goto grid_cleanup;
       // Autotune hooks, grids, and driver callbacks can change launch state.
       if (!fc_can_bypass_python(self->jit_fn, self->runtime_knobs,
-                                self->compilation_knobs, self->nvidia_knobs,
+                                self->compilation_knobs, self->dispatcher_knobs,
                                 self->amd_knobs) ||
-          !fc_attr_has_truth(self->nvidia_knobs, "use_autotune_c_cache",
+          !fc_attr_has_truth(self->dispatcher_knobs, "use_autotune_c_cache",
                              true) ||
           !fc_attr_is_none(self->autotuning_knobs, "listener") ||
           !fc_cache_is_current(self->jit_fn, cache_owner.ptr()))
@@ -3109,7 +3110,7 @@ static void AutotuneCacheProxy_dealloc(PyObject *o) {
   Py_XDECREF(self->param_name_to_idx);
   Py_XDECREF(self->runtime_knobs);
   Py_XDECREF(self->compilation_knobs);
-  Py_XDECREF(self->nvidia_knobs);
+  Py_XDECREF(self->dispatcher_knobs);
   Py_XDECREF(self->amd_knobs);
   Py_XDECREF(self->autotuning_knobs);
   Py_XDECREF(self->kernel_name);
@@ -3145,7 +3146,7 @@ static int AutotuneCacheProxy_traverse(PyObject *o, visitproc visit,
   Py_VISIT(self->param_name_to_idx);
   Py_VISIT(self->runtime_knobs);
   Py_VISIT(self->compilation_knobs);
-  Py_VISIT(self->nvidia_knobs);
+  Py_VISIT(self->dispatcher_knobs);
   Py_VISIT(self->amd_knobs);
   Py_VISIT(self->autotuning_knobs);
   Py_VISIT(self->kernel_name);
@@ -3174,7 +3175,7 @@ static int AutotuneCacheProxy_clear(PyObject *o) {
   Py_CLEAR(self->param_name_to_idx);
   Py_CLEAR(self->runtime_knobs);
   Py_CLEAR(self->compilation_knobs);
-  Py_CLEAR(self->nvidia_knobs);
+  Py_CLEAR(self->dispatcher_knobs);
   Py_CLEAR(self->amd_knobs);
   Py_CLEAR(self->autotuning_knobs);
   Py_CLEAR(self->kernel_name);
@@ -3305,18 +3306,19 @@ PyObject *native_create_autotune_proxy(PyObject *self_unused,
   PyObject *compilation_knobs =
       runtime_knobs ? PyObject_GetAttrString(knobs_mod, "compilation")
                     : nullptr;
-  PyObject *nvidia_knobs =
-      compilation_knobs ? PyObject_GetAttrString(knobs_mod, "nvidia") : nullptr;
+  PyObject *dispatcher_knobs =
+      runtime_knobs ? PyObject_GetAttrString(knobs_mod, "runtime") : nullptr;
   PyObject *autotuning_knobs =
-      nvidia_knobs ? PyObject_GetAttrString(knobs_mod, "autotuning") : nullptr;
+      compilation_knobs ? PyObject_GetAttrString(knobs_mod, "autotuning")
+                        : nullptr;
   PyObject *amd_knobs =
-      autotuning_knobs ? PyObject_GetAttrString(knobs_mod, "amd") : nullptr;
+      runtime_knobs ? PyObject_GetAttrString(knobs_mod, "amd") : nullptr;
   Py_XDECREF(knobs_mod);
   if (!amd_knobs) {
     Py_XDECREF(autotuning_knobs);
     Py_XDECREF(runtime_knobs);
     Py_XDECREF(compilation_knobs);
-    Py_XDECREF(nvidia_knobs);
+    Py_XDECREF(dispatcher_knobs);
     free(key_indices);
     free(dtype_indices);
     return nullptr;
@@ -3328,7 +3330,7 @@ PyObject *native_create_autotune_proxy(PyObject *self_unused,
     Py_DECREF(amd_knobs);
     Py_DECREF(runtime_knobs);
     Py_DECREF(compilation_knobs);
-    Py_DECREF(nvidia_knobs);
+    Py_DECREF(dispatcher_knobs);
     Py_DECREF(autotuning_knobs);
     free(key_indices);
     free(dtype_indices);
@@ -3337,7 +3339,7 @@ PyObject *native_create_autotune_proxy(PyObject *self_unused,
 
   proxy->runtime_knobs = runtime_knobs;
   proxy->compilation_knobs = compilation_knobs;
-  proxy->nvidia_knobs = nvidia_knobs;
+  proxy->dispatcher_knobs = dispatcher_knobs;
   proxy->autotuning_knobs = autotuning_knobs;
   proxy->amd_knobs = amd_knobs;
   proxy->vectorcall = AutotuneCacheProxy_vectorcall;
