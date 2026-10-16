@@ -229,50 +229,71 @@ def host_overhead_us(fn: Callable, iters: int = 300) -> float:
 #: clear the same benchmark cache before every timed call.
 LATENCY_MODES = ("wallclock", "gpu_events")
 
-#: The gate must cover the entire enqueue, including slow Python wrappers.
-#: Cycles are only an initial guess; the event query below validates each batch
-#: and each retry quadruples the gate. The gate runs before the first timed
-#: event, so it costs wall time but never enters a sample.
+#: The gate gives the host a head start on the GPU. Cycles are only an initial
+#: guess; the event queries below validate every timed call, and each batch
+#: retry quadruples the gate. The gate runs before the first timed event, so it
+#: costs wall time but never enters a sample.
 _GATE_CYCLES = 20_000_000
 _GATE_GROWTH = 4
 _GATE_MAX_ATTEMPTS = 4
 
-#: Iterations per gated batch. The host can only run so far ahead of a blocked
-#: stream: CUDA stops accepting work at about 1024 pending operations, and a
-#: one-kernel iteration queues four (cache clear, two events, the kernel). On a
-#: B200, 250 iterations fit and 300 did not. A batch that still overflows, such
-#: as a multi-kernel backward, is halved on retry.
+#: Calls per batch once a continuous run has fallen behind. A batch must fit in
+#: the launch queue so that all of it is queued before the GPU starts: CUDA
+#: stops accepting work at about 1024 pending operations, and a one-kernel call
+#: queues four (cache clear, two events, the kernel). On a B200, 250 calls fit
+#: and 300 did not. A batch that still overflows, such as a multi-kernel
+#: backward, is halved on retry.
 _GATE_BATCH = 100
 
 
-def _gpu_event_samples(fn: Callable, iters: int, grad_to_none: Optional[Iterable] = None) -> list[float]:
-    """Per-iteration ms, with timed GPU work held off until each batch is queued."""
+def _gated_run(fn: Callable, n: int, gate_cycles: int, grad_to_none: Optional[Iterable]) -> Optional[list[float]]:
+    """Per-call ms for `n` calls queued behind one gate, or None if any call
+    may contain a host gap."""
     import torch
 
     di = triton.runtime.driver.active.get_device_interface()
     cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
-    samples: list[float] = []
-    batch, failures = min(iters, _GATE_BATCH), 0
+    starts = [di.Event(enable_timing=True) for _ in range(n)]
+    ends = [di.Event(enable_timing=True) for _ in range(n)]
+    clean = True
+    torch.cuda._sleep(gate_cycles)
+    for i in range(n):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        triton.runtime.driver.active.clear_cache(cache)
+        starts[i].record()
+        fn()
+        ends[i].record()
+        # A call's interval is gap-free if the whole call was queued before
+        # the GPU reached its start event. Once the queue is full the host
+        # waits on the GPU, but a GPU-bound call still keeps the GPU behind.
+        if starts[i].query():
+            clean = False
+            break
     di.synchronize()
+    return [s.elapsed_time(e) for s, e in zip(starts, ends)] if clean else None
+
+
+def _gpu_event_samples(fn: Callable, iters: int, grad_to_none: Optional[Iterable] = None) -> list[float]:
+    """Per-call ms, each call queued in full before the GPU reaches it."""
+    di = triton.runtime.driver.active.get_device_interface()
+    di.synchronize()
+    # One continuous run keeps the GPU under the same back-to-back load as
+    # earlier versions of this harness. On B200 that load holds the clock at
+    # the power cap, so splitting the run would change the numbers.
+    samples = _gated_run(fn, iters, _GATE_CYCLES, grad_to_none)
+    if samples is not None:
+        return samples
+    # The host fell behind: the call is host-bound, or the gate drained before
+    # the first calls were queued. Batches that fit the queue are fully queued
+    # before the GPU starts, so their samples stay gap-free.
+    samples = []
+    batch, failures = min(iters, _GATE_BATCH), 0
     while len(samples) < iters:
-        n = min(batch, iters - len(samples))
-        starts = [di.Event(enable_timing=True) for _ in range(n)]
-        ends = [di.Event(enable_timing=True) for _ in range(n)]
-        torch.cuda._sleep(_GATE_CYCLES * _GATE_GROWTH**failures)
-        for i in range(n):
-            if grad_to_none is not None:
-                for x in grad_to_none:
-                    x.grad = None
-            triton.runtime.driver.active.clear_cache(cache)
-            starts[i].record()
-            fn()
-            ends[i].record()
-        # Query before synchronizing: an incomplete first event proves the
-        # entire batch was submitted before its first timed interval began.
-        fully_queued = not starts[0].query()
-        di.synchronize()
-        if fully_queued:
-            samples += [s.elapsed_time(e) for s, e in zip(starts, ends)]
+        run = _gated_run(fn, min(batch, iters - len(samples)), _GATE_CYCLES * _GATE_GROWTH**failures, grad_to_none)
+        if run is not None:
+            samples += run
             failures = 0
             continue
         failures += 1

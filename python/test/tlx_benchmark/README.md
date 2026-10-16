@@ -143,14 +143,25 @@ ok: everything else
 ## How a call is timed
 
 `gpu_events` is the default and the kernel-performance verdict metric.
-The samples are taken in batches of up to 100 calls, each queued behind a GPU
-gate. Batches stay small because the host can only run so far ahead of a
-blocked stream: CUDA stops accepting work at about 1024 pending operations.
-Before synchronizing, the harness checks that the batch's first timing event
-has not completed, proving that the entire batch was submitted before its timed
-work began. If it has, the batch is discarded and retried at half the size with
-four times the gate duration. After four failed attempts in a row the case
-reports an error; invalid timing samples never produce a performance verdict.
+The calls run back to back behind a GPU gate that gives the host a head start.
+After queuing each call, the harness checks that the GPU has not yet reached
+that call's start event, which proves the whole call was queued before its
+timed work began, so no host gap is inside the sample. A GPU-bound call passes
+even after the launch queue fills (CUDA stops accepting work at about 1024
+pending operations), because the GPU stays behind the host.
+
+If any call fails the check, the host fell behind and the run is discarded.
+The harness then takes the samples in batches of up to 100 calls, each small
+enough to be fully queued before the GPU starts. A batch that fails is retried
+at half the size with four times the gate duration. After four failed batches
+in a row the case reports an error; invalid timing samples never produce a
+performance verdict. A call that synchronizes with the host, for example by
+reading a device tensor with `.tolist()`, always fails.
+
+Keep the continuous run as the default. On B200 a compute-bound kernel runs at
+the power cap with the SM clock well below its lock, and pauses between batches
+let the clock recover, so batched samples of the same kernel read up to 8%
+faster.
 
 Both TLX and the reference clear the same benchmark cache before every timed
 call. Timing includes all device work in the operation, including multiple

@@ -1278,133 +1278,124 @@ def test_an_unknown_latency_mode_is_rejected():
         measure(lambda: None, mode="profiler")
 
 
-def _fake_gpu_queue(monkeypatch, query_results):
-    import types
-    import torch
-    import importlib
+class _LaunchQueue:
+    """A stream held by the gate, with a bounded launch queue.
 
-    timing = importlib.import_module("_harness.measure")
-
-    queries = iter(query_results)
-    calls = []
-    attempt = [0]
-
-    class Event:
-
-        def __init__(self, **kwargs):
-            self.attempt = attempt[0]
-
-        def record(self):
-            calls.append("record")
-
-        def query(self):
-            calls.append("query")
-            return next(queries)
-
-        def elapsed_time(self, end):
-            calls.append("elapsed")
-            return float(self.attempt)
-
-    def sleep(cycles):
-        calls.append(cycles)
-        attempt[0] += 1
-
-    active = types.SimpleNamespace(
-        get_device_interface=lambda: types.SimpleNamespace(Event=Event, synchronize=lambda: calls.append("sync")),
-        get_empty_cache_for_benchmark=lambda: "cache",
-        clear_cache=lambda cache: calls.append("clear"),
-    )
-    monkeypatch.setattr(triton.runtime.driver, "_active", active)
-    monkeypatch.setattr(torch.cuda, "_sleep", sleep)
-    return timing, calls
-
-
-def test_gpu_events_retries_started_batches_and_discards_their_samples(monkeypatch):
-    timing, calls = _fake_gpu_queue(monkeypatch, [True, False, False])
-    samples = timing._gpu_event_samples(lambda: calls.append("launch"), 2)
-    assert samples == [1.0, 2.0]  # the started batch is discarded; the retry runs halved batches
-    gates = [call for call in calls if isinstance(call, int)]
-    # The gate grows for the retry and resets once a batch queues cleanly.
-    assert gates == [timing._GATE_CYCLES, timing._GATE_CYCLES * timing._GATE_GROWTH, timing._GATE_CYCLES]
-    assert calls.count("clear") == calls.count("launch") == 4
-    assert calls.index("query") < calls.index("sync", 1)
-    assert calls.count("elapsed") == 2
-
-
-def _fake_launch_queue(monkeypatch, capacity):
-    """A device whose host blocks once `capacity` operations are pending.
-
-    That is how a CUDA stream behaves behind the gate: past the launch-queue
-    depth the host waits for the GPU, so the gate drains before the batch is
-    fully queued and the first timed event has already started.
+    The gate holds the GPU until the host blocks on a full queue (or
+    synchronizes). From then on a GPU-bound call keeps `capacity` operations
+    queued, so the GPU stays that far behind the host; a host-bound call lets
+    the GPU finish everything queued before each new operation arrives. A call
+    that synchronizes drains the queue outright. `elapsed_time` returns the
+    index of the gated run that recorded the event, so tests can tell which
+    run a sample came from.
     """
+
+    def __init__(self, capacity, host_bound):
+        self.capacity, self.host_bound = capacity, host_bound
+        self.queued = self.done = self.run = 0
+        self.released = False
+        self.gates = []
+
+    def enqueue(self):
+        self.queued += 1
+        if not self.released and self.queued - 1 > self.capacity:
+            self.released = True
+        if self.released:
+            behind = self.queued - 1 if self.host_bound else self.queued - self.capacity
+            self.done = max(self.done, behind)
+
+    def host_sync(self):
+        self.released, self.done = True, self.queued
+
+    def synchronize(self):
+        self.queued = self.done = 0
+        self.released = False
+
+
+def _fake_launch_queue(monkeypatch, capacity=1024, host_bound=False):
     import types
     import torch
     import importlib
 
     timing = importlib.import_module("_harness.measure")
-    pending = [0]
-    batches = []
-
-    def enqueue():
-        pending[0] += 1
+    q = _LaunchQueue(capacity, host_bound)
+    elapsed = []
 
     class Event:
 
         def __init__(self, **kwargs):
-            pass
+            self.pos = None
 
         def record(self):
-            enqueue()
+            q.enqueue()
+            self.pos, self.run = q.queued, q.run
 
         def query(self):
-            return pending[0] > capacity
+            return q.released and q.done >= self.pos
 
         def elapsed_time(self, end):
-            return 1.0
+            elapsed.append(self.run)
+            return float(self.run)
 
     def sleep(cycles):
-        batches.append(cycles)
-        enqueue()
-
-    def synchronize():
-        pending[0] = 0
+        q.run += 1
+        q.gates.append(cycles)
+        q.enqueue()
 
     active = types.SimpleNamespace(
-        get_device_interface=lambda: types.SimpleNamespace(Event=Event, synchronize=synchronize),
+        get_device_interface=lambda: types.SimpleNamespace(Event=Event, synchronize=q.synchronize),
         get_empty_cache_for_benchmark=lambda: "cache",
-        clear_cache=lambda cache: enqueue(),
+        clear_cache=lambda cache: q.enqueue(),
     )
     monkeypatch.setattr(triton.runtime.driver, "_active", active)
     monkeypatch.setattr(torch.cuda, "_sleep", sleep)
-    return timing, enqueue, batches
+    return timing, q, elapsed
 
 
-def test_gpu_events_sample_quota_survives_a_bounded_launch_queue(monkeypatch):
-    # One kernel per call: clear + start + kernel + end is four entries per
-    # iteration, so a single 500-iteration batch needs 2000 against a
-    # 1024-deep queue. Measured on B200: 250 iterations queue, 300 do not.
-    timing, launch, _ = _fake_launch_queue(monkeypatch, capacity=1024)
-    assert len(timing._gpu_event_samples(launch, 500)) == 500
+def test_gpu_events_times_a_gpu_bound_call_in_one_continuous_run(monkeypatch):
+    # clear + start + kernel + end is four operations per call, so 500 calls
+    # need 2000 against a 1024-deep queue (B200: 250 calls queue, 300 do not).
+    # The host blocks once the queue fills, but the GPU never catches up with
+    # it, so every sample is gap-free and the run is not split: the GPU sees
+    # the same back-to-back load as earlier versions of the harness.
+    timing, q, _ = _fake_launch_queue(monkeypatch)
+    assert len(timing._gpu_event_samples(q.enqueue, 500)) == 500
+    assert q.gates == [timing._GATE_CYCLES]
 
 
-def test_gpu_events_shrinks_batches_for_calls_that_launch_many_kernels(monkeypatch):
-    timing, launch, batches = _fake_launch_queue(monkeypatch, capacity=1024)
+def test_gpu_events_falls_back_to_batches_when_the_host_falls_behind(monkeypatch):
+    timing, q, _ = _fake_launch_queue(monkeypatch, host_bound=True)
+    samples = timing._gpu_event_samples(q.enqueue, 500)
+    assert len(samples) == 500
+    assert 1.0 not in samples  # nothing from the continuous run that fell behind
+    assert len(q.gates) == 1 + 500 // timing._GATE_BATCH
 
-    def backward():  # a multi-kernel call, like an attention backward
+
+def test_gpu_events_shrinks_batches_for_host_bound_multi_kernel_calls(monkeypatch):
+    timing, q, _ = _fake_launch_queue(monkeypatch, host_bound=True)
+
+    def backward():  # 20 launches per call, like an attention backward
         for _ in range(20):
-            launch()
+            q.enqueue()
 
     assert len(timing._gpu_event_samples(backward, 500)) == 500
-    assert len(batches) > 500 // timing._GATE_BATCH  # some batches were split
+    g, grow = timing._GATE_CYCLES, timing._GATE_GROWTH
+    # Continuous run, then batches of 100 and 50 overflow the queue; 25 fit.
+    # The gate grows with each failed batch and resets after a clean one.
+    assert q.gates[:5] == [g, g, g * grow, g * grow**2, g]
 
 
-def test_gpu_events_fails_without_a_fully_queued_batch(monkeypatch):
-    timing, calls = _fake_gpu_queue(monkeypatch, [True] * 4)
+def test_gpu_events_gets_no_samples_from_a_call_that_syncs_the_host(monkeypatch):
+    timing, q, elapsed = _fake_launch_queue(monkeypatch)
+
+    def syncs():  # e.g. a wrapper that calls .tolist() on a device tensor
+        q.enqueue()
+        q.host_sync()
+
     with pytest.raises(RuntimeError, match="no valid samples"):
-        timing._gpu_event_samples(lambda: None, 2)
-    assert "elapsed" not in calls
-    assert calls.count("query") == 4
+        timing._gpu_event_samples(syncs, 500)
+    assert elapsed == []
+    assert len(q.gates) == 1 + timing._GATE_MAX_ATTEMPTS
 
 
 @pytest.mark.parametrize("legacy_mode", ["gpu_events", "wallclock"])
