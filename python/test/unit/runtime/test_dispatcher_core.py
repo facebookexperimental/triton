@@ -22,8 +22,8 @@ pytestmark = pytest.mark.skipif(not (is_cuda() or is_hip()), reason="Requires CU
 @contextlib.contextmanager
 def force_dispatcher():
     prev_env = os.environ.get("TRITON_USE_C_DISPATCHER")
-    with knobs.nvidia.scope():
-        knobs.nvidia.use_triton_dispatcher = True
+    with knobs.runtime.scope():
+        knobs.runtime.use_triton_dispatcher = True
         os.environ["TRITON_USE_C_DISPATCHER"] = "1"
         try:
             yield
@@ -497,7 +497,7 @@ def test_hip_dispatcher_compiled_runner_dynamic_controls(control, fresh_knobs, m
         native_calls.clear()
         try:
             if control == "dispatcher_flag":
-                knobs.nvidia.use_triton_dispatcher = False
+                knobs.runtime.use_triton_dispatcher = False
             else:
                 hook_chain.add(launch_hook)
             runner(out, 9)
