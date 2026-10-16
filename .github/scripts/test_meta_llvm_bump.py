@@ -1,5 +1,5 @@
-from meta_llvm_bump import (commit_message, decide, issue_body, issue_marker, issue_title, oai_pins, pick_tracking,
-                            pr_body, parse_sha256_file, release_for, render, same_tree_chain, variants)
+from meta_llvm_bump import (commit_message, decide, issue_body, issue_marker, issue_release, issue_title, oai_pins,
+                            pick_tracking, pr_body, parse_sha256_file, release_for, render, same_tree_chain, variants)
 
 OLD = "1889ed344a2ea019320c1a49fc5b7103d0d9468d"
 NEW = "3dd0e43fed8836e77165a4f066b983efe1f13a82"
@@ -146,6 +146,14 @@ def test_issue_body_has_marker_and_self_contained_command():
     assert "compare/release/3.8.x...scratch/meta-llvm-bump/release-3.8.x" in body
     assert issue_marker("main") != issue_marker("release/3.8.x")
     assert "Release: `llvm-3dd0e43f-1`, built from fork commit `3dd0e43fed88`, published 2026-10-15 07:12:30 UTC." in body
+
+
+def test_issue_release_reads_release_line_not_old_pin():
+    body = issue_body("facebookexperimental/triton", "main", "scratch/meta-llvm-bump/main", "T",
+                      "It pins llvm-1889ed34-1, but the fork branch has a newer published release.", RELEASE)
+    assert issue_release(body) == "llvm-3dd0e43f-1"
+    assert issue_release("<!-- meta-llvm-bump main -->\nold format, no release line") is None
+    assert issue_release(None) is None
 
 
 def test_issue_title_dates_the_release():

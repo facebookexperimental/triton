@@ -18,7 +18,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from meta_llvm_bump import (commit_message, decide, issue_body, issue_title, oai_pins, parse_sha256_file,  # noqa: E402
+from meta_llvm_bump import (commit_message, decide, issue_body, issue_release, issue_title, oai_pins,
+                            parse_sha256_file,  # noqa: E402
                             pick_tracking, pr_body, release_for, render, same_tree_chain, variants)
 
 META_PATH = "cmake/meta-llvm-info.json"
@@ -107,10 +108,12 @@ def tracking_issue(repo, target):
     return issue
 
 
-def close_tracking_issue(repo, target, reason):
+def close_landed_issue(repo, target, pinned, current):
+    """Close the tracking issue once target pins its release. A newer fork tip may still lack a release
+    (status not current), so also compare the pin with the release the issue names."""
     issue = tracking_issue(repo, target)
-    if issue:
-        run("gh", "issue", "close", str(issue["number"]), "--repo", repo, "--comment", reason)
+    if issue and (current or issue_release(issue["body"]) == pinned):
+        run("gh", "issue", "close", str(issue["number"]), "--repo", repo, "--comment", f"{target} now pins {pinned}.")
 
 
 def publish(repo, target, title, message, body, release):
@@ -195,8 +198,8 @@ def main():
     emit(status=status)
     if status == "pin-moved":
         sys.exit(1)
-    if status == "current" and not args.dry_run:
-        close_tracking_issue(args.repo, args.target, f"{args.target} now pins this release ({detail}).")
+    if status in ("current", "no-release", "incomplete") and not args.dry_run:
+        close_landed_issue(args.repo, args.target, meta["release_base_url"].rsplit("/", 1)[-1], status == "current")
     if status != "bump":
         return
 

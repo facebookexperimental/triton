@@ -167,6 +167,12 @@ def pick_tracking(issues, target):
     return (matches[0] if matches else None), matches[1:]
 
 
+def issue_release(body):
+    """Release tag a tracking issue proposes, read from its Release: line, or None."""
+    match = re.search(r"^Release: `(llvm-[0-9a-f]{8}-[0-9]+)`", body or "", re.MULTILINE)
+    return match.group(1) if match else None
+
+
 def issue_title(target, release):
     """Tracking issue title; names the release and the day it was published."""
     return f"[Meta LLVM] Bump ready: {target} to {release['tag_name']} ({release['published_at'][:10]})"
