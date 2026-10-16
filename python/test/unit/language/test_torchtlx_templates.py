@@ -2263,6 +2263,26 @@ class TestHopperMMTemplate(TestCase):
         self.assertIn("_consume_tile", generated)
         self.assertNotIn("triton_poi_", generated)
 
+    def test_fused_epilogue_loading_input_fits_smem(self):
+        # K >= 1024 makes the force-mode heuristic pick a 4-stage ring, and the
+        # SE-block epilogue loads `x`, which needs layout-conversion scratch.
+        x = torch.randn(2048, 128, device=GPU_TYPE, dtype=torch.bfloat16)
+        a = torch.randn(2048, 1024, device=GPU_TYPE, dtype=torch.bfloat16)
+        b = torch.randn(1024, 128, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        def se_block(x, a, b):
+            return 2 * x * torch.sigmoid(a @ b)
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(se_block), x, a, b)
+        expected = (2 * x.float() * torch.sigmoid(a.float() @ b.float())).to(x.dtype)
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        self.assertIn("_consume_tile", "\n".join(code))
+
 
 class TestInterWaveTemplateCodegen(TestCase):
 
@@ -4169,6 +4189,38 @@ class TestResourceModel(TestCase):
         self.assertTrue(BLACKWELL_WS_GEMM.validate(tile, charge_epilogue=True, smem_margin=slack, limits=limits))
         self.assertFalse(BLACKWELL_WS_GEMM.validate(tile, charge_epilogue=True, smem_margin=slack + 1, limits=limits))
 
+    # --- Hopper WS GEMM model ---------------------------------------------
+
+    def test_hopper_smem_matches_hand_computed(self):
+        from triton.language.extra.tlx.hw.resources import (
+            HOPPER_WS_GEMM,
+            HopperWSGemmConfig,
+        )
+
+        tile = HopperWSGemmConfig(block_m=256, block_n=128, block_k=64, num_stages=4, num_mma_groups=2)
+        # A 131072 + B 65536 + barriers 2*4*(2+1)*8 = 196800; staging 2*256*32*2.
+        self.assertEqual(HOPPER_WS_GEMM.estimate_smem(tile, charge_epilogue=False), 196800)
+        self.assertEqual(HOPPER_WS_GEMM.estimate_smem(tile, charge_epilogue=True), 196800 + 32768)
+
+    def test_hopper_four_stage_tma_store_has_no_fusion_headroom(self):
+        """4-stage tiles must drop the TMA store; 3-stage tiles keep it."""
+        from triton.language.extra.tlx.hw.resources import (
+            HOPPER_WS_GEMM,
+            HopperWSGemmConfig,
+        )
+        from triton.language.extra.tlx.inductor.registry import HopperGemmWSConfigHeuristic
+
+        margin = HopperGemmWSConfigHeuristic._SMEM_SAFETY_MARGIN
+        for block_m, block_n in ((128, 256), (256, 128)):
+            for num_stages, fits in ((3, True), (4, False)):
+                tile = HopperWSGemmConfig(block_m, block_n, 64, num_stages, 2)
+                with self.subTest(block_m=block_m, block_n=block_n, num_stages=num_stages):
+                    self.assertTrue(HOPPER_WS_GEMM.validate(tile, charge_epilogue=False, smem_margin=margin))
+                    self.assertEqual(
+                        HOPPER_WS_GEMM.validate(tile, charge_epilogue=True, smem_margin=margin),
+                        fits,
+                    )
+
     # --- AMD warp-pipe model (budgets pinned at gfx950) -------------------
 
     def test_gfx950_warppipe_lds_matches_documented_budget(self):
@@ -4233,6 +4285,7 @@ class TestResourceModel(TestCase):
 
         for name in (
                 "blackwell_gemm_ws_template",
+                "hopper_gemm_ws_template",
                 "gfx950_addmm_warppipe_template",
                 "gfx950_addmm_persistent_warppipe_template",
                 "gfx950_bmm_warppipe_template",

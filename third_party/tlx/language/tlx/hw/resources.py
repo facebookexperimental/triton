@@ -416,6 +416,68 @@ class BlackwellWSGemmModel:
 
 
 # ---------------------------------------------------------------------------
+# Hopper warp-specialized GEMM
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class HopperWSGemmConfig:
+    """Tile-shape knobs of the Hopper WS GEMM template."""
+
+    block_m: int
+    block_n: int
+    block_k: int
+    num_stages: int
+    num_mma_groups: int
+
+
+class HopperWSGemmModel:
+    """Resource model for ``hopper_gemm_ws.py.jinja``.
+
+    Mirrors ``_sm90_core._allocate_buffers`` plus the template's epilogue::
+
+        a = local_alloc((BM // G, BK), NUM_STAGES * G)
+        b = local_alloc((BK, BN), NUM_STAGES)
+        c_smem = local_alloc((BM // G, BN // 4), 2 * G)   # TMA store only
+
+    with ``2 * NUM_STAGES * G`` A barriers and ``2 * NUM_STAGES`` B barriers.
+    """
+
+    arches = ("sm90", )
+
+    @staticmethod
+    def estimate_smem(tile: HopperWSGemmConfig, *, charge_epilogue: bool) -> int:
+        """Bytes of shared memory a tile config needs.
+
+        ``charge_epilogue`` controls the TMA store staging buffer, which the
+        masked ``tl.store`` path does not allocate.
+        """
+        smem_a = tile.block_m * tile.block_k * OPERAND_ELEM_BYTES * tile.num_stages
+        smem_b = tile.block_k * tile.block_n * OPERAND_ELEM_BYTES * tile.num_stages
+        smem_epilog = (2 * tile.block_m * (tile.block_n // 4) * OPERAND_ELEM_BYTES if charge_epilogue else 0)
+        smem_barriers = 2 * tile.num_stages * (tile.num_mma_groups + 1) * MBARRIER_BYTES
+        return smem_a + smem_b + smem_epilog + smem_barriers
+
+    @classmethod
+    def validate(
+        cls,
+        tile: HopperWSGemmConfig,
+        *,
+        charge_epilogue: bool,
+        smem_margin: int = 0,
+        limits: DeviceLimits | None = None,
+    ) -> bool:
+        """Whether a tile config fits SMEM with ``smem_margin`` to spare."""
+        if limits is None:
+            limits = HOPPER_LIMITS
+        smem = cls.estimate_smem(tile, charge_epilogue=charge_epilogue)
+        return smem + smem_margin <= limits.on_chip_bytes
+
+
+HOPPER_LIMITS = DeviceLimits.for_arch("sm90")
+
+
+# ---------------------------------------------------------------------------
 # AMD warp-pipelined GEMM (addmm / bmm / persistent addmm)
 # ---------------------------------------------------------------------------
 
@@ -500,6 +562,7 @@ class AmdWarpPipeModel:
 
 
 BLACKWELL_WS_GEMM = BlackwellWSGemmModel()
+HOPPER_WS_GEMM = HopperWSGemmModel()
 AMD_WARP_PIPE = AmdWarpPipeModel()
 
 #: Template uid -> resource model. Templates absent from this map have no model
@@ -510,6 +573,7 @@ AMD_WARP_PIPE = AmdWarpPipeModel()
 #: pattern as the Python objects and the .jinja files.
 MODELS: dict[str, Any] = {
     "triton::tlx_blackwell_gemm_ws": BLACKWELL_WS_GEMM,
+    "triton::tlx_hopper_gemm_ws": HOPPER_WS_GEMM,
     "triton::tlx_gfx950_addmm_warppipe": AMD_WARP_PIPE,
     "triton::tlx_gfx950_addmm_persistent_warppipe": AMD_WARP_PIPE,
     "triton::tlx_gfx950_bmm_warppipe": AMD_WARP_PIPE,

@@ -824,6 +824,12 @@ def _candidate_scorer_evaluate(
 class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
     """Reuse the SM90 TLX ops configuration space for Inductor."""
 
+    # Autotuning benchmarks the template before epilogue fusion, so a fused
+    # epilogue that loads another tensor adds layout-conversion scratch that
+    # only appears in the final kernel. Without headroom the 4-stage TMA-store
+    # configs (229568 B) win the benchmark and then fail to launch.
+    _SMEM_SAFETY_MARGIN = 8192
+
     def should_run(self, inputs: KernelInputs) -> bool:
         if not current_target().is_hopper or not isinstance(inputs, MMKernelInputs):
             return False
@@ -858,6 +864,16 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
         strides = kernel_inputs.strides_hinted()
         for conf in configs:
             meta = conf.kwargs
+            tile = resources.HopperWSGemmConfig(
+                block_m=meta["BM"],
+                block_n=meta["BN"],
+                block_k=meta["BK"],
+                num_stages=meta["NUM_STAGES"],
+                num_mma_groups=meta["NUM_MMA_GROUPS"],
+            )
+            tma_store = n % 8 == 0 and resources.HOPPER_WS_GEMM.validate(
+                tile, charge_epilogue=True, smem_margin=self._SMEM_SAFETY_MARGIN
+            )
             yield {
                 "BLOCK_M": meta["BM"],
                 "BLOCK_N": meta["BN"],
@@ -871,7 +887,7 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
                 "A_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1,
                 "B_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1,
                 "A_EVICTION": repr("evict_last" if n <= 1024 else ""),
-                "TMA_EPILOGUE_STORE": int(n % 8 == 0),
+                "TMA_EPILOGUE_STORE": int(tma_store),
                 "num_stages": conf.num_stages,
                 "num_warps": conf.num_warps,
                 "ACC_TYPE": "tl.float32",
