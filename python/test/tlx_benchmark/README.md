@@ -150,18 +150,27 @@ timed work began, so no host gap is inside the sample. A GPU-bound call passes
 even after the launch queue fills (CUDA stops accepting work at about 1024
 pending operations), because the GPU stays behind the host.
 
-If any call fails the check, the host fell behind and the run is discarded.
-The harness then takes the samples in batches of up to 100 calls, each small
-enough to be fully queued before the GPU starts. A batch that fails is retried
-at half the size with four times the gate duration. After four failed batches
-in a row the case reports an error; invalid timing samples never produce a
-performance verdict. A call that synchronizes with the host, for example by
-reading a device tensor with `.tolist()`, always fails.
+The check is sufficient, not necessary: a call that fails it is uncertified,
+not proven to contain a gap. It also assumes the op keeps its GPU work on the
+current stream; work on a side stream that does not wait for the start event
+would go unseen.
+
+If any call fails the check, the run is discarded and retried once behind a
+gate four times longer, which absorbs a one-off host stall. If that run also
+fails, the host cannot stay ahead of the GPU and the harness takes the samples
+in batches of up to 100 calls, each small enough to be fully queued before the
+GPU starts. The result then carries a note such as `tlx: timed in batches of
+up to 100 calls`. A batch that fails is retried at half the size with four
+times the gate duration. After four failed batches in a row the case reports
+an error; uncertified samples never produce a performance verdict. A call that
+waits on the timed stream from the host, for example by reading a tensor the
+stream writes with `.tolist()`, fails every check.
 
 Keep the continuous run as the default. On B200 a compute-bound kernel runs at
 the power cap with the SM clock well below its lock, and pauses between batches
 let the clock recover, so batched samples of the same kernel read up to 8%
-faster.
+faster. For the same reason, a speedup between a batched provider and a
+continuous one mixes two load patterns, which is what the note flags.
 
 Both TLX and the reference clear the same benchmark cache before every timed
 call. Timing includes all device work in the operation, including multiple

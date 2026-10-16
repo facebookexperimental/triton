@@ -268,17 +268,20 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     # `measure` converts every timed iteration through flop_count, so both
     # providers come back in TFLOP/s with the dispersion measured on that
     # quantity rather than on latency.
+    tlx_notes, ref_notes = [], []
     tlx = measure(prep.tlx_fn, flop_count=prep.flop_count, replicates=DEFAULT_REPLICATES,
-                  grad_to_none=prep.grad_to_none, mode="gpu_events")
+                  grad_to_none=prep.grad_to_none, mode="gpu_events", notes=tlx_notes)
     ref = None
     if prep.ref_fn is not None:
         ref = measure(prep.ref_fn, flop_count=prep.flop_count, replicates=DEFAULT_REPLICATES,
-                      grad_to_none=prep.grad_to_none, mode="gpu_events")
+                      grad_to_none=prep.grad_to_none, mode="gpu_events", notes=ref_notes)
     host_us = host_overhead_us(prep.tlx_fn)
     ref_host_us = host_overhead_us(prep.ref_fn) if prep.ref_fn is not None else None
 
     result = verdict.judge(case, tlx, ref, tlx_host_us=host_us, compile_stat=compile_stat, correct=correct,
                            accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops)
+    # After the verdict's notes, which lead the nightly failure summary.
+    result.notes += [f"tlx: {n}" for n in tlx_notes] + [f"ref: {n}" for n in ref_notes]
     result.flop_count = prep.flop_count
     result.ref_host_us = ref_host_us
     result.extra = dict(prep.extra)
