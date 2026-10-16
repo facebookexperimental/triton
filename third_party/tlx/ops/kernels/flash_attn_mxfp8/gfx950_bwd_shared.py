@@ -238,6 +238,18 @@ def _stage_layout(COLS):
         return tlx.swizzled_layout(1, 4, 4, order=[1, 0])
 
 
+@constexpr_function
+def _nc2048_qdo_stage_layout():
+    """Preserve 16-byte chunks for both Q/dO read orientations."""
+    # Physical row bits are r0, r4, r5, r3, r1, r2.
+    # Insert 16 bytes after each complete 1024-byte interval.
+    return tlx.padded_shared_layout_encoding.with_bases(
+        [(1024, 16)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+         [1, 0], [16, 0], [32, 0], [8, 0], [2, 0], [4, 0]],
+        (64, 128))
+
+
 @triton.jit
 def _load_scale_native(S, head, start, N, R: tl.constexpr, C: tl.constexpr, RHS: tl.constexpr,
                        TRANSPOSED_SQUARE: tl.constexpr, WARPS_N: tl.constexpr = 1):
@@ -640,7 +652,10 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
             kv_layout: tl.constexpr = _stage_layout(D)
             k = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
             vmem = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
-        shared_layout: tl.constexpr = _stage_layout(D)
+        if ARENA_N == 2048 and LSE_SPLIT:
+            shared_layout: tl.constexpr = _nc2048_qdo_stage_layout()
+        else:
+            shared_layout: tl.constexpr = _stage_layout(D)
         qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
         domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
         metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
@@ -957,11 +972,21 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
             next_q_words = _load_rhs_words(QS, head, start + BM, N, WARPS_N=WARPS_N)
             next_do_words = _load_rhs_words(DOS, head, start + BM, N, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
                                             WARPS_N=WARPS_N)
+    nc2048_k_before_q: tl.constexpr = (LSE_SPLIT and IMMUTABLE_KV and not CAUSAL and SCALED_P
+                                        and not PACK_DSS and not COMMON_PREP and PREP_N == 0
+                                        and DELAY_DO_HEAD and PACK_P_EARLY and not EARLY_DP
+                                        and not SCALE_LOOKAHEAD and WARPS_N == 1 and tlx.num_warps() == 2
+                                        and D == 128 and BM == 64 and BN == 64
+                                        and tl.constexpr(isinstance(N, int)) and N == 2048)
+    if nc2048_k_before_q:
+        k = tlx.local_load(k[0], layout=export_layout, relaxed=True)
+        # Keep K loads before Q loads in the native schedule.
+        tlx.amd_sched_barrier(0)
     q = _load_rhs_kv64(qmem[SLOT], True, WARPS_N=WARPS_N)
     if not DELAY_DO_HEAD:
         do = _load_rhs_kv64(domem[SLOT], True, WARPS_N=WARPS_N)
     qs = _decode_rhs_head(q_words, WARPS_N=WARPS_N, WAIT_STATES=1 if direct_causal_guards else 0)
-    if IMMUTABLE_KV:
+    if IMMUTABLE_KV and not nc2048_k_before_q:
         # The owner or first tile barrier publishes K before these immutable reads.
         k = tlx.local_load(k[0], layout=export_layout, relaxed=True)
     if EARLY_DP:
