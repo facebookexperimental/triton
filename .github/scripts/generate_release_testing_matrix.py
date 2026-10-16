@@ -8,6 +8,11 @@ SUITE_CONFIG = {
     "tritonbench": {
         "runners": ["h100", "mi350", "b200"],
     },
+    # Correctness gate rather than a benchmark: dispatches
+    # .ci/release-testing/run.sh <hardware>.
+    "release-testing": {
+        "runners": ["h100", "mi350", "b200"],
+    },
 }
 
 RUNNER_FULL_NAMES = {
