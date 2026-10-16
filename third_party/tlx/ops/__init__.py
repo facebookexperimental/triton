@@ -505,8 +505,9 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
 
     Q, K, V and the softmax probabilities are quantized internally to E4M3
     data with E8M0 scales: per 32x32 block for Q and K, per 32 keys for V and
-    the probabilities. gfx950 quantizes as Blackwell does, but its non-causal
-    kernel computes the probabilities with an approximate exp2 (see
+    the probabilities. gfx950 quantizes as Blackwell does, but its ping-pong
+    kernel (non-causal, and causal at sequence lengths divisible by 512)
+    computes the probabilities with an approximate exp2 (see
     kernels/flash_attn_mxfp8/gfx950.py), and the two agree to within the
     quantization error rather than bitwise. Head dim 128 and sequence lengths
     divisible by 256. Blackwell returns BF16 gradients; gfx950 is forward only.

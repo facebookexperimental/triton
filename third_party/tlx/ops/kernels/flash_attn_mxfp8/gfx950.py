@@ -5,21 +5,26 @@ is Blackwell's: Q and K are E4M3 with an E8M0 scale per 32x32 block (32 rows
 by 32 head elements), V is E4M3 with an E8M0 scale per 32 keys of each head
 column, and the softmax probabilities P get an E8M0 scale per 32 keys of each
 row, all by RCEIL of the block max. Q is quantized unscaled, and sm_scale *
-log2(e) multiplies the scores. Both MFMAs are scaled.
+log2(e) multiplies the scores. Both MFMAs are scaled. A call makes two
+launches: one quantizes Q, K and V, the other runs the attention.
 
-Non-causal runs a persistent two-warp-group ping-pong kernel (256x128 tiles,
-8 warps, Q/K/V staged in LDS by direct copies, K/V double buffered). It feeds
+A persistent two-warp-group ping-pong kernel (256x128 tiles, 8 warps, Q/K/V
+staged in LDS by direct copies, K/V double buffered) runs both cases. It feeds
 the row offset in as the QK accumulator, computes P with a bit-trick exp2
 instead of the hardware exp, and only rescales the accumulator when a row max
 grows past a threshold. P's block scales are applied by its scaled FP8
 conversion (v_cvt_scalef32_pk_fp8_bf16); its row sums run on the matrix cores
 from the FP8 P per block and take the block scales on the vector ALUs. Causal
-runs a single software-pipelined loop with the hardware exp, where P's block
-scales join the exp argument.
+Q tiles stop at the diagonal, whose two K/V tiles start the QK accumulator at
+-inf above it, and go to the workgroups in pairs of equal total length. For
+sm_scale = 0, where the scale multiply would turn the row offset and the -inf
+into NaN, a separately compiled variant applies both after the multiply.
+Lengths the ping-pong tiles do not divide run a single software-pipelined
+loop with the hardware exp, where P's block scales join the exp argument.
 
 The bit-trick exp2 is specific to gfx950 (Blackwell uses the hardware exp2):
 the hardware exp runs at a quarter of the VALU rate, in the softmax stage
-that bounds the non-causal kernel's speed. It gives 2**x with a linear
+that bounds the ping-pong kernel's speed. It gives 2**x with a linear
 mantissa, up to 6.1% high and 4.1% high on average. P and its row sums share
 that bias, so after the normalization P is between about 4% low and 2% high,
 within the error of rounding P to E4M3 (up to 6.25%).
@@ -41,9 +46,9 @@ _NUM_CUS = 256  # gfx950 as one whole device (compute partition SPX)
 def _default_config(causal, n_ctx):
     # Measured on gfx950, B=4 H=32 D=128. The ping-pong kernel is built around
     # its tiles and 8 warps and pipelines by hand (no num_stages), so it takes
-    # only the non-causal lengths its block_m divides; the loop kernel takes
-    # causal and the rest.
-    if not causal and n_ctx % 256 == 0:
+    # only the lengths its block_m divides, and causal ones only in pairs of Q
+    # tiles; the loop kernel takes the rest.
+    if n_ctx % (512 if causal else 256) == 0:
         return {"pingpong": True, "block_m": 256, "block_n": 128, "num_warps": 8}
     if causal:
         return {"pingpong": False, "block_m": 128, "block_n": 64, "num_warps": 4, "num_stages": 2}
@@ -59,8 +64,8 @@ def _mx_scale(amax):
 
 
 @triton.jit
-def _quantize_mxfp8_kernel(X, Out, Scale, stride_xz, stride_xh, stride_xn, stride_xd, H, N_CTX, HEAD_DIM: tl.constexpr,
-                           BLOCK_N: tl.constexpr, PACK_K: tl.constexpr):
+def _quantize_head(X, Out, Scale, stride_xz, stride_xh, stride_xn, stride_xd, H, N_CTX, HEAD_DIM: tl.constexpr,
+                   BLOCK_N: tl.constexpr, PACK_K: tl.constexpr):
     # Each 32x32 block of x (32 rows by 32 head elements) gets the E8M0 byte
     # _mx_scale(amax) for its max magnitude amax, stored for each of its rows,
     # and E4M3 data x / 2**(byte - 127). PACK_K writes the scales in
@@ -88,11 +93,17 @@ def _quantize_mxfp8_kernel(X, Out, Scale, stride_xz, stride_xh, stride_xn, strid
              cache_modifier=".cs")
 
 
+@triton.jit
+def _quantize_mxfp8_kernel(X, Out, Scale, stride_xz, stride_xh, stride_xn, stride_xd, H, N_CTX, HEAD_DIM: tl.constexpr,
+                           BLOCK_N: tl.constexpr, PACK_K: tl.constexpr):
+    _quantize_head(X, Out, Scale, stride_xz, stride_xh, stride_xn, stride_xd, H, N_CTX, HEAD_DIM, BLOCK_N, PACK_K)
+
+
 def quantize_mxfp8_head(x, *, pack_k=False):
     """E4M3 data and E8M0 scales of a ``[Z, H, N_CTX, HEAD_DIM]`` tensor with
     a scale per 32x32 block (32 rows by 32 head elements), as Blackwell
     quantizes Q and K. The scales are ``[Z, H, N_CTX, HEAD_DIM // 32]``, each
-    row holding its block's. ``pack_k`` orders K's scales as the non-causal
+    row holding its block's. ``pack_k`` orders K's scales as the ping-pong
     kernel reads them: per 64 keys, word ``32 * b + k`` holds keys ``k`` and
     ``k + 32`` at d-block ``b`` of both head-dim halves."""
     z, h, n, d = x.shape
@@ -423,6 +434,37 @@ def _p_half(s, tmax, FAST_EXP: tl.constexpr):
 
 
 @triton.jit
+def _causal_init(init, KEY_BASE: tl.constexpr):
+    # The QK accumulator start for keys KEY_BASE + [0, 64) of a diagonal K/V
+    # tile: row r of the Q tile sees key k of its own span iff k <= r, so the
+    # rest start at -inf, which gives P = 0 and leaves the row maxima to the
+    # visible keys. Masking the start rather than the scores keeps the scores'
+    # path to the PV MFMA free of branches, which the MFMA layout choice for
+    # the QK dot depends on.
+    return _causal_mask(init, tl.arange(0, init.shape[0]), KEY_BASE)
+
+
+@triton.jit
+def _causal_mask(x, lim, KEY_BASE: tl.constexpr):
+    # x with -inf where key KEY_BASE + c of its 64 keys (counted in the Q
+    # tile's span) is past row r's last visible key lim[r].
+    # Key 32t + 8j + 4h + i sits in register (t, j, i) of lane half h (see
+    # _block_max), so each test is a register's constant against one per-lane
+    # limit. KEY_BASE reaches the limit through an asm LLVM cannot see into:
+    # from a constant, the tests would be hoisted out of the loops and their
+    # lane masks spill.
+    R: tl.constexpr = x.shape[0]
+    base = tl.inline_asm_elementwise("s_mov_b32 $0, $1", "=s,s", [KEY_BASE], dtype=tl.int32, is_pure=False, pack=1)
+    t = tl.arange(0, 2)[None, :, None, None, None]
+    j = tl.arange(0, 4)[None, None, :, None, None]
+    h = tl.arange(0, 2)[None, None, None, :, None]
+    i = tl.arange(0, 4)[None, None, None, None, :]
+    lim = lim[:, None, None, None, None] - 4 * h - base
+    m = tl.where(32 * t + 8 * j + i <= lim, tl.reshape(x, (R, 2, 4, 2, 4)), float("-inf"))
+    return tl.reshape(m, (R, x.shape[1]))
+
+
+@triton.jit
 def _pingpong_softmax_first(s0, s1, FAST_EXP: tl.constexpr):
     # First tile: no offset in the scores yet (t = x * C).
     C: tl.constexpr = _score_scale(FAST_EXP)
@@ -439,11 +481,12 @@ def _pingpong_softmax_first(s0, s1, FAST_EXP: tl.constexpr):
 
 
 @triton.jit
-def _pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_EXP: tl.constexpr):
+def _pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_EXP: tl.constexpr,
+                      ZERO_SCALE: tl.constexpr):
     # s0, s1 carry the offset for m_i from the QK accumulator, and s0 comes
-    # multiplied by qk_scale (see _mfma_stage); acc0..acc3 are the 32-column
-    # chunks of the output accumulator and l_i the row sums per block half of
-    # _row_sums.
+    # multiplied by qk_scale (with ZERO_SCALE, s1 too; see _mfma_stage);
+    # acc0..acc3 are the 32-column chunks of the output accumulator and l_i
+    # the row sums per block half of _row_sums.
     #
     # Keep m_i until some row in this warp grows past it by more than 2**4,
     # i.e. t > (OFF + 4) * C. The vote predicate is pinned to the layout the
@@ -452,7 +495,8 @@ def _pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_E
     C: tl.constexpr = _score_scale(FAST_EXP)
     OFF: tl.constexpr = _score_offset(FAST_EXP)
     vote_layout: tl.constexpr = tlx.layout(shape=((32, 2, s0.shape[0] // 32), (1, )), stride=((1, 0, 32), (1, )))
-    s1 = s1 * qk_scale
+    if not ZERO_SCALE:
+        s1 = s1 * qk_scale
     tmax0 = _block_max(s0)
     tmax1 = _block_max(s1)
     row = tl.maximum(tl.max(tmax0, 1), tl.max(tmax1, 1))
@@ -551,7 +595,8 @@ def _pv(p, v, vs, acc):
 @triton.jit
 def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0, p1, acc0, acc1, acc2, acc3, l_i,
                 offset, qk_scale, k_ptr, v_ptr, ks_ptr, vs_ptr, kd_a, kd_b, vd_a, vd_b, ksd_a, ksd_b, vsd_a, vsd_b, kt,
-                vt, k_step, v_step, ks_step, k_n1, v_n1, ks_n1, COPY_K: tl.constexpr, COPY_V: tl.constexpr):
+                vt, k_step, v_step, ks_step, k_n1, v_n1, ks_n1, COPY_K: tl.constexpr, COPY_V: tl.constexpr, diag,
+                KEY_BASE: tl.constexpr, ZERO_SCALE: tl.constexpr, MASK: tl.constexpr):
     # QK(j + 1) and PV(j) with operands read from LDS in MFMA-sized pieces. Each
     # read is issued right after the MFMA that frees the previous piece and is
     # consumed one MFMA later, so its latency hides behind an MFMA while at most
@@ -561,11 +606,18 @@ def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0
     # behind the last PV MFMAs, and s1 is multiplied in the softmax stage:
     # split between the two stages, the multiplies cost the least.
     #
+    # With ZERO_SCALE (qk_scale = 0) the offset comes undivided and the
+    # accumulator starts at 0: both halves are multiplied here, the offset
+    # joins by an FMA, and where MASK (a causal step) the keys diag hides go
+    # to -inf after it. Their per-row limit, past every key off the diagonal,
+    # keeps no masked tile live across the MFMAs.
+    #
     # P's row sums go first: they need only registers, so the matrix cores get
     # work right after the stage barrier, and the first reads and the next
     # tile's global->LDS copies (those COPY_K / COPY_V select) issue behind
     # them. Their block scales are applied after the first QK MFMA, when the
-    # sums are in.
+    # sums are in. diag masks K/V tile j + 1, keys KEY_BASE + [0, 128) of the
+    # Q tile's span (see _causal_init).
     init = tl.broadcast_to(offset[:, None], (q_lo.shape[0], ka.shape[1]))
     ones = _rowsum_b()
     t0 = tl.dot(_as_rowsum_a(p0[0]), ones, tl.zeros([q_lo.shape[0] // 2, 16], dtype=tl.float32))
@@ -578,7 +630,13 @@ def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0
     _issue_tile(k_ptr, v_ptr, ks_ptr, vs_ptr, kd_a, kd_b, vd_a, vd_b, ksd_a, ksd_b, vsd_a, vsd_b, kt, vt, k_step,
                 v_step, ks_step, k_n1, v_n1, ks_n1, COPY_K, COPY_V)
     tlx.amd_sched_barrier(0)
-    s0 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kA0, sA0, "e4m3", acc=init, fast_math=True)
+    if ZERO_SCALE:
+        init0 = tl.zeros_like(init)
+    else:
+        init0 = init
+        if diag:
+            init0 = _causal_init(init, KEY_BASE)
+    s0 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kA0, sA0, "e4m3", acc=init0, fast_math=True)
     vA1 = _ld_v(va, 1)
     tlx.amd_sched_barrier(0)
     l_i = _scale_row_sums(t0, t1, p0, p1, l_i)
@@ -599,7 +657,13 @@ def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0
     vB0 = _ld_v(vb, 0)
     vsB0, vsB1, vsB2, vsB3 = _ld_vs(vsb)
     tlx.amd_sched_barrier(0)
-    s1 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kB0, sB0, "e4m3", acc=init, fast_math=True)
+    if ZERO_SCALE:
+        init1 = tl.zeros_like(init)
+    else:
+        init1 = init
+        if diag:
+            init1 = _causal_init(init, KEY_BASE + 64)
+    s1 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kB0, sB0, "e4m3", acc=init1, fast_math=True)
     vB1 = _ld_v(vb, 1)
     tlx.amd_sched_barrier(0)
     acc0 = _pv(p1, vB0, vsB0, acc0)
@@ -613,22 +677,45 @@ def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0
     tlx.amd_sched_barrier(0)
     acc2 = _pv(p1, vB2, vsB2, acc2)
     acc3 = _pv(p1, vB3, vsB3, acc3)
-    return s0 * qk_scale, s1, acc0, acc1, acc2, acc3, l_i
+    if ZERO_SCALE:
+        s0 = tl.fma(s0, qk_scale, init)
+        s1 = tl.fma(s1, qk_scale, init)
+        if MASK:
+            lim = tl.where(diag, tl.arange(0, q_lo.shape[0]), 1 << 20)
+            s0 = _causal_mask(s0, lim, KEY_BASE)
+            s1 = _causal_mask(s1, lim, KEY_BASE + 64)
+    else:
+        s0 = s0 * qk_scale
+    return s0, s1, acc0, acc1, acc2, acc3, l_i
 
 
 @triton.jit
-def _qk_first(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, qk_scale):
+def _qk_first(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, qk_scale, diag, ZERO_SCALE: tl.constexpr):
+    # QK(0); diag masks it as the diagonal tile of Q tile 0. With ZERO_SCALE
+    # the start (0, or -inf on the diagonal) is added after qk_scale instead.
     kA0 = _ld_k(ka, 0)
     kA1 = _ld_k(ka, 1)
     kB0 = _ld_k(kb, 0)
     kB1 = _ld_k(kb, 1)
     sA0, sA1 = _ld_ks(ksa)
     sB0, sB1 = _ld_ks(ksb)
-    s0 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kA0, sA0, "e4m3", fast_math=True)
+    init0 = tl.zeros([q_lo.shape[0], ka.shape[1]], dtype=tl.float32)
+    init1 = init0
+    if diag:
+        init0 = _causal_init(init0, 0)
+        init1 = _causal_init(init1, 64)
+    s0 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kA0, sA0, "e4m3", acc=tl.zeros_like(init0) if ZERO_SCALE else init0,
+                       fast_math=True)
     s0 = tl.dot_scaled(q_hi, qs_hi, "e4m3", kA1, sA1, "e4m3", acc=s0, fast_math=True)
-    s1 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kB0, sB0, "e4m3", fast_math=True)
+    s1 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kB0, sB0, "e4m3", acc=tl.zeros_like(init1) if ZERO_SCALE else init1,
+                       fast_math=True)
     s1 = tl.dot_scaled(q_hi, qs_hi, "e4m3", kB1, sB1, "e4m3", acc=s1, fast_math=True)
-    return s0 * qk_scale, s1 * qk_scale
+    s0 = s0 * qk_scale
+    s1 = s1 * qk_scale
+    if ZERO_SCALE:
+        s0 = s0 + init0
+        s1 = s1 + init1
+    return s0, s1
 
 
 @triton.jit
@@ -647,6 +734,23 @@ def _pv_last(p0, p1, va, vb, vsa, vsb, acc0, acc1, acc2, acc3, l_i):
     acc2 = _pv(p1, _ld_v(vb, 2), sb2, acc2)
     acc3 = _pv(p1, _ld_v(vb, 3), sb3, acc3)
     return acc0, acc1, acc2, acc3, _scale_row_sums(t0, t1, p0, p1, l_i)
+
+
+@triton.jit
+def _item(base, w, stride, n_m, CAUSAL: tl.constexpr):
+    # A workgroup's w-th (Q tile, batch * head) item. Causal items come in
+    # pairs, Q tiles n_m - 1 - i and i of one head, the long one first: every
+    # pair walks 2 * n_m + 2 K/V tiles, so equal pair counts balance the load.
+    if CAUSAL:
+        unit = base + (w // 2) * stride
+        i = unit % (n_m // 2)
+        start_m = tl.where(w % 2 == 0, n_m - 1 - i, i)
+        off_hz = unit // (n_m // 2)
+    else:
+        item = base + w * stride
+        start_m = item % n_m
+        off_hz = item // n_m
+    return start_m, off_hz
 
 
 @triton.jit
@@ -700,9 +804,11 @@ def _mxfp8_fa_fwd_pingpong(
     MFMA_PRIO: tl.constexpr,
     SOFTMAX_PRIO: tl.constexpr,
     FAST_EXP: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    ZERO_SCALE: tl.constexpr,
 ):
-    # Non-causal, N_CTX % (2 * BLOCK_N) == 0, contiguous [row, 4] Q scales, K
-    # from quantize_mxfp8_head(pack_k=True), V and its scales from
+    # N_CTX % (2 * BLOCK_N) == 0 (causal: % (2 * BLOCK_M)), contiguous [row, 4]
+    # Q scales, K from quantize_mxfp8_head(pack_k=True), V and its scales from
     # quantize_mxfp8_v(transposed=True) (V's strides given as for [key, head],
     # its scales strided like K's).
     # Persistent: each workgroup loops over (Q tile, head) items. Two warp
@@ -711,25 +817,30 @@ def _mxfp8_fa_fwd_pingpong(
     # halves in LDS, double buffered with compile-time buffer indices; tile
     # j + 1 is copied during step j. Q and its scales are staged in LDS as two
     # head-dim halves; the next item's Q and first K/V tiles are copied during
-    # this item's epilogue.
+    # this item's epilogue. Causal Q tile m walks K/V tiles 0 .. 2m + 1, the
+    # last two masked.
     HN: tl.constexpr = BLOCK_N // 2
     HD: tl.constexpr = HEAD_DIM // 2
     tl.static_assert(HN == 64 and HEAD_DIM == 128)
+    tl.static_assert(BLOCK_M == 2 * BLOCK_N)
     pid = tl.program_id(0)
     n_ctas = tl.num_programs(0)
     n_m = N_CTX // BLOCK_M
-    n_items = n_m * H * Z
+    # Work units: items, or causal pairs of items (see _item).
+    n_units = (n_m // 2 if CAUSAL else n_m) * H * Z
     # Workgroups go round-robin to the 8 XCDs. Give each XCD a contiguous run
-    # of items so the Q tiles sharing a K/V stream share that XCD's L2.
-    if (n_ctas % 8 == 0) and (n_items % 8 == 0):
-        per_xcd = n_items // 8
+    # of units so the Q tiles sharing a K/V stream share that XCD's L2.
+    if (n_ctas % 8 == 0) and (n_units % 8 == 0):
+        per_xcd = n_units // 8
         stride_item = n_ctas // 8
         base = (pid % 8) * per_xcd + pid // 8
         n_mine = (per_xcd - pid // 8 + stride_item - 1) // stride_item
     else:
         stride_item = n_ctas
         base = pid
-        n_mine = (n_items - pid + n_ctas - 1) // n_ctas
+        n_mine = (n_units - pid + n_ctas - 1) // n_ctas
+    if CAUSAL:
+        n_mine = 2 * n_mine
 
     offs_d = tl.arange(0, HEAD_DIM)
     offs_hd = tl.arange(0, HD)
@@ -737,8 +848,9 @@ def _mxfp8_fa_fwd_pingpong(
     offs_mm = tl.arange(0, BLOCK_M)
     C: tl.constexpr = _score_scale(FAST_EXP)
     OFF: tl.constexpr = _score_offset(FAST_EXP)
-    # The row offset starts the QK accumulator, before the scores' qk_scale.
-    c_qk = C / qk_scale
+    # The row offset starts the QK accumulator, before the scores' qk_scale;
+    # with ZERO_SCALE it is added after it (see _mfma_stage).
+    c_qk = C if ZERO_SCALE else C / qk_scale
 
     k_off = offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn
     v_off = offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
@@ -752,7 +864,6 @@ def _mxfp8_fa_fwd_pingpong(
     v_n1 = HN * stride_vn
     ks_n1 = HN * stride_ksn // 4
     q_n1 = HD * stride_qd
-    n_tiles = N_CTX // BLOCK_N
 
     k_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(1024, 16)], _K_LDS_BASES, [HEAD_DIM, HN])
     v_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(1024, 16)], _V_LDS_BASES, [HN, HEAD_DIM])
@@ -768,8 +879,7 @@ def _mxfp8_fa_fwd_pingpong(
     qsa = tlx.local_alloc((BLOCK_M, 1), tl.int32, 1)
 
     # First item: Q, then K(0) into buffer 1, then K(1) and V(0) into buffer 0.
-    start_m = base % n_m
-    off_hz = base // n_m
+    start_m, off_hz = _item(base, 0, stride_item, n_m, CAUSAL)
     q_base = (off_hz // H) * stride_qb + (off_hz % H) * stride_qh + start_m * BLOCK_M * stride_qm
     qs_base = ((off_hz // H) * stride_qsb + (off_hz % H) * stride_qsh + start_m * BLOCK_M * stride_qsm) // 4
     k_ptr = K + (off_hz // H) * stride_kb + (off_hz % H) * stride_kh + k_off
@@ -786,9 +896,8 @@ def _mxfp8_fa_fwd_pingpong(
                 v_step, ks_step, k_n1, v_n1, ks_n1, True, True)
 
     for w in tl.range(0, n_mine, num_stages=1):
-        item = base + w * stride_item
-        start_m = item % n_m
-        off_hz = item // n_m
+        start_m, off_hz = _item(base, w, stride_item, n_m, CAUSAL)
+        n_tiles = 2 * start_m + 2 if CAUSAL else N_CTX // BLOCK_N
         off_z = off_hz // H
         off_h = off_hz % H
         k_ptr = K + off_z * stride_kb + off_h * stride_kh + k_off
@@ -810,7 +919,8 @@ def _mxfp8_fa_fwd_pingpong(
         acc1 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
         acc2 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
         acc3 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-        s0, s1 = _qk_first(q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], qk_scale)
+        s0, s1 = _qk_first(q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], qk_scale, CAUSAL and start_m == 0,
+                           ZERO_SCALE)
         p0, p1, m_i, l_i = _pingpong_softmax_first(s0, s1, FAST_EXP)
         tlx.async_load_wait_group(0)
 
@@ -822,11 +932,11 @@ def _mxfp8_fa_fwd_pingpong(
                     q_lo, q_hi, qs_lo, qs_hi, ka[0], kb[0], ksa[0], ksb[0], va[0], vb[0], vsa[0], vsb[0], p0, p1, acc0,
                     acc1, acc2, acc3, l_i, (OFF - m_i) * c_qk, qk_scale, k_ptr, v_ptr, ks_ptr, vs_ptr, ka[1], kb[1],
                     va[1], vb[1], ksa[1], ksb[1], vsa[1], vsb[1], t, t - 1, k_step, v_step, ks_step, k_n1, v_n1, ks_n1,
-                    True, True)
+                    True, True, False, 0, ZERO_SCALE, False)
             tlx.async_load_wait_group(0)
             with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
                 p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3,
-                                                                             qk_scale, FAST_EXP)
+                                                                             qk_scale, FAST_EXP, ZERO_SCALE)
             # Step j + 1: same with the buffers swapped.
             with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIO):
                 t = 2 * it + 3
@@ -834,11 +944,11 @@ def _mxfp8_fa_fwd_pingpong(
                     q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], va[1], vb[1], vsa[1], vsb[1], p0, p1, acc0,
                     acc1, acc2, acc3, l_i, (OFF - m_i) * c_qk, qk_scale, k_ptr, v_ptr, ks_ptr, vs_ptr, ka[0], kb[0],
                     va[0], vb[0], ksa[0], ksb[0], vsa[0], vsb[0], t, t - 1, k_step, v_step, ks_step, k_n1, v_n1, ks_n1,
-                    True, True)
+                    True, True, CAUSAL and it == start_m - 1, 0, ZERO_SCALE, CAUSAL)
             tlx.async_load_wait_group(0)
             with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
                 p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3,
-                                                                             qk_scale, FAST_EXP)
+                                                                             qk_scale, FAST_EXP, ZERO_SCALE)
 
         # Last step j = n_tiles - 2 from buffer 0; V(n_tiles - 1) goes to buffer 1.
         s0, s1, acc0, acc1, acc2, acc3, l_i = _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka[0], kb[0], ksa[0], ksb[0], va[0],
@@ -846,13 +956,11 @@ def _mxfp8_fa_fwd_pingpong(
                                                           (OFF - m_i) * c_qk, qk_scale, k_ptr, v_ptr, ks_ptr, vs_ptr,
                                                           ka[1], kb[1], va[1], vb[1], ksa[1], ksb[1], vsa[1], vsb[1], 0,
                                                           n_tiles - 1, k_step, v_step, ks_step, k_n1, v_n1, ks_n1,
-                                                          False, True)
+                                                          False, True, CAUSAL, BLOCK_N, ZERO_SCALE, CAUSAL)
         # Buffer 0 and buffer 1's K half are free now: copy the next item's Q
         # and first tiles behind the rest of this epilogue (the last item
         # re-copies its own, which nothing reads).
-        nxt = tl.where(w + 1 < n_mine, item + stride_item, item)
-        n_start = nxt % n_m
-        n_hz = nxt // n_m
+        n_start, n_hz = _item(base, tl.minimum(w + 1, n_mine - 1), stride_item, n_m, CAUSAL)
         nq_base = (n_hz // H) * stride_qb + (n_hz % H) * stride_qh + n_start * BLOCK_M * stride_qm
         nqs_base = ((n_hz // H) * stride_qsb + (n_hz % H) * stride_qsh + n_start * BLOCK_M * stride_qsm) // 4
         nk_ptr = K + (n_hz // H) * stride_kb + (n_hz % H) * stride_kh + k_off
@@ -869,7 +977,7 @@ def _mxfp8_fa_fwd_pingpong(
                     k_step, v_step, ks_step, k_n1, v_n1, ks_n1, True, True)
         tlx.async_load_wait_group(3)
         p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
-                                                                     FAST_EXP)
+                                                                     FAST_EXP, ZERO_SCALE)
         acc0, acc1, acc2, acc3, l_i = _pv_last(p0, p1, va[1], vb[1], vsa[1], vsb[1], acc0, acc1, acc2, acc3, l_i)
 
         scale = tlx.require_layout(1.0 / tl.sum(l_i, 1),
@@ -884,10 +992,10 @@ def _mxfp8_fa_fwd_pingpong(
 
 
 @triton.jit
-def _quantize_mxfp8_v_kernel(V, Out, Scale, stride_vb, stride_vh, stride_vn, stride_vd, H, N_CTX,
-                             HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr, TRANSPOSED: tl.constexpr):
+def _quantize_v(V, Out, Scale, stride_vb, stride_vh, stride_vn, stride_vd, H, N_CTX, HEAD_DIM: tl.constexpr,
+                BLOCK_N: tl.constexpr, TRANSPOSED: tl.constexpr):
     # V to MXFP8 along the keys (a 32-key block per column), by
-    # _quantize_mxfp8_kernel's rule. TRANSPOSED writes quantize_mxfp8_v's
+    # _quantize_head's rule. TRANSPOSED writes quantize_mxfp8_v's
     # transposed layout; otherwise [key, head] data and [key block, head]
     # scales.
     pid_bh = tl.program_id(1)
@@ -924,11 +1032,36 @@ def _quantize_mxfp8_v_kernel(V, Out, Scale, stride_vb, stride_vh, stride_vn, str
                  cache_modifier=".cs")
 
 
+@triton.jit
+def _quantize_mxfp8_v_kernel(V, Out, Scale, stride_vb, stride_vh, stride_vn, stride_vd, H, N_CTX,
+                             HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr, TRANSPOSED: tl.constexpr):
+    _quantize_v(V, Out, Scale, stride_vb, stride_vh, stride_vn, stride_vd, H, N_CTX, HEAD_DIM, BLOCK_N, TRANSPOSED)
+
+
+@triton.jit
+def _quantize_mxfp8_qkv_kernel(Q, K, V, Q_out, Q_scale, K_out, K_scale, V_out, V_scale, stride_qz, stride_qh, stride_qn,
+                               stride_qd, stride_kz, stride_kh, stride_kn, stride_kd, stride_vz, stride_vh, stride_vn,
+                               stride_vd, H, N_CTX, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
+                               PINGPONG: tl.constexpr):
+    # The three quantizers in one launch, picked by the grid's third axis: each
+    # launch costs more host time than the quantizers take on the GPU.
+    which = tl.program_id(2)
+    if which == 0:
+        _quantize_head(Q, Q_out, Q_scale, stride_qz, stride_qh, stride_qn, stride_qd, H, N_CTX, HEAD_DIM, BLOCK_N,
+                       False)
+    elif which == 1:
+        _quantize_head(K, K_out, K_scale, stride_kz, stride_kh, stride_kn, stride_kd, H, N_CTX, HEAD_DIM, BLOCK_N,
+                       PINGPONG)
+    else:
+        _quantize_v(V, V_out, V_scale, stride_vz, stride_vh, stride_vn, stride_vd, H, N_CTX, HEAD_DIM, BLOCK_N,
+                    PINGPONG)
+
+
 def quantize_mxfp8_v(v, *, transposed=False):
     """E4M3 data and E8M0 scales of ``v`` along the sequence, a scale per 32
     keys of each head column: data ``[Z, H, N_CTX, HEAD_DIM]``, scales
     ``[Z, H, cdiv(N_CTX, 32), HEAD_DIM]``. ``transposed`` lays both out as the
-    non-causal kernel reads them: the data as ``[Z, H, HEAD_DIM, N_CTX]`` with
+    ping-pong kernel reads them: the data as ``[Z, H, HEAD_DIM, N_CTX]`` with
     its keys in the order P takes for the PV MFMA (key-index bits 2 and 4
     swapped), the scales as ``[Z, H, N_CTX, HEAD_DIM // 32]`` where, per 64
     keys, word ``32 * b + j`` holds key block ``b``'s scales of columns ``j``,
@@ -948,13 +1081,35 @@ def quantize_mxfp8_v(v, *, transposed=False):
     return out, scale
 
 
+def _quantize_qkv(q, k, v, pingpong):
+    """``quantize_mxfp8_head(q)``, ``quantize_mxfp8_head(k, pack_k=pingpong)``
+    and ``quantize_mxfp8_v(v, transposed=pingpong)`` in one launch, as
+    ``(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale)``."""
+    z, h, n, d = q.shape
+    q_fp8 = torch.empty((z, h, n, d), device=q.device, dtype=_FP8)
+    k_fp8 = torch.empty((z, h, n, d), device=q.device, dtype=_FP8)
+    q_scale = torch.empty((z, h, n, d // 32), device=q.device, dtype=torch.uint8)
+    k_scale = torch.empty((z, h, n, d // 32), device=q.device, dtype=torch.uint8)
+    if pingpong:
+        v_fp8 = torch.empty((z, h, d, n), device=q.device, dtype=_FP8)
+        v_scale = torch.empty((z, h, n, d // 32), device=q.device, dtype=torch.uint8)
+    else:
+        v_fp8 = torch.empty((z, h, n, d), device=q.device, dtype=_FP8)
+        v_scale = torch.empty((z, h, triton.cdiv(n, 32), d), device=q.device, dtype=torch.uint8)
+    # One warp suits V's per-column blocks; the head quantizer runs as fast on one.
+    _quantize_mxfp8_qkv_kernel[(triton.cdiv(n, 64), z * h, 3)](q, k, v, q_fp8, q_scale, k_fp8, k_scale, v_fp8, v_scale,
+                                                               *q.stride(), *k.stride(), *v.stride(), h, n, HEAD_DIM=d,
+                                                               BLOCK_N=64, PINGPONG=pingpong, num_warps=1)
+    return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
+
+
 def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, *, fast_exp=True):
     """Launch on already-quantized inputs: ``q_fp8`` and ``q_scale`` from
     ``quantize_mxfp8_head(q)``, K from ``quantize_mxfp8_head(k,
     pack_k=pingpong)`` and V from ``quantize_mxfp8_v(v, transposed=pingpong)``,
     with ``pingpong`` from ``_default_config``. On the ping-pong path,
-    ``fast_exp`` computes P with a linear-mantissa exp2 bit trick;
-    ``fast_exp=False`` uses the hardware exp."""
+    causal or not, ``fast_exp`` computes P with a linear-mantissa exp2 bit
+    trick; ``fast_exp=False`` uses the hardware exp."""
     batch, heads, n_ctx, _ = q_fp8.shape
     qk_scale = sm_scale * _LOG2E
     out = torch.empty(q_fp8.shape, device=q_fp8.device, dtype=torch.bfloat16)
@@ -966,8 +1121,8 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         v_scale = v_scale.contiguous()
         if v_scale.shape != k_scale.shape or v_scale.stride(2) != k_scale.stride(2):
             raise ValueError("V's scales must be laid out like K's")
-        n_items = n_ctx // cfg["block_m"] * batch * heads
-        grid = (min(n_items, _NUM_CUS), )
+        n_units = n_ctx // cfg["block_m"] // (2 if causal else 1) * batch * heads
+        grid = (min(n_units, _NUM_CUS), )
         args = (
             q_fp8,
             k_fp8,
@@ -1012,6 +1167,8 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
             MFMA_PRIO=1,
             SOFTMAX_PRIO=0,
             FAST_EXP=fast_exp,
+            CAUSAL=causal,
+            ZERO_SCALE=sm_scale == 0,
             num_warps=cfg["num_warps"],
             num_stages=1,
             # Accumulators and scores stay in arch VGPRs for the softmax VALU
@@ -1087,7 +1244,4 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
     if q.shape[-1] != _HEAD_DIM:
         raise ValueError(f"gfx950 flash_attn_mxfp8 expects head dim {_HEAD_DIM}")
     pingpong = _default_config(causal, q.shape[2])["pingpong"]
-    q_fp8, q_scale = quantize_mxfp8_head(q)
-    k_fp8, k_scale = quantize_mxfp8_head(k, pack_k=pingpong)
-    v_fp8, v_scale = quantize_mxfp8_v(v, transposed=pingpong)
-    return _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale)
+    return _launch_quantized(*_quantize_qkv(q, k, v, pingpong), causal, sm_scale)
