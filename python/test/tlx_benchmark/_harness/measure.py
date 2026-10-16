@@ -229,46 +229,108 @@ def host_overhead_us(fn: Callable, iters: int = 300) -> float:
 #: clear the same benchmark cache before every timed call.
 LATENCY_MODES = ("wallclock", "gpu_events")
 
-#: The gate must cover the entire enqueue, including slow Python wrappers.
-#: Cycles are only an initial guess; the event query below validates each batch
-#: and each retry quadruples the gate. The gate runs before the first timed
-#: event, so it costs wall time but never enters a sample.
+#: The gate gives the host a head start on the GPU. Cycles are only an initial
+#: guess; the event queries below validate every timed call, and each retry
+#: quadruples the gate. The gate runs before the first timed event, so it costs
+#: wall time but never enters a sample.
 _GATE_CYCLES = 20_000_000
 _GATE_GROWTH = 4
 _GATE_MAX_ATTEMPTS = 4
 
+#: Continuous runs to try before falling back to batches. The second, behind a
+#: longer gate, absorbs a one-off host stall such as the thread being
+#: descheduled, which says nothing about the call being measured.
+_CONTINUOUS_ATTEMPTS = 2
 
-def _gpu_event_samples(fn: Callable, iters: int, grad_to_none: Optional[Iterable] = None) -> list[float]:
-    """Per-iteration ms, with timed GPU work held off until the batch is queued."""
+#: Calls per batch once a continuous run has fallen behind. A batch must fit in
+#: the launch queue so that all of it is queued before the GPU starts: CUDA
+#: stops accepting work at about 1024 pending operations, and a one-kernel call
+#: queues four (cache clear, two events, the kernel). On a B200, 250 calls fit
+#: and 300 did not. A batch that still overflows, such as a multi-kernel
+#: backward, is halved on retry.
+_GATE_BATCH = 100
+
+
+def _gated_run(fn: Callable, n: int, gate_cycles: int, grad_to_none: Optional[Iterable]) -> Optional[list[float]]:
+    """Per-call ms for `n` calls queued behind one gate, or None if any call
+    could not be certified free of host gaps.
+
+    The certificate assumes `fn` keeps its GPU work on the current stream, as
+    every op here does. Work on a side stream that does not wait for the start
+    event could run during the gate, unseen by the query.
+    """
     import torch
 
     di = triton.runtime.driver.active.get_device_interface()
     cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
+    starts = [di.Event(enable_timing=True) for _ in range(n)]
+    ends = [di.Event(enable_timing=True) for _ in range(n)]
+    clean = True
+    torch.cuda._sleep(gate_cycles)
+    for i in range(n):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        triton.runtime.driver.active.clear_cache(cache)
+        starts[i].record()
+        fn()
+        ends[i].record()
+        # A call's interval is gap-free if the whole call was queued before
+        # the GPU reached its start event. Once the queue is full the host
+        # waits on the GPU, but a GPU-bound call still keeps the GPU behind.
+        # The test is sufficient, not necessary: a failed query means the call
+        # is uncertified, not that its sample would have held a gap.
+        if starts[i].query():
+            clean = False
+            break
     di.synchronize()
-    for attempt in range(_GATE_MAX_ATTEMPTS):
-        starts = [di.Event(enable_timing=True) for _ in range(iters)]
-        ends = [di.Event(enable_timing=True) for _ in range(iters)]
-        torch.cuda._sleep(_GATE_CYCLES * _GATE_GROWTH**attempt)
-        for i in range(iters):
-            if grad_to_none is not None:
-                for x in grad_to_none:
-                    x.grad = None
-            triton.runtime.driver.active.clear_cache(cache)
-            starts[i].record()
-            fn()
-            ends[i].record()
-        # Query before synchronizing: an incomplete first event proves the
-        # entire batch was submitted before its first timed interval began.
-        fully_queued = not starts[0].query()
-        di.synchronize()
-        if fully_queued:
-            return [s.elapsed_time(e) for s, e in zip(starts, ends)]
-    raise RuntimeError("GPU timing batch started before complete host enqueue; no valid samples")
+    return [s.elapsed_time(e) for s, e in zip(starts, ends)] if clean else None
+
+
+def _gpu_event_samples(fn: Callable, iters: int, grad_to_none: Optional[Iterable] = None,
+                       notes: Optional[list] = None) -> list[float]:
+    """Per-call ms, each call queued in full before the GPU reaches it.
+
+    Appends to `notes` when the samples had to be taken in batches.
+    """
+    di = triton.runtime.driver.active.get_device_interface()
+    di.synchronize()
+    # One continuous run keeps the GPU under the same back-to-back load as
+    # earlier versions of this harness. On B200 that load holds the clock at
+    # the power cap, so splitting the run would change the numbers.
+    for attempt in range(_CONTINUOUS_ATTEMPTS):
+        samples = _gated_run(fn, iters, _GATE_CYCLES * _GATE_GROWTH**attempt, grad_to_none)
+        if samples is not None:
+            return samples
+    # The host keeps falling behind, so the call is host-bound. Batches that
+    # fit the queue are fully queued before the GPU starts, so their samples
+    # stay gap-free, but the pauses between batches let a power-capped clock
+    # recover. Say so, so a comparison against a continuous run is not taken
+    # at face value.
+    if notes is not None:
+        notes.append(f"timed in batches of up to {_GATE_BATCH} calls: the host could not stay ahead of the GPU")
+    samples = []
+    batch, failures = min(iters, _GATE_BATCH), 0
+    while len(samples) < iters:
+        run = _gated_run(fn, min(batch, iters - len(samples)), _GATE_CYCLES * _GATE_GROWTH**failures, grad_to_none)
+        if run is not None:
+            samples += run
+            failures = 0
+            continue
+        failures += 1
+        if failures == _GATE_MAX_ATTEMPTS:
+            raise RuntimeError("GPU timing could not certify any samples: the GPU reached a timed call "
+                               "before the host finished queuing it")
+        # The gate drained before a slow host finished, or the batch overflowed
+        # the launch queue. The event cannot tell which, so address both.
+        batch = max(1, batch // 2)
+    return samples
 
 
 def measure(fn: Callable, *, flop_count: Optional[float] = None, warmup: Optional[int] = None,
             rep: Optional[int] = None, auto_window: bool = False, replicates: int = DEFAULT_REPLICATES,
-            grad_to_none: Optional[Iterable] = None, remove_outliers: bool = True, mode: str = "gpu_events") -> Stat:
+            grad_to_none: Optional[Iterable] = None, remove_outliers: bool = True, mode: str = "gpu_events",
+            notes: Optional[list] = None) -> Stat:
     # replicates>1 re-warms each time and measures drift BETWEEN runs
     # (rel_max_deviation); that is no longer the gate, hence the default of 1.
     # Window sizing is inherently temporal -- `do_bench` derives its iteration
@@ -284,7 +346,7 @@ def measure(fn: Callable, *, flop_count: Optional[float] = None, warmup: Optiona
         iters = max(1, math.ceil(MIN_TOTAL_SAMPLES / replicates))
         for _ in range(DEFAULT_WARMUP_ITERS):
             fn()
-        runs = [_gpu_event_samples(fn, iters, grad_to_none) for _ in range(replicates)]
+        runs = [_gpu_event_samples(fn, iters, grad_to_none, notes) for _ in range(replicates)]
         if flop_count:
             return summarize([to_tflops(r, flop_count) for r in runs], remove_outliers=remove_outliers, unit="tflops")
         return summarize(runs, remove_outliers=remove_outliers, unit="ms")
