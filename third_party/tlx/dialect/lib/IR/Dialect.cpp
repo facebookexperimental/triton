@@ -17,6 +17,7 @@ using namespace mlir::triton::tlx;
 namespace ttg = mlir::triton::gpu;
 
 namespace {
+// Return the enclosing ModuleOp for `op`, or `op` itself if it is a ModuleOp.
 ModuleOp getModuleOp(Operation *op) {
   auto module = dyn_cast<ModuleOp>(op);
   if (!module) {
