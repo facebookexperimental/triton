@@ -254,6 +254,11 @@ void init_triton_tlx_ir(py::module &&m) {
           },
           py::arg("v"), py::arg("encoding"), py::arg("pin") = false,
           py::arg("late_address_compute") = false)
+      .def("has_pinned_layout",
+           [](TritonOpBuilder &, Value &v) -> bool {
+             auto type = dyn_cast<RankedTensorType>(v.getType());
+             return type && containsPinnedEncoding(type.getEncoding());
+           })
       .def(
           "create_splat_with_layout",
           [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -1375,19 +1380,20 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_buffer_store",
            [](TritonOpBuilder &self, Value storedValue, Value ptr,
-              Value offsets, std::optional<Value> mask,
-              tt::CacheModifier cache) {
+              Value offsets, std::optional<Value> mask, tt::CacheModifier cache,
+              uint32_t contiguity) {
              self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
                                               Value() /*stride*/, cache,
-                                              mask.value_or(Value()));
+                                              mask.value_or(Value()), contiguity);
            })
       .def("create_buffer_load_to_local",
            [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
               std::optional<Value> mask, std::optional<Value> other,
-              tt::CacheModifier cache) -> Value {
+              tt::CacheModifier cache, uint32_t contiguity) -> Value {
              return self.create<ttag::BufferLoadToLocalOp>(
                  dest, ptr, offsets, mask.value_or(Value()),
-                 other.value_or(Value()), Value() /*stride*/, cache);
+                 other.value_or(Value()), Value() /*stride*/, cache,
+                 contiguity);
            })
       .def("create_buffer_atomic_rmw",
            [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,

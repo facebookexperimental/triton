@@ -19,14 +19,34 @@ never falls back to torch.
 
 from __future__ import annotations
 
+import functools
+
 from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 
 __all__ = ["mm", "flash_attn", "hstu_attn", "UnsupportedOp", "InvalidInput"]
 
 
+@functools.lru_cache(maxsize=None)
+def _mm_impl_for_device(device):
+    """Cache the stable device-to-implementation lookup on the MM hot path."""
+    return impl_for("mm", device=device)
+
+
 def mm(a, b, *, out=None, arch=None, space="full"):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major."""
-    fn, spec = impl_for("mm", arch)
+    if a.ndim != 2 or b.ndim != 2:
+        raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    if a.shape[1] != b.shape[0]:
+        raise InvalidInput("tlx.ops.mm reduction dimensions must match; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    if a.dtype != b.dtype or a.device != b.device:
+        raise InvalidInput("tlx.ops.mm operands must have the same dtype and device; "
+                           f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
+    if arch is None:
+        fn, spec = _mm_impl_for_device(a.device)
+    else:
+        fn, spec = impl_for("mm", arch)
     # Mirror the kernel's operand prep: a non-contiguous operand is fed to its
     # descriptor transposed, so that is the stride TMA must find aligned.
     a_src = a if a.is_contiguous() else a.T
