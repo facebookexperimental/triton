@@ -58,7 +58,7 @@ from torch.compiler import assume_constant_result
 from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_backward, check_inputs, impl_for
 
 __all__ = [
-    "mm", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
+    "mm", "mm_bias_grad", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
     "flash_attn_varlen", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
     "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
     "UnsupportedBackward", "InvalidInput"
@@ -106,6 +106,34 @@ def mm(a, b, *, out=None, space=None):
     if out is None:
         return fn(a, b, space=space)
     return fn(a, b, out=out, space=space)
+
+
+def mm_bias_grad(dout, input_act, *, out=None, space=None):
+    """Return ``(dout.T @ input_act, dout.sum(0))`` for a linear layer.
+
+    Inputs are contiguous BF16 ``[batch, out_features]`` and
+    ``[batch, in_features]`` tensors on the same CUDA device. Both feature
+    dimensions must be multiples of eight; batch may have a partial K tile.
+    Outputs have the input dtype and shapes ``[out_features, in_features]``
+    and ``[out_features]``. ``out`` may supply that pair of output tensors.
+
+    These are explicit first-order gradients. Inputs may require gradients,
+    but the returned tensors have no autograd graph for higher derivatives.
+    ``space=None`` selects "heuristic"; "full" autotunes the fused operation,
+    including the split-K reduction. Only Blackwell is currently supported.
+    """
+    if dout.ndim != 2 or input_act.ndim != 2:
+        raise InvalidInput("tlx.ops.mm_bias_grad expects two rank-2 tensors")
+    if dout.shape[0] != input_act.shape[0] or min(*dout.shape, *input_act.shape) <= 0:
+        raise InvalidInput("tlx.ops.mm_bias_grad requires matching, positive batch dimensions")
+    if dout.dtype != input_act.dtype or dout.device != input_act.device:
+        raise InvalidInput("tlx.ops.mm_bias_grad inputs must have the same dtype and device")
+    if not dout.is_contiguous() or not input_act.is_contiguous():
+        raise InvalidInput("tlx.ops.mm_bias_grad requires contiguous inputs")
+    fn, spec = impl_for("mm_bias_grad", device=dout.device)
+    check_inputs(spec, dtype=dout.dtype, row_strides=(dout.stride(0), input_act.stride(0)),
+                 elem_bytes=dout.element_size(), base_ptrs=(dout.data_ptr(), input_act.data_ptr()))
+    return fn(dout, input_act, out=out, space=spec.default_space if space is None else space)
 
 
 def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):

@@ -78,6 +78,16 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm_bias_grad",
+        arch="sm100",
+        variant="ws_wgrad_bias",
+        impl="triton.tlx.ops.kernels.mm_bias_grad.sm100:mm_bias_grad",
+        dtypes=frozenset({"bfloat16"}),
+        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]) and all(p % 16 == 0
+                                                                                               for p in d["base_ptrs"]),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
         op="addmm",
         arch="gfx942",
         variant="fused_gemm",

@@ -36,6 +36,7 @@ Implemented today:
 
 ```
 mm/sm100.py
+mm_bias_grad/sm100.py
 mm_mxfp8/sm100.py
 flash_attn/sm100.py
 flash_attn/gfx950.py
@@ -52,6 +53,7 @@ Current kernel selections for the rest of the catalog:
 ```
 kernels/
     mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
+    mm_bias_grad/         sm100.py
     mm_mxfp8/             sm100.py
     addmm/                gfx942.py
     bmm/                  gfx942.py
@@ -73,6 +75,158 @@ kernels/
     cross_attention/      sm100.py
     bmm_shared_a/         gfx950.py
 ```
+
+## Linear weight and bias gradients
+
+```python
+from triton.tlx.ops import mm_bias_grad
+
+d_weight, d_bias = mm_bias_grad(dout, input_act, space="full")
+```
+
+`dout` is contiguous `[batch, out_features]` and `input_act` is contiguous
+`[batch, in_features]`, with matching BF16 dtype on the same Blackwell
+GPU. Feature dimensions are positive multiples of eight; batch is positive
+and may have a partial K tile. The result is `dout.T @ input_act` and
+`dout.sum(0)`, in the input dtype. `out=(d_weight, d_bias)` supplies contiguous,
+non-overlapping outputs. These explicit first-order gradients accept saved
+activations requiring gradients and do not construct a higher-order graph.
+
+The operation follows the same architecture layout as `mm`:
+
+```
+mm_bias_grad/
+    __init__.py
+    _shapes.py
+    sm100.py
+```
+
+`sm100.py` contains the private JIT paths, configuration generation and pruning,
+lazy autotuning and the launch entry point. The catalog registers one public
+implementation for `(mm_bias_grad, sm100)`. `_shapes.py` uses the shared
+`FocusRegistry` for `sm100_1` and defines synthetic correctness cases.
+
+The kernel horizontally fuses GEMM and bias reduction through shared `dout`
+tiles. Four warp tasks run the epilogue, MMA, TMA and bias reduction. The bias
+task is replicated per MMA group; bias and MMA release each shared output-gradient
+tile through a two-arrival completion barrier. The large-K heuristic uses two
+CTAs, two MMA groups and eight default warps. BF16 split partials for weight and
+bias are finalized together. The default
+`space="heuristic"` selects one configuration; `space="full"` measures the
+complete operation over tile sizes, buffer depths and split-K choices
+spanning one and two occupancy waves. Below batch 65536, autotuning uses
+CUDA graph timing, including the merged finalization. Larger batches use
+ordinary-launch autotuning with cache flushing.
+
+Correctness tests live in `python/test/unit/tlx_ops/test_mm_bias_grad_sm100.py`.
+They cover BF16 production shapes, partial K and feature tiles,
+split-K, non-power-of-two buffer depths, bias ownership and CUDA graph replay.
+Run them from `fbsource/fbcode`:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 buck2 run @mode/opt -m ovr_config//triton:beta \
+  -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
+  --agent-context direct_call=true --agent-context reason="Check fused weight and bias gradients" \
+  fbsource//third-party/triton/beta/triton:py_tlx_mm_bias_grad_test -- -s --tb=short -v
+```
+
+### Benchmark against unfused PT2
+
+The TritonBench operator is `mm_bias_grad`, with `pt2_unfused_best` and `tlx`
+providers. Both return the complete weight and bias pair. PT2 selects among
+28 separately compiled serial and concurrent candidates before TritonBench
+times the providers with CUDA graphs. Inputs are seeded random BF16 tensors.
+
+From `fbsource/fbcode`:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 ../third-party/triton/beta/triton/third_party/tlx/denoise.sh \
+  buck2 run @mode/opt -m ovr_config//triton:beta \
+  -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
+  -c fbcode.enable_gpu_sections=true \
+  --agent-context direct_call=true --agent-context reason="Benchmark tlx.ops linear gradients" \
+  fbcode//pytorch/tritonbench:run_tlx -- \
+  --op mm_bias_grad --only pt2_unfused_best,tlx --metrics latency,speedup
+```
+
+For all candidate timings and a complete JSON report, the standalone entry
+uses `tritonbench/operators/fb/mm_bias_grad/benchmark.py`.
+
+From `fbsource/fbcode`, on an idle B200:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 ../third-party/triton/beta/triton/third_party/tlx/denoise.sh \
+  buck2 run @mode/opt -m ovr_config//triton:beta \
+  -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
+  --agent-context direct_call=true --agent-context reason="Benchmark fused weight and bias gradients" \
+  fbsource//third-party/triton/beta/triton:py_tlx_mm_bias_grad_perf -- \
+  --space full --json /tmp/mm_bias_grad_benchmark.json
+```
+
+The default focus suite is `(1024, 384, 384)`, `(4096, 512, 384)`,
+`(8192, 256, 256)` and `(294912, 512, 384)`, in `(batch, out, in)` order.
+Use `--shape BATCH OUT IN` to select cases.
+
+The benchmark separately compiles the PT2 GEMM and sum, making horizontal
+fusion across them impossible. It uses exhaustive max-autotune GEMM searches
+over ATEN, Triton and the combined ATEN/Triton/CUTLASS set, and compares
+cuBLAS/cuBLASLt preferences and reduction coordinate descent enabled and
+disabled. Each pair is measured both serially and with GEMM and reduction on
+separate CUDA streams joined before completion. Every candidate is checked
+against an FP32 reference. The fastest median end-to-end PT2 pair is selected
+per shape, with all provider times, compile failures and autotune warnings
+recorded in JSON.
+The selected GEMM backend is recorded separately from the requested search
+set, including any TorchTLX templates enabled in the current PT2 build.
+The default search measures 28 unfused PT2 providers per shape. To remeasure
+the winning serial and concurrent settings from a completed search, add
+`--pt2-report /tmp/mm_bias_grad_benchmark.json` and write the new measurements
+to a different `--json` path. The saved report must contain the complete
+search and match the GPU model, SM count, software versions, dtype and fill.
+The winners are compiled, checked and timed again alongside TLX.
+
+Both implementations capture 64 complete output pairs per CUDA graph and use
+CUDA events to time repeated graph launches, with the same inputs and output
+dtype. Timing includes both outputs and TLX split-K finalization. Compilation and
+autotuning precede timing. Three interleaved timing rounds follow a one-second
+warmup. Timing inputs default to zeros for fixed-clock measurements; use
+`--fill uniform` for populated inputs. Correctness always uses seeded random
+inputs. Replaying the same input tensors is a warm-cache measurement; the
+large production case's input footprint exceeds B200 L2.
+
+### Configurations and split-K layout
+
+`CONFIGS`, `SMOKE_CONFIGS` and `heuristic_config` define the full, smoke and
+heuristic spaces in `sm100.py`. Autotune state initializes lazily per shape
+and device, and the SM count follows the input device. Configuration pruning
+accounts for SMEM, TMEM, paired-CTA tile ownership and empty K splits.
+Split-K configurations require whole M tiles because workspace rows use M
+as their split stride. Feature tails use a single split. Worker tasks use a
+168-register budget, and autotuning includes the merged weight/bias finalization.
+
+### B200 measurements
+
+BF16 results on B200 with 148 SMs, Torch `2.16.0a0+fb`, Triton `3.9.0+fb`
+and CUDA `12.8.0`, using the graph timing protocol above:
+
+| Shape (batch, out, in) | TLX fused (us) | Best unfused PT2 (us) | Speedup | Selected PT2 GEMM / execution |
+|---|---:|---:|---:|---|
+| (1024, 384, 384) | 6.69 | 4.48 | 0.67x | ATEN / concurrent |
+| (4096, 512, 384) | 8.00 | 8.36 | 1.04x | ATEN / concurrent |
+| (8192, 256, 256) | 8.89 | 8.62 | 0.97x | TRITON / concurrent |
+| (294912, 512, 384) | 122.58 | 138.45 | 1.13x | TRITON / serial |
+
+The small cases remeasure the serial and concurrent winners selected by the
+complete 28-provider search. The large case uses that complete-search round,
+which produced the fastest observed PT2 baseline. Every row compares the
+complete TLX and PT2 output pair within the same timing round. The 1024 and
+8192 cases remain slower than the best current PT2 pair.
+
+A subsequent large-case matched run measured TLX at 123.92 us and PT2 at
+145.76 us. A graph-autotuning trial selected a slower 143.02 us TLX
+configuration for this shape; the large-K policy uses
+ordinary-launch autotuning. All reports retain the selected configurations,
+individual timing samples and compiler diagnostics.
 
 ## MXFP8 GEMM
 
