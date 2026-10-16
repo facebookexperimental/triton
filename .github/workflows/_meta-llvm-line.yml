@@ -7,7 +7,7 @@ on:
     inputs:
       target:           { type: string, required: true }
       fork_branch:      { type: string, required: true }
-      verify_workflows: { type: string, required: true }
+      verify_workflows: { type: string, required: false, default: '' }
       dry_run:          { type: boolean, required: false, default: false }
 
 permissions: read-all

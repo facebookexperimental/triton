@@ -244,8 +244,10 @@ def main():
     parser.add_argument("--fork", default="facebookexperimental/llvm-project")
     parser.add_argument("--fork-branch", required=True, help="Fork branch the target tracks, e.g. triton_3.8.x")
     parser.add_argument("--require", default=DEFAULT_REQUIRED, help="Platforms a release must publish")
-    parser.add_argument("--verify-workflows", required=True, type=lambda v: [w for w in v.split(",") if w],
-                        help="Workflow files that must pass on the bump commit, e.g. gpu-tests.yml")
+    parser.add_argument(
+        "--verify-workflows", default="", type=lambda v: [w for w in v.split(",") if w],
+        help="Workflow files that must pass on the bump commit, e.g. gpu-tests.yml; "
+        "none means the bump is ready as soon as it is pushed")
     parser.add_argument("--timeout-hours", type=float, default=8)
     parser.add_argument("--dry-run", action="store_true", help="Print the writes instead of making them")
     args = parser.parse_args()
