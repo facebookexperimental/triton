@@ -327,6 +327,74 @@ def test_scalarize_packed_fops_invalidates_cache(monkeypatch):
     assert enabled["AMDGCN_SCALARIZE_PACKED_FOPS"] == "true"
 
 
+@pytest.mark.parametrize("value", [None, ""])
+def test_cache_invalidating_env_vars_omits_unset_and_empty(monkeypatch, value):
+    name = "AMDGCN_SCALARIZE_PACKED_FOPS"
+    monkeypatch.delenv(name, raising=False)
+    if value is not None:
+        monkeypatch.setenv(name, value)
+    assert name not in get_cache_invalidating_env_vars()
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("1", "true"),
+    ("true", "true"),
+    ("TrUe", "true"),
+    ("ON", "true"),
+    ("0", "false"),
+    ("false", "false"),
+    ("FaLsE", "false"),
+    ("oFf", "false"),
+    ("yes", "yes"),
+    ("NO", "NO"),
+    ("y", "y"),
+    ("n", "n"),
+    (" true ", " true "),
+    (" ", " "),
+    ("disable-lsr", "disable-lsr"),
+    ("2", "2"),
+])
+def test_cache_invalidating_env_vars_normalizes_bool_and_preserves_strings(monkeypatch, value, expected):
+    name = "AMDGCN_SCALARIZE_PACKED_FOPS"
+    monkeypatch.setenv(name, value)
+    assert get_cache_invalidating_env_vars()[name] == expected
+
+
+def test_cache_invalidating_env_vars_reads_native_environment():
+    from triton._C.libtriton import getenv
+
+    name = "AMDGCN_SCALARIZE_PACKED_FOPS"
+    previous_mapping = os.environ.get(name)
+    previous_native = getenv(name)
+    try:
+        os.environ[name] = "mapping-value"
+        os.putenv(name, "1")
+        assert os.environ[name] == "mapping-value"
+        assert get_cache_invalidating_env_vars()[name] == "true"
+        os.putenv(name, "0")
+        assert get_cache_invalidating_env_vars()[name] == "false"
+        os.putenv(name, "native-value")
+        assert get_cache_invalidating_env_vars()[name] == "native-value"
+        os.unsetenv(name)
+        assert name not in get_cache_invalidating_env_vars()
+    finally:
+        # Restore the Python mapping before the native environment.
+        if previous_mapping is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous_mapping
+        if previous_native is None:
+            os.unsetenv(name)
+        else:
+            os.putenv(name, previous_native)
+
+
+@pytest.mark.parametrize("name", ["TRITON_REPRODUCER_PATH", "TRITON_TEST_UNKNOWN_CACHE_ENV"])
+def test_cache_invalidating_env_vars_excludes_neutral_and_unknown(monkeypatch, name):
+    monkeypatch.setenv(name, "1")
+    assert name not in get_cache_invalidating_env_vars()
+
+
 @pytest.mark.parametrize("truthy, falsey", [("1", "0"), ("true", "false"), ("True", "False"), ("TRUE", "FALSE"),
                                             ("y", "n"), ("YES", "NO"), ("ON", "OFF")])
 def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
