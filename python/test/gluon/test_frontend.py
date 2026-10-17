@@ -4896,10 +4896,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %2 = arith.bitcast %c1_i32 : i32 to i32
     %3 = ub.poison : i32
     scf.for %arg0 = %0 to %1 step %2  : i32 {
+      rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "stage0"}
       %c1_i32_0 = arith.constant 1 : i32
       %c1_i32_1 = arith.constant 1 : i32
       %4 = arith.addi %arg0, %c1_i32_1 : i32
       rocdl.sched.barrier none {triton.warp_pipeline.border = "stage0"}
+      rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "stage1"}
       %c1_i32_2 = arith.constant 1 : i32
       %c1_i32_3 = arith.constant 1 : i32
       %5 = arith.muli %4, %c1_i32_3 : i32

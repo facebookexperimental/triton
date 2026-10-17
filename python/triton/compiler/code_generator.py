@@ -38,6 +38,7 @@ from .errors import (
 )
 
 from triton.language.extra.tlx.compiler.dispatch import TLX_WITH_DISPATCH
+from triton.language.extra.tlx.compiler.code_generator import visit_withWarpPipelineStage
 
 WITH_DISPATCH = {}  # central registry for all 'with' handlers
 
@@ -1299,8 +1300,15 @@ class CodeGenerator(ast.NodeVisitor):
         # and it will require non-trivial changes in TLX dispatcher for async_task
         # which will be done later
         if isinstance(context, ast.Call):
+            # Gluon semantics imports this module. Resolve its context manager
+            # after module initialization to avoid an import cycle.
+            from triton.experimental.gluon.language.amd import warp_pipeline_stage as gluon_warp_pipeline_stage
+
             withitemClass = self.visit(context.func)
             handler = WITH_DISPATCH.get(withitemClass)
+            if withitemClass is gluon_warp_pipeline_stage:
+                # Both frontends emit the same AMD stage border markers.
+                handler = visit_withWarpPipelineStage
             if handler:
                 return handler(self, node)
         return self.visit_compound_statement(node.body)

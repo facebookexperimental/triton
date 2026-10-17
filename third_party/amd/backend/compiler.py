@@ -684,12 +684,12 @@ class HIPBackend(BaseBackend):
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
-        # Consume tlx.warp_pipeline_stage border markers (rocdl.sched.barrier with
-        # triton.warp_pipeline.border / .priority attrs) for the TLX / triton.jit
+        # Consume paired tlx.warp_pipeline_stage markers for the TLX / triton.jit
         # path. The gluon path runs this in gluon_to_ttgir; make_llir runs the
         # conversion. Placed at the TTGIR stage (so it does not double-run for gluon
         # kernels) and as the last pass before pm.run so the cleanup passes above do
         # not strip the priority markers before the pipeliner consumes them.
+        amd.passes.ttgpuir.add_normalize_warp_pipeline(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         # Consume explicit tlx.warp_pipeline_stage(scope="intra_wave")
         # regions. This pass is
@@ -725,6 +725,7 @@ class HIPBackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttir.add_loop_unroll(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+        amd.passes.ttgpuir.add_normalize_warp_pipeline(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
 

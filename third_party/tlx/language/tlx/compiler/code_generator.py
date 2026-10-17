@@ -426,6 +426,7 @@ def visit_withWarpPipelineStage(self, node):
     if scope == "inter_wave":
         if pair is not None:
             raise ValueError("pair is only meaningful with scope='intra_wave'")
+        self.builder.create_warp_pipeline_begin(str(label))
         self.visit_compound_statement(node.body)
         self.builder.create_warp_pipeline_border(str(label), -1 if priority is None else priority)
         return

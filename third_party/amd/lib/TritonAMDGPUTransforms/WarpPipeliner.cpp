@@ -9,6 +9,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -24,6 +25,7 @@ namespace tt = mlir::triton;
 namespace mlir {
 
 #define GEN_PASS_DEF_TRITONAMDGPUPRESERVEWARPPIPELINEOWNERS
+#define GEN_PASS_DEF_TRITONAMDGPUNORMALIZEWARPPIPELINE
 #define GEN_PASS_DEF_TRITONAMDGPUWARPPIPELINE
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
@@ -33,6 +35,8 @@ static constexpr llvm::StringLiteral kOwnerEndAttr =
     "triton.warp_pipeline.owner_end";
 static constexpr llvm::StringLiteral kOwnerStageCountAttr =
     "triton.warp_pipeline.owner_stage_count";
+static constexpr llvm::StringLiteral kStageBeginAttr =
+    "triton.warp_pipeline.stage_begin";
 static constexpr llvm::StringLiteral kFlatStageAttr =
     "triton.warp_pipeline.flat";
 
@@ -100,7 +104,7 @@ static BorderMarker readBorderMarker(Operation *op) {
 
 // If `cluster` is empty, materialize a dummy SchedBarrier so the cluster is
 // non-empty.  This lets users deliberately request a pipeline bubble by
-// emitting two consecutive border markers with no body between them.
+// emitting a begin/end pair with no body between them.
 static void addDummyOpIfEmptyCluster(OpBuilder &b, Location loc,
                                      Operation *insertBefore,
                                      SmallVectorImpl<Operation *> &cluster) {
@@ -134,7 +138,7 @@ static void createClusterOp(OpBuilder &b, Location loc,
   for (Operation *op : ops) {
     for (OpResult r : op->getResults()) {
       bool hasExternalUse = llvm::any_of(r.getUsers(), [&](Operation *u) {
-        return !opsLookup.count(u) && u->getParentOp() != nullptr;
+        return !opsLookup.contains(op->getBlock()->findAncestorOpInBlock(*u));
       });
       if (hasExternalUse) {
         yieldedTypes.push_back(r.getType());
@@ -200,267 +204,287 @@ static void createClusterOp(OpBuilder &b, Location loc,
   return;
 }
 
-// Move pure scalar IV-remap ops after adjacent inter-stage barriers/waits so
-// they become part of the next stage.  If a barrier/wait uses one of those
-// scalars, leave the run in place to preserve SSA.
-static void sinkPureScalarsIntoNextStage(Operation *begin, Operation *end) {
-  SmallVector<Operation *> pending;
-  auto consumesPending = [&](Operation *user) {
-    return llvm::any_of(user->getOperands(), [&](Value v) {
-      return llvm::is_contained(pending, v.getDefiningOp());
-    });
-  };
-  for (Operation *op = begin; op && op != end;) {
-    Operation *next = op->getNextNode();
-    if (triton::isPureScalarOp(op)) {
-      pending.push_back(op);
-      op = next;
+// Stage markers survive layout propagation and loop unrolling. Only operations
+// between a matched pair belong to a fixed stage. Labels need not be unique:
+// unrolling copies both markers, and each pair remains in the same block.
+struct Stage {
+  Operation *begin;
+  Operation *end;
+};
+
+static LogicalResult collectStages(Operation *begin, Operation *end,
+                                   SmallVectorImpl<Stage> &stages) {
+  Operation *active = nullptr;
+  for (Operation *op = begin; op && op != end; op = op->getNextNode()) {
+    if (op->hasAttr(kStageBeginAttr)) {
+      if (active)
+        return op->emitError(
+            "nested warp_pipeline_stage regions are not supported");
+      active = op;
+    } else if (isPipelineBorder(op)) {
+      if (!active || active->getAttr(kStageBeginAttr) !=
+                         op->getAttr("triton.warp_pipeline.border"))
+        return op->emitError("unmatched warp_pipeline_stage end marker");
+      stages.push_back({active, op});
+      active = nullptr;
+    } else if (active) {
+      if (canSitBetweenStages(op))
+        return op->emitError("barrier or wait op cannot appear inside a "
+                             "warp_pipeline_stage region");
+      if (isLoopOp(op))
+        return op->emitError(
+            "loop op cannot appear inside a warp_pipeline_stage "
+            "region; place stage blocks inside the loop body");
+    }
+  }
+  if (active)
+    return active->emitError("unmatched warp_pipeline_stage begin marker");
+  return success();
+}
+
+static bool canPlaceInStage(Operation *op) {
+  if (op->getNumRegions() == 0 && triton::isPureScalarOp(op))
+    return true;
+  if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+    // Register reorders and warp shuffles need no shared memory or CTA barrier.
+    // The op verifier also checks that forced shuffles stay inside one warp.
+    return !cvtNeedsSharedMemory(cvt);
+  }
+  return false;
+}
+
+// Owner recovery removes annotations when folding leaves one iteration.
+// Such a scope does not execute as a pipeline and needs no placement.
+static bool isSingleIterationOwner(Operation *begin, ArrayRef<Stage> stages,
+                                   bool hasOwner) {
+  if (!hasOwner)
+    return false;
+  auto originalCount =
+      begin->getPrevNode()->getAttrOfType<IntegerAttr>(kOwnerStageCountAttr);
+  return originalCount && stages.size() == originalCount.getInt();
+}
+
+static void selectStageInputScope(Operation *&begin, Operation *&end,
+                                  ArrayRef<Stage> stages, bool hasOwner) {
+  if (hasOwner || isa<scf::ForOp>(begin->getParentOp()))
+    return;
+  // Explicit boundaries keep a flat pipeline's prologue and epilogue out.
+  begin = stages.front().begin;
+  end = stages.back().end->getNextNode();
+}
+
+static DenseMap<Operation *, unsigned>
+getFixedStagePlacement(ArrayRef<Stage> stages) {
+  DenseMap<Operation *, unsigned> placement;
+  for (auto [index, stage] : llvm::enumerate(stages))
+    for (Operation *op = stage.begin; op != stage.end->getNextNode();
+         op = op->getNextNode())
+      placement[op] = index;
+  return placement;
+}
+
+static LogicalResult
+collectStageInputs(Operation *begin, Operation *end,
+                   const DenseMap<Operation *, unsigned> &placement,
+                   SmallVectorImpl<Operation *> &inputs) {
+  for (Operation *op = begin; op && op != end; op = op->getNextNode()) {
+    if (placement.contains(op) || canSitBetweenStages(op) ||
+        op->hasTrait<OpTrait::IsTerminator>())
       continue;
-    }
-    if (canSitBetweenStages(op) && !pending.empty()) {
-      Operation *anchor = op;
-      while (anchor->getNextNode() &&
-             canSitBetweenStages(anchor->getNextNode()))
-        anchor = anchor->getNextNode();
-      bool conflict = false;
-      for (Operation *ign = op; !conflict; ign = ign->getNextNode()) {
-        conflict = consumesPending(ign);
-        if (ign == anchor)
-          break;
+    if (!canPlaceInStage(op))
+      return op->emitError(
+          "cannot place operation outside warp_pipeline_stage: "
+          "expected pure scalar computation or a wave-local "
+          "layout conversion");
+    inputs.push_back(op);
+  }
+  return success();
+}
+
+// In a straight-line scope, the earliest use sets the latest legal stage.
+// A fixed use (for example a wait) requires the producer's stage to end before
+// that use. Loop yields are uses at the end of this iteration, not backedges.
+static FailureOr<unsigned>
+findLatestInputStage(Operation *op, ArrayRef<Stage> stages,
+                     const DenseMap<Operation *, unsigned> &placement) {
+  unsigned latest = stages.size() - 1;
+  Operation *limitingUser = nullptr;
+  for (Operation *user : op->getUsers()) {
+    Operation *ancestor = op->getBlock()->findAncestorOpInBlock(*user);
+    if (!ancestor)
+      continue; // A use outside the scope follows it by SSA dominance.
+    auto it = placement.find(ancestor);
+    if (it != placement.end()) {
+      if (it->second <= latest) {
+        latest = it->second;
+        limitingUser = ancestor;
       }
-      if (!conflict) {
-        next = anchor->getNextNode();
-        // Reverse iteration + moveAfter(anchor) preserves source order:
-        // each earlier-inserted scalar is pushed right by later inserts.
-        for (Operation *s : llvm::reverse(pending))
-          s->moveAfter(anchor);
+    } else {
+      // Fixed operations cannot move. Find the last stage before this use.
+      while (!stages[latest].end->isBeforeInBlock(ancestor)) {
+        if (latest == 0) {
+          auto diag = op->emitError("no legal warp-pipeline stage for input");
+          diag.attachNote(user->getLoc())
+              << "this fixed use precedes every available stage";
+          return failure();
+        }
+        --latest;
       }
+      limitingUser = ancestor;
     }
-    pending.clear();
-    op = next;
+  }
+  // Sink only. This preserves operand dominance and execution multiplicity.
+  // Producers assigned to the same stage will retain their original order.
+  if (!op->isBeforeInBlock(stages[latest].begin)) {
+    auto diag = op->emitError("no legal warp-pipeline stage for input");
+    if (limitingUser)
+      diag.attachNote(limitingUser->getLoc())
+          << "this use requires a stage before the input's original position";
+    return failure();
+  }
+  return latest;
+}
+
+// Reverse SSA order gives each unassigned user a stage before its producers.
+static LogicalResult
+planStageInputs(ArrayRef<Operation *> inputs, ArrayRef<Stage> stages,
+                DenseMap<Operation *, unsigned> &placement) {
+  for (Operation *op : llvm::reverse(inputs)) {
+    FailureOr<unsigned> stage = findLatestInputStage(op, stages, placement);
+    if (failed(stage))
+      return failure();
+    placement[op] = *stage;
+  }
+  return success();
+}
+
+static void moveStageInputs(ArrayRef<Operation *> inputs,
+                            ArrayRef<Stage> stages,
+                            const DenseMap<Operation *, unsigned> &placement) {
+  SmallVector<Operation *> anchors;
+  for (Stage stage : stages)
+    anchors.push_back(stage.begin);
+  for (Operation *op : inputs) {
+    Operation *&anchor = anchors[placement.lookup(op)];
+    op->moveAfter(anchor);
+    anchor = op;
   }
 }
 
-// Turns a partitioned region into the warp-pipelined clusters.  Returns
-// NotApplicable when the loop has no border markers (user opted out), Created
-// on success, or Malformed when border markers are present but the loop body
-// cannot be split into a valid pipeline (an error is emitted in that case).
-static PipelineResult createPipeline(OpBuilder &b, Location loc,
-                                     scf::ForOp forOp) {
-  Block &blk = *forOp.getBody();
+// This is a cold compiler path. Plan placement before changing the block.
+static LogicalResult normalizeStageInputs(Operation *begin, Operation *end,
+                                          bool hasOwner) {
+  // Match stage construction: only loops, explicit owner scopes, and function
+  // blocks form pipelines. Unowned markers in conditional tails stay in place.
+  if (!begin ||
+      (!hasOwner && !isa<scf::ForOp, tt::FuncOp>(begin->getParentOp())))
+    return success();
+  SmallVector<Stage> stages;
+  if (failed(collectStages(begin, end, stages)))
+    return failure();
+  if (stages.empty() || isSingleIterationOwner(begin, stages, hasOwner))
+    return success();
+  selectStageInputScope(begin, end, stages, hasOwner);
 
-  // Opt-in gate: if the loop body has no borders, the user did not request
-  // warp-pipelining for this loop and we must leave it untouched.
-  if (llvm::none_of(blk, [](Operation &op) { return isPipelineBorder(&op); }))
-    return PipelineResult::NotApplicable;
+  DenseMap<Operation *, unsigned> placement = getFixedStagePlacement(stages);
+  SmallVector<Operation *> inputs;
+  if (failed(collectStageInputs(begin, end, placement, inputs)))
+    return failure();
+  if (failed(planStageInputs(inputs, stages, placement)))
+    return failure();
+  moveStageInputs(inputs, stages, placement);
+  return success();
+}
 
-  SmallVector<Operation *> cluster;
-  SmallVector<BorderMarker> clusterMarkers;
-  SmallVector<SmallVector<Operation *>> clusters;
-  auto ctx = forOp.getContext();
+struct TritonAMDGPUNormalizeWarpPipelinePass
+    : impl::TritonAMDGPUNormalizeWarpPipelineBase<
+          TritonAMDGPUNormalizeWarpPipelinePass> {
+  using Base::Base;
 
-  sinkPureScalarsIntoNextStage(&blk.front(), /*end=*/nullptr);
-
-  // One pass over the body; collect clusters split by explicit borders.
-  for (Operation &opRef : llvm::make_early_inc_range(blk)) {
-    Operation *op = &opRef;
-    if (isPipelineBorder(op)) { // Wrap up one cluster at a border.
-      clusterMarkers.push_back(readBorderMarker(op));
-      addDummyOpIfEmptyCluster(b, loc, op, cluster);
-      clusters.push_back(std::move(cluster));
-      cluster.clear();
-      op->erase(); // Remove the marker.
-      continue;
-    }
-    if (canSitBetweenStages(op)) {
-      // Barrier / async_wait family ops belong between stages,
-      // never inside one.  Encountering one while a cluster is being built
-      // means the user inserted it inside a warp_pipeline_stage region.
-      if (!cluster.empty()) {
-        op->emitError("barrier or wait op cannot appear inside a "
-                      "warp_pipeline_stage region");
-        return PipelineResult::Malformed;
+  void runOnOperation() override {
+    WalkResult result = getOperation().walk([](Block *block) -> WalkResult {
+      if (block->empty())
+        return WalkResult::advance();
+      Operation *begin = &block->front();
+      bool hasOwner = false;
+      for (Operation &op : *block) {
+        bool isBegin = op.hasAttr(kOwnerBeginAttr);
+        if (!isBegin && !op.hasAttr(kOwnerEndAttr))
+          continue;
+        if (failed(normalizeStageInputs(begin, &op, hasOwner)))
+          return WalkResult::interrupt();
+        begin = op.getNextNode();
+        hasOwner = isBegin;
       }
-      continue;
-    }
-    if (isLoopOp(op)) {
-      // Loops are not permitted inside a stage; see isLoopOp for rationale.
-      op->emitError("loop op cannot appear inside a warp_pipeline_stage "
-                    "region; to pipeline loop iterations, place "
-                    "warp_pipeline_stage blocks inside the loop body");
-      return PipelineResult::Malformed;
-    }
-    if (isa<scf::YieldOp>(op)) // End of the loop.
-      break;
-
-    // Keep collecting ops for the current cluster.
-    cluster.push_back(op);
+      return failed(normalizeStageInputs(begin, nullptr, hasOwner))
+                 ? WalkResult::interrupt()
+                 : WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      signalPassFailure();
   }
-  if (!cluster.empty()) { // Create the last cluster if needed.
-    clusters.push_back(std::move(cluster));
-    auto clusterStr = StringAttr::get(ctx, "last_cluster");
-    clusterMarkers.push_back({clusterStr, -1, false});
-  }
+};
 
-  // We only reach here when at least one border existed; a single cluster
-  // means the borders are degenerate (e.g. a lone trailing border with no
-  // operations after it).  Treat as malformed user input.
-  if (clusters.size() < 2) {
-    forOp->emitError(
-        "warp_pipeline_stage borders did not produce at least two stages");
+// Construct only explicit stages. An unassigned operation in a loop or an
+// owner scope means normalization did not establish the placement contract.
+static PipelineResult createStages(OpBuilder &b, Operation *begin,
+                                   Operation *end, bool isFlat, bool bounded) {
+  SmallVector<Stage> stages;
+  if (failed(collectStages(begin, end, stages)))
+    return PipelineResult::Malformed;
+  if (stages.empty())
+    return PipelineResult::NotApplicable;
+  if (stages.size() < 2) {
+    stages.front().begin->emitError(
+        "warp_pipeline_stage requires at least two stages");
     return PipelineResult::Malformed;
   }
-
-  // Materialize each cluster as an execute_region.
-  int totalStages = clusters.size();
-  for (auto &&[stageOps, marker] : llvm::zip(clusters, clusterMarkers)) {
-    if (stageOps.empty())
-      continue;
-    createClusterOp(b, loc, stageOps, marker);
+  if (!bounded) {
+    begin = stages.front().begin;
+    end = stages.back().end->getNextNode();
   }
-
-  // Annotate the loop for the backend.
-  b.setInsertionPoint(forOp);
-  forOp->setAttr("triton.warp_pipeline.pipelined_for", b.getUnitAttr());
-
-  LDBG("[warp-pipeline] total_stages=" << totalStages << "\n");
+  unsigned index = 0;
+  for (Operation *op = begin; op && op != end;) {
+    if (index < stages.size() && op == stages[index].begin) {
+      op = stages[index++].end->getNextNode();
+      continue;
+    }
+    if (!canSitBetweenStages(op) && !op->hasTrait<OpTrait::IsTerminator>()) {
+      op->emitError(
+          "unassigned operation outside warp_pipeline_stage; "
+          "run warp-pipeline normalization before stage construction");
+      return PipelineResult::Malformed;
+    }
+    op = op->getNextNode();
+  }
+  for (Stage stage : stages) {
+    SmallVector<Operation *> ops;
+    for (Operation *op = stage.begin->getNextNode(); op != stage.end;
+         op = op->getNextNode())
+      ops.push_back(op);
+    addDummyOpIfEmptyCluster(b, stage.begin->getLoc(), stage.end, ops);
+    createClusterOp(b, stage.begin->getLoc(), ops, readBorderMarker(stage.end),
+                    isFlat);
+    stage.begin->erase();
+    stage.end->erase();
+  }
   return PipelineResult::Created;
 }
 
-// Create a pipelined region from flat (non-loop) border markers in a block.
-// This handles the case where a loop was unrolled at the Python level
-// (e.g. via static_range) but the body still has warp_pipeline_stage
-// annotations producing border markers.  The grouping logic mirrors
-// createPipeline but without a loop wrapper.
-//
-// Returns NotApplicable when the block has no border markers, Created when
-// a flat pipeline was materialized, or Malformed when borders are present
-// but a valid pipeline could not be built (an error is emitted in that case).
+static PipelineResult createPipeline(OpBuilder &b, scf::ForOp forOp) {
+  PipelineResult result = createStages(b, &forOp.getBody()->front(), nullptr,
+                                       /*isFlat=*/false, /*bounded=*/true);
+  if (result == PipelineResult::Created)
+    forOp->setAttr("triton.warp_pipeline.pipelined_for", b.getUnitAttr());
+  return result;
+}
+
 static PipelineResult createFlatPipeline(OpBuilder &b, Block &block,
                                          Operation *scopeBegin = nullptr,
                                          Operation *scopeEnd = nullptr) {
-  assert((!scopeBegin || scopeBegin->getBlock() == &block) &&
-         (!scopeEnd || scopeEnd->getBlock() == &block));
-
-  // 1. Find all border markers in this block.
-  SmallVector<Operation *> allBorders;
-  // scopeBegin/scopeEnd are exclusive owner-boundary markers. With no scope,
-  // preserve the existing whole-block flat-pipeline behavior.
-  Operation *firstInScope =
-      scopeBegin ? scopeBegin->getNextNode() : &block.front();
-  for (Operation *op = firstInScope; op && op != scopeEnd;
-       op = op->getNextNode())
-    if (isPipelineBorder(op))
-      allBorders.push_back(op);
-
-  // No borders at all means the block did not opt into flat pipelining.
-  if (allBorders.empty())
-    return PipelineResult::NotApplicable;
-
-  // A single border cannot form a 2-stage pipeline; treat as malformed input
-  // since the user did opt in (the lone border would otherwise leak through
-  // unprocessed).
-  if (!scopeEnd && allBorders.size() < 2) {
-    allBorders.front()->emitError(
-        "warp_pipeline_stage requires at least two borders to form a flat "
-        "pipeline");
-    return PipelineResult::Malformed;
-  }
-
-  Location loc = allBorders.front()->getLoc();
-  Operation *firstBorder = allBorders.front();
-  Operation *lastBorder = allBorders.back();
-
-  // 2. For flat pipelines, stage 0 may include the ops immediately before the
-  //    first border.  Stop at ops that must stay outside this pipeline.
-  Operation *regionStart = nullptr;
-  if (scopeBegin) {
-    regionStart = firstInScope;
-  } else {
-    regionStart = firstBorder;
-    for (Operation *op = firstBorder->getPrevNode(); op;
-         op = op->getPrevNode()) {
-      if (isLoopOp(op) || isa<tt::amdgpu::CondBarrierOp>(op) ||
-          canSitBetweenStages(op))
-        break;
-      regionStart = op;
-    }
-  }
-
-  sinkPureScalarsIntoNextStage(regionStart, scopeEnd);
-  if (scopeBegin)
-    regionStart = scopeBegin->getNextNode();
-
-  // 3. Sweep forward from regionStart, splitting ops into clusters at each
-  //    border.  Mirrors createPipeline's main loop, but bounded by lastBorder
-  //    instead of scf.yield.
-  SmallVector<Operation *> cluster;
-  SmallVector<BorderMarker> clusterMarkers;
-  SmallVector<SmallVector<Operation *>> clusters;
-
-  for (auto it = Block::iterator(regionStart); it != block.end();) {
-    Operation *op = &*it;
-    ++it;
-
-    if (op == scopeEnd)
-      break;
-
-    if (isPipelineBorder(op)) {
-      clusterMarkers.push_back(readBorderMarker(op));
-      addDummyOpIfEmptyCluster(b, loc, op, cluster);
-      clusters.push_back(std::move(cluster));
-      cluster.clear();
-
-      bool isLast = !scopeEnd && (op == lastBorder);
-      op->erase();
-      if (isLast)
-        break;
-      continue;
-    }
-
-    if (canSitBetweenStages(op)) {
-      // Same rule as createPipeline: barriers/waits cannot live inside a
-      // stage.
-      if (!cluster.empty()) {
-        op->emitError("barrier or wait op cannot appear inside a "
-                      "warp_pipeline_stage region");
-        return PipelineResult::Malformed;
-      }
-      continue;
-    }
-
-    if (isLoopOp(op)) {
-      // Same rule as createPipeline: loops cannot live inside a stage.
-      op->emitError("loop op cannot appear inside a warp_pipeline_stage "
-                    "region; to pipeline loop iterations, place "
-                    "warp_pipeline_stage blocks inside the loop body");
-      return PipelineResult::Malformed;
-    }
-
-    cluster.push_back(op);
-  }
-
-  if (scopeEnd && !cluster.empty()) {
-    clusters.push_back(std::move(cluster));
-    auto clusterStr = StringAttr::get(b.getContext(), "last_cluster");
-    clusterMarkers.push_back({clusterStr, -1, false});
-  }
-
-  // 4. The bounded sweep should produce at least two clusters.
-  if (clusters.size() < 2) {
-    mlir::emitError(
-        loc, "warp_pipeline_stage borders did not produce at least two stages");
-    return PipelineResult::Malformed;
-  }
-
-  for (auto &&[stageOps, marker] : llvm::zip(clusters, clusterMarkers)) {
-    if (stageOps.empty())
-      continue;
-    createClusterOp(b, loc, stageOps, marker, /*isFlat=*/true);
-  }
-
-  LDBG("[warp-pipeline] flat pipeline with " << clusters.size() << " stages");
-  return PipelineResult::Created;
+  return createStages(
+      b, scopeBegin ? scopeBegin->getNextNode() : &block.front(), scopeEnd,
+      /*isFlat=*/true, /*bounded=*/scopeBegin != nullptr);
 }
 
 // Preserve the identity of the loop that directly owns stage borders before
@@ -494,8 +518,9 @@ struct TritonAMDGPUPreserveWarpPipelineOwnersPass
         // A zero/single-trip loop cannot overlap different loop iterations.
         // Keep the kernel as an autotuning candidate, but make its warp-stage
         // annotations a no-op instead of phase-shifting an enclosing loop.
-        for (Operation *border : borders)
-          border->erase();
+        for (Operation &op : llvm::make_early_inc_range(*owner.getBody()))
+          if (isPipelineBorder(&op) || op.hasAttr(kStageBeginAttr))
+            op.erase();
         continue;
       }
 
@@ -568,8 +593,12 @@ static LogicalResult recoverFlattenedOwnerScopes(OpBuilder &builder,
         // Canonicalization flattened exactly one copy of the owner body. It
         // cannot overlap loop iterations, so retain the operations but erase
         // the scheduling-only stage borders.
-        for (Operation *border : directBorders)
-          border->erase();
+        for (Operation *op = scope.begin->getNextNode(); op != scope.end;) {
+          Operation *next = op->getNextNode();
+          if (isPipelineBorder(op) || op->hasAttr(kStageBeginAttr))
+            op->erase();
+          op = next;
+        }
         scope.begin->erase();
         scope.end->erase();
         continue;
@@ -600,8 +629,7 @@ struct TritonAMDGPUWarpPipelinePass
         continue;
       }
       funcOp.walk([&](scf::ForOp forOp) {
-        Location loc = forOp.getLoc();
-        switch (createPipeline(builder, loc, forOp)) {
+        switch (createPipeline(builder, forOp)) {
         case PipelineResult::NotApplicable:
           LDBG("scf.for has no warp_pipeline_stage borders; skipping");
           break;

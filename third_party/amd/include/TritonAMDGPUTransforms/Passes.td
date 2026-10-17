@@ -401,6 +401,20 @@ def TritonAMDGPUPreserveWarpPipelineOwners
   let dependentDialects = ["mlir::ROCDL::ROCDLDialect"];
 }
 
+def TritonAMDGPUNormalizeWarpPipeline
+    : Pass<"tritonamdgpu-normalize-warp-pipeline", "mlir::ModuleOp"> {
+  let summary = "Place compiler-generated inputs inside warp-pipeline stages";
+
+  let description = [{
+    Run after layout propagation and loop unrolling, before warp-pipeline
+    stage construction. Keep operations inside explicit begin/end markers in
+    their stages. Assign operations outside those markers to the latest stage
+    that dominates every use. Move only pure scalar operations and layout
+    conversions that need no shared memory. Keep operand order and stay in the
+    same block and owner scope. Report an error if no legal stage exists.
+  }];
+}
+
 def TritonAMDGPUWarpPipeline
     : Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp"> {
   let summary = "partition and pipeline";
