@@ -29,6 +29,22 @@ namespace mlir {
 
 using namespace triton;
 
+bool containsPinnedEncoding(Attribute encoding) {
+  if (!encoding)
+    return false;
+  if (isa<triton::gpu::PinnedEncodingTrait>(encoding))
+    return true;
+
+  bool pinned = false;
+  encoding.walkImmediateSubElements(
+      [&](Attribute nested) {
+        if (!pinned)
+          pinned = containsPinnedEncoding(nested);
+      },
+      [](Type) {});
+  return pinned;
+}
+
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
                                                 Type eltType, int numWarps) {
@@ -119,22 +135,6 @@ unsigned getElementBitWidth(RankedTensorType type) {
           ? cast<PointerType>(type.getElementType()).getPointeeType()
           : type.getElementType();
   return typeForMem.getIntOrFloatBitWidth();
-}
-
-bool containsPinnedEncoding(Attribute encoding) {
-  if (!encoding)
-    return false;
-  if (isa<triton::gpu::PinnedEncodingTrait>(encoding))
-    return true;
-
-  bool pinned = false;
-  encoding.walkImmediateSubElements(
-      [&](Attribute nested) {
-        if (!pinned)
-          pinned = containsPinnedEncoding(nested);
-      },
-      [](Type) {});
-  return pinned;
 }
 
 static std::optional<unsigned>
