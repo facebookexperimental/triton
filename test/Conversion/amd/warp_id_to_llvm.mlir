@@ -40,7 +40,11 @@ module {
   // WS-SAME: tritonamdgpu.wave_specialized
   // WS: %[[TID:.*]] = rocdl.workitem.id.x
   // WS: %[[P:.*]] = llvm.icmp "eq"
-  // WS-NEXT: llvm.cond_br %[[P]], ^[[TRUE:bb[0-9]+]], ^[[FALSE:bb[0-9]+]]
+  // WS-NEXT: %[[EXT:.*]] = llvm.zext %[[P]]
+  // WS-NEXT: %[[FREEZE:.*]] = llvm.freeze %[[EXT]]
+  // WS-NEXT: %[[BROADCAST:.*]] = rocdl.readfirstlane %[[FREEZE]]
+  // WS-NEXT: %[[DISPATCH:.*]] = llvm.trunc %[[BROADCAST]]
+  // WS-NEXT: llvm.cond_br %[[DISPATCH]], ^[[TRUE:bb[0-9]+]], ^[[FALSE:bb[0-9]+]]
   // WS: ^[[TRUE]]:
   // WS-NEXT: %[[T:.*]] = llvm.mlir.constant(true)
   // WS: llvm.store
@@ -196,6 +200,46 @@ module {
     llvm.return
   ^no(%b: i32):
     llvm.store %b, %out : i32, !llvm.ptr
+    llvm.return
+  }
+
+  // Fused TDM selects a descriptor pair using ((3 >> wave_id) & 1) != 0.
+  // Its selectors can be emitted in several blocks inside the persistent loop.
+  // Only one slice is extracted; every equivalent selector is specialized.
+  // CLEAN-LABEL: llvm.func @fused_tdm_selectors
+  // CLEAN-SAME: tritonamdgpu.wave_specialized
+  // CLEAN: rocdl.wave.id
+  // CLEAN: llvm.icmp "ne"
+  // CLEAN: llvm.freeze
+  // CLEAN: llvm.cond_br
+  // CLEAN-NOT: llvm.select
+  // CLEAN: llvm.return
+  llvm.func @fused_tdm_selectors(%out: !llvm.ptr, %n: i32,
+                                 %a: vector<4xi32>, %b: vector<4xi32>) {
+    %wave = rocdl.wave.id : i32
+    %zero = llvm.mlir.constant(0 : i32) : i32
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %mask = llvm.mlir.constant(3 : i32) : i32
+    llvm.br ^loop(%zero : i32)
+  // Deliberately put a dominated block before its dominator in textual order.
+  ^later:
+    %shift2 = llvm.lshr %mask, %wave : i32
+    %bit2 = llvm.and %shift2, %one : i32
+    %p2 = llvm.icmp "ne" %bit2, %zero : i32
+    %v2 = llvm.select %p2, %a, %b : i1, vector<4xi32>
+    llvm.store %v2, %out : vector<4xi32>, !llvm.ptr
+    %next = llvm.add %i, %one : i32
+    %more = llvm.icmp "slt" %next, %n : i32
+    llvm.cond_br %more, ^loop(%next : i32), ^exit
+  ^loop(%i: i32):
+    rocdl.s.barrier
+    %shift = llvm.lshr %mask, %wave : i32
+    %bit = llvm.and %shift, %one : i32
+    %p = llvm.icmp "ne" %bit, %zero : i32
+    %v = llvm.select %p, %a, %b : i1, vector<4xi32>
+    llvm.store %v, %out : vector<4xi32>, !llvm.ptr
+    llvm.br ^later
+  ^exit:
     llvm.return
   }
 }

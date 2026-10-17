@@ -5,7 +5,8 @@ Status: initial implementation. The reusable MLIR uniformity analysis is in
 AMD pass is in
 `third_party/amd/lib/TritonAMDGPUTransforms/AutomaticWaveSpecialization.cpp`,
 and `HIPOptions.enable_wave_specialization` gates the pipeline. The implementation
-selects one entry-available predicate and creates two versions.
+selects one invariant predicate (including equivalent repeated definitions),
+extracts its slice to entry, and creates two versions.
 
 ## Objective
 
@@ -113,7 +114,11 @@ exit behavior when redirecting returns.
 
 Values defined in the extracted prefix dominate both versions. Substitute
 selected predicates only in the cloned bodies; the dispatch uses their original
-runtime values. Every retained CFG edge targets the corresponding block in its
+runtime values. Before dispatch, freeze a zero-extended predicate and broadcast
+the chosen bit with `readfirstlane`. This keeps dispatch defined and uniform even
+when a speculated computation produces poison on a path that originally did not
+use it. Defined uniform predicates retain their original value.
+Every retained CFG edge targets the corresponding block in its
 own version, except edges to the common exit. The pass does not require retaining
 SCF through TTGIR lowering or reconstructing `scf.if` around existing CFGs.
 
@@ -302,12 +307,14 @@ synchronization semantics to justify movement. Loads cannot move across possibly
 aliasing writes just because their addresses are uniform. Speculation must not
 introduce executions that were absent on the original path.
 
-Initially extract from the entry basic block and clone the complete remaining
-CFG, including all loop blocks. Predicates in other blocks require safe hoisting
-to entry or remain ineligible. Do not linearize operations from different paths
-into the prefix without ordinary motion/speculation legality. Do not extract a
-whole original loop merely to obtain a predicate computed by that loop in the
-first implementation.
+Discover predicates throughout the CFG and clone the complete remaining CFG,
+including all loop blocks. For predicates outside entry, require every non-entry
+dependency to be movable, with all dependency leaves being entry arguments or
+operations in the slice. Reject non-entry block arguments, including induction
+variables and loop-carried state. This admits loop-invariant fused-TDM selectors
+without extracting an original loop. Order the slice along its dominance chain,
+preserving operation order within each source block even when blocks are printed
+in a different order.
 
 Plan extraction and cloning before mutating the kernel. Failure to construct a
 legal plan leaves the original body intact.
@@ -415,10 +422,17 @@ operations. No fine-grained region-placement heuristic is required.
 
 The current ranking assigns one point per entry-block use and four per use in
 other blocks, doubling the weight of select and conditional-branch conditions.
+Vector selects are additionally weighted by their element count. Structurally
+equivalent invariant predicates are grouped, ignoring locations, and their use
+scores are combined. Extract only a representative slice and substitute all
+equivalent results in each body. This handles the repeated A/B descriptor
+selectors emitted by fused TDM loads without extracting descriptor computations.
+
 Candidates need at least two points. Ties prefer a smaller prefix, then source
-order. The `max-extra-ops` pass parameter defaults to 4096 and bounds the estimated
+order. The `max-extra-ops` pass parameter defaults to 65536 and bounds the estimated
 extra body plus dispatch operations before mutation; it is not a machine-code
-size or register-pressure model.
+size or register-pressure model. The original 4096-operation limit rejected
+gfx1250 grouped GEMM, whose 256x256 lowered body contains roughly 29,400 operations.
 
 After a split, use constant propagation, CFG simplification, and dead-code
 elimination under the branch assumptions. These may remove unreachable blocks
@@ -572,6 +586,15 @@ Current regression coverage is in:
   comparing enabled/disabled kernels with alternating waves exchanging values
   through LDS over 1, 2, and 7 iterations. Both versions retain the original LDS
   allocation size. This test has passed on an MI350X (gfx950).
+- `python/test/unit/language/test_tlx_amd_gfx1250.py`: packed/list grouped GEMM
+  compile regressions verifying that specialization removes fused-TDM vector
+  descriptor selects and preserves shared-memory allocation.
+
+For gfx1250 grouped GEMM, the selector `((3 >> wave_id) & 1) != 0` divides the
+waves between the A and B descriptors. Packed clustered and ragged list kernels
+have passed off/on correctness comparisons on the gfx1250 functional simulator
+with bitwise-identical outputs. This is simulator validation, not a hardware
+performance result; the larger body versions increase code size.
 
 These checks establish functional behavior for the covered cases. Representative
 performance, register-pressure, and code-size characterization remains future

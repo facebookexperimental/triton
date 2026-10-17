@@ -5,17 +5,17 @@ include "mlir/Pass/PassBase.td"
 
 def TritonAMDGPUAutomaticWaveSpecialization
     : Pass<"tritonamdgpu-automatic-wave-specialization", "mlir::ModuleOp"> {
-  let summary = "Version a lowered kernel body on an entry wave-uniform predicate";
+  let summary = "Version a lowered kernel body on an invariant wave-uniform predicate";
   let description = [{
     Extract an ordered common prefix and clone the complete remaining LLVM CFG
     into two versions. Substitute the selected predicate in each version.
     Run after shared-memory allocation and LLVM/ROCDL lowering.
   }];
-  let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+  let dependentDialects = ["mlir::LLVM::LLVMDialect", "mlir::ROCDL::ROCDLDialect"];
   let options = [
     Option<"waveSize", "wave-size", "unsigned", "64",
            "Target wave size (32 or 64) for workitem ID inference">,
-    Option<"maxExtraOps", "max-extra-ops", "unsigned", "4096",
+    Option<"maxExtraOps", "max-extra-ops", "unsigned", "65536",
            "Maximum estimated additional operations from body versioning">
   ];
 }

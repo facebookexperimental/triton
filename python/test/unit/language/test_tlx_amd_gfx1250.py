@@ -803,6 +803,55 @@ def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size, in
     assert (" multicast " in compiled.asm["ttgir"]) == (multicast and cluster_size > 1)
 
 
+@pytest.mark.parametrize("interface", ["packed", "list"])
+def test_wave_specialization_grouped_gemm_fused(interface, monkeypatch):
+    from triton.backends.amd.compiler import HIPBackend
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    constants = dict(NUM_PROGRAMS=16, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, NUM_BUFFERS=2,
+                     L2_PREFETCH_DISTANCE=0, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=2, NUM_XCDS=8,
+                     XCD_CHUNK=2, K=512, group_size=2, CLUSTER_SIZE=4, CLUSTER_MULTICAST=True)
+    if interface == "packed":
+        kernel = _gfx1250_grouped.grouped_gemm_tdm_kernel
+        signature = _gfx1250_grouped._grouped_gemm_tdm_compile_signature()
+        attrs = _gfx1250_grouped._grouped_gemm_tdm_compile_attrs()
+    else:
+        kernel = _gfx1250_grouped.grouped_gemm_tdm_list_kernel
+        signature = _gfx1250_grouped._grouped_gemm_tdm_list_compile_signature()
+        attrs = _gfx1250_grouped._grouped_gemm_tdm_list_compile_attrs()
+        constants["ALLOW_MN_TAILS"] = False
+    original = HIPBackend.make_llir
+    lowered = []
+
+    def capture(src, metadata, options):
+        result = original(src, metadata, options)
+        lowered.append(str(src))
+        return result
+
+    monkeypatch.setattr(HIPBackend, "make_llir", staticmethod(capture))
+    kernels = []
+    for enabled in (False, True):
+        source = ASTSource(kernel, signature={k: v
+                                              for k, v in signature.items()
+                                              if k not in constants}, constexprs=constants, attrs=attrs)
+        kernels.append(
+            triton.compile(
+                source,
+                target=GPUTarget("hip", "gfx1250", 32),
+                options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(4, 1, 1), enable_wave_specialization=enabled),
+            ))
+        assert ("tritonamdgpu.wave_specialized" in lowered[-1]) == enabled
+        descriptor_selects = [
+            line for line in lowered[-1].splitlines()
+            if "llvm.select" in line and ("vector<4xi32>" in line or "vector<8xi32>" in line)
+        ]
+        assert bool(descriptor_selects) != enabled
+    assert kernels[0].metadata.shared == kernels[1].metadata.shared
+    assert kernels[0].asm["hsaco"] != kernels[1].asm["hsaco"]
+
+
 @pytest.mark.parametrize("dims,num_ctas,arch", [
     ((3, 1, 1), 1, "gfx1250"),
     ((4, 2, 1), 1, "gfx1250"),

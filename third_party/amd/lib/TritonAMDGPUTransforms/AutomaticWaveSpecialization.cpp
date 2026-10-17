@@ -1,5 +1,6 @@
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -40,6 +41,7 @@ bool isWaveId(Operation *op, unsigned waveSize) {
 
 struct Plan {
   Value predicate;
+  SmallVector<Value> equivalents;
   SmallVector<Operation *> prefix;
   unsigned score = 0;
 };
@@ -60,7 +62,7 @@ bool movable(Operation *op) {
 }
 
 std::optional<Plan> planFor(Value predicate, Block &entry, unsigned bodySize,
-                            unsigned maxExtraOps) {
+                            unsigned maxExtraOps, DominanceInfo &dominance) {
   llvm::SmallPtrSet<Operation *, 32> slice;
   SmallVector<Value> worklist{predicate};
   while (!worklist.empty()) {
@@ -71,8 +73,11 @@ std::optional<Plan> planFor(Value predicate, Block &entry, unsigned bodySize,
       continue;
     }
     Operation *def = value.getDefiningOp();
-    if (def->getBlock() != &entry || def->getNumRegions() ||
-        def->hasTrait<OpTrait::IsTerminator>())
+    if (def->getNumRegions() || def->hasTrait<OpTrait::IsTerminator>())
+      return std::nullopt;
+    // Every non-entry dependency must be safe to execute before any original
+    // control flow. Non-entry block arguments reject loop-carried recurrences.
+    if (def->getBlock() != &entry && !movable(def))
       return std::nullopt;
     if (slice.insert(def).second)
       llvm::append_range(worklist, def->getOperands());
@@ -80,6 +85,7 @@ std::optional<Plan> planFor(Value predicate, Block &entry, unsigned bodySize,
 
   Plan plan;
   plan.predicate = predicate;
+  plan.equivalents.push_back(predicate);
   bool crossedRetained = false;
   for (Operation &op : entry) {
     if (!slice.contains(&op)) {
@@ -94,8 +100,24 @@ std::optional<Plan> planFor(Value predicate, Block &entry, unsigned bodySize,
     }
     plan.prefix.push_back(&op);
   }
-  // One extra body, two constants, entry/leaf/exit branches and common return.
-  if (bodySize - plan.prefix.size() + 7 > maxExtraOps) {
+  for (Block &block : *entry.getParent()) {
+    if (&block == &entry)
+      continue;
+    for (Operation &op : block)
+      if (slice.contains(&op))
+        plan.prefix.push_back(&op);
+  }
+  // With no non-entry block arguments, the slice lies on the definition's
+  // dominance chain. Preserve order within each block, and order those blocks
+  // by dominance rather than their arbitrary textual layout.
+  llvm::stable_sort(plan.prefix, [&](Operation *a, Operation *b) {
+    if (a->getBlock() == b->getBlock())
+      return a->isBeforeInBlock(b);
+    return dominance.dominates(a->getBlock(), b->getBlock());
+  });
+  // One extra body, two constants, entry/leaf/exit branches, common return,
+  // and four operations to normalize the dispatch predicate.
+  if (bodySize - plan.prefix.size() + 11 > maxExtraOps) {
     LLVM_DEBUG(llvm::dbgs()
                << "Code-growth limit rejects " << predicate << "\n");
     return std::nullopt;
@@ -109,9 +131,30 @@ std::optional<Plan> planFor(Value predicate, Block &entry, unsigned bodySize,
     if (isa<LLVM::SelectOp, LLVM::CondBrOp>(user) &&
         use.getOperandNumber() == 0)
       weight *= 2;
+    if (auto select = dyn_cast<LLVM::SelectOp>(user))
+      if (auto type = dyn_cast<VectorType>(select.getType()))
+        weight *= type.getNumElements();
     plan.score += weight;
   }
-  return plan.score >= 2 ? std::optional<Plan>(std::move(plan)) : std::nullopt;
+  return plan;
+}
+
+// Repeated lowered fused loads build the same selector in different blocks.
+// Group their invariant expression trees without moving all their definitions
+// to the prefix. Only the representative slice is extracted; every equivalent
+// result is substituted in each clone and ordinary DCE removes the duplicates.
+bool equivalent(Value lhs, Value rhs) {
+  if (lhs == rhs)
+    return true;
+  auto l = dyn_cast<OpResult>(lhs);
+  auto r = dyn_cast<OpResult>(rhs);
+  if (!l || !r || l.getResultNumber() != r.getResultNumber() ||
+      !movable(l.getOwner()) || !movable(r.getOwner()))
+    return false;
+  return OperationEquivalence::isEquivalentTo(
+      l.getOwner(), r.getOwner(),
+      [](Value a, Value b) { return success(equivalent(a, b)); }, nullptr,
+      OperationEquivalence::IgnoreLocations);
 }
 
 void specialize(LLVM::LLVMFuncOp function, const Plan &plan) {
@@ -123,11 +166,23 @@ void specialize(LLVM::LLVMFuncOp function, const Plan &plan) {
   for (Operation *op : plan.prefix)
     op->moveBefore(&entry, entry.end());
 
+  OpBuilder builder(function.getContext());
+  Location loc = function.getLoc();
+  builder.setInsertionPointToEnd(&entry);
+  // Speculating a pure predicate can produce poison on a path that originally
+  // did not use it. Freeze before branching, and broadcast that choice so all
+  // lanes still enter the same version. Defined uniform predicates are
+  // unchanged.
+  Value dispatch =
+      LLVM::ZExtOp::create(builder, loc, builder.getI32Type(), plan.predicate);
+  dispatch = LLVM::FreezeOp::create(builder, loc, dispatch);
+  dispatch = ROCDL::ReadfirstlaneOp::create(builder, loc, builder.getI32Type(),
+                                            dispatch);
+  dispatch = LLVM::TruncOp::create(builder, loc, builder.getI1Type(), dispatch);
+
   Region original;
   original.getBlocks().splice(original.end(), body.getBlocks(),
                               std::next(body.begin()), body.end());
-  OpBuilder builder(function.getContext());
-  Location loc = function.getLoc();
   Block *exit = new Block;
   body.push_back(exit);
   builder.setInsertionPointToEnd(exit);
@@ -146,6 +201,12 @@ void specialize(LLVM::LLVMFuncOp function, const Plan &plan) {
     // Region::cloneInto creates all blocks and remaps forward edges, backedges,
     // arguments and SSA references, independent of source block layout.
     original.cloneInto(&body, exit->getIterator(), mapping);
+    // cloneInto creates new results for equivalent definitions retained in
+    // the body. Substitute those results after cloning has installed its map.
+    for (Value predicate : plan.equivalents)
+      if (Value cloned = mapping.lookupOrNull(predicate);
+          cloned && cloned != constant)
+        cloned.replaceAllUsesWith(constant);
     LLVM::BrOp::create(builder, loc, ValueRange{},
                        mapping.lookup(&original.front()));
     for (Block &block : original) {
@@ -158,7 +219,7 @@ void specialize(LLVM::LLVMFuncOp function, const Plan &plan) {
     }
   }
   builder.setInsertionPointToEnd(&entry);
-  LLVM::CondBrOp::create(builder, loc, plan.predicate, leaves[0], leaves[1]);
+  LLVM::CondBrOp::create(builder, loc, dispatch, leaves[0], leaves[1]);
   function->setAttr(specializedAttr, builder.getUnitAttr());
 }
 
@@ -214,7 +275,8 @@ struct AutomaticWaveSpecialization
         return signalPassFailure();
       }
       Block &entry = function.getBody().front();
-      std::optional<Plan> best;
+      DominanceInfo dominance(function);
+      SmallVector<Plan> groups;
       auto consider = [&](Value value) {
         Attribute attr;
         if (!value.getType().isInteger(1) ||
@@ -225,28 +287,44 @@ struct AutomaticWaveSpecialization
                      << "Not proven wave-uniform: " << value << "\n");
           return;
         }
-        auto plan = planFor(value, entry, bodySize, maxExtraOps);
-        if (plan && (!best || plan->score > best->score ||
-                     (plan->score == best->score &&
-                      plan->prefix.size() < best->prefix.size())))
-          best = std::move(plan);
+        auto plan = planFor(value, entry, bodySize, maxExtraOps, dominance);
+        if (!plan)
+          return;
+        for (Plan &group : groups) {
+          if (!equivalent(group.predicate, value))
+            continue;
+          group.score += plan->score;
+          group.equivalents.push_back(value);
+          return;
+        }
+        groups.push_back(std::move(*plan));
       };
       for (BlockArgument arg : entry.getArguments())
         consider(arg);
-      for (Operation &op : entry)
-        for (Value result : op.getResults())
-          consider(result);
+      for (Block &block : function.getBody())
+        for (Operation &op : block)
+          for (Value result : op.getResults())
+            consider(result);
+      Plan *best = nullptr;
+      for (Plan &group : groups)
+        if (group.score >= 2 && (!best || group.score > best->score ||
+                                 (group.score == best->score &&
+                                  group.prefix.size() < best->prefix.size())))
+          best = &group;
       if (!best) {
-        LLVM_DEBUG(llvm::dbgs()
-                   << function.getSymName()
-                   << ": no useful uniform entry predicate within extraction "
-                      "and code-growth limits\n");
+        LLVM_DEBUG(
+            llvm::dbgs()
+            << function.getSymName()
+            << ": no useful invariant uniform predicate within extraction "
+               "and code-growth limits\n");
         continue;
       }
-      LLVM_DEBUG(llvm::dbgs() << function.getSymName() << ": specializing "
-                              << best->predicate << ", prefix "
-                              << best->prefix.size() << ", extra body "
-                              << bodySize - best->prefix.size() << " ops\n");
+      LLVM_DEBUG(llvm::dbgs()
+                 << function.getSymName() << ": specializing "
+                 << best->predicate << ", prefix " << best->prefix.size()
+                 << ", extra body " << bodySize - best->prefix.size()
+                 << " ops, " << best->equivalents.size()
+                 << " equivalent predicates\n");
       specialize(function, *best);
     }
   }
