@@ -2,5 +2,5 @@
   "priority": 0,
   "backends": [],
   "architectures": [],
-  "documents": ["layout-conversion-efficiency.md"]
+  "documents": ["layout-conversion-efficiency.md", "loop-unrolling.md"]
 }
