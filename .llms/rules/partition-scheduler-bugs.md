@@ -309,6 +309,12 @@
 - **Tests**: `ws_memory_planner_cvt_scratch_budget.mlir` (real pre-planner IR; A=3/B=2 with `reserve-auxiliary-smem=false`, A=2/B=2 with the reservation). `ws_fa_bwd_idx3_store_wait_pipeline.mlir` now reserves 4096 B of conversion scratch, so its tuned budget moved from 202000 to 206096 to keep the same dV/dK copy split.
 - **Key insight**: an `OutOfResources` from a WS kernel never reaches the user under Inductor, because it degrades to `num_stages=1`. A planner budget miss shows up as a slow kernel, not an error.
 
+### 42. Phase 3.6 lands a TMA staging buffer on another staging buffer → cross-tile WAR token dropped (2026-10-16, fixed)
+- **Symptom**: Silent wrong output (about 45% of elements, unstable across relaunches) in a persistent autoWS GEMM with two TMEM accumulators whose fp32 tiles are both TMA-stored through one descriptor under `separate_epilogue_store=True` (MRS e92, `B_MODE=fused`, BM64 BN128 BK128 `num_stages=1`). SES=0 and non-persistent are correct.
+- **Root cause**: the plan is over budget, so Phase 3.6 (`WSMemoryPlanner.cpp`, `findReuseCandidate`) picks hosts for both staging buffers: staging 4 → staging 5, then staging 5 → operand 9. `mergeStagingReuseIntoHost` never realizes a staging host, so 4 stays standalone and the planner under-counted SMEM. Worse, Step 7.5 (`WSCodePartition.cpp`) resolves each pair's "load" task from the host channel's producer: the staging fill task for 4→5, the real load task for 5→9. The pairs disagree, so it only logged "unhandled" and inserted no cross-tile WAR token, yet 5→9 was still realized: the next tile's operand load could overwrite staging 5 while its TMA store was reading it.
+- **Fix**: `findReuseCandidate` skips TMA staging targets (and any target in the candidate's own `buffer.id` group), so the planner only proposes realizable reuses and counts SMEM honestly. The Step 7.5 side (collect only realizable pairs; drop any reuse it cannot guard) is the companion e5 fix.
+- **Lit test**: `ws_memory_planner_staging_no_staging_reuse.mlir` (real pre-planner e92 IR: staging 4 → operand 9, staging 5 → operand 12, and planner + code partition emit the WAR token and realize both reuses). Fails on the unfixed planner.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
