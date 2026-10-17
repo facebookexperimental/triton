@@ -11,6 +11,10 @@ add_triton_library(TritonGPUIR
   TritonGPUAttrDefsIncGen
   TritonGPUTypeInterfacesIncGen
   TritonGPUOpInterfacesIncGen
+  TLXTableGen
+  TLXTypesIncGen
+  TLXLayoutInterfaceIncGen
+  TLXAttrDefsIncGen
 
   LINK_LIBS PUBLIC
   MLIRGPUDialect
