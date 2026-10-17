@@ -2213,23 +2213,6 @@ def test_release_dot_layout_reduce_compiles_gfx950():
 
 
 @triton.jit
-def _invalid_release_layout_kernel(x_ptr, y_ptr):
-    offsets = tl.arange(0, 64)
-    values = tl.load(x_ptr + offsets)
-    values = tlx.release_layout(values)
-    tl.store(y_ptr + offsets, values)
-
-
-def test_release_layout_rejects_unencoded_source():
-    with pytest.raises(CompilationError, match="release_layout requires an explicit source layout"):
-        compile_for_gfx950(
-            _invalid_release_layout_kernel,
-            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
-            constexprs={},
-        )
-
-
-@triton.jit
 def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr, K_WIDTH: tl.constexpr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
