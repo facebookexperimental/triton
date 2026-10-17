@@ -393,6 +393,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<64x32xf16, #[[SW64]]>
 // CHECK: ttg.local_alloc %{{.*}} -> !ttg.memdesc<64x32xf16, #[[SW64]]
 // CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
+// A B filled by TMA is not written from registers, so it stays untagged.
+// CHECK-NOT: two_cta_register_b
 
 #blocked_s = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1_s = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -419,6 +421,51 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %acc_tmem, %token = ttng.tmem_alloc %acc_layout : (tensor<128x64xf32, #blocked3_s>) -> (!ttg.memdesc<128x64xf32, #tmem_s, #ttng.tensor_memory, mutable>, !ttg.async.token)
 
     %mma_token = ttng.tc_gen5_mma %a_smem, %b_smem, %acc_tmem[%token], %true, %true {two_ctas} : !ttg.memdesc<128x64xf16, #shared_s, #smem_s>, !ttg.memdesc<64x64xf16, #shared_s, #smem_s>, !ttg.memdesc<128x64xf32, #tmem_s, #ttng.tensor_memory, mutable>
+
+    tt.return
+  }
+}
+
+// -----
+
+// Test: a B tile transposed in registers (tt.trans) before its local_alloc is
+// written to shared memory from registers, so the split MMA is tagged
+// two_cta_register_b for a cluster-scoped fence. A B that is a plain
+// descriptor load (above) is filled by TMA and stays untagged.
+// CHECK-LABEL: @matmul_2cta_register_trans_b
+// CHECK: tt.descriptor_load {{.*}} -> tensor<32x64xf16
+// CHECK: tt.trans
+// CHECK: ttg.local_alloc {{.*}} -> !ttg.memdesc<64x32xf16
+// CHECK: ttng.tc_gen5_mma {{.*}} {two_cta_register_b, two_ctas}
+
+#blocked_t = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1_t = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked2_t = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+#blocked3_t = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared_t = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared_tt = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem_t = #ttg.shared_memory
+#tmem_t = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @matmul_2cta_register_trans_b(
+      %a_desc: !tt.tensordesc<128x64xf16, #shared_t>,
+      %b_desc: !tt.tensordesc<64x64xf16, #shared_t>) attributes {noinline = false} {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #blocked_t>
+
+    %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<128x64xf16, #shared_t> -> tensor<128x64xf16, #blocked1_t>
+    %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1_t>) -> !ttg.memdesc<128x64xf16, #shared_t, #smem_t>
+
+    %bt = tt.descriptor_load %b_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x64xf16, #shared_t> -> tensor<64x64xf16, #blocked1_t>
+    %b = tt.trans %bt {order = array<i32: 1, 0>} : tensor<64x64xf16, #blocked1_t> -> tensor<64x64xf16, #blocked2_t>
+    %b_smem = ttg.local_alloc %b : (tensor<64x64xf16, #blocked2_t>) -> !ttg.memdesc<64x64xf16, #shared_tt, #smem_t>
+
+    %acc_layout = ttg.convert_layout %cst : tensor<128x64xf32, #blocked_t> -> tensor<128x64xf32, #blocked3_t>
+    %acc_tmem, %token = ttng.tmem_alloc %acc_layout : (tensor<128x64xf32, #blocked3_t>) -> (!ttg.memdesc<128x64xf32, #tmem_t, #ttng.tensor_memory, mutable>, !ttg.async.token)
+
+    %mma_token = ttng.tc_gen5_mma %a_smem, %b_smem, %acc_tmem[%token], %true, %true {two_ctas} : !ttg.memdesc<128x64xf16, #shared_t, #smem_t>, !ttg.memdesc<64x64xf16, #shared_tt, #smem_t>, !ttg.memdesc<128x64xf32, #tmem_t, #ttng.tensor_memory, mutable>
 
     tt.return
   }

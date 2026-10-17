@@ -23,6 +23,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: scf.for
     // CHECK:   nvg.cluster_id
     // CHECK:   ttng.map_to_remote_buffer
+    // CHECK-NOT: ttng.fence_async_shared
     // CHECK:   ttng.arrive_barrier
     // CHECK:   ttng.wait_barrier
     // CHECK:   ttng.tc_gen5_mma
@@ -381,6 +382,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         !ttg.memdesc<64x128xf16, #shared_tb, #smem_t, mutable>,
         !ttg.memdesc<128x128xf32, #tmem_t, #ttng.tensor_memory, mutable>
     }
+    tt.return
+  }
+}
+
+// -----
+
+// A 2-CTA MMA whose register-built B was split across the pair
+// (two_cta_register_b) gets a cluster-scoped proxy fence before the arrive that
+// signals the leader, so each CTA's generic writes to its B half are ordered
+// before the leader's MMA reads them.
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+// CHECK-LABEL: @test_2cta_sync_register_b_fence
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_2cta_sync_register_b_fence(
+      %a: !ttg.memdesc<128x64xf16, #shared, #smem>,
+      %b: !ttg.memdesc<64x64xf16, #shared, #smem>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token) {
+    %true = arith.constant true
+    // CHECK: ttng.map_to_remote_buffer
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.arrive_barrier
+    // CHECK: ttng.wait_barrier
+    // CHECK-NEXT: ttng.tc_gen5_mma
+    %tok = ttng.tc_gen5_mma %a, %b, %acc[%acc_tok], %true, %true {two_cta_register_b, two_ctas} :
+      !ttg.memdesc<128x64xf16, #shared, #smem>,
+      !ttg.memdesc<64x64xf16, #shared, #smem>,
+      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
 }
