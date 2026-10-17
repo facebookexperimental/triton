@@ -51,6 +51,7 @@
 #include <memory>
 
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "third_party/tlx/dialect/include/IR/Dialect.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -1410,6 +1411,11 @@ void init_triton_ir(py::module_ &m) {
            })
 
       // Cast instructions
+      .def("create_amd_scaled_downcast_fp8",
+           [](TritonOpBuilder &self, Value src, Type dstType) -> Value {
+             return self.create<triton::amdgpu::ScaledDowncastFp8By256Op>(
+                 inheritTensorEncoding(src, dstType), src);
+           })
       // Conversions for custom FP types (FP8 and non-standard rounding
       // modes)
       .def(

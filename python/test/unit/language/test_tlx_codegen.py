@@ -5901,6 +5901,8 @@ def _local_load_kernel(
     output_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    RELAXED: tl.constexpr,
+    LAYOUT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -5912,7 +5914,7 @@ def _local_load_kernel(
     tlx.async_load_commit_group([tok])
     tlx.async_load_wait_group(0)
 
-    x = tlx.local_load(buf0)
+    x = tlx.local_load(buf0, layout=LAYOUT, relaxed=RELAXED)
     tl.store(output_ptr + offs, x, mask=mask)
 
 
@@ -6263,15 +6265,22 @@ def test_async_load_gather_transpose_compiles_gfx950(device):
     assert re.search(r"(buffer_load_dwordx4.*lds|global_load_lds_dwordx4)", compiled.asm["amdgcn"])
 
 
-def test_local_load_compiles_gfx950(device):
+@pytest.mark.parametrize("relaxed", [False, True])
+@pytest.mark.parametrize("with_layout", [False, True])
+def test_local_load_compiles_gfx950(device, relaxed, with_layout):
     """local_load after async_wait should compile and produce local_load in TTGIR."""
     compiled = compile_for_gfx950(
         _local_load_kernel,
         signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"},
-        constexprs={"BLOCK_SIZE": 64},
+        constexprs={
+            "BLOCK_SIZE": 64,
+            "RELAXED": relaxed,
+            "LAYOUT": tlx.layout(shape=((64, 4), ()), stride=((1, 0), ())) if with_layout else None,
+        },
     )
     ttgir = compiled.asm["ttgir"]
     assert "local_load" in ttgir
+    assert ("ttg.amdg.syncedViaAsyncWait = true" in ttgir) is relaxed
 
 
 def test_local_load_with_token_compiles_gfx950(device):
@@ -7032,3 +7041,347 @@ def test_amd_scheduled_mfma_output_subtiles_order_atomic_gfx950():
         if mnemonic in line or "buffer_atomic_add_f32" in line
     ]
     assert instructions == ["mfma", "atomic", "mfma"]
+
+
+@triton.jit
+def _amd_scaled_downcast_fp8_kernel(X, Y, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(X + offsets)
+    result = tlx.amd_scaled_downcast_fp8(values)
+    tl.store(Y + offsets, result)
+
+
+@pytest.mark.parametrize("block", [32, 128, 256, 512])
+def test_amd_scaled_downcast_fp8_by256(block):
+    source = ASTSource(_amd_scaled_downcast_fp8_kernel, signature={"X": "*fp32", "Y": "*fp8e4nv", "BLOCK": "constexpr"},
+                       constexprs={"BLOCK": block})
+    kernel = triton_compile(source, target=GPUTarget("hip", "gfx950", 64), options={"num_warps": 2})
+    assert "amdg.scaled_downcast_fp8_by256" in kernel.asm["ttgir"]
+    assert "llvm.amdgcn.cvt.scalef32.pk.fp8.f32" in kernel.asm["llir"]
+    conversions = [
+        line for line in kernel.asm["llir"].splitlines()
+        if "call" in line and "@llvm.amdgcn.cvt.scalef32.pk.fp8.f32(" in line
+    ]
+    assert conversions and all("float 3.906250e-03, i1 " in line for line in conversions)
+    assert "fmul" not in kernel.asm["llir"]
+    assert "fdiv" not in kernel.asm["llir"]
+    assert "v_cvt_scalef32_pk_fp8_f32" in kernel.asm["amdgcn"]
+    assert "s_setreg" in kernel.asm["amdgcn"]
+    assert "s_nop" not in kernel.asm["llir"]
+
+
+@triton.jit
+def _amd_scaled_downcast_fp8_mfma_kernel(X, Y):
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+    offsets = tl.arange(0, 64)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    values = tlx.require_layout(tl.load(X + offsets), mma, pin=True)
+    result = tlx.amd_scaled_downcast_fp8(values)
+    tl.store(Y + offsets, result)
+
+
+def test_amd_scaled_downcast_fp8_preserves_mfma_layout():
+    source = ASTSource(_amd_scaled_downcast_fp8_mfma_kernel, signature={"X": "*fp32", "Y": "*fp8e4nv"})
+    kernel = triton_compile(source, target=GPUTarget("hip", "gfx950", 64), options={"num_warps": 2})
+    line = next(line for line in kernel.asm["ttgir"].splitlines() if "amdg.scaled_downcast_fp8_by256" in line)
+    encodings = re.findall(r"tensor<64x64x(?:f32|f8E4M3FN), (#[^>]+)>", line)
+    assert len(encodings) == 2 and encodings[0] == encodings[1]
+    assert "fmul" not in kernel.asm["llir"]
+    assert "llvm.amdgcn.cvt.scalef32.pk.fp8.f32" in kernel.asm["llir"]
+    conversions = [
+        line for line in kernel.asm["llir"].splitlines()
+        if "call" in line and "@llvm.amdgcn.cvt.scalef32.pk.fp8.f32(" in line
+    ]
+    assert conversions and all("float 3.906250e-03, i1 " in line for line in conversions)
+
+
+def test_amd_scaled_downcast_fp8_rejects_non_fp32():
+    source = ASTSource(_amd_scaled_downcast_fp8_kernel, signature={"X": "*fp16", "Y": "*fp8e4nv", "BLOCK": "constexpr"},
+                       constexprs={"BLOCK": 128})
+    with pytest.raises(CompilationError, match="value must be an FP32 tensor"):
+        triton_compile(source, target=GPUTarget("hip", "gfx950", 64))
+
+
+@pytest.mark.parametrize("arch,warp_size", [("gfx942", 64), ("gfx1250", 32)])
+def test_amd_scaled_downcast_fp8_unsupported_target(arch, warp_size):
+    source = ASTSource(_amd_scaled_downcast_fp8_kernel, signature={"X": "*fp32", "Y": "*fp8e4nv", "BLOCK": "constexpr"},
+                       constexprs={"BLOCK": 128})
+    with pytest.raises(CompilationError, match="requires gfx950"):
+        triton_compile(source, target=GPUTarget("hip", arch, warp_size))
+
+
+@triton.jit
+def _amd_scaled_downcast_fp8_scalar_kernel(value, Y):
+    result = tlx.amd_scaled_downcast_fp8(value)
+    tl.store(Y, result)
+
+
+def test_amd_scaled_downcast_fp8_rejects_scalar_input():
+    source = ASTSource(_amd_scaled_downcast_fp8_scalar_kernel, signature={"value": "fp32", "Y": "*fp8e4nv"})
+    with pytest.raises(CompilationError, match="value must be an FP32 tensor"):
+        triton_compile(source, target=GPUTarget("hip", "gfx950", 64))
+
+
+@triton.jit
+def _amd_scaled_mfma_group_kernel(
+    a_ptr,
+    as_ptr,
+    b_ptr,
+    bs_ptr,
+    output_ptr,
+    TRANSPOSED: tl.constexpr,
+    FULL_WAVE: tl.constexpr = True,
+    OPAQUE: tl.constexpr = False,
+    CONSTANT_SCALE: tl.constexpr = False,
+    LOOP: tl.constexpr = False,
+    SCALE_SWAP: tl.constexpr = False,
+    K_WIDTH: tl.constexpr = 16,
+    INPUT_SOURCE: tl.constexpr = "load",
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 64],
+        transposed=TRANSPOSED,
+        warps_per_cta=[2, 2],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=K_WIDTH)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=K_WIDTH)
+    a_scale_layout: tl.constexpr = tlx.layout(
+        shape=((32, 2, 2, 2), (2, )),
+        stride=((2, 1, 0, 64), (128, )),
+    )
+    b_scale_layout: tl.constexpr = tlx.layout(
+        shape=((32, 2, 2, 2), (2, )),
+        stride=((2, 1, 64, 0), (128, )),
+    )
+    rows = tl.arange(0, 128)
+    reduction = tl.arange(0, 64)
+    scale_k = tl.arange(0, 2)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 64 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 128 + rows[None, :]),
+        dot1,
+        pin=False,
+    )
+    a_scale = tl.load(as_ptr + rows[:, None] * 2 + scale_k[None, :])
+    b_scale = tl.load(bs_ptr + rows[:, None] * 2 + scale_k[None, :])
+    if INPUT_SOURCE == "packed_scale":
+        a_scale = ((a_scale.to(tl.uint32) >> 1) & 255).to(tl.uint8)
+        b_scale = ((b_scale.to(tl.uint32) >> 1) & 255).to(tl.uint8)
+    elif INPUT_SOURCE == "masked_scale":
+        a_scale = tl.load(
+            as_ptr + rows[:, None] * 2 + scale_k[None, :],
+            mask=rows[:, None] >= tl.program_id(0),
+            other=0,
+        )
+    elif INPUT_SOURCE == "unknown_select":
+        a_scale = tl.where(rows[:, None] >= tl.program_id(0), a_scale, b_scale)
+    elif INPUT_SOURCE == "control_result":
+        for _ in range(tl.program_id(0) + 1):
+            a_scale = a_scale >> 1
+    if CONSTANT_SCALE:
+        a_scale = tl.full((128, 2), 127, tl.uint8)
+    if SCALE_SWAP:
+        a_scale = tlx.require_layout(a_scale, b_scale_layout, pin=False)
+    else:
+        a_scale = tlx.require_layout(a_scale, a_scale_layout, pin=False)
+    b_scale = tlx.require_layout(b_scale, b_scale_layout, pin=False)
+    if INPUT_SOURCE == "opaque_a":
+        bits = a.to(tl.uint8, bitcast=True).to(tl.uint32)
+        bits = tl.inline_asm_elementwise(
+            "",
+            "=v,0",
+            [bits],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+        a = bits.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
+    elif INPUT_SOURCE == "opaque_b":
+        bits = b.to(tl.uint8, bitcast=True).to(tl.uint32)
+        bits = tl.inline_asm_elementwise(
+            "",
+            "=v,0",
+            [bits],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+        b = bits.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
+    elif INPUT_SOURCE == "opaque_as":
+        bits = a_scale.to(tl.uint32)
+        bits = tl.inline_asm_elementwise(
+            "",
+            "=v,0",
+            [bits],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+        a_scale = bits.to(tl.uint8)
+    elif INPUT_SOURCE == "opaque_bs":
+        bits = b_scale.to(tl.uint32)
+        bits = tl.inline_asm_elementwise(
+            "",
+            "=v,0",
+            [bits],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+        b_scale = bits.to(tl.uint8)
+    acc = tlx.require_layout(tl.zeros((128, 128), tl.float32), mma, pin=False)
+    if OPAQUE:
+        acc = tl.inline_asm_elementwise(
+            "",
+            "=v,0",
+            [acc],
+            dtype=tl.float32,
+            is_pure=False,
+            pack=1,
+        )
+        acc = tlx.require_layout(acc, mma, pin=False)
+    acc = tlx.amd_scaled_mfma_group(
+        a,
+        a_scale,
+        b,
+        b_scale,
+        acc,
+        full_wave=FULL_WAVE,
+    )
+    if LOOP:
+        for _ in range(2):
+            acc = tlx.amd_scaled_mfma_group(
+                a,
+                a_scale,
+                b,
+                b_scale,
+                acc,
+                full_wave=FULL_WAVE,
+            )
+    offsets = tlx.require_layout(
+        output_ptr + rows[:, None] * 128 + rows[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(offsets, acc)
+
+
+def _compile_scaled_mfma_group(target="gfx950", **options):
+    constexprs = dict(
+        TRANSPOSED=True,
+        FULL_WAVE=True,
+        OPAQUE=False,
+        CONSTANT_SCALE=False,
+        LOOP=False,
+        SCALE_SWAP=False,
+        K_WIDTH=16,
+        INPUT_SOURCE="load",
+    )
+    constexprs.update(options)
+    signature = {
+        "a_ptr": "*fp8e4nv",
+        "as_ptr": "*u8",
+        "b_ptr": "*fp8e4nv",
+        "bs_ptr": "*u8",
+        "output_ptr": "*fp32",
+        **{name: "constexpr"
+           for name in constexprs},
+    }
+    source = ASTSource(
+        fn=_amd_scaled_mfma_group_kernel,
+        signature=signature,
+        constexprs=constexprs,
+    )
+    return triton_compile(
+        source,
+        target=GPUTarget("hip", target, 64),
+        options={"num_warps": 4, "num_stages": 1, "matrix_instr_nonkdim": 32},
+    )
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+def test_amd_scaled_mfma_group_native_mapping(transposed):
+    """Keep each accumulator chain and both scale-byte selectors unchanged."""
+    kernel = _compile_scaled_mfma_group(TRANSPOSED=transposed)
+    assert "amdg.scaled_mfma_group" in kernel.asm["ttgir"]
+    llir = kernel.asm["llir"]
+    assert llir.count("v_mfma_scale_f32_32x32x64_f8f6f4") == 4
+    assert "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v" in llir
+    assert llir.count(r"s_nop 15\0As_nop 3") == 1
+    assert r"s_nop 3\0Av_mfma_scale" in llir
+    for m in range(2):
+        for n in range(2):
+            first, second = (n, m) if transposed else (m, n)
+            index = m * 2 + n
+            instruction = ("v_mfma_scale_f32_32x32x64_f8f6f4 $" + str(index) + ", $" + str(8 + first) + ", $" +
+                           str(10 + second) + ", $" + str(index) + ", $12, $13 op_sel:[" + str(first) + "," +
+                           str(second) + ",0]")
+            assert instruction in llir
+    import re
+    calls = [line for line in llir.splitlines() if "asm sideeffect" in line and "v_mfma_scale" in line]
+    assert len(calls) == 1
+    attribute = re.search(r"#([0-9]+)", calls[0])
+    assert attribute is not None
+    definition = re.search(
+        r"attributes #" + attribute.group(1) + r" = \{([^}]*)\}",
+        llir,
+    )
+    assert definition is not None and "convergent" in definition.group(1)
+    assert kernel.asm["amdgcn"].count("v_mfma_scale_f32_32x32x64_f8f6f4") == 4
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("input_source", [
+    "packed_scale",
+    "opaque_a",
+    "opaque_b",
+    "opaque_as",
+    "opaque_bs",
+    "masked_scale",
+    "unknown_select",
+    "control_result",
+])
+def test_amd_scaled_mfma_group_entry_delay_provenance(transposed, input_source):
+    kernel = _compile_scaled_mfma_group(
+        TRANSPOSED=transposed,
+        INPUT_SOURCE=input_source,
+    )
+    calls = [line for line in kernel.asm["llir"].splitlines() if "asm sideeffect" in line and "v_mfma_scale" in line]
+    assert len(calls) == 1
+    group = calls[0]
+    assert group.count("v_mfma_scale_f32_32x32x64_f8f6f4") == 4
+    if input_source == "packed_scale":
+        assert group.count(r"s_nop 15\0As_nop 3") == 1
+        assert r"s_nop 3\0Av_mfma_scale" in group
+    else:
+        assert group.count(r"s_nop 15\0As_nop 3") == 2
+        assert r"s_nop 15\0As_nop 3\0Av_mfma_scale" in group
+    assert r"op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3" in group
+    assert "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v" in group
+
+
+def test_amd_scaled_mfma_group_completed_loop_accumulator():
+    kernel = _compile_scaled_mfma_group(LOOP=True)
+    assert "scf.for" in kernel.asm["ttgir"]
+    assert "v_mfma_scale_f32_32x32x64_f8f6f4" in kernel.asm["llir"]
+
+
+@pytest.mark.parametrize("option, message", [
+    ({"FULL_WAVE": False}, "full_wave"),
+    ({"OPAQUE": True}, "accumulator must originate"),
+    ({"CONSTANT_SCALE": True}, "nonconstant"),
+    ({"SCALE_SWAP": True}, "scale ownership"),
+    ({"K_WIDTH": 8}, "kWidth=16"),
+], ids=["incomplete_wave", "opaque_accumulator", "constant_scales", "scale_ownership", "k_width"])
+def test_amd_scaled_mfma_group_rejects_invalid_contract(option, message):
+    with pytest.raises(Exception, match=message):
+        _compile_scaled_mfma_group(**option)
+
+
+def test_amd_scaled_mfma_group_rejects_other_target():
+    with pytest.raises(Exception, match="gfx950"):
+        _compile_scaled_mfma_group(target="gfx942")

@@ -384,6 +384,7 @@ void init_triton_amd(py::module_ &m) {
     registry.insert<mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect>();
     // registry.insert<mlir::ROCDL::ROCDLDialect>();
     mlir::registerROCDLDialectTranslation(registry);
+    mlir::triton::AMD::registerAMDLLVMTranslationInterface(registry);
     mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();

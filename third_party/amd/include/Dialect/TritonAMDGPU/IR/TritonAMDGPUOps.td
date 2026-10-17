@@ -25,6 +25,7 @@
 #define TRITON_AMDGPU_OPS
 
 include "mlir/IR/OpBase.td"
+include "mlir/IR/SymbolInterfaces.td"
 include "triton/Dialect/Triton/IR/TritonDialect.td"
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
@@ -785,6 +786,29 @@ def ScaledDowncastFp8Op : TT_AMDGPU_Op<"scaled_downcast_fp8", [
 }
 
 //===----------------------------------------------------------------------===//
+// ScaledDowncastFp8By256Op
+//===----------------------------------------------------------------------===//
+
+def ScaledDowncastFp8By256Op
+    : TT_AMDGPU_Op<"scaled_downcast_fp8_by256",
+                   [Pure, Elementwise, SameOperandsAndResultEncoding]> {
+  let summary = "Convert FP32 values scaled by 256 to E4M3FN";
+  let description = [{
+    Convert each FP32 input multiplied by 256 to E4M3FN on gfx950, using the
+    hardware conversion's scale divisor 2^-8 (the E8M0 scale byte 119).
+    Rounding uses round-to-nearest, ties-to-even. Overflow saturates to the
+    largest finite output. NaNs remain NaNs. Input and output tensors have the
+    same shape and encoding. The operation introduces no separate FP32 multiply.
+  }];
+  let arguments = (ins RankedTensorOf<[F32]>:$input);
+  let results = (outs RankedTensorOf<[F8E4M3FN]>:$output);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input) `->` type($output)
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // InThreadTransposeOp
 //===----------------------------------------------------------------------===//
 
@@ -985,6 +1009,47 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
 
   let assemblyFormat = "$inputs attr-dict `:` type($inputs)";
 
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ScaledMfmaGroupOp
+//===----------------------------------------------------------------------===//
+
+def ScaledMfmaGroupOp
+    : TT_AMDGPU_Op<"scaled_mfma_group",
+                   [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Complete one native 2x2 scaled-MFMA K64 group";
+  let description = [{
+    Computes four E4M3/E8M0 scaled updates in independent FP32 chains.
+    Each participating wave must enable all 64 EXEC lanes.
+    full_wave records this source precondition.
+    Layouts do not prove EXEC.
+    Visible nonuniform predicated regions are rejected.
+    Other control regions remain subject to the source precondition.
+    Accumulators must originate from zero or completed group results.
+    Proved loop forwarding and transparent layouts preserve readiness.
+    A fused drain completes payload reads and FP32 results.
+    This dependency boundary is not a memory fence or workgroup barrier.
+  }];
+  let arguments = (ins TT_Tensor:$a, TT_Tensor:$a_scale,
+      TT_Tensor:$b, TT_Tensor:$b_scale, TT_Tensor:$c, BoolAttr:$full_wave);
+  let results = (outs TT_Tensor:$result);
+  let assemblyFormat = [{
+    $a `scale` $a_scale `,` $b `scale` $b_scale `,` $c
+    `full_wave` $full_wave attr-dict
+    `:` type($a) `,` type($a_scale) `,` type($b)
+    `,` type($b_scale) `,` type($c) `->` type($result)
+  }];
+  let extraClassDeclaration = [{
+    ::mlir::Value getD() { return getResult(); }
+    ::mlir::triton::ScaleDotElemType getAElemType() {
+      return ::mlir::triton::ScaleDotElemType::E4M3;
+    }
+    ::mlir::triton::ScaleDotElemType getBElemType() {
+      return ::mlir::triton::ScaleDotElemType::E4M3;
+    }
+  }];
   let hasVerifier = 1;
 }
 

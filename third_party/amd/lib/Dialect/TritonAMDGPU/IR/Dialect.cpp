@@ -22,17 +22,23 @@
  */
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "third_party/amd/include/Utils/Utility.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -1036,6 +1042,17 @@ Attribute ScaledDowncastFp8Op::inferSrcEncoding(unsigned opIdx,
   return dstEnc;
 }
 
+LogicalResult ScaledDowncastFp8By256Op::verify() {
+  auto srcTy = getInput().getType();
+  auto dstTy = getOutput().getType();
+  if (srcTy.getShape() != dstTy.getShape())
+    return emitOpError("input and output must have the same shape");
+  if (bool(srcTy.getEncoding()) != bool(dstTy.getEncoding()))
+    return emitOpError(
+        "input and output must both have an encoding or neither");
+  return success();
+}
+
 LogicalResult ConcatOp::verify() {
   auto sources = getSources();
   auto result = getResult();
@@ -1474,6 +1491,342 @@ static LogicalResult verifyWaveUniformExecution(Operation *op) {
       return op->emitOpError(
           "requires a wave-uniform enclosing ttg.warp_predicate");
   }
+  return success();
+}
+
+// Accept only literal FP32 zeros before register-class copies.
+static bool isScaledGroupZeroConstant(Value value) {
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return false;
+  if (auto elements = dyn_cast<DenseFPElementsAttr>(constant.getValue()))
+    return elements.getElementType().isF32() && elements.isSplat() &&
+           elements.getSplatValue<APFloat>().isZero();
+  if (auto scalar = dyn_cast<FloatAttr>(constant.getValue()))
+    return scalar.getType().isF32() && scalar.getValue().isZero();
+  return false;
+}
+
+static bool isScaledGroupLiteralZero(Value value) {
+  auto type = dyn_cast<RankedTensorType>(value.getType());
+  if (!type || !type.getElementType().isF32())
+    return false;
+  if (isScaledGroupZeroConstant(value))
+    return true;
+  auto splat = value.getDefiningOp<triton::SplatOp>();
+  return splat && splat.getSrc().getType().isF32() &&
+         isScaledGroupZeroConstant(splat.getSrc());
+}
+
+// Frontend zero helpers can remain calls before the inliner runs.
+static bool isScaledGroupZeroCall(Value value,
+                                  SymbolTableCollection &symbolTable) {
+  auto call = value.getDefiningOp<triton::CallOp>();
+  if (!call || call.getNumOperands() != 0 || call.getNumResults() != 1)
+    return false;
+  auto type = dyn_cast<RankedTensorType>(value.getType());
+  if (!type || type.getRank() != 2 || !type.getElementType().isF32())
+    return false;
+  auto callee = symbolTable.lookupNearestSymbolFrom<triton::FuncOp>(
+      call, call.getCalleeAttr());
+  if (!callee || !callee.isPrivate() || callee.getBody().empty() ||
+      callee.getFunctionType().getNumInputs() != 0 ||
+      callee.getFunctionType().getNumResults() != 1)
+    return false;
+  if (Attribute attr = callee->getAttr("noinline")) {
+    auto noinline = dyn_cast<BoolAttr>(attr);
+    if (!noinline || noinline.getValue())
+      return false;
+  }
+  Block &entry = callee.getBody().front();
+  auto returned = dyn_cast<triton::ReturnOp>(entry.getTerminator());
+  if (!returned || returned.getNumOperands() != 1 ||
+      returned.getOperand(0).getType() != value.getType() ||
+      !isScaledGroupLiteralZero(returned.getOperand(0)))
+    return false;
+  // A direct entry return makes later poison blocks unreachable.
+  return llvm::all_of(entry.without_terminator(), [](Operation &op) {
+    return op.getNumResults() == 1 &&
+           (isScaledGroupZeroConstant(op.getResult(0)) ||
+            isScaledGroupLiteralZero(op.getResult(0)));
+  });
+}
+
+// Prove readiness before register-class copies can precede the assembly wait.
+// Layout-only ops forward one tensor without changing its values. The TLX
+// layout ops are matched by name because the AMD dialect does not link TLX.
+static bool isScaledGroupLayoutForwardingOp(Operation *op) {
+  namespace ttg = mlir::triton::gpu;
+  if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+    return false;
+  if (isa<ttg::ConvertLayoutOp, ttg::RequireLayoutOp, ttg::ReleaseLayoutOp>(op))
+    return true;
+  StringRef name = op->getName().getStringRef();
+  return name == "tlx.require_layout" || name == "tlx.release_layout";
+}
+
+static bool
+isCompletedScaledGroupAccumulator(Value value, llvm::DenseSet<Value> &active,
+                                  llvm::DenseSet<Value> &proved,
+                                  SymbolTableCollection &symbolTable) {
+  if (proved.contains(value))
+    return true;
+  if (!active.insert(value).second)
+    return false;
+  auto prove = [&](Value input) {
+    return isCompletedScaledGroupAccumulator(input, active, proved,
+                                             symbolTable);
+  };
+  bool ready = false;
+  if (isScaledGroupLiteralZero(value) ||
+      isScaledGroupZeroCall(value, symbolTable)) {
+    ready = true;
+  } else if (value.getDefiningOp<ScaledMfmaGroupOp>()) {
+    ready = true;
+  } else if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Block *block = argument.getOwner();
+    if (auto loop = dyn_cast<scf::ForOp>(block->getParentOp())) {
+      unsigned index = argument.getArgNumber();
+      if (index > 0 && index <= loop.getInitArgs().size()) {
+        auto slot = mlir::getLoopCarriedSlot(loop, index - 1);
+        ready = slot.init && slot.yielded && prove(slot.init->get()) &&
+                prove(slot.yielded->get());
+      }
+    } else {
+      bool sawInput = false;
+      ready = true;
+      for (Block *predecessor : block->getPredecessors()) {
+        auto branch = dyn_cast<BranchOpInterface>(predecessor->getTerminator());
+        if (!branch) {
+          ready = false;
+          break;
+        }
+        for (auto [index, successor] :
+             llvm::enumerate(branch->getSuccessors())) {
+          if (successor != block)
+            continue;
+          SuccessorOperands operands = branch.getSuccessorOperands(index);
+          unsigned argumentIndex = argument.getArgNumber();
+          if (argumentIndex < operands.getProducedOperandCount()) {
+            ready = false;
+            break;
+          }
+          unsigned forwardedIndex =
+              argumentIndex - operands.getProducedOperandCount();
+          ValueRange forwarded = operands.getForwardedOperands();
+          if (forwardedIndex >= forwarded.size() ||
+              !prove(forwarded[forwardedIndex])) {
+            ready = false;
+            break;
+          }
+          sawInput = true;
+        }
+        if (!ready)
+          break;
+      }
+      ready &= sawInput;
+    }
+  } else if (auto loop = value.getDefiningOp<scf::ForOp>()) {
+    auto result = cast<OpResult>(value);
+    auto slot = mlir::getLoopCarriedSlot(loop, result.getResultNumber());
+    ready = slot.init && slot.yielded && prove(slot.init->get()) &&
+            prove(slot.yielded->get());
+  } else if (Operation *producer = value.getDefiningOp()) {
+    if (isScaledGroupLayoutForwardingOp(producer)) {
+      auto inputTy =
+          dyn_cast<RankedTensorType>(producer->getOperand(0).getType());
+      auto outputTy = dyn_cast<RankedTensorType>(value.getType());
+      ready = inputTy && outputTy &&
+              inputTy.getShape() == outputTy.getShape() &&
+              inputTy.getElementType() == outputTy.getElementType() &&
+              prove(producer->getOperand(0));
+    }
+  }
+  active.erase(value);
+  if (ready)
+    proved.insert(value);
+  return ready;
+}
+
+// A completed backedge needs a reachable zero seed in its producer graph.
+static bool hasScaledGroupZeroSeed(Value value, llvm::DenseSet<Value> &visited,
+                                   SymbolTableCollection &symbolTable) {
+  if (!visited.insert(value).second)
+    return false;
+  auto hasSeed = [&](Value input) {
+    return hasScaledGroupZeroSeed(input, visited, symbolTable);
+  };
+  if (isScaledGroupLiteralZero(value) ||
+      isScaledGroupZeroCall(value, symbolTable))
+    return true;
+  if (auto group = value.getDefiningOp<ScaledMfmaGroupOp>())
+    return hasSeed(group.getC());
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Block *block = argument.getOwner();
+    if (auto loop = dyn_cast<scf::ForOp>(block->getParentOp())) {
+      unsigned index = argument.getArgNumber();
+      if (index > 0 && index <= loop.getInitArgs().size()) {
+        auto slot = mlir::getLoopCarriedSlot(loop, index - 1);
+        return slot.init && hasSeed(slot.init->get());
+      }
+      return false;
+    }
+    for (Block *predecessor : block->getPredecessors()) {
+      auto branch = dyn_cast<BranchOpInterface>(predecessor->getTerminator());
+      if (!branch)
+        continue;
+      for (auto [index, successor] : llvm::enumerate(branch->getSuccessors())) {
+        if (successor != block)
+          continue;
+        SuccessorOperands operands = branch.getSuccessorOperands(index);
+        unsigned argumentIndex = argument.getArgNumber();
+        if (argumentIndex < operands.getProducedOperandCount())
+          continue;
+        unsigned forwardedIndex =
+            argumentIndex - operands.getProducedOperandCount();
+        ValueRange forwarded = operands.getForwardedOperands();
+        if (forwardedIndex < forwarded.size() &&
+            hasSeed(forwarded[forwardedIndex]))
+          return true;
+      }
+    }
+    return false;
+  }
+  if (auto loop = value.getDefiningOp<scf::ForOp>()) {
+    auto result = cast<OpResult>(value);
+    auto slot = mlir::getLoopCarriedSlot(loop, result.getResultNumber());
+    return slot.init && hasSeed(slot.init->get());
+  }
+  if (Operation *producer = value.getDefiningOp())
+    if (isScaledGroupLayoutForwardingOp(producer))
+      return hasSeed(producer->getOperand(0));
+  return false;
+}
+
+static bool isConstantScaledGroupScale(Value value) {
+  llvm::DenseSet<Value> visited;
+  while (visited.insert(value).second) {
+    Operation *producer = value.getDefiningOp();
+    if (!producer)
+      return false;
+    if (isa<arith::ConstantOp, triton::SplatOp>(producer))
+      return true;
+    if (!isScaledGroupLayoutForwardingOp(producer))
+      return false;
+    value = producer->getOperand(0);
+  }
+  return false;
+}
+
+LogicalResult ScaledMfmaGroupOp::verify() {
+  namespace ttg = mlir::triton::gpu;
+  if (!getFullWave())
+    return emitOpError("requires full_wave=true and all 64 EXEC lanes");
+  if (auto mod = getOperation()->getParentOfType<ModuleOp>())
+    if (auto arch = mlir::getAMDArch(mod); arch && *arch != "gfx950")
+      return emitOpError("is supported only on gfx950");
+  for (Operation *parent = getOperation()->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto predicate = dyn_cast<ttg::WarpPredicateOp>(parent))
+      if (!predicate.getWaveUniform().value_or(false))
+        return emitOpError("cannot execute in a nonuniform predicated region");
+  }
+
+  auto aTy = getA().getType();
+  auto bTy = getB().getType();
+  auto cTy = getC().getType();
+  auto asTy = getAScale().getType();
+  auto bsTy = getBScale().getType();
+  SmallVector<RankedTensorType, 5> operandTypes{aTy, bTy, cTy, asTy, bsTy};
+  if (llvm::any_of(operandTypes,
+                   [](RankedTensorType type) { return type.getRank() != 2; }))
+    return emitOpError("requires rank-two operands");
+  if (!isa<Float8E4M3FNType>(aTy.getElementType()) ||
+      aTy.getElementType() != bTy.getElementType() ||
+      !cTy.getElementType().isF32() || !asTy.getElementType().isInteger(8) ||
+      !bsTy.getElementType().isInteger(8))
+    return emitOpError(
+        "requires E4M3FN payloads, E8M0 bytes, and FP32 accumulators");
+  if (getResult().getType() != cTy || aTy.getShape()[0] != cTy.getShape()[0] ||
+      bTy.getShape()[1] != cTy.getShape()[1] || aTy.getShape()[1] != 64 ||
+      bTy.getShape()[0] != 64 ||
+      asTy.getShape() != ArrayRef<int64_t>({aTy.getShape()[0], 2}) ||
+      bsTy.getShape() != ArrayRef<int64_t>({bTy.getShape()[1], 2}))
+    return emitOpError("requires matching matrix and K64 scale shapes");
+
+  auto mma = dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(
+      unwrapTlxWrappers(cTy.getEncoding()));
+  if (!mma || mma.getRank() != 2 || mma.getVersion() != 4 ||
+      mma.getElementBitWidth() != 32 ||
+      mma.getInstrShape() != ArrayRef<unsigned>({32, 32, 64}))
+    return emitOpError(
+        "requires rank-two version-four FP32 32x32x64 MFMA ownership");
+  if (mma.getWarpsPerCTA().size() != 2)
+    return emitOpError("MFMA warpsPerCTA must contain two entries");
+  if (mma.getTilesPerWarp().size() < 2 || !mma.hasUnitTilesPerWarp())
+    return emitOpError("requires at least two unit tilesPerWarp entries");
+  if (llvm::is_contained(mma.getWarpsPerCTA(), 0u))
+    return emitOpError("MFMA warpsPerCTA entries must be positive");
+  if (auto mod = getOperation()->getParentOfType<ModuleOp>()) {
+    if (Attribute value = mod->getAttr("ttg.threads-per-warp")) {
+      auto threads = dyn_cast<IntegerAttr>(value);
+      if (!threads || threads.getInt() != 64)
+        return emitOpError("module threads-per-warp must equal 64");
+    }
+    if (Attribute value = mod->getAttr("ttg.num-warps")) {
+      auto warps = dyn_cast<IntegerAttr>(value);
+      uint64_t layoutWarps =
+          uint64_t(mma.getWarpsPerCTA()[0]) * mma.getWarpsPerCTA()[1];
+      if (!warps || warps.getInt() <= 0 ||
+          uint64_t(warps.getInt()) != layoutWarps)
+        return emitOpError("module num-warps must match MFMA warpsPerCTA");
+    }
+  }
+  auto aDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(aTy.getEncoding()));
+  auto bDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(bTy.getEncoding()));
+  if (!aDot || !bDot || aDot.getParent() != mma || bDot.getParent() != mma ||
+      aDot.getOpIdx() != 0 || bDot.getOpIdx() != 1 || aDot.getKWidth() != 16 ||
+      bDot.getKWidth() != 16)
+    return emitOpError("requires matching opIdx=0/1, kWidth=16 dot operands");
+  auto aRep = mma.getRepForOperand(aTy.getShape(), 16, 0);
+  auto bRep = mma.getRepForOperand(bTy.getShape(), 16, 1);
+  if (aRep[0] != 1 || bRep[0] != 1 || aRep[1] != 2 || bRep[2] != 2 ||
+      aRep[2] * 16 != 32 || bRep[1] * 16 != 32 ||
+      ttg::getTotalElemsPerThread(aDot, aTy.getShape()) != 64 ||
+      ttg::getTotalElemsPerThread(bDot, bTy.getShape()) != 64 ||
+      ttg::getTotalElemsPerThread(mma, cTy.getShape()) != 64)
+    return emitOpError(
+        "requires one native K64 and a 2x2 per-wave fragment group");
+  SmallVector<RankedTensorType, 2> scaleTypes{asTy, bsTy};
+  for (auto [index, type] : llvm::enumerate(scaleTypes)) {
+    auto expected = ttg::chooseScaledMfmaScaleLayout(
+        getContext(), index, type.getShape(), 32, {1, 1}, mma.getWarpsPerCTA());
+    auto actual = dyn_cast_or_null<ttg::LinearEncodingAttr>(
+        unwrapTlxWrappers(type.getEncoding()));
+    if (!actual || actual.getLinearLayout() != expected)
+      return emitOpError(
+          "scale ownership must match the native payload replicas");
+  }
+  for (Value scale : {getAScale(), getBScale()})
+    if (isConstantScaledGroupScale(scale))
+      return emitOpError("requires nonconstant native scales");
+  return success();
+}
+
+// Accumulator provenance can resolve zero-helper callees. Checking it here
+// keeps cross-function reads in the serial symbol-table verifier rather than
+// the parallel per-operation verifier.
+LogicalResult
+ScaledMfmaGroupOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  llvm::DenseSet<Value> active, proved;
+  if (!isCompletedScaledGroupAccumulator(getC(), active, proved, symbolTable))
+    return emitOpError(
+        "accumulator must originate from zero or completed scaled groups");
+  llvm::DenseSet<Value> seedVisited;
+  if (!hasScaledGroupZeroSeed(getC(), seedVisited, symbolTable))
+    return emitOpError("accumulator producer graph requires a zero seed");
   return success();
 }
 

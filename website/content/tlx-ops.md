@@ -56,7 +56,7 @@ kernels/
     addmm/                gfx942.py
     bmm/                  gfx942.py
     flash_attn/           sm90.py  sm100.py  gfx950.py  (fwd + bwd)
-    flash_attn_mxfp8/     sm100.py  gfx950.py           (gfx950 forward only)
+    flash_attn_mxfp8/     sm100.py  gfx950.py           (fwd + bwd)
     flash_attn_varlen/    gfx950.py                     (forward only)
     hstu_attn/            sm100.py  gfx942.py
                           _util.py  _stubs.py  _reference.py
@@ -73,6 +73,30 @@ kernels/
     cross_attention/      sm100.py
     bmm_shared_a/         gfx950.py
 ```
+
+### gfx950 MXFP8 attention backward
+
+`flash_attn_mxfp8` accepts contiguous, same-device BF16 Q/K/V with identical
+`[batch, heads, sequence, 128]` shapes and a positive sequence length divisible
+by 256. Each head must contain fewer than `2**31` elements. Both causal and
+noncausal backward return BF16 gradients, accumulate in FP32, and avoid atomics.
+Training uses hardware exp2 and saves the row maximum and log2 normalization
+term separately. Backward preserves both terms when it reconstructs probabilities.
+
+Q/K use E4M3 payloads with E8M0 scales per 32×32 block, as in current Blackwell.
+The general backward requantizes operands for their reduction axes and uses
+32×32 dS quantization. Separate dQ and dK/dV owners recompute QK and dP.
+
+For `B=4, H=32, D=128`, the specialized path supports
+`N=1024/2048/4096/8192, sm_scale=0.5` with either causal flag, plus
+`N=8192, sm_scale=1.3` noncausal. It shares square32 Q/K/dO payloads between
+reduction orientations, fuses backward preparation, and materializes FP8 dS
+once for the dQ consumer. It requires whole, aligned contiguous storage.
+Temporary workspace per call is `128*N*N + 128*(N//32)**2 + 34816*N` bytes,
+up to **8 GiB + 280 MiB at N8192**, excluding gradients and saved inputs.
+Causal calls allocate the same dense workspace. Other configurations use the
+general implementation; allocation or kernel failures are not silently retried.
+These are quantized training recipes, not BF16-equivalent gradients.
 
 ## MXFP8 GEMM
 

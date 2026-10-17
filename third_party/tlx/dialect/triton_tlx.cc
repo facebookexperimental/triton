@@ -243,6 +243,13 @@ void init_triton_tlx_ir(py::module_ &m) {
              auto op = self.create<amdgpu::MfmaCommitOp>(inputs);
              return {op.getOutputs().begin(), op.getOutputs().end()};
            })
+      .def("create_amd_scaled_mfma_group",
+           [](TritonOpBuilder &self, Value a, Value aScale, Value b,
+              Value bScale, Value acc, bool fullWave) -> Value {
+             return self.create<amdgpu::ScaledMfmaGroupOp>(
+                 acc.getType(), a, aScale, b, bScale, acc,
+                 self.getBuilder().getBoolAttr(fullWave));
+           })
       .def("create_amd_scheduled_mfma",
            [](TritonOpBuilder &self, Value a, Value b, Value acc,
               const std::string &residentOperand,

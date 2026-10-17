@@ -2522,3 +2522,856 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   }
 }
+
+
+// -----
+
+// Both tensor encodings can be absent before layout inference.
+module {
+  tt.func @scaled_downcast_unencoded(%x: tensor<64xf32>) {
+    %result = amdg.scaled_downcast_fp8_by256 %x : tensor<64xf32> -> tensor<64xf8E4M3FN>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @scaled_downcast_shape_mismatch(%x: tensor<64xf32>) {
+    // expected-error @+1 {{all non-scalar operands/results must have the same shape}}
+    %result = amdg.scaled_downcast_fp8_by256 %x : tensor<64xf32> -> tensor<128xf8E4M3FN>
+    tt.return
+  }
+}
+
+// -----
+
+#enc = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scaled_downcast_one_sided_encoding(%x: tensor<64xf32, #enc>) {
+    // expected-error @+1 {{input and output must both have an encoding or neither}}
+    %result = amdg.scaled_downcast_fp8_by256 %x : tensor<64xf32, #enc> -> tensor<64xf8E4M3FN>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @scaled_downcast_extra_operand(%x: tensor<64xf32>, %divisor: f32) {
+    // expected-error @+1 {{requires a single operand}}
+    %result = "amdg.scaled_downcast_fp8_by256"(%x, %divisor) : (tensor<64xf32>, f32) -> tensor<64xf8E4M3FN>
+    tt.return
+  }
+}
+
+// -----
+
+#enc0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#enc1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scaled_downcast_unequal_encodings(%x: tensor<128xf32, #enc0>) {
+    // expected-error @+1 {{requires the same encoding for all operands and results}}
+    %result = amdg.scaled_downcast_fp8_by256 %x : tensor<128xf32, #enc0> -> tensor<128xf8E4M3FN, #enc1>
+    tt.return
+  }
+}
+
+// -----
+
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_unproved_accumulator(
+      %a: tensor<128x64xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #as>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>, %c: tensor<128x128xf32, #mma>) {
+    // expected-error @+1 {{accumulator must originate from zero or completed scaled groups}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_incomplete_wave(
+      %a: tensor<128x64xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #as>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    // expected-error @+1 {{requires full_wave=true and all 64 EXEC lanes}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave false
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_unanchored_cycle(
+      %a: tensor<128x64xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #as>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>) {
+    tt.return
+  ^cycle(%c: tensor<128x128xf32, #mma>):
+    // expected-error @+1 {{accumulator producer graph requires a zero seed}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    cf.br ^cycle(%result : tensor<128x128xf32, #mma>)
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrong_scale_ownership(
+      %a: tensor<128x64xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #bs>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    // expected-error @+1 {{scale ownership must match the native payload replicas}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #bs>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrong_k_width(
+      %a: tensor<128x64xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #as>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    // expected-error @+1 {{requires matching opIdx=0/1, kWidth=16 dot operands}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrong_reduction(
+      %a: tensor<128x32xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #as>,
+      %b: tensor<32x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    // expected-error @+1 {{requires matching matrix and K64 scale shapes}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x32xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<32x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrong_replica_group(
+      %a: tensor<64x64xf8E4M3FN, #lhs>, %as: tensor<64x2xi8, #as>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>) {
+    %c = arith.constant dense<0.0> : tensor<64x128xf32, #mma>
+    // expected-error @+1 {{requires one native K64 and a 2x2 per-wave fragment group}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<64x64xf8E4M3FN, #lhs>, tensor<64x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<64x128xf32, #mma> -> tensor<64x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_nonuniform_execution(
+      %a: tensor<128x64xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #as>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>, %predicate: i1) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %predicated = ttg.warp_predicate %predicate (%c) {
+      // expected-error @+1 {{cannot execute in a nonuniform predicated region}}
+      %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+          : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+            tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+            tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+      ttg.predicate_yield %result : tensor<128x128xf32, #mma>
+    } : (i1, tensor<128x128xf32, #mma>) -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrapped_native_contract(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module {
+  tt.func public @scaled_wrapped_metadata_absent(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrapped_wrong_scale_ownership(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_bs>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{scale ownership must match the native payload replicas}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scaled_wrapped_wrong_wave_size(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{module threads-per-warp must equal 64}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrapped_wrong_warp_count(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{module num-warps must match MFMA warpsPerCTA}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true, elementBitWidth = 64}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrapped_wrong_output_width(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{requires rank-two version-four FP32 32x32x64 MFMA ownership}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true, tilesPerWarp = [1]}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrapped_short_tiles(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{requires at least two unit tilesPerWarp entries}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [0, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrapped_zero_warps(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{MFMA warpsPerCTA entries must be positive}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_wrapped_wrong_layout_rank(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{requires rank-two version-four FP32 32x32x64 MFMA ownership}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_durable_accumulator_boundary(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %seed = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_durable_constant_scales(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    %constant_scale = arith.constant dense<127> : tensor<128x2xi8, #wrapped_as>
+    %as = ttg.require_layout %constant_scale
+        : tensor<128x2xi8, #wrapped_as> -> tensor<128x2xi8, #wrapped_as>
+    // expected-error @+1 {{requires nonconstant native scales}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_splat_zero(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %scalar = arith.constant 0.0 : f32
+    %seed = tt.splat %scalar : f32 -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_splat_nonzero(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %scalar = arith.constant 1.0 : f32
+    %seed = tt.splat %scalar : f32 -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{accumulator must originate from zero or completed scaled groups}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func private @zero_helper() -> tensor<128x128xf32, #wrapped_mma> attributes {noinline = false} {
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    tt.return %zero : tensor<128x128xf32, #wrapped_mma>
+  ^unreachable:
+    %poison = "ub.poison"() <{value = #ub.poison}> : () -> tensor<128x128xf32, #wrapped_mma>
+    tt.return %poison : tensor<128x128xf32, #wrapped_mma>
+  }
+  tt.func public @scaled_call_zero_unreachable_poison(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %seed = tt.call @zero_helper() : () -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func private @zero_helper() -> tensor<128x128xf32, #wrapped_mma> attributes {noinline = false} {
+    %zero = arith.constant dense<1.0> : tensor<128x128xf32, #wrapped_mma>
+    tt.return %zero : tensor<128x128xf32, #wrapped_mma>
+  }
+  tt.func public @scaled_call_nonzero(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %seed = tt.call @zero_helper() : () -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{accumulator must originate from zero or completed scaled groups}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func private @zero_helper() -> tensor<128x128xf32, #wrapped_mma> attributes {noinline = false} {
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    %result = "tt.elementwise_inline_asm"(%zero) <{asm_string = "", constraints = "=v,0", packed_element = 1 : i32, pure = false}> : (tensor<128x128xf32, #wrapped_mma>) -> tensor<128x128xf32, #wrapped_mma>
+    tt.return %result : tensor<128x128xf32, #wrapped_mma>
+  }
+  tt.func public @scaled_call_opaque(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %seed = tt.call @zero_helper() : () -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{accumulator must originate from zero or completed scaled groups}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func private @zero_helper() -> tensor<128x128xf32, #wrapped_mma> attributes {noinline = true} {
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    tt.return %zero : tensor<128x128xf32, #wrapped_mma>
+  }
+  tt.func public @scaled_call_noinline(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %seed = tt.call @zero_helper() : () -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{accumulator must originate from zero or completed scaled groups}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func private @zero_helper() -> tensor<128x128xf32, #wrapped_mma>
+  tt.func public @scaled_call_external(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %seed = tt.call @zero_helper() : () -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{accumulator must originate from zero or completed scaled groups}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func private @zero_helper() -> tensor<128x128xf32, #wrapped_mma> attributes {noinline = false} {
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    %result = tt.call @zero_helper() : () -> tensor<128x128xf32, #wrapped_mma>
+    tt.return %result : tensor<128x128xf32, #wrapped_mma>
+  }
+  tt.func public @scaled_call_recursive(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %seed = tt.call @zero_helper() : () -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{accumulator must originate from zero or completed scaled groups}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func private @zero_helper() -> tensor<128x128xf32, #wrapped_mma> attributes {noinline = false} {
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    cf.br ^forwarded
+  ^forwarded:
+    tt.return %zero : tensor<128x128xf32, #wrapped_mma>
+  }
+  tt.func public @scaled_call_cfg(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %seed = tt.call @zero_helper() : () -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{accumulator must originate from zero or completed scaled groups}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}
+
+// -----
+
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+
+#wrapped_mma = #tlx.no_verify_layout<#mma>
+#wrapped_lhs = #tlx.no_verify_layout<#lhs>
+#wrapped_rhs = #tlx.no_verify_layout<#rhs>
+#wrapped_as = #tlx.no_verify_layout<#as>
+#wrapped_bs = #tlx.no_verify_layout<#bs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @zero_helper() -> tensor<128x128xf32, #wrapped_mma> attributes {noinline = false} {
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #wrapped_mma>
+    tt.return %zero : tensor<128x128xf32, #wrapped_mma>
+  }
+  tt.func public @scaled_call_public(
+      %a: tensor<128x64xf8E4M3FN, #wrapped_lhs>, %as: tensor<128x2xi8, #wrapped_as>,
+      %b: tensor<64x128xf8E4M3FN, #wrapped_rhs>, %bs: tensor<128x2xi8, #wrapped_bs>) {
+    %seed = tt.call @zero_helper() : () -> tensor<128x128xf32, #wrapped_mma>
+    %c = ttg.require_layout %seed
+        : tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    // expected-error @+1 {{accumulator must originate from zero or completed scaled groups}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #wrapped_lhs>, tensor<128x2xi8, #wrapped_as>,
+          tensor<64x128xf8E4M3FN, #wrapped_rhs>, tensor<128x2xi8, #wrapped_bs>,
+          tensor<128x128xf32, #wrapped_mma> -> tensor<128x128xf32, #wrapped_mma>
+    tt.return
+  }
+}

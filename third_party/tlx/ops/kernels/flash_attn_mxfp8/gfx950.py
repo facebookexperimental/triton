@@ -1,6 +1,8 @@
 """gfx950 MXFP8 Flash Attention forward.
 
-BF16 ``(Z, H, N_CTX, HEAD_DIM)`` in, BF16 out; forward only. The quantization
+BF16 ``(Z, H, N_CTX, HEAD_DIM)`` in, BF16 out. When autograd records the
+inputs, the call goes to the training forward in gfx950_train.py, which saves
+what backward needs; this module's kernels run inference. The quantization
 is Blackwell's: Q and K are E4M3 with an E8M0 scale per 32x32 block (32 rows
 by 32 head elements), V is E4M3 with an E8M0 scale per 32 keys of each head
 column, and the softmax probabilities P get an E8M0 scale per 32 keys of each
@@ -1243,5 +1245,10 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
         raise ValueError(f"gfx950 flash_attn_mxfp8 expects bf16, got {q.dtype}")
     if q.shape[-1] != _HEAD_DIM:
         raise ValueError(f"gfx950 flash_attn_mxfp8 expects head dim {_HEAD_DIM}")
+    if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v)):
+        # Training saves softmax statistics for backward (see gfx950_train.py).
+        from .gfx950_train import flash_attn_mxfp8_train
+
+        return flash_attn_mxfp8_train(q, k, v, causal, sm_scale)
     pingpong = _default_config(causal, q.shape[2])["pingpong"]
     return _launch_quantized(*_quantize_qkv(q, k, v, pingpong), causal, sm_scale)

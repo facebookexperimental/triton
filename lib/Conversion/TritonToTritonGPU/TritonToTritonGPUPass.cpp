@@ -698,6 +698,12 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
       typeConverter, context);
   patterns.add<GenericOpPattern<triton::amdgpu::AssumeUniformOp>>(typeConverter,
                                                                   context);
+  target.addDynamicallyLegalOp<triton::amdgpu::ScaledDowncastFp8By256Op>(
+      [&typeConverter](triton::amdgpu::ScaledDowncastFp8By256Op op) {
+        return typeConverter.isLegal(op.getOperation());
+      });
+  patterns.add<GenericOpPattern<triton::amdgpu::ScaledDowncastFp8By256Op>>(
+      typeConverter, context);
   patterns.add<GenericOpPattern<triton::amdgpu::RematerializedRangeOp>>(
       typeConverter, context);
   patterns.add<GenericOpPattern<triton::amdgpu::RegisterClassAnchorOp>>(

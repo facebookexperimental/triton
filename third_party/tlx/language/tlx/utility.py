@@ -19,6 +19,26 @@ def is_amd_tdm_target(arch):
 
 
 @tl.builtin
+def amd_scaled_downcast_fp8(value, _semantic=None):
+    """Convert an FP32 tensor multiplied by 256 to E4M3FN on gfx950.
+
+    The hardware conversion applies the scale divisor 2^-8 (E8M0 byte 119),
+    so it introduces no separate FP32 multiply. It uses round-to-nearest,
+    ties-to-even and finite saturation; NaNs remain NaNs. The result keeps the
+    input's tensor ownership.
+    """
+    options = _semantic.builder.options
+    if options.backend_name != "hip" or options.arch != "gfx950":
+        raise NotImplementedError("tlx.amd_scaled_downcast_fp8 requires gfx950")
+    value = _semantic.to_tensor(value)
+    if not value.type.is_block() or value.dtype != tl.float32:
+        raise TypeError("value must be an FP32 tensor")
+    result_ty = tl.block_type(tl.float8e4nv, value.type.shape)
+    handle = _semantic.builder.create_amd_scaled_downcast_fp8(value.handle, result_ty.to_ir(_semantic.builder))
+    return tl.tensor(handle, result_ty)
+
+
+@tl.builtin
 def amd_set_wave_sched_mode(value: tl.constexpr, offset: tl.constexpr = 0, width: tl.constexpr = 2, _semantic=None):
     """Write a field of ``HW_REG_WAVE_SCHED_MODE`` on gfx12 GPUs.
 

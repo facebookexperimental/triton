@@ -131,6 +131,43 @@ def amd_register_class_anchor(
 
 
 @tl.builtin
+def amd_scaled_mfma_group(a, a_scale, b, b_scale, acc, full_wave: tl.constexpr, _semantic=None):
+    """Complete one gfx950 E4M3/E8M0 K64 group in four FP32 chains.
+
+    Each participating wave must enable all 64 EXEC lanes.
+    full_wave is required and must be True: it records that the source
+    guarantees this precondition.
+    Layouts do not establish full EXEC.
+    Visible nonuniform predicated regions are rejected.
+    The source must preserve full EXEC in other control regions.
+    Matching native layouts must define two M and two N fragments per wave.
+    Payloads use version-four 32x32x64 dot layouts with kWidth 16.
+    Scales use the matching native E8M0 replica layouts.
+    The accumulator must originate from zero or completed group results.
+    The fused drain completes payload reads and every FP32 result.
+    The compiler can reduce the entry delay for proved load-derived inputs.
+    Unknown producer graphs retain the default entry delay.
+    Every group retains the complete result and payload drain.
+    Existing memory waits and workgroup barriers remain necessary.
+    """
+    full_wave = tl._unwrap_if_constexpr(full_wave)
+    assert isinstance(full_wave, bool) and full_wave, "full_wave must be True"
+    assert all(isinstance(x, tl.tensor)
+               for x in (a, a_scale, b, b_scale, acc)), ("operands must be distributed tensors")
+    assert a.dtype == tl.float8e4nv and b.dtype == tl.float8e4nv, ("payloads must use E4M3FN")
+    assert a_scale.dtype == tl.uint8 and b_scale.dtype == tl.uint8, ("scales must contain E8M0 uint8 bytes")
+    assert acc.dtype == tl.float32, "accumulator must use FP32"
+    assert all(len(x.shape) == 2 for x in (a, a_scale, b, b_scale, acc)), ("operands must be rank two")
+    assert a.shape[1] == 64 and b.shape[0] == 64, "K must equal 64"
+    assert a.shape[0] == acc.shape[0] and b.shape[1] == acc.shape[1], ("matrix shapes must match the accumulator")
+    assert a_scale.shape == [a.shape[0], 2] and b_scale.shape == [b.shape[1], 2
+                                                                  ], ("scale shapes must match the native K64 group")
+    handle = _semantic.builder.create_amd_scaled_mfma_group(a.handle, a_scale.handle, b.handle, b_scale.handle,
+                                                            acc.handle, full_wave)
+    return tl.tensor(handle, acc.type)
+
+
+@tl.builtin
 def amd_scheduled_mfma(
     a,
     b,

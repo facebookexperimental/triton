@@ -240,3 +240,29 @@ Debug Ops
     device_print
     device_assert
     expect_zero
+
+
+TLX AMD Conversion
+------------------
+
+``triton.language.extra.tlx.amd_scaled_downcast_fp8(value)`` converts an FP32
+tensor multiplied by 256 to E4M3FN on gfx950. The conversion instruction applies
+the scale divisor 2^-8, so no separate FP32 multiply is needed. Rounding uses
+round-to-nearest, ties-to-even and finite saturation. NaNs remain NaNs. The
+operation preserves tensor ownership.
+
+
+TLX Native Scaled MFMA
+----------------------
+
+.. autofunction:: triton.language.extra.tlx.amd_scaled_mfma_group
+
+This gfx950 operation completes one native E4M3/E8M0 K64 fragment group.
+Each participating wave must enable all 64 EXEC lanes.
+Set full_wave=True only when the source guarantees this precondition.
+Layouts do not establish full EXEC.
+The compiler can reduce the entry delay from 20 states to four states.
+All payload and scale inputs must pass its load or constant provenance checks.
+Unknown producer graphs retain the 20-state entry delay.
+Every group retains the 20-state result and payload drain.
+The fused dependency drain does not replace memory waits or workgroup barriers.
