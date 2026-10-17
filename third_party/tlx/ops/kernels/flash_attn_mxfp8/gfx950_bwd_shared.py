@@ -239,7 +239,7 @@ def _stage_layout(COLS):
 
 
 @constexpr_function
-def _nc2048_qdo_stage_layout():
+def _partial_qdo_stage_layout():
     """Preserve 16-byte chunks for both Q/dO read orientations."""
     # Physical row bits are r0, r4, r5, r3, r1, r2.
     # Insert 16 bytes after each complete 1024-byte interval.
@@ -652,8 +652,8 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
             kv_layout: tl.constexpr = _stage_layout(D)
             k = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
             vmem = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
-        if ARENA_N == 2048 and LSE_SPLIT:
-            shared_layout: tl.constexpr = _nc2048_qdo_stage_layout()
+        if (ARENA_N == 1024 or ARENA_N == 2048) and LSE_SPLIT:
+            shared_layout: tl.constexpr = _partial_qdo_stage_layout()
         else:
             shared_layout: tl.constexpr = _stage_layout(D)
         qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
