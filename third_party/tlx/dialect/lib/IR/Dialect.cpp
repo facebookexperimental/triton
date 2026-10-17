@@ -288,10 +288,6 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     return delegate->verifyDotOpEncodingCompatibility(op, a, b);
   }
 
-  LogicalResult verifyCatOpEncodingCompatibility(Operation *op) const override {
-    return success();
-  }
-
   LogicalResult
   inferFp4ToFpOpEncoding(ArrayRef<int64_t> shape, int axis, Attribute inEnc,
                          Attribute &outEnc, bool fwdInference,

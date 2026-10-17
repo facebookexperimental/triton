@@ -174,12 +174,14 @@ Synchronization transports the packed access-and-fence frontier in the same
 places that ordinary read visibility is transported:
 
 - A frontier-tracked mbarrier arrive copies the issuing base thread's current
-  proxy frontier into the barrier tracking row. The local copy remains live, so
-  an arrive does not make a later async access by the arriving thread legal.
-- A successful mbarrier wait merges the selected barrier row into the waiting
-  base thread's row. A fence before the wait cannot cover accesses learned only
-  by that wait; a fence after the wait can.
-- Barrier invalidation clears the barrier's proxy tracking row.
+  proxy frontier into the barrier tracking row for its current phase. The local
+  copy remains live, so an arrive does not make a later async access by the
+  arriving thread legal.
+- A successful mbarrier wait merges the tracking row for the requested phase
+  of the selected barrier row into the waiting base thread's row. A fence
+  before the wait cannot cover accesses learned only by that wait; a fence
+  after the wait can.
+- Barrier invalidation clears both phases of the barrier's proxy tracking row.
 - A non-relaxed publishing cluster barrier transports the proxy frontier across
   CTAs. At top level it publishes to every base-thread row; inside warp
   specialization it publishes only from and to the participating partition's
@@ -220,7 +222,9 @@ transaction count in bits `[41..61]`.
 - `experimental_verify_barrier_arrive` checks arrival-count underflow and
   transaction-count range.
 - `experimental_update_barrier_state` applies count deltas, flips the phase
-  when both counts reach zero, and reloads the initial arrival count.
+  when both counts reach zero, and reloads the initial arrival count. The
+  newly current phase's recycled publication slot is cleared, while the
+  preceding phase's publications remain available to late waiters.
 
 Deadlock detection records a waiting flag and phase for each base thread.
 `experimental_check_all_active_waiting` filters waits by the current barrier
