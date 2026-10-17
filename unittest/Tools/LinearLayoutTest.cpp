@@ -1454,6 +1454,33 @@ TEST_F(LinearLayoutTest, InvertAndCompose_Modular_MultiDim_LCM) {
   }
 }
 
+TEST_F(LinearLayoutTest, TryInvertAndCompose_ModularStatus) {
+  auto makeLayout = [&](StringRef inDim, int32_t basis, int32_t size) {
+    BasesT bases;
+    bases[S(inDim)].push_back({basis});
+    return LinearLayout(std::move(bases), {{S("dim0"), size}}, false);
+  };
+
+  auto requested = makeLayout("register", 1, 6);
+  auto unavailable = makeLayout("offset", 2, 6);
+  auto noSolution = requested.tryInvertAndCompose(unavailable);
+  EXPECT_EQ(noSolution.status, ModularSolveStatus::NoSolution);
+  EXPECT_FALSE(noSolution.layout.has_value());
+  EXPECT_DEATH((void)requested.invertAndCompose(unavailable),
+               "invertAndCompose failed");
+  EXPECT_DEATH((void)unavailable.pseudoinvert(), "pseudoinvert failed");
+
+  auto available = LinearLayout::modularIdentity1D(6, S("offset"), S("dim0"));
+  auto success = requested.tryInvertAndCompose(available);
+  ASSERT_TRUE(success.succeeded());
+  EXPECT_TRUE(success.layout.has_value());
+
+  auto singularSource = makeLayout("register", 3, 9);
+  auto singularTarget = makeLayout("offset", 3, 9);
+  auto singular = singularSource.tryInvertAndCompose(singularTarget);
+  EXPECT_NE(singular.status, ModularSolveStatus::NoSolution);
+}
+
 // Test multi-dimensional NPOT layouts
 TEST_F(LinearLayoutTest, IsModularSurjectiveMultiDim) {
   // Create a 2D layout with NPOT dimensions: 3x6
