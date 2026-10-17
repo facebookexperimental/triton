@@ -48,8 +48,13 @@ public:
         return WalkResult::advance();
 
       OpBuilder builder(dotOp);
+      // A 2-CTA MMA reads its operands from both CTAs of the pair, so the
+      // generic writes of the peer CTA must be ordered against the async proxy
+      // at cluster scope, not just within the CTA.
+      auto mmaV5 = dyn_cast<MMAv5OpInterface>(dotOp.getOperation());
+      bool cluster = mmaV5 && mmaV5.getTwoCtas();
       auto fence = FenceAsyncSharedOp::create(builder, dotOp.getLoc(),
-                                              /*bCluster=*/false);
+                                              /*bCluster=*/cluster);
       // If there is all the dependencies are outside of the loop try to hoist
       // the fence.
       while (auto loopOp = fence->getParentOfType<LoopLikeOpInterface>()) {

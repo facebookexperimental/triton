@@ -218,3 +218,25 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
     tt.return
   }
 }
+
+// -----
+
+// A 2-CTA MMA reads its operands from both CTAs of the pair, so the generic
+// (register) writes of the peer CTA must be ordered against the async proxy
+// at cluster scope; a CTA-scoped fence let the leader's MMA read a stale B half.
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, twoCTAs = true>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
+  // CHECK-LABEL: two_cta_mma_register_operand_fence
+  tt.func public @two_cta_mma_register_operand_fence(%a: !ttg.memdesc<128x64xbf16, #shared, #smem>, %b: tensor<64x64xbf16, #blocked>, %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %true = arith.constant true
+    %b_smem = ttg.local_alloc %b : (tensor<64x64xbf16, #blocked>) -> !ttg.memdesc<64x64xbf16, #shared, #smem>
+    // CHECK: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.tc_gen5_mma
+    ttng.tc_gen5_mma %a, %b_smem, %acc, %true, %true {two_ctas} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x64xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
