@@ -8,8 +8,10 @@
 
 namespace mlir::triton::AMD {
 class TargetInfo;
-// Annotates LocalLoadOps with ttg.amdg.syncedByAsyncWait=true if they are
-// synced by an AsyncWait.
+// Annotates LocalLoadOps with ttg.amdg.syncedViaAsyncWait=true if their async
+// producer is ordered by an AsyncWait. This is a producer-to-consumer RAW and
+// wait-count optimization hint; it does not release the LDS slice for a future
+// async write.
 void annotateLocalLoadsSyncedViaAsyncWait(ModuleOp mod);
 
 // Getter for the annotation applied by annotateLocalLoadsSyncedViaAsyncWait
@@ -27,10 +29,10 @@ bool isSyncedViaAsyncWait(Operation *localLoadOp);
 //   1) "amdg.AsyncCopies" will contain all AsyncCopy ops
 //   2) "amdg.LocalLoad" will contain all LocalLoads manually synchronized via
 //      AsyncWait
-// ALl manually synchronized LocalLoads will additionally have "AsyncCopies" as
+// All manually synchronized LocalLoads will additionally have "AsyncCopies" as
 // a non alias scope to disable the implicit waits from the LLVM backend
 
-// If localLoadOp has a token from an AsyncWait:
+// If localLoadOp is marked as synchronized via AsyncWait:
 //  - Attaches "amdg.LocalLoad" alias scope to llLoadOp
 //  - Attaches "amdg.AsyncCopies" as *non* alias scope to llLoadOp
 void addLocalLoadNoAliasScope(Operation *localLoadOp,
