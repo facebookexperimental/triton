@@ -143,17 +143,27 @@ bool assignUserProvidedLatencies(scf::ForOp forOp,
 class AssignLoadLatencies {
 public:
   AssignLoadLatencies(scf::ForOp forOp, int numStages,
-                      DenseMap<Operation *, int> &opLatency)
-      : forOp(forOp), numStages(numStages), opLatency(opLatency) {};
+                      DenseMap<Operation *, int> &opLatency, bool useMetaWS)
+      : forOp(forOp), numStages(numStages), opLatency(opLatency),
+        useMetaWS(useMetaWS) {};
 
   void run() {
     bool pipelineWithoutDot = forOp->hasAttr(mlir::triton::kNumStagesAttrName);
     ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
     tt::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
+    // Under Meta autoWS the memory planner, not the pipeliner, sizes TMA
+    // landing buffers and keeps a slot whose size is not a multiple of its
+    // alignment single-buffered. Leaving such a load (e.g. a 1-D [16] fp32
+    // tile) unpipelined only moves it to its consumer's stage, after the
+    // other loads of the same producer partition are prefetched; if one of
+    // those is single-buffered, the producer then blocks on it before issuing
+    // the load the consumer is waiting for, and the kernel deadlocks.
+    bool allowUnalignedTMA = useMetaWS && isUnderWarpSpecialize(forOp);
     llvm::MapVector<Operation *, std::pair<int, Operation *>> loadOpToIndLevel =
         loadOpsToIndirectionLevel(forOp, pipelineWithoutDot, axisInfoAnalysis,
-                                  numStages, opLatency);
+                                  numStages, opLatency, /*filterSmall=*/true,
+                                  allowUnalignedTMA);
     if (loadOpToIndLevel.empty())
       return;
 
@@ -169,9 +179,17 @@ public:
   }
 
 private:
+  static bool isUnderWarpSpecialize(scf::ForOp forOp) {
+    for (Operation *op = forOp; op; op = op->getParentOp())
+      if (op->hasAttr(mlir::triton::kWarpSpecializeAttrName))
+        return true;
+    return false;
+  }
+
   scf::ForOp forOp;
   int numStages;
   DenseMap<Operation *, int> &opLatency;
+  bool useMetaWS;
 
 public:
   static bool canHaveSharedEncoding(tt::LoadOp op) {
@@ -184,7 +202,7 @@ public:
   static bool
   isPipeliningBeneficial(Operation *op, Operation *finalUser,
                          tt::ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                         bool filterSmall) {
+                         bool filterSmall, bool allowUnalignedTMA) {
     if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
       if (filterSmall && !canBeConvertedToAsyncLoad(loadOp, axisInfoAnalysis)) {
         LDBG("Load " << *loadOp << " is too small for pipelining");
@@ -193,7 +211,8 @@ public:
     }
     if (auto loadOp = dyn_cast<tt::DescriptorLoadLikeOpInterface>(op)) {
       auto descTy = cast<tt::TensorDescType>(loadOp.getDesc().getType());
-      if (descTy.getSharedLayout() && !canPipelineTMALoad(op)) {
+      if (descTy.getSharedLayout() && !allowUnalignedTMA &&
+          !canPipelineTMALoad(op)) {
         LDBG("TMA load " << *op
                          << " has a per-stage allocation that is not aligned "
                             "for pipelining");
@@ -408,7 +427,7 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
         continue;
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
-    AssignLoadLatencies(forOp, numStages, opLatency).run();
+    AssignLoadLatencies(forOp, numStages, opLatency, useMetaWS).run();
     AssignMMALatencies(forOp, opLatency, useMetaWS).run();
   }
   serializeLatencies(moduleOp, opLatency);
@@ -424,7 +443,7 @@ llvm::MapVector<Operation *, std::pair<int, Operation *>>
 loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                           tt::ModuleAxisInfoAnalysis &axisInfoAnalysis,
                           int numStages, DenseMap<Operation *, int> &opLatency,
-                          bool filterSmall) {
+                          bool filterSmall, bool allowUnalignedTMA) {
   llvm::MapVector<Operation *, std::pair<int, Operation *>> loadOpToIndLevel;
   DenseSet<Operation *> seen;
   DenseSet<Operation *> excluded;
@@ -435,7 +454,8 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
           return;
         if (isa<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(op)) {
           if (!AssignLoadLatencies::isPipeliningBeneficial(
-                  op, finalUser, axisInfoAnalysis, filterSmall))
+                  op, finalUser, axisInfoAnalysis, filterSmall,
+                  allowUnalignedTMA))
             return;
           // FB Change: Skip the load if the user provided latency is 0.
           // TODO: Support user provided non-zero latency for loads.
