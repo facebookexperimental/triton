@@ -10,46 +10,44 @@
 
 namespace mlir {
 
-/// Given a value that may be produced by a chain of memdesc_index operations,
-/// narrow the parent buffer's interval to the sub-range actually accessed.
-/// memdesc_index selects a contiguous slice along the leading dimension, so if
-/// the index is a compile-time constant we can compute the exact byte range.
-/// This avoids false hazards when different indices of the same buffer are
-/// accessed (e.g. initializing elements of a barrier array).
+/// Given a value produced by memdesc_index, possibly wrapped in transparent
+/// memdesc views, narrow the parent buffer's interval to the sub-range actually
+/// accessed. memdesc_index selects a contiguous slice along the leading
+/// dimension, so a compile-time constant index identifies an exact byte range.
+/// Nested memdesc_index operations are verifier-invalid.
 static Interval<size_t> narrowIntervalForSubview(Value value,
                                                  Interval<size_t> interval) {
-  while (auto indexOp = value.getDefiningOp<triton::gpu::MemDescIndexOp>()) {
-    auto parentType =
-        cast<triton::gpu::MemDescType>(indexOp.getSrc().getType());
-
-    // Only narrow when the index is a compile-time constant.
-    APInt indexVal;
-    if (!matchPattern(indexOp.getIndex(), m_ConstantInt(&indexVal)))
+  triton::gpu::MemDescIndexOp indexOp;
+  while (Operation *defOp = value.getDefiningOp()) {
+    if ((indexOp = dyn_cast<triton::gpu::MemDescIndexOp>(defOp)))
       break;
-
-    int64_t idx = indexVal.getSExtValue();
-    int64_t dim0 = parentType.getShape()[0];
-    size_t totalSize = interval.end() - interval.start();
-
-    // Ensure the stride divides evenly (should always hold for well-formed IR).
-    if (dim0 <= 0 || totalSize % dim0 != 0)
-      break;
-
-    size_t stride = totalSize / dim0;
-    size_t newStart = interval.start() + idx * stride;
-    size_t newEnd = newStart + stride;
-    interval = Interval<size_t>(newStart, newEnd);
-
-    // Continue tracing through the parent in case of nested indexing.
-    value = indexOp.getSrc();
+    if (!defOp->hasTrait<OpTrait::MemDescViewTrait>())
+      return interval;
+    value = defOp->getOperand(0);
   }
-  return interval;
+  if (!indexOp)
+    return interval;
+
+  APInt indexVal;
+  if (!matchPattern(indexOp.getIndex(), m_ConstantInt(&indexVal)))
+    return interval;
+
+  auto parentType = cast<triton::gpu::MemDescType>(indexOp.getSrc().getType());
+  int64_t dim0 = parentType.getShape()[0];
+  size_t totalSize = interval.end() - interval.start();
+  if (dim0 <= 0 || totalSize % dim0 != 0)
+    return interval;
+
+  size_t stride = totalSize / dim0;
+  size_t newStart = interval.start() + indexVal.getSExtValue() * stride;
+  return Interval<size_t>(newStart, newStart + stride);
 }
 
 AllocationSlice::AllocationSlice(Value value,
                                  Interval<size_t> allocationInterval,
                                  Allocation::BufferId bufferId)
-    : allocationInterval(allocationInterval), bufferId(bufferId) {
+    : allocationInterval(narrowIntervalForSubview(value, allocationInterval)),
+      bufferId(bufferId) {
   auto accessTy = cast<triton::gpu::MemDescType>(value.getType());
   this->accessTy = accessTy;
 

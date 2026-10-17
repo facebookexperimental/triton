@@ -724,11 +724,17 @@ unsigned getContiguity(Value ptr, Value offset,
   // FIXME (Alex): this should not be needed anymore because it's done inside
   // getContiguity, but we have an order issues with LL, so we keep this
   // until the LL order issue is fixed
-  auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
-  auto llAttr = triton::gpu::LinearEncodingAttr::get(tensorTy.getContext(),
-                                                     std::move(linearLayout));
+  SmallVector<unsigned> contigPerThread;
+  if (auto llAttr =
+          dyn_cast<triton::gpu::LinearEncodingTrait>(tensorTy.getEncoding())) {
+    contigPerThread = llAttr.getContigPerThread();
+  } else {
+    auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
+    auto fallbackAttr = triton::gpu::LinearEncodingAttr::get(
+        tensorTy.getContext(), std::move(linearLayout));
+    contigPerThread = fallbackAttr.getContigPerThread();
+  }
   auto order = triton::gpu::getOrder(tensorTy);
-  auto contigPerThread = llAttr.getContigPerThread();
   assert(order[0] < contigPerThread.size() &&
          "Unexpected contigPerThread size");
   contiguity = std::min(contiguity, contigPerThread[order[0]]);
