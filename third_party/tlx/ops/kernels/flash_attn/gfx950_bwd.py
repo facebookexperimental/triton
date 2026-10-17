@@ -5184,10 +5184,11 @@ def fa_backward(q, k, v, o, do, lse, sm_scale, causal, *, split_q=None):
             _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel,
             _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel,
         )
-        # Optimized kernels scale raw LSE in the main kernel.
-        # Original GQA kernels require pre-scaled log2 LSE.
+        # Optimized kernels scale raw LSE in the main kernel, except for the
+        # score-cache shapes. Original GQA kernels require pre-scaled log2 LSE.
         lse_for_main = lse
-        if q.shape[1] == k.shape[1] or optimized:
+        if (q.shape[1] == k.shape[1]
+                or optimized) and not _optimized_gqa_uses_log2_lse(dispatch, gqa_signature, causal):
             _run_bwd_preprocess(o, do, delta)
         else:
             lse_for_main = torch.empty_like(lse)
@@ -5848,6 +5849,12 @@ def _attn_bwd_opt_gqa_front(
         if CACHE_SCORE_K:
             scores, dp = _attn_bwd_gqa_front_stream_cache64(k_buffer, k_score_cache, q_t, v_operand, do_t, MMA_NM,
                                                             K_NM_LAYOUT, QT_LAYOUT)
+            # One joint register boundary makes score scaling wait for every
+            # score and dP update instead of each score band.
+            joint = tlx.require_layout(tl.cat(scores, dp, dim=0), MMA_NM, pin=False)
+            joint = tlx.amd_register_resident(joint, register_class="vgpr", registers_per_group=32)
+            scores = tlx.extract_slice(joint, [256, 16], [0, 0])
+            dp = tlx.extract_slice(joint, [256, 16], [256, 0])
         else:
             scores, dp = _attn_bwd_gqa_front_stream(k_buffer, q_t, v_operand, do_t, MMA_NM, K_NM_LAYOUT, QT_LAYOUT)
     if PIN_SCORES:
@@ -5913,16 +5920,9 @@ def _attn_bwd_opt_gqa_front(
     do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
     if not IS_CAUSAL:
         if CACHE_SCORE_K:
-            # Keep native FP32 LSE scaling visible to LLVM.
-            # The empty scalar VGPR pin contains no instruction.
-            lse_log2 = tl.inline_asm_elementwise(
-                "",
-                "=v,0",
-                [lse_values * 1.4426950408889634],
-                dtype=tl.float32,
-                is_pure=True,
-                pack=1,
-            )
+            # Score-cache shapes receive log2 LSE from preprocessing.
+            # A native multiply here waits on its just-issued LDS load.
+            lse_log2 = lse_values
         else:
             lse_log2 = tl.inline_asm_elementwise(
                 "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
@@ -6249,6 +6249,8 @@ def _attn_bwd_opt_gqa_dk_fragmented_prefetch(
     """Update fragmented dK while prefetching the first two dQ bands."""
     query_rows: tl.constexpr = dk_lhs.shape[1]
     tl.static_assert(query_rows == 16 or query_rows == 32)
+    # BM16 dK inputs come straight from LDS; leave their placement to LLVM.
+    PIN_OPERANDS: tl.constexpr = query_rows != 16
     tl.static_assert(dk_lhs.shape == (256, query_rows))
     tl.static_assert(dk_rhs.shape == (query_rows, 128))
     tl.static_assert(prev_ds.shape == (query_rows, 256))
@@ -6283,24 +6285,24 @@ def _attn_bwd_opt_gqa_dk_fragmented_prefetch(
         c03 = tlx.extract_slice(dk, [128, 32], [0, 96])
         c13 = tlx.extract_slice(dk, [128, 32], [128, 96])
 
-    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent")
-    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent")
+    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
+    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
     ds0 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 0], [query_rows, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent")
-    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent")
-    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent")
-    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent")
+    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
+    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
+    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
+    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
     ds1 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 32], [query_rows, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator_role="persistent")
-    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator_role="persistent")
+    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
+    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
 
     if FRAGMENT_CHAIN:
         return (c00, c10, c01, c11, c02, c12, c03, c13), ds0, ds1
@@ -6390,6 +6392,7 @@ def _attn_bwd_gqa_dkdv_braid_prefetch(
     DS_MD_LAYOUT: tl.constexpr,
 ):
     """Update persistent dK and transient dV pairs before the unchanged dQ."""
+    # Unpinned dK inputs let LLVM wait for each loaded operand at its MFMA.
     tl.static_assert(dk_lhs.shape == (256, 16))
     tl.static_assert(dv_lhs.shape == (256, 16))
     tl.static_assert(dk_rhs.shape == (16, 128))
@@ -6431,22 +6434,22 @@ def _attn_bwd_gqa_dkdv_braid_prefetch(
     v13 = tlx.extract_slice(dv, [128, 32], [128, 96])
     v00 = tlx.amd_scheduled_mfma(vl0, vr0, v00, accumulator_role="transient")
     v10 = tlx.amd_scheduled_mfma(vl1, vr0, v10, accumulator_role="transient")
-    k00 = tlx.amd_scheduled_mfma(kl0, kr0, k00, accumulator_role="persistent")
-    k10 = tlx.amd_scheduled_mfma(kl1, kr0, k10, accumulator_role="persistent")
+    k00 = tlx.amd_scheduled_mfma(kl0, kr0, k00, accumulator_role="persistent", pin_operands=False)
+    k10 = tlx.amd_scheduled_mfma(kl1, kr0, k10, accumulator_role="persistent", pin_operands=False)
     ds0 = tlx.local_load(tlx.local_slice(prev_ds, [0, 0], [16, 32]), layout=DS_MD_LAYOUT, relaxed=True)
     v01 = tlx.amd_scheduled_mfma(vl0, vr1, v01, accumulator_role="transient")
     v11 = tlx.amd_scheduled_mfma(vl1, vr1, v11, accumulator_role="transient")
-    k01 = tlx.amd_scheduled_mfma(kl0, kr1, k01, accumulator_role="persistent")
-    k11 = tlx.amd_scheduled_mfma(kl1, kr1, k11, accumulator_role="persistent")
+    k01 = tlx.amd_scheduled_mfma(kl0, kr1, k01, accumulator_role="persistent", pin_operands=False)
+    k11 = tlx.amd_scheduled_mfma(kl1, kr1, k11, accumulator_role="persistent", pin_operands=False)
     v02 = tlx.amd_scheduled_mfma(vl0, vr2, v02, accumulator_role="transient")
     v12 = tlx.amd_scheduled_mfma(vl1, vr2, v12, accumulator_role="transient")
-    k02 = tlx.amd_scheduled_mfma(kl0, kr2, k02, accumulator_role="persistent")
-    k12 = tlx.amd_scheduled_mfma(kl1, kr2, k12, accumulator_role="persistent")
+    k02 = tlx.amd_scheduled_mfma(kl0, kr2, k02, accumulator_role="persistent", pin_operands=False)
+    k12 = tlx.amd_scheduled_mfma(kl1, kr2, k12, accumulator_role="persistent", pin_operands=False)
     ds1 = tlx.local_load(tlx.local_slice(prev_ds, [0, 32], [16, 32]), layout=DS_MD_LAYOUT, relaxed=True)
     v03 = tlx.amd_scheduled_mfma(vl0, vr3, v03, accumulator_role="transient")
     v13 = tlx.amd_scheduled_mfma(vl1, vr3, v13, accumulator_role="transient")
-    k03 = tlx.amd_scheduled_mfma(kl0, kr3, k03, accumulator_role="persistent")
-    k13 = tlx.amd_scheduled_mfma(kl1, kr3, k13, accumulator_role="persistent")
+    k03 = tlx.amd_scheduled_mfma(kl0, kr3, k03, accumulator_role="persistent", pin_operands=False)
+    k13 = tlx.amd_scheduled_mfma(kl1, kr3, k13, accumulator_role="persistent", pin_operands=False)
     row0 = tl.cat(tl.cat(v00, v01, dim=1), tl.cat(v02, v03, dim=1), dim=1)
     row1 = tl.cat(tl.cat(v10, v11, dim=1), tl.cat(v12, v13, dim=1), dim=1)
     new_dv = tlx.require_layout(tl.cat(row0, row1, dim=0), MMA_ND, pin=False)
@@ -6505,12 +6508,13 @@ def _attn_bwd_opt_gqa_phase(
     Its zero dS produces a harmless dQ before a real previous phase exists.
     """
     tl.static_assert(not (DIRECT_DK and REDIRECT_DUMMY_DQ))
-    BRAID_DK_DV: tl.constexpr = FRAGMENT_CHAIN and HQ == 8 * HK and (N == 2048 or N == 4096)
+    BRAID_DK_DV: tl.constexpr = FRAGMENT_CHAIN and HQ == 8 * HK and (N == 2048 or N == 4096 or N == 8192 or N == 16384)
     tl.static_assert(not (DIRECT_DK and FRAGMENT_CHAIN))
     tl.static_assert(not SKIP_DUMMY_DQ or (FRAGMENT_CHAIN and REDIRECT_DUMMY_DQ))
     if not IS_CAUSAL and (REDIRECT_DUMMY_DQ or (HQ == HK and not UNROLL_PHASES)):
         # Unrolled phases share one hint; rolled MHA needs a hint in each region.
-        tlx.amd_iglp_opt(2)
+        # The measured GQA1K schedule uses the simple exp/MFMA interleave.
+        tlx.amd_iglp_opt(3 if HQ == 8 * HK and N == 1024 else 2)
     step = outer_step * 4 + phase
     cur_stage = phase % 2
     q_slice, do_slice = _attn_bwd_gqa_load_qdo_slice(
@@ -7375,12 +7379,17 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         layout=k_md_layout,
         relaxed=True,
     )
+    # Native unpinned dK inputs make the full BM16 GQA specialization faster
+    # than the BM32 route on the measured 8K/16K shapes.
+    GQA_LONG_BM16: tl.constexpr = (HQ == 64 and HK == 8 and not IS_CAUSAL and SPLIT_Q == 1
+                                   and ((BATCH == 16 and N == 8192) or (BATCH == 15 and N == 16384)))
     CACHE_SCORE_K: tl.constexpr = (BATCH == 16 and HQ == 16 and HK == 16 and
                                    (N == 1024 or N == 2048 or N == 4096 or N == 8192 or N == 16384) and D == 128
                                    and BLOCK_M == 16 and BLOCK_N == 256 and not IS_CAUSAL and SPLIT_Q == 1
                                    or (BATCH == 16 and HQ == 64 and HK == 8 and
                                        (N == 1024 or N == 2048 or N == 4096) and D == 128 and BLOCK_M == 16
-                                       and BLOCK_N == 256 and not IS_CAUSAL and SPLIT_Q == 1))
+                                       and BLOCK_N == 256 and not IS_CAUSAL and SPLIT_Q == 1)
+                                   or (GQA_LONG_BM16 and D == 128 and BLOCK_M == 16 and BLOCK_N == 256))
     if CACHE_SCORE_K:
         k_score_cache = tlx.local_load(
             tlx.local_slice(k_buffer, [0, 0], [64, D]),
@@ -7392,8 +7401,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         k_score_cache = None
     # Chain dK fragments and peel the initial zero-dQ bridge for full MHA
     # and short unsplit GQA. Each owned interval is nonempty.
-    FRAGMENT_CHAIN: tl.constexpr = not IS_CAUSAL and (HQ == HK or (N <= 4096 and SPLIT_Q == 1))
-    PEEL_ZERO_DQ_SEED: tl.constexpr = not IS_CAUSAL and (HQ == HK or (N <= 4096 and SPLIT_Q == 1))
+    FRAGMENT_CHAIN: tl.constexpr = not IS_CAUSAL and (HQ == HK or (N <= 4096 and SPLIT_Q == 1) or GQA_LONG_BM16)
+    PEEL_ZERO_DQ_SEED: tl.constexpr = not IS_CAUSAL and (HQ == HK or (N <= 4096 and SPLIT_Q == 1) or GQA_LONG_BM16)
     if FRAGMENT_CHAIN:
         dk = (
             tlx.zeros((128, 32), tl.float32, layout=mma_nd),
@@ -7409,9 +7418,9 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
     dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
     # Carrying delayed dQ across outer/head boundaries helps short unsplit
-    # GQA. Published paired timings lose at 8K/16K, so keep their per-outer
-    # drain and preserve the bounded automatic split schedule.
-    continuous_gqa: tl.constexpr = HQ != HK and not IS_CAUSAL and N <= 4096 and SPLIT_Q == 1
+    # GQA and the measured 8K/16K shapes. Other long GQA shapes keep their
+    # per-outer drain and the bounded automatic split schedule.
+    continuous_gqa: tl.constexpr = HQ != HK and not IS_CAUSAL and (N <= 4096 or GQA_LONG_BM16) and SPLIT_Q == 1
     continuous_bridge: tl.constexpr = HQ == HK or continuous_gqa
     unroll_phases: tl.constexpr = continuous_gqa or (HQ == HK and not IS_CAUSAL)
     # Each unrolled phase frees its consumed Q/dO slice at the existing CTA
@@ -7662,7 +7671,12 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     store_d = tlx.rematerialized_range(0, D, 31)
     key_offsets = kv_offset_base + store_n[:, None] * D + store_d[None, :]
     key_offsets = tlx.require_layout(key_offsets.to(tl.int32), kv_native_layout, pin=False)
-    if SPLIT_Q == 1:
+    # The measured MHA1K-8K shapes stage dK/dV through the dead Q/dO LDS for
+    # 16-byte row stores. Native stores write 8 bytes per lane over 32 rows.
+    STAGE_KV_STORE: tl.constexpr = CACHE_SCORE_K and HQ == HK and N <= 8192
+    if STAGE_KV_STORE:
+        _attn_bwd_store_kv_staged(dk.to(tl.bfloat16), DK, kv_offset_base + kv_tile_n * D, q_buffers, do_buffers)
+    elif SPLIT_Q == 1:
         tlx.buffer_store(dk.to(tl.bfloat16), DK, key_offsets)
     else:
         # FP32 partials have half the buffer-addressable element range of
@@ -7683,10 +7697,57 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     dv = tl.permute(dv, (0, 3, 1, 2, 4, 5))
     dv = tl.reshape(dv, (BLOCK_N, D))
     dv = tlx.require_layout(dv, kv_native_layout, pin=False)
-    if SPLIT_Q == 1:
+    if STAGE_KV_STORE:
+        _attn_bwd_store_kv_staged(dv.to(tl.bfloat16), DV, kv_offset_base + kv_tile_n * D, q_buffers, do_buffers)
+    elif SPLIT_Q == 1:
         tlx.buffer_store(dv.to(tl.bfloat16), DV, key_offsets)
     else:
         tlx.buffer_store(dv, DV, key_offsets)
+
+
+@triton.jit
+def _attn_bwd_store_kv_staged(x, PTR, base, q_buffers, do_buffers):
+    """Store a native 256x128 BF16 tile through the dead Q/dO stages as 256x32 row chunks.
+
+    Each 32-column chunk is register-local in the native layout. Writing K's
+    LDS instead would make every K read in the main loop non-invariant.
+    """
+    stage_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32), (1024, 16)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0]],
+        [256, 32],
+    )
+    chunk_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (8, 16, 32, 64, 128, 256, 512, 1024),
+            (1, 2, 4, 2048, 4096),
+        ),
+    )
+    x = tl.permute(tl.reshape(x, (256, 2, 2, 32)), (0, 3, 1, 2))
+    a, b = tl.split(x)
+    x0, x2 = tl.split(a)
+    x1, x3 = tl.split(b)
+    v0 = tlx.local_reinterpret(tlx.local_view(q_buffers, 0), tl.bfloat16, [256, 32], layout=stage_layout)
+    v1 = tlx.local_reinterpret(tlx.local_view(q_buffers, 1), tl.bfloat16, [256, 32], layout=stage_layout)
+    v2 = tlx.local_reinterpret(tlx.local_view(do_buffers, 0), tl.bfloat16, [256, 32], layout=stage_layout)
+    v3 = tlx.local_reinterpret(tlx.local_view(do_buffers, 1), tl.bfloat16, [256, 32], layout=stage_layout)
+    tl.debug_barrier()
+    tlx.local_store(v0, x0)
+    tlx.local_store(v1, x1)
+    tlx.local_store(v2, x2)
+    tlx.local_store(v3, x3)
+    tl.debug_barrier()
+    rows = tl.arange(0, 256)
+    cols = tl.arange(0, 32)
+    offs = tlx.require_layout((base + rows[:, None] * 128 + cols[None, :]).to(tl.int32), chunk_layout, pin=False)
+    tlx.buffer_store(tlx.local_load(v0, layout=chunk_layout), PTR, offs)
+    tlx.buffer_store(tlx.local_load(v1, layout=chunk_layout), PTR, offs + 32)
+    tlx.buffer_store(tlx.local_load(v2, layout=chunk_layout), PTR, offs + 64)
+    tlx.buffer_store(tlx.local_load(v3, layout=chunk_layout), PTR, offs + 96)
 
 
 @triton.jit
@@ -8425,6 +8486,10 @@ def _attn_bwd_gqa_bm32_phase(
     tl.static_assert(not (DIRECT_DK and FRAGMENT_CHAIN))
     tl.static_assert(not SKIP_DUMMY_DQ or (REDIRECT_DUMMY_DQ and not DIRECT_DK))
     if N == 16384 and phase == 0:
+        tlx.amd_iglp_opt(2)
+    elif HQ == HK and N != 16384:
+        # Native MFMAs let LLVM cluster each front's exp chain. Interleave it
+        # with independent MFMAs in every rolled MHA phase region.
         tlx.amd_iglp_opt(2)
     step = outer_step * 2 + phase
     cur_stage = step % 2
@@ -9590,6 +9655,10 @@ def _validate_split_q(split_q, total_outer_steps=None):
         raise ValueError(f"split_q must be <= {total_outer_steps} outer64 steps")
 
 
+_GQA_LONG_BM16_SHAPES = ((16, 64, 8, 8192, 128), (15, 64, 8, 16384, 128))
+_MHA_SCORE_CACHE_SHAPES = tuple((16, 16, 16, n, 128) for n in (1024, 2048, 4096, 8192, 16384))
+
+
 def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_q=None):
     """Resolve a manual split or the conservative automatic schedule."""
     if shape is not None and not _is_supported_gqa_shape(shape):
@@ -9620,27 +9689,28 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
     _validate_split_q(split_q, total_outer_steps)
     if causal and split_q != 1:
         raise ValueError("split_q > 1 requires non-causal D128 attention")
-    long_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] >= 8192 and split_q == 1)
-    measured_mha_bm32 = (shape in ((16, 16, 16, 1024, 128), (16, 16, 16, 2048, 128), (16, 16, 16, 4096, 128),
-                                   (16, 16, 16, 8192, 128), (16, 16, 16, 16384, 128)) and not causal and split_q == 1)
+    # The measured GQA8K/16K shapes use the BM16 kernel, like every measured MHA shape.
+    measured_gqa_long_bm16 = shape in _GQA_LONG_BM16_SHAPES and not causal and split_q == 1
+    long_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] >= 8192 and split_q == 1
+                and not measured_gqa_long_bm16)
+    measured_mha = shape in _MHA_SCORE_CACHE_SHAPES and not causal and split_q == 1
     short_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] <= 4096 and split_q == 1)
     long_8k = long_gqa and shape[3] == 8192
     measured_gqa8k = shape == (16, 64, 8, 8192, 128) and not causal and split_q == 1
     precise_mha16k = shape == (16, 16, 16, 16384, 128) and not causal and split_q == 1
     regalloc = _d128_regalloc_options()
-    # Short GQA and the measured 16K MHA shape disable instruction sinking.
-    # The measured GQA8K shape enables reverse assignment.
-    # Other GQA8K shapes keep reverse assignment disabled.
-    # Explicit environment overrides remain independent.
-    reverse_default = "0" if causal or (long_8k and not measured_gqa8k) else "1"
-    sink_default = "0" if (short_gqa or long_8k or
-                           (shape == (16, 16, 16, 16384, 128) and not causal and split_q == 1)) else "1"
+    # Measured BM16 shapes disable instruction sinking. Measured MHA and the
+    # BM16 GQA8K/16K shapes also disable reverse assignment, as do unmeasured
+    # BM32 GQA8K shapes. Explicit environment overrides remain independent.
+    reverse_default = "0" if (causal or
+                              (long_8k and not measured_gqa8k) or measured_mha or measured_gqa_long_bm16) else "1"
+    sink_default = "0" if (short_gqa or long_8k or measured_mha or measured_gqa_long_bm16) else "1"
     regalloc["reverse_local_assignment"] = os.environ.get(_D128_REVERSE_LOCAL_ENV, reverse_default) == "1"
     regalloc["sink_insts_to_avoid_spills"] = os.environ.get(_D128_SINK_INSTS_ENV, sink_default) == "1"
     return _D128InterleavedDispatch(
         main_entry=(_attn_bwd_dkdv_dq_d128_gqa_bm32_kernel
-                    if long_gqa or measured_mha_bm32 else _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel),
-        block_m=32 if long_gqa or measured_mha_bm32 else 16,
+                    if long_gqa else _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel),
+        block_m=32 if long_gqa else 16,
         block_n=256,
         num_warps=4,
         num_stages=1,
@@ -9776,6 +9846,14 @@ def _select_d128_interleaved_dispatch(q_shape=None, k_shape=None, causal=False, 
     if split_q is not None and split_q != 1:
         raise ValueError("split_q > 1 requires non-causal D128 attention")
     return _select_original_d128_interleaved_dispatch(q_shape, k_shape, causal)
+
+
+def _optimized_gqa_uses_log2_lse(dispatch, shape, causal):
+    """Match the optimized kernel's score-cache specializations that read log2 LSE."""
+    return (dispatch.main_entry is _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel and dispatch.block_m == 16
+            and dispatch.block_n == 256 and dispatch.split_q == 1 and not causal
+            and tuple(shape) in ((16, 64, 8, 1024, 128), (16, 64, 8, 2048, 128),
+                                 (16, 64, 8, 4096, 128), *_GQA_LONG_BM16_SHAPES, *_MHA_SCORE_CACHE_SHAPES))
 
 
 def _allocate_dq_accumulator(q, k, causal=False, split_q=None):
