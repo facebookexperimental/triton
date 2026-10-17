@@ -323,8 +323,11 @@ struct CanonicalizeConvertFromConvert
   mlir::LogicalResult
   matchAndRewrite(ConvertLayoutOp op,
                   PatternRewriter &rewriter) const override {
-    // Convert to the same layout is redundant.
+    // Convert to the same layout is redundant unless it carries a backend
+    // request that must follow the conversion surviving layout propagation.
     if (op->getResultTypes() == op->getOperandTypes()) {
+      if (op->hasAttr("tlx.rematerialize_coordinates"))
+        return failure();
       rewriter.replaceOp(op, op->getOperands());
       return success();
     }

@@ -106,6 +106,15 @@ def _row_per_thread_layout():
     return tlx.layout(shape=((32, 4), (128, )), stride=((128, 4096), (1, )))
 
 
+def _column_per_thread_layout():
+    return tlx.layout(shape=((32, 4), (128, )), stride=((1, 32), (128, )))
+
+
+_COLUMN_PER_THREAD_LINEAR = ("#ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0]], "
+                             "lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], "
+                             "warp = [[0, 32], [0, 64]], block = []}>")
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_pinned_layout_propagates_through_elementwise():
     """A pinned (no_verify) register layout that feeds arith/math elementwise
@@ -373,6 +382,47 @@ def test_pinned_propagates_through_cast():
     assert "no_verify_layout" not in compiled.asm["ttgir"]
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_require_layout_after_release_reanchors_layout():
+    """A release boundary should permit a later explicit pin to establish a new
+    hard layout anchor. The current layout-removal path drops that second pin
+    when its only consumer is a layout-flexible local_store."""
+
+    @triton.jit
+    def kernel(ROW: tl.constexpr, COL: tl.constexpr):
+        offs = tl.arange(0, 128)
+        x = offs[:, None].to(tl.float32) + offs[None, :].to(tl.float32)
+        row = tlx.require_layout(x, ROW)
+        col = tlx.require_layout(tlx.release_layout(row), COL)
+        out_buf = tlx.local_alloc((128, 128), tl.float32, tl.constexpr(1))
+        tlx.local_store(tlx.local_view(out_buf, 0), col)
+
+    compiled = kernel.warmup(_row_per_thread_layout(), _column_per_thread_layout(), grid=(1, ), num_warps=4)
+    ttgir = compiled.asm["ttgir"]
+    assert _COLUMN_PER_THREAD_LINEAR in ttgir
+    _assert_no_layout_residue(ttgir)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_require_layout_after_release_reanchors_tmem_store():
+    """A user pin that feeds a TMEM local_store must not be erased by the
+    convert-layout cleanup before the required TMEM-compatible store layout."""
+
+    @triton.jit
+    def kernel(ROW: tl.constexpr, COL: tl.constexpr):
+        offs = tl.arange(0, 128)
+        x = offs[:, None].to(tl.float32) + offs[None, :].to(tl.float32)
+        row = tlx.require_layout(x, ROW)
+        store_value = tlx.require_layout(tlx.release_layout(row), COL)
+        out_buf = tlx.local_alloc((128, 128), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        tlx.local_store(tlx.local_view(out_buf, 0), store_value)
+
+    compiled = kernel.warmup(_row_per_thread_layout(), _column_per_thread_layout(), grid=(1, ), num_warps=4)
+    ttgir = compiled.asm["ttgir"]
+    assert _COLUMN_PER_THREAD_LINEAR in ttgir
+    _assert_no_layout_residue(ttgir)
+
+
 @pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
 def test_dump_layout_cute(capfd, monkeypatch):
     """`tlx.dump_layout` prints the resolved layout in CuTe Shape:Stride form to
@@ -519,9 +569,9 @@ def test_swizzled_layout_lowers_to_swizzled_shared():
 # ---------------------------------------------------------------------------
 # "Does the compiler understand user layouts?" -- adversarial end-to-end cases.
 #
-# Every user-pinned layout rides through the pipeline as #tlx.user_layout<...>
-# and must (a) survive to the final TTGIR as the exact concrete layout the user
-# asked for, and (b) leave no #tlx.user_layout / no_verify_layout residue.
+# Every user-pinned layout must (a) survive to the final TTGIR as the exact
+# concrete layout the user asked for, and (b) leave no #tlx.user_layout,
+# no_verify_layout, or ttg.require_layout residue.
 # ---------------------------------------------------------------------------
 
 
@@ -531,6 +581,7 @@ def _assert_no_layout_residue(ttgir):
     # `tlx.user_layout` (see triton_tlx.cc), which must not trip this check.
     assert "#tlx.user_layout" not in ttgir, "user-layout wrapper encoding leaked into final IR"
     assert "#tlx.no_verify_layout" not in ttgir, "no-verify wrapper encoding leaked into final IR"
+    assert "ttg.require_layout" not in ttgir, "require_layout boundary leaked into final IR"
 
 
 @pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
