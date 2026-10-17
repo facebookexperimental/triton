@@ -151,6 +151,60 @@ static FailureOr<unsigned> mapResultDimToDescriptor(tt::TensorDescType descType,
   return rankDelta + resultDim;
 }
 
+// Halve dimension splitDim of a blocked layout's tile when the halved shape no
+// longer holds it: move threads from splitDim to the largest other dimension,
+// then shrink sizePerThread. Returns null if the layout is not blocked.
+static ttg::BlockedEncodingAttr halveBlockedEncoding(Attribute encoding,
+                                                     ArrayRef<int64_t> shape,
+                                                     unsigned splitDim) {
+  auto blocked = dyn_cast_if_present<ttg::BlockedEncodingAttr>(encoding);
+  if (!blocked)
+    return {};
+  auto spt = SmallVector<unsigned>(blocked.getSizePerThread());
+  auto tpw = SmallVector<unsigned>(blocked.getThreadsPerWarp());
+  auto wpc = SmallVector<unsigned>(blocked.getWarpsPerCTA());
+  unsigned otherDim = splitDim;
+  for (unsigned d = 0; d < shape.size(); ++d)
+    if (d != splitDim && (otherDim == splitDim || shape[d] > shape[otherDim]))
+      otherDim = d;
+  auto tile = [&](unsigned d) { return spt[d] * tpw[d] * wpc[d]; };
+  while (otherDim != splitDim &&
+         tile(splitDim) > static_cast<unsigned>(shape[splitDim]) &&
+         tpw[splitDim] > 1) {
+    tpw[splitDim] /= 2;
+    tpw[otherDim] *= 2;
+  }
+  while (tile(splitDim) > static_cast<unsigned>(shape[splitDim]) &&
+         spt[splitDim] > 1)
+    spt[splitDim] /= 2;
+  return ttg::BlockedEncodingAttr::get(blocked.getContext(), spt, tpw, wpc,
+                                       blocked.getOrder(),
+                                       blocked.getCGALayout());
+}
+
+// For a reshape that only inserts or removes unit dimensions, map a
+// non-unit result dimension to the matching source dimension.
+static std::optional<unsigned> mapSqueezeReshapeDim(ArrayRef<int64_t> src,
+                                                    ArrayRef<int64_t> dst,
+                                                    unsigned dstDim) {
+  SmallVector<unsigned> srcDims, dstDims;
+  for (unsigned d = 0; d < src.size(); ++d)
+    if (src[d] != 1)
+      srcDims.push_back(d);
+  for (unsigned d = 0; d < dst.size(); ++d)
+    if (dst[d] != 1)
+      dstDims.push_back(d);
+  if (srcDims.size() != dstDims.size())
+    return std::nullopt;
+  for (unsigned i = 0; i < srcDims.size(); ++i) {
+    if (src[srcDims[i]] != dst[dstDims[i]])
+      return std::nullopt;
+    if (dstDims[i] == dstDim)
+      return srcDims[i];
+  }
+  return std::nullopt;
+}
+
 // Trace B operand from MMA back through LocalAllocOp and cheap layout/view ops
 // to find the DescriptorLoadOp. When B is transposed, either before allocation
 // with tt.trans or after allocation with ttg.memdesc_trans, split the
@@ -251,11 +305,14 @@ struct Transform2CTALoads
       }
       if (succeeded(transformBLoad(mma.getB(), op)))
         continue;
+      if (succeeded(transformRegisterBuiltB(mma.getB(), op)))
+        continue;
       // A 2-CTA MMA reads half of B from each CTA of the pair. Leaving the
       // full B tile in both CTAs silently computes with the wrong half.
       op->emitError("two_ctas dot: cannot split the B operand across the CTA "
-                    "pair (B must be a descriptor load, optionally transposed, "
-                    "with BLOCK_N / 2 >= 16)");
+                    "pair (B must be built from descriptor loads through "
+                    "elementwise, broadcast, reshape or transpose ops, with "
+                    "BLOCK_N / 2 >= 16)");
       signalPassFailure();
       return;
     }
@@ -471,6 +528,265 @@ struct Transform2CTALoads
     transformedMMAs.insert(rhsMMA);
     LDBG("Transformed split B load for 2-CTA MMAs at "
          << lhsMMA.getLoc() << " and " << rhsMMA.getLoc());
+    return success();
+  }
+
+  // Split a B tile built in registers from descriptor loads (e.g. a dtype
+  // cast, a scale by an N-independent vector, a product of two tiles, or a
+  // rank-3 load reshaped to 2-D). Every value on the way from the descriptor
+  // loads to the local_alloc carries the N dimension; each load is replaced by
+  // its CTA's half (as in transformBLoad) and the chain is rebuilt at half
+  // width. Values that do not carry N (broadcast sources, splats, scalars)
+  // are reused as they are.
+  LogicalResult transformRegisterBuiltB(Value b, Operation *mma) {
+    if (!b)
+      return failure();
+    ttg::MemDescTransOp memDescTrans;
+    unsigned splitDim = 1;
+    Value bMemDesc = b;
+    if (auto transOp = bMemDesc.getDefiningOp<ttg::MemDescTransOp>()) {
+      if (transOp.getOrder().size() != 2)
+        return failure();
+      memDescTrans = transOp;
+      splitDim = transOp.getOrder()[1];
+      bMemDesc = transOp.getSrc();
+    }
+    auto localAlloc = bMemDesc.getDefiningOp<ttg::LocalAllocOp>();
+    if (!localAlloc || !localAlloc.getSrc())
+      return failure();
+    Value root = localAlloc.getSrc();
+    int64_t fullN = cast<RankedTensorType>(root.getType()).getShape()[splitDim];
+    if (fullN % 2 != 0 || fullN / 2 < 16)
+      return failure();
+    int64_t halfN = fullN / 2;
+
+    // Collect the N-carrying slice in post-order (operands first), with the
+    // dimension of each value that holds N.
+    DenseMap<Value, unsigned> splitDimOf;
+    SmallVector<Value> slice;
+    SmallVector<tt::DescriptorLoadOp> loads;
+    std::function<bool(Value, unsigned)> visit = [&](Value v,
+                                                     unsigned d) -> bool {
+      if (auto it = splitDimOf.find(v); it != splitDimOf.end())
+        return it->second == d;
+      auto ty = dyn_cast<RankedTensorType>(v.getType());
+      Operation *op = v.getDefiningOp();
+      if (!ty || d >= ty.getRank() || ty.getShape()[d] != fullN || !op ||
+          op->getNumResults() != 1 ||
+          !halveBlockedEncoding(ty.getEncoding(), ty.getShape(), d))
+        return false;
+      splitDimOf[v] = d;
+      bool ok = false;
+      if (auto load = dyn_cast<tt::DescriptorLoadOp>(op)) {
+        auto descType = originalDescTypes.lookup(load.getDesc());
+        ok = descType && succeeded(mapResultDimToDescriptor(descType, ty, d)) &&
+             (load.getDesc().getDefiningOp<tt::MakeTensorDescOp>() ||
+              llvm::all_of(load.getDesc().getUsers(), [&](Operation *user) {
+                // A descriptor argument is retyped in place; every user must
+                // be a load (checked to be split at the end of the pass).
+                return isa<tt::DescriptorLoadOp>(user);
+              }));
+        if (ok)
+          loads.push_back(load);
+      } else if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+        ok = visit(cvt.getSrc(), d);
+      } else if (auto trans = dyn_cast<tt::TransOp>(op)) {
+        ok = visit(trans.getSrc(), trans.getOrder()[d]);
+      } else if (auto reshape = dyn_cast<tt::ReshapeOp>(op)) {
+        auto srcDim = mapSqueezeReshapeDim(
+            reshape.getSrc().getType().getShape(), ty.getShape(), d);
+        ok = !reshape.getAllowReorder() && srcDim &&
+             visit(reshape.getSrc(), *srcDim);
+      } else if (auto bcast = dyn_cast<tt::BroadcastOp>(op)) {
+        ok = bcast.getSrc().getType().getShape()[d] == 1 ||
+             visit(bcast.getSrc(), d);
+      } else if (auto cst = dyn_cast<arith::ConstantOp>(op)) {
+        ok = isa<SplatElementsAttr>(cst.getValue());
+      } else if (isa<tt::SplatOp>(op)) {
+        ok = true;
+      } else if (op->hasTrait<OpTrait::Elementwise>() &&
+                 op->getNumRegions() == 0 &&
+                 !isa<tt::ElementwiseInlineAsmOp>(op)) {
+        ok = llvm::all_of(op->getOperands(), [&](Value operand) {
+          return !isa<RankedTensorType>(operand.getType()) || visit(operand, d);
+        });
+      }
+      if (ok)
+        slice.push_back(v);
+      return ok;
+    };
+    if (!visit(root, splitDim) || loads.empty())
+      return failure();
+    // A descriptor argument is retyped in place, so it can only be halved
+    // along one dimension.
+    DenseMap<Value, unsigned> hostDescDim;
+    for (auto load : loads) {
+      if (load.getDesc().getDefiningOp())
+        continue;
+      unsigned descDim =
+          *mapResultDimToDescriptor(originalDescTypes.lookup(load.getDesc()),
+                                    cast<RankedTensorType>(load.getType()),
+                                    splitDimOf.lookup(load.getResult()));
+      auto [it, inserted] = hostDescDim.try_emplace(load.getDesc(), descDim);
+      if (!inserted && it->second != descDim)
+        return failure();
+    }
+
+    MLIRContext *ctx = mma->getContext();
+    auto halfType = [&](Value v) {
+      auto ty = cast<RankedTensorType>(v.getType());
+      unsigned d = splitDimOf.lookup(v);
+      SmallVector<int64_t> shape(ty.getShape());
+      shape[d] = halfN;
+      return RankedTensorType::get(
+          shape, ty.getElementType(),
+          halveBlockedEncoding(ty.getEncoding(), shape, d));
+    };
+    auto castTo = [](OpBuilder &builder, Location loc, Value v,
+                     RankedTensorType ty) -> Value {
+      if (v.getType() == ty)
+        return v;
+      return ttg::ConvertLayoutOp::create(builder, loc, ty, v);
+    };
+
+    DenseMap<Value, Value> halfOf;
+    DenseMap<std::pair<Value, unsigned>, Value> halfDescOf;
+    for (Value v : slice) {
+      Operation *op = v.getDefiningOp();
+      unsigned d = splitDimOf.lookup(v);
+      RankedTensorType newTy = halfType(v);
+      OpBuilder builder(op);
+      builder.setInsertionPointAfter(op);
+      Location loc = op->getLoc();
+      Value newV;
+      if (auto load = dyn_cast<tt::DescriptorLoadOp>(op)) {
+        auto descType = originalDescTypes.lookup(load.getDesc());
+        unsigned descDim = *mapResultDimToDescriptor(
+            descType, cast<RankedTensorType>(v.getType()), d);
+        Value &newDesc = halfDescOf[{load.getDesc(), descDim}];
+        if (!newDesc) {
+          SmallVector<int64_t> blockShape(descType.getBlockType().getShape());
+          blockShape[descDim] /= 2;
+          auto newDescType = tt::TensorDescType::get(
+              blockShape, descType.getElementType(),
+              shrinkSwizzleForShape(descType.getSharedLayout(), blockShape));
+          if (auto makeDesc =
+                  load.getDesc().getDefiningOp<tt::MakeTensorDescOp>()) {
+            OpBuilder descBuilder(makeDesc);
+            auto newMakeDesc =
+                cast<tt::MakeTensorDescOp>(descBuilder.clone(*makeDesc));
+            newMakeDesc.getResult().setType(newDescType);
+            newDesc = newMakeDesc.getResult();
+          } else {
+            Value descVal = load.getDesc();
+            descVal.setType(newDescType);
+            if (auto funcOp = load->getParentOfType<triton::FuncOp>()) {
+              auto &entryBlock = funcOp.getBlocks().front();
+              SmallVector<Type> argTys(entryBlock.getArgumentTypes());
+              funcOp.setFunctionType(FunctionType::get(
+                  ctx, argTys, funcOp.getFunctionType().getResults()));
+            }
+            newDesc = descVal;
+          }
+        }
+        builder.setInsertionPoint(load);
+        auto i32Ty = builder.getI32Type();
+        Value ctaRank = nvgpu::ClusterCTAIdOp::create(builder, loc, i32Ty);
+        Value two = arith::ConstantIntOp::create(builder, loc, 2, 32);
+        Value ctaMod2 = arith::RemSIOp::create(builder, loc, ctaRank, two);
+        Value halfNVal = arith::ConstantIntOp::create(builder, loc, halfN, 32);
+        Value offset = arith::MulIOp::create(builder, loc, ctaMod2, halfNVal);
+        SmallVector<Value> indices(load.getIndices());
+        indices[descDim] =
+            arith::AddIOp::create(builder, loc, indices[descDim], offset);
+        auto newLoad =
+            tt::DescriptorLoadOp::create(builder, loc, newTy, newDesc, indices);
+        newLoad->setAttr("two_cta_b", builder.getUnitAttr());
+        newV = newLoad.getResult();
+      } else if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+        newV = castTo(builder, loc, halfOf.lookup(cvt.getSrc()), newTy);
+      } else if (auto trans = dyn_cast<tt::TransOp>(op)) {
+        Value t = tt::TransOp::create(
+            builder, loc, halfOf.lookup(trans.getSrc()), trans.getOrder());
+        newV = castTo(builder, loc, t, newTy);
+      } else if (auto reshape = dyn_cast<tt::ReshapeOp>(op)) {
+        Value r = tt::ReshapeOp::create(builder, loc, newTy.getShape(),
+                                        halfOf.lookup(reshape.getSrc()),
+                                        /*allowReorder=*/false);
+        newV = castTo(builder, loc, r, newTy);
+      } else if (auto bcast = dyn_cast<tt::BroadcastOp>(op)) {
+        Value src = bcast.getSrc();
+        RankedTensorType srcTy;
+        if (cast<RankedTensorType>(src.getType()).getShape()[d] != 1) {
+          srcTy = halfType(src);
+          src = halfOf.lookup(src);
+        } else {
+          auto origSrcTy = cast<RankedTensorType>(src.getType());
+          srcTy = RankedTensorType::get(origSrcTy.getShape(),
+                                        origSrcTy.getElementType(),
+                                        newTy.getEncoding());
+        }
+        newV = tt::BroadcastOp::create(builder, loc, newTy,
+                                       castTo(builder, loc, src, srcTy));
+      } else if (auto cst = dyn_cast<arith::ConstantOp>(op)) {
+        auto splat = cast<SplatElementsAttr>(cst.getValue());
+        newV = arith::ConstantOp::create(
+            builder, loc, newTy,
+            SplatElementsAttr::get(newTy, splat.getSplatValue<Attribute>()));
+      } else if (auto splat = dyn_cast<tt::SplatOp>(op)) {
+        newV = tt::SplatOp::create(builder, loc, newTy, splat.getSrc());
+      } else {
+        IRMapping mapping;
+        for (Value operand : op->getOperands())
+          if (halfOf.count(operand))
+            mapping.map(operand, castTo(builder, loc, halfOf.lookup(operand),
+                                        halfType(operand)));
+        Operation *clone = builder.clone(*op, mapping);
+        clone->getResult(0).setType(newTy);
+        newV = clone->getResult(0);
+      }
+      halfOf[v] = newV;
+    }
+
+    // Allocate the half tile and swap it in.
+    OpBuilder builder(localAlloc);
+    Value allocSrc = halfOf.lookup(root);
+    auto allocSrcType = cast<RankedTensorType>(allocSrc.getType());
+    auto origMemDescType = cast<ttg::MemDescType>(localAlloc.getType());
+    auto newMemDescType = ttg::MemDescType::get(
+        allocSrcType.getShape(), allocSrcType.getElementType(),
+        shrinkSwizzleForShape(origMemDescType.getEncoding(),
+                              allocSrcType.getShape()),
+        origMemDescType.getMemorySpace(), origMemDescType.getMutableMemory());
+    auto newLocalAlloc = ttg::LocalAllocOp::create(builder, localAlloc.getLoc(),
+                                                   newMemDescType, allocSrc);
+    if (memDescTrans) {
+      auto newMemDescTrans = ttg::MemDescTransOp::create(
+          builder, memDescTrans.getLoc(), newLocalAlloc.getResult(),
+          memDescTrans.getOrder());
+      newMemDescTrans->setAttrs(memDescTrans->getAttrs());
+      memDescTrans.getResult().replaceAllUsesWith(newMemDescTrans.getResult());
+      memDescTrans.erase();
+      splitBOperands.insert(newMemDescTrans.getResult());
+    } else {
+      localAlloc.getResult().replaceAllUsesWith(newLocalAlloc.getResult());
+      splitBOperands.insert(newLocalAlloc.getResult());
+    }
+    if (localAlloc.getResult().use_empty())
+      localAlloc.erase();
+    // Erase the full-width chain where nothing else uses it.
+    for (Value v : llvm::reverse(slice))
+      if (v.use_empty())
+        v.getDefiningOp()->erase();
+    SetVector<Operation *> oldMakeDescs;
+    for (auto &[key, newDesc] : halfDescOf)
+      if (auto makeDesc = key.first.getDefiningOp<tt::MakeTensorDescOp>())
+        oldMakeDescs.insert(makeDesc);
+    for (Operation *makeDesc : oldMakeDescs)
+      if (makeDesc->use_empty())
+        makeDesc->erase();
+
+    LDBG("Transformed register-built B for 2-CTA MMA at " << mma->getLoc());
     return success();
   }
 
