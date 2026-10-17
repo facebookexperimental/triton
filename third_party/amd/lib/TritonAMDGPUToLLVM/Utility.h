@@ -56,8 +56,9 @@ Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
 Value emitCtaMulticastMask(RewriterBase &rewriter, Location loc, Value blockId,
                            const LinearLayout &cvt, unsigned maxMaskPopcount);
 
-std::pair<bool, bool>
-getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm, MemoryOp op);
+std::pair<bool, bool> getCacheModifierFlagsForLoadStore(
+    const triton::CacheModifier &cm, MemoryOp op,
+    triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL);
 
 // Loads from shared or global memory with predication.
 // `otherElems` is used to mask out the elements that are not loaded
@@ -67,6 +68,7 @@ getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm, MemoryOp op);
 Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
              Value pred, Value falseVal, Value multicastMask,
              triton::CacheModifier cm = triton::CacheModifier::NONE,
+             triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL,
              bool isVolatile = false, bool forceNoAliasAsyncLoads = false);
 
 // Stores to shared or global memory with predication.
@@ -75,6 +77,7 @@ Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
 // avoid conservative waits. See `addLocalLoadNoAliasScope` for more details
 void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
              Value pred, triton::CacheModifier cm = triton::CacheModifier::NONE,
+             triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL,
              bool forceNoAliasAsyncLoads = false);
 
 // Get cache modifier information for creating load or store instruction
@@ -82,7 +85,8 @@ void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
 std::pair<bool, bool> getCacheModifierFlagsForLoadStore(LLVM::CallOp);
 // Get the cachepolicy value for a cache modifier
 int32_t
-getCtrlBitsForCacheModifierOnTarget(triton::CacheModifier, bool,
+getCtrlBitsForCacheModifierOnTarget(triton::CacheModifier,
+                                    triton::EvictionPolicy, bool,
                                     const mlir::triton::AMD::TargetInfo &);
 
 // Return a tensor of pointers with the same type of `basePtr` and the same

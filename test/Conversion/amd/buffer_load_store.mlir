@@ -9,6 +9,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: %[[offset:.*]] = llvm.select %[[c_mask]]
         // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[offset]], {{.*}}, {{.*}}
         %ret = amdg.buffer_load %arg0[%offset] cacheModifier = cs : tensor<128xf32, #blocked0>
+        // evict_last never weakens the .cv bypass: sc0|sc1 stays 17.
+        // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 17
+        %ret2 = amdg.buffer_load %arg0[%offset] cacheModifier = cv evictionPolicy = evict_last : tensor<128xf32, #blocked0>
         tt.return
   }
 }
@@ -118,6 +121,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, %[[offset]], {{.*}}, {{.*}}
         %c256_i32 = arith.constant 256 : i32
         amdg.buffer_store %value, %arg0[%offset] cacheModifier = cs stride = %c256_i32 : tensor<128xf32, #blocked0>
+        // evict_first sets the nt bit (0 -> 2).
+        // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 2
+        amdg.buffer_store %value, %arg0[%offset] evictionPolicy = evict_first : tensor<128xf32, #blocked0>
+        // evict_last clears the nt bit that .cs sets (3 -> 1).
+        // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 1
+        amdg.buffer_store %value, %arg0[%offset] cacheModifier = cs evictionPolicy = evict_last : tensor<128xf32, #blocked0>
+        // evict_last never weakens the .wt bypass: sc0|sc1 stays 17.
+        // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 17
+        amdg.buffer_store %value, %arg0[%offset] cacheModifier = wt evictionPolicy = evict_last : tensor<128xf32, #blocked0>
         tt.return
   }
 }
@@ -535,5 +547,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     // CHECK: llvm.return
     %ret = amdg.buffer_load %ptr[%offset], %mask, %other : tensor<128xf32, #blocked>
     tt.return
+  }
+}
+
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // CHECK-LABEL: masked_load_eviction
+  tt.func @masked_load_eviction(%ptr: !llvm.ptr, %mask: i1, %falseVal: f32) -> f32 {
+    // evict_first marks the load nontemporal.
+    // CHECK: llvm.load {{.*}} {nontemporal} : !llvm.ptr -> f32
+    %ld = amdg.masked_load %ptr, %mask, %falseVal evictionPolicy = evict_first : (!llvm.ptr, i1, f32) -> f32
+    tt.return %ld : f32
+  }
+  // CHECK-LABEL: masked_load_evict_last
+  tt.func @masked_load_evict_last(%ptr: !llvm.ptr, %mask: i1, %falseVal: f32) -> f32 {
+    // evict_last keeps the load temporal (no nontemporal attribute).
+    // CHECK: llvm.load %{{[a-zA-Z0-9_.]+}} : !llvm.ptr -> f32
+    %ld = amdg.masked_load %ptr, %mask, %falseVal evictionPolicy = evict_last : (!llvm.ptr, i1, f32) -> f32
+    tt.return %ld : f32
   }
 }

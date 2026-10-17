@@ -322,6 +322,8 @@ def BufferLoadOp
           I32Tensor:$offsets, Optional<I32>:$stride,
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "::mlir::triton::CacheModifier::NONE">:$cache,
+          DefaultValuedAttr<TT_EvictionPolicyAttr,
+                            "triton::EvictionPolicy::NORMAL">:$evict,
           Optional<TT_BoolTensor>:$mask, Optional<TT_Tensor>:$other,
           DefaultValuedAttr<I32Attr, "1">:$contiguity);
   let results = (outs TT_Tensor:$result);
@@ -330,7 +332,7 @@ def BufferLoadOp
 
   let assemblyFormat = [{
       $ptr `[` $offsets `]` (`,` $mask^)? (`,` $other^)?
-      oilist(`cacheModifier` `=` $cache)
+      oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
       (`stride` `=` $stride^)?
       attr-dict `:` type($result)
     }];
@@ -377,6 +379,8 @@ def BufferLoadToLocalOp
           Optional<TT_Tensor>:$other, Optional<I32>:$stride,
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "::mlir::triton::CacheModifier::NONE">:$cache,
+          DefaultValuedAttr<TT_EvictionPolicyAttr,
+                            "triton::EvictionPolicy::NORMAL">:$evict,
           DefaultValuedAttr<I32Attr, "1">:$contiguity);
   let results = (outs TTG_AsyncToken:$token);
 
@@ -384,7 +388,7 @@ def BufferLoadToLocalOp
 
   let assemblyFormat = [{
       $ptr `[` $offsets `]` (`mask` `=` $mask^)? (`other` `=` $other^)? (`stride` `=` $stride^)?
-      oilist(`cacheModifier` `=` $cache) `into` $dest
+      oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict) `into` $dest
       attr-dict `:` type($ptr) `[` type($offsets) `]` type($other) `->` type($dest)
     }];
 }
@@ -537,12 +541,14 @@ def BufferStoreOp
       I32Tensor:$offsets, Optional<I32>:$stride,
       DefaultValuedAttr<TT_CacheModifierAttr,
                         "mlir::triton::CacheModifier::NONE">:$cache,
+      DefaultValuedAttr<TT_EvictionPolicyAttr,
+                        "triton::EvictionPolicy::NORMAL">:$evict,
       Optional<TT_BoolTensor>:$mask,
       DefaultValuedAttr<I32Attr, "1">:$contiguity);
 
   let assemblyFormat = [{
       $value `,` $ptr `[` $offsets `]` (`,` $mask^)?
-      oilist(`cacheModifier` `=` $cache)
+      oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
       (`stride` `=` $stride^)?
       attr-dict `:` type($value)
     }];
@@ -563,6 +569,8 @@ def MaskedLoadOp : TT_AMDGPU_Op<"masked_load", []> {
       Optional<I32>:$multicastMask,
       DefaultValuedAttr<TT_CacheModifierAttr,
                         "::mlir::triton::CacheModifier::NONE">:$cache,
+      DefaultValuedAttr<TT_EvictionPolicyAttr,
+                        "triton::EvictionPolicy::NORMAL">:$evict,
       DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
       DefaultValuedAttr<BoolAttr, "false">:$forceNoAlias);
 
@@ -570,7 +578,7 @@ def MaskedLoadOp : TT_AMDGPU_Op<"masked_load", []> {
 
   let assemblyFormat = [{
     $ptr `,` $mask `,` $falseVal (`,` $multicastMask^)?
-    oilist(`cacheModifier` `=` $cache)
+    oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
     (`volatile` $isVolatile^)?
     (`forceNoAlias` $forceNoAlias^)?
     attr-dict `:` functional-type(operands, results)
@@ -588,11 +596,13 @@ def MaskedStoreOp : TT_AMDGPU_Op<"masked_store", []> {
   let arguments = (ins LLVM_AnyPointer:$ptr, LLVM_Type:$value, I1:$mask,
       DefaultValuedAttr<TT_CacheModifierAttr,
                         "::mlir::triton::CacheModifier::NONE">:$cache,
+      DefaultValuedAttr<TT_EvictionPolicyAttr,
+                        "triton::EvictionPolicy::NORMAL">:$evict,
       DefaultValuedAttr<BoolAttr, "false">:$forceNoAlias);
 
   let assemblyFormat = [{
     $ptr `,` $value `,` $mask
-    oilist(`cacheModifier` `=` $cache)
+    oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
     (`forceNoAlias` $forceNoAlias^)?
     attr-dict `:` type(operands)
   }];

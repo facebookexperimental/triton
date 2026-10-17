@@ -267,6 +267,7 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                        isSyncedViaAsyncWait(localLoadOp);
   return mlir::LLVM::AMD::llLoad(rewriter, loc, ptr, elemTy, pred, falseVal, {},
                                  triton::CacheModifier::NONE,
+                                 triton::EvictionPolicy::NORMAL,
                                  /*isVolatile=*/false, addAliasGroup);
 }
 

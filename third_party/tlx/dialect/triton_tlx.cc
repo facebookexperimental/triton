@@ -1750,7 +1750,8 @@ void init_triton_tlx_ir(py::module_ &m) {
                                                     offsetsType.getEncoding());
             return self.create<ttag::BufferLoadOp>(
                 resultType, ptr, offsets, Value() /*stride*/, cache,
-                mask.value_or(Value()), other.value_or(Value()), contiguity);
+                tt::EvictionPolicy::NORMAL, mask.value_or(Value()),
+                other.value_or(Value()), contiguity);
           },
           py::arg("ptr"), py::arg("offsets"), py::arg("mask").none(),
           py::arg("other").none(), py::arg("cache"), py::arg("contiguity"))
@@ -1761,7 +1762,7 @@ void init_triton_tlx_ir(py::module_ &m) {
              uint32_t contiguity) -> OpState {
             return self.create<ttag::BufferStoreOp>(
                 storedValue, ptr, offsets, Value() /*stride*/, cache,
-                mask.value_or(Value()), contiguity);
+                tt::EvictionPolicy::NORMAL, mask.value_or(Value()), contiguity);
           },
           py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
           py::arg("mask").none(), py::arg("cache"), py::arg("contiguity"))
@@ -1784,7 +1785,8 @@ void init_triton_tlx_ir(py::module_ &m) {
              tt::CacheModifier cache, uint32_t contiguity) -> Value {
             return self.create<ttag::BufferLoadToLocalOp>(
                 dest, ptr, offsets, mask.value_or(Value()),
-                other.value_or(Value()), Value() /*stride*/, cache, contiguity);
+                other.value_or(Value()), Value() /*stride*/, cache,
+                tt::EvictionPolicy::NORMAL, contiguity);
           },
           py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
           py::arg("mask").none(), py::arg("other").none(), py::arg("cache"),

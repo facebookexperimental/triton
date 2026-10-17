@@ -303,37 +303,49 @@ Value permute(Location loc, RewriterBase &rewriter, Value x, Value y,
 //      | .wt |   T      | X
 // -----+-----+----------+---------
 std::pair<bool, bool>
-getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm,
-                                  MemoryOp op) {
+getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm, MemoryOp op,
+                                  triton::EvictionPolicy evict) {
+  bool nonTemporal = false;
   switch (op) {
   case MemoryOp::Load: {
     switch (cm) {
     case triton::CacheModifier::CA:
-      return std::make_pair(false, false);
+      nonTemporal = false;
+      break;
     case triton::CacheModifier::CG:
-      return std::make_pair(false, true);
     case triton::CacheModifier::CS:
-      return std::make_pair(false, true);
+      nonTemporal = true;
+      break;
     case triton::CacheModifier::CV:
       return std::make_pair(true, true);
     default:
-      return std::make_pair(false, false);
+      nonTemporal = false;
+      break;
     }
+    break;
   }
   case MemoryOp::Store: {
     switch (cm) {
-    case triton::CacheModifier::CG:
-      return std::make_pair(false, false);
     case triton::CacheModifier::CS:
-      return std::make_pair(false, true);
+      nonTemporal = true;
+      break;
     case triton::CacheModifier::WT:
       return std::make_pair(true, true);
     default:
-      return std::make_pair(false, false);
+      nonTemporal = false;
+      break;
     }
+    break;
   }
   }
-  return std::make_pair(false, false);
+  // An explicit eviction policy overrides the modifier's temporal hint, but
+  // never weakens the cache bypass (.cv/.wt) handled above.
+  if (evict == triton::EvictionPolicy::EVICT_FIRST)
+    nonTemporal = true;
+  else if (evict == triton::EvictionPolicy::EVICT_LAST)
+    nonTemporal = false;
+  // NB: .cv/.wt return early above, so volatile is always false here.
+  return std::make_pair(false, nonTemporal);
 }
 
 Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
@@ -459,19 +471,19 @@ Value emitCtaMulticastMask(RewriterBase &rewriter, Location loc, Value groupId,
 
 Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
              Value pred, Value falseVal, Value multicastMask,
-             triton::CacheModifier cm, bool isVolatile,
-             bool forceNoAliasAsyncLoads) {
+             triton::CacheModifier cm, triton::EvictionPolicy evict,
+             bool isVolatile, bool forceNoAliasAsyncLoads) {
   return triton::amdgpu::MaskedLoadOp::create(
              rewriter, loc, elemTy, ptr, pred, falseVal, multicastMask, cm,
-             isVolatile, forceNoAliasAsyncLoads)
+             evict, isVolatile, forceNoAliasAsyncLoads)
       .getResult();
 }
 
 void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
-             Value pred, triton::CacheModifier cm,
+             Value pred, triton::CacheModifier cm, triton::EvictionPolicy evict,
              bool forceNoAliasAsyncLoads) {
   triton::amdgpu::MaskedStoreOp::create(rewriter, loc, ptr, val, pred, cm,
-                                        forceNoAliasAsyncLoads);
+                                        evict, forceNoAliasAsyncLoads);
 }
 
 // Create the auxiliary/cachepolicy value of ROCDL::RawPtrBufferLoad/StoreOp
@@ -497,9 +509,8 @@ void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
 // Atomic | N/A |  0  |  1  | x  | Setting sc0 returns the pre-op value
 //        | N/A |  1  |  0  | x  | Setting sc1 performs a system-scope atomic
 // -------+-----+-----+-----+----+--
-static int32_t
-getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(triton::CacheModifier cm,
-                                          bool isLoad) {
+static int32_t getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(
+    triton::CacheModifier cm, triton::EvictionPolicy evict, bool isLoad) {
   const int sc0Bit = 0b1, ntBit = 0b10, sc1Bit = 0b10000;
   int32_t aux = 0;
   switch (cm) {
@@ -527,6 +538,13 @@ getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(triton::CacheModifier cm,
     break;
   default:
     aux = 0;
+  }
+  // Never let an eviction policy override a .cv/.wt cache bypass.
+  if (cm != triton::CacheModifier::CV && cm != triton::CacheModifier::WT) {
+    if (evict == triton::EvictionPolicy::EVICT_FIRST)
+      aux |= ntBit;
+    else if (evict == triton::EvictionPolicy::EVICT_LAST)
+      aux &= ~ntBit;
   }
   return aux;
 }
@@ -574,6 +592,7 @@ getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(triton::CacheModifier cm,
 //   DLC=1, SLC=1, GLC=1  -> non-temporal: bypass GL1, stream GL2,
 //                           skip MALL                             (.cs/.cv/.wt)
 static int32_t getCtrlBitsForCacheModifierOnRDNA3(triton::CacheModifier cm,
+                                                  triton::EvictionPolicy evict,
                                                   bool isLoad) {
   const int glcBit = 0b1, slcBit = 0b10, dlcBit = 0b100;
   int32_t aux = 0;
@@ -602,6 +621,15 @@ static int32_t getCtrlBitsForCacheModifierOnRDNA3(triton::CacheModifier cm,
     break;
   default:
     aux = 0;
+  }
+  // SLC/DLC steer L2/MALL streaming without touching the L1 bypass (GLC),
+  // which stays under the cache modifier's control.
+  // Never let an eviction policy override a .cv/.wt cache bypass.
+  if (cm != triton::CacheModifier::CV && cm != triton::CacheModifier::WT) {
+    if (evict == triton::EvictionPolicy::EVICT_FIRST)
+      aux |= slcBit | dlcBit;
+    else if (evict == triton::EvictionPolicy::EVICT_LAST)
+      aux &= ~(slcBit | dlcBit);
   }
   return aux;
 }
@@ -653,6 +681,7 @@ static int32_t getCtrlBitsForCacheModifierOnRDNA3(triton::CacheModifier cm,
 //        | .wt |  SYS  | WB | behavior for gfx1250, bypasses all caches
 // -------+-----+-------+----+-
 static int32_t getCtrlBitsForCacheModifierOn_GFX12(triton::CacheModifier cm,
+                                                   triton::EvictionPolicy evict,
                                                    bool isLoad,
                                                    bool cacheBypassAvailable) {
   const int scopeShift = 3;
@@ -661,6 +690,7 @@ static int32_t getCtrlBitsForCacheModifierOn_GFX12(triton::CacheModifier cm,
   const int scopeSys = 3 << scopeShift;
   const int THRegular = 0;
   const int THNonTemp = 1;
+  const int THHighTemp = 2;
   const int THLastUse = 3;
   const int THWriteBack = 3;
   int aux = -1;
@@ -689,6 +719,15 @@ static int32_t getCtrlBitsForCacheModifierOn_GFX12(triton::CacheModifier cm,
   default:
     aux = 0;
   }
+  // An explicit eviction policy overrides the temporal hint but never weakens
+  // a cache bypass (TH=3 with system scope).
+  const int scopeMask = 0x3 << scopeShift;
+  if ((aux & 0x7) != THLastUse) {
+    if (evict == triton::EvictionPolicy::EVICT_FIRST)
+      aux = (aux & scopeMask) | THNonTemp;
+    else if (evict == triton::EvictionPolicy::EVICT_LAST)
+      aux = (aux & scopeMask) | THHighTemp;
+  }
   return aux;
 }
 
@@ -704,19 +743,21 @@ static int32_t getDefaultCtrlBitsForCacheModifier(triton::CacheModifier cm) {
 // .wb: write-back, writes back data at all cache levels
 // .wt: write-through, write data directly to system memory
 int32_t getCtrlBitsForCacheModifierOnTarget(
-    triton::CacheModifier cm, bool isLoad,
+    triton::CacheModifier cm, triton::EvictionPolicy evict, bool isLoad,
     const mlir::triton::AMD::TargetInfo &targetInfo) {
   switch (targetInfo.getISAFamily()) {
   case ISAFamily::CDNA3:
   case ISAFamily::CDNA4:
-    return getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(cm, isLoad);
+    return getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(cm, evict, isLoad);
   case ISAFamily::RDNA3:
   case ISAFamily::RDNA4m:
-    return getCtrlBitsForCacheModifierOnRDNA3(cm, isLoad);
+    return getCtrlBitsForCacheModifierOnRDNA3(cm, evict, isLoad);
   case ISAFamily::RDNA4:
-    return getCtrlBitsForCacheModifierOn_GFX12(cm, isLoad, /*$ bypass*/ false);
+    return getCtrlBitsForCacheModifierOn_GFX12(cm, evict, isLoad,
+                                               /*$ bypass*/ false);
   case ISAFamily::GFX1250:
-    return getCtrlBitsForCacheModifierOn_GFX12(cm, isLoad, /*$ bypass*/ true);
+    return getCtrlBitsForCacheModifierOn_GFX12(cm, evict, isLoad,
+                                               /*$ bypass*/ true);
   default:
     return getDefaultCtrlBitsForCacheModifier(cm);
   }

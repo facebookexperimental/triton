@@ -1174,15 +1174,16 @@ void init_gluon_ir(py::module_ &m) {
       .def("create_buffer_load",
            [](GluonOpBuilder &self, Type resultType, Value ptr, Value offsets,
               Value mask, Value other, tt::CacheModifier cache) -> Value {
-             return self.create<ttag::BufferLoadOp>(resultType, ptr, offsets,
-                                                    Value() /*stride*/, cache,
-                                                    mask, other);
+             return self.create<ttag::BufferLoadOp>(
+                 resultType, ptr, offsets, Value() /*stride*/, cache,
+                 tt::EvictionPolicy::NORMAL, mask, other);
            })
       .def("create_buffer_store",
            [](GluonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
               Value mask, tt::CacheModifier cache) {
              self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
-                                              Value() /*stride*/, cache, mask);
+                                              Value() /*stride*/, cache,
+                                              tt::EvictionPolicy::NORMAL, mask);
            })
       .def("create_buffer_atomic_rmw",
            [](GluonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
@@ -1197,7 +1198,8 @@ void init_gluon_ir(py::module_ &m) {
               Value mask, Value other, Value stride,
               tt::CacheModifier cacheModifier) {
              self.create<ttag::BufferLoadToLocalOp>(
-                 dest, ptr, offsets, mask, other, stride, cacheModifier);
+                 dest, ptr, offsets, mask, other, stride, cacheModifier,
+                 tt::EvictionPolicy::NORMAL);
            })
       .def("create_local_load_packed_transposed",
            [](GluonOpBuilder &self, Type resultType, Value memDesc) -> Value {
