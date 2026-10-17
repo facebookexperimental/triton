@@ -1,5 +1,6 @@
 add_triton_library(TritonAMDGPUTransforms
   AccelerateAMDMatmul.cpp
+  AutomaticWaveSpecialization.cpp
   BlockPingpong.cpp
   CanonicalizePointers.cpp
   CoalesceAsyncCopy.cpp
@@ -42,6 +43,7 @@ add_triton_library(TritonAMDGPUTransforms
   TritonInstrumentIR
 
   LINK_LIBS PUBLIC
+  TritonAnalysis
   TritonAMDUtils
 )
 

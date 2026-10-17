@@ -289,6 +289,7 @@ class HIPOptions:
     launch_cluster: bool = False  # No-op placeholder
     multicast: bool = False  # No-op placeholder (TMA multicast is NVIDIA-only)
     enable_tree_reduction: bool = False
+    enable_wave_specialization: bool = False
     enable_nvptx_v2i32: bool = False  # No-op placeholder (NVPTX-only)
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
@@ -800,6 +801,15 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
+
+        if options.enable_wave_specialization:
+            amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
+            passes.convert.add_reconcile_unrealized_casts(pm)
+            amd.passes.ttgpuir.add_automatic_wave_specialization(pm, options.warp_size)
+            passes.ttgpuir.add_canonicalize_llvm_ir(pm)
+            passes.common.add_sccp(pm)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
 
         # This can not be moved below the di_scope pass
         if HIPBackend.instrumentation:

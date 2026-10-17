@@ -1,9 +1,11 @@
 # Automatic wave specialization
 
-Status: specialization design proposal. The reusable MLIR uniformity analysis is
-implemented in `include/triton/Analysis/Uniformity.h` and
-`lib/Analysis/Uniformity.cpp`; the specialization pass and kernel option are not
-yet implemented.
+Status: initial implementation. The reusable MLIR uniformity analysis is in
+`include/triton/Analysis/Uniformity.h` and `lib/Analysis/Uniformity.cpp`. The
+AMD pass is in
+`third_party/amd/lib/TritonAMDGPUTransforms/AutomaticWaveSpecialization.cpp`,
+and `HIPOptions.enable_wave_specialization` gates the pipeline. The implementation
+selects one entry-available predicate and creates two versions.
 
 ## Objective
 
@@ -38,7 +40,7 @@ proposed pass performs runtime partial evaluation of the kernel body.
 
 ## Kernel option
 
-Introduce an AMD kernel option:
+The AMD kernel option is disabled by default:
 
 ```python
 enable_wave_specialization: bool = False
@@ -62,14 +64,15 @@ The option is a compiler option, not a kernel argument or a language-level
 - Initially expose only the boolean option. Version and code-growth budgets are
   internal pass parameters, with test/debug overrides if needed.
 
-Add the field to `HIPOptions` in `third_party/amd/backend/compiler.py`. The
+The field is in `HIPOptions` in `third_party/amd/backend/compiler.py`. The
 existing option parser collects dataclass fields, and `HIPOptions.hash()` hashes
 the option values. Tests must verify both parsing and cache separation rather
 than relying only on that implementation detail.
 
-Initial integration targets the Triton/TLX AMD pipeline. Gluon and other backends
-require explicit integration and validation; accepting the option must not
-silently imply that an unimplemented pipeline performs specialization.
+Integration uses the common AMD `make_llir` pipeline for Triton/TLX and Gluon.
+Compile tests cover both frontends. The option has no integration in other
+backends. Autotuning can pass it through
+`triton.Config({"enable_wave_specialization": True})`.
 
 ## Transformation shape
 
@@ -120,6 +123,14 @@ select several predicates available from the same prefix, with at most four
 leaves as an initial experimental budget. Both leaf count and estimated code
 growth need limits because leaf count alone does not bound duplication cost.
 
+The pass currently targets defined external LLVM functions returning void,
+matching the AMD lowering convention for kernel entries. Internal device helpers
+are skipped; their arguments do not have the uniform kernel ABI. Supported bodies
+are region-free CFGs with ordinary LLVM branches, switches, returns, and
+unreachable terminators. Every cloned return branches to one common void return.
+The function attribute `tritonamdgpu.wave_specialized` prevents a repeated pass
+invocation from multiplying versions again.
+
 ## Uniformity analysis
 
 Analyze per-thread integer, boolean, and other modeled SSA values in common
@@ -163,6 +174,13 @@ Recognize common expressions such as linear thread ID divided by hardware wave
 size. Use the configured target wave size, not a hard-coded 32 or 64. A coarse
 uniformity lattice cannot derive this result from an unknown thread ID by itself;
 it needs an explicit rule or supporting integer facts.
+
+The AMD pass currently models unsigned division and logical right shift of
+`rocdl.workitem.id.x` by the configured wave size, including an intervening
+constant bit mask. The standalone pass accepts `wave-size=32|64`; the backend
+supplies `HIPOptions.warp_size`. More complex expressions reconstructing a
+distributed `arange` from lane and wave components can remain unknown. The
+initial implementation does not add a general bit-level uniformity analysis.
 
 `UniformityAnalysis` takes a function-like operation and optional argument and
 operation inference callbacks. `isUniform(value)` queries agreement at the
@@ -294,6 +312,14 @@ first implementation.
 Plan extraction and cloning before mutating the kernel. Failure to construct a
 legal plan leaves the original body intact.
 
+The initial planner uses an intentionally conservative movement rule. A
+dependency that is already in the contiguous initial slice stays in place.
+Moving a dependency across retained work requires a pure, speculatable,
+deterministic per-thread computation or a modeled invariant hardware ID read.
+Calls, inline assembly, and convergent broadcasts are not moved across retained
+work. No alias analysis or extraction of additional ordering predecessors is
+implemented yet; a candidate needing those capabilities is rejected.
+
 ## Communication and synchronization
 
 Cross-wave communication is part of the supported transformation, including LDS
@@ -387,6 +413,13 @@ Initial selection can use deterministic use-based ranking and hard budgets.
 More expensive estimates can later simplify temporary clones and count removed
 operations. No fine-grained region-placement heuristic is required.
 
+The current ranking assigns one point per entry-block use and four per use in
+other blocks, doubling the weight of select and conditional-branch conditions.
+Candidates need at least two points. Ties prefer a smaller prefix, then source
+order. The `max-extra-ops` pass parameter defaults to 4096 and bounds the estimated
+extra body plus dispatch operations before mutation; it is not a machine-code
+size or register-pressure model.
+
 After a split, use constant propagation, CFG simplification, and dead-code
 elimination under the branch assumptions. These may remove unreachable blocks
 containing synchronization as well as ordinary computation. Reevaluate related
@@ -401,7 +434,7 @@ removed work.
 
 ## Pipeline integration
 
-Proposed components:
+Implemented components:
 
 | Component | Responsibility |
 | --- | --- |
@@ -411,7 +444,7 @@ Proposed components:
 | Cleanup | Fold constants, simplify CFGs, and eliminate dead code using existing operation semantics |
 
 Keep the generic dataflow and CFG machinery reusable. Put AMD intrinsic models and
-initial backend integration in the AMD implementation. Proposed pass name:
+initial backend integration in the AMD implementation. Pass name:
 `tritonamdgpu-automatic-wave-specialization`.
 
 Run near the end of the MLIR portion of `HIPBackend.make_llir`, after TTGIR and
@@ -432,8 +465,10 @@ shared-memory allocation
 TTGIR and warp-specialization/predicate lowering
 remaining common-dialect conversion and cleanup
 if enable_wave_specialization:
+    builtin helper lowering and cast reconciliation
     common-dialect MLIR uniformity analysis
     ordered prefix extraction + whole-body CFG versioning
+    LLVM select/boolean/branch cleanup
     constant propagation / CFG simplification / dead-code elimination
 debug information and remaining LLVM translation preparation
 MLIR to LLVM IR
@@ -442,7 +477,11 @@ LLVM optimization and AMDGPU code generation
 
 Recompute or invalidate analysis when cloning and simplification change values or
 control flow. Run specialization once, with one shared budget for all decisions.
-The kernel option remains the sole enablement gate.
+The kernel option remains the sole enablement gate. The LLVM-specific cleanup
+extends the existing `canonicalize-llvm-ir` pass with constant boolean operations
+and conditional branches; its existing select folding handles the other main
+specialization use. Greedy region simplification removes unreachable blocks,
+including barriers on paths excluded by specialization.
 
 Existing `ttg.warp_predicate` and `ttg.warp_specialize` operations have already
 lowered. Their high-level region restrictions are not the legality policy for
@@ -519,21 +558,36 @@ register usage, LDS usage, and compilation time.
 
 For native/compiler implementation changes, rebuild with `make` before tests.
 Run lit from the build directory and pytest with `-s --tb=short`, as required by
-the repository instructions. This proposal alone does not require a rebuild.
+the repository instructions.
+
+Current regression coverage is in:
+
+- `test/Conversion/amd/warp_id_to_llvm.mlir`: raw CFG cloning, loop backedges,
+  ordered extraction, repeated-pass and growth limits, wave32/wave64 inference,
+  negative cases, boolean simplification, and removal of unreachable barriers.
+- `python/test/unit/language/test_tlx_codegen.py`: option parsing and hash
+  separation, autotuning kwargs, and disabled/enabled pipeline checks for TLX
+  and Gluon with allocated shared memory.
+- `python/test/unit/language/test_tlx_amd_hip.py`: bounded native execution
+  comparing enabled/disabled kernels with alternating waves exchanging values
+  through LDS over 1, 2, and 7 iterations. Both versions retain the original LDS
+  allocation size. This test has passed on an MI350X (gfx950).
+
+These checks establish functional behavior for the covered cases. Representative
+performance, register-pressure, and code-size characterization remains future
+work; the option stays disabled by default.
 
 ## Implementation stages
 
-1. Reusable common-dialect MLIR uniformity analysis and regression coverage are
-   implemented. Add the disabled-by-default kernel option when integrating the
-   specialization transform, and extend target inference models as needed.
-2. Implement one-predicate, two-version whole-body specialization with ordered
+1. Implemented: common-dialect MLIR uniformity analysis, initial AMD models,
+   regression coverage, and the disabled-by-default kernel option.
+2. Implemented: one-predicate, two-version whole-body specialization with ordered
    prefix extraction, complete CFG cloning, and no dispatch inside original loops.
-   Cross-wave communication support is part of this milestone and requires no
-   separate synchronization analysis.
-3. Integrate constant/CFG cleanup at the late MLIR insertion point. Validate
-   correctness through LLVM optimization and code generation, including removal
-   of unreachable barriers, and measure benefit on actual kernels.
-4. Extend to multiple predicates with bounded whole-body versions and improve
+   Cross-wave communication is supported without a separate synchronization
+   analysis.
+3. Implemented: late MLIR integration and constant/CFG cleanup, with compile
+   and native communication tests. Broader performance evaluation remains.
+4. Future: extend to multiple predicates with bounded whole-body versions and improve
    candidate discovery/ranking for predicates originating from tensor components.
 
 Keep the kernel option disabled by default throughout initial development.
