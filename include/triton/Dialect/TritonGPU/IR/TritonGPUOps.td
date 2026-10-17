@@ -43,6 +43,26 @@ def TTG_ConvertLayoutOp
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 }
 
+def TTG_RequireLayoutOp
+    : TTG_Op<"require_layout", [SameOperandsAndResultShape,
+                                SameOperandsAndResultElementType, Pure]> {
+  let summary = "preserve a user-requested layout boundary";
+
+  let description = [{
+    `ttg.require_layout` is a semantic layout boundary produced from a
+    source-level pinned layout request. Unlike `ttg.convert_layout`, it must not
+    be treated as a transparent cast by layout canonicalization or
+    rematerialization. Layout optimization may insert conversions around it, but
+    the boundary itself is retired only after those passes have run.
+  }];
+
+  let arguments = (ins TT_Tensor:$src);
+
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+}
+
 def TTG_AsyncWaitOp : TTG_Op<"async_wait", [MemWaitOpTrait]> {
   let summary = "Ensure all specified async_copy_* operations are complete.";
   let description = [{

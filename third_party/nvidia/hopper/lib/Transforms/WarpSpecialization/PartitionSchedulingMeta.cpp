@@ -2840,7 +2840,9 @@ void PartitionSchedulingMeta::runOnOperation() {
     }
     loops.push_back(loop);
   });
-  for (auto [idx, loop] : llvm::enumerate(loops)) {
+  for (auto it : llvm::enumerate(loops)) {
+    auto idx = it.index();
+    LoopLikeOpInterface loop = it.value();
     // Build SchedulingOptions from pass options and per-loop attributes.
     SchedulingOptions schedOpts;
     schedOpts.mergeEpilogue = mergeEpilogue;
