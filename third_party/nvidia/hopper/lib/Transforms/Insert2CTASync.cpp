@@ -226,19 +226,22 @@ using RunningIterCounts = DenseMap<Operation *, unsigned>;
 // of the barrier. phaseScope is the operation containing the barrier
 // allocation; loops outside it reinitialize the barrier and must not
 // contribute. Returns null when no enclosing loop contributes an index.
-static Value computeLinearBarrierIter(OpBuilder &builder, Location loc,
-                                      Operation *mma, Operation *phaseScope,
-                                      const RunningIterCounts &counts) {
+static FailureOr<Value>
+computeLinearBarrierIter(OpBuilder &builder, Location loc, Operation *mma,
+                         Operation *phaseScope,
+                         const RunningIterCounts &counts) {
   if (auto inner = dyn_cast<scf::ForOp>(mma->getParentOp())) {
     auto it = counts.find(inner);
     if (it != counts.end() && phaseScope->isProperAncestor(inner)) {
       Value base = inner->getBlock()->getArgument(it->second);
       Value iter = computeLoopIterIndex(builder, loc, inner);
-      return arith::AddIOp::create(builder, loc, base, iter);
+      return Value(arith::AddIOp::create(builder, loc, base, iter));
     }
   }
   Value linearIter;
   Value stride = arith::ConstantIntOp::create(builder, loc, 1, 64);
+  // The scf.for whose trip count is the current stride.
+  scf::ForOp strideLoop;
   for (Operation *parent = mma->getParentOp(); parent && parent != phaseScope;
        parent = parent->getParentOp()) {
     Value iter;
@@ -257,6 +260,20 @@ static Value computeLinearBarrierIter(OpBuilder &builder, Location loc,
       continue;
     }
 
+    // iter * stride counts the earlier rendezvous only if the inner loop runs
+    // the same number of iterations in every iteration of this loop. A
+    // varying count gives a wrong phase and a deadlocked CTA pair, so refuse
+    // the nests addRunningIterCount does not handle.
+    if (strideLoop &&
+        llvm::any_of(ValueRange{strideLoop.getLowerBound(),
+                                strideLoop.getUpperBound(),
+                                strideLoop.getStep()},
+                     [&](Value v) { return isDefinedInside(v, parent); }))
+      return mma->emitError(
+          "2-CTA MMA sync: the trip count of an enclosing loop changes "
+          "between iterations of an outer loop in an unsupported loop nest; "
+          "the cross-CTA barrier phase cannot be derived");
+
     Value contribution = arith::MulIOp::create(builder, loc, iter, stride);
     linearIter = linearIter ? arith::AddIOp::create(builder, loc, contribution,
                                                     linearIter)
@@ -265,6 +282,7 @@ static Value computeLinearBarrierIter(OpBuilder &builder, Location loc,
     if (!tripCount)
       break;
     stride = arith::MulIOp::create(builder, loc, stride, tripCount);
+    strideLoop = cast<scf::ForOp>(parent);
   }
 
   return linearIter;
@@ -345,7 +363,8 @@ static unsigned getOperandPipelineDepth(ttng::MMAv5OpInterface mma) {
 // Insert the "arrive remote, wait local" cross-CTA sync ops before a 2-CTA
 // MMA. The barrier must be allocated externally (before the containing loop
 // if the MMA is in a loop).
-static void insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
+static LogicalResult insertSyncBeforeMMA(ttng::MMAv5OpInterface mma,
+                                         Value barrierAlloc,
                                 Operation *phaseScope, unsigned baseIdx,
                                 unsigned depth,
                                 const RunningIterCounts &counts) {
@@ -359,8 +378,11 @@ static void insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
   // slot instead of lapping a single barrier's phase bit.
   // A null iteration means no enclosing loop contributes an index, so there is
   // a single rendezvous: slot 0, phase 0.
-  Value linearIter =
+  FailureOr<Value> maybeLinearIter =
       computeLinearBarrierIter(builder, loc, mma, phaseScope, counts);
+  if (failed(maybeLinearIter))
+    return failure();
+  Value linearIter = *maybeLinearIter;
   SlotAndPhase sp = computeSlotAndPhase(builder, loc, linearIter, depth);
   Value idx = arith::ConstantIntOp::create(builder, loc, baseIdx, 32);
   idx = arith::AddIOp::create(builder, loc, idx, sp.slot);
@@ -404,6 +426,7 @@ static void insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
   ttng::WaitBarrierOp::create(builder, loc, barrierView, sp.phase, isLeader);
 
   LDBG("Inserted cross-CTA sync before MMA at " << loc);
+  return success();
 }
 
 struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
@@ -550,8 +573,9 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
       unsigned baseIdx = 0;
       for (auto [mma, depth] : llvm::zip(mmas, depths)) {
         LDBG("  MMA slots [" << baseIdx << ", " << baseIdx + depth << ")");
-        insertSyncBeforeMMA(mma, barrierAlloc, phaseScope, baseIdx, depth,
-                            counts);
+        if (failed(insertSyncBeforeMMA(mma, barrierAlloc, phaseScope, baseIdx,
+                                       depth, counts)))
+          return signalPassFailure();
         baseIdx += depth;
       }
     }
@@ -595,8 +619,9 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
                                                   /*arriveCount=*/2);
         phaseScope = mma->getParentOp();
       }
-      insertSyncBeforeMMA(mma, barrierAlloc, phaseScope, /*baseIdx=*/0,
-                          /*depth=*/1, counts);
+      if (failed(insertSyncBeforeMMA(mma, barrierAlloc, phaseScope,
+                                     /*baseIdx=*/0, /*depth=*/1, counts)))
+        return signalPassFailure();
     }
   }
 };
