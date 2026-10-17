@@ -1189,6 +1189,11 @@ class TestDispatchArgIndicesWithNone(TestCase):
         # With None bias, output should be zeros
         self.assertTrue(torch.allclose(out2, torch.zeros(N, device=device)))
 
+    # The C fast path (which this test exercises via native_fast_dispatch_insert)
+    # is bypassed when TRITON_ALWAYS_COMPILE=1 (set by defs.bzl for all buck
+    # tests), so the replacement dispatcher would never fire. Opt out here:
+    # this test validates dispatch metadata, not recompilation.
+    @patch.dict(os.environ, {"TRITON_ALWAYS_COMPILE": "0"})
     def test_reinsert_preserves_dispatch_metadata(self):
         """Reinserting one specialization must not create metadata-less entries."""
 
