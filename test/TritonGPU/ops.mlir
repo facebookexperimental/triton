@@ -96,6 +96,13 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 2 : i32, "ttg.num-w
     tt.return
   }
 
+  // CHECK-LABEL: @subslice_non_broadcast_cga_dim
+  tt.func @subslice_non_broadcast_cga_dim(%arg0: !ttg.memdesc<8x16xf32, #shared_cga_01, #smem>) {
+    // CHECK: ttg.memdesc_subslice %{{.*}}[0, 0]
+    %0 = ttg.memdesc_subslice %arg0 [0, 0] : !ttg.memdesc<8x16xf32, #shared_cga_01, #smem> -> !ttg.memdesc<8x8xf32, #shared_cga_01, #smem, 8x16>
+    tt.return
+  }
+
   // CHECK-LABEL: @subslice_non_trivial_block_cga_10
   tt.func @subslice_non_trivial_block_cga_10(%arg0: !ttg.memdesc<8x16xf32, #shared_cga_10, #smem>) {
     // CHECK: ttg.memdesc_subslice %{{.*}}[0, 0]
