@@ -55,6 +55,12 @@ LinearLayout toLinearLayout(TensorOrMemDesc type);
 // with the allocShape as the shape, otherwise the layout will be incorrect!
 LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout);
 
+// Returns true if the layouts differ only in the order of their register
+// basis vectors. Reordering those vectors changes the order of values within a
+// thread, but not the set of tensor elements owned by each lane/warp/block.
+bool isLayoutEquivalentIgnoringRegisterOrder(const LinearLayout &lhs,
+                                             const LinearLayout &rhs);
+
 // Returns the linear component of a padded shared encoding. The encoding must
 // satisfy isPaddedEncoding (asserts otherwise).
 //

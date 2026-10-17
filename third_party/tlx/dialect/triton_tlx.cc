@@ -277,7 +277,12 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               if (!type.getEncoding())
+               auto parentFunc =
+                   v.getParentRegion()->getParentOfType<tt::FuncOp>();
+               bool hasDeferredHelperLayout =
+                   v.getDefiningOp<tt::CallOp>() ||
+                   (parentFunc && parentFunc.getSymVisibility() == "private");
+               if (!type.getEncoding() && !hasDeferredHelperLayout)
                  throw std::runtime_error(
                      "release_layout requires an explicit source layout");
                auto newType = RankedTensorType::get(type.getShape(),
@@ -610,6 +615,29 @@ void init_triton_tlx_ir(py::module &&m) {
                  context, version, warpsPerCta, instrShape, transposed,
                  cgaLayout, tilesPerWarp, elementBitWidth));
            })
+      .def(
+          "make_slice_encoding_attr",
+          [](TritonOpBuilder &self, unsigned dim,
+             Attribute parentEnc) -> Attribute {
+            auto context = self.getBuilder().getContext();
+            auto parent = dyn_cast<ttg::DistributedEncodingTrait>(parentEnc);
+            auto parentLayout = dyn_cast<ttg::LayoutEncodingTrait>(parentEnc);
+            if (!parent || !parentLayout)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: parent must be a ranked "
+                  "distributed layout");
+            unsigned rank = parentLayout.getRank();
+            if (rank <= 1)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: parent layout must have at "
+                  "least rank >= 2");
+            if (dim >= rank)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: slice dim=" + std::to_string(dim) +
+                  " must be less than the parent rank=" + std::to_string(rank));
+            return mlir::cast<Attribute>(
+                ttg::SliceEncodingAttr::get(context, dim, parent));
+          })
       .def("make_linear_encoding_attr",
            [](TritonOpBuilder &self, std::vector<std::vector<int>> regBases,
               std::vector<std::vector<int>> laneBases,
@@ -1265,18 +1293,39 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self) -> void {
              self.create<ttg::WarpReturnOp>();
            })
-      .def("create_async_load",
-           [](TritonOpBuilder &self, Value ptrTensor, Value result,
-              std::optional<Value> mask, std::optional<Value> other,
-              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile, std::optional<Value> bulkSize,
-              std::optional<Value> barrier, bool useBulk) -> mlir::Value {
-             return self.create<ttg::AsyncCopyGlobalToLocalOp>(
-                 ptrTensor, result, mask.value_or(Value()),
-                 other.value_or(Value()), bulkSize.value_or(Value()),
-                 barrier.value_or(Value()), cacheModifier, evictionPolicy,
-                 isVolatile, useBulk);
+      .def(
+          "create_warp_predicate_op",
+          [](TritonOpBuilder &self, std::vector<Type> &resultTypes,
+             Value predicate, std::vector<Value> &inits,
+             bool waveUniform) -> Operation * {
+            UnitAttr waveUniformAttr =
+                waveUniform ? self.getBuilder().getUnitAttr() : UnitAttr();
+            return self.create<ttg::WarpPredicateOp>(resultTypes, predicate,
+                                                     inits, waveUniformAttr);
+          },
+          py::return_value_policy::reference)
+      .def("create_predicate_yield_op",
+           [](TritonOpBuilder &self, std::vector<Value> &values) -> void {
+             self.create<ttg::PredicateYieldOp>(values);
            })
+      .def(
+          "create_async_load",
+          [](TritonOpBuilder &self, Value ptrTensor, Value result,
+             std::optional<Value> mask, std::optional<Value> other,
+             CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+             bool isVolatile, std::optional<Value> bulkSize,
+             std::optional<Value> barrier, bool useBulk) -> mlir::Value {
+            return self.create<ttg::AsyncCopyGlobalToLocalOp>(
+                ptrTensor, result, mask.value_or(Value()),
+                other.value_or(Value()), bulkSize.value_or(Value()),
+                barrier.value_or(Value()), cacheModifier, evictionPolicy,
+                isVolatile, useBulk);
+          },
+          py::arg("ptrTensor"), py::arg("result"), py::arg("mask").none(),
+          py::arg("other").none(), py::arg("cacheModifier"),
+          py::arg("evictionPolicy"), py::arg("isVolatile"),
+          py::arg("bulkSize").none(), py::arg("barrier").none(),
+          py::arg("useBulk"))
       .def("create_clock64",
            [](TritonOpBuilder &self) -> mlir::Value {
              return self.create<triton::gpu::Clock64Op>(
@@ -1378,14 +1427,17 @@ void init_triton_tlx_ir(py::module &&m) {
                  resultType, ptr, offsets, Value() /*stride*/, cache,
                  mask.value_or(Value()), other.value_or(Value()), contiguity);
            })
-      .def("create_buffer_store",
-           [](TritonOpBuilder &self, Value storedValue, Value ptr,
-              Value offsets, std::optional<Value> mask, tt::CacheModifier cache,
-              uint32_t contiguity) {
-             self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
-                                              Value() /*stride*/, cache,
-                                              mask.value_or(Value()), contiguity);
-           })
+      .def(
+          "create_buffer_store",
+          [](TritonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
+             std::optional<Value> mask, tt::CacheModifier cache,
+             uint32_t contiguity) -> OpState {
+            return self.create<ttag::BufferStoreOp>(
+                storedValue, ptr, offsets, Value() /*stride*/, cache,
+                mask.value_or(Value()), contiguity);
+          },
+          py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
+          py::arg("mask").none(), py::arg("cache"), py::arg("contiguity"))
       .def("create_buffer_load_to_local",
            [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
               std::optional<Value> mask, std::optional<Value> other,

@@ -374,6 +374,38 @@ class amd_mfma_layout(layout_encoding):
                                                    self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
 
 
+class slice_layout(layout_encoding):
+    """Rank-reduced view of a distributed parent layout.
+
+    This is the explicit-layout counterpart of the encoding inferred for a
+    reduction result. Keeping the parent is important because a later
+    ``expand_dims`` reconstructs that parent layout.
+    """
+
+    def __init__(self, parent, dim):
+        super().__init__()
+        self.parent = tl._unwrap_if_constexpr(parent)
+        self.dim = int(dim)
+        if not isinstance(self.parent, layout_encoding):
+            raise TypeError("slice_layout parent must be a TLX layout encoding")
+        if self.dim < 0:
+            raise ValueError("slice_layout dim must be non-negative")
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape
+        parent = self.parent.to_ir(builder, element_type=element_type)
+        return builder.make_slice_encoding_attr(self.dim, parent)
+
+    def __repr__(self):
+        return f"slice_layout<dim={self.dim}, parent={self.parent!r}>"
+
+    def __eq__(self, other):
+        return isinstance(other, slice_layout) and self.dim == other.dim and self.parent == other.parent
+
+    def __hash__(self):
+        return hash((self.__class__.__name__, self.dim, self.parent))
+
+
 class dot_operand_layout(layout_encoding):
     """Explicit MFMA dot-operand view for a shared-memory local load."""
 
