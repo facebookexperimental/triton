@@ -34,6 +34,9 @@ struct ScheduledMfmaLoweringState {
 
 void finalizeScheduledMfmaLowering(const ScheduledMfmaLoweringState &state);
 
+// Classify the original producer graph before LLVM conversion changes it.
+llvm::DenseSet<Operation *> collectLoadReadyScaledMfmaGroups(ModuleOp mod);
+
 void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            const TargetInfo &targetInfo,
                                            RewritePatternSet &patterns,
@@ -45,10 +48,10 @@ void populateMemoryOpToLLVMPatterns(
     std::shared_ptr<mlir::triton::DistributedCoordinateGroups> coordinateGroups,
     ScheduledMfmaLoweringState &scheduledMfmaState);
 
-void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
-                                 RewritePatternSet &patterns,
-                                 ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                                 PatternBenefit benefit);
+void populateDotOpToLLVMPatterns(
+    LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
+    ModuleAxisInfoAnalysis &axisInfoAnalysis, const TargetInfo &targetInfo,
+    const llvm::DenseSet<Operation *> &loadReadyGroups, PatternBenefit benefit);
 void populateElementwiseOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns, bool ftz,
     ModuleAxisInfoAnalysis &axisInfoAnalysis, ModuleAllocation &allocation,

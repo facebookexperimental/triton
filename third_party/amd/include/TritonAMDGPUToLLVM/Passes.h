@@ -11,6 +11,7 @@
 
 namespace mlir {
 
+class DialectRegistry;
 class ModuleOp;
 template <typename T> class OperationPass;
 
@@ -30,6 +31,7 @@ createConvertWarpPipelinePass(StringRef gfxArch);
 std::unique_ptr<OperationPass<ModuleOp>>
 createTritonAMDGPUConvertWarpSpecializeToLLVMPass(StringRef gfxArch);
 void runScalarizePackedFOpsPass(llvm::Function &F);
+void registerAMDLLVMTranslationInterface(DialectRegistry &registry);
 
 } // namespace mlir::triton::AMD
 

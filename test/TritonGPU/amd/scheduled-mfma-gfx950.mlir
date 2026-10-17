@@ -2592,3 +2592,302 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   }
 }
+
+// -----
+
+// CHECK-LABEL: llvm.func @scaled_complete_group_transposed
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: amdg.convergent
+// CHECK-SAME: "s_nop 15\0As_nop 3\0A
+// CHECK-SAME: v_mfma_scale_f32_32x32x64_f8f6f4 $0, $8, $10, $0, $12, $13 op_sel:[0,0,0]
+// CHECK-SAME: v_mfma_scale_f32_32x32x64_f8f6f4 $1, $9, $10, $1, $12, $13 op_sel:[1,0,0]
+// CHECK-SAME: v_mfma_scale_f32_32x32x64_f8f6f4 $2, $8, $11, $2, $12, $13 op_sel:[0,1,0]
+// CHECK-SAME: v_mfma_scale_f32_32x32x64_f8f6f4 $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_complete_group_transposed(
+      %a: tensor<128x64xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #as>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true {amdg.load_ready = true, amdg.entry_states = 4 : i32}
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @scaled_complete_group_untransposed
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: amdg.convergent
+// CHECK-SAME: "s_nop 15\0As_nop 3\0A
+// CHECK-SAME: v_mfma_scale_f32_32x32x64_f8f6f4 $0, $8, $10, $0, $12, $13 op_sel:[0,0,0]
+// CHECK-SAME: v_mfma_scale_f32_32x32x64_f8f6f4 $1, $8, $11, $1, $12, $13 op_sel:[0,1,0]
+// CHECK-SAME: v_mfma_scale_f32_32x32x64_f8f6f4 $2, $9, $10, $2, $12, $13 op_sel:[1,0,0]
+// CHECK-SAME: v_mfma_scale_f32_32x32x64_f8f6f4 $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = false}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_complete_group_untransposed(
+      %a: tensor<128x64xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #as>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// Prove all data inputs before conversion changes their producer graph.
+// Memory completion still requires backend VM/LGKM waits.
+
+// CHECK-LABEL: llvm.func @scaled_group_loaded_inputs
+// CHECK: llvm.inline_asm has_side_effects{{.*}}amdg.convergent
+// CHECK-SAME: "s_nop 3\0Av_mfma_scale
+// CHECK-SAME: $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+// CHECK-LABEL: llvm.func @scaled_group_local_payloads
+// CHECK: llvm.inline_asm has_side_effects{{.*}}amdg.convergent
+// CHECK-SAME: "s_nop 3\0Av_mfma_scale
+// CHECK-SAME: $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+// CHECK-LABEL: llvm.func @scaled_group_integer_pack_select
+// CHECK: llvm.inline_asm has_side_effects{{.*}}amdg.convergent
+// CHECK-SAME: "s_nop 3\0Av_mfma_scale
+// CHECK-SAME: $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+// CHECK-LABEL: llvm.func @scaled_group_unknown_select
+// CHECK: llvm.inline_asm has_side_effects{{.*}}amdg.convergent
+// CHECK-SAME: "s_nop 15\0As_nop 3\0Av_mfma_scale
+// CHECK-SAME: $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+// CHECK-LABEL: llvm.func @scaled_group_masked_load
+// CHECK: llvm.inline_asm has_side_effects{{.*}}amdg.convergent
+// CHECK-SAME: "s_nop 15\0As_nop 3\0Av_mfma_scale
+// CHECK-SAME: $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+// CHECK-LABEL: llvm.func @scaled_group_opaque_scale
+// CHECK: llvm.inline_asm has_side_effects{{.*}}amdg.convergent
+// CHECK-SAME: "s_nop 15\0As_nop 3\0Av_mfma_scale
+// CHECK-SAME: $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+// CHECK-LABEL: llvm.func @scaled_group_call_scale
+// CHECK: llvm.inline_asm has_side_effects{{.*}}amdg.convergent
+// CHECK-SAME: "s_nop 15\0As_nop 3\0Av_mfma_scale
+// CHECK-SAME: $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+// CHECK-LABEL: llvm.func @scaled_group_control_scale
+// CHECK: llvm.inline_asm has_side_effects{{.*}}amdg.convergent
+// CHECK-SAME: "s_nop 15\0As_nop 3\0Av_mfma_scale
+// CHECK-SAME: $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+// CHECK-LABEL: llvm.func @scaled_group_mfma_payload
+// CHECK: llvm.inline_asm has_side_effects{{.*}}amdg.convergent
+// CHECK-SAME: "s_nop 15\0As_nop 3\0Av_mfma_scale
+// CHECK-SAME: $3, $9, $11, $3, $12, $13 op_sel:[1,1,0] op_sel_hi:[0,0,0]\0As_nop 15\0As_nop 3"
+// CHECK-SAME: "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v"
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 16384 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_group_loaded_inputs(
+      %ap: tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>,
+      %asp: tensor<128x2x!tt.ptr<i8>, #as>,
+      %bp: tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>,
+      %bsp: tensor<128x2x!tt.ptr<i8>, #bs>) {
+    %a = tt.load %ap : tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>
+    %as = tt.load %asp : tensor<128x2x!tt.ptr<i8>, #as>
+    %b = tt.load %bp : tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>
+    %bs = tt.load %bsp : tensor<128x2x!tt.ptr<i8>, #bs>
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %bits = tt.bitcast %a : tensor<128x64xf8E4M3FN, #lhs> -> tensor<128x64xi8, #lhs>
+    %payload = tt.bitcast %bits : tensor<128x64xi8, #lhs> -> tensor<128x64xf8E4M3FN, #lhs>
+    %result = amdg.scaled_mfma_group %payload scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+  tt.func public @scaled_group_local_payloads(
+      %ap: tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>,
+      %asp: tensor<128x2x!tt.ptr<i8>, #as>,
+      %bp: tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>,
+      %bsp: tensor<128x2x!tt.ptr<i8>, #bs>) {
+    %a = tt.load %ap : tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>
+    %as = tt.load %asp : tensor<128x2x!tt.ptr<i8>, #as>
+    %b = tt.load %bp : tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>
+    %bs = tt.load %bsp : tensor<128x2x!tt.ptr<i8>, #bs>
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %al = ttg.local_alloc %a {allocation.offset = 0 : i32} : (tensor<128x64xf8E4M3FN, #lhs>) -> !ttg.memdesc<128x64xf8E4M3FN, #shared, #smem>
+    %bl = ttg.local_alloc %b {allocation.offset = 8192 : i32} : (tensor<64x128xf8E4M3FN, #rhs>) -> !ttg.memdesc<64x128xf8E4M3FN, #shared, #smem>
+    %ar = ttg.local_load %al : !ttg.memdesc<128x64xf8E4M3FN, #shared, #smem> -> tensor<128x64xf8E4M3FN, #lhs>
+    %br = ttg.local_load %bl : !ttg.memdesc<64x128xf8E4M3FN, #shared, #smem> -> tensor<64x128xf8E4M3FN, #rhs>
+    %result = amdg.scaled_mfma_group %ar scale %as, %br scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+  tt.func public @scaled_group_integer_pack_select(
+      %ap: tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>,
+      %asp: tensor<128x2x!tt.ptr<i8>, #as>,
+      %bp: tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>,
+      %bsp: tensor<128x2x!tt.ptr<i8>, #bs>) {
+    %a = tt.load %ap : tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>
+    %as = tt.load %asp : tensor<128x2x!tt.ptr<i8>, #as>
+    %b = tt.load %bp : tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>
+    %bs = tt.load %bsp : tensor<128x2x!tt.ptr<i8>, #bs>
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %as32 = arith.extui %as : tensor<128x2xi8, #as> to tensor<128x2xi32, #as>
+    %one = arith.constant dense<1> : tensor<128x2xi32, #as>
+    %shifted = arith.shrui %as32, %one : tensor<128x2xi32, #as>
+    %bytes = arith.trunci %shifted : tensor<128x2xi32, #as> to tensor<128x2xi8, #as>
+    %condition = arith.cmpi uge, %as32, %one : tensor<128x2xi32, #as>
+    %selected = arith.select %condition, %bytes, %as : tensor<128x2xi1, #as>, tensor<128x2xi8, #as>
+    %result = amdg.scaled_mfma_group %a scale %selected, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+  tt.func public @scaled_group_unknown_select(
+      %ap: tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>,
+      %asp: tensor<128x2x!tt.ptr<i8>, #as>,
+      %bp: tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>,
+      %bsp: tensor<128x2x!tt.ptr<i8>, #bs>,
+      %condition: i1) {
+    %a = tt.load %ap : tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>
+    %as = tt.load %asp : tensor<128x2x!tt.ptr<i8>, #as>
+    %b = tt.load %bp : tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>
+    %bs = tt.load %bsp : tensor<128x2x!tt.ptr<i8>, #bs>
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %selected = arith.select %condition, %as, %as : i1, tensor<128x2xi8, #as>
+    %result = amdg.scaled_mfma_group %a scale %selected, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+  tt.func public @scaled_group_masked_load(
+      %ap: tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>,
+      %asp: tensor<128x2x!tt.ptr<i8>, #as>,
+      %bp: tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>,
+      %bsp: tensor<128x2x!tt.ptr<i8>, #bs>,
+      %mask: tensor<128x2xi1, #as>) {
+    %a = tt.load %ap : tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>
+    %as = tt.load %asp : tensor<128x2x!tt.ptr<i8>, #as>
+    %b = tt.load %bp : tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>
+    %bs = tt.load %bsp : tensor<128x2x!tt.ptr<i8>, #bs>
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %other = arith.constant dense<0> : tensor<128x2xi8, #as>
+    %masked = tt.load %asp, %mask, %other : tensor<128x2x!tt.ptr<i8>, #as>
+    %result = amdg.scaled_mfma_group %a scale %masked, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+  tt.func public @scaled_group_opaque_scale(
+      %ap: tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>,
+      %asp: tensor<128x2x!tt.ptr<i8>, #as>,
+      %bp: tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>,
+      %bsp: tensor<128x2x!tt.ptr<i8>, #bs>) {
+    %a = tt.load %ap : tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>
+    %as = tt.load %asp : tensor<128x2x!tt.ptr<i8>, #as>
+    %b = tt.load %bp : tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>
+    %bs = tt.load %bsp : tensor<128x2x!tt.ptr<i8>, #bs>
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %wide = arith.extui %as : tensor<128x2xi8, #as> to tensor<128x2xi32, #as>
+    %opaque = "tt.elementwise_inline_asm"(%wide) <{asm_string = "", constraints = "=v,0", packed_element = 1 : i32, pure = false}> : (tensor<128x2xi32, #as>) -> tensor<128x2xi32, #as>
+    %bytes = arith.trunci %opaque : tensor<128x2xi32, #as> to tensor<128x2xi8, #as>
+    %result = amdg.scaled_mfma_group %a scale %bytes, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+  tt.func public @scaled_group_call_scale(
+      %ap: tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>,
+      %asp: tensor<128x2x!tt.ptr<i8>, #as>,
+      %bp: tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>,
+      %bsp: tensor<128x2x!tt.ptr<i8>, #bs>) {
+    %a = tt.load %ap : tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>
+    %as = tt.load %asp : tensor<128x2x!tt.ptr<i8>, #as>
+    %b = tt.load %bp : tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>
+    %bs = tt.load %bsp : tensor<128x2x!tt.ptr<i8>, #bs>
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %called = tt.call @forward_scale(%as) : (tensor<128x2xi8, #as>) -> tensor<128x2xi8, #as>
+    %result = amdg.scaled_mfma_group %a scale %called, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+  tt.func public @scaled_group_control_scale(
+      %ap: tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>,
+      %asp: tensor<128x2x!tt.ptr<i8>, #as>,
+      %bp: tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>,
+      %bsp: tensor<128x2x!tt.ptr<i8>, #bs>,
+      %condition: i1) {
+    %a = tt.load %ap : tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>
+    %as = tt.load %asp : tensor<128x2x!tt.ptr<i8>, #as>
+    %b = tt.load %bp : tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>
+    %bs = tt.load %bsp : tensor<128x2x!tt.ptr<i8>, #bs>
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %controlled = scf.if %condition -> (tensor<128x2xi8, #as>) {
+      scf.yield %as : tensor<128x2xi8, #as>
+    } else {
+      scf.yield %as : tensor<128x2xi8, #as>
+    }
+    %result = amdg.scaled_mfma_group %a scale %controlled, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+  tt.func public @scaled_group_mfma_payload(
+      %ap: tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>,
+      %asp: tensor<128x2x!tt.ptr<i8>, #as>,
+      %bp: tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>,
+      %bsp: tensor<128x2x!tt.ptr<i8>, #bs>) {
+    %a = tt.load %ap : tensor<128x64x!tt.ptr<f8E4M3FN>, #lhs>
+    %as = tt.load %asp : tensor<128x2x!tt.ptr<i8>, #as>
+    %b = tt.load %bp : tensor<64x128x!tt.ptr<f8E4M3FN>, #rhs>
+    %bs = tt.load %bsp : tensor<128x2x!tt.ptr<i8>, #bs>
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %ordinary = tt.dot_scaled %a scale %as, %b scale %bs, %c lhs = e4m3 rhs = e4m3 {fastMath = false} : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as> * tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs> -> tensor<128x128xf32, #mma>
+    %slice = amdg.extract_slice %ordinary [0, 0] : tensor<128x128xf32, #mma> to tensor<128x64xf32, #mma>
+    %narrow = tt.fp_to_fp %slice, rounding = rtne : tensor<128x64xf32, #mma> -> tensor<128x64xf8E4M3FN, #mma>
+    %payload = ttg.convert_layout %narrow {allocation.offset = 0 : i32} : tensor<128x64xf8E4M3FN, #mma> -> tensor<128x64xf8E4M3FN, #lhs>
+    %result = amdg.scaled_mfma_group %payload scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+  tt.func private @forward_scale(%value: tensor<128x2xi8, #as>) -> tensor<128x2xi8, #as> {
+    tt.return %value : tensor<128x2xi8, #as>
+  }
+}

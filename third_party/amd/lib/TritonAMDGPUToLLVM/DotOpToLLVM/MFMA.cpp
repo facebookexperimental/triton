@@ -21,16 +21,35 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 #include "../PatternTritonGPUOpToLLVM.h"
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "Utility.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <algorithm>
+
 using namespace mlir;
 using namespace mlir::triton;
 
 namespace {
+
+constexpr unsigned kScaledGroupValuEntryStates = 2;
+constexpr unsigned kScaledGroupExecEntryStates = 4;
+constexpr unsigned kScaledGroupMfmaWrite16States = 20;
+
+std::string scaledGroupDelay(unsigned states) {
+  std::string assembly;
+  while (states) {
+    unsigned chunk = std::min(states, 16u);
+    assembly += "s_nop " + std::to_string(chunk - 1);
+    states -= chunk;
+    if (states)
+      assembly += "\n";
+  }
+  return assembly;
+}
 
 using ::mlir::LLVM::AMD::scaleDotElemTypeToMLIRType;
 using ::mlir::LLVM::AMD::shuffleXor;
@@ -593,8 +612,10 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     return rewriter.create(loweredOp)->getResult(0);
   }
 
-  LogicalResult convertScaledDot(DotScaledOp op,
-                                 DotScaledOpAdaptor adaptor) const {
+  template <typename Op, typename Adaptor>
+  LogicalResult convertScaledDot(Op op, Adaptor adaptor,
+                                 bool completeGroup = false,
+                                 bool loadReadyOperands = false) const {
     // Check if this dot has come with priority set by setprio.
     auto setPrioOp = dyn_cast_or_null<ROCDL::SetPrioOp>(op->getPrevNode());
 
@@ -747,6 +768,89 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     Value firstMfma;
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     auto vecTy = vec_ty(dstElemTy, elemsPerVec);
+
+    if (completeGroup) {
+      if (numRepB != 1 || numRepM != 2 || numRepN != 2 || numVecInKBase != 1 ||
+          elemsPerVec != 16 || !existBothScales || isAScaleConstant ||
+          isBScaleConstant || operandA.size() != 2 || operandB.size() != 2 ||
+          operandAScale.size() != 1 || operandBScale.size() != 1)
+        return op.emitOpError(
+            "requires nonconstant scales and one native 2x2 K64 group");
+      auto payloadTy = vec_ty(i32_ty, 8);
+      for (auto *table : {&operandA, &operandB})
+        for (auto &entry : *table)
+          if (entry.second.getType() != payloadTy)
+            return op.emitOpError(
+                "payload fragments must contain eight registers");
+      SmallVector<Value> inputs;
+      SmallVector<Type> outputs(4, vecTy);
+      for (unsigned fragment = 0; fragment != 4; ++fragment) {
+        Value acc = tb.undef(vecTy);
+        for (unsigned element = 0; element != 16; ++element)
+          acc = tb.insert_element(vecTy, acc, fc[fragment * 16 + element],
+                                  tb.i32_val(element));
+        inputs.push_back(acc);
+      }
+      Value first0 = operandA[{0, 0, 0}];
+      Value first1 = operandA[{0, 1, 0}];
+      Value second0 = operandB[{0, 0, 0}];
+      Value second1 = operandB[{0, 1, 0}];
+      Value firstScale = operandAScale[{0, 0, 0}];
+      Value secondScale = operandBScale[{0, 0, 0}];
+      if (mfmaLayout.getIsTransposed()) {
+        std::swap(first0, second0);
+        std::swap(first1, second1);
+        std::swap(firstScale, secondScale);
+      }
+      inputs.append(
+          {first0, first1, second0, second1, firstScale, secondScale});
+      // Proved data inputs need the VALU and EXEC entry delays.
+      // Backend VM/LGKM completion remains necessary for memory inputs.
+      unsigned entryStates = loadReadyOperands
+                                 ? std::max(kScaledGroupValuEntryStates,
+                                            kScaledGroupExecEntryStates)
+                                 : kScaledGroupMfmaWrite16States;
+      std::string assembly = scaledGroupDelay(entryStates) + "\n";
+      for (unsigned m = 0; m != 2; ++m) {
+        for (unsigned n = 0; n != 2; ++n) {
+          unsigned index = m * 2 + n;
+          unsigned first = mfmaLayout.getIsTransposed() ? n : m;
+          unsigned second = mfmaLayout.getIsTransposed() ? m : n;
+          unsigned selectorA = (m * numRepK) % (aNonKPackedVals * akPackedVals);
+          unsigned selectorB = (n * numRepK) % (bNonKPackedVals * bkPackedVals);
+          unsigned firstSelector =
+              mfmaLayout.getIsTransposed() ? selectorB : selectorA;
+          unsigned secondSelector =
+              mfmaLayout.getIsTransposed() ? selectorA : selectorB;
+          assembly +=
+              "v_mfma_scale_f32_32x32x64_f8f6f4 $" + std::to_string(index) +
+              ", $" + std::to_string(8 + first) + ", $" +
+              std::to_string(10 + second) + ", $" + std::to_string(index) +
+              ", $12, $13 op_sel:[" + std::to_string(firstSelector) + "," +
+              std::to_string(secondSelector) + ",0] op_sel_hi:[0,0,0]\n";
+        }
+      }
+      // This fused drain prevents dead payload registers from being reused
+      // early.
+      assembly += scaledGroupDelay(kScaledGroupMfmaWrite16States);
+      auto resultTy = LLVM::LLVMStructType::getLiteral(ctx, outputs);
+      auto group = LLVM::InlineAsmOp::create(
+          rewriter, loc, resultTy, inputs, assembly,
+          "=&v,=&v,=&v,=&v,0,1,2,3,v,v,v,v,v,v",
+          /*has_side_effects=*/true, /*is_align_stack=*/false,
+          LLVM::TailCallKind::None,
+          LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
+          ArrayAttr::get(ctx, {}));
+      group->setAttr("amdg.convergent", rewriter.getUnitAttr());
+      for (unsigned fragment = 0; fragment != 4; ++fragment) {
+        Value acc = tb.extract_val(group.getRes(), fragment);
+        for (unsigned element = 0; element != 16; ++element)
+          fc[fragment * 16 + element] =
+              tb.extract_element(f32_ty, acc, tb.i32_val(element));
+      }
+      packAndReplaceResult(op, fc, maybeMfmaIntrinsic, dstElemTy, elemTyA, 4);
+      return success();
+    }
 
     // 2-step pingpong got local_loads + dot_scaled in the dot cluster
     // from the first step in the transform pingpong pass.
@@ -944,4 +1048,20 @@ LogicalResult convertScaledMFMA(triton::DotScaledOp op,
 
   return helper.convertScaledDot(op, adaptor);
 }
+
+LogicalResult
+convertScaledMFMAGroup(triton::amdgpu::ScaledMfmaGroupOp op,
+                       triton::amdgpu::ScaledMfmaGroupOp::Adaptor adaptor,
+                       const LLVMTypeConverter *typeConverter,
+                       ConversionPatternRewriter &rewriter,
+                       bool loadReadyOperands) {
+  auto layout =
+      dyn_cast<AMDMfmaEncodingAttr>(op.getResult().getType().getEncoding());
+  if (!layout)
+    return op.emitOpError("requires a native MFMA result layout");
+  ScaledDotOpMFMAConversionHelper helper(layout, rewriter, typeConverter,
+                                         op.getLoc());
+  return helper.convertScaledDot(op, adaptor, true, loadReadyOperands);
+}
+
 } // namespace mlir::triton::AMD

@@ -78,6 +78,7 @@ from .mma_ops import (
     amd_register_class_anchor,
     amd_register_resident,
     amd_scheduled_mfma,
+    amd_scaled_mfma_group,
     async_dot,
     async_dot_scaled,
     async_dot_wait,
@@ -127,6 +128,7 @@ from .types import (
     TMemCTAMode,
 )
 from .utility import (
+    amd_scaled_downcast_fp8,
     amd_set_wave_sched_mode,
     async_task_replica_id,
     clock64,
@@ -176,6 +178,7 @@ __all__ = [
     "amd_register_class_anchor",
     "amd_register_resident",
     "amd_scheduled_mfma",
+    "amd_scaled_mfma_group",
     "extract_slice",
     "rematerialized_range",
     "release_layout",
@@ -265,6 +268,7 @@ __all__ = [
     "release_layout",
     "tcgen05_commit",
     # utility
+    "amd_scaled_downcast_fp8",
     "amd_set_wave_sched_mode",
     "cluster_cta_rank",
     "cluster_size_1d",

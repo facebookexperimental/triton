@@ -515,15 +515,16 @@ Value Fp32ToFp16rtneOneValue(Location loc, RewriterBase &rewriter,
 
 // Convert Fp16/Bf16/Fp32 to OCP Fp8/Bf8 on CDNA4
 template <typename ConvertOp>
-SmallVector<Value> scalePk4DowncastToFp8(Location loc,
-                                         ConversionPatternRewriter &rewriter,
-                                         const SmallVector<Value> &v) {
+SmallVector<Value>
+scalePk4DowncastToFp8(Location loc, ConversionPatternRewriter &rewriter,
+                      const SmallVector<Value> &v, Value scale = {}) {
   assert(v.size() == 4);
   auto b = TritonLLVMOpBuilder(loc, rewriter);
 
   Type v2I16Ty = vec_ty(i16_ty, 2);
   Value v2I16Vec = b.undef(v2I16Ty);
-  Value scale = b.f32_val(1);
+  if (!scale)
+    scale = b.f32_val(1);
 
   if constexpr (std::is_same_v<ConvertOp, ROCDL::CvtScaleF32PkFp8F32Op> ||
                 std::is_same_v<ConvertOp, ROCDL::CvtScaleF32PkBf8F32Op>) {
@@ -2489,6 +2490,59 @@ struct FpToFpOpConversion
 private:
   ISAFamily isaFamily;
 };
+// E8M0 byte 119: the conversion divisor that scales FP32 inputs by 256.
+constexpr float kScaleBy256Divisor = 0x1p-8f;
+
+class ScaledDowncastFp8By256OpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::ScaledDowncastFp8By256Op> {
+public:
+  ScaledDowncastFp8By256OpConversion(LLVMTypeConverter &typeConverter,
+                                     ISAFamily isaFamily,
+                                     PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), isaFamily(isaFamily) {}
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::ScaledDowncastFp8By256Op op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (isaFamily != ISAFamily::CDNA4)
+      return op.emitOpError("requires the gfx950 scaled FP8 conversion");
+    if (!isa_and_nonnull<triton::gpu::DistributedEncodingTrait>(
+            op.getInput().getType().getEncoding()))
+      return op.emitOpError("requires a distributed tensor encoding");
+    auto func = op->getParentOfType<LLVM::LLVMFuncOp>();
+    if (!func)
+      return op.emitOpError(
+          "requires an LLVM function after function lowering");
+    using attrType = triton::amdgpu::SetFP8ClampingAttr;
+    func->setAttr(attrType::getMnemonic(), attrType::get(op.getContext()));
+
+    Location loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<Value> inputs =
+        unpackUniqueTensorElements(loc, adaptor.getInput(), rewriter);
+    // The conversion divides by its scale operand: 2^-8 multiplies by 256.
+    Value divisor = b.f32_val(kScaleBy256Divisor);
+    SmallVector<Value> outputs;
+    for (size_t offset = 0; offset < inputs.size(); offset += 4) {
+      size_t count = std::min(size_t(4), inputs.size() - offset);
+      SmallVector<Value> chunk(inputs.begin() + offset,
+                               inputs.begin() + offset + count);
+      chunk.resize(4, b.undef(f32_ty));
+      SmallVector<Value> converted =
+          scalePk4DowncastToFp8<ROCDL::CvtScaleF32PkFp8F32Op>(loc, rewriter,
+                                                              chunk, divisor);
+      outputs.append(converted.begin(), converted.begin() + count);
+    }
+    Value result = packUniqueTensorElements(loc, getTypeConverter(), outputs,
+                                            rewriter, op.getOutput().getType());
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+
+private:
+  ISAFamily isaFamily;
+};
 } // namespace
 
 namespace mlir::triton::AMD {
@@ -2501,5 +2555,7 @@ void populateFpCastOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
 
   patterns.add<FpToFpOpConversion>(typeConverter, axisInfoAnalysis,
                                    targetInfo.getISAFamily(), benefit);
+  patterns.add<ScaledDowncastFp8By256OpConversion>(
+      typeConverter, targetInfo.getISAFamily(), benefit);
 }
 } // namespace mlir::triton::AMD

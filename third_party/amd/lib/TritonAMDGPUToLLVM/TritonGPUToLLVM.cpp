@@ -19,6 +19,8 @@
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
+#include "mlir/Target/LLVMIR/ModuleTranslation.h"
 #include "third_party/amd/include/Analysis/AMDGPUAllocation.h"
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
@@ -33,6 +35,7 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/IR/Instructions.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTTRITONAMDGPUTOLLVM
@@ -43,6 +46,31 @@ namespace mlir::triton {
 using namespace mlir;
 
 namespace {
+
+class AMDLLVMTranslationInterface
+    : public mlir::LLVMTranslationDialectInterface {
+public:
+  using LLVMTranslationDialectInterface::LLVMTranslationDialectInterface;
+  mlir::LogicalResult
+  amendOperation(mlir::Operation *op,
+                 mlir::ArrayRef<llvm::Instruction *> instructions,
+                 mlir::NamedAttribute attribute,
+                 mlir::LLVM::ModuleTranslation &translation) const override {
+    if (attribute.getName().strref() != "amdg.convergent")
+      return mlir::success();
+    if (!mlir::isa<mlir::UnitAttr>(attribute.getValue()) ||
+        !mlir::isa<mlir::LLVM::InlineAsmOp>(op) || op->getNumResults() != 1)
+      return op->emitError(
+          "amdg.convergent requires one-result LLVM inline assembly");
+    auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(
+        translation.lookupValue(op->getResult(0)));
+    if (!call || !call->isInlineAsm())
+      return op->emitError(
+          "amdg.convergent did not resolve to an inline-assembly call");
+    call->setConvergent();
+    return mlir::success();
+  }
+};
 
 // Materialize the schedule-group program at real LDS hazard boundaries. The
 // TTGIR pass provides the scheduling decision and exact machine counts; this
@@ -231,6 +259,7 @@ public:
     // must fail the conversion instead of leaving the op behind. The rest of
     // the dialect stays unmarked: some of it is lowered later.
     addIllegalOp<triton::amdgpu::ScheduledMfmaOp>();
+    addIllegalOp<triton::amdgpu::ScaledMfmaGroupOp>();
     addIllegalOp<triton::amdgpu::MfmaCommitOp>();
   }
 };
@@ -416,6 +445,10 @@ struct ConvertTritonAMDGPUToLLVM
     membarPass.run();
     materializeDeferredSchedGroupBarriers(mod);
 
+    // Keep trusted per-operation decisions outside the IR attribute dictionary.
+    // Function conversion moves these operations without cloning their bodies.
+    const auto loadReadyGroups = AMD::collectLoadReadyScaledMfmaGroups(mod);
+
     // Lower functions
     {
       TritonLLVMFunctionConversionTarget funcTarget(*context);
@@ -469,7 +502,7 @@ struct ConvertTritonAMDGPUToLLVM
     mlir::triton::populateConvertLayoutOpToLLVMPatterns(
         typeConverter, targetInfo, patterns, commonBenefit);
     AMD::populateDotOpToLLVMPatterns(typeConverter, patterns, axisInfoAnalysis,
-                                     AMDBenefit);
+                                     targetInfo, loadReadyGroups, AMDBenefit);
     AMD::populateElementwiseOpToLLVMPatterns(typeConverter, patterns, ftz,
                                              axisInfoAnalysis, allocation,
                                              targetInfo, AMDBenefit);
@@ -648,3 +681,15 @@ createFinalizeScheduledMfmaOperandsPass() {
 }
 
 } // namespace mlir::triton
+
+namespace mlir::triton::AMD {
+
+void registerAMDLLVMTranslationInterface(DialectRegistry &registry) {
+  registry.addExtension(
+      +[](mlir::MLIRContext *,
+          mlir::triton::amdgpu::TritonAMDGPUDialect *dialect) {
+        dialect->addInterfaces<AMDLLVMTranslationInterface>();
+      });
+}
+
+} // namespace mlir::triton::AMD

@@ -56,3 +56,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// Target-free scaled groups still require the selected gfx950 lowering target.
+
+// CHECK: error: 'amdg.scaled_mfma_group' op is supported only on gfx950
+// CHECK: error: failed to legalize operation 'amdg.scaled_mfma_group'
+// CHECK-NOT: v_mfma_scale_f32_32x32x64_f8f6f4
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 64], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#as = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[0, 0], [32, 0]], block = []}>
+#bs = #ttg.linear<{register = [[64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]], warp = [[32, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scaled_mfma_group_on_cdna3(
+      %a: tensor<128x64xf8E4M3FN, #lhs>, %as: tensor<128x2xi8, #as>,
+      %b: tensor<64x128xf8E4M3FN, #rhs>, %bs: tensor<128x2xi8, #bs>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    // expected-error @+2 {{is supported only on gfx950}}
+    // expected-error @+1 {{failed to legalize operation 'amdg.scaled_mfma_group'}}
+    %result = amdg.scaled_mfma_group %a scale %as, %b scale %bs, %c full_wave true
+        : tensor<128x64xf8E4M3FN, #lhs>, tensor<128x2xi8, #as>,
+          tensor<64x128xf8E4M3FN, #rhs>, tensor<128x2xi8, #bs>,
+          tensor<128x128xf32, #mma> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
