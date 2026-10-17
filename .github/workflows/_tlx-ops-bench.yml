@@ -74,7 +74,7 @@ jobs:
           torch: torch==${{ env.TORCH_VERSION }}
           torch-index-url: ${{ inputs.torch_index }}
           # torchao: flash_attn_mxfp8 quantizes its inputs with it.
-          packages: numpy pytest torchao
+          packages: numpy pytest pytest-timeout torchao
           # Keep the release torch on its bundled ROCm libraries.
           rocm-lib-path: ""
       - name: Install prebuilt Triton
@@ -92,8 +92,11 @@ jobs:
           rm -rf /tmp/tlx_benchmark
           # TorchTLX benches need Meta's Inductor patches; the per-platform
           # *-torchtlx-test jobs already run them.
+          # --timeout caps each bench, so one slow bench fails on its own and
+          # the benches after it still run. The longest healthy bench takes
+          # about 15 minutes (mm on B200).
           python -m pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib \
-            -k "not torchtlx" -v -s --junitxml="${RUNNER_TEMP}/tlx-ops-bench.xml"
+            -k "not torchtlx" -v -s --timeout=2700 --junitxml="${RUNNER_TEMP}/tlx-ops-bench.xml"
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
