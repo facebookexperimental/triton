@@ -7,6 +7,7 @@ add_triton_library(TritonAnalysis
   Alias.cpp
   Utility.cpp
   ReductionOrder.cpp
+  Uniformity.cpp
 
   DEPENDS
   TritonTableGen
