@@ -309,6 +309,13 @@
 - **Tests**: `ws_memory_planner_cvt_scratch_budget.mlir` (real pre-planner IR; A=3/B=2 with `reserve-auxiliary-smem=false`, A=2/B=2 with the reservation). `ws_fa_bwd_idx3_store_wait_pipeline.mlir` now reserves 4096 B of conversion scratch, so its tuned budget moved from 202000 to 206096 to keep the same dV/dK copy split.
 - **Key insight**: an `OutOfResources` from a WS kernel never reaches the user under Inductor, because it degrades to `num_stages=1`. A planner budget miss shows up as a slow kernel, not an error.
 
+### 42. Post-loop walk routes a TMA reduce's token wait to the epilogue-store partition → reduce cloned, 2x (2026-10-16, fixed)
+- **Symptom**: With `separate_epilogue_store=True` and an epilogue that has both a TMA store and a TMA reduce-add (`c_desc.store(acc); d_desc.atomic_add(acc)` or a 1-D row-sum `atomic_add`), the reduced output is exactly 2x (garbage at 2-CTA, from an unsynchronized read of the staging buffer). SES=0, WS off, and a reduce-only epilogue are correct.
+- **Root cause** (`PartitionSchedulingMeta.cpp`, `schedulePostLoopOps`): the same misrouting as #12, through a different path. The post-loop use-walk overrides earlier assignments and sent every `TMAStoreTokenWaitOp`, including a reduce's, to `getStoreTarget` (epilogue_store), while the reduce went to `getEpilogueTarget` (epilogue). `doCodePartition` cloned the reduce into the epilogue-store partition to satisfy the wait.
+  The no-MMA (norm-style) in-loop epilogue-store anchoring in `getInitialSchedule` had the same gap (2x with `merge_epilogue`, garbage without).
+- **Fix**: in that walk, an `isReduceTokenWait` op takes the partition of its reduce (already visited: the wait's only operand is the reduce token), falling back to `getEpilogueTarget`. The no-MMA anchoring skips `isReduceTokenWait` ops, as the MMA-path anchoring already did. For the SES GEMM the reduce and its wait now sit in the epilogue partition, with the reduce's staging write.
+- **Lit test**: `partition-scheduling-meta-ses-reduce-token-wait.mlir` (real pre-PSM GEMM IR plus a no-MMA norm loop): the reduce and its wait share a partition, the plain store's copy and wait stay in the epilogue-store partition. Each function fails without its half of the fix.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
