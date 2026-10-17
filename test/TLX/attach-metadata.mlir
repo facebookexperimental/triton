@@ -459,7 +459,7 @@ module {
 #pin = #tlx.no_verify_layout<#tlx.user_layout<#mma>>
 module {
   // CHECK-LABEL: tt.func private @buffer_tail_previous(
-  // CHECK-SAME: -> tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+  // CHECK-SAME: -> tensor<16x128xf32, #[[$BUFFER_MMA]]>
   tt.func private @buffer_tail_previous(%ptr: !tt.ptr<f32>, %offsets: tensor<16x128xi32>, %mask: tensor<16x128xi1>) -> tensor<16x128xf32> {
     // CHECK: %[[BUFFER_OFFSETS:.*]] = tlx.require_layout %arg1
     %pinned_offsets = tlx.require_layout %offsets : tensor<16x128xi32> -> tensor<16x128xi32, #pin>
@@ -467,27 +467,29 @@ module {
     %pinned_mask = tlx.require_layout %mask : tensor<16x128xi1> -> tensor<16x128xi1, #pin>
     // CHECK: %[[BUFFER_ZERO:.*]] = arith.constant dense<0.000000e+00> : tensor<16x128xf32, #[[$BUFFER_MMA]]>
     %zero = arith.constant dense<0.000000e+00> : tensor<16x128xf32, #mma>
-    // CHECK: %[[BUFFER_OTHER:.*]] = tlx.require_layout %[[BUFFER_ZERO]] : tensor<16x128xf32, #[[$BUFFER_MMA]]> -> tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
-    // CHECK: amdg.buffer_load %arg0[%[[BUFFER_OFFSETS]]], %[[BUFFER_MASK]], %[[BUFFER_OTHER]]
+    // CHECK: %[[BUFFER_PHYSICAL_OFFSETS:.*]] = tlx.require_layout %[[BUFFER_OFFSETS]] : tensor<16x128xi32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>> -> tensor<16x128xi32, #[[$BUFFER_MMA]]>
+    // CHECK: %[[BUFFER_PHYSICAL_MASK:.*]] = tlx.require_layout %[[BUFFER_MASK]] : tensor<16x128xi1, #tlx.no_verify_layout<#[[$BUFFER_USER]]>> -> tensor<16x128xi1, #[[$BUFFER_MMA]]>
+    // CHECK: amdg.buffer_load %arg0[%[[BUFFER_PHYSICAL_OFFSETS]]], %[[BUFFER_PHYSICAL_MASK]], %[[BUFFER_ZERO]]
     // CHECK-SAME: contiguity = 2 : i32
     // CHECK-SAME: tlx.preserve_layout
-    // CHECK-SAME: tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+    // CHECK-SAME: tensor<16x128xf32, #[[$BUFFER_MMA]]>
     %previous = "amdg.buffer_load"(%ptr, %pinned_offsets, %pinned_mask, %zero) <{cache = 1 : i32, contiguity = 2 : i32, operandSegmentSizes = array<i32: 1, 1, 0, 1, 1>}> {tlx.preserve_layout} : (!tt.ptr<f32>, tensor<16x128xi32, #pin>, tensor<16x128xi1, #pin>, tensor<16x128xf32, #mma>) -> tensor<16x128xf32, #pin>
     // CHECK: arith.addf %[[BUFFER_ZERO]], %[[BUFFER_ZERO]] : tensor<16x128xf32, #[[$BUFFER_MMA]]>
     %bare_use = arith.addf %zero, %zero : tensor<16x128xf32, #mma>
     // CHECK: %[[BUFFER_STRIDE:.*]] = arith.constant 512 : i32
     %stride = arith.constant 512 : i32
-    // CHECK: %[[BUFFER_STRIDED_OTHER:.*]] = tlx.require_layout %[[BUFFER_ZERO]] : tensor<16x128xf32, #[[$BUFFER_MMA]]> -> tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
-    // CHECK: %[[BUFFER_STRIDED_LOAD:.*]] = amdg.buffer_load %arg0[%[[BUFFER_OFFSETS]]], %[[BUFFER_MASK]], %[[BUFFER_STRIDED_OTHER]] stride = %[[BUFFER_STRIDE]]
+    // CHECK: %[[BUFFER_STRIDED_OFFSETS:.*]] = tlx.require_layout %[[BUFFER_OFFSETS]] : tensor<16x128xi32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>> -> tensor<16x128xi32, #[[$BUFFER_MMA]]>
+    // CHECK: %[[BUFFER_STRIDED_MASK:.*]] = tlx.require_layout %[[BUFFER_MASK]] : tensor<16x128xi1, #tlx.no_verify_layout<#[[$BUFFER_USER]]>> -> tensor<16x128xi1, #[[$BUFFER_MMA]]>
+    // CHECK: %[[BUFFER_STRIDED_LOAD:.*]] = amdg.buffer_load %arg0[%[[BUFFER_STRIDED_OFFSETS]]], %[[BUFFER_STRIDED_MASK]], %[[BUFFER_ZERO]] stride = %[[BUFFER_STRIDE]]
     // CHECK-SAME: contiguity = 2 : i32
     // CHECK-SAME: tlx.preserve_layout
     %strided_previous = "amdg.buffer_load"(%ptr, %pinned_offsets, %stride, %pinned_mask, %zero) <{cache = 1 : i32, contiguity = 2 : i32, operandSegmentSizes = array<i32: 1, 1, 1, 1, 1>}> {tlx.preserve_layout} : (!tt.ptr<f32>, tensor<16x128xi32, #pin>, i32, tensor<16x128xi1, #pin>, tensor<16x128xf32, #mma>) -> tensor<16x128xf32, #pin>
-    // CHECK: tt.return %[[BUFFER_STRIDED_LOAD]] : tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+    // CHECK: tt.return %[[BUFFER_STRIDED_LOAD]] : tensor<16x128xf32, #[[$BUFFER_MMA]]>
     tt.return %strided_previous : tensor<16x128xf32, #pin>
   }
   // CHECK-LABEL: tt.func @buffer_tail_previous_caller(
   // CHECK: tt.call @buffer_tail_previous
-  // CHECK-SAME: -> tensor<16x128xf32, #tlx.no_verify_layout<#[[$BUFFER_USER]]>>
+  // CHECK-SAME: -> tensor<16x128xf32, #[[$BUFFER_MMA]]>
   tt.func @buffer_tail_previous_caller(%ptr: !tt.ptr<f32>, %offsets: tensor<16x128xi32>, %mask: tensor<16x128xi1>) {
     %previous = tt.call @buffer_tail_previous(%ptr, %offsets, %mask) : (!tt.ptr<f32>, tensor<16x128xi32>, tensor<16x128xi1>) -> tensor<16x128xf32>
     tt.return
