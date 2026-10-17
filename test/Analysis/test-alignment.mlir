@@ -15,6 +15,14 @@ tt.func @cast() {
 
 // -----
 
+tt.func @require_layout(%arg0: tensor<128xi32> {tt.contiguity = 16 : i32, tt.divisibility = 4 : i32, tt.constancy = 2 : i32}) {
+  // expected-remark @below {{contiguity = [16], divisibility = [4], constancy = [2], constant_value = <none>}}
+  %0 = ttg.require_layout %arg0 : tensor<128xi32> -> tensor<128xi32>
+  tt.return
+}
+
+// -----
+
 tt.func @add(%arg0: tensor<128xi32> {tt.contiguity = 1 : i32, tt.divisibility = 4 : i32, tt.constancy = 2: i32}, %arg1: tensor<128xi32> {tt.contiguity = 4 : i32, tt.divisibility = 4 : i32, tt.constancy = 1: i32}) {
   // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
   %0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>

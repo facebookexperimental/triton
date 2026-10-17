@@ -38,6 +38,143 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
+// Layout conversions that communicate between waves must surround rather than
+// execute inside a warp_predicate region. The carried values use the body's
+// native MFMA/row layouts, while the op's externally visible values retain
+// their original blocked layouts. Mark the module as TLX because the input
+// ownership is intentionally provisional until this pass hoists the bridges.
+
+#wp_blocked_acc = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
+#wp_blocked_row = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#wp_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#wp_mma_row = #ttg.slice<{dim = 1, parent = #wp_mma}>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-DAG: #[[$WP_BLOCKED_ROW:.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+  // CHECK-DAG: #[[$WP_BLOCKED_ACC:.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
+  // CHECK-DAG: #[[$WP_MMA:.*]] = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+  // CHECK-LABEL: tt.func public @hoist_warp_predicate_layout_conversions
+  // CHECK-SAME: (%[[PRED_ARG:.*]]: tensor<128xi1, #[[$WP_BLOCKED_ROW]]>, %[[ACC_ARG:.*]]: tensor<128x128xf32, #[[$WP_BLOCKED_ACC]]>, %[[ROW_ARG:.*]]: tensor<128xf32, #[[$WP_BLOCKED_ROW]]>)
+  tt.func public @hoist_warp_predicate_layout_conversions(
+      %predicate: tensor<128xi1, #wp_blocked_row>,
+      %acc: tensor<128x128xf32, #wp_blocked_acc>,
+      %row: tensor<128xf32, #wp_blocked_row>)
+      -> (tensor<128x128xf32, #wp_blocked_acc>, tensor<128xf32, #wp_blocked_row>) {
+    // CHECK-DAG: %[[PREDICATE:.*]] = ttg.convert_layout %[[PRED_ARG]] : tensor<128xi1, #[[$WP_BLOCKED_ROW]]> -> tensor<128xi1, #ttg.slice<{dim = 1, parent = #[[$WP_MMA]]}>>
+    // CHECK-DAG: %[[ACC_CAPTURE:.*]] = ttg.convert_layout %[[ACC_ARG]] : tensor<128x128xf32, #[[$WP_BLOCKED_ACC]]> -> tensor<128x128xf32, #[[$WP_MMA]]>
+    // CHECK-DAG: %[[ROW_CAPTURE:.*]] = ttg.convert_layout %[[ROW_ARG]] : tensor<128xf32, #[[$WP_BLOCKED_ROW]]> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #[[$WP_MMA]]}>>
+    // CHECK-DAG: %[[ACC_INIT:.*]] = ttg.convert_layout %[[ACC_ARG]] : tensor<128x128xf32, #[[$WP_BLOCKED_ACC]]> -> tensor<128x128xf32, #[[$WP_MMA]]>
+    // CHECK-DAG: %[[ROW_INIT:.*]] = ttg.convert_layout %[[ROW_ARG]] : tensor<128xf32, #[[$WP_BLOCKED_ROW]]> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #[[$WP_MMA]]}>>
+    // CHECK: %[[RESULT:.*]]:2 = ttg.warp_predicate %[[PREDICATE]](%[[ACC_INIT]], %[[ROW_INIT]]) {
+    %result:2 = ttg.warp_predicate %predicate (%acc, %row) {
+      %acc_wave = ttg.convert_layout %acc : tensor<128x128xf32, #wp_blocked_acc> -> tensor<128x128xf32, #wp_mma>
+      %acc_next = arith.addf %acc_wave, %acc_wave : tensor<128x128xf32, #wp_mma>
+      %acc_old = ttg.convert_layout %acc_next : tensor<128x128xf32, #wp_mma> -> tensor<128x128xf32, #wp_blocked_acc>
+      %row_wave = ttg.convert_layout %row : tensor<128xf32, #wp_blocked_row> -> tensor<128xf32, #wp_mma_row>
+      %row_next = arith.addf %row_wave, %row_wave : tensor<128xf32, #wp_mma_row>
+      %row_old = ttg.convert_layout %row_next : tensor<128xf32, #wp_mma_row> -> tensor<128xf32, #wp_blocked_row>
+      // CHECK-NOT: ttg.convert_layout
+      // CHECK: %[[ACC_NEXT:.*]] = arith.addf %[[ACC_CAPTURE]], %[[ACC_CAPTURE]] : tensor<128x128xf32, #[[$WP_MMA]]>
+      // CHECK: %[[ROW_NEXT:.*]] = arith.addf %[[ROW_CAPTURE]], %[[ROW_CAPTURE]] : tensor<128xf32, #ttg.slice<{dim = 1, parent = #[[$WP_MMA]]}>>
+      // CHECK: ttg.predicate_yield %[[ACC_NEXT]], %[[ROW_NEXT]] : tensor<128x128xf32, #[[$WP_MMA]]>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #[[$WP_MMA]]}>>
+      ttg.predicate_yield %acc_old, %row_old : tensor<128x128xf32, #wp_blocked_acc>, tensor<128xf32, #wp_blocked_row>
+    } : (tensor<128xi1, #wp_blocked_row>, tensor<128x128xf32, #wp_blocked_acc>, tensor<128xf32, #wp_blocked_row>) -> (tensor<128x128xf32, #wp_blocked_acc>, tensor<128xf32, #wp_blocked_row>)
+    // CHECK: } : (tensor<128xi1, #ttg.slice<{dim = 1, parent = #[[$WP_MMA]]}>>, tensor<128x128xf32, #[[$WP_MMA]]>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #[[$WP_MMA]]}>>) -> (tensor<128x128xf32, #[[$WP_MMA]]>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #[[$WP_MMA]]}>>)
+    // CHECK-NOT: ttg.convert_layout %[[RESULT]]#
+    // CHECK: %[[SECOND_PREDICATE:.*]] = ttg.convert_layout %[[PRED_ARG]]
+    // CHECK: %[[SECOND:.*]]:2 = ttg.warp_predicate %[[SECOND_PREDICATE]](%[[RESULT]]#0, %[[RESULT]]#1) {
+    %second:2 = ttg.warp_predicate %predicate (%result#0, %result#1) {
+      %acc_wave = ttg.convert_layout %result#0 : tensor<128x128xf32, #wp_blocked_acc> -> tensor<128x128xf32, #wp_mma>
+      %acc_next = arith.addf %acc_wave, %acc_wave : tensor<128x128xf32, #wp_mma>
+      %acc_old = ttg.convert_layout %acc_next : tensor<128x128xf32, #wp_mma> -> tensor<128x128xf32, #wp_blocked_acc>
+      %row_wave = ttg.convert_layout %result#1 : tensor<128xf32, #wp_blocked_row> -> tensor<128xf32, #wp_mma_row>
+      %row_next = arith.addf %row_wave, %row_wave : tensor<128xf32, #wp_mma_row>
+      %row_old = ttg.convert_layout %row_next : tensor<128xf32, #wp_mma_row> -> tensor<128xf32, #wp_blocked_row>
+      // CHECK-NOT: ttg.convert_layout
+      // CHECK: %[[SECOND_ACC:.*]] = arith.addf %[[RESULT]]#0, %[[RESULT]]#0
+      // CHECK: %[[SECOND_ROW:.*]] = arith.addf %[[RESULT]]#1, %[[RESULT]]#1
+      // CHECK: ttg.predicate_yield %[[SECOND_ACC]], %[[SECOND_ROW]]
+      ttg.predicate_yield %acc_old, %row_old : tensor<128x128xf32, #wp_blocked_acc>, tensor<128xf32, #wp_blocked_row>
+    } : (tensor<128xi1, #wp_blocked_row>, tensor<128x128xf32, #wp_blocked_acc>, tensor<128xf32, #wp_blocked_row>) -> (tensor<128x128xf32, #wp_blocked_acc>, tensor<128xf32, #wp_blocked_row>)
+    // CHECK: }
+    // CHECK-DAG: %[[ACC_RESULT:.*]] = ttg.convert_layout %[[SECOND]]#0 : tensor<128x128xf32, #[[$WP_MMA]]> -> tensor<128x128xf32, #[[$WP_BLOCKED_ACC]]>
+    // CHECK-DAG: %[[ROW_RESULT:.*]] = ttg.convert_layout %[[SECOND]]#1 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #[[$WP_MMA]]}>> -> tensor<128xf32, #[[$WP_BLOCKED_ROW]]>
+    // CHECK: tt.return %[[ACC_RESULT]], %[[ROW_RESULT]]
+    tt.return %second#0, %second#1 : tensor<128x128xf32, #wp_blocked_acc>, tensor<128xf32, #wp_blocked_row>
+  }
+}
+
+// -----
+// Carried rows with identical lane ownership may use different register
+// ordering. The shared predicate can select either ordering because EXEC is
+// controlled per lane, not per register.
+
+#register_order_old = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#register_order_a = #ttg.linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
+#register_order_b = #ttg.linear<{register = [[2], [1]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-DAG: #[[$REGISTER_ORDER_A:.*]] = #ttg.linear<{register = {{\[\[}}1], [2{{\]\]}}
+  // CHECK-DAG: #[[$REGISTER_ORDER_B:.*]] = #ttg.linear<{register = {{\[\[}}2], [1{{\]\]}}
+  // CHECK-LABEL: tt.func public @allow_register_reordered_carried_rows
+  tt.func public @allow_register_reordered_carried_rows(
+      %predicate: tensor<256xi1, #register_order_old>,
+      %lhs: tensor<256xf32, #register_order_old>,
+      %rhs: tensor<256xf32, #register_order_old>)
+      -> (tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>) {
+    // CHECK-DAG: %[[PREDICATE:.*]] = ttg.convert_layout %{{.*}} : tensor<256xi1, #{{.*}}> -> tensor<256xi1, #[[$REGISTER_ORDER_A]]>
+    // CHECK: %[[RESULT:.*]]:2 = ttg.warp_predicate %[[PREDICATE]](%{{.*}}, %{{.*}}) {
+    %result:2 = ttg.warp_predicate %predicate (%lhs, %rhs) {
+      %lhs_native = ttg.convert_layout %lhs : tensor<256xf32, #register_order_old> -> tensor<256xf32, #register_order_a>
+      %lhs_next = arith.addf %lhs_native, %lhs_native : tensor<256xf32, #register_order_a>
+      %lhs_old = ttg.convert_layout %lhs_next : tensor<256xf32, #register_order_a> -> tensor<256xf32, #register_order_old>
+      %rhs_native = ttg.convert_layout %rhs : tensor<256xf32, #register_order_old> -> tensor<256xf32, #register_order_b>
+      %rhs_next = arith.addf %rhs_native, %rhs_native : tensor<256xf32, #register_order_b>
+      %rhs_old = ttg.convert_layout %rhs_next : tensor<256xf32, #register_order_b> -> tensor<256xf32, #register_order_old>
+      // CHECK: ttg.predicate_yield %{{.*}}, %{{.*}} : tensor<256xf32, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_B]]>
+      ttg.predicate_yield %lhs_old, %rhs_old : tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>
+    } : (tensor<256xi1, #register_order_old>, tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>) -> (tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>)
+    // CHECK: } : (tensor<256xi1, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_B]]>) -> (tensor<256xf32, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_B]]>)
+    // CHECK-DAG: ttg.convert_layout %[[RESULT]]#0 : tensor<256xf32, #[[$REGISTER_ORDER_A]]> -> tensor<256xf32, #{{.*}}>
+    // CHECK-DAG: ttg.convert_layout %[[RESULT]]#1 : tensor<256xf32, #[[$REGISTER_ORDER_B]]> -> tensor<256xf32, #{{.*}}>
+    tt.return %result#0, %result#1 : tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>
+  }
+}
+
+// -----
+// A sibling that computes directly in the old layout must consume a restored
+// value instead of being optimistically retyped with the first region. Its
+// initial ownership is likewise a provisional TLX layout-propagation state.
+
+#mixed_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
+#mixed_row = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#mixed_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: tt.func public @preserve_old_layout_sibling
+  tt.func public @preserve_old_layout_sibling(
+      %predicate: tensor<128xi1, #mixed_row>,
+      %acc: tensor<128x128xf32, #mixed_blocked>)
+      -> tensor<128x128xf32, #mixed_blocked> {
+    // CHECK: %[[FIRST:.*]] = ttg.warp_predicate {{.*}}(%{{.*}}) {
+    %first = ttg.warp_predicate %predicate (%acc) {
+      %wave = ttg.convert_layout %acc : tensor<128x128xf32, #mixed_blocked> -> tensor<128x128xf32, #mixed_mma>
+      %next = arith.addf %wave, %wave : tensor<128x128xf32, #mixed_mma>
+      %old = ttg.convert_layout %next : tensor<128x128xf32, #mixed_mma> -> tensor<128x128xf32, #mixed_blocked>
+      ttg.predicate_yield %old : tensor<128x128xf32, #mixed_blocked>
+    } : (tensor<128xi1, #mixed_row>, tensor<128x128xf32, #mixed_blocked>) -> tensor<128x128xf32, #mixed_blocked>
+    // CHECK: %[[RESTORED:.*]] = ttg.convert_layout %[[FIRST]] : tensor<128x128xf32, #{{.*}}> -> tensor<128x128xf32, #{{.*}}>
+    // CHECK: %[[SECOND:.*]] = ttg.warp_predicate {{.*}}(%[[RESTORED]]) {
+    %second = ttg.warp_predicate %predicate (%first) {
+      %next = arith.addf %first, %first : tensor<128x128xf32, #mixed_blocked>
+      ttg.predicate_yield %next : tensor<128x128xf32, #mixed_blocked>
+    } : (tensor<128xi1, #mixed_row>, tensor<128x128xf32, #mixed_blocked>) -> tensor<128x128xf32, #mixed_blocked>
+    // CHECK: tt.return %[[SECOND]]
+    tt.return %second : tensor<128x128xf32, #mixed_blocked>
+  }
+}
+
+// -----
 
 // Test that a standalone packed i8 TMEM copy resolves its dummy destination
 // to the scales layout without a downstream require_layout or MMA consumer.
