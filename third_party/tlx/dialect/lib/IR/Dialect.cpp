@@ -47,7 +47,7 @@ static Attribute unwrapTlxLayoutWrappers(Attribute layout) {
 }
 
 LogicalResult delegateInferredLayout(
-    Attribute srcLayout, Attribute &resultLayout,
+    Attribute srcLayout, Attribute &resultLayout, bool preserveUserPin,
     function_ref<LogicalResult(const triton::DialectInferLayoutInterface *,
                                Attribute, Attribute &)>
         infer) {
@@ -60,10 +60,12 @@ LogicalResult delegateInferredLayout(
   Attribute unwrappedResultLayout;
   if (failed(infer(delegate, unwrappedSrcLayout, unwrappedResultLayout)))
     return failure();
-  // Re-apply only the TLX wrappers the source actually had (user_layout inside,
-  // no_verify outside), so re-inference after resolve-placeholder-layouts --
-  // which strips no_verify from operands -- stays consistent with the op's
-  // stored result type instead of unconditionally re-adding no_verify.
+  // Re-apply only the wrappers that describe the result. Shape-changing view
+  // ops derive a new layout from the pinned source; that derived layout is not
+  // itself a second hard user constraint. Keeping user_layout on both sides of
+  // an explicit require_layout would create two competing anchors and allow a
+  // trivial view conversion to discard the requested destination layout.
+  // Same-shape operations may opt into carrying the pin itself.
   Attribute afterNoVerify = unwrapNoVerifyLayout(srcLayout);
   bool hadUserLayout = unwrapUserLayout(afterNoVerify) != afterNoVerify;
   // no_verify may be the top wrapper (TMEM pin: no_verify<user_layout<L>>) or
@@ -71,7 +73,7 @@ LogicalResult delegateInferredLayout(
   // so the deferred placeholder is not silently downgraded to a plain anchor.
   bool hadNoVerify = hasNoVerifyLayout(srcLayout) ||
                      hasNoVerifyLayout(unwrapUserLayout(srcLayout));
-  if (hadUserLayout)
+  if (preserveUserPin && hadUserLayout)
     unwrappedResultLayout = wrapUserLayout(unwrappedResultLayout);
   if (hadNoVerify)
     unwrappedResultLayout = wrapNoVerifyLayout(unwrappedResultLayout);
@@ -87,7 +89,7 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
                        ArrayRef<int32_t> order, Attribute &resultEncoding,
                        std::optional<Location> loc) const override {
     return delegateInferredLayout(
-        operandEncoding, resultEncoding,
+        operandEncoding, resultEncoding, /*preserveUserPin=*/false,
         [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
             Attribute &result) {
           return delegate->inferTransOpEncoding(enc, shape, order, result, loc);
@@ -121,8 +123,17 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         getInferLayoutInterfaceFor(unwrapTlxLayoutWrappers(anchor));
     if (!delegate)
       return failure();
+    // A hard pin on a rank-reduced value is represented as
+    // user_layout<slice<parent>>.  The TritonGPU expand-dims inference expects
+    // SliceEncodingAttr itself at the top level, so pass the effective slice
+    // rather than its TLX wrapper.  For reduction inputs, retain `anchor` so a
+    // user_layout wrapper is preserved on the newly-created slice parent.
+    Attribute inferOperand = anchor;
+    Attribute effectiveAnchor = unwrapTlxLayoutWrappers(anchor);
+    if (isa<triton::gpu::SliceEncodingAttr>(effectiveAnchor))
+      inferOperand = effectiveAnchor;
     Attribute result;
-    if (failed(infer(delegate, anchor, result)))
+    if (failed(infer(delegate, inferOperand, result)))
       return failure();
     if (!deferred) {
       resultEncoding = result;
@@ -190,7 +201,7 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
                          bool allowReorder,
                          std::optional<Location> loc) const override {
     return delegateInferredLayout(
-        srcEnc, dstEnc,
+        srcEnc, dstEnc, /*preserveUserPin=*/false,
         [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
             Attribute &result) {
           return delegate->inferReshapeOpEncoding(srcShape, enc, dstShape,
@@ -220,7 +231,7 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
                              ArrayRef<int64_t> shape,
                              std::optional<Location> loc) const override {
     return delegateInferredLayout(
-        srcEnc, dstEnc,
+        srcEnc, dstEnc, /*preserveUserPin=*/false,
         [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
             Attribute &result) {
           return delegate->inferDefaultJoinOpEncoding(enc, result, shape, loc);
@@ -232,7 +243,7 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
                        ArrayRef<int64_t> shape,
                        std::optional<Location> loc) const override {
     return delegateInferredLayout(
-        srcEnc, dstEnc,
+        srcEnc, dstEnc, /*preserveUserPin=*/false,
         [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
             Attribute &result) {
           return delegate->inferSplitOpEncoding(enc, result, shape, loc);
@@ -286,7 +297,7 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
                          Attribute &outEnc, bool fwdInference,
                          std::optional<Location> loc) const override {
     return delegateInferredLayout(
-        inEnc, outEnc,
+        inEnc, outEnc, /*preserveUserPin=*/true,
         [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
             Attribute &result) {
           return delegate->inferFp4ToFpOpEncoding(shape, axis, enc, result,
