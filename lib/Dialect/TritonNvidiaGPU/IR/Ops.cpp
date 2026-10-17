@@ -2289,6 +2289,14 @@ LogicalResult TMEMSubSliceOp::verify() {
         dstTmemEncoding.getColStride() != encoding.getColStride())
       return emitOpError("The destination must have the same block size and "
                          "CTASplit size as the source.");
+    // A BLOCK_M=64 2-CTA accumulator keeps the right half of each blockN
+    // block in TMEM rows 64-127, so only whole blockN blocks are column
+    // ranges of the buffer.
+    if (encoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS &&
+        (dstTy.getShape().back() % encoding.getBlockN() != 0 ||
+         getOffset() % encoding.getBlockN() != 0))
+      return emitOpError("cannot take an N subslice of a two-CTA (twocta_rhs) "
+                         "accumulator");
   } else if (auto scaleEncoding =
                  dyn_cast<TensorMemoryScalesEncodingAttr>(srcEncoding)) {
     auto dstScaleEncoding =
