@@ -60,18 +60,6 @@ OpFoldResult ReleaseLayoutOp::fold(FoldAdaptor) {
   return {};
 }
 
-LogicalResult ReleaseLayoutOp::verify() {
-  auto srcType = cast<RankedTensorType>(getSrc().getType());
-  Attribute srcEncoding = srcType.getEncoding();
-  auto parentFunc = getOperation()->getParentOfType<triton::FuncOp>();
-  bool hasDeferredHelperLayout =
-      getSrc().getDefiningOp<triton::CallOp>() ||
-      (parentFunc && parentFunc.getSymVisibility() == "private");
-  if (!srcEncoding && !hasDeferredHelperLayout)
-    return emitOpError("requires the source tensor to have a layout encoding");
-  return success();
-}
-
 //-- StorageAliasSpecOp --
 
 // Each storage_alias_spec is a distinct logical buffer group. Emit an
