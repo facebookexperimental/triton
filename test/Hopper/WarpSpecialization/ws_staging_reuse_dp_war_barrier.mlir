@@ -2,22 +2,20 @@
 
 // Persistent BM=256 GEMM with data_partition_factor=2, num_stages=1 and an
 // A operand built in registers from two fp32 TMA tiles. SMEM is tight, so the
-// planner aliases one output-staging group onto an fp32 operand landing
-// buffer and also chains the two data partitions' stagings onto each other.
-// The cross-tile WAR barrier must still be emitted for the operand alias: the
-// staging->staging entries are ordered by the reuse group itself and must not
-// make the reuse pairs look inconsistent. The release must ride on the wait of
+// planner aliases the output stagings onto fp32 operand landing buffers (it
+// used to also chain the two data partitions' stagings onto each other, which
+// made the reuse pairs look inconsistent). The cross-tile WAR barrier must be
+// emitted for the operand aliases. The release must ride on the wait of
 // the last TMA store, which store-wait pipelining defers to the next tile
 // (loop.stage = 1), not fire at the bottom of the body while that store still
 // reads the aliased SMEM.
 
-// Only the operand alias is realized: mergeStagingReuseIntoHost drops a
-// reuseTarget that names another staging buffer, so that staging keeps its own
-// local_alloc and needs no cross-tile edge. (Stagings that share SMEM do so as
-// one buffer.id reuse group, which its own acquires order.)
-// CHECK: ttg.local_alloc {{.*}}buffer.tmaStaging = 1
-// CHECK: ttg.memdesc_reinterpret
-// CHECK-NOT: ttg.memdesc_reinterpret
+// The planner no longer picks a staging buffer as a reuse host, so both
+// output-staging groups land on distinct fp32 operand landing buffers and both
+// aliases are realized; the single cross-tile WAR barrier guards both.
+
+// CHECK: ttg.memdesc_reinterpret {{.*}}buffer.id = 2 : i32
+// CHECK: ttg.memdesc_reinterpret {{.*}}buffer.id = 4 : i32
 // CHECK: partition1(
 // CHECK: scf.for
 // CHECK: ttng.async_tma_store_token_wait {{.*}}, %{{.*}}[%{{.*}}], %{{.*}}[%{{.*}}] {{.*}}loop.stage = 1
