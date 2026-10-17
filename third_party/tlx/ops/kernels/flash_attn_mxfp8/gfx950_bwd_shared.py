@@ -817,7 +817,10 @@ def _bwd_kv_owner_causal_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, A
     mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
     dk = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
     dv = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
-    shared_layout: tl.constexpr = _stage_layout(D)
+    if ARENA_N == 2048 and LSE_SPLIT:
+        shared_layout: tl.constexpr = _partial_qdo_stage_layout()
+    else:
+        shared_layout: tl.constexpr = _stage_layout(D)
     qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
     domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
     metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
