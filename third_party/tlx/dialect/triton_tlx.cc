@@ -277,19 +277,12 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               auto parentFunc =
-                   v.getParentRegion()->getParentOfType<tt::FuncOp>();
-               bool hasDeferredHelperLayout =
-                   v.getDefiningOp<tt::CallOp>() ||
-                   (parentFunc && parentFunc.getSymVisibility() == "private");
-               if (!type.getEncoding() && !hasDeferredHelperLayout)
-                 throw std::runtime_error(
-                     "release_layout requires an explicit source layout");
                auto newType = RankedTensorType::get(type.getShape(),
                                                     type.getElementType());
                return self.create<tlx::ReleaseLayoutOp>(newType, v);
              } else {
-               throw std::runtime_error("Unsupported type");
+               throw std::runtime_error(
+                   "release_layout expects a ranked tensor");
              }
            })
       .def("create_assert_same_layout",
@@ -1353,8 +1346,8 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_workgroup_barrier",
            [](TritonOpBuilder &self) -> void {
              // Fenced full-workgroup barrier: a local (LDS-fenced) ttg.barrier
-             // bracketed by SchedBarrier(0) guards so the scheduler cannot hoist
-             // ops across the ping-pong cluster border.
+             // bracketed by SchedBarrier(0) guards so the scheduler cannot
+             // hoist ops across the ping-pong cluster border.
              self.create<ROCDL::SchedBarrier>(0);
              self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
              self.create<ROCDL::SchedBarrier>(0);
@@ -1427,14 +1420,17 @@ void init_triton_tlx_ir(py::module &&m) {
                  resultType, ptr, offsets, Value() /*stride*/, cache,
                  mask.value_or(Value()), other.value_or(Value()), contiguity);
            })
-      .def("create_buffer_store",
-           [](TritonOpBuilder &self, Value storedValue, Value ptr,
-              Value offsets, std::optional<Value> mask, tt::CacheModifier cache,
-              uint32_t contiguity) {
-             self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
-                                              Value() /*stride*/, cache,
-                                              mask.value_or(Value()), contiguity);
-           })
+      .def(
+          "create_buffer_store",
+          [](TritonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
+             std::optional<Value> mask, tt::CacheModifier cache,
+             uint32_t contiguity) -> OpState {
+            return self.create<ttag::BufferStoreOp>(
+                storedValue, ptr, offsets, Value() /*stride*/, cache,
+                mask.value_or(Value()), contiguity);
+          },
+          py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
+          py::arg("mask").none(), py::arg("cache"), py::arg("contiguity"))
       .def("create_buffer_load_to_local",
            [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
               std::optional<Value> mask, std::optional<Value> other,
