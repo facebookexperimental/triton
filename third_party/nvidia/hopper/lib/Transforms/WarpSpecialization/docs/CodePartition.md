@@ -117,7 +117,8 @@ epilogue-store partition after buffering. `createBuffer` inserts
 `local_store` ops in producer order, so `reorderEpilogOps` restores producer
 order for channels feeding the same descriptor to match the descriptor-store
 order. This keeps the producer-side `local_store` sequence aligned with the
-consumer-side TMA store sequence.
+consumer-side TMA store sequence. A TMA staging write is never hoisted above
+an earlier TMA store or reduce (see BufferAllocation.md, Step 2).
 
 ## Buffer Creation
 
