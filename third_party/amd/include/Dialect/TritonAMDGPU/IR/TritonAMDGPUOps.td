@@ -1037,7 +1037,8 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
 
     On the persistent lowering path, `resident_operand` is `none`, `lhs`, or
     `rhs` and selects an input to constrain to AGPRs; the other input uses
-    VGPRs. The transient intrinsic path does not add those source-class
+    VGPRs. `unconstrained` adds no input register-class constraints and leaves
+    input placement to LLVM. The transient intrinsic path does not add those source-class
     constraints, so a carried source needs a separate `register_resident`
     boundary when hard residency is required.
     `accumulator_role` is `transient` for a phase-local result or `persistent`

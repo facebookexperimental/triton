@@ -1628,9 +1628,9 @@ LogicalResult ScheduledMfmaOp::verify() {
         "accumulator ownership does not match the native MFMA grid");
 
   if (getResidentOperand() != "none" && getResidentOperand() != "lhs" &&
-      getResidentOperand() != "rhs")
-    return emitOpError(
-        "resident_operand must be \"none\", \"lhs\", or \"rhs\"");
+      getResidentOperand() != "rhs" && getResidentOperand() != "unconstrained")
+    return emitOpError("resident_operand must be \"none\", \"lhs\", "
+                       "\"rhs\", or \"unconstrained\"");
   if (getAccumulatorRole() != "transient" &&
       getAccumulatorRole() != "persistent")
     return emitOpError(

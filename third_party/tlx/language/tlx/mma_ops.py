@@ -139,6 +139,7 @@ def amd_scheduled_mfma(
     resident_operand: tl.constexpr = None,
     accumulator_register_class: tl.constexpr = None,
     initialize: tl.constexpr = False,
+    pin_operands: tl.constexpr = True,
     _semantic=None,
 ):
     """Update native CDNA3/CDNA4 MFMA fragments with explicit lifetime contracts.
@@ -164,7 +165,10 @@ def amd_scheduled_mfma(
 
     Persistent chains use inline assembly to constrain operand register
     classes. ``resident_operand=0`` or ``1`` selects the left or right input
-    for AGPR placement; other inputs use VGPRs. ``accumulator_register_class``
+    for AGPR placement; other inputs use VGPRs. ``pin_operands=False`` omits
+    these input constraints and leaves input placement to LLVM. An input pin
+    consumes its operand, so pinning an operand loaded from shared memory
+    makes LLVM wait for that load at the pin instead of at the MFMA. ``accumulator_register_class``
     may select ``"agpr"`` or ``"vgpr"``, and persistent ``auto`` selects AGPRs.
     Persistent accumulator tuples are pinned after all K updates; nonconstant
     input accumulators are also pinned before the updates when ``initialize``
@@ -216,7 +220,10 @@ def amd_scheduled_mfma(
     assert accumulator_register_class in (None, "agpr",
                                           "vgpr"), ("accumulator_register_class must be None, \"agpr\", or \"vgpr\"")
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
-    resident_role = {None: "none", 0: "lhs", 1: "rhs"}[resident_operand]
+    pin_operands = tl._unwrap_if_constexpr(pin_operands)
+    assert isinstance(pin_operands, bool), "pin_operands must be a constexpr bool"
+    assert pin_operands or resident_operand is None, "pin_operands=False requires resident_operand=None"
+    resident_role = {None: "none", 0: "lhs", 1: "rhs"}[resident_operand] if pin_operands else "unconstrained"
     accumulator_class = ("auto" if accumulator_register_class is None else accumulator_register_class)
     handle = _semantic.builder.create_amd_scheduled_mfma(
         a.handle,
