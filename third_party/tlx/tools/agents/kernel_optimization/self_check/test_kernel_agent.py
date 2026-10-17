@@ -1870,9 +1870,9 @@ class HarnessTest(unittest.TestCase):
             ("get_cuda_autotune_config", "heuristic_config"),
         )
         gfx950 = infer_kernel_path(repository, "mm", "gfx950")
-        self.assertEqual(
-            _tuning_symbols(gfx950.read_text()), ("_configs", "heuristic_config")
-        )
+        # gfx950 dispatches measured plans and has no CONFIGS search space to tune.
+        with self.assertRaisesRegex(SystemExit, "CONFIGS factory"):
+            _tuning_symbols(gfx950.read_text())
         for arch, kernel in (("gfx942", gfx942), ("gfx950", gfx950), ("sm100", sm100)):
             result = mm_harness.build(kernel.read_text(), {"architecture": arch})
             self.assertTrue(result["success"], result.get("diagnostics"))
