@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <vector>
 
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -1453,6 +1454,31 @@ LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout) {
   auto *ctx = layout.getContext();
   return ctx->getLoadedDialect<TritonGPUDialect>()->toLinearLayout(shape,
                                                                    layout);
+}
+
+bool isLayoutEquivalentIgnoringRegisterOrder(const LinearLayout &lhs,
+                                             const LinearLayout &rhs) {
+  if (lhs.getOutDims() != rhs.getOutDims() ||
+      lhs.getBases().size() != rhs.getBases().size())
+    return false;
+
+  for (auto [lhsDim, rhsDim] : llvm::zip(lhs.getBases(), rhs.getBases())) {
+    if (lhsDim.first != rhsDim.first)
+      return false;
+    if (lhsDim.first.getValue() != "register") {
+      if (lhsDim.second != rhsDim.second)
+        return false;
+      continue;
+    }
+
+    auto lhsRegisterBases = lhsDim.second;
+    auto rhsRegisterBases = rhsDim.second;
+    std::sort(lhsRegisterBases.begin(), lhsRegisterBases.end());
+    std::sort(rhsRegisterBases.begin(), rhsRegisterBases.end());
+    if (lhsRegisterBases != rhsRegisterBases)
+      return false;
+  }
+  return true;
 }
 
 LinearLayout paddedLinearLayout(ArrayRef<int64_t> shape, Attribute encoding) {

@@ -3,7 +3,8 @@
 
 include "mlir/Pass/PassBase.td"
 
-def TritonTLXFixup : Pass</*cli-arg*/"triton-tlx-fixup", /*Op*/"mlir::ModuleOp"> {
+def TritonTLXFixup
+    : Pass</*cli-arg*/ "triton-tlx-fixup", /*Op*/ "mlir::ModuleOp"> {
   let summary = "Fixup the IR for TritonTLX";
   let description = [{
     This pass applies fixups to the TritonDialect module to help TritonGPU
@@ -11,22 +12,17 @@ def TritonTLXFixup : Pass</*cli-arg*/"triton-tlx-fixup", /*Op*/"mlir::ModuleOp">
     such as attaching metadata to the module.
   }];
 
-  let options = [
-      Option<"target", "target",
-            "std::string", /*default*/"\"\"",
-            "the GPU target, e.g., cuda:80, hip:gfx942">,
-      Option<"numWarps", "num-warps",
-             "int32_t", /*default*/"4",
-             "number of warps">,
-      Option<"threadsPerWarp", "threads-per-warp",
-             "int32_t", /*default*/"32",
-             "number of threads per warp">,
-      Option<"numCTAs", "num-ctas",
-             "int32_t", /*default*/"1",
-             "number of ctas in a cga">,
-      ListOption<"clusterDims", "cluster-dims", "int32_t",
-             "cluster dimensions (X, Y, Z)">,
-   ];
+  let options = [Option<"target", "target", "std::string", /*default*/ "\"\"",
+                        "the GPU target, e.g., cuda:80, hip:gfx942">,
+                 Option<"numWarps", "num-warps", "int32_t", /*default*/ "4",
+                        "number of warps">,
+                 Option<"threadsPerWarp", "threads-per-warp", "int32_t",
+                        /*default*/ "32", "number of threads per warp">,
+                 Option<"numCTAs", "num-ctas", "int32_t", /*default*/ "1",
+                        "number of ctas in a cga">,
+                 ListOption<"clusterDims", "cluster-dims", "int32_t",
+                            "cluster dimensions (X, Y, Z)">,
+  ];
 }
 
 def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
@@ -43,12 +39,13 @@ def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
       tensor values when the tensor lattice reaches a concrete encoding
     - applying consensus-based updates for RegionBranchOpInterface carriers and
       `ttg.warp_specialize` partition captures/arguments
-    - lowering residual tensor constraints to `ttg.convert_layout`
+    - lowering residual unpinned tensor constraints to `ttg.convert_layout`
+    - lowering residual pinned tensor constraints to `ttg.require_layout`
     - validating post-conditions such as the absence of unresolved
       DummyTMEMLayoutAttr allocations
 
     Tensor and memdesc constraints are either folded away when propagation
-    successfully retags the producer, or lowered to `ttg.convert_layout`.
+    successfully retags the producer, or lowered to an explicit TTGIR boundary.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
@@ -57,8 +54,10 @@ def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
                            "mlir::arith::ArithDialect"];
 }
 
-def TLXInsertRequireLayout : Pass<"tlx-insert-require-layout", "mlir::ModuleOp"> {
-  let summary = "Insert explicit TLX layout constraints for local_load-to-dot and TDM paths";
+def TLXInsertRequireLayout
+    : Pass<"tlx-insert-require-layout", "mlir::ModuleOp"> {
+  let summary = "Insert explicit TLX layout constraints for local_load-to-dot "
+                "and TDM paths";
 
   let description = [{
     This pass discovers consumers with implicit shared-memory layout
@@ -82,7 +81,6 @@ def TLXInsertRequireLayout : Pass<"tlx-insert-require-layout", "mlir::ModuleOp">
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::tlx::TLXDialect",
                            "mlir::triton::amdgpu::TritonAMDGPUDialect"];
-
 }
 
 def TLXRewriteLocalAlias : Pass<"tlx-rewrite-local-alias", "mlir::ModuleOp"> {
@@ -96,7 +94,8 @@ def TLXRewriteLocalAlias : Pass<"tlx-rewrite-local-alias", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
-def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir::ModuleOp"> {
+def TLXResolvePlaceholderLayouts
+    : Pass<"tlx-resolve-placeholder-layouts", "mlir::ModuleOp"> {
   let summary = "Resolve placeholder layouts after function inlining";
 
   let description = [{
@@ -112,33 +111,31 @@ def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir
     Python make_default() methods.
   }];
 
-  let dependentDialects = [
-    "mlir::triton::tlx::TLXDialect",
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
+  let dependentDialects = ["mlir::triton::tlx::TLXDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-def TLXFinalizeUserLayouts : Pass<"tlx-finalize-user-layouts", "mlir::ModuleOp"> {
+def TLXFinalizeUserLayouts
+    : Pass<"tlx-finalize-user-layouts", "mlir::ModuleOp"> {
   let summary = "Unwrap user-pinned register layouts after layout optimization";
 
   let description = [{
     Unwraps every remaining `#tlx.user_layout<L>` encoding on a RankedTensorType
-    (a user-pinned *register* layout on a `ttg.local_load`) back to its concrete
-    wrapped layout `L`, and verifies none remain.
+    back to its concrete wrapped layout `L`, defensively lowers any remaining
+    `ttg.require_layout` boundaries to ordinary `ttg.convert_layout`, and
+    verifies none remain.
 
     User-pinned register layouts are kept wrapped through the layout-optimization
-    passes (remove-layout-conversions, accelerate-matmul, optimize-dot-operands):
-    the wrapper carries `PinnedEncodingTrait`, so those passes anchor the load and
-    do not rewrite it. This pass runs after them to retire the marker. (Shared
-    user layouts on `local_alloc` are unwrapped much earlier, in
+    passes (remove-layout-conversions, accelerate-matmul, optimize-dot-operands)
+    as `ttg.require_layout` boundaries whose result wrapper carries
+    `PinnedEncodingTrait`. This pass runs after them to retire the boundary and
+    marker. (Shared user layouts on `local_alloc` are unwrapped much earlier, in
     tlx-propagate-layout, since nothing rewrites a buffer's shared encoding.)
   }];
 
-  let dependentDialects = [
-    "mlir::triton::tlx::TLXDialect",
-    "mlir::triton::gpu::TritonGPUDialect"
-  ];
+  let dependentDialects = ["mlir::triton::tlx::TLXDialect",
+                           "mlir::triton::gpu::TritonGPUDialect"];
 }
 
 def TLXPrintTTGIRToTLX : Pass<"tlx-print-ttgir-to-tlx", "mlir::ModuleOp"> {
@@ -159,9 +156,7 @@ def TLXPrintTTGIRToTLX : Pass<"tlx-print-ttgir-to-tlx", "mlir::ModuleOp"> {
     - ttng::TMEMAllocOp -> tlx.local_alloc (tmem)
   }];
 
-  let dependentDialects = [
-    "mlir::triton::gpu::TritonGPUDialect"
-  ];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
 def TLXDumpLayout : Pass<"tlx-dump-layout", "mlir::ModuleOp"> {
@@ -178,13 +173,12 @@ def TLXDumpLayout : Pass<"tlx-dump-layout", "mlir::ModuleOp"> {
     layout is printed.
   }];
 
-  let dependentDialects = [
-    "mlir::triton::tlx::TLXDialect",
-    "mlir::triton::gpu::TritonGPUDialect"
-  ];
+  let dependentDialects = ["mlir::triton::tlx::TLXDialect",
+                           "mlir::triton::gpu::TritonGPUDialect"];
 }
 
-def TLXStorageAliasLowering : Pass<"tlx-storage-alias-lowering", "mlir::ModuleOp"> {
+def TLXStorageAliasLowering
+    : Pass<"tlx-storage-alias-lowering", "mlir::ModuleOp"> {
   let summary = "Lower storage alias operations";
 
   let description = [{
@@ -200,10 +194,8 @@ def TLXStorageAliasLowering : Pass<"tlx-storage-alias-lowering", "mlir::ModuleOp
        local_alias referencing the allocation.
   }];
 
-  let dependentDialects = [
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
 #endif // TRITON_TLX_PASSES
