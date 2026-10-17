@@ -565,6 +565,32 @@ public:
   }
 };
 
+class TritonWarpPredicatePattern : public OpConversionPattern<WarpPredicateOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(WarpPredicateOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> resultTypes;
+    if (failed(
+            getTypeConverter()->convertTypes(op.getResultTypes(), resultTypes)))
+      return rewriter.notifyMatchFailure(op, "could not convert result types");
+
+    auto newOp = WarpPredicateOp::create(
+        rewriter, op.getLoc(), resultTypes, adaptor.getPredicate(),
+        adaptor.getInits(), op.getWaveUniformAttr());
+    rewriter.inlineRegionBefore(op.getRegion(), newOp.getRegion(),
+                                newOp.getRegion().end());
+    if (failed(rewriter.convertRegionTypes(&newOp.getRegion(),
+                                           *getTypeConverter())))
+      return rewriter.notifyMatchFailure(op, "could not convert body types");
+
+    rewriter.replaceOp(op, newOp.getResults());
+    return success();
+  }
+};
+
 struct TTNGPrefetchPattern
     : public OpConversionPattern<triton::nvidia_gpu::PrefetchOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -611,6 +637,8 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       TritonDotPattern,
       TritonMapElementwisePattern,
       TritonWarpSpecializePattern,
+      TritonWarpPredicatePattern,
+      GenericOpPattern<PredicateYieldOp>,
       GatherScatterOpPattern<DescriptorGatherOp>,
       GatherScatterOpPattern<DescriptorScatterOp>,
       GenericOpPattern<triton::LoadOp>,

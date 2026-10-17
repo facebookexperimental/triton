@@ -42,7 +42,11 @@ OpFoldResult ReleaseLayoutOp::fold(FoldAdaptor) {
 LogicalResult ReleaseLayoutOp::verify() {
   auto srcType = cast<RankedTensorType>(getSrc().getType());
   Attribute srcEncoding = srcType.getEncoding();
-  if (!srcEncoding)
+  auto parentFunc = getOperation()->getParentOfType<triton::FuncOp>();
+  bool hasDeferredHelperLayout =
+      getSrc().getDefiningOp<triton::CallOp>() ||
+      (parentFunc && parentFunc.getSymVisibility() == "private");
+  if (!srcEncoding && !hasDeferredHelperLayout)
     return emitOpError("requires the source tensor to have a layout encoding");
   return success();
 }
