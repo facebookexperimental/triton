@@ -327,9 +327,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // GFX1250-LABEL: reduce_xor_row_xmask
   tt.func @reduce_xor_row_xmask(%arg0: tensor<16x2xf32, #linear>) {
-    // beta gfx1250: ROW_XMASK dpp shuffles only; this #linear reduction produces
-    // no stride-16 permlane step, so neither permlanex16 nor ds_bpermute is emitted.
+    // Lane bit 1 is broadcast while bits 0, 2, 3, and 4 move the reduction
+    // axis. Reduce only those participating bits: strides 16, 8, 4, and 1.
     // GFX1250-NOT: rocdl.ds_bpermute
+
+    // stride 16: permlanex16
+    // GFX1250: rocdl.permlanex16
 
     // stride 8: ROW_XMASK:8
     // GFX1250: rocdl.update.dpp
@@ -338,10 +341,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     // stride 4: ROW_XMASK:4
     // GFX1250: rocdl.update.dpp
     // GFX1250-SAME: with 356, 15, 15, true
-
-    // stride 2: ROW_XMASK:2
-    // GFX1250: rocdl.update.dpp
-    // GFX1250-SAME: with 354, 15, 15, true
 
     // stride 1: ROW_XMASK:1
     // GFX1250: rocdl.update.dpp
