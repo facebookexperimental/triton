@@ -92,11 +92,6 @@ public:
   verifyDotOpEncodingCompatibility(Operation *op, Attribute operandEncodingA,
                                    Attribute operandEncodingB) const = 0;
 
-  // Verify that the encodings are compatible to be used together in a cat
-  // operation.
-  virtual LogicalResult
-  verifyCatOpEncodingCompatibility(Operation *op) const = 0;
-
   // Verify that the operand and scale encodings are compatible to be used
   // together in a scaled dot operation. The scale encodings may be null, as
   // scales are optional.

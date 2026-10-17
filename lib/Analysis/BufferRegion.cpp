@@ -263,13 +263,6 @@ uint32_t getMemDescStorageOffset(ttg::MemDescType ty, unsigned index) {
   return static_cast<uint32_t>(offset);
 }
 
-bool isUsedAsBarrier(Value v) {
-  return llvm::any_of(v.getUsers(), [&](Operation *user) {
-    auto barrierOp = dyn_cast<ttg::MBarrierOpInterface>(user);
-    return barrierOp && llvm::is_contained(barrierOp.getBarriers(), v);
-  });
-}
-
 // toLinearLayout asserts that every dim is a power of two
 // (LinearLayoutConversions.cpp). BufferRegion only ever passes it the
 // allocation shape with pipelining dims dropped
@@ -347,19 +340,6 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
          "memdesc_subslice offset exceeds 32-bit range");
   return MemDescSubsliceOffsets{static_cast<uint32_t>(byteOffset),
                                 partitionOffset, blockOffset};
-}
-
-std::optional<triton::BufferRegionAnalysis::RegionType> getRegionType(Value v) {
-  if (isUsedAsBarrier(v))
-    return triton::BufferRegionAnalysis::RegionType::BARRIER;
-  auto type = dyn_cast<ttg::MemDescType>(v.getType());
-  if (!type)
-    return std::nullopt;
-  if (isa<ttg::SharedMemorySpaceAttr>(type.getMemorySpace()))
-    return triton::BufferRegionAnalysis::RegionType::SHARED_MEMORY;
-  if (isa<ttng::TensorMemorySpaceAttr>(type.getMemorySpace()))
-    return triton::BufferRegionAnalysis::RegionType::TENSOR_MEMORY;
-  return std::nullopt;
 }
 
 } // namespace
@@ -777,15 +757,24 @@ LogicalResult BufferRegionAnalysis::visitOperation(
 void BufferRegionAnalysis::calculateUsedBufferRegions(Operation *op) {
   op->walk([&](Operation *op) {
     for (const MemoryAccess &access : getMemoryAccesses(op)) {
-      std::optional<RegionType> regionType = getRegionType(access.value);
-      if (!regionType)
-        continue;
       const RegionInfo &regionInfo =
           getLatticeElement(access.value)->getValue();
-      if (regionInfo.isUnknown())
-        usedUnknownBufferRegions[*regionType] = true;
-      for (const BufferRegionView &view : regionInfo.views)
-        usedBufferRegions[*regionType].insert(view.region);
+      auto addRegions = [&](RegionType regionType) {
+        if (regionInfo.isUnknown())
+          usedUnknownBufferRegions[regionType] = true;
+        for (const BufferRegionView &view : regionInfo.views)
+          usedBufferRegions[regionType].insert(view.region);
+      };
+
+      auto type = dyn_cast<ttg::MemDescType>(access.value.getType());
+      if (!type)
+        continue;
+      bool isTensorMemory =
+          isa<ttng::TensorMemorySpaceAttr>(type.getMemorySpace());
+      addRegions(isTensorMemory ? TENSOR_MEMORY : SHARED_MEMORY);
+      if (auto barrierOp = dyn_cast<ttg::MBarrierOpInterface>(op))
+        if (llvm::is_contained(barrierOp.getBarriers(), access.value))
+          addRegions(BARRIER);
     }
   });
 }

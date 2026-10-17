@@ -4,6 +4,7 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=88' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=88' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX88 %s
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=87' --initialize-ws-cluster-barriers='compute-capability=107 ptx-version=87' -reconcile-unrealized-casts | FileCheck --check-prefix=RUBIN-PTX87 %s
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=94' --initialize-ws-cluster-barriers='compute-capability=107 ptx-version=94' -reconcile-unrealized-casts | FileCheck --check-prefix=RUBIN %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm=compute-capability=90 --initialize-ws-cluster-barriers=compute-capability=90 --canonicalize-llvm-ir -reconcile-unrealized-casts | FileCheck --check-prefix=CLUSTER-MASK %s
 
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -46,9 +47,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: init_barrier_cluster_broadcast
+  // CLUSTER-MASK-LABEL: init_barrier_cluster_broadcast
   tt.func @init_barrier_cluster_broadcast() {
     %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi64, #shared0, #smem, mutable>
     // CHECK: nvg.cluster_id
+    // CLUSTER-MASK: [[CTA:%.*]] = nvg.cluster_id
+    // CLUSTER-MASK-NOT: llvm.and [[CTA]], {{.*}} : i32
+    // CLUSTER-MASK: llvm.icmp "eq" [[CTA]], {{.*}} : i32
     // CHECK: @$0 mbarrier.init.shared::cta.b64 [$1], 2;
     ttng.init_barrier %alloc, 1 : !ttg.memdesc<1xi64, #shared0, #smem, mutable>
     ttng.inval_barrier %alloc : !ttg.memdesc<1xi64, #shared0, #smem, mutable>
@@ -859,17 +864,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c256_i32 = arith.constant 256 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    // CHECK: tensormap.replace.tile.global_address.shared::cta.b1024.b64 [ $0 + 0 ], $1;
-    // CHECK: tensormap.replace.tile.rank.shared::cta.b1024.b32 [ $0 + 0 ], 0x0;
+    // CHECK: llvm.cond_br
+    // CHECK: llvm.inline_asm has_side_effects {{.*}} "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [ $0 + 0 ], $1;"
+    // CHECK-NOT: tensormap.replace.tile.rank
     // CHECK: tensormap.replace.tile.box_dim.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.element_stride.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.elemtype.shared::cta.b1024.b32 [ $0 + 0 ], 0x3;
-    // CHECK: tensormap.replace.tile.interleave_layout.shared::cta.b1024.b32 [ $0 + 0 ], 0x0;
+    // CHECK-NOT: tensormap.replace.tile.interleave_layout
     // CHECK: tensormap.replace.tile.swizzle_mode.shared::cta.b1024.b32 [ $0 + 0 ], 0x2;
-    // CHECK: tensormap.replace.tile.fill_mode.shared::cta.b1024.b32 [ $0 + 0 ], 0x1;
+    // CHECK-NOT: tensormap.replace.tile.fill_mode
     // CHECK: tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [ $0 + 0 ], [ $1 + 0 ], 0x80;
-    ttng.tensormap_create %arg1, %arg0, [%c256_i32], [%arg2], [], [%c1_i32] {elem_type = 3 : i32, fill_mode = 1 : i32, interleave_layout = 0 : i32, swizzle_mode = 2 : i32, allocation.offset = 0 : i32} : (!tt.ptr<i8>, !tt.ptr<i16>, i32, i32, i32) -> ()
+    ttng.tensormap_create %arg1, %arg0, [%c256_i32], [%arg2], [], [%c1_i32] {elem_type = 3 : i32, fill_mode = 0 : i32, interleave_layout = 0 : i32, swizzle_mode = 2 : i32, allocation.offset = 0 : i32} : (!tt.ptr<i8>, !tt.ptr<i16>, i32, i32, i32) -> ()
     tt.return
   }
 }
@@ -883,7 +889,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
     %c1024_i64 = arith.constant 1024 : i64
-    // CHECK: tensormap.replace.tile.global_address.shared::cta.b1024.b64 [ $0 + 0 ], $1;
+    // CHECK: llvm.cond_br
+    // CHECK: llvm.inline_asm has_side_effects {{.*}} "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [ $0 + 0 ], $1;"
     // CHECK: tensormap.replace.tile.rank.shared::cta.b1024.b32 [ $0 + 0 ], 0x1;
     // CHECK: tensormap.replace.tile.box_dim.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.box_dim.shared::cta.b1024.b32 [ $0 + 0 ], 0x1, $1;
@@ -893,11 +900,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: tensormap.replace.tile.element_stride.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.element_stride.shared::cta.b1024.b32 [ $0 + 0 ], 0x1, $1;
     // CHECK: tensormap.replace.tile.elemtype.shared::cta.b1024.b32 [ $0 + 0 ], 0x3;
-    // CHECK: tensormap.replace.tile.interleave_layout.shared::cta.b1024.b32 [ $0 + 0 ], 0x0;
+    // CHECK: tensormap.replace.tile.interleave_layout.shared::cta.b1024.b32 [ $0 + 0 ], 0x1;
     // CHECK: tensormap.replace.tile.swizzle_mode.shared::cta.b1024.b32 [ $0 + 0 ], 0x2;
     // CHECK: tensormap.replace.tile.fill_mode.shared::cta.b1024.b32 [ $0 + 0 ], 0x1;
     // CHECK: tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [ $0 + 0 ], [ $1 + 0 ], 0x80;
-    ttng.tensormap_create %arg1, %arg0, [%c256_i32, %c256_i32], [%arg2, %arg2], [%c1024_i64], [%c1_i32, %c1_i32] {elem_type = 3 : i32, fill_mode = 1 : i32, interleave_layout = 0 : i32, swizzle_mode = 2 : i32, allocation.offset = 0 : i32} : (!tt.ptr<i8>, !tt.ptr<i16>, i32, i32, i32, i32, i64, i32, i32) -> ()
+    ttng.tensormap_create %arg1, %arg0, [%c256_i32, %c256_i32], [%arg2, %arg2], [%c1024_i64], [%c1_i32, %c1_i32] {elem_type = 3 : i32, fill_mode = 1 : i32, interleave_layout = 1 : i32, swizzle_mode = 2 : i32, allocation.offset = 0 : i32} : (!tt.ptr<i8>, !tt.ptr<i16>, i32, i32, i32, i32, i64, i32, i32) -> ()
     tt.return
   }
 }
@@ -1016,35 +1023,6 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.fence_mbarrier_init_release_cluster
     ttng.cluster_barrier {relaxed = 1 : i1}
     tt.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 4 : i32} {
-  // CHECK-LABEL: @cluster_arrive_not_warp_specialized
-  llvm.func @cluster_arrive_not_warp_specialized() {
-    // CHECK-NOT: ttg.warp_specialize
-    // CHECK: nvvm.cluster.arrive
-    ttng.cluster_arrive
-    llvm.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 8 : i32} {
-  // CHECK-LABEL: @cluster_arrive_warp_specialized
-  llvm.func @cluster_arrive_warp_specialized() {
-    // CHECK: ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4>}
-    // CHECK: default {
-    // CHECK-NEXT: nvvm.cluster.arrive.relaxed
-    // CHECK-NEXT: ttg.warp_yield
-    // CHECK: partition0() num_warps(4) {
-    // CHECK-NEXT: nvvm.cluster.arrive.relaxed
-    // CHECK-NEXT: ttg.warp_return
-    ttng.cluster_arrive {relaxed = true}
-    llvm.return
   }
 }
 
@@ -1286,8 +1264,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   tt.func @cluster_barrier_inside_warp_specialize() {
     ttg.warp_specialize()
     default {
-      // CHECK: nvvm.barrier
+      // CHECK-NOT: nvvm.barrier
       // CHECK: %[[COUNTER:.*]] = llvm.load
+      // CHECK-NEXT: nvvm.barrier
       // CHECK: %[[BARRIER_IDX:.*]] = llvm.and %[[COUNTER]]
       // CHECK: %[[PARITY:.*]] = llvm.lshr %[[COUNTER]]
       // CHECK: %[[BARRIER:.*]] = llvm.getelementptr %{{.*}}[%[[BARRIER_IDX]]]
@@ -1297,10 +1276,11 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
       // CHECK-NOT: mapa
       // CHECK: mbarrier.arrive.release.cluster.shared::cluster.b64
       // CHECK: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64
+      // CHECK-NOT: nvvm.barrier
       // CHECK: %[[NEXT_COUNTER:.*]] = llvm.add %[[COUNTER]]
       // CHECK: llvm.and %[[NEXT_COUNTER]]
       // CHECK: st.shared.b32
-      // CHECK: nvvm.barrier
+      // CHECK-NEXT: nvvm.barrier
       ttng.cluster_barrier
       ttg.warp_yield
     }
@@ -1349,6 +1329,10 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   // CHECK: nvvm.barrier
   // RUBIN-LABEL: @cluster_barrier_inside_warp_specialize_rubin
   // RUBIN-COUNT-2: mbarrier.init.shared::cta.b64 [$1], 3;
+  // RUBIN: nvvm.cluster.wait
+  // RUBIN-NOT: nvvm.barrier
+  // RUBIN: %[[RUBIN_COUNTER:.*]] = llvm.load
+  // RUBIN-NEXT: nvvm.barrier
   // RUBIN: %[[CTA:.*]] = nvvm.read.ptx.sreg.cluster.ctarank
   // RUBIN-DAG: %[[ALL_CTAS:.*]] = llvm.mlir.constant(15 : i32) : i32
   // RUBIN-DAG: %[[SELF_MASK:.*]] = llvm.shl %{{.*}}, %[[CTA]] : i32
@@ -1361,6 +1345,11 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   // RUBIN-PTX87: %[[ARRIVE_PRED:.*]] = llvm.icmp "ult"
   // RUBIN-PTX87-COUNT-1: mbarrier.arrive.release.cluster.shared::cluster.b64
   // RUBIN-PTX87-NOT: multicast::cluster::32b
+  // RUBIN-NOT: nvvm.barrier
+  // RUBIN: %[[RUBIN_NEXT_COUNTER:.*]] = llvm.add %[[RUBIN_COUNTER]]
+  // RUBIN: llvm.and %[[RUBIN_NEXT_COUNTER]]
+  // RUBIN: st.shared.b32
+  // RUBIN-NEXT: nvvm.barrier
   tt.func @cluster_barrier_inside_warp_specialize_rubin() {
     ttg.warp_specialize()
     default {
@@ -1421,35 +1410,6 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
       ttg.warp_return
     } : () -> ()
     tt.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 4 : i32} {
-  // CHECK-LABEL: @cluster_wait_not_warp_specialized
-  llvm.func @cluster_wait_not_warp_specialized() {
-    // CHECK-NOT: ttg.warp_specialize
-    // CHECK: nvvm.cluster.wait
-    ttng.cluster_wait
-    llvm.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 8 : i32} {
-  // CHECK-LABEL: @cluster_wait_warp_specialized
-  llvm.func @cluster_wait_warp_specialized() {
-    // CHECK: ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4>}
-    // CHECK: default {
-    // CHECK-NEXT: nvvm.cluster.wait
-    // CHECK-NEXT: ttg.warp_yield
-    // CHECK: partition0() num_warps(4) {
-    // CHECK-NEXT: nvvm.cluster.wait
-    // CHECK-NEXT: ttg.warp_return
-    ttng.cluster_wait
-    llvm.return
   }
 }
 

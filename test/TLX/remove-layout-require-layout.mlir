@@ -384,35 +384,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.thr
 
 // -----
 
-// tt.cat may rewrite both operands to match the result layout.  Each input
-// boundary must still be visible before concatenation, not bypassed by a
-// backward-propagated result encoding.
-
-#cat_src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-#cat_user = #ttg.linear<{register = [[1], [16]], lane = [[0], [0], [2], [4], [8]], warp = [[0], [0]], block = []}>
-#cat_result = #ttg.linear<{register = [[1], [16]], lane = [[0], [0], [2], [4], [8]], warp = [[0], [0]], block = []}>
-
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "cuda:100"} {
-  // CHECK-DAG: #[[$CAT_USER:.*]] = #ttg.linear
-  // CHECK-LABEL: tt.func @require_layout_blocks_cat_operand_rewrite
-  tt.func @require_layout_blocks_cat_operand_rewrite(
-      %lhs_src: tensor<16xf32, #cat_src>,
-      %rhs_src: tensor<16xf32, #cat_src>)
-      -> tensor<32xf32, #cat_result> {
-    // CHECK-DAG: %[[CAT_LHS_CVT:.*]] = ttg.convert_layout %arg0 : tensor<16xf32, #{{.*}}> -> tensor<16xf32, #[[$CAT_USER]]>
-    // CHECK-DAG: %[[CAT_RHS_CVT:.*]] = ttg.convert_layout %arg1 : tensor<16xf32, #{{.*}}> -> tensor<16xf32, #[[$CAT_USER]]>
-    // CHECK: %[[CAT_LHS_REQ:.*]] = ttg.require_layout %[[CAT_LHS_CVT]] : tensor<16xf32, #[[$CAT_USER]]> -> tensor<16xf32, #[[$CAT_USER]]>
-    %lhs = ttg.require_layout %lhs_src : tensor<16xf32, #cat_src> -> tensor<16xf32, #cat_user>
-    // CHECK: %[[CAT_RHS_REQ:.*]] = ttg.require_layout %[[CAT_RHS_CVT]] : tensor<16xf32, #[[$CAT_USER]]> -> tensor<16xf32, #[[$CAT_USER]]>
-    %rhs = ttg.require_layout %rhs_src : tensor<16xf32, #cat_src> -> tensor<16xf32, #cat_user>
-    // CHECK: %[[CAT:.*]] = tt.cat %[[CAT_LHS_REQ]], %[[CAT_RHS_REQ]]
-    %cat = tt.cat %lhs, %rhs : tensor<16xf32, #cat_user> -> tensor<32xf32, #cat_result>
-    tt.return %cat : tensor<32xf32, #cat_result>
-  }
-}
-
-// -----
-
 // tt.scan has a region and reduction-like layout preferences.  The scan input
 // must remain anchored at the user-required layout even if the pass can choose
 // a cheaper layout for surrounding arithmetic.

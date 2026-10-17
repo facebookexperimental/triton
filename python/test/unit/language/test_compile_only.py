@@ -43,6 +43,20 @@ def test_topk_valid_k(k):
     triton.compile(src, target=GPUTarget("cuda", 90, 32))
 
 
+def test_compile_only_sort_keeps_comparisons_boolean() -> None:
+
+    @triton.jit
+    def sort_kernel(values, result):
+        offsets = tl.arange(0, 128)
+        loaded = tl.load(values + offsets)
+        sorted_values = tl.sort(loaded, descending=False)
+        tl.store(result + offsets, sorted_values)
+
+    source = ASTSource(fn=sort_kernel, signature={"values": "*i32", "result": "*i32"})
+    compiled = triton.compile(source, target=GPUTarget("cuda", 100, 32))
+    assert "arith.extui" not in compiled.asm["ttgir"]
+
+
 @pytest.mark.parametrize("capability", [80, 86, 90, 100, 120])
 @pytest.mark.parametrize("reduce", [False, True])
 def test_compile_only_cuda_does_not_initialize_driver(capability, reduce, fresh_triton_cache) -> None:

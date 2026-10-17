@@ -79,13 +79,7 @@ struct FDivOpConversion
 
 struct FMulOpConversion
     : ElementwiseOpConversionBase<arith::MulFOp, FMulOpConversion> {
-
-  explicit FMulOpConversion(LLVMTypeConverter &typeConverter,
-                            ModuleAxisInfoAnalysis &axisAnalysisPass,
-                            ISAFamily isaFamily,
-                            PatternBenefit benefit = patternBenefitDefault)
-      : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
-        isaFamily(isaFamily) {}
+  using ElementwiseOpConversionBase::ElementwiseOpConversionBase;
 
   SmallVector<Value> createDestOps(arith::MulFOp op, OpAdaptor adaptor,
                                    ConversionPatternRewriter &rewriter,
@@ -94,30 +88,12 @@ struct FMulOpConversion
     auto lhsElemTy = getElementTypeOrSelf(op.getLhs());
     auto rhsElemTy = getElementTypeOrSelf(op.getRhs());
     if (lhsElemTy.isBF16() && rhsElemTy.isBF16()) {
-      if (isRDNA(isaFamily)) {
-        // To avoid casting to/from fp32, we compute a dot product with one
-        // element of each vector set to zero.
-        auto b = TritonLLVMOpBuilder(loc, rewriter);
-        Value aVal = packLLVector(
-            loc, ValueRange{operands[0][0], b.bf16_val(0.0)}, rewriter);
-        Value bVal = packLLVector(
-            loc, ValueRange{operands[0][1], b.bf16_val(0.0)}, rewriter);
-        return {LLVM::createLLVMIntrinsicCallOp(
-                    rewriter, loc, "llvm.amdgcn.fdot2.bf16.bf16", bf16_ty,
-                    ValueRange{aVal, bVal, b.bf16_val(0.0)})
-                    ->getResult(0)};
-      } else {
-        return {
-            EmitDualBF16ElementwiseOp<LLVM::FMulOp>(loc, rewriter, operands)};
-      }
+      return {EmitDualBF16ElementwiseOp<LLVM::FMulOp>(loc, rewriter, operands)};
     } else {
       return {LLVM::FMulOp::create(rewriter, loc, elemTy, operands[0][0],
                                    operands[0][1])};
     }
   }
-
-private:
-  ISAFamily isaFamily;
 };
 
 struct FAddOpConversion
@@ -433,6 +409,39 @@ struct SqrtOpConversion
 private:
   bool ftz;
 };
+
+struct ClampFOpConversion
+    : ElementwiseOpConversionBase<triton::ClampFOp, ClampFOpConversion> {
+  using Base =
+      ElementwiseOpConversionBase<triton::ClampFOp, ClampFOpConversion>;
+  using Base::Base;
+  using Adaptor = typename Base::OpAdaptor;
+
+  SmallVector<Value> createDestOps(triton::ClampFOp op, Adaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, MultipleOperandsRange operands,
+                                   Location loc) const {
+    if (!(elemTy.isF16() || elemTy.isF32()))
+      return {};
+
+    Value x = operands[0][0];
+    Value lo = operands[0][1];
+    Value hi = operands[0][2];
+
+    Value med = ROCDL::FMed3Op::create(rewriter, loc, elemTy, x, lo, hi);
+
+    // `PropagateNaN::ALL` requires us to return NaN if x is NaN. Since `v_med3`
+    // returns the min if any operand is NaN, we must explicitly check NaN.
+    if (op.getPropagateNan() == PropagateNan::ALL) {
+      Value isNan =
+          LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::une, x, x);
+      Value res = LLVM::SelectOp::create(rewriter, loc, isNan, x, med);
+      return {res};
+    }
+
+    return {med};
+  }
+};
 } // namespace
 
 namespace mlir::triton::AMD {
@@ -497,8 +506,7 @@ void populateElementwiseOpToLLVMPatterns(
   patterns.add<FDivOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FSubOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FAddOpConversion>(typeConverter, axisInfoAnalysis, benefit);
-  patterns.add<FMulOpConversion>(typeConverter, axisInfoAnalysis,
-                                 targetInfo.getISAFamily(), benefit);
+  patterns.add<FMulOpConversion>(typeConverter, axisInfoAnalysis, benefit);
 
   patterns.add<ExtFOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<TruncFOpConversion>(typeConverter, axisInfoAnalysis,
@@ -518,6 +526,8 @@ void populateElementwiseOpToLLVMPatterns(
   patterns.add<RsqrtOpConversion>(typeConverter, axisInfoAnalysis, ftz,
                                   benefit);
   patterns.add<SqrtOpConversion>(typeConverter, axisInfoAnalysis, ftz, benefit);
+  patterns.add<ClampFOpConversion>(typeConverter, axisInfoAnalysis,
+                                   benefit.getBenefit() + 1);
   triton::populateElementwiseOpToLLVMPatterns(
       typeConverter, patterns, axisInfoAnalysis, targetInfo, benefit);
   triton::populateClampFOpToLLVMPattern(typeConverter, patterns,

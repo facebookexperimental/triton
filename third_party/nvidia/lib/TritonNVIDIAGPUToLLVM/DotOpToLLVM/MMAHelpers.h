@@ -216,8 +216,13 @@ public:
       fullAddrb128 = tb.add(baseSrcb128, tb.i32_val(smemByteOffsetb128));
     }
     Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x7FFF));
-    Value addr64 = tb.zext(i64_ty, addrMasked);
-    Value descVal = tb.add(tb.int_val(64, currDesc.descriptor), addr64);
+    // Split the descriptor add into independent 32-bit low/high words so
+    // no 64-bit carry chain is needed (upstream #11329): currDesc.descriptor
+    // is static, so its high word folds to a constant.
+    Value low = tb.add(tb.i32_val(uint32_t(currDesc.descriptor)), addrMasked);
+    Value high = tb.i32_val(currDesc.descriptor >> 32);
+    Value descWords = packLLVector(loc, {low, high}, rewriter);
+    Value descVal = tb.bitcast(descWords, i64_ty);
     return descVal;
   }
   MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,
