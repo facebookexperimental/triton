@@ -50,7 +50,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c1 = arith.constant 1 : i32
     %zero = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #blocked>
     %acc_base, %acc_token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
-    %acc = ttng.tmem_subslice %acc_base {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+    %acc = ttng.tmem_subslice %acc_base {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
     %init_token = ttng.tmem_store %zero, %acc[%acc_token], %true : tensor<128x64xf32, #blocked> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
     %result = scf.for %iv = %c0 to %n_tiles step %c1 iter_args(%dep = %acc_token) -> (!ttg.async.token) : i32 {
       %mma_token = ttng.tc_gen5_mma %a, %b, %acc[%dep], %false, %true {async_task_id = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x64xf16, #shared1, #smem>, !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
