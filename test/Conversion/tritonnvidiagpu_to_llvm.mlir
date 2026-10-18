@@ -2,6 +2,7 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=85' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=85' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX85 %s
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=86' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=86' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX86 %s
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=88' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=88' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX88 %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=87' --initialize-ws-cluster-barriers='compute-capability=107 ptx-version=87' -reconcile-unrealized-casts | FileCheck --check-prefix=RUBIN-PTX87 %s
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=94' --initialize-ws-cluster-barriers='compute-capability=107 ptx-version=94' -reconcile-unrealized-casts | FileCheck --check-prefix=RUBIN %s
 
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -207,8 +208,14 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 2 : i32, "ttg
     // CHECK: fence.mbarrier_init.release.cluster
     // CHECK: nvvm.cluster.arrive.relaxed
     // CHECK-NEXT: nvvm.cluster.wait
-    // CHECK: mbarrier.arrive.release.cluster.shared::cluster.multicast::cluster::32b.b64 _, [${{.*}}], ${{.*}};
+    // CHECK-COUNT-2: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}];
+    // CHECK-NOT: multicast::cluster::32b
     // CHECK-NOT: mbarrier.arrive.release.cluster.shared::cta.b64
+    // RUBIN-PTX87-LABEL: arrive_barrier_multicast
+    // RUBIN-PTX87-COUNT-2: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}];
+    // RUBIN-PTX87-NOT: multicast::cluster::32b
+    // RUBIN-LABEL: arrive_barrier_multicast
+    // RUBIN: mbarrier.arrive.release.cluster.shared::cluster.multicast::cluster::32b.b64 _, [${{.*}}], ${{.*}};
     ttng.init_barrier %alloc, 1 : !ttg.memdesc<2xi64, #shared0, #smem, mutable>
     ttng.arrive_barrier %alloc, 1 {ctaMask = 1 : i32} : !ttg.memdesc<2xi64, #shared0, #smem, mutable>
     tt.return
@@ -1138,6 +1145,11 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   // RUBIN-COUNT-1: mbarrier.arrive.release.cluster.shared::cluster.multicast::cluster::32b.b64 _, [$1], $2;
   // RUBIN-NOT: mbarrier.arrive
   // RUBIN: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64
+  // RUBIN-PTX87-LABEL: @cluster_barrier_inside_warp_specialize_rubin
+  // RUBIN-PTX87: %[[RAW_TID:.*]] = nvvm.read.ptx.sreg.tid.x
+  // RUBIN-PTX87: %[[ARRIVE_PRED:.*]] = llvm.icmp "ult"
+  // RUBIN-PTX87-COUNT-1: mbarrier.arrive.release.cluster.shared::cluster.b64
+  // RUBIN-PTX87-NOT: multicast::cluster::32b
   tt.func @cluster_barrier_inside_warp_specialize_rubin() {
     ttg.warp_specialize()
     default {
