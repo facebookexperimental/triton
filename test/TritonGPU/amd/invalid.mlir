@@ -525,12 +525,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @tdm_gather_invalid_subbyte_element(
-    %tensorDesc: !tt.tensordesc<16x64xi4, #shared>,
-    %memDesc: !ttg.memdesc<16x64xi4, #shared, #smem, mutable>,
+    %tensorDesc: !tt.tensordesc<16x64xi1, #shared>,
+    %memDesc: !ttg.memdesc<16x64xi1, #shared, #smem, mutable>,
     %row_indices: tensor<16xi32, #slice>
   ) {
     // expected-error @+1 {{TDM gather requires element types of at least 8 bits}}
-    %token = amdg.async_tdm_gather %tensorDesc[%row_indices] to %memDesc : tensor<16xi32, #slice>, !ttg.memdesc<16x64xi4, #shared, #smem, mutable> -> !tt.tensordesc<16x64xi4, #shared>
+    %token = amdg.async_tdm_gather %tensorDesc[%row_indices] to %memDesc : tensor<16xi32, #slice>, !ttg.memdesc<16x64xi1, #shared, #smem, mutable> -> !tt.tensordesc<16x64xi1, #shared>
     tt.return
   }
 }
@@ -544,12 +544,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @tdm_scatter_invalid_subbyte_element(
-    %tensorDesc: !tt.tensordesc<16x64xi4, #shared>,
-    %memDesc: !ttg.memdesc<16x64xi4, #shared, #smem, mutable>,
+    %tensorDesc: !tt.tensordesc<16x64xi1, #shared>,
+    %memDesc: !ttg.memdesc<16x64xi1, #shared, #smem, mutable>,
     %row_indices: tensor<16xi32, #slice>
   ) {
     // expected-error @+1 {{TDM scatter requires element types of at least 8 bits}}
-    %token = amdg.async_tdm_scatter %tensorDesc[%row_indices] from %memDesc : tensor<16xi32, #slice>, !ttg.memdesc<16x64xi4, #shared, #smem, mutable> -> !tt.tensordesc<16x64xi4, #shared>
+    %token = amdg.async_tdm_scatter %tensorDesc[%row_indices] from %memDesc : tensor<16xi32, #slice>, !ttg.memdesc<16x64xi1, #shared, #smem, mutable> -> !tt.tensordesc<16x64xi1, #shared>
     tt.return
   }
 }
@@ -1025,7 +1025,7 @@ module {
 module {
   tt.func @memdesc_subslice_concrete_swizzling_pattern(%src: !ttg.memdesc<8x16xf32, #shared, #smem>) {
     // expected-error @+1 {{swizzling pattern}}
-    %slice = ttg.memdesc_subslice %src [0, 0] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<8x4xf32, #shared, #smem>
+    %slice = ttg.memdesc_subslice %src [0, 0] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<8x4xf32, #shared, #smem, 8x16>
     tt.return
   }
 }

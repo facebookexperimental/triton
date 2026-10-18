@@ -99,7 +99,7 @@ static std::optional<uint32_t> getTMemBaseAddress(Value value) {
     }
     if (auto slice = dyn_cast<TMEMSubSliceOp>(defOp)) {
       offset += getTMemSubSliceOffset(slice.getSrc().getType(),
-                                      slice.getOffset(), slice.getDim());
+                                      slice.getOffset(), slice.getSliceDim());
       value = slice.getSrc();
       continue;
     }
@@ -333,7 +333,7 @@ static void appendRootAllocs(Value value, SmallVectorImpl<RootAlloc> &allocs,
       // getTMemSubSliceOffset packs the column offset in the low 16 bits and
       // the row offset in the high 16 bits, as TMEMSubSliceOpConversion does.
       uint32_t packed = getTMemSubSliceOffset(
-          slice.getSrc().getType(), slice.getOffset(), slice.getDim());
+          slice.getSrc().getType(), slice.getOffset(), slice.getSliceDim());
       TMemViewOffset next = offset;
       next.col += packed & 0xffff;
       next.row += packed >> 16;
