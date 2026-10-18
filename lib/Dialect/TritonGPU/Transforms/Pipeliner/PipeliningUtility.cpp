@@ -227,7 +227,9 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     dotOp->moveBefore(yield);
     auto elseB = ifOp.getElseBodyBuilder();
     scf::YieldOp::create(elseB, loc, dotOp->getOperand(2));
-    op->replaceAllUsesWith(ifOp->getResults());
+    // Redirect external uses to the scf.if result, but not the then-yield we
+    // just created, which must keep forwarding the dot's own result.
+    dotOp->getResult(0).replaceAllUsesExcept(ifOp->getResult(0), yield);
     return ifOp;
   }
   // Ops without a built-in pred operand: wrap in scf.if.
