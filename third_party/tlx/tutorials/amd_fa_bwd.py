@@ -1290,8 +1290,9 @@ def _attn_bwd_gqa_front(
     QT_LAYOUT: tl.constexpr,
     P_ND_LAYOUT: tl.constexpr,
     Q_OUT_LAYOUT: tl.constexpr,
+    UPDATE_DV_FIRST_HALF: tl.constexpr = True,
 ):
-    """Apply the optional causal scaled-score mask, then publish current dS to LDS."""
+    """Publish current dS to LDS and optionally update the first dV fragments."""
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
     v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
     k_nm = tlx.local_load(
@@ -1407,15 +1408,16 @@ def _attn_bwd_gqa_front(
     p_nd = tl.permute(p_nd, (0, 2, 3, 1, 4, 5))
     p_nd = tl.reshape(p_nd, (BLOCK_N, BLOCK_M))
     p_nd = tlx.require_layout(p_nd, P_ND_LAYOUT, pin=False)
-    dv = _attn_bwd_gqa_dv_fragmented_half(
-        p_nd,
-        do_out,
-        dv,
-        MMA_ND,
-        P_ND_LAYOUT,
-        Q_OUT_LAYOUT,
-        True,
-    )
+    if UPDATE_DV_FIRST_HALF:
+        dv = _attn_bwd_gqa_dv_fragmented_half(
+            p_nd,
+            do_out,
+            dv,
+            MMA_ND,
+            P_ND_LAYOUT,
+            Q_OUT_LAYOUT,
+            True,
+        )
 
     ds_bf16 = ds.to(tl.bfloat16)
     tlx.local_store(ds_stage, tl.trans(ds_bf16))
