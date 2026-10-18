@@ -42,8 +42,8 @@ createPinnedRegisterLayoutBoundary(TritonOpBuilder &builder, Value src,
                                    Attribute encoding) {
   auto srcType = cast<RankedTensorType>(src.getType());
   Attribute physicalEncoding = tlx::getEffectiveEncoding(encoding);
-  auto pinnedType = srcType.cloneWithEncoding(tlx::wrapNoVerifyLayout(
-      tlx::wrapUserLayout(physicalEncoding)));
+  auto pinnedType = srcType.cloneWithEncoding(
+      tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(physicalEncoding)));
   return builder.create<tlx::RequireLayoutOp>(pinnedType, src);
 }
 
@@ -287,11 +287,10 @@ void init_triton_tlx_ir(py::module &&m) {
             // user pin with the same SSA boundary used by every other source.
             Attribute physicalEncoding = tlx::getEffectiveEncoding(encoding);
             auto resultType = RankedTensorType::get(
-                shape, elementType,
-                tlx::wrapNoVerifyLayout(physicalEncoding));
+                shape, elementType, tlx::wrapNoVerifyLayout(physicalEncoding));
             Value result = self.createOrFold<tt::SplatOp>(resultType, scalar);
             return createPinnedProducerLayoutBoundary(self, result,
-                                                        physicalEncoding);
+                                                      physicalEncoding);
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
@@ -339,10 +338,9 @@ void init_triton_tlx_ir(py::module &&m) {
                 load->setAttr("tlx.rematerialize_coordinates",
                               self.getBuilder().getUnitAttr());
               if (rematerializeCoordinatesGroup)
-                load->setAttr(
-                    "tlx.rematerialize_coordinates_group",
-                    self.getBuilder().getI32IntegerAttr(
-                        *rematerializeCoordinatesGroup));
+                load->setAttr("tlx.rematerialize_coordinates_group",
+                              self.getBuilder().getI32IntegerAttr(
+                                  *rematerializeCoordinatesGroup));
               return load;
             };
 
@@ -358,8 +356,8 @@ void init_triton_tlx_ir(py::module &&m) {
                 subViewType.getShape(), subViewType.getElementType(),
                 tlx::wrapNoVerifyLayout(physicalEncoding));
             auto load = createLoad(rawType);
-            return createPinnedProducerLayoutBoundary(
-                self, load.getResult(), physicalEncoding);
+            return createPinnedProducerLayoutBoundary(self, load.getResult(),
+                                                      physicalEncoding);
           },
           py::arg("subView"), py::arg("asyncToken").none(),
           py::arg("layoutEncoding") = std::nullopt,
@@ -884,7 +882,7 @@ void init_triton_tlx_ir(py::module &&m) {
             if (!userLayout)
               return loadOp;
             return createPinnedProducerLayoutBoundary(self, loadOp,
-                                                        physicalEncoding);
+                                                      physicalEncoding);
           },
           py::arg("subView"), py::arg("layoutEncoding"), py::arg("asyncToken"),
           py::arg("userLayout") = false)
