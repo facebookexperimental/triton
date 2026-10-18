@@ -2100,6 +2100,11 @@ void init_triton_ir(py::module &&m) {
              auto ctx = self.getContext();
              border->setAttr("triton.warp_pipeline.border",
                              StringAttr::get(ctx, marker));
+             // TLX stages predate the source-order memory policy. Preserve
+             // their original scheduling freedom; unmarked stages retain the
+             // existing policy.
+             border->setAttr("triton.warp_pipeline.allow_memory_reorder",
+                             UnitAttr::get(ctx));
              if (priority > -1) {
                auto i32Ty = IntegerType::get(ctx, 32);
                border->setAttr("triton.warp_pipeline.priority",
