@@ -684,6 +684,23 @@ private:
       return result;
     };
 
+    if (!enableTreeReduction) {
+      for (auto &[groupKey, group] : regGroups) {
+        auto reduced = reduceGroup(group);
+        auto key = groupKey;
+        key[axis] = 0;
+        bool isFirst = accs.find(key) == accs.end();
+        if (isFirst) {
+          accs[key] = std::move(reduced);
+          indices[key] = srcIndices[group.front()];
+        } else {
+          accumulate(op.getLoc(), rewriter, op.getCombineOp(), accs[key],
+                     reduced);
+        }
+      }
+      return;
+    }
+
     // Unordered reductions may combine all register groups that contribute to
     // the same output element.  Keeping the groups separate forces each
     // vectorized group to be reduced to a scalar before the partial results

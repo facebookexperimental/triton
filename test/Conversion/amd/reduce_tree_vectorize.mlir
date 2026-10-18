@@ -140,6 +140,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // GFX950: llvm.extractelement
   // GFX950: llvm.extractelement
   // GFX950: llvm.fadd {{.*}} : f32
+  // LINEAR-LABEL: reduce_multi_register_groups_unordered
+  // LINEAR: %[[R0:.*]] = llvm.extractvalue {{.*}}[0]
+  // LINEAR: %[[R1:.*]] = llvm.extractvalue {{.*}}[1]
+  // LINEAR: %[[R2:.*]] = llvm.extractvalue {{.*}}[2]
+  // LINEAR: %[[R3:.*]] = llvm.extractvalue {{.*}}[3]
+  // LINEAR: %[[PAIR0:.*]] = llvm.fadd %[[R0]], %[[R1]] : f32
+  // LINEAR: %[[PAIR1:.*]] = llvm.fadd %[[R2]], %[[R3]] : f32
+  // LINEAR: llvm.fadd %[[PAIR0]], %[[PAIR1]] : f32
   tt.func public @reduce_multi_register_groups_unordered(%arg0: tensor<512x8xf32, #multi_group>) {
     %0 = "tt.reduce"(%arg0) <{axis = 0 : i32, reduction_ordering = "unordered"}> ({
     ^bb0(%a: f32, %b: f32):
