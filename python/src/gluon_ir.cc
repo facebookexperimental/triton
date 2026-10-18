@@ -1032,8 +1032,8 @@ void init_gluon_ir(py::module &&m) {
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
              self.create<ttng::TCGen5MMAScaledOp>(
                  tokType, a, b, acc, accDep, aScale, bScale, aType, bType,
-                 useAcc, pred, mbarriers, mbarrier_preds, two_ctas,
-                 /*isAsync=*/false, multicast);
+                  useAcc, pred, two_ctas, mbarriers, mbarrier_preds,
+                  /*isAsync=*/false, multicast);
            })
       .def("create_tcgen05_commit",
            [](GluonOpBuilder &self, Value &barrier, Value &pred,
