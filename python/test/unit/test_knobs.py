@@ -327,6 +327,20 @@ def test_scalarize_packed_fops_invalidates_cache(monkeypatch):
     assert enabled["AMDGCN_SCALARIZE_PACKED_FOPS"] == "true"
 
 
+@pytest.mark.parametrize("env_var", ["TRITON_AUTO_TMA", "TRITON_AUTO_TMA_DEVICE"])
+def test_auto_tma_invalidates_cache(monkeypatch, env_var):
+    # Both knobs switch the PromoteLoadToTMA pass on in make_ttir, so a kernel
+    # compiled with one value must not be served from cache for the other.
+    monkeypatch.setenv(env_var, "0")
+    disabled = get_cache_invalidating_env_vars()
+
+    monkeypatch.setenv(env_var, "1")
+    enabled = get_cache_invalidating_env_vars()
+
+    assert disabled[env_var] == "false"
+    assert enabled[env_var] == "true"
+
+
 @pytest.mark.parametrize("truthy, falsey", [("1", "0"), ("true", "false"), ("True", "False"), ("TRUE", "FALSE"),
                                             ("y", "n"), ("YES", "NO"), ("ON", "OFF")])
 def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
