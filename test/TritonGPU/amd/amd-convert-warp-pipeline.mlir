@@ -1381,6 +1381,85 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
+// Constant ring slots must carry their precise allocation intervals into the
+// warp-pipeline dependency analysis. A transposed read of slot 0 and a write
+// to slot 1 are independent across the stage boundary; reading and refilling
+// slot 0 are not. The circular write-to-write edge still needs its own barrier.
+
+#ring_blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 16], warpsPerCTA = [8, 1], order = [1, 0]}>
+#ring_shared = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+#ring_shared_t = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [0, 1]}>
+#ring_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @constant_ring_distinct_slots(
+      %lb: index, %ub: index, %step: index,
+      %dst: tensor<32x128x!tt.ptr<f16>, #ring_blocked>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %data = arith.constant dense<0.0> : tensor<128x32xf16, #ring_blocked>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #ring_shared, #ring_smem, mutable>
+    %slot0 = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #ring_shared, #ring_smem, mutable> -> !ttg.memdesc<128x32xf16, #ring_shared, #ring_smem, mutable>
+    %slot1 = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #ring_shared, #ring_smem, mutable> -> !ttg.memdesc<128x32xf16, #ring_shared, #ring_smem, mutable>
+    %slot0_t = ttg.memdesc_trans %slot0 {order=array<i32: 1,0>} : !ttg.memdesc<128x32xf16, #ring_shared, #ring_smem, mutable> -> !ttg.memdesc<32x128xf16, #ring_shared_t, #ring_smem, mutable>
+
+    scf.for %i = %lb to %ub step %step {
+      scf.execute_region no_inline {
+        %value = ttg.local_load %slot0_t : !ttg.memdesc<32x128xf16, #ring_shared_t, #ring_smem, mutable> -> tensor<32x128xf16, #ring_blocked>
+        tt.store %dst, %value : tensor<32x128x!tt.ptr<f16>, #ring_blocked>
+        scf.yield
+      } {triton.warp_pipeline.stage = "read"}
+      scf.execute_region no_inline {
+        ttg.local_store %data, %slot1 : tensor<128x32xf16, #ring_blocked> -> !ttg.memdesc<128x32xf16, #ring_shared, #ring_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "write"}
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+    tt.return
+  }
+
+  // CHECK-LABEL: tt.func @constant_ring_distinct_slots
+  // CHECK: scf.for
+  // CHECK: ttg.local_load
+  // CHECK: rocdl.sched.barrier
+  // CHECK-NEXT: rocdl.s.barrier
+  // CHECK-NEXT: rocdl.sched.barrier
+  // CHECK: ttg.local_store
+
+  tt.func @constant_ring_same_slot(
+      %lb: index, %ub: index, %step: index,
+      %dst: tensor<32x128x!tt.ptr<f16>, #ring_blocked>) {
+    %c0 = arith.constant 0 : i32
+    %data = arith.constant dense<0.0> : tensor<128x32xf16, #ring_blocked>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #ring_shared, #ring_smem, mutable>
+    %slot0 = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #ring_shared, #ring_smem, mutable> -> !ttg.memdesc<128x32xf16, #ring_shared, #ring_smem, mutable>
+    %slot0_t = ttg.memdesc_trans %slot0 {order=array<i32: 1,0>} : !ttg.memdesc<128x32xf16, #ring_shared, #ring_smem, mutable> -> !ttg.memdesc<32x128xf16, #ring_shared_t, #ring_smem, mutable>
+
+    scf.for %i = %lb to %ub step %step {
+      scf.execute_region no_inline {
+        %value = ttg.local_load %slot0_t : !ttg.memdesc<32x128xf16, #ring_shared_t, #ring_smem, mutable> -> tensor<32x128xf16, #ring_blocked>
+        tt.store %dst, %value : tensor<32x128x!tt.ptr<f16>, #ring_blocked>
+        scf.yield
+      } {triton.warp_pipeline.stage = "read"}
+      scf.execute_region no_inline {
+        ttg.local_store %data, %slot0 : tensor<128x32xf16, #ring_blocked> -> !ttg.memdesc<128x32xf16, #ring_shared, #ring_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "write"}
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+    tt.return
+  }
+
+  // CHECK-LABEL: tt.func @constant_ring_same_slot
+  // CHECK: scf.for
+  // CHECK: ttg.local_load
+  // CHECK: rocdl.sched.barrier
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: rocdl.sched.barrier
+  // CHECK: ttg.local_store
+}
+
+// -----
+
 // ---- amdg.async_wait recognized as a valid barrier between stages ----
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
