@@ -6,7 +6,8 @@
 
 namespace mlir {
 class DialectRegistry;
-}
+struct MembarScratchSync;
+} // namespace mlir
 
 namespace mlir::triton::AMD {
 
@@ -19,6 +20,11 @@ namespace mlir::triton::AMD {
 // proven independent by the generic Membar allocation-slice analysis.
 bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
                   bool op2IsRead, Allocation *allocation);
+
+// Pair the allocated warp-local scratch reuse proof with its required leading
+// wave fence. Callers using only membarFilter retain CTA synchronization for
+// scratch reuse, since they have no corresponding wave-fence emitter.
+MembarScratchSync getWarpLocalScratchSync();
 
 // Registers an external interface model marking the AMD scheduling-only fences
 // rocdl.sched.barrier / rocdl.sched.group.barrier with

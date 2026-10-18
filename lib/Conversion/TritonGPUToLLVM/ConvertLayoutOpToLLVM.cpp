@@ -370,6 +370,8 @@ struct ConvertLayoutOpConversion
     };
 
     for (int i = 0; i < nReps; ++i) {
+      // Membar orders inter-operation scratch reuse after allocation. Repeated
+      // tiles within this operation still need to release the preceding reads.
       if (i > 0)
         emitBarrier();
       auto tileInVals =
