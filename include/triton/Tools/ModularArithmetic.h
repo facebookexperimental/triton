@@ -54,13 +54,14 @@ struct ModMatrix {
 // Gaussian elimination to RREF in Z/nZ. Modifies matrix in-place, returns rank.
 int modRREF(ModMatrix &mat);
 
-// Solve Ax = b (mod modulus) using Gaussian elimination.
-// The modulus parameter overrides A.modulus for the solve operation.
+// Solve Ax = b over a prime field using Gaussian elimination.
+// Returns {} outside this family or if no solution is found.
 std::vector<int64_t> modSolveLinear(const ModMatrix &A,
                                     const std::vector<int64_t> &b,
                                     int64_t modulus);
 
-// Solve Ax = b (mod p^e) using Hensel lifting
+// Solve Ax = b (mod p^e) using Hensel lifting. Solvable singular systems such
+// as 2x = 2 (mod 4) currently return {}.
 std::vector<int64_t> modSolveLinearHensel(const ModMatrix &A,
                                           const std::vector<int64_t> &b,
                                           int64_t prime, int exponent);
