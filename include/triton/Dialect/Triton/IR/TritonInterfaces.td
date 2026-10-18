@@ -7,12 +7,17 @@ include "mlir/Interfaces/InferTypeOpInterface.td"
 def TensorSizeTrait : NativeOpTrait<"TensorSizeTrait">;
 def VerifyTensorLayoutsTrait : NativeOpTrait<"VerifyTensorLayoutsTrait">;
 def SameOperandsEncoding : NativeOpTrait<"SameOperandsEncoding">;
-def SameOperandsAndResultEncoding : NativeOpTrait<"SameOperandsAndResultEncoding">;
+def SameOperandsAndResultEncoding
+    : NativeOpTrait<"SameOperandsAndResultEncoding">;
 def SameLoadStoreOperandsShape : NativeOpTrait<"SameLoadStoreOperandsShape">;
-def SameLoadStoreOperandsAndResultShape : NativeOpTrait<"SameLoadStoreOperandsAndResultShape">;
-def SameLoadStoreOperandsEncoding : NativeOpTrait<"SameLoadStoreOperandsEncoding">;
-def SameLoadStoreOperandsAndResultEncoding : NativeOpTrait<"SameLoadStoreOperandsAndResultEncoding">;
+def SameLoadStoreOperandsAndResultShape
+    : NativeOpTrait<"SameLoadStoreOperandsAndResultShape">;
+def SameLoadStoreOperandsEncoding
+    : NativeOpTrait<"SameLoadStoreOperandsEncoding">;
+def SameLoadStoreOperandsAndResultEncoding
+    : NativeOpTrait<"SameLoadStoreOperandsAndResultEncoding">;
 def AsyncRegions : NativeOpTrait<"AsyncRegions">;
+def AxisInfoPassthroughTrait : NativeOpTrait<"AxisInfoPassthroughTrait">;
 
 // A trait equivalent to InferTypeOpAdaptor, but that checks for structural
 // equivalence of the layouts of the result rather than just layout equality.
