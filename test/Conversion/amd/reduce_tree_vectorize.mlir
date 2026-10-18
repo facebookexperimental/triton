@@ -43,6 +43,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
 // -----
 
+#mfma_reduce = #ttg.amd_mfma<{version = 4, warpsPerCTA = [8, 1], instrShape = [32, 32, 16], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // This MFMA layout gives each thread 32 values on the reduction axis, split
+  // into eight register-contiguous spans of four. A regression flattened all
+  // 32 values into one dependency chain:
+  //
+  //   (((span0[0] + ... + span0[3]) + span1[0]) + span1[1]) + ...
+  //
+  // That long chain prevented LLVM from packing adjacent loop-carried values
+  // and caused severe VGPR spilling in Flash Attention. The required lowering
+  // finishes each four-value span first and immediately merges that partial:
+  //
+  //   running = reduce(span0); running += reduce(span1); ...
+  //
+  // Checking that operation seven merges the two completed span results makes
+  // the flattened form fail: its operation seven still consumes a raw value.
+  // LINEAR-LABEL: reduce_mfma_f32_in_contiguous_spans
+  // LINEAR: %[[SPAN0_01:.*]] = llvm.fadd %{{.*}}, %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN0_012:.*]] = llvm.fadd %[[SPAN0_01]], %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN0:.*]] = llvm.fadd %[[SPAN0_012]], %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN1_01:.*]] = llvm.fadd %{{.*}}, %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN1_012:.*]] = llvm.fadd %[[SPAN1_01]], %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN1:.*]] = llvm.fadd %[[SPAN1_012]], %{{.*}} : f32
+  // LINEAR-NEXT: %[[RUNNING:.*]] = llvm.fadd %[[SPAN0]], %[[SPAN1]] : f32
+  tt.func public @reduce_mfma_f32_in_contiguous_spans(%arg0: tensor<256x64xf32, #mfma_reduce>) {
+    %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<256x64xf32, #mfma_reduce>) -> tensor<256xf32, #ttg.slice<{dim = 1, parent = #mfma_reduce}>>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked_reduce = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // GFX1250-LABEL: reduce_f16_tree_vectorize
