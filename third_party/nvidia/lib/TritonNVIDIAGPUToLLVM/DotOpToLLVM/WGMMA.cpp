@@ -235,7 +235,7 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
     aLoader = std::move(*loader);
     transA = aLoader.getDescriptor().transposed;
   } else {
-    structA = unpackLLElements(loc, loadedA, rewriter);
+    structA = unpackTensorElements(loc, loadedA, rewriter, aTensorTy);
   }
   auto bLoader = DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB,
                                            {K, N}, 1, 3, hasLessRegMMA(op),
@@ -248,7 +248,7 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   }
   bool transB = !bLoader->getDescriptor().transposed;
 
-  auto fc = unpackLLElements(loc, loadedC, rewriter);
+  auto fc = unpackTensorElements(loc, loadedC, rewriter, dTensorTy);
 
   triton::nvgpu::WGMMAEltType eltTypeC = getMmaRetType(d);
   triton::nvgpu::WGMMAEltType eltTypeA = getMmaOperandType(a, allowTF32);
@@ -367,10 +367,8 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
       unpackAccumulator(rewriter, loc, mmaResults, dTensorTy);
 
   // replace with new packed result
-  Type structTy = LLVM::LLVMStructType::getLiteral(
-      mmaEncoding.getContext(),
-      SmallVector<Type>(results.size(), dTensorTy.getElementType()));
-  auto res = packLLElements(loc, typeConverter, results, rewriter, structTy);
+  auto res =
+      packTensorElements(loc, typeConverter, results, rewriter, dTensorTy);
   rewriter.replaceOp(op, res);
   return success();
 }
