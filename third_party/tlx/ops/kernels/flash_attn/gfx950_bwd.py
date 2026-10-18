@@ -5765,31 +5765,6 @@ def _attn_bwd_gqa_front_stream_cache64(
 
 
 @triton.jit
-def _attn_bwd_mha_score_cache64(
-    k_buffer,
-    k_score_cache,
-    q_t,
-    MMA_NM: tl.constexpr,
-    K_NM_LAYOUT: tl.constexpr,
-):
-    """Keep native K ownership through ordered joins before one full score dot."""
-    tl.static_assert(k_buffer.shape == (256, 128))
-    tl.static_assert(k_score_cache.shape == (64, 128))
-    tl.static_assert(q_t.shape == (128, 16))
-    k0 = tlx.require_layout(k_score_cache, K_NM_LAYOUT, pin=True)
-    k1 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [64, 128]), layout=K_NM_LAYOUT, relaxed=True)
-    k1 = tlx.require_layout(k1, K_NM_LAYOUT, pin=True)
-    k2 = tlx.local_load(tlx.local_slice(k_buffer, [128, 0], [64, 128]), layout=K_NM_LAYOUT, relaxed=True)
-    k2 = tlx.require_layout(k2, K_NM_LAYOUT, pin=True)
-    k3 = tlx.local_load(tlx.local_slice(k_buffer, [192, 0], [64, 128]), layout=K_NM_LAYOUT, relaxed=True)
-    k3 = tlx.require_layout(k3, K_NM_LAYOUT, pin=True)
-    k01 = tlx.require_layout(tl.cat(k0, k1, can_reorder=False, dim=0), K_NM_LAYOUT, pin=True)
-    k23 = tlx.require_layout(tl.cat(k2, k3, can_reorder=False, dim=0), K_NM_LAYOUT, pin=True)
-    k_nm = tlx.require_layout(tl.cat(k01, k23, can_reorder=False, dim=0), K_NM_LAYOUT, pin=True)
-    return tl.dot(k_nm, q_t, tlx.zeros((256, 16), tl.float32, layout=MMA_NM))
-
-
-@triton.jit
 def _attn_bwd_opt_gqa_front(
     dv,
     q_slice,
@@ -5822,7 +5797,7 @@ def _attn_bwd_opt_gqa_front(
     """Publish current dS to LDS and optionally update the first dV fragments."""
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
     v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
-    if not USE_STREAM and not CACHE_SCORE_K:
+    if not USE_STREAM:
         k_nm = tlx.local_load(
             k_buffer,
             layout=K_NM_LAYOUT,
@@ -5834,16 +5809,12 @@ def _attn_bwd_opt_gqa_front(
         relaxed=True,
     )
     if not USE_STREAM:
-        if CACHE_SCORE_K:
-            tl.static_assert(not IS_CAUSAL and BLOCK_M == 16 and BLOCK_N == 256
-                             and (N == 1024 or N == 2048 or N == 4096 or N == 8192 or N == 16384))
-            scores = _attn_bwd_mha_score_cache64(k_buffer, k_score_cache, q_t, MMA_NM, K_NM_LAYOUT)
-        else:
-            scores = tl.dot(
-                k_nm,
-                q_t,
-                tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
-            )
+        tl.static_assert(not CACHE_SCORE_K)
+        scores = tl.dot(
+            k_nm,
+            q_t,
+            tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
+        )
     else:
         do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
         if CACHE_SCORE_K:
@@ -6562,7 +6533,8 @@ def _attn_bwd_opt_gqa_phase(
         UPDATE_DV_FIRST_HALF=not BRAID_DK_DV,
         PIN_SCORES=IS_CAUSAL,
         PIN_DP=IS_CAUSAL,
-        USE_STREAM=HQ != HK and not IS_CAUSAL,
+        # GQA and the MHA score-cache shapes stream score and dP bands together.
+        USE_STREAM=not IS_CAUSAL and (HQ != HK or CACHE_SCORE_K),
         CACHE_SCORE_K=CACHE_SCORE_K,
         k_score_cache=k_score_cache,
     )
