@@ -70,6 +70,7 @@ class BenchCase:
 class BenchResult:
     case: BenchCase
     kernel: str
+    wave_specialization: str
     tensor_gib: float
     returncode: int
     ms: float | None
@@ -94,7 +95,8 @@ def _parse_case(value: str) -> BenchCase:
     return BenchCase(groups, m, n, k)
 
 
-def _build_command(args: argparse.Namespace, case: BenchCase, kernel_variant: str) -> list[str]:
+def _build_command(args: argparse.Namespace, case: BenchCase, kernel_variant: str,
+                   wave_specialization: str) -> list[str]:
     kernel = Path(__file__).with_name("amd_grouped_gemm_gfx1250_test.py")
     command = [
         sys.executable,
@@ -133,6 +135,8 @@ def _build_command(args: argparse.Namespace, case: BenchCase, kernel_variant: st
         str(args.cluster_size),
         "--seed",
         str(args.seed),
+        "--wave_specialization",
+        wave_specialization,
     ]
     if args.num_programs is not None:
         command.extend(["--num_programs", str(args.num_programs)])
@@ -149,13 +153,15 @@ def _build_command(args: argparse.Namespace, case: BenchCase, kernel_variant: st
     return command
 
 
-def _run_case(args: argparse.Namespace, case: BenchCase, kernel_variant: str, index: int, total: int) -> BenchResult:
-    command = _build_command(args, case, kernel_variant)
+def _run_case(args: argparse.Namespace, case: BenchCase, kernel_variant: str, wave_specialization: str, index: int,
+              total: int) -> BenchResult:
+    command = _build_command(args, case, kernel_variant, wave_specialization)
     print()
-    print(f"[{index}/{total}] {kernel_variant} {case.label}  estimated tensors: {case.tensor_gib:.1f} GiB")
+    print(f"[{index}/{total}] {kernel_variant} {case.label} wave_specialization={wave_specialization} "
+          f" estimated tensors: {case.tensor_gib:.1f} GiB")
     print(f"$ {shlex.join(command)}")
     if args.dry_run:
-        return BenchResult(case, kernel_variant, case.tensor_gib, 0, None, None)
+        return BenchResult(case, kernel_variant, wave_specialization, case.tensor_gib, 0, None, None)
 
     process = subprocess.Popen(
         command,
@@ -174,19 +180,21 @@ def _run_case(args: argparse.Namespace, case: BenchCase, kernel_variant: str, in
             ms = float(match.group(1))
             tflops = float(match.group(2))
     returncode = process.wait()
-    return BenchResult(case, kernel_variant, case.tensor_gib, returncode, ms, tflops)
+    return BenchResult(case, kernel_variant, wave_specialization, case.tensor_gib, returncode, ms, tflops)
 
 
 def _print_summary(results: list[BenchResult]) -> None:
     print()
     print("Summary")
-    print(f"{'kernel':>6} {'G':>4} {'M/group':>9} {'N':>7} {'K':>7} {'GiB':>7} {'ms':>12} {'TFLOPS':>12}  status")
+    print(f"{'kernel':>6} {'wave spec':>9} {'G':>4} {'M/group':>9} {'N':>7} {'K':>7} "
+          f"{'GiB':>7} {'ms':>12} {'TFLOPS':>12}  status")
     for result in results:
         ms = "-" if result.ms is None else f"{result.ms:.4f}"
         tflops = "-" if result.tflops is None else f"{result.tflops:.2f}"
         case = result.case
-        print(f"{result.kernel:>6} {case.groups:4d} {case.m:9d} {case.n:7d} {case.k:7d} "
-              f"{result.tensor_gib:7.1f} {ms:>12} {tflops:>12}  {result.status}")
+        print(
+            f"{result.kernel:>6} {result.wave_specialization:>9} {case.groups:4d} {case.m:9d} {case.n:7d} {case.k:7d} "
+            f"{result.tensor_gib:7.1f} {ms:>12} {tflops:>12}  {result.status}")
 
 
 def _write_csv(path: Path, results: list[BenchResult]) -> None:
@@ -194,13 +202,15 @@ def _write_csv(path: Path, results: list[BenchResult]) -> None:
     with path.open("w", newline="") as output:
         writer = csv.DictWriter(
             output,
-            fieldnames=("kernel", "groups", "m_per_group", "n", "k", "tensor_gib", "ms", "tflops", "status"),
+            fieldnames=("kernel", "wave_specialization", "groups", "m_per_group", "n", "k", "tensor_gib", "ms",
+                        "tflops", "status"),
         )
         writer.writeheader()
         for result in results:
             case = result.case
             writer.writerow({
                 "kernel": result.kernel,
+                "wave_specialization": result.wave_specialization,
                 "groups": case.groups,
                 "m_per_group": case.m,
                 "n": case.n,
@@ -243,6 +253,8 @@ def main() -> int:
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share inputs within a cluster; disable for a synchronization-only control")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph"), default="eager")
+    parser.add_argument("--wave-specialization", choices=("off", "on", "all"), default="off",
+                        help="run baseline, wave specialization, or both")
     parser.add_argument("--benchmark-num-iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)
@@ -253,10 +265,11 @@ def main() -> int:
 
     cases = args.cases or [BenchCase(*case) for case in DEFAULT_CASES]
     kernels = ("packed", "list") if args.kernel == "both" else (args.kernel, )
-    runs = [(case, kernel) for case in cases for kernel in kernels]
+    modes = ("off", "on") if args.wave_specialization == "all" else (args.wave_specialization, )
+    runs = [(case, kernel, mode) for case in cases for kernel in kernels for mode in modes]
     results = []
-    for index, (case, kernel) in enumerate(runs, start=1):
-        result = _run_case(args, case, kernel, index, len(runs))
+    for index, (case, kernel, mode) in enumerate(runs, start=1):
+        result = _run_case(args, case, kernel, mode, index, len(runs))
         results.append(result)
         if args.fail_fast and not args.dry_run and result.status != "ok":
             break

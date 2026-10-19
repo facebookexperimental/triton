@@ -155,6 +155,20 @@ python3 bench.py --case 16,4096,4096,4096 --kernel list --cluster-size 1
 the summary/CSV with a `kernel` column. With `--cluster-size 1`, use
 `--no-cross-tile-prefetch` for alias-C or `--auto-config` for tile selection.
 
+Compare automatic wave specialization with the baseline:
+
+```bash
+python3 bench.py --case 2,1024,1024,512 --num-programs 16 \
+  --wave-specialization all --check --csv wave_specialization.csv
+python3 bench.py --wave-specialization on
+```
+
+`--wave-specialization off|on|all` defaults to `off`. `all` runs each shape/kernel
+combination with specialization disabled and enabled, in separate processes.
+The summary and CSV identify the mode. The standalone kernel script accepts
+`--wave_specialization off|on`. The packed/list host wrappers expose
+`enable_wave_specialization=False`.
+
 ## Cluster multicast
 
 Cluster size 2 shares B within a workgroup pair; size 4 shares A/B across a
