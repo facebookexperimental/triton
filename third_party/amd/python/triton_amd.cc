@@ -6,11 +6,9 @@
 #include "amd/include/hipblas_types.h"
 #include "lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #include "lld/Common/Driver.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 #include "passes.h"
-#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LLVMOptions.h"
@@ -57,11 +55,15 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertTritonAMDGPUToLLVMPass(arch, ftz));
         });
-  m.def("add_to_llvmir", [](mlir::PassManager &pm, const std::string &arch,
-                            bool ftz, bool enableTreeReduction) {
-    pm.addPass(
-        createConvertTritonAMDGPUToLLVMPass(arch, ftz, enableTreeReduction));
-  });
+  m.def(
+      "add_to_llvmir",
+      [](mlir::PassManager &pm, const std::string &arch, bool ftz,
+         bool enableTreeReduction, bool enableWmmaQueuing) {
+        pm.addPass(createConvertTritonAMDGPUToLLVMPass(
+            arch, ftz, enableTreeReduction, enableWmmaQueuing));
+      },
+      py::arg("pm"), py::arg("arch"), py::arg("ftz"),
+      py::arg("enable_tree_reduction"), py::arg("enable_wmma_queuing") = false);
   m.def("add_builtin_func_to_llvmir",
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertBuiltinFuncToLLVMPass(arch, ftz));
@@ -389,23 +391,6 @@ void init_triton_amd(py::module_ &m) {
     mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
-  });
-
-  m.def("enable_wmma_queuing", [](mlir::triton::FuncOp func) {
-    mlir::OpBuilder builder(func.getContext());
-    builder.setInsertionPointToStart(&func.getBody().front());
-    // HW_REG_WAVE_SCHED_MODE is register 26. Write only bit 2, preserving
-    // bits 0..1 used by LLVM's expert scheduling mode.
-    constexpr unsigned hwreg = 26 | (2 << 6);
-    auto reg = mlir::LLVM::ConstantOp::create(builder, func.getLoc(),
-                                              builder.getI32Type(),
-                                              builder.getI32IntegerAttr(hwreg));
-    auto value = mlir::LLVM::ConstantOp::create(builder, func.getLoc(),
-                                                builder.getI32Type(),
-                                                builder.getI32IntegerAttr(1));
-    mlir::LLVM::CallIntrinsicOp::create(
-        builder, func.getLoc(), builder.getStringAttr("llvm.amdgcn.s.setreg"),
-        mlir::ValueRange{reg, value});
   });
 
   m.def("attach_target_triple", [](llvm::Module *module) {

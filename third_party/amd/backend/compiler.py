@@ -756,8 +756,6 @@ class HIPBackend(BaseBackend):
     @staticmethod
     def make_llir(src, metadata, options):
         mod = src
-        if options.enable_wmma_queuing:
-            amd.enable_wmma_queuing(mod.get_function(mod.get_entry_func_name()))
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -801,6 +799,7 @@ class HIPBackend(BaseBackend):
             options.arch,
             __HIP_FTZ,
             options.enable_tree_reduction,
+            options.enable_wmma_queuing,
         )
         amd.passes.ttgpuir.add_warp_specialize_to_llvm(pm, options.arch)
         passes.common.add_canonicalizer(pm)
