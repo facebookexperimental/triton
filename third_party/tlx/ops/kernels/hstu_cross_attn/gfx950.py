@@ -30,8 +30,11 @@ on the same SIMD runs ``v_mfma_f32_16x16x32_f16``, producing NaN/Inf rows at
 two waves per SIMD.
 
 The custom ops live in the ``tlx`` namespace, the environment knobs are
-prefixed ``TLX_HSTU_CROSS_ATTN_``, and ``space="smoke"`` selects one config per
-kernel for correctness tests.
+prefixed ``TLX_HSTU_CROSS_ATTN_``. ``space="curated"`` (the default) autotunes
+the forward over a short config list for head dims that have one
+(``_FWD_CURATED_BY_HEAD_DIM``) and over the whole 144-config grid otherwise;
+``space="full"`` always tunes the grid, and ``space="smoke"`` runs one config
+per kernel for correctness tests.
 
 Design notes on the forward follow.
 
@@ -206,29 +209,40 @@ def maybe_register_custom_op(op_name, mutates_args):
     return decorator
 
 
-# "full" autotunes over the whole config list; "smoke" runs one config per
-# kernel, for correctness tests. Set by `hstu_cross_attn` before each launch.
-_SPACE: str = "full"
+# "curated" autotunes over the kernel's curated config list for the call's
+# regime; "full" over the whole grid; "smoke" runs one config per kernel, for
+# correctness tests. Set by `hstu_cross_attn` before each launch.
+_SPACE: str = "curated"
 
 
 class _SpaceAutotuner:
-    """Launches the full-space or smoke-space autotuner of one JIT kernel."""
+    """Launches the curated-, full- or smoke-space autotuner of one JIT kernel."""
 
-    def __init__(self, full, smoke):
+    def __init__(self, full, smoke, curated=None):
         self.full = full
         self.smoke = smoke
+        self.curated = curated if curated is not None else full
+
+    def select(self):
+        return {"curated": self.curated, "full": self.full, "smoke": self.smoke}[_SPACE]
 
     def __getitem__(self, grid):
-        return (self.full if _SPACE == "full" else self.smoke)[grid]
+        return self.select()[grid]
 
 
-def _space_autotune(configs, smoke_configs, key):
+def _space_autotune(configs, smoke_configs, key, curated_prune=None):
+    """`curated_prune(configs, named_args, **kwargs)` narrows `configs` per call for the curated space."""
     assert len(smoke_configs) == 1, smoke_configs
 
     def decorator(fn):
+        curated = None
+        if curated_prune is not None:
+            curated = triton_autotune(configs=configs, key=key, prune_configs_by={"early_config_prune":
+                                                                                  curated_prune})(fn)
         return _SpaceAutotuner(
             triton_autotune(configs=configs, key=key)(fn),
             triton_autotune(configs=smoke_configs, key=key)(fn),
+            curated,
         )
 
     return decorator
@@ -1294,6 +1308,44 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
     return configs
 
 
+# Curated forward configs for head dims 64 and 128, picked from the 144-config
+# grid below. On a MI350X run not used to pick them, the best of these eight was
+# within 3.6% of the grid's best on every gfx950 focus shape (_shapes.py, all
+# head dim 64 or 128), and within 2.7% on shapes outside that list (GQA, short
+# q, other batches). At head dims 16, 32 and 256 they were up to 18% behind and
+# each new shape wanted different configs, so those head dims tune the whole
+# grid until they have shapes of their own to pick a list from. split-KV uses
+# the same lists. Fields: BLOCK_M, BLOCK_N, NUM_STAGES, matrix_instr_nonkdim,
+# waves_per_eu, num_warps. test_autotune_drift.py re-checks them.
+_FWD_CURATED = frozenset({
+    (64, 64, 1, 16, 3, 4),
+    (64, 64, 2, 16, 1, 4),
+    (64, 64, 2, 16, 2, 4),
+    (64, 64, 2, 16, 3, 4),
+    (128, 32, 1, 16, 3, 4),
+    (128, 64, 2, 16, 2, 4),
+    (128, 64, 2, 32, 1, 4),
+    (128, 64, 2, 32, 2, 4),
+})
+_FWD_CURATED_BY_HEAD_DIM = {64: _FWD_CURATED, 128: _FWD_CURATED}
+
+
+def _fwd_config_key(c: triton.Config) -> tuple:
+    return (c.kwargs["BLOCK_M"], c.kwargs["BLOCK_N"], c.num_stages, c.kwargs["matrix_instr_nonkdim"],
+            c.kwargs["waves_per_eu"], c.num_warps)
+
+
+def _fwd_curated_configs() -> List[triton.Config]:
+    return [c for c in get_fwd_triton_spec_configs() if _fwd_config_key(c) in _FWD_CURATED]
+
+
+def _prune_fwd_to_curated(configs, named_args, **kwargs):
+    curated = _FWD_CURATED_BY_HEAD_DIM.get(kwargs["HEAD_DIM"])
+    if curated is None:  # no curated list for this head dim: tune the whole grid
+        return configs
+    return [c for c in configs if _fwd_config_key(c) in curated]
+
+
 def _fwd_smoke_configs() -> List[triton.Config]:
     return [
         c for c in get_fwd_triton_spec_configs()
@@ -1305,6 +1357,7 @@ def _fwd_smoke_configs() -> List[triton.Config]:
 @_space_autotune(
     configs=get_fwd_triton_spec_configs(),
     smoke_configs=_fwd_smoke_configs(),
+    curated_prune=_prune_fwd_to_curated,
     key=[
         "AUTOTUNE_Z",
         "HEAD_DIM",
@@ -1479,6 +1532,7 @@ def _tlx_gfx950_cross_attn_fwd(
 @_space_autotune(
     configs=get_fwd_triton_spec_configs(),
     smoke_configs=_fwd_smoke_configs(),
+    curated_prune=_prune_fwd_to_curated,
     key=[
         "AUTOTUNE_Z",
         "HEAD_DIM",
@@ -3699,9 +3753,9 @@ def hstu_cross_attn(
     causal: bool = False,
     shared_kv: bool = False,
     *,
-    space: str = "full",
+    space: str = "curated",
 ) -> torch.Tensor:
-    if space not in ("full", "smoke"):
+    if space not in ("curated", "full", "smoke"):
         raise ValueError(f"hstu_cross_attn does not provide space={space!r}")
     global _SPACE
     _SPACE = space

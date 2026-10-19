@@ -31,11 +31,14 @@ buy back the tuned configs, which are worth up to ~4x on small shapes. The
 gfx950 implementation currently provides only `"heuristic"`.
 
 Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
-hstu_cross_attn, kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
+kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can follow
 `mm`. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
 configs are measurably faster; pass `space="heuristic"` for a fast first call.
+`hstu_cross_attn` on gfx950 defaults to "curated": at head dims 64 and 128 it
+tunes eight forward configs picked from its 144-config "full" grid, which come
+within a few percent of it; other head dims tune the whole grid.
 
 An op with no implementation for the current GPU raises `UnsupportedOp` -- it
 never falls back to torch. A forward-only implementation raises
@@ -628,7 +631,7 @@ def _hstu_cross_attn_impl_key(device):
 
 
 def hstu_cross_attn(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, seq_offsets_q=None, max_q_len=None,
-                    num_softmax_heads=0, num_targets=None, causal=False, shared_kv=False, *, space="full"):
+                    num_softmax_heads=0, num_targets=None, causal=False, shared_kv=False, *, space="curated"):
     """HSTU cross attention over jagged `q` `(total_q, H, D)` and `k`/`v` `(total_kv, H_kv, D/V)`. Differentiable.
 
     `seq_offsets` are the `(B + 1,)` KV prefix offsets and `seq_offsets_q` the

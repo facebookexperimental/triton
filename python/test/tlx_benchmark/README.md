@@ -19,7 +19,7 @@ python python/test/tlx_benchmark/bench_{op}.py
 options:
   -h, --help            show this help message and exit
   --device DEVICE       GPU index, or 'auto' (default) for the least-used one
-  --space {heuristic,full,smoke}
+  --space {heuristic,curated,full,smoke}
                         autotune search space; the default is each op's own, and measuring anything
                         else measures a path users do not take
   --head N              only the first N cases PER DIRECTION, for a quick look; on an op with a
@@ -58,7 +58,7 @@ options:
 | `flash_attn_mxfp8` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `flash_attn_varlen` | `F.scaled_dot_product_attention` on the padded batch, masked | speedup >= 0.9x | heuristic |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
-| `hstu_cross_attn` | `tutorials/hstu_cross_attn/triton_bw_cross_attention.py` (Triton) | speedup >= 0.9x | full |
+| `hstu_cross_attn` | `tutorials/hstu_cross_attn/triton_bw_cross_attention.py` (Triton) | speedup >= 0.9x | curated |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
 | `kda_decode` | none | absolute floor, currently unset -> reports only | heuristic |
@@ -68,7 +68,9 @@ analytically chosen config. The TorchTLX providers use Inductor's template
 selection and expose `heuristic` as the suite's comparable default label. The
 remaining direct providers autotune a full space on their first call, which is
 minutes rather than seconds; they raise `cap_s` accordingly rather than measure
-a `smoke` space no user takes.
+a `smoke` space no user takes. `hstu_cross_attn` defaults to `curated`, eight
+forward configs picked from its 144-config `full` grid for head dims 64 and 128;
+`test_autotune_drift.py` checks weekly that they still keep up with the grid.
 
 The TorchTLX providers reach `mm`, `addmm`, and `bmm` through `torch.compile`.
 They force the TLX template (`tlx_mode="force"`) and race it against the same

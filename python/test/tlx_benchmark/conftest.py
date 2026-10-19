@@ -8,9 +8,9 @@ def pytest_addoption(parser):
     # Not --device: python/test/conftest.py already takes it for the backend name.
     group.addoption("--gpu", default="auto", help="GPU index, or 'auto' (default) for the least-used one")
     group.addoption(
-        "--space", choices=("heuristic", "full", "smoke"), default=None,
-        help="autotune search space; the default is each op's own (mm: heuristic, everything "
-        "else: full), and measuring anything else measures a path users do not take")
+        "--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
+        help="autotune search space; the default is each op's own (mm: heuristic, hstu_cross_attn: "
+        "curated, everything else: full), and measuring anything else measures a path users do not take")
     group.addoption("--head", type=int, default=None, metavar="N",
                     help="only the first N cases per direction, for a quick look")
     group.addoption("--synthetic", action="store_true",
