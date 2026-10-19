@@ -50,6 +50,25 @@ where `BLOCK_M_SPLIT = BLOCK_M / replicate`, `acc_regs` is 1 for fp32 (0.5 for f
 
 Skip silently when the consumer `tlx.async_task` already carries an explicit `registers=` value; re-emitting a default over it is a no-op at best and an override at worst. The keyword is `registers=N`, not `num_regs=N`.
 
+## Partition Warps Around The Default Task
+
+Declare exactly one `tlx.async_task("default")`: it owns warps `[0, N)` with `N` = the `num_warps` from the kernel's autotune `triton.Config`. Explicit partitions add warps on top of the default, so always place the task that scales with warp count in the default — in this scaffold, the consumer — and size every explicit partition from its ops' warp minimums:
+
+- WGMMA: at least 4 warps (one warpgroup, 128 threads) per dot group.
+- TMA descriptor issue: 1 warp (single-thread issue; elect one thread).
+
+```python
+with tlx.async_tasks():  # num_warps=4 in the autotune config
+    with tlx.async_task("default"):  # consumer: 4 warps (one WGMMA group)
+        ...
+    with tlx.async_task(num_warps=1):  # producer: TMA issue only
+        ...
+```
+
+The default partition is always at least 4 warps: keep the autotune `num_warps` at or above the default task's minimum (a WGMMA default needs 4).
+
+Replication on the default is manual: `replicate=` does not split the default partition, so for N warp groups on the default role (e.g., 2 WGMMA warp groups), copy the task body into an additional explicit `async_task(num_warps=4)` block per extra group instead of a single `replicate=N` default.
+
 ## Check The SMEM Precondition Before Rewriting
 
 Compute this lower bound (bytes) for every autotune config BEFORE rewriting, sizing the manual rings the rewrite will actually allocate — NOT `num_stages` (which is 1 in this scaffold):
@@ -75,7 +94,7 @@ Scoping rules (violations are compile errors or silent corruption):
 - `tlx.local_alloc`, `tlx.alloc_barriers`, and constexprs go at kernel scope BEFORE `tlx.async_tasks()`.
 - Producer and consumer iterate tiles in identical order.
 
-The producer (default task) waits empty `phase ^ 1`, expects bytes, and issues `tlx.async_descriptor_load` per operand; the consumer waits full `phase`, computes, and arrives empty. Do not introduce TMA into a kernel that uses pointer loads — keep `tl.load` + `tlx.local_store` + `tlx.fence("async_shared")` + `barrier_arrive`.
+The producer waits empty `phase ^ 1`, expects bytes, and issues `tlx.async_descriptor_load` per operand; the consumer waits full `phase`, computes, and arrives empty. Do not introduce TMA into a kernel that uses pointer loads — keep `tl.load` + `tlx.local_store` + `tlx.fence("async_shared")` + `barrier_arrive`.
 
 ## Track Phase With Monotonic Counters
 
@@ -96,6 +115,8 @@ Producer and consumer advance identical counters. Resetting phase per tile deadl
 - SMEM overflow: shape stored into a buffer allocated for another shape.
 - Wrong results: producer/consumer tile-order mismatch.
 - Sharp regression at bit-exact output on a compute-saturated baseline: the gate misjudged — revert.
+- Undersized default: autotune `num_warps` below 4 starves a WGMMA default — raise `num_warps` to at least one warpgroup.
+- `replicate=N` on the default task: the default is not split — copy the body into explicit warp-group tasks instead.
 
 ## Validate The Rewrite
 
