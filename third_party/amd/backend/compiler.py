@@ -756,6 +756,8 @@ class HIPBackend(BaseBackend):
     @staticmethod
     def make_llir(src, metadata, options):
         mod = src
+        kernel = mod.get_function(mod.get_entry_func_name())
+        kernel.set_attr("amdg.enable_wmma_queuing", ir.builder(mod.context).get_bool_attr(options.enable_wmma_queuing))
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -877,8 +879,6 @@ class HIPBackend(BaseBackend):
         if not kernel_fn:
             raise RuntimeError("Could not find kernel function")
         kernel_fn.set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
-        if options.enable_wmma_queuing:
-            amd.enable_wmma_queuing(kernel_fn)
         cluster_dim = options.ctas_per_cga[0] if options.ctas_per_cga is not None else metadata["num_ctas"]
         kernel_fn.add_fn_attr("amdgpu-cluster-dims", f"{cluster_dim},1,1")
         # warp-specialization mutates num_warps
