@@ -101,6 +101,37 @@ bool arePairwiseCoprime(const std::vector<int64_t> &moduli) {
         return false;
   return true;
 }
+
+bool isPrime(int64_t modulus) {
+  PrimeFactorization factors = factorize(modulus);
+  return factors.factors.size() == 1 && factors.factors[0].first == modulus &&
+         factors.factors[0].second == 1;
+}
+
+int64_t normalizeMod(__int128 value, int64_t modulus) {
+  int64_t normalized = value % modulus;
+  return normalized < 0 ? normalized + modulus : normalized;
+}
+
+bool isSolution(const ModMatrix &A, const std::vector<int64_t> &b,
+                const std::vector<int64_t> &x, int64_t modulus) {
+  if (modulus <= 0 || static_cast<int>(b.size()) != A.rows ||
+      static_cast<int>(x.size()) != A.cols)
+    return false;
+
+  for (int row = 0; row < A.rows; ++row) {
+    int64_t actual = 0;
+    for (int col = 0; col < A.cols; ++col)
+      actual = normalizeMod(static_cast<__int128>(actual) +
+                                static_cast<__int128>(A.at(row, col)) * x[col],
+                            modulus);
+
+    int64_t expected = normalizeMod(b[row], modulus);
+    if (actual != expected)
+      return false;
+  }
+  return true;
+}
 } // namespace
 
 std::optional<CRTResult> solveCRT(const std::vector<int64_t> &remainders,
@@ -259,10 +290,7 @@ std::vector<int64_t> modSolveLinear(const ModMatrix &A,
     return {}; // Size mismatch
   }
 
-  // Z/N arithmetic is only defined for N > 0. The downstream % modulus
-  // operations would otherwise crash (modulus == 0) or produce ill-defined
-  // results (modulus < 0).
-  if (modulus <= 0) {
+  if (!isPrime(modulus)) {
     return {};
   }
 
@@ -318,7 +346,7 @@ std::vector<int64_t> modSolveLinear(const ModMatrix &A,
     }
   }
 
-  return x;
+  return isSolution(A, b, x, modulus) ? x : std::vector<int64_t>{};
 }
 
 // Solve Ax = b (mod p^e) by solving mod p then lifting each power via
@@ -406,7 +434,7 @@ std::vector<int64_t> modSolveLinearHensel(const ModMatrix &A,
     val = ((val % p_e) + p_e) % p_e;
   }
 
-  return x_k;
+  return isSolution(A, b, x_k, p_e) ? x_k : std::vector<int64_t>{};
 }
 
 std::vector<int64_t> modSolveLinearCRT(const ModMatrix &A,
@@ -480,7 +508,7 @@ std::vector<int64_t> modSolveLinearCRT(const ModMatrix &A,
     x[var] = crt_result->solution;
   }
 
-  return x;
+  return isSolution(A, b, x, modulus) ? x : std::vector<int64_t>{};
 }
 
 int64_t PrimeFactorization::product() const {
