@@ -69,6 +69,14 @@ The default partition is always at least 4 warps: keep the autotune `num_warps` 
 
 Replication on the default is manual: `replicate=` does not split the default partition, so for N warp groups on the default role (e.g., 2 WGMMA warp groups), copy the task body into an additional explicit `async_task(num_warps=4)` block per extra group instead of a single `replicate=N` default.
 
+## Account For Empty Partitions
+
+Total warps must be a multiple of 4. Task `num_warps` sum across the default and every explicit partition: the 4+1 split above totals 5, so 3 empty warps pad the CTA to 8 — allocated but unused, each still costing 24 registers.
+
+Since the empty warps and their registers are paid for anyway, experiment with assigning the spare warps real work: an additional warp group doing redundant work (e.g., recompute over reload) can save SMEM or bandwidth at no extra warp cost.
+
+Total allocated warps are capped at 16 — count the default, explicit partitions, and empty padding against that ceiling.
+
 ## Check The SMEM Precondition Before Rewriting
 
 Compute this lower bound (bytes) for every autotune config BEFORE rewriting, sizing the manual rings the rewrite will actually allocate — NOT `num_stages` (which is 1 in this scaffold):
@@ -117,6 +125,8 @@ Producer and consumer advance identical counters. Resetting phase per tile deadl
 - Sharp regression at bit-exact output on a compute-saturated baseline: the gate misjudged — revert.
 - Undersized default: autotune `num_warps` below 4 starves a WGMMA default — raise `num_warps` to at least one warpgroup.
 - `replicate=N` on the default task: the default is not split — copy the body into explicit warp-group tasks instead.
+- Sub-multiple-of-4 warp total: the shortfall is allocated as empty warps at 24 registers each — size up deliberately or assign the spares redundant work.
+- Over 16 total warps: above the cap — shrink the autotune `num_warps` or an explicit partition.
 
 ## Validate The Rewrite
 
