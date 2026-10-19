@@ -991,6 +991,31 @@ def _attn_fwd_triton(
     )
 
 
+# The HIP forward's default configs, picked from the 144-config grid in
+# get_fwd_triton_spec_configs so that on every gfx950 focus shape of
+# tlx.ops.hstu_cross_attn the best of these eight is close to the grid's best.
+# Picked on one MI350X run and checked on a second: at most 0.0% / 1.0% slower.
+# Checked only at head dims 64 and 128, the ones the benchmark uses; at 256 it
+# was 14.6% behind. Fields: BLOCK_M, BLOCK_N, NUM_STAGES, matrix_instr_nonkdim,
+# waves_per_eu, num_warps. get_full_autotune() (HSTU_CROSS_ATTN_FULL_AUTOTUNE=1)
+# tunes the whole grid, as on CUDA.
+HIP_FWD_CURATED = frozenset({
+    (64, 32, 2, 16, 3, 4),
+    (64, 64, 2, 16, 2, 4),
+    (64, 64, 2, 16, 3, 4),
+    (128, 32, 2, 16, 1, 8),
+    (128, 32, 2, 16, 2, 4),
+    (128, 32, 2, 32, 2, 4),
+    (128, 64, 2, 32, 1, 4),
+    (128, 64, 2, 32, 2, 4),
+})
+
+
+def _hip_fwd_config_key(c: triton.Config) -> tuple:
+    return (c.kwargs["BLOCK_M"], c.kwargs["BLOCK_N"], c.num_stages, c.kwargs["matrix_instr_nonkdim"],
+            c.kwargs["waves_per_eu"], c.num_warps)
+
+
 def get_fwd_triton_spec_configs() -> List[triton.Config]:
     if torch.version.hip:
         configs = []
@@ -1019,7 +1044,9 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                                         num_stages=num_stages,
                                         num_warps=num_warps,
                                     ))
-        return configs
+        if get_full_autotune():
+            return configs
+        return [c for c in configs if _hip_fwd_config_key(c) in HIP_FWD_CURATED]
     if get_full_autotune():
         configs = [
             triton.Config(

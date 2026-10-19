@@ -40,7 +40,7 @@ def _observe_kernel_run(monkeypatch, kernel, observer):
 
 
 def _run(lengths_kv, lengths_q, heads, num_softmax_heads, dtype, *, heads_kv=None, dim=128, causal=False,
-         has_num_targets=True, shared_kv=False, check_backward=False, bwd_variant=None):
+         has_num_targets=True, shared_kv=False, check_backward=False, bwd_variant=None, space="smoke"):
     from triton.tlx.ops import hstu_cross_attn
     from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
     from triton.tlx.ops.kernels.hstu_cross_attn._reference import pytorch_hstu_cross_mha
@@ -77,7 +77,7 @@ def _run(lengths_kv, lengths_q, heads, num_softmax_heads, dtype, *, heads_kv=Non
     if bwd_variant is None:
         out = hstu_cross_attn(q, k, v, seq_offsets, max_kv_len, attn_scale, alpha=alpha, seq_offsets_q=seq_offsets_q,
                               max_q_len=max_q_len, num_softmax_heads=num_softmax_heads, num_targets=kernel_num_targets,
-                              causal=causal, shared_kv=shared_kv, space="smoke")
+                              causal=causal, shared_kv=shared_kv, space=space)
     else:
         # The backward variant is not part of the public signature.
         gfx950._SPACE = "smoke"
@@ -180,6 +180,59 @@ def test_hstu_cross_attn_rejects_invalid_inputs():
         hstu_cross_attn(q, q, q, offsets, 8, scale, seq_offsets_q=offsets)
     with pytest.raises(ValueError):
         hstu_cross_attn(q, q, q, offsets, 8, scale, space="heuristic")
+
+
+def test_hstu_cross_attn_curated_space_narrows_the_grid_per_head_dim():
+    xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
+    grid = xa.get_fwd_triton_spec_configs()
+    for head_dim in (64, 128):
+        curated = xa._prune_fwd_to_curated(grid, {}, HEAD_DIM=head_dim)
+        assert len(curated) == len(xa._FWD_CURATED) < len(grid)
+        assert {xa._fwd_config_key(c) for c in curated} == xa._FWD_CURATED
+    # A head dim with no curated list tunes the whole grid.
+    for head_dim in (16, 32, 256):
+        assert xa._prune_fwd_to_curated(grid, {}, HEAD_DIM=head_dim) == grid
+    for kernel in (xa._tlx_gfx950_cross_attn_fwd, xa._tlx_gfx950_cross_attn_fwd_split_kv):
+        assert len(kernel.curated.configs) == len(kernel.full.configs) == len(grid)
+    # The backward space is small already, so its curated space is the full one.
+    assert xa._tlx_gfx950_cross_attn_bwd.curated is xa._tlx_gfx950_cross_attn_bwd.full
+
+
+def test_hstu_cross_attn_space_selects_its_autotuner(monkeypatch):
+    xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
+    kernel = xa._tlx_gfx950_cross_attn_fwd
+    for space, autotuner in (("curated", kernel.curated), ("full", kernel.full), ("smoke", kernel.smoke)):
+        monkeypatch.setattr(xa, "_SPACE", space)
+        assert kernel.select() is autotuner
+
+
+def test_hstu_cross_attn_defaults_to_the_curated_space(monkeypatch):
+    xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
+    seen = []
+    monkeypatch.setattr(xa, "tlx_gfx950_cross_attn_mha", lambda **kwargs: seen.append(xa._SPACE))
+    monkeypatch.setattr(xa, "_SPACE", "smoke")
+    xa.hstu_cross_attn(None, None, None, None, None, 0, 0, None, 1.0)
+    xa.hstu_cross_attn(None, None, None, None, None, 0, 0, None, 1.0, space="full")
+    assert seen == ["curated", "full"]
+
+
+@requires_gfx950
+@pytest.mark.parametrize("num_softmax_heads", [0, 1])
+@pytest.mark.parametrize("splits", [1, 3])
+@pytest.mark.parametrize("index", range(8))
+def test_hstu_cross_attn_each_curated_config_is_correct(index, splits, num_softmax_heads, monkeypatch):
+    # Autotuning only runs the configs that win, so pin each curated config in
+    # turn, through the plain forward (1 split) and the split-KV forward.
+    xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
+    curated = xa._fwd_curated_configs()
+    assert len(curated) == len(xa._FWD_CURATED) == 8
+    for kernel in (xa._tlx_gfx950_cross_attn_fwd, xa._tlx_gfx950_cross_attn_fwd_split_kv):
+        monkeypatch.setattr(kernel.curated, "configs", [curated[index]])
+        monkeypatch.setattr(kernel.curated, "cache", {})
+    monkeypatch.setenv(xa.KV_SPLITS_ENV, str(splits))
+    torch.manual_seed(1013)
+    _run([0, 5, 64, 100, 257, 640, 1000], [3, 17, 64, 65, 128, 129, 200], heads=2, num_softmax_heads=num_softmax_heads,
+         dtype=torch.bfloat16, check_backward=True, space="curated")
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")

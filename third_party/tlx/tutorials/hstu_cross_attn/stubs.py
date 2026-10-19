@@ -1,5 +1,7 @@
 # Standalone OSS stubs for the fbcode leaf deps used by the HSTU cross-attention
 # triton kernels. Lets the kernels run under OSS triton (MetaMain2) without buck.
+import os
+
 import triton
 
 
@@ -29,7 +31,8 @@ def triton_autotune(configs, key, **kwargs):
 
 
 def get_full_autotune(*a, **k):
-    return False
+    # Opt in to each kernel's whole autotune grid instead of its curated list.
+    return os.environ.get("HSTU_CROSS_ATTN_FULL_AUTOTUNE") == "1"
 
 
 def is_sm90(*a, **k):

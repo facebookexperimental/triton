@@ -7,7 +7,9 @@ no vendor library for SiLU-scaled jagged attention, and the softmax shapes are
 jagged cross attention with independent q and KV offsets, so "faster than what
 production runs" is the comparison that matters.
 
-The reference autotunes its full space; TLX runs at whatever `--space` says.
+The reference autotunes its own default list (on HIP, eight curated configs;
+`HSTU_CROSS_ATTN_FULL_AUTOTUNE=1` for its full grid); TLX runs at whatever
+`--space` says.
 FLOPs count QK^T and PV over the actual (unpadded) lengths; backward is 2.5x.
 """
 
@@ -28,8 +30,8 @@ from _harness import Case, Prepared, close_enough, driver  # noqa: E402
 
 OP = "hstu_cross_attn"
 REF_NAME = "tutorials/hstu_cross_attn/triton_bw_cross_attention.py:triton_bw_hstu_mha_wrapper"
-#: No `heuristic_config` yet; see `bench_flash_attn.py`.
-DEFAULT_SPACE = "full"
+#: The op's default: eight curated configs from its 144-config "full" grid at head dims 64/128.
+DEFAULT_SPACE = "curated"
 EXTRA_COLUMNS = (("q tokens", "q_tokens"), ("kv tokens", "kv_tokens"))
 COLD_COMPILE = "first"
 COMPILE_CAP_S = 900.0
