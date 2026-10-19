@@ -41,9 +41,6 @@ def ConvertTritonAMDGPUToLLVM
        Option<"enableTreeReduction", "enable-tree-reduction",
               "bool", /*default*/ "false",
               "use tree-shaped, vectorized in-thread reductions">,
-       Option<"enableWmmaQueuing", "enable-wmma-queuing",
-              "bool", /*default*/ "false",
-              "enable gfx1250 WMMA queuing via SCHED_MODE[2] at kernel entry">,
   ];
 }
 

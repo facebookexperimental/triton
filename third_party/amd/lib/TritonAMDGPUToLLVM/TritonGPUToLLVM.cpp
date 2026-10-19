@@ -360,11 +360,10 @@ struct ConvertTritonAMDGPUToLLVM
   }
 
   ConvertTritonAMDGPUToLLVM(StringRef gfxArch, bool ftz,
-                            bool enableTreeReduction, bool enableWmmaQueuing) {
+                            bool enableTreeReduction) {
     this->gfxArch = gfxArch.str();
     this->ftz = ftz;
     this->enableTreeReduction = enableTreeReduction;
-    this->enableWmmaQueuing = enableWmmaQueuing;
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -384,26 +383,6 @@ struct ConvertTritonAMDGPUToLLVM
     if (targetInfo.getISAFamily() == triton::amdgpu::ISAFamily::Unknown) {
       mod.emitError("unsupported target: '") << this->gfxArch.getValue() << "'";
       return signalPassFailure();
-    }
-
-    if (enableWmmaQueuing) {
-      if (targetInfo.getArch() != "gfx1250") {
-        mod.emitError("enable-wmma-queuing requires an AMD gfx1250 target");
-        return signalPassFailure();
-      }
-      OpBuilder builder(context);
-      for (auto func : mod.getOps<triton::FuncOp>()) {
-        if (!triton::isKernel(func) || func.isExternal())
-          continue;
-        builder.setInsertionPointToStart(&func.getBody().front());
-        // HW_REG_WAVE_SCHED_MODE is register 26. Write only bit 2, preserving
-        // bits 0..1 used by LLVM's expert scheduling mode.
-        constexpr unsigned hwreg = 26 | (2 << 6);
-        Value reg = LLVM::createConstantI32(func.getLoc(), builder, hwreg);
-        Value value = LLVM::createConstantI32(func.getLoc(), builder, 1);
-        LLVM::createLLVMIntrinsicCallOp(
-            builder, func.getLoc(), "llvm.amdgcn.s.setreg", {}, {reg, value});
-      }
     }
 
     // Function/CFG conversion can replace block arguments with materialization
@@ -658,10 +637,9 @@ createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz) {
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz,
-                                    bool enableTreeReduction,
-                                    bool enableWmmaQueuing) {
-  return std::make_unique<ConvertTritonAMDGPUToLLVM>(
-      gfxArch, ftz, enableTreeReduction, enableWmmaQueuing);
+                                    bool enableTreeReduction) {
+  return std::make_unique<ConvertTritonAMDGPUToLLVM>(gfxArch, ftz,
+                                                     enableTreeReduction);
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>
