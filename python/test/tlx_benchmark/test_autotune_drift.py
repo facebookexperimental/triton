@@ -2,18 +2,20 @@
 
 On gfx950, `tlx.ops.hstu_cross_attn` autotunes its forward at head dims 64 and
 128 over eight curated configs (`_FWD_CURATED_BY_HEAD_DIM`) picked from a
-144-config grid (`space="full"`). A kernel or compiler change can move the
-best config outside that list. The test tunes every gfx950 focus shape over
-the full grid and fails when the best curated config is more than `MAX_LOSS`
-slower than the grid's best.
+144-config grid (`space="full"`), and its benchmark reference over eight
+(`HIP_FWD_CURATED` in `tutorials/hstu_cross_attn/triton_bw_cross_attention.py`,
+full grid with `HSTU_CROSS_ATTN_FULL_AUTOTUNE=1`). A kernel or compiler change
+can move the best config outside those lists. Each test tunes every gfx950
+focus shape over the full grid and fails when the best curated config is more
+than `MAX_LOSS` slower than the grid's best.
 
 A failure is a lead, not a verdict: the best of 144 noisy timings is biased low
 against the best of a short list. Re-time the two configs it names before
 changing a curated list, and look for the cause (kernel change, compiler
 change, a new shape regime) rather than growing the list back toward the grid.
 
-It takes about as long as tuning the grid on every shape, so it only runs when
-`TLX_AUTOTUNE_DRIFT=1`.
+Each test takes about as long as tuning the grid on every shape, so they only
+run when `TLX_AUTOTUNE_DRIFT=1`.
 """
 
 import importlib
@@ -24,7 +26,8 @@ import sys
 
 import pytest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
 
 #: Above the run-to-run difference of an autotune pass on these shapes (~1-3%).
 MAX_LOSS = 0.05
@@ -106,3 +109,22 @@ def test_hstu_cross_attn_curated_forward_space_tracks_the_full_grid(governor, mo
         lambda shape: xa._FWD_CURATED_BY_HEAD_DIM.get(shape.head_dim),
         "_FWD_CURATED_BY_HEAD_DIM",
     )
+
+
+def test_hstu_cross_attn_reference_curated_forward_space_tracks_the_full_grid(governor, monkeypatch):
+    # The reference builds its config list at import, so import it with the full grid switched on.
+    monkeypatch.setenv("HSTU_CROSS_ATTN_FULL_AUTOTUNE", "1")
+    tutorial = _HERE.parents[2] / "third_party" / "tlx" / "tutorials" / "hstu_cross_attn"
+    monkeypatch.syspath_prepend(str(tutorial))
+    ref = importlib.reload(importlib.import_module("triton_bw_cross_attention"))
+    assert len(ref._attn_fwd_triton_spec.configs) > len(ref.HIP_FWD_CURATED)
+
+    def call(args):
+        ref.triton_bw_hstu_mha_wrapper(max_seq_len=args["max_seq_len"], alpha=args["alpha"], q=args["q"], k=args["k"],
+                                       v=args["v"], seq_offsets=args["seq_offsets"], attn_scale=args["attn_scale"],
+                                       max_q_len=args["max_q_len"], seq_offsets_q=args["seq_offsets_q"],
+                                       num_softmax_heads=args["num_softmax_heads"], num_targets=args["num_targets"],
+                                       shared_kv=args["shared_kv"], enable_tma=False)
+
+    _check_curated(monkeypatch, {"_attn_fwd_triton_spec": "ref_fwd"}, [ref._attn_fwd_triton_spec], call,
+                   ref._hip_fwd_config_key, lambda shape: ref.HIP_FWD_CURATED, "HIP_FWD_CURATED")

@@ -7,7 +7,9 @@ no vendor library for SiLU-scaled jagged attention, and the softmax shapes are
 jagged cross attention with independent q and KV offsets, so "faster than what
 production runs" is the comparison that matters.
 
-The reference autotunes its full space; TLX runs at whatever `--space` says.
+The reference autotunes its own default list (on HIP, eight curated configs;
+`HSTU_CROSS_ATTN_FULL_AUTOTUNE=1` for its full grid); TLX runs at whatever
+`--space` says.
 FLOPs count QK^T and PV over the actual (unpadded) lengths; backward is 2.5x.
 """
 
