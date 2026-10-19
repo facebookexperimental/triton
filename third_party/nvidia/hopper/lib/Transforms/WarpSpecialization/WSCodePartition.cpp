@@ -5986,15 +5986,63 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     unsigned targetBufferId;
     AsyncTaskId drainedStoreTask;
     Operation *firstStore;
+    int64_t stagingBufferId;
   };
-  SmallVector<StagingReuseInfo> stagingReuseInfos;
-  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+  // A staging reuse that Step 7.5 cannot guard must not be realized: drop it
+  // so the staging keeps its own SMEM (it may then not fit, which fails the
+  // compile instead of racing). Drop by buffer.id: all stagings of one
+  // buffer.id share one allocation (and Step 5 replaces the allocs), so the
+  // whole group keeps or loses the alias together.
+  auto dropStagingReuse = [&](int64_t stagingBufferId, StringRef reason) {
+    funcOp.walk([&](ttg::LocalAllocOp alloc) {
+      auto idAttr = alloc->getAttrOfType<IntegerAttr>("buffer.id");
+      if (!idAttr || idAttr.getInt() != stagingBufferId ||
+          !alloc->hasAttr("buffer.tmaStaging") ||
+          !alloc->hasAttr("allocation.reuseTarget"))
+        return;
+      alloc->emitWarning("[staging-reuse] ")
+          << reason << "; staging keeps its own region";
+      alloc->removeAttr("allocation.reuseTarget");
+    });
+  };
+  // mergeStagingReuseIntoHost only aliases a staging onto a host that is
+  // neither a TMA staging buffer nor itself a reuser; any other reuseTarget is
+  // dropped there and never shares SMEM. (Stagings that do share SMEM with
+  // each other do so through a common buffer.id reuse group, whose members are
+  // ordered by the group's intra-iteration and wrap-around acquires, not
+  // through allocation.reuseTarget.) Only realizable pairs need the Step 7.5
+  // cross-tile edge.
+  DenseSet<int64_t> reuseHostIds;
+  funcOp.walk([&](ttg::LocalAllocOp alloc) {
+    if (!alloc.isSharedMemoryAlloc() || alloc->hasAttr("buffer.tmaStaging") ||
+        alloc->hasAttr("allocation.reuseTarget"))
+      return;
+    if (auto attr = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
+      reuseHostIds.insert(attr.getInt());
+  });
+  // Stagings with one buffer.id share one allocation, which Step 5 gives the
+  // reuseTarget of one of them. So guard per group: if any member names a
+  // realizable host, every member's stores read that host's SMEM.
+  DenseMap<int64_t, int64_t> groupHostId;
+  funcOp.walk([&](ttg::LocalAllocOp alloc) {
     auto reuseAttr =
-        allocOp->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
+        alloc->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
+    auto bufferIdAttr = alloc->getAttrOfType<IntegerAttr>("buffer.id");
+    if (reuseAttr && bufferIdAttr && alloc->hasAttr("buffer.tmaStaging") &&
+        reuseHostIds.contains(reuseAttr.getInt()))
+      groupHostId.try_emplace(bufferIdAttr.getInt(), reuseAttr.getInt());
+  });
+  SmallVector<StagingReuseInfo> stagingReuseInfos;
+  DenseSet<int64_t> unguardableStagingIds;
+  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
     auto stagingAttr = allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
     auto bufferIdAttr = allocOp->getAttrOfType<IntegerAttr>("buffer.id");
-    if (!reuseAttr || !stagingAttr || !bufferIdAttr)
+    if (!stagingAttr || !bufferIdAttr)
       return;
+    auto hostIt = groupHostId.find(bufferIdAttr.getInt());
+    if (hostIt == groupHostId.end())
+      return;
+    int64_t hostId = hostIt->second;
     // Find the first local_store user and the task that launches the TMA store.
     Operation *firstStore = nullptr;
     SmallVector<AsyncTaskId> drainedStoreTasks;
@@ -6013,15 +6061,19 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
         !llvm::all_of(drainedStoreTasks, [&](AsyncTaskId task) {
           return task == drainedStoreTasks.front();
         })) {
-      LDBG("Step 4.5: staging alloc has reuseTarget="
-           << reuseAttr.getInt()
-           << " but does not have one local_store/drained-store task");
+      unguardableStagingIds.insert(bufferIdAttr.getInt());
       return;
     }
-    stagingReuseInfos.push_back(
-        {(unsigned)reuseAttr.getInt(), drainedStoreTasks.front(), firstStore});
+    stagingReuseInfos.push_back({(unsigned)hostId, drainedStoreTasks.front(),
+                                 firstStore, bufferIdAttr.getInt()});
     LDBG("Step 4.5: collected staging reuse: target buffer.id="
-         << reuseAttr.getInt() << " firstStore found");
+         << hostId << " firstStore found");
+  });
+  for (int64_t id : unguardableStagingIds)
+    dropStagingReuse(id, "cannot find one local_store and one drained-store "
+                         "task to guard the reuse");
+  llvm::erase_if(stagingReuseInfos, [&](const StagingReuseInfo &info) {
+    return unguardableStagingIds.contains(info.stagingBufferId);
   });
   LDBG("Step 4.5: collected " << stagingReuseInfos.size()
                               << " staging reuse entries");
@@ -6108,16 +6160,23 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     AsyncTaskId loadTask = -1;
     unsigned matched = 0;
     bool consistent = true;
+    SmallVector<int64_t> guardedStagings;
     for (auto &info : stagingReuseInfos) {
-      auto it = bufferIdToChannel.find(info.targetBufferId);
-      if (it == bufferIdToChannel.end() || !it->second->getSrcOp())
-        continue;
+      // A staging outside any persistent loop runs once, so there is no next
+      // tile to race with.
       LoopLikeOpInterface loop = getParentPersistentLoop(info.firstStore);
       if (!loop)
         continue;
-      auto lTaskIds = getAsyncTaskIds(it->second->getSrcOp());
-      if (lTaskIds.empty())
+      auto it = bufferIdToChannel.find(info.targetBufferId);
+      SmallVector<AsyncTaskId> lTaskIds;
+      if (it != bufferIdToChannel.end() && it->second->getSrcOp())
+        lTaskIds = getAsyncTaskIds(it->second->getSrcOp());
+      if (lTaskIds.empty()) {
+        dropStagingReuse(info.stagingBufferId,
+                         "cannot find the task that loads the host buffer");
         continue;
+      }
+      guardedStagings.push_back(info.stagingBufferId);
       AsyncTaskId storeTask = info.drainedStoreTask;
       AsyncTaskId lTask = lTaskIds.front();
       if (matched++ == 0) {
@@ -6131,13 +6190,21 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     }
 
     if (matched && !consistent) {
-      LDBG("Step 7.5: staging-reuse pairs span multiple outer loops / load / "
-           "drained-store tasks; cross-tile WAR barrier not inserted "
-           "(unhandled)");
+      // One coarse token cannot order pairs that span several loops or
+      // tasks; do not realize any of them rather than leave some unguarded.
+      for (int64_t stagingId : guardedStagings)
+        dropStagingReuse(stagingId,
+                         "reuse pairs span multiple outer loops / load / "
+                         "drained-store tasks, so no single cross-tile "
+                         "barrier can guard them");
     } else if (matched && outerLoop && loadTask == drainedStoreTask) {
-      LDBG("Step 7.5: load and drained store share task "
-           << loadTask << "; cross-tile WAR barrier not needed "
-           << "(same-partition staging)");
+      // Program order in one task does not order an async TMA store's SMEM
+      // reads before the next tile's TMA load, and the cross-partition token
+      // below needs two tasks.
+      for (int64_t stagingId : guardedStagings)
+        dropStagingReuse(stagingId, "the host is loaded by the task that "
+                                    "drains the staging, so no cross-tile "
+                                    "barrier can guard the reuse");
     } else if (matched && outerLoop && loadTask != drainedStoreTask) {
       MLIRContext *ctx = funcOp.getContext();
 
@@ -6148,10 +6215,82 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
       Value iterIdx = outerLoop.getSingleInductionVar().value_or(Value());
       if (auto whileOp = dyn_cast<scf::WhileOp>(outerLoop.getOperation()))
         iterIdx = getWhileIterationCounter(whileOp);
+      ttng::TMAStoreTokenWaitOp lastStoreWait;
+      bool releaseAtBottom = false;
       if (!outerBody || !iterIdx) {
-        LDBG("Step 7.5: could not derive persistent-loop iteration; "
-             "cross-tile WAR barrier not inserted (unhandled)");
+        for (int64_t stagingId : guardedStagings)
+          dropStagingReuse(stagingId,
+                           "cannot derive the persistent-loop iteration for "
+                           "the cross-tile barrier");
       } else {
+        // The release must come after the staging stores have finished
+        // reading SMEM. Store-wait pipelining can defer a store's wait into
+        // the next iteration, so a release at the bottom of the body could
+        // fire while the last TMA store still reads the aliased SMEM. Release
+        // on the wait of the last TMA store instead: it moves with that wait,
+        // and TMA stores drain in order, so all earlier stores have drained
+        // too. Only a wait directly in the body that follows every TMA store
+        // of the task qualifies (a nested wait could run conditionally or
+        // several times per tile).
+        auto isDrainedStoreTaskOp = [&](Operation *op) {
+          auto taskIds = getAsyncTaskIds(op);
+          return taskIds.size() == 1 && taskIds.front() == drainedStoreTask;
+        };
+        // A store nested in a region op (e.g. the collective scf.if of a
+        // CLC loop) is drained within that op when its wait is in the body
+        // too: pipelining only defers waits of top-level ops.
+        bool hasTopLevelStore = false;
+        bool nestedStoresWaitedInBody = true;
+        auto isWaitedInBody = [&](Operation *store) {
+          if (store->getNumResults() != 1)
+            return false;
+          return llvm::any_of(store->getResult(0).getUsers(),
+                              [&](Operation *u) {
+                                return isa<ttng::TMAStoreTokenWaitOp>(u) &&
+                                       outerBody->findAncestorOpInBlock(*u);
+                              });
+        };
+        for (Operation &op : *outerBody) {
+          if (auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op)) {
+            if (isDrainedStoreTaskOp(waitOp))
+              lastStoreWait = waitOp;
+            continue;
+          }
+          bool storeAfterWait = false;
+          op.walk([&](Operation *nested) {
+            if (!isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+                     tt::DescriptorStoreOp, tt::DescriptorReduceOp>(nested) ||
+                !isDrainedStoreTaskOp(nested))
+              return;
+            storeAfterWait = true;
+            if (nested == &op)
+              hasTopLevelStore = true;
+            else if (!isWaitedInBody(nested))
+              nestedStoresWaitedInBody = false;
+          });
+          if (storeAfterWait)
+            lastStoreWait = nullptr;
+        }
+        if (lastStoreWait) {
+          // Rotating the wait further would place the release after the next
+          // tile's staging waits, whose data depends on the loads this release
+          // gates; cap the wait's rotation at one iteration.
+          auto rotate = lastStoreWait->getAttrOfType<IntegerAttr>(
+              "can_rotate_by_buffer_count");
+          if (rotate && rotate.getInt() > 1)
+            lastStoreWait->setAttr("can_rotate_by_buffer_count",
+                                   IntegerAttr::get(rotate.getType(), 1));
+        }
+        releaseAtBottom =
+            !lastStoreWait && !hasTopLevelStore && nestedStoresWaitedInBody;
+        if (!lastStoreWait && !releaseAtBottom) {
+          for (int64_t stagingId : guardedStagings)
+            dropStagingReuse(stagingId,
+                             "no store wait in the persistent loop body can "
+                             "carry the cross-tile barrier release");
+        }
+      }
+      if (lastStoreWait || releaseAtBottom) {
         // Create the synthetic reuse token at function entry.
         OpBuilder entryB(funcOp);
         entryB.setInsertionPointToStart(&funcOp.getBody().front());
@@ -6197,17 +6336,22 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
             acqLoc, reuseToken, idxPhase.first, idxPhase.second,
             WSBarrierAttr::forDstTask(ctx, drainedStoreTask).build(ctx));
 
-        // consumer_release at the bottom of the drained-store task, after its
-        // TMA store waits have completed.
+        // Release on the chosen store wait (see above), which it moves with
+        // if store-wait pipelining defers it, or, when every store is nested
+        // and waited inside the body, at the bottom of the body.
         Operation *term = outerBody->getTerminator();
-        OpBuilderWithAsyncTaskIds relBuilder(term);
-        relBuilder.setInsertionPoint(term);
+        Operation *relPoint =
+            lastStoreWait ? lastStoreWait.getOperation() : term;
+        OpBuilderWithAsyncTaskIds relBuilder(relPoint);
         relBuilder.setAsynTaskIdsFromArray({drainedStoreTask});
         Value bufIdx = relBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-            term->getLoc(), 0, 32);
-        relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-            term->getLoc(), reuseToken, bufIdx,
-            WSBarrierAttr::forDstTask(ctx, loadTask).build(ctx));
+            relPoint->getLoc(), 0, 32);
+        if (lastStoreWait)
+          lastStoreWait.addToken(reuseToken, bufIdx);
+        else
+          relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+              term->getLoc(), reuseToken, bufIdx,
+              WSBarrierAttr::forDstTask(ctx, loadTask).build(ctx));
         LDBG("Step 7.5: inserted cross-tile staging-reuse WAR barrier (load "
              << loadTask << " -> drained store " << drainedStoreTask << ")");
       }
