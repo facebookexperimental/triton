@@ -318,7 +318,8 @@ def release_layout(x, relaxed: tl.constexpr = False, _semantic=None):
     return tl.tensor(handle, x.type)
 
 
-def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
+def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False,
+                                fp6Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     if isinstance(x.type.layout, tlx.shared_linear_layout_encoding):
         return _builder.create_require_layout(x.handle, x.type.layout.to_ir(_builder))
@@ -343,6 +344,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builde
         layout.numCTAOrder,
         layout.fp4Padded,
         layout.swizzled,
+        fp6Padded,
     )
     return _builder.create_require_layout(x.handle, layout_handle)
 
@@ -627,6 +629,10 @@ def async_dot_scaled(
     A_format : str
         Element format string for operand A: "e2m1" for packed FP4, "e2m3"
         and "e3m2" for packed FP6, or "e4m3" and "e5m2" for FP8.
+        FP6 in shared memory uses 16 packed values followed by four padding
+        bytes per 16-byte container. TMA inserts this padding when loading
+        dense global FP6; barrier byte counts exclude the padding. FP6 in
+        tensor memory uses one value in the low six bits of each byte.
 
     B_scale : tlx.buffered_tensor
         Scaling factors for operand B, same semantics as A_scale.
@@ -698,14 +704,16 @@ def async_dot_scaled(
     is_mixed_precision = A_format != B_format
     if A.type.storage == tlx.storage_kind.smem:
         A_fp4Padded = is_A_fp4 and is_mixed_precision
-        A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
+        A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded,
+                                               fp6Padded=A_format in ("e2m3", "e3m2"))
     else:
         assert a_is_tmem, "A must be in SMEM or TMEM"
         A_handle = require_tmem_layout(A, 1, a_cta_mode, _semantic.builder)
 
     # Require layout for B (always SMEM)
     B_fp4Padded = is_B_fp4 and is_mixed_precision
-    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded)
+    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded,
+                                           fp6Padded=B_format in ("e2m3", "e3m2"))
 
     # Handle scale tensors - can be in SMEM or TMEM (auto-detected from storage type)
     assert isinstance(A_scale, tlx.buffered_tensor), "A_scale must be a buffered tensor"

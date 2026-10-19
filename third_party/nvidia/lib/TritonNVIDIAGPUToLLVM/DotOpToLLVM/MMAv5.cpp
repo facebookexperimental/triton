@@ -6,6 +6,7 @@
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 
 #include <array>
 
@@ -621,11 +622,13 @@ LogicalResult convertDotImpl(
   std::unique_ptr<DotOpMmaMemLoader> aLoader;
   bool transA = false;
   auto isFp4a = op.numBitsPerElementA == 4;
-  auto isFp6a = op.numBitsPerElementA == 6;
+  auto isFp6a = op.numBitsPerElementA == 6 && op.mmaSizeK == 64;
   if (aInTmem) {
-    aLoader =
-        std::make_unique<DotOpMmaV5TmemLoader>(DotOpMmaV5TmemLoader::build(
-            loc, rewriter, aTensorTy, baseA, op.numBitsPerElementA));
+    aLoader = std::make_unique<DotOpMmaV5TmemLoader>(
+        DotOpMmaV5TmemLoader::build(loc, rewriter, aTensorTy, baseA,
+                                    op.numBitsPerElementA == 6 && mmaSizeK == 32
+                                        ? 8
+                                        : op.numBitsPerElementA));
   } else {
     auto loader = DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
                                             aOperandShape, 0, 5, lessRegMMA,
@@ -641,7 +644,7 @@ LogicalResult convertDotImpl(
   }
 
   auto isFp4b = op.numBitsPerElementB == 4;
-  auto isFp6b = op.numBitsPerElementB == 6;
+  auto isFp6b = op.numBitsPerElementB == 6 && op.mmaSizeK == 64;
   auto bLoader =
       DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB, bOperandShape,
                                 1, 5, lessRegMMA, isFp4b, std::nullopt, isFp6b);
@@ -930,6 +933,9 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
 
   dot.numBitsPerElementA = getFormatBitSize(op.getAType());
   dot.numBitsPerElementB = getFormatBitSize(op.getBType());
+  if (ttng::isFp6Padded(aTensorTy.getEncoding()) ||
+      ttng::isFp6Padded(bTensorTy.getEncoding()))
+    dot.mmaSizeK = 32;
 
   TritonLLVMOpBuilder tb(loc, rewriter);
   Value baseScaleA = tb.ptrtoint(i32_ty, adaptor.getAScale());

@@ -259,7 +259,8 @@ py::object layoutToGluon(Attribute layout, bool isRubin = false) {
     return layouts.NVMMASharedLayout(nvmma.getSwizzlingByteWidth(),
                                      nvmma.getElementBitWidth(),
                                      cgaLayout.getRank(), nvmma.getTransposed(),
-                                     nvmma.getFp4Padded(), cgaBases);
+                                     nvmma.getFp4Padded(), cgaBases,
+                                     nvmma.getFp6Padded());
   } else if (auto swizzled =
                  dyn_cast<ttg::SwizzledSharedEncodingAttr>(layout)) {
     auto cgaBases = getCgaLayoutBases(swizzled.getCGALayout());
@@ -564,12 +565,12 @@ void init_gluon_ir(py::module_ &m) {
            [](GluonOpBuilder &self, unsigned swizzleByteWidth,
               unsigned elementBitwidth, bool transposed, bool fp4Padded,
               std::vector<std::vector<int32_t>> &cgaBases,
-              unsigned rank) -> Attribute {
+              unsigned rank, bool fp6Padded) -> Attribute {
              auto ctx = self.getContext();
              auto cgaLayout = buildCgaLayoutAttr(ctx, cgaBases, rank);
              return self.getChecked<ttg::NVMMASharedEncodingAttr>(
                  ctx, swizzleByteWidth, transposed, elementBitwidth, fp4Padded,
-                 cgaLayout, /*fp6Padded=*/false);
+                 cgaLayout, fp6Padded);
            })
       .def("get_auto_layout",
            [](GluonOpBuilder &self) -> Attribute {
@@ -1082,8 +1083,8 @@ void init_gluon_ir(py::module_ &m) {
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
              self.create<ttng::TCGen5MMAScaledOp>(
                  tokType, a, b, acc, accDep, aScale, bScale, aType, bType,
-                 useAcc, pred, mbarriers, mbarrier_preds, two_ctas,
-                 /*isAsync=*/false, multicast);
+                 useAcc, pred, two_ctas, mbarriers, mbarrier_preds,
+                 /*isAsync=*/!mbarriers.empty(), multicast);
            })
       .def("create_tcgen05_commit",
            [](GluonOpBuilder &self, Value &barrier, Value &pred,
