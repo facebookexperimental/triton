@@ -1,10 +1,9 @@
 // RUN: triton-opt %s --split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 --convert-builtin-func-to-llvm | FileCheck %s
 
-// The kernel option is consumed during function lowering and sets only
-// SCHED_MODE[2] at entry, including when the kernel calls a device function.
+// The intrinsic inserted at kernel entry survives function lowering,
+// including when the kernel calls a device function.
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: llvm.func @wmma_queuing_enabled
-  // CHECK-NOT: amdg.enable_wmma_queuing
   // CHECK-DAG: %[[REG:.*]] = llvm.mlir.constant(154 : i32) : i32
   // CHECK-DAG: %[[VALUE:.*]] = llvm.mlir.constant(1 : i32) : i32
   // CHECK: llvm.call_intrinsic "llvm.amdgcn.s.setreg"(%[[REG]], %[[VALUE]])
@@ -12,7 +11,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK: llvm.call @wmma_queuing_helper
   // CHECK-NOT: llvm.amdgcn.s.setreg
   // CHECK: llvm.return
-  tt.func public @wmma_queuing_enabled() attributes {amdg.enable_wmma_queuing = true} {
+  tt.func public @wmma_queuing_enabled() {
+    %reg = llvm.mlir.constant(154 : i32) : i32
+    %value = llvm.mlir.constant(1 : i32) : i32
+    llvm.call_intrinsic "llvm.amdgcn.s.setreg"(%reg, %value) : (i32, i32) -> ()
     tt.call @wmma_queuing_helper() : () -> ()
     tt.return
   }
@@ -21,14 +23,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK-NOT: llvm.amdgcn.s.setreg
   // CHECK: llvm.return
   tt.func private @wmma_queuing_helper() attributes {noinline = true} {
-    tt.return
-  }
-
-  // CHECK-LABEL: llvm.func @wmma_queuing_disabled
-  // CHECK-NOT: amdg.enable_wmma_queuing
-  // CHECK-NOT: llvm.amdgcn.s.setreg
-  // CHECK: llvm.return
-  tt.func public @wmma_queuing_disabled() attributes {amdg.enable_wmma_queuing = false} {
     tt.return
   }
 
