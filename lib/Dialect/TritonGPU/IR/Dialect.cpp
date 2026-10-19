@@ -2605,6 +2605,7 @@ Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
   unsigned swizzlingByteWidth;
   bool transposed = false;
   bool fp4Padded = false;
+  bool fp6Padded = false;
   unsigned elementBitWidth;
   unsigned layoutRank;
   bool hasExplicitRank = false;
@@ -2622,6 +2623,9 @@ Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
         return {};
     } else if (attr.getName() == "fp4Padded") {
       if (parseBool(parser, attr, fp4Padded, "fp4Padded").failed())
+        return {};
+    } else if (attr.getName() == "fp6Padded") {
+      if (parseBool(parser, attr, fp6Padded, "fp6Padded").failed())
         return {};
     } else if (attr.getName() == "CGALayout") {
       cgaAttr = attr.getValue();
@@ -2658,7 +2662,7 @@ Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
 
   return parser.getChecked<NVMMASharedEncodingAttr>(
       parser.getContext(), swizzlingByteWidth, transposed, elementBitWidth,
-      fp4Padded, *CGALayout);
+      fp4Padded, *CGALayout, fp6Padded);
 }
 
 void NVMMASharedEncodingAttr::print(AsmPrinter &printer) const {
@@ -2670,6 +2674,8 @@ void NVMMASharedEncodingAttr::print(AsmPrinter &printer) const {
     // Print only in this case to reduce the noise for the more common case.
     printer << ", fp4Padded = true";
   }
+  if (getFp6Padded())
+    printer << ", fp6Padded = true";
   unsigned rank = getCGALayout().getCTAOrder().size();
   auto *ctx = getContext();
   auto defaultLayout = CGAEncodingAttr::get1CTALayout(ctx, rank);
@@ -2685,7 +2691,10 @@ LogicalResult
 NVMMASharedEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                                 unsigned swizzlingByteWidth, bool transposed,
                                 unsigned elementBitWidth, bool fp4Padded,
-                                CGAEncodingAttr CGALayout) {
+                                CGAEncodingAttr CGALayout, bool fp6Padded) {
+  if (fp6Padded && (fp4Padded || elementBitWidth != 8))
+    return emitError()
+           << "fp6Padded requires 8-bit storage and excludes fp4Padded";
   if (elementBitWidth == 0)
     return emitError() << "elementBitWidth must be non-zero";
   if (!llvm::is_contained({0, 32, 64, 128}, swizzlingByteWidth))
@@ -3203,7 +3212,8 @@ struct TritonGPUInferLayoutInterface
         CGAEncodingAttr cgaLayout = permuteCGALayout(enc.getCGALayout(), order);
         resultEncoding = NVMMASharedEncodingAttr::get(
             ctx, enc.getSwizzlingByteWidth(), !enc.getTransposed(),
-            enc.getElementBitWidth(), enc.getFp4Padded(), cgaLayout);
+            enc.getElementBitWidth(), enc.getFp4Padded(), cgaLayout,
+            enc.getFp6Padded());
         return success();
       }
     }
