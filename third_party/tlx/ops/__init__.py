@@ -34,8 +34,9 @@ Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
 hstu_cross_attn, kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can follow
-`mm`. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
-configs are measurably faster; pass `space="heuristic"` for a fast first call.
+`mm`. `mm_mxfp8` and `mm_mxfp6` have heuristics but default to "full" because
+their tuned configs are measurably faster; pass `space="heuristic"` for a fast
+first call.
 
 An op with no implementation for the current GPU raises `UnsupportedOp` -- it
 never falls back to torch. A forward-only implementation raises
@@ -58,7 +59,7 @@ from torch.compiler import assume_constant_result
 from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_backward, check_inputs, impl_for
 
 __all__ = [
-    "mm", "mm_bias_grad", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
+    "mm", "mm_bias_grad", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
     "flash_attn_varlen", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
     "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
     "UnsupportedBackward", "InvalidInput"
@@ -209,6 +210,88 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
         raise InvalidInput(f"tlx.ops.mm_mxfp8 does not provide space={space!r}")
 
     fn, spec = impl_for("mm_mxfp8", device=a.device)
+    tma_tensors = tensors if out is None else (*tensors, out)
+    check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
+    check_backward(spec, *tensors, out)
+    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space)
+
+
+def _check_mm_mxfp6_scales(a_scale, b_scale, *, M, N, K, sf_layout):
+    if sf_layout == "natural":
+        expected_a, expected_b = (M, K // 32), (N, K // 32)
+        if a_scale.shape != expected_a or b_scale.shape != expected_b:
+            raise InvalidInput("tlx.ops.mm_mxfp6 natural scales must have exact shapes "
+                               f"a_scale={expected_a}, b_scale={expected_b}; got "
+                               f"a_scale={tuple(a_scale.shape)}, b_scale={tuple(b_scale.shape)}")
+        return
+    if sf_layout != "cublas_blocked":
+        raise InvalidInput("tlx.ops.mm_mxfp6 sf_layout must be 'natural' or 'cublas_blocked'; "
+                           f"got {sf_layout!r}")
+    # M, N and K are 128-aligned, so the 128x4 atoms need no padding.
+    if a_scale.numel() != M * K // 32 or b_scale.numel() != N * K // 32:
+        raise InvalidInput("tlx.ops.mm_mxfp6 cublas_blocked scales must contain exactly "
+                           f"{M * K // 32} a-scale and {N * K // 32} b-scale bytes; "
+                           f"got {a_scale.numel()} and {b_scale.numel()}")
+
+
+def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+    """``a @ b.T`` over pre-quantized MXFP6 inputs, returning BF16 ``[M, N]``.
+
+    ``a`` is contiguous dense-packed E2M3 ``[M, K]`` and ``b`` is contiguous
+    dense-packed E3M2 ``[N, K]`` (K-major, as for a linear weight), both uint8
+    with 4 codes per 3 bytes LSB-first and the K dim padded to the unpacked
+    width; M, N and K must be multiples of 128. Each run of 32 values along K
+    has one E8M0 scale. ``sf_layout="natural"`` takes ``[M, K // 32]`` and
+    ``[N, K // 32]`` scales; ``"cublas_blocked"`` takes the swizzled byte
+    layout returned by torchao's ``MXTensor.to_mx(..., is_swizzled_scales=True)``.
+    Quantize with torchao (``elem_dtype="fp6_e2m3"`` / ``"fp6_e3m2"``), shift
+    its unpacked codes down (``qdata >> 2``), and dense-pack. A supplied
+    ``out`` is returned by identity. Forward-only.
+
+    ``space`` defaults to "full" (autotune; the first call per shape compiles
+    and benchmarks the pruned space). "heuristic" launches one shape-picked
+    config without autotuning.
+    """
+    import torch
+
+    tensors = (a, a_scale, b, b_scale)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects tensor inputs")
+    if a.ndim != 2 or b.ndim != 2:
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects rank-2 a and b; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    M, K = a.shape
+    N, b_k = b.shape
+    if b_k != K:
+        raise InvalidInput("tlx.ops.mm_mxfp6 reduction dimensions must match; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    if min(M, N, K) <= 0 or M % 128 or N % 128 or K % 128:
+        raise InvalidInput("tlx.ops.mm_mxfp6 requires positive M, N and K divisible by 128; "
+                           f"got M={M}, N={N}, K={K}")
+    if a.dtype != torch.uint8 or b.dtype != torch.uint8:
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects dense-packed uint8 a and b; "
+                           f"got a.dtype={a.dtype}, b.dtype={b.dtype}")
+    if a_scale.dtype != torch.float8_e8m0fnu or b_scale.dtype != torch.float8_e8m0fnu:
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects E8M0 a_scale and b_scale; "
+                           f"got a_scale.dtype={a_scale.dtype}, b_scale.dtype={b_scale.dtype}")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects all inputs to be contiguous")
+    if a.device.type != "cuda" or any(tensor.device != a.device for tensor in tensors[1:]):
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects all inputs on the same CUDA device; "
+                           f"got {[tensor.device for tensor in tensors]}")
+    _check_mm_mxfp6_scales(a_scale, b_scale, M=M, N=N, K=K, sf_layout=sf_layout)
+    if out is not None:
+        if not isinstance(out, torch.Tensor):
+            raise InvalidInput("tlx.ops.mm_mxfp6 expects out to be a tensor or None")
+        if out.shape != (M, N) or out.dtype != torch.bfloat16 or out.device != a.device or not out.is_contiguous():
+            raise InvalidInput("tlx.ops.mm_mxfp6 out must be contiguous BF16 [M, N] on a's device; "
+                               f"got shape={tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
+        if any(torch._C._overlaps(out, tensor) for tensor in tensors):
+            raise InvalidInput("tlx.ops.mm_mxfp6 out must not overlap any input")
+    if space not in ("heuristic", "full"):
+        raise InvalidInput(f"tlx.ops.mm_mxfp6 does not provide space={space!r}")
+
+    fn, spec = impl_for("mm_mxfp6", device=a.device)
     tma_tensors = tensors if out is None else (*tensors, out)
     check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
     check_backward(spec, *tensors, out)

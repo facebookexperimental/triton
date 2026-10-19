@@ -1761,8 +1761,8 @@ class TritonSemantic(Generic[TensorTy]):
         triton_ty = {"e5m2": tl.float8e5, "e4m3": tl.float8e4nv, "bf16": tl.bfloat16, "fp16":
                      tl.float16}.get(float_format)
         if triton_ty is None:
-            assert float_format == "e2m1", f"Internal Error: Unexpected float format: {float_format}"
-            assert val.dtype == tl.uint8, f"e2m1 format must be packed as uint8. Got {val.dtype}"
+            assert float_format in ("e2m1", "e2m3", "e3m2"), f"Internal Error: Unexpected float format: {float_format}"
+            assert val.dtype == tl.uint8, f"{float_format} format must be packed as uint8. Got {val.dtype}"
             return val
         if val.dtype == triton_ty:
             return val
@@ -1808,7 +1808,7 @@ class TritonSemantic(Generic[TensorTy]):
         assert lhs_rank == rhs_rank == 2 or lhs_rank == rhs_rank == 3, f"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})"
         lhs_format_enum = self._str_to_fp_type(lhs_format)
         rhs_format_enum = self._str_to_fp_type(rhs_format)
-        allowed_formats = {"e2m1", "e4m3", "e5m2", "bf16", "fp16"}
+        allowed_formats = {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2", "bf16", "fp16"}
         assert lhs_format in allowed_formats, f"NYI: lhs_format {lhs_format}"
         assert rhs_format in allowed_formats, f"NYI: rhs_format {rhs_format}"
         rhs_scale_is_none = rhs_scale is None or (isinstance(rhs_scale, tl.constexpr) and rhs_scale.value is None)
@@ -1818,12 +1818,25 @@ class TritonSemantic(Generic[TensorTy]):
 
         assert lhs_k_pack or lhs_format == "e2m1", "only mxfp4 inputs can be packed along a dimension different than K"
         assert rhs_k_pack or rhs_format == "e2m1", "only mxfp4 inputs can be packed along a dimension different than K"
+
+        # Logical elements per packed storage dim: fp4 stores 2 values per
+        # uint8; fp6 stores 4 values per 3 bytes (dense LSB-first packing)
+        # and pads the K dim to the unpacked width.
+        def _unpacked_dim(packed_dim, fmt):
+            if fmt == "e2m1":
+                return packed_dim * 2
+            if fmt in ("e2m3", "e3m2"):
+                assert packed_dim % 4 == 0, \
+                    f"padded dim {packed_dim} must be a multiple of 4 for {fmt} (4 values per 3 bytes plus padding)"
+                return packed_dim
+            return packed_dim
+
         M, K_LHS = lhs.type.shape[-2:]
         K_RHS, N = rhs.type.shape[-2:]
         PACKED_A = 2 if lhs_format == "e2m1" else 1
         PACKED_B = 2 if rhs_format == "e2m1" else 1
-        PACKED_A_DIM = PACKED_A * K_LHS if lhs_k_pack else K_LHS
-        PACKED_B_DIM = PACKED_B * K_RHS if rhs_k_pack else K_RHS
+        PACKED_A_DIM = _unpacked_dim(K_LHS, lhs_format) if lhs_k_pack else K_LHS
+        PACKED_B_DIM = _unpacked_dim(K_RHS, rhs_format) if rhs_k_pack else K_RHS
         assert PACKED_B_DIM == PACKED_A_DIM, (
             f"Reduction dimension should pack the same number of elements; (lhs: {lhs.shape} vs rhs: {rhs.shape})")
         # assert K * PACKED_B >= 64, f"scaled_dot NYI for K < 64. Got {K=}"
@@ -1832,7 +1845,7 @@ class TritonSemantic(Generic[TensorTy]):
         if not lhs_k_pack:
             M = M * PACKED_A
         else:
-            K = K * PACKED_A
+            K = _unpacked_dim(K, lhs_format)
         if not rhs_k_pack:
             N = N * PACKED_B
         ret_ty = tl.block_type(out_dtype, [B, M, N] if B else [M, N])
