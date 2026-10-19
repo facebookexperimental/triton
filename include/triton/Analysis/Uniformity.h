@@ -21,8 +21,13 @@ namespace mlir::triton {
 /// is performed. Recompute after modifying the analyzed function.
 class UniformityAnalysis {
 public:
-  enum class Rule { Uniform, FromOperands, Unknown };
+  enum class Rule { Uniform, ThreadId, FromOperands, Unknown };
   struct Options {
+    /// The X workitem coordinate is the linear thread ID, with subgroup-aligned
+    /// boundaries (e.g. a one-dimensional workgroup). Required to seed GPU and
+    /// ROCDL X thread IDs. The subgroup size comes from the enclosing module's
+    /// ttg.threads-per-warp attribute; missing/invalid sizes disable the seeds.
+    bool linearThreadIdX = false;
     /// Function arguments are unknown unless explicitly classified by the
     /// caller. In particular, ordinary device-function arguments are not kernel
     /// arguments. Invoked on the original entry arguments.
@@ -30,10 +35,12 @@ public:
     /// Optional model for ordinary operations and external calls, invoked on
     /// the original operations. Control-flow transfers are modeled separately.
     /// Uniform overrides operand divergence (e.g. subgroup broadcast).
+    /// ThreadId seeds the low-bit bound using the subgroup size from the IR.
     std::function<std::optional<Rule>(Operation *, unsigned)> getRule;
   };
 
-  explicit UniformityAnalysis(Operation *function, Options options = {});
+  explicit UniformityAnalysis(Operation *function);
+  UniformityAnalysis(Operation *function, Options options);
   ~UniformityAnalysis();
   UniformityAnalysis(const UniformityAnalysis &) = delete;
   UniformityAnalysis &operator=(const UniformityAnalysis &) = delete;

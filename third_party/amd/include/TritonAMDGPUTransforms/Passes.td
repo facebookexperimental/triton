@@ -13,8 +13,6 @@ def TritonAMDGPUAutomaticWaveSpecialization
   }];
   let dependentDialects = ["mlir::LLVM::LLVMDialect", "mlir::ROCDL::ROCDLDialect"];
   let options = [
-    Option<"waveSize", "wave-size", "unsigned", "64",
-           "Target wave size (32 or 64) for workitem ID inference">,
     Option<"maxExtraOps", "max-extra-ops", "unsigned", "65536",
            "Maximum estimated additional operations from body versioning">
   ];

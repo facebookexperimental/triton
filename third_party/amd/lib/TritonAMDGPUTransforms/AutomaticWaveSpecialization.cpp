@@ -1,4 +1,7 @@
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
+#include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
+#include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -7,10 +10,15 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/CSE.h"
+#include "triton/Analysis/IntegerRange.h"
 #include "triton/Analysis/Uniformity.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "tritonamdgpu-automatic-wave-specialization"
 
@@ -21,31 +29,168 @@ namespace mlir {
 namespace {
 constexpr StringLiteral specializedAttr = "tritonamdgpu.wave_specialized";
 
-// AMD kernels use a one-dimensional workgroup. Clearing low lane bits and
-// dividing/shifting by the configured wave size removes lane dependence.
-bool isWaveId(Operation *op, unsigned waveSize) {
-  if (!isa<LLVM::UDivOp, LLVM::LShrOp>(op))
+// Triton's kernel ABI uses a linear X workitem coordinate. Explicit warp
+// specialization can allocate more waves than the default partition, so use
+// the physical total when present. Do not infer bounds from absent metadata.
+void attachIDBounds(LLVM::LLVMFuncOp function) {
+  auto module = function->getParentOfType<ModuleOp>();
+  if (!module)
+    return;
+  auto warps = module->getAttrOfType<IntegerAttr>("ttg.total-num-warps");
+  if (!warps)
+    warps = module->getAttrOfType<IntegerAttr>(triton::gpu::AttrNumWarpsName);
+  auto size =
+      module->getAttrOfType<IntegerAttr>(triton::gpu::AttrNumThreadsPerWarp);
+  if (!warps || warps.getValue().getActiveBits() > 31 || warps.getInt() <= 0)
+    return;
+  uint64_t numWarps = warps.getInt();
+  auto attach = [&](auto id, uint64_t bound) {
+    if (!id.getRangeAttr())
+      id.setRangeAttr(
+          LLVM::ConstantRangeAttr::get(function.getContext(), 32, 0, bound));
+  };
+  function.walk([&](ROCDL::WaveId id) { attach(id, numWarps); });
+  if (!size || size.getValue().getActiveBits() > 31 || size.getInt() <= 0 ||
+      !size.getValue().isPowerOf2() || numWarps * size.getInt() > UINT32_MAX)
+    return;
+  function.walk(
+      [&](ROCDL::ThreadIdXOp id) { attach(id, numWarps * size.getInt()); });
+}
+
+std::optional<APInt> integerConstant(Value value) {
+  IntegerAttr attr;
+  if (auto type = dyn_cast<IntegerType>(value.getType());
+      type && matchPattern(value, m_Constant(&attr)))
+    return attr.getValue().sextOrTrunc(type.getWidth());
+  return std::nullopt;
+}
+
+// Normalize a scalar bit test to (input & mask) == 0, with optional negation.
+// Range analysis proves when a lookup in a low-ones bit mask is the same test
+// on a bit of the index. The algebra lives here, not in lowering patterns or a
+// new dataflow lattice.
+bool normalizeBitTest(LLVM::ICmpOp cmp, DataFlowSolver &solver,
+                      IRRewriter &rewriter) {
+  if (!cmp.getType().isInteger(1) ||
+      (cmp.getPredicate() != LLVM::ICmpPredicate::eq &&
+       cmp.getPredicate() != LLVM::ICmpPredicate::ne))
     return false;
-  APInt amount;
-  if (!matchPattern(op->getOperand(1), m_ConstantInt(&amount)))
-    return false;
-  unsigned shift = llvm::Log2_32(waveSize);
-  if ((isa<LLVM::UDivOp>(op) && amount != waveSize) ||
-      (isa<LLVM::LShrOp>(op) && amount != shift))
-    return false;
-  Value thread = op->getOperand(0);
-  if (auto mask = thread.getDefiningOp<LLVM::AndOp>()) {
-    APInt bits;
-    if (!matchPattern(mask.getRhs(), m_ConstantInt(&bits)))
-      return false;
-    thread = mask.getLhs();
+  Value tested = cmp.getLhs();
+  auto rhs = integerConstant(cmp.getRhs());
+  if (!rhs) {
+    rhs = integerConstant(tested);
+    tested = cmp.getRhs();
   }
-  return isa_and_nonnull<ROCDL::ThreadIdXOp>(thread.getDefiningOp());
+  if (!rhs)
+    return false;
+  auto bitAnd = tested.getDefiningOp<LLVM::AndOp>();
+  if (!bitAnd)
+    return false;
+  Value input = bitAnd.getLhs();
+  auto mask = integerConstant(bitAnd.getRhs());
+  if (!mask) {
+    mask = integerConstant(input);
+    input = bitAnd.getRhs();
+  }
+  if (!mask || !mask->isPowerOf2() || (!rhs->isZero() && *rhs != *mask))
+    return false;
+  bool negate =
+      (cmp.getPredicate() == LLVM::ICmpPredicate::ne) ^ !rhs->isZero();
+  bool changed =
+      !rhs->isZero() || cmp.getPredicate() == LLVM::ICmpPredicate::ne;
+  if (auto shift = input.getDefiningOp<LLVM::LShrOp>();
+      shift && mask->isOne()) {
+    auto table = integerConstant(shift.getLhs());
+    unsigned ones = table ? table->countr_one() : 0;
+    auto *range =
+        solver.lookupState<dataflow::IntegerValueRangeLattice>(shift.getRhs());
+    if (table && table->isMask() && llvm::isPowerOf2_32(ones) && range &&
+        !range->getValue().isUninitialized()) {
+      const APInt &max = range->getValue().getValue().umax();
+      // Both bounds matter: out-of-width LLVM shifts produce poison, and
+      // index 4 is already a counterexample for the table 0b0011.
+      if (max.ult(table->getBitWidth()) && max.ult(2 * ones)) {
+        input = shift.getRhs();
+        mask = APInt(mask->getBitWidth(), ones);
+        negate = !negate;
+        changed = true;
+      }
+    }
+  }
+  if (auto xored = input.getDefiningOp<LLVM::XOrOp>()) {
+    Value base = xored.getLhs();
+    auto bits = integerConstant(xored.getRhs());
+    if (!bits) {
+      bits = integerConstant(base);
+      base = xored.getRhs();
+    }
+    if (bits) {
+      negate ^= !(*bits & *mask).isZero();
+      input = base;
+      changed = true;
+    }
+  }
+  if (!changed)
+    return false;
+  rewriter.setInsertionPoint(cmp);
+  auto loc = cmp.getLoc();
+  Value maskValue =
+      LLVM::ConstantOp::create(rewriter, loc, input.getType(),
+                               rewriter.getIntegerAttr(input.getType(), *mask));
+  Value zero = LLVM::ConstantOp::create(rewriter, loc, input.getType(),
+                                        rewriter.getZeroAttr(input.getType()));
+  Value bit = LLVM::AndOp::create(rewriter, loc, input, maskValue);
+  Value result =
+      LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::eq, bit, zero);
+  if (negate) {
+    Value one = LLVM::ConstantOp::create(rewriter, loc, rewriter.getI1Type(),
+                                         rewriter.getBoolAttr(true));
+    result = LLVM::XOrOp::create(rewriter, loc, result, one);
+  }
+  // Keep analysis anchors alive until all range queries have finished.
+  rewriter.replaceAllUsesWith(cmp.getResult(), result);
+  return true;
+}
+
+LogicalResult canonicalizePredicates(LLVM::LLVMFuncOp function) {
+  attachIDBounds(function);
+  IRRewriter rewriter(function.getContext());
+  {
+    DataFlowSolver solver{DataFlowConfig().setInterprocedural(false)};
+    solver.load<dataflow::DeadCodeAnalysis>();
+    solver.load<dataflow::SparseConstantPropagation>();
+    solver.load<dataflow::IntegerRangeAnalysis>();
+    if (failed(solver.initializeAndRun(function)))
+      return failure();
+    SmallVector<LLVM::ICmpOp> comparisons;
+    function.walk([&](LLVM::ICmpOp cmp) { comparisons.push_back(cmp); });
+    for (auto cmp : comparisons) {
+      if (cmp.getResult().use_empty() || !cmp.getType().isInteger(1))
+        continue;
+      auto *range = solver.lookupState<dataflow::IntegerValueRangeLattice>(
+          cmp.getResult());
+      if (range && !range->getValue().isUninitialized()) {
+        if (auto value = range->getValue().getValue().getConstantValue()) {
+          rewriter.setInsertionPoint(cmp);
+          Value constant = LLVM::ConstantOp::create(
+              rewriter, cmp.getLoc(), cmp.getType(),
+              rewriter.getIntegerAttr(cmp.getType(), *value));
+          rewriter.replaceAllUsesWith(cmp.getResult(), constant);
+          continue;
+        }
+      }
+      normalizeBitTest(cmp, solver, rewriter);
+    }
+  }
+  DominanceInfo dominance(function);
+  eliminateCommonSubExpressions(rewriter, dominance, function);
+  return success();
 }
 
 struct Plan {
   Value predicate;
-  SmallVector<Value> equivalents;
+  // The bool records whether this equivalent definition is complemented.
+  SmallVector<std::pair<Value, bool>> equivalents;
   SmallVector<Operation *> prefix;
   unsigned score = 0;
 };
@@ -89,7 +234,7 @@ std::optional<Plan> planFor(Value predicate, Block &entry, unsigned bodySize,
 
   Plan plan;
   plan.predicate = predicate;
-  plan.equivalents.push_back(predicate);
+  plan.equivalents.emplace_back(predicate, false);
   bool crossedRetained = false;
   for (Operation &op : entry) {
     if (!slice.contains(&op)) {
@@ -119,9 +264,9 @@ std::optional<Plan> planFor(Value predicate, Block &entry, unsigned bodySize,
       return a->isBeforeInBlock(b);
     return dominance.dominates(a->getBlock(), b->getBlock());
   });
-  // One extra body, two constants, entry/leaf/exit branches, common return,
-  // and four operations to normalize the dispatch predicate.
-  if (bodySize - plan.prefix.size() + 11 > maxExtraOps) {
+  // One extra body, up to four constants (including complements),
+  // entry/leaf/exit branches, common return, and four dispatch operations.
+  if (bodySize - plan.prefix.size() + 13 > maxExtraOps) {
     LLVM_DEBUG(llvm::dbgs()
                << "Code-growth limit rejects " << predicate << "\n");
     return std::nullopt;
@@ -159,6 +304,20 @@ bool equivalent(Value lhs, Value rhs) {
       l.getOwner(), r.getOwner(),
       [](Value a, Value b) { return success(equivalent(a, b)); }, nullptr,
       OperationEquivalence::IgnoreLocations);
+}
+
+std::pair<Value, bool> stripNegation(Value value) {
+  bool negate = false;
+  while (auto op = value.getDefiningOp<LLVM::XOrOp>()) {
+    if (auto rhs = integerConstant(op.getRhs()); rhs && rhs->isOne())
+      value = op.getLhs();
+    else if (auto lhs = integerConstant(op.getLhs()); lhs && lhs->isOne())
+      value = op.getRhs();
+    else
+      break;
+    negate = !negate;
+  }
+  return {value, negate};
 }
 
 void specialize(LLVM::LLVMFuncOp function, const Plan &plan) {
@@ -200,17 +359,22 @@ void specialize(LLVM::LLVMFuncOp function, const Plan &plan) {
     builder.setInsertionPointToEnd(leaf);
     Value constant = LLVM::ConstantOp::create(
         builder, loc, builder.getI1Type(), builder.getBoolAttr(version == 0));
+    Value complement;
+    if (llvm::any_of(plan.equivalents, [](auto entry) { return entry.second; }))
+      complement = LLVM::ConstantOp::create(builder, loc, builder.getI1Type(),
+                                            builder.getBoolAttr(version != 0));
     IRMapping mapping;
-    mapping.map(plan.predicate, constant);
+    for (auto [predicate, negate] : plan.equivalents)
+      mapping.map(predicate, negate ? complement : constant);
     // Region::cloneInto creates all blocks and remaps forward edges, backedges,
     // arguments and SSA references, independent of source block layout.
     original.cloneInto(&body, exit->getIterator(), mapping);
     // cloneInto creates new results for equivalent definitions retained in
     // the body. Substitute those results after cloning has installed its map.
-    for (Value predicate : plan.equivalents)
+    for (auto [predicate, negate] : plan.equivalents)
       if (Value cloned = mapping.lookupOrNull(predicate);
-          cloned && cloned != constant)
-        cloned.replaceAllUsesWith(constant);
+          cloned && cloned != (negate ? complement : constant))
+        cloned.replaceAllUsesWith(negate ? complement : constant);
     LLVM::BrOp::create(builder, loc, ValueRange{},
                        mapping.lookup(&original.front()));
     for (Block &block : original) {
@@ -232,11 +396,12 @@ struct AutomaticWaveSpecialization
           AutomaticWaveSpecialization> {
   using Base::Base;
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    Base::getDependentDialects(registry);
+    triton::registerIntegerRangeExternalModels(registry);
+  }
+
   void runOnOperation() override {
-    if (waveSize != 32 && waveSize != 64) {
-      getOperation().emitError("wave-size must be 32 or 64");
-      return signalPassFailure();
-    }
     SmallVector<LLVM::LLVMFuncOp> functions;
     getOperation().walk(
         [&](LLVM::LLVMFuncOp function) { functions.push_back(function); });
@@ -249,11 +414,9 @@ struct AutomaticWaveSpecialization
               function.getFunctionType().getReturnType()) ||
           function->hasAttr(specializedAttr))
         continue;
-      unsigned bodySize = 0;
       bool supported = true;
       for (Block &block : function.getBody())
         for (Operation &op : block) {
-          ++bodySize;
           supported &= !op.getNumRegions();
           if (op.hasTrait<OpTrait::IsTerminator>())
             supported &= isa<LLVM::BrOp, LLVM::CondBrOp, LLVM::SwitchOp,
@@ -264,15 +427,16 @@ struct AutomaticWaveSpecialization
                    << function.getSymName() << ": unsupported lowered CFG\n");
         continue;
       }
+      if (failed(canonicalizePredicates(function))) {
+        function.emitError("integer range analysis failed");
+        return signalPassFailure();
+      }
+      unsigned bodySize = 0;
+      for (Block &block : function.getBody())
+        bodySize += block.getOperations().size();
       triton::UniformityAnalysis::Options options;
       options.isUniformArgument = [](BlockArgument) { return true; };
-      options.getRule =
-          [&](Operation *op,
-              unsigned) -> std::optional<triton::UniformityAnalysis::Rule> {
-        if (isWaveId(op, waveSize))
-          return triton::UniformityAnalysis::Rule::Uniform;
-        return std::nullopt;
-      };
+      options.linearThreadIdX = true;
       triton::UniformityAnalysis analysis(function, options);
       if (failed(analysis.getStatus())) {
         function.emitError("wave uniformity analysis failed");
@@ -295,10 +459,12 @@ struct AutomaticWaveSpecialization
         if (!plan)
           return;
         for (Plan &group : groups) {
-          if (!equivalent(group.predicate, value))
+          auto [base, negate] = stripNegation(value);
+          auto [groupBase, groupNegate] = stripNegation(group.predicate);
+          if (!equivalent(groupBase, base))
             continue;
           group.score += plan->score;
-          group.equivalents.push_back(value);
+          group.equivalents.emplace_back(value, negate != groupNegate);
           return;
         }
         groups.push_back(std::move(*plan));

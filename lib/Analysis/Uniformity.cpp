@@ -1,4 +1,5 @@
 #include "triton/Analysis/Uniformity.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
@@ -17,6 +18,7 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -25,7 +27,19 @@ using namespace mlir::dataflow;
 namespace {
 using Rule = UniformityAnalysis::Rule;
 
-Rule defaultRule(Operation *op) {
+unsigned getSubgroupSize(Operation *function) {
+  auto module = function->getParentOfType<ModuleOp>();
+  if (!module)
+    return 0;
+  auto size =
+      module->getAttrOfType<IntegerAttr>(triton::gpu::AttrNumThreadsPerWarp);
+  if (!size || !size.getValue().isPowerOf2() ||
+      size.getValue().getActiveBits() > 32)
+    return 0;
+  return size.getValue().getZExtValue();
+}
+
+Rule defaultRule(Operation *op, const UniformityAnalysis::Options &options) {
   if (op->getNumRegions())
     return Rule::Unknown;
   // Distributed tensor values require a different, layout-aware analysis.
@@ -39,10 +53,19 @@ Rule defaultRule(Operation *op) {
   if (isa<arith::ConstantOp, index::ConstantOp, LLVM::ConstantOp, LLVM::ZeroOp>(
           op))
     return Rule::Uniform;
-  if (isa<gpu::BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp, gpu::SubgroupIdOp,
-          gpu::SubgroupSizeOp, ROCDL::BlockIdXOp, ROCDL::BlockIdYOp,
-          ROCDL::BlockIdZOp, ROCDL::WaveId, ROCDL::ReadfirstlaneOp,
-          ROCDL::ReadlaneOp>(op))
+  if (isa<mlir::gpu::LaneIdOp>(op))
+    return Rule::ThreadId;
+  if (options.linearThreadIdX) {
+    if (isa<ROCDL::ThreadIdXOp>(op))
+      return Rule::ThreadId;
+    if (auto thread = dyn_cast<mlir::gpu::ThreadIdOp>(op))
+      if (thread.getDimension() == mlir::gpu::Dimension::x)
+        return Rule::ThreadId;
+  }
+  if (isa<mlir::gpu::BlockIdOp, mlir::gpu::BlockDimOp, mlir::gpu::GridDimOp,
+          mlir::gpu::SubgroupIdOp, mlir::gpu::SubgroupSizeOp, ROCDL::BlockIdXOp,
+          ROCDL::BlockIdYOp, ROCDL::BlockIdZOp, ROCDL::WaveId,
+          ROCDL::ReadfirstlaneOp, ROCDL::ReadlaneOp>(op))
     return Rule::Uniform;
   // These dialects' effect-free, region-free operations are deterministic
   // per-thread computations. Do not generalize this to arbitrary Pure ops:
@@ -83,14 +106,38 @@ bool sameValue(Value a, Value b) {
 }
 
 struct Uniformity {
-  enum Kind { Bottom, Uniform, Unknown } kind = Bottom;
+  enum Kind { Bottom, Uniform, ThreadId, Unknown } kind = Bottom;
+  // For ThreadId<N>, all bits above the low log2(N) bits agree across lanes.
+  // N is a power of two, not a count of distinct values. Uniform is N == 1.
+  unsigned threadIdSize = 1;
   Uniformity() = default;
   Uniformity(Kind kind) : kind(kind) {}
-  static Uniformity join(Uniformity a, Uniformity b) {
-    return std::max(a.kind, b.kind);
+  static Uniformity threadId(unsigned size) {
+    Uniformity result(size == 1 ? Uniform : ThreadId);
+    result.threadIdSize = size;
+    return result;
   }
-  bool operator==(const Uniformity &other) const { return kind == other.kind; }
+  static Uniformity join(Uniformity a, Uniformity b) {
+    if (a.kind == Bottom)
+      return b;
+    if (b.kind == Bottom)
+      return a;
+    if (a.kind == Unknown || b.kind == Unknown)
+      return Unknown;
+    return threadId(std::max(a.threadIdSize, b.threadIdSize));
+  }
+  // Ordinary computations and control decisions cannot use the low-bit bound.
+  Uniformity withoutThreadId() const {
+    return kind == ThreadId ? Uniformity(Unknown) : *this;
+  }
+  bool operator==(const Uniformity &other) const {
+    return kind == other.kind && threadIdSize == other.threadIdSize;
+  }
   void print(raw_ostream &os) const {
+    if (kind == ThreadId) {
+      os << "ThreadId<" << threadIdSize << ">";
+      return;
+    }
     os << (kind == Bottom ? "bottom" : kind == Uniform ? "uniform" : "unknown");
   }
 };
@@ -107,7 +154,7 @@ public:
   UniformityDataFlow(DataFlowSolver &solver, Operation *function,
                      UniformityAnalysis::Options options)
       : Base(solver), solver(solver), function(function),
-        options(std::move(options)) {}
+        options(std::move(options)), subgroupSize(getSubgroupSize(function)) {}
 
   LogicalResult initialize(Operation *top) override {
     if (failed(Base::initialize(top)))
@@ -135,14 +182,21 @@ public:
                                ArrayRef<const UniformityLattice *> operands,
                                ArrayRef<UniformityLattice *> results) override {
     for (auto [index, result] : llvm::enumerate(results)) {
-      Rule rule = defaultRule(op);
+      Rule rule = defaultRule(op, options);
       if (options.getRule)
         if (auto model = options.getRule(op, index))
           rule = *model;
       Uniformity state = Uniformity::Unknown;
       if (rule == Rule::Uniform) {
         state = Uniformity::Uniform;
+      } else if (rule == Rule::ThreadId) {
+        if (subgroupSize)
+          state = Uniformity::threadId(subgroupSize);
       } else if (rule == Rule::FromOperands) {
+        if (auto reduced = reduceThreadId(op)) {
+          update(result, *reduced);
+          continue;
+        }
         state = Uniformity::Uniform;
         ValueRange inputs = op->getOperands();
         if (isa<arith::SelectOp, LLVM::SelectOp>(op) &&
@@ -153,7 +207,7 @@ public:
           Uniformity next =
               atUse(input, op->getBlock(), getProgramPointAfter(op));
           pending |= next.kind == Uniformity::Bottom;
-          state = Uniformity::join(state, next);
+          state = Uniformity::join(state, next.withoutThreadId());
         }
         if (pending && state.kind != Uniformity::Unknown)
           state = Uniformity::Bottom;
@@ -185,6 +239,48 @@ public:
   }
 
 private:
+  std::optional<Uniformity> reduceThreadId(Operation *op) {
+    bool mask = isa<arith::AndIOp, index::AndOp, LLVM::AndOp>(op);
+    bool divide = isa<arith::DivUIOp, index::DivUOp, LLVM::UDivOp>(op);
+    bool shift = isa<arith::ShRUIOp, index::ShrUOp, LLVM::LShrOp>(op);
+    if ((!mask && !divide && !shift) ||
+        !isa<IntegerType, IndexType>(op->getResult(0).getType()))
+      return std::nullopt;
+    Value input = op->getOperand(0);
+    APInt amount;
+    if (!matchPattern(op->getOperand(1), m_ConstantInt(&amount))) {
+      if (!mask || !matchPattern(input, m_ConstantInt(&amount)))
+        return std::nullopt;
+      input = op->getOperand(1);
+    }
+    Uniformity state = atUse(input, op->getBlock(), getProgramPointAfter(op));
+    if (state.kind == Uniformity::Bottom)
+      return state;
+    if (state.kind != Uniformity::ThreadId)
+      return std::nullopt;
+    if (mask) {
+      APInt varying(amount.getBitWidth(), state.threadIdSize - 1);
+      return Uniformity::threadId(1u << (varying & amount).getActiveBits());
+    }
+    unsigned bits;
+    if (divide) {
+      // Other divisors can cross a quotient boundary within the subgroup.
+      if (!amount.isPowerOf2())
+        return Uniformity::Unknown;
+      bits = amount.logBase2();
+    } else {
+      // Index may lower to i32 or i64; only accept shifts valid for both.
+      auto type = dyn_cast<IntegerType>(input.getType());
+      unsigned width = type ? type.getWidth() : 32;
+      if (amount.uge(width))
+        return Uniformity::Unknown;
+      bits = amount.getZExtValue();
+    }
+    if (bits >= llvm::Log2_32(state.threadIdSize))
+      return Uniformity::Uniform;
+    return Uniformity::threadId(state.threadIdSize >> bits);
+  }
+
   Uniformity valueState(Value value, ProgramPoint *point) {
     const auto *lattice = point ? getLatticeElementFor(point, value)
                                 : solver.lookupState<UniformityLattice>(value);
@@ -236,7 +332,8 @@ private:
       }
       for (auto [i, operand] : llvm::enumerate(term->getOperands()))
         if (!forwarded[i])
-          state = Uniformity::join(state, valueState(operand, point));
+          state = Uniformity::join(
+              state, valueState(operand, point).withoutThreadId());
     }
     return state;
   }
@@ -293,8 +390,10 @@ private:
         continue;
       }
       ProgramPoint *point = getProgramPointBefore(loop.getBody());
-      Uniformity lower = atUse(loop.getLowerBound(), op->getBlock(), point);
-      Uniformity step = atUse(loop.getStep(), op->getBlock(), point);
+      Uniformity lower =
+          atUse(loop.getLowerBound(), op->getBlock(), point).withoutThreadId();
+      Uniformity step =
+          atUse(loop.getStep(), op->getBlock(), point).withoutThreadId();
       Uniformity state = Uniformity::join(lower, step);
       if ((lower.kind == Uniformity::Bottom ||
            step.kind == Uniformity::Bottom) &&
@@ -324,14 +423,15 @@ private:
     // count. Apply the loop's exit decision when propagating its results.
     if (!point->isBlockStart()) {
       for (Value operand : op->getOperands())
-        control =
-            Uniformity::join(control, atUse(operand, op->getBlock(), point));
+        control = Uniformity::join(
+            control, atUse(operand, op->getBlock(), point).withoutThreadId());
       for (Region &region : op->getRegions()) {
         control = Uniformity::join(control, cfgControl(&region, point));
         for (Block &block : region)
           if (auto cond = dyn_cast<scf::ConditionOp>(block.getTerminator()))
             control = Uniformity::join(
-                control, atUse(cond.getCondition(), &block, point));
+                control,
+                atUse(cond.getCondition(), &block, point).withoutThreadId());
       }
     }
     DenseMap<Value, SmallVector<Value>> incoming;
@@ -368,6 +468,7 @@ private:
   DataFlowSolver &solver;
   Operation *function;
   UniformityAnalysis::Options options;
+  unsigned subgroupSize;
 };
 } // namespace
 
@@ -393,6 +494,8 @@ struct UniformityAnalysis::Impl {
   }
 };
 
+UniformityAnalysis::UniformityAnalysis(Operation *function)
+    : UniformityAnalysis(function, Options{}) {}
 UniformityAnalysis::UniformityAnalysis(Operation *function, Options options)
     : impl(std::make_unique<Impl>(function, std::move(options))) {}
 UniformityAnalysis::~UniformityAnalysis() = default;

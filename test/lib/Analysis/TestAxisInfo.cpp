@@ -19,6 +19,7 @@ struct TestUniformityPass
       if (!arguments || function.getFunctionBody().empty())
         return;
       UniformityAnalysis::Options options;
+      options.linearThreadIdX = function->hasAttr("test.linear_thread_id_x");
       options.isUniformArgument = [&](BlockArgument arg) {
         return arg.getArgNumber() < arguments.size() &&
                cast<BoolAttr>(arguments[arg.getArgNumber()]).getValue();

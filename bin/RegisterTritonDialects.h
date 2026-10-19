@@ -43,6 +43,7 @@
 #include "triton/Target/LLVMIR/Passes.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
@@ -198,7 +199,8 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   registry.insert<
       mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
-      mlir::func::FuncDialect, mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
+      mlir::func::FuncDialect, mlir::index::IndexDialect,
+      mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
       mlir::triton::gpu::TritonGPUDialect,
       mlir::triton::instrument::TritonInstrumentDialect,
       mlir::math::MathDialect, mlir::arith::ArithDialect, mlir::scf::SCFDialect,

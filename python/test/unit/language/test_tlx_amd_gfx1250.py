@@ -850,6 +850,39 @@ def test_wave_specialization_grouped_gemm_fused(interface, groups, k, programs, 
             if "llvm.select" in line and ("vector<4xi32>" in line or "vector<8xi32>" in line)
         ]
         assert bool(descriptor_selects) != enabled
+        # The scalar descriptor membership bits use (wave & 2) == 0 or
+        # ((wave ^ 2) & 2) == 0. They must share the entry dispatch after range
+        # canonicalization, rather than survive in the specialized bodies.
+        definitions = dict(re.findall(r"^\s*(%\w+) = (.*)$", lowered[-1], re.MULTILINE))
+        waves = {value for value, op in definitions.items() if op.startswith("rocdl.wave.id")}
+        twos = {value for value, op in definitions.items() if op.startswith("llvm.mlir.constant(2 : i32)")}
+
+        def binary_operands(op, opcode):
+            match = re.match(rf"{re.escape(opcode)} (%\w+), (%\w+) : i32", op)
+            return set(match.groups()) if match else set()
+
+        flipped_waves = {
+            value
+            for value, op in definitions.items()
+            if (operands := binary_operands(op, "llvm.xor")) & waves and operands & twos
+        }
+        membership_bits = {
+            value
+            for value, op in definitions.items()
+            if (operands := binary_operands(op, "llvm.and")) & (waves | flipped_waves) and operands & twos
+        }
+        membership_comparisons = [
+            value for value, op in definitions.items()
+            if op.startswith("llvm.icmp") and set(re.findall(r"%\w+",
+                                                             op.split(" loc(")[0])) & membership_bits
+        ]
+        if enabled:
+            assert len(membership_comparisons) == 1
+            entry = lowered[-1].split("llvm.cond_br", 1)[0]
+            assert f"{membership_comparisons[0]} = llvm.icmp" in entry
+            assert "rocdl.wave.id range <i32, 0, 4>" in entry
+        else:
+            assert len(membership_comparisons) > 1
         # Check every fused site, including prologue, steady K loop and tile
         # refill. Versioning preserves each site in both branches; descriptor
         # choices must stay folded through LLVM optimization and codegen.

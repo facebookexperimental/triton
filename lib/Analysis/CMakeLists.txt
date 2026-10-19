@@ -8,6 +8,7 @@ add_triton_library(TritonAnalysis
   Utility.cpp
   ReductionOrder.cpp
   Uniformity.cpp
+  IntegerRange.cpp
 
   DEPENDS
   TritonTableGen
@@ -23,6 +24,8 @@ add_triton_library(TritonAnalysis
   MLIRControlFlowDialect
   MLIRGPUDialect
   MLIRIndexDialect
+  MLIRInferIntRangeCommon
+  MLIRInferIntRangeInterface
   MLIRLLVMDialect
   MLIRMathDialect
   MLIRROCDLDialect

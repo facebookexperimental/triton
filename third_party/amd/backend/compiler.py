@@ -805,7 +805,7 @@ class HIPBackend(BaseBackend):
         if options.enable_wave_specialization:
             amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
             passes.convert.add_reconcile_unrealized_casts(pm)
-            amd.passes.ttgpuir.add_automatic_wave_specialization(pm, options.warp_size)
+            amd.passes.ttgpuir.add_automatic_wave_specialization(pm)
             passes.ttgpuir.add_canonicalize_llvm_ir(pm)
             passes.common.add_sccp(pm)
             passes.common.add_canonicalizer(pm)

@@ -149,7 +149,7 @@ The implemented domain distinguishes subgroup-uniform values from values that
 may vary:
 
 ```text
-Uninitialized -> Uniform -> Unknown
+Uninitialized -> Uniform (= ThreadId<1>) -> ThreadId<2> -> ThreadId<4> -> ... -> Unknown
 ```
 
 MLIR's dataflow solver computes the fixed point. Uniform seeds initialize value
@@ -166,26 +166,42 @@ Initial sources and transfer rules:
 | --- | --- |
 | Numeric constants and modeled workgroup/program ID | Uniform |
 | Function arguments | Unknown unless the caller explicitly classifies them as uniform, e.g. kernel parameters |
-| AMD wave-ID intrinsics and recognized lowered wave-ID expressions | Wave-uniform |
-| AMD thread/lane-ID intrinsics | Unknown unless a recognized expression removes lane dependence |
-| Deterministic scalar arithmetic and comparisons | Preserve the weakest operand guarantee |
+| AMD wave-ID intrinsics | Wave-uniform |
+| Linear thread ID and lane ID | `ThreadId<subgroupSize>` when the required target assumptions are supplied |
+| Constant unsigned power-of-two division, logical right shift, AND mask | Reduce a `ThreadId` low-bit bound; `ThreadId<1>` becomes uniform |
+| Other deterministic scalar arithmetic and comparisons | Uniform for uniform operands; any `ThreadId` operand becomes unknown |
 | Select | Account for the condition and alternatives; equal alternatives may improve precision |
 | Unknown operations or calls | Unknown unless an operation summary supplies a proof |
 | Loads and atomics | Conservative initially; a uniform pointer alone does not prove uniform results for arbitrary memory semantics |
 | Shuffles and other communication intrinsics | Use explicit intrinsic semantics; otherwise unknown |
 | Inline assembly | Unknown unless a modeled form supplies a proof |
 
-Recognize common expressions such as linear thread ID divided by hardware wave
-size. Use the configured target wave size, not a hard-coded 32 or 64. A coarse
-uniformity lattice cannot derive this result from an unknown thread ID by itself;
-it needs an explicit rule or supporting integer facts.
+`ThreadId<N>` means only the low `log2(N)` bits may vary within a subgroup;
+all higher bits agree. `N` is a power of two, not the number of distinct lane
+values. Joining two bounds takes their maximum, treating uniform as `N = 1`.
+For a wave32, `tid / 4` yields `ThreadId<8>` and a subsequent `>> 3` becomes
+uniform. AND retains the bound implied by the highest remaining varying bit:
+`tid & 7` yields `ThreadId<8>`, while `tid & 16` remains `ThreadId<32>`.
+Clearing all varying bits produces uniformity immediately. Both operand orders
+of a constant AND are supported. Unsigned division by non-powers of two and
+other computations on `ThreadId` values become unknown. Arithmetic on values
+that have already become uniform follows the ordinary uniform rules.
 
-The AMD pass currently models unsigned division and logical right shift of
-`rocdl.workitem.id.x` by the configured wave size, including an intervening
-constant bit mask. The standalone pass accepts `wave-size=32|64`; the backend
-supplies `HIPOptions.warp_size`. More complex expressions reconstructing a
-distributed `arange` from lane and wave components can remain unknown. The
-initial implementation does not add a general bit-level uniformity analysis.
+These transfers inspect their own operands' dataflow states, without looking
+through defining operations. They apply to scalar `arith`, `index`, and LLVM
+operations and compose through CFG and SCF argument/result forwarding. Divergent
+control loses the bound unless the incoming value is identical on all edges;
+loop induction arithmetic also falls back to unknown for `ThreadId` operands.
+
+The enclosing module's `ttg.threads-per-warp` attribute supplies the seed bound;
+missing, zero, or non-power-of-two sizes disable these seeds. There is no
+separate subgroup-size analysis or pass option. `gpu.lane_id` only needs that
+size. `gpu.thread_id x` and
+`rocdl.workitem.id.x` additionally require `Options.linearThreadIdX`, which
+asserts subgroup-aligned linear X coordinates, as in Triton's one-dimensional
+AMD workgroups. Y/Z IDs are not seeded. The specialization pass supplies this
+linear-X assumption and contains no thread-ID expression matcher. The compiler
+already records the target wave size in the IR before lowering.
 
 `UniformityAnalysis` takes a function-like operation and optional argument and
 operation inference callbacks. `isUniform(value)` queries agreement at the
@@ -199,9 +215,9 @@ The solver owns reachability, dependency scheduling, and fixed-point iteration.
 There is no private IR copy, SCF normalization, observation-marker scheme,
 postdominance calculation, or cycle analysis.
 
-- Use a monotone value lattice: uninitialized, uniform, unknown. Unknown includes
-  potentially divergent values. Deterministic computations propagate operand
-  facts; explicit seeds and operation models establish uniformity.
+- Use a monotone value lattice: uninitialized, uniform, bounded `ThreadId`,
+  unknown. Only uniform is a proof of agreement; a `ThreadId` control decision
+  is potentially divergent. Explicit seeds and operation models establish facts.
 - Use `RegionBranchOpInterface` and the region-successor transfer hook to join
   incoming operands for structured control flow. Include the selector for
   `scf.if` and `scf.index_switch`. Loop region arguments model recurrences;
@@ -267,6 +283,47 @@ component handling or remain outside the initial candidate set.
 This avoids requiring a proof that one boolean describes an entire distributed
 tensor. Grouping related register predicates into a compact dispatch is a later
 profitability improvement subject to the same version budget.
+
+### Integer ranges and predicate canonicalization
+
+Before choosing a predicate, run MLIR's `dataflow::IntegerRangeAnalysis` with
+`DeadCodeAnalysis` and sparse constant propagation. Range inference is independent
+of uniformity: a value can have a small range and still vary between lanes.
+
+The common analysis library registers external `InferIntRangeInterface` models
+for scalar LLVM integer arithmetic, comparisons, casts, and selects, using
+MLIR's existing inference helpers. ROCDL ID models consume their `range`
+attributes, including wrapped ranges. `readfirstlane` preserves the global
+operand range; `freeze` remains conservative because it can turn poison into
+an arbitrary value. Existing GPU, arith, and index interfaces remain unchanged.
+
+The AMD specialization pass supplies missing ID bounds from the kernel's
+`ttg.num-warps` and `ttg.threads-per-warp` metadata. When explicit warp
+specialization allocated additional waves, `ttg.total-num-warps` supplies the
+physical bound. Existing range attributes are preserved. Missing launch
+metadata does not justify inventing a bound.
+
+Use these ranges to fold constant comparisons and normalize bit tests before
+CSE and candidate grouping. For example, when `w` is in `[0,3]`:
+
+```text
+((3 >> w) & 1) != 0  -> (w & 2) == 0
+((w ^ 2) & 2) == 0  -> !((w & 2) == 0)
+```
+
+The lookup rewrite requires both an in-width shift and the tighter bound that
+makes the predicates equivalent. In an eight-wave kernel the first rewrite
+does not apply. These are algebraic rewrites backed by standard interval
+analysis, without per-wave value enumeration or custom control-flow propagation.
+
+Group equivalent predicates and their boolean complements into the same plan.
+Each clone substitutes the appropriate constant for every grouped definition,
+including body uses of definitions in the extracted prefix. Existing cleanup removes the
+resulting dead descriptor computations without additional body versions.
+
+This does not add branch-sensitive ranges for dominating SSA values. For
+example, eliminating `w == 0` specifically inside the false branch of
+`(w & 2) == 0` remains a separate implication-folding improvement.
 
 ## Ordered common-prefix extraction
 
@@ -588,7 +645,8 @@ Current regression coverage is in:
   allocation size. This test has passed on an MI350X (gfx950).
 - `python/test/unit/language/test_tlx_amd_gfx1250.py`: packed/list grouped GEMM
   compile regressions verifying that specialization removes fused-TDM vector
-  descriptor selects and preserves shared-memory allocation.
+  descriptor selects and scalar descriptor membership tests from the bodies,
+  and preserves shared-memory allocation.
 
 For gfx1250 grouped GEMM, the selector `((3 >> wave_id) & 1) != 0` divides the
 waves between the A and B descriptors. Packed clustered and ragged list kernels

@@ -1390,6 +1390,162 @@ tt.func @negative_constants() {
 
 // -----
 // Uniformity of per-thread common-dialect values, independent of AxisInfo.
+module attributes {"ttg.threads-per-warp" = 32 : i32} {
+  func.func @uniformity_thread_id_transfers(%u: i32)
+      attributes {test.uniform_arguments = [true], test.linear_thread_id_x} {
+    %tid = rocdl.workitem.id.x {test.uniform = false} : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c3 = arith.constant 3 : i32
+    %c4 = arith.constant 4 : i32
+    %c5 = arith.constant 5 : i32
+    %c7 = arith.constant 7 : i32
+    %c16 = arith.constant 16 : i32
+    %c32 = arith.constant 32 : i32
+    %c64 = arith.constant 64 : i32
+    %clear = arith.constant -32 : i32
+    // Partial reductions compose across arith and LLVM operations.
+    %quarter = arith.divui %tid, %c4 {test.uniform = false} : i32
+    %wave = llvm.lshr %quarter, %c3 {test.uniform = true} : i32
+    %larger = arith.divui %tid, %c64 {test.uniform = true} : i32
+    %masked = llvm.and %c7, %tid {test.uniform = false} : i32
+    %masked_wave = arith.shrui %masked, %c3 {test.uniform = true} : i32
+    %upper = arith.andi %tid, %clear {test.uniform = true} : i32
+    %zero = llvm.and %tid, %c0 {test.uniform = true} : i32
+    // One remaining varying bit is not the same as a low-bit bound of one.
+    %sparse = arith.andi %tid, %c16 {test.uniform = false} : i32
+    %still_sparse = llvm.lshr %sparse, %c1 {test.uniform = false} : i32
+    %sparse_uniform = llvm.lshr %sparse, %c5 {test.uniform = true} : i32
+    // Unsupported arithmetic destroys the bound permanently.
+    %add = arith.addi %tid, %c1 : i32
+    %add_div = llvm.udiv %add, %c32 {test.uniform = false} : i32
+    %bad_divisor = llvm.udiv %tid, %c3 : i32
+    %bad_divisor_shift = arith.shrui %bad_divisor, %c5 {test.uniform = false} : i32
+    %signed = arith.divsi %tid, %c32 {test.uniform = false} : i32
+    %dynamic = arith.divui %tid, %u {test.uniform = false} : i32
+    %invalid_shift = llvm.lshr %tid, %c32 {test.uniform = false} : i32
+    %ty = rocdl.workitem.id.y : i32
+    %ty_div = llvm.udiv %ty, %c32 {test.uniform = false} : i32
+    // Once uniform, ordinary arithmetic preserves the fact.
+    %sum = arith.addi %wave, %u {test.uniform = true} : i32
+    %pred = arith.cmpi eq, %sum, %u {test.uniform = true} : i32
+    return
+  }
+
+  func.func @uniformity_thread_id_joins(%p: i1, %q: i1)
+      attributes {test.uniform_arguments = [true, false], test.linear_thread_id_x} {
+    %tid = rocdl.workitem.id.x : i32
+    %c7 = arith.constant 7 : i32
+    %c3 = arith.constant 3 : i32
+    %c5 = arith.constant 5 : i32
+    %low = arith.andi %tid, %c7 : i32
+    cf.cond_br %p, ^left, ^right
+  ^left:
+    cf.br ^merge(%tid : i32)
+  ^right:
+    cf.br ^merge(%low : i32)
+  ^merge(%v: i32):
+    // A join keeps the larger bound, and SCF forwarding preserves it.
+    %partial = arith.shrui %v, %c3 {test.uniform = false} : i32
+    %wave = arith.shrui %v, %c5 {test.uniform = true} : i32
+    %same = scf.if %q -> i32 {
+      scf.yield %tid : i32
+    } else {
+      scf.yield %tid : i32
+    }
+    %same_wave = arith.shrui %same, %c5 {test.uniform = true} : i32
+    %different = scf.if %q -> i32 {
+      scf.yield %tid : i32
+    } else {
+      scf.yield %low : i32
+    }
+    %different_wave = arith.shrui %different, %c5 {test.uniform = false} : i32
+    return
+  }
+
+  func.func @uniformity_thread_id_switch()
+      attributes {test.uniform_arguments = [], test.linear_thread_id_x} {
+    %tid = rocdl.workitem.id.x : i32
+    %c0 = arith.constant 0 : i32
+    %c32 = arith.constant 32 : i32
+    %c64 = arith.constant 64 : i32
+    // Distinct uniform values selected by a ThreadId control are divergent.
+    cf.switch %tid : i32, [
+      default: ^merge(%c64 : i32),
+      0: ^merge(%c0 : i32)
+    ]
+  ^merge(%selected: i32):
+    %selected_wave = arith.divui %selected, %c32 {test.uniform = false} : i32
+    return
+  }
+
+  func.func @uniformity_thread_id_index()
+      attributes {test.uniform_arguments = [], test.linear_thread_id_x} {
+    %tid = gpu.thread_id x
+    %lane = gpu.lane_id
+    %c0 = index.constant 0
+    %c1 = index.constant 1
+    %c3 = index.constant 3
+    %c4 = index.constant 4
+    %c5 = index.constant 5
+    %c7 = index.constant 7
+    %c32 = index.constant 32
+    %c64 = index.constant 64
+    %part = index.divu %tid, %c4 {test.uniform = false}
+    %wave = index.shru %part, %c3 {test.uniform = true}
+    %low = index.and %lane, %c7 {test.uniform = false}
+    %cleared = index.shru %low, %c3 {test.uniform = true}
+    // A ThreadId selector is divergent, even though it is not Unknown.
+    %selected = scf.index_switch %lane -> index
+    case 0 {
+      scf.yield %c0 : index
+    }
+    default {
+      scf.yield %c64 : index
+    }
+    %selected_wave = index.divu %selected, %c32 {test.uniform = false}
+    // Induction arithmetic cannot retain a ThreadId bound.
+    scf.for %i = %lane to %c64 step %c1 {
+      %induction_wave = index.shru %i, %c5 {test.uniform = false}
+    }
+    return
+  }
+
+  func.func @uniformity_thread_id_requires_linear_x()
+      attributes {test.uniform_arguments = []} {
+    %tid = rocdl.workitem.id.x : i32
+    %c32 = arith.constant 32 : i32
+    %unknown = arith.divui %tid, %c32 {test.uniform = false} : i32
+    %lane = gpu.lane_id
+    %c5 = index.constant 5
+    %uniform = index.shru %lane, %c5 {test.uniform = true}
+    return
+  }
+}
+
+// -----
+module attributes {"ttg.threads-per-warp" = 64 : i32} {
+  func.func @uniformity_thread_id_wave64()
+      attributes {test.uniform_arguments = [], test.linear_thread_id_x} {
+    %tid = rocdl.workitem.id.x : i32
+    %c32 = arith.constant 32 : i32
+    %c2 = arith.constant 2 : i32
+    %half = llvm.udiv %tid, %c32 {test.uniform = false} : i32
+    %wave = llvm.udiv %half, %c2 {test.uniform = true} : i32
+    return
+  }
+}
+
+// -----
+func.func @uniformity_thread_id_missing_size()
+    attributes {test.uniform_arguments = [], test.linear_thread_id_x} {
+  %tid = rocdl.workitem.id.x : i32
+  %c32 = arith.constant 32 : i32
+  %wave = llvm.udiv %tid, %c32 {test.uniform = false} : i32
+  return
+}
+
+// -----
 func.func @uniformity_arithmetic(%u: i32, %v: i32, %p: i1)
     attributes {test.uniform_arguments = [true, false, false]} {
   %one = arith.constant 1 : i32
