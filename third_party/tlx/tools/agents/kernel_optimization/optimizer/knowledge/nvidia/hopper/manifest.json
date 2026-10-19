@@ -1,0 +1,6 @@
+{
+  "priority": 20,
+  "backends": ["cuda", "nvidia"],
+  "architectures": ["hopper", "h100", "sm90", "sm_90"],
+  "documents": ["hopper-machine-limits.md"]
+}
