@@ -1,5 +1,9 @@
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
@@ -54,9 +58,9 @@ bool movable(Operation *op) {
           ROCDL::BlockIdXOp, ROCDL::BlockIdYOp, ROCDL::BlockIdZOp,
           ROCDL::WaveId>(op))
     return true;
-  StringRef dialect = op->getName().getDialectNamespace();
-  return (dialect == "llvm" || dialect == "arith" || dialect == "math" ||
-          dialect == "index") &&
+  return isa_and_nonnull<LLVM::LLVMDialect, arith::ArithDialect,
+                         math::MathDialect, index::IndexDialect>(
+             op->getDialect()) &&
          !isa<LLVM::CallOp, LLVM::CallIntrinsicOp, LLVM::InlineAsmOp>(op) &&
          isPure(op);
 }

@@ -1587,6 +1587,8 @@ func.func @uniformity_irreducible(%p: i1, %q: i1, %u: i32)
 llvm.func @uniformity_llvm(%p: i1, %u: i32)
     attributes {test.uniform_arguments = [false, true]} {
   %zero = llvm.mlir.constant(0 : i32) : i32
+  %same = llvm.select %p, %u, %u {test.uniform = true} : i1, i32
+  %different = llvm.select %p, %u, %zero {test.uniform = false} : i1, i32
   llvm.cond_br %p, ^a, ^b
 ^a:
   llvm.br ^merge(%u : i32)
@@ -1601,12 +1603,22 @@ llvm.func @uniformity_llvm(%p: i1, %u: i32)
 func.func @uniformity_gpu_seeds() attributes {test.uniform_arguments = []} {
   %tid = gpu.thread_id x {test.uniform = false}
   %bid = gpu.block_id x {test.uniform = true}
+  %bdim = gpu.block_dim x {test.uniform = true}
+  %gdim = gpu.grid_dim x {test.uniform = true}
   %sid = gpu.subgroup_id {test.uniform = true} : index
   %size = gpu.subgroup_size {test.uniform = true} : index
   %r = arith.addi %sid, %size {test.uniform = true} : index
   %t = arith.index_cast %tid : index to i32
   %first = rocdl.readfirstlane %t {test.uniform = true} : i32
   %wave = rocdl.wave.id {test.uniform = true} : i32
+  %bx = rocdl.workgroup.id.x {test.uniform = true} : i32
+  %by = rocdl.workgroup.id.y {test.uniform = true} : i32
+  %bz = rocdl.workgroup.id.z {test.uniform = true} : i32
+  %tx = rocdl.workitem.id.x {test.uniform = false} : i32
+  %ty = rocdl.workitem.id.y {test.uniform = false} : i32
+  %tz = rocdl.workitem.id.z {test.uniform = false} : i32
+  %zero = arith.constant 0 : i32
+  %lane = rocdl.readlane %t, %zero {test.uniform = true} : (i32, i32) -> i32
   return
 }
 
@@ -1678,6 +1690,7 @@ func.func @uniformity_parallel() attributes {test.uniform_arguments = []} {
 
 // -----
 llvm.func @uniformity_undef() attributes {test.uniform_arguments = []} {
+  %zero = llvm.mlir.zero {test.uniform = true} : !llvm.ptr
   %u = llvm.mlir.undef {test.uniform = false} : i32
   %f = llvm.freeze %u {test.uniform = false} : i32
   %p = llvm.mlir.poison {test.uniform = false} : i32

@@ -3,12 +3,20 @@
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/Index/IR/IndexOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallBitVector.h"
-#include "llvm/ADT/StringSwitch.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -26,46 +34,34 @@ Rule defaultRule(Operation *op) {
       llvm::any_of(op->getResultTypes(),
                    [](Type t) { return isa<TensorType>(t); }))
     return Rule::Unknown;
-  StringRef name = op->getName().getStringRef();
   // ConstantLike also includes undef/poison and address-of operations. It is
   // not a uniformity contract (e.g. thread-local addresses can differ).
-  if (name == "arith.constant" || name == "index.constant" ||
-      name == "llvm.mlir.constant" || name == "llvm.mlir.zero")
+  if (isa<arith::ConstantOp, index::ConstantOp, LLVM::ConstantOp, LLVM::ZeroOp>(
+          op))
     return Rule::Uniform;
-  if (llvm::StringSwitch<bool>(name)
-          .Cases({"gpu.block_id", "gpu.block_dim", "gpu.grid_dim"}, true)
-          .Cases({"gpu.subgroup_id", "gpu.subgroup_size"}, true)
-          .Cases({"rocdl.workgroup.id.x", "rocdl.workgroup.id.y",
-                  "rocdl.workgroup.id.z"},
-                 true)
-          .Cases({"rocdl.wave.id", "rocdl.readfirstlane", "rocdl.readlane"},
-                 true)
-          .Default(false))
+  if (isa<gpu::BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp, gpu::SubgroupIdOp,
+          gpu::SubgroupSizeOp, ROCDL::BlockIdXOp, ROCDL::BlockIdYOp,
+          ROCDL::BlockIdZOp, ROCDL::WaveId, ROCDL::ReadfirstlaneOp,
+          ROCDL::ReadlaneOp>(op))
     return Rule::Uniform;
-  StringRef dialect = op->getName().getDialectNamespace();
   // These dialects' effect-free, region-free operations are deterministic
   // per-thread computations. Do not generalize this to arbitrary Pure ops:
   // thread IDs, undef, and communication can also be Pure.
-  if ((dialect == "arith" || dialect == "math" || dialect == "index" ||
-       dialect == "vector") &&
+  if (isa_and_nonnull<arith::ArithDialect, math::MathDialect,
+                      index::IndexDialect, vector::VectorDialect>(
+          op->getDialect()) &&
       isMemoryEffectFree(op))
     return Rule::FromOperands;
-  if (llvm::StringSwitch<bool>(name)
-          .Cases({"llvm.add", "llvm.sub", "llvm.mul", "llvm.udiv"}, true)
-          .Cases({"llvm.sdiv", "llvm.urem", "llvm.srem"}, true)
-          .Cases({"llvm.shl", "llvm.lshr", "llvm.ashr"}, true)
-          .Cases({"llvm.and", "llvm.or", "llvm.xor"}, true)
-          .Cases({"llvm.icmp", "llvm.fcmp", "llvm.select"}, true)
-          .Cases({"llvm.fadd", "llvm.fsub", "llvm.fmul", "llvm.fdiv"}, true)
-          .Cases({"llvm.frem", "llvm.fneg", "llvm.fpext", "llvm.fptrunc"}, true)
-          .Cases({"llvm.sext", "llvm.zext", "llvm.trunc"}, true)
-          .Cases({"llvm.sitofp", "llvm.uitofp", "llvm.fptosi", "llvm.fptoui"},
-                 true)
-          .Cases({"llvm.bitcast", "llvm.ptrtoint", "llvm.inttoptr"}, true)
-          .Cases({"llvm.getelementptr", "llvm.extractelement"}, true)
-          .Cases({"llvm.insertelement", "llvm.shufflevector"}, true)
-          .Cases({"llvm.extractvalue", "llvm.insertvalue"}, true)
-          .Default(false))
+  if (isa<LLVM::AddOp, LLVM::SubOp, LLVM::MulOp, LLVM::UDivOp, LLVM::SDivOp,
+          LLVM::URemOp, LLVM::SRemOp, LLVM::ShlOp, LLVM::LShrOp, LLVM::AShrOp,
+          LLVM::AndOp, LLVM::OrOp, LLVM::XOrOp, LLVM::ICmpOp, LLVM::FCmpOp,
+          LLVM::SelectOp, LLVM::FAddOp, LLVM::FSubOp, LLVM::FMulOp,
+          LLVM::FDivOp, LLVM::FRemOp, LLVM::FNegOp, LLVM::FPExtOp,
+          LLVM::FPTruncOp, LLVM::SExtOp, LLVM::ZExtOp, LLVM::TruncOp,
+          LLVM::SIToFPOp, LLVM::UIToFPOp, LLVM::FPToSIOp, LLVM::FPToUIOp,
+          LLVM::BitcastOp, LLVM::PtrToIntOp, LLVM::IntToPtrOp, LLVM::GEPOp,
+          LLVM::ExtractElementOp, LLVM::InsertElementOp, LLVM::ShuffleVectorOp,
+          LLVM::ExtractValueOp, LLVM::InsertValueOp>(op))
     return Rule::FromOperands;
   // Includes loads, atomics, calls, inline assembly, poison/undef/freeze,
   // address-space casts, and unmodeled intrinsics.
@@ -149,8 +145,7 @@ public:
       } else if (rule == Rule::FromOperands) {
         state = Uniformity::Uniform;
         ValueRange inputs = op->getOperands();
-        StringRef name = op->getName().getStringRef();
-        if ((name == "arith.select" || name == "llvm.select") &&
+        if (isa<arith::SelectOp, LLVM::SelectOp>(op) &&
             sameValue(inputs[1], inputs[2]))
           inputs = inputs.slice(1, 1);
         bool pending = false;
@@ -226,9 +221,8 @@ private:
         continue;
       // The interface identifies forwarded operands, but is not a contract
       // that an arbitrary operation selects its edge deterministically.
-      StringRef name = term->getName().getStringRef();
-      if (name != "cf.cond_br" && name != "cf.switch" &&
-          name != "llvm.cond_br" && name != "llvm.switch")
+      if (!isa<cf::CondBranchOp, cf::SwitchOp, LLVM::CondBrOp, LLVM::SwitchOp>(
+              term))
         return Uniformity::Unknown;
       auto branch = dyn_cast<BranchOpInterface>(term);
       if (!branch)

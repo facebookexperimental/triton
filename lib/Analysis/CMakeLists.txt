@@ -19,7 +19,15 @@ add_triton_library(TritonAnalysis
 
   LINK_LIBS PUBLIC
   MLIRAnalysis
+  MLIRArithDialect
+  MLIRControlFlowDialect
+  MLIRGPUDialect
+  MLIRIndexDialect
   MLIRLLVMDialect
+  MLIRMathDialect
+  MLIRROCDLDialect
+  MLIRSCFDialect
+  MLIRVectorDialect
   TritonIR
   TritonGPUIR
   GluonIR
