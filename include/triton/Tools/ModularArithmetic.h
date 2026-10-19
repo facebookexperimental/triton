@@ -51,6 +51,17 @@ struct ModMatrix {
   void normalize();
 };
 
+// NoSolution is proved within a supported family. Unsupported includes inputs
+// outside that family and incomplete algorithms such as singular lifting.
+enum class ModularSolveStatus { Success, NoSolution, Unsupported };
+
+struct ModularSolveResult {
+  ModularSolveStatus status;
+  std::vector<int64_t> solution;
+
+  bool succeeded() const { return status == ModularSolveStatus::Success; }
+};
+
 // Gaussian elimination to RREF in Z/nZ. Modifies matrix in-place, returns rank.
 int modRREF(ModMatrix &mat);
 
@@ -60,17 +71,29 @@ std::vector<int64_t> modSolveLinear(const ModMatrix &A,
                                     const std::vector<int64_t> &b,
                                     int64_t modulus);
 
+ModularSolveResult tryModSolveLinear(const ModMatrix &A,
+                                     const std::vector<int64_t> &b,
+                                     int64_t modulus);
+
 // Solve Ax = b (mod p^e) using Hensel lifting. Solvable singular systems such
 // as 2x = 2 (mod 4) currently return {}.
 std::vector<int64_t> modSolveLinearHensel(const ModMatrix &A,
                                           const std::vector<int64_t> &b,
                                           int64_t prime, int exponent);
 
+ModularSolveResult tryModSolveLinearHensel(const ModMatrix &A,
+                                           const std::vector<int64_t> &b,
+                                           int64_t prime, int exponent);
+
 // Solve Ax = b (mod N) using CRT: factor N, solve subsystems, combine
 // solutions. Precondition: modulus > 0. Returns {} on precondition violation.
 std::vector<int64_t> modSolveLinearCRT(const ModMatrix &A,
                                        const std::vector<int64_t> &b,
                                        int64_t modulus);
+
+ModularSolveResult tryModSolveLinearCRT(const ModMatrix &A,
+                                        const std::vector<int64_t> &b,
+                                        int64_t modulus);
 
 // Prime factorization: N = p1^e1 * p2^e2 * ... * pk^ek
 struct PrimeFactorization {
