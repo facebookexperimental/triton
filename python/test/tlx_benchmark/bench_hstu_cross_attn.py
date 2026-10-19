@@ -28,8 +28,8 @@ from _harness import Case, Prepared, close_enough, driver  # noqa: E402
 
 OP = "hstu_cross_attn"
 REF_NAME = "tutorials/hstu_cross_attn/triton_bw_cross_attention.py:triton_bw_hstu_mha_wrapper"
-#: No `heuristic_config` yet; see `bench_flash_attn.py`.
-DEFAULT_SPACE = "full"
+#: The op's default: eight curated configs from its 144-config "full" grid at head dims 64/128.
+DEFAULT_SPACE = "curated"
 EXTRA_COLUMNS = (("q tokens", "q_tokens"), ("kv tokens", "kv_tokens"))
 COLD_COMPILE = "first"
 COMPILE_CAP_S = 900.0
