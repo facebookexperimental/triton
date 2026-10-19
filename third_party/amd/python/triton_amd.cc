@@ -15,6 +15,8 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAsmInfo.h"
@@ -556,6 +558,15 @@ void init_triton_amd(py::module_ &m) {
       }
     }
     return false;
+  });
+
+  m.def("enable_wmma_queuing", [](llvm::Function *fn) {
+    llvm::IRBuilder<> builder(&*fn->getEntryBlock().getFirstInsertionPt());
+    // HW_REG_WAVE_SCHED_MODE is register 26. Write only bit 2, preserving
+    // bits 0..1 used by LLVM's expert scheduling mode.
+    constexpr unsigned hwreg = 26 | (2 << 6);
+    builder.CreateIntrinsic(llvm::Intrinsic::amdgcn_s_setreg, {},
+                            {builder.getInt32(hwreg), builder.getInt32(1)});
   });
 
   m.def("set_all_fn_arg_inreg", [](llvm::Function *fn) {

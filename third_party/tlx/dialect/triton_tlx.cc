@@ -1040,18 +1040,6 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, uint32_t variant) {
              self.create<ROCDL::IglpOpt>(variant);
            })
-      .def("create_amd_set_wave_sched_mode",
-           [](TritonOpBuilder &self, uint32_t value, unsigned offset,
-              unsigned width) {
-             // HW_REG_WAVE_SCHED_MODE is register 26. The intrinsic's hwreg
-             // operand packs the register ID, bit offset, and width minus one.
-             uint32_t hwreg = 26 | (offset << 6) | ((width - 1) << 11);
-             Value reg = self.create<arith::ConstantIntOp>(hwreg, 32);
-             Value val = self.create<arith::ConstantIntOp>(value, 32);
-             self.create<LLVM::CallIntrinsicOp>(
-                 self.getBuilder().getStringAttr("llvm.amdgcn.s.setreg"),
-                 ValueRange{reg, val});
-           })
       .def("create_warp_vote",
            [](TritonOpBuilder &self, Value pred,
               const std::string &kind) -> mlir::Value {

@@ -29,6 +29,11 @@ def _grouped_gemm_tflops(ms: float, m_list: list[int], n: int, k: int) -> float:
     return total_flops / (ms * 1e-3) / 1e12
 
 
+def _grouped_gemm_enable_wmma_queuing(block_m, block_n, num_buffers, c_staging_mode, cross_tile_prefetch):
+    # The square single-wave-per-SIMD schedules benefit from SCHED_MODE[2].
+    return block_m == block_n == 256 and (cross_tile_prefetch or (c_staging_mode == 0 and num_buffers == 2))
+
+
 _XCD_REMAP_MODES = {
     "none": 0,
     "balanced": 1,
@@ -547,10 +552,6 @@ def _grouped_gemm_tdm_impl(
     CROSS_GROUP_PREFETCH: tl.constexpr = OPTIMIZE_CROSS_TILE and not HYBRID_TILE_PREFETCH
     OPTIMIZE_ALIAS_C: tl.constexpr = C_STAGING_MODE == 0 and BLOCK_M == 256 and BLOCK_N == 256 and NUM_BUFFERS == 2
     LIMIT_DOT_LIFETIME: tl.constexpr = OPTIMIZE_CROSS_TILE or OPTIMIZE_ALIAS_C
-    if LIMIT_DOT_LIFETIME:
-        # CDNA5 SCHED_MODE[2] lets this single-wave-per-SIMD schedule queue
-        # WMMAs while independent scalar and memory instructions execute.
-        tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
     DIRECT_LOAD_OFFSETS: tl.constexpr = OPTIMIZE_CROSS_TILE and L2_PREFETCH_DISTANCE == 0
     K_BLOCKS_PER_LOOP: tl.constexpr = 1 if CROSS_GROUP_PREFETCH else NUM_BUFFERS
     NUM_SUBTILES: tl.constexpr = 4
@@ -1366,6 +1367,8 @@ def grouped_gemm_tdm(
             CLUSTER_MULTICAST=cluster_multicast,
             num_warps=4,
             waves_per_eu=1,
+            enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
+                                                                  cross_tile_prefetch),
             ctas_per_cga=(cluster_size, 1, 1),
         )
 
@@ -1551,6 +1554,8 @@ def grouped_gemm_tdm_list(
             ALLOW_MN_TAILS=allow_mn_tails,
             num_warps=4,
             waves_per_eu=1,
+            enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
+                                                                  cross_tile_prefetch),
             ctas_per_cga=(cluster_size, 1, 1),
         )
 
@@ -1749,6 +1754,9 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
             CROSS_TILE_PREFETCH=tuning["CROSS_TILE_PREFETCH"], XCD_REMAP_MODE=tuning["XCD_REMAP_MODE"],
             NUM_XCDS=tuning["NUM_XCDS"], XCD_CHUNK=tuning["XCD_CHUNK"], CLUSTER_SIZE=tuning["CLUSTER_SIZE"],
             CLUSTER_MULTICAST=tuning["CLUSTER_MULTICAST"], ALLOW_MN_TAILS=cfg["ALLOW_MN_TAILS"],
+            enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(tuning["BLOCK_SIZE_M"], tuning["BLOCK_SIZE_N"],
+                                                                  tuning["NUM_BUFFERS"], tuning["C_STAGING_MODE"],
+                                                                  tuning["CROSS_TILE_PREFETCH"]),
             num_warps=tuning["num_warps"], waves_per_eu=tuning["waves_per_eu"], ctas_per_cga=(tuning["CLUSTER_SIZE"], 1,
                                                                                               1))
 
@@ -1877,7 +1885,10 @@ def test_grouped_gemm_tdm_compiles_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH):
         },
         attrs=_grouped_gemm_tdm_compile_attrs(),
     )
-    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})
+    compiled = triton_compile(
+        src, target=GPUTarget("hip", "gfx1250", 32), options=dict(
+            num_warps=4, enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(BLOCK_SIZE, BLOCK_SIZE,
+                                                                               TDM_PIPELINE_DEPTH, 0, False)))
 
     ttgir = compiled.asm["ttgir"]
     assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
@@ -1995,7 +2006,10 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, B
         },
         attrs=_grouped_gemm_tdm_compile_attrs(),
     )
-    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})
+    compiled = triton_compile(
+        src, target=GPUTarget("hip", "gfx1250", 32),
+        options=dict(num_warps=4,
+                     enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(BLOCK_M, 256, 2, C_STAGING_MODE, True)))
 
     assert compiled.metadata.shared < 320 * 1024
     ttgir = compiled.asm["ttgir"]

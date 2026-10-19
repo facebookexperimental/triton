@@ -579,53 +579,55 @@ test_gfx1250_grouped_gemm_tdm_xcd_remap = _gfx1250_grouped.test_grouped_gemm_tdm
 
 
 @triton.jit
-def _amd_wave_sched_mode_kernel(VALUE: tl.constexpr, OFFSET: tl.constexpr, WIDTH: tl.constexpr):
-    tlx.amd_set_wave_sched_mode(VALUE, offset=OFFSET, width=WIDTH)
+def _amd_wmma_queuing_kernel():
+    pass
 
 
-@pytest.mark.parametrize("value,offset,width", [(1, 2, 1), (0, 2, 1), (2, 0, 2)])
-def test_amd_wave_sched_mode_compiles(value, offset, width):
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_amd_wmma_queuing_compiles(enabled):
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
 
-    source = ASTSource(_amd_wave_sched_mode_kernel, signature={}, constexprs=dict(VALUE=value, OFFSET=offset,
-                                                                                  WIDTH=width))
-    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32))
-    hwreg = 26 | offset << 6 | (width - 1) << 11
+    source = ASTSource(_amd_wmma_queuing_kernel, signature={})
+    options = {} if enabled is None else dict(enable_wmma_queuing=enabled)
+    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32), options=options)
+    assert compiled.metadata.enable_wmma_queuing == bool(enabled)
+    assert "llvm.amdgcn.s.setreg" not in compiled.asm["ttir"]
     # A result-free intrinsic must survive optimization even in an empty kernel.
-    assert f"call void @llvm.amdgcn.s.setreg(i32 {hwreg}, i32 {value})" in compiled.asm["llir"]
+    assert compiled.asm["llir"].count("call void @llvm.amdgcn.s.setreg(i32 154, i32 1)") == int(bool(enabled))
     assert "asm sideeffect" not in compiled.asm["llir"]
-    instruction = f"s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, {offset}, {width}), {value}"
-    assert instruction in compiled.asm["amdgcn"]
+    instruction = "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1"
+    assert compiled.asm["amdgcn"].count(instruction) == int(bool(enabled))
     assert "s_mov_b32" not in compiled.asm["amdgcn"]
 
 
-@pytest.mark.parametrize("value,offset,width,message", [
-    (-1, 2, 1, "value must fit"),
-    (2, 2, 1, "value must fit"),
-    (1, -1, 1, "field must fit"),
-    (1, 32, 1, "field must fit"),
-    (0, 2, 0, "field must fit"),
-    (1, 31, 2, "field must fit"),
-    (1.0, 2, 1, "constexpr integers"),
-])
-def test_amd_wave_sched_mode_invalid_field(value, offset, width, message):
+def test_amd_wmma_queuing_cache_key():
+    from triton.backends.amd.compiler import HIPBackend
     from triton.backends.compiler import GPUTarget
-    from triton.compiler import ASTSource
 
-    source = ASTSource(_amd_wave_sched_mode_kernel, signature={}, constexprs=dict(VALUE=value, OFFSET=offset,
-                                                                                  WIDTH=width))
-    with pytest.raises(triton.CompilationError, match=message):
-        triton.compile(source, target=GPUTarget("hip", "gfx1250", 32))
+    backend = HIPBackend(GPUTarget("hip", "gfx1250", 32))
+    default = backend.parse_options({})
+    disabled = backend.parse_options(dict(enable_wmma_queuing=False))
+    enabled = backend.parse_options(dict(enable_wmma_queuing=True))
+    assert default.hash() == disabled.hash()
+    assert enabled.hash() != disabled.hash()
 
 
-def test_amd_wave_sched_mode_unsupported_target():
-    from triton.backends.compiler import GPUTarget
-    from triton.compiler import ASTSource
+@pytest.mark.parametrize("value", [0, 1, -1, 1.0, "true"])
+def test_amd_wmma_queuing_invalid_option(value):
+    from triton.backends.amd.compiler import HIPOptions
 
-    source = ASTSource(_amd_wave_sched_mode_kernel, signature={}, constexprs=dict(VALUE=1, OFFSET=2, WIDTH=1))
-    with pytest.raises(triton.CompilationError, match="requires an AMD gfx12 target"):
-        triton.compile(source, target=GPUTarget("hip", "gfx942", 64))
+    with pytest.raises(ValueError, match="enable_wmma_queuing must be a bool"):
+        HIPOptions(arch="gfx1250", enable_wmma_queuing=value)
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950", "gfx1200", "gfx1201"])
+def test_amd_wmma_queuing_unsupported_target(arch):
+    from triton.backends.amd.compiler import HIPOptions
+
+    assert not HIPOptions(arch=arch).enable_wmma_queuing
+    with pytest.raises(ValueError, match="requires an AMD gfx1250 target"):
+        HIPOptions(arch=arch, enable_wmma_queuing=True)
 
 
 @pytest.mark.parametrize("independent_ctas", [False, True])
@@ -769,7 +771,8 @@ def test_tdm_fused_multicast_distributed_correctness(device, num_ctas, split_m, 
 @pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
 @pytest.mark.parametrize("group_size", [1, 2])
 @pytest.mark.parametrize("interface", ["packed", "list"])
-def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size, interface):
+@pytest.mark.parametrize("enable_wmma_queuing", [False, True])
+def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size, interface, enable_wmma_queuing):
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
     from triton import knobs
@@ -790,11 +793,18 @@ def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size, in
                                           for k, v in signature.items()
                                           if k not in constants}, constexprs=constants, attrs=attrs)
     assert knobs.runtime.add_stages_inspection_hook is None
-    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32),
-                              options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1)))
+    compiled = triton.compile(
+        source, target=GPUTarget("hip", "gfx1250", 32),
+        options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1),
+                     enable_wmma_queuing=enable_wmma_queuing))
     assert compiled.metadata.num_ctas == 1
     assert compiled.metadata.ctas_per_cga == (cluster_size, 1, 1)
-    assert "call void @llvm.amdgcn.s.setreg(i32 154, i32 1)" in compiled.asm["llir"]
+    assert "llvm.amdgcn.s.setreg" not in compiled.asm["ttir"]
+    assert compiled.asm["llir"].count("call void @llvm.amdgcn.s.setreg(i32 154, i32 1)") == int(enable_wmma_queuing)
+    instruction = "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1"
+    assert compiled.asm["amdgcn"].count(instruction) == int(enable_wmma_queuing)
+    if enable_wmma_queuing:
+        assert compiled.asm["amdgcn"].index(instruction) < compiled.asm["amdgcn"].index("v_wmma_")
     assert f'"amdgpu-cluster-dims"="{cluster_size},1,1"' in compiled.asm["llir"]
     assert compiled.metadata.global_scratch_size == 0
     assert compiled.metadata.shared <= 320 * 1024
@@ -986,7 +996,7 @@ def test_grouped_gemm_list_gfx950_metadata(staging, cross):
                                                          GROUP_M=4, NUM_BUFFERS=2, L2_PREFETCH_DISTANCE=0,
                                                          C_STAGING_MODE=staging, CROSS_TILE_PREFETCH=cross,
                                                          XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, num_warps=4,
-                                                         waves_per_eu=1)
+                                                         waves_per_eu=1, enable_wmma_queuing=True)
     for output, a, b in zip(outputs, cpu_a, cpu_b):
         torch.testing.assert_close(output.cpu(), (a.float() @ b.float().T).half(), atol=1e-2, rtol=1e-2)
 
@@ -1051,7 +1061,8 @@ def test_grouped_gemm_list_tails_preserve_output_config(staging, cross, tdm_stor
     }
     source = ASTSource(_gfx1250_grouped.grouped_gemm_tdm_list_kernel, signature=signature, constexprs=constants,
                        attrs=_gfx1250_grouped._grouped_gemm_tdm_list_compile_attrs())
-    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4, waves_per_eu=1))
+    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32),
+                              options=dict(num_warps=4, waves_per_eu=1, enable_wmma_queuing=True))
     asm = compiled.asm["amdgcn"]
     assert asm.count("tensor_store_from_lds") == tdm_stores
     assert ("global_store" in asm) == (tdm_stores == 0)
@@ -1093,12 +1104,10 @@ def test_grouped_gemm_list_device_metadata_updates(staging, cross, tails):
     lds = torch.tensor(strides, dtype=torch.int32, device="cuda")
 
     def launch():
-        return _gfx1250_grouped.grouped_gemm_tdm_list_kernel[(2, )](*ptrs, sizes, lds, groups, K=k, NUM_PROGRAMS=2,
-                                                                    BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4,
-                                                                    NUM_BUFFERS=2, L2_PREFETCH_DISTANCE=0,
-                                                                    C_STAGING_MODE=staging, CROSS_TILE_PREFETCH=cross,
-                                                                    XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2,
-                                                                    num_warps=4, waves_per_eu=1)
+        return _gfx1250_grouped.grouped_gemm_tdm_list_kernel[(2, )](
+            *ptrs, sizes, lds, groups, K=k, NUM_PROGRAMS=2, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4,
+            NUM_BUFFERS=2, L2_PREFETCH_DISTANCE=0, C_STAGING_MODE=staging, CROSS_TILE_PREFETCH=cross, XCD_REMAP_MODE=0,
+            NUM_XCDS=8, XCD_CHUNK=2, num_warps=4, waves_per_eu=1, enable_wmma_queuing=True)
 
     launch()  # Compile and initialize the launcher before checking allocations.
     torch.cuda.synchronize()
