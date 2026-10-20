@@ -9,20 +9,27 @@ The implementation uses 64-token chunks and 16-token triangular solves:
 * consume normalized Q/K and form per-channel chunk-local cumulative log decays;
 * build causal QK and beta-scaled KK products with CDNA4 ``tl.dot`` MFMAs;
 * solve four 16x16 diagonal systems and merge their 64x64 WY inverse;
-* form W/U and scan the recurrent state sequentially between chunks;
-* add the parallel causal within-chunk output.
+* form W/U and carry the recurrent state between chunks, adding the causal
+  within-chunk output.
 
-TLX local-memory async copies stage the shared WY and causal matrices.
+The state walk streams each chunk's operands through a double-buffered TLX
+local-memory ring and writes the output as it goes. When a few long sequences
+cannot fill the GPU, it splits each sequence into time groups: one pass reduces
+every group to an affine map of its entry state, a short scan chains the maps,
+and a second pass replays every group from its true entry state. Shapes where
+the walk does not pay off use a single-pass scan plus a separate output pass.
 """
 
 from __future__ import annotations
 
+import functools
 from itertools import pairwise
 
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import tlx
+from triton.runtime.jit import constexpr_function
 
 CHUNK_SIZE = 64
 SUBCHUNK_SIZE = 16
@@ -452,6 +459,73 @@ def _form_w_u_kernel(
 
 
 @triton.jit
+def _load_scan_chunk(
+    W,
+    U,
+    Qg,
+    Bg,
+    key_base,
+    value_base,
+    token0,
+    length,
+    qw_offsets,
+    uv_offsets,
+    bg_keys,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    uv_layout: tl.constexpr,
+    uv_b_layout: tl.constexpr,
+    state_key_layout: tl.constexpr,
+):
+    # Offsets are row * stride + column with column < stride, so comparing them
+    # against the remaining rows' extent masks out rows past the sequence end.
+    remaining = length - token0
+    key_start = key_base + token0 * H * K
+    qw_mask = qw_offsets < remaining * H * K
+    q0 = tlx.buffer_load(Qg + key_start, qw_offsets, mask=qw_mask, other=0.0)
+    q1 = tlx.buffer_load(Qg + key_start + BK, qw_offsets, mask=qw_mask, other=0.0)
+    w0 = tlx.buffer_load(W + key_start, qw_offsets, mask=qw_mask, other=0.0)
+    w1 = tlx.buffer_load(W + key_start + BK, qw_offsets, mask=qw_mask, other=0.0)
+    u_value = tlx.buffer_load(
+        U + value_base + token0 * H * V,
+        uv_offsets,
+        mask=uv_offsets < remaining * H * V,
+        other=0.0,
+    )
+    last_start = key_base + (tl.minimum(token0 + BT, length) - 1) * H * K
+    decay0 = tlx.buffer_load(Bg + last_start, bg_keys)
+    decay1 = tlx.buffer_load(Bg + last_start + BK, bg_keys)
+    return (
+        tlx.require_layout(q0, uv_b_layout, pin=False),
+        tlx.require_layout(q1, uv_b_layout, pin=False),
+        tlx.require_layout(w0, uv_b_layout, pin=False),
+        tlx.require_layout(w1, uv_b_layout, pin=False),
+        tlx.require_layout(u_value, uv_layout, pin=False),
+        tlx.require_layout(decay0, state_key_layout, pin=False),
+        tlx.require_layout(decay1, state_key_layout, pin=False),
+    )
+
+
+@triton.jit
+def _copy_scan_kg(Kg, buffers, slot, key_base, token0, length, rows, keys, H: tl.constexpr, K: tl.constexpr):
+    """Start the async copy of one chunk's [BT, K] token-major tile into a shared buffer slot.
+
+    A register load of Kg in the state update's dot-operand layout would read
+    2-byte scalars; the copy reads whole rows instead.
+    """
+    tokens = token0 + rows[:, None]
+    token = tlx.async_load(
+        Kg + key_base + tokens * H * K + keys[None, :],
+        tlx.local_view(buffers, slot),
+        mask=(tokens < length) & (keys[None, :] < K),
+    )
+    tlx.async_load_commit_group([token])
+
+
+@triton.jit
 def _state_scan_kernel(
     W,
     U,
@@ -524,34 +598,72 @@ def _state_scan_kernel(
     state0 = tlx.require_layout(state0, state_layout, pin=False)
     state1 = tlx.require_layout(state1, state_layout, pin=False)
 
-    qw_keys = tl.arange(0, BK)
-    qw_rows = tl.arange(0, BT)
-    kg_rows = tl.arange(0, BT)
-    kg_keys = tl.arange(0, BK)
-    uv_values = tl.arange(0, BV)
-    uv_rows = tl.arange(0, BT)
-    out_values = value_block * BV + uv_values
     key_base = (begin * H + head) * K
     value_base = (begin * H + head) * V
 
+    # Chunk-relative offsets, already in the layouts the loads produce, so the
+    # loop only advances scalar bases.
+    qw_keys = tl.arange(0, BK)
+    qw_rows = tl.arange(0, BT)
+    qw_offsets = tlx.require_layout((qw_rows[None, :] * H * K + qw_keys[:, None]).to(tl.int32), uv_b_layout, pin=False)
+    uv_rows = tl.arange(0, BT)
+    out_values = value_block * BV + tl.arange(0, BV)
+    uv_offsets = tlx.require_layout((uv_rows[None, :] * H * V + out_values[:, None]).to(tl.int32), uv_layout, pin=False)
+    bg_keys = tlx.require_layout(state_keys.to(tl.int32), state_key_layout, pin=False)
+
+    kg_rows = tl.arange(0, BT)
+    kg_keys = tl.arange(0, K)
+    kg_buffers = tlx.local_alloc((BT, K), tl.bfloat16, 2)
+
+    # Every load in the scan depends only on the chunk, not on the state, so
+    # chunk i + 1 is fetched while chunk i computes. The loads past the last
+    # chunk are fully masked except decay, which rereads the last token.
+    _copy_scan_kg(Kg, kg_buffers, 0, key_base, 0, length, kg_rows, kg_keys, H, K)
+    q0, q1, w0, w1, u_value, decay0, decay1 = _load_scan_chunk(
+        W,
+        U,
+        Qg,
+        Bg,
+        key_base,
+        value_base,
+        0,
+        length,
+        qw_offsets,
+        uv_offsets,
+        bg_keys,
+        H,
+        K,
+        V,
+        BT,
+        BK,
+        uv_layout,
+        uv_b_layout,
+        state_key_layout,
+    )
     for local_chunk in range(num_chunks):
         token0 = local_chunk * BT
-        qw_offsets0 = ((token0 + qw_rows[None, :]) * H * K + qw_keys[:, None]).to(tl.int32)
-        qw_offsets0 = tlx.require_layout(qw_offsets0, uv_b_layout, pin=False)
-        qw_offsets1 = qw_offsets0 + BK
-        qw_mask = tlx.require_layout(
-            ((token0 + qw_rows[None, :] < length) & (qw_keys[:, None] < BK)).to(tl.int8),
+        _copy_scan_kg(Kg, kg_buffers, (local_chunk + 1) % 2, key_base, token0 + BT, length, kg_rows, kg_keys, H, K)
+        nq0, nq1, nw0, nw1, nu_value, ndecay0, ndecay1 = _load_scan_chunk(
+            W,
+            U,
+            Qg,
+            Bg,
+            key_base,
+            value_base,
+            token0 + BT,
+            length,
+            qw_offsets,
+            uv_offsets,
+            bg_keys,
+            H,
+            K,
+            V,
+            BT,
+            BK,
+            uv_layout,
             uv_b_layout,
-            pin=False,
-        ) != 0
-        q0 = tlx.buffer_load(Qg + key_base, qw_offsets0, mask=qw_mask, other=0.0)
-        q1 = tlx.buffer_load(Qg + key_base, qw_offsets1, mask=qw_mask, other=0.0)
-        w0 = tlx.buffer_load(W + key_base, qw_offsets0, mask=qw_mask, other=0.0)
-        w1 = tlx.buffer_load(W + key_base, qw_offsets1, mask=qw_mask, other=0.0)
-        q0 = tlx.require_layout(q0, uv_b_layout, pin=False)
-        q1 = tlx.require_layout(q1, uv_b_layout, pin=False)
-        w0 = tlx.require_layout(w0, uv_b_layout, pin=False)
-        w1 = tlx.require_layout(w1, uv_b_layout, pin=False)
+            state_key_layout,
+        )
 
         state_lhs0 = tlx.require_layout(state0.to(tl.bfloat16), uv_a_layout, pin=False)
         state_lhs1 = tlx.require_layout(state1.to(tl.bfloat16), uv_a_layout, pin=False)
@@ -562,62 +674,374 @@ def _state_scan_kernel(
         prediction = tl.dot(state_lhs0, w0, acc=prediction, out_dtype=tl.float32)
         prediction = tl.dot(state_lhs1, w1, acc=prediction, out_dtype=tl.float32)
 
-        result_offsets = ((token0 + uv_rows[None, :]) * H * V + out_values[:, None]).to(tl.int32)
-        result_offsets = tlx.require_layout(result_offsets, uv_layout, pin=False)
-        result_mask = tlx.require_layout(
-            ((token0 + uv_rows[None, :] < length) & (out_values[:, None] < V)).to(tl.int8),
-            uv_layout,
-            pin=False,
-        ) != 0
-        u_value = tlx.buffer_load(
-            U + value_base,
-            result_offsets,
-            mask=result_mask,
-            other=0.0,
-        ).to(tl.float32)
-        u_value = tlx.require_layout(u_value, uv_layout, pin=False)
-        new_value = u_value - prediction
+        new_value = u_value.to(tl.float32) - prediction
+        result_mask = uv_offsets < (length - token0) * H * V
         tlx.buffer_store(
             inter.to(Output.dtype.element_ty),
-            Output + value_base,
-            result_offsets,
+            Output + value_base + token0 * H * V,
+            uv_offsets,
             mask=result_mask,
         )
         tlx.buffer_store(
             new_value.to(tl.bfloat16),
-            VNew + value_base,
-            result_offsets,
+            VNew + value_base + token0 * H * V,
+            uv_offsets,
             mask=result_mask,
         )
 
-        kg_offsets0 = ((token0 + kg_rows[:, None]) * H * K + kg_keys[None, :]).to(tl.int32)
-        kg_offsets0 = tlx.require_layout(kg_offsets0, state_b_layout, pin=False)
-        kg_offsets1 = kg_offsets0 + BK
-        kg_mask = tlx.require_layout(
-            ((token0 + kg_rows[:, None] < length) & (kg_keys[None, :] < BK)).to(tl.int8),
-            state_b_layout,
-            pin=False,
-        ) != 0
-        kg0 = tlx.buffer_load(Kg + key_base, kg_offsets0, mask=kg_mask, other=0.0)
-        kg1 = tlx.buffer_load(Kg + key_base, kg_offsets1, mask=kg_mask, other=0.0)
-        kg0 = tlx.require_layout(kg0, state_b_layout, pin=False)
-        kg1 = tlx.require_layout(kg1, state_b_layout, pin=False)
-
-        last_token = tl.minimum(token0 + BT, length) - 1
-        bg_offsets = (last_token * H * K + state_keys).to(tl.int32)
-        bg_offsets = tlx.require_layout(bg_offsets, state_key_layout, pin=False)
-        decay0 = tlx.buffer_load(Bg + key_base, bg_offsets).to(tl.float32)
-        decay1 = tlx.buffer_load(Bg + key_base, bg_offsets + BK).to(tl.float32)
-        decay0 = tlx.require_layout(tl.exp(decay0), state_key_layout, pin=False)
-        decay1 = tlx.require_layout(tl.exp(decay1), state_key_layout, pin=False)
-        state0 *= decay0[None, :]
-        state1 *= decay1[None, :]
+        state0 *= tlx.require_layout(tl.exp(decay0.to(tl.float32)), state_key_layout, pin=False)[None, :]
+        state1 *= tlx.require_layout(tl.exp(decay1.to(tl.float32)), state_key_layout, pin=False)[None, :]
         state_lhs = tlx.require_layout(new_value.to(tl.bfloat16), state_a_layout, pin=False)
+        kg_ready = tlx.async_load_wait_group(1)
+        kg_tile = tlx.local_view(kg_buffers, local_chunk % 2)
+        kg0 = tlx.local_load(tlx.local_slice(kg_tile, [0, 0], [BT, BK]), token=kg_ready, layout=state_b_layout)
+        kg1 = tlx.local_load(tlx.local_slice(kg_tile, [0, BK], [BT, BK]), token=kg_ready, layout=state_b_layout)
         state0 = tl.dot(state_lhs, kg0, acc=state0, out_dtype=tl.float32)
         state1 = tl.dot(state_lhs, kg1, acc=state1, out_dtype=tl.float32)
 
+        q0, q1, w0, w1, u_value, decay0, decay1 = nq0, nq1, nw0, nw1, nu_value, ndecay0, ndecay1
+
     tlx.buffer_store(state0, FinalState + state_base, state_offsets, mask=state_mask)
     tlx.buffer_store(state1, FinalState + state_base + BK, state_offsets, mask=state_mask)
+
+
+@constexpr_function
+def _ring_layout(rows, cols, pad):
+    """Padded LDS image for a [rows, cols] bf16 slot that async copies fill and MFMA operands read.
+
+    One wave's direct-to-LDS copy writes 512 contiguous elements, so padding
+    goes after each 512. The rows within a 16-row MFMA read sit in different
+    512-element blocks, which gives each a distinct pad and so a distinct bank.
+    Builds without padded layouts (uTLX on ROCm Triton 3.8) get the default image.
+    """
+    padded = getattr(tlx, "padded_shared_layout_encoding", None)
+    if padded is None:
+        return None
+    column_bits = cols.bit_length() - 1
+    row_bits = rows.bit_length() - 1
+    block_row_bits = (512 // cols).bit_length() - 1
+    low_row_bits = row_bits - block_row_bits
+    bases = [[0, 1 << b] for b in range(column_bits)]
+    bases += [[1 << b, 0] for b in range(low_row_bits, row_bits)]
+    bases += [[1 << b, 0] for b in range(low_row_bits)]
+    return padded.with_bases([[512, pad]], bases, [rows, cols])
+
+
+@triton.jit
+def _copy_walk_chunk(
+    W,
+    Kg,
+    Qg,
+    U,
+    Aqk,
+    Bg,
+    w_buffers,
+    kg_buffers,
+    q_buffers,
+    u_buffers,
+    a_buffers,
+    decay_buffers,
+    slot,
+    key_base,
+    value_base,
+    token0,
+    length,
+    copy_rows,
+    keys,
+    u_offsets,
+    u_columns,
+    a_offsets,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    WANT_O: tl.constexpr,
+):
+    """Start one chunk's async copies into a ring slot, as a single commit group.
+
+    One group per chunk keeps the wait a plain "one group pending" that both
+    TLX backends turn into a partial vmcnt.
+    """
+    rows_left = copy_rows[:, None] < length - token0
+    key_mask = rows_left & (keys[None, :] < K)
+    key_offsets = key_base + (token0 + copy_rows[:, None]) * H * K + keys[None, :]
+    w = tlx.async_load(W + key_offsets, tlx.local_view(w_buffers, slot), mask=key_mask)
+    kg = tlx.async_load(Kg + key_offsets, tlx.local_view(kg_buffers, slot), mask=key_mask)
+    u = tlx.async_load(
+        U + value_base + token0 * H * V + u_offsets,
+        tlx.local_view(u_buffers, slot),
+        mask=rows_left & (u_columns[None, :] < V),
+    )
+    last = tl.minimum(token0 + BT, length) - 1
+    decay = tlx.async_load(Bg + key_base + last * H * K + keys, tlx.local_view(decay_buffers, slot), mask=keys < K)
+    if WANT_O:
+        q = tlx.async_load(Qg + key_offsets, tlx.local_view(q_buffers, slot), mask=key_mask)
+        a = tlx.async_load(
+            Aqk + token0 * H * BT + a_offsets,
+            tlx.local_view(a_buffers, slot),
+            mask=rows_left & (copy_rows[None, :] < BT),
+        )
+        tlx.async_load_commit_group([w, kg, u, decay, q, a])
+    else:
+        tlx.async_load_commit_group([w, kg, u, decay])
+
+
+@triton.jit
+def _state_walk_kernel(
+    W,
+    U,
+    Kg,
+    Qg,
+    Bg,
+    Aqk,
+    InitialState,
+    Output,
+    FinalState,
+    CuSeqLens,
+    GroupIn,
+    GroupB,
+    GroupM,
+    num_groups,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    NW: tl.constexpr,
+    PASS: tl.constexpr,
+):
+    """Walk one (row slice, sequence, head, chunk group) of the recurrence, output included.
+
+    Every warp owns whole [BV, K] state rows, so the state, v_new and their bf16
+    operands stay in registers. Each chunk's W, Kg, U, decay, Qg and Aqk come
+    through a two-slot shared-memory ring, and the output is formed as
+    o = Qg S^T + Aqk v_new^T in a token-major layout, so neither v_new nor a
+    partial output goes back to memory.
+
+    A chunk maps the state affinely, S' = S (D - W^T Kg) + U^T Kg, so a run of
+    chunks composes to S_out = S_in M + B. PASS 0 walks whole sequences. PASS 1
+    finds each group's B (value rows, from zero) and M (rows past V: identity
+    rows with U dropped), except group 0, which starts from the initial state
+    and yields group 1's entry state. After _group_scan_kernel chains the
+    groups, PASS 2 walks every group from its entry state and writes the output.
+    """
+    value_block = tl.program_id(0)
+    sequence_head = tl.program_id(1)
+    group = tl.program_id(2)
+    sequence = sequence_head // H
+    head = sequence_head % H
+    begin = tl.load(CuSeqLens + sequence).to(tl.int32)
+    length = tl.load(CuSeqLens + sequence + 1).to(tl.int32) - begin
+    num_chunks = tl.cdiv(length, BT)
+    TH: tl.constexpr = BT // 2
+    WANT_O: tl.constexpr = PASS != 1
+    if PASS == 1:
+        # Pass 1 rows past V are transfer rows; group 0 needs only value rows.
+        if value_block * BV >= V and group == 0:
+            return
+    base_chunks = num_chunks // num_groups
+    extra_chunks = num_chunks - base_chunks * num_groups
+    chunk_lo = group * base_chunks + tl.minimum(group, extra_chunks)
+    chunk_hi = chunk_lo + base_chunks + tl.where(group < extra_chunks, 1, 0)
+    group_plane = (group * tl.num_programs(1) + sequence_head).to(tl.int64)
+
+    # The state and v_new: warps along value rows. The output: warps along
+    # value columns, so its stores run along V.
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[NW, 1])
+    a_op: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=4)
+    b_op: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=4)
+    key_layout: tl.constexpr = tlx.slice_layout(mma, 0)
+    out_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
+                                                warps_per_cta=[1, NW])
+    out_a_op: tl.constexpr = tlx.dot_operand_layout(0, out_mma, k_width=4)
+    out_b_op: tl.constexpr = tlx.dot_operand_layout(1, out_mma, k_width=4)
+
+    values = value_block * BV + tl.arange(0, BV)
+    keys = tl.arange(0, K)
+    state_offsets = tlx.require_layout((values[:, None] * K + keys[None, :]).to(tl.int32), mma, pin=False)
+    state_mask = tlx.require_layout(((values[:, None] < V) & (keys[None, :] < K)).to(tl.int8), mma, pin=False) != 0
+    state_base = sequence_head * K * V
+    if PASS == 2:
+        if group == 0:
+            start = InitialState + state_base
+        else:
+            start = GroupIn + group_plane * (V * K)
+    else:
+        start = InitialState + state_base
+    state = tlx.buffer_load(start, state_offsets, mask=state_mask, other=0.0).to(tl.float32)
+    state = tlx.require_layout(state, mma, pin=False)
+    if PASS == 1:
+        eye = tlx.require_layout((keys[None, :] == values[:, None] - V).to(tl.float32), mma, pin=False)
+        # Transfer rows load as zero and eye is zero on value rows.
+        state = state * tl.where(group == 0, 1.0, 0.0) + eye
+
+    key_base = (begin * H + head) * K
+    value_base = (begin * H + head) * V
+    copy_rows = tl.arange(0, BT)
+    u_offsets = copy_rows[:, None] * H * V + values[None, :]
+    a_columns = tl.arange(0, BT)
+    a_offsets = (copy_rows[:, None] * H + head) * BT + a_columns[None, :] + begin * H * BT
+    # Transposed reads (w, u) want a 4-element pad; kg's plain b-operand
+    # reads want 16.
+    w_buffers = tlx.local_alloc((BT, K), tl.bfloat16, 2, layout=_ring_layout(BT, K, 4))
+    kg_buffers = tlx.local_alloc((BT, K), tl.bfloat16, 2, layout=_ring_layout(BT, K, 16))
+    u_buffers = tlx.local_alloc((BT, BV), tl.bfloat16, 2, layout=_ring_layout(BT, BV, 4))
+    decay_buffers = tlx.local_alloc((K, ), tl.float32, 2)
+    if WANT_O:
+        q_buffers = tlx.local_alloc((BT, K), tl.bfloat16, 2, layout=_ring_layout(BT, K, 4))
+        a_buffers = tlx.local_alloc((BT, BT), tl.bfloat16, 2, layout=_ring_layout(BT, BT, 4))
+        out_rows = tl.arange(0, BT)
+        out_offsets = tlx.require_layout((out_rows[:, None] * H * V + values[None, :]).to(tl.int32), out_mma)
+    else:
+        q_buffers = w_buffers
+        a_buffers = w_buffers
+
+    _copy_walk_chunk(
+        W,
+        Kg,
+        Qg,
+        U,
+        Aqk,
+        Bg,
+        w_buffers,
+        kg_buffers,
+        q_buffers,
+        u_buffers,
+        a_buffers,
+        decay_buffers,
+        0,
+        key_base,
+        value_base,
+        chunk_lo * BT,
+        length,
+        copy_rows,
+        keys,
+        u_offsets,
+        values,
+        a_offsets,
+        H,
+        K,
+        V,
+        BT,
+        WANT_O,
+    )
+    for local_chunk in range(chunk_lo, chunk_hi):
+        token0 = local_chunk * BT
+        slot = (local_chunk - chunk_lo) % 2
+        # Wait before issuing the next chunk's copies: uTLX lowers every wait
+        # to vmcnt(0), which would otherwise also wait for the prefetch.
+        ready = tlx.async_load_wait_group(0)
+        _copy_walk_chunk(
+            W,
+            Kg,
+            Qg,
+            U,
+            Aqk,
+            Bg,
+            w_buffers,
+            kg_buffers,
+            q_buffers,
+            u_buffers,
+            a_buffers,
+            decay_buffers,
+            1 - slot,
+            key_base,
+            value_base,
+            token0 + BT,
+            length,
+            copy_rows,
+            keys,
+            u_offsets,
+            values,
+            a_offsets,
+            H,
+            K,
+            V,
+            BT,
+            WANT_O,
+        )
+        w_tile = tlx.local_view(w_buffers, slot)
+        kg_tile = tlx.local_view(kg_buffers, slot)
+        u_tile = tlx.local_view(u_buffers, slot)
+
+        # Every operand change below is register-trivial for this MFMA
+        # config; pinning each one keeps layout propagation from undoing that.
+        state_bf16 = tlx.require_layout(state.to(tl.bfloat16), mma)
+        state_lhs = tlx.require_layout(state_bf16, a_op)
+        zero = tlx.zeros((BV, TH), tl.float32, layout=mma)
+        w0 = tlx.local_load(tlx.local_trans(tlx.local_slice(w_tile, [0, 0], [TH, K])), token=ready, layout=b_op)
+        w1 = tlx.local_load(tlx.local_trans(tlx.local_slice(w_tile, [TH, 0], [TH, K])), token=ready, layout=b_op)
+        u0 = tlx.local_load(tlx.local_trans(tlx.local_slice(u_tile, [0, 0], [TH, BV])), token=ready, layout=a_op)
+        u1 = tlx.local_load(tlx.local_trans(tlx.local_slice(u_tile, [TH, 0], [TH, BV])), token=ready, layout=a_op)
+        u0 = tlx.require_layout(u0, mma).to(tl.float32)
+        u1 = tlx.require_layout(u1, mma).to(tl.float32)
+        v0 = tlx.require_layout((u0 - tlx.require_layout(tl.dot(state_lhs, w0, acc=zero), mma)).to(tl.bfloat16), mma)
+        v1 = tlx.require_layout((u1 - tlx.require_layout(tl.dot(state_lhs, w1, acc=zero), mma)).to(tl.bfloat16), mma)
+        if WANT_O:
+            q = tlx.local_load(tlx.local_view(q_buffers, slot), token=ready, layout=out_a_op)
+            a_tile = tlx.local_view(a_buffers, slot)
+            a0 = tlx.local_load(tlx.local_slice(a_tile, [0, 0], [BT, TH]), token=ready, layout=out_a_op)
+            a1 = tlx.local_load(tlx.local_slice(a_tile, [0, TH], [BT, TH]), token=ready, layout=out_a_op)
+            out = tlx.zeros((BT, BV), tl.float32, layout=out_mma)
+            out = tl.dot(q, tlx.require_layout(tl.trans(state_bf16), out_b_op), acc=out)
+            out = tl.dot(a0, tlx.require_layout(tl.trans(v0), out_b_op), acc=out)
+            out = tlx.require_layout(tl.dot(a1, tlx.require_layout(tl.trans(v1), out_b_op), acc=out), out_mma)
+            tlx.buffer_store(
+                out.to(Output.dtype.element_ty),
+                Output + value_base + token0 * H * V,
+                out_offsets,
+                mask=out_offsets < (length - token0) * H * V,
+            )
+
+        decay = tlx.local_load(tlx.local_view(decay_buffers, slot), token=ready)
+        state *= tlx.require_layout(tl.exp(decay), key_layout, pin=False)[None, :]
+        kg0 = tlx.local_load(tlx.local_slice(kg_tile, [0, 0], [TH, K]), token=ready, layout=b_op)
+        kg1 = tlx.local_load(tlx.local_slice(kg_tile, [TH, 0], [TH, K]), token=ready, layout=b_op)
+        state = tl.dot(tlx.require_layout(v0, a_op), kg0, acc=state)
+        state = tlx.require_layout(tl.dot(tlx.require_layout(v1, a_op), kg1, acc=state), mma)
+
+    if PASS == 1:
+        if group == 0:
+            dest = GroupIn + (tl.num_programs(1) + group_plane) * (V * K)
+        else:
+            dest = GroupB + group_plane * (V * K)
+        tlx.buffer_store(state, dest, state_offsets, mask=state_mask)
+        if group != 0:
+            tlx.buffer_store(
+                state.to(GroupM.dtype.element_ty),
+                GroupM + group_plane * (K * K),
+                state_offsets - V * K,
+                mask=state_offsets >= V * K,
+            )
+    elif group == num_groups - 1:
+        tlx.buffer_store(state, FinalState + state_base, state_offsets, mask=state_mask)
+
+
+@triton.jit
+def _group_scan_kernel(
+    GroupIn,
+    GroupB,
+    GroupM,
+    num_groups,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """Chain the scan's chunk groups: entry[g + 1] = entry[g] M_g + B_g."""
+    value_block = tl.program_id(0)
+    sequence_head = tl.program_id(1)
+    planes = tl.num_programs(1)
+    values = value_block * BV + tl.arange(0, BV)
+    keys = tl.arange(0, K)
+    state_offsets = values[:, None] * K + keys[None, :]
+    m_offsets = keys[:, None] * K + keys[None, :]
+    state = tl.load(GroupIn + (planes + sequence_head).to(tl.int64) * (V * K) + state_offsets)
+    for group in tl.range(1, num_groups - 1, num_stages=3):
+        plane = (group * planes + sequence_head).to(tl.int64)
+        transfer = tl.load(GroupM + plane * (K * K) + m_offsets)
+        offset = tl.load(GroupB + plane * (V * K) + state_offsets)
+        state = tl.dot(state.to(tl.bfloat16), transfer, acc=offset, out_dtype=tl.float32)
+        tl.store(GroupIn + (plane + planes) * (V * K) + state_offsets, state)
 
 
 @triton.jit
@@ -668,6 +1092,110 @@ def _output_tail_kernel(
         (old + intra).to(Output.dtype.element_ty),
         mask=value_mask,
     )
+
+
+def _scan_groups(num_sequences: int, heads: int, num_chunks: int, device: torch.device) -> int:
+    """Time groups per sequence, so a few long sequences still fill the GPU."""
+    chunks_per_sequence = num_chunks // max(num_sequences, 1)
+    groups = min(3 * _num_cus(device) // (4 * num_sequences * heads), chunks_per_sequence // 4, 32)
+    return groups if chunks_per_sequence >= 48 and groups >= 2 else 1
+
+
+@functools.cache
+def _num_cus(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _launch_state_scan(w, u, gated_key, gated_query, cumulative_gate, aqk, initial_state, output, final_state,
+                       cu_seqlens, chunk_indices, num_sequences, heads, num_chunks, key_dim, value_dim):
+    """Carry the state across chunks, writing the output and the final state.
+
+    The walk splits long sequences into time groups when there are too few
+    sequences to fill the GPU; the single-pass scan plus output tail covers the
+    shapes where the walk does not pay off.
+    """
+    planes = num_sequences * heads
+    groups = _scan_groups(num_sequences, heads, num_chunks, initial_state.device)
+    # Without padded LDS images (uTLX on ROCm Triton 3.8) the walk's operand reads
+    # bank-conflict, so it only pays off when the time split adds a lot of
+    # parallelism.
+    if hasattr(tlx, "padded_shared_layout_encoding"):
+        use_walk = groups > 1 or planes >= 96
+    else:
+        use_walk = groups >= 16
+    common = dict(H=heads, K=key_dim, V=value_dim, BT=CHUNK_SIZE, num_stages=2)
+
+    if not use_walk:
+        block_value = 32 if heads >= 12 and num_sequences >= 4 else 16
+        v_new = torch.empty_like(u)
+        _state_scan_kernel[(value_dim // block_value, planes)](
+            w,
+            u,
+            gated_key,
+            gated_query,
+            cumulative_gate,
+            initial_state,
+            v_new,
+            output,
+            final_state,
+            cu_seqlens,
+            BV=block_value,
+            num_warps=4,
+            waves_per_eu=1 if heads >= 12 and num_sequences >= 8 else 2,
+            **common,
+        )
+        _output_tail_kernel[(num_chunks, heads, 2)](
+            aqk,
+            v_new,
+            output,
+            cu_seqlens,
+            chunk_indices,
+            H=heads,
+            V=value_dim,
+            BT=CHUNK_SIZE,
+            BV=64,
+            num_warps=4,
+            num_stages=2,
+            waves_per_eu=4,
+        )
+        return
+
+    walk_args = (w, u, gated_key, gated_query, cumulative_gate, aqk, initial_state, output, final_state, cu_seqlens)
+
+    def walk(pass_id, num_warps, grid_groups, group_buffers):
+        rows = value_dim + key_dim if pass_id == 1 else value_dim
+        _state_walk_kernel[(1, planes, grid_groups)](
+            *walk_args,
+            *group_buffers,
+            BV=rows,
+            NW=num_warps,
+            PASS=pass_id,
+            num_warps=num_warps,
+            waves_per_eu=1,
+            **common,
+        )
+
+    if groups == 1:
+        # Pass 0 never touches the group buffers.
+        walk(0, 8, 1, (initial_state, initial_state, initial_state, 1))
+        return
+    group_in = torch.empty((groups, planes, value_dim, key_dim), dtype=torch.float32, device=initial_state.device)
+    group_b = torch.empty_like(group_in)
+    group_m = torch.empty((groups, planes, key_dim, key_dim), dtype=torch.bfloat16, device=initial_state.device)
+    group_buffers = (group_in, group_b, group_m, groups)
+    walk(1, 4, groups - 1, group_buffers)
+    if groups > 2:
+        _group_scan_kernel[(value_dim // 16, planes)](
+            group_in,
+            group_b,
+            group_m,
+            groups,
+            K=key_dim,
+            V=value_dim,
+            BV=16,
+            num_warps=4,
+        )
+    walk(2, 8, groups, group_buffers)
 
 
 def _validate_prefill_inputs(
@@ -825,44 +1353,25 @@ def kda_paged_prefill(
         num_warps=4,
     )
 
-    v_new = torch.empty_like(v)
     output = torch.empty_like(v)
     final_state = torch.empty_like(initial_state)
-    state_block_value = 32 if heads >= 12 and num_sequences >= 4 else 16
-    state_waves_per_eu = 1 if heads >= 12 and num_sequences >= 8 else 2
-    _state_scan_kernel[(triton.cdiv(value_dim, state_block_value), num_sequences * heads)](
+    _launch_state_scan(
         w,
         u,
         gated_key,
         gated_query,
         cumulative_gate,
+        aqk,
         initial_state,
-        v_new,
         output,
         final_state,
         cu_seqlens,
-        H=heads,
-        K=key_dim,
-        V=value_dim,
-        BT=CHUNK_SIZE,
-        BV=state_block_value,
-        num_warps=4,
-        num_stages=2,
-        waves_per_eu=state_waves_per_eu,
-    )
-    _output_tail_kernel[(num_chunks, heads, 2)](
-        aqk,
-        v_new,
-        output,
-        cu_seqlens,
         chunk_indices,
-        H=heads,
-        V=value_dim,
-        BT=CHUNK_SIZE,
-        BV=64,
-        num_warps=4,
-        num_stages=2,
-        waves_per_eu=4,
+        num_sequences,
+        heads,
+        num_chunks,
+        key_dim,
+        value_dim,
     )
     return output.unsqueeze(0), final_state
 
