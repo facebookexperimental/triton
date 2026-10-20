@@ -477,10 +477,13 @@ LinearLayout ReduceOpHelper::reducedRegLaneLayout(RankedTensorType srcTy,
                                                   int axis) {
   auto *ctx = srcTy.getContext();
   auto kReg = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
   auto reduced = toLinearLayout(srcTy);
   reduced = actionRemoveBroadcastedRegs(reduced).apply(reduced);
   reduced = moveAxisBasesToFront(reduced, axis).apply(reduced);
   reduced = zeroBasesAlongDimAndReorder(reduced, axis, kReg);
+  if (reduced.getInDimSize(kLane) == 64)
+    reduced = zeroBasesAlongDimAndReorder(reduced, axis, kLane);
   reduced = actionRemoveBroadcastedRegs(reduced).apply(reduced);
   return reduced;
 }

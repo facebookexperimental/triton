@@ -20,6 +20,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -86,6 +87,8 @@ private:
         vals = removeBroadcast.apply(vals);
     }
 
+    std::tie(regLl, accs) =
+        reduceWithinThreads(op, std::move(regLl), std::move(accs), rewriter);
     std::tie(regLl, accs) =
         reduceWithinWarps(op, std::move(regLl), std::move(accs), rewriter);
 
@@ -720,9 +723,9 @@ private:
   }
 
   std::pair<LinearLayout, SmallVector<SmallVector<Value>>>
-  reduceWithinWarps(triton::ReduceOp op, LinearLayout layout,
-                    SmallVector<SmallVector<Value>> accs,
-                    ConversionPatternRewriter &rewriter) const {
+  reduceWithinThreads(triton::ReduceOp op, LinearLayout layout,
+                      SmallVector<SmallVector<Value>> accs,
+                      ConversionPatternRewriter &rewriter) const {
     auto *ctx = op.getContext();
     auto loc = op.getLoc();
     unsigned axis = op.getAxis();
@@ -825,6 +828,70 @@ private:
     layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, axis, kReg);
     layout = layout.removeZeroBasesAlongDim(kReg);
     return {std::move(layout), std::move(accs)};
+  }
+
+  std::pair<LinearLayout, SmallVector<SmallVector<Value>>>
+  reduceWithinWarps(triton::ReduceOp op, LinearLayout layout,
+                    SmallVector<SmallVector<Value>> accs,
+                    ConversionPatternRewriter &rewriter) const {
+    auto *ctx = op.getContext();
+    auto kLane = str_attr("lane");
+    if (layout.getInDimSize(kLane) != 64)
+      return {std::move(layout), std::move(accs)};
+
+    const auto &laneBases = layout.getBases().lookup(kLane);
+    unsigned reduceLaneIdMask = 0;
+    for (unsigned bit = 0; bit < laneBases.size(); ++bit) {
+      if (laneBases[bit][op.getAxis()] != 0)
+        reduceLaneIdMask |= 1u << bit;
+    }
+    if (reduceLaneIdMask == 0)
+      return {std::move(layout), std::move(accs)};
+
+    for (unsigned reg = 0; reg < accs.front().size(); ++reg) {
+      SmallVector<Value> acc(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i)
+        acc[i] = accs[i][reg];
+
+      warpReduceLaneMask(rewriter, op, acc, reduceLaneIdMask);
+
+      for (unsigned i = 0; i < op.getNumOperands(); ++i)
+        accs[i][reg] = acc[i];
+    }
+
+    layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, op.getAxis(),
+                                                        kLane);
+    return {std::move(layout), std::move(accs)};
+  }
+
+  void warpReduceLaneMask(ConversionPatternRewriter &rewriter,
+                         triton::ReduceOp op, SmallVector<Value> &acc,
+                         unsigned reduceLaneIdMask) const {
+    auto moduleOp = op->getParentOfType<ModuleOp>();
+    unsigned warpSize =
+        triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+    assert(reduceLaneIdMask < warpSize &&
+           "expected reduce lane ID mask to be smaller than the warp size");
+
+    unsigned firstBit = llvm::countr_zero(reduceLaneIdMask);
+    unsigned numBits = llvm::popcount(reduceLaneIdMask);
+    unsigned contiguousMask = ((1u << numBits) - 1) << firstBit;
+
+    if (reduceLaneIdMask == contiguousMask) {
+      warpReduce(rewriter, op.getLoc(), acc, op, 1u << numBits, 1u << firstBit);
+      return;
+    }
+
+    for (int bit = llvm::Log2_32(warpSize) - 1; bit >= 0; --bit) {
+      unsigned mask = 1u << bit;
+      if ((reduceLaneIdMask & mask) == 0)
+        continue;
+      SmallVector<Value> shuffled(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i)
+        shuffled[i] =
+            targetInfo.shuffleXor(rewriter, op.getLoc(), acc[i], mask);
+      accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shuffled);
+    }
   }
 
   // Apply warp reduction across the given number of contiguous lanes using op
