@@ -7,9 +7,12 @@ module.exports = async ({github, context, jobName, platform}) => {
   });
   const cutoff = new Date(current.created_at);
   const gpu = [ "h100", "b200", "mi350" ].includes(platform);
-  // Keep pre-migration history available until the new parent has green runs.
-  const workflows = gpu ? [ current.workflow_id, `${platform}.yml` ]
-                        : [ current.workflow_id ];
+  // Keep pre-migration history available until the new parent has green runs:
+  // the per-GPU workflows', and gpu-tests.yml's for suites that moved to
+  // gpu-tests-nightly.yml.
+  const workflows =
+      gpu ? [ current.workflow_id, "gpu-tests.yml", `${platform}.yml` ]
+          : [ current.workflow_id ];
   const candidates = [];
   for (const workflow_id of workflows) {
     const {data} = await github.rest.actions.listWorkflowRuns({

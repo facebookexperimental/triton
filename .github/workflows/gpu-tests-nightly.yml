@@ -1,0 +1,364 @@
+name: Meta Triton GPU Tests (nightly)
+# Slow GPU suites that PRs and pushes skip, run once a day and on demand:
+# TritonBench on H100, B200 and MI350. gpu-tests.yml stays the PR and push suite.
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-tests-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository_owner == 'facebookexperimental'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.sha }}
+
+  h100-tritonbench-test:
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: linux-gcp-h100
+    env:
+      GPU_WORKFLOW_NAME: Meta Triton H100 Tests
+      MAX_JOBS: 16
+      TORCHINDUCTOR_TLX_MODE: "off"
+      CCACHE_DIR: /tmp/fbtriton-ccache
+      CCACHE_MAXSIZE: 2G
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    outputs:
+      failures: ${{ steps.collect.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.sha }}
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          # Activate the runner environment in each composite-action shell.
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      - name: Export TritonBench env
+        run: |
+          . "${SETUP_SCRIPT}"
+          set -x
+          TRITONBENCH_TRITON_COMMIT_HASH=$(git rev-parse --verify HEAD)
+          TRITONBENCH_TRITON_REPO=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)\.git|\1|')
+          TRITONBENCH_TRITON_COMMIT=${GITHUB_REF_NAME}
+          TRITONBENCH_INSTALL_DIR=${PWD}
+          cat <<EOF >> "${SETUP_SCRIPT}"
+          if [ \${CONDA_ENV} == "${CONDA_ENV}" ] ; then
+              export TRITONBENCH_TRITON_COMMIT_HASH="${TRITONBENCH_TRITON_COMMIT_HASH}"
+              export TRITONBENCH_TRITON_REPO="${TRITONBENCH_TRITON_REPO}"
+              export TRITONBENCH_TRITON_COMMIT="${TRITONBENCH_TRITON_COMMIT}"
+              export TRITONBENCH_TRITON_INSTALL_DIR="${TRITONBENCH_INSTALL_DIR}"
+          fi
+          EOF
+      - name: Run TritonBench tests on H100 GPU
+        id: tritonbench
+        env:
+          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
+        run: |
+          . "${SETUP_SCRIPT}"
+          export TRITONBENCH_ROOT="${TRITONBENCH_ROOT:-/workspace/tritonbench}"
+          bash ./.ci/tritonbench/test-gpu.sh
+      - name: Collect nightly failure (TritonBench)
+        id: collect
+        if: always() && github.event_name == 'schedule' && failure()
+        run: |
+          BUCKET="h100-tritonbench"
+          TITLE="[nightly] ${GPU_WORKFLOW_NAME} / h100-tritonbench-test / ${BUCKET}"
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-tritonbench-test","summary":"TritonBench tests failed on H100 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
+          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
+
+  report-h100-tritonbench:
+    needs: h100-tritonbench-test
+    if: always() && github.event_name == 'schedule' && needs.h100-tritonbench-test.outputs.failures != '' && needs.h100-tritonbench-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.h100-tritonbench-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: Meta Triton H100 Tests
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: h100
+
+  reconcile-h100-tritonbench:
+    needs: h100-tritonbench-test
+    if: always() && github.event_name == 'schedule' && (needs.h100-tritonbench-test.result == 'success' || needs.h100-tritonbench-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: Meta Triton H100 Tests
+      job_name: h100-tritonbench-test
+      failures: ${{ needs.h100-tritonbench-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  b200-tritonbench-test:
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: nvidia-dgx-b200
+    env:
+      GPU_WORKFLOW_NAME: Meta Triton B200 Tests
+      MAX_JOBS: 32
+      TORCHINDUCTOR_TLX_MODE: "off"
+      CCACHE_DIR: /tmp/fbtriton-ccache
+      CCACHE_MAXSIZE: 2G
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    outputs:
+      failures: ${{ steps.collect.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.sha }}
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Install torchao
+        timeout-minutes: 10
+        uses: ./.github/actions/install-torchao
+        with:
+          platform: b200
+          setup-script: ${{ env.SETUP_SCRIPT }}
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          # Activate the runner environment in each composite-action shell.
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      - name: Export TritonBench env
+        run: |
+          . "${SETUP_SCRIPT}"
+          set -x
+          TRITONBENCH_TRITON_COMMIT_HASH=$(git rev-parse --verify HEAD)
+          TRITONBENCH_TRITON_REPO=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)\.git|\1|')
+          TRITONBENCH_TRITON_COMMIT=${GITHUB_REF_NAME}
+          TRITONBENCH_INSTALL_DIR=${PWD}
+          cat <<EOF >> "${SETUP_SCRIPT}"
+          if [ \${CONDA_ENV} == "${CONDA_ENV}" ] ; then
+              export TRITONBENCH_TRITON_COMMIT_HASH="${TRITONBENCH_TRITON_COMMIT_HASH}"
+              export TRITONBENCH_TRITON_REPO="${TRITONBENCH_TRITON_REPO}"
+              export TRITONBENCH_TRITON_COMMIT="${TRITONBENCH_TRITON_COMMIT}"
+              export TRITONBENCH_TRITON_INSTALL_DIR="${TRITONBENCH_INSTALL_DIR}"
+          fi
+          EOF
+      - name: Run TritonBench tests on B200 GPU
+        id: tritonbench
+        env:
+          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
+        run: |
+          . "${SETUP_SCRIPT}"
+          export TRITONBENCH_ROOT="${TRITONBENCH_ROOT:-/workspace/tritonbench}"
+          bash ./.ci/tritonbench/test-gpu.sh
+      - name: Collect nightly failure (TritonBench)
+        id: collect
+        if: always() && github.event_name == 'schedule' && failure()
+        run: |
+          BUCKET="b200-tritonbench"
+          TITLE="[nightly] ${GPU_WORKFLOW_NAME} / b200-tritonbench-test / ${BUCKET}"
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"b200-tritonbench-test","summary":"TritonBench tests failed on B200 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
+          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
+
+  report-b200-tritonbench:
+    needs: b200-tritonbench-test
+    if: always() && github.event_name == 'schedule' && needs.b200-tritonbench-test.outputs.failures != '' && needs.b200-tritonbench-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-tritonbench-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: Meta Triton B200 Tests
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: b200
+
+  reconcile-b200-tritonbench:
+    needs: b200-tritonbench-test
+    if: always() && github.event_name == 'schedule' && (needs.b200-tritonbench-test.result == 'success' || needs.b200-tritonbench-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: Meta Triton B200 Tests
+      job_name: b200-tritonbench-test
+      failures: ${{ needs.b200-tritonbench-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  mi350-tritonbench-test:
+    needs: build
+    if: needs.build.result == 'success'
+    env:
+      GPU_WORKFLOW_NAME: Meta Triton MI350 Tests
+      TORCHINDUCTOR_TLX_MODE: "off"
+      PYTEST_ADDOPTS: --import-mode=importlib
+    runs-on: linux-fb-triton-mi350-1
+    timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    outputs:
+      failures: ${{ steps.collect.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Checkout TritonBench
+        uses: actions/checkout@v4
+        with:
+          repository: meta-pytorch/tritonbench
+          path: tritonbench
+          submodules: recursive
+      - name: Set up test environment
+        timeout-minutes: 30
+        uses: ./.github/actions/setup-test-env
+        with:
+          backend: rocm
+          arch: gfx950
+      - name: Install TritonBench dependencies
+        working-directory: tritonbench
+        run: |
+          set -eux
+          # TritonBench owns its dependency list; on HIP, --all installs its
+          # AMD dependency group, liger and aiter into the active venv, pinning
+          # torch and numpy. TritonBench itself runs from this checkout.
+          # Must run after setup-test-env: with no torch in the venv,
+          # install.py installs its default PyTorch nightly instead, with
+          # device code for every GPU architecture. Triton is installed after
+          # it, so the prebuilt wheel's files are the ones the tests use.
+          python install.py --all
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      - name: Run TritonBench
+        id: tritonbench
+        env:
+          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
+          TRITONBENCH_ROOT: ${{ github.workspace }}/tritonbench
+        run: |
+          bash ./.ci/tritonbench/test-gpu.sh
+      - name: Collect nightly failure (TritonBench)
+        id: collect
+        if: always() && github.event_name == 'schedule' && failure()
+        run: |
+          BUCKET="amd-tritonbench"
+          TITLE="[nightly] ${GPU_WORKFLOW_NAME} / mi350-tritonbench-test / ${BUCKET}"
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-tritonbench-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
+          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
+
+  report-mi350-tritonbench:
+    needs: mi350-tritonbench-test
+    if: always() && github.event_name == 'schedule' && needs.mi350-tritonbench-test.outputs.failures != '' && needs.mi350-tritonbench-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.mi350-tritonbench-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: Meta Triton MI350 Tests
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: mi350
+
+  reconcile-mi350-tritonbench:
+    needs: mi350-tritonbench-test
+    if: always() && github.event_name == 'schedule' && (needs.mi350-tritonbench-test.result == 'success' || needs.mi350-tritonbench-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: Meta Triton MI350 Tests
+      job_name: mi350-tritonbench-test
+      failures: ${{ needs.mi350-tritonbench-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

@@ -2,7 +2,7 @@
 """Collect GPU workflow runs and render the /ci/ dashboard.
 
   collect DATA_DIR [--since ISO]
-      Fetch runs of gpu-tests.yml and nightly-fbtriton.yml created since the
+      Fetch runs of gpu-tests.yml, gpu-tests-nightly.yml and nightly-fbtriton.yml created since the
       saved cursor (or --since), plus the jobs and steps of every completed
       run and the failing tests in the log of every failed GPU job, into
       DATA_DIR/runs-YYYY-MM.jsonl.gz and DATA_DIR/state.json. ci-health.yml
@@ -47,8 +47,9 @@ RATE_FLOOR = 200
 BACKFILL_DAYS = 30
 #: A run still pending after this many days is treated as stuck.
 STUCK_DAYS = 7
-#: Workflows collected. Since #3875, gpu-tests.yml calls mi350/b200/h100.yml as reusable workflows.
-COLLECT = ("gpu-tests.yml", "nightly-fbtriton.yml")
+#: Workflows collected. Since #3875, gpu-tests.yml calls mi350/b200/h100.yml as reusable workflows;
+#: gpu-tests-nightly.yml runs the slow suites (TritonBench) once a day.
+COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-fbtriton.yml")
 
 
 def gh_api(path):
@@ -148,9 +149,9 @@ def _pr_and_author(run, api):
     return None, None
 
 
-def _attach_failures(jobs, text):
+def _attach_failures(jobs, text, wf="gpu-tests.yml"):
     for j in jobs:
-        if j["conclusion"] != "failure" or rules.gpu_of({"wf": "gpu-tests.yml"}, j) is None:
+        if j["conclusion"] != "failure" or rules.gpu_of({"wf": wf}, j) is None:
             continue
         try:
             logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"))
@@ -196,8 +197,9 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text):
             unfetched = todo[i:]
             break
         jobs = _jobs(api(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter=latest"))
+        if r["wf"] in rules.GPU_RUN_WORKFLOWS:
+            _attach_failures(jobs, text, r["wf"])
         if r["wf"] == "gpu-tests.yml":
-            _attach_failures(jobs, text)
             r["select"] = _selection(jobs, text)
             if r["id"] in raw:
                 r["pr"], r["author"] = _pr_and_author(raw[r["id"]], api)
