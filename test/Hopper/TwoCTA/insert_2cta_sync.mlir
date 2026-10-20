@@ -38,6 +38,58 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// Without warp specialization, a 2-CTA MMA left outside the loop (e.g. a
+// software-pipeline epilogue copy) gets its cross-CTA barrier at kernel entry
+// too. Initializing it next to the MMA races the peer CTA's remote arrive,
+// which is then lost and the leader waits forever.
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+// CHECK-LABEL: @test_non_ws_peeled_mma_barrier_at_entry
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_non_ws_peeled_mma_barrier_at_entry(
+      %a: !ttg.memdesc<128x64xf16, #shared, #smem>,
+      %b: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token) {
+    // CHECK-NEXT: ttg.local_alloc
+    // CHECK: ttng.init_barrier
+    // CHECK: ttg.local_alloc
+    // CHECK: ttng.init_barrier
+    // CHECK: arith.constant true
+    // CHECK: scf.for
+    // CHECK: ttng.tc_gen5_mma
+    // CHECK: }
+    // CHECK-NOT: ttng.init_barrier
+    // CHECK: %[[PH:.*]] = arith.constant 0 : i32
+    // CHECK: ttng.map_to_remote_buffer
+    // CHECK: ttng.arrive_barrier
+    // CHECK: ttng.wait_barrier %{{.*}}, %[[PH]], %{{.*}}
+    // CHECK: ttng.tc_gen5_mma
+    // CHECK: ttng.inval_barrier
+    %true = arith.constant true
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    scf.for %iv = %c0 to %c4 step %c1 {
+      %tok = ttng.tc_gen5_mma %a, %b, %acc[%acc_tok], %true, %true {two_ctas} :
+        !ttg.memdesc<128x64xf16, #shared, #smem>,
+        !ttg.memdesc<64x128xf16, #shared1, #smem>,
+        !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    }
+    %tok2 = ttng.tc_gen5_mma %a, %b, %acc[%acc_tok], %true, %true {two_ctas} :
+      !ttg.memdesc<128x64xf16, #shared, #smem>,
+      !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // A software-pipelined persistent kernel can leave MMA copies directly in a
 // warp-specialized scf.while body. The cross-CTA barrier lives outside the
 // warp-specialize op, so its phase must rotate with the while iteration.
@@ -547,6 +599,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         !ttg.memdesc<128x64xf16, #shared_t, #smem_t, mutable>,
         !ttg.memdesc<64x128xf16, #shared_tb, #smem_t, mutable>,
         !ttg.memdesc<128x128xf32, #tmem_t, #ttng.tensor_memory, mutable>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+// Without warp specialization, an scf.while around a 2-CTA MMA that has no
+// iteration counter starting at 0 gets one, and the phase is taken from it.
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+// CHECK-LABEL: @test_non_ws_while_gets_iteration_counter
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_non_ws_while_gets_iteration_counter(
+      %a: !ttg.memdesc<128x64xf16, #shared, #smem>,
+      %b: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token, %lo: i32, %n: i32) {
+    // CHECK: ttng.init_barrier
+    // CHECK: scf.while ({{.*}}, %{{.*}} = %c0_i64) : (i32, i64) -> (i32, i64)
+    // CHECK: ^bb0(%{{.*}}: i32, %[[CNT:.*]]: i64):
+    // CHECK: %[[ITER:.*]] = arith.muli %[[CNT]], %c1_i64
+    // CHECK: %[[GEN:.*]] = arith.divui %[[ITER]]
+    // CHECK: %[[PH64:.*]] = arith.andi %[[GEN]]
+    // CHECK: %[[PH:.*]] = arith.trunci %[[PH64]]
+    // CHECK: ttng.wait_barrier %{{.*}}, %[[PH]], %{{.*}}
+    // CHECK: ttng.tc_gen5_mma
+    // CHECK: %[[NEXT:.*]] = arith.addi %[[CNT]], %c1_i64
+    // CHECK: scf.yield %{{.*}}, %[[NEXT]] : i32, i64
+    %true = arith.constant true
+    %c1 = arith.constant 1 : i32
+    %r = scf.while (%i = %lo) : (i32) -> i32 {
+      %cond = arith.cmpi slt, %i, %n : i32
+      scf.condition(%cond) %i : i32
+    } do {
+    ^bb0(%j: i32):
+      %t = ttng.tc_gen5_mma %a, %b, %acc[%acc_tok], %true, %true {two_ctas} :
+        !ttg.memdesc<128x64xf16, #shared, #smem>,
+        !ttg.memdesc<64x128xf16, #shared1, #smem>,
+        !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %nx = arith.addi %j, %c1 : i32
+      scf.yield %nx : i32
     }
     tt.return
   }
