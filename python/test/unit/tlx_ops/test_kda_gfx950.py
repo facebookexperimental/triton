@@ -41,7 +41,7 @@ def _normalized_kda_input(shape):
     return torch.nn.functional.normalize(value, dim=-1).to(torch.bfloat16)
 
 
-def _check_kda_prefill(lengths, heads, scale, cu_on_cpu=False):
+def _check_kda_prefill(lengths, heads, scale, cu_on_cpu=False, gate_scale=1.0):
     torch.manual_seed(31)
     dim = 128
     total_tokens = sum(lengths)
@@ -49,7 +49,7 @@ def _check_kda_prefill(lengths, heads, scale, cu_on_cpu=False):
     q = _normalized_kda_input(shape)
     k = _normalized_kda_input(shape)
     v = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
-    g = -torch.nn.functional.softplus(torch.randn(shape, device=DEVICE, dtype=torch.float32))
+    g = -gate_scale * torch.nn.functional.softplus(torch.randn(shape, device=DEVICE, dtype=torch.float32))
     beta = torch.sigmoid(torch.randn(1, total_tokens, heads, device=DEVICE, dtype=torch.float32))
     initial_state = 0.1 * torch.randn(
         len(lengths),
@@ -124,6 +124,20 @@ def test_kda_paged_prefill_chunk_boundaries(scale):
 )
 def test_kda_paged_prefill_smoke_shapes(lengths, heads):
     _check_kda_prefill(lengths, heads=heads, scale=128**-0.5)
+
+
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [
+        pytest.param([256] * 8, 12, id="walk-h12"),
+        pytest.param([4096], 12, id="time-split-h12"),
+        pytest.param([17, 4000, 6000], 4, id="time-split-ragged-h4"),
+    ],
+)
+def test_kda_paged_prefill_walk_shapes(lengths, heads):
+    # A slow gate keeps the state's memory longer than one time group, so the
+    # chained group transfers are exercised rather than decayed to zero.
+    _check_kda_prefill(lengths, heads=heads, scale=128**-0.5, gate_scale=0.01)
 
 
 @pytest.mark.parametrize("total_tokens,sequences,heads,key_dim,value_dim,dtype_name", PREFILL_CORRECTNESS_SHAPES)
