@@ -132,12 +132,108 @@ def test_kda_paged_prefill_smoke_shapes(lengths, heads):
         pytest.param([256] * 8, 12, id="walk-h12"),
         pytest.param([4096], 12, id="time-split-h12"),
         pytest.param([17, 4000, 6000], 4, id="time-split-ragged-h4"),
+        # The last chunk ends 37 rows short: its loads must stay inside the inputs.
+        pytest.param([1638, 1228, 819, 411], 12, id="ragged-tail-h12"),
     ],
 )
 def test_kda_paged_prefill_walk_shapes(lengths, heads):
     # A slow gate keeps the state's memory longer than one time group, so the
     # chained group transfers are exercised rather than decayed to zero.
     _check_kda_prefill(lengths, heads=heads, scale=128**-0.5, gate_scale=0.01)
+
+
+def _raw_kda_inputs(lengths, heads):
+    """Split views of a packed bf16 qkv, a raw gate and a raw beta, as a model layer passes them."""
+    dim = 128
+    total_tokens = sum(lengths)
+    width = heads * dim
+    qkv = torch.randn(1, total_tokens, 3 * width, device=DEVICE, dtype=torch.bfloat16)
+    q, k, v = (x.unflatten(-1, (heads, dim)) for x in qkv.split(width, dim=-1))
+    g = torch.randn(1, total_tokens, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    beta = torch.randn(1, total_tokens, heads, device=DEVICE, dtype=torch.bfloat16)
+    A_log = -4.0 + 0.1 * torch.randn(heads, device=DEVICE)
+    dt_bias = 0.1 * torch.randn(width, device=DEVICE)
+    return q, k, v, g, beta, A_log, dt_bias
+
+
+def _activate_kda_inputs(q, k, g, beta, A_log, dt_bias, lower_bound):
+    """The prepared inputs that raw inputs stand for, rounded as the kernel rounds them."""
+
+    def l2norm(x):
+        x = x.float()
+        return (x / torch.sqrt((x * x).sum(-1, keepdim=True) + 1e-6)).to(torch.bfloat16)
+
+    heads, dim = g.shape[-2:]
+    rate = A_log.exp().view(heads, 1)
+    x = g.float() + dt_bias.view(heads, dim)
+    if lower_bound is not None:
+        g = lower_bound * torch.sigmoid(rate * x)
+    else:
+        g = -rate * torch.nn.functional.softplus(x)
+    return l2norm(q), l2norm(k), g, beta.float().sigmoid()
+
+
+@pytest.mark.parametrize("lower_bound", [-5.0, None], ids=["lower-bound", "softplus"])
+def test_kda_paged_prefill_raw_inputs(lower_bound):
+    torch.manual_seed(47)
+    lengths, heads, scale = [17, 64, 300], 4, 128**-0.5
+    q, k, v, g, beta, A_log, dt_bias = _raw_kda_inputs(lengths, heads)
+    initial_state = 0.1 * torch.randn(len(lengths), heads, 128, 128, device=DEVICE, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, *accumulate(lengths)], device=DEVICE, dtype=torch.int64)
+    actual_output, actual_state = kda_paged_prefill(q, k, v, g, beta, scale=scale, initial_state=initial_state,
+                                                    cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias,
+                                                    lower_bound=lower_bound, beta_is_raw=True)
+
+    prepared = _activate_kda_inputs(q, k, g, beta, A_log, dt_bias, lower_bound)
+    expected_outputs = []
+    expected_states = []
+    for sequence, (begin, end) in enumerate(pairwise(cu_seqlens.tolist())):
+        qn, kn, gn, bn = (x[0, begin:end] for x in prepared)
+        expected_output, expected_state = _kda_recurrent_reference(qn, kn, v[0, begin:end], gn, bn,
+                                                                   initial_state[sequence], scale)
+        expected_outputs.append(expected_output)
+        expected_states.append(expected_state)
+    torch.testing.assert_close(actual_output[0].float(), torch.cat(expected_outputs), atol=8e-3, rtol=3e-2)
+    torch.testing.assert_close(actual_state, torch.stack(expected_states), atol=8e-3, rtol=3e-2)
+
+
+@pytest.mark.parametrize("lengths", [[17, 100, 300], [17, 4000, 6000]], ids=["walk", "time-split"])
+def test_kda_paged_prefill_state_pool(lengths):
+    torch.manual_seed(59)
+    heads, slots = 4, 9
+    q, k, v, g, beta, A_log, dt_bias = _raw_kda_inputs(lengths, heads)
+    cu_seqlens = torch.tensor([0, *accumulate(lengths)], device=DEVICE, dtype=torch.int64)
+    kwargs = dict(scale=128**-0.5, cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
+                  beta_is_raw=True)
+    # Slots one apart in a doubled buffer: the pool's slot stride is not H * V * K.
+    backing = 0.1 * torch.randn(slots, 2, heads, 128, 128, device=DEVICE, dtype=torch.float32)
+    pool = backing[:, 1]
+    indices = torch.randperm(slots, device=DEVICE)[:len(lengths)].int()
+    original_pool = pool.clone()
+    other_half = backing[:, 0].clone()
+
+    expected_output, expected_state = kda_paged_prefill(q, k, v, g, beta, initial_state=pool[indices.long()].clone(),
+                                                        **kwargs)
+    actual_output, actual_state = kda_paged_prefill(q, k, v, g, beta, state_pool=pool, state_indices=indices, **kwargs)
+    assert actual_state is pool
+    torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
+    torch.testing.assert_close(pool[indices.long()], expected_state, atol=0, rtol=0)
+    untouched = torch.ones(slots, dtype=torch.bool, device=DEVICE)
+    untouched[indices.long()] = False
+    torch.testing.assert_close(pool[untouched], original_pool[untouched], atol=0, rtol=0)
+    torch.testing.assert_close(backing[:, 0], other_half, atol=0, rtol=0)
+
+
+def test_kda_paged_prefill_rejects_ambiguous_state():
+    q, k, v, g, beta, A_log, dt_bias = _raw_kda_inputs([17], 4)
+    state = torch.zeros(1, 4, 128, 128, device=DEVICE, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 17], device=DEVICE, dtype=torch.int64)
+    indices = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+    with pytest.raises(ValueError, match="either initial_state"):
+        kda_paged_prefill(q, k, v, g, beta, initial_state=state, state_pool=state, state_indices=indices,
+                          cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias)
+    with pytest.raises(ValueError, match="both A_log and dt_bias"):
+        kda_paged_prefill(q, k, v, g, beta, initial_state=state, cu_seqlens=cu_seqlens, A_log=A_log)
 
 
 @pytest.mark.parametrize("total_tokens,sequences,heads,key_dim,value_dim,dtype_name", PREFILL_CORRECTNESS_SHAPES)
