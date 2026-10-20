@@ -220,7 +220,7 @@ def test_each_tracked_branch_gets_its_own_tabs():
 
 
 def tb(gpu, *failing, setup=False, label="linux-gcp-b200"):
-    """A gpu-tests-nightly.yml TritonBench job (own job, so no "h100 / " prefix)."""
+    """A gpu-tests-nightly.yml TritonBench job, called from a job named after its GPU."""
     if setup:
         steps = [
             step("Install prebuilt Triton", "failure"),
@@ -231,19 +231,20 @@ def tb(gpu, *failing, setup=False, label="linux-gcp-b200"):
             step(f"Run TritonBench tests on {gpu.upper()} GPU", "failure" if failing else "success",
                  list(failing) if failing else None)
         ]
-    return job(f"{gpu}-tritonbench-test", *steps, label=label)
+    return job(f"{gpu} / {gpu}-tritonbench-test", *steps, label=label)
 
 
 def nightly(h, *jobs):
-    return run(h, [build_ok(), *jobs, job("report-h100-tritonbench / report", step("x", "success"))], event="schedule",
+    return run(h, [build_ok(), *jobs,
+                   job("h100 / report / report", step("x", "success"), label="ubuntu-latest")], event="schedule",
                wf="gpu-tests-nightly.yml")
 
 
 def test_gpu_of_reads_both_gpu_workflows():
     assert r.gpu_of({"wf": "gpu-tests.yml"}, {"name": "b200 / b200-tlx-test"}) == "B200"
-    assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "mi350-tritonbench-test"}) == "MI350"
-    assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "report-h100-tritonbench / report"}) is None
+    assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "mi350 / mi350-tritonbench-test"}) == "MI350"
     assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "build"}) is None
+    assert r.gpu_of({"wf": "nightly-fbtriton.yml"}, {"name": "h100 / x"}) is None
 
 
 def test_nightly_gpu_view_latest_result_and_week():

@@ -101,14 +101,12 @@ GPU_RUN_WORKFLOWS = ("gpu-tests.yml", "gpu-tests-nightly.yml")
 
 
 def gpu_of(run, job):
-    """The GPU a job ran on: gpu-tests.yml names its called jobs "h100 / ...", gpu-tests-nightly.yml its own jobs
-    "h100-..."."""
-    if run.get("wf") == "gpu-tests.yml":
-        prefix, sep, _ = job["name"].partition(" / ")
-        return GPU_PREFIX.get(prefix) if sep else None
-    if run.get("wf") == "gpu-tests-nightly.yml" and " / " not in job["name"]:
-        return GPU_PREFIX.get(job["name"].split("-", 1)[0])
-    return None
+    """The GPU a job ran on, from its "h100 / " name prefix: both GPU workflows call one workflow per GPU from a job
+    named after it."""
+    if run.get("wf") not in GPU_RUN_WORKFLOWS:
+        return None
+    prefix, sep, _ = job["name"].partition(" / ")
+    return GPU_PREFIX.get(prefix) if sep else None
 
 
 def job_key(name):
