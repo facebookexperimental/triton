@@ -801,7 +801,8 @@ void init_triton_llvm(py::module_ &m) {
         pb.registerCGSCCAnalyses(cgam);
         // Register before PassBuilder installs its default TargetIRAnalysis:
         // the first registration wins. Keep the target-machine pipeline and
-        // non-NVIDIA backends unchanged.
+        // non-NVIDIA backends unchanged. The switch preserves the generic TTI
+        // baseline for differential testing of future overrides.
         // NVIDIA normally leaves the module triple unset during optimization.
         if (enable_nvptx_tti && !targetMachine &&
             (mod->getTargetTriple().str().empty() ||
