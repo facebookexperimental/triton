@@ -563,10 +563,10 @@ def test_gfx1250_mxgemm_tdm_tiles_per_warp(DTYPE_B, TILES_PER_WARP):
     b_d = b_data.T.contiguous().cuda()
     a_scale_d = _gfx1250_mxfp.pack_scale(a_scale).cuda()
     b_scale_d = _gfx1250_mxfp.pack_scale(b_scale).cuda()
-    out = _gfx1250_mxfp.mxgemm_tdm_pipelined(
-        a_d, b_d, a_scale_d, b_scale_d, BLOCK_M=256, BLOCK_N=256, BLOCK_K=256, TRANSPOSE_B=True, NUM_BUFFERS=2,
-        DTYPE_A="e4m3", DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], SCHEDULE="sliceMNK", TDM_FUSION="partial",
-        TILES_PER_WARP=TILES_PER_WARP)
+    out = _gfx1250_mxfp.mxgemm_tdm_pipelined(a_d, b_d, a_scale_d, b_scale_d, BLOCK_M=256, BLOCK_N=256, BLOCK_K=256,
+                                             TRANSPOSE_B=True, NUM_BUFFERS=2, DTYPE_A="e4m3",
+                                             DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], SCHEDULE="sliceMNK",
+                                             TDM_FUSION="partial", TILES_PER_WARP=TILES_PER_WARP)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
 
 
