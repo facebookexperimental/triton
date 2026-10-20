@@ -16,6 +16,11 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
 /// memory Only adds annotations when MLIR_ENABLE_DUMP=1 is set.
 void addSharedMemoryAnnotations(ModuleOp mod);
 
+/// Under TRITON_ALLOW_NPOT, rejects NPOT tt.reduce, tt.scan and tt.gather, and
+/// tt.histogram with an NPOT input, which are wrong on modular layouts. Runs
+/// before ModuleAllocation; emits one error per op and never mutates the IR.
+LogicalResult verifyNpotModularOpsSupported(ModuleOp mod);
+
 } // namespace mlir::triton::gpu
 
 #endif // TRITON_CONVERSION_TRITON_GPU_TO_LLVM_ALLOCATE_UTILITY_H_

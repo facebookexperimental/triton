@@ -35,6 +35,8 @@ struct AllocateSharedMemoryNv
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    if (failed(mlir::triton::gpu::verifyNpotModularOpsSupported(mod)))
+      return signalPassFailure();
     mlir::triton::NVIDIA::TargetInfo targetInfo(computeCapability, ptxVersion);
     ModuleAllocation allocation(
         mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(

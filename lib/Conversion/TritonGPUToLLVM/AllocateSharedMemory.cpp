@@ -19,6 +19,8 @@ struct AllocateSharedMemory
           AllocateSharedMemory> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    if (failed(mlir::triton::gpu::verifyNpotModularOpsSupported(mod)))
+      return signalPassFailure();
     ModuleAllocation allocation(mod);
 
     mlir::triton::gpu::attachAllocationSizeAndOffsetAttr(mod, allocation);
