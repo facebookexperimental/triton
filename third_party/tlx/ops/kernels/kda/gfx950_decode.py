@@ -100,7 +100,7 @@ def _kda_recurrent_decode_kernel(
         else:
             log_decay = -A * tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
     else:
-        log_decay = gate.to(tl.bfloat16).to(tl.float32)
+        log_decay = gate.to(tl.float32)
     decay = tl.exp(log_decay)
     beta = tl.load(
         Beta + token * BETA_TOKEN_STRIDE + head,
