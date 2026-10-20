@@ -38,8 +38,10 @@ module.exports = async ({github, context, jobName, platform}) => {
           filter : "latest",
           per_page : 100,
         });
-    const matching = jobs.filter(
-        job => job.name === jobName || job.name === `${platform} / ${jobName}`);
+    // Called per GPU as "h100 / <job>" (gpu-tests.yml) or as a matrix value,
+    // "tritonbench (h100) / <job>" (gpu-tests-nightly.yml).
+    const matching = jobs.filter(job => job.name === jobName ||
+                                        job.name.endsWith(` / ${jobName}`));
     if (matching.length &&
         matching.every(job => job.conclusion === "success")) {
       return run.head_sha;
