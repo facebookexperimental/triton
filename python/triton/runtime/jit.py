@@ -537,7 +537,7 @@ class KernelInterface(Generic[T]):
         # — launch hooks, pre-run hooks, launch_metadata, or a stages-inspection
         # hook — so those still fire (mirrors the run() c_cache fast-path guard).
         if native_create_jit_proxy is not None and getattr(self, 'c_cache', False) \
-                and knobs.nvidia.use_triton_dispatcher \
+                and knobs.runtime.use_triton_dispatcher \
                 and _active_target_supports_triton_dispatcher() \
                 and not self.used_global_vals \
                 and not self.pre_run_hooks and not self.launch_metadata \
@@ -1106,7 +1106,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 and not self.used_global_vals \
                 and knobs.runtime.add_stages_inspection_hook is None \
                 and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook \
-                and not self.launch_metadata and knobs.nvidia.use_triton_dispatcher:
+                and not self.launch_metadata and knobs.runtime.use_triton_dispatcher:
             _fc_args = _bind_fc_args(self.params, self._param_name_to_idx, args, kwargs)
             _fc_opts = {name: value for name, value in kwargs.items() if name not in self._param_name_to_idx}
             _fc_hash = _hash_fc_opts(_fc_opts) if _fc_opts else self._fc_options_hash
@@ -1135,7 +1135,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                         if not getattr(kernel, '_dispatcher', None):
                             if _CACHE_STATS_ON:
                                 _cache_stats_record(self._fn_name, "run_fast_py_fallback")
-                            if knobs.nvidia.use_triton_dispatcher and _active_target_supports_triton_dispatcher():
+                            if knobs.runtime.use_triton_dispatcher and _active_target_supports_triton_dispatcher():
                                 warnings.warn(
                                     f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C "
                                     f"dispatcher, falling back to Python launch",
@@ -1284,7 +1284,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 kernel._compile_iq_resolve(grid_0, grid_1, grid_2, stream, bound_args)
             # launch kernel — prefer _TritonDispatcher (C direct cuLaunchKernelEx)
             # when available and hooks are not needed.
-            _disp = getattr(kernel, '_dispatcher', None) if knobs.nvidia.use_triton_dispatcher else None
+            _disp = getattr(kernel, '_dispatcher', None) if knobs.runtime.use_triton_dispatcher else None
             if _disp is not None and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook:
                 if _CACHE_STATS_ON:
                     _cache_stats_record(self._fn_name, "run_slow_c")
@@ -1294,7 +1294,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             else:
                 if _CACHE_STATS_ON:
                     _cache_stats_record(self._fn_name, "run_slow_py_fallback")
-                if (knobs.nvidia.use_triton_dispatcher and _disp is None
+                if (knobs.runtime.use_triton_dispatcher and _disp is None
                         and _active_target_supports_triton_dispatcher()):
                     warnings.warn(
                         f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
@@ -1330,6 +1330,20 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
         self._repr = repr
         self.launch_metadata = launch_metadata
+        # C cache defaults ON (opt out with TRITON_ENABLE_C_CACHE=0). An explicit
+        # c_cache=True/False on @triton.jit always wins over the env default;
+        # c_cache=None (not specified) falls back to the env-controlled default.
+        if c_cache is None:
+            self.c_cache = knobs.runtime.enable_c_cache
+        else:
+            self.c_cache = c_cache
+        if any(param.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.VAR_POSITIONAL)
+               for param in self.signature.parameters.values()):
+            self.c_cache = False
+        if self.c_cache:
+            _ensure_torch_bridge()
+        # Register for simple deserialization of JITFunction constants
+        _triton_jit_function_registry[f"{self.module}:{self.fn.__qualname__}"] = self
 
         self.params = []
         for i, param in enumerate(self.signature.parameters.values()):

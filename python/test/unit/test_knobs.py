@@ -305,6 +305,16 @@ def test_knobs_scope(fresh_knobs, monkeypatch):
     assert fresh_knobs.amd.use_buffer_ops
 
 
+def test_shared_runtime_knob_aliases():
+    from triton import knobs
+
+    with knobs.runtime.scope():
+        knobs.runtime.use_triton_dispatcher = True
+        assert knobs.nvidia.use_triton_dispatcher
+        knobs.nvidia.use_triton_dispatcher = False
+        assert not knobs.runtime.use_triton_dispatcher
+
+
 def test_env_updated(fresh_knobs, monkeypatch):
     fresh_knobs.amd.use_buffer_ops = False
     assert os.getenv("AMDGCN_USE_BUFFER_OPS") == "0"
