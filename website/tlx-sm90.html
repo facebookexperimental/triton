@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Supported ops and extension builtins on NVIDIA Hopper.">
+  <title>TLX on sm90 (Hopper) · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Tutorial kernels</a>
+<a href="tlx-ops.html">High-performance kernels</a>
+<a href="tlx-sm90.html" aria-current="page">TLX on sm90 (Hopper)</a>
+<a class="sub" href="#supported-tlx-ops">Supported `tlx.ops`</a>
+<a class="sub" href="#supported-extension-builtins-tlx">Supported extension builtins (`tlx.*`)</a>
+<a class="sub" href="#notes">Notes</a>
+<a href="tlx-sm100.html">TLX on sm100 (Blackwell)</a>
+<a href="tlx-gfx942.html">TLX on gfx942 (MI300)</a>
+<a href="tlx-gfx950.html">TLX on gfx950 (MI350)</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>TLX on sm90 (Hopper)</h1>
+      <p class="lede">Supported ops and extension builtins on NVIDIA Hopper.</p>
+      <article><p>H100-class GPUs: TMA descriptors, <code>wgmma</code> async MMA, thread-block clusters with distributed shared memory, warp specialization with <code>async_task</code> regions, and mbarrier pipelines. No TMEM, no <code>tcgen05</code>, no CLC — see <a href="tlx-sm100.html">TLX on sm100</a> for the Blackwell superset. Tags follow <a href="tlx.html">tlx.md</a>.</p>
+<h2 id="supported-tlx-ops">Supported <code>tlx.ops</code></h2>
+<table><thead><tr><th>Op</th><th>Variant</th><th>Impl</th><th>Dtypes</th><th>Requires</th><th>Backward</th><th>What it does</th></tr></thead><tbody><tr><td><code>mm</code></td><td>ws_cooperative</td><td><code>mm/sm90.py:mm</code></td><td>float16</td><td>tma</td><td>no</td><td>Cooperative-persistent GEMM: TMA producer warp-group feeds <code>wgmma</code> consumers through mbarriers. Full 8-config space beats the heuristic on tall shapes.</td></tr><tr><td><code>addmm</code></td><td>tma_ws</td><td><code>addmm/sm90.py:addmm</code></td><td>float16</td><td>—</td><td>no</td><td>Persistent WS, non-persistent one-CTA-per-tile, and direct-load GEMM+bias family; named barriers sync consumer warp-groups.</td></tr><tr><td><code>mm_torchtlx</code></td><td>inductor_hopper_gemm_ws</td><td><code>inductor/sm100_torch:mm</code></td><td>float16</td><td>tma</td><td>no</td><td>Inductor template entry for the Hopper WS GEMM.</td></tr><tr><td><code>flash_attn</code></td><td>ws_pipelined_pingpong</td><td><code>flash_attn/sm90.py:flash_attn</code></td><td>float16</td><td>tma</td><td>yes</td><td>FA3-style attention: persistent WS with K-ahead TMA prefetch ping-pong plus a non-persistent variant; FA2 math on TMA+<code>wgmma</code> backward.</td></tr></tbody></table>
+<h2 id="supported-extension-builtins-tlx">Supported extension builtins (<code>tlx.*</code>)</h2>
+<p>The sm100 set minus the Blackwell-only items (TMEM, <code>tcgen05</code>, CLC, TMA gather/scatter, <code>stoch_round</code>, <code>warp_redux</code>, packed PTX).</p>
+<h3 id="scalars-types-diagnostics">Scalars, types, diagnostics</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>assume_uniform</code></td><td>Scalar uniformity assert (no-op on NV)</td></tr><tr><td><code>zeros</code></td><td>Zero tensor, optional explicit register layout</td></tr><tr><td><code>dtype_of</code> / <code>size_of</code></td><td>Element type / byte size (host-side)</td></tr><tr><td><code>get_fp8_format_name</code></td><td><code>e5m2</code>/<code>e4m3</code> for scaled-MMA format args</td></tr><tr><td><code>clock64</code></td><td>64-bit hardware timer read</td></tr><tr><td><code>assert_same_layout</code> / <code>dump_layout</code></td><td>Layout assert / compile-time layout log</td></tr></tbody></table>
+<h3 id="local-memory">Local memory</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>local_alloc</code></td><td>Allocate <code>num</code> SMEM buffers</td></tr><tr><td><code>local_view</code> / <code>local_slice</code></td><td>Buffer subviews</td></tr><tr><td><code>local_store</code> / <code>local_load</code></td><td>Registers to/from SMEM buffer</td></tr><tr><td><code>local_gather</code> / <code>local_scatter</code></td><td>Indexed gather/scatter along an axis</td></tr><tr><td><code>storage_alias_spec</code></td><td>Sized/unsized shared-buffer alias spec</td></tr><tr><td><code>buffered_tensor</code> / <code>buffered_tensor_type</code></td><td>Memory-backed buffer value and its type</td></tr></tbody></table>
+<h3 id="async-copy-and-descriptors-tma">Async copy and descriptors (TMA)</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>async_load</code> / <code>async_load_commit_group</code> / <code>async_load_wait_group</code></td><td><code>cp.async</code> global-to-SMEM pipeline</td></tr><tr><td><code>async_store</code></td><td>Async SMEM-to-global bulk copy</td></tr><tr><td><code>async_descriptor_load</code></td><td>TMA global-to-SMEM load tracked by barrier</td></tr><tr><td><code>async_descriptor_store</code> / <code>async_descriptor_store_wait</code></td><td>TMA store + wait</td></tr><tr><td><code>async_descriptor_prefetch_tensor</code> / <code>prefetch</code></td><td>L2 prefetch hints</td></tr><tr><td><code>allocate_tensor_descriptor</code></td><td>128B-aligned descriptor scratch</td></tr><tr><td><code>make_tensor_descriptor</code> / <code>reinterpret_tensor_descriptor</code></td><td>Create / reinterpret TMA descriptors</td></tr><tr><td><code>tensor_descriptor_ptr</code> / <code>tensor_descriptor_ptr_type</code></td><td>Descriptor pointer values and types</td></tr></tbody></table>
+<h3 id="layout-control">Layout control</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>local_trans</code> / <code>local_reshape</code> / <code>local_reinterpret</code></td><td>Metadata-only descriptor transforms</td></tr><tr><td><code>require_layout</code> / <code>release_layout</code></td><td>Pin / release register layouts</td></tr><tr><td><code>dot_scaled</code></td><td>Scaled dot with optional tile schedule</td></tr><tr><td><code>nv_mma_layout</code></td><td>Hopper WGMMA accumulator/register layout</td></tr><tr><td><code>nv_mma_shared_layout_encoding</code></td><td>Hopper MMA SMEM operand encoding</td></tr><tr><td><code>slice_layout</code> / <code>layout</code></td><td>Rank-reduced view / user Shape:Stride layout</td></tr><tr><td><code>layout_encoding</code> / <code>shared_layout_encoding</code></td><td>Base layout classes</td></tr><tr><td><code>swizzled_shared_layout_encoding</code> / <code>swizzled_layout</code></td><td>Swizzled SMEM layouts</td></tr><tr><td><code>padded_shared_layout_encoding</code></td><td>Padded SMEM layout</td></tr><tr><td><code>shared_linear_layout_encoding</code></td><td>Explicit linear SMEM mapping</td></tr><tr><td><code>DummyRegisterLayoutEncoding</code></td><td>Placeholder layout resolved post-inline</td></tr><tr><td><code>storage_kind</code></td><td>Buffer storage selector enum</td></tr><tr><td><code>reuse_group</code> / <code>reuse_group_type</code> / <code>reuse_group_ir_type</code></td><td>Buffer overlap trees</td></tr><tr><td><code>storage_alias_spec_type</code> / <code>storage_alias_spec_type_class</code></td><td>Alias-spec MLIR types</td></tr></tbody></table>
+<h3 id="async-compute">Async compute</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>async_dot</code></td><td>Warp-group async MMA (<code>wgmma</code>; register-A allowed)</td></tr><tr><td><code>async_dot_wait</code></td><td>Wait for prior async dots</td></tr></tbody></table>
+<h3 id="synchronization">Synchronization</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>alloc_barriers</code> / <code>alloc_warp_barrier</code></td><td>SMEM / warp / cluster barriers</td></tr><tr><td><code>barrier_expect_bytes</code> / <code>barrier_wait</code> / <code>barrier_arrive</code></td><td>Expect-tx, wait, arrive (multicast capable)</td></tr><tr><td><code>remote_view</code></td><td>Map barrier into another cluster CTA</td></tr><tr><td><code>remote_shmem_store</code> / <code>async_remote_shmem_store</code> / <code>async_remote_shmem_copy</code></td><td>Cross-CTA SMEM access</td></tr><tr><td><code>named_barrier_wait</code> / <code>named_barrier_arrive</code></td><td>Hardware named barriers (ids 3-15)</td></tr><tr><td><code>cluster_barrier</code> / <code>fence_mbarrier_init_cluster</code></td><td>Cluster sync / init fence</td></tr><tr><td><code>fence</code> / <code>fence_async_shared</code></td><td>Memory and proxy fences</td></tr><tr><td><code>mbarrier</code> / <code>mbarrier_type</code> / <code>async_token</code></td><td>Barrier values, types, completion tokens</td></tr></tbody></table>
+<h3 id="warp-specialization-votes-clusters">Warp specialization, votes, clusters</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>async_task</code> / <code>async_tasks</code></td><td>Warp-specialized task regions and grouping</td></tr><tr><td><code>async_task_replica_id</code></td><td>Replica id inside an async region</td></tr><tr><td><code>warp_all</code> / <code>warp_any</code></td><td>Lane votes</td></tr><tr><td><code>vote_ballot_sync</code></td><td>Warp ballot bitmask</td></tr><tr><td><code>cluster_cta_rank</code> / <code>cluster_size_1d</code></td><td>CTA rank / cluster size</td></tr><tr><td><code>thread_id</code> / <code>num_warps</code></td><td>Thread id / kernel warp count</td></tr></tbody></table>
+<h2 id="notes">Notes</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>TMA descriptors need 16-byte-aligned row strides; the <code>mm</code> catalog</div></div>
+<p>entry enforces this via <code>accepts</code> and declines the rest.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>WGMMA accumulator layouts are Hopper-specific (<code>nv_mma_layout</code></div></div>
+<p>asserts version 3.0).</p></article>
+<footer class="pager"><a href="tlx-ops.html">← High-performance kernels</a><a class="next" href="tlx-sm100.html">TLX on sm100 (Blackwell) →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
