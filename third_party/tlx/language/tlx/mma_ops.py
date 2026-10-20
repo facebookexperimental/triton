@@ -452,6 +452,8 @@ def dot_scaled(
             raise ValueError(f"tiles_per_warp requires {rank} entries, got {len(tiles_per_warp)}")
         if any(tile <= 0 for tile in tiles_per_warp):
             raise ValueError("tiles_per_warp entries must be positive")
+        if any(tile & (tile - 1) for tile in tiles_per_warp):
+            raise ValueError("tiles_per_warp entries must be powers of two")
         result.handle.set_attr(
             "amdg.wmma_tiles_per_warp",
             _semantic.builder.make_i32_array_attr(tiles_per_warp),

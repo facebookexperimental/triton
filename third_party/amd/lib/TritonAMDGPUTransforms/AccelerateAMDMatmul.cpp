@@ -15,6 +15,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
@@ -169,9 +170,14 @@ SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
 }
 
 LogicalResult validateWmmaTilesPerWarp(tt::DotScaledOp dotOp) {
-  auto attr = dotOp->getAttrOfType<DenseI32ArrayAttr>(AttrAMDWmmaTilesPerWarp);
-  if (!attr)
+  Attribute rawAttr = dotOp->getAttr(AttrAMDWmmaTilesPerWarp);
+  if (!rawAttr)
     return success();
+
+  auto attr = dyn_cast<DenseI32ArrayAttr>(rawAttr);
+  if (!attr)
+    return dotOp.emitOpError()
+           << AttrAMDWmmaTilesPerWarp << " must be an array<i32> attribute";
 
   auto resultType = dotOp.getType();
   unsigned rank = resultType.getRank();
@@ -195,8 +201,11 @@ LogicalResult validateWmmaTilesPerWarp(tt::DotScaledOp dotOp) {
     if (tiles <= 0)
       return dotOp.emitOpError()
              << AttrAMDWmmaTilesPerWarp << " entries must be positive";
+    if (!llvm::isPowerOf2_32(static_cast<uint32_t>(tiles)))
+      return dotOp.emitOpError()
+             << AttrAMDWmmaTilesPerWarp << " entries must be powers of two";
     uint64_t requiredExtent = static_cast<uint64_t>(instrPerDim[dim]) *
-                              warpsPerTile[dim] * static_cast<unsigned>(tiles);
+                              warpsPerTile[dim] * static_cast<uint64_t>(tiles);
     if (static_cast<uint64_t>(shapePerCTA[dim]) < requiredExtent)
       return dotOp.emitOpError()
              << AttrAMDWmmaTilesPerWarp << " requires extent " << requiredExtent

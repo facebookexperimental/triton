@@ -545,6 +545,31 @@ def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
 
 
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("DTYPE_B", ["float8_e4m3", "float4"])
+@pytest.mark.parametrize("TILES_PER_WARP", [(1, 1), (2, 1), (1, 2), (2, 2)])
+def test_gfx1250_mxgemm_tdm_tiles_per_warp(DTYPE_B, TILES_PER_WARP):
+    M = N = 256
+    K = 512
+    torch.manual_seed(7)
+    a = _gfx1250_mxfp._init_data("float8_e4m3", M, K)
+    b = _gfx1250_mxfp._init_data(DTYPE_B, K, N)
+    a_scale = MXScaleTensor(size=(M, K // 32)).random(high=32.0).data
+    b_scale = MXScaleTensor(size=(N, K // 32)).random(high=32.0).data
+    ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
+
+    b_data = b.to_packed_tensor(dim=0).data if DTYPE_B == "float4" else b
+    a_d = a.contiguous().cuda()
+    b_d = b_data.T.contiguous().cuda()
+    a_scale_d = _gfx1250_mxfp.pack_scale(a_scale).cuda()
+    b_scale_d = _gfx1250_mxfp.pack_scale(b_scale).cuda()
+    out = _gfx1250_mxfp.mxgemm_tdm_pipelined(
+        a_d, b_d, a_scale_d, b_scale_d, BLOCK_M=256, BLOCK_N=256, BLOCK_K=256, TRANSPOSE_B=True, NUM_BUFFERS=2,
+        DTYPE_A="e4m3", DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], SCHEDULE="sliceMNK", TDM_FUSION="partial",
+        TILES_PER_WARP=TILES_PER_WARP)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("BATCH,H,SEQLEN", [(1, 8, 1024),  # multi-head
                                             (2, 4, 1024),  # multi-batch + multi-head

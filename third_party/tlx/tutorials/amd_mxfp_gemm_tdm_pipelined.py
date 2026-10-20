@@ -662,6 +662,7 @@ def mxgemm_tdm_pipelined_kernel(
     TDM_FUSION: tl.constexpr = "none",
     L2_PREFETCH_DISTANCE: tl.constexpr = -1,
     TDM_SPLIT: tl.constexpr = False,
+    TILES_PER_WARP: tl.constexpr = (2, 2),
 ):
     DIV_FACTOR_A: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
@@ -953,7 +954,7 @@ def mxgemm_tdm_pipelined_kernel(
         c10 = tl.zeros((SUBTILE_M, SUBTILE_N), dtype=tl.float32)
         c11 = tl.zeros((SUBTILE_M, SUBTILE_N), dtype=tl.float32)
         for i in tl.range(0, K_ITERS):
-            c00 = tlx.dot_scaled(a00, scale_a00, DTYPE_A, b00, scale_b00, DTYPE_B, c00, tiles_per_warp=[2, 2])
+            c00 = tlx.dot_scaled(a00, scale_a00, DTYPE_A, b00, scale_b00, DTYPE_B, c00, tiles_per_warp=TILES_PER_WARP)
             if TDM_SPLIT:
                 b01, scale_b01 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 0, 1, BLOCK_N,
                                                               BLOCK_K, DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -976,7 +977,7 @@ def mxgemm_tdm_pipelined_kernel(
                 _mxgemm_issue_l2_prefetches(a_desc, b_desc, a_scale_desc, b_scale_desc, load_idx, always,
                                             L2_PREFETCH_DISTANCE, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
                                             BLOCK_K_SCALE_PRESHUFFLED, TRANSPOSE_B, SCALE_PRESHUFFLE, WITH_A_SCALE)
-            c01 = tlx.dot_scaled(a00, scale_a00, DTYPE_A, b01, scale_b01, DTYPE_B, c01, tiles_per_warp=[2, 2])
+            c01 = tlx.dot_scaled(a00, scale_a00, DTYPE_A, b01, scale_b01, DTYPE_B, c01, tiles_per_warp=TILES_PER_WARP)
             if TDM_SPLIT:
                 a10, scale_a10 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 1, 0, BLOCK_M,
                                                               BLOCK_K, DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -988,7 +989,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                         DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED,
                                                         SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
                                                         SCALE_PRESHUFFLE, WITH_A_SCALE)
-            c10 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b00, scale_b00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+            c10 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b00, scale_b00, DTYPE_B, c10, tiles_per_warp=TILES_PER_WARP)
             if TDM_SPLIT:
                 b10, scale_b10 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 1, 0, BLOCK_N,
                                                               BLOCK_K, DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -1000,7 +1001,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                         DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
                                                         SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
                                                         TRANSPOSE_B, SCALE_PRESHUFFLE)
-            c11 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b01, scale_b01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+            c11 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b01, scale_b01, DTYPE_B, c11, tiles_per_warp=TILES_PER_WARP)
             if TDM_SPLIT:
                 a01, scale_a01 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 0, 1, BLOCK_M,
                                                               BLOCK_K, DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -1012,7 +1013,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                         DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED,
                                                         SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
                                                         SCALE_PRESHUFFLE, WITH_A_SCALE)
-            c00 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b10, scale_b10, DTYPE_B, c00, tiles_per_warp=[2, 2])
+            c00 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b10, scale_b10, DTYPE_B, c00, tiles_per_warp=TILES_PER_WARP)
             if TDM_SPLIT:
                 b11, scale_b11 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 1, 1, BLOCK_N,
                                                               BLOCK_K, DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -1024,7 +1025,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                         DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
                                                         SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
                                                         TRANSPOSE_B, SCALE_PRESHUFFLE)
-            c01 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b11, scale_b11, DTYPE_B, c01, tiles_per_warp=[2, 2])
+            c01 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b11, scale_b11, DTYPE_B, c01, tiles_per_warp=TILES_PER_WARP)
             if TDM_SPLIT:
                 a11, scale_a11 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 1, 1, BLOCK_M,
                                                               BLOCK_K, DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -1037,8 +1038,8 @@ def mxgemm_tdm_pipelined_kernel(
                                                         SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
                                                         SCALE_PRESHUFFLE, WITH_A_SCALE)
             wmma_idx += 1
-            c10 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b10, scale_b10, DTYPE_B, c10, tiles_per_warp=[2, 2])
-            c11 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b11, scale_b11, DTYPE_B, c11, tiles_per_warp=[2, 2])
+            c10 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b10, scale_b10, DTYPE_B, c10, tiles_per_warp=TILES_PER_WARP)
+            c11 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b11, scale_b11, DTYPE_B, c11, tiles_per_warp=TILES_PER_WARP)
             pred_load = i + 1 - epilogue_lb
             pred_load = (pred_load >> 31) & 1
             if TDM_SPLIT:
@@ -1108,8 +1109,8 @@ def mxgemm_tdm_pipelined_kernel(
                                                       DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
                                                       SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
                                                       TRANSPOSE_B, SCALE_PRESHUFFLE)
-                c0 = tlx.dot_scaled(a, scale_a, DTYPE_A, b0, scale_b0, DTYPE_B, c0, tiles_per_warp=[2, 2])
-                c1 = tlx.dot_scaled(a, scale_a, DTYPE_A, b1, scale_b1, DTYPE_B, c1, tiles_per_warp=[2, 2])
+                c0 = tlx.dot_scaled(a, scale_a, DTYPE_A, b0, scale_b0, DTYPE_B, c0, tiles_per_warp=TILES_PER_WARP)
+                c1 = tlx.dot_scaled(a, scale_a, DTYPE_A, b1, scale_b1, DTYPE_B, c1, tiles_per_warp=TILES_PER_WARP)
             wmma_idx += 1
         acc = tl.join(c0, c1).permute(0, 2, 1).reshape((BLOCK_M, BLOCK_N))
         acc = tlx.require_amd_wmma_layout(acc, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
@@ -1141,7 +1142,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                     SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED, SCALE_KWIDTH,
                                                     NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
                                                     SCALE_PRESHUFFLE)
-                acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=[2, 2])
+                acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=TILES_PER_WARP)
             wmma_idx += 1
         acc = tlx.require_amd_wmma_layout(acc, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
                                           instr_shape=STORE_INSTR_SHAPE)
@@ -1173,6 +1174,17 @@ def _init_data(dtype: str, rows: int, cols: int):
     raise ValueError(f"unsupported dtype: {dtype}")
 
 
+def _validate_tiles_per_warp(tiles_per_warp):
+    tiles_per_warp = tuple(tiles_per_warp)
+    if len(tiles_per_warp) != 2:
+        raise ValueError("TILES_PER_WARP requires two entries")
+    if any(not isinstance(tile, int) or isinstance(tile, bool) or tile <= 0 for tile in tiles_per_warp):
+        raise ValueError("TILES_PER_WARP entries must be positive integers")
+    if any(tile & (tile - 1) for tile in tiles_per_warp):
+        raise ValueError("TILES_PER_WARP entries must be powers of two")
+    return tiles_per_warp
+
+
 def mxgemm_tdm_pipelined(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1197,7 +1209,9 @@ def mxgemm_tdm_pipelined(
     GROUP_SIZE_M: int = 8,
     BENCHMARK: str | None = None,
     BENCHMARK_NUM_ITERS: int = 32,
+    TILES_PER_WARP: tuple[int, int] = (2, 2),
 ) -> torch.Tensor:
+    TILES_PER_WARP = _validate_tiles_per_warp(TILES_PER_WARP)
     if M is None:
         M = a.shape[0]
     if K is None:
@@ -1249,6 +1263,7 @@ def mxgemm_tdm_pipelined(
             TDM_FUSION=TDM_FUSION,
             L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE,
             TDM_SPLIT=TDM_SPLIT,
+            TILES_PER_WARP=TILES_PER_WARP,
             num_warps=4,
             waves_per_eu=1,
         )
@@ -1276,6 +1291,7 @@ _DEFAULT_CONFIG = {
     "TRANSPOSE_B": False,
     "num_warps": 4,
     "waves_per_eu": 1,
+    "TILES_PER_WARP": (2, 2),
 }
 
 
@@ -1337,6 +1353,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
         TDM_FUSION=cfg.get("TDM_FUSION", "none"),
         TDM_SPLIT=cfg.get("TDM_SPLIT", False),
         L2_PREFETCH_DISTANCE=cfg.get("L2_PREFETCH_DISTANCE", -1),
+        TILES_PER_WARP=_validate_tiles_per_warp(cfg.get("TILES_PER_WARP", (2, 2))),
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
     )
@@ -1371,6 +1388,8 @@ if __name__ == "__main__":
                         help="Prefetch distance in K iterations; -1 disables L2 prefetch")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
     parser.add_argument("--benchmark_num_iters", type=int, default=32)
+    parser.add_argument("--tiles_per_warp", nargs=2, type=int, choices=(1, 2), default=(2, 2), metavar=("M", "N"),
+                        help="WMMA tiles per warp in M and N (default: 2 2)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -1423,4 +1442,5 @@ if __name__ == "__main__":
         args.group_size_m,
         benchmark,
         args.benchmark_num_iters,
+        TILES_PER_WARP=tuple(args.tiles_per_warp),
     )

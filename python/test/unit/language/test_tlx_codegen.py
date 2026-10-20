@@ -5278,9 +5278,11 @@ def test_local_reshape_compiles_gfx1250(device):
     assert len(compiled.asm["amdgcn"]) > 0
 
 
-def test_dot_scaled_tiles_per_warp_attr_gfx1250():
-    compiled = _compile_dot_scaled_tiles_per_warp((2, 2))
-    assert "amdg.wmma_tiles_per_warp = array<i32: 2, 2>" in compiled.asm["ttir"]
+@pytest.mark.parametrize("tiles_per_warp", [(1, 1), (2, 1), (1, 2), (2, 2)])
+def test_dot_scaled_tiles_per_warp_attr_gfx1250(tiles_per_warp):
+    compiled = _compile_dot_scaled_tiles_per_warp(tiles_per_warp)
+    m_tiles, n_tiles = tiles_per_warp
+    assert f"amdg.wmma_tiles_per_warp = array<i32: {m_tiles}, {n_tiles}>" in compiled.asm["ttir"]
     assert "#ttg.amd_wmma" in compiled.asm["ttgir"]
 
 
@@ -5289,6 +5291,7 @@ def test_dot_scaled_tiles_per_warp_attr_gfx1250():
     [
         ((1, ), "tiles_per_warp requires 2 entries"),
         ((0, 1), "tiles_per_warp entries must be positive"),
+        ((3, 1), "tiles_per_warp entries must be powers of two"),
     ],
 )
 def test_dot_scaled_tiles_per_warp_rejects_invalid_gfx1250(tiles_per_warp, error):
@@ -5342,12 +5345,14 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
             "TDM_FUSION": "none",
             "L2_PREFETCH_DISTANCE": -1,
             "TDM_SPLIT": False,
+            "TILES_PER_WARP": (1, 2),
         },
     )
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
     assert "amdg.async_tdm_copy_global_to_local" in ttgir
     assert "tt.dot_scaled" in ttgir
+    assert "amdg.wmma_tiles_per_warp = array<i32: 1, 2>" in compiled.asm["ttir"]
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
 
