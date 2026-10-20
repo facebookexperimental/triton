@@ -798,17 +798,21 @@ def kda_paged_prefill(q, k, v, g, beta, *, scale=1.0, initial_state=None, cu_seq
 
 
 def kda_recurrent_decode(q, k, v, g, beta, *, scale=1.0, state_pool, read_indices, write_indices, cu_seqlens,
-                         space=None):
+                         A_log=None, dt_bias=None, lower_bound=None, beta_is_raw=False, space=None):
     """Forward-only indexed KDA recurrence over an FP32 V-major state pool.
 
-    ``space=`` takes no search space today; a ``Space`` is accepted only to
-    carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
+    Inputs are prepared (l2-normalized q/k, log decay g, activated beta) unless
+    `A_log` and `dt_bias` are passed, in which case they are raw, as for
+    `kda_paged_prefill`. ``space=`` takes no search space today; a ``Space`` is
+    accepted only to carry a ``BitwiseInvarianceSpec``, which is validated but
+    not enforced yet.
     """
     space_name, invariance = _normalize_space_arg("kda_recurrent_decode", space)
     _check_single_config_space("kda_recurrent_decode", space_name)
     fn, spec = impl_for("kda_recurrent_decode", device=q.device)
     check_inputs(spec, dtype=q.dtype, KEY_DIM=q.shape[-1], VALUE_DIM=v.shape[-1])
-    check_backward(spec, q, k, v, g, beta, state_pool)
+    check_backward(spec, q, k, v, g, beta, state_pool, A_log, dt_bias)
     _check_enforced("kda_recurrent_decode", spec, invariance)
     return fn(q, k, v, g, beta, scale=scale, state_pool=state_pool, read_indices=read_indices,
-              write_indices=write_indices, cu_seqlens=cu_seqlens)
+              write_indices=write_indices, cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias, lower_bound=lower_bound,
+              beta_is_raw=beta_is_raw)
