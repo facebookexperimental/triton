@@ -802,6 +802,20 @@ def test_flash_attn_mxfp8_gfx950_benchmark_is_forward_only(monkeypatch):
     assert directions("sm100") == {"fwd", "bwd"}
 
 
+def test_hstu_cross_attn_benchmark_times_inference_shapes_forward_only(monkeypatch):
+    import importlib
+
+    bench = importlib.import_module("bench_hstu_cross_attn")
+    monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
+    inference = set(bench.SHAPE_SUITES.resolved_shapes("gfx950_1"))
+    directions = {}
+    for case in bench.cases():
+        directions.setdefault(case.shape, set()).add(case.direction)
+
+    assert {d for shape, ds in directions.items() if shape in inference for d in ds} == {"fwd"}
+    assert all(ds == {"fwd", "bwd"} for shape, ds in directions.items() if shape not in inference)
+
+
 def test_focus_suite_selection_rejects_unknown_names():
     from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
 

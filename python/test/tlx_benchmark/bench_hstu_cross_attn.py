@@ -36,6 +36,9 @@ COMPILE_CAP_S = 900.0
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 DIRECTIONS = ("fwd", "bwd")
+#: Inference captures: production never runs their backward, and both backends'
+#: backward takes 60-530 ms a call on them, so the perf suite times the forward.
+FORWARD_ONLY = frozenset(SHAPE_SUITES.resolved_shapes("gfx950_1"))
 
 REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 
@@ -57,7 +60,7 @@ def cases(synthetic: bool = False, suites=None) -> list[Case]:
         Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry.dtype]).removeprefix("torch."), shape=tuple(entry),
              direction=direction, label=label(entry, direction))
         for entry in shapes(synthetic, suites)
-        for direction in DIRECTIONS
+        for direction in (("fwd", ) if entry in FORWARD_ONLY else DIRECTIONS)
     ]
 
 
