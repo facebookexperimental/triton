@@ -2,21 +2,27 @@
 """Collect GPU workflow runs and render the /ci/ dashboard.
 
   collect DATA_DIR [--since ISO]
-      Fetch runs of mi350/b200/h100.yml created since the saved cursor (or
-      --since), plus the jobs and steps of every completed run, into
+      Fetch runs of gpu-tests.yml and nightly-fbtriton.yml created since the
+      saved cursor (or --since), plus the jobs and steps of every completed
+      run and the failing tests in the log of every failed GPU job, into
       DATA_DIR/runs-YYYY-MM.jsonl.gz and DATA_DIR/state.json. ci-health.yml
       keeps DATA_DIR on the 'ci-health' release; DATA_DIR/changed.txt lists
       the month files this run rewrote, for upload.
-  render OUTDIR --from DATA_DIR
+  render OUTDIR --from DATA_DIR [--bench-from DIR]
       Write OUTDIR/index.html (the page, no data) and OUTDIR/data.json (what
       the page shows, computed by ci_health_rules.page_data), for pages.yml
-      to mount at /ci/. The page loads data.json asynchronously.
+      to mount at /ci/. The page loads data.json asynchronously. Perf events
+      come from the 'tlx-ops-bench' release (or the summaries in DIR).
 
 Stored run record, one JSON object per line in the month of created_at; a later
 line for the same id replaces an earlier one:
-  {id, wf, event, status, conclusion, created_at, head_sha, title, url, branch,
-   jobs: [{name, conclusion, started_at, completed_at, labels,
-           steps: [{name, conclusion}]}] | null until the run completes}
+  {id, wf, event, status, conclusion, created_at, head_sha, title, url, branch, pr, author,
+   select: {h100, b200, mi350, build, fallback} | null (gpu-tests.yml only),
+   jobs: [{name, conclusion, created_at, started_at, completed_at, labels,
+           steps: [{name, conclusion, started_at, completed_at,
+                    failures?: [{id, msg}]}]}] | null until the run completes}
+Records of mi350/b200/h100.yml from before #3875 may remain in the store; the
+rules ignore them.
 """
 import argparse
 import datetime as dt
@@ -28,7 +34,9 @@ import re
 import shutil
 import subprocess
 
+import ci_health_logs as logs
 import ci_health_rules as rules
+import tlx_ops_bench_dashboard as bench
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "facebookexperimental/triton")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,13 +47,19 @@ RATE_FLOOR = 200
 BACKFILL_DAYS = 30
 #: A run still pending after this many days is treated as stuck.
 STUCK_DAYS = 7
-WORKFLOW_FILES = [f".github/workflows/{wf}" for wf in rules.WORKFLOWS] + [".github/workflows/build.yml"]
+#: Workflows collected. Since #3875, gpu-tests.yml calls mi350/b200/h100.yml as reusable workflows.
+COLLECT = ("gpu-tests.yml", "nightly-fbtriton.yml")
 
 
 def gh_api(path):
     out = subprocess.run(["gh", "api", "--paginate", "--slurp", path], capture_output=True, text=True,
                          check=True).stdout
     return json.loads(out)
+
+
+def gh_text(path):
+    """A plain-text endpoint, such as a job log (gh follows the redirect to the log blob)."""
+    return subprocess.run(["gh", "api", path], capture_output=True, text=True, check=True).stdout
 
 
 def month_files(data_dir):
@@ -92,36 +106,87 @@ def _record(run, wf):
     return {
         "id": run["id"], "wf": wf, "event": run["event"], "status": run["status"], "conclusion": run["conclusion"],
         "created_at": run["created_at"], "head_sha": run.get("head_sha"), "title": run.get("display_title", ""), "url":
-        run.get("html_url", ""), "branch": run.get("head_branch"), "jobs": None
+        run.get("html_url", ""), "branch": run.get("head_branch"), "pr": None, "author": None, "jobs": None
     }
 
 
 def _jobs(pages):
     return [{
-        "name": j["name"], "conclusion": j["conclusion"], "started_at": j["started_at"], "completed_at":
-        j["completed_at"], "labels": j.get("labels") or [], "steps":
-        [{"name": s["name"], "conclusion": s["conclusion"]} for s in j.get("steps") or []]
+        "id":
+        j.get("id"), "name":
+        j["name"], "conclusion":
+        j["conclusion"], "created_at":
+        j.get("created_at"), "started_at":
+        j["started_at"], "completed_at":
+        j["completed_at"], "labels":
+        j.get("labels") or [], "steps": [{
+            "name": s["name"], "conclusion": s["conclusion"], "started_at": s.get("started_at"), "completed_at":
+            s.get("completed_at")
+        } for s in j.get("steps") or []]
     } for page in pages for j in page["jobs"]]
+
+
+def _pr_and_author(run, api):
+    """Push runs are triggered by the ShipIt bot, so the PR comes from the title's "(#N)". PR runs from forks
+    have no pull_requests entry, so the PR is looked up by head branch."""
+    try:
+        if run["event"] == "push":
+            m = re.search(r"\(#(\d+)\)\s*$", run.get("display_title") or "")
+            if m:
+                pr = api(f"repos/{REPO}/pulls/{m.group(1)}")[0]
+                return pr["number"], pr["user"]["login"]
+        elif run["event"] == "pull_request":
+            author = (run.get("actor") or {}).get("login")
+            if run.get("pull_requests"):
+                return run["pull_requests"][0]["number"], author
+            owner = ((run.get("head_repository") or {}).get("owner") or {}).get("login")
+            found = api(f"repos/{REPO}/pulls?head={owner}:{run.get('head_branch')}&state=all")[0]
+            return (found[0]["number"] if found else None), author
+    except (subprocess.CalledProcessError, KeyError, IndexError, TypeError):
+        pass
+    return None, None
+
+
+def _attach_failures(jobs, text):
+    for j in jobs:
+        if j["conclusion"] != "failure" or rules.gpu_of({"wf": "gpu-tests.yml"}, j) is None:
+            continue
+        try:
+            logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"))
+        except subprocess.CalledProcessError as exc:  # logs expired or not readable: no test result
+            print(f"no log for job {j['id']} ({j['name']}): {exc.stderr.strip() if exc.stderr else exc}")
+
+
+def _selection(jobs, text):
+    for j in jobs:
+        if j["name"] == "select" and j["conclusion"] in ("success", "failure"):
+            try:
+                return logs.parse_selection(text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"))
+            except subprocess.CalledProcessError:
+                return None
+    return None
 
 
 def _remaining(api):
     return api("rate_limit")[0]["resources"]["core"]["remaining"]
 
 
-def collect(data_dir, since, now, api=gh_api):
+def collect(data_dir, since, now, api=gh_api, text=gh_text):
     state_path = os.path.join(data_dir, "state.json")
     state = json.load(open(state_path)) if os.path.exists(state_path) else {}
     if since is None:
         since = (rules.iso(rules.t(state["cursor"]) - dt.timedelta(hours=1))
                  if state.get("cursor") else rules.iso(rules.t(now) - dt.timedelta(days=BACKFILL_DAYS)))
     runs = load_runs(data_dir)
-    for wf in rules.WORKFLOWS:
+    raw = {}
+    for wf in COLLECT:
         for page in api(f"repos/{REPO}/actions/workflows/{wf}/runs?created=>={since}&per_page=100"):
             for run in page["workflow_runs"]:
                 old = runs.get(run["id"])
                 if old and old["status"] == "completed" and old["jobs"] is not None:
                     continue
                 runs[run["id"]] = _record(run, wf)
+                raw[run["id"]] = run
     todo = sorted((r for r in runs.values() if r["status"] == "completed" and r["jobs"] is None),
                   key=lambda r: r["created_at"])
     unfetched = []
@@ -129,7 +194,13 @@ def collect(data_dir, since, now, api=gh_api):
         if i % 50 == 0 and _remaining(api) < RATE_FLOOR:
             unfetched = todo[i:]
             break
-        r["jobs"] = _jobs(api(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter=latest"))
+        jobs = _jobs(api(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter=latest"))
+        if r["wf"] == "gpu-tests.yml":
+            _attach_failures(jobs, text)
+            r["select"] = _selection(jobs, text)
+            if r["id"] in raw:
+                r["pr"], r["author"] = _pr_and_author(raw[r["id"]], api)
+        r["jobs"] = jobs
     # A run still not completed after STUCK_DAYS (a nightly stuck in "pending") no longer holds the cursor back.
     stuck = rules.iso(rules.t(now) - dt.timedelta(days=STUCK_DAYS))
     pending = [r["created_at"] for r in runs.values() if r["status"] != "completed" and r["created_at"] >= stuck]
@@ -145,31 +216,21 @@ def collect(data_dir, since, now, api=gh_api):
     return state
 
 
-def workflow_changes(since):
-    """Commits that changed the GPU workflow files, drawn as markers on the charts."""
+def bench_events(bench_dir=None):
+    """Per platform, the bench dashboard's per-night events. A failure here leaves the Nightly tab without perf."""
     try:
-        out = subprocess.run(["git", "log", f"--since={since}", "--format=%cI%x09%h%x09%s", "--"] + WORKFLOW_FILES,
-                             capture_output=True, text=True, check=True, cwd=HERE).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
-    changes = []
-    for line in out.splitlines():
-        ts, sha, subject = line.split("\t", 2)
-        m = re.search(r"\(#(\d+)\)\s*$", subject)
-        changes.append({
-            "t": rules.t(ts).astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"), "sha": sha, "pr":
-            m.group(1) if m else None, "subject": subject
-        })
-    return changes
+        summaries = bench.read_summaries(bench_dir) if bench_dir else bench.load_summaries()
+        return {platform: bench.events(nights) for platform, nights in summaries.items()}
+    except Exception as exc:  # noqa: BLE001 - the CI page must render even if the bench data cannot be read
+        print(f"warning: no bench perf events ({exc})")
+        return {}
 
 
-def render(data_dir, outdir, changelog=None):
+def render(data_dir, outdir, bench_dir=None):
     state_path = os.path.join(data_dir, "state.json")
     asof = json.load(open(state_path))["collected_at"] if os.path.exists(state_path) else None
     if asof:
-        if changelog is None:
-            changelog = workflow_changes(rules.iso(rules.t(asof) - dt.timedelta(days=30)))
-        data = rules.page_data(list(load_runs(data_dir).values()), asof, changelog)
+        data = rules.page_data(list(load_runs(data_dir).values()), asof, bench_events(bench_dir))
     else:
         data = {"asof": None}
     os.makedirs(outdir, exist_ok=True)
@@ -188,11 +249,12 @@ def main():
     r = sub.add_parser("render")
     r.add_argument("outdir")
     r.add_argument("--from", dest="data_dir", required=True)
+    r.add_argument("--bench-from", dest="bench_dir", help="read tlx-ops-bench summaries from this directory")
     args = parser.parse_args()
     if args.cmd == "collect":
         collect(args.data_dir, args.since, rules.iso(dt.datetime.now(dt.timezone.utc)))
     else:
-        render(args.data_dir, args.outdir)
+        render(args.data_dir, args.outdir, args.bench_dir)
 
 
 if __name__ == "__main__":
