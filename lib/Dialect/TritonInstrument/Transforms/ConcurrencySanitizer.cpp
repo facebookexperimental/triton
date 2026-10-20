@@ -1,7 +1,11 @@
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/Passes.h"
+#include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -19,10 +23,11 @@
 // Concurrency Sanitizer data structures:
 // ConSan keeps auxiliary data required for tracking memory accesses in tensors.
 // These tensors are stored as a distributed tensor or in global scratch memory.
-// C = CTAs, B = buffers, K = mbarriers, T = logical ConSan thread bit slots,
+// C = CTAs, D = packed buffer descriptors, B = buffer state lanes,
+// K = mbarriers/rendezvous, T = logical ConSan thread bit slots,
 // P = base-thread commit columns.
 //
-// Descriptors are CTA-agnostic: buffers are <B x i64> and barriers are
+// Descriptors are CTA-agnostic: buffers are <D x i64> and barriers are
 // <K x i64>. Scratch state has explicit CTA axes for buffer rows, barrier rows,
 // logical threads, and visibility masks. See TritonInstrument.md for the full
 // logical shapes.
@@ -639,6 +644,31 @@ Value getLocalLoadStoreRecipientCTAs(ImplicitLocOpBuilder &b,
       b, getLocalLoadStoreConversion(memDescTy, regTy));
 }
 
+Value getScratchReadCTAs(ImplicitLocOpBuilder &b, Operation *op,
+                         Value ownerCTAs) {
+  if (auto convert = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+    LinearLayout srcLayout = ttg::toLinearLayout(convert.getSrc().getType());
+    LinearLayout dstLayout = ttg::toLinearLayout(convert.getType());
+    Value loadCTAs = getLocalMemoryRecipientCTAs(
+        b, invertAndComposeBlockLocal(srcLayout, dstLayout));
+    return arith::OrIOp::create(b, ownerCTAs, loadCTAs);
+  }
+
+  if (auto reduce = dyn_cast<tt::ReduceOp>(op)) {
+    LinearLayout srcLayout = ttg::toLinearLayout(reduce.getInputTypes()[0]);
+    auto block = StringAttr::get(op->getContext(), "block");
+    auto axis = *(srcLayout.getOutDimNames().begin() + reduce.getAxis());
+    uint16_t groupMask = getInputBasisMask(srcLayout, block, {axis});
+    if (!groupMask)
+      return ownerCTAs;
+    if (groupMask == ttg::lookupNumCTAs(op) - 1)
+      return allCTAsMask(b);
+    return getRecipientCTAsForBroadcastMasks(b, {groupMask});
+  }
+
+  return ownerCTAs;
+}
+
 Value getMemEffectCTAs(ImplicitLocOpBuilder &b, Operation *op) {
   if (auto load = dyn_cast<ttg::LocalLoadOp>(op)) {
     return getLocalLoadStoreRecipientCTAs(b, load.getSrc().getType(),
@@ -780,27 +810,140 @@ public:
       : module(module), hooks(hooks) {}
 
   LogicalResult run() {
-    tti::FunctionBuilder funcBuilder(module, auxData);
-    if (failed(auxData.populateAndPassToWarpSpecialize(module, funcBuilder,
-                                                       hooks)))
+    SmallVector<tt::FuncOp> publicFuncs =
+        llvm::to_vector(llvm::make_filter_range(
+            module.getOps<tt::FuncOp>(),
+            [](tt::FuncOp func) { return tt::isKernel(func); }));
+    if (publicFuncs.size() != 1) {
+      module.emitError(
+          "ConSan requires exactly one public entrypoint function; "
+          "found ")
+          << publicFuncs.size();
+      return failure();
+    }
+    entryPoint = publicFuncs.front();
+    if (entryPoint.isExternal()) {
+      entryPoint.emitError("ConSan entrypoint must have a function body");
+      return failure();
+    }
+    if (failed(validateNonEntryFunctions()))
       return failure();
 
-    tt::FuncOp entryPoint = tti::getEntryPoint(module);
+    tti::FunctionBuilder funcBuilder(module, auxData);
+    if (failed(auxData.populateAndPassToWarpSpecialize(module, entryPoint,
+                                                       funcBuilder, hooks)))
+      return failure();
 
     ImplicitLocOpBuilder b(entryPoint.getLoc(), entryPoint);
     b.setInsertionPointToStart(&entryPoint.getBody().front());
-    instrumentMemoryOperations(b, funcBuilder);
+    if (failed(instrumentMemoryOperations(b, funcBuilder)))
+      return failure();
     initializeAllocations();
     return success();
   }
 
 private:
+  bool isCTALocalScratch(Operation *op) const {
+    if (!op->hasAttr("allocation.size"))
+      return true;
+
+    // NVIDIA broadcasts scalar atomic results; AMD executes them in each CTA.
+    if (isa<tt::AtomicRMWOp, tt::AtomicCASOp>(op) &&
+        !isa<RankedTensorType>(op->getResult(0).getType()))
+      return !hooks.hasUnsummarizableCalleeState(op);
+
+    return !tt::hasCrossCTAScratch(op);
+  }
+
+  // Non-entry bodies are not instrumented. Their compiler-owned shared memory
+  // is covered by the virtual frame on each call, but SSA-visible memory and
+  // sanitizer state transitions cannot be represented by that summary.
+  LogicalResult validateNonEntryFunctions() {
+    SymbolTableCollection symbolTable;
+    AuxDataMap emptyAuxData;
+    for (tt::FuncOp func : module.getOps<tt::FuncOp>()) {
+      WalkResult result = func.walk([&](Operation *op) -> WalkResult {
+        if (op == func.getOperation())
+          return WalkResult::advance();
+        if (auto call = dyn_cast<CallOpInterface>(op)) {
+          Operation *resolved = call.resolveCallableInTable(&symbolTable);
+          tt::FuncOp callee = dyn_cast_or_null<tt::FuncOp>(resolved);
+          if (!callee || callee.isExternal()) {
+            call->emitError("ConSan cannot summarize an unresolved or external "
+                            "callee in function @")
+                << func.getName();
+            return WalkResult::interrupt();
+          }
+        }
+        if (func == entryPoint)
+          return WalkResult::advance();
+        if (isa<CallOpInterface>(op))
+          return WalkResult::advance();
+
+        bool hasUnsupportedAllocation =
+            isa<ttg::LocalAllocOp, ttng::TMEMAllocOp>(op);
+        bool hasOpaqueEffects =
+            !isa<ttg::BarrierOp>(op) && hasUnknownEffects(op);
+        bool hasUnsupportedResource = false;
+        if (auto memoryEffects = dyn_cast<MemoryEffectOpInterface>(op)) {
+          SmallVector<MemoryEffects::EffectInstance> effects;
+          memoryEffects.getEffects(effects);
+          hasUnsupportedResource = llvm::any_of(
+              effects, [op](const MemoryEffects::EffectInstance &effect) {
+                if (effect.getResource() == tt::GlobalMemory::get())
+                  return false;
+                // Volatile global loads publish a synthetic default-resource
+                // write only to prevent compiler reordering.
+                auto load = dyn_cast<tt::LoadOp>(op);
+                return !(load && load.getIsVolatile() &&
+                         isa<MemoryEffects::Write>(effect.getEffect()) &&
+                         effect.getResource() ==
+                             SideEffects::DefaultResource::get());
+              });
+        }
+
+        auto info = hooks.getMemEffectsOpInfo(op);
+        bool hasMemoryState =
+            info && (!info->operandEffects.empty() || !info->barriers.empty() ||
+                     info->implicitCommit);
+        bool hasBarrierState = hooks.getBarrierInitInfo(op) ||
+                               hooks.getBarrierWaitInfo(op) ||
+                               hooks.getBarrierInvalidateInfo(op) ||
+                               isa<ttg::MBarrierOpInterface>(op);
+        bool hasAsyncState =
+            hooks.getAsyncProxyFenceInfo(op) ||
+            hooks.getWaitOpInfo(op, emptyAuxData) ||
+            op->hasTrait<OpTrait::MemWaitOpTrait>() ||
+            isa<ttg::AsyncCommitGroupOp, ttng::WarpGroupDotWaitOp,
+                ttg::AsyncWaitOp>(op);
+        bool hasControlState =
+            isa<ttg::WarpSpecializeOp, ttg::WarpSpecializePartitionsOp,
+                ttng::ClusterBarrierOp>(op) ||
+            hooks.hasUnsummarizableCalleeState(op);
+        if (!hasUnsupportedAllocation && !hasOpaqueEffects &&
+            !hasUnsupportedResource && !hasMemoryState && !hasBarrierState &&
+            !hasAsyncState && !hasControlState && isCTALocalScratch(op))
+          return WalkResult::advance();
+
+        op->emitError("ConSan cannot summarize ")
+            << op->getName() << " in non-entry function @" << func.getName()
+            << "; inline the function before ConSan or keep its body limited "
+               "to register/global-memory operations and compiler-owned "
+               "shared scratch";
+        return WalkResult::interrupt();
+      });
+      if (result.wasInterrupted())
+        return failure();
+    }
+    return success();
+  }
+
   void initializeAllocations() {
     if (!shouldInitializeAllocations())
       return;
 
     SmallVector<Operation *> allocationsToInitialize;
-    module.walk([&](Operation *op) {
+    entryPoint.walk([&](Operation *op) {
       if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op)) {
         if (!alloc.getSrc())
           allocationsToInitialize.push_back(op);
@@ -826,10 +969,10 @@ private:
     }
   }
 
-  void instrumentMemoryOperations(ImplicitLocOpBuilder &b,
-                                  tti::FunctionBuilder &funcBuilder) {
+  LogicalResult instrumentMemoryOperations(ImplicitLocOpBuilder &b,
+                                           tti::FunctionBuilder &funcBuilder) {
     SmallVector<ttng::ClusterBarrierOp> clusterBarriers;
-    module.walk([&](Operation *op) {
+    WalkResult walkResult = entryPoint.walk([&](Operation *op) -> WalkResult {
       CriticalSectionListener listener;
       b.setListener(&listener);
 
@@ -852,10 +995,13 @@ private:
         b.setListener(nullptr);
         instrumentBarrierWait(op, info->alloc, info->phase, info->pred, thread,
                               baseThread, funcBuilder);
-        return;
+        return WalkResult::advance();
       }
 
-      instrumentMemEffects(b, op, thread, funcBuilder);
+      if (failed(instrumentMemEffects(b, op, thread, funcBuilder))) {
+        b.setListener(nullptr);
+        return WalkResult::interrupt();
+      }
       b.setLoc(op->getLoc());
       if (auto info = hooks.getAsyncProxyFenceInfo(op)) {
         funcBuilder.createFenceProxyAccessesCall(
@@ -979,8 +1125,7 @@ private:
           b.setListener(&listener);
         }
       }
-      if (isa<tt::ReturnOp>(op) && !auxData.activeMasks.empty() &&
-          op->getParentOfType<tt::FuncOp>() == tti::getEntryPoint(module)) {
+      if (isa<tt::ReturnOp>(op) && !auxData.activeMasks.empty()) {
         b.setListener(nullptr);
         Value lock = auxData.lock.at(op).value;
         Value trueVal = arith::ConstantIntOp::create(b, 1, 1);
@@ -995,7 +1140,11 @@ private:
 
       listener.maybeWrapWithCriticalSection(b, auxData, nullptr);
       b.setListener(nullptr);
+      return WalkResult::advance();
     });
+    if (walkResult.wasInterrupted())
+      return failure();
+
     // Cluster rendezvous polling introduces control-flow blocks, so add it
     // after the operation walk rather than invalidating the walk iterators.
     for (ttng::ClusterBarrierOp clusterBarrier : clusterBarriers) {
@@ -1011,6 +1160,7 @@ private:
           getThreadPeersMask(baseThread, auxData.threadLayout), partitionScoped,
           /*publishVisibility=*/!clusterBarrier.getRelaxed(), op);
     }
+    return success();
   }
 
   void instrumentBarrierWait(Operation *op, Value alloc, Value phase,
@@ -1044,10 +1194,12 @@ private:
     tti::ExperimentalLockReleaseOp::create(wb, lock, pred);
   }
 
-  void instrumentMemEffects(ImplicitLocOpBuilder &b, Operation *op, int thread,
-                            tti::FunctionBuilder &funcBuilder) {
+  LogicalResult instrumentMemEffects(ImplicitLocOpBuilder &b, Operation *op,
+                                     int thread,
+                                     tti::FunctionBuilder &funcBuilder) {
     int baseThread = getBaseThread(thread, auxData.threadLayout);
-    std::optional<MemEffectsOpInfo> opInfo = hooks.getMemEffectsOpInfo(op);
+    std::optional<MemEffectsOpInfo> opInfo =
+        getConSanMemEffectsOpInfo(hooks, op);
     for (const MemoryAccess &access :
          getMemoryAccesses(op, ttg::SharedKind::Barrier)) {
       if (opInfo && llvm::any_of(opInfo->barriers, [&](const auto &barrier) {
@@ -1059,7 +1211,7 @@ private:
           getBarrierRecipientCTAs(b, op));
     }
     if (!opInfo)
-      return;
+      return success();
     bool isBarrierLifecycle = hooks.getBarrierInitInfo(op).has_value() ||
                               hooks.getBarrierInvalidateInfo(op).has_value();
     Value pred = opInfo->pred;
@@ -1074,6 +1226,39 @@ private:
     };
     SmallVector<MaterializedEffect> materializedEffects;
     materializedEffects.reserve(opInfo->operandEffects.size());
+
+    auto addBarrierOwners = [&](MaterializedEffect &materialized,
+                                const llvm::SmallBitVector &bufferMask,
+                                Value ownerCTAs, bool selectBarrierStorage) {
+      if (!selectBarrierStorage ||
+          materialized.memType != MemType::SHARED_MEM ||
+          auxData.barrierBufferMasks.empty())
+        return;
+
+      auto barrierStatesType =
+          cast<RankedTensorType>(auxData.barrierStates.at(op).type);
+      RankedTensorType barrierMaskType =
+          tti::getSlicedTensorType(barrierStatesType, {1}, b.getI1Type());
+      RankedTensorType barrierOwnersType =
+          cast<RankedTensorType>(barrierMaskType.clone(b.getI32Type()));
+      llvm::SmallBitVector overlaps(barrierMaskType.getNumElements());
+      for (auto [index, barrierMask] :
+           llvm::enumerate(auxData.barrierBufferMasks))
+        if (bufferMask.anyCommon(barrierMask))
+          overlaps.set(index);
+      if (overlaps.none())
+        return;
+
+      Value selected = createStateMaskConstant(b, barrierMaskType, overlaps);
+      Value owners = tt::SplatOp::create(b, barrierOwnersType, ownerCTAs);
+      Value zero =
+          tti::createConstIntTensor(b, b.getLoc(), 0, barrierOwnersType);
+      owners = arith::SelectOp::create(b, selected, owners, zero);
+      materialized.barrierCTAs =
+          materialized.barrierCTAs
+              ? arith::OrIOp::create(b, materialized.barrierCTAs, owners)
+              : owners;
+    };
 
     auto materializeBuffer =
         [&](Value buf, Value recipients,
@@ -1102,46 +1287,12 @@ private:
         return failure();
       materialized.bufferMask = *stateMask;
 
-      bool selectBarriers = selectBarrierStorage &&
-                            materialized.memType == MemType::SHARED_MEM &&
-                            !auxData.barrierBufferMasks.empty();
-      RankedTensorType barrierMaskType;
-      RankedTensorType barrierOwnersType;
-      if (selectBarriers) {
-        auto barrierStatesType =
-            cast<RankedTensorType>(auxData.barrierStates.at(op).type);
-        barrierMaskType =
-            tti::getSlicedTensorType(barrierStatesType, {1}, b.getI1Type());
-        barrierOwnersType =
-            cast<RankedTensorType>(barrierMaskType.clone(b.getI32Type()));
-      }
-      auto addBarrierOwners = [&](const llvm::SmallBitVector &bufferMask,
-                                  Value ownerCTAs) {
-        if (!selectBarriers)
-          return;
-        llvm::SmallBitVector overlaps(barrierMaskType.getNumElements());
-        for (auto [index, barrierMask] :
-             llvm::enumerate(auxData.barrierBufferMasks))
-          if (bufferMask.anyCommon(barrierMask))
-            overlaps.set(index);
-        if (overlaps.none())
-          return;
-        Value selected = createStateMaskConstant(b, barrierMaskType, overlaps);
-        Value owners = tt::SplatOp::create(b, barrierOwnersType, ownerCTAs);
-        Value zero =
-            tti::createConstIntTensor(b, b.getLoc(), 0, barrierOwnersType);
-        owners = arith::SelectOp::create(b, selected, owners, zero);
-        materialized.barrierCTAs =
-            materialized.barrierCTAs
-                ? arith::OrIOp::create(b, materialized.barrierCTAs, owners)
-                : owners;
-      };
-
       if (candidates.unknown) {
         materialized.effectCTAs = allCTAsMask(b);
         addBarrierOwners(
+            materialized,
             auxData.bufferStatePlans[(int)materialized.memType].unknownMask,
-            materialized.effectCTAs);
+            materialized.effectCTAs, selectBarrierStorage);
         return materialized;
       }
 
@@ -1155,39 +1306,79 @@ private:
             materialized.effectCTAs
                 ? arith::OrIOp::create(b, materialized.effectCTAs, ownerCTAs)
                 : ownerCTAs;
-        addBarrierOwners(candidate.mask, ownerCTAs);
+        addBarrierOwners(materialized, candidate.mask, ownerCTAs,
+                         selectBarrierStorage);
       }
       return materialized;
     };
 
+    auto materializeStaticBuffer =
+        [&](const MemEffectsOpInfo::Effects::StaticSharedBuffer &buffer,
+            bool selectBarrierStorage) -> FailureOr<MaterializedEffect> {
+      int index = static_cast<int>(MemType::SHARED_MEM);
+      const auto &regions = auxData.bufferRegions[index];
+      BufferRegion region = buffer.getRegion(ttg::lookupNumCTAs(op));
+      auto it = llvm::lower_bound(regions, region);
+      if (it == regions.end() || !(*it == region)) {
+        op->emitError("static shared-memory region is absent from the ConSan "
+                      "registry");
+        return failure();
+      }
+      unsigned id = std::distance(regions.begin(), it);
+      const llvm::SmallBitVector &stateMask =
+          auxData.bufferStatePlans[index].regionMasks[id];
+      auto writeVisibilityType =
+          cast<RankedTensorType>(auxData.writeVisibility[index].at(op).type);
+      RankedTensorType maskType =
+          tti::getSlicedTensorType(writeVisibilityType, {1}, b.getI1Type());
+
+      MaterializedEffect materialized;
+      materialized.memType = MemType::SHARED_MEM;
+      materialized.bufferMask = createStateMaskConstant(b, maskType, stateMask);
+      // Scratch stores target the issuing CTA; cross-CTA consumers read after
+      // intrinsic synchronization.
+      materialized.effectCTAs = currentCTAMask(b);
+      addBarrierOwners(materialized, stateMask, materialized.effectCTAs,
+                       selectBarrierStorage);
+      return materialized;
+    };
+
     for (const auto &effect : opInfo->operandEffects) {
-      Value buf = effect.buf;
-      bool isSharedMemory = isa<ttg::SharedMemorySpaceAttr>(
-          cast<ttg::MemDescType>(buf.getType()).getMemorySpace());
+      const auto *buf = std::get_if<Value>(&effect.buffer);
+      bool isSharedMemory =
+          !buf || isa<ttg::SharedMemorySpaceAttr>(
+                      cast<ttg::MemDescType>(buf->getType()).getMemorySpace());
       bool invalidatesBarriers =
           isSharedMemory && hooks.barrierWritesInvalidate() &&
           effect.rw == RW::Write &&
           effect.sharedKind == ttg::SharedKind::Generic &&
           thread == baseThread &&
           opInfo->trackingKind == MemEffectsOpInfo::TrackingKind::Barrier &&
-          llvm::none_of(getMemoryAccesses(op), [&](const auto &access) {
-            return access.value == buf &&
-                   access.sharedKind == effect.sharedKind && access.isRead;
-          });
-      FailureOr<MaterializedEffect> maybeMaterialized = materializeBuffer(
-          buf, defaultEffectCTAs, !isBarrierLifecycle || invalidatesBarriers);
+          (!buf ||
+           llvm::none_of(getMemoryAccesses(op), [&](const auto &access) {
+             return access.value == *buf &&
+                    access.sharedKind == effect.sharedKind && access.isRead;
+           }));
+      bool selectBarrierStorage = !isBarrierLifecycle || invalidatesBarriers;
+      FailureOr<MaterializedEffect> maybeMaterialized =
+          buf ? materializeBuffer(*buf, defaultEffectCTAs, selectBarrierStorage)
+              : materializeStaticBuffer(
+                    std::get<MemEffectsOpInfo::Effects::StaticSharedBuffer>(
+                        effect.buffer),
+                    selectBarrierStorage);
       if (failed(maybeMaterialized))
-        return;
+        return failure();
       MaterializedEffect materialized = *maybeMaterialized;
       materializedEffects.push_back(materialized);
 
       Value bufferMask = materialized.bufferMask;
       Value effectCTAs = materialized.effectCTAs;
+      Value readCTAs = buf ? effectCTAs : getScratchReadCTAs(b, op, effectCTAs);
       MemType memType = materialized.memType;
       bool invalidatedBarrier = false;
       auto verifyWrite = [&] {
         addWriteChecks(b, funcBuilder, op, bufferMask, pred, memType, thread,
-                       effect.operandName, effectCTAs, opInfo->commitKind);
+                       effect.operandName, readCTAs, opInfo->commitKind);
         addReadChecks(b, funcBuilder, op, bufferMask, pred, memType, thread,
                       effect.operandName, effectCTAs, opInfo->commitKind);
       };
@@ -1211,7 +1402,7 @@ private:
                                                   effectCTAs);
         } else {
           funcBuilder.createSetProxyAccessCall(b, bufferMask, baseThread, pred,
-                                               op, effectCTAs);
+                                               op, readCTAs);
         }
       }
       if (effect.rw == RW::Read) {
@@ -1264,7 +1455,7 @@ private:
             materializeBuffer(barrier, recipientCTAs,
                               /*selectBarrierStorage=*/false);
         if (failed(completion))
-          return;
+          return failure();
         completionBufferMask = completion->bufferMask;
         // A deferred completion may still touch the barrier after the issuing
         // thread advances. Model that future touch as a reader owned by the
@@ -1321,6 +1512,7 @@ private:
       funcBuilder.createCommitAccessesCall(b, baseThread, pred,
                                            opInfo->commitKind, op);
     }
+    return success();
   }
 
   void addWriteChecks(ImplicitLocOpBuilder &b,
@@ -1371,6 +1563,7 @@ private:
   }
 
   ModuleOp module;
+  tt::FuncOp entryPoint;
   AuxDataMap auxData;
   const ConSanTargetHooks &hooks;
 };

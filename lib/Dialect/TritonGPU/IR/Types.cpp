@@ -196,6 +196,11 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
                             "SharedClusterMemorySpace for shared encoding. "
                          << "Got " << memorySpace;
     }
+    if (bitwidth % 8 != 0)
+      return emitError()
+             << "shared-memory element type bit width must be a multiple of 8; "
+                "got "
+             << bitwidth;
   } else if (auto enc = dyn_cast<nvidia_gpu::TensorMemoryScalesEncodingAttr>(
                  encoding)) {
     if (memorySpace != nvidia_gpu::TensorMemorySpaceAttr::get(ctx)) {

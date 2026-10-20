@@ -434,12 +434,12 @@ static void appendWriteSlices(Value value, Operation *op,
     blockInfo->syncWriteSlices[slice].insert(op);
 }
 
-class TMemBarrierAnalysis : public MembarOrFenceAnalysis {
+class TMemBarrierAnalysis : public MembarAnalysis {
 public:
-  using MembarOrFenceAnalysis::MembarOrFenceAnalysis;
+  using MembarAnalysis::MembarAnalysis;
 
 private:
-  void update(Operation *operation, BlockInfo *blockInfo, FuncMapT *funcMap,
+  void update(Operation *operation, MembarInfo *membarInfo, FuncMapT *funcMap,
               OpBuilder *builder) override;
 
   void insertBarrier(Operation *operation, OpBuilder *builder);
@@ -451,29 +451,39 @@ void TMemBarrierAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
                                  triton::gpu::AddrSpace::Local);
 }
 
-void TMemBarrierAnalysis::update(Operation *op, BlockInfo *blockInfo,
+void TMemBarrierAnalysis::update(Operation *op, MembarInfo *membarInfo,
                                  FuncMapT *funcMap, OpBuilder *builder) {
-  // Per-thread arrives are not local barriers at all (see
-  // containsLocalBarrier), so they fall through to the generic path untouched.
+  // Per-thread arrives are not local barriers, so they fall through to the
+  // generic path untouched.
   if (auto arrive = dyn_cast<ArriveBarrierOp>(op);
       arrive && !arrive.getPerThread()) {
     // An mbarrier arrive signals another task; it orders nothing across this
     // task's own warps. Drop pending writes (same-task WAW needs no barrier)
     // but keep pending reads: a later store to the same TMEM is an intra-task
     // WAR hazard that still needs a barrier.
-    blockInfo->syncWriteSlices.clear();
+    membarInfo->pending.syncWriteSlices.clear();
     return;
   }
-  if (mlir::containsLocalBarrier(op)) {
-    blockInfo->sync();
-    return;
-  }
+  auto stages = mlir::getLocalBarrierStages(op, &allocation);
+  if (stages.beforeMemoryEffects)
+    membarInfo->sync();
 
   BlockInfo curBlockInfo;
   if (isa<triton::CallOp>(op)) {
-    auto call = dyn_cast<CallOpInterface>(op);
-    if (auto callee = dyn_cast<FunctionOpInterface>(call.resolveCallable()))
-      curBlockInfo = funcMap->lookup(callee);
+    auto call = cast<CallOpInterface>(op);
+    if (auto callee = dyn_cast<FunctionOpInterface>(call.resolveCallable())) {
+      // Tensor-memory allocation attributes are physical addresses assigned
+      // across the whole module, so callee slices need no call-frame offset.
+      MembarInfo calleeMembarInfo = funcMap->lookup(callee);
+      if (membarInfo->pending.isIntersected(calleeMembarInfo.entryBlockInfo,
+                                            filter, &allocation)) {
+        builder->setInsertionPoint(op);
+        insertBarrier(op, builder);
+        membarInfo->sync();
+      }
+      membarInfo->applyCallSummary(calleeMembarInfo);
+    }
+    return;
   } else if (auto load = dyn_cast<TMEMLoadOp>(op)) {
     appendReadSlices(load.getSrc(), op, &curBlockInfo);
   } else if (auto store = dyn_cast<TMEMStoreOp>(op)) {
@@ -495,13 +505,18 @@ void TMemBarrierAnalysis::update(Operation *op, BlockInfo *blockInfo,
     appendWriteSlices(shift.getBuffer(), op, &curBlockInfo);
   }
 
-  if (blockInfo->isIntersected(curBlockInfo, filter, &allocation)) {
+  if (membarInfo->pending.isIntersected(curBlockInfo, filter, &allocation)) {
     builder->setInsertionPoint(op);
     insertBarrier(op, builder);
-    blockInfo->sync();
+    membarInfo->sync();
   }
 
-  blockInfo->join(curBlockInfo);
+  membarInfo->addBlockInfo(curBlockInfo);
+  // A leading or interior rendezvous must preserve the operation's own effects.
+  if (stages.afterMemoryEffects ||
+      (stages.betweenMemoryEffects && curBlockInfo.syncReadSlices.empty() &&
+       curBlockInfo.syncWriteSlices.empty()))
+    membarInfo->sync();
 }
 
 } // namespace
@@ -520,9 +535,8 @@ struct TMemBarrierInsertionPass
                                 bool rhsIsRead, Allocation *allocation) {
       return filterFn(lhs, rhs, lhsIsRead, rhsIsRead, allocation, cache);
     };
-    ModuleMembarOrFenceAnalysis<TMemBarrierAnalysis> analysis(allocation,
-                                                              filter);
-    analysis.run();
+    ModuleMembarAnalysis analysis(allocation, filter);
+    analysis.runAnalysis<TMemBarrierAnalysis>();
   }
 };
 

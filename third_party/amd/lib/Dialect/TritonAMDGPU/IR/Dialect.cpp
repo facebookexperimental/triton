@@ -1155,6 +1155,13 @@ LogicalResult BufferLoadToLocalOp::verify() {
   return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
 
+// A buffer write's scalar base must be global memory (address space 1).
+static LogicalResult verifyBufferWriteBase(Operation *op, Value ptr) {
+  if (triton::getAddressSpace(ptr.getType()) != triton::PtrAddrSpace::Global)
+    return op->emitOpError("buffer writes require a global address space base");
+  return success();
+}
+
 static FailureOr<unsigned> getScheduledMfmaVersion(Operation *op) {
   auto mod = op->getParentOfType<ModuleOp>();
   if (!mod)
@@ -1179,12 +1186,18 @@ LogicalResult BufferLoadOp::verify() {
 }
 
 LogicalResult BufferStoreOp::verify() {
+  if (failed(verifyBufferWriteBase(getOperation(), getPtr())))
+    return failure();
+
   return verifyBufferContiguity(getOperation(),
                                 cast<RankedTensorType>(getOffsets().getType()),
                                 getContiguity(), /*checkPhysicalLayout=*/true);
 }
 
 LogicalResult BufferAtomicRMWOp::verify() {
+  if (failed(verifyBufferWriteBase(getOperation(), getPtr())))
+    return failure();
+
   if (failed(verifyBufferContiguity(
           getOperation(), cast<RankedTensorType>(getOffsets().getType()),
           getContiguity())))
@@ -1210,6 +1223,10 @@ LogicalResult BufferAtomicRMWOp::verify() {
       !features.supportsBufferAtomicFadd(elementType))
     return emitOpError("fadd is unsupported for this type on the target");
   return success();
+}
+
+LogicalResult BufferAtomicCASOp::verify() {
+  return verifyBufferWriteBase(getOperation(), getPtr());
 }
 
 LogicalResult LocalLoadPackedTransposedOp::verify() {

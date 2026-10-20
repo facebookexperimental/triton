@@ -101,6 +101,10 @@ public:
     return {arrive.getOperation(), wait.getOperation()};
   }
 
+  bool hasUnsummarizableCalleeState(Operation *op) const override {
+    return isa<ttag::ClusterBarrierArriveOp, ttag::ClusterBarrierWaitOp>(op);
+  }
+
   std::optional<MemEffectsOpInfo>
   getMemEffectsOpInfo(Operation *op) const override {
     bool isAsyncCopy =

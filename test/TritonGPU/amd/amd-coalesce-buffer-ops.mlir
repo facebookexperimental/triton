@@ -14,8 +14,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
       %offsets: tensor<1024xi32, #blocked1> {tt.divisibility = 16 : i32}) {
     // CHECK: %{{.*}} = ttg.convert_layout %{{.*}} : tensor<1024xi32, #blocked{{.*}}> -> tensor<1024xi32, #[[$BLOCKED4]]>
-    // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : tensor<1024xf32, #[[$BLOCKED4]]>
-    %result = amdg.buffer_load %ptr[%offsets] : tensor<1024xf32, #blocked1>
+    // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : !tt.ptr<f32> -> tensor<1024xf32, #[[$BLOCKED4]]>
+    %result = amdg.buffer_load %ptr[%offsets] : !tt.ptr<f32> -> tensor<1024xf32, #blocked1>
     tt.return
   }
 }
@@ -36,8 +36,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32},
       %offsets: tensor<1024xi32, #blocked2> {tt.divisibility = 16 : i32}) {
     // CHECK: %{{.*}} = ttg.convert_layout %{{.*}} : tensor<1024xi32, #blocked{{.*}}> -> tensor<1024xi32, #[[$BLOCKED4_F16]]>
-    // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : tensor<1024xf16, #[[$BLOCKED4_F16]]>
-    %result = amdg.buffer_load %ptr[%offsets] : tensor<1024xf16, #blocked2>
+    // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : !tt.ptr<f16> -> tensor<1024xf16, #[[$BLOCKED4_F16]]>
+    %result = amdg.buffer_load %ptr[%offsets] : !tt.ptr<f16> -> tensor<1024xf16, #blocked2>
     tt.return
   }
 }
@@ -58,8 +58,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32},
       %offsets: tensor<16384xi32, #blocked3> {tt.divisibility = 16 : i32}) {
     // CHECK: %{{.*}} = ttg.convert_layout %{{.*}} : tensor<16384xi32, #blocked{{.*}}> -> tensor<16384xi32, #[[$BLOCKED8]]>
-    // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : tensor<16384xf16, #[[$BLOCKED8]]>
-    %result = amdg.buffer_load %ptr[%offsets] : tensor<16384xf16, #blocked3>
+    // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : !tt.ptr<f16> -> tensor<16384xf16, #[[$BLOCKED8]]>
+    %result = amdg.buffer_load %ptr[%offsets] : !tt.ptr<f16> -> tensor<16384xf16, #blocked3>
     tt.return
   }
 }
@@ -83,8 +83,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: %{{.*}} = ttg.convert_layout %{{.*}} : tensor<1024xf32, #blocked{{.*}}> -> tensor<1024xf32, #[[$BLOCKED4_ST]]>
     // CHECK: %{{.*}} = ttg.convert_layout %{{.*}} : tensor<1024xi32, #blocked{{.*}}> -> tensor<1024xi32, #[[$BLOCKED4_ST]]>
     // CHECK: %{{.*}} = ttg.convert_layout %{{.*}} : tensor<1024xi1, #blocked{{.*}}> -> tensor<1024xi1, #[[$BLOCKED4_ST]]>
-    // CHECK: amdg.buffer_store %{{.*}}, %{{.*}}[%{{.*}}], %{{.*}} : tensor<1024xf32, #[[$BLOCKED4_ST]]>
-    amdg.buffer_store %value, %ptr[%offsets], %mask : tensor<1024xf32, #blocked4>
+    // CHECK: amdg.buffer_store %{{.*}}, %{{.*}}[%{{.*}}], %{{.*}} : !tt.ptr<f32> -> tensor<1024xf32, #[[$BLOCKED4_ST]]>
+    amdg.buffer_store %value, %ptr[%offsets], %mask : !tt.ptr<f32> -> tensor<1024xf32, #blocked4>
     tt.return
   }
 }
@@ -107,8 +107,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
       %offsets: tensor<128x64xi32, #blocked5> {tt.divisibility = dense<[2, 16]> : tensor<2xi32>}) {
     // CHECK: %{{.*}} = ttg.convert_layout %{{.*}} : tensor<128x64xi32, #blocked{{.*}}> -> tensor<128x64xi32, #[[$BLOCKED_2D]]>
-    // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : tensor<128x64xf32, #[[$BLOCKED_2D]]>
-    %result = amdg.buffer_load %ptr[%offsets] : tensor<128x64xf32, #blocked5>
+    // CHECK: %{{.*}} = amdg.buffer_load %{{.*}}[%{{.*}}] : !tt.ptr<f32> -> tensor<128x64xf32, #[[$BLOCKED_2D]]>
+    %result = amdg.buffer_load %ptr[%offsets] : !tt.ptr<f32> -> tensor<128x64xf32, #blocked5>
     tt.return
   }
 }
@@ -126,8 +126,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
       %offsets: tensor<1024xi32, #blocked6> {tt.divisibility = 16 : i32}) {
     // CHECK-NOT: ttg.convert_layout
-    // CHECK: amdg.buffer_load %{{.*}}[%{{.*}}] : tensor<1024xf32, #blocked{{.*}}>
-    %result = amdg.buffer_load %ptr[%offsets] : tensor<1024xf32, #blocked6>
+    // CHECK: amdg.buffer_load %{{.*}}[%{{.*}}] : !tt.ptr<f32> -> tensor<1024xf32, #blocked{{.*}}>
+    %result = amdg.buffer_load %ptr[%offsets] : !tt.ptr<f32> -> tensor<1024xf32, #blocked6>
     tt.return
   }
 }
@@ -146,8 +146,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %ptr: !tt.ptr<f32> {tt.divisibility = 4 : i32},
       %offsets: tensor<1024xi32, #blocked7> {tt.divisibility = 16 : i32}) {
     // CHECK-NOT: ttg.convert_layout
-    // CHECK: amdg.buffer_load %{{.*}}[%{{.*}}] : tensor<1024xf32, #blocked{{.*}}>
-    %result = amdg.buffer_load %ptr[%offsets] : tensor<1024xf32, #blocked7>
+    // CHECK: amdg.buffer_load %{{.*}}[%{{.*}}] : !tt.ptr<f32> -> tensor<1024xf32, #blocked{{.*}}>
+    %result = amdg.buffer_load %ptr[%offsets] : !tt.ptr<f32> -> tensor<1024xf32, #blocked7>
     tt.return
   }
 }
@@ -173,7 +173,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %offsets: tensor<1024xi32, #blocked8> {tt.divisibility = 16 : i32},
       %dst: !ttg.memdesc<1024xf32, #shared8, #smem, mutable>) {
     // CHECK: %[[OFF:.*]] = ttg.convert_layout %{{.*}} : tensor<1024xi32, #blocked{{.*}}> -> tensor<1024xi32, #[[$BL2L]]>
-    // CHECK: amdg.buffer_load_to_local %{{.*}}[%[[OFF]]] into %{{.*}} : <f32>[tensor<1024xi32, #[[$BL2L]]>] -> <1024xf32, #shared{{.*}}, #smem, mutable>
+    // CHECK: amdg.buffer_load_to_local %{{.*}}[%[[OFF]]] into %{{.*}} : !tt.ptr<f32>[tensor<1024xi32, #[[$BL2L]]>] -> <1024xf32, #shared{{.*}}, #smem, mutable>
     %token = amdg.buffer_load_to_local %ptr[%offsets] into %dst : !tt.ptr<f32>[tensor<1024xi32, #blocked8>] -> <1024xf32, #shared8, #smem, mutable>
     tt.return
   }

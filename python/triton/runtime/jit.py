@@ -350,7 +350,11 @@ class DependenciesFinder(ast.NodeVisitor):
     def visit_FunctionDef(self, node):
         # Save the local name, which may hide the global name.
         self.local_names = {arg.arg for arg in node.args.args}
-        self.generic_visit(node)
+        for child in ast.iter_child_nodes(node):
+            self.visit(child)
+            # Keyword-only parameters shadow globals in the body, but not in defaults.
+            if child is node.args and node.args.kwonlyargs:
+                self.local_names.update(arg.arg for arg in node.args.kwonlyargs)
 
     def visit_arguments(self, node):
         # The purpose of this function is to visit everything in `arguments`
@@ -631,15 +635,21 @@ def create_function_from_signature(sig, kparams, backend):
             else:
                 specialization.append(f"{ret}")
 
-    # compute argument string for a given parameter
-    def arg(name_param):
-        name, param = name_param
+    # compute argument strings, preserving the keyword-only separator
+    arg_list = []
+    has_star = False
+    for name, param in sig.parameters.items():
         if param.kind == inspect.Parameter.VAR_POSITIONAL:
-            return f"*{name}"
-        return name if param.default is inspect.Parameter.empty else f"{name}=default_{name}"
+            arg_list.append(f"*{name}")
+            has_star = True
+            continue
+        if param.kind == inspect.Parameter.KEYWORD_ONLY and not has_star:
+            arg_list.append("*")
+            has_star = True
+        arg_list.append(name if param.default is inspect.Parameter.empty else f"{name}=default_{name}")
 
     func_body = f"""
-def dynamic_func({", ".join(list(map(arg, sig.parameters.items())) + ["**options"])}):
+def dynamic_func({", ".join(arg_list + ["**options"])}):
     params = {{{', '.join([f"'{name}': {name}" for name in sig.parameters.keys()])}}}
     specialization = [{','.join(specialization)}]
     return params, specialization, options
@@ -1320,23 +1330,27 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
         self._repr = repr
         self.launch_metadata = launch_metadata
-        # C cache defaults ON (opt out with TRITON_ENABLE_C_CACHE=0). An explicit
-        # c_cache=True/False on @triton.jit always wins over the env default;
-        # c_cache=None (not specified) falls back to the env-controlled default.
-        if c_cache is None:
-            self.c_cache = knobs.nvidia.enable_c_cache
-        else:
-            self.c_cache = c_cache
-        if self.c_cache:
-            _ensure_torch_bridge()
-        # Register for simple deserialization of JITFunction constants
-        _triton_jit_function_registry[f"{self.module}:{self.fn.__qualname__}"] = self
 
         self.params = []
         for i, param in enumerate(self.signature.parameters.values()):
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                raise TypeError(f"JIT functions do not support **{param.name} parameters")
             dns = i in do_not_specialize or param.name in do_not_specialize
             dns_oa = i in do_not_specialize_on_alignment or param.name in do_not_specialize_on_alignment
             self.params.append(KernelParam(i, param, dns, dns_oa))
+
+        # C cache defaults ON (opt out with TRITON_ENABLE_C_CACHE=0). An explicit
+        # c_cache=True/False on @triton.jit overrides the env-controlled default,
+        # except for signatures the native binders cannot validate correctly.
+        self.c_cache = knobs.nvidia.enable_c_cache if c_cache is None else c_cache
+        if any(param.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.VAR_POSITIONAL)
+               for param in self.signature.parameters.values()):
+            self.c_cache = False
+        if self.c_cache:
+            _ensure_torch_bridge()
+
+        # Register for simple deserialization of JITFunction constants
+        _triton_jit_function_registry[f"{self.module}:{self.fn.__qualname__}"] = self
 
         # cache of just-in-time compiled kernels
         self.device_caches = _DeviceCaches(self, self.create_binder)
