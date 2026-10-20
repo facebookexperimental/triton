@@ -84,6 +84,11 @@ TLX_PAGES = (
         "Production-ready TLX kernels, one blessed implementation per op and architecture.",
     ),
     Page(
+        "tlx-gfx942",
+        "TLX on gfx942 (MI300)",
+        "Supported ops and extension builtins on AMD MI300.",
+    ),
+    Page(
         "tlx-gfx950",
         "TLX on gfx950 (MI350)",
         "Supported ops and extension builtins on AMD MI350.",
