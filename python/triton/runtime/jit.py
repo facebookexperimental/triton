@@ -1587,9 +1587,11 @@ class MockTensor:
         self.shape = shape
 
     def stride(self):
-        strides = [1]
-        for size in self.shape[1:]:
-            strides.append(strides[-1] * size)
+        strides = []
+        stride = 1
+        for size in reversed(self.shape):
+            strides.append(stride)
+            stride *= max(size, 1)
         return tuple(reversed(strides))
 
     @staticmethod
