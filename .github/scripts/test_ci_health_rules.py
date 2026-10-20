@@ -189,6 +189,36 @@ def test_pr_tags_main_ci_author():
     assert next(p for p in view if p["pr"] == 3)["gpus"] == ["B200"]
 
 
+def test_tracked_branch_of_pushes_bumps_and_prs():
+    assert r.tracked_branch(run(1, [], branch="release/3.8.x")) == "release/3.8.x"
+    assert r.tracked_branch(run(1, [], branch="scratch/meta-llvm-bump/release-3.8.x")) == "release/3.8.x"
+    assert r.tracked_branch(run(1, [], branch="scratch/meta-llvm-bump/main")) == "main"
+    assert r.tracked_branch({**run(1, [], event="pull_request", branch="a"), "base":
+                             "release/3.8.x"}) == "release/3.8.x"
+    assert r.tracked_branch(run(1, [], event="pull_request", branch="a")) == "main"  # older records lack a base
+
+
+def test_each_tracked_branch_gets_its_own_tabs():
+    rel = "release/3.8.x"
+    runs = [
+        push(1, tlx()),
+        push(2, tlx("t1"), branch=rel),
+        push(3, tlx()),
+        push(4, tlx(), branch="scratch/meta-llvm-bump/main"),
+        {**run(20, [build_ok(), tlx("t1")], event="pull_request", pr=1, branch="a"), "base": rel},
+        run(21, [build_ok(), tlx("t1")], event="pull_request", pr=2, branch="b"),
+    ]
+    page = r.page_data(runs, stamp(23), {})["branches"]
+    assert set(page) == set(r.TRACKED_BRANCHES)
+    m, rv = page["main"]["main"], page[rel]["main"]
+    # A bump branch's pushes count for its line in the other tabs, but are not pushes to the branch.
+    assert m["gpus"]["B200"]["verdict"] == "passing" and [p["sha"][:2] for p in m["pushes"]] == ["01", "03"]
+    assert items(rv, "B200", "new") == {("t1", "02")} and len(rv["pushes"]) == 1
+    # Each PR is listed under its base, and judged against that branch's failures.
+    assert [(p["pr"], p["whose"], p["note"]) for p in page[rel]["pr"]] == [(1, "main", f"all 1 also fail on {rel}")]
+    assert [(p["pr"], p["whose"]) for p in page["main"]["pr"]] == [(2, "author")]
+
+
 def test_gpu_hours_split_by_outcome_and_skip_cpu_jobs():
     setup = job("b200 / b200-tlx-test", step("Install prebuilt Triton", "failure"), minutes=30)
     runs = [
@@ -248,7 +278,7 @@ def test_nightly_release_and_perf_events():
 
 def test_records_from_before_gpu_tests_are_ignored():
     old = run(2, [job("b200 / b200-tlx-test", step(CORE, "failure", ["t1"]))], wf="b200.yml")
-    v = r.page_data([push(1, tlx()), old], stamp(23), {})
+    v = r.page_data([push(1, tlx()), old], stamp(23), {})["branches"]["main"]
     assert sum(d["test"] for d in v["ops"]["gpu_hours"]) == 0 and len(v["main"]["pushes"]) == 1
 
 
@@ -283,7 +313,8 @@ def test_failed_select_is_an_anomaly():
 
 def test_page_data_has_one_section_per_tab():
     data = r.page_data([push(1, tlx())], stamp(23), {})
-    assert set(data) == {"asof", "main", "nightly", "pr", "ops"}
+    assert set(data) == {"asof", "branches"}
+    assert all(set(v) == {"main", "nightly", "pr", "ops"} for v in data["branches"].values())
 
 
 def test_every_test_step_in_the_gpu_workflows_maps_to_a_group():

@@ -106,7 +106,8 @@ def _record(run, wf):
     return {
         "id": run["id"], "wf": wf, "event": run["event"], "status": run["status"], "conclusion": run["conclusion"],
         "created_at": run["created_at"], "head_sha": run.get("head_sha"), "title": run.get("display_title", ""), "url":
-        run.get("html_url", ""), "branch": run.get("head_branch"), "pr": None, "author": None, "jobs": None
+        run.get("html_url", ""), "branch": run.get("head_branch"), "pr": None, "author": None, "jobs": None, "base":
+        ((run.get("pull_requests") or [{}])[0].get("base") or {}).get("ref")
     }
 
 

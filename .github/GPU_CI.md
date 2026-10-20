@@ -56,9 +56,13 @@ the build rather than silently bypassing the producer lock.
 
 ## CI health dashboard
 
-`/ci/` on the Pages site shows four tabs, one owner each:
+`/ci/` on the Pages site shows one tracked branch at a time (`main` or
+`release/3.8.x`, chosen above the tabs; `TRACKED_BRANCHES` in
+`scripts/ci_health_rules.py`). A PR run counts for its base branch and a Meta
+LLVM bump branch's runs for its target. Four tabs, one owner each:
 
-- **Main** (on-call, commit author): has a push to `main` broken something new?
+- **GPU tests** (on-call, commit author): has a push to the branch broken
+  something new?
   A failing test is *new* if it passed on the previous push that ran its test
   step on the same GPU, and *known* if it failed there too. A known failure
   keeps the push it first failed at. A step that was skipped or hit a setup
@@ -66,7 +70,7 @@ the build rather than silently bypassing the producer lock.
 - **Nightly & perf** (release and perf owners): the `nightly-fbtriton.yml`
   release and the perf events from `/bench/`.
 - **Pull requests** (PR author): the latest run of each PR, tagged *fails on
-  main* or *setup: CI* when the failure is not the author's.
+  <branch>* or *setup: CI* when the failure is not the author's.
 - **Operations** (CI maintainers): GPU hours, job durations, setup failures,
   and what the `select` job ran per trigger, with runs where it failed, fell
   back to every suite, or skipped a GPU on a scheduled or manual run.
