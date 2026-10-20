@@ -1688,27 +1688,6 @@ void LayoutPropagation::resolveConflicts() {
         }
       }
     }
-    // Upstream #11309: without a preferred (blocked/MMA) candidate, ranking
-    // can select a lane/warp-degenerate layout; prefer the candidate needing
-    // the fewest registers per thread instead. Runs before the SMEM override
-    // so the budget check keeps the final say.
-    bool hasPreferred = llvm::any_of(info.encodings, [&](Attribute e) {
-      return (isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||
-             (!isLoadOrStore && isa<MmaEncodingTrait>(e));
-    });
-    if (!hasPreferred) {
-      if (auto tensorType = dyn_cast<RankedTensorType>(it.first.getType())) {
-        ArrayRef<int64_t> shape = tensorType.getShape();
-        unsigned bestElems = getTotalElemsPerThread(encoding, shape);
-        for (Attribute e : info.encodings) {
-          unsigned elems = getTotalElemsPerThread(e, shape);
-          if (elems < bestElems) {
-            bestElems = elems;
-            encoding = e;
-          }
-        }
-      }
-    }
     // Budget-aware override: if the chosen encoding would introduce a
     // convert_layout whose scratch buffer pushes SMEM over budget, pick the
     // candidate with the lowest scratch cost instead.

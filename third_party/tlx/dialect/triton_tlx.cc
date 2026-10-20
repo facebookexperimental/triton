@@ -1723,7 +1723,7 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_global_scratch_alloc",
            [](TritonOpBuilder &self, int nbytes, int alignment) -> Value {
              auto ptrType = triton::PointerType::get(
-                 self.getBuilder().getI8Type(), /*addressSpace=*/1);
+                 self.getBuilder().getI8Type(), triton::PtrAddrSpace::Global);
              return self.create<ttg::GlobalScratchAllocOp>(
                  ptrType, nbytes, alignment, mlir::UnitAttr());
            })

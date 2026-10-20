@@ -177,7 +177,8 @@ struct AuxDataMap {
   //   C = CTAs in the cluster.
   //   Cbar, Cbuf, Cthr, Cmask = CTA dimensions qualifying barriers, buffers,
   //       threads, and thread masks respectively. Each has extent C.
-  //   B = tracked buffers for one memory type, power-of-two padded.
+  //   D = packed buffer descriptors for one memory type, power-of-two padded.
+  //   B = analysis-selected buffer state lanes, power-of-two padded.
   //   K = tracked mbarriers and virtual cluster rendezvous slots,
   //       power-of-two padded.
   //   T = logical ConSan thread bit slots used by this module, power-of-two
@@ -190,7 +191,7 @@ struct AuxDataMap {
   //   tensor  = distributed tensor value.
   //   scratch = pointer to shared-cluster global scratch memory.
 
-  // tensor, <B x i64>
+  // tensor, <D x i64>
   // Per-memory-type packed buffer descriptors. Each i64 stores the 32-bit base
   // offset and 32-bit length of one shared-memory or tensor-memory region.
   RegionToValueMap buffers[numMemTypes];
@@ -245,13 +246,15 @@ struct AuxDataMap {
   RegionToValueMap commits[CommitKind::NumCommitKinds];
 
   // State-lane plans and analysis-derived runtime-base, state-mask, and CTA
-  // cases for each memdesc.
+  // cases for each memdesc. bufferRegions preserves the ordered region list
+  // used to build each plan so static scratch can select its mask directly.
   triton::BufferStatePlan bufferStatePlans[numMemTypes];
+  SmallVector<triton::BufferRegion> bufferRegions[numMemTypes];
   DenseMap<Value, BufferStateCandidates> bufferCandidates[numMemTypes];
 
   // Beta compatibility: legacy FunctionBuilder entry points still consume
   // packed descriptors and an optional alias expansion matrix.
-  // tensor, <B x B x i1>
+  // tensor, <D x D x i1>
   RegionToValueMap aliasMatrices[numMemTypes];
   // Shared-memory state lanes occupied by each physical mbarrier. Virtual
   // cluster barriers have no storage and therefore do not appear here.
@@ -288,6 +291,7 @@ struct AuxDataMap {
   bool hasAsyncProxyFenceTracking = false;
 
   LogicalResult populateAndPassToWarpSpecialize(ModuleOp module,
+                                                triton::FuncOp entryPoint,
                                                 FunctionBuilder &funcBuilder,
                                                 const ConSanTargetHooks &hooks);
 
@@ -295,8 +299,8 @@ struct AuxDataMap {
 
 private:
   LogicalResult getBuffersAndBarriers(
-      ModuleOp module,
-      SmallVector<SmallVector<triton::BufferRegion>, 2> &bufRegions,
+      ModuleOp module, triton::FuncOp entryPoint,
+      SmallVector<SmallVector<triton::BufferRegion>, 2> &descriptorRegions,
       SmallVector<triton::BufferRegion> &barrierRegions,
       const ConSanTargetHooks &hooks);
   void passToWarpSpecialize(triton::FuncOp func, ValueType value,

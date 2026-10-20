@@ -310,7 +310,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #wmma = #ttg.amd_wmma<{version = 0, isTranspose = false, ctaLayout = {warp = [[0, 1], [1, 0]]}}>
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
     tt.func public @fn(%arg0: !tt.ptr<i32>) {
-        %t = tt.splat %arg0 : !tt.ptr<i32,1> -> tensor<32x32x!tt.ptr<i32,1>, #wmma>
+        %t = tt.splat %arg0 : !tt.ptr<i32> -> tensor<32x32x!tt.ptr<i32>, #wmma>
         tt.return
     }
 }
@@ -724,7 +724,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
       %values: tensor<64xi16, #distributed>) {
     // expected-error @+1 {{supports only f16, bf16, f32, f64, i32, and i64 values}}
     %0 = amdg.buffer_atomic_rmw add, relaxed, gpu, %values, %ptr[%offsets]
-        : tensor<64xi16, #distributed>
+        : !tt.ptr<i16> -> tensor<64xi16, #distributed>
     tt.return
   }
 }
@@ -766,7 +766,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
       %ptr: !tt.ptr<bf16>, %offsets: tensor<64xi32, #nondistributed>) {
     // expected-error @+1 {{requires a distributed tensor encoding}}
     %0 = amdg.buffer_load %ptr[%offsets]
-        : tensor<64xbf16, #nondistributed>
+        : !tt.ptr<bf16> -> tensor<64xbf16, #nondistributed>
     tt.return
   }
 }
@@ -2519,6 +2519,41 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   ^forwarded(%copy: tensor<16x16xf32, #mma>):
     %first = amdg.mfma_commit %copy : tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// A buffer write's scalar base must be global memory; a non-global (generic,
+// address space 0) base is rejected -- for stores, atomic RMWs, and atomic CAS.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_store_nonglobal_base(%arg0: !tt.ptr<f32, "descriptor">, %arg1: tensor<256xi32, #blocked>, %arg2: tensor<256xf32, #blocked>) {
+    // expected-error @+1 {{buffer writes require a global address space base}}
+    amdg.buffer_store %arg2, %arg0[%arg1] : !tt.ptr<f32, "descriptor"> -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_atomic_rmw_nonglobal_base(%arg0: !tt.ptr<f32, "descriptor">, %arg1: tensor<256xi32, #blocked>, %arg2: tensor<256xf32, #blocked>) {
+    // expected-error @+1 {{buffer writes require a global address space base}}
+    %0 = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %arg2, %arg0[%arg1] : !tt.ptr<f32, "descriptor"> -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_atomic_cas_nonglobal_base(%arg0: !tt.ptr<i32, "descriptor">, %arg1: tensor<256xi32, #blocked>, %arg2: tensor<256xi32, #blocked>, %arg3: tensor<256xi32, #blocked>) {
+    // expected-error @+1 {{buffer writes require a global address space base}}
+    %0 = amdg.buffer_atomic_cas acq_rel, gpu, %arg2, %arg3, %arg0[%arg1] : !tt.ptr<i32, "descriptor"> -> tensor<256xi32, #blocked>
     tt.return
   }
 }

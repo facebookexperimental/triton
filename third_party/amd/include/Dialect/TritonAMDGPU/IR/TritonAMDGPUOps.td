@@ -287,7 +287,8 @@ def BufferLoadOp
           [SameLoadStoreOperandsAndResultEncoding, AttrSizedOperandSegments,
            BufferOpInterface, DeclareOpInterfaceMethods<PredicatedOpInterface>,
            TypesMatchWith<"result element type matches the pointed type of ptr",
-                          "result", "ptr", "getPointerTypeToElement($_self)">,
+                          "result", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"result and offsets have the same shape", "result",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"result and mask have the same shape", "result",
@@ -334,7 +335,7 @@ def BufferLoadOp
       $ptr `[` $offsets `]` (`,` $mask^)? (`,` $other^)?
       oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
       (`stride` `=` $stride^)?
-      attr-dict `:` type($result)
+      attr-dict `:` qualified(type($ptr)) `->` type($result)
     }];
 }
 
@@ -345,10 +346,11 @@ def BufferLoadOp
 def BufferLoadToLocalOp
     : TT_AMDGPU_Op<
           "buffer_load_to_local",
-          [AttrSizedOperandSegments, BufferOpInterface,
+          [GlobalToLocalCopyTrait, AttrSizedOperandSegments, BufferOpInterface,
            DeclareOpInterfaceMethods<PredicatedOpInterface>,
            TypesMatchWith<"dest element type matches pointee type of ptr",
-                          "dest", "ptr", "getPointerTypeToElement($_self)">,
+                          "dest", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"infer mask shape from offsets", "offsets", "mask",
                           "getI1SameShape($_self)",
                           "(cast<BufferLoadToLocalOp>($_op).getMask() == "
@@ -389,7 +391,7 @@ def BufferLoadToLocalOp
   let assemblyFormat = [{
       $ptr `[` $offsets `]` (`mask` `=` $mask^)? (`other` `=` $other^)? (`stride` `=` $stride^)?
       oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict) `into` $dest
-      attr-dict `:` type($ptr) `[` type($offsets) `]` type($other) `->` type($dest)
+      attr-dict `:` qualified(type($ptr)) `[` type($offsets) `]` type($other) `->` type($dest)
     }];
 }
 
@@ -405,7 +407,8 @@ def BufferAtomicRMWOp
            TypesMatchWith<"result element type matches the value type",
                           "result", "value", "$_self">,
            TypesMatchWith<"result element type matches the pointed type of ptr",
-                          "result", "ptr", "getPointerTypeToElement($_self)">,
+                          "result", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"result and offsets have the same shape", "result",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"result and mask have the same shape", "result",
@@ -413,7 +416,8 @@ def BufferAtomicRMWOp
                           "(cast<BufferAtomicRMWOp>($_op).getMask() == "
                           "nullptr) || std::equal_to<>()">,
            TypesMatchWith<"value element type matches the pointed type of ptr",
-                          "value", "ptr", "getPointerTypeToElement($_self)">,
+                          "value", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"value and offsets have the same shape", "value",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"value and mask have the same shape", "value", "mask",
@@ -450,7 +454,7 @@ def BufferAtomicRMWOp
   let assemblyFormat = [{
         $atomic_rmw_op `,` $sem `,` $scope `,` $value `,` $ptr `[` $offsets `]` (`,` $mask^)?
         (`stride` `=` $stride^)?
-        attr-dict `:` type($result)
+        attr-dict `:` qualified(type($ptr)) `->` type($result)
     }];
 }
 
@@ -466,7 +470,8 @@ def BufferAtomicCASOp
            TypesMatchWith<"result element type matches the cmp type", "result",
                           "cmp", "$_self">,
            TypesMatchWith<"result element type matches the pointed type of ptr",
-                          "result", "ptr", "getPointerTypeToElement($_self)">,
+                          "result", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"result and offsets have the same shape", "result",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"val and offsets have the same shape", "val",
@@ -493,10 +498,12 @@ def BufferAtomicCASOp
           TT_MemSyncScopeAttr:$scope);
   let results = (outs TT_Tensor:$result);
 
+  let hasVerifier = 1;
+
   let assemblyFormat = [{
         $sem `,` $scope `,` $cmp `,` $val `,` $ptr `[` $offsets `]`
         (`stride` `=` $stride^)?
-        attr-dict `:` type($result)
+        attr-dict `:` qualified(type($ptr)) `->` type($result)
     }];
 }
 
@@ -510,7 +517,8 @@ def BufferStoreOp
           [AttrSizedOperandSegments, SameLoadStoreOperandsEncoding,
            BufferOpInterface, DeclareOpInterfaceMethods<PredicatedOpInterface>,
            TypesMatchWith<"value element type matches the pointed type of ptr",
-                          "value", "ptr", "getPointerTypeToElement($_self)">,
+                          "value", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"value and offsets have the same shape", "value",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"value and mask have the same shape", "value", "mask",
@@ -550,7 +558,7 @@ def BufferStoreOp
       $value `,` $ptr `[` $offsets `]` (`,` $mask^)?
       oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
       (`stride` `=` $stride^)?
-      attr-dict `:` type($value)
+      attr-dict `:` qualified(type($ptr)) `->` type($value)
     }];
   let hasVerifier = 1;
 }
@@ -1176,7 +1184,8 @@ def ReadBarrierPhaseOp
 
 def AsyncTDMCopyGlobalToLocalOp
     : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
-                   [DeclareOpInterfaceMethods<MBarrierOpInterface>,
+                   [GlobalToLocalCopyTrait,
+                    DeclareOpInterfaceMethods<MBarrierOpInterface>,
                     DeclareOpInterfaceMethods<TDMOpInterface>]> {
   let summary = "Copy data based on descriptor from global memory to local "
                 "memory asynchronously";
@@ -1260,7 +1269,7 @@ def AsyncTDMCopyGlobalToLocalOp
 
 def AsyncTDMFusedCopyGlobalToLocalOp
     : TT_AMDGPU_Op<"async_tdm_fused_copy_global_to_local",
-                   [AttrSizedOperandSegments]> {
+                   [GlobalToLocalCopyTrait, AttrSizedOperandSegments]> {
   let summary = "Fuse multiple TDM global-to-local copies into one async "
                 "operation";
 
@@ -1389,7 +1398,8 @@ def AsyncTDMScatterOp
 
 def AsyncTDMGatherOp
     : TT_AMDGPU_Op<
-          "async_tdm_gather", [DeclareOpInterfaceMethods<MBarrierOpInterface>,
+          "async_tdm_gather", [GlobalToLocalCopyTrait,
+                               DeclareOpInterfaceMethods<MBarrierOpInterface>,
                                DeclareOpInterfaceMethods<TDMOpInterface>]> {
   let summary = "Gather data from non-contiguous global memory rows to local "
                 "memory asynchronously";

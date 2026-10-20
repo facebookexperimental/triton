@@ -7,18 +7,47 @@ and Tensor Core memory under warp specialization. It tracks per-buffer
 visibility across threads and CTAs, models barrier-based synchronization, and
 models commit-count synchronization such as cp.async and wgmma.
 
-ConSan currently supports one public entry point in a module. BufferRegion
-analysis collects shared-memory buffers, tensor-memory buffers, and barrier
-allocations. Auxiliary state is then created on demand for each
-warp-specialization partition using distributed tensors and shared-cluster
-global scratch memory.
+The pass is target-hook based. The module target selects the hook
+implementation:
+
+- `cuda:*` uses the NVIDIA hooks.
+- `hip:*` uses the AMD hooks.
+
+ConSan instruments the module's one public entry point. It uses BufferRegion
+analysis to collect exact shared-memory and tensor-memory address sets plus
+barrier allocations, then creates auxiliary state in distributed tensors and
+shared-cluster global scratch memory. Calls from the entry point are summarized
+as accesses to their allocator-provided shared-memory frames; ConSan does not
+instrument non-entry function bodies. A non-entry function that contains
+effects outside this call-frame model is rejected with a diagnostic asking the
+compiler to inline it. Most scratch state is CTA-qualified so cluster and
+multicast effects can be modeled explicitly.
+
+## Visibility Model
+
+ConSan models races by tracking visibility of completed accesses, not by
+building a general happens-before graph. For each tracked buffer, ConSan records
+which logical threads can see the latest write, and which prior reads are
+visible to each logical thread. A memory operation is legal only if the issuing
+logical thread can see the completed accesses that would conflict with it.
+
+Synchronization operations update visibility rather than creating vector-clock
+style ordering metadata. Barrier arrives and commits publish the accesses that
+are visible to the issuing logical thread. Barrier waits, commit-count waits,
+and target-specific synchronization then transfer that published visibility to
+the waiting logical thread and its peer thread classes. This keeps the runtime
+state close to the property ConSan needs to check: whether a given access has
+already been made visible as finished to the thread that is about to access the
+same buffer.
 
 ## Thread Model
 
-- Base threads: 16 warp-specialization threads, allowing up to 16 partitions.
-- Peer classes: 16 TMA, 16 Tensor Core, and 16 CLC threads model operations
-  that are not ordered with base threads.
-- Total logical threads: 64.
+- Base threads: the default thread plus warp-specialization partitions, up to
+  16 logical threads.
+- Peer classes: TMA, Tensor Core, and CLC threads model operations that are not
+  ordered with base threads. Each active class has one peer per base thread.
+- Total logical threads: up to 64; only classes used by the entry point are
+  assigned slots.
 
 Logical thread IDs are in `[0, 64)`. State dimensions are power-of-two padded
 where required by the distributed layout.
@@ -30,29 +59,33 @@ Shape notation:
 - `C`: CTAs in the cluster.
 - `Cbar`, `Cbuf`, `Cthr`, `Cmask`: CTA dimensions qualifying barriers,
   buffers, threads, and visibility masks. Each has extent `C`.
-- `B`: tracked buffers for one memory type.
-- `K`: tracked mbarriers.
+- `D`: packed buffer descriptor count for one memory type, power-of-two padded.
+- `B`: analysis-selected buffer state-lane count, power-of-two padded.
+- `K`: tracked mbarriers and virtual cluster rendezvous slots, power-of-two
+  padded.
 - `T`: logical ConSan thread slots.
 - `P`: base-thread commit columns.
+- `F`: mbarrier phase parity slots, with extent 2.
 
 `tensor` denotes a distributed tensor value. `scratch` denotes a pointer to
 shared-cluster global scratch memory. Logical state shapes are:
 
-- `buffers` (tensor, `<B x i64>`): packed buffer descriptors.
+- `buffers` (tensor, `<D x i64>`): packed buffer descriptors retained for beta
+  compatibility. Each stores a 32-bit base offset and 32-bit length.
 - `barriers` (tensor, `<K x i64>`): packed mbarrier descriptors.
 - `barrierStates` (scratch, `<Cbar x K x i64>`): packed lifecycle state.
 - `writeVisibility` (scratch, `<Cbuf x B x Cmask x i64>`): latest-write
   visibility masks.
-- `writeTracking` (scratch, `<Cbuf x B x Cbar x K x i8>`): barriers
+- `writeTracking` (scratch, `<Cbuf x B x Cbar x K x F x i8>`): barriers
   tracking writes.
 - `readVisibility` (scratch, `<Cbuf x B x Cthr x T x Cmask x i64>`):
   per-thread read frontiers.
-- `readTracking` (scratch, `<Cbuf x B x Cbar x K x Cmask x i64>`):
+- `readTracking` (scratch, `<Cbuf x B x Cbar x K x Cmask x F x i64>`):
   barriers tracking read visibility.
-- `outstandingCommits` (scratch, `<C x B x P x i8>`): staged and
-  outstanding cp.async or wgmma accesses.
-- `aliasMatrices` (tensor, `<B x B x i1>`): optional intra-CTA buffer
-  alias information.
+- `commits` (scratch, `<C x B x P x i8>`): staged and outstanding accesses
+  per commit kind, including cp.async, wgmma, and TMA store.
+- `aliasMatrices` (tensor, `<D x D x i1>`): optional intra-CTA alias expansion
+  for beta's packed-descriptor helpers.
 - `waiting` (scratch, `<Cbar x K x Cthr x i32>`): waiting flags and phases.
 - `activeMasks` (scratch, `<C x i32>`): active base-thread masks.
 - `lock` (scratch pointer, `i32`): serializes instrumentation updates.
@@ -60,6 +93,13 @@ shared-cluster global scratch memory. Logical state shapes are:
 Buffer and barrier descriptors are CTA-agnostic. CTA-qualified scratch axes
 identify the buffer row, barrier row, logical thread, or visibility mask to
 which a fact belongs.
+
+Descriptor rows and state lanes have separate indices and need not have the
+same count. The sorted canonical `bufferRegions` registry includes explicit
+buffers and compiler scratch; its region masks select overlapping state lanes.
+Only a copy used for descriptor output is padded with empty regions. Packed
+descriptors are rematerialized inside warp-specialization partitions rather
+than captured as arguments.
 
 Scratch state is initialized once before the instrumented body. A CTA or
 cluster barrier follows initialization before any instrumented operation uses
@@ -105,16 +145,16 @@ reads. ConSan emits:
 - `experimental_verify_read_visibility`: verifies that the writer's
   read-visibility lane covers all prior reads.
 
-Checks account for aliases and CTA recipients. A selected buffer row is
-expanded through alias metadata when BufferRegion analysis finds overlapping
-regions. Aliasing is intra-CTA: descriptors may alias within one CTA row, but
-not across different CTA rows.
+Checks account for aliases and CTA recipients. Each analysis-derived check mask
+selects every overlapping state lane. Beta's descriptor helpers retain optional
+alias expansion metadata. Aliasing is intra-CTA: descriptors may alias within
+one CTA row, but not across different CTA rows.
 
 Compiler-owned shared-memory scratch has no SSA memdesc for BufferRegion
 analysis to discover. After shared-memory allocation, ConSan reads the
 operation's `allocation.offset` and `allocation.size`, adds that static interval
-to the descriptor table, and instruments it with the corresponding constant
-state mask. This covers scratch used by layout conversions, reductions,
+to the canonical region registry, and instruments it with the corresponding
+constant state mask. This covers scratch used by layout conversions, reductions,
 gathers, atomic result broadcasts, and target-specific operations without
 introducing a separate runtime address ABI.
 
@@ -246,6 +286,10 @@ its aliases have no incompatible pending accesses. Commit counters apply to
 base-thread columns; TMA, Tensor Core, and CLC peers are represented through
 the visibility model.
 
+For target-defined ordered commit kinds, checks exclude the issuing base
+thread's own column to preserve same-partition ordering while checking other
+partitions.
+
 ## Modeled Operations
 
 The common hook implementation covers these TritonGPU operations:
@@ -263,6 +307,16 @@ The common hook implementation covers these TritonGPU operations:
   and atomic scatter RMW conservatively cover their full destination
   descriptors because their indices are runtime values.
 - `ttg.local_alloc` with a source: barrier-tracked shared-memory write.
+- Any operation with allocator-provided operation-local shared scratch: a
+  synchronous generic-proxy write over its allocated byte interval in its owning
+  CTA. Cross-CTA scratch reads follow intrinsic synchronization, and atomic
+  writes are issued only by producer CTAs. Forced warp-shuffle conversions
+  publish no scratch metadata because allocation reserves no scratch for them.
+- Function calls with allocator-provided virtual shared-memory frames: a
+  synchronous generic-proxy write over the whole callee frame in the current
+  CTA. This includes nested callees because each virtual frame is sized from
+  the callee's peak shared-memory allocation. Callees requiring cross-CTA
+  scratch accesses must be inlined.
 
 These shared-memory effects are generic-proxy accesses for the proxy-ordering
 model.
@@ -285,6 +339,8 @@ can continue, so no second cluster barrier is needed for the ConSan protocol.
 NVIDIA hooks additionally cover:
 
 - `ttng.init_barrier`, `ttng.wait_barrier`, and `ttng.inval_barrier` lifecycle
+  and wait instrumentation.
+- `ttng.barrier_expect`, including tx-count accounting and the non-leader CTA
   arrive path for multicast barriers.
 - `ttng.arrive_barrier`.
 - TMA loads as barrier-tracked writes with tx-count decrement and precise
@@ -293,7 +349,8 @@ NVIDIA hooks additionally cover:
 - TMA stores as `TmaStore` commit-count reads, with `ttng.tma_store_wait`
   transferring read visibility. Their shared-memory sources are async-proxy
   effects.
-- TMEM load, store, alloc-with-source, and copy operations.
+- TMEM load, store, alloc-with-source, copy, and shift operations. Beta's
+  TMEM shift retains both read and write effects and two-CTA issuer handling.
 - TCGen5 MMA, scaled MMA, commit, and TMEM copy operations as Tensor Core peer
   thread effects. Shared A/B/scale operands and the shared source of TMEM copy
   are async-proxy effects.
@@ -304,3 +361,29 @@ NVIDIA hooks additionally cover:
   `Wgmma` commit-count reads, with `ttng.warp_group_dot_wait` transferring read
   visibility.
 - `ttng.async_shared_store` as a generic-side shared-memory access.
+
+AMD hooks additionally cover:
+
+- AMD barrier init and wait instrumentation.
+- AMD explicit barrier arrives, with arrive count scaled by warps and threads
+  per warp.
+- Async TDM global-to-local and local-to-global copies. With a barrier, these
+  are modeled through barrier arrivals; without a barrier, they use `TmaStore`
+  commit counts and implicit commits.
+- AMD async wait variants for `AsyncCp`, and TDM wait variants for `TmaStore`
+  commit counts.
+- Ordered TDM commit kinds, using the self-column exclusion described above.
+
+## Implementation Notes
+
+- ConSan models one logical thread per warp-specialization partition, not every
+  hardware lane. Target hooks compensate for known ordered same-partition
+  commit flows where possible.
+- Global-memory race checking is handled by the separate global sanitizer, not
+  by ConSan.
+- The pass expects exactly one public entry point in the module. Non-entry
+  functions may contain register and global-memory operations, calls, and
+  CTA-local compiler-owned shared scratch. Explicit shared/tensor-memory
+  allocations or accesses, cross-CTA scratch effects, barrier or asynchronous
+  state, warp specialization, and cluster barriers require inlining before
+  ConSan.

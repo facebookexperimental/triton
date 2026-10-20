@@ -29,6 +29,21 @@ Value getLeaderCTAPredicate(ImplicitLocOpBuilder &b, uint32_t broadcastMask) {
                                arith::ConstantIntOp::create(b, 0, 32));
 }
 
+std::optional<uint16_t> getAtomicScratchBroadcastMask(Operation *op) {
+  if (!op->hasAttr("allocation.size") ||
+      !isa<AtomicPollOp, AtomicRMWOp, AtomicCASOp, ttg::LocalAtomicScatterRMWOp,
+           tti::ExperimentalGSanAtomicRMWOp, tti::ExperimentalGSanAtomicCASOp>(
+          op))
+    return std::nullopt;
+
+  Type resultTy = op->getResult(0).getType();
+  if (auto tensorTy = dyn_cast<RankedTensorType>(resultTy)) {
+    auto kBlock = StringAttr::get(op->getContext(), "block");
+    return ttg::toLinearLayout(tensorTy).getFreeVariableMasks().lookup(kBlock);
+  }
+  return static_cast<uint16_t>(ttg::lookupNumCTAs(op) - 1);
+}
+
 } // namespace
 
 class NVIDIAConSanHooks : public tti::ConSanTargetHooks {
@@ -130,6 +145,8 @@ public:
         mask = getBarrierMask(gatherOp.getResult());
     if (auto storeOp = dyn_cast<ttng::TMAStoreLikeOpInterface>(op))
       mask = getBarrierMask(storeOp.getSrc());
+    if (auto scratchMask = getAtomicScratchBroadcastMask(op))
+      mask = *scratchMask;
     if (isa<ttng::CLCTryCancelOp>(op) && ttg::lookupNumCTAs(op) > 1) {
       Value ctaId = tti::ExperimentalClusterCTAIdOp::create(b, b.getLoc());
       return arith::CmpIOp::create(b, arith::CmpIPredicate::eq, ctaId,
@@ -150,6 +167,12 @@ public:
   SmallVector<Operation *>
   createInitClusterBarrier(ImplicitLocOpBuilder &b) const override {
     return {ClusterBarrierOp::create(b, b.getLoc()).getOperation()};
+  }
+
+  bool hasUnsummarizableCalleeState(Operation *op) const override {
+    if (isa<ClusterBarrierOp>(op))
+      return true;
+    return getAtomicScratchBroadcastMask(op).value_or(0) != 0;
   }
 
   std::optional<MemEffectsOpInfo>
@@ -182,7 +205,8 @@ public:
       bool hasRead = false;
       bool hasWrite = false;
       for (auto &effect : info->operandEffects) {
-        if (effect.buf != shiftOp.getBuffer())
+        const auto *buffer = std::get_if<Value>(&effect.buffer);
+        if (!buffer || *buffer != shiftOp.getBuffer())
           continue;
         effect.operandName = "Buffer";
         hasRead |= effect.rw == RW::Read;
@@ -243,7 +267,9 @@ public:
            MemEffectsOpInfo::BarrierTrackingMode::EffectWrites,
            /*txCount=*/-txCount});
       if (llvm::none_of(info->operandEffects, [&](const auto &effect) {
-            return effect.buf == copyOp.getResult() && effect.rw == RW::Write;
+            const auto *buffer = std::get_if<Value>(&effect.buffer);
+            return buffer && *buffer == copyOp.getResult() &&
+                   effect.rw == RW::Write;
           }))
         info->operandEffects.emplace_back(RW::Write, copyOp.getResult(), "",
                                           ttg::SharedKind::Async);
@@ -262,7 +288,8 @@ public:
            /*txCount=*/
            -static_cast<int>(tti::getMemDescLength(tryCancelOp.getResult()))});
       if (llvm::none_of(info->operandEffects, [&](const auto &effect) {
-            return effect.buf == tryCancelOp.getResult() &&
+            const auto *buffer = std::get_if<Value>(&effect.buffer);
+            return buffer && *buffer == tryCancelOp.getResult() &&
                    effect.rw == RW::Write;
           }))
         info->operandEffects.emplace_back(RW::Write, tryCancelOp.getResult(),
@@ -293,7 +320,9 @@ public:
            MemEffectsOpInfo::BarrierTrackingMode::EffectWrites,
            /*txCount=*/-txCount});
       if (llvm::none_of(info->operandEffects, [&](const auto &effect) {
-            return effect.buf == gatherOp.getResult() && effect.rw == RW::Write;
+            const auto *buffer = std::get_if<Value>(&effect.buffer);
+            return buffer && *buffer == gatherOp.getResult() &&
+                   effect.rw == RW::Write;
           }))
         info->operandEffects.emplace_back(RW::Write, gatherOp.getResult(), "",
                                           ttg::SharedKind::Async);
@@ -308,7 +337,8 @@ public:
       for (auto [value, name] : namedOperands)
         for (auto it = info->operandEffects.begin();
              it != info->operandEffects.end(); ++it)
-          if (it->buf == value) {
+          if (auto *buffer = std::get_if<Value>(&it->buffer);
+              buffer && *buffer == value) {
             effects.emplace_back(*it).operandName = name.str();
             break;
           }

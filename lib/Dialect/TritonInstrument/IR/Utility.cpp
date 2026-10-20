@@ -5,6 +5,7 @@
 #include "triton/Analysis/BufferRegion.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
@@ -179,7 +180,8 @@ static Value createCurrentCTAMask(OpBuilder &b, Location loc,
 uint32_t getMemDescLength(Value buf) {
   auto memDescType = cast<MemDescType>(buf.getType());
   if (isa<SharedEncodingTrait>(memDescType.getEncoding())) {
-    unsigned elSize = memDescType.getElementType().getIntOrFloatBitWidth() / 8;
+    unsigned elSize =
+        getIntOrFloatOrPtrBitWidth(memDescType.getElementType()) / 8;
     return static_cast<uint32_t>(product(getShapePerCTA(memDescType)) * elSize);
   }
   if (isa<TensorMemorySpaceAttr>(memDescType.getMemorySpace())) {
@@ -397,14 +399,14 @@ FuncOp getEntryPoint(ModuleOp module) {
   return publicFuncs.front();
 }
 
-AuxDataMap::ThreadLayout getThreadLayout(ModuleOp module,
+AuxDataMap::ThreadLayout getThreadLayout(FuncOp entryPoint,
                                          const ConSanTargetHooks &hooks) {
   AuxDataMap::ThreadLayout layout;
   bool hasTMA = false;
   bool hasTC = false;
   bool hasCLC = false;
 
-  module.walk([&](Operation *op) {
+  entryPoint.walk([&](Operation *op) {
     if (auto wsOp = dyn_cast<WarpSpecializeOp>(op))
       layout.numBaseThreads = std::max<int>(
           layout.numBaseThreads, wsOp.getPartitionRegions().size() + 1);
@@ -477,22 +479,24 @@ Region *AuxDataMap::RegionToValueMap::getEnclosingParitionOrFunctionRegion(
   return nullptr;
 }
 
-LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
-    ModuleOp module, FunctionBuilder &fb, const ConSanTargetHooks &hooks) {
-  SmallVector<SmallVector<BufferRegion>, numMemTypes> bufRegions(numMemTypes);
+LogicalResult
+AuxDataMap::populateAndPassToWarpSpecialize(ModuleOp module, FuncOp entryPoint,
+                                            FunctionBuilder &fb,
+                                            const ConSanTargetHooks &hooks) {
+  SmallVector<SmallVector<BufferRegion>, numMemTypes> descriptorRegions(
+      numMemTypes);
   SmallVector<BufferRegion> barrierRegions;
-  if (failed(getBuffersAndBarriers(module, bufRegions, barrierRegions, hooks)))
+  if (failed(getBuffersAndBarriers(module, entryPoint, descriptorRegions,
+                                   barrierRegions, hooks)))
     return failure();
   int numCTAs = lookupNumCTAs(module);
-  threadLayout = getThreadLayout(module, hooks);
+  threadLayout = getThreadLayout(entryPoint, hooks);
   hasAsyncProxyFenceTracking =
       hooks.needsAsyncProxyFenceTracking(module) &&
       bufferStatePlans[(int)MemType::SHARED_MEM].numLanes != 0;
   int captureCounter = 0;
   int64_t captureBytes = 0;
 
-  FuncOp entryPoint = getEntryPoint(module);
-  assert(entryPoint);
   Region *entryRegion = &entryPoint.getBody();
 
   int numMBarriers = barrierRegions.size();
@@ -520,17 +524,17 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
 
     int numBufs = llvm::NextPowerOf2(bufferStatePlans[iMemType].numLanes - 1);
 
-    // Preserve beta's descriptor-based FunctionBuilder API while Reactor uses
-    // the state-lane plan below for sanitizer instrumentation.
-    if (!bufRegions[iMemType].empty()) {
-      buffers[iMemType].insert(
-          entryRegion,
-          createBufferDescriptorsTensor(b, memType, bufRegions[iMemType]));
+    // Preserve beta's packed-descriptor FunctionBuilder API separately from
+    // the canonical, unpadded regions used by the state-lane plan.
+    if (!descriptorRegions[iMemType].empty()) {
+      buffers[iMemType].insert(entryRegion,
+                               createBufferDescriptorsTensor(
+                                   b, memType, descriptorRegions[iMemType]));
       createInWarpSpecialize(entryPoint, buffers[iMemType],
                              [&](ImplicitLocOpBuilder &nestedBuilder) {
                                return createBufferDescriptorsTensor(
                                    nestedBuilder, memType,
-                                   bufRegions[iMemType]);
+                                   descriptorRegions[iMemType]);
                              });
     }
 
@@ -631,7 +635,8 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
       arith::CmpIOp::create(b, arith::CmpIPredicate::eq, ctaId, zero);
   ExperimentalLockReleaseOp::create(b, lockVal, isCTA0);
   if (numCTAs > 1) {
-    auto clusterBarriers = hooks.createInitClusterBarrier(b);
+    SmallVector<Operation *> clusterBarriers =
+        hooks.createInitClusterBarrier(b);
     assert(!clusterBarriers.empty() &&
            "target must provide a cluster initialization barrier");
     llvm::append_range(internalClusterBarriers, clusterBarriers);
@@ -686,9 +691,11 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
 }
 
 LogicalResult AuxDataMap::getBuffersAndBarriers(
-    ModuleOp module, SmallVector<SmallVector<BufferRegion>, 2> &bufRegions,
+    ModuleOp module, FuncOp entryPoint,
+    SmallVector<SmallVector<BufferRegion>, 2> &descriptorRegions,
     SmallVector<BufferRegion> &barrierRegions, const ConSanTargetHooks &hooks) {
-  // Collect shared memory buffers allocated in the module
+  // Run dataflow over the module so call edges resolve, then collect only the
+  // entrypoint regions that this ConSan invocation will instrument.
   std::unique_ptr<DataFlowSolver> solver = createDataFlowSolver();
   triton::BufferRegionAnalysis *analysis =
       solver->load<triton::BufferRegionAnalysis>();
@@ -719,11 +726,13 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
         pending.append({select.getTrueValue(), select.getFalseValue()});
     }
   };
-  module.walk([&](Operation *op) {
+  SmallVector<BufferRegion> staticSharedRegions;
+  unsigned numCTAs = lookupNumCTAs(module);
+  entryPoint.walk([&](Operation *op) {
     for (const MemoryAccess &access : getMemoryAccesses(op))
       collectCandidates(access.value);
 
-    auto info = hooks.getMemEffectsOpInfo(op);
+    auto info = getConSanMemEffectsOpInfo(hooks, op);
     if (!info)
       return;
     if (info->trackingKind == MemEffectsOpInfo::TrackingKind::CommitCount &&
@@ -733,9 +742,14 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
           [](const MemEffectsOpInfo::Effects &e) { return e.rw == RW::Read; });
     for (const auto &barrier : info->barriers)
       collectCandidates(barrier.barrier);
+    for (const auto &effect : info->operandEffects)
+      if (auto *buffer =
+              std::get_if<MemEffectsOpInfo::Effects::StaticSharedBuffer>(
+                  &effect.buffer))
+        staticSharedRegions.push_back(buffer->getRegion(numCTAs));
   });
 
-  analysis->calculateUsedBufferRegions(module);
+  analysis->calculateUsedBufferRegions(entryPoint);
   barrierRegions = analysis->getAllUsedBufferRegions(
       BufferRegionAnalysis::RegionType::BARRIER);
 
@@ -746,14 +760,19 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
                           : BufferRegionAnalysis::TENSOR_MEMORY;
     SmallVector<BufferRegion> regions =
         analysis->getAllUsedBufferRegions(regionType);
-    bufRegions[iMemType] = regions;
+    if (memType == MemType::SHARED_MEM)
+      llvm::append_range(regions, staticSharedRegions);
+    llvm::sort(regions);
+    regions.erase(std::unique(regions.begin(), regions.end()), regions.end());
     bool hasUnknown = analysis->hasUnknownUsedBufferRegions(regionType);
 
     if (regions.empty() && !hasUnknown)
       continue;
 
+    descriptorRegions[iMemType] = regions;
+    bufferRegions[iMemType] = regions;
     bufferStatePlans[iMemType] =
-        triton::createBufferStatePlan(regions, hasUnknown);
+        triton::createBufferStatePlan(bufferRegions[iMemType], hasUnknown);
 
     if (memType == MemType::SHARED_MEM) {
       for (const BufferRegion &barrier : barrierRegions) {
@@ -797,9 +816,9 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
       bufferCandidates[iMemType].try_emplace(value, std::move(stateCandidates));
     }
 
-    if (!bufRegions[iMemType].empty())
-      bufRegions[iMemType].resize(
-          llvm::NextPowerOf2(bufRegions[iMemType].size() - 1),
+    if (!descriptorRegions[iMemType].empty())
+      descriptorRegions[iMemType].resize(
+          llvm::NextPowerOf2(descriptorRegions[iMemType].size() - 1),
           BufferRegion{0, 0});
   }
   return success();

@@ -550,8 +550,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
   // CHECK-LABEL: @multiple_warp_scope_writers
   // CHECK: ttg.warp_specialize
-  // CHECK: ttg.barrier local
-  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: ttng.tmem_load
   tt.func @multiple_warp_scope_writers(
       %arg0: tensor<128x128xf32, #blocked>) {
     %true = arith.constant true
@@ -654,6 +654,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     ttng.tmem_store %arg0, %idx, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
     ttng.arrive_barrier %bar, 1 : !ttg.memdesc<1xi64, #barrier_shared, #ttg.shared_memory, mutable>
     ttng.tmem_store %arg0, %idx, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @tmem_entry_c
+  // CHECK: ttng.tmem_alloc
+  // CHECK-NEXT: ttg.barrier local
+  tt.func private @tmem_entry_c() {
+    %cst = arith.constant dense<0.0> : tensor<128x128xf32, #blocked>
+    %alloc = ttng.tmem_alloc %cst {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    tt.return
+  }
+
+  // CHECK-LABEL: @tmem_entry_b
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: tt.call @tmem_entry_c
+  tt.func private @tmem_entry_b() {
+    tt.call @tmem_entry_c() : () -> ()
+    tt.return
+  }
+
+  // CHECK-LABEL: @tmem_entry_a
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: tt.call @tmem_entry_b
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: tt.call @tmem_entry_b
+  tt.func @tmem_entry_a() {
+    tt.call @tmem_entry_b() : () -> ()
+    %c0 = arith.constant 0 : i32
+    %alloc = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<2x128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    %view = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    %loaded = ttng.tmem_load %view : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    tt.call @tmem_entry_b() : () -> ()
     tt.return
   }
 }
