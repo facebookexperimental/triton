@@ -1,7 +1,8 @@
 name: CI Health
-# Collects runs, jobs and steps of mi350/b200/h100.yml into the 'ci-health'
-# release, for the /ci/ dashboard that pages.yml renders after each successful
-# collection. Never deploys. On pull requests it only runs the dashboard's tests.
+# Collects runs, jobs, steps and failing tests of gpu-tests.yml, and runs of
+# nightly-fbtriton.yml, into the 'ci-health' release, for the /ci/ dashboard
+# that pages.yml renders after each successful collection. Never deploys. On
+# pull requests it only runs the dashboard's tests.
 on:
   schedule:
     - cron: '17 */3 * * *'
@@ -14,10 +15,14 @@ on:
     paths:
       - '.github/scripts/ci_health.py'
       - '.github/scripts/ci_health_rules.py'
+      - '.github/scripts/ci_health_logs.py'
       - '.github/scripts/ci_health_dashboard.html'
       - '.github/scripts/test_ci_health.py'
       - '.github/scripts/test_ci_health_rules.py'
+      - '.github/scripts/test_ci_health_logs.py'
       - '.github/workflows/ci-health.yml'
+      - '.github/workflows/gpu-tests.yml'
+      - '.github/workflows/nightly-fbtriton.yml'
       - '.github/workflows/mi350.yml'
       - '.github/workflows/b200.yml'
       - '.github/workflows/h100.yml'
@@ -43,7 +48,7 @@ jobs:
       # Also checks that every test step in the GPU workflows maps to a dashboard group.
       - name: Run dashboard tests
         working-directory: .github/scripts
-        run: python3 -m pytest -q test_ci_health.py test_ci_health_rules.py
+        run: python3 -m pytest -q test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py
 
   collect:
     if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'
@@ -61,7 +66,7 @@ jobs:
           mkdir -p data
           gh release view ci-health >/dev/null 2>&1 \
             || gh release create ci-health --prerelease --latest=false --title "CI health data" \
-                 --notes "Runs, jobs and steps of mi350/b200/h100.yml behind the /ci/ dashboard." \
+                 --notes "Runs, jobs, steps and failing tests of gpu-tests.yml behind the /ci/ dashboard." \
             || gh release view ci-health >/dev/null
           gh release download ci-health --dir data --pattern '*' || echo "no stored data yet"
       - name: Collect

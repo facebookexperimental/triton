@@ -54,10 +54,58 @@ It also needs `s3:ListBucket` for missing keys to return 404 instead of 403. No
 delete permission is needed for the cache. Authorization or service errors fail
 the build rather than silently bypassing the producer lock.
 
+## CI health dashboard
+
+`/ci/` on the Pages site shows four tabs, one owner each:
+
+- **Main** (on-call, commit author): has a push to `main` broken something new?
+  A failing test is *new* if it passed on the previous push that ran its test
+  step on the same GPU, and *known* if it failed there too. A known failure
+  keeps the push it first failed at. A step that was skipped or hit a setup
+  failure has no result and does not count.
+- **Nightly & perf** (release and perf owners): the `nightly-fbtriton.yml`
+  release and the perf events from `/bench/`.
+- **Pull requests** (PR author): the latest run of each PR, tagged *fails on
+  main* or *setup: CI* when the failure is not the author's.
+- **Operations** (CI maintainers): GPU hours, job durations, setup failures,
+  and what the `select` job ran per trigger, with runs where it failed, fell
+  back to every suite, or skipped a GPU on a scheduled or manual run.
+
+`ci-health.yml` runs `scripts/ci_health.py collect` every three hours. It stores
+`gpu-tests.yml` and `nightly-fbtriton.yml` runs, with jobs and steps, on the
+`ci-health` release. For each failed GPU job it reads the failing tests from the
+job log, and from each `select` job log it reads the selection
+(`scripts/ci_health_logs.py`). `pages.yml` then runs
+`ci_health.py render`, which computes `data.json` with
+`scripts/ci_health_rules.py`. The page is `scripts/ci_health_dashboard.html`.
+
+The dashboard depends on these properties of the GPU workflows:
+
+- GPU job check names keep the `h100 / `, `b200 / ` or `mi350 / ` prefix. The
+  prefix is how a job maps to a GPU.
+- Every test step's name matches a pattern in `GROUPS` in `ci_health_rules.py`.
+  Any other step counts as setup.
+  `test_every_test_step_in_the_gpu_workflows_maps_to_a_group` fails when a
+  `Run ...` step has no group.
+- pytest prints its short test summary (`FAILED <nodeid> - <message>`). Flags
+  that hide it, such as `-rN`, make every failure look like a crash of the whole
+  step. Parametrized variants count as one test.
+- Setup steps (install, download, checkout) match `INFRA_STEP`, so their
+  failures are counted as CI's and not as test failures.
+- The shared jobs keep the names `select` and `build` (its checks show as
+  `build / build`). Main shows their failure as a build failure.
+- `gpu_test_selection.py` keeps printing `GPU selection for <sha>: {...}`, and
+  `Cannot determine changed paths` when it falls back to every suite.
+
+To re-collect after a fix to the collector, run **CI Health** manually with
+`since` set to an ISO time. GitHub keeps job logs for 90 days, so failures older
+than that cannot be recovered.
+
 ## Local validation
 
 ```bash
 python3 -m pytest .github/scripts/test_gpu_ci.py .github/scripts/test_nightly_select.py -s --tb=short
+(cd .github/scripts && python3 -m pytest -q test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py)
 node --test .github/scripts/test_last_green_nightly.js
 ```
 
