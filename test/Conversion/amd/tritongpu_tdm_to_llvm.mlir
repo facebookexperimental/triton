@@ -1,5 +1,41 @@
 // RUN: triton-opt %s --split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 --convert-builtin-func-to-llvm | FileCheck %s
 
+// The intrinsic inserted at kernel entry survives function lowering,
+// including when the kernel calls a device function.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: llvm.func @wmma_queuing_enabled
+  // CHECK-DAG: %[[REG:.*]] = llvm.mlir.constant(154 : i32) : i32
+  // CHECK-DAG: %[[VALUE:.*]] = llvm.mlir.constant(1 : i32) : i32
+  // CHECK: llvm.call_intrinsic "llvm.amdgcn.s.setreg"(%[[REG]], %[[VALUE]])
+  // CHECK-NOT: llvm.amdgcn.s.setreg
+  // CHECK: llvm.call @wmma_queuing_helper
+  // CHECK-NOT: llvm.amdgcn.s.setreg
+  // CHECK: llvm.return
+  tt.func public @wmma_queuing_enabled() {
+    %reg = llvm.mlir.constant(154 : i32) : i32
+    %value = llvm.mlir.constant(1 : i32) : i32
+    llvm.call_intrinsic "llvm.amdgcn.s.setreg"(%reg, %value) : (i32, i32) -> ()
+    tt.call @wmma_queuing_helper() : () -> ()
+    tt.return
+  }
+
+  // CHECK-LABEL: llvm.func internal @wmma_queuing_helper
+  // CHECK-NOT: llvm.amdgcn.s.setreg
+  // CHECK: llvm.return
+  tt.func private @wmma_queuing_helper() attributes {noinline = true} {
+    tt.return
+  }
+
+  // CHECK-LABEL: llvm.func @wmma_queuing_default
+  // CHECK-NOT: llvm.amdgcn.s.setreg
+  // CHECK: llvm.return
+  tt.func public @wmma_queuing_default() {
+    tt.return
+  }
+}
+
+// -----
+
 // All three TDM copy paths must use the padded origin of a shared-memory view.
 #base = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 128]}>
 #tile = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [32, 128]}>

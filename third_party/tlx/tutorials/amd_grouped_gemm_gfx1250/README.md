@@ -96,6 +96,14 @@ group_offsets: [G + 1]
 Every M, N, and K must cover full tiles. The packed and list JIT entry points
 share the TDM pipeline, prefetch, and output implementation.
 
+The HIP kernel launch option `enable_wmma_queuing=True` sets gfx1250
+`SCHED_MODE[2]` at kernel entry, allowing WMMAs to queue while independent
+scalar and memory instructions execute. It preserves the other register bits
+and does not change LLVM's scheduler or wait insertion. The option defaults to
+`False` (no register write). The host wrappers enable it for 256x256 tiles with
+cross-tile prefetch or depth-2 alias-C staging; callers launching either JIT
+kernel directly can pass the option explicitly.
+
 ## Schedules
 
 The main schedules use BK=128, depth 2, `group_m=4`, four warps, and

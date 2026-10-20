@@ -127,7 +127,6 @@ from .types import (
     TMemCTAMode,
 )
 from .utility import (
-    amd_set_wave_sched_mode,
     async_task_replica_id,
     clock64,
     cluster_cta_rank,
@@ -265,7 +264,6 @@ __all__ = [
     "release_layout",
     "tcgen05_commit",
     # utility
-    "amd_set_wave_sched_mode",
     "cluster_cta_rank",
     "cluster_size_1d",
     "thread_id",
