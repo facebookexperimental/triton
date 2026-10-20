@@ -1,23 +1,19 @@
 """Stateful chunk-parallel Kimi Delta Attention prefill for gfx950.
 
 The kernel accepts normalized Q/K, per-token log decays, and sigmoid-applied
-beta coefficients. Recurrent states use the physical ``[N, H, V, K]``
-V-major layout.
+beta coefficients, or the raw inputs those come from. Recurrent states use the
+physical ``[N, H, V, K]`` V-major layout, dense or as slots of a state pool.
 
-The implementation uses 64-token chunks and 16-token triangular solves:
+The implementation uses 64-token chunks and 16-token bands, in two passes:
 
-* consume normalized Q/K and form per-channel chunk-local cumulative log decays;
-* build causal QK and beta-scaled KK products with CDNA4 ``tl.dot`` MFMAs;
-* solve four 16x16 diagonal systems and merge their 64x64 WY inverse;
-* form W/U and carry the recurrent state between chunks, adding the causal
-  within-chunk output.
+* one program per (chunk, head) forms the band-local gate cumsum, the causal
+  QK and beta-scaled KK products with CDNA4 ``tl.dot`` MFMAs, the 64x64 WY
+  inverse, and W/U;
+* a walk carries the recurrent state across chunks and adds each chunk's
+  causal within-chunk output, split in time when too few sequences would idle
+  the GPU.
 
-The state walk streams each chunk's operands through a double-buffered TLX
-local-memory ring and writes the output as it goes. When a few long sequences
-cannot fill the GPU, it splits each sequence into time groups: one pass reduces
-every group to an affine map of its entry state, a short scan chains the maps,
-and a second pass replays every group from its true entry state. Shapes where
-the walk does not pay off use a single-pass scan plus a separate output pass.
+TLX local-memory async copies stage the walk's per-chunk operands.
 """
 
 from __future__ import annotations
@@ -83,626 +79,329 @@ def _prepare_prefill_metadata(cu_seqlens: torch.Tensor, device: torch.device, to
 
 
 @triton.jit
-def _load_chunk_block(
-    buffer,
-    block: tl.constexpr,
-    BC: tl.constexpr,
-    D: tl.constexpr,
-    layout: tl.constexpr,
-):
-    view = tlx.local_slice(tlx.local_view(buffer, 0), [block * BC, 0], [BC, D])
-    return tlx.local_load(view, layout=layout)
+def _mm_f32(lhs, rhs, solve_layout: tl.constexpr, solve_a: tl.constexpr, solve_b: tl.constexpr):
+    zero = tlx.zeros(lhs.shape, tl.float32, layout=solve_layout)
+    product = tl.dot(tlx.require_layout(lhs, solve_a), tlx.require_layout(rhs, solve_b), acc=zero,
+                     input_precision="ieee")
+    return tlx.require_layout(product, solve_layout)
 
 
 @triton.jit
-def _preprocess_chunk_kernel(
+def _along(n: tl.constexpr, axis: tl.constexpr):
+    """arange(n) along ``axis`` of a rank-3 tensor.
+
+    Built by reshape: uTLX re-lays index math feeding a dot operand out in the
+    operand's layout, and fails on chained expand_dims.
+    """
+    return tl.reshape(tl.arange(0, n), [n if axis == 0 else 1, n if axis == 1 else 1, n if axis == 2 else 1])
+
+
+@triton.jit
+def _along2(n: tl.constexpr, axis: tl.constexpr):
+    """arange(n) along ``axis`` of a rank-2 tensor, as for ``_along``."""
+    return tl.reshape(tl.arange(0, n), [n if axis == 0 else 1, n if axis == 1 else 1])
+
+
+@triton.jit
+def _rcp(x):
+    # v_rcp_f32 (1 ulp): a plain divide lowers to the full IEEE sequence.
+    return tl.inline_asm_elementwise("v_rcp_f32 $0, $1", "=v,v", [x], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _exp2(x):
+    # v_exp_f32, flushing results below 2^-126: tl.exp wraps it in a
+    # denormal-safe range reduction.
+    return tl.inline_asm_elementwise("v_exp_f32 $0, $1", "=v,v", [x], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@constexpr_function
+def _row_padded(rows, cols, pad, bands=0):
+    """Row-major LDS image with ``pad`` elements after each row, as [bands, rows // bands, cols] if ``bands``.
+
+    Explicit, because uTLX otherwise picks an image for its transposed reads
+    that turns the row-vector writes into 2-byte stores.
+    """
+    padded = getattr(tlx, "padded_shared_layout_encoding", None)
+    if padded is None:
+        return None
+    shape = [bands, rows // bands, cols] if bands else [rows, cols]
+    return padded.with_identity_for([[cols, pad]], shape)
+
+
+@triton.jit
+def _shift_bands(x, s: tl.constexpr, layout: tl.constexpr):
+    """x with band b - s moved to band b, in ``layout``.
+
+    Bands below s get band 0; every caller multiplies them by a zero block.
+    """
+    band = _along(x.shape[0], 0) + tl.zeros(x.shape, tl.int32)
+    return tl.gather(x, tlx.require_layout(tl.maximum(band - s, 0), layout), 0)
+
+
+@triton.jit
+def _prepare_chunk_kernel(
     Q,
     K,
+    V,
     G,
     Beta,
-    Bg,
     Qg,
-    Akk,
+    W,
+    U,
+    Kg,
     Aqk,
+    Decay,
     CuSeqLens,
     ChunkIndices,
+    ALog,
+    DtBias,
+    lower_bound,
     SCALE: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     BT: tl.constexpr,
     BC: tl.constexpr,
+    NW: tl.constexpr,
+    STRIDE_Q: tl.constexpr,
+    STRIDE_K: tl.constexpr,
+    STRIDE_V: tl.constexpr,
+    STRIDE_G: tl.constexpr,
+    STRIDE_BETA: tl.constexpr,
+    RAW: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    SIGMOID_BETA: tl.constexpr,
 ):
+    """Everything the walk reads for one (chunk, head), in one program.
+
+    The chunk is held as [NB, BC, D] bands, one per warp, so the band-local
+    gate cumsum and every [BC, BC] block product run batched over bands. Akk
+    never leaves registers: block (b, J) of all bands comes from one batched
+    MFMA per column band J, each band's diagonal block is inverted by repeated
+    squaring, and the off-diagonal inverse blocks are built a diagonal at a
+    time from band-shifted copies (cross-warp gathers).
+    """
+    NB: tl.constexpr = BT // BC
+    LOG2E: tl.constexpr = 1.4426950408889634
+    LN2: tl.constexpr = 0.6931471805599453
     chunk = tl.program_id(0)
     head = tl.program_id(1)
     sequence = tl.load(ChunkIndices + chunk * 2).to(tl.int32)
     local_chunk = tl.load(ChunkIndices + chunk * 2 + 1).to(tl.int32)
     begin = tl.load(CuSeqLens + sequence).to(tl.int32)
-    end = tl.load(CuSeqLens + sequence + 1).to(tl.int32)
-    length = end - begin
     token0 = local_chunk * BT
+    rows_left = tl.load(CuSeqLens + sequence + 1).to(tl.int32) - begin - token0
 
-    rows = tl.arange(0, BT)
-    keys = tl.arange(0, D)
-    tokens = token0 + rows
-    mask = (tokens[:, None] < length) & (keys[None, :] < D)
-    offsets = ((begin + tokens[:, None]) * H + head) * D + keys[None, :]
-    q = tl.load(Q + offsets, mask=mask, other=0.0)
-    k = tl.load(K + offsets, mask=mask, other=0.0)
-    log_decay = tl.load(G + offsets, mask=mask, other=0.0).to(tl.bfloat16).to(tl.float32)
-    log_decay = tl.where(mask, log_decay, 0.0)
-    cumulative = tl.cumsum(log_decay, axis=0)
-    gated_q = q.to(tl.float32) * tl.exp(cumulative) * SCALE
-    tl.store(Bg + offsets, cumulative, mask=mask)
-    tl.store(Qg + offsets, gated_q.to(Qg.dtype.element_ty), mask=mask)
+    mb: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
+                                           warps_per_cta=[NW, 1, 1])
+    a3: tl.constexpr = tlx.dot_operand_layout(0, mb, k_width=8)
+    b3: tl.constexpr = tlx.dot_operand_layout(1, mb, k_width=8)
+    mf: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 4], transposed=True,
+                                           warps_per_cta=[NW, 1, 1])
+    af: tl.constexpr = tlx.dot_operand_layout(0, mf, k_width=1)
+    bf: tl.constexpr = tlx.dot_operand_layout(1, mf, k_width=1)
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[NW, 1])
+    a_op: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    b_op: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
 
-    q_shared_layout: tl.constexpr = tlx.swizzled_layout(3, 3, 5, order=[1, 0])
-    bg_shared_layout: tl.constexpr = tlx.swizzled_layout(3, 2, 5, order=[1, 0])
-    q_buffer = tlx.local_alloc((BT, D), tl.bfloat16, 1, layout=q_shared_layout)
-    k_buffer = tlx.local_alloc((BT, D), tl.bfloat16, 1, layout=q_shared_layout)
-    bg_buffer = tlx.local_alloc((BT, D), tl.float32, 1, layout=bg_shared_layout)
-    tlx.local_store(tlx.local_view(q_buffer, 0), q)
-    tlx.local_store(tlx.local_view(k_buffer, 0), k)
-    tlx.local_store(tlx.local_view(bg_buffer, 0), cumulative)
+    band = _along(NB, 0)
+    row = band * BC + _along(BC, 1)
+    chan = _along(D, 2)
+    # [NB, BC, D] tiles live in the fp32 MFMA result layout, a band per warp:
+    # scans only lower for blocked layouts, so the in-band cumsum is a
+    # lower-triangular product and only the [NB, D] band scan is released.
+    # Buffer ops keep these layouts: pointer-tensor loads get re-coalesced.
+    # Masks are rebuilt from offsets in each layout (row < rows_left exactly
+    # when offset < rows_left * H * D): uTLX cannot move i1 tensors via LDS.
+    # Inputs keep their token strides (split views of a packed qkv); outputs
+    # are dense [T, H, D].
+    tile_base = ((begin + token0) * H + head) * D
+    tile_limit = rows_left * (H * D)
+    tile_offsets = tlx.require_layout(row * (H * D) + chan, mf)
+    tile_mask = tile_offsets < tile_limit
+    start = (begin + token0).to(tl.int64)
+    q_offsets = tlx.require_layout(row * STRIDE_Q + chan, mf)
+    k_offsets = tlx.require_layout(row * STRIDE_K + chan, mf)
+    v_offsets = tlx.require_layout(row * STRIDE_V + chan, mf)
+    g_offsets = tlx.require_layout(row * STRIDE_G + chan, bf)
+    g_rows = tlx.require_layout(tl.minimum(row, rows_left - 1) * STRIDE_G + chan, bf)
+    beta_offsets = tlx.require_layout(row * STRIDE_BETA, mf)
+    # Inputs stay bf16 until their turn below, so few fp32 tiles are live at once.
+    q = tlx.buffer_load(Q + (start * STRIDE_Q + head * D), q_offsets, mask=q_offsets < rows_left * STRIDE_Q, other=0.0)
+    k = tlx.buffer_load(K + (start * STRIDE_K + head * D), k_offsets, mask=k_offsets < rows_left * STRIDE_K, other=0.0)
+    v = tlx.buffer_load(V + (start * STRIDE_V + head * D), v_offsets, mask=v_offsets < rows_left * STRIDE_V, other=0.0)
+    # Unmasked, with rows past the sequence rereading its last row, then
+    # zeroed: uTLX keys buffer_load helpers on dtype and shape but not layout,
+    # so a masked bf16 load here would reuse q's layout.
+    g_mask = g_offsets < rows_left * STRIDE_G
+    g = tlx.buffer_load(G + (start * STRIDE_G + head * D), g_rows).to(tl.float32)
+    beta_mask = beta_offsets < rows_left * STRIDE_BETA
+    beta = tlx.buffer_load(Beta + (start * STRIDE_BETA + head), beta_offsets, mask=beta_mask, other=0.0).to(tl.float32)
+    if RAW:
+        # What prepare_kda_inputs does, rounded the same way: the activated
+        # gate here, l2-normalized Q/K in bf16 below.
+        # A [D] vector broadcast in registers: the full-tile offsets would go
+        # through LDS on uTLX, and the loads lose their broadcast.
+        bias = tl.load(DtBias + head * D +
+                       tlx.require_layout(tl.arange(0, D), tlx.slice_layout(tlx.slice_layout(bf, 1), 0)))
+        rate = tl.exp(tl.load(ALog + head).to(tl.float32))
+        if USE_LOWER_BOUND:
+            # exp(-rate (g + bias)) as one exp2 of an FMA. Spelled out rather
+            # than _exp2: uTLX gives every call of one shape a single layout.
+            slope = -rate * LOG2E
+            decay = tl.inline_asm_elementwise("v_exp_f32 $0, $1", "=v,v", [g * slope + (slope * bias)[None, None, :]],
+                                              dtype=tl.float32, is_pure=True, pack=1)
+            g = lower_bound * _rcp(1.0 + decay)
+        else:
+            x = g + bias[None, None, :]
+            g = -rate * tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
+    if SIGMOID_BETA:
+        beta = tl.where(beta_mask, tl.sigmoid(beta), 0.0)
+    g = tl.where(g_mask, g, 0.0).to(tl.bfloat16).to(tl.float32)
+
+    # G = pivot + in_band, in log2 units: each band's gate relative to the
+    # token before it. exp(G) and exp(last - G) are split into a per-band
+    # factor and exp(+-in_band), so no fp32 gate tile stays live.
+    lower = tlx.require_layout(tl.broadcast_to(tl.where(_along(BC, 2) <= _along(BC, 1), LOG2E, 0.0), (NB, BC, BC)), af)
+    in_band = tl.dot(lower, g, acc=tlx.zeros((NB, BC, D), tl.float32, layout=mf), input_precision="ieee")
+    band_total = tlx.release_layout(tl.sum(g, axis=1)) * LOG2E
+    pivot = tl.cumsum(band_total, axis=0) - band_total
+    last = tl.sum(band_total, axis=0)
+    tl.store(Decay + ((begin // BT + sequence + local_chunk) * H + head) * D + tl.arange(0, D), last * LN2)
+    rise = _exp2(in_band)
+    fall = _exp2(-in_band)
+    to_pivot = tlx.require_layout(_exp2(pivot)[:, None, :], mf)
+    to_last = tlx.require_layout(_exp2(last[None, :] - pivot)[:, None, :], mf)
+
+    # The W/U right-hand sides wait in LDS, not registers, until the inverse is done.
+    key_rhs = tlx.local_alloc((BT, D), tl.bfloat16, 1, layout=_row_padded(BT, D, 8))
+    value_rhs = tlx.local_alloc((BT, D), tl.bfloat16, 1, layout=_row_padded(BT, D, 8))
+    tlx.local_store(tlx.local_view(value_rhs, 0), tl.reshape((v.to(tl.float32) * beta).to(tl.bfloat16), [BT, D]))
+
+    # Rows decayed to their band's pivot (lhs) and columns lifted from it; a
+    # bridge exp(pivot_b - pivot_J) then moves column band J to row band b.
+    q = q.to(tl.float32)
+    if RAW:
+        q = (q * tl.math.rsqrt(tl.sum(q * q, axis=2) + 1e-6)[:, :, None]).to(tl.bfloat16).to(tl.float32)
+    q_rows = q * rise * SCALE
+    tlx.buffer_store((q_rows * to_pivot).to(Qg.dtype.element_ty), Qg + tile_base, tile_offsets, mask=tile_mask)
+    q_lhs = tlx.require_layout(q_rows.to(tl.bfloat16), a3)
+    k = k.to(tl.float32)
+    if RAW:
+        k = (k * tl.math.rsqrt(tl.sum(k * k, axis=2) + 1e-6)[:, :, None]).to(tl.bfloat16).to(tl.float32)
+    k_cols = k * fall
+    tlx.buffer_store((k_cols * to_last).to(Kg.dtype.element_ty), Kg + tile_base, tile_offsets, mask=tile_mask)
+    lifted = tlx.local_alloc((NB, BC, D), tl.bfloat16, 1, layout=_row_padded(NB * BC, D, 8, NB))
+    tlx.local_store(tlx.local_view(lifted, 0), k_cols.to(tl.bfloat16))
+    k_rows = k * rise
+    tlx.local_store(tlx.local_view(key_rhs, 0), tl.reshape((k_rows * to_pivot * beta).to(tl.bfloat16), [BT, D]))
+    k_lhs = tlx.require_layout(k_rows.to(tl.bfloat16), a3)
+    band_pivot = tlx.release_layout(pivot)
+    # bridges[J, b] = exp(pivot_b - pivot_J), clamped where b < J and the block is masked anyway.
+    bridges = tlx.local_alloc((NB * NB, D), tl.float32, 1)
+    pivot_band = tl.arange(0, NB)[:, None]
+    for J in tl.static_range(NB):
+        pivot_J = tl.sum(tl.where(pivot_band == J, band_pivot, 0.0), axis=0)
+        tlx.local_store(tlx.local_slice(tlx.local_view(bridges, 0), [J * NB, 0], [NB, D]),
+                        _exp2(tl.minimum(band_pivot - pivot_J[None, :], 0.0)))
+    bridged = tlx.local_view(tlx.local_alloc((NB, BC, D), tl.bfloat16, 1, layout=_row_padded(NB * BC, D, 8, NB)), 0)
     tl.debug_barrier()
 
-    mfma_layout: tl.constexpr = tlx.amd_mfma_layout(
-        version=4,
-        instr_shape=[16, 16, 32],
-        transposed=True,
-        warps_per_cta=[4, 1],
-    )
-    a_layout: tl.constexpr = tlx.dot_operand_layout(0, mfma_layout, k_width=8)
-    b_layout: tl.constexpr = tlx.dot_operand_layout(1, mfma_layout, k_width=8)
-    beta_layout: tl.constexpr = tlx.slice_layout(a_layout, 1)
-    reference_layout: tl.constexpr = tlx.slice_layout(a_layout, 0)
-    out_rows = tl.arange(0, BC)
-    out_cols = tl.arange(0, BC)
-    sub_rows = tl.arange(0, BC)
+    # Block products live in the MFMA result layout, not the tiles'.
+    block_rows = tlx.release_layout(row)
+    block_beta = tlx.release_layout(beta)
+    block_cols = _along(BC, 2)
+    aqk_base = Aqk + (start * H + head) * BT
+    aqk_offsets = block_rows * (H * BT) + block_cols
+    aqk_mask = aqk_offsets < rows_left * (H * BT)
+    band_mb = tl.broadcast_to(band, (NB, BC, BC))
+    n0 = tl.zeros((NB, BC, BC), tl.float32)
+    n1 = tl.zeros((NB, BC, BC), tl.float32)
+    n2 = tl.zeros((NB, BC, BC), tl.float32)
+    n3 = tl.zeros((NB, BC, BC), tl.float32)
+    for J in tl.static_range(NB):
+        column_band = tlx.local_load(tlx.local_slice(tlx.local_view(lifted, 0), [J, 0, 0], [1, BC, D]), layout=mf)
+        bridge = tlx.local_load(tlx.local_slice(tlx.local_view(bridges, 0), [J * NB, 0], [NB, D]),
+                                layout=tlx.slice_layout(mf, 1))[:, None, :]
+        column_band = tlx.require_layout(tl.broadcast_to(column_band, (NB, BC, D)), mf)
+        tlx.local_store(bridged, (column_band.to(tl.float32) * bridge).to(tl.bfloat16))
+        tl.debug_barrier()
+        rhs = tlx.require_layout(tlx.local_load(tlx.local_trans(bridged, (0, 2, 1)), layout=b3), b3)
+        akk = tl.dot(k_lhs, rhs, acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mb))
+        aqk = tl.dot(q_lhs, rhs, acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mb))
+        column = J * BC + block_cols
+        tlx.buffer_store(
+            tl.where(block_rows >= column, aqk, 0.0).to(Aqk.dtype.element_ty), aqk_base + J * BC, aqk_offsets,
+            mask=aqk_mask)
+        akk = tl.where(block_rows > column, -block_beta * akk, 0.0)
+        n0 = tl.where(band_mb == J, akk, n0)
+        n1 = tl.where(band_mb == J + 1, akk, n1)
+        n2 = tl.where(band_mb == J + 2, akk, n2)
+        n3 = tl.where(band_mb == J + 3, akk, n3)
+    # Diagonal blocks: (I - N)^-1 = (I + N)(I + N^2)(I + N^4)(I + N^8).
+    tl.static_assert(NB == 4, "the inverse is unrolled for four bands")
+    sub_r = _along(BC, 1)
+    sub_c = _along(BC, 2)
+    n0 = tlx.require_layout(n0, mf)
+    power = _mm_f32(n0, n0, mf, af, bf)
+    x0 = n0 + (sub_r == sub_c).to(tl.float32)
+    x0 += _mm_f32(x0, power, mf, af, bf)
+    power = _mm_f32(power, power, mf, af, bf)
+    x0 += _mm_f32(x0, power, mf, af, bf)
+    power = _mm_f32(power, power, mf, af, bf)
+    x0 += _mm_f32(x0, power, mf, af, bf)
 
-    for row_block in tl.static_range(0, BT // BC):
-        row_q = _load_chunk_block(q_buffer, row_block, BC, D, a_layout).to(tl.float32)
-        row_k = _load_chunk_block(k_buffer, row_block, BC, D, a_layout).to(tl.float32)
-        row_bg = _load_chunk_block(bg_buffer, row_block, BC, D, a_layout)
-        reference = tl.sum(
-            tl.where(sub_rows[:, None] == 0, tlx.release_layout(row_bg), 0.0),
-            axis=0,
-        )
-        reference = tlx.require_layout(reference, reference_layout, pin=False)
-        row_gate = tl.exp(row_bg - reference[None, :])
-        row_q *= row_gate
-        row_k *= row_gate
-
-        row_tokens = token0 + row_block * BC + sub_rows
-        row_mask = row_tokens < length
-        row_beta = tl.load(
-            Beta + (begin + row_tokens) * H + head,
-            mask=row_mask,
-            other=0.0,
-        ).to(tl.float32)
-        row_beta = tlx.require_layout(row_beta, beta_layout, pin=False)
-        lhs_k = tlx.require_layout(
-            (row_k * row_beta[:, None]).to(tl.bfloat16),
-            a_layout,
-            pin=False,
-        )
-        lhs_q = tlx.require_layout(row_q.to(tl.bfloat16), a_layout, pin=False)
-
-        for col_block in tl.static_range(0, row_block + 1):
-            col_k = _load_chunk_block(k_buffer, col_block, BC, D, a_layout).to(tl.float32)
-            col_bg = _load_chunk_block(bg_buffer, col_block, BC, D, a_layout)
-            col_k *= tl.exp(reference[None, :] - col_bg)
-            rhs = tlx.require_layout(tl.trans(col_k.to(tl.bfloat16)), b_layout, pin=False)
-            acc_k = tlx.zeros((BC, BC), tl.float32, layout=mfma_layout)
-            acc_q = tlx.zeros((BC, BC), tl.float32, layout=mfma_layout)
-            acc_k = tl.dot(lhs_k, rhs, acc=acc_k, out_dtype=tl.float32)
-            acc_q = tl.dot(lhs_q, rhs, acc=acc_q, out_dtype=tl.float32)
-
-            if col_block == row_block:
-                lower_mask = tlx.require_layout(
-                    (out_rows[:, None] > out_cols[None, :]).to(tl.int8),
-                    mfma_layout,
-                    pin=False,
-                ) != 0
-                causal_mask = tlx.require_layout(
-                    (out_rows[:, None] >= out_cols[None, :]).to(tl.int8),
-                    mfma_layout,
-                    pin=False,
-                ) != 0
-                acc_k = tl.where(lower_mask, acc_k, 0.0)
-                acc_q = tl.where(causal_mask, acc_q, 0.0)
-
-            out_offsets = (((begin + token0 + row_block * BC + out_rows[:, None]) * H + head) * BT + col_block * BC +
-                           out_cols[None, :]).to(tl.int32)
-            out_offsets = tlx.require_layout(out_offsets, mfma_layout, pin=False)
-            out_mask = tlx.require_layout(
-                (token0 + row_block * BC + out_rows[:, None] < length).to(tl.int8),
-                mfma_layout,
-                pin=False,
-            ) != 0
-            tlx.buffer_store(acc_k, Akk, out_offsets, mask=out_mask)
-            tlx.buffer_store(
-                (acc_q * SCALE).to(Aqk.dtype.element_ty),
-                Aqk,
-                out_offsets,
-                mask=out_mask,
-            )
-
-
-@triton.jit
-def _solve_16x16_kernel(
-    Akk,
-    DiagonalInverse,
-    CuSeqLens,
-    ChunkIndices,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-):
-    chunk_block = tl.program_id(0)
-    head = tl.program_id(1)
-    chunk = chunk_block // (BT // BC)
-    block = chunk_block % (BT // BC)
-    sequence = tl.load(ChunkIndices + chunk * 2).to(tl.int32)
-    local_chunk = tl.load(ChunkIndices + chunk * 2 + 1).to(tl.int32)
-    begin = tl.load(CuSeqLens + sequence).to(tl.int32)
-    end = tl.load(CuSeqLens + sequence + 1).to(tl.int32)
-    length = end - begin
-    token0 = local_chunk * BT + block * BC
-
-    rows = tl.arange(0, BC)
-    cols = tl.arange(0, BC)
-    offsets = ((begin + token0 + rows[:, None]) * H + head) * BT + block * BC + cols[None, :]
-    matrix = tl.load(Akk + offsets, mask=token0 + rows[:, None] < length, other=0.0).to(tl.float32)
-    inverse = -tl.where(rows[:, None] > cols[None, :], matrix, 0.0)
-    for row in tl.static_range(2, BC):
-        coefficients = -tl.load(
-            Akk + ((begin + token0 + row) * H + head) * BT + block * BC + cols,
-            mask=token0 + row < length,
-            other=0.0,
-        ).to(tl.float32)
-        coefficients = tl.where(cols < row, coefficients, 0.0)
-        solved = coefficients + tl.sum(coefficients[:, None] * inverse, axis=0)
-        inverse = tl.where((rows == row)[:, None], solved[None, :], inverse)
-    inverse += rows[:, None] == cols[None, :]
-
-    out_offsets = ((begin + token0 + rows[:, None]) * H + head) * BC + cols[None, :]
-    tl.store(
-        DiagonalInverse + out_offsets,
-        inverse,
-        mask=token0 + rows[:, None] < length,
-    )
+    # Off-diagonals X_{b, b-d} = X_bb sum_s N_{b, b-s} X_{b-s, b-d}, with
+    # X_{b-s, b-d} diagonal d - s shifted down s bands. N_{b, b-s} is zero for
+    # b < s, so so is diagonal d below band d.
+    n1 = tlx.require_layout(n1, af)
+    n2 = tlx.require_layout(n2, af)
+    n3 = tlx.require_layout(n3, af)
+    acc = tl.dot(n1, _shift_bands(x0, 1, bf), acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mf),
+                 input_precision="ieee")
+    x1 = _mm_f32(x0, tlx.require_layout(acc, mf), mf, af, bf)
+    acc = tl.dot(n1, _shift_bands(x1, 1, bf), acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mf),
+                 input_precision="ieee")
+    acc = tl.dot(n2, _shift_bands(x0, 2, bf), acc=acc, input_precision="ieee")
+    x2 = _mm_f32(x0, tlx.require_layout(acc, mf), mf, af, bf)
+    acc = tl.dot(n1, _shift_bands(x2, 1, bf), acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mf),
+                 input_precision="ieee")
+    acc = tl.dot(n2, _shift_bands(x1, 2, bf), acc=acc, input_precision="ieee")
+    acc = tl.dot(n3, _shift_bands(x0, 3, bf), acc=acc, input_precision="ieee")
+    x3 = _mm_f32(x0, tlx.require_layout(acc, mf), mf, af, bf)
+    # A^-1 by column band: band b of column band J is diagonal b - J. Then W
+    # and U are plain [BT, BT] x [BT, D] products.
+    inverse = tlx.local_alloc((BT, BT), tl.bfloat16, 1, layout=_row_padded(BT, BT, 8))
+    selector = tlx.release_layout(band) + tl.zeros((NB, BC, BC), tl.int32)
+    for J in tl.static_range(NB):
+        block = tl.where(selector == J, x0, 0.0)
+        block = tl.where(selector == J + 1, x1, block)
+        block = tl.where(selector == J + 2, x2, block)
+        block = tl.where(selector == J + 3, x3, block)
+        tlx.local_store(tlx.local_slice(tlx.local_view(inverse, 0), [0, J * BC], [BT, BC]),
+                        tl.reshape(block.to(tl.bfloat16), [BT, BC]))
+    tl.debug_barrier()
+    inverse = tlx.local_load(tlx.local_view(inverse, 0), layout=a_op)
+    # Stored from the A-operand layout: eight contiguous channels per lane.
+    flat_offsets = tlx.require_layout(_along2(BT, 0) * (H * D) + _along2(D, 1), a_op)
+    w = tl.dot(inverse, tlx.local_load(tlx.local_view(key_rhs, 0), layout=b_op), acc=tlx.zeros((BT, D), tl.float32,
+                                                                                               layout=mma))
+    tlx.buffer_store(tlx.require_layout(w.to(W.dtype.element_ty), a_op), W + tile_base, flat_offsets, mask=flat_offsets
+                     < tile_limit)
+    u = tl.dot(inverse, tlx.local_load(tlx.local_view(value_rhs, 0), layout=b_op), acc=tlx.zeros((BT, D), tl.float32,
+                                                                                                 layout=mma))
+    tlx.buffer_store(tlx.require_layout(u.to(U.dtype.element_ty), a_op), U + tile_base, flat_offsets, mask=flat_offsets
+                     < tile_limit)
 
 
 @triton.jit
-def _load_akk_block(
-    Akk,
-    begin,
-    length,
-    token0,
-    head,
-    ROW_BLOCK: tl.constexpr,
-    COL_BLOCK: tl.constexpr,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-):
-    rows = tl.arange(0, BC)
-    cols = tl.arange(0, BC)
-    offsets = (((begin + token0 + ROW_BLOCK * BC + rows[:, None]) * H + head) * BT + COL_BLOCK * BC + cols[None, :])
-    return tl.load(
-        Akk + offsets,
-        mask=token0 + ROW_BLOCK * BC + rows[:, None] < length,
-        other=0.0,
-    ).to(tl.float32)
+def _decay_row(begin, sequence, head, H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr):
+    """Offset of a sequence's first chunk row in the per-chunk decay table.
 
-
-@triton.jit
-def _load_diagonal_block(
-    DiagonalInverse,
-    begin,
-    length,
-    token0,
-    head,
-    BLOCK: tl.constexpr,
-    H: tl.constexpr,
-    BC: tl.constexpr,
-):
-    rows = tl.arange(0, BC)
-    cols = tl.arange(0, BC)
-    offsets = ((begin + token0 + BLOCK * BC + rows[:, None]) * H + head) * BC + cols[None, :]
-    return tl.load(
-        DiagonalInverse + offsets,
-        mask=token0 + BLOCK * BC + rows[:, None] < length,
-        other=0.0,
-    ).to(tl.float32)
-
-
-@triton.jit
-def _mm16(lhs, rhs):
-    return tl.dot(lhs.to(tl.bfloat16), rhs.to(tl.bfloat16))
-
-
-@triton.jit
-def _store_inverse_block(
-    TInverse,
-    value,
-    begin,
-    length,
-    token0,
-    head,
-    ROW_BLOCK: tl.constexpr,
-    COL_BLOCK: tl.constexpr,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-):
-    rows = tl.arange(0, BC)
-    cols = tl.arange(0, BC)
-    offsets = (((begin + token0 + ROW_BLOCK * BC + rows[:, None]) * H + head) * BT + COL_BLOCK * BC + cols[None, :])
-    tl.store(
-        TInverse + offsets,
-        value.to(TInverse.dtype.element_ty),
-        mask=token0 + ROW_BLOCK * BC + rows[:, None] < length,
-    )
-
-
-@triton.jit
-def _merge_inverse_64_kernel(
-    Akk,
-    DiagonalInverse,
-    TInverse,
-    CuSeqLens,
-    ChunkIndices,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-):
-    chunk = tl.program_id(0)
-    head = tl.program_id(1)
-    sequence = tl.load(ChunkIndices + chunk * 2).to(tl.int32)
-    local_chunk = tl.load(ChunkIndices + chunk * 2 + 1).to(tl.int32)
-    begin = tl.load(CuSeqLens + sequence).to(tl.int32)
-    end = tl.load(CuSeqLens + sequence + 1).to(tl.int32)
-    length = end - begin
-    token0 = local_chunk * BT
-
-    i00 = _load_diagonal_block(DiagonalInverse, begin, length, token0, head, 0, H, BC)
-    i11 = _load_diagonal_block(DiagonalInverse, begin, length, token0, head, 1, H, BC)
-    i22 = _load_diagonal_block(DiagonalInverse, begin, length, token0, head, 2, H, BC)
-    i33 = _load_diagonal_block(DiagonalInverse, begin, length, token0, head, 3, H, BC)
-    a10 = _load_akk_block(Akk, begin, length, token0, head, 1, 0, H, BT, BC)
-    a20 = _load_akk_block(Akk, begin, length, token0, head, 2, 0, H, BT, BC)
-    a21 = _load_akk_block(Akk, begin, length, token0, head, 2, 1, H, BT, BC)
-    a30 = _load_akk_block(Akk, begin, length, token0, head, 3, 0, H, BT, BC)
-    a31 = _load_akk_block(Akk, begin, length, token0, head, 3, 1, H, BT, BC)
-    a32 = _load_akk_block(Akk, begin, length, token0, head, 3, 2, H, BT, BC)
-
-    i10 = -_mm16(_mm16(i11, a10), i00)
-    i21 = -_mm16(_mm16(i22, a21), i11)
-    i20 = -_mm16(i22, _mm16(a20, i00) + _mm16(a21, i10))
-    i32 = -_mm16(_mm16(i33, a32), i22)
-    i31 = -_mm16(i33, _mm16(a31, i11) + _mm16(a32, i21))
-    i30 = -_mm16(i33, _mm16(a30, i00) + _mm16(a31, i10) + _mm16(a32, i20))
-
-    _store_inverse_block(TInverse, i00, begin, length, token0, head, 0, 0, H, BT, BC)
-    _store_inverse_block(TInverse, i10, begin, length, token0, head, 1, 0, H, BT, BC)
-    _store_inverse_block(TInverse, i11, begin, length, token0, head, 1, 1, H, BT, BC)
-    _store_inverse_block(TInverse, i20, begin, length, token0, head, 2, 0, H, BT, BC)
-    _store_inverse_block(TInverse, i21, begin, length, token0, head, 2, 1, H, BT, BC)
-    _store_inverse_block(TInverse, i22, begin, length, token0, head, 2, 2, H, BT, BC)
-    _store_inverse_block(TInverse, i30, begin, length, token0, head, 3, 0, H, BT, BC)
-    _store_inverse_block(TInverse, i31, begin, length, token0, head, 3, 1, H, BT, BC)
-    _store_inverse_block(TInverse, i32, begin, length, token0, head, 3, 2, H, BT, BC)
-    _store_inverse_block(TInverse, i33, begin, length, token0, head, 3, 3, H, BT, BC)
-
-
-@triton.jit
-def _form_w_u_kernel(
-    TInverse,
-    K,
-    V,
-    Bg,
-    Beta,
-    U,
-    W,
-    Kg,
-    CuSeqLens,
-    ChunkIndices,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BO: tl.constexpr,
-):
-    chunk = tl.program_id(0)
-    head = tl.program_id(1)
-    out_block = tl.program_id(2)
-    sequence = tl.load(ChunkIndices + chunk * 2).to(tl.int32)
-    local_chunk = tl.load(ChunkIndices + chunk * 2 + 1).to(tl.int32)
-    begin = tl.load(CuSeqLens + sequence).to(tl.int32)
-    end = tl.load(CuSeqLens + sequence + 1).to(tl.int32)
-    length = end - begin
-    token0 = local_chunk * BT
-
-    rows = tl.arange(0, BT)
-    cols = tl.arange(0, BT)
-    t_offsets = ((begin + token0 + rows[:, None]) * H + head) * BT + cols[None, :]
-    t_mask = token0 + rows[:, None] < length
-    t_buffer = tlx.local_alloc((BT, BT), TInverse.dtype.element_ty, 1)
-    token = tlx.async_load(TInverse + t_offsets, tlx.local_view(t_buffer, 0), mask=t_mask)
-    tlx.async_load_commit_group([token])
-
-    out_cols = out_block * BO + tl.arange(0, BO)
-    data_offsets = ((begin + token0 + rows[:, None]) * H + head) * D + out_cols[None, :]
-    data_mask = (token0 + rows[:, None] < length) & (out_cols[None, :] < D)
-    beta = tl.load(
-        Beta + (begin + token0 + rows) * H + head,
-        mask=token0 + rows < length,
-        other=0.0,
-    ).to(tl.float32)
-    values = tl.load(V + data_offsets, mask=data_mask, other=0.0)
-    keys = tl.load(K + data_offsets, mask=data_mask, other=0.0)
-    gates = tl.load(Bg + data_offsets, mask=data_mask, other=0.0).to(tl.float32)
-
-    wait_token = tlx.async_load_wait_group(0)
-    inverse = tlx.local_load(tlx.local_view(t_buffer, 0), token=wait_token)
-    u = tl.dot(inverse, (values * beta[:, None]).to(values.dtype))
-    w = tl.dot(
-        inverse,
-        (keys.to(tl.float32) * beta[:, None] * tl.exp(gates)).to(keys.dtype),
-    )
-    last_token = tl.minimum(token0 + BT, length) - 1
-    last_gate = tl.load(Bg + ((begin + last_token) * H + head) * D + out_cols)
-    kg = keys.to(tl.float32) * tl.exp(last_gate[None, :] - gates)
-    tl.store(U + data_offsets, u.to(U.dtype.element_ty), mask=data_mask)
-    tl.store(W + data_offsets, w.to(W.dtype.element_ty), mask=data_mask)
-    tl.store(Kg + data_offsets, kg.to(Kg.dtype.element_ty), mask=data_mask)
-
-
-@triton.jit
-def _load_scan_chunk(
-    W,
-    U,
-    Qg,
-    Bg,
-    key_base,
-    value_base,
-    token0,
-    length,
-    qw_offsets,
-    uv_offsets,
-    bg_keys,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    uv_layout: tl.constexpr,
-    uv_b_layout: tl.constexpr,
-    state_key_layout: tl.constexpr,
-):
-    # Offsets are row * stride + column with column < stride, so comparing them
-    # against the remaining rows' extent masks out rows past the sequence end.
-    remaining = length - token0
-    key_start = key_base + token0 * H * K
-    qw_mask = qw_offsets < remaining * H * K
-    q0 = tlx.buffer_load(Qg + key_start, qw_offsets, mask=qw_mask, other=0.0)
-    q1 = tlx.buffer_load(Qg + key_start + BK, qw_offsets, mask=qw_mask, other=0.0)
-    w0 = tlx.buffer_load(W + key_start, qw_offsets, mask=qw_mask, other=0.0)
-    w1 = tlx.buffer_load(W + key_start + BK, qw_offsets, mask=qw_mask, other=0.0)
-    u_value = tlx.buffer_load(
-        U + value_base + token0 * H * V,
-        uv_offsets,
-        mask=uv_offsets < remaining * H * V,
-        other=0.0,
-    )
-    last_start = key_base + (tl.minimum(token0 + BT, length) - 1) * H * K
-    decay0 = tlx.buffer_load(Bg + last_start, bg_keys)
-    decay1 = tlx.buffer_load(Bg + last_start + BK, bg_keys)
-    return (
-        tlx.require_layout(q0, uv_b_layout, pin=False),
-        tlx.require_layout(q1, uv_b_layout, pin=False),
-        tlx.require_layout(w0, uv_b_layout, pin=False),
-        tlx.require_layout(w1, uv_b_layout, pin=False),
-        tlx.require_layout(u_value, uv_layout, pin=False),
-        tlx.require_layout(decay0, state_key_layout, pin=False),
-        tlx.require_layout(decay1, state_key_layout, pin=False),
-    )
-
-
-@triton.jit
-def _copy_scan_kg(Kg, buffers, slot, key_base, token0, length, rows, keys, H: tl.constexpr, K: tl.constexpr):
-    """Start the async copy of one chunk's [BT, K] token-major tile into a shared buffer slot.
-
-    A register load of Kg in the state update's dot-operand layout would read
-    2-byte scalars; the copy reads whole rows instead.
+    begin // BT + sequence + local_chunk is distinct for every chunk of every
+    sequence and stays below T // BT + 2 * N, so the table needs no chunk offsets.
     """
-    tokens = token0 + rows[:, None]
-    token = tlx.async_load(
-        Kg + key_base + tokens * H * K + keys[None, :],
-        tlx.local_view(buffers, slot),
-        mask=(tokens < length) & (keys[None, :] < K),
-    )
-    tlx.async_load_commit_group([token])
-
-
-@triton.jit
-def _state_scan_kernel(
-    W,
-    U,
-    Kg,
-    Qg,
-    Bg,
-    InitialState,
-    VNew,
-    Output,
-    FinalState,
-    CuSeqLens,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-):
-    value_block = tl.program_id(0)
-    sequence_head = tl.program_id(1)
-    sequence = sequence_head // H
-    head = sequence_head % H
-    begin = tl.load(CuSeqLens + sequence).to(tl.int32)
-    end = tl.load(CuSeqLens + sequence + 1).to(tl.int32)
-    length = end - begin
-    num_chunks = tl.cdiv(length, BT)
-    BK: tl.constexpr = K // 2
-
-    uv_layout: tl.constexpr = tlx.amd_mfma_layout(
-        version=4,
-        instr_shape=[16, 16, 32],
-        transposed=True,
-        warps_per_cta=[1, 4],
-    )
-    state_layout: tl.constexpr = tlx.amd_mfma_layout(
-        version=4,
-        instr_shape=[16, 16, 32],
-        transposed=True,
-        warps_per_cta=[1, 4],
-    )
-    uv_a_layout: tl.constexpr = tlx.dot_operand_layout(0, uv_layout, k_width=8)
-    uv_b_layout: tl.constexpr = tlx.dot_operand_layout(1, uv_layout, k_width=8)
-    state_a_layout: tl.constexpr = tlx.dot_operand_layout(0, state_layout, k_width=8)
-    state_b_layout: tl.constexpr = tlx.dot_operand_layout(1, state_layout, k_width=8)
-
-    state_key_layout: tl.constexpr = tlx.slice_layout(state_layout, 0)
-
-    state_values = tl.arange(0, BV)
-    state_keys = tl.arange(0, BK)
-    values = value_block * BV + state_values
-    state_offsets = values[:, None] * K + state_keys[None, :]
-    state_offsets = tlx.require_layout(state_offsets.to(tl.int32), state_layout, pin=False)
-    state_mask = tlx.require_layout(
-        ((values[:, None] < V) & (state_keys[None, :] < BK)).to(tl.int8),
-        state_layout,
-        pin=False,
-    ) != 0
-    state_base = sequence_head * K * V
-    state0 = tlx.buffer_load(
-        InitialState + state_base,
-        state_offsets,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
-    state1 = tlx.buffer_load(
-        InitialState + state_base + BK,
-        state_offsets,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
-    state0 = tlx.require_layout(state0, state_layout, pin=False)
-    state1 = tlx.require_layout(state1, state_layout, pin=False)
-
-    key_base = (begin * H + head) * K
-    value_base = (begin * H + head) * V
-
-    # Chunk-relative offsets, already in the layouts the loads produce, so the
-    # loop only advances scalar bases.
-    qw_keys = tl.arange(0, BK)
-    qw_rows = tl.arange(0, BT)
-    qw_offsets = tlx.require_layout((qw_rows[None, :] * H * K + qw_keys[:, None]).to(tl.int32), uv_b_layout, pin=False)
-    uv_rows = tl.arange(0, BT)
-    out_values = value_block * BV + tl.arange(0, BV)
-    uv_offsets = tlx.require_layout((uv_rows[None, :] * H * V + out_values[:, None]).to(tl.int32), uv_layout, pin=False)
-    bg_keys = tlx.require_layout(state_keys.to(tl.int32), state_key_layout, pin=False)
-
-    kg_rows = tl.arange(0, BT)
-    kg_keys = tl.arange(0, K)
-    kg_buffers = tlx.local_alloc((BT, K), tl.bfloat16, 2)
-
-    # Every load in the scan depends only on the chunk, not on the state, so
-    # chunk i + 1 is fetched while chunk i computes. The loads past the last
-    # chunk are fully masked except decay, which rereads the last token.
-    _copy_scan_kg(Kg, kg_buffers, 0, key_base, 0, length, kg_rows, kg_keys, H, K)
-    q0, q1, w0, w1, u_value, decay0, decay1 = _load_scan_chunk(
-        W,
-        U,
-        Qg,
-        Bg,
-        key_base,
-        value_base,
-        0,
-        length,
-        qw_offsets,
-        uv_offsets,
-        bg_keys,
-        H,
-        K,
-        V,
-        BT,
-        BK,
-        uv_layout,
-        uv_b_layout,
-        state_key_layout,
-    )
-    for local_chunk in range(num_chunks):
-        token0 = local_chunk * BT
-        _copy_scan_kg(Kg, kg_buffers, (local_chunk + 1) % 2, key_base, token0 + BT, length, kg_rows, kg_keys, H, K)
-        nq0, nq1, nw0, nw1, nu_value, ndecay0, ndecay1 = _load_scan_chunk(
-            W,
-            U,
-            Qg,
-            Bg,
-            key_base,
-            value_base,
-            token0 + BT,
-            length,
-            qw_offsets,
-            uv_offsets,
-            bg_keys,
-            H,
-            K,
-            V,
-            BT,
-            BK,
-            uv_layout,
-            uv_b_layout,
-            state_key_layout,
-        )
-
-        state_lhs0 = tlx.require_layout(state0.to(tl.bfloat16), uv_a_layout, pin=False)
-        state_lhs1 = tlx.require_layout(state1.to(tl.bfloat16), uv_a_layout, pin=False)
-        inter = tlx.zeros((BV, BT), tl.float32, layout=uv_layout)
-        inter = tl.dot(state_lhs0, q0, acc=inter, out_dtype=tl.float32)
-        inter = tl.dot(state_lhs1, q1, acc=inter, out_dtype=tl.float32)
-        prediction = tlx.zeros((BV, BT), tl.float32, layout=uv_layout)
-        prediction = tl.dot(state_lhs0, w0, acc=prediction, out_dtype=tl.float32)
-        prediction = tl.dot(state_lhs1, w1, acc=prediction, out_dtype=tl.float32)
-
-        new_value = u_value.to(tl.float32) - prediction
-        result_mask = uv_offsets < (length - token0) * H * V
-        tlx.buffer_store(
-            inter.to(Output.dtype.element_ty),
-            Output + value_base + token0 * H * V,
-            uv_offsets,
-            mask=result_mask,
-        )
-        tlx.buffer_store(
-            new_value.to(tl.bfloat16),
-            VNew + value_base + token0 * H * V,
-            uv_offsets,
-            mask=result_mask,
-        )
-
-        state0 *= tlx.require_layout(tl.exp(decay0.to(tl.float32)), state_key_layout, pin=False)[None, :]
-        state1 *= tlx.require_layout(tl.exp(decay1.to(tl.float32)), state_key_layout, pin=False)[None, :]
-        state_lhs = tlx.require_layout(new_value.to(tl.bfloat16), state_a_layout, pin=False)
-        kg_ready = tlx.async_load_wait_group(1)
-        kg_tile = tlx.local_view(kg_buffers, local_chunk % 2)
-        kg0 = tlx.local_load(tlx.local_slice(kg_tile, [0, 0], [BT, BK]), token=kg_ready, layout=state_b_layout)
-        kg1 = tlx.local_load(tlx.local_slice(kg_tile, [0, BK], [BT, BK]), token=kg_ready, layout=state_b_layout)
-        state0 = tl.dot(state_lhs, kg0, acc=state0, out_dtype=tl.float32)
-        state1 = tl.dot(state_lhs, kg1, acc=state1, out_dtype=tl.float32)
-
-        q0, q1, w0, w1, u_value, decay0, decay1 = nq0, nq1, nw0, nw1, nu_value, ndecay0, ndecay1
-
-    tlx.buffer_store(state0, FinalState + state_base, state_offsets, mask=state_mask)
-    tlx.buffer_store(state1, FinalState + state_base + BK, state_offsets, mask=state_mask)
+    return ((begin // BT + sequence) * H + head) * K
 
 
 @constexpr_function
@@ -734,7 +433,7 @@ def _copy_walk_chunk(
     Qg,
     U,
     Aqk,
-    Bg,
+    Decay,
     w_buffers,
     kg_buffers,
     q_buffers,
@@ -744,6 +443,7 @@ def _copy_walk_chunk(
     slot,
     key_base,
     value_base,
+    decay_base,
     token0,
     length,
     copy_rows,
@@ -772,8 +472,8 @@ def _copy_walk_chunk(
         tlx.local_view(u_buffers, slot),
         mask=rows_left & (u_columns[None, :] < V),
     )
-    last = tl.minimum(token0 + BT, length) - 1
-    decay = tlx.async_load(Bg + key_base + last * H * K + keys, tlx.local_view(decay_buffers, slot), mask=keys < K)
+    decay = tlx.async_load(Decay + decay_base + (token0 // BT) * H * K + keys, tlx.local_view(decay_buffers, slot),
+                           mask=keys < K)
     if WANT_O:
         q = tlx.async_load(Qg + key_offsets, tlx.local_view(q_buffers, slot), mask=key_mask)
         a = tlx.async_load(
@@ -792,12 +492,14 @@ def _state_walk_kernel(
     U,
     Kg,
     Qg,
-    Bg,
+    Decay,
     Aqk,
     InitialState,
     Output,
     FinalState,
     CuSeqLens,
+    StateIndices,
+    state_stride,
     GroupIn,
     GroupB,
     GroupM,
@@ -809,6 +511,7 @@ def _state_walk_kernel(
     BV: tl.constexpr,
     NW: tl.constexpr,
     PASS: tl.constexpr,
+    PAGED: tl.constexpr,
 ):
     """Walk one (row slice, sequence, head, chunk group) of the recurrence, output included.
 
@@ -824,6 +527,8 @@ def _state_walk_kernel(
     rows with U dropped), except group 0, which starts from the initial state
     and yields group 1's entry state. After _group_scan_kernel chains the
     groups, PASS 2 walks every group from its entry state and writes the output.
+    Group 0's entry is the initial state, which pass 1 also copies to GroupIn:
+    PASS 2 never reads InitialState, so FinalState may alias it.
     """
     value_block = tl.program_id(0)
     sequence_head = tl.program_id(1)
@@ -860,23 +565,23 @@ def _state_walk_kernel(
     keys = tl.arange(0, K)
     state_offsets = tlx.require_layout((values[:, None] * K + keys[None, :]).to(tl.int32), mma, pin=False)
     state_mask = tlx.require_layout(((values[:, None] < V) & (keys[None, :] < K)).to(tl.int8), mma, pin=False) != 0
-    state_base = sequence_head * K * V
+    state_base = _state_base(StateIndices, state_stride, sequence, head, H, K, V, PAGED)
     if PASS == 2:
-        if group == 0:
-            start = InitialState + state_base
-        else:
-            start = GroupIn + group_plane * (V * K)
+        start = GroupIn + group_plane * (V * K)
     else:
         start = InitialState + state_base
     state = tlx.buffer_load(start, state_offsets, mask=state_mask, other=0.0).to(tl.float32)
     state = tlx.require_layout(state, mma, pin=False)
     if PASS == 1:
+        if group == 0:
+            tlx.buffer_store(state, GroupIn + group_plane * (V * K), state_offsets, mask=state_mask)
         eye = tlx.require_layout((keys[None, :] == values[:, None] - V).to(tl.float32), mma, pin=False)
         # Transfer rows load as zero and eye is zero on value rows.
         state = state * tl.where(group == 0, 1.0, 0.0) + eye
 
     key_base = (begin * H + head) * K
     value_base = (begin * H + head) * V
+    decay_base = _decay_row(begin, sequence, head, H, K, BT)
     copy_rows = tl.arange(0, BT)
     u_offsets = copy_rows[:, None] * H * V + values[None, :]
     a_columns = tl.arange(0, BT)
@@ -902,7 +607,7 @@ def _state_walk_kernel(
         Qg,
         U,
         Aqk,
-        Bg,
+        Decay,
         w_buffers,
         kg_buffers,
         q_buffers,
@@ -912,6 +617,7 @@ def _state_walk_kernel(
         0,
         key_base,
         value_base,
+        decay_base,
         chunk_lo * BT,
         length,
         copy_rows,
@@ -937,7 +643,7 @@ def _state_walk_kernel(
             Qg,
             U,
             Aqk,
-            Bg,
+            Decay,
             w_buffers,
             kg_buffers,
             q_buffers,
@@ -947,6 +653,7 @@ def _state_walk_kernel(
             1 - slot,
             key_base,
             value_base,
+            decay_base,
             token0 + BT,
             length,
             copy_rows,
@@ -1018,6 +725,15 @@ def _state_walk_kernel(
 
 
 @triton.jit
+def _state_base(StateIndices, state_stride, sequence, head, H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                PAGED: tl.constexpr):
+    """Offset of a sequence's [V, K] state for one head: its pool slot when PAGED."""
+    if PAGED:
+        return tl.load(StateIndices + sequence).to(tl.int64) * state_stride + head * (V * K)
+    return (sequence * H + head).to(tl.int64) * (V * K)
+
+
+@triton.jit
 def _group_scan_kernel(
     GroupIn,
     GroupB,
@@ -1044,146 +760,58 @@ def _group_scan_kernel(
         tl.store(GroupIn + (plane + planes) * (V * K) + state_offsets, state)
 
 
-@triton.jit
-def _output_tail_kernel(
-    Aqk,
-    VNew,
-    Output,
-    CuSeqLens,
-    ChunkIndices,
-    H: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-):
-    chunk = tl.program_id(0)
-    head = tl.program_id(1)
-    value_block = tl.program_id(2)
-    sequence = tl.load(ChunkIndices + chunk * 2).to(tl.int32)
-    local_chunk = tl.load(ChunkIndices + chunk * 2 + 1).to(tl.int32)
-    begin = tl.load(CuSeqLens + sequence).to(tl.int32)
-    end = tl.load(CuSeqLens + sequence + 1).to(tl.int32)
-    length = end - begin
-    token0 = local_chunk * BT
-
-    rows = tl.arange(0, BT)
-    cols = tl.arange(0, BT)
-    a_offsets = ((begin + token0 + rows[:, None]) * H + head) * BT + cols[None, :]
-    row_mask = token0 + rows < length
-    a_buffer = tlx.local_alloc((BT, BT), Aqk.dtype.element_ty, 1)
-    token = tlx.async_load(
-        Aqk + a_offsets,
-        tlx.local_view(a_buffer, 0),
-        mask=row_mask[:, None],
-    )
-    tlx.async_load_commit_group([token])
-
-    value_cols = value_block * BV + tl.arange(0, BV)
-    value_offsets = (((begin + token0 + cols[:, None]) * H + head) * V + value_cols[None, :])
-    value_mask = row_mask[:, None] & (value_cols[None, :] < V)
-    vnew = tl.load(VNew + value_offsets, mask=value_mask, other=0.0)
-    wait_token = tlx.async_load_wait_group(0)
-    causal = tlx.local_load(tlx.local_view(a_buffer, 0), token=wait_token)
-    intra = tl.dot(causal, vnew)
-    output_offsets = (((begin + token0 + rows[:, None]) * H + head) * V + value_cols[None, :])
-    old = tl.load(Output + output_offsets, mask=value_mask, other=0.0).to(tl.float32)
-    tl.store(
-        Output + output_offsets,
-        (old + intra).to(Output.dtype.element_ty),
-        mask=value_mask,
-    )
-
-
-def _scan_groups(num_sequences: int, heads: int, num_chunks: int, device: torch.device) -> int:
-    """Time groups per sequence, so a few long sequences still fill the GPU."""
+def _scan_groups(num_sequences: int, heads: int, num_chunks: int) -> int:
+    """Chunk groups per sequence, so short batches of long sequences fill the GPU."""
     chunks_per_sequence = num_chunks // max(num_sequences, 1)
-    groups = min(3 * _num_cus(device) // (4 * num_sequences * heads), chunks_per_sequence // 4, 32)
-    return groups if chunks_per_sequence >= 48 and groups >= 2 else 1
+    planes = num_sequences * heads
+    groups = min(3 * _num_cus(torch.cuda.current_device()) // (4 * planes), chunks_per_sequence // 4, 32)
+    return groups if chunks_per_sequence >= 24 and groups >= 4 else 1
 
 
 @functools.cache
-def _num_cus(device: torch.device) -> int:
+def _num_cus(device: int) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def _launch_state_scan(w, u, gated_key, gated_query, cumulative_gate, aqk, initial_state, output, final_state,
-                       cu_seqlens, chunk_indices, num_sequences, heads, num_chunks, key_dim, value_dim):
-    """Carry the state across chunks, writing the output and the final state.
+def _launch_state_scan(t, num_sequences, heads, num_chunks, key_dim, value_dim):
+    """Walk the chunk recurrence into t["output"] and t["final_state"].
 
-    The walk splits long sequences into time groups when there are too few
-    sequences to fill the GPU; the single-pass scan plus output tail covers the
-    shapes where the walk does not pay off.
+    Splits sequences in time when too few would idle the GPU.
     """
+    initial_state = t["initial_state"]
     planes = num_sequences * heads
-    groups = _scan_groups(num_sequences, heads, num_chunks, initial_state.device)
-    # Without padded LDS images (uTLX on ROCm Triton 3.8) the walk's operand reads
-    # bank-conflict, so it only pays off when the time split adds a lot of
-    # parallelism.
-    if hasattr(tlx, "padded_shared_layout_encoding"):
-        use_walk = groups > 1 or planes >= 96
-    else:
-        use_walk = groups >= 16
-    common = dict(H=heads, K=key_dim, V=value_dim, BT=CHUNK_SIZE, num_stages=2)
+    groups = _scan_groups(num_sequences, heads, num_chunks)
+    common = dict(H=heads, K=key_dim, V=value_dim, BT=CHUNK_SIZE, num_stages=2, waves_per_eu=1)
 
-    if not use_walk:
-        block_value = 32 if heads >= 12 and num_sequences >= 4 else 16
-        v_new = torch.empty_like(u)
-        _state_scan_kernel[(value_dim // block_value, planes)](
-            w,
-            u,
-            gated_key,
-            gated_query,
-            cumulative_gate,
-            initial_state,
-            v_new,
-            output,
-            final_state,
-            cu_seqlens,
-            BV=block_value,
-            num_warps=4,
-            waves_per_eu=1 if heads >= 12 and num_sequences >= 8 else 2,
-            **common,
-        )
-        _output_tail_kernel[(num_chunks, heads, 2)](
-            aqk,
-            v_new,
-            output,
-            cu_seqlens,
-            chunk_indices,
-            H=heads,
-            V=value_dim,
-            BT=CHUNK_SIZE,
-            BV=64,
-            num_warps=4,
-            num_stages=2,
-            waves_per_eu=4,
-        )
-        return
+    paged = t.get("state_indices") is not None
+    state_args = [t["state_indices"] if paged else t["cu_seqlens"], t["initial_state"].stride(0)]
+    walk_args = [
+        t[n] for n in ("w", "u", "gated_key", "gated_query", "decay", "aqk", "initial_state", "output", "final_state",
+                       "cu_seqlens")
+    ] + state_args
 
-    walk_args = (w, u, gated_key, gated_query, cumulative_gate, aqk, initial_state, output, final_state, cu_seqlens)
-
-    def walk(pass_id, num_warps, grid_groups, group_buffers):
+    def scan(pass_id, block, warps, grid_groups, buffers):
         rows = value_dim + key_dim if pass_id == 1 else value_dim
-        _state_walk_kernel[(1, planes, grid_groups)](
-            *walk_args,
-            *group_buffers,
-            BV=rows,
-            NW=num_warps,
-            PASS=pass_id,
-            num_warps=num_warps,
-            waves_per_eu=1,
-            **common,
-        )
+        grid = (rows // block, planes, grid_groups)
+        _state_walk_kernel[grid](*walk_args, *buffers, BV=block, NW=warps, PASS=pass_id, PAGED=paged, num_warps=warps,
+                                 **common)
 
     if groups == 1:
-        # Pass 0 never touches the group buffers.
-        walk(0, 8, 1, (initial_state, initial_state, initial_state, 1))
+        # An unsplit walk takes the narrowest value slice that still keeps
+        # every program on its own CU, with a warp per 16 value rows.
+        block_value = value_dim
+        for width in (32, 64):
+            if planes * (value_dim // width) <= _num_cus(torch.cuda.current_device()):
+                block_value = width
+                break
+        unused_group_buffers = (initial_state, initial_state, initial_state, 1)
+        scan(0, block_value, max(block_value // 16, 2), 1, unused_group_buffers)
         return
     group_in = torch.empty((groups, planes, value_dim, key_dim), dtype=torch.float32, device=initial_state.device)
     group_b = torch.empty_like(group_in)
     group_m = torch.empty((groups, planes, key_dim, key_dim), dtype=torch.bfloat16, device=initial_state.device)
-    group_buffers = (group_in, group_b, group_m, groups)
-    walk(1, 4, groups - 1, group_buffers)
+    buffers = (group_in, group_b, group_m, groups)
+    scan(1, value_dim + key_dim, 4, groups - 1, buffers)
     if groups > 2:
         _group_scan_kernel[(value_dim // 16, planes)](
             group_in,
@@ -1195,7 +823,7 @@ def _launch_state_scan(w, u, gated_key, gated_query, cumulative_gate, aqk, initi
             BV=16,
             num_warps=4,
         )
-    walk(2, 8, groups, group_buffers)
+    scan(2, value_dim, 8, groups, buffers)
 
 
 def _validate_prefill_inputs(
@@ -1206,6 +834,8 @@ def _validate_prefill_inputs(
     beta: torch.Tensor,
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    raw: bool = False,
+    state_indices: torch.Tensor | None = None,
 ) -> tuple[int, int, int, int]:
     tensors = (q, k, v, g, beta, initial_state)
     if not all(tensor.is_cuda for tensor in tensors):
@@ -1214,12 +844,17 @@ def _validate_prefill_inputs(
         raise ValueError("KDA data tensors must be on the same GPU")
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("q must be a packed [1, T, H, K] tensor")
-    if q.shape != k.shape or q.shape != g.shape:
+    if raw:
+        if q.shape != k.shape or g.numel() != q.numel():
+            raise ValueError("q and k must have identical shapes and g as many elements")
+        if beta.numel() != q[..., 0].numel():
+            raise ValueError("beta must have T * H elements")
+    elif q.shape != k.shape or q.shape != g.shape:
         raise ValueError("q, k, and g must have identical shapes")
+    elif beta.shape != q.shape[:-1]:
+        raise ValueError("beta must have shape [1, T, H]")
     if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
         raise ValueError("v must match q through the head dimension")
-    if beta.shape != q.shape[:-1]:
-        raise ValueError("beta must have shape [1, T, H]")
     _, total_tokens, heads, key_dim = q.shape
     value_dim = v.shape[-1]
     if (key_dim, value_dim) != (_KEY_DIM, _VALUE_DIM):
@@ -1234,7 +869,12 @@ def _validate_prefill_inputs(
         raise ValueError("initial_state must have V-major shape [N, H, V, K]")
     if initial_state.stride()[-2:] != (key_dim, 1):
         raise ValueError("initial_state inner [V, K] dimensions must be contiguous")
-    if cu_seqlens.ndim != 1 or cu_seqlens.numel() != initial_state.shape[0] + 1:
+    if state_indices is not None:
+        if initial_state.stride(1) != value_dim * key_dim:
+            raise ValueError("state_pool must be dense within each [H, V, K] slot")
+        if state_indices.ndim != 1 or cu_seqlens.ndim != 1 or cu_seqlens.numel() != state_indices.numel() + 1:
+            raise ValueError("cu_seqlens and state_indices must describe the same batch")
+    elif cu_seqlens.ndim != 1 or cu_seqlens.numel() != initial_state.shape[0] + 1:
         raise ValueError("cu_seqlens and initial_state must describe the same batch")
     return total_tokens, heads, key_dim, value_dim
 
@@ -1247,10 +887,39 @@ def kda_paged_prefill(
     beta: torch.Tensor,
     *,
     scale: float = 1.0,
-    initial_state: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    beta_is_raw: bool = False,
+    state_pool: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run prepared-input KDA prefill and return output plus final state."""
+    """Run KDA prefill and return output plus final state.
+
+    By default the inputs are prepared: l2-normalized q/k, the per-channel log
+    decay g and an activated beta. Passing ``A_log`` and ``dt_bias`` takes raw
+    inputs instead, as ``prepare_kda_inputs`` does: q/k are normalized in the
+    kernel and g is the gate pre-activation, mapped to
+    ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``, or to
+    ``-exp(A_log) * softplus(g + dt_bias)`` without a lower bound. Either way
+    ``beta_is_raw`` applies the sigmoid to beta. q, k, v and g may be strided
+    over tokens (split views of a packed qkv); each head vector must be dense.
+
+    The state is either a dense ``initial_state`` [N, H, V, K], with the final
+    state returned as a new tensor, or a ``state_pool`` [slots, H, V, K] with
+    ``state_indices`` [N] naming each sequence's slot. A pool is updated in
+    place and returned as the final state.
+    """
+    raw = A_log is not None
+    if raw and dt_bias is None:
+        raise ValueError("raw inputs need both A_log and dt_bias")
+    paged = state_pool is not None
+    if paged == (initial_state is not None) or paged != (state_indices is not None):
+        raise ValueError("pass either initial_state, or state_pool with state_indices")
+    if paged:
+        initial_state = state_pool
     total_tokens, heads, key_dim, value_dim = _validate_prefill_inputs(
         q,
         k,
@@ -1259,114 +928,29 @@ def kda_paged_prefill(
         beta,
         initial_state,
         cu_seqlens,
+        raw,
+        state_indices,
     )
-    q = q[0].contiguous()
-    k = k[0].contiguous()
-    v = v[0].contiguous()
-    g = g[0].contiguous()
-    beta = beta[0].to(dtype=torch.float32).contiguous()
-    initial_state = initial_state.contiguous()
+    q, k, v, g = (_token_rows(x, total_tokens, heads) for x in (q, k, v, g))
+    beta = _token_rows(beta, total_tokens, heads)
+    if not paged:
+        initial_state = initial_state.contiguous()
     cu_seqlens, chunk_indices = _prepare_prefill_metadata(cu_seqlens, q.device, total_tokens)
     num_chunks = chunk_indices.shape[0]
     num_sequences = cu_seqlens.numel() - 1
     if num_chunks == 0:
-        return torch.empty_like(v).unsqueeze(0), initial_state.clone()
+        output = torch.empty((total_tokens, heads, value_dim), dtype=v.dtype, device=v.device)
+        return output.unsqueeze(0), state_pool if paged else initial_state.clone()
 
-    cumulative_gate = torch.empty_like(g, dtype=torch.float32)
-    gated_query = torch.empty_like(q)
-    akk = torch.empty(
-        (total_tokens, heads, CHUNK_SIZE),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    aqk = torch.zeros(
-        (total_tokens, heads, CHUNK_SIZE),
-        dtype=torch.bfloat16,
-        device=q.device,
-    )
-
-    _preprocess_chunk_kernel[(num_chunks, heads)](
-        q,
-        k,
-        g,
-        beta,
-        cumulative_gate,
-        gated_query,
-        akk,
-        aqk,
-        cu_seqlens,
-        chunk_indices,
-        SCALE=scale,
-        H=heads,
-        D=key_dim,
-        BT=CHUNK_SIZE,
-        BC=SUBCHUNK_SIZE,
-        num_warps=4,
-    )
-
-    diagonal_inverse = torch.empty(
-        (total_tokens, heads, SUBCHUNK_SIZE),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    _solve_16x16_kernel[(num_chunks * 4, heads)](
-        akk,
-        diagonal_inverse,
-        cu_seqlens,
-        chunk_indices,
-        H=heads,
-        BT=CHUNK_SIZE,
-        BC=SUBCHUNK_SIZE,
-        num_warps=1,
-    )
-    inverse = torch.zeros_like(aqk)
-    _merge_inverse_64_kernel[(num_chunks, heads)](
-        akk,
-        diagonal_inverse,
-        inverse,
-        cu_seqlens,
-        chunk_indices,
-        H=heads,
-        BT=CHUNK_SIZE,
-        BC=SUBCHUNK_SIZE,
-        num_warps=4,
-    )
-
-    u = torch.empty_like(v)
-    w = torch.empty_like(k)
-    gated_key = torch.empty_like(k)
-    _form_w_u_kernel[(num_chunks, heads, 2)](
-        inverse,
-        k,
-        v,
-        cumulative_gate,
-        beta,
-        u,
-        w,
-        gated_key,
-        cu_seqlens,
-        chunk_indices,
-        H=heads,
-        D=key_dim,
-        BT=CHUNK_SIZE,
-        BO=64,
-        num_warps=4,
-    )
-
-    output = torch.empty_like(v)
-    final_state = torch.empty_like(initial_state)
+    activation = None
+    if raw:
+        activation = dict(A_log=A_log.reshape(-1).float(), dt_bias=dt_bias.reshape(-1).float(), lower_bound=lower_bound)
+    chunks = _prepare_chunks(q, k, v, g, beta, scale, cu_seqlens, chunk_indices, num_sequences, activation, beta_is_raw)
+    output = torch.empty((total_tokens, heads, value_dim), dtype=v.dtype, device=v.device)
+    final_state = state_pool if paged else torch.empty_like(initial_state)
     _launch_state_scan(
-        w,
-        u,
-        gated_key,
-        gated_query,
-        cumulative_gate,
-        aqk,
-        initial_state,
-        output,
-        final_state,
-        cu_seqlens,
-        chunk_indices,
+        dict(**chunks, initial_state=initial_state, output=output, final_state=final_state, cu_seqlens=cu_seqlens,
+             state_indices=state_indices.contiguous() if paged else None),
         num_sequences,
         heads,
         num_chunks,
@@ -1374,6 +958,68 @@ def kda_paged_prefill(
         value_dim,
     )
     return output.unsqueeze(0), final_state
+
+
+def _token_rows(x, total_tokens, heads):
+    """A [T, H, D] (or [T, H]) view of x that keeps its token stride; copies only if a head is not dense."""
+    rows = x.reshape(total_tokens, heads, -1)
+    if rows.stride(2) != 1 or rows.stride(1) != rows.shape[2]:
+        rows = rows.contiguous()
+    return rows if x.numel() != total_tokens * heads else rows[..., 0]
+
+
+def _decay_table(total_tokens, num_sequences, heads, key_dim, device):
+    return torch.empty((total_tokens // CHUNK_SIZE + 2 * num_sequences + 1, heads, key_dim), dtype=torch.float32,
+                       device=device)
+
+
+def _prepare_chunks(q, k, v, g, beta, scale, cu_seqlens, chunk_indices, num_sequences, activation=None,
+                    beta_is_raw=False):
+    total_tokens, heads, key_dim = q.shape
+    dense = dict(dtype=q.dtype, device=q.device)
+    chunks = dict(
+        gated_query=torch.empty((total_tokens, heads, key_dim), **dense),
+        w=torch.empty((total_tokens, heads, key_dim), **dense),
+        u=torch.empty((total_tokens, heads, v.shape[2]), **dense),
+        gated_key=torch.empty((total_tokens, heads, key_dim), **dense),
+        aqk=torch.empty((total_tokens, heads, CHUNK_SIZE), dtype=torch.bfloat16, device=q.device),
+        decay=_decay_table(total_tokens, num_sequences, heads, key_dim, q.device),
+    )
+    _prepare_chunk_kernel[(chunk_indices.shape[0], heads)](
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunks["gated_query"],
+        chunks["w"],
+        chunks["u"],
+        chunks["gated_key"],
+        chunks["aqk"],
+        chunks["decay"],
+        cu_seqlens,
+        chunk_indices,
+        activation["A_log"] if activation else beta,
+        activation["dt_bias"] if activation else beta,
+        (activation or {}).get("lower_bound") or 0.0,
+        SCALE=scale,
+        H=heads,
+        D=key_dim,
+        BT=CHUNK_SIZE,
+        BC=SUBCHUNK_SIZE,
+        NW=4,
+        STRIDE_Q=q.stride(0),
+        STRIDE_K=k.stride(0),
+        STRIDE_V=v.stride(0),
+        STRIDE_G=g.stride(0),
+        STRIDE_BETA=beta.stride(0),
+        RAW=activation is not None,
+        USE_LOWER_BOUND=activation is not None and activation["lower_bound"] is not None,
+        SIGMOID_BETA=beta_is_raw,
+        num_warps=4,
+        waves_per_eu=2,
+    )
+    return chunks
 
 
 __all__ = [
