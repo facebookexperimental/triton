@@ -130,13 +130,18 @@ def _row_padded(rows, cols, pad, bands=0):
 
 
 @triton.jit
-def _shift_bands(x, s: tl.constexpr, layout: tl.constexpr):
-    """x with band b - s moved to band b, in ``layout``.
+def _shift_bands(diagonal, s: tl.constexpr, NB: tl.constexpr, BC: tl.constexpr, layout: tl.constexpr):
+    """The [NB, BC, BC] blocks in LDS ``diagonal`` with band b - s moved to band b, in ``layout``.
 
-    Bands below s get band 0; every caller multiplies them by a zero block.
+    Read a band at a time, as subslices must be aligned to their size. Bands
+    below s are zero.
     """
-    band = _along(x.shape[0], 0) + tl.zeros(x.shape, tl.int32)
-    return tl.gather(x, tlx.require_layout(tl.maximum(band - s, 0), layout), 0)
+    band = tlx.require_layout(tl.arange(0, NB), tlx.slice_layout(tlx.slice_layout(layout, 2), 1))[:, None, None]
+    shifted = tlx.zeros((NB, BC, BC), tl.float32, layout=layout)
+    for b in tl.static_range(s, NB):
+        part = tlx.local_load(tlx.local_slice(diagonal, [b - s, 0, 0], [1, BC, BC]), layout=layout)
+        shifted = tl.where(band == b, part, shifted)
+    return shifted
 
 
 @triton.jit
@@ -179,7 +184,7 @@ def _prepare_chunk_kernel(
     never leaves registers: block (b, J) of all bands comes from one batched
     MFMA per column band J, each band's diagonal block is inverted by repeated
     squaring, and the off-diagonal inverse blocks are built a diagonal at a
-    time from band-shifted copies (cross-warp gathers).
+    time from band-shifted copies read back from LDS.
     """
     NB: tl.constexpr = BT // BC
     LOG2E: tl.constexpr = 1.4426950408889634
@@ -279,7 +284,7 @@ def _prepare_chunk_kernel(
     tlx.local_store(tlx.local_view(value_rhs, 0), tl.reshape((v.to(tl.float32) * beta).to(tl.bfloat16), [BT, D]))
 
     # Rows decayed to their band's pivot (lhs) and columns lifted from it; a
-    # bridge exp(pivot_b - pivot_J) then moves column band J to row band b.
+    # bridge exp(pivot_b - pivot_J) on row band b's rows meets column band J.
     q = q.to(tl.float32)
     if RAW:
         q = (q * tl.math.rsqrt(tl.sum(q * q, axis=2) + 1e-6)[:, :, None]).to(tl.bfloat16).to(tl.float32)
@@ -299,12 +304,13 @@ def _prepare_chunk_kernel(
     band_pivot = tlx.release_layout(pivot)
     # bridges[J, b] = exp(pivot_b - pivot_J), clamped where b < J and the block is masked anyway.
     bridges = tlx.local_alloc((NB * NB, D), tl.float32, 1)
-    pivot_band = tl.arange(0, NB)[:, None]
+    pivots = tlx.local_view(tlx.local_alloc((NB, D), tl.float32, 1), 0)
+    tlx.local_store(pivots, band_pivot)
+    tl.debug_barrier()
     for J in tl.static_range(NB):
-        pivot_J = tl.sum(tl.where(pivot_band == J, band_pivot, 0.0), axis=0)
+        pivot_J = tlx.local_load(tlx.local_slice(pivots, [J, 0], [1, D]))
         tlx.local_store(tlx.local_slice(tlx.local_view(bridges, 0), [J * NB, 0], [NB, D]),
-                        _exp2(tl.minimum(band_pivot - pivot_J[None, :], 0.0)))
-    bridged = tlx.local_view(tlx.local_alloc((NB, BC, D), tl.bfloat16, 1, layout=_row_padded(NB * BC, D, 8, NB)), 0)
+                        _exp2(tl.minimum(band_pivot - pivot_J, 0.0)))
     tl.debug_barrier()
 
     # Block products live in the MFMA result layout, not the tiles'.
@@ -320,15 +326,15 @@ def _prepare_chunk_kernel(
     n2 = tl.zeros((NB, BC, BC), tl.float32)
     n3 = tl.zeros((NB, BC, BC), tl.float32)
     for J in tl.static_range(NB):
-        column_band = tlx.local_load(tlx.local_slice(tlx.local_view(lifted, 0), [J, 0, 0], [1, BC, D]), layout=mf)
         bridge = tlx.local_load(tlx.local_slice(tlx.local_view(bridges, 0), [J * NB, 0], [NB, D]),
-                                layout=tlx.slice_layout(mf, 1))[:, None, :]
-        column_band = tlx.require_layout(tl.broadcast_to(column_band, (NB, BC, D)), mf)
-        tlx.local_store(bridged, (column_band.to(tl.float32) * bridge).to(tl.bfloat16))
-        tl.debug_barrier()
-        rhs = tlx.require_layout(tlx.local_load(tlx.local_trans(bridged, (0, 2, 1)), layout=b3), b3)
-        akk = tl.dot(k_lhs, rhs, acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mb))
-        aqk = tl.dot(q_lhs, rhs, acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mb))
+                                layout=tlx.slice_layout(a3, 1))[:, None, :]
+        column_band = tlx.local_load(
+            tlx.local_trans(tlx.local_slice(tlx.local_view(lifted, 0), [J, 0, 0], [1, BC, D]), (0, 2, 1)), layout=b3)
+        rhs = tlx.require_layout(tl.broadcast_to(column_band, (NB, D, BC)), b3)
+        k_bridged = tlx.require_layout((k_lhs.to(tl.float32) * bridge).to(tl.bfloat16), a3)
+        q_bridged = tlx.require_layout((q_lhs.to(tl.float32) * bridge).to(tl.bfloat16), a3)
+        akk = tl.dot(k_bridged, rhs, acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mb))
+        aqk = tl.dot(q_bridged, rhs, acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mb))
         column = J * BC + block_cols
         tlx.buffer_store(
             tl.where(block_rows >= column, aqk, 0.0).to(Aqk.dtype.element_ty), aqk_base + J * BC, aqk_offsets,
@@ -357,17 +363,26 @@ def _prepare_chunk_kernel(
     n1 = tlx.require_layout(n1, af)
     n2 = tlx.require_layout(n2, af)
     n3 = tlx.require_layout(n3, af)
-    acc = tl.dot(n1, _shift_bands(x0, 1, bf), acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mf),
+    diagonal0 = tlx.local_view(tlx.local_alloc((NB, BC, BC), tl.float32, 1), 0)
+    diagonal1 = tlx.local_view(tlx.local_alloc((NB, BC, BC), tl.float32, 1), 0)
+    diagonal2 = tlx.local_view(tlx.local_alloc((NB, BC, BC), tl.float32, 1), 0)
+    tlx.local_store(diagonal0, x0)
+    tl.debug_barrier()
+    acc = tl.dot(n1, _shift_bands(diagonal0, 1, NB, BC, bf), acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mf),
                  input_precision="ieee")
     x1 = _mm_f32(x0, tlx.require_layout(acc, mf), mf, af, bf)
-    acc = tl.dot(n1, _shift_bands(x1, 1, bf), acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mf),
+    tlx.local_store(diagonal1, x1)
+    tl.debug_barrier()
+    acc = tl.dot(n1, _shift_bands(diagonal1, 1, NB, BC, bf), acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mf),
                  input_precision="ieee")
-    acc = tl.dot(n2, _shift_bands(x0, 2, bf), acc=acc, input_precision="ieee")
+    acc = tl.dot(n2, _shift_bands(diagonal0, 2, NB, BC, bf), acc=acc, input_precision="ieee")
     x2 = _mm_f32(x0, tlx.require_layout(acc, mf), mf, af, bf)
-    acc = tl.dot(n1, _shift_bands(x2, 1, bf), acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mf),
+    tlx.local_store(diagonal2, x2)
+    tl.debug_barrier()
+    acc = tl.dot(n1, _shift_bands(diagonal2, 1, NB, BC, bf), acc=tlx.zeros((NB, BC, BC), tl.float32, layout=mf),
                  input_precision="ieee")
-    acc = tl.dot(n2, _shift_bands(x1, 2, bf), acc=acc, input_precision="ieee")
-    acc = tl.dot(n3, _shift_bands(x0, 3, bf), acc=acc, input_precision="ieee")
+    acc = tl.dot(n2, _shift_bands(diagonal1, 2, NB, BC, bf), acc=acc, input_precision="ieee")
+    acc = tl.dot(n3, _shift_bands(diagonal0, 3, NB, BC, bf), acc=acc, input_precision="ieee")
     x3 = _mm_f32(x0, tlx.require_layout(acc, mf), mf, af, bf)
     # A^-1 by column band: band b of column band J is diagonal b - J. Then W
     # and U are plain [BT, BT] x [BT, D] products.
@@ -760,12 +775,20 @@ def _group_scan_kernel(
         tl.store(GroupIn + (plane + planes) * (V * K) + state_offsets, state)
 
 
-def _scan_groups(num_sequences: int, heads: int, num_chunks: int) -> int:
-    """Chunk groups per sequence, so short batches of long sequences fill the GPU."""
+def _scan_groups(num_sequences: int, heads: int, num_chunks: int, block_value: int, value_dim: int) -> int:
+    """Chunk groups per sequence, so short batches of long sequences fill the GPU.
+
+    The groups' pass-2 programs, ``block_value`` value rows each, fill one wave of CUs.
+    """
     chunks_per_sequence = num_chunks // max(num_sequences, 1)
-    planes = num_sequences * heads
-    groups = min(3 * _num_cus(torch.cuda.current_device()) // (4 * planes), chunks_per_sequence // 4, 32)
-    return groups if chunks_per_sequence >= 24 and groups >= 4 else 1
+    planes = num_sequences * heads * (value_dim // block_value)
+    cus = _num_cus(torch.cuda.current_device())
+    groups = min(cus // planes, chunks_per_sequence // 4, 32)
+    # Short sequences whose unsplit walk already fills the GPU skip the split.
+    unsplit_fills = num_sequences * heads * (value_dim // 32) >= 3 * cus // 4
+    if chunks_per_sequence < 24 or groups < 4 or (unsplit_fills and chunks_per_sequence < 48):
+        return 1
+    return groups
 
 
 @functools.cache
@@ -780,7 +803,12 @@ def _launch_state_scan(t, num_sequences, heads, num_chunks, key_dim, value_dim):
     """
     initial_state = t["initial_state"]
     planes = num_sequences * heads
-    groups = _scan_groups(num_sequences, heads, num_chunks)
+    cus = _num_cus(torch.cuda.current_device())
+    # When the split runs out of chunks before CUs, pass 2 takes half-width
+    # value slices, which walk a chunk faster.
+    chunk_limited = num_chunks // max(num_sequences, 1) // 4 < cus // planes
+    block_value2 = value_dim // 2 if chunk_limited else value_dim
+    groups = _scan_groups(num_sequences, heads, num_chunks, block_value2, value_dim)
     common = dict(H=heads, K=key_dim, V=value_dim, BT=CHUNK_SIZE, num_stages=2, waves_per_eu=1)
 
     paged = t.get("state_indices") is not None
@@ -801,7 +829,7 @@ def _launch_state_scan(t, num_sequences, heads, num_chunks, key_dim, value_dim):
         # every program on its own CU, with a warp per 16 value rows.
         block_value = value_dim
         for width in (32, 64):
-            if planes * (value_dim // width) <= _num_cus(torch.cuda.current_device()):
+            if planes * (value_dim // width) <= cus:
                 block_value = width
                 break
         unused_group_buffers = (initial_state, initial_state, initial_state, 1)
@@ -811,7 +839,11 @@ def _launch_state_scan(t, num_sequences, heads, num_chunks, key_dim, value_dim):
     group_b = torch.empty_like(group_in)
     group_m = torch.empty((groups, planes, key_dim, key_dim), dtype=torch.bfloat16, device=initial_state.device)
     buffers = (group_in, group_b, group_m, groups)
-    scan(1, value_dim + key_dim, 4, groups - 1, buffers)
+    # Pass 1 halves its row block while that still fits on the CUs.
+    block_value1 = value_dim + key_dim
+    if 2 * planes * (groups - 1) <= cus:
+        block_value1 //= 2
+    scan(1, block_value1, 4, groups - 1, buffers)
     if groups > 2:
         _group_scan_kernel[(value_dim // 16, planes)](
             group_in,
@@ -823,7 +855,7 @@ def _launch_state_scan(t, num_sequences, heads, num_chunks, key_dim, value_dim):
             BV=16,
             num_warps=4,
         )
-    scan(2, value_dim, 8, groups, buffers)
+    scan(2, block_value2, 8 if block_value2 == value_dim else 4, groups, buffers)
 
 
 def _validate_prefill_inputs(
