@@ -20,6 +20,7 @@ struct ConcatOpConversion : public ConvertOpToLLVMPattern<amdgpu::ConcatOp> {
   matchAndRewrite(amdgpu::ConcatOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
     RankedTensorType resultType =
         cast<RankedTensorType>(op.getResult().getType());
 
@@ -29,6 +30,7 @@ struct ConcatOpConversion : public ConvertOpToLLVMPattern<amdgpu::ConcatOp> {
     RankedTensorType srcType = cast<RankedTensorType>(srcVal.getType());
     ArrayRef<int64_t> srcShape = srcType.getShape();
 
+    auto kReg = str_attr("register");
     auto linearLayoutSrc = triton::gpu::toLinearLayout(srcType);
     auto outDimNames = llvm::to_vector(linearLayoutSrc.getOutDimNames());
     // Call transposeOuts, to ensure that order of input and output tensor
@@ -50,7 +52,8 @@ struct ConcatOpConversion : public ConvertOpToLLVMPattern<amdgpu::ConcatOp> {
 
     for (size_t i = 0; i < sources.size(); i++) {
       Value currSrc = sources[i];
-      unpackedSources.push_back(unpackLLElements(loc, currSrc, rewriter));
+      unpackedSources.push_back(unpackTensorElements(
+          loc, currSrc, rewriter, op.getSources()[i].getType()));
     }
 
     // Algorithm:
@@ -60,8 +63,6 @@ struct ConcatOpConversion : public ConvertOpToLLVMPattern<amdgpu::ConcatOp> {
     // 4.   subtract dst coordinates and start coordinates of the tile
     // 5.   find source register number which holds dst value
     // 6.   copy dst element from computed tile and register
-    auto ctx = rewriter.getContext();
-    StringAttr kReg = StringAttr::get(ctx, "register");
     auto dstRegBases = linearLayoutDst.getBases().lookup(kReg);
 
     // for every output register get element coords,
@@ -100,8 +101,8 @@ struct ConcatOpConversion : public ConvertOpToLLVMPattern<amdgpu::ConcatOp> {
       resultVals.push_back(unpackedSources[linearOperandIdx][srcReg.value()]);
     }
 
-    Value packedResult = packLLElements(loc, this->getTypeConverter(),
-                                        resultVals, rewriter, resultType);
+    Value packedResult = packTensorElements(loc, this->getTypeConverter(),
+                                            resultVals, rewriter, resultType);
 
     rewriter.replaceOp(op, packedResult);
     return success();

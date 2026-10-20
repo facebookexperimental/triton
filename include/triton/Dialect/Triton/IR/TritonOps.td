@@ -441,6 +441,9 @@ def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType]> {
   let hasCanonicalizeMethod = 1;
   let hasFolder = 1;
   let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    std::optional<unsigned> getExpandDimsAxis();
+  }];
 }
 
 def TT_BroadcastOp : TT_Op<"broadcast", [Pure, SameOperandsAndResultElementType,
@@ -497,7 +500,7 @@ def TT_JoinOp : TT_Op<"join", [Pure, SameTypeOperands]> {
   let hasVerifier = 1;
 }
 
-def TT_SplitOp : TT_Op<"split", [Pure, InferTensorTypeOpWithLayoutEquivalence,
+def TT_SplitOp : TT_Op<"split", [Pure, InferTypeOpAdaptorWithIsCompatible,
                                  TypesMatchWith<"outLHS and outRHS types match",
                                                 "outLHS", "outRHS", "$_self">,
 ]> {
