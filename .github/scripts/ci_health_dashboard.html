@@ -39,6 +39,7 @@ details{margin-top:6px}summary{cursor:pointer;color:var(--text-secondary);font-s
 .cell{width:46px;height:24px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;cursor:default}
 .c-pass{background:rgba(12,163,12,.14);color:var(--good)}.c-known{background:rgba(237,161,0,.20);color:var(--warning)}
 .c-new{background:var(--critical);color:#fff}.c-setup{background:rgba(236,131,90,.22);color:var(--serious)}.c-na{background:var(--wash);color:var(--text-muted)}.c-blocked{background:var(--wash);color:var(--warning)}
+.branchbar{display:flex;gap:10px;align-items:center;margin-top:14px}.branchbar .seg{margin-left:0}
 .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-left:auto}
 .seg button{background:var(--surface-1);border:0;border-right:1px solid var(--border);padding:4px 12px;font:inherit;font-size:12.5px;color:var(--text-secondary);cursor:pointer}
 .seg button:last-child{border-right:0}.seg button[aria-pressed="true"]{background:var(--wash);color:var(--text-primary);font-weight:650}
@@ -58,8 +59,9 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <header><div><h1>CI health: facebookexperimental/triton</h1>
 <p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every 3 h</p></div>
 <button class="theme" id="themeBtn" type="button">Toggle theme</button></header>
+<div class="branchbar"><span class="muted">Branch</span><span class="seg" id="branch-sel"></span></div>
 <nav class="tabs" role="tablist">
-<button role="tab" data-tab="main" aria-selected="true">Main <span class="badge" id="b-main"></span></button>
+<button role="tab" data-tab="main" aria-selected="true">GPU tests <span class="badge" id="b-main"></span></button>
 <button role="tab" data-tab="sched" aria-selected="false">Nightly &amp; perf <span class="badge" id="b-sched"></span></button>
 <button role="tab" data-tab="pr" aria-selected="false">Pull requests <span class="badge na">author-owned</span></button>
 <button role="tab" data-tab="ops" aria-selected="false">Operations <span class="badge" id="b-ops"></span></button>
@@ -67,7 +69,7 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <p class="empty" id="nodata" hidden>No data collected yet.</p>
 
 <section id="main" role="tabpanel">
-<div class="shead"><h2>Main</h2><span class="q">Did a push to main break something new?</span><span class="owner">Owner: on-call / commit author</span></div>
+<div class="shead"><h2>GPU tests</h2><span class="q" id="m-q">Did a push to main break something new?</span><span class="owner">Owner: on-call / commit author</span></div>
 <div class="subsec"><h3>GPU Tests</h3><span class="muted">push runs of Meta Triton GPU Tests (<code>gpu-tests.yml</code>)</span></div>
 <div id="m-build"></div>
 <div class="card"><h3>By GPU: verdict and the last pushes, newest first (T+N h = pushed N hours before the data time)</h3><table class="strip" id="m-grid"></table>
@@ -173,9 +175,9 @@ function renderNightly(nt){
   if(r&&r.conclusion!=="success")badge("b-sched","✕ release","bad");else if(slower)badge("b-sched",`${slower} slower`,"bad");else badge("b-sched","✓","ok");
 }
 
-function renderPR(list){
+function renderPR(list,branch="main"){
   const R={tests:p=>`<span class="${p.whose==="main"?"warn":"bad"}">✕ ${p.n_failed} test${p.n_failed>1?"s":""}</span>`,setup:()=>`<span class="infra">⚠ setup</span>`,build:()=>`<span class="bad">✕ build</span>`,passed:()=>`<span class="ok">✓</span>`,running:()=>`<span class="na">running</span>`,cancelled:()=>`<span class="na">cancelled</span>`};
-  const W={author:`<span class="tag own">author</span>`,main:`<span class="tag main">fails on main</span>`,ci:`<span class="tag ci">setup: CI</span>`};
+  const W={author:`<span class="tag own">author</span>`,main:`<span class="tag main">fails on ${esc(branch)}</span>`,ci:`<span class="tag ci">setup: CI</span>`};
   $("p-list").innerHTML=table(["PR","Author","GPUs run","Result","Whose"],list.map(p=>[`${p.pr?pr(p.pr):esc(p.branch)} <a href="${esc(p.url)}">${esc(p.title.slice(0,70))}</a><br><span class="muted">${ago(p.t)}</span>`,who(p.author),p.gpus.length?p.gpus.join(" · "):`<span class="na">none</span>`,(R[p.result]||(()=>esc(p.result)))(p),`${W[p.whose]||""} ${esc(p.note)}`]));
 }
 
@@ -203,6 +205,16 @@ function renderOps(o){
   if(bad)badge("b-ops",`✕ trigger`,"bad");else if(t.setup_n)badge("b-ops",`⚠ ${pct(t.setup_rate)} setup`,"infra");else badge("b-ops","✓","ok");
 }
 
+// The page shows one tracked branch at a time, picked with the chips above the tabs.
+function renderBranches(d){
+  let cur="main";
+  const draw=()=>{
+    $("branch-sel").innerHTML=Object.keys(d.branches).map(b=>`<button type="button" data-b="${esc(b)}" aria-pressed="${b===cur}">${esc(b)}</button>`).join("");
+    for(const b of $("branch-sel").querySelectorAll("button"))b.onclick=()=>{cur=b.dataset.b;draw()};
+    $("m-q").textContent=`Did a push to ${cur} break something new?`;
+    const v=d.branches[cur];renderMain(v.main);renderNightly(v.nightly);renderPR(v.pr,cur);renderOps(v.ops)};
+  draw()}
+
 function show(id){if(!$(id)||!$(id).matches("section"))id="main";
   for(const b of document.querySelectorAll("nav.tabs button"))b.setAttribute("aria-selected",b.dataset.tab===id);
   for(const s of document.querySelectorAll("section[role=tabpanel]"))s.hidden=s.id!==id}
@@ -215,5 +227,5 @@ $("themeBtn").onclick=()=>{const r=document.documentElement;r.dataset.theme=(r.d
 fetch("data.json").then(r=>r.json()).then(d=>{
   if(!d.asof){$("nodata").hidden=false;$("asof").textContent="never";for(const s of document.querySelectorAll("section"))s.hidden=true;return}
   ASOF=new Date(d.asof);$("asof").textContent=d.asof.replace("T"," ").slice(0,16)+" UTC";
-  renderMain(d.main);renderNightly(d.nightly);renderPR(d.pr);renderOps(d.ops)});
+  renderBranches(d)});
 </script></body></html>

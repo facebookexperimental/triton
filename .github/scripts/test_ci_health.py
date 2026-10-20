@@ -190,7 +190,7 @@ def _store_one_push(tmp_path):
     (tmp_path / "state.json").write_text(json.dumps({"cursor": "x", "collected_at": "2026-10-12T02:00:00Z"}))
 
 
-def test_render_writes_four_sections(tmp_path):
+def test_render_writes_every_section(tmp_path):
     _store_one_push(tmp_path)
     (tmp_path / "bench").mkdir()
     out = tmp_path / "site"
@@ -198,7 +198,7 @@ def test_render_writes_four_sections(tmp_path):
     page = (out / "index.html").read_text()
     data = json.loads((out / "data.json").read_text())
     assert 'fetch("data.json"' in page and 'data-tab="ops"' in page
-    assert data["asof"] == "2026-10-12T02:00:00Z" and set(data) == {"asof", "main", "nightly", "pr", "ops"}
+    assert data["asof"] == "2026-10-12T02:00:00Z" and set(data) == {"asof", "branches"}
 
 
 def test_render_survives_bench_failure(tmp_path, monkeypatch):
@@ -210,7 +210,7 @@ def test_render_survives_bench_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(ch.bench, "load_summaries", boom)
     out = tmp_path / "site"
     ch.render(str(tmp_path), str(out))
-    assert json.loads((out / "data.json").read_text())["nightly"]["perf"] == []
+    assert json.loads((out / "data.json").read_text())["branches"]["main"]["nightly"]["perf"] == []
 
 
 def test_render_without_data_still_writes_a_page(tmp_path):

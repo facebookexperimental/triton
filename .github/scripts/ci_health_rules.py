@@ -22,6 +22,11 @@ GPU_WORKFLOWS = ("mi350.yml", "b200.yml", "h100.yml")
 #: The summary job of gpu-tests.yml: fails whenever any suite does, so it is ignored everywhere.
 SUMMARY_JOB = "GPU tests"
 
+#: Branches the page tracks. Every tab shows one of them at a time.
+TRACKED_BRANCHES = ("main", "release/3.8.x")
+#: Meta LLVM bump branches: scratch/meta-llvm-bump/<target with "/" as "-">. Their runs count for their target.
+BUMP_PREFIX = "scratch/meta-llvm-bump/"
+
 #: Step name -> test group. A step with a group is a test step; any other step is setup.
 GROUPS = [
     (r"^Run TLX (core|unit) tests$", "TLX core"),  # MI350 called it "unit" until its rename
@@ -154,9 +159,21 @@ def run_outcome(run):
     return "setup"
 
 
-def _pushes(runs):
-    return sorted((r for r in runs if r.get("wf") == "gpu-tests.yml" and r["event"] == "push"
-                   and r.get("jobs") is not None and r.get("status") == "completed"), key=lambda r: r["created_at"])
+def tracked_branch(run):
+    """The tracked branch a run counts for: a PR's base, a bump branch's target, else the branch it ran on."""
+    if run["event"] == "pull_request":
+        return run.get("base") or "main"
+    branch = run.get("branch") or "main"
+    if branch.startswith(BUMP_PREFIX):
+        line = branch[len(BUMP_PREFIX):]
+        return next((b for b in TRACKED_BRANCHES if b.replace("/", "-") == line), branch)
+    return branch
+
+
+def _pushes(runs, branch):
+    return sorted((r for r in runs if r.get("wf") == "gpu-tests.yml" and r["event"] == "push" and (
+        r.get("branch") or "main") == branch and r.get("jobs") is not None and r.get("status") == "completed"),
+                  key=lambda r: r["created_at"])
 
 
 def _commit(run):
@@ -211,8 +228,9 @@ def _sched_result(runs, sha, unit, test_id):
     return found
 
 
-def main_view(runs, asof):
-    pushes = [r for r in _pushes(runs) if r["created_at"] <= asof]
+def main_view(runs, asof, branch="main"):
+    """New and known failures over the push runs of one branch. A bump branch's pushes are not the branch's."""
+    pushes = [r for r in _pushes(runs, branch) if r["created_at"] <= asof]
     state, last, names, seen, units = _history(pushes)
     # A unit counts only while its job ran on a push in the last RETIRE_DAYS and its test group still exists in
     # the latest push that ran the job.
@@ -317,7 +335,8 @@ def _step_grid(pushes, start, units):
     return out
 
 
-def pr_view(runs, asof, main):
+def pr_view(runs, asof, main, branch="main"):
+    """PR runs, with their failures compared with main: the GPU tests view of the PRs' base branch."""
     since = iso(t(asof) - dt.timedelta(hours=24))
     on_main = {(i["gpu"], i["job"], i["id"]) for g in main["gpus"].values() for i in g["new"] + g["known"]}
     latest = {}
@@ -345,7 +364,7 @@ def pr_view(runs, asof, main):
         elif fails:
             row["result"] = "tests"
             if fails <= on_main:
-                row["whose"], row["note"] = "main", f"all {len(fails)} also fail on main"
+                row["whose"], row["note"] = "main", f"all {len(fails)} also fail on {branch}"
             else:
                 row["whose"] = "author"
         elif outcome in ("setup", "build"):
@@ -527,8 +546,13 @@ def select_view(runs, asof):
 
 def page_data(runs, asof, bench):
     """The data.json the /ci/ page renders, computed from stored run records and bench perf events."""
-    main = main_view(runs, asof)
-    return {
-        "asof": asof, "main": main, "nightly": nightly_view(runs, asof, bench), "pr": pr_view(runs, asof, main), "ops":
-        ops_view(runs, asof)
-    }
+    branches = {}
+    for b in TRACKED_BRANCHES:
+        rs = [r for r in runs if tracked_branch(r) == b]
+        main = main_view(rs, asof, b)
+        # The bench dashboard's perf events come from main's nightly bench.
+        branches[b] = {
+            "main": main, "nightly": nightly_view(rs, asof, bench if b == "main" else {}), "pr":
+            pr_view(rs, asof, main, b), "ops": ops_view(rs, asof)
+        }
+    return {"asof": asof, "branches": branches}
