@@ -41,3 +41,4 @@ on AMD requires `arrive_count == 1`.
 ## Per-hardware support
 
 - [TLX on gfx950 (MI350)](tlx-gfx950.html)
+- [TLX on gfx942 (MI300)](tlx-gfx942.html)
