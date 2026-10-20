@@ -2287,6 +2287,42 @@ def load_kernel(inp, xnumel):
     ttgl.load(inp + xindex, mask=mask, other=0.0)
 
 
+@pytest.mark.parametrize("target", [HOPPER_TARGET, HIP_TARGET_CDNA4])
+@pytest.mark.parametrize("dtype", [ttgl.float32, ttgl.int1])
+@pytest.mark.parametrize("scalar", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("latency", [None, 4])
+def test_load_result_layout(target, dtype, scalar, masked, latency):
+
+    @gluon.jit
+    def kernel(inp, out, SCALAR: ttgl.constexpr, MASKED: ttgl.constexpr, LATENCY: ttgl.constexpr,
+               WARP_SIZE: ttgl.constexpr):
+        if SCALAR:
+            value = ttgl.load(inp, mask=True if MASKED else None, other=0 if MASKED else None, latency=LATENCY)
+            ttgl.static_assert(value.type == inp.dtype.element_ty)
+            ttgl.store(out, value)
+        else:
+            layout: ttgl.constexpr = ttgl.BlockedLayout([1], [WARP_SIZE], [4], [0])
+            offsets = ttgl.arange(0, 128, layout)
+            mask = offsets < 96 if MASKED else None
+            value = ttgl.load(inp + offsets, mask=mask, other=0 if MASKED else None, latency=LATENCY)
+            ttgl.static_assert(value.type.layout == layout)
+            ttgl.static_assert(value.dtype == inp.dtype.element_ty)
+            dst_layout: ttgl.constexpr = ttgl.BlockedLayout([2], [WARP_SIZE], [4], [0])
+            value = ttgl.convert_layout(value, dst_layout)
+            dst_offsets = ttgl.arange(0, 128, dst_layout)
+            ttgl.store(out + dst_offsets, value, mask=dst_offsets < 96 if MASKED else None)
+
+    mod = run_parser(kernel, *make_args(MockTensor(dtype), MockTensor(dtype), scalar, masked, latency,
+                                       target.warp_size), target=target)
+    text = mod.str_nodebug()
+    assert "tt.load" in text and "tt.store" in text
+    if not scalar:
+        assert "ttg.convert_layout" in text
+    if latency is not None:
+        assert "tt.latency = 4 : i32" in text
+
+
 @pytest.mark.parametrize("target", ALL_TARGETS)
 def test_load(target):
     mod = run_parser(load_kernel, *make_args(MockTensor(ttgl.float32), xnumel=100), target=target)
