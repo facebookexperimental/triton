@@ -366,6 +366,14 @@ tt.func @test_canonicalize_reshape(%arg0: tensor<8xf32>, %arg1: tensor<f32>) -> 
     tt.return %reshape1, %reshape2, %add, %view : tensor<4x2xf32>, tensor<2x2x2xf32>, tensor<8xf32>, tensor<2x2x2xf32>
 }
 
+// CHECK-LABEL: @test_canonicalize_reshape_expand_dims
+tt.func @test_canonicalize_reshape_expand_dims(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+    // CHECK-NEXT: tt.return %arg0 : tensor<8xf32>
+    %0 = tt.expand_dims %arg0 {axis = 0 : i32} : tensor<8xf32> -> tensor<1x8xf32>
+    %1 = tt.reshape %0 : tensor<1x8xf32> -> tensor<8xf32>
+    tt.return %1 : tensor<8xf32>
+}
+
 // CHECK-LABEL: @test_canonicalize_broadcast
 tt.func @test_canonicalize_broadcast(%arg0: tensor<1x1x8xf32>, %arg1: tensor<f32>) -> (tensor<4x2x8xf32>, tensor<8x8xf32>, tensor<1x1x8xf32>) {
     %broadcast0 = tt.broadcast %arg0 : tensor<1x1x8xf32> -> tensor<1x2x8xf32>

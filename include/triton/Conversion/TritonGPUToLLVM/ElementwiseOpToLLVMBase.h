@@ -84,6 +84,7 @@ public:
     // We zero out the bases that are constant
     auto kReg = StringAttr::get(ctx, "register");
     auto ll = toLinearLayout(rtType);
+    ll = ll.removeZeroBasesAlongDim(kReg);
     auto dims = to_vector(ll.getOutDimNames());
     auto llReg = ll.sublayout({kReg}, dims);
     auto inv = ll.pseudoinvert();
@@ -122,7 +123,7 @@ public:
     Type elemTy = this->getTypeConverter()->convertType(resultElementTy);
     SmallVector<SmallVector<Value>> allOperands;
     for (auto operand : adaptor.getOperands()) {
-      auto subOperands = unpackLLElements(loc, operand, rewriter);
+      auto subOperands = unpackUniqueTensorElements(loc, operand, rewriter);
       allOperands.resize(subOperands.size());
       for (auto v : llvm::enumerate(subOperands))
         allOperands[v.index()].push_back(v.value());
@@ -144,8 +145,8 @@ public:
       it += curr.size();
     }
     resultVals = maybeDeduplicate(op, resultVals);
-    Value view = packLLElements(loc, this->getTypeConverter(), resultVals,
-                                rewriter, resultTy);
+    Value view = packUniqueTensorElements(loc, this->getTypeConverter(),
+                                          resultVals, rewriter, resultTy);
     rewriter.replaceOp(op, view);
 
     return success();
