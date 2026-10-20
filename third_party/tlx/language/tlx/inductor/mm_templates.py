@@ -185,6 +185,15 @@ gfx950_addmm_persistent_warppipe_template = TritonTemplate(
     source=load_tlx_template("gfx950_addmm_persistent_warppipe"),
 )
 
+# Templates whose every output store goes through reduction_store_output.
+for _template in (
+    gfx950_addmm_warppipe_template,
+    gfx950_addmm_persistent_warppipe_template,
+    gfx950_mm_interwave_template,
+    gfx950_addmm_interwave_template,
+):
+    _template.tlx_row_partials = True
+
 
 def append_tlx(templates, op_name, kernel_inputs):
     # Import registry to trigger heuristic registration via decorators
