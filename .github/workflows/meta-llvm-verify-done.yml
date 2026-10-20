@@ -5,10 +5,7 @@ name: Meta LLVM verify done
 on:
   workflow_run:
     workflows:
-      - Meta Triton GPU Tests    # main: gpu-tests.yml
-      - Meta Triton H100 Tests   # release/3.8.x runs these three directly
-      - Meta Triton B200 Tests
-      - Meta Triton MI350 Tests
+      - Meta Triton GPU Tests
     types: [completed]
     branches: ['scratch/meta-llvm-bump/**']
 

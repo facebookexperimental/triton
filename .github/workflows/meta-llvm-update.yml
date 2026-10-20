@@ -75,6 +75,6 @@ jobs:
     with:
       target: release/3.8.x
       fork_branch: triton_3.8.x
-      verify_workflows: h100.yml,b200.yml,mi350.yml
+      verify_workflows: gpu-tests.yml
       dry_run: ${{ inputs.dry_run == true }}
     secrets: inherit
