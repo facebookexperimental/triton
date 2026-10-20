@@ -104,6 +104,11 @@ TLX_PAGES = (
         "Supported ops and extension builtins on AMD MI350.",
     ),
     Page(
+        "tlx-gfx1250",
+        "TLX on gfx1250 (RDNA4)",
+        "TDM descriptors and expected support on next-gen AMD.",
+    ),
+    Page(
         "testing",
         "Testing",
         "Correctness and performance scripts for the TLX tutorial kernels.",

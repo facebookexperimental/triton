@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="TDM descriptors and expected support on next-gen AMD.">
+  <title>TLX on gfx1250 (RDNA4) · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Tutorial kernels</a>
+<a href="tlx-ops.html">High-performance kernels</a>
+<a href="tlx-sm90.html">TLX on sm90 (Hopper)</a>
+<a href="tlx-sm100.html">TLX on sm100 (Blackwell)</a>
+<a href="tlx-gfx942.html">TLX on gfx942 (MI300)</a>
+<a href="tlx-gfx950.html">TLX on gfx950 (MI350)</a>
+<a href="tlx-gfx1250.html" aria-current="page">TLX on gfx1250 (RDNA4)</a>
+<a class="sub" href="#supported-tlx-ops">Supported `tlx.ops`</a>
+<a class="sub" href="#supported-extension-builtins-tlx">Supported extension builtins (`tlx.*`)</a>
+<a class="sub" href="#notes">Notes</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>TLX on gfx1250 (RDNA4)</h1>
+      <p class="lede">TDM descriptors and expected support on next-gen AMD.</p>
+      <article><p>Next-generation AMD target. The distinguishing TLX feature is TDM (Tensor Descriptor Machine): hardware descriptors with fused multi-member loads, multicast, and prefetch, mirroring what TMA provides on NVIDIA. Tags follow <a href="tlx.html">tlx.md</a>; a trailing <code>?</code> marks availability that still needs verification — most of this page is <code>?</code> by design.</p>
+<h2 id="supported-tlx-ops">Supported <code>tlx.ops</code></h2>
+<p>No <code>tlx.ops</code> catalog entries target gfx1250 yet. The closest coverage is the tutorial <code>third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/</code>, which exercises fused TDM loads/stores, TDM prefetch, <code>amd_sched_barrier</code>, and <code>amd_set_wave_sched_mode</code> in a grouped-GEMM experiment (see its README).</p>
+<h2 id="supported-extension-builtins-tlx">Supported extension builtins (<code>tlx.*</code>)</h2>
+<p>Status is <code>yes</code> only where the TDM tutorials or the builtin definition confirm it; everything else AMD is <code>?</code>.</p>
+<h3 id="tdm-descriptors-gfx1250">TDM descriptors (gfx1250+)</h3>
+<table><thead><tr><th>Builtin</th><th>Status</th><th>Purpose</th></tr></thead><tbody><tr><td><code>update_tensor_descriptor</code></td><td>yes</td><td>Reposition/rebound an AMD TDM descriptor</td></tr><tr><td><code>async_amd_descriptor_load</code></td><td>yes</td><td>Async TDM global-to-local load</td></tr><tr><td><code>async_amd_descriptor_load_fused</code></td><td>yes</td><td>One fused TDM load for 2-4 members</td></tr><tr><td><code>async_amd_descriptor_store</code></td><td>yes</td><td>Async TDM local-to-global store</td></tr><tr><td><code>amd_descriptor_prefetch_tensor</code></td><td>yes</td><td>L2 prefetch hint for a descriptor tile</td></tr><tr><td><code>async_amd_descriptor_wait</code></td><td>yes</td><td>Wait for outstanding TDM ops</td></tr></tbody></table>
+<h3 id="confirmed-carryover">Confirmed carryover</h3>
+<table><thead><tr><th>Builtin</th><th>Status</th><th>Purpose</th></tr></thead><tbody><tr><td><code>amd_set_wave_sched_mode</code></td><td>yes</td><td>Write wave-scheduler-mode register field</td></tr><tr><td><code>amd_sched_barrier</code></td><td>yes</td><td>Compiler scheduling marker</td></tr><tr><td><code>cluster_barrier</code></td><td>yes</td><td>Sync all threads in all cluster CTAs</td></tr></tbody></table>
+<h3 id="cross-backend-expected-yes-portability-tbd">Cross-backend (expected yes, portability TBD)</h3>
+<p>Local memory, async copy, layout control, barriers, ids, and votes work through the portable TLX paths; confirm per kernel. Full list: <code>assume_uniform</code>, <code>zeros</code>, <code>dtype_of</code>, <code>size_of</code>, <code>get_fp8_format_name</code>, <code>clock64</code>, <code>assert_same_layout</code>, <code>dump_layout</code>, <code>storage_alias_spec</code>, <code>local_alloc</code>, <code>local_view</code>, <code>local_slice</code>, <code>local_store</code>, <code>local_load</code>, <code>local_gather</code>, <code>local_scatter</code>, <code>async_load</code>, <code>async_load_commit_group</code>, <code>async_load_wait_group</code>, <code>local_trans</code>, <code>local_reshape</code>, <code>local_reinterpret</code>, <code>require_layout</code>, <code>release_layout</code>, <code>dot_scaled</code>, <code>allocate_tensor_descriptor</code>, <code>alloc_barriers</code>, <code>alloc_warp_barrier</code>, <code>barrier_wait</code>, <code>barrier_arrive</code>, <code>cluster_cta_rank</code>, <code>cluster_size_1d</code>, <code>thread_id</code>, <code>num_warps</code>, <code>warp_all</code>, <code>warp_any</code>, <code>layout_encoding</code>, <code>shared_layout_encoding</code>, <code>swizzled_shared_layout_encoding</code>, <code>swizzled_layout</code>, <code>padded_shared_layout_encoding</code>, <code>shared_linear_layout_encoding</code>, <code>slice_layout</code>, <code>DummyRegisterLayoutEncoding</code>, <code>layout</code>, <code>storage_kind</code>, <code>reuse_group</code>, <code>reuse_group_type</code>, <code>reuse_group_ir_type</code>, <code>storage_alias_spec_type</code>, <code>storage_alias_spec_type_class</code>, <code>buffered_tensor</code>, <code>buffered_tensor_type</code>, <code>mbarrier</code>, <code>mbarrier_type</code>, <code>async_token</code>. See <a href="tlx-gfx950.html">TLX on gfx950</a> for what each does.</p>
+<h3 id="amd-builtins-unconfirmed">AMD builtins (<code>?</code> — unconfirmed)</h3>
+<p><code>buffer_load</code>, <code>buffer_store</code>, <code>buffer_atomic_add</code>, <code>buffer_load_to_local</code>, <code>extract_slice</code>, <code>rematerialized_range</code>, <code>require_amd_wmma_layout</code>, <code>amd_register_resident</code>, <code>amd_register_class_anchor</code>, <code>amd_scheduled_mfma</code>, <code>amd_mfma_commit</code>, <code>amd_mfma_layout</code>, <code>dot_operand_layout</code>, <code>cond_barrier</code>, <code>workgroup_barrier</code>, <code>amd_iglp_opt</code>, <code>warp_pipeline_stage</code>, <code>warp_predicate</code>.</p>
+<h2 id="notes">Notes</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Promoting a gfx1250 tutorial into <code>tlx.ops</code> means adding a catalog entry</div></div>
+<p>with <code>arch=&quot;gfx1250&quot;</code>; see <a href="tlx-ops.html">tlx-ops</a> for the process.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Fused TDM loads require disjoint warp masks and support at most 5</div></div>
+<p>multicast recipients; <code>async_amd_descriptor_wait</code> takes pendings xor tokens, not both.</p></article>
+<footer class="pager"><a href="tlx-gfx950.html">← TLX on gfx950 (MI350)</a><a class="next" href="testing.html">Testing →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

@@ -44,3 +44,4 @@ on AMD requires `arrive_count == 1`.
 - [TLX on gfx942 (MI300)](tlx-gfx942.html)
 - [TLX on sm100 (Blackwell)](tlx-sm100.html)
 - [TLX on sm90 (Hopper)](tlx-sm90.html)
+- [TLX on gfx1250 (RDNA4)](tlx-gfx1250.html)
