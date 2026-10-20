@@ -65,18 +65,15 @@ SmallVector<Value> lowerLocalScGt(Location loc, MemDescType memDescTy,
   return results;
 }
 
-LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
-                              MemDescType memDescTy, SharedMemoryObject smemObj,
-                              ArrayRef<Value> inVals,
-                              const LLVMTypeConverter *typeConverter,
-                              ConversionPatternRewriter &rewriter,
-                              const TargetInfoBase &targetInfo,
-                              std::optional<Value> clusterCTARank = {},
-                              std::optional<Value> barrierPtr = {}) {
-  auto regTy = cast<RankedTensorType>(regVal.getType());
+LogicalResult lowerLocalStore(
+    Location loc, MLIRContext *ctx, LinearLayout regLayout,
+    MemDescType memDescTy, SharedMemoryObject smemObj, ArrayRef<Value> inVals,
+    const LLVMTypeConverter *typeConverter, ConversionPatternRewriter &rewriter,
+    const TargetInfoBase &targetInfo, std::optional<Value> clusterCTARank = {},
+    std::optional<Value> barrierPtr = {}) {
+  assert(regLayout.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
+         "expected register broadcasting to be removed by the caller");
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
-
-  auto regLayout = toLinearLayout(regTy);
   LinearLayout cvt = LinearLayout::empty();
   if (isPaddedEncoding(memDescTy.getEncoding())) {
     cvt = invertAndComposeBlockLocal(paddedLinearLayout(memDescTy), regLayout);
@@ -155,9 +152,11 @@ struct LocalAllocOpConversion
     // If there is an initial tensor, store it into the shared memory.
     if (op.getSrc()) {
       auto *ctx = op.getContext();
-      auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-
-      if (failed(lowerLocalStore(loc, ctx, op.getSrc(), memDescTy, smemObj,
+      auto regTy = cast<RankedTensorType>(op.getSrc().getType());
+      auto regLayout =
+          toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
+      auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+      if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj,
                                  inVals, typeConverter, rewriter,
                                  targetInfo))) {
         return failure();
@@ -212,7 +211,8 @@ public:
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                          llvmElemTy, rewriter);
 
-    auto regLayout = toLinearLayout(regTy);
+    auto regLayout =
+        toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
     LinearLayout cvt = LinearLayout::empty();
     if (isPaddedEncoding(memDescTy.getEncoding())) {
       cvt =
@@ -244,7 +244,8 @@ public:
                                   /*ctaRank=*/{}, /*barrierPtr=*/{},
                                   distributedCoordinates);
 
-    Value result = packLLElements(loc, typeConverter, outVals, rewriter, regTy);
+    Value result =
+        packUniqueTensorElements(loc, typeConverter, outVals, rewriter, regTy);
     rewriter.replaceOp(op, result);
 
     return success();
@@ -272,15 +273,17 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
-    Value regVal = op.getSrc();
     Value memDescVal = op.getDst();
     auto typeConverter = getTypeConverter();
+    auto regTy = cast<RankedTensorType>(op.getSrc().getType());
     auto memDescTy = cast<MemDescType>(memDescVal.getType());
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getDst(),
                                                          llvmElemTy, rewriter);
-    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-    if (failed(lowerLocalStore(loc, ctx, regVal, memDescTy, smemObj, inVals,
+    auto regLayout =
+        toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+    if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj, inVals,
                                typeConverter, rewriter, targetInfo))) {
       return failure();
     }
@@ -311,17 +314,19 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
-    Value regVal = op.getSrc();
     Value memDescVal = op.getDst();
     auto typeConverter = getTypeConverter();
+    auto regTy = cast<RankedTensorType>(op.getSrc().getType());
     auto memDescTy = cast<MemDescType>(memDescVal.getType());
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getDst(),
                                                          llvmElemTy, rewriter);
-    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+    auto regLayout =
+        toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
     Value clusterCTARank = op.getCtaRank();
 
-    if (failed(lowerLocalStore(loc, ctx, regVal, memDescTy, smemObj, inVals,
+    if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj, inVals,
                                typeConverter, rewriter, targetInfo,
                                clusterCTARank))) {
       return failure();
@@ -364,6 +369,7 @@ public:
   matchAndRewrite(LocalGatherOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getSrc().getType());
     // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
     // PRs.
@@ -380,14 +386,16 @@ public:
                                                          llvmElemTy, rewriter);
 
     SmallVector<Value> idxValues =
-        unpackLLElements(loc, adaptor.getIndices(), rewriter);
-    auto regLayout = toLinearLayout(regTy);
+        unpackUniqueTensorElements(loc, adaptor.getIndices(), rewriter);
+    auto regLayout =
+        toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
 
     auto results = lowerLocalScGt(loc, memDescTy, smemObj, llvmElemTy,
                                   regLayout, idxValues, op.getAxis(),
                                   /*storeVals=*/{}, rewriter, targetInfo);
 
-    Value result = packLLElements(loc, typeConverter, results, rewriter, regTy);
+    Value result =
+        packUniqueTensorElements(loc, typeConverter, results, rewriter, regTy);
     rewriter.replaceOp(op, result);
 
     return success();
@@ -415,14 +423,16 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
-    Value regVal = op.getSrc();
     Value memDescVal = op.getDst();
     auto typeConverter = getTypeConverter();
+    auto regTy = cast<RankedTensorType>(op.getSrc().getType());
     auto memDescTy = cast<MemDescType>(memDescVal.getType());
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getDst(),
                                                          llvmElemTy, rewriter);
-    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+    auto regLayout =
+        toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
     Value clusterCTARank = op.getCtaRank();
 
     auto barrierDesc = op.getBarrier();
@@ -434,7 +444,7 @@ public:
         loc, barrierAdaptor, barrierLLVMElemTy, rewriter);
     std::optional<Value> barrierPtr = barrierSmemObj.getBase();
 
-    if (failed(lowerLocalStore(loc, ctx, regVal, memDescTy, smemObj, inVals,
+    if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj, inVals,
                                typeConverter, rewriter, targetInfo,
                                clusterCTARank, barrierPtr))) {
       return failure();
@@ -461,6 +471,7 @@ public:
   matchAndRewrite(LocalScatterOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getDst().getType());
     // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
     // PRs.
@@ -477,10 +488,11 @@ public:
                                                          llvmElemTy, rewriter);
 
     SmallVector<Value> values =
-        unpackLLElements(loc, adaptor.getValues(), rewriter);
+        unpackUniqueTensorElements(loc, adaptor.getValues(), rewriter);
     SmallVector<Value> idxValues =
-        unpackLLElements(loc, adaptor.getIndices(), rewriter);
-    auto regLayout = toLinearLayout(valuesTy);
+        unpackUniqueTensorElements(loc, adaptor.getIndices(), rewriter);
+    auto regLayout =
+        toLinearLayout(valuesTy).removeZeroBasesAlongDim(str_attr("register"));
 
     lowerLocalScGt(loc, memDescTy, smemObj, llvmElemTy, regLayout, idxValues,
                    op.getAxis(), values, rewriter, targetInfo);
