@@ -41,7 +41,7 @@ def _normalized_kda_input(shape):
     return torch.nn.functional.normalize(value, dim=-1).to(torch.bfloat16)
 
 
-def _check_kda_prefill(lengths, heads, scale, cu_on_cpu=False, gate_scale=1.0):
+def _check_kda_prefill(lengths, heads, scale, cu_on_cpu=False, gate_scale=1.0, state_atol=8e-3):
     torch.manual_seed(31)
     dim = 128
     total_tokens = sum(lengths)
@@ -97,7 +97,7 @@ def _check_kda_prefill(lengths, heads, scale, cu_on_cpu=False, gate_scale=1.0):
     torch.testing.assert_close(
         actual_state,
         torch.stack(expected_states),
-        atol=8e-3,
+        atol=state_atol,
         rtol=3e-2,
     )
     assert actual_state.dtype == torch.float32
@@ -137,9 +137,10 @@ def test_kda_paged_prefill_smoke_shapes(lengths, heads):
     ],
 )
 def test_kda_paged_prefill_walk_shapes(lengths, heads):
-    # A slow gate keeps the state's memory longer than one time group, so the
-    # chained group transfers are exercised rather than decayed to zero.
-    _check_kda_prefill(lengths, heads=heads, scale=128**-0.5, gate_scale=0.01)
+    # A wrong group-to-group hand-off only reaches the output if the state
+    # remembers across a time group (about 400 tokens here), which takes a
+    # gate this slow. It also lets bf16 rounding build up in the state.
+    _check_kda_prefill(lengths, heads=heads, scale=128**-0.5, gate_scale=0.001, state_atol=2e-2)
 
 
 def _raw_kda_inputs(lengths, heads):
