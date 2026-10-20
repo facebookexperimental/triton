@@ -243,8 +243,8 @@ def _prepare_chunk_kernel(
     beta_mask = beta_offsets < rows_left * STRIDE_BETA
     beta = tlx.buffer_load(Beta + (start * STRIDE_BETA + head), beta_offsets, mask=beta_mask, other=0.0).to(tl.float32)
     if RAW:
-        # What prepare_kda_inputs does, rounded the same way: the activated
-        # gate here, l2-normalized Q/K in bf16 below.
+        # What prepare_kda_inputs does, but the activated gate here and the
+        # l2-normalized Q/K below stay fp32 until they become MFMA operands.
         # A [D] vector broadcast in registers: the full-tile offsets would go
         # through LDS on uTLX, and the loads lose their broadcast.
         bias = tl.load(DtBias + head * D +
@@ -262,7 +262,7 @@ def _prepare_chunk_kernel(
             g = -rate * tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
     if SIGMOID_BETA:
         beta = tl.where(beta_mask, tl.sigmoid(beta), 0.0)
-    g = tl.where(g_mask, g, 0.0).to(tl.bfloat16).to(tl.float32)
+    g = tl.where(g_mask, g, 0.0)
 
     # G = pivot + in_band, in log2 units: each band's gate relative to the
     # token before it. exp(G) and exp(last - G) are split into a per-band
@@ -287,13 +287,13 @@ def _prepare_chunk_kernel(
     # bridge exp(pivot_b - pivot_J) on row band b's rows meets column band J.
     q = q.to(tl.float32)
     if RAW:
-        q = (q * tl.math.rsqrt(tl.sum(q * q, axis=2) + 1e-6)[:, :, None]).to(tl.bfloat16).to(tl.float32)
+        q = q * tl.math.rsqrt(tl.sum(q * q, axis=2) + 1e-6)[:, :, None]
     q_rows = q * rise * SCALE
     tlx.buffer_store((q_rows * to_pivot).to(Qg.dtype.element_ty), Qg + tile_base, tile_offsets, mask=tile_mask)
     q_lhs = tlx.require_layout(q_rows.to(tl.bfloat16), a3)
     k = k.to(tl.float32)
     if RAW:
-        k = (k * tl.math.rsqrt(tl.sum(k * k, axis=2) + 1e-6)[:, :, None]).to(tl.bfloat16).to(tl.float32)
+        k = k * tl.math.rsqrt(tl.sum(k * k, axis=2) + 1e-6)[:, :, None]
     k_cols = k * fall
     tlx.buffer_store((k_cols * to_last).to(Kg.dtype.element_ty), Kg + tile_base, tile_offsets, mask=tile_mask)
     lifted = tlx.local_alloc((NB, BC, D), tl.bfloat16, 1, layout=_row_padded(NB * BC, D, 8, NB))

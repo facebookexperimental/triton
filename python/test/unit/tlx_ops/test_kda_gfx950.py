@@ -15,12 +15,12 @@ pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="gfx950 KDA operators
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
-def _kda_recurrent_reference(q, k, v, g, beta, state, scale, round_gate=True):
+def _kda_recurrent_reference(q, k, v, g, beta, state, scale):
     """FP32 recurrence for prepared inputs and a physical [H, V, K] state."""
     q = q.float()
     k = k.float()
     v = v.float()
-    g = g.to(torch.bfloat16).float() if round_gate else g.float()
+    g = g.float()
     beta = beta.float()
 
     state = state.float().clone()
@@ -156,13 +156,12 @@ def _raw_kda_inputs(lengths, heads):
     return q, k, v, g, beta, A_log, dt_bias
 
 
-def _activate_kda_inputs(q, k, g, beta, A_log, dt_bias, lower_bound, round_qk=True):
-    """The prepared inputs that raw inputs stand for, rounded as the kernel rounds them."""
+def _activate_kda_inputs(q, k, g, beta, A_log, dt_bias, lower_bound):
+    """The fp32 prepared inputs that raw inputs stand for."""
 
     def l2norm(x):
         x = x.float()
-        x = x / torch.sqrt((x * x).sum(-1, keepdim=True) + 1e-6)
-        return x.to(torch.bfloat16) if round_qk else x
+        return x / torch.sqrt((x * x).sum(-1, keepdim=True) + 1e-6)
 
     heads, dim = g.shape[-2:]
     rate = A_log.exp().view(heads, 1)
@@ -409,15 +408,14 @@ def test_kda_recurrent_decode_raw_inputs(lower_bound):
                                   write_indices=indices, cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias,
                                   lower_bound=lower_bound, beta_is_raw=True)
 
-    qn, kn, gn, bn = _activate_kda_inputs(q, k, g, beta, A_log, dt_bias, lower_bound, round_qk=False)
+    qn, kn, gn, bn = _activate_kda_inputs(q, k, g, beta, A_log, dt_bias, lower_bound)
     expected_pool = original_pool.clone()
     expected = []
     for row in range(batch):
         slot = indices[row].long()
         output, expected_pool[slot] = _kda_recurrent_reference(qn[0, row:row + 1], kn[0, row:row + 1],
-                                                               v[0, row:row + 1], gn[0, row:row + 1], bn[0,
-                                                                                                         row:row + 1],
-                                                               original_pool[slot], scale, round_gate=False)
+                                                               v[0, row:row + 1], gn[0, row:row + 1],
+                                                               bn[0, row:row + 1], original_pool[slot], scale)
         expected.append(output[0])
     torch.testing.assert_close(actual.float(), torch.stack(expected).unsqueeze(0), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(state_pool, expected_pool, atol=1e-5, rtol=1e-5)
