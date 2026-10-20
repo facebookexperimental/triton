@@ -2,7 +2,8 @@ name: Meta Triton GPU Tests
 
 on:
   push:
-    branches: [main]
+    # Meta LLVM bump branches: the updater turns this run into the bump's issue.
+    branches: [main, 'scratch/meta-llvm-bump/main']
   pull_request:
   schedule:
     - cron: '0 */6 * * *'
@@ -21,6 +22,9 @@ jobs:
   select:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read  # a bump PR looks up its head's push run
     outputs:
       sha: ${{ steps.select.outputs.sha }}
       build: ${{ steps.select.outputs.build }}
@@ -34,6 +38,8 @@ jobs:
           fetch-depth: 0
       - name: Select affected GPU platforms
         id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/gpu_test_selection.py
 
   build:

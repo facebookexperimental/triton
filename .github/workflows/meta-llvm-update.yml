@@ -1,9 +1,11 @@
 name: Meta LLVM update
 # Prepares a bump when the Meta LLVM fork (facebookexperimental/llvm-project)
 # publishes a release newer than a release line's cmake/meta-llvm-info.json pin:
-# pushes scratch/meta-llvm-bump/<line>, builds wheels from it, and reports on a
-# tracking issue with the command a person runs to open the PR. The Meta CLA
-# check rejects bot-authored PRs, so the bot never opens one. Never lands anything.
+# pushes scratch/meta-llvm-bump/<line>, which runs the line's GPU workflows, then
+# opens a "Bump ready" issue with the command a person runs to open the PR, or a
+# "Bump failed verify" issue. The Meta CLA check rejects bot-authored PRs, so the
+# bot never opens one. Never lands anything. meta-llvm-verify-done.yml starts this
+# workflow when a bump branch's GPU run completes, so the issue need not wait an hour.
 #
 # Scheduled workflows run from the default branch, so this one file serves every
 # release line; _meta-llvm-line.yml does the work for one line.
@@ -17,7 +19,7 @@ on:
         required: false
         default: ''
       dry_run:
-        description: 'Print the new pin, message and issue without pushing'
+        description: 'Print the writes instead of making them'
         type: boolean
         default: false
   pull_request:
@@ -25,8 +27,10 @@ on:
       - '.github/scripts/meta_llvm_bump.py'
       - '.github/scripts/meta_llvm_update.py'
       - '.github/scripts/test_meta_llvm_bump.py'
+      - '.github/scripts/test_meta_llvm_update.py'
       - '.github/workflows/meta-llvm-update.yml'
       - '.github/workflows/_meta-llvm-line.yml'
+      - '.github/workflows/meta-llvm-verify-done.yml'
 
 permissions:
   contents: read
@@ -47,18 +51,18 @@ jobs:
       - run: python3 -m pip install pytest
       - name: Run updater tests
         working-directory: .github/scripts
-        run: python3 -m pytest -q test_meta_llvm_bump.py
+        run: python3 -m pytest -q test_meta_llvm_bump.py test_meta_llvm_update.py
 
   main:
     if: >-
       github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental' &&
       (inputs.target == '' || inputs.target == 'main')
-    # read-all: the build check reuses wheels_fb.yml, which declares it.
     permissions: read-all
     uses: ./.github/workflows/_meta-llvm-line.yml
     with:
       target: main
       fork_branch: triton_beta
+      verify_workflows: gpu-tests.yml
       dry_run: ${{ inputs.dry_run == true }}
     secrets: inherit
 
@@ -71,5 +75,6 @@ jobs:
     with:
       target: release/3.8.x
       fork_branch: triton_3.8.x
+      verify_workflows: gpu-tests.yml
       dry_run: ${{ inputs.dry_run == true }}
     secrets: inherit
