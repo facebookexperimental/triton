@@ -54,6 +54,20 @@ def device(request):
     return "cuda" if selected is None else selected
 
 
+@pytest.fixture(scope="module")
+def process_pool(request):
+    from triton._internal_testing import is_hopper_or_newer, use_process_pool
+
+    if request.config.getoption("--warmup-only", default=False) or os.environ.get("DISABLE_SUBPROCESS"):
+        yield
+        return
+    if not is_hopper_or_newer():
+        yield
+        return
+    with use_process_pool(request.module.__name__) as pool:
+        yield pool
+
+
 @pytest.fixture
 def fresh_triton_cache():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -76,6 +90,14 @@ def fresh_knobs():
         yield fresh_function()
     finally:
         reset_function()
+
+
+@pytest.fixture
+def fresh_compilation_knobs():
+    from triton import knobs
+
+    with knobs.compilation.scope():
+        yield knobs
 
 
 @pytest.fixture
