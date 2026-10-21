@@ -8,6 +8,8 @@ import triton
 import triton.language as tl
 from triton._internal_testing import is_hip_cdna4
 import triton.language.extra.tlx as tlx
+from triton.experimental import gluon
+from triton.experimental.gluon import language as ttgl
 from triton.tlx.ops.kernels.flash_attn.gfx950 import _sum_rows_chain4 as _cluster_sum_rows_chain4
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -77,6 +79,60 @@ def test_signed_div_rem_dynamic_program_mapping(modulus, group, base):
     quotient = torch.div(values, 64, rounding_mode="trunc")
     expected = table[(remainder + 64).long()] + table[(quotient & 255).long()]
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("groups,columns", [(3, 5), (7, 13), (2, 19)])
+def test_integer_facts_dynamic_tile_column(groups, columns):
+
+    @triton.jit(do_not_specialize=["groups", "columns"])
+    def kernel(output, table, groups, columns, L: tl.constexpr):
+        tl.assume(groups > 0)
+        tl.assume(groups <= 7)
+        tl.assume(columns > 0)
+        tl.assume(columns <= 8388608)
+        pid = tl.program_id(0)
+        tl.assume(pid < groups * columns)
+        column = pid // groups
+        lanes = tlx.require_layout(tl.arange(0, 256), L)
+        offsets = column * 256 + lanes
+        values = tl.load(table + offsets % 256)
+        tl.store(output + pid * 256 + lanes, values)
+
+    layout = tlx.layout(shape=((64, ), (4, )), stride=((4, ), (1, )))
+    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
+    output = torch.empty((groups * columns, 256), dtype=torch.int32, device=DEVICE)
+    compiled = kernel[(groups * columns, )](output, table, groups, columns, layout, num_warps=1)
+    torch.testing.assert_close(output, table.expand_as(output), rtol=0, atol=0)
+    assert "tt.refine" in compiled.asm["ttir"]
+    assert "tt.refine" not in compiled.asm["llir"]
+    assert re.search(r"(?:global|buffer)_load_dwordx4", compiled.asm["amdgcn"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_integer_facts_gluon_dynamic_tile_column():
+
+    @gluon.jit(do_not_specialize=["groups", "columns"])
+    def kernel(output, table, groups, columns, layout: ttgl.constexpr):
+        ttgl.assume(groups > 0)
+        ttgl.assume(groups <= 7)
+        ttgl.assume(columns > 0)
+        ttgl.assume(columns <= 8388608)
+        pid = ttgl.program_id(0)
+        ttgl.assume(pid < groups * columns)
+        column = pid // groups
+        lanes = ttgl.arange(0, 256, layout=layout)
+        values = ttgl.load(table + (column * 256 + lanes) % 256)
+        ttgl.store(output + pid * 256 + lanes, values)
+
+    layout = ttgl.BlockedLayout([4], [64], [1], [0])
+    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
+    output = torch.empty((35, 256), dtype=torch.int32, device=DEVICE)
+    compiled = kernel[(35, )](output, table, 7, 5, layout, num_warps=1)
+    torch.testing.assert_close(output, table.expand_as(output), rtol=0, atol=0)
+    assert "tt.refine" in compiled.asm["ttgir"]
+    assert "tt.refine" not in compiled.asm["llir"]
+    assert "load <4 x i32>" in compiled.asm["llir"]
 
 
 @triton.jit

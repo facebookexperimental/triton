@@ -30,6 +30,30 @@ class TT_Op<string mnemonic, list<Trait> traits = []>
 //
 // Cast Ops
 //
+def TT_IntegerPredicateAttr : Attr<CPred<"::llvm::isa<::mlir::arith::CmpIPredicateAttr>($_self)">,
+                                   "integer comparison predicate"> {
+  let storageType = "::mlir::arith::CmpIPredicateAttr";
+  let returnType = "::mlir::arith::CmpIPredicate";
+  let convertFromStorage = "$_self.getValue()";
+  let constBuilderCall = "::mlir::arith::CmpIPredicateAttr::get($_builder.getContext(), $0)";
+}
+
+def TT_RefineOp : TT_Op<"refine", [Pure,
+    AllTypesMatch<["value", "bound", "result"]>]> {
+  let summary = "Refine one integer value with a relational bound";
+  let description = [{
+    The result equals value when the comparison holds on defined operands.
+    Otherwise the result is poison. Facts constrain only the result, not
+    sibling uses of either operand. An unused result does not cause UB.
+    Producing poison is safe to speculate; operand dominance still applies.
+  }];
+  let arguments = (ins AnySignlessInteger:$value,
+                       AnySignlessInteger:$bound,
+                       TT_IntegerPredicateAttr:$predicate);
+  let results = (outs AnySignlessInteger:$result);
+  let assemblyFormat = "$value `,` $bound attr-dict `:` type($result)";
+}
+
 // Use cast ops in arith:
 //   bitcast
 //   fptoui, fptosi, uitofp, sitofp,

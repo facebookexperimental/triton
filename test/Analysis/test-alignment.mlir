@@ -1,4 +1,206 @@
-// RUN: triton-opt %s -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
+// RUN: triton-opt %s -triton-materialize-integer-facts -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
+// RUN: triton-opt %s -triton-materialize-integer-facts -test-integer-facts -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
+// RUN: triton-opt %s -triton-materialize-integer-facts -triton-materialize-integer-facts -test-print-alignment -verify-diagnostics=only-expected -split-input-file | FileCheck %s --check-prefix=REFINE
+// RUN: triton-opt %s -triton-materialize-integer-facts -test-print-alignment -triton-erase-integer-refinements -verify-diagnostics=only-expected -split-input-file | FileCheck %s --check-prefix=ERASE
+
+// ERASE-NOT: tt.refine
+// ERASE: llvm.intr.assume
+// ERASE-NOT: tt.refine
+
+// REFINE-LABEL: tt.func @refine_branch_scope
+// REFINE: scf.if
+// REFINE: %[[LOW:.*]] = tt.refine %{{.*}}, %{{.*}} {predicate = 5 : i64}
+// REFINE: %[[HIGH:.*]] = tt.refine %[[LOW]], %{{.*}} {predicate = 2 : i64}
+// REFINE-NOT: tt.refine
+// REFINE: tt.splat %[[HIGH]]
+// REFINE: } else {
+// REFINE-NOT: tt.refine
+// REFINE: tt.splat %arg0
+tt.func @refine_branch_scope(%x: i32) {
+  %zero = arith.constant 0 : i32
+  %upper = arith.constant 1024 : i32
+  %nonnegative = arith.cmpi sge, %x, %zero : i32
+  %bounded = arith.cmpi slt, %x, %upper : i32
+  %both = arith.andi %bounded, %nonnegative : i1
+  scf.if %both {
+    %base = tt.splat %x : i32 -> tensor<4xi32>
+    %stride = arith.constant dense<4> : tensor<4xi32>
+    %scaled = arith.muli %base, %stride : tensor<4xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32>
+    %index = arith.addi %scaled, %lane : tensor<4xi32>
+    // expected-remark @below {{contiguity = [4], divisibility = [4], constancy = [1]}}
+    %rem = arith.remsi %index, %stride : tensor<4xi32>
+  } else {
+    %base = tt.splat %x : i32 -> tensor<4xi32>
+    %stride = arith.constant dense<4> : tensor<4xi32>
+    %scaled = arith.muli %base, %stride : tensor<4xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32>
+    %index = arith.addi %scaled, %lane : tensor<4xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+    %rem = arith.remsi %index, %stride : tensor<4xi32>
+  }
+  tt.return
+}
+
+// -----
+
+// REFINE-LABEL: tt.func @refine_dynamic_bound
+// REFINE: tt.refine
+tt.func @refine_dynamic_bound(%x: i32, %limit: i32) {
+  %zero = arith.constant 0 : i32
+  %upper = arith.constant 1024 : i32
+  %limit_bound = tt.refine %limit, %upper {predicate = 3 : i64} : i32
+  %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
+  %bounded = tt.refine %positive, %limit_bound {predicate = 2 : i64} : i32
+  %proof = arith.cmpi slt, %bounded, %limit_bound {test.proof = "proven"} : i32
+  %inverse = arith.cmpi sge, %bounded, %limit_bound {test.proof = "disproven"} : i32
+  %sibling = arith.cmpi slt, %x, %limit_bound {test.proof = "unknown"} : i32
+  %base = tt.splat %bounded : i32 -> tensor<4xi32>
+  %stride = arith.constant dense<4> : tensor<4xi32>
+  %scaled = arith.muli %base, %stride : tensor<4xi32>
+  %lane = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32>
+  %index = arith.addi %scaled, %lane : tensor<4xi32>
+  // expected-remark @below {{contiguity = [4], divisibility = [4], constancy = [1]}}
+  %rem = arith.remsi %index, %stride : tensor<4xi32>
+  %original = tt.splat %x : i32 -> tensor<4xi32>
+  %original_scaled = arith.muli %original, %stride : tensor<4xi32>
+  %original_index = arith.addi %original_scaled, %lane : tensor<4xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %original_rem = arith.remsi %original_index, %stride : tensor<4xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @refine_existing_chain(%x: i32) {
+  %zero = arith.constant 0 : i32
+  %upper = arith.constant 1024 : i32
+  %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
+  %condition = arith.cmpi slt, %x, %upper : i32
+  llvm.intr.assume %condition : i1
+  %lower = arith.cmpi sge, %x, %zero {test.proof = "unknown"} : i32
+  %refined_lower = arith.cmpi sge, %positive, %zero {test.proof = "proven"} : i32
+  %refined_upper = arith.cmpi slt, %positive, %upper {test.proof = "proven"} : i32
+  %bound = arith.cmpi slt, %x, %upper {test.proof = "proven"} : i32
+  tt.return
+}
+
+// -----
+
+tt.func @refine_merge_and_freeze(%x: i32, %limit: i32, %cond: i1) {
+  %zero = arith.constant 0 : i32
+  %negative = tt.refine %x, %zero {predicate = 2 : i64} : i32
+  %frozen = llvm.freeze %negative : i32
+  %freeze_proof = arith.cmpi slt, %frozen, %zero {test.proof = "unknown"} : i32
+  %merged = scf.if %cond -> (i32) {
+    %low = tt.refine %x, %limit {predicate = 2 : i64} : i32
+    scf.yield %low : i32
+  } else {
+    %high = tt.refine %x, %limit {predicate = 5 : i64} : i32
+    scf.yield %high : i32
+  }
+  %merge_proof = arith.cmpi slt, %merged, %limit {test.proof = "unknown"} : i32
+  %one = arith.constant 1 : i32
+  %loop = scf.for %iv = %zero to %limit step %one iter_args(%carry = %x) -> (i32) : i32 {
+    %next = tt.refine %carry, %iv {predicate = 2 : i64} : i32
+    scf.yield %next : i32
+  }
+  %loop_proof = arith.cmpi slt, %loop, %limit {test.proof = "unknown"} : i32
+  %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
+  %contradiction = tt.refine %positive, %zero {predicate = 2 : i64} : i32
+  %sibling = arith.cmpi sge, %x, %zero {test.proof = "unknown"} : i32
+  tt.return
+}
+
+// -----
+
+tt.func @refine_product_quotient(%x: i32, %groups: i32, %columns: i32) {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %seven = arith.constant 7 : i32
+  %limit = arith.constant 268435456 : i32
+  %g0 = tt.refine %groups, %one {predicate = 5 : i64} : i32
+  %g = tt.refine %g0, %seven {predicate = 3 : i64} : i32
+  %n0 = tt.refine %columns, %one {predicate = 5 : i64} : i32
+  %n = tt.refine %n0, %limit {predicate = 3 : i64} : i32
+  %total = arith.muli %g, %n : i32
+  %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
+  %bounded = tt.refine %positive, %total {predicate = 2 : i64} : i32
+  %q = arith.divsi %bounded, %g : i32
+  %base = tt.splat %q : i32 -> tensor<4xi32>
+  %stride = arith.constant dense<4> : tensor<4xi32>
+  %scaled = arith.muli %base, %stride : tensor<4xi32>
+  %lane = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32>
+  %index = arith.addi %scaled, %lane : tensor<4xi32>
+  // expected-remark @below {{contiguity = [4], divisibility = [4], constancy = [1]}}
+  %rem = arith.remsi %index, %stride : tensor<4xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @refine_wrapping_product_quotient(%x: i32, %groups: i32, %columns: i32) {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %sixteen = arith.constant 16 : i32
+  %limit = arith.constant 268435456 : i32
+  %g0 = tt.refine %groups, %one {predicate = 5 : i64} : i32
+  %g = tt.refine %g0, %sixteen {predicate = 3 : i64} : i32
+  %n0 = tt.refine %columns, %one {predicate = 5 : i64} : i32
+  %n = tt.refine %n0, %limit {predicate = 3 : i64} : i32
+  %total = arith.muli %g, %n : i32
+  %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
+  %bounded = tt.refine %positive, %total {predicate = 2 : i64} : i32
+  %q = arith.divsi %bounded, %g : i32
+  %base = tt.splat %q : i32 -> tensor<4xi32>
+  %stride = arith.constant dense<4> : tensor<4xi32>
+  %scaled = arith.muli %base, %stride : tensor<4xi32>
+  %lane = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32>
+  %index = arith.addi %scaled, %lane : tensor<4xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %rem = arith.remsi %index, %stride : tensor<4xi32>
+  tt.return
+}
+
+// -----
+
+// REFINE-LABEL: tt.func @refine_shared_successor
+// REFINE: cf.cond_br
+// REFINE: tt.refine
+// REFINE: cf.br
+// REFINE: tt.refine
+// REFINE: cf.br
+tt.func @refine_shared_successor(%x: i32, %limit: i32) -> i32 {
+  %condition = arith.cmpi slt, %x, %limit : i32
+  cf.cond_br %condition, ^join(%x : i32), ^join(%x : i32)
+^join(%arg: i32):
+  %unknown = arith.cmpi slt, %arg, %limit {test.proof = "unknown"} : i32
+  tt.return %arg : i32
+}
+
+// -----
+
+tt.func @refine_congruence_limits_signed_range(%x: i32) {
+  %two = arith.constant 2 : i32
+  %zero = arith.constant 0 : i32
+  %even = arith.muli %x, %two : i32
+  %nonnegative = tt.refine %even, %zero {predicate = 5 : i64} : i32
+  %max = arith.constant 2147483647 : i32
+  %even_bound = arith.cmpi slt, %nonnegative, %max {test.proof = "proven"} : i32
+  %three = arith.constant 3 : i32
+  %wrapped = arith.muli %x, %three : i32
+  %wrapped_positive = tt.refine %wrapped, %zero {predicate = 5 : i64} : i32
+  %wrapped_bound = arith.cmpi slt, %wrapped_positive, %max {test.proof = "unknown"} : i32
+  %base = tt.splat %nonnegative : i32 -> tensor<2xi32>
+  %lane = tt.make_range {start = 0 : i32, end = 2 : i32} : tensor<2xi32>
+  %index = arith.addi %base, %lane : tensor<2xi32>
+  %divisor = arith.constant dense<2> : tensor<2xi32>
+  // expected-remark @below {{contiguity = [2], divisibility = [2], constancy = [1]}}
+  %rem = arith.remsi %index, %divisor : tensor<2xi32>
+  tt.return
+}
+
+// -----
 
 tt.func @negative_dividend_dynamic_remainder(%input: i32, %divisor: i32) {
   %zero = arith.constant 0 : i32
@@ -865,7 +1067,7 @@ tt.func @signed_tile_can_wrap() {
 
 // -----
 
-tt.func @signed_assumption_is_use_local(%base: i32 {tt.divisibility = 128 : i32}, %cond: i1) {
+tt.func @signed_assumption_follows_ssa(%base: i32 {tt.divisibility = 128 : i32}, %cond: i1) {
   %zero = arith.constant 0 : i32
   %limit = arith.constant 2147483520 : i32
   %positive = arith.cmpi sge, %base, %zero : i32
@@ -879,8 +1081,13 @@ tt.func @signed_assumption_is_use_local(%base: i32 {tt.divisibility = 128 : i32}
   scf.if %cond {
     llvm.intr.assume %positive : i1
     llvm.intr.assume %bounded : i1
-    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64]}}
+    // Earlier computations retain their original SSA facts.
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
     %inside = arith.divsi %indices, %divisor : tensor<128xi32>
+    %local_bases = tt.splat %base : i32 -> tensor<128xi32>
+    %local_indices = arith.addi %local_bases, %lanes : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64]}}
+    %local = arith.divsi %local_indices, %divisor : tensor<128xi32>
   } else {
     // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
     %sibling = arith.divsi %indices, %divisor : tensor<128xi32>
@@ -889,8 +1096,12 @@ tt.func @signed_assumption_is_use_local(%base: i32 {tt.divisibility = 128 : i32}
   %outside = arith.divsi %indices, %divisor : tensor<128xi32>
   llvm.intr.assume %positive : i1
   llvm.intr.assume %bounded : i1
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64]}}
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
   %after = arith.divsi %indices, %divisor : tensor<128xi32>
+  %new_bases = tt.splat %base : i32 -> tensor<128xi32>
+  %new_indices = arith.addi %new_bases, %lanes : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64]}}
+  %new = arith.divsi %new_indices, %divisor : tensor<128xi32>
   tt.return
 }
 

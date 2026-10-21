@@ -43,6 +43,10 @@ void init_triton_passes_common(py::module_ &m) {
 }
 
 void init_triton_passes_ttir(py::module_ &m) {
+  ADD_PASS_WRAPPER_0("add_materialize_integer_facts",
+                     mlir::triton::createTritonMaterializeIntegerFacts);
+  ADD_PASS_WRAPPER_0("add_erase_integer_refinements",
+                     mlir::triton::createTritonEraseIntegerRefinements);
   using namespace mlir::triton;
   ADD_PASS_WRAPPER_0("add_combine", createTritonCombineOps);
   ADD_PASS_WRAPPER_0("add_reorder_broadcast", createTritonReorderBroadcast);
