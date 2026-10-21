@@ -304,6 +304,7 @@ public:
   unsigned getAlignment(Value offsetsValue, unsigned elementBitWidth);
 
   unsigned getMaskAlignment(Value mask);
+  unsigned getMaskAlignment(Value mask, unsigned axis);
 
 private:
   void initialize(FunctionOpInterface funcOp, AxisInfoAnalysis::LoadCallback);
