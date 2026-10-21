@@ -125,8 +125,9 @@ class IntegerRelations {
       return value == other.value && divisor == other.divisor;
     }
   };
-  using Monomial = SmallVector<Symbol, 2>;
-  using Polynomial = std::map<Monomial, int64_t>;
+  using Monomial = SmallVector<Symbol, 4>;
+  // Sorted, bounded terms avoid a tree allocation for each proof subtraction.
+  using Polynomial = SmallVector<std::pair<Monomial, int64_t>, 16>;
   struct Constraint {
     Polynomial expression;
     bool strict;
@@ -326,19 +327,31 @@ private:
                                        int64_t sign = 1) {
     if (!a || !b)
       return std::nullopt;
-    for (const auto &[term, coefficient] : *b) {
-      int64_t scaled, sum;
-      if (llvm::MulOverflow(coefficient, sign, scaled) ||
-          llvm::AddOverflow((*a)[term], scaled, sum))
-        return std::nullopt;
-      if (sum)
-        (*a)[term] = sum;
-      else
-        a->erase(term);
-      if (a->size() > 16)
+    Polynomial result;
+    auto lhs = a->begin();
+    auto rhs = b->begin();
+    while (lhs != a->end() || rhs != b->end()) {
+      if (rhs == b->end() || (lhs != a->end() && lhs->first < rhs->first)) {
+        result.push_back(*lhs++);
+      } else {
+        int64_t scaled, sum;
+        if (llvm::MulOverflow(rhs->second, sign, scaled))
+          return std::nullopt;
+        if (lhs != a->end() && lhs->first == rhs->first) {
+          if (llvm::AddOverflow(lhs->second, scaled, sum))
+            return std::nullopt;
+          ++lhs;
+        } else {
+          sum = scaled;
+        }
+        if (sum)
+          result.emplace_back(rhs->first, sum);
+        ++rhs;
+      }
+      if (result.size() > 16)
         return std::nullopt;
     }
-    return a;
+    return result;
   }
 
   static std::optional<Polynomial>
@@ -497,33 +510,46 @@ private:
       LDBG() << "Integer relation constraint budget exhausted";
   }
 
-  bool constantNonnegative(const Polynomial &expression, bool strict) const {
+  std::optional<std::pair<APInt, APInt>> termRange(const Monomial &term) const {
+    APInt lo(256, 1), hi(256, 1);
+    for (Symbol symbol : term) {
+      auto it = ranges.find(symbols[symbol.value]);
+      if (it == ranges.end() || it->second.smin().getBitWidth() > 64)
+        return std::nullopt;
+      APInt a = it->second.smin().sext(256);
+      APInt b = it->second.smax().sext(256);
+      if (symbol.divisor) {
+        auto divisor = ranges.find(symbols[symbol.divisor]);
+        if (a.isNegative() || divisor == ranges.end() ||
+            !divisor->second.smin().isStrictlyPositive())
+          return std::nullopt;
+        a = a.sdiv(divisor->second.smax().sext(256));
+        b = b.sdiv(divisor->second.smin().sext(256));
+      }
+      std::array<APInt, 4> products{lo * a, lo * b, hi * a, hi * b};
+      lo = *llvm::min_element(
+          products, [](const APInt &x, const APInt &y) { return x.slt(y); });
+      hi = *llvm::max_element(
+          products, [](const APInt &x, const APInt &y) { return x.slt(y); });
+    }
+    return std::make_pair(std::move(lo), std::move(hi));
+  }
+
+  bool constantNonnegative(const Polynomial &expression, bool strict) {
     APInt sum(256, 0);
     for (const auto &[term, coefficient] : expression) {
-      APInt lo(256, 1), hi(256, 1);
-      for (Symbol symbol : term) {
-        auto it = ranges.find(symbols[symbol.value]);
-        if (it == ranges.end() || it->second.smin().getBitWidth() > 64)
-          return false;
-        APInt a = it->second.smin().sext(256);
-        APInt b = it->second.smax().sext(256);
-        if (symbol.divisor) {
-          auto divisor = ranges.find(symbols[symbol.divisor]);
-          if (a.isNegative() || divisor == ranges.end() ||
-              !divisor->second.smin().isStrictlyPositive())
-            return false;
-          a = a.sdiv(divisor->second.smax().sext(256));
-          b = b.sdiv(divisor->second.smin().sext(256));
-        }
-        std::array<APInt, 4> products{lo * a, lo * b, hi * a, hi * b};
-        lo = *llvm::min_element(
-            products, [](const APInt &x, const APInt &y) { return x.slt(y); });
-        hi = *llvm::max_element(
-            products, [](const APInt &x, const APInt &y) { return x.slt(y); });
-      }
-      bool overflow;
-      APInt product = (coefficient < 0 ? hi : lo)
-                          .smul_ov(APInt(256, coefficient, true), overflow);
+      auto [it, inserted] = termRanges.try_emplace(term);
+      if (inserted)
+        it->second = termRange(term);
+      if (!it->second)
+        return false;
+      const auto &[lo, hi] = *it->second;
+      bool overflow = false;
+      APInt product =
+          coefficient == 1
+              ? lo
+              : (coefficient < 0 ? hi : lo)
+                    .smul_ov(APInt(256, coefficient, true), overflow);
       if (overflow)
         return false;
       sum = sum.sadd_ov(product, overflow);
@@ -533,14 +559,14 @@ private:
     return strict ? sum.isStrictlyPositive() : sum.isNonNegative();
   }
 
-  bool knownNonnegative(const Polynomial &expression, bool strict) const {
+  bool knownNonnegative(const Polynomial &expression, bool strict) {
     for (const Constraint &constraint : constraints)
       if (constraint.expression == expression && (!strict || constraint.strict))
         return true;
     return constantNonnegative(expression, strict);
   }
 
-  bool proveDirect(const Polynomial &expression, bool strict) const {
+  bool proveDirect(const Polynomial &expression, bool strict) {
     if (knownNonnegative(expression, strict))
       return true;
     unsigned budget = 256;
@@ -580,8 +606,12 @@ private:
                      const Polynomial &constraint) {
     SmallVector<int64_t, 2> scales;
     for (const auto &[term, coefficient] : constraint) {
-      auto it = expression.find(term);
-      if (term.empty() || it == expression.end() || !coefficient ||
+      auto it = llvm::lower_bound(expression, term,
+                                  [](const auto &entry, const Monomial &key) {
+                                    return entry.first < key;
+                                  });
+      if (term.empty() || it == expression.end() || it->first != term ||
+          !coefficient ||
           (coefficient == -1 &&
            it->second == std::numeric_limits<int64_t>::min()))
         continue;
@@ -616,10 +646,12 @@ private:
   SmallVector<Value> values;
   SmallVector<std::pair<Value, IntegerBound>> inheritedBounds;
   SmallVector<Value> symbols{Value{}};
-  SmallVector<Constraint> constraints;
+  SmallVector<Constraint, 0> constraints;
   DenseMap<Value, unsigned> symbolIDs;
   DenseMap<Value, ConstantIntRanges> ranges;
   DenseMap<Value, std::optional<Polynomial>> normalized;
+  // Ranges are immutable within one local proof; never cache across transfers.
+  std::map<Monomial, std::optional<std::pair<APInt, APInt>>> termRanges;
   function_ref<const IntegerFacts &(Value)> getFacts;
   bool valid = true;
 };
