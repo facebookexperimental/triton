@@ -98,6 +98,10 @@ public:
   int getComputeCapability() const {
     return targetFeatures.getComputeCapability();
   }
+  bool supportsMbarrierMulticast() const {
+    // mbarrier.arrive.multicast was introduced in PTX 9.4 for Rubin.
+    return targetFeatures.supportsMbarMulticast() && ptxVersion >= 94;
+  }
   const triton::nvidia_gpu::TargetFeatures &getTargetFeatures() const {
     return targetFeatures;
   }
