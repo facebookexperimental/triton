@@ -2,7 +2,8 @@
 """Collect GPU workflow runs and render the /ci/ dashboard.
 
   collect DATA_DIR [--since ISO]
-      Fetch runs of gpu-tests.yml, gpu-tests-nightly.yml and nightly-fbtriton.yml created since the
+      Fetch runs of gpu-tests.yml, gpu-tests-nightly.yml,
+      nightly-tlx-ops-bench.yml and nightly-fbtriton.yml created since the
       saved cursor (or --since), plus the jobs and steps of every completed
       run and the failing tests in the log of every failed GPU job, into
       DATA_DIR/runs-YYYY-MM.jsonl.gz and DATA_DIR/state.json. ci-health.yml
@@ -49,7 +50,7 @@ BACKFILL_DAYS = 30
 STUCK_DAYS = 7
 #: Workflows collected. Since #3875, gpu-tests.yml calls mi350/b200/h100.yml as reusable workflows;
 #: gpu-tests-nightly.yml runs the slow suites (TritonBench) once a day.
-COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-fbtriton.yml")
+COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml")
 
 
 def gh_api(path):
@@ -154,7 +155,7 @@ def _attach_failures(jobs, text, wf="gpu-tests.yml"):
         if j["conclusion"] != "failure" or rules.gpu_of({"wf": wf}, j) is None:
             continue
         try:
-            logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"))
+            logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"), wf != rules.BENCH_WF)
         except subprocess.CalledProcessError as exc:  # logs expired or not readable: no test result
             print(f"no log for job {j['id']} ({j['name']}): {exc.stderr.strip() if exc.stderr else exc}")
 

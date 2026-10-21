@@ -11,6 +11,8 @@ header{display:flex;justify-content:space-between;gap:16px;align-items:flex-star
 h1{font-size:23px;margin:0 0 2px;font-weight:650}h2{font-size:16px;margin:0;font-weight:620}h3{font-size:13px;margin:0 0 6px;font-weight:620;color:var(--text-secondary)}
 .sub{color:var(--text-secondary);margin:0}.muted{color:var(--text-muted);font-size:12px}
 button.theme{background:var(--surface-1);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer;font:inherit;font-size:12px}
+.guide{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px 16px;margin:14px 0 0;font-size:12.5px;color:var(--text-secondary)}.guide b{color:var(--text-primary);font-weight:620}
+@media (max-width:820px){.guide{grid-template-columns:1fr}}
 nav.tabs{display:flex;gap:2px;margin:18px 0 0;border-bottom:1px solid var(--border);flex-wrap:wrap}
 nav.tabs button{background:none;border:0;border-bottom:3px solid transparent;margin-bottom:-1px;padding:8px 14px;font:inherit;font-size:14px;color:var(--text-secondary);cursor:pointer;display:inline-flex;gap:8px;align-items:center}
 nav.tabs button:hover{color:var(--text-primary)}nav.tabs button[aria-selected="true"]{color:var(--text-primary);font-weight:620;border-bottom-color:var(--text-primary)}
@@ -65,16 +67,22 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every 3 h</p></div>
 <button class="theme" id="themeBtn" type="button">Toggle theme</button></header>
 <div class="branchbar"><span class="muted">Branch</span><span class="seg" id="branch-sel"></span></div>
+<div class="guide">
+<span><b>Push</b>: did a push to this branch break a test that passed on the push before it?</span>
+<span><b>Scheduled</b>: did last night's release, daily GPU suites and TLX ops bench pass, and did perf move?</span>
+<span><b>Pull requests</b>: each PR's latest run, and whether a failure is the author's, the branch's or CI's.</span>
+<span><b>Operations</b>: what CI costs in GPU hours, how long jobs and queues take, and which setup steps fail.</span>
+</div>
 <nav class="tabs" role="tablist">
-<button role="tab" data-tab="main" aria-selected="true">GPU tests <span class="badge" id="b-main"></span></button>
-<button role="tab" data-tab="sched" aria-selected="false">Nightly &amp; perf <span class="badge" id="b-sched"></span></button>
+<button role="tab" data-tab="main" aria-selected="true">Push <span class="badge" id="b-main"></span></button>
+<button role="tab" data-tab="sched" aria-selected="false">Scheduled <span class="badge" id="b-sched"></span></button>
 <button role="tab" data-tab="pr" aria-selected="false">Pull requests <span class="badge na">author-owned</span></button>
 <button role="tab" data-tab="ops" aria-selected="false">Operations <span class="badge" id="b-ops"></span></button>
 </nav>
 <p class="empty" id="nodata" hidden>No data collected yet.</p>
 
 <section id="main" role="tabpanel">
-<div class="shead"><h2>GPU tests</h2><span class="q" id="m-q">Did a push to main break something new?</span><span class="owner">Owner: on-call / commit author</span></div>
+<div class="shead"><h2>Push</h2><span class="q" id="m-q">Did a push to main break something new?</span><span class="owner">Owner: on-call / commit author</span></div>
 <div class="subsec"><h3>GPU Tests</h3><span class="muted">push runs of Meta Triton GPU Tests (<code>gpu-tests.yml</code>)</span></div>
 <div id="m-build"></div>
 <div class="card"><h3>By GPU: verdict and the last pushes, newest first (T+N h = pushed N hours before the data time)</h3><table class="strip" id="m-grid"></table>
@@ -90,10 +98,12 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 </section>
 
 <section id="sched" role="tabpanel" hidden>
-<div class="shead"><h2>Nightly &amp; perf</h2><span class="q">Did the nightly release ship, and did perf regress?</span><span class="owner">Owner: release / perf owners</span></div>
+<div class="shead"><h2>Scheduled</h2><span class="q">Did last night's scheduled runs pass, and did perf regress?</span><span class="owner">Owner: release / perf owners</span></div>
 <div class="card"><h3>Nightly release (<code>nightly-fbtriton.yml</code>)</h3><div class="grid4" id="n-rel"></div></div>
 <div class="card"><h3>GPU tests, nightly (<code>gpu-tests-nightly.yml</code>): TritonBench</h3><div id="n-gpu"></div>
 <p class="note">Suites too slow for PRs and pushes run here once a day. Each row is the latest run on that GPU.</p></div>
+<div class="card"><h3>TLX ops bench (<code>nightly-tlx-ops-bench.yml</code>)</h3><div id="n-bench"></div>
+<p class="note">Times every tlx.ops op against its reference on each GPU after each nightly release. Each row is the latest run on that GPU, with the ops whose bench failed; per-case numbers are on the <a href="../bench/">TLX ops bench dashboard</a>.</p></div>
 <div class="card"><h3>Perf events from the TLX ops bench, last two nights</h3><div id="n-perf"></div>
 <p class="note">An event is a case whose TLX TFLOP/s moved 10% or more from one night to the next and still holds the night after. The latest night cannot be confirmed yet. Full per-kernel history is on the <a href="../bench/">TLX ops bench dashboard</a>.</p></div>
 </section>
@@ -191,13 +201,15 @@ function renderNightly(nt){
     `${e.n_slower?`<span class="bad">▼ ${e.n_slower} slower</span>`:""}${e.n_slower&&e.n_faster?"<br>":""}${e.n_faster?`<span class="ok">▲ ${e.n_faster} faster</span>`:""}`,esc(e.signature||""),
     (e.suspects||[]).map(s=>`${sha(s.sha)} ${pr(s.pr)} <span class="muted">${esc((s.title||"").slice(0,60))}</span>`).join("<br>")+(e.compare?`<br><a href="${esc(e.compare)}">${esc(e.range||"compare")}</a>`:"")]));
   const G={passed:`<span class="ok">✓ passed</span>`,test:`<span class="bad">✕ tests failed</span>`,setup:`<span class="warn">⚠ setup failed</span>`,cancelled:`<span class="na">cancelled</span>`};
-  const gpus=["H100","B200","MI350"].filter(g=>nt.gpu&&nt.gpu[g]);
-  $("n-gpu").innerHTML=table(["GPU","Last run","Failing tests","Passed, last 7 days"],gpus.map(g=>{const x=nt.gpu[g];
-    return [g,`${G[x.result]||esc(x.result)}${x.setup?` <span class="muted">${esc(x.setup)}</span>`:""}<br><a href="${esc(x.url)}">${sha(x.sha)}</a> <span class="muted">${ago(x.t)}</span>`,
-      x.fails.length?x.fails.map(f=>`<code>${esc(f.id)}</code>${f.msg?`<br><span class="muted">${esc(f.msg.slice(0,120))}</span>`:""}`).join("<br>"):`<span class="muted">none</span>`,`${x.passed_7} / ${x.runs_7}`]}),[3]);
-  const gpuRed=gpus.filter(g=>nt.gpu[g].result==="test").length;
+  // One row per GPU: the latest run of a daily GPU workflow. Returns how many GPUs failed on tests.
+  const perGpu=(id,v)=>{const gpus=["H100","B200","MI350"].filter(g=>v&&v[g]);
+    $(id).innerHTML=table(["GPU","Last run","Failing tests","Passed, last 7 days"],gpus.map(g=>{const x=v[g];
+      return [g,`${G[x.result]||esc(x.result)}${x.setup?` <span class="muted">${esc(x.setup)}</span>`:""}<br><a href="${esc(x.url)}">${sha(x.sha)}</a> <span class="muted">${ago(x.t)}</span>`,
+        x.fails.length?x.fails.map(f=>`<code>${esc(f.id)}</code>${f.msg?`<br><span class="muted">${esc(f.msg.slice(0,120))}</span>`:""}`).join("<br>"):`<span class="muted">none</span>`,`${x.passed_7} / ${x.runs_7}`]}),[3]);
+    return gpus.filter(g=>v[g].result==="test").length};
+  const gpuRed=perGpu("n-gpu",nt.gpu)+perGpu("n-bench",nt.bench);
   const slower=nt.perf.filter(e=>e.n_slower&&!e.unconfirmed).length;
-  if(r&&r.conclusion!=="success")badge("b-sched","✕ release","bad");else if(gpuRed)badge("b-sched",`✕ ${gpuRed} GPU nightly`,"bad");else if(slower)badge("b-sched",`${slower} slower`,"bad");else badge("b-sched","✓","ok");
+  if(r&&r.conclusion!=="success")badge("b-sched","✕ release","bad");else if(gpuRed)badge("b-sched",`✕ ${gpuRed} GPU run${gpuRed>1?"s":""}`,"bad");else if(slower)badge("b-sched",`${slower} slower`,"bad");else badge("b-sched","✓","ok");
 }
 
 function renderPR(list,branch="main"){

@@ -97,7 +97,8 @@ def test_collect_lists_gpu_and_nightly_runs_only(tmp_path):
     _, api, _ = collect(tmp_path, {})
     listed = [c for c in api.calls if "/workflows/" in c]
     assert {c.split("/workflows/")[1].split("/")[0]
-            for c in listed} == {"gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-fbtriton.yml"}
+            for c in listed
+            } == {"gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml", "nightly-fbtriton.yml"}
 
 
 def test_select_log_gives_the_runs_selection(tmp_path):

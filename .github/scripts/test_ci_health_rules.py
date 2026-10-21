@@ -249,6 +249,7 @@ def test_gpu_of_reads_both_gpu_workflows():
     assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "tritonbench (x) / x-tritonbench-test"}) is None
     assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "build"}) is None
     assert r.gpu_of({"wf": "nightly-fbtriton.yml"}, {"name": "h100 / x"}) is None
+    assert r.gpu_of({"wf": r.BENCH_WF}, {"name": "mi350 / bench"}) == "MI350"
 
 
 def test_nightly_gpu_view_latest_result_and_week():
@@ -259,6 +260,30 @@ def test_nightly_gpu_view_latest_result_and_week():
     assert "MI350" not in v
     first = r.gpu_nightly_view(runs[:1], stamp(23))["H100"]
     assert first["result"] == "test" and [f["id"] for f in first["fails"]] == ["gemm"]
+
+
+def bench_run(h, platform, *failing):
+    steps = [step("Run tlx.ops perf suite", "failure" if failing else "success", list(failing) if failing else None)]
+    return run(h, [
+        job(f"{platform} / bench", *steps, label="linux-gpu"),
+        job(f"{platform} / publish", step("x", "success"), label="ubuntu-latest")
+    ], event="workflow_run", wf=r.BENCH_WF)
+
+
+def test_bench_card_shows_the_latest_run_per_gpu():
+    runs = [bench_run(1, "b200", "test_op_perf[bench_mm]"), bench_run(2, "b200", "test_op_perf[bench_addmm]")]
+    v = r.page_data(runs, stamp(23), {})["branches"]["main"]["nightly"]["bench"]
+    assert v["B200"]["result"] == "test" and [f["id"] for f in v["B200"]["fails"]] == ["test_op_perf[bench_addmm]"]
+    assert (v["B200"]["passed_7"], v["B200"]["runs_7"]) == (0, 2) and set(v) == {"B200"}
+
+
+def test_bench_step_maps_to_a_group():
+    """A failed bench is a test result, not a setup failure, so the bench workflow's step needs a group."""
+    import os
+    import re
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "_tlx-ops-bench.yml")
+    names = re.findall(r"^\s+- name: (Run .+?)\s*$", open(path).read(), re.M)
+    assert names and all(r.group_of(n) == "TLX ops bench" for n in names)
 
 
 def test_nightly_gpu_hours_count_in_ops():

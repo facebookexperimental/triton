@@ -37,6 +37,7 @@ GROUPS = [
     (r"^Run runtime unit tests$", "Runtime"),
     (r"^Run host-default TLX L2 perf$", "TLX perf"),
     (r"^Run TorchTLX", "TorchTLX"),
+    (r"^Run tlx\.ops perf suite$", "TLX ops bench"),
 ]
 #: Job name -> job group, for runner time. *-meta-triton-test was renamed *-tritonbench-test in #3943.
 JOB_GROUPS = [
@@ -103,7 +104,9 @@ OUTCOMES = ("passed", "test", "build", "setup", "cancelled")
 RETIRE_DAYS = 7
 
 #: Workflows whose runs hold GPU jobs.
-GPU_RUN_WORKFLOWS = ("gpu-tests.yml", "gpu-tests-nightly.yml")
+#: The TLX ops perf bench, run on each GPU after every nightly release ("b200 / bench").
+BENCH_WF = "nightly-tlx-ops-bench.yml"
+GPU_RUN_WORKFLOWS = ("gpu-tests.yml", "gpu-tests-nightly.yml", BENCH_WF)
 
 
 def gpu_of(run, job):
@@ -427,12 +430,15 @@ def nightly_view(runs, asof, bench):
                     e["n_faster"], "signature": e.get("signature"), "unconfirmed": e.get("unconfirmed"), "range":
                     night.get("range"), "compare": night.get("compare"), "suspects": e.get("suspects", [])[:3]
                 })
-    return {"release": release, "perf": perf, "gpu": gpu_nightly_view(runs, asof)}
+    return {
+        "release": release, "perf": perf, "gpu": gpu_nightly_view(runs, asof), "bench":
+        gpu_nightly_view(runs, asof, BENCH_WF)
+    }
 
 
-def gpu_nightly_view(runs, asof):
-    """The latest gpu-tests-nightly.yml run per GPU: result and failing tests; and passes over the last 7 days."""
-    nights = sorted((r for r in runs if r.get("wf") == "gpu-tests-nightly.yml" and r.get("status") == "completed"
+def gpu_nightly_view(runs, asof, wf="gpu-tests-nightly.yml"):
+    """The latest run of a daily GPU workflow per GPU: result and failing tests; and passes over the last 7 days."""
+    nights = sorted((r for r in runs if r.get("wf") == wf and r.get("status") == "completed"
                      and r.get("jobs") is not None and r["created_at"] <= asof), key=lambda r: r["created_at"])
     week_ago = iso(t(asof) - dt.timedelta(days=7))
     out = {}
