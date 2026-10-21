@@ -235,9 +235,8 @@ struct PTXInstrCommon {
 protected:
   // "Call" the instruction with operands.
   // \param oprs The operands of this instruction.
-  // \param onlyAttachMLIRArgs Indicate that it simply attach the MLIR Arguments
-  // to the inline Asm without generating the operand ids(such as $0, $1) in PTX
-  // code.
+  // Raw snippets bind $N and ${N:modifier} to oprs[N]. Archive order stays
+  // fixed.
   PTXInstrExecution &call(llvm::ArrayRef<Operand *> oprs,
                           bool onlyAttachMLIRArgs = false);
 

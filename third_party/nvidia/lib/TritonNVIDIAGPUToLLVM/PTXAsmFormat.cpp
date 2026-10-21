@@ -2,6 +2,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Conversion/TritonGPUToLLVM/AsmFormat.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 // TODO(Superjomn): unify to llvm::raw_string_ostream
 #include <sstream>
@@ -149,18 +150,6 @@ std::string PTXBuilder::dump() const {
 
 PTXInstrExecution &PTXInstrCommon::call(ArrayRef<Operand *> oprs,
                                         bool onlyAttachMLIRArgs) {
-  if (onlyAttachMLIRArgs) {
-    // Nearly impossible to make the $0,$1 in two PTX code snippets to point to
-    // the same MLIR values in onlyAttachMLIRArgs mode.
-
-    // Facebook begin. Comment out the following code to avoid compilation error
-    // in CLC TLX query_cancel. assert(builder->executions.empty() &&
-    //        "builder can only hold a single execution when onlyAttachMIIRArgs
-    //        " "is true.");
-    // builder->reorderArgArchive(oprs);
-    // Facebook end.
-  }
-
   builder->executions.emplace_back(
       std::make_unique<PTXInstrExecution>(this, oprs, onlyAttachMLIRArgs));
 
@@ -185,7 +174,31 @@ std::string PTXInstrExecution::dump() const {
 
   std::string instrRepr = strJoin(instr->instrParts, ".");
   if (onlyAttachMLIRArgs) {
-    os << instrRepr;
+    StringRef remaining = instrRepr;
+    while (!remaining.empty()) {
+      auto [prefix, suffix] = remaining.split('$');
+      os << prefix;
+      if (prefix.size() == remaining.size())
+        break;
+      remaining = suffix;
+      os << '$';
+      if (remaining.consume_front("$")) {
+        os << '$';
+        continue;
+      }
+      if (remaining.consume_front("{"))
+        os << '{';
+      if (remaining.empty() || !llvm::isDigit(remaining.front()))
+        continue;
+      unsigned localIndex;
+      bool invalid = remaining.consumeInteger(10, localIndex);
+      assert(!invalid && localIndex < argsInOrder.size() &&
+             "raw PTX operand index out of range");
+      (void)invalid;
+      Operand *operand = argsInOrder[localIndex];
+      assert(operand->idx >= 0 && "raw PTX requires a numbered operand");
+      os << operand->idx;
+    }
     os.flush();
     return osStr;
   }
