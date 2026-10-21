@@ -85,7 +85,8 @@ def _pv(p, v_slot, acc0, acc1, acc2, acc3):
 
 
 @triton.jit
-def _mfma_stage(q0, q1, q2, q3, p, k_slot, v_slot, acc0, acc1, acc2, acc3, BLOCK_N: tl.constexpr):
+def _mfma_stage(q0, q1, q2, q3, p, k_slot, v_slot, acc0, acc1, acc2, acc3, kp, blk, last, k_step, k_buf, cur,
+                BLOCK_N: tl.constexpr):
     # QK(b + 1) from k_slot and PV(b) from v_slot, alternating 32-wide chunks.
     mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
     kl: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
@@ -105,6 +106,8 @@ def _mfma_stage(q0, q1, q2, q3, p, k_slot, v_slot, acc0, acc1, acc2, acc3, BLOCK
     v1 = tlx.require_layout(tlx.local_load(tlx.local_slice(v_slot, [0, 32], [n, 32]), relaxed=True), vl, pin=False)
     tlx.amd_sched_barrier(0)
     s = tl.dot(q1, k1, s)
+    tok_k = tlx.async_load(kp + tl.minimum(blk + 2, last) * k_step, tlx.local_view(k_buf, cur))
+    tlx.async_load_commit_group([tok_k])
     k2 = tlx.require_layout(tlx.local_load(tlx.local_trans(tlx.local_slice(k_slot, [0, 64], [n, 32])), relaxed=True),
                             kl, pin=False)
     tlx.amd_sched_barrier(0)
@@ -233,11 +236,6 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
     row_ok = offs_m < q_len
     q = tl.load(Q + (q_start + offs_m)[:, None] * stride_qt + off_h * stride_qh + offs_d[None, :], mask=row_ok[:, None],
                 other=0.0)
-    q = tlx.require_layout(q, tlx.dot_operand_layout(0, mma, k_width=8), pin=False)
-    q0 = tlx.extract_slice(q, [BLOCK_M, 32], [0, 0])
-    q1 = tlx.extract_slice(q, [BLOCK_M, 32], [0, 32])
-    q2 = tlx.extract_slice(q, [BLOCK_M, 32], [0, 64])
-    q3 = tlx.extract_slice(q, [BLOCK_M, 32], [0, 96])
     k_ptrs = K + k_start * stride_kt + off_kh * stride_kh + offs_n[:, None] * stride_kt + offs_d[None, :]
     v_ptrs = V + k_start * stride_vt + off_kh * stride_vh + offs_n[:, None] * stride_vt + offs_d[None, :]
     k_step = BLOCK_N * stride_kt
@@ -269,6 +267,14 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
         [BLOCK_N, HEAD_DIM])
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 2, layout=kv_layout)
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, 2, layout=kv_layout)
+    q_slot = tlx.local_view(v_buf, 1)
+    tlx.local_store(q_slot, q)
+    tl.debug_barrier()
+    q = tlx.require_layout(tlx.local_load(q_slot, relaxed=True), tlx.dot_operand_layout(0, mma, k_width=8), pin=False)
+    q0 = tlx.extract_slice(q, [BLOCK_M, 32], [0, 0])
+    q1 = tlx.extract_slice(q, [BLOCK_M, 32], [0, 32])
+    q2 = tlx.extract_slice(q, [BLOCK_M, 32], [0, 64])
+    q3 = tlx.extract_slice(q, [BLOCK_M, 32], [0, 96])
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc0 = tlx.zeros((BLOCK_M, 32), tl.float32, layout=mma)
@@ -284,11 +290,11 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
         last = full - lo - 1
         tok = tlx.async_load(kp, tlx.local_view(k_buf, 0))
         tlx.async_load_commit_group([tok])
-        tlx.async_load_wait_group(0)
-        tl.debug_barrier()
         tok_k = tlx.async_load(kp + tl.minimum(1, last) * k_step, tlx.local_view(k_buf, 1))
         tok_v = tlx.async_load(vp, tlx.local_view(v_buf, 0))
         tlx.async_load_commit_group([tok_k, tok_v])
+        tlx.async_load_wait_group(1)
+        tl.debug_barrier()
         s = _qk(q0, q1, q2, q3, tlx.local_view(k_buf, 0), BLOCK_N)
         m_i, l_i, p, acc0, acc1, acc2, acc3 = _softmax(s, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
                                                        Q.dtype.element_ty)
@@ -297,11 +303,11 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
             nxt = 1 - cur
             tlx.async_load_wait_group(0)
             tl.debug_barrier()
-            tok_k = tlx.async_load(kp + tl.minimum(blk + 2, last) * k_step, tlx.local_view(k_buf, cur))
             tok_v = tlx.async_load(vp + (blk + 1) * v_step, tlx.local_view(v_buf, nxt))
-            tlx.async_load_commit_group([tok_k, tok_v])
+            tlx.async_load_commit_group([tok_v])
             s, acc0, acc1, acc2, acc3 = _mfma_stage(q0, q1, q2, q3, p, tlx.local_view(k_buf, nxt),
-                                                    tlx.local_view(v_buf, cur), acc0, acc1, acc2, acc3, BLOCK_N)
+                                                    tlx.local_view(v_buf, cur), acc0, acc1, acc2, acc3, kp, blk,
+                                                    last, k_step, k_buf, cur, BLOCK_N)
             m_i, l_i, p, acc0, acc1, acc2, acc3 = _softmax(s, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
                                                            Q.dtype.element_ty)
         tlx.async_load_wait_group(0)
