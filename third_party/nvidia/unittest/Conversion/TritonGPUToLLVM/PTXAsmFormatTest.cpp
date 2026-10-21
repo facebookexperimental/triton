@@ -127,9 +127,9 @@ TEST_F(PTXAsmFormatTest, onlyAttachMLIRArgs) {
   PTXBuilder builder;
   const char *ptxCode =
       ".param .b64 param0;\n" // prepare param0 (format string)
-      "st.param.b64 [param0], %0;\n"
-      "st.param.b64 [param0], %1;\n"
-      "st.param.b64 [param0], %2;\n";
+      "st.param.b64 [param0], $0;\n"
+      "st.param.b64 [param0], $1;\n"
+      "st.param.b64 [param0], $2;\n";
 
   auto &ptxSnippet = *builder.create(ptxCode);
   auto *opr0 = builder.newOperand(v[0], "r");
@@ -137,11 +137,38 @@ TEST_F(PTXAsmFormatTest, onlyAttachMLIRArgs) {
   auto *opr2 = builder.newOperand(v[2], "r");
   ptxSnippet({opr1, opr2, opr0}, true);
 
-  EXPECT_EQ(builder.dump(), ptxCode);
-  ASSERT_EQ(builder.getAllMLIRArgs()[0], v[1]);
-  ASSERT_EQ(builder.getAllMLIRArgs()[1], v[2]);
-  ASSERT_EQ(builder.getAllMLIRArgs()[2], v[0]);
+  EXPECT_EQ(builder.dump(), ".param .b64 param0;\n"
+                            "st.param.b64 [param0], $1;\n"
+                            "st.param.b64 [param0], $2;\n"
+                            "st.param.b64 [param0], $0;\n");
+  ASSERT_EQ(builder.getAllMLIRArgs()[0], v[0]);
+  ASSERT_EQ(builder.getAllMLIRArgs()[1], v[1]);
+  ASSERT_EQ(builder.getAllMLIRArgs()[2], v[2]);
   ASSERT_EQ(builder.getAllMLIRArgs().size(), 3);
+}
+
+TEST_F(PTXAsmFormatTest, rawSnippetsPreserveEarlierBindings) {
+  PTXBuilder builder;
+  auto *out = builder.newOperand("=r", true);
+  auto *a = builder.newOperand(v[0], "r");
+  auto *b = builder.newOperand(v[1], "r");
+  auto &snippet = *builder.create("add.u32 $0, $1, $2;");
+  snippet({out, b, a}, true);
+  snippet({out, a, b}, true);
+  EXPECT_EQ(builder.dump(), "mov.u32 $0, 0x0;\n\t"
+                            "add.u32 $0, $2, $1;\n\t"
+                            "add.u32 $0, $1, $2;");
+  EXPECT_EQ(builder.getConstraints(), "=r,r,r");
+  EXPECT_EQ(builder.getAllMLIRArgs(), (SmallVector<Value, 4>{v[0], v[1]}));
+}
+
+TEST_F(PTXAsmFormatTest, rawSnippetOperandSyntax) {
+  PTXBuilder builder;
+  auto *a = builder.newOperand(v[0], "r");
+  auto *b = builder.newOperand(v[1], "r");
+  auto &snippet = *builder.create("${0:r} $1 $$0 ${:uid} %tid.x");
+  snippet({b, a}, true);
+  EXPECT_EQ(builder.dump(), "${1:r} $0 $$0 ${:uid} %tid.x");
 }
 
 } // namespace triton
