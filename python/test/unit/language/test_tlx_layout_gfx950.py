@@ -49,6 +49,36 @@ def test_signed_div_rem_contiguous_boundary(base, divisor, op, indirect):
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("modulus", [-17, 17])
+@pytest.mark.parametrize("group", [-7, 7])
+@pytest.mark.parametrize("base", [-128, 0, 2147483584])
+def test_signed_div_rem_dynamic_program_mapping(modulus, group, base):
+
+    @triton.jit
+    def kernel(output, table, modulus, group, base, L: tl.constexpr):
+        pid = tl.program_id(0)
+        mapped = (pid % modulus) // group
+        lanes = tlx.require_layout(tl.arange(0, 1024), L)
+        values = mapped * 128 + base + lanes
+        remainder = values % 64
+        quotient = values // 64
+        result = tl.load(table + (remainder + 64)) + tl.load(table + (quotient & 255))
+        tl.store(output + pid * 1024 + lanes, result)
+
+    layout = tlx.layout(shape=((64, 4), (4, )), stride=((4, 256), (1, )))
+    output = torch.empty((32, 1024), dtype=torch.int32, device=DEVICE)
+    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
+    kernel[(32, )](output, table, modulus, group, base, layout)
+    pid = torch.arange(32, dtype=torch.int64, device=DEVICE)
+    mapped = torch.div(torch.fmod(pid, modulus), group, rounding_mode="trunc")
+    values = (mapped[:, None] * 128 + base + torch.arange(1024, device=DEVICE)).to(torch.int32)
+    remainder = torch.fmod(values, 64)
+    quotient = torch.div(values, 64, rounding_mode="trunc")
+    expected = table[(remainder + 64).long()] + table[(quotient & 255).long()]
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 @triton.jit
 def _pinned_add_combine(a, b):
     return a + b

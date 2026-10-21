@@ -24,6 +24,16 @@
 namespace mlir {
 namespace triton {
 
+class DialectLaunchBoundsInterface
+    : public DialectInterface::Base<DialectLaunchBoundsInterface> {
+public:
+  explicit DialectLaunchBoundsInterface(Dialect *dialect) : Base(dialect) {}
+
+  /// Inclusive program-ID bound for this target; absent if not applicable.
+  virtual std::optional<int64_t> getMaxProgramId(ModuleOp mod,
+                                                 unsigned axis) const = 0;
+};
+
 struct GlobalMemory : public SideEffects::Resource::Base<GlobalMemory> {
   StringRef getName() const final { return "<GlobalMemory>"; }
   SideEffects::Resource *getParent() const override { return nullptr; }
