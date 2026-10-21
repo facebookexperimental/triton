@@ -251,7 +251,7 @@ static LogicalResult validateFinalWarpPredicateLayouts(ModuleOp mod) {
           triton::gpu::toLinearLayout(dstType))
         return WalkResult::advance();
       if (waveUniform && (triton::gpu::lookupNumWarps(predicateOp) == 1 ||
-                          !cvtNeedsSharedMemory(srcType, dstType)))
+                          !cvtNeedsSharedMemory(convert)))
         return WalkResult::advance();
       unsafeConvert = convert;
       return WalkResult::interrupt();
@@ -320,7 +320,7 @@ struct ConvertTritonAMDGPUToLLVM
     if (targetInfo.requiresAliasInfoForAsyncOps())
       AMD::annotateLocalLoadsSyncedViaAsyncWait(mod);
 
-    ModuleMembarAnalysis membarPass(&allocation,
+    ModuleMembarAnalysis membarPass(allocation,
                                     mlir::triton::AMD::membarFilter);
     membarPass.run();
     materializeDeferredSchedGroupBarriers(mod);

@@ -41,6 +41,19 @@ tt.func public @memdesc_zero_allocation_dimension(%arg0: !ttg.memdesc<2x4xi32, #
 
 // -----
 
+#blocked0 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [4, 8], warpsPerCTA = [2, 2], order = [0, 1]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @force_warp_shuffle_cross_warp(%arg0: tensor<32x32xf32, #blocked0>) {
+    // expected-error@+1 {{force_warp_shuffle requires a conversion within one warp}}
+    %0 = ttg.convert_layout %arg0 {force_warp_shuffle} : tensor<32x32xf32, #blocked0> -> tensor<32x32xf32, #blocked1>
+    tt.return
+  }
+}
+
+// -----
+
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 tt.func public @local_alloc_i1() {

@@ -8,8 +8,10 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Support/DebugStringHelper.h"
+#include "llvm/ADT/STLExtras.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/IR/Utility.h"
@@ -179,7 +181,6 @@ FuncOp getOrCreateFunction(
   func.setVisibility(SymbolTable::Visibility::Private);
   func->setAttr(ttg::AttrNumWarpsName,
                 moduleBuilder.getI32IntegerAttr(numWarps));
-  func->setAttr("always_use_warp_shuffle", moduleBuilder.getUnitAttr());
   for (auto [i, argType] : llvm::enumerate(argTypes)) {
     if (isa<PointerType>(argType)) {
       func.setArgAttr(i, "tt.divisibility",
@@ -190,6 +191,15 @@ FuncOp getOrCreateFunction(
   OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entryBlock);
   ImplicitLocOpBuilder fb(loc, bodyBuilder);
   buildBody(fb, entryBlock);
+  func.walk([&](ttg::ConvertLayoutOp op) {
+    auto conversion = minimalCvtLayout(op.getSrc().getType(), op.getType());
+    auto dims = conversion.getInDimNames();
+    auto warp = StringAttr::get(op.getContext(), "warp");
+    auto block = StringAttr::get(op.getContext(), "block");
+    if (llvm::is_contained(dims, warp) || llvm::is_contained(dims, block))
+      return;
+    op.setForceWarpShuffleAttr(moduleBuilder.getUnitAttr());
+  });
   return func;
 }
 

@@ -1548,3 +1548,24 @@ tt.func @subview_different_index_no_barrier(%A : !tt.ptr<f16>) {
   tt.return
 }
 }
+
+// -----
+
+#unreachableBlocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#unreachableShared = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// CHECK-LABEL: unreachable_return
+tt.func @unreachable_return(%arg0 : !tt.ptr<f16>) {
+  %mask = arith.constant dense<true> : tensor<128x32xi1, #unreachableBlocked>
+  %other = arith.constant dense<0.0> : tensor<128x32xf16, #unreachableBlocked>
+  %ptrs = tt.splat %arg0 : !tt.ptr<f16> -> tensor<128x32x!tt.ptr<f16>, #unreachableBlocked>
+  %value = tt.load %ptrs, %mask, %other : tensor<128x32x!tt.ptr<f16>, #unreachableBlocked>
+  %buffer = ttg.local_alloc %value : (tensor<128x32xf16, #unreachableBlocked>) -> !ttg.memdesc<128x32xf16, #unreachableShared, #ttg.shared_memory>
+  %result = ttg.local_load %buffer : !ttg.memdesc<128x32xf16, #unreachableShared, #ttg.shared_memory> -> tensor<128x32xf16, #unreachableBlocked>
+  // CHECK: tt.return
+  tt.return
+^unreachable:
+  tt.return
+}
+}
