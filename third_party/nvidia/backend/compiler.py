@@ -25,7 +25,6 @@ from triton.runtime.errors import PTXASError
 TRITON_MAX_TMA_DESCS = 8
 TRITON_MAX_TMA_DIMS = 5
 
-
 _PTX_FILE_DIRECTIVE = re.compile(
     r"""
     # Match one complete PTX .file directive and preserve its prefix.
@@ -47,6 +46,7 @@ _PTX_FILE_DIRECTIVE = re.compile(
 
 
 def normalize_ptx_file_metadata(src: str) -> str:
+
     def normalize_file(match: re.Match[str]) -> str:
         filename = match.group("path").rsplit("/", 1)[-1]
         virtual_path = f"<source>/{filename}"
@@ -118,6 +118,11 @@ def get_ptx_version_from_options(options, arch: int):
         cuda_version = get_ptxas(arch).version
         ptx_version = ptx_get_version(cuda_version)
     return ptx_version
+
+
+def get_llvm_flags():
+    """LLVM command line flags used throughout NVIDIA LLVM lowering."""
+    return ["nvptx-mad-wide-opt", "nvptx-short-ptr"]
 
 
 @functools.lru_cache()
@@ -246,6 +251,7 @@ class CUDAOptions:
     auto_tma_device: bool = False
     enable_tree_reduction: bool = False
     enable_nvptx_v2i32: bool = False
+    sched4reg: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -1250,9 +1256,9 @@ class CUDABackend(BaseBackend):
 
         proc = sm_arch_from_capability(cap_llvm)
         features = get_features(options, cap_llvm)
-        triple = "nvptx64-nvidia-cuda"
-        nvidia.set_short_ptr()
-        llvm.attach_datalayout(llvm_mod, triple, proc, features)
+        triple = 'nvptx64-nvidia-cuda'
+        flags = get_llvm_flags()
+        llvm.attach_datalayout(llvm_mod, triple, proc, features, flags, "shortptr")
         if options.enable_reflect_ftz:
             nvidia.set_nvvm_reflect_ftz(llvm_mod)
 
@@ -1261,11 +1267,9 @@ class CUDABackend(BaseBackend):
             llvm.link_extern_libs(llvm_mod, paths)
 
         llvm.optimize_module(
-            llvm_mod,
-            llvm.OPTIMIZE_O3,
+            llvm_mod, llvm.OPTIMIZE_O3, flags=flags,
             disable_slp_vectorizer=disable_slp_vectorizer,
-            scalarize_packed_fops=True,
-        )
+            scalarize_packed_fops=True)
 
         # Get some metadata
         # warp-specialization mutates num_warps
@@ -1295,11 +1299,12 @@ class CUDABackend(BaseBackend):
 
         proc = sm_arch_from_capability(cap_llvm)
         features = get_features(opt, cap_llvm)
-        flags = ["nvptx-mad-wide-opt"]
+        flags = get_llvm_flags()
         if opt.enable_nvptx_v2i32:
             flags.append("nvptx-v2i32")
         canonicalize_gep = "fpsan" in opt.instrumentation_mode
-        ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep)
+        ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep,
+                                    "shortptr", sched4reg=opt.sched4reg)
         # Find kernel names (there should only be one)
         names = re.findall(r".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)", ret)
         assert len(names) == 1
@@ -1388,8 +1393,7 @@ class CUDABackend(BaseBackend):
                 fbin,
             ]
             try:
-                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog,
-                               env=knobs.nvidia.get_tool_env())
+                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog, env=knobs.nvidia.get_tool_env())
                 if knobs.nvidia.dump_ptxas_log:
                     with open(flog.name) as log_file:
                         print(log_file.read())
