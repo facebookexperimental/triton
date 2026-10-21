@@ -1385,12 +1385,34 @@ static CGAEncodingAttr linearToCGAEncodingAttr(const LinearLayout &ll) {
 // LinearEncodingTrait shared implementations
 //===----------------------------------------------------------------------===//
 
+// basesPerDim/orderPerDim need each basis of `dimName` to own at most one
+// output coordinate. Flattening the outputs (hasPowerOfTwoBases) checks that
+// only when every output size is a power of two, so NPOT layouts go per basis.
+static bool hasPerDimBases(const LinearLayout &ll, StringAttr dimName) {
+  auto isPow2Out = [&](StringAttr outDim) {
+    return llvm::isPowerOf2_32(ll.getOutDimSize(outDim));
+  };
+  if (llvm::all_of(ll.getOutDimNames(), isPow2Out))
+    return hasPowerOfTwoBases(
+        ll.sublayout({dimName}, llvm::to_vector(ll.getOutDimNames())));
+  return llvm::all_of(ll.getBases().lookup(dimName), [&](const auto &basis) {
+    int owners = 0;
+    for (auto [outDim, value] : llvm::zip(ll.getOutDimNames(), basis)) {
+      if (value == 0)
+        continue;
+      if (++owners > 1)
+        return false;
+      if (isPow2Out(outDim) && !llvm::isPowerOf2_32(value))
+        return false;
+    }
+    return true;
+  });
+}
+
 SmallVector<unsigned> LinearEncodingTrait::basesPerDim(const LinearLayout &ll,
                                                        StringAttr dimName,
                                                        bool skipBroadcast) {
-  auto dimLayout =
-      ll.sublayout({dimName}, llvm::to_vector(ll.getOutDimNames()));
-  if (!hasPowerOfTwoBases(dimLayout))
+  if (!hasPerDimBases(ll, dimName))
     llvm_unreachable("basesPerDim cannot decompose swizzled bases into "
                      "per-dimension counts.");
   auto rank = ll.getNumOutDims();
@@ -1400,9 +1422,7 @@ SmallVector<unsigned> LinearEncodingTrait::basesPerDim(const LinearLayout &ll,
 SmallVector<unsigned>
 LinearEncodingTrait::orderPerDim(const LinearLayout &ll, StringAttr dimName,
                                  ArrayRef<unsigned> defaultOrder) {
-  auto dimLayout =
-      ll.sublayout({dimName}, llvm::to_vector(ll.getOutDimNames()));
-  if (!hasPowerOfTwoBases(dimLayout))
+  if (!hasPerDimBases(ll, dimName))
     llvm_unreachable(
         "orderPerDim cannot determine dimension order for swizzled bases.");
   return orderPerDimImpl(ll, dimName, defaultOrder);

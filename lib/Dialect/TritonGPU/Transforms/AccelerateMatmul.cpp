@@ -1201,6 +1201,30 @@ static void transposeDots(ModuleOp m) {
   }
 }
 
+// On sm_12x, ScaledBlockedToMMA has no plan for an NPOT operand or scale under
+// TRITON_ALLOW_NPOT: its scale layout asserts or fails to verify, and release
+// builds lower the dot silently. Reject such dots before any IR change.
+static bool rejectNpotScaledDecompositions(ModuleOp m, int computeCapability) {
+  if (computeCapability / 10 != 12 ||
+      !triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+    return false;
+  auto isNpot = [](Value v) {
+    return v && llvm::any_of(cast<RankedTensorType>(v.getType()).getShape(),
+                             [](int64_t d) { return !llvm::isPowerOf2_64(d); });
+  };
+  bool rejected = false;
+  m.walk([&](DotScaledOp op) {
+    if (!op.getAScale() || !op.getBScale() ||
+        llvm::none_of(op->getOperands(), isNpot) ||
+        isa_and_nonnull<MmaEncodingTrait>(op.getType().getEncoding()))
+      return;
+    op->emitError("NPOT dot_scaled: decomposing a scaled operand or scale with "
+                  "a non-power-of-two extent is unsupported");
+    rejected = true;
+  });
+  return rejected;
+}
+
 #define GEN_PASS_DEF_TRITONGPUACCELERATEMATMUL
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
@@ -1221,6 +1245,9 @@ public:
     // We could do this generically if we manage to improve the heuristics
     // reverted in these two PRs https://github.com/triton-lang/triton/pull/5834
     // https://github.com/triton-lang/triton/pull/5837
+    // Named NPOT rejects must precede transposeDots, which rewrites the IR.
+    if (rejectNpotScaledDecompositions(m, computeCapability))
+      return signalPassFailure();
     transposeDots(m);
 
     mlir::RewritePatternSet patterns(context);
