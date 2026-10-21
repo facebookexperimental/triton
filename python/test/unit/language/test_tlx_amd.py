@@ -5806,7 +5806,7 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert "v_mov_b32_dpp" not in amdgcn
     assert "v_permlane" not in amdgcn
     # These are deliberate static goldens for the grid-9, K=1536 specialization.
-    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
     assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == _A4W4_INTER_WAVE_256TILE_WAITCNT
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
@@ -5838,7 +5838,7 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert ttgir.count("scf.for") == 1
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
-    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
     assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == _A4W4_INTER_WAVE_256TILE_WAITCNT
     assert "s_trap" not in amdgcn
     assert compiled.metadata.shared == 143232
