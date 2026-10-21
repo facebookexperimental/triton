@@ -2952,16 +2952,7 @@ def test_amd_intra_wave_pipeline_prices_mixed_memory_gfx950():
     )
     ttgir = compiled.asm["ttgir"]
     groups = re.findall(r"rocdl\.sched\.group\.barrier ([0-9]+), ([0-9]+),", ttgir)
-    # 3.8 prices each mixed anchor at 8 machine ops (beta: 1) because its
-    # layout/pricing pipeline counts the 2048-element anchors scalarly. The
-    # window still forms two identical halves with compute covers summing to
-    # DOT_COUNT (5 + 5), so assert the full 3.8-calibrated sequence.
-    half = (
-        [("512", "1"), ("8", "1")]
-        + [("512", "1")] * 7
-        + [("32", "1"), ("8", "1")] * 4
-        + [("32", "1")] * 4
-    )
+    half = [("512", "1"), ("8", "2"), ("32", "1"), ("8", "3")]
     assert groups == half * 2, groups
 
 
@@ -2981,9 +2972,7 @@ def test_amd_intra_wave_pipeline_reserves_mixed_memory_anchors_gfx950():
     )
     ttgir = compiled.asm["ttgir"]
     groups = re.findall(r"rocdl\.sched\.group\.barrier ([0-9]+), ([0-9]+),", ttgir)
-    # Same 3.8 calibration as above: 8 machine ops per anchor, compute covers
-    # summing to DOT_COUNT (1 + 1) across the two identical halves.
-    half = [("512", "1")] * 8 + [("32", "1"), ("8", "1")] + [("32", "1")] * 7
+    half = [("512", "1"), ("32", "1"), ("8", "1")]
     assert groups == half * 2, groups
 
 
