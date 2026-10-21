@@ -760,6 +760,41 @@ tt.func @atomic_release_loop(%ptr: !tt.ptr<i32>) -> i32 {
   tt.return %result : i32
 }
 
+// The scan reuses scratch read by the scalar atomic after its internal barrier.
+// CHECK-LABEL: atomic_release_then_scan
+tt.func @atomic_release_then_scan(%ptr: !tt.ptr<i32>, %x: tensor<8x16xf32, #AL>) -> (i32, tensor<8x16xf32, #AL>) {
+  %one = arith.constant 1 : i32
+  %true = arith.constant true
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: tt.atomic_rmw add, release
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: %{{.*}} = "tt.scan"
+  %old = tt.atomic_rmw add, release, gpu, %ptr, %one, %true : (!tt.ptr<i32>, i32, i1) -> i32
+  %scan = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}>({
+  ^bb0(%lhs: f32, %rhs: f32):
+    %sum = arith.addf %lhs, %rhs : f32
+    tt.scan.return %sum : f32
+  }) : (tensor<8x16xf32, #AL>) -> tensor<8x16xf32, #AL>
+  tt.return %old, %scan : i32, tensor<8x16xf32, #AL>
+}
+
+// CHECK-LABEL: atomic_acq_rel_then_scan
+tt.func @atomic_acq_rel_then_scan(%ptr: !tt.ptr<i32>, %x: tensor<8x16xf32, #AL>) -> (i32, tensor<8x16xf32, #AL>) {
+  %one = arith.constant 1 : i32
+  %true = arith.constant true
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: tt.atomic_rmw add, acq_rel
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: %{{.*}} = "tt.scan"
+  %old = tt.atomic_rmw add, acq_rel, gpu, %ptr, %one, %true : (!tt.ptr<i32>, i32, i1) -> i32
+  %scan = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}>({
+  ^bb0(%lhs: f32, %rhs: f32):
+    %sum = arith.addf %lhs, %rhs : f32
+    tt.scan.return %sum : f32
+  }) : (tensor<8x16xf32, #AL>) -> tensor<8x16xf32, #AL>
+  tt.return %old, %scan : i32, tensor<8x16xf32, #AL>
+}
+
 // CHECK-LABEL: convert_layout1
 tt.func @convert_layout1(%A : !tt.ptr<f16>) {
   // CHECK-NOT: ttg.barrier local
