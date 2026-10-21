@@ -37,6 +37,7 @@ def matmul_tma_set_block_size_hook(nargs):
     block_n = nargs["BN"]
     block_k = nargs["BK"]
     block_m_split = block_m // nargs["NUM_MMA_GROUPS"]
+    swap_ab = nargs["SWAP_AB"]
 
     if nargs.get("A_ROW_MAJOR", True):
         nargs["a_desc"].block_shape = [block_m_split, block_k]
@@ -46,8 +47,13 @@ def matmul_tma_set_block_size_hook(nargs):
         nargs["b_desc"].block_shape = [block_k, block_n]
     else:
         nargs["b_desc"].block_shape = [block_n, block_k]
-    epilogue_block = [block_m_split, block_n // 4 if nargs["EPILOGUE_SUBTILE"] else block_n]
-    nargs["c_desc"].block_shape = epilogue_block
+    if swap_ab:
+        # The kernel computes C^T; each consumer stores its transposed tile.
+        epilogue_block = [block_n, block_m_split]
+    else:
+        epilogue_block = [block_m_split, block_n // 4 if nargs["EPILOGUE_SUBTILE"] else block_n]
+    c = nargs["c_desc"]
+    c.block_shape = epilogue_block
 
     split_k = nargs["SPLIT_K"]
     workspace_desc = nargs["workspace_desc"]
@@ -56,13 +62,12 @@ def matmul_tma_set_block_size_hook(nargs):
         # spills into the next split. Partials stay fp32 until the reduction,
         # which sums them in a fixed order: split-K stays bitwise deterministic,
         # unlike fp32 atomics or a TMA reduce-add into one buffer.
-        rows = split_k * _workspace_rows_per_split(nargs["M"], block_m)
-        workspace = torch.empty((rows, nargs["N"]), device=nargs["c_desc"].base.device, dtype=torch.float32)
+        rows = split_k * _workspace_rows_per_split(c.shape[0], block_n if swap_ab else block_m)
+        workspace = torch.empty((rows, c.shape[1]), device=c.base.device, dtype=torch.float32)
         workspace_desc.base = workspace
         workspace_desc.shape = list(workspace.shape)
         workspace_desc.strides = list(workspace.stride())
     else:
-        c = nargs["c_desc"]
         workspace_desc.base = c.base
         workspace_desc.shape = list(c.shape)
         workspace_desc.strides = list(c.strides)
@@ -73,17 +78,18 @@ def _workspace_rows_per_split(M, block_m):
     return triton.cdiv(M, block_m) * block_m
 
 
-def _config(block_m, block_n, num_stages, group_size_m=8, split_k=1):
+def _config(block_m, block_n, num_stages, group_size_m=8, split_k=1, block_k=64, swap_ab=False):
     return triton.Config(
         {
             "BM": block_m,
             "BN": block_n,
-            "BK": 64,
+            "BK": block_k,
             "GROUP_SIZE_M": group_size_m,
             "NUM_STAGES": num_stages,
             "NUM_MMA_GROUPS": 2,
-            "EPILOGUE_SUBTILE": True,
+            "EPILOGUE_SUBTILE": not swap_ab,
             "SPLIT_K": split_k,
+            "SWAP_AB": swap_ab,
         },
         num_stages=1,
         num_warps=4,
@@ -91,14 +97,16 @@ def _config(block_m, block_n, num_stages, group_size_m=8, split_k=1):
     )
 
 
-def _smem_bytes(block_m, block_n, block_k, num_stages, split_k, elem_bytes=2):
+def _smem_bytes(block_m, block_n, block_k, num_stages, split_k, elem_bytes=2, swap_ab=False):
     ring = (block_m + block_n) * block_k * elem_bytes * num_stages
-    epilogue = 4 * (block_m // 2) * (block_n // 4) * (4 if split_k > 1 else elem_bytes)
+    # Subtiled epilogue: four (BM/2, BN/4) slots. Swap-AB: one transposed
+    # (BN, BM/2) slot per consumer.
+    epilogue = block_m * block_n // (1 if swap_ab else 2) * (4 if split_k > 1 else elem_bytes)
     return ring + epilogue
 
 
-def _fits_smem(block_m, block_n, num_stages, split_k):
-    return _smem_bytes(block_m, block_n, 64, num_stages, split_k) <= _MAX_SMEM
+def _fits_smem(block_m, block_n, num_stages, split_k, block_k=64, swap_ab=False):
+    return _smem_bytes(block_m, block_n, block_k, num_stages, split_k, swap_ab=swap_ab) <= _MAX_SMEM
 
 
 _TILES = (
@@ -135,8 +143,8 @@ def _full_configs():
 CONFIGS = _full_configs
 
 
-def _split_k_valid(K, split_k):
-    k_tiles = triton.cdiv(K, 64)
+def _split_k_valid(K, split_k, block_k=64):
+    k_tiles = triton.cdiv(K, block_k)
     if split_k == 1:
         return True
     if k_tiles // split_k < _MIN_K_TILES_PER_SPLIT:
@@ -204,6 +212,72 @@ def _smoke_configs():
 
 SMOKE_CONFIGS = _smoke_configs
 
+# Swap-AB computes C^T = B^T A^T so a skinny M lands on the WGMMA N dimension
+# (as small as 16) instead of padding two 64-row consumer tiles. The kernel's M
+# and N are the problem's N and M below.
+_SWAP_AB_MAX_M = 64
+_SWAP_BLOCK_NS = (16, 32, 64)
+
+
+def _use_swap_ab(M, space):
+    return M <= _SWAP_AB_MAX_M and space != "smoke"
+
+
+def _swap_block_n(m):
+    return next(bn for bn in _SWAP_BLOCK_NS if bn >= m)
+
+
+def _deepest_ring(block_m, block_n, block_k, split_k, max_stages=6):
+    num_stages = max_stages
+    while num_stages > 2 and not _fits_smem(block_m, block_n, num_stages, split_k, block_k, swap_ab=True):
+        num_stages -= 1
+    return num_stages
+
+
+def _swap_configs():
+    return [
+        _config(block_m, block_n, _deepest_ring(block_m, block_n, block_k, split_k), 1, split_k, block_k, True)
+        # BM=256 and BK=64 measured slower on every skinny shape; a longer K
+        # extent reads more contiguous bytes per row of the streamed operand.
+        for block_m in (128, )
+        for block_n in _SWAP_BLOCK_NS
+        for block_k in (128, 256)
+        for split_k in (1, ) + _SPLIT_K_CHOICES
+    ]
+
+
+def _prune_swap_configs(configs, nargs, **kwargs):
+    # Kernel M/N are the problem's N/M.
+    M, N, K = nargs["M"], nargs["N"], nargs["K"]
+    num_sms = _get_num_sms()
+    kept = []
+    for c in configs:
+        kw = c.kwargs
+        bm, bk, split_k = kw["BM"], kw["BK"], kw["SPLIT_K"]
+        if kw["BN"] != _swap_block_n(N) or not _split_k_valid(K, split_k, bk):
+            continue
+        if split_k > 1 and _mn_tiles(M, N, bm, kw["BN"]) * split_k > num_sms:
+            continue
+        kept.append(c)
+    best_splits = {}
+    for c in kept:
+        if c.kwargs["SPLIT_K"] > 1:
+            best_splits.setdefault((c.kwargs["BM"], c.kwargs["BK"]), set()).add(c.kwargs["SPLIT_K"])
+    best_splits = {key: set(sorted(splits)[-2:]) for key, splits in best_splits.items()}
+    return [
+        c for c in kept
+        if c.kwargs["SPLIT_K"] == 1 or c.kwargs["SPLIT_K"] in best_splits[(c.kwargs["BM"], c.kwargs["BK"])]
+    ]
+
+
+def _swap_heuristic_config(M, N, K):
+    # Arguments are the problem's (M, N, K).
+    num_sms = _get_num_sms()
+    block_m, block_n, block_k = 128, _swap_block_n(M), 128
+    mn_tiles = _mn_tiles(N, M, block_m, block_n)
+    split_k = max([s for s in _SPLIT_K_CHOICES if mn_tiles * s <= num_sms and _split_k_valid(K, s, block_k)], default=1)
+    return [_config(block_m, block_n, _deepest_ring(block_m, block_n, block_k, split_k), 1, split_k, block_k, True)]
+
 
 def heuristic_config(M, N, K):
     num_sms = _get_num_sms()
@@ -254,7 +328,8 @@ def _reduce_split_k(workspace, c, M, N, split_k):
 def _reduce_post_hook(nargs, exception=None):
     # Autotuning times the split-K partial pass plus its reduction.
     if exception is None and nargs["SPLIT_K"] > 1:
-        _reduce_split_k(nargs["workspace_desc"].base, nargs["c_desc"].base, nargs["M"], nargs["N"], nargs["SPLIT_K"])
+        c = nargs["c_desc"].base
+        _reduce_split_k(nargs["workspace_desc"].base, c, c.shape[0], c.shape[1], nargs["SPLIT_K"])
 
 
 @triton.jit
@@ -280,6 +355,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
     B_ROW_MAJOR: tl.constexpr,
     A_EVICTION: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    SWAP_AB: tl.constexpr,
 ):
     block_m_split: tl.constexpr = BM // NUM_MMA_GROUPS
     # workspace_desc is fp32 for split-K and aliases c_desc otherwise.
@@ -297,6 +373,8 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
     )
     if EPILOGUE_SUBTILE:
         c_smem = tlx.local_alloc((block_m_split, BN // 4), tlx.dtype_of(out_desc), 2 * NUM_MMA_GROUPS)
+    if SWAP_AB:
+        c_smem_t = tlx.local_alloc((BN, block_m_split), tlx.dtype_of(out_desc), NUM_MMA_GROUPS)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):
@@ -365,9 +443,17 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                 )
 
                 offset_cm = offset_am + block_m_split * consumer_id
+                if SWAP_AB:
+                    # acc is C^T[offset_cm:+BM/2, offset_bn:+BN]; store it transposed.
+                    # C rows past the problem's M land in this split's padding.
+                    slot = tlx.local_view(c_smem_t, consumer_id)
+                    tlx.async_descriptor_store_wait(0)
+                    tlx.local_store(slot, tl.trans(acc).to(tlx.dtype_of(out_desc)))
+                    tlx.fence("async_shared")
+                    tlx.async_descriptor_store(out_desc, slot, [offset_bn + split_id * num_pid_n * BN, offset_cm])
                 # Split slabs are tile-padded, so rows past M are real workspace
                 # memory; skip a consumer half that lies entirely past M.
-                if SPLIT_K == 1 or offset_cm < M:
+                elif SPLIT_K == 1 or offset_cm < M:
                     offset_cm += split_id * num_pid_m * BM
                     if EPILOGUE_SUBTILE:
                         acc_0, acc_1, acc_2, acc_3 = _split_acc(acc, block_m_split, BN)
@@ -383,18 +469,18 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                             acc.to(tlx.dtype_of(out_desc)),
                         )
 
-            if EPILOGUE_SUBTILE:
+            if EPILOGUE_SUBTILE or SWAP_AB:
                 tlx.async_descriptor_store_wait(0)
 
 
 @functools.lru_cache(maxsize=None)
-def _tuned(space, shape=None):
+def _tuned(space, shape=None, swap_ab=False):
     prune_configs_by = None
     if space == "heuristic":
-        configs = heuristic_config(*shape)
+        configs = _swap_heuristic_config(*shape) if swap_ab else heuristic_config(*shape)
     elif space == "full":
-        configs = CONFIGS()
-        prune_configs_by = {"early_config_prune": _prune_full_configs}
+        configs = _swap_configs() if swap_ab else CONFIGS()
+        prune_configs_by = {"early_config_prune": _prune_swap_configs if swap_ab else _prune_full_configs}
     elif space == "smoke":
         configs = SMOKE_CONFIGS()
     else:
@@ -432,14 +518,27 @@ def mm(a, b, *, out=None, space="full"):
     if c.data_ptr() % 16 != 0:
         raise InvalidInput("sm90 tlx.ops.mm requires a 16-byte-aligned output")
 
-    a_row_major = a.is_contiguous()
-    b_row_major = b.is_contiguous()
-    a_src = a if a_row_major else a.T
-    b_src = b if b_row_major else b.T
+    swap_ab = _use_swap_ab(M, space)
+    # A contiguous view of each operand's storage; for these, is_contiguous()
+    # is ambiguous only on extent-1 dims, so descriptors use canonical strides.
+    a_rm = a.is_contiguous()
+    b_rm = b.is_contiguous()
+    a_store = a if a_rm else a.T
+    b_store = b if b_rm else b.T
+    if swap_ab:
+        # Run the same kernel on (B^T, A^T) and write C^T tiles back to C. B^T
+        # is row-major exactly when B is column-major, and likewise for A^T.
+        kernel_m, kernel_n = N, M
+        a_row_major, b_row_major = not b_rm, not a_rm
+        a_src, b_src = b_store, a_store
+    else:
+        kernel_m, kernel_n = M, N
+        a_row_major, b_row_major = a_rm, b_rm
+        a_src, b_src = a_store, b_store
 
     dummy_block = [1, 1]
-    a_desc = TensorDescriptor(a_src, a_src.shape, a_src.stride(), dummy_block)
-    b_desc = TensorDescriptor(b_src, b_src.shape, b_src.stride(), dummy_block)
+    a_desc = TensorDescriptor(a_src, a_src.shape, [a_src.shape[1], 1], dummy_block)
+    b_desc = TensorDescriptor(b_src, b_src.shape, [b_src.shape[1], 1], dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
     # The pre_hook swaps in an fp32 workspace once SPLIT_K is known.
     workspace_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
@@ -447,24 +546,25 @@ def mm(a, b, *, out=None, space="full"):
     num_sms = _get_num_sms()
 
     def grid(meta):
-        num_tiles = triton.cdiv(M, meta["BM"]) * triton.cdiv(N, meta["BN"]) * meta["SPLIT_K"]
+        num_tiles = triton.cdiv(kernel_m, meta["BM"]) * triton.cdiv(kernel_n, meta["BN"]) * meta["SPLIT_K"]
         return (min(num_sms, num_tiles), )
 
-    kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
+    kernel = _tuned(space, (M, N, K) if space == "heuristic" else None, swap_ab)
     kernel[grid](
         a_desc,
         b_desc,
         c_desc,
         workspace_desc,
-        M,
-        N,
+        kernel_m,
+        kernel_n,
         K,
         NUM_SMS=num_sms,
         A_ROW_MAJOR=a_row_major,
         B_ROW_MAJOR=b_row_major,
         # With N <= 1024 only a few N-tiles read each A panel, back to back;
         # keeping it in L2 serves the repeat reads. Larger N regresses slightly.
-        A_EVICTION="evict_last" if N <= 1024 else "",
+        # Under swap-AB the kernel's A is B, streamed once.
+        A_EVICTION="evict_last" if N <= 1024 and not swap_ab else "",
     )
     # post_hook only fires while benchmarking, so reduce here for the real launch.
     split_k = kernel.best_config.kwargs["SPLIT_K"]
