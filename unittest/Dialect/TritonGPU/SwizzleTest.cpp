@@ -5,7 +5,6 @@
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
-#include "unittest/Util/ScopedAllowNpot.h"
 
 #include "mlir/Support/LLVM.h"
 #include "llvm/Support/Signals.h"
@@ -19,7 +18,6 @@
 using namespace mlir;
 using namespace mlir::triton;
 
-using mlir::triton::actionAdditiveStrides;
 using mlir::triton::gpu::bankConflictsLdSt;
 using mlir::triton::gpu::getVecBitwidthLdSt;
 using mlir::triton::gpu::LocalMemOpTile;
@@ -305,58 +303,6 @@ protected:
 
 // ——— Tests ———
 
-TEST_F(SwizzleTest, AdditiveStridesRejectsTransitiveOverlap) {
-  auto kRegister = S("register");
-  auto kLane = S("lane");
-  auto kWarp = S("warp");
-  auto kBlock = S("block");
-  auto kOffset = S("offset");
-  SmallVector<std::pair<StringAttr, int32_t>> outDims = {{kOffset, 2048},
-                                                         {kBlock, 1}};
-
-  // The 0x510 basis overlaps the lane address at 0x10, so it must remain in
-  // the outer xor offset. The 0x100 basis must remain there too because it
-  // overlaps 0x510; moving it into the additive inner loop would incorrectly
-  // turn (base ^ 0x510) ^ 0x100 into (base ^ 0x510) + 0x100.
-  LinearLayout reps(
-      {{kRegister, {{1, 0}, {2, 0}, {4, 0}, {0x100, 0}, {0x510, 0}}},
-       {kLane, {{0x10, 0}}},
-       {kWarp, {}},
-       {kBlock, {}}},
-      outDims, /*requireSurjective=*/false);
-  LinearLayout addrLayout({{kLane, {{0x10, 0}}}, {kWarp, {}}, {kBlock, {}}},
-                          outDims, /*requireSurjective=*/false);
-
-  auto result = actionAdditiveStrides(reps, addrLayout, /*maskSpanOffsets=*/0,
-                                      /*maskSpanBlocks=*/0,
-                                      /*regsPerInst=*/8);
-  EXPECT_EQ(result.first, 8);
-}
-
-TEST_F(SwizzleTest, AdditiveStridesKeepsIndependentRegisterBases) {
-  auto kRegister = S("register");
-  auto kLane = S("lane");
-  auto kWarp = S("warp");
-  auto kBlock = S("block");
-  auto kOffset = S("offset");
-  SmallVector<std::pair<StringAttr, int32_t>> outDims = {{kOffset, 2048},
-                                                         {kBlock, 1}};
-
-  LinearLayout reps(
-      {{kRegister, {{1, 0}, {2, 0}, {4, 0}, {0x100, 0}, {0x500, 0}}},
-       {kLane, {{0x10, 0}}},
-       {kWarp, {}},
-       {kBlock, {}}},
-      outDims, /*requireSurjective=*/false);
-  LinearLayout addrLayout({{kLane, {{0x10, 0}}}, {kWarp, {}}, {kBlock, {}}},
-                          outDims, /*requireSurjective=*/false);
-
-  auto result = actionAdditiveStrides(reps, addrLayout, /*maskSpanOffsets=*/0,
-                                      /*maskSpanBlocks=*/0,
-                                      /*regsPerInst=*/8);
-  EXPECT_EQ(result.first, 32);
-}
-
 TEST_F(SwizzleTest, Test128x128Float8Transpose) {
   // 128x128 float8 matrix transpose
   LinearLayout matrix(
@@ -514,8 +460,39 @@ TEST_F(SwizzleTest, Test64x128F16BlockedLinear32Bank) {
   EXPECT_EQ(w, 0);
 }
 
-TEST_F(SwizzleTest, MixedLayoutPreservesPow2TileSwizzle) {
-  ScopedAllowNpot npot;
+TEST_F(SwizzleTest, MixedLayoutPreservesCompatibleInstructionTile) {
+  auto reg = S("register"), lane = S("lane"), warp = S("warp");
+  auto block = S("block"), dim0 = S("dim0"), dim1 = S("dim1");
+  LinearLayout src({{reg, {{0, 1}, {0, 2}, {0, 4}, {16, 0}, {32, 0}}},
+                    {lane, {{0, 8}, {0, 16}, {0, 32}, {0, 64}, {1, 0}, {2, 0}}},
+                    {warp, {{4, 0}, {8, 0}}},
+                    {block, {}}},
+                   {{dim0, 64}, {dim1, 128}}, true);
+  LinearLayout dst(
+      {{reg, {{0, 1}, {0, 2}, {0, 8}, {0, 16}, {0, 32}, {0, 64}, {32, 0}}},
+       {lane, {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 4}}},
+       {warp, {{0, 0}, {0, 0}}},
+       {block, {}}},
+      {{dim0, 64}, {dim1, 128}}, true);
+  auto batch = LinearLayout::modularIdentity1D(3, reg, S("batch"));
+  auto mixedSrc = src * batch;
+  auto mixedDst = dst * batch;
+  EXPECT_EQ(getVecBitwidthLdSt(mixedSrc, mixedDst, 16), 128);
+  LocalMemOpTile readTile{{}, {0, 1, 4}};
+  auto base = optimalSwizzlingLdSt(src, dst, 16, 32, {}, readTile);
+  auto mixed = optimalSwizzlingLdSt(mixedSrc, mixedDst, 16, 32, {}, readTile);
+  auto projected =
+      mixed.sublayout(llvm::to_vector(mixed.getInDimNames()), {dim0, dim1});
+  for (auto input : {S("vector"), S("bank")}) {
+    EXPECT_EQ(base.getInDimSize(input), projected.getInDimSize(input));
+    for (int bit : llvm::seq(base.getInDimSizeLog2(input)))
+      for (auto dim : {dim0, dim1})
+        EXPECT_EQ(base.getBasis(input, bit, dim),
+                  projected.getBasis(input, bit, dim));
+  }
+}
+
+TEST_F(SwizzleTest, MixedLayoutSelectsProjectedVectorWidth) {
   auto kReg = S("register");
   auto kLane = S("lane");
   auto kWarp = S("warp");
@@ -537,7 +514,8 @@ TEST_F(SwizzleTest, MixedLayoutPreservesPow2TileSwizzle) {
 
   constexpr int32_t numBanks = 32;
   LocalMemOpTile srcTile;
-  LocalMemOpTile dstTile{{}, {0, 1, 4}};
+  EXPECT_EQ(getVecBitwidthLdSt(src, dst, 16), 32);
+  LocalMemOpTile dstTile;
   auto mixed = optimalSwizzlingLdSt(src, dst, /*bitwidth=*/16, numBanks,
                                     srcTile, dstTile);
 
