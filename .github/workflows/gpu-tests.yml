@@ -2,8 +2,10 @@ name: Meta Triton GPU Tests
 
 on:
   push:
-    # Meta LLVM bump branches: the updater turns this run into the bump's issue.
-    branches: [main, 'scratch/meta-llvm-bump/main']
+    # A push reads the triggers in its own branch's copy, so release branches cut from
+    # main inherit this list; they also get fbsource exports that never had a PR. Meta
+    # LLVM bump branches: the updater turns this run into the bump's issue.
+    branches: [main, 'release/**', 'scratch/meta-llvm-bump/**']
   pull_request:
   schedule:
     - cron: '0 */6 * * *'
