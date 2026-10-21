@@ -209,6 +209,20 @@ Combine these inequalities with the quotient/remainder relation before
 converting the symbolic bound to a numeric range. Positive scaling preserves
 an inequality; scaling by a value with unknown sign does not.
 
+Unsigned division, remainder, and minimum use these mathematical rules when
+their operands fit the nonnegative signed range. Sign extension preserves a
+signed value. Zero extension has the same interpretation only for a
+nonnegative source value. Canonicalize equivalent signed and unsigned bounds
+before a join; otherwise the join can discard a common fact.
+
+For integer inequalities, a strict bound supplies at least one unit of slack.
+Positive integer multiples of known inequalities can cancel terms in a proof.
+Congruences can supply a larger gap: if `a < b` and both are multiples of `k`,
+then `a + offset < b` for `0 <= offset < k`. Use a non-power-of-two congruence
+only with a consistent integer interpretation. Preserve such congruences across
+arithmetic when unsigned ranges prove that it cannot wrap. Otherwise intersect
+the modulus with the integer type's wrap modulus.
+
 For a coordinate `c` and lane `l`, the following facts prove safe signed scaling:
 
 ```text
@@ -238,6 +252,12 @@ At a merge, retain only facts valid for every executable incoming value.
 Translate symbolic references to the destination values before comparing facts.
 A relation between two merged values requires agreement for the corresponding
 incoming pair on every edge. Independent joins cannot establish that pairing.
+
+At a call boundary, translate bound references from actual operands to formal
+arguments. At a return boundary, translate formal arguments back to actual
+operands. Discard references that have no representation in the destination.
+Join all executable call sites and return sites; a caller-specific bound must
+not escape through another call. These transfers do not specialize functions.
 
 Use widening for changing loop-carried facts. A body-entry refinement remains
 a transfer in each iteration; widening the recurrence does not erase the
@@ -313,6 +333,11 @@ operands in `E` and symbolic storage in `K`.
 All-pairs relational closure requires quadratic storage and can require cubic
 work. Exhaustive path splitting can require exponential work. Neither belongs
 in the default analysis. Retention and widening choices must be deterministic.
+
+Bounded local proofs must retain the input relations as well as relations from
+arithmetic definitions. A proof budget exhausted by intermediate bounds yields
+unknown, not permission to narrow. Bound positive scaling and constraint
+combinations separately from the number of stored relations.
 
 The pre-pass must also account for inserted operands and rewritten uses. A
 scope can refine many values, and nested scopes can multiply that work. Group

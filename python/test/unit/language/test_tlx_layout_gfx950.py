@@ -16,6 +16,67 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("m,n", [(13, 17), (1025, 2049), (2147483647, 2147483647)])
+@pytest.mark.parametrize("xcd,chunk,group", [(8, 4, 4), (3, 5, 7)])
+def test_integer_facts_swizzle_coordinates(m, n, xcd, chunk, group):
+
+    @triton.jit
+    def permute(tile, count, XCD: tl.constexpr, CHUNK: tl.constexpr):
+        aligned = (count // (XCD * CHUNK)) * (XCD * CHUNK)
+        if tile >= aligned:
+            return tile
+        minor = tile % XCD
+        major = tile // XCD
+        return (major // CHUNK) * XCD * CHUNK + minor * CHUNK + major % CHUNK
+
+    @triton.jit(do_not_specialize=["m", "n"])
+    def kernel(tiles, row_out, col_out, m, n, XCD: tl.constexpr, CHUNK: tl.constexpr, GROUP: tl.constexpr):
+        if (m > 0) & (n > 0):
+            wide_m = m.to(tl.uint64)
+            wide_n = n.to(tl.uint64)
+            rows = tl.cdiv(wide_m, 32)
+            cols = tl.cdiv(wide_n, 32)
+            count = rows * cols
+            tile = tl.load(tiles + tl.program_id(0)).to(tl.uint64)
+            if tile < count:
+                mapped = permute(tile, count, XCD, CHUNK)
+                width = GROUP * cols
+                base = (mapped // width) * GROUP
+                active = tl.minimum(rows - base, GROUP)
+                row = base + (mapped % width) % active
+                col = (mapped % width) // active
+                lane = tl.arange(0, 32).to(tl.uint64)
+                r = (row * 32 + lane) % wide_m
+                c = (col * 32 + lane) % wide_n
+                out = tl.program_id(0) * 32 + tl.arange(0, 32)
+                tl.store(row_out + out, r)
+                tl.store(col_out + out, c)
+
+    rows, cols = triton.cdiv(m, 32), triton.cdiv(n, 32)
+    count = rows * cols
+    tiles = sorted({0, min(1, count - 1), count // 2, count - 1})
+    tile_tensor = torch.tensor(tiles, dtype=torch.int64, device=DEVICE)
+    row_out = torch.empty((len(tiles), 32), dtype=torch.int64, device=DEVICE)
+    col_out = torch.empty_like(row_out)
+    compiled = kernel[(len(tiles), )](tile_tensor, row_out, col_out, m, n, xcd, chunk, group)
+    expected_rows, expected_cols = [], []
+    for tile in tiles:
+        aligned = count // (xcd * chunk) * (xcd * chunk)
+        major, minor = divmod(tile, xcd)
+        mapped = tile if tile >= aligned else major // chunk * xcd * chunk + minor * chunk + major % chunk
+        base = mapped // (group * cols) * group
+        active = min(rows - base, group)
+        row = base + mapped % (group * cols) % active
+        col = mapped % (group * cols) // active
+        expected_rows.append([(row * 32 + lane) % m for lane in range(32)])
+        expected_cols.append([(col * 32 + lane) % n for lane in range(32)])
+    torch.testing.assert_close(row_out, torch.tensor(expected_rows, device=DEVICE), rtol=0, atol=0)
+    torch.testing.assert_close(col_out, torch.tensor(expected_cols, device=DEVICE), rtol=0, atol=0)
+    assert re.search(r"arith.remui .* : tensor<32xi32>", compiled.asm["ttir"])
+    assert not re.search(r"arith.remui .* : tensor<32xi64>", compiled.asm["ttir"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 @pytest.mark.parametrize("value", [-17, 0, 1023, 1024, 2**40])
 def test_integer_facts_narrow_branch(value):
 
