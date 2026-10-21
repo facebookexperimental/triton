@@ -1,7 +1,8 @@
 name: CI Health
 # Collects runs, jobs, steps and failing tests of gpu-tests.yml,
-# gpu-tests-nightly.yml and nightly-tlx-ops-bench.yml, and runs of
-# nightly-fbtriton.yml, into the 'ci-health' release, for the /ci/ dashboard
+# gpu-tests-nightly.yml and nightly-tlx-ops-bench.yml, runs of
+# nightly-fbtriton.yml, and each tracked branch's Meta LLVM pin, into the
+# 'ci-health' release, for the /ci/ dashboard
 # that pages.yml renders after each successful collection. Never deploys. On
 # pull requests it only runs the dashboard's tests.
 on:
@@ -21,6 +22,7 @@ on:
       - '.github/scripts/test_ci_health.py'
       - '.github/scripts/test_ci_health_rules.py'
       - '.github/scripts/test_ci_health_logs.py'
+      - '.github/scripts/meta_llvm_bump.py'
       - '.github/workflows/ci-health.yml'
       - '.github/workflows/gpu-tests.yml'
       - '.github/workflows/nightly-fbtriton.yml'
