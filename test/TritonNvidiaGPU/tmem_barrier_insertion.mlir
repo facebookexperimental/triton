@@ -615,9 +615,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
   // CHECK-LABEL: @multiple_warp_scope_writers
   // CHECK: ttg.warp_specialize
-  // CHECK: ttng.tmem_wait store
-  // CHECK-NEXT: ttg.barrier local
-  // CHECK-NEXT: ttng.tmem_load
+  // CHECK: ttng.tmem_store
+  // CHECK-NEXT: ttng.tmem_wait store
+  // CHECK-NEXT: ttg.warp_yield
+  // CHECK: partition0
+  // CHECK: ttng.tmem_store
+  // CHECK-NEXT: ttng.tmem_wait store
+  // CHECK-NEXT: ttg.warp_return
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: ttng.tmem_wait load
+  // CHECK-NEXT: tt.return
   tt.func @multiple_warp_scope_writers(
       %arg0: tensor<128x128xf32, #blocked>) {
     %true = arith.constant true
