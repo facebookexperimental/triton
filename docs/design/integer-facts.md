@@ -12,13 +12,13 @@ predicate-style assumptions into result-producing SSA refinements. A sparse
 dataflow analysis then derives integer facts from SSA definitions. It does not
 query program points, dominance, nearby assumptions, or enclosing predicates.
 
-The analysis belongs in generic compiler analysis support. Triton and target
-models supply operation semantics and hardware bounds. AxisInfo consumes
-proofs for its tensor layout rules. The contract does not depend on the Wave
-backend or a kernel pattern.
+TLX owns the complete implementation: the fact-materialization pre-pass,
+refinement IR, integer analysis, operation models, and consumer integration.
+The analysis lives in TLX compiler analysis support. Target models in TLX supply
+hardware bounds. AxisInfo consumes proofs for its tensor layout rules.
 
-Backend adapters must preserve the result-scoped meaning of their source
-assumption operations. This contract does not change those operations' semantics.
+Refinement operations are consumed and lowered within TLX. Arithmetic rules
+apply to operation semantics, not kernel patterns.
 
 ## SSA refinement contract
 
