@@ -101,8 +101,14 @@ static void materialize(ArrayRef<Predicate> predicates, Block *block,
           existing.getPredicate() == predicate.comparison)
         continue;
       auto inScope = [&](OpOperand &use) {
-        // Bound operands retain their identity; never create refinement cycles.
-        return !isa<RefineOp>(use.getOwner()) && position != block->end() &&
+        if (auto refine = dyn_cast<RefineOp>(use.getOwner())) {
+          // Chain value facts; bound operands keep their SSA identity.
+          if (use.getOperandNumber() != 0 ||
+              (refine.getBound() == predicate.bound &&
+               refine.getPredicate() == predicate.comparison))
+            return false;
+        }
+        return position != block->end() &&
                dominance.dominates(&*position, use.getOwner());
       };
       if (!llvm::any_of(input.getUses(), inScope))

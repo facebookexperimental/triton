@@ -9,8 +9,11 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/Support/DebugLog.h"
+#include "llvm/Support/MathExtras.h"
 #include <array>
 #include <limits>
+#include <map>
+#include <tuple>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -28,12 +31,15 @@ struct IntegerBound {
 };
 
 struct IntegerFacts {
+  enum class Sign { Unknown, Nonnegative, Positive };
   SmallVector<IntegerBound, 4> bounds;
   // Modulus zero denotes an exact bit pattern; one denotes no congruence.
   std::optional<std::pair<APInt, APInt>> congruence;
+  Sign sign = Sign::Unknown;
 
   bool operator==(const IntegerFacts &other) const {
-    return bounds == other.bounds && congruence == other.congruence;
+    return bounds == other.bounds && congruence == other.congruence &&
+           sign == other.sign;
   }
 
   static IntegerFacts unknown(Value value) {
@@ -58,6 +64,7 @@ struct IntegerFacts {
     for (IntegerBound bound : a.bounds)
       if (llvm::is_contained(b.bounds, bound))
         result.bounds.push_back(bound);
+    result.sign = std::min(a.sign, b.sign);
     return result;
   }
 
@@ -81,6 +88,394 @@ static Value stripRefinements(Value value) {
     value = refine.getValue();
   return value;
 }
+
+// 64 SSA nodes; 16 relations/terms; degree four; normalization depth 12.
+// K relations and T terms: pairwise proof costs O(K^2*T*log(T)).
+// At most eight bounds and eight positive scale factors per transfer.
+class IntegerRelations {
+  struct Symbol {
+    unsigned value;
+    unsigned divisor;
+    bool operator<(const Symbol &other) const {
+      return std::tie(value, divisor) < std::tie(other.value, other.divisor);
+    }
+    bool operator==(const Symbol &other) const {
+      return value == other.value && divisor == other.divisor;
+    }
+  };
+  using Monomial = SmallVector<Symbol, 2>;
+  using Polynomial = std::map<Monomial, int64_t>;
+  struct Constraint {
+    Polynomial expression;
+    bool strict;
+  };
+
+public:
+  IntegerRelations(ValueRange roots,
+                   function_ref<IntegerValueRange(Value)> getRange) {
+    SmallVector<Value> pending(roots);
+    DenseSet<Value> visited;
+    while (!pending.empty()) {
+      Value value = pending.pop_back_val();
+      if (!visited.insert(value).second)
+        continue;
+      if (values.size() == 64) {
+        LDBG() << "Integer relation SSA budget exhausted";
+        valid = false;
+        return;
+      }
+      values.push_back(value);
+      if (ConstantIntRanges::getStorageBitwidth(value.getType()) > 64) {
+        valid = false;
+        return;
+      }
+      IntegerValueRange range = getRange(value);
+      if (!range.isUninitialized()) {
+        Value identity = stripRefinements(value);
+        auto it = ranges.find(identity);
+        if (it == ranges.end())
+          ranges.try_emplace(identity, range.getValue());
+        else
+          it->second = it->second.intersection(range.getValue());
+      }
+      Operation *op = value.getDefiningOp();
+      // These operations require all operands to be non-poison. Select does
+      // not.
+      if (op &&
+          isa<RefineOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
+              arith::DivSIOp, arith::RemSIOp, arith::MinSIOp, arith::MaxSIOp>(
+              op))
+        llvm::append_range(pending, op->getOperands());
+    }
+    for (Value value : values) {
+      if (auto refine = value.getDefiningOp<RefineOp>()) {
+        using P = arith::CmpIPredicate;
+        P pred = refine.getPredicate();
+        if ((pred == P::slt || pred == P::sle) &&
+            !matchPattern(refine.getBound(), m_Constant()))
+          addConstraint(
+              subtract(normalize(refine.getBound()), normalize(value)),
+              pred == P::slt);
+        if ((pred == P::sgt || pred == P::sge) &&
+            !matchPattern(refine.getBound(), m_Constant()))
+          addConstraint(
+              subtract(normalize(value), normalize(refine.getBound())),
+              pred == P::sgt);
+      }
+      Operation *op = value.getDefiningOp();
+      if (auto minimum = dyn_cast_or_null<arith::MinSIOp>(op)) {
+        addConstraint(subtract(normalize(minimum.getLhs()), normalize(value)),
+                      false);
+        addConstraint(subtract(normalize(minimum.getRhs()), normalize(value)),
+                      false);
+      }
+      if (!op || !isa<arith::DivSIOp, arith::RemSIOp>(op) ||
+          !nonnegativeRange(op->getOperand(0)) ||
+          !positiveRange(op->getOperand(1)))
+        continue;
+      auto dividend = normalize(op->getOperand(0));
+      auto divisor = normalize(op->getOperand(1));
+      auto quotient = quotientSymbol(op->getOperand(0), op->getOperand(1));
+      auto remainder = subtract(dividend, multiply(quotient, divisor));
+      addConstraint(remainder, false);
+      addConstraint(subtract(divisor, remainder), true);
+    }
+  }
+
+  bool nonnegative(Value value) {
+    if (auto minimum = stripRefinements(value).getDefiningOp<arith::MinSIOp>())
+      return prove(normalize(minimum.getLhs()), false) &&
+             prove(normalize(minimum.getRhs()), false);
+    return prove(normalize(value), false);
+  }
+
+  bool positive(Value value) {
+    if (!valid)
+      return false;
+    if (auto minimum = stripRefinements(value).getDefiningOp<arith::MinSIOp>())
+      return prove(normalize(minimum.getLhs()), true) &&
+             prove(normalize(minimum.getRhs()), true);
+    return prove(normalize(value), true);
+  }
+
+  bool productUpperBound(Value value, Value divisor, Value bound) {
+    if (!valid)
+      return false;
+    auto upper = normalize(bound);
+    auto input = normalize(value);
+    if (auto minimum =
+            stripRefinements(divisor).getDefiningOp<arith::MinSIOp>())
+      return prove(
+                 subtract(multiply(normalize(minimum.getLhs()), upper), input),
+                 true) &&
+             prove(
+                 subtract(multiply(normalize(minimum.getRhs()), upper), input),
+                 true);
+    return prove(subtract(multiply(normalize(divisor), upper), input), true);
+  }
+
+  ArrayRef<Value> candidates() const { return values; }
+  bool hasRelations() const { return valid && !constraints.empty(); }
+  bool upperBound(Value value, Value bound) {
+    return prove(subtract(normalize(bound), normalize(value)), true);
+  }
+
+private:
+  static std::optional<Polynomial> add(std::optional<Polynomial> a,
+                                       const std::optional<Polynomial> &b,
+                                       int64_t sign = 1) {
+    if (!a || !b)
+      return std::nullopt;
+    for (const auto &[term, coefficient] : *b) {
+      int64_t scaled, sum;
+      if (llvm::MulOverflow(coefficient, sign, scaled) ||
+          llvm::AddOverflow((*a)[term], scaled, sum))
+        return std::nullopt;
+      if (sum)
+        (*a)[term] = sum;
+      else
+        a->erase(term);
+      if (a->size() > 16)
+        return std::nullopt;
+    }
+    return a;
+  }
+
+  static std::optional<Polynomial>
+  subtract(std::optional<Polynomial> a, const std::optional<Polynomial> &b) {
+    return add(std::move(a), b, -1);
+  }
+
+  static std::optional<Polynomial>
+  multiply(const std::optional<Polynomial> &a,
+           const std::optional<Polynomial> &b) {
+    if (!a || !b)
+      return std::nullopt;
+    std::optional<Polynomial> result = Polynomial{};
+    for (const auto &[at, ac] : *a)
+      for (const auto &[bt, bc] : *b) {
+        if (at.size() + bt.size() > 4)
+          return std::nullopt;
+        int64_t coefficient;
+        if (llvm::MulOverflow(ac, bc, coefficient))
+          return std::nullopt;
+        Monomial term(at);
+        llvm::append_range(term, bt);
+        llvm::sort(term);
+        result = add(std::move(result), Polynomial{{term, coefficient}});
+        if (!result)
+          return std::nullopt;
+      }
+    return result;
+  }
+
+  unsigned symbolID(Value value) {
+    value = stripRefinements(value);
+    auto [it, inserted] = symbolIDs.try_emplace(value, symbols.size());
+    if (inserted)
+      symbols.push_back(value);
+    return it->second;
+  }
+
+  Polynomial quotientSymbol(Value dividend, Value divisor) {
+    return {{{{symbolID(dividend), symbolID(divisor)}}, 1}};
+  }
+
+  bool positiveRange(Value value) const {
+    auto it = ranges.find(stripRefinements(value));
+    return it != ranges.end() && it->second.smin().isStrictlyPositive();
+  }
+  bool nonnegativeRange(Value value) const {
+    auto it = ranges.find(stripRefinements(value));
+    return it != ranges.end() && it->second.smin().isNonNegative();
+  }
+
+  bool noSignedWrap(Operation *op) const {
+    if (auto overflow = dyn_cast<arith::ArithIntegerOverflowFlagsInterface>(op))
+      if (overflow.hasNoSignedWrap())
+        return true;
+    auto a = ranges.find(stripRefinements(op->getOperand(0)));
+    auto b = ranges.find(stripRefinements(op->getOperand(1)));
+    if (a == ranges.end() || b == ranges.end())
+      return false;
+    bool noOverflow = true;
+    for (const APInt &av : {a->second.smin(), a->second.smax()})
+      for (const APInt &bv : {b->second.smin(), b->second.smax()}) {
+        bool overflow;
+        if (isa<arith::AddIOp>(op))
+          (void)av.sadd_ov(bv, overflow);
+        else if (isa<arith::SubIOp>(op))
+          (void)av.ssub_ov(bv, overflow);
+        else
+          (void)av.smul_ov(bv, overflow);
+        noOverflow &= !overflow;
+      }
+    if (noOverflow)
+      return true;
+    if (!isa<arith::MulIOp>(op) || !a->second.smin().isNonNegative() ||
+        !b->second.smin().isNonNegative())
+      return false;
+    // 0 <= a <= limit / b, b > 0 implies 0 <= a*b <= limit.
+    for (Value value : values) {
+      auto refine = value.getDefiningOp<RefineOp>();
+      if (!refine || (refine.getPredicate() != arith::CmpIPredicate::sle &&
+                      refine.getPredicate() != arith::CmpIPredicate::slt))
+        continue;
+      auto quotient =
+          stripRefinements(refine.getBound()).getDefiningOp<arith::DivSIOp>();
+      if (!quotient || !nonnegativeRange(quotient.getLhs()) ||
+          !positiveRange(quotient.getRhs()))
+        continue;
+      Value bounded = stripRefinements(refine.getValue());
+      Value divisor = stripRefinements(quotient.getRhs());
+      Value lhs = stripRefinements(op->getOperand(0));
+      Value rhs = stripRefinements(op->getOperand(1));
+      if ((bounded == lhs && divisor == rhs) ||
+          (bounded == rhs && divisor == lhs))
+        return true;
+    }
+    return false;
+  }
+
+  std::optional<Polynomial> normalize(Value value, unsigned depth = 0) {
+    if (depth == 12)
+      return std::nullopt;
+    value = stripRefinements(value);
+    if (auto constant = getConstantIntValue(value))
+      return Polynomial{{{}, *constant}};
+    Operation *op = value.getDefiningOp();
+    if (op && isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(op) &&
+        noSignedWrap(op)) {
+      auto a = normalize(op->getOperand(0), depth + 1);
+      auto b = normalize(op->getOperand(1), depth + 1);
+      if (isa<arith::AddIOp>(op))
+        return add(a, b);
+      if (isa<arith::SubIOp>(op))
+        return subtract(a, b);
+      return multiply(a, b);
+    }
+    if (op && isa<arith::DivSIOp>(op))
+      return quotientSymbol(op->getOperand(0), op->getOperand(1));
+    if (op && isa<arith::RemSIOp>(op) && nonnegativeRange(op->getOperand(0)) &&
+        positiveRange(op->getOperand(1)))
+      return subtract(
+          normalize(op->getOperand(0), depth + 1),
+          multiply(quotientSymbol(op->getOperand(0), op->getOperand(1)),
+                   normalize(op->getOperand(1), depth + 1)));
+    return Polynomial{{{{symbolID(value), 0}}, 1}};
+  }
+
+  void addConstraint(std::optional<Polynomial> expression, bool strict) {
+    if (expression)
+      for (Constraint &constraint : constraints)
+        if (constraint.expression == *expression) {
+          constraint.strict |= strict;
+          return;
+        }
+    if (expression && constraints.size() < 16)
+      constraints.push_back({std::move(*expression), strict});
+  }
+
+  bool constantNonnegative(const Polynomial &expression, bool strict) const {
+    APInt sum(256, 0);
+    for (const auto &[term, coefficient] : expression) {
+      APInt lo(256, 1), hi(256, 1);
+      for (Symbol symbol : term) {
+        auto it = ranges.find(symbols[symbol.value]);
+        if (it == ranges.end() || it->second.smin().getBitWidth() > 64)
+          return false;
+        APInt a = it->second.smin().sext(256);
+        APInt b = it->second.smax().sext(256);
+        if (symbol.divisor) {
+          auto divisor = ranges.find(symbols[symbol.divisor]);
+          if (a.isNegative() || divisor == ranges.end() ||
+              !divisor->second.smin().isStrictlyPositive())
+            return false;
+          a = a.sdiv(divisor->second.smax().sext(256));
+          b = b.sdiv(divisor->second.smin().sext(256));
+        }
+        std::array<APInt, 4> products{lo * a, lo * b, hi * a, hi * b};
+        lo = *llvm::min_element(
+            products, [](const APInt &x, const APInt &y) { return x.slt(y); });
+        hi = *llvm::max_element(
+            products, [](const APInt &x, const APInt &y) { return x.slt(y); });
+      }
+      bool overflow;
+      APInt product = (coefficient < 0 ? hi : lo)
+                          .smul_ov(APInt(256, coefficient, true), overflow);
+      if (overflow)
+        return false;
+      sum = sum.sadd_ov(product, overflow);
+      if (overflow)
+        return false;
+    }
+    return strict ? sum.isStrictlyPositive() : sum.isNonNegative();
+  }
+
+  bool proveDirect(const Polynomial &expression, bool strict) const {
+    if (constantNonnegative(expression, strict))
+      return true;
+    for (const Constraint &constraint : constraints)
+      if (constraint.expression == expression && (!strict || constraint.strict))
+        return true;
+    for (const Constraint &a : constraints) {
+      if (!cancelsTerm(expression, a.expression))
+        continue;
+      auto rest = subtract(expression, a.expression);
+      if (!rest)
+        continue;
+      if (constantNonnegative(*rest, strict && !a.strict))
+        return true;
+      for (const Constraint &b : constraints) {
+        if (!cancelsTerm(*rest, b.expression))
+          continue;
+        auto tail = subtract(rest, b.expression);
+        if (tail &&
+            constantNonnegative(*tail, strict && !a.strict && !b.strict))
+          return true;
+      }
+    }
+    return false;
+  }
+
+  static bool cancelsTerm(const Polynomial &expression,
+                          const Polynomial &constraint) {
+    for (const auto &[term, coefficient] : constraint) {
+      auto it = expression.find(term);
+      if (!term.empty() && it != expression.end() && it->second == coefficient)
+        return true;
+    }
+    return false;
+  }
+
+  bool prove(const std::optional<Polynomial> &expression, bool strict) {
+    if (!valid || !expression)
+      return false;
+    if (proveDirect(*expression, strict))
+      return true;
+    // Positive scaling preserves the inequality; never assume a divisor's sign.
+    DenseSet<Value> tried;
+    for (Value value : values) {
+      if (!positiveRange(value) || matchPattern(value, m_Constant()))
+        continue;
+      if (!tried.insert(stripRefinements(value)).second)
+        continue;
+      if (tried.size() > 8)
+        break;
+      auto scaled = multiply(expression, normalize(value));
+      if (scaled && proveDirect(*scaled, strict))
+        return true;
+    }
+    return false;
+  }
+
+  SmallVector<Value> values;
+  SmallVector<Value> symbols{Value{}};
+  SmallVector<Constraint> constraints;
+  DenseMap<Value, unsigned> symbolIDs;
+  DenseMap<Value, ConstantIntRanges> ranges;
+  bool valid = true;
+};
 
 class IntegerFactsAnalysis final
     : public dataflow::SparseForwardDataFlowAnalysis<IntegerFactsLattice> {
@@ -174,53 +569,47 @@ public:
       facts.congruence = {modulus,
                           residue.urem(modulus.isZero() ? wrap : modulus)};
     }
-    if (isa<arith::DivSIOp>(op)) {
-      const auto *lhs = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
-          getProgramPointAfter(op), op->getOperand(0));
-      const auto *rhs = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
-          getProgramPointAfter(op), op->getOperand(1));
-      if (lhs->getValue().isUninitialized() ||
-          rhs->getValue().isUninitialized())
+    if (isa<arith::DivSIOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
+            arith::MinSIOp>(op) &&
+        isa<IntegerType>(result.getType())) {
+      bool pending = false;
+      auto range = [&](Value value) {
+        const auto *state = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+            getProgramPointAfter(op), value);
+        pending |= state->getValue().isUninitialized();
+        return state->getValue();
+      };
+      IntegerRelations relations(op->getOperands(), range);
+      if (pending)
         return success();
-      if (lhs->getValue().getValue().smin().isNonNegative() &&
-          rhs->getValue().getValue().smin().isStrictlyPositive()) {
-        for (IntegerBound bound : operands[0]->getValue().bounds) {
-          if (bound.predicate != arith::CmpIPredicate::slt)
+      bool division = isa<arith::DivSIOp>(op);
+      Value dividend = op->getOperand(0), divisor = op->getOperand(1);
+      bool nonnegative =
+          division
+              ? relations.nonnegative(dividend) && relations.positive(divisor)
+              : relations.hasRelations() && relations.nonnegative(result);
+      if (nonnegative) {
+        DenseSet<Value> tried;
+        for (Value bound : relations.candidates()) {
+          IntegerValueRange limit = range(bound);
+          if (bound.getType() != result.getType() ||
+              matchPattern(bound, m_Constant()) || limit.isUninitialized() ||
+              !limit.getValue().smin().isStrictlyPositive() ||
+              !tried.insert(stripRefinements(bound)).second)
             continue;
-          auto product =
-              stripRefinements(bound.value).getDefiningOp<arith::MulIOp>();
-          if (!product)
+          if (tried.size() > 8)
+            break;
+          bool proven =
+              division ? relations.productUpperBound(dividend, divisor, bound)
+                       : relations.upperBound(result, bound);
+          if (!proven)
             continue;
-          Value divisor = stripRefinements(op->getOperand(1));
-          Value factor;
-          if (stripRefinements(product.getLhs()) == divisor)
-            factor = product.getRhs();
-          else if (stripRefinements(product.getRhs()) == divisor)
-            factor = product.getLhs();
-          if (!factor)
-            continue;
-          const auto *a = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
-              getProgramPointAfter(op), product.getLhs());
-          const auto *b = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
-              getProgramPointAfter(op), product.getRhs());
-          if (a->getValue().isUninitialized() ||
-              b->getValue().isUninitialized())
-            return success();
-          bool noWrap = product.hasNoSignedWrap();
-          if (!noWrap) {
-            const ConstantIntRanges &ar = a->getValue().getValue();
-            const ConstantIntRanges &br = b->getValue().getValue();
-            noWrap = true;
-            for (const APInt &av : {ar.smin(), ar.smax()})
-              for (const APInt &bv : {br.smin(), br.smax()}) {
-                bool overflow;
-                (void)av.smul_ov(bv, overflow);
-                noWrap &= !overflow;
-              }
-          }
-          if (noWrap)
-            facts.bounds.push_back({factor, arith::CmpIPredicate::slt});
+          if (facts.bounds.size() < 8)
+            facts.bounds.push_back({bound, arith::CmpIPredicate::slt});
         }
+        facts.sign = !division && relations.positive(result)
+                         ? IntegerFacts::Sign::Positive
+                         : IntegerFacts::Sign::Nonnegative;
       }
     }
     propagateIfChanged(results[0], results[0]->join(facts));
@@ -386,12 +775,22 @@ public:
     for (const auto *operand : operands)
       ranges.push_back(operand->getValue());
     auto setRange = [&](Value value, const IntegerValueRange &range) {
-      auto *lattice = results[cast<OpResult>(value).getResultNumber()];
+      auto result = dyn_cast<OpResult>(value);
+      if (!result)
+        return;
+      auto *lattice = results[result.getResultNumber()];
       const auto *facts =
           getOrCreateFor<IntegerFactsLattice>(getProgramPointAfter(op), value);
       if (!facts->getValue().congruence || range.isUninitialized())
         return;
       ConstantIntRanges refined = range.getValue();
+      IntegerFacts::Sign sign = facts->getValue().sign;
+      if (sign != IntegerFacts::Sign::Unknown) {
+        unsigned width = refined.smin().getBitWidth();
+        refined = refined.intersection(ConstantIntRanges::fromSigned(
+            APInt(width, sign == IntegerFacts::Sign::Positive),
+            APInt::getSignedMaxValue(width)));
+      }
       const auto &[modulus, residue] = *facts->getValue().congruence;
       if (modulus.isZero()) {
         APInt exact = residue.trunc(refined.umin().getBitWidth());
@@ -420,6 +819,10 @@ public:
     };
     if (inferTritonRanges(op, ranges, setRange, maxProgramIds))
       return success();
+    if (auto inferrable = dyn_cast<InferIntRangeInterface>(op)) {
+      inferrable.inferResultRangesFromOptional(ranges, setRange);
+      return success();
+    }
     return dataflow::IntegerRangeAnalysis::visitOperation(op, operands,
                                                           results);
   }

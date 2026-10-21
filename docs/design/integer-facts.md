@@ -128,6 +128,10 @@ Reuse a refinement operation when its operands and predicates already express th
 required facts. Repeated execution must converge from IR structure. Do not add
 processed markers or pass-history attributes.
 
+A new fact must also reach the value input of a dominated refinement.
+Preserve that chain when a loop or branch fact surrounds an assumption.
+Do not rewrite refinement bound operands or duplicate a matching refinement.
+
 Group predicates by their valid entry scope. Do not insert a refinement per use
 or clone arithmetic solely to attach facts. A previously computed value does
 not acquire facts merely because one of its inputs has a later refinement.
@@ -188,6 +192,23 @@ These are mathematical relations. Lift a wrapping source product into them only
 after proving that its relevant interpretation does not overflow. A widened
 analysis expression does not prove that the original narrow operation was safe.
 
+A signed product also has no overflow when `0 <= a <= limit / b`,
+`limit >= 0`, and `b > 0`, where `limit` has the product's integer type.
+This rule can use a consumed refinement of `a`. It must not use a refinement
+on a sibling path.
+
+A query can combine relations from strict operand chains: a defined result
+requires every operand on those chains to be non-poison. Within that query,
+refinement results and their value inputs have equal bit patterns. Do not
+traverse select alternatives or freeze with this rule. An unselected poison
+operand does not make a select result poison.
+
+For `d = min(a, b)`, prove a positive divisor from both `a > 0` and `b > 0`.
+Prove `x < d*n`, for positive `n`, from both `x < a*n` and `x < b*n`.
+Combine these inequalities with the quotient/remainder relation before
+converting the symbolic bound to a numeric range. Positive scaling preserves
+an inequality; scaling by a value with unknown sign does not.
+
 For a coordinate `c` and lane `l`, the following facts prove safe signed scaling:
 
 ```text
@@ -222,6 +243,10 @@ Use widening for changing loop-carried facts. A body-entry refinement remains
 a transfer in each iteration; widening the recurrence does not erase the
 operation's semantic predicate. Prove an invariant from the entry and backedge,
 not by assuming the invariant to prove itself.
+
+The range lattice owns numeric intervals and their widening. The symbolic
+lattice retains finite sign facts and SSA bounds, not a second numeric interval
+that can bypass range widening.
 
 Cloning remaps all predicate operands. CSE requires equal operands, result
 types, and predicates. Refinements have no memory effects, but motion must
