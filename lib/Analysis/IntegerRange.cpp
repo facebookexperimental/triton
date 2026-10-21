@@ -836,7 +836,8 @@ private:
 IntegerFactAnalysis::IntegerFactAnalysis() = default;
 IntegerFactAnalysis::~IntegerFactAnalysis() = default;
 
-LogicalResult IntegerFactAnalysis::initialize(Operation *root) {
+std::unique_ptr<DataFlowSolver>
+mlir::triton::createIntegerFactSolver(Operation *root) {
   std::array<int64_t, 3> maxProgramIds;
   maxProgramIds.fill(std::numeric_limits<int32_t>::max());
   ModuleOp mod = dyn_cast<ModuleOp>(root);
@@ -850,9 +851,14 @@ LogicalResult IntegerFactAnalysis::initialize(Operation *root) {
           if (std::optional<int64_t> bound = bounds->getMaxProgramId(mod, axis))
             maxProgramIds[axis] = std::min(maxProgramIds[axis], *bound);
 
-  solver = createDataFlowSolver();
+  auto solver = createDataFlowSolver();
   solver->load<IntegerFactsAnalysis>();
   solver->load<IntegerRangeAnalysis>(maxProgramIds);
+  return solver;
+}
+
+LogicalResult IntegerFactAnalysis::initialize(Operation *root) {
+  solver = createIntegerFactSolver(root);
   return solver->initializeAndRun(root);
 }
 
