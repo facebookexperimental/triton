@@ -107,8 +107,8 @@ def _along2(n: tl.constexpr, axis: tl.constexpr):
 def _row_padded(rows, cols, pad, bands=0):
     """Row-major LDS image with ``pad`` elements after each row, as [bands, rows // bands, cols] if ``bands``.
 
-    Explicit, because uTLX otherwise picks an image for its transposed reads
-    that turns the row-vector writes into 2-byte stores.
+    Explicit, because the image picked by default for these buffers'
+    transposed reads is slower.
     """
     shape = [bands, rows // bands, cols] if bands else [rows, cols]
     # getattr: a plain attribute would make the layout class a global the
@@ -232,8 +232,8 @@ def _prepare_chunk_kernel(
     if RAW:
         # What prepare_kda_inputs does, but the activated gate here and the
         # l2-normalized Q/K below stay fp32 until they become MFMA operands.
-        # A [D] vector broadcast in registers: the full-tile offsets would go
-        # through LDS on uTLX, and the loads lose their broadcast.
+        # A [D] vector broadcast in registers: a load with the tile's
+        # offsets is slower.
         bias = tlx.release_layout(
             tl.load(DtBias + head * D +
                     tlx.require_layout(tl.arange(0, D), tlx.slice_layout(tlx.slice_layout(bf, 1), 0))))
@@ -423,7 +423,8 @@ def _ring_layout(rows, cols, pad):
     bases = [[0, 1 << b] for b in range(column_bits)]
     bases += [[1 << b, 0] for b in range(low_row_bits, row_bits)]
     bases += [[1 << b, 0] for b in range(low_row_bits)]
-    return getattr(tlx, "padded_shared_layout_encoding").with_bases([[512, pad]], bases, [rows, cols])  # as in _row_padded
+    # getattr, as in _row_padded.
+    return getattr(tlx, "padded_shared_layout_encoding").with_bases([[512, pad]], bases, [rows, cols])
 
 
 @triton.jit
@@ -617,8 +618,8 @@ def _walk_chunks(
     for local_chunk in range(chunk_lo, chunk_hi):
         token0 = local_chunk * BT
         slot = (local_chunk - chunk_lo) % 2
-        # Wait before issuing the next chunk's copies: uTLX lowers every wait
-        # to vmcnt(0), which would otherwise also wait for the prefetch.
+        # Wait before issuing the next chunk's copies, so the wait never
+        # covers the prefetch, even where it is lowered to vmcnt(0).
         ready = tlx.async_load_wait_group(0)
         _copy_walk_chunk(
             W,
