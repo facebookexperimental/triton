@@ -190,6 +190,7 @@ public:
            /*txCount=*/static_cast<int>(expectOp.getSize())});
     }
     if (auto copyOp = dyn_cast<ttng::TMEMCopyOp>(op)) {
+      info->pred = copyOp.getPred();
       namedOperands = {{copyOp.getSrc(), "Src"}, {copyOp.getDst(), "Dst"}};
     }
     if (auto shiftOp = dyn_cast<ttng::TMEMShiftOp>(op)) {
