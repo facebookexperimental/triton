@@ -196,6 +196,10 @@ public:
 
 class AxisInfoVisitorList {
 public:
+  void append(std::unique_ptr<AxisInfoVisitor> visitor) {
+    visitors.push_back(std::move(visitor));
+  }
+
   template <typename... Ts, typename = std::enable_if_t<sizeof...(Ts) != 0>>
   void append() {
     (visitors.emplace_back(std::make_unique<Ts>()), ...);
@@ -216,6 +220,7 @@ private:
 class AxisInfoAnalysis : public dataflow::SparseForwardDataFlowAnalysis<
                              dataflow::Lattice<AxisInfo>> {
 protected:
+  DenseSet<Operation *> nonNegativeDividends;
   AxisInfoVisitorList visitors;
 
   void setToEntryState(dataflow::Lattice<AxisInfo> *lattice) override;
@@ -231,6 +236,7 @@ protected:
 
 public:
   AxisInfoAnalysis(DataFlowSolver &solver);
+  LogicalResult initialize(Operation *top) override;
   using dataflow::SparseForwardDataFlowAnalysis<
       dataflow::Lattice<AxisInfo>>::getLatticeElement;
 

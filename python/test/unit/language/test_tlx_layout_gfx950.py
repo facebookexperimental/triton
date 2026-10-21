@@ -13,6 +13,42 @@ from triton.tlx.ops.kernels.flash_attn.gfx950 import _sum_rows_chain4 as _cluste
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("base", [-128, -64, -4, 0, 128, 2147483584])
+@pytest.mark.parametrize("divisor", [-64, -4, 4, 64])
+@pytest.mark.parametrize("op", ["div", "rem"])
+@pytest.mark.parametrize("indirect", [False, True])
+def test_signed_div_rem_contiguous_boundary(base, divisor, op, indirect):
+
+    @triton.jit
+    def kernel(output, table, base, DIVISOR: tl.constexpr, OP: tl.constexpr, INDIRECT: tl.constexpr, L: tl.constexpr):
+        lanes = tlx.require_layout(tl.arange(0, 1024), L)
+        values = base + lanes
+        if OP == "div":
+            result = values // DIVISOR
+        else:
+            result = values % DIVISOR
+        if INDIRECT:
+            if OP == "rem":
+                index = result + 64
+            else:
+                index = result & 255
+            result = tl.load(table + index)
+        tl.store(output + lanes, result)
+
+    layout = tlx.layout(shape=((64, 4), (4, )), stride=((4, 256), (1, )))
+    output = torch.empty((1024, ), dtype=torch.int32, device=DEVICE)
+    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
+    kernel[(1, )](output, table, base, divisor, op, indirect, layout)
+    values = (torch.arange(1024, dtype=torch.int64, device=DEVICE) + base).to(torch.int32)
+    quotient = torch.div(values, divisor, rounding_mode="trunc")
+    expected = quotient if op == "div" else values - quotient * divisor
+    if indirect:
+        index = expected + 64 if op == "rem" else expected & 255
+        expected = table[index.to(torch.int64)]
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 @triton.jit
 def _pinned_add_combine(a, b):
     return a + b
