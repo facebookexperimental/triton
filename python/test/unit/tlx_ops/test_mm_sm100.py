@@ -24,7 +24,7 @@ import torch
 import triton
 from triton._internal_testing import is_blackwell
 from triton.tlx.ops.kernels.mm import sm100
-from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
+from triton.tlx.ops.kernels.mm._shapes import SM100_CORRECTNESS_SHAPES, operand
 
 from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case
 
@@ -54,7 +54,7 @@ def test_mm_default_space_is_full(monkeypatch):
     assert seen["space"] == "full"
 
 
-@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", CORRECTNESS_SHAPES)
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", SM100_CORRECTNESS_SHAPES)
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     if (M, N, K, a_strides, b_strides, dtype_name) == (384, 384, 19459, (1, 384), (384, 1), "bf16"):
         pytest.skip(_LONG_K_BF16_SKIP_REASON)

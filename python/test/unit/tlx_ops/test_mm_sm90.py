@@ -15,10 +15,16 @@ pytestmark = pytest.mark.skipif(not is_hopper(), reason="Requires sm90")
 
 ARCH = "sm90"
 COOPERATIVE_CONFIGS = (
-    (128, 256, 3),
-    (128, 256, 4),
-    (256, 128, 3),
-    (256, 128, 4),
+    (128, 256, 3, 1),
+    (128, 256, 4, 1),
+    (256, 128, 3, 1),
+    (256, 128, 4, 1),
+    (128, 128, 6, 1),
+    (128, 64, 8, 1),
+    (128, 256, 3, 2),
+    (256, 128, 3, 3),
+    (128, 128, 6, 5),
+    (128, 64, 8, 2),
 )
 
 
@@ -114,9 +120,9 @@ def test_rejects_unaligned_out():
 
 
 @contextlib.contextmanager
-def _pinned_full_config(block_m, block_n, num_stages):
+def _pinned_full_config(block_m, block_n, num_stages, split_k=1):
     original = sm90.CONFIGS
-    sm90.CONFIGS = lambda: [sm90._config(block_m, block_n, num_stages)]
+    sm90.CONFIGS = lambda: [sm90._config(block_m, block_n, num_stages, split_k=split_k)]
     sm90._tuned.cache_clear()
     try:
         yield
@@ -125,14 +131,44 @@ def _pinned_full_config(block_m, block_n, num_stages):
         sm90._tuned.cache_clear()
 
 
-@pytest.mark.parametrize("block_m, block_n, num_stages", COOPERATIVE_CONFIGS)
-def test_cooperative_config(block_m, block_n, num_stages):
+@pytest.mark.parametrize("block_m, block_n, num_stages, split_k", COOPERATIVE_CONFIGS)
+def test_cooperative_config(block_m, block_n, num_stages, split_k):
     from triton.tlx.ops import mm as tlx_mm
 
-    # Five K tiles wrap both stage rings; 153 output tiles also make some SMs
-    # revisit the persistent loop on an H100.
-    a, b = _inputs(M=2176, N=2176, K=320)
-    with _pinned_full_config(block_m, block_n, num_stages):
+    # Five K tiles per split wrap both stage rings; 153+ work units also make
+    # some SMs revisit the persistent loop on an H100. M is not a tile multiple,
+    # so the last split slab has padding rows, and 41 K tiles leave a short
+    # last split.
+    k = 64 * (5 * split_k if split_k == 1 else 41)
+    a, b = _inputs(M=2176 - 40, N=2176, K=k)
+    with _pinned_full_config(block_m, block_n, num_stages, split_k):
         actual = tlx_mm(a, b, space="full")
 
     _assert_close(actual, torch.matmul(a, b))
+
+
+@pytest.mark.parametrize("M, N, K", [(706, 256, 20992), (7, 4096, 4096), (706, 128, 3536), (706, 2560, 2560)])
+def test_full_space_prune_fills_the_gpu(M, N, K):
+    configs = sm90._prune_full_configs(sm90.CONFIGS(), {"M": M, "N": N, "K": K})
+    num_sms = sm90._get_num_sms()
+    assert configs
+    for c in configs:
+        kw = c.kwargs
+        assert sm90._smem_bytes(kw["BM"], kw["BN"], kw["BK"], kw["NUM_STAGES"], kw["SPLIT_K"]) <= sm90._MAX_SMEM
+        work = sm90._mn_tiles(M, N, kw["BM"], kw["BN"]) * kw["SPLIT_K"]
+        assert kw["SPLIT_K"] == 1 or work <= num_sms
+    best = max(sm90._mn_tiles(M, N, c.kwargs["BM"], c.kwargs["BN"]) * c.kwargs["SPLIT_K"] for c in configs)
+    assert best > num_sms // 2
+
+
+def test_split_k_is_deterministic():
+    # Guards the fixed-order workspace reduction: switching split-K to fp32
+    # atomics or TMA reduce-add would make results depend on CTA scheduling.
+    from triton.tlx.ops import mm as tlx_mm
+
+    a, b = _inputs(M=706, N=256, K=20992)
+    assert sm90.heuristic_config(706, 256, 20992)[0].kwargs["SPLIT_K"] > 1
+    first = tlx_mm(a, b, space="heuristic")
+    for _ in range(3):
+        assert torch.equal(tlx_mm(a, b, space="heuristic"), first)
+    _assert_close(first, torch.matmul(a, b))
