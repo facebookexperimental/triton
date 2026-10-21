@@ -63,6 +63,30 @@ static size_t linearizeIndices(llvm::ArrayRef<unsigned> multiDim,
   return linear;
 }
 
+namespace {
+class AMDLaunchBoundsInterface final : public DialectLaunchBoundsInterface {
+public:
+  using DialectLaunchBoundsInterface::DialectLaunchBoundsInterface;
+
+  std::optional<int64_t> getMaxProgramId(ModuleOp mod,
+                                         unsigned axis) const override {
+    auto target = mod->getAttrOfType<StringAttr>("ttg.target");
+    if (!target || !target.getValue().starts_with("hip:") || axis != 0)
+      return std::nullopt;
+    auto warps = mod->getAttrOfType<IntegerAttr>("ttg.num-warps");
+    auto threads = mod->getAttrOfType<IntegerAttr>("ttg.threads-per-warp");
+    if (!warps || !threads)
+      return std::nullopt;
+    int64_t blockSize = warps.getInt() * threads.getInt();
+    assert(blockSize > 0 && "AMD launch requires a positive workgroup size");
+    // HIP requires gridDim.x * blockDim.x < 2^32:
+    // https://rocm.docs.amd.com/projects/HIP/en/docs-7.2.3/doxygen/html/group___execution.html
+    // Extra warp-specialization threads and clustered CTAs only tighten this.
+    return ((int64_t{1} << 32) - 1) / blockSize - 1;
+  }
+};
+} // namespace
+
 void mlir::triton::amdgpu::TritonAMDGPUDialect::initialize() {
   addAttributes<
 #define GET_ATTRDEF_LIST
@@ -74,7 +98,7 @@ void mlir::triton::amdgpu::TritonAMDGPUDialect::initialize() {
 #include "Dialect/TritonAMDGPU/IR/Ops.cpp.inc"
       >();
 
-  addInterfaces<TritonInlinerInterface>();
+  addInterfaces<TritonInlinerInterface, AMDLaunchBoundsInterface>();
 }
 
 #include "Dialect/TritonAMDGPU/IR/TritonAMDGPUEnums.cpp.inc"

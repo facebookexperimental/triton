@@ -3,29 +3,74 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/Interfaces/Utils/InferIntRangeCommon.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include <array>
+#include <limits>
 
 using namespace mlir;
 using namespace mlir::triton;
 
 namespace {
 
+static ConstantIntRanges inferSignedDivRem(Operation *op,
+                                           const ConstantIntRanges &lhs,
+                                           const ConstantIntRanges &rhs) {
+  unsigned width = lhs.smin().getBitWidth();
+  APInt zero(width, 0);
+  std::optional<ConstantIntRanges> result;
+  // Zero divisors are undefined; analyze each nonzero signed interval.
+  for (bool negative : {false, true}) {
+    if (negative ? !rhs.smin().isNegative() : !rhs.smax().isStrictlyPositive())
+      continue;
+    APInt lo = negative ? rhs.smin()
+                        : llvm::APIntOps::smax(rhs.smin(), APInt(width, 1));
+    APInt hi = negative
+                   ? llvm::APIntOps::smin(rhs.smax(), APInt::getAllOnes(width))
+                   : rhs.smax();
+    if (lo.sgt(hi))
+      continue;
+    std::array<ConstantIntRanges, 2> operands{
+        lhs, ConstantIntRanges::fromSigned(lo, hi)};
+    ConstantIntRanges range = isa<arith::DivSIOp>(op)
+                                  ? intrange::inferDivS(operands)
+                                  : intrange::inferRemS(operands);
+    result = result ? result->rangeUnion(range) : range;
+  }
+  ConstantIntRanges range = result.value_or(ConstantIntRanges::maxRange(width));
+  if (isa<arith::RemSIOp>(op))
+    // Remainder has the dividend's sign and cannot exceed its magnitude.
+    range = range.intersection(
+        ConstantIntRanges::fromSigned(llvm::APIntOps::smin(lhs.smin(), zero),
+                                      llvm::APIntOps::smax(lhs.smax(), zero)));
+  return range;
+}
+
 // Tensor ranges bound all elements, independent of their lane layout.
 static bool inferTritonRanges(Operation *op,
                               ArrayRef<IntegerValueRange> operands,
-                              SetIntLatticeFn setRange) {
+                              SetIntLatticeFn setRange,
+                              ArrayRef<int64_t> maxProgramIds) {
+  if (isa<arith::DivSIOp, arith::RemSIOp>(op)) {
+    if (operands[0].isUninitialized() || operands[1].isUninitialized())
+      return false;
+    setRange(op->getResult(0), inferSignedDivRem(op, operands[0].getValue(),
+                                                 operands[1].getValue()));
+    return true;
+  }
   if (auto range = dyn_cast<MakeRangeOp>(op)) {
     setRange(range.getResult(),
              ConstantIntRanges::fromSigned(APInt(32, range.getStart()),
                                            APInt(32, range.getEnd() - 1)));
     return true;
   }
-  if (isa<GetProgramIdOp>(op)) {
-    setRange(op->getResult(0), ConstantIntRanges::fromSigned(
-                                   APInt(32, 0), APInt::getSignedMaxValue(32)));
+  if (auto pid = dyn_cast<GetProgramIdOp>(op)) {
+    setRange(op->getResult(0),
+             ConstantIntRanges::fromSigned(
+                 APInt(32, 0), APInt(32, maxProgramIds[pid.getAxisAsInt()])));
     return true;
   }
   if (isa<SplatOp, ExpandDimsOp, BroadcastOp, ReshapeOp, TransOp, SplitOp,
@@ -46,7 +91,9 @@ static bool inferTritonRanges(Operation *op,
 class IntegerRangeAnalysis final : public dataflow::IntegerRangeAnalysis {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IntegerRangeAnalysis)
-  using dataflow::IntegerRangeAnalysis::IntegerRangeAnalysis;
+  IntegerRangeAnalysis(DataFlowSolver &solver,
+                       std::array<int64_t, 3> maxProgramIds)
+      : dataflow::IntegerRangeAnalysis(solver), maxProgramIds(maxProgramIds) {}
 
   LogicalResult visitOperation(
       Operation *op,
@@ -59,11 +106,14 @@ public:
       auto *lattice = results[cast<OpResult>(value).getResultNumber()];
       propagateIfChanged(lattice, lattice->join(range));
     };
-    if (inferTritonRanges(op, ranges, setRange))
+    if (inferTritonRanges(op, ranges, setRange, maxProgramIds))
       return success();
     return dataflow::IntegerRangeAnalysis::visitOperation(op, operands,
                                                           results);
   }
+
+private:
+  std::array<int64_t, 3> maxProgramIds;
 };
 
 // Use-local refinement must not narrow the global SSA lattice.
@@ -71,9 +121,9 @@ class RangeAtUse {
 public:
   RangeAtUse(DataFlowSolver &solver, DominanceInfo &dominance,
              const DenseMap<Value, SmallVector<LLVM::AssumeOp>> &assumptions,
-             Operation *use)
+             Operation *use, ArrayRef<int64_t> maxProgramIds)
       : solver(solver), dominance(dominance), assumptions(assumptions),
-        use(use) {}
+        use(use), maxProgramIds(maxProgramIds) {}
 
   IntegerValueRange get(Value value) {
     SmallVector<std::pair<Value, bool>> pending{{value, false}};
@@ -119,7 +169,7 @@ private:
         if (result == value && !inferred.isUninitialized())
           range = inferred;
       };
-      if (!inferTritonRanges(definition, operands, setRange))
+      if (!inferTritonRanges(definition, operands, setRange, maxProgramIds))
         if (auto interface = dyn_cast<InferIntRangeInterface>(definition))
           interface.inferResultRangesFromOptional(operands, setRange);
     }
@@ -141,6 +191,7 @@ private:
   DominanceInfo &dominance;
   const DenseMap<Value, SmallVector<LLVM::AssumeOp>> &assumptions;
   Operation *use;
+  ArrayRef<int64_t> maxProgramIds;
 };
 
 } // namespace
@@ -157,8 +208,21 @@ mlir::triton::collectNonNegativeDividends(Operation *root,
   if (queries.empty())
     return success();
 
+  std::array<int64_t, 3> maxProgramIds;
+  maxProgramIds.fill(std::numeric_limits<int32_t>::max());
+  ModuleOp mod = dyn_cast<ModuleOp>(root);
+  if (!mod)
+    mod = root->getParentOfType<ModuleOp>();
+  if (mod)
+    for (Dialect *dialect : root->getContext()->getLoadedDialects())
+      if (const auto *bounds =
+              dialect->getRegisteredInterface<DialectLaunchBoundsInterface>())
+        for (unsigned axis : llvm::seq(3u))
+          if (std::optional<int64_t> bound = bounds->getMaxProgramId(mod, axis))
+            maxProgramIds[axis] = std::min(maxProgramIds[axis], *bound);
+
   auto solver = createDataFlowSolver();
-  solver->load<IntegerRangeAnalysis>();
+  solver->load<IntegerRangeAnalysis>(maxProgramIds);
   if (failed(solver->initializeAndRun(root)))
     return failure();
 
@@ -173,7 +237,7 @@ mlir::triton::collectNonNegativeDividends(Operation *root,
   // time, O(V+E+A) space. Dataflow fixed-point cost is separate.
   // Each use has its own cache because assumptions can differ within a block.
   for (Operation *op : queries) {
-    RangeAtUse query(*solver, dominance, assumptions, op);
+    RangeAtUse query(*solver, dominance, assumptions, op, maxProgramIds);
     IntegerValueRange range = query.get(op->getOperand(0));
     if (!range.isUninitialized() && range.getValue().smin().isNonNegative())
       operations.insert(op);

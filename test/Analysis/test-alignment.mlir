@@ -1,5 +1,240 @@
 // RUN: triton-opt %s -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
 
+tt.func @negative_dividend_dynamic_remainder(%input: i32, %divisor: i32) {
+  %zero = arith.constant 0 : i32
+  %lower = arith.constant -1024 : i32
+  %bounded = arith.cmpi sge, %input, %lower : i32
+  %negative = arith.cmpi slt, %input, %zero : i32
+  llvm.intr.assume %bounded : i1
+  llvm.intr.assume %negative : i1
+  %rem = arith.remsi %input, %divisor : i32
+  %minus_one = arith.constant -1 : i32
+  %mapped = arith.divsi %rem, %minus_one : i32
+  %tile = arith.constant 128 : i32
+  %base = arith.muli %mapped, %tile : i32
+  %bases = tt.splat %base : i32 -> tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %bases, %lanes : tensor<128xi32>
+  %four = arith.constant dense<4> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [4], divisibility = [4], constancy = [1]}}
+  %result = arith.remsi %indices, %four : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_unknown_divisor_sign(%group: i32) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %mapped = arith.divsi %pid, %group : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %mapped, %tile : i32
+    %bases = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %bases, %lane : tensor<128xi32>
+    %divisor = arith.constant dense<16> : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+    %remainder = arith.remsi %coordinate, %divisor : tensor<128xi32>
+    tt.return
+  }
+
+  tt.func @launch_bound_dynamic_remapping(%modulus: i32, %group: i32) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %within_group = arith.remsi %pid, %modulus : i32
+    %mapped = arith.divsi %within_group, %group : i32
+    %zero = arith.constant 0 : i32
+    %positive = arith.cmpi sge, %mapped, %zero : i32
+    llvm.intr.assume %positive : i1
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %mapped, %tile : i32
+    %bases = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %bases, %lane : tensor<128xi32>
+    %divisor = arith.constant dense<16> : tensor<128xi32>
+    // expected-remark @below {{contiguity = [16], divisibility = [16], constancy = [1]}}
+    %remainder = arith.remsi %coordinate, %divisor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16]}}
+    %quotient = arith.divsi %coordinate, %divisor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_x_safe(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [16], divisibility = [16], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_x_overflow(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 256 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<256xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<256xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<256xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<256xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<256xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx1100"} {
+  tt.func @launch_bound_wave32_safe(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 64 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<64xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 64 : i32} : tensor<64xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<64xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<64xi32>
+    // expected-remark @below {{contiguity = [16], divisibility = [16], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<64xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<64xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx1100"} {
+  tt.func @launch_bound_wave32_overflow(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_y_unbounded(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id y : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_z_unbounded(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id z : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 4 : i32, ttg.target = "hip:gfx1250"} {
+  tt.func @launch_bound_cluster_safe(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [16], divisibility = [16], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:90"} {
+  tt.func @launch_bound_other_target(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 64 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<64xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 64 : i32} : tensor<64xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<64xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<64xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<64xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<64xi32>
+    tt.return
+  }
+}
+
+
+
+// -----
+
 tt.func @cast() {
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = 1}}
   %cst = arith.constant 1 : i32
