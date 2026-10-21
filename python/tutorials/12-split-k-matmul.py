@@ -83,17 +83,22 @@ def _stock_triton_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    # Launcher skips empty matrices and supplies an exact tile grid.
+    tl.assume((M > 0) & (N > 0))
+    index_m = M.to(tl.uint64)
+    index_n = N.to(tl.uint64)
+    pid = tl.program_id(0).to(tl.uint64)
+    num_pid_m = tl.cdiv(index_m, BLOCK_M)
+    num_pid_n = tl.cdiv(index_n, BLOCK_N)
+    tl.assume(pid < num_pid_m * num_pid_n)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % index_n
     offs_k = tl.arange(0, BLOCK_K)
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
@@ -116,6 +121,8 @@ def stock_triton_matmul(a, b):
     M, K = a.shape
     K, N = b.shape
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    if M == 0 or N == 0:
+        return c
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )
     _stock_triton_kernel[grid](
         a,
@@ -176,10 +183,15 @@ def _skinny_atomic_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    # Launcher skips empty matrices and supplies an exact tile grid.
+    tl.assume((M > 0) & (N > 0))
+    index_m = M.to(tl.uint64)
+    index_n = N.to(tl.uint64)
+    pid = tl.program_id(0).to(tl.uint64)
     pid_k = tl.program_id(1)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_m = tl.cdiv(index_m, BLOCK_M)
+    num_pid_n = tl.cdiv(index_n, BLOCK_N)
+    tl.assume(pid < num_pid_m * num_pid_n)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -188,8 +200,8 @@ def _skinny_atomic_kernel(
     pid_n = (pid % num_pid_in_group) // group_size_m
     k_start = pid_k * K_PER_SPLIT
     k_end = min(k_start + K_PER_SPLIT, K)
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % index_n
     offs_k = tl.arange(0, BLOCK_K)
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
     b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn
@@ -215,6 +227,8 @@ def _skinny_atomic_kernel(
 def skinny_atomic_matmul(a, b):
     M, K = a.shape
     _, N = b.shape
+    if M == 0 or N == 0:
+        return torch.empty((M, N), device=a.device, dtype=torch.float16)
     split_k = _compute_split_k(M, N, K)
     k_per_split = (K + split_k - 1) // split_k
     if split_k > 1:
@@ -284,10 +298,15 @@ def _twopass_compute_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    # Launcher skips empty matrices and supplies an exact tile grid.
+    tl.assume((M > 0) & (N > 0))
+    index_m = M.to(tl.uint64)
+    index_n = N.to(tl.uint64)
+    pid = tl.program_id(0).to(tl.uint64)
     pid_k = tl.program_id(1)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_m = tl.cdiv(index_m, BLOCK_M)
+    num_pid_n = tl.cdiv(index_n, BLOCK_N)
+    tl.assume(pid < num_pid_m * num_pid_n)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -296,8 +315,8 @@ def _twopass_compute_kernel(
     pid_n = (pid % num_pid_in_group) // group_size_m
     k_start = pid_k * K_PER_SPLIT
     k_end = min(k_start + K_PER_SPLIT, K)
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % index_n
     offs_k = tl.arange(0, BLOCK_K)
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
     b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn
@@ -366,6 +385,8 @@ def _twopass_reduce_kernel(
 def skinny_twopass_matmul(a, b):
     M, K = a.shape
     _, N = b.shape
+    if M == 0 or N == 0:
+        return torch.empty((M, N), device=a.device, dtype=torch.float16)
     split_k = _compute_split_k(M, N, K)
     k_per_split = (K + split_k - 1) // split_k
 
