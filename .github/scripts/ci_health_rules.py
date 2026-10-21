@@ -93,6 +93,12 @@ BUILD_JOBS = ("build", "select")
 PUSH_GRID = 12
 SETUP_WINDOW = 10
 RAN = ("success", "failure", "cancelled")
+#: Triggers the Operations tab's GPU minutes per run is split by, with their labels.
+PER_RUN_EVENTS = {"push": "push", "pull_request": "PR"}
+#: How many days the Operations tab's daily charts look back.
+OPS_DAYS = 30
+#: Run outcomes on the Operations tab, in stacking order.
+OUTCOMES = ("passed", "test", "build", "setup", "cancelled")
 #: A job that ran on no push for this long is retired (disabled or removed), and its failures no longer count.
 RETIRE_DAYS = 7
 
@@ -118,6 +124,12 @@ def job_key(name):
 
 def _gpu_jobs(run):
     return [(gpu_of(run, j), j) for j in run.get("jobs") or [] if gpu_of(run, j) and gpu_job(j)]
+
+
+def gpu_minutes(run):
+    """GPU runner time of a run's jobs that ran. A skipped job used no runner, and GitHub can give it a started_at
+    after its completed_at."""
+    return sum(mins(j["started_at"], j["completed_at"]) for _, j in _gpu_jobs(run) if j["conclusion"] != "skipped")
 
 
 def step_result(job, step):
@@ -443,33 +455,45 @@ def gpu_nightly_view(runs, asof):
     return out
 
 
-def _pct(xs, p):
+def _pct(xs, p, digits=1):
     xs = sorted(xs)
-    return round(xs[min(len(xs) - 1, int(p * len(xs)))], 1) if xs else None
+    return round(xs[min(len(xs) - 1, int(p * len(xs)))], digits) if xs else None
+
+
+def ops_days(now):
+    """The Operations tab's daily-chart days, oldest first, ending on now's day."""
+    return [str((now - dt.timedelta(days=d)).date()) for d in range(OPS_DAYS - 1, -1, -1)]
 
 
 def ops_view(runs, asof):
     now = t(asof)
     week_ago, two_weeks = iso(now - dt.timedelta(days=7)), iso(now - dt.timedelta(days=14))
     gpu_runs = [r for r in runs if r.get("wf") in GPU_RUN_WORKFLOWS and r["created_at"] <= asof and r.get("jobs")]
-    days = [str((now - dt.timedelta(days=d)).date()) for d in range(13, -1, -1)]
-    hours = {d: {"day": d, "passed": 0.0, "test": 0.0, "setup": 0.0, "cancelled": 0.0} for d in days}
+    days = ops_days(now)
+    hours = {d: dict.fromkeys(OUTCOMES, 0.0) for d in days}
+    counts = {d: dict.fromkeys(OUTCOMES, 0) for d in days}
+    per_run = {d: {e: [] for e in PER_RUN_EVENTS} for d in days}
     for r in gpu_runs:
-        k = {"build": "test"}.get(run_outcome(r), run_outcome(r))
-        if k in ("passed", "test", "setup", "cancelled") and r["created_at"][:10] in hours:
-            hours[r["created_at"][:10]][k] += sum(mins(j["started_at"], j["completed_at"])
-                                                  for _, j in _gpu_jobs(r)) / 60
+        k, d = run_outcome(r), r["created_at"][:10]
+        if k not in OUTCOMES or d not in hours:
+            continue
+        h = gpu_minutes(r) / 60
+        hours[d][k] += h
+        # A run that never reached a GPU is counted only when its build failed: the rest ran nothing.
+        if h > 0 or k == "build":
+            counts[d][k] += 1
+        # Only runs whose tests ran to the end: cancelled, setup- and build-failed runs stopped early, so their GPU
+        # time understates what a run costs.
+        if h > 0 and k in ("passed", "test") and r["event"] in PER_RUN_EVENTS:
+            per_run[d][r["event"]].append(h * 60)
 
     def gpu_h(lo, hi):
-        return round(
-            sum(
-                mins(j["started_at"], j["completed_at"]) for r in gpu_runs if lo <= r["created_at"] < hi
-                for _, j in _gpu_jobs(r)) / 60, 1)
+        return round(sum(gpu_minutes(r) for r in gpu_runs if lo <= r["created_at"] < hi) / 60, 1)
 
     recent = [r for r in gpu_runs if r["created_at"] >= week_ago]
     finished = [r for r in recent if run_outcome(r) in ("passed", "test", "setup", "build")]
     setups = [r for r in finished if run_outcome(r) == "setup"]
-    queue = [mins(j["created_at"], j["started_at"]) for r in recent for _, j in _gpu_jobs(r) if j.get("created_at")]
+    queue = queue_view(gpu_runs, now)
     prs = [r for r in recent if r["event"] == "pull_request"]
 
     durations, prev, step_t = collections.defaultdict(list), collections.defaultdict(list), collections.defaultdict(
@@ -512,40 +536,80 @@ def ops_view(runs, asof):
                           for k, v in steps.items()), key=lambda x: -x["n"])
     return {
         "tiles": {
-            "gpu_h_7d":
-            gpu_h(week_ago, asof + "~"), "gpu_h_prev_7d":
-            gpu_h(two_weeks, week_ago), "setup_n":
-            len(setups), "runs_n":
-            len(finished), "setup_rate":
-            round(len(setups) / len(finished), 3) if finished else None, "setup_mi350":
-            sum(any(g == "MI350" and setup_step(j) for g, j in _gpu_jobs(r)) for r in setups), "queue_p50":
-            _pct(queue, 0.5), "queue_p90":
-            _pct(queue, 0.9), "pr_n":
-            len(prs), "cancelled_pr":
-            sum(r["conclusion"] == "cancelled" for r in prs), "cancelled_gpu_h":
-            round(
-                sum(
-                    mins(j["started_at"], j["completed_at"]) for r in prs if r["conclusion"] == "cancelled"
-                    for _, j in _gpu_jobs(r)) / 60, 1)
+            "gpu_h_7d": gpu_h(week_ago, asof + "~"), "gpu_h_prev_7d": gpu_h(two_weeks,
+                                                                            week_ago), "setup_n": len(setups), "runs_n":
+            len(finished), "setup_rate": round(len(setups) / len(finished), 3) if finished else None, "setup_mi350":
+            sum(any(g == "MI350" and setup_step(j)
+                    for g, j in _gpu_jobs(r))
+                for r in setups), "queue_p50": queue["pr_p50"], "queue_p90": queue["pr_p90"], "pr_n": len(prs),
+            "cancelled_pr": sum(r["conclusion"] == "cancelled" for r in prs), "cancelled_gpu_h":
+            round(sum(gpu_minutes(r) for r in prs if r["conclusion"] == "cancelled") / 60, 1)
         }, "select":
-        select_view(runs, asof), "gpu_hours":
-        [{**v, **{k: round(v[k], 1)
-                  for k in ("passed", "test", "setup", "cancelled")}}
-         for v in hours.values()], "jobs":
+        select_view(runs, asof), "gpu_hours": [{"day": d, **{k: round(v, 1)
+                                                             for k, v in hours[d].items()}}
+                                               for d in days], "runs": [{"day": d, **counts[d]} for d in days],
+        "per_run": [{
+            "day": d, **{
+                PER_RUN_EVENTS[e]: {f"p{q}": _pct(v, q / 100, 0)
+                                    for q in (25, 50, 75)} | {"n": len(v)}
+                for e, v in per_run[d].items()
+            }
+        }
+                    for d in days], "jobs":
         jobs, "setup_steps":
-        setup_steps
+        setup_steps, "queue":
+        queue
+    }
+
+
+def queue_view(gpu_runs, now):
+    """Queue time (job created to started) of GPU jobs that ran: per GPU pool per day, and per pool over the last
+    7 days with how often its job was the last to finish on a PR run. That job decides when the PR gets its result,
+    so its queue time is what a PR author waits (pr_p50/pr_p90, last 7 days)."""
+    days = ops_days(now)
+    week_ago = iso(now - dt.timedelta(days=7))
+    by_day = {d: {g: [] for g in GPUS} for d in days}
+    week, last, pr_wait = {g: [] for g in GPUS}, collections.Counter(), []
+    for r in gpu_runs:
+        d = r["created_at"][:10]
+        jobs = [(g, j) for g, j in _gpu_jobs(r) if j["conclusion"] in ("success", "failure") and j.get("created_at")]
+        for g, j in jobs:
+            q = mins(j["created_at"], j["started_at"])
+            if d in by_day:
+                by_day[d][g].append(q)
+            if r["created_at"] >= week_ago:
+                week[g].append(q)
+        if jobs and r["event"] == "pull_request" and r["created_at"] >= week_ago and run_outcome(r) != "cancelled":
+            g, j = max(jobs, key=lambda gj: gj[1]["completed_at"])
+            last[g] += 1
+            pr_wait.append(mins(j["created_at"], j["started_at"]))
+    n_pr = sum(last.values())
+    return {
+        "days": [{
+            "day": d,
+            **{g: {f"p{q}": _pct(v, q / 100)
+                   for q in (25, 50, 75)} | {"n": len(v)}
+               for g, v in by_day[d].items()}
+        }
+                 for d in days], "gpus": [{
+                     "gpu": g, "n": len(week[g]), "p50": _pct(week[g], 0.5), "p90": _pct(week[g], 0.9), "last_pct":
+                     round(last[g] / n_pr, 2) if n_pr else None
+                 } for g in GPUS], "pr_n":
+        n_pr, "pr_p50":
+        _pct(pr_wait, 0.5), "pr_p90":
+        _pct(pr_wait, 0.9)
     }
 
 
 def select_view(runs, asof):
-    """The smart trigger (the select job of gpu-tests.yml) over the last 7 days: what it chose per trigger, and
+    """The smart trigger (the select job of gpu-tests.yml) per day over OPS_DAYS: what it chose per trigger, and
     runs where it did not do its job (failed, fell back to every suite, or skipped a suite on a full run)."""
-    week_ago = iso(t(asof) - dt.timedelta(days=7))
+    days = ops_days(t(asof))
     recent = sorted(
         (r for r in runs
-         if r.get("wf") == "gpu-tests.yml" and week_ago <= r["created_at"] <= asof and r.get("jobs") is not None),
+         if r.get("wf") == "gpu-tests.yml" and days[0] <= r["created_at"] <= asof and r.get("jobs") is not None),
         key=lambda r: r["created_at"])
-    triggers, anomalies = {}, []
+    by_day, anomalies = {d: {} for d in days}, []
     for r in recent:
         sel, base = r.get("select"), {
             "event": r["event"], "sha": r.get("head_sha") or "", "t": r["created_at"], "url": r.get("url"), "pr":
@@ -557,7 +621,7 @@ def select_view(runs, asof):
         if not sel:
             continue
         gpus = [g for g in GPUS if sel.get(g.lower())]
-        e = triggers.setdefault(
+        e = by_day[r["created_at"][:10]].setdefault(
             r["event"], {
                 "runs": 0, "gpus": dict.fromkeys("0123", 0), "build_skipped": 0, "fallback": 0, "per_gpu":
                 dict.fromkeys(GPUS, 0)
@@ -573,7 +637,7 @@ def select_view(runs, asof):
         elif r["event"] in ("schedule", "workflow_dispatch") and len(gpus) < len(GPUS):
             missing = ", ".join(g for g in GPUS if g not in gpus)
             anomalies.append({**base, "kind": "partial", "detail": f"full run skipped {missing}"})
-    return {"triggers": triggers, "anomalies": anomalies}
+    return {"days": [{"day": d, "triggers": by_day[d]} for d in days], "anomalies": anomalies}
 
 
 def page_data(runs, asof, bench):
