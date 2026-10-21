@@ -13,6 +13,8 @@ class DistributedCoordinateGroups;
 }
 
 namespace mlir::triton::AMD {
+void inferScheduledMfmaHazards(ModuleOp mod, const TargetInfo &targetInfo);
+
 void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            const TargetInfo &targetInfo,
                                            RewritePatternSet &patterns,
