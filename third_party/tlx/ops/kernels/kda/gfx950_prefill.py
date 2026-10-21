@@ -110,11 +110,10 @@ def _row_padded(rows, cols, pad, bands=0):
     Explicit, because uTLX otherwise picks an image for its transposed reads
     that turns the row-vector writes into 2-byte stores.
     """
-    padded = getattr(tlx, "padded_shared_layout_encoding", None)
-    if padded is None:
-        return None
     shape = [bands, rows // bands, cols] if bands else [rows, cols]
-    return padded.with_identity_for([[cols, pad]], shape)
+    # getattr: a plain attribute would make the layout class a global the
+    # kernels depend on, and such kernels skip the C launch fast path.
+    return getattr(tlx, "padded_shared_layout_encoding").with_identity_for([[cols, pad]], shape)
 
 
 @triton.jit
@@ -416,11 +415,7 @@ def _ring_layout(rows, cols, pad):
     One wave's direct-to-LDS copy writes 512 contiguous elements, so padding
     goes after each 512. The rows within a 16-row MFMA read sit in different
     512-element blocks, which gives each a distinct pad and so a distinct bank.
-    Builds without padded layouts (uTLX on ROCm Triton 3.8) get the default image.
     """
-    padded = getattr(tlx, "padded_shared_layout_encoding", None)
-    if padded is None:
-        return None
     column_bits = cols.bit_length() - 1
     row_bits = rows.bit_length() - 1
     block_row_bits = (512 // cols).bit_length() - 1
@@ -428,7 +423,7 @@ def _ring_layout(rows, cols, pad):
     bases = [[0, 1 << b] for b in range(column_bits)]
     bases += [[1 << b, 0] for b in range(low_row_bits, row_bits)]
     bases += [[1 << b, 0] for b in range(low_row_bits)]
-    return padded.with_bases([[512, pad]], bases, [rows, cols])
+    return getattr(tlx, "padded_shared_layout_encoding").with_bases([[512, pad]], bases, [rows, cols])  # as in _row_padded
 
 
 @triton.jit
