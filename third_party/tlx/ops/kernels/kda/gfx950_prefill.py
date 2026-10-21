@@ -25,6 +25,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra import tlx
+from triton.language.extra.libdevice import fast_dividef
 from triton.runtime.jit import constexpr_function
 
 CHUNK_SIZE = 64
@@ -100,19 +101,6 @@ def _along(n: tl.constexpr, axis: tl.constexpr):
 def _along2(n: tl.constexpr, axis: tl.constexpr):
     """arange(n) along ``axis`` of a rank-2 tensor, as for ``_along``."""
     return tl.reshape(tl.arange(0, n), [n if axis == 0 else 1, n if axis == 1 else 1])
-
-
-@triton.jit
-def _rcp(x):
-    # v_rcp_f32 (1 ulp): a plain divide lowers to the full IEEE sequence.
-    return tl.inline_asm_elementwise("v_rcp_f32 $0, $1", "=v,v", [x], dtype=tl.float32, is_pure=True, pack=1)
-
-
-@triton.jit
-def _exp2(x):
-    # v_exp_f32, flushing results below 2^-126: tl.exp wraps it in a
-    # denormal-safe range reduction.
-    return tl.inline_asm_elementwise("v_exp_f32 $0, $1", "=v,v", [x], dtype=tl.float32, is_pure=True, pack=1)
 
 
 @constexpr_function
@@ -252,12 +240,10 @@ def _prepare_chunk_kernel(
                     tlx.require_layout(tl.arange(0, D), tlx.slice_layout(tlx.slice_layout(bf, 1), 0))))
         rate = tl.exp(tl.load(ALog + head).to(tl.float32))
         if USE_LOWER_BOUND:
-            # exp(-rate (g + bias)) as one exp2 of an FMA. Spelled out rather
-            # than _exp2: uTLX gives every call of one shape a single layout.
+            # exp(-rate (g + bias)) as one exp2 of an FMA.
             slope = -rate * LOG2E
-            decay = tl.inline_asm_elementwise("v_exp_f32 $0, $1", "=v,v", [g * slope + (slope * bias)[None, None, :]],
-                                              dtype=tl.float32, is_pure=True, pack=1)
-            g = lower_bound * _rcp(1.0 + decay)
+            decay = tl.math.exp2(g * slope + (slope * bias)[None, None, :])
+            g = fast_dividef(lower_bound, 1.0 + decay)
         else:
             x = g + bias[None, None, :]
             g = -rate * tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
@@ -269,15 +255,17 @@ def _prepare_chunk_kernel(
     # token before it. exp(G) and exp(last - G) are split into a per-band
     # factor and exp(+-in_band), so no fp32 gate tile stays live.
     lower = tlx.require_layout(tl.broadcast_to(tl.where(_along(BC, 2) <= _along(BC, 1), LOG2E, 0.0), (NB, BC, BC)), af)
-    in_band = tl.dot(lower, g, acc=tlx.zeros((NB, BC, D), tl.float32, layout=mf), input_precision="ieee")
+    # Released: exp(+-in_band) scales the q and k tiles, which keep their own layout.
+    in_band = tlx.release_layout(
+        tl.dot(lower, g, acc=tlx.zeros((NB, BC, D), tl.float32, layout=mf), input_precision="ieee"))
     band_total = tlx.release_layout(tl.sum(g, axis=1)) * LOG2E
     pivot = tl.cumsum(band_total, axis=0) - band_total
     last = tl.sum(band_total, axis=0)
     tl.store(Decay + ((begin // BT + sequence + local_chunk) * H + head) * D + tl.arange(0, D), last * LN2)
-    rise = _exp2(in_band)
-    fall = _exp2(-in_band)
-    to_pivot = tlx.require_layout(_exp2(pivot)[:, None, :], mf)
-    to_last = tlx.require_layout(_exp2(last[None, :] - pivot)[:, None, :], mf)
+    rise = tl.math.exp2(in_band)
+    fall = tl.math.exp2(-in_band)
+    to_pivot = tlx.require_layout(tl.math.exp2(pivot)[:, None, :], mf)
+    to_last = tlx.require_layout(tl.math.exp2(last[None, :] - pivot)[:, None, :], mf)
 
     # The W/U right-hand sides wait in LDS, not registers, until the inverse is done.
     key_rhs = tlx.local_alloc((BT, D), tl.bfloat16, 1, layout=_row_padded(BT, D, 8))
@@ -311,7 +299,7 @@ def _prepare_chunk_kernel(
     for J in tl.static_range(NB):
         pivot_J = tlx.local_load(tlx.local_slice(pivots, [J, 0], [1, D]))
         tlx.local_store(tlx.local_slice(tlx.local_view(bridges, 0), [J * NB, 0], [NB, D]),
-                        _exp2(tl.minimum(band_pivot - pivot_J, 0.0)))
+                        tl.math.exp2(tl.minimum(band_pivot - pivot_J, 0.0)))
     tl.debug_barrier()
 
     # Block products live in the MFMA result layout, not the tiles'.
