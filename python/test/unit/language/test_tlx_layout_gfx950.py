@@ -110,6 +110,39 @@ def test_integer_facts_dynamic_tile_column(groups, columns):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("rows,columns,group", [(13, 17, 8), (7, 19, 16), (24, 23, 4), (1, 5, 8)])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_integer_facts_partial_group(rows, columns, group, persistent):
+
+    @triton.jit(do_not_specialize=["rows", "columns"])
+    def kernel(output, table, rows, columns, GROUP: tl.constexpr, L: tl.constexpr):
+        tl.assume(rows > 0)
+        tl.assume(rows <= 16777215)
+        tl.assume(columns > 0)
+        tl.assume(columns <= 8388608)
+        tl.assume(rows <= 2147483647 // columns)
+        pid = tl.program_id(0)
+        for tile in range(pid, rows * columns, tl.num_programs(0)):
+            tl.assume(tile >= 0)
+            width = GROUP * columns
+            base = (tile // width) * GROUP
+            active = tl.minimum(rows - base, GROUP)
+            column = (tile % width) // active
+            lanes = tlx.require_layout(tl.arange(0, 256), L)
+            offsets = column * 256 + lanes
+            values = tl.load(table + offsets % 256)
+            tl.store(output + tile * 256 + lanes, values)
+
+    layout = tlx.layout(shape=((64, ), (4, )), stride=((4, ), (1, )))
+    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
+    output = torch.empty((rows * columns, 256), dtype=torch.int32, device=DEVICE)
+    grid = 3 if persistent else rows * columns
+    compiled = kernel[(grid, )](output, table, rows, columns, group, layout, num_warps=1)
+    torch.testing.assert_close(output, table.expand_as(output), rtol=0, atol=0)
+    assert re.search(r"(?:global|buffer)_load_dwordx4", compiled.asm["amdgcn"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_integer_facts_gluon_dynamic_tile_column():
 
     @gluon.jit(do_not_specialize=["groups", "columns"])

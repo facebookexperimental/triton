@@ -139,6 +139,101 @@ tt.func @refine_product_quotient(%x: i32, %groups: i32, %columns: i32) {
 
 // -----
 
+tt.func @refine_partial_divisor(%x: i32, %rows: i32, %columns: i32) {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %eight = arith.constant 8 : i32
+  %row_limit = arith.constant 16777215 : i32
+  %max = arith.constant 2147483647 : i32
+  %column_limit = arith.constant 8388608 : i32
+  %m0 = tt.refine %rows, %one {predicate = 5 : i64} : i32
+  %m1 = tt.refine %m0, %row_limit {predicate = 3 : i64} : i32
+  %n0 = tt.refine %columns, %one {predicate = 5 : i64} : i32
+  %n = tt.refine %n0, %column_limit {predicate = 3 : i64} : i32
+  %allowed = arith.divsi %max, %n : i32
+  %m = tt.refine %m1, %allowed {predicate = 3 : i64} : i32
+  %total = arith.muli %m, %n : i32
+  %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
+  %bounded = tt.refine %positive, %total {predicate = 2 : i64} : i32
+  %width = arith.muli %eight, %n : i32
+  %chunk = arith.divsi %bounded, %width : i32
+  %base = arith.muli %chunk, %eight : i32
+  %remaining = arith.subi %m, %base : i32
+  %divisor = arith.minsi %remaining, %eight : i32
+  %residual = arith.remsi %bounded, %width : i32
+  %column = arith.divsi %residual, %divisor : i32
+  %proof = arith.cmpi slt, %column, %n {test.proof = "proven"} : i32
+  %nonnegative = arith.cmpi sge, %column, %zero {test.proof = "proven"} : i32
+  %row_offset = arith.remsi %residual, %divisor : i32
+  %row = arith.addi %base, %row_offset : i32
+  %row_bound = arith.cmpi slt, %row, %m {test.proof = "proven"} : i32
+  %row_sign = arith.cmpi sge, %row, %zero {test.proof = "proven"} : i32
+  %bases = tt.splat %column : i32 -> tensor<256xi32>
+  %scale = arith.constant dense<256> : tensor<256xi32>
+  %scaled = arith.muli %bases, %scale : tensor<256xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32>
+  %index = arith.addi %scaled, %lanes : tensor<256xi32>
+  // expected-remark @below {{contiguity = [256], divisibility = [256], constancy = [1]}}
+  %rem = arith.remsi %index, %scale : tensor<256xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @refine_missing_tile_bound(%x: i32, %rows: i32, %columns: i32) {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %eight = arith.constant 8 : i32
+  %limit = arith.constant 255 : i32
+  %m0 = tt.refine %rows, %one {predicate = 5 : i64} : i32
+  %m = tt.refine %m0, %limit {predicate = 3 : i64} : i32
+  %n0 = tt.refine %columns, %one {predicate = 5 : i64} : i32
+  %n = tt.refine %n0, %limit {predicate = 3 : i64} : i32
+  %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
+  %width = arith.muli %eight, %n : i32
+  %chunk = arith.divsi %positive, %width : i32
+  %base = arith.muli %chunk, %eight : i32
+  %remaining = arith.subi %m, %base : i32
+  %divisor = arith.minsi %remaining, %eight : i32
+  %sign = arith.cmpi sgt, %divisor, %zero {test.proof = "unknown"} : i32
+  tt.return
+}
+
+// -----
+
+// REFINE-LABEL: tt.func @refine_loop_assumption_chain
+// REFINE: scf.for %[[IV:.*]] =
+// REFINE: %[[UPPER:.*]] = tt.refine %[[IV]], %{{.*}} {predicate = 2 : i64}
+// REFINE: llvm.intr.assume
+// REFINE: %[[BOTH:.*]] = tt.refine %[[UPPER]], %{{.*}} {predicate = 5 : i64}
+// REFINE-NOT: tt.refine
+// REFINE: arith.cmpi slt, %[[BOTH]]
+tt.func @refine_loop_assumption_chain(%start: i32, %limit: i32, %step: i32) {
+  %zero = arith.constant 0 : i32
+  scf.for %iv = %start to %limit step %step : i32 {
+    %condition = arith.cmpi sge, %iv, %zero : i32
+    llvm.intr.assume %condition : i1
+    %bound = arith.cmpi slt, %iv, %limit {test.proof = "proven"} : i32
+    %sign = arith.cmpi sge, %iv, %zero {test.proof = "proven"} : i32
+  }
+  tt.return
+}
+
+// -----
+
+tt.func @refine_unselected_relation(%x: i32, %limit: i32, %condition: i1) {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %positive = tt.refine %limit, %one {predicate = 5 : i64} : i32
+  %bounded = tt.refine %x, %positive {predicate = 2 : i64} : i32
+  %selected = arith.select %condition, %bounded, %x : i32
+  %identity = arith.addi %selected, %zero : i32
+  %proof = arith.cmpi slt, %identity, %positive {test.proof = "unknown"} : i32
+  tt.return
+}
+
+// -----
+
 tt.func @refine_wrapping_product_quotient(%x: i32, %groups: i32, %columns: i32) {
   %zero = arith.constant 0 : i32
   %one = arith.constant 1 : i32
