@@ -262,7 +262,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 // CHECK-LABEL: llvm.func @scheduled_mfma_round_robin_k
 // CHECK-COUNT-4: llvm.inline_asm has_side_effects{{.*}}"s_nop 3\0Av_mfma_f32_16x16x32_bf16 $0, $1, $2, 0"
 // CHECK-COUNT-4: llvm.inline_asm has_side_effects{{.*}}"s_nop 3\0Av_mfma_f32_16x16x32_bf16 $0, $1, $2, $0"
-// CHECK-COUNT-4: llvm.inline_asm has_side_effects{{.*}}"s_nop 15\0As_nop 3"
+// CHECK-COUNT-4: llvm.inline_asm has_side_effects{{.*}}"s_nop 11"
 // CHECK-NOT: amdg.
 
 #round_robin_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
