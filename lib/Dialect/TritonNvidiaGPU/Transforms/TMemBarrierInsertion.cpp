@@ -25,6 +25,8 @@ namespace nvidia_gpu {
 
 namespace {
 
+namespace ttg = triton::gpu;
+
 enum class TMemAccessKind { None, Load, Store, MMA };
 
 // Fine grain modeling of TMEM ops as pipelining behavior is not fully
