@@ -1219,7 +1219,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
                 try:
                     from triton.tools.tlx_benchmark_gen import capture_kernel_args
-                    capture_kernel_args(bound_args, signature, constexprs, self.params, options)
+                    capture_kernel_args(bound_args, signature, constexprs, self.params, options, fn=self.fn)
                 except Exception:
                     pass
 
