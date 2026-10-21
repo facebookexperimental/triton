@@ -643,6 +643,11 @@ getValueName(Value v,
 
   // Pass through convert_layout and type casts: use the input operand's name
   if (Operation *defOp = v.getDefiningOp()) {
+    // The TMA store/reduce handlers print no result, so their token has no
+    // Python binding. tlx.async_descriptor_store_wait orders by count instead.
+    if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(defOp))
+      return "None";
+
     // Handle ub.poison (undefined values) — emit proper Python default
     if (defOp->getName().getStringRef() == "ub.poison") {
       Type type = v.getType();
@@ -1042,6 +1047,8 @@ bool shouldSkipOp(
       "tt.splat",
       "tt.broadcast",
       "tt.map_elementwise.return",
+      // Undefined values: getValueName inlines a default at each use.
+      "ub.poison",
       "ttng.tcgen5_global_alloc",
       "amdg.in_thread_transpose",
   };
@@ -2377,6 +2384,19 @@ void printSimplifiedOp(
       pendings = planned.getInt();
     os << "tlx.async_descriptor_store_wait(" << pendings << ")";
     printLocComment(op, os);
+    // Warp specialization folds the consumer release into the wait; dropping
+    // it leaves the producer waiting on the staging buffer forever.
+    auto wait = cast<ttng::TMAStoreTokenWaitOp>(op);
+    for (auto [barrier, pred] :
+         llvm::zip(wait.getBarriers(), wait.getBarrierPreds())) {
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << "tlx.barrier_arrive(" << getValueName(barrier, argSubstitutionMap);
+      if (!isConstantTrue(pred))
+        os << ", pred=" << getValueName(pred, argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+    }
     return;
   }
 
@@ -3588,6 +3608,39 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
 
 // Print block arg assignments: dest_arg = src_value
 // If skipArgIdx >= 0, skip that arg index (used for for-loop iterators).
+// A token that only orders a TMA store against its token wait. TLX orders
+// those waits by count, so such tokens -- including block args every
+// predecessor feeds one -- have no Python binding.
+static bool isTMAStoreToken(Value v, llvm::SmallPtrSetImpl<Value> &visited) {
+  if (!isa<ttg::AsyncTokenType>(v.getType()))
+    return false;
+  if (!visited.insert(v).second)
+    return true;
+  if (Operation *def = v.getDefiningOp())
+    return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+               def) ||
+           def->getName().getStringRef() == "ub.poison";
+  auto arg = cast<BlockArgument>(v);
+  Block *block = arg.getOwner();
+  if (block->isEntryBlock())
+    return false;
+  for (auto it = block->pred_begin(); it != block->pred_end(); ++it) {
+    auto branch = dyn_cast<BranchOpInterface>((*it)->getTerminator());
+    if (!branch)
+      return false;
+    Value incoming =
+        branch.getSuccessorOperands(it.getSuccessorIndex())[arg.getArgNumber()];
+    if (!incoming || !isTMAStoreToken(incoming, visited))
+      return false;
+  }
+  return true;
+}
+
+static bool isTMAStoreToken(Value v) {
+  llvm::SmallPtrSet<Value, 8> visited;
+  return isTMAStoreToken(v, visited);
+}
+
 void printBlockArgAssignments(Block *dest, OperandRange operands,
                               llvm::raw_ostream &os, unsigned indent,
                               DenseMap<Value, Value> *argSubstitutionMap,
@@ -3600,7 +3653,7 @@ void printBlockArgAssignments(Block *dest, OperandRange operands,
   SmallVector<std::string> lhs, rhs;
   for (unsigned i = 0; i < dest->getNumArguments() && i < operands.size();
        ++i) {
-    if ((int)i == skipArgIdx)
+    if ((int)i == skipArgIdx || isTMAStoreToken(dest->getArgument(i)))
       continue;
     std::string destName =
         getValueName(dest->getArgument(i), argSubstitutionMap);
