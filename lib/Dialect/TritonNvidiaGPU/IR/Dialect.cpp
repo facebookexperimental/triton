@@ -36,6 +36,7 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 
@@ -108,18 +109,18 @@ TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
 
 uint32_t getTMemSubSliceOffset(MemDescType memDescType, int32_t offset,
                                int32_t dim) {
-  // The offset is computed in the *allocation*'s layout (the parent tile the
-  // subslice indexes into), so use getAllocShape() rather than the (possibly
-  // smaller) view shape. Strip multibuffering by taking only the trailing two
-  // dims: the column offset lives within a single 2D tile and the buffer index
-  // is carried by the base pointer. Without dropping the leading dim, a
-  // multibuffered (rank-3) memdesc trips the shape.size() == 2 assert in
-  // tensorMemoryToLinearLayout. (Equivalent to the original
-  // toLinearLayout(memDescType), which used
-  // getAllocShape().take_back(getRank()), except it keeps the inner 2 dims
-  // instead of all getRank() dims.)
-  auto shape = memDescType.getAllocShape().take_back(2);
-  auto llInv = toLinearLayout(shape, memDescType.getEncoding()).pseudoinvert();
+  auto layoutShape =
+      dropPipeliningDim(memDescType.getAllocShape(), memDescType.getEncoding());
+  if (memDescType.getRank() == 3 && dim == 0) {
+    auto layout = toLinearLayout(layoutShape, memDescType.getEncoding());
+    auto colDim = StringAttr::get(memDescType.getContext(), "col");
+    return offset * llvm::divideCeil(layout.getInDimSize(colDim) *
+                                         memDescType.getElementTypeBitWidth(),
+                                     32);
+  }
+
+  dim -= memDescType.getRank() - layoutShape.size();
+  auto llInv = toLinearLayout(memDescType).pseudoinvert();
   auto dimNames = llvm::to_vector(llInv.getInDimNames());
   SmallVector<std::pair<StringAttr, int32_t>> logicalOffsets;
   logicalOffsets.reserve(dimNames.size());
@@ -188,18 +189,9 @@ getDistributedLayoutForTmemLdSt(const LinearLayout &ll, TMemAccessAtom atom,
   auto *ctx = dims[0].getContext();
   // This code is dual to the one in lowerTMemLdSt
   if (bitwidth != 32) {
-    // TODO move this to a helper function
     auto kReg = StringAttr::get(ctx, "register");
-    LinearLayout quot;
-    int bestContig = 1;
-    for (int contig = 1; bitwidth * contig <= 32; contig *= 2) {
-      auto maybeQuot = divideLeft(
-          ll, LinearLayout::identity1D(contig, rowColDims[1], dims[1]));
-      if (!maybeQuot)
-        break;
-      quot = *maybeQuot;
-      bestContig = contig;
-    }
+    auto [bestContig, quot] =
+        factorMaximalIdentityPrefix(ll, rowColDims[1], dims[1], 32 / bitwidth);
 
     // Pack contiguous elements
     // This works to pack b8 or b16 into b32 but also b8 into b16 and recurse
