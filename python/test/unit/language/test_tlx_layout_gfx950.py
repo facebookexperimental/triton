@@ -16,6 +16,34 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("start,stride", [(0, 3), (2147483640, 3), (-2147483648, -1), (1073741824, 7)])
+def test_address_distribution_preserves_wrapping(start, stride):
+
+    @triton.jit(do_not_specialize=["start", "stride"])
+    def kernel(table, output, start, stride):
+        lane = tl.arange(0, 128)
+        acc = tl.full((128, ), 0, tl.int32)
+        for i in range(5):
+            product = ((start + i + lane) * stride).to(tl.int64)
+            index = (product.to(tl.uint64) // 3) % 2
+            acc += tl.load(table + index)
+        tl.store(output + lane, acc)
+
+    table = torch.tensor([17, 41], dtype=torch.int32, device=DEVICE)
+    output = torch.empty((128, ), dtype=torch.int32, device=DEVICE)
+    compiled = kernel[(1, )](table, output, start, stride)
+    expected = []
+    for lane in range(128):
+        total = 0
+        for i in range(5):
+            product = ((start + i + lane) * stride + 2**31) % 2**32 - 2**31
+            total += (17, 41)[(product % 2**64 // 3) % 2]
+        expected.append(total)
+    torch.testing.assert_close(output, torch.tensor(expected, dtype=torch.int32, device=DEVICE), rtol=0, atol=0)
+    assert re.search(r"arith.muli .* : i32", compiled.asm["ttgir"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 @pytest.mark.parametrize("m,n", [(13, 17), (1025, 2049), (2147483647, 2147483647)])
 @pytest.mark.parametrize("xcd,chunk,group", [(8, 4, 4), (3, 5, 7)])
 def test_integer_facts_swizzle_coordinates(m, n, xcd, chunk, group):
