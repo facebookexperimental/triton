@@ -344,7 +344,7 @@ class shared_linear_layout_encoding(shared_layout_encoding):
 
 
 class amd_mfma_layout(layout_encoding):
-    """gfx950 MFMA distributed layout for explicit shared-load consumers."""
+    """AMD MFMA distributed layout for explicit shared-load consumers."""
 
     def __init__(self, version, instr_shape, transposed, warps_per_cta, element_bitwidth=32, tiles_per_warp=None,
                  cga_layout=None):
