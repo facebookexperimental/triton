@@ -247,8 +247,9 @@ def _prepare_chunk_kernel(
         # l2-normalized Q/K below stay fp32 until they become MFMA operands.
         # A [D] vector broadcast in registers: the full-tile offsets would go
         # through LDS on uTLX, and the loads lose their broadcast.
-        bias = tl.load(DtBias + head * D +
-                       tlx.require_layout(tl.arange(0, D), tlx.slice_layout(tlx.slice_layout(bf, 1), 0)))
+        bias = tlx.release_layout(
+            tl.load(DtBias + head * D +
+                    tlx.require_layout(tl.arange(0, D), tlx.slice_layout(tlx.slice_layout(bf, 1), 0))))
         rate = tl.exp(tl.load(ALog + head).to(tl.float32))
         if USE_LOWER_BOUND:
             # exp(-rate (g + bias)) as one exp2 of an FMA. Spelled out rather
@@ -326,8 +327,9 @@ def _prepare_chunk_kernel(
     n2 = tl.zeros((NB, BC, BC), tl.float32)
     n3 = tl.zeros((NB, BC, BC), tl.float32)
     for J in tl.static_range(NB):
-        bridge = tlx.local_load(tlx.local_slice(tlx.local_view(bridges, 0), [J * NB, 0], [NB, D]),
-                                layout=tlx.slice_layout(a3, 1))[:, None, :]
+        bridge = tlx.release_layout(
+            tlx.local_load(tlx.local_slice(tlx.local_view(bridges, 0), [J * NB, 0], [NB, D]),
+                           layout=tlx.slice_layout(a3, 1)))[:, None, :]
         column_band = tlx.local_load(
             tlx.local_trans(tlx.local_slice(tlx.local_view(lifted, 0), [J, 0, 0], [1, BC, D]), (0, 2, 1)), layout=b3)
         rhs = tlx.require_layout(tl.broadcast_to(column_band, (NB, D, BC)), b3)
