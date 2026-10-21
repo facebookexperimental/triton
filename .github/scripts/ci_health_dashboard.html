@@ -13,6 +13,8 @@ h1{font-size:23px;margin:0 0 2px;font-weight:650}h2{font-size:16px;margin:0;font
 button.theme{background:var(--surface-1);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer;font:inherit;font-size:12px}
 nav.tabs{display:flex;gap:2px;margin:18px 0 0;border-bottom:1px solid var(--border);flex-wrap:wrap}
 nav.tabs button{background:none;border:0;border-bottom:3px solid transparent;margin-bottom:-1px;padding:8px 14px;font:inherit;font-size:14px;color:var(--text-secondary);cursor:pointer;display:inline-flex;gap:8px;align-items:center}
+.tabrows{display:grid;grid-template-columns:auto 1fr;column-gap:10px;align-items:center;margin-top:14px;border-bottom:1px solid var(--border)}
+.tabrows nav.tabs{margin:0;border-bottom:0}
 nav.tabs button:hover{color:var(--text-primary)}nav.tabs button[aria-selected="true"]{color:var(--text-primary);font-weight:620;border-bottom-color:var(--text-primary)}
 nav.tabs .badge{font-size:11.5px;font-weight:600;border-radius:999px;padding:0 7px;border:1px solid currentColor}
 section[hidden]{display:none}section{margin-top:18px}
@@ -65,12 +67,17 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every 3 h</p></div>
 <button class="theme" id="themeBtn" type="button">Toggle theme</button></header>
 <div class="branchbar"><span class="muted">Branch</span><span class="seg" id="branch-sel"></span></div>
-<nav class="tabs" role="tablist">
+<div class="tabrows">
+<span class="muted">Tests</span><nav class="tabs" role="tablist" aria-label="Tests">
 <button role="tab" data-tab="main" aria-selected="true">Push <span class="badge" id="b-main"></span></button>
 <button role="tab" data-tab="sched" aria-selected="false">Scheduled <span class="badge" id="b-sched"></span></button>
 <button role="tab" data-tab="pr" aria-selected="false">Pull requests <span class="badge na">author-owned</span></button>
+</nav>
+<span class="muted">Health</span><nav class="tabs" role="tablist" aria-label="Health">
+<button role="tab" data-tab="perf" aria-selected="false">Perf <span class="badge" id="b-perf"></span></button>
 <button role="tab" data-tab="ops" aria-selected="false">Operations <span class="badge" id="b-ops"></span></button>
 </nav>
+</div>
 <p class="empty" id="nodata" hidden>No data collected yet.</p>
 
 <section id="main" role="tabpanel">
@@ -90,12 +97,16 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 </section>
 
 <section id="sched" role="tabpanel" hidden>
-<div class="shead"><h2>Scheduled</h2><span class="q">Did last night's scheduled runs pass, and did perf regress?</span><span class="owner">Owner: release / perf owners</span></div>
+<div class="shead"><h2>Scheduled</h2><span class="q">Did last night's scheduled runs pass?</span><span class="owner">Owner: release owners</span></div>
 <div class="card"><h3>Nightly release (<code>nightly-fbtriton.yml</code>)</h3><div class="grid4" id="n-rel"></div></div>
 <div class="card"><h3>GPU tests, nightly (<code>gpu-tests-nightly.yml</code>): TritonBench</h3><div id="n-gpu"></div>
 <p class="note">Suites too slow for PRs and pushes run here once a day. Each row is the latest run on that GPU.</p></div>
 <div class="card"><h3>TLX ops bench (<code>nightly-tlx-ops-bench.yml</code>)</h3><div id="n-bench"></div>
 <p class="note">Times every tlx.ops op against its reference on each GPU after each nightly release. Each row is the latest run on that GPU, with the ops whose bench failed; per-case numbers are on the <a href="../bench/">TLX ops bench dashboard</a>.</p></div>
+</section>
+
+<section id="perf" role="tabpanel" hidden>
+<div class="shead"><h2>Perf</h2><span class="q">Did a TLX op get slower or faster over the last two nights?</span><span class="owner">Owner: perf owners</span></div>
 <div class="card"><h3>Perf events from the TLX ops bench, last two nights</h3><div id="n-perf"></div>
 <p class="note">An event is a case whose TLX TFLOP/s moved 10% or more from one night to the next and still holds the night after. The latest night cannot be confirmed yet. Full per-kernel history is on the <a href="../bench/">TLX ops bench dashboard</a>.</p></div>
 </section>
@@ -189,9 +200,6 @@ function renderMain(m){
 function renderNightly(nt){
   const r=nt.release,res=c=>c==="success"?`<span class="ok">✓ ${c}</span>`:c?`<span class="bad">✕ ${esc(c)}</span>`:`<span class="na">–</span>`;
   $("n-rel").innerHTML=r?tile("Last nightly run",res(r.conclusion),`<a href="${esc(r.url)}">run</a> · ${ago(r.t)}`)+tile("Wheel build",res(r.build),"")+tile("Publish",res(r.publish),"")+tile("Published, last 7 nights",`${r.published_7} of ${r.nights_7}`,""):`<p class="empty">No nightly runs collected.</p>`;
-  $("n-perf").innerHTML=table(["GPU","Night","Op","Change","Signature","Suspect commits"],nt.perf.map(e=>[esc(e.platform),`${esc(e.date)}${e.unconfirmed?`<br><span class="muted">unconfirmed</span>`:""}`,`<code>${esc(e.op)}</code>`,
-    `${e.n_slower?`<span class="bad">▼ ${e.n_slower} slower</span>`:""}${e.n_slower&&e.n_faster?"<br>":""}${e.n_faster?`<span class="ok">▲ ${e.n_faster} faster</span>`:""}`,esc(e.signature||""),
-    (e.suspects||[]).map(s=>`${sha(s.sha)} ${pr(s.pr)} <span class="muted">${esc((s.title||"").slice(0,60))}</span>`).join("<br>")+(e.compare?`<br><a href="${esc(e.compare)}">${esc(e.range||"compare")}</a>`:"")]));
   const G={passed:`<span class="ok">✓ passed</span>`,test:`<span class="bad">✕ tests failed</span>`,setup:`<span class="warn">⚠ setup failed</span>`,cancelled:`<span class="na">cancelled</span>`};
   // One row per GPU: the latest run of a daily GPU workflow. Returns how many GPUs failed on tests.
   const perGpu=(id,v)=>{const gpus=["H100","B200","MI350"].filter(g=>v&&v[g]);
@@ -200,8 +208,15 @@ function renderNightly(nt){
         x.fails.length?x.fails.map(f=>`<code>${esc(f.id)}</code>${f.msg?`<br><span class="muted">${esc(f.msg.slice(0,120))}</span>`:""}`).join("<br>"):`<span class="muted">none</span>`,`${x.passed_7} / ${x.runs_7}`]}),[3]);
     return gpus.filter(g=>v[g].result==="test").length};
   const gpuRed=perGpu("n-gpu",nt.gpu)+perGpu("n-bench",nt.bench);
+  if(r&&r.conclusion!=="success")badge("b-sched","✕ release","bad");else if(gpuRed)badge("b-sched",`✕ ${gpuRed} GPU run${gpuRed>1?"s":""}`,"bad");else badge("b-sched","✓","ok");
+}
+
+function renderPerf(nt){
+  $("n-perf").innerHTML=table(["GPU","Night","Op","Change","Signature","Suspect commits"],nt.perf.map(e=>[esc(e.platform),`${esc(e.date)}${e.unconfirmed?`<br><span class="muted">unconfirmed</span>`:""}`,`<code>${esc(e.op)}</code>`,
+    `${e.n_slower?`<span class="bad">▼ ${e.n_slower} slower</span>`:""}${e.n_slower&&e.n_faster?"<br>":""}${e.n_faster?`<span class="ok">▲ ${e.n_faster} faster</span>`:""}`,esc(e.signature||""),
+    (e.suspects||[]).map(s=>`${sha(s.sha)} ${pr(s.pr)} <span class="muted">${esc((s.title||"").slice(0,60))}</span>`).join("<br>")+(e.compare?`<br><a href="${esc(e.compare)}">${esc(e.range||"compare")}</a>`:"")]));
   const slower=nt.perf.filter(e=>e.n_slower&&!e.unconfirmed).length;
-  if(r&&r.conclusion!=="success")badge("b-sched","✕ release","bad");else if(gpuRed)badge("b-sched",`✕ ${gpuRed} GPU run${gpuRed>1?"s":""}`,"bad");else if(slower)badge("b-sched",`${slower} slower`,"bad");else badge("b-sched","✓","ok");
+  if(slower)badge("b-perf",`${slower} slower`,"bad");else badge("b-perf","✓","ok");
 }
 
 function renderPR(list,branch="main"){
@@ -293,7 +308,7 @@ function renderBranches(d){
     $("branch-sel").innerHTML=Object.keys(d.branches).map(b=>`<button type="button" data-b="${esc(b)}" aria-pressed="${b===cur}">${esc(b)}</button>`).join("");
     for(const b of $("branch-sel").querySelectorAll("button"))b.onclick=()=>{cur=b.dataset.b;draw()};
     $("m-q").textContent=`Did a push to ${cur} break something new?`;
-    const v=d.branches[cur];renderMain(v.main);renderNightly(v.nightly);renderPR(v.pr,cur);renderOps(v.ops)};
+    const v=d.branches[cur];renderMain(v.main);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderOps(v.ops)};
   draw()}
 
 function show(id){if(!$(id)||!$(id).matches("section"))id="main";
