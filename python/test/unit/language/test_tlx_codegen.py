@@ -1,7 +1,7 @@
 import re
 from triton.compiler.errors import CompilationError
-import pytest
 
+import pytest
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
@@ -138,6 +138,74 @@ def test_release_layout_accepts_unencoded_source_gfx950():
     )
     assert "tlx.release_layout" not in compiled.asm["ttir"]
     assert "amdgcn" in compiled.asm
+
+
+SM80 = GPUTarget("cuda", 80, 32)
+SM90 = GPUTarget("cuda", 90, 32)
+SM100 = GPUTarget("cuda", 100, 32)
+GFX942 = GPUTarget("hip", "gfx942", 64)
+GFX1250 = GPUTarget("hip", "gfx1250", 32)
+
+
+@triton.jit
+def _async_local_slice_dot_kernel(q_ptr, k_ptr, output_ptr):
+    rows = tl.arange(0, 128)
+    cols = tl.arange(0, 32)
+    reduction = tl.arange(0, 128)
+    q = tl.load(q_ptr + rows[:, None] * 128 + reduction[None, :])
+
+    k_rows = tl.arange(0, 64)
+    k_ptrs = k_ptr + k_rows[:, None] * 128 + reduction[None, :]
+    k_buffers = tlx.local_alloc((64, 128), tl.float16, 1)
+    k_view = tlx.local_view(k_buffers, 0)
+    token = tlx.async_load(k_ptrs, k_view)
+    tlx.async_load_commit_group([token])
+    wait = tlx.async_load_wait_group(0)
+
+    k_lo = tlx.local_slice(k_view, [0, 0], [32, 128])
+    kt = tlx.local_load(tlx.local_trans(k_lo), token=wait, relaxed=True)
+    result = tl.dot(q, kt)
+    tl.store(output_ptr + rows[:, None] * 32 + cols[None, :], result)
+
+
+@pytest.mark.parametrize(
+    "target,expected_warp_size",
+    [
+        (SM80, 32),
+        (SM90, 32),
+        (SM100, 32),
+        (GFX942, 64),
+        (GFX950, 64),
+        (GFX1250, 32),
+    ],
+    ids=["sm80", "sm90", "sm100", "gfx942", "gfx950", "gfx1250"],
+)
+def test_raw_ttir_uses_target_warp_size(target, expected_warp_size):
+    backend = triton.compiler.compiler.make_backend(target)
+    options = backend.parse_options({})
+    assert options.warp_size == expected_warp_size
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    source = ASTSource(
+        fn=_async_local_slice_dot_kernel,
+        signature={
+            "q_ptr": "*fp16",
+            "k_ptr": "*fp16",
+            "output_ptr": "*fp32",
+        },
+        constexprs={},
+    )
+
+    module = source.make_ir(
+        target,
+        options,
+        backend.get_codegen_implementation(options),
+        backend.get_module_map(),
+        context,
+    )
+
+    assert module.get_int_attr("ttg.threads-per-warp") == expected_warp_size
 
 
 @triton.jit
