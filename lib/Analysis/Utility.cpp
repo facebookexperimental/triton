@@ -1281,6 +1281,11 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
+    // BlockedToMMAv5 puts A (MxK) in an NVMMA shared memdesc, and only the
+    // leading dimension of a shared memdesc may be non-power-of-two
+    // (MemDescType::verify), so an NPOT K has no legal A operand.
+    if (!llvm::isPowerOf2_64(k))
+      return false;
     if (!isMmaOutputShapeSupported(retShapePerCTA, version))
       return false;
     if (aElemTy.isF64() || bElemTy.isF64() ||
