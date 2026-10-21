@@ -4,7 +4,7 @@ The kernel accepts normalized Q/K, per-token log decays, and sigmoid-applied
 beta coefficients, or the raw inputs those come from. Recurrent states use the
 physical ``[N, H, V, K]`` V-major layout, dense or as slots of a state pool.
 
-The implementation uses 64-token chunks and 16-token bands, in two passes:
+The implementation uses 64-token chunks and 16-token bands, in two steps:
 
 * one program per (chunk, head) forms the band-local gate cumsum, the causal
   QK and beta-scaled KK products with CDNA4 ``tl.dot`` MFMAs, the 64x64 WY
@@ -472,7 +472,7 @@ def _copy_walk_chunk(
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
-    WANT_O: tl.constexpr,
+    WRITE_OUTPUT: tl.constexpr,
 ):
     """Start one chunk's async copies into a ring slot, as a single commit group.
 
@@ -491,7 +491,7 @@ def _copy_walk_chunk(
     )
     decay = tlx.async_load(Decay + decay_base + (token0 // BT) * H * K + keys, tlx.local_view(decay_buffers, slot),
                            mask=keys < K)
-    if WANT_O:
+    if WRITE_OUTPUT:
         q = tlx.async_load(Qg + key_offsets, tlx.local_view(q_buffers, slot), mask=key_mask)
         a = tlx.async_load(
             Aqk + token0 * H * BT + a_offsets,
@@ -504,69 +504,67 @@ def _copy_walk_chunk(
 
 
 @triton.jit
-def _state_walk_kernel(
+def _group_chunks(num_chunks, num_groups, group):
+    """Chunks [lo, hi) of one time group: near-equal runs, the first ones a chunk longer."""
+    base_chunks = num_chunks // num_groups
+    extra_chunks = num_chunks - base_chunks * num_groups
+    chunk_lo = group * base_chunks + tl.minimum(group, extra_chunks)
+    return chunk_lo, chunk_lo + base_chunks + tl.where(group < extra_chunks, 1, 0)
+
+
+@triton.jit
+def _load_state_rows(start, value_block, K: tl.constexpr, V: tl.constexpr, BV: tl.constexpr, NW: tl.constexpr):
+    """Load one [BV, K] row slice of a [V, K] state at ``start``, in the walk's MFMA layout.
+
+    Rows past V (a group summary's transfer rows) load as zero. Returns the
+    slice, its offsets and mask, and the identity on the transfer rows, zero
+    on the value rows.
+    """
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[NW, 1])
+    values = value_block * BV + tl.arange(0, BV)
+    keys = tl.arange(0, K)
+    offsets = tlx.require_layout((values[:, None] * K + keys[None, :]).to(tl.int32), mma, pin=False)
+    mask = tlx.require_layout(((values[:, None] < V) & (keys[None, :] < K)).to(tl.int8), mma, pin=False) != 0
+    state = tlx.buffer_load(start, offsets, mask=mask, other=0.0).to(tl.float32)
+    state = tlx.require_layout(state, mma, pin=False)
+    eye = tlx.require_layout((keys[None, :] == values[:, None] - V).to(tl.float32), mma, pin=False)
+    return state, offsets, mask, eye
+
+
+@triton.jit
+def _walk_chunks(
+    state,
     W,
-    U,
     Kg,
     Qg,
-    Decay,
+    U,
     Aqk,
-    InitialState,
+    Decay,
     Output,
-    FinalState,
-    CuSeqLens,
-    StateIndices,
-    state_stride,
-    GroupIn,
-    GroupB,
-    GroupM,
-    num_groups,
+    begin,
+    length,
+    sequence,
+    head,
+    chunk_lo,
+    chunk_hi,
+    value_block,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
     NW: tl.constexpr,
-    PASS: tl.constexpr,
-    PAGED: tl.constexpr,
+    WRITE_OUTPUT: tl.constexpr,
 ):
-    """Walk one (row slice, sequence, head, chunk group) of the recurrence, output included.
+    """Carry one [BV, K] row slice of a state across chunks [chunk_lo, chunk_hi) and return it.
 
-    Every warp owns whole [BV, K] state rows, so the state, v_new and their bf16
+    Every warp owns whole state rows, so the state, v_new and their bf16
     operands stay in registers. Each chunk's W, Kg, U, decay, Qg and Aqk come
-    through a two-slot shared-memory ring, and the output is formed as
-    o = Qg S^T + Aqk v_new^T in a token-major layout, so neither v_new nor a
-    partial output goes back to memory.
-
-    A chunk maps the state affinely, S' = S (D - W^T Kg) + U^T Kg, so a run of
-    chunks composes to S_out = S_in M + B. PASS 0 walks whole sequences. PASS 1
-    finds each group's B (value rows, from zero) and M (rows past V: identity
-    rows with U dropped), except group 0, which starts from the initial state
-    and yields group 1's entry state. After _group_scan_kernel chains the
-    groups, PASS 2 walks every group from its entry state and writes the output.
-    Group 0's entry is the initial state, which pass 1 also copies to GroupIn:
-    PASS 2 never reads InitialState, so FinalState may alias it.
+    through a two-slot shared-memory ring. With WRITE_OUTPUT each chunk's
+    output is formed as o = Qg S^T + Aqk v_new^T in a token-major layout, so
+    neither v_new nor a partial output goes back to memory.
     """
-    value_block = tl.program_id(0)
-    sequence_head = tl.program_id(1)
-    group = tl.program_id(2)
-    sequence = sequence_head // H
-    head = sequence_head % H
-    begin = tl.load(CuSeqLens + sequence).to(tl.int32)
-    length = tl.load(CuSeqLens + sequence + 1).to(tl.int32) - begin
-    num_chunks = tl.cdiv(length, BT)
     TH: tl.constexpr = BT // 2
-    WANT_O: tl.constexpr = PASS != 1
-    if PASS == 1:
-        # Pass 1 rows past V are transfer rows; group 0 needs only value rows.
-        if value_block * BV >= V and group == 0:
-            return
-    base_chunks = num_chunks // num_groups
-    extra_chunks = num_chunks - base_chunks * num_groups
-    chunk_lo = group * base_chunks + tl.minimum(group, extra_chunks)
-    chunk_hi = chunk_lo + base_chunks + tl.where(group < extra_chunks, 1, 0)
-    group_plane = (group * tl.num_programs(1) + sequence_head).to(tl.int64)
-
     # The state and v_new: warps along value rows. The output: warps along
     # value columns, so its stores run along V.
     mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[NW, 1])
@@ -578,24 +576,9 @@ def _state_walk_kernel(
     out_a_op: tl.constexpr = tlx.dot_operand_layout(0, out_mma, k_width=4)
     out_b_op: tl.constexpr = tlx.dot_operand_layout(1, out_mma, k_width=4)
 
+    state = tlx.require_layout(state, mma, pin=False)
     values = value_block * BV + tl.arange(0, BV)
     keys = tl.arange(0, K)
-    state_offsets = tlx.require_layout((values[:, None] * K + keys[None, :]).to(tl.int32), mma, pin=False)
-    state_mask = tlx.require_layout(((values[:, None] < V) & (keys[None, :] < K)).to(tl.int8), mma, pin=False) != 0
-    state_base = _state_base(StateIndices, state_stride, sequence, head, H, K, V, PAGED)
-    if PASS == 2:
-        start = GroupIn + group_plane * (V * K)
-    else:
-        start = InitialState + state_base
-    state = tlx.buffer_load(start, state_offsets, mask=state_mask, other=0.0).to(tl.float32)
-    state = tlx.require_layout(state, mma, pin=False)
-    if PASS == 1:
-        if group == 0:
-            tlx.buffer_store(state, GroupIn + group_plane * (V * K), state_offsets, mask=state_mask)
-        eye = tlx.require_layout((keys[None, :] == values[:, None] - V).to(tl.float32), mma, pin=False)
-        # Transfer rows load as zero and eye is zero on value rows.
-        state = state * tl.where(group == 0, 1.0, 0.0) + eye
-
     key_base = (begin * H + head) * K
     value_base = (begin * H + head) * V
     decay_base = _decay_row(begin, sequence, head, H, K, BT)
@@ -609,7 +592,7 @@ def _state_walk_kernel(
     kg_buffers = tlx.local_alloc((BT, K), tl.bfloat16, 2, layout=_ring_layout(BT, K, 16))
     u_buffers = tlx.local_alloc((BT, BV), tl.bfloat16, 2, layout=_ring_layout(BT, BV, 4))
     decay_buffers = tlx.local_alloc((K, ), tl.float32, 2)
-    if WANT_O:
+    if WRITE_OUTPUT:
         q_buffers = tlx.local_alloc((BT, K), tl.bfloat16, 2, layout=_ring_layout(BT, K, 4))
         a_buffers = tlx.local_alloc((BT, BT), tl.bfloat16, 2, layout=_ring_layout(BT, BT, 4))
         out_rows = tl.arange(0, BT)
@@ -646,7 +629,7 @@ def _state_walk_kernel(
         K,
         V,
         BT,
-        WANT_O,
+        WRITE_OUTPUT,
     )
     for local_chunk in range(chunk_lo, chunk_hi):
         token0 = local_chunk * BT
@@ -682,7 +665,7 @@ def _state_walk_kernel(
             K,
             V,
             BT,
-            WANT_O,
+            WRITE_OUTPUT,
         )
         w_tile = tlx.local_view(w_buffers, slot)
         kg_tile = tlx.local_view(kg_buffers, slot)
@@ -701,7 +684,7 @@ def _state_walk_kernel(
         u1 = tlx.require_layout(u1, mma).to(tl.float32)
         v0 = tlx.require_layout((u0 - tlx.require_layout(tl.dot(state_lhs, w0, acc=zero), mma)).to(tl.bfloat16), mma)
         v1 = tlx.require_layout((u1 - tlx.require_layout(tl.dot(state_lhs, w1, acc=zero), mma)).to(tl.bfloat16), mma)
-        if WANT_O:
+        if WRITE_OUTPUT:
             q = tlx.local_load(tlx.local_view(q_buffers, slot), token=ready, layout=out_a_op)
             a_tile = tlx.local_view(a_buffers, slot)
             a0 = tlx.local_load(tlx.local_slice(a_tile, [0, 0], [BT, TH]), token=ready, layout=out_a_op)
@@ -723,22 +706,126 @@ def _state_walk_kernel(
         kg1 = tlx.local_load(tlx.local_slice(kg_tile, [TH, 0], [TH, K]), token=ready, layout=b_op)
         state = tl.dot(tlx.require_layout(v0, a_op), kg0, acc=state)
         state = tlx.require_layout(tl.dot(tlx.require_layout(v1, a_op), kg1, acc=state), mma)
+    return state
 
-    if PASS == 1:
-        if group == 0:
-            dest = GroupIn + (tl.num_programs(1) + group_plane) * (V * K)
-        else:
-            dest = GroupB + group_plane * (V * K)
-        tlx.buffer_store(state, dest, state_offsets, mask=state_mask)
-        if group != 0:
-            tlx.buffer_store(
-                state.to(GroupM.dtype.element_ty),
-                GroupM + group_plane * (K * K),
-                state_offsets - V * K,
-                mask=state_offsets >= V * K,
-            )
-    elif group == num_groups - 1:
+
+@triton.jit
+def _state_walk_kernel(
+    W,
+    U,
+    Kg,
+    Qg,
+    Decay,
+    Aqk,
+    InitialState,
+    Output,
+    FinalState,
+    CuSeqLens,
+    StateIndices,
+    state_stride,
+    GroupEntry,
+    num_groups,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    NW: tl.constexpr,
+    FROM_GROUP_ENTRY: tl.constexpr,
+    PAGED: tl.constexpr,
+):
+    """Walk one (row slice, sequence, head, time group) of the recurrence and write its output.
+
+    Unsplit, one group walks the whole sequence from the initial state. In a
+    time split, each group starts from its entry state in GroupEntry, which
+    _group_summary_kernel and _chain_groups_kernel produce. Entry 0 is a copy
+    of the initial state, so a split walk never reads InitialState and
+    FinalState may alias it. The last group writes the final state.
+    """
+    value_block = tl.program_id(0)
+    sequence_head = tl.program_id(1)
+    group = tl.program_id(2)
+    sequence = sequence_head // H
+    head = sequence_head % H
+    begin = tl.load(CuSeqLens + sequence).to(tl.int32)
+    length = tl.load(CuSeqLens + sequence + 1).to(tl.int32) - begin
+    chunk_lo, chunk_hi = _group_chunks(tl.cdiv(length, BT), num_groups, group)
+    state_base = _state_base(StateIndices, state_stride, sequence, head, H, K, V, PAGED)
+    if FROM_GROUP_ENTRY:
+        start = GroupEntry + (group * tl.num_programs(1) + sequence_head).to(tl.int64) * (V * K)
+    else:
+        start = InitialState + state_base
+    state, state_offsets, state_mask, _ = _load_state_rows(start, value_block, K, V, BV, NW)
+    state = _walk_chunks(state, W, Kg, Qg, U, Aqk, Decay, Output, begin, length, sequence, head, chunk_lo, chunk_hi,
+                         value_block, H, K, V, BT, BV, NW, True)
+    if group == num_groups - 1:
         tlx.buffer_store(state, FinalState + state_base, state_offsets, mask=state_mask)
+
+
+@triton.jit
+def _group_summary_kernel(
+    W,
+    U,
+    Kg,
+    Decay,
+    InitialState,
+    CuSeqLens,
+    StateIndices,
+    state_stride,
+    GroupEntry,
+    GroupB,
+    GroupM,
+    num_groups,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    NW: tl.constexpr,
+    PAGED: tl.constexpr,
+):
+    """Summarize one (row slice, sequence, head, time group) of a split walk as S_out = S_in M + B.
+
+    A chunk maps the state affinely, S' = S (D - W^T Kg) + U^T Kg, so a run of
+    chunks composes to S_out = S_in M + B. The value rows, walked from zero,
+    give B; the K transfer rows past V start as the identity and, with no U,
+    give M. Group 0 knows its entry, the initial state: it copies it to
+    GroupEntry and walks it, without transfer rows, to group 1's entry. The
+    last group needs no summary and is not launched.
+    """
+    value_block = tl.program_id(0)
+    sequence_head = tl.program_id(1)
+    group = tl.program_id(2)
+    sequence = sequence_head // H
+    head = sequence_head % H
+    begin = tl.load(CuSeqLens + sequence).to(tl.int32)
+    length = tl.load(CuSeqLens + sequence + 1).to(tl.int32) - begin
+    # Group 0 needs only value rows.
+    if value_block * BV >= V and group == 0:
+        return
+    chunk_lo, chunk_hi = _group_chunks(tl.cdiv(length, BT), num_groups, group)
+    group_plane = (group * tl.num_programs(1) + sequence_head).to(tl.int64)
+    state_base = _state_base(StateIndices, state_stride, sequence, head, H, K, V, PAGED)
+    state, state_offsets, state_mask, eye = _load_state_rows(InitialState + state_base, value_block, K, V, BV, NW)
+    if group == 0:
+        tlx.buffer_store(state, GroupEntry + group_plane * (V * K), state_offsets, mask=state_mask)
+    # Transfer rows load as zero and eye is zero on value rows.
+    state = state * tl.where(group == 0, 1.0, 0.0) + eye
+    # No output: W stands in for the unused Qg, Aqk and Output.
+    state = _walk_chunks(state, W, Kg, W, U, W, Decay, W, begin, length, sequence, head, chunk_lo, chunk_hi,
+                         value_block, H, K, V, BT, BV, NW, False)
+    if group == 0:
+        dest = GroupEntry + (tl.num_programs(1) + group_plane) * (V * K)
+    else:
+        dest = GroupB + group_plane * (V * K)
+    tlx.buffer_store(state, dest, state_offsets, mask=state_mask)
+    if group != 0:
+        tlx.buffer_store(
+            state.to(GroupM.dtype.element_ty),
+            GroupM + group_plane * (K * K),
+            state_offsets - V * K,
+            mask=state_offsets >= V * K,
+        )
 
 
 @triton.jit
@@ -751,8 +838,8 @@ def _state_base(StateIndices, state_stride, sequence, head, H: tl.constexpr, K: 
 
 
 @triton.jit
-def _group_scan_kernel(
-    GroupIn,
+def _chain_groups_kernel(
+    GroupEntry,
     GroupB,
     GroupM,
     num_groups,
@@ -760,7 +847,7 @@ def _group_scan_kernel(
     V: tl.constexpr,
     BV: tl.constexpr,
 ):
-    """Chain the scan's chunk groups: entry[g + 1] = entry[g] M_g + B_g."""
+    """Chain the time groups' summaries into entry states: entry[g + 1] = entry[g] M_g + B_g."""
     value_block = tl.program_id(0)
     sequence_head = tl.program_id(1)
     planes = tl.num_programs(1)
@@ -768,19 +855,19 @@ def _group_scan_kernel(
     keys = tl.arange(0, K)
     state_offsets = values[:, None] * K + keys[None, :]
     m_offsets = keys[:, None] * K + keys[None, :]
-    state = tl.load(GroupIn + (planes + sequence_head).to(tl.int64) * (V * K) + state_offsets)
+    state = tl.load(GroupEntry + (planes + sequence_head).to(tl.int64) * (V * K) + state_offsets)
     for group in tl.range(1, num_groups - 1, num_stages=3):
         plane = (group * planes + sequence_head).to(tl.int64)
         transfer = tl.load(GroupM + plane * (K * K) + m_offsets)
         offset = tl.load(GroupB + plane * (V * K) + state_offsets)
         state = tl.dot(state.to(tl.bfloat16), transfer, acc=offset, out_dtype=tl.float32)
-        tl.store(GroupIn + (plane + planes) * (V * K) + state_offsets, state)
+        tl.store(GroupEntry + (plane + planes) * (V * K) + state_offsets, state)
 
 
 def _scan_groups(num_sequences: int, heads: int, num_chunks: int, block_value: int, value_dim: int) -> int:
-    """Chunk groups per sequence, so short batches of long sequences fill the GPU.
+    """Time groups per sequence, so short batches of long sequences fill the GPU.
 
-    The groups' pass-2 programs, ``block_value`` value rows each, fill one wave of CUs.
+    The groups' walk programs, ``block_value`` value rows each, fill one wave of CUs.
     """
     chunks_per_sequence = num_chunks // max(num_sequences, 1)
     planes = num_sequences * heads * (value_dim // block_value)
@@ -801,30 +888,31 @@ def _num_cus(device: int) -> int:
 def _launch_state_scan(t, num_sequences, heads, num_chunks, key_dim, value_dim):
     """Walk the chunk recurrence into t["output"] and t["final_state"].
 
-    Splits sequences in time when too few would idle the GPU.
+    Splits sequences in time when too few would idle the GPU: every group is
+    summarized at once, the summaries are chained into each group's entry
+    state, and every group is then walked at once from its entry.
     """
     initial_state = t["initial_state"]
     planes = num_sequences * heads
     cus = _num_cus(torch.cuda.current_device())
-    # When the split runs out of chunks before CUs, pass 2 takes half-width
-    # value slices, which walk a chunk faster.
+    # When the split runs out of chunks before CUs, the split walk takes
+    # half-width value slices, which walk a chunk faster.
     chunk_limited = num_chunks // max(num_sequences, 1) // 4 < cus // planes
-    block_value2 = value_dim // 2 if chunk_limited else value_dim
-    groups = _scan_groups(num_sequences, heads, num_chunks, block_value2, value_dim)
+    split_block = value_dim // 2 if chunk_limited else value_dim
+    groups = _scan_groups(num_sequences, heads, num_chunks, split_block, value_dim)
     common = dict(H=heads, K=key_dim, V=value_dim, BT=CHUNK_SIZE, num_stages=2, waves_per_eu=1)
 
     paged = t.get("state_indices") is not None
-    state_args = [t["state_indices"] if paged else t["cu_seqlens"], t["initial_state"].stride(0)]
+    state_args = [t["state_indices"] if paged else t["cu_seqlens"], initial_state.stride(0)]
     walk_args = [
         t[n] for n in ("w", "u", "gated_key", "gated_query", "decay", "aqk", "initial_state", "output", "final_state",
                        "cu_seqlens")
     ] + state_args
 
-    def scan(pass_id, block, warps, grid_groups, buffers):
-        rows = value_dim + key_dim if pass_id == 1 else value_dim
-        grid = (rows // block, planes, grid_groups)
-        _state_walk_kernel[grid](*walk_args, *buffers, BV=block, NW=warps, PASS=pass_id, PAGED=paged, num_warps=warps,
-                                 **common)
+    def walk(block, warps, group_entry):
+        grid = (value_dim // block, planes, groups)
+        _state_walk_kernel[grid](*walk_args, group_entry, groups, BV=block, NW=warps, FROM_GROUP_ENTRY=groups > 1,
+                                 PAGED=paged, num_warps=warps, **common)
 
     if groups == 1:
         # An unsplit walk takes the narrowest value slice that still keeps
@@ -834,21 +922,23 @@ def _launch_state_scan(t, num_sequences, heads, num_chunks, key_dim, value_dim):
             if planes * (value_dim // width) <= cus:
                 block_value = width
                 break
-        unused_group_buffers = (initial_state, initial_state, initial_state, 1)
-        scan(0, block_value, max(block_value // 16, 2), 1, unused_group_buffers)
+        walk(block_value, max(block_value // 16, 2), initial_state)
         return
-    group_in = torch.empty((groups, planes, value_dim, key_dim), dtype=torch.float32, device=initial_state.device)
-    group_b = torch.empty_like(group_in)
+    group_entry = torch.empty((groups, planes, value_dim, key_dim), dtype=torch.float32, device=initial_state.device)
+    group_b = torch.empty_like(group_entry)
     group_m = torch.empty((groups, planes, key_dim, key_dim), dtype=torch.bfloat16, device=initial_state.device)
-    buffers = (group_in, group_b, group_m, groups)
-    # Pass 1 halves its row block while that still fits on the CUs.
-    block_value1 = value_dim + key_dim
+    # A summary walks the value rows and the transfer rows. It halves its row
+    # block while that still fits on the CUs.
+    summary_block = value_dim + key_dim
     if 2 * planes * (groups - 1) <= cus:
-        block_value1 //= 2
-    scan(1, block_value1, 4, groups - 1, buffers)
+        summary_block //= 2
+    summary_args = [t[n] for n in ("w", "u", "gated_key", "decay", "initial_state", "cu_seqlens")] + state_args
+    grid = ((value_dim + key_dim) // summary_block, planes, groups - 1)
+    _group_summary_kernel[grid](*summary_args, group_entry, group_b, group_m, groups, BV=summary_block, NW=4,
+                                PAGED=paged, num_warps=4, **common)
     if groups > 2:
-        _group_scan_kernel[(value_dim // 16, planes)](
-            group_in,
+        _chain_groups_kernel[(value_dim // 16, planes)](
+            group_entry,
             group_b,
             group_m,
             groups,
@@ -857,7 +947,7 @@ def _launch_state_scan(t, num_sequences, heads, num_chunks, key_dim, value_dim):
             BV=16,
             num_warps=4,
         )
-    scan(2, block_value2, 8 if block_value2 == value_dim else 4, groups, buffers)
+    walk(split_block, 8 if split_block == value_dim else 4, group_entry)
 
 
 def _validate_prefill_inputs(
