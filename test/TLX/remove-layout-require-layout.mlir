@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions | FileCheck %s
+// RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions -tritongpu-remove-layout-conversions | FileCheck %s
 
 // A user layout requirement is a semantic boundary, not a transparent
 // convert_layout.  RemoveLayoutConversions may insert physical conversions on
@@ -88,6 +89,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: %[[GATHERED:.*]] = tt.gather %[[GATHER_REQ]][%{{.*}}]
     %gathered = tt.gather %required[%idx] {axis = 0 : i32} : (tensor<64x64xf32, #gather_user>, tensor<64x64xi32, #gather_user>) -> tensor<64x64xf32, #gather_user>
     tt.return %gathered : tensor<64x64xf32, #gather_user>
+  }
+}
+
+// -----
+
+// Once a user layout is materialized, require_layout becomes an identity
+// boundary. The concrete layout nested under its wrappers must remain available
+// to downstream layout scoring, including when the pass is run again.
+
+#pin_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#pin_user = #tlx.user_layout<#pin_mma>
+#pin = #tlx.no_verify_layout<#pin_user>
+#pin_dot = #ttg.dot_op<{opIdx = 0, parent = #pin_mma, kWidth = 4}>
+#pin_mid = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 1, 64], warpsPerCTA = [1, 1, 1], order = [2, 1, 0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: tt.func @require_layout_concrete_candidate_is_idempotent
+  tt.func @require_layout_concrete_candidate_is_idempotent(
+      %src: tensor<32x32xf32, #pin_mma>) -> tensor<32x32xf32, #pin_dot> {
+    // CHECK: %[[PIN_REQ:.*]] = ttg.require_layout
+    %req = ttg.require_layout %src : tensor<32x32xf32, #pin_mma> -> tensor<32x32xf32, #pin>
+    // CHECK: %[[PIN_MID:.*]] = tt.reshape %[[PIN_REQ]]
+    %mid = tt.reshape %req : tensor<32x32xf32, #pin> -> tensor<32x2x16xf32, #tlx.no_verify_layout<#pin_mid>>
+    // CHECK: %[[PIN_FLAT:.*]] = tt.reshape %[[PIN_MID]] {{.*}} -> tensor<32x32xf32, #ttg.dot_op
+    // CHECK-NEXT: tt.return %[[PIN_FLAT]]
+    %flat = tt.reshape %mid : tensor<32x2x16xf32, #tlx.no_verify_layout<#pin_mid>> -> tensor<32x32xf32, #tlx.no_verify_layout<#pin_mma>>
+    %out = ttg.convert_layout %flat : tensor<32x32xf32, #tlx.no_verify_layout<#pin_mma>> -> tensor<32x32xf32, #pin_dot>
+    tt.return %out : tensor<32x32xf32, #pin_dot>
   }
 }
 

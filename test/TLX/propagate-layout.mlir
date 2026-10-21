@@ -609,10 +609,34 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1x64x64xf32, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0 [%c0_i32] : !ttg.memdesc<1x64x64xf32, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     %2 = ttg.local_load %1 : !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> tensor<64x64xf32, #blocked1>
+    // An unpinned requirement is soft: it lowers to an ordinary conversion
+    // that later layout optimization may rewrite or remove.
     // CHECK-NOT: tlx.require_layout
+    // CHECK-NOT: ttg.require_layout
     // CHECK: ttg.convert_layout %{{.*}} : tensor<64x64xf32, #blocked1> -> tensor<64x64xf32, #blocked>
     %3 = tlx.require_layout %2 : tensor<64x64xf32, #blocked1> -> tensor<64x64xf32, #blocked>
     tt.return %3 : tensor<64x64xf32, #blocked>
+  }
+}
+
+// -----
+
+// A pinned requirement carries #tlx.user_layout and must remain a hard
+// ttg.require_layout boundary for RemoveLayoutConversions.
+
+#pinned_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#pinned_dst = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
+#pinned_user = #tlx.no_verify_layout<#tlx.user_layout<#pinned_dst>>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-DAG: #[[$PINNED_DST:.*]] = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
+  // CHECK-DAG: #[[$PINNED_USER:.*]] = #tlx.user_layout<#[[$PINNED_DST]]>
+  // CHECK-LABEL: @pinned_require_layout_on_tensor
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: ttg.require_layout %{{.*}} : tensor<64x64xf32, #{{.*}}> -> tensor<64x64xf32, #tlx.no_verify_layout<#[[$PINNED_USER]]>>
+  tt.func public @pinned_require_layout_on_tensor(%arg0: tensor<64x64xf32, #pinned_src>) -> tensor<64x64xf32, #pinned_user> attributes {noinline = false} {
+    %required = tlx.require_layout %arg0 : tensor<64x64xf32, #pinned_src> -> tensor<64x64xf32, #pinned_user>
+    tt.return %required : tensor<64x64xf32, #pinned_user>
   }
 }
 
