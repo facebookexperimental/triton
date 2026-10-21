@@ -4,20 +4,20 @@
 
 include "mlir/IR/OpBase.td"
 include "mlir/IR/EnumAttr.td"
-include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
+include "mlir/Interfaces/InferTypeOpInterface.td"  // SameOperandsAndResultType
 include "mlir/Interfaces/ControlFlowInterfaces.td" // RegionBranchOpInterface
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "triton/Dialect/Triton/IR/TritonTypes.td"
+include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
 include "TLXDialect.td"
 include "TLXInterfaces.td"
 include "TLXTypes.td"
 
-
-class TLX_Op<string mnemonic, list<Trait> traits = []> :
-    Op<TLX_Dialect, mnemonic, traits>;
+class TLX_Op<string mnemonic, list<Trait> traits = []>
+    : Op<TLX_Dialect, mnemonic, traits>;
 
 //===----------------------------------------------------------------------===//
 // Storage Alias Spec Operation
@@ -31,8 +31,9 @@ class TLX_Op<string mnemonic, list<Trait> traits = []> :
 // lowering runs after CSE (i.e. after layout propagation). Declaring an
 // allocation memory effect keeps each op distinct (not CSE-able) while still
 // allowing dead-spec elimination.
-def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec",
-                                    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+def TLX_StorageAliasSpecOp
+    : TLX_Op<"storage_alias_spec", [DeclareOpInterfaceMethods<
+                                       MemoryEffectsOpInterface>]> {
   let summary = "Define a storage alias specification";
 
   let description = [{
@@ -56,11 +57,9 @@ def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec",
     ```
   }];
 
-  let arguments = (ins
-    TLX_StorageKindAttr:$storage,
-    OptionalAttr<I64Attr>:$buffer_size_bytes,
-    OptionalAttr<DenseI64ArrayAttr>:$buffer_shape
-  );
+  let arguments = (ins TLX_StorageKindAttr:$storage,
+      OptionalAttr<I64Attr>:$buffer_size_bytes,
+      OptionalAttr<DenseI64ArrayAttr>:$buffer_shape);
 
   let results = (outs TLX_StorageAliasSpecType:$result);
 
@@ -84,9 +83,11 @@ def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec",
 // making a `distinct` reuse_group contain duplicate leaves. Declaring an
 // allocation memory effect keeps each op distinct (not CSE-able) while still
 // allowing dead-alloc elimination.
-def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
-                                          [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
-  let summary = "Allocate local memory referencing a storage alias specification";
+def TLX_StorageAliasLocalAllocOp
+    : TLX_Op<"storage_alias_local_alloc", [DeclareOpInterfaceMethods<
+                                              MemoryEffectsOpInterface>]> {
+  let summary =
+      "Allocate local memory referencing a storage alias specification";
 
   let description = [{
     Allocates local memory (shared memory or tensor memory) that references
@@ -110,9 +111,7 @@ def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
     ```
   }];
 
-  let arguments = (ins
-    TLX_StorageAliasSpecType:$storage_alias
-  );
+  let arguments = (ins TLX_StorageAliasSpecType:$storage_alias);
 
   let results = (outs TTG_MemDescType:$result);
 
@@ -132,7 +131,8 @@ def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
 // - TTG_MemDescType: buffered tensors from local_alloc (smem or tmem)
 // - TLX_ReuseGroupType: nested reuse groups
 def TLX_ReuseGroupElement : AnyTypeOf<[TTG_MemDescType, TLX_ReuseGroupType],
-    "buffered tensor (!ttg.memdesc) or nested reuse group (!tlx.reuse_group)">;
+                                      "buffered tensor (!ttg.memdesc) or "
+                                      "nested reuse group (!tlx.reuse_group)">;
 
 def TLX_ReuseGroupOp : TLX_Op<"reuse_group", [Pure]> {
   let summary = "Define a reuse group for buffer overlap relationships";
@@ -182,11 +182,9 @@ def TLX_ReuseGroupOp : TLX_Op<"reuse_group", [Pure]> {
     ```
   }];
 
-  let arguments = (ins
-    Variadic<TLX_ReuseGroupElement>:$elements,
-    TLX_ReuseGroupKindAttr:$group_kind,
-    DefaultValuedAttr<I64Attr, "1">:$group_size
-  );
+  let arguments = (ins Variadic<TLX_ReuseGroupElement>:$elements,
+      TLX_ReuseGroupKindAttr:$group_kind,
+      DefaultValuedAttr<I64Attr, "1">:$group_size);
 
   let results = (outs TLX_ReuseGroupType:$result);
 
@@ -237,10 +235,8 @@ def TLX_SetBufferOverlapOp : TLX_Op<"set_buffer_overlap", []> {
     ```
   }];
 
-  let arguments = (ins
-    TLX_StorageAliasSpecType:$storage_alias_spec,
-    TLX_ReuseGroupType:$overlap_def
-  );
+  let arguments = (ins TLX_StorageAliasSpecType:$storage_alias_spec,
+      TLX_ReuseGroupType:$overlap_def);
 
   let results = (outs);
 
@@ -257,11 +253,12 @@ def TLX_SetBufferOverlapOp : TLX_Op<"set_buffer_overlap", []> {
 // Layout Operations
 //===----------------------------------------------------------------------===//
 
-def TLX_RequireLayoutOp : TLX_Op<"require_layout",
-                                 [SameOperandsAndResultShape,
-                                  SameOperandsAndResultElementType,
-                                  Pure]> {
-  let summary = "materialize an explicit layout constraint on a memdesc or tensor value";
+def TLX_RequireLayoutOp
+    : TLX_Op<"require_layout", [SameOperandsAndResultShape,
+                                SameOperandsAndResultElementType,
+                                AxisInfoPassthroughTrait, Pure]> {
+  let summary =
+      "materialize an explicit layout constraint on a memdesc or tensor value";
 
   let description = [{
     `tlx.require_layout` makes a layout requirement explicit in the IR.
@@ -283,10 +280,10 @@ def TLX_RequireLayoutOp : TLX_Op<"require_layout",
   let hasFolder = 1;
 }
 
-def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
-                                 [SameOperandsAndResultShape,
-                                  SameOperandsAndResultElementType,
-                                  Pure]> {
+def TLX_ReleaseLayoutOp
+    : TLX_Op<"release_layout", [SameOperandsAndResultShape,
+                                SameOperandsAndResultElementType,
+                                AxisInfoPassthroughTrait, Pure]> {
   let summary = "release specific layout for a register buffer";
 
   let description = [{
@@ -294,10 +291,13 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
     propagation may choose an encoding independently of the source. The
     source may be encoding-free, in which case there is no layout to release
     and the operation is a no-op. The result may be unencoded in TTIR or carry
-    the layout selected during TTGIR propagation.
+    the layout selected during TTGIR propagation. A relaxed release inserted
+    by TLX implementation details may be optimized through; the default release
+    remains a boundary across repeated layout propagation.
   }];
 
-  let arguments = (ins TT_Tensor:$src);
+  let arguments = (ins TT_Tensor:$src,
+      DefaultValuedAttr<BoolAttr, "false">:$relaxed);
 
   let results = (outs TT_Tensor:$result);
 
@@ -359,9 +359,8 @@ def TLX_DumpLayoutOp : TLX_Op<"dump_layout", []> {
   let assemblyFormat = "$src attr-dict `:` type($src)";
 }
 
-def TLX_LocalAliasOp : TLX_Op<"local_alias",
-                              [SameOperandAndResultMemorySpace,
-                               Pure]> {
+def TLX_LocalAliasOp
+    : TLX_Op<"local_alias", [SameOperandAndResultMemorySpace, Pure]> {
   let summary = "Create an alias of a local memory buffer";
 
   let description = [{
@@ -378,9 +377,7 @@ def TLX_LocalAliasOp : TLX_Op<"local_alias",
     ```
   }];
 
-  let arguments = (ins
-    TTG_TensorOrMemDesc:$src
-  );
+  let arguments = (ins TTG_TensorOrMemDesc:$src);
 
   let results = (outs TTG_TensorOrMemDesc:$result);
 

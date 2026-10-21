@@ -11,6 +11,7 @@ include "mlir/Dialect/Arith/IR/ArithBase.td"
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
 include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
+include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td" // RegionBranchOpInterface
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
@@ -45,7 +46,8 @@ def TTG_ConvertLayoutOp
 
 def TTG_RequireLayoutOp
     : TTG_Op<"require_layout", [SameOperandsAndResultShape,
-                                SameOperandsAndResultElementType, Pure]> {
+                                SameOperandsAndResultElementType,
+                                AxisInfoPassthroughTrait, Pure]> {
   let summary = "preserve a user-requested layout boundary";
 
   let description = [{
@@ -54,6 +56,27 @@ def TTG_RequireLayoutOp
     be treated as a transparent cast by layout canonicalization or
     rematerialization. Layout optimization may insert conversions around it, but
     the boundary itself is retired only after those passes have run.
+  }];
+
+  let arguments = (ins TT_Tensor:$src);
+
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+}
+
+def TTG_ReleaseLayoutOp
+    : TTG_Op<"release_layout", [SameOperandsAndResultShape,
+                                SameOperandsAndResultElementType,
+                                AxisInfoPassthroughTrait, Pure]> {
+  let summary = "end a user-requested layout region";
+
+  let description = [{
+    `ttg.release_layout` is a semantic layout boundary produced from a
+    source-level layout release. Layout propagation must not carry the source
+    layout through this operation; the result starts an independently selected
+    layout region. The operation is not a memory fence and is retired only after
+    layout optimization has completed.
   }];
 
   let arguments = (ins TT_Tensor:$src);
@@ -849,9 +872,8 @@ def TTG_WarpReturnOp
   let assemblyFormat = "attr-dict";
 }
 
-def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [
-  RecursiveMemoryEffects, RecursivelySpeculatable
-]> {
+def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [RecursiveMemoryEffects,
+                                                    RecursivelySpeculatable]> {
   let summary = "run a region under a per-lane predicate";
   let description = [{
     Executes `$region` with the per-thread execution mask restricted to lanes
@@ -865,7 +887,11 @@ def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [
 
     The region must contain exactly one block and may not contain nested
     dynamic control flow. Cross-lane operations require `wave_uniform`, which
-    declares that every lane in each wavefront observes the same predicate.
+    declares that every lane in each wavefront observes the same predicate, and
+    no enclosing non-wave-uniform predicate may already have masked lanes.
+    In a multi-wave region, layout conversions under `wave_uniform` must
+    remain warp-local; conversions that lower through CTA shared memory and a
+    barrier are unsupported.
     Reductions spanning multiple warps remain unsupported. Other operations
     with nested regions are rejected. Each init, result, and yielded value at
     a given position must have the same type. A tensor predicate must have the
@@ -874,7 +900,7 @@ def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [
   }];
 
   let arguments = (ins TT_BoolLike:$predicate, Variadic<AnyType>:$inits,
-                       OptionalAttr<UnitAttr>:$wave_uniform);
+      OptionalAttr<UnitAttr>:$wave_uniform);
   let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$region);
 
@@ -884,9 +910,9 @@ def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [
   let hasVerifier = 1;
 }
 
-def TTG_PredicateYieldOp : TTG_Op<"predicate_yield", [
-  Pure, Terminator, ReturnLike, HasParent<"WarpPredicateOp">
-]> {
+def TTG_PredicateYieldOp
+    : TTG_Op<"predicate_yield", [Pure, Terminator, ReturnLike,
+                                 HasParent<"WarpPredicateOp">]> {
   let summary = "yield values from a ttg.warp_predicate region";
   let arguments = (ins Variadic<AnyType>:$values);
   let assemblyFormat = "($values^)? attr-dict (`:` type($values)^)?";
@@ -984,7 +1010,8 @@ def TTG_WarpVoteOp : TTG_Op<"warp_vote", [Pure]> {
   let arguments = (ins TT_BoolTensor:$pred, StrAttr:$kind);
   let results = (outs I1:$result);
 
-  let assemblyFormat = "$pred $kind attr-dict `:` type($pred) `->` type($result)";
+  let assemblyFormat =
+      "$pred $kind attr-dict `:` type($pred) `->` type($result)";
   let hasVerifier = 1;
 }
 
