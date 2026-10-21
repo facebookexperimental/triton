@@ -115,6 +115,12 @@ class GluonSemantic(TritonSemantic[TensorTy]):
     def _wrap_tensor_infer_layout(self, tensor):
         return self._wrap_handle_infer_layout(tensor.handle, tensor.type.scalar, tensor.shape)
 
+    def load(self, ptr, mask, other, boundary_check, padding_option, cache_modifier, eviction_policy, is_volatile,
+             latency):
+        value = super().load(ptr, mask, other, boundary_check, padding_option, cache_modifier, eviction_policy,
+                             is_volatile, latency)
+        return self._wrap_tensor_infer_layout(value)
+
     def _broadcast_shapes(self, lhs_shape: List[int], rhs_shape: List[int]):
         if len(lhs_shape) != len(rhs_shape):
             raise ValueError(f"Cannot broadcast, rank mismatch: {lhs_shape}, {rhs_shape}")
