@@ -5,8 +5,8 @@
 // CHECK-NOT: llvm.add
 // CHECK: llvm.icmp "slt"
 // CHECK-NOT: llvm.icmp "slt"
-// CHECK: llvm.udiv
-// CHECK-NOT: llvm.udiv
+// CHECK: llvm.sdiv
+// CHECK-NOT: llvm.sdiv
 // CHECK: llvm.getelementptr %arg0[[[REGISTER:%[0-9]+]]]
 // CHECK-COUNT-7: llvm.getelementptr %arg0[[[REGISTER]]]
 // CHECK-NOT: llvm.getelementptr %arg0[[[REGISTER]]]
@@ -16,13 +16,16 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
     %cst = arith.constant dense<256> : tensor<1024xi32, #blocked>
     %c1024_i32 = arith.constant 1024 : i32
     %0 = tt.get_program_id x : i32
+    %limit = arith.constant 2097152 : i32
+    %bounded = arith.cmpi ult, %0, %limit : i32
+    llvm.intr.assume %bounded : i1
     %1 = arith.muli %0, %c1024_i32 : i32
     %2 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
     %3 = tt.splat %1 : i32 -> tensor<1024xi32, #blocked>
     %4 = arith.addi %3, %2 : tensor<1024xi32, #blocked>
     %5 = tt.splat %arg2 : i32 -> tensor<1024xi32, #blocked>
     %6 = arith.cmpi slt, %4, %5 : tensor<1024xi32, #blocked>
-    %7 = arith.divui %4, %cst : tensor<1024xi32, #blocked>
+    %7 = arith.divsi %4, %cst : tensor<1024xi32, #blocked>
     %8 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
     %9 = tt.addptr %8, %7 : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
     %10 = tt.load %9, %6 : tensor<1024x!tt.ptr<f16>, #blocked>
@@ -40,8 +43,8 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
 // CHECK-NOT: llvm.add
 // CHECK: llvm.icmp "slt"
 // CHECK-NOT: llvm.icmp "slt"
-// CHECK-COUNT-2: llvm.udiv
-// CHECK-NOT: llvm.udiv
+// CHECK-COUNT-2: llvm.sdiv
+// CHECK-NOT: llvm.sdiv
 // CHECK: llvm.getelementptr %arg0[[[REGISTER1:%[0-9]+]]]
 // CHECK-COUNT-3: llvm.getelementptr %arg0[[[REGISTER1]]]
 // CHECK-NOT: llvm.getelementptr %arg0[[[REGISTER1]]]
@@ -54,13 +57,16 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
     %cst = arith.constant dense<4> : tensor<1024xi32, #blocked>
     %c1024_i32 = arith.constant 1024 : i32
     %0 = tt.get_program_id x : i32
+    %limit = arith.constant 2097152 : i32
+    %bounded = arith.cmpi ult, %0, %limit : i32
+    llvm.intr.assume %bounded : i1
     %1 = arith.muli %0, %c1024_i32 : i32
     %2 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
     %3 = tt.splat %1 : i32 -> tensor<1024xi32, #blocked>
     %4 = arith.addi %3, %2 : tensor<1024xi32, #blocked>
     %5 = tt.splat %arg2 : i32 -> tensor<1024xi32, #blocked>
     %6 = arith.cmpi slt, %4, %5 : tensor<1024xi32, #blocked>
-    %7 = arith.divui %4, %cst : tensor<1024xi32, #blocked>
+    %7 = arith.divsi %4, %cst : tensor<1024xi32, #blocked>
     %8 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
     %9 = tt.addptr %8, %7 : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
     %10 = tt.load %9, %6 : tensor<1024x!tt.ptr<f16>, #blocked>

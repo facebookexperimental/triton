@@ -576,7 +576,7 @@ tt.func @partial_div_rem_groups() {
 
 // -----
 
-// Signed div/rem must not apply the partial-group relaxation. These facts can
+// Signed div/rem need a sign proof for partial groups. These facts can
 // describe local runs such as [-4, -3, -2, -1, 8, 9, 10, 11], for which
 // truncation toward zero produces neither four equal quotients nor a
 // four-element contiguous remainder run.
@@ -588,6 +588,121 @@ tt.func @signed_partial_div_rem_is_conservative(
   %quotient = arith.divsi %lhs, %four : tensor<8xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %remainder = arith.remsi %lhs, %four : tensor<8xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_bounded_tile() {
+  %pid = tt.get_program_id x : i32
+  %limit = arith.constant 16777216 : i32
+  %valid = arith.cmpi ult, %pid, %limit : i32
+  llvm.intr.assume %valid : i1
+  %tile = arith.constant 128 : i32
+  %base = arith.muli %pid, %tile : i32
+  %bases = tt.splat %base : i32 -> tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %bases, %lanes : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64]}}
+  %quotient = arith.divsi %indices, %divisor : tensor<128xi32>
+  // expected-remark @below {{contiguity = [64], divisibility = [64], constancy = [1]}}
+  %remainder = arith.remsi %indices, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_tile_can_wrap() {
+  %pid = tt.get_program_id x : i32
+  %tile = arith.constant 128 : i32
+  %base = arith.muli %pid, %tile : i32
+  %bases = tt.splat %base : i32 -> tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %bases, %lanes : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %quotient = arith.divsi %indices, %divisor : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %remainder = arith.remsi %indices, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_assumption_is_use_local(%base: i32 {tt.divisibility = 128 : i32}, %cond: i1) {
+  %zero = arith.constant 0 : i32
+  %limit = arith.constant 2147483520 : i32
+  %positive = arith.cmpi sge, %base, %zero : i32
+  %bounded = arith.cmpi sle, %base, %limit : i32
+  %bases = tt.splat %base : i32 -> tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %bases, %lanes : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %before = arith.divsi %indices, %divisor : tensor<128xi32>
+  scf.if %cond {
+    llvm.intr.assume %positive : i1
+    llvm.intr.assume %bounded : i1
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64]}}
+    %inside = arith.divsi %indices, %divisor : tensor<128xi32>
+  } else {
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+    %sibling = arith.divsi %indices, %divisor : tensor<128xi32>
+  }
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %outside = arith.divsi %indices, %divisor : tensor<128xi32>
+  llvm.intr.assume %positive : i1
+  llvm.intr.assume %bounded : i1
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64]}}
+  %after = arith.divsi %indices, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_partial_groups_with_proof() {
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %sixtyfour = arith.constant dense<64> : tensor<128xi32>
+  %eight = arith.constant dense<8> : tensor<128xi32>
+  %groups = arith.remui %lanes, %sixtyfour : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8]}}
+  %quotient = arith.divsi %groups, %eight : tensor<128xi32>
+  // expected-remark @below {{contiguity = [8], divisibility = [8], constancy = [1]}}
+  %remainder = arith.remsi %groups, %eight : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_bounded_loop() {
+  %zero = arith.constant 0 : i32
+  %end = arith.constant 1024 : i32
+  %step = arith.constant 128 : i32
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  scf.for %iv = %zero to %end step %step : i32 {
+    %bases = tt.splat %iv : i32 -> tensor<128xi32>
+    %indices = arith.addi %bases, %lanes : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64]}}
+    %quotient = arith.divsi %indices, %divisor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [64], divisibility = [64], constancy = [1]}}
+    %remainder = arith.remsi %indices, %divisor : tensor<128xi32>
+  }
+  tt.return
+}
+
+// -----
+
+tt.func @signed_wrapping_add() {
+  %base = arith.constant dense<2147483584> : tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %base, %lanes : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %quotient = arith.divsi %indices, %divisor : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %remainder = arith.remsi %indices, %divisor : tensor<128xi32>
   tt.return
 }
 
