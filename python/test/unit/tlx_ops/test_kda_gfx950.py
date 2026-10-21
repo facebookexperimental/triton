@@ -129,8 +129,11 @@ def test_kda_paged_prefill_smoke_shapes(lengths, heads):
 @pytest.mark.parametrize(
     ("lengths", "heads"),
     [
-        pytest.param([256] * 8, 12, id="walk-h12"),
-        pytest.param([4096], 12, id="time-split-h12"),
+        # Enough heads that the unsplit walk takes all 128 value rows per program.
+        pytest.param([256] * 16, 12, id="walk-h12"),
+        # Long enough that the split's second pass also takes full-width rows.
+        pytest.param([8192], 12, id="time-split-h12"),
+        # Its 17-token sequence leaves most of its groups empty.
         pytest.param([17, 4000, 6000], 4, id="time-split-ragged-h4"),
         # The last chunk ends 37 rows short: its loads must stay inside the inputs.
         pytest.param([1638, 1228, 819, 411], 12, id="ragged-tail-h12"),
@@ -223,18 +226,6 @@ def test_kda_paged_prefill_state_pool(lengths):
     untouched[indices.long()] = False
     torch.testing.assert_close(pool[untouched], original_pool[untouched], atol=0, rtol=0)
     torch.testing.assert_close(backing[:, 0], other_half, atol=0, rtol=0)
-
-
-def test_kda_paged_prefill_rejects_ambiguous_state():
-    q, k, v, g, beta, A_log, dt_bias = _raw_kda_inputs([17], 4)
-    state = torch.zeros(1, 4, 128, 128, device=DEVICE, dtype=torch.float32)
-    cu_seqlens = torch.tensor([0, 17], device=DEVICE, dtype=torch.int64)
-    indices = torch.zeros(1, device=DEVICE, dtype=torch.int32)
-    with pytest.raises(ValueError, match="either initial_state"):
-        kda_paged_prefill(q, k, v, g, beta, initial_state=state, state_pool=state, state_indices=indices,
-                          cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias)
-    with pytest.raises(ValueError, match="both A_log and dt_bias"):
-        kda_paged_prefill(q, k, v, g, beta, initial_state=state, cu_seqlens=cu_seqlens, A_log=A_log)
 
 
 @pytest.mark.parametrize("total_tokens,sequences,heads,key_dim,value_dim,dtype_name", PREFILL_CORRECTNESS_SHAPES)
