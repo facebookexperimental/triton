@@ -254,6 +254,126 @@ class TestTorchTLXEpilogueFusion(TestCase):
         not (has_tlx() and _HAS_BLACKWELL_TUTORIAL),
         "TLX Blackwell tutorial not available",
     )
+    def test_tlx_mm_epilogue_with_live_intermediate_is_not_fused(self):
+        """A GEMM output that stays live outside the fused group vetoes TLX fusion.
+
+        The TLX compute_epilogue/TMA path redirects intermediate stores into
+        variable assignments and materializes only the final result. Fusing
+        mm + mul + sigmoid while the pre-sigmoid mm result is also a graph
+        output (e.g. a tensor saved for backward) leaves that buffer allocated
+        but never written. The veto keeps the GEMM materialized and runs the
+        pointwise ops separately.
+        """
+        m, k, n = 4096, 4096, 1024
+        dtype = torch.bfloat16
+        device = GPU_TYPE
+        torch.manual_seed(0)
+        x = torch.randn(m, k, device=device, dtype=dtype)
+        w = torch.randn(k, n, device=device, dtype=dtype)
+
+        def mm_gated_with_live_mm(
+            x: torch.Tensor,
+            w: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            mm = torch.mm(x, w)
+            return mm * torch.sigmoid(mm), mm
+
+        with torch.no_grad():
+            expected = mm_gated_with_live_mm(x, w)
+            with (
+                    config.patch({
+                        "triton.tlx_mode": "force",
+                        "force_disable_caches": True,
+                        "enable_caching_generated_triton_templates": False,
+                    }),
+                    tlx_config.patch(use_heuristic_config=True),
+            ):
+                actual, code = run_and_get_code(
+                    torch.compile(mm_gated_with_live_mm, fullgraph=True),
+                    x,
+                    w,
+                )
+
+        for actual_output, expected_output in zip(actual, expected):
+            torch.testing.assert_close(
+                actual_output,
+                expected_output,
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        generated_code_str = "\n".join(code)
+        if "_reduce_k_kernel" in generated_code_str:
+            # Split-K disables epilogue fusion; nothing to veto.
+            return
+        self.assertIn(
+            "tlx_mm_",
+            generated_code_str,
+            "Expected the TLX mm template to be in play for this graph.",
+        )
+        self.assertNotIn(
+            "triton_tem_fused_tlx_mm_",
+            generated_code_str,
+            "Live intermediate must veto the single-TMA fused TLX epilogue kernel.",
+        )
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(
+        not (has_tlx() and _HAS_BLACKWELL_TUTORIAL),
+        "TLX Blackwell tutorial not available",
+    )
+    def test_tlx_mm_epilogue_with_internal_intermediate_stays_fused(self):
+        """Positive control: a fully internal intermediate still fuses."""
+        m, k, n = 4096, 4096, 1024
+        dtype = torch.bfloat16
+        device = GPU_TYPE
+        torch.manual_seed(0)
+        x = torch.randn(m, k, device=device, dtype=dtype)
+        w = torch.randn(k, n, device=device, dtype=dtype)
+
+        def mm_gated(
+            x: torch.Tensor,
+            w: torch.Tensor,
+        ) -> torch.Tensor:
+            mm = torch.mm(x, w)
+            return mm * torch.sigmoid(mm)
+
+        with torch.no_grad():
+            expected = mm_gated(x, w)
+            with (
+                    config.patch({
+                        "triton.tlx_mode": "force",
+                        "force_disable_caches": True,
+                        "enable_caching_generated_triton_templates": False,
+                    }),
+                    tlx_config.patch(use_heuristic_config=True),
+            ):
+                actual, code = run_and_get_code(
+                    torch.compile(mm_gated, fullgraph=True),
+                    x,
+                    w,
+                )
+
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        generated_code_str = "\n".join(code)
+        if "_reduce_k_kernel" in generated_code_str:
+            return
+        self.assertIn(
+            "triton_tem_fused_tlx_mm_",
+            generated_code_str,
+            "Fully internal intermediate should still fuse into the TLX kernel.",
+        )
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(
+        not (has_tlx() and _HAS_BLACKWELL_TUTORIAL),
+        "TLX Blackwell tutorial not available",
+    )
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_customized_matmul_relu_epilogue_is_fused(
         self,
