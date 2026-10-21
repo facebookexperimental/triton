@@ -1150,6 +1150,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // cluster barrier (none) is next.
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: amdg.memory_counter_wait ds(0)
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 //
@@ -1159,6 +1160,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Barrier between stage1→stage2 is LOCAL (distance-2 WAR: a1 reads, a0 writes).
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: amdg.memory_counter_wait ds(0)
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 //
@@ -1450,6 +1452,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Stage 0's mem ops are nested in the scf.if (not top-level), so there is no
 // per-mem-op barrier here — just the cluster barrier (none).
 // CHECK: rocdl.sched.barrier none
+// CHECK-NEXT: amdg.memory_counter_wait ds(0)
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 // Stage 1 reads LDS.
@@ -1459,6 +1462,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // cluster barrier (none) is next.
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: amdg.memory_counter_wait ds(0)
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK: scf.yield
@@ -1541,6 +1545,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
   // CHECK: tt.store
   // CHECK-NEXT: rocdl.sched.barrier non_mem_non_sideeffect
   // CHECK-NEXT: rocdl.sched.barrier none
+  // CHECK-NEXT: amdg.memory_counter_wait ds(0)
   // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: rocdl.sched.barrier none
   // CHECK: ttg.local_store
@@ -2218,6 +2223,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Barrier between stage0→stage1 is LOCAL (adjacent RAW: write→read).
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: amdg.memory_counter_wait ds(0)
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 //
@@ -2227,6 +2233,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Barrier between stage1→stage2 is LOCAL (distance-2 WAR: a1 reads, a0 writes).
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: amdg.memory_counter_wait ds(0)
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 //
@@ -2518,6 +2525,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Stage 0's mem ops are nested in the scf.if (not top-level), so there is no
 // per-mem-op barrier here — just the cluster barrier (none).
 // CHECK: rocdl.sched.barrier none
+// CHECK-NEXT: amdg.memory_counter_wait ds(0)
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 // Stage 1 reads LDS.
@@ -2527,6 +2535,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // cluster barrier (none) is next.
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: amdg.memory_counter_wait ds(0)
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK: scf.yield
@@ -2626,3 +2635,64 @@ tt.func @loop_varying_subslice_origin(%n: i32, %initial: tensor<512xi32, #blocke
   tt.return %result#1 : tensor<128xi32, #blocked>
 }
 }
+
+// -----
+
+// ---- Top-of-loop async_wait with a LOCAL dependency gets a ds wait ----
+//
+// The mem stage async-copies into the ring buffer the other warp group may
+// still be reading. Membar adds the barrier after the wait; this pass must add
+// the ds wait so that barrier also orders the other group's pending ds_reads.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @top_async_wait_ring(%n: i32, %ptrs: tensor<64x64x!tt.ptr<bf16>, #blocked>, %acc0: tensor<64x64xf32, #blocked>) -> tensor<64x64xf32, #blocked> {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c3 = arith.constant 3 : i32
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xbf16, #shared, #smem, mutable>
+    %init = arith.constant dense<0.0> : tensor<64x64xbf16, #blocked>
+    %r:2 = scf.for %i = %c0 to %n step %c1 iter_args(%tile = %init, %acc = %acc0) -> (tensor<64x64xbf16, #blocked>, tensor<64x64xf32, #blocked>) : i32 {
+      %w = ttg.async_wait {num = 1 : i32}
+      %a = scf.execute_region -> tensor<64x64xf32, #blocked> no_inline {
+        %e = arith.extf %tile : tensor<64x64xbf16, #blocked> to tensor<64x64xf32, #blocked>
+        %s = arith.addf %acc, %e : tensor<64x64xf32, #blocked>
+        scf.yield %s : tensor<64x64xf32, #blocked>
+      } {triton.warp_pipeline.stage = "mfma"}
+      %t = scf.execute_region -> tensor<64x64xbf16, #blocked> no_inline {
+        %p = arith.remsi %i, %c3 : i32
+        %ip = arith.addi %i, %c1 : i32
+        %q = arith.remsi %ip, %c3 : i32
+        %dst = ttg.memdesc_index %buf[%p] : !ttg.memdesc<3x64x64xbf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>
+        %cp = ttg.async_copy_global_to_local %ptrs, %dst : tensor<64x64x!tt.ptr<bf16>, #blocked> -> <64x64xbf16, #shared, #smem, mutable>
+        %cg = ttg.async_commit_group tokens %cp
+        %src = ttg.memdesc_index %buf[%q] : !ttg.memdesc<3x64x64xbf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>
+        %ld = ttg.local_load %src : !ttg.memdesc<64x64xbf16, #shared, #smem, mutable> -> tensor<64x64xbf16, #blocked>
+        scf.yield %ld : tensor<64x64xbf16, #blocked>
+      } {triton.warp_pipeline.stage = "mem"}
+      scf.yield %t, %a : tensor<64x64xbf16, #blocked>, tensor<64x64xf32, #blocked>
+    } {triton.warp_pipeline.pipelined_for}
+    ttg.local_dealloc %buf : !ttg.memdesc<3x64x64xbf16, #shared, #smem, mutable>
+    tt.return %r#1 : tensor<64x64xf32, #blocked>
+  }
+}
+
+// CHECK-LABEL: tt.func @top_async_wait_ring
+// CHECK: amdg.cond_barrier
+// CHECK: scf.for
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: amdg.memory_counter_wait ds(0)
+// CHECK-NEXT: ttg.async_wait
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NOT: ttg.barrier
+// CHECK: arith.addf
+// CHECK: rocdl.s.barrier
+// CHECK: ttg.async_copy_global_to_local
+// CHECK: ttg.local_load
+// CHECK: scf.yield
+// CHECK: amdg.memory_counter_wait ds(0)
+// CHECK-NEXT: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: tt.return

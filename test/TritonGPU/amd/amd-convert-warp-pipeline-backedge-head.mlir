@@ -55,6 +55,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // HEURISTIC-NEXT: scf.for
 // Key difference: the backedge barrier has moved to the loop head.
 // HEURISTIC-NEXT: rocdl.sched.barrier
+// HEURISTIC-NEXT: amdg.memory_counter_wait ds(0)
 // HEURISTIC-NEXT: ttg.barrier local
 // HEURISTIC-NEXT: rocdl.sched.barrier
 // HEURISTIC: ttg.local_load
@@ -72,6 +73,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // HEURISTIC-NEXT: rocdl.s.setprio 0
 // HEURISTIC-NEXT: scf.yield
 // HEURISTIC: rocdl.sched.barrier
+// HEURISTIC-NEXT: amdg.memory_counter_wait ds(0)
 // HEURISTIC-NEXT: ttg.barrier local
 // HEURISTIC-NEXT: rocdl.sched.barrier
 // HEURISTIC: rocdl.s.setprio 0
@@ -99,6 +101,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // NOHEURISTIC-NEXT: rocdl.sched.barrier non_mem_non_sideeffect
 // NOHEURISTIC-NEXT: rocdl.s.setprio 0
 // NOHEURISTIC: rocdl.sched.barrier
+// NOHEURISTIC-NEXT: amdg.memory_counter_wait ds(0)
 // NOHEURISTIC-NEXT: ttg.barrier local
 // NOHEURISTIC-NEXT: rocdl.sched.barrier
 // NOHEURISTIC-NEXT: scf.yield

@@ -263,12 +263,23 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
   }
 }
 
+// The LLVM workgroup fence emitted for a local barrier assumes LDS accesses
+// are totally ordered and omits lgkmcnt(0). Async global-to-LDS copies bypass
+// that order, so a pending ds_read can observe a later copy into its buffer.
+static void emitDsWait(OpBuilder &r, Location loc) {
+  triton::amdgpu::MemoryCounterWaitOp::create(r, loc, /*load=*/nullptr,
+                                              /*store=*/nullptr,
+                                              /*ds=*/r.getI32IntegerAttr(0));
+}
+
 static void emitClusterBarrier(OpBuilder &r, Location loc, bool needLocal) {
   ROCDL::SchedBarrier::create(r, loc, ROCDL::SchedGroupMask::none);
-  if (needLocal)
+  if (needLocal) {
+    emitDsWait(r, loc);
     mlir::triton::gpu::BarrierOp::create(r, loc, triton::gpu::AddrSpace::Local);
-  else
+  } else {
     ROCDL::SBarrierOp::create(r, loc);
+  }
   ROCDL::SchedBarrier::create(r, loc, ROCDL::SchedGroupMask::none);
 }
 
@@ -286,15 +297,18 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
 // Wrap a pre-existing barrier op (e.g. async_wait) with sched_barriers so the
 // backend scheduler cannot move ops across it, and emit the cluster's
 // priority just before the barrier.  Used in place of inserting a fresh
-// cluster barrier when one already exists at the cluster boundary.
+// cluster barrier when one already exists at the cluster boundary.  A LOCAL
+// boundary also gets a ds wait; Membar places the barrier after a wait op.
 static void wrapExistingBarrier(OpBuilder &b, Location loc,
                                 Operation *clusterOp,
                                 Operation *existingBarrier, bool anyHasPriority,
-                                bool emitPriority = true) {
+                                bool needLocal, bool emitPriority = true) {
   b.setInsertionPoint(existingBarrier);
   if (emitPriority)
     emitClusterPriority(b, loc, clusterOp, anyHasPriority);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
+  if (needLocal)
+    emitDsWait(b, loc);
   b.setInsertionPointAfter(existingBarrier);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
 }
@@ -500,12 +514,9 @@ private:
 
       if (auto exBar = existingBarrierMap.find(i);
           exBar != existingBarrierMap.end()) {
-        // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing
-        // barrier is not enough to satisfy LDS ordering.  For now we rely on
-        // the producer to place such barriers only where no local fence is
-        // needed.
         wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
-                            anyHasPriority, emitPriorityAtBoundary);
+                            anyHasPriority, /*needLocal=*/bars[i],
+                            emitPriorityAtBoundary);
       } else {
         if (emitPriorityAtBoundary)
           emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
@@ -644,11 +655,8 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
     }
 
     if (existingBarrier) {
-      // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing barrier
-      // is not enough to satisfy LDS ordering.  For now we rely on the
-      // producer to place such barriers only where no local fence is needed.
       wrapExistingBarrier(b, loc, clusterOps[i], existingBarrier,
-                          anyHasPriority);
+                          anyHasPriority, /*needLocal=*/bars[i]);
     } else {
       b.setInsertionPoint(clusterOps[i]);
       emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
