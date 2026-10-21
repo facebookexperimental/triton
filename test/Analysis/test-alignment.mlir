@@ -2,6 +2,7 @@
 // RUN: triton-opt %s -triton-materialize-integer-facts -test-integer-facts -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
 // RUN: triton-opt %s -triton-materialize-integer-facts -triton-materialize-integer-facts -test-print-alignment -verify-diagnostics=only-expected -split-input-file | FileCheck %s --check-prefix=REFINE
 // RUN: triton-opt %s -triton-materialize-integer-facts -test-print-alignment -triton-erase-integer-refinements -verify-diagnostics=only-expected -split-input-file | FileCheck %s --check-prefix=ERASE
+// RUN: triton-opt %s -triton-materialize-integer-facts -triton-narrow-integer-ranges -canonicalize -split-input-file | FileCheck %s --check-prefix=NARROW
 
 // ERASE-NOT: tt.refine
 // ERASE: llvm.intr.assume
@@ -2337,5 +2338,89 @@ tt.func @negative_constants() {
   %sixteen = arith.constant dense<16> : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [8], constancy = [128], constant_value = 8}}
   %sum = arith.addi %neg8_dense, %sixteen : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+// NARROW-LABEL: tt.func @narrow_branch_only
+// NARROW: scf.if
+// NARROW: arith.divsi {{.*}} : i32
+// NARROW: } else {
+// NARROW: arith.divsi {{.*}} : i64
+tt.func @narrow_branch_only(%x: i64) -> i64 {
+  %zero = arith.constant 0 : i64
+  %limit = arith.constant 1024 : i64
+  %three = arith.constant 3 : i64
+  %lo = arith.cmpi sge, %x, %zero : i64
+  %hi = arith.cmpi slt, %x, %limit : i64
+  %bounded = arith.andi %lo, %hi : i1
+  %result = scf.if %bounded -> i64 {
+    %q = arith.divsi %x, %three : i64
+    scf.yield %q : i64
+  } else {
+    %q = arith.divsi %x, %three : i64
+    scf.yield %q : i64
+  }
+  tt.return %result : i64
+}
+
+// -----
+
+// NARROW-LABEL: tt.func @narrow_unsigned_keep_product
+// NARROW: arith.muli {{.*}} : i64
+// NARROW: arith.divui {{.*}} : i32
+// NARROW: arith.extui {{.*}} : i32 to i64
+tt.func @narrow_unsigned_keep_product(%x: i32, %y: i32) -> (i64, i64) {
+  %wide_x = arith.extui %x : i32 to i64
+  %wide_y = arith.extui %y : i32 to i64
+  %product = arith.muli %wide_x, %wide_y : i64
+  %three = arith.constant 3 : i64
+  %quotient = arith.divui %wide_x, %three : i64
+  tt.return %product, %quotient : i64, i64
+}
+
+// -----
+
+// NARROW-LABEL: tt.func @keep_unsigned_sign_extended
+// NARROW: arith.remui {{.*}} : i64
+// NARROW: arith.shrui {{.*}} : i64
+tt.func @keep_unsigned_sign_extended(%x: i32) -> (i64, i64) {
+  %wide = arith.extsi %x : i32 to i64
+  %seven = arith.constant 7 : i64
+  %shift = arith.constant 33 : i64
+  %rem = arith.remui %wide, %seven : i64
+  %shr = arith.shrui %wide, %shift : i64
+  tt.return %rem, %shr : i64, i64
+}
+
+// -----
+
+// NARROW-LABEL: tt.func @keep_wide_shift
+// NARROW: arith.shrui {{.*}} : i64
+tt.func @keep_wide_shift(%x: i32, %shift: i32) -> i64 {
+  %wide = arith.extui %x : i32 to i64
+  %amount = arith.extui %shift : i32 to i64
+  %result = arith.shrui %wide, %amount : i64
+  tt.return %result : i64
+}
+
+// -----
+
+// NARROW-LABEL: tt.func @narrow_range_loop
+// NARROW: scf.for {{.*}} : i32
+tt.func @narrow_range_loop(%n: i64, %ptr: !tt.ptr<i64>) {
+  %zero = arith.constant 0 : i64
+  %limit = arith.constant 1024 : i64
+  %one = arith.constant 1 : i64
+  %lo = arith.cmpi sgt, %n, %zero : i64
+  %hi = arith.cmpi sle, %n, %limit : i64
+  %bounded = arith.andi %lo, %hi : i1
+  scf.if %bounded {
+    scf.for %i = %zero to %n step %one : i64 {
+      %p = tt.addptr %ptr, %i : !tt.ptr<i64>, i64
+      tt.store %p, %i : !tt.ptr<i64>
+    }
+  }
   tt.return
 }

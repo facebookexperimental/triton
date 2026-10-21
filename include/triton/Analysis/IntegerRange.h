@@ -11,6 +11,9 @@ namespace mlir::triton {
 
 enum class IntegerProof { Proven, Disproven, Unknown };
 
+/// Create a solver for SSA integer facts and target launch bounds.
+std::unique_ptr<DataFlowSolver> createIntegerFactSolver(Operation *root);
+
 class IntegerFactAnalysis {
 public:
   IntegerFactAnalysis();

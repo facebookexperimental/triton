@@ -16,6 +16,63 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("value", [-17, 0, 1023, 1024, 2**40])
+def test_integer_facts_narrow_branch(value):
+
+    @triton.jit
+    def kernel(input, output):
+        x = tl.load(input)
+        if (x >= 0) & (x < 1024):
+            result = x // 3
+        else:
+            result = x // 5
+        tl.store(output, result)
+
+    input = torch.tensor([value], dtype=torch.int64, device=DEVICE)
+    output = torch.empty_like(input)
+    compiled = kernel[(1, )](input, output)
+    expected = torch.div(input, 3 if 0 <= value < 1024 else 5, rounding_mode="trunc")
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert re.search(r"arith.divsi .* : i32", compiled.asm["ttir"])
+    assert re.search(r"arith.divsi .* : i64", compiled.asm["ttir"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("value", [-2147483648, -17, -1, 0, 2147483647])
+def test_integer_facts_unsigned_sign_extension(value):
+
+    @triton.jit
+    def kernel(input, output):
+        x = tl.load(input).to(tl.int64).to(tl.uint64)
+        tl.store(output, x % 7)
+        tl.store(output + 1, x >> 33)
+
+    input = torch.tensor([value], dtype=torch.int32, device=DEVICE)
+    output = torch.empty((2, ), dtype=torch.int64, device=DEVICE)
+    kernel[(1, )](input, output)
+    unsigned = value % 2**64
+    expected = torch.tensor([unsigned % 7, unsigned >> 33], dtype=torch.int64, device=DEVICE)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("shift", [0, 31, 32, 33, 63])
+def test_integer_facts_wide_shift(shift):
+
+    @triton.jit
+    def kernel(input, amount, output):
+        x = tl.load(input).to(tl.uint32).to(tl.uint64)
+        s = tl.load(amount).to(tl.uint64)
+        tl.store(output, x >> s)
+
+    input = torch.tensor([-1], dtype=torch.int32, device=DEVICE)
+    amount = torch.tensor([shift], dtype=torch.int32, device=DEVICE)
+    output = torch.empty((1, ), dtype=torch.int64, device=DEVICE)
+    kernel[(1, )](input, amount, output)
+    assert output.item() == (2**32 - 1) >> shift
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 @pytest.mark.parametrize("base", [-128, -64, -4, 0, 128, 2147483584])
 @pytest.mark.parametrize("divisor", [-64, -4, 4, 64])
 @pytest.mark.parametrize("op", ["div", "rem"])

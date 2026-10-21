@@ -1,16 +1,89 @@
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "triton/Analysis/IntegerRange.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_TRITONMATERIALIZEINTEGERFACTS
 #define GEN_PASS_DEF_TRITONERASEINTEGERREFINEMENTS
+#define GEN_PASS_DEF_TRITONNARROWINTEGERRANGES
 #include "triton/Dialect/Triton/Transforms/Passes.h.inc"
 
 namespace {
+class IntegerRangeRewriteListener : public RewriterBase::Listener {
+public:
+  explicit IntegerRangeRewriteListener(DataFlowSolver &solver)
+      : solver(solver) {}
+
+  void notifyOperationErased(Operation *op) override {
+    solver.eraseState(solver.getProgramPointAfter(op));
+    for (Value result : op->getResults())
+      solver.eraseState(result);
+  }
+
+private:
+  DataFlowSolver &solver;
+};
+
+static bool preservesIntegerWidth(Operation *op, DataFlowSolver &solver) {
+  if (isa<arith::ShLIOp, arith::ShRUIOp, arith::ShRSIOp>(op)) {
+    const auto *shift = solver.lookupState<dataflow::IntegerValueRangeLattice>(
+        op->getOperand(1));
+    // A valid wide shift must not become an out-of-range narrow shift.
+    if (!shift || shift->getValue().isUninitialized() ||
+        shift->getValue().getValue().umax().uge(32))
+      return false;
+  }
+  if (!isa<arith::DivUIOp, arith::RemUIOp, arith::CeilDivUIOp, arith::ShRUIOp>(
+          op))
+    return true;
+  // Sign-extension changes unsigned division/remainder and logical shifts.
+  for (Value operand : op->getOperands()) {
+    const auto *range =
+        solver.lookupState<dataflow::IntegerValueRangeLattice>(operand);
+    if (!range || range->getValue().isUninitialized() ||
+        range->getValue().getValue().umax().getActiveBits() > 32)
+      return false;
+  }
+  return true;
+}
+
+struct TritonNarrowIntegerRangesPass
+    : impl::TritonNarrowIntegerRangesBase<TritonNarrowIntegerRangesPass> {
+  void runOnOperation() override {
+    auto solver = createIntegerFactSolver(getOperation());
+    if (failed(solver->initializeAndRun(getOperation())))
+      return signalPassFailure();
+    IntegerRangeRewriteListener listener(*solver);
+    RewritePatternSet patterns(&getContext());
+    arith::populateIntRangeNarrowingPatterns(patterns, *solver, {32});
+    arith::populateControlFlowValuesNarrowingPatterns(patterns, *solver, {32});
+    SmallVector<Operation *> candidates;
+    getOperation()->walk([&](Operation *op) {
+      if ((isa<arith::ArithDialect>(op->getDialect()) ||
+           isa<LoopLikeOpInterface>(op)) &&
+          preservesIntegerWidth(op, *solver))
+        candidates.push_back(op);
+    });
+    // Keep block-argument storage stable while range facts are live.
+    GreedyRewriteConfig config;
+    config.setUseTopDownTraversal(false)
+        .enableFolding(false)
+        .setRegionSimplificationLevel(GreedySimplifyRegionLevel::Disabled)
+        .setStrictness(GreedyRewriteStrictness::ExistingOps)
+        .setListener(&listener);
+    if (failed(
+            applyOpPatternsGreedily(candidates, std::move(patterns), config)))
+      return signalPassFailure();
+  }
+};
+
 struct Predicate {
   Value value;
   Value bound;

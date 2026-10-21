@@ -284,6 +284,20 @@ consumers can use them for narrowing and arithmetic simplification. Proof
 availability establishes legality, not profitability. Backend cost models remain
 responsible for the choice between equivalent arithmetic forms.
 
+Integer narrowing consumes the same range lattice. Operand and result ranges
+must permit reconstruction at the original width. Signed and unsigned
+operations must retain their integer interpretation. In particular, a value
+that fits after sign extension does not justify narrowing unsigned division,
+unsigned remainder, or a logical right shift. Those operations require a
+zero-extension proof. For example, `remui(sext(-1 : i32), 7)` differs from
+`remui(-1 : i32, 7)`.
+Shift counts must also be less than the new width. A defined wide shift must
+not become poison after narrowing.
+
+Rewrites invalidate facts for erased values. They must not associate a new SSA
+value with facts from reused storage. Range analysis and rewriting have separate
+lifetimes; canonicalization follows the range consumer.
+
 ## Compile-time constraints
 
 This is a compiler hot path. Bound expression size, retained relations, and
