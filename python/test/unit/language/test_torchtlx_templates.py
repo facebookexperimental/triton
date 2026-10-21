@@ -118,6 +118,66 @@ TEMPLATE_TEST_SHAPES = [
 ]
 
 
+@instantiate_parametrized_tests
+class TestTLXReductionEpilogue(TestCase):
+
+    def test_unresolved_partial_width_falls_back(self):
+        from triton.language.extra.tlx.inductor import reduction_epilogue
+
+        kernel = mock.Mock(meta={}, _tlx_reduction_epilogue_plan=mock.sentinel.plan, _tlx_split_k=1)
+        with self.assertRaises(reduction_epilogue.RowPartialsUnsupported):
+            reduction_epilogue.reduction_store_output(kernel, ("rows", "cols"), "value", "mask", partial_index="pid_n",
+                                                      partial_columns="BLOCK_N")
+        kernel.store_output.assert_not_called()
+
+    def test_reduction_hooks_install_once_without_existing_fusion_hook(self):
+        from torch._inductor import scheduler
+        from torch._inductor.codegen import cuda_combined_scheduling, triton
+        from triton.language.extra.tlx.inductor import reduction_epilogue
+
+        scheduling_classes = [type("Scheduling", (), {}) for _ in range(2)]
+        scheduler_class = type("Scheduler", (), {"speedup_by_fusion": mock.Mock()})
+        kernel_class = type(
+            "Kernel", (), {
+                name: mock.Mock()
+                for name in ("codegen_template_body", "_compute_fusion_metadata", "render", "_emit_post_kernel_code",
+                             "call_kernel")
+            })
+        with contextlib.ExitStack() as stack:
+            for module, name, value in (
+                (cuda_combined_scheduling, "CUDACombinedScheduling", scheduling_classes[0]),
+                (triton, "TritonScheduling", scheduling_classes[1]),
+                (scheduler, "Scheduler", scheduler_class),
+                (reduction_epilogue, "TritonTemplateKernel", kernel_class),
+                (reduction_epilogue, "_INSTALLED", False),
+                (reduction_epilogue, "can_fuse_reduction_epilogue", mock.Mock(return_value=False)),
+            ):
+                stack.enter_context(mock.patch.object(module, name, value))
+            reduction_epilogue.install()
+            hooks = [cls.can_fuse_reduction_epilogue for cls in scheduling_classes]
+            codegen = kernel_class.codegen_template_body
+            reduction_epilogue.install()
+            self.assertIs(kernel_class.codegen_template_body, codegen)
+            for cls, hook in zip(scheduling_classes, hooks):
+                self.assertIs(cls.can_fuse_reduction_epilogue, hook)
+                self.assertFalse(cls().can_fuse_reduction_epilogue(None, None))
+
+            reduction_epilogue.can_fuse_reduction_epilogue.return_value = True
+            split_k = mock.Mock(_tlx_row_partials=True, _tlx_split_k=2)
+            unsplit = mock.Mock(_tlx_row_partials=True, _tlx_split_k=1)
+            template = mock.Mock()
+            node = mock.Mock()
+            node.get_template_node.return_value = template
+            with mock.patch.dict("os.environ", {"TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE": "force"}):
+                template.choice_timings.return_value = {split_k: 0.1, unsplit: 0.2}
+                scheduler_class().speedup_by_fusion(node, None)
+                template.finalize_as_triton_caller.assert_called_once_with(unsplit)
+                template.finalize_as_triton_caller.reset_mock()
+                template.choice_timings.return_value = {split_k: 0.1}
+                scheduler_class().speedup_by_fusion(node, None)
+                template.finalize_as_triton_caller.assert_not_called()
+
+
 class TestLocalBufferRetention(TestCase):
 
     @contextlib.contextmanager
@@ -2279,10 +2339,23 @@ class TestInterWaveTemplateCodegen(TestCase):
             return f"tl.store(A, {val}, mask={mask})"
 
         hooks = {
-            "def_kernel": lambda *args, **kwargs: "def _kernel(A, B):",
-            "size": lambda *args, **kwargs: "256",
-            "stride": lambda *args, **kwargs: "1",
-            "store_output": store_output,
+            "def_kernel":
+            lambda *args, **kwargs: "def _kernel(A, B):",
+            "size":
+            lambda *args, **kwargs: "256",
+            "stride":
+            lambda *args, **kwargs: "1",
+            "store_output":
+            store_output,
+            "reduction_store_output":
+            lambda indices, val, mask, **kwargs: store_output(
+                indices,
+                val,
+                mask,
+                **{k: v
+                   for k, v in kwargs.items()
+                   if not k.startswith(("partial_", "tile_"))},
+            ),
         }
         rendered = jinja2.Environment().from_string(source).render(**hooks)
 
@@ -2317,6 +2390,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
             "stride": lambda *a, **k: "1",
             "output_ptr": lambda *a, **k: "out_ptr0",
             "store_output": lambda *a, **k: "# store_output(...)",
+            "reduction_store_output": lambda *a, **k: "# store_output(...)",
             "prefetch_epilogue": lambda *a, **k: "# prefetch_epilogue(...)",
         }
         tmpl = jinja2.Environment().from_string(source)
@@ -2350,6 +2424,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
             "stride": lambda *a, **k: "1",
             "output_ptr": lambda *a, **k: "out_ptr0",
             "store_output": lambda *a, **k: "# store_output(...)",
+            "reduction_store_output": lambda *a, **k: "# store_output(...)",
             "prefetch_epilogue": lambda *a, **k: "# prefetch_epilogue(...)",
         }
         tmpl = jinja2.Environment().from_string(source)

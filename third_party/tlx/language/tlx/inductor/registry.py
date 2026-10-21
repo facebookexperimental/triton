@@ -2552,6 +2552,8 @@ def _tlx_tt_generate(self, input_nodes, layout, *args, **kwargs):  # type: ignor
             dtype=torch.float32,
         )
     choice = _orig_tt_generate(self, input_nodes, layout, *args, **kwargs)
+    if choice is not None:
+        choice._tlx_row_partials = getattr(self, "tlx_row_partials", False)
     if split_k > 1 and choice is not None:
         # Tag the ChoiceCaller so benchmark() can add the reducer's cost to this
         # candidate's score; see _tlx_caller_benchmark. optimization_hint (not int())
@@ -3312,7 +3314,7 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
 ):
     split_k = getattr(self, "_tlx_split_k", 1)
     # Set _final_output_name so output_ptr() resolves to the fused output.
-    if epilogue_nodes:
+    if epilogue_nodes and getattr(self, "_tlx_reduction_epilogue_plan", None) is None:
         last_names = epilogue_nodes[-1].get_buffer_names()
         if len(last_names) == 1:
             self._final_output_name = next(iter(last_names))
@@ -3330,6 +3332,11 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
         # After render, codegen epilogue nodes into COMPUTE_EPILOGUE subgraphs,
         # redirecting their stores to variable assignments.
         num_ce = self._tlx_get_compute_epilogue_count()
+        compute_epilogue_nodes = (
+            ()
+            if getattr(self, "_tlx_reduction_epilogue_plan", None) is not None
+            else epilogue_nodes
+        )
         for i in range(num_ce):
             subgraph_name = self._get_compute_epilogue_subgraph_name(i)
             result_name = getattr(
@@ -3347,7 +3354,7 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
 
                 self.store = _redirect_store  # type: ignore[method-assign]
                 try:
-                    for node in epilogue_nodes:
+                    for node in compute_epilogue_nodes:
                         node.codegen(self.split_and_set_ranges(node.get_ranges()))
                 finally:
                     self.store = orig_store  # type: ignore[method-assign]
@@ -3381,6 +3388,7 @@ _orig_render = TritonTemplateKernel.render
 
 
 def _tlx_render(self, template, kwargs, record_input_dependent_tracked_event=False):  # type: ignore[no-untyped-def]
+    kwargs = {**kwargs, "TLX_REDUCTION_EPILOGUE": getattr(self, "_tlx_reduction_epilogue_plan", None) is not None}
     # Register the paired prefetch hook for templates that expose a drain
     # boundary. It remains a no-op unless the config knob and eligibility both
     # permit moving a load.
@@ -3591,10 +3599,6 @@ def _tlx_create_kernel_choices(self, kernel_features, kernel_args, kernel_kwargs
 TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ignore[method-assign]
 
 
-# Register graph-level GEMM + normalization rewrites when callers import the
-# TLX integration before compilation.
-from .gemm_rmsnorm_gfx950 import register_gemm_rmsnorm_pattern
-from .gemm_layernorm_gfx950 import register_gemm_layernorm_pattern
+from .reduction_epilogue import install as install_reduction_epilogue
 
-register_gemm_rmsnorm_pattern()
-register_gemm_layernorm_pattern()
+install_reduction_epilogue()
