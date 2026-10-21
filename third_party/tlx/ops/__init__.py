@@ -20,21 +20,21 @@ choosing another space. `mm` and `addmm` also accept `out=` for implementations
 that support a preallocated output.
 
 `space=` defaults to "heuristic" -- a single config chosen analytically -- for
-any op that offers one, so that a first call stays interactive. The exception
-is `mm` on sm90, whose full space is only 8 configs; it defaults to "full".
-Measured on
-B200, `mm` at `space="full"` takes 221-285s on a cold Triton cache (348 configs
-compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
-tens of GB of autotune workspaces; at "heuristic" the same call is under a
-second. On implementations that provide it, pass `space="full"` explicitly to
-buy back the tuned configs, which are worth up to ~4x on small shapes. The
+most ops that offer one, so that a first call stays interactive. `mm` on sm90
+and sm100 defaults to "full" instead: sm90's full space is only 8 configs, and
+on sm100 the tuned configs are worth up to ~4x on small shapes and beat the
+heuristic on skinny, long-K shapes. The cost on sm100 is the first call per
+shape: on B200, `mm` at `space="full"` takes 221-285s on a cold Triton cache
+(348 configs compiled and benchmarked for a 1024x1024x1024 product) and also
+accumulates tens of GB of autotune workspaces; at "heuristic" the same call is
+under a second. Pass `space="heuristic"` explicitly for a fast first call. The
 gfx950 implementation currently provides only `"heuristic"`.
 
 Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
-ship a bad config. Each needs its own `heuristic_config` before it can follow
-`mm`. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
+ship a bad config. Each needs its own `heuristic_config` before it can offer a
+fast first call. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
 configs are measurably faster; pass `space="heuristic"` for a fast first call.
 `hstu_cross_attn` on gfx950 defaults to "curated": at head dims 64 and 128 it
 tunes eight forward configs picked from its 144-config "full" grid, which come
@@ -79,8 +79,9 @@ def mm(a, b, *, out=None, space=None):
 
     This op is currently forward-only.
 
-    `space=None` uses the implementation's default: "full" on sm90, otherwise
-    a single analytically chosen config so the first call stays interactive.
+    `space=None` uses the implementation's default: "full" on sm90 and sm100,
+    otherwise a single analytically chosen config so the first call stays
+    interactive. Pass `space="heuristic"` for a fast first call on sm100.
     Pass `space="full"` to implementations that expose a full autotune space;
     unsupported spaces raise `InvalidInput`. See the module docstring.
     """
