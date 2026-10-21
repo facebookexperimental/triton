@@ -22,30 +22,34 @@ apply to operation semantics, not kernel patterns.
 
 ## SSA refinement contract
 
-Use `refine(values; predicates)` below as notation for a typed IR operation.
-Each result has the same type as its corresponding input. Predicates use typed
-expressions over operand positions. Integer width, comparison signedness, and
-division rounding are explicit. Strings are not a predicate representation.
+Use `refine(value, bounds...; predicates)` below as notation for a typed IR
+operation. Each operation has exactly one result, with the same type as its
+value input. Additional SSA operands supply values referenced by the predicates.
+Predicates use typed expressions over operand positions. Integer width,
+comparison signedness, and division rounding are explicit. Strings are not a
+predicate representation.
 
-If all predicates hold on defined inputs, the results equal their corresponding
-inputs. If a predicate is false, all results are poison. Poison inputs cannot
-produce defined results. Evaluation of an unused refinement does not cause
+If all predicates hold on defined inputs, the result equals the value input.
+If a predicate is false, the result is poison. Poison inputs cannot produce a
+defined result. Evaluation of an unused refinement does not cause
 immediate undefined behavior.
 
-Facts constrain the results. They do not constrain the original inputs or
+Facts constrain the result. They do not constrain the original inputs or
 sibling uses. Analysis conclusions apply when the values that support the
 proof are non-poison. A `freeze` operation cannot retain predicates that hold
 only for non-poison refinement results.
 
-A refinement can return several values:
+A relational predicate can reference an unchanged bound operand:
 
 ```text
-(x1, limit1) = refine(x, limit; 0 <= x < limit)
+x1 = refine(x, limit; 0 <= x < limit)
 ```
 
-The relation becomes `0 <= x1 < limit1`. It must not become a global constraint
-on `x` or `limit`. Return all operands needed by a relation as one bundle.
-Instantiate the relation over that bundle's results, without cyclic SSA uses.
+The relation becomes `0 <= x1 < limit`. It is conditional on `x1` being
+non-poison. It must not become a global constraint on `x` or `limit`. Replace
+only the value input with the result when instantiating the predicate; bound
+operands retain their SSA identity. A separate refinement is required to give
+another value its own refined result.
 
 The verifier checks types, operand references, predicate structure, and result
 arity. It does not prove predicates by inspecting producers or control flow.
@@ -59,17 +63,17 @@ the new operation's inputs from use replacement.
 
 ### Branches
 
-For a scalar branch on `x < limit`, refine the operands at the true successor's
-entry. At the false successor, use the negated comparison with the same integer
-interpretation. Rewrite only uses dominated by the refinement.
+For a scalar branch on `x < limit`, refine the constrained value at the true
+successor's entry. At the false successor, use the negated comparison with the
+same integer interpretation. Rewrite only uses dominated by the refinement.
 
 ```text
 if x < limit:
-    (x1, limit1) = refine(x, limit; x < limit)
-    consume(x1, limit1)
+    x1 = refine(x, limit; x < limit)
+    consume(x1, limit)
 else:
-    (x2, limit2) = refine(x, limit; x >= limit)
-    consume(x2, limit2)
+    x2 = refine(x, limit; x >= limit)
+    consume(x2, limit)
 ```
 
 A successor with other incoming edges cannot use one predecessor's predicate
@@ -120,7 +124,7 @@ its removal or preserves its execution constraint.
 
 ### Placement and repeated execution
 
-Reuse a refinement bundle when its operands and predicates already express the
+Reuse a refinement operation when its operands and predicates already express the
 required facts. Repeated execution must converge from IR structure. Do not add
 processed markers or pass-history attributes.
 
@@ -141,7 +145,7 @@ The analysis combines these components. Each component can refine the others.
 
 Represent exact constants separately from unknown facts. Distinguish an
 uninitialized state from a state with no useful bounds. An inconsistent
-refinement means its results cannot be non-poison; it does not make the
+refinement means its result cannot be non-poison; it does not make the
 enclosing block unreachable or justify facts about unrelated values.
 
 Expression nodes are shared and typed. Preserve variable products and divisors
