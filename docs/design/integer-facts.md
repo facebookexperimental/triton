@@ -339,6 +339,12 @@ arithmetic definitions. A proof budget exhausted by intermediate bounds yields
 unknown, not permission to narrow. Bound positive scaling and constraint
 combinations separately from the number of stored relations.
 
+Keep polynomial terms in sorted, bounded storage. Cache a term's numeric range
+only within a local proof whose input ranges are fixed. A dataflow transfer must
+not reuse this cache after its input facts change. For `Q` bounded polynomial
+probes with at most `T` terms each, the cache has at most `Q*T` entries. This
+avoids repeated wide-integer products and divisions without reducing precision.
+
 The pre-pass must also account for inserted operands and rewritten uses. A
 scope can refine many values, and nested scopes can multiply that work. Group
 use replacement by value and scope rather than rescanning the full function
