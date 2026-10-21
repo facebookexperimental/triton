@@ -96,13 +96,20 @@ RAN = ("success", "failure", "cancelled")
 #: A job that ran on no push for this long is retired (disabled or removed), and its failures no longer count.
 RETIRE_DAYS = 7
 
+#: Workflows whose runs hold GPU jobs.
+GPU_RUN_WORKFLOWS = ("gpu-tests.yml", "gpu-tests-nightly.yml")
+
 
 def gpu_of(run, job):
-    """The GPU a job ran on, from its "h100 / " name prefix."""
-    if run.get("wf") != "gpu-tests.yml":
+    """The GPU a job ran on, from the calling job's name: "h100 / ..." in gpu-tests.yml, which calls one workflow per
+    GPU, or a matrix value as in "tritonbench (h100) / ..." in gpu-tests-nightly.yml."""
+    if run.get("wf") not in GPU_RUN_WORKFLOWS:
         return None
     prefix, sep, _ = job["name"].partition(" / ")
-    return GPU_PREFIX.get(prefix) if sep else None
+    if not sep:
+        return None
+    m = re.fullmatch(r"[\w-]+ \((\w+)\)", prefix)
+    return GPU_PREFIX.get(m.group(1) if m else prefix)
 
 
 def job_key(name):
@@ -408,7 +415,32 @@ def nightly_view(runs, asof, bench):
                     e["n_faster"], "signature": e.get("signature"), "unconfirmed": e.get("unconfirmed"), "range":
                     night.get("range"), "compare": night.get("compare"), "suspects": e.get("suspects", [])[:3]
                 })
-    return {"release": release, "perf": perf}
+    return {"release": release, "perf": perf, "gpu": gpu_nightly_view(runs, asof)}
+
+
+def gpu_nightly_view(runs, asof):
+    """The latest gpu-tests-nightly.yml run per GPU: result and failing tests; and passes over the last 7 days."""
+    nights = sorted((r for r in runs if r.get("wf") == "gpu-tests-nightly.yml" and r.get("status") == "completed"
+                     and r.get("jobs") is not None and r["created_at"] <= asof), key=lambda r: r["created_at"])
+    week_ago = iso(t(asof) - dt.timedelta(days=7))
+    out = {}
+    for gpu in GPUS:
+        ran = [(r, j) for r in nights for g, j in _gpu_jobs(r) if g == gpu and j["conclusion"] in RAN]
+        if not ran:
+            continue
+        run, j = ran[-1]
+        fails = [{"id": f["id"], "msg": f["msg"], "step": s["name"]}
+                 for s in j["steps"]
+                 for f in s.get("failures") or []]
+        result = ("passed" if j["conclusion"] == "success" else
+                  "cancelled" if j["conclusion"] == "cancelled" else "setup" if setup_step(j) else "test")
+        week = [jj for r, jj in ran if r["created_at"] >= week_ago]
+        out[gpu] = {
+            "job": job_key(j["name"]), "result": result, "setup": setup_step(j), "fails": fails, "sha":
+            run.get("head_sha") or "", "t": run["created_at"], "url": run.get("url"), "passed_7":
+            sum(jj["conclusion"] == "success" for jj in week), "runs_7": len(week)
+        }
+    return out
 
 
 def _pct(xs, p):
@@ -419,7 +451,7 @@ def _pct(xs, p):
 def ops_view(runs, asof):
     now = t(asof)
     week_ago, two_weeks = iso(now - dt.timedelta(days=7)), iso(now - dt.timedelta(days=14))
-    gpu_runs = [r for r in runs if r.get("wf") == "gpu-tests.yml" and r["created_at"] <= asof and r.get("jobs")]
+    gpu_runs = [r for r in runs if r.get("wf") in GPU_RUN_WORKFLOWS and r["created_at"] <= asof and r.get("jobs")]
     days = [str((now - dt.timedelta(days=d)).date()) for d in range(13, -1, -1)]
     hours = {d: {"day": d, "passed": 0.0, "test": 0.0, "setup": 0.0, "cancelled": 0.0} for d in days}
     for r in gpu_runs:

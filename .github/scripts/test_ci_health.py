@@ -93,10 +93,11 @@ def test_collect_stores_completed_runs_with_jobs_and_keeps_cursor_at_running(tmp
     assert (tmp_path / "changed.txt").read_text().split() == [str(tmp_path / "runs-2026-10.jsonl.gz")]
 
 
-def test_collect_lists_gpu_tests_and_nightly_runs_only(tmp_path):
+def test_collect_lists_gpu_and_nightly_runs_only(tmp_path):
     _, api, _ = collect(tmp_path, {})
     listed = [c for c in api.calls if "/workflows/" in c]
-    assert {c.split("/workflows/")[1].split("/")[0] for c in listed} == {"gpu-tests.yml", "nightly-fbtriton.yml"}
+    assert {c.split("/workflows/")[1].split("/")[0]
+            for c in listed} == {"gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-fbtriton.yml"}
 
 
 def test_select_log_gives_the_runs_selection(tmp_path):

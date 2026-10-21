@@ -219,6 +219,53 @@ def test_each_tracked_branch_gets_its_own_tabs():
     assert [(p["pr"], p["whose"]) for p in page["main"]["pr"]] == [(2, "author")]
 
 
+def tb(gpu, *failing, setup=False, label="linux-gcp-b200"):
+    """A gpu-tests-nightly.yml TritonBench job, called from a job named after its GPU."""
+    if setup:
+        steps = [
+            step("Install prebuilt Triton", "failure"),
+            step(f"Run TritonBench tests on {gpu.upper()} GPU", "skipped")
+        ]
+    else:
+        steps = [
+            step(f"Run TritonBench tests on {gpu.upper()} GPU", "failure" if failing else "success",
+                 list(failing) if failing else None)
+        ]
+    return job(f"tritonbench ({gpu}) / {gpu}-tritonbench-test", *steps, label=label)
+
+
+def nightly(h, *jobs):
+    return run(
+        h,
+        [build_ok(), *jobs,
+         job("tritonbench (h100) / report / report", step("x", "success"), label="ubuntu-latest")], event="schedule",
+        wf="gpu-tests-nightly.yml")
+
+
+def test_gpu_of_reads_both_gpu_workflows():
+    assert r.gpu_of({"wf": "gpu-tests.yml"}, {"name": "b200 / b200-tlx-test"}) == "B200"
+    assert r.gpu_of({"wf": "gpu-tests-nightly.yml"},
+                    {"name": "tritonbench (mi350) / mi350-tritonbench-test"}) == "MI350"
+    assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "tritonbench (x) / x-tritonbench-test"}) is None
+    assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "build"}) is None
+    assert r.gpu_of({"wf": "nightly-fbtriton.yml"}, {"name": "h100 / x"}) is None
+
+
+def test_nightly_gpu_view_latest_result_and_week():
+    runs = [nightly(1, tb("h100", "gemm")), nightly(2, tb("h100"), tb("b200", setup=True))]
+    v = r.page_data(runs, stamp(23), {})["branches"]["main"]["nightly"]["gpu"]
+    assert v["H100"]["result"] == "passed" and (v["H100"]["passed_7"], v["H100"]["runs_7"]) == (1, 2)
+    assert v["B200"]["result"] == "setup" and v["B200"]["setup"] == "Install prebuilt Triton"
+    assert "MI350" not in v
+    first = r.gpu_nightly_view(runs[:1], stamp(23))["H100"]
+    assert first["result"] == "test" and [f["id"] for f in first["fails"]] == ["gemm"]
+
+
+def test_nightly_gpu_hours_count_in_ops():
+    day = r.ops_view([nightly(1, tb("h100"))], stamp(23))["gpu_hours"][-1]
+    assert day["passed"] == 0.2
+
+
 def test_gpu_hours_split_by_outcome_and_skip_cpu_jobs():
     setup = job("b200 / b200-tlx-test", step("Install prebuilt Triton", "failure"), minutes=30)
     runs = [

@@ -4,6 +4,9 @@
 the same wheel URL and SHA256 to `h100.yml`, `b200.yml`, and `mi350.yml`. Build and
 test checkouts use the same exact commit, including the merge commit for PRs.
 The GPU workflows are reusable test workflows; trigger the parent to run them.
+`workflows/gpu-tests-nightly.yml` runs suites too slow for PRs and pushes once a
+day and on demand: it builds the same wheel and runs TritonBench on H100, B200
+and MI350, filing nightly issues under the same platform workflow names.
 Fork PRs pass the wheel through GitHub artifacts and skip AWS and the S3 cache;
 their downloads are checksum-verified too.
 
@@ -68,7 +71,8 @@ LLVM bump branch's runs for its target. Four tabs, one owner each:
   keeps the push it first failed at. A step that was skipped or hit a setup
   failure has no result and does not count.
 - **Nightly & perf** (release and perf owners): the `nightly-fbtriton.yml`
-  release and the perf events from `/bench/`.
+  release, the latest `gpu-tests-nightly.yml` run per GPU (TritonBench), and
+  the perf events from `/bench/`.
 - **Pull requests** (PR author): the latest run of each PR, tagged *fails on
   <branch>* or *setup: CI* when the failure is not the author's.
 - **Operations** (CI maintainers): GPU hours, job durations, setup failures,
@@ -76,10 +80,10 @@ LLVM bump branch's runs for its target. Four tabs, one owner each:
   back to every suite, or skipped a GPU on a scheduled or manual run.
 
 `ci-health.yml` runs `scripts/ci_health.py collect` every three hours. It stores
-`gpu-tests.yml` and `nightly-fbtriton.yml` runs, with jobs and steps, on the
-`ci-health` release. For each failed GPU job it reads the failing tests from the
-job log, and from each `select` job log it reads the selection
-(`scripts/ci_health_logs.py`). `pages.yml` then runs
+`gpu-tests.yml`, `gpu-tests-nightly.yml` and `nightly-fbtriton.yml` runs, with
+jobs and steps, on the `ci-health` release. For each failed GPU job it reads
+the failing tests from the job log, and from each `select` job log it reads the
+selection (`scripts/ci_health_logs.py`). `pages.yml` then runs
 `ci_health.py render`, which computes `data.json` with
 `scripts/ci_health_rules.py`. The page is `scripts/ci_health_dashboard.html`.
 
