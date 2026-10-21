@@ -2,6 +2,7 @@
 
 
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 8, order = [1, 0]}>
+#shared1d = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #padded = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [256, 128]}>
 #smem = #ttg.shared_memory
 
@@ -25,6 +26,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %10 = ttg.memdesc_subslice %padded_indexed_explicit_alloc_shape [128, 96]  : !ttg.memdesc<256x128xf16, #padded, #smem, mutable> -> !ttg.memdesc<128x32xf16, #padded, #smem, mutable, 256x128>
     %padded_indexed_implicit_alloc_shape = ttg.memdesc_index %padded[%c0_i32] : !ttg.memdesc<1x256x128xf16, #padded, #smem, mutable> -> !ttg.memdesc<256x128xf16, #padded, #smem, mutable>
     %11 = ttg.memdesc_subslice %padded_indexed_implicit_alloc_shape [128, 96]  : !ttg.memdesc<256x128xf16, #padded, #smem, mutable> -> !ttg.memdesc<128x32xf16, #padded, #smem, mutable, 256x128>
+    tt.return
+  }
+
+  // CHECK-LABEL: memdesc_index_layout_rank_reduction
+  tt.func public @memdesc_index_layout_rank_reduction() {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<2x64xf16, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<2x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64xf16, #shared1d, #smem, mutable>
     tt.return
   }
 }

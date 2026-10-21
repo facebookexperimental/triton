@@ -179,8 +179,7 @@ std::pair<Value, AccessRange> findBufferAccess(Value a) {
     auto [alloc, parentAccess] = findBufferAccess(subslice.getSrc());
     if (!alloc)
       return {};
-    unsigned dim =
-        subslice.getSrc().getType().getRank() - 2 + subslice.getDim();
+    unsigned dim = subslice.getSliceDim();
     if (!parentAccess.ranges[dim])
       return {alloc, parentAccess};
     uint64_t start = parentAccess.ranges[dim]->start() + subslice.getOffset();

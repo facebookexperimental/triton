@@ -174,7 +174,8 @@ def TTI_ExperimentalGSanAtomicTensorAccessOp
 
 def TTI_ExperimentalGSanAtomicRMWOp
     : TTI_Op<"experimental_gsan_atomic_rmw",
-             [SameOperandsAndResultShape, SameOperandsAndResultEncoding,
+             [AtomicOpInterface, SameOperandsAndResultShape,
+              SameOperandsAndResultEncoding,
               TypesMatchWith<"ptr type matches value type", "val", "ptr",
                              "getPointerTypeSameShape($_self)">,
               TypesMatchWith<
@@ -195,7 +196,8 @@ def TTI_ExperimentalGSanAtomicRMWOp
 
 def TTI_ExperimentalGSanAtomicCASOp
     : TTI_Op<"experimental_gsan_atomic_cas",
-             [SameOperandsAndResultShape, SameOperandsAndResultEncoding,
+             [AtomicOpInterface, SameOperandsAndResultShape,
+              SameOperandsAndResultEncoding,
               TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
                              "getPointerTypeSameShape($_self)">,
               TypesMatchWith<"ptr type matches value type", "val", "ptr",

@@ -652,8 +652,8 @@ getTranspositionSelectors(SmallVector<std::pair<int, int>> &mixedTranspositions,
                           int bitwidth);
 
 DecomposedWarpConversion
-getWarpLayoutConvertDecomposition(RankedTensorType srcTy,
-                                  RankedTensorType dstTy, int bitwidth) {
+getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
+                                  const LinearLayout &dstLayout, int bitwidth) {
   // Two layouts, ll_src and ll_dst, representing the same tensor can be
   // viewed as surjections of GF(2) vector spaces:
   //
@@ -689,22 +689,15 @@ getWarpLayoutConvertDecomposition(RankedTensorType srcTy,
   // `pLane`. Finally, we determine any selectors needed for byte permute
   // instructions in place of `selp` instructions when packing registers.
 
-  // We remove any broadcasting in the register dimensions of the layouts before
-  // forming the permutation `P` as the components of the decomposition directly
-  // inform the number of emitted instructions, and leaving broadcasting in
-  // would unnecessarily inflate the count.
-  auto srcLayout = toLinearLayout(srcTy);
-  auto dstLayout = toLinearLayout(dstTy);
-  auto removeBroadcastSrc = actionRemoveBroadcastedRegs(srcLayout);
-  auto removeBroadcastDst = actionRemoveBroadcastedRegs(dstLayout);
-  srcLayout = removeBroadcastSrc.apply(srcLayout);
-  dstLayout = removeBroadcastDst.apply(dstLayout);
+  assert(actionRemoveBroadcastedRegs(srcLayout).isIdentity() &&
+         actionRemoveBroadcastedRegs(dstLayout).isIdentity() &&
+         "expected layouts without broadcasted registers");
 
   // We want to describe the conversion from `srcLayout` to `dstLayout` as a
   // permutation. Since this requires that each input dimension have the same
   // size in each of the layouts, we first pad the lane and register dimensions
   // with zero vectors if needed.
-  auto *ctx = srcTy.getContext();
+  auto *ctx = srcLayout.getInDimNames().begin()->getContext();
   StringAttr kReg = StringAttr::get(ctx, "register");
   StringAttr kLane = StringAttr::get(ctx, "lane");
 
@@ -720,26 +713,8 @@ getWarpLayoutConvertDecomposition(RankedTensorType srcTy,
   auto outDimNames = llvm::to_vector(srcLayout.getOutDimNames());
   auto S = srcLayout.sublayout(inDimNames, outDimNames);
   auto T = dstLayout.sublayout(inDimNames, outDimNames);
-  // Conditionally pad.
-  if (nSrcRegBases != nDstRegBases || nSrcLaneBases != nDstLaneBases) {
-    auto padWithZeros = [&](const LinearLayout &ll) {
-      auto newBases = ll.getBases();
-      auto padDim = [&](StringAttr dim, int dimSize) {
-        auto &dimBases = newBases[dim];
-        dimBases.reserve(dimSize);
-        for (int i = ll.getInDimSizeLog2(dim); i < dimSize; ++i)
-          dimBases.emplace_back(outDimNames.size(), 0);
-      };
-      padDim(kReg, nRegBases);
-      padDim(kLane, nLaneBases);
-      // Surjectivity is not expected in general since we do not consider
-      // the 'warp' and 'block' dimensions of the original layouts.
-      return LinearLayout(std::move(newBases), ll.getOutDims(),
-                          /*requireSurjective=*/false);
-    };
-    S = padWithZeros(S);
-    T = padWithZeros(T);
-  }
+  S = S.resizeInDim(kReg, 1 << nRegBases).resizeInDim(kLane, 1 << nLaneBases);
+  T = T.resizeInDim(kReg, 1 << nRegBases).resizeInDim(kLane, 1 << nLaneBases);
 
   // We compute T^transpose \circ S, which serves as a skeleton for `P`, then
   // fill in zero columns, prioritizing producing fixed points. As we only need
@@ -1395,11 +1370,8 @@ bool supportMMA(Value value, int version) {
 // distributed shared memory. If it's also the identity on kWarp, we can
 // transfer via warp-shuffles, and if it's the identity on kLane just have to
 // reorder the registers.
-LinearLayout minimalCvtLayout(Type srcTy_, Type dstTy_) {
-  auto srcTy = cast<triton::gpu::TensorOrMemDesc>(srcTy_);
-  auto dstTy = cast<triton::gpu::TensorOrMemDesc>(dstTy_);
-  LinearLayout srcLayout = toLinearLayout(srcTy);
-  LinearLayout dstLayout = toLinearLayout(dstTy);
+LinearLayout minimalCvtLayout(const LinearLayout &srcLayout,
+                              const LinearLayout &dstLayout) {
   auto sDims = to_vector(srcLayout.getInDimNames());
   auto dDims = to_vector(dstLayout.getInDimNames());
   SmallVector<StringAttr> dims;
@@ -1422,6 +1394,12 @@ LinearLayout minimalCvtLayout(Type srcTy_, Type dstTy_) {
     comp = *quotient;
   }
   return comp;
+}
+
+LinearLayout minimalCvtLayout(Type srcTy_, Type dstTy_) {
+  auto srcTy = cast<triton::gpu::TensorOrMemDesc>(srcTy_);
+  auto dstTy = cast<triton::gpu::TensorOrMemDesc>(dstTy_);
+  return minimalCvtLayout(toLinearLayout(srcTy), toLinearLayout(dstTy));
 }
 
 static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
@@ -1463,7 +1441,9 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
   auto kLane = StringAttr::get(ctx, "lane");
   if (to_vector(layout.getOutDimNames()) ==
       SmallVector<StringAttr, 2>{kRegister, kLane}) {
-    auto factors = getWarpLayoutConvertDecomposition(srcTy, dstTy, 32);
+    auto srcLayout = toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
+    auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
+    auto factors = getWarpLayoutConvertDecomposition(srcLayout, dstLayout, 32);
     return (factors.mixedTranspositions.size() < 2);
   }
   return false;

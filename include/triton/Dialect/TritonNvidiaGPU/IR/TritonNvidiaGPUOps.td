@@ -1390,8 +1390,9 @@ def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure, MemDescViewTrait]> {
   let description = [{
     This operation takes a subslice of a tensor memory allocation and returns a
     new descriptor containing the address and a view of the subslice.
-    This is similar to ttg.memdesc_subslice and can slice either of the trailing
-    two tensor-memory dimensions, including non-contiguous views within a CTA.
+    This is similar to ttg.memdesc_subslice and can slice either physical-layout
+    dimension or the leading pipeline dimension of an ordinary descriptor. Scale
+    descriptors support their two physical-layout dimensions.
   }];
   let arguments = (ins TTG_MemDescType:$src, I32Attr:$offset,
                        DefaultValuedAttr<I32Attr, "1">:$dim);
@@ -1406,6 +1407,9 @@ def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure, MemDescViewTrait]> {
     ];
   let results = (outs TTG_MemDescType:$result);
   let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    int64_t getSliceDim();
+  }];
 }
 
 def TTNG_TMEMCopyOp : TTNG_Op<"tmem_copy"> {

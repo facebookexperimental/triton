@@ -308,7 +308,8 @@ def TT_StoreOp
 //
 def TT_AtomicRMWOp
     : TT_Op<"atomic_rmw",
-            [SameOperandsAndResultShape, SameOperandsAndResultEncoding,
+            [AtomicOpInterface, SameOperandsAndResultShape,
+             SameOperandsAndResultEncoding,
              DeclareOpInterfaceMethods<PredicatedOpInterface>,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
                             "getPointerTypeSameShape($_self)">,
@@ -341,7 +342,8 @@ def TT_AtomicRMWOp
 
 def TT_AtomicCASOp
     : TT_Op<"atomic_cas",
-            [SameOperandsAndResultShape, SameOperandsAndResultEncoding,
+            [AtomicOpInterface, SameOperandsAndResultShape,
+             SameOperandsAndResultEncoding,
              TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
