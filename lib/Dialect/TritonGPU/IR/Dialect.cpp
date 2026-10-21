@@ -1608,7 +1608,7 @@ Attribute AMDMfmaEncodingAttr::parse(AsmParser &parser, Type type) {
     return {};
 
   if (tilesPerWarp.empty())
-    tilesPerWarp = SmallVector<unsigned>(instrShape.size(), 1);
+    tilesPerWarp = SmallVector<unsigned>(warpsPerCTA.size(), 1);
 
   return parser.getChecked<AMDMfmaEncodingAttr>(
       parser.getContext(), version, warpsPerCTA, instrShape, isTransposed,
@@ -3875,7 +3875,8 @@ struct TritonGPUVerifyTensorLayoutInterface
       return true;
     return isa<triton::MakeRangeOp, triton::SplatOp, triton::BroadcastOp,
                triton::LoadOp, triton::StoreOp, triton::JoinOp, triton::SplitOp,
-               triton::gpu::ConvertLayoutOp, triton::gpu::Fp4ToFpOp,
+               triton::gpu::ConvertLayoutOp, triton::gpu::RequireLayoutOp,
+               triton::gpu::ReleaseLayoutOp, triton::gpu::Fp4ToFpOp,
                triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(op);
   }
 
