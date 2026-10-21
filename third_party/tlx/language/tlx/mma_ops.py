@@ -134,23 +134,38 @@ def amd_scheduled_mfma(
 
     Unlike ``tl.dot``, which represents one logical matrix product and carries
     no accumulator-lifetime or register-class contract, this operation exposes
-    independent native fragment chains in source order. A ``tl.dot`` result can
-    still remain live across phases through ordinary SSA uses; its backend
-    lowering infers that lifetime instead of receiving an explicit role.
+    independent native fragment chains in source order.
 
-    ``accumulator_role`` controls the lowering contract, not the numerical
-    operation. ``"transient"`` describes a phase-local chain: default storage
-    selects VGPRs and lowering uses ROCDL MFMA intrinsics so LLVM can model
-    instruction latency and hazards. ``"persistent"`` describes a chain
-    carried across phases and lowering uses register-constrained inline
-    assembly; default storage selects AGPRs on every target. An explicit
-    ``accumulator_register_class`` overrides that default, allowing two
-    persistent accumulator sets to occupy complementary register files.
+    With ``initialize=False``, computes ``acc + a @ b`` over native fragments.
+    The operation keeps one SSA chain per output fragment and creates updates
+    in K-major, N-major, M-minor order. LLVM may reschedule independent updates
+    on the transient intrinsic path. With ``initialize=True``, the first native
+    K update starts from zero and the result is ``a @ b``; the supplied
+    accumulator value is ignored.
 
-    On CDNA3 the compiler-generated AGPR read is not ordered against the MFMA
-    drain, so AGPR accumulators are rejected there and a ``"persistent"`` chain
-    must pass ``accumulator_register_class="vgpr"``; the default is an error
-    rather than a silent downgrade.
+    ``accumulator_role`` changes lowering, not the numerical operation.
+    ``"transient"`` describes a phase-local chain and uses LLVM-visible MFMA
+    intrinsics. ``"persistent"`` describes a chain carried across phases and
+    uses register-constrained inline assembly. Because LLVM cannot model an
+    MFMA hidden in inline assembly, that path adds target-specific input and
+    result wait padding. On the persistent path,
+    ``resident_operand=0`` or ``1`` selects the left or right input for AGPR
+    placement, and ``accumulator_register_class`` may select ``"agpr"`` or
+    ``"vgpr"``. Persistent ``auto`` selects AGPRs. The transient intrinsic path
+    does not apply these class constraints and leaves physical placement to
+    LLVM; use :func:`amd_register_resident` for a hard source residency point.
+
+    The compiler recognizes eligible persistent AGPR accumulator chains ending
+    at ``amd_mfma_commit``. After scheduling and physical register assignment,
+    it repairs source and EXEC hazards and drains outstanding results before
+    any physical AGPR read or overwrite. Unknown dataflow and VGPR accumulators
+    retain conservative waits.
+
+    CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
+    ``accumulator_register_class="vgpr"``. The inputs must be matching rank-two
+    BF16 or F16 dot operands with ``kWidth`` 4 or 8, the accumulator must be
+    rank-two F32 with the corresponding unit-tile MFMA layout, and all active
+    lanes of a wave must execute the operation uniformly.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
