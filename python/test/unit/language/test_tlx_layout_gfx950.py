@@ -1,6 +1,8 @@
 """TLX layout tests -- CDNA4 (gfx950)."""
 import math
 import re
+import importlib.util
+from pathlib import Path
 
 import pytest
 import torch
@@ -11,8 +13,48 @@ import triton.language.extra.tlx as tlx
 from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
 from triton.tlx.ops.kernels.flash_attn.gfx950 import _sum_rows_chain4 as _cluster_sum_rows_chain4
+from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import matmul_kernel_warp_pipeline
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+@pytest.fixture(scope="module")
+def split_k_tutorial():
+    path = Path(__file__).resolve().parents[3] / "tutorials" / "12-split-k-matmul.py"
+    spec = importlib.util.spec_from_file_location("split_k_tutorial_test", path)
+    tutorial = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tutorial)
+    for kernel in vars(tutorial).values():
+        if isinstance(kernel, triton.runtime.Autotuner):
+            kernel.configs = kernel.configs[:1]
+    return tutorial
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("method", ["stock_triton_matmul", "skinny_atomic_matmul", "skinny_twopass_matmul"])
+@pytest.mark.parametrize("m,n", [(64, 96), (288, 160), (0, 32), (32, 0)])
+def test_split_k_grouped_coordinates(split_k_tutorial, method, m, n):
+    a = torch.randn((m, 256), device=DEVICE, dtype=torch.float16) * 0.2
+    b = torch.randn((256, n), device=DEVICE, dtype=torch.float16) * 0.2
+    output = getattr(split_k_tutorial, method)(a, b)
+    torch.testing.assert_close(output, a @ b, atol=0.015, rtol=0.015)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("m,n", [(256, 256), (768, 1280), (0, 256), (256, 0), (-1, 256)])
+def test_grouped_gemm_ignores_outside_tiles(m, n):
+    k = 256
+    a = torch.randn((max(m, 1), k), device=DEVICE, dtype=torch.float16) * 0.2
+    b = torch.randn((k, max(n, 1)), device=DEVICE, dtype=torch.float16) * 0.2
+    output = torch.zeros((max(m, 1), max(n, 1)), device=DEVICE, dtype=torch.float16)
+    tiles = triton.cdiv(max(m, 0), 256) * triton.cdiv(max(n, 0), 256)
+    matmul_kernel_warp_pipeline[(tiles + 3, )](a, b, output, m, n, k,
+                                               a.stride(0), a.stride(1), b.stride(0), b.stride(1), output.stride(0),
+                                               output.stride(1), BLOCK_M=256, BLOCK_N=256, BLOCK_K=64, GROUP_M=4,
+                                               NUM_BUFFERS=2, NUM_XCDS=3, XCD_CHUNK=5, num_warps=8, num_stages=1,
+                                               matrix_instr_nonkdim=16)
+    expected = a @ b if m > 0 and n > 0 else torch.zeros_like(output)
+    torch.testing.assert_close(output, expected, atol=0.015, rtol=0.015)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
