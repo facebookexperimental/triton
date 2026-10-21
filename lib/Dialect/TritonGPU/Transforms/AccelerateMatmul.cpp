@@ -21,6 +21,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
@@ -1134,6 +1135,31 @@ static void decomposeMixedModeDotOp(ModuleOp mod, int computeCapability) {
   });
 }
 
+// Under TRITON_ALLOW_NPOT, no NVIDIA lowering has a plan for a tt.dot whose
+// result M or N is not a power of two (MMAv3 asserts or aborts later; MMAv5,
+// MMAv2 and FMA fail to legalize it), so reject it by name before any rewrite.
+constexpr llvm::StringLiteral kNpotNvidiaDotResultExtent =
+    "NPOT NVIDIA dot: no MMA or FMA lowering admits a result M or N extent "
+    "that is not a power of two";
+
+static bool rejectNpotNvidiaDotResults(ModuleOp m) {
+  if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+    return false;
+  bool rejected = false;
+  m.walk([&](DotOp op) {
+    RankedTensorType retType = op.getType();
+    if (!retType.getEncoding() ||
+        isa<NvidiaMmaEncodingAttr>(retType.getEncoding()))
+      return;
+    if (llvm::all_of(retType.getShape().take_back(2),
+                     [](int64_t d) { return llvm::isPowerOf2_64(d); }))
+      return;
+    op->emitError(kNpotNvidiaDotResultExtent);
+    rejected = true;
+  });
+  return rejected;
+}
+
 // Transpose scaled_dot ops that have a scale on lhs.
 static void transposeDotOp(DotScaledOp dotOp) {
   // two_ctas means the CTA pair splits M, so it cannot be carried across a
@@ -1188,6 +1214,8 @@ public:
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
+    if (rejectNpotNvidiaDotResults(m))
+      return signalPassFailure();
 
     auto computeCapability = getNVIDIAComputeCapability(m);
     // We could do this generically if we manage to improve the heuristics
