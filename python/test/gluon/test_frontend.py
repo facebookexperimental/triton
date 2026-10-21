@@ -289,7 +289,9 @@ def test_nvmma_layout_rank_mangling():
 
 @gluon.jit
 def anchor_tmem_linear_layout(ll: ttgl.constexpr):
-    pass
+    # Side-effecting body keeps both specializations alive in the parsed
+    # module (an empty body gets eliminated); cf. allocate_with_nvmma_layout.
+    ttgl.barrier()
 
 
 @gluon.jit
@@ -307,8 +309,10 @@ def test_tmem_linear_layout_mangling():
     module = run_parser(tmem_linear_layout_kernel, target=BLACKWELL_TARGET)
     module_text = module.str_nodebug()
 
-    specializations = re.findall(r'tt\.func private @"?test_frontend\.anchor_tmem_linear_layout', module_text)
+    specializations = re.findall(
+        r'tt\.func private @"([^"]*test_frontend\.anchor_tmem_linear_layout[^"]*)"', module_text)
     assert len(specializations) == 2
+    assert len(set(specializations)) == 2
 
 
 @filecheck_test
