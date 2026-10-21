@@ -98,7 +98,8 @@ static std::optional<uint32_t> getTMemBaseAddress(Value value) {
              (static_cast<uint32_t>(row.getInt()) << 16);
     }
     if (auto slice = dyn_cast<TMEMSubSliceOp>(defOp)) {
-      offset += getTMemSubSliceOffset(slice.getSrc().getType(), slice.getN());
+      offset += getTMemSubSliceOffset(slice.getSrc().getType(),
+                                      slice.getOffset(), slice.getDim());
       value = slice.getSrc();
       continue;
     }
@@ -331,11 +332,8 @@ static void appendRootAllocs(Value value, SmallVectorImpl<RootAlloc> &allocs,
     } else if (auto slice = dyn_cast<TMEMSubSliceOp>(defOp)) {
       // getTMemSubSliceOffset packs the column offset in the low 16 bits and
       // the row offset in the high 16 bits, as TMEMSubSliceOpConversion does.
-      // This tree's tmem_subslice predates upstream's (offset, dim) form: it
-      // carries a single $N and can only slice the inner (column) dimension,
-      // which is exactly upstream's dim=1 default.
-      uint32_t packed =
-          getTMemSubSliceOffset(slice.getSrc().getType(), slice.getN());
+      uint32_t packed = getTMemSubSliceOffset(
+          slice.getSrc().getType(), slice.getOffset(), slice.getDim());
       TMemViewOffset next = offset;
       next.col += packed & 0xffff;
       next.row += packed >> 16;
