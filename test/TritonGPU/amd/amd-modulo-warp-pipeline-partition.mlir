@@ -1,5 +1,8 @@
 // RUN: env TRITON_ENABLE_AMD_MODULO=1 triton-opt %s -split-input-file \
-// RUN:   -tritonamdgpu-dot-decompose-and-schedule 2>&1 | FileCheck %s
+// RUN:   -tritonamdgpu-dot-decompose-and-schedule | FileCheck %s
+// RUN: env TRITON_ENABLE_AMD_MODULO=1 triton-opt %s -split-input-file \
+// RUN:   -tritonamdgpu-dot-decompose-and-schedule -o /dev/null 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=REMARK
 //
 // Steps 4.7 + 4.8: AMD warp-pipeline cluster partitioning and s_setprio
 // derivation.
@@ -7,8 +10,8 @@
 // Test 1: Two pipelines (LDS + MFMA).
 // A minimal GEMM loop with LDS local_loads feeding a dot.
 //
-// CHECK-DAG: remark: amd-modulo: DDG {{[0-9]+}} nodes MFMA={{[0-9]+}} LDS={{[0-9]+}}{{.*}}clusters=
-// CHECK-DAG: remark: amd-modulo: DDG {{[0-9]+}} nodes{{.*}}GLOBAL={{[1-9]}}{{.*}}clusters=
+// REMARK-DAG: remark: amd-modulo: DDG {{[0-9]+}} nodes MFMA={{[0-9]+}} LDS={{[0-9]+}}{{.*}}clusters=
+// REMARK-DAG: remark: amd-modulo: DDG {{[0-9]+}} nodes{{.*}}GLOBAL={{[1-9]}}{{.*}}clusters=
 // Step 4.7/4.8 annotate each op with its cluster ID and derived s_setprio: the
 // LDS local_loads and the MFMA dot land in different clusters.
 // CHECK:      ttg.local_load {{.*}}ttg.warp_pipeline_cluster = {{[0-9]+}}{{.*}}ttg.warp_pipeline_priority = {{[0-9]+}}
@@ -103,8 +106,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 //
 // With a single active pipeline there is no warp-pipelining: the remark reports
 // clusters=1(no-warp-pipeline) and no cluster/priority attributes are emitted.
-// CHECK: remark: amd-modulo: DDG {{[0-9]+}} nodes MFMA=1 LDS=0 GLOBAL=0
-// CHECK-SAME: clusters=1(no-warp-pipeline)
+// REMARK: remark: amd-modulo: DDG {{[0-9]+}} nodes MFMA=1 LDS=0 GLOBAL=0
+// REMARK-SAME: clusters=1(no-warp-pipeline)
 
 #mma3 = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0_3 = #ttg.dot_op<{opIdx = 0, parent = #mma3, kWidth = 8}>
