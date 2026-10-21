@@ -1,20 +1,296 @@
 #include "triton/Analysis/IntegerRange.h"
 #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/Utils/InferIntRangeCommon.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/Support/DebugLog.h"
 #include <array>
 #include <limits>
 
 using namespace mlir;
 using namespace mlir::triton;
 
+#define DEBUG_TYPE "triton-integer-facts"
+
 namespace {
+
+struct IntegerBound {
+  Value value;
+  arith::CmpIPredicate predicate;
+  bool operator==(const IntegerBound &other) const {
+    return value == other.value && predicate == other.predicate;
+  }
+};
+
+struct IntegerFacts {
+  SmallVector<IntegerBound, 4> bounds;
+  // Modulus zero denotes an exact bit pattern; one denotes no congruence.
+  std::optional<std::pair<APInt, APInt>> congruence;
+
+  bool operator==(const IntegerFacts &other) const {
+    return bounds == other.bounds && congruence == other.congruence;
+  }
+
+  static IntegerFacts unknown(Value value) {
+    unsigned width =
+        std::max(1u, ConstantIntRanges::getStorageBitwidth(value.getType()));
+    return {{},
+            std::make_pair(APInt(2 * width + 2, 1), APInt(2 * width + 2, 0))};
+  }
+
+  static IntegerFacts join(const IntegerFacts &a, const IntegerFacts &b) {
+    if (!a.congruence)
+      return b;
+    if (!b.congruence)
+      return a;
+    const auto &[am, ar] = *a.congruence;
+    const auto &[bm, br] = *b.congruence;
+    APInt delta = ar.uge(br) ? ar - br : br - ar;
+    APInt modulus = llvm::APIntOps::GreatestCommonDivisor(
+        llvm::APIntOps::GreatestCommonDivisor(am, bm), delta);
+    IntegerFacts result{
+        {}, std::make_pair(modulus, modulus.isZero() ? ar : ar.urem(modulus))};
+    for (IntegerBound bound : a.bounds)
+      if (llvm::is_contained(b.bounds, bound))
+        result.bounds.push_back(bound);
+    return result;
+  }
+
+  void print(raw_ostream &os) const {
+    if (!congruence) {
+      os << "uninitialized";
+      return;
+    }
+    os << "modulus=" << congruence->first << ", residue=" << congruence->second;
+  }
+};
+
+class IntegerFactsLattice : public dataflow::Lattice<IntegerFacts> {
+public:
+  using Lattice::Lattice;
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IntegerFactsLattice)
+};
+
+static Value stripRefinements(Value value) {
+  while (auto refine = value.getDefiningOp<RefineOp>())
+    value = refine.getValue();
+  return value;
+}
+
+class IntegerFactsAnalysis final
+    : public dataflow::SparseForwardDataFlowAnalysis<IntegerFactsLattice> {
+public:
+  using SparseForwardDataFlowAnalysis::SparseForwardDataFlowAnalysis;
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IntegerFactsAnalysis)
+
+  void setToEntryState(IntegerFactsLattice *lattice) override {
+    propagateIfChanged(
+        lattice, lattice->join(IntegerFacts::unknown(lattice->getAnchor())));
+  }
+
+  void visitNonControlFlowArguments(
+      Operation *op, const RegionSuccessor &successor, ValueRange inputs,
+      ArrayRef<IntegerFactsLattice *> lattices) override {
+    auto loop = dyn_cast<scf::ForOp>(op);
+    if (!loop || !isa<IntegerType>(loop.getInductionVar().getType())) {
+      SparseForwardDataFlowAnalysis::visitNonControlFlowArguments(
+          op, successor, inputs, lattices);
+      return;
+    }
+    const auto *lower = getLatticeElementFor(
+        getProgramPointBefore(loop.getBody()), loop.getLowerBound());
+    const auto *step = getLatticeElementFor(
+        getProgramPointBefore(loop.getBody()), loop.getStep());
+    if (!lower->getValue().congruence || !step->getValue().congruence)
+      return;
+    const auto &[lm, lr] = *lower->getValue().congruence;
+    const auto &[sm, sr] = *step->getValue().congruence;
+    unsigned bits =
+        cast<IntegerType>(loop.getInductionVar().getType()).getWidth();
+    APInt modulus = llvm::APIntOps::GreatestCommonDivisor(
+        llvm::APIntOps::GreatestCommonDivisor(lm, sm),
+        llvm::APIntOps::GreatestCommonDivisor(
+            sr, APInt::getOneBitSet(lm.getBitWidth(), bits)));
+    IntegerFacts facts{{}, std::make_pair(modulus, lr.urem(modulus))};
+    auto *iv = getLatticeElement(loop.getInductionVar());
+    propagateIfChanged(iv, iv->join(facts));
+  }
+
+  LogicalResult
+  visitOperation(Operation *op, ArrayRef<const IntegerFactsLattice *> operands,
+                 ArrayRef<IntegerFactsLattice *> results) override {
+    if (results.size() != 1) {
+      setAllToEntryStates(results);
+      return success();
+    }
+    Value result = op->getResult(0);
+    unsigned bits = ConstantIntRanges::getStorageBitwidth(result.getType());
+    if (!bits) {
+      setAllToEntryStates(results);
+      return success();
+    }
+    for (const auto *operand : operands)
+      if (!operand->getValue().congruence)
+        return success();
+    IntegerFacts facts = IntegerFacts::unknown(result);
+    APInt constant;
+    if (matchPattern(result, m_ConstantInt(&constant))) {
+      facts.congruence = {APInt(2 * bits + 2, 0), constant.zext(2 * bits + 2)};
+    } else if (auto refine = dyn_cast<RefineOp>(op)) {
+      facts = operands[0]->getValue();
+      if (refine.getPredicate() == arith::CmpIPredicate::eq &&
+          operands[1]->getValue().congruence->first.isZero())
+        facts.congruence = operands[1]->getValue().congruence;
+      IntegerBound bound{refine.getBound(), refine.getPredicate()};
+      // Keep a finite prefix. Existing relations cannot change order on
+      // revisit.
+      if (facts.bounds.size() < 8 && !llvm::is_contained(facts.bounds, bound))
+        facts.bounds.push_back(bound);
+      else if (!llvm::is_contained(facts.bounds, bound))
+        LDBG() << "Symbolic bound budget exhausted: " << *op;
+    } else if (isa<SplatOp, ExpandDimsOp, BroadcastOp, ReshapeOp, TransOp,
+                   triton::gpu::ConvertLayoutOp>(op)) {
+      facts.congruence = operands[0]->getValue().congruence;
+    } else if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(op)) {
+      const auto &[am, ar] = *operands[0]->getValue().congruence;
+      const auto &[bm, br] = *operands[1]->getValue().congruence;
+      APInt wrap = APInt::getOneBitSet(2 * bits + 2, bits);
+      APInt modulus = llvm::APIntOps::GreatestCommonDivisor(am, bm);
+      APInt residue = ar + br;
+      if (isa<arith::SubIOp>(op))
+        residue = ar + wrap - br;
+      if (isa<arith::MulIOp>(op)) {
+        modulus = llvm::APIntOps::GreatestCommonDivisor(
+            llvm::APIntOps::GreatestCommonDivisor(am * bm, am * br), bm * ar);
+        residue = ar * br;
+      }
+      if (!modulus.isZero())
+        modulus = llvm::APIntOps::GreatestCommonDivisor(modulus, wrap);
+      facts.congruence = {modulus,
+                          residue.urem(modulus.isZero() ? wrap : modulus)};
+    }
+    if (isa<arith::DivSIOp>(op)) {
+      const auto *lhs = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+          getProgramPointAfter(op), op->getOperand(0));
+      const auto *rhs = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+          getProgramPointAfter(op), op->getOperand(1));
+      if (lhs->getValue().isUninitialized() ||
+          rhs->getValue().isUninitialized())
+        return success();
+      if (lhs->getValue().getValue().smin().isNonNegative() &&
+          rhs->getValue().getValue().smin().isStrictlyPositive()) {
+        for (IntegerBound bound : operands[0]->getValue().bounds) {
+          if (bound.predicate != arith::CmpIPredicate::slt)
+            continue;
+          auto product =
+              stripRefinements(bound.value).getDefiningOp<arith::MulIOp>();
+          if (!product)
+            continue;
+          Value divisor = stripRefinements(op->getOperand(1));
+          Value factor;
+          if (stripRefinements(product.getLhs()) == divisor)
+            factor = product.getRhs();
+          else if (stripRefinements(product.getRhs()) == divisor)
+            factor = product.getLhs();
+          if (!factor)
+            continue;
+          const auto *a = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+              getProgramPointAfter(op), product.getLhs());
+          const auto *b = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+              getProgramPointAfter(op), product.getRhs());
+          if (a->getValue().isUninitialized() ||
+              b->getValue().isUninitialized())
+            return success();
+          bool noWrap = product.hasNoSignedWrap();
+          if (!noWrap) {
+            const ConstantIntRanges &ar = a->getValue().getValue();
+            const ConstantIntRanges &br = b->getValue().getValue();
+            noWrap = true;
+            for (const APInt &av : {ar.smin(), ar.smax()})
+              for (const APInt &bv : {br.smin(), br.smax()}) {
+                bool overflow;
+                (void)av.smul_ov(bv, overflow);
+                noWrap &= !overflow;
+              }
+          }
+          if (noWrap)
+            facts.bounds.push_back({factor, arith::CmpIPredicate::slt});
+        }
+      }
+    }
+    propagateIfChanged(results[0], results[0]->join(facts));
+    return success();
+  }
+};
+
+static ConstantIntRanges refineRange(arith::CmpIPredicate predicate,
+                                     const ConstantIntRanges &value,
+                                     const ConstantIntRanges &bound) {
+  using P = arith::CmpIPredicate;
+  bool isUnsigned = predicate == P::ult || predicate == P::ule ||
+                    predicate == P::ugt || predicate == P::uge;
+  APInt lo = isUnsigned ? value.umin() : value.smin();
+  APInt hi = isUnsigned ? value.umax() : value.smax();
+  APInt boundLo = isUnsigned ? bound.umin() : bound.smin();
+  APInt boundHi = isUnsigned ? bound.umax() : bound.smax();
+  auto less = [&](const APInt &a, const APInt &b) {
+    return isUnsigned ? a.ult(b) : a.slt(b);
+  };
+  auto setLower = [&](const APInt &v) {
+    if (less(lo, v))
+      lo = v;
+  };
+  auto setUpper = [&](const APInt &v) {
+    if (less(v, hi))
+      hi = v;
+  };
+  switch (predicate) {
+  case P::eq:
+    setLower(boundLo);
+    setUpper(boundHi);
+    break;
+  case P::slt:
+  case P::ult:
+    if (isUnsigned ? boundHi.isZero() : boundHi.isMinSignedValue())
+      return value;
+    setUpper(boundHi - 1);
+    break;
+  case P::sle:
+  case P::ule:
+    setUpper(boundHi);
+    break;
+  case P::sgt:
+  case P::ugt:
+    if (isUnsigned ? boundLo.isMaxValue() : boundLo.isMaxSignedValue())
+      return value;
+    setLower(boundLo + 1);
+    break;
+  case P::sge:
+  case P::uge:
+    setLower(boundLo);
+    break;
+  case P::ne:
+    if (boundLo == boundHi && lo != hi) {
+      if (lo == boundLo)
+        ++lo;
+      if (hi == boundHi)
+        --hi;
+    }
+    break;
+  }
+  // Contradictions poison this result; they do not make its block unreachable.
+  if (less(hi, lo))
+    return value;
+  ConstantIntRanges refined = isUnsigned
+                                  ? ConstantIntRanges::fromUnsigned(lo, hi)
+                                  : ConstantIntRanges::fromSigned(lo, hi);
+  return value.intersection(refined);
+}
 
 static ConstantIntRanges inferSignedDivRem(Operation *op,
                                            const ConstantIntRanges &lhs,
@@ -54,6 +330,13 @@ static bool inferTritonRanges(Operation *op,
                               ArrayRef<IntegerValueRange> operands,
                               SetIntLatticeFn setRange,
                               ArrayRef<int64_t> maxProgramIds) {
+  if (auto refine = dyn_cast<RefineOp>(op)) {
+    if (!operands[0].isUninitialized() && !operands[1].isUninitialized())
+      setRange(refine.getResult(),
+               refineRange(refine.getPredicate(), operands[0].getValue(),
+                           operands[1].getValue()));
+    return true;
+  }
   if (isa<arith::DivSIOp, arith::RemSIOp>(op)) {
     if (operands[0].isUninitialized() || operands[1].isUninitialized())
       return false;
@@ -104,7 +387,36 @@ public:
       ranges.push_back(operand->getValue());
     auto setRange = [&](Value value, const IntegerValueRange &range) {
       auto *lattice = results[cast<OpResult>(value).getResultNumber()];
-      propagateIfChanged(lattice, lattice->join(range));
+      const auto *facts =
+          getOrCreateFor<IntegerFactsLattice>(getProgramPointAfter(op), value);
+      if (!facts->getValue().congruence || range.isUninitialized())
+        return;
+      ConstantIntRanges refined = range.getValue();
+      const auto &[modulus, residue] = *facts->getValue().congruence;
+      if (modulus.isZero()) {
+        APInt exact = residue.trunc(refined.umin().getBitWidth());
+        if (exact.uge(refined.umin()) && exact.ule(refined.umax()) &&
+            exact.sge(refined.smin()) && exact.sle(refined.smax()))
+          refined = ConstantIntRanges::constant(exact);
+      } else if (!modulus.isOne()) {
+        APInt lo = refined.umin().zext(modulus.getBitWidth());
+        APInt hi = refined.umax().zext(modulus.getBitWidth());
+        lo += (residue + modulus - lo.urem(modulus)).urem(modulus);
+        APInt delta = (hi + modulus - residue).urem(modulus);
+        if (hi.uge(delta) && lo.ule(hi - delta))
+          refined = refined.intersection(ConstantIntRanges::fromUnsigned(
+              lo.trunc(refined.umin().getBitWidth()),
+              (hi - delta).trunc(refined.umin().getBitWidth())));
+      }
+      for (IntegerBound bound : facts->getValue().bounds) {
+        const auto *limit = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+            getProgramPointAfter(op), bound.value);
+        if (limit->getValue().isUninitialized())
+          return;
+        refined =
+            refineRange(bound.predicate, refined, limit->getValue().getValue());
+      }
+      propagateIfChanged(lattice, lattice->join(refined));
     };
     if (inferTritonRanges(op, ranges, setRange, maxProgramIds))
       return success();
@@ -116,98 +428,12 @@ private:
   std::array<int64_t, 3> maxProgramIds;
 };
 
-// Use-local refinement must not narrow the global SSA lattice.
-class RangeAtUse {
-public:
-  RangeAtUse(DataFlowSolver &solver, DominanceInfo &dominance,
-             const DenseMap<Value, SmallVector<LLVM::AssumeOp>> &assumptions,
-             Operation *use, ArrayRef<int64_t> maxProgramIds)
-      : solver(solver), dominance(dominance), assumptions(assumptions),
-        use(use), maxProgramIds(maxProgramIds) {}
-
-  IntegerValueRange get(Value value) {
-    SmallVector<std::pair<Value, bool>> pending{{value, false}};
-    while (!pending.empty()) {
-      auto [current, operandsReady] = pending.pop_back_val();
-      if (cache.contains(current))
-        continue;
-      if (Operation *definition = getDefinition(current);
-          !operandsReady && definition) {
-        pending.emplace_back(current, true);
-        for (Value operand : definition->getOperands())
-          if (!cache.contains(operand))
-            pending.emplace_back(operand, false);
-        continue;
-      }
-      cache.try_emplace(current, infer(current));
-    }
-    return cache.lookup(value);
-  }
-
-private:
-  static Operation *getDefinition(Value value) {
-    Operation *definition = value.getDefiningOp();
-    if (definition && definition->getNumRegions() == 0 &&
-        ConstantIntRanges::getStorageBitwidth(value.getType()) != 0)
-      return definition;
-    return nullptr;
-  }
-
-  IntegerValueRange infer(Value value) {
-    IntegerValueRange range = IntegerValueRange::getMaxRange(value);
-    if (const auto *lattice =
-            solver.lookupState<dataflow::IntegerValueRangeLattice>(value))
-      if (!lattice->getValue().isUninitialized())
-        range = lattice->getValue();
-
-    // Region results and block arguments use the solver's fixed point.
-    if (Operation *definition = getDefinition(value)) {
-      SmallVector<IntegerValueRange> operands;
-      for (Value operand : definition->getOperands())
-        operands.push_back(cache.lookup(operand));
-      auto setRange = [&](Value result, const IntegerValueRange &inferred) {
-        if (result == value && !inferred.isUninitialized())
-          range = inferred;
-      };
-      if (!inferTritonRanges(definition, operands, setRange, maxProgramIds))
-        if (auto interface = dyn_cast<InferIntRangeInterface>(definition))
-          interface.inferResultRangesFromOptional(operands, setRange);
-    }
-
-    auto it = assumptions.find(value);
-    if (it != assumptions.end())
-      for (LLVM::AssumeOp assume : it->second) {
-        if (!dominance.properlyDominates(assume.getOperation(), use))
-          continue;
-        auto cmp = assume.getCond().getDefiningOp<arith::CmpIOp>();
-        if (auto bound = getBoundFromCmpOp(cmp, value))
-          range = IntegerValueRange(range.getValue().intersection(*bound));
-      }
-    return range;
-  }
-
-  DenseMap<Value, IntegerValueRange> cache;
-  DataFlowSolver &solver;
-  DominanceInfo &dominance;
-  const DenseMap<Value, SmallVector<LLVM::AssumeOp>> &assumptions;
-  Operation *use;
-  ArrayRef<int64_t> maxProgramIds;
-};
-
 } // namespace
 
-LogicalResult
-mlir::triton::collectNonNegativeDividends(Operation *root,
-                                          DenseSet<Operation *> &operations) {
-  SmallVector<Operation *> queries;
-  root->walk([&](Operation *op) {
-    if (isa<arith::DivSIOp, arith::RemSIOp>(op) &&
-        isa<RankedTensorType>(op->getResult(0).getType()))
-      queries.push_back(op);
-  });
-  if (queries.empty())
-    return success();
+IntegerFactAnalysis::IntegerFactAnalysis() = default;
+IntegerFactAnalysis::~IntegerFactAnalysis() = default;
 
+LogicalResult IntegerFactAnalysis::initialize(Operation *root) {
   std::array<int64_t, 3> maxProgramIds;
   maxProgramIds.fill(std::numeric_limits<int32_t>::max());
   ModuleOp mod = dyn_cast<ModuleOp>(root);
@@ -221,24 +447,91 @@ mlir::triton::collectNonNegativeDividends(Operation *root,
           if (std::optional<int64_t> bound = bounds->getMaxProgramId(mod, axis))
             maxProgramIds[axis] = std::min(maxProgramIds[axis], *bound);
 
-  auto solver = createDataFlowSolver();
+  solver = createDataFlowSolver();
+  solver->load<IntegerFactsAnalysis>();
   solver->load<IntegerRangeAnalysis>(maxProgramIds);
-  if (failed(solver->initializeAndRun(root)))
-    return failure();
+  return solver->initializeAndRun(root);
+}
 
-  DenseMap<Value, SmallVector<LLVM::AssumeOp>> assumptions;
-  root->walk([&](LLVM::AssumeOp assume) {
-    if (auto cmp = assume.getCond().getDefiningOp<arith::CmpIOp>())
-      for (Value operand : cmp->getOperands())
-        assumptions[operand].push_back(assume);
+IntegerValueRange IntegerFactAnalysis::getRange(Value value) const {
+  assert(solver && "initialize integer facts before querying");
+  const auto *state =
+      solver->lookupState<dataflow::IntegerValueRangeLattice>(value);
+  return state ? state->getValue() : IntegerValueRange::getMaxRange(value);
+}
+
+IntegerProof IntegerFactAnalysis::prove(arith::CmpIPredicate predicate,
+                                        Value lhs, Value rhs) const {
+  assert(solver && "initialize integer facts before querying");
+  if (const auto *facts = solver->lookupState<IntegerFactsLattice>(lhs))
+    for (IntegerBound bound : facts->getValue().bounds)
+      if (stripRefinements(bound.value) == stripRefinements(rhs)) {
+        if (bound.predicate == predicate)
+          return IntegerProof::Proven;
+        if (bound.predicate == arith::invertPredicate(predicate))
+          return IntegerProof::Disproven;
+      }
+  IntegerValueRange a = getRange(lhs);
+  IntegerValueRange b = getRange(rhs);
+  if (a.isUninitialized() || b.isUninitialized())
+    return IntegerProof::Unknown;
+  using P = arith::CmpIPredicate;
+  intrange::CmpPredicate pred;
+  switch (predicate) {
+  case P::eq:
+    pred = intrange::CmpPredicate::eq;
+    break;
+  case P::ne:
+    pred = intrange::CmpPredicate::ne;
+    break;
+  case P::slt:
+    pred = intrange::CmpPredicate::slt;
+    break;
+  case P::sle:
+    pred = intrange::CmpPredicate::sle;
+    break;
+  case P::sgt:
+    pred = intrange::CmpPredicate::sgt;
+    break;
+  case P::sge:
+    pred = intrange::CmpPredicate::sge;
+    break;
+  case P::ult:
+    pred = intrange::CmpPredicate::ult;
+    break;
+  case P::ule:
+    pred = intrange::CmpPredicate::ule;
+    break;
+  case P::ugt:
+    pred = intrange::CmpPredicate::ugt;
+    break;
+  case P::uge:
+    pred = intrange::CmpPredicate::uge;
+    break;
+  }
+  std::optional<bool> result =
+      intrange::evaluatePred(pred, a.getValue(), b.getValue());
+  if (!result)
+    return IntegerProof::Unknown;
+  return *result ? IntegerProof::Proven : IntegerProof::Disproven;
+}
+
+LogicalResult
+mlir::triton::collectNonNegativeDividends(Operation *root,
+                                          DenseSet<Operation *> &operations) {
+  SmallVector<Operation *> queries;
+  root->walk([&](Operation *op) {
+    if (isa<arith::DivSIOp, arith::RemSIOp>(op) &&
+        isa<RankedTensorType>(op->getResult(0).getType()))
+      queries.push_back(op);
   });
-  DominanceInfo dominance(root);
-  // Q uses, V values, E operand edges, A assumptions: O(Q*(V+E+A)) query
-  // time, O(V+E+A) space. Dataflow fixed-point cost is separate.
-  // Each use has its own cache because assumptions can differ within a block.
+  if (queries.empty())
+    return success();
+  IntegerFactAnalysis facts;
+  if (failed(facts.initialize(root)))
+    return failure();
   for (Operation *op : queries) {
-    RangeAtUse query(*solver, dominance, assumptions, op, maxProgramIds);
-    IntegerValueRange range = query.get(op->getOperand(0));
+    IntegerValueRange range = facts.getRange(op->getOperand(0));
     if (!range.isUninitialized() && range.getValue().smin().isNonNegative())
       operations.insert(op);
   }
