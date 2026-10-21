@@ -9,6 +9,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -501,7 +502,42 @@ static LogicalResult reconcileEncodingUniformOps(ModuleOp mod, bool &changed) {
       changed = true;
     }
   }
-  return success(!traitConflict);
+  if (traitConflict)
+    return failure();
+
+  // A constant-scale FP8 downcast is elementwise: its input and result share
+  // one encoding. The op carries no same-encoding trait because a scale
+  // operand, when present, has its own compact layout.
+  SmallVector<triton::amdgpu::ScaledDowncastFp8Op> downcasts;
+  mod.walk([&](triton::amdgpu::ScaledDowncastFp8Op op) {
+    if (!op.getScale())
+      downcasts.push_back(op);
+  });
+  for (auto op : downcasts) {
+    auto inputTy = op.getInput().getType();
+    auto outputTy = op.getOutput().getType();
+    Attribute targetEncoding;
+    if (isConcreteDistributed(inputTy))
+      targetEncoding = inputTy.getEncoding();
+    else if (isConcreteDistributed(outputTy))
+      targetEncoding = outputTy.getEncoding();
+    else if (inputTy.getEncoding())
+      targetEncoding = inputTy.getEncoding();
+    if (!targetEncoding)
+      continue;
+    if (outputTy.getEncoding() != targetEncoding) {
+      op.getOutput().setType(outputTy.cloneWithEncoding(targetEncoding));
+      changed = true;
+    }
+    if (inputTy.getEncoding() != targetEncoding) {
+      OpBuilder b(op);
+      op.getInputMutable().assign(RequireLayoutOp::create(
+          b, op.getLoc(), inputTy.cloneWithEncoding(targetEncoding),
+          op.getInput()));
+      changed = true;
+    }
+  }
+  return success();
 }
 
 static LogicalResult reconcileDotLayouts(ModuleOp mod, bool &changed) {
@@ -1559,6 +1595,16 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
       privatizeHelperForCall(callOp, callee, "_tlxpin", symbolTables);
       changed = true;
     }
+    // View inference can resolve a deferred layout to a concrete encoding
+    // during this sweep. Its users (including arith casts) and helper return
+    // ABIs must then participate in the same fixpoint: they were still
+    // encoding-free when the initial concrete reconciliation ran.
+    if (failed(synchronizeConcreteHelperABI(mod, changed)) ||
+        failed(reconcileEncodingUniformOps(mod, changed)) ||
+        failed(reconcileDotLayouts(mod, changed)) ||
+        failed(reconcileRegionCarriedLayouts(mod, changed)) ||
+        failed(reconcileWarpPredicateLayouts(mod, changed)))
+      return failure();
   }
   return success();
 }

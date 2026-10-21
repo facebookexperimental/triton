@@ -240,3 +240,15 @@ Debug Ops
     device_print
     device_assert
     expect_zero
+
+
+TLX AMD Conversion
+------------------
+
+``triton.language.extra.tlx.amd_scaled_downcast_fp8(value, scale, dtype=tl.float8e4nv)``
+converts ``value * scale`` from FP32 to E4M3FN or E5M2 on gfx950. ``scale`` is a
+compile-time power of two from 2^-127 to 2^126; it becomes the constant E8M0
+divisor of ``amdg.scaled_downcast_fp8`` (``scale_const = 127 - log2(scale)``), so
+the conversion instruction applies the factor and no separate FP32 multiply is
+needed. Rounding is round-to-nearest-even; NaNs and values beyond the FP8 range
+convert to NaN. The operation preserves tensor ownership.

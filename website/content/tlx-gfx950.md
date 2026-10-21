@@ -41,6 +41,7 @@ only); `Requires` lists hardware capabilities; `Backward` is catalog
 | `zeros` | Zero tensor, optional explicit register layout |
 | `dtype_of` / `size_of` | Element type / byte size (host-side) |
 | `get_fp8_format_name` | `e5m2`/`e4m3` for scaled-MMA format args |
+| `amd_scaled_downcast_fp8` | FP32 × power-of-two scale to E4M3FN or E5M2 in one scaled conversion instruction |
 | `clock64` | 64-bit hardware timer read |
 | `assert_same_layout` | Compile-time assert two final layouts match |
 | `dump_layout` | Compile-time log of resolved layout |

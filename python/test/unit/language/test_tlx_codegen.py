@@ -5922,6 +5922,8 @@ def _local_load_kernel(
     output_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    RELAXED: tl.constexpr,
+    LAYOUT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -5933,7 +5935,7 @@ def _local_load_kernel(
     tlx.async_load_commit_group([tok])
     tlx.async_load_wait_group(0)
 
-    x = tlx.local_load(buf0)
+    x = tlx.local_load(buf0, layout=LAYOUT, relaxed=RELAXED)
     tl.store(output_ptr + offs, x, mask=mask)
 
 
@@ -6284,15 +6286,22 @@ def test_async_load_gather_transpose_compiles_gfx950(device):
     assert re.search(r"(buffer_load_dwordx4.*lds|global_load_lds_dwordx4)", compiled.asm["amdgcn"])
 
 
-def test_local_load_compiles_gfx950(device):
+@pytest.mark.parametrize("relaxed", [False, True])
+@pytest.mark.parametrize("with_layout", [False, True])
+def test_local_load_compiles_gfx950(device, relaxed, with_layout):
     """local_load after async_wait should compile and produce local_load in TTGIR."""
     compiled = compile_for_gfx950(
         _local_load_kernel,
         signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"},
-        constexprs={"BLOCK_SIZE": 64},
+        constexprs={
+            "BLOCK_SIZE": 64,
+            "RELAXED": relaxed,
+            "LAYOUT": tlx.layout(shape=((64, 4), ()), stride=((1, 0), ())) if with_layout else None,
+        },
     )
     ttgir = compiled.asm["ttgir"]
     assert "local_load" in ttgir
+    assert ("ttg.amdg.syncedViaAsyncWait = true" in ttgir) is relaxed
 
 
 def test_local_load_with_token_compiles_gfx950(device):
@@ -7053,3 +7062,111 @@ def test_amd_scheduled_mfma_output_subtiles_order_atomic_gfx950():
         if mnemonic in line or "buffer_atomic_add_f32" in line
     ]
     assert instructions == ["mfma", "atomic", "mfma"]
+
+
+@triton.jit
+def _amd_scaled_downcast_fp8_kernel(X, Y, BLOCK: tl.constexpr, SCALE: tl.constexpr = 256.0, E5M2: tl.constexpr = False):
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(X + offsets)
+    if E5M2:
+        result = tlx.amd_scaled_downcast_fp8(values, SCALE, tl.float8e5)
+    else:
+        result = tlx.amd_scaled_downcast_fp8(values, SCALE)
+    tl.store(Y + offsets, result)
+
+
+def _compile_scaled_downcast_fp8(scale, block=128, e5m2=False):
+    source = ASTSource(
+        _amd_scaled_downcast_fp8_kernel, signature={
+            "X": "*fp32", "Y": "*fp8e5" if e5m2 else "*fp8e4nv", "BLOCK": "constexpr", "SCALE": "constexpr", "E5M2":
+            "constexpr"
+        }, constexprs={"BLOCK": block, "SCALE": scale, "E5M2": e5m2})
+    return triton_compile(source, target=GPUTarget("hip", "gfx950", 64), options={"num_warps": 2})
+
+
+@pytest.mark.parametrize("scale,byte", [(256.0, 119), (256, 119), (1.0, 127), (0.5, 128), (2.0**126, 1),
+                                        (2.0**-127, 254)])
+def test_amd_scaled_downcast_fp8_scale_maps_to_e8m0(scale, byte):
+    kernel = _compile_scaled_downcast_fp8(scale)
+    signed = byte - 256 if byte > 127 else byte
+    assert f"scale_const = {signed} : i8" in kernel.asm["ttgir"]
+
+
+def test_amd_scaled_downcast_fp8_e5m2():
+    kernel = _compile_scaled_downcast_fp8(256.0, e5m2=True)
+    assert "f8E5M2" in kernel.asm["ttgir"]
+    assert "llvm.amdgcn.cvt.scalef32.pk.bf8.f32" in kernel.asm["llir"]
+    assert "fmul" not in kernel.asm["llir"]
+
+
+@pytest.mark.parametrize("scale", [3.0, 0.0, -2.0, 2.0**127, 2.0**-128, float("inf")])
+def test_amd_scaled_downcast_fp8_rejects_scale(scale):
+    with pytest.raises(CompilationError, match="scale must be"):
+        _compile_scaled_downcast_fp8(scale)
+
+
+@pytest.mark.parametrize("block", [32, 128, 256, 512])
+def test_amd_scaled_downcast_fp8_constant_scale(block):
+    kernel = _compile_scaled_downcast_fp8(256.0, block=block)
+    assert "scale_const = 119 : i8" in kernel.asm["ttgir"]
+    assert "llvm.amdgcn.cvt.scalef32.pk.fp8.f32" in kernel.asm["llir"]
+    conversions = [
+        line for line in kernel.asm["llir"].splitlines()
+        if "call" in line and "@llvm.amdgcn.cvt.scalef32.pk.fp8.f32(" in line
+    ]
+    assert conversions and all("float 3.906250e-03, i1 " in line for line in conversions)
+    assert "fmul" not in kernel.asm["llir"]
+    assert "fdiv" not in kernel.asm["llir"]
+    assert "v_cvt_scalef32_pk_fp8_f32" in kernel.asm["amdgcn"]
+    assert "s_nop" not in kernel.asm["llir"]
+
+
+@triton.jit
+def _amd_scaled_downcast_fp8_mfma_kernel(X, Y):
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+    offsets = tl.arange(0, 64)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    values = tlx.require_layout(tl.load(X + offsets), mma, pin=True)
+    result = tlx.amd_scaled_downcast_fp8(values, 256.0)
+    tl.store(Y + offsets, result)
+
+
+def test_amd_scaled_downcast_fp8_preserves_mfma_layout():
+    source = ASTSource(_amd_scaled_downcast_fp8_mfma_kernel, signature={"X": "*fp32", "Y": "*fp8e4nv"})
+    kernel = triton_compile(source, target=GPUTarget("hip", "gfx950", 64), options={"num_warps": 2})
+    line = next(line for line in kernel.asm["ttgir"].splitlines() if "amdg.scaled_downcast_fp8" in line)
+    encodings = re.findall(r"tensor<64x64x(?:f32|f8E4M3FN), (#[^>]+)>", line)
+    assert len(encodings) == 2 and encodings[0] == encodings[1]
+    assert "fmul" not in kernel.asm["llir"]
+    assert "llvm.amdgcn.cvt.scalef32.pk.fp8.f32" in kernel.asm["llir"]
+    conversions = [
+        line for line in kernel.asm["llir"].splitlines()
+        if "call" in line and "@llvm.amdgcn.cvt.scalef32.pk.fp8.f32(" in line
+    ]
+    assert conversions and all("float 3.906250e-03, i1 " in line for line in conversions)
+
+
+def test_amd_scaled_downcast_fp8_rejects_non_fp32():
+    source = ASTSource(_amd_scaled_downcast_fp8_kernel, signature={"X": "*fp16", "Y": "*fp8e4nv", "BLOCK": "constexpr"},
+                       constexprs={"BLOCK": 128})
+    with pytest.raises(CompilationError, match="value must be an FP32 tensor"):
+        triton_compile(source, target=GPUTarget("hip", "gfx950", 64))
+
+
+@pytest.mark.parametrize("arch,warp_size", [("gfx942", 64), ("gfx1250", 32)])
+def test_amd_scaled_downcast_fp8_unsupported_target(arch, warp_size):
+    source = ASTSource(_amd_scaled_downcast_fp8_kernel, signature={"X": "*fp32", "Y": "*fp8e4nv", "BLOCK": "constexpr"},
+                       constexprs={"BLOCK": 128})
+    with pytest.raises(CompilationError, match="requires gfx950"):
+        triton_compile(source, target=GPUTarget("hip", arch, warp_size))
+
+
+@triton.jit
+def _amd_scaled_downcast_fp8_scalar_kernel(value, Y):
+    result = tlx.amd_scaled_downcast_fp8(value, 256.0)
+    tl.store(Y, result)
+
+
+def test_amd_scaled_downcast_fp8_rejects_scalar_input():
+    source = ASTSource(_amd_scaled_downcast_fp8_scalar_kernel, signature={"value": "fp32", "Y": "*fp8e4nv"})
+    with pytest.raises(CompilationError, match="value must be an FP32 tensor"):
+        triton_compile(source, target=GPUTarget("hip", "gfx950", 64))
