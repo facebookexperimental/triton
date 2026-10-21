@@ -21,7 +21,7 @@ that support a preallocated output.
 
 `space=` defaults to "heuristic" -- a single config chosen analytically -- for
 most ops that offer one, so that a first call stays interactive. `mm` on sm90
-and sm100 defaults to "full" instead: sm90's full space is only 8 configs, and
+and sm100 defaults to "full" instead: sm90's full space prunes to 8-28 configs per shape, and
 on sm100 the tuned configs are worth up to ~4x on small shapes and beat the
 heuristic on skinny, long-K shapes. The cost on sm100 is the first call per
 shape: on B200, `mm` at `space="full"` takes 221-285s on a cold Triton cache
