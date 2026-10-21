@@ -353,6 +353,14 @@ int getNVIDIAComputeCapability(Operation *module);
 // Read the amd target from the module attributes
 std::optional<StringRef> getAMDArch(Operation *module);
 
+// Return true when a global load may legally use a vector instruction whose
+// base address is aligned only to the element size. The caller must still
+// enforce contiguity, logical-extent, and vector-width limits. For masked
+// loads, it must also clamp the width to mask constancy along the pointer's
+// vectorized axis.
+bool canUseUnalignedVectorizedLoad(Operation *op);
+bool canUseUnalignedVectorizedLoad(Operation *op, StringRef targetArch);
+
 std::optional<mlir::triton::gpu::SwizzledSharedEncodingAttr>
 getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible);
 
