@@ -1390,18 +1390,20 @@ def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure, MemDescViewTrait]> {
   let description = [{
     This operation takes a subslice of a tensor memory allocation and returns a
     new descriptor containing the address and a view of the subslice.
-    This is similar to ttg.memdesc_subslice except we can only slice along the
-    inner dimension of a 2D memdesc, as this is the only supported slice for
-    TMEM.
+    This is similar to ttg.memdesc_subslice and can slice either of the trailing
+    two tensor-memory dimensions, including non-contiguous views within a CTA.
   }];
-  let arguments = (ins TTG_MemDescType:$src, I32Attr:$N);
+  let arguments = (ins TTG_MemDescType:$src, I32Attr:$offset,
+                       DefaultValuedAttr<I32Attr, "1">:$dim);
 
   let assemblyFormat = [{
     $src attr-dict `:` qualified(type($src)) `->` qualified(type($result))
   }];
 
-  let builders = [OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size)>,
-  ];
+  let builders = [
+      OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size)>,
+      OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size, "int":$dim)>,
+    ];
   let results = (outs TTG_MemDescType:$result);
   let hasVerifier = 1;
 }

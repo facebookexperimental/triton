@@ -172,7 +172,9 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
       // to fill a full 32b register, e.g., colN = 1 and colStride != 1 or when
       // bitwidth == 8 (this happens with scales with K=1).
       // These two cases are mostly supported for testing purposes.
-      unpacked = bitwidth == 16;
+      // A padded TMEM value occupies one physical column, so an unpacked
+      // store would overwrite the adjacent column.
+      unpacked = false;
       quot = *maybeQuot;
       padding = true;
       newBitwidth = 32;
@@ -324,9 +326,10 @@ computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
   return lowerTMemLdSt(cvt, maxnreg, bitwidth, isScales, emitError);
 }
 
-FailureOr<LinearLayout>
-getTMemLdStMessageLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
-                         int numRegsPerMessage) {
+FailureOr<LinearLayout> getTMemLdStMessageLayout(MLIRContext *ctx,
+                                                 TMemAccessAtom atom,
+                                                 bool unpacked,
+                                                 int numRegsPerMessage) {
   auto kReg = StringAttr::get(ctx, "register");
   auto kCol = StringAttr::get(ctx, "col");
   LinearLayout atomLayout =
@@ -334,13 +337,13 @@ getTMemLdStMessageLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
   int32_t atomRegs = atomLayout.getInDimSize(kReg);
   if (numRegsPerMessage % atomRegs != 0)
     return failure();
-  return atomLayout * LinearLayout::identity1D(numRegsPerMessage / atomRegs,
-                                                kReg, kCol);
+  return atomLayout *
+         LinearLayout::identity1D(numRegsPerMessage / atomRegs, kReg, kCol);
 }
 
 FailureOr<SmallVector<DenseSet<uint32_t>>>
-getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy,
-                         int maxnreg, uint32_t baseAddress) {
+getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
+                         uint32_t baseAddress) {
   auto info = computeTMemLdStEncodingInfo(regTy, memTy, maxnreg);
   if (failed(info))
     return failure();
@@ -371,17 +374,17 @@ getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy,
     return (row << 16) | col;
   };
 
-  auto messageLayout = getTMemLdStMessageLayout(
-      ctx, info->atom, info->unpacked, info->numRegsPerMessage);
+  auto messageLayout = getTMemLdStMessageLayout(ctx, info->atom, info->unpacked,
+                                                info->numRegsPerMessage);
   if (failed(messageLayout))
     return failure();
 
   SmallVector<uint32_t> messageOffsets;
-  for (int32_t messageReg = 0;
-       messageReg < messageLayout->getInDimSize(kReg); ++messageReg) {
+  for (int32_t messageReg = 0; messageReg < messageLayout->getInDimSize(kReg);
+       ++messageReg) {
     for (int32_t lane = 0; lane < messageLayout->getInDimSize(kLane); ++lane) {
-      auto [row, col] = getRowCol(
-          messageLayout->apply({{kReg, messageReg}, {kLane, lane}}));
+      auto [row, col] =
+          getRowCol(messageLayout->apply({{kReg, messageReg}, {kLane, lane}}));
       if (!row || !col)
         return failure();
       messageOffsets.push_back(encode(*row, *col));
