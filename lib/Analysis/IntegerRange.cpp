@@ -1,4 +1,5 @@
 #include "triton/Analysis/IntegerRange.h"
+#include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Matchers.h"
@@ -10,6 +11,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <map>
@@ -74,6 +76,10 @@ struct IntegerFacts {
       return;
     }
     os << "modulus=" << congruence->first << ", residue=" << congruence->second;
+    os << ", sign=" << static_cast<unsigned>(sign);
+    for (IntegerBound bound : bounds)
+      os << ", " << stringifyCmpIPredicate(bound.predicate) << " "
+         << bound.value;
   }
 };
 
@@ -89,9 +95,25 @@ static Value stripRefinements(Value value) {
   return value;
 }
 
-// 64 SSA nodes; 16 relations/terms; degree four; normalization depth 12.
-// K relations and T terms: pairwise proof costs O(K^2*T*log(T)).
-// At most eight bounds and eight positive scale factors per transfer.
+static arith::CmpIPredicate signedPredicate(arith::CmpIPredicate predicate) {
+  using P = arith::CmpIPredicate;
+  switch (predicate) {
+  case P::ult:
+    return P::slt;
+  case P::ule:
+    return P::sle;
+  case P::ugt:
+    return P::sgt;
+  case P::uge:
+    return P::sge;
+  default:
+    return predicate;
+  }
+}
+
+// 64 SSA nodes/relations; 16 terms; degree four; normalization depth 12.
+// K relations, T terms: O(K^2*T^4*log(T)); cap pair subtractions at 256.
+// At most eight candidate bounds and eight positive scale factors per transfer.
 class IntegerRelations {
   struct Symbol {
     unsigned value;
@@ -112,7 +134,9 @@ class IntegerRelations {
 
 public:
   IntegerRelations(ValueRange roots,
-                   function_ref<IntegerValueRange(Value)> getRange) {
+                   function_ref<IntegerValueRange(Value)> getRange,
+                   function_ref<const IntegerFacts &(Value)> getFacts)
+      : getFacts(getFacts) {
     SmallVector<Value> pending(roots);
     DenseSet<Value> visited;
     while (!pending.empty()) {
@@ -125,6 +149,10 @@ public:
         return;
       }
       values.push_back(value);
+      for (IntegerBound bound : getFacts(value).bounds) {
+        inheritedBounds.emplace_back(value, bound);
+        pending.push_back(bound.value);
+      }
       if (ConstantIntRanges::getStorageBitwidth(value.getType()) > 64) {
         valid = false;
         return;
@@ -141,10 +169,10 @@ public:
       Operation *op = value.getDefiningOp();
       // These operations require all operands to be non-poison. Select does
       // not.
-      if (op &&
-          isa<RefineOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
-              arith::DivSIOp, arith::RemSIOp, arith::MinSIOp, arith::MaxSIOp>(
-              op))
+      if (op && isa<RefineOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
+                    arith::DivSIOp, arith::RemSIOp, arith::DivUIOp,
+                    arith::RemUIOp, arith::MinSIOp, arith::MinUIOp,
+                    arith::MaxSIOp, arith::ExtSIOp, arith::ExtUIOp>(op))
         llvm::append_range(pending, op->getOperands());
     }
     for (Value value : values) {
@@ -163,13 +191,17 @@ public:
               pred == P::sgt);
       }
       Operation *op = value.getDefiningOp();
-      if (auto minimum = dyn_cast_or_null<arith::MinSIOp>(op)) {
-        addConstraint(subtract(normalize(minimum.getLhs()), normalize(value)),
-                      false);
-        addConstraint(subtract(normalize(minimum.getRhs()), normalize(value)),
-                      false);
+      if (Operation *minimum = signedMinimum(value)) {
+        addConstraint(
+            subtract(normalize(minimum->getOperand(0)), normalize(value)),
+            false);
+        addConstraint(
+            subtract(normalize(minimum->getOperand(1)), normalize(value)),
+            false);
       }
-      if (!op || !isa<arith::DivSIOp, arith::RemSIOp>(op) ||
+      if (!op ||
+          !isa<arith::DivSIOp, arith::RemSIOp, arith::DivUIOp, arith::RemUIOp>(
+              op) ||
           !nonnegativeRange(op->getOperand(0)) ||
           !positiveRange(op->getOperand(1)))
         continue;
@@ -180,21 +212,46 @@ public:
       addConstraint(remainder, false);
       addConstraint(subtract(divisor, remainder), true);
     }
+    for (auto [value, bound] : inheritedBounds) {
+      if (matchPattern(bound.value, m_Constant()))
+        continue;
+      using P = arith::CmpIPredicate;
+      P pred = bound.predicate;
+      bool unsignedOrder =
+          nonnegativeRange(value) && nonnegativeRange(bound.value);
+      if (pred == P::slt || pred == P::sle ||
+          (unsignedOrder && (pred == P::ult || pred == P::ule)))
+        addConstraint(subtract(normalize(bound.value), normalize(value)),
+                      pred == P::slt || pred == P::ult);
+      if (pred == P::sgt || pred == P::sge ||
+          (unsignedOrder && (pred == P::ugt || pred == P::uge)))
+        addConstraint(subtract(normalize(value), normalize(bound.value)),
+                      pred == P::sgt || pred == P::ugt);
+    }
   }
 
   bool nonnegative(Value value) {
-    if (auto minimum = stripRefinements(value).getDefiningOp<arith::MinSIOp>())
-      return prove(normalize(minimum.getLhs()), false) &&
-             prove(normalize(minimum.getRhs()), false);
+    if (nonnegativeRange(value))
+      return true;
+    Operation *op = stripRefinements(value).getDefiningOp();
+    if (op && isa<arith::AddIOp, arith::MulIOp>(op) && noSignedWrap(op) &&
+        nonnegativeRange(op->getOperand(0)) &&
+        nonnegativeRange(op->getOperand(1)))
+      return true;
+    if (Operation *minimum = signedMinimum(value))
+      return prove(normalize(minimum->getOperand(0)), false) &&
+             prove(normalize(minimum->getOperand(1)), false);
     return prove(normalize(value), false);
   }
 
   bool positive(Value value) {
     if (!valid)
       return false;
-    if (auto minimum = stripRefinements(value).getDefiningOp<arith::MinSIOp>())
-      return prove(normalize(minimum.getLhs()), true) &&
-             prove(normalize(minimum.getRhs()), true);
+    if (positiveRange(value))
+      return true;
+    if (Operation *minimum = signedMinimum(value))
+      return prove(normalize(minimum->getOperand(0)), true) &&
+             prove(normalize(minimum->getOperand(1)), true);
     return prove(normalize(value), true);
   }
 
@@ -203,24 +260,67 @@ public:
       return false;
     auto upper = normalize(bound);
     auto input = normalize(value);
-    if (auto minimum =
-            stripRefinements(divisor).getDefiningOp<arith::MinSIOp>())
-      return prove(
-                 subtract(multiply(normalize(minimum.getLhs()), upper), input),
-                 true) &&
-             prove(
-                 subtract(multiply(normalize(minimum.getRhs()), upper), input),
-                 true);
+    if (Operation *minimum = signedMinimum(divisor))
+      return prove(subtract(multiply(normalize(minimum->getOperand(0)), upper),
+                            input),
+                   true) &&
+             prove(subtract(multiply(normalize(minimum->getOperand(1)), upper),
+                            input),
+                   true);
     return prove(subtract(multiply(normalize(divisor), upper), input), true);
   }
 
   ArrayRef<Value> candidates() const { return values; }
   bool hasRelations() const { return valid && !constraints.empty(); }
-  bool upperBound(Value value, Value bound) {
-    return prove(subtract(normalize(bound), normalize(value)), true);
+  bool upperBound(Value value, Value bound, bool strict = true) {
+    if (auto add = value.getDefiningOp<arith::AddIOp>();
+        add && noSignedWrap(add))
+      for (unsigned i : llvm::seq(2u)) {
+        Value base = add->getOperand(i), offset = add->getOperand(1 - i);
+        auto range = ranges.find(stripRefinements(offset));
+        if (range == ranges.end())
+          continue;
+        for (IntegerBound upper : getFacts(base).bounds) {
+          using P = arith::CmpIPredicate;
+          if (stripRefinements(upper.value) != stripRefinements(bound) ||
+              (upper.predicate != P::slt && upper.predicate != P::sle))
+            continue;
+          int64_t gap = upper.predicate == P::slt;
+          const auto &a = getFacts(base).congruence;
+          const auto &b = getFacts(upper.value).congruence;
+          if (a && b) {
+            APInt modulus =
+                llvm::APIntOps::GreatestCommonDivisor(a->first, b->first);
+            if (!modulus.isZero() && modulus.getActiveBits() < 64 &&
+                (modulus.isPowerOf2() ||
+                 (nonnegativeRange(base) && nonnegativeRange(upper.value)))) {
+              APInt residue =
+                  (b->second.urem(modulus) + modulus - a->second.urem(modulus))
+                      .urem(modulus);
+              gap =
+                  (residue.isZero() && gap ? modulus : residue).getZExtValue();
+            }
+          }
+          APInt maximum = range->second.smax();
+          APInt distance(maximum.getBitWidth(), gap);
+          if (strict ? maximum.slt(distance) : maximum.sle(distance))
+            return true;
+        }
+      }
+    return prove(subtract(normalize(bound), normalize(value)), strict);
   }
 
 private:
+  Operation *signedMinimum(Value value) const {
+    Operation *op = stripRefinements(value).getDefiningOp();
+    if (op &&
+        (isa<arith::MinSIOp>(op) ||
+         (isa<arith::MinUIOp>(op) && nonnegativeRange(op->getOperand(0)) &&
+          nonnegativeRange(op->getOperand(1)))))
+      return op;
+    return nullptr;
+  }
+
   static std::optional<Polynomial> add(std::optional<Polynomial> a,
                                        const std::optional<Polynomial> &b,
                                        int64_t sign = 1) {
@@ -338,6 +438,18 @@ private:
   }
 
   std::optional<Polynomial> normalize(Value value, unsigned depth = 0) {
+    if (depth)
+      return normalizeImpl(value, depth);
+    value = stripRefinements(value);
+    auto it = normalized.find(value);
+    if (it != normalized.end())
+      return it->second;
+    auto expression = normalizeImpl(value, 0);
+    normalized.try_emplace(value, expression);
+    return expression;
+  }
+
+  std::optional<Polynomial> normalizeImpl(Value value, unsigned depth) {
     if (depth == 12)
       return std::nullopt;
     value = stripRefinements(value);
@@ -354,10 +466,17 @@ private:
         return subtract(a, b);
       return multiply(a, b);
     }
-    if (op && isa<arith::DivSIOp>(op))
+    if (op && isa<arith::ExtSIOp>(op))
+      return normalize(op->getOperand(0), depth + 1);
+    if (op && isa<arith::ExtUIOp>(op) && nonnegativeRange(op->getOperand(0)))
+      return normalize(op->getOperand(0), depth + 1);
+    if (op &&
+        (isa<arith::DivSIOp>(op) ||
+         (isa<arith::DivUIOp>(op) && nonnegativeRange(op->getOperand(0)) &&
+          positiveRange(op->getOperand(1)))))
       return quotientSymbol(op->getOperand(0), op->getOperand(1));
-    if (op && isa<arith::RemSIOp>(op) && nonnegativeRange(op->getOperand(0)) &&
-        positiveRange(op->getOperand(1)))
+    if (op && isa<arith::RemSIOp, arith::RemUIOp>(op) &&
+        nonnegativeRange(op->getOperand(0)) && positiveRange(op->getOperand(1)))
       return subtract(
           normalize(op->getOperand(0), depth + 1),
           multiply(quotientSymbol(op->getOperand(0), op->getOperand(1)),
@@ -372,8 +491,10 @@ private:
           constraint.strict |= strict;
           return;
         }
-    if (expression && constraints.size() < 16)
+    if (expression && constraints.size() < 64)
       constraints.push_back({std::move(*expression), strict});
+    else if (expression)
+      LDBG() << "Integer relation constraint budget exhausted";
   }
 
   bool constantNonnegative(const Polynomial &expression, bool strict) const {
@@ -412,40 +533,63 @@ private:
     return strict ? sum.isStrictlyPositive() : sum.isNonNegative();
   }
 
-  bool proveDirect(const Polynomial &expression, bool strict) const {
-    if (constantNonnegative(expression, strict))
-      return true;
+  bool knownNonnegative(const Polynomial &expression, bool strict) const {
     for (const Constraint &constraint : constraints)
       if (constraint.expression == expression && (!strict || constraint.strict))
         return true;
+    return constantNonnegative(expression, strict);
+  }
+
+  bool proveDirect(const Polynomial &expression, bool strict) const {
+    if (knownNonnegative(expression, strict))
+      return true;
+    unsigned budget = 256;
     for (const Constraint &a : constraints) {
-      if (!cancelsTerm(expression, a.expression))
-        continue;
-      auto rest = subtract(expression, a.expression);
-      if (!rest)
-        continue;
-      if (constantNonnegative(*rest, strict && !a.strict))
-        return true;
-      for (const Constraint &b : constraints) {
-        if (!cancelsTerm(*rest, b.expression))
+      for (int64_t scale : cancellationScales(expression, a.expression)) {
+        auto rest = subtractConstraint(expression, a, scale);
+        if (!rest)
           continue;
-        auto tail = subtract(rest, b.expression);
-        if (tail &&
-            constantNonnegative(*tail, strict && !a.strict && !b.strict))
+        if (knownNonnegative(*rest, strict))
           return true;
+        for (const Constraint &b : constraints) {
+          for (int64_t scale : cancellationScales(*rest, b.expression)) {
+            if (!budget--) {
+              LDBG() << "Integer relation combination budget exhausted";
+              return false;
+            }
+            auto tail = subtractConstraint(*rest, b, scale);
+            if (tail && knownNonnegative(*tail, strict))
+              return true;
+          }
+        }
       }
     }
     return false;
   }
 
-  static bool cancelsTerm(const Polynomial &expression,
-                          const Polynomial &constraint) {
+  static std::optional<Polynomial>
+  subtractConstraint(const Polynomial &expression, const Constraint &constraint,
+                     int64_t scale) {
+    auto rest = add(expression, constraint.expression, -scale);
+    // Strict integer bounds have at least one unit of slack.
+    return constraint.strict ? add(rest, Polynomial{{{}, scale}}) : rest;
+  }
+
+  static SmallVector<int64_t, 2>
+  cancellationScales(const Polynomial &expression,
+                     const Polynomial &constraint) {
+    SmallVector<int64_t, 2> scales;
     for (const auto &[term, coefficient] : constraint) {
       auto it = expression.find(term);
-      if (!term.empty() && it != expression.end() && it->second == coefficient)
-        return true;
+      if (term.empty() || it == expression.end() || !coefficient ||
+          (coefficient == -1 &&
+           it->second == std::numeric_limits<int64_t>::min()))
+        continue;
+      if (it->second % coefficient == 0 && it->second / coefficient > 0)
+        if (!llvm::is_contained(scales, it->second / coefficient))
+          scales.push_back(it->second / coefficient);
     }
-    return false;
+    return scales;
   }
 
   bool prove(const std::optional<Polynomial> &expression, bool strict) {
@@ -456,7 +600,7 @@ private:
     // Positive scaling preserves the inequality; never assume a divisor's sign.
     DenseSet<Value> tried;
     for (Value value : values) {
-      if (!positiveRange(value) || matchPattern(value, m_Constant()))
+      if (!positiveRange(value))
         continue;
       if (!tried.insert(stripRefinements(value)).second)
         continue;
@@ -470,10 +614,13 @@ private:
   }
 
   SmallVector<Value> values;
+  SmallVector<std::pair<Value, IntegerBound>> inheritedBounds;
   SmallVector<Value> symbols{Value{}};
   SmallVector<Constraint> constraints;
   DenseMap<Value, unsigned> symbolIDs;
   DenseMap<Value, ConstantIntRanges> ranges;
+  DenseMap<Value, std::optional<Polynomial>> normalized;
+  function_ref<const IntegerFacts &(Value)> getFacts;
   bool valid = true;
 };
 
@@ -486,6 +633,94 @@ public:
   void setToEntryState(IntegerFactsLattice *lattice) override {
     propagateIfChanged(
         lattice, lattice->join(IntegerFacts::unknown(lattice->getAnchor())));
+  }
+
+  std::optional<IntegerFacts>
+  remapFacts(Value value, ProgramPoint *point,
+             const DenseMap<Value, Value> &mapping) {
+    const IntegerFacts &source = getLatticeElementFor(point, value)->getValue();
+    if (!source.congruence)
+      return std::nullopt;
+    IntegerFacts result = source;
+    result.bounds.clear();
+    for (IntegerBound bound : source.bounds)
+      if (Value mapped = mapping.lookup(stripRefinements(bound.value))) {
+        if (signedPredicate(bound.predicate) != bound.predicate) {
+          const auto *a =
+              getOrCreateFor<dataflow::IntegerValueRangeLattice>(point, value);
+          const auto *b = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+              point, bound.value);
+          if (a->getValue().isUninitialized() ||
+              b->getValue().isUninitialized())
+            return std::nullopt;
+          if (a->getValue().getValue().smin().isNonNegative() &&
+              b->getValue().getValue().smin().isNonNegative())
+            bound.predicate = signedPredicate(bound.predicate);
+        }
+        IntegerBound translated{mapped, bound.predicate};
+        if (!llvm::is_contained(result.bounds, translated))
+          result.bounds.push_back(translated);
+      }
+    return result;
+  }
+
+  void visitCallableOperation(
+      CallableOpInterface callable,
+      ArrayRef<dataflow::AbstractSparseLattice *> arguments) override {
+    Block &entry = callable.getCallableRegion()->front();
+    ProgramPoint *point = getProgramPointBefore(&entry);
+    const auto *calls = getOrCreateFor<dataflow::PredecessorState>(
+        point, getProgramPointAfter(callable));
+    if (!calls->allPredecessorsKnown() ||
+        !getSolverConfig().isInterprocedural()) {
+      AbstractSparseForwardDataFlowAnalysis::visitCallableOperation(callable,
+                                                                    arguments);
+      return;
+    }
+    for (Operation *caller : calls->getKnownPredecessors()) {
+      auto call = cast<CallOpInterface>(caller);
+      DenseMap<Value, Value> mapping;
+      for (auto [operand, argument] :
+           llvm::zip_equal(call.getArgOperands(), entry.getArguments()))
+        mapping.try_emplace(stripRefinements(operand), argument);
+      for (auto [operand, target] :
+           llvm::zip_equal(call.getArgOperands(), arguments)) {
+        auto *lattice = static_cast<IntegerFactsLattice *>(target);
+        if (auto facts = remapFacts(operand, point, mapping))
+          propagateIfChanged(lattice, lattice->join(*facts));
+      }
+    }
+  }
+
+  LogicalResult visitCallOperation(
+      CallOpInterface call,
+      ArrayRef<const dataflow::AbstractSparseLattice *> operands,
+      ArrayRef<dataflow::AbstractSparseLattice *> results) override {
+    auto callable =
+        dyn_cast_if_present<CallableOpInterface>(call.resolveCallable());
+    if (!callable || !callable.getCallableRegion() ||
+        !getSolverConfig().isInterprocedural())
+      return AbstractSparseForwardDataFlowAnalysis::visitCallOperation(
+          call, operands, results);
+    ProgramPoint *point = getProgramPointAfter(call);
+    const auto *returns =
+        getOrCreateFor<dataflow::PredecessorState>(point, point);
+    if (!returns->allPredecessorsKnown())
+      return AbstractSparseForwardDataFlowAnalysis::visitCallOperation(
+          call, operands, results);
+    DenseMap<Value, Value> mapping;
+    for (auto [argument, operand] :
+         llvm::zip_equal(callable.getCallableRegion()->front().getArguments(),
+                         call.getArgOperands()))
+      mapping.try_emplace(argument, operand);
+    for (Operation *terminator : returns->getKnownPredecessors())
+      for (auto [operand, target] :
+           llvm::zip_equal(terminator->getOperands(), results)) {
+        auto *lattice = static_cast<IntegerFactsLattice *>(target);
+        if (auto facts = remapFacts(operand, point, mapping))
+          propagateIfChanged(lattice, lattice->join(*facts));
+      }
+    return success();
   }
 
   void visitNonControlFlowArguments(
@@ -542,6 +777,20 @@ public:
           operands[1]->getValue().congruence->first.isZero())
         facts.congruence = operands[1]->getValue().congruence;
       IntegerBound bound{refine.getBound(), refine.getPredicate()};
+      if (signedPredicate(bound.predicate) != bound.predicate) {
+        const auto *valueRange =
+            getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+                getProgramPointAfter(op), refine.getValue());
+        const auto *boundRange =
+            getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+                getProgramPointAfter(op), refine.getBound());
+        if (valueRange->getValue().isUninitialized() ||
+            boundRange->getValue().isUninitialized())
+          return success();
+        if (valueRange->getValue().getValue().smin().isNonNegative() &&
+            boundRange->getValue().getValue().smin().isNonNegative())
+          bound.predicate = signedPredicate(bound.predicate);
+      }
       // Keep a finite prefix. Existing relations cannot change order on
       // revisit.
       if (facts.bounds.size() < 8 && !llvm::is_contained(facts.bounds, bound))
@@ -564,13 +813,34 @@ public:
             llvm::APIntOps::GreatestCommonDivisor(am * bm, am * br), bm * ar);
         residue = ar * br;
       }
-      if (!modulus.isZero())
+      if (!modulus.isZero() && !modulus.isPowerOf2()) {
+        std::array<const ConstantIntRanges *, 2> ranges;
+        for (unsigned i : llvm::seq(2u)) {
+          const auto *state =
+              getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+                  getProgramPointAfter(op), op->getOperand(i));
+          if (state->getValue().isUninitialized())
+            return success();
+          ranges[i] = &state->getValue().getValue();
+        }
+        bool wraps;
+        if (isa<arith::AddIOp>(op))
+          (void)ranges[0]->umax().uadd_ov(ranges[1]->umax(), wraps);
+        else if (isa<arith::MulIOp>(op))
+          (void)ranges[0]->umax().umul_ov(ranges[1]->umax(), wraps);
+        else
+          (void)ranges[0]->umin().usub_ov(ranges[1]->umax(), wraps);
+        if (wraps)
+          modulus = llvm::APIntOps::GreatestCommonDivisor(modulus, wrap);
+        else if (isa<arith::SubIOp>(op))
+          residue = ar + modulus - br.urem(modulus);
+      } else if (!modulus.isZero())
         modulus = llvm::APIntOps::GreatestCommonDivisor(modulus, wrap);
       facts.congruence = {modulus,
                           residue.urem(modulus.isZero() ? wrap : modulus)};
     }
-    if (isa<arith::DivSIOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
-            arith::MinSIOp>(op) &&
+    if (isa<arith::DivSIOp, arith::DivUIOp, arith::AddIOp, arith::SubIOp,
+            arith::MulIOp, arith::MinSIOp, arith::MinUIOp>(op) &&
         isa<IntegerType>(result.getType())) {
       bool pending = false;
       auto range = [&](Value value) {
@@ -579,10 +849,16 @@ public:
         pending |= state->getValue().isUninitialized();
         return state->getValue();
       };
-      IntegerRelations relations(op->getOperands(), range);
+      auto getFacts = [&](Value value) -> const IntegerFacts & {
+        const auto *state =
+            getLatticeElementFor(getProgramPointAfter(op), value);
+        pending |= !state->getValue().congruence;
+        return state->getValue();
+      };
+      IntegerRelations relations(op->getOperands(), range, getFacts);
       if (pending)
         return success();
-      bool division = isa<arith::DivSIOp>(op);
+      bool division = isa<arith::DivSIOp, arith::DivUIOp>(op);
       Value dividend = op->getOperand(0), divisor = op->getOperand(1);
       bool nonnegative =
           division
@@ -590,11 +866,18 @@ public:
               : relations.hasRelations() && relations.nonnegative(result);
       if (nonnegative) {
         DenseSet<Value> tried;
-        for (Value bound : relations.candidates()) {
+        SmallVector<Value> candidates(relations.candidates());
+        std::stable_partition(
+            candidates.begin(), candidates.end(), [&](Value value) {
+              IntegerValueRange limit = range(value);
+              return !limit.isUninitialized() &&
+                     limit.getValue().smin().isStrictlyPositive();
+            });
+        for (Value bound : candidates) {
           IntegerValueRange limit = range(bound);
           if (bound.getType() != result.getType() ||
               matchPattern(bound, m_Constant()) || limit.isUninitialized() ||
-              !limit.getValue().smin().isStrictlyPositive() ||
+              !limit.getValue().smin().isNonNegative() ||
               !tried.insert(stripRefinements(bound)).second)
             continue;
           if (tried.size() > 8)
@@ -602,16 +885,45 @@ public:
           bool proven =
               division ? relations.productUpperBound(dividend, divisor, bound)
                        : relations.upperBound(result, bound);
-          if (!proven)
+          bool inclusive =
+              !proven && relations.upperBound(result, bound, false);
+          if (!proven && !inclusive)
             continue;
           if (facts.bounds.size() < 8)
-            facts.bounds.push_back({bound, arith::CmpIPredicate::slt});
+            facts.bounds.push_back({bound, proven ? arith::CmpIPredicate::slt
+                                                  : arith::CmpIPredicate::sle});
         }
         facts.sign = !division && relations.positive(result)
                          ? IntegerFacts::Sign::Positive
                          : IntegerFacts::Sign::Nonnegative;
       }
     }
+    for (unsigned i = 0; i < facts.bounds.size() && facts.bounds.size() < 8;
+         ++i) {
+      IntegerBound bound = facts.bounds[i];
+      using P = arith::CmpIPredicate;
+      if (bound.predicate != P::slt && bound.predicate != P::sle)
+        continue;
+      const auto *limit =
+          getLatticeElementFor(getProgramPointAfter(op), bound.value);
+      if (!limit->getValue().congruence)
+        return success();
+      for (IntegerBound upper : limit->getValue().bounds) {
+        if (upper.predicate != P::slt && upper.predicate != P::sle)
+          continue;
+        IntegerBound transitive{upper.value, bound.predicate == P::slt ||
+                                                     upper.predicate == P::slt
+                                                 ? P::slt
+                                                 : P::sle};
+        if (facts.bounds.size() < 8 &&
+            !llvm::is_contained(facts.bounds, transitive))
+          facts.bounds.push_back(transitive);
+      }
+    }
+    LDBG_OS([&](raw_ostream &os) {
+      os << *op << ": ";
+      facts.print(os);
+    });
     propagateIfChanged(results[0], results[0]->join(facts));
     return success();
   }
@@ -872,16 +1184,23 @@ IntegerValueRange IntegerFactAnalysis::getRange(Value value) const {
 IntegerProof IntegerFactAnalysis::prove(arith::CmpIPredicate predicate,
                                         Value lhs, Value rhs) const {
   assert(solver && "initialize integer facts before querying");
+  IntegerValueRange a = getRange(lhs);
+  IntegerValueRange b = getRange(rhs);
+  bool nonnegative = !a.isUninitialized() && !b.isUninitialized() &&
+                     a.getValue().smin().isNonNegative() &&
+                     b.getValue().smin().isNonNegative();
+  if (nonnegative)
+    predicate = signedPredicate(predicate);
   if (const auto *facts = solver->lookupState<IntegerFactsLattice>(lhs))
     for (IntegerBound bound : facts->getValue().bounds)
       if (stripRefinements(bound.value) == stripRefinements(rhs)) {
+        if (nonnegative)
+          bound.predicate = signedPredicate(bound.predicate);
         if (bound.predicate == predicate)
           return IntegerProof::Proven;
         if (bound.predicate == arith::invertPredicate(predicate))
           return IntegerProof::Disproven;
       }
-  IntegerValueRange a = getRange(lhs);
-  IntegerValueRange b = getRange(rhs);
   if (a.isUninitialized() || b.isUninitialized())
     return IntegerProof::Unknown;
   using P = arith::CmpIPredicate;

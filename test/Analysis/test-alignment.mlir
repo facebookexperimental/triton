@@ -8,6 +8,123 @@
 // ERASE: llvm.intr.assume
 // ERASE-NOT: tt.refine
 
+module {
+  tt.func @non_power_of_two_gap(%input: i32) -> i32 {
+    %zero = arith.constant 0 : i32
+    %limit = arith.constant 100 : i32
+    %factor = arith.constant 15 : i32
+    %offset = arith.constant 14 : i32
+    %bound = arith.constant 1500 : i32
+    %x0 = tt.refine %input, %zero {predicate = 5 : i64} : i32
+    %x = tt.refine %x0, %limit {predicate = 3 : i64} : i32
+    %product = arith.muli %x, %factor : i32
+    %aligned = tt.refine %product, %bound {predicate = 6 : i64} : i32
+    %result = arith.addi %aligned, %offset : i32
+    %check = arith.cmpi ult, %result, %bound {test.proof = "proven"} : i32
+    tt.return %result : i32
+  }
+  tt.func @wrapped_non_power_of_two_gap(%input: i32) -> i32 {
+    %factor = arith.constant 15 : i32
+    %offset = arith.constant 14 : i32
+    %bound = arith.constant 1500 : i32
+    %product = arith.muli %input, %factor : i32
+    %aligned = tt.refine %product, %bound {predicate = 6 : i64} : i32
+    %result = arith.addi %aligned, %offset : i32
+    %check = arith.cmpi ult, %result, %bound {test.proof = "unknown"} : i32
+    tt.return %result : i32
+  }
+}
+
+// -----
+
+module {
+  tt.func @refine_swizzle_bound(%input: i32, %p: i32) -> i64 {
+    %zero = arith.constant 0 : i32
+    %positive = arith.cmpi sgt, %input, %zero : i32
+    llvm.intr.assume %positive : i1
+    %n = arith.extsi %input : i32 to i64
+    %pid = arith.extui %p : i32 to i64
+    %valid = arith.cmpi ult, %pid, %n : i64
+    llvm.intr.assume %valid : i1
+    %r = tt.call @permute(%pid, %n) : (i64, i64) -> i64
+    %check = arith.cmpi slt, %r, %n {test.proof = "proven"} : i64
+    tt.return %r : i64
+  }
+  tt.func private @permute(%pid: i64, %n: i64) -> i64 {
+    %c4 = arith.constant 4 : i64
+    %c8 = arith.constant 8 : i64
+    %c32 = arith.constant 32 : i64
+    %q = arith.divui %n, %c32 : i64
+    %aligned = arith.muli %q, %c32 : i64
+    %tail = arith.cmpi uge, %pid, %aligned : i64
+    cf.cond_br %tail, ^bb1, ^bb2
+  ^bb1:
+    tt.return %pid : i64
+  ^bb2:
+    %minor = arith.remui %pid, %c8 : i64
+    %major = arith.divui %pid, %c8 : i64
+    %group = arith.divui %major, %c4 : i64
+    %check_group = arith.cmpi slt, %group, %q {test.proof = "proven"} : i64
+    %base = arith.muli %group, %c32 : i64
+    %part = arith.muli %minor, %c4 : i64
+    %offset = arith.remui %major, %c4 : i64
+    %sum = arith.addi %base, %part : i64
+    %result = arith.addi %sum, %offset : i64
+    %check_result = arith.cmpi slt, %result, %aligned {test.proof = "proven"} : i64
+    tt.return %result : i64
+  }
+}
+
+// -----
+
+module {
+  tt.func @remap_two_calls(%x: i32, %y: i32) -> (i32, i32) {
+    %zero = arith.constant 0 : i32
+    %a = arith.constant 21 : i32
+    %b = arith.constant 63 : i32
+    %x0 = tt.refine %x, %zero {predicate = 5 : i64} : i32
+    %y0 = tt.refine %y, %zero {predicate = 5 : i64} : i32
+    %x1 = tt.refine %x0, %a {predicate = 2 : i64} : i32
+    %y1 = tt.refine %y0, %b {predicate = 2 : i64} : i32
+    %r = tt.call @identity(%x1, %a) : (i32, i32) -> i32
+    %s = tt.call @identity(%y1, %b) : (i32, i32) -> i32
+    %check_r = arith.cmpi slt, %r, %a {test.proof = "proven"} : i32
+    %check_s = arith.cmpi slt, %s, %b {test.proof = "proven"} : i32
+    %no_cross_call = arith.cmpi slt, %s, %a {test.proof = "unknown"} : i32
+    tt.return %r, %s : i32, i32
+  }
+  tt.func private @identity(%value: i32, %bound: i32) -> i32 {
+    tt.return %value : i32
+  }
+}
+
+// -----
+
+module {
+  tt.func @unbounded_call(%x: i32, %y: i32, %bound: i32) -> i32 {
+    %bounded = tt.refine %x, %bound {predicate = 2 : i64} : i32
+    %r = tt.call @identity(%bounded, %bound) : (i32, i32) -> i32
+    %s = tt.call @identity(%y, %bound) : (i32, i32) -> i32
+    %no_leak = arith.cmpi slt, %s, %bound {test.proof = "unknown"} : i32
+    tt.return %s : i32
+  }
+  tt.func private @identity(%value: i32, %bound: i32) -> i32 {
+    tt.return %value : i32
+  }
+}
+
+// -----
+
+tt.func @unsigned_bound_is_not_signed(%value: i64) -> i64 {
+  %zero = arith.constant 0 : i64
+  %positive = tt.refine %value, %zero {predicate = 8 : i64} : i64
+  %unsigned = arith.cmpi ugt, %positive, %zero {test.proof = "proven"} : i64
+  %signed = arith.cmpi sgt, %positive, %zero {test.proof = "unknown"} : i64
+  tt.return %positive : i64
+}
+
+// -----
+
 // REFINE-LABEL: tt.func @refine_branch_scope
 // REFINE: scf.if
 // REFINE: %[[LOW:.*]] = tt.refine %{{.*}}, %{{.*}} {predicate = 5 : i64}
