@@ -7,8 +7,9 @@ on:
     # LLVM bump branches: the updater turns this run into the bump's issue.
     branches: [main, 'release/**', 'scratch/meta-llvm-bump/**']
   pull_request:
+  # One full run a day on main: pushes and PRs run only the GPUs their changes touch.
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
