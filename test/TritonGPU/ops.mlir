@@ -48,6 +48,23 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
     tt.return
   }
 }
+
+// -----
+
+// A require-layout boundary only carries its operand through layout
+// optimization, so it is safe for swizzled and non-injective register layouts.
+#require_src = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+#require_generic = #ttg.generic_linear<{register = [[1, 0], [2, 0]], lane = [[4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 1]], warp = [[0, 2], [16, 4], [0, 0]], block = []}>
+
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @require_generic_linear
+  tt.func @require_generic_linear(%arg0: tensor<128x8xi32, #require_src>) {
+    // CHECK: ttg.require_layout
+    %0 = ttg.require_layout %arg0 : tensor<128x8xi32, #require_src> -> tensor<128x8xi32, #require_generic>
+    tt.return
+  }
+}
+
 // -----
 
 #blocked= #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
