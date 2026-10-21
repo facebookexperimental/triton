@@ -460,7 +460,39 @@ TEST_F(SwizzleTest, Test64x128F16BlockedLinear32Bank) {
   EXPECT_EQ(w, 0);
 }
 
-TEST_F(SwizzleTest, MixedLayoutPreservesPow2TileSwizzle) {
+TEST_F(SwizzleTest, MixedLayoutPreservesCompatibleInstructionTile) {
+  auto reg = S("register"), lane = S("lane"), warp = S("warp");
+  auto block = S("block"), dim0 = S("dim0"), dim1 = S("dim1");
+  LinearLayout src({{reg, {{0, 1}, {0, 2}, {0, 4}, {16, 0}, {32, 0}}},
+                    {lane, {{0, 8}, {0, 16}, {0, 32}, {0, 64}, {1, 0}, {2, 0}}},
+                    {warp, {{4, 0}, {8, 0}}},
+                    {block, {}}},
+                   {{dim0, 64}, {dim1, 128}}, true);
+  LinearLayout dst(
+      {{reg, {{0, 1}, {0, 2}, {0, 8}, {0, 16}, {0, 32}, {0, 64}, {32, 0}}},
+       {lane, {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 4}}},
+       {warp, {{0, 0}, {0, 0}}},
+       {block, {}}},
+      {{dim0, 64}, {dim1, 128}}, true);
+  auto batch = LinearLayout::modularIdentity1D(3, reg, S("batch"));
+  auto mixedSrc = src * batch;
+  auto mixedDst = dst * batch;
+  EXPECT_EQ(getVecBitwidthLdSt(mixedSrc, mixedDst, 16), 128);
+  LocalMemOpTile readTile{{}, {0, 1, 4}};
+  auto base = optimalSwizzlingLdSt(src, dst, 16, 32, {}, readTile);
+  auto mixed = optimalSwizzlingLdSt(mixedSrc, mixedDst, 16, 32, {}, readTile);
+  auto projected =
+      mixed.sublayout(llvm::to_vector(mixed.getInDimNames()), {dim0, dim1});
+  for (auto input : {S("vector"), S("bank")}) {
+    EXPECT_EQ(base.getInDimSize(input), projected.getInDimSize(input));
+    for (int bit : llvm::seq(base.getInDimSizeLog2(input)))
+      for (auto dim : {dim0, dim1})
+        EXPECT_EQ(base.getBasis(input, bit, dim),
+                  projected.getBasis(input, bit, dim));
+  }
+}
+
+TEST_F(SwizzleTest, MixedLayoutSelectsProjectedVectorWidth) {
   auto kReg = S("register");
   auto kLane = S("lane");
   auto kWarp = S("warp");
@@ -482,7 +514,8 @@ TEST_F(SwizzleTest, MixedLayoutPreservesPow2TileSwizzle) {
 
   constexpr int32_t numBanks = 32;
   LocalMemOpTile srcTile;
-  LocalMemOpTile dstTile{{}, {0, 1, 4}};
+  EXPECT_EQ(getVecBitwidthLdSt(src, dst, 16), 32);
+  LocalMemOpTile dstTile;
   auto mixed = optimalSwizzlingLdSt(src, dst, /*bitwidth=*/16, numBanks,
                                     srcTile, dstTile);
 

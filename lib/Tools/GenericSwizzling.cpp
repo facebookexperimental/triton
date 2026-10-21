@@ -507,6 +507,16 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   return basis1D.reshapeOuts(outDims);
 }
 
+static LinearLayout projectSwizzledDimensions(const LinearLayout &layout) {
+  SmallVector<StringAttr> dimensions;
+  for (StringAttr dim : layout.getOutDimNames())
+    if (!layout.isOutDimModular(dim))
+      dimensions.push_back(dim);
+  LinearLayout projected =
+      layout.sublayout(llvm::to_vector(layout.getInDimNames()), dimensions);
+  return actionRemoveBroadcastedRegs(projected).apply(projected);
+}
+
 // Swizzle pow2 dimensions and map NPOT dimensions to segment.
 static LinearLayout
 optimalSwizzlingLdStMixed(const LinearLayout &src, const LinearLayout &dst,
@@ -539,11 +549,8 @@ optimalSwizzlingLdStMixed(const LinearLayout &src, const LinearLayout &dst,
         npotPart.getOutDims(), /*requireSurjective=*/true);
   }
 
-  auto inDims = llvm::to_vector(src.getInDimNames());
-  auto srcPow2 = src.sublayout(inDims, pow2Dims);
-  auto dstPow2 = dst.sublayout(inDims, pow2Dims);
-  srcPow2 = actionRemoveBroadcastedRegs(srcPow2).apply(srcPow2);
-  dstPow2 = actionRemoveBroadcastedRegs(dstPow2).apply(dstPow2);
+  auto srcPow2 = projectSwizzledDimensions(src);
+  auto dstPow2 = projectSwizzledDimensions(dst);
 
   auto smemPow2 = optimalSwizzlingLdSt(srcPow2, dstPow2, bitwidth, numBanks,
                                        srcTile, dstTile);
@@ -648,6 +655,13 @@ getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
 
 int32_t getVecBitwidthLdSt(const LinearLayout &src, const LinearLayout &dst,
                            int32_t bitwidth) {
+  if (src.isModular()) {
+    auto srcPow2 = projectSwizzledDimensions(src);
+    auto dstPow2 = projectSwizzledDimensions(dst);
+    if (srcPow2.getNumOutDims() == 0)
+      return bitwidth;
+    return getVecBitwidthLdSt(srcPow2, dstPow2, bitwidth);
+  }
   auto srcFlat = src.flattenOuts();
   auto dstFlat = dst.flattenOuts();
   auto vbasis = getVecBasisLdSt(srcFlat, dstFlat, bitwidth).first;
