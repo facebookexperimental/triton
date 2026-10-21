@@ -28,6 +28,12 @@ from triton.backends.amd import amdgc_hazard_repair
 from triton.backends.amd import compiler as amd_compiler
 from triton.backends.compiler import GPUTarget
 from triton.runtime.jit import MockTensor
+from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
+    _bmm_register_staged,
+    _MT144X256_MI16_KERNEL_SPEC,
+    _MT64X256_MI32_KERNEL_SPEC,
+    _MT224X160_MI16_KERNEL_SPEC,
+)
 from triton.language.extra.tlx.tutorials import amd_fa_cluster as _amd_fa_cluster_module
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
@@ -6736,3 +6742,58 @@ def test_buffer_load_to_local_contiguity_rejects_unpinned_destination_gfx950():
             signature={"x_ptr": "*bf16"},
             constexprs={},
         )
+
+
+def _compile_register_staged_bmm_gfx950(m, n, k, kernel_spec):
+    batch = 1
+    block_m, block_n = kernel_spec.block_m, kernel_spec.block_n
+    instr_shape = kernel_spec.instr_shape
+    warps_per_cta = kernel_spec.warps_per_cta
+    n_blocks = triton.cdiv(n, block_n)
+    tiles_per_batch = triton.cdiv(m, block_m) * n_blocks
+    a = MockTensor(torch.float16, (batch, m, k))
+    b = MockTensor(torch.float16, (batch, k, n))
+    c = MockTensor(torch.float16, (batch, m, n))
+    strides = (0, k, 1, k * n, n, 1, m * n, n, 1)
+
+    with knobs.runtime.scope():
+        knobs.runtime.override_arch = "gfx950"
+        return _bmm_register_staged.warmup(
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            *strides,
+            KERNEL_SPEC=kernel_spec,
+            EVEN_M=m % block_m == 0,
+            EVEN_N=n % block_n == 0,
+            HAS_K_TAIL=k % 32 != 0,
+            N_BLOCKS=n_blocks,
+            BATCH_GROUP=8,
+            GMN=tiles_per_batch,
+            NT=tiles_per_batch,
+            grid=(tiles_per_batch,),
+            num_warps=warps_per_cta[0] * warps_per_cta[1],
+            num_stages=1,
+            matrix_instr_nonkdim=instr_shape[0],
+        )
+
+
+def test_shared_a_bmm_tuned_dispatches_keep_wide_unaligned_loads_gfx950():
+    compiled = [
+        _compile_register_staged_bmm_gfx950(
+            40, 256, 1956, _MT64X256_MI32_KERNEL_SPEC
+        ),
+        _compile_register_staged_bmm_gfx950(
+            262, 256, 294, _MT144X256_MI16_KERNEL_SPEC
+        ),
+        _compile_register_staged_bmm_gfx950(
+            448, 160, 931, _MT224X160_MI16_KERNEL_SPEC
+        ),
+    ]
+    amdgcn = "\n".join(kernel.asm["amdgcn"] for kernel in compiled)
+
+    assert "buffer_load_dwordx2" in amdgcn
+    assert "buffer_load_dwordx4" in amdgcn
