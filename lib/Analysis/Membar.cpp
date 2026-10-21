@@ -54,27 +54,6 @@ static Interval<size_t> narrowIntervalForSubview(Value value,
   return Interval<size_t>(newStart, newStart + stride);
 }
 
-// Index expressions describe a slot of their original allocation, not of an
-// arbitrary allocation whose bytes alias the value. Only attach one when the
-// indexed root owns exactly the buffer id being recorded. Physical intervals
-// still conservatively track views with multiple or uncertain alias owners.
-static bool isOwnBufferIndex(Value value, Allocation::BufferId bufferId,
-                             Allocation &allocation) {
-  while (Operation *def = value.getDefiningOp()) {
-    if (auto index = dyn_cast<triton::gpu::MemDescIndexOp>(def)) {
-      auto alloc = index.getSrc().getDefiningOp<triton::gpu::LocalAllocOp>();
-      if (!alloc)
-        return false;
-      auto ids = allocation.getBufferIds(alloc.getResult());
-      return ids.size() == 1 && ids.front() == bufferId;
-    }
-    if (!isa<triton::gpu::MemDescSubsliceOp, triton::gpu::MemDescTransOp>(def))
-      return false;
-    value = def->getOperand(0);
-  }
-  return false;
-}
-
 static bool isConstantInt(Value value, int64_t expected) {
   APInt constant;
   return matchPattern(value, m_ConstantInt(&constant)) && constant == expected;
@@ -890,10 +869,12 @@ MembarAnalysis::getAllocationSlices(Value value, Value stageBasis) {
                       Allocation::BufferId bufferId) {
     auto slice =
         AllocationSlice(value, interval, bufferId, &allocation, stageBasis);
-    if (isOwnBufferIndex(value, bufferId, allocation))
-      slice.bufferIndexExpr =
-          bufferIndexAnalysis.makeSlice(value, interval, bufferId)
-              .bufferIndexExpr;
+    // Attach unconditionally as upstream does: the disjointness proof checks
+    // same base, indexed source and modulus, so argument-rooted indices are
+    // sound here too.
+    slice.bufferIndexExpr =
+        bufferIndexAnalysis.makeSlice(value, interval, bufferId)
+            .bufferIndexExpr;
     slice.physicalFootprint = footprint;
     slices.push_back(std::move(slice));
   };
