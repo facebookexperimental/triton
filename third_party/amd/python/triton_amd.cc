@@ -353,7 +353,13 @@ static std::optional<std::string> lldInvoke(const char *inPath,
   // Context: lld::elf::LinkerDriver::link uses parallelFor which uses the
   // LLVM's thread pool. During cleanup at ~TaskGroup() the child process hangs
   // waiting.
-  std::array args{"ld.lld", "--threads=1", "-shared", inPath, "-o", outPath};
+  // Facebook begin
+  // Embed a GNU build ID so debuggers and symbol servers can look up this code
+  // object by ID. sha1 hashes the linked output, so identical code objects get
+  // identical 20-byte IDs.
+  std::array args{"ld.lld", "--threads=1", "-shared", "--build-id=sha1",
+                  inPath,   "-o",          outPath};
+  // Facebook end
   std::string errString;
   llvm::raw_string_ostream errStream(errString);
   auto lldRes = lld::lldMain(args, llvm::outs(), errStream,
