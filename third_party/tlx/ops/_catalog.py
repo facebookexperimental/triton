@@ -338,7 +338,7 @@ CATALOG: tuple[OpSpec, ...] = (
     OpSpec(
         op="hstu_cross_attn",
         arch="gfx950",
-        variant="tlx_split_kv",
+        variant="tlx",
         impl="triton.tlx.ops.kernels.hstu_cross_attn.gfx950:hstu_cross_attn",
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") in (16, 32, 64, 128, 256),

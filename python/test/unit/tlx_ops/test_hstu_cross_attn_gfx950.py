@@ -230,8 +230,7 @@ def test_hstu_cross_attn_fwd_kernels_read_no_module_globals():
     # A module global read by a kernel (or anything it calls) keeps every launch off the C launch fast path.
     from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k, gfx950
 
-    for kernel in (gfx950._tlx_gfx950_cross_attn_fwd.curated.fn, gfx950._tlx_gfx950_cross_attn_fwd_split_kv.curated.fn,
-                   _forward_stream_k._hstu_cross_attn_fwd_stream_k):
+    for kernel in (gfx950._tlx_gfx950_cross_attn_fwd.curated.fn, _forward_stream_k._hstu_cross_attn_fwd_stream_k):
         kernel.cache_key
         assert not kernel.used_global_vals, sorted(name for name, _ in kernel.used_global_vals)
 
@@ -244,7 +243,6 @@ def test_hstu_cross_attn_fwd_launches_take_the_c_fast_path(stream_k, monkeypatch
     from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k, gfx950
 
     monkeypatch.setenv(gfx950.STREAM_K_ENV, "1" if stream_k else "0")
-    monkeypatch.setenv(gfx950.KV_SPLITS_ENV, "1")
     kernel = _forward_stream_k._hstu_cross_attn_fwd_stream_k if stream_k else gfx950._tlx_gfx950_cross_attn_fwd.curated.fn
     runs = []
     run = kernel.run
@@ -260,22 +258,6 @@ def test_hstu_cross_attn_fwd_launches_take_the_c_fast_path(stream_k, monkeypatch
         for _ in range(3):
             hstu_cross_attn(**a)
     assert not runs
-
-
-@requires_gfx950
-@pytest.mark.parametrize("splits", [2, 3, 8])
-@pytest.mark.parametrize("num_softmax_heads", [0, 1, 2])
-def test_hstu_cross_attn_split_kv(splits, num_softmax_heads, monkeypatch):
-    # The split heuristic only fires on large shapes; force the count. The KV
-    # lengths give empty chunks, partial last blocks and several full blocks
-    # per chunk, and the backward reads the merged M.
-    from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
-
-    monkeypatch.setenv(gfx950.STREAM_K_ENV, "0")
-    monkeypatch.setenv(gfx950.KV_SPLITS_ENV, str(splits))
-    torch.manual_seed(1009)
-    _run([0, 5, 64, 100, 257, 640, 1000], [3, 17, 64, 65, 128, 129, 200], heads=2, num_softmax_heads=num_softmax_heads,
-         dtype=torch.bfloat16, check_backward=True)
 
 
 @requires_gfx950
@@ -315,8 +297,8 @@ def test_hstu_cross_attn_curated_space_narrows_the_grid_per_head_dim():
     # A head dim with no curated list tunes the whole grid.
     for head_dim in (16, 32, 256):
         assert xa._prune_fwd_to_curated(grid, {}, HEAD_DIM=head_dim) == grid
-    for kernel in (xa._tlx_gfx950_cross_attn_fwd, xa._tlx_gfx950_cross_attn_fwd_split_kv):
-        assert len(kernel.curated.configs) == len(kernel.full.configs) == len(grid)
+    kernel = xa._tlx_gfx950_cross_attn_fwd
+    assert len(kernel.curated.configs) == len(kernel.full.configs) == len(grid)
     # The backward space is small already, so its curated space is the full one.
     assert xa._tlx_gfx950_cross_attn_bwd.curated is xa._tlx_gfx950_cross_attn_bwd.full
 
@@ -341,19 +323,16 @@ def test_hstu_cross_attn_defaults_to_the_curated_space(monkeypatch):
 
 @requires_gfx950
 @pytest.mark.parametrize("num_softmax_heads", [0, 1])
-@pytest.mark.parametrize("splits", [1, 3])
 @pytest.mark.parametrize("index", range(8))
-def test_hstu_cross_attn_each_curated_config_is_correct(index, splits, num_softmax_heads, monkeypatch):
-    # Autotuning only runs the configs that win, so pin each curated config in
-    # turn, through the plain forward (1 split) and the split-KV forward.
+def test_hstu_cross_attn_each_curated_config_is_correct(index, num_softmax_heads, monkeypatch):
+    # Autotuning only runs the configs that win, so pin each curated config in turn.
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     curated = xa._fwd_curated_configs()
     assert len(curated) == len(xa._FWD_CURATED) == 8
-    for kernel in (xa._tlx_gfx950_cross_attn_fwd, xa._tlx_gfx950_cross_attn_fwd_split_kv):
-        monkeypatch.setattr(kernel.curated, "configs", [curated[index]])
-        monkeypatch.setattr(kernel.curated, "cache", {})
+    kernel = xa._tlx_gfx950_cross_attn_fwd
+    monkeypatch.setattr(kernel.curated, "configs", [curated[index]])
+    monkeypatch.setattr(kernel.curated, "cache", {})
     monkeypatch.setenv(xa.STREAM_K_ENV, "0")
-    monkeypatch.setenv(xa.KV_SPLITS_ENV, str(splits))
     torch.manual_seed(1013)
     _run([0, 5, 64, 100, 257, 640, 1000], [3, 17, 64, 65, 128, 129, 200], heads=2, num_softmax_heads=num_softmax_heads,
          dtype=torch.bfloat16, check_backward=True, space="curated")

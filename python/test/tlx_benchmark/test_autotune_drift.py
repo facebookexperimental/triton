@@ -99,8 +99,8 @@ def test_hstu_cross_attn_curated_forward_space_tracks_the_full_grid(governor, mo
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     _check_curated(
         monkeypatch,
-        {"_tlx_gfx950_cross_attn_fwd": "fwd", "_tlx_gfx950_cross_attn_fwd_split_kv": "fwd_split_kv"},
-        [xa._tlx_gfx950_cross_attn_fwd.full, xa._tlx_gfx950_cross_attn_fwd_split_kv.full],
+        {"_tlx_gfx950_cross_attn_fwd": "fwd"},
+        [xa._tlx_gfx950_cross_attn_fwd.full],
         lambda args: hstu_cross_attn(space="full", **args),
         xa._fwd_config_key,
         lambda shape: xa._FWD_CURATED_BY_HEAD_DIM.get(shape.head_dim),
