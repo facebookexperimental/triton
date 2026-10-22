@@ -37,6 +37,9 @@ a{color:var(--series-1)}
 details{margin-top:6px}summary{cursor:pointer;color:var(--text-secondary);font-size:13px;font-weight:600}
 .strip{border-collapse:separate;border-spacing:3px;width:auto}.strip td,.strip th{border:0;padding:0}
 .strip th{font-weight:500;color:var(--text-muted);font-size:10.5px;text-align:center;font-family:ui-monospace,monospace;padding:0 2px}
+.strip a.cell-link{text-decoration:none;display:block}.strip a.cell-link .cell{cursor:pointer}.strip a.cell-link:hover .cell{outline:2px solid var(--text-primary);outline-offset:1px}
+.strip td.gl.step{font-size:12.5px;font-weight:500;padding-left:16px;color:var(--text-secondary)}.strip td.gl[data-g]{cursor:pointer}
+.strip tr.grp td{font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--text-muted);font-weight:650;padding:12px 0 2px}.strip tr.grp .muted{text-transform:none;letter-spacing:0;font-weight:400;font-family:var(--mono,monospace)}
 .strip td.gl{font-size:14px;font-weight:650;color:var(--text-primary);padding-right:12px;white-space:nowrap;vertical-align:middle;width:170px;min-width:170px}
 .strip td{vertical-align:middle}
 .cell{width:46px;height:24px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;cursor:default}
@@ -84,16 +87,12 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 
 <section id="main" role="tabpanel">
 <div class="shead"><h2>Push</h2><span class="q" id="m-q">Did a push to main break something new?</span><span class="owner">Owner: on-call / commit author</span></div>
-<div class="subsec"><h3>GPU Tests</h3><span class="muted">push runs of Meta Triton GPU Tests (<code>gpu-tests.yml</code>)</span></div>
-<div id="m-build"></div>
-<div class="card"><h3>By GPU: verdict and the last pushes, newest first (T+N h = pushed N hours before the data time)</h3><table class="strip" id="m-grid"></table>
-<div class="legend"><span><i class="cell c-pass">✓</i>all pass</span><span><i class="cell c-new">✕</i>new failure</span><span><i class="cell c-known">●</i>known failures only</span><span><i class="cell c-setup">⚠</i>setup failure, no test result</span><span><i class="cell c-na">–</i>not run (path filter or build failed)</span></div></div>
-<div class="card"><div class="chead"><h3 style="margin:0">By test step</h3><span class="seg" id="m-step-sel"></span></div>
-<table class="strip" id="m-steps" style="margin-top:8px"></table>
-<div class="legend"><span><i class="cell c-pass">✓</i>pass</span><span><i class="cell c-new">✕</i>new failure</span><span><i class="cell c-known">●</i>known failure</span><span><i class="cell c-setup">⚠</i>job failed in setup</span><span><i class="cell c-blocked">⊘</i>skipped: an earlier step failed</span><span><i class="cell c-na">–</i>not run</span></div>
-<p class="note">A step that shows ⊘ or – for several pushes is a blind spot: the GPU's verdict cannot see it.</p></div>
+<div id="m-build"></div><div id="t-build"></div>
+<div class="card"><h3>By commit: each test group on the last pushes, newest first (T+N h = pushed N hours before the data time)</h3><table class="strip" id="m-grid"></table>
+<div class="legend"><span><i class="cell c-pass">✓</i>all pass</span><span><i class="cell c-new">✕</i>new failure: this commit broke it</span><span><i class="cell c-known">●</i>still failing from an earlier commit</span><span><i class="cell c-setup">⚠</i>setup or build failure, no test result</span><span><i class="cell c-blocked">⊘</i>step skipped: an earlier step failed</span><span><i class="cell c-setup">?</i>job failed, log unavailable</span><span><i class="cell c-na">…</i>running</span><span><i class="cell c-na">○</i>skipped: nothing this suite tests changed</span><span><i class="cell c-na">–</i>not run on this commit</span></div>
+<p class="note">The Latest column is the newest commit only; the failure tables below keep each suite's last result. Click a GPU to show or hide its test steps; a GPU with failures opens on its own. A step that shows ⊘ or – for several pushes is a blind spot: the GPU's verdict cannot see it.</p></div>
 <div class="card"><h3>New failures: tests that passed on the previous push and fail now</h3><div id="m-new"></div>
-<p class="note">A test is <b>new</b> when it failed on this push and passed on the previous push that ran its step on the same GPU. Pushes where the step was skipped or hit a setup failure do not count. On the step's next result it moves to Known, keeping the push it first failed at. The last column checks the scheduled run of the same commit: a failure it reproduces is real, one it does not is a flake candidate.</p></div>
+<p class="note">A test is <b>new</b> when it failed on this push and passed on the previous push that ran it (for a GPU test, the same step on the same GPU). Pushes where it was skipped, or hit a setup or build failure, do not count. On its next result it moves to Known, keeping the push it first failed at. The last column checks the scheduled GPU run of the same commit: a failure it reproduces is real, one it does not is a flake candidate.</p></div>
 <div class="card"><details open id="m-known-d"><summary id="m-known-s">Known failures</summary><div id="m-known"></div></details>
 <details><summary id="m-setup-s">Setup failures</summary><div id="m-setup"></div><p class="note">A setup failure leaves no test result for that job, so the next push compares against the last push that has one.</p></details></div>
 </section>
@@ -168,43 +167,69 @@ const table=(head,rows,num=[])=>rows.length?`<table><tr>${head.map((h,i)=>`<th c
 const tile=(k,big,d,cls="")=>`<div class="tile"><div class="k">${k}</div><div class="big ${cls}">${big}</div><div class="d">${d}</div></div>`;
 const badge=(id,text,cls)=>{const b=$(id);b.textContent=text;b.className="badge "+cls};
 
-function renderMain(m){
+function renderLit(l){
+  $("t-build").innerHTML="";
+  if(!l)return null;
+  if(l.unknown)$("t-build").innerHTML=`<div class="banner"><b class="bad">✕ LIT job failed</b> at <a href="${esc(l.unknown.url)}">${esc(l.unknown.sha.slice(0,9))}</a>, ${ago(l.unknown.t)}, and its log is unavailable, so which tests failed is unknown.</div>`;
+  if(l.build)$("t-build").innerHTML=`<div class="banner"><b class="bad">✕ LIT build failed</b> at <a href="${esc(l.build.url)}">${esc(l.build.sha.slice(0,9))}</a>, ${ago(l.build.t)}. lit did not run on this push; its verdict is from its last result.</div>`;
+  return l;
+}
+
+let OPEN=null;
+function renderMain(m,l,branch){
+  if(OPEN===null||OPEN.branch!==branch)OPEN=Object.fromEntries(["H100","B200","MI350"].map(g=>[g,m.gpus[g].verdict==="new"||m.gpus[g].verdict==="known"]).concat([["branch",branch]]));
   $("m-build").innerHTML=m.build?`<div class="banner"><b class="bad">✕ Build failed</b> at ${sha(m.build.sha)} ${pr(m.build.pr)} ${who(m.build.author)}, ${ago(m.build.t)}: ${esc(m.build.step)}. No GPU tests ran on this push; each GPU's verdict is from its last result.</div>`:"";
   const all=k=>["H100","B200","MI350"].flatMap(g=>m.gpus[g][k]);
   const S={reproduced:`<span class="bad">✕ reproduced</span><br><span class="muted">not flaky</span>`,"not reproduced":`<span class="warn">✓ passed</span><br><span class="muted">flake candidate</span>`,none:`<span class="na">no scheduled run yet</span>`};
-  $("m-new").innerHTML=table(["GPU","Test","First failed at","Previous push (passed)","Scheduled run, same commit"],
-    all("new").map(i=>[i.gpu,`<code>${esc(i.id)}</code><br><span class="muted">${esc(i.job)} · ${esc(i.step)}</span>${i.msg?`<br><span class="muted">${esc(i.msg.slice(0,160))}</span>`:""}`,
-      `${sha(i.first_sha)} ${pr(i.first_pr)}<br>${who(i.first_author)} · ${ago(i.first_t)}`,i.prev_sha?sha(i.prev_sha):`<span class="muted">first result</span>`,S[i.sched]]));
-  const known=all("known");
+  // GPU and LIT failures share one row shape: Suite, Test, First failed at, ...
+  const litItems=k=>(l?l[k]:[]).map(f=>({...f,gpu:"LIT",where:"compiler.yml"}));
+  const testCell=(i,msg)=>`<code>${esc(i.id)}</code><br><span class="muted">${esc(i.where||`${i.job} · ${i.step}`)}</span>${msg&&i.msg?`<br><span class="muted">${esc(i.msg.slice(0,160))}</span>`:""}`;
+  const firstCell=i=>i.gpu==="LIT"?`<a href="${esc(i.first_url)}">${esc(i.first_sha.slice(0,9))}</a> · ${ago(i.first_t)}<br><span class="muted">${esc(i.first_title.slice(0,70))}</span>`:`${sha(i.first_sha)} ${pr(i.first_pr)}<br>${who(i.first_author)} · ${ago(i.first_t)}`;
+  $("m-new").innerHTML=table(["Suite","Test","First failed at","Previous push (passed)","Scheduled run, same commit"],
+    [...all("new"),...litItems("new")].map(i=>[i.gpu,testCell(i,true),firstCell(i),i.prev_sha?sha(i.prev_sha):`<span class="muted">first result</span>`,i.gpu==="LIT"?`<span class="na">not checked for LIT</span>`:S[i.sched]]));
+  const known=[...all("known"),...litItems("known")];
   $("m-known-s").textContent=`Known failures (${known.length}): carried over from an earlier push`;
-  $("m-known").innerHTML=table(["GPU","Test","First failed at","Pushes in a row","Last passed"],
-    known.map(i=>[i.gpu,`<code>${esc(i.id)}</code><br><span class="muted">${esc(i.job)} · ${esc(i.step)}</span>`,`${sha(i.first_sha)} ${pr(i.first_pr)} ${who(i.first_author)}<br><span class="muted">${ago(i.first_t)}</span>`,i.streak,i.prev_sha?sha(i.prev_sha):`<span class="muted">never seen passing</span>`]),[3]);
+  $("m-known").innerHTML=table(["Suite","Test","First failed at","Pushes in a row","Last passed"],
+    known.map(i=>[i.gpu,testCell(i,true),firstCell(i),i.streak,i.prev_sha?sha(i.prev_sha):`<span class="muted">never seen passing</span>`]),[3]);
   $("m-setup-s").textContent=`Setup failures (${m.setup.length} in the last 10 pushes)`;
   $("m-setup").innerHTML=table(["Push","GPU","Job","Step"],m.setup.map(s=>[`${sha(s.sha)} <span class="muted">${ago(s.t)}</span>`,s.gpu,esc(s.job),esc(s.step)]));
-  const C={pass:["c-pass","✓","all tests pass"],new:["c-new","✕","new failure"],known:["c-known","●","known failures only"],setup:["c-setup","⚠","setup failure, no test result"],na:["c-na","–","not run"]};
-  // The Latest cell shows the GPU's verdict, which comes from its last result even when the latest push skipped it.
-  const V={new:"c-new",known:"c-known",passing:"c-pass",none:"c-na"};
-  const verdict=g=>{const x=m.gpus[g];return {new:`✕ ${x.new.length} new`,known:`● ${x.known.length} known`,passing:"✓ Passing",none:"no results"}[x.verdict]};
-  const latestCell=(g,p)=>{const x=m.gpus[g],stale=p.cells[g]==="na"&&x.sha?`\nnot run on this push; verdict from ${x.sha.slice(0,9)} (${ago(x.t)})`:"";
-    return `<td class="latest"><div class="cell wide ${V[x.verdict]}" data-tip="${esc(`${g} · ${p.sha.slice(0,9)} · ${ago(p.t)}\n${p.title}${stale}`)}">${verdict(g)}</div></td>`};
-  const P=[...m.pushes].reverse(),hrs=p=>Math.round((ASOF-new Date(p.t))/36e5);
-  $("m-grid").innerHTML="<tr><th></th>"+P.map((p,i)=>`<th${i?"":` class="latest"`}>${i?"":"Latest<br>"}<a href="${esc(p.url)}" data-tip="${esc(`${p.sha.slice(0,9)} · ${p.t.replace("T"," ").slice(0,16)} UTC (${ago(p.t)})\n${p.title}`)}">T+${hrs(p)}h</a></th>`).join("")+"</tr>"+
-    ["H100","B200","MI350"].map(g=>`<tr><td class="gl">${g}</td>`+P.map((p,i)=>{if(!i)return latestCell(g,p);const [cl,t,d]=C[p.cells[g]];
-      return `<td><div class="cell ${cl}" data-tip="${esc(`${g} · ${p.sha.slice(0,9)} · ${ago(p.t)}\n${p.title}\n${d}`)}">${t}</div></td>`}).join("")+"</tr>").join("");
-  const SC={pass:["c-pass","✓","pass"],new:["c-new","✕","new failure"],known:["c-known","●","known failure"],setup:["c-setup","⚠","job failed in setup"],blocked:["c-blocked","⊘","skipped: an earlier step failed"],na:["c-na","–","not run"]};
-  const rank={new:0,known:1,passing:2,none:3};
-  let sel=["H100","B200","MI350"].sort((a,b)=>rank[m.gpus[a].verdict]-rank[m.gpus[b].verdict])[0];
-  const drawSteps=()=>{
-    $("m-step-sel").innerHTML=["H100","B200","MI350"].map(g=>`<button type="button" data-g="${g}" aria-pressed="${g===sel}">${g}</button>`).join("");
-    for(const b of $("m-step-sel").querySelectorAll("button"))b.onclick=()=>{sel=b.dataset.g;drawSteps()};
-    const rows=m.steps[sel]||[];
-    if(!rows.length){$("m-steps").innerHTML=`<tr><td class="empty">No test step results for ${sel} in these pushes.</td></tr>`;return}
-    $("m-steps").innerHTML="<tr><th></th>"+P.map((p,i)=>`<th${i?"":` class="latest"`}>${i?"":"Latest<br>"}T+${hrs(p)}h</th>`).join("")+"</tr>"+
-      rows.map(r=>{const cells=[...r.cells].reverse();return `<tr><td class="gl" data-tip="${esc(r.step)}" style="font-size:13px">${esc(r.group)}</td>`+cells.map((c,i)=>{const [cl,t,d]=SC[c],p=P[i];
-        return `<td${i?"":` class="latest"`}><div class="cell ${cl}" data-tip="${esc(`${sel} · ${r.step}\n${p.sha.slice(0,9)} · ${ago(p.t)}\n${d}`)}">${t}</div></td>`}).join("")+"</tr>"}).join("")};
-  drawSteps();
-  const n=all("new").length;
-  if(m.build)badge("b-main","✕ build","bad");else if(n)badge("b-main",`✕ ${n} new`,"bad");else if(known.length)badge("b-main","● known only","warn");else badge("b-main","✓","ok");
+  // One grid: a column per commit, a row per test group. GPU and LIT runs of the same push share a column.
+  const C={pass:["c-pass","✓","all tests pass"],new:["c-new","✕","new failure: this commit broke it"],known:["c-known","●","still failing from an earlier commit"],setup:["c-setup","⚠","setup failure, no test result"],build:["c-setup","⚠","build failed, no lit result"],skip:["c-na","○","skipped: path selection found nothing this suite tests"],running:["c-na","…","running, no result yet"],unknown:["c-setup","?","job failed; its log is unavailable, so the result is unknown"],na:["c-na","–","not run on this commit"]};
+  const LATEST={pass:"✓ Passing",new:"✕ New failure",known:"✕ Failing",skip:"○ Not run",running:"… Running",na:"– Not run",setup:"⚠ Setup failed",build:"⚠ Build failed",unknown:"? Failed, no log"};
+  const cols=new Map();
+  for(const p of m.pushes)cols.set(p.sha,{sha:p.sha,t:p.t,title:p.title,pr:p.pr,gpu:p});
+  for(const p of l?l.pushes:[]){const c=cols.get(p.sha)||{sha:p.sha,t:p.t,title:p.title,pr:null};c.lit=p;if(p.t<c.t)c.t=p.t;cols.set(p.sha,c)}
+  // Each source keeps only its last pushes; drop columns older than the shorter history so a missing cell means "not run".
+  const full=[m.pushes,l&&l.pushes].filter(x=>x&&x.length>=12).map(x=>x[0].t),cut=full.length?full.reduce((a,b)=>a>b?a:b):"";
+  const P=[...cols.values()].filter(c=>c.t>=cut).sort((a,b)=>a.t<b.t?-1:1).slice(-12).reverse();
+  const hrs=p=>Math.round((ASOF-new Date(p.t))/36e5),prOf=c=>c.pr||((c.title||"").match(/\(#(\d+)\)\s*$/)||[])[1];
+  const tip=c=>`${c.sha.slice(0,9)} · ${c.t.replace("T"," ").slice(0,16)} UTC (${ago(c.t)})\n${c.title}`;
+  const group=(name,wf)=>`<tr class="grp"><td colspan="${P.length+1}">${name} <span class="muted">${wf}</span></td></tr>`;
+  const SC={pass:["c-pass","✓","pass"],new:["c-new","✕","new failure: this commit broke it"],known:["c-known","●","still failing from an earlier commit"],setup:["c-setup","⚠","job failed in setup"],blocked:["c-blocked","⊘","skipped: an earlier step failed"],skip:["c-na","○","skipped: path selection found nothing this suite tests"],running:["c-na","…","running, no result yet"],na:["c-na","–","not run on this commit"]};
+  const at=Object.fromEntries(m.pushes.map((p,i)=>[p.sha,i]));
+  // ✕ and ● cells link to the commit that broke them: ✕ is this commit, ● the commit its failure started at.
+  const COMMIT="https://github.com/facebookexperimental/triton/commit/";
+  const link=(st,c,list,html)=>{const to=st==="new"?c.sha:st==="known"&&list&&list.length?list[0].sha:"";
+    return to?`<a class="cell-link" href="${COMMIT}${esc(to)}">${html}</a>`:html};
+  // A known cell's tooltip names the commit(s) its failures started at.
+  const blame=list=>list&&list.length?"\nstarted at:\n"+list.map(b=>`${b.sha.slice(0,9)} ${(b.title||"").slice(0,70)}`).join("\n"):"";
+  // A step gets a row only while it ran on at least one of the commits shown.
+  const steps=g=>(m.steps[g]||[]).filter(r=>P.some(c=>(r.cells[at[c.sha]]||"na")!=="na")).map(r=>`<tr><td class="gl step" data-tip="${esc(r.step)}">${esc(r.group)}</td>`+P.map((c,i)=>{
+            const gs=c.gpu&&c.gpu.cells[g],k=gs==="skip"||gs==="running"?gs:r.cells[at[c.sha]]||"na",[cl,t,d]=SC[k];
+      const from=k==="known"&&r.since?r.since[at[c.sha]]:null,b=blame(from);
+      return `<td${i?"":` class="latest"`}>${link(k,c,from,`<div class="cell ${cl}" data-tip="${esc(`${g} · ${r.step}\n${tip(c)}\n${d}${b}`)}">${t}</div>`)}</td>`}).join("")+"</tr>").join("");
+  const row=(label,x,cell,since)=>`<tr><td class="gl"${x===m.gpus[label]?` data-g="${label}"`:""}>${x===m.gpus[label]?`${OPEN[label]?"▾":"▸"} `:""}${label}</td>`+P.map((c,i)=>{
+      // The Latest cell is the newest commit's own state: a verdict when the row ran there, else why it did not.
+      const st=cell(c),[cl,t,d]=C[st],b=st==="known"?blame(since(c)):"";
+      const div=`<div class="cell${i?"":" wide"} ${!i&&st==="known"?"c-new":cl}" data-tip="${esc(`${label} · ${tip(c)}\n${d}${b}`)}">${i?t:LATEST[st]}</div>`;
+      return `<td${i?"":` class="latest"`}>${link(st,c,since(c),div)}</td>`}).join("")+"</tr>";
+  $("m-grid").innerHTML="<tr><th></th>"+P.map((c,i)=>{const n=prOf(c);return `<th${i?"":` class="latest"`}>${i?"":"Latest<br>"}<a href="https://github.com/facebookexperimental/triton/commit/${esc(c.sha)}" data-tip="${esc(tip(c))}">${n?"#"+esc(n):esc(c.sha.slice(0,7))}</a><br><span class="muted">T+${hrs(c)}h</span></th>`}).join("")+"</tr>"+
+    group("GPU Tests","gpu-tests.yml")+["H100","B200","MI350"].map(g=>row(g,m.gpus[g],c=>c.gpu?c.gpu.cells[g]:"na",c=>c.gpu&&c.gpu.since&&c.gpu.since[g])+(OPEN[g]?steps(g):"")).join("")+
+    group("LIT Tests","compiler.yml")+(l?row("LIT",l,c=>c.lit?c.lit.cell:"na",c=>c.lit&&c.lit.since):`<tr><td class="gl">LIT</td><td colspan="${P.length}" class="muted" style="font-size:12px">runs on pushes to main only, not on ${esc(branch)}</td></tr>`);
+  for(const td of $("m-grid").querySelectorAll("td[data-g]"))td.onclick=()=>{OPEN[td.dataset.g]=!OPEN[td.dataset.g];renderMain(m,l,branch)};
+  const lit=l||{new:[],known:[]};
+  const n=all("new").length+lit.new.length;
+  if(m.build||lit.build)badge("b-main","✕ build","bad");else if(lit.unknown)badge("b-main","✕ LIT failed","bad");else if(n)badge("b-main",`✕ ${n} new`,"bad");else if(known.length)badge("b-main",`✕ ${known.length} failing`,"bad");else badge("b-main","✓","ok");
 }
 
 function renderNightly(nt){
@@ -345,7 +370,7 @@ function renderBranches(d){
     $("branch-sel").innerHTML=Object.keys(d.branches).map(b=>`<button type="button" data-b="${esc(b)}" aria-pressed="${b===cur}">${esc(b)}</button>`).join("");
     for(const b of $("branch-sel").querySelectorAll("button"))b.onclick=()=>{cur=b.dataset.b;draw()};
     $("m-q").textContent=`Did a push to ${cur} break something new?`;
-    const v=d.branches[cur];renderMain(v.main);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderOps(v.ops);renderLLVM(v.bump,cur)};
+    const v=d.branches[cur];renderMain(v.main,renderLit(v.lit),cur);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderOps(v.ops);renderLLVM(v.bump,cur)};
   draw()}
 
 function show(id){if(!$(id)||!$(id).matches("section"))id="main";

@@ -99,12 +99,15 @@ def test_collect_stores_completed_runs_with_jobs_and_keeps_cursor_at_running(tmp
     assert (tmp_path / "changed.txt").read_text().split() == [str(tmp_path / "runs-2026-10.jsonl.gz")]
 
 
-def test_collect_lists_gpu_and_nightly_runs_only(tmp_path):
+def test_collect_lists_gpu_nightly_and_lit_push_runs_only(tmp_path):
     _, api, _ = collect(tmp_path, {})
     listed = [c for c in api.calls if "/workflows/" in c]
     assert {c.split("/workflows/")[1].split("/")[0]
-            for c in listed
-            } == {"gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml", "nightly-fbtriton.yml"}
+            for c in listed} == {
+                "gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml", "nightly-fbtriton.yml",
+                "compiler.yml"
+            }
+    assert [c for c in listed if "/compiler.yml/" in c][0].endswith("&event=push&per_page=100")
 
 
 def test_select_log_gives_the_runs_selection(tmp_path):
@@ -312,3 +315,28 @@ def test_failed_snapshot_keeps_the_previous_bump_json(tmp_path):
     collect(tmp_path, {})
     assert (tmp_path / "bump.json").read_text() == '{"lines": {}}'
     assert "bump.json" not in (tmp_path / "changed.txt").read_text()
+
+
+def test_failed_lit_job_log_gives_the_failing_tests(tmp_path):
+    runs = {"compiler.yml": [gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", event="push")]}
+    lit_step = {
+        "name": "Build and run LIT tests", "conclusion": "failure", "number": 1, "started_at": "2026-10-12T01:01:00Z",
+        "completed_at": "2026-10-12T01:04:00Z"
+    }
+    jobs = {1: [gh_job(11, "LIT Tests", "failure", [lit_step]), gh_job(12, "report-compiler-lit")]}
+    log = ("2026-10-12T01:02:00.1Z FAIL: TRITON :: TritonGPU/a.mlir (401 of 646)\n"
+           "2026-10-12T01:02:00.2Z ******************** TEST 'TRITON :: TritonGPU/a.mlir' FAILED ********************\n"
+           "2026-10-12T01:02:00.3Z # | /w/test/TritonGPU/a.mlir:32:50: error: undefined variable: MMA\n")
+    _, _, text = collect(tmp_path, runs, jobs, logs={11: log})
+    run = ch.load_runs(str(tmp_path))[1]
+    assert run["wf"] == "compiler.yml"
+    assert run["jobs"][0]["steps"][0]["failures"] == [{"id": "TritonGPU/a.mlir", "msg": "undefined variable: MMA"}]
+    assert text.calls == ["repos/facebookexperimental/triton/actions/jobs/11/logs"]
+
+
+def test_unreadable_lit_log_marks_the_job_log_missing(tmp_path):
+    runs = {"compiler.yml": [gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", event="push")]}
+    jobs = {1: [gh_job(11, "LIT Tests", "failure")]}
+    collect(tmp_path, runs, jobs, logs={})
+    j = ch.load_runs(str(tmp_path))[1]["jobs"][0]
+    assert j["log_missing"] is True and "failures" not in j["steps"][0]
