@@ -1,3 +1,4 @@
+import base64
 import json
 
 import ci_health as ch
@@ -69,9 +70,14 @@ JOBS = {1: [gh_job(11, "h100 / h100-tlx-test")]}
 NOW = "2026-10-12T03:00:00Z"
 
 
-def collect(tmp_path, runs, jobs=JOBS, since="2026-10-12T00:00:00Z", now=NOW, logs=None, pulls=None, remaining=5000):
+def no_get(path):
+    raise subprocess.CalledProcessError(1, "gh", stderr="HTTP 404")
+
+
+def collect(tmp_path, runs, jobs=JOBS, since="2026-10-12T00:00:00Z", now=NOW, logs=None, pulls=None, remaining=5000,
+            get=no_get):
     api, text = fake_api(runs, jobs, remaining, pulls), fake_text(logs or {})
-    state = ch.collect(str(tmp_path), since, now, api=api, text=text)
+    state = ch.collect(str(tmp_path), since, now, api=api, text=text, get=get)
     return state, api, text
 
 
@@ -225,3 +231,84 @@ def test_a_run_stuck_in_pending_does_not_pin_the_cursor(tmp_path):
     runs = {"gpu-tests.yml": [gh_run(1, "2026-10-01T01:00:00Z", "pending", None)]}
     state, _, _ = collect(tmp_path, runs, since="2026-09-30T00:00:00Z")
     assert state["cursor"] == "2026-10-12T03:00:00Z"
+
+
+def fake_get(responses):
+
+    def get(path):
+        for prefix, value in responses.items():
+            if path.startswith(prefix):
+                return value
+        raise subprocess.CalledProcessError(1, "gh", stderr=f"HTTP 404: {path}")
+
+    return get
+
+
+def meta_file(tag, llvm_hash):
+    body = json.dumps({"llvm_hash": llvm_hash, "release_base_url": f"https://x/download/{tag}"})
+    return {"content": base64.b64encode(body.encode()).decode()}
+
+
+def fork_commit(sha, title):
+    return {"sha": sha, "commit": {"message": title + "\n\nbody"}}
+
+
+T, F = "repos/facebookexperimental/triton", "repos/facebookexperimental/llvm-project"
+A, B, C = "a" * 40, "b" * 40, "c" * 40
+
+
+def test_snapshot_line_reads_pin_pending_changes_issues_and_history():
+    get = fake_get({
+        f"{T}/contents/cmake/meta-llvm-info.json?ref=main":
+        meta_file("llvm-bbbbbbbb-1", B),
+        f"{T}/contents/cmake/meta-llvm-info.json?ref={'2' * 40}":
+        meta_file("llvm-bbbbbbbb-1", B),
+        f"{T}/contents/cmake/meta-llvm-info.json?ref={'1' * 40}":
+        meta_file("llvm-aaaaaaaa-1", A),
+        f"{F}/commits?sha=triton_beta": [{"sha": C, "commit": {"tree": {"sha": "t"}}}],
+        f"{F}/compare/{B}...{C}": {
+            "commits": [
+                fork_commit("s" * 40, "fbshipit-source-id: 48d598b00a9b"),
+                fork_commit("d" * 40, "[triton/beta] Backport VOPD fix (#18)")
+            ]
+        },
+        f"{T}/pulls?head=":
+        [{"number": 4282, "title": "[Meta LLVM] Bump main", "html_url": "p", "user": {"login": "me"}}],
+        f"{T}/commits?sha=main&path=cmake/meta-llvm-info.json": [
+            {
+                "sha": "2" * 40, "commit": {
+                    "message": "[Meta LLVM] Bump main to llvm-bbbbbbbb-1 (#4300)", "committer":
+                    {"date": "2026-10-20T00:00:00Z"}
+                }
+            },
+            {
+                "sha": "1" * 40, "commit":
+                {"message": "Build against the fork (#4122)", "committer": {"date": "2026-10-16T00:00:00Z"}}
+            },
+        ],
+    })
+    releases = [{"tag_name": "llvm-cccccccc-1", "target_commitish": C, "published_at": "2026-10-21T00:00:00Z"}]
+    issues = [
+        {
+            "number": 7, "title": "[Meta LLVM] Bump ready: main", "state": "open", "html_url": "i7", "created_at":
+            "2026-10-21T02:00:00Z", "body": "<!-- meta-llvm-bump main -->"
+        },
+        {
+            "number": 8, "title": "[Meta LLVM] Bump ready: release/3.8.x", "state": "open", "html_url": "i8",
+            "created_at": "2026-10-21T02:00:00Z", "body": "<!-- meta-llvm-bump release/3.8.x -->"
+        },
+    ]
+    line = ch.snapshot_line(get, "main", "triton_beta", releases, issues)
+    assert line["pinned"] == {"tag": "llvm-bbbbbbbb-1", "llvm_hash": B, "base": None}
+    assert line["newest"]["tag"] == "llvm-cccccccc-1"
+    assert line["pending"] == [{"sha": "d" * 40, "title": "[triton/beta] Backport VOPD fix", "pr": 18}]
+    assert line["pr"]["number"] == 4282 and [i["number"] for i in line["issues"]] == [7]
+    assert [(h["pr"], h["tag"]) for h in line["history"]] == [(4300, "llvm-bbbbbbbb-1"), (4122, "llvm-aaaaaaaa-1")]
+    assert [(h["prev_hash"], h["llvm_hash"]) for h in line["history"]] == [(A, B), (None, A)]
+
+
+def test_failed_snapshot_keeps_the_previous_bump_json(tmp_path):
+    (tmp_path / "bump.json").write_text('{"lines": {}}')
+    collect(tmp_path, {})
+    assert (tmp_path / "bump.json").read_text() == '{"lines": {}}'
+    assert "bump.json" not in (tmp_path / "changed.txt").read_text()

@@ -11,6 +11,8 @@ page_data() builds the data.json the page renders, one section per tab:
   nightly  the nightly release and the bench dashboard's perf events.
   pr       the latest run of each PR in the last 24 h, tagged by whose it is.
   ops      GPU hours, job durations and setup failures.
+  bump     is the branch's Meta LLVM pin current, what a newer fork release
+           would add, the open bump issues, and the pin's recent changes.
 No I/O.
 """
 import collections
@@ -646,8 +648,17 @@ def select_view(runs, asof):
     return {"days": [{"day": d, "triggers": by_day[d]} for d in days], "anomalies": anomalies}
 
 
-def page_data(runs, asof, bench):
-    """The data.json the /ci/ page renders, computed from stored run records and bench perf events."""
+def bump_view(line):
+    """The Meta LLVM tab of one tracked branch, from its bump.json entry (None before the first snapshot).
+    status: current (pins the newest fork release), new (a newer release is not pinned yet) or unknown."""
+    if not line or not line.get("newest") or not line.get("pinned"):
+        return {"status": "unknown", **(line or {})}
+    return {"status": "current" if line["pinned"]["tag"] == line["newest"]["tag"] else "new", **line}
+
+
+def page_data(runs, asof, bench, bump=None):
+    """The data.json the /ci/ page renders, computed from stored run records, bench perf events and the Meta LLVM
+    pin snapshot."""
     branches = {}
     for b in TRACKED_BRANCHES:
         rs = [r for r in runs if tracked_branch(r) == b]
@@ -655,6 +666,7 @@ def page_data(runs, asof, bench):
         # The bench dashboard's perf events come from main's nightly bench.
         branches[b] = {
             "main": main, "nightly": nightly_view(rs, asof, bench if b == "main" else {}), "pr":
-            pr_view(rs, asof, main, b), "ops": ops_view(rs, asof)
+            pr_view(rs, asof, main, b), "ops": ops_view(rs, asof), "bump": bump_view(((bump or {}).get("lines")
+                                                                                      or {}).get(b))
         }
     return {"asof": asof, "branches": branches}

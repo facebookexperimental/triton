@@ -449,7 +449,7 @@ def test_failed_select_is_an_anomaly():
 def test_page_data_has_one_section_per_tab():
     data = r.page_data([push(1, tlx())], stamp(23), {})
     assert set(data) == {"asof", "branches"}
-    assert all(set(v) == {"main", "nightly", "pr", "ops"} for v in data["branches"].values())
+    assert all(set(v) == {"main", "nightly", "pr", "ops", "bump"} for v in data["branches"].values())
 
 
 def test_every_test_step_in_the_gpu_workflows_maps_to_a_group():
@@ -490,3 +490,11 @@ def test_step_grid_marks_setup_and_not_run():
 def test_step_grid_has_no_rows_for_a_gpu_without_results():
     v = main([push(1, tlx())])
     assert v["steps"]["MI350"] == []
+
+
+def test_bump_status_compares_the_pin_with_the_newest_release():
+    line = {"pinned": {"tag": "llvm-aaaaaaaa-1"}, "newest": {"tag": "llvm-bbbbbbbb-1"}}
+    assert r.bump_view(line)["status"] == "new"
+    assert r.bump_view({**line, "newest": {"tag": "llvm-aaaaaaaa-1"}})["status"] == "current"
+    assert r.bump_view(None)["status"] == "unknown"
+    assert r.page_data([], stamp(23), {}, {"lines": {"main": line}})["branches"]["main"]["bump"]["status"] == "new"
