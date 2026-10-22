@@ -333,17 +333,24 @@ def _relabel_keys(p):
 
 @triton.jit
 def _block_max(s):
-    # Each row's max score per 32-key block. In the transposed 32x32 MFMA
-    # layout a lane holds one row, and key 32t + 8j + 4h + i sits in register
-    # (t, j, i) of lane half h: a reduction over registers, then one across the
-    # two halves.
-    return tl.max(tl.reshape(s, (s.shape[0], 2, 32)), 2)
+    # Each row's max score in the 32-key blocks s[0], s[1]. In the transposed
+    # 32x32 MFMA layout a lane holds one row, and key 8j + 4h + i of a block
+    # sits in register (j, i) of lane half h: a reduction over registers, then
+    # one across the two halves.
+    return tl.max(tl.join(s[0], s[1]), 1)
 
 
 @triton.jit
 def _per_block(x):
-    # [row, block] values over each block's 32 keys.
-    return tl.reshape(tl.broadcast_to(x[:, :, None], (x.shape[0], 2, 32)), (x.shape[0], 64))
+    # [row, block] values as each block's [row, key] tile.
+    return tl.split(tl.broadcast_to(x[:, None, :], (x.shape[0], 32, 2)))
+
+
+@triton.jit
+def _row_max(s0, s1):
+    # Each row's max over the 32-key blocks of s0 and s1, reduced block by
+    # block as in _block_max, so the reductions are shared.
+    return tl.maximum(tl.maximum(tl.max(s0[0], 1), tl.max(s0[1], 1)), tl.maximum(tl.max(s1[0], 1), tl.max(s1[1], 1)))
 
 
 @triton.jit
@@ -425,47 +432,59 @@ def _scale_row_sums(t0, t1, p0, p1, l_i):
 
 @triton.jit
 def _p_half(s, tmax, FAST_EXP: tl.constexpr):
-    # One 64-key half of P in MXFP8 from scores s whose 32-key blocks peak at
-    # tmax: (E4M3 in the PV operand order, E8M0 per 32 keys of each row). The
-    # scales are pinned to the scores' MFMA layout (the reshape leaves them in
-    # an equivalent linear one); otherwise the scores get converted to it and
-    # the accumulators lose the MFMA layout.
+    # One 64-key half of P in MXFP8 from the scores s of its two 32-key blocks,
+    # which peak at tmax: (E4M3 in the PV operand order, E8M0 per 32 keys of
+    # each row). The scales are pinned to the scores' MFMA layout (the split
+    # leaves them in an equivalent linear one); otherwise the scores get
+    # converted to it and the accumulators lose the MFMA layout. The blocks of
+    # P are joined in that layout too, which moves whole registers: in the
+    # join's, the two blocks alternate byte by byte.
     mfma: tl.constexpr = tlx.amd_mfma_layout(4, [32, 32, 64], True, [8, 1])
     byte, scale = _p_scales(tmax, FAST_EXP)
     if FAST_EXP:
-        bits = _exp2_bf16_bits(s)
+        bits0 = _exp2_bf16_bits(s[0])
+        bits1 = _exp2_bf16_bits(s[1])
     else:
-        bits = tl.math.exp2(s).to(tl.bfloat16)
-    p = _to_e4m3(bits, tlx.require_layout(_per_block(scale), mfma))
-    return _relabel_keys(p), byte
+        bits0 = tl.math.exp2(s[0]).to(tl.bfloat16)
+        bits1 = tl.math.exp2(s[1]).to(tl.bfloat16)
+    scale0, scale1 = _per_block(scale)
+    p0 = _to_e4m3(bits0, tlx.require_layout(scale0, mfma))
+    p1 = _to_e4m3(bits1, tlx.require_layout(scale1, mfma))
+    p = tl.reshape(tl.permute(tl.join(p0, p1), (0, 2, 1)), (p0.shape[0], 2 * p0.shape[1]))
+    return _relabel_keys(tlx.require_layout(p, mfma)), byte
 
 
 @triton.jit
 def _causal_mask(x, lim, KEY_BASE: tl.constexpr):
-    # x with -inf where key KEY_BASE + c of its 64 keys (counted in the Q
+    # x with -inf where key KEY_BASE + c of its 32 keys (counted in the Q
     # tile's span) is past row r's last visible key lim[r].
-    # Key 32t + 8j + 4h + i sits in register (t, j, i) of lane half h (see
-    # _block_max), so each test is a register's constant against one per-lane
-    # limit. KEY_BASE reaches the limit through an asm LLVM cannot see into:
-    # from a constant, the tests would be hoisted out of the loops and their
-    # lane masks spill.
+    # Key 8j + 4h + i sits in register (j, i) of lane half h (see _block_max),
+    # so each test is a register's constant against one per-lane limit.
+    # KEY_BASE reaches the limit through an asm LLVM cannot see into: from a
+    # constant, the tests would be hoisted out of the loops and their lane
+    # masks spill.
     R: tl.constexpr = x.shape[0]
     base = tl.inline_asm_elementwise("s_mov_b32 $0, $1", "=s,s", [KEY_BASE], dtype=tl.int32, is_pure=False, pack=1)
-    t = tl.arange(0, 2)[None, :, None, None, None]
-    j = tl.arange(0, 4)[None, None, :, None, None]
-    h = tl.arange(0, 2)[None, None, None, :, None]
-    i = tl.arange(0, 4)[None, None, None, None, :]
-    lim = lim[:, None, None, None, None] - 4 * h - base
-    m = tl.where(32 * t + 8 * j + i <= lim, tl.reshape(x, (R, 2, 4, 2, 4)), float("-inf"))
+    j = tl.arange(0, 4)[None, :, None, None]
+    h = tl.arange(0, 2)[None, None, :, None]
+    i = tl.arange(0, 4)[None, None, None, :]
+    lim = lim[:, None, None, None] - 4 * h - base
+    m = tl.where(8 * j + i <= lim, tl.reshape(x, (R, 4, 2, 4)), float("-inf"))
     return tl.reshape(m, (R, x.shape[1]))
 
 
+# A diagonal tile's scores as _diag_asm operands: 4 groups of 32 keys, each
+# _DIAG_PACK registers per lane.
+_DIAG_GROUPS = 4
+_DIAG_PACK = tl.constexpr(16)
+
+
 def _diag_asm():
-    # Masks a diagonal tile's scores in place for one warp. Operands: s0 and s1
-    # out ($0-$63) and in ($64-$127), -inf in a VGPR ($128) and d, the warp's
-    # first row less the tile's first key ($160, an SGPR). Warp w holds rows
-    # 32w .. 32w + 31, so its 32-key group g = d / 32 is its diagonal block,
-    # the groups before it stay and the ones after it go to -inf; d < 0 (all
+    # Masks a diagonal tile's scores in place for one warp. Operands: its
+    # groups out, then in, then -inf in a VGPR and d, the warp's first row less
+    # the tile's first key (an SGPR), each _DIAG_PACK copies. Warp w holds rows
+    # 32w .. 32w + 31, so its group g = d / 32 is its diagonal block, the
+    # groups before it stay and the ones after it go to -inf; d < 0 (all
     # hidden, already -inf from the accumulator start) and d >= 128 (all in
     # view) leave the scores as they are. In the transposed 32x32 MFMA layout
     # element 4j + i of group g is operand 16g + 4j + i and holds key
@@ -476,38 +495,42 @@ def _diag_asm():
     # hidden groups after g are a suffix of one run of moves, entered at group
     # g + 1. The scores come from MFMAs that inline asm gets no hazard wait
     # states for, hence the nops.
+    p = _DIAG_PACK.value
+    neg = f"${2 * _DIAG_GROUPS * p}"
+    d = f"${2 * _DIAG_GROUPS * p + p}"
     L = lambda name: f".Ldiag_{name}_${{:uid}}"
     lines = [
-        "s_cmp_lt_i32 $160, 0",
+        f"s_cmp_lt_i32 {d}, 0",
         f"s_cbranch_scc1 {L('end')}",
-        "s_cmp_lt_i32 $160, 32",
+        f"s_cmp_lt_i32 {d}, 32",
         f"s_cbranch_scc1 {L('t0')}",
-        "s_cmp_lt_i32 $160, 64",
+        f"s_cmp_lt_i32 {d}, 64",
         f"s_cbranch_scc1 {L('t1')}",
-        "s_cmp_lt_i32 $160, 96",
+        f"s_cmp_lt_i32 {d}, 96",
         f"s_cbranch_scc1 {L('t2')}",
-        "s_cmp_lt_i32 $160, 128",
+        f"s_cmp_lt_i32 {d}, 128",
         f"s_cbranch_scc0 {L('end')}",
     ]
     for g in (3, 2, 1, 0):
         lines += [f"{L(f't{g}')}:", "s_nop 7", "s_nop 7", "s_nop 3", "s_mov_b32 vcc_lo, -1", "s_mov_b32 vcc_hi, -16"]
-        for k in range(16):
+        for k in range(p):
             if k:
                 step = 5 if k % 4 == 0 else 1
                 lines += [f"s_lshl_b32 vcc_lo, vcc_lo, {step}", f"s_lshl_b32 vcc_hi, vcc_hi, {step}"]
-            lines.append(f"v_cndmask_b32 ${16 * g + k}, $128, ${16 * g + k}, vcc")
+            lines.append(f"v_cndmask_b32 ${p * g + k}, {neg}, ${p * g + k}, vcc")
         if g:
             lines.append(f"s_branch {L('end') if g == 3 else L(f'h{g + 1}')}")
     for g in (1, 2, 3):
         lines.append(f"{L(f'h{g}')}:")
-        lines += [f"v_mov_b32 ${16 * g + k}, $128" for k in range(16)]
+        lines += [f"v_mov_b32 ${p * g + k}, {neg}" for k in range(p)]
     lines.append(f"{L('end')}:")
     return "\n\t".join(lines)
 
 
 _DIAG_ASM = tl.constexpr(_diag_asm())
-_DIAG_CONSTRAINTS = tl.constexpr(",".join(["=v"] * 64 + [str(e) for e in range(64)] + ["v"] * 32 + ["s"] * 32 +
-                                          ["~{vcc}", "~{scc}"]))
+_DIAG_CONSTRAINTS = tl.constexpr(
+    ",".join(["=v"] * (_DIAG_GROUPS * _DIAG_PACK.value) + [str(e) for e in range(_DIAG_GROUPS * _DIAG_PACK.value)] +
+             ["v"] * _DIAG_PACK.value + ["s"] * _DIAG_PACK.value + ["~{vcc}", "~{scc}"]))
 
 
 @triton.jit
@@ -519,38 +542,13 @@ def _first_row():
 
 @triton.jit
 def _diag_mask(s0, s1, d):
-    # s0, s1 (keys [0, 64) and [64, 128) of a diagonal tile) with -inf where a
-    # key is past its row; d is the warp's first row less the tile's first key.
-    neg = tl.full(s0.shape, float("-inf"), tl.float32)
-    return tl.inline_asm_elementwise(_DIAG_ASM, _DIAG_CONSTRAINTS, [s0, s1, neg, d], dtype=(tl.float32, tl.float32),
-                                     is_pure=True, pack=32)
-
-
-@triton.jit
-def _one_score(s):
-    # One score per lane: the splits drop the register dimensions of key
-    # 32t + 8j + 4h + i, leaving lane half h.
-    R: tl.constexpr = s.shape[0]
-    x, _ = tl.split(tl.reshape(s, (R, 2, 4, 2, 2, 2)))
-    x, _ = tl.split(x)
-    x = tl.reshape(tl.permute(x, (0, 3, 1, 2)), (R, 2, 2, 2, 2))
-    x, _ = tl.split(x)
-    x, _ = tl.split(x)
-    x, _ = tl.split(x)
-    return x
-
-
-@triton.jit
-def _score_flag(s0, s1):
-    # Whether a score of either half is NaN on some lane: a branch on a
-    # condition that reads the scores stays in both QK dots' forward slices,
-    # which their MFMA layout choice depends on. The branch body tests diag
-    # again, so LLVM folds the condition to diag and waits for no MFMA.
-    R: tl.constexpr = s0.shape[0]
-    a = _one_score(s0)
-    b = _one_score(s1)
-    lanes: tl.constexpr = tlx.layout(shape=((32, 2, R // 32), (1, )), stride=((2, 1, 64), (1, )))
-    return tlx.warp_any(tlx.require_layout((a != a) | (b != b), lanes))
+    # s0, s1 (the 32-key blocks of keys [0, 64) and [64, 128) of a diagonal
+    # tile) with -inf where a key is past its row; d is the warp's first row
+    # less the tile's first key.
+    neg = tl.full(s0[0].shape, float("-inf"), tl.float32)
+    m = tl.inline_asm_elementwise(_DIAG_ASM, _DIAG_CONSTRAINTS, [s0[0], s0[1], s1[0], s1[1], neg, d],
+                                  dtype=(tl.float32, tl.float32, tl.float32, tl.float32), is_pure=True, pack=_DIAG_PACK)
+    return (m[0], m[1]), (m[2], m[3])
 
 
 @triton.jit
@@ -567,9 +565,9 @@ def _pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_E
     # r // 32); otherwise warp_any gets a default layout and a shuffle.
     C: tl.constexpr = _score_scale(FAST_EXP)
     OFF: tl.constexpr = _score_offset(FAST_EXP)
-    vote_layout: tl.constexpr = tlx.layout(shape=((32, 2, s0.shape[0] // 32), (1, )), stride=((1, 0, 32), (1, )))
+    vote_layout: tl.constexpr = tlx.layout(shape=((32, 2, m_i.shape[0] // 32), (1, )), stride=((1, 0, 32), (1, )))
     if not ZERO_SCALE:
-        s1 = s1 * qk_scale
+        s1 = (s1[0] * qk_scale, s1[1] * qk_scale)
     tmax0 = _block_max(s0)
     tmax1 = _block_max(s1)
     row = tl.maximum(tl.max(tmax0, 1), tl.max(tmax1, 1))
@@ -581,14 +579,14 @@ def _pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_E
         # a blocked layout and converted around every PV. Shift the scores in
         # place: computing P in both branches keeps P and the scores live
         # together and pushes the kernel past 256 VGPRs.
-        up = tl.maximum(tl.maximum(tl.max(s0, 1), tl.max(s1, 1)) - OFF * C, 0.0)
+        up = tl.maximum(_row_max(s0, s1) - OFF * C, 0.0)
         alpha = tl.math.exp2(up * (-1.0 / C))[:, None]
         acc0 = acc0 * alpha
         acc1 = acc1 * alpha
         acc2 = acc2 * alpha
         acc3 = acc3 * alpha
-        s0 = s0 - up[:, None]
-        s1 = s1 - up[:, None]
+        s0 = (s0[0] - up[:, None], s0[1] - up[:, None])
+        s1 = (s1[0] - up[:, None], s1[1] - up[:, None])
         m_i = m_i + up * (1.0 / C)
         tshift = -tl.maximum(row - OFF * C, 0.0)
     # The block maxima and the row sums follow outside the branch (a shift of
@@ -621,21 +619,34 @@ def _issue_tile(k_ptr, v_ptr, ks_ptr, vs_ptr, ka, kb, va, vb, ksa, ksb, vsa, vsb
 
 @triton.jit
 def _ld_k(kbuf, half: tl.constexpr):
-    # One head-dim half of a K tile.
-    return tlx.local_load(tlx.local_slice(kbuf, [64 * half, 0], [64, kbuf.shape[1]]), relaxed=True)
+    # One head-dim half of a K tile, as its two 32-key blocks: one MFMA tile
+    # wide, a QK dot can only split its 8 warps by rows, as the softmax needs.
+    # (A 64-key dot gets 4 x 2 warps unless the compiler sees its result reach
+    # a PV dot.)
+    k0 = tlx.local_load(tlx.local_slice(kbuf, [64 * half, 0], [64, 32]), relaxed=True)
+    k1 = tlx.local_load(tlx.local_slice(kbuf, [64 * half, 32], [64, 32]), relaxed=True)
+    return k0, k1
+
+
+@triton.jit
+def _key_blocks(s):
+    # [64 keys, d-block] scales as those of keys 0 .. 31 and 32 .. 63.
+    return tl.split(tl.permute(tl.reshape(s, (2, 32, s.shape[1])), (1, 2, 0)))
 
 
 @triton.jit
 def _ld_ks(ksbuf):
     # The E8M0 scales of 64 keys in the packed K order: lane l's word holds
     # keys l % 32 and l % 32 + 32 at d-block l // 32 of both head-dim halves,
-    # so one word per lane feeds both QK MFMA pairs. Returns the scales of the
-    # low and high head-dim halves, [key, block] each.
+    # so one word per lane feeds all four QK MFMAs. Returns the scales of the
+    # low and high head-dim halves, each as the [key, block] scales of the two
+    # 32-key blocks.
     view: tl.constexpr = tlx.shared_linear_layout_encoding([[32, 0, 0], [0, 0, 1], [1, 0, 0], [2, 0, 0], [4, 0, 0],
                                                             [8, 0, 0], [16, 0, 0], [0, 1, 0]])
     lanes: tl.constexpr = tlx.layout(shape=((32, 2, 8), (2, 2)), stride=((4, 2, 0), (128, 1)))
     ks = tlx.local_reinterpret(ksbuf, tl.uint8, [64, 2, 2], layout=view)
-    return tl.split(tlx.local_load(ks, layout=lanes, relaxed=True))
+    lo, hi = tl.split(tlx.local_load(ks, layout=lanes, relaxed=True))
+    return _key_blocks(lo), _key_blocks(hi)
 
 
 @triton.jit
@@ -700,7 +711,7 @@ def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0
                 # A warp whose rows all come before the tile's keys starts its
                 # scores at -inf, which the MFMAs keep.
                 offset = tl.where(diag & (first < KEY_BASE), float("-inf"), offset)
-    init = tl.broadcast_to(offset[:, None], (q_lo.shape[0], ka.shape[1]))
+    init = tl.broadcast_to(offset[:, None], (q_lo.shape[0], 32))
     ones = _rowsum_b()
     t0 = tl.dot(_as_rowsum_a(p0[0]), ones, tl.zeros([q_lo.shape[0] // 2, 16], dtype=tl.float32))
     kA0 = _ld_k(ka, 0)
@@ -716,7 +727,8 @@ def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0
         init0 = tl.zeros_like(init)
     else:
         init0 = init
-    s0 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kA0, sA0, "e4m3", acc=init0, fast_math=True)
+    s0 = (tl.dot_scaled(q_lo, qs_lo, "e4m3", kA0[0], sA0[0], "e4m3", acc=init0, fast_math=True),
+          tl.dot_scaled(q_lo, qs_lo, "e4m3", kA0[1], sA0[1], "e4m3", acc=init0, fast_math=True))
     vA1 = _ld_v(va, 1)
     tlx.amd_sched_barrier(0)
     l_i = _scale_row_sums(t0, t1, p0, p1, l_i)
@@ -726,7 +738,8 @@ def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0
     acc1 = _pv(p0, vA1, vsA1, acc1)
     vA2 = _ld_v(va, 2)
     tlx.amd_sched_barrier(0)
-    s0 = tl.dot_scaled(q_hi, qs_hi, "e4m3", kA1, sA1, "e4m3", acc=s0, fast_math=True)
+    s0 = (tl.dot_scaled(q_hi, qs_hi, "e4m3", kA1[0], sA1[0], "e4m3", acc=s0[0], fast_math=True),
+          tl.dot_scaled(q_hi, qs_hi, "e4m3", kA1[1], sA1[1], "e4m3", acc=s0[1], fast_math=True))
     vA3 = _ld_v(va, 3)
     tlx.amd_sched_barrier(0)
     acc2 = _pv(p0, vA2, vsA2, acc2)
@@ -741,7 +754,8 @@ def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0
         init1 = tl.zeros_like(init)
     else:
         init1 = init
-    s1 = tl.dot_scaled(q_lo, qs_lo, "e4m3", kB0, sB0, "e4m3", acc=init1, fast_math=True)
+    s1 = (tl.dot_scaled(q_lo, qs_lo, "e4m3", kB0[0], sB0[0], "e4m3", acc=init1, fast_math=True),
+          tl.dot_scaled(q_lo, qs_lo, "e4m3", kB0[1], sB0[1], "e4m3", acc=init1, fast_math=True))
     vB1 = _ld_v(vb, 1)
     tlx.amd_sched_barrier(0)
     acc0 = _pv(p1, vB0, vsB0, acc0)
@@ -750,24 +764,24 @@ def _mfma_stage(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, va, vb, vsa, vsb, p0
     acc1 = _pv(p1, vB1, vsB1, acc1)
     vB2 = _ld_v(vb, 2)
     tlx.amd_sched_barrier(0)
-    s1 = tl.dot_scaled(q_hi, qs_hi, "e4m3", kB1, sB1, "e4m3", acc=s1, fast_math=True)
+    s1 = (tl.dot_scaled(q_hi, qs_hi, "e4m3", kB1[0], sB1[0], "e4m3", acc=s1[0], fast_math=True),
+          tl.dot_scaled(q_hi, qs_hi, "e4m3", kB1[1], sB1[1], "e4m3", acc=s1[1], fast_math=True))
     vB3 = _ld_v(vb, 3)
     tlx.amd_sched_barrier(0)
     acc2 = _pv(p1, vB2, vsB2, acc2)
     acc3 = _pv(p1, vB3, vsB3, acc3)
     if ZERO_SCALE:
-        s0 = tl.fma(s0, qk_scale, init)
-        s1 = tl.fma(s1, qk_scale, init)
+        s0 = (tl.fma(s0[0], qk_scale, init), tl.fma(s0[1], qk_scale, init))
+        s1 = (tl.fma(s1[0], qk_scale, init), tl.fma(s1[1], qk_scale, init))
         if MASK:
             lim = tl.where(diag, tl.arange(0, q_lo.shape[0]), 1 << 20)
-            s0 = _causal_mask(s0, lim, KEY_BASE)
-            s1 = _causal_mask(s1, lim, KEY_BASE + 64)
+            s0 = (_causal_mask(s0[0], lim, KEY_BASE), _causal_mask(s0[1], lim, KEY_BASE + 32))
+            s1 = (_causal_mask(s1[0], lim, KEY_BASE + 64), _causal_mask(s1[1], lim, KEY_BASE + 96))
     else:
-        s0 = s0 * qk_scale
+        s0 = (s0[0] * qk_scale, s0[1] * qk_scale)
         if MASK:
-            if diag | _score_flag(s0, s1):
-                if diag:
-                    s0, s1 = _diag_mask(s0, s1, first - KEY_BASE)
+            if diag:
+                s0, s1 = _diag_mask(s0, s1, first - KEY_BASE)
     return s0, s1, acc0, acc1, acc2, acc3, l_i
 
 
@@ -849,15 +863,14 @@ def _pingpong_softmax_b(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, last
     # _pingpong_softmax; where last, the scores are the next item's first,
     # without an offset: store this item's output (where store) and start
     # the next, its row max from these scores alone. One branch for both the
-    # rescale and the item start, on a condition from the scores so the QK
-    # dot still sees the PV dot behind it; inside, per-row selects between
-    # the two (a nested branch with results costs a second copy of the
-    # accumulators at its join).
+    # rescale and the item start; inside, per-row selects between the two (a
+    # nested branch with results costs a second copy of the accumulators at
+    # its join).
     C: tl.constexpr = _score_scale(FAST_EXP)
     OFF: tl.constexpr = _score_offset(FAST_EXP)
-    vote_layout: tl.constexpr = tlx.layout(shape=((32, 2, s0.shape[0] // 32), (1, )), stride=((1, 0, 32), (1, )))
+    vote_layout: tl.constexpr = tlx.layout(shape=((32, 2, m_i.shape[0] // 32), (1, )), stride=((1, 0, 32), (1, )))
     if not ZERO_SCALE:
-        s1 = s1 * qk_scale
+        s1 = (s1[0] * qk_scale, s1[1] * qk_scale)
     tmax0 = _block_max(s0)
     tmax1 = _block_max(s1)
     row = tl.maximum(tl.max(tmax0, 1), tl.max(tmax1, 1))
@@ -867,7 +880,7 @@ def _pingpong_softmax_b(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, last
         if last:
             if store:
                 _store_o(o_ptr, acc0, acc1, acc2, acc3, l_i, offs_mm, stride_om, stride_od)
-        smax = tl.maximum(tl.max(s0, 1), tl.max(s1, 1))
+        smax = _row_max(s0, s1)
         up = tl.maximum(smax - OFF * C, 0.0)
         m_b = smax * (1.0 / C)
         # A zero factor clears the accumulators for the next item.
@@ -877,8 +890,8 @@ def _pingpong_softmax_b(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, last
         acc2 = _fmul_legacy(acc2, alpha)
         acc3 = _fmul_legacy(acc3, alpha)
         shift = ((OFF - m_b) * C)[:, None]
-        s0 = tl.where(last, s0 + shift, s0 - up[:, None])
-        s1 = tl.where(last, s1 + shift, s1 - up[:, None])
+        s0 = (tl.where(last, s0[0] + shift, s0[0] - up[:, None]), tl.where(last, s0[1] + shift, s0[1] - up[:, None]))
+        s1 = (tl.where(last, s1[0] + shift, s1[0] - up[:, None]), tl.where(last, s1[1] + shift, s1[1] - up[:, None]))
         m_i = tl.where(last, m_b, m_i + up * (1.0 / C))
         tshift = tl.where(last, OFF * C - row, -tl.maximum(row - OFF * C, 0.0))
         lshift = tl.where(last, 0.0, tshift)
@@ -926,7 +939,6 @@ def _mxfp8_fa_fwd_pingpong(
     H,
     N_CTX,
     qk_scale,
-    N_CTAS,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -953,10 +965,9 @@ def _mxfp8_fa_fwd_pingpong(
     tl.static_assert(HN == 64 and HEAD_DIM == 128)
     tl.static_assert(BLOCK_M == 2 * BLOCK_N)
     pid = tl.program_id(0)
-    # The grid size comes as an argument: LLVM takes tl.num_programs (a call)
-    # as per-lane, which would make every item index, loop bound and branch
-    # derived from it divergent.
-    n_ctas = N_CTAS
+    # LLVM takes tl.num_programs (a call) as per-lane, which would make every
+    # item index, loop bound and branch derived from it divergent.
+    n_ctas = tlx.assume_uniform(tl.num_programs(0))
     n_m = N_CTX // BLOCK_M
     # Work units: items, or causal pairs of items (see _item).
     n_units = (n_m // 2 if CAUSAL else n_m) * H * Z
@@ -1298,7 +1309,6 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
             heads,
             n_ctx,
             qk_scale,
-            grid[0],
         )
         kwargs = dict(
             HEAD_DIM=_HEAD_DIM,
@@ -1316,8 +1326,8 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
             # Without IEEE mode, max needs no canonicalizing v_max x, x of its
             # operands (NaN scores would still come out NaN).
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ("amdgpu-ieee", "false")),
-            # Packed FP32 ops cannot issue while the other warp group's MFMAs
-            # keep the matrix core busy, so each one stalls the softmax stage.
+            # Packed FP32 ops only issue in gaps in the other warp group's MFMA
+            # stream; in thread traces the softmax adds stall for hundreds of cycles.
             disable_packed_fp32_ops=True,
             enable_sched_group_barrier_scheduler=True,
             sched_group_barrier_mfma_per_dwordx4=4,
