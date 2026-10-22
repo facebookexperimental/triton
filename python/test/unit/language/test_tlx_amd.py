@@ -4771,6 +4771,38 @@ def test_local_load_with_token_compiles_gfx950(device):
 
 
 @triton.jit
+def _local_load_layout_relaxed_kernel(x_ptr, output_ptr, BLOCK: tl.constexpr):
+    offs_m = tl.arange(0, BLOCK)[:, None]
+    offs_n = tl.arange(0, BLOCK)[None, :]
+    buf = tlx.local_alloc((BLOCK, BLOCK), tl.float16, 1)
+    buf0 = tlx.local_view(buf, 0)
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 2],
+    )
+    dot_a: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    x = tlx.local_load(buf0, layout=dot_a, relaxed=True)
+    tl.store(output_ptr + offs_m * BLOCK + offs_n, x)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_local_load_layout_relaxed_attr_on_load_gfx950(device):
+    """local_load with layout= and relaxed=True must put syncedViaAsyncWait on the load itself."""
+    compiled = compile_for_gfx950(
+        _local_load_layout_relaxed_kernel,
+        signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"BLOCK": 32},
+    )
+    ttir = compiled.asm["ttir"]
+    assert re.search(r'ttg\.local_load .* \{ttg\.amdg\.syncedViaAsyncWait = true\}', ttir, re.MULTILINE)
+    for line in ttir.splitlines():
+        if "require_layout" in line:
+            assert "syncedViaAsyncWait" not in line
+
+
+@triton.jit
 def _local_load_rematerialized_coordinates_kernel(
     x_ptr,
     output_ptr,
@@ -6294,6 +6326,43 @@ def _amd_scheduled_mfma_unproven_chain_kernel(
     tl.store(output_offsets, acc)
 
 
+@triton.jit
+def _buffer_load_to_local_contiguity_subslice_kernel(x_ptr):
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for(
+        [(512, 16)],
+        [32, 16],
+        order=[1, 0],
+    )
+    k = tl.arange(0, 32)
+    m = tl.arange(0, 16)
+    offsets = (k[:, None] * 16 + m[None, :]).to(tl.int32)
+    buffer = tlx.local_alloc((32, 16), tl.bfloat16, 1, layout=shared_layout)
+    destination = tlx.local_slice(
+        tlx.local_view(buffer, 0),
+        [0, 0],
+        [32, 16],
+    )
+    tlx.buffer_load_to_local(
+        destination,
+        x_ptr,
+        offsets,
+        contiguity=2,
+    )
+
+
+def test_buffer_load_to_local_contiguity_vectorizes_subslice_gfx950():
+    compiled = compile_for_gfx950(
+        _buffer_load_to_local_contiguity_subslice_kernel,
+        signature={"x_ptr": "*bf16"},
+        constexprs={},
+    )
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.buffer_load_to_local" in ttgir
+    assert "contiguity = 2" in ttgir
+    assert re.search(r"^\s*buffer_load_[^\n]*\blds\s*$", compiled.asm["amdgcn"], re.MULTILINE)
+
+
 @pytest.mark.parametrize(
     "second_transient,second_vgpr",
     [
@@ -6654,7 +6723,7 @@ def _buffer_load_to_local_unpinned_contiguity_kernel(x_ptr):
 def test_buffer_load_to_local_contiguity_rejects_unpinned_destination_gfx950():
     with pytest.raises(
             RuntimeError,
-            match="contiguity > 1 requires a directly indexed user-pinned padded_shared destination",
+            match="contiguity > 1 requires a supported view of a user-pinned padded_shared destination",
     ):
         compile_for_gfx950(
             _buffer_load_to_local_unpinned_contiguity_kernel,
