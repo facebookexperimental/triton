@@ -3667,6 +3667,46 @@ def test_amd_scheduled_mfma_chain_correct_gfx950():
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("disable_packed_fp32_ops", [False, True])
+def test_amd_adaptive_attention_forced_rebase_repeated_gfx950(monkeypatch, disable_packed_fp32_ops):
+    from triton.language.extra.tlx.tutorials import amd_fa_adaptive
+
+    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
+    shape = (1, 64, 16384, 128)
+    q = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    q[..., 0] = 1.0
+    tiles = torch.arange(shape[2] // 64, dtype=torch.int32, device="cuda")
+    k = torch.zeros_like(q)
+    k[..., 0] = (tiles * 64.0).to(torch.bfloat16).repeat_interleave(64)
+    values = torch.where(tiles % 2 == 0, 64.0, 0.0).to(torch.bfloat16).repeat_interleave(64)
+    v = values[None, None, :, None].expand(shape).contiguous()
+    scale = shape[-1]**-0.5
+    reference = (torch.softmax(k[0, 0, :, 0].float() * scale, dim=0) * values.float()).sum()
+    cache_flush = torch.empty(256_000_000, dtype=torch.int8, device="cuda")
+    poisoned_output = torch.empty_like(q)
+
+    for iteration in range(1024):
+        out = poisoned_output.fill_(float("nan")) if iteration % 2 else None
+        cache_flush.zero_()
+        actual = amd_fa_adaptive.attention(
+            q,
+            k,
+            v,
+            sm_scale=scale,
+            out=out,
+            disable_packed_fp32_ops=disable_packed_fp32_ops,
+        )
+        assert torch.isfinite(actual).all(), f"Nonfinite output on launch {iteration}"
+        torch.testing.assert_close(
+            actual.float(),
+            reference.expand_as(actual),
+            atol=2e-2,
+            rtol=2e-2,
+            msg=lambda error: f"Launch {iteration}: {error}",
+        )
+
+
 @triton.jit
 def _amd_scheduled_mfma_persistent_acc_kernel(
     a_ptr,
