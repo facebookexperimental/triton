@@ -1,0 +1,480 @@
+{
+ "schema_version": "prepared-joint-solution-v1",
+ "provenance": {
+  "model": "paper",
+  "ddg_sha256": "193de9421ed004e897a5aadd723b2d0656e31e3e02c63ce3d13eb913fb75addf",
+  "solver_sources_sha256": "9c996b45262a0ec33fa2af162414801ce24257eb0b09c9bf723acb287e2f95cd",
+  "normalization_u": 300,
+  "machine": {
+   "capacities": {
+    "TC": 1,
+    "TMA": 1,
+    "TMEM": 1,
+    "SFU": 1,
+    "CUDA": 1
+   },
+   "smem_bytes": 232448,
+   "tmem_cols": 512,
+   "smem_fixed_overhead": 0,
+   "tmem_fixed_cols": 0,
+   "num_warpgroups": 32,
+   "num_warps": 32,
+   "warp_fixed_overhead": 0,
+   "group_widths": [
+    1,
+    2,
+    4,
+    8
+   ],
+   "regs_per_sm": 65536,
+   "regs_fixed_overhead": 0,
+   "regs_per_warp": 8160,
+   "tmem_column_bytes": 512,
+   "barrier_pair_bytes": 16,
+   "spill_cost": 30
+  },
+  "curation_source": {
+   "baseline_graph_sha256": "6826215795a11f8610e637fccb536f3dcf88753eee9111d40b4daa531b1de6c5",
+   "curator_sources_sha256": "2bef320b1288ea32a96348ecd50399b7ce2b56b561e74bfd328f90a8dcc7eac4",
+   "ddg_sha256": "999f93ea4cf185cc691b292858b252931610cf251f1793b8dd1877aacb18f333"
+  },
+  "experiment_inputs": {
+   "allow_cross_warp": true,
+   "num_warps_override": null,
+   "reg_budget": null
+  },
+  "preparation": {
+   "regime": "prepared",
+   "prepared_sources_sha256": "6eab67cdaa298b2e036fb33ba5220834ba16e87caeacf2288d0c51f271091439",
+   "curated_ddg_sha256": "193de9421ed004e897a5aadd723b2d0656e31e3e02c63ce3d13eb913fb75addf",
+   "raw_ddg_sha256": "999f93ea4cf185cc691b292858b252931610cf251f1793b8dd1877aacb18f333",
+   "assumptions": {
+    "a1_pool_members": "one entry per node, non-zero edge latencies, non-zero spills",
+    "a2_issue_width": 128,
+    "a2_elementwise_dialects": [
+     "arith",
+     "math"
+    ],
+    "a3_async_tokens_keep_measured_cost": true,
+    "a4_tmem_functional_unit": "TMEM",
+    "b1_cluster_tolerance": [
+     11,
+     10
+    ],
+    "b2_floor_divisor": 32,
+    "b3_zlp": "paper_joint_solver.normalize.normalize_costs",
+    "b4_second_objective": "maximize sum(C') at F = F*",
+    "b5_u": 300
+   },
+   "health": {
+    "pool_size": 80,
+    "positive_entries": 66,
+    "collapsed_entries": 1,
+    "collapse_ratio": 0.0152,
+    "survivor_spread": 22.0,
+    "distinct_survivors": [
+     1,
+     2,
+     3,
+     6,
+     11,
+     14,
+     22
+    ],
+    "objective_f": 370,
+    "first_stage_sum": 259,
+    "second_stage_sum": 259,
+    "u": 300,
+    "clusters": 10
+   },
+   "b5_u_applied": 300
+  }
+ },
+ "attempts": [
+  {
+   "ii": 1,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 2,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 3,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 4,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 5,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 6,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 7,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 8,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 9,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 10,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 11,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 12,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 13,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 14,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 15,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 16,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 17,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 18,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 19,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 20,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 21,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 22,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 23,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 24,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 25,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 26,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 27,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 28,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 29,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 30,
+   "L": 85,
+   "stage": "joint",
+   "result": "sat",
+   "seconds": 4.5
+  }
+ ],
+ "wall_s": 7.2,
+ "status": "sat",
+ "satisfiable": true,
+ "ii": 30,
+ "length": 85,
+ "copies": 3,
+ "horizon": 145,
+ "cycles": {
+  "0": 0,
+  "1": 0,
+  "2": 6,
+  "3": 6,
+  "4": 0,
+  "5": 0,
+  "6": 11,
+  "7": 12,
+  "8": 18,
+  "9": 19,
+  "10": 0,
+  "11": 0,
+  "12": 22,
+  "13": 28,
+  "14": 24,
+  "15": 25,
+  "16": 30,
+  "17": 33,
+  "18": 55,
+  "19": 65,
+  "20": 6,
+  "21": 6,
+  "22": 78,
+  "23": 31,
+  "24": 32,
+  "25": 28,
+  "26": 34,
+  "27": 48,
+  "28": 50,
+  "29": 52,
+  "30": 54,
+  "31": 54,
+  "32": 76,
+  "33": 82,
+  "34": 84,
+  "36": 72
+ },
+ "warp_sets": {
+  "0": [
+   0
+  ],
+  "1": [
+   31
+  ],
+  "2": [
+   0
+  ],
+  "3": [
+   31
+  ],
+  "4": [
+   28,
+   29,
+   30,
+   31
+  ],
+  "5": [
+   28,
+   29,
+   30,
+   31
+  ],
+  "6": [
+   28,
+   29,
+   30,
+   31
+  ],
+  "7": [
+   0
+  ],
+  "8": [
+   28,
+   29,
+   30,
+   31
+  ],
+  "9": [
+   0
+  ],
+  "10": [
+   31
+  ],
+  "11": [
+   12
+  ],
+  "12": [
+   2,
+   8,
+   20,
+   25
+  ],
+  "13": [
+   2,
+   8,
+   20,
+   25
+  ],
+  "14": [
+   28,
+   29,
+   30,
+   31
+  ],
+  "15": [
+   13,
+   14,
+   15,
+   17
+  ],
+  "16": [
+   2,
+   8,
+   20,
+   25
+  ],
+  "17": [
+   2,
+   7,
+   22,
+   31
+  ],
+  "18": [
+   2,
+   8,
+   20,
+   25
+  ],
+  "19": [
+   2
+  ],
+  "20": [
+   31
+  ],
+  "21": [
+   29
+  ],
+  "22": [
+   17
+  ],
+  "23": [
+   28,
+   29,
+   30,
+   31
+  ],
+  "24": [
+   3,
+   10,
+   22,
+   29
+  ],
+  "25": [
+   3,
+   10,
+   22,
+   29
+  ],
+  "26": [
+   3,
+   10,
+   22,
+   29
+  ],
+  "27": [
+   1,
+   2,
+   7,
+   22
+  ],
+  "28": [
+   1,
+   2,
+   7,
+   22
+  ],
+  "29": [
+   22
+  ],
+  "30": [
+   31
+  ],
+  "31": [
+   26
+  ],
+  "32": [
+   16,
+   19,
+   26,
+   31
+  ],
+  "33": [
+   16,
+   19,
+   26,
+   31
+  ],
+  "34": [
+   4,
+   9,
+   13,
+   18
+  ],
+  "36": [
+   20
+  ]
+ },
+ "stats": {
+  "normalization_u": 300,
+  "normalization_f": 370,
+  "profile": "paper",
+  "num_asserts": 8974,
+  "T": 145,
+  "num_warp_sets": 17,
+  "warps_used": 25,
+  "num_warps": 25,
+  "physical_warp_budget": 32,
+  "regs_per_warp": 8160,
+  "smem_capacity": 232448,
+  "tmem_capacity": 512,
+  "tmem_value_count": 6,
+  "peak_tmem_cols": 384,
+  "time_variables": 36,
+  "live_variables": 0
+ }
+}

@@ -1,0 +1,767 @@
+{
+ "regime": "prepared",
+ "prepared_sources_sha256": "6eab67cdaa298b2e036fb33ba5220834ba16e87caeacf2288d0c51f271091439",
+ "curated_ddg_sha256": "193de9421ed004e897a5aadd723b2d0656e31e3e02c63ce3d13eb913fb75addf",
+ "raw_ddg_sha256": "999f93ea4cf185cc691b292858b252931610cf251f1793b8dd1877aacb18f333",
+ "assumptions": {
+  "a1_pool_members": "one entry per node, non-zero edge latencies, non-zero spills",
+  "a2_issue_width": 128,
+  "a2_elementwise_dialects": [
+   "arith",
+   "math"
+  ],
+  "a3_async_tokens_keep_measured_cost": true,
+  "a4_tmem_functional_unit": "TMEM",
+  "b1_cluster_tolerance": [
+   11,
+   10
+  ],
+  "b2_floor_divisor": 32,
+  "b3_zlp": "paper_joint_solver.normalize.normalize_costs",
+  "b4_second_objective": "maximize sum(C') at F = F*",
+  "b5_u": 300
+ },
+ "health": {
+  "pool_size": 80,
+  "positive_entries": 66,
+  "collapsed_entries": 1,
+  "collapse_ratio": 0.0152,
+  "survivor_spread": 22.0,
+  "distinct_survivors": [
+   1,
+   2,
+   3,
+   6,
+   11,
+   14,
+   22
+  ],
+  "objective_f": 370,
+  "first_stage_sum": 259,
+  "second_stage_sum": 259,
+  "u": 300,
+  "clusters": 10
+ },
+ "pool": [
+  {
+   "kind": "node",
+   "key": 0,
+   "basis": "occupancy",
+   "raw": 96,
+   "clustered": 96,
+   "processed": 96,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 1,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 2,
+   "basis": "occupancy",
+   "raw": 96,
+   "clustered": 96,
+   "processed": 96,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 3,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 4,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 5,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 6,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 7,
+   "basis": "occupancy",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 8,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 9,
+   "basis": "occupancy",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 10,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 11,
+   "basis": "occupancy",
+   "raw": 256,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "node",
+   "key": 12,
+   "basis": "occupancy",
+   "raw": 128,
+   "clustered": 128,
+   "processed": 128,
+   "scaled": 3
+  },
+  {
+   "kind": "node",
+   "key": 13,
+   "basis": "elementwise",
+   "raw": 64,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 14,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 15,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 16,
+   "basis": "elementwise",
+   "raw": 64,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 17,
+   "basis": "occupancy",
+   "raw": 64,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 18,
+   "basis": "elementwise",
+   "raw": 64,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 19,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 20,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 21,
+   "basis": "occupancy",
+   "raw": 256,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "node",
+   "key": 22,
+   "basis": "occupancy",
+   "raw": 256,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "node",
+   "key": 23,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 24,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 25,
+   "basis": "occupancy",
+   "raw": 128,
+   "clustered": 128,
+   "processed": 128,
+   "scaled": 3
+  },
+  {
+   "kind": "node",
+   "key": 26,
+   "basis": "elementwise",
+   "raw": 64,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 27,
+   "basis": "elementwise",
+   "raw": 64,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 28,
+   "basis": "elementwise",
+   "raw": 64,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 29,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 30,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 31,
+   "basis": "occupancy",
+   "raw": 256,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "node",
+   "key": 32,
+   "basis": "occupancy",
+   "raw": 128,
+   "clustered": 128,
+   "processed": 128,
+   "scaled": 3
+  },
+  {
+   "kind": "node",
+   "key": 33,
+   "basis": "elementwise",
+   "raw": 64,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 34,
+   "basis": "occupancy",
+   "raw": 52,
+   "clustered": 52,
+   "processed": 52,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 36,
+   "basis": "occupancy",
+   "raw": 256,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "edge",
+   "key": 10,
+   "basis": "edge-latency",
+   "raw": 460,
+   "clustered": 460,
+   "processed": 460,
+   "scaled": 11
+  },
+  {
+   "kind": "edge",
+   "key": 12,
+   "basis": "edge-latency",
+   "raw": 460,
+   "clustered": 460,
+   "processed": 460,
+   "scaled": 11
+  },
+  {
+   "kind": "edge",
+   "key": 14,
+   "basis": "edge-latency",
+   "raw": 900,
+   "clustered": 900,
+   "processed": 900,
+   "scaled": 22
+  },
+  {
+   "kind": "edge",
+   "key": 15,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "edge",
+   "key": 16,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "edge",
+   "key": 17,
+   "basis": "edge-latency",
+   "raw": 69,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "edge",
+   "key": 20,
+   "basis": "edge-latency",
+   "raw": 65,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "edge",
+   "key": 21,
+   "basis": "edge-latency",
+   "raw": 570,
+   "clustered": 570,
+   "processed": 570,
+   "scaled": 14
+  },
+  {
+   "kind": "edge",
+   "key": 22,
+   "basis": "edge-latency",
+   "raw": 570,
+   "clustered": 570,
+   "processed": 570,
+   "scaled": 14
+  },
+  {
+   "kind": "edge",
+   "key": 23,
+   "basis": "edge-latency",
+   "raw": 52,
+   "clustered": 52,
+   "processed": 52,
+   "scaled": 1
+  },
+  {
+   "kind": "edge",
+   "key": 26,
+   "basis": "edge-latency",
+   "raw": 900,
+   "clustered": 900,
+   "processed": 900,
+   "scaled": 22
+  },
+  {
+   "kind": "edge",
+   "key": 27,
+   "basis": "edge-latency",
+   "raw": 256,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "edge",
+   "key": 30,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "edge",
+   "key": 31,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "edge",
+   "key": 32,
+   "basis": "edge-latency",
+   "raw": 65,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "edge",
+   "key": 33,
+   "basis": "edge-latency",
+   "raw": 69,
+   "clustered": 65,
+   "processed": 65,
+   "scaled": 2
+  },
+  {
+   "kind": "edge",
+   "key": 34,
+   "basis": "edge-latency",
+   "raw": 52,
+   "clustered": 52,
+   "processed": 52,
+   "scaled": 1
+  },
+  {
+   "kind": "edge",
+   "key": 38,
+   "basis": "edge-latency",
+   "raw": 900,
+   "clustered": 900,
+   "processed": 900,
+   "scaled": 22
+  },
+  {
+   "kind": "edge",
+   "key": 39,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "edge",
+   "key": 40,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "edge",
+   "key": 41,
+   "basis": "edge-latency",
+   "raw": 52,
+   "clustered": 52,
+   "processed": 52,
+   "scaled": 1
+  },
+  {
+   "kind": "edge",
+   "key": 42,
+   "basis": "edge-latency",
+   "raw": 256,
+   "clustered": 261,
+   "processed": 261,
+   "scaled": 6
+  },
+  {
+   "kind": "spill",
+   "key": 4,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 5,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 6,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 7,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 8,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 9,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 12,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 13,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 14,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 15,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 16,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 17,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 18,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 23,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 24,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 25,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 26,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 27,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 28,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 32,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 33,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 34,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  }
+ ]
+}
