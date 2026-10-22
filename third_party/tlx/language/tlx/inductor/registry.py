@@ -1292,6 +1292,11 @@ def _gfx950_static_tn_problem(kernel_inputs, dtypes):
 class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
     """Feed the gfx942 tlx.ops heuristic into an Inductor GEMM template."""
 
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if config.triton.tlx_mode in ("allow", "force"):
+            return _is_gfx942()
+        return super().should_run(inputs)
+
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx942():
             return
@@ -1314,23 +1319,29 @@ class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
             return
 
-        # Keep TorchTLX and tlx.ops on the same measured shape policy.  The
-        # special split-panel/local-split-U paths have different program grids;
-        # this template is the common direct-load path only.
-        from triton.tlx.ops.kernels.mm.gfx942 import heuristic_config
+        # Share the measured shape policy, with layout/dtype guards for the
+        # split-K workspace path. Special local split paths use other grids.
+        from triton.tlx.ops.kernels.mm.gfx942 import torchtlx_heuristic_config
 
-        for config in heuristic_config(m, n, k):
+        scalars = getattr(kernel_inputs, "_scalars", None) or {}
+        for config in torchtlx_heuristic_config(
+            m, n, k, dtype=dtype, out_dtype=kernel_inputs.out_dtype(),
+            a_strides=(stride_am, stride_ak), b_strides=(stride_bk, stride_bn),
+            alpha=scalars.get("alpha", 1), beta=scalars.get("beta", 1),
+        ):
             meta = dict(config.kwargs)
             if meta.pop("SPLIT_M_128_32", False) or meta.pop(
                 "USE_LOCAL_SPLIT_U", False
             ):
                 continue
-            meta.pop("XCD_CHUNK", None)  # fixed to four in the template source
+            meta.setdefault("SPLIT_K", 1)
+            meta.setdefault("SPLIT_ORDER_CHUNK", 1)
+            meta.setdefault("LAUNCH_XCD_CHUNK", 0)
+            meta.setdefault("matrix_instr_nonkdim", 16)
             triton_config = self.triton_config(
                 config.num_stages,
                 config.num_warps,
                 **meta,
-                matrix_instr_nonkdim=16,
             )
             yield self._convert_config_to_template_kwargs(
                 triton_config,
@@ -3602,6 +3613,38 @@ def _tlx_create_kernel_choices(self, kernel_features, kernel_args, kernel_kwargs
 
 
 TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
+# Fusion-aware selection in allow mode without max_autotune.
+#
+# Inductor defers a template choice to the scheduler (MultiTemplateBuffer),
+# which times each template with its epilogue fused against the unfused best,
+# only under max_autotune. Without it a vendor GEMM can win on GEMM-only time
+# and leave the epilogue as a separate pass. TorchTLX does not depend on
+# max_autotune, so take the deferred path whenever a gfx942 TLX template is
+# racing (the only arch measured so far).
+# ---------------------------------------------------------------------------
+from torch._inductor.select_algorithm import AlgorithmSelectorCache
+from .fusion import _is_tlx_choice
+
+_orig_algorithm_selector_call = AlgorithmSelectorCache.__call__
+
+
+def _tlx_algorithm_selector_call(self, name, choices, *args, **kwargs):
+    if (
+        config.triton.tlx_mode == "allow"
+        and kwargs.get("return_multi_template")
+        and not (config.max_autotune or config.max_autotune_gemm)
+        and _is_gfx942()
+        and any(_is_tlx_choice(c) for c in choices)
+    ):
+        with config.patch(max_autotune_gemm=True):
+            return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
+    return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
+
+
+AlgorithmSelectorCache.__call__ = _tlx_algorithm_selector_call  # type: ignore[method-assign]
 
 
 from .reduction_epilogue import install as install_reduction_epilogue

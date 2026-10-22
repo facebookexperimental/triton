@@ -854,6 +854,68 @@ class TestTLXTemplates(TestCase):
         torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=2e-2, rtol=2e-2)
         self.assertIn("tlx_gfx942_addmm", "\n".join(code))
 
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    @parametrize("shape", ((4662, 256, 18688), (4942, 512, 18688)))
+    def test_tlx_gfx942_split_k_without_max_autotune(self, shape):
+        m, n, k = shape
+        torch.manual_seed(m + n + k)
+        bias = torch.randn((n, ), device=GPU_TYPE, dtype=torch.float16)
+        a = torch.randn((m, k), device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn((n, k), device=GPU_TYPE, dtype=torch.float16).t()
+        torch._dynamo.reset()
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "max_autotune": False,
+                "max_autotune_gemm": False,
+                "fx_graph_cache": False,
+                "fx_graph_remote_cache": False,
+        }):
+            compiled = torch.compile(torch.addmm, fullgraph=True, dynamic=False)
+            actual, code = run_and_get_code(compiled, bias, a, b)
+            expected = torch.addmm(bias, a, b)
+            torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+            generated = "\n".join(code)
+            self.assertIn("tlx_gfx942_addmm", generated)
+            self.assertIn("_reduce_k_kernel", generated)
+            torch.testing.assert_close(compiled(bias, a, b), expected, atol=0.05, rtol=0.05)
+
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    @parametrize("operation", ("mm", "relu", "scaled_addmm"))
+    def test_tlx_gfx942_split_k_epilogue_contract(self, operation):
+        m, n, k = 4178, 256, 18688
+        torch.manual_seed(42)
+        bias = torch.randn((n, ), device=GPU_TYPE, dtype=torch.float16)
+        a = torch.randn((m, k), device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn((n, k), device=GPU_TYPE, dtype=torch.float16).t()
+
+        def fn(bias, a, b):
+            if operation == "mm":
+                return torch.mm(a, b)
+            if operation == "relu":
+                return torch.addmm(bias, a, b).relu()
+            return torch.addmm(bias, a, b, alpha=0.5, beta=2)
+
+        torch._dynamo.reset()
+        expected = fn(bias, a, b)
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "max_autotune": False,
+                "max_autotune_gemm": False,
+                "fx_graph_cache": False,
+                "fx_graph_remote_cache": False,
+        }):
+            compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+            actual, code = run_and_get_code(compiled, bias, a, b)
+            generated = "\n".join(code)
+            self.assertIn("tlx_gfx942_", generated)
+            if operation == "scaled_addmm":
+                self.assertNotIn("_reduce_k", generated)
+            else:
+                self.assertIn("_reduce_k", generated)
+            for _ in range(3):
+                torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+                actual = compiled(bias, a, b)
+
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_mm_interwave_rejects_non_gfx950(self):
         from triton.language.extra.tlx.inductor import registry as _tlx_registry
@@ -947,6 +1009,8 @@ class TestTLXTemplates(TestCase):
         }
         config_args = {
             "matrix_instr_nonkdim": 16,
+            "enable_sched_group_barrier_scheduler": True,
+            "sched_group_barrier_mfma_per_dwordx4": 2,
             "inductor_32bit_pointer_range": (
                 "arg_A",
                 "arg_B",
@@ -956,7 +1020,12 @@ class TestTLXTemplates(TestCase):
 
         result = _tlx_registry._update_tlx_amd_compile_meta(compile_meta, config_args, "hip")
 
-        self.assertEqual(result["backend_options"], {"matrix_instr_nonkdim": 16})
+        self.assertEqual(
+            result["backend_options"], {
+                "matrix_instr_nonkdim": 16,
+                "enable_sched_group_barrier_scheduler": True,
+                "sched_group_barrier_mfma_per_dwordx4": 2,
+            })
         self.assertEqual(
             result["configs"][0],
             {
