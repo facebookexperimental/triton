@@ -1,5 +1,6 @@
 name: CI Health
-# Collects runs, jobs, steps and failing tests of gpu-tests.yml, and runs of
+# Collects runs, jobs, steps and failing tests of gpu-tests.yml,
+# gpu-tests-nightly.yml and nightly-tlx-ops-bench.yml, and runs of
 # nightly-fbtriton.yml, into the 'ci-health' release, for the /ci/ dashboard
 # that pages.yml renders after each successful collection. Never deploys. On
 # pull requests it only runs the dashboard's tests.
@@ -26,6 +27,7 @@ on:
       - '.github/workflows/mi350.yml'
       - '.github/workflows/b200.yml'
       - '.github/workflows/h100.yml'
+      - '.github/workflows/_tlx-ops-bench.yml'
 
 permissions:
   contents: read

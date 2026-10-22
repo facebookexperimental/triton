@@ -29,6 +29,18 @@ def test_parametrized_variants_collapse_to_one_id():
     assert job["steps"][0]["failures"] == [{"id": "x.py::test_addmm", "msg": "AssertionError: one"}]
 
 
+def test_bench_keeps_the_op_parameter():
+    job = {
+        "name": "b200 / bench", "steps":
+        [step("Run tlx.ops perf suite", "failure", "2026-10-16T00:00:00Z", "2026-10-16T01:00:00Z")]
+    }
+    log = ("2026-10-16T00:01:56.2055972Z FAILED t.py::test_op_perf[bench_mm] - AssertionError: one\n"
+           "2026-10-16T00:01:56.2057707Z FAILED t.py::test_op_perf[bench_kda] - AssertionError: two\n")
+    lg.attach_failures(job, log, normalize_ids=False)
+    assert [f["id"]
+            for f in job["steps"][0]["failures"]] == ["t.py::test_op_perf[bench_mm]", "t.py::test_op_perf[bench_kda]"]
+
+
 def test_lines_attach_to_the_step_by_timestamp():
     job = {
         "name":

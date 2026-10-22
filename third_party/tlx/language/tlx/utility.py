@@ -1,5 +1,6 @@
 import re
 import builtins
+import math
 
 import triton.language.core as tl
 import triton.runtime.driver as driver
@@ -16,6 +17,41 @@ def is_amd_tdm_target(arch):
     if not isinstance(arch, str) or not arch.startswith("gfx"):
         return False
     return _amd.supports_tdm(arch)
+
+
+@tl.builtin
+def amd_scaled_downcast_fp8(value, scale: tl.constexpr, dtype: tl.constexpr = tl.float8e4nv, _semantic=None):
+    """Convert ``value * scale`` from FP32 to FP8 on gfx950.
+
+    ``scale`` must be a compile-time power of two from 2^-127 to 2^126. The
+    conversion instruction divides by the E8M0 scale ``1 / scale``, emitted as
+    ``amdg.scaled_downcast_fp8`` with ``scale_const = 127 - log2(scale)``, so
+    no separate FP32 multiply is needed. ``dtype`` is ``tl.float8e4nv``
+    (E4M3FN, the default) or ``tl.float8e5`` (E5M2). Rounding is
+    round-to-nearest-even; NaNs and values beyond the FP8 range convert to
+    NaN. The result keeps the input's layout.
+    """
+    options = _semantic.builder.options
+    if options.backend_name != "hip" or options.arch != "gfx950":
+        raise NotImplementedError("tlx.amd_scaled_downcast_fp8 requires gfx950")
+    value = _semantic.to_tensor(value)
+    if not value.type.is_block() or value.dtype != tl.float32:
+        raise TypeError("value must be an FP32 tensor")
+    dtype = tl._unwrap_if_constexpr(dtype)
+    if dtype not in (tl.float8e4nv, tl.float8e5):
+        raise TypeError("dtype must be tl.float8e4nv or tl.float8e5")
+    scale = tl._unwrap_if_constexpr(scale)
+    if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("scale must be a positive compile-time power of two")
+    mantissa, exponent = math.frexp(scale)
+    log2_scale = exponent - 1
+    # E8M0 byte 0 (2^-127) lowers to a zero divisor, and 255 is NaN.
+    if mantissa != 0.5 or not -127 <= log2_scale <= 126:
+        raise ValueError("scale must be a power of two from 2^-127 to 2^126")
+    result_ty = tl.block_type(dtype, value.type.shape)
+    handle = _semantic.builder.create_amd_scaled_downcast_fp8(value.handle, dtype.to_ir(_semantic.builder),
+                                                              127 - log2_scale)
+    return tl.tensor(handle, result_ty)
 
 
 def cuda_parse_arch(arch):

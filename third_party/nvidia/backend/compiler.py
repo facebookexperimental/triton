@@ -1297,6 +1297,8 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
+        if capability // 10 >= 10 and not knobs.nvidia.disable_mma_collector_reuse:
+            nvidia.passes.ttnvgpuir.add_mma_collector_reuse(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(
             pm,
             capability,

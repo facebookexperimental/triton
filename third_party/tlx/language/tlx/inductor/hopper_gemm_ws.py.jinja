@@ -67,8 +67,9 @@ from triton.tlx.ops.kernels.mm._sm90_core import (
                 group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
                 pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
                 pid_n = (tile_id % num_pid_in_group) // group_size_m
-                offs_am = pid_m * BLOCK_M + BLOCK_M_SPLIT * consumer_id
-                offs_bn = pid_n * BLOCK_N
+                # TMA coordinates must be int32; a dynamic M makes the tile ids int64.
+                offs_am = (pid_m * BLOCK_M + BLOCK_M_SPLIT * consumer_id).to(tl.int32)
+                offs_bn = (pid_n * BLOCK_N).to(tl.int32)
                 acc, buf, phase = _consume_tile(
                     K, a, b, empty_a, full_a, empty_b, full_b, buf, phase,
                     consumer_id, BLOCK_K, NUM_STAGES, A_ROW_MAJOR, B_ROW_MAJOR)

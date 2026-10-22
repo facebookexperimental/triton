@@ -4,6 +4,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
+#include <map>
 #include <optional>
 
 #include "triton/Analysis/Allocation.h"
@@ -111,6 +112,73 @@ struct ConvertLayoutOpConversion
     }
   }
 
+  // Source register for each destination register, or a named error. The NPOT
+  // invertAndCompose remap can scramble, so check src(remap[i], 0) == dst(i, 0)
+  // and repair. Exact: L(r, t) = L(r, 0) + L(0, t) and non-register dims agree.
+  FailureOr<SmallVector<int32_t>>
+  getRegisterRemap(ConvertLayoutOp op, const LinearLayout &conversion) const {
+    auto kRegister = StringAttr::get(op.getContext(), "register");
+    SmallVector<int32_t> remap;
+    for (int32_t i = 0; i < conversion.getInDimSize(kRegister); ++i)
+      remap.push_back(conversion.apply({{kRegister, i}}).begin()->second);
+    if (llvm::all_of(op.getType().getShape(),
+                     [](int64_t dim) { return llvm::isPowerOf2_64(dim); }))
+      return remap;
+
+    LinearLayout srcLayout = toLinearLayout(op.getSrc().getType())
+                                 .removeZeroBasesAlongDim(kRegister);
+    LinearLayout dstLayout =
+        toLinearLayout(op.getType()).removeZeroBasesAlongDim(kRegister);
+    auto coords = [](const LinearLayout &ll, StringAttr inDim,
+                     int32_t val) -> SmallVector<int32_t> {
+      SmallVector<std::pair<StringAttr, int32_t>> ins;
+      for (StringAttr dim : ll.getInDimNames())
+        ins.push_back({dim, dim == inDim ? val : 0});
+      SmallVector<int32_t> out;
+      for (auto [outDim, outVal] : ll.apply(ins))
+        out.push_back(outVal);
+      return out;
+    };
+    auto reject = [&]() -> FailureOr<SmallVector<int32_t>> {
+      op.emitError("NPOT register-only convert_layout: no register remap "
+                   "between these modular layouts");
+      return failure();
+    };
+    if (srcLayout.getOutDims() != dstLayout.getOutDims() ||
+        !llvm::equal(srcLayout.getInDimNames(), dstLayout.getInDimNames()))
+      return reject();
+    // Both callers build the conversion from these broadcast-stripped layouts,
+    // so the remap indexes their register dims. Fail closed if it does not.
+    if (static_cast<int32_t>(remap.size()) !=
+            dstLayout.getInDimSize(kRegister) ||
+        llvm::any_of(remap, [&](int32_t j) {
+          return j < 0 || j >= srcLayout.getInDimSize(kRegister);
+        }))
+      return reject();
+    for (StringAttr dim : srcLayout.getInDimNames()) {
+      if (dim == kRegister)
+        continue;
+      if (srcLayout.getInDimSize(dim) != dstLayout.getInDimSize(dim))
+        return reject();
+      for (int32_t v = 1; v < srcLayout.getInDimSize(dim); ++v)
+        if (coords(srcLayout, dim, v) != coords(dstLayout, dim, v))
+          return reject();
+    }
+    std::map<SmallVector<int32_t>, int32_t> firstSrcReg;
+    for (int32_t j = srcLayout.getInDimSize(kRegister) - 1; j >= 0; --j)
+      firstSrcReg[coords(srcLayout, kRegister, j)] = j;
+    for (int32_t i = 0; i < static_cast<int32_t>(remap.size()); ++i) {
+      SmallVector<int32_t> want = coords(dstLayout, kRegister, i);
+      if (coords(srcLayout, kRegister, remap[i]) == want)
+        continue;
+      auto it = firstSrcReg.find(want);
+      if (it == firstSrcReg.end())
+        return reject();
+      remap[i] = it->second;
+    }
+    return remap;
+  }
+
   LogicalResult
   transferWithinThread(ConvertLayoutOp op, const LinearLayout &conversion,
                        OpAdaptor adaptor,
@@ -123,10 +191,13 @@ struct ConvertLayoutOpConversion
     assert(dims.size() == 1 && dims.front() == kRegister &&
            "expected a register-only conversion");
 
+    FailureOr<SmallVector<int32_t>> remap = getRegisterRemap(op, conversion);
+    if (failed(remap))
+      return failure();
     auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
-    SmallVector<Value> outVals(conversion.getInDimSize(kRegister));
+    SmallVector<Value> outVals(remap->size());
     for (int i = 0; i < outVals.size(); i++) {
-      auto srcIdx = conversion.apply({{kRegister, i}}).begin()->second;
+      auto srcIdx = (*remap)[i];
       assert(srcIdx < inVals.size());
       outVals[i] = inVals[srcIdx];
     }

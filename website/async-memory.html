@@ -34,6 +34,7 @@
 <a href="utilities.html">Other operations</a>
 <a href="kernels.html">Tutorial kernels</a>
 <a href="tlx-ops.html">High-performance kernels</a>
+<a href="tlx-gfx950.html">TLX on gfx950 (MI350)</a>
 <a href="testing.html">Testing</a>
 <a href="resources.html">Further reading</a></nav>
     </aside>
@@ -127,20 +128,30 @@
    # TMA atomic reduce-add with L2 evict_first hint
    tlx.async_descriptor_store(desc_c, c_buf[0], [offs_m, offs_n],
                               eviction_policy=&quot;evict_first&quot;, store_reduce=&quot;add&quot;)</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)</code> <strong>[sm90+]</strong></div></div>
-<p>Store a distributed tensor into a buffer in the remote shared memory of a cluster asynchronously. Signals the provided mbarrier when the store completes.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier, store_reduce=&quot;&quot;)</code> <strong>[NVIDIA sm90+]</strong></div></div>
+<p>Asynchronously store a register-source distributed tensor into cluster shared memory, or atomically reduce it with <code>store_reduce=&quot;add&quot;</code>, <code>&quot;min&quot;</code>, <code>&quot;max&quot;</code>, <code>&quot;and&quot;</code>, <code>&quot;or&quot;</code>, <code>&quot;xor&quot;</code>, <code>&quot;inc&quot;</code>, or <code>&quot;dec&quot;</code>. The default <code>store_reduce=&quot;&quot;</code> preserves the regular store behavior. ADD, MIN, MAX, AND, OR, and XOR support <code>int32</code> and <code>uint32</code>; INC and DEC support only <code>uint32</code>. Source/destination shapes and element types must match, and the destination must be mutable.</p>
+<p>MIN/MAX use signed comparisons for <code>int32</code> and unsigned comparisons for <code>uint32</code>. For INC/DEC, each source value is a bound <code>b</code>, not an amount to add or subtract: <code>inc(old, b)</code> returns zero when <code>old &gt;= b</code>, otherwise <code>old + 1</code>; <code>dec(old, b)</code> returns <code>b</code> when <code>old == 0</code> or <code>old &gt; b</code>, otherwise <code>old - 1</code>.</p>
+<p>Reductions require a cluster containing at least two physical CTAs, configured through either <code>num_ctas</code> or <code>ctas_per_cga</code>. A physical two-CTA launch with logical <code>num_ctas=1</code> is supported. <code>remote_cta_rank</code> may name a peer CTA or the executing CTA itself; destination and completion barrier are mapped to the same rank.</p>
+<p>Regular stores use <code>st.async</code>; reductions use scalar <code>red.async.relaxed.cluster.shared::cluster.mbarrier::complete_tx::bytes.&lt;op&gt;.&lt;type&gt;</code>. ADD uses <code>.add.u32</code> for both signed and unsigned inputs because their 32-bit sums have the same bit-level result. MIN/MAX use <code>.s32</code> or <code>.u32</code>; bitwise operations use <code>.b32</code>; INC/DEC use <code>.u32</code>. These instructions use the <strong>generic proxy</strong>, not the async proxy: asynchronous completion alone does not require <code>fence(&quot;async_shared_cluster&quot;)</code>.</p>
+<p>Each executed reduction completes <strong>4 bytes per unique logical element</strong> on the receiving mbarrier, without an additional arrival. Allocate barriers with <code>scope=&quot;cluster&quot;</code> for compiler-owned initialization visibility; this does not replace application-owned destination initialization, expected-byte registration, data-ready synchronization, completion waits, or storage lifetime protection. Expected-byte registration can follow transaction completion, but barrier initialization must precede remote use. Wait on the receiving barrier before consuming the result. Keep every participating CTA's destination and barrier storage alive until all remote operations finish, including a final cluster rendezvous before exit or storage reuse.</p>
 <p><strong>Parameters:</strong></p>
 <div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>dst</code>: The destination buffer in local shared memory (will be internally mapped to the remote CTA)</div></div>
-<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>src</code>: The source distributed tensor to store</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>src</code>: The register-source distributed tensor; for INC/DEC, each element is a bound</div></div>
 <div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>remote_cta_rank</code>: The rank (unique ID) of the remote CTA within the cluster</div></div>
-<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>barrier</code>: mbarrier to signal when the store completes</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>barrier</code>: Mutable local shared-memory mbarrier mapped to the same CTA as <code>dst</code> for completion</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>store_reduce</code>: <code>&quot;&quot;</code> for a regular store, or <code>&quot;add&quot;</code>, <code>&quot;min&quot;</code>, <code>&quot;max&quot;</code>, <code>&quot;and&quot;</code>, <code>&quot;or&quot;</code>, <code>&quot;xor&quot;</code>, <code>&quot;inc&quot;</code>, or <code>&quot;dec&quot;</code> for a 32-bit integer reduction</div></div>
 <p><strong>Example:</strong></p>
 <pre><code class="language-python">   # Allocate shared memory buffer and barrier
    buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
-   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1, scope=&quot;cluster&quot;)
 
    # Store to remote CTA&#x27;s shared memory
-   tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])</code></pre>
+   tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])
+
+   # Integer register-source reduction after initialization, expected-byte
+   # registration, and a cluster rendezvous (int_buffer matches src_i32).
+   tlx.async_remote_shmem_store(int_buffer[0], src_i32, remote_cta_rank=1,
+                                barrier=barrier[0], store_reduce=&quot;add&quot;)</code></pre>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.remote_shmem_copy(dst, src, remote_cta_rank)</code> <strong>[sm90+]</strong></div></div>
 <p>Store a local shared memory buffer into a buffer in the remote shared memory of a cluster asynchronously.</p>
 <p><strong>Parameters:</strong></p>

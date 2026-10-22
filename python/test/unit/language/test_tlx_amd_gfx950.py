@@ -2876,6 +2876,38 @@ def test_masked_unaligned_vector_load_correctness_gfx950(device):
 
 
 @triton.jit
+def _amd_scaled_downcast_fp8_rounding_kernel(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(X + offsets, offsets < N, 0.0)
+    result = tlx.amd_scaled_downcast_fp8(values, 256.0)
+    tl.store(Y + offsets, result, offsets < N)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("block", [128, 256, 512])
+def test_amd_scaled_downcast_fp8_rounding_gfx950(device, block):
+    levels = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    midpoints = (levels[:-1] + levels[1:]) * (0.5 / 256.0)
+    neighbors = torch.cat((torch.nextafter(midpoints, torch.full_like(midpoints, -float("inf"))), midpoints,
+                           torch.nextafter(midpoints, torch.full_like(midpoints, float("inf")))))
+    # 1.8125 * 256 = 464 is the midpoint above 448 and rounds down to it.
+    positive = torch.cat((levels / 256.0, neighbors, torch.tensor([1.75, 1.8125])))
+    # Values beyond the E4M3 range are not clamped; they convert to NaN.
+    overflow = torch.tensor([2.0, 1.0e30, float("nan")])
+    values = torch.cat((positive, -positive, overflow, -overflow)).to(torch.float32)
+    finite = torch.cat((torch.ones(2 * positive.numel(),
+                                   dtype=torch.bool), torch.zeros(2 * overflow.numel(), dtype=torch.bool)))
+    expected = (values[finite] * 256.0).to(torch.float8_e4m3fn)
+    inputs = values.to(device)
+    actual = torch.empty(values.numel(), device=device, dtype=torch.float8_e4m3fn)
+    _amd_scaled_downcast_fp8_rounding_kernel[(triton.cdiv(values.numel(), block), )](inputs, actual, values.numel(),
+                                                                                     block, num_warps=2)
+    actual = actual.cpu()
+    torch.testing.assert_close(actual.view(torch.uint8)[finite], expected.view(torch.uint8), atol=0, rtol=0)
+    assert torch.isnan(actual.float()[~finite]).all()
+
+
+@triton.jit
 def _amd_scheduled_mfma_column_subtiles_kernel(
     a_ptr,
     b_ptr,

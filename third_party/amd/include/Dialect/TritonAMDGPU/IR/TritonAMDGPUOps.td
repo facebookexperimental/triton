@@ -771,12 +771,17 @@ def ScaledDowncastFp8Op : TT_AMDGPU_Op<"scaled_downcast_fp8", [
 
     This will be hardware accelerated on architectures supporting
     `v_cvt_scalef32_pk_{fp8,bf8}_*` instructions (e.g. CDNA4 and CDNA5).
+
+    Instead of a scale tensor, `scale_const` can give one raw E8M0 byte shared
+    by every element. The conversion then takes the constant directly, so the
+    scale imposes no layout constraint and `axis` is not used.
   }];
 
   let arguments = (ins
     RankedTensorOf<[F16, BF16, F32]>:$input,
-    RankedTensorOf<[I8]>:$scale,
-    I32Attr:$axis);
+    Optional<RankedTensorOf<[I8]>>:$scale,
+    I32Attr:$axis,
+    OptionalAttr<I8Attr>:$scale_const);
   let results = (outs RankedTensorOf<[AnyTypeOf<[F8E4M3FN, F8E5M2]>]>:$output);
 
   let builders = [
@@ -784,13 +789,23 @@ def ScaledDowncastFp8Op : TT_AMDGPU_Op<"scaled_downcast_fp8", [
                      "int32_t":$axis), [{
         auto inputTy = cast<RankedTensorType>(input.getType());
         auto resultTy = inputTy.clone(elemType);
-        build($_builder, $_state, resultTy, input, scale, axis);
+        build($_builder, $_state, resultTy, input, scale, axis,
+              /*scale_const=*/IntegerAttr());
+      }]>,
+      OpBuilder<(ins "Value":$input, "Type":$elemType,
+                     "uint8_t":$scaleConst), [{
+        auto inputTy = cast<RankedTensorType>(input.getType());
+        auto resultTy = inputTy.clone(elemType);
+        build($_builder, $_state, resultTy, input, /*scale=*/Value(),
+              /*axis=*/inputTy.getRank() - 1,
+              $_builder.getIntegerAttr($_builder.getIntegerType(8),
+                                       scaleConst));
       }]>
   ];
 
   let assemblyFormat = [{
-    $input `scale` $scale attr-dict
-        `:` type($input) `,` type($scale) `->` type($output)
+    $input (`scale` $scale^)? attr-dict
+        `:` type($input) (`,` type($scale)^)? `->` type($output)
   }];
 
   let extraClassDeclaration = [{

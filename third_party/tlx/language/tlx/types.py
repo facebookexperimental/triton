@@ -8,7 +8,68 @@ from triton.language.core import _aggregate as aggregate
 from triton.runtime.jit import constexpr_function
 
 
-class layout_encoding:
+def _freeze_layout_value(value):
+    # Not tl._unwrap_if_constexpr: it also recurses into lists, doubling the walk.
+    while isinstance(value, tl.constexpr):
+        value = value.value
+    if isinstance(value, (list, tuple)):
+        return tuple([_freeze_layout_value(v) for v in value])
+    return value
+
+
+class _value_semantics:
+    """Equality, hashing and repr derived from the instance fields.
+
+    Layouts are passed to kernels as constexprs, so they become part of the
+    JIT kernel cache key: hashing must follow the fields, or a layout rebuilt
+    on every launch adds a new cache entry each time; repr must show the
+    fields, or two different layouts share a compiled-kernel key.
+
+    The normalized fields and their hash are computed once, on the first
+    hash/eq/repr, because the JIT hashes the key on every launch. From then on
+    the object is frozen: setting an attribute raises, and a modified layout
+    must be made with `copy.copy`, which drops the memo.
+    """
+
+    _VALUE_KEY = "_value_key_memo"
+
+    def _value_key(self):
+        key = self.__dict__.get(self._VALUE_KEY)
+        if key is None:
+            fields = tuple(sorted((k, _freeze_layout_value(v)) for k, v in vars(self).items()))
+            key = (fields, hash((type(self), fields)))
+            object.__setattr__(self, self._VALUE_KEY, key)
+        return key
+
+    def _fields(self):
+        return self._value_key()[0]
+
+    def __setattr__(self, name, value):
+        if self._VALUE_KEY in self.__dict__:
+            raise AttributeError(f"{type(self).__name__} is immutable once hashed, compared or printed; "
+                                 f"use copy.copy() to derive a layout with a different {name!r}")
+        object.__setattr__(self, name, value)
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state.pop(self._VALUE_KEY, None)
+        return state
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        return (type(self) is type(other) and self._value_key()[1] == other._value_key()[1]
+                and self._fields() == other._fields())
+
+    def __hash__(self):
+        return self._value_key()[1]
+
+    def __repr__(self):
+        fields = ", ".join(f"{k}={v!r}" for k, v in self._fields())
+        return f"{self.__class__.__name__}<{fields}>"
+
+
+class layout_encoding(_value_semantics):
     """Base class for every TLX layout that lowers to an MLIR layout attribute.
 
     Two families live under this base:
@@ -23,9 +84,6 @@ class layout_encoding:
 
     def __init__(self):
         pass
-
-    def __repr__(self):
-        return self.__class__.__name__
 
     def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
         raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
@@ -528,7 +586,7 @@ def make_tensor_memory_layout(block_m: tl.constexpr, block_n: tl.constexpr, _sem
         (tl._unwrap_if_constexpr(block_m), tl._unwrap_if_constexpr(block_n)))
 
 
-class tensor_memory_scales_layout_encoding:
+class tensor_memory_scales_layout_encoding(_value_semantics):
     """
     Tensor memory scales layout encoding for Blackwell.
     Used for scales in scaled MMA operations.
@@ -633,12 +691,6 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
     def __str__(self) -> str:
         return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
-
-    def __eq__(self, other) -> bool:
-        return (type(self) is type(other) and self.shape == other.shape and self.order == other.order
-                and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
-                and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
-                and self.fp4Padded == other.fp4Padded and self.swizzled == other.swizzled)
 
 
 class DummyRegisterLayoutEncoding(layout_encoding):

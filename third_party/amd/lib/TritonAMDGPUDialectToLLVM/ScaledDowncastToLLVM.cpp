@@ -214,10 +214,20 @@ struct ScaledDowncastFp8OpPattern
     // register.
     auto inputVals =
         unpackUniqueTensorElements(loc, adaptor.getInput(), rewriter);
-    auto scaleVals =
-        unpackUniqueTensorElements(loc, adaptor.getScale(), rewriter);
     int64_t numOutputBytes = inputVals.size();
-    auto scaleRegisters = computeScaleRegisters(downcastOp, numOutputBytes);
+    // A scale_const applies one uniform scale, so every value maps to the
+    // single constant scale register 0.
+    std::optional<uint8_t> scaleConst = downcastOp.getScaleConst();
+    SmallVector<Value> scaleVals;
+    SmallVector<int> scaleRegisters;
+    if (scaleConst) {
+      scaleVals.push_back(
+          TritonLLVMOpBuilder(loc, rewriter).i8_val(*scaleConst));
+      scaleRegisters.assign(numOutputBytes, 0);
+    } else {
+      scaleVals = unpackUniqueTensorElements(loc, adaptor.getScale(), rewriter);
+      scaleRegisters = computeScaleRegisters(downcastOp, numOutputBytes);
+    }
 
     bool isE4M3 = isa<Float8E4M3FNType>(
         downcastOp.getOutput().getType().getElementType());

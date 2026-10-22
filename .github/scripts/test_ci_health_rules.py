@@ -219,6 +219,78 @@ def test_each_tracked_branch_gets_its_own_tabs():
     assert [(p["pr"], p["whose"]) for p in page["main"]["pr"]] == [(2, "author")]
 
 
+def tb(gpu, *failing, setup=False, label="linux-gcp-b200"):
+    """A gpu-tests-nightly.yml TritonBench job, called from a job named after its GPU."""
+    if setup:
+        steps = [
+            step("Install prebuilt Triton", "failure"),
+            step(f"Run TritonBench tests on {gpu.upper()} GPU", "skipped")
+        ]
+    else:
+        steps = [
+            step(f"Run TritonBench tests on {gpu.upper()} GPU", "failure" if failing else "success",
+                 list(failing) if failing else None)
+        ]
+    return job(f"tritonbench ({gpu}) / {gpu}-tritonbench-test", *steps, label=label)
+
+
+def nightly(h, *jobs):
+    return run(
+        h,
+        [build_ok(), *jobs,
+         job("tritonbench (h100) / report / report", step("x", "success"), label="ubuntu-latest")], event="schedule",
+        wf="gpu-tests-nightly.yml")
+
+
+def test_gpu_of_reads_both_gpu_workflows():
+    assert r.gpu_of({"wf": "gpu-tests.yml"}, {"name": "b200 / b200-tlx-test"}) == "B200"
+    assert r.gpu_of({"wf": "gpu-tests-nightly.yml"},
+                    {"name": "tritonbench (mi350) / mi350-tritonbench-test"}) == "MI350"
+    assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "tritonbench (x) / x-tritonbench-test"}) is None
+    assert r.gpu_of({"wf": "gpu-tests-nightly.yml"}, {"name": "build"}) is None
+    assert r.gpu_of({"wf": "nightly-fbtriton.yml"}, {"name": "h100 / x"}) is None
+    assert r.gpu_of({"wf": r.BENCH_WF}, {"name": "mi350 / bench"}) == "MI350"
+
+
+def test_nightly_gpu_view_latest_result_and_week():
+    runs = [nightly(1, tb("h100", "gemm")), nightly(2, tb("h100"), tb("b200", setup=True))]
+    v = r.page_data(runs, stamp(23), {})["branches"]["main"]["nightly"]["gpu"]
+    assert v["H100"]["result"] == "passed" and (v["H100"]["passed_7"], v["H100"]["runs_7"]) == (1, 2)
+    assert v["B200"]["result"] == "setup" and v["B200"]["setup"] == "Install prebuilt Triton"
+    assert "MI350" not in v
+    first = r.gpu_nightly_view(runs[:1], stamp(23))["H100"]
+    assert first["result"] == "test" and [f["id"] for f in first["fails"]] == ["gemm"]
+
+
+def bench_run(h, platform, *failing):
+    steps = [step("Run tlx.ops perf suite", "failure" if failing else "success", list(failing) if failing else None)]
+    return run(h, [
+        job(f"{platform} / bench", *steps, label="linux-gpu"),
+        job(f"{platform} / publish", step("x", "success"), label="ubuntu-latest")
+    ], event="workflow_run", wf=r.BENCH_WF)
+
+
+def test_bench_card_shows_the_latest_run_per_gpu():
+    runs = [bench_run(1, "b200", "test_op_perf[bench_mm]"), bench_run(2, "b200", "test_op_perf[bench_addmm]")]
+    v = r.page_data(runs, stamp(23), {})["branches"]["main"]["nightly"]["bench"]
+    assert v["B200"]["result"] == "test" and [f["id"] for f in v["B200"]["fails"]] == ["test_op_perf[bench_addmm]"]
+    assert (v["B200"]["passed_7"], v["B200"]["runs_7"]) == (0, 2) and set(v) == {"B200"}
+
+
+def test_bench_step_maps_to_a_group():
+    """A failed bench is a test result, not a setup failure, so the bench workflow's step needs a group."""
+    import os
+    import re
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "_tlx-ops-bench.yml")
+    names = re.findall(r"^\s+- name: (Run .+?)\s*$", open(path).read(), re.M)
+    assert names and all(r.group_of(n) == "TLX ops bench" for n in names)
+
+
+def test_nightly_gpu_hours_count_in_ops():
+    day = r.ops_view([nightly(1, tb("h100"))], stamp(23))["gpu_hours"][-1]
+    assert day["passed"] == 0.2
+
+
 def test_gpu_hours_split_by_outcome_and_skip_cpu_jobs():
     setup = job("b200 / b200-tlx-test", step("Install prebuilt Triton", "failure"), minutes=30)
     runs = [
@@ -228,7 +300,69 @@ def test_gpu_hours_split_by_outcome_and_skip_cpu_jobs():
         run(4, [build_ok(), tlx()], conclusion="cancelled"),
     ]
     day = r.ops_view(runs, stamp(23))["gpu_hours"][-1]
-    assert day == {"day": "2026-10-12", "passed": 0.2, "test": 0.2, "setup": 0.5, "cancelled": 0.2}
+    assert day == {"day": "2026-10-12", "passed": 0.2, "test": 0.2, "build": 0.0, "setup": 0.5, "cancelled": 0.2}
+
+
+def test_runs_per_day_count_build_failures_and_skip_runs_without_gpu_time():
+    broken = job("build", step("Build wheel", "failure"), label="ubuntu-latest")
+    runs = [
+        push(1, tlx()),
+        push(2, tlx("t1")),
+        run(3, [broken]),
+        push(4),  # select picked no GPU
+        run(5, [build_ok()], conclusion="cancelled"),  # cancelled before a GPU job started
+    ]
+    day = r.ops_view(runs, stamp(23))["runs"][-1]
+    assert {k: day[k] for k in r.OUTCOMES} == {"passed": 1, "test": 1, "build": 1, "setup": 0, "cancelled": 0}
+
+
+def test_gpu_minutes_per_run_by_trigger_count_only_runs_whose_tests_finished():
+    runs = [
+        push(h, tlx(), job("h100 / h100-tlx-test", step(CORE, "success"), minutes=m, label="h100"))
+        for h, m in ((1, 2), (2, 20), (3, 50), (4, 50))
+    ]
+    runs.append(run(5, [build_ok(), tlx()], conclusion="cancelled"))
+    runs.append(run(6, [build_ok(), tlx()], event="pull_request"))
+    runs.append(run(7, [build_ok(), tlx()], event="schedule"))
+    broken = job("b200 / b200-tlx-test", step("Fail if the build job did not succeed", "failure"), minutes=1)
+    runs.append(run(8, [job("build", step("Build wheel", "failure"), label="ubuntu-latest"), broken]))
+    day = r.ops_view(runs, stamp(23))["per_run"][-1]
+    assert day == {
+        "day": "2026-10-12", "push": {"p25": 30, "p50": 60, "p75": 60, "n": 4}, "PR":
+        {"p25": 10, "p50": 10, "p75": 10, "n": 1}
+    }
+
+
+def queued(gpu, created_h, wait, minutes=10):
+    """A *-tlx-test job queued at created_h that waited `wait` minutes for a runner."""
+    j = tlx(gpu=gpu)
+    j["created_at"], j["started_at"] = stamp(created_h), f"2026-10-12T{created_h:02d}:{wait:02d}:00Z"
+    j["completed_at"] = f"2026-10-12T{created_h:02d}:{wait + minutes:02d}:00Z"
+    return j
+
+
+def test_queue_per_gpu_and_pr_wait_follows_the_last_job_to_finish():
+    runs = [
+        run(1, [build_ok(), queued("h100", 1, 2), queued("b200", 1, 30)], event="pull_request"),
+        run(2, [build_ok(), queued("h100", 2, 40), queued("b200", 2, 5)], event="pull_request"),
+        run(3, [build_ok(), queued("b200", 3, 50, minutes=5)], event="pull_request", conclusion="cancelled"),
+        push(4, queued("b200", 4, 10)),
+    ]
+    v = r.ops_view(runs, stamp(23))
+    q = v["queue"]
+    assert len(q["days"]) == r.OPS_DAYS
+    assert q["days"][-1]["B200"] == {"p25": 10.0, "p50": 30.0, "p75": 50.0, "n": 4}
+    gpus = {g["gpu"]: g for g in q["gpus"]}
+    assert gpus["B200"]["last_pct"] == 0.5 and gpus["H100"]["last_pct"] == 0.5 and gpus["MI350"]["n"] == 0
+    # PR wait: run 1 ends on B200 (30 min queue), run 2 on H100 (40); the cancelled run 3 does not count.
+    assert q["pr_n"] == 2 and (v["tiles"]["queue_p50"], v["tiles"]["queue_p90"]) == (40.0, 40.0)
+
+
+def test_skipped_jobs_use_no_gpu_time():
+    skipped = job("b200 / b200-torchtlx-test", step(CORE, "skipped"), conclusion="skipped")
+    skipped["started_at"] = "2026-10-15T00:00:00Z"  # GitHub can stamp a skipped job after it completed
+    day = r.ops_view([push(1, tlx(), skipped)], stamp(23))["gpu_hours"][-1]
+    assert day["passed"] == 0.2
 
 
 def test_job_duration_p90_by_job_key_across_gpus():
@@ -297,7 +431,8 @@ def test_smart_trigger_counts_selection_per_trigger():
         sel_run(5, "schedule", mi350=False),
     ]
     sel = r.ops_view(runs, stamp(23))["select"]
-    pr = sel["triggers"]["pull_request"]
+    assert len(sel["days"]) == r.OPS_DAYS
+    pr = sel["days"][-1]["triggers"]["pull_request"]
     assert pr == {
         "runs": 3, "gpus": {"0": 1, "1": 1, "2": 0, "3": 1}, "build_skipped": 1, "fallback": 1, "per_gpu":
         {"H100": 2, "B200": 1, "MI350": 1}

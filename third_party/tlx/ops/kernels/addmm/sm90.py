@@ -36,7 +36,6 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 # Handoff ring depth per M-half group for the partitioned epilogue. Depth
 # 2 measures the same as depth 1 (the store keeps up), so this stays 1.
-_EPI_STAGES = tl.constexpr(1)
 
 
 @triton.jit
@@ -94,6 +93,10 @@ def addmm_kernel_tma_ws(
     # stays dynamic.
     _CONS_REGS_C0: tl.constexpr = None if EPILOGUE_PARTITION else 240
     _CONS_REGS_C1: tl.constexpr = 184 if EPILOGUE_PARTITION else 240
+    # Epilogue ring depth, kept kernel-local (not a module global) so the
+    # kernel stays eligible for the C fast dispatch path: any global it
+    # reads bypasses the C cache and costs ~50us of host overhead/launch.
+    EPI_STAGES: tl.constexpr = 1
 
     a = tlx.local_alloc((BLOCK_M_SPLIT, BK), tlx.dtype_of(a_desc), NUM_STAGES * 2)
     if not B_ROW_MAJOR:
@@ -109,9 +112,9 @@ def addmm_kernel_tma_ws(
     # Handoff rings for the partitioned epilogue: one ring of half-tiles
     # per wgmma partition, with full/empty barriers per ring slot.
     if EPILOGUE_PARTITION:
-        epi = tlx.local_alloc((BLOCK_M_SPLIT, BN), tlx.dtype_of(c_desc), _EPI_STAGES * 2)
-        epi_empty = tlx.alloc_barriers(num_barriers=_EPI_STAGES * 2, arrive_count=1)
-        epi_full = tlx.alloc_barriers(num_barriers=_EPI_STAGES * 2, arrive_count=1)
+        epi = tlx.local_alloc((BLOCK_M_SPLIT, BN), tlx.dtype_of(c_desc), EPI_STAGES * 2)
+        epi_empty = tlx.alloc_barriers(num_barriers=EPI_STAGES * 2, arrive_count=1)
+        epi_full = tlx.alloc_barriers(num_barriers=EPI_STAGES * 2, arrive_count=1)
 
     # Barriers for cross-CTA synchronization before multicast TMA loads.
     if NUM_CTAS == 2:
@@ -175,8 +178,8 @@ def addmm_kernel_tma_ws(
                 bias = tl.load(bias_ptrs, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
                 c = (acc + bias.to(tl.float32)).to(tlx.dtype_of(c_desc))
                 if EPILOGUE_PARTITION:
-                    eslot = _EPI_STAGES * cid + epi_cnt % _EPI_STAGES
-                    ephase = (epi_cnt // _EPI_STAGES) & 1
+                    eslot = EPI_STAGES * cid + epi_cnt % EPI_STAGES
+                    ephase = (epi_cnt // EPI_STAGES) & 1
                     tlx.barrier_wait(bar=tlx.local_view(epi_empty, eslot), phase=ephase ^ 1)
                     tlx.local_store(tlx.local_view(epi, eslot), c)
                     tlx.barrier_arrive(tlx.local_view(epi_full, eslot))
@@ -251,8 +254,8 @@ def addmm_kernel_tma_ws(
                 bias = tl.load(bias_ptrs, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
                 c = (acc + bias.to(tl.float32)).to(tlx.dtype_of(c_desc))
                 if EPILOGUE_PARTITION:
-                    eslot = _EPI_STAGES * cid + epi_cnt % _EPI_STAGES
-                    ephase = (epi_cnt // _EPI_STAGES) & 1
+                    eslot = EPI_STAGES * cid + epi_cnt % EPI_STAGES
+                    ephase = (epi_cnt // EPI_STAGES) & 1
                     tlx.barrier_wait(bar=tlx.local_view(epi_empty, eslot), phase=ephase ^ 1)
                     tlx.local_store(tlx.local_view(epi, eslot), c)
                     tlx.barrier_arrive(tlx.local_view(epi_full, eslot))
@@ -439,8 +442,8 @@ def addmm_kernel_tma_ws(
                     offset_cm = pid_m * BM + BLOCK_M_SPLIT * rid
                     offset_bn = pid_n * BN
 
-                    eslot = _EPI_STAGES * rid + epi_cnt % _EPI_STAGES
-                    ephase = (epi_cnt // _EPI_STAGES) & 1
+                    eslot = EPI_STAGES * rid + epi_cnt % EPI_STAGES
+                    ephase = (epi_cnt // EPI_STAGES) & 1
                     tlx.barrier_wait(bar=tlx.local_view(epi_full, eslot), phase=ephase)
                     c_tile = tlx.local_load(tlx.local_view(epi, eslot))
                     if EPILOGUE_SUBTILE:

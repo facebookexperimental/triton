@@ -1,0 +1,44 @@
+name: Meta Triton GPU Tests (nightly)
+# Slow GPU suites that PRs and pushes skip, run once a day and on demand.
+# gpu-tests.yml stays the PR and push suite.
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-tests-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository_owner == 'facebookexperimental'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.sha }}
+
+  # One job per suite, run on each GPU it supports. A suite is a reusable workflow taking
+  # platform and the wheel; add the next one as another block like this.
+  tritonbench:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [h100, b200, mi350]
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      issues: write
+    uses: ./.github/workflows/tritonbench.yml
+    with:
+      platform: ${{ matrix.platform }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
