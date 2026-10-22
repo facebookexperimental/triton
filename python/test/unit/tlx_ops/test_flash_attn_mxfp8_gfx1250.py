@@ -62,9 +62,10 @@ def test_flash_attn_mxfp8_quantizer_matches_blackwell():
         assert torch.equal(data.view(torch.uint8), ref_data.view(torch.uint8))
         assert torch.equal(scale, ref_scale.repeat_interleave(32, 2))
     ref_data, ref_scale = _blackwell_mxfp8(v, 32, 1)
-    assert torch.equal(v8.view(torch.uint8), ref_data.view(torch.uint8))
-    # Per 128-key tile, column d holds its four 32-key blocks' scales.
     z, h, n, d = shape
+    # V's data are transposed per 128-key tile.
+    assert torch.equal(v8.view(torch.uint8), ref_data.view(torch.uint8).reshape(z, h, n // 128, 128, d).transpose(3, 4))
+    # Per 128-key tile, column d holds its four 32-key blocks' scales.
     assert torch.equal(vs, ref_scale.reshape(z, h, n // 128, 4, d).transpose(3, 4))
 
 
@@ -80,12 +81,34 @@ def test_flash_attn_mxfp8_fwd_causal_lengths(shape):
     torch.testing.assert_close(out, _sdpa(q, k, v, True, 0.5), atol=0.2, rtol=0)
 
 
+# 1024 takes the persistent kernels.
+@pytest.mark.parametrize("causal,n_ctx", [(False, 1024), (True, 1024)])
+def test_flash_attn_mxfp8_fast_exp_bound(causal, n_ctx):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx1250
+
+    torch.manual_seed(20)
+    q, k, v = _qkv((1, 4, n_ctx, 128))
+    # A flat softmax, where the bit-trick exp2 errs the most against the rest
+    # of the MXFP8 error.
+    sm_scale = 128**-0.5
+    args = gfx1250.quantize_mxfp8_qkv(q, k, v)
+    fast = gfx1250._launch_quantized(*args, causal, sm_scale).float()
+    exact = gfx1250._launch_quantized(*args, causal, sm_scale, fast_exp=False).float()
+    ref = _sdpa(q.float(), k.float(), v.float(), causal, sm_scale)
+
+    def rms(t):
+        return t.pow(2).mean().sqrt().item()
+
+    assert rms(fast - ref) < 1.15 * rms(exact - ref)
+
+
 # A zero sm_scale weighs all visible keys equally: the output is the mean of V
 # over them. With V = 1 only NaNs show; V growing with the key also shows keys
-# missing from the mean.
+# missing from the mean. Causal calls take the non-persistent kernel here.
+@pytest.mark.parametrize("fast_exp", [True, False])
 @pytest.mark.parametrize("causal,n_ctx,v_kind", [(True, 512, "ones"), (False, 1024, "key"), (True, 1024, "key")])
-def test_flash_attn_mxfp8_zero_scale(causal, n_ctx, v_kind):
-    from triton.tlx.ops import flash_attn_mxfp8
+def test_flash_attn_mxfp8_zero_scale(causal, n_ctx, v_kind, fast_exp):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx1250
 
     torch.manual_seed(20)
     shape = (1, 2, n_ctx, 128)
@@ -95,7 +118,7 @@ def test_flash_attn_mxfp8_zero_scale(causal, n_ctx, v_kind):
     else:
         q, k, _ = _qkv(shape)
         v = (torch.arange(n_ctx, device="cuda") / n_ctx)[:, None].expand(shape).to(torch.bfloat16).contiguous()
-    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=0.0, space="smoke")
+    out = gfx1250._launch_quantized(*gfx1250.quantize_mxfp8_qkv(q, k, v), causal, 0.0, fast_exp=fast_exp)
     torch.testing.assert_close(out.float(), _sdpa(q.float(), k.float(), v.float(), causal, 0.0), atol=0.02, rtol=0)
 
 

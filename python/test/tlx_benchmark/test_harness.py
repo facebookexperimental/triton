@@ -572,6 +572,8 @@ def test_arch_matches_the_part():
     assert Device(NVIDIA, 0, "NVIDIA GB200").arch == "sm100"
     assert Device(AMD, 0, "MI350X").arch == "gfx950"
     assert Device(AMD, 0, "MI355X").arch == "gfx950"
+    assert Device(AMD, 0, "MI450X").arch == "gfx1250"
+    assert Device(AMD, 0, "MI455X").arch == "gfx1250"
 
 
 def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypatch):

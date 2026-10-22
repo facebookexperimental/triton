@@ -722,8 +722,8 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
     kernel (non-causal, and causal at sequence lengths divisible by 512), whose
     approximate exp2 makes its output differ from the training forward by
     about 0.04 relative RMS, less than either differs from BF16 attention.
-    gfx1250 quantizes as Blackwell does and uses exact exp2. See the kernel
-    module for the recipes.
+    gfx1250 quantizes as Blackwell does and, like gfx950's ping-pong kernel,
+    computes P with an approximate exp2. See the kernel module for the recipes.
     ``p_expcast=True`` (Blackwell only) encodes the forward probabilities with
     ExpCast-FP8 instead of exp2 (see kernels/flash_attn_mxfp8/sm100.py).
     """
