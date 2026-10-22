@@ -1,3 +1,4 @@
+import copy
 import warnings
 from typing import Optional, overload, Tuple
 
@@ -541,6 +542,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
             # respects it (does not retag the buffer to satisfy a consumer). The
             # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
             if not getattr(layout, "_tlx_default", False):
+                layout = copy.copy(layout)
                 layout._tlx_user_pinned = True
                 layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
         elif isinstance(
@@ -1505,6 +1507,7 @@ def local_reinterpret(
         # Match local_alloc's explicit-layout contract for SMEM. TMEM scales
         # already use a concrete hardware encoding and need no user wrapper.
         if is_smem_layout and pin and not getattr(layout, "_tlx_default", False):
+            layout = copy.copy(layout)
             layout._tlx_user_pinned = True
             encoding = _semantic.builder.make_user_layout_attr(encoding)
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
