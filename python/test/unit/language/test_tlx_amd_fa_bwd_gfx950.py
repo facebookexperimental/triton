@@ -243,33 +243,106 @@ def test_d64_causal_gqa8_codegen_is_scratch_free_gfx950(monkeypatch):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_varlen_d128_plan_owns_offsets_and_compact_schedules():
+def test_varlen_d128_device_compact_schedules():
+    q_lengths = [17, 31, 40]
+    kv_lengths = [33, 129, 7]
     cu_q = torch.tensor([0, 17, 48, 88], dtype=torch.int32, device="cuda")
     cu_kv = torch.tensor([0, 33, 162, 169], dtype=torch.int32, device="cuda")
 
-    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q,
+        cu_kv,
+        sum(q_lengths),
+        sum(kv_lengths),
+        max(q_lengths),
+        max(kv_lengths),
+    )
+    amd_fa_varlen_bwd.validate_varlen_backward_plan(plan)
+    q_count, full_count, tail_count, wide_count, plan_error, causal_error = plan.task_counts.tolist()
+    assert plan_error == 0
+    assert causal_error == 1
+
+    def tasks(sequences, starts, count):
+        return set(zip(sequences[:count].tolist(), starts[:count].tolist()))
 
     assert plan.batch == 3
     assert plan.total_q == 88
     assert plan.total_kv == 169
     assert plan.max_q == 40
-    assert plan.q_block_sequence.tolist() == [0, 0, 1, 1, 2, 2, 2]
-    assert plan.q_block_start.tolist() == [0, 16, 0, 16, 0, 16, 32]
-    assert plan.num_full_kv_blocks == 1
-    assert plan.kv_block_sequence.tolist() == [1, 0, 1, 2]
-    assert plan.kv_block_start.tolist() == [0, 0, 128, 0]
-    assert plan.wide_kv_start.tolist() == [162, 33, 0]
-    assert plan.wide_q_start.tolist() == [48, 17, 0]
-    assert plan.wide_dq_start.tolist() == [78, 32, 0]
-    assert plan.wide_q_len.tolist() == [40, 31, 17]
-    assert plan.wide_kv_valid.tolist() == [7, 129, 33]
-    assert plan.dq_tail_k96 is True
-    assert plan.dq_full_kv_sequence.numel() == plan.dq_full_kv_start.numel() == 0
+    assert tasks(plan.q_block_sequence, plan.q_block_start, q_count) == {(sequence, start)
+                                                                         for sequence, length in enumerate(q_lengths)
+                                                                         for start in range(0, length, 16)}
+    assert tasks(
+        plan.full_kv_block_sequence,
+        plan.full_kv_block_start,
+        full_count,
+    ) == {(sequence, start)
+          for sequence, length in enumerate(kv_lengths)
+          for start in range(0, length // 128 * 128, 128)}
+    assert tasks(
+        plan.tail_kv_block_sequence,
+        plan.tail_kv_block_start,
+        tail_count,
+    ) == {(sequence, length // 128 * 128)
+          for sequence, length in enumerate(kv_lengths)
+          if length % 128}
+    actual_wide = set(
+        zip(
+            plan.wide_kv_start[:wide_count].tolist(),
+            plan.wide_q_start[:wide_count].tolist(),
+            plan.wide_dq_start[:wide_count].tolist(),
+            plan.wide_q_len[:wide_count].tolist(),
+            plan.wide_kv_valid[:wide_count].tolist(),
+        ))
+    expected_wide = set()
+    q_start = 0
+    kv_start = 0
+    for sequence, (q_len, kv_len) in enumerate(zip(q_lengths, kv_lengths, strict=True)):
+        for block_start in range(0, kv_len, 256):
+            expected_wide.add((
+                kv_start + block_start,
+                q_start,
+                q_start + sequence * 15,
+                q_len,
+                min(256, kv_len - block_start),
+            ))
+        q_start += q_len
+        kv_start += kv_len
+    assert actual_wide == expected_wide
+    assert plan.cu_seqlens_q is cu_q
+    assert plan.cu_seqlens_k is cu_kv
+    assert plan.dq_full_kv_sequence is None
+    assert plan.dq_full_kv_start is None
+    assert plan.dq_tail_k96 is False
 
-    cu_q.fill_(0)
-    cu_kv.fill_(0)
-    assert plan.cu_seqlens_q.tolist() == [0, 17, 48, 88]
-    assert plan.cu_seqlens_k.tolist() == [0, 33, 162, 169]
+
+@pytest.mark.parametrize(
+    ("q_lengths", "kv_lengths", "supply_metadata", "expected_capacities"),
+    (
+        pytest.param([16, 32], [128, 256], False, (3, 3, 0, 2), id="legacy-all-full"),
+        pytest.param([1, 17], [1, 127], False, (3, 0, 2, 2), id="legacy-all-tail"),
+        pytest.param([16, 16], [128, 128], True, (2, 2, 0, 2), id="metadata-uniform-all-full"),
+        pytest.param([16, 16], [64, 96], True, (2, 0, 2, 3), id="metadata-all-tail"),
+        pytest.param([17, 31, 40], [33, 129, 7], True, (9, 1, 3, 4), id="metadata-mixed"),
+    ),
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_plan_tightens_provable_schedule_capacities(q_lengths, kv_lengths, supply_metadata,
+                                                                expected_capacities):
+    cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor([0, *torch.tensor(kv_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    metadata = (sum(q_lengths), sum(kv_lengths), max(q_lengths), max(kv_lengths)) if supply_metadata else ()
+
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, *metadata)
+
+    capacities = (
+        plan.q_block_sequence.numel(),
+        plan.full_kv_block_sequence.numel(),
+        plan.tail_kv_block_sequence.numel(),
+        plan.wide_kv_start.numel(),
+    )
+    assert capacities == expected_capacities
+    amd_fa_varlen_bwd.validate_varlen_backward_plan(plan)
 
 
 def _make_seeded_extend_attention_lengths(batch, max_context, seed):
@@ -293,6 +366,30 @@ def test_varlen_d128_plan_records_whether_offsets_match():
 
     assert amd_fa_varlen_bwd.prepare_varlen_backward(shared, shared.clone()).qk_offsets_equal is True
     assert amd_fa_varlen_bwd.prepare_varlen_backward(shared, different).qk_offsets_equal is False
+
+    device_plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        shared,
+        shared.clone(),
+        48,
+        48,
+        31,
+        31,
+    )
+    assert device_plan.qk_offsets_equal is None
+    amd_fa_varlen_bwd.validate_varlen_backward_plan(device_plan, causal=True)
+
+    device_mismatch = amd_fa_varlen_bwd.prepare_varlen_backward(
+        shared,
+        different,
+        48,
+        49,
+        31,
+        32,
+    )
+    assert device_mismatch.qk_offsets_equal is None
+    amd_fa_varlen_bwd.validate_varlen_backward_plan(device_mismatch)
+    with pytest.raises(ValueError, match="match between Q and KV"):
+        amd_fa_varlen_bwd.validate_varlen_backward_plan(device_mismatch, causal=True)
 
 
 def test_varlen_d128_seeded_extend_attention_lengths_are_reproducible():
@@ -406,7 +503,14 @@ def test_varlen_d128_interleaved_lengths_gfx950(q_lengths, kv_lengths, q_heads, 
             tensor = shifted
         shifted_inputs.append(tensor)
     q, do = shifted_inputs
-    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q,
+        cu_kv,
+        q.shape[0],
+        k.shape[0],
+        max(q_lengths),
+        max(kv_lengths),
+    )
 
     actual = amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale)
 
@@ -580,7 +684,14 @@ def test_varlen_d128_bm32_boundaries_gfx950(q_lengths, q_heads, kv_heads):
         seed=487 + q_heads,
     )
     q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
-    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q,
+        cu_kv,
+        q.shape[0],
+        k.shape[0],
+        max(q_lengths),
+        max(kv_lengths),
+    )
 
     actual = amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale)
 
@@ -637,13 +748,22 @@ def test_varlen_d128_runtime_totals_reuse_specialization_gfx950(kv_length):
     for q_length in (17, 33):
         case = _make_varlen_d128_reference_case([q_length], [kv_length], q_heads=1, kv_heads=1, seed=419 + q_length)
         q, k, v, out, do, lse, cu_q, cu_kv, scale, _expected = case
-        plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+        plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+            cu_q,
+            cu_kv,
+            q.shape[0],
+            k.shape[0],
+            q_length,
+            kv_length,
+        )
 
         amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale)
         torch.cuda.synchronize()
 
     device = torch.cuda.current_device()
-    expected_counts = (1, 1) if kv_length == 128 else (2, 0)
+    # Uniform full-tile metadata proves the tail schedule is empty, so only
+    # the full specialization is compiled for KV128.
+    expected_counts = (1, 1) if kv_length == 128 else (2, 1)
     for kernel, expected in zip(kernels, expected_counts, strict=True):
         assert len(kernel.device_caches[device][0]) == expected, kernel.fn.__name__
 
@@ -681,12 +801,12 @@ def test_varlen_d128_scratch_reset_graph_replay_gfx950(monkeypatch, q_heads, kv_
 
         def __getitem__(self, grid):
 
-            def launch(o, do, delta, cu_q, dq_acc, total_q_padded, **kwargs):
+            def launch(o, do, delta, cu_q, dq_acc, total_q_padded, task_counts, **kwargs):
                 # Valid dQ columns use the whole swizzled BM16 footprint,
                 # including rows beyond the final logical query row.
                 assert kwargs["ZERO_DQ"]
                 dq_acc.fill_(float("nan"))
-                return preprocess[grid](o, do, delta, cu_q, dq_acc, total_q_padded, **kwargs)
+                return preprocess[grid](o, do, delta, cu_q, dq_acc, total_q_padded, task_counts, **kwargs)
 
             return launch
 
@@ -731,7 +851,14 @@ def test_varlen_d128_bm32_runtime_totals_reuse_specialization_gfx950():
     for q_length in (5460, 5476):
         case = _make_varlen_d128_reference_case([q_length], [17], q_heads=3, kv_heads=1, seed=503 + q_length)
         q, k, v, out, do, lse, cu_q, cu_kv, scale, _expected = case
-        plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+        plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+            cu_q,
+            cu_kv,
+            q.shape[0],
+            k.shape[0],
+            q_length,
+            17,
+        )
         amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale)
         torch.cuda.synchronize()
 
@@ -740,23 +867,108 @@ def test_varlen_d128_bm32_runtime_totals_reuse_specialization_gfx950():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_varlen_d128_plan_rejects_invalid_offsets():
+def test_varlen_d128_plan_rejects_invalid_offset_metadata():
     valid = torch.tensor([0, 16, 48], dtype=torch.int32, device="cuda")
+    strided = torch.tensor(
+        [0, -1, 16, -1, 48],
+        dtype=torch.int32,
+        device="cuda",
+    )[::2]
     cases = (
-        (torch.tensor([1, 17, 49], dtype=torch.int32, device="cuda"), valid, "must start at zero"),
-        (torch.tensor([0, 16, 16], dtype=torch.int32, device="cuda"), valid, "must be strictly increasing"),
-        (valid, torch.tensor([0, 32], dtype=torch.int32, device="cuda"), "must describe the same batch"),
+        (valid.view(1, 3), valid, "rank-1 tensor"),
+        (valid.to(torch.int64), valid, "dtype torch.int32"),
+        (valid, torch.tensor([0, 32], dtype=torch.int32, device="cuda"), "same batch"),
+        (
+            strided,
+            valid,
+            "must be contiguous when token metadata is supplied",
+        ),
     )
     for cu_q, cu_kv, message in cases:
         with pytest.raises(ValueError, match=message):
-            amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+            amd_fa_varlen_bwd.prepare_varlen_backward(
+                cu_q,
+                cu_kv,
+                48,
+                48,
+                32,
+                32,
+            )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_legacy_plan_accepts_strided_offsets():
+    cu_q = torch.tensor(
+        [0, -1, 17, -1, 48],
+        dtype=torch.int32,
+        device="cuda",
+    )[::2]
+    cu_kv = torch.tensor(
+        [0, -1, 33, -1, 162],
+        dtype=torch.int32,
+        device="cuda",
+    )[::2]
+
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+
+    assert plan.cu_seqlens_q.is_contiguous()
+    assert plan.cu_seqlens_k.is_contiguous()
+    assert plan.cu_seqlens_q.tolist() == [0, 17, 48]
+    assert plan.cu_seqlens_k.tolist() == [0, 33, 162]
+
+    cu_q.zero_()
+    cu_kv.zero_()
+    assert plan.cu_seqlens_q.tolist() == [0, 17, 48]
+    assert plan.cu_seqlens_k.tolist() == [0, 33, 162]
+    amd_fa_varlen_bwd.validate_varlen_backward_plan(plan)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    ("q_offsets", "kv_offsets", "total_q", "total_kv", "max_q", "max_kv"),
+    (
+        pytest.param([1, 17, 49], [0, 16, 48], 48, 48, 32, 32, id="nonzero-start"),
+        pytest.param([0, 16, 16], [0, 16, 48], 16, 48, 16, 32, id="empty-sequence"),
+        pytest.param([0, 17, 16], [0, 16, 48], 16, 48, 17, 32, id="nonmonotonic"),
+        pytest.param([0, 16, 48], [0, 16, 48], 47, 48, 32, 32, id="wrong-q-total"),
+        pytest.param([0, 16], [0, 256], 16, 128, 16, 256, id="undersized-kv-total"),
+        pytest.param(
+            [0, 16, 32, 48, 64],
+            [0, 128, 0, 128, 0],
+            64,
+            128,
+            16,
+            128,
+            id="alternating-kv-offsets",
+        ),
+        pytest.param([0, 16, 48], [0, 16, 48], 48, 48, 31, 32, id="wrong-max"),
+    ),
+)
+def test_varlen_d128_device_validation_rejects_invalid_values(q_offsets, kv_offsets, total_q, total_kv, max_q, max_kv):
+    cu_q = torch.tensor(q_offsets, dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor(kv_offsets, dtype=torch.int32, device="cuda")
+
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q,
+        cu_kv,
+        total_q,
+        total_kv,
+        max_q,
+        max_kv,
+    )
+
+    counts = plan.task_counts.tolist()
+    assert counts[-2:] == [1, 1]
+    assert counts[:-2] == [0, 0, 0, 0]
+    with pytest.raises(ValueError, match="cu_seqlens must start at zero"):
+        amd_fa_varlen_bwd.validate_varlen_backward_plan(plan)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_varlen_d128_backward_rejects_unsupported_signature():
     case = _make_varlen_d128_reference_case([16], [128], q_heads=1, kv_heads=1, seed=407)
     q, k, v, out, do, lse, cu_q, cu_kv, scale, _expected = case
-    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, q.shape[0], k.shape[0], 16, 128)
 
     with pytest.raises(ValueError, match="q must be contiguous bfloat16 THD"):
         amd_fa_varlen_bwd.fa_varlen_backward(q.float(), k, v, out, do, lse, plan, scale)
@@ -801,7 +1013,7 @@ def test_varlen_d128_backward_rejects_unsupported_signature():
 def test_varlen_d128_backward_rejects_nondivisible_gqa():
     case = _make_varlen_d128_reference_case([16], [128], q_heads=4, kv_heads=2, seed=411)
     q, k, v, out, do, lse, cu_q, cu_kv, scale, _expected = case
-    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, q.shape[0], k.shape[0], 16, 128)
     invalid_k = torch.empty((k.shape[0], 3, 128), dtype=k.dtype, device=k.device)
     invalid_v = torch.empty_like(invalid_k)
 
@@ -864,7 +1076,7 @@ def test_varlen_d128_noncausal_still_rejects_strided_v():
 def test_varlen_d128_backward_rejects_noncontiguous_lse():
     case = _make_varlen_d128_reference_case([16], [128], q_heads=2, kv_heads=2, seed=413)
     q, k, v, out, do, lse, cu_q, cu_kv, scale, _expected = case
-    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, q.shape[0], k.shape[0], 16, 128)
     lse_storage = torch.empty((2, 32), dtype=torch.float32, device="cuda")
     strided_lse = lse_storage[:, ::2]
     assert strided_lse.shape == lse.shape
@@ -886,7 +1098,7 @@ def test_varlen_d128_interleaved_codegen_is_scratch_free_gfx950():
 
     case = _make_varlen_d128_reference_case([17], [129], q_heads=3, kv_heads=1, seed=409)
     q, k, v, out, do, lse, cu_q, cu_kv, scale, _expected = case
-    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, q.shape[0], k.shape[0], 17, 129)
     amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale)
     torch.cuda.synchronize()
 
@@ -956,7 +1168,14 @@ def test_varlen_d128_split_codegen_is_scratch_free_gfx950():
     for q_length, q_heads in ((5460, 3), (2048, 8)):
         case = _make_varlen_d128_reference_case([q_length], [129], q_heads=q_heads, kv_heads=1, seed=463 + q_heads)
         q, k, v, out, do, lse, cu_q, cu_kv, scale, _expected = case
-        plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+        plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+            cu_q,
+            cu_kv,
+            q.shape[0],
+            k.shape[0],
+            q_length,
+            129,
+        )
         amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale)
     torch.cuda.synchronize()
 
