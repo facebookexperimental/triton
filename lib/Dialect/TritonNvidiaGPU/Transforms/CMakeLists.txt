@@ -11,6 +11,7 @@ add_triton_library(TritonNvidiaGPUTransforms
   HoistMBarrierLifecycle.cpp
   InterleaveTMem.cpp
   MBarrierUtilities.cpp
+  MMACollectorReuse.cpp
   MMALowering.cpp
   OptimizeCTALocality.cpp
   OptimizeDescriptorEncoding.cpp
