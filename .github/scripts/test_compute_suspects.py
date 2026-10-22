@@ -87,3 +87,23 @@ def test_render_markdown_table():
     assert "#2" in md
     assert "`a/b/c.py`" in md
     assert "| Rank | PR | Overlap | Title |" in md
+
+
+def test_test_location_pytest_forms():
+    assert cs.test_location("a/b/test_x.py::TestC::test_y") == ("a/b/test_x.py", "test_y")
+    assert cs.test_location("python.test.unit.language.test_tlx_amd_hip::test_z") == (
+        "python/test/unit/language/test_tlx_amd_hip.py", "test_z")
+    assert cs.test_location("python.test.unit.language.test_fa.TestProvider::test_w") == (
+        "python/test/unit/language/test_fa.py", "test_w")
+
+
+def test_test_location_lit_and_bucket():
+    assert cs.test_location("TRITON :: Conversion/foo.mlir") == ("test/Conversion/foo.mlir", None)
+    assert cs.test_location("mi350-tlx-job-failed") is None
+
+
+def test_render_new_test():
+    md = cs.render_new_test("a/test_x.py", "test_y", "goodsha123", {"sha": "addsha4567890", "pr": 4313})
+    assert md == ("**New test:** `test_y` in `a/test_x.py` did not exist at the last green commit `goodsha12`; "
+                  "it was added by `addsha456` (#4313).")
+    assert "added in this range" in cs.render_new_test("test/foo.mlir", None, "goodsha123", None)
