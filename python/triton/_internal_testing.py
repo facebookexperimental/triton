@@ -370,9 +370,9 @@ def _call_in_process(client_fn, args, kwargs, env, stderr_file, compilation_list
     if env is not None:
         os.environ.update(env)
 
-    # By defaul AMD runtime calls abort on device assert.
-    # Following forces hip rutime to skip abort call.
-    if is_hip():
+    # Avoid initializing the GPU driver before the callback's startup code.
+    # The HIP build of PyTorch needs abort-on-device-assert disabled.
+    if not is_interpreter() and torch.version.hip is not None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         os.environ["HIP_SKIP_ABORT_ON_GPU_ERROR"] = "1"
 
