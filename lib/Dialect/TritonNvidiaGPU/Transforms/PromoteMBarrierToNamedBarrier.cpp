@@ -619,6 +619,86 @@ bool haveEquivalentIterationSpaces(scf::ForOp lhs, scf::ForOp rhs) {
          areEquivalentLoopValues(lhs.getStep(), rhs.getStep());
 }
 
+// Preserve signed loop bounds when looking through widening casts. In
+// particular, truncation and unsigned extension do not preserve signed order.
+Value stripLoopBoundCasts(Value value) {
+  value = resolveWarpSpecializeCapture(value);
+  while (Operation *def = value.getDefiningOp()) {
+    if (!isa<arith::ExtSIOp, arith::IndexCastOp>(def))
+      break;
+    Value input = def->getOperand(0);
+    auto width = [](Type type) {
+      return type.isIndex() ? 64 : type.getIntOrFloatBitWidth();
+    };
+    if (width(input.getType()) > width(value.getType()))
+      break;
+    value = resolveWarpSpecializeCapture(input);
+  }
+  return value;
+}
+
+bool areEquivalentLoopBounds(Value lhs, Value rhs) {
+  return areEquivalentLoopValues(stripLoopBoundCasts(lhs),
+                                 stripLoopBoundCasts(rhs));
+}
+
+bool hasOneFewerIteration(scf::ForOp consumer, scf::ForOp producer) {
+  auto supportedType = [](Type type) {
+    return type.isIndex() || type.isInteger(32) || type.isInteger(64);
+  };
+  if (!supportedType(consumer.getLowerBound().getType()) ||
+      !supportedType(producer.getLowerBound().getType()))
+    return false;
+  APInt step;
+  if (!matchPattern(stripLoopBoundCasts(producer.getStep()),
+                    m_ConstantInt(&step)) ||
+      !step.isStrictlyPositive() ||
+      !areEquivalentLoopBounds(consumer.getLowerBound(),
+                               producer.getLowerBound()) ||
+      !areEquivalentLoopBounds(consumer.getStep(), producer.getStep()))
+    return false;
+  auto upper = stripLoopBoundCasts(consumer.getUpperBound())
+                   .getDefiningOp<arith::SubIOp>();
+  if (!upper ||
+      !areEquivalentLoopBounds(upper.getLhs(), producer.getUpperBound()) ||
+      !areEquivalentLoopBounds(upper.getRhs(), producer.getStep()))
+    return false;
+  APInt constantUpper;
+  if (matchPattern(stripLoopBoundCasts(upper.getLhs()),
+                   m_ConstantInt(&constantUpper))) {
+    unsigned width = upper.getType().isIndex()
+                         ? 64
+                         : upper.getType().getIntOrFloatBitWidth();
+    bool overflow = false;
+    (void)constantUpper.sextOrTrunc(width).ssub_ov(step.sextOrTrunc(width),
+                                                   overflow);
+    if (overflow)
+      return false;
+  }
+
+  // For positive s and non-overflowing ub-s, ceil((ub-lb-s)/s) is
+  // ceil((ub-lb)/s)-1; clamping both trip counts at zero handles empty
+  // producers. No divisibility assumption on ub-lb is needed. As with the
+  // SWP peel itself, this uses the loop arithmetic's no-overflow assumption.
+  return true;
+}
+
+bool isProducerNonempty(Value predicate, scf::ForOp producer) {
+  if (isAlwaysTrue(predicate)) {
+    APInt lower, upper;
+    return matchPattern(stripLoopBoundCasts(producer.getLowerBound()),
+                        m_ConstantInt(&lower)) &&
+           matchPattern(stripLoopBoundCasts(producer.getUpperBound()),
+                        m_ConstantInt(&upper)) &&
+           lower.sextOrTrunc(64).slt(upper.sextOrTrunc(64));
+  }
+  auto cmp =
+      resolveWarpSpecializeCapture(predicate).getDefiningOp<arith::CmpIOp>();
+  return cmp && cmp.getPredicate() == arith::CmpIPredicate::slt &&
+         areEquivalentLoopBounds(cmp.getLhs(), producer.getLowerBound()) &&
+         areEquivalentLoopBounds(cmp.getRhs(), producer.getUpperBound());
+}
+
 std::optional<Value> findIterationCounter(scf::ForOp loop,
                                           uint64_t initialValue,
                                           uint64_t increment) {
@@ -675,6 +755,8 @@ struct WaitPhasePlan {
   unsigned iterationIncrement = 0;
   unsigned iterationOffset = 0;
   std::optional<unsigned> constantPhase;
+  enum class Kind { Regular, PeeledPrologue, PeeledLoop };
+  Kind kind = Kind::Regular;
 };
 
 Value getWaitPredicate(const WaitPhasePlan &plan) {
@@ -1022,8 +1104,76 @@ bool hasProvenStaticSlotSchedule(const BarrierCandidate &candidate,
   return true;
 }
 
+bool provePeeledWaitCovering(const BarrierCandidate &candidate,
+                             MutableArrayRef<WaitPhasePlan> sites) {
+  if (candidate.numBarriers != 1 || candidate.arrives.size() != 1 ||
+      sites.size() != 2)
+    return false;
+  for (const auto &use : candidate.waits)
+    if (getStaticSlot(use.index, 1) != 0)
+      return false;
+  const auto &arrive = candidate.arrives.front();
+  if (getStaticSlot(arrive.index, 1) != 0)
+    return false;
+  scf::ForOp producer = arrive.op->getParentOfType<scf::ForOp>();
+  Region *producerTask = getWarpSpecializeTaskRegion(arrive.op);
+  if (!producer || !producerTask || !llvm::hasSingleElement(*producerTask) ||
+      arrive.op->getBlock() != producer.getBody() ||
+      producer->getParentRegion() != producerTask ||
+      !findIterationCounter(producer, /*initialValue=*/0, /*increment=*/1))
+    return false;
+
+  // Site order, start generation and count together prove a covering of
+  // [0, trip(producer)). Alternation alone would also accept re-observations
+  // of completed phases, which cannot participate in a named barrier.
+  SmallVector<WaitPhasePlan *> ordered;
+  for (WaitPhasePlan &site : sites)
+    ordered.push_back(&site);
+  if (ordered.front()->iteration)
+    std::swap(ordered[0], ordered[1]);
+  WaitPhasePlan &prologue = *ordered[0];
+  WaitPhasePlan &body = *ordered[1];
+  Region *task = getWarpSpecializeTaskRegion(prologue.wait);
+  if (!task || !llvm::hasSingleElement(*task) || task == producerTask ||
+      getWarpSpecializeOwner(task) != getWarpSpecializeOwner(producerTask) ||
+      getWarpSpecializeTaskRegion(body.wait) != task ||
+      prologue.constantPhase != 0 || !body.iteration ||
+      prologue.wait->getParentRegion() != task ||
+      body.loop->getParentRegion() != task ||
+      prologue.wait->getBlock() != body.loop->getBlock() ||
+      !prologue.wait->isBeforeInBlock(body.loop) ||
+      body.wait->getBlock() != body.loop.getBody() ||
+      !hasOneFewerIteration(body.loop, producer) ||
+      !isProducerNonempty(getWaitPredicate(prologue), producer))
+    return false;
+
+  unsigned nextGeneration = 0;
+  for (WaitPhasePlan *site : ordered) {
+    if (!site->iteration) {
+      if (site->constantPhase != nextGeneration)
+        return false;
+      ++nextGeneration;
+      continue;
+    }
+    if (site->initialIteration != nextGeneration ||
+        site->iterationIncrement != 1 || site->iterationOffset != 0 ||
+        site->iterationsPerGeneration != 1 ||
+        !isAlwaysTrue(getWaitPredicate(*site)))
+      return false;
+  }
+  // The prologue covers generation 0 iff the producer is nonempty; the
+  // loop covers [1, N). For N=0 both are skipped. With the arrival/init
+  // count equality checked below, arrival k completes phase k&1, so these
+  // ordered, contiguous sites pair with every arrival exactly once.
+  prologue.kind = WaitPhasePlan::Kind::PeeledPrologue;
+  body.kind = WaitPhasePlan::Kind::PeeledLoop;
+  return true;
+}
+
 bool hasProvenDynamicSchedule(const BarrierCandidate &candidate,
-                              ArrayRef<WaitPhasePlan> waitPhases) {
+                              MutableArrayRef<WaitPhasePlan> waitPhases) {
+  if (provePeeledWaitCovering(candidate, waitPhases))
+    return true;
   if (hasProvenStaticSlotSchedule(candidate, waitPhases))
     return true;
 
@@ -1034,8 +1184,7 @@ bool hasProvenDynamicSchedule(const BarrierCandidate &candidate,
       return plan.constantPhase == 0 && isAlwaysTrue(getWaitPredicate(plan));
     });
   }
-  // A mix of constant-phase (peeled prologue) and dynamic-phase waits is a
-  // conditional schedule: reject it (see the phase-offset design doc).
+  // All other mixed schedules need a more general phase-offset proof.
   if (llvm::any_of(waitPhases,
                    [](const WaitPhasePlan &plan) { return !plan.iteration; }))
     return false;
@@ -1147,6 +1296,9 @@ std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
         return std::nullopt;
   if (!hasProvenDynamicSchedule(candidate, waitPhases))
     return std::nullopt;
+  bool peeled = llvm::any_of(waitPhases, [](const WaitPhasePlan &plan) {
+    return plan.kind == WaitPhasePlan::Kind::PeeledPrologue;
+  });
 
   SmallVector<SmallVector<Operation *>> arrivesBySlot;
   SmallVector<SmallVector<Operation *>> waitsBySlot;
@@ -1260,13 +1412,14 @@ std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
       // Count sites per slot, not per allocation: separate static slots can
       // legitimately have a wait in the same task. Dynamic indices were
       // conservatively mapped to every slot by mapUsesToSlots above.
-      if (!task || arriveTaskSet.contains(task) ||
-          !waitTaskSet.insert(task).second)
+      if (!task || arriveTaskSet.contains(task))
+        return std::nullopt;
+      if (!waitTaskSet.insert(task).second && !peeled)
         return std::nullopt;
       for (Region *producer : arriveTaskSet) {
         if (llvm::none_of(arrives, [&](Operation *arrive) {
               return getWarpSpecializeTaskRegion(arrive) == producer &&
-                     haveMatchingLoopNests(arrive, wait);
+                     (peeled || haveMatchingLoopNests(arrive, wait));
             }))
           return std::nullopt;
       }
@@ -1447,9 +1600,14 @@ void promoteBarrier(BarrierCandidate &candidate,
                                                  idsBySlot, use.index);
     Value count =
         arith::ConstantIntOp::create(builder, wait.getLoc(), numThreads, 32);
-    // Every promoted wait is unconditional: the schedule provers only accept
-    // waits whose predicate is provably always-true, and phase plans with an
-    // initial skip are never built.
+    // Reuse the predicate proved by the covering schedule. Its false case
+    // means zero producer iterations; its true case includes every counted
+    // thread. This coupling is what permits a constant participant count.
+    if (!isAlwaysTrue(wait.getPred())) {
+      auto guard = scf::IfOp::create(builder, wait.getLoc(), wait.getPred(),
+                                     /*withElseRegion=*/false);
+      builder.setInsertionPointToStart(guard.thenBlock());
+    }
     ttng::NamedBarrierWaitOp::create(builder, wait.getLoc(), namedId, count);
     wait.erase();
   }
