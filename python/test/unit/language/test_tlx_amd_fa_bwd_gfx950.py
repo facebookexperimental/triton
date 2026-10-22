@@ -2108,6 +2108,21 @@ def _observe_prefix_ds_kernels(monkeypatch, before=None, *, roles=_H12_DS_ROLES)
     return records
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_gqa_is_spill_free_gfx950(monkeypatch):
+    q_lengths, kv_lengths = [300, *([17] * 767)], [3200, *([17] * 767)]
+    case = _make_varlen_d128_reference_case(q_lengths, kv_lengths, q_heads=12, kv_heads=4, seed=17)
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    name = "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel"
+    records = _observe_prefix_ds_kernels(monkeypatch, roles=(name,))
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q, k, v, out, do, lse, plan, sm_scale=scale, causal=False, dq_atomic_fp32=True)
+    _assert_prefix_ds_result(actual, case, expected, q_lengths, kv_lengths)
+    assert len(records) == 1 and records[0][0] == name
+    _assert_scratch_free(name, records[0][2])
+
+
 def _assert_h12_ds_route(records, handoff):
     expected = [_H12_DS_ROLES[0], _H12_DS_ROLES[1], _H12_DS_ROLES[3]
                 ] if handoff else [_H12_DS_ROLES[0], _H12_DS_ROLES[4], _H12_DS_ROLES[2], _H12_DS_ROLES[5]]
