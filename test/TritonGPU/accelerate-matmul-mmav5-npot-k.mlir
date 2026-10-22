@@ -26,10 +26,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK: #[[MMA:.+]] = #ttg.nvidia_mma<{versionMajor = 2
+  // CHECK: #[[$MMA:.+]] = #ttg.nvidia_mma<{versionMajor = 2
   // CHECK-LABEL: tt.func @k48_f16_aligned
   // CHECK-NOT: ttng.tc_gen5_mma
-  // CHECK: tt.dot {{.*}} -> tensor<64x64xf32, #[[MMA]]>
+  // CHECK: tt.dot {{.*}} -> tensor<64x64xf32, #[[$MMA]]>
   // CHECK-NOT: ttng.tc_gen5_mma
   // CHECK: tt.return
   tt.func @k48_f16_aligned(%a: tensor<64x48xf16, #blocked1>, %b: tensor<48x64xf16, #blocked1>, %c: tensor<64x64xf32, #blocked>) -> tensor<64x64xf32, #blocked> {
