@@ -305,8 +305,8 @@ KV_SPLIT_NOMINAL_BLOCK_M: int = 128
 # `auto` (default) uses the heuristic below; an integer forces that many splits
 # (1 disables). For benchmarking and A/B tests.
 KV_SPLITS_ENV: str = "TLX_HSTU_CROSS_ATTN_KV_SPLITS"
-# Forwards that `stream_k_supported` accepts (non-causal, untruncated, separate K/V, head dim 128, at most 64
-# sequences, all or no softmax heads) take the persistent stream-K kernel in `_forward_stream_k`; "0" keeps them
+# Forwards that `stream_k_supported` accepts (non-causal, untruncated, head dim 128, all or no softmax heads, at
+# most 64 sequences or long q sequences) take the persistent stream-K kernel in `_forward_stream_k`; "0" keeps them
 # on the tiled kernel. For benchmarking and A/B tests.
 STREAM_K_ENV: str = "TLX_HSTU_CROSS_ATTN_STREAM_K"
 

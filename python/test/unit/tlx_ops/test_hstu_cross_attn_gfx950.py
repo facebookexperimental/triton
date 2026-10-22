@@ -169,6 +169,35 @@ def test_hstu_cross_attn_stream_k(dtype, num_softmax_heads, lengths_kv, lengths_
         assert int(flags.abs().sum()) == 0
 
 
+@requires_gfx950
+@pytest.mark.parametrize("num_softmax_heads", [0, 2])
+@pytest.mark.parametrize("shared_kv", [False, True])
+def test_hstu_cross_attn_stream_k_many_seqs(num_softmax_heads, shared_kv, monkeypatch):
+    # Past FEW_SEQS sequences only long q sequences take stream-K; these give each program more q tiles than
+    # MAX_SEGMENTS - 1, with empty q and KV sequences among them.
+    from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k, gfx950
+
+    calls = []
+    stream_k_fwd = gfx950.stream_k_fwd
+    monkeypatch.setattr(gfx950, "stream_k_fwd", lambda *args: calls.append(args) or stream_k_fwd(*args))
+    generator = torch.Generator().manual_seed(1039)
+    lengths_q = torch.randint(150, 520, (300, ), generator=generator).tolist()
+    lengths_kv = torch.randint(1, 700, (300, ), generator=generator).tolist()
+    lengths_q[:3] = [0, 1, 513]
+    lengths_kv[3] = 0
+    torch.manual_seed(1039)
+    _run(lengths_kv, lengths_q, heads=2, num_softmax_heads=num_softmax_heads, dtype=torch.bfloat16, shared_kv=shared_kv,
+         check_backward=num_softmax_heads > 0)
+    assert calls
+    q, num_cus = calls[0][0], calls[0][-1]
+    tiles = q.shape[1] * (triton.cdiv(q.shape[0], _forward_stream_k.BLOCK_M) + len(lengths_q))
+    assert triton.cdiv(tiles, num_cus) > _forward_stream_k.MAX_SEGMENTS - 1
+    calls.clear()
+    _run([64] * 100, [32] * 100, heads=2, num_softmax_heads=num_softmax_heads, dtype=torch.bfloat16,
+         shared_kv=shared_kv)
+    assert not calls
+
+
 def _inference_inputs(lengths_kv, lengths_q, heads=2, dim=128, dtype=torch.bfloat16):
     device = torch.device("cuda")
     seq_offsets = _offsets(torch.tensor(lengths_kv, device=device))
