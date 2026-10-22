@@ -4,6 +4,8 @@ from torch._inductor.kernel.mm_common import mm_grid  # noqa: F401
 from torch._inductor.select_algorithm import SymbolicGridFn, TritonTemplate
 from torch._inductor.utils import load_template
 
+from ..hw.target import current_target
+
 # TLX kernel .jinja templates ship alongside this module (packaged as buck
 # resources of the triton beta python library), so load them from here rather
 # than from the OSS inductor template dir.
@@ -126,6 +128,8 @@ def append_tlx(templates, op_name="mm"):
         uids = {getattr(t, "uid", None) for t in templates}
         if bmm_template.uid in uids and amd_bmm_warppipe_template.uid not in uids:
             templates.append(amd_bmm_warppipe_template)
-    else:
+    elif op_name == "mm" and current_target().is_blackwell:
+        # Two-input TMEM GEMM: Blackwell only, and never for scaled_mm, whose extra
+        # scale inputs trip def_kernel's input-count assertion.
         templates.append(blackwell_gemm_ws_template)
     return templates
