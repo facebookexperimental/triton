@@ -1444,12 +1444,13 @@ def _attn_bwd_gqa_front(
     p_nd = tl.permute(p_nd, (0, 2, 3, 1, 4, 5))
     p_nd = tl.reshape(p_nd, (BLOCK_N, BLOCK_M))
     p_nd = tlx.require_layout(p_nd, P_ND_LAYOUT, pin=False)
-    ds_bf16 = ds.to(tl.bfloat16)
-    tlx.local_store(ds_stage, tl.trans(ds_bf16))
-    ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
-    ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
-    ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
-    ds_nd = tlx.require_layout(ds_nd, P_ND_LAYOUT, pin=False)
+    if not (SCALE_LSE_IN_MAIN and not IS_CAUSAL):
+        ds_bf16 = ds.to(tl.bfloat16)
+        tlx.local_store(ds_stage, tl.trans(ds_bf16))
+        ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
+        ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
+        ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
+        ds_nd = tlx.require_layout(ds_nd, P_ND_LAYOUT, pin=False)
 
     if UPDATE_DV_FIRST_HALF:
         dv = _attn_bwd_gqa_dv_fragmented_half(
@@ -1461,6 +1462,14 @@ def _attn_bwd_gqa_front(
             Q_OUT_LAYOUT,
             True,
         )
+
+    if SCALE_LSE_IN_MAIN and not IS_CAUSAL:
+        ds_bf16 = ds.to(tl.bfloat16)
+        tlx.local_store(ds_stage, tl.trans(ds_bf16))
+        ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
+        ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
+        ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
+        ds_nd = tlx.require_layout(ds_nd, P_ND_LAYOUT, pin=False)
 
     return dv, ds_nd, q_out, p_nd, do_out
 
