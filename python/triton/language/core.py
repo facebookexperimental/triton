@@ -2481,7 +2481,7 @@ def split(a, _semantic=None, _generator=None) -> tuple[tensor, tensor]:
 def view(input, *shape, _semantic=None):
     """
     Returns a tensor with the same elements as `input` but a different shape.
-    The order of the elements may not be preserved.
+    The order of the elements is preserved.
 
     :param input: The input tensor.
     :type input: Block
@@ -2493,9 +2493,9 @@ def view(input, *shape, _semantic=None):
         view(x, (32, 32))
         view(x, 32, 32)
     """
-    warn("view is deprecated, please use reshape with can_reorder being true.")
+    warn("view is deprecated, please use reshape.")
     shape = _shape_check_impl(_unwrap_iterable(shape))
-    return _semantic.reshape(input, shape, can_reorder=True)
+    return _semantic.reshape(input, shape, can_reorder=False)
 
 
 @_tensor_member_fn
