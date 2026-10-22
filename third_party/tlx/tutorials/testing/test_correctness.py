@@ -1372,7 +1372,9 @@ def test_amd_fa_cluster_short_causal_nonpositive_scale(sm_scale):
     q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.float16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
+    assert torch.isfinite(ref).all()
     out = _amd_fa_cluster(q, k, v, sm_scale, True)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
@@ -1391,7 +1393,9 @@ def test_amd_fa_cluster_negative_scale_stays_finite():
     k = key_rows[None, None, :, None].expand(B, H, N_CTX, D).to(q.dtype).contiguous()
     v = torch.randn_like(q)
     sm_scale = -0.125
-    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
+    assert torch.isfinite(ref).all()
     out = _amd_fa_cluster(q, k, v, sm_scale, True)
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
