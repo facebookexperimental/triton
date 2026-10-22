@@ -879,7 +879,7 @@ TargetInfo::getSharedLdStTiles(int32_t vecBitwidth) const {
   case ISAFamily::RDNA3:
   case ISAFamily::RDNA4m:
     if (vecBitwidth == 128)
-      return {/*load tile*/ {{}, {}, {1, 2, 20}}, /*store tile*/ {}};
+      return {/*load tile*/ {{}, {}, {1, 2, 16}}, /*store tile*/ {}};
     break;
   case ISAFamily::CDNA4:
     if (vecBitwidth == 128)
