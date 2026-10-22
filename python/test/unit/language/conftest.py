@@ -4,6 +4,11 @@ import torch
 import triton.runtime.driver as driver
 
 
+@pytest.fixture
+def gfx950_beta_slp_copying(monkeypatch):
+    monkeypatch.setenv("DISABLE_LLVM_OPT", "slp-copyable-elements")
+
+
 def _generate_test_params():
     """Generate test parameters with filtering for memory constraints."""
     dims_mn = [16, 32, 64, 128, 512]
