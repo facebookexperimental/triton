@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from torch._inductor import config as inductor_config
 from torch._inductor.kernel.mm_common import mm_grid  # noqa: F401
 from torch._inductor.select_algorithm import SymbolicGridFn, TritonTemplate
 from torch._inductor.utils import load_template
@@ -45,6 +46,14 @@ def _mm_grid_split_k(m, n, meta, *, cdiv):
         1,
         1,
     )
+
+
+@SymbolicGridFn
+def _gfx942_mm_grid_split_k(m, n, meta, *, cdiv):
+    tiles = cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"])
+    split_k = meta.get("SPLIT_K", 1)
+    chunk = meta.get("SPLIT_ORDER_CHUNK", 1)
+    return (cdiv(tiles, chunk) * chunk * split_k, 1, 1)
 
 
 @SymbolicGridFn
@@ -99,21 +108,18 @@ gfx950_addmm_warppipe_template = TritonTemplate(
     source=load_tlx_template("gfx950_addmm_warppipe"),
 )
 
-# MI300X/gfx942 direct-load GEMM templates.  The source is intentionally shared
-# with the register-resident gfx950 fallback: it is the Inductor form of the
-# direct-load path in tlx.ops.kernels.mm.gfx942 (explicit strides, register
-# operands, tl.dot, and a store_output epilogue).  Separate identities let the
-# registry attach gfx942's measured heuristic to mm and addmm independently.
+# MI300X direct-load GEMM templates support fp32 split-K workspace output.
+# The existing wrapper launches the shared reducer and applies addmm bias once.
 gfx942_mm_template = TritonTemplate(
     name="tlx_gfx942_mm",
-    grid=mm_grid,
-    source="# tlx_gfx942_mm\n" + load_tlx_template("gfx950_mm_register"),
+    grid=_gfx942_mm_grid_split_k,
+    source="# tlx_gfx942_mm\n" + load_tlx_template("gfx942_mm_register"),
 )
 
 gfx942_addmm_template = TritonTemplate(
     name="tlx_gfx942_addmm",
-    grid=mm_grid,
-    source="# tlx_gfx942_addmm\n" + load_tlx_template("gfx950_mm_register"),
+    grid=_gfx942_mm_grid_split_k,
+    source="# tlx_gfx942_addmm\n" + load_tlx_template("gfx942_mm_register"),
 )
 
 # gfx950-only inter-wave GEMM candidates derived from the a16w16 tutorial. The
@@ -211,16 +217,17 @@ def append_tlx(templates, op_name, kernel_inputs):
 
 def _append_tlx_amd(templates, op_name):
     if op_name in ("mm", "addmm"):
-        # Both operations inject only into a choice set that already contains
-        # the stock mm_template. tuned_addmm issues several get_template_configs
-        # calls (aten, subgraph, unified), so this also identifies its unified
-        # choice set and prevents duplicate TLX candidates.
-        from torch._inductor.kernel.mm import mm_template
+        # Identify the unified choice set when autotuning is enabled and the
+        # default ATen choice set otherwise, avoiding duplicate TLX candidates.
+        from torch._inductor.kernel.mm import aten_addmm, aten_mm, mm_template
 
         uids = {getattr(t, "uid", None) for t in templates}
-        if mm_template.uid not in uids:
-            return templates
         if current_target().is_gfx942:
+            default_set = not (
+                inductor_config.max_autotune or inductor_config.max_autotune_gemm
+            ) and bool(uids & {aten_mm.uid, aten_addmm.uid})
+            if mm_template.uid not in uids and not default_set:
+                return templates
             template = (
                 gfx942_mm_template
                 if op_name == "mm"
@@ -228,6 +235,8 @@ def _append_tlx_amd(templates, op_name):
             )
             if template.uid not in uids:
                 templates.append(template)
+            return templates
+        if mm_template.uid not in uids:
             return templates
         if op_name == "mm":
             for template in (
@@ -265,6 +274,23 @@ def _append_tlx_amd(templates, op_name):
     # one here is the bug reported in P2462423082: it cannot be selected on
     # gfx9xx and only produces log noise.
     return templates
+
+
+def tlx_kernel_inputs(template, kernel_inputs, op_name):
+    """Expand default addmm bias inputs for the gfx942 template epilogue."""
+    if template is not gfx942_addmm_template or op_name != "addmm":
+        return kernel_inputs
+    bias, mat1, mat2 = kernel_inputs.nodes()
+    size = [mat1.get_size()[0], mat2.get_size()[1]]
+    if list(bias.get_size()) == size:
+        return kernel_inputs
+    from torch._inductor.ir import ExpandView
+    from torch._inductor.kernel_inputs import MMKernelInputs
+
+    return MMKernelInputs(
+        [ExpandView.create(bias, size), mat1, mat2],
+        scalars=kernel_inputs._scalars, out_dtype=kernel_inputs.out_dtype(),
+    )
 
 
 def _append_tlx_blackwell(templates, op_name):
