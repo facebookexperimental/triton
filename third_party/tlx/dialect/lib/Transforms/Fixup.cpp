@@ -162,55 +162,57 @@ static bool retypeWithEncoding(Value v, Attribute enc) {
 
 static void privatizeHelperForCall(::mlir::triton::CallOp call,
                                    ::mlir::triton::FuncOp callee,
-                                   StringRef suffix) {
+                                   StringRef suffix,
+                                   SymbolTableCollection &symbolTables) {
+  auto &symbolTable = symbolTables.getSymbolTable(callee->getParentOp());
   OpBuilder b(callee);
   auto clone = cast<::mlir::triton::FuncOp>(b.clone(*callee.getOperation()));
   std::string base = (callee.getSymName() + suffix).str();
   std::string name = base;
   unsigned n = 0;
-  while (SymbolTable::lookupNearestSymbolFrom(
-      call, StringAttr::get(callee.getContext(), name)))
+  while (symbolTable.lookup(name))
     name = base + "_" + std::to_string(n++);
   clone.setSymName(name);
   SymbolTable::setSymbolVisibility(clone, SymbolTable::Visibility::Private);
+  symbolTable.insert(clone);
   call.setCalleeAttr(FlatSymbolRefAttr::get(callee.getContext(), name));
 }
 
 // Frontend helper signatures omit encodings that TLX tensor values carry.
-static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod, bool &changed) {
+static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod,
+                                                   bool &changed) {
   // A frontend-monomorphized helper can be shared by call sites carrying
   // different concrete layouts. Privatize every concrete call while the
   // original ABI is still encoding-free; otherwise the first call would
   // specialize the shared function and make a later, equally valid layout
   // look like a conflict. Encoding-free callers retain the original.
+
+  // Shared helpers may receive different concrete layouts at each call site.
   SmallVector<std::pair<::mlir::triton::CallOp, ::mlir::triton::FuncOp>>
       concreteClones;
+  // Build the symbol-to-user index once. Calling getSymbolUses(callee, mod)
+  // for each concrete call repeatedly walks the whole module and is quadratic
+  // for large helper-heavy TLX kernels.
+  SymbolTableCollection symbolTables;
+  SymbolUserMap symbolUsers(symbolTables, mod);
   mod.walk([&](::mlir::triton::CallOp call) {
     if (!llvm::any_of(call.getOperandTypes(), isConcreteDistributed))
       return;
-    auto callee = SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+    auto callee = symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
         call, call.getCalleeAttr());
     if (!callee || callee.getBody().empty())
       return;
-    auto uses = SymbolTable::getSymbolUses(callee, mod);
-    if (!uses)
-      return;
-    unsigned useCount = 0;
-    for (const auto &use : *uses) {
-      (void)use;
-      ++useCount;
-    }
-    if (useCount > 1)
+    if (symbolUsers.getUsers(callee).size() > 1)
       concreteClones.emplace_back(call, callee);
   });
   for (auto [call, callee] : concreteClones) {
-    privatizeHelperForCall(call, callee, "_tlxabi");
+    privatizeHelperForCall(call, callee, "_tlxabi", symbolTables);
     changed = true;
   }
 
   bool inputConflict = false;
   mod.walk([&](::mlir::triton::CallOp call) {
-    auto callee = SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+    auto callee = symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
         call, call.getCalleeAttr());
     if (!callee || callee.getBody().empty())
       return;
@@ -347,7 +349,7 @@ static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod, bool &changed) {
   }
 
   mod.walk([&](::mlir::triton::CallOp call) {
-    auto callee = SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+    auto callee = symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
         call, call.getCalleeAttr());
     if (!callee)
       return;
@@ -1090,6 +1092,7 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
     // tt.calls whose shared helper callee must be privatized (cloned) before it
     // can be specialized. Collected during the walk and applied afterwards, so
     // we never insert into the module while traversing it.
+    SymbolUserMap symbolUsers(symbolTables, mod);
     SmallVector<::mlir::triton::CallOp> pendingClones;
     mod.walk([&](Operation *op) {
       // arith/math elementwise, select, cmp: all same-shape tensor operands and
@@ -1322,6 +1325,7 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
         }
         return;
       }
+
       // Re-infer any op whose operands acquired a layout after frontend
       // construction. Besides deferred placeholders, this covers a concrete
       // encoding propagated through control flow into a previously unencoded
@@ -1416,7 +1420,7 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
               break;
             }
         auto callee =
-            enc ? SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+            enc ? symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
                       callOp, callOp.getCalleeAttr())
                 : ::mlir::triton::FuncOp();
         if (!callee)
@@ -1429,16 +1433,9 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
         // clone a private copy after the walk and point this call at it, so
         // specializing never changes types out from under other callers or
         // toggles a shared callee between two pins across fixpoint iterations.
-        if (auto symUses = SymbolTable::getSymbolUses(callee, mod)) {
-          unsigned useCount = 0;
-          for (const auto &u : *symUses) {
-            (void)u;
-            ++useCount;
-          }
-          if (useCount > 1) {
-            pendingClones.push_back(callOp);
-            return;
-          }
+        if (symbolUsers.getUsers(callee).size() > 1) {
+          pendingClones.push_back(callOp);
+          return;
         }
         // Triton monomorphizes @triton.jit helpers with encoding-stripped
         // (null) signatures, so specialize params (entry block args +
@@ -1542,11 +1539,11 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
     // cannot change types out from under other callers.
     for (auto callOp : pendingClones) {
       auto callee =
-          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+          symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
               callOp, callOp.getCalleeAttr());
       if (!callee)
         continue;
-      privatizeHelperForCall(callOp, callee, "_tlxpin");
+      privatizeHelperForCall(callOp, callee, "_tlxpin", symbolTables);
       changed = true;
     }
   }
@@ -1778,8 +1775,10 @@ public:
           mod.emitError("TLX concrete layout reconciliation did not converge");
           return signalPassFailure();
         }
-        if (failed(reconcileEncodingUniformOps(mod, changed)) ||
-            failed(reconcileDotLayouts(mod, changed)))
+        if (failed(synchronizeConcreteHelperABI(mod, changed)) ||
+            failed(reconcileEncodingUniformOps(mod, changed)) ||
+            failed(reconcileDotLayouts(mod, changed)) ||
+            failed(reconcileRegionCarriedLayouts(mod, changed)))
           return signalPassFailure();
       }
     }

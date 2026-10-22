@@ -26,6 +26,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
@@ -166,8 +167,9 @@ public:
     bool rematerializeCoordinates =
         cvtOp->hasAttr("tlx.rematerialize_coordinates");
 
-    auto encoding = cvtOp.getSrc().getType().getEncoding();
-    if (!isa<triton::gpu::MmaEncodingTrait>(encoding))
+    auto srcEncoding = cvtOp.getSrc().getType().getEncoding();
+    if (!isa<triton::gpu::MmaEncodingTrait>(
+            triton::unwrapTlxWrappers(srcEncoding)))
       return mlir::failure();
 
     if (!cvtOp.getResult().hasOneUse())
