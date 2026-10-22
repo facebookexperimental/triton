@@ -27,19 +27,21 @@ def _iso(ts):
     return f"{head}.{(frac + '000000')[:6]}Z" if frac else ts
 
 
-def parse_lines(log_text):
-    """(timestamp, normalized id, message) for each short-summary line, in log order."""
+def parse_lines(log_text, normalize_ids=True):
+    """(timestamp, id, message) for each short-summary line, in log order. Ids are normalized unless
+    normalize_ids is False, for a suite whose parameter names what failed (the TLX ops bench's op)."""
     out = []
     for line in log_text.splitlines():
         m = SUMMARY.match(ANSI.sub("", line).rstrip())
         if m:
-            out.append((_iso(m.group(1)), normalize(m.group(3)), (m.group(4) or "").strip()))
+            out.append((_iso(m.group(1)), normalize(m.group(3)) if normalize_ids else m.group(3), (m.group(4)
+                                                                                                   or "").strip()))
     return out
 
 
-def attach_failures(job, log_text):
+def attach_failures(job, log_text, normalize_ids=True):
     """Set step["failures"] = [{id, msg}] on each failed test step of the job. A failed setup step gets none."""
-    lines = [(t(ts), i, msg) for ts, i, msg in parse_lines(log_text)]
+    lines = [(t(ts), i, msg) for ts, i, msg in parse_lines(log_text, normalize_ids)]
     key = job["name"].split(" / ", 1)[-1]
     for s in job["steps"]:
         if s["conclusion"] != "failure" or INFRA_STEP.search(s["name"]):
