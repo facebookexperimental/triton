@@ -303,6 +303,18 @@ queue-wide `wait_group(K-1)` operations before the next iteration's staging
 writers, followed by one `wait_group(0)` drain after the loop. Ordinary
 software-pipelined loops retain their loop-carried token schedule.
 
+When a planned-count wait (K > 1) moves to a later iteration of an ordinary
+pipelined loop, it sits a stage after the staging writer, so the pipeliner's
+prologue has no copy of it: the first iterations of the next run of the loop
+(for example the next persistent tile's epilogue) would write the staging slots
+while the previous run's last K-1 stores are still in flight (the drain copies
+keep the rotated count). For barrier- and token-free waits the pass therefore
+also gives the target writer a queue-wide `wait_group(min(K-1, n))` in the
+writer's own stage, where n is the number of TMA store-like ops issued between
+the store and that writer. In steady state it waits for the same store as the
+token wait. One `wait_group(0)` after the outermost enclosing loop drains the
+last run.
+
 The merge attribute can be on an enclosing persistent loop rather than the
 loop containing the dQ stores. The pass therefore searches the loop ancestry:
 an inner reduction loop inherits the merged-epilogue realization and receives
