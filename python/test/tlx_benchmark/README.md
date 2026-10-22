@@ -11,7 +11,7 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-`{op}` is one of `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
+`{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
 `kda_prefill`, `kda_decode`.
 
@@ -298,3 +298,7 @@ needs the measured mean.
 `Prepared.tlx_fn`/`ref_fn` must not allocate -- they are called hundreds of times
 inside the measured window. Build the tensors in `prepare` and capture them.
 `test_ops_perf.py` picks the new file up automatically.
+
+`bench_norm.py` covers the GEO plain, saved-state, MXFP8, MXFP4, NVFP4,
+fused/jagged and softmax requests. It replays CUDA graphs for both providers;
+quantized cases report latency without a torch quantization speedup.
