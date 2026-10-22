@@ -194,22 +194,6 @@ class _PlainFuncWrapper:
     def __call__(self, *args, **kwargs):
         return self._func(*args, **kwargs)
 
-    def register_fake(self, fn):
-        return fn
-
-    def register_kernel(self, *args, **kwargs):
-        return lambda fn: fn
-
-
-def maybe_register_custom_op(op_name, mutates_args):
-
-    def decorator(func):
-        if os.environ.get("AOTI_LOWER"):
-            return _PlainFuncWrapper(func)
-        return torch.library.custom_op(op_name, func, mutates_args=mutates_args)
-
-    return decorator
-
 
 # "curated" autotunes over the kernel's curated config list for the call's
 # regime; "full" over the whole grid; "smoke" runs one config per kernel, for
@@ -1493,8 +1477,7 @@ def _tlx_gfx950_cross_attn_fwd(
     )
 
 
-@maybe_register_custom_op("tlx::hstu_cross_attn_gfx950_fwd", mutates_args=())
-def tlx_gfx950_cross_attn_fwd(
+def _tlx_gfx950_cross_attn_fwd_impl(
     max_seq_len: int,
     alpha: float,
     q: torch.Tensor,
@@ -1539,7 +1522,7 @@ def tlx_gfx950_cross_attn_fwd(
     _, _, DimV = v.shape
     out = torch.empty(total_seq_len_q, H, DimV, device=q.device, dtype=q.dtype)
     if total_seq_len_q == 0:
-        M = torch.empty(0, device=q.device, dtype=torch.float32)
+        M = torch.empty((0, num_softmax_heads) if num_softmax_heads > 0 else 0, device=q.device, dtype=torch.float32)
         return out, M
 
     grid = lambda meta: (  # noqa E731
@@ -2886,21 +2869,24 @@ def _tlx_gfx950_cross_attn_double_backward(ctx, *grads):
 
 
 # Extra dispatch keys require the standard backend dispatch path.
-_HSTU_BWD_EAGER_KEYSETS = tuple(
-    (torch._C.DispatchKeySet(backend) | torch._C.DispatchKeySet(autograd)).raw_repr()
-    for backend, autograd in ((torch._C.DispatchKey.CPU, torch._C.DispatchKey.AutogradCPU),
-                              (torch._C.DispatchKey.CUDA, torch._C.DispatchKey.AutogradCUDA)))
+_HSTU_EAGER_KEYSETS = tuple((torch._C.DispatchKeySet(backend) | torch._C.DispatchKeySet(autograd)).raw_repr()
+                            for backend, autograd in ((torch._C.DispatchKey.CPU, torch._C.DispatchKey.AutogradCPU),
+                                                      (torch._C.DispatchKey.CUDA, torch._C.DispatchKey.AutogradCUDA)))
 
 
-def _tlx_gfx950_cross_attn_bwd_dispatch(keyset, *args):
-    unsafe = keyset.raw_repr() not in _HSTU_BWD_EAGER_KEYSETS
+def _eager_dispatch(op, impl, keyset, *args):
+    unsafe = keyset.raw_repr() not in _HSTU_EAGER_KEYSETS
     # Forward AD dual tensors can have ordinary dispatch keys.
     unsafe = unsafe or getattr(torch.autograd.forward_ad, "_current_level", 0) >= 0
     unsafe = unsafe or any(isinstance(arg, torch.Tensor) and type(arg) is not torch.Tensor for arg in args)
     if unsafe:
         with torch._C._AutoDispatchBelowAutograd():
-            return tlx_gfx950_cross_attn_bwd.redispatch(keyset & torch._C._after_autograd_keyset, *args)
-    return _tlx_gfx950_cross_attn_bwd_impl(*args)
+            return op.redispatch(keyset & torch._C._after_autograd_keyset, *args)
+    return impl(*args)
+
+
+def _tlx_gfx950_cross_attn_bwd_dispatch(keyset, *args):
+    return _eager_dispatch(tlx_gfx950_cross_attn_bwd, _tlx_gfx950_cross_attn_bwd_impl, keyset, *args)
 
 
 class _TlxGfx950CrossAttentionBackwardAutogradFunction(torch.autograd.Function):
@@ -3329,8 +3315,6 @@ def tlx_gfx950_cross_attn_mha_wrapper(
     )
 
 
-@tlx_gfx950_cross_attn_fwd.register_fake
-@tlx_gfx950_cross_attn_fwd.register_kernel("cpu")
 def _tlx_gfx950_cross_attn_fwd_fake(
     max_seq_len: int,
     alpha: float,
@@ -3361,6 +3345,52 @@ def _tlx_gfx950_cross_attn_fwd_fake(
         torch.empty(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype),
         M,
     )
+
+
+def _tlx_gfx950_cross_attn_fwd_no_backward(ctx, *grads):
+    raise RuntimeError("Trying to backward through tlx.hstu_cross_attn_gfx950_fwd.default but no autograd "
+                       "formula was registered. Please use register_autograd to add one.")
+
+
+class _TlxGfx950CrossAttentionForwardOpAutogradFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, keyset, *args):
+        return _tlx_gfx950_cross_attn_fwd_dispatch(keyset, *args)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        return _tlx_gfx950_cross_attn_fwd_no_backward(ctx, *grads)
+
+
+def _tlx_gfx950_cross_attn_fwd_dispatch(keyset, *args):
+    return _eager_dispatch(tlx_gfx950_cross_attn_fwd, _tlx_gfx950_cross_attn_fwd_impl, keyset, *args)
+
+
+def _tlx_gfx950_cross_attn_fwd_autograd(keyset, *args):
+    if torch.is_grad_enabled() and torch._C._any_requires_grad(*args):
+        return _TlxGfx950CrossAttentionForwardOpAutogradFunction.apply(keyset, *args)
+    return _tlx_gfx950_cross_attn_fwd_dispatch(keyset, *args)
+
+
+if os.environ.get("AOTI_LOWER"):
+    tlx_gfx950_cross_attn_fwd = _PlainFuncWrapper(_tlx_gfx950_cross_attn_fwd_impl)
+else:
+    # Registered like the backward: `torch.library.custom_op` checks output aliasing on every call, a large share
+    # of a short forward's host time.
+    _hstu_cross_attn_fwd_library = torch.library.Library("tlx", "FRAGMENT")
+    _hstu_cross_attn_fwd_library.define(
+        "hstu_cross_attn_gfx950_fwd" + torch.library.infer_schema(_tlx_gfx950_cross_attn_fwd_impl, mutates_args=()),
+        tags=(torch.Tag.pt2_compliant_tag, ),
+    )
+    _hstu_cross_attn_fwd_library.impl("hstu_cross_attn_gfx950_fwd", _tlx_gfx950_cross_attn_fwd_impl,
+                                      "CompositeExplicitAutograd")
+    _hstu_cross_attn_fwd_library.impl("hstu_cross_attn_gfx950_fwd", _tlx_gfx950_cross_attn_fwd_fake, "CPU")
+    _hstu_cross_attn_fwd_library.impl("hstu_cross_attn_gfx950_fwd", _tlx_gfx950_cross_attn_fwd_autograd, "Autograd",
+                                      with_keyset=True)
+    torch.library.register_fake("tlx::hstu_cross_attn_gfx950_fwd", _tlx_gfx950_cross_attn_fwd_fake,
+                                lib=_hstu_cross_attn_fwd_library)
+    tlx_gfx950_cross_attn_fwd = torch.ops.tlx.hstu_cross_attn_gfx950_fwd.default
 
 
 def hstu_cross_attn(

@@ -1739,6 +1739,36 @@ def test_hstu_cross_attn_gfx950_backward_op_schema(monkeypatch, shared_kv, q_len
 
 
 @requires_gfx950
+@pytest.mark.parametrize("num_softmax_heads", [0, 2])
+@pytest.mark.parametrize("q_length", [0, 3])
+def test_hstu_cross_attn_gfx950_forward_op_schema(monkeypatch, num_softmax_heads, q_length):
+    """Keep eager, fake, and functionalized forward outputs consistent."""
+    from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
+
+    monkeypatch.setattr(gfx950, "_SPACE", "smoke")
+    torch.manual_seed(317)
+    q = torch.randn(q_length, 2, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(5, 2, 128, device="cuda", dtype=q.dtype)
+    # Distinct K/V only: opcheck copies its inputs, which would break the aliasing `shared_kv` requires.
+    inputs = dict(max_seq_len=128, alpha=1.0 / 128, q=q, k=k, v=torch.randn_like(k),
+                  seq_offsets=torch.tensor([0, 5], device="cuda", dtype=torch.int64),
+                  seq_offsets_q=torch.tensor([0, q_length], device="cuda", dtype=torch.int64), max_q_len=256,
+                  attn_scale=torch.tensor(1.0 / 128, device="cuda"), G=1, num_softmax_heads=num_softmax_heads)
+    op = torch.ops.tlx.hstu_cross_attn_gfx950_fwd.default
+    assert gfx950.tlx_gfx950_cross_attn_fwd is op
+    out, m = op(**inputs)
+    assert out.shape == q.shape and m.shape == ((q_length, num_softmax_heads) if num_softmax_heads else (0, ))
+    tensors = [value for value in inputs.values() if isinstance(value, torch.Tensor)]
+    assert all(not torch._C._is_alias_of(output, tensor) for output in (out, m) for tensor in tensors)
+    checks = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
+    result = torch.library.opcheck(op, (), inputs, test_utils=checks)
+    assert result == dict.fromkeys(checks, "SUCCESS")
+    q.requires_grad_()
+    with pytest.raises(RuntimeError, match="no autograd formula"):
+        op(**inputs)[0].sum().backward()
+
+
+@requires_gfx950
 def test_hstu_cross_attn_gfx950_backward_op_rejects_double_backward(monkeypatch):
     """Reject differentiation through the backward operator."""
     from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
