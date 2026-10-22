@@ -303,17 +303,16 @@ def _pin_workitem_layout(value):
 
 @triton.jit
 def _duplicate_rows_to_workitems(rows):
-    # The reduction produces one value per logical row. Lanes enumerate the
-    # 32 rows within each pair, the first two warp bits enumerate the four row
-    # pairs, and the final warp bit duplicates that ownership across the two
-    # warp groups that covered the score columns.
-    row_layout: tl.constexpr = tlx.layout(
-        shape=((2, 32, 4, 2), ()),
-        stride=((32, 1, 64, 0), ()),
+    mma_layout: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[8, 1],
     )
-    rows = tlx.release_layout(tlx.require_layout(rows, row_layout))
-    per_warp_rows = rows.reshape([8, 32])
-    per_workitem = tl.broadcast_to(per_warp_rows[:, None, :], (8, 2, 32))
+    row_layout: tl.constexpr = tlx.slice_layout(mma_layout, 1)
+    rows = tlx.require_layout(rows, row_layout)
+    row_copies = tl.broadcast_to(rows[:, None], (BLOCK_M, 2))
+    per_workitem = row_copies.reshape([8, 32, 2]).permute(0, 2, 1)
     return _pin_workitem_layout(per_workitem.reshape([8 * 64]))
 
 
@@ -947,6 +946,7 @@ def _score_phase(
     )
     next_scores = tl.dot(q, current_k, score_acc)
     next_scores = tlx.release_layout(next_scores)
+    next_scores = tlx.require_layout(next_scores, mma_layout)
     q = tlx.release_layout(q)
     return state, probability_fragments, next_scores
 
@@ -1016,6 +1016,7 @@ def _warp_pipeline_phase(
         )
         next_scores = tl.dot(q, current_k, score_acc)
         next_scores = tlx.release_layout(next_scores)
+        next_scores = tlx.require_layout(next_scores, mma_layout)
         q = tlx.release_layout(q)
 
     with tlx.warp_pipeline_stage("value"):
@@ -1104,6 +1105,7 @@ def _pipeline(
     )
     scores = tl.dot(q, k0, score_acc)
     scores = tlx.release_layout(scores)
+    scores = tlx.require_layout(scores, mma_layout)
     _stage_end()
     state, exponentiated_scores = state.prepare(
         scores,
