@@ -228,3 +228,59 @@ tt.func public @tdm_store_allocation_encoding(%desc: !tt.tensordesc<32x32xf16>) 
   tt.return
 }
 }
+
+// -----
+// A pinned allocation is valid for TDM, and descriptor assignment uses the
+// concrete physical layout under the pin rather than the wrapper.
+#padded = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+#pinned = #tlx.user_layout<#padded>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-DAG: #[[$PINNED_TDM_PADDED:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-DAG: #[[$PINNED_TDM:.*]] = #tlx.user_layout<#[[$PINNED_TDM_PADDED]]>
+// CHECK-LABEL: @tdm_load_pinned_allocation_encoding
+tt.func public @tdm_load_pinned_allocation_encoding(%desc: !tt.tensordesc<128x32xf16>) {
+  // CHECK-SAME: %[[PINNED_DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PINNED_TDM_PADDED]]>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #pinned, #smem, mutable>
+  // CHECK: amdg.async_tdm_copy_global_to_local %[[PINNED_DESC]] into {{.*}} : !tt.tensordesc<128x32xf16, #[[$PINNED_TDM_PADDED]]> -> !ttg.memdesc<128x32xf16, #[[$PINNED_TDM]], #smem, mutable>
+  %token = amdg.async_tdm_copy_global_to_local %desc into %alloc : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #pinned, #smem, mutable>
+  tt.return
+}
+}
+
+// -----
+// Store descriptor assignment also reads through the allocation pin.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#pinned = #tlx.user_layout<#shared>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-DAG: #[[$PINNED_TDM_SHARED:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+// CHECK-DAG: #[[$PINNED_TDM_STORE:.*]] = #tlx.user_layout<#[[$PINNED_TDM_SHARED]]>
+// CHECK-LABEL: @tdm_store_pinned_allocation_encoding
+tt.func public @tdm_store_pinned_allocation_encoding(%desc: !tt.tensordesc<32x32xf16>) {
+  // CHECK-SAME: %[[PINNED_STORE_DESC:.*]]: !tt.tensordesc<32x32xf16, #[[$PINNED_TDM_SHARED]]>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #pinned, #smem, mutable>
+  // CHECK: amdg.async_tdm_copy_local_to_global %[[PINNED_STORE_DESC]] from {{.*}} : !ttg.memdesc<32x32xf16, #[[$PINNED_TDM_STORE]], #smem, mutable> -> !tt.tensordesc<32x32xf16, #[[$PINNED_TDM_SHARED]]>
+  amdg.async_tdm_copy_local_to_global %desc from %alloc : !ttg.memdesc<32x32xf16, #pinned, #smem, mutable> -> !tt.tensordesc<32x32xf16>
+  tt.return
+}
+}
+
+// -----
+// Pins nested inside a partitioned layout are normalized before descriptor
+// assignment and verification as well.
+#padded = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+#pinned_inner = #tlx.user_layout<#padded>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #pinned_inner}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-DAG: #[[$PARTITIONED_TDM_PADDED:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-LABEL: @tdm_load_partitioned_pinned_inner_encoding
+tt.func public @tdm_load_partitioned_pinned_inner_encoding(%desc: !tt.tensordesc<128x32xf16>) {
+  // CHECK-SAME: %[[PARTITIONED_DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PARTITIONED_TDM_PADDED]]>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #partitioned, #smem, mutable>
+  // CHECK: amdg.async_tdm_copy_global_to_local %[[PARTITIONED_DESC]] into
+  %token = amdg.async_tdm_copy_global_to_local %desc into %alloc : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #partitioned, #smem, mutable>
+  tt.return
+}
+}
