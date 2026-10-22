@@ -200,6 +200,9 @@ static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
 struct Transform2CTALoads
     : public impl::NVGPU2CTATransformLoadsBase<Transform2CTALoads> {
   DenseMap<Value, tt::TensorDescType> originalDescTypes;
+  // B operands (local_alloc / memdesc_trans results) already split by an
+  // earlier MMA that shares them.
+  DenseSet<Value> splitBOperands;
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
@@ -234,7 +237,8 @@ struct Transform2CTALoads
     DenseSet<Operation *> splitTransformedMMAs;
     for (auto mma : twoCTAMMAOps) {
       Operation *op = mma.getOperation();
-      if (splitTransformedMMAs.contains(op))
+      if (splitTransformedMMAs.contains(op) ||
+          splitBOperands.contains(mma.getB()))
         continue;
       // Both paths halve the B descriptor; they differ in how many MMAs consume
       // the load. transformSplitBLoad handles a source-level tt.split feeding
@@ -245,9 +249,36 @@ struct Transform2CTALoads
         if (succeeded(transformSplitBLoad(plain, splitTransformedMMAs)))
           continue;
       }
-      if (failed(transformBLoad(mma.getB(), op)))
-        LDBG("Skipped MMA at " << op->getLoc()
-                               << " (B not from descriptor load)");
+      if (succeeded(transformBLoad(mma.getB(), op)))
+        continue;
+      // A 2-CTA MMA reads half of B from each CTA of the pair. Leaving the
+      // full B tile in both CTAs silently computes with the wrong half.
+      op->emitError("two_ctas dot: cannot split the B operand across the CTA "
+                    "pair (B must be a descriptor load, optionally transposed, "
+                    "with BLOCK_N / 2 >= 16)");
+      signalPassFailure();
+      return;
+    }
+
+    // Host-side descriptor arguments are retyped to the half-width block in
+    // place. Any load of such an argument that was not replaced by a
+    // half-width load would read the wrong tile.
+    bool unsplitHostLoad = false;
+    moduleOp.walk([&](tt::DescriptorLoadOp descLoad) {
+      auto desc = descLoad.getDesc();
+      if (desc.getDefiningOp())
+        return;
+      auto orig = originalDescTypes.lookup(desc);
+      if (orig && orig != desc.getType() && !descLoad->hasAttr("two_cta_b")) {
+        descLoad.emitError("two_ctas dot: this load shares a descriptor "
+                           "argument with a 2-CTA B operand that was split "
+                           "across the CTA pair, but is not split itself");
+        unsplitHostLoad = true;
+      }
+    });
+    if (unsplitHostLoad) {
+      signalPassFailure();
+      return;
     }
 
     // A 2-CTA TMA load is issued by both CTAs as one hardware CTA-group
@@ -584,10 +615,12 @@ struct Transform2CTALoads
       newMemDescTrans->setAttrs(memDescTrans->getAttrs());
       memDescTrans.getResult().replaceAllUsesWith(newMemDescTrans.getResult());
       memDescTrans.erase();
+      splitBOperands.insert(newMemDescTrans.getResult());
       if (localAlloc.getResult().use_empty())
         localAlloc.erase();
     } else {
       localAlloc.getResult().replaceAllUsesWith(newLocalAlloc.getResult());
+      splitBOperands.insert(newLocalAlloc.getResult());
       localAlloc.erase();
     }
 
