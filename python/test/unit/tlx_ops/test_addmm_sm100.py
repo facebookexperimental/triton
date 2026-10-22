@@ -47,6 +47,23 @@ def test_generic_addmm_broadcast(bias_shape, dtype):
     torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
 
 
+@pytest.mark.parametrize("m,n", [(64, 64), (4096, 4096)])
+@pytest.mark.parametrize("bias_2d", [False, True])
+def test_addmm_empty_k(m, n, bias_2d):
+    from triton.tlx.ops import addmm as tlx_addmm
+
+    # K == 0 routes to the direct-load kernel at any output size: the WS
+    # kernel's K-loop never commits with zero K-tiles. The large shape sits
+    # above the small-output envelope that used to mask the deadlock.
+    torch.manual_seed(0)
+    a = torch.randn((m, 0), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((0, n), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(((m, n) if bias_2d else (n, )), device="cuda", dtype=torch.bfloat16)
+    actual = tlx_addmm(bias, a, b, space="heuristic")
+    expected = torch.addmm(bias, a, b)
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+
+
 @pytest.mark.parametrize("bias_2d", [False, True])
 def test_addmm_paired_handoff_smoke(bias_2d):
     from triton.tlx.ops import addmm as tlx_addmm
