@@ -128,8 +128,9 @@ class TestDispatcherFallbackWarning:
 class TestCCacheFallbackWarning:
     """Tests for TRITON_ENABLE_C_CACHE fallback warnings."""
 
-    def test_c_cache_bypass_warning_with_hooks(self, monkeypatch):
+    def test_c_cache_bypass_warning_with_hooks(self, monkeypatch, fresh_compilation_knobs):
         """C fast path should warn when bypassed due to launch hooks."""
+        fresh_compilation_knobs.compilation.always_compile = False
         monkeypatch.setenv("TRITON_ENABLE_C_CACHE", "1")
         monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "0")
 
@@ -238,8 +239,9 @@ class TestProxyFallbackWarning:
     """Tests for JIT proxy creation fallback warning."""
 
     @pytest.mark.skipif(not _is_dispatch_target(), reason="Requires CUDA or HIP JIT proxy")
-    def test_proxy_creation_failure_warning(self, monkeypatch):
+    def test_proxy_creation_failure_warning(self, monkeypatch, fresh_compilation_knobs):
         """Should warn when native_create_jit_proxy returns None."""
+        fresh_compilation_knobs.compilation.always_compile = False
         monkeypatch.setenv("TRITON_ENABLE_C_CACHE", "1")
         monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
 
