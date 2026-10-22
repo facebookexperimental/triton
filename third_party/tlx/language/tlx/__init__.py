@@ -11,6 +11,7 @@ from .barrier import (
     fence_mbarrier_init_cluster,
     named_barrier_arrive,
     named_barrier_wait,
+    amd_iglp_opt,
     amd_sched_barrier,
     workgroup_barrier,
 )
@@ -226,6 +227,7 @@ __all__ = [
     "fence_mbarrier_init_cluster",
     "named_barrier_wait",
     "named_barrier_arrive",
+    "amd_iglp_opt",
     "amd_sched_barrier",
     # mma_ops
     "async_dot",
