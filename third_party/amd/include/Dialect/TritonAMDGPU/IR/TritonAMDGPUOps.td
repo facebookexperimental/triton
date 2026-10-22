@@ -1035,17 +1035,28 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     returning to an accumulator dependency chain, while preserving one SSA
     chain per output fragment. LLVM determines the final instruction schedule.
 
-    On the persistent lowering path, `resident_operand` is `none`, `lhs`, or
-    `rhs` and selects an input to constrain to AGPRs; the other input uses
-    VGPRs. `unconstrained` adds no input register-class constraints and leaves
-    input placement to LLVM. The transient intrinsic path does not add those source-class
-    constraints, so a carried source needs a separate `register_resident`
-    boundary when hard residency is required.
     `accumulator_role` is `transient` for a phase-local result or `persistent`
-    for an accumulator carried across phases. `accumulator_register_class` is
-    `auto`, `agpr`, or `vgpr`. Persistent lowering honors this field: `auto`
-    selects AGPRs, while an explicit class supports kernels whose persistent
-    accumulator sets intentionally occupy complementary register classes. The
+    for an accumulator carried across phases. A persistent chain has two
+    guarantees that a transient chain does not: its accumulator keeps one
+    register class across phases, anchored by side-effecting accumulator pins,
+    and its result pins carry the MFMA completion wait when a result reaches
+    an unmodeled consumer (both described below). A transient result relies
+    on LLVM's hazard recognizer for native consumers and on `mfma_commit`
+    otherwise.
+
+    `resident_operand` is a separate operand-placement control, which only
+    the persistent path applies. It does not change either guarantee. `lhs` or
+    `rhs` constrains that input to AGPRs and the other input to VGPRs; `none`
+    constrains both inputs to VGPRs. `unconstrained` adds no input
+    register-class constraints and leaves input placement to LLVM. The
+    transient intrinsic path does not add those source-class constraints, so a
+    carried source needs a separate `register_resident` boundary when hard
+    residency is required.
+
+    `accumulator_register_class` is `auto`, `agpr`, or `vgpr`. Persistent
+    lowering honors this field: `auto` selects AGPRs, while an explicit class
+    supports kernels whose persistent accumulator sets intentionally occupy
+    complementary register classes. The
     transient intrinsic path leaves physical accumulator placement to LLVM.
     CDNA3 retains its VGPR-only accumulator contract and rejects any AGPR
     accumulator request, including persistent `auto`: a persistent accumulator
@@ -1063,8 +1074,8 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     `scheduled_mfma` is visible from the commit.
 
     Both accumulator roles lower arithmetic to native ROCDL MFMA intrinsics.
-    Persistent operand register classes are constrained with inline
-    assembly. Persistent accumulator tuples are pinned after all K updates;
+    Persistent operand register classes, when requested, are constrained with
+    inline assembly. Persistent accumulator tuples are pinned after all K updates;
     nonconstant input accumulators are also pinned before the updates when
     `initialize` is false. These side-effecting accumulator pins constrain
     compiler-side ordering. Kernel chains with only native consumers and no

@@ -163,23 +163,30 @@ def amd_scheduled_mfma(
     chain carried across phases. Both roles use native ROCDL MFMA intrinsics,
     exposing arithmetic latency and hazards to LLVM.
 
-    Persistent chains use inline assembly to constrain operand register
-    classes. ``resident_operand=0`` or ``1`` selects the left or right input
-    for AGPR placement; other inputs use VGPRs. ``pin_operands=False`` omits
-    these input constraints and leaves input placement to LLVM. An input pin
-    consumes its operand, so pinning an operand loaded from shared memory
-    makes LLVM wait for that load at the pin instead of at the MFMA. ``accumulator_register_class``
-    may select ``"agpr"`` or ``"vgpr"``, and persistent ``auto`` selects AGPRs.
-    Persistent accumulator tuples are pinned after all K updates; nonconstant
-    input accumulators are also pinned before the updates when ``initialize``
-    is false. These side-effecting accumulator pins constrain compiler-side
-    ordering. Kernel chains with only native consumers and no calls retain
-    empty pins that provide no hardware wait. If a persistent result reaches
-    opaque inline assembly or an unmodeled escape, including through potentially
-    aliasing memory reloads, without a sufficient explicit commit, affected
-    result pins include a target-specific completion wait. Non-kernel helpers
-    and functions with remaining calls conservatively complete every persistent
-    result at its pin, including unused fragments.
+    A persistent chain has two guarantees that a transient chain does not:
+
+    * Lifetime and storage. The accumulator keeps one register class across
+      phases. ``accumulator_register_class`` may select ``"agpr"`` or
+      ``"vgpr"``, and persistent ``auto`` selects AGPRs. Accumulator tuples are
+      pinned after all K updates; nonconstant input accumulators are also
+      pinned before the updates when ``initialize`` is false. These
+      side-effecting pins constrain compiler-side ordering.
+    * Self-completion. Each result pin records the MFMA result hazard. Kernel
+      chains with only native consumers and no calls retain empty pins that
+      provide no hardware wait. If a persistent result reaches opaque inline
+      assembly or an unmodeled escape, including through potentially aliasing
+      memory reloads, without a sufficient explicit commit, affected result
+      pins include a target-specific completion wait. Non-kernel helpers and
+      functions with remaining calls conservatively complete every persistent
+      result at its pin, including unused fragments.
+
+    Input register classes are a separate operand-placement control, which
+    only the persistent path applies. ``resident_operand=0`` or ``1`` selects
+    the left or right input for AGPR placement; other inputs use VGPRs.
+    ``pin_operands=False`` omits these input constraints and leaves input
+    placement to LLVM; it does not change either guarantee above. An input pin
+    consumes its operand, so pinning an operand loaded from shared memory makes
+    LLVM wait for that load at the pin instead of at the MFMA.
 
     Functions containing persistent MFMAs also prefix nonempty opaque inline
     assembly with the largest required completion delay in that function. This
