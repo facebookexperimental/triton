@@ -7,6 +7,7 @@
 #shared_trans = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #shared_fp8 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem256 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
@@ -303,5 +304,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttg.local_dealloc %B_multibuf : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
     %res_f16 = arith.truncf %res : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
     tt.return %res_f16 : tensor<128x128xf16, #blocked1>
+  }
+  // Test: a 256x256 fp32 accumulator fills all 512 TMEM columns, so a 256x64
+  // operand A (64 more columns) cannot be promoted next to it. A stays in SMEM.
+  // CHECK-LABEL: @dont_promote_lhs_tmem_full
+  // CHECK: %[[A:.+]] = arith.truncf
+  // CHECK: %[[A_SH:.+]] = ttg.local_alloc %[[A]]
+  // CHECK-NOT: ttng.tmem_alloc %{{.+}} : (tensor<256x64xf16
+  // CHECK: ttng.tc_gen5_mma %[[A_SH]],
+  tt.func public @dont_promote_lhs_tmem_full(%A_ptr: tensor<256x64x!tt.ptr<f32>, #blocked2>, %B_sh: !ttg.memdesc<64x256xf16, #shared, #ttg.shared_memory, mutable>) {
+    %true = arith.constant true
+    %cst = arith.constant dense<0.000000e+00> : tensor<256x256xf32, #blocked1>
+    %A = tt.load %A_ptr : tensor<256x64x!tt.ptr<f32>, #blocked2>
+    %A_f16 = arith.truncf %A : tensor<256x64xf32, #blocked2> to tensor<256x64xf16, #blocked2>
+    %A_sh = ttg.local_alloc %A_f16 : (tensor<256x64xf16, #blocked2>) -> !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable>
+    %acc_tm = ttng.tmem_alloc %cst : (tensor<256x256xf32, #blocked1>) -> !ttg.memdesc<256x256xf32, #tmem256, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %true, %true : !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<64x256xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<256x256xf32, #tmem256, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
+  // Control: a 256x128 fp32 accumulator (256 columns) leaves room for A.
+  // CHECK-LABEL: @promote_lhs_tmem_fits
+  // CHECK: %[[A:.+]] = arith.truncf
+  // CHECK: %[[A_TMEM:.+]] = ttng.tmem_alloc %{{.+}} : (tensor<256x64xf16
+  // CHECK: ttng.tc_gen5_mma %[[A_TMEM]],
+  tt.func public @promote_lhs_tmem_fits(%A_ptr: tensor<256x64x!tt.ptr<f32>, #blocked2>, %B_sh: !ttg.memdesc<64x128xf16, #shared, #ttg.shared_memory, mutable>) {
+    %true = arith.constant true
+    %cst = arith.constant dense<0.000000e+00> : tensor<256x128xf32, #blocked1>
+    %A = tt.load %A_ptr : tensor<256x64x!tt.ptr<f32>, #blocked2>
+    %A_f16 = arith.truncf %A : tensor<256x64xf32, #blocked2> to tensor<256x64xf16, #blocked2>
+    %A_sh = ttg.local_alloc %A_f16 : (tensor<256x64xf16, #blocked2>) -> !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable>
+    %acc_tm = ttng.tmem_alloc %cst : (tensor<256x128xf32, #blocked1>) -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %true, %true : !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<64x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
   }
 }
