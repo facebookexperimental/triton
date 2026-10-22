@@ -113,7 +113,7 @@ jobs:
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
       - name: Collect nightly failures (TLX)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
@@ -180,7 +180,7 @@ jobs:
           python -m pytest python/test/unit/runtime/ --import-mode=importlib -v --junitxml=/tmp/runtime-unit.xml
       - name: Collect nightly failures (runtime)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
@@ -196,7 +196,7 @@ jobs:
 
   report-h100-tlx:
     needs: h100-tlx-test
-    if: always() && github.event_name == 'schedule' && needs.h100-tlx-test.outputs.failures != '' && needs.h100-tlx-test.outputs.failures != '[]'
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.h100-tlx-test.outputs.failures != '' && needs.h100-tlx-test.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -225,7 +225,7 @@ jobs:
 
   report-h100-runtime:
     needs: h100-runtime-test
-    if: always() && github.event_name == 'schedule' && needs.h100-runtime-test.outputs.failures != '' && needs.h100-runtime-test.outputs.failures != '[]'
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.h100-runtime-test.outputs.failures != '' && needs.h100-runtime-test.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -254,7 +254,7 @@ jobs:
 
   reconcile-h100-tlx:
     needs: h100-tlx-test
-    if: always() && github.event_name == 'schedule' && (needs.h100-tlx-test.result == 'success' || needs.h100-tlx-test.result == 'failure')
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.h100-tlx-test.result == 'success' || needs.h100-tlx-test.result == 'failure')
     permissions:
       contents: read
       issues: write
@@ -267,7 +267,7 @@ jobs:
 
   reconcile-h100-runtime:
     needs: h100-runtime-test
-    if: always() && github.event_name == 'schedule' && (needs.h100-runtime-test.result == 'success' || needs.h100-runtime-test.result == 'failure')
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.h100-runtime-test.result == 'success' || needs.h100-runtime-test.result == 'failure')
     permissions:
       contents: read
       issues: write

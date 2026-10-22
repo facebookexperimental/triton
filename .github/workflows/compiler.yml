@@ -103,7 +103,7 @@ jobs:
 
       - name: Collect nightly failures (LIT)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
         run: |
           FAILED_FLAG=""
           if [ "${{ steps.lit.outcome }}" = "failure" ]; then
@@ -119,7 +119,7 @@ jobs:
   # ----- Nightly issue filing (schedule only) -----
   report-compiler-lit:
     needs: lit-tests
-    if: always() && github.event_name == 'schedule' && needs.lit-tests.outputs.failures != '' && needs.lit-tests.outputs.failures != '[]'
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.lit-tests.outputs.failures != '' && needs.lit-tests.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -151,7 +151,7 @@ jobs:
   # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
   reconcile-compiler-lit:
     needs: lit-tests
-    if: always() && github.event_name == 'schedule' && (needs.lit-tests.result == 'success' || needs.lit-tests.result == 'failure')
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.lit-tests.result == 'success' || needs.lit-tests.result == 'failure')
     permissions:
       contents: read
       issues: write

@@ -130,7 +130,7 @@ jobs:
           python -m pytest python/test/unit/language/test_tlx_codegen.py --import-mode=importlib -v --junitxml=/tmp/tlx-codegen.xml
       - name: Collect nightly failures (TLX)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
@@ -238,16 +238,20 @@ jobs:
           if-no-files-found: ignore
       - name: Collect nightly failures (TorchTLX)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
         run: |
           . "${SETUP_SCRIPT}"
+          # The perf bench runs on scheduled runs only; on a push it is skipped and writes no XML.
+          PERF="${{ steps.run_torchtlx_perf.outcome }}"
+          JUNIT=(/tmp/torchtlx.xml)
+          [[ "${PERF}" == skipped ]] || JUNIT+=(/tmp/torchtlx_perf.xml)
           FAILED_FLAG=""
           if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" || \
-                "${{ steps.run_torchtlx_perf.outcome }}" != "success" ]]; then
+                ( "${PERF}" != "success" && "${PERF}" != "skipped" ) ]]; then
             FAILED_FLAG="--failed --bucket b200-torchtlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/torchtlx.xml /tmp/torchtlx_perf.xml \
+            --junit "${JUNIT[@]}" \
             --workflow "${GPU_WORKFLOW_NAME}" \
             --job "b200-torchtlx-test" \
             ${FAILED_FLAG}
@@ -304,7 +308,7 @@ jobs:
           python -m pytest python/test/gluon/ --import-mode=importlib -v --junitxml=/tmp/gluon.xml
       - name: Collect nightly failures (Gluon)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
@@ -320,7 +324,7 @@ jobs:
 
   report-b200-tlx:
     needs: b200-tlx-test
-    if: always() && github.event_name == 'schedule' && needs.b200-tlx-test.outputs.failures != '' && needs.b200-tlx-test.outputs.failures != '[]'
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.b200-tlx-test.outputs.failures != '' && needs.b200-tlx-test.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -349,7 +353,7 @@ jobs:
 
   report-b200-torchtlx:
     needs: b200-torchtlx-test
-    if: always() && github.event_name == 'schedule' && needs.b200-torchtlx-test.outputs.failures != '' && needs.b200-torchtlx-test.outputs.failures != '[]'
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.b200-torchtlx-test.outputs.failures != '' && needs.b200-torchtlx-test.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -375,7 +379,7 @@ jobs:
 
   report-b200-gluon:
     needs: b200-gluon-test
-    if: always() && github.event_name == 'schedule' && needs.b200-gluon-test.outputs.failures != '' && needs.b200-gluon-test.outputs.failures != '[]'
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.b200-gluon-test.outputs.failures != '' && needs.b200-gluon-test.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -404,7 +408,7 @@ jobs:
 
   reconcile-b200-tlx:
     needs: b200-tlx-test
-    if: always() && github.event_name == 'schedule' && (needs.b200-tlx-test.result == 'success' || needs.b200-tlx-test.result == 'failure')
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.b200-tlx-test.result == 'success' || needs.b200-tlx-test.result == 'failure')
     permissions:
       contents: read
       issues: write
@@ -417,7 +421,7 @@ jobs:
 
   reconcile-b200-torchtlx:
     needs: b200-torchtlx-test
-    if: always() && github.event_name == 'schedule' && (needs.b200-torchtlx-test.result == 'success' || needs.b200-torchtlx-test.result == 'failure')
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.b200-torchtlx-test.result == 'success' || needs.b200-torchtlx-test.result == 'failure')
     permissions:
       contents: read
       issues: write
@@ -430,7 +434,7 @@ jobs:
 
   reconcile-b200-gluon:
     needs: b200-gluon-test
-    if: always() && github.event_name == 'schedule' && (needs.b200-gluon-test.result == 'success' || needs.b200-gluon-test.result == 'failure')
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.b200-gluon-test.result == 'success' || needs.b200-gluon-test.result == 'failure')
     permissions:
       contents: read
       issues: write
