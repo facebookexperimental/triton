@@ -47,7 +47,9 @@
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Tools/Sys/Dump.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "triton/Tools/TimeTrace.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TimeProfiler.h"
 #include <memory>
 
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
@@ -2346,6 +2348,9 @@ void init_triton_ir(py::module_ &m) {
             bool haveTiming = ::triton::tools::getBoolEnv("MLIR_ENABLE_TIMING");
             if (haveTiming) {
               self.enableTiming();
+            }
+            if (llvm::timeTraceProfilerEnabled()) {
+              mlir::triton::tools::addTimeTraceInstrumentation(self);
             }
 
             TritonSourceMgrDiagnosticHandler diagHandler =
