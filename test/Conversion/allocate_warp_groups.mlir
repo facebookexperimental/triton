@@ -96,6 +96,44 @@ tt.func @setmaxnreg() {
 
 // -----
 
+module attributes {"ttg.num-warps" = 4 : i32, ttg.maxnreg = 128 : i32} {
+
+// CHECK-LABEL: tt.func @fixed_default_registers
+tt.func @fixed_default_registers() {
+  // CHECK: actualRegisters = array<i32: 80, 24>
+  ttg.warp_specialize() attributes {defaultRequestedRegisters = 80 : i32, requestedRegisters = array<i32: 24>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.maxnreg = 128 : i32} {
+
+// CHECK-LABEL: tt.func @fixed_default_shared_worker_registers
+tt.func @fixed_default_shared_worker_registers() {
+  // CHECK: actualRegisters = array<i32: 80, 176>
+  ttg.warp_specialize() attributes {defaultRequestedRegisters = 80 : i32}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}
+
+// -----
+
 // CHECK: module attributes {ttg.maxnreg = 40 : i32
 module attributes {"ttg.num-warps" = 4 : i32, ttg.maxnreg = 40 : i32} {
 
