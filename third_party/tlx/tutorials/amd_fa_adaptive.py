@@ -1026,6 +1026,8 @@ def _warp_pipeline_phase(
             v_layout,
         )
 
+    tlx.async_load_wait_group(1)
+
     # PV is the longest phase. Favor its warps so the companion pipeline group
     # reaches the phase barriers with less skew.
     with tlx.warp_pipeline_stage("pv", priority=1):
