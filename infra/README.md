@@ -1,7 +1,8 @@
-# TritonBench Infra Configuration on Google Cloud Platform
+# FBTriton CI Infra Setup Guide
 
-It defines the specification of infrastruture used by TorchBench CI.
-The Infra is a Kubernetes cluster built on top of Google Cloud Platform.
+It defines the specification of infrastruture used by FBTriton CI.
+
+The H100 Runner Infra is built on a Kubernetes cluster running on Google Cloud Platform.
 
 ## Step 1: Create the cluster and install the ARC Controller
 
@@ -10,7 +11,7 @@ The Infra is a Kubernetes cluster built on top of Google Cloud Platform.
 docker login ghcr.io
 
 # Get credentials for the cluster so that kubectl could use it
-gcloud container clusters get-credentials --location us-east4-a meta-triton-h100-runner-cluster
+gcloud container clusters get-credentials --location us-central1 meta-triton-runner-h100-cluster
 
 # Install the ARC controller
 INSTALLATION_NAME="linux-gcp-h100"
@@ -100,3 +101,16 @@ kubectl get pods -n arc-runners
 # inspect the logs
 kubectl logs -n arc-runners linux-gcp-h100-...
 ```
+
+## B200 Runner Infra
+
+The B200 Runner Infra is set up on NVIDIA DGX Box with 8xB200 GPUs.
+
+We setup a K8s cluster using k3s, and installs the NVIDIA device plugin on it:
+
+
+```
+sudo k3s kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.0/deployments/static/nvidia-device-plugin.yml
+```
+
+Then, we start the k3s service which will be able to run all the helm and kubectl commands on the local shell.
