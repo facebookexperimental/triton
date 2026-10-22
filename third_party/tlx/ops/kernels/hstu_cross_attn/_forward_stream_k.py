@@ -33,17 +33,10 @@ from ..flash_attn.gfx950 import (
 BLOCK_M = 256
 BLOCK_N = 64
 HEAD_DIM = 128
-# Static segment copies per program; ranges spanning more q tiles finish in a non-pipelined loop. Launches whose
-# programs may cover more than MAX_SEGMENTS - 1 q tiles take MANY_TILES_SEGMENTS copies.
+# Static segment copies per program; ranges spanning more q tiles finish in a non-pipelined loop.
 MAX_SEGMENTS = 5
-MANY_TILES_SEGMENTS = 10
 # Sequence tables are register vectors of next_power_of_2(Z) entries.
-MAX_Z = 1024
-# Up to this many sequences the q tiles are too few to fill the GPU and the even partition wins at any q length.
-# Past it the tiled kernel's smaller tiles win unless 256-row tiles are mostly full: at least MIN_MEAN_Q_ROWS q
-# rows per sequence (on MI350X, 2-512 uniform rows per sequence, mean 160, is 5-20% slower here).
-FEW_SEQS = 64
-MIN_MEAN_Q_ROWS = 192
+MAX_Z = 64
 # Fewest unmasked KV blocks that take the pipelined loop.
 PIPE_STAGES = 4
 # Fixed cost of a q tile, in KV blocks, when the cost space charges one (see `_phantom`).
@@ -641,26 +634,20 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
              stride_om: tl.constexpr, stride_oh: tl.constexpr, stride_mm: tl.constexpr, G: tl.constexpr,
              QK_SCALE: tl.constexpr, IS_SOFTMAX: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr,
              BLOCK_N: tl.constexpr, Z_PAD: tl.constexpr, LOG2_Z_PAD: tl.constexpr, PIPELINE: tl.constexpr,
-             PIPE_STAGES: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr, z, SEARCH: tl.constexpr):
-    """Process units [u, min(u1, end of u's q tile)) of one q tile, in sequence z unless SEARCH; return the next
-    unit and its sequence."""
+             PIPE_STAGES: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
+    """Process units [u, min(u1, end of u's q tile)) of one q tile; return the next unit."""
     offs_n = _lanes(BLOCK_N)
     offs_d = _lanes(HEAD_DIM)
     local_m = _lanes(BLOCK_M)
-    # Largest z with starts[z] <= u (padding rows start at W, past every unit, and the entry after them is W).
-    if SEARCH:
-        lo = 0
-        hi = Z - 1
-        for _ in tl.static_range(LOG2_Z_PAD):
-            mid = (lo + hi + 1) // 2
-            take = tl.load(tab + mid) <= u
-            lo = tl.where(take, mid, lo)
-            hi = tl.where(take, hi, mid - 1)
-        z = lo
-    else:
-        # A program's next segment is in the same sequence or a later one: a short scan replaces the search.
-        while tl.load(tab + z + 1) <= u:
-            z += 1
+    # Largest z with starts[z] <= u (padding rows start at W, past every unit).
+    lo = 0
+    hi = Z - 1
+    for _ in tl.static_range(LOG2_Z_PAD):
+        mid = (lo + hi + 1) // 2
+        take = tl.load(tab + mid) <= u
+        lo = tl.where(take, mid, lo)
+        hi = tl.where(take, hi, mid - 1)
+    z = lo
     rel = u - tl.load(tab + z)
     lq_z = tl.load(seq_offsets_q + z + 1).to(tl.int32) - tl.load(seq_offsets_q + z).to(tl.int32)
     lk_z = tl.load(seq_offsets + z + 1).to(tl.int32) - tl.load(seq_offsets + z).to(tl.int32)
@@ -777,7 +764,7 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
     local_m = _wait_stores(local_m)
     tl.debug_barrier()
     tl.atomic_xchg(Flags + p, 1, sem="release", scope="gpu", mask=mid)
-    return u + (b1 - b0), z
+    return u + (b1 - b0)
 
 
 @triton.jit
@@ -857,19 +844,18 @@ def _hstu_cross_attn_fwd_stream_k(
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(K), 2, layout=k_layout)
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(V), 2, layout=v_layout)
     # Statically unrolled: in a runtime loop LLVM hoists the per-segment address math out of it and spills.
-    z = 0
-    for i in tl.static_range(MAX_SEGMENTS):
+    for _ in tl.static_range(MAX_SEGMENTS):
         if u < u1:
-            u, z = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W,
-                            ph, P, p, u, u1, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn,
-                            stride_vh, stride_om, stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M,
-                            BLOCK_N, Z_PAD, LOG2_Z_PAD, True, PIPE_STAGES, RESCALE_THRESHOLD, z, i == 0)
+            u = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph,
+                         P, p, u, u1, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh,
+                         stride_om, stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD,
+                         LOG2_Z_PAD, True, PIPE_STAGES, RESCALE_THRESHOLD)
     # Rare: ranges spanning more than MAX_SEGMENTS q tiles (short KV sequences).
     while u < u1:
-        u, z = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph, P,
-                        p, u, u1, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh,
-                        stride_om, stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD,
-                        LOG2_Z_PAD, False, PIPE_STAGES, RESCALE_THRESHOLD, z, False)
+        u = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph, P, p,
+                     u, u1, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh, stride_om,
+                     stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD, LOG2_Z_PAD,
+                     False, PIPE_STAGES, RESCALE_THRESHOLD)
 
 
 _FLAGS = {}
@@ -892,9 +878,7 @@ def _flags(device: torch.device, num_programs: int) -> torch.Tensor:
 def stream_k_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, Z: int, num_softmax_heads: int,
                        shared_kv: bool, causal: bool, truncate_method: str, num_cus: int) -> bool:
     H = q.shape[1]
-    # Shared K/V is read as both operands.
-    return (not causal and truncate_method == "none" and 0 < Z <= MAX_Z
-            and (Z <= FEW_SEQS or q.shape[0] >= MIN_MEAN_Q_ROWS * Z) and num_cus % 8 == 0
+    return (not causal and truncate_method == "none" and not shared_kv and 0 < Z <= MAX_Z and num_cus % 8 == 0
             and q.dtype in (torch.float16, torch.bfloat16) and q.shape[2] == HEAD_DIM and v.shape[2] == HEAD_DIM
             and num_softmax_heads in (0, H) and q.stride(2) == 1 and k.stride(2) == 1 and v.stride(2) == 1)
 
@@ -913,10 +897,6 @@ def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets:
         return
     P = num_cus
     z_pad = 1 << (max(Z, 2) - 1).bit_length()
-    log2_z_pad = max(1, (z_pad - 1).bit_length())
-    # Each sequence adds at most one partial q tile.
-    tiles_per_program = -(-H * (-(-q.shape[0] // BLOCK_M) + Z) // P)
-    segments = MAX_SEGMENTS if tiles_per_program <= MAX_SEGMENTS - 1 else MANY_TILES_SEGMENTS
     part = torch.empty((P, BLOCK_M, D), device=q.device, dtype=torch.float32)
     part_lse = torch.empty((P, BLOCK_M), device=q.device, dtype=torch.float32)
     tab = torch.empty((P, 2 * z_pad + 4), device=q.device, dtype=torch.int32)
@@ -927,6 +907,7 @@ def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets:
         stride_vn=v.stride(0), stride_vh=v.stride(1), stride_om=out.stride(0), stride_oh=out.stride(1),
         stride_mm=M.stride(0) if is_softmax else 0, H=H, G=G,
         QK_SCALE=alpha * 1.4426950408889634 if is_softmax else alpha, IS_SOFTMAX=is_softmax, HEAD_DIM=D,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, Z_PAD=z_pad, LOG2_Z_PAD=log2_z_pad, MAX_SEGMENTS=segments,
-        PHANTOM_BLOCKS=PHANTOM_BLOCKS, PIPE_STAGES=PIPE_STAGES, RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value,
-        num_warps=8, waves_per_eu=2, llvm_fn_attrs=_VGPR_ONLY, enable_sched_group_barrier_scheduler=False)
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, Z_PAD=z_pad, LOG2_Z_PAD=max(1, (z_pad - 1).bit_length()),
+        MAX_SEGMENTS=MAX_SEGMENTS, PHANTOM_BLOCKS=PHANTOM_BLOCKS, PIPE_STAGES=PIPE_STAGES,
+        RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2, llvm_fn_attrs=_VGPR_ONLY,
+        enable_sched_group_barrier_scheduler=False)
