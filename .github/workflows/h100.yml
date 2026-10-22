@@ -17,7 +17,8 @@ on:
         type: string
 
 env:
-  GPU_WORKFLOW_NAME: Meta Triton H100 Tests
+  # Issue-title scope. Off main it names the branch, so branches never share issues.
+  GPU_WORKFLOW_NAME: Meta Triton H100 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
   MAX_JOBS: 16
   TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
@@ -209,7 +210,7 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: Meta Triton H100 Tests
+      workflow_name: Meta Triton H100 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
@@ -238,7 +239,7 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: Meta Triton H100 Tests
+      workflow_name: Meta Triton H100 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
@@ -259,7 +260,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: Meta Triton H100 Tests
+      workflow_name: Meta Triton H100 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
       job_name: h100-tlx-test
       failures: ${{ needs.h100-tlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -272,7 +273,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: Meta Triton H100 Tests
+      workflow_name: Meta Triton H100 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
       job_name: h100-runtime-test
       failures: ${{ needs.h100-runtime-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
