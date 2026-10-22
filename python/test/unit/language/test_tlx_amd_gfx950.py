@@ -2,6 +2,7 @@
 import gc
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -717,6 +718,46 @@ def _amd_scheduled_mfma_lds_loop_kernel(a_ptr, b_ptr, output_ptr, iterations):
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
     output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
     tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_lds_operand_wait_kernel(a_ptr, b_ptr, output_ptr, RESIDENT: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 64 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a_local = tlx.local_alloc((16, 64), tl.bfloat16, 1)
+    b_local = tlx.local_alloc((64, 64), tl.bfloat16, 1)
+    tlx.local_store(tlx.local_view(a_local, 0), a)
+    tlx.local_store(tlx.local_view(b_local, 0), b)
+    tl.debug_barrier()
+    # Chain X reads register-resident operands; it is independent work that
+    # can hide chain Y's LDS loads.
+    xa = tlx.local_load(tlx.local_slice(tlx.local_view(a_local, 0), [0, 0], [16, 32]), layout=dot0, relaxed=True)
+    xb = tlx.local_load(tlx.local_slice(tlx.local_view(b_local, 0), [0, 0], [32, 64]), layout=dot1, relaxed=True)
+    xa = tlx.amd_register_resident(xa, register_class="vgpr", registers_per_group=4)
+    xb = tlx.amd_register_resident(xb, register_class="vgpr", registers_per_group=4)
+    tl.debug_barrier()
+    ya = tlx.local_load(tlx.local_slice(tlx.local_view(a_local, 0), [0, 32], [16, 32]), layout=dot0, relaxed=True)
+    yb = tlx.local_load(tlx.local_slice(tlx.local_view(b_local, 0), [32, 0], [32, 64]), layout=dot1, relaxed=True)
+    acc_x = tlx.zeros((16, 64), tl.float32, layout=mma)
+    for _ in tl.static_range(4):
+        acc_x = tlx.amd_scheduled_mfma(xa, xb, acc_x, accumulator_role="transient")
+    acc_y = tlx.zeros((16, 64), tl.float32, layout=mma)
+    acc_y = tlx.amd_scheduled_mfma(ya, yb, acc_y, accumulator_role="persistent", resident_operand=RESIDENT)
+    acc_x, acc_y = tlx.amd_mfma_commit((acc_x, acc_y))
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, acc_x + acc_y)
 
 
 @triton.jit
@@ -2039,6 +2080,70 @@ def test_amd_scheduled_mfma_inferred_lds_loop_correct_gfx950():
         matrix_instr_nonkdim=16,
     )
     torch.testing.assert_close(actual, 3.0 * (a.float() @ b.float()), atol=6e-4, rtol=6e-4)
+
+
+def _vgprs(operand):
+    """Return the VGPR numbers named by one ISA operand such as v8 or v[8:11]."""
+    match = re.fullmatch(r"v(\d+)|v\[(\d+):(\d+)\]", operand)
+    if match is None:
+        return set()
+    if match.group(1) is not None:
+        return {int(match.group(1))}
+    return set(range(int(match.group(2)), int(match.group(3)) + 1))
+
+
+def _early_lds_waits(amdgcn):
+    """Count LDS waits issued before an MFMA that reads no LDS-loaded register.
+
+    Only the region after the last barrier before the final MFMA is examined.
+    """
+    lines = [line.strip() for line in amdgcn.splitlines()]
+    lines = [line for line in lines if line and not line.startswith((";", "."))]
+    last_mfma = max(i for i, line in enumerate(lines) if line.startswith("v_mfma"))
+    start = max(i for i, line in enumerate(lines[:last_mfma]) if line.startswith("s_barrier")) + 1
+    loaded = set()
+    early = 0
+    pending_wait = False
+    for line in lines[start:last_mfma + 1]:
+        opcode, _, rest = line.partition(" ")
+        operands = [operand.strip() for operand in rest.split(",")]
+        if opcode.startswith("ds_read"):
+            loaded |= _vgprs(operands[0])
+        elif opcode == "s_waitcnt" and "lgkmcnt" in rest:
+            pending_wait = True
+        elif opcode.startswith("v_mfma") and pending_wait:
+            sources = _vgprs(operands[1]) | _vgprs(operands[2])
+            early += not (sources & loaded)
+            pending_wait = False
+    return early
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_unconstrained_lds_operand_wait_gfx950():
+    """An unconstrained persistent MFMA waits for its LDS operands at the MFMA.
+
+    Pinned inputs are consumed by their pins, so LLVM waits for the loads
+    before independent MFMAs. The pinned case is a control for the detector.
+    """
+    torch.manual_seed(0)
+    a = torch.randn((16, 64), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
+    expected = 4.0 * (a[:, :32].float() @ b[:32].float()) + a[:, 32:].float() @ b[32:].float()
+    early_waits = {}
+    for resident in (None, "unconstrained"):
+        actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+        compiled = _amd_scheduled_mfma_lds_operand_wait_kernel[(1, )](
+            a,
+            b,
+            actual,
+            RESIDENT=resident,
+            num_warps=4,
+            matrix_instr_nonkdim=16,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+        early_waits[resident] = _early_lds_waits(compiled.asm["amdgcn"])
+    assert early_waits[None] > 0
+    assert early_waits["unconstrained"] == 0
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
