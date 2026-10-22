@@ -812,6 +812,10 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, int32_t mask) {
              self.create<ROCDL::SchedBarrier>(mask);
            })
+      .def("create_amd_iglp_opt",
+           [](TritonOpBuilder &self, uint32_t variant) {
+             self.create<ROCDL::IglpOpt>(variant);
+           })
       .def("create_warp_vote",
            [](TritonOpBuilder &self, Value pred,
               const std::string &kind) -> mlir::Value {
