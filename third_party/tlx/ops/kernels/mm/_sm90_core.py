@@ -79,12 +79,13 @@ def _run_producer(M, N, K, a_desc, b_desc, a, b, bars_empty_a, bars_full_a, bars
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + ((mn_tile_id % num_pid_in_group) % group_size_m)
         pid_n = (mn_tile_id % num_pid_in_group) // group_size_m
-        offset_am = pid_m * BM
-        offset_bn = pid_n * BN
+        # TMA coordinates must be int32; a dynamic M/N/K makes these int64.
+        offset_am = (pid_m * BM).to(tl.int32)
+        offset_bn = (pid_n * BN).to(tl.int32)
         k_lo, k_hi = _k_tile_range(K, tile_id // num_mn_tiles, BK, SPLIT_K)
 
         for k in range(k_lo, k_hi):
-            offset_k = k * BK
+            offset_k = (k * BK).to(tl.int32)
 
             empty_a_0 = tlx.local_view(bars_empty_a, buf)
             full_a_0 = tlx.local_view(bars_full_a, buf)
