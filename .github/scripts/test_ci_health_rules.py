@@ -449,7 +449,7 @@ def test_failed_select_is_an_anomaly():
 def test_page_data_has_one_section_per_tab():
     data = r.page_data([push(1, tlx())], stamp(23), {})
     assert set(data) == {"asof", "branches"}
-    assert all(set(v) == {"main", "nightly", "pr", "ops", "bump"} for v in data["branches"].values())
+    assert all(set(v) == {"main", "lit", "nightly", "pr", "ops", "bump"} for v in data["branches"].values())
 
 
 def test_every_test_step_in_the_gpu_workflows_maps_to_a_group():
@@ -498,3 +498,81 @@ def test_bump_status_compares_the_pin_with_the_newest_release():
     assert r.bump_view({**line, "newest": {"tag": "llvm-aaaaaaaa-1"}})["status"] == "current"
     assert r.bump_view(None)["status"] == "unknown"
     assert r.page_data([], stamp(23), {}, {"lines": {"main": line}})["branches"]["main"]["bump"]["status"] == "new"
+
+
+def lit(h, *failing, build=False, conclusion=None, branch="main"):
+    """A compiler.yml push run: lit fails with the given test paths, or the build breaks before lit runs."""
+    s = step("Build and run LIT tests", "failure" if failing or build else "success",
+             list(failing) if failing else None)
+    return run(h, [job("LIT Tests", s, conclusion=conclusion, label="ubuntu-latest")], wf="compiler.yml", branch=branch)
+
+
+def test_lit_failure_is_new_then_known_with_its_first_push():
+    v = r.lit_view([lit(1), lit(2, "a.mlir"), lit(3, "a.mlir", "b.mlir")], stamp(23))
+    assert v["verdict"] == "new"
+    assert [(f["id"], f["first_sha"][:2], f["prev_sha"][:2]) for f in v["new"]] == [("b.mlir", "03", "02")]
+    assert [(f["id"], f["first_sha"][:2], f["streak"], f["prev_sha"][:2])
+            for f in v["known"]] == [("a.mlir", "02", 2, "01")]
+    assert v["known"][0]["first_title"] == "commit 2 (#4002)"
+    assert [p["cell"] for p in v["pushes"]] == ["pass", "new", "new"]
+
+
+def test_lit_build_failure_has_no_result_and_shows_a_banner():
+    v = r.lit_view([lit(1, "a.mlir"), lit(2, build=True), lit(3, "a.mlir"), lit(4, build=True)], stamp(23))
+    assert [f["streak"] for f in v["known"]] == [2]
+    assert v["sha"][:2] == "03" and v["build"]["sha"][:2] == "04"
+    assert [p["cell"] for p in v["pushes"]] == ["new", "build", "known", "build"]
+
+
+def test_lit_fixed_test_drops_off_and_cancelled_push_is_skipped():
+    v = r.lit_view([lit(1, "a.mlir"), lit(2, conclusion="cancelled"), lit(3)], stamp(23))
+    assert v["verdict"] == "passing" and not v["new"] and not v["known"]
+    assert [p["cell"] for p in v["pushes"]] == ["new", "na", "pass"]
+
+
+def test_lit_view_is_none_for_a_branch_without_lit_pushes():
+    assert r.lit_view([push(1, tlx())], stamp(23)) is None
+    assert r.lit_view([lit(1, branch="release/3.8.x")], stamp(23), "main") is None
+
+
+def test_grid_marks_gpus_skipped_by_selection_and_runs_in_progress():
+    skipped = push(2)
+    skipped["select"] = {"h100": False, "b200": False, "mi350": False, "build": False}
+    v = main([push(1, tlx()), skipped, run(3, [], status="in_progress", conclusion=None)])
+    assert [p["cells"]["B200"] for p in v["pushes"]] == ["pass", "skip", "running"]
+    assert [p["cells"]["H100"] for p in v["pushes"]] == ["na", "skip", "running"]
+
+
+def test_lit_run_in_progress_shows_as_running():
+    v = r.lit_view([lit(1), run(2, [], wf="compiler.yml", status="in_progress", conclusion=None)], stamp(23))
+    assert [p["cell"] for p in v["pushes"]] == ["pass", "running"] and v["verdict"] == "passing"
+
+
+def test_cancelled_gpu_job_without_a_test_result_is_not_a_pass():
+    cancelled = job("b200 / b200-tlx-test", step(CORE, "cancelled"), conclusion="cancelled")
+    v = main([push(1, cancelled, conclusion="cancelled")])
+    assert v["pushes"][0]["cells"]["B200"] == "na"
+
+
+def test_lit_failure_with_an_unreadable_log_is_not_a_build_failure():
+    unread = lit(2, build=True)
+    unread["jobs"][0]["log_missing"] = True
+    v = r.lit_view([lit(1), unread], stamp(23))
+    assert [p["cell"] for p in v["pushes"]] == ["pass", "unknown"] and v["build"] is None
+    assert v["unknown"]["sha"][:2] == "02"
+
+
+def test_lit_view_shows_a_run_in_progress_before_any_finished():
+    v = r.lit_view([run(1, [], wf="compiler.yml", status="in_progress", conclusion=None)], stamp(23))
+    assert v["verdict"] == "none" and [p["cell"] for p in v["pushes"]] == ["running"]
+
+
+def test_known_cells_name_the_push_their_failures_started_at():
+    v = main([push(1, tlx()), push(2, tlx("a")), push(3, tlx("a"))])
+    assert [p["since"] for p in v["pushes"][:2]] == [{}, {}]
+    assert [s["sha"][:2] for s in v["pushes"][2]["since"]["B200"]] == ["02"]
+    core = next(r for r in v["steps"]["B200"] if r["group"] == "TLX core")
+    assert [s["sha"][:2] for s in core["since"][2]] == ["02"]
+    lv = r.lit_view([lit(1), lit(2, "a.mlir"), lit(3, "a.mlir")], stamp(23))
+    assert [p["since"] for p in lv["pushes"][:2]] == [[], []]
+    assert [s["sha"][:2] for s in lv["pushes"][2]["since"]] == ["02"]

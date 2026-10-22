@@ -3,9 +3,10 @@
 
   collect DATA_DIR [--since ISO]
       Fetch runs of gpu-tests.yml, gpu-tests-nightly.yml,
-      nightly-tlx-ops-bench.yml and nightly-fbtriton.yml created since the
-      saved cursor (or --since), plus the jobs and steps of every completed
-      run and the failing tests in the log of every failed GPU job, into
+      nightly-tlx-ops-bench.yml and nightly-fbtriton.yml, and push runs of
+      compiler.yml (LIT), created since the saved cursor (or --since), plus
+      the jobs and steps of every completed run and the failing tests in the
+      log of every failed GPU or LIT job, into
       DATA_DIR/runs-YYYY-MM.jsonl.gz and DATA_DIR/state.json, and each
       tracked branch's Meta LLVM pin into DATA_DIR/bump.json. ci-health.yml
       keeps DATA_DIR on the 'ci-health' release; DATA_DIR/changed.txt lists
@@ -64,7 +65,8 @@ BACKFILL_DAYS = 30
 STUCK_DAYS = 7
 #: Workflows collected. Since #3875, gpu-tests.yml calls mi350/b200/h100.yml as reusable workflows;
 #: gpu-tests-nightly.yml runs the slow suites (TritonBench) once a day.
-COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml")
+#: compiler.yml runs LIT on every PR too; only its push runs are collected.
+COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml", rules.LIT_WF)
 FORK = "facebookexperimental/llvm-project"
 #: Fork branch each tracked branch's cmake/meta-llvm-info.json follows, as in meta-llvm-update.yml.
 FORK_BRANCHES = {"main": "triton_beta", "release/3.8.x": "triton_3.8.x"}
@@ -182,6 +184,17 @@ def _attach_failures(jobs, text, wf="gpu-tests.yml"):
         try:
             logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"), wf != rules.BENCH_WF)
         except subprocess.CalledProcessError as exc:  # logs expired or not readable: no test result
+            print(f"no log for job {j['id']} ({j['name']}): {exc.stderr.strip() if exc.stderr else exc}")
+
+
+def _attach_lit_failures(jobs, text):
+    for j in jobs:
+        if j["name"] != rules.LIT_JOB or j["conclusion"] != "failure":
+            continue
+        try:
+            logs.attach_lit_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"))
+        except subprocess.CalledProcessError as exc:  # logs expired or not readable: no test result
+            j["log_missing"] = True  # so the failure is not mistaken for a build failure
             print(f"no log for job {j['id']} ({j['name']}): {exc.stderr.strip() if exc.stderr else exc}")
 
 
@@ -307,7 +320,8 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
     runs = load_runs(data_dir)
     raw = {}
     for wf in COLLECT:
-        for page in api(f"repos/{REPO}/actions/workflows/{wf}/runs?created=>={since}&per_page=100"):
+        event = "&event=push" if wf == rules.LIT_WF else ""
+        for page in api(f"repos/{REPO}/actions/workflows/{wf}/runs?created=>={since}{event}&per_page=100"):
             for run in page["workflow_runs"]:
                 old = runs.get(run["id"])
                 if old and old["status"] == "completed" and old["jobs"] is not None:
@@ -324,6 +338,8 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
         jobs = _jobs(api(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter=latest"))
         if r["wf"] in rules.GPU_RUN_WORKFLOWS:
             _attach_failures(jobs, text, r["wf"])
+        if r["wf"] == rules.LIT_WF:
+            _attach_lit_failures(jobs, text)
         if r["wf"] == "gpu-tests.yml":
             r["select"] = _selection(jobs, text)
             if r["id"] in raw:

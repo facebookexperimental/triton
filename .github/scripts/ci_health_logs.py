@@ -54,6 +54,35 @@ def attach_failures(job, log_text, normalize_ids=True):
         s["failures"] = [{"id": i, "msg": m} for i, m in seen.items()] or [{"id": f"{key}/{s['name']}", "msg": ""}]
 
 
+#: lit's per-test result line, "<timestamp> FAIL: TRITON :: <path> (n of m)", for each test that did not pass.
+LIT_RESULT = re.compile(r"^\S+Z (FAIL|XPASS|TIMEOUT|UNRESOLVED): \S+ :: (\S+)")
+
+#: The first diagnostic in a failing test's output block, e.g. "<file>:32:50: error: undefined variable: MMA".
+LIT_ERROR = re.compile(r": error: (.*)$")
+
+
+def attach_lit_failures(job, log_text):
+    """Set step["failures"] = [{id: test path, msg}] on the job's failed step when lit reported failing tests; msg
+    is the first error in the test's output, else its lit result. A step that failed without any (the build broke
+    before lit ran) gets none."""
+    seen, cur = {}, None
+    for line in log_text.splitlines():
+        line = ANSI.sub("", line).rstrip()
+        m = LIT_RESULT.match(line)
+        if m:
+            cur = m.group(2) if m.group(2) not in seen else None
+            seen.setdefault(m.group(2), m.group(1))
+            continue
+        if line.endswith("Z ********************"):  # the end of the test's output block
+            cur = None
+        e = LIT_ERROR.search(line)
+        if cur and e and seen[cur] in ("FAIL", "XPASS", "TIMEOUT", "UNRESOLVED"):
+            seen[cur], cur = e.group(1), None
+    for s in job["steps"]:
+        if s["conclusion"] == "failure" and seen:
+            s["failures"] = [{"id": i, "msg": r} for i, r in seen.items()]
+
+
 SELECTION = re.compile(r"GPU selection for \S+: (\{.*\})")
 
 
