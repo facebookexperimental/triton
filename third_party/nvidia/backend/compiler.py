@@ -1393,7 +1393,7 @@ class CUDABackend(BaseBackend):
             # Same LLVM flags as make_ptx: compilations sharing a process only
             # run in parallel while their flag sets are identical.
             flags=flags, disable_slp_vectorizer=capability == 80, expand_masked_div_rem=True,
-            scalarize_packed_fops=True)
+            vectorize_extracted_adds=True, scalarize_packed_fops=True)
 
         # Get some metadata
         # warp-specialization mutates num_warps
