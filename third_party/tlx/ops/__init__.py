@@ -32,8 +32,12 @@ def _mm_impl_for_device(device):
     return impl_for("mm", device=device)
 
 
-def mm(a, b, *, out=None, arch=None, space="full"):
-    """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major."""
+def mm(a, b, *, out=None, arch=None, space=None):
+    """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
+
+    `space=None` uses the implementation's default: a single analytically
+    chosen config so the first call stays interactive.
+    """
     if a.ndim != 2 or b.ndim != 2:
         raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
                            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
@@ -53,6 +57,8 @@ def mm(a, b, *, out=None, arch=None, space="full"):
     b_src = b if b.is_contiguous() else b.T
     check_inputs(spec, dtype=a.dtype, row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]),
                  elem_bytes=a.element_size())
+    if space is None:
+        space = spec.default_space
     if out is None:
         return fn(a, b, space=space)
     return fn(a, b, out=out, space=space)

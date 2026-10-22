@@ -27,6 +27,7 @@ class OpSpec:
     dtypes: frozenset = frozenset()  # bare torch names, so the table needs no torch
     accepts: Optional[Callable[[Mapping[str, Any]], bool]] = None
     requires: frozenset = frozenset()
+    default_space: str = "heuristic"  # used when the caller passes space=None
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"

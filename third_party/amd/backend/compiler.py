@@ -685,6 +685,12 @@ class HIPBackend(BaseBackend):
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', get_llvm_flags(options.arch),
                              options.enable_fp_fusion, disable_vector_combine=options.disable_vector_combine or options.arch != "gfx950")
 
+        # This LLVM's AMDGPU backend can only select raw buffer accesses up to
+        # 128 bits wide, but O3 (VectorCombine) can merge adjacent narrow
+        # accesses into wider ones (e.g. 2x v4f32 stores into v8f32) which then
+        # fail selection. Split those back down; a no-op when none are wide.
+        amd.add_split_wide_buffer_accesses_llvm_pass(kernel_fn)
+
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
         # optimize_module from calls to @llvm.amdgcn.workgroup.id.x/y/z(). We cannot rely on this because a
