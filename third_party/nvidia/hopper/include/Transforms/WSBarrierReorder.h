@@ -286,6 +286,60 @@ buildBarrierToMemoryOpMap(Block &block) {
   return map;
 }
 
+// Whether two WS barrier endpoints in one partition may belong to the same
+// channel. Endpoints with disjoint channel graphs, or with different peer
+// partitions (dstTask), cannot, unless one of them uses a barrier array that
+// endpoints with different peers share (a reuse group with more members than
+// slots), where the peer no longer identifies the slot.
+inline bool mayShareWSChannel(WaitBarrierOp wait, ArriveBarrierOp arrive,
+                              const DenseSet<Value> &mixedBarrierRoots) {
+  if (canAdvanceWSBarrier(wait.getConstraints(), arrive.getConstraints()))
+    return false;
+  auto wsA = getWSBarrierConstraints(wait.getConstraints());
+  auto wsB = getWSBarrierConstraints(arrive.getConstraints());
+  if (!wsA || !wsB)
+    return true;
+  Value waitRoot = mlir::getMemDescRoot(wait.getAlloc());
+  Value arriveRoot = mlir::getMemDescRoot(arrive.getAlloc());
+  if (waitRoot == arriveRoot || mixedBarrierRoots.contains(waitRoot) ||
+      mixedBarrierRoots.contains(arriveRoot))
+    return true;
+  auto dstA = wsA.getAs<IntegerAttr>("dstTask");
+  auto dstB = wsB.getAs<IntegerAttr>("dstTask");
+  return !dstA || !dstB || dstA.getInt() == dstB.getInt();
+}
+
+// Check whether `wait` can be lowered below `crossedOp`. Lowering a wait
+// moves `crossedOp` ahead of it, so an arrive may only be crossed when it
+// cannot belong to the same channel: the release of the slot this wait
+// acquires would otherwise signal before the acquire.
+inline bool canLowerWSWaitPast(WaitBarrierOp wait, Operation *crossedOp,
+                               const DenseSet<Value> &mixedBarrierRoots) {
+  if (crossedOp->getNumRegions() != 0)
+    return false;
+  if (auto otherWait = dyn_cast<WaitBarrierOp>(crossedOp))
+    return hasWSBarrierConstraints(otherWait.getConstraints());
+  if (auto arrive = dyn_cast<ArriveBarrierOp>(crossedOp))
+    return !mayShareWSChannel(wait, arrive, mixedBarrierRoots);
+  if (isBarrierLikeOp(crossedOp))
+    return false;
+  return !hasArriveLikeSemantics(crossedOp);
+}
+
+// Check whether `arrive` can be raised above `crossedOp`. Raising an arrive
+// signals before `crossedOp`, so a wait may only be crossed when it cannot
+// belong to the same channel.
+inline bool canRaiseWSArrivePast(ArriveBarrierOp arrive, Operation *crossedOp,
+                                 const DenseSet<Value> &mixedBarrierRoots) {
+  if (crossedOp->getNumRegions() != 0)
+    return false;
+  if (auto otherArrive = dyn_cast<ArriveBarrierOp>(crossedOp))
+    return hasWSBarrierConstraints(otherArrive.getConstraints());
+  if (auto wait = dyn_cast<WaitBarrierOp>(crossedOp))
+    return !mayShareWSChannel(wait, arrive, mixedBarrierRoots);
+  return !isBarrierLikeOp(crossedOp);
+}
+
 // Record each op's position in the block before any reordering, so that
 // optimizeWSBarrierLocations can tell which ops a barrier originally guarded.
 inline DenseMap<Operation *, unsigned> buildOriginalBlockOrder(Block &block) {
@@ -311,6 +365,17 @@ inline DenseMap<Operation *, unsigned> buildOriginalBlockOrder(Block &block) {
 // counts. When the memory op has no memdesc operand, any side-effecting op
 // counts. Ops with regions, and ops missing from `originalOrder`, are treated
 // as guarded.
+//
+// Lowering a wait toward its memory op, or raising an arrive toward its memory
+// op, is only a scheduling choice: leaving the barrier where it is stays
+// correct. So such a move also stops at the first barrier it may not cross,
+// unless that only restores the original order. A wait lowered below an
+// arrive (or an arrive raised above a wait) of the same channel would signal
+// before the acquire it depends on. Without
+// this, a wait whose nearest memory op belonged to another channel (a
+// broadcast slot whose local_load was dead) was lowered below the release of
+// its own slot, so the producer could overwrite the slot twice and the
+// consumer's parity wait hung.
 inline void optimizeWSBarrierLocations(
     const DenseMap<Operation *, Operation *> &barrierToMemOp,
     const DenseMap<Operation *, unsigned> &originalOrder) {
@@ -337,7 +402,50 @@ inline void optimizeWSBarrierLocations(
     unsigned barrierPos = originalOrder.lookup(barrier);
     return isWait ? it->second > barrierPos : it->second < barrierPos;
   };
-  for (auto [barrier, memOp] : barrierToMemOp) {
+  // Moving a barrier back across an op it originally followed (or preceded)
+  // only restores the original order, which is always legal.
+  auto wasOriginallyBefore = [&](Operation *a, Operation *b) {
+    auto itA = originalOrder.find(a), itB = originalOrder.find(b);
+    return itA != originalOrder.end() && itB != originalOrder.end() &&
+           itA->second < itB->second;
+  };
+  // Barrier arrays used by WS endpoints with more than one peer partition.
+  // Every WS endpoint in the block votes, not just the ones the map holds.
+  DenseMap<Value, std::optional<int64_t>> peerOfRoot;
+  DenseSet<Value> mixedBarrierRoots;
+  if (!barrierToMemOp.empty()) {
+    for (Operation &op : *barrierToMemOp.begin()->first->getBlock()) {
+      Value alloc;
+      std::optional<DictionaryAttr> constraints;
+      if (auto wait = dyn_cast<WaitBarrierOp>(&op)) {
+        alloc = wait.getAlloc();
+        constraints = wait.getConstraints();
+      } else if (auto arrive = dyn_cast<ArriveBarrierOp>(&op)) {
+        alloc = arrive.getAlloc();
+        constraints = arrive.getConstraints();
+      } else {
+        continue;
+      }
+      auto ws = getWSBarrierConstraints(constraints);
+      if (!ws)
+        continue;
+      std::optional<int64_t> peer;
+      if (auto dst = ws.getAs<IntegerAttr>("dstTask"))
+        peer = dst.getInt();
+      Value root = mlir::getMemDescRoot(alloc);
+      auto [it, inserted] = peerOfRoot.try_emplace(root, peer);
+      if (!inserted && it->second != peer)
+        mixedBarrierRoots.insert(root);
+    }
+  }
+  // Visit barriers in block order so the result does not depend on pointer
+  // hashing: a barrier's clamp depends on where earlier-moved barriers sit.
+  SmallVector<std::pair<Operation *, Operation *>> barriers(
+      barrierToMemOp.begin(), barrierToMemOp.end());
+  llvm::sort(barriers, [&](const auto &a, const auto &b) {
+    return originalOrder.lookup(a.first) < originalOrder.lookup(b.first);
+  });
+  for (auto [barrier, memOp] : barriers) {
     if (barrier->getBlock() != memOp->getBlock())
       continue;
     DenseSet<Value> roots = memDescRoots(memOp);
@@ -346,7 +454,9 @@ inline void optimizeWSBarrierLocations(
       if (anchor->isBeforeInBlock(barrier)) {
         for (auto *cur = barrier->getPrevNode(); cur != anchor;
              cur = cur->getPrevNode()) {
-          if (isGuarded(cur, barrier, /*isWait=*/false, roots)) {
+          if (isGuarded(cur, barrier, /*isWait=*/false, roots) ||
+              (!wasOriginallyBefore(barrier, cur) &&
+               !canRaiseWSArrivePast(arrive, cur, mixedBarrierRoots))) {
             anchor = cur;
             break;
           }
@@ -358,11 +468,14 @@ inline void optimizeWSBarrierLocations(
           barrier->moveAfter(anchor);
       }
     } else {
+      auto wait = cast<WaitBarrierOp>(barrier);
       Operation *target = memOp;
       if (barrier->isBeforeInBlock(memOp)) {
         for (auto *cur = barrier->getNextNode(); cur != memOp;
              cur = cur->getNextNode()) {
-          if (isGuarded(cur, barrier, /*isWait=*/true, roots)) {
+          if (isGuarded(cur, barrier, /*isWait=*/true, roots) ||
+              (!wasOriginallyBefore(cur, barrier) &&
+               !canLowerWSWaitPast(wait, cur, mixedBarrierRoots))) {
             target = cur;
             break;
           }
