@@ -3939,6 +3939,7 @@ def _run_bwd_d128_gqa(
         num_warps=4,
         num_stages=1,
         matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        disable_unclustered_high_rp_reschedule=True,
         # The source bridge directly emits fragmented persistent current-dK
         # and transient delayed-dQ MFMAs. The chains read different alternating
         # dS stages, so they are independent and can be interleaved. No TTGIR
