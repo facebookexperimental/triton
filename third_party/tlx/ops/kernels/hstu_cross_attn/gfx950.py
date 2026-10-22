@@ -20,10 +20,12 @@ made to the kernel after that snapshot:
   - KV address arithmetic hoisted out of the KV loop;
   - 16-byte direct-to-LDS K/V loads for the shared-KV HEAD_DIM=128 path.
 
-A lazy softmax rescale is intentionally not included: on gfx950 the
-packed-FP32 subtract it relies on can read a wrong operand while another wave
-on the same SIMD runs ``v_mfma_f32_16x16x32_f16``, producing NaN/Inf rows at
-two waves per SIMD.
+The softmax rescales lazily (`_forward_softmax_lazy`) only for BF16 with
+distinct K/V outside causal attention, on the double-buffered path. On gfx950
+a packed-FP32 subtract can read a wrong operand while another wave on the same
+SIMD runs ``v_mfma_f32_16x16x32_f16``, producing NaN/Inf rows at two waves per
+SIMD; the lazy BF16 kernels issue neither, folding the subtract into a packed
+FMA.
 
 The custom ops live in the ``tlx`` namespace, the environment knobs are
 prefixed ``TLX_HSTU_CROSS_ATTN_``. ``space="curated"`` (the default) autotunes
@@ -128,6 +130,7 @@ from ._backward_pipeline import _tlx_gfx950_cross_attn_v3_ttgir_bwd
 from ._backward_small import coarse_softmax_backward, compact_softmax_backward, small_softmax_backward
 from ._backward_retained import retained_softmax_backward
 from ._forward_stream_k import stream_k_fwd, stream_k_supported
+from ..flash_attn.gfx950 import LAZY_RESCALE_THRESHOLD
 from ..hstu_attn._stubs import triton_autotune
 from ..hstu_attn._util import (
     backward_softmax_activation_scaled_alpha,
@@ -384,6 +387,32 @@ def _tlx_gfx950_cross_attn_fwd_issue_kv(
 
 
 @triton.jit
+def _rescale_acc(acc, corr_2d):
+    return acc * corr_2d
+
+
+@triton.jit
+def _forward_softmax_lazy(qk, scaled_alpha, valid_mask, m_i, acc, l_i, RESCALE_THRESHOLD: tl.constexpr):
+    """Online softmax whose frame `m_i` only advances when the row max grows by more than `RESCALE_THRESHOLD`.
+
+    Probabilities stay below 2**RESCALE_THRESHOLD, and a wave skips the acc rescale when none of its rows advance.
+    `scaled_alpha` must be non-negative: the row max is taken before scaling.
+    """
+    m_ij = tl.max(tl.where(valid_mask, qk, -float("inf")), 1) * scaled_alpha
+    advance = m_ij - m_i > RESCALE_THRESHOLD
+    m_new = tl.where(advance, m_ij, m_i)
+    act_qk = tl.math.exp2(tl.where(valid_mask, qk * scaled_alpha - m_new[:, None], -float("inf")))
+    # One for rows that keep their frame, so a wave running the rescale for some of its rows leaves the rest exact.
+    corr = tl.math.exp2(m_i - m_new)
+    # The predicate is broadcast to the accumulator's shape: a row predicate does not get the accumulator's lane
+    # ownership from layout propagation.
+    acc = tlx.warp_predicate(tl.broadcast_to(advance[:, None], acc.shape), acc, _rescale_acc,
+                             args=(tl.broadcast_to(corr[:, None], acc.shape), ))
+    l_i = l_i * corr + tl.sum(act_qk, 1)
+    return act_qk, acc, l_i, m_new
+
+
+@triton.jit
 def _tlx_gfx950_cross_attn_fwd_consume_kv(
     wait_tok,
     k_buf,
@@ -404,6 +433,8 @@ def _tlx_gfx950_cross_attn_fwd_consume_kv(
     IS_SOFTMAX: tl.constexpr,
     MASKED: tl.constexpr,
     HAS_CAUSAL: tl.constexpr,
+    LAZY_RESCALE: tl.constexpr = False,
+    RESCALE_THRESHOLD: tl.constexpr = 0.0,
 ):
     """Both dots for one KV tile.
 
@@ -426,7 +457,10 @@ def _tlx_gfx950_cross_attn_fwd_consume_kv(
         valid_mask = tl.full([BLOCK_M, BLOCK_N], 1, tl.int1)
 
     if IS_SOFTMAX:
-        act_qk, acc, l_i, m_i = forward_softmax_activation_scaled_alpha(qk, alpha, valid_mask, m_i, acc, l_i)
+        if LAZY_RESCALE:
+            act_qk, acc, l_i, m_i = _forward_softmax_lazy(qk, alpha, valid_mask, m_i, acc, l_i, RESCALE_THRESHOLD)
+        else:
+            act_qk, acc, l_i, m_i = forward_softmax_activation_scaled_alpha(qk, alpha, valid_mask, m_i, acc, l_i)
     else:
         masked_alpha = tl.where(valid_mask, alpha, 0.0)
         qk = qk * masked_alpha
@@ -589,6 +623,8 @@ def _tlx_gfx950_cross_attn_fwd_compute_distinct_pipeline(
     SHARED_KV: tl.constexpr,
     IS_SOFTMAX: tl.constexpr,
     HAS_CAUSAL: tl.constexpr,
+    LAZY_RESCALE: tl.constexpr,
+    RESCALE_THRESHOLD: tl.constexpr,
 ):
     # Distinct-KV double-buffered pipeline covering both softmax and silu.
     # Called only when not SHARED_KV and NUM_STAGES >= 2 (see dispatcher).
@@ -601,6 +637,12 @@ def _tlx_gfx950_cross_attn_fwd_compute_distinct_pipeline(
         last_block_start_n = tl.maximum(0, (tl.cdiv(seq_len_kv, BLOCK_N) - 1) * BLOCK_N)
     if IS_SOFTMAX:
         alpha = alpha * 1.44269504
+        if LAZY_RESCALE:
+            # The lazy softmax takes the row max before scaling, so it needs a non-negative scale. Negating q
+            # negates every score exactly.
+            if alpha < 0:
+                q = -q
+                alpha = -alpha
     K_base = K + seq_start_kv.to(tl.int64) * stride_kn + off_h_kv * stride_kh
     V_base = V + seq_start_kv.to(tl.int64) * stride_vn + off_h_kv * stride_vh
     # Two physical slots, separately inferred per tensor. Selected by
@@ -659,6 +701,8 @@ def _tlx_gfx950_cross_attn_fwd_compute_distinct_pipeline(
             IS_SOFTMAX=IS_SOFTMAX,
             MASKED=False,
             HAS_CAUSAL=HAS_CAUSAL,
+            LAZY_RESCALE=LAZY_RESCALE,
+            RESCALE_THRESHOLD=RESCALE_THRESHOLD,
         )
         # Readers in every wave must finish before the next slot reuse.
         tl.debug_barrier()
@@ -684,6 +728,8 @@ def _tlx_gfx950_cross_attn_fwd_compute_distinct_pipeline(
         IS_SOFTMAX=IS_SOFTMAX,
         MASKED=True,
         HAS_CAUSAL=HAS_CAUSAL,
+        LAZY_RESCALE=LAZY_RESCALE,
+        RESCALE_THRESHOLD=RESCALE_THRESHOLD,
     )
     if IS_SOFTMAX:
         # Same epilogue as _tlx_gfx950_cross_attn_fwd_compute: normalize by l_i
@@ -741,6 +787,8 @@ def _tlx_gfx950_cross_attn_fwd_compute(
     SHARED_KV: tl.constexpr,
     IS_SOFTMAX: tl.constexpr,
     HAS_CAUSAL: tl.constexpr,
+    LAZY_RESCALE: tl.constexpr,
+    RESCALE_THRESHOLD: tl.constexpr,
 ):
     # The runtime head branch compiles both specializations, even for zero heads.
     # Distinct-KV double buffering is selected by NUM_STAGES >= 2 so the
@@ -782,6 +830,8 @@ def _tlx_gfx950_cross_attn_fwd_compute(
                 SHARED_KV,
                 IS_SOFTMAX,
                 HAS_CAUSAL,
+                LAZY_RESCALE,
+                RESCALE_THRESHOLD,
             )
     if HAS_CAUSAL:
         high = start_m + BLOCK_M + seq_len_kv - uih_len_q
@@ -1122,6 +1172,8 @@ def _tlx_gfx950_cross_attn_fwd_inner(
     NUM_STAGES: tl.constexpr,
     SHARED_KV: tl.constexpr,
     HAS_CAUSAL: tl.constexpr,
+    LAZY_RESCALE: tl.constexpr,
+    RESCALE_THRESHOLD: tl.constexpr,
 ):
     # initialize offsets
     if start_m < seq_len_q:
@@ -1177,6 +1229,8 @@ def _tlx_gfx950_cross_attn_fwd_inner(
                     # pyrefly: ignore [bad-argument-type]
                     IS_SOFTMAX=True,
                     HAS_CAUSAL=HAS_CAUSAL,
+                    LAZY_RESCALE=LAZY_RESCALE,
+                    RESCALE_THRESHOLD=RESCALE_THRESHOLD,
                 )
             else:
                 acc = _tlx_gfx950_cross_attn_fwd_compute(
@@ -1214,6 +1268,8 @@ def _tlx_gfx950_cross_attn_fwd_inner(
                     # pyrefly: ignore [bad-argument-type]
                     IS_SOFTMAX=False,
                     HAS_CAUSAL=HAS_CAUSAL,
+                    LAZY_RESCALE=False,
+                    RESCALE_THRESHOLD=RESCALE_THRESHOLD,
                 )
         off_o = Out + seq_start_q * stride_om + off_h * stride_oh
         offs_m = start_m + tl.arange(0, BLOCK_M)
@@ -1361,6 +1417,9 @@ def _tlx_gfx950_cross_attn_fwd(
     SORT_BY_KV: tl.constexpr,
     SORT_MAX_Z: tl.constexpr,
     SORT_MIN_PROGRAMS: tl.constexpr,
+    # Lazily rescaled softmax on the distinct-KV double-buffered path; see `_forward_softmax_lazy`.
+    LAZY_RESCALE: tl.constexpr,
+    RESCALE_THRESHOLD: tl.constexpr,
 ):
     # 1-D grid so tiles can be regrouped per XCD. The 2-D (m_tile, Z*H) launch
     # this replaces hands consecutive tiles to different XCDs, which scatters
@@ -1435,6 +1494,8 @@ def _tlx_gfx950_cross_attn_fwd(
                 NUM_STAGES1,
                 SHARED_KV=SHARED_KV,
                 HAS_CAUSAL=HAS_CAUSAL,
+                LAZY_RESCALE=LAZY_RESCALE,
+                RESCALE_THRESHOLD=RESCALE_THRESHOLD,
             )
             return
     _tlx_gfx950_cross_attn_fwd_inner(
@@ -1474,6 +1535,8 @@ def _tlx_gfx950_cross_attn_fwd(
         NUM_STAGES,
         SHARED_KV=SHARED_KV,
         HAS_CAUSAL=HAS_CAUSAL,
+        LAZY_RESCALE=LAZY_RESCALE,
+        RESCALE_THRESHOLD=RESCALE_THRESHOLD,
     )
 
 
@@ -1582,6 +1645,10 @@ def _tlx_gfx950_cross_attn_fwd_impl(
         SORT_BY_KV=FWD_SORT_BY_KV,
         SORT_MAX_Z=SEQ_SORT_MAX_Z,
         SORT_MIN_PROGRAMS=SEQ_SORT_MIN_PROGRAMS,
+        # BF16 only: the packed-FP32 subtract hazard (module docstring) involves the FP16 MFMA. Training shares K/V,
+        # so it keeps the exact rescale.
+        LAZY_RESCALE=q.dtype == torch.bfloat16 and not shared_kv and not causal,
+        RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value,
     )
     return out, M
 

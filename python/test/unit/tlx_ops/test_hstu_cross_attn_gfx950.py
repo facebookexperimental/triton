@@ -338,6 +338,40 @@ def test_hstu_cross_attn_each_curated_config_is_correct(index, num_softmax_heads
          dtype=torch.bfloat16, check_backward=True, space="curated")
 
 
+@requires_gfx950
+@pytest.mark.parametrize("alpha_sign", [1.0, -1.0])
+@pytest.mark.parametrize("nonkdim", [16, 32])
+def test_hstu_cross_attn_lazy_softmax_rescale(nonkdim, alpha_sign, monkeypatch):
+    # BF16 softmax with distinct K/V on the double-buffered path rescales lazily. Key norms ramp up along each
+    # sequence, so row maxima grow between KV blocks both by more and by less than the rescale threshold; a negative
+    # alpha takes the path that negates q.
+    from triton.tlx.ops import hstu_cross_attn
+    from triton.tlx.ops.kernels.hstu_cross_attn._reference import pytorch_hstu_cross_mha
+
+    xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
+    config = next(c for c in xa._fwd_curated_configs()
+                  if c.num_stages == 2 and c.kwargs["matrix_instr_nonkdim"] == nonkdim)
+    kernel = xa._tlx_gfx950_cross_attn_fwd
+    monkeypatch.setattr(kernel.curated, "configs", [config])
+    monkeypatch.setattr(kernel.curated, "cache", {})
+    monkeypatch.setenv(xa.STREAM_K_ENV, "0")
+    torch.manual_seed(1031)
+    lengths_kv, lengths_q, heads, dim = [1000, 129, 64, 7], [200, 65, 1, 64], 2, 64
+    seq_offsets = _offsets(torch.tensor(lengths_kv, device="cuda"))
+    seq_offsets_q = _offsets(torch.tensor(lengths_q, device="cuda"))
+    ramp = torch.cat([torch.linspace(0.1, 6.0, n, device="cuda") for n in lengths_kv])
+    q = torch.randn(sum(lengths_q), heads, dim, device="cuda").bfloat16()
+    k = (torch.randn(sum(lengths_kv), heads, dim, device="cuda") * ramp[:, None, None]).bfloat16()
+    v = torch.empty_like(k).uniform_(-1, 1)
+    attn_scale = torch.tensor(1.0 / 1000, device="cuda")
+    alpha = alpha_sign * dim**-0.5
+    out = hstu_cross_attn(q, k, v, seq_offsets, max(lengths_kv), attn_scale, alpha=alpha, seq_offsets_q=seq_offsets_q,
+                          max_q_len=max(lengths_q), num_softmax_heads=1, space="curated")
+    ref = pytorch_hstu_cross_mha(max(lengths_q), max(lengths_kv), alpha, q.float(), k.float(), v.float(), attn_scale,
+                                 seq_offsets_q, seq_offsets, num_softmax_heads=1)
+    torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=FWD_RTOL)
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("variant", ["v3_ttgir", "fp32_pipeline_qdo", "split_softmax"])
 @pytest.mark.parametrize("q_lengths,kv_lengths", [
