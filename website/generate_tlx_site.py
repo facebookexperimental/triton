@@ -84,6 +84,11 @@ TLX_PAGES = (
         "Production-ready TLX kernels, one blessed implementation per op and architecture.",
     ),
     Page(
+        "tlx-sm90",
+        "TLX on sm90 (Hopper)",
+        "Supported ops and extension builtins on NVIDIA Hopper.",
+    ),
+    Page(
         "tlx-sm100",
         "TLX on sm100 (Blackwell)",
         "Supported ops and extension builtins on NVIDIA Blackwell.",
