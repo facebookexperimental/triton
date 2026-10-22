@@ -1,45 +1,120 @@
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 namespace mlir::triton::AMD {
 bool hasMutuallyExclusiveSuccessorUses(Value value) {
-  auto blockArgument = dyn_cast<BlockArgument>(value);
-  if (!blockArgument)
-    return false;
-  Operation *terminator = blockArgument.getOwner()->getTerminator();
-  // This is the exact shape produced when SCF-to-CF lowers a runtime loop.
-  // Do not generalize the exception to switches or other multiway CFGs.
-  if (!isa<cf::CondBranchOp>(terminator) || terminator->getNumSuccessors() != 2)
+  Block *header = value.getParentBlock();
+  auto branch = dyn_cast<cf::CondBranchOp>(header->getTerminator());
+  if (!branch || branch.getTrueDest() == branch.getFalseDest())
     return false;
 
-  llvm::DenseSet<Block *> successorBlocks;
-  for (unsigned index = 0; index < terminator->getNumSuccessors(); ++index)
-    successorBlocks.insert(terminator->getSuccessor(index));
-
-  llvm::DenseSet<Block *> usedSuccessors;
-  for (OpOperand &use : value.getUses()) {
-    Block *useBlock = use.getOwner()->getBlock();
-    if (!successorBlocks.contains(useBlock) ||
-        !usedSuccessors.insert(useBlock).second)
-      return false;
-  }
-  if (usedSuccessors.size() != 2)
-    return false;
-
-  SmallVector<Block *> blocks(usedSuccessors.begin(), usedSuccessors.end());
-  Block *header = blockArgument.getOwner();
+  // SCF-to-CF may insert an unrelated diamond before the loop's accumulator
+  // update. Each arm must still reach its own unique consumer on every path,
+  // before any header re-entry. Only acyclic direct-branch prefixes are
+  // modeled.
+  auto allPathsReachConsumer = [header](Block *from, Block *consumer) {
+    llvm::SmallPtrSet<Block *, 16> active;
+    llvm::SmallPtrSet<Block *, 16> proven;
+    auto visit = [&](auto &&self, Block *block) -> bool {
+      if (block == consumer)
+        return true;
+      if (block == header || block->getParent() != header->getParent())
+        return false;
+      if (proven.contains(block))
+        return true;
+      if (!active.insert(block).second)
+        return false;
+      Operation *terminator = block->getTerminator();
+      if (!isa<cf::BranchOp, cf::CondBranchOp>(terminator))
+        return false;
+      for (Block *successor : terminator->getSuccessors()) {
+        if (!self(self, successor))
+          return false;
+      }
+      active.erase(block);
+      proven.insert(block);
+      return true;
+    };
+    return visit(visit, from);
+  };
   auto isReachableWithoutHeader = [header](Block *from, Block *to) {
+    if (from == header)
+      return false;
     llvm::SmallPtrSet<Block *, 16> excluded;
     excluded.insert(header);
     return from->isReachable(to, std::move(excluded));
   };
-  for (auto [index, lhs] : llvm::enumerate(blocks)) {
-    for (Block *rhs : ArrayRef(blocks).drop_front(index + 1)) {
-      if (isReachableWithoutHeader(lhs, rhs) ||
-          isReachableWithoutHeader(rhs, lhs))
+  // CFG simplification may fold a bypass block into a forwarded header
+  // operand. This use occurs on the edge, so the other consumer may still
+  // reach the forwarded destination as a common join.
+  if (value.hasNUses(2)) {
+    OpOperand *forwardedUse = nullptr;
+    Block *consumer = nullptr;
+    for (OpOperand &use : value.getUses()) {
+      if (use.getOwner() == branch.getOperation()) {
+        if (forwardedUse)
+          return false;
+        forwardedUse = &use;
+      } else {
+        consumer = use.getOwner()->getBlock();
+      }
+    }
+    if (forwardedUse) {
+      if (!consumer || consumer == header ||
+          consumer->getParent() != header->getParent())
+        return false;
+      std::optional<BlockArgument> successorArgument =
+          cast<BranchOpInterface>(branch.getOperation())
+              .getSuccessorBlockArgument(forwardedUse->getOperandNumber());
+      if (!successorArgument)
+        return false;
+      Block *forwarded = successorArgument->getOwner();
+      Block *opposite = forwarded == branch.getTrueDest()
+                            ? branch.getFalseDest()
+                            : branch.getTrueDest();
+      if (!allPathsReachConsumer(opposite, consumer) ||
+          isReachableWithoutHeader(forwarded, consumer))
+        return false;
+      for (Block *successor : consumer->getSuccessors()) {
+        if (isReachableWithoutHeader(successor, consumer))
+          return false;
+      }
+      return true;
+    }
+  }
+
+  SmallVector<Block *, 2> consumers;
+  for (OpOperand &use : value.getUses()) {
+    Block *useBlock = use.getOwner()->getBlock();
+    // Do not lift captures in nested regions to their enclosing CFG block.
+    if (useBlock == header || useBlock->getParent() != header->getParent() ||
+        llvm::is_contained(consumers, useBlock) || consumers.size() == 2)
+      return false;
+    consumers.push_back(useBlock);
+  }
+  if (consumers.size() != 2)
+    return false;
+
+  auto matchesArms = [&](Block *first, Block *second) {
+    return allPathsReachConsumer(branch.getTrueDest(), first) &&
+           allPathsReachConsumer(branch.getFalseDest(), second);
+  };
+  if (!matchesArms(consumers[0], consumers[1]) &&
+      !matchesArms(consumers[1], consumers[0]))
+    return false;
+
+  if (isReachableWithoutHeader(consumers[0], consumers[1]) ||
+      isReachableWithoutHeader(consumers[1], consumers[0]))
+    return false;
+  // An inner cycle must not consume the same dynamic accumulator again. Start
+  // at successors so this tests a nonempty path, not reflexive reachability.
+  for (Block *consumer : consumers) {
+    for (Block *successor : consumer->getSuccessors()) {
+      if (isReachableWithoutHeader(successor, consumer))
         return false;
     }
   }
