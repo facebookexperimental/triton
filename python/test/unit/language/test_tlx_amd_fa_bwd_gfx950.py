@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 import ast
 import itertools
 import math
@@ -3148,4 +3149,171 @@ def test_varlen_d128_h64_ds_error_propagation_host(monkeypatch, failure):
     shapes = [tensor.shape for _, tensor, _ in api.allocations]
     assert shapes.count((64, elements)) <= 1
     assert shapes.count((64, 51039, 128)) == failure.startswith("fallback_after_")
+
+
+
+def _make_dense_reference_case(shape, causal, seed=0):
+    """Build dense MHA forward state and FP32 reference gradients by head."""
+    batch, heads, n_ctx, head_dim = shape
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    grad_out = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
+    grads = tuple(torch.empty(shape, device="cuda", dtype=torch.float32) for _ in range(3))
+    sm_scale = head_dim**-0.5
+    causal_mask = torch.ones((n_ctx, n_ctx), device="cuda", dtype=torch.bool).triu(1) if causal else None
+
+    for batch_idx in range(batch):
+        for head_idx in range(heads):
+            q_ref = q[batch_idx, head_idx].float().requires_grad_(True)
+            k_ref = k[batch_idx, head_idx].float().requires_grad_(True)
+            v_ref = v[batch_idx, head_idx].float().requires_grad_(True)
+            scores = q_ref @ k_ref.mT * sm_scale
+            if causal_mask is not None:
+                scores = scores.masked_fill(causal_mask, float("-inf"))
+            lse_ref = torch.logsumexp(scores, dim=-1)
+            out_ref = torch.softmax(scores, dim=-1) @ v_ref
+            reference = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad_out[batch_idx, head_idx].float())
+            with torch.no_grad():
+                out[batch_idx, head_idx].copy_(out_ref)
+                lse[batch_idx, head_idx].copy_(lse_ref)
+                for destination, source in zip(grads, reference, strict=True):
+                    destination[batch_idx, head_idx].copy_(source)
+
+    return ReferenceCase(q, k, v, out, grad_out, lse, sm_scale, causal, grads)
+
+
+def _make_dense_gqa_reference_case(shape, *, causal=False, seed=0, sm_scale=None):
+    """Build a small supported dense GQA reference case."""
+    assert amd_fa_bwd._is_supported_gqa_shape(shape)
+    batch, query_heads, kv_heads, n_ctx, head_dim = shape
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn((batch, query_heads, n_ctx, head_dim), generator=generator, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, n_ctx, head_dim), generator=generator, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, n_ctx, head_dim), generator=generator, device="cuda", dtype=torch.bfloat16)
+    grad_out = torch.randn(q.shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:-1], device="cuda", dtype=torch.float32)
+    dq = torch.empty_like(q, dtype=torch.float32)
+    dk = torch.zeros_like(k, dtype=torch.float32)
+    dv = torch.zeros_like(v, dtype=torch.float32)
+    sm_scale = head_dim**-0.5 if sm_scale is None else sm_scale
+    causal_mask = torch.ones((n_ctx, n_ctx), device="cuda", dtype=torch.bool).triu(1) if causal else None
+    group_size = query_heads // kv_heads
+
+    for batch_idx in range(batch):
+        for query_head in range(query_heads):
+            kv_head = query_head // group_size
+            q_ref = q[batch_idx, query_head].float().requires_grad_(True)
+            k_ref = k[batch_idx, kv_head].float().requires_grad_(True)
+            v_ref = v[batch_idx, kv_head].float().requires_grad_(True)
+            scores = q_ref @ k_ref.mT * sm_scale
+            if causal_mask is not None:
+                scores = scores.masked_fill(causal_mask, float("-inf"))
+            lse_ref = torch.logsumexp(scores, dim=-1)
+            out_ref = torch.softmax(scores, dim=-1) @ v_ref
+            reference = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad_out[batch_idx, query_head].float())
+            with torch.no_grad():
+                out[batch_idx, query_head].copy_(out_ref)
+                lse[batch_idx, query_head].copy_(lse_ref)
+                dq[batch_idx, query_head].copy_(reference[0])
+                dk[batch_idx, kv_head].add_(reference[1])
+                dv[batch_idx, kv_head].add_(reference[2])
+
+    return ReferenceCase(q, k, v, out, grad_out, lse, sm_scale, causal, (dq, dk, dv))
+
+
+def _snr_db(actual, expected):
+    signal = torch.linalg.vector_norm(expected.float())
+    noise = torch.linalg.vector_norm(actual.float() - expected.float())
+    return 20.0 * torch.log10(signal / noise).item()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("zero_dq", [False, True], ids=["delta-only", "zero-dq"])
+def test_dense_bwd_preprocess_scaled_lse_tail_gfx950(zero_dq):
+    batch, heads, n_ctx, head_dim = 2, 3, 70, 128
+    rows = batch * heads * n_ctx
+    shape = (batch, heads, n_ctx, head_dim)
+    elements = torch.arange(rows * head_dim, device="cuda", dtype=torch.float32).reshape(shape)
+    # Dyadic inputs keep the delta reduction exact; distinct row patterns also
+    # expose a missing batch/head offset. N=70 exercises the final 64-row tile.
+    out = ((elements % 17 - 8) / 8).to(torch.bfloat16)
+    grad_out = ((elements % 13 - 6) / 8).to(torch.bfloat16)
+    lse = (torch.arange(rows, device="cuda", dtype=torch.float32).reshape(shape[:-1]) - rows // 2) / 8
+    original_lse = lse.clone()
+    expected_delta = (out.float() * grad_out.float()).sum(dim=-1)
+    baseline_delta = torch.full_like(lse, float("nan"))
+    amd_fa_bwd._run_bwd_preprocess(out, grad_out, baseline_delta)
+
+    # The guard catches writes from inactive rows in the final preprocess tile.
+    guard_rows = 64
+    lse_storage = torch.full((rows + guard_rows, ), -123.0, device="cuda", dtype=torch.float32)
+    scaled_lse = lse_storage[:rows].reshape(shape[:-1])
+    scaled_lse.fill_(float("nan"))
+    delta = torch.full_like(lse, float("nan"))
+    dq_acc = torch.full_like(out, float("nan"), dtype=torch.float32) if zero_dq else None
+    # Keep dq_acc in its existing fourth positional slot when enabling LSE work.
+    amd_fa_bwd._run_bwd_preprocess(out, grad_out, delta, dq_acc, lse=lse, lse_log2=scaled_lse)
+
+    log2e = torch.tensor(1.4426950408889634, device="cuda", dtype=torch.float32)
+    torch.testing.assert_close(scaled_lse, original_lse * log2e, atol=0, rtol=0)
+    torch.testing.assert_close(lse, original_lse, atol=0, rtol=0)
+    torch.testing.assert_close(baseline_delta, expected_delta, atol=0, rtol=0)
+    torch.testing.assert_close(delta, expected_delta, atol=0, rtol=0)
+    torch.testing.assert_close(delta, baseline_delta, atol=0, rtol=0)
+    torch.testing.assert_close(lse_storage[rows:], torch.full_like(lse_storage[rows:], -123.0), atol=0, rtol=0)
+    if zero_dq:
+        torch.testing.assert_close(dq_acc, torch.zeros_like(dq_acc), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("sm_scale", [0.0, -0.125], ids=["zero-scale", "negative-scale"])
+@pytest.mark.parametrize("shape", [(1, 1, 1, 256, 128), (1, 2, 1, 256, 128)], ids=["mha", "gqa2"])
+def test_dense_bwd_gqa_causal_scale_edges_gfx950(shape, sm_scale):
+    case = _make_dense_gqa_reference_case(shape, causal=True, seed=17, sm_scale=sm_scale)
+    actual_grads = fa_backward(*case.kernel_args)
+    for actual, expected in zip(actual_grads, case.grads, strict=True):
+        assert torch.isfinite(actual).all()
+        if torch.count_nonzero(expected).item() == 0:
+            assert torch.count_nonzero(actual).item() == 0
+        else:
+            assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_dense_bwd_d128_noncausal_rectangular_tail_is_repeatable_gfx950(monkeypatch):
+    options = {
+        amd_fa_bwd._D128_EXACT_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_SINK_INSTS_ENV: "0",
+        amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV: "0",
+        amd_fa_bwd._D128_REVERSE_LOCAL_ENV: "0",
+    }
+    case = _make_dense_reference_case((16, 27, 200, 128), False, seed=21)
+
+    def poison_allocation(allocate):
+
+        def allocate_and_poison(*args, **kwargs):
+            result = allocate(*args, **kwargs)
+            if result.is_floating_point():
+                result.fill_(float("nan"))
+            return result
+
+        return allocate_and_poison
+
+    # Poison newly allocated gradients and delta while running the real public
+    # path. N=200 reuses the BM32 Q/dO ring before its final eight valid rows.
+    with mock.patch.dict(os.environ, options), monkeypatch.context() as allocations:
+        allocations.setattr(torch, "empty", poison_allocation(torch.empty))
+        allocations.setattr(torch, "empty_like", poison_allocation(torch.empty_like))
+        for _ in range(5):
+            actual_grads = fa_backward(*case.kernel_args)
+            for actual, expected in zip(actual_grads, case.grads, strict=True):
+                assert torch.isfinite(actual).all()
+                assert _snr_db(actual, expected) >= 40.0
 
