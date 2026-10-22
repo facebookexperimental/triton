@@ -36,6 +36,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/NamedBarrier.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierInsertion.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
 namespace ttng = mlir::triton::nvidia_gpu;
 
@@ -530,6 +531,10 @@ LogicalResult ConvertTritonGPUToLLVM::prepareModule(ModuleOp mod,
 
   ModuleMembarAnalysis membarPass(allocation, canSkipBarSync);
   membarPass.run();
+  mlir::PassManager waitPm(mod.getContext());
+  waitPm.addPass(ttng::createTritonNvidiaGPUTMemWaitInsertionPass());
+  if (failed(waitPm.run(mod)))
+    return failure();
 
   if (enableConcurrencySanitizer) {
     auto hooks = mlir::triton::instrument::createConSanHooks("nvidia");
