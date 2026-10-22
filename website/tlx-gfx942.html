@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Supported ops and extension builtins on AMD MI300.">
+  <title>TLX on gfx942 (MI300) · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Tutorial kernels</a>
+<a href="tlx-ops.html">High-performance kernels</a>
+<a href="tlx-gfx942.html" aria-current="page">TLX on gfx942 (MI300)</a>
+<a class="sub" href="#supported-tlx-ops">Supported `tlx.ops`</a>
+<a class="sub" href="#supported-extension-builtins-tlx">Supported extension builtins (`tlx.*`)</a>
+<a class="sub" href="#not-on-this-target">Not on this target</a>
+<a href="tlx-gfx950.html">TLX on gfx950 (MI350)</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>TLX on gfx942 (MI300)</h1>
+      <p class="lede">Supported ops and extension builtins on AMD MI300.</p>
+      <article><p>MI300X: CDNA3 MFMA, per-CU LDS, explicit buffer loads. Unlike gfx950, async global-to-LDS copies are not profitable here, so kernels stage through registers with direct buffer loads plus explicit LDS. Tags follow <a href="tlx.html">tlx.md</a>; a trailing <code>?</code> marks unconfirmed availability.</p>
+<h2 id="supported-tlx-ops">Supported <code>tlx.ops</code></h2>
+<table><thead><tr><th>Op</th><th>Variant</th><th>Impl</th><th>Dtypes</th><th>Requires</th><th>Backward</th><th>What it does</th></tr></thead><tbody><tr><td><code>mm</code></td><td>direct_load</td><td><code>mm/gfx942.py:mm</code></td><td>float16</td><td>—</td><td>no</td><td>Direct-load GEMM: register-staged buffer loads + explicit LDS, hand-pinned MFMA layouts; intra-CTA K-split for short-M; N-edge panels share one A tile. No descriptor alignment constraints.</td></tr><tr><td><code>addmm</code></td><td>fused_gemm</td><td><code>addmm/gfx942.py:addmm</code></td><td>float16</td><td>—</td><td>no</td><td>Thin fused-bias wrapper over the <code>mm</code> direct-load path: one kernel does GEMM+bias.</td></tr><tr><td><code>mm_torchtlx</code></td><td>inductor_gfx942_mm</td><td><code>inductor/gfx942_torch:mm</code></td><td>float16</td><td>—</td><td>no</td><td>Inductor template entry so the gfx942 GEMM participates in PT2 template selection, autotuning, and fusion.</td></tr><tr><td><code>addmm_torchtlx</code></td><td>inductor_gfx942_addmm</td><td><code>addmm/gfx942_torch:addmm</code></td><td>float16</td><td>—</td><td>no</td><td>Inductor template entry for fused GEMM+bias on gfx942.</td></tr></tbody></table>
+<h2 id="supported-extension-builtins-tlx">Supported extension builtins (<code>tlx.*</code>)</h2>
+<p>Same cross-backend set as <a href="tlx-gfx950.html">gfx950</a>, minus the gfx950-only items below.</p>
+<h3 id="scalars-types-diagnostics">Scalars, types, diagnostics</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>assume_uniform</code></td><td>Assert scalar wave-uniform (<code>v_readfirstlane</code>)</td></tr><tr><td><code>zeros</code></td><td>Zero tensor, optional explicit register layout</td></tr><tr><td><code>dtype_of</code> / <code>size_of</code></td><td>Element type / byte size (host-side)</td></tr><tr><td><code>get_fp8_format_name</code></td><td><code>e5m2</code>/<code>e4m3</code> for scaled-MMA format args</td></tr><tr><td><code>clock64</code></td><td>64-bit hardware timer read</td></tr><tr><td><code>assert_same_layout</code> / <code>dump_layout</code></td><td>Layout assert / compile-time layout log</td></tr></tbody></table>
+<h3 id="local-memory">Local memory</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>local_alloc</code> / <code>local_view</code> / <code>local_slice</code></td><td>Multi-buffer alloc, index subview, same-rank slice</td></tr><tr><td><code>local_store</code> / <code>local_load</code></td><td>Registers to/from LDS buffer</td></tr><tr><td><code>local_gather</code> / <code>local_scatter</code></td><td>Indexed gather/scatter along an axis</td></tr><tr><td><code>storage_alias_spec</code></td><td>Sized/unsized shared-buffer alias spec</td></tr><tr><td><code>buffered_tensor</code> / <code>buffered_tensor_type</code></td><td>Memory-backed buffer value and its type</td></tr></tbody></table>
+<h3 id="amd-buffer-ops">AMD buffer ops</h3>
+<p>Register-staged loads are the primary path on this target (<code>mm/gfx942.py</code> uses <code>buffer_load</code> for all operand traffic).</p>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>buffer_load</code> / <code>buffer_store</code></td><td>Global access via scalar base + i32 offsets</td></tr><tr><td><code>buffer_atomic_add</code>?</td><td>Buffer atomic add; unconfirmed on gfx942</td></tr></tbody></table>
+<h3 id="layout-control">Layout control</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>local_trans</code> / <code>local_reshape</code> / <code>local_reinterpret</code></td><td>Metadata-only descriptor transforms</td></tr><tr><td><code>require_layout</code> / <code>release_layout</code></td><td>Pin / release register layouts</td></tr><tr><td><code>amd_mfma_layout</code></td><td>MFMA distributed layout, versions 1-4</td></tr><tr><td><code>dot_operand_layout</code></td><td>Explicit MFMA dot-operand view</td></tr><tr><td><code>require_amd_wmma_layout</code></td><td>Pin tensor to explicit WMMA layout</td></tr><tr><td><code>slice_layout</code> / <code>layout</code></td><td>Rank-reduced view / user Shape:Stride layout</td></tr><tr><td><code>layout_encoding</code> / <code>shared_layout_encoding</code></td><td>Base layout classes</td></tr><tr><td><code>swizzled_shared_layout_encoding</code> / <code>swizzled_layout</code></td><td>Swizzled LDS layouts</td></tr><tr><td><code>padded_shared_layout_encoding</code></td><td>Padded LDS layout (bank-conflict relief)</td></tr><tr><td><code>shared_linear_layout_encoding</code></td><td>Explicit linear SMEM mapping</td></tr><tr><td><code>DummyRegisterLayoutEncoding</code></td><td>Placeholder layout resolved post-inline</td></tr><tr><td><code>storage_kind</code></td><td>Buffer storage selector enum</td></tr><tr><td><code>reuse_group</code> / <code>reuse_group_type</code> / <code>reuse_group_ir_type</code></td><td>Buffer overlap trees for aliasing</td></tr><tr><td><code>storage_alias_spec_type</code> / <code>storage_alias_spec_type_class</code></td><td>Alias-spec MLIR types</td></tr></tbody></table>
+<h3 id="compute-and-register-control">Compute and register control</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>dot_scaled</code></td><td>Scaled dot with optional tile schedule</td></tr><tr><td><code>amd_scheduled_mfma</code></td><td>Native MFMA chains (persistent needs VGPR on gfx942)</td></tr><tr><td><code>amd_mfma_commit</code></td><td>Wave-local MFMA completion boundary</td></tr><tr><td><code>amd_register_resident</code></td><td>Constrain packed register groups (AGPR/VGPR)</td></tr><tr><td><code>amd_register_class_anchor</code></td><td>Per-register tied allocator anchor</td></tr></tbody></table>
+<h3 id="synchronization">Synchronization</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>alloc_barriers</code> / <code>alloc_warp_barrier</code></td><td>Allocate SMEM / warp barriers</td></tr><tr><td><code>barrier_wait</code> / <code>barrier_arrive</code></td><td>Phase wait / arrival (<code>arrive_count</code> must be 1)</td></tr><tr><td><code>cluster_barrier</code></td><td>Sync all threads in all cluster CTAs</td></tr><tr><td><code>cond_barrier</code></td><td>Conditional <code>s_barrier</code> phase-shift primitive</td></tr><tr><td><code>workgroup_barrier</code></td><td>Full workgroup barrier + LDS fence</td></tr><tr><td><code>mbarrier</code> / <code>mbarrier_type</code></td><td>Barrier values and types</td></tr><tr><td><code>async_token</code></td><td>Tracks async-op completion</td></tr><tr><td><code>allocate_tensor_descriptor</code></td><td>128B-aligned descriptor scratch (host-side alloc)</td></tr></tbody></table>
+<h3 id="scheduling-and-threads">Scheduling and threads</h3>
+<table><thead><tr><th>Builtin</th><th>Purpose</th></tr></thead><tbody><tr><td><code>amd_sched_barrier</code></td><td>Compiler scheduling marker (no sync/fence)</td></tr><tr><td><code>amd_iglp_opt</code></td><td>IGLP interleave hint</td></tr><tr><td><code>warp_predicate</code></td><td>Execute body under per-lane predicate</td></tr><tr><td><code>cluster_cta_rank</code> / <code>cluster_size_1d</code></td><td>CTA rank / cluster size</td></tr><tr><td><code>thread_id</code> / <code>num_warps</code></td><td>Thread id / kernel warp count</td></tr><tr><td><code>warp_all</code> / <code>warp_any</code></td><td>Lane votes</td></tr></tbody></table>
+<h2 id="not-on-this-target">Not on this target</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>async_load</code>, <code>async_load_commit_group</code>, <code>async_load_wait_group</code>:</div></div>
+<p>async copies require gfx950.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer_load_to_local</code>: direct-to-LDS path requires gfx950; use</div></div>
+<p>register-staged <code>buffer_load</code> + <code>local_store</code> instead.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>warp_pipeline_stage</code>: CDNA4+ cluster scheduling; not available here.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>extract_slice</code>, <code>rematerialized_range</code>: used by gfx950 kernels;</div></div>
+<p>unconfirmed here.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>TDM descriptor ops (<code>async_amd_descriptor_*</code>) are gfx1250+.</div></div></article>
+<footer class="pager"><a href="tlx-ops.html">← High-performance kernels</a><a class="next" href="tlx-gfx950.html">TLX on gfx950 (MI350) →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
