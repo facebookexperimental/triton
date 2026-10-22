@@ -6221,7 +6221,7 @@ def _attn_bwd_opt_gqa_dk_fragmented_prefetch(
     query_rows: tl.constexpr = dk_lhs.shape[1]
     tl.static_assert(query_rows == 16 or query_rows == 32)
     # BM16 dK inputs come straight from LDS; leave their placement to LLVM.
-    PIN_OPERANDS: tl.constexpr = query_rows != 16
+    DK_OPERANDS: tl.constexpr = "unconstrained" if query_rows == 16 else None
     tl.static_assert(dk_lhs.shape == (256, query_rows))
     tl.static_assert(dk_rhs.shape == (query_rows, 128))
     tl.static_assert(prev_ds.shape == (query_rows, 256))
@@ -6256,24 +6256,24 @@ def _attn_bwd_opt_gqa_dk_fragmented_prefetch(
         c03 = tlx.extract_slice(dk, [128, 32], [0, 96])
         c13 = tlx.extract_slice(dk, [128, 32], [128, 96])
 
-    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
-    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
+    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent", resident_operand=DK_OPERANDS)
+    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent", resident_operand=DK_OPERANDS)
     ds0 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 0], [query_rows, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
-    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
-    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
-    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
+    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent", resident_operand=DK_OPERANDS)
+    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent", resident_operand=DK_OPERANDS)
+    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent", resident_operand=DK_OPERANDS)
+    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent", resident_operand=DK_OPERANDS)
     ds1 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 32], [query_rows, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
-    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator_role="persistent", pin_operands=PIN_OPERANDS)
+    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator_role="persistent", resident_operand=DK_OPERANDS)
+    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator_role="persistent", resident_operand=DK_OPERANDS)
 
     if FRAGMENT_CHAIN:
         return (c00, c10, c01, c11, c02, c12, c03, c13), ds0, ds1
@@ -6405,22 +6405,22 @@ def _attn_bwd_gqa_dkdv_braid_prefetch(
     v13 = tlx.extract_slice(dv, [128, 32], [128, 96])
     v00 = tlx.amd_scheduled_mfma(vl0, vr0, v00, accumulator_role="transient")
     v10 = tlx.amd_scheduled_mfma(vl1, vr0, v10, accumulator_role="transient")
-    k00 = tlx.amd_scheduled_mfma(kl0, kr0, k00, accumulator_role="persistent", pin_operands=False)
-    k10 = tlx.amd_scheduled_mfma(kl1, kr0, k10, accumulator_role="persistent", pin_operands=False)
+    k00 = tlx.amd_scheduled_mfma(kl0, kr0, k00, accumulator_role="persistent", resident_operand="unconstrained")
+    k10 = tlx.amd_scheduled_mfma(kl1, kr0, k10, accumulator_role="persistent", resident_operand="unconstrained")
     ds0 = tlx.local_load(tlx.local_slice(prev_ds, [0, 0], [16, 32]), layout=DS_MD_LAYOUT, relaxed=True)
     v01 = tlx.amd_scheduled_mfma(vl0, vr1, v01, accumulator_role="transient")
     v11 = tlx.amd_scheduled_mfma(vl1, vr1, v11, accumulator_role="transient")
-    k01 = tlx.amd_scheduled_mfma(kl0, kr1, k01, accumulator_role="persistent", pin_operands=False)
-    k11 = tlx.amd_scheduled_mfma(kl1, kr1, k11, accumulator_role="persistent", pin_operands=False)
+    k01 = tlx.amd_scheduled_mfma(kl0, kr1, k01, accumulator_role="persistent", resident_operand="unconstrained")
+    k11 = tlx.amd_scheduled_mfma(kl1, kr1, k11, accumulator_role="persistent", resident_operand="unconstrained")
     v02 = tlx.amd_scheduled_mfma(vl0, vr2, v02, accumulator_role="transient")
     v12 = tlx.amd_scheduled_mfma(vl1, vr2, v12, accumulator_role="transient")
-    k02 = tlx.amd_scheduled_mfma(kl0, kr2, k02, accumulator_role="persistent", pin_operands=False)
-    k12 = tlx.amd_scheduled_mfma(kl1, kr2, k12, accumulator_role="persistent", pin_operands=False)
+    k02 = tlx.amd_scheduled_mfma(kl0, kr2, k02, accumulator_role="persistent", resident_operand="unconstrained")
+    k12 = tlx.amd_scheduled_mfma(kl1, kr2, k12, accumulator_role="persistent", resident_operand="unconstrained")
     ds1 = tlx.local_load(tlx.local_slice(prev_ds, [0, 32], [16, 32]), layout=DS_MD_LAYOUT, relaxed=True)
     v03 = tlx.amd_scheduled_mfma(vl0, vr3, v03, accumulator_role="transient")
     v13 = tlx.amd_scheduled_mfma(vl1, vr3, v13, accumulator_role="transient")
-    k03 = tlx.amd_scheduled_mfma(kl0, kr3, k03, accumulator_role="persistent", pin_operands=False)
-    k13 = tlx.amd_scheduled_mfma(kl1, kr3, k13, accumulator_role="persistent", pin_operands=False)
+    k03 = tlx.amd_scheduled_mfma(kl0, kr3, k03, accumulator_role="persistent", resident_operand="unconstrained")
+    k13 = tlx.amd_scheduled_mfma(kl1, kr3, k13, accumulator_role="persistent", resident_operand="unconstrained")
     row0 = tl.cat(tl.cat(v00, v01, dim=1), tl.cat(v02, v03, dim=1), dim=1)
     row1 = tl.cat(tl.cat(v10, v11, dim=1), tl.cat(v12, v13, dim=1), dim=1)
     new_dv = tlx.require_layout(tl.cat(row0, row1, dim=0), MMA_ND, pin=False)

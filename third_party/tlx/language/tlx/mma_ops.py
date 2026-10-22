@@ -139,7 +139,6 @@ def amd_scheduled_mfma(
     resident_operand: tl.constexpr = None,
     accumulator_register_class: tl.constexpr = None,
     initialize: tl.constexpr = False,
-    pin_operands: tl.constexpr = True,
     _semantic=None,
 ):
     """Update native CDNA3/CDNA4 MFMA fragments with explicit lifetime contracts.
@@ -180,13 +179,14 @@ def amd_scheduled_mfma(
       functions with remaining calls conservatively complete every persistent
       result at its pin, including unused fragments.
 
-    Input register classes are a separate operand-placement control, which
-    only the persistent path applies. ``resident_operand=0`` or ``1`` selects
-    the left or right input for AGPR placement; other inputs use VGPRs.
-    ``pin_operands=False`` omits these input constraints and leaves input
-    placement to LLVM; it does not change either guarantee above. An input pin
-    consumes its operand, so pinning an operand loaded from shared memory makes
-    LLVM wait for that load at the pin instead of at the MFMA.
+    ``resident_operand`` is a separate operand-placement control, which only
+    the persistent path applies. It does not change either guarantee above.
+    ``None`` constrains both inputs to VGPRs. ``0`` or ``1`` constrains the
+    left or right input to AGPRs and the other input to VGPRs.
+    ``"unconstrained"`` adds no input constraints and leaves input placement
+    to LLVM. An input constraint consumes its operand, so constraining an
+    operand loaded from shared memory makes LLVM wait for that load at the
+    constraint instead of at the MFMA.
 
     Functions containing persistent MFMAs also prefix nonempty opaque inline
     assembly with the largest required completion delay in that function. This
@@ -220,17 +220,15 @@ def amd_scheduled_mfma(
     initialize = tl._unwrap_if_constexpr(initialize)
     assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), ("a and b must be distributed tensors")
     assert isinstance(acc, tl.tensor), "acc must be a distributed tensor"
-    assert resident_operand is None or (isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
-                                        and resident_operand in (0, 1)), "resident_operand must be None, 0, or 1"
+    assert resident_operand is None or resident_operand == "unconstrained" or (
+        isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
+        and resident_operand in (0, 1)), 'resident_operand must be None, 0, 1, or "unconstrained"'
     assert accumulator_role in ("transient",
                                 "persistent"), ('accumulator_role must be either "transient" or "persistent"')
     assert accumulator_register_class in (None, "agpr",
                                           "vgpr"), ("accumulator_register_class must be None, \"agpr\", or \"vgpr\"")
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
-    pin_operands = tl._unwrap_if_constexpr(pin_operands)
-    assert isinstance(pin_operands, bool), "pin_operands must be a constexpr bool"
-    assert pin_operands or resident_operand is None, "pin_operands=False requires resident_operand=None"
-    resident_role = {None: "none", 0: "lhs", 1: "rhs"}[resident_operand] if pin_operands else "unconstrained"
+    resident_role = {None: "none", 0: "lhs", 1: "rhs", "unconstrained": "unconstrained"}[resident_operand]
     accumulator_class = ("auto" if accumulator_register_class is None else accumulator_register_class)
     handle = _semantic.builder.create_amd_scheduled_mfma(
         a.handle,
