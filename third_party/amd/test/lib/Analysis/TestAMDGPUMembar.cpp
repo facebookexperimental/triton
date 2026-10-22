@@ -1,5 +1,6 @@
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Analysis/Allocation.h"
@@ -20,12 +21,17 @@ struct TestAMDGPUMembarPass
            "backend";
   }
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<LLVM::LLVMDialect>();
+  }
+
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
     triton::AMD::annotateLocalLoadsSyncedViaAsyncWait(moduleOp);
     // Print all ops after membar pass
     ModuleAllocation allocation(moduleOp);
-    ModuleMembarAnalysis membarPass(allocation, triton::AMD::membarFilter);
+    ModuleMembarAnalysis membarPass(allocation, triton::AMD::membarFilter,
+                                    triton::AMD::getWarpLocalScratchSync());
     membarPass.run();
   }
 };
