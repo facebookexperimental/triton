@@ -392,3 +392,32 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+// CHECK-DAG: #[[$PREEXISTING_TTG_PADDING:.*]] = #ttg.padded_shared<[512:+32]
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @preexisting_ttg_require_preserves_direct_lds_padding
+  tt.func public @preexisting_ttg_require_preserves_direct_lds_padding(
+      %ptrs: tensor<64x64x!tt.ptr<bf16>, #blocked>,
+      %lhs: tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>,
+      %acc: tensor<256x64xf32, #mma>) -> tensor<256x64xf32, #mma> {
+    %c0 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x64x64xbf16, #shared, #smem, mutable>
+    // CHECK: %[[BOUNDARY_BUF:.*]] = ttg.memdesc_index
+    %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<1x64x64xbf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>
+    %tok = ttg.async_copy_global_to_local %ptrs, %buf {contiguity = 8 : i32} : tensor<64x64x!tt.ptr<bf16>, #blocked> -> <64x64xbf16, #shared, #smem, mutable>
+    // CHECK: %[[BOUNDARY_MEM:.*]] = tlx.require_layout %[[BOUNDARY_BUF]] : !ttg.memdesc<64x64xbf16, #{{.*}}, #smem, mutable> -> !ttg.memdesc<64x64xbf16, #[[$PREEXISTING_TTG_PADDING]], #smem, mutable>
+    // CHECK-NEXT: %[[BOUNDARY_LOAD:.*]] = ttg.local_load %[[BOUNDARY_MEM]]
+    %rhs = ttg.local_load %buf : !ttg.memdesc<64x64xbf16, #shared, #smem, mutable> -> tensor<64x64xbf16, #blocked>
+    // CHECK-NEXT: %[[BOUNDARY_DOT:.*]] = ttg.require_layout %[[BOUNDARY_LOAD]]
+    %rhs_dot = ttg.require_layout %rhs : tensor<64x64xbf16, #blocked> -> tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+    // CHECK-NEXT: tt.dot %{{.*}}, %[[BOUNDARY_DOT]], %{{.*}}
+    %dot = tt.dot %lhs, %rhs_dot, %acc : tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> * tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<256x64xf32, #mma>
+    tt.return %dot : tensor<256x64xf32, #mma>
+  }
+}
