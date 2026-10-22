@@ -87,6 +87,47 @@ def _compute_k_tile_range(tile_id, num_mn_tiles, k_tiles_total, SPLIT_K: tl.cons
 
 
 @triton.jit
+def _issue_k_step_mmas(
+    a_operand,
+    buffers_B,
+    buf,
+    acc,
+    release_bar,
+    USE_ACC: tl.constexpr,
+    TWO_CTAS: tl.constexpr,
+    B_ROW_MAJOR: tl.constexpr,
+    buffers_B_tail,
+    acc_tail,
+    N_TAIL: tl.constexpr,
+    buffers_B_tail2,
+    acc_tail2,
+    N_TAIL2: tl.constexpr,
+):
+    """One K step of a tile whose N is split into pieces BLOCK_N0 [+ N_TAIL [+ N_TAIL2]].
+
+    Each N piece is its own MMA. Only the last carries ``release_bar``:
+    tcgen05 MMAs complete in issue order, so it covers every piece.
+    """
+    b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
+    if N_TAIL == 0:
+        tlx.async_dot(a_operand, b_operand, acc, use_acc=USE_ACC, mBarriers=[release_bar], two_ctas=TWO_CTAS,
+                      out_dtype=tl.float32)
+    else:
+        tlx.async_dot(a_operand, b_operand, acc, use_acc=USE_ACC, two_ctas=TWO_CTAS, out_dtype=tl.float32,
+                      force_async=True)
+        b_tail = tlx.local_trans(buffers_B_tail[buf]) if not B_ROW_MAJOR else buffers_B_tail[buf]
+        if N_TAIL2 == 0:
+            tlx.async_dot(a_operand, b_tail, acc_tail, use_acc=USE_ACC, mBarriers=[release_bar], two_ctas=TWO_CTAS,
+                          out_dtype=tl.float32)
+        else:
+            tlx.async_dot(a_operand, b_tail, acc_tail, use_acc=USE_ACC, two_ctas=TWO_CTAS, out_dtype=tl.float32,
+                          force_async=True)
+            b_tail2 = tlx.local_trans(buffers_B_tail2[buf]) if not B_ROW_MAJOR else buffers_B_tail2[buf]
+            tlx.async_dot(a_operand, b_tail2, acc_tail2, use_acc=USE_ACC, mBarriers=[release_bar], two_ctas=TWO_CTAS,
+                          out_dtype=tl.float32)
+
+
+@triton.jit
 def _process_tile_mma_inner(
     k_tile_start,
     k_tile_end,
@@ -111,6 +152,12 @@ def _process_tile_mma_inner(
     B_ROW_MAJOR: tl.constexpr = True,
     EXPLICIT_CTA_SYNC: tl.constexpr = False,
     pair_cta_base=0,
+    buffers_B_tail=None,
+    tmem_buffers_tail=None,
+    N_TAIL: tl.constexpr = 0,
+    buffers_B_tail2=None,
+    tmem_buffers_tail2=None,
+    N_TAIL2: tl.constexpr = 0,
 ):
     """Run one tile's MMA pipeline for either persistent scheduling shell.
 
@@ -118,6 +165,10 @@ def _process_tile_mma_inner(
     TorchTLX's static persistent shell retains its explicit CTA rendezvous and
     completion arrivals.  ``EXPLICIT_CTA_SYNC`` specializes those protocol
     differences away while sharing the actual tile pipeline.
+
+    A non-power-of-two tile N is split into power-of-two pieces: the main
+    piece plus ``N_TAIL`` (and ``N_TAIL2``) wide pieces with their own B and
+    accumulator buffers, one MMA per piece per K step (``_issue_k_step_mmas``).
     """
     local_k_tiles = k_tile_end - k_tile_start
     buf, phase = get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
@@ -143,15 +194,21 @@ def _process_tile_mma_inner(
             tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
         a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
-        b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
-        tlx.async_dot(
+        _issue_k_step_mmas(
             a_operand,
-            b_operand,
+            buffers_B,
+            buf,
             tmem_buffers[acc_buf],
-            use_acc=False,
-            mBarriers=[A_smem_empty_bars[a_buf]],
-            two_ctas=NUM_CTAS == 2,
-            out_dtype=tl.float32,
+            A_smem_empty_bars[a_buf],
+            False,
+            NUM_CTAS == 2,
+            B_ROW_MAJOR,
+            buffers_B_tail,
+            tmem_buffers_tail[acc_buf] if N_TAIL > 0 else None,
+            N_TAIL,
+            buffers_B_tail2,
+            tmem_buffers_tail2[acc_buf] if N_TAIL2 > 0 else None,
+            N_TAIL2,
         )
 
     smem_accum_cnt += 1
@@ -180,15 +237,21 @@ def _process_tile_mma_inner(
                 tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
             a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
-            b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
-            tlx.async_dot(
+            _issue_k_step_mmas(
                 a_operand,
-                b_operand,
+                buffers_B,
+                buf,
                 tmem_buffers[acc_buf],
-                use_acc=True,
-                mBarriers=[A_smem_empty_bars[a_buf]],
-                two_ctas=NUM_CTAS == 2,
-                out_dtype=tl.float32,
+                A_smem_empty_bars[a_buf],
+                True,
+                NUM_CTAS == 2,
+                B_ROW_MAJOR,
+                buffers_B_tail,
+                tmem_buffers_tail[acc_buf] if N_TAIL > 0 else None,
+                N_TAIL,
+                buffers_B_tail2,
+                tmem_buffers_tail2[acc_buf] if N_TAIL2 > 0 else None,
+                N_TAIL2,
             )
 
         smem_accum_cnt += 1
@@ -303,16 +366,31 @@ def _process_tile_producer_inner(
     MULTICAST_A: tl.constexpr = False,
     CLUSTER_N: tl.constexpr = 1,
     num_pid_n=None,
+    b_tail_desc=None,
+    buffers_B_tail=None,
+    N_TAIL: tl.constexpr = 0,
+    b_tail2_desc=None,
+    buffers_B_tail2=None,
+    N_TAIL2: tl.constexpr = 0,
 ):
-    """Load one tile's operands for either persistent scheduling shell."""
+    """Load one tile's operands for either persistent scheduling shell.
+
+    ``BLOCK_SIZE_N`` is the tile's main power-of-two N piece. With ``N_TAIL``
+    (and ``N_TAIL2``) > 0 each K step also loads those B pieces (the columns
+    after the main piece) onto the same full barrier as B.
+    """
     mn_tile_id = tile_id if SPLIT_K == 1 else tile_id % num_mn_tiles
     pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, CLUSTER_N, num_pid_n)
     dsize: tl.constexpr = tlx.size_of(tlx.dtype_of(b_desc))
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
     # Pair-relative N-half: identical for (2,1)/(1,1); ranks 0..3 split the
     # same halves within each MMA pair under (2,2).
-    offs_bn = pid_n * BLOCK_SIZE_N + (cluster_cta_rank % 2) * (BLOCK_SIZE_N // NUM_CTAS)
-    b_expected_bytes: tl.constexpr = dsize * BLOCK_SIZE_N * BLOCK_SIZE_K // NUM_CTAS
+    pair_rank = cluster_cta_rank % 2
+    BLOCK_N_TILE: tl.constexpr = BLOCK_SIZE_N + N_TAIL + N_TAIL2
+    offs_bn = pid_n * BLOCK_N_TILE + pair_rank * (BLOCK_SIZE_N // NUM_CTAS)
+    offs_bn_tail = pid_n * BLOCK_N_TILE + BLOCK_SIZE_N + pair_rank * (N_TAIL // NUM_CTAS)
+    offs_bn_tail2 = pid_n * BLOCK_N_TILE + BLOCK_SIZE_N + N_TAIL + pair_rank * (N_TAIL2 // NUM_CTAS)
+    b_expected_bytes: tl.constexpr = dsize * BLOCK_N_TILE * BLOCK_SIZE_K // NUM_CTAS
     a_expected_bytes: tl.constexpr = dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K
     use_multicast: tl.constexpr = MULTICAST_TMA and NUM_CTAS == 2
     use_mcast_a: tl.constexpr = MULTICAST_A and NUM_CTAS == 2
@@ -341,6 +419,32 @@ def _process_tile_producer_inner(
                 use_multicast,
                 not B_ROW_MAJOR,
             )
+            if N_TAIL > 0:
+                _expect_and_load(
+                    b_tail_desc,
+                    buffers_B_tail[buf],
+                    offs_k,
+                    offs_bn_tail,
+                    A_smem_full_bars[buf],
+                    0,
+                    is_leader,
+                    use_multicast,
+                    not B_ROW_MAJOR,
+                    EXPECT_BYTES=False,
+                )
+            if N_TAIL2 > 0:
+                _expect_and_load(
+                    b_tail2_desc,
+                    buffers_B_tail2[buf],
+                    offs_k,
+                    offs_bn_tail2,
+                    A_smem_full_bars[buf],
+                    0,
+                    is_leader,
+                    use_multicast,
+                    not B_ROW_MAJOR,
+                    EXPECT_BYTES=False,
+                )
             _expect_and_load(
                 a_desc,
                 buffers_A[buf],
@@ -383,6 +487,32 @@ def _process_tile_producer_inner(
                 use_multicast,
                 not B_ROW_MAJOR,
             )
+            if N_TAIL > 0:
+                _expect_and_load(
+                    b_tail_desc,
+                    buffers_B_tail[buf],
+                    offs_k,
+                    offs_bn_tail,
+                    B_smem_full_bars[buf],
+                    0,
+                    is_leader,
+                    use_multicast,
+                    not B_ROW_MAJOR,
+                    EXPECT_BYTES=False,
+                )
+            if N_TAIL2 > 0:
+                _expect_and_load(
+                    b_tail2_desc,
+                    buffers_B_tail2[buf],
+                    offs_k,
+                    offs_bn_tail2,
+                    B_smem_full_bars[buf],
+                    0,
+                    is_leader,
+                    use_multicast,
+                    not B_ROW_MAJOR,
+                    EXPECT_BYTES=False,
+                )
 
             for group_id in tl.static_range(1, NUM_MMA_GROUPS):
                 a_buf = group_id * NUM_SMEM_BUFFERS + buf
