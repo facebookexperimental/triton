@@ -1306,15 +1306,15 @@ public:
   }
 };
 
-class RegisterHandoffOpConversion
-    : public ConvertOpToLLVMPattern<triton::amdgpu::RegisterHandoffOp> {
+class RegisterClassAnchorOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::RegisterClassAnchorOp> {
 public:
   using ConvertOpToLLVMPattern<
-      triton::amdgpu::RegisterHandoffOp>::ConvertOpToLLVMPattern;
-  using OpAdaptor = triton::amdgpu::RegisterHandoffOp::Adaptor;
+      triton::amdgpu::RegisterClassAnchorOp>::ConvertOpToLLVMPattern;
+  using OpAdaptor = triton::amdgpu::RegisterClassAnchorOp::Adaptor;
 
   LogicalResult
-  matchAndRewrite(triton::amdgpu::RegisterHandoffOp op, OpAdaptor adaptor,
+  matchAndRewrite(triton::amdgpu::RegisterClassAnchorOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto *ctx = rewriter.getContext();
@@ -2067,7 +2067,7 @@ void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
                                                   benefit.getBenefit() + 1);
   patterns.add<RematerializedRangeOpConversion>(typeConverter, targetInfo,
                                                 transBenefit);
-  patterns.add<RegisterResidentOpConversion, RegisterHandoffOpConversion>(
+  patterns.add<RegisterResidentOpConversion, RegisterClassAnchorOpConversion>(
       typeConverter, transBenefit);
   patterns.add<MfmaCommitOpConversion, ScheduledMfmaOpConversion>(
       typeConverter, targetInfo, transBenefit);
