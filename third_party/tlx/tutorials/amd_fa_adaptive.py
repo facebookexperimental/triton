@@ -1661,6 +1661,7 @@ def _prepare_output(q, k, v, out):
 
 def _build_launch_options(batch, heads, sequence, sm_scale, log2_score_bound, adaptive_reference, compiler_options):
     return {
+        "disable_packed_fp32_ops": True,
         **compiler_options,
         "N_CTX": sequence,
         "BATCH": batch,
