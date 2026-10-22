@@ -141,6 +141,128 @@ def test_hstu_cross_attn_gqa(heads_kv):
 
 
 @requires_gfx950
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_softmax_heads", [0, 2])
+@pytest.mark.parametrize(
+    "lengths_kv,lengths_q",
+    [
+        # Fewer (q tile, KV block) units than CUs: most programs get no work.
+        ([256, 100, 64, 0], [128, 31, 64, 5]),
+        # Tiles split across programs, ranges spanning several tiles, empty q and KV sequences.
+        ([3000, 0, 1500, 640, 2048, 33], [700, 300, 0, 513, 1024, 256]),
+        # Enough q tiles that the partition charges each one a fixed cost.
+        ([512] * 64, [800] * 64),
+    ],
+)
+def test_hstu_cross_attn_stream_k(dtype, num_softmax_heads, lengths_kv, lengths_q, monkeypatch):
+    from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k, gfx950
+
+    calls = []
+    stream_k_fwd = gfx950.stream_k_fwd
+    monkeypatch.setattr(gfx950, "stream_k_fwd", lambda *args: calls.append(args) or stream_k_fwd(*args))
+    torch.manual_seed(1021)
+    _run(lengths_kv, lengths_q, heads=2, num_softmax_heads=num_softmax_heads, dtype=dtype,
+         check_backward=num_softmax_heads > 0)
+    assert calls
+    # Every raised handoff flag is reset by the program that consumes it, so the next launch starts clean.
+    for flags in _forward_stream_k._FLAGS.values():
+        assert int(flags.abs().sum()) == 0
+
+
+def _inference_inputs(lengths_kv, lengths_q, heads=2, dim=128, dtype=torch.bfloat16):
+    device = torch.device("cuda")
+    seq_offsets = _offsets(torch.tensor(lengths_kv, device=device))
+    seq_offsets_q = _offsets(torch.tensor(lengths_q, device=device))
+
+    def rand(total):
+        return torch.empty((total, heads, dim), dtype=dtype, device=device).uniform_(-0.1, 0.1)
+
+    max_kv_len, max_q_len = max(lengths_kv), max(lengths_q)
+    attn_scale = torch.tensor(1.0 / (max_kv_len + max_q_len), device=device)
+    return dict(q=rand(int(seq_offsets_q[-1])), k=rand(int(seq_offsets[-1])), v=rand(int(seq_offsets[-1])),
+                seq_offsets=seq_offsets, seq_offsets_q=seq_offsets_q, max_seq_len=max_kv_len, max_q_len=max_q_len,
+                attn_scale=attn_scale, alpha=dim**-0.5, num_softmax_heads=heads)
+
+
+@requires_gfx950
+def test_hstu_cross_attn_stream_k_cuda_graphs():
+    # Graphs captured on the shared default capture stream each take their own flags, not the eager cache's.
+    from triton.tlx.ops import hstu_cross_attn
+    from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k
+
+    torch.manual_seed(1031)
+    inputs = [_inference_inputs([3000, 1500, 640], [700, 513, 256]), _inference_inputs([512] * 8, [800] * 8)]
+    with torch.inference_mode():
+        eager = [hstu_cross_attn(**a).clone() for a in inputs]
+        cached = set(_forward_stream_k._FLAGS)
+        graphs, outs = [], []
+        for a in inputs:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outs.append(hstu_cross_attn(**a))
+            graphs.append(graph)
+        assert set(_forward_stream_k._FLAGS) == cached
+        for _ in range(3):
+            for graph in graphs:
+                graph.replay()
+        torch.cuda.synchronize()
+    for out, ref in zip(outs, eager):
+        assert torch.equal(out, ref)
+
+
+@requires_gfx950
+def test_hstu_cross_attn_no_grad_matches_autograd():
+    from triton.tlx.ops import hstu_cross_attn
+
+    torch.manual_seed(1033)
+    a = _inference_inputs([256, 100, 64], [128, 31, 64])
+    for name in ("q", "k", "v"):
+        a[name].requires_grad_()
+    with_grad = hstu_cross_attn(**a)
+    with torch.no_grad():
+        without_grad = hstu_cross_attn(**a)
+    assert with_grad.grad_fn is not None and without_grad.grad_fn is None
+    assert torch.equal(with_grad.detach(), without_grad)
+
+
+@requires_gfx950
+def test_hstu_cross_attn_fwd_kernels_read_no_module_globals():
+    # A module global read by a kernel (or anything it calls) keeps every launch off the C launch fast path.
+    from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k, gfx950
+
+    for kernel in (gfx950._tlx_gfx950_cross_attn_fwd.curated.fn, gfx950._tlx_gfx950_cross_attn_fwd_split_kv.curated.fn,
+                   _forward_stream_k._hstu_cross_attn_fwd_stream_k):
+        kernel.cache_key
+        assert not kernel.used_global_vals, sorted(name for name, _ in kernel.used_global_vals)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("stream_k", [True, False])
+def test_hstu_cross_attn_fwd_launches_take_the_c_fast_path(stream_k, monkeypatch):
+    # Repeat launches resolved by the C launch path never reach the kernel's Python `run`.
+    from triton.tlx.ops import hstu_cross_attn
+    from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k, gfx950
+
+    monkeypatch.setenv(gfx950.STREAM_K_ENV, "1" if stream_k else "0")
+    monkeypatch.setenv(gfx950.KV_SPLITS_ENV, "1")
+    kernel = _forward_stream_k._hstu_cross_attn_fwd_stream_k if stream_k else gfx950._tlx_gfx950_cross_attn_fwd.curated.fn
+    runs = []
+    run = kernel.run
+    monkeypatch.setattr(kernel, "run", lambda *args, **kwargs: runs.append(1) or run(*args, **kwargs))
+    # A launch proxy binds `run` when it is created; start from none so the new ones fall back to the counter.
+    monkeypatch.setattr(kernel, "_jit_proxy_cache", {}, raising=False)
+    torch.manual_seed(1037)
+    a = _inference_inputs([256, 100, 64], [128, 31, 64])
+    with torch.inference_mode():
+        for _ in range(2):
+            hstu_cross_attn(**a)
+        runs.clear()
+        for _ in range(3):
+            hstu_cross_attn(**a)
+    assert not runs
+
+
+@requires_gfx950
 @pytest.mark.parametrize("splits", [2, 3, 8])
 @pytest.mark.parametrize("num_softmax_heads", [0, 1, 2])
 def test_hstu_cross_attn_split_kv(splits, num_softmax_heads, monkeypatch):
@@ -149,6 +271,7 @@ def test_hstu_cross_attn_split_kv(splits, num_softmax_heads, monkeypatch):
     # per chunk, and the backward reads the merged M.
     from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
 
+    monkeypatch.setenv(gfx950.STREAM_K_ENV, "0")
     monkeypatch.setenv(gfx950.KV_SPLITS_ENV, str(splits))
     torch.manual_seed(1009)
     _run([0, 5, 64, 100, 257, 640, 1000], [3, 17, 64, 65, 128, 129, 200], heads=2, num_softmax_heads=num_softmax_heads,
@@ -229,6 +352,7 @@ def test_hstu_cross_attn_each_curated_config_is_correct(index, splits, num_softm
     for kernel in (xa._tlx_gfx950_cross_attn_fwd, xa._tlx_gfx950_cross_attn_fwd_split_kv):
         monkeypatch.setattr(kernel.curated, "configs", [curated[index]])
         monkeypatch.setattr(kernel.curated, "cache", {})
+    monkeypatch.setenv(xa.STREAM_K_ENV, "0")
     monkeypatch.setenv(xa.KV_SPLITS_ENV, str(splits))
     torch.manual_seed(1013)
     _run([0, 5, 64, 100, 257, 640, 1000], [3, 17, 64, 65, 128, 129, 200], heads=2, num_softmax_heads=num_softmax_heads,

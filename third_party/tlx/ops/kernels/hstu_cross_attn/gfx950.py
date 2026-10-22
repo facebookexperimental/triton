@@ -131,6 +131,7 @@ import triton.language.extra.tlx as tlx
 from ._backward_pipeline import _tlx_gfx950_cross_attn_v3_ttgir_bwd
 from ._backward_small import coarse_softmax_backward, compact_softmax_backward, small_softmax_backward
 from ._backward_retained import retained_softmax_backward
+from ._forward_stream_k import stream_k_fwd, stream_k_supported
 from ..hstu_attn._stubs import triton_autotune
 from ..hstu_attn._util import (
     backward_softmax_activation_scaled_alpha,
@@ -174,6 +175,11 @@ def next_power_of_2(n: int) -> int:
     n |= n >> 32
     n += 1
     return n
+
+
+def cdiv(x: int, y: int) -> int:
+    # `triton.cdiv` is a constexpr function, ~0.7 us per host call; forward launches pay it several times.
+    return (x + y - 1) // y
 
 
 def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
@@ -250,12 +256,12 @@ def _space_autotune(configs, smoke_configs, key, curated_prune=None):
 
 # MI300X/MI350X expose 8 XCDs; round-robin pid assignment across them hurts L2
 # reuse, so tiles are re-grouped to be contiguous within an XCD.
-NUM_XCDS: tl.constexpr = tl.constexpr(8)
+NUM_XCDS: int = 8
 # Grouping hands each XCD whole (sequence, head) pairs, so with few pairs one
 # long sequence sets the time for its XCD while the others idle. Measured on
 # MI350X: at Z*H <= 32 the regrouped grid is up to 2.3x slower than the
 # round-robin one, at Z*H >= 64 it is up to 1.45x faster.
-MIN_PAIRS_PER_XCD_FOR_REMAP: tl.constexpr = tl.constexpr(8)
+MIN_PAIRS_PER_XCD_FOR_REMAP: int = 8
 
 # `autotune_max_seq_len` is the wrong quantizer for the q-length autotune key:
 # its runtime path is `prev_power_of_2`, which rounds *down* and so merges
@@ -299,17 +305,21 @@ KV_SPLIT_NOMINAL_BLOCK_M: int = 128
 # `auto` (default) uses the heuristic below; an integer forces that many splits
 # (1 disables). For benchmarking and A/B tests.
 KV_SPLITS_ENV: str = "TLX_HSTU_CROSS_ATTN_KV_SPLITS"
+# Forwards that `stream_k_supported` accepts (non-causal, untruncated, separate K/V, head dim 128, at most 64
+# sequences, all or no softmax heads) take the persistent stream-K kernel in `_forward_stream_k`; "0" keeps them
+# on the tiled kernel. For benchmarking and A/B tests.
+STREAM_K_ENV: str = "TLX_HSTU_CROSS_ATTN_STREAM_K"
 
 # Below the XCD regroup threshold, launch the tiles of the longest-KV
 # sequences first (longest-processing-time order): with ~3 waves of tiles of
 # uneven length, launching in sequence order leaves CUs idle behind the long
 # sequences at the end. Each program ranks the Z KV lengths itself, so the
-# kernel signature is unchanged; needs Z <= SEQ_SORT_MAX_Z. Read once at import.
-SEQ_SORT_MAX_Z: tl.constexpr = tl.constexpr(64)
+# launch takes no permutation; needs Z <= SEQ_SORT_MAX_Z. Read once at import.
+SEQ_SORT_MAX_Z: int = 64
 # Only with ~2+ waves of programs, where the end-of-launch tail matters; on
 # small launches the ranking is pure overhead (~2% on the production shape).
-SEQ_SORT_MIN_PROGRAMS: tl.constexpr = tl.constexpr(512)
-FWD_SORT_BY_KV: tl.constexpr = tl.constexpr(os.environ.get("TLX_HSTU_CROSS_ATTN_SORT_BY_KV", "1") == "1")
+SEQ_SORT_MIN_PROGRAMS: int = 512
+FWD_SORT_BY_KV: bool = os.environ.get("TLX_HSTU_CROSS_ATTN_SORT_BY_KV", "1") == "1"
 
 
 @functools.lru_cache(maxsize=None)
@@ -337,11 +347,11 @@ def _num_kv_splits(
     # with many short-q sequences (training: 1024 x 2 pairs, mean q ~16) the
     # q-token estimate alone undercounts the tiles ~8x and splits a launch
     # that already fills the GPU (3 splits there cost 11%).
-    tiles = max(triton.cdiv(total_q, KV_SPLIT_NOMINAL_BLOCK_M), Z) * H
+    tiles = max(cdiv(total_q, KV_SPLIT_NOMINAL_BLOCK_M), Z) * H
     if tiles >= KV_SPLIT_MIN_TILE_WAVES * num_cus:
         return 1
     splits = min(
-        triton.cdiv(KV_SPLIT_TARGET_ITEMS_PER_CU * num_cus, tiles),
+        cdiv(KV_SPLIT_TARGET_ITEMS_PER_CU * num_cus, tiles),
         (total_kv // Z) // KV_SPLIT_MIN_KV_PER_SPLIT,
         KV_SPLIT_MAX_SPLITS,
     )
@@ -365,17 +375,17 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr):
 
 
 @triton.jit
-def _seq_by_kv_rank(rank, Z, seq_offsets):
+def _seq_by_kv_rank(rank, Z, seq_offsets, MAX_Z: tl.constexpr):
     """Index of the sequence with the `rank`-th longest KV (ties by index).
 
-    One scalar pass over the Z lengths with a SEQ_SORT_MAX_Z-wide vector of
+    One scalar pass over the Z lengths with a MAX_Z-wide vector of
     ranks; a Z x Z comparison tile costs enough registers to slow the main
     loop of the register-tight configs.
     """
-    idx = tl.arange(0, SEQ_SORT_MAX_Z)
+    idx = tl.arange(0, MAX_Z)
     valid = idx < Z
     length = tl.load(seq_offsets + idx + 1, mask=valid, other=0) - tl.load(seq_offsets + idx, mask=valid, other=0)
-    ranks = tl.zeros([SEQ_SORT_MAX_Z], dtype=tl.int32)
+    ranks = tl.zeros([MAX_Z], dtype=tl.int32)
     for j in range(Z):
         length_j = tl.load(seq_offsets + j + 1) - tl.load(seq_offsets + j)
         ahead = (length_j > length) | ((length_j == length) & (j < idx))
@@ -1413,23 +1423,30 @@ def _tlx_gfx950_cross_attn_fwd(
     TRUNCATE_METHOD: tl.constexpr,
     HAS_CAUSAL: tl.constexpr,
     HAS_NUM_TARGETS: tl.constexpr,
+    # Tile order, passed at launch: reading the module constants here would keep every launch off the C launch
+    # fast path.
+    XCDS: tl.constexpr,
+    MIN_PAIRS_PER_XCD: tl.constexpr,
+    SORT_BY_KV: tl.constexpr,
+    SORT_MAX_Z: tl.constexpr,
+    SORT_MIN_PROGRAMS: tl.constexpr,
 ):
     # 1-D grid so tiles can be regrouped per XCD. The 2-D (m_tile, Z*H) launch
     # this replaces hands consecutive tiles to different XCDs, which scatters
     # workgroups that share K/V across all 8 L2s.
     tpid = tl.program_id(0)
     num_tiles = tl.cdiv(MAX_Q_LEN, BLOCK_M)
-    if Z * H >= MIN_PAIRS_PER_XCD_FOR_REMAP * NUM_XCDS:
-        tpid = remap_xcd(tpid, num_tiles * Z * H, NUM_XCDS)
+    if Z * H >= MIN_PAIRS_PER_XCD * XCDS:
+        tpid = remap_xcd(tpid, num_tiles * Z * H, XCDS)
     off_h = tpid % H
     off_nz = tpid // H
     start_m = (off_nz % num_tiles) * BLOCK_M
     off_z = off_nz // num_tiles
-    if FWD_SORT_BY_KV:
-        if Z * H < MIN_PAIRS_PER_XCD_FOR_REMAP * NUM_XCDS:
-            if Z <= SEQ_SORT_MAX_Z:
-                if num_tiles * Z * H >= SEQ_SORT_MIN_PROGRAMS:
-                    off_z = _seq_by_kv_rank(off_z, Z, seq_offsets)
+    if SORT_BY_KV:
+        if Z * H < MIN_PAIRS_PER_XCD * XCDS:
+            if Z <= SORT_MAX_Z:
+                if num_tiles * Z * H >= SORT_MIN_PROGRAMS:
+                    off_z = _seq_by_kv_rank(off_z, Z, seq_offsets, SORT_MAX_Z)
     (
         off_h_kv,
         seq_start_kv,
@@ -1805,7 +1822,7 @@ def _tlx_gfx950_cross_attn_fwd_split_kv_launch(
         dtype=torch.float32,
     )
     grid = lambda meta: (  # noqa E731
-        triton.cdiv(max_q_len, meta["BLOCK_M"]) * Z * H * num_splits, )
+        cdiv(max_q_len, meta["BLOCK_M"]) * Z * H * num_splits, )
     _tlx_gfx950_cross_attn_fwd_split_kv[grid](
         alpha=alpha,
         Z=Z,
@@ -1834,7 +1851,7 @@ def _tlx_gfx950_cross_attn_fwd_split_kv_launch(
         NUM_SPLITS=num_splits,
         MAX_Q_LEN=max_q_len,
         AUTOTUNE_Z=next_power_of_2(Z),
-        AUTOTUNE_MAX_Q_LEN=triton.cdiv(max_q_len, AUTOTUNE_Q_LEN_GRANULARITY) * AUTOTUNE_Q_LEN_GRANULARITY,
+        AUTOTUNE_MAX_Q_LEN=cdiv(max_q_len, AUTOTUNE_Q_LEN_GRANULARITY) * AUTOTUNE_Q_LEN_GRANULARITY,
         AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
         num_softmax_heads=num_softmax_heads,
         HEAD_DIM=DimQ,
@@ -1843,7 +1860,7 @@ def _tlx_gfx950_cross_attn_fwd_split_kv_launch(
         TRUNCATE_METHOD=truncate_method,
     )
     block_t = 32
-    _tlx_gfx950_cross_attn_split_kv_merge[(triton.cdiv(total_q, block_t), H)](
+    _tlx_gfx950_cross_attn_split_kv_merge[(cdiv(total_q, block_t), H)](
         PartAcc=part_acc,
         PartLse=part_lse,
         Out=out,
@@ -1915,7 +1932,7 @@ def tlx_gfx950_cross_attn_fwd(
         return out, M
 
     grid = lambda meta: (  # noqa E731
-        triton.cdiv(max_q_len, meta["BLOCK_M"]) * Z * H, )
+        cdiv(max_q_len, meta["BLOCK_M"]) * Z * H, )
 
     # Create M tensor for softmax heads if needed
     if num_softmax_heads > 0:
@@ -1923,6 +1940,13 @@ def tlx_gfx950_cross_attn_fwd(
     else:
         M = torch.empty(0, device=q.device, dtype=torch.float32)
         stride_mm = 0
+
+    num_cus = _num_cus(q.device.index if q.device.index is not None else 0)
+    if os.environ.get(STREAM_K_ENV, "1") == "1" and stream_k_supported(q, k, v, Z, num_softmax_heads, shared_kv, causal,
+                                                                       truncate_method, num_cus):
+        stream_k_fwd(q, k, v, seq_offsets, seq_offsets_q, alpha, attn_scale, G, out,
+                     M if num_softmax_heads > 0 else None, num_cus)
+        return out, M
 
     num_splits = _num_kv_splits(q.device, total_seq_len_q, k.shape[0], Z, H, causal or truncate_method != "none")
     if num_splits > 1:
@@ -1973,7 +1997,7 @@ def tlx_gfx950_cross_attn_fwd(
         num_targets=num_targets,
         MAX_Q_LEN=max_q_len,
         AUTOTUNE_Z=next_power_of_2(Z),
-        AUTOTUNE_MAX_Q_LEN=triton.cdiv(max_q_len, AUTOTUNE_Q_LEN_GRANULARITY) * AUTOTUNE_Q_LEN_GRANULARITY,
+        AUTOTUNE_MAX_Q_LEN=cdiv(max_q_len, AUTOTUNE_Q_LEN_GRANULARITY) * AUTOTUNE_Q_LEN_GRANULARITY,
         AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
         num_softmax_heads=num_softmax_heads,
         HEAD_DIM=DimQ,
@@ -1982,6 +2006,11 @@ def tlx_gfx950_cross_attn_fwd(
         TRUNCATE_METHOD=truncate_method,
         HAS_CAUSAL=causal,
         HAS_NUM_TARGETS=num_targets is not None,
+        XCDS=NUM_XCDS,
+        MIN_PAIRS_PER_XCD=MIN_PAIRS_PER_XCD_FOR_REMAP,
+        SORT_BY_KV=FWD_SORT_BY_KV,
+        SORT_MAX_Z=SEQ_SORT_MAX_Z,
+        SORT_MIN_PROGRAMS=SEQ_SORT_MIN_PROGRAMS,
     )
     return out, M
 
@@ -3418,7 +3447,6 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
                 "Split-softmax query lengths must fit max_q_len",
             )
 
-        ctx.bwd_variant = bwd_variant
         out, M = tlx_gfx950_cross_attn_fwd(
             max_seq_len=max_seq_len,
             alpha=alpha,
@@ -3437,7 +3465,10 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
             num_targets=num_targets,
             causal=causal,
         )
+        if ctx is None:
+            return out.view(total_seq_len_q, H, DimV)
 
+        ctx.bwd_variant = bwd_variant
         saved_tensors = [q, k, v, seq_offsets, attn_scale, seq_offsets_q]
         if num_softmax_heads > 0:
             saved_tensors.extend([M, out])
@@ -3641,7 +3672,7 @@ def tlx_gfx950_cross_attn_mha(
     # view while giving k and v distinct Python objects.
     if v is k:
         v = v.view(v.shape)
-    return _TlxGfx950CrossAttentionFunction.apply(
+    args = (
         max_seq_len,
         alpha,
         q,
@@ -3659,6 +3690,12 @@ def tlx_gfx950_cross_attn_mha(
         causal,
         bwd_variant,
     )
+    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or
+                                    (v is not None and v.requires_grad) or attn_scale.requires_grad):
+        return _TlxGfx950CrossAttentionFunction.apply(*args)
+    # With no gradient to compute, `autograd.Function.apply` and the backward setup are a large share of a short
+    # forward's host time; `forward` without a ctx skips both.
+    return _TlxGfx950CrossAttentionFunction.forward(None, *args)
 
 
 def tlx_gfx950_cross_attn_mha_wrapper(

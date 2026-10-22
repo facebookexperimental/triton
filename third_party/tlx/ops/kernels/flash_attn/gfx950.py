@@ -179,7 +179,9 @@ def _concat_cols(x0, x1):
 @triton.jit
 def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
     """Release the MFMA row sum to prevent repeated-RLC N8 relayouts."""
-    tl.static_assert(x.shape[0] == CDNA_MFMA_ROWS_PER_WAVE * tlx.num_warps())
+    # 32 is CDNA_MFMA_ROWS_PER_WAVE, written out: through SoftmaxState, kernels in other modules record this
+    # function's globals, and one would keep them off the C launch fast path.
+    tl.static_assert(x.shape[0] == 32 * tlx.num_warps())
     tl.static_assert(x.shape[1] % 4 == 0)
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
@@ -346,11 +348,13 @@ class SoftmaxState:
         return state, p_state, score_delta, advance
 
     @triton.jit
-    def vec1_lazy_max(self, qk, QK_SCALE: tl.constexpr):
+    def vec1_lazy_max(self, qk, QK_SCALE: tl.constexpr, THRESHOLD: tl.constexpr = LAZY_RESCALE_THRESHOLD):
         """Advance the lazy softmax frame while retaining the score tile."""
+        # A kernel that names SoftmaxState records the globals of all of its methods; one read here would keep every
+        # such kernel off the C launch fast path.
         m_ij = SoftmaxState._row_max(qk * QK_SCALE)
         score_delta = m_ij - self.m_i
-        advance = score_delta > LAZY_RESCALE_THRESHOLD
+        advance = score_delta > THRESHOLD
         m_new = tl.where(advance, m_ij, self.m_i)
         return SoftmaxState(self.acc, self.l_i, m_new), score_delta, advance
 
