@@ -204,10 +204,13 @@ def _attn_bwd_preprocess_kernel(
     DO,
     Delta,
     DQ_ACC,
+    LSE,
+    LSE_LOG2,
     N: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     ZERO_DQ: tl.constexpr,
+    SCALE_LSE: tl.constexpr,
 ):
     batch_head = tl.program_id(1)
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -224,9 +227,24 @@ def _attn_bwd_preprocess_kernel(
     tl.store(Delta + delta_base + rows, tl.sum(o * do, axis=1), mask=rows < N)
     if ZERO_DQ:
         tl.store(DQ_ACC + tensor_base + offsets, 0.0, mask=mask)
+    if SCALE_LSE:
+        lse_values = tl.load(LSE + delta_base + rows, mask=rows < N, other=0.0)
+        # Preserve the main kernel's scalar FP32 multiply and rounding boundary.
+        # This preprocess kernel contains no MFMA that requires an opaque drain.
+        lse_log2 = tl.inline_asm_elementwise(
+            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+            "=v,v",
+            [lse_values],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        tl.store(LSE_LOG2 + delta_base + rows, lse_log2, mask=rows < N)
 
 
-def _run_bwd_preprocess(o, do, delta, dq_acc=None):
+def _run_bwd_preprocess(o, do, delta, dq_acc=None, lse=None, lse_log2=None):
+    if (lse is None) != (lse_log2 is None):
+        raise ValueError("LSE preprocessing requires both input and output buffers")
     batch, heads, n_ctx, head_dim = o.shape
     block_m = 64
     grid = (triton.cdiv(n_ctx, block_m), batch * heads)
@@ -235,10 +253,13 @@ def _run_bwd_preprocess(o, do, delta, dq_acc=None):
         do,
         delta,
         dq_acc if dq_acc is not None else delta,
+        lse if lse is not None else delta,
+        lse_log2 if lse_log2 is not None else delta,
         N=n_ctx,
         D=head_dim,
         BLOCK_M=block_m,
         ZERO_DQ=dq_acc is not None,
+        SCALE_LSE=lse is not None,
         num_warps=4,
     )
 
@@ -583,6 +604,7 @@ def _attn_bwd_dkdv_d128_rect_impl(
         shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
         stride=((8, 16, 32, 64, 2048, 1024, 128, 256), (1, 2, 4, 512)),
     )
+    zero_qdo = tlx.require_layout(tl.zeros((BLOCK_M, D), tl.bfloat16), qdo_async_layout)
 
     first_m = tl.arange(0, BLOCK_M)
     first_mask = first_m[:, None] < N
@@ -606,9 +628,9 @@ def _attn_bwd_dkdv_d128_rect_impl(
         next_m = (m_block + 1) * BLOCK_M + tl.arange(0, BLOCK_M)
         next_mask = next_m[:, None] < N
         if ((m_block + 1) * BLOCK_M + BLOCK_M) > N:
-            # A masked direct-to-LDS copy leaves OOB rows untouched. Clear the
-            # reused slot before issuing the final partial Q/dO tile so the
-            # score/dP products cannot observe stale values.
+            # Initialize padding in the reused slot before the next Q/dO copy.
+            # Its masked rows also use explicit zero fill so the score/dP
+            # products cannot observe stale values.
             tlx.local_store(tlx.local_view(q_buffers, next_slot), tl.zeros((BLOCK_M, D), tl.bfloat16))
             tlx.local_store(tlx.local_view(do_buffers, next_slot), tl.zeros((BLOCK_M, D), tl.bfloat16))
             tl.debug_barrier()
@@ -617,9 +639,9 @@ def _attn_bwd_dkdv_d128_rect_impl(
         next_load_mask = tl.broadcast_to(next_mask, next_offsets.shape)
         next_load_mask = tlx.require_layout(next_load_mask, qdo_async_layout)
         next_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, next_slot), Q, next_offsets,
-                                                mask=next_load_mask)
+                                                mask=next_load_mask, other=zero_qdo)
         next_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, next_slot), DO, next_offsets,
-                                                 mask=next_load_mask)
+                                                 mask=next_load_mask, other=zero_qdo)
         tlx.async_load_commit_group([next_q_token, next_do_token])
         qdo_wait = tlx.async_load_wait_group(1)
 
@@ -1291,6 +1313,8 @@ def _attn_bwd_gqa_front(
     P_ND_LAYOUT: tl.constexpr,
     Q_OUT_LAYOUT: tl.constexpr,
     UPDATE_DV_FIRST_HALF: tl.constexpr = True,
+    SCALE_LSE_IN_MAIN: tl.constexpr = False,
+    EARLY_Q_OUT: tl.constexpr = False,
 ):
     """Publish current dS to LDS and optionally update the first dV fragments."""
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
@@ -1314,14 +1338,18 @@ def _attn_bwd_gqa_front(
     if IS_CAUSAL:
         # Mask after scaling so custom zero or negative scales cannot turn an
         # invalid raw-score sentinel into a NaN or a finite probability.
-        lse_log2 = tl.inline_asm_elementwise(
-            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-            "=v,v",
-            [lse_values],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        lse_log2 = lse_values
+        if SCALE_LSE_IN_MAIN:
+            lse_log2 = tlx.require_layout(
+                lse_values * 1.4426950408889634,
+                tlx.slice_layout(MMA_NM, 0),
+                pin=False,
+            )
+            lse_log2 = tlx.amd_register_resident(
+                lse_log2,
+                register_class="vgpr",
+                registers_per_group=2,
+            )
         lse_full = tlx.require_layout(
             tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
             MMA_NM,
@@ -1352,6 +1380,10 @@ def _attn_bwd_gqa_front(
             )
             scaled_scores = tl.where(valid, scaled_scores, neg_inf)
             scaled_scores = tlx.require_layout(scaled_scores, MMA_NM, pin=False)
+    if EARLY_Q_OUT:
+        q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
+        q_out = tlx.amd_register_resident(q_out, register_class="vgpr", registers_per_group=4)
+
     do_t = tlx.local_load(
         tlx.local_trans(do_slice),
         layout=QT_LAYOUT,
@@ -1364,21 +1396,25 @@ def _attn_bwd_gqa_front(
     )
     dp = tlx.amd_register_resident(dp, register_class="vgpr", registers_per_group=16)
 
-    q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
-    q_out = tlx.amd_register_resident(q_out, register_class="vgpr", registers_per_group=4)
+    if not EARLY_Q_OUT:
+        q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
+        q_out = tlx.amd_register_resident(q_out, register_class="vgpr", registers_per_group=4)
     do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
     if not IS_CAUSAL:
-        # Keep LSE scaling on an independent scalar VALU chain.  Broadcasting
-        # the multiply lets LLVM pair an LSE lane with a score fragment in a
-        # packed multiply and creates a false cross-fragment dependency.
-        lse_log2 = tl.inline_asm_elementwise(
-            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-            "=v,v",
-            [lse_values],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        # GQA preprocessing supplies rounded log2 LSE. MHA keeps the native
+        # multiply here, with an identity pin preserving its FP32 boundary.
+        lse_log2 = lse_values
+        if SCALE_LSE_IN_MAIN:
+            lse_log2 = tlx.require_layout(
+                lse_values * 1.4426950408889634,
+                tlx.slice_layout(MMA_NM, 0),
+                pin=False,
+            )
+            lse_log2 = tlx.amd_register_resident(
+                lse_log2,
+                register_class="vgpr",
+                registers_per_group=2,
+            )
         # These are soft requirements. Layout propagation does not yet infer
         # the score MFMA layout for broadcast/full operands from elementwise users.
         lse_full = tlx.require_layout(
@@ -1408,6 +1444,13 @@ def _attn_bwd_gqa_front(
     p_nd = tl.permute(p_nd, (0, 2, 3, 1, 4, 5))
     p_nd = tl.reshape(p_nd, (BLOCK_N, BLOCK_M))
     p_nd = tlx.require_layout(p_nd, P_ND_LAYOUT, pin=False)
+    ds_bf16 = ds.to(tl.bfloat16)
+    tlx.local_store(ds_stage, tl.trans(ds_bf16))
+    ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
+    ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
+    ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
+    ds_nd = tlx.require_layout(ds_nd, P_ND_LAYOUT, pin=False)
+
     if UPDATE_DV_FIRST_HALF:
         dv = _attn_bwd_gqa_dv_fragmented_half(
             p_nd,
@@ -1419,12 +1462,6 @@ def _attn_bwd_gqa_front(
             True,
         )
 
-    ds_bf16 = ds.to(tl.bfloat16)
-    tlx.local_store(ds_stage, tl.trans(ds_bf16))
-    ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
-    ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
-    ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
-    ds_nd = tlx.require_layout(ds_nd, P_ND_LAYOUT, pin=False)
     return dv, ds_nd, q_out, p_nd, do_out
 
 
@@ -1510,6 +1547,8 @@ def _attn_bwd_gqa_dq_prefetched(
     K_MD_LAYOUT: tl.constexpr,
     V_LAYOUT: tl.constexpr,
     COORDINATE_GROUP: tl.constexpr = None,
+    ds2_prefetched=None,
+    PREFETCH_DS2: tl.constexpr = False,
 ):
     """Reduce eight K=32 bands into two independent native dQ chains."""
     ds0 = tlx.require_layout(ds0, DS_MD_LAYOUT, pin=False)
@@ -1521,12 +1560,15 @@ def _attn_bwd_gqa_dq_prefetched(
     dq0 = tlx.zeros((16, 64), tl.float32, layout=MMA_MD)
     dq1 = tlx.zeros((16, 64), tl.float32, layout=MMA_MD)
 
-    ds2 = tlx.local_load(
-        tlx.local_slice(prev_ds, [0, 64], [16, 32]),
-        layout=DS_MD_LAYOUT,
-        relaxed=True,
-        rematerialize_coordinates_group=COORDINATE_GROUP,
-    )
+    if PREFETCH_DS2:
+        ds2 = ds2_prefetched
+    else:
+        ds2 = tlx.local_load(
+            tlx.local_slice(prev_ds, [0, 64], [16, 32]),
+            layout=DS_MD_LAYOUT,
+            relaxed=True,
+            rematerialize_coordinates_group=COORDINATE_GROUP,
+        )
     k7 = tlx.local_load(
         tlx.local_slice(k_buffer, [224, 0], [32, 128]),
         layout=K_MD_LAYOUT,
@@ -1677,7 +1719,7 @@ def _attn_bwd_gqa_dk_fragmented_prefetch(
     Q_OUT_LAYOUT: tl.constexpr,
     DS_MD_LAYOUT: tl.constexpr,
 ):
-    """Update fragmented dK while prefetching the first two dQ bands."""
+    """Update fragmented dK while prefetching the first three dQ bands."""
     dk_lhs = tlx.require_layout(dk_lhs, P_ND_LAYOUT, pin=False)
     dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
     dk = tlx.require_layout(dk, MMA_ND, pin=False)
@@ -1706,6 +1748,11 @@ def _attn_bwd_gqa_dk_fragmented_prefetch(
     )
     c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent")
     c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent")
+    ds2 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 64], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+    )
     c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent")
     c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent")
     ds1 = tlx.local_load(
@@ -1728,7 +1775,7 @@ def _attn_bwd_gqa_dk_fragmented_prefetch(
     )
     new_dk = tl.cat(row0, row1, dim=0)
     new_dk = tlx.require_layout(new_dk, MMA_ND, pin=False)
-    return new_dk, ds0, ds1
+    return new_dk, ds0, ds1, ds2
 
 
 @triton.jit
@@ -1751,7 +1798,7 @@ def _attn_bwd_gqa_bridge(
     V_LAYOUT: tl.constexpr,
 ):
     """Interleave independent current-dK and previous-dQ chains."""
-    new_dk, ds0, ds1 = _attn_bwd_gqa_dk_fragmented_prefetch(
+    new_dk, ds0, ds1, ds2 = _attn_bwd_gqa_dk_fragmented_prefetch(
         dk_lhs,
         dk_rhs,
         dk,
@@ -1774,6 +1821,8 @@ def _attn_bwd_gqa_bridge(
         DS_MD_LAYOUT,
         K_MD_LAYOUT,
         V_LAYOUT,
+        ds2_prefetched=ds2,
+        PREFETCH_DS2=True,
     )
     return new_dk, dq, v_resident
 
@@ -1817,9 +1866,11 @@ def _attn_bwd_gqa_phase(
     DIRECT_DK: tl.constexpr,
     REDIRECT_DUMMY_DQ: tl.constexpr,
     Q_BATCH_FITS_BUFFER: tl.constexpr,
+    SCALE_LSE_IN_MAIN: tl.constexpr = False,
 ):
     """Run one absolute outer-step phase with direct dK or the lagged bridge.
 
+    ``SCALE_LSE_IN_MAIN`` uses original head counts before KV_SPLITS changes the virtual head topology.
     ``REDIRECT_DUMMY_DQ`` is used only by MHA phase 0, whose seeded zero dS
     produces a harmless dQ before any real previous phase exists.
     """
@@ -1868,6 +1919,8 @@ def _attn_bwd_gqa_phase(
         QT_LAYOUT,
         P_ND_LAYOUT,
         Q_OUT_LAYOUT,
+        SCALE_LSE_IN_MAIN=SCALE_LSE_IN_MAIN,
+        EARLY_Q_OUT=DIRECT_DK and not IS_CAUSAL,
     )
     dv = _attn_bwd_gqa_dv_fragmented_half(
         dv_lhs,
@@ -2406,6 +2459,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
             not continuous_bridge,
             continuous_bridge,
             q_batch_fits_buffer,
+            SCALE_LSE_IN_MAIN=HQ == HK,
         )
 
         for phase in tl.range(1, 4, loop_unroll_factor=1):
@@ -2447,6 +2501,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
                 False,
                 False,
                 q_batch_fits_buffer,
+                SCALE_LSE_IN_MAIN=HQ == HK,
             )
 
         _attn_bwd_gqa_issue_qdo_async(
@@ -2487,6 +2542,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
                 ds_md_layout,
                 k_md_layout,
                 k_nm_layout,
+                COORDINATE_GROUP=None if IS_CAUSAL else 21,
             )
             _attn_bwd_gqa_store_dq_native(
                 dq,
@@ -3915,6 +3971,7 @@ def _run_bwd_d128_gqa(
     sm_scale,
     causal,
 ):
+    """Run the D128 bridge with raw MHA LSE or pre-scaled GQA log2 LSE."""
     batch, hq, n_ctx, head_dim = q.shape
     hk = k.shape[1]
     assert _is_supported_gqa_shape((batch, hq, hk, n_ctx, head_dim))
@@ -4735,13 +4792,19 @@ def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         delta = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
-        _run_bwd_preprocess(o, do, delta)
+        # Match SCALE_LSE_IN_MAIN in the phase helper: equal heads are MHA.
+        lse_for_main = lse
+        if q.shape[1] == k.shape[1]:
+            _run_bwd_preprocess(o, do, delta)
+        else:
+            lse_for_main = torch.empty_like(lse)
+            _run_bwd_preprocess(o, do, delta, lse=lse, lse_log2=lse_for_main)
         _run_bwd_d128_gqa(
             q,
             k,
             v,
             do,
-            lse,
+            lse_for_main,
             delta,
             dq_acc,
             dq,
