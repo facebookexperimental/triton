@@ -164,6 +164,22 @@ jobs:
             const BLAME_START = "<!-- BLAME:START -->";
             const BLAME_END = "<!-- BLAME:END -->";
 
+            // Runs can finish out of order. A run must not overwrite an issue, or undo its close,
+            // after a run of a newer commit has already handled it.
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+            const SHA_ROW = /^\| SHA \| `([0-9a-f]{7,40})` \|$/m;
+            const CLOSED_AT = /<!-- closed-at-sha: ([0-9a-f]{7,40}) -->/;
+            async function isNewerThanThisRun(other) {
+              if (!other || other === sha) return false;
+              try {
+                const { data } = await github.rest.repos.compareCommitsWithBasehead({ ...repo, basehead: `${sha}...${other}` });
+                return data.status === "ahead";
+              } catch (e) {
+                core.warning(`Could not compare ${sha}...${other}: ${e}`);
+                return false;
+              }
+            }
+
             // Deep bisection only makes sense with a runnable repro + known platform.
             const wantBisect = !externalDep && !!repro && !!platform;
 
@@ -191,7 +207,7 @@ jobs:
                 "### 🔎 Blame analysis",
                 statusLine,
                 "",
-                suspectsMd || "_No suspect PRs computed (no prior green nightly found)._",
+                suspectsMd || "_No suspect PRs computed (no prior green run found)._",
                 BLAME_END,
               ].join("\n");
             }
@@ -227,7 +243,7 @@ jobs:
               "| Normalized failing identity | `" + normalizedId + "` |",
               "| Ref | `" + ref + "` |",
               "| SHA | `" + sha + "` |",
-              "| Last green nightly | " + (goodSha ? "`" + goodSha + "`" : "_unknown_") + " |",
+              "| Last green run | " + (goodSha ? "`" + goodSha + "`" : "_unknown_") + " |",
               "| Event | `" + eventName + "` |",
               "| Run attempt | `" + runAttempt + "` |",
               "| Run | " + runUrl + " |",
@@ -242,7 +258,7 @@ jobs:
               "_Last updated: " + new Date().toISOString() + "_",
             ].join("\n");
 
-            const header = "> Auto-filed by nightly CI. Do not edit the title — it is the dedup key.\n";
+            const header = "> Auto-filed by CI from a `" + eventName + "` run. Do not edit the title — it is the dedup key.\n";
             const fullBody = [header, blame, "", meta, "", status].join("\n");
 
             // Find an existing OPEN issue with the exact same title + labels.
@@ -260,6 +276,10 @@ jobs:
               // Preserve the blame section + metadata (possibly edited by the bisect
               // job); only refresh the status table below the STATUS marker.
               const old = existing.body || "";
+              if (await isNewerThanThisRun((old.match(SHA_ROW) || [])[1])) {
+                core.info(`Skipped #${existing.number}: a run of a newer commit already updated it.`);
+                return;
+              }
               const idx = old.indexOf(STATUS);
               const body = idx >= 0 ? old.slice(0, idx) + status : fullBody;
               await github.rest.issues.update({
@@ -268,6 +288,20 @@ jobs:
               });
               core.info(`Updated existing issue #${existing.number}: ${title}`);
             } else {
+              const closed = await github.rest.search.issuesAndPullRequests({
+                q: q.replace("is:open", "is:closed"), sort: "updated", order: "desc", per_page: 10,
+              });
+              const lastClosed = closed.data.items.find(i => i.title === title && !i.pull_request);
+              if (lastClosed) {
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  ...repo, issue_number: lastClosed.number, per_page: 100,
+                });
+                const closedAt = comments.map(c => (c.body || "").match(CLOSED_AT)).filter(Boolean).pop();
+                if (closedAt && await isNewerThanThisRun(closedAt[1])) {
+                  core.info(`Skipped: #${lastClosed.number} was closed by a run of a newer commit.`);
+                  return;
+                }
+              }
               const created = await github.rest.issues.create({
                 owner: context.repo.owner, repo: context.repo.repo,
                 title, body: fullBody, labels,

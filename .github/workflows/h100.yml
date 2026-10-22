@@ -264,6 +264,7 @@ jobs:
       job_name: h100-tlx-test
       failures: ${{ needs.h100-tlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
 
   reconcile-h100-runtime:
     needs: h100-runtime-test
@@ -277,3 +278,4 @@ jobs:
       job_name: h100-runtime-test
       failures: ${{ needs.h100-runtime-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}

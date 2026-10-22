@@ -70,6 +70,42 @@ def test_subsystem_dir(normalized_failure_id):
     return None
 
 
+def test_location(normalized_failure_id):
+    """``(path, function)`` of a failing test, or None for a job-level bucket.
+
+    ``function`` is None for a LIT test, whose identity is the whole file.
+
+    - pytest path id ``a/b/test_x.py::TestC::test_y``       -> ``("a/b/test_x.py", "test_y")``
+    - pytest dotted classname ``a.b.test_x.TestC::test_y``  -> ``("a/b/test_x.py", "test_y")``
+    - LIT id ``TRITON :: Conversion/foo.mlir``              -> ``("test/Conversion/foo.mlir", None)``
+    """
+    nid = (normalized_failure_id or "").strip()
+    if "::" not in nid:
+        return None
+    left, right = (s.strip() for s in nid.split("::", 1))
+    if left == "TRITON" or right.endswith((".mlir", ".ll", ".td")):
+        return "test/" + right, None
+    func = right.split("::")[-1].strip()
+    if left.endswith(".py"):
+        return left, func
+    # The dotted classname may end in a test class; the module is the last test_* part.
+    parts = left.split(".")
+    modules = [i for i, part in enumerate(parts) if part.startswith("test_")]
+    if not modules:
+        return None
+    return "/".join(parts[:modules[-1] + 1]) + ".py", func
+
+
+def render_new_test(path, func, good_sha, commit):
+    """Markdown note for a failing test that did not exist at the last green commit."""
+    name = f"`{func}` in `{path}`" if func else f"`{path}`"
+    if commit:
+        added = f"it was added by `{commit['sha'][:9]}`" + (f" (#{commit['pr']})" if commit["pr"] else "")
+    else:
+        added = "it was added in this range"
+    return f"**New test:** {name} did not exist at the last green commit `{good_sha[:9]}`; {added}."
+
+
 def _overlap(path, test_dir):
     """Shared leading-directory-component count between a file and the test dir."""
     if not test_dir:
@@ -149,6 +185,23 @@ def collect_range(good_sha, bad_sha):
     return commits, files_by_sha
 
 
+def test_exists(sha, path, func):
+    """Whether the test file, and the test function if given, exist at ``sha``."""
+    if subprocess.run(["git", "cat-file", "-e", f"{sha}:{path}"], capture_output=True, check=False).returncode:
+        return False
+    return not func or re.search(rf"^\s*(async\s+)?def {re.escape(func)}\(", _git(["show", f"{sha}:{path}"]),
+                                 re.MULTILINE) is not None
+
+
+def first_adding_commit(good_sha, bad_sha, path, func):
+    """The oldest commit in ``good..bad`` that added the test, or None."""
+    # git log -G takes a POSIX regex, where "\(" opens a group; "[(]" is a literal parenthesis.
+    pick = ["-G", f"def {func}[(]"] if func else ["--diff-filter=A"]
+    commits = parse_commits(
+        _git(["log", "--reverse", "--format=%H%x09%s", *pick, f"{good_sha}..{bad_sha}", "--", f":(top){path}"]))
+    return commits[0] if commits else None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--good-sha", required=True)
@@ -158,11 +211,15 @@ def main():
     args = ap.parse_args()
 
     if not args.good_sha:
-        print("_No prior green nightly found — suspect list unavailable._")
+        print("_No prior green run found — suspect list unavailable._")
         return 0
     commits, files_by_sha = collect_range(args.good_sha, args.bad_sha)
     test_dir = test_subsystem_dir(args.normalized_id)
     ranked = rank_prs(commits, files_by_sha, test_dir)
+    location = test_location(args.normalized_id)
+    if location and test_exists(args.bad_sha, *location) and not test_exists(args.good_sha, *location):
+        print(render_new_test(*location, args.good_sha, first_adding_commit(args.good_sha, args.bad_sha, *location)))
+        print()
     print(render_markdown(ranked, args.good_sha, args.bad_sha, test_dir, args.limit))
     return 0
 

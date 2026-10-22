@@ -418,6 +418,7 @@ jobs:
       job_name: b200-tlx-test
       failures: ${{ needs.b200-tlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
 
   reconcile-b200-torchtlx:
     needs: b200-torchtlx-test
@@ -431,6 +432,7 @@ jobs:
       job_name: b200-torchtlx-test
       failures: ${{ needs.b200-torchtlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
 
   reconcile-b200-gluon:
     needs: b200-gluon-test
@@ -444,3 +446,4 @@ jobs:
       job_name: b200-gluon-test
       failures: ${{ needs.b200-gluon-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}

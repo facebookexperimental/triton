@@ -407,6 +407,7 @@ jobs:
       job_name: mi350-tlx-test
       failures: ${{ needs.mi350-tlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
 
   reconcile-mi350-torchtlx:
     needs: mi350-torchtlx-test
@@ -420,6 +421,7 @@ jobs:
       job_name: mi350-torchtlx-test
       failures: ${{ needs.mi350-torchtlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
 
   reconcile-mi350-gluon:
     needs: mi350-gluon-test
@@ -433,3 +435,4 @@ jobs:
       job_name: mi350-gluon-test
       failures: ${{ needs.mi350-gluon-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}

@@ -161,3 +161,4 @@ jobs:
       job_name: lit-tests
       failures: ${{ needs.lit-tests.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ github.sha }}
