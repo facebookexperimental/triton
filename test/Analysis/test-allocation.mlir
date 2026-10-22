@@ -1201,4 +1201,72 @@ tt.func @barrier_then_smem_with_warpspec() {
   ttng.wait_barrier %2, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
   tt.return
 }
+// A TMA store keeps reading its SMEM source until a later
+// async_tma_store_wait completes it. Here the token wait has already been
+// lowered (as when allocation re-runs during ConvertTritonGPUToLLVM), so the
+// store is completed by position: %other is allocated while the store is in
+// flight and must not reuse %buf.
+// expected-remark @below {{lowered_tma_store_wait_liveness}}
+// expected-remark @below {{size = 4096}}
+tt.func @lowered_tma_store_wait_liveness(%desc: !tt.tensordesc<16x64xf16, #NVMMA_SHARED_128>, %t: tensor<16x64xf16, #AL>) {
+  %c0 = arith.constant 0 : i32
+  // expected-remark @below {{offset = 0, size = 2048}}
+  %buf = ttg.local_alloc %t : (tensor<16x64xf16, #AL>) -> !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem>
+  ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf : !tt.tensordesc<16x64xf16, #NVMMA_SHARED_128>, !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem>
+  // expected-remark @below {{offset = 2048, size = 2048}}
+  %other = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem, mutable>
+  "use"(%other) : (!ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem, mutable>) -> ()
+  ttng.async_tma_store_wait {pendings = 0 : i32}
+  tt.return
+}
+
+// Control: once a wait has completed the store, the buffer can be reused.
+// expected-remark @below {{lowered_tma_store_wait_reuse}}
+// expected-remark @below {{size = 2048}}
+tt.func @lowered_tma_store_wait_reuse(%desc: !tt.tensordesc<16x64xf16, #NVMMA_SHARED_128>, %t: tensor<16x64xf16, #AL>) {
+  %c0 = arith.constant 0 : i32
+  // expected-remark @below {{offset = 0, size = 2048}}
+  %buf = ttg.local_alloc %t : (tensor<16x64xf16, #AL>) -> !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem>
+  ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf : !tt.tensordesc<16x64xf16, #NVMMA_SHARED_128>, !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem>
+  ttng.async_tma_store_wait {pendings = 0 : i32}
+  // expected-remark @below {{offset = 0, size = 2048}}
+  %other = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem, mutable>
+  "use"(%other) : (!ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem, mutable>) -> ()
+  tt.return
+}
+// A token wait with planned_pending_count = 1 (rotated to the next write of a
+// multi-buffered staging ring) does not retire its own store: the last store
+// stays in flight until a later wait, so %other must not reuse %buf.
+// expected-remark @below {{planned_pending_token_wait_liveness}}
+// expected-remark @below {{size = 4096}}
+tt.func @planned_pending_token_wait_liveness(%desc: !tt.tensordesc<16x64xf16, #NVMMA_SHARED_128>, %t: tensor<16x64xf16, #AL>) {
+  %c0 = arith.constant 0 : i32
+  // expected-remark @below {{offset = 0, size = 2048}}
+  %buf = ttg.local_alloc %t : (tensor<16x64xf16, #AL>) -> !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem>
+  %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf : !tt.tensordesc<16x64xf16, #NVMMA_SHARED_128>, !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem> -> !ttg.async.token
+  ttng.async_tma_store_token_wait %tok {planned_pending_count = 1 : i32} : !ttg.async.token
+  // expected-remark @below {{offset = 2048, size = 2048}}
+  %other = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem, mutable>
+  "use"(%other) : (!ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem, mutable>) -> ()
+  ttng.async_tma_store_wait {pendings = 0 : i32}
+  tt.return
+}
+// The store is issued in a loop body and retired by a wait after the loop:
+// %other, allocated after the loop but before that wait, must not reuse %buf.
+// expected-remark @below {{tma_store_retired_after_loop}}
+// expected-remark @below {{size = 4096}}
+tt.func @tma_store_retired_after_loop(%desc: !tt.tensordesc<16x64xf16, #NVMMA_SHARED_128>, %t: tensor<16x64xf16, #AL>, %n: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  // expected-remark @below {{offset = 0, size = 2048}}
+  %buf = ttg.local_alloc %t : (tensor<16x64xf16, #AL>) -> !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem>
+  scf.for %i = %c0 to %n step %c1 : i32 {
+    ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf : !tt.tensordesc<16x64xf16, #NVMMA_SHARED_128>, !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem>
+  }
+  // expected-remark @below {{offset = 2048, size = 2048}}
+  %other = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem, mutable>
+  "use"(%other) : (!ttg.memdesc<16x64xf16, #NVMMA_SHARED_128, #smem, mutable>) -> ()
+  ttng.async_tma_store_wait {pendings = 0 : i32}
+  tt.return
+}
 }

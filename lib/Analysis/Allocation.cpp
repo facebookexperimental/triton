@@ -30,6 +30,71 @@ static size_t getPartitionIndex(size_t offset, size_t partitionSize) {
 namespace ttng = mlir::triton::nvidia_gpu;
 namespace ttg = mlir::triton::gpu;
 
+// The buffer a TMA store reads, looking through memdesc views.
+static mlir::Value getTMAStoreSourceRoot(mlir::Operation *store) {
+  mlir::Value src =
+      mlir::isa<ttng::AsyncTMACopyLocalToGlobalOp>(store)
+          ? mlir::cast<ttng::AsyncTMACopyLocalToGlobalOp>(store).getSrc()
+          : mlir::cast<ttng::AsyncTMAReduceOp>(store).getSrc();
+  while (mlir::Operation *def = src.getDefiningOp()) {
+    if (!def->hasTrait<mlir::OpTrait::MemDescViewTrait>())
+      break;
+    src = def->getOperand(0);
+  }
+  return src;
+}
+
+static bool isTMAStoreLike(mlir::Operation *op) {
+  return mlir::isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+      op);
+}
+
+// Returns the wait that retires the TMA store `store`: the first later wait
+// that leaves at most as many stores in flight as were issued after `store`
+// (bulk stores complete in issue order). A token wait without a planned count
+// retires its own store and every earlier one; with
+// `planned_pending_count = P` (a wait rotated to the next write of a
+// multi-buffered staging slot) it only retires stores that are at least P
+// stores old, exactly like the `async_tma_store_wait {pendings = P}` it lowers
+// to. Returns null when no wait retires the store.
+static mlir::Operation *getTMAStoreCompletion(mlir::Operation *store) {
+  llvm::SmallPtrSet<mlir::Operation *, 8> laterStores;
+  // Scan the rest of the store's region, then continue after each enclosing
+  // op (a retiring wait may follow the loop). Stop at a function or at a
+  // warp-specialize partition region, whose warps do not run what follows.
+  for (mlir::Operation *pos = store; pos;) {
+    for (mlir::Block *block = pos->getBlock(); block;
+         block = block->getNextNode()) {
+      auto it = block == pos->getBlock() ? std::next(pos->getIterator())
+                                         : block->begin();
+      for (; it != block->end(); ++it) {
+        mlir::Operation *op = &*it;
+        if (auto wait = mlir::dyn_cast<ttng::TMAStoreWaitOp>(op)) {
+          if (wait.getPendings() <= laterStores.size())
+            return op;
+        } else if (auto wait = mlir::dyn_cast<ttng::TMAStoreTokenWaitOp>(op)) {
+          if (auto planned = wait->getAttrOfType<mlir::IntegerAttr>(
+                  ttng::kPlannedPendingCount)) {
+            if (planned.getInt() <= (int64_t)laterStores.size())
+              return op;
+          } else if (mlir::Operation *def = wait.getToken().getDefiningOp();
+                     def && (def == store || laterStores.contains(def))) {
+            return op;
+          }
+        }
+        if (isTMAStoreLike(op))
+          laterStores.insert(op);
+      }
+    }
+    mlir::Operation *parent = pos->getParentOp();
+    if (!parent || mlir::isa<mlir::FunctionOpInterface,
+                             ttg::WarpSpecializePartitionsOp>(parent))
+      break;
+    pos = parent;
+  }
+  return nullptr;
+}
+
 namespace mlir {
 
 //===----------------------------------------------------------------------===//
@@ -491,24 +556,34 @@ private:
         minId = 0;
         maxId = operationId.size();
       }
-      // For SMEM buffers used by AsyncTMACopyLocalToGlobalOp (early TMA
-      // store lowering), the buffer must remain live until the corresponding
-      // TMAStoreTokenWaitOp completes. SSA liveness only tracks the memdesc
-      // use at the async_tma_copy op, but the TMA hardware continues reading
-      // from the buffer asynchronously until the token wait. Without this
-      // extension, two such buffers can be assigned the same SMEM offset,
-      // causing a data race when the second local_alloc overwrites the first
-      // buffer while the TMA is still reading it.
-      if (hasOpOfAnyTypeInForwardSlice<ttng::AsyncTMACopyLocalToGlobalOp>(
-              defOp)) {
+      // A TMA store keeps reading its SMEM source asynchronously until a
+      // later wait retires it, so the buffer must stay live until then. SSA
+      // liveness only covers the store op itself; without this, later scratch
+      // or buffers can be placed on top of a tile that is still being stored.
+      // When the retiring wait is in a later block (CFG loops after
+      // SCF-to-CF) or there is none, keep the buffer live across its whole
+      // region, since the store can still be in flight when execution comes
+      // back around the loop.
+      if (hasOpOfAnyTypeInForwardSlice<ttng::AsyncTMACopyLocalToGlobalOp,
+                                       ttng::AsyncTMAReduceOp>(defOp)) {
         llvm::SetVector<Operation *> forwardSlice;
         getForwardSlice(defOp, &forwardSlice);
         for (Operation *op : forwardSlice) {
-          if (isa<ttng::TMAStoreTokenWaitOp>(op)) {
-            if ((operationId[op] + 1) > maxId) {
-              maxId = operationId[op] + 1;
-            }
+          if (isa<ttng::TMAStoreTokenWaitOp>(op) &&
+              (operationId[op] + 1) > maxId)
+            maxId = operationId[op] + 1;
+          if (!isTMAStoreLike(op) || getTMAStoreSourceRoot(op) != value)
+            continue;
+          Operation *done = getTMAStoreCompletion(op);
+          Region *region = op->getParentRegion();
+          if (!done || done->getBlock() != op->getBlock()) {
+            region->walk([&](Operation *regionOp) {
+              minId = std::min(minId, operationId[regionOp]);
+              maxId = std::max(maxId, operationId[regionOp] + 1);
+            });
           }
+          if (done && (operationId[done] + 1) > maxId)
+            maxId = operationId[done] + 1;
         }
       }
       return Interval(minId, maxId);
