@@ -7003,6 +7003,7 @@ def _attn_bwd_dq_d64_causal_impl(
     GRID_OWNER_M: tl.constexpr,
     KV_PIPELINE_STAGES: tl.constexpr,
     STAT_MODE: tl.constexpr,
+    Q3_REGISTER_CLASS: tl.constexpr,
 ):
     tl.static_assert(D == 64)
     tl.static_assert(HQ % HKV == 0)
@@ -7012,6 +7013,8 @@ def _attn_bwd_dq_d64_causal_impl(
     tl.static_assert(LOGICAL_N == 32 or LOGICAL_N == 64)
     tl.static_assert(KV_PIPELINE_STAGES == 2)
     tl.static_assert(STAT_MODE == _D64_MHA_POSITIVE_JIT or STAT_MODE == _D64_GQA_SIGNED_JIT)
+    tl.static_assert(Q3_REGISTER_CLASS is None or Q3_REGISTER_CLASS == "vgpr" or Q3_REGISTER_CLASS == "agpr",
+                     "Q3_REGISTER_CLASS must be None, 'vgpr', or 'agpr'")
     score_pre_scaled: tl.constexpr = STAT_MODE == _D64_GQA_SIGNED_JIT
 
     grid_owner_m: tl.constexpr = (OWNER_FRAGMENTS * 64 if GRID_OWNER_M == 0 else GRID_OWNER_M)
@@ -7174,8 +7177,10 @@ def _attn_bwd_dq_d64_causal_impl(
         )
         q3 = tlx.require_layout(q3, q_op0_mn, pin=False)
         # One 64x64 bf16 fragment over four waves is eight 32-bit registers
-        # per thread, so one group keeps the complete fragment resident.
-        q3 = tlx.amd_register_resident(q3, register_class="agpr", registers_per_group=8)
+        # per thread, so one group covers the complete fragment.
+        # None leaves register placement to the compiler.
+        if Q3_REGISTER_CLASS is not None:
+            q3 = tlx.amd_register_resident(q3, register_class=Q3_REGISTER_CLASS, registers_per_group=8)
     else:
         q3, do3, lse3, delta3, rows3 = q0, do0, lse0, delta0, rows0
 
@@ -7338,10 +7343,12 @@ def _attn_bwd_dq_d64_causal_mha_kernel(
     OWNER_FRAGMENTS: tl.constexpr,
     GRID_OWNER_M: tl.constexpr,
     KV_PIPELINE_STAGES: tl.constexpr,
+    Q3_REGISTER_CLASS: tl.constexpr = None,
 ):
     _attn_bwd_dq_d64_causal_impl(Q, K, V, O, DO, LSE, DELTA, DELTA, DQ, SM_SCALE, HQ, HKV, SQ, SKV, D, OWNER_ROWS,
                                  LOGICAL_N, USE_DQ_XCD, SKIP_OWNER_TAIL, OWNER_PID_BASE, LAUNCH_Q_TILES,
-                                 OWNER_FRAGMENTS, GRID_OWNER_M, KV_PIPELINE_STAGES, _D64_MHA_POSITIVE_JIT)
+                                 OWNER_FRAGMENTS, GRID_OWNER_M, KV_PIPELINE_STAGES, _D64_MHA_POSITIVE_JIT,
+                                 Q3_REGISTER_CLASS)
 
 
 @triton.jit
@@ -7370,10 +7377,12 @@ def _attn_bwd_dq_d64_causal_gqa8_kernel(
     OWNER_FRAGMENTS: tl.constexpr,
     GRID_OWNER_M: tl.constexpr,
     KV_PIPELINE_STAGES: tl.constexpr,
+    Q3_REGISTER_CLASS: tl.constexpr = "agpr",
 ):
     _attn_bwd_dq_d64_causal_impl(Q, K, V, O, DO, LSE, DELTA, LSE_TERM, DQ, SM_SCALE, HQ, HKV, SQ, SKV, D, OWNER_ROWS,
                                  LOGICAL_N, USE_DQ_XCD, SKIP_OWNER_TAIL, OWNER_PID_BASE, LAUNCH_Q_TILES,
-                                 OWNER_FRAGMENTS, GRID_OWNER_M, KV_PIPELINE_STAGES, _D64_GQA_SIGNED_JIT)
+                                 OWNER_FRAGMENTS, GRID_OWNER_M, KV_PIPELINE_STAGES, _D64_GQA_SIGNED_JIT,
+                                 Q3_REGISTER_CLASS)
 
 
 @triton.jit
