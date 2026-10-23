@@ -111,20 +111,17 @@ jobs:
           fi
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py ${K[@]+"${K[@]}"} \
             -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-correctness.xml
-      - name: Collect nightly failures (TLX)
+      - name: Parse test failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
-        run: |
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket mi350-tlx-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml \
-            --budget /tmp/tlx-core.xml=90 --budget /tmp/tlx-correctness.xml=30 \
-            --workflow "${GPU_WORKFLOW_NAME}" \
-            --job "mi350-tlx-test" \
-            ${FAILED_FLAG}
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: mi350-tlx-test
+          failed: ${{ steps.run_core_tests.outcome != 'success' || steps.run_correctness_tests.outcome != 'success' }}
+          bucket: mi350-tlx-job-failed
+          junit: /tmp/tlx-core.xml /tmp/tlx-correctness.xml
+          budget: /tmp/tlx-core.xml=90 /tmp/tlx-correctness.xml=30
 
   mi350-torchtlx-test:
     # Temporarily disabled because the TorchTLX environment is brittle.
@@ -224,20 +221,16 @@ jobs:
           name: mi350-torchtlx-gemm-perf
           path: /tmp/tlx_benchmark/*_torchtlx.gfx950.json
           if-no-files-found: ignore
-      - name: Collect nightly failures (TorchTLX)
+      - name: Parse test failures (TorchTLX)
         id: parse
         if: always() && github.event_name == 'schedule'
-        run: |
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" || \
-                "${{ steps.run_torchtlx_perf.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket mi350-torchtlx-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/torchtlx.xml /tmp/torchtlx_perf.xml \
-            --workflow "${GPU_WORKFLOW_NAME}" \
-            --job "mi350-torchtlx-test" \
-            ${FAILED_FLAG}
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: mi350-torchtlx-test
+          failed: ${{ steps.run_torchtlx_tests.outcome != 'success' || steps.run_torchtlx_perf.outcome != 'success' }}
+          bucket: mi350-torchtlx-job-failed
+          junit: /tmp/torchtlx.xml /tmp/torchtlx_perf.xml
 
   mi350-gluon-test:
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
@@ -291,20 +284,17 @@ jobs:
         run: |
           set -eux
           python -m pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
-      - name: Collect nightly failures (Gluon)
+      - name: Parse test failures (Gluon)
         id: parse
         if: always() && github.event_name == 'schedule'
-        run: |
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_gluon.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket mi350-gluon-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/gluon.xml \
-            --budget /tmp/gluon.xml=50 \
-            --workflow "${GPU_WORKFLOW_NAME}" \
-            --job "mi350-gluon-test" \
-            ${FAILED_FLAG}
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: mi350-gluon-test
+          failed: ${{ steps.run_gluon.outcome != 'success' }}
+          bucket: mi350-gluon-job-failed
+          junit: /tmp/gluon.xml
+          budget: /tmp/gluon.xml=50
 
   report-mi350-tlx:
     needs: mi350-tlx-test
