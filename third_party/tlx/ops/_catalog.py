@@ -31,6 +31,8 @@ class OpSpec:
     requires: frozenset = frozenset()
     supports_backward: bool = False
     default_space: str = "heuristic"  # used when the caller passes space=None
+    invariant_vocab: frozenset = frozenset()  # canonical dim names a BitwiseInvarianceSpec may use
+    enforces_invariance: bool = False  # the impl prunes schedules per the resolved spec
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -38,6 +40,16 @@ class OpSpec:
 
 _FP16 = frozenset({"float16", "bfloat16"})
 _BF16 = frozenset({"bfloat16"})
+
+# Per-op dim vocabularies for BitwiseInvarianceSpec. Parallel dims tile the
+# output; reduction dims order the accumulation. TorchTLX catalog entries take
+# no spec (they have no public wrapper) and keep the empty default.
+_GEMM_DIMS = frozenset({"M", "N", "K"})
+_GROUPED_GEMM_DIMS = frozenset({"G", "M", "N", "K"})
+_ATTN_DIMS = frozenset({"B", "H", "SQ", "SKV", "D"})
+_VARLEN_DIMS = frozenset({"TQ", "TKV", "H", "D"})
+_HSTU_DIMS = frozenset({"B", "LQ", "LKV", "H", "D"})
+_KDA_DIMS = frozenset({"T", "H", "D"})
 
 # A static table, not decorator self-registration: `impl` stays a string so
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
@@ -48,6 +60,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm90",
         variant="ws_cooperative",
         impl="triton.tlx.ops.kernels.mm.sm90:mm",
+        invariant_vocab=_GEMM_DIMS,
         dtypes=_FP16,
         accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma"}),
@@ -59,6 +72,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm100",
         variant="ws",
         impl="triton.tlx.ops.kernels.mm.sm100:mm",
+        invariant_vocab=_GEMM_DIMS,
         dtypes=_FP16,
         # TMA needs 16-byte-aligned descriptor row strides. Checked against the
         # real strides, not M/N/K: a column-major operand is fed to its
@@ -75,6 +89,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx942",
         variant="direct_load",
         impl="triton.tlx.ops.kernels.mm.gfx942:mm",
+        invariant_vocab=_GEMM_DIMS,
         dtypes=_FP16,
         # No `accepts`: operands are read through explicit strides rather than a
         # descriptor, so there is no alignment rule to fail. This arch therefore
@@ -96,6 +111,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx942",
         variant="fused_gemm",
         impl="triton.tlx.ops.kernels.addmm.gfx942:addmm",
+        invariant_vocab=_GEMM_DIMS,
         dtypes=_FP16,
         requires=frozenset(),
     ),
@@ -124,6 +140,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="heuristic",
         impl="triton.tlx.ops.kernels.mm.gfx950:mm",
+        invariant_vocab=_GEMM_DIMS,
         # LocalSplitU and persistent plans remain FP16-only; the register and
         # general LDS paths also support BF16 and validate their own plans.
         dtypes=_FP16,
@@ -134,6 +151,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm100",
         variant="ws",
         impl="triton.tlx.ops.kernels.grouped_gemm.sm100:grouped_gemm",
+        invariant_vocab=_GROUPED_GEMM_DIMS,
         dtypes=frozenset({"float16"}),
         accepts=lambda d: all(stride * d["elem_bytes"] % 16 == 0
                               for stride in d["row_strides"]) and all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
@@ -144,6 +162,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm100",
         variant="ws_mxfp8",
         impl="triton.tlx.ops.kernels.mm_mxfp8.sm100:mm_mxfp8",
+        invariant_vocab=_GEMM_DIMS,
         dtypes=frozenset({"float8_e4m3fn"}),
         # Row strides are 128-aligned by the M/N/K contract; only the bases vary.
         accepts=lambda d: all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
@@ -154,6 +173,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm100",
         variant="ws_persistent_mxfp8",
         impl="triton.tlx.ops.kernels.grouped_gemm_mxfp8.sm100:grouped_gemm_mxfp8",
+        invariant_vocab=_GROUPED_GEMM_DIMS,
         dtypes=frozenset({"float8_e4m3fn"}),
         accepts=lambda d: all(row_bytes % 16 == 0 for row_bytes in d["row_bytes"]) and all(ptr % 16 == 0
                                                                                            for ptr in d["base_ptrs"]),
@@ -164,6 +184,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="persistent_warp_pipeline_mxfp8",
         impl="triton.tlx.ops.kernels.grouped_gemm_mxfp8.gfx950:grouped_gemm_mxfp8",
+        invariant_vocab=_GROUPED_GEMM_DIMS,
         dtypes=frozenset({"float8_e4m3fn"}),
         accepts=lambda d: all(row_bytes % 16 == 0 for row_bytes in d["row_bytes"]) and all(ptr % 16 == 0
                                                                                            for ptr in d["base_ptrs"]),
@@ -174,6 +195,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="heuristic",
         impl="triton.tlx.ops.kernels.grouped_gemm.gfx950:grouped_gemm",
+        invariant_vocab=_GROUPED_GEMM_DIMS,
         dtypes=frozenset({"float16"}),
         requires=frozenset(),
     ),
@@ -246,6 +268,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm90",
         variant="ws_pipelined_pingpong",
         impl="triton.tlx.ops.kernels.flash_attn.sm90:flash_attn",
+        invariant_vocab=_ATTN_DIMS,
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma"}),
@@ -256,6 +279,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm100",
         variant="ws_pipelined_persistent",
         impl="triton.tlx.ops.kernels.flash_attn.sm100:flash_attn",
+        invariant_vocab=_ATTN_DIMS,
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma", "tmem"}),
@@ -266,6 +290,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="rotated_cluster_pipeline",
         impl="triton.tlx.ops.kernels.flash_attn.gfx950:flash_attn",
+        invariant_vocab=_ATTN_DIMS,
         dtypes=_BF16,
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset(),
@@ -276,6 +301,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="host_validated",
         impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950_bwd:prepare_varlen_backward",
+        invariant_vocab=_VARLEN_DIMS,
         dtypes=frozenset({"int32"}),
     ),
     OpSpec(
@@ -283,6 +309,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="prepared",
         impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950_bwd:fa_varlen_backward",
+        invariant_vocab=_VARLEN_DIMS,
         dtypes=_BF16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         # Explicit first-order gradients; differentiating this op is unsupported.
@@ -293,6 +320,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm100",
         variant="ws_pipelined_persistent_mxfp8",
         impl="triton.tlx.ops.kernels.flash_attn_mxfp8.sm100:flash_attn_mxfp8",
+        invariant_vocab=_ATTN_DIMS,
         dtypes=_BF16,
         accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
         requires=frozenset({"tma", "tmem"}),
@@ -303,6 +331,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="mfma_mxfp8",
         impl="triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950:flash_attn_mxfp8",
+        invariant_vocab=_ATTN_DIMS,
         dtypes=_BF16,
         accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
         requires=frozenset(),
@@ -313,6 +342,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="mfma_interleaved",
         impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950:flash_attn_varlen",
+        invariant_vocab=_VARLEN_DIMS,
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset(),
@@ -323,6 +353,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm100",
         variant="ws",
         impl="triton.tlx.ops.kernels.hstu_attn.sm100:hstu_attn",
+        invariant_vocab=_HSTU_DIMS,
         dtypes=_FP16,
         # Causal-only, non-causal is not supported yet
         accepts=lambda d: bool(d.get("causal", True)),
@@ -334,6 +365,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="tlx",
         impl="triton.tlx.ops.kernels.hstu_attn.gfx950:hstu_attn",
+        invariant_vocab=_HSTU_DIMS,
         dtypes=_FP16,
         # Causal-only, non-causal is not supported yet.
         accepts=lambda d: bool(d.get("causal", True)),
@@ -344,6 +376,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="tlx_split_kv",
         impl="triton.tlx.ops.kernels.hstu_cross_attn.gfx950:hstu_cross_attn",
+        invariant_vocab=_HSTU_DIMS,
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") in (16, 32, 64, 128, 256),
         supports_backward=True,
@@ -353,6 +386,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="sm100",
         variant="ws",
         impl="triton.tlx.ops.kernels.kda.sm100:kimi_delta_attention",
+        invariant_vocab=_KDA_DIMS,
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset({"tma", "tmem"}),
@@ -363,6 +397,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="tlx",
         impl="triton.tlx.ops.kernels.kda.gfx950_prefill:kda_paged_prefill",
+        invariant_vocab=_KDA_DIMS,
         dtypes=_BF16,
         accepts=lambda d: d.get("KEY_DIM") == 128 and d.get("VALUE_DIM") == 128,
     ),
@@ -371,6 +406,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="tlx",
         impl="triton.tlx.ops.kernels.kda.gfx950_decode:kda_recurrent_decode",
+        invariant_vocab=_KDA_DIMS,
         dtypes=_BF16,
         accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
     ),
@@ -417,6 +453,20 @@ def has_impl(op: str, arch: str) -> bool:
     shape and reporting each one as an error.
     """
     return (op, arch) in _BY_KEY
+
+
+def invariant_vocab_for(op: str) -> frozenset:
+    """The dim vocabulary for `op`, shared by its arch entries; empty if unknown."""
+    for spec in CATALOG:
+        if spec.op == op:
+            return spec.invariant_vocab
+    return frozenset()
+
+
+@functools.lru_cache(maxsize=None)
+def any_enforces_invariance(op: str) -> bool:
+    """Whether any arch entry for `op` enforces an invariance request yet."""
+    return any(spec.op == op and spec.enforces_invariance for spec in CATALOG)
 
 
 @functools.lru_cache(maxsize=None)
