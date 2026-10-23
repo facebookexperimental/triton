@@ -4,12 +4,14 @@ description: >
   install the cutracer CLI from PyPI into the active venv (see
   setup-test-env). The runner images ship no CUDA toolkit, so the sanitizer
   comes from the same apt source CUTracer's own CI uses on these runners
-  (.ci/setup-gpu.sh in facebookexperimental/CUTracer).
+  (.ci/setup-gpu.sh in facebookexperimental/CUTracer), along with the
+  toolkit's forward-compatibility driver libraries, since the runners' R580
+  driver predates CUDA 13.4.
 inputs:
   cuda-version:
-    description: "CUDA toolkit version providing compute-sanitizer, e.g. 13.0"
+    description: "CUDA toolkit version providing compute-sanitizer, e.g. 13.4"
     required: false
-    default: "13.0"
+    default: "13.4"
   cutracer-version:
     description: cutracer version on PyPI
     required: true
@@ -26,10 +28,13 @@ runs:
         curl -fsSL -o "${KEYRING_DEB}" https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
         sudo dpkg -i "${KEYRING_DEB}"
         sudo apt-get update -y
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "cuda-toolkit-${CUDA_VERSION//./-}"
-        CUDA_BIN="/usr/local/cuda-${CUDA_VERSION}/bin"
-        "${CUDA_BIN}/compute-sanitizer" --version
-        echo "${CUDA_BIN}" >> "${GITHUB_PATH}"
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          "cuda-toolkit-${CUDA_VERSION//./-}" "cuda-compat-${CUDA_VERSION//./-}"
+        CUDA_ROOT="/usr/local/cuda-${CUDA_VERSION}"
+        # Later steps load the toolkit's libcuda instead of the older driver's.
+        echo "LD_LIBRARY_PATH=${CUDA_ROOT}/compat${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "${GITHUB_ENV}"
+        "${CUDA_ROOT}/bin/compute-sanitizer" --version
+        echo "${CUDA_ROOT}/bin" >> "${GITHUB_PATH}"
     - name: Install CUTracer
       shell: bash
       env:
