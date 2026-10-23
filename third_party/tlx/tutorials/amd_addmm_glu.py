@@ -144,18 +144,23 @@ def tlx_addmm_glu_kernel_optimized(
     tl.assume(sc0 > 0)
     tl.assume(sc1 > 0)
 
-    pid = tl.program_id(axis=0)
+    # Launcher skips empty matrices and supplies an exact tile grid.
+    tl.assume((M > 0) & (N > 0))
+    index_m = M.to(tl.uint64)
+    index_n = N.to(tl.uint64)
+    pid = tl.program_id(axis=0).to(tl.uint64)
 
     # Num pids along M dim
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)
 
     # Num pids along N dim
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_n = tl.cdiv(index_n, BLOCK_SIZE_N)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
 
     # Remap pids via L2 swizzle
+    tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
 
     # Num pids in the group (of shared rows along M dim pids)
@@ -177,10 +182,12 @@ def tlx_addmm_glu_kernel_optimized(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # Get offsets this pid is responsible for in m dim
-    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_m = offs_cm % index_m
 
     # Get offsets this pid is responsible for in n dim
-    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_n = offs_cn % index_n
 
     # Get offsets this pid is responsible for in k dim
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -304,12 +311,15 @@ def tlx_addmm_glu_kernel_optimized(
 
     out = tl.fma(acc, y_regs.to(tl.float32), acc)
 
-    c_ptrs = c_ptr + offs_m[:, None] * sc0 + offs_n[None, :] * sc1
+    c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
 
-    tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), cache_modifier=".cs")
+    output_mask = (offs_cm[:, None] < index_m) & (offs_cn[None, :] < index_n)
+    tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=output_mask, cache_modifier=".cs")
 
 
 def run_kernel_optimized(a, b, bias, y, out, cfg):
+    if out.numel() == 0:
+        return
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
@@ -382,18 +392,23 @@ def tlx_addmm_glu_kernel_optimized_async(
     tl.assume(sc0 > 0)
     tl.assume(sc1 > 0)
 
-    pid = tl.program_id(axis=0)
+    # Launcher skips empty matrices and supplies an exact tile grid.
+    tl.assume((M > 0) & (N > 0))
+    index_m = M.to(tl.uint64)
+    index_n = N.to(tl.uint64)
+    pid = tl.program_id(axis=0).to(tl.uint64)
 
     # Num pids along M dim
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)
 
     # Num pids along N dim
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_n = tl.cdiv(index_n, BLOCK_SIZE_N)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
 
     # Remap pids via L2 swizzle
+    tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
 
     # Num pids in the group (of shared rows along M dim pids)
@@ -418,10 +433,10 @@ def tlx_addmm_glu_kernel_optimized_async(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
     # Get offsets this pid is responsible for in m dim
-    offs_m = offs_cm % M
+    offs_m = offs_cm % index_m
 
     # Get offsets this pid is responsible for in n dim
-    offs_n = offs_cn % N
+    offs_n = offs_cn % index_n
 
     # Get offsets this pid is responsible for in k dim
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -531,6 +546,8 @@ def tlx_addmm_glu_kernel_optimized_async(
 
 
 def run_kernel_optimized_async(a, b, bias, y, out, cfg):
+    if out.numel() == 0:
+        return
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
@@ -605,10 +622,15 @@ def tlx_addmm_glu_kernel_simple_async(
     tl.assume(sc0 > 0)
     tl.assume(sc1 > 0)
 
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    # Launcher skips empty matrices and supplies an exact tile grid.
+    tl.assume((M > 0) & (N > 0))
+    index_m = M.to(tl.uint64)
+    index_n = N.to(tl.uint64)
+    pid = tl.program_id(axis=0).to(tl.uint64)
+    num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(index_n, BLOCK_SIZE_N)
     grid_mn = num_pid_m * num_pid_n
+    tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
@@ -619,8 +641,8 @@ def tlx_addmm_glu_kernel_simple_async(
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_m = offs_cm % M
-    offs_n = offs_cn % N
+    offs_m = offs_cm % index_m
+    offs_n = offs_cn % index_n
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # Async-prefetch Y into a padded LDS buffer before the K-loop
@@ -848,6 +870,8 @@ def run_kernel_persistent(a, b, bias, y, out, cfg, num_cus):
 
 
 def run_kernel_simple_async(a, b, bias, y, out, cfg):
+    if out.numel() == 0:
+        return
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
@@ -997,6 +1021,8 @@ def run_kernel_baseline(bias, a, b, y, cfg):
     M, K = a.shape
     K2, N = b.shape
     out = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    if out.numel() == 0:
+        return out
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
     tlx_addmm_glu_kernel_baseline[grid](
         a,
