@@ -33,6 +33,20 @@ gfx950_flex_attention_template = _make_flex_template(
 )
 
 
+@SymbolicGridFn
+def sm90_flex_attention_bwd_grid(batch_size, q_heads, num_queries, d_model, kv_heads, num_key_value, meta):
+    """One CTA per (batch, head) row."""
+    del q_heads, num_queries, d_model, num_key_value, meta
+    return (batch_size * kv_heads, 1, 1)
+
+
+sm90_flex_attention_backward_template = _make_flex_template(
+    "tlx_sm90_flex_attention_bwd",
+    load_tlx_template("sm90_flex_attention_bwd") + load_flex_template("utilities"),
+    grid=sm90_flex_attention_bwd_grid,
+)
+
+
 #: Arches offered the gfx950 flex-attention template.
 #:
 #: Unlike the warp-pipe GEMM templates, this one is gated to exactly the arch
@@ -150,7 +164,14 @@ def append_tlx_flex_backward(
     if not _is_backward_payload(input_nodes, subgraphs):
         return choices
 
-    if _is_eligible_amd_flex_bwd(input_nodes):
+    if original_kernel_options.get("TLX_KV_SUM") or sm90_flex_bwd_eligible(
+        *input_nodes[:3], input_nodes[5], original_kernel_options,
+        sparse_q_block_size, sparse_kv_block_size, len(mutated_inputs),
+    ):
+        _append_sm90_flex_backward(
+            choices, input_nodes, subgraphs, layout, original_kernel_options, mutated_inputs,
+        )
+    elif _is_eligible_amd_flex_bwd(input_nodes):
         _append_tlx_flex_amd_backward(
             choices,
             configs,
@@ -385,3 +406,104 @@ def _append_tlx_flex_amd(
             call_sizes=query.get_size(),
             **opts,
         )
+
+
+_SM90_HEAD_DIMS = (64, 80, 96, 128)
+
+
+def _same_tensor(a, b) -> bool:
+    return (
+        a.get_name() == b.get_name()
+        and a.get_size() == b.get_size()
+        and a.get_stride() == b.get_stride()
+        and a.get_layout().offset == b.get_layout().offset
+    )
+
+
+# (BLOCK_N, NUM_KV_BUFFERS) for the sm90 backward template.
+_SM90_BWD_CONFIGS = ((64, 2), (64, 3), (128, 2))
+_SM90_BWD_MAX_Q_LEN = 64
+
+
+def sm90_flex_bwd_eligible(
+    query, key, value, grad_out, opts, sparse_q_block_size, sparse_kv_block_size, num_mutated_inputs=2
+) -> bool:
+    """Backward calls the sm90 template covers.
+
+    Shared with sdpa_to_flex, which may only request TLX_KV_SUM when this holds.
+    """
+    import sympy
+    from torch._inductor import config
+    from torch._inductor.utils import can_use_tma
+    from torch._inductor.virtualized import V
+
+    if config.triton.tlx_mode is None or not current_target().is_hopper:
+        return False
+    if query.get_dtype() not in (torch.bfloat16, torch.float16):
+        return False
+    if opts.get("PRESCALE_QK") or not opts.get("WRITE_DQ", True) or num_mutated_inputs != 2:
+        return False
+    sizevars = V.graph.sizevars
+    q_size, k_size, v_size = query.get_size(), key.get_size(), value.get_size()
+    if not all(sizevars.statically_known_equals(a, b) for a, b in zip(q_size[:2], k_size[:2])):
+        return False
+    if list(k_size) != list(v_size) or q_size[-1] != k_size[-1]:
+        return False
+    if sizevars.guard_int(q_size[-1]) not in _SM90_HEAD_DIMS:
+        return False
+    q_len, kv_len = q_size[2], k_size[2]
+    if not (
+        sizevars.guard_or_false(sympy.Le(q_len, _SM90_BWD_MAX_Q_LEN))
+        and sizevars.guard_or_false(sympy.Ge(sparse_q_block_size, q_len))
+        and sizevars.guard_or_false(sympy.Ge(sparse_kv_block_size, kv_len))
+    ):
+        return False
+    tensors = (query, key, value, grad_out)
+    heads = q_size[1]
+    if not sizevars.statically_known_equals(heads, 1) and not all(
+        sizevars.statically_known_equals(t.get_stride()[0], heads * t.get_stride()[1]) for t in tensors
+    ):
+        return False
+    return can_use_tma(*tensors)
+
+
+def _append_sm90_flex_backward(choices, input_nodes, subgraphs, layout, original_kernel_options, mutated_inputs):
+    """Under TLX_KV_SUM the stock choices compute a different dK, so only TLX remains."""
+    from torch._inductor import config
+    from torch._inductor.runtime.runtime_utils import next_power_of_2
+    from torch._inductor.virtualized import V
+
+    query = input_nodes[0]
+    opts = {k: v for k, v in original_kernel_options.items() if not k.startswith("fwd_")}
+    for k in [k for k in opts if k.startswith("bwd_")]:
+        opts[k[4:]] = opts.pop(k)
+    q_len = query.get_size()[2]
+
+    opts.update(
+        TLX_KV_SUM=bool(original_kernel_options.get("TLX_KV_SUM")),
+        SHARED_KV=_same_tensor(input_nodes[1], input_nodes[2]),
+        BLOCK_Q=max(32, next_power_of_2(V.graph.sizevars.optimization_hint(q_len))),
+        USE_TMA=True,
+        num_warps=4,
+        # TLX is hand-pipelined; disable Triton software pipelining.
+        num_stages=1,
+    )
+    tlx_choices = []
+    for block_n, num_buffers in _SM90_BWD_CONFIGS:
+        opts.update(BLOCK_N=block_n, NUM_KV_BUFFERS=num_buffers)
+        sm90_flex_attention_backward_template.maybe_append_choice(
+            choices=tlx_choices,
+            input_nodes=input_nodes,
+            layout=layout,
+            subgraphs=subgraphs,
+            mutated_inputs=mutated_inputs,
+            call_sizes=query.get_size() + input_nodes[1].get_size()[1:3],
+            **opts,
+        )
+    if opts["TLX_KV_SUM"]:
+        if not tlx_choices:
+            raise RuntimeError("TLX_KV_SUM requires the sm90 TLX backward template, which produced no choice")
+        choices.clear()
+    elif config.triton.tlx_mode == "force" and tlx_choices:
+        choices.clear()
+    choices.extend(tlx_choices)
