@@ -12,6 +12,7 @@ from triton.compiler import ASTSource
 from triton.compiler.errors import CompileTimeAssertionFailure
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon._runtime import GluonASTSource
 from triton.runtime.driver import driver
 
 
@@ -37,14 +38,16 @@ def test_cuda_integer_ranges_narrow_in_branch(capability, frontend):
     @gluon.jit
     def gluon_kernel(input, output):
         x = gl.load(input)
+        offsets = gl.arange(0, 32, layout=gl.BlockedLayout([1], [32], [4], [0]))
         if (x >= 0) & (x < 1024):
             result = x // 3
         else:
             result = x // 5
-        gl.store(output, result)
+        gl.store(output + offsets, result)
 
     kernel = triton_kernel if frontend == "triton" else gluon_kernel
-    source = ASTSource(fn=kernel, signature={"input": "*i64", "output": "*i64"})
+    source_type = ASTSource if frontend == "triton" else GluonASTSource
+    source = source_type(fn=kernel, signature={"input": "*i64", "output": "*i64"})
     compiled = triton.compile(source, target=GPUTarget("cuda", capability, 32))
     ir = compiled.asm["ttir" if frontend == "triton" else "ttgir"]
     assert re.search(r"arith.divsi .* : i32", ir)
