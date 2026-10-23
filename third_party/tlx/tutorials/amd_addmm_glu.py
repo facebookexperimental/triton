@@ -718,10 +718,14 @@ def tlx_addmm_glu_kernel_persistent(
 
     NUM_BUFFERS: tl.constexpr = 3
 
-    start_pid = tl.program_id(axis=0)
+    # Launcher skips empty matrices; tile coordinates must not wrap in i32.
+    tl.assume((M > 0) & (N > 0))
+    index_m = M.to(tl.uint64)
+    index_n = N.to(tl.uint64)
+    start_pid = tl.program_id(axis=0).to(tl.uint64)
 
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(index_n, BLOCK_SIZE_N)
     num_tiles = num_pid_m * num_pid_n
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
@@ -743,8 +747,8 @@ def tlx_addmm_glu_kernel_persistent(
         pid_m = first_pid_m + ((swizzled % num_pid_in_group) % group_size_m)
         pid_n = (swizzled % num_pid_in_group) // group_size_m
 
-        offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % index_m
+        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % index_n
 
         a_base_off = offs_m[:, None] * sa0
         b_base_off = offs_n[None, :] * sb1
@@ -829,12 +833,14 @@ def tlx_addmm_glu_kernel_persistent(
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        c_mask = (offs_cm[:, None] < index_m) & (offs_cn[None, :] < index_n)
         c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
         tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
 
 
 def run_kernel_persistent(a, b, bias, y, out, cfg, num_cus):
+    if out.numel() == 0:
+        return
     M, K = a.shape
     _, N = b.shape
     grid = (min(num_cus, triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"])), )
