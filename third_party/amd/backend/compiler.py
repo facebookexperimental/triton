@@ -326,11 +326,20 @@ class HIPOptions:
     sched_group_barrier_mfma_per_dwordx4: int = 4
     sched_group_barrier_required_region_count: int = 0
 
+    # gfx1250 SCHED_MODE[2]: queue WMMAs while scalar/memory work executes.
+    # This controls hardware behavior, independently of LLVM scheduling.
+    enable_wmma_queuing: bool = False
+
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
         warp_size = 32 if gfx_major >= 10 else 64
         object.__setattr__(self, "warp_size", warp_size)
         assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
+
+        if type(self.enable_wmma_queuing) is not bool:
+            raise ValueError("enable_wmma_queuing must be a bool")
+        if self.enable_wmma_queuing and self.arch != "gfx1250":
+            raise ValueError("enable_wmma_queuing requires an AMD gfx1250 target")
 
         if self.ctas_per_cga is not None:
             dims = tuple(self.ctas_per_cga)
@@ -747,6 +756,8 @@ class HIPBackend(BaseBackend):
     @staticmethod
     def make_llir(src, metadata, options):
         mod = src
+        if options.enable_wmma_queuing:
+            amd.enable_wmma_queuing(mod.get_function(mod.get_entry_func_name()))
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()

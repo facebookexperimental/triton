@@ -2,12 +2,15 @@
 """Collect GPU workflow runs and render the /ci/ dashboard.
 
   collect DATA_DIR [--since ISO]
-      Fetch runs of gpu-tests.yml and nightly-fbtriton.yml created since the
-      saved cursor (or --since), plus the jobs and steps of every completed
-      run and the failing tests in the log of every failed GPU job, into
-      DATA_DIR/runs-YYYY-MM.jsonl.gz and DATA_DIR/state.json. ci-health.yml
+      Fetch runs of gpu-tests.yml, gpu-tests-nightly.yml,
+      nightly-tlx-ops-bench.yml and nightly-fbtriton.yml, and push runs of
+      compiler.yml (LIT), created since the saved cursor (or --since), plus
+      the jobs and steps of every completed run and the failing tests in the
+      log of every failed GPU or LIT job, into
+      DATA_DIR/runs-YYYY-MM.jsonl.gz and DATA_DIR/state.json, and each
+      tracked branch's Meta LLVM pin into DATA_DIR/bump.json. ci-health.yml
       keeps DATA_DIR on the 'ci-health' release; DATA_DIR/changed.txt lists
-      the month files this run rewrote, for upload.
+      the files this run rewrote, for upload.
   render OUTDIR --from DATA_DIR [--bench-from DIR]
       Write OUTDIR/index.html (the page, no data) and OUTDIR/data.json (what
       the page shows, computed by ci_health_rules.page_data), for pages.yml
@@ -23,8 +26,19 @@ line for the same id replaces an earlier one:
                     failures?: [{id, msg}]}]}] | null until the run completes}
 Records of mi350/b200/h100.yml from before #3875 may remain in the store; the
 rules ignore them.
+
+bump.json, rewritten whole by each collection:
+  {lines: {<tracked branch>: {fork_branch, pinned: {tag, llvm_hash, base} | null,
+   newest: {tag, llvm_hash, published_at} | null, pending: [fork change],
+   pr: {number, title, url, author, created_at} | null, issues: [{number, title, url, created_at}],
+   history: [{sha, t, title, pr, tag, llvm_hash, prev_hash | null}]}}}
+  fork change: {sha, title, pr}, a fork commit with its fork PR number. pending is
+  what newest adds over pinned; base is the upstream (OAI) LLVM commit the pin
+  is built on; history is the pin's last changes on the branch,
+  newest first, each with the llvm_hash it replaced (null for the first pin).
 """
 import argparse
+import base64
 import datetime as dt
 import glob
 import gzip
@@ -33,9 +47,11 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.parse
 
 import ci_health_logs as logs
 import ci_health_rules as rules
+import meta_llvm_bump as mlb
 import tlx_ops_bench_dashboard as bench
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "facebookexperimental/triton")
@@ -47,14 +63,27 @@ RATE_FLOOR = 200
 BACKFILL_DAYS = 30
 #: A run still pending after this many days is treated as stuck.
 STUCK_DAYS = 7
-#: Workflows collected. Since #3875, gpu-tests.yml calls mi350/b200/h100.yml as reusable workflows.
-COLLECT = ("gpu-tests.yml", "nightly-fbtriton.yml")
+#: Workflows collected. Since #3875, gpu-tests.yml calls mi350/b200/h100.yml as reusable workflows;
+#: gpu-tests-nightly.yml runs the slow suites (TritonBench) once a day.
+#: compiler.yml runs LIT on every PR too; only its push runs are collected.
+COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml", rules.LIT_WF)
+FORK = "facebookexperimental/llvm-project"
+#: Fork branch each tracked branch's cmake/meta-llvm-info.json follows, as in meta-llvm-update.yml.
+FORK_BRANCHES = {"main": "triton_beta", "release/3.8.x": "triton_3.8.x"}
+META_PATH = "cmake/meta-llvm-info.json"
+#: Pin changes listed per branch.
+PIN_HISTORY = 6
 
 
 def gh_api(path):
     out = subprocess.run(["gh", "api", "--paginate", "--slurp", path], capture_output=True, text=True,
                          check=True).stdout
     return json.loads(out)
+
+
+def gh_get(path):
+    """One page of an endpoint. gh_api's --paginate would walk all of a fork branch's commits."""
+    return json.loads(subprocess.run(["gh", "api", path], capture_output=True, text=True, check=True).stdout)
 
 
 def gh_text(path):
@@ -106,7 +135,8 @@ def _record(run, wf):
     return {
         "id": run["id"], "wf": wf, "event": run["event"], "status": run["status"], "conclusion": run["conclusion"],
         "created_at": run["created_at"], "head_sha": run.get("head_sha"), "title": run.get("display_title", ""), "url":
-        run.get("html_url", ""), "branch": run.get("head_branch"), "pr": None, "author": None, "jobs": None
+        run.get("html_url", ""), "branch": run.get("head_branch"), "pr": None, "author": None, "jobs": None, "base":
+        ((run.get("pull_requests") or [{}])[0].get("base") or {}).get("ref")
     }
 
 
@@ -147,13 +177,24 @@ def _pr_and_author(run, api):
     return None, None
 
 
-def _attach_failures(jobs, text):
+def _attach_failures(jobs, text, wf="gpu-tests.yml"):
     for j in jobs:
-        if j["conclusion"] != "failure" or rules.gpu_of({"wf": "gpu-tests.yml"}, j) is None:
+        if j["conclusion"] != "failure" or rules.gpu_of({"wf": wf}, j) is None:
             continue
         try:
-            logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"))
+            logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"), wf != rules.BENCH_WF)
         except subprocess.CalledProcessError as exc:  # logs expired or not readable: no test result
+            print(f"no log for job {j['id']} ({j['name']}): {exc.stderr.strip() if exc.stderr else exc}")
+
+
+def _attach_lit_failures(jobs, text):
+    for j in jobs:
+        if j["name"] != rules.LIT_JOB or j["conclusion"] != "failure":
+            continue
+        try:
+            logs.attach_lit_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"))
+        except subprocess.CalledProcessError as exc:  # logs expired or not readable: no test result
+            j["log_missing"] = True  # so the failure is not mistaken for a build failure
             print(f"no log for job {j['id']} ({j['name']}): {exc.stderr.strip() if exc.stderr else exc}")
 
 
@@ -167,11 +208,110 @@ def _selection(jobs, text):
     return None
 
 
+def _q(ref):
+    return urllib.parse.quote(ref, safe="")
+
+
+def _meta(get, ref):
+    try:
+        data = get(f"repos/{REPO}/contents/{META_PATH}?ref={_q(ref)}")
+    except subprocess.CalledProcessError:  # no cmake/meta-llvm-info.json at ref
+        return None
+    meta = json.loads(base64.b64decode(data["content"]))
+    return {
+        "tag": meta["release_base_url"].rsplit("/", 1)[-1], "llvm_hash": meta["llvm_hash"], "base":
+        meta.get("based_on_oai_llvm_hash")
+    }
+
+
+def _pr_of(title):
+    m = re.search(r"\s*\(#(\d+)\)\s*$", title)
+    return (title[:m.start()], int(m.group(1))) if m else (title, None)
+
+
+def fork_changes(get, old, new):
+    """The fork commits new adds over old, oldest first, without ShipIt's empty sync commits; None if unknown."""
+    try:
+        commits = get(f"repos/{FORK}/compare/{old}...{new}")["commits"]
+    except subprocess.CalledProcessError:
+        return None
+    out = []
+    for c in commits:
+        title, pr = _pr_of(c["commit"]["message"].splitlines()[0])
+        if not title.startswith("fbshipit-source-id:"):
+            out.append({"sha": c["sha"], "title": title, "pr": pr})
+    return out
+
+
+def snapshot_line(get, target, fork_branch, releases, issues):
+    """One tracked branch's Meta LLVM pin: what it pins, the newest fork release it could take and what that adds,
+    the open bump PR and issues, and the pin's recent changes."""
+    pinned = _meta(get, target)
+    commits = get(f"repos/{FORK}/commits?sha={_q(fork_branch)}&per_page=30")
+    release = mlb.release_for(mlb.same_tree_chain([(c["sha"], c["commit"]["tree"]["sha"]) for c in commits]), releases)
+    newest = {
+        "tag": release["tag_name"], "llvm_hash": release["target_commitish"], "published_at":
+        release.get("published_at")
+    } if release else None
+    pending = []
+    if pinned and newest and pinned["tag"] != newest["tag"]:
+        pending = fork_changes(get, pinned["llvm_hash"], newest["llvm_hash"]) or []
+    branch = mlb.bot_branch_for(target)
+    prs = get(f"repos/{REPO}/pulls?head={REPO.split('/')[0]}:{_q(branch)}&state=open")
+    pr = {
+        "number": prs[0]["number"], "title": prs[0]["title"], "url": prs[0]["html_url"], "author":
+        prs[0]["user"]["login"], "created_at": prs[0].get("created_at")
+    } if prs else None
+    marker = mlb.issue_marker(target)
+    open_issues = [{"number": i["number"], "title": i["title"], "url": i["html_url"], "created_at": i["created_at"]}
+                   for i in issues
+                   if i["state"] == "open" and marker in (i.get("body") or "")]
+    # The pin's changes: commits that touched the file and moved llvm_hash, each with the hash it replaced.
+    touched = get(f"repos/{REPO}/commits?sha={_q(target)}&path={META_PATH}&per_page={PIN_HISTORY + 1}")
+    metas = [_meta(get, c["sha"]) for c in touched]
+    history = []
+    for i, c in enumerate(touched):
+        before = metas[i + 1] if i + 1 < len(touched) else None
+        if metas[i] is None or before and before["llvm_hash"] == metas[i]["llvm_hash"]:
+            continue
+        title, pr_number = _pr_of(c["commit"]["message"].splitlines()[0])
+        history.append({
+            "sha": c["sha"], "t": c["commit"]["committer"]["date"], "title": title, "pr": pr_number, "tag":
+            metas[i]["tag"], "llvm_hash": metas[i]["llvm_hash"], "prev_hash": before["llvm_hash"] if before else None
+        })
+    return {
+        "fork_branch": fork_branch, "pinned": pinned, "newest": newest, "pending": pending, "pr": pr, "issues":
+        open_issues, "history": history[:PIN_HISTORY]
+    }
+
+
+def snapshot_bumps(get):
+    releases = get(f"repos/{FORK}/releases?per_page=100")
+    q = urllib.parse.quote(f'repo:{REPO} is:issue is:open in:title "[Meta LLVM]"')
+    issues = get(f"search/issues?q={q}&sort=created&order=desc&per_page=50")["items"]
+    return {
+        "lines": {
+            t: snapshot_line(get, t, fb, releases, issues)
+            for t, fb in FORK_BRANCHES.items()
+            if t in rules.TRACKED_BRANCHES
+        }
+    }
+
+
+def _write_if_changed(path, data):
+    body = json.dumps(data, indent=1, sort_keys=True)
+    if os.path.exists(path) and open(path).read() == body:
+        return False
+    with open(path, "w") as fh:
+        fh.write(body)
+    return True
+
+
 def _remaining(api):
     return api("rate_limit")[0]["resources"]["core"]["remaining"]
 
 
-def collect(data_dir, since, now, api=gh_api, text=gh_text):
+def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
     state_path = os.path.join(data_dir, "state.json")
     state = json.load(open(state_path)) if os.path.exists(state_path) else {}
     if since is None:
@@ -180,7 +320,8 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text):
     runs = load_runs(data_dir)
     raw = {}
     for wf in COLLECT:
-        for page in api(f"repos/{REPO}/actions/workflows/{wf}/runs?created=>={since}&per_page=100"):
+        event = "&event=push" if wf == rules.LIT_WF else ""
+        for page in api(f"repos/{REPO}/actions/workflows/{wf}/runs?created=>={since}{event}&per_page=100"):
             for run in page["workflow_runs"]:
                 old = runs.get(run["id"])
                 if old and old["status"] == "completed" and old["jobs"] is not None:
@@ -195,8 +336,11 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text):
             unfetched = todo[i:]
             break
         jobs = _jobs(api(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter=latest"))
+        if r["wf"] in rules.GPU_RUN_WORKFLOWS:
+            _attach_failures(jobs, text, r["wf"])
+        if r["wf"] == rules.LIT_WF:
+            _attach_lit_failures(jobs, text)
         if r["wf"] == "gpu-tests.yml":
-            _attach_failures(jobs, text)
             r["select"] = _selection(jobs, text)
             if r["id"] in raw:
                 r["pr"], r["author"] = _pr_and_author(raw[r["id"]], api)
@@ -207,6 +351,13 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text):
     pending += [r["created_at"] for r in unfetched]
     state = {"cursor": min(pending) if pending else now, "collected_at": now}
     changed = save_runs(data_dir, runs)
+    # A failed snapshot keeps the previous bump.json, so the rest of the page still updates.
+    try:
+        bump_path = os.path.join(data_dir, "bump.json")
+        if _write_if_changed(bump_path, snapshot_bumps(get)):
+            changed.append(bump_path)
+    except (subprocess.CalledProcessError, KeyError, ValueError) as exc:
+        print(f"warning: no Meta LLVM bump snapshot ({exc})")
     with open(state_path, "w") as fh:
         json.dump(state, fh)
     with open(os.path.join(data_dir, "changed.txt"), "w") as fh:
@@ -230,7 +381,9 @@ def render(data_dir, outdir, bench_dir=None):
     state_path = os.path.join(data_dir, "state.json")
     asof = json.load(open(state_path))["collected_at"] if os.path.exists(state_path) else None
     if asof:
-        data = rules.page_data(list(load_runs(data_dir).values()), asof, bench_events(bench_dir))
+        bump_path = os.path.join(data_dir, "bump.json")
+        bump = json.load(open(bump_path)) if os.path.exists(bump_path) else None
+        data = rules.page_data(list(load_runs(data_dir).values()), asof, bench_events(bench_dir), bump)
     else:
         data = {"asof": None}
     os.makedirs(outdir, exist_ok=True)

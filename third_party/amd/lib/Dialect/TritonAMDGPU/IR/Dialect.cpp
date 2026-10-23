@@ -1004,7 +1004,6 @@ Attribute ScaledUpcastFp8Op::inferSrcEncoding(unsigned opIdx,
 LogicalResult ScaledDowncastFp8Op::verify() {
   RankedTensorType inputTy = getInput().getType();
   RankedTensorType outputTy = getOutput().getType();
-  RankedTensorType scaleTy = getScale().getType();
   auto inputShape = inputTy.getShape();
   auto outputShape = outputTy.getShape();
 
@@ -1013,6 +1012,16 @@ LogicalResult ScaledDowncastFp8Op::verify() {
     return emitError() << "input and output must have the same shape";
   if (inputTy.getEncoding() != outputTy.getEncoding())
     return emitError() << "input and output must have the same encoding";
+  if (bool(getScale()) == bool(getScaleConst()))
+    return emitError() << "requires exactly one of a scale operand or "
+                          "scale_const";
+  if (auto scaleConst = getScaleConst()) {
+    // 0xFF is the E8M0 NaN encoding.
+    if (*scaleConst == 0xFF)
+      return emitError() << "scale_const must be a finite E8M0 scale";
+    return success();
+  }
+  RankedTensorType scaleTy = getScale().getType();
   if (failed(verifyScaledDowncastScaleShapeAndAxis(*this, outputTy, scaleTy)))
     return failure();
 
@@ -1025,6 +1034,8 @@ LogicalResult ScaledDowncastFp8Op::verify() {
 Attribute ScaledDowncastFp8Op::inferDstEncoding(unsigned opIdx,
                                                 Attribute srcEnc) {
   if (opIdx == 1) {
+    if (!getScale())
+      return {};
     if (auto scaleEnc = inferScaledDowncastScaleEncoding(*this, srcEnc))
       return *scaleEnc;
     return {};
@@ -1035,6 +1046,8 @@ Attribute ScaledDowncastFp8Op::inferDstEncoding(unsigned opIdx,
 Attribute ScaledDowncastFp8Op::inferSrcEncoding(unsigned opIdx,
                                                 Attribute dstEnc) {
   if (opIdx == 1) {
+    if (!getScale())
+      return {};
     if (auto scaleEnc = inferScaledDowncastScaleEncoding(*this, dstEnc)) {
       return *scaleEnc;
     }
@@ -1615,9 +1628,9 @@ LogicalResult ScheduledMfmaOp::verify() {
         "accumulator ownership does not match the native MFMA grid");
 
   if (getResidentOperand() != "none" && getResidentOperand() != "lhs" &&
-      getResidentOperand() != "rhs")
-    return emitOpError(
-        "resident_operand must be \"none\", \"lhs\", or \"rhs\"");
+      getResidentOperand() != "rhs" && getResidentOperand() != "unconstrained")
+    return emitOpError("resident_operand must be \"none\", \"lhs\", "
+                       "\"rhs\", or \"unconstrained\"");
   if (getAccumulatorRole() != "transient" &&
       getAccumulatorRole() != "persistent")
     return emitOpError(

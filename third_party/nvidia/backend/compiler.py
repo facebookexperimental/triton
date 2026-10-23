@@ -15,6 +15,7 @@ from triton import knobs
 from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.runtime.errors import PTXASError
+from triton.tools.compile_trace import run_subprocess
 
 # Auto-TMA host-launcher caps. These MUST stay in lockstep with the C macros of
 # the same name in nvidia/backend/launch.h and nvidia/backend/driver.c: the
@@ -1297,6 +1298,8 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
+        if capability // 10 >= 10 and not knobs.nvidia.disable_mma_collector_reuse:
+            nvidia.passes.ttnvgpuir.add_mma_collector_reuse(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(
             pm,
             capability,
@@ -1391,7 +1394,7 @@ class CUDABackend(BaseBackend):
             # Same LLVM flags as make_ptx: compilations sharing a process only
             # run in parallel while their flag sets are identical.
             flags=flags, disable_slp_vectorizer=capability == 80, expand_masked_div_rem=True,
-            scalarize_packed_fops=True)
+            vectorize_extracted_adds=True, scalarize_packed_fops=True)
 
         # Get some metadata
         # warp-specialization mutates num_warps
@@ -1519,7 +1522,7 @@ class CUDABackend(BaseBackend):
                 fbin,
             ]
             try:
-                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog, env=knobs.nvidia.get_tool_env())
+                run_subprocess(ptxas_cmd, check=True, close_fds=False, stderr=flog, env=knobs.nvidia.get_tool_env())
                 if knobs.nvidia.dump_ptxas_log:
                     with open(flog.name) as log_file:
                         print(log_file.read())

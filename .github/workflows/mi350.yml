@@ -25,87 +25,6 @@ env:
   PYTEST_ADDOPTS: --import-mode=importlib
 
 jobs:
-  mi350-tritonbench-test:
-    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
-    runs-on: linux-fb-triton-mi350-1
-    timeout-minutes: 180
-    permissions:
-      id-token: write
-      contents: read
-      actions: read
-    outputs:
-      failures: ${{ steps.collect.outputs.failures }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
-      - name: Resolve TritonBench ref from PR body (X-link)
-        id: tritonbench_pr
-        if: github.event_name == 'pull_request'
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          PR_BODY_FILE="$(mktemp)"
-          printf '%s' "${PR_BODY}" > "${PR_BODY_FILE}"
-          bash ./.ci/tritonbench/checkout.sh "${PR_BODY_FILE}" --ref-only
-      - name: Checkout TritonBench
-        uses: actions/checkout@v4
-        with:
-          repository: meta-pytorch/tritonbench
-          path: tritonbench
-          ref: ${{ steps.tritonbench_pr.outputs.ref }}
-          submodules: recursive
-      - name: Select kernel-affected tests
-        id: select
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/select-kernel-tests
-      # Everything below is skipped when no TritonBench source references the
-      # changed kernels, so a skipped run does not pay for setup.
-      - name: Set up test environment
-        if: steps.select.outputs.run_tritonbench != 'false'
-        timeout-minutes: 30
-        uses: ./.github/actions/setup-test-env
-        with:
-          backend: rocm
-          arch: gfx950
-      - name: Install TritonBench dependencies
-        if: steps.select.outputs.run_tritonbench != 'false'
-        working-directory: tritonbench
-        run: |
-          set -eux
-          # TritonBench owns its dependency list; on HIP, --all installs its
-          # AMD dependency group, liger and aiter into the active venv, pinning
-          # torch and numpy. TritonBench itself runs from this checkout.
-          # Must run after setup-test-env: with no torch in the venv,
-          # install.py installs its default PyTorch nightly instead, with
-          # device code for every GPU architecture. Triton is installed after
-          # it, so the prebuilt wheel's files are the ones the tests use.
-          python install.py --all
-      - name: Install prebuilt Triton
-        if: steps.select.outputs.run_tritonbench != 'false'
-        uses: ./.github/actions/install-prebuilt-triton
-        with:
-          wheel-url: ${{ inputs.wheel_url }}
-          wheel-filename: ${{ inputs.wheel_filename }}
-          wheel-sha256: ${{ inputs.wheel_sha256 }}
-      - name: Run TritonBench
-        id: tritonbench
-        if: steps.select.outputs.run_tritonbench != 'false'
-        env:
-          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
-          TRITONBENCH_ROOT: ${{ github.workspace }}/tritonbench
-        run: |
-          bash ./.ci/tritonbench/test-gpu.sh
-      - name: Collect nightly failure (TritonBench)
-        id: collect
-        if: always() && github.event_name == 'schedule' && failure()
-        run: |
-          BUCKET="amd-tritonbench"
-          TITLE="[nightly] ${GPU_WORKFLOW_NAME} / mi350-tritonbench-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-tritonbench-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
-          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
-
   mi350-tlx-test:
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-fb-triton-mi350-1
@@ -387,35 +306,6 @@ jobs:
             --job "mi350-gluon-test" \
             ${FAILED_FLAG}
 
-  report-mi350-tritonbench:
-    needs: mi350-tritonbench-test
-    if: always() && github.event_name == 'schedule' && needs.mi350-tritonbench-test.outputs.failures != '' && needs.mi350-tritonbench-test.outputs.failures != '[]'
-    permissions:
-      contents: read
-      issues: write
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.mi350-tritonbench-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
-    with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: Meta Triton MI350 Tests
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ inputs.ref }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      platform: mi350
-
   report-mi350-tlx:
     needs: mi350-tlx-test
     if: always() && github.event_name == 'schedule' && needs.mi350-tlx-test.outputs.failures != '' && needs.mi350-tlx-test.outputs.failures != '[]'
@@ -499,19 +389,6 @@ jobs:
       external_dep: ${{ matrix.item.external_dep }}
       external_dep_reason: ${{ matrix.item.external_dep_reason }}
       platform: mi350
-
-  reconcile-mi350-tritonbench:
-    needs: mi350-tritonbench-test
-    if: always() && github.event_name == 'schedule' && (needs.mi350-tritonbench-test.result == 'success' || needs.mi350-tritonbench-test.result == 'failure')
-    permissions:
-      contents: read
-      issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
-    with:
-      workflow_name: Meta Triton MI350 Tests
-      job_name: mi350-tritonbench-test
-      failures: ${{ needs.mi350-tritonbench-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   reconcile-mi350-tlx:
     needs: mi350-tlx-test

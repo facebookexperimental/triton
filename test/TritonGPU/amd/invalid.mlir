@@ -2557,3 +2557,66 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32}
     tt.return
   }
 }
+
+// -----
+
+// A constant scale needs no scale operand, and both tensor encodings can be
+// absent before layout inference.
+module {
+  tt.func @scaled_downcast_const_unencoded(%x: tensor<64xf32>) {
+    %result = amdg.scaled_downcast_fp8 %x {axis = 0 : i32, scale_const = 119 : i8} : tensor<64xf32> -> tensor<64xf8E4M3FN>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @scaled_downcast_const_and_scale(%x: tensor<64xf32>, %s: tensor<2xi8>) {
+    // expected-error @+1 {{requires exactly one of a scale operand or scale_const}}
+    %result = amdg.scaled_downcast_fp8 %x scale %s {axis = 0 : i32, scale_const = 119 : i8} : tensor<64xf32>, tensor<2xi8> -> tensor<64xf8E4M3FN>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @scaled_downcast_no_scale(%x: tensor<64xf32>) {
+    // expected-error @+1 {{requires exactly one of a scale operand or scale_const}}
+    %result = amdg.scaled_downcast_fp8 %x {axis = 0 : i32} : tensor<64xf32> -> tensor<64xf8E4M3FN>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @scaled_downcast_const_nan(%x: tensor<64xf32>) {
+    // expected-error @+1 {{scale_const must be a finite E8M0 scale}}
+    %result = amdg.scaled_downcast_fp8 %x {axis = 0 : i32, scale_const = -1 : i8} : tensor<64xf32> -> tensor<64xf8E4M3FN>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @scaled_downcast_const_shape_mismatch(%x: tensor<64xf32>) {
+    // expected-error @+1 {{input and output must have the same shape}}
+    %result = amdg.scaled_downcast_fp8 %x {axis = 0 : i32, scale_const = 119 : i8} : tensor<64xf32> -> tensor<128xf8E4M3FN>
+    tt.return
+  }
+}
+
+// -----
+
+#enc0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#enc1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scaled_downcast_const_unequal_encodings(%x: tensor<128xf32, #enc0>) {
+    // expected-error @+1 {{input and output must have the same encoding}}
+    %result = amdg.scaled_downcast_fp8 %x {axis = 0 : i32, scale_const = 119 : i8} : tensor<128xf32, #enc0> -> tensor<128xf8E4M3FN, #enc1>
+    tt.return
+  }
+}

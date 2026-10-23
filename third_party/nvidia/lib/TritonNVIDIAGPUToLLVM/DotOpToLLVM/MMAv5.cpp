@@ -6,6 +6,7 @@
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #include <array>
 
@@ -529,13 +530,15 @@ struct DotConversion {
   GetInstOperandsFn getInstOperands;
 };
 
-LogicalResult convertDotImpl(
-    const LLVMTypeConverter &typeConverter, ConversionPatternRewriter &rewriter,
-    Location loc, Value a, Value b, Value loadedA, Value loadedB,
-    MemDescType dTensorTy, Value loadedD, Value useDFlag, Value pred,
-    ValueRange barriers, ValueRange barrierPreds, bool twoCTAs,
-    bool tlxPairedMMA, ValueRange commitDescs, bool lessRegMMA,
-    const ttng::TargetFeatures &targetFeatures, const DotConversion &op) {
+LogicalResult
+convertDotImpl(const LLVMTypeConverter &typeConverter,
+               ConversionPatternRewriter &rewriter, Location loc, Value a,
+               Value b, Value loadedA, Value loadedB, MemDescType dTensorTy,
+               Value loadedD, Value useDFlag, Value pred, ValueRange barriers,
+               ValueRange barrierPreds, bool twoCTAs, bool tlxPairedMMA,
+               ValueRange commitDescs, bool lessRegMMA,
+               const ttng::TargetFeatures &targetFeatures,
+               const DotConversion &op, StringAttr collectorA = {}) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
   auto dLoader = DotOpMmaV5TmemLoader::build(
       loc, rewriter, dTensorTy, loadedD, dTensorTy.getElementTypeBitWidth());
@@ -615,6 +618,23 @@ LogicalResult convertDotImpl(
          "grep for [Note: numRepN > 1 and two_ctas]");
   int numRepK = op.kOffsets.empty() ? ceil<unsigned>(K, mmaSizeK)
                                     : op.kOffsets.size() - 1;
+
+  // A reuse must pair exactly one shared-memory A slice per op. Requiring a
+  // single M repetition also excludes the B-collector path below.
+  if (collectorA && (numRepM != 1 || numRepN != 1 || numRepK != 1 || aInTmem))
+    return mlir::emitError(loc, "A-collector reuse requires a single MMA "
+                                "instruction with operand A in shared memory");
+
+  CollectorAction explicitReuseA = CollectorAction::None;
+  if (collectorA) {
+    explicitReuseA = llvm::StringSwitch<CollectorAction>(collectorA.getValue())
+                         .Case("fill", CollectorAction::Fill)
+                         .Case("use", CollectorAction::Use)
+                         .Case("lastuse", CollectorAction::Lastuse)
+                         .Default(CollectorAction::None);
+    if (explicitReuseA == CollectorAction::None)
+      return mlir::emitError(loc, "unsupported A-collector reuse action");
+  }
 
   // In A * B = C
   // For M=64 twoCTAs, B and C have the same split and A has a split half of C
@@ -739,6 +759,8 @@ LogicalResult convertDotImpl(
                  : (nextMatch ? CollectorAction::Fill : CollectorAction::None);
     };
     OperandReuse reuse{getReuse(reuseA, 0), getReuse(reuseB, 1)};
+    if (collectorA)
+      reuse.a = explicitReuseA;
     auto [m, n, k] = indices;
     MemDescOperand accAddress =
         dLoader.tmemLoad(m * mmaSizeM, n * mmaSizeN, rewriter, loc);
@@ -817,12 +839,13 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
             {}};
   };
 
-  return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
-                        adaptor.getA(), adaptor.getB(), dTensorTy,
-                        adaptor.getD(), adaptor.getUseD(), adaptor.getPred(),
-                        adaptor.getBarriers(), adaptor.getBarrierPreds(),
-                        twoCTAs, tlx::tlxEnablePairedMMA(op), commitDescs,
-                        hasLessRegMMA(op), targetFeatures, dot);
+  return convertDotImpl(
+      typeConverter, rewriter, loc, op.getA(), op.getB(), adaptor.getA(),
+      adaptor.getB(), dTensorTy, adaptor.getD(), adaptor.getUseD(),
+      adaptor.getPred(), adaptor.getBarriers(), adaptor.getBarrierPreds(),
+      twoCTAs, tlx::tlxEnablePairedMMA(op), commitDescs, hasLessRegMMA(op),
+      targetFeatures, dot,
+      op->getAttrOfType<StringAttr>(ttng::kCollectorAAttrName));
 }
 
 int64_t getFormatBitSize(ScaleDotElemType type) {

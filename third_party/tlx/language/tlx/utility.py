@@ -1,5 +1,6 @@
 import re
 import builtins
+import math
 
 import triton.language.core as tl
 import triton.runtime.driver as driver
@@ -19,26 +20,38 @@ def is_amd_tdm_target(arch):
 
 
 @tl.builtin
-def amd_set_wave_sched_mode(value: tl.constexpr, offset: tl.constexpr = 0, width: tl.constexpr = 2, _semantic=None):
-    """Write a field of ``HW_REG_WAVE_SCHED_MODE`` on gfx12 GPUs.
+def amd_scaled_downcast_fp8(value, scale: tl.constexpr, dtype: tl.constexpr = tl.float8e4nv, _semantic=None):
+    """Convert ``value * scale`` from FP32 to FP8 on gfx950.
 
-    ``value``, ``offset``, and ``width`` must be compile-time integers. Each
-    executing wave updates the selected field and preserves the other bits.
-    This emits ``llvm.amdgcn.s.setreg`` and does not configure LLVM's scheduler
-    or its wait insertion. Bits 0..1 select the hardware scheduling mode;
-    bit 2 controls WMMA queuing on gfx1250.
+    ``scale`` must be a compile-time power of two from 2^-127 to 2^126. The
+    conversion instruction divides by the E8M0 scale ``1 / scale``, emitted as
+    ``amdg.scaled_downcast_fp8`` with ``scale_const = 127 - log2(scale)``, so
+    no separate FP32 multiply is needed. ``dtype`` is ``tl.float8e4nv``
+    (E4M3FN, the default) or ``tl.float8e5`` (E5M2). Rounding is
+    round-to-nearest-even; NaNs and values beyond the FP8 range convert to
+    NaN. The result keeps the input's layout.
     """
     options = _semantic.builder.options
-    if options.backend_name != "hip" or not options.arch.startswith("gfx12"):
-        raise NotImplementedError("tlx.amd_set_wave_sched_mode requires an AMD gfx12 target")
-    value, offset, width = (tl._unwrap_if_constexpr(arg) for arg in (value, offset, width))
-    if any(type(arg) is not int for arg in (value, offset, width)):
-        raise ValueError("value, offset, and width must be constexpr integers")
-    if not 0 <= offset < 32 or not 1 <= width <= 32 - offset:
-        raise ValueError("the register field must fit within 32 bits")
-    if not 0 <= value < 1 << width:
-        raise ValueError("value must fit in the selected register field")
-    _semantic.builder.create_amd_set_wave_sched_mode(value, offset, width)
+    if options.backend_name != "hip" or options.arch != "gfx950":
+        raise NotImplementedError("tlx.amd_scaled_downcast_fp8 requires gfx950")
+    value = _semantic.to_tensor(value)
+    if not value.type.is_block() or value.dtype != tl.float32:
+        raise TypeError("value must be an FP32 tensor")
+    dtype = tl._unwrap_if_constexpr(dtype)
+    if dtype not in (tl.float8e4nv, tl.float8e5):
+        raise TypeError("dtype must be tl.float8e4nv or tl.float8e5")
+    scale = tl._unwrap_if_constexpr(scale)
+    if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("scale must be a positive compile-time power of two")
+    mantissa, exponent = math.frexp(scale)
+    log2_scale = exponent - 1
+    # E8M0 byte 0 (2^-127) lowers to a zero divisor, and 255 is NaN.
+    if mantissa != 0.5 or not -127 <= log2_scale <= 126:
+        raise ValueError("scale must be a power of two from 2^-127 to 2^126")
+    result_ty = tl.block_type(dtype, value.type.shape)
+    handle = _semantic.builder.create_amd_scaled_downcast_fp8(value.handle, dtype.to_ir(_semantic.builder),
+                                                              127 - log2_scale)
+    return tl.tensor(handle, result_ty)
 
 
 def cuda_parse_arch(arch):

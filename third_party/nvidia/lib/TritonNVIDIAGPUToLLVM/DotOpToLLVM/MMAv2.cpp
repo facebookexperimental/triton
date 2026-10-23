@@ -5,6 +5,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
@@ -743,22 +744,35 @@ LogicalResult convertMMAImpl(
   assert(repA[0] == repB[0]);
   int repM = repA[1], repN = repB[2], repK = repA[2];
   int repBatch = repA[0];
+  // Under TRITON_ALLOW_NPOT an NPOT K gives modular operands whose struct holds
+  // PowerOf2Ceil(K) / kTile K-reps per outer rep (the tail wraps k mod K).
+  // Unpack with that padded count so outer reps align; MMAs use the true repK.
+  int repKStruct = repK;
+  int64_t kSize = aShapePerCTA.back();
+  if (!llvm::isPowerOf2_64(kSize) &&
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT")) {
+    SmallVector<int64_t> aPadded(aShapePerCTA.begin(), aShapePerCTA.end());
+    aPadded.back() = llvm::PowerOf2Ceil(kSize);
+    repKStruct =
+        cast<NvidiaMmaEncodingAttr>(dotOpA.getParent())
+            .getRepForOperand(aPadded, bitwidth, kWidth, dotOpA.getOpIdx())[2];
+  }
 
   // We can reuse the same iteration order in
   // getValuesFromDotOperandLayoutStruct as both a and b are K-major
   assert(dotOpA.getRepOrder() == getOrderForDotOperand(dotOpA.getOpIdx(),
                                                        aShapePerCTA.size(),
                                                        /*kContig=*/true));
-  auto ha = getValuesFromDotOperandLayoutStruct(typeConverter, loc, rewriter,
-                                                llvmA, repBatch, repM, repK,
-                                                aTensorTy, numRegisters);
+  auto ha = getValuesFromDotOperandLayoutStruct(
+      typeConverter, loc, rewriter, llvmA, repBatch, repM, repKStruct,
+      aTensorTy, numRegisters);
 
   assert(dotOpB.getRepOrder() == getOrderForDotOperand(dotOpB.getOpIdx(),
                                                        bShapePerCTA.size(),
                                                        /*kContig=*/true));
-  auto hb = getValuesFromDotOperandLayoutStruct(typeConverter, loc, rewriter,
-                                                llvmB, repBatch, repN, repK,
-                                                bTensorTy, numRegisters);
+  auto hb = getValuesFromDotOperandLayoutStruct(
+      typeConverter, loc, rewriter, llvmB, repBatch, repN, repKStruct,
+      bTensorTy, numRegisters);
 
   int bitwidthRet = dTensorTy.getElementType().getIntOrFloatBitWidth();
   auto numMmaRets = bitwidthRet == 64 ? 2 : bitwidthRet / 8;

@@ -84,6 +84,31 @@ TLX_PAGES = (
         "Production-ready TLX kernels, one blessed implementation per op and architecture.",
     ),
     Page(
+        "tlx-sm90",
+        "TLX on sm90 (Hopper)",
+        "Supported ops and extension builtins on NVIDIA Hopper.",
+    ),
+    Page(
+        "tlx-sm100",
+        "TLX on sm100 (Blackwell)",
+        "Supported ops and extension builtins on NVIDIA Blackwell.",
+    ),
+    Page(
+        "tlx-gfx942",
+        "TLX on gfx942 (MI300)",
+        "Supported ops and extension builtins on AMD MI300.",
+    ),
+    Page(
+        "tlx-gfx950",
+        "TLX on gfx950 (MI350)",
+        "Supported ops and extension builtins on AMD MI350.",
+    ),
+    Page(
+        "tlx-gfx1250",
+        "TLX on gfx1250 (RDNA4)",
+        "TDM descriptors and expected support on next-gen AMD.",
+    ),
+    Page(
         "testing",
         "Testing",
         "Correctness and performance scripts for the TLX tutorial kernels.",

@@ -8,7 +8,7 @@ from botocore.exceptions import ClientError
 import pytest
 import yaml
 
-from gpu_test_selection import PATH_FILTERS, changed_paths, select_platforms
+from gpu_test_selection import PATH_FILTERS, bump_ref, changed_paths, passed_push_run, select_platforms
 from wheel_cache import BUCKET, LEASE_SECONDS, RETENTION_SECONDS, WheelCache
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +44,27 @@ def test_schedule_manual_and_new_branch_run_all():
     assert changed_paths("schedule", {}) is None
     assert changed_paths("workflow_dispatch", {}) is None
     assert changed_paths("push", {"before": "0" * 40}) is None
+
+
+def test_bump_ref_push_and_same_repo_pr_only():
+    assert bump_ref("push", {"ref": "refs/heads/scratch/meta-llvm-bump/main"}) == "scratch/meta-llvm-bump/main"
+    assert bump_ref("push", {"ref": "refs/heads/main"}) is None
+    pr = {
+        "head": {"ref": "scratch/meta-llvm-bump/main", "repo": {"full_name": "o/r"}}, "base":
+        {"repo": {"full_name": "o/r"}}
+    }
+    assert bump_ref("pull_request", {"pull_request": pr}) == "scratch/meta-llvm-bump/main"
+    fork = {**pr, "head": {**pr["head"], "repo": {"full_name": "x/r"}}}
+    assert bump_ref("pull_request", {"pull_request": fork}) is None
+    assert bump_ref("schedule", {}) is None
+
+
+def test_passed_push_run_needs_green_push_run_of_gpu_tests():
+    run = {"event": "push", "path": ".github/workflows/gpu-tests.yml", "conclusion": "success", "html_url": "u"}
+    assert passed_push_run([run]) == "u"
+    assert passed_push_run([{**run, "conclusion": "failure"}]) is None
+    assert passed_push_run([{**run, "event": "pull_request"}]) is None
+    assert passed_push_run([{**run, "path": ".github/workflows/pre-commit.yml"}]) is None
 
 
 def test_diff_uses_pr_merge_base_and_push_range(monkeypatch):

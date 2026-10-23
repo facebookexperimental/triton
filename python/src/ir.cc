@@ -47,10 +47,13 @@
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Tools/Sys/Dump.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "triton/Tools/TimeTrace.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TimeProfiler.h"
 #include <memory>
 
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "third_party/tlx/dialect/include/IR/Dialect.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -1416,6 +1419,12 @@ void init_triton_ir(py::module_ &m) {
            })
 
       // Cast instructions
+      .def("create_amd_scaled_downcast_fp8",
+           [](TritonOpBuilder &self, Value src, Type elemType,
+              uint8_t scaleConst) -> Value {
+             return self.create<triton::amdgpu::ScaledDowncastFp8Op>(
+                 src, elemType, scaleConst);
+           })
       // Conversions for custom FP types (FP8 and non-standard rounding
       // modes)
       .def(
@@ -2339,6 +2348,9 @@ void init_triton_ir(py::module_ &m) {
             bool haveTiming = ::triton::tools::getBoolEnv("MLIR_ENABLE_TIMING");
             if (haveTiming) {
               self.enableTiming();
+            }
+            if (llvm::timeTraceProfilerEnabled()) {
+              mlir::triton::tools::addTimeTraceInstrumentation(self);
             }
 
             TritonSourceMgrDiagnosticHandler diagHandler =

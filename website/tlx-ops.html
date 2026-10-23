@@ -36,6 +36,14 @@
 <a class="sub" href="#interface">Interface</a>
 <a class="sub" href="#structure">Structure</a>
 <a class="sub" href="#current-availability">Current availability</a>
+<a class="sub" href="#linear-weight-and-bias-gradients">Linear weight and bias gradients</a>
+<a class="sub" href="#mxfp8-gemm">MXFP8 GEMM</a>
+<a class="sub" href="#mxfp8-grouped-gemm">MXFP8 grouped GEMM</a>
+<a href="tlx-sm90.html">TLX on sm90 (Hopper)</a>
+<a href="tlx-sm100.html">TLX on sm100 (Blackwell)</a>
+<a href="tlx-gfx942.html">TLX on gfx942 (MI300)</a>
+<a href="tlx-gfx950.html">TLX on gfx950 (MI350)</a>
+<a href="tlx-gfx1250.html">TLX on gfx1250 (RDNA4)</a>
 <a href="testing.html">Testing</a>
 <a href="resources.html">Further reading</a></nav>
     </aside>
@@ -65,16 +73,21 @@ out = tlx_mm(a, b)</code></pre>
 <h2 id="current-availability">Current availability</h2>
 <p>Implemented today:</p>
 <pre><code>mm/sm100.py
+mm_bias_grad/sm100.py
+mm_mxfp8/sm100.py
 flash_attn/sm100.py
 flash_attn/gfx950.py
 flash_attn_mxfp8/sm100.py
 flash_attn_mxfp8/gfx950.py
 flash_attn_varlen/gfx950.py
 hstu_attn/sm100.py
+hstu_cross_attn/gfx950.py
 kda/sm100.py</code></pre>
 <p>Current kernel selections for the rest of the catalog:</p>
 <pre><code>kernels/
     mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
+    mm_bias_grad/         sm100.py
+    mm_mxfp8/             sm100.py
     addmm/                gfx942.py
     bmm/                  gfx942.py
     flash_attn/           sm90.py  sm100.py  gfx950.py  (fwd + bwd)
@@ -82,17 +95,107 @@ kda/sm100.py</code></pre>
     flash_attn_varlen/    gfx950.py                     (forward only)
     hstu_attn/            sm100.py  gfx942.py
                           _util.py  _stubs.py  _reference.py
+    hstu_cross_attn/      gfx950.py                     (fwd + bwd, split-KV)
     kda/                  sm100.py
     gdpa/                 sm100.py  gfx950.py
     grouped_gemm/         sm100.py  gfx950.py
+    grouped_gemm_mxfp8/   sm100.py  gfx950.py
     addmm_glu/            gfx950.py
     paged_decode/         gfx950.py
     ikbo_fa/              gfx950.py
     ikbo_lce/             gfx950.py
     multi_cta_layernorm/  sm100.py
     cross_attention/      sm100.py
-    bmm_shared_a/         gfx950.py</code></pre></article>
-<footer class="pager"><a href="kernels.html">← Tutorial kernels</a><a class="next" href="testing.html">Testing →</a></footer>
+    bmm_shared_a/         gfx950.py</code></pre>
+<h2 id="linear-weight-and-bias-gradients">Linear weight and bias gradients</h2>
+<pre><code class="language-python">from triton.tlx.ops import mm_bias_grad
+
+d_weight, d_bias = mm_bias_grad(dout, input_act, space=&quot;full&quot;)</code></pre>
+<p><code>dout</code> is contiguous <code>[batch, out_features]</code> and <code>input_act</code> is contiguous <code>[batch, in_features]</code>, with matching BF16 dtype on the same Blackwell GPU. Feature dimensions are positive multiples of eight; batch is positive and may have a partial K tile. The result is <code>dout.T @ input_act</code> and <code>dout.sum(0)</code>, in the input dtype. <code>out=(d_weight, d_bias)</code> supplies contiguous, non-overlapping outputs. These explicit first-order gradients accept saved activations requiring gradients and do not construct a higher-order graph.</p>
+<p>The operation follows the same architecture layout as <code>mm</code>:</p>
+<pre><code>mm_bias_grad/
+    __init__.py
+    _shapes.py
+    sm100.py</code></pre>
+<p><code>sm100.py</code> contains the private JIT paths, configuration generation and pruning, lazy autotuning and the launch entry point. The catalog registers one public implementation for <code>(mm_bias_grad, sm100)</code>. <code>_shapes.py</code> uses the shared <code>FocusRegistry</code> for <code>sm100_1</code> and defines synthetic correctness cases.</p>
+<p>The kernel horizontally fuses GEMM and bias reduction through shared <code>dout</code> tiles. Four warp tasks run the epilogue, MMA, TMA and bias reduction. The bias task is replicated per MMA group; bias and MMA release each shared output-gradient tile through a two-arrival completion barrier. The large-K heuristic uses two CTAs, two MMA groups and eight default warps. BF16 split partials for weight and bias are finalized together. The default <code>space=&quot;heuristic&quot;</code> selects one configuration; <code>space=&quot;full&quot;</code> measures the complete operation over tile sizes, buffer depths and split-K choices spanning one and two occupancy waves. Below batch 65536, autotuning uses CUDA graph timing, including the merged finalization. Larger batches use ordinary-launch autotuning with cache flushing.</p>
+<p>Correctness tests live in <code>python/test/unit/tlx_ops/test_mm_bias_grad_sm100.py</code>. They cover BF16 production shapes, partial K and feature tiles, split-K, non-power-of-two buffer depths, bias ownership and CUDA graph replay. Run them from <code>fbsource/fbcode</code>:</p>
+<pre><code class="language-bash">CUDA_VISIBLE_DEVICES=1 buck2 run @mode/opt -m ovr_config//triton:beta \
+  -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
+  --agent-context direct_call=true --agent-context reason=&quot;Check fused weight and bias gradients&quot; \
+  fbsource//third-party/triton/beta/triton:py_tlx_mm_bias_grad_test -- -s --tb=short -v</code></pre>
+<h3 id="benchmark-against-unfused-pt2">Benchmark against unfused PT2</h3>
+<p>The TritonBench operator is <code>mm_bias_grad</code>, with <code>pt2_unfused_best</code> and <code>tlx</code> providers. Both return the complete weight and bias pair. PT2 selects among 28 separately compiled serial and concurrent candidates before TritonBench times the providers with CUDA graphs. Inputs are seeded random BF16 tensors.</p>
+<p>From <code>fbsource/fbcode</code>:</p>
+<pre><code class="language-bash">CUDA_VISIBLE_DEVICES=1 ../third-party/triton/beta/triton/third_party/tlx/denoise.sh \
+  buck2 run @mode/opt -m ovr_config//triton:beta \
+  -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
+  -c fbcode.enable_gpu_sections=true \
+  --agent-context direct_call=true --agent-context reason=&quot;Benchmark tlx.ops linear gradients&quot; \
+  fbcode//pytorch/tritonbench:run_tlx -- \
+  --op mm_bias_grad --only pt2_unfused_best,tlx --metrics latency,speedup</code></pre>
+<p>For all candidate timings and a complete JSON report, the standalone entry uses <code>tritonbench/operators/fb/mm_bias_grad/benchmark.py</code>.</p>
+<p>From <code>fbsource/fbcode</code>, on an idle B200:</p>
+<pre><code class="language-bash">CUDA_VISIBLE_DEVICES=1 ../third-party/triton/beta/triton/third_party/tlx/denoise.sh \
+  buck2 run @mode/opt -m ovr_config//triton:beta \
+  -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
+  --agent-context direct_call=true --agent-context reason=&quot;Benchmark fused weight and bias gradients&quot; \
+  fbsource//third-party/triton/beta/triton:py_tlx_mm_bias_grad_perf -- \
+  --space full --json /tmp/mm_bias_grad_benchmark.json</code></pre>
+<p>The default focus suite is <code>(1024, 384, 384)</code>, <code>(4096, 512, 384)</code>, <code>(8192, 256, 256)</code> and <code>(294912, 512, 384)</code>, in <code>(batch, out, in)</code> order. Use <code>--shape BATCH OUT IN</code> to select cases.</p>
+<p>The benchmark separately compiles the PT2 GEMM and sum, making horizontal fusion across them impossible. It uses exhaustive max-autotune GEMM searches over ATEN, Triton and the combined ATEN/Triton/CUTLASS set, and compares cuBLAS/cuBLASLt preferences and reduction coordinate descent enabled and disabled. Each pair is measured both serially and with GEMM and reduction on separate CUDA streams joined before completion. Every candidate is checked against an FP32 reference. The fastest median end-to-end PT2 pair is selected per shape, with all provider times, compile failures and autotune warnings recorded in JSON. The selected GEMM backend is recorded separately from the requested search set, including any TorchTLX templates enabled in the current PT2 build. The default search measures 28 unfused PT2 providers per shape. To remeasure the winning serial and concurrent settings from a completed search, add <code>--pt2-report /tmp/mm_bias_grad_benchmark.json</code> and write the new measurements to a different <code>--json</code> path. The saved report must contain the complete search and match the GPU model, SM count, software versions, dtype and fill. The winners are compiled, checked and timed again alongside TLX.</p>
+<p>Both implementations capture 64 complete output pairs per CUDA graph and use CUDA events to time repeated graph launches, with the same inputs and output dtype. Timing includes both outputs and TLX split-K finalization. Compilation and autotuning precede timing. Three interleaved timing rounds follow a one-second warmup. Timing inputs default to zeros for fixed-clock measurements; use <code>--fill uniform</code> for populated inputs. Correctness always uses seeded random inputs. Replaying the same input tensors is a warm-cache measurement; the large production case's input footprint exceeds B200 L2.</p>
+<h3 id="configurations-and-split-k-layout">Configurations and split-K layout</h3>
+<p><code>CONFIGS</code>, <code>SMOKE_CONFIGS</code> and <code>heuristic_config</code> define the full, smoke and heuristic spaces in <code>sm100.py</code>. Autotune state initializes lazily per shape and device, and the SM count follows the input device. Configuration pruning accounts for SMEM, TMEM, paired-CTA tile ownership and empty K splits. Split-K configurations require whole M tiles because workspace rows use M as their split stride. Feature tails use a single split. Worker tasks use a 168-register budget, and autotuning includes the merged weight/bias finalization.</p>
+<h3 id="b200-measurements">B200 measurements</h3>
+<p>BF16 results on B200 with 148 SMs, Torch <code>2.16.0a0+fb</code>, Triton <code>3.9.0+fb</code> and CUDA <code>12.8.0</code>, using the graph timing protocol above:</p>
+<table><thead><tr><th>Shape (batch, out, in)</th><th>TLX fused (us)</th><th>Best unfused PT2 (us)</th><th>Speedup</th><th>Selected PT2 GEMM / execution</th></tr></thead><tbody><tr><td>(1024, 384, 384)</td><td>6.69</td><td>4.48</td><td>0.67x</td><td>ATEN / concurrent</td></tr><tr><td>(4096, 512, 384)</td><td>8.00</td><td>8.36</td><td>1.04x</td><td>ATEN / concurrent</td></tr><tr><td>(8192, 256, 256)</td><td>8.89</td><td>8.62</td><td>0.97x</td><td>TRITON / concurrent</td></tr><tr><td>(294912, 512, 384)</td><td>122.58</td><td>138.45</td><td>1.13x</td><td>TRITON / serial</td></tr></tbody></table>
+<p>The small cases remeasure the serial and concurrent winners selected by the complete 28-provider search. The large case uses that complete-search round, which produced the fastest observed PT2 baseline. Every row compares the complete TLX and PT2 output pair within the same timing round. The 1024 and 8192 cases remain slower than the best current PT2 pair.</p>
+<p>A subsequent large-case matched run measured TLX at 123.92 us and PT2 at 145.76 us. A graph-autotuning trial selected a slower 143.02 us TLX configuration for this shape; the large-K policy uses ordinary-launch autotuning. All reports retain the selected configurations, individual timing samples and compiler diagnostics.</p>
+<h2 id="mxfp8-gemm">MXFP8 GEMM</h2>
+<pre><code class="language-python">out = triton.tlx.ops.mm_mxfp8(a, a_scale, b, b_scale, out=None, sf_layout=&quot;natural&quot;, space=&quot;full&quot;)</code></pre>
+<p>Computes <code>a @ b.T</code> from contiguous E4M3 <code>a</code> <code>[M, K]</code> and <code>b</code> <code>[N, K]</code> with one E8M0 scale per 32 K values, returning contiguous BF16 <code>[M, N]</code>. <code>M</code>, <code>N</code> and <code>K</code> must be multiples of 128. This is a forward-only SM100 operation promoted from <code>tutorials/blackwell_gemm_ws_mxfp8.py</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>sf_layout=&quot;natural&quot;</code>: <code>a_scale</code> is <code>[M, K // 32]</code> and <code>b_scale</code> is</div></div>
+<p><code>[N, K // 32]</code>; they are packed into the blocked layout on every call.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>sf_layout=&quot;cublas_blocked&quot;</code>: scales are already in the cuBLAS 128x4 atom</div></div>
+<p>layout, e.g. torchao's <code>MXTensor.to_mx(..., is_swizzled_scales=True).scale</code>, and must contain exactly <code>M * K // 32</code> and <code>N * K // 32</code> bytes.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>space=&quot;full&quot;</code> (default) autotunes over 1-/2-CTA, split-K, overlapped-</div></div>
+<p>accumulator and pipeline-depth configs; the first call per shape compiles and benchmarks the pruned space. When all of B fits in shared memory next to at least four A stages (small N and K), it also tries a B-resident family: B is loaded once per CTA, each tile computes a whole 128 x N row so A is read from DRAM once, and the epilogue uses async TMA stores. <code>space=&quot;heuristic&quot;</code> launches one shape-picked config without autotuning.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>A supplied <code>out</code> must be contiguous, non-overlapping BF16 <code>[M, N]</code> on</div></div>
+<p><code>a.device</code> and is returned by identity.</p>
+<h2 id="mxfp8-grouped-gemm">MXFP8 grouped GEMM</h2>
+<pre><code class="language-python">out = triton.tlx.ops.grouped_gemm_mxfp8(
+    x,
+    x_scale,
+    w,
+    w_scale,
+    split_sizes,
+    out=None,
+    num_sms=None,
+    sf_layout=&quot;natural&quot;,
+)</code></pre>
+<p>The exact public signature is <code>(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout=&#x27;natural&#x27;)</code>. This is a forward-only operation for SM100 (compute capability 10.0) and gfx950 (MI350/MI355X): E4M3 inputs and E8M0 scale factors produce a contiguous BF16 result. It has no backward implementation or fallback on other architectures.</p>
+<h3 id="data-and-group-layout">Data and group layout</h3>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>x</code> is contiguous E4M3 <code>[GM, K]</code> data, packed in expert order.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>w</code> is contiguous E4M3 <code>[G, N, K]</code> or packed <code>[G * N, K]</code> data. For rank 2,</div></div>
+<p><code>G</code> comes from <code>split_sizes.shape[0]</code>, and <code>w.shape[0]</code> must be divisible by <code>G</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>split_sizes</code> is contiguous int32 <code>[G]</code> on the same CUDA device. Values may be</div></div>
+<p>zero, must be nonnegative, every exclusive prefix must be divisible by 128, and the final sum must equal <code>GM</code>. Thus zero-sized experts are supported in any position, but a nonzero expert may start only at a 128-row boundary.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>GM</code> and <code>K</code> must be positive and divisible by 128; <code>G</code> and <code>N</code> must be</div></div>
+<p>positive. TMA base pointers and row byte strides must be 16-byte aligned, which additionally requires <code>N</code> to be divisible by 8 for the BF16 output.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Every input must be contiguous and on <code>x.device</code>.</div></div>
+<p>The split values remain on device so dispatch does not introduce a host read or synchronization. The kernel checks nonnegativity, aligned prefixes, and the final sum. Violating one of those requirements triggers a device trap; callers that need to observe the error immediately must synchronize the CUDA stream.</p>
+<h3 id="scale-factor-layouts">Scale-factor layouts</h3>
+<p>Both scale tensors are contiguous E8M0. <code>sf_layout</code> accepts exactly these values:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>&quot;natural&quot;</code> (default): <code>x_scale</code> has exact shape <code>[GM, K // 32]</code>.</div></div>
+<p>With rank-3 <code>w</code>, <code>w_scale</code> is <code>[G, N, K // 32]</code>; with rank-2 <code>w</code>, it is <code>[G * N, K // 32]</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>&quot;cublas_blocked&quot;</code>: both scales are rank-2 opaque byte tensors in the cuBLAS</div></div>
+<p>128-row by 4-scale-column atom layout. Let <code>SK = 4 * ceil((K // 32) / 4)</code>. <code>x_scale</code> must contain exactly <code>ceil(GM / 128) * 128 * SK</code> bytes, and <code>w_scale</code> exactly <code>G * ceil(N / 128) * 128 * SK</code> bytes. Tensor shape is otherwise opaque; byte order, not a semantic row/column interpretation, defines this layout.</p>
+<h3 id="output-and-scheduling">Output and scheduling</h3>
+<p>The result shape is <code>[GM, N]</code>. If <code>out</code> is supplied, it must be a contiguous, non-overlapping BF16 tensor of that exact shape on <code>x.device</code>, and the operation returns the same tensor object. <code>num_sms=None</code> launches one persistent CTA per SM on the input device; an explicit <code>num_sms</code> must be an integer from 1 through the device SM count.</p>
+<p>The SM100 implementation uses fixed, shape-selected 1CTA and 2CTA configurations with a dynamic atomic tile scheduler; it does not autotune. Large, sufficiently saturated N/K shapes use a cooperative 2CTA cluster, while other shapes retain the 1CTA path. Each launch owns a counter initialized to zero; that reset is part of CUDA graph capture and is replayed before the kernel, so repeated graph replays traverse all tiles.</p>
+<p>The gfx950 implementation launches one persistent workgroup per CU (<code>num_sms</code> counts CUs) with an XCD-aware static tile stride, so it needs no counter and is graph-safe. When 256x256 tiles fill the device it uses the 2x2-quadrant <code>warp_pipeline_stage</code> engine of the FP16 gfx950 grouped GEMM, with each half-tile's scales copied direct-to-LDS alongside its data. Smaller problems use a compiler-pipelined 128-row tile. It does not autotune.</p></article>
+<footer class="pager"><a href="kernels.html">← Tutorial kernels</a><a class="next" href="tlx-sm90.html">TLX on sm90 (Hopper) →</a></footer>
     </main>
   </div>
 </body>

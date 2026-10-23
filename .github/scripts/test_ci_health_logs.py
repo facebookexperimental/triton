@@ -29,6 +29,18 @@ def test_parametrized_variants_collapse_to_one_id():
     assert job["steps"][0]["failures"] == [{"id": "x.py::test_addmm", "msg": "AssertionError: one"}]
 
 
+def test_bench_keeps_the_op_parameter():
+    job = {
+        "name": "b200 / bench", "steps":
+        [step("Run tlx.ops perf suite", "failure", "2026-10-16T00:00:00Z", "2026-10-16T01:00:00Z")]
+    }
+    log = ("2026-10-16T00:01:56.2055972Z FAILED t.py::test_op_perf[bench_mm] - AssertionError: one\n"
+           "2026-10-16T00:01:56.2057707Z FAILED t.py::test_op_perf[bench_kda] - AssertionError: two\n")
+    lg.attach_failures(job, log, normalize_ids=False)
+    assert [f["id"]
+            for f in job["steps"][0]["failures"]] == ["t.py::test_op_perf[bench_mm]", "t.py::test_op_perf[bench_kda]"]
+
+
 def test_lines_attach_to_the_step_by_timestamp():
     job = {
         "name":
@@ -87,3 +99,31 @@ def test_selection_fallback_is_flagged():
 
 def test_selection_missing_is_none():
     assert lg.parse_selection("2026-10-19T19:56:15.1Z nothing here\n") is None
+
+
+def lit_job():
+    return {"name": "LIT Tests", "steps": [step("Build and run LIT tests", "failure", None, None)]}
+
+
+def test_lit_failures_take_the_first_error_of_each_test():
+    log = ("2026-10-21T22:22:47.7Z Testing:  0.. 10.. 20..\n"
+           "2026-10-21T22:22:47.8Z FAIL: TRITON :: TritonGPU/a.mlir (401 of 646)\n"
+           "2026-10-21T22:22:47.8Z ******************** TEST 'TRITON :: TritonGPU/a.mlir' FAILED ********************\n"
+           "2026-10-21T22:22:47.8Z # | /w/a.mlir:19:10: remark: MMA version 5 acceleration not applied\n"
+           "2026-10-21T22:22:47.8Z # | /w/a.mlir:32:50: error: undefined variable: MMA\n"
+           "2026-10-21T22:22:47.8Z # | /w/a.mlir:40:1: error: a second error\n"
+           "2026-10-21T22:22:47.9Z ********************\n"
+           "2026-10-21T22:22:48.0Z XPASS: TRITON :: Conversion/b.mlir (402 of 646)\n"
+           "2026-10-21T22:22:48.1Z XFAIL: TRITON :: Conversion/c.mlir (403 of 646)\n"
+           "2026-10-21T22:22:49.0Z Failed Tests (1):\n"
+           "2026-10-21T22:22:49.0Z   TRITON :: TritonGPU/a.mlir\n")
+    job = lit_job()
+    lg.attach_lit_failures(job, log)
+    assert job["steps"][0]["failures"] == [{"id": "TritonGPU/a.mlir", "msg": "undefined variable: MMA"},
+                                           {"id": "Conversion/b.mlir", "msg": "XPASS"}]
+
+
+def test_lit_step_that_failed_before_lit_ran_gets_no_failures():
+    job = lit_job()
+    lg.attach_lit_failures(job, "2026-10-21T22:00:00.0Z FAILED: lib/x.cpp.o\n2026-10-21T22:00:00.1Z error: boom\n")
+    assert "failures" not in job["steps"][0]

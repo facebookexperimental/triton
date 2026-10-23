@@ -162,20 +162,31 @@ def amd_scheduled_mfma(
     chain carried across phases. Both roles use native ROCDL MFMA intrinsics,
     exposing arithmetic latency and hazards to LLVM.
 
-    Persistent chains use inline assembly to constrain operand register
-    classes. ``resident_operand=0`` or ``1`` selects the left or right input
-    for AGPR placement; other inputs use VGPRs. ``accumulator_register_class``
-    may select ``"agpr"`` or ``"vgpr"``, and persistent ``auto`` selects AGPRs.
-    Persistent accumulator tuples are pinned after all K updates; nonconstant
-    input accumulators are also pinned before the updates when ``initialize``
-    is false. These side-effecting accumulator pins constrain compiler-side
-    ordering. Kernel chains with only native consumers and no calls retain
-    empty pins that provide no hardware wait. If a persistent result reaches
-    opaque inline assembly or an unmodeled escape, including through potentially
-    aliasing memory reloads, without a sufficient explicit commit, affected
-    result pins include a target-specific completion wait. Non-kernel helpers
-    and functions with remaining calls conservatively complete every persistent
-    result at its pin, including unused fragments.
+    A persistent chain has two guarantees that a transient chain does not:
+
+    * Lifetime and storage. The accumulator keeps one register class across
+      phases. ``accumulator_register_class`` may select ``"agpr"`` or
+      ``"vgpr"``, and persistent ``auto`` selects AGPRs. Accumulator tuples are
+      pinned after all K updates; nonconstant input accumulators are also
+      pinned before the updates when ``initialize`` is false. These
+      side-effecting pins constrain compiler-side ordering.
+    * Self-completion. Each result pin records the MFMA result hazard. Kernel
+      chains with only native consumers and no calls retain empty pins that
+      provide no hardware wait. If a persistent result reaches opaque inline
+      assembly or an unmodeled escape, including through potentially aliasing
+      memory reloads, without a sufficient explicit commit, affected result
+      pins include a target-specific completion wait. Non-kernel helpers and
+      functions with remaining calls conservatively complete every persistent
+      result at its pin, including unused fragments.
+
+    ``resident_operand`` is a separate operand-placement control, which only
+    the persistent path applies. It does not change either guarantee above.
+    ``None`` constrains both inputs to VGPRs. ``0`` or ``1`` constrains the
+    left or right input to AGPRs and the other input to VGPRs.
+    ``"unconstrained"`` adds no input constraints and leaves input placement
+    to LLVM. An input constraint consumes its operand, so constraining an
+    operand loaded from shared memory makes LLVM wait for that load at the
+    constraint instead of at the MFMA.
 
     Functions containing persistent MFMAs also prefix nonempty opaque inline
     assembly with the largest required completion delay in that function. This
@@ -209,14 +220,15 @@ def amd_scheduled_mfma(
     initialize = tl._unwrap_if_constexpr(initialize)
     assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), ("a and b must be distributed tensors")
     assert isinstance(acc, tl.tensor), "acc must be a distributed tensor"
-    assert resident_operand is None or (isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
-                                        and resident_operand in (0, 1)), "resident_operand must be None, 0, or 1"
+    assert resident_operand is None or resident_operand == "unconstrained" or (
+        isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
+        and resident_operand in (0, 1)), 'resident_operand must be None, 0, 1, or "unconstrained"'
     assert accumulator_role in ("transient",
                                 "persistent"), ('accumulator_role must be either "transient" or "persistent"')
     assert accumulator_register_class in (None, "agpr",
                                           "vgpr"), ("accumulator_register_class must be None, \"agpr\", or \"vgpr\"")
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
-    resident_role = {None: "none", 0: "lhs", 1: "rhs"}[resident_operand]
+    resident_role = {None: "none", 0: "lhs", 1: "rhs", "unconstrained": "unconstrained"}[resident_operand]
     accumulator_class = ("auto" if accumulator_register_class is None else accumulator_register_class)
     handle = _semantic.builder.create_amd_scheduled_mfma(
         a.handle,

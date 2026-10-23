@@ -36,6 +36,7 @@
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/VCSRevision.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
@@ -44,6 +45,7 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/InstSimplifyPass.h"
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <memory>
@@ -705,7 +707,7 @@ void init_triton_llvm(py::module_ &m) {
          std::string arch, std::string features, std::vector<std::string> flags,
          bool enable_fp_fusion, bool disable_slp_vectorizer,
          bool disable_vector_combine, bool expand_masked_div_rem,
-         bool scalarize_packed_fops) {
+         bool scalarize_packed_fops, bool vectorize_extracted_adds) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
         // Declare the same flags as codegen even though IR optimization does
@@ -747,6 +749,11 @@ void init_triton_llvm(py::module_ &m) {
         }
         if (mlir::triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
           standardInstr.registerCallbacks(passInstrCb, &mam);
+          enablePassInstrumentation = true;
+        }
+        TimeProfilingPassesHandler timeProfiling;
+        if (llvm::timeTraceProfilerEnabled()) {
+          timeProfiling.registerCallbacks(passInstrCb);
           enablePassInstrumentation = true;
         }
         if (enablePassInstrumentation)
@@ -819,10 +826,14 @@ void init_triton_llvm(py::module_ &m) {
           mpm.addPass(AddressSanitizerPass(Opts));
         }
         mpm.addPass(pb.buildPerModuleDefaultPipeline(opt));
-        if (scalarize_packed_fops) {
+        if (vectorize_extracted_adds || scalarize_packed_fops) {
           FunctionPassManager fpm;
-          fpm.addPass(ScalarizePackedFOpsPass());
-          fpm.addPass(InstSimplifyPass());
+          if (vectorize_extracted_adds)
+            fpm.addPass(VectorizeExtractedAddsPass());
+          if (scalarize_packed_fops) {
+            fpm.addPass(ScalarizePackedFOpsPass());
+            fpm.addPass(InstSimplifyPass());
+          }
           mpm.addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));
         }
         if (expand_masked_div_rem)
@@ -840,6 +851,7 @@ void init_triton_llvm(py::module_ &m) {
       py::arg("disable_vector_combine") = false,
       py::arg("expand_masked_div_rem") = false,
       py::arg("scalarize_packed_fops") = false,
+      py::arg("vectorize_extracted_adds") = false,
       py::call_guard<py::gil_scoped_release>());
 
   m.def(
@@ -967,6 +979,29 @@ void init_triton_llvm(py::module_ &m) {
     // thread pool is not fork-safe: a forked child inherits the pool's state
     // but not its threads, causing SIGABRT on use or cleanup.
     llvm::parallel::strategy = llvm::hardware_concurrency(1);
+  });
+
+  // Per-thread LLVM time-trace profiler, used by triton.tools.compile_trace.
+  // begin returns the steady_clock time the profiler's timestamps are relative
+  // to (CLOCK_MONOTONIC on Linux, like Python's time.monotonic_ns), or -1 if a
+  // profiler is already running on this thread.
+  m.def("time_trace_begin", [](unsigned granularityUs) -> int64_t {
+    if (llvm::timeTraceProfilerEnabled())
+      return -1;
+    auto start = std::chrono::steady_clock::now();
+    llvm::timeTraceProfilerInitialize(granularityUs, "triton");
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               start.time_since_epoch())
+        .count();
+  });
+  m.def("time_trace_end", []() -> std::string {
+    if (!llvm::timeTraceProfilerEnabled())
+      return "";
+    SmallString<0> json;
+    llvm::raw_svector_ostream os(json);
+    llvm::timeTraceProfilerWrite(os);
+    llvm::timeTraceProfilerCleanup();
+    return std::string(json);
   });
 
   m.def("link_extern_libs", [](llvm::Module *dstMod,
