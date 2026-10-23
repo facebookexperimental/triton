@@ -104,7 +104,10 @@ jobs:
     env:
       SETUP_SCRIPT: /workspace/setup_instance.sh
       CUDA_VERSION: "13.4"
-    timeout-minutes: 120
+    # Setup takes about 4 minutes. The step limits below fit the rest inside
+    # the job's limit, so a slow run ends as incomplete with its logs uploaded
+    # instead of being cancelled.
+    timeout-minutes: 20
     permissions:
       id-token: write
       contents: read
@@ -141,9 +144,10 @@ jobs:
         with:
           cuda-version: ${{ env.CUDA_VERSION }}
           cutracer-version: ${{ env.CUTRACER_VERSION }}
+          cuda-arch: sm_100
       - name: Run sanitizers
         id: sanitize
-        timeout-minutes: 90
+        timeout-minutes: 9
         env:
           # The one place that decides whether this run files and closes issues:
           # only a run of main's code speaks for main. It closes only the issues
@@ -161,9 +165,40 @@ jobs:
             --tools "${TOOLS}" \
             --kernel "${KERNEL}" \
             --out "${RUNNER_TEMP}/cutracer" \
-            --timeout-minutes 30 \
+            --timeout-minutes 4 \
             "${ISSUES[@]}" \
             -- python -m pytest "${TEST_IDS[@]}" --import-mode=importlib -q -p no:cacheprovider
+      # Correct synchronization does not depend on timing, so a test that
+      # fails once CUTracer delays its threads at random points reveals a
+      # race the sanitizers above cannot see.
+      - name: Run tests under random delay
+        if: ${{ !cancelled() && steps.sanitize.outcome != 'skipped' }}
+        timeout-minutes: 5
+        env:
+          TESTS: ${{ needs.select.outputs.tests }}
+        run: |
+          . "${SETUP_SCRIPT}"
+          readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
+          FILTER=()
+          if [[ -n "${KERNEL}" ]]; then
+            FILTER=(--kernel-filters "${KERNEL}")
+          fi
+          # CUTracer also writes a file per kernel launch, hundreds of MB for a
+          # test file; only its main log and the delay config go into the
+          # uploaded logs. The config replays a failure with --delay-load-path.
+          OUT="${RUNNER_TEMP}/random-delay"
+          LOGS="${RUNNER_TEMP}/cutracer/random-delay"
+          mkdir -p "${OUT}" "${LOGS}"
+          status=0
+          cutracer trace --cutracer-so "${CUTRACER_SO}" -a random_delay --delay-ns 10000 \
+            --delay-dump-path "${LOGS}/delay-config.json" \
+            "${FILTER[@]}" --output-dir "${OUT}" \
+            -- python -m pytest "${TEST_IDS[@]}" --import-mode=importlib -q -p no:cacheprovider \
+            > "${OUT}/pytest.log" 2>&1 || status=$?
+          # CUTracer prints a line per delay point; keep them out of the job log.
+          grep -v -E '^(Delay injection|CUTracer: )' "${OUT}/pytest.log" | tail -200
+          cp "${OUT}"/cutracer_main_*.log "${LOGS}/" || true
+          exit "${status}"
       - name: Upload sanitizer logs
         if: always()
         uses: actions/upload-artifact@v4
