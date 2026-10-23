@@ -166,8 +166,8 @@ isTransparentDotUserBeforeConstraintMaterialization(Operation *op,
   if (auto requireOp = dyn_cast<ttg::RequireLayoutOp>(op)) {
     assert(operandIndex == 0 && "RequireLayoutOp only has one operand");
     auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
-    return resultType &&
-           isSupportedDotConstraintEncoding(resultType.getEncoding());
+    return resultType && isSupportedDotConstraintEncoding(
+                             getEffectiveEncoding(resultType.getEncoding()));
   }
 
   return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
@@ -189,7 +189,8 @@ public:
     top->walk([&](ttg::RequireLayoutOp requireOp) {
       auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
       if (!isTrackedDotValue(requireOp.getSrc()) || !resultType ||
-          !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+          !isSupportedDotConstraintEncoding(
+              getEffectiveEncoding(resultType.getEncoding())))
         return;
       unionLatticeAnchors<DotRewriteLattice>(requireOp.getSrc(),
                                              requireOp.getResult());
@@ -204,8 +205,8 @@ public:
     if (auto dotOp = dyn_cast<tt::DotOp>(op)) {
       for (unsigned i = 0; i < 2; ++i) {
         auto type = cast<RankedTensorType>(dotOp.getOperand(i).getType());
-        if (auto dotEnc =
-                dyn_cast<ttg::DotOperandEncodingAttr>(type.getEncoding())) {
+        if (auto dotEnc = dyn_cast<ttg::DotOperandEncodingAttr>(
+                getEffectiveEncoding(type.getEncoding()))) {
           ChangeResult changed = operands[i]->meet(DotRewriteState(dotEnc));
           propagateIfChanged(operands[i], changed);
         }
