@@ -2362,6 +2362,39 @@ def test_flash_attn_mxfp8_gfx950_quantization_large_head_offset_codegen(kind):
     assert re.search(r"arith.muli .* : i64", ir)
 
 
+# Grad-enabled calls use the hardware-exp2 training forward, which saves the
+# statistics backward recomputes P from; no_grad calls use the inference
+# ping-pong kernel, whose approximate exp2 is faster. Their outputs differ by
+# less than either differs from BF16 SDPA (measured <= 0.039 RRMS).
+_TRAIN_INFERENCE_FORWARD_RRMS = 0.05
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 512, 128), (1, 2, 768, 128), (4, 32, 1024, 128), (4, 32, 2048, 128)])
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_mxfp8_gfx950_train_and_inference_forward_agree(shape, causal):
+    from triton.tlx.ops import flash_attn_mxfp8
+
+    def relative_rms(actual, expected):
+        actual, expected = actual.float(), expected.float()
+        return ((actual - expected).square().mean() / expected.square().mean()).sqrt().item()
+
+    torch.manual_seed(0)
+    q, k, v = _qkv(shape)
+    reference = _sdpa(q, k, v, causal, 0.5)
+    with torch.no_grad():
+        inference = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=0.5)
+    training = flash_attn_mxfp8(*[x.clone().requires_grad_() for x in (q, k, v)], causal=causal, sm_scale=0.5).detach()
+    assert training.grad_fn is None and inference.shape == training.shape
+    drift = relative_rms(training, inference)
+    assert drift < _TRAIN_INFERENCE_FORWARD_RRMS
+    for output in (inference, training):
+        assert bool(output.isfinite().all())
+        assert relative_rms(output, reference) < 0.15
+        assert torch.nn.functional.cosine_similarity(output.float().flatten(),
+                                                     reference.float().flatten(), dim=0) >= 0.98
+        assert drift < relative_rms(output, reference)
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
 @pytest.mark.parametrize("negative_input", (0, 1, 2))
 @pytest.mark.parametrize("causal", (False, True))

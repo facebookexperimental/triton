@@ -621,11 +621,14 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
 
     Inputs have identical [batch, heads, sequence, 128] shapes with sequence
     lengths divisible by 256. Both architectures return BF16 gradients.
-    Both architectures use 32x32 Q/K blocks. gfx950 training uses hardware
-    exp2 and saves separate row maxima and log2 normalization terms, whereas
-    its inference ping-pong kernel (non-causal, and causal at sequence lengths
-    divisible by 512) may use an approximate exp2. See the kernel module for
-    the recipes.
+    Both architectures use 32x32 Q/K blocks. On gfx950, calls where autograd
+    records Q, K or V use a training forward with hardware exp2 that saves
+    separate row maxima and log2 normalization terms, the statistics backward
+    recomputes P from. Other calls use the faster inference ping-pong kernel
+    (non-causal, and causal at sequence lengths divisible by 512), whose
+    approximate exp2 makes its output differ from the training forward by
+    about 0.04 relative RMS, less than either differs from BF16 attention.
+    See the kernel module for the recipes.
     ``p_expcast=True`` (Blackwell only) encodes the forward probabilities with
     ExpCast-FP8 instead of exp2 (see kernels/flash_attn_mxfp8/sm100.py).
     """
