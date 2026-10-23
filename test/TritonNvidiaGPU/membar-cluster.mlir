@@ -242,9 +242,10 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @cluster_barrier_for_nonindexed_remote_gather
   // CHECK: ttg.local_gather
   // CHECK: ttg.local_dealloc
-  // CHECK: ttng.cluster_arrive
-  // CHECK-NEXT: ttng.cluster_wait
   // CHECK-NEXT: ttg.local_alloc
+  // CHECK-NEXT: ttng.cluster_arrive
+  // CHECK-NEXT: ttng.cluster_wait
+  // CHECK-NEXT: ttg.local_store
   tt.func @cluster_barrier_for_nonindexed_remote_gather(
       %indices: tensor<2x32xi32, #gatherSubviewBlocked>,
       %replacement: tensor<4x32xi32, #gatherReuseBlocked>) -> tensor<2x32xi32, #gatherSubviewBlocked> {
@@ -252,7 +253,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %remote = ttg.memdesc_subslice %parent [2, 0] : !ttg.memdesc<4x32xi32, #gatherSubviewShared, #smem, mutable> -> !ttg.memdesc<2x32xi32, #gatherSubviewShared, #smem, mutable, 4x32>
     %gathered = ttg.local_gather %remote[%indices] {axis = 1 : i32} : !ttg.memdesc<2x32xi32, #gatherSubviewShared, #smem, mutable, 4x32>, tensor<2x32xi32, #gatherSubviewBlocked> -> tensor<2x32xi32, #gatherSubviewBlocked>
     ttg.local_dealloc %parent : !ttg.memdesc<4x32xi32, #gatherSubviewShared, #smem, mutable>
-    %reuse = ttg.local_alloc %replacement : (tensor<4x32xi32, #gatherReuseBlocked>) -> !ttg.memdesc<4x32xi32, #gatherSubviewShared, #smem, mutable>
+    %reuse = ttg.local_alloc : () -> !ttg.memdesc<4x32xi32, #gatherSubviewShared, #smem, mutable>
+    // Init store keeps the reuse alloc live: the merged pipeline folds unused allocs, collapsing the two lifetimes.
+    ttg.local_store %replacement, %reuse : tensor<4x32xi32, #gatherReuseBlocked> -> !ttg.memdesc<4x32xi32, #gatherSubviewShared, #smem, mutable>
     tt.return %gathered : tensor<2x32xi32, #gatherSubviewBlocked>
   }
 }
@@ -270,16 +273,19 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @cluster_barrier_for_remote_local_load
   // CHECK: ttg.local_load
   // CHECK: ttg.local_dealloc
+  // CHECK-NEXT: ttg.local_alloc
   // CHECK-NEXT: ttng.cluster_arrive
   // CHECK-NEXT: ttng.cluster_wait
-  // CHECK-NEXT: ttg.local_alloc
+  // CHECK-NEXT: ttg.local_store
   tt.func @cluster_barrier_for_remote_local_load(
       %replacement: tensor<4x32xi32, #subviewOwnerBlocked>) -> tensor<2x32xi32, #subviewBlocked> {
     %parent = ttg.local_alloc : () -> !ttg.memdesc<4x32xi32, #subviewShared, #smem, mutable>
     %remote = ttg.memdesc_subslice %parent [2, 0] : !ttg.memdesc<4x32xi32, #subviewShared, #smem, mutable> -> !ttg.memdesc<2x32xi32, #subviewShared, #smem, mutable, 4x32>
     %loaded = ttg.local_load %remote : !ttg.memdesc<2x32xi32, #subviewShared, #smem, mutable, 4x32> -> tensor<2x32xi32, #subviewBlocked>
     ttg.local_dealloc %parent : !ttg.memdesc<4x32xi32, #subviewShared, #smem, mutable>
-    %reuse = ttg.local_alloc %replacement : (tensor<4x32xi32, #subviewOwnerBlocked>) -> !ttg.memdesc<4x32xi32, #subviewShared, #smem, mutable>
+    %reuse = ttg.local_alloc : () -> !ttg.memdesc<4x32xi32, #subviewShared, #smem, mutable>
+    // Init store keeps the reuse alloc live: the merged pipeline folds unused allocs, collapsing the two lifetimes.
+    ttg.local_store %replacement, %reuse : tensor<4x32xi32, #subviewOwnerBlocked> -> !ttg.memdesc<4x32xi32, #subviewShared, #smem, mutable>
     tt.return %loaded : tensor<2x32xi32, #subviewBlocked>
   }
 
@@ -322,16 +328,19 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @cluster_barrier_for_sharded_axis_gather
   // CHECK: ttg.local_gather
   // CHECK: ttg.local_dealloc
+  // CHECK-NEXT: ttg.local_alloc
   // CHECK-NEXT: ttng.cluster_arrive
   // CHECK-NEXT: ttng.cluster_wait
-  // CHECK-NEXT: ttg.local_alloc
+  // CHECK-NEXT: ttg.local_store
   tt.func @cluster_barrier_for_sharded_axis_gather(
       %indices: tensor<2x32xi32, #axisBlocked>,
       %replacement: tensor<2x32xi32, #axisBlocked>) -> tensor<2x32xi32, #axisBlocked> {
     %parent = ttg.local_alloc : () -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
     %gathered = ttg.local_gather %parent[%indices] {axis = 1 : i32} : !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>, tensor<2x32xi32, #axisBlocked> -> tensor<2x32xi32, #axisBlocked>
     ttg.local_dealloc %parent : !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
-    %reuse = ttg.local_alloc %replacement : (tensor<2x32xi32, #axisBlocked>) -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
+    %reuse = ttg.local_alloc : () -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
+    // Init store keeps the reuse alloc live: the merged pipeline folds unused allocs, collapsing the two lifetimes.
+    ttg.local_store %replacement, %reuse : tensor<2x32xi32, #axisBlocked> -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
     tt.return %gathered : tensor<2x32xi32, #axisBlocked>
   }
 
@@ -339,17 +348,22 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @no_cluster_barrier_for_local_gather
   // CHECK: ttg.local_gather
   // CHECK: ttg.local_dealloc
-  // CHECK-NOT: ttng.cluster_barrier
   // CHECK-NOT: ttng.cluster_arrive
   // CHECK-NOT: ttng.cluster_wait
-  // CHECK: ttg.local_alloc
+  // CHECK-NEXT: ttg.local_alloc
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttng.cluster_barrier
+  // CHECK-NEXT: tt.return
   tt.func @no_cluster_barrier_for_local_gather(
       %indices: tensor<2x32xi32, #axisBlocked>,
       %replacement: tensor<2x32xi32, #axisBlocked>) -> tensor<2x32xi32, #axisBlocked> {
     %parent = ttg.local_alloc : () -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
     %gathered = ttg.local_gather %parent[%indices] {axis = 0 : i32} : !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>, tensor<2x32xi32, #axisBlocked> -> tensor<2x32xi32, #axisBlocked>
     ttg.local_dealloc %parent : !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
-    %reuse = ttg.local_alloc %replacement : (tensor<2x32xi32, #axisBlocked>) -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
+    %reuse = ttg.local_alloc : () -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
+    // Init store keeps the reuse alloc live: the merged pipeline folds unused allocs, collapsing the two lifetimes.
+    ttg.local_store %replacement, %reuse : tensor<2x32xi32, #axisBlocked> -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
     tt.return %gathered : tensor<2x32xi32, #axisBlocked>
   }
 
@@ -383,13 +397,13 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-NEXT: ttg.local_atomic_scatter_rmw
   tt.func @cluster_barrier_before_sharded_axis_atomic(
       %indices: tensor<2x32xi32, #axisBlocked>,
-      %values: tensor<2x32xi32, #axisBlocked>) -> tensor<2x32xi32, #axisBlocked> {
+      %values: tensor<2x32xi32, #axisBlocked>) -> (tensor<2x32xi32, #axisBlocked>, tensor<2x32xi32, #axisBlocked>) {
     %first = ttg.local_alloc : () -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
     %loaded = ttg.local_load %first : !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable> -> tensor<2x32xi32, #axisBlocked>
     ttg.local_dealloc %first : !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
     %second = ttg.local_alloc : () -> !ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>
     %old = ttg.local_atomic_scatter_rmw add, %second[%indices], %values {axis = 1 : i32} : (!ttg.memdesc<2x32xi32, #axisShared, #smem, mutable>, tensor<2x32xi32, #axisBlocked>, tensor<2x32xi32, #axisBlocked>) -> tensor<2x32xi32, #axisBlocked>
-    tt.return %old : tensor<2x32xi32, #axisBlocked>
+    tt.return %loaded, %old : tensor<2x32xi32, #axisBlocked>, tensor<2x32xi32, #axisBlocked>
   }
 }
 
@@ -404,16 +418,19 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   // CHECK-LABEL: @cluster_barrier_for_runtime_index_on_sharded_axis
   // CHECK: ttg.local_gather
   // CHECK: ttg.local_dealloc
+  // CHECK-NEXT: ttg.local_alloc
   // CHECK-NEXT: ttng.cluster_arrive
   // CHECK-NEXT: ttng.cluster_wait
-  // CHECK-NEXT: ttg.local_alloc
+  // CHECK-NEXT: ttg.local_store
   tt.func @cluster_barrier_for_runtime_index_on_sharded_axis(
       %indices: tensor<8xi32, #runtimeIndexBlocked>,
       %replacement: tensor<8xi32, #runtimeIndexBlocked>) -> tensor<8xi32, #runtimeIndexBlocked> {
     %parent = ttg.local_alloc : () -> !ttg.memdesc<8xi32, #runtimeIndexShared, #smem, mutable>
     %gathered = ttg.local_gather %parent[%indices] {axis = 0 : i32} : !ttg.memdesc<8xi32, #runtimeIndexShared, #smem, mutable>, tensor<8xi32, #runtimeIndexBlocked> -> tensor<8xi32, #runtimeIndexBlocked>
     ttg.local_dealloc %parent : !ttg.memdesc<8xi32, #runtimeIndexShared, #smem, mutable>
-    %reuse = ttg.local_alloc %replacement : (tensor<8xi32, #runtimeIndexBlocked>) -> !ttg.memdesc<8xi32, #runtimeIndexShared, #smem, mutable>
+    %reuse = ttg.local_alloc : () -> !ttg.memdesc<8xi32, #runtimeIndexShared, #smem, mutable>
+    // Init store keeps the reuse alloc live: the merged pipeline folds unused allocs, collapsing the two lifetimes.
+    ttg.local_store %replacement, %reuse : tensor<8xi32, #runtimeIndexBlocked> -> !ttg.memdesc<8xi32, #runtimeIndexShared, #smem, mutable>
     tt.return %gathered : tensor<8xi32, #runtimeIndexBlocked>
   }
 }
@@ -431,17 +448,22 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   // CHECK-LABEL: @no_cluster_barrier_for_broadcast_gather_larger_index
   // CHECK: ttg.local_gather
   // CHECK: ttg.local_dealloc
-  // CHECK-NOT: ttng.cluster_barrier
   // CHECK-NOT: ttng.cluster_arrive
   // CHECK-NOT: ttng.cluster_wait
-  // CHECK: ttg.local_alloc
+  // CHECK-NEXT: ttg.local_alloc
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttng.cluster_barrier
+  // CHECK-NEXT: tt.return
   tt.func @no_cluster_barrier_for_broadcast_gather_larger_index(
       %indices: tensor<64xi32, #broadcastGatherBlocked>,
       %replacement: tensor<32xi32, #broadcastGatherLocalBlocked>) -> tensor<64xi32, #broadcastGatherBlocked> {
     %parent = ttg.local_alloc : () -> !ttg.memdesc<32xi32, #broadcastGatherShared, #smem, mutable>
     %gathered = ttg.local_gather %parent[%indices] {axis = 0 : i32} : !ttg.memdesc<32xi32, #broadcastGatherShared, #smem, mutable>, tensor<64xi32, #broadcastGatherBlocked> -> tensor<64xi32, #broadcastGatherBlocked>
     ttg.local_dealloc %parent : !ttg.memdesc<32xi32, #broadcastGatherShared, #smem, mutable>
-    %reuse = ttg.local_alloc %replacement : (tensor<32xi32, #broadcastGatherLocalBlocked>) -> !ttg.memdesc<32xi32, #broadcastGatherShared, #smem, mutable>
+    %reuse = ttg.local_alloc : () -> !ttg.memdesc<32xi32, #broadcastGatherShared, #smem, mutable>
+    // Init store keeps the reuse alloc live: the merged pipeline folds unused allocs, collapsing the two lifetimes.
+    ttg.local_store %replacement, %reuse : tensor<32xi32, #broadcastGatherLocalBlocked> -> !ttg.memdesc<32xi32, #broadcastGatherShared, #smem, mutable>
     tt.return %gathered : tensor<64xi32, #broadcastGatherBlocked>
   }
 }
@@ -1134,6 +1156,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-NEXT: ttng.cluster_arrive
   // CHECK-NEXT: ttng.cluster_wait
   // CHECK-NEXT: ttng.fence_mbarrier_init_release_cluster
+  // CHECK-NEXT: ttng.cluster_barrier {relaxed = true}
   // CHECK-NEXT: ttng.async_shared_store
   // CHECK: tt.return
   tt.func @cluster_hazard_before_remote_async_shared_store(
