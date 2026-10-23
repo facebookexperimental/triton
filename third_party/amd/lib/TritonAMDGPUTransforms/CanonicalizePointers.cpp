@@ -1,4 +1,5 @@
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "Utility.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -185,25 +186,6 @@ Value createTruncIOffset(RewriterBase &rewriter, Location loc, Value offset,
 
 using ScalarToSplatMap = llvm::SmallMapVector<std::pair<Value, Type>, Value, 8>;
 
-static Value registerIdentity(Value value) {
-  while (Operation *op = value.getDefiningOp()) {
-    if (!isa<tt::BroadcastOp, tt::ExpandDimsOp, tt::SplatOp>(op))
-      break;
-    value = op->getOperand(0);
-  }
-  return value;
-}
-
-static unsigned tensorRegisters(Value value) {
-  value = registerIdentity(value);
-  auto type = dyn_cast<RankedTensorType>(value.getType());
-  if (!type || !type.getEncoding() || !type.getElementType().isIntOrFloat() ||
-      matchPattern(value, m_Constant()))
-    return 0;
-  return llvm::divideCeil(
-      ttg::getTotalElemsPerThread(type) * type.getElementTypeBitWidth(), 32u);
-}
-
 // Distribute within the narrow ring; extension stays around the rebuilt sum.
 static void distributeAddressProducts(tt::FuncOp func) {
   SmallVector<arith::MulIOp> candidates;
@@ -259,16 +241,9 @@ static void distributeAddressProducts(tt::FuncOp func) {
             !loop.isDefinedOutsideOfLoop(lane))
           continue;
         auto [it, inserted] = pressure.try_emplace(loop, 0);
-        if (inserted) {
-          DenseSet<Value> live;
-          for (Value value : liveness.getLiveIn(loop.getBody()))
-            live.insert(registerIdentity(value));
-          for (Value value : loop.getRegionIterArgs())
-            live.insert(registerIdentity(value));
-          for (Value value : live)
-            it->second += tensorRegisters(value);
-        }
-        unsigned extra = tensorRegisters(lane);
+        if (inserted)
+          it->second = estimateLoopRegisterPressure(loop, liveness);
+        unsigned extra = estimateTensorRegisters(lane);
         LDBG("address product pressure " << it->second << " + " << extra);
         if (it->second + extra >= budget)
           continue;

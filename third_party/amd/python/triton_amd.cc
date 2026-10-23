@@ -125,6 +125,8 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
                      mlir::createTritonAMDGPULowerBarrierOps);
   ADD_FUNC_PASS_WRAPPER_0("add_optimize_buffer_op_ptr",
                           mlir::createTritonAMDGPUOptimizeBufferOpPtr);
+  ADD_FUNC_PASS_WRAPPER_0("add_regroup_buffer_offsets",
+                          mlir::createTritonAMDGPURegroupBufferOffsets);
   ADD_PASS_WRAPPER_0("add_fold_true_cmpi", mlir::createTritonAMDFoldTrueCmpI);
   ADD_PASS_WRAPPER_0("add_fp_sanitizer", mlir::createTritonAMDGPUFpSanitizer);
 

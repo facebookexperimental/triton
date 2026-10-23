@@ -12,6 +12,14 @@
 
 using namespace mlir;
 
+namespace mlir {
+class Liveness;
+}
+
+unsigned estimateTensorRegisters(Value value);
+unsigned estimateLoopRegisterPressure(scf::ForOp loop, Liveness &liveness,
+                                      Operation *point = nullptr);
+
 inline void dumpScheduleDebug(triton::CoarseSchedule &schedule,
                               const char *debugType, llvm::StringRef msg) {
   DEBUG_WITH_TYPE(debugType, {
