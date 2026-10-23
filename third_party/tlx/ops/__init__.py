@@ -15,15 +15,51 @@ to the plain behaviour: `arch=` pins an entry instead of detecting one, and
 
 An op with no implementation for the current GPU raises `UnsupportedOp` -- it
 never falls back to torch.
+
+`space=` also accepts a `Space`, which bundles the search-space name with a
+`BitwiseInvarianceSpec` naming the logical dims that may vary across calls
+while overlapping outputs stay bitwise identical. Unknown dim names raise
+`InvalidInput` before dispatch; a non-empty spec on an op that does not
+enforce it yet raises `UnsupportedOp` rather than being silently ignored.
 """
 
 from __future__ import annotations
 
 import functools
 
-from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
+from ._catalog import (
+    InvalidInput,
+    UnsupportedOp,
+    any_enforces_invariance,
+    check_inputs,
+    impl_for,
+    invariant_vocab_for,
+)
+from ._invariance import BitwiseInvarianceSpec, Space, normalize_space
 
-__all__ = ["mm", "flash_attn", "hstu_attn", "UnsupportedOp", "InvalidInput"]
+__all__ = [
+    "mm", "flash_attn", "hstu_attn", "UnsupportedOp", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+]
+
+
+def _normalize_space_arg(op, space):
+    """Split `space=` into (search-space name, resolved invariance spec).
+
+    Unknown dim names raise `InvalidInput` here, before dispatch. A non-empty
+    spec raises `UnsupportedOp` here when no arch entry enforces it yet; ops
+    with partial enforcement re-check the dispatched entry afterwards.
+    """
+    name, spec = normalize_space(space)
+    resolved = spec.resolve(invariant_vocab_for(op))
+    if resolved.needs_bitwise() and not any_enforces_invariance(op):
+        raise UnsupportedOp(f"tlx.ops.{op} does not enforce bitwise_invariance_spec yet")
+    return name, resolved
+
+
+def _check_enforced(op, entry, invariance):
+    """Refuse an invariance request the dispatched entry does not enforce."""
+    if invariance.needs_bitwise() and not entry.enforces_invariance:
+        raise UnsupportedOp(f"tlx.ops.{op} does not enforce bitwise_invariance_spec yet on {entry.arch}")
 
 
 @functools.lru_cache(maxsize=None)
@@ -36,7 +72,8 @@ def mm(a, b, *, out=None, arch=None, space=None):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
 
     `space=None` uses the implementation's default: a single analytically
-    chosen config so the first call stays interactive.
+    chosen config so the first call stays interactive. `space=` also accepts
+    a `Space` carrying a `BitwiseInvarianceSpec` over the M/N/K vocabulary.
     """
     if a.ndim != 2 or b.ndim != 2:
         raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
@@ -47,6 +84,7 @@ def mm(a, b, *, out=None, arch=None, space=None):
     if a.dtype != b.dtype or a.device != b.device:
         raise InvalidInput("tlx.ops.mm operands must have the same dtype and device; "
                            f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
+    space_name, invariance = _normalize_space_arg("mm", space)
     if arch is None:
         fn, spec = _mm_impl_for_device(a.device)
     else:
@@ -57,11 +95,12 @@ def mm(a, b, *, out=None, arch=None, space=None):
     b_src = b if b.is_contiguous() else b.T
     check_inputs(spec, dtype=a.dtype, row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]),
                  elem_bytes=a.element_size())
-    if space is None:
-        space = spec.default_space
+    _check_enforced("mm", spec, invariance)
+    if space_name is None:
+        space_name = spec.default_space
     if out is None:
-        return fn(a, b, space=space)
-    return fn(a, b, out=out, space=space)
+        return fn(a, b, space=space_name)
+    return fn(a, b, out=out, space=space_name)
 
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, arch=None, space="full"):
