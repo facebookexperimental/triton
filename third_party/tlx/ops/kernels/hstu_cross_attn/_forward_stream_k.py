@@ -41,6 +41,7 @@ MAX_Z = 64
 PIPE_STAGES = 4
 # Fixed cost of a q tile, in KV blocks, when the cost space charges one (see `_phantom`).
 PHANTOM_BLOCKS = 3
+LOG2E: tl.constexpr = tl.constexpr(1.4426950408889634)
 _VGPR_ONLY = (("amdgpu-agpr-alloc", "0,0"), )
 
 
@@ -238,7 +239,7 @@ def _softmax_block_masked(state, q, k_ptrs, v_ptrs, start_n, kv_len, k_buf, v_bu
 @triton.jit
 def _silu(qk, ALPHA: tl.constexpr):
     """`silu(qk * ALPHA)` as `qk * rcp(fma(e, 1/ALPHA, 1/ALPHA))`, with e = exp2(-qk * ALPHA * log2(e))."""
-    NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * 1.4426950408889634
+    NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * LOG2E
     INV_ALPHA: tl.constexpr = 1.0 / ALPHA
     return qk * fast_dividef(1.0, tl.fma(tl.math.exp2(qk * NEG_ALPHA_LOG2E), INV_ALPHA, INV_ALPHA))
 
@@ -339,7 +340,7 @@ def _qk_pieces(q, kt):
 @triton.jit
 def _qk_silu(q, kt, h, ALPHA: tl.constexpr):
     """`_qk_pieces(q, kt)` and `_silu(h)` (as `q.dtype`), woven."""
-    NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * 1.4426950408889634
+    NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * LOG2E
     INV_ALPHA: tl.constexpr = 1.0 / ALPHA
     mma: tl.constexpr = _mma()
     q = tlx.require_layout(q, tlx.dot_operand_layout(0, mma, k_width=8), pin=False)
@@ -401,7 +402,7 @@ def _qk_silu(q, kt, h, ALPHA: tl.constexpr):
 def _pv_silu(acc, p_dot, v, h, ALPHA: tl.constexpr):
     """`_attn_dot_pv_mfma(acc, p_dot, v)` from `_v_pieces` (each D32 tile's K16 steps in order, bit for bit) and
     `_silu(h)` (as `p_dot.dtype`), woven."""
-    NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * 1.4426950408889634
+    NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * LOG2E
     INV_ALPHA: tl.constexpr = 1.0 / ALPHA
     mma: tl.constexpr = _mma()
     p_dot = tlx.require_layout(p_dot, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
@@ -905,9 +906,8 @@ def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets:
         q, k, v, out, m_arg, part, part_lse, seq_offsets_q, seq_offsets, attn_scale, tab, _flags(q.device, P), Z, P=P,
         stride_qm=q.stride(0), stride_qh=q.stride(1), stride_kn=k.stride(0), stride_kh=k.stride(1),
         stride_vn=v.stride(0), stride_vh=v.stride(1), stride_om=out.stride(0), stride_oh=out.stride(1),
-        stride_mm=M.stride(0) if is_softmax else 0, H=H, G=G,
-        QK_SCALE=alpha * 1.4426950408889634 if is_softmax else alpha, IS_SOFTMAX=is_softmax, HEAD_DIM=D,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, Z_PAD=z_pad, LOG2_Z_PAD=max(1, (z_pad - 1).bit_length()),
-        MAX_SEGMENTS=MAX_SEGMENTS, PHANTOM_BLOCKS=PHANTOM_BLOCKS, PIPE_STAGES=PIPE_STAGES,
-        RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2, llvm_fn_attrs=_VGPR_ONLY,
-        enable_sched_group_barrier_scheduler=False)
+        stride_mm=M.stride(0) if is_softmax else 0, H=H, G=G, QK_SCALE=alpha * LOG2E.value if is_softmax else alpha,
+        IS_SOFTMAX=is_softmax, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, Z_PAD=z_pad,
+        LOG2_Z_PAD=max(1, (z_pad - 1).bit_length()), MAX_SEGMENTS=MAX_SEGMENTS, PHANTOM_BLOCKS=PHANTOM_BLOCKS,
+        PIPE_STAGES=PIPE_STAGES, RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2,
+        llvm_fn_attrs=_VGPR_ONLY, enable_sched_group_barrier_scheduler=False)
