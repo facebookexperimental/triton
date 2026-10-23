@@ -92,6 +92,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="direct_load",
         impl="triton.tlx.ops.kernels.mm.gfx942:mm",
         invariant_vocab=_GEMM_DIMS,
+        enforces_invariance=True,
         dtypes=_FP16,
         # No `accepts`: operands are read through explicit strides rather than a
         # descriptor, so there is no alignment rule to fail. This arch therefore
@@ -143,6 +144,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="heuristic",
         impl="triton.tlx.ops.kernels.mm.gfx950:mm",
         invariant_vocab=_GEMM_DIMS,
+        enforces_invariance=True,
         # LocalSplitU and persistent plans remain FP16-only; the register and
         # general LDS paths also support BF16 and validate their own plans.
         dtypes=_FP16,
