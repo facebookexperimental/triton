@@ -5283,7 +5283,17 @@ def test_dot_scaled_tiles_per_warp_attr_gfx1250(tiles_per_warp):
     compiled = _compile_dot_scaled_tiles_per_warp(tiles_per_warp)
     m_tiles, n_tiles = tiles_per_warp
     assert f"amdg.wmma_tiles_per_warp = array<i32: {m_tiles}, {n_tiles}>" in compiled.asm["ttir"]
-    assert "#ttg.amd_wmma" in compiled.asm["ttgir"]
+    # WMMA encodes tiles-per-warp in the CTA layout's register bases, not as
+    # a separate tilesPerWarp field. Check that lowering used the requested hint.
+    expected_cta_layout = {
+        (1, 1): "ctaLayout = {warp =",
+        (2, 1): "ctaLayout = {register = [[1, 0]], warp =",
+        (1, 2): "ctaLayout = {register = [[0, 1]], warp =",
+        (2, 2): "ctaLayout = {register = [[0, 1], [1, 0]], warp =",
+    }[tiles_per_warp]
+    wmma_encodings = [line for line in compiled.asm["ttgir"].splitlines() if " = #ttg.amd_wmma<" in line]
+    assert wmma_encodings, compiled.asm["ttgir"]
+    assert all(expected_cta_layout in encoding for encoding in wmma_encodings), wmma_encodings
 
 
 @pytest.mark.parametrize(
