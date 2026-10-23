@@ -176,11 +176,6 @@ def next_power_of_2(n: int) -> int:
     return n
 
 
-def cdiv(x: int, y: int) -> int:
-    # `triton.cdiv` is a constexpr function, ~0.7 us per host call; forward launches pay it several times.
-    return (x + y - 1) // y
-
-
 def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
     # Largest power of 2 <= runtime_max_seq_len (0 stays 0).
     out = next_power_of_2(runtime_max_seq_len)
@@ -239,12 +234,12 @@ def _space_autotune(configs, smoke_configs, key, curated_prune=None):
 
 # MI300X/MI350X expose 8 XCDs; round-robin pid assignment across them hurts L2
 # reuse, so tiles are re-grouped to be contiguous within an XCD.
-NUM_XCDS: int = 8
+NUM_XCDS: tl.constexpr = tl.constexpr(8)
 # Grouping hands each XCD whole (sequence, head) pairs, so with few pairs one
 # long sequence sets the time for its XCD while the others idle. Measured on
 # MI350X: at Z*H <= 32 the regrouped grid is up to 2.3x slower than the
 # round-robin one, at Z*H >= 64 it is up to 1.45x faster.
-MIN_PAIRS_PER_XCD_FOR_REMAP: int = 8
+MIN_PAIRS_PER_XCD_FOR_REMAP: tl.constexpr = tl.constexpr(8)
 
 # `autotune_max_seq_len` is the wrong quantizer for the q-length autotune key:
 # its runtime path is `prev_power_of_2`, which rounds *down* and so merges
@@ -280,12 +275,12 @@ STREAM_K_ENV: str = "TLX_HSTU_CROSS_ATTN_STREAM_K"
 # sequences first (longest-processing-time order): with ~3 waves of tiles of
 # uneven length, launching in sequence order leaves CUs idle behind the long
 # sequences at the end. Each program ranks the Z KV lengths itself, so the
-# launch takes no permutation; needs Z <= SEQ_SORT_MAX_Z. Read once at import.
-SEQ_SORT_MAX_Z: int = 64
+# kernel signature is unchanged; needs Z <= SEQ_SORT_MAX_Z. Read once at import.
+SEQ_SORT_MAX_Z: tl.constexpr = tl.constexpr(64)
 # Only with ~2+ waves of programs, where the end-of-launch tail matters; on
 # small launches the ranking is pure overhead (~2% on the production shape).
-SEQ_SORT_MIN_PROGRAMS: int = 512
-FWD_SORT_BY_KV: bool = os.environ.get("TLX_HSTU_CROSS_ATTN_SORT_BY_KV", "1") == "1"
+SEQ_SORT_MIN_PROGRAMS: tl.constexpr = tl.constexpr(512)
+FWD_SORT_BY_KV: tl.constexpr = tl.constexpr(os.environ.get("TLX_HSTU_CROSS_ATTN_SORT_BY_KV", "1") == "1")
 
 
 @functools.lru_cache(maxsize=None)
@@ -310,17 +305,17 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr):
 
 
 @triton.jit
-def _seq_by_kv_rank(rank, Z, seq_offsets, MAX_Z: tl.constexpr):
+def _seq_by_kv_rank(rank, Z, seq_offsets):
     """Index of the sequence with the `rank`-th longest KV (ties by index).
 
-    One scalar pass over the Z lengths with a MAX_Z-wide vector of
+    One scalar pass over the Z lengths with a SEQ_SORT_MAX_Z-wide vector of
     ranks; a Z x Z comparison tile costs enough registers to slow the main
     loop of the register-tight configs.
     """
-    idx = tl.arange(0, MAX_Z)
+    idx = tl.arange(0, SEQ_SORT_MAX_Z)
     valid = idx < Z
     length = tl.load(seq_offsets + idx + 1, mask=valid, other=0) - tl.load(seq_offsets + idx, mask=valid, other=0)
-    ranks = tl.zeros([MAX_Z], dtype=tl.int32)
+    ranks = tl.zeros([SEQ_SORT_MAX_Z], dtype=tl.int32)
     for j in range(Z):
         length_j = tl.load(seq_offsets + j + 1) - tl.load(seq_offsets + j)
         ahead = (length_j > length) | ((length_j == length) & (j < idx))
@@ -1410,13 +1405,6 @@ def _tlx_gfx950_cross_attn_fwd(
     TRUNCATE_METHOD: tl.constexpr,
     HAS_CAUSAL: tl.constexpr,
     HAS_NUM_TARGETS: tl.constexpr,
-    # Tile order, passed at launch: reading the module constants here would keep every launch off the C launch
-    # fast path.
-    XCDS: tl.constexpr,
-    MIN_PAIRS_PER_XCD: tl.constexpr,
-    SORT_BY_KV: tl.constexpr,
-    SORT_MAX_Z: tl.constexpr,
-    SORT_MIN_PROGRAMS: tl.constexpr,
     # Lazily rescaled softmax on the distinct-KV double-buffered path; see `_forward_softmax_lazy`.
     LAZY_RESCALE: tl.constexpr,
     RESCALE_THRESHOLD: tl.constexpr,
@@ -1426,17 +1414,17 @@ def _tlx_gfx950_cross_attn_fwd(
     # workgroups that share K/V across all 8 L2s.
     tpid = tl.program_id(0)
     num_tiles = tl.cdiv(MAX_Q_LEN, BLOCK_M)
-    if Z * H >= MIN_PAIRS_PER_XCD * XCDS:
-        tpid = remap_xcd(tpid, num_tiles * Z * H, XCDS)
+    if Z * H >= MIN_PAIRS_PER_XCD_FOR_REMAP * NUM_XCDS:
+        tpid = remap_xcd(tpid, num_tiles * Z * H, NUM_XCDS)
     off_h = tpid % H
     off_nz = tpid // H
     start_m = (off_nz % num_tiles) * BLOCK_M
     off_z = off_nz // num_tiles
-    if SORT_BY_KV:
-        if Z * H < MIN_PAIRS_PER_XCD * XCDS:
-            if Z <= SORT_MAX_Z:
-                if num_tiles * Z * H >= SORT_MIN_PROGRAMS:
-                    off_z = _seq_by_kv_rank(off_z, Z, seq_offsets, SORT_MAX_Z)
+    if FWD_SORT_BY_KV:
+        if Z * H < MIN_PAIRS_PER_XCD_FOR_REMAP * NUM_XCDS:
+            if Z <= SEQ_SORT_MAX_Z:
+                if num_tiles * Z * H >= SEQ_SORT_MIN_PROGRAMS:
+                    off_z = _seq_by_kv_rank(off_z, Z, seq_offsets)
     (
         off_h_kv,
         seq_start_kv,
@@ -1589,7 +1577,7 @@ def _tlx_gfx950_cross_attn_fwd_impl(
         return out, M
 
     grid = lambda meta: (  # noqa E731
-        cdiv(max_q_len, meta["BLOCK_M"]) * Z * H, )
+        triton.cdiv(max_q_len, meta["BLOCK_M"]) * Z * H, )
 
     # Create M tensor for softmax heads if needed
     if num_softmax_heads > 0:
@@ -1631,7 +1619,7 @@ def _tlx_gfx950_cross_attn_fwd_impl(
         num_targets=num_targets,
         MAX_Q_LEN=max_q_len,
         AUTOTUNE_Z=next_power_of_2(Z),
-        AUTOTUNE_MAX_Q_LEN=cdiv(max_q_len, AUTOTUNE_Q_LEN_GRANULARITY) * AUTOTUNE_Q_LEN_GRANULARITY,
+        AUTOTUNE_MAX_Q_LEN=triton.cdiv(max_q_len, AUTOTUNE_Q_LEN_GRANULARITY) * AUTOTUNE_Q_LEN_GRANULARITY,
         AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
         num_softmax_heads=num_softmax_heads,
         HEAD_DIM=DimQ,
@@ -1640,11 +1628,6 @@ def _tlx_gfx950_cross_attn_fwd_impl(
         TRUNCATE_METHOD=truncate_method,
         HAS_CAUSAL=causal,
         HAS_NUM_TARGETS=num_targets is not None,
-        XCDS=NUM_XCDS,
-        MIN_PAIRS_PER_XCD=MIN_PAIRS_PER_XCD_FOR_REMAP,
-        SORT_BY_KV=FWD_SORT_BY_KV,
-        SORT_MAX_Z=SEQ_SORT_MAX_Z,
-        SORT_MIN_PROGRAMS=SEQ_SORT_MIN_PROGRAMS,
         # BF16 only: the packed-FP32 subtract hazard (module docstring) involves the FP16 MFMA. Training shares K/V,
         # so it keeps the exact rescale.
         LAZY_RESCALE=q.dtype == torch.bfloat16 and not shared_kv and not causal,

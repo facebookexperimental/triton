@@ -247,12 +247,9 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         for b in (block_bases or []):
             assert len(b) == rank, \
                 f"each block base vector must have length rank={rank}, got {len(b)}: {b}"
-        # Imported here so kernels that build this layout do not record the class as a global, which would keep
-        # them off the C launch fast path.
-        from triton.language.extra.tlx.types import padded_shared_layout_encoding as _encoding
         intervals = [int(p[0]) for p in interval_padding_pairs]
         paddings = [int(p[1]) for p in interval_padding_pairs]
-        enc = _encoding(
+        enc = padded_shared_layout_encoding(
             intervals=intervals,
             paddings=paddings,
             order=list(reversed(range(rank))),
@@ -271,11 +268,9 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         rank = len(shape)
         if order is None:
             order = list(reversed(range(rank)))
-        # See `with_bases`.
-        from triton.language.extra.tlx.types import padded_shared_layout_encoding as _encoding
         intervals = [int(p[0]) for p in interval_padding_pairs]
         paddings = [int(p[1]) for p in interval_padding_pairs]
-        return _encoding(
+        return padded_shared_layout_encoding(
             intervals=intervals,
             paddings=paddings,
             order=list(order),
