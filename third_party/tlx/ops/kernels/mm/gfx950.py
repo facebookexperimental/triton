@@ -19,6 +19,7 @@ import triton.language.extra.tlx as tlx
 from triton.runtime.driver import driver
 
 from ..._catalog import InvalidInput
+from ..._invariance import gemm_fixed_split_k
 
 # Regular wave-grid implementation and dispatch policy.
 
@@ -21981,22 +21982,73 @@ def _supports_short_k_register(m, n, k, dtype):
     return (dtype == torch.bfloat16 and 0 < k <= 64 and m >= 256 and n >= 256)
 
 
+def _wave_grid_is_sequential(plan, fixed):
+    """Return whether a wave-grid plan uses the fixed K schedule in one program."""
+    return plan.get("split_k", 1) == fixed and not plan.get("streamk_tail_split", 0)
+
+
+def _range_candidate_is_sequential(path, plan, fixed):
+    """Return whether a range-family candidate uses the fixed K schedule."""
+    if path in ("short_k_register", "register", "range_register"):
+        return True
+    if path == "lds":
+        return plan[2] == fixed
+    if path in ("wave_grid", "transposed_wave_grid"):
+        return _wave_grid_is_sequential(plan, fixed)
+    return False
+
+
+def _sequential_inter_wave_dispatch(m, n, k, dtype, element_size, fixed):
+    """Dispatch the inter-wave family with the fixed K schedule.
+
+    Mirrors `_iw_matmul`'s register-first policy, but forces the fixed SPLIT_K
+    on the LDS path so rows stay bit-identical across batch sizes. Returns
+    None when no fixed-schedule inter-wave launch exists for the shape.
+    """
+    register_config = _register_plan_for_shape(m, n, k)
+    if register_config is not None:
+        return "register", register_config
+    if k < 2 * _iw_BLOCK_K or k * element_size % 16 != 0:
+        return None
+    block_m, block_n, _ = _iw_choose_tile(m, n, k)
+    return "inter_wave", {"TILE": (block_m, block_n), "SPLIT_K": fixed}
+
+
 @lru_cache(maxsize=None)
-def _dispatch_plan(m, n, k, dtype, element_size):
+def _dispatch_plan(m, n, k, dtype, element_size, *, invariance=None):
+    fixed = gemm_fixed_split_k(invariance)
     shape = (m, n, k)
     wave_grid_plan = _wave_grid_plan_for_shape(m, n, k, dtype)
     if dtype == torch.bfloat16:
         streamk_plan = _BF16_STREAMK_PROMOTIONS.get(shape)
-        if streamk_plan is not None:
+        if streamk_plan is not None and fixed is None:
             return "streamk", streamk_plan
         promotion = _BF16_INTER_WAVE_PROMOTIONS.get(shape)
         if promotion is not None or shape in _BF16_INTER_WAVE_PROMOTIONS:
-            return "inter_wave", promotion
+            if fixed is not None:
+                if promotion is not None and promotion.get("SPLIT_K", 1) == fixed:
+                    return "inter_wave", promotion
+                forced = _sequential_inter_wave_dispatch(m, n, k, dtype, element_size, fixed)
+                if forced is not None:
+                    return forced
+                # Fall through to the validated paths below: short_k_register
+                # and register are K-sequential; wave-grid, strong-LDS, and
+                # LDS each check (or force) the fixed schedule.
+            else:
+                return "inter_wave", promotion
         if _supports_short_k_register(m, n, k, dtype):
             return "short_k_register", None
-    if dtype == torch.bfloat16 and wave_grid_plan is not None:
+    if dtype == torch.bfloat16 and wave_grid_plan is not None and (fixed is None
+                                                                   or _wave_grid_is_sequential(wave_grid_plan, fixed)):
         return "wave_grid", wave_grid_plan
-    if dtype == torch.float16:
+    if dtype == torch.float16 and fixed is not None:
+        # The persistent kernel reduces K sequentially within one program per
+        # output tile (persistence is over M/N tiles), so it preserves row
+        # invariance across batch sizes and stays eligible.
+        persistent_plan = _persistent_plan_for_shape(m, n, k, dtype)
+        if persistent_plan is not None:
+            return "persistent", persistent_plan
+    if dtype == torch.float16 and fixed is None:
         promotion = _FP16_INTER_WAVE_PROMOTIONS.get((m, n, k))
         if promotion is not None:
             return "inter_wave", promotion
@@ -22022,34 +22074,58 @@ def _dispatch_plan(m, n, k, dtype, element_size):
         if (prefer_tuned_wave_grid(m, n, k, wave_grid_plan) and not prefer_lds_over_wave_grid(m, n, k, wave_grid_plan)):
             return "wave_grid", wave_grid_plan
     strong_lds_plan = _strong_lds_plan(m, n, k)
-    if strong_lds_plan is not None:
+    if strong_lds_plan is not None and (fixed is None or strong_lds_plan[2] == fixed):
         return "lds", strong_lds_plan
     register_plan = _register_plan_for_shape(m, n, k, dtype)
     if register_plan is not None:
         return "register", register_plan
     if dtype == torch.float16:
-        if prefer_streamk(m, n, k):
-            return "streamk", None
-        if prefer_ragged_n(m, n, k, wave_grid_plan):
-            return "ragged_n", None
-        if prefer_m192n256(m, n, k):
-            return "m192n256", None
+        if fixed is None:
+            # Stream-K, ragged-N (via its auto-split fallback), and MT192x256
+            # (via auto SPLIT_K) can split K; prune them under a fixed schedule.
+            if prefer_streamk(m, n, k):
+                return "streamk", None
+            if prefer_ragged_n(m, n, k, wave_grid_plan):
+                return "ragged_n", None
+            if prefer_m192n256(m, n, k):
+                return "m192n256", None
         if wave_grid_plan is not None:
             if prefer_lds_over_wave_grid(m, n, k, wave_grid_plan):
-                return "inter_wave", None
-            return "wave_grid", wave_grid_plan
+                if fixed is not None:
+                    forced = _sequential_inter_wave_dispatch(m, n, k, dtype, element_size, fixed)
+                    if forced is not None:
+                        return forced
+                    # No fixed inter-wave launch exists; fall back to a
+                    # sequential wave-grid plan rather than declining.
+                    if _wave_grid_is_sequential(wave_grid_plan, fixed):
+                        return "wave_grid", wave_grid_plan
+                else:
+                    return "inter_wave", None
+            elif fixed is None or _wave_grid_is_sequential(wave_grid_plan, fixed):
+                return "wave_grid", wave_grid_plan
     if min(m, n) <= 0 or k < 128 or k * element_size % 16 != 0:
         return None
     if dtype == torch.float16:
+        if fixed is not None:
+            return _sequential_inter_wave_dispatch(m, n, k, dtype, element_size, fixed)
         return "inter_wave", None
     block_m, block_n, split_k = _lds_plan_for_shape(m, n, k)
+    if fixed is not None:
+        split_k = fixed
     if not _valid_lds_split(k, split_k, element_size):
         return None
     return "lds", (block_m, block_n, split_k)
 
 
-def _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
-    """Return one production plan selected from measured gfx950 families."""
+def _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides, *, invariance=None):
+    """Return one production plan selected from measured gfx950 families.
+
+    A fixed schedule prunes the K-splitting plans (LocalSplitU, split-K
+    LDS, Stream-K/ragged-N/MT192x256, split wave-grid) and forces the fixed
+    SPLIT_K on the inter-wave fallback so the reduction stays uniform. The
+    persistent kernel reduces K sequentially per output tile, so it stays
+    eligible.
+    """
 
     def register(block_m, block_n, block_k, group_m, num_xcds, waves_per_eu, num_warps, num_stages):
         return "register", {
@@ -22097,15 +22173,15 @@ def _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strid
 
     # Sub-1024 row problems retain their measured LDS, persistent, and LocalSplitU algorithm choices.
     if m < 1024:
-        return _dispatch_plan(m, n, k, dtype, element_size)
+        return _dispatch_plan(m, n, k, dtype, element_size, invariance=invariance)
 
     # Small output grids and shallow medium-M reductions retain their measured incumbent algorithms.
     if m < 4096 and (m * n <= 4 * 1024 * 1024 or n <= 512 or k <= 512):
-        return _dispatch_plan(m, n, k, dtype, element_size)
+        return _dispatch_plan(m, n, k, dtype, element_size, invariance=invariance)
 
     # Extremely reduction-heavy matrices retain the incumbent split-K plan.
     if k >= 64 * n:
-        return _dispatch_plan(m, n, k, dtype, element_size)
+        return _dispatch_plan(m, n, k, dtype, element_size, invariance=invariance)
 
     # Short reductions favor the measured 128x256 K32 wave-limited family.
     if k <= 256:
@@ -22151,12 +22227,24 @@ def _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strid
     return register(128, 128, 64, 8, 8, 0, 4, 2)
 
 
-def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
+def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides, *, invariance=None):
     """Return one gfx950 plan from the geometry default or incumbent policy."""
-    candidates = _range_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides, include_incumbent=False)
-    if candidates:
-        return candidates[0]
-    return _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides)
+    fixed = gemm_fixed_split_k(invariance)
+    if fixed is None:
+        candidates = _range_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides,
+                                                include_incumbent=False)
+        if candidates:
+            return candidates[0]
+        return _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides)
+    incumbent = _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides, invariance=invariance)
+    if incumbent is not None:
+        return incumbent
+    # The pruned incumbent has no plan (unaligned K rejects every LDS route);
+    # retain a sequential range-family candidate instead of failing.
+    for path, plan in _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides):
+        if _range_candidate_is_sequential(path, plan, fixed):
+            return path, plan
+    return None
 
 
 def _dispatch_for(a, b):
@@ -22368,7 +22456,12 @@ def _range_winner_is_stable(a, b, out, candidates, timings, winner, use_cache):
 
 
 def mm(a, b, *, out=None, space="heuristic", invariance=None):
-    """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation."""
+    """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation.
+
+    A fixed schedule prunes the K-splitting dispatch families so the K
+    reduction stays uniform across the invariant dims.
+    """
+    fixed = gemm_fixed_split_k(invariance)
     if space not in ("full", "heuristic"):
         raise InvalidInput(f"unknown gfx950 mm search space: {space}")
     if not a.is_cuda or any(stride <= 0 for stride in (*a.stride(), *b.stride())):
@@ -22393,6 +22486,8 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
     dispatch = None
     use_compiled_cache = None
     if space == "full":
+        if fixed is not None:
+            return _launch_register(a, b, out=out)
         if k >= 128:
             use_compiled_cache = _can_use_range_register_compiled_cache()
             if use_compiled_cache:
@@ -22410,7 +22505,12 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
         # master heuristic remains the fallback for layouts such as row-major B
         # that are outside the promoted selector's validated domain.
         if a.dtype == torch.float16 and a.stride(1) == 1 and b.stride(0) == 1:
-            dispatch = _dispatch_plan(m, n, k, a.dtype, a.element_size())
+            dispatch = _dispatch_plan(m, n, k, a.dtype, a.element_size(), invariance=invariance)
+        elif fixed is not None:
+            # Range and row-major plans may split K; use the pruned incumbent
+            # heuristic below instead (persistent reduces K sequentially and
+            # stays eligible through it).
+            dispatch = None
         else:
             dispatch = _dispatch_for(a, b)
         if dispatch is None:
@@ -22422,6 +22522,7 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
                 a.element_size(),
                 a.stride(),
                 b.stride(),
+                invariance=invariance,
             )
     if dispatch is None:
         raise InvalidInput("gfx950 mm does not support "
