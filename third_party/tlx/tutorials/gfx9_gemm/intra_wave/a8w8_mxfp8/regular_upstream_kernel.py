@@ -1,17 +1,14 @@
-"""Regular MXFP8 GEMM using current TLX's LDS-scale quadrant pipeline.
+"""Regular MXFP8 GEMM using TLX's shared gfx950 MXFP8 tile pipeline.
 
-This has no group routing or persistent group scheduler. The hot tile helper is
-shared with upstream tlx.ops.grouped_gemm_mxfp8 until the regular specialization
-is independently tuned.
+The device launch has no group routing or persistent group scheduler. Regular
+and grouped GEMM use common tile bodies without depending on either API.
 """
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.tlx.ops.kernels.grouped_gemm_mxfp8.gfx950 import _generic_tile, _quad_tile
-from triton.tlx.ops.kernels.grouped_gemm.gfx950 import chiplet_transform_chunked
-from triton.tlx.ops.kernels.grouped_gemm_mxfp8._scales import _swizzle_scale_to_5d
+from triton.tlx.ops.kernels.mxfp8_tiles_gfx950 import _generic_tile, _quad_tile
 
 
 @triton.jit
@@ -56,7 +53,6 @@ def regular_mxfp8_lds_scales_kernel(
     M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
-    XCD_CHUNK: tl.constexpr,
 ):
     HALF: tl.constexpr = 128
     BK: tl.constexpr = 128
@@ -80,8 +76,6 @@ def regular_mxfp8_lds_scales_kernel(
     smem_sb_right = tlx.local_alloc((32, 16), scale_dtype, 2)
 
     pid = tl.program_id(0)
-    if XCD_CHUNK:
-        pid = chiplet_transform_chunked(pid, (M // 256) * (N // 256), 8, XCD_CHUNK)
     pid_m = pid // (N // 256)
     pid_n = pid % (N // 256)
     _quad_tile(
@@ -97,14 +91,14 @@ def regular_mxfp8_lds_scales_kernel(
 
 
 def regular_mxfp8_lds_scales(a, b, as_packed, bs_packed, *, out,
-                             return_kernel=False, agpr_alloc=False, xcd_chunk=0):
+                             return_kernel=False, agpr_alloc=False):
     m, k = a.shape
     n = b.shape[0]
     if m % 256 or n % 256 or k % 128:
         raise ValueError("M and N must be divisible by 256 and K by 128")
     kernel = regular_mxfp8_lds_scales_kernel[(m // 256 * (n // 256),)](
         a, b, out, as_packed, bs_packed,
-        M=m, N=n, K=k, XCD_CHUNK=xcd_chunk,
+        M=m, N=n, K=k,
         num_warps=8, num_stages=1, matrix_instr_nonkdim=16,
         llvm_fn_attrs=() if agpr_alloc else (("amdgpu-agpr-alloc", "0,0"),),
     )
@@ -122,9 +116,12 @@ def pack_regular_mxfp8_scale(scale):
         raise TypeError("scale must have E8M0 or uint8 dtype")
     if not scale.is_cuda:
         raise ValueError("scale must be on a GPU")
-    return _swizzle_scale_to_5d(scale, batch=1, rows=size, outer_chunks=size // 128,
-                                k_groups=size // 32, k_chunks=size // 128,
-                                k_major_chunks=True)
+    # The square shapes need no padding. Store each 128x4 scale atom as
+    # [row-within-32, K-scale-column, row-group] for the gfx950 LDS scale load.
+    return (scale.view(torch.uint8)
+            .view(1, size // 128, 4, 32, size // 128, 4)
+            .permute(0, 1, 4, 3, 5, 2).contiguous()
+            .view(1, size // 128, size // 128, 2, 256))
 
 
 def pack_regular_mxfp8_scales(a_scales, b_scales):

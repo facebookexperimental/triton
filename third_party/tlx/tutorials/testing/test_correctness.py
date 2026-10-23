@@ -1709,8 +1709,9 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
 
 
 @pytest.mark.parametrize("size", [1024, 2048, 4096])
+@pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_gfx950_regular_mxfp8_square_matches_fp32_reference(size):
+def test_gfx950_regular_mxfp8_square_matches_fp32_reference(size, scale_dtype):
     generator = torch.Generator(device=DEVICE)
     generator.manual_seed(43)
     a = (torch.randn((size, size), device=DEVICE, generator=generator) * 0.25).to(torch.float8_e4m3fn)
@@ -1719,7 +1720,8 @@ def test_gfx950_regular_mxfp8_square_matches_fp32_reference(size):
                              device=DEVICE, generator=generator)
     b_scales = torch.randint(124, 130, (size, size // 32), dtype=torch.uint8,
                              device=DEVICE, generator=generator)
-    packed_a, packed_b = pack_regular_mxfp8_scales(a_scales, b_scales)
+    packed_a, packed_b = pack_regular_mxfp8_scales(a_scales.view(scale_dtype),
+                                                   b_scales.view(scale_dtype))
     out = torch.empty((size, size), dtype=torch.bfloat16, device=DEVICE)
     regular_mxfp8_square(a, b, packed_a, packed_b, out=out)
 
