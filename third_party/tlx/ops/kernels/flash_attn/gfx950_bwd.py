@@ -6726,10 +6726,11 @@ def _attn_bwd_gqa_outer_step(
     MASK_CAUSAL: tl.constexpr = True,
     k_score_cache=None,
 ):
-    # Unroll fully valid short GQA regions after the masked diagonal has completed.
+    # Unroll fully valid MHA and short GQA regions after the masked diagonal.
     steady_causal_gqa: tl.constexpr = (IS_CAUSAL and HQ != HK and CACHE_SCORE_K and (N == 2048 or N == 4096)
                                        and not MASK_CAUSAL)
-    steady_unroll: tl.constexpr = unroll_phases or steady_causal_gqa
+    steady_unroll: tl.constexpr = (unroll_phases or steady_causal_gqa
+                                   or (IS_CAUSAL and HQ == HK and CACHE_SCORE_K and not MASK_CAUSAL))
     steady_slice_refill: tl.constexpr = slice_refill or steady_causal_gqa
     outer_stage = (outer_step - outer_start) % 2
     # A causal MHA workgroup visits one head and never crosses a head boundary.
@@ -7420,8 +7421,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         relaxed=True,
     )
     k_resident_band6 = tlx.local_load(
-        # Causal masks need extra registers. Keep only band 6 resident to avoid spills.
-        tlx.local_slice(k_buffer, [192, 0], [32 if IS_CAUSAL else 64, D]),
+        # Short causal MHA and GQA keep the last band in LDS to avoid spills.
+        tlx.local_slice(k_buffer, [192, 0], [32 if IS_CAUSAL and (HQ != HK or N <= 1024) else 64, D]),
         token=initial_wait,
         layout=k_md_layout,
         relaxed=True,
@@ -7547,8 +7548,9 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         )
         # Only the first 256 query rows of each head intersect this key tile's diagonal.
         # The second region omits mask coordinates and the runtime diagonal branch.
-        head_begin = outer_start // active_outer_blocks if IS_CAUSAL else 0
-        head_end = tl.cdiv(outer_end, active_outer_blocks) if IS_CAUSAL else 1
+        # Causal MHA owns one head. Remove its redundant loop to avoid spills when unrolling phases.
+        head_begin = outer_start // active_outer_blocks if IS_CAUSAL and HQ != HK else 0
+        head_end = tl.cdiv(outer_end, active_outer_blocks) if IS_CAUSAL and HQ != HK else 1
         for head_interval in range(head_begin, head_end):
             for region in tl.static_range(2 if IS_CAUSAL else 1):
                 if IS_CAUSAL:
