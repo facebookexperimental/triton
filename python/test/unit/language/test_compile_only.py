@@ -54,6 +54,28 @@ def test_cuda_integer_ranges_narrow_in_branch(capability, frontend):
     assert re.search(r"arith.divsi .* : i64", ir)
 
 
+@pytest.mark.parametrize("block", [1, 32])
+@pytest.mark.parametrize("minimum, divisor_maximum, width", [(-2147483648, -1, 64), (-2147483647, -1, 32),
+                                                             (-2147483648, -2, 32)])
+def test_cuda_remainder_narrowing_preserves_defined_inputs(block, minimum, divisor_maximum, width):
+
+    @triton.jit
+    def kernel(input, output, BLOCK: tl.constexpr, MINIMUM: tl.constexpr, DIVISOR_MAXIMUM: tl.constexpr):
+        offsets = 0 if BLOCK == 1 else tl.arange(0, BLOCK)
+        a = tl.load(input)
+        b = tl.load(input + 1)
+        tl.assume(a >= MINIMUM)
+        tl.assume(a <= -2147483646)
+        tl.assume(b >= -3)
+        tl.assume(b <= DIVISOR_MAXIMUM)
+        tl.store(output + offsets, (a + offsets) % b)
+
+    source = ASTSource(fn=kernel, signature={"input": "*i64", "output": "*i64"},
+                       constexprs={"BLOCK": block, "MINIMUM": minimum, "DIVISOR_MAXIMUM": divisor_maximum})
+    compiled = triton.compile(source, target=GPUTarget("cuda", 80, 32))
+    assert re.search(rf"arith.remsi .* : (?:tensor<32x)?i{width}", compiled.asm["ttir"])
+
+
 @pytest.mark.parametrize(
     "k, error",
     [
