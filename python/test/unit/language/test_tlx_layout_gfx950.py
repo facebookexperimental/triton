@@ -18,6 +18,43 @@ from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import matmul_ke
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("bits", [16, 32])
+@pytest.mark.parametrize("iterations", [0, 3])
+@pytest.mark.parametrize("negative", [False, True])
+@pytest.mark.parametrize("shared_mask", [False, True])
+def test_buffer_loop_offset_wrapping(bits, iterations, negative, shared_mask):
+
+    @triton.jit
+    def kernel(X, Y, base, start, count, BITS: tl.constexpr, SHARED_MASK: tl.constexpr):
+        lane = tl.arange(0, 64) - 32
+        acc = tl.full((64, ), 0, tl.int32)
+        for i in range(count):
+            dynamic = start + i * 32
+            if BITS == 16:
+                term = (dynamic.to(tl.int16) + lane.to(tl.int16)).to(tl.int16)
+            else:
+                term = dynamic + lane
+            offset = (base.to(tl.int64) + term.to(tl.int64)).to(tl.int32)
+            mask = offset < 65536 if SHARED_MASK else tl.full((64, ), True, tl.int1)
+            acc += tlx.buffer_load(X, offset, mask, other=0)
+        tl.store(Y + tl.arange(0, 64), acc)
+
+    start = -(1 << (bits - 1)) if negative else (1 << (bits - 1)) - 16
+    base = -start + 65536 + (1 << 32)
+    x = torch.arange(131072, device=DEVICE, dtype=torch.int32)
+    y = torch.empty((64, ), device=DEVICE, dtype=torch.int32)
+    kernel[(1, )](x, y, base, start, iterations, bits, shared_mask, num_warps=1)
+    lanes = torch.arange(64, device=DEVICE, dtype=torch.int64) - 32
+    expected = torch.zeros_like(y)
+    for i in range(iterations):
+        term = (start + i * 32 + lanes + (1 << (bits - 1))) % (1 << bits) - (1 << (bits - 1))
+        offset = (base + term).to(torch.int32).to(torch.int64)
+        valid = offset < 65536 if shared_mask else torch.ones_like(offset, dtype=torch.bool)
+        expected += torch.where(valid, x[offset.clamp(0, x.numel() - 1)], 0)
+    torch.testing.assert_close(y, expected, atol=0, rtol=0)
+
+
 @pytest.fixture(scope="module")
 def split_k_tutorial():
     path = Path(__file__).resolve().parents[3] / "tutorials" / "12-split-k-matmul.py"

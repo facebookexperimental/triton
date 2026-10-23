@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --tritonamdgpu-convert-buffer-ops="gfx-arch=gfx950" --tritonamdgpu-optimize-buffer-op-ptr| FileCheck %s --check-prefixes=CHECK
+// RUN: triton-opt %s -split-input-file --tritonamdgpu-convert-buffer-ops="gfx-arch=gfx950" --tritonamdgpu-optimize-buffer-op-ptr --tritonamdgpu-regroup-buffer-offsets | FileCheck %s --check-prefixes=CHECK
 
 // CHECK-LABEL: add_after_load
 // CHECK-DAG: [[X_OFFSET_CST:%.*]] = arith.constant dense<123>
@@ -585,5 +585,127 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       scf.yield %arg2, %data : tensor<256xi32, #blocked>, tensor<256xi32, #blocked>
     }
     tt.return %for#1 : tensor<256xi32, #blocked>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @regroup_wrapping_offset
+  // CHECK-SAME: ([[PTR:%[^:]+]]: {{.*}}, [[BASE_ARG:%[^:]+]]: tensor<64xi64, #blocked>, [[LANE_ARG:%[^:]+]]:
+  // CHECK: [[BASE:%.*]] = arith.trunci [[BASE_ARG]]
+  // CHECK: [[INV:%.*]] = arith.addi [[BASE]], [[LANE_ARG]]
+  // CHECK: scf.for
+  // CHECK: [[OFFSET:%.*]] = arith.addi [[INV]], {{%.*}}
+  // CHECK: amdg.buffer_load [[PTR]]{{\[}}[[OFFSET]]{{\]}}
+  tt.func @regroup_wrapping_offset(%ptr: !tt.ptr<i32>, %base: tensor<64xi64, #blocked>, %lane: tensor<64xi32, #blocked>, %n: i32) -> tensor<64xi32, #blocked> {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %init = arith.constant dense<0> : tensor<64xi32, #blocked>
+    %result = scf.for %i = %zero to %n step %one iter_args(%carry = %init) -> tensor<64xi32, #blocked> : i32 {
+      %dynamic = tt.splat %i : i32 -> tensor<64xi32, #blocked>
+      %sum = arith.addi %dynamic, %lane : tensor<64xi32, #blocked>
+      %wide = arith.extsi %sum : tensor<64xi32, #blocked> to tensor<64xi64, #blocked>
+      %address = arith.addi %base, %wide : tensor<64xi64, #blocked>
+      %offset = arith.trunci %address : tensor<64xi64, #blocked> to tensor<64xi32, #blocked>
+      %value = amdg.buffer_load %ptr[%offset] : !tt.ptr<i32> -> tensor<64xi32, #blocked>
+      scf.yield %value : tensor<64xi32, #blocked>
+    }
+    tt.return %result : tensor<64xi32, #blocked>
+  }
+
+  // CHECK-LABEL: @retain_narrow_sign_extension
+  // CHECK-SAME: ([[PTR:%[^:]+]]: {{.*}}, [[BASE_ARG:%[^:]+]]: tensor<64xi32, #blocked>,
+  // CHECK: scf.for
+  // CHECK: [[SUM:%.*]] = arith.addi {{.*}} : tensor<64xi16
+  // CHECK: [[SIGNED:%.*]] = arith.extsi [[SUM]]
+  // CHECK: [[OFFSET:%.*]] = arith.addi [[BASE_ARG]], [[SIGNED]]
+  // CHECK: amdg.buffer_load [[PTR]]{{\[}}[[OFFSET]]{{\]}}
+  tt.func @retain_narrow_sign_extension(%ptr: !tt.ptr<i32>, %base: tensor<64xi32, #blocked>, %lane: tensor<64xi16, #blocked>, %n: i32) -> tensor<64xi32, #blocked> {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %init = arith.constant dense<0> : tensor<64xi32, #blocked>
+    %result = scf.for %i = %zero to %n step %one iter_args(%carry = %init) -> tensor<64xi32, #blocked> : i32 {
+      %narrow = arith.trunci %i : i32 to i16
+      %dynamic = tt.splat %narrow : i16 -> tensor<64xi16, #blocked>
+      %sum = arith.addi %dynamic, %lane : tensor<64xi16, #blocked>
+      %wide = arith.extsi %sum : tensor<64xi16, #blocked> to tensor<64xi32, #blocked>
+      %offset = arith.addi %base, %wide : tensor<64xi32, #blocked>
+      %value = amdg.buffer_load %ptr[%offset] : !tt.ptr<i32> -> tensor<64xi32, #blocked>
+      scf.yield %value : tensor<64xi32, #blocked>
+    }
+    tt.return %result : tensor<64xi32, #blocked>
+  }
+
+  // CHECK-LABEL: @retain_mask_shared_offset
+  // CHECK: scf.for
+  // CHECK: [[SUM:%.*]] = arith.addi
+  // CHECK: [[MASK:%.*]] = arith.cmpi slt, [[SUM]],
+  // CHECK: [[OFFSET:%.*]] = arith.addi {{%.*}}, [[SUM]]
+  // CHECK: amdg.buffer_load {{.*}}[[OFFSET]]{{\]}}, [[MASK]]
+  tt.func @retain_mask_shared_offset(%ptr: !tt.ptr<i32>, %base: tensor<64xi32, #blocked>, %lane: tensor<64xi32, #blocked>, %n: i32) -> tensor<64xi32, #blocked> {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %init = arith.constant dense<0> : tensor<64xi32, #blocked>
+    %limit = tt.splat %n : i32 -> tensor<64xi32, #blocked>
+    %result = scf.for %i = %zero to %n step %one iter_args(%carry = %init) -> tensor<64xi32, #blocked> : i32 {
+      %dynamic = tt.splat %i : i32 -> tensor<64xi32, #blocked>
+      %sum = arith.addi %dynamic, %lane : tensor<64xi32, #blocked>
+      %mask = arith.cmpi slt, %sum, %limit : tensor<64xi32, #blocked>
+      %offset = arith.addi %base, %sum : tensor<64xi32, #blocked>
+      %value = amdg.buffer_load %ptr[%offset], %mask : !tt.ptr<i32> -> tensor<64xi32, #blocked>
+      scf.yield %value : tensor<64xi32, #blocked>
+    }
+    tt.return %result : tensor<64xi32, #blocked>
+  }
+
+  // CHECK-LABEL: @retain_grouped_offset
+  // CHECK-NOT: arith.addi
+  // CHECK: scf.for
+  // CHECK: [[INV:%.*]] = arith.addi
+  // CHECK: [[OFFSET:%.*]] = arith.addi {{%.*}}, [[INV]]
+  // CHECK: amdg.buffer_load {{.*}}[[OFFSET]]
+  tt.func @retain_grouped_offset(%ptr: !tt.ptr<i32>, %base: tensor<64xi32, #blocked>, %lane: tensor<64xi32, #blocked>, %n: i32) -> tensor<64xi32, #blocked> {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %init = arith.constant dense<0> : tensor<64xi32, #blocked>
+    %result = scf.for %i = %zero to %n step %one iter_args(%carry = %init) -> tensor<64xi32, #blocked> : i32 {
+      %dynamic = tt.splat %i : i32 -> tensor<64xi32, #blocked>
+      %invariant = arith.addi %base, %lane : tensor<64xi32, #blocked>
+      %offset = arith.addi %dynamic, %invariant : tensor<64xi32, #blocked>
+      %value = amdg.buffer_load %ptr[%offset] : !tt.ptr<i32> -> tensor<64xi32, #blocked>
+      scf.yield %value : tensor<64xi32, #blocked>
+    }
+    tt.return %result : tensor<64xi32, #blocked>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.maxnreg" = 4 : i32} {
+  // CHECK-LABEL: @retain_pressure_limited_offset
+  // CHECK-NOT: arith.addi
+  // CHECK: scf.for
+  // CHECK: [[SUM:%.*]] = arith.addi
+  // CHECK: [[SIGNED:%.*]] = arith.extsi [[SUM]]
+  // CHECK: [[ADDRESS:%.*]] = arith.addi {{%.*}}, [[SIGNED]]
+  // CHECK: [[OFFSET:%.*]] = arith.trunci [[ADDRESS]]
+  // CHECK: amdg.buffer_load {{.*}}[[OFFSET]]
+  tt.func @retain_pressure_limited_offset(%ptr: !tt.ptr<i32>, %base: tensor<64xi64, #blocked>, %lane: tensor<64xi32, #blocked>, %n: i32) -> tensor<64xi32, #blocked> {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %init = arith.constant dense<0> : tensor<64xi32, #blocked>
+    %result = scf.for %i = %zero to %n step %one iter_args(%carry = %init) -> tensor<64xi32, #blocked> : i32 {
+      %dynamic = tt.splat %i : i32 -> tensor<64xi32, #blocked>
+      %sum = arith.addi %dynamic, %lane : tensor<64xi32, #blocked>
+      %wide = arith.extsi %sum : tensor<64xi32, #blocked> to tensor<64xi64, #blocked>
+      %address = arith.addi %base, %wide : tensor<64xi64, #blocked>
+      %offset = arith.trunci %address : tensor<64xi64, #blocked> to tensor<64xi32, #blocked>
+      %value = amdg.buffer_load %ptr[%offset] : !tt.ptr<i32> -> tensor<64xi32, #blocked>
+      scf.yield %value : tensor<64xi32, #blocked>
+    }
+    tt.return %result : tensor<64xi32, #blocked>
   }
 }
