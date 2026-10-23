@@ -107,20 +107,17 @@ jobs:
             ${{ runner.temp }}/tlx-ops-bench.xml
           if-no-files-found: ignore
           retention-days: 90
-      - name: Collect failures
+      - name: Parse test failures
         id: parse
         if: always()
-        run: |
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_bench.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket ${{ inputs.platform }}-tlx-ops-bench-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit "${RUNNER_TEMP}/tlx-ops-bench.xml" \
-            --budget "${RUNNER_TEMP}/tlx-ops-bench.xml=120" \
-            --workflow "${GITHUB_WORKFLOW}" \
-            --job "${{ inputs.platform }}-tlx-ops-bench" \
-            ${FAILED_FLAG}
+        uses: ./.ci/.github/actions/parse-test-failures
+        with:
+          workflow: ${{ github.workflow }}
+          job: ${{ inputs.platform }}-tlx-ops-bench
+          failed: ${{ steps.run_bench.outcome != 'success' }}
+          bucket: ${{ inputs.platform }}-tlx-ops-bench-job-failed
+          junit: ${{ runner.temp }}/tlx-ops-bench.xml
+          budget: ${{ runner.temp }}/tlx-ops-bench.xml=120
 
   # Feeds the /bench/ dashboard that pages.yml renders from this release. Kept
   # off the GPU runner so it never holds a write token.

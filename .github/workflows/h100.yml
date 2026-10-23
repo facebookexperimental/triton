@@ -110,21 +110,18 @@ jobs:
             fi
           fi
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
-      - name: Collect nightly failures (TLX)
+      - name: Parse test failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
-        run: |
-          . "${SETUP_SCRIPT}"
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket h100-tlx-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml \
-            --budget /tmp/tlx-core.xml=60 --budget /tmp/tlx-correctness.xml=30 \
-            --workflow "${GPU_WORKFLOW_NAME}" \
-            --job "h100-tlx-test" \
-            ${FAILED_FLAG}
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: h100-tlx-test
+          failed: ${{ steps.run_core_tests.outcome != 'success' || steps.run_correctness_tests.outcome != 'success' }}
+          bucket: h100-tlx-job-failed
+          junit: /tmp/tlx-core.xml /tmp/tlx-correctness.xml
+          budget: /tmp/tlx-core.xml=60 /tmp/tlx-correctness.xml=30
+          setup-script: ${{ env.SETUP_SCRIPT }}
 
   h100-runtime-test:
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
@@ -177,21 +174,18 @@ jobs:
             exit 0
           fi
           python -m pytest python/test/unit/runtime/ --import-mode=importlib -v --junitxml=/tmp/runtime-unit.xml
-      - name: Collect nightly failures (runtime)
+      - name: Parse test failures (runtime)
         id: parse
         if: always() && github.event_name == 'schedule'
-        run: |
-          . "${SETUP_SCRIPT}"
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_runtime_tests.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket h100-runtime-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/runtime-unit.xml \
-            --budget /tmp/runtime-unit.xml=30 \
-            --workflow "${GPU_WORKFLOW_NAME}" \
-            --job "h100-runtime-test" \
-            ${FAILED_FLAG}
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: h100-runtime-test
+          failed: ${{ steps.run_runtime_tests.outcome != 'success' }}
+          bucket: h100-runtime-job-failed
+          junit: /tmp/runtime-unit.xml
+          budget: /tmp/runtime-unit.xml=30
+          setup-script: ${{ env.SETUP_SCRIPT }}
 
   report-h100-tlx:
     needs: h100-tlx-test
