@@ -34,6 +34,8 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import cap_grid as _cap_grid
+
 # Handoff ring depth per M-half group for the partitioned epilogue. Depth
 # 2 measures the same as depth 1 (the store keeps up), so this stays 1.
 
@@ -1070,9 +1072,14 @@ def _space_configs(space, shape, configs_fn, smoke_fn, heuristic_fn):
     raise ValueError(f"Unknown sm90 addmm search space: {space!r}")
 
 
+# Cache the static device count only; the carveout is read live per call.
 @functools.lru_cache(maxsize=None)
-def _get_num_sms():
+def _get_device_sm_count():
     return torch.cuda.get_device_properties("cuda").multi_processor_count
+
+
+def _get_num_sms():
+    return _cap_grid(_get_device_sm_count())
 
 
 @functools.lru_cache(maxsize=None)

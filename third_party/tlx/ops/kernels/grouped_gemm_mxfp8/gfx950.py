@@ -28,6 +28,8 @@ from triton.tlx.ops.kernels.grouped_gemm.gfx950 import (
 )
 from triton.tlx.ops.kernels.grouped_gemm_mxfp8._scales import prepare_scales
 
+from ..._holdout import cap_grid as _cap_grid
+
 _BLOCK_K = 128
 # AMD buffer descriptors expose at most this many bytes from each scalar base.
 _MAX_BUFFER_BYTES = (1 << 31) - 2
@@ -723,6 +725,7 @@ def grouped_gemm_mxfp8(
         launch_sms = props.multi_processor_count if num_sms is None else num_sms
         if launch_sms <= 0:
             raise ValueError("num_sms must be positive")
+        launch_sms = _cap_grid(launch_sms)
         cfg = _pick_config(gm, n, launch_sms, k=k)
         if config:
             cfg.update(config)

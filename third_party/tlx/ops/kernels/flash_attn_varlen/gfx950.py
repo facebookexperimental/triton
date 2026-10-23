@@ -36,6 +36,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
+from ..._holdout import cap_grid as _cap_grid
+
 BLOCK_M = 64
 BLOCK_N = 64
 NUM_WARPS = 4
@@ -370,9 +372,14 @@ def _split_plan(bh, num_m_blocks, cus):
     return 0, num_m_blocks, 1
 
 
+# Cache the static device count only; the carveout is read live per call.
 @functools.lru_cache(maxsize=None)
-def _num_cus(device):
+def _get_device_sm_count(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _num_cus(device):
+    return _cap_grid(_get_device_sm_count(device))
 
 
 _free_counters = {}

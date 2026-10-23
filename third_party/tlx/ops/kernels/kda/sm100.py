@@ -24,6 +24,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 
+from ..._holdout import cap_grid as _cap_grid
+
 
 @triton.jit
 def _add_f32x2(a, b):
@@ -1459,7 +1461,7 @@ def kimi_delta_attention_ws_fwd(
     # Persistent grid: one program per SM (capped at the work-item count), each
     # grid-striding over the n_seq*H (seq, head) work-items.
     n_work = n_seq * H
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = _cap_grid(torch.cuda.get_device_properties(q.device).multi_processor_count)
     grid = (min(num_sms, n_work), )
     _kda_ws_fwd_kernel[grid](
         q.view(T, H * D),
@@ -1540,7 +1542,7 @@ def kimi_delta_attention_ws_bwd(q, k, v, g, beta, do, states, tinv, *, scale=1.0
     dq2, dk2, dv2, dg2 = (x.view(T, HD) for x in (dq, dk, dv, dg))
     beta2 = beta.view(T, H)
     dbeta2 = dbeta.view(T, H)
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = _cap_grid(torch.cuda.get_device_properties(q.device).multi_processor_count)
     grid = (min(num_sms, n_seq * H), )
     _kda_bwd_kernel[grid](
         q2,

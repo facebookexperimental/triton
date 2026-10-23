@@ -19,6 +19,7 @@ import triton.language.extra.tlx as tlx
 from triton.runtime.driver import driver
 
 from ..._catalog import InvalidInput
+from ..._holdout import carveout_stream as _carveout_stream
 
 # Regular wave-grid implementation and dispatch policy.
 
@@ -22225,6 +22226,18 @@ def _launch_production_wave_grid(a, b, out, plan):
 
 
 def _launch_dispatch(a, b, out, dispatch):
+    # Static grids cannot shrink, so a carveout runs them on a stream whose
+    # mask drops the first-K holdout CUs instead of capping the grid.
+    with _carveout_stream(a.device):
+        return _launch_dispatch_inner(a, b, out, dispatch)
+
+
+def _launch_dispatch_inner(a, b, out, dispatch):
+    # TODO: generalize the carveout mask beyond drop-first-K to arbitrary
+    # masks selectable per stream (holdout set vs complement, XCD-aligned
+    # subsets). A mask restricts *which* CUs run blocks, not how many, so
+    # each selection still needs a distribution rule for spreading consecutive
+    # programs across allowed CUs; see tlx.ops._holdout.carveout_stream.
     path, plan = dispatch
     if path == "short_k_register":
         return _launch_short_k_register(a, b, out=out)
@@ -22404,7 +22417,8 @@ def mm(a, b, *, out=None, space="heuristic"):
             elif candidates:
                 return _launch_range_autotuned(a, b, out, candidates)
             else:
-                return _launch_register(a, b, out=out)
+                with _carveout_stream(a.device):
+                    return _launch_register(a, b, out=out)
     else:
         # Preserve the measured family selector for dense TN inputs.  The broader
         # master heuristic remains the fallback for layouts such as row-major B
@@ -22428,55 +22442,58 @@ def mm(a, b, *, out=None, space="heuristic"):
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     # Keep this catalog hot path inline: ``tlx.ops.mm`` already validated the
     # inputs, and another Python call is material for the small-M kernels.
+    # The carveout wrap stays on this path: it is a no-op at carveout 0 and
+    # routes launches to the CU-masked stream otherwise.
     path, plan = dispatch
-    if path == "short_k_register":
-        return _launch_short_k_register(a, b, out=out)
-    if path == "row_major_direct":
-        return _launch_row_major_direct(a, b, out, plan)
-    if path == "hybrid_n160":
-        return _launch_hybrid_n160(a, b, out)
-    if path in ("inter_wave", "streamk", "ragged_n", "m192n256"):
-        return _launch_optimized_inter_wave(a, b, out, path, plan)
-    if path == "transposed_wave_grid":
-        _launch_production_wave_grid(
-            b.T,
-            a.T,
-            out.T,
-            plan,
-        )
-        return out
-    if path == "transposed_register":
-        _launch_register_plan(
-            b.T,
-            a.T,
-            config=plan,
-            out=out.T,
-            _validated=True,
-        )
-        return out
-    if path == "fragmented_register":
-        return _launch_fragmented_register(a, b, out, plan)
-    if path == "wave_grid":
-        return _launch_production_wave_grid(a, b, out, plan)
-    if path == "persistent":
-        return _launch_persistent(a, b, out=out)
-    if path == "range_register":
-        return _launch_range_register_plan(a, b, config=plan, out=out, _use_compiled_cache=use_compiled_cache)
-    if path == "register":
-        return _launch_register_plan(
-            a,
-            b,
-            config=plan,
-            out=out,
-            _validated=True,
-        )
-    if path == "lds":
-        block_m, block_n, split_k = plan
-        return _launch_lds(
-            a,
-            b,
-            SPLIT_K=split_k,
-            TILE=(block_m, block_n),
-            out=out,
-        )
-    return _launch_validated(a, b, out, plan)
+    with _carveout_stream(a.device):
+        if path == "short_k_register":
+            return _launch_short_k_register(a, b, out=out)
+        if path == "row_major_direct":
+            return _launch_row_major_direct(a, b, out, plan)
+        if path == "hybrid_n160":
+            return _launch_hybrid_n160(a, b, out)
+        if path in ("inter_wave", "streamk", "ragged_n", "m192n256"):
+            return _launch_optimized_inter_wave(a, b, out, path, plan)
+        if path == "transposed_wave_grid":
+            _launch_production_wave_grid(
+                b.T,
+                a.T,
+                out.T,
+                plan,
+            )
+            return out
+        if path == "transposed_register":
+            _launch_register_plan(
+                b.T,
+                a.T,
+                config=plan,
+                out=out.T,
+                _validated=True,
+            )
+            return out
+        if path == "fragmented_register":
+            return _launch_fragmented_register(a, b, out, plan)
+        if path == "wave_grid":
+            return _launch_production_wave_grid(a, b, out, plan)
+        if path == "persistent":
+            return _launch_persistent(a, b, out=out)
+        if path == "range_register":
+            return _launch_range_register_plan(a, b, config=plan, out=out, _use_compiled_cache=use_compiled_cache)
+        if path == "register":
+            return _launch_register_plan(
+                a,
+                b,
+                config=plan,
+                out=out,
+                _validated=True,
+            )
+        if path == "lds":
+            block_m, block_n, split_k = plan
+            return _launch_lds(
+                a,
+                b,
+                SPLIT_K=split_k,
+                TILE=(block_m, block_n),
+                out=out,
+            )
+        return _launch_validated(a, b, out, plan)

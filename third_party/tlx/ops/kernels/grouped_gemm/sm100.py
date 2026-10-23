@@ -14,6 +14,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 
+from ..._holdout import cap_grid as _cap_grid
+
 _MAX_SMEM_BYTES = 232448
 _SMEM_SAFETY_MARGIN_BYTES = 1024
 _MAX_TMEM_BYTES = 256 * 1024
@@ -165,9 +167,14 @@ def _alloc_tma_descriptor_buffer(size: int, _alignment: int, _stream: Optional[i
     return torch.empty(size, device=device, dtype=torch.int8)
 
 
+# Cache the static device count only; the carveout is read live per call.
 @functools.lru_cache(maxsize=None)
-def _get_num_sms(device_index: int) -> int:
+def _get_device_sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _get_num_sms(device_index: int) -> int:
+    return _cap_grid(_get_device_sm_count(device_index))
 
 
 @triton.jit

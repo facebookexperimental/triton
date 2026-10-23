@@ -20,6 +20,7 @@ from triton.language.core import _aggregate as aggregate
 from triton.language.extra.libdevice import fast_dividef
 
 from ..._catalog import InvalidInput
+from ..._holdout import cap_grid as _cap_grid
 from . import gfx950_bwd
 
 CLUSTER_BUF_DEPTH = 2
@@ -3494,6 +3495,7 @@ def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw
         raise ValueError(f"cluster attention: NUM_SMS ({num_sms}) must be >= NUM_XCDS ({num_xcds})")
     if num_sms % num_xcds != 0:
         raise ValueError(f"cluster attention: NUM_SMS ({num_sms}) must be divisible by NUM_XCDS ({num_xcds})")
+    num_sms = max(num_xcds, _cap_grid(num_sms) // num_xcds * num_xcds)
 
     o = torch.empty_like(q)
     m_blocks = triton.cdiv(N_CTX, block_m)

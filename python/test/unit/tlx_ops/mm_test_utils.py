@@ -74,3 +74,21 @@ def run_mm_case(
 
     del a, b, out, ref
     torch.cuda.empty_cache()
+
+
+def cpu_tn_inputs(m, n, k):
+    """CPU fp16 TN operands for launch-logic tests (no kernel runs)."""
+    a = torch.ones((m, k), dtype=torch.float16)
+    storage = torch.ones((n * (n - 1) + k, ), dtype=torch.float16)
+    return a, storage.as_strided((k, n), (1, n))
+
+
+class GridRecorder:
+    """Stand-in for a ``@triton.jit`` kernel capturing launch grids."""
+
+    def __init__(self):
+        self.grids = []
+
+    def __getitem__(self, grid):
+        self.grids.append(grid)
+        return lambda *args, **kwargs: None

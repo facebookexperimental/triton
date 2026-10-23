@@ -26,6 +26,8 @@ import triton.language.extra.tlx as tlx
 from triton.tlx.ops.kernels.mm import _sm100_core as _mm_core
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import cap_grid as _cap_grid
+
 # slice_empty recycle handshake on per-slot static named barriers (one
 # unique ID per slot: base 3 + slot; paired handoff halves the slots,
 # so epi <= 8 needs IDs 3..6, inside the user range 3..15).
@@ -1520,9 +1522,14 @@ def _space_configs(space, shape, configs_fn, smoke_fn, heuristic_fn):
     raise ValueError(f"Unknown sm100 addmm search space: {space!r}")
 
 
+# Cache the static device count only; the carveout is read live per call.
 @functools.lru_cache(maxsize=None)
-def _get_num_sms():
+def _get_device_sm_count():
     return torch.cuda.get_device_properties("cuda").multi_processor_count
+
+
+def _get_num_sms():
+    return _cap_grid(_get_device_sm_count())
 
 
 @functools.lru_cache(maxsize=None)

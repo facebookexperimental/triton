@@ -17,6 +17,8 @@ import triton.language.extra.tlx as tlx
 from triton.runtime import _allocation
 from triton.tlx.ops.kernels.grouped_gemm_mxfp8._scales import prepare_scales
 
+from ..._holdout import cap_grid as _cap_grid
+
 _BLOCK_SIZE_M = 128
 _BLOCK_SIZE_N = 256
 _BLOCK_SIZE_K = 128
@@ -987,6 +989,7 @@ def grouped_gemm_mxfp8(
         launch_sms = (torch.cuda.get_device_properties(device).multi_processor_count if num_sms is None else num_sms)
         if launch_sms <= 0:
             raise ValueError("num_sms must be positive")
+        launch_sms = _cap_grid(launch_sms)
 
         num_ctas = _select_num_ctas(gm=gm, n=n, k=k, launch_sms=launch_sms)
         config = _CONFIG_2CTA_SPEC if num_ctas == 2 else _CONFIG_SPEC
