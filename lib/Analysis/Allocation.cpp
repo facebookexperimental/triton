@@ -419,16 +419,10 @@ private:
           continue;
         }
 
-        if (op && isa<mlir::triton::gpu::WarpSpecializeOp>(op)) {
-          bufferRange.insert(
-              {buffer, Interval((size_t)0, (size_t)operationId.size())});
-        } else {
-
-          // Any scratch memory's live range is the current operation's live
-          // range.
-          bufferRange.insert(
-              {buffer, Interval(operationId.at(op), operationId.at(op) + 1)});
-        }
+        // Any scratch memory's live range is the current operation's live
+        // range.
+        bufferRange.insert(
+            {buffer, Interval(operationId.at(op), operationId.at(op) + 1)});
         LLVM_DEBUG({
           llvm::dbgs() << "-- buffer " << buffer->id << "; value: ";
           op->dump();
