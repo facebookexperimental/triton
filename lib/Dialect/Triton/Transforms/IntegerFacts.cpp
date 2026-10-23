@@ -79,6 +79,26 @@ private:
 };
 
 static bool preservesIntegerWidth(Operation *op, DataFlowSolver &solver) {
+  if (isa<arith::RemSIOp>(op)) {
+    unsigned width = getElementTypeOrSelf(op->getResult(0).getType())
+                         .getIntOrFloatBitWidth();
+    if (width > 32) {
+      auto mayContain = [&](Value value, const APInt &candidate) {
+        const auto *lattice =
+            solver.lookupState<dataflow::IntegerValueRangeLattice>(value);
+        if (!lattice || lattice->getValue().isUninitialized())
+          return true;
+        const auto &range = lattice->getValue().getValue();
+        return range.smin().sle(candidate) && range.smax().sge(candidate) &&
+               range.umin().ule(candidate) && range.umax().uge(candidate);
+      };
+      // LLVM srem is undefined for the narrowed signed minimum modulo -1.
+      if (mayContain(op->getOperand(0),
+                     APInt::getSignedMinValue(32).sext(width)) &&
+          mayContain(op->getOperand(1), APInt::getAllOnes(width)))
+        return false;
+    }
+  }
   if (isa<arith::ShLIOp, arith::ShRUIOp, arith::ShRSIOp>(op)) {
     const auto *shift = solver.lookupState<dataflow::IntegerValueRangeLattice>(
         op->getOperand(1));

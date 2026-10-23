@@ -206,6 +206,27 @@ def test_integer_facts_narrow_branch(value):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("a,b", [(-2147483648, -1), (-2147483648, -2), (-2147483647, -1), (-2147483647, -2)])
+def test_integer_facts_remainder_signed_minimum(a, b):
+
+    @triton.jit
+    def kernel(input, output):
+        x = tl.load(input)
+        y = tl.load(input + 1)
+        tl.assume(x >= -2147483648)
+        tl.assume(x <= -2147483647)
+        tl.assume(y >= -2)
+        tl.assume(y <= -1)
+        tl.store(output, x % y)
+
+    input = torch.tensor([a, b], dtype=torch.int64, device=DEVICE)
+    output = torch.empty((), dtype=torch.int64, device=DEVICE)
+    compiled = kernel[(1, )](input, output)
+    torch.testing.assert_close(output, torch.fmod(input[0], input[1]))
+    assert re.search(r"arith.remsi .* : i64", compiled.asm["ttir"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 @pytest.mark.parametrize("value", [-2147483648, -17, -1, 0, 2147483647])
 def test_integer_facts_unsigned_sign_extension(value):
 
