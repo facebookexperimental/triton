@@ -2569,3 +2569,72 @@ tt.func @narrow_range_loop(%n: i64, %ptr: !tt.ptr<i64>) {
   }
   tt.return
 }
+
+// -----
+
+// NARROW-LABEL: @unsigned_result
+// NARROW: arith.addi {{.*}} overflow<nuw> : i32
+// NARROW: arith.extui {{.*}} : i32 to i64
+tt.func @unsigned_result(%x: i64) -> i64 {
+  %lo = arith.constant 2147483600 : i64
+  %hi = arith.constant 2147483647 : i64
+  %one = arith.constant 1 : i64
+  %lower = arith.cmpi sge, %x, %lo : i64
+  %upper = arith.cmpi sle, %x, %hi : i64
+  %inside = arith.andi %lower, %upper : i1
+  llvm.intr.assume %inside : i1
+  %sum = arith.addi %x, %one overflow<nsw, nuw> : i64
+  tt.return %sum : i64
+}
+
+// -----
+
+// NARROW-LABEL: @negative_result
+// NARROW: arith.subi {{.*}} overflow<nsw> : i32
+// NARROW: arith.extsi {{.*}} : i32 to i64
+tt.func @negative_result(%x: i64) -> i64 {
+  %lo = arith.constant -2147483647 : i64
+  %hi = arith.constant -2147483600 : i64
+  %one = arith.constant 1 : i64
+  %lower = arith.cmpi sge, %x, %lo : i64
+  %upper = arith.cmpi sle, %x, %hi : i64
+  %inside = arith.andi %lower, %upper : i1
+  llvm.intr.assume %inside : i1
+  %difference = arith.subi %x, %one overflow<nsw, nuw> : i64
+  tt.return %difference : i64
+}
+
+// -----
+
+// NARROW-LABEL: @safe_flags
+// NARROW: arith.addi {{.*}} overflow<nsw, nuw> : i32
+// NARROW: arith.ext{{[su]}}i {{.*}} : i32 to i64
+tt.func @safe_flags(%x: i64) -> i64 {
+  %lo = arith.constant 0 : i64
+  %hi = arith.constant 100 : i64
+  %one = arith.constant 1 : i64
+  %lower = arith.cmpi sge, %x, %lo : i64
+  %upper = arith.cmpi sle, %x, %hi : i64
+  %inside = arith.andi %lower, %upper : i1
+  llvm.intr.assume %inside : i1
+  %sum = arith.addi %x, %one overflow<nsw, nuw> : i64
+  tt.return %sum : i64
+}
+
+// -----
+
+// NARROW-LABEL: @already_narrow
+// NARROW: arith.addi {{.*}} overflow<nsw, nuw> : i32
+tt.func @already_narrow(%x: i32, %y: i32) -> i32 {
+  %sum = arith.addi %x, %y overflow<nsw, nuw> : i32
+  tt.return %sum : i32
+}
+
+// -----
+
+// NARROW-LABEL: @keep_wide
+// NARROW: arith.addi {{.*}} overflow<nsw, nuw> : i64
+tt.func @keep_wide(%x: i64, %y: i64) -> i64 {
+  %sum = arith.addi %x, %y overflow<nsw, nuw> : i64
+  tt.return %sum : i64
+}
