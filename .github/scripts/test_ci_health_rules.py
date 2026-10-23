@@ -365,13 +365,14 @@ def test_skipped_jobs_use_no_gpu_time():
     assert day["passed"] == 0.2
 
 
-def test_job_duration_p90_by_job_key_across_gpus():
+def test_job_duration_is_per_gpu_and_job():
     runs = [
-        push(h, job(f"{g} / {g}-tlx-test", step(CORE, "success"), minutes=m))
+        push(h, job(f"{g} / {g}-tlx-test", step(CORE, "success"), minutes=m, label=g))
         for h, (g, m) in enumerate([("b200", 10), ("h100", 20), ("b200", 30)], 1)
     ]
-    jobs = {j["job"]: j for j in r.ops_view(runs, stamp(23))["jobs"]}
-    assert jobs["tlx-test"]["p50"] == 20 and jobs["tlx-test"]["p90"] == 30
+    jobs = {(j["gpu"], j["job"]): j for j in r.ops_view(runs, stamp(23))["jobs"]["7"]}
+    assert (jobs["B200", "tlx-test"]["n"], jobs["B200", "tlx-test"]["p90"]) == (2, 30)
+    assert (jobs["H100", "tlx-test"]["n"], jobs["H100", "tlx-test"]["p90"]) == (1, 20)
 
 
 def test_setup_steps_counted_by_step_gpu_and_trigger():
@@ -576,3 +577,114 @@ def test_known_cells_name_the_push_their_failures_started_at():
     lv = r.lit_view([lit(1), lit(2, "a.mlir"), lit(3, "a.mlir")], stamp(23))
     assert [p["since"] for p in lv["pushes"][:2]] == [[], []]
     assert [s["sha"][:2] for s in lv["pushes"][2]["since"]] == ["02"]
+
+
+def test_gpu_outcome_is_per_gpu():
+    runs = [
+        push(1, tlx(), tlx("t1", gpu="mi350")),
+        run(2, [job("build", step("Build wheel", "failure"), label="ubuntu-latest")]),
+    ]
+    runs[1]["select"] = {"b200": True, "mi350": False}
+    assert (r.gpu_outcome(runs[0], "B200"), r.gpu_outcome(runs[0],
+                                                          "MI350"), r.gpu_outcome(runs[0],
+                                                                                  "H100")) == ("passed", "test", None)
+    assert (r.gpu_outcome(runs[1], "B200"), r.gpu_outcome(runs[1], "MI350")) == ("build", None)
+    v = r.ops_view(runs, stamp(23))
+    assert v["runs"][-1]["test"] == 1 and v["by_gpu"]["B200"]["runs"][-1]["passed"] == 1
+    assert v["by_gpu"]["B200"]["runs"][-1]["build"] == 1 and v["by_gpu"]["MI350"]["runs"][-1]["test"] == 1
+
+
+def span(gpu, start_h, start_m, end_h, end_m, created_m=None):
+    j = tlx(gpu=gpu)
+    j["created_at"] = f"2026-10-12T{start_h:02d}:{start_m if created_m is None else created_m:02d}:00Z"
+    j["started_at"], j[
+        "completed_at"] = f"2026-10-12T{start_h:02d}:{start_m:02d}:00Z", f"2026-10-12T{end_h:02d}:{end_m:02d}:00Z"
+    return j
+
+
+def test_concurrency_counts_overlapping_jobs_per_gpu():
+    # B200: 10:00-10:30 and 10:15-10:45 overlap; 10:45-11:00 starts when the second ends. MI350: one job waited 20 min.
+    runs = [
+        push(1, span("b200", 10, 0, 10, 30), span("b200", 10, 15, 10, 45), span("b200", 10, 45, 11, 0)),
+        push(2, span("mi350", 10, 20, 10, 40, created_m=0)),
+    ]
+    c = r.concurrency_view(runs, "2026-10-12T23:00:00Z")
+    hour = {x["day"]: x for x in c["hours"]}["2026-10-12 10:00"]
+    assert hour["B200"] == {"peak": 2, "mean": 1.25, "wait_peak": 0}
+    assert hour["MI350"]["peak"] == 1 and hour["MI350"]["wait_peak"] == 1 and hour["H100"]["peak"] == 0
+    assert c["days"][-1]["B200"]["peak"] == 2 and len(c["hours"]) == r.OPS_HOURS
+
+
+def test_concurrency_stops_at_a_run_whose_jobs_are_not_stored_yet():
+    pending = run(20, [], status="in_progress")
+    pending["jobs"] = None
+    c = r.concurrency_view([push(1, span("b200", 10, 0, 10, 30)), pending], "2026-10-12T23:00:00Z")
+    hours = {x["day"]: x for x in c["hours"]}
+    assert hours["2026-10-12 10:00"]["B200"]["peak"] == 1 and hours["2026-10-12 21:00"]["B200"]["peak"] is None
+
+
+def test_page_data_shares_concurrency_across_branches():
+    runs = [push(1, span("b200", 10, 0, 10, 30)), push(2, span("b200", 10, 0, 10, 30), branch="release/3.8.x")]
+    d = r.page_data(runs, stamp(23), {})
+    for b in r.TRACKED_BRANCHES:
+        assert {x["day"]: x
+                for x in d["branches"][b]["ops"]["concurrency"]["hours"]}["2026-10-12 10:00"]["B200"]["peak"] == 2
+
+
+def test_queue_has_hourly_medians():
+    q = r.ops_view([push(1, queued("b200", 4, 10))], stamp(23))["queue"]
+    assert {x["day"]: x for x in q["hours"]}["2026-10-12 04:00"]["B200"]["p50"] == 10.0
+
+
+def timed(gpu, *tests):
+    s = step(CORE, "success")
+    s["slowest"] = [{"id": i, "s": sec} for i, sec in tests]
+    return job(f"{gpu} / {gpu}-tlx-test", s, label=gpu)
+
+
+def test_slow_tests_rank_by_median_over_main_pushes():
+    runs = [
+        push(1, timed("b200", ("a", 300.0), ("b", 10.0))),
+        push(2, timed("b200", ("b", 12.0))),
+        push(3, timed("b200", ("b", 14.0), ("c", 1.0))),
+        run(4, [build_ok(), timed("b200", ("pr", 999.0))], event="pull_request"),  # PR runs do not count
+        push(5, timed("b200", ("rel", 999.0)), branch="release/3.8.x"),  # nor other branches
+    ]
+    st = r.ops_view(runs, stamp(23))["slow_tests"]["7"]
+    assert st["B200"]["runs"] == 3 and st["H100"]["runs"] == 0 and st["H100"]["tests"] == []
+    assert [(x["id"], x["p50"], x["max"], x["n"]) for x in st["B200"]["tests"]] == [("a", 300.0, 300.0, 1),
+                                                                                    ("b", 12.0, 14.0, 3),
+                                                                                    ("c", 1.0, 1.0, 1)]
+    assert st["B200"]["tests"][0]["step"] == "TLX core"
+
+
+def test_job_durations_and_slow_tests_follow_the_range():
+    old = push(1, timed("b200", ("x", 5.0)))
+    old["created_at"] = "2026-10-02T01:00:00Z"  # 10 days before asof
+    v = r.ops_view([old, push(2, timed("b200", ("y", 7.0)))], stamp(23))
+    assert sorted(v["jobs"]) == sorted(str(n) for n in r.OPS_RANGES)
+    assert [x["id"] for x in v["slow_tests"]["7"]["B200"]["tests"]] == ["y"]
+    assert {x["id"] for x in v["slow_tests"]["14"]["B200"]["tests"]} == {"x", "y"}
+    (j7, ) = v["jobs"]["7"]
+    assert j7["n"] == 1 and j7["p90_prev"] is not None  # the 10-day-old run is in the 7 days before
+    (j14, ) = v["jobs"]["14"]
+    assert j14["n"] == 2 and j14["p90_prev"] is None
+
+
+def test_slow_test_change_compares_the_last_3_days_with_the_7_before():
+
+    def at(h, day, *tests):
+        rr = push(h, timed("b200", *tests))
+        rr["created_at"] = f"2026-10-{day:02d}T01:00:00Z"
+        return rr
+
+    before = [at(h, h + 2, ("old", 10.0), ("steady", 5.0)) for h in range(1, 6)]  # Oct 3-7, in the 7 days before
+    runs = before + [at(10, 10, ("old", 30.0), ("steady", 5.5), ("fresh", 300.0)), at(11, 11, ("old", 30.0))]
+    for n in ("7", "30"):  # the verdict does not depend on the range
+        by = {x["id"]: x for x in r.ops_view(runs, stamp(23))["slow_tests"][n]["B200"]["tests"]}
+        assert by["fresh"]["change"] == "new" and by["fresh"]["first"] == "2026-10-10T01:00:00Z"
+        assert by["old"]["change"] == "slower" and (by["old"]["p50_recent"], by["old"]["p50_prev"]) == (30.0, 10.0)
+        assert by["steady"]["change"] is None  # 5.5 vs 5.0, under the 1.5x ratio
+    # With fewer than SLOW_MIN_PREV_RUNS runs before, a test absent from them is not called new.
+    by = {x["id"]: x for x in r.ops_view(runs[1:], stamp(23))["slow_tests"]["7"]["B200"]["tests"]}
+    assert by["fresh"]["change"] is None
