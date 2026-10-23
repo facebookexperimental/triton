@@ -61,6 +61,7 @@ enforce it yet raises `UnsupportedOp` rather than being silently ignored.
 from __future__ import annotations
 
 import functools
+import math
 
 from torch.compiler import assume_constant_result
 
@@ -659,8 +660,8 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
     parity. K/V may have fewer heads than Q (GQA) if they divide its head count.
     Causal masking is bottom-right aligned: query ``i`` sees keys
     ``j <= i + k_len - q_len``, and a query row that sees no key returns zeros.
-    `sm_scale` defaults to `HEAD_DIM ** -0.5`. Returns the output only (no
-    log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
+    `sm_scale` defaults to `HEAD_DIM ** -0.5` and must be positive and finite.
+    Returns the output only (no log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
     uninitialized.
     """
     import torch
@@ -680,6 +681,8 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
         raise InvalidInput("tlx.ops.flash_attn_varlen expects all tensors on one device")
     space_name, invariance = _normalize_space_arg("flash_attn_varlen", space)
     _check_single_config_space("flash_attn_varlen", space_name)
+    if sm_scale is not None and not 0 < sm_scale < math.inf:
+        raise InvalidInput(f"tlx.ops.flash_attn_varlen expects a positive finite sm_scale; got {sm_scale!r}")
     fn, spec = impl_for("flash_attn_varlen", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2])
     check_backward(spec, q, k, v)
