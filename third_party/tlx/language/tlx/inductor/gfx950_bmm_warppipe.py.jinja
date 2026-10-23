@@ -7,8 +7,8 @@
     # per-batch int64 base advance. num_stages=1.
     #
     # NOTE: tlx.async_load's flat offset is int32, so the heuristic restricts this template to
-    # per-batch M*K and N*K < 2**31. The per-batch base advance is done in int64 (batch*M*K can
-    # exceed 2**31).
+    # per-batch A/B element spans < 2**31. The per-batch base advance is done in int64
+    # (batch*M*K can exceed 2**31).
     #
     # DUAL PATH (selected by the USE_ASYNC constexpr the heuristic sets from K's alignment):
     #  * USE_ASYNC=1  (K % 8 == 0, i.e. (K*itemsize) % 16 == 0, 16-byte-aligned rows): the fast
