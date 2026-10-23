@@ -377,8 +377,8 @@ void createTMABarrierAndWait(
     const LoadGroupInfo loadGroup = loadGroups.find(numBuffers)->second;
     for (Operation *op : group) {
       auto tensorTy = cast<RankedTensorType>(op->getResultTypes()[0]);
-      int loadSize = product(getShapePerCTA(tensorTy));
-      sizeInBytes += loadSize * tensorTy.getElementTypeBitWidth() / 8;
+      sizeInBytes +=
+          ttng::getDescriptorLoadBytes(op, tensorTy, op->getOperand(0));
     }
 
     Value barrierAlloc = triton::createBarrierAlloc(forOp, numBuffers);
