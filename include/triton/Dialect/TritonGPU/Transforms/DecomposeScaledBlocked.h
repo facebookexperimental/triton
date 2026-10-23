@@ -39,6 +39,9 @@ protected:
                                                 DotScaledOp scaledDotOp,
                                                 int opIdx,
                                                 FloatType computeType) const;
+  TypedValue<RankedTensorType> upcastFp6(PatternRewriter &rewriter,
+                                         DotScaledOp scaledDotOp, int opIdx,
+                                         FloatType computeType) const;
   TypedValue<RankedTensorType>
   cvtDotOperand(PatternRewriter &rewriter, DotScaledOp scaledDotOp, int opIdx,
                 TypedValue<RankedTensorType> v) const;
