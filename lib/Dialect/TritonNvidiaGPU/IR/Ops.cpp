@@ -917,6 +917,8 @@ static LogicalResult verifyAsyncTMAStoreOp(Operation *op,
   // do not support fp4_padded operands.
   if (isFp4Padded(srcEnc))
     return op->emitOpError("does not support fp4_padded operands");
+  if (isFp6Padded(srcEnc))
+    return op->emitOpError("does not support fp6_padded operands");
   auto shape = dropPipeliningDim(srcType.getShape(), srcEnc);
   auto allocation = toLinearLayout(srcType);
   auto block = StringAttr::get(op->getContext(), "block");
@@ -1153,6 +1155,8 @@ LogicalResult AsyncTMAGatherOp::verify() {
   // `tile::gather4` does not support fp4_padded operands.
   if (isFp4Padded(getResult().getType().getEncoding()))
     return emitOpError("does not support fp4_padded operands");
+  if (isFp6Padded(getResult().getType().getEncoding()))
+    return emitOpError("does not support fp6_padded operands");
   if (getMulticast() && !hasCGABroadcast(resultType))
     return emitOpError(
         "multicast requires the shared layout to broadcast across CTAs");

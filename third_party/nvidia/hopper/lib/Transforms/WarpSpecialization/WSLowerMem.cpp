@@ -59,7 +59,8 @@ static bool isValidTMADestEncoding(Attribute bufferEnc, Attribute descEnc) {
   return descNvmma && descNvmma.getTransposed() == nvmma.getTransposed() &&
          descNvmma.getSwizzlingByteWidth() == nvmma.getSwizzlingByteWidth() &&
          descNvmma.getElementBitWidth() == nvmma.getElementBitWidth() &&
-         descNvmma.getFp4Padded() == nvmma.getFp4Padded();
+         descNvmma.getFp4Padded() == nvmma.getFp4Padded() &&
+         descNvmma.getFp6Padded() == nvmma.getFp6Padded();
 }
 
 static bool isScheduleRematerialization(Operation *op) {
