@@ -1,4 +1,6 @@
-// RUN: triton-opt %s -triton-materialize-integer-facts -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
+// RUN: triton-opt %s -triton-materialize-integer-facts -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o %t.once
+// RUN: triton-opt %t.once -triton-materialize-integer-facts -split-input-file -o %t.twice
+// RUN: diff %t.once %t.twice
 // RUN: triton-opt %s -triton-materialize-integer-facts -test-integer-facts -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
 // RUN: triton-opt %s -triton-materialize-integer-facts -triton-materialize-integer-facts -test-print-alignment -verify-diagnostics=only-expected -split-input-file | FileCheck %s --check-prefix=REFINE
 // RUN: triton-opt %s -triton-materialize-integer-facts -test-print-alignment -triton-erase-integer-refinements -verify-diagnostics=only-expected -split-input-file | FileCheck %s --check-prefix=ERASE
@@ -2570,6 +2572,7 @@ tt.func @narrow_range_loop(%n: i64, %ptr: !tt.ptr<i64>) {
   tt.return
 }
 
+
 // -----
 
 // NARROW-LABEL: @unsigned_result
@@ -2637,4 +2640,85 @@ tt.func @already_narrow(%x: i32, %y: i32) -> i32 {
 tt.func @keep_wide(%x: i64, %y: i64) -> i64 {
   %sum = arith.addi %x, %y overflow<nsw, nuw> : i64
   tt.return %sum : i64
+}
+
+// -----
+
+// Duplicate operands must receive the same edge fact.
+tt.func @single_predecessor(%x: i32, %bound: i32) -> i32 {
+  %condition = arith.cmpi slt, %x, %bound : i32
+  cf.cond_br %condition, ^then(%x, %x : i32, i32), ^else(%x : i32)
+^then(%a: i32, %alias: i32):
+  %check_a = arith.cmpi slt, %a, %bound {test.proof = "proven"} : i32
+  %check_alias = arith.cmpi slt, %alias, %bound {test.proof = "proven"} : i32
+  tt.return %a : i32
+^else(%b: i32):
+  %check_b = arith.cmpi sge, %b, %bound {test.proof = "proven"} : i32
+  %check_false = arith.cmpi slt, %b, %bound {test.proof = "disproven"} : i32
+  tt.return %b : i32
+}
+
+// An unbounded predecessor must discard the edge fact at the join.
+tt.func @multiple_predecessors(%x: i32, %y: i32, %bound: i32) -> i32 {
+  %condition = arith.cmpi slt, %x, %bound : i32
+  cf.cond_br %condition, ^merge(%x : i32), ^other
+^other:
+  cf.br ^merge(%y : i32)
+^merge(%arg: i32):
+  %check = arith.cmpi slt, %arg, %bound {test.proof = "unknown"} : i32
+  tt.return %arg : i32
+}
+
+// Opposite edges into one block must not leak either outcome.
+tt.func @same_successor(%x: i32, %bound: i32) -> i32 {
+  %condition = arith.cmpi slt, %x, %bound : i32
+  cf.cond_br %condition, ^merge(%x : i32), ^merge(%x : i32)
+^merge(%arg: i32):
+  %check = arith.cmpi slt, %arg, %bound {test.proof = "unknown"} : i32
+  tt.return %arg : i32
+}
+
+// Both incoming edges establish the same bound.
+tt.func @bounded_predecessors(%x: i32, %y: i32, %bound: i32) -> i32 {
+  %first = arith.cmpi slt, %x, %bound : i32
+  cf.cond_br %first, ^merge(%x : i32), ^other
+^other:
+  %second = arith.cmpi slt, %y, %bound : i32
+  cf.cond_br %second, ^merge(%y : i32), ^exit
+^merge(%arg: i32):
+  %check = arith.cmpi slt, %arg, %bound {test.proof = "proven"} : i32
+  tt.return %arg : i32
+^exit:
+  tt.return %y : i32
+}
+
+// Both predicate operands can cross the edge, including duplicate aliases.
+tt.func @transported_bound(%x: i32, %bound: i32) -> i32 {
+  %condition = arith.cmpi slt, %x, %bound : i32
+  cf.cond_br %condition, ^then(%x, %x, %bound, %bound : i32, i32, i32, i32), ^else(%x, %bound : i32, i32)
+^then(%a: i32, %alias_a: i32, %b: i32, %alias_b: i32):
+  %check_a = arith.cmpi slt, %a, %b {test.proof = "proven"} : i32
+  %check_alias_a = arith.cmpi slt, %alias_a, %b {test.proof = "proven"} : i32
+  %check_alias_b = arith.cmpi slt, %a, %alias_b {test.proof = "proven"} : i32
+  %check_both = arith.cmpi slt, %alias_a, %alias_b {test.proof = "proven"} : i32
+  %check_original = arith.cmpi slt, %a, %bound {test.proof = "proven"} : i32
+  tt.return %a : i32
+^else(%c: i32, %d: i32):
+  %check_else = arith.cmpi sge, %c, %d {test.proof = "proven"} : i32
+  tt.return %c : i32
+}
+
+// Equal predicates with different bounds do not establish a common relation.
+tt.func @different_bounds(%choose: i1, %x: i32, %y: i32, %bound_a: i32, %bound_b: i32) -> i32 {
+  cf.cond_br %choose, ^left, ^right
+^left:
+  %a = tt.refine %x, %bound_a {predicate = 2 : i64} : i32
+  cf.br ^merge(%a : i32)
+^right:
+  %b = tt.refine %y, %bound_b {predicate = 2 : i64} : i32
+  cf.br ^merge(%b : i32)
+^merge(%arg: i32):
+  %check_a = arith.cmpi slt, %arg, %bound_a {test.proof = "unknown"} : i32
+  %check_b = arith.cmpi slt, %arg, %bound_b {test.proof = "unknown"} : i32
+  tt.return %arg : i32
 }
