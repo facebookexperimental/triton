@@ -321,7 +321,8 @@ tt.func @refine_missing_tile_bound(%x: i32, %rows: i32, %columns: i32) {
 
 // REFINE-LABEL: tt.func @refine_loop_assumption_chain
 // REFINE: scf.for %[[IV:.*]] =
-// REFINE: %[[UPPER:.*]] = tt.refine %[[IV]], %{{.*}} {predicate = 2 : i64}
+// REFINE: %[[LOWER:.*]] = tt.refine %[[IV]], %{{.*}} {predicate = 5 : i64}
+// REFINE: %[[UPPER:.*]] = tt.refine %[[LOWER]], %{{.*}} {predicate = 2 : i64}
 // REFINE: llvm.intr.assume
 // REFINE: %[[BOTH:.*]] = tt.refine %[[UPPER]], %{{.*}} {predicate = 5 : i64}
 // REFINE-NOT: tt.refine
@@ -334,6 +335,33 @@ tt.func @refine_loop_assumption_chain(%start: i32, %limit: i32, %step: i32) {
     %bound = arith.cmpi slt, %iv, %limit {test.proof = "proven"} : i32
     %sign = arith.cmpi sge, %iv, %zero {test.proof = "proven"} : i32
   }
+  tt.return
+}
+
+// -----
+
+tt.func @refine_signed_loop_lower_bound(%start: i32, %limit: i32, %step: i32) {
+  %zero = arith.constant 0 : i32
+  scf.for %iv = %start to %limit step %step : i32 {
+    %lower = arith.cmpi sge, %iv, %start {test.proof = "proven"} : i32
+    %upper = arith.cmpi slt, %iv, %limit {test.proof = "proven"} : i32
+    %sign = arith.cmpi sge, %iv, %zero {test.proof = "unknown"} : i32
+  }
+  %outside = arith.cmpi slt, %start, %limit {test.proof = "unknown"} : i32
+  tt.return
+}
+
+// -----
+
+tt.func @refine_unsigned_loop_lower_bound(%start: i32, %limit: i32, %step: i32) {
+  %zero = arith.constant 0 : i32
+  scf.for unsigned %iv = %start to %limit step %step : i32 {
+    %lower = arith.cmpi uge, %iv, %start {test.proof = "proven"} : i32
+    %upper = arith.cmpi ult, %iv, %limit {test.proof = "proven"} : i32
+    %signed = arith.cmpi sge, %iv, %start {test.proof = "unknown"} : i32
+    %sign = arith.cmpi sge, %iv, %zero {test.proof = "unknown"} : i32
+  }
+  %outside = arith.cmpi ult, %start, %limit {test.proof = "unknown"} : i32
   tt.return
 }
 

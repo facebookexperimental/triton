@@ -9,6 +9,8 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
+#include <array>
+
 namespace mlir::triton {
 #define GEN_PASS_DEF_TRITONMATERIALIZEINTEGERFACTS
 #define GEN_PASS_DEF_TRITONERASEINTEGERREFINEMENTS
@@ -147,31 +149,42 @@ static void collectPredicates(Value condition, bool truth,
 
 static void materialize(ArrayRef<Predicate> predicates, Block *block,
                         Block::iterator position, DominanceInfo &dominance) {
+  // Existing entry refinements already dominate the remaining scope.
+  while (position != block->end() && isa<RefineOp>(*position))
+    ++position;
   OpBuilder builder(block, position);
   for (Predicate predicate : predicates) {
     if (matchPattern(predicate.value, m_Constant()))
       continue;
-    SmallVector<Value> pending{predicate.value};
-    SmallVector<Value> inputs;
+    auto matches = [&](RefineOp refine) {
+      return refine.getBound() == predicate.bound &&
+             refine.getPredicate() == predicate.comparison;
+    };
+    bool known = false;
+    for (Value value = predicate.value;
+         auto refine = value.getDefiningOp<RefineOp>();
+         value = refine.getValue())
+      known |= matches(refine);
+    SmallVector<std::pair<Value, bool>> pending{{predicate.value, known}};
+    SmallVector<std::pair<Value, bool>> inputs;
     DenseSet<Value> visited;
     while (!pending.empty()) {
-      Value input = pending.pop_back_val();
+      auto [input, known] = pending.pop_back_val();
       if (!visited.insert(input).second)
         continue;
-      inputs.push_back(input);
+      inputs.emplace_back(input, known);
       for (Operation *user : input.getUsers()) {
         auto candidate = dyn_cast<RefineOp>(user);
         if (!candidate || candidate.getValue() != input ||
             position == block->end() ||
             !dominance.properlyDominates(user, &*position))
           continue;
-        pending.push_back(candidate.getResult());
+        pending.emplace_back(candidate.getResult(),
+                             known || matches(candidate));
       }
     }
-    for (Value input : inputs) {
-      auto existing = input.getDefiningOp<RefineOp>();
-      if (existing && existing.getBound() == predicate.bound &&
-          existing.getPredicate() == predicate.comparison)
+    for (auto [input, known] : inputs) {
+      if (known)
         continue;
       auto inScope = [&](OpOperand &use) {
         if (auto refine = dyn_cast<RefineOp>(use.getOwner())) {
@@ -225,10 +238,15 @@ struct TritonMaterializeIntegerFactsPass
       } else if (auto loop = dyn_cast<scf::ForOp>(source)) {
         if (!isa<IntegerType>(loop.getInductionVar().getType()))
           continue;
-        Predicate predicate{loop.getInductionVar(), loop.getUpperBound(),
-                            loop.getUnsignedCmp() ? arith::CmpIPredicate::ult
-                                                  : arith::CmpIPredicate::slt};
-        materialize({predicate}, loop.getBody(), loop.getBody()->begin(),
+        // scf.for requires a positive step and a representable exit value.
+        std::array predicates{
+            Predicate{loop.getInductionVar(), loop.getLowerBound(),
+                      loop.getUnsignedCmp() ? arith::CmpIPredicate::uge
+                                            : arith::CmpIPredicate::sge},
+            Predicate{loop.getInductionVar(), loop.getUpperBound(),
+                      loop.getUnsignedCmp() ? arith::CmpIPredicate::ult
+                                            : arith::CmpIPredicate::slt}};
+        materialize(predicates, loop.getBody(), loop.getBody()->begin(),
                     dominance);
       } else if (auto branch = dyn_cast<cf::CondBranchOp>(source)) {
         for (unsigned edge : {0u, 1u}) {
