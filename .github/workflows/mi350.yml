@@ -59,58 +59,24 @@ jobs:
       - name: Run TLX core tests
         id: run_core_tests
         timeout-minutes: 90
-        run: |
-          set -eux
-          shopt -s nullglob
-          FILES=(
+        uses: ./.github/actions/run-tlx-core-tests
+        with:
+          platform: mi350
+          files: |
             python/test/unit/language/test_tlx_*_any.py
             python/test/unit/language/test_tlx_*hip*.py
             python/test/unit/language/test_tlx_*gfx950*.py
             python/test/unit/tlx_ops/test_*_hip.py
             python/test/unit/tlx_ops/test_*_gfx950.py
-          )
-          # TorchTLX depends on floating PyTorch Inductor APIs and runs in the
-          # separate mi350-torchtlx-test job below, not this pinned-PyTorch job.
-          TLX_FILES=()
-          for file in "${FILES[@]}"; do
-            [[ "${file}" == */test_torchtlx_* ]] || TLX_FILES+=("${file}")
-          done
-          FILES=("${TLX_FILES[@]}")
-          [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
-            mapfile -t FILES < <(printf '%s\n' "${FILES[@]}" | grep -Fxf /tmp/affected.txt || true)
-            echo "kernel-only PR: ${#FILES[@]} TLX core file(s) touch the changed kernel(s)"
-            [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
-          fi
-          echo "mi350 collects:" "${FILES[@]}"
-          # Log runner size and the pod's memory peak, pass or fail, to size -n.
-          trap 'echo "runner: nproc=$(nproc) memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) memory.peak_mib=$(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 ))"' EXIT
-          # Forkserver children must import the test module by its importlib
-          # name (python.test.unit.tlx_ops.*), not just its helpers from tlx_ops.
-          # Kernel compilation dominates these tests (a cold Triton cache was
-          # ~4x slower than a warm one on a 343-test subset), so overlap
-          # compiles across four xdist workers sharing the runner's single GPU
-          # (pod memory peaked at ~44 of 100 GiB). worksteal rebalances the few
-          # multi-minute cases instead of stranding them behind a static split.
-          PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-core.xml
+          kernel-only: ${{ steps.select.outputs.kernel_only }}
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
-        env:
-          KERNEL_ONLY: ${{ steps.select.outputs.kernel_only }}
-          CORRECTNESS_MODE: ${{ steps.select.outputs.correctness_mode }}
-          CORRECTNESS_K: ${{ steps.select.outputs.correctness_k }}
-        run: |
-          set -eux
-          K=()
-          if [ "${KERNEL_ONLY}" = true ]; then
-            case "${CORRECTNESS_MODE}" in
-              skip) echo "kernel-only PR: no tutorial correctness tests touch the changed kernel(s); skipping"; exit 0 ;;
-              filtered) K=(-k "${CORRECTNESS_K}") ;;
-            esac
-          fi
-          python -m pytest third_party/tlx/tutorials/testing/test_correctness.py ${K[@]+"${K[@]}"} \
-            -v -n 4 --dist worksteal --durations=25 --junitxml=/tmp/tlx-correctness.xml
+        uses: ./.github/actions/run-tlx-correctness-tests
+        with:
+          kernel-only: ${{ steps.select.outputs.kernel_only }}
+          correctness-mode: ${{ steps.select.outputs.correctness_mode }}
+          correctness-k: ${{ steps.select.outputs.correctness_k }}
       - name: Parse test failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
