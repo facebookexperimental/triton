@@ -36,6 +36,7 @@
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/VCSRevision.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
@@ -44,6 +45,7 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/InstSimplifyPass.h"
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <memory>
@@ -749,6 +751,11 @@ void init_triton_llvm(py::module_ &m) {
           standardInstr.registerCallbacks(passInstrCb, &mam);
           enablePassInstrumentation = true;
         }
+        TimeProfilingPassesHandler timeProfiling;
+        if (llvm::timeTraceProfilerEnabled()) {
+          timeProfiling.registerCallbacks(passInstrCb);
+          enablePassInstrumentation = true;
+        }
         if (enablePassInstrumentation)
           instrCbPtr = &passInstrCb;
 
@@ -972,6 +979,29 @@ void init_triton_llvm(py::module_ &m) {
     // thread pool is not fork-safe: a forked child inherits the pool's state
     // but not its threads, causing SIGABRT on use or cleanup.
     llvm::parallel::strategy = llvm::hardware_concurrency(1);
+  });
+
+  // Per-thread LLVM time-trace profiler, used by triton.tools.compile_trace.
+  // begin returns the steady_clock time the profiler's timestamps are relative
+  // to (CLOCK_MONOTONIC on Linux, like Python's time.monotonic_ns), or -1 if a
+  // profiler is already running on this thread.
+  m.def("time_trace_begin", [](unsigned granularityUs) -> int64_t {
+    if (llvm::timeTraceProfilerEnabled())
+      return -1;
+    auto start = std::chrono::steady_clock::now();
+    llvm::timeTraceProfilerInitialize(granularityUs, "triton");
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               start.time_since_epoch())
+        .count();
+  });
+  m.def("time_trace_end", []() -> std::string {
+    if (!llvm::timeTraceProfilerEnabled())
+      return "";
+    SmallString<0> json;
+    llvm::raw_svector_ostream os(json);
+    llvm::timeTraceProfilerWrite(os);
+    llvm::timeTraceProfilerCleanup();
+    return std::string(json);
   });
 
   m.def("link_extern_libs", [](llvm::Module *dstMod,

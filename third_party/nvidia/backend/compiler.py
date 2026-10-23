@@ -15,6 +15,7 @@ from triton import knobs
 from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.runtime.errors import PTXASError
+from triton.tools.compile_trace import run_subprocess
 
 # Auto-TMA host-launcher caps. These MUST stay in lockstep with the C macros of
 # the same name in nvidia/backend/launch.h and nvidia/backend/driver.c: the
@@ -1521,7 +1522,7 @@ class CUDABackend(BaseBackend):
                 fbin,
             ]
             try:
-                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog, env=knobs.nvidia.get_tool_env())
+                run_subprocess(ptxas_cmd, check=True, close_fds=False, stderr=flog, env=knobs.nvidia.get_tool_env())
                 if knobs.nvidia.dump_ptxas_log:
                     with open(flog.name) as log_file:
                         print(log_file.read())
