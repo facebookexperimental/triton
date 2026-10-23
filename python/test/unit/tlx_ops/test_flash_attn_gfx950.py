@@ -1,0 +1,931 @@
+"""Public ``tlx.ops.flash_attn`` coverage for gfx950."""
+
+import contextlib
+import subprocess
+import sys
+from unittest import mock
+
+import pytest
+import torch
+
+from triton._internal_testing import is_hip_cdna4
+
+
+@pytest.fixture
+def flash_attention_registry():
+    attention = pytest.importorskip("torch.nn.attention")
+    names = (
+        "activate_flash_attention_impl",
+        "current_flash_attention_impl",
+        "register_flash_attention_impl",
+        "restore_flash_attention_impl",
+    )
+    if not all(hasattr(attention, name) for name in names) or not hasattr(torch.library, "get_kernel"):
+        pytest.skip("requires PyTorch's conditional FlashAttention provider APIs")
+
+
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize("case", ("measured", "different_lengths", "unknown_shape", "shifted_q", "shifted_v"))
+def test_varlen_provider_admission_requires_measured_workload(monkeypatch, case):
+    from triton.tlx import pytorch as provider
+
+    q = torch.empty((96, 2, 128), dtype=torch.bfloat16)
+    k = torch.empty((192, 2, 128), dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    cu_q = torch.tensor([0, 32, 96], dtype=torch.int32)
+    q_offsets, k_offsets = [0, 32, 96], [0, 64, 192]
+    # This measured fixture has the same totals as [0, 64, 96], but a
+    # different query-length distribution. Totals alone must not admit it.
+    signature = ((96, 2, 128), (192, 2, 128), 2, 64, 128, False)
+    monkeypatch.setattr(provider, "_PERFORMANCE_VALIDATED_VARLEN_SIGNATURES", {
+        signature: "22c09c3283a266bfb0745905f4d1a625bdbeedd59a3ece10c333921b3b163b3b",
+    })
+    if case == "different_lengths":
+        q_offsets = [0, 64, 96]
+    elif case == "unknown_shape":
+        q = q[:80]
+    elif case == "shifted_q":
+        q = torch.empty(q.numel() + 1, dtype=q.dtype)[1:].view_as(q)
+    elif case == "shifted_v":
+        v = torch.empty(v.numel() + 1, dtype=v.dtype)[1:].view_as(v)
+
+    admitted = provider._is_varlen_performance_validated(q, k, cu_q, 64, 128, False, q_offsets, k_offsets, (v, ))
+    assert admitted is (case == "measured")
+
+
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize("shared_offsets", (False, True))
+def test_varlen_provider_reuses_validated_offsets(shared_offsets):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    q = torch.empty((96, 2, 128), dtype=torch.bfloat16)
+    k = q if shared_offsets else torch.empty((192, 2, 128), dtype=q.dtype)
+    v, out = torch.empty_like(k), torch.empty_like(q)
+    grad_out = torch.ones((), dtype=q.dtype).expand_as(q)
+    lse = torch.empty((2, 96), dtype=torch.float32)
+    cu_q = torch.tensor([0, 32, 96], dtype=torch.int32)
+    cu_k = cu_q if shared_offsets else torch.tensor([0, 64, 192], dtype=torch.int32)
+    gradients = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
+    native_kernel = mock.Mock()
+
+    # Run host planning with CPU tensors and replace device-only operations.
+    with (
+            mock.patch.object(provider, "_varlen_support_error", return_value=None),
+            mock.patch.object(provider, "_is_varlen_performance_validated", return_value=True),
+            mock.patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()),
+            mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            mock.patch.object(gfx950_varlen_bwd, "_validate_cu_seqlens_metadata"),
+            mock.patch.object(gfx950_varlen_bwd, "_varlen_validate_offsets"),
+            mock.patch.object(gfx950_varlen_bwd, "_varlen_build_compact_schedules"),
+            mock.patch.object(gfx950_varlen_bwd, "_read_cu_seqlens", wraps=gfx950_varlen_bwd._read_cu_seqlens) as reads,
+            mock.patch.object(gfx950_varlen_bwd, "_validate_backward_inputs") as validate_inputs,
+            mock.patch.object(gfx950_varlen_bwd, "fa_varlen_backward", return_value=gradients),
+    ):
+        actual = provider._tlx_flash_attention_backward(native_kernel, object(), grad_out, q, k, v, out, lse, cu_q,
+                                                        cu_k, 128, 256, 0.0, False, None, None)
+
+    assert actual is gradients
+    native_kernel.call_boxed.assert_not_called()
+    assert reads.call_count == (1 if shared_offsets else 2)
+    assert reads.call_args_list[0].args == ("cum_seq_q", cu_q)
+    if not shared_offsets:
+        assert reads.call_args_list[1].args == ("cum_seq_k", cu_k)
+    plan = validate_inputs.call_args.args[6]
+    assert (plan.total_q, plan.total_kv, plan.max_q, plan.max_kv) == (96, 96 if shared_offsets else 192, 64,
+                                                                      64 if shared_offsets else 128)
+    assert plan.qk_offsets_equal is shared_offsets
+    for planned, original in ((plan.cu_seqlens_q, cu_q), (plan.cu_seqlens_k, cu_k)):
+        assert planned.data_ptr() != original.data_ptr()
+        torch.testing.assert_close(planned, original)
+    assert (plan.cu_seqlens_q is plan.cu_seqlens_k) is shared_offsets
+    assert validate_inputs.call_args.args[4].is_contiguous()
+
+
+@pytest.fixture
+def varlen_host_case(monkeypatch):
+    from triton.tlx import pytorch as provider
+
+    q = torch.empty((96, 2, 128), dtype=torch.bfloat16)
+    k = torch.empty((192, 2, 128), dtype=q.dtype)
+    v = torch.empty_like(k)
+    out = torch.arange(q.numel(), dtype=q.dtype).view(2, 96, 128).transpose(0, 1)
+    grad_out = torch.ones((), dtype=q.dtype).expand_as(q)
+    lse = torch.empty((2, 96), dtype=torch.float32)
+    cu_q = torch.tensor([0, 32, 96], dtype=torch.int32)
+    cu_k = torch.tensor([0, 64, 192], dtype=torch.int32)
+    signature = (tuple(q.shape), tuple(k.shape), 2, 64, 128, False)
+    monkeypatch.setattr(provider, "_PERFORMANCE_VALIDATED_VARLEN_SIGNATURES", {
+        signature: "22c09c3283a266bfb0745905f4d1a625bdbeedd59a3ece10c333921b3b163b3b",
+    })
+    return [grad_out, q, k, v, out, lse, cu_q, cu_k, 64, 128, 0.0, False, object(), object()]
+
+
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize("reason", ("different_lengths", "shifted_v", "shifted_lse", "shifted_out", "shifted_grad"))
+def test_varlen_provider_rejection_avoids_normalization(monkeypatch, varlen_host_case, reason):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    args = varlen_host_case
+    if reason == "different_lengths":
+        args[6] = torch.tensor([0, 64, 96], dtype=torch.int32)
+    else:
+        index = {"shifted_v": 3, "shifted_lse": 5, "shifted_out": 4, "shifted_grad": 0}[reason]
+        tensor = args[index]
+        args[index] = torch.empty(tensor.numel() + 1, dtype=tensor.dtype)[1:].view_as(tensor)
+        assert args[index].is_contiguous()
+        assert args[index].data_ptr() % provider._REQUIRED_BASE_ALIGNMENT_BYTES
+
+    contiguous = torch.Tensor.contiguous
+    normalization_calls = []
+
+    def observe_contiguous(tensor, *call_args, **kwargs):
+        if tensor is args[0] or tensor is args[4]:
+            normalization_calls.append(tensor)
+        return contiguous(tensor, *call_args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "contiguous", observe_contiguous)
+    native_result = object()
+    native_kernel = mock.Mock()
+    native_kernel.call_boxed.return_value = native_result
+    dispatch_keys = object()
+    kwargs = {"scale": 0.25, "window_size_left": -1, "window_size_right": -1}
+    with (
+            mock.patch.object(provider, "_varlen_support_error", return_value=None),
+            mock.patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()),
+            mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            mock.patch.object(gfx950_varlen_bwd, "_prepare_varlen_backward") as prepare,
+            mock.patch.object(gfx950_varlen_bwd, "fa_varlen_backward") as backward,
+    ):
+        actual = provider._tlx_flash_attention_backward(native_kernel, dispatch_keys, *args, **kwargs)
+
+    assert actual is native_result
+    assert not normalization_calls
+    prepare.assert_not_called()
+    backward.assert_not_called()
+    native_kernel.call_boxed.assert_called_once()
+    actual_args = native_kernel.call_boxed.call_args.args
+    assert actual_args[0] is dispatch_keys
+    assert all(actual is original for actual, original in zip(actual_args[1:], args, strict=True))
+    assert native_kernel.call_boxed.call_args.kwargs == kwargs
+
+
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize("shifted_bases", (False, True))
+def test_varlen_provider_admission_normalizes_strided_inputs(monkeypatch, varlen_host_case, shifted_bases):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    args = varlen_host_case
+    if shifted_bases:
+        out = torch.empty(args[4].numel() + 1, dtype=args[4].dtype)[1:].view(2, 96, 128).transpose(0, 1)
+        out.copy_(args[4])
+        args[4] = out
+        args[0] = torch.tensor([0.0, 3.0], dtype=out.dtype)[1:].expand_as(out)
+        assert all(tensor.data_ptr() % provider._REQUIRED_BASE_ALIGNMENT_BYTES for tensor in (args[0], args[4]))
+    assert not args[0].is_contiguous()
+    assert not args[4].is_contiguous()
+
+    contiguous = torch.Tensor.contiguous
+    normalization_calls = []
+
+    def observe_contiguous(tensor, *call_args, **kwargs):
+        if tensor is args[0] or tensor is args[4]:
+            normalization_calls.append(tensor)
+        return contiguous(tensor, *call_args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "contiguous", observe_contiguous)
+    gradients = (torch.empty_like(args[1]), torch.empty_like(args[2]), torch.empty_like(args[3]))
+    native_kernel = mock.Mock()
+    with (
+            mock.patch.object(provider, "_varlen_support_error", return_value=None),
+            mock.patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()),
+            mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            mock.patch.object(gfx950_varlen_bwd, "_validate_cu_seqlens_metadata"),
+            mock.patch.object(gfx950_varlen_bwd, "_varlen_validate_offsets"),
+            mock.patch.object(gfx950_varlen_bwd, "_varlen_build_compact_schedules"),
+            mock.patch.object(gfx950_varlen_bwd, "_validate_backward_inputs") as validate_inputs,
+            mock.patch.object(gfx950_varlen_bwd, "fa_varlen_backward", return_value=gradients) as backward,
+    ):
+        actual = provider._tlx_flash_attention_backward(native_kernel, object(), *args)
+
+    assert actual is gradients
+    native_kernel.call_boxed.assert_not_called()
+    assert len(normalization_calls) == 2
+    assert normalization_calls[0] is args[4]
+    assert normalization_calls[1] is args[0]
+    for normalized, original in zip(backward.call_args.args[3:5], (args[4], args[0]), strict=True):
+        assert normalized.is_contiguous()
+        assert normalized.data_ptr() % provider._REQUIRED_BASE_ALIGNMENT_BYTES == 0
+        assert normalized.data_ptr() != original.data_ptr()
+        torch.testing.assert_close(normalized, original)
+    assert backward.call_args.args[3] is validate_inputs.call_args.args[3]
+    assert backward.call_args.args[4] is validate_inputs.call_args.args[4]
+
+
+@contextlib.contextmanager
+def _varlen_provider():
+    from triton.tlx import pytorch as provider
+    import torch.nn.attention as attention
+
+    previous = attention.current_flash_attention_impl()
+    attention.activate_flash_attention_impl(provider.PROVIDER_NAME)
+    try:
+        yield provider
+    finally:
+        attention.restore_flash_attention_impl()
+        if previous is not None:
+            attention.activate_flash_attention_impl(previous)
+
+
+def _varlen_aten_case(*, causal=False, gqa=False, empty=False, expanded_grad=False):
+    cu_q = torch.tensor([0, 0 if empty else 32, 96], device="cuda", dtype=torch.int32)
+    cu_k = cu_q if causal else torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
+    max_q = 96 if empty else 64
+    max_k = max_q if causal else 128
+    generator = torch.Generator(device="cuda").manual_seed(3775)
+    q = torch.randn((96, 2, 128), device="cuda", dtype=torch.bfloat16, generator=generator)
+    k = torch.randn((96 if causal else 192, 1 if gqa else 2, 128), device="cuda", dtype=q.dtype, generator=generator)
+    v = torch.randn(k.shape, device="cuda", dtype=q.dtype, generator=generator)
+    out, lse, rng, unused, _ = torch.ops.aten._flash_attention_forward(q, k, v, cu_q, cu_k, max_q, max_k, 0.0, causal,
+                                                                       False)
+    do = torch.ones((), dtype=q.dtype, device=q.device).expand_as(q) if expanded_grad else torch.randn(
+        q.shape, device=q.device, dtype=q.dtype, generator=generator)
+    return (do, q, k, v, out, lse, cu_q, cu_k, max_q, max_k, 0.0, causal, rng, unused)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize(("causal", "gqa", "expanded_grad"),
+                         ((False, False, False), (False, True, False), (True, False, True)))
+def test_varlen_provider_routes_fp32_backward_gfx950(monkeypatch, causal, gqa, expanded_grad):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    args = _varlen_aten_case(causal=causal, gqa=gqa, expanded_grad=expanded_grad)
+    kwargs = {"window_size_left": -1, "window_size_right": 0 if causal else -1}
+    reference = torch.ops.aten._flash_attention_backward(*args, **kwargs)
+    # Exercise the real operator adapter independently of which production
+    # benchmark signatures have earned transparent routing.
+    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args, **kwargs: True, raising=False)
+    calls = []
+    original = gfx950_varlen_bwd.fa_varlen_backward
+
+    def observe(*args, **kwargs):
+        calls.append(kwargs["dq_atomic_fp32"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(gfx950_varlen_bwd, "fa_varlen_backward", observe)
+    with (
+            mock.patch.object(gfx950_varlen_bwd, "_read_cu_seqlens", wraps=gfx950_varlen_bwd._read_cu_seqlens) as reads,
+            _varlen_provider(),
+    ):
+        actual = torch.ops.aten._flash_attention_backward(*args, **kwargs)
+    assert calls == [True]
+    assert reads.call_count == (1 if causal else 2)
+    for result, expected in zip(actual, reference, strict=True):
+        error = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(expected.float())
+        assert error.item() < 1e-2
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.usefixtures("flash_attention_registry")
+def test_varlen_provider_empty_sequence_uses_native_gfx950(monkeypatch):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    args = _varlen_aten_case(empty=True)
+    reference = torch.ops.aten._flash_attention_backward(*args)
+    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args, **kwargs: True, raising=False)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("unsupported empty sequence reached TLX")
+
+    monkeypatch.setattr(gfx950_varlen_bwd, "fa_varlen_backward", unexpected)
+    with _varlen_provider():
+        actual = torch.ops.aten._flash_attention_backward(*args)
+    torch.testing.assert_close(actual[0], reference[0], rtol=1e-2, atol=1e-2)
+    # Native CK can leave dK/dV rows for an empty query sequence unwritten.
+    # Compare its nonempty sequence; the guard above checks that TLX was not called.
+    first_nonempty_kv = args[7][1].item()
+    for result, expected in zip(actual[1:], reference[1:], strict=True):
+        torch.testing.assert_close(result[first_nonempty_kv:], expected[first_nonempty_kv:], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize("reason", ("unmeasured", "deterministic", "causal_gqa", "window", "capture"))
+def test_varlen_provider_preserves_native_fallback_gfx950(monkeypatch, reason):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    args = _varlen_aten_case(causal=reason == "causal_gqa", gqa=reason == "causal_gqa")
+    kwargs = {"window_size_left": 16, "window_size_right": 16} if reason == "window" else {}
+    reference = torch.ops.aten._flash_attention_backward(*args, **kwargs)
+    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args, **kwargs: reason != "unmeasured")
+    if reason == "deterministic":
+        monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+    if reason == "capture":
+        # Verify the branch before any host offset copy. Real graph replay
+        # has separate coverage; CK's native capture support varies by build.
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("unsupported call prepared a TLX plan")
+
+    monkeypatch.setattr(gfx950_varlen_bwd, "_prepare_varlen_backward", unexpected)
+    with _varlen_provider():
+        actual = torch.ops.aten._flash_attention_backward(*args, **kwargs)
+    for result, expected in zip(actual, reference, strict=True):
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize("stage", ("backward", "preparation"))
+@pytest.mark.parametrize("error_type", (RuntimeError, TypeError, ValueError))
+def test_varlen_provider_does_not_retry_kernel_failure_gfx950(monkeypatch, stage, error_type):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    args = _varlen_aten_case()
+    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args, **kwargs: True)
+
+    def fail(*args, **kwargs):
+        raise error_type("varlen kernel failure")
+
+    name = "fa_varlen_backward" if stage == "backward" else "_prepare_varlen_backward"
+    monkeypatch.setattr(gfx950_varlen_bwd, name, fail)
+    with _varlen_provider(), pytest.raises(error_type, match="varlen kernel failure"):
+        torch.ops.aten._flash_attention_backward(*args)
+
+
+def _gfx950_device_indices():
+    return [
+        index for index in range(torch.cuda.device_count())
+        if getattr(torch.cuda.get_device_properties(index), "gcnArchName", "").startswith("gfx950")
+    ]
+
+
+def _has_two_gfx950_devices():
+    return len(_gfx950_device_indices()) >= 2
+
+
+def test_gfx950_device_indices_ignore_non_rocm_and_other_amd_devices():
+    properties = (
+        mock.Mock(spec=["name"]),
+        mock.Mock(gcnArchName="gfx950:sramecc+:xnack-"),
+        mock.Mock(gcnArchName="gfx942:sramecc+:xnack-"),
+        mock.Mock(gcnArchName="gfx950"),
+    )
+    with (
+            mock.patch.object(torch.cuda, "device_count", return_value=len(properties)),
+            mock.patch.object(torch.cuda, "get_device_properties", side_effect=lambda index: properties[index]),
+    ):
+        assert _gfx950_device_indices() == [1, 3]
+        assert _has_two_gfx950_devices()
+
+
+def test_flash_attn_gfx950_catalog_entry():
+    from triton.tlx.ops._catalog import CATALOG, InvalidInput, check_inputs
+
+    specs = [spec for spec in CATALOG if (spec.op, spec.arch) == ("flash_attn", "gfx950")]
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.impl == "triton.tlx.ops.kernels.flash_attn.gfx950:flash_attn"
+    assert spec.supports_backward
+
+    check_inputs(spec, dtype=torch.bfloat16, HEAD_DIM=64)
+    check_inputs(spec, dtype=torch.bfloat16, HEAD_DIM=128)
+    with pytest.raises(InvalidInput, match="does not support float16"):
+        check_inputs(spec, dtype=torch.float16, HEAD_DIM=64)
+    with pytest.raises(InvalidInput, match="does not support these inputs"):
+        check_inputs(spec, dtype=torch.bfloat16, HEAD_DIM=256)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+def test_flash_attn_gfx950_catalog_resolves_public_implementation():
+    from triton.tlx.ops._catalog import impl_for
+    from triton.tlx.ops.kernels.flash_attn.gfx950 import flash_attn
+
+    implementation, spec = impl_for("flash_attn", arch="gfx950")
+    assert implementation is flash_attn
+    assert spec.supports_backward
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize(
+    ("requires_grad", "grad_enabled"),
+    ((False, True), (True, False)),
+)
+def test_flash_attn_gfx950_inference_skips_backward_state(requires_grad, grad_enabled):
+    from triton.tlx.ops.kernels.flash_attn import gfx950
+
+    q, k, v = _qkv(64, requires_grad=requires_grad, context=256)
+    sentinel = object()
+    with (
+            mock.patch.object(gfx950, "_flash_attn_inference", return_value=sentinel) as inference,
+            mock.patch.object(gfx950._attention, "apply") as differentiable,
+            torch.set_grad_enabled(grad_enabled),
+    ):
+        assert gfx950.flash_attn(q, k, v, space="smoke") is sentinel
+
+    inference.assert_called_once_with(q, k, v, 64**-0.5, False, "smoke")
+    differentiable.assert_not_called()
+
+
+@pytest.mark.skipif(not _has_two_gfx950_devices(), reason="requires two gfx950 GPUs")
+def test_flash_attn_gfx950_uses_input_device_when_current_device_differs():
+    previous_device, query_device = _gfx950_device_indices()[:2]
+    # Keep an illegal cross-device launch from poisoning the pytest process if
+    # this regresses. The child deliberately leaves one gfx950 current while
+    # the public op's inputs live on another gfx950.
+    script = r"""
+import sys
+
+import torch
+
+from triton.tlx.ops import flash_attn
+
+previous_device = int(sys.argv[1])
+query_device = int(sys.argv[2])
+torch.cuda.set_device(previous_device)
+q, k, v = [
+    torch.randn(
+        (1, 1, 256, 64),
+        device=f"cuda:{query_device}",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    for _ in range(3)
+]
+assert torch.cuda.current_device() == previous_device
+
+out = flash_attn(q, k, v, space="smoke")
+assert out.device == q.device
+assert torch.cuda.current_device() == previous_device
+torch.cuda.synchronize(query_device)
+torch.cuda.synchronize(previous_device)
+
+grad_out = torch.randn_like(out)
+out.backward(grad_out)
+torch.cuda.synchronize(query_device)
+torch.cuda.synchronize(previous_device)
+assert torch.cuda.current_device() == previous_device
+assert q.grad.device == k.grad.device == v.grad.device == q.device
+
+rq, rk, rv = (tensor.detach().clone().requires_grad_() for tensor in (q, k, v))
+with torch.cuda.device(query_device):
+    reference = torch.nn.functional.scaled_dot_product_attention(rq, rk, rv)
+    reference.backward(grad_out)
+torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
+for actual, expected in zip((q.grad, k.grad, v.grad), (rq.grad, rk.grad, rv.grad), strict=True):
+    relative_l2 = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(expected.float())
+    assert relative_l2.item() < 5e-3
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(previous_device),
+         str(query_device)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+def _qkv(head_dim, *, requires_grad, context=None):
+    context = context or (512 if head_dim == 64 else 1024)
+    return [
+        torch.randn(
+            (1, 4, context, head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).requires_grad_(requires_grad) for _ in range(3)
+    ]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_gfx950_forward_returns_natural_log_lse(causal):
+    from triton.tlx.ops.kernels.flash_attn.gfx950 import _flash_attn_forward
+
+    torch.manual_seed(1)
+    q, k, v = _qkv(64, requires_grad=False, context=256)
+    scale = q.shape[-1]**-0.5
+
+    _out, lse = _flash_attn_forward(q, k, v, scale, causal, "smoke")
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+    if causal:
+        causal_mask = torch.ones((q.shape[-2], k.shape[-2]), device=q.device, dtype=torch.bool).triu(1)
+        scores.masked_fill_(causal_mask, float("-inf"))
+    expected = torch.logsumexp(scores, dim=-1)
+
+    assert lse.dtype is torch.float32
+    assert lse.shape == q.shape[:-1]
+    torch.testing.assert_close(lse, expected, atol=2e-2, rtol=2e-3)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("head_dim", (64, 128))
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_gfx950_forward_and_backward(head_dim, causal):
+    from triton.tlx.ops import flash_attn
+
+    torch.manual_seed(0)
+    q, k, v = _qkv(head_dim, requires_grad=True)
+    rq, rk, rv = (tensor.detach().clone().requires_grad_() for tensor in (q, k, v))
+    if head_dim == 64 and not causal:
+        grad_out = torch.randn((*q.shape[:-1], 2 * head_dim), device=q.device, dtype=q.dtype)[..., ::2]
+        assert not grad_out.is_contiguous()
+    else:
+        grad_out = torch.randn_like(q)
+    scale = None if causal else 0.75 * head_dim**-0.5
+
+    if head_dim == 64 and not causal:
+        # Exercise the public default and the STORE_LSE/ALLOW_PRESCALE_Q
+        # autotuner-key ABI; the remaining cases use the smaller smoke space.
+        out = flash_attn(q, k, v, causal=causal, sm_scale=scale)
+    else:
+        out = flash_attn(q, k, v, causal=causal, sm_scale=scale, space="smoke")
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        rq,
+        rk,
+        rv,
+        is_causal=causal,
+        scale=scale,
+    )
+
+    torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
+    out.backward(grad_out)
+    reference.backward(grad_out)
+
+    for name, actual, expected in zip(
+        ("dq", "dk", "dv"),
+        (q.grad, k.grad, v.grad),
+        (rq.grad, rk.grad, rv.grad),
+            strict=True,
+    ):
+        assert torch.isfinite(actual).all(), name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        tolerance = 5e-3 if head_dim == 64 else 1e-2
+        assert relative_l2.item() < tolerance, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+def test_flash_attn_gfx950_honors_deterministic_algorithms():
+    from triton.tlx.ops import flash_attn
+    from triton.tlx.ops.kernels.flash_attn import gfx950, gfx950_bwd
+
+    q, k, v = _qkv(128, requires_grad=True, context=256)
+    forward_state = (
+        torch.empty_like(q),
+        torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32),
+    )
+    backward_result = tuple(torch.empty_like(tensor) for tensor in (q, k, v))
+    grad_out = torch.empty_like(q)
+    previous_mode = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        with (
+                mock.patch.object(gfx950, "_flash_attn_forward", return_value=forward_state),
+                mock.patch.object(gfx950_bwd, "fa_backward", return_value=backward_result) as backward,
+        ):
+            torch.use_deterministic_algorithms(False)
+            with mock.patch.object(gfx950_bwd, "fa_backward_is_deterministic") as classify_determinism:
+                out = flash_attn(q, k, v, space="smoke")
+                out.backward(grad_out)
+            classify_determinism.assert_not_called()
+            backward.assert_called_once()
+
+            backward.reset_mock()
+            torch.use_deterministic_algorithms(True)
+            out = flash_attn(q, k, v, space="smoke")
+            with pytest.raises(RuntimeError, match="does not have a deterministic implementation"):
+                out.backward(grad_out)
+            backward.assert_not_called()
+
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            out = flash_attn(q, k, v, space="smoke")
+            with pytest.warns(UserWarning, match="does not have a deterministic implementation"):
+                out.backward(grad_out)
+            backward.assert_called_once()
+
+            backward.reset_mock()
+            torch.use_deterministic_algorithms(True)
+            with mock.patch.object(gfx950_bwd, "fa_backward_is_deterministic", return_value=True):
+                out = flash_attn(q, k, v, space="smoke")
+                out.backward(grad_out)
+            backward.assert_called_once()
+    finally:
+        torch.use_deterministic_algorithms(previous_mode, warn_only=previous_warn_only)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "family", "expected"),
+    (
+        ((1, 4, 256, 64), (1, 4, 256, 64), "noncausal_direct_n256", True),
+        ((1, 4, 4096, 64), (1, 4, 4096, 64), "noncausal_fused_n256", False),
+        ((16, 27, 256, 128), (16, 27, 256, 128), None, False),
+        ((16, 27, 200, 128), (16, 27, 200, 128), None, True),
+        ((32, 1, 2600, 256), (32, 1, 2600, 256), None, True),
+    ),
+)
+def test_flash_attn_gfx950_backward_determinism_matches_route(q_shape, k_shape, family, expected):
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+
+    q = mock.Mock(shape=q_shape)
+    k = mock.Mock(shape=k_shape)
+    tensors = (q, k, mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock())
+    dispatch = mock.Mock(family=family)
+    with (
+            mock.patch.object(gfx950_bwd, "_validate_inputs"),
+            mock.patch.object(gfx950_bwd, "_select_d64_dispatch_for_device", return_value=dispatch) as select_d64,
+    ):
+        actual = gfx950_bwd.fa_backward_is_deterministic(*tensors, 0.125, False)
+
+    assert actual is expected
+    assert select_d64.call_count == int(q_shape[-1] == 64)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("causal", (False, True))
+@pytest.mark.parametrize("exact", (False, True), ids=("split", "exact"))
+def test_flash_attn_gfx950_short_d128_forward_and_backward(causal, exact, monkeypatch):
+    from triton.tlx.ops import flash_attn
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+
+    route_options = (
+        gfx950_bwd._D128_EXACT_ENABLE_ENV,
+        gfx950_bwd._D128_PERSISTENT_ENABLE_ENV,
+        gfx950_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV,
+        gfx950_bwd._D128_SINK_INSTS_ENV,
+        gfx950_bwd._D128_REGCLASS_PRIORITY_ENV,
+        gfx950_bwd._D128_REVERSE_LOCAL_ENV,
+    )
+    for option in route_options:
+        monkeypatch.setenv(option, "0")
+    monkeypatch.setenv(gfx950_bwd._D128_EXACT_ENABLE_ENV, str(int(exact)))
+
+    shape = (16, 27, 200, 128)
+    generator = torch.Generator(device="cuda").manual_seed(3735 + 2 * int(exact) + int(causal))
+    q, k, v = [
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=generator).requires_grad_() for _ in range(3)
+    ]
+    rq, rk, rv = (tensor.detach().clone().requires_grad_() for tensor in (q, k, v))
+    grad_out = torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+
+    out = flash_attn(q, k, v, causal=causal, space="smoke")
+    reference = torch.nn.functional.scaled_dot_product_attention(rq, rk, rv, is_causal=causal)
+    torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
+
+    out.backward(grad_out)
+    reference.backward(grad_out)
+    for name, actual, expected in zip(
+        ("dq", "dk", "dv"),
+        (q.grad, k.grad, v.grad),
+        (rq.grad, rk.grad, rv.grad),
+            strict=True,
+    ):
+        assert torch.isfinite(actual).all(), name
+        relative_l2 = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+def test_flash_attn_gfx950_rejects_fp16():
+    from triton.tlx.ops import InvalidInput, flash_attn
+
+    q, k, v = [torch.randn((1, 1, 128, 64), device="cuda", dtype=torch.float16) for _ in range(3)]
+    with pytest.raises(InvalidInput, match="does not support float16"):
+        flash_attn(q, k, v, space="smoke")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+def test_flash_attn_gfx950_rejects_unknown_space():
+    from triton.tlx.ops import InvalidInput, flash_attn
+
+    q, k, v = _qkv(64, requires_grad=False)
+    with pytest.raises(InvalidInput, match="does not provide space"):
+        flash_attn(q, k, v, space="heuristic")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("requires_grad", (False, True))
+@pytest.mark.parametrize(
+    ("invalid", "match"),
+    (
+        ("rank", "rank-4"),
+        ("shape", "same shape"),
+        ("dtype", "same dtype"),
+    ),
+)
+def test_flash_attn_gfx950_invalid_inputs_use_public_exception(invalid, match, requires_grad):
+    from triton.tlx.ops import InvalidInput, flash_attn
+
+    q, k, v = _qkv(64, requires_grad=requires_grad, context=256)
+    if invalid == "rank":
+        q = q[0]
+        k = k[0]
+        v = v[0]
+    elif invalid == "shape":
+        k = k[..., :-1, :].contiguous()
+    else:
+        k = k.to(torch.float16).requires_grad_(requires_grad)
+
+    with pytest.raises(InvalidInput, match=match):
+        flash_attn(q, k, v, space="smoke")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+def test_flash_attn_gfx950_keeps_inference_only_shapes():
+    from triton.tlx.ops import flash_attn
+
+    q, k, v = _qkv(64, requires_grad=False, context=192)
+    out = flash_attn(q, k, v, space="smoke")
+    reference = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+def test_flash_attn_gfx950_rejects_unsupported_backward_shape():
+    from triton.tlx.ops import InvalidInput, flash_attn
+
+    q, k, v = _qkv(64, requires_grad=True, context=192)
+    with pytest.raises(InvalidInput, match="supported MHA shapes"):
+        flash_attn(q, k, v, space="smoke")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("operand", ("q", "k", "v"))
+def test_flash_attn_gfx950_rejects_noncontiguous_backward_inputs(operand):
+    from triton.tlx.ops import InvalidInput, flash_attn
+
+    tensors = _qkv(64, requires_grad=True, context=256)
+    padded = torch.randn(
+        (*tensors[0].shape[:-1], 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    tensors[("q", "k", "v").index(operand)] = padded[..., ::2]
+    assert not tensors[("q", "k", "v").index(operand)].is_contiguous()
+
+    with pytest.raises(InvalidInput, match=rf"{operand} must be contiguous"):
+        flash_attn(*tensors, space="smoke")
+
+
+@pytest.mark.parametrize(
+    ("shape", "causal", "split_q", "planes"),
+    (
+        pytest.param((16, 64, 8, 1024, 128), False, 1, 1, id="pr0-gqa1k"),
+        pytest.param((16, 64, 8, 2048, 128), False, 1, 1, id="pr1-gqa2k"),
+        pytest.param((16, 64, 8, 4096, 128), False, 1, 1, id="pr2-gqa4k"),
+        pytest.param((16, 64, 8, 8192, 128), False, 1, 1, id="pr3-gqa8k"),
+        pytest.param((15, 64, 8, 16384, 128), False, 1, 1, id="pr4-gqa16k"),
+        pytest.param((16, 16, 16, 1024, 128), False, 1, 1, id="pr5-mha1k"),
+        pytest.param((16, 16, 16, 2048, 128), False, 1, 1, id="pr6-mha2k"),
+        pytest.param((16, 16, 16, 4096, 128), False, 1, 1, id="pr7-mha4k"),
+        pytest.param((16, 16, 16, 8192, 128), False, 1, 1, id="pr8-mha8k"),
+        pytest.param((16, 16, 16, 16384, 128), False, 1, 2, id="pr9-mha16k"),
+        pytest.param((16, 16, 16, 16384, 128), False, None, 2, id="pr9-auto"),
+        pytest.param((16, 16, 16, 16384, 128), True, None, 1, id="pr9-causal-auto"),
+        pytest.param((16, 16, 16, 16384, 128), True, 1, 1, id="pr9-causal-unsplit"),
+        pytest.param((16, 16, 16, 16384, 128), False, 2, 1, id="pr9-split2"),
+        pytest.param((15, 16, 16, 16384, 128), False, 1, 1, id="batch15"),
+        pytest.param((16, 32, 32, 16384, 128), False, 1, 1, id="heads32"),
+        pytest.param((16, 16, 8, 16384, 128), False, 1, 1, id="gqa2"),
+        pytest.param((16, 16, 16, 16128, 128), False, 1, 1, id="shorter"),
+        pytest.param((16, 16, 16, 16640, 128), False, 1, 1, id="longer"),
+    ),
+)
+def test_flash_attn_gfx950_d128_accumulator_allocation_metadata(shape, causal, split_q, planes):
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+
+    batch, hq, hkv, n_ctx, head_dim = shape
+    q = torch.empty((batch, hq, n_ctx, head_dim), device="meta", dtype=torch.bfloat16)
+    k = torch.empty((batch, hkv, n_ctx, head_dim), device="meta", dtype=torch.bfloat16)
+    accumulator = gfx950_bwd._allocate_dq_accumulator(q, k, causal=causal, split_q=split_q)
+
+    assert accumulator.shape == ((2, *q.shape) if planes == 2 else q.shape)
+    assert accumulator.dtype is torch.bfloat16
+    assert accumulator.device == q.device
+    assert accumulator.is_contiguous()
+    logical_bytes = accumulator.numel() * accumulator.element_size()
+    assert logical_bytes == planes * q.numel() * q.element_size()
+    assert accumulator.untyped_storage().nbytes() == logical_bytes
+    if planes == 2:
+        # Metadata tensors verify the 2 GiB contract without allocating GPU storage.
+        assert logical_bytes == 2**31
+
+
+@pytest.mark.parametrize(
+    ("shape", "causal", "split_q", "planes"),
+    (
+        pytest.param((16, 16, 16, 16384, 128), False, None, 2, id="planes2-auto"),
+        pytest.param((16, 16, 16, 16384, 128), False, 1, 2, id="planes2-unsplit"),
+        pytest.param((16, 16, 16, 16384, 128), True, 1, 1, id="causal"),
+        pytest.param((16, 16, 16, 16384, 128), False, 2, 1, id="split2"),
+        pytest.param((16, 16, 16, 8192, 128), False, 1, 1, id="mha8k"),
+        pytest.param((16, 64, 8, 8192, 128), False, 1, 1, id="long-gqa"),
+    ),
+)
+@pytest.mark.parametrize("invalid", ("shape", "dtype", "device", "noncontiguous-storage"))
+def test_flash_attn_gfx950_d128_accumulator_rejects_invalid_metadata(shape, causal, split_q, planes, invalid):
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+
+    batch, hq, hkv, n_ctx, head_dim = shape
+    q = torch.empty((batch, hq, n_ctx, head_dim), device="meta", dtype=torch.bfloat16)
+    k = torch.empty((batch, hkv, n_ctx, head_dim), device="meta", dtype=torch.bfloat16)
+    accumulator_shape = (2, *q.shape) if planes == 2 else tuple(q.shape)
+    if invalid == "shape":
+        wrong_shape = tuple(q.shape) if planes == 2 else (2, *q.shape)
+        accumulator = torch.empty(wrong_shape, device=q.device, dtype=q.dtype)
+    elif invalid == "dtype":
+        accumulator = torch.empty(accumulator_shape, device=q.device, dtype=torch.float32)
+    elif invalid == "device":
+        # Replace only device metadata to avoid a 2 GiB CPU allocation.
+        accumulator = mock.Mock(shape=accumulator_shape, dtype=q.dtype, device=torch.device("cpu"))
+        accumulator.is_contiguous.return_value = True
+    else:
+        padded = torch.empty((*accumulator_shape[:-1], 2 * head_dim), device=q.device, dtype=q.dtype)
+        accumulator = padded[..., ::2]
+        assert accumulator.shape == accumulator_shape
+        assert not accumulator.is_contiguous()
+
+    class LaunchTrap:
+
+        def __getitem__(self, grid):
+            pytest.fail("Invalid accumulator reached a GPU launch")
+
+    with (
+            mock.patch.object(gfx950_bwd, "_attn_bwd_dkdv_dq_d128_gqa_kernel", LaunchTrap()),
+            mock.patch.object(gfx950_bwd, "_attn_bwd_dkdv_dq_d128_gqa_optimized_kernel", LaunchTrap()),
+            mock.patch.object(gfx950_bwd, "_attn_bwd_dkdv_dq_d128_gqa_bm32_kernel", LaunchTrap()),
+            pytest.raises(ValueError, match="dQ accumulator shape, dtype, device, or strides"),
+    ):
+        gfx950_bwd._run_bwd_d128_gqa(
+            q,
+            k,
+            k,
+            q,
+            None,
+            None,
+            accumulator,
+            q,
+            k,
+            k,
+            head_dim**-0.5,
+            causal,
+            split_q=split_q,
+        )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize(("batch", "heads", "n_ctx"), ((1, 1, 128), (2, 3, 384)))
+def test_flash_attn_gfx950_d128_planes2_converter_merges_full_output(batch, heads, n_ctx):
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+
+    head_dim, block_m = 128, 128
+    shape = (batch, heads, n_ctx, head_dim)
+    indices = torch.arange(batch * heads * n_ctx * head_dim, dtype=torch.int32).reshape(shape)
+    # Different periods vary both planes across rows, features, heads, and tiles.
+    plane0 = ((indices % 509 - 254).float() / 64).to(torch.bfloat16)
+    plane1 = (((indices * 37) % 257 - 128).float() / 128).to(torch.bfloat16)
+    # Include cancellation and both BF16 rounding directions at a midpoint.
+    plane0.flatten()[:4] = torch.tensor((4, 1 + 2**-7, 1, 1 + 2**-7), dtype=torch.bfloat16)
+    plane1.flatten()[:4] = torch.tensor((-4, -1, 2**-8, 2**-8), dtype=torch.bfloat16)
+    fp32_sum = plane0.float() + plane1.float()
+    expected = fp32_sum.to(torch.bfloat16)
+    assert torch.count_nonzero(fp32_sum != expected.float()) > 0
+    torch.testing.assert_close(
+        expected.flatten()[:4],
+        torch.tensor((0, 2**-7, 1, 1 + 2**-6), dtype=torch.bfloat16),
+        rtol=0,
+        atol=0,
+    )
+
+    def pack_native(logical):
+        # Logical bit order is m3,m2,m1,m0,d6,d5,d4,d3,d2,d1,d0.
+        bits = logical.reshape(-1, *([2] * 11))
+        # Native memory bit order is d5,d4,d6,d1,d3,d2,m3,m2,m1,m0,d0.
+        return bits.permute(0, 6, 7, 5, 10, 8, 9, 1, 2, 3, 4, 11).contiguous().reshape(shape)
+
+    accumulator = torch.stack((pack_native(plane0), pack_native(plane1))).to("cuda")
+    accumulator_before = accumulator.clone()
+    output = torch.full(shape, float("nan"), device="cuda", dtype=torch.bfloat16)
+    gfx950_bwd._attn_bwd_dq_native_planes2_convert_kernel[(n_ctx // block_m, batch * heads)](
+        accumulator,
+        output,
+        N=n_ctx,
+        D=head_dim,
+        BLOCK_M=block_m,
+        PLANE_ELEMENTS=output.numel(),
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(accumulator, accumulator_before, rtol=0, atol=0)

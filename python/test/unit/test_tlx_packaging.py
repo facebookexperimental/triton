@@ -151,6 +151,10 @@ class TlxPackagingTest(unittest.TestCase):
             ops_link = fixture / "python" / "triton" / "tlx" / "ops"
             self.assertTrue((ops_link / "__init__.py").exists())
 
+            # triton.tlx.ops imports torch._dynamo, whose first import reads
+            # triton.language; load it while the real triton is still in place.
+            import torch._dynamo  # noqa: F401
+
             for mod in [m for m in list(sys.modules) if m == "triton" or m.startswith("triton.")]:
                 del sys.modules[mod]
             stub = types.ModuleType("triton")

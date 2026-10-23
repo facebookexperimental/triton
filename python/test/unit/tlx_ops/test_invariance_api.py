@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 from triton.tlx.ops import BitwiseInvarianceSpec, InvalidInput, Space, UnsupportedOp
+from triton.tlx.ops import flash_attn as tlx_flash_attn
+from triton.tlx.ops import grouped_gemm as tlx_grouped_gemm
 from triton.tlx.ops import mm as tlx_mm
 from triton.tlx.ops._catalog import any_enforces_invariance, invariant_vocab_for
 from triton.tlx.ops._invariance import gemm_fixed_split_k, normalize_space
@@ -103,6 +105,20 @@ def test_gemm_fixed_split_k():
 
 def test_vocabularies():
     assert invariant_vocab_for("mm") == GEMM_VOCAB
+    assert invariant_vocab_for("addmm") == GEMM_VOCAB
+    assert invariant_vocab_for("mm_mxfp8") == GEMM_VOCAB
+    assert invariant_vocab_for("flash_attn") == frozenset({"B", "H", "SQ", "SKV", "D"})
+    assert invariant_vocab_for("flash_attn_mxfp8") == frozenset({"B", "H", "SQ", "SKV", "D"})
+    assert invariant_vocab_for("flash_attn_varlen") == frozenset({"TQ", "TKV", "H", "D"})
+    assert invariant_vocab_for("prepare_flash_attn_varlen_backward") == frozenset({"TQ", "TKV", "H", "D"})
+    assert invariant_vocab_for("flash_attn_varlen_backward") == frozenset({"TQ", "TKV", "H", "D"})
+    assert invariant_vocab_for("grouped_gemm") == frozenset({"G", "M", "N", "K"})
+    assert invariant_vocab_for("grouped_gemm_mxfp8") == frozenset({"G", "M", "N", "K"})
+    assert invariant_vocab_for("hstu_attn_dev") == frozenset({"B", "LQ", "LKV", "H", "D"})
+    assert invariant_vocab_for("hstu_cross_attn") == frozenset({"B", "LQ", "LKV", "H", "D"})
+    assert invariant_vocab_for("kimi_delta_attention") == frozenset({"T", "H", "D"})
+    assert invariant_vocab_for("kda_paged_prefill") == frozenset({"T", "H", "D"})
+    assert invariant_vocab_for("kda_recurrent_decode") == frozenset({"T", "H", "D"})
     assert invariant_vocab_for("no_such_op") == frozenset()
 
 
@@ -125,10 +141,36 @@ def test_mm_enforced_per_arch():
     spec = BitwiseInvarianceSpec.dims("M")
     assert any_enforces_invariance("mm")
     enforced = {entry.arch for entry in CATALOG if entry.op == "mm" and entry.enforces_invariance}
-    assert enforced == {"gfx950"}
+    assert enforced == {"sm90", "sm100", "gfx942", "gfx950"}
     for entry in [entry for entry in CATALOG if entry.op == "mm"]:
         if entry.arch in enforced:
             tlx_ops._check_enforced("mm", entry, spec)
         else:
             with pytest.raises(UnsupportedOp, match="does not enforce"):
                 tlx_ops._check_enforced("mm", entry, spec)
+
+
+def test_flash_attn_refuses_unenforced_spec():
+    q = SimpleNamespace(ndim=4)
+    with pytest.raises(UnsupportedOp, match="does not enforce"):
+        tlx_flash_attn(q, q, q, space=Space("full", invariance=BitwiseInvarianceSpec.dims("B")))
+
+
+def test_grouped_gemm_refuses_unenforced_spec():
+    import torch
+
+    a = torch.empty(4, 8)
+    b = torch.empty(16, 8).t()
+    with pytest.raises(UnsupportedOp, match="does not enforce"):
+        tlx_grouped_gemm([a], [b], space=Space("heuristic", invariance=BitwiseInvarianceSpec.dims("G")))
+
+
+def test_grouped_gemm_rejects_invalid_space_name():
+    import torch
+
+    a = torch.empty(4, 8)
+    b = torch.empty(16, 8).t()
+    with pytest.raises(InvalidInput, match="does not provide"):
+        tlx_grouped_gemm([a], [b], space="typo")
+    with pytest.raises(InvalidInput, match="does not provide"):
+        tlx_grouped_gemm([a], [b], space=Space("full"))
