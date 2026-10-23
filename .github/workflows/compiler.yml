@@ -97,20 +97,16 @@ jobs:
             .
           ninja -C build check-triton-lit-tests 2>&1 | tee /tmp/lit.log
 
-      - name: Collect nightly failures (LIT)
+      - name: Parse test failures (LIT)
         id: parse
         if: always() && github.event_name == 'schedule'
-        run: |
-          FAILED_FLAG=""
-          if [ "${{ steps.lit.outcome }}" = "failure" ]; then
-            FAILED_FLAG="--failed"
-          fi
-          python3 .github/scripts/parse_lit_failures.py \
-            --log /tmp/lit.log \
-            --workflow "${GITHUB_WORKFLOW}" \
-            --job "lit-tests" \
-            --bucket "compiler-lit" \
-            ${FAILED_FLAG}
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ github.workflow }}
+          job: lit-tests
+          failed: ${{ steps.lit.outcome == 'failure' }}
+          bucket: compiler-lit
+          lit-log: /tmp/lit.log
 
   # ----- Nightly issue filing (schedule only) -----
   report-compiler-lit:
