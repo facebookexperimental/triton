@@ -1,0 +1,230 @@
+name: CUTracer Sanitizer
+# Runs TLX kernel tests under NVIDIA Compute Sanitizer through CUTracer and
+# reports the result in the job summary. Findings do not fail the job; a
+# sanitizer run that produced no summary (timeout, crash, missing binary) does,
+# because then the job checked nothing. A pull request checks the B200 tests of
+# the TLX kernels it changes, or a self-test when it changes this pipeline (see
+# select_tests.py); a manual run checks the test it names. A manual run on main
+# files each finding as an issue, one per GPU, kernel and source file, labeled
+# cutracer, and closes the issues of kernels it checked that came back clean.
+# Pull requests report in the job summary only.
+#
+# Racecheck is opt-in through the tools input: it reports false-positive
+# shared-memory hazards on mbarrier-synchronized warp-specialized kernels (see
+# .llms/rules/partition-scheduler-bugs.md #9) and did not finish within 30
+# minutes on the default flash-attention test.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit to test (defaults to the dispatched ref)
+        required: false
+        type: string
+      test:
+        description: Pytest node id or test file that launches the kernel
+        required: true
+        type: string
+      kernel:
+        description: Kernel name, used to attribute racecheck findings
+        required: false
+        type: string
+      tools:
+        description: Comma-separated compute-sanitizer tools (racecheck is opt-in)
+        required: false
+        type: string
+      cutracer_version:
+        description: cutracer version on PyPI
+        required: false
+        type: string
+  # The select job decides what these changes need checked.
+  pull_request:
+    paths:
+      - third_party/tlx/ops/**
+      - third_party/tlx/tutorials/**
+      - python/test/unit/tlx_ops/**
+      - .github/workflows/cutracer.yml
+      - .github/scripts/cutracer_ci/**
+      - .github/actions/setup-cutracer/**
+
+env:
+  REF: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+  KERNEL: ${{ inputs.kernel }}
+  TOOLS: ${{ inputs.tools || 'synccheck,memcheck' }}
+  CUTRACER_VERSION: ${{ inputs.cutracer_version || '0.4.0' }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cutracer-sanitizer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The jobs below need this repo's B200 runners and build credentials, so in a
+  # fork this job is skipped and everything that depends on it with it.
+  select:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tests: ${{ steps.select.outputs.tests }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # A pull request's merge commit and both its parents.
+          fetch-depth: 2
+      - name: Select tests
+        id: select
+        env:
+          TEST: ${{ inputs.test }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == pull_request ]]; then
+            git diff --name-only HEAD^1 HEAD > "${RUNNER_TEMP}/changed.txt"
+            python3 .github/scripts/cutracer_ci/select_tests.py --changed-files "${RUNNER_TEMP}/changed.txt"
+          else
+            python3 .github/scripts/cutracer_ci/select_tests.py --test "${TEST}"
+          fi
+
+  build:
+    needs: select
+    # An empty list means this pull request changes nothing CUTracer checks.
+    if: needs.select.outputs.tests != '[]'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+
+  sanitize-b200:
+    needs: [select, build]
+    runs-on: nvidia-dgx-b200
+    env:
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+      CUDA_VERSION: "13.4"
+    timeout-minutes: 120
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    outputs:
+      failures: ${{ steps.sanitize.outputs.failures }}
+      reconcile_prefixes: ${{ steps.sanitize.outputs.reconcile_prefixes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.REF }}
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Install test dependencies
+        run: |
+          . "${SETUP_SCRIPT}"
+          uv pip install pytest
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      - name: Set up CUTracer
+        uses: ./.github/actions/setup-cutracer
+        env:
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          cuda-version: ${{ env.CUDA_VERSION }}
+          cutracer-version: ${{ env.CUTRACER_VERSION }}
+      - name: Run sanitizers
+        id: sanitize
+        timeout-minutes: 90
+        env:
+          # The one place that decides whether this run files and closes issues:
+          # only a run of main's code speaks for main. It closes only the issues
+          # of kernels it checked (see findings.py).
+          FILE_ISSUES: ${{ github.ref == 'refs/heads/main' && inputs.ref == '' }}
+          TESTS: ${{ needs.select.outputs.tests }}
+        run: |
+          . "${SETUP_SCRIPT}"
+          readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
+          ISSUES=()
+          if [[ "${FILE_ISSUES}" == true ]]; then
+            ISSUES=(--issue-title-prefix "[CUTracer][B200]" --issue-job sanitize-b200)
+          fi
+          python3 .github/scripts/cutracer_ci/sanitize.py \
+            --tools "${TOOLS}" \
+            --kernel "${KERNEL}" \
+            --out "${RUNNER_TEMP}/cutracer" \
+            --timeout-minutes 30 \
+            "${ISSUES[@]}" \
+            -- python -m pytest "${TEST_IDS[@]}" --import-mode=importlib -q -p no:cacheprovider
+      - name: Upload sanitizer logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cutracer-sanitizer-b200
+          path: ${{ runner.temp }}/cutracer
+          if-no-files-found: warn
+          retention-days: 30
+
+  report:
+    needs: sanitize-b200
+    # A failed sanitize job still reports its fallback items.
+    if: always() && needs.sanitize-b200.outputs.failures != '' && needs.sanitize-b200.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.sanitize-b200.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: CUTracer Sanitizer
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      # No platform: a finding is often older than the last green nightly, so
+      # bisecting it would blame an unrelated PR.
+      platform: ""
+      labels: cutracer
+
+  reconcile:
+    needs: sanitize-b200
+    # Runs after a successful sanitize job that produced a list; an empty
+    # output means no list was produced, not that nothing was found. Each call
+    # closes only within one kernel or tool this run checked, so a run of one
+    # test never closes another kernel's issue.
+    if: needs.sanitize-b200.outputs.reconcile_prefixes != ''
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        title_prefix: ${{ fromJSON(needs.sanitize-b200.outputs.reconcile_prefixes) }}
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: CUTracer Sanitizer
+      job_name: sanitize-b200
+      failures: ${{ needs.sanitize-b200.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      title_prefix: ${{ matrix.title_prefix }}
+      labels: cutracer
