@@ -16,15 +16,21 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import cap_grid as _cap_grid
 from . import _sm100_core as _core
 
 
-# Cached SM count — never changes during program lifetime.
-# Calling torch.cuda.get_device_properties() on every matmul() call
-# adds measurable overhead that degrades benchmark throughput on fast kernels.
+# Device props are cached: querying them on every matmul() call adds
+# measurable overhead that degrades benchmark throughput on fast kernels.
+# The carveout stays outside the cache -- it can change mid-process, so
+# only the static device count is cached, never the capped result.
 @functools.lru_cache(maxsize=1)
-def _get_num_sms():
+def _get_device_sm_count():
     return torch.cuda.get_device_properties("cuda").multi_processor_count
+
+
+def _get_num_sms():
+    return _cap_grid(_get_device_sm_count())
 
 
 def get_heuristic_config(M, N, K, num_sms=148):

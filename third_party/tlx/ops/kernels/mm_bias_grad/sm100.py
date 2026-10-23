@@ -18,6 +18,7 @@ from triton.testing import do_bench_cudagraph
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..._catalog import InvalidInput
+from ..._holdout import cap_grid as _cap_grid
 
 _SPLIT_K_VALUES = (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 19, 24, 32, 48, 64)
 
@@ -1278,7 +1279,7 @@ def mm_bias_grad(dout, input_act, *, out=None, space="heuristic"):
         c_desc = TensorDescriptor(weight, weight.shape, weight.stride(), [1, 1])
         workspace_desc = TensorDescriptor(weight, weight.shape, weight.stride(), [1, 1])
         bias_workspace = torch.empty((max(_SPLIT_K_VALUES) * M, ), device=dout.device, dtype=dout.dtype)
-        num_sms = torch.cuda.get_device_properties(dout.device).multi_processor_count
+        num_sms = _cap_grid(torch.cuda.get_device_properties(dout.device).multi_processor_count)
         kernel = _tuned(space, M, N, K, num_sms, dout.dtype)
         triton.set_allocator(_allocate)
 

@@ -16,6 +16,7 @@ import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..._catalog import InvalidInput
+from ..._holdout import cap_grid as _cap_grid
 from ._shapes import SM90_FOCUS
 from ._sm90_core import _allocate_buffers, _consume_tile, _k_tile_range, _run_producer, _split_acc, _store_subtile
 
@@ -27,9 +28,14 @@ _MIN_K_TILES_PER_SPLIT = 4
 _TORCH_TO_TL = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
 
 
+# Cache the static device count only; the carveout is read live per call.
 @functools.lru_cache(maxsize=1)
-def _get_num_sms():
+def _get_device_sm_count():
     return torch.cuda.get_device_properties("cuda").multi_processor_count
+
+
+def _get_num_sms():
+    return _cap_grid(_get_device_sm_count())
 
 
 def matmul_tma_set_block_size_hook(nargs):

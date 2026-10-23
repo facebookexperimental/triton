@@ -17,6 +17,8 @@ from triton.language.extra.tlx.mxfp8_utils import (
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import cap_grid as _cap_grid
+
 try:
     from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
 except ImportError:
@@ -3143,7 +3145,7 @@ def attention_bwd(
 
     triton.set_allocator(alloc_fn)
 
-    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
+    NUM_SMS = _cap_grid(torch.cuda.get_device_properties(device).multi_processor_count)
 
     def grid(meta):
         total_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H

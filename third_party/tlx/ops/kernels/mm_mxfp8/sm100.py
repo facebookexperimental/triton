@@ -30,6 +30,8 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import cap_grid as _cap_grid
+
 VEC_SIZE = 32
 OUTPUT_DTYPE = tl.bfloat16
 
@@ -55,9 +57,14 @@ DEFAULT_CONFIG = {
 }
 
 
+# Cache the static device count only; the carveout is read live per call.
 @functools.lru_cache(maxsize=None)
-def _num_sms(device_index):
+def _get_device_sm_count(device_index):
     return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _num_sms(device_index):
+    return _cap_grid(_get_device_sm_count(device_index))
 
 
 def _select_group_size_m(M, N, block_m):
