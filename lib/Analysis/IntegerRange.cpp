@@ -24,6 +24,8 @@ using namespace mlir::triton;
 
 namespace {
 
+static Value stripRefinements(Value value);
+
 struct IntegerBound {
   Value value;
   arith::CmpIPredicate predicate;
@@ -63,9 +65,22 @@ struct IntegerFacts {
         llvm::APIntOps::GreatestCommonDivisor(am, bm), delta);
     IntegerFacts result{
         {}, std::make_pair(modulus, modulus.isZero() ? ar : ar.urem(modulus))};
-    for (IntegerBound bound : a.bounds)
-      if (llvm::is_contained(b.bounds, bound))
+    for (IntegerBound bound : a.bounds) {
+      if (llvm::is_contained(b.bounds, bound)) {
+        if (!llvm::is_contained(result.bounds, bound))
+          result.bounds.push_back(bound);
+        continue;
+      }
+      // Distinct refinements agree on bits, but not on poison across edges.
+      bound.value = stripRefinements(bound.value);
+      if (llvm::any_of(b.bounds,
+                       [&](IntegerBound other) {
+                         return other.predicate == bound.predicate &&
+                                stripRefinements(other.value) == bound.value;
+                       }) &&
+          !llvm::is_contained(result.bounds, bound))
         result.bounds.push_back(bound);
+    }
     result.sign = std::min(a.sign, b.sign);
     return result;
   }

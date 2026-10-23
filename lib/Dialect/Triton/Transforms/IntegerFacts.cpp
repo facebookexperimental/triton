@@ -194,6 +194,12 @@ static void collectPredicates(Value condition, bool truth,
   }
 }
 
+static Value refinementIdentity(Value value) {
+  while (auto refine = value.getDefiningOp<RefineOp>())
+    value = refine.getValue();
+  return value;
+}
+
 static void materialize(ArrayRef<Predicate> predicates, Block *block,
                         Block::iterator position, DominanceInfo &dominance) {
   // Existing entry refinements already dominate the remaining scope.
@@ -204,7 +210,8 @@ static void materialize(ArrayRef<Predicate> predicates, Block *block,
     if (matchPattern(predicate.value, m_Constant()))
       continue;
     auto matches = [&](RefineOp refine) {
-      return refine.getBound() == predicate.bound &&
+      return refinementIdentity(refine.getBound()) ==
+                 refinementIdentity(predicate.bound) &&
              refine.getPredicate() == predicate.comparison;
     };
     bool known = false;
@@ -236,9 +243,7 @@ static void materialize(ArrayRef<Predicate> predicates, Block *block,
       auto inScope = [&](OpOperand &use) {
         if (auto refine = dyn_cast<RefineOp>(use.getOwner())) {
           // Chain value facts; bound operands keep their SSA identity.
-          if (use.getOperandNumber() != 0 ||
-              (refine.getBound() == predicate.bound &&
-               refine.getPredicate() == predicate.comparison))
+          if (use.getOperandNumber() != 0 || matches(refine))
             return false;
         }
         return position != block->end() &&
@@ -302,10 +307,10 @@ struct TritonMaterializeIntegerFactsPass
           if (predicates.empty())
             continue;
           Block *destination = branch->getSuccessor(edge);
+          ValueRange operands = edge == 0 ? branch.getTrueDestOperands()
+                                          : branch.getFalseDestOperands();
           if (!destination->getSinglePredecessor() ||
               branch.getTrueDest() == branch.getFalseDest()) {
-            ValueRange operands = edge == 0 ? branch.getTrueDestOperands()
-                                            : branch.getFalseDestOperands();
             SmallVector<Value> arguments(operands);
             OpBuilder builder(source);
             Block *edgeBlock = builder.createBlock(destination);
@@ -315,6 +320,12 @@ struct TritonMaterializeIntegerFactsPass
             branch.getSuccessorOperands(edge).erase(0, arguments.size());
             destination = edgeBlock;
             dominance.invalidate();
+          } else if (dominance.properlyDominates(branch->getBlock(),
+                                                 destination)) {
+            // Unique incoming values dominate every successor argument use.
+            for (auto [operand, argument] :
+                 llvm::zip_equal(operands, destination->getArguments()))
+              argument.replaceAllUsesWith(operand);
           }
           materialize(predicates, destination, destination->begin(), dominance);
         }
