@@ -34,14 +34,14 @@ def wmma(a, b, acc, _semantic=None):
 
 # List all valid combinations directly for readability
 _valid_dtype_combinations = set([(dtype_a, dtype_b, "e8m0", "e8m0")
-                                 for dtype_a in ("e4m3", "e5m2", "e2m1")
-                                 for dtype_b in ("e4m3", "e5m2", "e2m1")] + [(dtype_a, "e2m1", "e8m0", dtype_b_scale)
-                                                                             for dtype_a in ("e4m3", "e5m2")
-                                                                             for dtype_b_scale in ("e4m3", )] +
-                                [("e2m1", dtype_b, dtype_a_scale, "e8m0")
-                                 for dtype_b in ("e4m3", "e5m2")
-                                 for dtype_a_scale in ("e4m3", )] + [("e2m1", "e2m1", dtype_scale, dtype_scale)
-                                                                     for dtype_scale in ("e4m3", )])
+                                 for dtype_a in ("e4m3", "e5m2", "e2m1", "e2m3", "e3m2")
+                                 for dtype_b in ("e4m3", "e5m2", "e2m1", "e2m3", "e3m2")] +
+                                [(dtype_a, "e2m1", "e8m0", dtype_b_scale)
+                                 for dtype_a in ("e4m3", "e5m2")
+                                 for dtype_b_scale in ("e4m3", )] + [("e2m1", dtype_b, dtype_a_scale, "e8m0")
+                                                                     for dtype_b in ("e4m3", "e5m2")
+                                                                     for dtype_a_scale in ("e4m3", )] +
+                                [("e2m1", "e2m1", dtype_scale, dtype_scale) for dtype_scale in ("e4m3", )])
 
 
 @builtin
@@ -61,11 +61,11 @@ def wmma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, _semantic=None)
         a (tensor): The operand A to be multiplied.
         a_scale (Optional[tensor]): Scale factor for operand A.
         a_format (str): Format of operand A. Available formats: ``e2m1``,
-            ``e4m3``, ``e5m2``.
+            ``e2m3``, ``e3m2``, ``e4m3``, ``e5m2``.
         b (tensor): The operand B to be multiplied.
         b_scale (Optional[tensor]): Scale factor for operand B.
         b_format (str): Format of operand B. Available formats: ``e2m1``,
-            ``e4m3``, ``e5m2``.
+            ``e2m3``, ``e3m2``, ``e4m3``, ``e5m2``.
         acc (tensor): Accumulator tensor.
     """
     _verify_wmma(3, a, b, acc)
@@ -82,6 +82,14 @@ def wmma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, _semantic=None)
         wmma_layout = b.type.layout.parent
         assert isinstance(wmma_layout, AMDWMMALayout) and wmma_layout.instr_shape in [[16, 16, 64], [32, 16, 64]], \
             "e2m1 format expects instr_shape to be [16, 16, 64] or [32, 16, 64]"
+    if a_format in ("e2m3", "e3m2"):
+        wmma_layout = a.type.layout.parent
+        assert isinstance(wmma_layout, AMDWMMALayout) and wmma_layout.instr_shape in [[16, 16, 96]], \
+            "e2m3/e3m2 format expects instr_shape to be [16, 16, 96]"
+    if b_format in ("e2m3", "e3m2"):
+        wmma_layout = b.type.layout.parent
+        assert isinstance(wmma_layout, AMDWMMALayout) and wmma_layout.instr_shape in [[16, 16, 96]], \
+            "e2m3/e3m2 format expects instr_shape to be [16, 16, 96]"
     acc_shapes = [[16, 16, 128]]
     if a_format == "e2m1" and b_format == "e2m1":
         acc_shapes.append([32, 16, 128])
@@ -90,8 +98,8 @@ def wmma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, _semantic=None)
     assert isinstance(acc_layout, AMDWMMALayout) and acc_layout.instr_shape in acc_shapes, \
         f"accumulator tensor's layout must be one of {acc_shapes}"
 
-    assert a_format in {"e2m1", "e4m3", "e5m2"}, f"Unsupported lhs_format: {a_format}"
-    assert b_format in {"e2m1", "e4m3", "e5m2"}, f"Unsupported rhs_format: {b_format}"
+    assert a_format in {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}, f"Unsupported lhs_format: {a_format}"
+    assert b_format in {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}, f"Unsupported rhs_format: {b_format}"
 
     scale_dtype_to_format = {float8e4nv: "e4m3"}
 
