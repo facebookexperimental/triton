@@ -263,9 +263,10 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
   }
 }
 
-// The LLVM workgroup fence emitted for a local barrier assumes LDS accesses
-// are totally ordered and omits lgkmcnt(0). Async global-to-LDS copies bypass
-// that order, so a pending ds_read can observe a later copy into its buffer.
+// SIInsertWaitcnts can erase a local fence's soft lgkmcnt(0) at a loop header,
+// leaving loop-carried ds_reads in flight across the barrier (fixed upstream
+// by llvm/llvm-project 437f88f61b). An explicit wait is not erased.
+// TODO: remove once the AMD codegen LLVM includes that commit.
 static void emitDsWait(OpBuilder &r, Location loc) {
   triton::amdgpu::MemoryCounterWaitOp::create(r, loc, /*load=*/nullptr,
                                               /*store=*/nullptr,
