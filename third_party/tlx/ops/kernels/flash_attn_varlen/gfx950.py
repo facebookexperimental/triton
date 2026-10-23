@@ -234,8 +234,7 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
     row_ok = offs_m < q_len
-    q = tl.load(Q + (q_start + offs_m)[:, None] * stride_qt + off_h * stride_qh + offs_d[None, :], mask=row_ok[:, None],
-                other=0.0)
+    q_ptrs = Q + (q_start + offs_m)[:, None] * stride_qt + off_h * stride_qh + offs_d[None, :]
     k_ptrs = K + k_start * stride_kt + off_kh * stride_kh + offs_n[:, None] * stride_kt + offs_d[None, :]
     v_ptrs = V + k_start * stride_vt + off_kh * stride_vh + offs_n[:, None] * stride_vt + offs_d[None, :]
     k_step = BLOCK_N * stride_kt
@@ -268,7 +267,9 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 2, layout=kv_layout)
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, 2, layout=kv_layout)
     q_slot = tlx.local_view(v_buf, 1)
-    tlx.local_store(q_slot, q)
+    tok_q = tlx.async_load(q_ptrs, q_slot, mask=row_ok[:, None])
+    tlx.async_load_commit_group([tok_q])
+    tlx.async_load_wait_group(0)
     tl.debug_barrier()
     q = tlx.require_layout(tlx.local_load(q_slot, relaxed=True), tlx.dot_operand_layout(0, mma, k_width=8), pin=False)
     q0 = tlx.extract_slice(q, [BLOCK_M, 32], [0, 0])
