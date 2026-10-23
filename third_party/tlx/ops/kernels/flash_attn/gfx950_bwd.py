@@ -4184,6 +4184,7 @@ class _D128InterleavedDispatch:
 
 
 def _select_original_d128_interleaved_dispatch(q_shape=None, k_shape=None, causal=False):
+    # Retain the original tuning for forced comparison routes in tests.
     regalloc = _d128_regalloc_options()
     main_entry = _attn_bwd_dkdv_dq_d128_gqa_kernel
     block_m = 16
@@ -5128,11 +5129,12 @@ def fa_backward_is_deterministic(q, k, v, o, do, lse, sm_scale, causal):
 
 
 def fa_backward(q, k, v, o, do, lse, sm_scale, causal, *, split_q=None):
-    """Run backward, optionally splitting non-causal D128 query work.
+    """Run backward with automatic scheduling or a manual noncausal query split.
 
-    split_q=None selects a bounded schedule for sparse workgroup grids;
-    split_q=1 forces the unsplit path. Larger positive integers explicitly
-    divide the query/head traversal and reduce FP32 dK/dV partials.
+    split_q=None selects an automatic schedule.
+    Automatic causal partitions contain complete query heads.
+    split_q=1 forces the unsplit path.
+    Larger positive integers divide noncausal query/head traversal and reduce FP32 dK/dV partials.
     """
     if split_q is not None:
         _validate_split_q(split_q)
@@ -5182,6 +5184,7 @@ def fa_backward(q, k, v, o, do, lse, sm_scale, causal, *, split_q=None):
         dispatch = _select_d128_interleaved_dispatch(q.shape, k.shape, causal, split_q=split_q)
         optimized = dispatch.main_entry in (
             _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel,
+            _attn_bwd_dkdv_dq_d128_gqa_folded_kernel,
             _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel,
         )
         # Optimized kernels scale raw LSE in the main kernel, except for the
@@ -5511,7 +5514,8 @@ def _validate_d64_dispatch(q_shape, k_shape, causal, dispatch):
 @triton.jit
 def _attn_bwd_gqa_issue_qdo_slice_async(q_dst, do_dst, lse_dst, delta_dst, Q, DO, LSE, Delta, off_h_kv, outer_step,
                                         phase, HQ: tl.constexpr, HK: tl.constexpr, N: tl.constexpr, D: tl.constexpr,
-                                        Q_BATCH_FITS_BUFFER: tl.constexpr):
+                                        Q_BATCH_FITS_BUFFER: tl.constexpr, pid_n, BLOCK_N: tl.constexpr,
+                                        IS_CAUSAL: tl.constexpr):
     tl.static_assert(D == 128 and N % 64 == 0 and HQ % HK == 0)
     tl.static_assert(q_dst.shape == (16, 128) and do_dst.shape == (16, 128))
     tl.static_assert(lse_dst.shape == (64, ) and delta_dst.shape == (64, ))
@@ -5523,10 +5527,12 @@ def _attn_bwd_gqa_issue_qdo_slice_async(q_dst, do_dst, lse_dst, delta_dst, Q, DO
     )
     stats_layout: tl.constexpr = tlx.layout(shape=((64, 4), ()), stride=((1, 0), ()))
     n_outer: tl.constexpr = N // 64
-    total: tl.constexpr = (HQ // HK) * n_outer
+    first_outer = pid_n * (BLOCK_N // 64) if IS_CAUSAL else 0
+    active_outer = n_outer - first_outer
+    total = (HQ // HK) * active_outer
     future = outer_step % total
-    off_h_q = off_h_kv * (HQ // HK) + future // n_outer
-    row = (future % n_outer) * 64 + phase * 16
+    off_h_q = off_h_kv if IS_CAUSAL and HQ == HK else off_h_kv * (HQ // HK) + future // active_outer
+    row = (first_outer + future % active_outer) * 64 + phase * 16
     rr = tl.arange(0, 16)
     dd = tl.arange(0, D)
     if Q_BATCH_FITS_BUFFER:
@@ -5833,14 +5839,17 @@ def _attn_bwd_opt_gqa_front(
     if IS_CAUSAL:
         # Mask after scaling so custom zero or negative scales cannot turn an
         # invalid raw-score sentinel into a NaN or a finite probability.
-        lse_log2 = tl.inline_asm_elementwise(
-            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-            "=v,v",
-            [lse_values],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        if CACHE_SCORE_K:
+            lse_log2 = lse_values
+        else:
+            lse_log2 = tl.inline_asm_elementwise(
+                "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+                "=v,v",
+                [lse_values],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
         lse_full = tlx.require_layout(
             tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
             MMA_NM,
@@ -6471,18 +6480,23 @@ def _attn_bwd_opt_gqa_phase(
     FRAGMENT_CHAIN: tl.constexpr = False,
     SKIP_DUMMY_DQ: tl.constexpr = False,
     CACHE_SCORE_K: tl.constexpr = False,
+    MASK_CAUSAL: tl.constexpr = True,
     k_score_cache=None,
 ):
     """Run one absolute outer-step phase with direct dK or the lagged bridge.
 
-    ``REDIRECT_DUMMY_DQ`` seeds phase 0 for MHA and continuous short GQA.
+    ``REDIRECT_DUMMY_DQ`` seeds phase 0 for MHA and continuous GQA.
     Its zero dS produces a harmless dQ before a real previous phase exists.
     """
     tl.static_assert(not (DIRECT_DK and REDIRECT_DUMMY_DQ))
-    BRAID_DK_DV: tl.constexpr = FRAGMENT_CHAIN and HQ == 8 * HK and (N == 2048 or N == 4096 or N == 8192 or N == 16384)
+    SHORT_CAUSAL_GQA: tl.constexpr = IS_CAUSAL and CACHE_SCORE_K and HQ == 8 * HK and (N == 2048 or N == 4096)
+    BRAID_DK_DV: tl.constexpr = not SHORT_CAUSAL_GQA and FRAGMENT_CHAIN and HQ == 8 * HK and (N == 2048 or N == 4096 or
+                                                                                              N == 8192 or N == 16384)
     tl.static_assert(not (DIRECT_DK and FRAGMENT_CHAIN))
     tl.static_assert(not SKIP_DUMMY_DQ or (FRAGMENT_CHAIN and REDIRECT_DUMMY_DQ))
-    if not IS_CAUSAL and (REDIRECT_DUMMY_DQ or (HQ == HK and not UNROLL_PHASES)):
+    if IS_CAUSAL and (HQ == HK or SHORT_CAUSAL_GQA):
+        tlx.amd_iglp_opt(3)
+    elif not IS_CAUSAL and (REDIRECT_DUMMY_DQ or (HQ == HK and not UNROLL_PHASES)):
         # Unrolled phases share one hint; rolled MHA needs a hint in each region.
         # The measured GQA1K schedule uses the simple exp/MFMA interleave.
         tlx.amd_iglp_opt(3 if HQ == 8 * HK and N == 1024 else 2)
@@ -6523,7 +6537,7 @@ def _attn_bwd_opt_gqa_phase(
         N,
         BLOCK_M,
         BLOCK_N,
-        IS_CAUSAL,
+        IS_CAUSAL and MASK_CAUSAL,
         MMA_NM,
         MMA_ND,
         K_NM_LAYOUT,
@@ -6531,10 +6545,10 @@ def _attn_bwd_opt_gqa_phase(
         P_ND_LAYOUT,
         Q_OUT_LAYOUT,
         UPDATE_DV_FIRST_HALF=not BRAID_DK_DV,
-        PIN_SCORES=IS_CAUSAL,
-        PIN_DP=IS_CAUSAL,
+        PIN_SCORES=False,
+        PIN_DP=False,
         # GQA and the MHA score-cache shapes stream score and dP bands together.
-        USE_STREAM=not IS_CAUSAL and (HQ != HK or CACHE_SCORE_K),
+        USE_STREAM=HQ != HK or CACHE_SCORE_K,
         CACHE_SCORE_K=CACHE_SCORE_K,
         k_score_cache=k_score_cache,
     )
@@ -6622,7 +6636,13 @@ def _attn_bwd_opt_gqa_phase(
                 )
             if REDIRECT_DUMMY_DQ:
                 # Keep the seeded zero atomic inside this workgroup's interval.
-                dq_step = tl.maximum(step - 1, dq_step_floor)
+                previous_step = step - 1
+                if IS_CAUSAL and HQ != HK and phase == 0:
+                    # Commit the previous head's final tile before skipping the next head's masked prefix.
+                    outer_rows: tl.constexpr = 4 * BLOCK_M
+                    if outer_step % (N // outer_rows) == pid_n * (BLOCK_N // outer_rows):
+                        previous_step = (outer_step // (N // outer_rows)) * (N // BLOCK_M) - 1
+                dq_step = tl.maximum(previous_step, dq_step_floor)
             else:
                 dq_step = step - 1
             _attn_bwd_opt_gqa_store_dq_native(
@@ -6703,11 +6723,18 @@ def _attn_bwd_gqa_outer_step(
     unroll_phases: tl.constexpr,
     SKIP_DUMMY_DQ: tl.constexpr = False,
     CACHE_SCORE_K: tl.constexpr = False,
+    MASK_CAUSAL: tl.constexpr = True,
     k_score_cache=None,
 ):
+    # Unroll fully valid short GQA regions after the masked diagonal has completed.
+    steady_causal_gqa: tl.constexpr = (IS_CAUSAL and HQ != HK and CACHE_SCORE_K and (N == 2048 or N == 4096)
+                                       and not MASK_CAUSAL)
+    steady_unroll: tl.constexpr = unroll_phases or steady_causal_gqa
+    steady_slice_refill: tl.constexpr = slice_refill or steady_causal_gqa
     outer_stage = (outer_step - outer_start) % 2
-    group_idx = outer_step // active_outer_blocks
-    outer_block = first_outer_block + outer_step % active_outer_blocks
+    # A causal MHA workgroup visits one head and never crosses a head boundary.
+    group_idx = 0 if IS_CAUSAL and HQ == HK else outer_step // active_outer_blocks
+    outer_block = first_outer_block + (outer_step if IS_CAUSAL and HQ == HK else outer_step % active_outer_blocks)
     global_outer_step = group_idx * n_outer_blocks + outer_block
     q_outer = tlx.local_view(q_buffers, outer_stage)
     do_outer = tlx.local_view(do_buffers, outer_stage)
@@ -6778,14 +6805,15 @@ def _attn_bwd_gqa_outer_step(
         k_md_layout,
         not continuous_bridge,
         continuous_bridge,
-        unroll_phases,
+        steady_unroll,
         q_batch_fits_buffer,
         FRAGMENT_CHAIN,
         SKIP_DUMMY_DQ=SKIP_DUMMY_DQ,
         CACHE_SCORE_K=CACHE_SCORE_K,
+        MASK_CAUSAL=MASK_CAUSAL,
         k_score_cache=k_score_cache,
     )
-    if slice_refill:
+    if steady_slice_refill:
         _attn_bwd_gqa_issue_qdo_slice_async(
             tlx.local_view(q_tiles, phase0),
             tlx.local_view(do_tiles, phase0),
@@ -6803,9 +6831,12 @@ def _attn_bwd_gqa_outer_step(
             N,
             D,
             q_batch_fits_buffer,
+            pid_n,
+            BLOCK_N,
+            IS_CAUSAL,
         )
 
-    for phase in tl.range(1, 4, loop_unroll_factor=3 if unroll_phases else 1):
+    for phase in tl.range(1, 4, loop_unroll_factor=3 if steady_unroll else 1):
         dk, dv, v_operand = _attn_bwd_opt_gqa_phase(
             q_tiles,
             do_tiles,
@@ -6844,13 +6875,14 @@ def _attn_bwd_gqa_outer_step(
             k_md_layout,
             False,
             False,
-            unroll_phases,
+            steady_unroll,
             q_batch_fits_buffer,
             FRAGMENT_CHAIN,
             CACHE_SCORE_K=CACHE_SCORE_K,
+            MASK_CAUSAL=MASK_CAUSAL,
             k_score_cache=k_score_cache,
         )
-        if slice_refill:
+        if steady_slice_refill:
             _attn_bwd_gqa_issue_qdo_slice_async(
                 tlx.local_view(q_tiles, phase),
                 tlx.local_view(do_tiles, phase),
@@ -6868,9 +6900,12 @@ def _attn_bwd_gqa_outer_step(
                 N,
                 D,
                 q_batch_fits_buffer,
+                pid_n,
+                BLOCK_N,
+                IS_CAUSAL,
             )
 
-    if not slice_refill:
+    if not steady_slice_refill:
         _attn_bwd_gqa_issue_qdo_async(
             q_outer,
             do_outer,
@@ -6924,12 +6959,159 @@ def _attn_bwd_gqa_outer_step(
             mma_md,
             q_batch_fits_buffer,
         )
-    # The first iteration drains the two initial next-tile groups. Each
-    # later iteration drains the previous four slice-refill groups while
-    # leaving this iteration's four future groups in flight.
-    tlx.async_load_wait_group(4 if slice_refill else 2)
+    # Slice refills leave four groups in flight; full-tile refills leave two.
+    # Each mode drains the previous mode's groups before the next tile reads them.
+    tlx.async_load_wait_group(4 if steady_slice_refill else 2)
     tl.debug_barrier()
     return dk, dv, v_operand
+
+
+# Tune the program count for the measured 256-CU MI350X configuration.
+# The host launch count must equal the scheduling stride. CU placement is unspecified.
+_D128_CAUSAL_FOLD_PROGRAMS = tl.constexpr(256)
+
+
+@triton.jit
+def _attn_bwd_gqa_allocate_shared_buffers(BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr):
+    """Allocate the shared buffers for one optimized KV tile."""
+    OUTER_M: tl.constexpr = 64
+    qdo_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32), (1024, 16)],
+        [
+            [0, 0, 1],
+            [0, 0, 2],
+            [0, 0, 4],
+            [0, 0, 8],
+            [0, 0, 16],
+            [0, 0, 32],
+            [0, 1, 0],
+            [0, 0, 64],
+            [0, 4, 0],
+            [0, 2, 0],
+            [0, 8, 0],
+            [1, 0, 0],
+            [2, 0, 0],
+        ],
+        [OUTER_M // BLOCK_M, BLOCK_M, D],
+    ))
+    stats_smem_layout: tl.constexpr = (tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1],
+            [2],
+            [4],
+            [8],
+            [16],
+            [32],
+        ],
+        block_bases=[],
+        alignment=16,
+    ))
+    ds_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)],
+        [
+            [1, 0],
+            [2, 0],
+            [0, 1],
+            [0, 2],
+            [4, 0],
+            [0, 8],
+            [8, 0],
+            [0, 32],
+            [0, 16],
+            [0, 4],
+            [0, 64],
+            [0, 128],
+        ],
+        [BLOCK_M, BLOCK_N],
+    ))
+    # Reinterpret the rank-3 K producer as the bank-rotated rank-2 dQ consumer.
+    k_raw_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 0, 1],
+            [0, 0, 2],
+            [0, 0, 4],
+            [0, 1, 0],
+            [0, 2, 0],
+            [0, 4, 0],
+            [0, 8, 0],
+            [1, 0, 0],
+            [2, 0, 0],
+            [4, 0, 0],
+            [8, 0, 0],
+            [16, 0, 0],
+            [32, 0, 0],
+            [64, 0, 0],
+            [128, 0, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    k_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 64],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 64],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [128, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+
+    k_raw_buffer = tlx.local_alloc(
+        (BLOCK_N, D // 8, 8),
+        tl.bfloat16,
+        1,
+        layout=k_raw_smem_layout,
+    )
+    k_buffer = tlx.local_reinterpret(
+        tlx.local_view(k_raw_buffer, 0),
+        tl.bfloat16,
+        [BLOCK_N, D],
+        layout=k_smem_layout,
+    )
+    q_buffers = tlx.local_alloc(
+        (OUTER_M // BLOCK_M, BLOCK_M, D),
+        tl.bfloat16,
+        2,
+        layout=qdo_smem_layout,
+    )
+    do_buffers = tlx.local_alloc(
+        (OUTER_M // BLOCK_M, BLOCK_M, D),
+        tl.bfloat16,
+        2,
+        layout=qdo_smem_layout,
+    )
+    lse_buffers = tlx.local_alloc(
+        (OUTER_M, ),
+        tl.float32,
+        2,
+        layout=stats_smem_layout,
+    )
+    delta_buffers = tlx.local_alloc(
+        (OUTER_M, ),
+        tl.float32,
+        2,
+        layout=stats_smem_layout,
+    )
+    ds_buffers = tlx.local_alloc(
+        (BLOCK_M, BLOCK_N),
+        tl.bfloat16,
+        2,
+        layout=ds_smem_layout,
+    )
+
+    return (k_raw_buffer, k_buffer, q_buffers, do_buffers, lse_buffers, delta_buffers, ds_buffers)
 
 
 @triton.jit
@@ -6953,6 +7135,9 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     BLOCK_N: tl.constexpr,
     BATCH: tl.constexpr = 1,
     SPLIT_Q: tl.constexpr = 1,
+    owner_coordinates=None,
+    shared_buffers=None,
+    PIN_V_COORDINATES: tl.constexpr = False,
 ):
     """Four-wave outer64 causal/full GQA backward bridge."""
     tl.static_assert(D == 128)
@@ -6961,30 +7146,39 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     tl.static_assert(N % 256 == 0)
     tl.static_assert(HQ % HK == 0)
 
-    # Keep adjacent workgroups on different KV heads for the same batch and
-    # N tile to improve the dQ atomic/cache locality of the GQA bridge.
-    off_h_kv = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    if owner_coordinates is None:
+        # Decode the KV head from the causal head-partition grid.
+        off_h_kv = tl.program_id(0) // SPLIT_Q if IS_CAUSAL else tl.program_id(0)
+        pid_n = tl.program_id(1)
+        if SPLIT_Q == 1:
+            off_z = tl.program_id(2)
+            split_id = 0
+        else:
+            off_z = tl.program_id(2) if IS_CAUSAL else tl.program_id(2) % BATCH
+            split_id = tl.program_id(0) % SPLIT_Q if IS_CAUSAL else tl.program_id(2) // BATCH
+    else:
+        off_h_kv, pid_n, off_z, split_id = owner_coordinates
     OUTER_M: tl.constexpr = 64
     n_outer_blocks: tl.constexpr = N // OUTER_M
     first_outer_block = pid_n * (BLOCK_N // OUTER_M) if IS_CAUSAL else 0
     active_outer_blocks = n_outer_blocks - first_outer_block
     total_outer_steps = (HQ // HK) * active_outer_blocks
     tl.static_assert(SPLIT_Q >= 1 and SPLIT_Q <= (HQ // HK) * (N // OUTER_M))
-    tl.static_assert(not IS_CAUSAL or SPLIT_Q == 1)
+    tl.static_assert(not IS_CAUSAL or (HQ // HK) % SPLIT_Q == 0)
     if SPLIT_Q == 1:
-        off_z = tl.program_id(2)
-        split_id = 0
         outer_start = 0
         outer_end = total_outer_steps
     else:
-        off_z = tl.program_id(2) % BATCH
-        split_id = tl.program_id(2) // BATCH
         # The products can exceed i32 even when each interval fits. Widen
         # before multiplication, then keep the loop coordinates in i32.
         outer_start = (total_outer_steps * split_id.to(tl.int64) // SPLIT_Q).to(tl.int32)
         outer_end = (total_outer_steps * (split_id.to(tl.int64) + 1) // SPLIT_Q).to(tl.int32)
-    first_dq_step = pid_n * (BLOCK_N // BLOCK_M) if IS_CAUSAL else outer_start * 4
+    if IS_CAUSAL:
+        first_absolute_outer = ((outer_start // active_outer_blocks) * n_outer_blocks + first_outer_block +
+                                outer_start % active_outer_blocks)
+        first_dq_step = first_absolute_outer * (OUTER_M // BLOCK_M)
+    else:
+        first_dq_step = outer_start * (OUTER_M // BLOCK_M)
 
     # AMD buffer instructions use signed 32-bit byte offsets. Rebase every
     # global tensor to this program's batch with 64-bit pointer arithmetic;
@@ -7069,25 +7263,6 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         ),
     )
 
-    qdo_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 32), (1024, 16)],
-        [
-            [0, 0, 1],
-            [0, 0, 2],
-            [0, 0, 4],
-            [0, 0, 8],
-            [0, 0, 16],
-            [0, 0, 32],
-            [0, 1, 0],
-            [0, 0, 64],
-            [0, 4, 0],
-            [0, 2, 0],
-            [0, 8, 0],
-            [1, 0, 0],
-            [2, 0, 0],
-        ],
-        [OUTER_M // BLOCK_M, BLOCK_M, D],
-    ))
     qdo_slice_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
         [(512, 32), (1024, 16)],
         [
@@ -7105,132 +7280,19 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         ],
         [BLOCK_M, D],
     ))
-    stats_smem_layout: tl.constexpr = (tlx.shared_linear_layout_encoding(
-        offset_bases=[
-            [1],
-            [2],
-            [4],
-            [8],
-            [16],
-            [32],
-        ],
-        block_bases=[],
-        alignment=16,
-    ))
     stats_slice_smem_layout: tl.constexpr = (tlx.shared_linear_layout_encoding(
         offset_bases=[[1], [2], [4], [8]],
         block_bases=[],
         alignment=16,
     ))
-    ds_smem_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)],
-        [
-            [1, 0],
-            [2, 0],
-            [0, 1],
-            [0, 2],
-            [4, 0],
-            [0, 8],
-            [8, 0],
-            [0, 32],
-            [0, 16],
-            [0, 4],
-            [0, 64],
-            [0, 128],
-        ],
-        [BLOCK_M, BLOCK_N],
-    ))
-    # Preserve the existing TLX physical K image: a direct-to-LDS rank-3
-    # producer is reinterpreted as the bank-rotated rank-2 dQ consumer.
-    k_raw_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
-        offset_bases=[
-            [0, 0, 1],
-            [0, 0, 2],
-            [0, 0, 4],
-            [0, 1, 0],
-            [0, 2, 0],
-            [0, 4, 0],
-            [0, 8, 0],
-            [1, 0, 0],
-            [2, 0, 0],
-            [4, 0, 0],
-            [8, 0, 0],
-            [16, 0, 0],
-            [32, 0, 0],
-            [64, 0, 0],
-            [128, 0, 0],
-        ],
-        block_bases=[],
-        alignment=16,
-    )
-    k_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
-        offset_bases=[
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-            [0, 64],
-            [1, 0],
-            [2, 0],
-            [4, 0],
-            [8, 64],
-            [0, 16],
-            [0, 32],
-            [16, 0],
-            [32, 0],
-            [64, 0],
-            [128, 0],
-        ],
-        block_bases=[],
-        alignment=16,
-    )
     k_raw_async_layout: tl.constexpr = tlx.layout(
         shape=((64, 4), (8, 8, 2)),
         stride=((8, 512), (1, 2048, 16384)),
     )
 
-    k_raw_buffer = tlx.local_alloc(
-        (BLOCK_N, D // 8, 8),
-        tl.bfloat16,
-        1,
-        layout=k_raw_smem_layout,
-    )
-    k_buffer = tlx.local_reinterpret(
-        tlx.local_view(k_raw_buffer, 0),
-        tl.bfloat16,
-        [BLOCK_N, D],
-        layout=k_smem_layout,
-    )
-    q_buffers = tlx.local_alloc(
-        (OUTER_M // BLOCK_M, BLOCK_M, D),
-        tl.bfloat16,
-        2,
-        layout=qdo_smem_layout,
-    )
-    do_buffers = tlx.local_alloc(
-        (OUTER_M // BLOCK_M, BLOCK_M, D),
-        tl.bfloat16,
-        2,
-        layout=qdo_smem_layout,
-    )
-    lse_buffers = tlx.local_alloc(
-        (OUTER_M, ),
-        tl.float32,
-        2,
-        layout=stats_smem_layout,
-    )
-    delta_buffers = tlx.local_alloc(
-        (OUTER_M, ),
-        tl.float32,
-        2,
-        layout=stats_smem_layout,
-    )
-    ds_buffers = tlx.local_alloc(
-        (BLOCK_M, BLOCK_N),
-        tl.bfloat16,
-        2,
-        layout=ds_smem_layout,
-    )
+    if shared_buffers is None:
+        shared_buffers = _attn_bwd_gqa_allocate_shared_buffers(BLOCK_M, BLOCK_N, D)
+    k_raw_buffer, k_buffer, q_buffers, do_buffers, lse_buffers, delta_buffers, ds_buffers = shared_buffers
 
     # K direct-to-LDS group.
     raw_n = tl.arange(0, BLOCK_N)
@@ -7266,8 +7328,15 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     tlx.async_load_commit_group([k_token])
 
     if EARLY_V:
-        offs_n = kv_tile_n + tl.arange(0, BLOCK_N)
-        offs_d = tl.arange(0, D)
+        if PIN_V_COORDINATES:
+            # Pin narrow V coordinates to avoid a 128-KiB integer layout conversion.
+            offs_n = kv_tile_n + tlx.rematerialized_range(0, BLOCK_N, 80, placement=pid_n)
+            offs_d = tlx.rematerialized_range(0, D, 81, placement=pid_n)
+            offs_n = tlx.require_layout(offs_n, tlx.slice_layout(k_nm_layout, 1), pin=True)
+            offs_d = tlx.require_layout(offs_d, tlx.slice_layout(k_nm_layout, 0), pin=True)
+        else:
+            offs_n = kv_tile_n + tl.arange(0, BLOCK_N)
+            offs_d = tl.arange(0, D)
         v_offsets = kv_offset_base + offs_n[:, None] * D + offs_d[None, :]
         v_offsets = tlx.require_layout(v_offsets.to(tl.int32), k_nm_layout, pin=False)
         v_operand = tlx.buffer_load(V, v_offsets)
@@ -7325,8 +7394,15 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     tl.debug_barrier()
 
     if not EARLY_V:
-        offs_n = kv_tile_n + tl.arange(0, BLOCK_N)
-        offs_d = tl.arange(0, D)
+        if PIN_V_COORDINATES:
+            # Pin narrow V coordinates to avoid a 128-KiB integer layout conversion.
+            offs_n = kv_tile_n + tlx.rematerialized_range(0, BLOCK_N, 82, placement=pid_n)
+            offs_d = tlx.rematerialized_range(0, D, 83, placement=pid_n)
+            offs_n = tlx.require_layout(offs_n, tlx.slice_layout(k_nm_layout, 1), pin=True)
+            offs_d = tlx.require_layout(offs_d, tlx.slice_layout(k_nm_layout, 0), pin=True)
+        else:
+            offs_n = kv_tile_n + tl.arange(0, BLOCK_N)
+            offs_d = tl.arange(0, D)
         v_offsets = kv_offset_base + offs_n[:, None] * D + offs_d[None, :]
         v_offsets = tlx.require_layout(v_offsets.to(tl.int32), k_nm_layout, pin=False)
         v_operand = tlx.buffer_load(V, v_offsets)
@@ -7344,23 +7420,21 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         relaxed=True,
     )
     k_resident_band6 = tlx.local_load(
-        # Full attention keeps the final K band in registers, avoiding its
-        # repeated LDS read in every delayed dQ phase.
-        tlx.local_slice(k_buffer, [192, 0], [64 if not IS_CAUSAL else 32, D]),
+        # Causal masks need extra registers. Keep only band 6 resident to avoid spills.
+        tlx.local_slice(k_buffer, [192, 0], [32 if IS_CAUSAL else 64, D]),
         token=initial_wait,
         layout=k_md_layout,
         relaxed=True,
     )
     # Native unpinned dK inputs make the full BM16 GQA specialization faster
     # than the BM32 route on the measured 8K/16K shapes.
-    GQA_LONG_BM16: tl.constexpr = (HQ == 64 and HK == 8 and not IS_CAUSAL and SPLIT_Q == 1
+    GQA_LONG_BM16: tl.constexpr = (HQ == 64 and HK == 8 and (SPLIT_Q == 1 or IS_CAUSAL)
                                    and ((BATCH == 16 and N == 8192) or (BATCH == 15 and N == 16384)))
     CACHE_SCORE_K: tl.constexpr = (BATCH == 16 and HQ == 16 and HK == 16 and
                                    (N == 1024 or N == 2048 or N == 4096 or N == 8192 or N == 16384) and D == 128
-                                   and BLOCK_M == 16 and BLOCK_N == 256 and not IS_CAUSAL and SPLIT_Q == 1
-                                   or (BATCH == 16 and HQ == 64 and HK == 8 and
-                                       (N == 1024 or N == 2048 or N == 4096) and D == 128 and BLOCK_M == 16
-                                       and BLOCK_N == 256 and not IS_CAUSAL and SPLIT_Q == 1)
+                                   and BLOCK_M == 16 and BLOCK_N == 256 and (SPLIT_Q == 1 or IS_CAUSAL) or
+                                   (BATCH == 16 and HQ == 64 and HK == 8 and (N == 1024 or N == 2048 or N == 4096)
+                                    and D == 128 and BLOCK_M == 16 and BLOCK_N == 256 and (SPLIT_Q == 1 or IS_CAUSAL))
                                    or (GQA_LONG_BM16 and D == 128 and BLOCK_M == 16 and BLOCK_N == 256))
     if CACHE_SCORE_K:
         k_score_cache = tlx.local_load(
@@ -7371,10 +7445,10 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         )
     else:
         k_score_cache = None
-    # Chain dK fragments and peel the initial zero-dQ bridge for full MHA
-    # and short unsplit GQA. Each owned interval is nonempty.
-    FRAGMENT_CHAIN: tl.constexpr = not IS_CAUSAL and (HQ == HK or (N <= 4096 and SPLIT_Q == 1) or GQA_LONG_BM16)
-    PEEL_ZERO_DQ_SEED: tl.constexpr = not IS_CAUSAL and (HQ == HK or (N <= 4096 and SPLIT_Q == 1) or GQA_LONG_BM16)
+    # Chain dK fragments and skip the initial zero-dQ bridge for MHA and selected GQA partitions.
+    # Each owned interval is nonempty.
+    FRAGMENT_CHAIN: tl.constexpr = (HQ == HK or (N <= 4096 and (SPLIT_Q == 1 or IS_CAUSAL)) or GQA_LONG_BM16)
+    PEEL_ZERO_DQ_SEED: tl.constexpr = (HQ == HK or (N <= 4096 and (SPLIT_Q == 1 or IS_CAUSAL)) or GQA_LONG_BM16)
     if FRAGMENT_CHAIN:
         dk = (
             tlx.zeros((128, 32), tl.float32, layout=mma_nd),
@@ -7389,12 +7463,12 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     else:
         dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
     dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
-    # Carrying delayed dQ across outer/head boundaries helps short unsplit
-    # GQA and the measured 8K/16K shapes. Other long GQA shapes keep their
-    # per-outer drain and the bounded automatic split schedule.
-    continuous_gqa: tl.constexpr = HQ != HK and not IS_CAUSAL and (N <= 4096 or GQA_LONG_BM16) and SPLIT_Q == 1
+    # Carry delayed dQ across outer/head boundaries within each complete-head partition.
+    # Use this bridge for MHA, short unsplit GQA, causal short GQA, and measured long GQA.
+    # Other GQA shapes drain each outer tile.
+    continuous_gqa: tl.constexpr = HQ != HK and (N <= 4096 or GQA_LONG_BM16) and (SPLIT_Q == 1 or IS_CAUSAL)
     continuous_bridge: tl.constexpr = HQ == HK or continuous_gqa
-    unroll_phases: tl.constexpr = continuous_gqa or (HQ == HK and not IS_CAUSAL)
+    unroll_phases: tl.constexpr = not IS_CAUSAL and (continuous_gqa or HQ == HK)
     # Each unrolled phase frees its consumed Q/dO slice at the existing CTA
     # barrier. Refill that slice while later phases compute; phase3 alone
     # refills the full64-row statistics used by all four phases.
@@ -7408,8 +7482,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         )
         tl.debug_barrier()
 
-    # MHA and short unsplit GQA carry delayed dQ across outer64 boundaries.
-    # Other GQA shapes drain per outer tile to overlap the next Q/dO refill.
+    # Continuous bridges carry delayed dQ across outer64 and query-head boundaries.
+    # Other GQA shapes drain each outer tile to overlap the next Q/dO refill.
     if PEEL_ZERO_DQ_SEED:
         # Skip only the initial known-zero delayed dQ, once per owned
         # interval. Later query-head boundaries commit real previous-head dQ.
@@ -7471,64 +7545,82 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
             CACHE_SCORE_K=CACHE_SCORE_K,
             k_score_cache=k_score_cache,
         )
-        for outer_step in tl.range(outer_start + 1, outer_end, loop_unroll_factor=1):
-            dk, dv, v_operand = _attn_bwd_gqa_outer_step(
-                dk,
-                dv,
-                v_operand,
-                BLOCK_M,
-                BLOCK_N,
-                D,
-                DO,
-                DQ_ACC,
-                Delta,
-                FRAGMENT_CHAIN,
-                HK,
-                HQ,
-                IS_CAUSAL,
-                LSE,
-                N,
-                OUTER_M,
-                Q,
-                SM_SCALE,
-                active_outer_blocks,
-                continuous_bridge,
-                delta_buffers,
-                do_buffers,
-                ds_buffers,
-                ds_md_layout,
-                first_dq_step,
-                first_outer_block,
-                k_buffer,
-                k_md_layout,
-                k_nm_layout,
-                k_resident_band6,
-                k_resident_lo,
-                k_resident_mid,
-                lse_buffers,
-                mma_md,
-                mma_nd,
-                mma_nm,
-                n_outer_blocks,
-                off_h_kv,
-                outer_start,
-                outer_step,
-                p_nd_layout,
-                pid_n,
-                q_batch_fits_buffer,
-                q_buffers,
-                q_out_layout,
-                qdo_async_layout,
-                qdo_slice_smem_layout,
-                qt_layout,
-                slice_refill,
-                stats_async_layout,
-                stats_slice_smem_layout,
-                unroll_phases,
-                SKIP_DUMMY_DQ=False,
-                CACHE_SCORE_K=CACHE_SCORE_K,
-                k_score_cache=k_score_cache,
-            )
+        # Only the first 256 query rows of each head intersect this key tile's diagonal.
+        # The second region omits mask coordinates and the runtime diagonal branch.
+        head_begin = outer_start // active_outer_blocks if IS_CAUSAL else 0
+        head_end = tl.cdiv(outer_end, active_outer_blocks) if IS_CAUSAL else 1
+        for head_interval in range(head_begin, head_end):
+            for region in tl.static_range(2 if IS_CAUSAL else 1):
+                if IS_CAUSAL:
+                    head_start = head_interval * active_outer_blocks
+                    if region == 0:
+                        region_start = tl.maximum(head_start, outer_start + 1)
+                        region_end = tl.minimum(head_start + BLOCK_N // OUTER_M, outer_end)
+                    else:
+                        region_start = tl.maximum(head_start + BLOCK_N // OUTER_M, outer_start + 1)
+                        region_end = tl.minimum(head_start + active_outer_blocks, outer_end)
+                else:
+                    region_start = outer_start + 1
+                    region_end = outer_end
+                for outer_step in tl.range(region_start, region_end, loop_unroll_factor=1):
+                    dk, dv, v_operand = _attn_bwd_gqa_outer_step(
+                        dk,
+                        dv,
+                        v_operand,
+                        BLOCK_M,
+                        BLOCK_N,
+                        D,
+                        DO,
+                        DQ_ACC,
+                        Delta,
+                        FRAGMENT_CHAIN,
+                        HK,
+                        HQ,
+                        IS_CAUSAL,
+                        LSE,
+                        N,
+                        OUTER_M,
+                        Q,
+                        SM_SCALE,
+                        active_outer_blocks,
+                        continuous_bridge,
+                        delta_buffers,
+                        do_buffers,
+                        ds_buffers,
+                        ds_md_layout,
+                        first_dq_step,
+                        first_outer_block,
+                        k_buffer,
+                        k_md_layout,
+                        k_nm_layout,
+                        k_resident_band6,
+                        k_resident_lo,
+                        k_resident_mid,
+                        lse_buffers,
+                        mma_md,
+                        mma_nd,
+                        mma_nm,
+                        n_outer_blocks,
+                        off_h_kv,
+                        outer_start,
+                        outer_step,
+                        p_nd_layout,
+                        pid_n,
+                        q_batch_fits_buffer,
+                        q_buffers,
+                        q_out_layout,
+                        qdo_async_layout,
+                        qdo_slice_smem_layout,
+                        qt_layout,
+                        slice_refill,
+                        stats_async_layout,
+                        stats_slice_smem_layout,
+                        unroll_phases,
+                        SKIP_DUMMY_DQ=False,
+                        CACHE_SCORE_K=CACHE_SCORE_K,
+                        MASK_CAUSAL=region == 0,
+                        k_score_cache=k_score_cache,
+                    )
     else:
         for outer_step in tl.range(outer_start, outer_end, loop_unroll_factor=1):
             dk, dv, v_operand = _attn_bwd_gqa_outer_step(
@@ -7606,11 +7698,18 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
             k_nm_layout,
             21 if IS_CAUSAL else None,
         )
+        if IS_CAUSAL:
+            last_outer = outer_end - 1
+            last_absolute_outer = ((last_outer // active_outer_blocks) * n_outer_blocks + first_outer_block +
+                                   last_outer % active_outer_blocks)
+            last_dq_step = (last_absolute_outer + 1) * (OUTER_M // BLOCK_M) - 1
+        else:
+            last_dq_step = outer_end * (OUTER_M // BLOCK_M) - 1
         _attn_bwd_opt_gqa_store_dq_native(
             dq,
             DQ_ACC,
             off_h_kv,
-            N // BLOCK_M - 1 if IS_CAUSAL else outer_end * 4 - 1,
+            last_dq_step,
             SM_SCALE,
             HQ,
             HK,
@@ -7675,6 +7774,73 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
         tlx.buffer_store(dv.to(tl.bfloat16), DV, key_offsets)
     else:
         tlx.buffer_store(dv, DV, key_offsets)
+
+
+@triton.jit
+def _attn_bwd_dkdv_dq_d128_gqa_folded_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DQ_ACC,
+    DK,
+    DV,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BATCH: tl.constexpr = 1,
+    SPLIT_Q: tl.constexpr = 1,
+):
+    """Process causal KV tiles in balanced pairs with shared buffers."""
+    tl.static_assert(IS_CAUSAL)
+    tl.static_assert(SPLIT_Q >= 1)
+    tl.static_assert(HQ % HK == 0 and (HQ // HK) % SPLIT_Q == 0)
+    shared_buffers = _attn_bwd_gqa_allocate_shared_buffers(BLOCK_M, BLOCK_N, D)
+    tiles: tl.constexpr = N // BLOCK_N
+    pairs: tl.constexpr = tl.cdiv(tiles, 2)
+    owners: tl.constexpr = BATCH * HK * SPLIT_Q
+    for task in tl.range(tl.program_id(0), owners * pairs, _D128_CAUSAL_FOLD_PROGRAMS, loop_unroll_factor=1):
+        pair_id = task % pairs
+        owner = task // pairs
+        split_id = owner % SPLIT_Q
+        off_h_kv = owner // SPLIT_Q % HK
+        off_z = owner // (SPLIT_Q * HK)
+        for member in tl.range(0, 2, loop_unroll_factor=1):
+            pid_n = tl.where(member == 0, pair_id, tiles - 1 - pair_id)
+            if member == 0 or pid_n != pair_id:
+                _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
+                    Q,
+                    K,
+                    V,
+                    DO,
+                    LSE,
+                    Delta,
+                    DQ_ACC,
+                    DK,
+                    DV,
+                    SM_SCALE,
+                    IS_CAUSAL,
+                    HQ,
+                    HK,
+                    N,
+                    D,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BATCH,
+                    SPLIT_Q,
+                    owner_coordinates=(off_h_kv, pid_n, off_z, split_id),
+                    shared_buffers=shared_buffers,
+                    PIN_V_COORDINATES=True,
+                )
+                # Complete all shared reads before the next tile overwrites these buffers.
+                tl.debug_barrier()
 
 
 @triton.jit
@@ -9637,7 +9803,8 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
         raise ValueError("split-query dispatch requires a supported D128 GQA shape")
     total_outer_steps = None if shape is None else (shape[1] // shape[2]) * (shape[3] // 64)
     if split_q is None:
-        split_q = 1
+        # These causal shapes assign two complete query heads to each KV-tile owner.
+        split_q = 4 if causal and shape in ((16, 64, 8, 2048, 128), (16, 64, 8, 4096, 128)) else 1
         if shape is not None and not causal:
             batch, hq, hk, n_ctx, head_dim = shape
             base_workgroups = batch * hk * triton.cdiv(n_ctx, 256)
@@ -9659,14 +9826,14 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
                         max_workspace_bytes // bytes_per_split,
                     ))
     _validate_split_q(split_q, total_outer_steps)
-    if causal and split_q != 1:
-        raise ValueError("split_q > 1 requires non-causal D128 attention")
+    if causal and split_q != 1 and (shape is None or (shape[1] // shape[2]) % split_q != 0):
+        raise ValueError("causal query partitions must contain complete query heads")
     # The measured GQA8K/16K shapes use the BM16 kernel, like every measured MHA shape.
-    measured_gqa_long_bm16 = shape in _GQA_LONG_BM16_SHAPES and not causal and split_q == 1
+    measured_gqa_long_bm16 = shape in _GQA_LONG_BM16_SHAPES and split_q == 1
     long_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] >= 8192 and split_q == 1
                 and not measured_gqa_long_bm16)
-    measured_mha = shape in _MHA_SCORE_CACHE_SHAPES and not causal and split_q == 1
-    short_gqa = (shape is not None and not causal and shape[1] > shape[2] and shape[3] <= 4096 and split_q == 1)
+    measured_mha = shape in _MHA_SCORE_CACHE_SHAPES and split_q == 1
+    short_gqa = (shape is not None and shape[1] > shape[2] and shape[3] <= 4096 and (split_q == 1 or causal))
     long_8k = long_gqa and shape[3] == 8192
     measured_gqa8k = shape == (16, 64, 8, 8192, 128) and not causal and split_q == 1
     precise_mha16k = shape == (16, 16, 16, 16384, 128) and not causal and split_q == 1
@@ -9679,9 +9846,12 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
     sink_default = "0" if (short_gqa or long_8k or measured_mha or measured_gqa_long_bm16) else "1"
     regalloc["reverse_local_assignment"] = os.environ.get(_D128_REVERSE_LOCAL_ENV, reverse_default) == "1"
     regalloc["sink_insts_to_avoid_spills"] = os.environ.get(_D128_SINK_INSTS_ENV, sink_default) == "1"
+    folded_causal = causal and split_q == 1 and shape in ((16, 16, 16, 1024, 128), (16, 64, 8, 1024, 128),
+                                                          (16, 64, 8, 8192, 128))
+    main_entry = (_attn_bwd_dkdv_dq_d128_gqa_folded_kernel if folded_causal else
+                  _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel if long_gqa else _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel)
     return _D128InterleavedDispatch(
-        main_entry=(_attn_bwd_dkdv_dq_d128_gqa_bm32_kernel
-                    if long_gqa else _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel),
+        main_entry=main_entry,
         block_m=32 if long_gqa else 16,
         block_n=256,
         num_warps=4,
@@ -9728,7 +9898,13 @@ def _run_bwd_d128_gqa_optimized(
         partial_shape = (split_q, batch, hk, n_ctx, head_dim)
         dk_partial = torch.empty(partial_shape, device=q.device, dtype=torch.float32)
         dv_partial = torch.empty_like(dk_partial)
-    dispatch.main_entry[(hk, triton.cdiv(n_ctx, dispatch.block_n), batch * split_q)](
+    if dispatch.main_entry is _attn_bwd_dkdv_dq_d128_gqa_folded_kernel:
+        grid = (int(_D128_CAUSAL_FOLD_PROGRAMS), )
+    else:
+        # Adjacent causal partition IDs address the same KV tile.
+        grid = ((hk * split_q, triton.cdiv(n_ctx, dispatch.block_n), batch) if causal else
+                (hk, triton.cdiv(n_ctx, dispatch.block_n), batch * split_q))
+    dispatch.main_entry[grid](
         q,
         k,
         v,
@@ -9813,7 +9989,7 @@ def _select_d128_interleaved_dispatch(q_shape=None, k_shape=None, causal=False, 
             shape = (q_shape[0], q_shape[1], k_shape[1], q_shape[2], q_shape[3])
     supported = shape is not None and _is_supported_gqa_shape(shape)
     sparse_grid = supported and shape[0] * shape[2] * triton.cdiv(shape[3], 256) <= 64
-    if supported and not causal and (split_q is not None or shape in _PR2709_OPTIMIZED_SHAPES or sparse_grid):
+    if supported and ((not causal and (split_q is not None or sparse_grid)) or shape in _PR2709_OPTIMIZED_SHAPES):
         return _select_optimized_d128_interleaved_dispatch(shape, causal, split_q)
     if split_q is not None and split_q != 1:
         raise ValueError("split_q > 1 requires non-causal D128 attention")
@@ -9822,8 +9998,9 @@ def _select_d128_interleaved_dispatch(q_shape=None, k_shape=None, causal=False, 
 
 def _optimized_gqa_uses_log2_lse(dispatch, shape, causal):
     """Match the optimized kernel's score-cache specializations that read log2 LSE."""
-    return (dispatch.main_entry is _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel and dispatch.block_m == 16
-            and dispatch.block_n == 256 and dispatch.split_q == 1 and not causal
+    return (dispatch.main_entry
+            in (_attn_bwd_dkdv_dq_d128_gqa_optimized_kernel, _attn_bwd_dkdv_dq_d128_gqa_folded_kernel)
+            and dispatch.block_m == 16 and dispatch.block_n == 256 and (dispatch.split_q == 1 or causal)
             and tuple(shape) in ((16, 64, 8, 1024, 128), (16, 64, 8, 2048, 128),
                                  (16, 64, 8, 4096, 128), *_GQA_LONG_BM16_SHAPES, *_MHA_SCORE_CACHE_SHAPES))
 
@@ -9843,7 +10020,8 @@ def _run_bwd_d128_gqa(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, cau
     if (tuple(dq_acc.shape) != expected_shape or dq_acc.dtype != q.dtype or dq_acc.device != q.device
             or not dq_acc.is_contiguous()):
         raise ValueError("dQ accumulator shape, dtype, device, or strides do not match dispatch")
-    if dispatch.main_entry in (_attn_bwd_dkdv_dq_d128_gqa_optimized_kernel, _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel):
+    if dispatch.main_entry in (_attn_bwd_dkdv_dq_d128_gqa_optimized_kernel, _attn_bwd_dkdv_dq_d128_gqa_folded_kernel,
+                               _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel):
         return _run_bwd_d128_gqa_optimized(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, causal,
                                            dispatch.split_q)
     return _run_bwd_d128_gqa_original(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, causal)
