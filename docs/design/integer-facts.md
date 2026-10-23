@@ -90,13 +90,14 @@ all-elements fact requires a justified reduction or uniformity fact.
 
 ### Loops
 
-Materialize the loop body's guaranteed exit-test relation on a refined induction
-value. For a signed upper-exclusive test, this includes `iv < upper_bound`.
+For `scf.for`, materialize both `lower_bound <= iv` and `iv < upper_bound`,
+using the loop's signed or unsigned interpretation. Its contract requires a
+positive step and a representable exit value `lower_bound + trip_count * step`.
+Thus defined execution cannot wrap the induction value. See the
+[SCF loop contract](https://github.com/llvm/llvm-project/blob/a6533ab0f5a1df16ff3dbf7358fb79097c60855e/mlir/include/mlir/Dialect/SCF/IR/SCFOps.td#L178).
 
-Lower-bound, step, and congruence facts depend on the loop operation's semantics.
-An integer recurrence that can wrap does not imply `iv >= lower_bound`.
-Likewise, mathematical `iv = lower_bound + k * step` requires a valid integer
-interpretation. Preserve modular relations when only bitvector arithmetic is
+For other integer recurrences, prove that they cannot wrap before deriving
+ordered bounds. Preserve modular relations when only bitvector arithmetic is
 justified.
 
 Use refined induction values in the body. Keep the original loop bounds and
