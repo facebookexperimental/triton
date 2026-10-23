@@ -22367,7 +22367,7 @@ def _range_winner_is_stable(a, b, out, candidates, timings, winner, use_cache):
     return max(medians[1]) < min(medians[0])
 
 
-def mm(a, b, *, out=None, space="heuristic"):
+def mm(a, b, *, out=None, space="heuristic", invariance=None):
     """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation."""
     if space not in ("full", "heuristic"):
         raise InvalidInput(f"unknown gfx950 mm search space: {space}")

@@ -5,11 +5,11 @@ import contextlib
 import pytest
 import torch
 from triton._internal_testing import is_hopper
-from triton.tlx.ops import InvalidInput
+from triton.tlx.ops import BitwiseInvarianceSpec, InvalidInput
 from triton.tlx.ops.kernels.mm import sm90
 from triton.tlx.ops.kernels.mm._shapes import SM90_FOCUS, SYNTHETIC
 
-from mm_test_utils import REL_PRECISION, run_mm_case
+from mm_test_utils import REL_PRECISION, run_mm_case, run_mm_invariance_case
 
 pytestmark = pytest.mark.skipif(not is_hopper(), reason="Requires sm90")
 
@@ -235,3 +235,22 @@ def test_swap_ab_split_k_is_deterministic():
     for _ in range(3):
         assert torch.equal(tlx_mm(a, b, space="heuristic"), first)
     _assert_close(first, torch.matmul(a, b))
+
+
+_INVARIANCE_SPECS = [
+    BitwiseInvarianceSpec.dims("M"),
+    BitwiseInvarianceSpec.dims("K"),
+    BitwiseInvarianceSpec.all(),
+]
+
+_INVARIANCE_SHAPES = [
+    (1024, 1024, 1024, (1024, 1), (1024, 1), "bf16"),
+    (512, 2048, 512, (512, 1), (2048, 1), "bf16"),
+]
+
+
+@pytest.mark.parametrize("spec", _INVARIANCE_SPECS)
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _INVARIANCE_SHAPES)
+def test_mm_invariance(spec, M, N, K, a_strides, b_strides, dtype_name):
+    """A non-empty spec is accepted and gives exact M-slice equality."""
+    run_mm_invariance_case(ARCH, M, N, K, a_strides, b_strides, dtype_name, spec)
