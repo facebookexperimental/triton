@@ -23,13 +23,58 @@ public:
   explicit IntegerRangeRewriteListener(DataFlowSolver &solver)
       : solver(solver) {}
 
+  void notifyOperationReplaced(Operation *op,
+                               ValueRange replacements) override {
+    auto overflow = dyn_cast<arith::ArithIntegerOverflowFlagsInterface>(op);
+    if (!overflow || replacements.size() != 1)
+      return;
+    Operation *extension = replacements.front().getDefiningOp();
+    if (!isa_and_nonnull<arith::ExtSIOp, arith::ExtUIOp>(extension))
+      return;
+    Operation *narrow = extension->getOperand(0).getDefiningOp();
+    if (!narrow || narrow->getName() != op->getName())
+      return;
+    unsigned width = getElementTypeOrSelf(narrow->getResult(0).getType())
+                         .getIntOrFloatBitWidth();
+    auto flags = overflow.getOverflowAttr().getValue();
+    for (Value value :
+         llvm::concat<Value>(op->getOperands(), op->getResults())) {
+      const auto *lattice =
+          solver.lookupState<dataflow::IntegerValueRangeLattice>(value);
+      if (!lattice || lattice->getValue().isUninitialized()) {
+        flags = arith::IntegerOverflowFlags::none;
+        break;
+      }
+      const auto &range = lattice->getValue().getValue();
+      if (!range.smin().isSignedIntN(width) ||
+          !range.smax().isSignedIntN(width))
+        flags = arith::bitEnumClear(flags, arith::IntegerOverflowFlags::nsw);
+      if (!range.umax().isIntN(width))
+        flags = arith::bitEnumClear(flags, arith::IntegerOverflowFlags::nuw);
+    }
+    if (flags != overflow.getOverflowAttr().getValue())
+      narrowedFlags[narrow] = flags;
+  }
+
   void notifyOperationErased(Operation *op) override {
+    narrowedFlags.erase(op);
     solver.eraseState(solver.getProgramPointAfter(op));
     for (Value result : op->getResults())
       solver.eraseState(result);
   }
 
+  void updateNarrowedOverflowFlags() {
+    // Wide no-wrap guarantees do not imply no-wrap at the narrowed width.
+    for (auto [op, flags] : narrowedFlags) {
+      auto overflow = cast<arith::ArithIntegerOverflowFlagsInterface>(op);
+      op->setAttr(
+          overflow.getIntegerOverflowAttrName(),
+          arith::IntegerOverflowFlagsAttr::get(op->getContext(), flags));
+    }
+  }
+
 private:
+  DenseMap<Operation *, arith::IntegerOverflowFlags> narrowedFlags;
   DataFlowSolver &solver;
 };
 
@@ -83,6 +128,8 @@ struct TritonNarrowIntegerRangesPass
     if (failed(
             applyOpPatternsGreedily(candidates, std::move(patterns), config)))
       return signalPassFailure();
+    // New ops stay unvisited and unfolded until their flags are repaired.
+    listener.updateNarrowedOverflowFlags();
   }
 };
 
