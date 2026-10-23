@@ -24,9 +24,14 @@ on:
         type: string
         default: "[]"
       run_url:
-        description: URL of the nightly run (for the close comment).
+        description: URL of the run (for the close comment).
         required: true
         type: string
+      sha:
+        description: Commit the run tested. When set, issues last updated by a run of a newer commit stay open.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -47,6 +52,21 @@ jobs:
             const jobName = ${{ toJSON(inputs.job_name) }};
             const runUrl = ${{ toJSON(inputs.run_url) }};
             const rawFailures = ${{ toJSON(inputs.failures) }};
+            const sha = ${{ toJSON(inputs.sha) }};
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+            const SHA_ROW = /^\| SHA \| `([0-9a-f]{7,40})` \|$/m;
+            // Runs can finish out of order: a pass at an older commit must not close an issue that a
+            // run of a newer commit reported.
+            async function isNewerThanThisRun(other) {
+              if (!sha || !other || other === sha) return false;
+              try {
+                const { data } = await github.rest.repos.compareCommitsWithBasehead({ ...repo, basehead: `${sha}...${other}` });
+                return data.status === "ahead";
+              } catch (e) {
+                core.warning(`Could not compare ${sha}...${other}: ${e}`);
+                return false;
+              }
+            }
 
             let failures = [];
             try {
@@ -84,11 +104,17 @@ jobs:
               if (issue.pull_request) continue;
               if (!issue.title.startsWith(prefix)) continue;   // scope to this job
               if (stillFailing.has(issue.title)) continue;      // still broken: leave open
+              if (await isNewerThanThisRun(((issue.body || "").match(SHA_ROW) || [])[1])) {
+                core.info(`Left #${issue.number} open: a run of a newer commit reported it.`);
+                continue;
+              }
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issue.number,
-                body: "✅ Auto-closing: this failure identity no longer appears in the latest nightly run (" + runUrl + "). A new issue will be filed automatically if it recurs.",
+                body: "✅ Auto-closing: this failure identity no longer appears in " + runUrl
+                  + (sha ? " (`" + sha.slice(0, 9) + "`)" : "") + ". A new issue will be filed automatically if it recurs."
+                  + (sha ? "\n<!-- closed-at-sha: " + sha + " -->" : ""),
               });
               await github.rest.issues.update({
                 owner: context.repo.owner,
