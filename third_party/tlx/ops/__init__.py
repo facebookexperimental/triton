@@ -616,16 +616,18 @@ def flash_attn_varlen_backward(q, k, v, o, do, lse, plan, sm_scale=None, causal=
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_expcast=False):
-    """MXFP8 attention over contiguous BF16 ``(Z, H, N_CTX, HEAD_DIM)`` tensors.
+    """Differentiable MXFP8 attention over contiguous BF16 Q/K/V.
 
-    Q, K, V and the softmax probabilities are quantized internally to E4M3
-    data with E8M0 scales: per 32x32 block for Q and K, per 32 keys for V and
-    the probabilities. gfx950 quantizes as Blackwell does, but its ping-pong
-    kernel (non-causal, and causal at sequence lengths divisible by 512)
-    computes the probabilities with an approximate exp2 (see
-    kernels/flash_attn_mxfp8/gfx950.py), and the two agree to within the
-    quantization error rather than bitwise. Head dim 128 and sequence lengths
-    divisible by 256. Blackwell returns BF16 gradients; gfx950 is forward only.
+    Inputs have identical [batch, heads, sequence, 128] shapes with sequence
+    lengths divisible by 256. Both architectures return BF16 gradients.
+    Both architectures use 32x32 Q/K blocks. On gfx950, calls where autograd
+    records Q, K or V use a training forward with hardware exp2 that saves
+    separate row maxima and log2 normalization terms, the statistics backward
+    recomputes P from. Other calls use the faster inference ping-pong kernel
+    (non-causal, and causal at sequence lengths divisible by 512), whose
+    approximate exp2 makes its output differ from the training forward by
+    about 0.04 relative RMS, less than either differs from BF16 attention.
+    See the kernel module for the recipes.
     ``p_expcast=True`` (Blackwell only) encodes the forward probabilities with
     ExpCast-FP8 instead of exp2 (see kernels/flash_attn_mxfp8/sm100.py).
     """
@@ -634,6 +636,8 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
     if q.shape != k.shape or q.shape != v.shape:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have identical shapes; "
                            f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if any(size == 0 for size in q.shape):
+        raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects nonempty Q/K/V dimensions")
     if q.dtype != k.dtype or q.dtype != v.dtype or q.device != k.device or q.device != v.device:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have the same dtype and device")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
@@ -645,7 +649,9 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], N_CTX=q.shape[-2])
     check_backward(spec, q, k, v)
     _check_enforced("flash_attn_mxfp8", spec, invariance)
-    return fn(q, k, v, causal, sm_scale, space=space_name, p_expcast=p_expcast)
+    import torch
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, causal, sm_scale, space=space_name, p_expcast=p_expcast)
 
 
 def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None, causal=False, *,
