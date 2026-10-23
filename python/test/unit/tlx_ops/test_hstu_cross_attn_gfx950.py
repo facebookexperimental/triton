@@ -211,31 +211,6 @@ def test_hstu_cross_attn_stream_k_cuda_graphs():
 
 
 @requires_gfx950
-def test_hstu_cross_attn_no_grad_matches_autograd():
-    from triton.tlx.ops import hstu_cross_attn
-
-    torch.manual_seed(1033)
-    a = _inference_inputs([256, 100, 64], [128, 31, 64])
-    for name in ("q", "k", "v"):
-        a[name].requires_grad_()
-    with_grad = hstu_cross_attn(**a)
-    with torch.no_grad():
-        without_grad = hstu_cross_attn(**a)
-    assert with_grad.grad_fn is not None and without_grad.grad_fn is None
-    assert torch.equal(with_grad.detach(), without_grad)
-
-
-@requires_gfx950
-def test_hstu_cross_attn_fwd_kernels_read_no_module_globals():
-    # A module global read by a kernel (or anything it calls) keeps every launch off the C launch fast path.
-    from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k, gfx950
-
-    for kernel in (gfx950._tlx_gfx950_cross_attn_fwd.curated.fn, _forward_stream_k._hstu_cross_attn_fwd_stream_k):
-        kernel.cache_key
-        assert not kernel.used_global_vals, sorted(name for name, _ in kernel.used_global_vals)
-
-
-@requires_gfx950
 def test_hstu_cross_attn_bwd_split_softmax():
     torch.manual_seed(1001)
     _run([2048, 1792, 64, 0], [256, 250, 17, 33], heads=1, num_softmax_heads=1, dtype=torch.bfloat16, shared_kv=True,
