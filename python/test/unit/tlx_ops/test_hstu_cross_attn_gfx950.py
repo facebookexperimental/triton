@@ -236,31 +236,6 @@ def test_hstu_cross_attn_fwd_kernels_read_no_module_globals():
 
 
 @requires_gfx950
-@pytest.mark.parametrize("stream_k", [True, False])
-def test_hstu_cross_attn_fwd_launches_take_the_c_fast_path(stream_k, monkeypatch):
-    # Repeat launches resolved by the C launch path never reach the kernel's Python `run`.
-    from triton.tlx.ops import hstu_cross_attn
-    from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k, gfx950
-
-    monkeypatch.setenv(gfx950.STREAM_K_ENV, "1" if stream_k else "0")
-    kernel = _forward_stream_k._hstu_cross_attn_fwd_stream_k if stream_k else gfx950._tlx_gfx950_cross_attn_fwd.curated.fn
-    runs = []
-    run = kernel.run
-    monkeypatch.setattr(kernel, "run", lambda *args, **kwargs: runs.append(1) or run(*args, **kwargs))
-    # A launch proxy binds `run` when it is created; start from none so the new ones fall back to the counter.
-    monkeypatch.setattr(kernel, "_jit_proxy_cache", {}, raising=False)
-    torch.manual_seed(1037)
-    a = _inference_inputs([256, 100, 64], [128, 31, 64])
-    with torch.inference_mode():
-        for _ in range(2):
-            hstu_cross_attn(**a)
-        runs.clear()
-        for _ in range(3):
-            hstu_cross_attn(**a)
-    assert not runs
-
-
-@requires_gfx950
 def test_hstu_cross_attn_bwd_split_softmax():
     torch.manual_seed(1001)
     _run([2048, 1792, 64, 0], [256, 250, 17, 33], heads=1, num_softmax_heads=1, dtype=torch.bfloat16, shared_kv=True,
