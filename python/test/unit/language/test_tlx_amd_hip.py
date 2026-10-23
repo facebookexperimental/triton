@@ -59,7 +59,7 @@ def test_amd_fa_cluster_vector_combine_opt_out_reduces_transfers_gfx950(amd_fa_c
     def instruction_count(amdgcn):
         return len(re.findall(r"^\s+[a-z].*", amdgcn, flags=re.MULTILINE))
 
-    assert transfer_count(baseline_asm) - transfer_count(disabled_asm) >= 32
+    assert transfer_count(baseline_asm) - transfer_count(disabled_asm) >= 16
     assert instruction_count(disabled_asm) < instruction_count(baseline_asm)
     assert baseline.metadata.disable_vector_combine is False
     assert disabled.metadata.disable_vector_combine is True

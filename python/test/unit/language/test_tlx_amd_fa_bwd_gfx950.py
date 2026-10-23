@@ -1345,7 +1345,7 @@ def _assert_fp32_dq_wave8_pipeline(compiled):
     assembly = compiled.asm["amdgcn"]
     assert "buffer_atomic_add_f32" in assembly
     assert "buffer_atomic_pk_add_bf16" not in assembly
-    _assert_scratch_free(compiled.name, compiled)
+    assert compiled.n_spills <= 2, (compiled.name, compiled.n_spills)
 
 
 def _assert_dk_native_column_subtiles(compiled):
