@@ -1,0 +1,124 @@
+name: CUTracer Sanitizer
+# Runs one TLX kernel's test under NVIDIA Compute Sanitizer through CUTracer
+# and reports the result in the job summary. Report-only: findings do not fail
+# the job; a sanitizer run that produced no summary (timeout, crash, missing
+# binary) does, because then the job checked nothing.
+#
+# Racecheck is opt-in through the tools input: it reports false-positive
+# shared-memory hazards on mbarrier-synchronized warp-specialized kernels (see
+# .llms/rules/partition-scheduler-bugs.md #9) and did not finish within 30
+# minutes on the default flash-attention test.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit to test (defaults to the dispatched ref)
+        required: false
+        type: string
+      test:
+        description: Pytest node id that launches the kernel (default in env below)
+        required: false
+        type: string
+      kernel:
+        description: Kernel name, used to attribute racecheck findings
+        required: false
+        type: string
+      tools:
+        description: Comma-separated compute-sanitizer tools (racecheck is opt-in)
+        required: false
+        type: string
+      cutracer_version:
+        description: cutracer version on PyPI
+        required: false
+        type: string
+  # Changes to this workflow, its script or its setup action run it on the
+  # default kernel.
+  pull_request:
+    paths:
+      - .github/workflows/cutracer.yml
+      - .github/scripts/cutracer_sanitize.py
+      - .github/actions/setup-cutracer/**
+
+env:
+  REF: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+  TEST_ID: ${{ inputs.test || 'python/test/unit/tlx_ops/test_flash_attn_sm100.py::test_flash_attn_fwd[1-1-256-64-False-fp16]' }}
+  KERNEL: ${{ inputs.kernel || '_attn_fwd_ws' }}
+  TOOLS: ${{ inputs.tools || 'synccheck,memcheck' }}
+  CUTRACER_VERSION: ${{ inputs.cutracer_version || '0.4.0' }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cutracer-sanitizer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository_owner == 'facebookexperimental'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+
+  sanitize-b200:
+    needs: build
+    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    runs-on: nvidia-dgx-b200
+    env:
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+      CUDA_VERSION: "13.0"
+    timeout-minutes: 120
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.REF }}
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Install test dependencies
+        run: |
+          . "${SETUP_SCRIPT}"
+          uv pip install pytest
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      - name: Set up CUTracer
+        uses: ./.github/actions/setup-cutracer
+        env:
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          cuda-version: ${{ env.CUDA_VERSION }}
+          cutracer-version: ${{ env.CUTRACER_VERSION }}
+      - name: Run sanitizers
+        timeout-minutes: 90
+        run: |
+          . "${SETUP_SCRIPT}"
+          python3 .github/scripts/cutracer_sanitize.py \
+            --tools "${TOOLS}" \
+            --kernel "${KERNEL}" \
+            --out "${RUNNER_TEMP}/cutracer" \
+            --timeout-minutes 30 \
+            -- python -m pytest "${TEST_ID}" --import-mode=importlib -x -q -p no:cacheprovider
+      - name: Upload sanitizer logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cutracer-sanitizer-b200
+          path: ${{ runner.temp }}/cutracer
+          if-no-files-found: warn
+          retention-days: 30
