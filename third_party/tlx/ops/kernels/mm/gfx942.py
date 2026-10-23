@@ -1656,7 +1656,7 @@ def _launch_global_split_k(a, b, bias, out, space):
     return _launch_global_split_k_config(a, b, bias, out, workspace, config)
 
 
-def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
+def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
     M, N, K = _validate_operands(a, b, out)
     bias_strides = _bias_strides(bias, M, N, a) if bias is not None else (0, 0)
     if out is None:
@@ -1732,9 +1732,9 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
     return out
 
 
-def mm(a, b, *, out=None, space="heuristic"):
+def mm(a, b, *, out=None, space="heuristic", invariance=None):
     """Compute ``a @ b`` using the gfx942 direct-load GEMM kernel."""
-    return _gemm(a, b, out=out, space=space)
+    return _gemm(a, b, out=out, space=space, invariance=invariance)
 
 
 # Compatibility entry point used by the kernel-optimization agent.
