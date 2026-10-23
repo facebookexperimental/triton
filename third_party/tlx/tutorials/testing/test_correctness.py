@@ -147,6 +147,12 @@ if is_hip():
 else:
     _amd_addmm_glu_registry = {}
 
+if is_hip_cdna4():
+    from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a8w8_mxfp8 import (
+        pack_regular_mxfp8_scales,
+        regular_mxfp8_square,
+    )
+
 _IKBO_SUPPORTED = is_hip_cdna4() or is_hopper_or_newer()
 
 # Spelled out rather than read off the registry: the parametrize is evaluated at
@@ -1695,6 +1701,33 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
     config["TRANSPOSE_B"] = TRANSPOSE_B
     out = _amd_mxfp_gemm_tdm_pipelined(a_d, b_d, a_scale.to(DEVICE), b_scale.to(DEVICE), config=config)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
+
+
+# =============================================================================
+# AMD regular MXFP8 GEMM Tests (gfx950)
+# =============================================================================
+
+
+@pytest.mark.parametrize("size", [1024, 2048, 4096])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_gfx950_regular_mxfp8_square_matches_fp32_reference(size):
+    generator = torch.Generator(device=DEVICE)
+    generator.manual_seed(43)
+    a = (torch.randn((size, size), device=DEVICE, generator=generator) * 0.25).to(torch.float8_e4m3fn)
+    b = (torch.randn((size, size), device=DEVICE, generator=generator) * 0.25).to(torch.float8_e4m3fn)
+    a_scales = torch.randint(124, 130, (size, size // 32), dtype=torch.uint8,
+                             device=DEVICE, generator=generator)
+    b_scales = torch.randint(124, 130, (size, size // 32), dtype=torch.uint8,
+                             device=DEVICE, generator=generator)
+    packed_a, packed_b = pack_regular_mxfp8_scales(a_scales, b_scales)
+    out = torch.empty((size, size), dtype=torch.bfloat16, device=DEVICE)
+    regular_mxfp8_square(a, b, packed_a, packed_b, out=out)
+
+    a_ref = a.float() * torch.exp2(a_scales.float() - 127).repeat_interleave(32, dim=1)
+    b_ref = b.float() * torch.exp2(b_scales.float() - 127).repeat_interleave(32, dim=1)
+    expected = a_ref @ b_ref.T
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), expected, rtol=0.03, atol=0.5)
 
 
 # =============================================================================
