@@ -813,6 +813,103 @@ def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size, in
     assert (" multicast " in compiled.asm["ttgir"]) == (multicast and cluster_size > 1)
 
 
+@pytest.mark.parametrize("interface", ["packed", "list"])
+@pytest.mark.parametrize("groups,k,programs", [(2, 512, 16), (32, 4096, 256)])
+def test_wave_specialization_grouped_gemm_fused(interface, groups, k, programs, monkeypatch):
+    import re
+    from triton.backends.amd.compiler import HIPBackend
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    constants = dict(NUM_PROGRAMS=programs, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, NUM_BUFFERS=2,
+                     L2_PREFETCH_DISTANCE=0, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=2, NUM_XCDS=8,
+                     XCD_CHUNK=2, K=k, group_size=groups, CLUSTER_SIZE=4, CLUSTER_MULTICAST=True)
+    if interface == "packed":
+        kernel = _gfx1250_grouped.grouped_gemm_tdm_kernel
+        signature = _gfx1250_grouped._grouped_gemm_tdm_compile_signature()
+        attrs = _gfx1250_grouped._grouped_gemm_tdm_compile_attrs()
+    else:
+        kernel = _gfx1250_grouped.grouped_gemm_tdm_list_kernel
+        signature = _gfx1250_grouped._grouped_gemm_tdm_list_compile_signature()
+        attrs = _gfx1250_grouped._grouped_gemm_tdm_list_compile_attrs()
+        constants["ALLOW_MN_TAILS"] = False
+    original = HIPBackend.make_llir
+    lowered = []
+
+    def capture(src, metadata, options):
+        result = original(src, metadata, options)
+        lowered.append(str(src))
+        return result
+
+    monkeypatch.setattr(HIPBackend, "make_llir", staticmethod(capture))
+    kernels = []
+    for enabled in (False, True):
+        source = ASTSource(kernel, signature={k: v
+                                              for k, v in signature.items()
+                                              if k not in constants}, constexprs=constants, attrs=attrs)
+        kernels.append(
+            triton.compile(
+                source,
+                target=GPUTarget("hip", "gfx1250", 32),
+                options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(4, 1, 1), enable_wave_specialization=enabled),
+            ))
+        assert ("tritonamdgpu.wave_specialized" in lowered[-1]) == enabled
+        descriptor_selects = [
+            line for line in lowered[-1].splitlines()
+            if "llvm.select" in line and ("vector<4xi32>" in line or "vector<8xi32>" in line)
+        ]
+        assert bool(descriptor_selects) != enabled
+        # The scalar descriptor membership bits use (wave & 2) == 0 or
+        # ((wave ^ 2) & 2) == 0. They must share the entry dispatch after range
+        # canonicalization, rather than survive in the specialized bodies.
+        definitions = dict(re.findall(r"^\s*(%\w+) = (.*)$", lowered[-1], re.MULTILINE))
+        waves = {value for value, op in definitions.items() if op.startswith("rocdl.wave.id")}
+        twos = {value for value, op in definitions.items() if op.startswith("llvm.mlir.constant(2 : i32)")}
+
+        def binary_operands(op, opcode):
+            match = re.match(rf"{re.escape(opcode)} (%\w+), (%\w+) : i32", op)
+            return set(match.groups()) if match else set()
+
+        flipped_waves = {
+            value
+            for value, op in definitions.items()
+            if (operands := binary_operands(op, "llvm.xor")) & waves and operands & twos
+        }
+        membership_bits = {
+            value
+            for value, op in definitions.items()
+            if (operands := binary_operands(op, "llvm.and")) & (waves | flipped_waves) and operands & twos
+        }
+        membership_comparisons = [
+            value for value, op in definitions.items()
+            if op.startswith("llvm.icmp") and set(re.findall(r"%\w+",
+                                                             op.split(" loc(")[0])) & membership_bits
+        ]
+        if enabled:
+            assert len(membership_comparisons) == 1
+            entry = lowered[-1].split("llvm.cond_br", 1)[0]
+            assert f"{membership_comparisons[0]} = llvm.icmp" in entry
+            assert "rocdl.wave.id range <i32, 0, 4>" in entry
+        else:
+            assert len(membership_comparisons) > 1
+        # Check every fused site, including prologue, steady K loop and tile
+        # refill. Versioning preserves each site in both branches; descriptor
+        # choices must stay folded through LLVM optimization and codegen.
+        asm = kernels[-1].asm
+        fused_sites = asm["ttgir"].count("amdg.async_tdm_fused_copy_global_to_local")
+        assert fused_sites == 6
+        expected_loads = fused_sites * (2 if enabled else 1)
+        assert lowered[-1].count('"llvm.amdgcn.tensor.load.to.lds"') == expected_loads
+        assert asm["llir"].count("call void @llvm.amdgcn.tensor.load.to.lds(") == expected_loads
+        assert len(re.findall(r"^\s*tensor_load_to_lds\b", asm["amdgcn"], re.MULTILINE)) == expected_loads
+        # LLVM may bitcast the four-i32 group into two i64s before selecting.
+        llvm_descriptor_selects = re.findall(r"\bselect\b[^\n]*<(?:4 x i32|8 x i32|2 x i64)>", asm["llir"])
+        assert bool(llvm_descriptor_selects) != enabled
+    assert len({kernel.metadata.shared for kernel in kernels}) == 1
+    assert kernels[0].asm["hsaco"] != kernels[1].asm["hsaco"]
+
+
 @pytest.mark.parametrize("dims,num_ctas,arch", [
     ((3, 1, 1), 1, "gfx1250"),
     ((4, 2, 1), 1, "gfx1250"),
@@ -1249,13 +1346,17 @@ def test_grouped_gemm_interface_rejects_other_arch(monkeypatch):
         _gfx1250_grouped._require_grouped_gemm_gfx1250(torch.device("cuda"))
 
 
-def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
+@pytest.mark.parametrize("mode", [None, "on", "all"])
+def test_grouped_gemm_interface_defaults_match_bench(monkeypatch, tmp_path, mode):
+    import csv
     import sys
     from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import bench
 
     checked = []
 
-    def check_case(args, case, kernel_variant, index, total):
+    def check_case(args, case, kernel_variant, wave_specialization, index, total):
+        command = bench._build_command(args, case, kernel_variant, wave_specialization)
+        assert command[command.index("--wave_specialization") + 1] == wave_specialization
         cfg = _gfx1250_grouped._grouped_gemm_interface_launch_config(
             _gfx1250_grouped._grouped_gemm_interface_config(None, case.k), [case.m] * case.groups, case.n, case.k, 256,
             auto_cluster=True)
@@ -1277,14 +1378,22 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
             assert cfg[key] == value, (case, key)
         assert cfg["ALLOW_MN_TAILS"] is False
         assert cfg["NUM_SM"] == 256
-        checked.append(case)
-        return bench.BenchResult(case, kernel_variant, case.tensor_gib, 0, None, None)
+        checked.append(wave_specialization)
+        return bench.BenchResult(case, kernel_variant, wave_specialization, case.tensor_gib, 0, None, None)
 
-    monkeypatch.setattr(sys, "argv", ["bench.py", "--dry-run"])
+    csv_path = tmp_path / "results.csv"
+    argv = ["bench.py", "--dry-run", "--csv", str(csv_path)]
+    if mode is not None:
+        argv += ["--wave-specialization", mode]
+    monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(bench, "_run_case", check_case)
     monkeypatch.setattr(bench, "_print_summary", lambda results: None)
     assert bench.main() == 0
-    assert len(checked) == 2 * len(bench.DEFAULT_CASES)
+    modes = ["off", "on"] if mode == "all" else [mode or "off"]
+    assert checked == modes * (2 * len(bench.DEFAULT_CASES))
+    with csv_path.open() as stream:
+        rows = list(csv.DictReader(stream))
+    assert [row["wave_specialization"] for row in rows] == checked
 
 
 @pytest.mark.parametrize("ms,n,num_sm,config,expected", [

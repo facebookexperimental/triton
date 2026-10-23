@@ -2947,6 +2947,67 @@ def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
         amd_compiler.HIPOptions(arch="gfx950", sched_group_barrier_required_region_count=-1)
 
 
+def test_wave_specialization_option_cache():
+    backend = amd_compiler.HIPBackend(GFX950)
+    baseline = backend.parse_options({})
+    disabled = backend.parse_options({"enable_wave_specialization": False})
+    enabled = backend.parse_options(triton.Config({"enable_wave_specialization": True}).all_kwargs())
+    assert not baseline.enable_wave_specialization
+    assert baseline.hash() == disabled.hash()
+    assert enabled.enable_wave_specialization
+    # Config also supplies num_stages; compare otherwise identical options.
+    assert enabled.hash() != dataclasses.replace(enabled, enable_wave_specialization=False).hash()
+
+
+@triton.jit
+def _wave_specialization_exchange(x, y, n, WAVE: tl.constexpr):
+    offsets = tl.arange(0, 4 * WAVE)
+    p = (tlx.thread_id(0).to(tl.uint32) // WAVE) % 2 == 0
+    value = tl.load(x + offsets)
+    for i in range(n):
+        value = tl.where(p, value + i + 1, value - i - 1)
+        value = tl.gather(value, offsets ^ WAVE, axis=0)
+    tl.store(y + offsets, value)
+
+
+@gluon.jit
+def _wave_specialization_gluon_exchange(x, y, n, WAVE: ttgl.constexpr):
+    offsets = ttgl.arange(0, 4 * WAVE, layout=ttgl.BlockedLayout([1], [WAVE], [4], [0]))
+    p = ttgl.program_id(0) % 2 == 0
+    value = ttgl.load(x + offsets)
+    shared = ttgl.allocate_shared_memory(ttgl.int32, [4 * WAVE], ttgl.SwizzledSharedLayout(1, 1, 1, [0]))
+    for i in range(n):
+        value = ttgl.where(p, value + i + 1, value - i - 1)
+        shared.store(value)
+        value = shared.gather(offsets ^ WAVE, axis=0)
+    ttgl.store(y + offsets, value)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("language", ["tlx", "gluon"])
+def test_wave_specialization_pipeline(enabled, language, monkeypatch):
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    original = amd_compiler.HIPBackend.make_llir
+    lowered = []
+
+    def capture(src, metadata, options):
+        result = original(src, metadata, options)
+        lowered.append(str(src))
+        return result
+
+    monkeypatch.setattr(amd_compiler.HIPBackend, "make_llir", staticmethod(capture))
+    from triton.experimental.gluon._runtime import GluonASTSource
+    source_type = GluonASTSource if language == "gluon" else ASTSource
+    kernel = _wave_specialization_gluon_exchange if language == "gluon" else _wave_specialization_exchange
+    source = source_type(kernel, {"x": "*i32", "y": "*i32", "n": "i32"}, constexprs={"WAVE": 64})
+    compiled = triton_compile(source, target=GFX950, options={"enable_wave_specialization": enabled})
+    assert len(lowered) == 1
+    assert ("tritonamdgpu.wave_specialized" in lowered[0]) == enabled
+    assert compiled.metadata.enable_wave_specialization == enabled
+    assert compiled.metadata.shared > 0
+    assert "llvm.amdgcn.s.barrier" in compiled.asm["llir"]
+
+
 @pytest.mark.parametrize(
     ("sq", "skv", "supported"),
     [

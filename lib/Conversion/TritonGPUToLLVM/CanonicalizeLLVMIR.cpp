@@ -53,6 +53,53 @@ class ElideFullClusterRankMaskPattern : public OpRewritePattern<LLVM::AndOp> {
     return success();
   }
 };
+
+class BranchConstantConditionPattern : public OpRewritePattern<LLVM::CondBrOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(LLVM::CondBrOp op,
+                                PatternRewriter &b) const override {
+    BoolAttr cond;
+    if (!matchPattern(op.getCondition(), m_Constant(&cond)))
+      return failure();
+    Block *dest = cond.getValue() ? op.getTrueDest() : op.getFalseDest();
+    ValueRange args =
+        cond.getValue() ? op.getTrueDestOperands() : op.getFalseDestOperands();
+    b.replaceOpWithNewOp<LLVM::BrOp>(op, args, dest);
+    return success();
+  }
+};
+
+template <typename Op>
+class BooleanConstantPattern : public OpRewritePattern<Op> {
+  using OpRewritePattern<Op>::OpRewritePattern;
+  LogicalResult matchAndRewrite(Op op, PatternRewriter &b) const override {
+    if (!op.getType().isInteger(1))
+      return failure();
+    for (unsigned i = 0; i != 2; ++i) {
+      BoolAttr constant;
+      if (!matchPattern(op->getOperand(i), m_Constant(&constant)))
+        continue;
+      bool value = constant.getValue();
+      if constexpr (std::is_same_v<Op, LLVM::AndOp>) {
+        b.replaceOp(op, op->getOperand(value ? 1 - i : i));
+      } else if constexpr (std::is_same_v<Op, LLVM::OrOp>) {
+        b.replaceOp(op, op->getOperand(value ? i : 1 - i));
+      } else {
+        if (value) {
+          BoolAttr other;
+          if (!matchPattern(op->getOperand(1 - i), m_Constant(&other)))
+            continue;
+          b.replaceOpWithNewOp<LLVM::ConstantOp>(
+              op, b.getI1Type(), b.getBoolAttr(!other.getValue()));
+        } else {
+          b.replaceOp(op, op->getOperand(1 - i));
+        }
+      }
+      return success();
+    }
+    return failure();
+  }
+};
 } // namespace
 
 namespace {
@@ -62,9 +109,11 @@ struct CanonicalizeLLVMIR
   void runOnOperation() override {
     LLVM::LLVMFuncOp func = getOperation();
     RewritePatternSet patterns(&getContext());
-    patterns
-        .add<SelectConstantConditionPattern, ElideFullClusterRankMaskPattern>(
-            &getContext());
+    patterns.add<
+        SelectConstantConditionPattern, ElideFullClusterRankMaskPattern,
+        BranchConstantConditionPattern, BooleanConstantPattern<LLVM::AndOp>,
+        BooleanConstantPattern<LLVM::OrOp>,
+        BooleanConstantPattern<LLVM::XOrOp>>(&getContext());
 
     getContext()
         .getLoadedDialect<LLVM::LLVMDialect>()

@@ -7,6 +7,8 @@ add_triton_library(TritonAnalysis
   Alias.cpp
   Utility.cpp
   ReductionOrder.cpp
+  Uniformity.cpp
+  IntegerRange.cpp
 
   DEPENDS
   TritonTableGen
@@ -18,7 +20,17 @@ add_triton_library(TritonAnalysis
 
   LINK_LIBS PUBLIC
   MLIRAnalysis
+  MLIRArithDialect
+  MLIRControlFlowDialect
+  MLIRGPUDialect
+  MLIRIndexDialect
+  MLIRInferIntRangeCommon
+  MLIRInferIntRangeInterface
   MLIRLLVMDialect
+  MLIRMathDialect
+  MLIRROCDLDialect
+  MLIRSCFDialect
+  MLIRVectorDialect
   TritonIR
   TritonGPUIR
   GluonIR

@@ -68,6 +68,8 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
         });
   ADD_PASS_WRAPPER_0("add_finalize_scheduled_mfma_operands",
                      mlir::triton::createFinalizeScheduledMfmaOperandsPass);
+  ADD_PASS_WRAPPER_0("add_automatic_wave_specialization",
+                     mlir::createTritonAMDGPUAutomaticWaveSpecialization);
   ADD_PASS_OPTION_WRAPPER_1("add_allocate_shared_memory",
                             mlir::triton::createAllocateAMDGPUSharedMemoryPass,
                             const std::string &);

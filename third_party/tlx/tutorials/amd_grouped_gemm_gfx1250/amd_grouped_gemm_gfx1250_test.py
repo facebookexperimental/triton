@@ -1244,6 +1244,7 @@ def grouped_gemm_tdm(
     xcd_chunk: int = 2,
     cluster_size: int = 1,
     cluster_multicast: bool = True,
+    enable_wave_specialization: bool = False,
 ) -> torch.Tensor:
     """Compute packed ragged-M grouped GEMM with gfx1250 TDM.
 
@@ -1365,6 +1366,7 @@ def grouped_gemm_tdm(
             XCD_CHUNK=xcd_chunk,
             CLUSTER_SIZE=cluster_size,
             CLUSTER_MULTICAST=cluster_multicast,
+            enable_wave_specialization=enable_wave_specialization,
             num_warps=4,
             waves_per_eu=1,
             enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
@@ -1469,6 +1471,7 @@ def grouped_gemm_tdm_list(
     xcd_chunk: int = 2,
     cluster_size: int = 1,
     cluster_multicast: bool = True,
+    enable_wave_specialization: bool = False,
 ) -> list[torch.Tensor]:
     """Compute FP16 A[g] @ B[g] using the optimized TDM list kernel.
 
@@ -1552,6 +1555,7 @@ def grouped_gemm_tdm_list(
             CLUSTER_SIZE=cluster_size,
             CLUSTER_MULTICAST=cluster_multicast,
             ALLOW_MN_TAILS=allow_mn_tails,
+            enable_wave_specialization=enable_wave_specialization,
             num_warps=4,
             waves_per_eu=1,
             enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
@@ -2220,6 +2224,8 @@ if __name__ == "__main__":
     parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share inputs within a cluster; disable for a synchronization-only control")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
+    parser.add_argument("--wave_specialization", choices=("off", "on"), default="off",
+                        help="enable automatic wave specialization")
     parser.add_argument("--benchmark_num_iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)
@@ -2248,6 +2254,7 @@ if __name__ == "__main__":
               f"cross_tile_prefetch={selected['cross_tile_prefetch']}")
 
     benchmark = None if args.benchmark_mode == "none" else args.benchmark_mode
+    print(f"wave specialization: {args.wave_specialization}")
     launch_options = dict(
         block_m=args.BM,
         block_n=args.BN,
@@ -2264,6 +2271,7 @@ if __name__ == "__main__":
         xcd_chunk=args.xcd_chunk,
         cluster_size=args.cluster_size,
         cluster_multicast=args.cluster_multicast,
+        enable_wave_specialization=args.wave_specialization != "off",
         benchmark=benchmark,
         benchmark_num_iters=args.benchmark_num_iters,
     )

@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
+// RUN: triton-opt %s -test-uniformity -split-input-file -o /dev/null
 
 tt.func @cast() {
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = 1}}
@@ -1571,4 +1572,604 @@ tt.func @negative_constants() {
   // expected-remark @below {{contiguity = [1], divisibility = [8], constancy = [128], constant_value = 8}}
   %sum = arith.addi %neg8_dense, %sixteen : tensor<128xi32>
   tt.return
+}
+
+// -----
+// Uniformity of per-thread common-dialect values, independent of AxisInfo.
+module attributes {"ttg.threads-per-warp" = 32 : i32} {
+  func.func @uniformity_thread_id_transfers(%u: i32)
+      attributes {test.uniform_arguments = [true], test.linear_thread_id_x} {
+    %tid = rocdl.workitem.id.x {test.uniform = false} : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c3 = arith.constant 3 : i32
+    %c4 = arith.constant 4 : i32
+    %c5 = arith.constant 5 : i32
+    %c7 = arith.constant 7 : i32
+    %c16 = arith.constant 16 : i32
+    %c32 = arith.constant 32 : i32
+    %c64 = arith.constant 64 : i32
+    %clear = arith.constant -32 : i32
+    // Partial reductions compose across arith and LLVM operations.
+    %quarter = arith.divui %tid, %c4 {test.uniform = false} : i32
+    %wave = llvm.lshr %quarter, %c3 {test.uniform = true} : i32
+    %larger = arith.divui %tid, %c64 {test.uniform = true} : i32
+    %masked = llvm.and %c7, %tid {test.uniform = false} : i32
+    %masked_wave = arith.shrui %masked, %c3 {test.uniform = true} : i32
+    %upper = arith.andi %tid, %clear {test.uniform = true} : i32
+    %zero = llvm.and %tid, %c0 {test.uniform = true} : i32
+    // One remaining varying bit is not the same as a low-bit bound of one.
+    %sparse = arith.andi %tid, %c16 {test.uniform = false} : i32
+    %still_sparse = llvm.lshr %sparse, %c1 {test.uniform = false} : i32
+    %sparse_uniform = llvm.lshr %sparse, %c5 {test.uniform = true} : i32
+    // Unsupported arithmetic destroys the bound permanently.
+    %add = arith.addi %tid, %c1 : i32
+    %add_div = llvm.udiv %add, %c32 {test.uniform = false} : i32
+    %bad_divisor = llvm.udiv %tid, %c3 : i32
+    %bad_divisor_shift = arith.shrui %bad_divisor, %c5 {test.uniform = false} : i32
+    %signed = arith.divsi %tid, %c32 {test.uniform = false} : i32
+    %dynamic = arith.divui %tid, %u {test.uniform = false} : i32
+    %invalid_shift = llvm.lshr %tid, %c32 {test.uniform = false} : i32
+    %ty = rocdl.workitem.id.y : i32
+    %ty_div = llvm.udiv %ty, %c32 {test.uniform = false} : i32
+    // Once uniform, ordinary arithmetic preserves the fact.
+    %sum = arith.addi %wave, %u {test.uniform = true} : i32
+    %pred = arith.cmpi eq, %sum, %u {test.uniform = true} : i32
+    return
+  }
+
+  func.func @uniformity_thread_id_joins(%p: i1, %q: i1)
+      attributes {test.uniform_arguments = [true, false], test.linear_thread_id_x} {
+    %tid = rocdl.workitem.id.x : i32
+    %c7 = arith.constant 7 : i32
+    %c3 = arith.constant 3 : i32
+    %c5 = arith.constant 5 : i32
+    %low = arith.andi %tid, %c7 : i32
+    cf.cond_br %p, ^left, ^right
+  ^left:
+    cf.br ^merge(%tid : i32)
+  ^right:
+    cf.br ^merge(%low : i32)
+  ^merge(%v: i32):
+    // A join keeps the larger bound, and SCF forwarding preserves it.
+    %partial = arith.shrui %v, %c3 {test.uniform = false} : i32
+    %wave = arith.shrui %v, %c5 {test.uniform = true} : i32
+    %same = scf.if %q -> i32 {
+      scf.yield %tid : i32
+    } else {
+      scf.yield %tid : i32
+    }
+    %same_wave = arith.shrui %same, %c5 {test.uniform = true} : i32
+    %different = scf.if %q -> i32 {
+      scf.yield %tid : i32
+    } else {
+      scf.yield %low : i32
+    }
+    %different_wave = arith.shrui %different, %c5 {test.uniform = false} : i32
+    return
+  }
+
+  func.func @uniformity_thread_id_switch()
+      attributes {test.uniform_arguments = [], test.linear_thread_id_x} {
+    %tid = rocdl.workitem.id.x : i32
+    %c0 = arith.constant 0 : i32
+    %c32 = arith.constant 32 : i32
+    %c64 = arith.constant 64 : i32
+    // Distinct uniform values selected by a ThreadId control are divergent.
+    cf.switch %tid : i32, [
+      default: ^merge(%c64 : i32),
+      0: ^merge(%c0 : i32)
+    ]
+  ^merge(%selected: i32):
+    %selected_wave = arith.divui %selected, %c32 {test.uniform = false} : i32
+    return
+  }
+
+  func.func @uniformity_thread_id_index()
+      attributes {test.uniform_arguments = [], test.linear_thread_id_x} {
+    %tid = gpu.thread_id x
+    %lane = gpu.lane_id
+    %c0 = index.constant 0
+    %c1 = index.constant 1
+    %c3 = index.constant 3
+    %c4 = index.constant 4
+    %c5 = index.constant 5
+    %c7 = index.constant 7
+    %c32 = index.constant 32
+    %c64 = index.constant 64
+    %part = index.divu %tid, %c4 {test.uniform = false}
+    %wave = index.shru %part, %c3 {test.uniform = true}
+    %low = index.and %lane, %c7 {test.uniform = false}
+    %cleared = index.shru %low, %c3 {test.uniform = true}
+    // A ThreadId selector is divergent, even though it is not Unknown.
+    %selected = scf.index_switch %lane -> index
+    case 0 {
+      scf.yield %c0 : index
+    }
+    default {
+      scf.yield %c64 : index
+    }
+    %selected_wave = index.divu %selected, %c32 {test.uniform = false}
+    // Induction arithmetic cannot retain a ThreadId bound.
+    scf.for %i = %lane to %c64 step %c1 {
+      %induction_wave = index.shru %i, %c5 {test.uniform = false}
+    }
+    return
+  }
+
+  func.func @uniformity_thread_id_requires_linear_x()
+      attributes {test.uniform_arguments = []} {
+    %tid = rocdl.workitem.id.x : i32
+    %c32 = arith.constant 32 : i32
+    %unknown = arith.divui %tid, %c32 {test.uniform = false} : i32
+    %lane = gpu.lane_id
+    %c5 = index.constant 5
+    %uniform = index.shru %lane, %c5 {test.uniform = true}
+    return
+  }
+}
+
+// -----
+module attributes {"ttg.threads-per-warp" = 64 : i32} {
+  func.func @uniformity_thread_id_wave64()
+      attributes {test.uniform_arguments = [], test.linear_thread_id_x} {
+    %tid = rocdl.workitem.id.x : i32
+    %c32 = arith.constant 32 : i32
+    %c2 = arith.constant 2 : i32
+    %half = llvm.udiv %tid, %c32 {test.uniform = false} : i32
+    %wave = llvm.udiv %half, %c2 {test.uniform = true} : i32
+    return
+  }
+}
+
+// -----
+func.func @uniformity_thread_id_missing_size()
+    attributes {test.uniform_arguments = [], test.linear_thread_id_x} {
+  %tid = rocdl.workitem.id.x : i32
+  %c32 = arith.constant 32 : i32
+  %wave = llvm.udiv %tid, %c32 {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func @uniformity_arithmetic(%u: i32, %v: i32, %p: i1)
+    attributes {test.uniform_arguments = [true, false, false]} {
+  %one = arith.constant 1 : i32
+  %a = arith.addi %u, %one {test.uniform = true} : i32
+  %b = arith.addi %v, %a {test.uniform = false} : i32
+  %c = arith.cmpi slt, %b, %a {test.uniform = false} : i32
+  %d = arith.select %p, %a, %a {test.uniform = true} : i32
+  %e = arith.select %p, %a, %b {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func @uniformity_diamond(%p: i1, %u: i32)
+    attributes {test.uniform_arguments = [false, true]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  cf.cond_br %p, ^left, ^right
+^left:
+  cf.br ^merge(%zero : i32)
+^right:
+  cf.br ^merge(%one : i32)
+^merge(%x: i32):
+  %r = arith.addi %x, %u {test.uniform = false} : i32
+  // The basic CFG analysis does not track reconvergence: a later join remains
+  // conservative even though its immediate branch condition is uniform.
+  %q = arith.cmpi slt, %u, %zero : i32
+  cf.cond_br %q, ^a, ^b
+^a:
+  cf.br ^end(%zero : i32)
+^b:
+  cf.br ^end(%one : i32)
+^end(%y: i32):
+  %s = arith.addi %y, %u {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func @uniformity_same_incoming(%p: i1, %u: i32)
+    attributes {test.uniform_arguments = [false, true]} {
+  cf.cond_br %p, ^left, ^right
+^left:
+  cf.br ^merge(%u : i32)
+^right:
+  cf.br ^merge(%u : i32)
+^merge(%x: i32):
+  %r = arith.addi %x, %u {test.uniform = true} : i32
+  return
+}
+
+// -----
+// Different edges from the same predecessor still select different values.
+func.func @uniformity_duplicate_edges(%p: i1)
+    attributes {test.uniform_arguments = [false]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  cf.cond_br %p, ^merge(%zero : i32), ^merge(%one : i32)
+^merge(%x: i32):
+  %r = arith.addi %x, %one {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func @uniformity_structured_if(%p: i1, %q: i1, %u: i32)
+    attributes {test.uniform_arguments = [false, true, true]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %x = scf.if %p -> i32 {
+    scf.yield %zero : i32
+  } else {
+    scf.yield %one : i32
+  } {test.uniform = false}
+  %y = scf.if %q -> i32 {
+    scf.yield %zero : i32
+  } else {
+    scf.yield %one : i32
+  } {test.uniform = true}
+  %z = arith.addi %x, %y {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func private @uniformity_sink(index)
+func.func @uniformity_for(%n: index)
+    attributes {test.uniform_arguments = [true]} {
+  %zero = arith.constant 0 : index
+  %one = arith.constant 1 : index
+  %r = scf.for %i = %zero to %n step %one iter_args(%s = %zero) -> index {
+    func.call @uniformity_sink(%i) {test.uniform_operands = [true]} : (index) -> ()
+    %next = arith.addi %s, %i {test.uniform = true} : index
+    scf.yield %next : index
+  } {test.uniform = true}
+  return
+}
+
+// -----
+func.func private @uniformity_sink(index)
+func.func @uniformity_divergent_for(%n: index)
+    attributes {test.uniform_arguments = [false]} {
+  %zero = arith.constant 0 : index
+  %one = arith.constant 1 : index
+  %r = scf.for %i = %zero to %n step %one iter_args(%s = %zero) -> index {
+    // The IV is uniform at each iteration despite different exit iterations.
+    func.call @uniformity_sink(%i) {test.uniform_operands = [true]} : (index) -> ()
+    %next = arith.addi %s, %one {test.uniform = true} : index
+    scf.yield %next : index
+  } {test.uniform = false}
+  func.call @uniformity_sink(%r) {test.uniform_operands = [false]} : (index) -> ()
+  return
+}
+
+// -----
+func.func private @uniformity_sink(i32)
+func.func @uniformity_temporal_use(%n: i32)
+    attributes {test.uniform_arguments = [false]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  cf.br ^header(%zero : i32)
+^header(%i: i32):
+  // CFG recurrences are conservative when any branch in the region varies.
+  %v = arith.addi %i, %one {test.uniform = false} : i32
+  func.call @uniformity_sink(%v) {test.uniform_operands = [false]} : (i32) -> ()
+  // An explicit broadcast is uniform at its definition. Its observation after
+  // the loop still needs the cross-block check, even without an exit argument.
+  %wave = rocdl.readfirstlane %v {test.uniform = true} : i32
+  func.call @uniformity_sink(%wave) {test.uniform_operands = [true]} : (i32) -> ()
+  %p = arith.cmpi slt, %i, %n : i32
+  cf.cond_br %p, ^latch, ^exit
+^latch:
+  cf.br ^header(%v : i32)
+^exit:
+  // No phi here: the same SSA definition is observed at different iterations.
+  func.call @uniformity_sink(%v) {test.uniform_operands = [false]} : (i32) -> ()
+  func.call @uniformity_sink(%wave) {test.uniform_operands = [false]} : (i32) -> ()
+  %r = arith.addi %v, %one {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func @uniformity_while(%n: i32)
+    attributes {test.uniform_arguments = [true]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %r = scf.while (%i = %zero) : (i32) -> i32 {
+    %p = arith.cmpi slt, %i, %n : i32
+    scf.condition(%p) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %next = arith.addi %i, %one {test.uniform = true} : i32
+    scf.yield %next : i32
+  } attributes {test.uniform = true}
+  return
+}
+
+// -----
+func.func @uniformity_dead_edge(%v: i32)
+    attributes {test.uniform_arguments = [false]} {
+  %false = arith.constant false
+  %one = arith.constant 1 : i32
+  cf.cond_br %false, ^dead, ^live
+^dead:
+  cf.br ^end(%v : i32)
+^live:
+  cf.br ^end(%one : i32)
+^end(%x: i32):
+  %r = arith.addi %x, %one {test.uniform = true} : i32
+  return
+}
+
+// -----
+func.func private @uniformity_unknown(i32) -> i32
+func.func @uniformity_unknown_call(%u: i32)
+    attributes {test.uniform_arguments = [true]} {
+  %x = func.call @uniformity_unknown(%u) {test.uniform = false} : (i32) -> i32
+  %y = arith.addi %x, %u {test.uniform = false} : i32
+  %z = func.call @uniformity_unknown(%x) {test.uniform_model, test.uniform = true} : (i32) -> i32
+  return
+}
+
+// -----
+func.func @uniformity_irreducible(%p: i1, %q: i1, %u: i32)
+    attributes {test.uniform_arguments = [false, true, true]} {
+  %one = arith.constant 1 : i32
+  cf.cond_br %p, ^a(%u : i32), ^b(%one : i32)
+^a(%x: i32):
+  %v = arith.addi %x, %one {test.uniform = false} : i32
+  cf.cond_br %q, ^b(%v : i32), ^exit
+^b(%y: i32):
+  %w = arith.addi %y, %one {test.uniform = false} : i32
+  cf.cond_br %p, ^a(%w : i32), ^exit
+^exit:
+  return
+}
+
+// -----
+llvm.func @uniformity_llvm(%p: i1, %u: i32)
+    attributes {test.uniform_arguments = [false, true]} {
+  %zero = llvm.mlir.constant(0 : i32) : i32
+  %same = llvm.select %p, %u, %u {test.uniform = true} : i1, i32
+  %different = llvm.select %p, %u, %zero {test.uniform = false} : i1, i32
+  llvm.cond_br %p, ^a, ^b
+^a:
+  llvm.br ^merge(%u : i32)
+^b:
+  llvm.br ^merge(%zero : i32)
+^merge(%x: i32):
+  %r = llvm.add %x, %u {test.uniform = false} : i32
+  llvm.return
+}
+
+// -----
+func.func @uniformity_gpu_seeds() attributes {test.uniform_arguments = []} {
+  %tid = gpu.thread_id x {test.uniform = false}
+  %bid = gpu.block_id x {test.uniform = true}
+  %bdim = gpu.block_dim x {test.uniform = true}
+  %gdim = gpu.grid_dim x {test.uniform = true}
+  %sid = gpu.subgroup_id {test.uniform = true} : index
+  %size = gpu.subgroup_size {test.uniform = true} : index
+  %r = arith.addi %sid, %size {test.uniform = true} : index
+  %t = arith.index_cast %tid : index to i32
+  %first = rocdl.readfirstlane %t {test.uniform = true} : i32
+  %wave = rocdl.wave.id {test.uniform = true} : i32
+  %bx = rocdl.workgroup.id.x {test.uniform = true} : i32
+  %by = rocdl.workgroup.id.y {test.uniform = true} : i32
+  %bz = rocdl.workgroup.id.z {test.uniform = true} : i32
+  %tx = rocdl.workitem.id.x {test.uniform = false} : i32
+  %ty = rocdl.workitem.id.y {test.uniform = false} : i32
+  %tz = rocdl.workitem.id.z {test.uniform = false} : i32
+  %zero = arith.constant 0 : i32
+  %lane = rocdl.readlane %t, %zero {test.uniform = true} : (i32, i32) -> i32
+  return
+}
+
+// -----
+func.func @uniformity_vector_math(%u: f32, %v: f32)
+    attributes {test.uniform_arguments = [true, false]} {
+  %a = math.exp %u {test.uniform = true} : f32
+  %b = math.exp %v {test.uniform = false} : f32
+  %x = vector.broadcast %a {test.uniform = true} : f32 to vector<4xf32>
+  %y = vector.broadcast %b {test.uniform = false} : f32 to vector<4xf32>
+  %z = arith.addf %x, %y {test.uniform = false} : vector<4xf32>
+  return
+}
+
+// -----
+func.func @uniformity_memory(%ptr: memref<4xi32>)
+    attributes {test.uniform_arguments = [true]} {
+  %zero = arith.constant 0 : index
+  %x = memref.load %ptr[%zero] {test.uniform = false} : memref<4xi32>
+  %y = arith.addi %x, %x {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func @uniformity_execute_region(%p: i1)
+    attributes {test.uniform_arguments = [false]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %r = scf.execute_region -> i32 {
+    cf.cond_br %p, ^a, ^b
+  ^a:
+    scf.yield %zero : i32
+  ^b:
+    scf.yield %one : i32
+  }
+  %x = arith.addi %r, %one {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func @uniformity_nested_loops(%n: index, %m: index)
+    attributes {test.uniform_arguments = [true, false]} {
+  %zero = arith.constant 0 : index
+  %one = arith.constant 1 : index
+  %r = scf.for %i = %zero to %n step %one iter_args(%acc = %zero) -> index {
+    %s = scf.for %j = %zero to %m step %one iter_args(%v = %zero) -> index {
+      %next = arith.addi %v, %one {test.uniform = true} : index
+      scf.yield %next : index
+    } {test.uniform = false}
+    %outer_iv = arith.addi %i, %one {test.uniform = true} : index
+    %next_acc = arith.addi %acc, %s {test.uniform = false} : index
+    scf.yield %next_acc : index
+  } {test.uniform = false}
+  return
+}
+
+// -----
+// Unsupported concurrent regions do not inherit sequential SCF semantics.
+func.func @uniformity_parallel() attributes {test.uniform_arguments = []} {
+  %zero = arith.constant 0 : index
+  %one = arith.constant 1 : index
+  %four = arith.constant 4 : index
+  scf.parallel (%i) = (%zero) to (%four) step (%one) {
+    %v = arith.addi %i, %one {test.uniform = false} : index
+    scf.reduce
+  }
+  return
+}
+
+// -----
+llvm.func @uniformity_undef() attributes {test.uniform_arguments = []} {
+  %zero = llvm.mlir.zero {test.uniform = true} : !llvm.ptr
+  %u = llvm.mlir.undef {test.uniform = false} : i32
+  %f = llvm.freeze %u {test.uniform = false} : i32
+  %p = llvm.mlir.poison {test.uniform = false} : i32
+  llvm.return
+}
+
+// -----
+// A uniform branch can obscure a join reached from a divergent branch.
+func.func @uniformity_hidden_join(%p: i1, %q: i1)
+    attributes {test.uniform_arguments = [false, true]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  cf.cond_br %p, ^a, ^b(%zero : i32)
+^a:
+  cf.cond_br %q, ^b(%one : i32), ^exit(%zero : i32)
+^b(%x: i32):
+  %v = arith.addi %x, %one {test.uniform = false} : i32
+  cf.br ^exit(%one : i32)
+^exit(%y: i32):
+  %w = arith.addi %y, %one {test.uniform = false} : i32
+  return
+}
+
+// -----
+// Multi-exit loops can hide the eventual divergent join behind uniform exits.
+func.func @uniformity_hidden_loop_join(%p: i1, %q: i1)
+    attributes {test.uniform_arguments = [false, true]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  cf.br ^header
+^header:
+  cf.cond_br %p, ^a, ^b
+^a:
+  cf.br ^c
+^b:
+  cf.br ^c
+^c:
+  cf.cond_br %q, ^e, ^d
+^d:
+  cf.cond_br %p, ^header, ^f
+^e:
+  cf.br ^exit(%zero : i32)
+^f:
+  cf.br ^exit(%one : i32)
+^exit(%x: i32):
+  %r = arith.addi %x, %one {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func @uniformity_nested_irreducible(%p: i1, %n: index)
+    attributes {test.uniform_arguments = [false, true]} {
+  %zero = arith.constant 0 : index
+  %one = arith.constant 1 : index
+  scf.for %i = %zero to %n step %one {
+    %r = scf.execute_region -> index {
+      cf.cond_br %p, ^a(%zero : index), ^b(%one : index)
+    ^a(%x: index):
+      %v = arith.addi %x, %one {test.uniform = false} : index
+      %c = arith.cmpi slt, %v, %n : index
+      cf.cond_br %c, ^b(%v : index), ^exit(%v : index)
+    ^b(%y: index):
+      %w = arith.addi %y, %one {test.uniform = false} : index
+      cf.cond_br %p, ^a(%w : index), ^exit(%w : index)
+    ^exit(%z: index):
+      scf.yield %z : index
+    }
+    %unknown = arith.addi %r, %one {test.uniform = false} : index
+    %uniform = arith.addi %i, %one {test.uniform = true} : index
+  }
+  return
+}
+
+// -----
+func.func @uniformity_index_switch(%p: index)
+    attributes {test.uniform_arguments = [false]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %r = scf.index_switch %p -> i32
+  case 0 {
+    scf.yield %zero : i32
+  }
+  default {
+    scf.yield %one : i32
+  }
+  %v = arith.addi %r, %one {test.uniform = false} : i32
+  return
+}
+
+// -----
+// Uniform decisions allow distinct incoming uniform values, including a CFG
+// recurrence. The solver, rather than a custom iteration loop, finds the fixpoint.
+func.func @uniformity_uniform_cfg(%p: i1, %n: i32)
+    attributes {test.uniform_arguments = [true, true]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  cf.cond_br %p, ^left, ^right
+^left:
+  cf.br ^merge(%zero : i32)
+^right:
+  cf.br ^merge(%one : i32)
+^merge(%x: i32):
+  %v = arith.addi %x, %one {test.uniform = true} : i32
+  cf.br ^header(%v : i32)
+^header(%i: i32):
+  %next = arith.addi %i, %one {test.uniform = true} : i32
+  %q = arith.cmpi slt, %next, %n {test.uniform = true} : i32
+  cf.cond_br %q, ^header(%next : i32), ^exit
+^exit:
+  %r = arith.addi %next, %one {test.uniform = true} : i32
+  return
+}
+
+// -----
+func.func @uniformity_divergent_while(%n: i32)
+    attributes {test.uniform_arguments = [false]} {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  %r = scf.while (%i = %zero) : (i32) -> i32 {
+    %p = arith.cmpi slt, %i, %n : i32
+    scf.condition(%p) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %next = arith.addi %i, %one {test.uniform = true} : i32
+    scf.yield %next : i32
+  } attributes {test.uniform = false}
+  %use = arith.addi %r, %one {test.uniform = false} : i32
+  return
+}
+
+// -----
+func.func @uniformity_same_structured_incoming(%p: i1, %u: i32)
+    attributes {test.uniform_arguments = [false, true]} {
+  %r = scf.if %p -> i32 {
+    scf.yield %u : i32
+  } else {
+    scf.yield %u : i32
+  } {test.uniform = true}
+  return
 }

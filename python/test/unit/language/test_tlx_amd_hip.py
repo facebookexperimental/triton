@@ -7,6 +7,9 @@ compile-only siblings that build an ASTSource directly need no driver and live
 in test_tlx_codegen.py.
 """
 import re
+import os
+import subprocess
+import sys
 import pytest
 import torch
 import triton
@@ -41,6 +44,58 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 
 GFX950 = GPUTarget("hip", "gfx950", 64)
+
+
+@triton.jit
+def _wave_specialization_cross_wave_kernel(x, y, n, WAVE: tl.constexpr):
+    offsets = tl.arange(0, 4 * WAVE)
+    p = (tlx.thread_id(0).to(tl.uint32) // WAVE) % 2 == 0
+    value = tl.load(x + offsets)
+    for i in range(n):
+        value = tl.where(p, value + i + 1, value - i - 1)
+        value = tl.gather(value, offsets ^ WAVE, axis=0)
+    tl.store(y + offsets, value)
+
+
+def test_wave_specialization_cross_wave():
+    # Bound execution of a synchronization regression in a separate process.
+    worker = "TRITON_TEST_WAVE_SPECIALIZATION_WORKER"
+    if os.environ.get(worker) != "1":
+        env = dict(os.environ, **{worker: "1"})
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-s", "--tb=short", f"{__file__}::test_wave_specialization_cross_wave"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
+    wave = triton.runtime.driver.active.get_current_target().warp_size
+    offsets = torch.arange(4 * wave, device="cuda", dtype=torch.int32)
+    x = offsets * 3 + 11
+    p = (offsets // wave) % 2 == 0
+    permutation = (offsets ^ wave).long()
+    for n in (1, 2, 7):
+        expected = x.clone()
+        for i in range(n):
+            expected = torch.where(p, expected + i + 1, expected - i - 1)[permutation]
+        shared_sizes = []
+        for enabled in (False, True):
+            y = torch.empty_like(x)
+            kernel = _wave_specialization_cross_wave_kernel[(1, )](
+                x,
+                y,
+                n,
+                WAVE=wave,
+                num_warps=4,
+                enable_wave_specialization=enabled,
+            )
+            torch.testing.assert_close(y, expected, rtol=0, atol=0)
+            assert kernel.metadata.shared > 0
+            assert kernel.metadata.enable_wave_specialization == enabled
+            shared_sizes.append(kernel.metadata.shared)
+        assert shared_sizes[0] == shared_sizes[1]
 
 
 def compile_for_target(fn, signature, constexprs, target):
