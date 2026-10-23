@@ -63,8 +63,8 @@ def matmul_kernel_warp_pipeline(
     tl.assume(stride_bk > 0)
 
     if (M > 0) & (N > 0):
-        index_m = M.to(tl.uint64)
-        index_n = N.to(tl.uint64)
+        index_m = tl.cast(M, tl.uint64)
+        index_n = tl.cast(N, tl.uint64)
         pid = tl.program_id(0).to(tl.uint64)
         num_pid_m = tl.cdiv(index_m, BLOCK_M)
         num_pid_n = tl.cdiv(index_n, BLOCK_N)

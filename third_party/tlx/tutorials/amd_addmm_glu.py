@@ -146,8 +146,8 @@ def tlx_addmm_glu_kernel_optimized(
 
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
-    index_m = M.to(tl.uint64)
-    index_n = N.to(tl.uint64)
+    index_m = tl.cast(M, tl.uint64)
+    index_n = tl.cast(N, tl.uint64)
     pid = tl.program_id(axis=0).to(tl.uint64)
 
     # Num pids along M dim
@@ -394,8 +394,8 @@ def tlx_addmm_glu_kernel_optimized_async(
 
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
-    index_m = M.to(tl.uint64)
-    index_n = N.to(tl.uint64)
+    index_m = tl.cast(M, tl.uint64)
+    index_n = tl.cast(N, tl.uint64)
     pid = tl.program_id(axis=0).to(tl.uint64)
 
     # Num pids along M dim
@@ -624,8 +624,8 @@ def tlx_addmm_glu_kernel_simple_async(
 
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
-    index_m = M.to(tl.uint64)
-    index_n = N.to(tl.uint64)
+    index_m = tl.cast(M, tl.uint64)
+    index_n = tl.cast(N, tl.uint64)
     pid = tl.program_id(axis=0).to(tl.uint64)
     num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(index_n, BLOCK_SIZE_N)
@@ -720,8 +720,8 @@ def tlx_addmm_glu_kernel_persistent(
 
     # Launcher skips empty matrices; tile coordinates must not wrap in i32.
     tl.assume((M > 0) & (N > 0))
-    index_m = M.to(tl.uint64)
-    index_n = N.to(tl.uint64)
+    index_m = tl.cast(M, tl.uint64)
+    index_n = tl.cast(N, tl.uint64)
     start_pid = tl.program_id(axis=0).to(tl.uint64)
 
     num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)

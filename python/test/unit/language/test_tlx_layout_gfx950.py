@@ -69,7 +69,7 @@ def split_k_tutorial():
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 @pytest.mark.parametrize("method", ["stock_triton_matmul", "skinny_atomic_matmul", "skinny_twopass_matmul"])
-@pytest.mark.parametrize("m,n", [(64, 96), (288, 160), (0, 32), (32, 0)])
+@pytest.mark.parametrize("m,n", [(64, 96), (288, 160), (1, 32), (32, 1), (1, 1), (0, 32), (32, 0)])
 def test_split_k_grouped_coordinates(split_k_tutorial, method, m, n):
     a = torch.randn((m, 256), device=DEVICE, dtype=torch.float16) * 0.2
     b = torch.randn((256, n), device=DEVICE, dtype=torch.float16) * 0.2
@@ -78,7 +78,7 @@ def test_split_k_grouped_coordinates(split_k_tutorial, method, m, n):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("m,n", [(256, 256), (768, 1280), (0, 256), (256, 0), (-1, 256)])
+@pytest.mark.parametrize("m,n", [(256, 256), (768, 1280), (1, 256), (256, 1), (1, 1), (0, 256), (256, 0), (-1, 256)])
 def test_grouped_gemm_ignores_outside_tiles(m, n):
     k = 256
     a = torch.randn((max(m, 1), k), device=DEVICE, dtype=torch.float16) * 0.2
