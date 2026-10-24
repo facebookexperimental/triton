@@ -6,31 +6,31 @@
 // matched by its NAME location (q/k/do/qk_trans/dq/dk/...) alongside its
 // loop.stage/loop.cluster, across the top-4 picks.
 
-// RUN: STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
+// RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
 // RUN:   TRITON_MODULO_TOPK=5 TRITON_MODULO_PICK=1 \
 // RUN:   triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=CONTRACTED \
 // RUN:       --implicit-check-not=tt.autows --implicit-check-not=tt.modulo_ii --implicit-check-not=ttg.partition
 
-// RUN: STANDALONE_MODULO=1 STANDALONE_MODULO_MAX_STAGE_DIFF=2 \
+// RUN: env STANDALONE_MODULO=1 STANDALONE_MODULO_MAX_STAGE_DIFF=2 \
 // RUN:   TRITON_USE_MODULO_SCHEDULE=exhaustive TRITON_MODULO_TOPK=4 TRITON_MODULO_PICK=0 \
 // RUN:   triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=P0 \
 // RUN:       --implicit-check-not=tt.autows --implicit-check-not=tt.modulo_ii --implicit-check-not=ttg.partition
 
-// RUN: STANDALONE_MODULO=1 STANDALONE_MODULO_MAX_STAGE_DIFF=2 \
+// RUN: env STANDALONE_MODULO=1 STANDALONE_MODULO_MAX_STAGE_DIFF=2 \
 // RUN:   TRITON_USE_MODULO_SCHEDULE=exhaustive TRITON_MODULO_TOPK=4 TRITON_MODULO_PICK=1 \
 // RUN:   triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=P1 \
 // RUN:       --implicit-check-not=tt.autows --implicit-check-not=tt.modulo_ii --implicit-check-not=ttg.partition
 
-// RUN: STANDALONE_MODULO=1 STANDALONE_MODULO_MAX_STAGE_DIFF=2 \
+// RUN: env STANDALONE_MODULO=1 STANDALONE_MODULO_MAX_STAGE_DIFF=2 \
 // RUN:   TRITON_USE_MODULO_SCHEDULE=exhaustive TRITON_MODULO_TOPK=4 TRITON_MODULO_PICK=2 \
 // RUN:   triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=P2 \
 // RUN:       --implicit-check-not=tt.autows --implicit-check-not=tt.modulo_ii --implicit-check-not=ttg.partition
 
-// RUN: STANDALONE_MODULO=1 STANDALONE_MODULO_MAX_STAGE_DIFF=2 \
+// RUN: env STANDALONE_MODULO=1 STANDALONE_MODULO_MAX_STAGE_DIFF=2 \
 // RUN:   TRITON_USE_MODULO_SCHEDULE=exhaustive TRITON_MODULO_TOPK=4 TRITON_MODULO_PICK=3 \
 // RUN:   triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=P3 \

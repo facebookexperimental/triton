@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448" | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448" | FileCheck %s
 
 // Case 3 (graceful reject): the persistent scf.while's tile counter is claimed
 // by a NON-scalar (scatter) tt.atomic_rmw replicated across partitions. AutoWS

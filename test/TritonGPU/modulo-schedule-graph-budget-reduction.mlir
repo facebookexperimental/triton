@@ -1,5 +1,5 @@
-// RUN: TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule="print-schedule-graph" 2>&1 | FileCheck %s --check-prefix=GRAPH
-// RUN: TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule | FileCheck %s --check-prefix=IR
+// RUN: env TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule="print-schedule-graph" 2>&1 | FileCheck %s --check-prefix=GRAPH
+// RUN: env TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule | FileCheck %s --check-prefix=IR
 
 //===----------------------------------------------------------------------===//
 // Regression tests for Step 4.6 budget reduction (reduceBufferGroup +

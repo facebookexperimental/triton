@@ -1,4 +1,4 @@
-// RUN: TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file --allocate-shared-memory-nv=compute-capability=90 --convert-triton-gpu-to-llvm=compute-capability=90 | FileCheck %s
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file --allocate-shared-memory-nv=compute-capability=90 --convert-triton-gpu-to-llvm=compute-capability=90 | FileCheck %s
 //
 // NPOT (non-power-of-2) elementwise lowering. A non-power-of-2 out-dim builds a
 // modular LinearLayout, so the per-element index arithmetic uses ADD + a modulo

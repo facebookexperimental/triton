@@ -1,4 +1,4 @@
-// RUN: TRITON_AMD_EARLY_LOWER=1 triton-opt %s -split-input-file \
+// RUN: env TRITON_AMD_EARLY_LOWER=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule 2>&1 \
 // RUN:   | FileCheck %s --implicit-check-not="tt.load"
 //
