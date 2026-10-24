@@ -1305,7 +1305,8 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
 
     def test_sdpa_autograd_routes_expanded_d128_mha_to_tlx(self):
         for causal in (False, True):
-            for sequence_length in (1024, 2048):
+            sequences = (1024, 2048, 8192) if causal else (1024, 2048)
+            for sequence_length in sequences:
                 with self.subTest(sequence_length=sequence_length, causal=causal):
                     self._assert_sdpa_autograd_routes_to_tlx(
                         (16, 16, sequence_length, 128),
@@ -4417,6 +4418,44 @@ def test_dense_bwd_optimized_causal_head_boundaries_gfx950(shape, partitions, fo
                     assert torch.count_nonzero(actual).item() == 0
                 else:
                     assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("n_ctx", [1024, 2048, 8192])
+@pytest.mark.parametrize("sm_scale", [128**-0.5, 0.0, -0.125])
+def test_dense_bwd_diagonal_groups_scales_gfx950(n_ctx, sm_scale):
+    owners = {(0, 0), (8, 8), (15, 15)}
+    case = _make_dense_gqa_reference_case((16, 16, 16, n_ctx, 128), causal=True, seed=4346, sm_scale=sm_scale,
+                                          owners=owners)
+
+    def check(gradients):
+        for gradient in gradients:
+            assert torch.isfinite(gradient).all()
+        if sm_scale == 0.0:
+            assert torch.count_nonzero(gradients[0]) == 0
+            assert torch.count_nonzero(gradients[1]) == 0
+        for batch, head in owners:
+            for actual, expected in zip(gradients, case.grads, strict=True):
+                result, reference = actual[batch, head], expected[batch, head]
+                if torch.count_nonzero(reference).item() == 0:
+                    assert torch.count_nonzero(result).item() == 0
+                else:
+                    assert _snr_db(result, reference) >= 40.0
+
+    check(fa_backward(*case.kernel_args))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fa_backward(*case.kernel_args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        gradients = fa_backward(*case.kernel_args)
+    torch.cuda.current_stream().wait_stream(stream)
+    for _ in range(2):
+        for gradient in gradients:
+            gradient.fill_(float("nan"))
+        graph.replay()
+        check(gradients)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

@@ -5774,6 +5774,95 @@ def _attn_bwd_gqa_front_stream_cache64(
 
 
 @triton.jit
+def _attn_bwd_mha_diagonal_probabilities(
+    k_buffer,
+    k_score_cache,
+    q_t,
+    v_operand,
+    do_t,
+    lse_values,
+    delta_values,
+    pid_n,
+    step,
+    SM_SCALE: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MMA_NM: tl.constexpr,
+    LEFT_LAYOUT: tl.constexpr,
+    RIGHT_LAYOUT: tl.constexpr,
+):
+    """Skip fully masked key groups and convert each valid group to BF16."""
+    tl.static_assert(BLOCK_M == 16 and BLOCK_N == 256)
+    group_rows: tl.constexpr = 64
+    m_block = step % (N // BLOCK_M)
+    query_fragment = m_block - pid_n * (BLOCK_N // BLOCK_M)
+    last_group = query_fragment // (group_rows // BLOCK_M)
+    q_t = tlx.require_layout(q_t, RIGHT_LAYOUT, pin=False)
+    do_t = tlx.require_layout(do_t, RIGHT_LAYOUT, pin=False)
+    v_operand = tlx.require_layout(v_operand, LEFT_LAYOUT, pin=False)
+    k_score_cache = tlx.require_layout(k_score_cache, LEFT_LAYOUT, pin=False)
+    p0 = tlx.zeros((group_rows, BLOCK_M), tl.bfloat16, layout=MMA_NM)
+    p1, p2, p3 = p0, p0, p0
+    ds0, ds1, ds2, ds3 = p0, p0, p0, p0
+    for group in tl.static_range(BLOCK_N // group_rows):
+        probability_out = tlx.zeros((group_rows, BLOCK_M), tl.bfloat16, layout=MMA_NM)
+        ds_out = probability_out
+        if group == 0 or last_group >= group:
+            score = tlx.zeros((group_rows, BLOCK_M), tl.float32, layout=MMA_NM)
+            dp = tlx.zeros((group_rows, BLOCK_M), tl.float32, layout=MMA_NM)
+            for band in tl.static_range(4):
+                if group == 0:
+                    left_k = tlx.require_layout(tlx.extract_slice(k_score_cache, [group_rows, 32], [0, band * 32]),
+                                                LEFT_LAYOUT, pin=False)
+                else:
+                    left_k = tlx.local_load(
+                        tlx.local_slice(k_buffer, [group * group_rows, band * 32], [group_rows, 32]),
+                        layout=LEFT_LAYOUT, relaxed=True)
+                right_q = tlx.require_layout(tlx.extract_slice(q_t, [32, BLOCK_M], [band * 32, 0]), RIGHT_LAYOUT,
+                                             pin=False)
+                right_do = tlx.require_layout(tlx.extract_slice(do_t, [32, BLOCK_M], [band * 32, 0]), RIGHT_LAYOUT,
+                                              pin=False)
+                score = tlx.amd_scheduled_mfma(left_k, right_q, score, accumulator_role="transient",
+                                               initialize=band == 0)
+                left_v = tlx.require_layout(
+                    tlx.extract_slice(v_operand, [group_rows, 32], [group * group_rows, band * 32]), LEFT_LAYOUT,
+                    pin=False)
+                dp = tlx.amd_scheduled_mfma(left_v, right_do, dp, accumulator_role="transient", initialize=band == 0)
+            joint = tlx.require_layout(tl.cat(score, dp, dim=0), MMA_NM, pin=False)
+            # Each thread holds eight score/dP registers for one key group.
+            joint = tlx.amd_register_resident(joint, register_class="vgpr", registers_per_group=8)
+            score = tlx.extract_slice(joint, [group_rows, BLOCK_M], [0, 0])
+            dp = tlx.extract_slice(joint, [group_rows, BLOCK_M], [group_rows, 0])
+            lse_full = tlx.require_layout(tl.broadcast_to(lse_values[None, :], (group_rows, BLOCK_M)), MMA_NM,
+                                          pin=False)
+            scale_full = tlx.require_layout(tl.full((group_rows, BLOCK_M), SM_SCALE * 1.4426950408889634, tl.float32),
+                                            MMA_NM, pin=False)
+            scaled = score * scale_full - lse_full
+            key_rows = pid_n * BLOCK_N + group * group_rows + tlx.rematerialized_range(
+                0, group_rows, 32, placement=step)
+            query_rows = m_block * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
+            valid = tlx.require_layout(key_rows[:, None] <= query_rows[None, :], MMA_NM, pin=False)
+            neg_inf = tlx.require_layout(tl.full((group_rows, BLOCK_M), float("-inf"), tl.float32), MMA_NM, pin=False)
+            scaled = tlx.require_layout(tl.where(valid, scaled, neg_inf), MMA_NM, pin=False)
+            probability = tl.math.exp2(scaled)
+            delta = tlx.require_layout(tl.broadcast_to(delta_values[None, :], (group_rows, BLOCK_M)), MMA_NM, pin=False)
+            probability_out = probability.to(tl.bfloat16)
+            ds_out = (probability * (dp - delta)).to(tl.bfloat16)
+        if group == 0:
+            p0, ds0 = probability_out, ds_out
+        elif group == 1:
+            p1, ds1 = probability_out, ds_out
+        elif group == 2:
+            p2, ds2 = probability_out, ds_out
+        else:
+            p3, ds3 = probability_out, ds_out
+    probability = tl.cat(tl.cat(p0, p1, dim=0), tl.cat(p2, p3, dim=0), dim=0)
+    ds = tl.cat(tl.cat(ds0, ds1, dim=0), tl.cat(ds2, ds3, dim=0), dim=0)
+    return tlx.require_layout(probability, MMA_NM, pin=False), tlx.require_layout(ds, MMA_NM, pin=False)
+
+
+@triton.jit
 def _attn_bwd_opt_gqa_front(
     dv,
     q_slice,
@@ -5802,6 +5891,7 @@ def _attn_bwd_opt_gqa_front(
     USE_STREAM: tl.constexpr = False,
     CACHE_SCORE_K: tl.constexpr = False,
     k_score_cache=None,
+    PRUNE_DIAGONAL: tl.constexpr = False,
 ):
     """Publish current dS to LDS and optionally update the first dV fragments."""
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
@@ -5817,128 +5907,137 @@ def _attn_bwd_opt_gqa_front(
         layout=QT_LAYOUT,
         relaxed=True,
     )
-    if not USE_STREAM:
-        tl.static_assert(not CACHE_SCORE_K)
-        scores = tl.dot(
-            k_nm,
-            q_t,
-            tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
-        )
-    else:
+    if PRUNE_DIAGONAL and CACHE_SCORE_K and IS_CAUSAL:
+        tl.static_assert(USE_STREAM)
         do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
-        if CACHE_SCORE_K:
-            scores, dp = _attn_bwd_gqa_front_stream_cache64(k_buffer, k_score_cache, q_t, v_operand, do_t, MMA_NM,
-                                                            K_NM_LAYOUT, QT_LAYOUT)
-            # One joint register boundary makes score scaling wait for every
-            # score and dP update instead of each score band.
-            joint = tlx.require_layout(tl.cat(scores, dp, dim=0), MMA_NM, pin=False)
-            joint = tlx.amd_register_resident(joint, register_class="vgpr", registers_per_group=32)
-            scores = tlx.extract_slice(joint, [256, 16], [0, 0])
-            dp = tlx.extract_slice(joint, [256, 16], [256, 0])
-        else:
-            scores, dp = _attn_bwd_gqa_front_stream(k_buffer, q_t, v_operand, do_t, MMA_NM, K_NM_LAYOUT, QT_LAYOUT)
-    if PIN_SCORES:
-        scores = tlx.amd_register_resident(scores, register_class="vgpr", registers_per_group=16)
-    if IS_CAUSAL:
-        # Mask after scaling so custom zero or negative scales cannot turn an
-        # invalid raw-score sentinel into a NaN or a finite probability.
-        if CACHE_SCORE_K:
-            lse_log2 = lse_values
-        else:
-            lse_log2 = tl.inline_asm_elementwise(
-                "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-                "=v,v",
-                [lse_values],
-                dtype=tl.float32,
-                is_pure=True,
-                pack=1,
+        p, ds = _attn_bwd_mha_diagonal_probabilities(k_buffer, k_score_cache, q_t, v_operand, do_t, lse_values,
+                                                     delta_values, pid_n, step, SM_SCALE, N, BLOCK_M, BLOCK_N, MMA_NM,
+                                                     K_NM_LAYOUT, QT_LAYOUT)
+        q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
+        do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
+    else:
+        if not USE_STREAM:
+            tl.static_assert(not CACHE_SCORE_K)
+            scores = tl.dot(
+                k_nm,
+                q_t,
+                tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
             )
-        lse_full = tlx.require_layout(
-            tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
-            MMA_NM,
-            pin=False,
-        )
-        scale_full = tlx.require_layout(
-            tl.full(
-                (BLOCK_N, BLOCK_M),
-                SM_SCALE * 1.4426950408889634,
-                tl.float32,
-            ),
-            MMA_NM,
-            pin=False,
-        )
-        scaled_scores = scores * scale_full - lse_full
-        n_m_blocks: tl.constexpr = N // BLOCK_M
-        m_block = step % n_m_blocks
-        query_fragment = m_block - pid_n * (BLOCK_N // BLOCK_M)
-        if query_fragment < BLOCK_N // BLOCK_M:
-            offs_n = pid_n * BLOCK_N + tlx.rematerialized_range(0, BLOCK_N, 32, placement=step)
-            offs_m = m_block * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
-            valid = offs_n[:, None] <= offs_m[None, :]
-            valid = tlx.require_layout(valid, MMA_NM, pin=False)
-            neg_inf = tlx.require_layout(
-                tl.full((BLOCK_N, BLOCK_M), float("-inf"), dtype=tl.float32),
+        else:
+            do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
+            if CACHE_SCORE_K:
+                scores, dp = _attn_bwd_gqa_front_stream_cache64(k_buffer, k_score_cache, q_t, v_operand, do_t, MMA_NM,
+                                                                K_NM_LAYOUT, QT_LAYOUT)
+                # One joint register boundary makes score scaling wait for every
+                # score and dP update instead of each score band.
+                joint = tlx.require_layout(tl.cat(scores, dp, dim=0), MMA_NM, pin=False)
+                joint = tlx.amd_register_resident(joint, register_class="vgpr", registers_per_group=32)
+                scores = tlx.extract_slice(joint, [256, 16], [0, 0])
+                dp = tlx.extract_slice(joint, [256, 16], [256, 0])
+            else:
+                scores, dp = _attn_bwd_gqa_front_stream(k_buffer, q_t, v_operand, do_t, MMA_NM, K_NM_LAYOUT, QT_LAYOUT)
+        if PIN_SCORES:
+            scores = tlx.amd_register_resident(scores, register_class="vgpr", registers_per_group=16)
+        if IS_CAUSAL:
+            # Mask after scaling so custom zero or negative scales cannot turn an
+            # invalid raw-score sentinel into a NaN or a finite probability.
+            if CACHE_SCORE_K:
+                lse_log2 = lse_values
+            else:
+                lse_log2 = tl.inline_asm_elementwise(
+                    "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+                    "=v,v",
+                    [lse_values],
+                    dtype=tl.float32,
+                    is_pure=True,
+                    pack=1,
+                )
+            lse_full = tlx.require_layout(
+                tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
                 MMA_NM,
                 pin=False,
             )
-            scaled_scores = tl.where(valid, scaled_scores, neg_inf)
-            scaled_scores = tlx.require_layout(scaled_scores, MMA_NM, pin=False)
-    if not USE_STREAM:
-        do_t = tlx.local_load(
-            tlx.local_trans(do_slice),
-            layout=QT_LAYOUT,
-            relaxed=True,
-        )
-        dp = tl.dot(
-            v_operand,
-            do_t,
-            tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
-        )
-    if PIN_DP:
-        dp = tlx.amd_register_resident(dp, register_class="vgpr", registers_per_group=16)
-
-    q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
-    if not USE_STREAM and IS_CAUSAL:
-        q_out = tlx.amd_register_resident(q_out, register_class="vgpr", registers_per_group=4)
-    do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
-    if not IS_CAUSAL:
-        if CACHE_SCORE_K:
-            # Score-cache shapes receive log2 LSE from preprocessing.
-            # A native multiply here waits on its just-issued LDS load.
-            lse_log2 = lse_values
-        else:
-            lse_log2 = tl.inline_asm_elementwise(
-                "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-                "=v,v",
-                [lse_values],
-                dtype=tl.float32,
-                is_pure=True,
-                pack=1,
+            scale_full = tlx.require_layout(
+                tl.full(
+                    (BLOCK_N, BLOCK_M),
+                    SM_SCALE * 1.4426950408889634,
+                    tl.float32,
+                ),
+                MMA_NM,
+                pin=False,
             )
-        # These are soft requirements. Layout propagation does not yet infer
-        # the score MFMA layout for broadcast/full operands from elementwise users.
-        lse_full = tlx.require_layout(
-            tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
+            scaled_scores = scores * scale_full - lse_full
+            n_m_blocks: tl.constexpr = N // BLOCK_M
+            m_block = step % n_m_blocks
+            query_fragment = m_block - pid_n * (BLOCK_N // BLOCK_M)
+            if query_fragment < BLOCK_N // BLOCK_M:
+                offs_n = pid_n * BLOCK_N + tlx.rematerialized_range(0, BLOCK_N, 32, placement=step)
+                offs_m = m_block * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
+                valid = offs_n[:, None] <= offs_m[None, :]
+                valid = tlx.require_layout(valid, MMA_NM, pin=False)
+                neg_inf = tlx.require_layout(
+                    tl.full((BLOCK_N, BLOCK_M), float("-inf"), dtype=tl.float32),
+                    MMA_NM,
+                    pin=False,
+                )
+                scaled_scores = tl.where(valid, scaled_scores, neg_inf)
+                scaled_scores = tlx.require_layout(scaled_scores, MMA_NM, pin=False)
+        if not USE_STREAM:
+            do_t = tlx.local_load(
+                tlx.local_trans(do_slice),
+                layout=QT_LAYOUT,
+                relaxed=True,
+            )
+            dp = tl.dot(
+                v_operand,
+                do_t,
+                tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
+            )
+        if PIN_DP:
+            dp = tlx.amd_register_resident(dp, register_class="vgpr", registers_per_group=16)
+
+        q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
+        if not USE_STREAM and IS_CAUSAL:
+            q_out = tlx.amd_register_resident(q_out, register_class="vgpr", registers_per_group=4)
+        do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
+        if not IS_CAUSAL:
+            if CACHE_SCORE_K:
+                # Score-cache shapes receive log2 LSE from preprocessing.
+                # A native multiply here waits on its just-issued LDS load.
+                lse_log2 = lse_values
+            else:
+                lse_log2 = tl.inline_asm_elementwise(
+                    "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+                    "=v,v",
+                    [lse_values],
+                    dtype=tl.float32,
+                    is_pure=True,
+                    pack=1,
+                )
+            # These are soft requirements. Layout propagation does not yet infer
+            # the score MFMA layout for broadcast/full operands from elementwise users.
+            lse_full = tlx.require_layout(
+                tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
+                MMA_NM,
+                pin=False,
+            )
+            scale_full = tlx.require_layout(
+                tl.full(
+                    (BLOCK_N, BLOCK_M),
+                    SM_SCALE * 1.4426950408889634,
+                    tl.float32,
+                ),
+                MMA_NM,
+                pin=False,
+            )
+            scaled_scores = scores * scale_full - lse_full
+        p = tl.math.exp2(scaled_scores)
+        delta_full = tlx.require_layout(
+            tl.broadcast_to(delta_values[None, :], (BLOCK_N, BLOCK_M)),
             MMA_NM,
             pin=False,
         )
-        scale_full = tlx.require_layout(
-            tl.full(
-                (BLOCK_N, BLOCK_M),
-                SM_SCALE * 1.4426950408889634,
-                tl.float32,
-            ),
-            MMA_NM,
-            pin=False,
-        )
-        scaled_scores = scores * scale_full - lse_full
-    p = tl.math.exp2(scaled_scores)
-    delta_full = tlx.require_layout(
-        tl.broadcast_to(delta_values[None, :], (BLOCK_N, BLOCK_M)),
-        MMA_NM,
-        pin=False,
-    )
-    ds = p * (dp - delta_full)
+        ds = p * (dp - delta_full)
 
     p_nd = tl.reshape(p.to(tl.bfloat16), (2, 2, 2, 2, 16, BLOCK_M))
     p_nd = tl.permute(p_nd, (0, 2, 3, 1, 4, 5))
@@ -6568,6 +6667,8 @@ def _attn_bwd_opt_gqa_phase(
         USE_STREAM=HQ != HK or CACHE_SCORE_K,
         CACHE_SCORE_K=CACHE_SCORE_K,
         k_score_cache=k_score_cache,
+        PRUNE_DIAGONAL=(IS_CAUSAL and HQ == 16 and HK == 16 and CACHE_SCORE_K
+                        and (N == 1024 or N == 2048 or N == 8192)),
     )
     if not BRAID_DK_DV:
         dv = _attn_bwd_opt_gqa_dv_fragmented_half(
