@@ -410,8 +410,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, ttg.shar
       %out: !tt.tensordesc<8x32xi32, #local_atomic_tma_shared>,
       %result: tensor<8x32x!tt.ptr<i32>, #local_atomic_blocked>) {
     // The atomic is the allocation's only user, so its descriptor and state
-    // mask prove BufferRegion discovers the full destination and result scratch.
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 512, 1024, 0], [512, 512, 512, 0], shared_mem : tensor<4xi64
+    // mask prove BufferRegion discovers the full explicit destination.
+    // Result scratch adds no descriptor while its checks are disabled.
+    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 512], [512, 512], shared_mem : tensor<2xi64
     %c0 = arith.constant 0 : i32
     %indices = arith.constant dense<0> : tensor<8x32xi32, #local_atomic_blocked>
     %values = arith.constant dense<1> : tensor<8x32xi32, #local_atomic_blocked>
