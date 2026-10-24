@@ -1,13 +1,13 @@
 {
   "based_on_oai_llvm_hash": "5f07f818b51b786b0a87b4e514882600ecba112f",
-  "llvm_hash": "d66c19be74cd1720cf7b18dfe65819c73bd0672e",
+  "llvm_hash": "eb62de6e1525487a1fe8dba08d126d04b8a01d74",
   "llvm_repository": "https://github.com/facebookexperimental/llvm-project",
   "build_number": 1,
-  "release_base_url": "https://github.com/facebookexperimental/llvm-project/releases/download/llvm-d66c19be-1",
+  "release_base_url": "https://github.com/facebookexperimental/llvm-project/releases/download/llvm-eb62de6e-1",
   "sha256sum": {
-    "almalinux-arm64": "cd729c9ce0eb7b0335bd06c1f7eb87fd38d8b48eb5065614b72aa234f3fc5431",
-    "almalinux-x64": "e5585380dbd853941a2bee3781c323d46bc381f664e687276240dd98927f20d7",
-    "ubuntu-arm64": "b10e31aa3dfa8abb27c189c50d8c77696740f596ea6a89b1ebe25632399607ed",
-    "ubuntu-x64": "afb89f129ab63bf8f29f509ae53aac25b82392b48d919fab152037a7fb522d99"
+    "almalinux-arm64": "af36c4ecae05bbf76e6f760bbf76b0941907f000ce2aab8704b5f35a48d7de4a",
+    "almalinux-x64": "03556d809956e1bcdab968e26be0d4b99144611d432659bcb9c6c37251da6647",
+    "ubuntu-arm64": "62fca2fa37f653495f245a915f0870855474e0096beca0167b9d9f6a939829ea",
+    "ubuntu-x64": "932d38f39ba3baea04dbc3bec77f45f7942775c9c3655d4e46dcfcd0c6708fd0"
   }
 }
