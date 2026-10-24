@@ -5791,11 +5791,13 @@ def _attn_bwd_diagonal_probabilities(
     MMA_NM: tl.constexpr,
     LEFT_LAYOUT: tl.constexpr,
     RIGHT_LAYOUT: tl.constexpr,
+    SINGLE_QUERY_HEAD: tl.constexpr = False,
 ):
     """Skip fully masked key groups and convert each valid group to BF16."""
     tl.static_assert(BLOCK_M == 16 and BLOCK_N == 256)
     group_rows: tl.constexpr = 64
-    m_block = step % (N // BLOCK_M)
+    # One-head causal traversal keeps each phase index inside the query head.
+    m_block = step if SINGLE_QUERY_HEAD else step % (N // BLOCK_M)
     query_fragment = m_block - pid_n * (BLOCK_N // BLOCK_M)
     last_group = query_fragment // (group_rows // BLOCK_M)
     q_t = tlx.require_layout(q_t, RIGHT_LAYOUT, pin=False)
@@ -5892,6 +5894,7 @@ def _attn_bwd_opt_gqa_front(
     CACHE_SCORE_K: tl.constexpr = False,
     k_score_cache=None,
     PRUNE_DIAGONAL: tl.constexpr = False,
+    SINGLE_QUERY_HEAD: tl.constexpr = False,
 ):
     """Publish current dS to LDS and optionally update the first dV fragments."""
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
@@ -5912,7 +5915,7 @@ def _attn_bwd_opt_gqa_front(
         do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
         p, ds = _attn_bwd_diagonal_probabilities(k_buffer, k_score_cache, q_t, v_operand, do_t, lse_values,
                                                  delta_values, pid_n, step, SM_SCALE, N, BLOCK_M, BLOCK_N, MMA_NM,
-                                                 K_NM_LAYOUT, QT_LAYOUT)
+                                                 K_NM_LAYOUT, QT_LAYOUT, SINGLE_QUERY_HEAD=SINGLE_QUERY_HEAD)
         q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
         do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
     else:
@@ -6667,6 +6670,7 @@ def _attn_bwd_opt_gqa_phase(
         CACHE_SCORE_K=CACHE_SCORE_K,
         k_score_cache=k_score_cache,
         PRUNE_DIAGONAL=(IS_CAUSAL and CACHE_SCORE_K),
+        SINGLE_QUERY_HEAD=IS_CAUSAL and CACHE_SCORE_K and HQ == HK and N == 4096,
     )
     if not BRAID_DK_DV:
         dv = _attn_bwd_opt_gqa_dv_fragmented_half(
