@@ -208,6 +208,9 @@ def _wg_regular_wave_grid_plan(
         row_wise_epilogue=False,
         wide_epilogue=False,
         num_xcds=1,
+        xcd_group_size=1,
+        exact_lds=False,
+        dot_mode="persistent",
         workgroup_mapping=1,
         reverse_local_assignment=True,
         sink_insts_to_avoid_spills=False,
@@ -253,6 +256,9 @@ def _wg_regular_wave_grid_plan(
         "row_wise_epilogue": row_wise_epilogue,
         "wide_epilogue": wide_epilogue,
         "num_xcds": num_xcds,
+        "xcd_group_size": xcd_group_size,
+        "exact_lds": exact_lds,
+        "dot_mode": dot_mode,
         "workgroup_mapping": workgroup_mapping,
         "reverse_local_assignment": reverse_local_assignment,
         "sink_insts_to_avoid_spills": sink_insts_to_avoid_spills,
@@ -2242,6 +2248,7 @@ def _wg_wave_grid_global_load_a(
     force_stream: tl.constexpr = False,
     k128_macro_base: tl.constexpr = False,
     k_half: tl.constexpr = 0,
+    cache_policy: tl.constexpr = "auto",
 ):
     """Load one MI-height A row for a regular MI16 wave grid."""
     local_rows = tl.arange(0, a_group_m)
@@ -2274,7 +2281,7 @@ def _wg_wave_grid_global_load_a(
     elements_per_thread: tl.constexpr = (a_group_m * block_k // (64 * cta_waves))
     a_contiguity: tl.constexpr = (elements_per_thread
                                   if elements_per_thread < preferred_contiguity else preferred_contiguity)
-    if (stride_am % 8 != 0 and block_k == 64 and a_group_m == 32 and (cta_waves == 4 or cta_waves == 8)):
+    if (stride_am % 32 != 0 and block_k == 64 and a_group_m == 32 and (cta_waves == 4 or cta_waves == 8)):
         # Strided rows otherwise make layout inference collapse the K register
         # dimension. Pin the full-cover distribution while retaining the
         # normal vector transaction width; buffer loads support unaligned rows.
@@ -2283,8 +2290,11 @@ def _wg_wave_grid_global_load_a(
         return tlx.buffer_load(
             a_ptr,
             offsets,
+            cache=cache_policy if cache_policy != "auto" else "",
             contiguity=a_contiguity,
         )
+    if cache_policy != "auto":
+        return tlx.buffer_load(a_ptr, offsets, cache=cache_policy, contiguity=a_contiguity)
     # For tall-M/small-N grids, A advances to a new macro tile while B is
     # reused by many neighboring M programs.  Bypass L1 for the streaming A
     # operand so it does not evict that reusable B working set.
@@ -2463,6 +2473,7 @@ def _wg_wave_grid_global_load_pgr2_b_half(
     n: tl.constexpr,
     k128_macro_base: tl.constexpr = False,
     k_half: tl.constexpr = 0,
+    cache_policy: tl.constexpr = "auto",
 ):
     """Load one 32-column machine fragment of a PGR2 B group."""
     tl.static_assert(b_group_n == 32 or b_group_n == 64)
@@ -2513,6 +2524,8 @@ def _wg_wave_grid_global_load_pgr2_b_half(
     load_contiguity: tl.constexpr = (8 if (m == 128 and block_m == 128 and block_n == 128 and block_k == 64
                                            and a_row_count == 4 and b_group_n == 32 and stride_bk == 1
                                            and stride_bn == 20926) else half_n // 8)
+    if cache_policy != "auto":
+        return tlx.buffer_load(b_ptr, offsets, cache=cache_policy, contiguity=load_contiguity)
     if stream_b:
         return tlx.buffer_load(
             b_ptr,
@@ -3174,6 +3187,7 @@ def _wg_wave_grid_dot_row(
     dot_b: tl.constexpr,
     initialize: tl.constexpr = False,
     accumulator_register_class: tl.constexpr = None,
+    dot_mode: tl.constexpr = "persistent",
     _semantic=None,
 ):
     """Update one MI-height row across the complete N wave grid."""
@@ -3185,16 +3199,24 @@ def _wg_wave_grid_dot_row(
     b_operands = list(b_operands)
     for column in range(first_column, first_column + column_count):
         index = row * b_group_count + column
-        values[index] = tlx.amd_scheduled_mfma(
-            tlx.require_layout(a_operand, dot_a, pin=False, _semantic=_semantic),
-            tlx.require_layout(b_operands[column], dot_b, pin=False, _semantic=_semantic),
-            tlx.require_layout(values[index], mma, pin=False, _semantic=_semantic),
-            accumulator_role="persistent",
-            resident_operand=None,
-            accumulator_register_class=accumulator_register_class,
-            initialize=initialize,
-            _semantic=_semantic,
-        )
+        if tl.core._unwrap_if_constexpr(dot_mode) == "logical":
+            lhs = tlx.require_layout(a_operand, dot_a, pin=False, _semantic=_semantic)
+            rhs = tlx.require_layout(b_operands[column], dot_b, pin=False, _semantic=_semantic)
+            accumulator = tlx.require_layout(values[index], mma, pin=False, _semantic=_semantic)
+            if tl.core._unwrap_if_constexpr(initialize):
+                accumulator = tlx.zeros(accumulator.shape, tl.float32, layout=mma, _semantic=_semantic)
+            values[index] = tl.dot(lhs, rhs, accumulator, allow_tf32=False, _semantic=_semantic)
+        else:
+            values[index] = tlx.amd_scheduled_mfma(
+                tlx.require_layout(a_operand, dot_a, pin=False, _semantic=_semantic),
+                tlx.require_layout(b_operands[column], dot_b, pin=False, _semantic=_semantic),
+                tlx.require_layout(values[index], mma, pin=False, _semantic=_semantic),
+                accumulator_role=dot_mode,
+                resident_operand=None,
+                accumulator_register_class=accumulator_register_class,
+                initialize=initialize,
+                _semantic=_semantic,
+            )
     return tl.tuple(values)
 
 
@@ -3211,6 +3233,7 @@ def _wg_wave_grid_dot_column_major_at(
     dot_b: tl.constexpr,
     initialize: tl.constexpr = False,
     accumulator_register_class: tl.constexpr = None,
+    dot_mode: tl.constexpr = "persistent",
     _semantic=None,
 ):
     """Issue one MFMA from a column-major regular operand grid."""
@@ -3233,6 +3256,7 @@ def _wg_wave_grid_dot_column_major_at(
         initialize,
         accumulator_register_class,
         _semantic=_semantic,
+        dot_mode=dot_mode,
     )
 
 
@@ -3315,6 +3339,7 @@ def _wg_wave_grid_dot_column_major_range(
     dot_a: tl.constexpr,
     dot_b: tl.constexpr,
     initialize: tl.constexpr = False,
+    dot_mode: tl.constexpr = "persistent",
     _semantic=None,
 ):
     """Issue one compile-time consecutive range of a column-major grid."""
@@ -3334,6 +3359,7 @@ def _wg_wave_grid_dot_column_major_range(
             dot_b,
             initialize,
             _semantic=_semantic,
+            dot_mode=dot_mode,
         )
     return values
 
@@ -3394,6 +3420,7 @@ def _wg_wave_grid_dot_two_half_range(
     dot_a: tl.constexpr,
     dot_b: tl.constexpr,
     initialize: tl.constexpr = False,
+    dot_mode: tl.constexpr = "persistent",
     _semantic=None,
 ):
     """Issue a linear MFMA interval spanning two consecutive K32 halves."""
@@ -3418,6 +3445,7 @@ def _wg_wave_grid_dot_two_half_range(
                 dot_b,
                 initialize,
                 _semantic=_semantic,
+                dot_mode=dot_mode,
             )
         else:
             values = _wg_wave_grid_dot_column_major_at(
@@ -3431,6 +3459,7 @@ def _wg_wave_grid_dot_two_half_range(
                 dot_a,
                 dot_b,
                 _semantic=_semantic,
+                dot_mode=dot_mode,
             )
     return values
 
@@ -3752,6 +3781,7 @@ def _wg_wave_grid_compute_stage_k64(
     b_group_count: tl.constexpr,
     initialize: tl.constexpr = False,
     accumulator_register_class: tl.constexpr = None,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Consume both K32 halves of one regular K64 operand tile."""
     for half in tl.static_range(2):
@@ -3774,6 +3804,7 @@ def _wg_wave_grid_compute_stage_k64(
                 dot_b,
                 initialize and half == 0,
                 accumulator_register_class,
+                dot_mode=dot_mode,
             )
     return accumulators
 
@@ -3923,6 +3954,7 @@ def _wg_grouped_square_k64_compute_stage(
     dot_a: tl.constexpr,
     dot_b: tl.constexpr,
     fragment_count: tl.constexpr,
+    dot_mode: tl.constexpr = "persistent",
 ):
     for half in tl.static_range(2):
         b_operands = tl.tuple([
@@ -3942,6 +3974,7 @@ def _wg_grouped_square_k64_compute_stage(
                 mma,
                 dot_a,
                 dot_b,
+                dot_mode=dot_mode,
             )
     return accumulators
 
@@ -3980,6 +4013,7 @@ def _wg_logical_rect_k64_direct_pgr2_step(
     refill_read_window: tl.constexpr = 0,
     read_cover_sixteenths: tl.constexpr = 8,
     initialize: tl.constexpr = False,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Advance one K64 for an arbitrary regular MI16 grid using PGR2."""
     mfma_count: tl.constexpr = a_row_count * b_group_count
@@ -4018,6 +4052,7 @@ def _wg_logical_rect_k64_direct_pgr2_step(
             dot_a,
             dot_b,
             initialize=initialize,
+            dot_mode=dot_mode,
         )
 
     a_direct_load_count: tl.constexpr = ((block_m + direct_chunk - 1) //
@@ -4139,6 +4174,7 @@ def _wg_logical_rect_k64_direct_pgr2_step(
                 dot_a,
                 dot_b,
                 initialize=initialize,
+                dot_mode=dot_mode,
             )
         return accumulators, next_a, next_b
 
@@ -4180,6 +4216,7 @@ def _wg_logical_rect_k64_direct_pgr2_step(
             dot_a,
             dot_b,
             initialize=initialize,
+            dot_mode=dot_mode,
         )
     # K(t+1) was the older set of async groups. Retire those groups but
     # leave K(t+2) in flight, then read K(t+1).kh0 while the remaining
@@ -4211,6 +4248,7 @@ def _wg_logical_rect_k64_direct_pgr2_step(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     return accumulators, next_a, next_b
 
@@ -4231,6 +4269,7 @@ def _wg_logical_rect_k64_direct_pgr2_finish(
     b_group_count: tl.constexpr,
     current_stage: tl.constexpr,
     final_stage: tl.constexpr,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Consume the final two resident K64 stages without redundant reads."""
     mfma_count: tl.constexpr = a_row_count * b_group_count
@@ -4259,6 +4298,7 @@ def _wg_logical_rect_k64_direct_pgr2_finish(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
 
     tlx.async_load_wait_group(0)
@@ -4287,6 +4327,7 @@ def _wg_logical_rect_k64_direct_pgr2_finish(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
 
     with tlx.warp_pipeline_stage("direct_pgr2_finish_final", scope="intra_wave"):
@@ -4313,6 +4354,7 @@ def _wg_logical_rect_k64_direct_pgr2_finish(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
 
     return _wg_wave_grid_dot_column_major_range(
@@ -4326,6 +4368,7 @@ def _wg_logical_rect_k64_direct_pgr2_finish(
         mma,
         dot_a,
         dot_b,
+        dot_mode=dot_mode,
     )
 
 
@@ -4358,6 +4401,7 @@ def _wg_logical_rect_k64_compute_tile_direct_pgr2(
     refill_read_window: tl.constexpr = 0,
     read_cover_sixteenths: tl.constexpr = 8,
     loop_unroll_factor: tl.constexpr = 1,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Compute a regular MI16 grid with a two-stage direct PGR2 pipeline."""
     k_blocks: tl.constexpr = k // 64
@@ -4461,6 +4505,7 @@ def _wg_logical_rect_k64_compute_tile_direct_pgr2(
         refill_read_window,
         read_cover_sixteenths,
         True,
+        dot_mode=dot_mode,
     ))
     if k_blocks == 3:
         return _wg_logical_rect_k64_direct_pgr2_finish(
@@ -4478,6 +4523,7 @@ def _wg_logical_rect_k64_compute_tile_direct_pgr2(
             b_group_count,
             1,
             0,
+            dot_mode=dot_mode,
         )
     accumulators, current_a, current_b = (_wg_logical_rect_k64_direct_pgr2_step(
         a_ptr,
@@ -4511,6 +4557,7 @@ def _wg_logical_rect_k64_compute_tile_direct_pgr2(
         warps_per_cta,
         refill_read_window,
         read_cover_sixteenths,
+        dot_mode=dot_mode,
     ))
     for kb in tl.range(
             2,
@@ -4551,6 +4598,7 @@ def _wg_logical_rect_k64_compute_tile_direct_pgr2(
             warps_per_cta,
             refill_read_window,
             read_cover_sixteenths,
+            dot_mode=dot_mode,
         ))
         accumulators, current_a, current_b = (_wg_logical_rect_k64_direct_pgr2_step(
             a_ptr,
@@ -4584,6 +4632,7 @@ def _wg_logical_rect_k64_compute_tile_direct_pgr2(
             warps_per_cta,
             refill_read_window,
             read_cover_sixteenths,
+            dot_mode=dot_mode,
         ))
 
     return _wg_logical_rect_k64_direct_pgr2_finish(
@@ -4601,6 +4650,7 @@ def _wg_logical_rect_k64_compute_tile_direct_pgr2(
         b_group_count,
         0,
         1,
+        dot_mode=dot_mode,
     )
 
 
@@ -4863,6 +4913,12 @@ def _wg_logical_rect_k128_allocate_direct_operand(
     """Allocate two K128 banks from independently addressable K64 chunks."""
     logical_extent = tl.core._unwrap_if_constexpr(logical_extent)
     is_a = tl.core._unwrap_if_constexpr(is_a)
+    if is_a and logical_extent <= 64:
+        layout64: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], _wg_A_BASES_64X64, [64, 64])
+        return tl.tuple([
+            tlx.local_alloc((64, 64), element_type, tl.constexpr(1), layout=layout64, _semantic=_semantic)
+            for _ in range(4)
+        ])
     chunks_per_half = 1 if logical_extent <= 128 else 2
     buffers = []
     # A K128 stage contains two K64 halves.  Keeping each half in its own
@@ -4964,6 +5020,34 @@ def _wg_wave_grid_allocate_pgr2_operand_chunks(
                 _semantic=_semantic,
             ))
     return tl.tuple(chunks)
+
+
+@tl.core.builtin
+def _wg_wave_grid_allocate_pgr2_single_buffer_operand(
+    logical_extent: tl.constexpr,
+    group_extent: tl.constexpr,
+    block_k: tl.constexpr,
+    is_a: tl.constexpr,
+    element_type: tl.constexpr,
+    n_contiguous: tl.constexpr = False,
+    _semantic=None,
+):
+    extent = tl.core._unwrap_if_constexpr(logical_extent)
+    group = tl.core._unwrap_if_constexpr(group_extent)
+    reduction = tl.core._unwrap_if_constexpr(block_k)
+    left = tl.core._unwrap_if_constexpr(is_a)
+    contiguous = tl.core._unwrap_if_constexpr(n_contiguous)
+    assert extent % group == 0 and group in (16, 32, 64)
+    assert not contiguous or not left
+    identity = ([(512, 16)] if contiguous else [(64, 16)] if group == 16 else [(512, 16)] if group == 32 else [(256,
+                                                                                                                16)])
+    shape = [group, reduction] if left else [reduction, group]
+    order = [1, 0] if left or contiguous else [0, 1]
+    layout = tlx.padded_shared_layout_encoding.with_identity_for(identity, shape, order=order)
+    return tl.tuple([
+        tlx.local_alloc(shape, element_type, tl.constexpr(1), layout=layout, _semantic=_semantic)
+        for _ in range(extent // group)
+    ])
 
 
 @tl.core.builtin
@@ -5252,8 +5336,10 @@ def _wg_logical_rect_k64_direct_load_chunk(
                 True,
             )
         elif b_chunk_count == 4:
-            offset_layout: tl.constexpr = (_wg_N_CONTIG_OFFSET_LAYOUT_64X64_4W if stride_bn == 1 else (
-                _wg_B_OFFSET_LAYOUT_64X64_8W if warps_per_cta == 8 else _wg_B_OFFSET_LAYOUT_64X64_4W))
+            offset_layout: tl.constexpr = (
+                (_wg_A_OFFSET_LAYOUT_64X64_8W if warps_per_cta == 8 else _wg_N_CONTIG_OFFSET_LAYOUT_64X64_4W)
+                if stride_bn == 1 else
+                (_wg_B_OFFSET_LAYOUT_64X64_8W if warps_per_cta == 8 else _wg_B_OFFSET_LAYOUT_64X64_4W))
             _wg_logical_rect_k64_direct_load_extent(
                 b_ptr,
                 pid_n,
@@ -5490,6 +5576,7 @@ def _wg_logical_rect_k128_direct_load_stage(
                 n,
                 (_wg_B_OFFSET_LAYOUT_64X64_4W if block_n == 192 and chunk == 1 else _wg_B_OFFSET_LAYOUT_64X128_4W),
                 False,
+                scalar_k_base=(block_m <= 64 and block_n <= 96),
             )
             tlx.async_load_commit_group()
         for chunk in tl.static_range(a_chunks):
@@ -5499,13 +5586,15 @@ def _wg_logical_rect_k128_direct_load_stage(
                 macro_k * 2 + half,
                 a_local[(stage * 2 + half) * a_chunks + chunk][0],
                 chunk * 128,
-                64 if block_m == 192 and chunk == 1 else 128,
+                64 if block_m <= 64 or (block_m == 192 and chunk == 1) else 128,
                 block_m,
                 stride_am,
                 stride_ak,
                 m,
-                (_wg_A_OFFSET_LAYOUT_64X64_4W if block_m == 192 and chunk == 1 else _wg_A_OFFSET_LAYOUT_128X64_4W),
+                (_wg_A_OFFSET_LAYOUT_64X64_4W if block_m <= 64 or
+                 (block_m == 192 and chunk == 1) else _wg_A_OFFSET_LAYOUT_128X64_4W),
                 True,
+                scalar_k_base=(block_m <= 64 and block_n <= 96),
             )
             tlx.async_load_commit_group()
 
@@ -6093,6 +6182,7 @@ def _wg_logical_rect_k64_compute_stage(
     b_group_n: tl.constexpr,
     a_row_count: tl.constexpr,
     b_group_count: tl.constexpr,
+    dot_mode: tl.constexpr = "persistent",
 ):
     for half in tl.static_range(2):
         a_operands = tl.tuple([
@@ -6114,6 +6204,7 @@ def _wg_logical_rect_k64_compute_stage(
                 mma,
                 dot_a,
                 dot_b,
+                dot_mode=dot_mode,
             )
     return accumulators
 
@@ -6148,6 +6239,7 @@ def _wg_logical_rect_k64_compute_and_prefetch_direct(
     n: tl.constexpr,
     warps_per_cta: tl.constexpr,
     initialize: tl.constexpr = False,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Consume one logical grid while refilling its physical LDS backing."""
     operand_count: tl.constexpr = a_row_count + b_group_count
@@ -6190,6 +6282,7 @@ def _wg_logical_rect_k64_compute_and_prefetch_direct(
             dot_a,
             dot_b,
             initialize=initialize,
+            dot_mode=dot_mode,
         )
     second_b = tl.tuple([second_values[index] for index in range(b_group_count)])
     second_a = tl.tuple([second_values[b_group_count + index] for index in range(a_row_count)])
@@ -6232,6 +6325,7 @@ def _wg_logical_rect_k64_compute_and_prefetch_direct(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     return accumulators
 
@@ -6265,6 +6359,8 @@ def _wg_logical_rect_k64_compute_tile_direct(
     preloaded: tl.constexpr = False,
 ):
     """Two-stage direct-to-LDS pipeline for one logical regular MI16 grid."""
+    dot_mode: tl.constexpr = ("logical" if a_ptr.dtype.element_ty == tl.float16 and block_m == 256 and block_n == 256
+                              and k <= 512 and warps_per_cta == 4 else "persistent")
     k_blocks: tl.constexpr = k // 64
     tl.static_assert(block_m <= 256 and block_n <= 256)
     tl.static_assert(block_m >= 32 and block_n >= 32)
@@ -6351,6 +6447,7 @@ def _wg_logical_rect_k64_compute_tile_direct(
         n,
         warps_per_cta,
         True,
+        dot_mode=dot_mode,
     )
     tlx.async_load_wait_group(direct_group_count)
     tl.debug_barrier()
@@ -6382,6 +6479,7 @@ def _wg_logical_rect_k64_compute_tile_direct(
         m,
         n,
         warps_per_cta,
+        dot_mode=dot_mode,
     )
     tlx.async_load_wait_group(direct_group_count)
     tl.debug_barrier()
@@ -6415,6 +6513,7 @@ def _wg_logical_rect_k64_compute_tile_direct(
             m,
             n,
             warps_per_cta,
+            dot_mode=dot_mode,
         )
         tlx.async_load_wait_group(direct_group_count)
         tl.debug_barrier()
@@ -6446,6 +6545,7 @@ def _wg_logical_rect_k64_compute_tile_direct(
             m,
             n,
             warps_per_cta,
+            dot_mode=dot_mode,
         )
         tlx.async_load_wait_group(direct_group_count)
         tl.debug_barrier()
@@ -6462,6 +6562,7 @@ def _wg_logical_rect_k64_compute_tile_direct(
         b_group_n,
         a_row_count,
         b_group_count,
+        dot_mode=dot_mode,
     )
     tlx.async_load_wait_group(0)
     tl.debug_barrier()
@@ -6477,6 +6578,7 @@ def _wg_logical_rect_k64_compute_tile_direct(
         b_group_n,
         a_row_count,
         b_group_count,
+        dot_mode=dot_mode,
     )
 
 
@@ -6511,6 +6613,7 @@ def _wg_wave_grid_pipeline_step_rect_k64(
     stride_bn: tl.constexpr,
     m: tl.constexpr,
     n: tl.constexpr,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Advance any regular rectangular MI grid through one K64 stage.
 
@@ -6560,6 +6663,7 @@ def _wg_wave_grid_pipeline_step_rect_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     second_b = tl.tuple([second_values[index] for index in range(b_group_count)])
     second_a = tl.tuple([second_values[b_group_count + index] for index in range(a_row_count)])
@@ -6577,6 +6681,7 @@ def _wg_wave_grid_pipeline_step_rect_k64(
         mma,
         dot_a,
         dot_b,
+        dot_mode=dot_mode,
     )
     tl.debug_barrier()
 
@@ -6640,6 +6745,7 @@ def _wg_wave_grid_pipeline_step_rect_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
 
     tl.debug_barrier()
@@ -6677,6 +6783,7 @@ def _wg_wave_grid_pipeline_step_rect_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     next_b = tl.tuple([next_values[index] for index in range(b_group_count)])
     next_a = tl.tuple([next_values[b_group_count + index] for index in range(a_row_count)])
@@ -6713,6 +6820,7 @@ def _wg_wave_grid_pipeline_pair_rect_k64(
     stride_bn: tl.constexpr,
     m: tl.constexpr,
     n: tl.constexpr,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Advance two rectangular K64 blocks through static ping-pong stages."""
     for half in tl.static_range(2):
@@ -6746,6 +6854,7 @@ def _wg_wave_grid_pipeline_pair_rect_k64(
             stride_bn,
             m,
             n,
+            dot_mode=dot_mode,
         )
         (
             accumulators,
@@ -6787,6 +6896,7 @@ def _wg_wave_grid_pipeline_step_vendor_square_k64(
     stride_bn: tl.constexpr,
     m: tl.constexpr,
     n: tl.constexpr,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Vendor-shaped square K64 pipeline with bounded MFMA windows."""
     a_group_m: tl.constexpr = block_m // a_row_count
@@ -6849,6 +6959,7 @@ def _wg_wave_grid_pipeline_step_vendor_square_k64(
                 mma,
                 dot_a,
                 dot_b,
+                dot_mode=dot_mode,
             )
 
     # Publish every next-stage fragment and prefetch the following K64. The
@@ -6935,6 +7046,7 @@ def _wg_wave_grid_pipeline_step_vendor_square_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
 
     # All next-stage stores are now visible.  Seventeen remaining MFMAs cover
@@ -6984,6 +7096,7 @@ def _wg_wave_grid_pipeline_step_vendor_square_k64(
                 mma,
                 dot_a,
                 dot_b,
+                dot_mode=dot_mode,
             )
 
     for tail_index in tl.static_range(second_read_start + operand_count, mfma_per_half):
@@ -6997,6 +7110,7 @@ def _wg_wave_grid_pipeline_step_vendor_square_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     return accumulators, future_a, future_b, next_a, next_b
 
@@ -7031,6 +7145,8 @@ def _wg_wave_grid_compute_tile_rect_k64(
     accumulator_register_class: tl.constexpr = None,
 ):
     """Compute one tile using the geometry-derived rectangular K64 pipeline."""
+    dot_mode: tl.constexpr = ("logical"
+                              if a_ptr.dtype.element_ty == tl.float16 and k >= 128 and k <= 512 else "persistent")
     tl.static_assert(block_k == 64)
     a_group_m: tl.constexpr = block_m // a_row_count
     k_blocks: tl.constexpr = k // block_k
@@ -7065,6 +7181,7 @@ def _wg_wave_grid_compute_tile_rect_k64(
             b_group_count,
             True,
             accumulator_register_class,
+            dot_mode=dot_mode,
         )
 
     tl.static_assert(k_blocks == 1 or k_blocks % 2 == 0)
@@ -7121,6 +7238,7 @@ def _wg_wave_grid_compute_tile_rect_k64(
                 stride_bn,
                 m,
                 n,
+                dot_mode=dot_mode,
             )
             (
                 accumulators,
@@ -7161,6 +7279,7 @@ def _wg_wave_grid_compute_tile_rect_k64(
                 stride_bn,
                 m,
                 n,
+                dot_mode=dot_mode,
             )
             (
                 accumulators,
@@ -7184,6 +7303,7 @@ def _wg_wave_grid_compute_tile_rect_k64(
             dot_b,
             False,
             accumulator_register_class,
+            dot_mode=dot_mode,
         )
     second_a = tl.tuple([
         _wg_wave_grid_local_load_a_half(a_local, (k_blocks - 2) % local_stages, row, 1, a_group_m, dot_a)
@@ -7204,6 +7324,7 @@ def _wg_wave_grid_compute_tile_rect_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     _wg_wave_grid_local_store_all(
         a_local,
@@ -7231,6 +7352,7 @@ def _wg_wave_grid_compute_tile_rect_k64(
         b_group_count,
         False,
         accumulator_register_class,
+        dot_mode=dot_mode,
     )
 
 
@@ -7267,6 +7389,7 @@ def _wg_wave_grid_pgr2_compact_stage_k64(
     prefetch_future: tl.constexpr,
     double_buffered: tl.constexpr,
     initialize: tl.constexpr = False,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Advance the vendor-sized 1x2 MFMA grid through one K64 bank."""
     tl.static_assert(block_k == 64)
@@ -7318,6 +7441,7 @@ def _wg_wave_grid_pgr2_compact_stage_k64(
                 dot_a,
                 dot_b,
                 initialize,
+                dot_mode=dot_mode,
             )
 
     tl.debug_barrier()
@@ -7396,6 +7520,7 @@ def _wg_wave_grid_pgr2_compact_stage_k64(
                 mma,
                 dot_a,
                 dot_b,
+                dot_mode=dot_mode,
             )
 
     tl.debug_barrier()
@@ -7451,6 +7576,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
     double_buffered: tl.constexpr,
     late_read_count: tl.constexpr,
     initialize: tl.constexpr = False,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Advance a regular PGR2 grid through compiler-derived cover windows.
 
@@ -7496,6 +7622,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
             dot_a,
             dot_b,
             initialize,
+            dot_mode=dot_mode,
         )
         with tlx.warp_pipeline_stage("pgr2_compact_read_and_compute", scope="intra_wave"):
             for read in tl.static_range(operand_count):
@@ -7535,6 +7662,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
                     dot_a,
                     dot_b,
                     initialize,
+                    dot_mode=dot_mode,
                 )
         for mfma_index in tl.static_range(operand_count + 1, mfma_count - 2):
             accumulators = _wg_wave_grid_dot_column_major_at(
@@ -7548,6 +7676,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
                 dot_a,
                 dot_b,
                 initialize,
+                dot_mode=dot_mode,
             )
     else:
         early_read_count: tl.constexpr = (operand_count - late_read_count if overlap_late_reads else operand_count)
@@ -7589,6 +7718,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
                     dot_a,
                     dot_b,
                     initialize,
+                    dot_mode=dot_mode,
                 )
     # Every old LDS value is now resident in registers.  Reuse the one-stage
     # allocation fragment by fragment and refill the global prefetch bank.
@@ -7668,6 +7798,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
                     dot_a,
                     dot_b,
                     initialize,
+                    dot_mode=dot_mode,
                 )
     else:
         # Source preserves the stage-reuse boundary and the independent work
@@ -7776,6 +7907,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
                         dot_a,
                         dot_b,
                         initialize,
+                        dot_mode=dot_mode,
                     )
         with tlx.warp_pipeline_stage(
                 "pgr2_regular_publish_and_prefetch",
@@ -7851,6 +7983,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
                 dot_a,
                 dot_b,
                 initialize,
+                dot_mode=dot_mode,
             )
 
     # K(t+1) is visible in LDS.  Its first-half reads are covered by the final
@@ -7870,6 +8003,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     if compact_publish:
         with tlx.warp_pipeline_stage("pgr2_compact_read_and_compute_next", scope="intra_wave"):
@@ -7909,6 +8043,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
                     mma,
                     dot_a,
                     dot_b,
+                    dot_mode=dot_mode,
                 )
     else:
         with tlx.warp_pipeline_stage("pgr2_regular_read_and_compute_next", scope="intra_wave"):
@@ -7951,6 +8086,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
                     mma,
                     dot_a,
                     dot_b,
+                    dot_mode=dot_mode,
                 )
     if compact_publish:
         for mfma_index in tl.static_range(final_first + operand_count + 1, mfma_count):
@@ -7964,6 +8100,7 @@ def _wg_wave_grid_pgr2_regular_stage_k64(
                 mma,
                 dot_a,
                 dot_b,
+                dot_mode=dot_mode,
             )
     return accumulators, future_a, future_b, next_a, next_b
 
@@ -8002,6 +8139,7 @@ def _wg_wave_grid_pgr2_stage_k64(
     double_buffered: tl.constexpr,
     late_read_count: tl.constexpr,
     initialize: tl.constexpr = False,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Select the proven regular or vendor-sized compact K64 stage."""
     operand_count: tl.constexpr = a_row_count + b_group_count
@@ -8039,6 +8177,7 @@ def _wg_wave_grid_pgr2_stage_k64(
             prefetch_future,
             double_buffered,
             initialize,
+            dot_mode=dot_mode,
         )
     else:
         return _wg_wave_grid_pgr2_regular_stage_k64(
@@ -8074,6 +8213,7 @@ def _wg_wave_grid_pgr2_stage_k64(
             double_buffered,
             late_read_count,
             initialize,
+            dot_mode=dot_mode,
         )
 
 
@@ -8107,6 +8247,7 @@ def _wg_wave_grid_pgr2_stage_pair_k64(
     n: tl.constexpr,
     late_read_count: tl.constexpr,
     initialize: tl.constexpr = False,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Consume two K64 blocks using distinct, statically selected banks."""
     state = _wg_wave_grid_pgr2_stage_k64(
@@ -8142,6 +8283,7 @@ def _wg_wave_grid_pgr2_stage_pair_k64(
         True,
         late_read_count,
         initialize,
+        dot_mode=dot_mode,
     )
     (
         accumulators,
@@ -8183,6 +8325,7 @@ def _wg_wave_grid_pgr2_stage_pair_k64(
         True,
         late_read_count,
         False,
+        dot_mode=dot_mode,
     )
 
 
@@ -8202,6 +8345,7 @@ def _wg_wave_grid_consume_final_pgr2_k64(
     a_row_count: tl.constexpr,
     b_group_count: tl.constexpr,
     initialize: tl.constexpr = False,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Consume the final K64 after its first operand bank was preloaded."""
     second_a = tl.tuple([
@@ -8224,6 +8368,7 @@ def _wg_wave_grid_consume_final_pgr2_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     for mfma_index in tl.static_range(mfma_count):
         accumulators = _wg_wave_grid_dot_column_major_at(
@@ -8236,6 +8381,7 @@ def _wg_wave_grid_consume_final_pgr2_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     return accumulators
 
@@ -8267,6 +8413,7 @@ def _wg_wave_grid_compute_tile_pgr2_k64(
     k: tl.constexpr,
     local_stages: tl.constexpr,
     late_read_count: tl.constexpr,
+    dot_mode: tl.constexpr = "persistent",
 ):
     """Run the parameterized PGR2 two-operand-bank pipeline."""
     a_group_m: tl.constexpr = block_m // a_row_count
@@ -8363,6 +8510,7 @@ def _wg_wave_grid_compute_tile_pgr2_k64(
             n,
             late_read_count,
             True,
+            dot_mode=dot_mode,
         )
         # Pair only while both future blocks are in bounds.  For an odd
         # number of K64 blocks, the old upper bound admitted a final pair
@@ -8406,6 +8554,7 @@ def _wg_wave_grid_compute_tile_pgr2_k64(
                 n,
                 late_read_count,
                 False,
+                dot_mode=dot_mode,
             )
         if k_blocks % 2 != 0:
             (
@@ -8447,6 +8596,7 @@ def _wg_wave_grid_compute_tile_pgr2_k64(
                 True,
                 late_read_count,
                 False,
+                dot_mode=dot_mode,
             )
     else:
         (
@@ -8488,6 +8638,7 @@ def _wg_wave_grid_compute_tile_pgr2_k64(
             False,
             late_read_count,
             True,
+            dot_mode=dot_mode,
         )
         for kb in tl.range(1, k_blocks - 2, num_stages=1):
             (
@@ -8529,6 +8680,7 @@ def _wg_wave_grid_compute_tile_pgr2_k64(
                 False,
                 late_read_count,
                 False,
+                dot_mode=dot_mode,
             )
 
     (
@@ -8570,6 +8722,7 @@ def _wg_wave_grid_compute_tile_pgr2_k64(
         double_buffered,
         late_read_count,
         False,
+        dot_mode=dot_mode,
     )
     return _wg_wave_grid_consume_final_pgr2_k64(
         a_local,
@@ -8585,6 +8738,7 @@ def _wg_wave_grid_compute_tile_pgr2_k64(
         b_group_n,
         a_row_count,
         b_group_count,
+        dot_mode=dot_mode,
     )
 
 
@@ -9605,7 +9759,7 @@ def _wg_wave_grid_compute_tile_pgr2_k128(
     k: tl.constexpr,
 ):
     """Run a one-LDS-stage K128 pipeline with register PGR2 prefetching."""
-    if a_row_count == 4 and b_group_count == 4:
+    if a_row_count == 4 and b_group_count == 4 and block_m == 128 and block_n == 128 and m <= block_m:
         return _wg_wave_grid_compute_tile_pgr2_k128_4x4(
             a_ptr,
             b_ptr,
@@ -11152,6 +11306,9 @@ def _wg_wave_grid_compute_tile_regular_k64(
     k: tl.constexpr,
 ):
     """Run one regular 5x5..8x8 square MI grid through the K64 pipeline."""
+    dot_mode: tl.constexpr = ("logical" if a_ptr.dtype.element_ty == tl.float16 and k >= 128 and
+                              (k <= 512 or (block_m == 192 and block_n == 192) or
+                               (block_m == 224 and block_n == 224)) else "persistent")
     tl.static_assert(block_k == 64)
     tl.static_assert(a_row_count == b_group_count and a_row_count >= 5 and a_row_count <= 8)
     a_group_m: tl.constexpr = block_m // a_row_count
@@ -11221,6 +11378,7 @@ def _wg_wave_grid_compute_tile_regular_k64(
             stride_bn,
             m,
             n,
+            dot_mode=dot_mode,
         )
         (
             accumulators,
@@ -11243,6 +11401,7 @@ def _wg_wave_grid_compute_tile_regular_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     second_a = tl.tuple([
         _wg_grouped_square_k64_local_load_a_half(a_local, 0, row, 1, a_row_count, dot_a) for row in range(a_row_count)
@@ -11262,6 +11421,7 @@ def _wg_wave_grid_compute_tile_regular_k64(
             mma,
             dot_a,
             dot_b,
+            dot_mode=dot_mode,
         )
     _wg_grouped_square_k64_local_store_all(
         a_local,
@@ -11281,6 +11441,7 @@ def _wg_wave_grid_compute_tile_regular_k64(
         dot_a,
         dot_b,
         a_row_count,
+        dot_mode=dot_mode,
     )
 
 
@@ -12379,9 +12540,14 @@ def _wg_store_mi16_wave_grid_output(
     use_mask: tl.constexpr,
     mma: tl.constexpr,
     accumulators_committed: tl.constexpr = False,
+    store_cache: tl.constexpr = "",
 ):
     """Commit and store one regular MI16 accumulator grid."""
-    use_wide_epilogue: tl.constexpr = wide_epilogue and stride_cn == 1
+    use_wide_epilogue: tl.constexpr = (wide_epilogue and stride_cn == 1
+                                       and a_group_m * stride_cm + N_GROUP_FRAGMENTS * TILE * stride_cn < 1 << 30)
+    if tl.cdiv(m, block_m) * block_m * stride_cm + tl.cdiv(n, block_n) * block_n * stride_cn >= 1 << 30:
+        pid_m = pid_m.to(tl.int64)
+        pid_n = pid_n.to(tl.int64)
     if not row_wise:
         if not accumulators_committed:
             accumulators = tlx.amd_mfma_commit(
@@ -12390,7 +12556,7 @@ def _wg_store_mi16_wave_grid_output(
                     for index in range(a_row_count * b_group_count)
                 ]))
     for row in tl.static_range(a_row_count):
-        if row_wise:
+        if row_wise and not accumulators_committed:
             row_values = tlx.amd_mfma_commit(
                 tl.tuple([
                     tlx.require_layout(
@@ -12441,13 +12607,13 @@ def _wg_store_mi16_wave_grid_output(
                                    (row + 1) * a_group_m <= m) & (pid_n * block_n +
                                                                   (wide_group + 1) * N_GROUP_FRAGMENTS * b_group_n <= n)
                     if full_region:
-                        tlx.buffer_store(value, c_base, offsets, contiguity=8)
+                        tlx.buffer_store(value, c_base, offsets, contiguity=8, cache=store_cache)
                     else:
                         mask = (rows[:, None] < m) & (cols[None, :] < n)
                         mask = tlx.require_layout(mask, _C_STORE_32X128_LAYOUT, pin=False)
-                        tlx.buffer_store(value, c_base, offsets, mask=mask)
+                        tlx.buffer_store(value, c_base, offsets, mask=mask, cache=store_cache)
                 else:
-                    tlx.buffer_store(value, c_base, offsets, contiguity=8)
+                    tlx.buffer_store(value, c_base, offsets, contiguity=8, cache=store_cache)
         for group in tl.static_range(
             (b_group_count // N_GROUP_FRAGMENTS * N_GROUP_FRAGMENTS if use_wide_epilogue else 0),
                 b_group_count,
@@ -12461,9 +12627,183 @@ def _wg_store_mi16_wave_grid_output(
                     ptrs,
                     value,
                     mask=mask,
+                    cache_modifier=store_cache,
                 )
             else:
-                tl.store(ptrs, value)
+                tl.store(ptrs, value, cache_modifier=store_cache)
+
+
+@triton.jit
+def _wg_cached_b_tile_coords(tile, tile_count: tl.constexpr, grid_m: tl.constexpr, grid_n: tl.constexpr,
+                             group_m: tl.constexpr, num_xcds: tl.constexpr):
+    pid = tl.minimum(tile, tile_count - 1)
+    if num_xcds != 1:
+        aligned: tl.constexpr = tile_count // (num_xcds * 4) * (num_xcds * 4)
+        if pid < aligned:
+            xcd = pid % num_xcds
+            local_pid = pid // num_xcds
+            pid = local_pid // 4 * num_xcds * 4 + xcd * 4 + local_pid % 4
+    width: tl.constexpr = group_m * grid_n
+    group_id = pid // width
+    group_size = tl.minimum(grid_m - group_id * group_m, group_m)
+    return group_id * group_m + pid % group_size, pid % width // group_size
+
+
+@triton.jit
+def _wg_store_cached_b_output(
+    c_ptr,
+    accumulators,
+    pid_m,
+    pid_n,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    mi_m: tl.constexpr,
+    mi_n: tl.constexpr,
+    warps_m: tl.constexpr,
+    mma: tl.constexpr,
+    wide: tl.constexpr,
+):
+    group_m: tl.constexpr = 16 * warps_m
+    if warps_m == 4 and wide:
+        store_layout: tl.constexpr = tlx.layout(shape=((16, 4, 4, 2), (16, 1)),
+                                                stride=((128, 16, 2048, 64), (1, group_m * 128)))
+        accumulators = tlx.amd_mfma_commit(
+            tl.tuple([tlx.require_layout(accumulators[index], mma, pin=False) for index in range(mi_m * mi_n)]))
+        for row in tl.static_range(mi_m):
+            for column in tl.static_range(mi_n // 4):
+                committed = tl.tuple([
+                    tlx.require_layout(accumulators[row * mi_n + column * 4 + index], mma, pin=False)
+                    for index in range(4)
+                ])
+                lo = tl.cat(committed[0], committed[1], dim=1)
+                hi = tl.cat(committed[2], committed[3], dim=1)
+                value = tl.cat(lo, hi, dim=1)
+                row_base = pid_m * block_m + row * group_m
+                col_base = pid_n * block_n + column * 128
+                if M * stride_cm >= 1 << 30:
+                    row_base = row_base.to(tl.int64)
+                base = c_ptr + row_base * stride_cm + col_base * stride_cn
+                rows = tl.arange(0, group_m)
+                cols = tl.arange(0, 128)
+                offsets = tlx.require_layout(rows[:, None] * stride_cm + cols[None, :] * stride_cn, store_layout,
+                                             pin=False)
+                value = tlx.require_layout(value.to(c_ptr.dtype.element_ty), store_layout)
+                tlx.buffer_store(value, base, offsets, contiguity=8, cache=".cs")
+    else:
+        _wg_store_mi16_wave_grid_output(c_ptr, accumulators, pid_m, pid_n, stride_cm, stride_cn, M, N, block_m, block_n,
+                                        group_m, 32, mi_m, mi_n, False, wide, False, mma, store_cache=".cs")
+
+
+@triton.jit
+def _wg_kernel_cached_b_lds(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    MI_WAVE_TILE_M: tl.constexpr,
+    MI_WAVE_TILE_N: tl.constexpr,
+    WARPS_M: tl.constexpr,
+    PROGRAM_COUNT: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    WIDE: tl.constexpr,
+):
+    tl.static_assert(K % 64 == 0 and K >= 128 and K <= 256)
+    tl.static_assert(WARPS_M == 2 or WARPS_M == 4)
+    group_m: tl.constexpr = 16 * WARPS_M
+    block_m: tl.constexpr = group_m * MI_WAVE_TILE_M
+    block_n: tl.constexpr = 32 * MI_WAVE_TILE_N
+    tl.static_assert(M % block_m == 0 and N % block_n == 0)
+    grid_m: tl.constexpr = M // block_m
+    grid_n: tl.constexpr = N // block_n
+    tile_count: tl.constexpr = grid_m * grid_n
+    tl.static_assert(grid_m % GROUP_M == 0)
+    tl.static_assert(PROGRAM_COUNT % (GROUP_M * grid_n) == 0)
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
+                                            warps_per_cta=[WARPS_M, 2])
+    dot_a: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot_b: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    a_local = _wg_wave_grid_allocate_pgr2_operand_chunks(block_m, group_m, 64, 1, True, tlx.dtype_of(a_ptr))
+    b_locals = tl.tuple([
+        _wg_wave_grid_allocate_pgr2_operand_chunks(block_n, 32, 64, 1, False, tlx.dtype_of(b_ptr))
+        for _ in range(K // 64)
+    ])
+    program = tl.program_id(0)
+    first_pid_m, pid_n = _wg_cached_b_tile_coords(program, tile_count, grid_m, grid_n, GROUP_M, 1)
+    for kb in tl.static_range(K // 64):
+        b_values = tl.tuple([
+            _wg_wave_grid_global_load_pgr2_b_half(b_ptr, pid_n, kb, group, 0, block_m, block_n, MI_WAVE_TILE_M, 64, 32,
+                                                  stride_bk, stride_bn, M, N, cache_policy=".ca")
+            for group in range(MI_WAVE_TILE_N)
+        ])
+        for group in tl.static_range(MI_WAVE_TILE_N):
+            _wg_wave_grid_local_store_pgr2_fragment(a_local, b_locals[kb], tl.tuple([]), b_values, group,
+                                                    MI_WAVE_TILE_N, MI_WAVE_TILE_M, group_m, 32, 64)
+    tl.debug_barrier()
+    first_a = tl.tuple([
+        _wg_wave_grid_global_load_a(a_ptr, first_pid_m, 0, row, group_m, 32, block_m, 64, stride_am, stride_ak, M,
+                                    cache_policy=".ca") for row in range(MI_WAVE_TILE_M)
+    ])
+    for tile in tl.range(program, tile_count, PROGRAM_COUNT, num_stages=1):
+        pid_m, _ = _wg_cached_b_tile_coords(tile, tile_count, grid_m, grid_n, GROUP_M, 1)
+        future_pid_m, _ = _wg_cached_b_tile_coords(tile + PROGRAM_COUNT, tile_count, grid_m, grid_n, GROUP_M, 1)
+        current_a = first_a
+        accumulators = tl.tuple(
+            [tlx.zeros((group_m, 32), tl.float32, layout=mma) for _ in range(MI_WAVE_TILE_M * MI_WAVE_TILE_N)])
+        for kb in tl.static_range(K // 64):
+            tl.debug_barrier()
+            for row in tl.static_range(MI_WAVE_TILE_M):
+                _wg_wave_grid_local_store_pgr2_fragment(a_local, b_locals[kb], current_a, tl.tuple([]),
+                                                        MI_WAVE_TILE_N + row, MI_WAVE_TILE_N, MI_WAVE_TILE_M, group_m,
+                                                        32, 64)
+            tl.debug_barrier()
+            if kb + 1 < K // 64:
+                next_a = tl.tuple([
+                    _wg_wave_grid_global_load_a(a_ptr, pid_m, kb + 1, row, group_m, 32, block_m, 64, stride_am,
+                                                stride_ak, M, cache_policy=".ca") for row in range(MI_WAVE_TILE_M)
+                ])
+            for half in tl.static_range(2):
+                a_operands = tl.tuple([
+                    _wg_wave_grid_local_load_pgr2_a_half(a_local, row, half, group_m, MI_WAVE_TILE_M, dot_a)
+                    for row in range(MI_WAVE_TILE_M)
+                ])
+                b_operands = tl.tuple([
+                    _wg_wave_grid_local_load_pgr2_b_half(b_locals[kb], group, half, 32, MI_WAVE_TILE_N, dot_b)
+                    for group in range(MI_WAVE_TILE_N)
+                ])
+                accumulators = _wg_wave_grid_dot_column_major_range(a_operands, b_operands, accumulators, 0,
+                                                                    MI_WAVE_TILE_M * MI_WAVE_TILE_N, MI_WAVE_TILE_M,
+                                                                    MI_WAVE_TILE_N, mma, dot_a, dot_b, kb == 0
+                                                                    and half == 0)
+            if kb + 1 < K // 64:
+                current_a = next_a
+        if tile + PROGRAM_COUNT < tile_count:
+            first_a = tl.tuple([
+                _wg_wave_grid_global_load_a(a_ptr, future_pid_m, 0, row, group_m, 32, block_m, 64, stride_am, stride_ak,
+                                            M, cache_policy=".ca") for row in range(MI_WAVE_TILE_M)
+            ])
+        _wg_store_cached_b_output(c_ptr, accumulators, pid_m, pid_n, stride_cm, stride_cn, M, N, block_m, block_n,
+                                  MI_WAVE_TILE_M, MI_WAVE_TILE_N, WARPS_M, mma, WIDE)
+
+
+def _launch_cached_b(a, b, out, plan):
+    wide = out.stride(1) == 1 and out.stride(0) % 8 == 0 and out.data_ptr() % 16 == 0
+    _wg_kernel_cached_b_lds[(plan["PROGRAM_COUNT"], )](
+        a, b, out, a.shape[0], b.shape[1], a.shape[1], *a.stride(), *b.stride(), *out.stride(), **plan, WIDE=wide,
+        num_warps=2 * plan["WARPS_M"], num_stages=1, matrix_instr_nonkdim=16, regclass_priority_trumps_globalness=True,
+        reverse_local_assignment=True, sink_insts_to_avoid_spills=True, disable_unclustered_high_rp_reschedule=True)
+    return out
 
 
 @triton.jit
@@ -12691,6 +13031,17 @@ def _wg_kernel_persistent_mi16_wave_grid(
 
 
 @triton.jit
+def _wg_grouped_xcd_program(program, program_count: tl.constexpr, num_xcds: tl.constexpr, group_size: tl.constexpr):
+    tl.static_assert(group_size > 0 and (group_size & (group_size - 1)) == 0)
+    tl.static_assert(num_xcds > 0)
+    full_count: tl.constexpr = program_count // (num_xcds * group_size) * (num_xcds * group_size)
+    xcd = program // group_size % num_xcds
+    local_program = program // (num_xcds * group_size) * group_size + program % group_size
+    mapped = xcd * (full_count // num_xcds) + local_program
+    return tl.where(program < full_count, mapped, program)
+
+
+@triton.jit
 def _wg_kernel_regular_mi16_wave_grid(
     a_ptr,
     b_ptr,
@@ -12727,6 +13078,9 @@ def _wg_kernel_regular_mi16_wave_grid(
     LOOP_UNROLL_FACTOR: tl.constexpr,
     SPLIT_K: tl.constexpr,
     PAIR_BALANCED_SPLIT_K: tl.constexpr,
+    XCD_GROUP_SIZE: tl.constexpr = 1,
+    EXACT_LDS: tl.constexpr = False,
+    DOT_MODE: tl.constexpr = "persistent",
 ):
     """Regular MI16 wave grid with a VGPR -> LDS K32 pipeline."""
     tl.static_assert(BLOCK_K == 32 or BLOCK_K == 64 or (BLOCK_K == 128 and PGR2_OPERANDS))
@@ -12734,10 +13088,12 @@ def _wg_kernel_regular_mi16_wave_grid(
     tl.static_assert(WARPS_M == 1 or WARPS_M == 2 or WARPS_M == 4)
     tl.static_assert(WARPS_N == 1 or WARPS_N == 2 or WARPS_N == 4)
     tl.static_assert(WORKGROUP_MAPPING >= 1)
+    tl.static_assert(XCD_GROUP_SIZE > 0 and (XCD_GROUP_SIZE & (XCD_GROUP_SIZE - 1)) == 0)
     # Keep the supported MIWaveTile range explicit but geometry-independent.
     # In particular, vendor-selected non-power-of-two tiles such as
     # MT256x240 use MIWaveTile=4x15 and should not require a new kernel.
     tl.static_assert(MI_WAVE_TILE_N >= 2 and MI_WAVE_TILE_N <= 16)
+    tl.static_assert(not EXACT_LDS or (BLOCK_K == 64 and PGR2_OPERANDS and LOCAL_STAGES == 1 and not DIRECT_TO_LDS))
     block_m: tl.constexpr = 16 * MI_WAVE_TILE_M * WARPS_M
     block_n: tl.constexpr = 16 * MI_WAVE_TILE_N * WARPS_N
     a_row_count: tl.constexpr = MI_WAVE_TILE_M
@@ -12801,15 +13157,18 @@ def _wg_kernel_regular_mi16_wave_grid(
         # costs materially on short-K and very-wide grids.
         program = launch_program
     if NUM_XCDS != 1:
-        programs_per_xcd: tl.constexpr = tl.cdiv(program_count, NUM_XCDS)
-        remainder_xcds: tl.constexpr = program_count % NUM_XCDS
-        tall_xcds: tl.constexpr = (NUM_XCDS if remainder_xcds == 0 else remainder_xcds)
-        xcd = program % NUM_XCDS
-        local_program = program // NUM_XCDS
-        if xcd < tall_xcds:
-            program = xcd * programs_per_xcd + local_program
+        if XCD_GROUP_SIZE > 1:
+            program = _wg_grouped_xcd_program(program, program_count, NUM_XCDS, XCD_GROUP_SIZE)
         else:
-            program = (tall_xcds * programs_per_xcd + (xcd - tall_xcds) * (programs_per_xcd - 1) + local_program)
+            programs_per_xcd: tl.constexpr = tl.cdiv(program_count, NUM_XCDS)
+            remainder_xcds: tl.constexpr = program_count % NUM_XCDS
+            tall_xcds: tl.constexpr = (NUM_XCDS if remainder_xcds == 0 else remainder_xcds)
+            xcd = program % NUM_XCDS
+            local_program = program // NUM_XCDS
+            if xcd < tall_xcds:
+                program = xcd * programs_per_xcd + local_program
+            else:
+                program = (tall_xcds * programs_per_xcd + (xcd - tall_xcds) * (programs_per_xcd - 1) + local_program)
     grid_m: tl.constexpr = tl.cdiv(M, block_m)
     if LINEAR_TILES:
         first_tile = program * TILES_PER_PROGRAM
@@ -12885,7 +13244,12 @@ def _wg_kernel_regular_mi16_wave_grid(
             # boundary while retaining the exact logical fragments.
             # The allocator chooses the smallest power-of-two backing extent;
             # compact grids avoid reserving the full 256-element axis.
-            if LOCAL_STAGES == 2 and block_m <= 256 and block_n <= 256:
+            if EXACT_LDS:
+                a_local = _wg_wave_grid_allocate_pgr2_single_buffer_operand(block_m, a_group_m, BLOCK_K, True,
+                                                                            a_element_type)
+                b_local = _wg_wave_grid_allocate_pgr2_single_buffer_operand(block_n, b_group_n, BLOCK_K, False,
+                                                                            b_element_type, ROW_MAJOR_B_LDS)
+            elif LOCAL_STAGES == 2 and block_m <= 256 and block_n <= 256:
                 a_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
                     block_m,
                     a_group_m,
@@ -13412,6 +13776,7 @@ def _wg_kernel_regular_mi16_wave_grid(
                     REFILL_READ_WINDOW,
                     READ_COVER_SIXTEENTHS,
                     LOOP_UNROLL_FACTOR,
+                    dot_mode=DOT_MODE,
                 )
             else:
                 accumulators = _wg_logical_rect_k64_compute_tile_direct(
@@ -13550,6 +13915,7 @@ def _wg_kernel_regular_mi16_wave_grid(
                             long_split_k,
                             LOCAL_STAGES,
                             PGR2_LATE_READ_COUNT,
+                            dot_mode=DOT_MODE,
                         )
                     else:
                         accumulators = _wg_wave_grid_compute_tile_pgr2_k64(
@@ -13578,6 +13944,7 @@ def _wg_kernel_regular_mi16_wave_grid(
                             short_split_k,
                             LOCAL_STAGES,
                             PGR2_LATE_READ_COUNT,
+                            dot_mode=DOT_MODE,
                         )
                 else:
                     accumulators = _wg_wave_grid_compute_tile_pgr2_k64(
@@ -13606,6 +13973,7 @@ def _wg_kernel_regular_mi16_wave_grid(
                         main_k,
                         LOCAL_STAGES,
                         PGR2_LATE_READ_COUNT,
+                        dot_mode=DOT_MODE,
                     )
             elif (a_row_count == b_group_count and a_row_count >= 5 and a_row_count <= 8):
                 accumulators = _wg_wave_grid_compute_tile_regular_k64(
@@ -13948,7 +14316,7 @@ def _wg_kernel_regular_mi16_wave_grid(
             WIDE_EPILOGUE,
             M % block_m != 0 or N % block_n != 0,
             mma,
-            single_regular_k64,
+            single_regular_k64 or (PGR2_OPERANDS and not DIRECT_TO_LDS and DOT_MODE == "logical"),
         )
 
 
@@ -14339,11 +14707,14 @@ def _wg_matmul(
             LOOP_UNROLL_FACTOR=plan.get("loop_unroll_factor", 1),
             SPLIT_K=_split_k,
             PAIR_BALANCED_SPLIT_K=pair_balanced_split_k,
+            XCD_GROUP_SIZE=plan.get("xcd_group_size", 1),
+            EXACT_LDS=plan.get("exact_lds", False),
+            DOT_MODE=plan.get("dot_mode", "persistent"),
             num_warps=plan["num_warps"],
             num_stages=1,
             matrix_instr_nonkdim=16,
             waves_per_eu=plan.get("waves_per_eu", 0),
-            regclass_priority_trumps_globalness=True,
+            regclass_priority_trumps_globalness=plan.get("regclass_priority_trumps_globalness", True),
             reverse_local_assignment=plan.get("reverse_local_assignment", True),
             sink_insts_to_avoid_spills=plan.get("sink_insts_to_avoid_spills", False),
             disable_unclustered_high_rp_reschedule=plan.get("disable_unclustered_high_rp_reschedule", False),
@@ -15178,13 +15549,14 @@ def _register_kernel_impl(  # noqa: TR001
     CACHE_B_CG: tl.constexpr = False,
     PACK_B_PAIRS: tl.constexpr = False,
     B_PAIRS_PADDED: tl.constexpr = False,
+    XCD_CHUNK_SIZE: tl.constexpr = 4,
 ):
     pid = tl.program_id(0).to(tl.int32)
     grid_m = (M + BLOCK_M - 1) // BLOCK_M
     grid_n = (N + BLOCK_N - 1) // BLOCK_N
     grid_mn = grid_m * grid_n
 
-    xcd_chunk: tl.constexpr = 4
+    xcd_chunk: tl.constexpr = XCD_CHUNK_SIZE
     if NUM_XCDS != 1:
         aligned = (grid_mn // (NUM_XCDS * xcd_chunk)) * (NUM_XCDS * xcd_chunk)
         if pid < aligned:
@@ -15256,7 +15628,10 @@ def _register_kernel_impl(  # noqa: TR001
             eviction_policy="evict_last",
         )
         acc += bias.to(tl.float32)
-    output_offsets = idx_m * stride_cm + idx_n * stride_cn
+    if tl.cdiv(M, BLOCK_M) * BLOCK_M * stride_cm + tl.cdiv(N, BLOCK_N) * BLOCK_N * stride_cn >= 1 << 30:
+        output_offsets = idx_m.to(tl.int64) * stride_cm + idx_n.to(tl.int64) * stride_cn
+    else:
+        output_offsets = idx_m * stride_cm + idx_n * stride_cn
     if WRITE_STATS:
         value = acc.to(c_ptr.dtype.element_ty)
         value_fp32 = tl.where(mask, value.to(tl.float32), 0.0)
@@ -15668,6 +16043,11 @@ def _column_major_range_candidates(m, n, k, dtype, element_size, a_strides, b_st
         128, 64, 64, 4, 1, 4, 3), )
 
 
+def _offsets_fit_signed_i32(m, n, k, element_size, a_strides, b_strides):
+    max_offset = max((m - 1) * a_strides[0] + k - 1, (k - 1) * b_strides[0] + (n - 1) * b_strides[1], m * n)
+    return max_offset * element_size < 2**31
+
+
 @lru_cache(maxsize=None)
 def _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides):
     """Return bounded unsplit candidates for contiguous-A GEMM families."""
@@ -15676,8 +16056,7 @@ def _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides)
         return ()
     if _supports_short_k_register(m, n, k, dtype):
         return (("short_k_register", None), )
-    max_offset = max((m - 1) * a_strides[0] + k - 1, (k - 1) * b_strides[0] + (n - 1) * b_strides[1], m * n)
-    if not 128 <= k <= 4096 or n < 128 or max_offset * element_size >= 2**31:
+    if not 128 <= k <= 4096 or n < 128 or not _offsets_fit_signed_i32(m, n, k, element_size, a_strides, b_strides):
         return ()
     column_major = _column_major_range_candidates(m, n, k, dtype, element_size, a_strides, b_strides)
     if column_major:
@@ -15711,14 +16090,17 @@ def _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides)
             return ()
         return (register(128, 128, 64, 16, 8, 4, 2), register(256, 256, 64, 8, 8, 8, 2))
 
-    square = register(256, 256, 64, min(triton.cdiv(m, 256), 256) if n % 256 == 0 else 8, 1, 8, 2)
+    extreme_axis = m >= 8 * n or n >= 8 * k
+    square_group_m = min(triton.cdiv(m, 256), 256) if n % 256 == 0 or extreme_axis else 8
+    square = register(256, 256, 64, square_group_m, 1, 8, 2)
     compact = register(128, 128, 64, 16, 8, 4, 3)
     direct_legal = (k % 128 == 0 and k >= 512 and n % 8 == 0 and a_strides[0] % 8 == 0 and b_strides[0] % 8 == 0)
     if not direct_legal:
         return (compact, square)
     if (240 <= n <= 256 and k >= 1024 and a_strides == (k, 1) and b_strides == (n, 1)
             and _NUM_CU // 2 <= triton.cdiv(m, 160) <= _NUM_CU):
-        narrow_direct = _wg_regular_wave_grid_plan(5, 8, 2, 2, 64, local_stages=2, pgr2_operands=True,
+        warps_n = 4 if 1536 <= k <= 2048 and triton.cdiv(m, 160) >= 3 * _NUM_CU // 4 else 2
+        narrow_direct = _wg_regular_wave_grid_plan(5, 16 // warps_n, 2, warps_n, 64, local_stages=2, pgr2_operands=True,
                                                    direct_to_lds=True, direct_chunk=64, row_major_b_lds=True,
                                                    row_wise_epilogue=True, num_xcds=1, workgroup_mapping=1,
                                                    reverse_local_assignment=True, sink_insts_to_avoid_spills=True,
@@ -15738,7 +16120,7 @@ def _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides)
                                       wide_epilogue=True, num_xcds=8, workgroup_mapping=6,
                                       reverse_local_assignment=False, sink_insts_to_avoid_spills=True,
                                       disable_unclustered_high_rp_reschedule=True)
-    if m >= 8 * n and n % 256 == 0:
+    if extreme_axis:
         return (square, ("wave_grid", wide), compact)
     return (("wave_grid", wide), square, compact)
 
@@ -15808,17 +16190,15 @@ def _range_register_launch_options(a, b, config):
     options = {}
     if a.dtype == torch.bfloat16 and config["BLOCK_K"] == 64:
         options["llvm_fn_attrs"] = (("amdgpu-agpr-alloc", "0,0"), )
-        if (config["BLOCK_M"] >= 128 and b.shape[1] % config["BLOCK_N"] != 0 and b.stride(1) == 1
+        square = config["BLOCK_M"] == config["BLOCK_N"] == 256
+        if (not square and config["BLOCK_M"] >= 128 and b.shape[1] % config["BLOCK_N"] != 0 and b.stride(1) == 1
                 and a.shape[0] >= 8 * b.shape[1]):
             options["CACHE_A_CG"] = True
-        if config["BLOCK_M"] == config["BLOCK_N"] == 256:
+        if square and b.shape[1] % 256 == 0:
             grid_m = triton.cdiv(a.shape[0], 256)
             grid_n = triton.cdiv(b.shape[1], 256)
             if grid_m >= 2 * grid_n:
-                if b.shape[1] % 256:
-                    options["reverse_local_assignment"] = True
-                else:
-                    options["disable_unclustered_high_rp_reschedule"] = True
+                options["disable_unclustered_high_rp_reschedule"] = True
     options["PACK_B_PAIRS"] = (config.get("PACK_B_PAIRS", False) and a.dtype == torch.bfloat16 and b.stride(1) == 2
                                and b.stride(0) % 2 == 0 and b.data_ptr() % 4 == 0)
     options["B_PAIRS_PADDED"] = (options["PACK_B_PAIRS"] and config.get("B_PAIRS_PADDED", False)
@@ -17574,6 +17954,9 @@ def _regular_wave_grid_options(plan, split_k):
         "LOOP_UNROLL_FACTOR": plan.get("loop_unroll_factor", 1),
         "SPLIT_K": split_k,
         "PAIR_BALANCED_SPLIT_K": plan.get("pair_balanced_split_k", False),
+        "XCD_GROUP_SIZE": plan.get("xcd_group_size", 1),
+        "EXACT_LDS": plan.get("exact_lds", False),
+        "DOT_MODE": plan.get("dot_mode", "persistent"),
         "num_warps": plan["num_warps"],
         "num_stages": 1,
         "matrix_instr_nonkdim": 16,
@@ -18371,6 +18754,7 @@ def _iw_a16w16_8wave(
     DEFER_EPILOGUE: tl.constexpr,
     WARPS_M: tl.constexpr,
     WARPS_N: tl.constexpr,
+    STORE_CACHE: tl.constexpr = "",
 ):
     # ── Split-K: grid is GRID_MN*SPLIT_K. Peel off split_id, keep the MN pid for
     # the XCD/group remap below. Each split owns a contiguous K-slice of size KS.
@@ -18818,38 +19202,41 @@ def _iw_a16w16_8wave(
                 # Static guard (no device code): the pin must survive
                 # coalesce/remove-layout-conversions/AMD optimize-epilogue.
                 tlx.assert_same_layout(c_tl, L)
-                tl.store(c_ptr + c_top_left, c_tl, mask=m_top & n_left)
+                tl.store(c_ptr + c_top_left, c_tl, mask=m_top & n_left, cache_modifier=STORE_CACHE)
             else:
-                tl.store(c_ptr + c_top_left, acc_tl.to(et), mask=m_top & n_left)
+                tl.store(c_ptr + c_top_left, acc_tl.to(et), mask=m_top & n_left, cache_modifier=STORE_CACHE)
             if SECOND_M == 128 and FIRST_N == 128:
                 tl.store(
                     c_ptr + c_bot_left,
                     tlx.require_layout(acc_bl.to(et), L),
                     mask=m_bot & n_left,
+                    cache_modifier=STORE_CACHE,
                 )
             else:
-                tl.store(c_ptr + c_bot_left, acc_bl.to(et), mask=m_bot & n_left)
+                tl.store(c_ptr + c_bot_left, acc_bl.to(et), mask=m_bot & n_left, cache_modifier=STORE_CACHE)
             if FIRST_M == 128 and SECOND_N == 128:
                 tl.store(
                     c_ptr + c_top_right,
                     tlx.require_layout(acc_tr.to(et), L),
                     mask=m_top & n_right,
+                    cache_modifier=STORE_CACHE,
                 )
             else:
-                tl.store(c_ptr + c_top_right, acc_tr.to(et), mask=m_top & n_right)
+                tl.store(c_ptr + c_top_right, acc_tr.to(et), mask=m_top & n_right, cache_modifier=STORE_CACHE)
             if SECOND_M == 128 and SECOND_N == 128:
                 tl.store(
                     c_ptr + c_bot_right,
                     tlx.require_layout(acc_br.to(et), L),
                     mask=m_bot & n_right,
+                    cache_modifier=STORE_CACHE,
                 )
             else:
-                tl.store(c_ptr + c_bot_right, acc_br.to(et), mask=m_bot & n_right)
+                tl.store(c_ptr + c_bot_right, acc_br.to(et), mask=m_bot & n_right, cache_modifier=STORE_CACHE)
         else:
-            tl.store(c_ptr + c_top_left, acc_tl.to(et), mask=m_top & n_left)
-            tl.store(c_ptr + c_bot_left, acc_bl.to(et), mask=m_bot & n_left)
-            tl.store(c_ptr + c_top_right, acc_tr.to(et), mask=m_top & n_right)
-            tl.store(c_ptr + c_bot_right, acc_br.to(et), mask=m_bot & n_right)
+            tl.store(c_ptr + c_top_left, acc_tl.to(et), mask=m_top & n_left, cache_modifier=STORE_CACHE)
+            tl.store(c_ptr + c_bot_left, acc_bl.to(et), mask=m_bot & n_left, cache_modifier=STORE_CACHE)
+            tl.store(c_ptr + c_top_right, acc_tr.to(et), mask=m_top & n_right, cache_modifier=STORE_CACHE)
+            tl.store(c_ptr + c_bot_right, acc_br.to(et), mask=m_bot & n_right, cache_modifier=STORE_CACHE)
     else:
         # Split-K: every split writes its fp32 partial into its workspace slice
         # (rows [split_id*M, split_id*M+M)). Mask stays in relative-M coords; the
@@ -19619,6 +20006,7 @@ def _iw_launch(
     WAVES_PER_EU=0,
     REGCLASS_PRIORITY=False,
     MATRIX_INSTR_NONKDIM=16,
+    STORE_CACHE="",
 ):
     """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
     M, input_k = a.shape
@@ -19737,6 +20125,7 @@ def _iw_launch(
         DEFER_EPILOGUE=DEFER_EPILOGUE,
         WARPS_M=warps_m,
         WARPS_N=warps_n,
+        STORE_CACHE=STORE_CACHE,
         num_warps=warps_m * warps_n,
         num_stages=1,
         matrix_instr_nonkdim=MATRIX_INSTR_NONKDIM,
@@ -22151,6 +22540,292 @@ def _incumbent_heuristic_config(m, n, k, dtype, element_size, a_strides, b_strid
     return register(128, 128, 64, 8, 8, 0, 4, 2)
 
 
+def _cached_b_geometry_plan(m, n, k, dtype, a_strides):
+    if k % 64 or not 128 <= k <= 256 or a_strides != (k, 1) or n % 256:
+        return None
+    warps_m = 4 if dtype == torch.bfloat16 else 2
+    if warps_m == 4 and k > 192:
+        return None
+    block_m = 64 * warps_m
+    group_m = 8 if warps_m == 4 else 1
+    grid_n = n // 256
+    if warps_m == 2 and grid_n != 1:
+        return None
+    if (m < 8 * NUM_CU * block_m or m % (block_m * group_m) or not 1 <= grid_n <= 8 or NUM_CU % (group_m * grid_n)):
+        return None
+    return {
+        "MI_WAVE_TILE_M": 4,
+        "MI_WAVE_TILE_N": 8,
+        "WARPS_M": warps_m,
+        "PROGRAM_COUNT": NUM_CU,
+        "GROUP_M": group_m,
+    }
+
+
+def _optimized_row_major_config(m, n, k):
+    if m >= 32768 and m % 16 == 0 and n >= 4096 and n % 256 == 0 and 1536 <= k < 3072 and k % 128 == 0:
+        mi_wave_tile_n = 10 if m % 192 == 0 and n % 320 == 0 else 8
+        return "wave_grid", _wg_regular_wave_grid_plan(6, mi_wave_tile_n, 2, 2, 64, local_stages=2, pgr2_operands=True,
+                                                       pgr2_late_read_count=14 if mi_wave_tile_n == 10 else 2,
+                                                       row_major_b_lds=True, row_wise_epilogue=True, wide_epilogue=True,
+                                                       num_xcds=8, xcd_group_size=4, reverse_local_assignment=True,
+                                                       disable_unclustered_high_rp_reschedule=True,
+                                                       llvm_sched_strategy="iterative-ilp")
+    if m >= 32768 and n >= 3072 and n % 256 == 0 and 3072 <= k <= 5120 and k % 32 == 0:
+        plan = dict(_fixed_register_plan(128, 256, 32, 64, 8, 4, 2))
+        plan["llvm_fn_attrs"] = (("amdgpu-sched-strategy", "iterative-ilp"), )
+        return "register", plan
+    wide_n = m >= 2048 and n >= 8 * k and n % 256 == 0 and k >= 512 and 2 * n * k >= 1 << 29
+    long_k = m >= 32768 and m % 16 == 0 and 4096 <= n <= 8192 and k >= 6144 and k % 64 == 0
+    if wide_n or long_k:
+        return "wave_grid", _wg_regular_wave_grid_plan(6, 8, 2, 2, 64, local_stages=2, pgr2_operands=True,
+                                                       row_major_b_lds=True, row_wise_epilogue=True, wide_epilogue=True,
+                                                       num_xcds=8 if wide_n else 1,
+                                                       workgroup_mapping=4 if wide_n else 1,
+                                                       reverse_local_assignment=True, sink_insts_to_avoid_spills=True,
+                                                       disable_unclustered_high_rp_reschedule=True)
+    reverse = ((m >= 4096 and n <= 256 and k >= 512) or (m >= 4096 and n >= 1024 and 512 <= k <= 3072)
+               or (2048 <= m < 4096 and k >= 2 * n and n >= 4096))
+    plan = _ROW_MAJOR_WAVE_GRID_PLANS.get((m, n, k)) if reverse else None
+    if plan is not None and plan.get("kind") == "regular_mi16_wave_grid":
+        plan = dict(plan, reverse_local_assignment=True)
+        tile_m = 16 * plan["mi_wave_tile_m"] * plan["warps_m"]
+        tile_n = 16 * plan["mi_wave_tile_n"] * plan["warps_n"]
+        if (m >= 262144 and tile_m >= 256 and m % tile_m == 0 and n == tile_n and 128 <= n <= 256 and 512 <= k <= 1536
+                and k % 64 == 0 and plan["block_k"] == 64 and plan["pgr2_operands"] and plan["local_stages"] == 2):
+            plan["pgr2_late_read_count"] = 4
+            plan["llvm_fn_attrs"] = (("amdgpu-sched-strategy", "iterative-ilp"), )
+        return "wave_grid", plan
+    return None
+
+
+def _optimized_tn_config(m, n, k):
+    if k == 256 and NUM_CU * 64 <= m <= NUM_CU * 128 and 64 < n <= 96:
+        return "wave_grid", _wg_regular_wave_grid_plan(2, 3, 2, 2, 64)
+    if 512 <= m <= 1024 and n >= 32768 and 2048 <= k <= 4096:
+        dispatch = _dispatch_plan(m, n, k, torch.float16, 2)
+        if dispatch is not None and dispatch[0] in ("wave_grid", "transposed_wave_grid"):
+            plan = dispatch[1]
+            if (plan.get("kind") == "regular_mi16_wave_grid" and plan.get("mi_wave_tile_m") == 7
+                    and plan.get("mi_wave_tile_n") == 7 and not plan.get("pgr2_operands")
+                    and not plan.get("direct_to_lds")):
+                if dispatch[0] == "transposed_wave_grid" and k == 4096:
+                    return dispatch[0], dict(plan, reverse_local_assignment=True, pgr2_operands=True, local_stages=2)
+                if dispatch[0] == "wave_grid":
+                    return "wave_grid", dict(plan, reverse_local_assignment=True)
+    if 128 <= m <= 160 and n >= 65536 and k == 768:
+        dispatch = _dispatch_plan(m, n, k, torch.float16, 2)
+        if dispatch is not None and dispatch[0] == "transposed_wave_grid":
+            plan = dispatch[1]
+            if (plan.get("kind") == "regular_mi16_wave_grid" and plan.get("mi_wave_tile_m") == 5
+                    and plan.get("mi_wave_tile_n") == 5 and plan.get("pgr2_operands") and not plan.get("direct_to_lds")
+                    and plan.get("local_stages") == 1):
+                return dispatch[0], dict(plan, dot_mode="logical")
+    if k == 256 and m >= 8192 and 192 <= n <= 256:
+        dispatch = _dispatch_plan(m, n, k, torch.float16, 2)
+        if dispatch is not None and dispatch[0] == "wave_grid":
+            plan = dispatch[1]
+            if (plan.get("kind") == "regular_mi16_wave_grid" and plan.get("mi_wave_tile_m") == 4
+                    and plan.get("mi_wave_tile_n") == 5 and plan.get("warps_m") == 2 and plan.get("warps_n") == 2
+                    and not plan.get("pgr2_operands") and not plan.get("direct_to_lds")):
+                return "wave_grid", dict(plan, reverse_local_assignment=False)
+    if 1024 <= m <= 2048 and n >= 16384 and k == 512:
+        dispatch = _dispatch_plan(m, n, k, torch.float16, 2)
+        if dispatch is not None and dispatch[0] == "wave_grid":
+            plan = dispatch[1]
+            if (plan.get("kind") == "regular_mi16_wave_grid" and plan.get("mi_wave_tile_m") == 8
+                    and plan.get("mi_wave_tile_n") == 8 and plan.get("warps_m") == 2 and plan.get("warps_n") == 2
+                    and plan.get("direct_to_lds") and not plan.get("pgr2_operands")):
+                return "wave_grid", dict(plan, reverse_local_assignment=True, num_xcds=8, workgroup_mapping=8)
+    if k == 256 and m >= NUM_CU * 32 and n >= NUM_CU * 32:
+        plan = _fixed_register_plan(256, 256, 64, 2, 8, 8, 2, matrix_instr_nonkdim=32)
+        return "register", dict(plan, XCD_CHUNK_SIZE=16)
+    stream_a = m >= NUM_CU * 128 and 64 <= n <= 96 and 512 <= k <= 768 and k % 64 == 0
+    stream_b = 64 <= m <= 128 and n >= 65536 and 512 <= k <= 1536 and k % 128 == 0
+    if stream_a or stream_b:
+        dispatch = _dispatch_plan(m, n, k, torch.float16, 2)
+        if dispatch is not None and dispatch[0] == "register":
+            config = dispatch[1]
+            if config["BLOCK_M"] == config["BLOCK_N"] == 128 and config["num_stages"] == 2:
+                if stream_a and config["BLOCK_K"] == 64 and config["num_warps"] == 4:
+                    return "register", dict(config, CACHE_A_CG=True)
+                if stream_b and config["BLOCK_K"] == 128 and config["num_warps"] == 8:
+                    return "register", dict(config, CACHE_B_CG=True)
+    register_rows = triton.cdiv(m, 128)
+    register_grid = register_rows * triton.cdiv(n, 64)
+    if (3 <= register_rows <= 4 and 9 * NUM_CU <= 16 * register_grid <= 16 * NUM_CU and 2048 <= k <= 4608 and k < 2 * n
+            and k % 64 == 0 and n % 64 == 0):
+        return "register", _fixed_register_plan(128, 64, 64, 4, 1, 4, 3, matrix_instr_nonkdim=32)
+    if 64 <= m <= 128 and n >= 32768 and 192 <= k <= 256 and k % 64 == 0:
+        return "transposed_wave_grid", _wg_regular_wave_grid_plan(5, 4, 2, 2, 64, pgr2_operands=True, exact_lds=True,
+                                                                  num_xcds=8, reverse_local_assignment=True,
+                                                                  sink_insts_to_avoid_spills=True,
+                                                                  disable_unclustered_high_rp_reschedule=True,
+                                                                  llvm_sched_strategy="iterative-maxocc")
+    store_grid = triton.cdiv(m, 256) * triton.cdiv(n, 256)
+    if (m * n >= 8 * (1 << 20) and 3 * NUM_CU // 4 <= store_grid <= NUM_CU and m % 256 == 0 and n % 256 == 0
+            and 1024 <= k <= 4096 and k % 64 == 0):
+        return "inter_wave", {
+            "TILE": (256, 256),
+            "SPLIT_K": 1,
+            "GROUP_M_OVERRIDE": 2,
+            "NUM_XCDS_OVERRIDE": 1,
+            "WORKGROUP_MAPPING": 4,
+            "WAVES_PER_EU": 1,
+            "STORE_CACHE": ".cs",
+        }
+    direct_grid = triton.cdiv(m, 64) * triton.cdiv(n, 96)
+    if (512 <= m < 1024 and 1024 <= n <= 2048 and k >= 2 * n and k % 256 == 0
+            and 7 * NUM_CU <= 8 * direct_grid <= 8 * NUM_CU):
+        dispatch = _dispatch_plan(m, n, k, torch.float16, 2)
+        if (dispatch is not None and dispatch[0] == "wave_grid" and dispatch[1].get("kind") == "regular_mi16_wave_grid"
+                and dispatch[1].get("block_k") == 128 and dispatch[1].get("pgr2_operands")
+                and dispatch[1].get("direct_to_lds")):
+            return "wave_grid", _wg_regular_wave_grid_plan(2, 3, 2, 2, 128, local_stages=2, pgr2_operands=True,
+                                                           direct_to_lds=True, row_wise_epilogue=True,
+                                                           reverse_local_assignment=True,
+                                                           sink_insts_to_avoid_spills=True,
+                                                           disable_unclustered_high_rp_reschedule=True)
+    if 512 <= m <= 2048 and 1024 <= n <= 2048 and k >= 16384:
+        dispatch = _dispatch_plan(m, n, k, torch.float16, 2)
+        if dispatch is not None and dispatch[0] == "wave_grid":
+            plan = dispatch[1]
+            if (plan.get("kind") == "regular_mi16_wave_grid" and plan.get("mi_wave_tile_m") == 5
+                    and plan.get("mi_wave_tile_n") == 7 and plan.get("warps_m") == plan.get("warps_n") == 2
+                    and plan.get("block_k") == 64 and plan.get("local_stages") == 2 and plan.get("pgr2_operands")
+                    and not plan.get("direct_to_lds")):
+                return dispatch[0], dict(plan, reverse_local_assignment=True, dot_mode="logical")
+    reverse = (1024 <= m < 4096 and ((n <= 2048 and k >= 2 * n) or (k <= 512 and n >= 8 * k)))
+    dispatch = _dispatch_plan(m, n, k, torch.float16, 2) if reverse else None
+    if (dispatch is not None and dispatch[0] in ("wave_grid", "transposed_wave_grid")
+            and dispatch[1].get("kind") == "regular_mi16_wave_grid"):
+        plan = dict(dispatch[1], reverse_local_assignment=True)
+        block_m = 16 * plan["mi_wave_tile_m"] * plan["warps_m"]
+        block_n = 16 * plan["mi_wave_tile_n"] * plan["warps_n"]
+        tile_grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
+        if (block_m == block_n == 128 and plan["block_k"] == 64 and plan.get("pgr2_operands")
+                and plan.get("local_stages") == 2 and plan.get("pgr2_late_read_count") == 2 and k >= 3 * n
+                and 3 * NUM_CU <= 4 * tile_grid <= 4 * NUM_CU):
+            plan["direct_to_lds"] = True
+            plan["pgr2_late_read_count"] = 0
+        return dispatch[0], plan
+    dispatch = _dispatch_plan(m, n, k, torch.float16, 2)
+    if (dispatch is not None and dispatch[0] == "wave_grid" and m >= NUM_CU * 128 and n <= 144 and n % 32 == 16
+            and 1536 <= k <= 4096 and k % 128 == 0):
+        plan = dispatch[1]
+        if (plan.get("kind") == "regular_mi32_wave_grid" and plan.get("warps_m") == 4 and plan.get("warps_n") == 1
+                and plan.get("local_stages") == 1 and not plan.get("pgr2_operands")
+                and 2 * plan["mi_wave_tile_m"] * (n // 16) <= 54):
+            return "wave_grid", dict(plan, kind="regular_mi16_wave_grid", matrix_instr_nonkdim=16,
+                                     mi_wave_tile_m=2 * plan["mi_wave_tile_m"], mi_wave_tile_n=n // 16,
+                                     reverse_local_assignment=True, sink_insts_to_avoid_spills=True,
+                                     disable_unclustered_high_rp_reschedule=True)
+    if (dispatch is not None and dispatch[0] == "wave_grid" and m >= NUM_CU * 128 and 192 < n <= 224 and k == 1024):
+        plan = dispatch[1]
+        if (plan.get("kind") == "regular_mi16_wave_grid" and plan.get("block_k") == 64
+                and plan.get("mi_wave_tile_m") == 4 and plan.get("mi_wave_tile_n") == 13 and plan.get("warps_m") == 4
+                and plan.get("warps_n") == 1 and not plan.get("pgr2_operands")):
+            return "wave_grid", _wg_regular_wave_grid_plan(8, 7, 2, 2, 64, local_stages=2, linear_tiles=True,
+                                                           pgr2_operands=True, pgr2_late_read_count=8,
+                                                           dot_mode="logical")
+    if (dispatch is not None and dispatch[0] == "wave_grid" and dispatch[1].get("kind") == "regular_mi16_wave_grid"
+            and dispatch[1].get("num_warps") == 4 and dispatch[1].get("block_k") == 64
+            and dispatch[1].get("pgr2_operands") and dispatch[1].get("local_stages") == 2
+            and dispatch[1].get("direct_to_lds") and dispatch[1].get("warps_m") == 2
+            and dispatch[1].get("warps_n") == 2):
+        plan = dispatch[1]
+        if (m >= NUM_CU * 128 and 512 <= n <= 1024 and 512 <= k <= 1024 and k % 128 == 0 and plan["mi_wave_tile_m"] == 8
+                and plan["mi_wave_tile_n"] == 5):
+            return "wave_grid", dict(plan, reverse_local_assignment=True, loop_unroll_factor=4)
+        if (1024 <= m <= 8192 and 2048 <= n <= 8192 and k == 512 and plan["mi_wave_tile_m"] == 7
+                and plan["mi_wave_tile_n"] == 4 and plan.get("direct_chunk") == 32):
+            return "wave_grid", dict(plan, reverse_local_assignment=True, loop_unroll_factor=2)
+    if (dispatch is not None and dispatch[0] in ("wave_grid", "transposed_wave_grid")
+            and dispatch[1].get("kind") == "regular_mi16_wave_grid" and dispatch[1].get("block_k") == 64
+            and dispatch[1].get("pgr2_operands") and dispatch[1].get("num_warps") == 4):
+        plan = dispatch[1]
+        tile_m = plan["mi_wave_tile_m"]
+        tile_n = plan["mi_wave_tile_n"]
+        if k == 1024 and n >= 65536 and plan.get("local_stages") == 2 and plan.get("warps_m") == 2:
+            if dispatch[0] == "transposed_wave_grid" and 1024 <= m <= 2048:
+                if tile_m == 8 and tile_n == 5 and plan.get("direct_to_lds"):
+                    return dispatch[0], dict(plan, reverse_local_assignment=True, dot_mode="logical")
+                if tile_m == 8 and tile_n == 6 and not plan.get("direct_to_lds"):
+                    return dispatch[0], dict(plan, direct_to_lds=True, direct_chunk=128, pack_direct_chunks=False,
+                                             reverse_local_assignment=True, dot_mode="logical")
+            if (dispatch[0] == "wave_grid" and 704 <= m <= 768 and tile_m == tile_n == 8 and plan.get("direct_to_lds")):
+                return dispatch[0], dict(plan, mi_wave_tile_n=6, reverse_local_assignment=True, dot_mode="logical")
+            if (dispatch[0] == "wave_grid" and 640 <= m <= 672 and tile_m == tile_n == 8 and plan.get("direct_to_lds")):
+                return dispatch[0], dict(plan, mi_wave_tile_m=7, reverse_local_assignment=True, dot_mode="logical")
+        if (dispatch[0] == "transposed_wave_grid" and k == 4096 and n >= 65536 and 1024 <= m <= 2048
+                and plan.get("local_stages") == 2 and plan.get("warps_m") == plan.get("warps_n") == 2
+                and plan.get("direct_to_lds")):
+            if tile_m == 8 and tile_n == 6:
+                return dispatch[0], dict(plan, reverse_local_assignment=True, dot_mode="logical")
+            if tile_m == tile_n == 8 and plan.get("direct_chunk") == 32:
+                return dispatch[0], dict(plan, reverse_local_assignment=True, loop_unroll_factor=4,
+                                         regclass_priority_trumps_globalness=False)
+        if not plan.get("direct_to_lds"):
+            if (dispatch[0] == "wave_grid" and tile_m == tile_n == 7 and plan.get("local_stages") == 2
+                    and 192 <= m <= 224 and n >= 65536 and n % 224 == 0 and k >= 4096 and k % 128 == 0):
+                return dispatch[0], dict(plan, dot_mode="logical", pgr2_late_read_count=8)
+            if (dispatch[0] == "transposed_wave_grid" and k == 8192 and 8192 <= m <= 16384 and 1024 <= n <= 2048
+                    and tile_m == tile_n == 6 and plan.get("local_stages") == 2
+                    and plan.get("warps_m") == plan.get("warps_n") == 2):
+                return dispatch[0], dict(plan, reverse_local_assignment=True, workgroup_mapping=2)
+            if (dispatch[0] == "wave_grid" and k == 4096 and m <= 512 and n >= 65536 and tile_m == 7 and tile_n == 6
+                    and plan.get("local_stages") == 2 and plan.get("warps_m") == plan.get("warps_n") == 2):
+                return dispatch[0], dict(plan, reverse_local_assignment=True, workgroup_mapping=2)
+            if (dispatch[0] == "wave_grid" and k == 4096 and m <= 512 and n >= 65536 and tile_m == 7 and tile_n == 5
+                    and plan.get("local_stages") == 2 and plan.get("warps_m") == plan.get("warps_n") == 2):
+                return dispatch[0], dict(plan, reverse_local_assignment=False, pgr2_late_read_count=8,
+                                         dot_mode="transient")
+            if (tile_m == 10 and tile_n == 5 and plan.get("local_stages") == 2 and m >= NUM_CU * 128 and n <= 512
+                    and 4096 <= k <= 8192):
+                return dispatch[0], dict(plan, llvm_fn_attrs="")
+            if (tile_m == 5 and tile_n == 3 and plan.get("warps_m") == 1 and plan.get("warps_n") == 4
+                    and 4096 <= k <= 8192):
+                return dispatch[0], dict(plan, reverse_local_assignment=True, dot_mode="transient")
+    if (dispatch is not None and dispatch[0] in ("wave_grid", "transposed_wave_grid")
+            and dispatch[1].get("kind") == "regular_mi16_wave_grid" and dispatch[1].get("num_warps") == 4
+            and dispatch[1].get("block_k") == 64 and dispatch[1].get("pgr2_operands")
+            and dispatch[1].get("local_stages") == 2 and not dispatch[1].get("reverse_local_assignment")):
+        return dispatch[0], dict(dispatch[1], reverse_local_assignment=True)
+    return None
+
+
+def _optimized_geometry_config(m, n, k, dtype, element_size, a_strides, b_strides):
+    if (dtype not in (torch.float16, torch.bfloat16) or min(m, n, k) <= 0 or a_strides[1] != 1
+            or (b_strides[0] != 1 and b_strides[1] != 1)
+            or not _offsets_fit_signed_i32(m, n, k, element_size, a_strides, b_strides)):
+        return None
+    cached = _cached_b_geometry_plan(m, n, k, dtype, a_strides)
+    if cached is not None:
+        return "cached_b_lds", cached
+    if (dtype == torch.bfloat16 and k % 512 == 256 and k >= 48 * m and n >= 1024 and m >= 2 * n and m % 256 == 0
+            and n % 256 != 0 and b_strides[0] == 1 and a_strides[0] % 32 == 0 and b_strides[1] % 32 == 0
+            and (m - 1) * a_strides[0] + k - 1 < 1 << 30 and (n - 1) * b_strides[1] + k - 1 < 1 << 30):
+        tile_grid = triton.cdiv(m, 256) * triton.cdiv(n, 256)
+        if 2 * tile_grid == NUM_CU:
+            return "lds", (256, 256, 4)
+    if dtype != torch.float16:
+        return None
+    if b_strides[1] == 1:
+        return _optimized_row_major_config(m, n, k)
+    if a_strides[0] % 8 or b_strides[1] % 8:
+        return None
+    return _optimized_tn_config(m, n, k)
+
+
+def _optimized_dispatch_for(a, b):
+    if (a.ndim != 2 or b.ndim != 2 or a.dtype != b.dtype or not a.is_cuda or a.device != b.device
+            or a.shape[1] != b.shape[0] or a.data_ptr() % 16 or b.data_ptr() % 16
+            or _wg_device_arch(a.device) != "gfx950"):
+        return None
+    return _optimized_geometry_config(a.shape[0], b.shape[1], a.shape[1], a.dtype, a.element_size(), a.stride(),
+                                      b.stride())
+
+
 def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
     """Return one gfx950 plan from the geometry default or incumbent policy."""
     candidates = _range_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides, include_incumbent=False)
@@ -22160,6 +22835,9 @@ def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
 
 
 def _dispatch_for(a, b):
+    optimized = _optimized_dispatch_for(a, b)
+    if optimized is not None:
+        return optimized
     if a.dtype == torch.bfloat16:
         ranged = _range_dispatch_for(a, b)
         if ranged is not None:
@@ -22226,6 +22904,8 @@ def _launch_production_wave_grid(a, b, out, plan):
 
 def _launch_dispatch(a, b, out, dispatch):
     path, plan = dispatch
+    if path == "cached_b_lds":
+        return _launch_cached_b(a, b, out, plan)
     if path == "short_k_register":
         return _launch_short_k_register(a, b, out=out)
     if path == "row_major_direct":
@@ -22410,7 +23090,9 @@ def mm(a, b, *, out=None, space="heuristic"):
         # master heuristic remains the fallback for layouts such as row-major B
         # that are outside the promoted selector's validated domain.
         if a.dtype == torch.float16 and a.stride(1) == 1 and b.stride(0) == 1:
-            dispatch = _dispatch_plan(m, n, k, a.dtype, a.element_size())
+            dispatch = _optimized_dispatch_for(a, b)
+            if dispatch is None:
+                dispatch = _dispatch_plan(m, n, k, a.dtype, a.element_size())
         else:
             dispatch = _dispatch_for(a, b)
         if dispatch is None:
@@ -22429,6 +23111,8 @@ def mm(a, b, *, out=None, space="heuristic"):
     # Keep this catalog hot path inline: ``tlx.ops.mm`` already validated the
     # inputs, and another Python call is material for the small-M kernels.
     path, plan = dispatch
+    if path == "cached_b_lds":
+        return _launch_cached_b(a, b, out, plan)
     if path == "short_k_register":
         return _launch_short_k_register(a, b, out=out)
     if path == "row_major_direct":
