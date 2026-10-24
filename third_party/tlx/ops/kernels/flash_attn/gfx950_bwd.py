@@ -5792,11 +5792,12 @@ def _attn_bwd_diagonal_probabilities(
     LEFT_LAYOUT: tl.constexpr,
     RIGHT_LAYOUT: tl.constexpr,
     SINGLE_QUERY_HEAD: tl.constexpr = False,
+    SKIP_FULL_GROUP_MASK: tl.constexpr = False,
 ):
     """Skip fully masked key groups and convert each valid group to BF16."""
     tl.static_assert(BLOCK_M == 16 and BLOCK_N == 256)
     group_rows: tl.constexpr = 64
-    # One-head causal traversal keeps each phase index inside the query head.
+    # Each causal MHA owner processes one query head.
     m_block = step if SINGLE_QUERY_HEAD else step % (N // BLOCK_M)
     query_fragment = m_block - pid_n * (BLOCK_N // BLOCK_M)
     last_group = query_fragment // (group_rows // BLOCK_M)
@@ -5841,16 +5842,23 @@ def _attn_bwd_diagonal_probabilities(
             scale_full = tlx.require_layout(tl.full((group_rows, BLOCK_M), SM_SCALE * 1.4426950408889634, tl.float32),
                                             MMA_NM, pin=False)
             scaled = score * scale_full - lse_full
-            key_rows = pid_n * BLOCK_N + group * group_rows + tlx.rematerialized_range(
-                0, group_rows, 32, placement=step)
-            query_rows = m_block * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
-            valid = tlx.require_layout(key_rows[:, None] <= query_rows[None, :], MMA_NM, pin=False)
-            neg_inf = tlx.require_layout(tl.full((group_rows, BLOCK_M), float("-inf"), tl.float32), MMA_NM, pin=False)
-            scaled = tlx.require_layout(tl.where(valid, scaled, neg_inf), MMA_NM, pin=False)
+            if not SKIP_FULL_GROUP_MASK or last_group <= group:
+                key_rows = pid_n * BLOCK_N + group * group_rows + tlx.rematerialized_range(
+                    0, group_rows, 32, placement=step)
+                query_rows = m_block * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
+                valid = tlx.require_layout(key_rows[:, None] <= query_rows[None, :], MMA_NM, pin=False)
+                neg_inf = tlx.require_layout(tl.full((group_rows, BLOCK_M), float("-inf"), tl.float32), MMA_NM,
+                                             pin=False)
+                scaled = tlx.require_layout(tl.where(valid, scaled, neg_inf), MMA_NM, pin=False)
             probability = tl.math.exp2(scaled)
             delta = tlx.require_layout(tl.broadcast_to(delta_values[None, :], (group_rows, BLOCK_M)), MMA_NM, pin=False)
             probability_out = probability.to(tl.bfloat16)
+            if SKIP_FULL_GROUP_MASK:
+                # Fix each BF16 group layout before it crosses the conditional.
+                probability_out = tlx.require_layout(probability_out, MMA_NM, pin=True)
             ds_out = (probability * (dp - delta)).to(tl.bfloat16)
+            if SKIP_FULL_GROUP_MASK:
+                ds_out = tlx.require_layout(ds_out, MMA_NM, pin=True)
         if group == 0:
             p0, ds0 = probability_out, ds_out
         elif group == 1:
@@ -5895,6 +5903,7 @@ def _attn_bwd_opt_gqa_front(
     k_score_cache=None,
     PRUNE_DIAGONAL: tl.constexpr = False,
     SINGLE_QUERY_HEAD: tl.constexpr = False,
+    SKIP_FULL_GROUP_MASK: tl.constexpr = False,
 ):
     """Publish current dS to LDS and optionally update the first dV fragments."""
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
@@ -5915,7 +5924,8 @@ def _attn_bwd_opt_gqa_front(
         do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
         p, ds = _attn_bwd_diagonal_probabilities(k_buffer, k_score_cache, q_t, v_operand, do_t, lse_values,
                                                  delta_values, pid_n, step, SM_SCALE, N, BLOCK_M, BLOCK_N, MMA_NM,
-                                                 K_NM_LAYOUT, QT_LAYOUT, SINGLE_QUERY_HEAD=SINGLE_QUERY_HEAD)
+                                                 K_NM_LAYOUT, QT_LAYOUT, SINGLE_QUERY_HEAD=SINGLE_QUERY_HEAD,
+                                                 SKIP_FULL_GROUP_MASK=SKIP_FULL_GROUP_MASK)
         q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
         do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
     else:
@@ -6671,6 +6681,7 @@ def _attn_bwd_opt_gqa_phase(
         k_score_cache=k_score_cache,
         PRUNE_DIAGONAL=(IS_CAUSAL and CACHE_SCORE_K),
         SINGLE_QUERY_HEAD=IS_CAUSAL and CACHE_SCORE_K and HQ == HK and N == 4096,
+        SKIP_FULL_GROUP_MASK=IS_CAUSAL and CACHE_SCORE_K and HQ == HK and N == 1024,
     )
     if not BRAID_DK_DV:
         dv = _attn_bwd_opt_gqa_dv_fragmented_half(
