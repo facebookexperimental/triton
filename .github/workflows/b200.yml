@@ -50,7 +50,7 @@ jobs:
       - name: Install test dependencies
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install pytest
+          uv pip install pytest pytest-xdist
       - name: Install torchao
         timeout-minutes: 10
         uses: ./.github/actions/install-torchao
@@ -73,50 +73,25 @@ jobs:
       - name: Run TLX core tests
         id: run_core_tests
         timeout-minutes: 90
-        run: |
-          . "${SETUP_SCRIPT}"
-          shopt -s nullglob
-          FILES=(
+        uses: ./.github/actions/run-tlx-core-tests
+        with:
+          platform: b200
+          files: |
             python/test/unit/language/test_tlx_*_any.py
             python/test/unit/language/test_tlx_*sm90up*.py
             python/test/unit/language/test_tlx_*sm100*.py
             python/test/unit/tlx_ops/test_*_sm100.py
-          )
-          # TorchTLX depends on floating PyTorch Inductor APIs and runs in the
-          # separate b200-torchtlx-test job below, not this pinned-PyTorch job.
-          TLX_FILES=()
-          for file in "${FILES[@]}"; do
-            [[ "${file}" == */test_torchtlx_* ]] || TLX_FILES+=("${file}")
-          done
-          FILES=("${TLX_FILES[@]}")
-          [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
-            mapfile -t FILES < <(printf '%s\n' "${FILES[@]}" | grep -Fxf /tmp/affected.txt || true)
-            echo "kernel-only PR: ${#FILES[@]} TLX core file(s) touch the changed kernel(s)"
-            [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
-          fi
-          echo "b200 collects:" "${FILES[@]}"
-          # Log runner size and the pod's memory peak, pass or fail.
-          trap 'echo "runner: nproc=$(nproc) memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) memory.peak_mib=$(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 ))"' EXIT
-          PYTHONPATH="${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" python -m pytest "${FILES[@]}" --import-mode=importlib -v --durations=25 --junitxml=/tmp/tlx-core.xml
+          kernel-only: ${{ steps.select.outputs.kernel_only }}
+          setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
-        run: |
-          . "${SETUP_SCRIPT}"
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
-            MODE="${{ steps.select.outputs.correctness_mode }}"
-            if [ "$MODE" = "skip" ]; then
-              echo "kernel-only PR: no tutorial correctness tests touch the changed kernel(s); skipping"
-              exit 0
-            fi
-            if [ "$MODE" = "filtered" ]; then
-              echo "kernel-only PR: correctness filter: ${{ steps.select.outputs.correctness_k }}"
-              python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -k "${{ steps.select.outputs.correctness_k }}" -v --junitxml=/tmp/tlx-correctness.xml
-              exit 0
-            fi
-          fi
-          python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+        uses: ./.github/actions/run-tlx-correctness-tests
+        with:
+          kernel-only: ${{ steps.select.outputs.kernel_only }}
+          correctness-mode: ${{ steps.select.outputs.correctness_mode }}
+          correctness-k: ${{ steps.select.outputs.correctness_k }}
+          setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run device-agnostic TLX codegen tests
         id: run_codegen_tests
         timeout-minutes: 30
