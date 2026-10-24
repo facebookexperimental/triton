@@ -550,8 +550,10 @@ tt.func @rem_unit_contiguity(
 
 // -----
 
-// Preserve useful subgroup information through the nested quotient/remainder
-// decomposition used by gather-transpose pointer tensors.
+// NOTE: unsigned remui no longer keeps partial-group contiguity (upstream
+// PR11546 soundness test pins unit below); %within_group collapses. Re-derive
+// the D122462298 MI350 relaxation in rem_partial_groups-compatible form if
+// paged-decode perf regresses.
 tt.func @partial_div_rem_groups() {
   // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
   %n = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
@@ -565,8 +567,9 @@ tt.func @partial_div_rem_groups() {
   // [0 x 8, 1 x 8, ..., 7 x 8] repeated twice.
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %group = arith.divui %token, %c8 : tensor<128xi32>
-  // Eight contiguous groups [0, ..., 7].
-  // expected-remark @below {{contiguity = [8], divisibility = [8], constancy = [1], constant_value = <none>}}
+  // Eight [0, ..., 7] runs exist, but partial-group inference is disabled:
+  // unit result (see NOTE above).
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %within_group = arith.remui %token, %c8 : tensor<128xi32>
   tt.return
 }
