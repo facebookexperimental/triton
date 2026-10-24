@@ -4137,6 +4137,7 @@ def test_dense_bwd_folded_grid_matches_stride_host(shape, programs, monkeypatch)
     assert grid == (programs, )
     assert options["FOLD_PROGRAMS"] == programs
     assert options.get("disable_unclustered_high_rp_reschedule", False) is (hq == hk == 16)
+    assert launches[-1][1].get("WIDE_LOADS", False) is (hq == hk == 16)
 
 
 @pytest.mark.parametrize("n_ctx,causal,split_q,empty", [
@@ -6210,6 +6211,34 @@ def test_dense_bwd_gqa_exact_buffer_bound_analytic_gfx950(shape, split_q):
     torch.testing.assert_close(dq[0, -1, -1, -1].float(), expected_dq, rtol=0.005, atol=1e-6)
     torch.testing.assert_close(dk[0, -1, :, -1].float(), expected_dk, rtol=0.005, atol=1e-8)
     torch.testing.assert_close(dv[0, -1, :, 0].float(), probability, rtol=0.005, atol=1e-8)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("n_ctx", [256, 1024, 2048, 8192])
+@pytest.mark.parametrize("wide_loads", [False, True])
+def test_dense_bwd_dq_convert_bits_gfx950(n_ctx, wide_loads):
+    heads, head_dim, block_m = 6, 128, 128
+    elements = heads * n_ctx * head_dim
+    # Include every BF16 bit pattern, including NaNs and signed zeros.
+    bits = torch.arange(elements, device="cuda", dtype=torch.int32).to(torch.int16)
+    accumulator = bits.view(torch.bfloat16).reshape(heads, n_ctx, head_dim)
+    output = torch.empty_like(accumulator)
+    amd_fa_bwd._attn_bwd_dq_native_optimized_convert_kernel[(n_ctx // block_m, heads)](
+        accumulator,
+        output,
+        N=n_ctx,
+        D=head_dim,
+        BLOCK_M=block_m,
+        WIDE_LOADS=wide_loads,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    rows = torch.arange(n_ctx, device="cuda", dtype=torch.int64)[:, None]
+    cols = torch.arange(head_dim, device="cuda", dtype=torch.int64)[None, :]
+    offsets = (rows & ~15) * head_dim + ((rows & 15) << 1)
+    offsets = offsets + (cols & 1) + ((cols & 2) << 6) + ((cols & 12) << 3) + ((cols & 48) << 5) + ((cols & 64) << 2)
+    expected = bits.reshape(heads, n_ctx * head_dim)[:, offsets.reshape(-1)].reshape(heads, n_ctx, head_dim)
+    assert torch.equal(output.view(torch.int16), expected)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

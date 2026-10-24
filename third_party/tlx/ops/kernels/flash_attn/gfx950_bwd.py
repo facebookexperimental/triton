@@ -7954,28 +7954,62 @@ def _attn_bwd_dq_native_optimized_convert_kernel(
     N: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    WIDE_LOADS: tl.constexpr = False,
 ):
     """Restore the logical [M,D] order of native-swizzled BF16 dQ."""
-    native_layout: tl.constexpr = tlx.layout(
-        shape=(
-            (2, 2, 2, 2, 2, 2, 2, 2),
-            (2, 2, 2, 2, 2, 2),
-        ),
-        stride=(
-            (256, 512, 1024, 8, 2, 2048, 16, 32),
-            (1, 128, 4, 64, 4096, 8192),
-        ),
-    )
-    store_layout: tl.constexpr = tlx.layout(
-        shape=(
-            (2, 2, 2, 2, 2, 2, 2, 2),
-            (2, 2, 2, 2, 2, 2),
-        ),
-        stride=(
-            (256, 512, 1024, 8, 128, 2048, 16, 32),
-            (1, 2, 4, 64, 4096, 8192),
-        ),
-    )
+    if WIDE_LOADS:
+        tl.static_assert(D == 128 and BLOCK_M == 128)
+        native_layout: tl.constexpr = tlx.layout(
+            shape=(
+                (2, 2, 2, 2, 2, 2, 2, 2),
+                (2, 2, 2, 2, 2, 2),
+            ),
+            stride=(
+                (2048, 512, 1024, 8, 2, 4, 16, 32),
+                (1, 128, 256, 64, 4096, 8192),
+            ),
+        )
+        store_layout: tl.constexpr = tlx.layout(
+            shape=(
+                (2, 2, 2, 2, 2, 2, 2, 2),
+                (2, 2, 2, 2, 2, 2),
+            ),
+            stride=(
+                (2048, 512, 1024, 8, 128, 256, 16, 32),
+                (1, 2, 4, 64, 4096, 8192),
+            ),
+        )
+        middle_layout: tl.constexpr = tlx.layout(
+            shape=(
+                (2, 2, 2, 2, 2, 2, 2, 2),
+                (2, 2, 2, 2, 2, 2),
+            ),
+            stride=(
+                (2048, 512, 1024, 8, 128, 4, 16, 32),
+                (1, 2, 256, 64, 4096, 8192),
+            ),
+        )
+    else:
+        native_layout: tl.constexpr = tlx.layout(
+            shape=(
+                (2, 2, 2, 2, 2, 2, 2, 2),
+                (2, 2, 2, 2, 2, 2),
+            ),
+            stride=(
+                (256, 512, 1024, 8, 2, 2048, 16, 32),
+                (1, 128, 4, 64, 4096, 8192),
+            ),
+        )
+        store_layout: tl.constexpr = tlx.layout(
+            shape=(
+                (2, 2, 2, 2, 2, 2, 2, 2),
+                (2, 2, 2, 2, 2, 2),
+            ),
+            stride=(
+                (256, 512, 1024, 8, 128, 2048, 16, 32),
+                (1, 2, 4, 64, 4096, 8192),
+            ),
+        )
     pid_m = tl.program_id(0)
     batch_head = tl.program_id(1)
     max_bf16_buffer_elements: tl.constexpr = (1 << 30) - 1
@@ -8002,7 +8036,12 @@ def _attn_bwd_dq_native_optimized_convert_kernel(
     # Reading the swizzled accumulator needs native MFMA ownership, but this
     # requirement may remain soft and be absorbed by layout propagation.
     native_offsets = tlx.require_layout(native_offsets, native_layout, pin=False)
-    values = tlx.buffer_load(DQ_ACC, native_offsets, contiguity=4)
+    values = tlx.buffer_load(DQ_ACC, native_offsets, contiguity=8 if WIDE_LOADS else 4)
+    if WIDE_LOADS:
+        # Use separate lane/register swaps to keep both conversions in registers.
+        values = tlx.require_layout(values, middle_layout, pin=True)
+        # Keep this boundary so layout simplification cannot combine the swaps.
+        values = tlx.amd_register_resident(values, register_class="vgpr", registers_per_group=4)
     # Keep this one hard: softening the native-to-store conversion makes the
     # current compiler materialize the transpose through 32 KiB of LDS.
     values = tlx.require_layout(values, store_layout, pin=True)
@@ -10063,6 +10102,8 @@ def _run_bwd_d128_gqa_optimized(
                 num_warps=4,
             )
     convert_kwargs = ({"PLANE_ELEMENTS": batch * hq * n_ctx * head_dim} if precise_mha16k else {})
+    if _is_short_causal_mha((batch, hq, hk, n_ctx, head_dim), causal, split_q):
+        convert_kwargs["WIDE_LOADS"] = True
     dispatch.convert_entry[(triton.cdiv(n_ctx, dispatch.convert_block_m), batch * hq)](
         dq_acc,
         dq,
