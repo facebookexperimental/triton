@@ -98,31 +98,29 @@ of the kernel source matter:
 | | Without it | In v7 |
 |---|---|---|
 | LDS layout | inferred padded layout, plain row-major order: 4 bank conflicts per LDS instruction | explicit conflict-free offset bases: 0 |
-| Accumulator | LLVM splits it across VGPRs and AGPRs: ~140 `v_accvgpr` copies in the hot loop | `tlx.amd_dot(..., register_class="agpr")` pins every MFMA tile to AGPRs: 0 copies |
-| K offset | added to every element of the i32 offset tensors: vector adds in the hot loop | advances the scalar base pointer: none |
+| Accumulator | LLVM splits it across VGPRs and AGPRs: 31-50 `v_accvgpr` copies in the hot loop | `tlx.amd_dot(..., register_class="agpr")` pins every MFMA tile to AGPRs: 0 copies |
+| K offset | added to every element of the i32 offset tensors: 33 vector adds in the hot loop | advances the scalar base pointer: none |
 
 Measured with this `bench.py` on one gfx950 (MI355X), fp16, M=N=4096, K=8192, two rounds, on
-the current `main` (AMD codegen LLVM d26ff26e). `triton` is the default `do_bench` median;
+the current `main` (AMD codegen built from Meta's LLVM 285fe1d0). `triton` is the default `do_bench` median;
 `batched` is `--timing-mode batched`. This is a different GPU from the table at the top, so
 compare by the ratio to rocBLAS. "Before" is v7 with the inferred layout, no pins and tensor K
 offsets.
 
 | Kernel | `triton` TFLOPS | %rocBLAS | `batched` TFLOPS | %rocBLAS | `SQ_LDS_BANK_CONFLICT` per launch |
 |---|---:|---:|---:|---:|---:|
-| rocBLAS | 1402 / 1406 | | 1450 / 1456 | | |
-| v7 before | 959 / 957 | 68% | 1087 / 1088 | 75% | 1.68e7 |
-| v7 before + scheduler | 1200 / 1204 | 86% | 1264 / 1264 | 87% | 1.68e7 |
-| v7 | 749 / 752 | 53% | 960 / 962 | 66% | 0 |
-| v7 + scheduler | **1393 / 1398** | **99%** | **1466 / 1475** | **101%** | 0 |
+| rocBLAS | 1404 / 1406 | | 1449 / 1457 | | |
+| v7 before | 1103 / 1102 | 78% | 1167 / 1165 | 80% | 1.68e7 |
+| v7 before + scheduler | 1223 / 1231 | 87% | 1295 / 1296 | 89% | 1.68e7 |
+| v7 | 1028 / 1030 | 73% | 1204 / 1205 | 83% | 0 |
+| v7 + scheduler | **1374 / 1387** | **98%** | **1481 / 1481** | **102%** | 0 |
 
 The three details are not a win on their own: without the scheduler, LLVM's default schedule
-still decides the outcome, and the current codegen LLVM (d26ff26e) has a register-pressure
-regression that the accumulator pins expose when nothing fixes the MFMA order (the unscheduled
-v7 carries 636 `v_accvgpr` copies in its hot loop; on the previous LLVM pin it carried 0 and ran at
-75% / 84%). Upstream moved to 6bc4aaf6 for that reason. The details are what lets the scheduler
-deliver, and the scheduled hot loop is then instruction-for-instruction the scheduled Gluon v7
-loop (256 MFMA, 64 `ds_read_b128`, 32 direct-to-LDS loads, 0 `v_accvgpr`, 0 vector ALU), unaffected
-by the pin.
+still decides the outcome, and v7 lands next to the kernel without them (5 points below it with
+`do_bench`, 3 points above in batched mode). The details are what let the scheduler deliver:
+with it, v7 is 11-13 points ahead of the scheduled kernel without them. The scheduled hot loop has
+the scheduled Gluon v7 loop's instruction mix (256 MFMA, 64 `ds_read_b128`, 32 direct-to-LDS loads,
+0 `v_accvgpr`, 0 vector ALU), unaffected by the pin.
 
 The scheduler is for 4-wave kernels. Do not enable it for v8 / v9 or other
 `warp_pipeline_stage` kernels: their interleave is already fixed by the pipeline stages, and the
@@ -159,7 +157,7 @@ All versions use `num_stages=1` with manual pipeline management (matching Gluon'
   is LLVM-backend instruction scheduling — Gluon's published best uses custom
   MFMA scheduler (`llirSched`, now in-tree) / `amdgcnSched` passes that the default backend scheduler doesn't match.
   v7 can now be scheduled by the same pass, in-tree as the AMD backend's MFMA scheduler
-  (`schedule_hint="mfma-schedule"`): 99% of rocBLAS at 4 waves (see
+  (`schedule_hint="mfma-schedule"`): 98-102% of rocBLAS at 4 waves (see
   [v7 and the MFMA scheduler](#v7-and-the-mfma-scheduler)).
 - **v8**: `warp_pipeline_stage` (`s_setprio` mem/compute interleaving) is the big
   hot-loop win — 1005T / 86% of rocBLAS, ahead of Gluon v7 (958T) measured here.
