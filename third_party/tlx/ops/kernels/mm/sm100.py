@@ -16,7 +16,7 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from triton.tlx.ops._invariance import BitwiseInvarianceSpec, gemm_fixed_split_k
+from ..._invariance import BitwiseInvarianceSpec, gemm_fixed_split_k
 from . import _sm100_core as _core
 
 _FIXED_SPEC = BitwiseInvarianceSpec.dims("K")

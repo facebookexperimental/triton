@@ -141,7 +141,7 @@ def test_mm_enforced_per_arch():
     spec = BitwiseInvarianceSpec.dims("M")
     assert any_enforces_invariance("mm")
     enforced = {entry.arch for entry in CATALOG if entry.op == "mm" and entry.enforces_invariance}
-    assert enforced == {"sm90", "sm100"}
+    assert enforced == {"sm90", "sm100", "gfx942", "gfx950"}
     for entry in [entry for entry in CATALOG if entry.op == "mm"]:
         if entry.arch in enforced:
             tlx_ops._check_enforced("mm", entry, spec)

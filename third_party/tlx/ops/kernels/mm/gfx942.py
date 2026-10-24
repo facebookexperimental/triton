@@ -14,6 +14,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.inductor.reduce_k import _reduce_k_kernel
 
+from ..._invariance import gemm_fixed_split_k
+
 
 class _LocalSplitUPlan(NamedTuple):
     tile_m: int
@@ -1657,6 +1659,13 @@ def _launch_global_split_k(a, b, bias, out, space):
 
 
 def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
+    """Direct-load GEMM with measured LocalSplitU fast paths.
+
+    TODO: let the user specify only LocalSplitU (so long as it's internally consistent).
+    """
+    # A fixed schedule prunes the LocalSplitU plans; the standard direct-load
+    # configs reduce K sequentially.
+    fixed = gemm_fixed_split_k(invariance)
     M, N, K = _validate_operands(a, b, out)
     bias_strides = _bias_strides(bias, M, N, a) if bias is not None else (0, 0)
     if out is None:
@@ -1665,8 +1674,8 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
     if space in ("heuristic", "full") and _global_split_k_shape(M, N, K) and _precheck_global_split_k(a, b, bias, out):
         return _launch_global_split_k(a, b, bias, out, space)
 
-    enable_local_split_u = _precheck_local_split_u(a, b, bias)
-    if space == "heuristic" and (M, N, K) in _MEASURED_LOCAL_SPLIT_U_PLANS:
+    enable_local_split_u = _precheck_local_split_u(a, b, bias) and fixed is None
+    if space == "heuristic" and fixed is None and (M, N, K) in _MEASURED_LOCAL_SPLIT_U_PLANS:
         plan = _MEASURED_LOCAL_SPLIT_U_PLANS[(M, N, K)]
         return _launch_local_split_u(a, b, out, plan)
 
@@ -1684,7 +1693,7 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
         fast_configs = getattr(kernel, "_tlx_fast_configs", None)
         if fast_configs is None:
             fast_configs = kernel._tlx_fast_configs = {}
-        fast_key = (_full_config_key(a, b), bias is not None, bias_strides)
+        fast_key = (_full_config_key(a, b), bias is not None, bias_strides, fixed)
         cached = fast_configs.get(fast_key)
         if cached is not None and cached[1]:
             config = cached[0]
