@@ -6,7 +6,9 @@ description: >
   comes from the same apt source CUTracer's own CI uses on these runners
   (.ci/setup-gpu.sh in facebookexperimental/CUTracer), along with the
   toolkit's forward-compatibility driver libraries, since the runners' R580
-  driver predates CUDA 13.4.
+  driver predates CUDA 13.4. PyPI ships no cutracer.so, so the action builds
+  it from the CUTracer tag matching the CLI and exports its path as
+  CUTRACER_SO.
 inputs:
   cuda-version:
     description: "CUDA toolkit version providing compute-sanitizer, e.g. 13.4"
@@ -14,6 +16,9 @@ inputs:
     default: "13.4"
   cutracer-version:
     description: cutracer version on PyPI
+    required: true
+  cuda-arch:
+    description: "GPU architecture to build cutracer.so for, e.g. sm_100"
     required: true
 runs:
   using: composite
@@ -43,3 +48,20 @@ runs:
         set -euo pipefail
         uv pip install "cutracer==${CUTRACER_VERSION}"
         cutracer --help > /dev/null
+    - name: Build cutracer.so
+      shell: bash
+      env:
+        CUTRACER_VERSION: ${{ inputs.cutracer-version }}
+        CUDA_ARCH: ${{ inputs.cuda-arch }}
+        CUDA_VERSION: ${{ inputs.cuda-version }}
+      run: |
+        set -euo pipefail
+        # The Makefile checks the nvcc version with bc and links libzstd.
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bc libzstd-dev
+        export PATH="/usr/local/cuda-${CUDA_VERSION}/bin:${PATH}"
+        SRC="${RUNNER_TEMP}/CUTracer"
+        git clone --depth 1 --branch "v${CUTRACER_VERSION}" https://github.com/facebookexperimental/CUTracer.git "${SRC}"
+        cd "${SRC}"
+        ./install_third_party.sh
+        make -j"$(nproc)" ARCH="${CUDA_ARCH}"
+        echo "CUTRACER_SO=${SRC}/lib/cutracer.so" >> "${GITHUB_ENV}"
