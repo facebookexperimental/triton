@@ -106,8 +106,10 @@ jobs:
       CUDA_VERSION: "13.4"
     # Setup takes about 4 minutes. The step limits below fit the rest inside
     # the job's limit, so a slow run ends as incomplete with its logs uploaded
-    # instead of being cancelled.
-    timeout-minutes: 20
+    # instead of being cancelled. They allow about 1.5x the time the full
+    # sm90 flash-attention test file took on an H100: memcheck 6.4 minutes,
+    # random delay 7.
+    timeout-minutes: 40
     permissions:
       id-token: write
       contents: read
@@ -147,7 +149,7 @@ jobs:
           cuda-arch: sm_100
       - name: Run sanitizers
         id: sanitize
-        timeout-minutes: 9
+        timeout-minutes: 22
         env:
           # The one place that decides whether this run files and closes issues:
           # only a run of main's code speaks for main. It closes only the issues
@@ -165,7 +167,7 @@ jobs:
             --tools "${TOOLS}" \
             --kernel "${KERNEL}" \
             --out "${RUNNER_TEMP}/cutracer" \
-            --timeout-minutes 4 \
+            --timeout-minutes 10 \
             "${ISSUES[@]}" \
             -- python -m pytest "${TEST_IDS[@]}" --import-mode=importlib -q -p no:cacheprovider
       # Correct synchronization does not depend on timing, so a test that
@@ -173,7 +175,7 @@ jobs:
       # race the sanitizers above cannot see.
       - name: Run tests under random delay
         if: ${{ !cancelled() && steps.sanitize.outcome != 'skipped' }}
-        timeout-minutes: 5
+        timeout-minutes: 10
         env:
           TESTS: ${{ needs.select.outputs.tests }}
         run: |
