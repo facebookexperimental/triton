@@ -106,14 +106,8 @@ OPS_DAYS = 30
 OPS_HOURS = 72
 #: The Operations tab's time ranges in days. Job durations and the slowest tests are computed for each.
 OPS_RANGES = (3, 7, 14, 30)
-#: The slowest tests: how many per GPU and range, and the median ratio over the window before that marks one slower.
-SLOW_TOP = 20
-SLOWER_RATIO = 1.5
-#: Runs the window before needs before a test absent from its lists counts as new.
-SLOW_MIN_PREV_RUNS = 5
-#: A slow test's change compares its last SLOW_RECENT_DAYS with the SLOW_BASE_DAYS before them.
-SLOW_RECENT_DAYS = 3
-SLOW_BASE_DAYS = 7
+#: How many of the slowest tests to keep per GPU and range.
+SLOW_TOP = 10
 #: Run outcomes on the Operations tab, in stacking order.
 OUTCOMES = ("passed", "test", "build", "setup", "cancelled")
 #: A job that ran on no push for this long is retired (disabled or removed), and its failures no longer count.
@@ -767,8 +761,8 @@ def job_durations(gpu_runs, now, days):
 
 
 def _slow_runs(runs, gpu, lo, hi):
-    """[(created_at, {test key: seconds})], oldest first, for one GPU's main push runs created in [lo, hi] that
-    recorded durations. A test key is (step group, test id)."""
+    """[{test key: seconds}] for one GPU's main push runs created in [lo, hi] that recorded durations. A test key is
+    (step group, test id)."""
     out = []
     for r in runs:
         if not slow_test_run(r) or not lo <= r["created_at"] <= hi:
@@ -780,62 +774,26 @@ def _slow_runs(runs, gpu, lo, hi):
                     for e in s.get("slowest") or []:
                         found[(group_of(s["name"]) or s["name"], e["id"])] = e["s"]
         if found:
-            out.append((r["created_at"], found))
-    return sorted(out, key=lambda x: x[0])
-
-
-def _slow_samples(runs, gpu, lo, hi):
-    """(test key -> seconds per run, test key -> first run date, runs that recorded durations) over _slow_runs."""
-    times, first = collections.defaultdict(list), {}
-    per_run = _slow_runs(runs, gpu, lo, hi)
-    for created, found in per_run:
-        for key, sec in found.items():
-            times[key].append(sec)
-            first.setdefault(key, created)
-    return times, first, len(per_run)
-
-
-def slow_test_changes(runs, asof):
-    """Per GPU, test key -> (change, median, median before, first date), comparing the last SLOW_RECENT_DAYS with
-    the SLOW_BASE_DAYS before them. change is "new" (in the recent lists, in none of the at least SLOW_MIN_PREV_RUNS
-    runs before: added since, or it got slower), "slower" (recent median at least SLOWER_RATIO times the one before)
-    or None. Fixed windows, so every range of the page shows the same verdict."""
-    now = t(asof)
-    lo = iso(now - dt.timedelta(days=SLOW_RECENT_DAYS))
-    lo_base = iso(now - dt.timedelta(days=SLOW_RECENT_DAYS + SLOW_BASE_DAYS))
-    out = {}
-    for gpu in GPUS:
-        recent, first, _ = _slow_samples(runs, gpu, lo, asof)
-        base, _, n_base = _slow_samples(runs, gpu, lo_base, lo)
-        out[gpu] = {}
-        for k, v in recent.items():
-            p50, prev = _pct(v, 0.5), _pct(base[k], 0.5) if base.get(k) else None
-            change = None
-            if prev is None and n_base >= SLOW_MIN_PREV_RUNS:
-                change = "new"
-            elif prev and p50 >= SLOWER_RATIO * prev:
-                change = "slower"
-            out[gpu][k] = (change, p50, prev, first[k])
+            out.append(found)
     return out
 
 
-def slow_tests_view(runs, asof, days, changes):
+def slow_tests_view(runs, asof, days):
     """Per GPU, the SLOW_TOP tests with the highest median time over the main push runs of the last `days` that
-    recorded durations, each with its change from slow_test_changes. Each run lists only its slowest tests (pytest
-    --durations), so n says how often a test was among them."""
+    recorded durations. Each run lists only its slowest tests (pytest --durations), so n says how often a test was
+    among them."""
     lo = iso(t(asof) - dt.timedelta(days=days))
     out = {}
     for gpu in GPUS:
-        times, _, n_runs = _slow_samples(runs, gpu, lo, asof)
-        rows = []
-        for k, v in times.items():
-            change, p50_recent, p50_prev, first = changes[gpu].get(k, (None, None, None, None))
-            rows.append({
-                "step": k[0], "id": k[1], "n": len(v), "p50": _pct(v, 0.5), "max": round(max(v), 1), "change": change,
-                "p50_recent": p50_recent, "p50_prev": p50_prev, "first": first
-            })
+        per_run = _slow_runs(runs, gpu, lo, asof)
+        times = collections.defaultdict(list)
+        for found in per_run:
+            for k, sec in found.items():
+                times[k].append(sec)
+        rows = [{"step": k[0], "id": k[1], "n": len(v), "p50": _pct(v, 0.5), "max": round(max(v), 1)}
+                for k, v in times.items()]
         rows.sort(key=lambda x: -x["p50"])
-        out[gpu] = {"runs": n_runs, "tests": rows[:SLOW_TOP]}
+        out[gpu] = {"runs": len(per_run), "tests": rows[:SLOW_TOP]}
     return out
 
 
@@ -862,7 +820,6 @@ def ops_view(runs, asof):
     finished = [r for r in recent if run_outcome(r) in ("passed", "test", "setup", "build")]
     setups = [r for r in finished if run_outcome(r) == "setup"]
     queue = queue_view(gpu_runs, now)
-    changes = slow_test_changes(runs, asof)
     prs = [r for r in recent if r["event"] == "pull_request"]
 
     steps = collections.defaultdict(lambda: {"n": 0, "triggers": collections.Counter()})
@@ -890,16 +847,15 @@ def ops_view(runs, asof):
         }, "select": select_view(runs, asof), **daily, "by_gpu": by_gpu, "setup_steps": setup_steps, "queue": queue,
         # Keyed by range in days, as strings for JSON.
         "jobs": {str(n): job_durations(gpu_runs, now, n)
-                 for n in OPS_RANGES}, "slow_tests":
-        {str(n): slow_tests_view(runs, asof, n, changes)
-         for n in OPS_RANGES}
+                 for n in OPS_RANGES}, "slow_tests": {str(n): slow_tests_view(runs, asof, n)
+                                                      for n in OPS_RANGES}
     }
 
 
 def queue_view(gpu_runs, now):
-    """Queue time (job created to started) of GPU jobs that ran: per GPU pool per day, and per pool over the last
-    7 days with how often its job was the last to finish on a PR run. That job decides when the PR gets its result,
-    so its queue time is what a PR author waits (pr_p50/pr_p90, last 7 days)."""
+    """Queue time (job created to started) of GPU jobs that ran: per GPU pool per day and per hour (OPS_HOURS), and
+    per pool over the last 7 days with how often its job was the last to finish on a PR run. That job decides when the
+    PR gets its result, so its queue time is what a PR author waits (pr_p50/pr_p90, last 7 days)."""
     days, hours = ops_days(now), ops_hours(now)
     week_ago = iso(now - dt.timedelta(days=7))
     by_day = {d: {g: [] for g in GPUS} for d in days}

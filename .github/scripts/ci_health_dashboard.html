@@ -138,7 +138,7 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <svg class="bars" id="o-per-run" viewBox="0 0 720 190"></svg>
 <p class="note">Push and PR runs that passed or failed tests. Cancelled runs and setup or build failures stopped early and are left out. Hover a day for the 25th and 75th percentiles. A PR run tests only the GPUs its paths touch, so the spread mixes one-GPU and all-GPU runs.</p></div>
 <div class="card"><h3>Queue time: waiting for a GPU runner (minutes)</h3>
-<div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>B200</span><span><i class="sw" style="background:var(--series-2)"></i>H100</span><span><i class="sw" style="background:var(--series-3)"></i>MI350</span><span class="muted">median per day</span></div>
+<div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>B200</span><span><i class="sw" style="background:var(--series-2)"></i>H100</span><span><i class="sw" style="background:var(--series-3)"></i>MI350</span><span class="muted">median per day (per hour, in the 3-day range)</span></div>
 <svg class="bars" id="o-queue" viewBox="0 0 720 190"></svg><div id="o-queue-t" style="margin-top:12px"></div>
 <p class="note">Time from a GPU job being queued to a runner picking it up, all triggers, jobs that ran. Each line is the day's median (the hour's, in the 3-day range); hover for the 25th and 75th percentiles. "Last to finish" is how often that GPU's job was the last one on a PR run: that job decides when the PR gets its result, so its queue is the wait the queue tile reports.</p></div>
 <div class="card"><h3>GPU jobs running at once</h3>
@@ -148,7 +148,7 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <div class="card"><h3 id="o-jobs-h">Job duration (minutes)</h3><div id="o-jobs"></div>
 <p class="note">The slowest 10% shows stalls the median hides, such as a wheel download that stalls.</p></div>
 <div class="card"><h3 id="o-slow-h">Slowest tests, main pushes (seconds)</h3><div id="o-slow"></div>
-<p class="note">From pytest's <code>--durations</code> list in each GPU test job of a push to main: each run prints only its 25 slowest tests per step, so "Runs" counts how often a test was among them. Ranked by median time. A test's setup, call and teardown add up. "Became slow" lists tests that are new in the last 3 days' lists against the 7 days before (added since, or faster than every listed test then), or whose median there is at least 1.5 times the median before.</p></div>
+<p class="note">From pytest's <code>--durations</code> list in each GPU test job of a push to main: each step prints only its 25 slowest test phases (setup, call or teardown), so "Runs" counts how often a test was among them. A test's time is the sum of its listed phases. Ranked by median time.</p></div>
 <div class="card"><h3>Setup failures, last 7 days, by step</h3><div id="o-setup"></div></div>
 </section>
 
@@ -269,7 +269,7 @@ function renderPR(list,branch="main"){
 }
 
 const GPUS=["H100","B200","MI350"];
-// Day ranges of the Operations tab's daily charts; the data holds the longest.
+// The Operations tab's time ranges in days, as in OPS_RANGES of ci_health_rules.py; the 3-day range draws hourly charts.
 const RANGES=[3,7,14,30];let RANGE=30;
 // The Operations tab's GPU filter: "All" or one of GPUS.
 let OGPU="All",BRANCH="main";
@@ -360,10 +360,8 @@ function renderOps(o){
     $("o-jobs-h").textContent=`Job duration, last ${RANGE} days vs the ${RANGE} before (minutes)`;
     $("o-slow-h").textContent=`Slowest tests, main pushes, last ${RANGE} days (seconds)`;
     $("o-jobs").innerHTML=table(["GPU","Job","Runs","Median","Slowest 10%","Before, slowest 10%","Slowest step (median / slowest 10%)"],o.jobs[RANGE].filter(mine).map(j=>[j.gpu,`<code>${esc(j.job)}</code>`,j.n,j.p50,`<span class="${j.p90_prev&&j.p90>1.5*j.p90_prev?"bad":""}">${j.p90}</span>`,j.p90_prev??"–",j.slowest_step?`${esc(j.slowest_step)} <span class="muted">(${j.slowest_p50} / ${j.slowest_p90})</span>`:""]),[2,3,4,5]);
-    const ST=o.slow_tests[RANGE],slow=GPUS.filter(g=>OGPU==="All"||g===OGPU).flatMap(g=>(ST[g]?.tests||[]).map(x=>({...x,gpu:g,runs:ST[g].runs}))).sort((a,b)=>b.p50-a.p50).slice(0,20);
-    const hot=slow.filter(x=>x.change);
-    $("o-slow").innerHTML=(hot.length?`<p class="bad" style="margin:4px 0 8px">▲ Became slow: ${hot.map(x=>`<code>${esc(x.id.split("::").pop())}</code> on ${x.gpu} (${x.p50} s)`).join(", ")}</p>`:"")+
-      (slow.length?table(["GPU","Test","Step","Median","Slowest","Runs"],slow.map(x=>[x.gpu,testId(x.id),esc(x.step),x.p50,x.max,`${x.n} <span class="muted">of ${x.runs}</span>`]),[3,4,5]):`<p class="empty">No durations recorded for main pushes in the last ${RANGE} days.</p>`);
+    const ST=o.slow_tests[RANGE],slow=GPUS.filter(g=>OGPU==="All"||g===OGPU).flatMap(g=>(ST[g]?.tests||[]).map(x=>({...x,gpu:g,runs:ST[g].runs}))).sort((a,b)=>b.p50-a.p50).slice(0,10);
+    $("o-slow").innerHTML=slow.length?table(["GPU","Test","Step","Median","Slowest","Runs"],slow.map(x=>[x.gpu,testId(x.id),esc(x.step),x.p50,x.max,`${x.n} <span class="muted">of ${x.runs}</span>`]),[3,4,5]):`<p class="empty">No durations recorded for main pushes in the last ${RANGE} days.</p>`;
     $("o-setup").innerHTML=table(["Step","GPU","Jobs","Triggers"],o.setup_steps.filter(mine).map(r=>[esc(r.step),r.gpu,r.n,Object.entries(r.triggers).map(([k,v])=>`${v} ${esc(k.replace("pull_request","PR"))}`).join(" · ")]),[2])};
   draw();
   const week=new Date(ASOF-7*864e5).toISOString(),bad=o.select.anomalies.filter(a=>a.kind!=="fallback"&&a.t>=week).length;
@@ -408,6 +406,7 @@ function renderBranches(d){
   draw()}
 
 function show(id){if(!$(id)||!$(id).matches("section"))id="main";
+  TAB=id;
   for(const b of document.querySelectorAll("nav.tabs button"))b.setAttribute("aria-selected",b.dataset.tab===id);
   for(const s of document.querySelectorAll("section[role=tabpanel]"))s.hidden=s.id!==id;
   $("ops-filters").hidden=id!=="ops"}

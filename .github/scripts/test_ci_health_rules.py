@@ -669,22 +669,3 @@ def test_job_durations_and_slow_tests_follow_the_range():
     assert j7["n"] == 1 and j7["p90_prev"] is not None  # the 10-day-old run is in the 7 days before
     (j14, ) = v["jobs"]["14"]
     assert j14["n"] == 2 and j14["p90_prev"] is None
-
-
-def test_slow_test_change_compares_the_last_3_days_with_the_7_before():
-
-    def at(h, day, *tests):
-        rr = push(h, timed("b200", *tests))
-        rr["created_at"] = f"2026-10-{day:02d}T01:00:00Z"
-        return rr
-
-    before = [at(h, h + 2, ("old", 10.0), ("steady", 5.0)) for h in range(1, 6)]  # Oct 3-7, in the 7 days before
-    runs = before + [at(10, 10, ("old", 30.0), ("steady", 5.5), ("fresh", 300.0)), at(11, 11, ("old", 30.0))]
-    for n in ("7", "30"):  # the verdict does not depend on the range
-        by = {x["id"]: x for x in r.ops_view(runs, stamp(23))["slow_tests"][n]["B200"]["tests"]}
-        assert by["fresh"]["change"] == "new" and by["fresh"]["first"] == "2026-10-10T01:00:00Z"
-        assert by["old"]["change"] == "slower" and (by["old"]["p50_recent"], by["old"]["p50_prev"]) == (30.0, 10.0)
-        assert by["steady"]["change"] is None  # 5.5 vs 5.0, under the 1.5x ratio
-    # With fewer than SLOW_MIN_PREV_RUNS runs before, a test absent from them is not called new.
-    by = {x["id"]: x for x in r.ops_view(runs[1:], stamp(23))["slow_tests"]["7"]["B200"]["tests"]}
-    assert by["fresh"]["change"] is None
