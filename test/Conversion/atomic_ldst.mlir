@@ -152,8 +152,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK-POLL: llvm.fence syncscope("device") acquire
   // CHECK-POLL: nvvm.cluster.arrive
   // CHECK-POLL: nvvm.cluster.wait
-  // CHECK-POLL: nvvm.mapa
-  // CHECK-POLL: llvm.load %{{.*}} {{.*}} : !llvm.ptr<7> -> i8
+  // CHECK-POLL: llvm.load %{{.*}} : !llvm.ptr<3> -> i8
   // CHECK-POLL: llvm.trunc %{{.*}} : i8 to i1
   // CHECK-POLL: llvm.return
   tt.func public @atomic_poll_cluster_replicas(%ptr: tensor<128x!tt.ptr<i32>, #poll>, %expected: tensor<128xi32, #poll>, %timeout: i64, %out: tensor<128x!tt.ptr<i32>, #poll>) {
