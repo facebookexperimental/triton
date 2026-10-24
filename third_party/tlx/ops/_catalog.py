@@ -27,6 +27,8 @@ class OpSpec:
     dtypes: frozenset = frozenset()  # bare torch names, so the table needs no torch
     accepts: Optional[Callable[[Mapping[str, Any]], bool]] = None
     requires: frozenset = frozenset()
+    invariant_vocab: frozenset = frozenset()  # canonical dim names a BitwiseInvarianceSpec may use
+    enforces_invariance: bool = False  # the impl prunes schedules per the resolved spec
     default_space: str = "heuristic"  # used when the caller passes space=None
 
     def __str__(self) -> str:
@@ -34,6 +36,10 @@ class OpSpec:
 
 
 _FP16 = frozenset({"float16", "bfloat16"})
+
+# Per-op dim vocabularies for BitwiseInvarianceSpec. Parallel dims tile the
+# output; reduction dims order the accumulation.
+_GEMM_DIMS = frozenset({"M", "N", "K"})
 
 # A static table, not decorator self-registration: `impl` stays a string so
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
@@ -44,6 +50,7 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="heuristic",
         impl="kernels.mm.gfx950:mm",
+        invariant_vocab=_GEMM_DIMS,
         # LocalSplitU and persistent plans remain FP16-only; the register and
         # general LDS paths also support BF16 and validate their own plans.
         dtypes=_FP16,
@@ -91,6 +98,20 @@ def has_impl(op: str, arch: str) -> bool:
     shape and reporting each one as an error.
     """
     return (op, arch) in _BY_KEY
+
+
+def invariant_vocab_for(op: str) -> frozenset:
+    """The dim vocabulary for `op`, shared by its arch entries; empty if unknown."""
+    for spec in CATALOG:
+        if spec.op == op:
+            return spec.invariant_vocab
+    return frozenset()
+
+
+@functools.lru_cache(maxsize=None)
+def any_enforces_invariance(op: str) -> bool:
+    """Whether any arch entry for `op` enforces an invariance request yet."""
+    return any(spec.op == op and spec.enforces_invariance for spec in CATALOG)
 
 
 def impl_for(op: str, arch: Optional[str] = None, *, device=None) -> tuple[Callable[..., Any], OpSpec]:
