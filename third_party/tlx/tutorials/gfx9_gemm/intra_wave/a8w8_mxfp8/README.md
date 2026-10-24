@@ -45,11 +45,11 @@ Numbers are median microseconds per operation; TFLOPS is `2 * size**3 / time`.
 
 | M=N=K | TLX, cached scales | TLX, pack both + GEMM | AITER Triton, raw scales | Primus FlyDSL, raw scales |
 | ---: | ---: | ---: | ---: | ---: |
-| 1K | 7.08 µs / 303 TFLOPS | 16.69 µs / 129 TFLOPS | 7.79 µs / 276 TFLOPS | 17.88 µs / 120 TFLOPS |
-| 2K | 19.81 µs / 867 TFLOPS | 30.54 µs / 563 TFLOPS | 46.58 µs / 369 TFLOPS | 26.87 µs / 639 TFLOPS |
-| 4K | 61.98 µs / 2217 TFLOPS | 77.27 µs / 1779 TFLOPS | 357.27 µs / 385 TFLOPS | 56.15 µs / 2448 TFLOPS |
-| 8K | 465.33 µs / 2363 TFLOPS | 476.91 µs / 2306 TFLOPS | 2802.61 µs / 392 TFLOPS | 439.93 µs / 2499 TFLOPS |
-| 16K | 3889.17 µs / 2262 TFLOPS | 3928.49 µs / 2239 TFLOPS | 25169.60 µs / 349 TFLOPS | 3606.50 µs / 2439 TFLOPS* |
+| 1K | 7.19 µs / 299 TFLOPS | 16.92 µs / 127 TFLOPS | 8.02 µs / 268 TFLOPS | 17.96 µs / 120 TFLOPS |
+| 2K | 19.98 µs / 860 TFLOPS | 30.80 µs / 558 TFLOPS | 47.03 µs / 365 TFLOPS | 27.46 µs / 626 TFLOPS |
+| 4K | 60.91 µs / 2257 TFLOPS | 75.49 µs / 1821 TFLOPS | 356.60 µs / 385 TFLOPS | 53.39 µs / 2574 TFLOPS |
+| 8K | 452.97 µs / 2427 TFLOPS | 469.35 µs / 2343 TFLOPS | 2799.88 µs / 393 TFLOPS | 429.12 µs / 2562 TFLOPS |
+| 16K | 3806.39 µs / 2311 TFLOPS | 3852.94 µs / 2283 TFLOPS | 25258.56 µs / 348 TFLOPS | N/A (non-reproducible output) |
 
 Seven graph-replay samples, 12 iterations/sample, two operations/replay;
 preallocated outputs. The TLX cached-scales column measures only GEMM, while
@@ -57,18 +57,28 @@ its second column includes packing both scales on every call. Primus's regular
 call includes its fused preshuffle + GEMM; first-call autotuning is excluded.
 The 1K/2K outputs were fully checked against an independent FP32 dequantized
 reference; a fixed-seed 128x128 sample was checked at 4K-16K, including after
-graph replay. All passed (`rtol=0.03`, `atol=0.5`). Clocks were **not** fixed.
+graph replay. All reported timings passed (`rtol=0.03`, `atol=0.5`). The 1K-8K
+Primus full outputs also matched exactly across three identical cold-cache
+runs. Measurements used physical GPU 7 with the default AUTO clock policy.
 
-The 16K Primus autotuner warned that it found no reproducible configuration and
-ranked candidates by time alone. Its 16K number passed the sampled correctness
-check in this run, but should be treated as provisional.
+The 16K Primus autotuner found no reproducible configuration. Direct testing
+confirmed that identical cold runs of its chosen regular-GEMM kernel changed
+the full output; six alternate configurations also changed output. The
+benchmark therefore excludes that timing instead of publishing an invalid
+comparison. Sampled numerical closeness alone would not have detected this.
+
+Clocks were **not** fixed: AMD documents that performance-determinism mode is
+unsupported on MI350, and this host rejected a manual maximum GFXCLK limit.
+We restored AUTO after checking that control. The table reports interleaved
+medians, not fixed-clock peak performance. See [AMD SMI performance-level
+support](https://rocm.docs.amd.com/projects/amdsmi/en/docs-10.1.0/conceptual/perf-determinism.html).
 
 Environment: MI350X, TLX 3.9, PyTorch 2.16.0a0+rocm10.2.0a20261012,
 amd-aiter 0.1.24 (source `2ebbe6275b2a`), Primus-Turbo 0.0.0.dev1 (source
 `ca1fdd673172`), FlyDSL 0.3.4.1. To rerun with all three installed:
 
 ```bash
-python3 third_party/tlx/tutorials/gfx9_gemm/intra_wave/a8w8_mxfp8/bench_compare_regular.py \
+HIP_VISIBLE_DEVICES=7 python3 third_party/tlx/tutorials/gfx9_gemm/intra_wave/a8w8_mxfp8/bench_compare_regular.py \
     --size 1024 --size 2048 --size 4096 --size 8192 --size 16384 \
     --samples 7 --iterations 12 --unroll 2
 ```

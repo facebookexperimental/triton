@@ -12,6 +12,7 @@ import json
 import os
 import statistics
 import subprocess
+import warnings
 
 import torch
 
@@ -99,9 +100,36 @@ def benchmark(size, samples, iterations, unroll):
         "aiter_triton": aiter_triton,
         "primus_flydsl": primus_flydsl,
     }
+    excluded = {}
     for name, fn in functions.items():
-        outputs[name] = fn()
+        if name == "primus_flydsl":
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", RuntimeWarning)
+                output = fn()
+            if any("no reproducible config" in str(w.message) for w in caught):
+                excluded[name] = "Primus autotuner found no reproducible configuration"
+                continue
+            outputs[name] = output
+        else:
+            outputs[name] = fn()
         torch.cuda.synchronize()
+    for name in excluded:
+        del functions[name]
+    if "primus_flydsl" in functions:
+        # The Primus autotuner checks exact output reproducibility after a cold
+        # cache flush. Confirm the selected path here before publishing a time.
+        first = outputs["primus_flydsl"].clone()
+        cache_flush = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
+        for _ in range(3):
+            cache_flush.zero_()
+            functions["primus_flydsl"]()
+            torch.cuda.synchronize()
+            if not torch.equal(first, outputs["primus_flydsl"]):
+                excluded["primus_flydsl"] = "full output changed across identical cold runs"
+                del functions["primus_flydsl"]
+                del outputs["primus_flydsl"]
+                break
+        del first, cache_flush
     checks = {name: _check(name, output, a, b, a_scale, b_scale, size)
               for name, output in outputs.items()}
     graphs = {name: _capture(fn, unroll) for name, fn in functions.items()}
@@ -123,7 +151,7 @@ def benchmark(size, samples, iterations, unroll):
         }
         for name, values in measurements.items()
     }
-    result = {"size": size, "correctness": checks, "timings": timing}
+    result = {"size": size, "correctness": checks, "timings": timing, "excluded": excluded}
     del graphs, outputs, a, b, a_scale, b_scale, packed_a, packed_b
     gc.collect()
     torch.cuda.empty_cache()
