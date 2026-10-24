@@ -56,18 +56,13 @@ runs:
         [[ -z "${SETUP_SCRIPT}" ]] || . "${SETUP_SCRIPT}"
         ARGS=(--workflow "${WORKFLOW}" --job "${JOB}" --bucket "${BUCKET}")
         [[ "${FAILED}" != true ]] || ARGS+=(--failed)
-        # The list reaches later jobs through GITHUB_OUTPUT. Keep it out of the
-        # job log, which internal CI signal cards read for their highlight.
+        # The list reaches later jobs through GITHUB_OUTPUT and the run page
+        # through the job summary. Keep it out of the job log, which internal
+        # CI signal cards read for their highlight.
         if [[ -n "${LIT_LOG}" ]]; then
-          python3 .github/scripts/parse_lit_failures.py --log "${LIT_LOG}" "${ARGS[@]}" > /dev/null
+          python3 .github/scripts/parse_lit_failures.py --log "${LIT_LOG}" "${ARGS[@]}" | python3 .github/scripts/failure_summary.py
         else
           for b in ${BUDGET}; do ARGS+=(--budget "${b}"); done
           # shellcheck disable=SC2086  # JUNIT is a space-separated list
-          python3 .github/scripts/parse_junit_failures.py --junit ${JUNIT} "${ARGS[@]}" > /dev/null
+          python3 .github/scripts/parse_junit_failures.py --junit ${JUNIT} "${ARGS[@]}" | python3 .github/scripts/failure_summary.py
         fi
-    - name: Show failures on the run page
-      shell: bash
-      env:
-        JOB: ${{ inputs.job }}
-        FAILURES: ${{ steps.parse.outputs.failures }}
-      run: python3 .github/scripts/failure_summary.py
