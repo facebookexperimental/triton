@@ -939,7 +939,7 @@ def test_mm_caches_public_catalog_lookup(monkeypatch):
         calls += 1
         assert op == "mm"
         assert device == a.device
-        return (lambda _a, _b, *, out, space: out), spec
+        return (lambda _a, _b, *, out, space, invariance=None: out), spec
 
     monkeypatch.setattr(tlx_ops, "impl_for", counting_impl_for)
     tlx_ops._mm_impl_for_device.cache_clear()

@@ -103,16 +103,16 @@ def normalize_space(space: str | Space | None,
     raise InvalidInput(f"space must be a string, Space, or None; got {space!r}")
 
 
-def gemm_fixed_split_k(spec: BitwiseInvarianceSpec) -> int | None:
+def gemm_fixed_split_k(spec: BitwiseInvarianceSpec | None) -> int | None:
     """The SPLIT_K a GEMM schedule must use, or None for the normal choice.
 
     R1/R3 (K invariant): 1 -- the K reduction stays sequential within one
     program per output tile. R2 (M/N invariant, K fixed): 1 until a fixed-K
     specialization exists; uniformity is what matters, and 1 is always
-    eligible. R4 (empty spec): None.
+    eligible. R4 (empty or missing spec): None.
 
     TODO: allow the spec to require a specific SPLIT_K.
     """
-    if not spec.needs_bitwise():
+    if spec is None or not spec.needs_bitwise():
         return None
     return 1

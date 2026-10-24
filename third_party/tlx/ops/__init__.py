@@ -161,8 +161,8 @@ def mm(a, b, *, out=None, space=None):
     if space_name is None:
         space_name = spec.default_space
     if out is None:
-        return fn(a, b, space=space_name)
-    return fn(a, b, out=out, space=space_name)
+        return fn(a, b, space=space_name, invariance=invariance)
+    return fn(a, b, out=out, space=space_name, invariance=invariance)
 
 
 def mm_bias_grad(dout, input_act, *, out=None, space=None):

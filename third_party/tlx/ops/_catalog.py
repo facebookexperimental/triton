@@ -61,6 +61,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws_cooperative",
         impl="triton.tlx.ops.kernels.mm.sm90:mm",
         invariant_vocab=_GEMM_DIMS,
+        enforces_invariance=True,
         dtypes=_FP16,
         accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma"}),
@@ -73,6 +74,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws",
         impl="triton.tlx.ops.kernels.mm.sm100:mm",
         invariant_vocab=_GEMM_DIMS,
+        enforces_invariance=True,
         dtypes=_FP16,
         # TMA needs 16-byte-aligned descriptor row strides. Checked against the
         # real strides, not M/N/K: a column-major operand is fed to its
