@@ -1,6 +1,6 @@
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 | FileCheck %s
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 | FileCheck %s
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1100 | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 | FileCheck %s --check-prefixes=CHECK,CDNA
+// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 | FileCheck %s --check-prefixes=CHECK,CDNA
+// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1100 | FileCheck %s --check-prefixes=CHECK,RDNA
 
 #blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
@@ -10,8 +10,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: %[[offset:.*]] = llvm.select %[[c_mask]]
         // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[offset]], {{.*}}, {{.*}}
         %ret = amdg.buffer_load %arg0[%offset] cacheModifier = cs : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
-        // evict_last never weakens the .cv bypass: sc0|sc1 stays 17.
-        // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 17
+        // evict_last never weakens the .cv bypass: sc0|sc1 stays 17 on CDNA
+        // (RDNA3 lowers the same policy to aux 7).
+        // CDNA: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 17
+        // RDNA: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 7
         %ret2 = amdg.buffer_load %arg0[%offset] cacheModifier = cv evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         tt.return
   }
@@ -122,14 +124,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, %[[offset]], {{.*}}, {{.*}}
         %c256_i32 = arith.constant 256 : i32
         amdg.buffer_store %value, %arg0[%offset] cacheModifier = cs stride = %c256_i32 : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
-        // evict_first sets the nt bit (0 -> 2).
-        // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 2
+        // evict_first sets the nt bit on CDNA (0 -> 2); RDNA3 lowers it to 7.
+        // CDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 2
+        // RDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 7
         amdg.buffer_store %value, %arg0[%offset] evictionPolicy = evict_first : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         // evict_last clears the nt bit that .cs sets (3 -> 1).
         // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 1
         amdg.buffer_store %value, %arg0[%offset] cacheModifier = cs evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
-        // evict_last never weakens the .wt bypass: sc0|sc1 stays 17.
-        // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 17
+        // evict_last never weakens the .wt bypass: sc0|sc1 stays 17 on CDNA
+        // (RDNA3 lowers the same case to aux 1).
+        // CDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 17
+        // RDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 1
         amdg.buffer_store %value, %arg0[%offset] cacheModifier = wt evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         tt.return
   }
