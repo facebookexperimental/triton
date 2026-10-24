@@ -473,6 +473,174 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                 tlx.async_descriptor_store_wait(0)
 
 
+# With only a few K steps the warp-specialized kernel's fixed cost (barrier
+# setup, producer/consumer hand-off, persistent scheduling) dominates; a plain
+# one-tile-per-CTA kernel, software-pipelined by Triton, is cheaper there. The
+# full space also tries it, with split-K, on skinny shapes that leave SMs idle.
+_SMALL_K_MAX = 256
+# Heuristic-space N cap for M > 64. Wider N gives the persistent WS kernel many
+# N tiles per A tile to reuse; on 706x20992x128 WS ran 17.4 us vs 21.1 us here.
+_SMALL_K_MAX_N = 8192
+
+
+def _use_small_k(M, N, K, space):
+    # The smoke space pins one WS config (see SMOKE_CONFIGS) so tests that
+    # select it cover the WS lowering path; it never takes the small-K kernel.
+    if space == "smoke" or K > _SMALL_K_MAX:
+        return False
+    if M <= _SWAP_AB_MAX_M:
+        # One or two K steps: a small-M tile beats swap-AB's warp-specialized
+        # kernel at any N; from K = 256 swap-AB's pipelining wins.
+        return K <= 128
+    if N > _SMALL_K_MAX_N:
+        return False
+    # Past a wave of tiles at K = 256, and for very wide N (A reuse), the
+    # persistent WS kernel's store/compute overlap wins back its fixed cost.
+    return K <= 128 or _mn_tiles(M, N, 128, 128) <= _get_num_sms()
+
+
+def _small_k_set_block_size_hook(nargs):
+    bm, bn, bk = nargs["BM"], nargs["BN"], nargs["BK"]
+    nargs["a_desc"].block_shape = [bm, bk] if nargs["A_ROW_MAJOR"] else [bk, bm]
+    nargs["b_desc"].block_shape = [bk, bn] if nargs["B_ROW_MAJOR"] else [bn, bk]
+    c = nargs["c_desc"]
+    c.block_shape = [bm, bn]
+    workspace_desc = nargs["workspace_desc"]
+    if nargs["SPLIT_K"] > 1:
+        # Same tile-padded fp32 slabs and fixed-order reduction as the WS path.
+        rows = nargs["SPLIT_K"] * _workspace_rows_per_split(nargs["M"], bm)
+        workspace = torch.empty((rows, nargs["N"]), device=c.base.device, dtype=torch.float32)
+        workspace_desc.base = workspace
+        workspace_desc.shape = list(workspace.shape)
+        workspace_desc.strides = list(workspace.stride())
+    else:
+        workspace_desc.base = c.base
+        workspace_desc.shape = list(c.shape)
+        workspace_desc.strides = list(c.strides)
+    workspace_desc.block_shape = [bm, bn]
+
+
+def _small_k_config(block_m, block_n, block_k, num_warps, num_stages, group_size_m=8, split_k=1):
+    return triton.Config(
+        {"BM": block_m, "BN": block_n, "BK": block_k, "GROUP_SIZE_M": group_size_m, "SPLIT_K": split_k},
+        num_warps=num_warps,
+        num_stages=num_stages,
+        pre_hook=_small_k_set_block_size_hook,
+    )
+
+
+_SMALL_K_TILES = (
+    # (BM, BN, BK, warps, stages)
+    (64, 128, 32, 4, 4),
+    (64, 128, 64, 4, 3),
+    (64, 128, 128, 4, 2),
+    (64, 256, 64, 8, 3),
+    (64, 64, 64, 4, 3),
+    (128, 64, 64, 4, 3),
+    (128, 128, 32, 4, 4),
+    (128, 128, 64, 4, 3),
+    (128, 128, 64, 8, 3),
+    (128, 128, 128, 8, 2),
+    (128, 256, 64, 8, 3),
+)
+# Skinny-M tiles for M <= 64, where the WGMMA M of 64 would be mostly padding.
+_SKINNY_SMALL_K_TILES = (
+    (16, 32, 64, 2, 2),
+    (16, 64, 64, 2, 2),
+    (16, 64, 64, 4, 2),
+    (16, 128, 64, 4, 2),
+    (16, 64, 32, 2, 3),
+    (32, 64, 64, 4, 2),
+    (16, 32, 128, 2, 1),
+)
+
+
+def _small_k_tile(c):
+    kw = c.kwargs
+    return kw["BM"], kw["BN"], kw["BK"], c.num_warps, c.num_stages
+
+
+def _small_k_configs():
+    return [
+        _small_k_config(*tile, split_k=split_k)
+        for tile in _SMALL_K_TILES + _SKINNY_SMALL_K_TILES
+        for split_k in (1, ) + _SPLIT_K_CHOICES
+    ]
+
+
+def _prune_small_k_configs(configs, nargs, **kwargs):
+    """Tiles by M; split-K only past the small-K range, keeping per tile the two
+    split counts that best fill one wave."""
+    M, N, K = nargs["M"], nargs["N"], nargs["K"]
+    tiles = _SKINNY_SMALL_K_TILES if M <= _SWAP_AB_MAX_M else _SMALL_K_TILES
+    num_sms = _get_num_sms()
+    kept, splits = [], {}
+    for c in configs:
+        tile, split_k = _small_k_tile(c), c.kwargs["SPLIT_K"]
+        if tile not in tiles:
+            continue
+        if split_k > 1:
+            if K <= _SMALL_K_MAX or not _split_k_valid(K, split_k, tile[2]):
+                continue
+            if _mn_tiles(M, N, tile[0], tile[1]) * split_k > num_sms:
+                continue
+            splits.setdefault(tile, set()).add(split_k)
+        kept.append(c)
+    best = {tile: set(sorted(s)[-2:]) for tile, s in splits.items()}
+    kept = [c for c in kept if c.kwargs["SPLIT_K"] == 1 or c.kwargs["SPLIT_K"] in best[_small_k_tile(c)]]
+    return kept or [c for c in configs if c.kwargs["SPLIT_K"] == 1]
+
+
+def _small_k_heuristic_config(M, N, K):
+    if M <= _SWAP_AB_MAX_M:
+        return [_small_k_config(16, 32, 64, 2, 2)]
+    return [_small_k_config(128, 128, 64, 8, 3)]
+
+
+@triton.jit
+def _small_k_kernel(a_desc, b_desc, c_desc, workspace_desc, M, N, K, BM: tl.constexpr, BN: tl.constexpr,
+                    BK: tl.constexpr, GROUP_SIZE_M: tl.constexpr, SPLIT_K: tl.constexpr, A_ROW_MAJOR: tl.constexpr,
+                    B_ROW_MAJOR: tl.constexpr):
+    pid = tl.program_id(0)
+    split_id = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    first_pid_m = (pid // num_pid_in_group) * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    offs_m = pid_m * BM
+    offs_n = pid_n * BN
+    k_lo, k_hi = _k_tile_range(K, split_id, BK, SPLIT_K)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(k_lo, k_hi):
+        offs_k = k * BK
+        if A_ROW_MAJOR:
+            a = a_desc.load([offs_m, offs_k])
+        else:
+            a = a_desc.load([offs_k, offs_m]).T
+        if B_ROW_MAJOR:
+            b = b_desc.load([offs_k, offs_n])
+        else:
+            b = b_desc.load([offs_n, offs_k]).T
+        acc = tl.dot(a, b, acc)
+    if SPLIT_K > 1:
+        # Each split owns a tile-padded slab of num_pid_m * BM rows.
+        workspace_desc.store([split_id * num_pid_m * BM + offs_m, offs_n], acc)
+    else:
+        c_desc.store([offs_m, offs_n], acc.to(tlx.dtype_of(c_desc)))
+
+
+@functools.lru_cache(maxsize=None)
+def _tuned_small_k(space, shape=None):
+    if space == "heuristic":
+        return triton.autotune(configs=_small_k_heuristic_config(*shape), key=["M", "N", "K"])(_small_k_kernel)
+    return triton.autotune(configs=_small_k_configs(), key=["M", "N", "K"],
+                           prune_configs_by={"early_config_prune":
+                                             _prune_small_k_configs}, post_hook=_reduce_post_hook)(_small_k_kernel)
+
+
 @functools.lru_cache(maxsize=None)
 def _tuned(space, shape=None, swap_ab=False):
     prune_configs_by = None
@@ -492,6 +660,78 @@ def _tuned(space, shape=None, swap_ab=False):
         prune_configs_by=prune_configs_by,
         post_hook=_reduce_post_hook,
     )(matmul_kernel_tma_ws_hopper_cooperative)
+
+
+_SKINNY_MAX_MN = 256
+
+# (M, N, K, A row-major, B row-major, dtype) -> path chosen by the full space.
+_PATH_CACHE = {}
+# Tests pin one path, e.g. to exercise a pinned config of that kernel.
+_FORCE_PATH = None
+
+
+def _small_k_candidate(M, N, K, space):
+    if space != "full":
+        return _use_small_k(M, N, K, space)
+    # Past the small-K range, one-tile-per-CTA (with split-K) can beat the
+    # persistent WS kernel only on skinny shapes that underfill the GPU.
+    return K <= _SMALL_K_MAX or (min(M, N) <= _SKINNY_MAX_MN and _mn_tiles(M, N, 128, 128) < _get_num_sms())
+
+
+def _select_path(space, key, launchers):
+    """Pick the kernel for a call.
+
+    The full space autotunes every candidate kernel, times each one's best
+    config the same way the autotuner does, and caches the winner per shape and
+    layout. The heuristic space takes the first candidate in preference order
+    without timing anything.
+    """
+    if _FORCE_PATH is not None:
+        return _FORCE_PATH
+    if len(launchers) == 1 or space != "full":
+        return "small_k" if "small_k" in launchers else "ws"
+    path = _PATH_CACHE.get(key)
+    if path is None:
+        timings = {}
+        for name, launch in launchers.items():
+            launch()  # autotunes this kernel on first use
+            timings[name] = _cold_gpu_time(launch)
+        path = min(timings, key=timings.get)
+        _PATH_CACHE[key] = path
+    return path
+
+
+def _cold_gpu_time(fn, calls=10, reps=5):
+    """Median GPU time of ``fn`` with a cold L2.
+
+    These kernels run for a few microseconds, where host launch cost would
+    dominate event timing and favor the path with the least Python, so time a
+    CUDA graph of (L2 flush, fn) calls minus a graph of the flushes alone.
+    """
+    flush = torch.empty(2 * torch.cuda.get_device_properties(torch.cuda.current_device()).L2_cache_size,
+                        dtype=torch.int8, device="cuda")
+    graphs = []
+    for with_fn in (True, False):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(calls):
+                flush.zero_()
+                if with_fn:
+                    fn()
+        graphs.append(graph)
+
+    def replay_ms(graph):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end)
+
+    for graph in graphs:
+        graph.replay()
+    diffs = sorted(replay_ms(graphs[0]) - replay_ms(graphs[1]) for _ in range(reps))
+    return diffs[reps // 2] / calls
 
 
 def mm(a, b, *, out=None, space="full"):
@@ -518,13 +758,42 @@ def mm(a, b, *, out=None, space="full"):
     if c.data_ptr() % 16 != 0:
         raise InvalidInput("sm90 tlx.ops.mm requires a 16-byte-aligned output")
 
-    swap_ab = _use_swap_ab(M, space)
+    if space not in ("heuristic", "full", "smoke"):
+        raise InvalidInput(f"sm90 tlx.ops.mm does not provide search space {space!r}; "
+                           "expected 'heuristic', 'full', or 'smoke'")
     # A contiguous view of each operand's storage; for these, is_contiguous()
     # is ambiguous only on extent-1 dims, so descriptors use canonical strides.
     a_rm = a.is_contiguous()
     b_rm = b.is_contiguous()
     a_store = a if a_rm else a.T
     b_store = b if b_rm else b.T
+    args = (a_store, b_store, a_rm, b_rm, c, M, N, K, space)
+    launchers = {"ws": functools.partial(_launch_ws, *args)}
+    if _small_k_candidate(M, N, K, space):
+        launchers["small_k"] = functools.partial(_launch_small_k, *args)
+    launchers[_select_path(space, (M, N, K, a_rm, b_rm, a.dtype), launchers)]()
+    return c
+
+
+def _descriptor(t):
+    return TensorDescriptor(t, t.shape, [t.shape[1], 1], [1, 1])
+
+
+def _launch_small_k(a_store, b_store, a_rm, b_rm, c, M, N, K, space):
+    kernel = _tuned_small_k(space, (M, N, K) if space == "heuristic" else None)
+    # The pre_hook swaps in an fp32 workspace once SPLIT_K is known.
+    workspace_desc = _descriptor(c)
+    grid = lambda meta: (triton.cdiv(M, meta["BM"]) * triton.cdiv(N, meta["BN"]), meta["SPLIT_K"])  # noqa: E731
+    kernel[grid](_descriptor(a_store), _descriptor(b_store), _descriptor(c), workspace_desc, M, N, K, A_ROW_MAJOR=a_rm,
+                 B_ROW_MAJOR=b_rm)
+    # post_hook only fires while benchmarking, so reduce here for the real launch.
+    split_k = kernel.best_config.kwargs["SPLIT_K"]
+    if split_k > 1:
+        _reduce_split_k(workspace_desc.base, c, M, N, split_k)
+
+
+def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space):
+    swap_ab = _use_swap_ab(M, space)
     if swap_ab:
         # Run the same kernel on (B^T, A^T) and write C^T tiles back to C. B^T
         # is row-major exactly when B is column-major, and likewise for A^T.
@@ -535,14 +804,9 @@ def mm(a, b, *, out=None, space="full"):
         kernel_m, kernel_n = M, N
         a_row_major, b_row_major = a_rm, b_rm
         a_src, b_src = a_store, b_store
-
-    dummy_block = [1, 1]
-    a_desc = TensorDescriptor(a_src, a_src.shape, [a_src.shape[1], 1], dummy_block)
-    b_desc = TensorDescriptor(b_src, b_src.shape, [b_src.shape[1], 1], dummy_block)
-    c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+    c_desc = _descriptor(c)
     # The pre_hook swaps in an fp32 workspace once SPLIT_K is known.
-    workspace_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
-
+    workspace_desc = _descriptor(c)
     num_sms = _get_num_sms()
 
     def grid(meta):
@@ -551,8 +815,8 @@ def mm(a, b, *, out=None, space="full"):
 
     kernel = _tuned(space, (M, N, K) if space == "heuristic" else None, swap_ab)
     kernel[grid](
-        a_desc,
-        b_desc,
+        _descriptor(a_src),
+        _descriptor(b_src),
         c_desc,
         workspace_desc,
         kernel_m,
@@ -570,4 +834,3 @@ def mm(a, b, *, out=None, space="full"):
     split_k = kernel.best_config.kwargs["SPLIT_K"]
     if split_k > 1:
         _reduce_split_k(workspace_desc.base, c, M, N, split_k)
-    return c
