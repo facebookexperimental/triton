@@ -1,7 +1,8 @@
 name: Parse test failures
 description: >-
   Parse a test job's JUnit XML or LIT log into the failure list that
-  report-nightly-failure.yml and reconcile-nightly-issues.yml take.
+  report-nightly-failure.yml and reconcile-nightly-issues.yml take, and
+  show the failures on the run's summary page.
 inputs:
   workflow:
     description: Workflow name; scopes the issue titles
@@ -62,3 +63,9 @@ runs:
           # shellcheck disable=SC2086  # JUNIT is a space-separated list
           python3 .github/scripts/parse_junit_failures.py --junit ${JUNIT} "${ARGS[@]}"
         fi
+    - name: Show failures on the run page
+      shell: bash
+      env:
+        JOB: ${{ inputs.job }}
+        FAILURES: ${{ steps.parse.outputs.failures }}
+      run: python3 .github/scripts/failure_summary.py
