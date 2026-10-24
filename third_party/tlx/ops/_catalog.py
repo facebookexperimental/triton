@@ -51,6 +51,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="heuristic",
         impl="kernels.mm.gfx950:mm",
         invariant_vocab=_GEMM_DIMS,
+        enforces_invariance=True,
         # LocalSplitU and persistent plans remain FP16-only; the register and
         # general LDS paths also support BF16 and validate their own plans.
         dtypes=_FP16,
