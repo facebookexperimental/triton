@@ -56,6 +56,7 @@ def normalize_ptx_file_metadata(src: str) -> str:
 
     return _PTX_FILE_DIRECTIVE.sub(normalize_file, src)
 
+
 instrument = functools.partial(_instrument, backend="nvidia")
 
 

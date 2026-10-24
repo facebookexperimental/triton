@@ -32,6 +32,7 @@ def test_dynamic_instrumentation_and_dialect_loading():
 
     assert not instrument("context", point="load-dialects", backend="test")
 
+
 pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
 
 

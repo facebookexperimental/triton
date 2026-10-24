@@ -173,6 +173,8 @@ def assemble_amdgcn(assembly: str, processor: str, features: str) -> bytes:
         return ctypes.string_at(object_file, object_size.value)
     finally:
         library.triton_amdgpu_free(object_file)
+
+
 instrument = functools.partial(_instrument, backend="amd")
 
 
@@ -864,8 +866,7 @@ class HIPBackend(BaseBackend):
         target_features = ""
         if knobs.compilation.enable_asan:
             target_features = '+xnack'
-        llvm.attach_datalayout(llvm_mod, target_triple, options.arch, target_features, get_llvm_flags(options.arch),
-                               "")
+        llvm.attach_datalayout(llvm_mod, target_triple, options.arch, target_features, get_llvm_flags(options.arch), "")
 
         # Set various control constants on the LLVM module so that device
         # libraries can resolve references to them.
