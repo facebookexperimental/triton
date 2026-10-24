@@ -4421,12 +4421,17 @@ def test_dense_bwd_optimized_causal_head_boundaries_gfx950(shape, partitions, fo
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-@pytest.mark.parametrize("n_ctx", [1024, 2048, 4096, 8192, 16384])
+@pytest.mark.parametrize(
+    "shape",
+    [(16, 16, 16, n, 128) for n in (1024, 2048, 4096, 8192, 16384)] + [(15 if n == 16384 else 16, 64, 8, n, 128)
+                                                                       for n in (1024, 2048, 4096, 8192, 16384)],
+)
 @pytest.mark.parametrize("sm_scale", [128**-0.5, 0.0, -0.125])
-def test_dense_bwd_diagonal_groups_scales_gfx950(n_ctx, sm_scale):
-    owners = {(0, 0), (8, 8), (15, 15)}
-    case = _make_dense_gqa_reference_case((16, 16, 16, n_ctx, 128), causal=True, seed=4346, sm_scale=sm_scale,
-                                          owners=owners)
+def test_dense_bwd_diagonal_groups_scales_gfx950(shape, sm_scale):
+    batch, hq, hk, _n_ctx, _head_dim = shape
+    group_size = hq // hk
+    owners = {(0, 0), (batch // 2, hk // 2), (batch - 1, hk - 1)}
+    case = _make_dense_gqa_reference_case(shape, causal=True, seed=4346, sm_scale=sm_scale, owners=owners)
 
     def check(gradients):
         for gradient in gradients:
@@ -4434,9 +4439,11 @@ def test_dense_bwd_diagonal_groups_scales_gfx950(n_ctx, sm_scale):
         if sm_scale == 0.0:
             assert torch.count_nonzero(gradients[0]) == 0
             assert torch.count_nonzero(gradients[1]) == 0
-        for batch, head in owners:
+        for batch_idx, head in owners:
+            query_slice = slice(head * group_size, (head + 1) * group_size)
             for actual, expected in zip(gradients, case.grads, strict=True):
-                result, reference = actual[batch, head], expected[batch, head]
+                head_slice = query_slice if actual.shape[1] == hq else head
+                result, reference = actual[batch_idx, head_slice], expected[batch_idx, head_slice]
                 if torch.count_nonzero(reference).item() == 0:
                     assert torch.count_nonzero(result).item() == 0
                 else:

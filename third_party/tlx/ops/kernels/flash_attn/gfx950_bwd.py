@@ -5774,7 +5774,7 @@ def _attn_bwd_gqa_front_stream_cache64(
 
 
 @triton.jit
-def _attn_bwd_mha_diagonal_probabilities(
+def _attn_bwd_diagonal_probabilities(
     k_buffer,
     k_score_cache,
     q_t,
@@ -5910,9 +5910,9 @@ def _attn_bwd_opt_gqa_front(
     if PRUNE_DIAGONAL and CACHE_SCORE_K and IS_CAUSAL:
         tl.static_assert(USE_STREAM)
         do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
-        p, ds = _attn_bwd_mha_diagonal_probabilities(k_buffer, k_score_cache, q_t, v_operand, do_t, lse_values,
-                                                     delta_values, pid_n, step, SM_SCALE, N, BLOCK_M, BLOCK_N, MMA_NM,
-                                                     K_NM_LAYOUT, QT_LAYOUT)
+        p, ds = _attn_bwd_diagonal_probabilities(k_buffer, k_score_cache, q_t, v_operand, do_t, lse_values,
+                                                 delta_values, pid_n, step, SM_SCALE, N, BLOCK_M, BLOCK_N, MMA_NM,
+                                                 K_NM_LAYOUT, QT_LAYOUT)
         q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
         do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
     else:
@@ -6667,7 +6667,7 @@ def _attn_bwd_opt_gqa_phase(
         USE_STREAM=HQ != HK or CACHE_SCORE_K,
         CACHE_SCORE_K=CACHE_SCORE_K,
         k_score_cache=k_score_cache,
-        PRUNE_DIAGONAL=(IS_CAUSAL and HQ == 16 and HK == 16 and CACHE_SCORE_K),
+        PRUNE_DIAGONAL=(IS_CAUSAL and CACHE_SCORE_K),
     )
     if not BRAID_DK_DV:
         dv = _attn_bwd_opt_gqa_dv_fragmented_half(
