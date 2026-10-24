@@ -3080,7 +3080,9 @@ tt.func private @expand_dims_linear_layout() -> tensor<1x4xi32, #linear> {
 tt.func private @reshape_linear_layout_broadcasting(%arg0: tensor<32x4xbf16, #linear>) -> tensor<32x4x1xbf16, #blocked> {
   %0 = ttg.convert_layout %arg0 : tensor<32x4xbf16, #linear> -> tensor<32x4xbf16, #linear1>
   %1 = tt.reshape %0 : tensor<32x4xbf16, #linear1> -> tensor<32x4x1xbf16, #blocked>
-  // CHECK: llvm.return %[[ARG0]] : !llvm.struct<(bf16)>
+  // CHECK: %[[ELT:.*]] = llvm.extractvalue %[[ARG0]][0]
+  // CHECK: %[[RESHAPED:.*]] = llvm.insertvalue %[[ELT]]
+  // CHECK: llvm.return %[[RESHAPED]] : !llvm.struct<(bf16)>
   tt.return %1 : tensor<32x4x1xbf16, #blocked>
 }
 
