@@ -617,7 +617,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.tw
   // The following reduction must wait before overwriting that allocation.
   // CHECK-LABEL: @cross_cta_inline_asm_then_local_reduce
   // CHECK: tt.elementwise_inline_asm
-  // CHECK-NEXT: ttng.cluster_barrier
+  // CHECK-NEXT: ttng.cluster_arrive
+  // CHECK-NEXT: ttng.cluster_wait
   // CHECK-NEXT: "tt.reduce"{{.*}}axis = 0
   tt.func @cross_cta_inline_asm_then_local_reduce(%ptr: !tt.ptr<i32>, %input: tensor<256x128xf16, #blockedScratch>) -> (i32, tensor<128xf16, #sliceScratch0>) {
     %result = tt.elementwise_inline_asm "atom.global.add.u32 $0, [$1], 1;" {constraints = "=r,l", packed_element = 1 : i32, pure = false} %ptr : !tt.ptr<i32> -> i32

@@ -2330,7 +2330,7 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // CHECK-LABEL: inline_asm_scalar_pointer_result
   // CHECK: llvm.inline_asm has_side_effects
   // CHECK: llvm.ptrtoint {{.*}} : !llvm.ptr<1> to i64
-  // CHECK: st.shared::cta.b64
+  // CHECK: st.shared.b64
   // CHECK: nvvm.barrier
   // CHECK: llvm.load {{.*}} -> i64
   // CHECK: llvm.inttoptr {{.*}} : i64 to !llvm.ptr<1>
@@ -2346,7 +2346,7 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // CHECK: llvm.cond_br
   // CHECK: llvm.inline_asm has_side_effects
   // CHECK-SAME: "atom.global.add.u32 $0, [$2], 1; mov.u32 $1, $0;"
-  // CHECK: st.shared::cta.b8
+  // CHECK: st.shared.b8
   // CHECK: nvvm.barrier
   // CHECK: llvm.load
   // CHECK: llvm.return
@@ -2360,7 +2360,7 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // CHECK: llvm.cond_br
   // CHECK: llvm.inline_asm has_side_effects
   // CHECK-SAME: "mov.u32 $0, 7;"
-  // CHECK: st.shared::cta.b32
+  // CHECK: st.shared.b32
   // CHECK: nvvm.barrier
   // CHECK: llvm.load
   // CHECK: llvm.return
@@ -2378,7 +2378,7 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // CHECK: llvm.inline_asm has_side_effects
   // CHECK-SAME: "atom.global.add.u32 $0, [$2], 1; mov.u32 $1, $0;"
   // CHECK-SAME: %{{.*}}, %[[PAD]] : (!llvm.ptr<1>, !llvm.ptr<1>) -> !llvm.struct<(i32, i32)>
-  // CHECK: st.shared::cta.b32
+  // CHECK: st.shared.b32
   // CHECK: nvvm.barrier
   // CHECK: llvm.load
   // CHECK: llvm.return
@@ -2397,7 +2397,7 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 2 : i32, "ttg.num-
   // CHECK: llvm.inline_asm has_side_effects
   // CHECK: llvm.zext {{.*}} : i1 to i8
   // CHECK: vector<4xi8>
-  // CHECK: st.shared::cta.v4.b8
+  // CHECK: st.shared.v4.b8
   // CHECK: nvvm.cluster.arrive
   // CHECK: nvvm.cluster.wait
   // CHECK: llvm.load {{.*}} -> vector<4xi8>
