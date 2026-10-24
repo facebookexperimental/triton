@@ -4421,7 +4421,7 @@ def test_dense_bwd_optimized_causal_head_boundaries_gfx950(shape, partitions, fo
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-@pytest.mark.parametrize("n_ctx", [1024, 2048, 8192])
+@pytest.mark.parametrize("n_ctx", [1024, 2048, 4096, 8192, 16384])
 @pytest.mark.parametrize("sm_scale", [128**-0.5, 0.0, -0.125])
 def test_dense_bwd_diagonal_groups_scales_gfx950(n_ctx, sm_scale):
     owners = {(0, 0), (8, 8), (15, 15)}
