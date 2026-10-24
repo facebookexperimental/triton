@@ -6623,11 +6623,9 @@ def _attn_bwd_opt_gqa_phase(
         do_tiles,
         phase,
     )
-    # Re-anchor lane/warp coordinates at the adjacent statistics loads and
-    # share the copy. The group number is only a local equivalence tag, not a
-    # tuning parameter. Entry coordinates otherwise cross the register-heavy
-    # phase; rematerializing each load independently duplicates the anchors.
-    stats_coordinate_group: tl.constexpr = 20
+    # The selected causal MHA8K schedule keeps the entry coordinates.
+    # Other schedules share fresh coordinates at the adjacent statistics loads.
+    stats_coordinate_group: tl.constexpr = (None if IS_CAUSAL and CACHE_SCORE_K and HQ == HK and N == 8192 else 20)
     lse_values = tlx.local_load(
         tlx.local_view(lse_tiles, phase),
         relaxed=True,
