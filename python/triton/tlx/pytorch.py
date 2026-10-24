@@ -29,6 +29,7 @@ _D128_SPLIT_ENTRY = "split"
 _D128_COMBINED_ENTRY = "combined"
 _D128_INTERLEAVED_ENTRY = "interleaved"
 _D128_OPTIMIZED_ENTRY = "interleaved_optimized"
+_D128_FOLDED_ENTRY = "interleaved_folded"
 _D128_INTERLEAVED_BM32_ENTRY = "interleaved_bm32"
 _D128_BM32_ENTRY = "dense_bm32"
 _D128_NATIVE_CONVERT_ENTRY = "native_convert"
@@ -37,19 +38,8 @@ _D256_PRODUCER_ENTRY = "producer"
 _D128_NONCAUSAL_SPLIT_CONFIG = (_D128_SPLIT_ENTRY, 32, 64, 4, True, True, False)
 _D128_CAUSAL_SPLIT_CONFIG = (_D128_SPLIT_ENTRY, 32, 32, 2, False, False, False)
 _D128_EXACT_CONFIG = (_D128_COMBINED_ENTRY, 16, 256, 4, False, False, True)
-_D128_INTERLEAVED_CONFIG = (
-    _D128_INTERLEAVED_ENTRY, 16, 256, 4, 1, 16, _D128_NATIVE_CONVERT_ENTRY, 128, 4, False, False, False,
-    1,  # query-head owner splits
-    -1,  # no phase scheduling hint
-    False,  # do not peel the causal diagonal
-    1,  # query-row splits
-)
-_D128_IGLP3_CONFIG = (*_D128_INTERLEAVED_CONFIG[:-3], 3, False, 1)
-_D128_CAUSAL_PEEL_CONFIG = (*_D128_INTERLEAVED_CONFIG[:-3], 3, True, 1)
-_D128_HEAD_SPLIT_CONFIG = (*_D128_INTERLEAVED_CONFIG[:-4], 4, -1, False, 1)
-_D128_BM32_CONFIG = (_D128_BM32_ENTRY, 32, *_D128_INTERLEAVED_CONFIG[2:])
-# These configurations preserve the measured compiler options for PR2709.
-_D128_OPTIMIZED_MHA_CONFIG = (
+# Match each measured kernel entry, output layout, and compiler option.
+_D128_OPTIMIZED_BM16_CONFIG = (
     _D128_OPTIMIZED_ENTRY,
     16,
     256,
@@ -66,7 +56,32 @@ _D128_OPTIMIZED_MHA_CONFIG = (
     -1,
     False,
     1,
+    False,
+    False,
 )
+_D128_CAUSAL_GQA_BF16_CONFIG = (*_D128_OPTIMIZED_BM16_CONFIG[:-3], 4, True, False)
+_D128_CAUSAL_GQA_LONG_CONFIG = (
+    _D128_OPTIMIZED_ENTRY,
+    16,
+    256,
+    4,
+    1,
+    16,
+    _D128_NATIVE_CONVERT_ENTRY,
+    128,
+    4,
+    True,
+    False,
+    False,
+    1,
+    -1,
+    False,
+    4,
+    True,
+    False,
+)
+_D128_CAUSAL_FOLDED_CONFIG = (_D128_FOLDED_ENTRY, *_D128_OPTIMIZED_BM16_CONFIG[1:])
+_D128_CAUSAL_SHORT_MHA_CONFIG = (_D128_FOLDED_ENTRY, *_D128_OPTIMIZED_BM16_CONFIG[1:-1], True)
 _D128_OPTIMIZED_GQA_CONFIG = (
     _D128_OPTIMIZED_ENTRY,
     16,
@@ -84,10 +99,14 @@ _D128_OPTIMIZED_GQA_CONFIG = (
     -1,
     False,
     1,
+    False,
+    False,
 )
 _D256_NONCAUSAL_CONFIG = (_D256_PRODUCER_ENTRY, 4, False, True)
 _D256_CAUSAL_CONFIG = (_D256_PRODUCER_ENTRY, 4, False, False)
 _REQUIRED_BASE_ALIGNMENT_BYTES = 16
+# Folded provider measurements used the full 256-CU configuration.
+_D128_CAUSAL_FOLDED_CU_COUNT = 256
 
 # (Q shape, K/V shape, batch, max_q, max_k, causal). Admission measurements
 # include offset validation, plan construction, and O/dO normalization. The
@@ -281,18 +300,22 @@ _PERFORMANCE_VALIDATED_SIGNATURES = {
     (_D128_SHORT_ROUTE, frozenset({_D128_NONCAUSAL_SPLIT_CONFIG, _D128_EXACT_CONFIG})),
     ((16, 27, 200, 128), (16, 27, 200, 128), True):
     (_D128_SHORT_ROUTE, frozenset({_D128_CAUSAL_SPLIT_CONFIG, _D128_EXACT_CONFIG})),
-    ((16, 16, 4096, 128), (16, 16, 4096, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_PEEL_CONFIG),
-    ((16, 16, 8192, 128), (16, 16, 8192, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_PEEL_CONFIG),
-    ((16, 16, 16384, 128), (16, 16, 16384, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_PEEL_CONFIG),
     ((16, 64, 1024, 128), (16, 8, 1024, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_GQA_CONFIG),
     ((16, 64, 2048, 128), (16, 8, 2048, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_GQA_CONFIG),
     ((16, 64, 4096, 128), (16, 8, 4096, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_GQA_CONFIG),
-    ((16, 16, 1024, 128), (16, 16, 1024, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_MHA_CONFIG),
-    ((16, 16, 2048, 128), (16, 16, 2048, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_MHA_CONFIG),
-    # Changed GQA8K and MHA4K routes require new provider-path measurements.
-    ((16, 64, 1024, 128), (16, 8, 1024, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
-    ((16, 64, 2048, 128), (16, 8, 2048, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_HEAD_SPLIT_CONFIG),
-    ((16, 64, 4096, 128), (16, 8, 4096, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_HEAD_SPLIT_CONFIG),
+    ((16, 16, 1024, 128), (16, 16, 1024, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_BM16_CONFIG),
+    ((16, 16, 2048, 128), (16, 16, 2048, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_BM16_CONFIG),
+    # Causal signatures use the measured native BM16 schedules.
+    ((16, 64, 1024, 128), (16, 8, 1024, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_FOLDED_CONFIG),
+    ((16, 64, 2048, 128), (16, 8, 2048, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_GQA_BF16_CONFIG),
+    ((16, 64, 4096, 128), (16, 8, 4096, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_GQA_BF16_CONFIG),
+    ((16, 64, 8192, 128), (16, 8, 8192, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_GQA_LONG_CONFIG),
+    ((15, 64, 16384, 128), (15, 8, 16384, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_GQA_LONG_CONFIG),
+    ((16, 16, 1024, 128), (16, 16, 1024, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_SHORT_MHA_CONFIG),
+    ((16, 16, 2048, 128), (16, 16, 2048, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_CAUSAL_SHORT_MHA_CONFIG),
+    ((16, 16, 4096, 128), (16, 16, 4096, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_BM16_CONFIG),
+    ((16, 16, 8192, 128), (16, 16, 8192, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_BM16_CONFIG),
+    ((16, 16, 16384, 128), (16, 16, 16384, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_OPTIMIZED_BM16_CONFIG),
     ((32, 1, 2600, 256), (32, 1, 2600, 256), False): (_D256_ROUTE, _D256_NONCAUSAL_CONFIG),
     ((32, 1, 2600, 256), (32, 1, 2600, 256), True): (_D256_ROUTE, _D256_CAUSAL_CONFIG),
 }
@@ -330,13 +353,15 @@ def _d128_interleaved_dispatch_config(dispatch):
         main_entry = _D128_INTERLEAVED_ENTRY
     elif dispatch.main_entry is gfx950_bwd._attn_bwd_dkdv_dq_d128_gqa_optimized_kernel:
         main_entry = _D128_OPTIMIZED_ENTRY
+    elif dispatch.main_entry is gfx950_bwd._attn_bwd_dkdv_dq_d128_gqa_folded_kernel:
+        main_entry = _D128_FOLDED_ENTRY
     elif dispatch.main_entry is gfx950_bwd._attn_bwd_dkdv_dq_d128_gqa_bm32_kernel:
         main_entry = _D128_INTERLEAVED_BM32_ENTRY
     elif dispatch.main_entry is gfx950_bwd._dense_bwd_dkdv_dq_bm32_kernel:
         main_entry = _D128_BM32_ENTRY
     else:
         return None
-    optimized = main_entry in (_D128_OPTIMIZED_ENTRY, _D128_INTERLEAVED_BM32_ENTRY)
+    optimized = main_entry in (_D128_OPTIMIZED_ENTRY, _D128_FOLDED_ENTRY, _D128_INTERLEAVED_BM32_ENTRY)
     expected_convert = (gfx950_bwd._attn_bwd_dq_native_optimized_convert_kernel
                         if optimized else gfx950_bwd._attn_bwd_dq_native_convert_kernel)
     if dispatch.convert_entry is not expected_convert:
@@ -358,6 +383,8 @@ def _d128_interleaved_dispatch_config(dispatch):
         dispatch.phase_iglp,
         dispatch.peel_causal,
         dispatch.split_q,
+        dispatch.bf16_kv_partials,
+        dispatch.disable_unclustered_high_rp_reschedule,
     )
 
 
@@ -453,6 +480,10 @@ def _is_performance_validated(query, key, value, out, grad_out, logsumexp, scale
         try:
             dispatch = gfx950_bwd._select_d128_interleaved_dispatch(tuple(query.shape), tuple(key.shape), is_causal)
             selected_config = _d128_interleaved_dispatch_config(dispatch)
+            if dispatch.main_entry is gfx950_bwd._attn_bwd_dkdv_dq_d128_gqa_folded_kernel:
+                properties = torch.cuda.get_device_properties(query.device)
+                if properties.multi_processor_count != _D128_CAUSAL_FOLDED_CU_COUNT:
+                    return False
         except (AssertionError, AttributeError, RuntimeError, TypeError, ValueError):
             return False
         return selected_config == expected_config
