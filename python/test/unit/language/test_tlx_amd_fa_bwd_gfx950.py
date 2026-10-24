@@ -4019,6 +4019,7 @@ def test_dense_bwd_optimized_dispatch(hq, hk, n, causal, bm, splits, iglp, peel,
     config = amd_fa_bwd._select_d128_interleaved_dispatch((16, hq, n, 128), (16, hk, n, 128), causal)
     assert (config.block_m, config.kv_splits, config.phase_iglp, config.peel_causal) == (bm, splits, iglp, peel)
     assert config.split_q == (4 if causal and hq == 64 and hk == 8 and n in (2048, 4096, 8192) else 1)
+    assert config.bf16_kv_partials is (causal and hq == 64 and hk == 8 and n in (2048, 4096, 8192))
     folded = causal and (n == 1024 or (hq == hk == 16 and n == 2048))
     expected_entry = (amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_bm32_kernel
                       if bm == 32 else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_folded_kernel
@@ -4138,7 +4139,7 @@ def test_dense_bwd_folded_grid_matches_stride_host(shape, programs, monkeypatch)
     assert grid == (programs, )
     assert options["FOLD_PROGRAMS"] == programs
     assert options.get("disable_unclustered_high_rp_reschedule", False) is (hq == hk == 16)
-    assert launches[-1][1].get("WIDE_LOADS", False) is (hq == hk == 16)
+    assert launches[-1][1].get("WIDE_LOADS", False) is (hq == hk == 16 or shape == (16, 64, 8, 1024, 128))
 
 
 @pytest.mark.parametrize("n_ctx,causal,split_q,empty", [
@@ -4370,7 +4371,7 @@ def test_dense_bwd_optimized_causal_head_boundaries_gfx950(shape, partitions, fo
         allocate_like = torch.empty_like
 
         def poison_partial(tensor):
-            if tensor.ndim == 5 and tensor.dtype == torch.float32:
+            if tensor.ndim == 5 and tensor.dtype in (torch.float32, torch.bfloat16):
                 tensor.fill_(float("nan"))
             return tensor
 
@@ -5893,9 +5894,9 @@ def test_dense_bwd_mha_dispatch_guard_host(n_ctx, mode, monkeypatch):
     split_q = None if mode == "default" else 2 if mode == "split2" else 1
     selected = mode in ("default", "unsplit", "causal")
     dispatch = _select_d128_shape_dispatch(shape, causal=causal, split_q=split_q)
-    # Measured causal MHA 1K uses folded KV tile pairs.
+    # Measured causal MHA 1K/2K use folded KV tile pairs.
     expected_entry = (amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_folded_kernel
-                      if causal and n_ctx == 1024 else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_optimized_kernel)
+                      if causal and n_ctx in (1024, 2048) else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_optimized_kernel)
     assert dispatch.main_entry is expected_entry
     assert dispatch.block_m == 16
     if selected:
@@ -6354,7 +6355,9 @@ def test_dense_bwd_split_query_automatic_selection(shape, expected):
 
 
 @pytest.mark.parametrize("batch,n_ctx,causal,split_q,expected_dtype", [
-    (16, 2048, True, None, torch.float32),
+    (16, 2048, True, None, torch.bfloat16),
+    (16, 2048, True, 2, torch.float32),
+    (16, 2048, True, 1, None),
     (16, 4096, True, None, torch.bfloat16),
     (16, 8192, True, None, torch.bfloat16),
     (15, 16384, True, None, torch.bfloat16),

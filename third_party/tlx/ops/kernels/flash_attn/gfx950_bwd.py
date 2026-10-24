@@ -7891,9 +7891,9 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     store_d = tlx.rematerialized_range(0, D, 31)
     key_offsets = kv_offset_base + store_n[:, None] * D + store_d[None, :]
     key_offsets = tlx.require_layout(key_offsets.to(tl.int32), kv_native_layout, pin=False)
-    # The measured MHA1K-8K shapes stage dK/dV through the dead Q/dO LDS for
-    # 16-byte row stores. Native stores write 8 bytes per lane over 32 rows.
-    STAGE_KV_STORE: tl.constexpr = CACHE_SCORE_K and HQ == HK and N <= 8192
+    # Selected MHA shapes use the unused Q/dO LDS for 16-byte row stores.
+    # Native stores write 8 bytes per lane over 32 rows.
+    STAGE_KV_STORE: tl.constexpr = CACHE_SCORE_K and HQ == HK and (N <= 8192 or (IS_CAUSAL and N == 16384))
     if STAGE_KV_STORE:
         _attn_bwd_store_kv_staged(dk.to(tl.bfloat16), DK, kv_offset_base + kv_tile_n * D, q_buffers, do_buffers)
     elif SPLIT_Q == 1:
@@ -7909,8 +7909,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
             kv_native_layout,
             pin=False,
         )
-        # The measured 4K BF16 partials use wider stores through the unused Q/dO stages.
-        if N == 4096 and DK.dtype.element_ty == tl.bfloat16:
+        # The measured 2K/4K BF16 partials use wider stores through the unused Q/dO stages.
+        if (N == 2048 or N == 4096) and DK.dtype.element_ty == tl.bfloat16:
             _attn_bwd_store_kv_staged(dk.to(tl.bfloat16), DK, 0, q_buffers, do_buffers)
         else:
             tlx.buffer_store(dk.to(DK.dtype.element_ty), DK, key_offsets)
@@ -7926,7 +7926,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     elif SPLIT_Q == 1:
         tlx.buffer_store(dv.to(tl.bfloat16), DV, key_offsets)
     else:
-        if N == 4096 and DV.dtype.element_ty == tl.bfloat16:
+        if (N == 2048 or N == 4096) and DV.dtype.element_ty == tl.bfloat16:
             _attn_bwd_store_kv_staged(dv.to(tl.bfloat16), DV, 0, q_buffers, do_buffers)
         else:
             tlx.buffer_store(dv.to(DV.dtype.element_ty), DV, key_offsets)
@@ -10096,8 +10096,8 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
         convert_num_warps=4,
         split_q=split_q,
         disable_unclustered_high_rp_reschedule=_is_short_causal_mha(shape, causal, split_q),
-        bf16_kv_partials=(causal and split_q == 4
-                          and shape in ((16, 64, 8, 4096, 128), (16, 64, 8, 8192, 128), (15, 64, 8, 16384, 128))),
+        bf16_kv_partials=(causal and split_q == 4 and shape in ((16, 64, 8, 2048, 128), (16, 64, 8, 4096, 128),
+                                                                (16, 64, 8, 8192, 128), (15, 64, 8, 16384, 128))),
         **regalloc,
     )
 
@@ -10209,7 +10209,8 @@ def _run_bwd_d128_gqa_optimized(
                 num_warps=4,
             )
     convert_kwargs = ({"PLANE_ELEMENTS": batch * hq * n_ctx * head_dim} if precise_mha16k else {})
-    if _is_short_causal_mha((batch, hq, hk, n_ctx, head_dim), causal, split_q):
+    if (_is_short_causal_mha((batch, hq, hk, n_ctx, head_dim), causal, split_q)
+            or (causal and split_q == 1 and (batch, hq, hk, n_ctx, head_dim) == (16, 64, 8, 1024, 128))):
         convert_kwargs["WIDE_LOADS"] = True
     dispatch.convert_entry[(triton.cdiv(n_ctx, dispatch.convert_block_m), batch * hq)](
         dq_acc,
