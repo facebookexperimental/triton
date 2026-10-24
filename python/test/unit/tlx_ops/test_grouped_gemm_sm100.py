@@ -60,7 +60,7 @@ import inspect
 import sys
 from triton.tlx import ops
 assert 'triton.tlx.ops.kernels.grouped_gemm.sm100' not in sys.modules
-assert str(inspect.signature(ops.grouped_gemm)) == '(group_a, group_b)'
+assert str(inspect.signature(ops.grouped_gemm)) == '(group_a, group_b, *, space=None)'
 assert 'grouped_gemm' in ops.__all__
 """
     subprocess.run([sys.executable, "-c", script], check=True)
@@ -254,4 +254,4 @@ def test_grouped_gemm_uses_input_device_and_restores_current_device():
 def test_public_signature_matches_contract():
     from triton.tlx import ops
 
-    assert str(inspect.signature(ops.grouped_gemm)) == "(group_a, group_b)"
+    assert str(inspect.signature(ops.grouped_gemm)) == "(group_a, group_b, *, space=None)"

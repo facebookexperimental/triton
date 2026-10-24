@@ -16,6 +16,7 @@ import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..._catalog import InvalidInput
+from ..._invariance import BitwiseInvarianceSpec, gemm_fixed_split_k
 from ._shapes import SM90_FOCUS
 from ._sm90_core import _allocate_buffers, _consume_tile, _k_tile_range, _run_producer, _split_acc, _store_subtile
 
@@ -25,6 +26,7 @@ _MAX_SMEM = 232448 - 1024  # leave room for mbarriers and alignment
 _SPLIT_K_CHOICES = (2, 3, 4, 5, 6, 8, 11, 16, 22, 32)
 _MIN_K_TILES_PER_SPLIT = 4
 _TORCH_TO_TL = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
+_FIXED_SPEC = BitwiseInvarianceSpec.dims("K")
 
 
 @functools.lru_cache(maxsize=1)
@@ -270,16 +272,21 @@ def _prune_swap_configs(configs, nargs, **kwargs):
     ]
 
 
-def _swap_heuristic_config(M, N, K):
+def _swap_heuristic_config(M, N, K, *, invariance=None):
     # Arguments are the problem's (M, N, K).
     num_sms = _get_num_sms()
     block_m, block_n, block_k = 128, _swap_block_n(M), 128
     mn_tiles = _mn_tiles(N, M, block_m, block_n)
-    split_k = max([s for s in _SPLIT_K_CHOICES if mn_tiles * s <= num_sms and _split_k_valid(K, s, block_k)], default=1)
+    fixed = gemm_fixed_split_k(invariance)
+    if fixed is not None:
+        split_k = fixed
+    else:
+        split_k = max([s for s in _SPLIT_K_CHOICES if mn_tiles * s <= num_sms and _split_k_valid(K, s, block_k)],
+                      default=1)
     return [_config(block_m, block_n, _deepest_ring(block_m, block_n, block_k, split_k), 1, split_k, block_k, True)]
 
 
-def heuristic_config(M, N, K):
+def heuristic_config(M, N, K, *, invariance=None):
     num_sms = _get_num_sms()
     block_m, block_n = (256, 128) if M > N else (128, 256)
     if _mn_tiles(M, N, block_m, block_n) >= num_sms:
@@ -289,7 +296,11 @@ def heuristic_config(M, N, K):
     # Too few output tiles to fill the GPU: shrink the tile, then split K.
     block_m, block_n = 128, 128 if N > 64 else 64
     mn_tiles = _mn_tiles(M, N, block_m, block_n)
-    split_k = max([s for s in _SPLIT_K_CHOICES if mn_tiles * s <= num_sms and _split_k_valid(K, s)], default=1)
+    fixed = gemm_fixed_split_k(invariance)
+    if fixed is not None:
+        split_k = fixed
+    else:
+        split_k = max([s for s in _SPLIT_K_CHOICES if mn_tiles * s <= num_sms and _split_k_valid(K, s)], default=1)
     num_stages = 6 if block_n == 128 else 8
     while num_stages > 2 and not _fits_smem(block_m, block_n, num_stages, split_k):
         num_stages -= 1
@@ -473,11 +484,23 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                 tlx.async_descriptor_store_wait(0)
 
 
+def _tuned(space, shape=None, swap_ab=False, *, invariance=None):
+    """Autotuned kernel per search space, keyed on the effective fixed schedule.
+
+    Every non-empty invariance spec currently maps to the same `SPLIT_K`, so
+    `dims("M")`, `dims("K")` and `all()` share one autotuner instead of
+    retuning identical schedules.
+    """
+    return _tuned_for_fixed(space, shape, swap_ab, gemm_fixed_split_k(invariance))
+
+
 @functools.lru_cache(maxsize=None)
-def _tuned(space, shape=None, swap_ab=False):
+def _tuned_for_fixed(space, shape, swap_ab, fixed):
     prune_configs_by = None
     if space == "heuristic":
-        configs = _swap_heuristic_config(*shape) if swap_ab else heuristic_config(*shape)
+        fixed_spec = None if fixed is None else _FIXED_SPEC
+        configs = _swap_heuristic_config(*shape, invariance=fixed_spec) if swap_ab else heuristic_config(
+            *shape, invariance=fixed_spec)
     elif space == "full":
         configs = _swap_configs() if swap_ab else CONFIGS()
         prune_configs_by = {"early_config_prune": _prune_swap_configs if swap_ab else _prune_full_configs}
@@ -486,6 +509,8 @@ def _tuned(space, shape=None, swap_ab=False):
     else:
         raise InvalidInput(f"sm90 tlx.ops.mm does not provide search space {space!r}; "
                            "expected 'heuristic', 'full', or 'smoke'")
+    if fixed is not None:
+        configs = [c for c in configs if c.kwargs.get("SPLIT_K", 1) == fixed]
     return triton.autotune(
         configs=configs,
         key=["M", "N", "K"],
@@ -494,8 +519,15 @@ def _tuned(space, shape=None, swap_ab=False):
     )(matmul_kernel_tma_ws_hopper_cooperative)
 
 
-def mm(a, b, *, out=None, space="full"):
-    """Compute ``a @ b`` with the Hopper cooperative persistent GEMM."""
+_tuned.cache_clear = _tuned_for_fixed.cache_clear
+
+
+def mm(a, b, *, out=None, space="full", invariance=None):
+    """Compute ``a @ b`` with the Hopper cooperative persistent GEMM.
+
+    `invariance` is the resolved spec; a fixed schedule prunes split-K
+    candidates from every space so the K reduction stays uniform.
+    """
     M, K = a.shape
     _, N = b.shape
 
@@ -549,7 +581,7 @@ def mm(a, b, *, out=None, space="full"):
         num_tiles = triton.cdiv(kernel_m, meta["BM"]) * triton.cdiv(kernel_n, meta["BN"]) * meta["SPLIT_K"]
         return (min(num_sms, num_tiles), )
 
-    kernel = _tuned(space, (M, N, K) if space == "heuristic" else None, swap_ab)
+    kernel = _tuned(space, (M, N, K) if space == "heuristic" else None, swap_ab, invariance=invariance)
     kernel[grid](
         a_desc,
         b_desc,

@@ -16,7 +16,10 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._invariance import BitwiseInvarianceSpec, gemm_fixed_split_k
 from . import _sm100_core as _core
+
+_FIXED_SPEC = BitwiseInvarianceSpec.dims("K")
 
 
 # Cached SM count — never changes during program lifetime.
@@ -27,7 +30,7 @@ def _get_num_sms():
     return torch.cuda.get_device_properties("cuda").multi_processor_count
 
 
-def get_heuristic_config(M, N, K, num_sms=148):
+def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
     """
     Select optimal GEMM config based on problem shape characteristics.
 
@@ -39,10 +42,13 @@ def get_heuristic_config(M, N, K, num_sms=148):
     Args:
         M, N, K: GEMM dimensions (A is MxK, B is KxN, C is MxN)
         num_sms: Number of SMs on the GPU (default 148 for B200)
+        invariance: resolved BitwiseInvarianceSpec; a fixed schedule disables
+            the M/N-dependent split-K branches so the reduction stays uniform.
 
     Returns:
         dict: Configuration parameters for the TLX GEMM kernel
     """
+    fixed = gemm_fixed_split_k(invariance)
     MAX_SMEM = 232 * 1024  # 232KB shared memory limit
     MAX_TMEM = 256 * 1024  # 256KB tensor memory limit per SM
 
@@ -133,7 +139,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 }
 
     # Characteristic 2: Undersaturated GPU needs Split-K for parallelism
-    if is_undersaturated:
+    if is_undersaturated and fixed is None:
         # Use MN product to determine tile size - larger MN benefits from wider tiles
         mn_product = M * N
         is_large_output = mn_product >= 1_000_000  # ~1M elements in output
@@ -301,7 +307,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
         num_tiles_n = math.ceil(N / bn)
         num_mn_tiles = num_tiles_m * num_tiles_n
 
-        if num_mn_tiles < num_sms:
+        if num_mn_tiles < num_sms and fixed is None:
             k_tiles = math.ceil(K / bk)
             # Try split-K values (higher first), each split must have enough K tiles
             for sk in [8, 4, 2]:
@@ -1384,9 +1390,9 @@ def _smoke_configs():
 SMOKE_CONFIGS = _smoke_configs
 
 
-def heuristic_config(M, N, K):
+def heuristic_config(M, N, K, *, invariance=None):
     """The shape-picked config as a one-element space, or None if it declines."""
-    cfg = get_heuristic_config(M, N, K, _get_num_sms())
+    cfg = get_heuristic_config(M, N, K, _get_num_sms(), invariance=invariance)
     if cfg is None:
         return None
     cfg = dict(cfg)
@@ -1412,27 +1418,58 @@ def _widen_on_empty(prune, full_space):
     return pruned
 
 
+def _eligible_configs(configs, fixed):
+    """Keep the single fixed SPLIT_K; the autotuner and its hooks are unchanged."""
+    return [c for c in configs if c.kwargs.get("SPLIT_K", 1) == fixed]
+
+
+def _filtered_full_space(fixed):
+    """Full space pruned to the fixed schedule (widen fallback under invariance)."""
+    return _eligible_configs(CONFIGS(), fixed)
+
+
+def _tuned(space, shape=None, *, invariance=None):
+    """Autotuned kernel per search space; `shape` keys only the heuristic one.
+
+    Specs are keyed by their effective fixed schedule: every non-empty spec
+    currently maps to the same `SPLIT_K`, so `dims("M")`, `dims("K")` and
+    `all()` share one autotuner instead of retuning identical schedules.
+    """
+    return _tuned_for_fixed(space, shape, gemm_fixed_split_k(invariance))
+
+
 @functools.lru_cache(maxsize=None)
-def _tuned(space, shape=None):
-    """Autotuned kernel per search space; `shape` keys only the heuristic one."""
+def _tuned_for_fixed(space, shape, fixed):
     if space == "heuristic":
-        configs = heuristic_config(*shape) or SMOKE_CONFIGS()
+        configs = heuristic_config(*shape, invariance=None if fixed is None else _FIXED_SPEC) or SMOKE_CONFIGS()
     else:
         configs = {"full": CONFIGS, "smoke": SMOKE_CONFIGS}[space]()
+    widen_space = CONFIGS
+    if fixed is not None:
+        configs = _eligible_configs(configs, fixed)
+        widen_space = functools.partial(_filtered_full_space, fixed)
+        if not configs:
+            # A reduced space may hold no fixed-schedule candidate; widen now
+            # rather than handing an empty space to the autotuner.
+            configs = widen_space()
     return triton.autotune(
         configs=configs,
         key=["M", "N", "K"],
-        prune_configs_by={"early_config_prune": _widen_on_empty(preprocess_configs, CONFIGS)},
+        prune_configs_by={"early_config_prune": _widen_on_empty(preprocess_configs, widen_space)},
         post_hook=reduce_post_hook,
     )(matmul_kernel_tma_ws_blackwell)
 
 
-def mm(a, b, *, out=None, space="full"):
+_tuned.cache_clear = _tuned_for_fixed.cache_clear
+
+
+def mm(a, b, *, out=None, space="full", invariance=None):
     """Matrix multiply ``a @ b`` on Blackwell.
 
     `space` selects the search space -- "full" for perf, "heuristic" (one
     config) for correctness, "smoke" for path coverage. Not exposed on
-    `tlx.ops.mm`.
+    `tlx.ops.mm`. `invariance` is the resolved spec; a fixed schedule prunes
+    split-K candidates from every space so the K reduction stays uniform.
     """
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
@@ -1468,7 +1505,7 @@ def mm(a, b, *, out=None, space="full"):
         num_pid_n = triton.cdiv(N, META["BLOCK_SIZE_N"])
         return (num_pid_m * num_pid_n * META["SPLIT_K"], )
 
-    kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
+    kernel = _tuned(space, (M, N, K) if space == "heuristic" else None, invariance=invariance)
     kernel[grid](
         a_desc,
         b_desc,

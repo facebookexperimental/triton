@@ -28,7 +28,16 @@
     "!.claude/**",
     "!.llms/**",
     "!AGENTS.md",
-    "!third_party/tlx/tools/agents/skills/**"
+    "!third_party/tlx/tools/agents/skills/**",
+    "!.github/**",
+    ".github/workflows/gpu-tests.yml",
+    ".github/workflows/build.yml",
+    ".github/actions/install-prebuilt-triton/**",
+    ".github/actions/select-kernel-tests/**",
+    ".github/scripts/kernel_test_selection.py",
+    ".github/scripts/wheel_cache.py",
+    ".github/workflows/h100.yml",
+    ".github/actions/install-torchao/**"
   ],
   "b200": [
     "**",
@@ -55,7 +64,16 @@
     "!.claude/**",
     "!.llms/**",
     "!AGENTS.md",
-    "!third_party/tlx/tools/agents/skills/**"
+    "!third_party/tlx/tools/agents/skills/**",
+    "!.github/**",
+    ".github/workflows/gpu-tests.yml",
+    ".github/workflows/build.yml",
+    ".github/actions/install-prebuilt-triton/**",
+    ".github/actions/select-kernel-tests/**",
+    ".github/scripts/kernel_test_selection.py",
+    ".github/scripts/wheel_cache.py",
+    ".github/workflows/b200.yml",
+    ".github/actions/install-torchao/**"
   ],
   "mi350": [
     "**",
@@ -87,6 +105,15 @@
     "!.claude/**",
     "!.llms/**",
     "!AGENTS.md",
-    "!third_party/tlx/tools/agents/skills/**"
+    "!third_party/tlx/tools/agents/skills/**",
+    "!.github/**",
+    ".github/workflows/gpu-tests.yml",
+    ".github/workflows/build.yml",
+    ".github/actions/install-prebuilt-triton/**",
+    ".github/actions/select-kernel-tests/**",
+    ".github/scripts/kernel_test_selection.py",
+    ".github/scripts/wheel_cache.py",
+    ".github/workflows/mi350.yml",
+    ".github/actions/setup-test-env/**"
   ]
 }

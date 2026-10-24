@@ -5,7 +5,7 @@ import itertools
 import pytest
 import torch
 from triton._internal_testing import is_hip_cdna4
-from triton.tlx.ops.kernels.flash_attn_varlen._shapes import CORRECTNESS_SHAPES, seqlens
+from triton.tlx.ops.kernels.flash_attn_varlen._shapes import CORRECTNESS_SHAPES, is_cross_attention, seqlens
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="tlx.ops.flash_attn_varlen on gfx950 requires CDNA4")
 
@@ -51,7 +51,8 @@ def _check(lens_q, lens_k, causal, heads=1, kv_heads=None, dtype=torch.float16, 
     torch.testing.assert_close(out.float(), ref, **TOLERANCE[dtype])
 
 
-@pytest.mark.parametrize("batch,min_seqlen,max_seqlen,heads,head_dim,causal,dtype_name", CORRECTNESS_SHAPES)
+@pytest.mark.parametrize("batch,min_seqlen,max_seqlen,heads,head_dim,causal,dtype_name",
+                         [shape[:7] for shape in CORRECTNESS_SHAPES if not is_cross_attention(shape)])
 def test_flash_attn_varlen_shapes(batch, min_seqlen, max_seqlen, heads, head_dim, causal, dtype_name):
     torch.manual_seed(20)
     lengths = seqlens(batch, min_seqlen, max_seqlen)

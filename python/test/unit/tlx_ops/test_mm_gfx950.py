@@ -7,9 +7,11 @@ import torch
 import triton
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx import ops as tlx_ops
-from triton.tlx.ops import InvalidInput, UnsupportedOp
+from triton.tlx.ops import BitwiseInvarianceSpec, InvalidInput, UnsupportedOp
 from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
 from triton.tlx.ops.kernels.mm import gfx950 as _gfx950
+
+from mm_test_utils import run_mm_invariance_case
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
@@ -939,7 +941,7 @@ def test_mm_caches_public_catalog_lookup(monkeypatch):
         calls += 1
         assert op == "mm"
         assert device == a.device
-        return (lambda _a, _b, *, out, space: out), spec
+        return (lambda _a, _b, *, out, space, invariance=None: out), spec
 
     monkeypatch.setattr(tlx_ops, "impl_for", counting_impl_for)
     tlx_ops._mm_impl_for_device.cache_clear()
@@ -1954,3 +1956,121 @@ def test_mm_matches_aten_for_cancellation(n, k, pattern_period, segment_k):
     actual = matmul(a, b)
     expected = torch.matmul(a, b)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+_INVARIANCE_SPECS = [
+    BitwiseInvarianceSpec.dims("M"),
+    BitwiseInvarianceSpec.dims("K"),
+    BitwiseInvarianceSpec.all(),
+]
+
+_INVARIANCE_SHAPES = [
+    (64, 1920, 1536, (1536, 1), (1920, 1), "bf16"),
+    (2048, 1024, 1000, (1000, 1), (1024, 1), "bf16"),
+    (512, 512, 48, (48, 1), (512, 1), "bf16"),
+    (7, 8192, 2048, (2048, 1), (8192, 1), "fp16"),
+    # TN persistent specialization: full-M run uses the persistent kernel.
+    (1024, 6144, 4096, (4096, 1), (1, 4096), "fp16"),
+    # Unaligned K keeps a sequential range fallback instead of raising.
+    (2048, 512, 1001, (1001, 1), (1, 1001), "bf16"),
+]
+
+
+@pytest.mark.parametrize("spec", _INVARIANCE_SPECS)
+@pytest.mark.parametrize("m,n,k,a_strides,b_strides,dtype_name", _INVARIANCE_SHAPES)
+def test_mm_invariance(spec, m, n, k, a_strides, b_strides, dtype_name):
+    """A non-empty spec gives exact M-slice equality (public `tlx.ops.mm`)."""
+    run_mm_invariance_case("gfx950", m, n, k, a_strides, b_strides, dtype_name, spec)
+
+
+def _assert_sequential_dispatch(dispatch, fixed=1):
+    """Reject every K-splitting plan a fixed schedule must prune."""
+    assert dispatch is not None
+    path, plan = dispatch
+    assert path not in ("local_split_u", "streamk", "ragged_n", "m192n256")
+    if path == "lds":
+        assert plan[2] == fixed
+    if path == "inter_wave":
+        assert plan is not None and plan["SPLIT_K"] == fixed
+    if path == "wave_grid":
+        assert _gfx950._wave_grid_is_sequential(plan, fixed)
+
+
+def test_heuristic_prunes_split_k():
+    """A fixed schedule prunes K-splitting plans from the dispatch (no launch)."""
+    invariance = BitwiseInvarianceSpec.dims("K")
+    # (7, 8192, 2048) fp16 selects a LocalSplitU plan by default.
+    default = _gfx950._dispatch_plan(7, 8192, 2048, torch.float16, 2)
+    assert default[0] == "local_split_u"
+    pruned = _gfx950._dispatch_plan(7, 8192, 2048, torch.float16, 2, invariance=invariance)
+    _assert_sequential_dispatch(pruned)
+    # (677, 4096, 8192) bf16 selects a split-K LDS plan by default.
+    default = _gfx950._dispatch_plan(677, 4096, 8192, torch.bfloat16, 2)
+    assert default == ("lds", (192, 256, 4))
+    pruned = _gfx950._dispatch_plan(677, 4096, 8192, torch.bfloat16, 2, invariance=invariance)
+    _assert_sequential_dispatch(pruned)
+    # Persistent shapes stay eligible: the kernel reduces K sequentially
+    # within one program per output tile.
+    pruned = _gfx950._dispatch_plan(1024, 6144, 4096, torch.float16, 2, invariance=invariance)
+    assert pruned == ("persistent", "mt224x128_k4096")
+
+
+def test_heuristic_unaligned_k_keeps_sequential_fallback():
+    """Unaligned K keeps a sequential range fallback under the spec (no launch)."""
+    strides_a, strides_b = (1001, 1), (1, 1001)
+    default = _gfx950.heuristic_config(2048, 512, 1001, torch.bfloat16, 2, strides_a, strides_b)
+    assert default[0] == "range_register"
+    pruned = _gfx950.heuristic_config(2048, 512, 1001, torch.bfloat16, 2, strides_a, strides_b,
+                                      invariance=BitwiseInvarianceSpec.dims("M"))
+    assert pruned == default
+
+
+def test_heuristic_split_k_inter_wave_promotion_stays_sequential(monkeypatch):
+    """A split-K inter-wave promotion stays sequential under the spec (no launch)."""
+    shape = (2048, 25408, 10240)
+    monkeypatch.setitem(_gfx950._BF16_INTER_WAVE_PROMOTIONS, shape, {"TILE": (256, 256), "SPLIT_K": 4})
+    _gfx950._dispatch_plan.cache_clear()
+    try:
+        pruned = _gfx950._dispatch_plan(*shape, torch.bfloat16, 2, invariance=BitwiseInvarianceSpec.dims("K"))
+    finally:
+        _gfx950._dispatch_plan.cache_clear()
+    _assert_sequential_dispatch(pruned)
+
+
+def test_full_space_fixed_takes_sequential_register(monkeypatch):
+    """`space="full"` under a fixed schedule launches the register path (no launch)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    a = SimpleNamespace(is_cuda=True, shape=(64, 128), dtype=torch.bfloat16, device="cuda:0")
+    a.stride = lambda: (128, 1)
+    b = SimpleNamespace(shape=(128, 64), dtype=torch.bfloat16, device="cuda:0")
+    b.stride = lambda: (64, 1)
+    # `mm` validates `out` is a `torch.Tensor` before the mocked launch;
+    # use a tensor-spec mock so this GPU-free test passes validation.
+    out = MagicMock(spec=torch.Tensor)
+    out.shape = (64, 64)
+    out.dtype = torch.bfloat16
+    out.device = "cuda:0"
+    sentinel = object()
+    monkeypatch.setattr(_gfx950, "_launch_register", lambda x, y, out=None: sentinel)
+    monkeypatch.setattr(
+        _gfx950, "_launch_range_autotuned", lambda *args:
+        (_ for _ in ()).throw(AssertionError("full+fixed must not autotune range candidates")))
+    assert _gfx950.mm(a, b, out=out, space="full", invariance=BitwiseInvarianceSpec.dims("K")) is sentinel
+
+
+def test_mm_invariance_full_space():
+    """End-to-end M-slice equality through `Space("full", ...)` (public `tlx.ops.mm`)."""
+    from triton.tlx.ops import Space, mm as tlx_mm
+
+    spec = BitwiseInvarianceSpec.dims("M")
+    space = Space("full", invariance=spec)
+    a = operand(64, 1536, (1536, 1), torch.bfloat16)
+    b = operand(1536, 1920, (1920, 1), torch.bfloat16)
+    full = tlx_mm(a, b, space=space)
+    rerun = tlx_mm(a[:32], b, space=space)
+    assert torch.equal(full[:32], rerun)
+    ref = torch.matmul(a, b)
+    torch.testing.assert_close(full, ref, atol=8e-3 * ref.abs().max().item(), rtol=8e-3)
+    torch.cuda.empty_cache()
