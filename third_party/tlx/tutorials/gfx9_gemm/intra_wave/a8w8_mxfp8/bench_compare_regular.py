@@ -22,7 +22,6 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a8w8_mxfp8.regular
     regular_mxfp8_square,
 )
 
-
 SIZES = (1024, 2048, 4096, 8192, 16384)
 
 
@@ -88,8 +87,8 @@ def benchmark(size, samples, iterations, unroll):
         return regular_mxfp8_square(a, b, sa, sb, out=out_packed)
 
     def aiter_triton():
-        return gemm_a8w8_blockscale_group32(a, b, a_scale, b_scale, dtype=torch.bfloat16,
-                                            y=out_aiter, weight_group_rows=1)
+        return gemm_a8w8_blockscale_group32(a, b, a_scale, b_scale, dtype=torch.bfloat16, y=out_aiter,
+                                            weight_group_rows=1)
 
     def primus_flydsl():
         return gemm_mxfp8_flydsl_kernel(a, a_scale, b, b_scale, out=out_flydsl)
@@ -130,8 +129,7 @@ def benchmark(size, samples, iterations, unroll):
                 del outputs["primus_flydsl"]
                 break
         del first, cache_flush
-    checks = {name: _check(name, output, a, b, a_scale, b_scale, size)
-              for name, output in outputs.items()}
+    checks = {name: _check(name, output, a, b, a_scale, b_scale, size) for name, output in outputs.items()}
     graphs = {name: _capture(fn, unroll) for name, fn in functions.items()}
     measurements = {name: [] for name in functions}
     names = list(functions)
@@ -152,9 +150,6 @@ def benchmark(size, samples, iterations, unroll):
         for name, values in measurements.items()
     }
     result = {"size": size, "correctness": checks, "timings": timing, "excluded": excluded}
-    del graphs, outputs, a, b, a_scale, b_scale, packed_a, packed_b
-    gc.collect()
-    torch.cuda.empty_cache()
     return result
 
 
@@ -166,27 +161,35 @@ def main():
     parser.add_argument("--unroll", type=int, default=2)
     args = parser.parse_args()
     try:
-        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True,
-                                           stderr=subprocess.DEVNULL).strip()
+        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
     except (OSError, subprocess.CalledProcessError):
         revision = os.environ.get("TLX_REVISION", "unknown")
-    print(json.dumps({
-        "kind": "environment", "gpu": torch.cuda.get_device_name(),
-        "torch": torch.__version__, "tlx_revision": revision,
-        "aiter_version": importlib.metadata.version("amd-aiter"),
-        "flydsl_version": importlib.metadata.version("flydsl"),
-        "primus_version": importlib.metadata.version("primus-turbo"),
-        "dtype": "E4M3 x E4M3, E8M0 1x32 A/B, BF16 output",
-        "metric": "CUDA/HIP graph replay median operation time; output buffers preallocated",
-        "scope": "TLX cached=GEMM only; TLX pack=two scale packs+GEMM; AITER=raw-scale Triton; Primus=raw-scale fused preshuffle+GEMM",
-        "clock_policy": "not fixed",
-        "aiter_tuning": "package defaults (no square-shape group32 config rows)",
-        "primus_tuning": "first-call autotuned per shape",
-        "samples": args.samples, "iterations": args.iterations, "unroll": args.unroll,
-    }), flush=True)
+    print(
+        json.dumps({
+            "kind": "environment",
+            "gpu": torch.cuda.get_device_name(),
+            "torch": torch.__version__,
+            "tlx_revision": revision,
+            "aiter_version": importlib.metadata.version("amd-aiter"),
+            "flydsl_version": importlib.metadata.version("flydsl"),
+            "primus_version": importlib.metadata.version("primus-turbo"),
+            "dtype": "E4M3 x E4M3, E8M0 1x32 A/B, BF16 output",
+            "metric": "CUDA/HIP graph replay median operation time; output buffers preallocated",
+            "scope":
+            "TLX cached=GEMM only; TLX pack=two scale packs+GEMM; AITER=raw-scale Triton; Primus=raw-scale fused preshuffle+GEMM",
+            "clock_policy": "not fixed",
+            "aiter_tuning": "package defaults (no square-shape group32 config rows)",
+            "primus_tuning": "first-call autotuned per shape",
+            "samples": args.samples,
+            "iterations": args.iterations,
+            "unroll": args.unroll,
+        }), flush=True)
     for size in args.size or SIZES:
-        print(json.dumps({"kind": "result", **benchmark(size, args.samples, args.iterations, args.unroll)}),
-              flush=True)
+        result = benchmark(size, args.samples, args.iterations, args.unroll)
+        print(json.dumps({"kind": "result", **result}), flush=True)
+        del result
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

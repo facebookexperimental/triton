@@ -1716,12 +1716,9 @@ def test_gfx950_regular_mxfp8_square_matches_fp32_reference(size, scale_dtype):
     generator.manual_seed(43)
     a = (torch.randn((size, size), device=DEVICE, generator=generator) * 0.25).to(torch.float8_e4m3fn)
     b = (torch.randn((size, size), device=DEVICE, generator=generator) * 0.25).to(torch.float8_e4m3fn)
-    a_scales = torch.randint(124, 130, (size, size // 32), dtype=torch.uint8,
-                             device=DEVICE, generator=generator)
-    b_scales = torch.randint(124, 130, (size, size // 32), dtype=torch.uint8,
-                             device=DEVICE, generator=generator)
-    packed_a, packed_b = pack_regular_mxfp8_scales(a_scales.view(scale_dtype),
-                                                   b_scales.view(scale_dtype))
+    a_scales = torch.randint(124, 130, (size, size // 32), dtype=torch.uint8, device=DEVICE, generator=generator)
+    b_scales = torch.randint(124, 130, (size, size // 32), dtype=torch.uint8, device=DEVICE, generator=generator)
+    packed_a, packed_b = pack_regular_mxfp8_scales(a_scales.view(scale_dtype), b_scales.view(scale_dtype))
     out = torch.empty((size, size), dtype=torch.bfloat16, device=DEVICE)
     regular_mxfp8_square(a, b, packed_a, packed_b, out=out)
 

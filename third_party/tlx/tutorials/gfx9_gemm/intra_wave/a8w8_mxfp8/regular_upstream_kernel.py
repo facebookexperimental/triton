@@ -13,32 +13,64 @@ from triton.tlx.ops.kernels.mxfp8_tiles_gfx950 import _generic_tile, _quad_tile
 
 @triton.jit
 def regular_mxfp8_generic_kernel(
-    a_ptr, b_ptr, c_ptr, as_ptr, bs_ptr,
-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    as_ptr,
+    bs_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
     STAGES: tl.constexpr,
 ):
     pid = tl.program_id(0)
     _generic_tile(
-        pid // (N // BN), pid % (N // BN),
-        a_ptr, b_ptr, c_ptr, as_ptr, bs_ptr,
-        0, M, N, K, K // BK,
-        BLOCK_SIZE_M=BM, BLOCK_SIZE_N=BN, BLOCK_SIZE_K=BK,
-        NUM_STAGES=STAGES, K_MAJOR=True,
+        pid // (N // BN),
+        pid % (N // BN),
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        as_ptr,
+        bs_ptr,
+        0,
+        M,
+        N,
+        K,
+        K // BK,
+        BLOCK_SIZE_M=BM,
+        BLOCK_SIZE_N=BN,
+        BLOCK_SIZE_K=BK,
+        NUM_STAGES=STAGES,
+        K_MAJOR=True,
     )
 
 
-def regular_mxfp8_generic(a, b, as_packed, bs_packed, *, out, return_kernel=False,
-                          bm=128, bn=256, bk=128, stages=2, warps=8):
+def regular_mxfp8_generic(a, b, as_packed, bs_packed, *, out, return_kernel=False, bm=128, bn=256, bk=128, stages=2,
+                          warps=8):
     m, k = a.shape
     n = b.shape[0]
     if m % bm or n % bn or k % bk:
         raise ValueError("matrix sizes must divide tile sizes")
-    kernel = regular_mxfp8_generic_kernel[(m // bm * (n // bn),)](
-        a, b, out, as_packed, bs_packed,
-        M=m, N=n, K=k, BM=bm, BN=bn, BK=bk, STAGES=stages,
-        num_warps=warps, num_stages=stages, matrix_instr_nonkdim=16,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    kernel = regular_mxfp8_generic_kernel[(m // bm * (n // bn), )](
+        a,
+        b,
+        out,
+        as_packed,
+        bs_packed,
+        M=m,
+        N=n,
+        K=k,
+        BM=bm,
+        BN=bn,
+        BK=bk,
+        STAGES=stages,
+        num_warps=warps,
+        num_stages=stages,
+        matrix_instr_nonkdim=16,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
     )
     return (out, kernel) if return_kernel else out
 
@@ -59,8 +91,20 @@ def regular_mxfp8_lds_scales_kernel(
     smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
-            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
-            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [1, 0],
+            [32, 0],
+            [64, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
         ],
         [HALF, BK],
     )
@@ -79,28 +123,53 @@ def regular_mxfp8_lds_scales_kernel(
     pid_m = pid // (N // 256)
     pid_n = pid % (N // 256)
     _quad_tile(
-        pid_m, pid_n, a_ptr, b_ptr, c_ptr, as_ptr, bs_ptr,
-        0, M, N, K, K // BK,
-        smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
-        smem_sa_top, smem_sa_bot, smem_sb_left, smem_sb_right,
-        BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=BK,
+        pid_m,
+        pid_n,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        as_ptr,
+        bs_ptr,
+        0,
+        M,
+        N,
+        K,
+        K // BK,
+        smem_a_top,
+        smem_a_bot,
+        smem_b_left,
+        smem_b_right,
+        smem_sa_top,
+        smem_sa_bot,
+        smem_sb_left,
+        smem_sb_right,
+        BLOCK_SIZE_M=256,
+        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_K=BK,
         N_ALIGNED=True,
         opaque_zero=pid // (1 << 30),
         K_MAJOR=True,
     )
 
 
-def regular_mxfp8_lds_scales(a, b, as_packed, bs_packed, *, out,
-                             return_kernel=False, agpr_alloc=False):
+def regular_mxfp8_lds_scales(a, b, as_packed, bs_packed, *, out, return_kernel=False, agpr_alloc=False):
     m, k = a.shape
     n = b.shape[0]
     if m % 256 or n % 256 or k % 128:
         raise ValueError("M and N must be divisible by 256 and K by 128")
-    kernel = regular_mxfp8_lds_scales_kernel[(m // 256 * (n // 256),)](
-        a, b, out, as_packed, bs_packed,
-        M=m, N=n, K=k,
-        num_warps=8, num_stages=1, matrix_instr_nonkdim=16,
-        llvm_fn_attrs=() if agpr_alloc else (("amdgpu-agpr-alloc", "0,0"),),
+    kernel = regular_mxfp8_lds_scales_kernel[(m // 256 * (n // 256), )](
+        a,
+        b,
+        out,
+        as_packed,
+        bs_packed,
+        M=m,
+        N=n,
+        K=k,
+        num_warps=8,
+        num_stages=1,
+        matrix_instr_nonkdim=16,
+        llvm_fn_attrs=() if agpr_alloc else (("amdgpu-agpr-alloc", "0,0"), ),
     )
     return (out, kernel) if return_kernel else out
 
@@ -118,10 +187,9 @@ def pack_regular_mxfp8_scale(scale):
         raise ValueError("scale must be on a GPU")
     # The square shapes need no padding. Store each 128x4 scale atom as
     # [row-within-32, K-scale-column, row-group] for the gfx950 LDS scale load.
-    return (scale.view(torch.uint8)
-            .view(1, size // 128, 4, 32, size // 128, 4)
-            .permute(0, 1, 4, 3, 5, 2).contiguous()
-            .view(1, size // 128, size // 128, 2, 256))
+    return (scale.view(torch.uint8).view(1, size // 128, 4, 32, size // 128,
+                                         4).permute(0, 1, 4, 3, 5,
+                                                    2).contiguous().view(1, size // 128, size // 128, 2, 256))
 
 
 def pack_regular_mxfp8_scales(a_scales, b_scales):
@@ -153,12 +221,9 @@ def regular_mxfp8_square(a, b, as_packed, bs_packed, *, out, return_kernel=False
             or as_packed.dtype != torch.uint8 or bs_packed.dtype != torch.uint8):
         raise ValueError("expected uint8 K-major blocked scale tensors")
     if size == 1024:
-        return regular_mxfp8_generic(a, b, as_packed, bs_packed, out=out,
-                                     return_kernel=return_kernel,
-                                     bm=64, bn=64, stages=3, warps=4)
+        return regular_mxfp8_generic(a, b, as_packed, bs_packed, out=out, return_kernel=return_kernel, bm=64, bn=64,
+                                     stages=3, warps=4)
     if size == 2048:
-        return regular_mxfp8_generic(a, b, as_packed, bs_packed, out=out,
-                                     return_kernel=return_kernel,
-                                     bm=64, bn=128, stages=2, warps=4)
-    return regular_mxfp8_lds_scales(a, b, as_packed, bs_packed, out=out,
-                                    return_kernel=return_kernel)
+        return regular_mxfp8_generic(a, b, as_packed, bs_packed, out=out, return_kernel=return_kernel, bm=64, bn=128,
+                                     stages=2, warps=4)
+    return regular_mxfp8_lds_scales(a, b, as_packed, bs_packed, out=out, return_kernel=return_kernel)

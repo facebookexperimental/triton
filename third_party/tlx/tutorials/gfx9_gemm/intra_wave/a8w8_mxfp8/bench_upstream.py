@@ -18,14 +18,10 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a8w8_mxfp8.regular
 def regular_inputs(size, seed=42):
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
-    a = torch.randint(-2, 3, (size, size), dtype=torch.int8, device="cuda", generator=generator).to(
-        torch.float8_e4m3fn)
-    b = torch.randint(-2, 3, (size, size), dtype=torch.int8, device="cuda", generator=generator).to(
-        torch.float8_e4m3fn)
-    a_scales = torch.randint(125, 128, (size, size // 32), dtype=torch.uint8,
-                             device="cuda", generator=generator)
-    b_scales = torch.randint(125, 128, (size, size // 32), dtype=torch.uint8,
-                             device="cuda", generator=generator)
+    a = torch.randint(-2, 3, (size, size), dtype=torch.int8, device="cuda", generator=generator).to(torch.float8_e4m3fn)
+    b = torch.randint(-2, 3, (size, size), dtype=torch.int8, device="cuda", generator=generator).to(torch.float8_e4m3fn)
+    a_scales = torch.randint(125, 128, (size, size // 32), dtype=torch.uint8, device="cuda", generator=generator)
+    b_scales = torch.randint(125, 128, (size, size // 32), dtype=torch.uint8, device="cuda", generator=generator)
     return a, b, a_scales, b_scales
 
 
@@ -40,8 +36,8 @@ def _time_batch(fn, iterations):
     return start.elapsed_time(end) / iterations
 
 
-def run(size: int, samples: int, iterations: int, unroll: int, variant: str,
-        bm: int, bn: int, stages: int, warps: int) -> dict:
+def run(size: int, samples: int, iterations: int, unroll: int, variant: str, bm: int, bn: int, stages: int,
+        warps: int) -> dict:
     a, b, raw_sa, raw_sb = regular_inputs(size)
     sa, sb = pack_regular_mxfp8_scales(raw_sa, raw_sb)
     out = torch.empty((size, size), device="cuda", dtype=torch.bfloat16)
@@ -50,11 +46,10 @@ def run(size: int, samples: int, iterations: int, unroll: int, variant: str,
         if variant == "auto":
             return regular_mxfp8_square(a, b, sa, sb, out=out, return_kernel=capture)
         if variant == "lds":
-            return regular_mxfp8_lds_scales(a, b, sa, sb, out=out,
-                                            return_kernel=capture)
+            return regular_mxfp8_lds_scales(a, b, sa, sb, out=out, return_kernel=capture)
         if variant == "generic":
-            return regular_mxfp8_generic(a, b, sa, sb, out=out, return_kernel=capture,
-                                         bm=bm, bn=bn, stages=stages, warps=warps)
+            return regular_mxfp8_generic(a, b, sa, sb, out=out, return_kernel=capture, bm=bm, bn=bn, stages=stages,
+                                         warps=warps)
         raise ValueError(f"unknown variant: {variant}")
 
     _, kernel = launch(capture=True)
@@ -117,8 +112,10 @@ def main():
     parser.add_argument("--warps", type=int, default=8)
     args = parser.parse_args()
     for size in args.size or (1024, 2048, 4096, 8192, 16384):
-        print(json.dumps(run(size, args.samples, args.iterations, args.unroll, args.variant,
-                             args.bm, args.bn, args.stages, args.warps)), flush=True)
+        print(
+            json.dumps(
+                run(size, args.samples, args.iterations, args.unroll, args.variant, args.bm, args.bn, args.stages,
+                    args.warps)), flush=True)
 
 
 if __name__ == "__main__":
