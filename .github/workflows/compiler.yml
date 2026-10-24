@@ -99,57 +99,27 @@ jobs:
 
       - name: Parse test failures (LIT)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always()
         uses: ./.github/actions/parse-test-failures
         with:
-          workflow: ${{ github.workflow }}
+          workflow: ${{ github.workflow }}${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
           job: lit-tests
           failed: ${{ steps.lit.outcome == 'failure' }}
           bucket: compiler-lit
           lit-log: /tmp/lit.log
 
-  # ----- Nightly issue filing (schedule only) -----
-  report-compiler-lit:
+  # File and close failure issues; ci-issues.yml decides which runs file.
+  issues-compiler-lit:
     needs: lit-tests
-    if: always() && github.event_name == 'schedule' && needs.lit-tests.outputs.failures != '' && needs.lit-tests.outputs.failures != '[]'
+    if: always()
     permissions:
       contents: read
       issues: write
       actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.lit-tests.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
+    uses: ./.github/workflows/ci-issues.yml
     with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      # platform intentionally empty: compiler LIT gets the suspect list + external-dep
-      # annotation, but not per-commit deep bisection (LLVM+Triton rebuild is too heavy).
-      platform: ''
-
-  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
-  reconcile-compiler-lit:
-    needs: lit-tests
-    if: always() && github.event_name == 'schedule' && (needs.lit-tests.result == 'success' || needs.lit-tests.result == 'failure')
-    permissions:
-      contents: read
-      issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
-    with:
-      workflow_name: ${{ github.workflow }}
-      job_name: lit-tests
+      workflow: ${{ github.workflow }}
+      job: lit-tests
+      result: ${{ needs.lit-tests.result }}
       failures: ${{ needs.lit-tests.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ github.sha }}
