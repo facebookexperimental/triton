@@ -4181,6 +4181,7 @@ class _D128InterleavedDispatch:
     kv_splits: int = 1
     phase_iglp: int = -1
     peel_causal: bool = False
+    bf16_kv_partials: bool = False
 
 
 def _select_original_d128_interleaved_dispatch(q_shape=None, k_shape=None, causal=False):
@@ -6482,6 +6483,7 @@ def _attn_bwd_opt_gqa_phase(
     CACHE_SCORE_K: tl.constexpr = False,
     MASK_CAUSAL: tl.constexpr = True,
     k_score_cache=None,
+    TUNED_CAUSAL_GQA: tl.constexpr = False,
 ):
     """Run one absolute outer-step phase with direct dK or the lagged bridge.
 
@@ -6494,8 +6496,8 @@ def _attn_bwd_opt_gqa_phase(
                                                                                               N == 8192 or N == 16384)
     tl.static_assert(not (DIRECT_DK and FRAGMENT_CHAIN))
     tl.static_assert(not SKIP_DUMMY_DQ or (FRAGMENT_CHAIN and REDIRECT_DUMMY_DQ))
-    if IS_CAUSAL and (HQ == HK or SHORT_CAUSAL_GQA):
-        tlx.amd_iglp_opt(3)
+    if IS_CAUSAL and (HQ == HK or SHORT_CAUSAL_GQA or TUNED_CAUSAL_GQA):
+        tlx.amd_iglp_opt(2 if TUNED_CAUSAL_GQA else 3)
     elif not IS_CAUSAL and (REDIRECT_DUMMY_DQ or (HQ == HK and not UNROLL_PHASES)):
         # Unrolled phases share one hint; rolled MHA needs a hint in each region.
         # The measured GQA1K schedule uses the simple exp/MFMA interleave.
@@ -6725,10 +6727,10 @@ def _attn_bwd_gqa_outer_step(
     CACHE_SCORE_K: tl.constexpr = False,
     MASK_CAUSAL: tl.constexpr = True,
     k_score_cache=None,
+    TUNED_CAUSAL_GQA: tl.constexpr = False,
 ):
-    # Unroll fully valid MHA and short GQA regions after the masked diagonal.
-    steady_causal_gqa: tl.constexpr = (IS_CAUSAL and HQ != HK and CACHE_SCORE_K and (N == 2048 or N == 4096)
-                                       and not MASK_CAUSAL)
+    # Unroll fully valid MHA and GQA regions after the masked diagonal.
+    steady_causal_gqa: tl.constexpr = (IS_CAUSAL and HQ != HK and CACHE_SCORE_K and not MASK_CAUSAL)
     steady_unroll: tl.constexpr = (unroll_phases or steady_causal_gqa
                                    or (IS_CAUSAL and HQ == HK and CACHE_SCORE_K and not MASK_CAUSAL))
     steady_slice_refill: tl.constexpr = slice_refill or steady_causal_gqa
@@ -6813,6 +6815,7 @@ def _attn_bwd_gqa_outer_step(
         CACHE_SCORE_K=CACHE_SCORE_K,
         MASK_CAUSAL=MASK_CAUSAL,
         k_score_cache=k_score_cache,
+        TUNED_CAUSAL_GQA=TUNED_CAUSAL_GQA,
     )
     if steady_slice_refill:
         _attn_bwd_gqa_issue_qdo_slice_async(
@@ -6882,6 +6885,7 @@ def _attn_bwd_gqa_outer_step(
             CACHE_SCORE_K=CACHE_SCORE_K,
             MASK_CAUSAL=MASK_CAUSAL,
             k_score_cache=k_score_cache,
+            TUNED_CAUSAL_GQA=TUNED_CAUSAL_GQA,
         )
         if steady_slice_refill:
             _attn_bwd_gqa_issue_qdo_slice_async(
@@ -7146,6 +7150,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     tl.static_assert(BLOCK_N == 256)
     tl.static_assert(N % 256 == 0)
     tl.static_assert(HQ % HK == 0)
+    TUNED_CAUSAL_GQA: tl.constexpr = (IS_CAUSAL and HQ == 64 and HK == 8 and SPLIT_Q == 4
+                                      and ((BATCH == 16 and N == 8192) or (BATCH == 15 and N == 16384)))
 
     if owner_coordinates is None:
         # Decode the KV head from the causal head-partition grid.
@@ -7545,13 +7551,17 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
             SKIP_DUMMY_DQ=True,
             CACHE_SCORE_K=CACHE_SCORE_K,
             k_score_cache=k_score_cache,
+            TUNED_CAUSAL_GQA=TUNED_CAUSAL_GQA,
         )
         # Only the first 256 query rows of each head intersect this key tile's diagonal.
         # The second region omits mask coordinates and the runtime diagonal branch.
         # Causal MHA owns one head. Remove its redundant loop to avoid spills when unrolling phases.
         head_begin = outer_start // active_outer_blocks if IS_CAUSAL and HQ != HK else 0
         head_end = tl.cdiv(outer_end, active_outer_blocks) if IS_CAUSAL and HQ != HK else 1
-        for head_interval in range(head_begin, head_end):
+        head_loop_start = 0 if TUNED_CAUSAL_GQA else head_begin
+        head_loop_end = (HQ // HK) // SPLIT_Q if TUNED_CAUSAL_GQA else head_end
+        for head_index in tl.range(head_loop_start, head_loop_end, loop_unroll_factor=2 if TUNED_CAUSAL_GQA else 1):
+            head_interval = split_id * ((HQ // HK) // SPLIT_Q) + head_index if TUNED_CAUSAL_GQA else head_index
             for region in tl.static_range(2 if IS_CAUSAL else 1):
                 if IS_CAUSAL:
                     head_start = head_interval * active_outer_blocks
@@ -7622,6 +7632,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
                         CACHE_SCORE_K=CACHE_SCORE_K,
                         MASK_CAUSAL=region == 0,
                         k_score_cache=k_score_cache,
+                        TUNED_CAUSAL_GQA=TUNED_CAUSAL_GQA,
                     )
     else:
         for outer_step in tl.range(outer_start, outer_end, loop_unroll_factor=1):
@@ -7681,6 +7692,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
                 SKIP_DUMMY_DQ=False,
                 CACHE_SCORE_K=CACHE_SCORE_K,
                 k_score_cache=k_score_cache,
+                TUNED_CAUSAL_GQA=TUNED_CAUSAL_GQA,
             )
 
     if continuous_bridge:
@@ -7762,7 +7774,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
             kv_native_layout,
             pin=False,
         )
-        tlx.buffer_store(dk, DK, key_offsets)
+        tlx.buffer_store(dk.to(DK.dtype.element_ty), DK, key_offsets)
 
     # dK is dead before constructing the dV view, so its temporary registers
     # are available to the dV epilogue.
@@ -7775,7 +7787,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     elif SPLIT_Q == 1:
         tlx.buffer_store(dv.to(tl.bfloat16), DV, key_offsets)
     else:
-        tlx.buffer_store(dv, DV, key_offsets)
+        tlx.buffer_store(dv.to(DV.dtype.element_ty), DV, key_offsets)
 
 
 @triton.jit
@@ -9788,6 +9800,33 @@ def _attn_bwd_split_q_reduce_kernel(
     tl.store(DV + offsets, dv, offsets < ELEMENTS)
 
 
+@triton.jit
+def _attn_bwd_split_q_bf16_reduce_kernel(
+    DK_PARTIAL,
+    DV_PARTIAL,
+    DK,
+    DV,
+    ELEMENTS: tl.constexpr,
+    SPLIT_Q: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Add BF16 partition gradients in FP32 before the final BF16 conversion."""
+
+    tl.static_assert(BLOCK == 2048 and ELEMENTS % BLOCK == 0 and SPLIT_Q == 4)
+    # Each CTA reduces 2,048 elements with eight elements per lane across four waves.
+    layout: tl.constexpr = tlx.layout(shape=((64, 4), (8, BLOCK // 2048)), stride=((8, 512), (1, 2048)))
+    offsets = tlx.require_layout(tl.arange(0, BLOCK).to(tl.int32), layout, pin=False)
+    base = tl.program_id(0).to(tl.int64) * BLOCK
+    dk = tlx.zeros((BLOCK, ), tl.float32, layout=layout)
+    dv = tlx.zeros((BLOCK, ), tl.float32, layout=layout)
+    for split in tl.static_range(SPLIT_Q):
+        part = base + split * ELEMENTS
+        dk = dk + tlx.buffer_load(DK_PARTIAL + part, offsets).to(tl.float32)
+        dv = dv + tlx.buffer_load(DV_PARTIAL + part, offsets).to(tl.float32)
+    tlx.buffer_store(dk.to(DK.dtype.element_ty), DK + base, offsets)
+    tlx.buffer_store(dv.to(DV.dtype.element_ty), DV + base, offsets)
+
+
 def _validate_split_q(split_q, total_outer_steps=None):
     if isinstance(split_q, bool) or not isinstance(split_q, int) or split_q < 1:
         raise ValueError("split_q must be a positive integer")
@@ -9806,7 +9845,8 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
     total_outer_steps = None if shape is None else (shape[1] // shape[2]) * (shape[3] // 64)
     if split_q is None:
         # These causal shapes assign two complete query heads to each KV-tile owner.
-        split_q = 4 if causal and shape in ((16, 64, 8, 2048, 128), (16, 64, 8, 4096, 128)) else 1
+        split_q = 4 if causal and shape in ((16, 64, 8, 2048, 128), (16, 64, 8, 4096, 128), (16, 64, 8, 8192, 128),
+                                            (15, 64, 8, 16384, 128)) else 1
         if shape is not None and not causal:
             batch, hq, hk, n_ctx, head_dim = shape
             base_workgroups = batch * hk * triton.cdiv(n_ctx, 256)
@@ -9864,6 +9904,8 @@ def _select_optimized_d128_interleaved_dispatch(shape=None, causal=False, split_
         convert_block_m=128,
         convert_num_warps=4,
         split_q=split_q,
+        bf16_kv_partials=(causal and split_q == 4
+                          and shape in ((16, 64, 8, 4096, 128), (16, 64, 8, 8192, 128), (15, 64, 8, 16384, 128))),
         **regalloc,
     )
 
@@ -9898,7 +9940,10 @@ def _run_bwd_d128_gqa_optimized(
         dk_partial, dv_partial = dk, dv
     else:
         partial_shape = (split_q, batch, hk, n_ctx, head_dim)
-        dk_partial = torch.empty(partial_shape, device=q.device, dtype=torch.float32)
+        # Selected causal partitions round each complete two-head gradient to BF16.
+        # The reducer adds these partition gradients in FP32.
+        partial_dtype = torch.bfloat16 if dispatch.bf16_kv_partials else torch.float32
+        dk_partial = torch.empty(partial_shape, device=q.device, dtype=partial_dtype)
         dv_partial = torch.empty_like(dk_partial)
     if dispatch.main_entry is _attn_bwd_dkdv_dq_d128_gqa_folded_kernel:
         grid = (int(_D128_CAUSAL_FOLD_PROGRAMS), )
@@ -9942,17 +9987,29 @@ def _run_bwd_d128_gqa_optimized(
     )
     if split_q > 1:
         elements = batch * hk * n_ctx * head_dim
-        _attn_bwd_split_q_reduce_kernel[(triton.cdiv(elements, 1024), )](
-            dk_partial,
-            dv_partial,
-            dk,
-            dv,
-            ELEMENTS=elements,
-            SPLIT_Q=split_q,
-            BLOCK=1024,
-            SPLIT_BLOCK=min(16, triton.next_power_of_2(split_q)),
-            num_warps=4,
-        )
+        if dispatch.bf16_kv_partials:
+            _attn_bwd_split_q_bf16_reduce_kernel[(triton.cdiv(elements, 2048), )](
+                dk_partial,
+                dv_partial,
+                dk,
+                dv,
+                ELEMENTS=elements,
+                SPLIT_Q=split_q,
+                BLOCK=2048,
+                num_warps=4,
+            )
+        else:
+            _attn_bwd_split_q_reduce_kernel[(triton.cdiv(elements, 1024), )](
+                dk_partial,
+                dv_partial,
+                dk,
+                dv,
+                ELEMENTS=elements,
+                SPLIT_Q=split_q,
+                BLOCK=1024,
+                SPLIT_BLOCK=min(16, triton.next_power_of_2(split_q)),
+                num_warps=4,
+            )
     convert_kwargs = ({"PLANE_ELEMENTS": batch * hq * n_ctx * head_dim} if precise_mha16k else {})
     dispatch.convert_entry[(triton.cdiv(n_ctx, dispatch.convert_block_m), batch * hq)](
         dq_acc,

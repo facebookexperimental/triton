@@ -972,6 +972,7 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
                 {"kv_splits": 4},
                 {"phase_iglp": 3},
                 {"peel_causal": True},
+                {"bf16_kv_partials": not dispatch.bf16_kv_partials},
                 {"sink_insts_to_avoid_spills": not dispatch.sink_insts_to_avoid_spills},
                 {"reverse_local_assignment": not dispatch.reverse_local_assignment},
             ):
@@ -991,7 +992,7 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
             k_shape = (batch, hk, n_ctx, head_dim)
             tensors = self._performance_tensors(q_shape, k_shape)
             dispatch = amd_fa_bwd._select_d128_interleaved_dispatch(q_shape, k_shape, True)
-            folded = n_ctx == 1024 or (hq, hk, n_ctx) == (64, 8, 8192)
+            folded = n_ctx == 1024
             expected_entry = (amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_folded_kernel
                               if folded else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_optimized_kernel)
             self.assertIs(dispatch.main_entry, expected_entry)
@@ -1010,6 +1011,7 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
                 {"kv_splits": 4},
                 {"phase_iglp": 3},
                 {"peel_causal": True},
+                {"bf16_kv_partials": not dispatch.bf16_kv_partials},
                 {"sink_insts_to_avoid_spills": not dispatch.sink_insts_to_avoid_spills},
                 {"reverse_local_assignment": not dispatch.reverse_local_assignment},
             ):
@@ -4012,8 +4014,8 @@ def test_dense_bwd_optimized_dispatch(hq, hk, n, causal, bm, splits, iglp, peel,
         monkeypatch.delenv(name, raising=False)
     config = amd_fa_bwd._select_d128_interleaved_dispatch((16, hq, n, 128), (16, hk, n, 128), causal)
     assert (config.block_m, config.kv_splits, config.phase_iglp, config.peel_causal) == (bm, splits, iglp, peel)
-    assert config.split_q == (4 if causal and hq == 64 and hk == 8 and n in (2048, 4096) else 1)
-    folded = causal and (n == 1024 or (hq, hk, n) == (64, 8, 8192))
+    assert config.split_q == (4 if causal and hq == 64 and hk == 8 and n in (2048, 4096, 8192) else 1)
+    folded = causal and n == 1024
     expected_entry = (amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_bm32_kernel
                       if bm == 32 else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_folded_kernel
                       if folded else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_optimized_kernel)
@@ -4042,7 +4044,7 @@ def test_dense_bwd_unmeasured_dispatch_is_unchanged(hq, hk, n, causal):
         pytest.param((16, 64, 8, 7936, 128), False, None, "original", 1, True, id="original-gqa-fallback"),
         pytest.param((16, 64, 8, 1024, 128), True, None, "folded", 1, True, id="folded-causal-gqa"),
         pytest.param((16, 16, 16, 1024, 128), True, None, "folded", 1, True, id="folded-causal-mha"),
-        pytest.param((16, 64, 8, 8192, 128), True, None, "folded", 1, True, id="folded-causal-gqa-long-score-cache"),
+        pytest.param((16, 64, 8, 8192, 128), True, None, "optimized", 4, True, id="causal-gqa-long-partitions"),
         pytest.param((16, 64, 8, 2048, 128), True, None, "optimized", 4, True, id="causal-head-partitions"),
         pytest.param((16, 64, 8, 4096, 128), True, 1, "optimized", 1, True, id="causal-forced-unsplit"),
         pytest.param((16, 16, 16, 1024, 128), False, None, "optimized", 1, True, id="optimized-mha-score-cache"),
@@ -4168,6 +4170,7 @@ def test_dense_bwd_forced_dispatch_reaches_main_launch_host(route, monkeypatch):
     launches = _force_d128_dispatch(monkeypatch, measured, kernel_override=host_kernel)
     monkeypatch.setattr(amd_fa_bwd, "_attn_bwd_gqa_reduce_dkdv", host_kernel)
     monkeypatch.setattr(amd_fa_bwd, "_attn_bwd_split_q_reduce_kernel", host_kernel)
+    monkeypatch.setattr(amd_fa_bwd, "_attn_bwd_split_q_bf16_reduce_kernel", host_kernel)
     q = torch.empty((2, hq, 256, 128), device="meta", dtype=torch.bfloat16)
     k = torch.empty((2, hk, 256, 128), device=q.device, dtype=q.dtype)
     lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
@@ -4352,6 +4355,7 @@ def test_dense_bwd_optimized_causal_head_boundaries_gfx950(shape, partitions, fo
     pytest.param((16, 16, 16, 4096, 128), None, id="mha-4k"),
     pytest.param((16, 16, 16, 8192, 128), None, id="mha-8k"),
     pytest.param((16, 16, 16, 16384, 128), None, id="mha-16k"),
+    pytest.param((16, 64, 8, 8192, 128), None, id="gqa-8k"),
     pytest.param((15, 64, 8, 16384, 128), None, id="gqa-16k"),
     pytest.param((16, 64, 8, 2048, 128), 1, id="gqa-2k-forced-unsplit"),
     pytest.param((16, 64, 8, 4096, 128), 1, id="gqa-4k-forced-unsplit"),
@@ -4361,9 +4365,26 @@ def test_dense_bwd_causal_sampled_owners_gfx950(shape, split_q, monkeypatch):
     owners = {(b, h) for b in (0, batch // 2, batch - 1) for h in (0, hk // 2, hk - 1)}
     case = _make_dense_gqa_reference_case(shape, causal=True, seed=2831, owners=owners)
     dispatch = amd_fa_bwd._select_d128_interleaved_dispatch(case.q.shape, case.k.shape, True, split_q=split_q)
+    partials = []
+    if dispatch.bf16_kv_partials:
+        assert dispatch.split_q == 4
+        original_empty = torch.empty
+        original_empty_like = torch.empty_like
+
+        def poison_partial(tensor):
+            if tensor.ndim == 5:
+                assert tensor.dtype is torch.bfloat16
+                tensor.fill_(float("nan"))
+                partials.append(tensor)
+            return tensor
+
+        monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: poison_partial(original_empty(*args, **kwargs)))
+        monkeypatch.setattr(torch, "empty_like",
+                            lambda *args, **kwargs: poison_partial(original_empty_like(*args, **kwargs)))
     launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_bwd, dispatch.main_entry.__name__)
     actual = fa_backward(*case.kernel_args, split_q=split_q)
     assert len(launches) == 1
+    assert len(partials) == (2 if dispatch.bf16_kv_partials else 0)
     _assert_scratch_free(dispatch.main_entry.__name__, launches[0][1])
     for result in actual:
         assert torch.isfinite(result).all()
@@ -5701,7 +5722,8 @@ def test_dense_bwd_mha16k_sink_default_guard(monkeypatch):
         ((2, 6, 2, 8448, 128), False, None, 16, 1),
         ((16, 64, 8, 8192, 128), False, 2, 16, 2),
         ((1, 4, 2, 8192, 128), False, None, 16, 4),
-        ((16, 64, 8, 8192, 128), True, None, 16, 1),
+        ((16, 64, 8, 8192, 128), True, None, 16, 4),
+        ((15, 64, 8, 16384, 128), True, None, 16, 4),
         ((16, 16, 16, 8192, 128), False, 1, 16, 1),
     ],
 )
@@ -6179,12 +6201,88 @@ def test_dense_bwd_split_query_too_many_chunks():
 def test_dense_bwd_split_query_automatic_selection(shape, expected):
     dispatch = _select_d128_shape_dispatch(shape)
     assert dispatch.split_q == expected
-    expected_causal = 4 if shape in ((16, 64, 8, 2048, 128), (16, 64, 8, 4096, 128)) else 1
+    expected_causal = 4 if shape in ((16, 64, 8, 2048, 128), (16, 64, 8, 4096, 128), (16, 64, 8, 8192, 128),
+                                     (15, 64, 8, 16384, 128)) else 1
     assert _select_d128_shape_dispatch(shape, causal=True).split_q == expected_causal
     assert _select_d128_shape_dispatch(shape, split_q=1).split_q == 1
     if expected > 1:
         batch, _hq, hkv, n_ctx, head_dim = shape
         assert 2 * batch * hkv * n_ctx * head_dim * 4 * dispatch.split_q <= 64 * 1024 * 1024
+
+
+@pytest.mark.parametrize("batch,n_ctx,causal,split_q,expected_dtype", [
+    (16, 2048, True, None, torch.float32),
+    (16, 4096, True, None, torch.bfloat16),
+    (16, 8192, True, None, torch.bfloat16),
+    (15, 16384, True, None, torch.bfloat16),
+    (16, 4096, True, 2, torch.float32),
+    (16, 8192, True, 2, torch.float32),
+    (16, 8192, False, 4, torch.float32),
+    (16, 8192, True, 1, None),
+])
+def test_dense_bwd_causal_partial_storage_host(batch, n_ctx, causal, split_q, expected_dtype, monkeypatch):
+    launches = []
+
+    class HostKernel:
+
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                launches.append((self.name, grid, args, kwargs))
+
+            return launch
+
+    monkeypatch.setattr(amd_fa_bwd, "_matrix_instr_nonkdim", lambda: 16)
+    for name, label in (
+        ("_attn_bwd_dkdv_dq_d128_gqa_optimized_kernel", "main"),
+        ("_attn_bwd_dkdv_dq_d128_gqa_folded_kernel", "main"),
+        ("_attn_bwd_split_q_reduce_kernel", "fp32_reduce"),
+        ("_attn_bwd_split_q_bf16_reduce_kernel", "bf16_reduce"),
+        ("_attn_bwd_dq_native_optimized_convert_kernel", "convert"),
+    ):
+        monkeypatch.setattr(amd_fa_bwd, name, HostKernel(label))
+    q = torch.empty((batch, 64, n_ctx, 128), device="meta", dtype=torch.bfloat16)
+    k = torch.empty((batch, 8, n_ctx, 128), device="meta", dtype=torch.bfloat16)
+    lse = torch.empty(q.shape[:-1], device="meta", dtype=torch.float32)
+    amd_fa_bwd._run_bwd_d128_gqa_optimized(q, k, k, q, lse, lse, q, q, k, k, 128**-0.5, causal, split_q)
+    _, _, args, options = launches[0]
+    if expected_dtype is None:
+        assert args[7] is k and args[8] is k
+        assert [name for name, *_ in launches] == ["main", "convert"]
+    else:
+        assert args[7].dtype is expected_dtype and args[8].dtype is expected_dtype
+        expected_reducer = "bf16_reduce" if expected_dtype is torch.bfloat16 else "fp32_reduce"
+        assert [name for name, *_ in launches] == ["main", expected_reducer, "convert"]
+        assert args[7].shape == (options["SPLIT_Q"], batch, 8, n_ctx, 128)
+        assert launches[1][2][0] is args[7]
+        assert launches[1][2][1] is args[8]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_dense_bwd_bf16_partition_reduce_cancellation_gfx950():
+    elements = 8192
+    dk_partial = torch.tensor([256.0, 1.0, -256.0, 1.0], device="cuda", dtype=torch.bfloat16)
+    dv_partial = torch.tensor([1.0, 2**-8, -1.0, 2**-8], device="cuda", dtype=torch.bfloat16)
+    dk_partial = dk_partial[:, None].expand(4, elements).contiguous()
+    dv_partial = dv_partial[:, None].expand(4, elements).contiguous()
+    dk = torch.full((elements, ), float("nan"), device="cuda", dtype=torch.bfloat16)
+    dv = torch.full_like(dk, float("nan"))
+    amd_fa_bwd._attn_bwd_split_q_bf16_reduce_kernel[(elements // 2048, )](
+        dk_partial,
+        dv_partial,
+        dk,
+        dv,
+        ELEMENTS=elements,
+        SPLIT_Q=4,
+        BLOCK=2048,
+        num_warps=4,
+    )
+    # BF16 intermediate additions would lose the first small contribution in each gradient.
+    assert torch.equal(dk, torch.full_like(dk, 2.0))
+    assert torch.equal(dv, torch.full_like(dv, 2**-7))
 
 
 def test_dense_bwd_split_query_automatic_workspace_cap():
