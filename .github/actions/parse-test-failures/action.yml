@@ -1,7 +1,8 @@
 name: Parse test failures
 description: >-
   Parse a test job's JUnit XML or LIT log into the failure list that
-  report-nightly-failure.yml and reconcile-nightly-issues.yml take.
+  report-nightly-failure.yml and reconcile-nightly-issues.yml take, and
+  show the failures on the run's summary page.
 inputs:
   workflow:
     description: Workflow name; scopes the issue titles
@@ -55,10 +56,13 @@ runs:
         [[ -z "${SETUP_SCRIPT}" ]] || . "${SETUP_SCRIPT}"
         ARGS=(--workflow "${WORKFLOW}" --job "${JOB}" --bucket "${BUCKET}")
         [[ "${FAILED}" != true ]] || ARGS+=(--failed)
+        # The list reaches later jobs through GITHUB_OUTPUT and the run page
+        # through the job summary. Keep it out of the job log, which internal
+        # CI signal cards read for their highlight.
         if [[ -n "${LIT_LOG}" ]]; then
-          python3 .github/scripts/parse_lit_failures.py --log "${LIT_LOG}" "${ARGS[@]}"
+          python3 .github/scripts/parse_lit_failures.py --log "${LIT_LOG}" "${ARGS[@]}" | python3 .github/scripts/failure_summary.py
         else
           for b in ${BUDGET}; do ARGS+=(--budget "${b}"); done
           # shellcheck disable=SC2086  # JUNIT is a space-separated list
-          python3 .github/scripts/parse_junit_failures.py --junit ${JUNIT} "${ARGS[@]}"
+          python3 .github/scripts/parse_junit_failures.py --junit ${JUNIT} "${ARGS[@]}" | python3 .github/scripts/failure_summary.py
         fi
