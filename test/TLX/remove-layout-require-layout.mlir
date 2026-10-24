@@ -374,9 +374,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.thr
     %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #split_reshape> -> tensor<128x64x2xf32, #split_trans>
     // CHECK: %[[SPLIT_BLOCKED:.*]] = ttg.convert_layout %[[TRANSPOSED]] : tensor<128x64x2xf32, #{{.*}}> -> tensor<128x64x2xf32, #[[$SPLIT_BLOCKED3D]]>
     %blocked = ttg.convert_layout %transposed : tensor<128x64x2xf32, #split_trans> -> tensor<128x64x2xf32, #split_blocked3d>
-    // CHECK: %[[LO:.*]], %[[HI:.*]] = tt.split %[[SPLIT_BLOCKED]]
+    // The join(split) round-trip folds away (exact types); the convert chain
+    // and require_layout above must survive.
+    // CHECK: tt.return %[[SPLIT_BLOCKED]] : tensor<128x64x2xf32, #[[$SPLIT_BLOCKED3D]]>
     %lo, %hi = tt.split %blocked : tensor<128x64x2xf32, #split_blocked3d> -> tensor<128x64xf32, #split_piece>
-    // CHECK: %[[JOINED:.*]] = tt.join %[[LO]], %[[HI]]
     %joined = tt.join %lo, %hi : tensor<128x64xf32, #split_piece> -> tensor<128x64x2xf32, #split_blocked3d>
     tt.return %joined : tensor<128x64x2xf32, #split_blocked3d>
   }
