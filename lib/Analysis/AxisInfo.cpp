@@ -750,14 +750,7 @@ private:
     // The minimal contiguity is gcd(d_lhs, d_rhs).
     // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
     // we need to use another gcd to get the actual contiguity.
-    // Partial contiguity is sufficient for unsigned remainder. For example,
-    // if lhs repeats contiguous groups of 64 elements, `lhs % 8` repeats
-    // contiguous groups of 8 elements even when the tensor dimension itself
-    // is larger than 64. Signed remainder cannot use this relaxation without
-    // a non-negativity proof because negative dividends break the run at zero.
-    // Preserve the pre-existing full-dimension inference for signed remainder.
-    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
-    if ((isUnsigned || AxisInfoVisitor::isContiguousDim(lhs, shape, dim)) &&
+    if (AxisInfoVisitor::isContiguousDim(lhs, shape, dim) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       contiguity = gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
                        rhs.getDivisibility(dim));
