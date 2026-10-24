@@ -6623,9 +6623,10 @@ def _attn_bwd_opt_gqa_phase(
         do_tiles,
         phase,
     )
-    # The selected causal MHA8K schedule keeps the entry coordinates.
+    # The selected causal MHA8K/16K schedules keep the entry coordinates.
     # Other schedules share fresh coordinates at the adjacent statistics loads.
-    stats_coordinate_group: tl.constexpr = (None if IS_CAUSAL and CACHE_SCORE_K and HQ == HK and N == 8192 else 20)
+    stats_coordinate_group: tl.constexpr = (None if IS_CAUSAL and CACHE_SCORE_K and HQ == HK and
+                                            (N == 8192 or N == 16384) else 20)
     lse_values = tlx.local_load(
         tlx.local_view(lse_tiles, phase),
         relaxed=True,
