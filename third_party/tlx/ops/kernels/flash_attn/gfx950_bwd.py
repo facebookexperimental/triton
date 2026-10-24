@@ -7909,7 +7909,11 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
             kv_native_layout,
             pin=False,
         )
-        tlx.buffer_store(dk.to(DK.dtype.element_ty), DK, key_offsets)
+        # The measured 4K BF16 partials use wider stores through the unused Q/dO stages.
+        if N == 4096 and DK.dtype.element_ty == tl.bfloat16:
+            _attn_bwd_store_kv_staged(dk.to(tl.bfloat16), DK, 0, q_buffers, do_buffers)
+        else:
+            tlx.buffer_store(dk.to(DK.dtype.element_ty), DK, key_offsets)
 
     # dK is dead before constructing the dV view, so its temporary registers
     # are available to the dV epilogue.
@@ -7922,7 +7926,10 @@ def _attn_bwd_dkdv_dq_d128_gqa_optimized_kernel(
     elif SPLIT_Q == 1:
         tlx.buffer_store(dv.to(tl.bfloat16), DV, key_offsets)
     else:
-        tlx.buffer_store(dv.to(DV.dtype.element_ty), DV, key_offsets)
+        if N == 4096 and DV.dtype.element_ty == tl.bfloat16:
+            _attn_bwd_store_kv_staged(dv.to(tl.bfloat16), DV, 0, q_buffers, do_buffers)
+        else:
+            tlx.buffer_store(dv.to(DV.dtype.element_ty), DV, key_offsets)
 
 
 @triton.jit
