@@ -436,8 +436,8 @@ def test_mm_wave_grid_compiled_cache_rejects_changed_globals(monkeypatch):
 
 @pytest.mark.parametrize("space", ["heuristic", "full"])
 @pytest.mark.parametrize("n", [240, 256])
-def test_mm_narrow_direct_range_is_batch_invariant(n, space):
-    m, k = 25601, 1280
+@pytest.mark.parametrize("m,k", [(25601, 1280), (30721, 1536)])
+def test_mm_narrow_direct_range_is_batch_invariant(m, k, n, space):
     torch.manual_seed(71)
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((k, n), device="cuda", dtype=a.dtype)
@@ -447,7 +447,9 @@ def test_mm_narrow_direct_range_is_batch_invariant(n, space):
     full = torch.full((m, n), float("nan"), device=a.device, dtype=a.dtype)
     assert tlx_ops.mm(a, b, out=full, space=space) is full
     _assert_range_result(full, a @ b)
-    for prefix_m in (1, 159, 160, 161, 20320, 20321, m - 1):
+    for prefix_m in (1, 159, 160, 161, 20320, 20321, 30560, 30561, m - 1):
+        if prefix_m >= m:
+            continue
         prefix = torch.full((prefix_m, n), float("nan"), device=a.device, dtype=a.dtype)
         assert tlx_ops.mm(a[:prefix_m], b, out=prefix, space=space) is prefix
         assert torch.equal(prefix.view(torch.int16), full[:prefix_m].view(torch.int16)), prefix_m
@@ -477,7 +479,7 @@ def test_mm_narrow_direct_range_boundaries():
         assert is_narrow_direct == direct, (m, n, k, a_padding, b_padding, dtype)
 
 
-@pytest.mark.parametrize("warps_n,direct_chunk", [(2, 64), (4, 128)])
+@pytest.mark.parametrize("warps_n,direct_chunk", [(2, 64), (4, 64), (4, 128)])
 def test_mm_direct_a_tail_preserves_four_and_eight_wave_loads(warps_n, direct_chunk):
     m, n, k = 319, 248, 256
     torch.manual_seed(73)
@@ -2074,3 +2076,223 @@ def test_mm_invariance_full_space():
     ref = torch.matmul(a, b)
     torch.testing.assert_close(full, ref, atol=8e-3 * ref.abs().max().item(), rtol=8e-3)
     torch.cuda.empty_cache()
+
+
+def _dyadic_gemm_operands(m, n, k, dtype, transposed_b):
+    torch.manual_seed(97)
+    a = torch.randint(-2, 3, (m, k), device="cuda", dtype=torch.int16).to(dtype) * 0.125
+    shape = (n, k) if transposed_b else (k, n)
+    b = torch.randint(-2, 3, shape, device="cuda", dtype=torch.int16).to(dtype) * 0.125
+    return a, b.T if transposed_b else b
+
+
+@pytest.mark.parametrize("m,n,k", [
+    (511, 2048, 4096),
+    (677, 2048, 4096),
+    (704, 2048, 4096),
+    (896, 1536, 3072),
+    (1023, 2048, 4096),
+    (677, 2048, 4224),
+    (677, 2049, 4352),
+    (2048, 3840, 2048),
+    (2048, 4096, 960),
+    (2048, 4096, 1024),
+    (2048, 4096, 4096),
+    (2048, 4096, 4160),
+    (3072, 5120, 2048),
+    (3073, 5120, 2112),
+    (2032, 2048, 7072),
+])
+def test_mm_tn_boundaries_preserve_values_and_prefix(m, n, k):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, True)
+    actual = tlx_ops.mm(a, b, space="heuristic")
+    torch.testing.assert_close(actual, a @ b, rtol=0, atol=0)
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), actual[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("m,n,k", [(677, 2048, 4096), (3072, 5120, 2048), (2032, 2048, 7072)])
+@pytest.mark.parametrize("step,padding,offset", [(1, 0, 0), (2, 0, 0), (1, 1, 1), (1, 350000, 0)])
+def test_mm_tn_preserves_output_storage_and_rebinding(m, n, k, step, padding, offset):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, True)
+    expected = a @ b
+    row_stride = n * step + padding
+    for space in ("heuristic", "full"):
+        storage = torch.full((offset + m * row_stride + 8, ), float("nan"), device="cuda", dtype=a.dtype)
+        out = torch.as_strided(storage, (m, n), (row_stride, step), storage_offset=offset)
+        assert tlx_ops.mm(a, b, out=out, space=space) is out
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        body = storage[offset:offset + m * row_stride].view(m, row_stride)
+        if step == 2:
+            assert body[:, 1:n * step:2].isnan().all()
+        if padding:
+            assert body[:, n * step:].isnan().all()
+        assert storage[:offset].isnan().all() and storage[-8:].isnan().all()
+        rebound = torch.full((m, n), float("nan"), device="cuda", dtype=a.dtype)
+        assert tlx_ops.mm(a, b, out=rebound, space=space) is rebound
+        torch.testing.assert_close(rebound, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("a_padding,b_padding", [
+    (0, 32),
+    (8, 8),
+    (16, 16),
+    (24, 56),
+    (32, 64),
+    (64, 96),
+    (128, 160),
+])
+def test_mm_tn_long_k_padding_and_prefix(a_padding, b_padding):
+    m, n, k = 2032, 2048, 7072
+    values_a, values_b = _dyadic_gemm_operands(m, n, k, torch.float16, True)
+    a = torch.empty_strided((m, k), (k + a_padding, 1), dtype=values_a.dtype, device="cuda")
+    b = torch.empty_strided((k, n), (1, k + b_padding), dtype=values_b.dtype, device="cuda")
+    a.copy_(values_a)
+    b.copy_(values_b)
+    expected = a @ b
+    row_stride = n + 600000
+    storage = torch.full((m * row_stride + 8, ), float("nan"), device="cuda", dtype=a.dtype)
+    out = torch.as_strided(storage, (m, n), (row_stride, 1))
+    assert tlx_ops.mm(a, b, out=out, space="heuristic") is out
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert storage[:m * row_stride].view(m, row_stride)[:, n:].isnan().all()
+    assert storage[-8:].isnan().all()
+    rebound = torch.full((m, n), float("nan"), device="cuda", dtype=a.dtype)
+    assert tlx_ops.mm(a, b, out=rebound, space="heuristic") is rebound
+    torch.testing.assert_close(rebound, expected, rtol=0, atol=0)
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), out[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("k,a_padding,b_padding", [(196864, 64, 96), (242432, 0, 0), (242944, 32, 64)])
+def test_mm_bf16_long_k_preserves_output_storage_and_prefix(k, a_padding, b_padding):
+    m, n = 4096, 1894
+    values_a, values_b = _dyadic_gemm_operands(m, n, k, torch.bfloat16, True)
+    a = torch.empty_strided((m, k), (k + a_padding, 1), dtype=values_a.dtype, device="cuda")
+    b = torch.empty_strided((k, n), (1, k + b_padding), dtype=values_b.dtype, device="cuda")
+    a.copy_(values_a)
+    b.copy_(values_b)
+    del values_a, values_b
+    expected = a @ b
+    actual = tlx_ops.mm(a, b, space="heuristic")
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for step in (1, 2):
+        storage = torch.full((m, n * step + 16), float("nan"), device="cuda", dtype=a.dtype)
+        out = storage[:, 8:8 + n * step:step]
+        assert tlx_ops.mm(a, b, out=out, space="heuristic") is out
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        assert storage[:, :8].isnan().all()
+        assert storage[:, 8 + n * step:].isnan().all()
+        if step == 2:
+            assert storage[:, 9:8 + n * step:step].isnan().all()
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), actual[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("dtype_name,m,n,k", [
+    ("bf16", 524288, 512, 192),
+    ("fp16", 262144, 256, 256),
+])
+@pytest.mark.parametrize("step,padding,offset", [(1, 0, 0), (2, 0, 0), (1, 1, 1), (1, 4096, 0)])
+def test_mm_cached_b_preserves_output_storage_and_prefix(dtype_name, m, n, k, step, padding, offset):
+    dtype = torch.bfloat16 if dtype_name == "bf16" else torch.float16
+    a, b = _dyadic_gemm_operands(m, n, k, dtype, dtype_name == "bf16")
+    row_stride = n * step + padding
+    storage = torch.full((offset + m * row_stride + 8, ), float("nan"), device="cuda", dtype=dtype)
+    out = torch.as_strided(storage, (m, n), (row_stride, step), storage_offset=offset)
+    assert tlx_ops.mm(a, b, out=out, space="heuristic") is out
+    torch.testing.assert_close(out, a @ b, rtol=0, atol=0)
+    body = storage[offset:offset + m * row_stride].view(m, row_stride)
+    if step == 2:
+        assert body[:, 1:n * step:2].isnan().all()
+    if padding:
+        assert body[:, n * step:].isnan().all()
+    assert storage[:offset].isnan().all() and storage[-8:].isnan().all()
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), out[:16].view(torch.int16))
+
+
+def test_mm_cached_b_rejects_i32_offset_overflow():
+    m, n, k = 524288, 512, 192
+    dense = _gfx950._optimized_geometry_config(m, n, k, torch.bfloat16, 2, (k, 1), (n, 1))
+    assert dense is not None and dense[0] == "cached_b_lds"
+    b_strides = (2**26, 1)
+    assert _gfx950._optimized_geometry_config(m, n, k, torch.bfloat16, 2, (k, 1), b_strides) is None
+    assert _gfx950.heuristic_config(m, n, k, torch.bfloat16, 2, (k, 1), b_strides)[0] == "register"
+
+
+@pytest.mark.parametrize("m,n,k", [
+    (32768, 4096, 1536),
+    (32768, 4352, 1664),
+    (32769, 4352, 1664),
+    (32832, 5120, 1792),
+    (61632, 5120, 2176),
+])
+def test_mm_grouped_xcd_covers_partial_grid(m, n, k):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, False)
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=a.dtype)
+    assert tlx_ops.mm(a, b, out=out, space="heuristic") is out
+    torch.testing.assert_close(out, a @ b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m,n,k", [(33024, 5120, 1792), (819200, 192, 1024)])
+@pytest.mark.parametrize("step,padding,offset", [(1, 0, 0), (2, 0, 0), (1, 1, 1), (1, 35000, 0)])
+def test_mm_row_major_output_storage_and_prefix(m, n, k, step, padding, offset):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, False)
+    expected = a @ b
+    row_stride = n * step + padding
+    for space in ("heuristic", "full"):
+        storage = torch.full((offset + m * row_stride + 8, ), float("nan"), device="cuda", dtype=a.dtype)
+        out = torch.as_strided(storage, (m, n), (row_stride, step), storage_offset=offset)
+        assert tlx_ops.mm(a, b, out=out, space=space) is out
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        body = storage[offset:offset + m * row_stride].view(m, row_stride)
+        if step == 2:
+            assert body[:, 1:n * step:2].isnan().all()
+        if padding:
+            assert body[:, n * step:].isnan().all()
+        assert storage[:offset].isnan().all() and storage[-8:].isnan().all()
+        rebound = torch.full((m, n), float("nan"), device="cuda", dtype=a.dtype)
+        assert tlx_ops.mm(a, b, out=rebound, space=space) is rebound
+        torch.testing.assert_close(rebound, expected, rtol=0, atol=0)
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), out[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("m,n,k", [(33024, 5120, 1792), (819200, 192, 1024)])
+@pytest.mark.parametrize("a_padding,b_padding", [(8, 16), (16, 0), (24, 0), (32, 32), (64, 64), (128, 256)])
+def test_mm_row_major_padded_operands(m, n, k, a_padding, b_padding):
+    values_a, values_b = _dyadic_gemm_operands(m, n, k, torch.float16, False)
+    a = torch.empty_strided((m, k), (k + a_padding, 1), dtype=values_a.dtype, device="cuda")
+    b = torch.empty_strided((k, n), (n + b_padding, 1), dtype=values_b.dtype, device="cuda")
+    a.copy_(values_a)
+    b.copy_(values_b)
+    expected = a @ b
+    for space in ("heuristic", "full"):
+        actual = tlx_ops.mm(a, b, space=space)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), actual[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("m,n,k", [
+    (63, 32768, 192),
+    (64, 32768, 192),
+    (127, 33153, 192),
+    (128, 33153, 256),
+    (129, 32768, 192),
+    (128, 32767, 192),
+    (128, 32768, 128),
+    (128, 32768, 320),
+])
+def test_mm_short_k_transposed_family_boundaries(m, n, k):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, True)
+    actual = tlx_ops.mm(a, b, space="heuristic")
+    torch.testing.assert_close(actual, a @ b, rtol=0, atol=0)
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), actual[:16].view(torch.int16))
