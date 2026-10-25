@@ -4648,5 +4648,278 @@ class TestTargetDetection(TestCase):
             target.current_target.cache_clear()
 
 
+class TestWarppipeInt32Gate(TestCase):
+    """Stride-aware int32 admission for the gfx950 warp-pipe templates (P2561566366).
+
+    CPU-runnable: real Inductor SizeVars + stub input nodes, no device.
+    """
+
+    class _Node:
+        """Minimal IR-node stand-in: the gates only read size/stride/dtype."""
+
+        def __init__(self, size, stride, dtype=torch.float16):
+            self._size = size
+            self._stride = stride
+            self._dtype = dtype
+
+        def get_size(self):
+            return self._size
+
+        def get_stride(self):
+            return self._stride
+
+        def get_dtype(self):
+            return self._dtype
+
+    def _graph(self):
+        graph = mock.Mock(sizevars=SizeVarAllocator())
+        graph.get_current_device_or_throw.return_value = torch.device("cuda")
+        return graph
+
+    def _addmm_inputs(self, m, n, k, a_strides, b_strides):
+        from torch._inductor.kernel_inputs import MMKernelInputs
+
+        bias = self._Node((n,), (1,))
+        a = self._Node((m, k), a_strides)
+        b = self._Node((k, n), b_strides)
+        return MMKernelInputs(
+            [bias, a, b], out_dtype=torch.float16, mat1_idx=1, mat2_idx=2
+        )
+
+    def _bmm_inputs(self, batch, m, n, k, a_strides, b_strides):
+        from torch._inductor.kernel_inputs import MMKernelInputs
+
+        a = self._Node((batch, m, k), a_strides)
+        b = self._Node((batch, k, n), b_strides)
+        return MMKernelInputs(
+            [a, b], out_dtype=torch.float16, mat1_idx=0, mat2_idx=1
+        )
+
+    def _configs(self, heuristic_cls, kernel_inputs, op_name):
+        from triton.language.extra.tlx.inductor import registry
+
+        heuristic = heuristic_cls()
+        with (
+            V.set_graph_handler(self._graph()),
+            mock.patch.object(registry, "_amd_num_xcds", return_value=8),
+            mock.patch.object(registry, "get_num_sms", return_value=256),
+        ):
+            return list(
+                heuristic._get_template_configs_impl(kernel_inputs, op_name)
+            )
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_storage_span_elems(self):
+        from triton.language.extra.tlx.inductor.registry import _storage_span_elems
+
+        self.assertEqual(_storage_span_elems((4, 8), (8, 1)), 32)
+        self.assertEqual(_storage_span_elems((4, 8), (16, 1)), 56)
+        self.assertIsNone(_storage_span_elems((4, 8), (8,)))
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_guard_discipline_is_static_proof_or_guard_else_decline(self):
+        from triton.language.extra.tlx.inductor.registry import _guard_int32_spans
+
+        spans = (sympy.Symbol("span_a"), sympy.Symbol("span_b"))
+        strides = (sympy.Symbol("s0"), sympy.Symbol("s1"))
+
+        sizevars = mock.Mock()
+        sizevars.statically_known_true.return_value = True
+        self.assertTrue(_guard_int32_spans(sizevars, spans, strides))
+        sizevars.guard_or_false.assert_not_called()
+
+        sizevars = mock.Mock()
+        sizevars.statically_known_true.side_effect = [True, False]
+        sizevars.guard_or_false.return_value = True
+        self.assertTrue(_guard_int32_spans(sizevars, spans, strides))
+        sizevars.guard_or_false.assert_called_once()
+
+        sizevars = mock.Mock()
+        sizevars.statically_known_true.side_effect = [True, False]
+        sizevars.guard_or_false.return_value = False
+        self.assertFalse(_guard_int32_spans(sizevars, spans, strides))
+
+        sizevars = mock.Mock()
+        sizevars.statically_known_true.return_value = False
+        self.assertFalse(_guard_int32_spans(sizevars, spans, strides))
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_declines_pitched_a_with_small_mk(self):
+        """The P2561566366 repro at gate level: M*K fits, true span wraps."""
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic,
+        )
+
+        m, k, n = 3072, 401408, 256
+        int32_max = torch.iinfo(torch.int32).max
+        self.assertLess(m * k, int32_max)
+        pitched = (m - 1) * 2 * k + k
+        self.assertGreater(pitched, int32_max)
+
+        kernel_inputs = self._addmm_inputs(
+            m, n, k, a_strides=(2 * k, 1), b_strides=(1, k)
+        )
+        configs = self._configs(
+            Gfx950AddMMWarpPipeConfigHeuristic, kernel_inputs, "addmm"
+        )
+        self.assertEqual(configs, [])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_admits_fitting_static_shapes(self):
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic,
+        )
+
+        kernel_inputs = self._addmm_inputs(
+            4096, 192, 2048, a_strides=(2048, 1), b_strides=(1, 2048)
+        )
+        configs = self._configs(
+            Gfx950AddMMWarpPipeConfigHeuristic, kernel_inputs, "addmm"
+        )
+        self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_declines_row_major_b(self):
+        """S1: copy-needing B is declined, never converted (NameError)."""
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic,
+            Gfx950AddMMPersistentWarpPipeConfigHeuristic,
+        )
+
+        kernel_inputs = self._addmm_inputs(
+            4096, 192, 2048, a_strides=(2048, 1), b_strides=(192, 1)
+        )
+        for heuristic_cls in (
+            Gfx950AddMMWarpPipeConfigHeuristic,
+            Gfx950AddMMPersistentWarpPipeConfigHeuristic,
+        ):
+            with self.subTest(heuristic=heuristic_cls.__name__):
+                configs = self._configs(heuristic_cls, kernel_inputs, "addmm")
+                self.assertEqual(configs, [])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_bmm_declines_strided_within_batch(self):
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950BMMWarpPipeConfigHeuristic,
+        )
+
+        m, k, n = 3072, 401408, 64
+        int32_max = torch.iinfo(torch.int32).max
+        self.assertLess(m * k, int32_max)
+        pitched = (m - 1) * 2 * k + k
+        self.assertGreater(pitched, int32_max)
+
+        kernel_inputs = self._bmm_inputs(
+            2,
+            m,
+            n,
+            k,
+            a_strides=(m * k, 2 * k, 1),
+            b_strides=(k * n, n, 1),
+        )
+        configs = self._configs(
+            Gfx950BMMWarpPipeConfigHeuristic, kernel_inputs, "bmm"
+        )
+        self.assertEqual(configs, [])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_bmm_admits_fitting_static_shapes(self):
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950BMMWarpPipeConfigHeuristic,
+        )
+
+        kernel_inputs = self._bmm_inputs(
+            8,
+            256,
+            256,
+            272,
+            a_strides=(256 * 272, 272, 1),
+            b_strides=(272 * 256, 256, 1),
+        )
+        configs = self._configs(
+            Gfx950BMMWarpPipeConfigHeuristic, kernel_inputs, "bmm"
+        )
+        self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_bmm_ignores_batch_span(self):
+        """The batch advance is int64: only the within-batch span is gated."""
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950BMMWarpPipeConfigHeuristic,
+        )
+
+        batch, m, n, k = 2**20, 128, 128, 128
+        full_span = (batch - 1) * m * k + m * k
+        self.assertGreater(full_span, torch.iinfo(torch.int32).max)
+
+        kernel_inputs = self._bmm_inputs(
+            batch,
+            m,
+            n,
+            k,
+            a_strides=(m * k, k, 1),
+            b_strides=(k * n, n, 1),
+        )
+        configs = self._configs(
+            Gfx950BMMWarpPipeConfigHeuristic, kernel_inputs, "bmm"
+        )
+        self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_persistent_tile_fit_rejects_s2_tile(self):
+        """S2: the persistent (128,256,64,NB3) tile exceeds gfx950 LDS."""
+        from triton.language.extra.tlx.hw.resources import DeviceLimits
+        from triton.language.extra.tlx.inductor import registry
+        from triton.language.extra.tlx.inductor.registry import _warppipe_tile_fits
+
+        gfx950 = DeviceLimits.for_arch("gfx950")
+        with (
+            mock.patch.object(
+                DeviceLimits, "current", return_value=gfx950
+            ),
+            mock.patch.object(
+                registry, "current_target", return_value=mock.Mock(key="gfx950")
+            ),
+        ):
+            self.assertTrue(
+                _warppipe_tile_fits(
+                    128, 256, 64, 3, elem_bytes=2, use_async=True
+                )
+            )
+            self.assertFalse(
+                _warppipe_tile_fits(
+                    128,
+                    256,
+                    64,
+                    3,
+                    elem_bytes=2,
+                    use_async=True,
+                    persistent=True,
+                )
+            )
+            self.assertTrue(
+                _warppipe_tile_fits(
+                    128,
+                    256,
+                    64,
+                    2,
+                    elem_bytes=2,
+                    use_async=True,
+                    persistent=True,
+                )
+            )
+            self.assertTrue(
+                _warppipe_tile_fits(
+                    128,
+                    256,
+                    64,
+                    3,
+                    elem_bytes=2,
+                    use_async=False,
+                    persistent=True,
+                )
+            )
+
+
 if __name__ == "__main__":
     run_tests()

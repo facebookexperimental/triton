@@ -69,6 +69,68 @@ def _sizevar_hint(sizevars, expr, fallback):
     return fn(expr, fallback=fallback)
 
 
+def _storage_span_elems(shape, stride):
+    """Element span of a tensor view: its max flat offset + 1.
+
+    Correct only for nonneg strides; callers prove that separately. Callers
+    needing bytes scale the result by itemsize.
+    """
+    if len(shape) != len(stride):
+        return None
+    return 1 + sum((dim - 1) * step for dim, step in zip(shape, stride))
+
+
+def _guard_int32_spans(sizevars, spans, strides) -> bool:
+    """Admit only when every element span fits int32: static proof or recompile guard.
+
+    The backend performs no verification of the explicit ``.to(tl.int32)``
+    truncations in the templates, so an unguarded hint-sized check admits
+    shapes whose true span wraps at runtime (P2561566366). This helper never
+    consults optimization hints.
+    """
+    int32_max = torch.iinfo(torch.int32).max
+    if not sizevars.statically_known_true(
+        sympy.And(*(sympy.Ge(step, 0) for step in strides))
+    ):
+        return False
+    bound = sympy.And(*(sympy.Le(span, int32_max) for span in spans))
+    if sizevars.statically_known_true(bound):
+        return True
+    return bool(sizevars.guard_or_false(bound))
+
+
+def _warppipe_operands_fit_int32(kernel_inputs, *, per_batch: bool) -> bool:
+    """Stride-aware int32 gate for the warp-pipe templates (P2561566366).
+
+    Every load offset in the warp-pipe bodies is unconditionally narrowed with
+    ``.to(tl.int32)``, so admission requires the true max element offset --
+    ``(M-1)*stride + (K-1)*stride``, not ``M*K`` -- to fit int32. For bmm only
+    the within-batch span is gated; the batch advance stays int64 in the template.
+    """
+    from torch._inductor.virtualized import V
+
+    shapes = kernel_inputs.shapes_symbolic()
+    strides = kernel_inputs.strides_symbolic()
+    a_shape = shapes[kernel_inputs._mat1_idx]
+    a_stride = strides[kernel_inputs._mat1_idx]
+    b_shape = shapes[kernel_inputs._mat2_idx]
+    b_stride = strides[kernel_inputs._mat2_idx]
+    if per_batch:
+        if len(a_shape) != 3 or len(b_shape) != 3:
+            return False
+        a_shape, a_stride = a_shape[1:], a_stride[1:]
+        b_shape, b_stride = b_shape[1:], b_stride[1:]
+    elif len(a_shape) != 2 or len(b_shape) != 2:
+        return False
+    a_span = _storage_span_elems(a_shape, a_stride)
+    b_span = _storage_span_elems(b_shape, b_stride)
+    if a_span is None or b_span is None:
+        return False
+    return _guard_int32_spans(
+        V.graph.sizevars, (a_span, b_span), (*a_stride, *b_stride)
+    )
+
+
 from . import tlx_config
 from .mm_templates import (
     amd_bmm_shared_a_template,
@@ -202,6 +264,12 @@ def _warppipe_configs_for(heuristic) -> list[tuple[int, int, int, int, int, int]
 #: against its raw budget, which is what removes tiles the backend cannot run.
 _AMD_LDS_SAFETY_MARGIN_BY_ARCH: dict[str, int] = {"gfx942": 32768}
 
+#: Extra LDS the *persistent* warp-pipe variant needs beyond the tile estimate,
+#: charged only for async persistent candidates. Measured 37376B gap on the
+#: persistent (128, 256, 64, NB3) fp16 tile (147456B estimate vs 184832B actual,
+#: P2561566366 S2); rounded up for headroom.
+_AMD_LDS_PERSISTENT_OVERHEAD: int = 40960
+
 
 def _warppipe_tile_fits(
     block_m: int,
@@ -211,6 +279,7 @@ def _warppipe_tile_fits(
     *,
     elem_bytes: int,
     use_async: bool,
+    persistent: bool = False,
 ) -> bool:
     """Whether a warp-pipe tile fits the *live* target's LDS budget.
 
@@ -229,6 +298,8 @@ def _warppipe_tile_fits(
         elem_bytes=elem_bytes,
     )
     margin = _AMD_LDS_SAFETY_MARGIN_BY_ARCH.get(current_target().key, 0)
+    if persistent and use_async:
+        margin += _AMD_LDS_PERSISTENT_OVERHEAD
     return resources.AMD_WARP_PIPE.validate(cfg, smem_margin=margin)
 def _select_group_size_m(M: int, N: int, block_m: int) -> int:
     """
@@ -1281,8 +1352,12 @@ def _gfx950_static_tn_problem(kernel_inputs, dtypes):
     int32_max = torch.iinfo(torch.int32).max
     # `tt.pointer_range=32` is a byte-range promise for A, B, and the
     # contiguous output, not merely a bound on their element offsets.
-    a_span_bytes = ((m - 1) * stride_am + k) * dtype.itemsize
-    b_span_bytes = (k + (n - 1) * stride_bn) * dtype.itemsize
+    a_span = _storage_span_elems((m, k), (stride_am, stride_ak))
+    b_span = _storage_span_elems((k, n), (stride_bk, stride_bn))
+    if a_span is None or b_span is None:
+        return None
+    a_span_bytes = a_span * dtype.itemsize
+    b_span_bytes = b_span * dtype.itemsize
     c_span_bytes = m * n * out_dtype.itemsize
     if max(a_span_bytes, b_span_bytes, c_span_bytes) > int32_max:
         return None
@@ -1540,15 +1615,13 @@ class _Gfx950InterWaveTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         if stride_am * itemsize % 16 != 0 or b_row_stride * itemsize % 16 != 0:
             return
 
-        int32_max = 2**31 - 1
-        max_a_offset = (m_int - 1) * stride_am + (k_int - 1) * stride_ak
-        max_b_offset = (k_int - 1) * stride_bk + (n_int - 1) * stride_bn
-        if (
-            max_a_offset >= int32_max
-            or max_b_offset >= int32_max
-            or not sizevars.guard_or_false(
-                sympy.Lt((m - 1) * stride_am + (k_int - 1) * stride_ak, int32_max)
-            )
+        # B's span is static, so only A's dynamic-M span can install a guard.
+        a_span = _storage_span_elems((m, k_int), (stride_am, stride_ak))
+        b_span = _storage_span_elems((k_int, n_int), (stride_bk, stride_bn))
+        if a_span is None or b_span is None or not _guard_int32_spans(
+            sizevars,
+            (a_span, b_span),
+            (stride_am, stride_ak, stride_bk, stride_bn),
         ):
             return
 
@@ -1826,14 +1899,16 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
 
     WARPPIPE_CONFIGS_BY_ARCH = ADDMM_WARPPIPE_CONFIGS_BY_ARCH
     _PREDRAIN_EPILOGUE_PREFETCH = True
+    _WARPPIPE_PERSISTENT = False
 
     def adjust_kernel_inputs(
         self, kernel_inputs: KernelInputs, op_name: str
     ) -> KernelInputs:
-        # The warp-pipe kernel async-loads B as (BLOCK_N, BLOCK_K) with K contiguous, so it
-        # requires col-major B (stride_bk == 1). REQUIRE it here (free for an nn.Linear weight)
-        # rather than gate on the current -- possibly unfrozen -- stride; this replaces the
-        # require_stride_order that used to live in OSS tuned_addmm.
+        # Must never insert a copy: one dropped from the template signature at
+        # final render fails with NameError('B is not defined') (P2561566366 S1).
+        # The config gate requires col-major B statically, so this only freezes
+        # that layout. This replaces the require_stride_order that used to live
+        # in OSS tuned_addmm.
         from torch._inductor.ir import ExternKernel
 
         kernel_inputs = super().adjust_kernel_inputs(kernel_inputs, op_name)
@@ -1867,14 +1942,16 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
         m, n, k = kernel_inputs.mnk_symbolic()
         out_dtype = kernel_inputs.out_dtype()
         sizevars = V.graph.sizevars
-        # async_load lowers to a 32-bit block pointer, so this template is only valid when M*K
-        # and N*K fit int32. Use optimization_hint (not statically_known) so dynamic/symbolic M
-        # is allowed via the example-input hint -- the int32 buffer-index cast keeps it correct
-        # under AOTI dynamic shapes.
-        int32_max = 2**31 - 1
-        if not (
-            _sizevar_hint(sizevars, m * k, int32_max) < int32_max
-            and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
+        if not _warppipe_operands_fit_int32(kernel_inputs, per_batch=False):
+            return
+        # Col-major B only: a require_stride_order copy risks NameError at
+        # final render (P2561566366 S1; see adjust_kernel_inputs).
+        b_strides = kernel_inputs.strides_symbolic()[kernel_inputs._mat2_idx]
+        if not sizevars.statically_known_true(
+            sympy.And(
+                sympy.Eq(b_strides[-2], 1),
+                sympy.Ge(b_strides[-1], 1),
+            )
         ):
             return
         # DUAL PATH by K alignment (the USE_ASYNC constexpr picks the template branch), mirroring
@@ -1932,6 +2009,7 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
                 num_buffers,
                 elem_bytes=itemsize,
                 use_async=use_async,
+                persistent=self._WARPPIPE_PERSISTENT,
             ):
                 continue
             if use_async:
@@ -2003,8 +2081,9 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         K % BLOCK_K remainder is a sync-tail).
       * otherwise (unaligned K -- the direct-to-LDS async_copy cannot legalize on CDNA4 -- or
         dynamic K): USE_ASYNC=0, the register-path fallback (tl.load->tl.dot, auto-pipelined),
-        correct for ANY K (T280910119). Common gate (fp16/bf16 only): per-batch M*K and N*K fit
-        int32 (the within-batch offset is int32 on both paths).
+        correct for ANY K (T280910119). Common gate (fp16/bf16 only): the
+        within-batch A/B element spans fit int32 (the within-batch offset is
+        int32 on both paths; the batch advance is int64).
     """
 
     # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, NUM_BUFFERS)
@@ -2052,12 +2131,7 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         m, n, k = kernel_inputs.mnk_symbolic()
         out_dtype = kernel_inputs.out_dtype()
         sizevars = V.graph.sizevars
-        int32_max = 2**31 - 1
-        # per-batch offsets must fit int32 (the batch offset is applied separately in int64).
-        if not (
-            _sizevar_hint(sizevars, m * k, int32_max) < int32_max
-            and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
-        ):
+        if not _warppipe_operands_fit_int32(kernel_inputs, per_batch=True):
             return
         # DUAL PATH by K alignment (the USE_ASYNC constexpr picks the template branch):
         #  * (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16, 16-byte-aligned rows) -> USE_ASYNC=1, the
@@ -2174,17 +2248,12 @@ class ROCmBMMSharedATemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         # input span and the contiguous output must fit in signed 32-bit bytes.
         # Requiring a static proof also keeps dynamic/very-large batches on the
         # generic BMM path rather than speculating from an example-size hint.
-        def storage_span(shape, stride):
-            if len(shape) != len(stride):
-                return None
-            return 1 + sum((dim - 1) * step for dim, step in zip(shape, stride))
-
         a_shape = symbolic_shapes[kernel_inputs._mat1_idx]
         b_shape = symbolic_shapes[kernel_inputs._mat2_idx]
         a_stride = a_strides
         b_stride = b_strides
-        a_span = storage_span(a_shape, a_stride)
-        b_span = storage_span(b_shape, b_stride)
+        a_span = _storage_span_elems(a_shape, a_stride)
+        b_span = _storage_span_elems(b_shape, b_stride)
         if a_span is None or b_span is None:
             return
         batch = a_shape[0]
@@ -2278,6 +2347,8 @@ class Gfx950AddMMPersistentWarpPipeConfigHeuristic(
     must be threaded into the template kwargs (it becomes a constexpr; the kernel
     strides over output tiles by it).
     """
+
+    _WARPPIPE_PERSISTENT = True
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         num_sms = get_num_sms()
