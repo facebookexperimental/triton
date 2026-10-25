@@ -371,6 +371,54 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         )
 
 
+class partitioned_shared_layout_encoding(shared_layout_encoding):
+    """Split a tensor into pieces placed in distinct physical LDS partitions.
+
+    ``num_partitions`` buffers each contain ``num_groups`` pieces. The
+    inner layout describes one piece, not the full tensor. Partition placement
+    alone does not change which pieces simultaneous waves read; the register
+    layout and traversal must select opposite pieces across SIMD pairs.
+    """
+
+    def __init__(self, num_partitions, num_groups, partition_dim, partition_layout):
+        super().__init__()
+        values = [
+            tl._unwrap_if_constexpr(value) for value in (num_partitions, num_groups, partition_dim, partition_layout)
+        ]
+        self.num_partitions, self.num_groups, self.partition_dim, self.partition_layout = values
+        if not isinstance(self.num_partitions, int) or self.num_partitions < 2 or (self.num_partitions &
+                                                                                   (self.num_partitions - 1)):
+            raise ValueError("num_partitions must be a power of two and at least two")
+        if not isinstance(self.num_groups, int) or self.num_groups < 1 or self.num_groups & (self.num_groups - 1):
+            raise ValueError("num_groups must be a positive power of two")
+        if not isinstance(self.partition_dim, int) or self.partition_dim < 0:
+            raise ValueError("partition_dim must be a non-negative integer")
+        if not isinstance(self.partition_layout, shared_layout_encoding):
+            raise TypeError("partition_layout must be a shared_layout_encoding")
+
+    def make_permute(self, dims):
+        dims = list(dims)
+        if sorted(dims) != list(range(len(dims))) or self.partition_dim >= len(dims):
+            raise ValueError("invalid permutation or partition dimension")
+        inner = self.partition_layout
+        if isinstance(inner, padded_shared_layout_encoding):
+            # Preserve explicit dS offset bases as well as identity layouts.
+            inner = padded_shared_layout_encoding(
+                inner.intervals, inner.paddings, [dims.index(dim) for dim in inner.order],
+                [inner.shape[dim] for dim in dims], [inner.numCTAsPerCGA[dim] for dim in dims],
+                [inner.numCTASplit[dim] for dim in dims], [dims.index(dim) for dim in inner.numCTAOrder],
+                None if inner.offset_bases is None else [[base[dim] for dim in dims] for base in inner.offset_bases],
+                None if inner.block_bases is None else [[base[dim] for dim in dims] for base in inner.block_bases])
+        else:
+            inner = inner.make_permute(dims)
+        return partitioned_shared_layout_encoding(self.num_partitions, self.num_groups, dims.index(self.partition_dim),
+                                                  inner)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_partitioned_shared_encoding_attr(self.num_partitions, self.num_groups, self.partition_dim,
+                                                             self.partition_layout.to_ir(builder))
+
+
 class shared_linear_layout_encoding(shared_layout_encoding):
     """Explicit linear shared-memory mapping used by Gluon K-tile paths.
 
@@ -485,6 +533,27 @@ class amd_mfma_layout(layout_encoding):
         del shape, element_type
         return builder.make_amd_mfma_encoding_attr(self.version, self.warps_per_cta, self.instr_shape, self.transposed,
                                                    self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
+
+
+class amd_wmma_layout(layout_encoding):
+    """AMD WMMA layout for explicit accumulator and LDS operand ownership."""
+
+    def __init__(self, warp_bases, reg_bases=(), instr_shape=(16, 16, 32), version=3, transposed=True):
+        super().__init__()
+        self.version = int(version)
+        self.transposed = bool(transposed)
+        self.warp_bases = [list(map(int, basis)) for basis in warp_bases]
+        self.reg_bases = [list(map(int, basis)) for basis in reg_bases]
+        self.instr_shape = list(map(int, instr_shape))
+        assert self.version in (1, 2, 3), "WMMA version must be in [1, 3]"
+        assert all(len(basis) == 2 for basis in self.warp_bases + self.reg_bases), "WMMA bases must have rank two"
+        assert len(self.instr_shape) == 3 and all(dim > 0 for dim in self.instr_shape)
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None):
+        del element_type
+        rank = len(shape) if shape is not None else 2
+        return builder.make_amd_wmma_encoding_attr(self.version, self.transposed, self.warp_bases, self.reg_bases,
+                                                   self.instr_shape, rank)
 
 
 class slice_layout(layout_encoding):

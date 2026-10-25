@@ -582,3 +582,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 32 : i32, "ttg.th
     tt.return
   }
 }
+
+// -----
+
+// Descriptor assignment can retain the inner row layout. The copy must use
+// the destination's partitioned address mapping and dynamically select a base.
+#inner = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #inner}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_plain_descriptor_partitioned_destination
+  tt.func @tdm_plain_descriptor_partitioned_destination(%desc: !tt.tensordesc<128x16xf16, #inner>) {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<128x16xf16, #partitioned, #smem, mutable>
+    // CHECK: llvm.insertelement {{.*}}vector<2x!llvm.ptr<3>>
+    // CHECK: %[[BASES:.*]] = llvm.insertelement {{.*}}vector<2x!llvm.ptr<3>>
+    // CHECK: %[[BASE:.*]] = llvm.extractelement %[[BASES]]{{.*}}vector<2x!llvm.ptr<3>>
+    // CHECK: llvm.getelementptr %[[BASE]]
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"
+    %token = amdg.async_tdm_copy_global_to_local %desc into %alloc : !tt.tensordesc<128x16xf16, #inner> -> !ttg.memdesc<128x16xf16, #partitioned, #smem, mutable>
+    tt.return
+  }
+}

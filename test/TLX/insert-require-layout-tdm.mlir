@@ -588,6 +588,35 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
   }
 }
 
+// -----
+
+// Preserve physical partitioning while assigning the descriptor's inner row layout.
+// CHECK-DAG: #[[$PART_INNER:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 128]}>
+// CHECK-DAG: #[[$PART:.*]] = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #[[$PART_INNER]]}>
+// PROP-DAG: #[[$PROP_PART:.*]] = #ttg.partitioned_shared<
+#inner = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 128]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #inner}>
+#pinned = #tlx.user_layout<#partitioned>
+#smem = #ttg.shared_memory
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_partitioned_single_and_fused
+  // PROP-LABEL: @tdm_partitioned_single_and_fused
+  tt.func public @tdm_partitioned_single_and_fused(%a: !tt.tensordesc<128x128xf16>, %b: !tt.tensordesc<128x128xf16>) {
+    %c1 = arith.constant 1 : i32
+    // PROP: ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #[[$PROP_PART]], #smem, mutable>
+    %aa = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #pinned, #smem, mutable>
+    %bb = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #pinned, #smem, mutable>
+    %av = ttg.memdesc_index %aa[%c1] : !ttg.memdesc<2x128x128xf16, #pinned, #smem, mutable> -> !ttg.memdesc<128x128xf16, #pinned, #smem, mutable>
+    %bv = ttg.memdesc_index %bb[%c1] : !ttg.memdesc<2x128x128xf16, #pinned, #smem, mutable> -> !ttg.memdesc<128x128xf16, #pinned, #smem, mutable>
+    // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x128xf16, #[[$PART]], #smem, mutable>
+    // CHECK: amdg.async_tdm_copy_global_to_local
+    %single = amdg.async_tdm_copy_global_to_local %a into %av : !tt.tensordesc<128x128xf16> -> !ttg.memdesc<128x128xf16, #pinned, #smem, mutable>
+    // CHECK: amdg.async_tdm_fused_copy_global_to_local {{.*}} -> !ttg.memdesc<128x128xf16, #[[$PART]], #smem, mutable>, !ttg.memdesc<128x128xf16, #[[$PART]], #smem, mutable>
+    %fused = amdg.async_tdm_fused_copy_global_to_local %a, %b into %av, %bv {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<128x128xf16>, !tt.tensordesc<128x128xf16> -> !ttg.memdesc<128x128xf16, #pinned, #smem, mutable>, !ttg.memdesc<128x128xf16, #pinned, #smem, mutable>
+    tt.return
+  }
+}
+
 //--- invalid.mlir
 
 // Genuine swizzling remains unsupported and is rejected by the TDM verifier.

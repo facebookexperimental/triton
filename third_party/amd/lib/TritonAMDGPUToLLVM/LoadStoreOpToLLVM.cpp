@@ -1286,6 +1286,17 @@ getTDMSharedBases(Location loc, ConversionPatternRewriter &rewriter,
   return bases;
 }
 
+// A descriptor may carry only the inner row encoding of a partitioned
+// allocation. Warp distribution and base selection must still use the
+// destination's physical partitions, not a contiguous single-base tile.
+static Attribute getTDMLoadEncoding(triton::TensorDescType descriptor,
+                                    triton::gpu::MemDescType destination) {
+  Attribute encoding = destination.getEncoding();
+  if (isa<PartitionedSharedEncodingAttr>(encoding))
+    return encoding;
+  return descriptor.getSharedLayout();
+}
+
 struct AsyncTDMCopyGlobalToLocalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>,
@@ -1305,7 +1316,7 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
     auto tensorDescTy = op.getDesc().getType();
-    auto encoding = tensorDescTy.getSharedLayout();
+    auto encoding = getTDMLoadEncoding(tensorDescTy, op.getResult().getType());
     Type elementType =
         getTypeConverter()->convertType(tensorDescTy.getElementType());
     // Use descBlockTy to query shared layout because TDM lowering logic expects
@@ -1409,7 +1420,8 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
     SmallVector<uint32_t, 4> memberHints;
     for (size_t i = 0; i < numMembers; ++i) {
       auto descTy = cast<triton::TensorDescType>(op.getDescs()[i].getType());
-      Attribute encoding = descTy.getSharedLayout();
+      Attribute encoding = getTDMLoadEncoding(
+          descTy, cast<triton::gpu::MemDescType>(op.getDests()[i].getType()));
       auto &member = members[i];
 
       member.elementType =

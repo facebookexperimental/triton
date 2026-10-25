@@ -1497,3 +1497,95 @@ def test_grouped_gemm_list_empty_m(block_m, staging, cross, m_tiles):
     for out, a, b in zip(outputs, cpu_a, cpu_b):
         expected = (a.float() @ b.float().T).half()
         torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+@triton.constexpr_function
+def _tdm_partitioned_view_layout(partition_dim):
+    shape = [64, 128] if partition_dim == 0 else [128, 64]
+    inner = tlx.padded_shared_layout_encoding.with_identity_for([(128, 8)], shape)
+    return tlx.partitioned_shared_layout_encoding(2, 1, partition_dim, inner)
+
+
+@triton.jit
+def _tdm_partitioned_views_kernel(input_ptr, output_ptr, PARTITION_DIM: tl.constexpr, VIEW: tl.constexpr,
+                                  FUSED: tl.constexpr):
+    encoding: tl.constexpr = _tdm_partitioned_view_layout(PARTITION_DIM)
+    a_buffers = tlx.local_alloc((128, 128), tl.bfloat16, 2, layout=encoding)
+    b_buffers = tlx.local_alloc((128, 128), tl.bfloat16, 2, layout=encoding)
+    a_desc = tl.make_tensor_descriptor(input_ptr, [256, 128], [128, 1], [128, 128])
+    b_desc = tl.make_tensor_descriptor(input_ptr + 256 * 128, [256, 128], [128, 1], [128, 128])
+    SIZE: tl.constexpr = 64 if VIEW == 'slice' or VIEW == 'dynamic' else 128
+    for stage in tl.static_range(2):
+        a = tlx.local_view(a_buffers, stage)
+        b = tlx.local_view(b_buffers, stage)
+        if FUSED:
+            ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[stage * 128, 0])
+            bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[stage * 128, 0])
+            token = tlx.async_amd_descriptor_load_fused([(ad, a, 3), (bd, b, 12)])
+            tlx.async_amd_descriptor_wait(tokens=[token])
+        else:
+            tlx.async_amd_descriptor_load(a_desc, a, [stage * 128, 0])
+            tlx.async_amd_descriptor_load(b_desc, b, [stage * 128, 0])
+            tlx.async_amd_descriptor_wait(0)
+        if VIEW == 'transpose':
+            a = tlx.local_trans(a)
+            b = tlx.local_trans(b)
+        elif VIEW == 'slice':
+            a = tlx.local_slice(a, [64, 64], [64, 64])
+            b = tlx.local_slice(b, [64, 64], [64, 64])
+        elif VIEW == 'dynamic':
+            # The host initializes this element to 64, but the compiler must
+            # select the physical partition using its runtime value.
+            offset = tl.load(input_ptr).to(tl.int32) & 0x40
+            a = tlx.local_slice(a, [offset, offset], [64, 64])
+            b = tlx.local_slice(b, [offset, offset], [64, 64])
+        offsets = tl.arange(0, SIZE)[:, None] * SIZE + tl.arange(0, SIZE)[None, :]
+        tl.store(output_ptr + (stage * 2) * SIZE * SIZE + offsets, tlx.local_load(a))
+        tl.store(output_ptr + (stage * 2 + 1) * SIZE * SIZE + offsets, tlx.local_load(b))
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason='Requires gfx1250')
+@pytest.mark.parametrize('partition_dim', [0, 1])
+@pytest.mark.parametrize('view', ['full', 'transpose', 'slice', 'dynamic'])
+@pytest.mark.parametrize('fused', [False, True])
+def test_tdm_partitioned_views_correctness(partition_dim, view, fused):
+    torch.manual_seed(1250)
+    source = torch.randn((512, 128), dtype=torch.bfloat16, device='cuda')
+    if view == 'dynamic':
+        source[0, 0] = 64
+    size = 64 if view in ('slice', 'dynamic') else 128
+    output = torch.empty((4, size, size), dtype=source.dtype, device='cuda')
+    kernel = _tdm_partitioned_views_kernel.warmup(source, output, partition_dim, view, fused, grid=(1, ), num_warps=4)
+    assert kernel.metadata.shared <= 327680
+    import re
+    assert int(re.search(r'\.private_segment_fixed_size:\s*(\d+)', kernel.asm['amdgcn'])[1]) == 0
+    _tdm_partitioned_views_kernel[(1, )](source, output, partition_dim, view, fused, num_warps=4)
+    expected = torch.stack((source[:128], source[256:384], source[128:256], source[384:512]))
+    if view == 'transpose':
+        expected = expected.transpose(-1, -2)
+    elif view in ('slice', 'dynamic'):
+        expected = expected[:, 64:, 64:]
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    assert '#ttg.partitioned_shared' in kernel.asm['ttgir']
+
+
+@pytest.mark.parametrize('partitions,groups,dimension,message', [
+    (1, 1, 0, 'num_partitions'),
+    (3, 1, 0, 'num_partitions'),
+    (2, 0, 0, 'num_groups'),
+    (2, 3, 0, 'num_groups'),
+    (2, 1, -1, 'partition_dim'),
+])
+def test_partitioned_shared_invalid_parameters(partitions, groups, dimension, message):
+    inner = tlx.padded_shared_layout_encoding.with_identity_for([(128, 8)], [64, 128])
+    with pytest.raises(ValueError, match=message):
+        tlx.partitioned_shared_layout_encoding(partitions, groups, dimension, inner)
+
+
+def test_partitioned_shared_permute_preserves_bases():
+    inner = tlx.padded_shared_layout_encoding.with_bases([(8, 2)], [[1, 0], [0, 1], [2, 0], [0, 2]], [4, 4])
+    original = tlx.partitioned_shared_layout_encoding(2, 1, 0, inner)
+    transposed = original.make_permute([1, 0])
+    assert transposed.partition_dim == 1
+    assert transposed.partition_layout.offset_bases == [[0, 1], [1, 0], [0, 2], [2, 0]]
+    assert transposed.make_permute([1, 0]).partition_layout.offset_bases == inner.offset_bases

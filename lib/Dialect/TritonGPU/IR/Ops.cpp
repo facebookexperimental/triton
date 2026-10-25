@@ -1511,11 +1511,6 @@ LogicalResult MemDescDynamicSubsliceOp::verify() {
   Attribute srcEnc = srcTy.getEncoding();
   if (!isa<SharedEncodingTrait>(srcEnc))
     return emitError("source and result must use a shared-memory encoding");
-  Attribute concreteSrcEnc = triton::unwrapTlxWrappers(srcEnc);
-  if (isa<PartitionedSharedEncodingAttr>(concreteSrcEnc))
-    return emitError(
-        "dynamic subslices do not support partitioned shared encodings");
-
   bool slicesAnyDimension = false;
   for (int dim = 0; dim < srcTy.getRank(); ++dim) {
     int64_t srcSize = srcTy.getDimSize(dim);
