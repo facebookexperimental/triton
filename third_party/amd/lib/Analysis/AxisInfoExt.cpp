@@ -79,12 +79,28 @@ public:
     return isa<amdgpu::RematerializedRangeOp>(op);
   }
 };
+
+// A buffer descriptor is as aligned as its base pointer, which buffer ops use
+// to vectorize accesses through it.
+class MakeBufferDescOpAxisInfoVisitor : public AxisInfoVisitor {
+public:
+  using AxisInfoVisitor::AxisInfoVisitor;
+
+  AxisInfo
+  getAxisInfo(Operation *op,
+              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) final {
+    return operands[0]->getValue();
+  }
+
+  virtual bool match(Operation *op) final {
+    return isa<amdgpu::MakeBufferDescOp>(op);
+  }
+};
 } // namespace
 
 AxisInfoAnalysisExt::AxisInfoAnalysisExt(DataFlowSolver &solver)
     : triton::AxisInfoAnalysis(solver) {
-  visitors.append<ExtractSliceOpAxisInfoVisitor,
-                  RematerializedRangeOpAxisInfoVisitor>();
+  visitors.append<ExtractSliceOpAxisInfoVisitor, RematerializedRangeOpAxisInfoVisitor, MakeBufferDescOpAxisInfoVisitor>();
 }
 
 triton::AxisInfoAnalysis *
