@@ -837,8 +837,9 @@ bool TargetInfo::supportsBufferAtomicFadd(mlir::Type elementType) const {
   return targetFeatures.supportsBufferAtomicFadd(elementType);
 }
 
-int32_t TargetInfo::getBufferAtomicCachePolicy(bool hasUsers) const {
-  return targetFeatures.getBufferAtomicCachePolicy(hasUsers);
+int32_t TargetInfo::getBufferAtomicCachePolicy(bool hasUsers,
+                                               bool clusterScope) const {
+  return targetFeatures.getBufferAtomicCachePolicy(hasUsers, clusterScope);
 }
 
 bool TargetInfo::supportsWaveId() const {

@@ -1776,14 +1776,15 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_buffer_atomic_rmw",
           [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
              Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
-             std::optional<Value> mask, uint32_t contiguity) -> Value {
+             std::optional<Value> mask, uint32_t contiguity,
+             bool clusterScope) -> Value {
             return self.create<ttag::BufferAtomicRMWOp>(
                 value.getType(), op, ptr, offsets, value, Value() /*stride*/,
-                sem, scope, mask.value_or(Value()), contiguity);
+                sem, scope, mask.value_or(Value()), contiguity, clusterScope);
           },
           py::arg("op"), py::arg("ptr"), py::arg("offsets"), py::arg("value"),
           py::arg("sem"), py::arg("scope"), py::arg("mask").none(),
-          py::arg("contiguity"))
+          py::arg("contiguity"), py::arg("cluster_scope") = false)
       .def(
           "create_buffer_load_to_local",
           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,

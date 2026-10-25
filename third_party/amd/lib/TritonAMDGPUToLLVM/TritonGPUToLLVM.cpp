@@ -385,6 +385,20 @@ struct ConvertTritonAMDGPUToLLVM
       return signalPassFailure();
     }
 
+    // A failed conversion pattern alone does not fail partial conversion for
+    // AMD ops with unknown legality. Reject unsupported cluster scope before
+    // conversion so no buffer atomic can silently remain unlowered.
+    if (targetInfo.getISAFamily() != triton::amdgpu::ISAFamily::GFX1250) {
+      WalkResult result = mod.walk([](triton::amdgpu::BufferAtomicRMWOp op) {
+        if (!op.getClusterScope())
+          return WalkResult::advance();
+        op.emitOpError("cluster_scope requires gfx1250");
+        return WalkResult::interrupt();
+      });
+      if (result.wasInterrupted())
+        return signalPassFailure();
+    }
+
     // Function/CFG conversion can replace block arguments with materialization
     // casts, so classify the original tensor graph before the first conversion.
     AMD::ScheduledMfmaLoweringState scheduledMfmaState;

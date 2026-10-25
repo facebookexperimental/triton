@@ -149,8 +149,8 @@ public:
   bool supportsBufferAtomicFadd(mlir::Type elementType) const;
   // Returns the cache policy (cpol) immediate for buffer atomic instructions.
   // When hasUsers is true, sets SC0/TH_ATOMIC_RETURN to return pre-op value.
-  // On gfx1250, also sets SCOPE_DEV for device-wide visibility.
-  int32_t getBufferAtomicCachePolicy(bool hasUsers) const;
+  // On gfx1250, defaults to SCOPE_DEV; clusterScope opts into SCOPE_SE.
+  int32_t getBufferAtomicCachePolicy(bool hasUsers, bool clusterScope) const;
 
   bool supportsWaveId() const;
   bool supportsPermlaneSwap() const;
