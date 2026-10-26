@@ -46,6 +46,9 @@ details{margin-top:6px}summary{cursor:pointer;color:var(--text-secondary);font-s
 .c-pass{background:rgba(12,163,12,.14);color:var(--good)}.c-known{background:rgba(237,161,0,.20);color:var(--warning)}
 .c-new{background:var(--critical);color:#fff}.c-setup{background:rgba(236,131,90,.22);color:var(--serious)}.c-na{background:var(--wash);color:var(--text-muted)}.c-blocked{background:var(--wash);color:var(--warning)}
 .branchbar{display:flex;gap:10px;align-items:center;margin-top:14px}.branchbar .seg{margin-left:0}
+/* The page's filters (branch; GPU and time range on the Operations tab) stay in reach while scrolling. */
+.filterbar{position:sticky;top:0;z-index:5;margin-top:12px;padding:8px 12px;border-radius:10px;border:1px solid color-mix(in srgb,var(--series-1) 35%,var(--border));background:color-mix(in srgb,var(--series-1) 12%,var(--page));box-shadow:0 2px 6px rgba(0,0,0,.08)}
+.filterbar .muted{color:var(--text-secondary);font-weight:600}#ops-filters{display:inline-flex;gap:10px;align-items:center;margin-left:14px}#ops-filters[hidden]{display:none}
 .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-left:auto}
 .seg button{background:var(--surface-1);border:0;border-right:1px solid var(--border);padding:4px 12px;font:inherit;font-size:12.5px;color:var(--text-secondary);cursor:pointer}
 .seg button:last-child{border-right:0}.seg button[aria-pressed="true"]{background:var(--wash);color:var(--text-primary);font-weight:650}
@@ -70,7 +73,7 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <header><div><h1>CI health: facebookexperimental/triton</h1>
 <p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every 3 h</p></div>
 <button class="theme" id="themeBtn" type="button">Toggle theme</button></header>
-<div class="branchbar"><span class="muted">Branch</span><span class="seg" id="branch-sel"></span></div>
+<div class="branchbar filterbar"><span class="muted">Branch</span><span class="seg" id="branch-sel"></span><span id="ops-filters" hidden><span class="muted">GPU</span><span class="seg" id="o-gpu"></span><span class="muted">Time range</span><span class="seg" id="o-range"></span></span></div>
 <div class="tabrows">
 <span class="muted">Tests</span><nav class="tabs" role="tablist" aria-label="Tests">
 <button role="tab" data-tab="main" aria-selected="true">Push <span class="badge" id="b-main"></span></button>
@@ -121,7 +124,6 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <section id="ops" role="tabpanel" hidden>
 <div class="shead"><h2>Operations</h2><span class="q">Is CI itself healthy, and what does it cost?</span><span class="owner">Owner: CI maintainers</span></div>
 <div class="grid4" style="margin-top:14px" id="o-tiles"></div>
-<div class="branchbar" style="margin-top:20px"><span class="muted">Time range</span><span class="seg" id="o-range"></span></div>
 <div class="card"><h3>Smart trigger: which GPU types each run tested</h3><div id="o-select-a"></div>
 <div class="legend"><span><i class="sw" style="background:var(--ord-3)"></i>all 3</span><span><i class="sw" style="background:var(--ord-2)"></i>2 of 3</span><span><i class="sw" style="background:var(--ord-1)"></i>1 of 3</span><span><i class="sw" style="background:var(--ord-0)"></i>none (build skipped too)</span></div>
 <div id="o-select"></div>
@@ -136,11 +138,17 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <svg class="bars" id="o-per-run" viewBox="0 0 720 190"></svg>
 <p class="note">Push and PR runs that passed or failed tests. Cancelled runs and setup or build failures stopped early and are left out. Hover a day for the 25th and 75th percentiles. A PR run tests only the GPUs its paths touch, so the spread mixes one-GPU and all-GPU runs.</p></div>
 <div class="card"><h3>Queue time: waiting for a GPU runner (minutes)</h3>
-<div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>B200</span><span><i class="sw" style="background:var(--series-2)"></i>H100</span><span><i class="sw" style="background:var(--series-3)"></i>MI350</span><span class="muted">median per day</span></div>
+<div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>B200</span><span><i class="sw" style="background:var(--series-2)"></i>H100</span><span><i class="sw" style="background:var(--series-3)"></i>MI350</span><span class="muted">median per day (per hour, in the 3-day range)</span></div>
 <svg class="bars" id="o-queue" viewBox="0 0 720 190"></svg><div id="o-queue-t" style="margin-top:12px"></div>
-<p class="note">Time from a GPU job being queued to a runner picking it up, all triggers, jobs that ran. Each line is the day's median; hover a day for the 25th and 75th percentiles. "Last to finish" is how often that GPU's job was the last one on a PR run: that job decides when the PR gets its result, so its queue is the wait the queue tile reports.</p></div>
-<div class="card"><h3>Job duration, last 7 days vs the 7 before (minutes)</h3><div id="o-jobs"></div>
+<p class="note">Time from a GPU job being queued to a runner picking it up, all triggers, jobs that ran. Each line is the day's median (the hour's, in the 3-day range); hover for the 25th and 75th percentiles. "Last to finish" is how often that GPU's job was the last one on a PR run: that job decides when the PR gets its result, so its queue is the wait the queue tile reports.</p></div>
+<div class="card"><h3>GPU jobs running at once</h3>
+<div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>B200</span><span><i class="sw" style="background:var(--series-2)"></i>H100</span><span><i class="sw" style="background:var(--series-3)"></i>MI350</span><span class="muted">peak per day (per hour, in the 3-day range)</span></div>
+<svg class="bars" id="o-conc" viewBox="0 0 720 190"></svg>
+<p class="note">The most GPU jobs of each type running at the same moment, from job start and finish times; hover for the time-weighted average and the most jobs waiting for a runner. Every branch and trigger counts, since they share the runners. Only this repository's CI workflows are counted: other repositories share some runner pools, so a flat peak with jobs waiting means the pool is full, not that demand stopped.</p></div>
+<div class="card"><h3 id="o-jobs-h">Job duration (minutes)</h3><div id="o-jobs"></div>
 <p class="note">The slowest 10% shows stalls the median hides, such as a wheel download that stalls.</p></div>
+<div class="card"><h3 id="o-slow-h">Slowest tests, main pushes (seconds)</h3><div id="o-slow"></div>
+<p class="note">From pytest's <code>--durations</code> list in each GPU test job of a push to main: each step prints only its 25 slowest test phases (setup, call or teardown), so "Runs" counts how often a test was among them. A test's time is the sum of its listed phases. Ranked by median time.</p></div>
 <div class="card"><h3>Setup failures, last 7 days, by step</h3><div id="o-setup"></div></div>
 </section>
 
@@ -261,8 +269,19 @@ function renderPR(list,branch="main"){
 }
 
 const GPUS=["H100","B200","MI350"];
-// Day ranges of the Operations tab's daily charts; the data holds the longest.
-const RANGES=[7,14,30];let RANGE=30;
+// The Operations tab's time ranges in days, as in OPS_RANGES of ci_health_rules.py; the 3-day range draws hourly charts.
+const RANGES=[3,7,14,30];let RANGE=30;
+// The Operations tab's GPU filter: "All" or one of GPUS.
+let OGPU="All",BRANCH="main";
+// The view lives in the URL hash, "#<tab>?branch=...&gpu=...&range=...", so a link opens the same view. Defaults
+// are left out of it.
+const VIEW=(()=>{const [tab,q=""]=location.hash.slice(1).split("?");return {tab,p:new URLSearchParams(q)}})();
+let TAB=VIEW.tab;
+if(RANGES.includes(+VIEW.p.get("range")))RANGE=+VIEW.p.get("range");
+if(GPUS.includes(VIEW.p.get("gpu")))OGPU=VIEW.p.get("gpu");
+function saveView(){const p=new URLSearchParams();
+  if(BRANCH!=="main")p.set("branch",BRANCH);if(OGPU!=="All")p.set("gpu",OGPU);if(RANGE!==30)p.set("range",RANGE);
+  history.replaceState(null,"","#"+(TAB||"main")+(p.size?"?"+p:""))}
 const OUT=["passed","test","build","setup","cancelled"],OUT_C=["var(--good)","var(--critical)","var(--warning)","var(--serious)","var(--neutral)"];
 const X0=34,YB=165;
 function axes(D,top,fmt,every=2,XR=720){let s="";const w=(XR-X0)/D.length;
@@ -274,19 +293,19 @@ function stacked(D,unit,every){
   D.forEach((x,i)=>{let y=YB;const tt=esc(`${x.day}\n`+OUT.map(k=>`${k}: ${x[k]}${unit}`).join("\n"));
     OUT.forEach((k,j)=>{const h=sc(x[k]);y-=h;if(h>0)s+=`<rect x="${X0+i*w+4}" y="${y+1}" width="${w-8}" height="${Math.max(h-2,0.5)}" rx="2" fill="${OUT_C[j]}" data-tip="${tt}"/>`})});
   return s}
-function lines(D,S,unit,every,noun="jobs"){
-  const XR=670,w=(XR-X0)/D.length,max=Math.max(1,...D.flatMap(x=>S.map(([k])=>x[k].p50??0))),top=max>10?Math.ceil(max/10)*10:Math.ceil(max),
+function lines(D,S,unit,every,noun="jobs",val=v=>v.p50,tip=null){
+  const XR=670,w=(XR-X0)/D.length,max=Math.max(1,...D.flatMap(x=>S.map(([k])=>val(x[k])??0))),top=max>10?Math.ceil(max/10)*10:Math.ceil(max),
     y=v=>YB-v/top*150,cx=i=>X0+i*w+w/2;
   let s=axes(D,top,v=>String(Math.round(v)),every,XR);
   const ends=[];
   for(const [k,c] of S){let d="",cmd="M",end=null;
-    D.forEach((x,i)=>{const v=x[k].p50;if(v==null){cmd="M";return}d+=`${cmd}${cx(i)},${y(v)}`;cmd="L";end=[cx(i),y(v)]});
+    D.forEach((x,i)=>{const v=val(x[k]);if(v==null){cmd="M";return}d+=`${cmd}${cx(i)},${y(v)}`;cmd="L";end=[cx(i),y(v)]});
     s+=`<path d="${d}" fill="none" stroke="${c}" stroke-width="2" stroke-linejoin="round"/>`;
     if(end){s+=`<circle cx="${end[0]}" cy="${end[1]}" r="3.5" fill="${c}" stroke="var(--surface-1)" stroke-width="2"/>`;ends.push({k,x:end[0],y:end[1]})}}
   // Direct labels at the line ends, pushed apart (bottom up) so close values do not overlap.
   ends.sort((a,b)=>b.y-a.y).forEach((e,i,a)=>{e.ly=i?Math.min(e.y,a[i-1].ly-11):Math.min(e.y,YB);
     s+=`<text x="${e.x+8}" y="${e.ly+3.5}" style="fill:var(--text-secondary)">${e.k}</text>`});
-  D.forEach((x,i)=>{const tt=esc(`${x.day}  median (25th–75th percentile)\n`+S.map(([k])=>`${k}: ${x[k].p50??"–"}${unit} (${x[k].p25??"–"}–${x[k].p75??"–"}), ${x[k].n} ${noun}`).join("\n"));
+  D.forEach((x,i)=>{const tt=esc(tip?tip(x):`${x.day}  median (25th–75th percentile)\n`+S.map(([k])=>`${k}: ${x[k].p50??"–"}${unit} (${x[k].p25??"–"}–${x[k].p75??"–"}), ${x[k].n} ${noun}`).join("\n"));
     s+=`<rect x="${X0+i*w}" y="${YB-150}" width="${w}" height="150" fill="transparent" data-tip="${tt}"/>`});
   return s}
 
@@ -313,25 +332,38 @@ function renderSelect(D,anomalies){
   const A=anomalies.filter(a=>a.t.slice(0,10)>=D[0].day);
   $("o-select-a").innerHTML=A.length?`<h3 class="bad" style="margin-top:8px">Runs where the trigger misbehaved</h3>`+table(["Run","Trigger","What happened"],A.map(a=>[`<a href="${esc(a.url)}">${esc(a.sha.slice(0,9))}</a> ${pr(a.pr)} <span class="muted">${ago(a.t)}</span>`,TR[a.event]||esc(a.event),`${AK[a.kind]} <span class="muted">${esc(a.detail)}</span>`])):`<p class="ok" style="margin:6px 0 0">✓ No failed selections, fallbacks or partial full runs.</p>`}
 
+// A pytest node id as two lines, file then test, so long parametrized ids fit a table cell.
+function testId(id){const i=id.indexOf("::");if(i<0)return `<code>${esc(id)}</code>`;
+  return `<code class="muted">${esc(id.slice(0,i))}</code><br><code style="overflow-wrap:anywhere">${esc(id.slice(i+2))}</code>`}
 function renderOps(o){
   const t=o.tiles,pct=x=>x==null?"–":(100*x).toFixed(0)+"%",d=t.gpu_h_prev_7d?Math.round(100*(t.gpu_h_7d-t.gpu_h_prev_7d)/t.gpu_h_prev_7d):null;
   $("o-tiles").innerHTML=tile("GPU hours, last 7 days",t.gpu_h_7d.toLocaleString(),`prior 7 days: ${t.gpu_h_prev_7d.toLocaleString()}${d==null?"":` · ${d>0?"▲":"▼"} ${Math.abs(d)}%`}`)+
     tile("Setup failures, gpu-tests.yml runs",pct(t.setup_rate),`${t.setup_n} of ${t.runs_n} finished runs · ${t.setup_mi350} on MI350`,t.setup_n?"infra":"")+
     tile("PR wait for a GPU runner, median",t.queue_p50==null?"–":t.queue_p50+" min",`slowest 10%: ${t.queue_p90??"–"} min · the PR's last job to finish`)+
     tile("Cancelled PR runs",t.pr_n?pct(t.cancelled_pr/t.pr_n):"–",`${t.cancelled_pr} of ${t.pr_n} PR runs · ${t.cancelled_gpu_h} GPU h`);
-  const Q=o.queue,drawDaily=()=>{
+  const Q=o.queue,C=o.concurrency,SER={B200:"var(--series-1)",H100:"var(--series-2)",MI350:"var(--series-3)"},draw=()=>{
+    $("o-gpu").innerHTML=["All",...GPUS].map(g=>`<button type="button" data-g="${g}" aria-pressed="${g===OGPU}">${g}</button>`).join("");
+    for(const b of $("o-gpu").querySelectorAll("button"))b.onclick=()=>{OGPU=b.dataset.g;saveView();draw()};
     $("o-range").innerHTML=RANGES.map(n=>`<button type="button" data-n="${n}" aria-pressed="${n===RANGE}">${n} days</button>`).join("");
-    for(const b of $("o-range").querySelectorAll("button"))b.onclick=()=>{RANGE=+b.dataset.n;drawDaily()};
-    const last=D=>D.slice(-RANGE),every=RANGE>14?7:RANGE>7?2:1;
-    $("o-hours").innerHTML=stacked(last(o.gpu_hours)," h",every);
-    $("o-runs").innerHTML=stacked(last(o.runs),"",every);
-    $("o-per-run").innerHTML=lines(last(o.per_run),[["push","var(--series-1)"],["PR","var(--series-2)"]]," min",every,"runs");
-    $("o-queue").innerHTML=lines(last(Q.days),[["B200","var(--series-1)"],["H100","var(--series-2)"],["MI350","var(--series-3)"]]," min",every,"jobs");
-    renderSelect(last(o.select.days),o.select.anomalies)};
-  drawDaily();
-  $("o-queue-t").innerHTML=table(["GPU, last 7 days","Jobs","Median","Slowest 10%","Last to finish on a PR"],Q.gpus.map(g=>[g.gpu,g.n,g.p50??"–",g.p90??"–",g.last_pct==null?"–":`${Math.round(100*g.last_pct)}% <span class="muted">of ${Q.pr_n}</span>`]),[1,2,3,4]);
-  $("o-jobs").innerHTML=table(["Job","Runs","Median","Slowest 10%","Before, slowest 10%","Slowest step (median / slowest 10%)"],o.jobs.map(j=>[`<code>${esc(j.job)}</code>`,j.n,j.p50,`<span class="${j.p90_prev&&j.p90>1.5*j.p90_prev?"bad":""}">${j.p90}</span>`,j.p90_prev??"–",j.slowest_step?`${esc(j.slowest_step)} <span class="muted">(${j.slowest_p50} / ${j.slowest_p90})</span>`:""]),[1,2,3,4]);
-  $("o-setup").innerHTML=table(["Step","GPU","Jobs","Triggers"],o.setup_steps.map(r=>[esc(r.step),r.gpu,r.n,Object.entries(r.triggers).map(([k,v])=>`${v} ${esc(k.replace("pull_request","PR"))}`).join(" · ")]),[2]);
+    for(const b of $("o-range").querySelectorAll("button"))b.onclick=()=>{RANGE=+b.dataset.n;saveView();draw()};
+    // The 3-day range draws queue time and concurrency per hour; a daily chart there has only three points.
+    const last=D=>D.slice(-RANGE),every=RANGE>14?7:RANGE>7?2:1,hourly=RANGE===3,v=OGPU==="All"?o:o.by_gpu[OGPU];
+    const S=(OGPU==="All"?["B200","H100","MI350"]:[OGPU]).map(g=>[g,SER[g]]),mine=x=>OGPU==="All"||x.gpu===OGPU;
+    $("o-hours").innerHTML=stacked(last(v.gpu_hours)," h",every);
+    $("o-runs").innerHTML=stacked(last(v.runs),"",every);
+    $("o-per-run").innerHTML=lines(last(v.per_run),[["push","var(--series-1)"],["PR","var(--series-2)"]]," min",every,"runs");
+    $("o-queue").innerHTML=lines(hourly?Q.hours:last(Q.days),S," min",hourly?12:every,"jobs");
+    $("o-conc").innerHTML=lines(hourly?C.hours:last(C.days),S,"",hourly?12:every,"jobs",x=>x.peak,
+      x=>`${x.day}  peak running (average) · peak waiting\n`+S.map(([k])=>`${k}: ${x[k].peak??"–"} (${x[k].mean??"–"}) · ${x[k].wait_peak??"–"} waiting`).join("\n"));
+    renderSelect(last(o.select.days),o.select.anomalies);
+    $("o-queue-t").innerHTML=table(["GPU, last 7 days","Jobs","Median","Slowest 10%","Last to finish on a PR"],Q.gpus.filter(mine).map(g=>[g.gpu,g.n,g.p50??"–",g.p90??"–",g.last_pct==null?"–":`${Math.round(100*g.last_pct)}% <span class="muted">of ${Q.pr_n}</span>`]),[1,2,3,4]);
+    $("o-jobs-h").textContent=`Job duration, last ${RANGE} days vs the ${RANGE} before (minutes)`;
+    $("o-slow-h").textContent=`Slowest tests, main pushes, last ${RANGE} days (seconds)`;
+    $("o-jobs").innerHTML=table(["GPU","Job","Runs","Median","Slowest 10%","Before, slowest 10%","Slowest step (median / slowest 10%)"],o.jobs[RANGE].filter(mine).map(j=>[j.gpu,`<code>${esc(j.job)}</code>`,j.n,j.p50,`<span class="${j.p90_prev&&j.p90>1.5*j.p90_prev?"bad":""}">${j.p90}</span>`,j.p90_prev??"–",j.slowest_step?`${esc(j.slowest_step)} <span class="muted">(${j.slowest_p50} / ${j.slowest_p90})</span>`:""]),[2,3,4,5]);
+    const ST=o.slow_tests[RANGE],slow=GPUS.filter(g=>OGPU==="All"||g===OGPU).flatMap(g=>(ST[g]?.tests||[]).map(x=>({...x,gpu:g,runs:ST[g].runs}))).sort((a,b)=>b.p50-a.p50).slice(0,10);
+    $("o-slow").innerHTML=slow.length?table(["GPU","Test","Step","Median","Slowest","Runs"],slow.map(x=>[x.gpu,testId(x.id),esc(x.step),x.p50,x.max,`${x.n} <span class="muted">of ${x.runs}</span>`]),[3,4,5]):`<p class="empty">No durations recorded for main pushes in the last ${RANGE} days.</p>`;
+    $("o-setup").innerHTML=table(["Step","GPU","Jobs","Triggers"],o.setup_steps.filter(mine).map(r=>[esc(r.step),r.gpu,r.n,Object.entries(r.triggers).map(([k,v])=>`${v} ${esc(k.replace("pull_request","PR"))}`).join(" · ")]),[2])};
+  draw();
   const week=new Date(ASOF-7*864e5).toISOString(),bad=o.select.anomalies.filter(a=>a.kind!=="fallback"&&a.t>=week).length;
   if(bad)badge("b-ops",`✕ trigger`,"bad");else if(t.setup_n)badge("b-ops",`⚠ ${pct(t.setup_rate)} setup`,"infra");else badge("b-ops","✓","ok");
 }
@@ -365,19 +397,21 @@ function renderLLVM(u,branch){
 
 // The page shows one tracked branch at a time, picked with the chips above the tabs.
 function renderBranches(d){
-  let cur="main";
-  const draw=()=>{
+  if(d.branches[VIEW.p.get("branch")])BRANCH=VIEW.p.get("branch");
+  const draw=()=>{const cur=BRANCH;
     $("branch-sel").innerHTML=Object.keys(d.branches).map(b=>`<button type="button" data-b="${esc(b)}" aria-pressed="${b===cur}">${esc(b)}</button>`).join("");
-    for(const b of $("branch-sel").querySelectorAll("button"))b.onclick=()=>{cur=b.dataset.b;draw()};
+    for(const b of $("branch-sel").querySelectorAll("button"))b.onclick=()=>{BRANCH=b.dataset.b;saveView();draw()};
     $("m-q").textContent=`Did a push to ${cur} break something new?`;
     const v=d.branches[cur];renderMain(v.main,renderLit(v.lit),cur);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderOps(v.ops);renderLLVM(v.bump,cur)};
   draw()}
 
 function show(id){if(!$(id)||!$(id).matches("section"))id="main";
+  TAB=id;
   for(const b of document.querySelectorAll("nav.tabs button"))b.setAttribute("aria-selected",b.dataset.tab===id);
-  for(const s of document.querySelectorAll("section[role=tabpanel]"))s.hidden=s.id!==id}
-for(const b of document.querySelectorAll("nav.tabs button"))b.onclick=()=>{history.replaceState(null,"","#"+b.dataset.tab);show(b.dataset.tab)};
-show(location.hash.slice(1));
+  for(const s of document.querySelectorAll("section[role=tabpanel]"))s.hidden=s.id!==id;
+  $("ops-filters").hidden=id!=="ops"}
+for(const b of document.querySelectorAll("nav.tabs button"))b.onclick=()=>{TAB=b.dataset.tab;saveView();show(TAB)};
+show(TAB);
 const tip=$("tip");
 document.addEventListener("mousemove",e=>{const el=e.target.closest("[data-tip]");if(!el){tip.style.opacity=0;return}tip.textContent=el.dataset.tip;tip.style.opacity=1;
   let x=e.clientX+14,y=e.clientY+14;if(x+tip.offsetWidth>innerWidth-8)x=e.clientX-tip.offsetWidth-14;if(y+tip.offsetHeight>innerHeight-8)y=e.clientY-tip.offsetHeight-14;tip.style.left=x+"px";tip.style.top=y+"px"});
