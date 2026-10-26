@@ -64,7 +64,12 @@ runs:
         fi
         echo "${PLATFORM} collects:" "${FILES[@]}"
         # Log runner size and the pod's memory peak, pass or fail, to size -n.
-        trap 'echo "runner: nproc=$(nproc) memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) memory.peak_mib=$(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 ))"' EXIT
+        # The usage monitor samples GPU, CPU and memory once a second, to tell
+        # whether more workers or more GPUs would shorten this step. It must
+        # never fail the step, hence bash (no exec bit needed) and || true.
+        MONITOR="${GITHUB_WORKSPACE}/.github/scripts/usage_monitor.sh"
+        bash "${MONITOR}" start "/tmp/usage-${PLATFORM}" || true
+        trap 'bash "${MONITOR}" stop "/tmp/usage-${PLATFORM}" || true; echo "runner: nproc=$(nproc) memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) memory.peak_mib=$(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 ))"' EXIT
         # Forkserver children must import the test module by its importlib
         # name (python.test.unit.tlx_ops.*), not just its helpers from tlx_ops.
         # Kernel compilation dominates these tests (a cold Triton cache was
