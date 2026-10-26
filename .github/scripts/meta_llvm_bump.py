@@ -107,17 +107,19 @@ def decide(meta, pins, chain, release, required):
     return "bump", release["tag_name"]
 
 
-def _bump_text(repo, target, fork, fork_branch, meta, new):
+def _bump_text(repo, target, fork, fork_branch, meta, new, release=None):
     """(problem, solution, test plan, log header) prose shared by the commit message and the PR body."""
     old_tag = meta["release_base_url"].rsplit("/", 1)[-1]
     tip, base = new["llvm_hash"], new["based_on_oai_llvm_hash"]
     tag = new["release_base_url"].rsplit("/", 1)[-1]
-    return (f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
-            "fork branch has a newer published release.",
-            f"This points cmake/meta-llvm-info.json at {tag}, built from fork tip {tip[:12]} on the same OAI pin "
-            f"{base[:12]}.", "The pinned digests match the release's .sha256 assets and GitHub's asset digests "
-            f"({', '.join(sorted(new['sha256sum']))}).",
-            f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):")
+    published = f" (published {_date(release)})" if release else ""
+    return (
+        f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
+        "fork branch has a newer published release.",
+        f"This points cmake/meta-llvm-info.json at {tag}{published}, built from fork tip {tip[:12]} on the same OAI "
+        f"pin {base[:12]}.", "The pinned digests match the release's .sha256 assets and GitHub's asset digests "
+        f"({', '.join(sorted(new['sha256sum']))}).",
+        f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):")
 
 
 def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width=72):
@@ -141,14 +143,48 @@ def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width
     return "\n".join(lines)
 
 
-def pr_body(repo, target, fork, fork_branch, meta, new, log):
-    """PR description: markdown headings, unwrapped paragraphs (GitHub turns each newline into a break), and the
-    fork log in a fence with full subjects."""
-    problem, solution, test, log_header = _bump_text(repo, target, fork, fork_branch, meta, new)
-    entries = [f"{sha[:12]} {subject}" for sha, subject in log] or ["(none)"]
+def _fork_change(fork, sha, subject):
+    """Markdown bullet for one fork commit: its commit link, then its fork PR link when the subject ends in a squash
+    "(#N)"."""
+    line = f"- [`{sha[:12]}`](https://github.com/{fork}/commit/{sha})"
+    match = re.search(r"\s*\(#(\d+)\)\s*$", subject)
+    if match:
+        line += f" [#{match.group(1)}](https://github.com/{fork}/pull/{match.group(1)})"
+        subject = subject[:match.start()]
+    return f"{line} {subject}"
+
+
+def compare_url(fork, old, new):
+    return f"https://github.com/{fork}/compare/{old}...{new}"
+
+
+def _adds(log, compare):
+    """Count sentence for the fork changes, linking the fork's compare view."""
+    return f"It adds [{len(log)} fork change{'s' if len(log) != 1 else ''}]({compare}){':' if log else '.'}"
+
+
+def _fork_changes(fork, log, compare):
+    """The count sentence, then one linked bullet per fork commit."""
+    return [_adds(log, compare), *([""] if log else []), *[_fork_change(fork, sha, subject) for sha, subject in log]]
+
+
+def _job_block(jobs):
+    width = max((len(name) for name, _ in jobs), default=0)
+    return ["```", *[f"{name:<{width}}  {conclusion}" for name, conclusion in jobs], "```"]
+
+
+def pr_body(repo, target, fork, fork_branch, meta, new, log, release, sha, latest, jobs):
+    """PR description: markdown headings, unwrapped paragraphs (GitHub turns each newline into a break), the fork
+    changes as linked bullets under Solution, and the bump commit's GPU result in the Test Plan.
+
+    sha: the bump commit; latest: {workflow file: run} that passed on it; jobs: [(name, conclusion)] that ran.
+    """
+    problem, solution, test, _ = _bump_text(repo, target, fork, fork_branch, meta, new, release)
     return "\n".join([
-        "# Summary:", "", "**Problem**", "", problem, "", "**Solution**", "", solution, "", "# Test Plan:", "", test,
-        "", log_header, "", "```", *entries, "```"
+        "# Summary:", "", "**Problem**", "", problem, "", "**Solution**", "",
+        f"{solution} {_adds(log, compare_url(fork, meta['llvm_hash'], new['llvm_hash']))}", *([""] if log else []),
+        *[_fork_change(fork, c, subject) for c, subject in log], "", "# Test Plan:", "",
+        f"GPU tests passed on the bump commit `{sha[:12]}`: {_runs_line(latest)}.", "", *_job_block(jobs), "", test
     ])
 
 
@@ -233,8 +269,8 @@ def issue_title(target, release, kind="ready"):
     return f"[Meta LLVM] {outcome[kind]}: {target} to {release['tag_name']} ({_date(release)})"
 
 
-def issue_body(repo, target, title, body, release, sha, latest):
-    """Ready issue: the GPU result and the command a person runs to open the PR.
+def issue_body(repo, target, title, body, release, sha, latest, fork, log, compare, jobs):
+    """Ready issue: the fork changes, the GPU result and the command a person runs to open the PR.
 
     A person opens the PR because the Meta CLA check and the fbsource importer accept only
     PR authors with a CLA on file; the bot account has none.
@@ -250,7 +286,11 @@ def issue_body(repo, target, title, body, release, sha, latest):
         "",
         _release_line(release),
         "",
+        *_fork_changes(fork, log, compare),
+        "",
         f"GPU runs: {_runs_line(latest)}.",
+        "",
+        *_job_block(jobs),
     ]
     return "\n".join(lines + [
         "",
