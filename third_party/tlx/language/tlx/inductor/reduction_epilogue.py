@@ -242,7 +242,9 @@ def plan_reduction_epilogue(
     """Recognize GEMM -> row reductions -> pointwise output from scheduler Loop IR."""
     if os.environ.get("TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE", "1") == "0":
         return None
-    if config.triton.tlx_mode not in ("allow", "force") or len(gemm.get_size()) != 2:
+    if config.triton.tlx_mode not in ("allow", "force") or not isinstance(gemm, Buffer):
+        return None
+    if len(gemm.get_size()) != 2:
         return None
     rows, columns = gemm.get_size()
     if not isinstance(columns, (int, sympy.Integer)) or not _is_row_major(gemm, int(columns)):
