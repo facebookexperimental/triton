@@ -17,6 +17,15 @@ from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_quant import _decode_scale, 
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="tlx.ops.flash_attn_mxfp8 on gfx950 requires CDNA4")
 
 MULTI_WAVE_SHAPE = (1, 64, 1024, 128)
+GRAD_SUBSETS = [
+    pytest.param((True, False, False), id="q"),
+    pytest.param((False, True, False), id="k"),
+    pytest.param((False, False, True), id="v"),
+    pytest.param((True, True, False), id="qk"),
+    pytest.param((True, False, True), id="qv"),
+    pytest.param((False, True, True), id="kv"),
+    pytest.param((True, True, True), id="qkv"),
+]
 
 
 def _qkv(shape, *, requires_grad=False):
@@ -195,6 +204,149 @@ def test_flash_attn_mxfp8_supports_backward():
     out = flash_attn_mxfp8(q, k, v, space="smoke")
     grads = torch.autograd.grad(out, (q, k, v), torch.randn_like(out))
     assert all(x.dtype == torch.bfloat16 and bool(x.isfinite().all()) for x in grads)
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 256, 128), (4, 32, 1024, 128), (4, 32, 2048, 128), (4, 32, 8192, 128)],
+                         ids=["general", "shared_n1024", "shared_n2048", "shared_n8192"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("needs_input_grad", GRAD_SUBSETS)
+def test_flash_attn_mxfp8_backward_requested_gradients(shape, causal, needs_input_grad):
+    from triton.tlx.ops import flash_attn_mxfp8
+
+    torch.manual_seed(20)
+    full_inputs = _qkv(shape, requires_grad=True)
+    inputs = [tensor.detach().clone().requires_grad_(needed) for tensor, needed in zip(full_inputs, needs_input_grad)]
+    reference_inputs = [tensor.detach().clone().requires_grad_() for tensor in full_inputs]
+    do = torch.randn_like(inputs[0]) * 0.5
+    scale = 0.5
+
+    flash_attn_mxfp8(*full_inputs, causal=causal, sm_scale=scale, space="smoke").backward(do)
+    flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale, space="smoke").backward(do)
+    _sdpa(*reference_inputs, causal, scale).backward(do)
+
+    for tensor, full_tensor, reference, needed in zip(inputs, full_inputs, reference_inputs, needs_input_grad):
+        if not needed:
+            assert tensor.grad is None
+            continue
+        actual = tensor.grad
+        assert actual.dtype == torch.bfloat16 and bool(actual.isfinite().all())
+        torch.testing.assert_close(actual, full_tensor.grad, atol=0, rtol=0)
+        actual, expected = actual.float(), reference.grad.float()
+        cosine = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
+        relative_rms = ((actual - expected).square().mean() / expected.square().mean()).sqrt()
+        assert cosine >= 0.98
+        assert relative_rms < 0.15
+
+
+@pytest.mark.parametrize("transpose_storage", [False, True])
+@pytest.mark.parametrize("needs_input_grad", GRAD_SUBSETS)
+def test_flash_attn_mxfp8_backward_quantizes_requested_operands(needs_input_grad, transpose_storage):
+    from contextlib import nullcontext
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_quant
+
+    inputs = [torch.empty((1, 1, 256, 128), dtype=torch.bfloat16) for _ in range(4)]
+    allocations = []
+    original_empty = torch.empty
+
+    def allocate(shape, *, dtype, device):
+        tensor = original_empty(shape, dtype=dtype, device="meta")
+        allocations.append(tensor)
+        return tensor
+
+    with mock.patch.object(torch.cuda, "device", lambda device: nullcontext()):
+        with mock.patch.object(gfx950_quant.torch, "empty", side_effect=allocate):
+            with mock.patch.object(gfx950_quant, "_quantize_backward") as kernel:
+                pairs = gfx950_quant.quantize_backward_operands(*inputs, transpose_storage=transpose_storage,
+                                                                needs_input_grad=needs_input_grad)
+                quantize = kernel.__getitem__.return_value
+    need_dq, need_dk, need_dv = needs_input_grad
+    required = (need_dk, need_dq, need_dq or need_dk, need_dq or need_dk, need_dv)
+    assert len(allocations) == 2 * sum(required)
+    assert quantize.call_count == 1
+    for pair, needed, sequence in zip(pairs, required, (True, True, False, False, True)):
+        if not needed:
+            assert pair == (None, None)
+            continue
+        payload, scale = pair
+        assert payload.shape == inputs[0].shape and payload.dtype == torch.float8_e4m3fn
+        assert (payload.stride(-2) == 1) == (sequence and transpose_storage)
+        assert scale.shape == ((1, 1, 128, 8) if sequence else (1, 1, 256, 4))
+        assert scale.dtype == torch.uint8
+    assert quantize.call_args.kwargs["NEED_DQ"] is need_dq
+    assert quantize.call_args.kwargs["NEED_DK"] is need_dk
+    assert quantize.call_args.kwargs["NEED_DV"] is need_dv
+
+
+@pytest.mark.parametrize("needs_input_grad", GRAD_SUBSETS)
+def test_flash_attn_mxfp8_backward_launches_requested_gradients(needs_input_grad):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd
+
+    need_dq, need_dk, need_dv = needs_input_grad
+    need_ds = need_dq or need_dk
+    shape = (1, 1, 256, 128)
+    payload = torch.empty(shape, device="meta", dtype=torch.float8_e4m3fn)
+    scale = torch.empty((*shape[:-1], 4), device="meta", dtype=torch.uint8)
+    master = torch.empty(shape, device="meta", dtype=torch.bfloat16)
+    lse = torch.empty(shape[:-1], device="meta", dtype=torch.float32)
+    q_dk, k_dq, do_dv = (payload if needed else None for needed in (need_dk, need_dq, need_dv))
+    dq, dk, dv = (master if needed else None for needed in needs_input_grad)
+    with mock.patch.object(gfx950_bwd, "_bwd_preprocess") as preprocess:
+        with mock.patch.object(gfx950_bwd, "_bwd_kv_owner") as kv:
+            with mock.patch.object(gfx950_bwd, "_bwd_q_owner") as query:
+                gfx950_bwd.launch_backward(payload if need_ds else None, do_dv, payload, q_dk, payload, k_dq,
+                                           payload if need_ds else None, master, lse, scale, scale if need_dk else None,
+                                           scale, scale if need_dq else None, scale if need_ds else None,
+                                           scale if need_ds else None, scale if need_dv else None, 0.5, master, dq, dk,
+                                           dv, lse if need_ds else None, needs_input_grad=needs_input_grad)
+    assert preprocess.__getitem__.return_value.call_count == int(need_ds)
+    assert kv.__getitem__.return_value.call_count == int(need_dk or need_dv)
+    assert query.__getitem__.return_value.call_count == int(need_dq)
+    if need_dk or need_dv:
+        call = kv.__getitem__.return_value.call_args
+        assert call.args[14] is dk and call.args[15] is dv
+        assert call.kwargs["NEED_DK"] is need_dk
+        assert call.kwargs["NEED_DV"] is need_dv
+
+
+@pytest.mark.parametrize("n_ctx", [1024, 4096])
+@pytest.mark.parametrize("needs_input_grad", GRAD_SUBSETS[:-1])
+def test_flash_attn_mxfp8_shared_backward_allocates_requested_work(n_ctx, needs_input_grad):
+    from contextlib import ExitStack
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    shape = (4, 32, n_ctx, 128)
+    allocations = []
+    original_empty = torch.empty
+
+    def allocate(allocation_shape, *, dtype, device):
+        tensor = original_empty(allocation_shape, dtype=dtype, device="meta")
+        allocations.append(tensor)
+        return tensor
+
+    with ExitStack() as stack:
+        stack.enter_context(mock.patch.object(shared.torch, "empty", side_effect=allocate))
+        prepare = stack.enter_context(mock.patch.object(shared, "_prepare_fused")).__getitem__.return_value
+        kv = stack.enter_context(mock.patch.object(shared, "_bwd_kv_owner")).__getitem__.return_value
+        query = stack.enter_context(mock.patch.object(shared, "_bwd_q_consume")).__getitem__.return_value
+        gradients = shared._launch_backward_shared_square_selective(*([object()] * 8), 0.5, False, torch.device("meta"),
+                                                                    shape, True, needs_input_grad)
+
+    need_dq, need_dk, need_dv = needs_input_grad
+    need_ds = need_dq or need_dk
+    assert len(allocations) == 2 + 3 * need_ds + 3 * need_dq + sum(needs_input_grad)
+    assert prepare.call_count == kv.call_count == 1
+    assert query.call_count == int(need_dq)
+    assert [(tensor is not None) for tensor in gradients] == list(needs_input_grad)
+    assert all(tensor.dtype == torch.bfloat16 and tensor.shape == shape for tensor in gradients if tensor is not None)
+    prepare_args, kv_args = prepare.call_args.args, kv.call_args.args
+    assert (prepare_args[3] is not None) is need_ds  # V payload.
+    assert (prepare_args[5] is not None) is need_ds  # V scales.
+    assert (prepare_args[7] is not None) is need_dq  # K scales for dQ.
+    assert (prepare_args[9] is not None) is need_ds  # Delta.
+    assert kv_args[10] is gradients[1] and kv_args[11] is gradients[2]
+    assert (kv_args[14] is not None) is need_dq  # dS payload.
+    assert (kv_args[15] is not None) is need_dq  # dS scales.
+    assert sum(tensor.dtype == torch.float32 for tensor in allocations) == int(need_ds)
 
 
 @pytest.mark.parametrize(
@@ -1019,7 +1171,11 @@ def test_flash_attn_mxfp8_public_qk_arena_admission(n_ctx, offset, lse_split):
             with mock.patch.object(shared, "_launch_backward_shared_square", return_value="launched") as launch:
                 assert shared._try_launch_backward_shared_square(arena, None, None, None, whole, whole, whole,
                                                                  whole_lse, 0.5, lse_split=lse_split) == "launched"
-                assert launch.call_args.kwargs == {"qk_format": True, "lse_split": lse_split}
+                assert launch.call_args.kwargs == {
+                    "qk_format": True,
+                    "lse_split": lse_split,
+                    "needs_input_grad": (True, True, True),
+                }
                 for slots in ((None, whole, None), (whole, None, None), (None, None, whole)):
                     assert shared._try_launch_backward_shared_square(arena, *slots, whole, whole, whole, whole_lse, 0.5,
                                                                      lse_split=lse_split) is None
@@ -1053,7 +1209,7 @@ def test_flash_attn_mxfp8_public_qk_arena_fallback_validation():
                       dtype=torch.float32)[1:1 + 2 * 128 * n_ctx].view(2, *shape[:-1])
     arena = torch.empty(shared._saved_qk_arena_layout(n_ctx)[-1], device="cpu", dtype=torch.uint8)
     ctx = SimpleNamespace(saved_format=shared._SAVED_QK_ARENA_FORMAT, saved_tensors=(q, q, view, arena, view, lse),
-                          sm_scale=0.5, causal=False, lse_split=True)
+                          sm_scale=0.5, causal=False, lse_split=True, needs_input_grad=(True, True, True, False, False))
     original_empty = torch.empty
     with ExitStack() as stack:
         stack.enter_context(mock.patch.object(torch.Tensor, "device", property(lambda tensor: device)))
