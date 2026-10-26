@@ -40,6 +40,10 @@ a { color: var(--series-1); }
 .banner { background: var(--banner); border: 1px solid var(--ring); border-radius: 8px; padding: 8px 12px; margin: 16px 0;
   color: var(--text-secondary); }
 .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+/* Same tinted, sticky filter bar as /ci/, so the filters stay in reach while scrolling. */
+.filterbar { position: sticky; top: 0; z-index: 6; padding: 8px 12px; border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--series-1) 35%, var(--ring));
+  background: color-mix(in srgb, var(--series-1) 12%, var(--page)); box-shadow: 0 2px 6px rgba(0,0,0,.08); }
 label.ctl { color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
 select, button { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--axis);
   border-radius: 6px; padding: 4px 8px; }
@@ -150,7 +154,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     <a href="../">FBTriton site</a></p>
   <div class="banner" id="banner"></div>
 
-  <div class="row" role="group" aria-label="Filters">
+  <div class="row filterbar" role="group" aria-label="Filters">
     <label class="ctl">Nights <select id="range"><option value="7">Last 7</option><option value="14">Last 14</option>
       <option value="30" selected>Last 30</option><option value="60">Last 60</option></select></label>
     <label class="ctl">Platform <select id="platform"></select></label>
@@ -351,18 +355,27 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       ps.append(o);
     }
     ps.value = state.platform;
+    // Filters carry across platform and op switches; drop only the ones the new view cannot apply.
+    if (state.op !== "all" && !plat().latest[state.op]) state.op = "all";
+    const cases = state.op === "all" ? [] : plat().latest[state.op].cases;
+    for (const [k, v] of Object.entries(state.inputs)) {
+      const vals = new Set(cases.map((c) => c.p[k]));
+      if (vals.size < 2 || !vals.has(v)) delete state.inputs[k];
+    }
+    if (state.ev && !(plat().events && evNight(state.ev))) state.ev = null;
     const os = $("op");
     os.textContent = "";
     os.append(el("option", {value: "all"}, "All ops"));
     for (const n of Object.keys(plat().latest)) os.append(el("option", {value: n}, n));
     os.value = state.op;
-    const dts = [...new Set(Object.values(plat().latest).flatMap((o) => o.cases.map((c) => c.dt)))].sort();
+    const dts = [...new Set(scopeOps().flatMap((n) => plat().latest[n].cases.map((c) => c.dt)))].sort();
     if (state.dtype !== "all" && !dts.includes(state.dtype)) state.dtype = "all";
     const ds = $("dtype");
     ds.textContent = "";
     ds.append(el("option", {value: "all"}, "all"));
     for (const d of dts) ds.append(el("option", {value: d}, d));
     ds.value = state.dtype;
+    if (state.dir !== "all" && !scopeOps().some((n) => plat().latest[n].cases.some((c) => c.d === state.dir))) state.dir = "all";
     $("dir").value = state.dir;
     const opts = groupOptions();
     if (!opts.includes(state.group)) state.group = opts[0];
@@ -426,11 +439,24 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       d.append(kk, el("div", {class: "v"}, v));
       t.append(d);
     };
+    // Count changes vs the previous night, over the same slice.
+    const H = plat().history;
+    const before = H.length > 1 ? scopeOps().flatMap((n) => (H[H.length - 2].ops[n] || {cases: []}).cases.filter(matches)) : null;
+    const change = (k, now, prev) => {
+      if (before === null) return;
+      const diff = now - prev;
+      const d = el("div", {class: "k"}, diff ? `${diff > 0 ? "+" : "−"}${Math.abs(diff)} vs previous night` : "no change vs previous night");
+      if (diff && (EV_UP_GOOD[k] || EV_UP_BAD[k])) d.style.color = (diff > 0) === !!EV_UP_GOOD[k] ? "var(--good-text)" : "var(--critical)";
+      t.lastChild.append(d);
+    };
     add("Cases (latest night)", String(cs.length));
-    for (const st of Object.keys(STATUS)) add("", String(count(st)), st);
+    change("cases", cs.length, before && before.length);
+    for (const st of Object.keys(STATUS)) {
+      add("", String(count(st)), st);
+      change(st, count(st), before && before.filter((c) => c.s === st).length);
+    }
     add("Geomean speedup", sp ? sp.toFixed(3) + "×" : "–");
     // Night-over-night change, for a single op (the all-ops figure mixes ops of very different size).
-    const H = plat().history;
     if (state.op !== "all" && sp && H.length > 1) {
       const prev = aggOf(H[H.length - 2].ops[state.op].cases).speedup;
       if (prev) {
@@ -783,7 +809,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   $("range").value = String(state.range);
   const saveHash = () => {
     const p = new URLSearchParams();
-    if (state.platform !== "b200") p.set("platform", state.platform);
+    p.set("platform", state.platform);
     if (state.op !== "all") p.set("op", state.op);
     if (state.range !== 30) p.set("nights", state.range);
     if (state.ev) p.set("ev", state.ev);
@@ -1103,15 +1129,13 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
   }
 
   function render() { banner(); controls(); inputs(); tiles(); trend(); evCard(); dist(); table(); versions(); howto(); saveHash(); }
-  $("platform").onchange = (e) => { state.platform = e.target.value; state.trendScroll = null; state.ev = null; state.op = "all"; state.inputs = {}; state.group = "op"; state.hidden.clear(); render(); };
+  $("platform").onchange = (e) => { state.platform = e.target.value; state.trendScroll = null; state.hidden.clear(); render(); };
   $("range").onchange = (e) => { state.range = Number(e.target.value); state.trendScroll = null; render(); };
   $("dir").onchange = (e) => { state.dir = e.target.value; state.rows = 50; render(); };
   $("dtype").onchange = (e) => { state.dtype = e.target.value; state.rows = 50; render(); };
   $("group").onchange = (e) => { state.group = e.target.value; state.hidden.clear(); state.sortSum = {key: null, dir: 1}; render(); };
   $("op").onchange = (e) => {
     state.op = e.target.value;
-    state.inputs = {};
-    state.group = state.op === "all" ? "op" : "none";
     state.hidden.clear();
     state.rows = 50; state.sort = {key: null, dir: 1}; render(); };
   $("theme").onclick = () => {
