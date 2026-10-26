@@ -514,6 +514,7 @@ def test_arch_matches_the_part():
     from _harness.denoise import AMD, NVIDIA, Device
 
     assert Device(NVIDIA, 0, "NVIDIA B200").arch == "sm100"
+    assert Device(NVIDIA, 0, "NVIDIA H100 80GB HBM3").arch == "sm90"
     assert Device(AMD, 0, "MI300X").arch == "gfx942"
     # "GB200" contains "B200"; both map to sm100, but the longer key must win so
     # the table stays correct if they ever diverge.
@@ -1250,10 +1251,10 @@ def test_arch_follows_the_selected_device_not_physical_gpu_zero(unpinned_driver,
     monkeypatch.setattr(
         unpinned_driver, "list_devices",
         lambda: [Device(NVIDIA, 0, "NVIDIA H100"), Device(NVIDIA, 1, "NVIDIA B200")])
-    # Unpinned falls back to the first device, i.e. what torch calls cuda:0.
-    # H100 is not in ARCH_BY_PART, so that answer is None -- and None is exactly
-    # what the old code would have reported for a run pinned to the B200.
-    assert unpinned_driver.arch() is None
+    # Unpinned falls back to the first device, i.e. what torch calls cuda:0 --
+    # and GPU 0's sm90 is exactly what the old code would have reported for a
+    # run pinned to the B200.
+    assert unpinned_driver.arch() == "sm90"
 
     unpinned_driver.select(Device(NVIDIA, 1, "NVIDIA B200"))
     assert unpinned_driver.arch() == "sm100"
