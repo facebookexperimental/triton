@@ -288,9 +288,9 @@ struct TCGen5MMAScaleSharedToTmemConversion
       // reads stale peer SMEM.
       if (rhsPublicationWait)
         rewriter.setInsertionPointAfter(rhsPublicationWait);
-      FailureOr<bool> changed = lowerScaleToTmem(
-          op.getAScaleMutable(), rewriter, blockM, aScaleBlockRepOrder,
-          op.getPred());
+      FailureOr<bool> changed =
+          lowerScaleToTmem(op.getAScaleMutable(), rewriter, blockM,
+                           aScaleBlockRepOrder, op.getPred());
       rewriter.setInsertionPoint(op);
       if (failed(changed))
         return failure();

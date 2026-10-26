@@ -75,8 +75,7 @@ Value emitRedundantThreadPredicate(
   if (op && op->getParentOfType<ttg::ThreadScopeOp>()) {
     masks[kLane] = 0;
     masks[kWarp] = 0;
-    masks[kBlock] =
-        freeVarMasks.lookup(kBlock) & (ttg::lookupNumCTAs(op) - 1);
+    masks[kBlock] = freeVarMasks.lookup(kBlock) & (ttg::lookupNumCTAs(op) - 1);
     loc = op->getLoc();
   }
 

@@ -68,8 +68,8 @@ getTMAGatherScatterLayouts(RankedTensorType xOffsetsType,
   // shape's messages and issue the first numMessages. PowerOf2Ceil is a no-op
   // for pow2 inputs, so pow2 behavior is unchanged.
   unsigned numMessagesPlanned = llvm::PowerOf2Ceil(numMessages);
-  auto messageToColumn = LinearLayout::strided1D(numMessagesPlanned,
-                                                 messageSize, message, column);
+  auto messageToColumn =
+      LinearLayout::strided1D(numMessagesPlanned, messageSize, message, column);
   auto messageToOffset =
       getMessageToPackedOffsetLayout(type, ttg::TMAMode::Tiled);
   auto messageLayout = xOffsets * messageToColumn;

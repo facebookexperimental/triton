@@ -601,8 +601,8 @@ class language_knobs(base_knobs):
     allow_npot: env_bool = env_bool("TRITON_ALLOW_NPOT")
 
     def fp_fusion_enabled(self, requested: Optional[bool]) -> bool:
-        return self.allow_fp_fusion and not self.force_disable_fp_fusion and (
-            self.default_fp_fusion if requested is None else requested)
+        return self.allow_fp_fusion and not self.force_disable_fp_fusion and (self.default_fp_fusion
+                                                                              if requested is None else requested)
 
 
 class nvidia_knobs(base_knobs):

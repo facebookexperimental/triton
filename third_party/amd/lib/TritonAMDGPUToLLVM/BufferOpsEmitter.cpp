@@ -171,7 +171,8 @@ Value BufferEmitter::emitAtomicCAS(Type type, Value rsrcDesc, Value offset,
   SmallVector<Value, 6> args{casStoreVal, casCmpVal};
   fillCommonArgs(type, rsrcDesc, offset, /*soffsetBytes=*/Value(), pred,
                  /*isAtomicRMW=*/true, args);
-  int32_t aux = targetInfo.getBufferAtomicCachePolicy(hasUsers, /*clusterScope=*/false);
+  int32_t aux =
+      targetInfo.getBufferAtomicCachePolicy(hasUsers, /*clusterScope=*/false);
 
   Value data = ROCDL::RawPtrBufferAtomicCmpSwap::create(
       rewriter, loc, bufferType, args[0], args[1], args[2], args[3], args[4],

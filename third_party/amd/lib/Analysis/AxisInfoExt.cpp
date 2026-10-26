@@ -100,7 +100,9 @@ public:
 
 AxisInfoAnalysisExt::AxisInfoAnalysisExt(DataFlowSolver &solver)
     : triton::AxisInfoAnalysis(solver) {
-  visitors.append<ExtractSliceOpAxisInfoVisitor, RematerializedRangeOpAxisInfoVisitor, MakeBufferDescOpAxisInfoVisitor>();
+  visitors.append<ExtractSliceOpAxisInfoVisitor,
+                  RematerializedRangeOpAxisInfoVisitor,
+                  MakeBufferDescOpAxisInfoVisitor>();
 }
 
 triton::AxisInfoAnalysis *
