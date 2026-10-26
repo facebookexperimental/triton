@@ -67,6 +67,19 @@ Value emitRedundantThreadPredicate(
   auto kWarp = str_attr("warp");
   auto kBlock = str_attr("block");
 
+  // Ops inside a single-thread scope execute on the scope's canonical thread:
+  // drop lane/warp predication and keep only CTA participation (mirrors
+  // ttg::emitMemoryThreadPredicate). Falls through to the cluster-aware body
+  // below so physical clusters still predicate CTA-locally.
+  llvm::MapVector<StringAttr, int32_t> masks = freeVarMasks;
+  if (op && op->getParentOfType<ttg::ThreadScopeOp>()) {
+    masks[kLane] = 0;
+    masks[kWarp] = 0;
+    masks[kBlock] =
+        freeVarMasks.lookup(kBlock) & (ttg::lookupNumCTAs(op) - 1);
+    loc = op->getLoc();
+  }
+
   Value zero = b.i32_val(0);
   auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
 
@@ -75,7 +88,7 @@ Value emitRedundantThreadPredicate(
   // rank.
   bool isClusteredKernel = op && triton::gpu::isPhysicalCluster(op);
 
-  Value blockId = (freeVarMasks.lookup(kBlock) == 0 || isClusteredKernel)
+  Value blockId = (masks.lookup(kBlock) == 0 || isClusteredKernel)
                       ? zero
                       : targetInfo.getClusterCTAId(rewriter, loc);
 
@@ -83,7 +96,7 @@ Value emitRedundantThreadPredicate(
   auto dimNames = {kLane, kWarp, kBlock};
   auto dimIds = {laneId, warpId, blockId};
   for (auto [dimName, dimId] : llvm::zip(dimNames, dimIds)) {
-    int32_t mask = freeVarMasks.lookup(dimName);
+    int32_t mask = masks.lookup(dimName);
     if (mask != 0) {
       auto dimPred = b.icmp_eq(b.and_(dimId, b.i32_val(mask)), zero);
       pred = maybeAnd(rewriter, loc, pred, dimPred);
@@ -706,10 +719,7 @@ struct AtomicCASOpConversion
   matchAndRewrite(triton::AtomicCASOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    insertAtomicOrderingBarriers(op, op.getSem(),
-                                 !atomicResultHasOrderingBarrier(op), rewriter,
-                                 targetInfo);
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    insertAtomicOrderingBarriers(op, op.getSem(), rewriter, targetInfo);
     Value llPtr = adaptor.getPtr();
     Value llCmp = adaptor.getCmp();
     Value llVal = adaptor.getVal();
@@ -718,11 +728,7 @@ struct AtomicCASOpConversion
     auto cmpElements = unpackUniqueTensorElements(loc, llCmp, rewriter);
     auto valElements = unpackUniqueTensorElements(loc, llVal, rewriter);
 
-    auto valueTy = op.getType();
-    auto tensorTy = dyn_cast<RankedTensorType>(valueTy);
-    Type valueElemTy =
-        tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
-                 : valueTy;
+    Type valueElemTy = valElements.front().getType();
     auto elemsPerThread = getUniqueElemsPerThread(op.getVal().getType());
     auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
@@ -741,8 +747,8 @@ struct AtomicCASOpConversion
       resultVals[i] = old;
     }
 
-    finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, threadPred,
-                          targetInfo, getTypeConverter());
+    finalizeAtomicResults(op, rewriter, resultVals, threadPred, targetInfo,
+                          getTypeConverter());
     return success();
   }
 };
@@ -816,9 +822,7 @@ public:
   matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    insertAtomicOrderingBarriers(op, op.getSem(),
-                                 !atomicResultHasOrderingBarrier(op), rewriter,
-                                 targetInfo);
+    insertAtomicOrderingBarriers(op, op.getSem(), rewriter, targetInfo);
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     MLIRContext *ctx = rewriter.getContext();
 
@@ -920,8 +924,8 @@ public:
             ScopeMap[op.getScope()]);
 
         resultVals[i] = loadAcquireOp;
-        finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, pred,
-                              targetInfo, getTypeConverter());
+        finalizeAtomicResults(op, rewriter, resultVals, pred, targetInfo,
+                              getTypeConverter());
         return success();
       }
 
@@ -998,8 +1002,8 @@ public:
       rewriter.eraseOp(op);
       return success();
     }
-    finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, resultPred,
-                          targetInfo, getTypeConverter());
+    finalizeAtomicResults(op, rewriter, resultVals, resultPred, targetInfo,
+                          getTypeConverter());
     return success();
   }
 };
