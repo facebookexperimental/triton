@@ -1334,7 +1334,14 @@ class _attention(torch.autograd.Function):
             "RANK3_DESC": rank3_desc,
         }
         _host_descriptor_pre_hook(nargs)
-        torch._library.capture_triton(_attn_fwd_ws_pipelined_pingpong.fn)[grid](
+        # capture_triton files each call's TMA descriptors in torch's
+        # process-wide kernel side table and never frees them, and desc_o pins
+        # o, so in eager mode every call would leak its output. Only
+        # torch.compile needs the wrapper.
+        kernel = _attn_fwd_ws_pipelined_pingpong.fn
+        if torch.compiler.is_compiling():
+            kernel = torch._library.capture_triton(kernel)
+        kernel[grid](
             sm_scale,
             M,
             q.shape[0],
