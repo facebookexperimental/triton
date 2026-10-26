@@ -3616,6 +3616,38 @@ def _tlx_create_kernel_choices(self, kernel_features, kernel_args, kernel_kwargs
 TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ignore[method-assign]
 
 
+# ---------------------------------------------------------------------------
+# Fusion-aware selection in allow mode without max_autotune.
+#
+# Inductor defers a template choice to the scheduler (MultiTemplateBuffer),
+# which times each template with its epilogue fused against the unfused best,
+# only under max_autotune. Without it a vendor GEMM can win on GEMM-only time
+# and leave the epilogue as a separate pass. TorchTLX does not depend on
+# max_autotune, so take the deferred path whenever a gfx942 TLX template is
+# racing (the only arch measured so far).
+# ---------------------------------------------------------------------------
+from torch._inductor.select_algorithm import AlgorithmSelectorCache
+from .fusion import _is_tlx_choice
+
+_orig_algorithm_selector_call = AlgorithmSelectorCache.__call__
+
+
+def _tlx_algorithm_selector_call(self, name, choices, *args, **kwargs):
+    if (
+        config.triton.tlx_mode == "allow"
+        and kwargs.get("return_multi_template")
+        and not (config.max_autotune or config.max_autotune_gemm)
+        and _is_gfx942()
+        and any(_is_tlx_choice(c) for c in choices)
+    ):
+        with config.patch(max_autotune_gemm=True):
+            return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
+    return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
+
+
+AlgorithmSelectorCache.__call__ = _tlx_algorithm_selector_call  # type: ignore[method-assign]
+
+
 from .reduction_epilogue import install as install_reduction_epilogue
 
 install_reduction_epilogue()
