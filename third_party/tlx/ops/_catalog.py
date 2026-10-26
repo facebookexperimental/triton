@@ -61,6 +61,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws_cooperative",
         impl="triton.tlx.ops.kernels.mm.sm90:mm",
         invariant_vocab=_GEMM_DIMS,
+        enforces_invariance=True,
         dtypes=_FP16,
         accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma"}),
@@ -73,6 +74,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws",
         impl="triton.tlx.ops.kernels.mm.sm100:mm",
         invariant_vocab=_GEMM_DIMS,
+        enforces_invariance=True,
         dtypes=_FP16,
         # TMA needs 16-byte-aligned descriptor row strides. Checked against the
         # real strides, not M/N/K: a column-major operand is fed to its
@@ -90,6 +92,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="direct_load",
         impl="triton.tlx.ops.kernels.mm.gfx942:mm",
         invariant_vocab=_GEMM_DIMS,
+        enforces_invariance=True,
         dtypes=_FP16,
         # No `accepts`: operands are read through explicit strides rather than a
         # descriptor, so there is no alignment rule to fail. This arch therefore
@@ -141,6 +144,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="heuristic",
         impl="triton.tlx.ops.kernels.mm.gfx950:mm",
         invariant_vocab=_GEMM_DIMS,
+        enforces_invariance=True,
         # LocalSplitU and persistent plans remain FP16-only; the register and
         # general LDS paths also support BF16 and validate their own plans.
         dtypes=_FP16,
@@ -333,9 +337,11 @@ CATALOG: tuple[OpSpec, ...] = (
         impl="triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950:flash_attn_mxfp8",
         invariant_vocab=_ATTN_DIMS,
         dtypes=_BF16,
-        accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
+        # Direct-LDS buffer loads use signed i32 offsets within each head.
+        accepts=lambda d:
+        (d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) > 0 and d["N_CTX"] % 256 == 0 and d["N_CTX"] * 128 < 2**31),
         requires=frozenset(),
-        supports_backward=False,
+        supports_backward=True,
     ),
     OpSpec(
         op="flash_attn_varlen",
