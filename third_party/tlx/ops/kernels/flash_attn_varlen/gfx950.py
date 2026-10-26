@@ -12,12 +12,13 @@ CUs), so the tiles stay small and the time is per-tile latency:
 - Workgroups go round-robin to the 8 XCDs; each XCD gets a contiguous run of
   work items, so most tiles of a (sequence, head) share its K/V in that XCD's
   L2 (one can straddle two runs).
-- K and V are copied straight from global memory into LDS, double buffered;
-  one copy group per step (K(b + 2), V(b + 1)) lands during step b.
+- Q, K and V are copied from global memory into LDS. K and V are double
+  buffered; Q is staged once in a reused V-buffer slot. One copy group per
+  step (K(b + 2), V(b + 1)) lands during step b.
 - Each step issues QK(b + 1) and PV(b) MFMA by MFMA, with K and V read from
   LDS in 32-wide pieces, each read issued one MFMA before its use (as in
-  flash_attn_mxfp8/gfx950.py's ``_mfma_stage``); scheduling barriers keep
-  LLVM from sinking the reads to their uses.
+  flash_attn_mxfp8/gfx950.py's interleaved MFMA-stage helpers); scheduling
+  barriers keep LLVM from sinking the reads to their uses.
 - Key blocks that every row of the tile sees in full run unmasked; only the
   sequence's last partial block and the causal diagonal are masked.
 - Causal: tile m sees m + 1 key blocks, so the last tiles of a sequence set
@@ -85,9 +86,8 @@ def _pv(p, v_slot, acc0, acc1, acc2, acc3):
 
 
 @triton.jit
-def _mfma_stage(q0, q1, q2, q3, p, k_slot, v_slot, acc0, acc1, acc2, acc3, kp, blk, last, k_step, k_buf, cur,
-                BLOCK_N: tl.constexpr):
-    # QK(b + 1) from k_slot and PV(b) from v_slot, alternating 32-wide chunks.
+def _mfma_stage_part0(q0, q1, p, k_slot, v_slot, acc0, BLOCK_N: tl.constexpr):
+    # First half of stage compute: q0/q1 and v0/v1.
     mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
     kl: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
     vl: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=4)
@@ -106,8 +106,16 @@ def _mfma_stage(q0, q1, q2, q3, p, k_slot, v_slot, acc0, acc1, acc2, acc3, kp, b
     v1 = tlx.require_layout(tlx.local_load(tlx.local_slice(v_slot, [0, 32], [n, 32]), relaxed=True), vl, pin=False)
     tlx.amd_sched_barrier(0)
     s = tl.dot(q1, k1, s)
-    tok_k = tlx.async_load(kp + tl.minimum(blk + 2, last) * k_step, tlx.local_view(k_buf, cur))
-    tlx.async_load_commit_group([tok_k])
+    return s, p, v1, acc0
+
+
+@triton.jit
+def _mfma_stage_part1(q2, q3, p, s, v1, k_slot, v_slot, acc1, acc2, acc3):
+    # Second half of stage compute: q2/q3 and v2/v3.
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
+    kl: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    vl: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=4)
+    n: tl.constexpr = k_slot.shape[0]
     k2 = tlx.require_layout(tlx.local_load(tlx.local_trans(tlx.local_slice(k_slot, [0, 64], [n, 32])), relaxed=True),
                             kl, pin=False)
     tlx.amd_sched_barrier(0)
@@ -124,7 +132,7 @@ def _mfma_stage(q0, q1, q2, q3, p, k_slot, v_slot, acc0, acc1, acc2, acc3, kp, b
     s = tl.dot(q3, k3, s)
     tlx.amd_sched_barrier(0)
     acc3 = tl.dot(p, v3, acc3)
-    return s, acc0, acc1, acc2, acc3
+    return s, acc1, acc2, acc3
 
 
 @triton.jit
@@ -306,9 +314,12 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
             tl.debug_barrier()
             tok_v = tlx.async_load(vp + (blk + 1) * v_step, tlx.local_view(v_buf, nxt))
             tlx.async_load_commit_group([tok_v])
-            s, acc0, acc1, acc2, acc3 = _mfma_stage(q0, q1, q2, q3, p, tlx.local_view(k_buf, nxt),
-                                                    tlx.local_view(v_buf, cur), acc0, acc1, acc2, acc3, kp, blk,
-                                                    last, k_step, k_buf, cur, BLOCK_N)
+            s, p, v1, acc0 = _mfma_stage_part0(q0, q1, p, tlx.local_view(k_buf, nxt), tlx.local_view(v_buf, cur), acc0,
+                                               BLOCK_N)
+            tok_k = tlx.async_load(kp + tl.minimum(blk + 2, last) * k_step, tlx.local_view(k_buf, cur))
+            tlx.async_load_commit_group([tok_k])
+            s, acc1, acc2, acc3 = _mfma_stage_part1(q2, q3, p, s, v1, tlx.local_view(k_buf, nxt), tlx.local_view(v_buf, cur),
+                                                    acc1, acc2, acc3)
             m_i, l_i, p, acc0, acc1, acc2, acc3 = _softmax(s, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
                                                            Q.dtype.element_ty)
         tlx.async_load_wait_group(0)
