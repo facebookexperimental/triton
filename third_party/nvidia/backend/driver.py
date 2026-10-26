@@ -159,7 +159,7 @@ class CudaUtils(object):
         self.get_default_stream = mod.get_default_stream
         self.is_stream_capturing = mod.is_stream_capturing
         self.get_device_capability = mod.get_device_capability
-        self.get_device_properties = mod.get_device_properties
+        self._get_device_properties = functools.lru_cache(maxsize=None)(mod.get_device_properties)
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
         self.set_printf_fifo_size = mod.set_printf_fifo_size
         self.fill_tma_descriptor_tiled = mod.fill_tma_descriptor_tiled
@@ -178,6 +178,11 @@ class CudaUtils(object):
         self._TritonJITRunner = mod._TritonJITRunner
         self._ProxyRunner = mod._ProxyRunner
         self.create_fast_jit_type = mod.create_fast_jit_type
+
+    def get_device_properties(self, device):
+        # CUDA device attributes are immutable. Keep the cached dictionary private
+        # so callers can continue to mutate their results independently.
+        return self._get_device_properties(device).copy()
 
 
 # ------------------------
