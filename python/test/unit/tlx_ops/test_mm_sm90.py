@@ -417,3 +417,85 @@ def test_full_space_selects_fastest_candidate(monkeypatch, M, N, K, candidates):
     _assert_close(actual, torch.matmul(a, b))
     # A second call reuses the cached choice.
     _assert_close(tlx_mm(a, b, space="full"), torch.matmul(a, b))
+
+
+def test_npot_config_not_reused_across_b_layouts(monkeypatch):
+    """The autotune cache is keyed on the operand layouts: a non-power-of-two
+    tile tuned for a K-major B must not serve a row-major B of the same shape,
+    which that tile cannot run."""
+    from triton.tlx.ops import mm as tlx_mm
+
+    M, N, K = 2136, 1000, 64 * 7
+    npot = next(c for c in sm90._npot_configs() if c.kwargs["BN"] == 192)
+    monkeypatch.setattr(sm90, "CONFIGS", lambda: [npot, sm90._config(128, 128, 4)])
+    real_prune = sm90._prune_full_configs
+
+    def prune(configs, nargs, **kwargs):
+        # Make the K-major call pick the 192 tile deterministically.
+        if not kwargs.get("B_ROW_MAJOR", True):
+            return [c for c in configs if c.kwargs["BN"] == 192]
+        return real_prune(configs, nargs, **kwargs)
+
+    monkeypatch.setattr(sm90, "_prune_full_configs", prune)
+    monkeypatch.setattr(sm90, "_FORCE_PATH", "ws")
+    sm90._tuned.cache_clear()
+    try:
+        torch.manual_seed(0)
+        a = _operand(M, K, True)
+        b_col = _operand(K, N, False)
+        _assert_close(tlx_mm(a, b_col, space="full"), torch.matmul(a, b_col))
+        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == 192
+        b_row = b_col.contiguous()
+        _assert_close(tlx_mm(a, b_row, space="full"), torch.matmul(a, b_row))
+        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == 128
+    finally:
+        sm90._tuned.cache_clear()
+
+
+@pytest.mark.parametrize("block_n", [96, 160, 192, 224])
+@pytest.mark.parametrize("a_row_major", [True, False])
+def test_npot_block_n_config(block_n, a_row_major):
+    from triton.tlx.ops import mm as tlx_mm
+
+    torch.manual_seed(0)
+    # Ragged M and N, more tiles than SMs (persistent revisits), and a K that
+    # wraps the stage ring; B is K-major (W^T), the only layout NPOT tiles use.
+    M, N, K = 2136, 1000, 64 * 7
+    a = _operand(M, K, a_row_major)
+    b = _operand(K, N, False)
+    num_stages = {c.kwargs["BN"]: c.kwargs["NUM_STAGES"] for c in sm90._npot_configs()}[block_n]
+    with _pinned_full_config(128, block_n, num_stages):
+        actual = tlx_mm(a, b, space="full")
+        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == block_n
+
+    _assert_close(actual, torch.matmul(a, b))
+
+
+def test_n_piece_decomposition():
+    assert [sm90._n_piece(96, i) for i in range(3)] == [64, 32, 0]
+    assert [sm90._n_piece(224, i) for i in range(4)] == [128, 64, 32, 0]
+    assert [sm90._n_piece(128, i) for i in range(2)] == [128, 0]
+
+
+def test_npot_prune_rules():
+    num_sms = sm90._get_num_sms()
+
+    def npot_kept(M, N, K, b_row_major):
+        kept = sm90._prune_full_configs(sm90.CONFIGS(), {"M": M, "N": N, "K": K}, B_ROW_MAJOR=b_row_major)
+        return {c.kwargs["BN"] for c in kept if not sm90._is_pow2(c.kwargs["BN"])}
+
+    # 2048 / 96 = 22 tiles across N fill exactly one wave with M = 706.
+    assert 96 in npot_kept(706, 2048, 7072, False)
+    # 128x192 only ties 128x128 on per-SM work here (2 waves x 192 vs 3 x 128),
+    # but the two-piece tile is kept: 128x128 is SMEM-bandwidth bound.
+    assert 192 in npot_kept(706, 8192, 2560, False)
+    # Against a 128x256 best tile an NPOT tile still needs a 3% cut.
+    assert not npot_kept(4096, 4096, 4096, False)
+    # N-major B never takes N pieces; a shape that tiles evenly gains nothing.
+    assert not npot_kept(706, 2048, 7072, True)
+    assert not npot_kept(8192, 8192, 8192, False)
+    for bn in sm90._NPOT_BLOCK_NS:
+        pieces = [sm90._n_piece(bn, i) for i in range(4)]
+        assert pieces[3] == 0 and min(p for p in pieces if p) >= 32
+        assert sm90._fits_smem(128, bn, 2, 1)
+    assert num_sms > 0

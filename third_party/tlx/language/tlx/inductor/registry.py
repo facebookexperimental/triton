@@ -851,7 +851,8 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
         m, n, k = kernel_inputs.mnk_hinted()
         if min(m, n, k) <= 0:
             return
-        # The Inductor template has no split-K reduction; keep whole-K configs.
+        # The Inductor template has no split-K reduction and no N pieces; keep
+        # whole-K, power-of-two-N configs.
         if config.triton.tlx_mode == "allow":
             configs = _prune_full_configs(CONFIGS(), {"M": m, "N": n, "K": k})
         else:
@@ -859,7 +860,10 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
             if configs[0].kwargs["SPLIT_K"] > 1:
                 meta = configs[0].kwargs
                 configs = [_config(meta["BM"], meta["BN"], meta["NUM_STAGES"], meta["GROUP_SIZE_M"])]
-        configs = [conf for conf in configs if conf.kwargs["SPLIT_K"] == 1]
+        configs = [
+            conf for conf in configs
+            if conf.kwargs["SPLIT_K"] == 1 and conf.kwargs["BN"] & (conf.kwargs["BN"] - 1) == 0
+        ]
         strides = kernel_inputs.strides_hinted()
         for conf in configs:
             meta = conf.kwargs
