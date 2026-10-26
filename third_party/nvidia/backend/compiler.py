@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 from triton import knobs
 from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton._instrumentation import instrument as _instrument, is_enabled
+from triton._utils import is_power_of_two
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.magnon.flags import apply_enabled as _compile_iq_apply_enabled
 from triton.runtime.errors import PTXASError, attach_shared_memory_breakdown
@@ -334,7 +335,7 @@ class CUDAOptions:
             extern_libs["gsan"] = str(gsan_lib)
 
         object.__setattr__(self, "extern_libs", tuple(extern_libs.items()))
-        assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
+        assert is_power_of_two(self.num_warps), "num_warps must be a power of 2"
         _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
         _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
 
@@ -360,6 +361,9 @@ class CUDAOptions:
             raise ValueError("a cluster must be requested exactly one way: either num_ctas, or ctas_per_cga "
                              f"(optionally mirrored in cluster_dims). Got num_ctas={self.num_ctas}, "
                              f"ctas_per_cga={self.ctas_per_cga}, cluster_dims={self.cluster_dims}")
+
+        # Validate raw num_ctas: the mirroring below normalizes it to 1.
+        assert is_power_of_two(self.num_ctas), "num_ctas must be a power of 2"
 
         # ctas_per_cga regroups grid CTAs rather than spawning them, so it is
         # incompatible with the multiplicative semantics of num_ctas. Mirror it
