@@ -753,7 +753,10 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
 
     Inputs have identical [batch, heads, sequence, 128] shapes with sequence
     lengths divisible by 256. Blackwell and gfx950 return BF16 gradients;
-    gfx1250 is forward only. All three use 32x32 Q/K blocks. On gfx950, calls
+    gfx1250 is forward only. Backward computes gradients only for inputs with
+    ``requires_grad=True``. It skips unrequested gradient outputs and operations
+    used only by those gradients, including quantization used only by them.
+    All three use 32x32 Q/K blocks. On gfx950, calls
     where autograd records Q, K or V use a training forward with hardware exp2
     that saves separate row maxima and log2 normalization terms, the statistics
     backward recomputes P from. Other calls use the faster inference ping-pong

@@ -12,11 +12,13 @@ Causal scales instead pack eight bytes per query128/key64 block in
 allocation's square shape describes capacity, not this causal physical layout.
 Each gradient has one writer; no atomics are used.
 
-Per call, temporary storage is 128*N*N + 128*(N/32)**2 + 34816*N bytes:
+Full-gradient temporary storage is 128*N*N + 128*(N/32)**2 + 34816*N bytes:
 dS, its square scales, preparation and Delta. At N8192 this is
 8 GiB + 280 MiB, excluding the three 256 MiB BF16 gradients and saved
 inputs. Causal calls retain the same physical workspace size, but only
 initialize/read whole diagonal128 and lower-triangular attention blocks.
+Calls without dQ omit the dQ consumer, dS, and its scales.
+V-only calls also omit V quantization, Delta, dP, and dS computation.
 All allocations and launches use
 the input device's current stream. The caller owns input readiness and must
 not mutate inputs until their queued uses finish. Same-stream allocator
@@ -140,17 +142,19 @@ def _prepare_fused(V, DO, KS, VB, DO8, VS, DOS, KDQS, O, Delta, N: tl.constexpr,
     d = tl.arange(0, D)
     offsets = (head * N + rows[:, None]) * D + d[None, :]
     valid = rows[:, None] < N
-    v = tl.load(V + offsets, valid, 0).to(tl.float32)
-    if PACKED_STORES:
-        _quantize_prepared_feature_store_packed(v, VB, VS, head, rows, group, N, D, BLOCK_N)
-    else:
-        _quantize_store(v, VB, VS, head, rows, N, D, False, BLOCK_N)
+    if VB is not None:
+        v = tl.load(V + offsets, valid, 0).to(tl.float32)
+        if PACKED_STORES:
+            _quantize_prepared_feature_store_packed(v, VB, VS, head, rows, group, N, D, BLOCK_N)
+        else:
+            _quantize_store(v, VB, VS, head, rows, N, D, False, BLOCK_N)
     do = tl.load(DO + offsets, valid, 0).to(tl.float32)
-    o = tl.load(O + offsets, valid, 0).to(tl.float32)
-    delta_layout: tl.constexpr = tlx.layout(shape=((16, 4, 4), (8, 2)), stride=((8, 128, 512), (1, 2048)))
-    products = tlx.require_layout(o * do, delta_layout, pin=True)
-    delta = tl.sum(products, 1)
-    tl.store(Delta + head * N + rows, tlx.release_layout(delta), rows < N)
+    if Delta is not None:
+        o = tl.load(O + offsets, valid, 0).to(tl.float32)
+        delta_layout: tl.constexpr = tlx.layout(shape=((16, 4, 4), (8, 2)), stride=((8, 128, 512), (1, 2048)))
+        products = tlx.require_layout(o * do, delta_layout, pin=True)
+        delta = tl.sum(products, 1)
+        tl.store(Delta + head * N + rows, tlx.release_layout(delta), rows < N)
     square = do.reshape(32, D // 32, 32)
     exponent = _scale_exponent(tl.max(tl.max(tl.abs(square), 2), 0))
     inverse = _decode_scale(exponent, RECIPROCAL=True)
@@ -161,10 +165,11 @@ def _prepare_fused(V, DO, KS, VB, DO8, VS, DOS, KDQS, O, Delta, N: tl.constexpr,
         tl.store(DO8 + offsets, payload.reshape(32, D), valid)
     feature_offsets = (head * N + rows[:, None]) * (D // 32) + tl.arange(0, D // 32)[None, :]
     tl.store(DOS + feature_offsets, tl.broadcast_to(exponent[None, :], (32, D // 32)).to(tl.uint8), valid)
-    saved_offsets = (head * N + group * 32) * (D // 32) + d // 32
-    ks = tl.load(KS + saved_offsets, group < N // 32, 0)
-    seq_offsets = (head * D + d) * (N // 32) + group
-    tl.store(KDQS + seq_offsets, ks, group < N // 32)
+    if KDQS is not None:
+        saved_offsets = (head * N + group * 32) * (D // 32) + d // 32
+        ks = tl.load(KS + saved_offsets, group < N // 32, 0)
+        seq_offsets = (head * D + d) * (N // 32) + group
+        tl.store(KDQS + seq_offsets, ks, group < N // 32)
 
 
 @constexpr_function
@@ -392,7 +397,7 @@ def _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, st
             (prep_offsets[5] // 4 + head.to(tl.int32) * PREP_N + start + tl.arange(0, 64)).to(tl.int32), copy_layout,
             pin=True)
         tlx.buffer_load_to_local(deltamem[SLOT], Delta.to(tl.pointer_type(tl.float32)), delta_offsets)
-    else:
+    elif Delta is not None:
         tlx.buffer_load_to_local(deltamem[SLOT], Delta + metadata_base, offsets)
     rows = start + tl.arange(0, BM)
     offsets = rows[:, None] * D + tl.arange(0, D)[None, :]
@@ -945,6 +950,64 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   SCALED_P: tl.constexpr = False, OMIT_P_ZERO_INITIALIZER: tl.constexpr = False,
                   GUARD_SCORES: tl.constexpr = True, SCALE_LOOKAHEAD: tl.constexpr = False, Q_SCALE_WORDS=None,
                   DO_SCALE_WORDS=None, EXCHANGE_LDS: tl.constexpr = False, xpmem=None, xdsmem=None, xdssmem=None):
+    if Delta is None:
+        tl.static_assert(DK is None and DV is not None and DS_EXPORT is None and DSS_EXPORT is None)
+        tl.static_assert(not SCALE_LOOKAHEAD and not EXCHANGE_LDS and not COMMON_PREP and not IMMUTABLE_KV)
+        export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
+                                                       warps_per_cta=[2, WARPS_N])
+        export_layout: tl.constexpr = tlx.dot_operand_layout(0, export_mma, k_width=16)
+        native_rhs: tl.constexpr = tlx.dot_operand_layout(1, export_mma, k_width=16)
+        q_words = _load_rhs_words(QS, head, start, N, WARPS_N=WARPS_N)
+        do_words = _load_rhs_words(DOS, head, start, N, WARPS_N=WARPS_N)
+        tlx.async_load_wait_group(0)
+        tlx.workgroup_barrier()
+        if PREFETCH:
+            _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, start + BM, N, BM, D, 1 - SLOT,
+                        LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
+        q = _load_rhs_kv64(qmem[SLOT], True, WARPS_N=WARPS_N)
+        qs = _decode_rhs_head(q_words, WARPS_N=WARPS_N)
+        scores = tlx.release_layout(
+            tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks, WARPS_N=WARPS_N),
+                           'e4m3', q, qs, 'e4m3',
+                           tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
+        if LSE_SPLIT:
+            lse, log_norm = _load_softmax_metadata(lsemem[SLOT], BM, WARPS_N=WARPS_N)
+            scaled = scores * (sm_scale * 1.4426950408889634)
+            logits = (scaled - lse[None, :]) - log_norm[None, :]
+        else:
+            lse = _load_metadata(lsemem[SLOT], WARPS_N=WARPS_N)
+            logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
+        queries = start + tl.arange(0, BM)
+        if CAUSAL:
+            logits = tl.where(keys[:, None] <= queries[None, :], logits, -float('inf'))
+        p = tl.exp2(logits)
+        p8 = _guarded_p_words(p, tl.full((BN, BM // 2), 0.00390625, tl.float32))
+        ps = tl.full((BN, BM // 32), 119, tl.uint8)
+        dodv = _load_rhs_kv64(domem[SLOT], False, WARPS_N=WARPS_N)
+        dodvs = _decode_rhs_late(do_words, WARPS_N=WARPS_N)
+        dv = tlx.dot_scaled(tlx.require_layout(p8, export_layout, pin=False), _lhs_scale_kv64(ps, WARPS_N=WARPS_N),
+                            'e4m3', tlx.require_layout(dodv, native_rhs, pin=False), dodvs, 'e4m3',
+                            tlx.require_layout(dv, export_mma, pin=False))
+        return dk, dv
+    else:
+        return _compute_ds_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
+                                BM, BN, CAUSAL, qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base,
+                                key_tile, keys, start, SLOT, PREFETCH, PACK_DSS, PACK_P_EARLY, DELAY_DO_HEAD,
+                                COMMON_PREP, PREP_N, IMMUTABLE_KV, EARLY_DP, LSE_SPLIT, WARPS_N, SCALED_P,
+                                OMIT_P_ZERO_INITIALIZER, GUARD_SCORES, SCALE_LOOKAHEAD, Q_SCALE_WORDS, DO_SCALE_WORDS,
+                                EXCHANGE_LDS, xpmem, xdsmem, xdssmem)
+
+
+@triton.jit
+def _compute_ds_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
+                     D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, qmem, domem, lsemem,
+                     deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, start, SLOT: tl.constexpr, PREFETCH,
+                     PACK_DSS: tl.constexpr, PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False,
+                     COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, IMMUTABLE_KV: tl.constexpr = False,
+                     EARLY_DP: tl.constexpr = False, LSE_SPLIT: tl.constexpr = False, WARPS_N: tl.constexpr = 1,
+                     SCALED_P: tl.constexpr = False, OMIT_P_ZERO_INITIALIZER: tl.constexpr = False,
+                     GUARD_SCORES: tl.constexpr = True, SCALE_LOOKAHEAD: tl.constexpr = False, Q_SCALE_WORDS=None,
+                     DO_SCALE_WORDS=None, EXCHANGE_LDS: tl.constexpr = False, xpmem=None, xdsmem=None, xdssmem=None):
     direct_causal_guards: tl.constexpr = (LSE_SPLIT and PACK_DSS and not COMMON_PREP and PREP_N == 0
                                           and not IMMUTABLE_KV and WARPS_N == 1 and D == 128 and BM == 64 and BN == 64)
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
@@ -1102,7 +1165,7 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
         ds8 = tlx.local_load(xdsmem[SLOT], layout=export_layout, relaxed=True)
         dss_export = tlx.local_load(xdssmem[SLOT], layout=_ds_scale_native_layout(WARPS_N), relaxed=True)
         dsk = tlx.local_load(xdssmem[SLOT], layout=_lhs_scale_kv64_layout(BN, BM // 32, WARPS_N), relaxed=True)
-    elif PACK_P_EARLY:
+    elif PACK_P_EARLY and DV is not None:
         # P has no FP32 consumers after dS is formed.
         if SCALED_P:
             p8 = tlx.amd_scaled_downcast_fp8(p, 256.0)
@@ -1113,46 +1176,49 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     if not EXCHANGE_LDS:
         ds8, dsk, unused_compact_exponent = _quantize_ds_square(ds, BN, BM)
         dsk = _lhs_scale_kv64(dsk, WARPS_N=WARPS_N)
-    if not PACK_P_EARLY and not EXCHANGE_LDS:
+    if not PACK_P_EARLY and not EXCHANGE_LDS and DV is not None:
         if SCALED_P:
             p8 = tlx.amd_scaled_downcast_fp8(p, 256.0)
         else:
             p8 = _guarded_p_words(p, tl.full((BN, BM // 2), 0.00390625, tl.float32),
                                   OMIT_ZERO_INITIALIZER=OMIT_P_ZERO_INITIALIZER)
         ps = tl.full((BN, BM // 32), 119, tl.uint8)
-    dodv = _load_rhs_kv64(domem[SLOT], False, WARPS_N=WARPS_N)
-    dodvs = _decode_rhs_late(do_words, WARPS_N=WARPS_N)
-    # LLVM 850a2b1b: mask-zero ends the head IGLP scheduling region.
-    tlx.amd_sched_barrier(0)
-    dv = tlx.dot_scaled(tlx.require_layout(p8, export_layout, pin=False), _lhs_scale_kv64(ps, WARPS_N=WARPS_N), 'e4m3',
-                        tlx.require_layout(dodv, native_rhs, pin=False), dodvs, 'e4m3',
-                        tlx.require_layout(dv, export_mma, pin=False))
-    qdk = _load_rhs_kv64(qmem[SLOT], False, WARPS_N=WARPS_N)
-    qdks = _decode_rhs_late(q_words, WARPS_N=WARPS_N)
-    dk = tlx.dot_scaled(tlx.require_layout(ds8, export_layout, pin=False), _lhs_scale_kv64(dsk, WARPS_N=WARPS_N),
-                        'e4m3', tlx.require_layout(qdk, native_rhs, pin=False), qdks, 'e4m3',
-                        tlx.require_layout(dk, export_mma, pin=False))
-    export_base = head * N * N
-    export_rows = tlx.require_layout(tl.arange(0, BN), tlx.slice_layout(export_layout, 1), pin=False)
-    export_cols = tlx.require_layout(tl.arange(0, BM), tlx.slice_layout(export_layout, 0), pin=False)
-    export_keys = key_tile * BN + export_rows
-    export_queries = start + export_cols
-    export_key_column = tlx.require_layout(export_keys[:, None], export_layout, pin=True)
-    export_query_row = tlx.require_layout(export_queries[None, :], export_layout, pin=True)
-    export_offsets = (export_key_column * N + export_query_row).to(tl.int32)
-    export_offsets = tlx.require_layout(export_offsets, export_layout, pin=False)
-    export_value = tlx.require_layout(ds8, export_layout, pin=False)
-    tlx.buffer_store(export_value, DS_EXPORT + export_base, export_offsets)
-    # Workspace ABI follows the original kernel mask mode, not this tile's
-    # peeled fine-mask flag (which is False in causal bulk/drain calls).
-    if EXCHANGE_LDS and PACK_DSS:
-        _store_ds_scale_packed(DSS_EXPORT, dss_export, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
-    elif EXCHANGE_LDS:
-        _store_ds_scale_native(DSS_EXPORT, dss_export, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
-    elif PACK_DSS:
-        _store_ds_scale_packed(DSS_EXPORT, dsk, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
-    else:
-        _store_ds_scale_native(DSS_EXPORT, dsk, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
+    if DV is not None:
+        dodv = _load_rhs_kv64(domem[SLOT], False, WARPS_N=WARPS_N)
+        dodvs = _decode_rhs_late(do_words, WARPS_N=WARPS_N)
+        # LLVM 850a2b1b: mask-zero ends the head IGLP scheduling region.
+        tlx.amd_sched_barrier(0)
+        dv = tlx.dot_scaled(tlx.require_layout(p8, export_layout, pin=False), _lhs_scale_kv64(ps, WARPS_N=WARPS_N),
+                            'e4m3', tlx.require_layout(dodv, native_rhs, pin=False), dodvs, 'e4m3',
+                            tlx.require_layout(dv, export_mma, pin=False))
+    if DK is not None:
+        qdk = _load_rhs_kv64(qmem[SLOT], False, WARPS_N=WARPS_N)
+        qdks = _decode_rhs_late(q_words, WARPS_N=WARPS_N)
+        dk = tlx.dot_scaled(tlx.require_layout(ds8, export_layout, pin=False), _lhs_scale_kv64(dsk, WARPS_N=WARPS_N),
+                            'e4m3', tlx.require_layout(qdk, native_rhs, pin=False), qdks, 'e4m3',
+                            tlx.require_layout(dk, export_mma, pin=False))
+    if DS_EXPORT is not None:
+        export_base = head * N * N
+        export_rows = tlx.require_layout(tl.arange(0, BN), tlx.slice_layout(export_layout, 1), pin=False)
+        export_cols = tlx.require_layout(tl.arange(0, BM), tlx.slice_layout(export_layout, 0), pin=False)
+        export_keys = key_tile * BN + export_rows
+        export_queries = start + export_cols
+        export_key_column = tlx.require_layout(export_keys[:, None], export_layout, pin=True)
+        export_query_row = tlx.require_layout(export_queries[None, :], export_layout, pin=True)
+        export_offsets = (export_key_column * N + export_query_row).to(tl.int32)
+        export_offsets = tlx.require_layout(export_offsets, export_layout, pin=False)
+        export_value = tlx.require_layout(ds8, export_layout, pin=False)
+        tlx.buffer_store(export_value, DS_EXPORT + export_base, export_offsets)
+        # Workspace ABI follows the original kernel mask mode, not this tile's
+        # peeled fine-mask flag (which is False in causal bulk/drain calls).
+        if EXCHANGE_LDS and PACK_DSS:
+            _store_ds_scale_packed(DSS_EXPORT, dss_export, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
+        elif EXCHANGE_LDS:
+            _store_ds_scale_native(DSS_EXPORT, dss_export, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
+        elif PACK_DSS:
+            _store_ds_scale_packed(DSS_EXPORT, dsk, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
+        else:
+            _store_ds_scale_native(DSS_EXPORT, dsk, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
     if SCALE_LOOKAHEAD:
         return (dk, dv, next_q_words, next_do_words)
     else:
@@ -1206,9 +1272,15 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     d = tl.arange(0, D)
     base = head * N * D
     k = _load_resident_kv64(K, base, keys, N, D, WARPS_N=WARPS_N)
-    v = _load_resident_kv64(V, base, keys, N, D, WARPS_N=WARPS_N)
+    if V is not None:
+        v = _load_resident_kv64(V, base, keys, N, D, WARPS_N=WARPS_N)
+    else:
+        v = None
     ks = _load_scale_native(KS, head, key_tile * BN, N, 64, 4, False, False, WARPS_N=WARPS_N)
-    vs = _load_scale_native(VS, head, key_tile * BN, N, 64, 4, False, False, WARPS_N=WARPS_N)
+    if VS is not None:
+        vs = _load_scale_native(VS, head, key_tile * BN, N, 64, 4, False, False, WARPS_N=WARPS_N)
+    else:
+        vs = None
     dk = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), export_mma, pin=False)
     dv = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), export_mma, pin=False)
     shared_layout: tl.constexpr = _stage_layout(D)
@@ -1367,8 +1439,10 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
         (not CAUSAL and WARPS_N == 2) or (CAUSAL and WARPS_N == 1)):
         dk = _guard_kv_scores(dk, export_mma, PACK32=True)
     out = base + keys[:, None] * D + d[None, :]
-    tl.store(DK + out, dk * sm_scale)
-    tl.store(DV + out, dv)
+    if DK is not None:
+        tl.store(DK + out, dk * sm_scale)
+    if DV is not None:
+        tl.store(DV + out, dv)
 
 
 @triton.jit
@@ -1866,7 +1940,7 @@ def can_use_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_b
 
 
 def _try_launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, *,
-                                       causal=False, lse_split=False):
+                                       causal=False, lse_split=False, needs_input_grad=(True, True, True)):
     """Internal autograd dispatch; the caller already holds the input device.
 
     Return None only for unsupported metadata or architecture. Validation
@@ -1889,13 +1963,14 @@ def _try_launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, d
         return None
     if qk_format:
         return _launch_backward_shared_square(q_fp8, None, None, None, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal,
-                                              device, shape, qk_format=True, lse_split=lse_split)
+                                              device, shape, qk_format=True, lse_split=lse_split,
+                                              needs_input_grad=needs_input_grad)
     return _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale,
-                                          causal, device, shape, lse_split=lse_split)
+                                          causal, device, shape, lse_split=lse_split, needs_input_grad=needs_input_grad)
 
 
 def launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, *,
-                                  causal=False):
+                                  causal=False, needs_input_grad=(True, True, True)):
     """Return BF16 (dQ, dK, dV) for the admitted shared-square recipe.
 
     q_fp8/k_fp8 and their uint8 scales MUST be the saved output of the
@@ -1920,12 +1995,18 @@ def launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf1
         if not _is_gfx950(device):
             raise ValueError("Shared-square backward is gfx950-only")
         return _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale,
-                                              causal, device, shape)
+                                              causal, device, shape, needs_input_grad=needs_input_grad)
 
 
 def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal,
-                                   device, shape, qk_format=False, lse_split=False):
+                                   device, shape, qk_format=False, lse_split=False,
+                                   needs_input_grad=(True, True, True)):
     """Launch after metadata/architecture checks, inside the input device context."""
+    if not all(needs_input_grad):
+        if qk_format:
+            q_fp8, k_fp8, q_scale, k_scale = _saved_qk_arena_views(q_fp8, shape[2])
+        return _launch_backward_shared_square_selective(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse,
+                                                        sm_scale, causal, device, shape, lse_split, needs_input_grad)
     n = shape[2]
     if qk_format and n not in _PREPARATION_ARENA_BYTES:
         raise ValueError("Saved Q/K arena requires the private backward arena")
@@ -2102,4 +2183,34 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
         _bwd_q_consume.run(ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal, HEADS=128,
                            num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
                            warmup=False)
+    return dq, dk, dv
+
+
+def _launch_backward_shared_square_selective(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale,
+                                             causal, device, shape, lse_split, needs_input_grad):
+    """Allocate and compute only requested gradients with the shared-square recipe."""
+    need_dq, need_dk, need_dv = needs_input_grad
+    if not any(needs_input_grad):
+        return None, None, None
+    n = shape[2]
+    need_ds = need_dq or need_dk
+    feature_scale_shape = (*shape[:-1], shape[-1] // 32)
+    vb = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device) if need_ds else None
+    vs = torch.empty(feature_scale_shape, dtype=torch.uint8, device=device) if need_ds else None
+    do8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
+    dos = torch.empty(feature_scale_shape, dtype=torch.uint8, device=device)
+    kdqs = torch.empty((4, 32, 128, n // 32), dtype=torch.uint8, device=device) if need_dq else None
+    delta = torch.empty(shape[:-1], dtype=torch.float32, device=device) if need_ds else None
+    ds = torch.empty((4, 32, n, n), dtype=torch.float8_e4m3fn, device=device) if need_dq else None
+    dss = torch.empty((4, 32, n // 32, n // 32), dtype=torch.uint8, device=device) if need_dq else None
+    dq, dk, dv = (torch.empty(shape, dtype=torch.bfloat16, device=device) if needed else None
+                  for needed in needs_input_grad)
+    _prepare_fused[(n // 32, 128)](v_bf16, do_bf16, k_scale, vb, do8, vs, dos, kdqs, out_bf16, delta, n, 128, 32,
+                                   num_warps=4, num_stages=2)
+    _bwd_kv_owner[(128, n // 64)](q_fp8, k_fp8, vb, do8, q_scale, k_scale, vs, dos, lse, delta, dk, dv, n, sm_scale, ds,
+                                  dss, D=128, BM=64, BN=64, CAUSAL=causal, LSE_SPLIT=lse_split, num_warps=2,
+                                  num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, enable_fp_fusion=not lse_split)
+    if need_dq:
+        _bwd_q_consume[(n // 128, 128)](ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal,
+                                        HEADS=128, num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0)
     return dq, dk, dv
