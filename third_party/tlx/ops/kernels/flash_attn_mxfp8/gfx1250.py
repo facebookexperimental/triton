@@ -1461,7 +1461,7 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
             waves_per_eu=2,
         )
         return out
-    grid = (batch * heads, n_m)
+    grid = (batch * heads, n_m) if causal else (n_m, batch * heads)
     _mxfp8_fa_fwd_tdm[grid](
         q_fp8,
         k_fp8,

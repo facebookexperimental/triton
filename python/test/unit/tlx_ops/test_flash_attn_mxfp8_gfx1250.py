@@ -81,8 +81,21 @@ def test_flash_attn_mxfp8_fwd_causal_lengths(shape):
     torch.testing.assert_close(out, _sdpa(q, k, v, True, 0.5), atol=0.2, rtol=0)
 
 
-# 1024 takes the persistent kernels.
-@pytest.mark.parametrize("causal,n_ctx", [(False, 1024), (True, 1024)])
+# Non-causal lengths that are not a multiple of 512 take the non-persistent
+# kernel, one workgroup per Q tile and head; more heads than Q tiles, and
+# fewer, both cover its grid.
+@pytest.mark.parametrize("shape", [(2, 3, 768, 128), (1, 2, 1280, 128)])
+def test_flash_attn_mxfp8_fwd_non_persistent(shape):
+    from triton.tlx.ops import flash_attn_mxfp8
+
+    torch.manual_seed(20)
+    q, k, v = _qkv(shape)
+    out = flash_attn_mxfp8(q, k, v, causal=False, sm_scale=0.5, space="smoke")
+    torch.testing.assert_close(out, _sdpa(q, k, v, False, 0.5), atol=0.2, rtol=0)
+
+
+# 1024 takes the persistent kernels and 768 the non-persistent one.
+@pytest.mark.parametrize("causal,n_ctx", [(False, 1024), (False, 768), (True, 1024)])
 def test_flash_attn_mxfp8_fast_exp_bound(causal, n_ctx):
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx1250
 
