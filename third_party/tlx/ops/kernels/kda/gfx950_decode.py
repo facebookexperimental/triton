@@ -50,9 +50,9 @@ def _kda_recurrent_decode_kernel(
     NUM_SLOTS: tl.constexpr,
     TOKENS: tl.constexpr,
     STATE_SLOT_STRIDE: tl.constexpr,
-    RAW: tl.constexpr,
+    USE_QK_L2NORM_AND_GATE: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
-    BETA_IS_RAW: tl.constexpr,
+    USE_BETA_SIGMOID: tl.constexpr,
 ):
     value_block = tl.program_id(0)
     sequence_head = tl.program_id(1)
@@ -90,7 +90,7 @@ def _kda_recurrent_decode_kernel(
         mask=valid_read & key_mask,
         other=0.0,
     )
-    if RAW:
+    if USE_QK_L2NORM_AND_GATE:
         q = q / tl.sqrt(tl.sum(q * q) + 1e-6)
         k = k / tl.sqrt(tl.sum(k * k) + 1e-6)
         x = gate.to(tl.float32) + tl.load(DtBias + head * K + key_offsets, mask=key_mask, other=0.0)
@@ -107,7 +107,7 @@ def _kda_recurrent_decode_kernel(
         mask=valid_read,
         other=0.0,
     ).to(tl.float32)
-    if BETA_IS_RAW:
+    if USE_BETA_SIGMOID:
         beta = tl.sigmoid(beta)
 
     q *= SCALE
@@ -235,10 +235,10 @@ def kda_recurrent_decode(
     ``-exp(A_log) * softplus(g + dt_bias)`` without a lower bound. Either way
     ``beta_is_raw`` applies the sigmoid to beta.
     """
-    raw = A_log is not None
-    if raw != (dt_bias is not None):
+    use_qk_l2norm_and_gate = A_log is not None
+    if use_qk_l2norm_and_gate != (dt_bias is not None):
         raise ValueError("raw inputs need both A_log and dt_bias")
-    if lower_bound is not None and not raw:
+    if lower_bound is not None and not use_qk_l2norm_and_gate:
         raise ValueError("lower_bound applies to raw inputs only")
     batch, heads, key_dim = _validate_decode_inputs(
         q,
@@ -251,7 +251,7 @@ def kda_recurrent_decode(
         write_indices,
         cu_seqlens,
     )
-    if raw:
+    if use_qk_l2norm_and_gate:
         if A_log.numel() != heads or dt_bias.numel() != heads * key_dim:
             raise ValueError("A_log must have H elements and dt_bias H * K")
         A_log = A_log.reshape(-1).contiguous()
@@ -295,9 +295,9 @@ def kda_recurrent_decode(
         NUM_SLOTS=state_pool.shape[0],
         TOKENS=batch,
         STATE_SLOT_STRIDE=state_pool.stride(0),
-        RAW=raw,
+        USE_QK_L2NORM_AND_GATE=use_qk_l2norm_and_gate,
         USE_LOWER_BOUND=lower_bound is not None,
-        BETA_IS_RAW=beta_is_raw,
+        USE_BETA_SIGMOID=beta_is_raw,
         num_warps=1,
         num_stages=2,
     )

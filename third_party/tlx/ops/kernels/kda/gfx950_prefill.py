@@ -160,9 +160,9 @@ def _prepare_chunk_kernel(
     STRIDE_V: tl.constexpr,
     STRIDE_G: tl.constexpr,
     STRIDE_BETA: tl.constexpr,
-    RAW: tl.constexpr,
+    USE_QK_L2NORM_AND_GATE: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
-    SIGMOID_BETA: tl.constexpr,
+    USE_BETA_SIGMOID: tl.constexpr,
 ):
     """Everything the walk reads for one (chunk, head), in one program.
 
@@ -229,7 +229,7 @@ def _prepare_chunk_kernel(
     g = tlx.buffer_load(G + (start * STRIDE_G + head * D), g_rows).to(tl.float32)
     beta_mask = beta_offsets < rows_left * STRIDE_BETA
     beta = tlx.buffer_load(Beta + (start * STRIDE_BETA + head), beta_offsets, mask=beta_mask, other=0.0).to(tl.float32)
-    if RAW:
+    if USE_QK_L2NORM_AND_GATE:
         # What prepare_kda_inputs does, but the activated gate here and the
         # l2-normalized Q/K below stay fp32 until they become MFMA operands.
         # A [D] vector broadcast in registers: a load with the tile's
@@ -246,7 +246,7 @@ def _prepare_chunk_kernel(
         else:
             x = g + bias[None, None, :]
             g = -rate * tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
-    if SIGMOID_BETA:
+    if USE_BETA_SIGMOID:
         beta = tl.where(beta_mask, tl.sigmoid(beta), 0.0)
     g = tl.where(g_mask, g, 0.0)
 
@@ -274,13 +274,13 @@ def _prepare_chunk_kernel(
     # Rows decayed to their band's pivot (lhs) and columns lifted from it; a
     # bridge exp(pivot_b - pivot_J) on row band b's rows meets column band J.
     q = q.to(tl.float32)
-    if RAW:
+    if USE_QK_L2NORM_AND_GATE:
         q = q * tl.math.rsqrt(tl.sum(q * q, axis=2) + 1e-6)[:, :, None]
     q_rows = q * rise * SCALE
     tlx.buffer_store((q_rows * to_pivot).to(Qg.dtype.element_ty), Qg + tile_base, tile_offsets, mask=tile_mask)
     q_lhs = tlx.require_layout(q_rows.to(tl.bfloat16), a3)
     k = k.to(tl.float32)
-    if RAW:
+    if USE_QK_L2NORM_AND_GATE:
         k = k * tl.math.rsqrt(tl.sum(k * k, axis=2) + 1e-6)[:, :, None]
     k_cols = k * fall
     tlx.buffer_store((k_cols * to_last).to(Kg.dtype.element_ty), Kg + tile_base, tile_offsets, mask=tile_mask)
@@ -942,7 +942,7 @@ def _validate_prefill_inputs(
     beta: torch.Tensor,
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    raw: bool = False,
+    use_qk_l2norm_and_gate: bool = False,
     state_indices: torch.Tensor | None = None,
 ) -> tuple[int, int, int, int]:
     tensors = (q, k, v, g, beta, initial_state)
@@ -952,7 +952,7 @@ def _validate_prefill_inputs(
         raise ValueError("KDA data tensors must be on the same GPU")
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("q must be a packed [1, T, H, K] tensor")
-    if raw:
+    if use_qk_l2norm_and_gate:
         if q.shape != k.shape or g.numel() != q.numel():
             raise ValueError("q and k must have identical shapes and g as many elements")
         if beta.numel() != q[..., 0].numel():
@@ -1020,8 +1020,8 @@ def kda_paged_prefill(
     ``state_indices`` [N] naming each sequence's slot. A pool is updated in
     place and returned as the final state.
     """
-    raw = A_log is not None
-    if raw and dt_bias is None:
+    use_qk_l2norm_and_gate = A_log is not None
+    if use_qk_l2norm_and_gate and dt_bias is None:
         raise ValueError("raw inputs need both A_log and dt_bias")
     paged = state_pool is not None
     if paged == (initial_state is not None) or paged != (state_indices is not None):
@@ -1036,7 +1036,7 @@ def kda_paged_prefill(
         beta,
         initial_state,
         cu_seqlens,
-        raw,
+        use_qk_l2norm_and_gate,
         state_indices,
     )
     q, k, v, g = (_token_rows(x, total_tokens, heads) for x in (q, k, v, g))
@@ -1051,7 +1051,7 @@ def kda_paged_prefill(
         return output.unsqueeze(0), state_pool if paged else initial_state.clone()
 
     activation = None
-    if raw:
+    if use_qk_l2norm_and_gate:
         activation = dict(A_log=A_log.reshape(-1).float(), dt_bias=dt_bias.reshape(-1).float(), lower_bound=lower_bound)
     chunks = _prepare_chunks(q, k, v, g, beta, scale, cu_seqlens, chunk_indices, num_sequences, activation, beta_is_raw)
     output = torch.empty((total_tokens, heads, value_dim), dtype=v.dtype, device=v.device)
@@ -1121,9 +1121,9 @@ def _prepare_chunks(q, k, v, g, beta, scale, cu_seqlens, chunk_indices, num_sequ
         STRIDE_V=v.stride(0),
         STRIDE_G=g.stride(0),
         STRIDE_BETA=beta.stride(0),
-        RAW=activation is not None,
+        USE_QK_L2NORM_AND_GATE=activation is not None,
         USE_LOWER_BOUND=activation is not None and activation["lower_bound"] is not None,
-        SIGMOID_BETA=beta_is_raw,
+        USE_BETA_SIGMOID=beta_is_raw,
         num_warps=4,
         waves_per_eu=2,
     )
