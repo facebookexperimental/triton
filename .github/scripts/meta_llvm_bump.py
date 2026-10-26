@@ -107,17 +107,19 @@ def decide(meta, pins, chain, release, required):
     return "bump", release["tag_name"]
 
 
-def _bump_text(repo, target, fork, fork_branch, meta, new):
+def _bump_text(repo, target, fork, fork_branch, meta, new, release=None):
     """(problem, solution, test plan, log header) prose shared by the commit message and the PR body."""
     old_tag = meta["release_base_url"].rsplit("/", 1)[-1]
     tip, base = new["llvm_hash"], new["based_on_oai_llvm_hash"]
     tag = new["release_base_url"].rsplit("/", 1)[-1]
-    return (f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
-            "fork branch has a newer published release.",
-            f"This points cmake/meta-llvm-info.json at {tag}, built from fork tip {tip[:12]} on the same OAI pin "
-            f"{base[:12]}.", "The pinned digests match the release's .sha256 assets and GitHub's asset digests "
-            f"({', '.join(sorted(new['sha256sum']))}).",
-            f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):")
+    published = f" (published {_date(release)})" if release else ""
+    return (
+        f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
+        "fork branch has a newer published release.",
+        f"This points cmake/meta-llvm-info.json at {tag}{published}, built from fork tip {tip[:12]} on the same OAI "
+        f"pin {base[:12]}.", "The pinned digests match the release's .sha256 assets and GitHub's asset digests "
+        f"({', '.join(sorted(new['sha256sum']))}).",
+        f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):")
 
 
 def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width=72):
@@ -141,14 +143,24 @@ def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width
     return "\n".join(lines)
 
 
-def pr_body(repo, target, fork, fork_branch, meta, new, log):
+def _fork_change(fork, sha, subject):
+    """Markdown bullet for one fork commit: its fork PR link when the subject ends in a squash "(#N)", else the
+    commit link."""
+    match = re.search(r"\s*\(#(\d+)\)\s*$", subject)
+    if match:
+        return f"- [#{match.group(1)}](https://github.com/{fork}/pull/{match.group(1)}) {subject[:match.start()]}"
+    return f"- [{sha[:12]}](https://github.com/{fork}/commit/{sha}) {subject}"
+
+
+def pr_body(repo, target, fork, fork_branch, meta, new, log, release):
     """PR description: markdown headings, unwrapped paragraphs (GitHub turns each newline into a break), and the
-    fork log in a fence with full subjects."""
-    problem, solution, test, log_header = _bump_text(repo, target, fork, fork_branch, meta, new)
-    entries = [f"{sha[:12]} {subject}" for sha, subject in log] or ["(none)"]
+    fork changes as linked bullets under Solution."""
+    problem, solution, test, _ = _bump_text(repo, target, fork, fork_branch, meta, new, release)
+    count = f"{len(log)} fork change{'s' if len(log) != 1 else ''}"
+    solution += f" It adds {count}{':' if log else '.'}"
     return "\n".join([
-        "# Summary:", "", "**Problem**", "", problem, "", "**Solution**", "", solution, "", "# Test Plan:", "", test,
-        "", log_header, "", "```", *entries, "```"
+        "# Summary:", "", "**Problem**", "", problem, "", "**Solution**", "", solution, "",
+        *[_fork_change(fork, sha, subject) for sha, subject in log], *([""] if log else []), "# Test Plan:", "", test
     ])
 
 

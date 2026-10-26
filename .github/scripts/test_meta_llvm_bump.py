@@ -119,20 +119,36 @@ RELEASE = {
 }
 
 
-def test_pr_body_markdown_unwrapped_full_subjects():
+def test_pr_body_markdown_unwrapped_linked_fork_changes():
     release = _release(NEW, 1, ["almalinux-x64"])
     new = render(META, release, {"almalinux-x64": "e" * 64}, "facebookexperimental/llvm-project")
-    long_subject = "[triton][3.8][LLVM] Cap SLSR candidate-basis SCEV differences per function (#13)"
+    long_subject = "[triton][3.8][LLVM] Cap SLSR candidate-basis SCEV differences per function"
     body = pr_body("facebookexperimental/triton", "release/3.8.x", "facebookexperimental/llvm-project", "triton_3.8.x",
-                   META, new, [(NEW, long_subject)])
+                   META, new, [(NEW, f"{long_subject} (#13)"), (BASE, "Direct push")], RELEASE)
     lines = body.splitlines()
     assert lines[:4] == ["# Summary:", "", "**Problem**", ""]
-    assert "# Test Plan:" in lines
     # One line per paragraph: GitHub renders every newline as a hard break.
     assert any(
         line.startswith("facebookexperimental/triton@release/3.8.x tracks") and line.endswith("release.")
         for line in lines)
-    assert lines[-3:] == ["```", f"3dd0e43fed88 {long_subject}", "```"]
+    solution = lines.index("**Solution**")
+    assert "at llvm-3dd0e43f-1 (published 2026-10-15), built from" in lines[solution + 2]
+    assert lines[solution + 2].endswith(". It adds 2 fork changes:")
+    # Squash-merged fork commits link their fork PR; others link the commit.
+    assert lines[solution + 4:solution + 6] == [
+        f"- [#13](https://github.com/facebookexperimental/llvm-project/pull/13) {long_subject}",
+        f"- [{BASE[:12]}](https://github.com/facebookexperimental/llvm-project/commit/{BASE}) Direct push",
+    ]
+    assert lines[solution + 6:solution + 8] == ["", "# Test Plan:"]
+    assert "```" not in body
+
+
+def test_pr_body_without_fork_changes():
+    release = _release(NEW, 1, ["almalinux-x64"])
+    new = render(META, release, {"almalinux-x64": "e" * 64}, "facebookexperimental/llvm-project")
+    body = pr_body("facebookexperimental/triton", "release/3.8.x", "facebookexperimental/llvm-project", "triton_3.8.x",
+                   META, new, [], RELEASE)
+    assert ". It adds 0 fork changes.\n\n# Test Plan:" in body
 
 
 SHA = "a" * 40

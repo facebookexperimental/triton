@@ -162,11 +162,11 @@ def failed_jobs(repo, latest):
     return names
 
 
-def pr_text(repo, target, fork, fork_branch, meta, new):
+def pr_text(repo, target, fork, fork_branch, meta, new, release):
     """(title, body) of the PR that bumps target from meta to new."""
     title = f"[Meta LLVM] Bump {target} to {tag_of(new)}"
-    return title, pr_body(repo, target, fork, fork_branch, meta, new, fork_log(fork, meta["llvm_hash"],
-                                                                               new["llvm_hash"]))
+    log = fork_log(fork, meta["llvm_hash"], new["llvm_hash"])
+    return title, pr_body(repo, target, fork, fork_branch, meta, new, log, release)
 
 
 def file_result(repo, issue, title, body):
@@ -202,7 +202,7 @@ def settle(args, meta, branch, issue):
                     failed_body(args.repo, args.target, release, sha, latest, [], args.timeout_hours))
         return "running"
     if verdict(latest) == "ready":
-        title, body = pr_text(args.repo, args.target, args.fork, args.fork_branch, meta, new)
+        title, body = pr_text(args.repo, args.target, args.fork, args.fork_branch, meta, new, release)
         text = issue_body(args.repo, args.target, title, body, release, sha, latest)
         wrote = file_result(args.repo, issue, issue_title(args.target, release), text)
     else:
