@@ -18,12 +18,7 @@ regular_mxfp8_square(a, b, packed_a, packed_b, out=out)
 or `uint8` dtype. Packing rearranges these bytes into K-major blocked atoms;
 it does not change the numerical scales. Use `pack_regular_mxfp8_scale` to pack
 and cache the weight scales independently when weights are static. The
-kernel-only benchmark pre-packs both scales before timing:
-
-```bash
-python3 third_party/tlx/tutorials/gfx9_gemm/intra_wave/a8w8_mxfp8/bench_upstream.py \
-    --size 1024 --size 2048 --size 4096 --size 8192 --size 16384
-```
+cached-scale measurements below pre-pack both scales before timing the GEMM.
 
 The 1K path uses 64x64 output tiles, 4 waves, and 3 compiler pipeline stages;
 2K uses 64x128, 4 waves, and 2 stages. The larger path uses 256x256 output
@@ -63,9 +58,9 @@ runs. Measurements used physical GPU 7 with the default AUTO clock policy.
 
 The 16K Primus autotuner found no reproducible configuration. Direct testing
 confirmed that identical cold runs of its chosen regular-GEMM kernel changed
-the full output; six alternate configurations also changed output. The
-benchmark therefore excludes that timing instead of publishing an invalid
-comparison. Sampled numerical closeness alone would not have detected this.
+the full output; six alternate configurations also changed output. That timing
+is excluded rather than publishing an invalid comparison. Sampled numerical
+closeness alone would not have detected this.
 
 Clocks were **not** fixed: AMD documents that performance-determinism mode is
 unsupported on MI350, and this host rejected a manual maximum GFXCLK limit.
@@ -75,10 +70,5 @@ support](https://rocm.docs.amd.com/projects/amdsmi/en/docs-10.1.0/conceptual/per
 
 Environment: MI350X, TLX 3.9, PyTorch 2.16.0a0+rocm10.2.0a20261012,
 amd-aiter 0.1.24 (source `2ebbe6275b2a`), Primus-Turbo 0.0.0.dev1 (source
-`ca1fdd673172`), FlyDSL 0.3.4.1. To rerun with all three installed:
-
-```bash
-HIP_VISIBLE_DEVICES=7 python3 third_party/tlx/tutorials/gfx9_gemm/intra_wave/a8w8_mxfp8/bench_compare_regular.py \
-    --size 1024 --size 2048 --size 4096 --size 8192 --size 16384 \
-    --samples 7 --iterations 12 --unroll 2
-```
+`ca1fdd673172`), FlyDSL 0.3.4.1. Development benchmark scripts are not part
+of this tutorial; the comparison conditions and results are recorded above.
