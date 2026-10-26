@@ -615,7 +615,7 @@ def _walk_chunks(
         BT,
         WRITE_OUTPUT,
     )
-    for local_chunk in range(chunk_lo, chunk_hi):
+    for local_chunk in tl.range(chunk_lo, chunk_hi, num_stages=1):
         token0 = local_chunk * BT
         slot = (local_chunk - chunk_lo) % 2
         # Wait before issuing the next chunk's copies, so the wait never
