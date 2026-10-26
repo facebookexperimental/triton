@@ -13,12 +13,12 @@ CUs), so the tiles stay small and the time is per-tile latency:
   work items, so most tiles of a (sequence, head) share its K/V in that XCD's
   L2 (one can straddle two runs).
 - Q, K and V are copied from global memory into LDS. K and V are double
-  buffered; Q is staged once in a reused V-buffer slot. One copy group per
-  step (K(b + 2), V(b + 1)) lands during step b.
-- Each step issues QK(b + 1) and PV(b) MFMA by MFMA, with K and V read from
-  LDS in 32-wide pieces, each read issued one MFMA before its use (as in
-  flash_attn_mxfp8/gfx950.py's interleaved MFMA-stage helpers); scheduling
-  barriers keep LLVM from sinking the reads to their uses.
+  buffered; Q is staged once in a reused V-buffer slot. In steady state,
+  each iteration prefetches the next V block and the K block after that.
+- Each steady-state iteration issues QK and PV MFMA in an interleaved pattern,
+  with K and V read from LDS in 32-wide pieces. Each read is issued one MFMA
+  before its use (as in flash_attn_mxfp8/gfx950.py's interleaved MFMA-stage
+  helpers); scheduling barriers keep LLVM from sinking the reads to their uses.
 - Key blocks that every row of the tile sees in full run unmasked; only the
   sequence's last partial block and the causal diagonal are masked.
 - Causal: tile m sees m + 1 key blocks, so the last tiles of a sequence set
