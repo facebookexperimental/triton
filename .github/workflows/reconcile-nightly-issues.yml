@@ -94,6 +94,7 @@ jobs:
               if (issue.pull_request) continue;
               if (!issue.title.startsWith(prefix)) continue;   // scope to this job
               if (stillFailing.has(issue.title)) continue;      // still broken: leave open
+              if (issue.labels.some(l => l.name === "flaky")) continue;  // flaky: closed by hand
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
