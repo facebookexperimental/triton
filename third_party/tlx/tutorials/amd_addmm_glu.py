@@ -147,7 +147,6 @@ def tlx_addmm_glu_kernel_optimized(
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(axis=0)
-    tl.assume(pid >= 0)
 
     # Num pids along M dim
     tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
@@ -191,21 +190,19 @@ def tlx_addmm_glu_kernel_optimized(
     tl.assume(pid_n <= (N - 1) // BLOCK_SIZE_N)
 
     # Get offsets this pid is responsible for in m dim
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_m = offs_cm % M
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
 
     # Get offsets this pid is responsible for in n dim
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_n = offs_cn % N
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
 
     # Get offsets this pid is responsible for in k dim
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # Base pointers for A along m dim
-    a_base_off = offs_m[:, None].to(tl.int64) * sa0
+    a_base_off = offs_m[:, None] * sa0
 
     # Base pointers for B along n dim
-    b_base_off = offs_n[None, :].to(tl.int64) * sb1
+    b_base_off = offs_n[None, :] * sb1
 
     # The number of buffers for this kernel is fixed to be 3 which allows
     # for the async_load_wait_group in the hotloop to not wait on the directly
@@ -295,7 +292,7 @@ def tlx_addmm_glu_kernel_optimized(
     # Prefetch Y from GMEM into registers. Issues the streaming Y load into VGPRs
     # here so its 44MB HBM read overlaps the drain MFMAs below and is only
     # consumed at the fma
-    y_ptrs = y_ptr + offs_m[:, None].to(tl.int64) * sy0 + offs_n[None, :].to(tl.int64) * sy1
+    y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
     y_regs = tl.load(y_ptrs, cache_modifier=".cs")
 
     # Epilogue: drain the remaining in-flight tiles
@@ -320,10 +317,9 @@ def tlx_addmm_glu_kernel_optimized(
 
     out = tl.fma(acc, y_regs.to(tl.float32), acc)
 
-    c_ptrs = c_ptr + offs_cm[:, None].to(tl.int64) * sc0 + offs_cn[None, :].to(tl.int64) * sc1
+    c_ptrs = c_ptr + offs_m[:, None] * sc0 + offs_n[None, :] * sc1
 
-    output_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=output_mask, cache_modifier=".cs")
+    tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), cache_modifier=".cs")
 
 
 def run_kernel_optimized(a, b, bias, y, out, cfg):
@@ -404,7 +400,6 @@ def tlx_addmm_glu_kernel_optimized_async(
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(axis=0)
-    tl.assume(pid >= 0)
 
     # Num pids along M dim
     tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
@@ -460,10 +455,10 @@ def tlx_addmm_glu_kernel_optimized_async(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # Base pointers for A along m dim
-    a_base_off = offs_m[:, None].to(tl.int64) * sa0
+    a_base_off = offs_m[:, None] * sa0
 
     # Base pointers for B along n dim
-    b_base_off = offs_n[None, :].to(tl.int64) * sb1
+    b_base_off = offs_n[None, :] * sb1
 
     # How many times we need to iterate through blocks of size BLOCK_SIZE_K
     k_iters = tl.cdiv(K, BLOCK_SIZE_K)
@@ -529,7 +524,7 @@ def tlx_addmm_glu_kernel_optimized_async(
     # Async-prefetch Y into a padded LDS buffer
     y_layout: tl.constexpr = _y_padded_layout(BLOCK_SIZE_M, BLOCK_SIZE_N, Y_PAD)
     smemY = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tlx.dtype_of(y_ptr), 1, layout=y_layout)
-    y_ptrs = y_ptr + offs_m[:, None].to(tl.int64) * sy0 + offs_n[None, :].to(tl.int64) * sy1
+    y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
     y_tok = tlx.async_load(y_ptrs, tlx.local_view(smemY, 0))
     tlx.async_load_commit_group([y_tok])
 
@@ -558,7 +553,7 @@ def tlx_addmm_glu_kernel_optimized_async(
     out = x + x * y_regs
 
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c_ptrs = c_ptr + offs_cm[:, None].to(tl.int64) * sc0 + offs_cn[None, :].to(tl.int64) * sc1
+    c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
 
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
 
@@ -643,7 +638,6 @@ def tlx_addmm_glu_kernel_simple_async(
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(axis=0)
-    tl.assume(pid >= 0)
     tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
@@ -675,12 +669,12 @@ def tlx_addmm_glu_kernel_simple_async(
     # Async-prefetch Y into a padded LDS buffer before the K-loop
     y_layout: tl.constexpr = _y_padded_layout(BLOCK_SIZE_M, BLOCK_SIZE_N, Y_PAD)
     smemY = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tlx.dtype_of(y_ptr), 1, layout=y_layout)
-    y_ptrs = y_ptr + offs_m[:, None].to(tl.int64) * sy0 + offs_n[None, :].to(tl.int64) * sy1
+    y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
     y_tok = tlx.async_load(y_ptrs, tlx.local_view(smemY, 0))
     tlx.async_load_commit_group([y_tok])
 
-    a_ptrs = a_ptr + offs_m[:, None].to(tl.int64) * sa0 + offs_k[None, :] * sa1
-    b_ptrs = b_ptr + offs_k[:, None] * sb0 + offs_n[None, :].to(tl.int64) * sb1
+    a_ptrs = a_ptr + offs_m[:, None] * sa0 + offs_k[None, :] * sa1
+    b_ptrs = b_ptr + offs_k[:, None] * sb0 + offs_n[None, :] * sb1
 
     # Plain unpipelined K-loop: grab A and B for this iteration, dot, advance
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -702,7 +696,7 @@ def tlx_addmm_glu_kernel_simple_async(
     out = x + x * y_regs
 
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c_ptrs = c_ptr + offs_cm[:, None].to(tl.int64) * sc0 + offs_cn[None, :].to(tl.int64) * sc1
+    c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
 
 
@@ -748,7 +742,6 @@ def tlx_addmm_glu_kernel_persistent(
     # Launcher skips empty matrices; bounds preserve padded tile coordinates.
     tl.assume((M > 0) & (N > 0))
     start_pid = tl.program_id(axis=0)
-    tl.assume(start_pid >= 0)
 
     tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -793,8 +786,8 @@ def tlx_addmm_glu_kernel_persistent(
         offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
 
-        a_base_off = offs_m[:, None].to(tl.int64) * sa0
-        b_base_off = offs_n[None, :].to(tl.int64) * sb1
+        a_base_off = offs_m[:, None] * sa0
+        b_base_off = offs_n[None, :] * sb1
 
         k_iters = tl.cdiv(K, BLOCK_SIZE_K)
 
@@ -856,7 +849,7 @@ def tlx_addmm_glu_kernel_persistent(
             wait_tok = tlx.async_load_wait_group(1)
 
         # Register-resident Y prefetch before the drain dots (overlaps its HBM latency)
-        y_ptrs = y_ptr + offs_m[:, None].to(tl.int64) * sy0 + offs_n[None, :].to(tl.int64) * sy1
+        y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
         y_regs = tl.load(y_ptrs, cache_modifier=".cs")
 
         # Epilogue: drain remaining in-flight tiles
@@ -877,7 +870,7 @@ def tlx_addmm_glu_kernel_persistent(
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        c_ptrs = c_ptr + offs_cm[:, None].to(tl.int64) * sc0 + offs_cn[None, :].to(tl.int64) * sc1
+        c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
         tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
 
 

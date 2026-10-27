@@ -62,105 +62,104 @@ def matmul_kernel_warp_pipeline(
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
 
-    if (M > 0) & (N > 0):
-        pid = tl.program_id(0)
-        tl.assume(pid >= 0)
-        tl.assume(M <= 2147483647 - (BLOCK_M - 1))
-        num_pid_m = tl.cdiv(M, BLOCK_M)
-        tl.assume(N <= 2147483647 - (BLOCK_N - 1))
-        num_pid_n = tl.cdiv(N, BLOCK_N)
-        grid_mn = num_pid_m * num_pid_n
-        tl.assume(grid_mn > 0)
-        if pid < grid_mn:
-            pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
-            tl.assume(pid >= 0)
+    tl.assume((M > 0) & (N > 0))
+    pid = tl.program_id(0)
+    tl.assume(M <= 2147483647 - (BLOCK_M - 1))
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    tl.assume(N <= 2147483647 - (BLOCK_N - 1))
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    grid_mn = num_pid_m * num_pid_n
+    tl.assume(grid_mn > 0)
+    tl.assume(pid < grid_mn)
+    pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
+    tl.assume(pid >= 0)
 
-            num_pid_in_group = GROUP_M * num_pid_n
-            tl.assume(num_pid_in_group > 0)
-            group_id = pid // num_pid_in_group
-            first_pid_m = group_id * GROUP_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-            tl.assume(group_size_m > 0)
-            pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-            pid_n = (pid % num_pid_in_group) // group_size_m
-            tl.assume(pid_m >= 0)
-            tl.assume(pid_n >= 0)
-            tl.assume(pid_m <= (M - 1) // BLOCK_M)
-            tl.assume(pid_n <= (N - 1) // BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    tl.assume(num_pid_in_group > 0)
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    tl.assume(group_size_m > 0)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_m <= (M - 1) // BLOCK_M)
+    tl.assume(pid_n <= (N - 1) // BLOCK_N)
 
-            # Precompute row/col offsets (these are per-thread, not carried in loop)
-            offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-            offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-            offs_k = tl.arange(0, BLOCK_K)
+    # Precompute row/col offsets (these are per-thread, not carried in loop)
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
 
-            # Base offsets — recompute full pointer from tile_id * BLOCK_K
-            a_base_off = offs_m[:, None].to(tl.int64) * stride_am
-            b_base_off = offs_n[None, :].to(tl.int64) * stride_bn
+    # Base offsets — recompute full pointer from tile_id * BLOCK_K
+    a_base_off = offs_m[:, None] * stride_am
+    b_base_off = offs_n[None, :] * stride_bn
 
-            K_ITERS = tl.cdiv(K, BLOCK_K)
+    K_ITERS = tl.cdiv(K, BLOCK_K)
 
-            smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
-            smemB = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
+    smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
+    smemB = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
 
-            # Prologue: async-copy NUM_BUFFERS tiles
-            for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
-                k_start = i * BLOCK_K
-                a_offs = a_base_off + (k_start + offs_k[None, :]) * stride_ak
-                b_offs = (k_start + offs_k[:, None]) * stride_bk + b_base_off
-                tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, i), mask=offs_k[None, :] < K - k_start)
-                tlx.async_load_commit_group([tok_a])
-                tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, i), mask=offs_k[:, None] < K - k_start)
-                tlx.async_load_commit_group([tok_b])
+    # Prologue: async-copy NUM_BUFFERS tiles
+    for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
+        k_start = i * BLOCK_K
+        a_offs = a_base_off + (k_start + offs_k[None, :]) * stride_ak
+        b_offs = (k_start + offs_k[:, None]) * stride_bk + b_base_off
+        tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, i), mask=offs_k[None, :] < K - k_start)
+        tlx.async_load_commit_group([tok_a])
+        tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, i), mask=offs_k[:, None] < K - k_start)
+        tlx.async_load_commit_group([tok_b])
 
-            # Wait for buffer 0
-            tlx.async_load_wait_group((NUM_BUFFERS - 1) * 2)
-            a_tile = tlx.local_load(tlx.local_view(smemA, 0))
-            b_tile = tlx.local_load(tlx.local_view(smemB, 0))
+    # Wait for buffer 0
+    tlx.async_load_wait_group((NUM_BUFFERS - 1) * 2)
+    a_tile = tlx.local_load(tlx.local_view(smemA, 0))
+    b_tile = tlx.local_load(tlx.local_view(smemB, 0))
 
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-            # Main loop: only 3 iter_args (acc, a_tile, b_tile)
-            # Offsets computed from tile_id — no pointer iter_args
-            for tile_id in tl.range(0, K_ITERS - NUM_BUFFERS):
-                prefetch_buf = tile_id % NUM_BUFFERS
-                next_buf = (tile_id + 1) % NUM_BUFFERS
-                k_prefetch = (tile_id + NUM_BUFFERS) * BLOCK_K
+    # Main loop: only 3 iter_args (acc, a_tile, b_tile)
+    # Offsets computed from tile_id — no pointer iter_args
+    for tile_id in tl.range(0, K_ITERS - NUM_BUFFERS):
+        prefetch_buf = tile_id % NUM_BUFFERS
+        next_buf = (tile_id + 1) % NUM_BUFFERS
+        k_prefetch = (tile_id + NUM_BUFFERS) * BLOCK_K
 
-                with tlx.warp_pipeline_stage("mfma", priority=0):
-                    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
-
-                # Drain the buffer we are about to local_load (its A+B commits). With the
-                # wait placed before the prefetch commits, the oldest pending groups are
-                # next_buf's, so we must keep only (NUM_BUFFERS-2) buffers in flight.
-                tlx.async_load_wait_group((NUM_BUFFERS - 2) * 2)
-
-                with tlx.warp_pipeline_stage("mem", priority=1):
-                    a_offs = a_base_off + (k_prefetch + offs_k[None, :]) * stride_ak
-                    b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
-                    tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, prefetch_buf), mask=offs_k[None, :]
-                                           < K - k_prefetch)
-                    tlx.async_load_commit_group([tok_a])
-                    tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, prefetch_buf), mask=offs_k[:, None]
-                                           < K - k_prefetch)
-                    tlx.async_load_commit_group([tok_b])
-                    a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
-                    b_tile = tlx.local_load(tlx.local_view(smemB, next_buf))
-
-            # Epilogue
+        with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
-            tlx.async_load_wait_group(0)
-            for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
-                buf = (K_ITERS - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS
-                a_tile = tlx.local_load(tlx.local_view(smemA, buf))
-                b_tile = tlx.local_load(tlx.local_view(smemB, buf))
-                acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-            c = acc.to(tlx.dtype_of(c_ptr))
-            offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-            c_ptrs = c_ptr + stride_cm * offs_cm[:, None].to(tl.int64) + stride_cn * offs_cn[None, :].to(tl.int64)
-            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-            tl.store(c_ptrs, c, mask=c_mask)
+        # Drain the buffer we are about to local_load (its A+B commits). With the
+        # wait placed before the prefetch commits, the oldest pending groups are
+        # next_buf's, so we must keep only (NUM_BUFFERS-2) buffers in flight.
+        tlx.async_load_wait_group((NUM_BUFFERS - 2) * 2)
+
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_offs = a_base_off + (k_prefetch + offs_k[None, :]) * stride_ak
+            b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
+            tok_a = tlx.async_load(a_ptr + a_offs, tlx.local_view(smemA, prefetch_buf), mask=offs_k[None, :]
+                                   < K - k_prefetch)
+            tlx.async_load_commit_group([tok_a])
+            tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, prefetch_buf), mask=offs_k[:, None]
+                                   < K - k_prefetch)
+            tlx.async_load_commit_group([tok_b])
+            a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
+            b_tile = tlx.local_load(tlx.local_view(smemB, next_buf))
+
+    # Epilogue
+    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+    tlx.async_load_wait_group(0)
+    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+        buf = (K_ITERS - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS
+        a_tile = tlx.local_load(tlx.local_view(smemA, buf))
+        b_tile = tlx.local_load(tlx.local_view(smemB, buf))
+        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+
+    c = acc.to(tlx.dtype_of(c_ptr))
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor, config=None) -> torch.Tensor:

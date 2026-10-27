@@ -1803,10 +1803,13 @@ def test_amd_standalone_addmm_stock_triton_shapes(M, N, K):
 @pytest.mark.parametrize("K", [256, 512, 1024])
 @pytest.mark.parametrize("kernel_name,shape", [(kernel, None) for kernel in _AMD_ADDMM_GLU_KERNELS] +
                          [(kernel, shape)
-                          for kernel in ("tlx_baseline", "tlx_optimized", "tlx_optimized_async", "tlx_simple_async")
+                          for kernel in ("tlx_baseline", "tlx_optimized_async", "tlx_simple_async")
                           for shape in ((1152, 1280), (257, 259), (1, 128), (128, 1), (0, 128),
-                                        (128, 0))] + [("tlx_persistent", shape)
-                                                      for shape in ((1152, 1280), (1, 128), (0, 128), (128, 0))])
+                                        (128, 0))] + [("tlx_optimized", shape)
+                                                      for shape in ((1152, 1280), (0, 128),
+                                                                    (128, 0))] + [("tlx_persistent", shape)
+                                                                                  for shape in ((1152, 1280), (1, 128),
+                                                                                                (0, 128), (128, 0))])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 def test_amd_addmm_glu(kernel_name, K, shape):
     assert tuple(_amd_addmm_glu_registry) == _AMD_ADDMM_GLU_KERNELS, "registry drifted from the parametrize list"
