@@ -747,10 +747,10 @@ private:
 
   int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                           int dim) override {
-    int64_t contiguity = getContiguity(op, lhs, rhs, dim);
-    int64_t divisibility =
-        gcd(lhs.getDivisibility(dim), rhs.getDivisibility(dim));
-    // Splitting an input group creates bases at result-contiguity offsets.
+    auto contiguity = getContiguity(op, lhs, rhs, dim);
+    auto divisibility = gcd(lhs.getDivisibility(dim), rhs.getDivisibility(dim));
+    // New group bases inside an operand's contiguous group have offsets that
+    // are multiples of the result contiguity.
     if (lhs.getContiguity(dim) > contiguity ||
         rhs.getContiguity(dim) > contiguity)
       divisibility = gcd(divisibility, contiguity);

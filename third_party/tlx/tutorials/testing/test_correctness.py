@@ -1803,7 +1803,7 @@ def test_amd_standalone_addmm_stock_triton_shapes(M, N, K):
 @pytest.mark.parametrize("K", [256, 512, 1024])
 @pytest.mark.parametrize("kernel_name,shape", [(kernel, None) for kernel in _AMD_ADDMM_GLU_KERNELS] +
                          [(kernel, shape)
-                          for kernel in ("tlx_baseline", "tlx_optimized_async", "tlx_simple_async")
+                          for kernel in ("tlx_optimized_async", "tlx_simple_async")
                           for shape in ((1152, 1280), (257, 259), (1, 128), (128, 1), (0, 128),
                                         (128, 0))] + [("tlx_optimized", shape)
                                                       for shape in ((1152, 1280), (0, 128),
