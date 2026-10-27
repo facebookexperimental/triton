@@ -19,43 +19,6 @@ from triton.language.extra.tlx.tutorials import amd_addmm_glu, amd_gemm_warp_pip
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("bits", [16, 32])
-@pytest.mark.parametrize("iterations", [0, 3])
-@pytest.mark.parametrize("negative", [False, True])
-@pytest.mark.parametrize("shared_mask", [False, True])
-def test_buffer_loop_offset_wrapping(bits, iterations, negative, shared_mask):
-
-    @triton.jit
-    def kernel(X, Y, base, start, count, BITS: tl.constexpr, SHARED_MASK: tl.constexpr):
-        lane = tl.arange(0, 64) - 32
-        acc = tl.full((64, ), 0, tl.int32)
-        for i in range(count):
-            dynamic = start + i * 32
-            if BITS == 16:
-                term = (dynamic.to(tl.int16) + lane.to(tl.int16)).to(tl.int16)
-            else:
-                term = dynamic + lane
-            offset = (base.to(tl.int64) + term.to(tl.int64)).to(tl.int32)
-            mask = offset < 65536 if SHARED_MASK else tl.full((64, ), True, tl.int1)
-            acc += tlx.buffer_load(X, offset, mask, other=0)
-        tl.store(Y + tl.arange(0, 64), acc)
-
-    start = -(1 << (bits - 1)) if negative else (1 << (bits - 1)) - 16
-    base = -start + 65536 + (1 << 32)
-    x = torch.arange(131072, device=DEVICE, dtype=torch.int32)
-    y = torch.empty((64, ), device=DEVICE, dtype=torch.int32)
-    kernel[(1, )](x, y, base, start, iterations, bits, shared_mask, num_warps=1)
-    lanes = torch.arange(64, device=DEVICE, dtype=torch.int64) - 32
-    expected = torch.zeros_like(y)
-    for i in range(iterations):
-        term = (start + i * 32 + lanes + (1 << (bits - 1))) % (1 << bits) - (1 << (bits - 1))
-        offset = (base + term).to(torch.int32).to(torch.int64)
-        valid = offset < 65536 if shared_mask else torch.ones_like(offset, dtype=torch.bool)
-        expected += torch.where(valid, x[offset.clamp(0, x.numel() - 1)], 0)
-    torch.testing.assert_close(y, expected, atol=0, rtol=0)
-
-
 @pytest.fixture(scope="module")
 def split_k_tutorial():
     path = Path(__file__).resolve().parents[3] / "tutorials" / "12-split-k-matmul.py"
@@ -116,85 +79,6 @@ def test_grouped_gemm_ignores_outside_tiles(m, n):
                                                matrix_instr_nonkdim=16)
     expected = a @ b if m > 0 and n > 0 else torch.zeros_like(output)
     torch.testing.assert_close(output, expected, atol=0.015, rtol=0.015)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("operand", ["a", "b"])
-@pytest.mark.parametrize("family", [
-    "warp",
-    "stock_triton_matmul",
-    "skinny_atomic_matmul",
-    "skinny_twopass_matmul",
-    "tlx_optimized",
-    "tlx_optimized_async",
-    "tlx_simple_async",
-    "tlx_persistent",
-])
-def test_grouped_coordinates_large_strides(split_k_tutorial, family, operand):
-    a_values = torch.randn((3, 256), device=DEVICE, dtype=torch.float16) * 0.2
-    b_values = torch.randn((256, 3), device=DEVICE, dtype=torch.float16) * 0.2
-    # Third row/column crosses 2**31 elements with an i32 stride argument.
-    if operand == "a":
-        a = torch.empty_strided(a_values.shape, (1 << 30, 1), device=DEVICE, dtype=torch.float16)
-        a.copy_(a_values)
-        b = b_values
-    else:
-        a = a_values
-        b = torch.empty_strided(b_values.shape, (1, 1 << 30), device=DEVICE, dtype=torch.float16)
-        b.copy_(b_values)
-    reference = a_values @ b_values
-    if family == "warp":
-        output = torch.empty((3, 3), device=DEVICE, dtype=torch.float16)
-        compiled = matmul_kernel_warp_pipeline[(1, )](a, b, output, 3, 3, 256, a.stride(0), a.stride(1), b.stride(0),
-                                                      b.stride(1), output.stride(0), output.stride(1), BLOCK_M=256,
-                                                      BLOCK_N=256, BLOCK_K=64, GROUP_M=4, NUM_BUFFERS=2, NUM_XCDS=3,
-                                                      XCD_CHUNK=5, num_warps=8, num_stages=1, matrix_instr_nonkdim=16)
-        assert not re.search(r"arith.remsi .* : tensor<[^>]*xi64>", compiled.asm["ttir"])
-    elif family.startswith("tlx_"):
-        bias = torch.randn((3, ), device=DEVICE, dtype=torch.float16) * 0.2
-        y = torch.randn((3, 3), device=DEVICE, dtype=torch.float16) * 0.2
-        output = torch.empty((3, 3), device=DEVICE, dtype=torch.float16)
-        config = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=32, GROUP_SIZE_M=4, XCD_CHUNK=4, num_warps=4,
-                      matrix_instr_nonkdim=16, waves_per_eu=0)
-        if family == "tlx_optimized_async":
-            config["NUM_BUFFERS"] = 4
-        runner = getattr(amd_addmm_glu, "run_kernel_" + family.removeprefix("tlx_"))
-        if family == "tlx_persistent":
-            runner(a, b, bias, y, output, config, 1)
-        else:
-            runner(a, b, bias, y, output, config)
-        reference = amd_addmm_glu.pytorch_baseline(bias, a_values, b_values, y)
-    else:
-        output = getattr(split_k_tutorial, family)(a, b)
-    torch.testing.assert_close(output, reference, atol=0.015, rtol=0.015)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("start,stride", [(0, 3), (2147483640, 3), (-2147483648, -1), (1073741824, 7)])
-def test_address_distribution_preserves_wrapping(start, stride):
-
-    @triton.jit(do_not_specialize=["start", "stride"])
-    def kernel(table, output, start, stride):
-        lane = tl.arange(0, 128)
-        acc = tl.full((128, ), 0, tl.int32)
-        for i in range(5):
-            product = ((start + i + lane) * stride).to(tl.int64)
-            index = (product.to(tl.uint64) // 3) % 2
-            acc += tl.load(table + index)
-        tl.store(output + lane, acc)
-
-    table = torch.tensor([17, 41], dtype=torch.int32, device=DEVICE)
-    output = torch.empty((128, ), dtype=torch.int32, device=DEVICE)
-    compiled = kernel[(1, )](table, output, start, stride)
-    expected = []
-    for lane in range(128):
-        total = 0
-        for i in range(5):
-            product = ((start + i + lane) * stride + 2**31) % 2**32 - 2**31
-            total += (17, 41)[(product % 2**64 // 3) % 2]
-        expected.append(total)
-    torch.testing.assert_close(output, torch.tensor(expected, dtype=torch.int32, device=DEVICE), rtol=0, atol=0)
-    assert re.search(r"arith.muli .* : i32", compiled.asm["ttgir"])
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")

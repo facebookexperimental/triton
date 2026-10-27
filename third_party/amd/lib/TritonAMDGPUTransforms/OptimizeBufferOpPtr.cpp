@@ -1,6 +1,4 @@
 #include "TritonAMDGPUTransforms/Passes.h"
-#include "Utility.h"
-#include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -32,139 +30,9 @@ namespace amdttg = mlir::triton::amdgpu;
 namespace mlir {
 
 #define GEN_PASS_DEF_TRITONAMDGPUOPTIMIZEBUFFEROPPTR
-#define GEN_PASS_DEF_TRITONAMDGPUREGROUPBUFFEROFFSETS
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
 namespace {
-struct OffsetTerm {
-  SmallVector<Operation *> shapes;
-  Value value;
-};
-
-struct OffsetStructure {
-  unsigned invariantGroups;
-  bool varies;
-};
-
-// Plan first: unsuccessful regrouping must not change the offset DAG.
-static std::optional<OffsetStructure>
-collectOffsetTerms(Value value, scf::ForOp loop,
-                   SmallVectorImpl<OffsetTerm> &terms,
-                   SmallVector<Operation *> &shapes, unsigned &remaining) {
-  // Bound repeated DAG expansion, including shared subexpressions.
-  if (!remaining)
-    return std::nullopt;
-  --remaining;
-  Operation *op = value.getDefiningOp();
-  // Shared intermediates stay live; splitting them duplicates loop work.
-  if (!loop.isDefinedOutsideOfLoop(value) && op && value.hasOneUse()) {
-    if (auto add = dyn_cast<arith::AddIOp>(op)) {
-      auto lhs =
-          collectOffsetTerms(add.getLhs(), loop, terms, shapes, remaining);
-      auto rhs =
-          collectOffsetTerms(add.getRhs(), loop, terms, shapes, remaining);
-      if (!lhs || !rhs)
-        return std::nullopt;
-      bool varies = lhs->varies || rhs->varies;
-      // An invariant subtree is already grouped; LICM owns its placement.
-      return OffsetStructure{
-          varies ? lhs->invariantGroups + rhs->invariantGroups : 1, varies};
-    }
-    if (isa<arith::TruncIOp, arith::ExtSIOp, arith::ExtUIOp>(op) &&
-        getElementTypeOrSelf(op->getOperand(0).getType())
-                .getIntOrFloatBitWidth() >= 32)
-      return collectOffsetTerms(op->getOperand(0), loop, terms, shapes,
-                                remaining);
-    if (isa<tt::BroadcastOp, tt::ExpandDimsOp, tt::SplatOp>(op)) {
-      shapes.push_back(op);
-      auto collected =
-          collectOffsetTerms(op->getOperand(0), loop, terms, shapes, remaining);
-      shapes.pop_back();
-      return collected;
-    }
-  }
-  terms.push_back({shapes, value});
-  bool varies = !loop.isDefinedOutsideOfLoop(value);
-  return OffsetStructure{varies ? 0u : 1u, varies};
-}
-
-static Type offsetType(Type type, Builder &builder) {
-  if (auto tensor = dyn_cast<RankedTensorType>(type))
-    return tensor.clone(builder.getI32Type());
-  return builder.getI32Type();
-}
-
-static Value materializeOffsetTerm(const OffsetTerm &term, IRRewriter &rewriter,
-                                   Location loc) {
-  Value value = term.value;
-  Type type = offsetType(value.getType(), rewriter);
-  if (value.getType() != type)
-    value = arith::TruncIOp::create(rewriter, loc, type, value);
-  for (Operation *shape : llvm::reverse(term.shapes)) {
-    Type resultType = offsetType(shape->getResult(0).getType(), rewriter);
-    if (isa<tt::SplatOp>(shape))
-      value = tt::SplatOp::create(rewriter, loc, resultType, value);
-    else if (isa<tt::BroadcastOp>(shape))
-      value = tt::BroadcastOp::create(rewriter, loc, resultType, value);
-    else
-      value = tt::ExpandDimsOp::create(rewriter, loc, resultType, value,
-                                       cast<tt::ExpandDimsOp>(shape).getAxis());
-  }
-  return value;
-}
-
-static void regroupLoopOffsets(FuncOp func) {
-  IRRewriter rewriter(func.getContext());
-  Liveness liveness(func);
-  DenseMap<Operation *, unsigned> pressure;
-  unsigned budget = 256;
-  if (auto limit =
-          func->getParentOfType<ModuleOp>()->getAttrOfType<IntegerAttr>(
-              ttg::AttrMaxRegistersName))
-    budget = std::min(budget, static_cast<unsigned>(limit.getInt()));
-  func.walk([&](amdttg::BufferOpInterface op) {
-    auto loop = op->getParentOfType<scf::ForOp>();
-    if (!loop)
-      return;
-    Value offset = op.getOffsets();
-    if (!getElementTypeOrSelf(offset.getType()).isInteger(32))
-      return;
-    SmallVector<OffsetTerm> terms;
-    SmallVector<Operation *> shapes;
-    unsigned remaining = 64;
-    auto structure = collectOffsetTerms(offset, loop, terms, shapes, remaining);
-    if (!structure || !structure->varies || structure->invariantGroups < 2)
-      return;
-    auto [entry, inserted] = pressure.try_emplace(loop, 0);
-    if (inserted)
-      entry->second = estimateLoopRegisterPressure(loop, liveness, op);
-    unsigned extra = estimateTensorRegisters(offset);
-    if (entry->second + extra >= budget)
-      return;
-    entry->second += extra;
-
-    // Group the base with lane terms; separate products invite LLVM factoring.
-    Location loc = op.getLoc();
-    rewriter.setInsertionPoint(loop);
-    Value invariant;
-    for (const OffsetTerm &term : terms) {
-      if (!loop.isDefinedOutsideOfLoop(term.value))
-        continue;
-      Value value = materializeOffsetTerm(term, rewriter, loc);
-      invariant = invariant
-                      ? arith::AddIOp::create(rewriter, loc, invariant, value)
-                      : value;
-    }
-    rewriter.setInsertionPoint(op);
-    Value result = invariant;
-    for (const OffsetTerm &term : terms)
-      if (!loop.isDefinedOutsideOfLoop(term.value))
-        result = arith::AddIOp::create(
-            rewriter, loc, result, materializeOffsetTerm(term, rewriter, loc));
-    op.getOffsetsMutable().assign(result);
-  });
-}
-
 // /*-----------------Base pointer increment optimization-------------------*/
 
 // Optimization tries to transfer increments from offsets to base pointer in
@@ -691,12 +559,6 @@ struct TritonAMDGPUOptimizeBufferOpPtrPass
     patterns.add<AdvanceBasePointer>(context, solver.get(), /*benefit=*/1);
     walkAndApplyPatterns(funcOp, std::move(patterns));
   }
-};
-
-struct TritonAMDGPURegroupBufferOffsetsPass
-    : impl::TritonAMDGPURegroupBufferOffsetsBase<
-          TritonAMDGPURegroupBufferOffsetsPass> {
-  void runOnOperation() override { regroupLoopOffsets(getOperation()); }
 };
 
 } // namespace mlir

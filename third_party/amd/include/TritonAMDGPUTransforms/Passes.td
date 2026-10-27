@@ -204,17 +204,6 @@ def TritonAMDGPUOptimizeBufferOpPtr
   let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
-def TritonAMDGPURegroupBufferOffsets
-    : Pass<"tritonamdgpu-regroup-buffer-offsets", "mlir::triton::FuncOp"> {
-  let summary = "Group loop-invariant terms in wrapping buffer offsets";
-  let description = [{
-    Combine invariant terms in the 32-bit buffer-offset ring. Preserve narrower
-    extension boundaries and shared intermediates. Limit hoisting with the loop
-    register-pressure estimate. Run after CSE exposes invariant base expressions.
-  }];
-  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::triton::TritonDialect"];
-}
-
 def TritonAMDGPUBlockPingpong
     : Pass<"tritonamdgpu-block-pingpong", "mlir::ModuleOp"> {
   let summary = "Interleaving instructions from two warps on the same SIMD to "
