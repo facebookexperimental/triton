@@ -769,36 +769,50 @@ def kimi_delta_attention(q, k, v, g, beta, *, scale=1.0, cu_seqlens=None, cu_seq
     return fn(q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, space=space_name)
 
 
-def kda_paged_prefill(q, k, v, g, beta, *, scale=1.0, initial_state, cu_seqlens, space=None):
-    """Prepared-input chunked KDA prefill for packed `[1, T, H, 128]` tensors.
+def kda_paged_prefill(q, k, v, g, beta, *, scale=1.0, initial_state=None, cu_seqlens, A_log=None, dt_bias=None,
+                      lower_bound=None, beta_is_raw=False, state_pool=None, state_indices=None, space=None):
+    """Chunked KDA prefill for packed `[1, T, H, 128]` tensors.
 
-    `g` contains per-channel log decays and `beta` is sigmoid-applied.
-    State is FP32 and V-major: `[N, H, 128, 128]`. This op is currently
-    forward-only. ``space=`` takes no search space today; a ``Space`` is
-    accepted only to carry a ``BitwiseInvarianceSpec``, which is validated
-    but not enforced yet.
+    By default `g` contains per-channel log decays, `q`/`k` are l2-normalized
+    and `beta` is sigmoid-applied. Passing `A_log` and `dt_bias` takes raw
+    inputs instead: `q`/`k` are normalized in the kernel and `g` is the gate
+    pre-activation, mapped to `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`,
+    or to `-exp(A_log) * softplus(g + dt_bias)` without a lower bound.
+    `beta_is_raw` applies the sigmoid to `beta`.
+
+    State is FP32 and V-major: a dense `initial_state` `[N, H, 128, 128]`, or a
+    `state_pool` `[slots, H, 128, 128]` with `state_indices` `[N]` naming each
+    sequence's slot, updated in place. This op is currently forward-only.
+    ``space=`` takes no search space today; a ``Space`` is accepted only to
+    carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
     """
     space_name, invariance = _normalize_space_arg("kda_paged_prefill", space)
     _check_single_config_space("kda_paged_prefill", space_name)
     fn, spec = impl_for("kda_paged_prefill", device=q.device)
     check_inputs(spec, dtype=q.dtype, KEY_DIM=q.shape[-1], VALUE_DIM=v.shape[-1])
-    check_backward(spec, q, k, v, g, beta, initial_state)
+    check_backward(spec, q, k, v, g, beta, initial_state, state_pool, A_log, dt_bias)
     _check_enforced("kda_paged_prefill", spec, invariance)
-    return fn(q, k, v, g, beta, scale=scale, initial_state=initial_state, cu_seqlens=cu_seqlens)
+    return fn(q, k, v, g, beta, scale=scale, initial_state=initial_state, cu_seqlens=cu_seqlens, A_log=A_log,
+              dt_bias=dt_bias, lower_bound=lower_bound, beta_is_raw=beta_is_raw, state_pool=state_pool,
+              state_indices=state_indices)
 
 
 def kda_recurrent_decode(q, k, v, g, beta, *, scale=1.0, state_pool, read_indices, write_indices, cu_seqlens,
-                         space=None):
+                         A_log=None, dt_bias=None, lower_bound=None, beta_is_raw=False, space=None):
     """Forward-only indexed KDA recurrence over an FP32 V-major state pool.
 
-    ``space=`` takes no search space today; a ``Space`` is accepted only to
-    carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
+    Inputs are prepared (l2-normalized q/k, log decay g, activated beta) unless
+    `A_log` and `dt_bias` are passed, in which case they are raw, as for
+    `kda_paged_prefill`. ``space=`` takes no search space today; a ``Space`` is
+    accepted only to carry a ``BitwiseInvarianceSpec``, which is validated but
+    not enforced yet.
     """
     space_name, invariance = _normalize_space_arg("kda_recurrent_decode", space)
     _check_single_config_space("kda_recurrent_decode", space_name)
     fn, spec = impl_for("kda_recurrent_decode", device=q.device)
     check_inputs(spec, dtype=q.dtype, KEY_DIM=q.shape[-1], VALUE_DIM=v.shape[-1])
-    check_backward(spec, q, k, v, g, beta, state_pool)
+    check_backward(spec, q, k, v, g, beta, state_pool, A_log, dt_bias)
     _check_enforced("kda_recurrent_decode", spec, invariance)
     return fn(q, k, v, g, beta, scale=scale, state_pool=state_pool, read_indices=read_indices,
-              write_indices=write_indices, cu_seqlens=cu_seqlens)
+              write_indices=write_indices, cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias, lower_bound=lower_bound,
+              beta_is_raw=beta_is_raw)
