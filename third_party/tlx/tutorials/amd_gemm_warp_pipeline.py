@@ -20,20 +20,6 @@ NUM_XCDS = 8
 XCD_CHUNK = 8
 
 
-def _checked_tile_count(m, n, block_m, block_n, group_m, step=0):
-    if min(m, n) < 0 or min(block_m, block_n, group_m) <= 0:
-        raise ValueError("Dimensions must be nonnegative; tile and group sizes must be positive")
-    if m == 0 or n == 0:
-        return 0
-    limit = 2**31 - 1
-    if m > limit - (block_m - 1) or n > limit - (block_n - 1):
-        raise ValueError("Ceiling-division sum exceeds signed 32-bit range")
-    tiles_m, tiles_n = triton.cdiv(m, block_m), triton.cdiv(n, block_n)
-    if tiles_m * tiles_n > limit - step or group_m * tiles_n > limit:
-        raise ValueError("Tile grid or group exceeds signed 32-bit range")
-    return tiles_m * tiles_n
-
-
 @triton.jit
 def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk_size: tl.constexpr):
     """Group adjacent PIDs onto the same XCD in chunks of chunk_size for L2 reuse.
@@ -83,8 +69,6 @@ def matmul_kernel_warp_pipeline(
         num_pid_m = tl.cdiv(M, BLOCK_M)
         tl.assume(N <= 2147483647 - (BLOCK_N - 1))
         num_pid_n = tl.cdiv(N, BLOCK_N)
-        tl.assume(num_pid_m <= 2147483647 // num_pid_n)
-        tl.assume(num_pid_n <= 2147483647 // GROUP_M)
         grid_mn = num_pid_m * num_pid_n
         tl.assume(grid_mn > 0)
         if pid < grid_mn:
@@ -208,8 +192,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, config=None) -> torch.Tensor:
     assert M % BLOCK_M == 0 and N % BLOCK_N == 0 and K % BLOCK_K == 0, \
         "M, N, K must be multiples of their block sizes"
 
-    grid = (_checked_tile_count(M, N, BLOCK_M, BLOCK_N, GROUP_M), )
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
     matmul_kernel_warp_pipeline[grid](
         a,
         b,
