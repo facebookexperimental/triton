@@ -1,6 +1,7 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm, amd, tlx
 from triton import knobs
+from triton._instrumentation import instrument as _instrument, is_enabled
 from dataclasses import dataclass
 import ctypes
 from typing import Any, Dict, Tuple
@@ -155,7 +156,7 @@ def assemble_amdgcn(assembly: str, processor: str, features: str) -> bytes:
     status = library.triton_amdgpu_assemble(
         source,
         len(source),
-        amd.TARGET_TRIPLE.encode("utf-8"),
+        amd.get_target_triple(processor).encode("utf-8"),
         processor.encode("utf-8"),
         features.encode("utf-8"),
         ctypes.byref(object_file),
@@ -172,6 +173,9 @@ def assemble_amdgcn(assembly: str, processor: str, features: str) -> bytes:
         return ctypes.string_at(object_file, object_size.value)
     finally:
         library.triton_amdgpu_free(object_file)
+
+
+instrument = functools.partial(_instrument, backend="amd")
 
 
 def get_min_dot_size(target: GPUTarget):
@@ -382,7 +386,6 @@ class HIPOptions:
 
 
 class HIPBackend(BaseBackend):
-    instrumentation = None
     supports_native_tensor_specialization = False
 
     @staticmethod
@@ -406,7 +409,7 @@ class HIPBackend(BaseBackend):
 
     def parse_options(self, opts) -> Any:
         # Keep device-side ConSan assertions through LLVM optimization.
-        if "consan" in opts.get("instrumentation_mode", ""):
+        if is_enabled(opts, "consan"):
             opts["debug"] = True
             opts["sanitize_overflow"] = False
 
@@ -519,8 +522,7 @@ class HIPBackend(BaseBackend):
         # TLX frontends can emit tlx.* view/alias ops while still targeting the
         # AMD backend, so register TLX IR before parsing user kernels.
         tlx.load_dialects(ctx)
-        if HIPBackend.instrumentation:
-            HIPBackend.instrumentation.load_dialects(ctx)
+        instrument(ctx, point="load-dialects")
 
     # is_within_2gb() needs to check for a torch subobject and this var tracks torch
     # availability state: None - not tested, True - torch is present. Anything else -
@@ -725,7 +727,7 @@ class HIPBackend(BaseBackend):
                 options.sched_group_barrier_mfma_per_dwordx4,
                 options.sched_group_barrier_required_region_count,
             )
-        if options.instrumentation_mode == "fpsan":
+        if is_enabled(options, "fpsan"):
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
@@ -742,6 +744,7 @@ class HIPBackend(BaseBackend):
         pm.enable_debug()
 
         passes.gluon.add_inliner(pm)
+        passes.gluon.add_infer_coalesced_encodings(pm)
         passes.gluon.add_resolve_auto_encodings(pm)
         passes.common.add_sccp(pm)
         passes.ttir.add_loop_aware_cse(pm)
@@ -749,10 +752,12 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_loop_unroll(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         amd.passes.ttgpuir.add_normalize_warp_pipeline(pm)
+        if is_enabled(options, "fpsan"):
+            passes.common.add_symbol_dce(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
 
-        if options.instrumentation_mode == "fpsan":
+        if is_enabled(options, "fpsan"):
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
 
@@ -783,17 +788,19 @@ class HIPBackend(BaseBackend):
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
-        if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
+
+        # Reserve LDS space for ConSan captures before allocation computes offsets.
+        if is_enabled(options, "consan") and is_consan_supported(options.arch):
             passes.ttgpuir.add_prepare_consan_captures(pm, "amd")
         amd.passes.ttgpuir.add_allocate_shared_memory(pm, options.arch)
-        if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
+        # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after shared
+        if is_enabled(options, "consan") and is_consan_supported(options.arch):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
             passes.gluon.add_canonicalizer(pm)
             passes.common.add_cse(pm)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
-        # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
-        if HIPBackend.instrumentation:
-            HIPBackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
+        # Instrumentation point here so an extension can override IRs above (e.g., ttir and ttgir).
+        instrument(pm, point="ttgpuir-to-llvmir", context=mod.context)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         ## __HIP_FTZ is used to control the denorm flushing behavior of exp2 op as follows:
         ## 1. If __HIP_FTZ = 1, exp2 flushes denorms in input and output regardless
@@ -820,8 +827,7 @@ class HIPBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
 
         # This can not be moved below the di_scope pass
-        if HIPBackend.instrumentation:
-            HIPBackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
+        instrument(pm, point="llvmir-to-llvm", context=mod.context)
 
         if (not knobs.compilation.disable_line_info and not knobs.compilation.dump_ir_extract_di_local_variables):
             passes.llvmir.add_di_scope(pm)
@@ -862,12 +868,12 @@ class HIPBackend(BaseBackend):
         llvm.init_targets()
         context = llvm.context()
         llvm_mod = llvm.to_module(mod, context)
-        amd.attach_target_triple(llvm_mod)
+        target_triple = amd.get_target_triple(options.arch)
+        amd.attach_target_triple(llvm_mod, options.arch)
         target_features = ""
         if knobs.compilation.enable_asan:
             target_features = '+xnack'
-        llvm.attach_datalayout(llvm_mod, amd.TARGET_TRIPLE, options.arch, target_features, get_llvm_flags(options.arch),
-                               "")
+        llvm.attach_datalayout(llvm_mod, target_triple, options.arch, target_features, get_llvm_flags(options.arch), "")
 
         # Set various control constants on the LLVM module so that device
         # libraries can resolve references to them.
@@ -997,8 +1003,7 @@ class HIPBackend(BaseBackend):
         features = get_amdgpu_codegen_features(options.arch, src, options.disable_packed_fp32_ops)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + "_" + ir_hash
-        # Beta bindings predate amd.get_target_triple; TARGET_TRIPLE is the same value.
-        target_triple = amd.TARGET_TRIPLE
+        target_triple = amd.get_target_triple(options.arch)
         if knobs.amd.dump_mir:
             _ = llvm.translate_to_mir(src, target_triple, options.arch, features, flags, options.enable_fp_fusion,
                                       dump_file_id)
