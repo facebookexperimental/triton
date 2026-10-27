@@ -14,7 +14,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
 from triton.tlx.ops.kernels.flash_attn.gfx950 import _sum_rows_chain4 as _cluster_sum_rows_chain4
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import matmul_kernel_warp_pipeline
-from triton.language.extra.tlx.tutorials import amd_addmm_glu
+from triton.language.extra.tlx.tutorials import amd_addmm_glu, amd_gemm_warp_pipeline
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -66,6 +66,29 @@ def split_k_tutorial():
         if isinstance(kernel, triton.runtime.Autotuner):
             kernel.configs = kernel.configs[:1]
     return tutorial
+
+
+@pytest.mark.parametrize("family", ["warp", "glu", "split"])
+@pytest.mark.parametrize("m,n,bm,bn,group,step,expected", [
+    (1, 1, 1, 1, 1, 0, 1),
+    (2147483520, 1, 128, 1, 1, 0, 16777215),
+    (1, 2147483520, 1, 128, 1, 0, 16777215),
+    (2147483647, 1, 1, 1, 1, 0, 2147483647),
+    (2147483646, 1, 1, 1, 1, 1, 2147483646),
+    (1, 1073741823, 1, 1, 2, 0, 1073741823),
+    (2147483521, 1, 128, 1, 1, 0, None),
+    (1, 2147483521, 1, 128, 1, 0, None),
+    (46341, 46341, 1, 1, 1, 0, None),
+    (1, 1073741824, 1, 1, 2, 0, None),
+    (2147483647, 1, 1, 1, 1, 1, None),
+])
+def test_grouped_coordinate_launch_bounds(split_k_tutorial, family, m, n, bm, bn, group, step, expected):
+    tutorial = {"warp": amd_gemm_warp_pipeline, "glu": amd_addmm_glu, "split": split_k_tutorial}[family]
+    if expected is None:
+        with pytest.raises(ValueError, match="signed 32-bit range"):
+            tutorial._checked_tile_count(m, n, bm, bn, group, step)
+    else:
+        assert tutorial._checked_tile_count(m, n, bm, bn, group, step) == expected
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")

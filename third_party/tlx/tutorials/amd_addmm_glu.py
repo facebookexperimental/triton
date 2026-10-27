@@ -89,6 +89,20 @@ SIMPLE_BEST_CONFIG = {
 
 
 # L2 swizzling
+def _checked_tile_count(m, n, block_m, block_n, group_m, step=0):
+    if min(m, n) < 0 or min(block_m, block_n, group_m) <= 0:
+        raise ValueError("Dimensions must be nonnegative; tile and group sizes must be positive")
+    if m == 0 or n == 0:
+        return 0
+    limit = 2**31 - 1
+    if m > limit - (block_m - 1) or n > limit - (block_n - 1):
+        raise ValueError("Ceiling-division sum exceeds signed 32-bit range")
+    tiles_m, tiles_n = triton.cdiv(m, block_m), triton.cdiv(n, block_n)
+    if tiles_m * tiles_n > limit - step or group_m * tiles_n > limit:
+        raise ValueError("Tile grid or group exceeds signed 32-bit range")
+    return tiles_m * tiles_n
+
+
 @triton.jit
 def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk_size: tl.constexpr):
     """Group adjacent PIDs onto the same XCD in chunks of chunk_size for L2 reuse.
@@ -150,14 +164,18 @@ def tlx_addmm_glu_kernel_optimized(
     tl.assume(pid >= 0)
 
     # Num pids along M dim
-    # Ceiling-division sums can exceed i32 for valid positive dimensions.
-    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_SIZE_M)
+    tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
 
     # Num pids along N dim
-    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_SIZE_N)
+    tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    tl.assume(num_pid_m <= 2147483647 // num_pid_n)
+    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
+    tl.assume(grid_mn > 0)
 
     # Remap pids via L2 swizzle
     tl.assume(pid < num_pid_m * num_pid_n)
@@ -166,6 +184,7 @@ def tlx_addmm_glu_kernel_optimized(
 
     # Num pids in the group (of shared rows along M dim pids)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tl.assume(num_pid_in_group > 0)
 
     # Which group we are in
     group_id = pid // num_pid_in_group
@@ -199,10 +218,10 @@ def tlx_addmm_glu_kernel_optimized(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # Base pointers for A along m dim
-    a_base_off = offs_m[:, None] * sa0
+    a_base_off = offs_m[:, None].to(tl.int64) * sa0
 
     # Base pointers for B along n dim
-    b_base_off = offs_n[None, :] * sb1
+    b_base_off = offs_n[None, :].to(tl.int64) * sb1
 
     # The number of buffers for this kernel is fixed to be 3 which allows
     # for the async_load_wait_group in the hotloop to not wait on the directly
@@ -292,7 +311,7 @@ def tlx_addmm_glu_kernel_optimized(
     # Prefetch Y from GMEM into registers. Issues the streaming Y load into VGPRs
     # here so its 44MB HBM read overlaps the drain MFMAs below and is only
     # consumed at the fma
-    y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
+    y_ptrs = y_ptr + offs_m[:, None].to(tl.int64) * sy0 + offs_n[None, :].to(tl.int64) * sy1
     y_regs = tl.load(y_ptrs, cache_modifier=".cs")
 
     # Epilogue: drain the remaining in-flight tiles
@@ -317,7 +336,7 @@ def tlx_addmm_glu_kernel_optimized(
 
     out = tl.fma(acc, y_regs.to(tl.float32), acc)
 
-    c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
+    c_ptrs = c_ptr + offs_cm[:, None].to(tl.int64) * sc0 + offs_cn[None, :].to(tl.int64) * sc1
 
     output_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=output_mask, cache_modifier=".cs")
@@ -328,7 +347,7 @@ def run_kernel_optimized(a, b, bias, y, out, cfg):
         return
     M, K = a.shape
     _, N = b.shape
-    grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
+    grid = (_checked_tile_count(M, N, cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["GROUP_SIZE_M"]), )
     return tlx_addmm_glu_kernel_optimized[grid](
         a,
         b,
@@ -404,14 +423,18 @@ def tlx_addmm_glu_kernel_optimized_async(
     tl.assume(pid >= 0)
 
     # Num pids along M dim
-    # Ceiling-division sums can exceed i32 for valid positive dimensions.
-    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_SIZE_M)
+    tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
 
     # Num pids along N dim
-    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_SIZE_N)
+    tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    tl.assume(num_pid_m <= 2147483647 // num_pid_n)
+    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
+    tl.assume(grid_mn > 0)
 
     # Remap pids via L2 swizzle
     tl.assume(pid < num_pid_m * num_pid_n)
@@ -420,6 +443,7 @@ def tlx_addmm_glu_kernel_optimized_async(
 
     # Num pids in the group (of shared rows along M dim pids)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tl.assume(num_pid_in_group > 0)
 
     # Which group we are in
     group_id = pid // num_pid_in_group
@@ -454,10 +478,10 @@ def tlx_addmm_glu_kernel_optimized_async(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # Base pointers for A along m dim
-    a_base_off = offs_m[:, None] * sa0
+    a_base_off = offs_m[:, None].to(tl.int64) * sa0
 
     # Base pointers for B along n dim
-    b_base_off = offs_n[None, :] * sb1
+    b_base_off = offs_n[None, :].to(tl.int64) * sb1
 
     # How many times we need to iterate through blocks of size BLOCK_SIZE_K
     k_iters = tl.cdiv(K, BLOCK_SIZE_K)
@@ -523,7 +547,7 @@ def tlx_addmm_glu_kernel_optimized_async(
     # Async-prefetch Y into a padded LDS buffer
     y_layout: tl.constexpr = _y_padded_layout(BLOCK_SIZE_M, BLOCK_SIZE_N, Y_PAD)
     smemY = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tlx.dtype_of(y_ptr), 1, layout=y_layout)
-    y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
+    y_ptrs = y_ptr + offs_m[:, None].to(tl.int64) * sy0 + offs_n[None, :].to(tl.int64) * sy1
     y_tok = tlx.async_load(y_ptrs, tlx.local_view(smemY, 0))
     tlx.async_load_commit_group([y_tok])
 
@@ -552,7 +576,7 @@ def tlx_addmm_glu_kernel_optimized_async(
     out = x + x * y_regs
 
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
+    c_ptrs = c_ptr + offs_cm[:, None].to(tl.int64) * sc0 + offs_cn[None, :].to(tl.int64) * sc1
 
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
 
@@ -562,7 +586,7 @@ def run_kernel_optimized_async(a, b, bias, y, out, cfg):
         return
     M, K = a.shape
     _, N = b.shape
-    grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
+    grid = (_checked_tile_count(M, N, cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["GROUP_SIZE_M"]), )
     return tlx_addmm_glu_kernel_optimized_async[grid](
         a,
         b,
@@ -638,14 +662,19 @@ def tlx_addmm_glu_kernel_simple_async(
     tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(axis=0)
     tl.assume(pid >= 0)
-    # Ceiling-division sums can exceed i32 for valid positive dimensions.
-    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_SIZE_N)
+    tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    tl.assume(num_pid_m <= 2147483647 // num_pid_n)
+    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
     grid_mn = num_pid_m * num_pid_n
+    tl.assume(grid_mn > 0)
     tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
     tl.assume(pid >= 0)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tl.assume(num_pid_in_group > 0)
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
@@ -666,12 +695,12 @@ def tlx_addmm_glu_kernel_simple_async(
     # Async-prefetch Y into a padded LDS buffer before the K-loop
     y_layout: tl.constexpr = _y_padded_layout(BLOCK_SIZE_M, BLOCK_SIZE_N, Y_PAD)
     smemY = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tlx.dtype_of(y_ptr), 1, layout=y_layout)
-    y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
+    y_ptrs = y_ptr + offs_m[:, None].to(tl.int64) * sy0 + offs_n[None, :].to(tl.int64) * sy1
     y_tok = tlx.async_load(y_ptrs, tlx.local_view(smemY, 0))
     tlx.async_load_commit_group([y_tok])
 
-    a_ptrs = a_ptr + offs_m[:, None] * sa0 + offs_k[None, :] * sa1
-    b_ptrs = b_ptr + offs_k[:, None] * sb0 + offs_n[None, :] * sb1
+    a_ptrs = a_ptr + offs_m[:, None].to(tl.int64) * sa0 + offs_k[None, :] * sa1
+    b_ptrs = b_ptr + offs_k[:, None] * sb0 + offs_n[None, :].to(tl.int64) * sb1
 
     # Plain unpipelined K-loop: grab A and B for this iteration, dot, advance
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -693,7 +722,7 @@ def tlx_addmm_glu_kernel_simple_async(
     out = x + x * y_regs
 
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
+    c_ptrs = c_ptr + offs_cm[:, None].to(tl.int64) * sc0 + offs_cn[None, :].to(tl.int64) * sc1
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
 
 
@@ -741,11 +770,16 @@ def tlx_addmm_glu_kernel_persistent(
     start_pid = tl.program_id(axis=0)
     tl.assume(start_pid >= 0)
 
-    # Ceiling-division sums can exceed i32 for valid positive dimensions.
-    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_SIZE_N)
+    tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    tl.assume(num_pid_m <= (2147483647 - NUM_CUS) // num_pid_n)
+    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
     num_tiles = num_pid_m * num_pid_n
+    tl.assume(num_tiles > 0)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tl.assume(num_pid_in_group > 0)
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
@@ -761,7 +795,7 @@ def tlx_addmm_glu_kernel_persistent(
 
         # Delinearize swizzled tile_id
         group_id = swizzled // num_pid_in_group
-        tl.assume(group_id < tl.cdiv(num_pid_m, GROUP_SIZE_M))
+        tl.assume(group_id < (num_pid_m - 1) // GROUP_SIZE_M + 1)
         first_pid_m = group_id * GROUP_SIZE_M
         rows_left = num_pid_m - first_pid_m
         tl.assume((rows_left > 0) & (rows_left <= num_pid_m))
@@ -780,8 +814,8 @@ def tlx_addmm_glu_kernel_persistent(
         offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
 
-        a_base_off = offs_m[:, None] * sa0
-        b_base_off = offs_n[None, :] * sb1
+        a_base_off = offs_m[:, None].to(tl.int64) * sa0
+        b_base_off = offs_n[None, :].to(tl.int64) * sb1
 
         k_iters = tl.cdiv(K, BLOCK_SIZE_K)
 
@@ -843,7 +877,7 @@ def tlx_addmm_glu_kernel_persistent(
             wait_tok = tlx.async_load_wait_group(1)
 
         # Register-resident Y prefetch before the drain dots (overlaps its HBM latency)
-        y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
+        y_ptrs = y_ptr + offs_m[:, None].to(tl.int64) * sy0 + offs_n[None, :].to(tl.int64) * sy1
         y_regs = tl.load(y_ptrs, cache_modifier=".cs")
 
         # Epilogue: drain remaining in-flight tiles
@@ -864,7 +898,7 @@ def tlx_addmm_glu_kernel_persistent(
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
+        c_ptrs = c_ptr + offs_cm[:, None].to(tl.int64) * sc0 + offs_cn[None, :].to(tl.int64) * sc1
         tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
 
 
@@ -873,7 +907,8 @@ def run_kernel_persistent(a, b, bias, y, out, cfg, num_cus):
         return
     M, K = a.shape
     _, N = b.shape
-    grid = (min(num_cus, triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"])), )
+    grid = (min(num_cus,
+                _checked_tile_count(M, N, cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["GROUP_SIZE_M"], num_cus)), )
     return tlx_addmm_glu_kernel_persistent[grid](
         a,
         b,
@@ -910,7 +945,7 @@ def run_kernel_simple_async(a, b, bias, y, out, cfg):
         return
     M, K = a.shape
     _, N = b.shape
-    grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
+    grid = (_checked_tile_count(M, N, cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["GROUP_SIZE_M"]), )
     return tlx_addmm_glu_kernel_simple_async[grid](
         a,
         b,
