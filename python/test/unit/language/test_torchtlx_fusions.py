@@ -1315,5 +1315,74 @@ class TestTorchTLXEpilogueFusion(TestCase):
         self._assert_reduction_epilogue_fused(code, fused=False)
 
 
+def is_gfx942():
+    """True on AMD MI300X (gfx942)."""
+    try:
+        from triton.language.extra.tlx.hw.target import current_target
+    except ImportError:
+        return False
+    return current_target().is_gfx942
+
+
+@instantiate_parametrized_tests
+class TestGfx942ReductionEpilogue(TestCase):
+
+    def _centered_swish_norm(self, value):
+        value = value.to(torch.float32)
+        value = value - value.mean(dim=-1, keepdim=True)
+        value = value / torch.sqrt(torch.square(value).mean(dim=-1, keepdim=True) + 1e-5)
+        value = value.to(torch.float16)
+        return value * torch.sigmoid(value)
+
+    def _gated_swish_norm(self, value, norm_weight, norm_bias):
+        dtype = value.dtype
+        value = value.to(torch.float32)
+        centered = value - value.mean(dim=[-1], keepdim=True)
+        normed = torch.nn.functional.rms_norm(centered, [value.shape[-1]], weight=None, eps=1e-5)
+        normed = normed * norm_weight.to(torch.float32) + norm_bias.to(torch.float32)
+        return (value * torch.sigmoid(normed)).to(dtype)
+
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("epilogue", ("layernorm", "rmsnorm", "centered_swish_norm", "centered_swish_norm_residual", "gated_swish_norm",
+                              "centered_swish_norm_wide_tile"))
+    def test_gfx942_reduction_epilogue_is_fused(self, epilogue: str):
+        """addmm + row-normalization epilogues lower to the gfx942 template with row partials and a consumer."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        # The prod 4662x2560x2560 row selects a 256x256 tile, which stores its partials in two halves.
+        m, k, n = (4662, 2560, 2560) if epilogue == "centered_swish_norm_wide_tile" else (1000, 512, 2560)
+        fp16 = {"device": GPU_TYPE, "dtype": torch.float16}
+        x = torch.randn((m, k), **fp16)
+        weight = torch.randn((n, k), **fp16) / k**0.5
+        bias = torch.randn((n, ), **fp16)
+        res = torch.randn((m, n), **fp16)
+        scale = torch.randn((n, ), **fp16)
+        shift = torch.randn((n, ), **fp16)
+
+        def layer(x, weight, bias, res, scale, shift):
+            value = torch.nn.functional.linear(x, weight, bias)
+            if epilogue in ("layernorm", "rmsnorm"):
+                return _normalize(value, scale, shift, epilogue)
+            if epilogue == "gated_swish_norm":
+                return self._gated_swish_norm(value, scale, shift)
+            if epilogue == "centered_swish_norm_residual":
+                value = res + value
+            return self._centered_swish_norm(value)
+
+        with torch.no_grad(), mock.patch.dict(os.environ, {"TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE": "force"}):
+            expected = layer(x, weight, bias, res, scale, shift)
+            torch._dynamo.reset()
+            with config.patch({"triton.tlx_mode": "allow", "force_disable_caches": True}):
+                actual, code = run_and_get_code(torch.compile(layer, fullgraph=True), x, weight, bias, res, scale,
+                                                shift)
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        source = "\n".join(code)
+        self.assertIn("tlx_gfx942_addmm", source)
+        self.assertIn("row_stats_ws", source)
+        self.assertIn("_row_consumer", source)
+
+
 if __name__ == "__main__":
     run_tests()

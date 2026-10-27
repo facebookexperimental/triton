@@ -153,9 +153,19 @@ from triton.tlx.ops.kernels.mm.gfx942 import matmul_kernel_gfx942
         )
 
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
-    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
     idx_m = rows[:, None]
-    idx_n = cols[None, :]
+{% if BLOCK_N > 128 %}
+    # Row partials over 256-wide tiles miscompile on gfx942; store two halves.
+    acc_l, acc_r = tl.split(tl.permute(tl.reshape(acc, (BLOCK_M, 2, BLOCK_N // 2)), (0, 2, 1)))
+    idx_n_l = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N // 2).to(tl.int32))[None, :]
+    idx_n_r = idx_n_l + BLOCK_N // 2
+    mask_l = (idx_m < M) & (idx_n_l < N)
+    mask_r = (idx_m < M) & (idx_n_r < N)
+    {{reduction_store_output(("idx_m", "idx_n_l"), "acc_l", "mask_l", partial_index="pid_n * 2", partial_columns="BLOCK_N // 2", val_shape=("BLOCK_M", "BLOCK_N // 2"))}}
+    {{reduction_store_output(("idx_m", "idx_n_r"), "acc_r", "mask_r", partial_index="pid_n * 2 + 1", partial_columns="BLOCK_N // 2", val_shape=("BLOCK_M", "BLOCK_N // 2"))}}
+{% else %}
+    idx_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32))[None, :]
     mask = (idx_m < M) & (idx_n < N)
-    {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
+    {{reduction_store_output(("idx_m", "idx_n"), "acc", "mask", partial_index="pid_n", partial_columns="BLOCK_N", val_shape=("BLOCK_M", "BLOCK_N"))}}
+{% endif %}
 {% endif %}

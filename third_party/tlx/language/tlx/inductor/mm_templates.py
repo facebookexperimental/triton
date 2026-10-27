@@ -183,7 +183,7 @@ amd_bmm_shared_a_template = TritonTemplate(
 # Persistent variant of the gfx950 warp-pipe addmm: same warp-pipe body, but the grid
 # is capped at NUM_SMS (_persistent_mm_grid_split_k) and the kernel loops over output
 # tiles. Competes as an additional addmm candidate so per-template selection can be
-# attributed in the merge_net gemm sweep. Requires NUM_SMS in the template kwargs
+# attributed in GEMM sweeps. Requires NUM_SMS in the template kwargs
 # (supplied by Gfx950AddMMPersistentWarpPipeConfigHeuristic in registry.py).
 gfx950_addmm_persistent_warppipe_template = TritonTemplate(
     name="tlx_gfx950_addmm_persistent_warppipe",
@@ -193,6 +193,8 @@ gfx950_addmm_persistent_warppipe_template = TritonTemplate(
 
 # Templates whose every output store goes through reduction_store_output.
 for _template in (
+    gfx942_mm_template,
+    gfx942_addmm_template,
     gfx950_addmm_warppipe_template,
     gfx950_addmm_persistent_warppipe_template,
     gfx950_mm_interwave_template,

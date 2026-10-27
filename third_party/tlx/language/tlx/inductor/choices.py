@@ -187,6 +187,31 @@ class TLXInductorChoices(InductorChoices):
             template_choices, kernel_inputs, templates, op_name, kwarg_overrides
         )
 
+    # gfx942 row norms up to this width fit one register-resident pass, which
+    # beats the default multi-pass looped reduction above 1024.
+    _GFX942_PERSISTENT_INNER_RNUMEL = 4096
+
+    @staticmethod
+    def should_use_persistent_reduction(features, cooperative_reduction: bool) -> bool:
+        from torch._inductor.runtime.hints import ReductionHint
+        from torch._inductor.virtualized import V
+
+        from .registry import _is_gfx942
+
+        if (
+            config.triton.tlx_mode is not None
+            and config.triton.persistent_reductions
+            and not cooperative_reduction
+            and features.get_reduction_hint() == ReductionHint.INNER
+            and _is_gfx942()
+            and V.graph.sizevars.statically_known_leq(
+                features.reduction_numel,
+                TLXInductorChoices._GFX942_PERSISTENT_INNER_RNUMEL,
+            )
+        ):
+            return True
+        return InductorChoices.should_use_persistent_reduction(features, cooperative_reduction)
+
     def customize_fused_kernel_name(self, fused_name: str, src_code: str) -> str:
         from .fusion import maybe_add_tlx_prefix
 
