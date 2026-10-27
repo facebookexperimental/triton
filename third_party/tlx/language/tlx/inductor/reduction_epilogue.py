@@ -129,7 +129,12 @@ def _is_row_buffer(buffer: Buffer) -> bool:
 
 
 def _is_row_major(buffer: Buffer, columns: int) -> bool:
-    size, stride = buffer.get_size(), buffer.get_stride()
+    try:
+        size, stride = buffer.get_size(), buffer.maybe_get_stride()
+    except (AttributeError, NotImplementedError):
+        return False
+    if stride is None:
+        return False
     sizevars = V.graph.sizevars
     return (
         len(size) == 2
