@@ -568,7 +568,11 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
   }
   if (packedAxis)
     shape[*packedAxis] *= 2;
-  if (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout)) {
+  // Flag off keeps upstream's allocation size (no pow2 rounding).
+  static const bool allowNpot =
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+  if (allowNpot &&
+      (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout))) {
     unsigned tileRank = getCGALayout(layout).getRank();
     size_t firstTileDim = shape.size() > tileRank ? shape.size() - tileRank : 0;
     for (size_t i = firstTileDim; i < shape.size(); ++i) {

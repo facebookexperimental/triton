@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory | FileCheck %s
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file --allocate-shared-memory | FileCheck %s --check-prefix=NPOT
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [2, 2], order = [1, 0]}>
 
@@ -186,4 +187,36 @@ tt.func @convert_layout_scratch_size(%arg0: tensor<128xi32, #src>) {
   tt.return
 }
 
+}
+
+// -----
+
+#npot_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#npot_smem = #ttg.shared_memory
+
+// CHECK-LABEL: module @npot_swizzled_alloc
+// CHECK-SAME: ttg.shared = 12288 : i32
+// NPOT-LABEL: module @npot_swizzled_alloc
+// NPOT-SAME: ttg.shared = 16384 : i32
+module @npot_swizzled_alloc attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+tt.func @npot_swizzled_alloc() {
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<96x64xf16, #npot_shared, #npot_smem, mutable>
+  tt.return
+}
+}
+
+// -----
+
+#pow2_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#pow2_smem = #ttg.shared_memory
+
+// CHECK-LABEL: module @pow2_swizzled_alloc
+// CHECK-SAME: ttg.shared = 16384 : i32
+// NPOT-LABEL: module @pow2_swizzled_alloc
+// NPOT-SAME: ttg.shared = 16384 : i32
+module @pow2_swizzled_alloc attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+tt.func @pow2_swizzled_alloc() {
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #pow2_shared, #pow2_smem, mutable>
+  tt.return
+}
 }
