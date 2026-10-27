@@ -172,8 +172,11 @@ def load_summaries():
         try:
             sh("gh", "release", "download", TAG, "--repo", REPO, "--pattern", "*.json", "--dir", tmp)
         except subprocess.CalledProcessError as exc:
-            print(f"no {TAG} release to render ({exc.stderr.strip()})", file=sys.stderr)
-            return {}
+            if "release not found" in exc.stderr:
+                print(f"no {TAG} release to render", file=sys.stderr)
+                return {}
+            # Any other failure, such as an HTTP 500 on one asset, fails the step so the last good page stays up.
+            sys.exit(f"downloading the {TAG} release failed: {exc.stderr.strip()}")
         return read_summaries(tmp)
 
 
