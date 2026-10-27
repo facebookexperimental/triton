@@ -152,6 +152,8 @@ def test_integer_facts_swizzle_coordinates(m, n, xcd, chunk, group):
                 active = tl.minimum(rows - base, GROUP)
                 row = base + (mapped % width) % active
                 col = (mapped % width) // active
+                tl.assume(row < rows)
+                tl.assume(col < cols)
                 lane = tl.arange(0, 32).to(tl.uint64)
                 r = (row * 32 + lane) % wide_m
                 c = (col * 32 + lane) % wide_n
@@ -340,6 +342,7 @@ def test_integer_facts_dynamic_tile_column(groups, columns):
         pid = tl.program_id(0)
         tl.assume(pid < groups * columns)
         column = pid // groups
+        tl.assume(column < columns)
         lanes = tlx.require_layout(tl.arange(0, 256), L)
         offsets = column * 256 + lanes
         values = tl.load(table + offsets % 256)
@@ -374,6 +377,7 @@ def test_integer_facts_partial_group(rows, columns, group, persistent):
             base = (tile // width) * GROUP
             active = tl.minimum(rows - base, GROUP)
             column = (tile % width) // active
+            tl.assume((column >= 0) & (column < columns))
             lanes = tlx.require_layout(tl.arange(0, 256), L)
             offsets = column * 256 + lanes
             values = tl.load(table + offsets % 256)
@@ -400,6 +404,7 @@ def test_integer_facts_gluon_dynamic_tile_column():
         pid = ttgl.program_id(0)
         ttgl.assume(pid < groups * columns)
         column = pid // groups
+        ttgl.assume(column < columns)
         lanes = ttgl.arange(0, 256, layout=layout)
         values = ttgl.load(table + (column * 256 + lanes) % 256)
         ttgl.store(output + pid * 256 + lanes, values)

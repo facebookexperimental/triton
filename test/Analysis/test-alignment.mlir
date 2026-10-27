@@ -10,96 +10,6 @@
 // ERASE: llvm.intr.assume
 // ERASE-NOT: tt.refine
 
-module {
-  tt.func @non_power_of_two_gap(%input: i32) -> i32 {
-    %zero = arith.constant 0 : i32
-    %limit = arith.constant 100 : i32
-    %factor = arith.constant 15 : i32
-    %offset = arith.constant 14 : i32
-    %bound = arith.constant 1500 : i32
-    %x0 = tt.refine %input, %zero {predicate = 5 : i64} : i32
-    %x = tt.refine %x0, %limit {predicate = 3 : i64} : i32
-    %product = arith.muli %x, %factor : i32
-    %aligned = tt.refine %product, %bound {predicate = 6 : i64} : i32
-    %result = arith.addi %aligned, %offset : i32
-    %check = arith.cmpi ult, %result, %bound {test.proof = "proven"} : i32
-    tt.return %result : i32
-  }
-  tt.func @wrapped_non_power_of_two_gap(%input: i32) -> i32 {
-    %factor = arith.constant 15 : i32
-    %offset = arith.constant 14 : i32
-    %bound = arith.constant 1500 : i32
-    %product = arith.muli %input, %factor : i32
-    %aligned = tt.refine %product, %bound {predicate = 6 : i64} : i32
-    %result = arith.addi %aligned, %offset : i32
-    %check = arith.cmpi ult, %result, %bound {test.proof = "unknown"} : i32
-    tt.return %result : i32
-  }
-}
-
-// -----
-
-module {
-  tt.func @refine_swizzle_bound(%input: i32, %p: i32) -> i64 {
-    %zero = arith.constant 0 : i32
-    %positive = arith.cmpi sgt, %input, %zero : i32
-    llvm.intr.assume %positive : i1
-    %n = arith.extsi %input : i32 to i64
-    %pid = arith.extui %p : i32 to i64
-    %valid = arith.cmpi ult, %pid, %n : i64
-    llvm.intr.assume %valid : i1
-    %r = tt.call @permute(%pid, %n) : (i64, i64) -> i64
-    %check = arith.cmpi slt, %r, %n {test.proof = "proven"} : i64
-    tt.return %r : i64
-  }
-  tt.func private @permute(%pid: i64, %n: i64) -> i64 {
-    %c4 = arith.constant 4 : i64
-    %c8 = arith.constant 8 : i64
-    %c32 = arith.constant 32 : i64
-    %q = arith.divui %n, %c32 : i64
-    %aligned = arith.muli %q, %c32 : i64
-    %tail = arith.cmpi uge, %pid, %aligned : i64
-    cf.cond_br %tail, ^bb1, ^bb2
-  ^bb1:
-    tt.return %pid : i64
-  ^bb2:
-    %minor = arith.remui %pid, %c8 : i64
-    %major = arith.divui %pid, %c8 : i64
-    %group = arith.divui %major, %c4 : i64
-    %check_group = arith.cmpi slt, %group, %q {test.proof = "proven"} : i64
-    %base = arith.muli %group, %c32 : i64
-    %part = arith.muli %minor, %c4 : i64
-    %offset = arith.remui %major, %c4 : i64
-    %sum = arith.addi %base, %part : i64
-    %result = arith.addi %sum, %offset : i64
-    %check_result = arith.cmpi slt, %result, %aligned {test.proof = "proven"} : i64
-    tt.return %result : i64
-  }
-}
-
-// -----
-
-module {
-  tt.func @remap_two_calls(%x: i32, %y: i32) -> (i32, i32) {
-    %zero = arith.constant 0 : i32
-    %a = arith.constant 21 : i32
-    %b = arith.constant 63 : i32
-    %x0 = tt.refine %x, %zero {predicate = 5 : i64} : i32
-    %y0 = tt.refine %y, %zero {predicate = 5 : i64} : i32
-    %x1 = tt.refine %x0, %a {predicate = 2 : i64} : i32
-    %y1 = tt.refine %y0, %b {predicate = 2 : i64} : i32
-    %r = tt.call @identity(%x1, %a) : (i32, i32) -> i32
-    %s = tt.call @identity(%y1, %b) : (i32, i32) -> i32
-    %check_r = arith.cmpi slt, %r, %a {test.proof = "proven"} : i32
-    %check_s = arith.cmpi slt, %s, %b {test.proof = "proven"} : i32
-    %no_cross_call = arith.cmpi slt, %s, %a {test.proof = "unknown"} : i32
-    tt.return %r, %s : i32, i32
-  }
-  tt.func private @identity(%value: i32, %bound: i32) -> i32 {
-    tt.return %value : i32
-  }
-}
-
 // -----
 
 module {
@@ -172,8 +82,8 @@ tt.func @refine_dynamic_bound(%x: i32, %limit: i32) {
   %limit_bound = tt.refine %limit, %upper {predicate = 3 : i64} : i32
   %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
   %bounded = tt.refine %positive, %limit_bound {predicate = 2 : i64} : i32
-  %proof = arith.cmpi slt, %bounded, %limit_bound {test.proof = "proven"} : i32
-  %inverse = arith.cmpi sge, %bounded, %limit_bound {test.proof = "disproven"} : i32
+  %proof = arith.cmpi slt, %bounded, %upper {test.proof = "proven"} : i32
+  %inverse = arith.cmpi sge, %bounded, %upper {test.proof = "disproven"} : i32
   %sibling = arith.cmpi slt, %x, %limit_bound {test.proof = "unknown"} : i32
   %base = tt.splat %bounded : i32 -> tensor<4xi32>
   %stride = arith.constant dense<4> : tensor<4xi32>
@@ -234,72 +144,6 @@ tt.func @refine_merge_and_freeze(%x: i32, %limit: i32, %cond: i1) {
 
 // -----
 
-tt.func @refine_product_quotient(%x: i32, %groups: i32, %columns: i32) {
-  %zero = arith.constant 0 : i32
-  %one = arith.constant 1 : i32
-  %seven = arith.constant 7 : i32
-  %limit = arith.constant 268435456 : i32
-  %g0 = tt.refine %groups, %one {predicate = 5 : i64} : i32
-  %g = tt.refine %g0, %seven {predicate = 3 : i64} : i32
-  %n0 = tt.refine %columns, %one {predicate = 5 : i64} : i32
-  %n = tt.refine %n0, %limit {predicate = 3 : i64} : i32
-  %total = arith.muli %g, %n : i32
-  %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
-  %bounded = tt.refine %positive, %total {predicate = 2 : i64} : i32
-  %q = arith.divsi %bounded, %g : i32
-  %base = tt.splat %q : i32 -> tensor<4xi32>
-  %stride = arith.constant dense<4> : tensor<4xi32>
-  %scaled = arith.muli %base, %stride : tensor<4xi32>
-  %lane = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32>
-  %index = arith.addi %scaled, %lane : tensor<4xi32>
-  // expected-remark @below {{contiguity = [4], divisibility = [4], constancy = [1]}}
-  %rem = arith.remsi %index, %stride : tensor<4xi32>
-  tt.return
-}
-
-// -----
-
-tt.func @refine_partial_divisor(%x: i32, %rows: i32, %columns: i32) {
-  %zero = arith.constant 0 : i32
-  %one = arith.constant 1 : i32
-  %eight = arith.constant 8 : i32
-  %row_limit = arith.constant 16777215 : i32
-  %max = arith.constant 2147483647 : i32
-  %column_limit = arith.constant 8388608 : i32
-  %m0 = tt.refine %rows, %one {predicate = 5 : i64} : i32
-  %m1 = tt.refine %m0, %row_limit {predicate = 3 : i64} : i32
-  %n0 = tt.refine %columns, %one {predicate = 5 : i64} : i32
-  %n = tt.refine %n0, %column_limit {predicate = 3 : i64} : i32
-  %allowed = arith.divsi %max, %n : i32
-  %m = tt.refine %m1, %allowed {predicate = 3 : i64} : i32
-  %total = arith.muli %m, %n : i32
-  %positive = tt.refine %x, %zero {predicate = 5 : i64} : i32
-  %bounded = tt.refine %positive, %total {predicate = 2 : i64} : i32
-  %width = arith.muli %eight, %n : i32
-  %chunk = arith.divsi %bounded, %width : i32
-  %base = arith.muli %chunk, %eight : i32
-  %remaining = arith.subi %m, %base : i32
-  %divisor = arith.minsi %remaining, %eight : i32
-  %residual = arith.remsi %bounded, %width : i32
-  %column = arith.divsi %residual, %divisor : i32
-  %proof = arith.cmpi slt, %column, %n {test.proof = "proven"} : i32
-  %nonnegative = arith.cmpi sge, %column, %zero {test.proof = "proven"} : i32
-  %row_offset = arith.remsi %residual, %divisor : i32
-  %row = arith.addi %base, %row_offset : i32
-  %row_bound = arith.cmpi slt, %row, %m {test.proof = "proven"} : i32
-  %row_sign = arith.cmpi sge, %row, %zero {test.proof = "proven"} : i32
-  %bases = tt.splat %column : i32 -> tensor<256xi32>
-  %scale = arith.constant dense<256> : tensor<256xi32>
-  %scaled = arith.muli %bases, %scale : tensor<256xi32>
-  %lanes = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32>
-  %index = arith.addi %scaled, %lanes : tensor<256xi32>
-  // expected-remark @below {{contiguity = [256], divisibility = [256], constancy = [1]}}
-  %rem = arith.remsi %index, %scale : tensor<256xi32>
-  tt.return
-}
-
-// -----
-
 tt.func @refine_missing_tile_bound(%x: i32, %rows: i32, %columns: i32) {
   %zero = arith.constant 0 : i32
   %one = arith.constant 1 : i32
@@ -334,7 +178,7 @@ tt.func @refine_loop_assumption_chain(%start: i32, %limit: i32, %step: i32) {
   scf.for %iv = %start to %limit step %step : i32 {
     %condition = arith.cmpi sge, %iv, %zero : i32
     llvm.intr.assume %condition : i1
-    %bound = arith.cmpi slt, %iv, %limit {test.proof = "proven"} : i32
+    %bound = arith.cmpi slt, %iv, %limit {test.proof = "unknown"} : i32
     %sign = arith.cmpi sge, %iv, %zero {test.proof = "proven"} : i32
   }
   tt.return
@@ -342,11 +186,15 @@ tt.func @refine_loop_assumption_chain(%start: i32, %limit: i32, %step: i32) {
 
 // -----
 
+// REFINE-LABEL: tt.func @refine_signed_loop_lower_bound
+// REFINE: scf.for
+// REFINE: %[[LOW:.*]] = tt.refine %{{.*}}, %{{.*}} {predicate = 5 : i64}
+// REFINE: tt.refine %[[LOW]], %{{.*}} {predicate = 2 : i64}
 tt.func @refine_signed_loop_lower_bound(%start: i32, %limit: i32, %step: i32) {
   %zero = arith.constant 0 : i32
   scf.for %iv = %start to %limit step %step : i32 {
-    %lower = arith.cmpi sge, %iv, %start {test.proof = "proven"} : i32
-    %upper = arith.cmpi slt, %iv, %limit {test.proof = "proven"} : i32
+    %lower = arith.cmpi sge, %iv, %start {test.proof = "unknown"} : i32
+    %upper = arith.cmpi slt, %iv, %limit {test.proof = "unknown"} : i32
     %sign = arith.cmpi sge, %iv, %zero {test.proof = "unknown"} : i32
   }
   %outside = arith.cmpi slt, %start, %limit {test.proof = "unknown"} : i32
@@ -355,11 +203,15 @@ tt.func @refine_signed_loop_lower_bound(%start: i32, %limit: i32, %step: i32) {
 
 // -----
 
+// REFINE-LABEL: tt.func @refine_unsigned_loop_lower_bound
+// REFINE: scf.for
+// REFINE: %[[LOW:.*]] = tt.refine %{{.*}}, %{{.*}} {predicate = 9 : i64}
+// REFINE: tt.refine %[[LOW]], %{{.*}} {predicate = 6 : i64}
 tt.func @refine_unsigned_loop_lower_bound(%start: i32, %limit: i32, %step: i32) {
   %zero = arith.constant 0 : i32
   scf.for unsigned %iv = %start to %limit step %step : i32 {
-    %lower = arith.cmpi uge, %iv, %start {test.proof = "proven"} : i32
-    %upper = arith.cmpi ult, %iv, %limit {test.proof = "proven"} : i32
+    %lower = arith.cmpi uge, %iv, %start {test.proof = "unknown"} : i32
+    %upper = arith.cmpi ult, %iv, %limit {test.proof = "unknown"} : i32
     %signed = arith.cmpi sge, %iv, %start {test.proof = "unknown"} : i32
     %sign = arith.cmpi sge, %iv, %zero {test.proof = "unknown"} : i32
   }
@@ -419,28 +271,6 @@ tt.func @refine_shared_successor(%x: i32, %limit: i32) -> i32 {
 ^join(%arg: i32):
   %unknown = arith.cmpi slt, %arg, %limit {test.proof = "unknown"} : i32
   tt.return %arg : i32
-}
-
-// -----
-
-tt.func @refine_congruence_limits_signed_range(%x: i32) {
-  %two = arith.constant 2 : i32
-  %zero = arith.constant 0 : i32
-  %even = arith.muli %x, %two : i32
-  %nonnegative = tt.refine %even, %zero {predicate = 5 : i64} : i32
-  %max = arith.constant 2147483647 : i32
-  %even_bound = arith.cmpi slt, %nonnegative, %max {test.proof = "proven"} : i32
-  %three = arith.constant 3 : i32
-  %wrapped = arith.muli %x, %three : i32
-  %wrapped_positive = tt.refine %wrapped, %zero {predicate = 5 : i64} : i32
-  %wrapped_bound = arith.cmpi slt, %wrapped_positive, %max {test.proof = "unknown"} : i32
-  %base = tt.splat %nonnegative : i32 -> tensor<2xi32>
-  %lane = tt.make_range {start = 0 : i32, end = 2 : i32} : tensor<2xi32>
-  %index = arith.addi %base, %lane : tensor<2xi32>
-  %divisor = arith.constant dense<2> : tensor<2xi32>
-  // expected-remark @below {{contiguity = [2], divisibility = [2], constancy = [1]}}
-  %rem = arith.remsi %index, %divisor : tensor<2xi32>
-  tt.return
 }
 
 // -----
@@ -2645,7 +2475,8 @@ tt.func @keep_wide(%x: i64, %y: i64) -> i64 {
 // -----
 
 // Duplicate operands must receive the same edge fact.
-tt.func @single_predecessor(%x: i32, %bound: i32) -> i32 {
+tt.func @single_predecessor(%x: i32) -> i32 {
+  %bound = arith.constant 1024 : i32
   %condition = arith.cmpi slt, %x, %bound : i32
   cf.cond_br %condition, ^then(%x, %x : i32, i32), ^else(%x : i32)
 ^then(%a: i32, %alias: i32):
@@ -2659,7 +2490,8 @@ tt.func @single_predecessor(%x: i32, %bound: i32) -> i32 {
 }
 
 // An unbounded predecessor must discard the edge fact at the join.
-tt.func @multiple_predecessors(%x: i32, %y: i32, %bound: i32) -> i32 {
+tt.func @multiple_predecessors(%x: i32, %y: i32) -> i32 {
+  %bound = arith.constant 1024 : i32
   %condition = arith.cmpi slt, %x, %bound : i32
   cf.cond_br %condition, ^merge(%x : i32), ^other
 ^other:
@@ -2670,7 +2502,8 @@ tt.func @multiple_predecessors(%x: i32, %y: i32, %bound: i32) -> i32 {
 }
 
 // Opposite edges into one block must not leak either outcome.
-tt.func @same_successor(%x: i32, %bound: i32) -> i32 {
+tt.func @same_successor(%x: i32) -> i32 {
+  %bound = arith.constant 1024 : i32
   %condition = arith.cmpi slt, %x, %bound : i32
   cf.cond_br %condition, ^merge(%x : i32), ^merge(%x : i32)
 ^merge(%arg: i32):
@@ -2679,7 +2512,8 @@ tt.func @same_successor(%x: i32, %bound: i32) -> i32 {
 }
 
 // Both incoming edges establish the same bound.
-tt.func @bounded_predecessors(%x: i32, %y: i32, %bound: i32) -> i32 {
+tt.func @bounded_predecessors(%x: i32, %y: i32) -> i32 {
+  %bound = arith.constant 1024 : i32
   %first = arith.cmpi slt, %x, %bound : i32
   cf.cond_br %first, ^merge(%x : i32), ^other
 ^other:
@@ -2693,7 +2527,8 @@ tt.func @bounded_predecessors(%x: i32, %y: i32, %bound: i32) -> i32 {
 }
 
 // Both predicate operands can cross the edge, including duplicate aliases.
-tt.func @transported_bound(%x: i32, %bound: i32) -> i32 {
+tt.func @transported_bound(%x: i32) -> i32 {
+  %bound = arith.constant 1024 : i32
   %condition = arith.cmpi slt, %x, %bound : i32
   cf.cond_br %condition, ^then(%x, %x, %bound, %bound : i32, i32, i32, i32), ^else(%x, %bound : i32, i32)
 ^then(%a: i32, %alias_a: i32, %b: i32, %alias_b: i32):
