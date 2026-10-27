@@ -1,4 +1,4 @@
-"""Regular MXFP8 GEMM using TLX's shared gfx950 MXFP8 tile pipeline.
+"""Regular gfx950 MXFP8 GEMM using TLX's shared tile pipeline.
 
 The device launch has no group routing or persistent group scheduler. Regular
 and grouped GEMM use common tile bodies without depending on either API.
