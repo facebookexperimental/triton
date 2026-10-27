@@ -153,6 +153,20 @@ public:
                    function_ref<IntegerValueRange(Value)> getRange,
                    function_ref<const IntegerFacts &(Value)> getFacts)
       : getFacts(getFacts) {
+    collectValues(roots, getRange);
+    if (!valid)
+      return;
+    for (Value value : values) {
+      addRefinementConstraint(value);
+      addArithmeticConstraints(value);
+    }
+    for (auto [value, bound] : inheritedBounds)
+      addInheritedBound(value, bound);
+  }
+
+private:
+  void collectValues(ValueRange roots,
+                     function_ref<IntegerValueRange(Value)> getRange) {
     SmallVector<Value> pending(roots);
     DenseSet<Value> visited;
     while (!pending.empty()) {
@@ -191,61 +205,63 @@ public:
                     arith::MaxSIOp, arith::ExtSIOp, arith::ExtUIOp>(op))
         llvm::append_range(pending, op->getOperands());
     }
-    for (Value value : values) {
-      if (auto refine = value.getDefiningOp<RefineOp>()) {
-        using P = arith::CmpIPredicate;
-        P pred = refine.getPredicate();
-        if ((pred == P::slt || pred == P::sle) &&
-            !matchPattern(refine.getBound(), m_Constant()))
-          addConstraint(
-              subtract(normalize(refine.getBound()), normalize(value)),
-              pred == P::slt);
-        if ((pred == P::sgt || pred == P::sge) &&
-            !matchPattern(refine.getBound(), m_Constant()))
-          addConstraint(
-              subtract(normalize(value), normalize(refine.getBound())),
-              pred == P::sgt);
-      }
-      Operation *op = value.getDefiningOp();
-      if (Operation *minimum = signedMinimum(value)) {
-        addConstraint(
-            subtract(normalize(minimum->getOperand(0)), normalize(value)),
-            false);
-        addConstraint(
-            subtract(normalize(minimum->getOperand(1)), normalize(value)),
-            false);
-      }
-      if (!op ||
-          !isa<arith::DivSIOp, arith::RemSIOp, arith::DivUIOp, arith::RemUIOp>(
-              op) ||
-          !nonnegativeRange(op->getOperand(0)) ||
-          !positiveRange(op->getOperand(1)))
-        continue;
-      auto dividend = normalize(op->getOperand(0));
-      auto divisor = normalize(op->getOperand(1));
-      auto quotient = quotientSymbol(op->getOperand(0), op->getOperand(1));
-      auto remainder = subtract(dividend, multiply(quotient, divisor));
-      addConstraint(remainder, false);
-      addConstraint(subtract(divisor, remainder), true);
-    }
-    for (auto [value, bound] : inheritedBounds) {
-      if (matchPattern(bound.value, m_Constant()))
-        continue;
+  }
+
+  void addRefinementConstraint(Value value) {
+    if (auto refine = value.getDefiningOp<RefineOp>()) {
       using P = arith::CmpIPredicate;
-      P pred = bound.predicate;
-      bool unsignedOrder =
-          nonnegativeRange(value) && nonnegativeRange(bound.value);
-      if (pred == P::slt || pred == P::sle ||
-          (unsignedOrder && (pred == P::ult || pred == P::ule)))
-        addConstraint(subtract(normalize(bound.value), normalize(value)),
-                      pred == P::slt || pred == P::ult);
-      if (pred == P::sgt || pred == P::sge ||
-          (unsignedOrder && (pred == P::ugt || pred == P::uge)))
-        addConstraint(subtract(normalize(value), normalize(bound.value)),
-                      pred == P::sgt || pred == P::ugt);
+      P pred = refine.getPredicate();
+      if ((pred == P::slt || pred == P::sle) &&
+          !matchPattern(refine.getBound(), m_Constant()))
+        addConstraint(subtract(normalize(refine.getBound()), normalize(value)),
+                      pred == P::slt);
+      if ((pred == P::sgt || pred == P::sge) &&
+          !matchPattern(refine.getBound(), m_Constant()))
+        addConstraint(subtract(normalize(value), normalize(refine.getBound())),
+                      pred == P::sgt);
     }
   }
 
+  void addArithmeticConstraints(Value value) {
+    Operation *op = value.getDefiningOp();
+    if (Operation *minimum = signedMinimum(value)) {
+      addConstraint(
+          subtract(normalize(minimum->getOperand(0)), normalize(value)), false);
+      addConstraint(
+          subtract(normalize(minimum->getOperand(1)), normalize(value)), false);
+    }
+    if (!op ||
+        !isa<arith::DivSIOp, arith::RemSIOp, arith::DivUIOp, arith::RemUIOp>(
+            op) ||
+        !nonnegativeRange(op->getOperand(0)) ||
+        !positiveRange(op->getOperand(1)))
+      return;
+    auto dividend = normalize(op->getOperand(0));
+    auto divisor = normalize(op->getOperand(1));
+    auto quotient = quotientSymbol(op->getOperand(0), op->getOperand(1));
+    auto remainder = subtract(dividend, multiply(quotient, divisor));
+    addConstraint(remainder, false);
+    addConstraint(subtract(divisor, remainder), true);
+  }
+
+  void addInheritedBound(Value value, IntegerBound bound) {
+    if (matchPattern(bound.value, m_Constant()))
+      return;
+    using P = arith::CmpIPredicate;
+    P pred = bound.predicate;
+    bool unsignedOrder =
+        nonnegativeRange(value) && nonnegativeRange(bound.value);
+    if (pred == P::slt || pred == P::sle ||
+        (unsignedOrder && (pred == P::ult || pred == P::ule)))
+      addConstraint(subtract(normalize(bound.value), normalize(value)),
+                    pred == P::slt || pred == P::ult);
+    if (pred == P::sgt || pred == P::sge ||
+        (unsignedOrder && (pred == P::ugt || pred == P::uge)))
+      addConstraint(subtract(normalize(value), normalize(bound.value)),
+                    pred == P::sgt || pred == P::ugt);
+  }
+
+public:
   bool nonnegative(Value value) {
     if (nonnegativeRange(value))
       return true;
@@ -301,22 +317,7 @@ public:
           if (stripRefinements(upper.value) != stripRefinements(bound) ||
               (upper.predicate != P::slt && upper.predicate != P::sle))
             continue;
-          int64_t gap = upper.predicate == P::slt;
-          const auto &a = getFacts(base).congruence;
-          const auto &b = getFacts(upper.value).congruence;
-          if (a && b) {
-            APInt modulus =
-                llvm::APIntOps::GreatestCommonDivisor(a->first, b->first);
-            if (!modulus.isZero() && modulus.getActiveBits() < 64 &&
-                (modulus.isPowerOf2() ||
-                 (nonnegativeRange(base) && nonnegativeRange(upper.value)))) {
-              APInt residue =
-                  (b->second.urem(modulus) + modulus - a->second.urem(modulus))
-                      .urem(modulus);
-              gap =
-                  (residue.isZero() && gap ? modulus : residue).getZExtValue();
-            }
-          }
+          int64_t gap = congruenceGap(base, upper);
           APInt maximum = range->second.smax();
           APInt distance(maximum.getBitWidth(), gap);
           if (strict ? maximum.slt(distance) : maximum.sle(distance))
@@ -327,6 +328,24 @@ public:
   }
 
 private:
+  int64_t congruenceGap(Value base, IntegerBound upper) const {
+    int64_t gap = upper.predicate == arith::CmpIPredicate::slt;
+    const auto &a = getFacts(base).congruence;
+    const auto &b = getFacts(upper.value).congruence;
+    if (a && b) {
+      APInt modulus = llvm::APIntOps::GreatestCommonDivisor(a->first, b->first);
+      if (!modulus.isZero() && modulus.getActiveBits() < 64 &&
+          (modulus.isPowerOf2() ||
+           (nonnegativeRange(base) && nonnegativeRange(upper.value)))) {
+        APInt residue =
+            (b->second.urem(modulus) + modulus - a->second.urem(modulus))
+                .urem(modulus);
+        gap = (residue.isZero() && gap ? modulus : residue).getZExtValue();
+      }
+    }
+    return gap;
+  }
+
   Operation *signedMinimum(Value value) const {
     Operation *op = stripRefinements(value).getDefiningOp();
     if (op &&
@@ -426,9 +445,19 @@ private:
     auto b = ranges.find(stripRefinements(op->getOperand(1)));
     if (a == ranges.end() || b == ranges.end())
       return false;
+    if (rangeArithmeticFits(op, a->second, b->second))
+      return true;
+    if (!isa<arith::MulIOp>(op) || !a->second.smin().isNonNegative() ||
+        !b->second.smin().isNonNegative())
+      return false;
+    return hasProductBound(op);
+  }
+
+  static bool rangeArithmeticFits(Operation *op, const ConstantIntRanges &a,
+                                  const ConstantIntRanges &b) {
     bool noOverflow = true;
-    for (const APInt &av : {a->second.smin(), a->second.smax()})
-      for (const APInt &bv : {b->second.smin(), b->second.smax()}) {
+    for (const APInt &av : {a.smin(), a.smax()})
+      for (const APInt &bv : {b.smin(), b.smax()}) {
         bool overflow;
         if (isa<arith::AddIOp>(op))
           (void)av.sadd_ov(bv, overflow);
@@ -438,11 +467,10 @@ private:
           (void)av.smul_ov(bv, overflow);
         noOverflow &= !overflow;
       }
-    if (noOverflow)
-      return true;
-    if (!isa<arith::MulIOp>(op) || !a->second.smin().isNonNegative() ||
-        !b->second.smin().isNonNegative())
-      return false;
+    return noOverflow;
+  }
+
+  bool hasProductBound(Operation *op) const {
     // 0 <= a <= limit / b, b > 0 implies 0 <= a*b <= limit.
     for (Value value : values) {
       auto refine = value.getDefiningOp<RefineOp>();
@@ -498,6 +526,11 @@ private:
       return normalize(op->getOperand(0), depth + 1);
     if (op && isa<arith::ExtUIOp>(op) && nonnegativeRange(op->getOperand(0)))
       return normalize(op->getOperand(0), depth + 1);
+    return normalizeDivRem(value, depth);
+  }
+
+  std::optional<Polynomial> normalizeDivRem(Value value, unsigned depth) {
+    Operation *op = value.getDefiningOp();
     if (op &&
         (isa<arith::DivSIOp>(op) ||
          (isa<arith::DivUIOp>(op) && nonnegativeRange(op->getOperand(0)) &&
@@ -819,73 +852,105 @@ public:
     if (matchPattern(result, m_ConstantInt(&constant))) {
       facts.congruence = {APInt(2 * bits + 2, 0), constant.zext(2 * bits + 2)};
     } else if (auto refine = dyn_cast<RefineOp>(op)) {
-      facts = operands[0]->getValue();
-      if (refine.getPredicate() == arith::CmpIPredicate::eq &&
-          operands[1]->getValue().congruence->first.isZero())
-        facts.congruence = operands[1]->getValue().congruence;
-      IntegerBound bound{refine.getBound(), refine.getPredicate()};
-      if (signedPredicate(bound.predicate) != bound.predicate) {
-        const auto *valueRange =
-            getOrCreateFor<dataflow::IntegerValueRangeLattice>(
-                getProgramPointAfter(op), refine.getValue());
-        const auto *boundRange =
-            getOrCreateFor<dataflow::IntegerValueRangeLattice>(
-                getProgramPointAfter(op), refine.getBound());
-        if (valueRange->getValue().isUninitialized() ||
-            boundRange->getValue().isUninitialized())
-          return success();
-        if (valueRange->getValue().getValue().smin().isNonNegative() &&
-            boundRange->getValue().getValue().smin().isNonNegative())
-          bound.predicate = signedPredicate(bound.predicate);
-      }
-      // Keep a finite prefix. Existing relations cannot change order on
-      // revisit.
-      if (facts.bounds.size() < 8 && !llvm::is_contained(facts.bounds, bound))
-        facts.bounds.push_back(bound);
-      else if (!llvm::is_contained(facts.bounds, bound))
-        LDBG() << "Symbolic bound budget exhausted: " << *op;
+      if (inferRefinement(refine, operands, facts) == FactStatus::Pending)
+        return success();
     } else if (isa<SplatOp, ExpandDimsOp, BroadcastOp, ReshapeOp, TransOp,
                    triton::gpu::ConvertLayoutOp>(op)) {
       facts.congruence = operands[0]->getValue().congruence;
     } else if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(op)) {
-      const auto &[am, ar] = *operands[0]->getValue().congruence;
-      const auto &[bm, br] = *operands[1]->getValue().congruence;
-      APInt wrap = APInt::getOneBitSet(2 * bits + 2, bits);
-      APInt modulus = llvm::APIntOps::GreatestCommonDivisor(am, bm);
-      APInt residue = ar + br;
-      if (isa<arith::SubIOp>(op))
-        residue = ar + wrap - br;
-      if (isa<arith::MulIOp>(op)) {
-        modulus = llvm::APIntOps::GreatestCommonDivisor(
-            llvm::APIntOps::GreatestCommonDivisor(am * bm, am * br), bm * ar);
-        residue = ar * br;
-      }
-      if (!modulus.isZero() && !modulus.isPowerOf2()) {
-        std::array<const ConstantIntRanges *, 2> ranges;
-        for (unsigned i : llvm::seq(2u)) {
-          const auto *state =
-              getOrCreateFor<dataflow::IntegerValueRangeLattice>(
-                  getProgramPointAfter(op), op->getOperand(i));
-          if (state->getValue().isUninitialized())
-            return success();
-          ranges[i] = &state->getValue().getValue();
-        }
-        bool wraps;
-        if (isa<arith::AddIOp>(op))
-          (void)ranges[0]->umax().uadd_ov(ranges[1]->umax(), wraps);
-        else if (isa<arith::MulIOp>(op))
-          (void)ranges[0]->umax().umul_ov(ranges[1]->umax(), wraps);
-        else
-          (void)ranges[0]->umin().usub_ov(ranges[1]->umax(), wraps);
-        if (wraps)
-          modulus = llvm::APIntOps::GreatestCommonDivisor(modulus, wrap);
-        else if (isa<arith::SubIOp>(op))
-          residue = ar + modulus - br.urem(modulus);
-      } else if (!modulus.isZero())
-        modulus = llvm::APIntOps::GreatestCommonDivisor(modulus, wrap);
-      facts.congruence = {modulus,
-                          residue.urem(modulus.isZero() ? wrap : modulus)};
+      if (inferArithmetic(op, operands, bits, facts) == FactStatus::Pending)
+        return success();
     }
+    if (inferRelations(op, facts) == FactStatus::Pending ||
+        inferTransitiveBounds(op, facts) == FactStatus::Pending)
+      return success();
+    LDBG_OS([&](raw_ostream &os) {
+      os << *op << ": ";
+      facts.print(os);
+    });
+    propagateIfChanged(results[0], results[0]->join(facts));
+    return success();
+  }
+
+private:
+  enum class FactStatus { Pending, Ready };
+
+  FactStatus inferRefinement(RefineOp refine,
+                             ArrayRef<const IntegerFactsLattice *> operands,
+                             IntegerFacts &facts) {
+    Operation *op = refine;
+    facts = operands[0]->getValue();
+    if (refine.getPredicate() == arith::CmpIPredicate::eq &&
+        operands[1]->getValue().congruence->first.isZero())
+      facts.congruence = operands[1]->getValue().congruence;
+    IntegerBound bound{refine.getBound(), refine.getPredicate()};
+    if (signedPredicate(bound.predicate) != bound.predicate) {
+      const auto *valueRange =
+          getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+              getProgramPointAfter(op), refine.getValue());
+      const auto *boundRange =
+          getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+              getProgramPointAfter(op), refine.getBound());
+      if (valueRange->getValue().isUninitialized() ||
+          boundRange->getValue().isUninitialized())
+        return FactStatus::Pending;
+      if (valueRange->getValue().getValue().smin().isNonNegative() &&
+          boundRange->getValue().getValue().smin().isNonNegative())
+        bound.predicate = signedPredicate(bound.predicate);
+    }
+    // Keep a finite prefix. Existing relations cannot change order on
+    // revisit.
+    if (facts.bounds.size() < 8 && !llvm::is_contained(facts.bounds, bound))
+      facts.bounds.push_back(bound);
+    else if (!llvm::is_contained(facts.bounds, bound))
+      LDBG() << "Symbolic bound budget exhausted: " << *op;
+    return FactStatus::Ready;
+  }
+
+  FactStatus inferArithmetic(Operation *op,
+                             ArrayRef<const IntegerFactsLattice *> operands,
+                             unsigned bits, IntegerFacts &facts) {
+    const auto &[am, ar] = *operands[0]->getValue().congruence;
+    const auto &[bm, br] = *operands[1]->getValue().congruence;
+    APInt wrap = APInt::getOneBitSet(2 * bits + 2, bits);
+    APInt modulus = llvm::APIntOps::GreatestCommonDivisor(am, bm);
+    APInt residue = ar + br;
+    if (isa<arith::SubIOp>(op))
+      residue = ar + wrap - br;
+    if (isa<arith::MulIOp>(op)) {
+      modulus = llvm::APIntOps::GreatestCommonDivisor(
+          llvm::APIntOps::GreatestCommonDivisor(am * bm, am * br), bm * ar);
+      residue = ar * br;
+    }
+    if (!modulus.isZero() && !modulus.isPowerOf2()) {
+      std::array<const ConstantIntRanges *, 2> ranges;
+      for (unsigned i : llvm::seq(2u)) {
+        const auto *state = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
+            getProgramPointAfter(op), op->getOperand(i));
+        if (state->getValue().isUninitialized())
+          return FactStatus::Pending;
+        ranges[i] = &state->getValue().getValue();
+      }
+      bool wraps;
+      if (isa<arith::AddIOp>(op))
+        (void)ranges[0]->umax().uadd_ov(ranges[1]->umax(), wraps);
+      else if (isa<arith::MulIOp>(op))
+        (void)ranges[0]->umax().umul_ov(ranges[1]->umax(), wraps);
+      else
+        (void)ranges[0]->umin().usub_ov(ranges[1]->umax(), wraps);
+      if (wraps)
+        modulus = llvm::APIntOps::GreatestCommonDivisor(modulus, wrap);
+      else if (isa<arith::SubIOp>(op))
+        residue = ar + modulus - br.urem(modulus);
+    } else if (!modulus.isZero())
+      modulus = llvm::APIntOps::GreatestCommonDivisor(modulus, wrap);
+    facts.congruence = {modulus,
+                        residue.urem(modulus.isZero() ? wrap : modulus)};
+    return FactStatus::Ready;
+  }
+
+  FactStatus inferRelations(Operation *op, IntegerFacts &facts) {
+    Value result = op->getResult(0);
     if (isa<arith::DivSIOp, arith::DivUIOp, arith::AddIOp, arith::SubIOp,
             arith::MulIOp, arith::MinSIOp, arith::MinUIOp>(op) &&
         isa<IntegerType>(result.getType())) {
@@ -904,7 +969,7 @@ public:
       };
       IntegerRelations relations(op->getOperands(), range, getFacts);
       if (pending)
-        return success();
+        return FactStatus::Pending;
       bool division = isa<arith::DivSIOp, arith::DivUIOp>(op);
       Value dividend = op->getOperand(0), divisor = op->getOperand(1);
       bool nonnegative =
@@ -912,39 +977,51 @@ public:
               ? relations.nonnegative(dividend) && relations.positive(divisor)
               : relations.hasRelations() && relations.nonnegative(result);
       if (nonnegative) {
-        DenseSet<Value> tried;
-        SmallVector<Value> candidates(relations.candidates());
-        std::stable_partition(
-            candidates.begin(), candidates.end(), [&](Value value) {
-              IntegerValueRange limit = range(value);
-              return !limit.isUninitialized() &&
-                     limit.getValue().smin().isStrictlyPositive();
-            });
-        for (Value bound : candidates) {
-          IntegerValueRange limit = range(bound);
-          if (bound.getType() != result.getType() ||
-              matchPattern(bound, m_Constant()) || limit.isUninitialized() ||
-              !limit.getValue().smin().isNonNegative() ||
-              !tried.insert(stripRefinements(bound)).second)
-            continue;
-          if (tried.size() > 8)
-            break;
-          bool proven =
-              division ? relations.productUpperBound(dividend, divisor, bound)
-                       : relations.upperBound(result, bound);
-          bool inclusive =
-              !proven && relations.upperBound(result, bound, false);
-          if (!proven && !inclusive)
-            continue;
-          if (facts.bounds.size() < 8)
-            facts.bounds.push_back({bound, proven ? arith::CmpIPredicate::slt
-                                                  : arith::CmpIPredicate::sle});
-        }
+        inferCandidateBounds(op, relations, range, facts);
         facts.sign = !division && relations.positive(result)
                          ? IntegerFacts::Sign::Positive
                          : IntegerFacts::Sign::Nonnegative;
       }
     }
+    return FactStatus::Ready;
+  }
+
+  void inferCandidateBounds(Operation *op, IntegerRelations &relations,
+                            function_ref<IntegerValueRange(Value)> range,
+                            IntegerFacts &facts) {
+    Value result = op->getResult(0);
+    bool division = isa<arith::DivSIOp, arith::DivUIOp>(op);
+    Value dividend = op->getOperand(0), divisor = op->getOperand(1);
+    DenseSet<Value> tried;
+    SmallVector<Value> candidates(relations.candidates());
+    std::stable_partition(candidates.begin(), candidates.end(),
+                          [&](Value value) {
+                            IntegerValueRange limit = range(value);
+                            return !limit.isUninitialized() &&
+                                   limit.getValue().smin().isStrictlyPositive();
+                          });
+    for (Value bound : candidates) {
+      IntegerValueRange limit = range(bound);
+      if (bound.getType() != result.getType() ||
+          matchPattern(bound, m_Constant()) || limit.isUninitialized() ||
+          !limit.getValue().smin().isNonNegative() ||
+          !tried.insert(stripRefinements(bound)).second)
+        continue;
+      if (tried.size() > 8)
+        break;
+      bool proven = division
+                        ? relations.productUpperBound(dividend, divisor, bound)
+                        : relations.upperBound(result, bound);
+      bool inclusive = !proven && relations.upperBound(result, bound, false);
+      if (!proven && !inclusive)
+        continue;
+      if (facts.bounds.size() < 8)
+        facts.bounds.push_back({bound, proven ? arith::CmpIPredicate::slt
+                                              : arith::CmpIPredicate::sle});
+    }
+  }
+
+  FactStatus inferTransitiveBounds(Operation *op, IntegerFacts &facts) {
     for (unsigned i = 0; i < facts.bounds.size() && facts.bounds.size() < 8;
          ++i) {
       IntegerBound bound = facts.bounds[i];
@@ -954,7 +1031,7 @@ public:
       const auto *limit =
           getLatticeElementFor(getProgramPointAfter(op), bound.value);
       if (!limit->getValue().congruence)
-        return success();
+        return FactStatus::Pending;
       for (IntegerBound upper : limit->getValue().bounds) {
         if (upper.predicate != P::slt && upper.predicate != P::sle)
           continue;
@@ -967,72 +1044,67 @@ public:
           facts.bounds.push_back(transitive);
       }
     }
-    LDBG_OS([&](raw_ostream &os) {
-      os << *op << ": ";
-      facts.print(os);
-    });
-    propagateIfChanged(results[0], results[0]->join(facts));
-    return success();
+    return FactStatus::Ready;
   }
 };
+
+static bool refineOrderedEndpoints(arith::CmpIPredicate predicate,
+                                   bool isUnsigned, APInt &lo, APInt &hi,
+                                   const APInt &boundLo, const APInt &boundHi) {
+  auto less = [&](const APInt &a, const APInt &b) {
+    return isUnsigned ? a.ult(b) : a.slt(b);
+  };
+  APInt lower = boundLo, upper = boundHi;
+  using P = arith::CmpIPredicate;
+  switch (signedPredicate(predicate)) {
+  case P::slt:
+    if (isUnsigned ? upper.isZero() : upper.isMinSignedValue())
+      return false;
+    --upper;
+    [[fallthrough]];
+  case P::sle:
+    if (less(upper, hi))
+      hi = upper;
+    break;
+  case P::sgt:
+    if (isUnsigned ? lower.isMaxValue() : lower.isMaxSignedValue())
+      return false;
+    ++lower;
+    [[fallthrough]];
+  case P::sge:
+    if (less(lo, lower))
+      lo = lower;
+    break;
+  default:
+    llvm_unreachable("expected ordered integer comparison");
+  }
+  return true;
+}
 
 static ConstantIntRanges refineRange(arith::CmpIPredicate predicate,
                                      const ConstantIntRanges &value,
                                      const ConstantIntRanges &bound) {
   using P = arith::CmpIPredicate;
-  bool isUnsigned = predicate == P::ult || predicate == P::ule ||
-                    predicate == P::ugt || predicate == P::uge;
+  bool isUnsigned = signedPredicate(predicate) != predicate;
   APInt lo = isUnsigned ? value.umin() : value.smin();
   APInt hi = isUnsigned ? value.umax() : value.smax();
   APInt boundLo = isUnsigned ? bound.umin() : bound.smin();
   APInt boundHi = isUnsigned ? bound.umax() : bound.smax();
-  auto less = [&](const APInt &a, const APInt &b) {
-    return isUnsigned ? a.ult(b) : a.slt(b);
-  };
-  auto setLower = [&](const APInt &v) {
-    if (less(lo, v))
-      lo = v;
-  };
-  auto setUpper = [&](const APInt &v) {
-    if (less(v, hi))
-      hi = v;
-  };
-  switch (predicate) {
-  case P::eq:
-    setLower(boundLo);
-    setUpper(boundHi);
-    break;
-  case P::slt:
-  case P::ult:
-    if (isUnsigned ? boundHi.isZero() : boundHi.isMinSignedValue())
-      return value;
-    setUpper(boundHi - 1);
-    break;
-  case P::sle:
-  case P::ule:
-    setUpper(boundHi);
-    break;
-  case P::sgt:
-  case P::ugt:
-    if (isUnsigned ? boundLo.isMaxValue() : boundLo.isMaxSignedValue())
-      return value;
-    setLower(boundLo + 1);
-    break;
-  case P::sge:
-  case P::uge:
-    setLower(boundLo);
-    break;
-  case P::ne:
+  if (predicate == P::eq) {
+    lo = llvm::APIntOps::smax(lo, boundLo);
+    hi = llvm::APIntOps::smin(hi, boundHi);
+  } else if (predicate == P::ne) {
     if (boundLo == boundHi && lo != hi) {
       if (lo == boundLo)
         ++lo;
       if (hi == boundHi)
         --hi;
     }
-    break;
-  }
+  } else if (!refineOrderedEndpoints(predicate, isUnsigned, lo, hi, boundLo,
+                                     boundHi))
+    return value;
   // Contradictions poison this result; they do not make its block unreachable.
-  if (less(hi, lo))
+  if (isUnsigned ? hi.ult(lo) : hi.slt(lo))
     return value;
   ConstantIntRanges refined = isUnsigned
                                   ? ConstantIntRanges::fromUnsigned(lo, hi)
@@ -1119,6 +1191,27 @@ static bool inferTritonRanges(Operation *op,
   return false;
 }
 
+static ConstantIntRanges refineCongruence(ConstantIntRanges refined,
+                                          const IntegerFacts &facts) {
+  const auto &[modulus, residue] = *facts.congruence;
+  if (modulus.isZero()) {
+    APInt exact = residue.trunc(refined.umin().getBitWidth());
+    if (exact.uge(refined.umin()) && exact.ule(refined.umax()) &&
+        exact.sge(refined.smin()) && exact.sle(refined.smax()))
+      refined = ConstantIntRanges::constant(exact);
+  } else if (!modulus.isOne()) {
+    APInt lo = refined.umin().zext(modulus.getBitWidth());
+    APInt hi = refined.umax().zext(modulus.getBitWidth());
+    lo += (residue + modulus - lo.urem(modulus)).urem(modulus);
+    APInt delta = (hi + modulus - residue).urem(modulus);
+    if (hi.uge(delta) && lo.ule(hi - delta))
+      refined = refined.intersection(ConstantIntRanges::fromUnsigned(
+          lo.trunc(refined.umin().getBitWidth()),
+          (hi - delta).trunc(refined.umin().getBitWidth())));
+  }
+  return refined;
+}
+
 class IntegerRangeAnalysis final : public dataflow::IntegerRangeAnalysis {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IntegerRangeAnalysis)
@@ -1150,22 +1243,7 @@ public:
             APInt(width, sign == IntegerFacts::Sign::Positive),
             APInt::getSignedMaxValue(width)));
       }
-      const auto &[modulus, residue] = *facts->getValue().congruence;
-      if (modulus.isZero()) {
-        APInt exact = residue.trunc(refined.umin().getBitWidth());
-        if (exact.uge(refined.umin()) && exact.ule(refined.umax()) &&
-            exact.sge(refined.smin()) && exact.sle(refined.smax()))
-          refined = ConstantIntRanges::constant(exact);
-      } else if (!modulus.isOne()) {
-        APInt lo = refined.umin().zext(modulus.getBitWidth());
-        APInt hi = refined.umax().zext(modulus.getBitWidth());
-        lo += (residue + modulus - lo.urem(modulus)).urem(modulus);
-        APInt delta = (hi + modulus - residue).urem(modulus);
-        if (hi.uge(delta) && lo.ule(hi - delta))
-          refined = refined.intersection(ConstantIntRanges::fromUnsigned(
-              lo.trunc(refined.umin().getBitWidth()),
-              (hi - delta).trunc(refined.umin().getBitWidth())));
-      }
+      refined = refineCongruence(refined, facts->getValue());
       for (IntegerBound bound : facts->getValue().bounds) {
         const auto *limit = getOrCreateFor<dataflow::IntegerValueRangeLattice>(
             getProgramPointAfter(op), bound.value);
@@ -1228,28 +1306,7 @@ IntegerValueRange IntegerFactAnalysis::getRange(Value value) const {
   return state ? state->getValue() : IntegerValueRange::getMaxRange(value);
 }
 
-IntegerProof IntegerFactAnalysis::prove(arith::CmpIPredicate predicate,
-                                        Value lhs, Value rhs) const {
-  assert(solver && "initialize integer facts before querying");
-  IntegerValueRange a = getRange(lhs);
-  IntegerValueRange b = getRange(rhs);
-  bool nonnegative = !a.isUninitialized() && !b.isUninitialized() &&
-                     a.getValue().smin().isNonNegative() &&
-                     b.getValue().smin().isNonNegative();
-  if (nonnegative)
-    predicate = signedPredicate(predicate);
-  if (const auto *facts = solver->lookupState<IntegerFactsLattice>(lhs))
-    for (IntegerBound bound : facts->getValue().bounds)
-      if (stripRefinements(bound.value) == stripRefinements(rhs)) {
-        if (nonnegative)
-          bound.predicate = signedPredicate(bound.predicate);
-        if (bound.predicate == predicate)
-          return IntegerProof::Proven;
-        if (bound.predicate == arith::invertPredicate(predicate))
-          return IntegerProof::Disproven;
-      }
-  if (a.isUninitialized() || b.isUninitialized())
-    return IntegerProof::Unknown;
+static intrange::CmpPredicate rangePredicate(arith::CmpIPredicate predicate) {
   using P = arith::CmpIPredicate;
   intrange::CmpPredicate pred;
   switch (predicate) {
@@ -1284,6 +1341,34 @@ IntegerProof IntegerFactAnalysis::prove(arith::CmpIPredicate predicate,
     pred = intrange::CmpPredicate::uge;
     break;
   }
+  return pred;
+}
+
+static bool hasNonnegativeRange(const IntegerValueRange &range) {
+  return !range.isUninitialized() && range.getValue().smin().isNonNegative();
+}
+
+IntegerProof IntegerFactAnalysis::prove(arith::CmpIPredicate predicate,
+                                        Value lhs, Value rhs) const {
+  assert(solver && "initialize integer facts before querying");
+  IntegerValueRange a = getRange(lhs);
+  IntegerValueRange b = getRange(rhs);
+  bool nonnegative = hasNonnegativeRange(a) && hasNonnegativeRange(b);
+  if (nonnegative)
+    predicate = signedPredicate(predicate);
+  if (const auto *facts = solver->lookupState<IntegerFactsLattice>(lhs))
+    for (IntegerBound bound : facts->getValue().bounds)
+      if (stripRefinements(bound.value) == stripRefinements(rhs)) {
+        if (nonnegative)
+          bound.predicate = signedPredicate(bound.predicate);
+        if (bound.predicate == predicate)
+          return IntegerProof::Proven;
+        if (bound.predicate == arith::invertPredicate(predicate))
+          return IntegerProof::Disproven;
+      }
+  if (a.isUninitialized() || b.isUninitialized())
+    return IntegerProof::Unknown;
+  intrange::CmpPredicate pred = rangePredicate(predicate);
   std::optional<bool> result =
       intrange::evaluatePred(pred, a.getValue(), b.getValue());
   if (!result)

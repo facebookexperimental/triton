@@ -78,24 +78,26 @@ private:
   DataFlowSolver &solver;
 };
 
+static bool rangeMayContain(DataFlowSolver &solver, Value value,
+                            const APInt &candidate) {
+  const auto *lattice =
+      solver.lookupState<dataflow::IntegerValueRangeLattice>(value);
+  if (!lattice || lattice->getValue().isUninitialized())
+    return true;
+  const auto &range = lattice->getValue().getValue();
+  return range.smin().sle(candidate) && range.smax().sge(candidate) &&
+         range.umin().ule(candidate) && range.umax().uge(candidate);
+}
+
 static bool preservesIntegerWidth(Operation *op, DataFlowSolver &solver) {
   if (isa<arith::RemSIOp>(op)) {
     unsigned width = getElementTypeOrSelf(op->getResult(0).getType())
                          .getIntOrFloatBitWidth();
     if (width > 32) {
-      auto mayContain = [&](Value value, const APInt &candidate) {
-        const auto *lattice =
-            solver.lookupState<dataflow::IntegerValueRangeLattice>(value);
-        if (!lattice || lattice->getValue().isUninitialized())
-          return true;
-        const auto &range = lattice->getValue().getValue();
-        return range.smin().sle(candidate) && range.smax().sge(candidate) &&
-               range.umin().ule(candidate) && range.umax().uge(candidate);
-      };
       // LLVM srem is undefined for the narrowed signed minimum modulo -1.
-      if (mayContain(op->getOperand(0),
-                     APInt::getSignedMinValue(32).sext(width)) &&
-          mayContain(op->getOperand(1), APInt::getAllOnes(width)))
+      if (rangeMayContain(solver, op->getOperand(0),
+                          APInt::getSignedMinValue(32).sext(width)) &&
+          rangeMayContain(solver, op->getOperand(1), APInt::getAllOnes(width)))
         return false;
     }
   }
@@ -220,6 +222,34 @@ static Value refinementIdentity(Value value) {
   return value;
 }
 
+static SmallVector<std::pair<Value, bool>>
+refinementInputs(Predicate predicate, Block *block, Block::iterator position,
+                 DominanceInfo &dominance,
+                 function_ref<bool(RefineOp)> matches) {
+  bool known = false;
+  for (Value value = predicate.value;
+       auto refine = value.getDefiningOp<RefineOp>(); value = refine.getValue())
+    known |= matches(refine);
+  SmallVector<std::pair<Value, bool>> pending{{predicate.value, known}};
+  SmallVector<std::pair<Value, bool>> inputs;
+  DenseSet<Value> visited;
+  while (!pending.empty()) {
+    auto [input, known] = pending.pop_back_val();
+    if (!visited.insert(input).second)
+      continue;
+    inputs.emplace_back(input, known);
+    for (Operation *user : input.getUsers()) {
+      auto candidate = dyn_cast<RefineOp>(user);
+      if (!candidate || candidate.getValue() != input ||
+          position == block->end() ||
+          !dominance.properlyDominates(user, &*position))
+        continue;
+      pending.emplace_back(candidate.getResult(), known || matches(candidate));
+    }
+  }
+  return inputs;
+}
+
 static void materialize(ArrayRef<Predicate> predicates, Block *block,
                         Block::iterator position, DominanceInfo &dominance) {
   // Existing entry refinements already dominate the remaining scope.
@@ -234,29 +264,8 @@ static void materialize(ArrayRef<Predicate> predicates, Block *block,
                  refinementIdentity(predicate.bound) &&
              refine.getPredicate() == predicate.comparison;
     };
-    bool known = false;
-    for (Value value = predicate.value;
-         auto refine = value.getDefiningOp<RefineOp>();
-         value = refine.getValue())
-      known |= matches(refine);
-    SmallVector<std::pair<Value, bool>> pending{{predicate.value, known}};
-    SmallVector<std::pair<Value, bool>> inputs;
-    DenseSet<Value> visited;
-    while (!pending.empty()) {
-      auto [input, known] = pending.pop_back_val();
-      if (!visited.insert(input).second)
-        continue;
-      inputs.emplace_back(input, known);
-      for (Operation *user : input.getUsers()) {
-        auto candidate = dyn_cast<RefineOp>(user);
-        if (!candidate || candidate.getValue() != input ||
-            position == block->end() ||
-            !dominance.properlyDominates(user, &*position))
-          continue;
-        pending.emplace_back(candidate.getResult(),
-                             known || matches(candidate));
-      }
-    }
+    auto inputs =
+        refinementInputs(predicate, block, position, dominance, matches);
     for (auto [input, known] : inputs) {
       if (known)
         continue;
@@ -277,6 +286,36 @@ static void materialize(ArrayRef<Predicate> predicates, Block *block,
       // A sibling refinement can be poison even when this input is defined.
       input.replaceUsesWithIf(refinement.getResult(), inScope);
     }
+  }
+}
+
+static void materializeBranchEdges(cf::CondBranchOp branch,
+                                   DominanceInfo &dominance) {
+  for (unsigned edge : {0u, 1u}) {
+    SmallVector<Predicate> predicates;
+    collectPredicates(branch.getCondition(), edge == 0, predicates);
+    if (predicates.empty())
+      continue;
+    Block *destination = branch->getSuccessor(edge);
+    ValueRange operands = edge == 0 ? branch.getTrueDestOperands()
+                                    : branch.getFalseDestOperands();
+    if (!destination->getSinglePredecessor() ||
+        branch.getTrueDest() == branch.getFalseDest()) {
+      SmallVector<Value> arguments(operands);
+      OpBuilder builder(branch);
+      Block *edgeBlock = builder.createBlock(destination);
+      cf::BranchOp::create(builder, branch.getLoc(), destination, arguments);
+      branch->setSuccessor(edgeBlock, edge);
+      branch.getSuccessorOperands(edge).erase(0, arguments.size());
+      destination = edgeBlock;
+      dominance.invalidate();
+    } else if (dominance.properlyDominates(branch->getBlock(), destination)) {
+      // Unique incoming values dominate every successor argument use.
+      for (auto [operand, argument] :
+           llvm::zip_equal(operands, destination->getArguments()))
+        argument.replaceAllUsesWith(operand);
+    }
+    materialize(predicates, destination, destination->begin(), dominance);
   }
 }
 
@@ -321,34 +360,7 @@ struct TritonMaterializeIntegerFactsPass
         materialize(predicates, loop.getBody(), loop.getBody()->begin(),
                     dominance);
       } else if (auto branch = dyn_cast<cf::CondBranchOp>(source)) {
-        for (unsigned edge : {0u, 1u}) {
-          SmallVector<Predicate> predicates;
-          collectPredicates(branch.getCondition(), edge == 0, predicates);
-          if (predicates.empty())
-            continue;
-          Block *destination = branch->getSuccessor(edge);
-          ValueRange operands = edge == 0 ? branch.getTrueDestOperands()
-                                          : branch.getFalseDestOperands();
-          if (!destination->getSinglePredecessor() ||
-              branch.getTrueDest() == branch.getFalseDest()) {
-            SmallVector<Value> arguments(operands);
-            OpBuilder builder(source);
-            Block *edgeBlock = builder.createBlock(destination);
-            cf::BranchOp::create(builder, source->getLoc(), destination,
-                                 arguments);
-            branch->setSuccessor(edgeBlock, edge);
-            branch.getSuccessorOperands(edge).erase(0, arguments.size());
-            destination = edgeBlock;
-            dominance.invalidate();
-          } else if (dominance.properlyDominates(branch->getBlock(),
-                                                 destination)) {
-            // Unique incoming values dominate every successor argument use.
-            for (auto [operand, argument] :
-                 llvm::zip_equal(operands, destination->getArguments()))
-              argument.replaceAllUsesWith(operand);
-          }
-          materialize(predicates, destination, destination->begin(), dominance);
-        }
+        materializeBranchEdges(branch, dominance);
       }
     }
   }

@@ -186,8 +186,7 @@ Value createTruncIOffset(RewriterBase &rewriter, Location loc, Value offset,
 
 using ScalarToSplatMap = llvm::SmallMapVector<std::pair<Value, Type>, Value, 8>;
 
-// Distribute within the narrow ring; extension stays around the rebuilt sum.
-static void distributeAddressProducts(tt::FuncOp func) {
+static SmallVector<arith::MulIOp> collectAddressProducts(tt::FuncOp func) {
   SmallVector<arith::MulIOp> candidates;
   DenseSet<Value> visited;
   SmallVector<Value> pending;
@@ -206,6 +205,54 @@ static void distributeAddressProducts(tt::FuncOp func) {
         isa<tt::BroadcastOp, tt::ExpandDimsOp, tt::SplatOp>(op))
       llvm::append_range(pending, op->getOperands());
   }
+  return candidates;
+}
+
+static bool distributeAddressProduct(arith::MulIOp mul, scf::ForOp loop,
+                                     Liveness &liveness,
+                                     DenseMap<Operation *, unsigned> &pressure,
+                                     unsigned budget, IRRewriter &rewriter) {
+  for (unsigned side : llvm::seq(2u)) {
+    auto factor = mul->getOperand(side).getDefiningOp<tt::SplatOp>();
+    auto sum = mul->getOperand(1 - side).getDefiningOp<arith::AddIOp>();
+    if (!factor || !sum || !loop.isDefinedOutsideOfLoop(factor.getSrc()))
+      continue;
+    for (unsigned term : llvm::seq(2u)) {
+      auto uniform = sum->getOperand(term).getDefiningOp<tt::SplatOp>();
+      Value lane = sum->getOperand(1 - term);
+      if (!uniform || loop.isDefinedOutsideOfLoop(uniform.getSrc()) ||
+          !loop.isDefinedOutsideOfLoop(lane))
+        continue;
+      auto [it, inserted] = pressure.try_emplace(loop, 0);
+      if (inserted)
+        it->second = estimateLoopRegisterPressure(loop, liveness);
+      unsigned extra = estimateTensorRegisters(lane);
+      LDBG("address product pressure " << it->second << " + " << extra);
+      if (it->second + extra >= budget)
+        continue;
+      it->second += extra;
+      Location loc = mul.getLoc();
+      rewriter.setInsertionPoint(loop);
+      Value invariantFactor =
+          tt::SplatOp::create(rewriter, loc, lane.getType(), factor.getSrc());
+      Value invariant =
+          arith::MulIOp::create(rewriter, loc, lane, invariantFactor);
+      rewriter.setInsertionPoint(mul);
+      Value scalar = arith::MulIOp::create(rewriter, loc, uniform.getSrc(),
+                                           factor.getSrc());
+      Value splat = tt::SplatOp::create(rewriter, loc, mul.getType(), scalar);
+      Value replacement =
+          arith::AddIOp::create(rewriter, loc, splat, invariant);
+      mul.getResult().replaceAllUsesWith(replacement);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Distribute within the narrow ring; extension stays around the rebuilt sum.
+static void distributeAddressProducts(tt::FuncOp func) {
+  auto candidates = collectAddressProducts(func);
   if (candidates.empty())
     return;
 
@@ -229,44 +276,9 @@ static void distributeAddressProducts(tt::FuncOp func) {
     auto type = dyn_cast<RankedTensorType>(mul.getType());
     if (!type || !type.getEncoding())
       continue;
-    for (unsigned side : llvm::seq(2u)) {
-      auto factor = mul->getOperand(side).getDefiningOp<tt::SplatOp>();
-      auto sum = mul->getOperand(1 - side).getDefiningOp<arith::AddIOp>();
-      if (!factor || !sum || !loop.isDefinedOutsideOfLoop(factor.getSrc()))
-        continue;
-      for (unsigned term : llvm::seq(2u)) {
-        auto uniform = sum->getOperand(term).getDefiningOp<tt::SplatOp>();
-        Value lane = sum->getOperand(1 - term);
-        if (!uniform || loop.isDefinedOutsideOfLoop(uniform.getSrc()) ||
-            !loop.isDefinedOutsideOfLoop(lane))
-          continue;
-        auto [it, inserted] = pressure.try_emplace(loop, 0);
-        if (inserted)
-          it->second = estimateLoopRegisterPressure(loop, liveness);
-        unsigned extra = estimateTensorRegisters(lane);
-        LDBG("address product pressure " << it->second << " + " << extra);
-        if (it->second + extra >= budget)
-          continue;
-        it->second += extra;
-        Location loc = mul.getLoc();
-        rewriter.setInsertionPoint(loop);
-        Value invariantFactor =
-            tt::SplatOp::create(rewriter, loc, lane.getType(), factor.getSrc());
-        Value invariant =
-            arith::MulIOp::create(rewriter, loc, lane, invariantFactor);
-        rewriter.setInsertionPoint(mul);
-        Value scalar = arith::MulIOp::create(rewriter, loc, uniform.getSrc(),
-                                             factor.getSrc());
-        Value splat = tt::SplatOp::create(rewriter, loc, mul.getType(), scalar);
-        Value replacement =
-            arith::AddIOp::create(rewriter, loc, splat, invariant);
-        mul.getResult().replaceAllUsesWith(replacement);
-        rewritten.insert(mul);
-        break;
-      }
-      if (rewritten.contains(mul))
-        break;
-    }
+    if (distributeAddressProduct(mul, loop, liveness, pressure, budget,
+                                 rewriter))
+      rewritten.insert(mul);
   }
 }
 
