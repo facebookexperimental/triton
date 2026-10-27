@@ -77,6 +77,11 @@ jobs:
           packages: numpy pytest pytest-timeout torchao
           # Keep the release torch on its bundled ROCm libraries.
           rocm-lib-path: ""
+      # Triton finds libcuda through the linker cache, which is stale on the
+      # linux-gcp-h100 runners until refreshed; h100.yml and b200.yml do the same.
+      - name: Refresh the linker cache
+        if: ${{ !contains(inputs.torch_index, 'rocm') }}
+        run: sudo ldconfig
       - name: Install prebuilt Triton
         uses: ./.ci/.github/actions/install-prebuilt-triton
         with:
