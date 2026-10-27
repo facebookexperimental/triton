@@ -85,23 +85,25 @@ def _stock_triton_kernel(
 ):
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
-    index_m = tl.cast(M, tl.uint64)
-    index_n = tl.cast(N, tl.uint64)
-    pid = tl.program_id(0).to(tl.uint64)
-    num_pid_m = tl.cdiv(index_m, BLOCK_M)
-    num_pid_n = tl.cdiv(index_n, BLOCK_N)
+    pid = tl.program_id(0)
+    tl.assume(pid >= 0)
+    # Ceiling-division sums can exceed i32 for valid positive dimensions.
+    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_M)
+    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_N)
     tl.assume(pid < num_pid_m * num_pid_n)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    tl.assume(group_size_m > 0)
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
-    # Last tile starts at or before the last matrix element.
-    tl.assume(pid_m <= (index_m - 1) // BLOCK_M)
-    tl.assume(pid_n <= (index_n - 1) // BLOCK_N)
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % index_n
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_m <= (M - 1) // BLOCK_M)
+    tl.assume(pid_n <= (N - 1) // BLOCK_N)
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
@@ -188,26 +190,28 @@ def _skinny_atomic_kernel(
 ):
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
-    index_m = tl.cast(M, tl.uint64)
-    index_n = tl.cast(N, tl.uint64)
-    pid = tl.program_id(0).to(tl.uint64)
+    pid = tl.program_id(0)
+    tl.assume(pid >= 0)
     pid_k = tl.program_id(1)
-    num_pid_m = tl.cdiv(index_m, BLOCK_M)
-    num_pid_n = tl.cdiv(index_n, BLOCK_N)
+    # Ceiling-division sums can exceed i32 for valid positive dimensions.
+    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_M)
+    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_N)
     tl.assume(pid < num_pid_m * num_pid_n)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    tl.assume(group_size_m > 0)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
-    # Last tile starts at or before the last matrix element.
-    tl.assume(pid_m <= (index_m - 1) // BLOCK_M)
-    tl.assume(pid_n <= (index_n - 1) // BLOCK_N)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_m <= (M - 1) // BLOCK_M)
+    tl.assume(pid_n <= (N - 1) // BLOCK_N)
     k_start = pid_k * K_PER_SPLIT
     k_end = min(k_start + K_PER_SPLIT, K)
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % index_n
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
     b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn
@@ -306,26 +310,28 @@ def _twopass_compute_kernel(
 ):
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
-    index_m = tl.cast(M, tl.uint64)
-    index_n = tl.cast(N, tl.uint64)
-    pid = tl.program_id(0).to(tl.uint64)
+    pid = tl.program_id(0)
+    tl.assume(pid >= 0)
     pid_k = tl.program_id(1)
-    num_pid_m = tl.cdiv(index_m, BLOCK_M)
-    num_pid_n = tl.cdiv(index_n, BLOCK_N)
+    # Ceiling-division sums can exceed i32 for valid positive dimensions.
+    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_M)
+    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_N)
     tl.assume(pid < num_pid_m * num_pid_n)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    tl.assume(group_size_m > 0)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
-    # Last tile starts at or before the last matrix element.
-    tl.assume(pid_m <= (index_m - 1) // BLOCK_M)
-    tl.assume(pid_n <= (index_n - 1) // BLOCK_N)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_m <= (M - 1) // BLOCK_M)
+    tl.assume(pid_n <= (N - 1) // BLOCK_N)
     k_start = pid_k * K_PER_SPLIT
     k_end = min(k_start + K_PER_SPLIT, K)
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % index_n
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
     b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn

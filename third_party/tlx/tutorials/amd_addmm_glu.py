@@ -146,15 +146,15 @@ def tlx_addmm_glu_kernel_optimized(
 
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
-    index_m = tl.cast(M, tl.uint64)
-    index_n = tl.cast(N, tl.uint64)
-    pid = tl.program_id(axis=0).to(tl.uint64)
+    pid = tl.program_id(axis=0)
+    tl.assume(pid >= 0)
 
     # Num pids along M dim
-    num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)
+    # Ceiling-division sums can exceed i32 for valid positive dimensions.
+    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_SIZE_M)
 
     # Num pids along N dim
-    num_pid_n = tl.cdiv(index_n, BLOCK_SIZE_N)
+    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_SIZE_N)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
@@ -162,6 +162,7 @@ def tlx_addmm_glu_kernel_optimized(
     # Remap pids via L2 swizzle
     tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
+    tl.assume(pid >= 0)
 
     # Num pids in the group (of shared rows along M dim pids)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -174,20 +175,25 @@ def tlx_addmm_glu_kernel_optimized(
 
     # Either GROUP_SIZE_M or smaller due to last group cutting off early
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    tl.assume(group_size_m > 0)
 
     # Which pid along m dim
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
 
     # Which pid along n dim
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_m <= (M - 1) // BLOCK_SIZE_M)
+    tl.assume(pid_n <= (N - 1) // BLOCK_SIZE_N)
 
     # Get offsets this pid is responsible for in m dim
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_m = offs_cm % index_m
+    offs_m = offs_cm % M
 
     # Get offsets this pid is responsible for in n dim
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_n = offs_cn % index_n
+    offs_n = offs_cn % N
 
     # Get offsets this pid is responsible for in k dim
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -313,7 +319,7 @@ def tlx_addmm_glu_kernel_optimized(
 
     c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
 
-    output_mask = (offs_cm[:, None] < index_m) & (offs_cn[None, :] < index_n)
+    output_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=output_mask, cache_modifier=".cs")
 
 
@@ -394,15 +400,15 @@ def tlx_addmm_glu_kernel_optimized_async(
 
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
-    index_m = tl.cast(M, tl.uint64)
-    index_n = tl.cast(N, tl.uint64)
-    pid = tl.program_id(axis=0).to(tl.uint64)
+    pid = tl.program_id(axis=0)
+    tl.assume(pid >= 0)
 
     # Num pids along M dim
-    num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)
+    # Ceiling-division sums can exceed i32 for valid positive dimensions.
+    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_SIZE_M)
 
     # Num pids along N dim
-    num_pid_n = tl.cdiv(index_n, BLOCK_SIZE_N)
+    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_SIZE_N)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
@@ -410,6 +416,7 @@ def tlx_addmm_glu_kernel_optimized_async(
     # Remap pids via L2 swizzle
     tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
+    tl.assume(pid >= 0)
 
     # Num pids in the group (of shared rows along M dim pids)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -422,21 +429,26 @@ def tlx_addmm_glu_kernel_optimized_async(
 
     # Either GROUP_SIZE_M or smaller due to last group cutting off early
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    tl.assume(group_size_m > 0)
 
     # Which pid along m dim
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
 
     # Which pid along n dim
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_m <= (M - 1) // BLOCK_SIZE_M)
+    tl.assume(pid_n <= (N - 1) // BLOCK_SIZE_N)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
     # Get offsets this pid is responsible for in m dim
-    offs_m = offs_cm % index_m
+    offs_m = offs_cm % M
 
     # Get offsets this pid is responsible for in n dim
-    offs_n = offs_cn % index_n
+    offs_n = offs_cn % N
 
     # Get offsets this pid is responsible for in k dim
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -624,25 +636,31 @@ def tlx_addmm_glu_kernel_simple_async(
 
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
-    index_m = tl.cast(M, tl.uint64)
-    index_n = tl.cast(N, tl.uint64)
-    pid = tl.program_id(axis=0).to(tl.uint64)
-    num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(index_n, BLOCK_SIZE_N)
+    pid = tl.program_id(axis=0)
+    tl.assume(pid >= 0)
+    # Ceiling-division sums can exceed i32 for valid positive dimensions.
+    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_SIZE_N)
     grid_mn = num_pid_m * num_pid_n
     tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
+    tl.assume(pid >= 0)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    tl.assume(group_size_m > 0)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_m <= (M - 1) // BLOCK_SIZE_M)
+    tl.assume(pid_n <= (N - 1) // BLOCK_SIZE_N)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_m = offs_cm % index_m
-    offs_n = offs_cn % index_n
+    offs_m = offs_cm % M
+    offs_n = offs_cn % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # Async-prefetch Y into a padded LDS buffer before the K-loop
@@ -718,14 +736,14 @@ def tlx_addmm_glu_kernel_persistent(
 
     NUM_BUFFERS: tl.constexpr = 3
 
-    # Launcher skips empty matrices; tile coordinates must not wrap in i32.
+    # Launcher skips empty matrices; bounds preserve padded tile coordinates.
     tl.assume((M > 0) & (N > 0))
-    index_m = tl.cast(M, tl.uint64)
-    index_n = tl.cast(N, tl.uint64)
-    start_pid = tl.program_id(axis=0).to(tl.uint64)
+    start_pid = tl.program_id(axis=0)
+    tl.assume(start_pid >= 0)
 
-    num_pid_m = tl.cdiv(index_m, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(index_n, BLOCK_SIZE_N)
+    # Ceiling-division sums can exceed i32 for valid positive dimensions.
+    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_SIZE_N)
     num_tiles = num_pid_m * num_pid_n
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
@@ -739,6 +757,7 @@ def tlx_addmm_glu_kernel_persistent(
     for tile_id in tl.range(start_pid, num_tiles, NUM_CUS):
         # Apply XCD swizzle to the flat tile_id for L2 locality
         swizzled = chiplet_transform_chunked(tile_id, num_tiles, NUM_XCDS, XCD_CHUNK)
+        tl.assume(swizzled >= 0)
 
         # Delinearize swizzled tile_id
         group_id = swizzled // num_pid_in_group
@@ -747,14 +766,19 @@ def tlx_addmm_glu_kernel_persistent(
         rows_left = num_pid_m - first_pid_m
         tl.assume((rows_left > 0) & (rows_left <= num_pid_m))
         group_size_m = min(rows_left, GROUP_SIZE_M)
+        tl.assume(group_size_m > 0)
         pid_m = first_pid_m + ((swizzled % num_pid_in_group) % group_size_m)
         pid_n = (swizzled % num_pid_in_group) // group_size_m
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+        tl.assume(pid_m <= (M - 1) // BLOCK_SIZE_M)
+        tl.assume(pid_n <= (N - 1) // BLOCK_SIZE_N)
         # Grouped mapping stays inside the matrix tile grid.
         tl.assume(pid_m < num_pid_m)
         tl.assume(pid_n < num_pid_n)
 
-        offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % index_m
-        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % index_n
+        offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
 
         a_base_off = offs_m[:, None] * sa0
         b_base_off = offs_n[None, :] * sb1
@@ -839,7 +863,7 @@ def tlx_addmm_glu_kernel_persistent(
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_mask = (offs_cm[:, None] < index_m) & (offs_cn[None, :] < index_n)
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
         tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
 

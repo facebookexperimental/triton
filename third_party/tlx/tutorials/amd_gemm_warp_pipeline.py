@@ -63,25 +63,31 @@ def matmul_kernel_warp_pipeline(
     tl.assume(stride_bk > 0)
 
     if (M > 0) & (N > 0):
-        index_m = tl.cast(M, tl.uint64)
-        index_n = tl.cast(N, tl.uint64)
-        pid = tl.program_id(0).to(tl.uint64)
-        num_pid_m = tl.cdiv(index_m, BLOCK_M)
-        num_pid_n = tl.cdiv(index_n, BLOCK_N)
+        pid = tl.program_id(0)
+        tl.assume(pid >= 0)
+        # Ceiling-division sums can exceed i32 for valid positive dimensions.
+        num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_M)
+        num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_N)
         grid_mn = num_pid_m * num_pid_n
         if pid < grid_mn:
             pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
+            tl.assume(pid >= 0)
 
             num_pid_in_group = GROUP_M * num_pid_n
             group_id = pid // num_pid_in_group
             first_pid_m = group_id * GROUP_M
             group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+            tl.assume(group_size_m > 0)
             pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
             pid_n = (pid % num_pid_in_group) // group_size_m
+            tl.assume(pid_m >= 0)
+            tl.assume(pid_n >= 0)
+            tl.assume(pid_m <= (M - 1) // BLOCK_M)
+            tl.assume(pid_n <= (N - 1) // BLOCK_N)
 
             # Precompute row/col offsets (these are per-thread, not carried in loop)
-            offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m
-            offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % index_n
+            offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+            offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
             offs_k = tl.arange(0, BLOCK_K)
 
             # Base offsets — recompute full pointer from tile_id * BLOCK_K
@@ -150,7 +156,7 @@ def matmul_kernel_warp_pipeline(
             offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
             offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
             c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-            c_mask = (offs_cm[:, None] < index_m) & (offs_cn[None, :] < index_n)
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
             tl.store(c_ptrs, c, mask=c_mask)
 
 
