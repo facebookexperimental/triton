@@ -10,9 +10,6 @@ from triton.backends.compiler import GPUTarget
 from triton.backends.nvidia.compiler import _max_shared_mem_for_capability
 from triton.compiler import ASTSource
 from triton.compiler.errors import CompileTimeAssertionFailure
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
-from triton.experimental.gluon._runtime import GluonASTSource
 from triton.runtime.driver import driver
 
 
@@ -20,60 +17,6 @@ from triton.runtime.driver import driver
 def topk_kernel(K: tl.constexpr):
     x = tl.arange(0, 8)
     tl.topk(x, K)
-
-
-@pytest.mark.parametrize("capability", [80, 90, 100])
-@pytest.mark.parametrize("frontend", ["triton", "gluon"])
-def test_cuda_integer_ranges_narrow_in_branch(capability, frontend):
-
-    @triton.jit
-    def triton_kernel(input, output):
-        x = tl.load(input)
-        if (x >= 0) & (x < 1024):
-            result = x // 3
-        else:
-            result = x // 5
-        tl.store(output, result)
-
-    @gluon.jit
-    def gluon_kernel(input, output):
-        x = gl.load(input)
-        offsets = gl.arange(0, 32, layout=gl.BlockedLayout([1], [32], [4], [0]))
-        if (x >= 0) & (x < 1024):
-            result = x // 3
-        else:
-            result = x // 5
-        gl.store(output + offsets, result)
-
-    kernel = triton_kernel if frontend == "triton" else gluon_kernel
-    source_type = ASTSource if frontend == "triton" else GluonASTSource
-    source = source_type(fn=kernel, signature={"input": "*i64", "output": "*i64"})
-    compiled = triton.compile(source, target=GPUTarget("cuda", capability, 32))
-    ir = compiled.asm["ttir" if frontend == "triton" else "ttgir"]
-    assert re.search(r"arith.divsi .* : i32", ir)
-    assert re.search(r"arith.divsi .* : i64", ir)
-
-
-@pytest.mark.parametrize("block", [1, 32])
-@pytest.mark.parametrize("minimum, divisor_maximum, width", [(-2147483648, -1, 64), (-2147483647, -1, 32),
-                                                             (-2147483648, -2, 32)])
-def test_cuda_remainder_narrowing_preserves_defined_inputs(block, minimum, divisor_maximum, width):
-
-    @triton.jit
-    def kernel(input, output, BLOCK: tl.constexpr, MINIMUM: tl.constexpr, DIVISOR_MAXIMUM: tl.constexpr):
-        offsets = 0 if BLOCK == 1 else tl.arange(0, BLOCK)
-        a = tl.load(input)
-        b = tl.load(input + 1)
-        tl.assume(a >= MINIMUM)
-        tl.assume(a <= -2147483646)
-        tl.assume(b >= -3)
-        tl.assume(b <= DIVISOR_MAXIMUM)
-        tl.store(output + offsets, (a + offsets) % b)
-
-    source = ASTSource(fn=kernel, signature={"input": "*i64", "output": "*i64"},
-                       constexprs={"BLOCK": block, "MINIMUM": minimum, "DIVISOR_MAXIMUM": divisor_maximum})
-    compiled = triton.compile(source, target=GPUTarget("cuda", 80, 32))
-    assert re.search(rf"arith.remsi .* : (?:tensor<32x)?i{width}", compiled.asm["ttir"])
 
 
 @pytest.mark.parametrize(

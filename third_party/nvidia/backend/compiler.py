@@ -877,8 +877,6 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
-        passes.ttir.add_materialize_integer_facts(pm)
-        passes.ttir.add_narrow_integer_ranges(pm)
         pm.run(mod, "make_ttir")
         return mod
 
@@ -1236,8 +1234,6 @@ class CUDABackend(BaseBackend):
         pm.enable_debug()
 
         passes.gluon.add_inliner(pm)
-        passes.ttir.add_materialize_integer_facts(pm)
-        passes.ttir.add_narrow_integer_ranges(pm)
         passes.gluon.add_infer_coalesced_encodings(pm)
         passes.gluon.add_resolve_auto_encodings(pm)
         nvidia.passes.ttnvgpuir.add_tma_lowering(pm)

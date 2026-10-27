@@ -1238,7 +1238,6 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
                   BitcastOpAxisInfoVisitor,
                   IdentityOpAxisInfoVisitor<triton::gluon::SetAutoLayoutOp>>();
   visitors.append<MakeRangeOpAxisInfoVisitor>();
-  visitors.append<IdentityOpAxisInfoVisitor<RefineOp>>();
   visitors.append<PoisonOpAxisInfoVisitor>();
   visitors.append<AddSubOpAxisInfoVisitor<triton::AddPtrOp>,
                   AddSubOpAxisInfoVisitor<arith::AddIOp>,

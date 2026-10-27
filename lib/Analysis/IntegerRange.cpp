@@ -1,7 +1,11 @@
 #include "triton/Analysis/IntegerRange.h"
+#include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/Utils/InferIntRangeCommon.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include <array>
 
 using namespace mlir;
@@ -46,17 +50,60 @@ static ConstantIntRanges inferSignedDivRem(Operation *op,
 class IntegerRangeAnalysis final : public dataflow::IntegerRangeAnalysis {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IntegerRangeAnalysis)
-  using dataflow::IntegerRangeAnalysis::IntegerRangeAnalysis;
+  IntegerRangeAnalysis(DataFlowSolver &solver, Operation *root)
+      : dataflow::IntegerRangeAnalysis(solver), dominance(root) {
+    root->walk([&](LLVM::AssumeOp assume) {
+      SmallVector<Value> pending{assume.getCond()};
+      DenseSet<Value> visited;
+      while (!pending.empty()) {
+        Value condition = pending.pop_back_val();
+        if (!visited.insert(condition).second)
+          continue;
+        if (auto conjunction = condition.getDefiningOp<arith::AndIOp>())
+          llvm::append_range(pending, conjunction->getOperands());
+        else if (auto cmp = condition.getDefiningOp<arith::CmpIOp>())
+          for (Value value : cmp->getOperands())
+            if (auto range = getBoundFromCmpOp(cmp, value))
+              assumptions[value].push_back({assume, *range});
+      }
+    });
+  }
+
+  // Apply assumptions at operand uses; never change the defining value's range.
+  IntegerValueRange atUse(Value value, Operation *use,
+                          const IntegerValueRange &inferred) {
+    if (inferred.isUninitialized())
+      return inferred;
+    ConstantIntRanges range = inferred.getValue();
+    auto it = assumptions.find(value);
+    if (it != assumptions.end())
+      for (const auto &fact : it->second)
+        if (dominance.properlyDominates(fact.first, use))
+          range = range.intersection(fact.second);
+    return IntegerValueRange(range);
+  }
 
   LogicalResult visitOperation(
       Operation *op,
       ArrayRef<const dataflow::IntegerValueRangeLattice *> operands,
       ArrayRef<dataflow::IntegerValueRangeLattice *> results) override {
+    SmallVector<std::unique_ptr<dataflow::IntegerValueRangeLattice>> storage;
+    SmallVector<const dataflow::IntegerValueRangeLattice *> inputs;
+    for (auto [value, lattice] : llvm::zip(op->getOperands(), operands)) {
+      if (!assumptions.contains(value)) {
+        inputs.push_back(lattice);
+        continue;
+      }
+      auto local = std::make_unique<dataflow::IntegerValueRangeLattice>(value);
+      (void)local->join(atUse(value, op, lattice->getValue()));
+      inputs.push_back(local.get());
+      storage.push_back(std::move(local));
+    }
     if (!isa<arith::DivSIOp, arith::RemSIOp>(op))
-      return dataflow::IntegerRangeAnalysis::visitOperation(op, operands,
+      return dataflow::IntegerRangeAnalysis::visitOperation(op, inputs,
                                                             results);
-    const IntegerValueRange &lhs = operands[0]->getValue();
-    const IntegerValueRange &rhs = operands[1]->getValue();
+    const IntegerValueRange &lhs = inputs[0]->getValue();
+    const IntegerValueRange &rhs = inputs[1]->getValue();
     if (lhs.isUninitialized() || rhs.isUninitialized())
       return success();
     ConstantIntRanges range =
@@ -64,15 +111,14 @@ public:
     propagateIfChanged(results.front(), results.front()->join(range));
     return success();
   }
+
+private:
+  DenseMap<Value, SmallVector<std::pair<Operation *, ConstantIntRanges>>>
+      assumptions;
+  DominanceInfo dominance;
 };
 
 } // namespace
-
-std::unique_ptr<DataFlowSolver> mlir::triton::createIntegerRangeSolver() {
-  auto solver = createDataFlowSolver();
-  solver->load<IntegerRangeAnalysis>();
-  return solver;
-}
 
 LogicalResult
 mlir::triton::collectNonNegativeDividends(Operation *root,
@@ -85,14 +131,18 @@ mlir::triton::collectNonNegativeDividends(Operation *root,
   });
   if (queries.empty())
     return success();
-  auto solver = createIntegerRangeSolver();
+  auto solver = createDataFlowSolver();
+  auto *analysis = solver->load<IntegerRangeAnalysis>(root);
   if (failed(solver->initializeAndRun(root)))
     return failure();
   for (Operation *op : queries) {
     const auto *range = solver->lookupState<dataflow::IntegerValueRangeLattice>(
         op->getOperand(0));
-    if (range && !range->getValue().isUninitialized() &&
-        range->getValue().getValue().smin().isNonNegative())
+    if (!range)
+      continue;
+    IntegerValueRange atUse =
+        analysis->atUse(op->getOperand(0), op, range->getValue());
+    if (!atUse.isUninitialized() && atUse.getValue().smin().isNonNegative())
       operations.insert(op);
   }
   return success();

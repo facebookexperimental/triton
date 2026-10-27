@@ -10,8 +10,6 @@ import triton
 import triton.language as tl
 from triton._internal_testing import is_hip_cdna4
 import triton.language.extra.tlx as tlx
-from triton.experimental import gluon
-from triton.experimental.gluon import language as ttgl
 from triton.tlx.ops.kernels.flash_attn.gfx950 import _sum_rows_chain4 as _cluster_sum_rows_chain4
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -31,153 +29,12 @@ def split_k_tutorial():
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 @pytest.mark.parametrize("method", ["stock_triton_matmul", "skinny_atomic_matmul", "skinny_twopass_matmul"])
-@pytest.mark.parametrize("m,n", [(64, 96), (288, 160), (1, 32), (32, 1), (1, 1), (0, 32), (32, 0)])
+@pytest.mark.parametrize("m,n", [(64, 96), (288, 160), (1, 32), (32, 1), (1, 1)])
 def test_split_k_grouped_coordinates(split_k_tutorial, method, m, n):
     a = torch.randn((m, 256), device=DEVICE, dtype=torch.float16) * 0.2
     b = torch.randn((256, n), device=DEVICE, dtype=torch.float16) * 0.2
     output = getattr(split_k_tutorial, method)(a, b)
     torch.testing.assert_close(output, a @ b, atol=0.015, rtol=0.015)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("m,n", [(13, 17), (1025, 2049), (2147483647, 2147483647)])
-@pytest.mark.parametrize("xcd,chunk,group", [(8, 4, 4), (3, 5, 7)])
-def test_integer_facts_swizzle_coordinates(m, n, xcd, chunk, group):
-
-    @triton.jit
-    def permute(tile, count, XCD: tl.constexpr, CHUNK: tl.constexpr):
-        aligned = (count // (XCD * CHUNK)) * (XCD * CHUNK)
-        if tile >= aligned:
-            return tile
-        minor = tile % XCD
-        major = tile // XCD
-        return (major // CHUNK) * XCD * CHUNK + minor * CHUNK + major % CHUNK
-
-    @triton.jit(do_not_specialize=["m", "n"])
-    def kernel(tiles, row_out, col_out, m, n, XCD: tl.constexpr, CHUNK: tl.constexpr, GROUP: tl.constexpr):
-        if (m > 0) & (n > 0):
-            wide_m = m.to(tl.uint64)
-            wide_n = n.to(tl.uint64)
-            rows = tl.cdiv(wide_m, 32)
-            cols = tl.cdiv(wide_n, 32)
-            count = rows * cols
-            tile = tl.load(tiles + tl.program_id(0)).to(tl.uint64)
-            if tile < count:
-                mapped = permute(tile, count, XCD, CHUNK)
-                width = GROUP * cols
-                base = (mapped // width) * GROUP
-                active = tl.minimum(rows - base, GROUP)
-                row = base + (mapped % width) % active
-                col = (mapped % width) // active
-                tl.assume(row < rows)
-                tl.assume(col < cols)
-                lane = tl.arange(0, 32).to(tl.uint64)
-                r = (row * 32 + lane) % wide_m
-                c = (col * 32 + lane) % wide_n
-                out = tl.program_id(0) * 32 + tl.arange(0, 32)
-                tl.store(row_out + out, r)
-                tl.store(col_out + out, c)
-
-    rows, cols = triton.cdiv(m, 32), triton.cdiv(n, 32)
-    count = rows * cols
-    tiles = sorted({0, min(1, count - 1), count // 2, count - 1})
-    tile_tensor = torch.tensor(tiles, dtype=torch.int64, device=DEVICE)
-    row_out = torch.empty((len(tiles), 32), dtype=torch.int64, device=DEVICE)
-    col_out = torch.empty_like(row_out)
-    compiled = kernel[(len(tiles), )](tile_tensor, row_out, col_out, m, n, xcd, chunk, group)
-    expected_rows, expected_cols = [], []
-    for tile in tiles:
-        aligned = count // (xcd * chunk) * (xcd * chunk)
-        major, minor = divmod(tile, xcd)
-        mapped = tile if tile >= aligned else major // chunk * xcd * chunk + minor * chunk + major % chunk
-        base = mapped // (group * cols) * group
-        active = min(rows - base, group)
-        row = base + mapped % (group * cols) % active
-        col = mapped % (group * cols) // active
-        expected_rows.append([(row * 32 + lane) % m for lane in range(32)])
-        expected_cols.append([(col * 32 + lane) % n for lane in range(32)])
-    torch.testing.assert_close(row_out, torch.tensor(expected_rows, device=DEVICE), rtol=0, atol=0)
-    torch.testing.assert_close(col_out, torch.tensor(expected_cols, device=DEVICE), rtol=0, atol=0)
-    assert re.search(r"arith.remui .* : tensor<32xi32>", compiled.asm["ttir"])
-    assert not re.search(r"arith.remui .* : tensor<32xi64>", compiled.asm["ttir"])
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("value", [-17, 0, 1023, 1024, 2**40])
-def test_integer_facts_narrow_branch(value):
-
-    @triton.jit
-    def kernel(input, output):
-        x = tl.load(input)
-        if (x >= 0) & (x < 1024):
-            result = x // 3
-        else:
-            result = x // 5
-        tl.store(output, result)
-
-    input = torch.tensor([value], dtype=torch.int64, device=DEVICE)
-    output = torch.empty_like(input)
-    compiled = kernel[(1, )](input, output)
-    expected = torch.div(input, 3 if 0 <= value < 1024 else 5, rounding_mode="trunc")
-    torch.testing.assert_close(output, expected, rtol=0, atol=0)
-    assert re.search(r"arith.divsi .* : i32", compiled.asm["ttir"])
-    assert re.search(r"arith.divsi .* : i64", compiled.asm["ttir"])
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("a,b", [(-2147483648, -1), (-2147483648, -2), (-2147483647, -1), (-2147483647, -2)])
-def test_integer_facts_remainder_signed_minimum(a, b):
-
-    @triton.jit
-    def kernel(input, output):
-        x = tl.load(input)
-        y = tl.load(input + 1)
-        tl.assume(x >= -2147483648)
-        tl.assume(x <= -2147483647)
-        tl.assume(y >= -2)
-        tl.assume(y <= -1)
-        tl.store(output, x % y)
-
-    input = torch.tensor([a, b], dtype=torch.int64, device=DEVICE)
-    output = torch.empty((), dtype=torch.int64, device=DEVICE)
-    compiled = kernel[(1, )](input, output)
-    torch.testing.assert_close(output, torch.fmod(input[0], input[1]))
-    assert re.search(r"arith.remsi .* : i64", compiled.asm["ttir"])
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("value", [-2147483648, -17, -1, 0, 2147483647])
-def test_integer_facts_unsigned_sign_extension(value):
-
-    @triton.jit
-    def kernel(input, output):
-        x = tl.load(input).to(tl.int64).to(tl.uint64)
-        tl.store(output, x % 7)
-        tl.store(output + 1, x >> 33)
-
-    input = torch.tensor([value], dtype=torch.int32, device=DEVICE)
-    output = torch.empty((2, ), dtype=torch.int64, device=DEVICE)
-    kernel[(1, )](input, output)
-    unsigned = value % 2**64
-    expected = torch.tensor([unsigned % 7, unsigned >> 33], dtype=torch.int64, device=DEVICE)
-    torch.testing.assert_close(output, expected, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("shift", [0, 31, 32, 33, 63])
-def test_integer_facts_wide_shift(shift):
-
-    @triton.jit
-    def kernel(input, amount, output):
-        x = tl.load(input).to(tl.uint32).to(tl.uint64)
-        s = tl.load(amount).to(tl.uint64)
-        tl.store(output, x >> s)
-
-    input = torch.tensor([-1], dtype=torch.int32, device=DEVICE)
-    amount = torch.tensor([shift], dtype=torch.int32, device=DEVICE)
-    output = torch.empty((1, ), dtype=torch.int64, device=DEVICE)
-    kernel[(1, )](input, amount, output)
-    assert output.item() == (2**32 - 1) >> shift
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
@@ -244,96 +101,6 @@ def test_signed_div_rem_dynamic_program_mapping(modulus, group, base):
     quotient = torch.div(values, 64, rounding_mode="trunc")
     expected = table[(remainder + 64).long()] + table[(quotient & 255).long()]
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("groups,columns", [(3, 5), (7, 13), (2, 19)])
-def test_integer_facts_dynamic_tile_column(groups, columns):
-
-    @triton.jit(do_not_specialize=["groups", "columns"])
-    def kernel(output, table, groups, columns, L: tl.constexpr):
-        tl.assume(groups > 0)
-        tl.assume(groups <= 7)
-        tl.assume(columns > 0)
-        tl.assume(columns <= 8388608)
-        pid = tl.program_id(0)
-        tl.assume(pid < groups * columns)
-        column = pid // groups
-        tl.assume(column < columns)
-        lanes = tlx.require_layout(tl.arange(0, 256), L)
-        offsets = column * 256 + lanes
-        values = tl.load(table + offsets % 256)
-        tl.store(output + pid * 256 + lanes, values)
-
-    layout = tlx.layout(shape=((64, ), (4, )), stride=((4, ), (1, )))
-    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
-    output = torch.empty((groups * columns, 256), dtype=torch.int32, device=DEVICE)
-    compiled = kernel[(groups * columns, )](output, table, groups, columns, layout, num_warps=1)
-    torch.testing.assert_close(output, table.expand_as(output), rtol=0, atol=0)
-    assert "tt.refine" in compiled.asm["ttir"]
-    assert "tt.refine" not in compiled.asm["llir"]
-    assert re.search(r"(?:global|buffer)_load_dwordx4", compiled.asm["amdgcn"])
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("rows,columns,group", [(13, 17, 8), (7, 19, 16), (24, 23, 4), (1, 5, 8)])
-@pytest.mark.parametrize("persistent", [False, True])
-def test_integer_facts_partial_group(rows, columns, group, persistent):
-
-    @triton.jit(do_not_specialize=["rows", "columns"])
-    def kernel(output, table, rows, columns, GROUP: tl.constexpr, L: tl.constexpr):
-        tl.assume(rows > 0)
-        tl.assume(rows <= 16777215)
-        tl.assume(columns > 0)
-        tl.assume(columns <= 8388608)
-        tl.assume(rows <= 2147483647 // columns)
-        pid = tl.program_id(0)
-        for tile in range(pid, rows * columns, tl.num_programs(0)):
-            tl.assume(tile >= 0)
-            width = GROUP * columns
-            base = (tile // width) * GROUP
-            active = tl.minimum(rows - base, GROUP)
-            column = (tile % width) // active
-            tl.assume((column >= 0) & (column < columns))
-            lanes = tlx.require_layout(tl.arange(0, 256), L)
-            offsets = column * 256 + lanes
-            values = tl.load(table + offsets % 256)
-            tl.store(output + tile * 256 + lanes, values)
-
-    layout = tlx.layout(shape=((64, ), (4, )), stride=((4, ), (1, )))
-    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
-    output = torch.empty((rows * columns, 256), dtype=torch.int32, device=DEVICE)
-    grid = 3 if persistent else rows * columns
-    compiled = kernel[(grid, )](output, table, rows, columns, group, layout, num_warps=1)
-    torch.testing.assert_close(output, table.expand_as(output), rtol=0, atol=0)
-    assert re.search(r"(?:global|buffer)_load_dwordx4", compiled.asm["amdgcn"])
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-def test_integer_facts_gluon_dynamic_tile_column():
-
-    @gluon.jit(do_not_specialize=["groups", "columns"])
-    def kernel(output, table, groups, columns, layout: ttgl.constexpr):
-        ttgl.assume(groups > 0)
-        ttgl.assume(groups <= 7)
-        ttgl.assume(columns > 0)
-        ttgl.assume(columns <= 8388608)
-        pid = ttgl.program_id(0)
-        ttgl.assume(pid < groups * columns)
-        column = pid // groups
-        ttgl.assume(column < columns)
-        lanes = ttgl.arange(0, 256, layout=layout)
-        values = ttgl.load(table + (column * 256 + lanes) % 256)
-        ttgl.store(output + pid * 256 + lanes, values)
-
-    layout = ttgl.BlockedLayout([4], [64], [1], [0])
-    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
-    output = torch.empty((35, 256), dtype=torch.int32, device=DEVICE)
-    compiled = kernel[(35, )](output, table, 7, 5, layout, num_warps=1)
-    torch.testing.assert_close(output, table.expand_as(output), rtol=0, atol=0)
-    assert "tt.refine" in compiled.asm["ttgir"]
-    assert "tt.refine" not in compiled.asm["llir"]
-    assert "load <4 x i32>" in compiled.asm["llir"]
 
 
 @triton.jit

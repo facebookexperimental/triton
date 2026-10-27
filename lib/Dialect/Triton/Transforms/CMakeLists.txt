@@ -4,7 +4,6 @@ add_public_tablegen_target(TritonCombineIncGen)
 
 add_triton_library(TritonTransforms
   Combine.cpp
-  IntegerFacts.cpp
   CudaWarningsPass.cpp
   LoopAwareCSE.cpp
   LoopInvariantCodeMotion.cpp
@@ -25,9 +24,7 @@ add_triton_library(TritonTransforms
   MLIRPass
   MLIRTransformUtils
   MLIRTransforms
-  MLIRArithTransforms
   MLIRSCFToControlFlow
   MLIRSCFTransforms
   TritonIR
-  TritonAnalysis
 )

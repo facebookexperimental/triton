@@ -3,22 +3,6 @@
 
 include "mlir/Pass/PassBase.td"
 
-def TritonMaterializeIntegerFacts : Pass<"triton-materialize-integer-facts"> {
-  let summary = "Materialize control-flow integer facts as SSA refinements";
-  let dependentDialects = ["mlir::triton::TritonDialect",
-                          "mlir::arith::ArithDialect",
-                          "mlir::cf::ControlFlowDialect"];
-}
-
-def TritonEraseIntegerRefinements : Pass<"triton-erase-integer-refinements"> {
-  let summary = "Erase integer refinements after their consumers";
-}
-
-def TritonNarrowIntegerRanges : Pass<"triton-narrow-integer-ranges"> {
-  let summary = "Narrow integer arithmetic with SSA integer facts";
-  let dependentDialects = ["mlir::arith::ArithDialect"];
-}
-
 def TritonCombineOps : Pass</*cli-arg*/"triton-combine", /*Op*/"mlir::ModuleOp"> {
   let summary = "combine ops";
   let description = [{

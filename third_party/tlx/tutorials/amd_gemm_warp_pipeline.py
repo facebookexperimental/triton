@@ -62,30 +62,20 @@ def matmul_kernel_warp_pipeline(
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
 
-    tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(0)
-    tl.assume(M <= 2147483647 - (BLOCK_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_M)
-    tl.assume(N <= 2147483647 - (BLOCK_N - 1))
     num_pid_n = tl.cdiv(N, BLOCK_N)
     grid_mn = num_pid_m * num_pid_n
-    tl.assume(grid_mn > 0)
-    tl.assume(pid < grid_mn)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
-    tl.assume(pid >= 0)
 
     num_pid_in_group = GROUP_M * num_pid_n
-    tl.assume(num_pid_in_group > 0)
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-    tl.assume(group_size_m > 0)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_M >= 0) & (pid_m * BLOCK_M <= 2147483647 - (BLOCK_M - 1)))
     pid_n = (pid % num_pid_in_group) // group_size_m
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    tl.assume(pid_m <= (M - 1) // BLOCK_M)
-    tl.assume(pid_n <= (N - 1) // BLOCK_N)
+    tl.assume((pid_n * BLOCK_N >= 0) & (pid_n * BLOCK_N <= 2147483647 - (BLOCK_N - 1)))
 
     # Precompute row/col offsets (these are per-thread, not carried in loop)
     offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
