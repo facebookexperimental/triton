@@ -27,6 +27,16 @@ on:
         description: URL of the nightly run (for the close comment).
         required: true
         type: string
+      title_prefix:
+        description: Title prefix of this job's issues; defaults to "[nightly] <workflow_name> / <job_name> / ".
+        required: false
+        type: string
+        default: ""
+      labels:
+        description: Comma-separated labels of this job's issues.
+        required: false
+        type: string
+        default: ci_issues,nightly
 
 permissions:
   contents: read
@@ -66,8 +76,8 @@ jobs:
             }
 
             const stillFailing = new Set(failures.map(f => f.issue_title));
-            const labels = ["ci_issues", "nightly"];
-            const prefix = `[nightly] ${workflowName} / ${jobName} / `;
+            const labels = ${{ toJSON(inputs.labels) }}.split(",").map(l => l.trim()).filter(Boolean);
+            const prefix = ${{ toJSON(inputs.title_prefix) }} || `[nightly] ${workflowName} / ${jobName} / `;
 
             // Enumerate open issues for this workflow+job (scoped by title prefix
             // so one workflow's run never touches another's issues).

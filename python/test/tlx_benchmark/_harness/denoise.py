@@ -476,6 +476,7 @@ ARCH_BY_PART = {
     "GB200": "sm100",
     "GB300": "sm100",
     "B200": "sm100",
+    "H100": "sm90",
     "MI350X": "gfx950",
     "MI355X": "gfx950",
     "MI300X": "gfx942",
@@ -487,12 +488,31 @@ class Device:
     vendor: str
     index: int
     name: str
+    #: NVIDIA: the GPU UUID. AMD: the ROCr agent UUID, which is not rocm-smi's
+    #: "Unique ID"; None when rocminfo could not be matched.
     uuid: Optional[str] = None
     memory_used_mib: float = 0.0
 
     @property
     def visibility_env(self) -> str:
-        return "CUDA_VISIBLE_DEVICES" if self.vendor == NVIDIA else "HIP_VISIBLE_DEVICES"
+        return "CUDA_VISIBLE_DEVICES" if self.vendor == NVIDIA else "ROCR_VISIBLE_DEVICES"
+
+    def pin(self) -> bool:
+        """Make this the only GPU the process sees; False if its UUID is unknown.
+
+        By UUID, not `index`: `index` is nvidia-smi's or rocm-smi's numbering, and
+        CUDA and HIP number GPUs in their own order. On an MI350 host
+        HIP_VISIBLE_DEVICES=5 ran on rocm-smi's card4.
+        """
+        if not self.uuid:
+            return False
+        os.environ[self.visibility_env] = self.uuid
+        if self.vendor == AMD:
+            # HIP applies these index lists on top of ROCR_VISIBLE_DEVICES, so an
+            # inherited HIP_VISIBLE_DEVICES=4 (denoise.sh's default) hides the GPU.
+            os.environ.pop("HIP_VISIBLE_DEVICES", None)
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        return True
 
     @property
     def power_target_w(self) -> Optional[int]:
@@ -538,17 +558,68 @@ def list_devices() -> list[Device]:
                 found.append(Device(NVIDIA, int(f[0]), f[1], f[2], _num(f[3]) or 0.0))
         return found
     if which == AMD:
-        out = _rocm(["--showmeminfo", "vram", "--csv"]) or ""
+        lines = (_rocm(["--showmeminfo", "vram", "--showbus", "--csv"]) or "").splitlines()
+        if not lines:
+            return []
+        col = {name.strip(): i for i, name in enumerate(lines[0].split(","))}
+        used_col, bus_col = col.get("VRAM Total Used Memory (B)"), col.get("PCI Bus")
+        if used_col is None:
+            return []
+        rocr = _rocr_uuids()
         found = []
-        for line in out.splitlines()[1:]:
+        for line in lines[1:]:
             f = [x.strip() for x in line.split(",")]
-            if len(f) >= 3 and f[0].lower().startswith("card"):
-                used = _num(f[2])
-                idx = "".join(c for c in f[0] if c.isdigit())
-                if idx:
-                    found.append(Device(AMD, int(idx), _amd_name(int(idx)), None, (used or 0.0) / 1024 / 1024))
+            idx = "".join(c for c in f[0] if c.isdigit())
+            if not (f[0].lower().startswith("card") and idx and len(f) > used_col):
+                continue
+            bus = f[bus_col] if bus_col is not None and len(f) > bus_col else None
+            used = _num(f[used_col])
+            uuid = rocr.get(_pci_bus_number(bus))
+            found.append(Device(AMD, int(idx), _amd_name(int(idx)), uuid, (used or 0.0) / 1024 / 1024))
         return found
     return []
+
+
+def _pci_bus_number(bus: Optional[str]) -> Optional[int]:
+    """0x88 for "0000:88:00.0"."""
+    try:
+        return int(bus.split(":")[1], 16)
+    except (AttributeError, IndexError, ValueError):
+        return None
+
+
+def _rocminfo() -> Optional[str]:
+    try:
+        out = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=30, check=True)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return out.stdout
+
+
+def _rocr_uuids() -> dict[int, str]:
+    """ROCr GPU agent UUIDs by PCI bus number.
+
+    rocm-smi numbers cards in a different order from ROCr (and HIP), so the PCI
+    bus is the key that joins the two tools. rocminfo's BDFID is
+    bus << 8 | device << 3 | function.
+    """
+    found: dict[int, str] = {}
+    uuid = bdf = None
+    gpu = False
+    for line in (_rocminfo() or "").splitlines():
+        line = line.strip()
+        if re.match(r"Agent \d+", line):
+            uuid, bdf, gpu = None, None, False
+        elif line.startswith("Uuid:"):
+            uuid = line.split()[-1]
+        elif line.startswith("BDFID:"):
+            bdf = line.split()[-1]
+        elif line.startswith("Device Type:"):
+            gpu = line.split()[-1] == "GPU"
+        # A GPU without a UUID reports the placeholder "GPU-XX", which ROCr rejects.
+        if gpu and uuid and re.fullmatch(r"GPU-[0-9a-fA-F]+", uuid) and bdf and bdf.isdigit():
+            found[int(bdf) >> 8] = uuid
+    return found
 
 
 def _amd_name(index: int) -> str:

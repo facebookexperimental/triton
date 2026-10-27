@@ -226,7 +226,7 @@ class TLXInductorChoices(InductorChoices):
                 kernel_inputs, templates, op_name, kwarg_overrides
             )
 
-        from .mm_templates import append_tlx
+        from .mm_templates import append_tlx, tlx_kernel_inputs
 
         templates = list(templates)
         kwarg_overrides = kwarg_overrides or {}
@@ -238,7 +238,8 @@ class TLXInductorChoices(InductorChoices):
 
         template_choices = {
             t.uid: self.get_ktc(
-                kernel_inputs, t, op_name, kwarg_overrides.get(t.uid, {})
+                tlx_kernel_inputs(t, kernel_inputs, op_name), t, op_name,
+                kwarg_overrides.get(t.uid, {})
             )
             for t in templates
         }

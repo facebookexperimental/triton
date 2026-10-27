@@ -27,7 +27,8 @@ import sys
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from meta_llvm_bump import (BAD_CONCLUSIONS, bot_branch_for, commit_message, decide, failed_body,  # noqa: E402
+from meta_llvm_bump import (BAD_CONCLUSIONS, bot_branch_for, commit_message, compare_url, decide,
+                            failed_body,  # noqa: E402
                             issue_body, issue_release, issue_result, issue_title, oai_pins, parse_sha256_file,
                             pick_tracking, pr_body, release_for, render, same_tree_chain, variants, verdict,
                             verify_state)
@@ -162,11 +163,13 @@ def failed_jobs(repo, latest):
     return names
 
 
-def pr_text(repo, target, fork, fork_branch, meta, new):
-    """(title, body) of the PR that bumps target from meta to new."""
-    title = f"[Meta LLVM] Bump {target} to {tag_of(new)}"
-    return title, pr_body(repo, target, fork, fork_branch, meta, new, fork_log(fork, meta["llvm_hash"],
-                                                                               new["llvm_hash"]))
+def ran_jobs(repo, latest):
+    """[(job name, conclusion)], sorted by name ignoring case, of the jobs that ran (not skipped) in latest's runs."""
+    jobs = []
+    for _, run_obj in sorted(latest.items()):
+        jobs += gh_json(f"repos/{repo}/actions/runs/{run_obj['id']}/jobs?per_page=100")["jobs"]
+    return sorted(((job["name"], job["conclusion"]) for job in jobs if job["conclusion"] != "skipped"),
+                  key=lambda job: job[0].lower())
 
 
 def file_result(repo, issue, title, body):
@@ -202,8 +205,11 @@ def settle(args, meta, branch, issue):
                     failed_body(args.repo, args.target, release, sha, latest, [], args.timeout_hours))
         return "running"
     if verdict(latest) == "ready":
-        title, body = pr_text(args.repo, args.target, args.fork, args.fork_branch, meta, new)
-        text = issue_body(args.repo, args.target, title, body, release, sha, latest)
+        title = f"[Meta LLVM] Bump {args.target} to {tag_of(new)}"
+        log, jobs = fork_log(args.fork, meta["llvm_hash"], new["llvm_hash"]), ran_jobs(args.repo, latest)
+        body = pr_body(args.repo, args.target, args.fork, args.fork_branch, meta, new, log, release, sha, latest, jobs)
+        compare = compare_url(args.fork, meta["llvm_hash"], new["llvm_hash"])
+        text = issue_body(args.repo, args.target, title, body, release, sha, latest, args.fork, log, compare, jobs)
         wrote = file_result(args.repo, issue, issue_title(args.target, release), text)
     else:
         text = failed_body(args.repo, args.target, release, sha, latest, failed_jobs(args.repo, latest))

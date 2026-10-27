@@ -79,7 +79,7 @@ LLVM bump branch's runs for its target. Four tabs, one owner each:
   and what the `select` job ran per trigger, with runs where it failed, fell
   back to every suite, or skipped a GPU on a scheduled or manual run.
 
-`ci-health.yml` runs `scripts/ci_health.py collect` every three hours. It stores
+`ci-health.yml` runs `scripts/ci_health.py collect` every hour. It stores
 `gpu-tests.yml`, `gpu-tests-nightly.yml` and `nightly-fbtriton.yml` runs, with
 jobs and steps, on the `ci-health` release. For each failed GPU job it reads
 the failing tests from the job log, and from each `select` job log it reads the

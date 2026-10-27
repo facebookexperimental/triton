@@ -846,6 +846,14 @@ public:
                                  dotOp.getMaxNumImpreciseAcc());
     }
 
+    // Keep the accumulator register-class request (`amdg.cd_regclass`, see
+    // DotOpToLLVM/MFMA.cpp) on the re-created dot. Gluon emits the TTGIR dot
+    // directly and never gets here, but a `tt.dot` that comes from TTIR (TLX /
+    // triton.jit) is rebuilt by this pattern without its discardable
+    // attributes, which would silently drop the request.
+    if (Attribute cdRegClass = dotOp->getAttr("amdg.cd_regclass"))
+      newDot.getDefiningOp()->setAttr("amdg.cd_regclass", cdRegClass);
+
     Value dotOutput =
         convertAndCastTensor(rewriter, newDot, oldRetType.getEncoding(),
                              oldRetType.getElementType());
@@ -1843,8 +1851,8 @@ struct TritonAMDGPUAccelerateMatmulPass
     case ISAFamily::RDNA3:
     case ISAFamily::RDNA4m:
     case ISAFamily::RDNA4:
-      ttg::populateDecomposeScaledBlockedPatterns(mfmaPatterns,
-                                                  /*benefit=*/3);
+      mfmaPatterns.add<::DecomposeAMDScaledBlocked>(context, targetFeatures,
+                                                    /*benefit=*/3);
       mfmaPatterns.add<::BlockedToWMMA>(context, wmmaVersion,
                                         matrixInstructionSize,
                                         /*benefit=*/2);

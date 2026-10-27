@@ -134,11 +134,20 @@ def test_mm_rejects_unknown_dim_before_dispatch():
         tlx_mm(a, b, space=Space("heuristic", invariance=BitwiseInvarianceSpec.dims("M", "ZZZ")))
 
 
-def test_mm_refuses_unenforced_spec():
-    a, b = _mm_tensors()
-    assert not any_enforces_invariance("mm")
-    with pytest.raises(UnsupportedOp, match="does not enforce"):
-        tlx_mm(a, b, space=Space("heuristic", invariance=BitwiseInvarianceSpec.dims("M")))
+def test_mm_enforced_per_arch():
+    import triton.tlx.ops as tlx_ops
+    from triton.tlx.ops._catalog import CATALOG
+
+    spec = BitwiseInvarianceSpec.dims("M")
+    assert any_enforces_invariance("mm")
+    enforced = {entry.arch for entry in CATALOG if entry.op == "mm" and entry.enforces_invariance}
+    assert enforced == {"sm90", "sm100", "gfx942", "gfx950"}
+    for entry in [entry for entry in CATALOG if entry.op == "mm"]:
+        if entry.arch in enforced:
+            tlx_ops._check_enforced("mm", entry, spec)
+        else:
+            with pytest.raises(UnsupportedOp, match="does not enforce"):
+                tlx_ops._check_enforced("mm", entry, spec)
 
 
 def test_flash_attn_refuses_unenforced_spec():

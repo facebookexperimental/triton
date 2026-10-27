@@ -5,8 +5,9 @@
       Fetch runs of gpu-tests.yml, gpu-tests-nightly.yml,
       nightly-tlx-ops-bench.yml and nightly-fbtriton.yml, and push runs of
       compiler.yml (LIT), created since the saved cursor (or --since), plus
-      the jobs and steps of every completed run and the failing tests in the
-      log of every failed GPU or LIT job, into
+      the jobs and steps of every completed run, the failing tests in the
+      log of every failed GPU or LIT job and the slowest tests of each GPU
+      job of a main push run, into
       DATA_DIR/runs-YYYY-MM.jsonl.gz and DATA_DIR/state.json, and each
       tracked branch's Meta LLVM pin into DATA_DIR/bump.json. ci-health.yml
       keeps DATA_DIR on the 'ci-health' release; DATA_DIR/changed.txt lists
@@ -23,7 +24,9 @@ line for the same id replaces an earlier one:
    select: {h100, b200, mi350, build, fallback} | null (gpu-tests.yml only),
    jobs: [{name, conclusion, created_at, started_at, completed_at, labels,
            steps: [{name, conclusion, started_at, completed_at,
-                    failures?: [{id, msg}]}]}] | null until the run completes}
+                    failures?: [{id, msg}], slowest?: [{id, s}]}]}] | null until the run completes}
+slowest is pytest's --durations list (seconds per test, slowest first), stored on
+main push runs of gpu-tests.yml only.
 Records of mi350/b200/h100.yml from before #3875 may remain in the store; the
 rules ignore them.
 
@@ -40,6 +43,7 @@ bump.json, rewritten whole by each collection:
 import argparse
 import base64
 import datetime as dt
+import functools
 import glob
 import gzip
 import json
@@ -87,8 +91,10 @@ def gh_get(path):
 
 
 def gh_text(path):
-    """A plain-text endpoint, such as a job log (gh follows the redirect to the log blob)."""
-    return subprocess.run(["gh", "api", path], capture_output=True, text=True, check=True).stdout
+    """A plain-text endpoint, such as a job log (gh follows the redirect to the log blob). gh refuses to print a
+    response with terminal escape sequences unless allowed, and job logs can hold them."""
+    return subprocess.run(["gh", "api", "--allow-escape-sequences", path], capture_output=True, text=True,
+                          check=True).stdout
 
 
 def month_files(data_dir):
@@ -184,6 +190,17 @@ def _attach_failures(jobs, text, wf="gpu-tests.yml"):
         try:
             logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"), wf != rules.BENCH_WF)
         except subprocess.CalledProcessError as exc:  # logs expired or not readable: no test result
+            print(f"no log for job {j['id']} ({j['name']}): {exc.stderr.strip() if exc.stderr else exc}")
+
+
+def _attach_durations(jobs, text):
+    """The slowest tests of each GPU job that ran its tests, from pytest's --durations output."""
+    for j in jobs:
+        if j["conclusion"] not in ("success", "failure") or rules.gpu_of({"wf": "gpu-tests.yml"}, j) is None:
+            continue
+        try:
+            logs.attach_durations(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"))
+        except subprocess.CalledProcessError as exc:  # logs expired or not readable: no durations
             print(f"no log for job {j['id']} ({j['name']}): {exc.stderr.strip() if exc.stderr else exc}")
 
 
@@ -336,8 +353,12 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
             unfetched = todo[i:]
             break
         jobs = _jobs(api(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter=latest"))
+        # Failures and durations can need the same job log: fetch it once.
+        log = functools.lru_cache(maxsize=None)(text)
         if r["wf"] in rules.GPU_RUN_WORKFLOWS:
-            _attach_failures(jobs, text, r["wf"])
+            _attach_failures(jobs, log, r["wf"])
+        if rules.slow_test_run(r):
+            _attach_durations(jobs, log)
         if r["wf"] == rules.LIT_WF:
             _attach_lit_failures(jobs, text)
         if r["wf"] == "gpu-tests.yml":

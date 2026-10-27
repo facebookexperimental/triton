@@ -4,6 +4,7 @@
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/include/hipblas_instance.h"
 #include "amd/include/hipblas_types.h"
+#include "amd/lib/Target/MFMASchedule/MFMASchedule.h"
 #include "lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #include "lld/Common/Driver.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -36,6 +37,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/TargetParser/AMDGPUTargetParser.h"
+#include "llvm/TargetParser/Triple.h"
 #include <array>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
@@ -49,7 +51,15 @@
 namespace py = nanobind;
 
 namespace {
-const char *const amdTargetTriple = "amdgcn-amd-amdhsa";
+llvm::Triple getAMDTargetTriple(const std::string &arch) {
+  llvm::AMDGPU::GPUKind gpuKind = llvm::AMDGPU::parseArchAMDGCN(arch);
+  llvm::Triple::SubArchType subArch = llvm::AMDGPU::getSubArch(gpuKind);
+  if (subArch == llvm::Triple::NoSubArch)
+    throw std::invalid_argument("invalid AMD GPU architecture: " + arch);
+
+  return llvm::Triple(llvm::Triple::amdgpu, subArch, llvm::Triple::AMD,
+                      llvm::Triple::AMDHSA);
+}
 
 void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   using namespace mlir::triton;
@@ -379,9 +389,11 @@ void init_triton_amd(py::module_ &m) {
   auto ttgpuir_m = passes.def_submodule("ttgpuir");
   init_triton_amd_passes_ttgpuir(ttgpuir_m);
 
-  m.attr("TARGET_TRIPLE") = amdTargetTriple;
   m.attr("CALLING_CONV_AMDGPU_KERNEL") =
       (unsigned)llvm::CallingConv::AMDGPU_KERNEL;
+
+  m.def("get_target_triple",
+        [](const std::string &arch) { return getAMDTargetTriple(arch).str(); });
 
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
@@ -414,9 +426,10 @@ void init_triton_amd(py::module_ &m) {
         mlir::ValueRange{reg, value});
   });
 
-  m.def("attach_target_triple", [](llvm::Module *module) {
-    module->setTargetTriple(llvm::Triple(amdTargetTriple));
-  });
+  m.def("attach_target_triple",
+        [](llvm::Module *module, const std::string &arch) {
+          module->setTargetTriple(getAMDTargetTriple(arch));
+        });
 
   // Set target architecture ISA version
   m.def("set_isa_version", [](llvm::Module *module, const std::string &arch) {
@@ -486,7 +499,7 @@ void init_triton_amd(py::module_ &m) {
                               const std::string &features) {
     std::string error;
 
-    llvm::Triple triple(amdTargetTriple);
+    llvm::Triple triple = getAMDTargetTriple(arch);
     const llvm::Target *target =
         llvm::TargetRegistry::lookupTarget(triple, error);
     if (!target)
@@ -542,7 +555,7 @@ void init_triton_amd(py::module_ &m) {
 
   m.def("has_architected_sgprs", [](const std::string &arch) {
     std::string error;
-    llvm::Triple triple(amdTargetTriple);
+    llvm::Triple triple = getAMDTargetTriple(arch);
     const llvm::Target *target =
         llvm::TargetRegistry::lookupTarget(triple, error);
     if (!target)
@@ -606,6 +619,10 @@ void init_triton_amd(py::module_ &m) {
 
   m.def("add_scalarize_packed_fops_llvm_pass", [](llvm::Function *fn) {
     mlir::triton::AMD::runScalarizePackedFOpsPass(*fn);
+  });
+
+  m.def("add_mfma_schedule_pass", [](llvm::Function *fn) -> bool {
+    return mlir::triton::AMD::runMFMASchedulePass(*fn);
   });
 
   auto hipBlas = m.def_submodule("hipblas");

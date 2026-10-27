@@ -4,6 +4,14 @@ from triton.language import core
 def _validate_num_regs(num_regs):
     if num_regs is not None and num_regs % 8 != 0:
         raise ValueError(f"num_regs must be divisible by 8, got {num_regs}")
+    # `nvvm.setmaxregister` requires the per-thread register count to be at
+    # most 256. Reject over-limit requests here: without this they are
+    # silently clamped (or silently abandon register optimization) downstream.
+    # Note the floor stays unchecked: below-minimum requests (e.g. 16) are
+    # masked by the warp-group max when they share a group with a request
+    # >= 24, and existing kernels rely on that.
+    if num_regs is not None and num_regs > 256:
+        raise ValueError(f"num_regs must be at most 256, got {num_regs}")
 
 
 class async_task:

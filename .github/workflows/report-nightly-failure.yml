@@ -87,6 +87,11 @@ on:
         required: false
         type: string
         default: ""
+      labels:
+        description: Comma-separated labels the issue is filed with and found by.
+        required: false
+        type: string
+        default: ci_issues,nightly
 
 permissions:
   contents: read
@@ -141,7 +146,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const labels = ["ci_issues", "nightly"];
+            const labels = ${{ toJSON(inputs.labels) }}.split(",").map(l => l.trim()).filter(Boolean);
             const title = ${{ toJSON(inputs.issue_title) }};
             const normalizedId = ${{ toJSON(inputs.normalized_failure_id) }};
             const rawIds = ${{ toJSON(inputs.raw_failure_ids) }};

@@ -497,7 +497,58 @@ def test_visibility_variable_follows_the_vendor():
     from _harness.denoise import AMD, NVIDIA, Device
 
     assert Device(NVIDIA, 2, "NVIDIA B200").visibility_env == "CUDA_VISIBLE_DEVICES"
-    assert Device(AMD, 2, "MI350X").visibility_env == "HIP_VISIBLE_DEVICES"
+    assert Device(AMD, 2, "MI350X").visibility_env == "ROCR_VISIBLE_DEVICES"
+
+
+def test_pin_by_uuid_never_by_smi_index(monkeypatch):
+    from _harness.denoise import AMD, NVIDIA, Device
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    assert Device(NVIDIA, 2, "NVIDIA B200", uuid="GPU-abc").pin()
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-abc"
+
+    # denoise.sh exports HIP_VISIBLE_DEVICES=4; HIP would apply it on top of the
+    # ROCR pin and see no GPU at all.
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "4")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    assert not Device(AMD, 2, "MI350X").pin()
+    assert Device(AMD, 2, "MI350X", uuid="GPU-46c1d72dcdc11989").pin()
+    assert os.environ["ROCR_VISIBLE_DEVICES"] == "GPU-46c1d72dcdc11989"
+    assert "HIP_VISIBLE_DEVICES" not in os.environ and "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
+# rocminfo lists GPU agents in a different order from rocm-smi's cards, as on a
+# real MI350 host, so matching by position instead of PCI bus picks the wrong GPU.
+_ROCM_SMI_VRAM_BUS = """device,PCI Bus,VRAM Total Memory (B),VRAM Total Used Memory (B)
+card0,0000:08:00.0,309220868096,30000000000
+card1,0000:88:00.0,309220868096,808349696
+"""
+_ROCMINFO = """Agent 1
+  Uuid:                    CPU-XX
+  Device Type:             CPU
+Agent 2
+  Uuid:                    GPU-46c1d72dcdc11989
+  Device Type:             GPU
+  BDFID:                   34816
+Agent 3
+  Uuid:                    GPU-be8bd961d1e61412
+  Device Type:             GPU
+  BDFID:                   2048
+"""
+
+
+def test_amd_devices_get_the_rocr_uuid_of_their_pci_bus(monkeypatch):
+    import _harness.denoise as denoise_mod
+
+    monkeypatch.setattr(denoise_mod, "vendor", lambda: denoise_mod.AMD)
+    monkeypatch.setattr(denoise_mod, "_rocm", lambda args: _ROCM_SMI_VRAM_BUS if "--showbus" in args else None)
+    monkeypatch.setattr(denoise_mod, "_rocminfo", lambda: _ROCMINFO)
+    monkeypatch.setattr(denoise_mod, "_amd_name", lambda index: "MI350X")
+
+    card0, card1 = denoise_mod.list_devices()
+    assert [(d.index, d.uuid) for d in (card0, card1)] == [(0, "GPU-be8bd961d1e61412"), (1, "GPU-46c1d72dcdc11989")]
+    assert denoise_mod.select_device("auto").uuid == "GPU-46c1d72dcdc11989"
 
 
 def test_sampler_join_does_not_shadow_thread_internals():
@@ -514,6 +565,7 @@ def test_arch_matches_the_part():
     from _harness.denoise import AMD, NVIDIA, Device
 
     assert Device(NVIDIA, 0, "NVIDIA B200").arch == "sm100"
+    assert Device(NVIDIA, 0, "NVIDIA H100 80GB HBM3").arch == "sm90"
     assert Device(AMD, 0, "MI300X").arch == "gfx942"
     # "GB200" contains "B200"; both map to sm100, but the longer key must win so
     # the table stays correct if they ever diverge.
@@ -749,7 +801,10 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_1", ),
         },
-        "triton.tlx.ops.kernels.flash_attn_varlen._shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.flash_attn_varlen._shapes": {
+            "gfx950": ("gfx950_1", ),
+            "sm90": ("sm90_all", ),
+        },
         "triton.tlx.ops.kernels.hstu_attn._shapes": {
             "sm100": ("sm100_1", ),
             "gfx950": (),
@@ -786,11 +841,14 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     flash_attn = importlib.import_module("triton.tlx.ops.kernels.flash_attn._shapes").FOCUS
     assert flash_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
+    flash_attn_varlen = importlib.import_module("triton.tlx.ops.kernels.flash_attn_varlen._shapes").FOCUS
+    assert flash_attn_varlen.suite("sm90_all").includes == ("sm90_1", "sm90_2", "sm90_3")
+
     hstu_cross_attn = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn._shapes").FOCUS
     assert hstu_cross_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 
-def test_flash_attn_mxfp8_gfx950_benchmark_is_forward_only(monkeypatch):
+def test_flash_attn_mxfp8_gfx950_benchmark_supports_backward(monkeypatch):
     import importlib
 
     bench = importlib.import_module("bench_flash_attn_mxfp8")
@@ -799,7 +857,7 @@ def test_flash_attn_mxfp8_gfx950_benchmark_is_forward_only(monkeypatch):
         monkeypatch.setattr(bench.driver, "arch", lambda: arch)
         return {case.direction for case in bench.cases(synthetic=True)}
 
-    assert directions("gfx950") == {"fwd"}
+    assert directions("gfx950") == {"fwd", "bwd"}
     assert directions("sm100") == {"fwd", "bwd"}
 
 
@@ -843,6 +901,7 @@ BENCH_MODULES = (
     "bench_flash_attn",
     "bench_flash_attn_mxfp8",
     "bench_flash_attn_varlen",
+    "bench_flash_attn_varlen_ragged",
     "bench_hstu_attn",
     "bench_hstu_cross_attn",
     "bench_kda",
@@ -1243,10 +1302,10 @@ def test_arch_follows_the_selected_device_not_physical_gpu_zero(unpinned_driver,
     monkeypatch.setattr(
         unpinned_driver, "list_devices",
         lambda: [Device(NVIDIA, 0, "NVIDIA H100"), Device(NVIDIA, 1, "NVIDIA B200")])
-    # Unpinned falls back to the first device, i.e. what torch calls cuda:0.
-    # H100 is not in ARCH_BY_PART, so that answer is None -- and None is exactly
-    # what the old code would have reported for a run pinned to the B200.
-    assert unpinned_driver.arch() is None
+    # Unpinned falls back to the first device, i.e. what torch calls cuda:0 --
+    # and GPU 0's sm90 is exactly what the old code would have reported for a
+    # run pinned to the B200.
+    assert unpinned_driver.arch() == "sm90"
 
     unpinned_driver.select(Device(NVIDIA, 1, "NVIDIA B200"))
     assert unpinned_driver.arch() == "sm100"
@@ -1505,3 +1564,38 @@ def test_run_case_uses_only_gpu_timing_and_keeps_cpu_diagnostics(monkeypatch, le
     rendered = report.table([result])
     assert "eager" not in rendered and "CPU us" in rendered
     assert "80.00" in rendered
+
+
+@pytest.mark.parametrize("factor,expected", [(1.0, True), (2.0, False), (0.0, False), (float("nan"), False)])
+def test_mxfp8_backward_check_validates_magnitude_and_finiteness(factor, expected):
+    import torch
+    from bench_flash_attn_mxfp8 import _backward_close_enough
+
+    inputs = tuple(torch.ones(4, requires_grad=True) for _ in range(3))
+    reference = sum(inputs)
+    actual = inputs[0] * factor + inputs[1] + inputs[2]
+    passed, message = _backward_close_enough(actual, reference, inputs, torch.ones_like(reference))
+    assert passed is expected
+    assert not message if passed else "dQ" in message
+
+
+def test_mxfp8_backward_check_accepts_zero_gradients():
+    import torch
+    from bench_flash_attn_mxfp8 import _backward_close_enough
+
+    inputs = tuple(torch.ones(4, requires_grad=True) for _ in range(3))
+    actual = sum(inputs) * 0
+    reference = sum(inputs) * 0
+    assert _backward_close_enough(actual, reference, inputs, torch.ones_like(reference)) == (True, "")
+
+
+def test_mxfp8_backward_check_rejects_nonfinite_reference():
+    import torch
+    from bench_flash_attn_mxfp8 import _backward_close_enough
+
+    inputs = tuple(torch.ones(4, requires_grad=True) for _ in range(3))
+    actual = sum(inputs)
+    reference = inputs[0] * float("nan") + inputs[1] + inputs[2]
+    passed, message = _backward_close_enough(actual, reference, inputs, torch.ones_like(reference))
+    assert not passed
+    assert "reference contains nonfinite" in message

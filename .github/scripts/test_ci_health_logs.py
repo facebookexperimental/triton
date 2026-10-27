@@ -127,3 +127,38 @@ def test_lit_step_that_failed_before_lit_ran_gets_no_failures():
     job = lit_job()
     lg.attach_lit_failures(job, "2026-10-21T22:00:00.0Z FAILED: lib/x.cpp.o\n2026-10-21T22:00:00.1Z error: boom\n")
     assert "failures" not in job["steps"][0]
+
+
+def test_durations_go_to_the_step_that_printed_them():
+    job = {
+        "name":
+        "b200 / b200-tlx-test", "steps": [
+            step("Run TLX core tests", "success", "2026-10-22T01:00:00Z", "2026-10-22T01:26:02Z"),
+            step("Run TLX tutorial correctness tests", "success", "2026-10-22T01:26:02Z", "2026-10-22T01:27:00Z"),
+        ]
+    }
+    log = (
+        "2026-10-22T01:20:00.0000000Z x.py::t PASSED\n"
+        "2026-10-22T01:26:02.7203967Z ============================= slowest 25 durations =============================\n"
+        "2026-10-22T01:26:02.7204000Z 367.30s call     a.py::test_slow\n"
+        "2026-10-22T01:26:02.7205000Z 2.00s setup    b.py::test_p[x]\n"
+        "2026-10-22T01:26:02.7206000Z 10.00s call     b.py::test_p[x]\n"
+        "2026-10-22T01:26:02.7207000Z \n"
+        "2026-10-22T01:26:02.7208000Z (12 durations < 0.005s hidden.  Use -vv to show these durations.)\n"
+        "2026-10-22T01:26:02.7216176Z ========= 1592 passed, 102 skipped in 1328.03s (0:22:08) ==========\n"
+        "2026-10-22T01:26:40.0000000Z ============================= slowest 25 durations =============================\n"
+        "2026-10-22T01:26:40.1000000Z 3.50s call     third_party/c.py::test_gemm\n")
+    lg.attach_durations(job, log)
+    core, corr = job["steps"]
+    # The core block, printed in the second the core step ended and the correctness step began, stays with core.
+    assert core["slowest"] == [{"id": "a.py::test_slow", "s": 367.3}, {"id": "b.py::test_p[x]", "s": 12.0}]
+    assert corr["slowest"] == [{"id": "third_party/c.py::test_gemm", "s": 3.5}]
+
+
+def test_no_durations_block_leaves_steps_alone():
+    job = {
+        "name": "b200 / b200-tlx-test", "steps":
+        [step("Run TLX core tests", "success", "2026-10-22T01:00:00Z", "2026-10-22T01:30:00Z")]
+    }
+    lg.attach_durations(job, "2026-10-22T01:20:00.0000000Z 12.00s call     a.py::t\n")
+    assert "slowest" not in job["steps"][0]

@@ -176,6 +176,7 @@ the register allocator still chooses physical registers.
 
 | API | Verified targets | Purpose |
 |-----|------------------|---------|
+| `tlx.amd_dot` | gfx942, gfx950 | One AMD dot with register placement, MFMA order and accumulator lifetime as options; `mfma_order="explicit"` is `amd_scheduled_mfma`. |
 | `tlx.amd_scheduled_mfma` | gfx942, gfx950 | Update explicitly ordered native MFMA accumulator chains. |
 | `tlx.amd_mfma_commit` | gfx942, gfx950 | Apply an MFMA completion and liveness boundary to one or more independent chains. |
 | `tlx.amd_register_class_anchor` | gfx950 | Add a separate local register-class anchor for each native 32-bit value. |
@@ -186,6 +187,47 @@ fragment without cross-thread movement; `tlx.rematerialized_range`, which
 recreates inexpensive coordinates near a use; and `tlx.amd_sched_barrier`,
 which prevents selected AMD instruction classes from crossing a source
 boundary. None of these operations is a workgroup barrier or memory fence.
+
+### `tlx.amd_dot`
+
+```python
+acc = tlx.amd_dot(a, b, acc, register_class="agpr")
+acc = tlx.amd_dot(a, b, acc, register_class="agpr", mfma_order="explicit", accumulator_role="persistent")
+```
+
+One AMD dot, `acc + a @ b`, with register placement, MFMA order and
+accumulator lifetime as separate options.
+
+| Argument | Meaning |
+|----------|---------|
+| `register_class=None` / `"agpr"` / `"vgpr"` | Register file of the MFMA accumulator input (C) and result (D). `None` leaves the choice to LLVM. |
+| `mfma_order="auto"` | One logical `tt.dot`; the compiler orders the MFMAs (LLVM, or the AMD backend's MFMA scheduler with `schedule_hint="mfma-schedule"` on gfx950). The default. |
+| `mfma_order="explicit"` | The native fragment chains keep their source order: `amd_scheduled_mfma` under this name. |
+| `accumulator_role="transient"` / `"persistent"` | The accumulator's lifetime: phase-local (the default) or carried across phases with register pins and completion waits. A logical dot is phase-local by construction, so the auto order takes `"transient"` only. |
+| `resident_operand`, `initialize` | AGPR operand selection and zero-initialization of the explicit order; see `amd_scheduled_mfma`. |
+
+With `mfma_order="auto"` the product is exactly `tl.dot(a, b, acc)` lowered to
+LLVM-visible MFMA intrinsics, for every element type `tl.dot` accepts.
+`register_class` is recorded on the dot as `amdg.cd_regclass` (`"a"` or
+`"v"`). The MFMA lowering wraps each tile's accumulator in an empty inline asm
+with a tied `"=a,0"` or `"=v,0"` constraint, right before the tile's first
+MFMA and right after its last; no instruction is emitted. This is the
+mechanism of Gluon's `gl.amd.cdna3.mfma(..., cd_regclass=...)`.
+
+Use it when a large accumulator is carried across a hot loop and LLVM would
+otherwise move it between the two register files around every MFMA. A 256x256
+FP32 accumulator on four waves needs 256 registers per lane, so it cannot
+stay in VGPRs alone; pinned to AGPRs, the loop needs no `v_accvgpr` copies.
+The pins have to sit next to their own MFMAs. Anchoring the whole accumulator
+tensor at one source point with `tlx.amd_register_class_anchor` makes all
+tiles meet at one program point and does not remove the copies.
+
+With `mfma_order="explicit"` the call is `amd_scheduled_mfma(a, b, acc,
+accumulator_role, resident_operand, accumulator_register_class=register_class,
+initialize)`: the same op, lowering, operand constraints and completion rules,
+documented [below](#tlxamd_scheduled_mfma), and `amd_mfma_commit` applies to
+the results. `register_class=None` is its `auto`. `amd_scheduled_mfma` itself
+is kept under its original name and is defined as this call.
 
 ### `tlx.amd_register_resident`
 
@@ -248,6 +290,10 @@ acc = tlx.amd_scheduled_mfma(
     initialize=False,
 )
 ```
+
+This is `tlx.amd_dot(a, b, acc, register_class=accumulator_register_class,
+mfma_order="explicit", ...)` under its original name; both spellings lower
+identically.
 
 With `initialize=False`, the operation computes the native-fragment equivalent
 of `acc + a @ b` for the entire accumulator tile passed to the call. That tile

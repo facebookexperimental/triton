@@ -1,5 +1,7 @@
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 | FileCheck %s
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 | FileCheck %s --check-prefixes=CHECK,ATOMIC,CDNA
+// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 | FileCheck %s --check-prefixes=CHECK,ATOMIC,CDNA
+// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1100 | FileCheck %s --check-prefixes=CHECK,ATOMIC,RDNA
+// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1170 | FileCheck %s --check-prefixes=CHECK,ATOMIC,RDNA
 
 #blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
@@ -9,8 +11,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: %[[offset:.*]] = llvm.select %[[c_mask]]
         // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[offset]], {{.*}}, {{.*}}
         %ret = amdg.buffer_load %arg0[%offset] cacheModifier = cs : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
-        // evict_last never weakens the .cv bypass: sc0|sc1 stays 17.
-        // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 17
+        // evict_last never weakens the .cv bypass: sc0|sc1 stays 17 on CDNA
+        // (RDNA3 lowers the same policy to aux 7).
+        // CDNA: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 17
+        // RDNA: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 7
         %ret2 = amdg.buffer_load %arg0[%offset] cacheModifier = cv evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         tt.return
   }
@@ -121,14 +125,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, %[[offset]], {{.*}}, {{.*}}
         %c256_i32 = arith.constant 256 : i32
         amdg.buffer_store %value, %arg0[%offset] cacheModifier = cs stride = %c256_i32 : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
-        // evict_first sets the nt bit (0 -> 2).
-        // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 2
+        // evict_first sets the nt bit on CDNA (0 -> 2); RDNA3 lowers it to 7.
+        // CDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 2
+        // RDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 7
         amdg.buffer_store %value, %arg0[%offset] evictionPolicy = evict_first : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         // evict_last clears the nt bit that .cs sets (3 -> 1).
         // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 1
         amdg.buffer_store %value, %arg0[%offset] cacheModifier = cs evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
-        // evict_last never weakens the .wt bypass: sc0|sc1 stays 17.
-        // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 17
+        // evict_last never weakens the .wt bypass: sc0|sc1 stays 17 on CDNA
+        // (RDNA3 lowers the same case to aux 1).
+        // CDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 17
+        // RDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 1
         amdg.buffer_store %value, %arg0[%offset] cacheModifier = wt evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         tt.return
   }
@@ -275,25 +282,44 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         %5 = tt.splat %N: i32 -> tensor<128xi32, #blocked0>
         %mask = arith.cmpi slt, %4, %5: tensor<128xi32, #blocked0>
         // CHECK: %[[mask0:.*]] = llvm.extractvalue %{{.*}} : !llvm.struct<(i1, i1, i1, i1)>
+        // CDNA: %[[FLAGS:.*]] = llvm.mlir.constant(159744 : i32) : i32
+        // CDNA: rocdl.make.buffer.rsrc {{.*}}, %[[FLAGS]]
+        // RDNA: %[[FLAGS:.*]] = llvm.mlir.constant(822243328 : i32) : i32
+        // RDNA: rocdl.make.buffer.rsrc {{.*}}, %[[FLAGS]]
         // There should be a single release fence before any atomics
         // CHECK: llvm.fence syncscope("agent") release
         // CHECK: %[[mask1:.*]] = llvm.mlir.constant(true) : i1
         // CHECK: %[[mask2:.*]] = llvm.and %[[mask1]], %[[mask0]]
         // CHECK: %[[offset:.*]] = llvm.select %[[mask2]]
+        // ATOMIC-NEXT: %[[SOFFSET:.*]] = llvm.mlir.constant(0 : i32) : i32
+        // ATOMIC-NEXT: %[[CPOL:.*]] = llvm.mlir.constant(0 : i32) : i32
+        // ATOMIC-NEXT: %[[result:.*]] = llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"({{.*}}, {{.*}}, %[[offset]], %[[SOFFSET]], %[[CPOL]]) : (f32, !llvm.ptr<8>, i32, i32, i32) -> f32
+        // ATOMIC-COUNT-3: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"
+        // ATOMIC-NOT: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"
 
         // We will have 4 calls to fadd, since the sizePerThread is 4. Scope/ordering instructions will be
         // generated by the lowering of llvm.fence
         %ret = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %values, %arg0[%offset], %mask stride = %stride : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
 
-        // CHECK: %[[result:.*]] = llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"({{.*}}, {{.*}}, %[[mask1:.*]], {{.*}}, {{.*}}) : (f32, !llvm.ptr<8>, i32, i32, i32) -> f32
-        // CHECK: %[[result:.*]] = llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"({{.*}}, {{.*}}, %[[mask1:.*]], {{.*}}, {{.*}}) : (f32, !llvm.ptr<8>, i32, i32, i32) -> f32
-        // CHECK: %[[result:.*]] = llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"({{.*}}, {{.*}}, %[[mask1:.*]], {{.*}}, {{.*}}) : (f32, !llvm.ptr<8>, i32, i32, i32) -> f32
-        // CHECK: %[[result:.*]] = llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"({{.*}}, {{.*}}, %[[mask1:.*]], {{.*}}, {{.*}}) : (f32, !llvm.ptr<8>, i32, i32, i32) -> f32
-
         // There should be a single acquire fence after all of the atomics
         // CHECK: llvm.fence syncscope("agent") acquire
         tt.return
   }
+}
+
+// -----
+
+#blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+    // CHECK-LABEL: buffer_atomic_rmw_fadd_used
+    tt.func @buffer_atomic_rmw_fadd_used(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %offsets : tensor<32xi32, #blocked0>{tt.divisibility=16:i32}, %values : tensor<32xf32, #blocked0>) -> tensor<32xf32, #blocked0> {
+        // CHECK: %[[CPOL:.*]] = llvm.mlir.constant(1 : i32) : i32
+        // CHECK-NEXT: %[[RESULT:.*]] = llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"({{.*}}, {{.*}}, {{.*}}, {{.*}}, %[[CPOL]]) : (f32, !llvm.ptr<8>, i32, i32, i32) -> f32
+        // CHECK-NOT: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"
+        %ret = amdg.buffer_atomic_rmw fadd, relaxed, gpu, %values, %arg0[%offsets] : !tt.ptr<f32> -> tensor<32xf32, #blocked0>
+        %used = arith.addf %ret, %values : tensor<32xf32, #blocked0>
+        tt.return %used : tensor<32xf32, #blocked0>
+    }
 }
 
 // -----
