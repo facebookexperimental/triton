@@ -71,7 +71,7 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 .tip{position:fixed;pointer-events:none;background:var(--surface-1);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;padding:7px 9px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.12);opacity:0;z-index:10;max-width:360px;white-space:pre-line}
 </style></head><body><div class="viz-root"><div class="wrap">
 <header><div><h1>CI health: facebookexperimental/triton</h1>
-<p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every 3 h</p></div>
+<p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every hour</p></div>
 <button class="theme" id="themeBtn" type="button">Toggle theme</button></header>
 <div class="branchbar filterbar"><span class="muted">Branch</span><span class="seg" id="branch-sel"></span><span id="ops-filters" hidden><span class="muted">GPU</span><span class="seg" id="o-gpu"></span><span class="muted">Time range</span><span class="seg" id="o-range"></span></span></div>
 <div class="tabrows">
@@ -160,7 +160,7 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <p class="note">Each row is a commit that moved <code>cmake/meta-llvm-info.json</code> to a new LLVM release, with a link to the fork commits it added over the previous pin (over the upstream pin for the first).</p></div>
 </section>
 
-<p class="muted" style="margin-top:28px">Rebuilt every 3 h from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
+<p class="muted" style="margin-top:28px">Rebuilt every hour from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
 </div><div class="tip" id="tip"></div></div>
 <script>
 const REPO="https://github.com/facebookexperimental/triton";
