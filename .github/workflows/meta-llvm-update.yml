@@ -57,7 +57,11 @@ jobs:
     if: >-
       github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental' &&
       (inputs.target == '' || inputs.target == 'main')
-    permissions: read-all
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
     uses: ./.github/workflows/_meta-llvm-line.yml
     with:
       target: main
@@ -70,7 +74,11 @@ jobs:
     if: >-
       github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental' &&
       (inputs.target == '' || inputs.target == 'release/3.8.x')
-    permissions: read-all
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
     uses: ./.github/workflows/_meta-llvm-line.yml
     with:
       target: release/3.8.x

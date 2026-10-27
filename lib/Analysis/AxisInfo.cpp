@@ -750,14 +750,7 @@ private:
     // The minimal contiguity is gcd(d_lhs, d_rhs).
     // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
     // we need to use another gcd to get the actual contiguity.
-    // Partial contiguity is sufficient for unsigned remainder. For example,
-    // if lhs repeats contiguous groups of 64 elements, `lhs % 8` repeats
-    // contiguous groups of 8 elements even when the tensor dimension itself
-    // is larger than 64. Signed remainder cannot use this relaxation without
-    // a non-negativity proof because negative dividends break the run at zero.
-    // Preserve the pre-existing full-dimension inference for signed remainder.
-    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
-    if ((isUnsigned || AxisInfoVisitor::isContiguousDim(lhs, shape, dim)) &&
+    if (AxisInfoVisitor::isContiguousDim(lhs, shape, dim) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       contiguity = gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
                        rhs.getDivisibility(dim));
@@ -767,26 +760,14 @@ private:
 
   int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                           int dim) override {
-    auto resTy = dyn_cast<RankedTensorType>(op.getType());
-    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
-    // Divisibility applies to the base of each resulting contiguity group. If
-    // signed remainder cannot preserve a partial group, the old group-base
-    // divisibility does not apply to every now-scalar result.
-    bool preservesContiguousGroup =
-        isUnsigned ||
-        (resTy && AxisInfoVisitor::isContiguousDim(lhs, resTy.getShape(), dim));
-    if (rhs.getConstancy(dim) > 1 && preservesContiguousGroup) {
-      // lhs: d_lhs * k = gcd(d_lhs, d_rhs) * k' * k = gcd(d_lhs, d_rhs) * k''
-      // rhs: d_rhs * p = gcd(d_lhs, d_rhs) * p' * p = gcd(d_lhs, d_rhs) * p''
-      // lhs = gcd(d_lhs, d_rhs) * k'' = gcd(d_lhs, d_rhs) * d + r
-      // r must be divisible by gcd(d_lhs, d_rhs)
-      return gcd(lhs.getDivisibility(dim), rhs.getDivisibility(dim));
-    }
-    // Otherwise we shouldn't assume any divisibility.
-    // For example:
-    // lhs: [2, 2, 4, 4], rhs: [0, 1, 2, 3]
-    // lhs % rhs = [0, 0, 0, 1]
-    return 1;
+    auto contiguity = getContiguity(op, lhs, rhs, dim);
+    auto divisibility = gcd(lhs.getDivisibility(dim), rhs.getDivisibility(dim));
+    // New group bases inside an operand's contiguous group have offsets that
+    // are multiples of the result contiguity.
+    if (lhs.getContiguity(dim) > contiguity ||
+        rhs.getContiguity(dim) > contiguity)
+      divisibility = gcd(divisibility, contiguity);
+    return divisibility;
   };
 };
 
@@ -821,13 +802,8 @@ public:
   AxisInfo
   getAxisInfo(triton::LoadOp op,
               ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
-    // If pointers and mask both have constancy properties, those properties
-    // will also extend to output.
+    // Repeated pointers, masks, and fallback values produce repeated results.
     AxisInfo ptrInfo = operands[0]->getValue();
-    std::optional<AxisInfo> maskInfo;
-    if (operands.size() > 1) {
-      maskInfo = operands[1]->getValue();
-    }
     AxisInfo::DimVectorT contiguity;
     AxisInfo::DimVectorT divisibility;
     AxisInfo::DimVectorT constancy;
@@ -835,9 +811,11 @@ public:
     for (int d = 0; d < ptrInfo.getRank(); ++d) {
       contiguity.push_back(1);
       divisibility.push_back(1);
-      constancy.push_back(
-          gcd(ptrInfo.getConstancy(d),
-              maskInfo.has_value() ? maskInfo->getConstancy(d) : 0));
+      int64_t resultConstancy = ptrInfo.getConstancy(d);
+      for (const auto *operand : operands.drop_front())
+        resultConstancy =
+            gcd(resultConstancy, operand->getValue().getConstancy(d));
+      constancy.push_back(resultConstancy);
     }
 
     return AxisInfo(contiguity, divisibility, constancy);

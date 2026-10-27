@@ -24,14 +24,17 @@ import pytest
 import torch
 import triton
 from triton._internal_testing import is_blackwell
+from triton.tlx.ops import BitwiseInvarianceSpec
+from triton.tlx.ops._catalog import invariant_vocab_for
 from triton.tlx.ops.kernels.mm import sm100
 from triton.tlx.ops.kernels.mm._shapes import SM100_CORRECTNESS_SHAPES, operand
 
-from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case
+from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case, run_mm_invariance_case
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires sm100")
 
 ARCH = "sm100"
+_GEMM_VOCAB = invariant_vocab_for("mm")
 
 _LONG_K_BF16_SKIP_REASON = "Long-K BF16 output currently exceeds the numerical tolerance"
 
@@ -44,7 +47,7 @@ def test_mm_default_space_is_full(monkeypatch):
     _, spec = impl_for("mm", ARCH)
     seen = {}
 
-    def record(a, b, *, out=None, space):
+    def record(a, b, *, out=None, space, invariance=None):
         seen["space"] = space
         return torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=a.dtype)
 
@@ -213,7 +216,7 @@ def _pinned_config(overrides):
     """Force ``space="heuristic"`` to compile exactly one config."""
     original = sm100.heuristic_config
 
-    def one_config(M, N, K):
+    def one_config(M, N, K, *, invariance=None):
         cfg = sm100.get_heuristic_config(M, N, K, sm100._get_num_sms())
         assert cfg is not None, f"no heuristic config for {M}x{N}x{K}"
         cfg = dict(cfg)
@@ -303,7 +306,7 @@ def _pinned_explicit(cfg):
     original = sm100.heuristic_config
     num_ctas = cfg.get("NUM_CTAS", 1)
 
-    def one_config(M, N, K):
+    def one_config(M, N, K, invariance=None):
         return [
             triton.Config(cfg, num_warps=4, num_stages=1, pre_hook=sm100.matmul_tma_set_block_size_hook,
                           ctas_per_cga=(num_ctas, 1, 1) if num_ctas > 1 else None)
@@ -448,3 +451,38 @@ def test_preprocess_drops_unsupported_npot_block_n():
     assert sm100.preprocess_configs([_npot_config(240, epilogue_subtile=8)], shape) == []
     # The 16-wide piece is narrower than a 32-wide epilogue slice.
     assert sm100.preprocess_configs([_npot_config(208, epilogue_subtile=4)], shape) == []
+
+
+_INVARIANCE_SPECS = [
+    BitwiseInvarianceSpec.dims("M"),
+    BitwiseInvarianceSpec.dims("K"),
+    BitwiseInvarianceSpec.all(),
+]
+
+_INVARIANCE_SHAPES = [
+    # Undersaturated: the default heuristic selects split-K here.
+    (1024, 256, 16384, (16384, 1), (256, 1), "bf16"),
+    (2048, 2048, 2048, (2048, 1), (2048, 1), "bf16"),
+]
+
+
+@pytest.mark.parametrize("spec", _INVARIANCE_SPECS)
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _INVARIANCE_SHAPES)
+def test_mm_invariance(spec, M, N, K, a_strides, b_strides, dtype_name):
+    """A non-empty spec gives exact M-slice equality."""
+    run_mm_invariance_case(ARCH, M, N, K, a_strides, b_strides, dtype_name, spec)
+
+
+@pytest.mark.parametrize("spec", _INVARIANCE_SPECS)
+def test_heuristic_prunes_split_k(spec):
+    """A fixed schedule prunes split-K from the heuristic config (no launch)."""
+    default = sm100.get_heuristic_config(1024, 256, 16384, num_sms=148)
+    assert default["SPLIT_K"] > 1
+    pruned = sm100.get_heuristic_config(1024, 256, 16384, num_sms=148, invariance=spec.resolve(_GEMM_VOCAB))
+    assert pruned["SPLIT_K"] == 1
+
+
+def test_eligible_configs_filter():
+    """The full-space filter keeps the single fixed SPLIT_K (no launch)."""
+    cfgs = [triton.Config({"SPLIT_K": sk}, num_warps=4) for sk in (1, 2, 4)]
+    assert [c.kwargs["SPLIT_K"] for c in sm100._eligible_configs(cfgs, 1)] == [1]

@@ -40,6 +40,10 @@ a { color: var(--series-1); }
 .banner { background: var(--banner); border: 1px solid var(--ring); border-radius: 8px; padding: 8px 12px; margin: 16px 0;
   color: var(--text-secondary); }
 .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+/* Same tinted, sticky filter bar as /ci/, so the filters stay in reach while scrolling. */
+.filterbar { position: sticky; top: 0; z-index: 6; padding: 8px 12px; border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--series-1) 35%, var(--ring));
+  background: color-mix(in srgb, var(--series-1) 12%, var(--page)); box-shadow: 0 2px 6px rgba(0,0,0,.08); }
 label.ctl { color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
 select, button { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--axis);
   border-radius: 6px; padding: 4px 8px; }
@@ -150,7 +154,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     <a href="../">FBTriton site</a></p>
   <div class="banner" id="banner"></div>
 
-  <div class="row" role="group" aria-label="Filters">
+  <div class="row filterbar" role="group" aria-label="Filters">
     <label class="ctl">Nights <select id="range"><option value="7">Last 7</option><option value="14">Last 14</option>
       <option value="30" selected>Last 30</option><option value="60">Last 60</option></select></label>
     <label class="ctl">Platform <select id="platform"></select></label>
@@ -185,6 +189,16 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     <p class="sub" id="dist-sub"></p>
     <div class="inputs-slot"></div>
     <div class="chart" id="dist"><div class="tip"></div></div>
+  </section>
+
+  <section class="card" id="cases-card">
+    <h2 id="cases-title"></h2>
+    <p class="sub" id="cases-sub"></p>
+    <div class="inputs-slot"></div>
+    <div class="row" style="margin: 4px 0 8px"><div class="legend" id="cases-legend" style="margin: 0"></div><span class="spacer"></span>
+      <label class="ctl">Sort by <select id="cases-sort"><option value="r">reference TF/s</option><option value="t">TLX TF/s</option>
+        <option value="x">speedup</option><option value="in">input</option></select></label></div>
+    <div class="chart" id="cases"><div class="tip"></div></div>
   </section>
 
   <section class="card">
@@ -257,7 +271,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     error: {label: "ERROR", icon: "✕", color: "var(--critical)"},
   };
   const state = {platform: PLATFORMS.map(([k]) => k).find((k) => DATA.platforms[k]) || Object.keys(DATA.platforms)[0], op: "all", dir: "all", dtype: "all", inputs: {}, group: "op", range: 30, trendScroll: null, hidden: new Set(), statuses: new Set(Object.keys(STATUS)),
-                 sort: {key: null, dir: 1}, sortSum: {key: null, dir: 1}, rows: 50, ev: null};
+                 sort: {key: null, dir: 1}, sortSum: {key: null, dir: 1}, rows: 50, ev: null, casesSort: "r"};
   const $ = (id) => document.getElementById(id);
   const el = (tag, attrs = {}, text) => {
     const n = document.createElementNS(tag === "svg" || attrs.svg ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml", tag);
@@ -268,6 +282,8 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   const s = (tag, attrs) => el(tag, {...attrs, svg: true});
   const fmt = (v, d = 3, suf = "") => (v === null || v === undefined ? "–" : v.toFixed(d) + suf);
   const fmtDate = (d) => `${d.slice(4, 6)}/${d.slice(6)}`;
+  // Round tick step near raw: 1, 2, 2.5 or 5 times a power of ten.
+  const niceStep = (raw) => { const mag = 10 ** Math.floor(Math.log10(raw)); return mag * [1, 2, 2.5, 5, 10].find((f) => f * mag >= raw); };
   const geomean = (xs) => { xs = xs.filter((x) => x > 0); return xs.length ? Math.exp(xs.reduce((a, x) => a + Math.log(x), 0) / xs.length) : null; };
 
   const plat = () => DATA.platforms[state.platform];
@@ -351,18 +367,27 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       ps.append(o);
     }
     ps.value = state.platform;
+    // Filters carry across platform and op switches; drop only the ones the new view cannot apply.
+    if (state.op !== "all" && !plat().latest[state.op]) state.op = "all";
+    const cases = state.op === "all" ? [] : plat().latest[state.op].cases;
+    for (const [k, v] of Object.entries(state.inputs)) {
+      const vals = new Set(cases.map((c) => c.p[k]));
+      if (vals.size < 2 || !vals.has(v)) delete state.inputs[k];
+    }
+    if (state.ev && !(plat().events && evNight(state.ev))) state.ev = null;
     const os = $("op");
     os.textContent = "";
     os.append(el("option", {value: "all"}, "All ops"));
     for (const n of Object.keys(plat().latest)) os.append(el("option", {value: n}, n));
     os.value = state.op;
-    const dts = [...new Set(Object.values(plat().latest).flatMap((o) => o.cases.map((c) => c.dt)))].sort();
+    const dts = [...new Set(scopeOps().flatMap((n) => plat().latest[n].cases.map((c) => c.dt)))].sort();
     if (state.dtype !== "all" && !dts.includes(state.dtype)) state.dtype = "all";
     const ds = $("dtype");
     ds.textContent = "";
     ds.append(el("option", {value: "all"}, "all"));
     for (const d of dts) ds.append(el("option", {value: d}, d));
     ds.value = state.dtype;
+    if (state.dir !== "all" && !scopeOps().some((n) => plat().latest[n].cases.some((c) => c.d === state.dir))) state.dir = "all";
     $("dir").value = state.dir;
     const opts = groupOptions();
     if (!opts.includes(state.group)) state.group = opts[0];
@@ -426,11 +451,24 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       d.append(kk, el("div", {class: "v"}, v));
       t.append(d);
     };
+    // Count changes vs the previous night, over the same slice.
+    const H = plat().history;
+    const before = H.length > 1 ? scopeOps().flatMap((n) => (H[H.length - 2].ops[n] || {cases: []}).cases.filter(matches)) : null;
+    const change = (k, now, prev) => {
+      if (before === null) return;
+      const diff = now - prev;
+      const d = el("div", {class: "k"}, diff ? `${diff > 0 ? "+" : "−"}${Math.abs(diff)} vs previous night` : "no change vs previous night");
+      if (diff && (EV_UP_GOOD[k] || EV_UP_BAD[k])) d.style.color = (diff > 0) === !!EV_UP_GOOD[k] ? "var(--good-text)" : "var(--critical)";
+      t.lastChild.append(d);
+    };
     add("Cases (latest night)", String(cs.length));
-    for (const st of Object.keys(STATUS)) add("", String(count(st)), st);
+    change("cases", cs.length, before && before.length);
+    for (const st of Object.keys(STATUS)) {
+      add("", String(count(st)), st);
+      change(st, count(st), before && before.filter((c) => c.s === st).length);
+    }
     add("Geomean speedup", sp ? sp.toFixed(3) + "×" : "–");
     // Night-over-night change, for a single op (the all-ops figure mixes ops of very different size).
-    const H = plat().history;
     if (state.op !== "all" && sp && H.length > 1) {
       const prev = aggOf(H[H.length - 2].ops[state.op].cases).speedup;
       if (prev) {
@@ -481,9 +519,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const vals = shown.flatMap((o) => H.map((n) => val(n, o))).filter((v) => v);
     let lo = Math.min(...vals), hi = Math.max(...vals);
     if (!byTflops) { lo = Math.min(lo, 0.8); hi = Math.max(hi, 1.05); }
-    // Round tick values: snap the step to 1, 2, 2.5 or 5 times a power of ten.
-    const raw = (hi - lo) / 4 || 1, mag = 10 ** Math.floor(Math.log10(raw));
-    const step = mag * [1, 2, 2.5, 5, 10].find((f) => f * mag >= raw);
+    const step = niceStep((hi - lo) / 4 || 1);
     lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
     const x = (i) => m.l + (W - m.l - m.r) * (i / Math.max(H.length - 1, 1));
     const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / (hi - lo);
@@ -688,6 +724,104 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     box.insertBefore(svg, box.querySelector(".tip"));
   }
 
+  // ---- cases: absolute TFLOP/s of every case, reference and TLX side by side. Shown with one op selected.
+  function cases() {
+    const card = $("cases-card"), box = $("cases"), tip = box.querySelector(".tip");
+    box.querySelectorAll(".scroll, .yaxis, .note").forEach((n) => n.remove());
+    card.hidden = state.op === "all";
+    if (card.hidden) return;
+    const o = plat().latest[state.op], hasRef = !!o.ref;
+    const all = o.cases.filter(matches), cs = all.filter((c) => c.s !== "error" && c.t);
+    const sort = hasRef || state.casesSort !== "r" && state.casesSort !== "x" ? state.casesSort : "t";
+    $("cases-sort").value = sort;
+    [...$("cases-sort").options].forEach((op) => { op.disabled = !hasRef && (op.value === "r" || op.value === "x"); });
+    $("cases-title").textContent = (hasRef ? `${state.op}: TLX vs reference TFLOP/s per case, latest night` : `${state.op}: TLX TFLOP/s per case, latest night`);
+    const skipped = all.length - cs.length;
+    $("cases-sub").textContent = (hasRef ? `Each pair is one case: ${o.ref} next to TLX. ` : "No reference, so one TLX bar per case. ")
+      + (hasRef ? "Hover a case for its inputs and speedup." : "Hover a case for its inputs.") + (skipped ? ` ${skipped} errored case(s) have no timing and appear only in the table.` : "");
+    // Bar labels: the inputs that vary across this op's cases and are short enough to read, joined by ×.
+    const keys = groupOptions().filter((g) => g.startsWith("in.")).map((g) => g.slice(3))
+      .filter((k) => o.cases.every((c) => String(c.p[k] ?? "").length <= 8));
+    const label = (c) => keys.map((k) => c.p[k]).join("×");
+    const series = [...(hasRef ? [{k: "r", name: o.ref, color: "var(--muted)"}] : []), {k: "t", name: "TLX", color: "var(--series-1)"}];
+    const legend = $("cases-legend");
+    legend.textContent = "";
+    if (series.length > 1) for (const sr of series) {
+      const sp = el("span", {class: "nm", style: "display:flex;gap:6px;align-items:center"});
+      const k = el("span", {class: "key"}); k.style.background = sr.color; k.style.height = "10px"; k.style.width = "10px";
+      sp.append(k, document.createTextNode(sr.name));
+      legend.append(sp);
+    }
+    if (!cs.length) { box.prepend(el("p", {class: "note"}, `No timed ${state.op} cases match ${sliceName() || "these filters"}.`)); return; }
+    const byInput = (a, b) => keys.reduce((d, k) => d || byValue(a.p[k], b.p[k]), 0) || a.l.localeCompare(b.l);
+    cs.sort(sort === "in" ? byInput : (a, b) => (a[sort] ?? 0) - (b[sort] ?? 0) || byInput(a, b));
+    // Each case gets a fixed-width slot; past what fits, the plot widens and scrolls under a pinned y axis, like the trend.
+    const GAP = 2, SLOT = series.length * 7 + (series.length - 1) * GAP + 6;
+    const longest = Math.max(...cs.map((c) => label(c).length));
+    // Labels are rotated 50°, so each one reaches ~5.2 units down and ~4.4 units left per character (11px text).
+    const W0 = 1040, Hh0 = 280, m = {l: 48, r: 12, t: 12, b: Math.min(170, 24 + longest * 5.2)}, Hh = Hh0 + m.b;
+    const W = Math.max(W0, m.l + m.r + SLOT * cs.length);
+    let slot = (W - m.l - m.r) / cs.length;
+    // Inset the first slot far enough that its label clears the pinned y axis.
+    const inset = Math.max(0, longest * 4.4 - slot / 2);
+    slot = (W - m.l - m.r - inset) / cs.length;
+    const x0of = (i) => m.l + inset + i * slot;
+    // Bars widen with the slot when few cases match, up to a cap, so a filtered view isn't a row of hairlines.
+    const BAR = Math.min(24, (slot * 0.7 - (series.length - 1) * GAP) / series.length);
+    const vmax = Math.max(...cs.flatMap((c) => series.map((sr) => c[sr.k] || 0)));
+    const step = niceStep(vmax / 4), hi = Math.ceil(vmax / step) * step;
+    const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / hi;
+    const svg = s("svg", {viewBox: `0 0 ${W} ${Hh}`, role: "img", "aria-label": $("cases-title").textContent});
+    svg.style.width = `${W / W0 * 100}%`;
+    const yaxis = s("svg", {class: "yaxis", viewBox: `0 0 ${m.l} ${Hh - m.b + 6}`, "aria-hidden": "true"});
+    yaxis.style.width = `${m.l / W0 * 100}%`;
+    yaxis.append(s("rect", {x: 0, y: 0, width: m.l, height: Hh - m.b + 6, fill: "var(--surface-1)"}));
+    for (let v = 0; v <= hi + step / 2; v += step) {
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1}));
+      yaxis.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, String(+v.toPrecision(6))));
+    }
+    svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(0), y2: y(0), stroke: "var(--axis)", "stroke-width": 1}));
+    const grp = series.length * BAR + (series.length - 1) * GAP;
+    const show = (ev, c) => {
+      tip.textContent = "";
+      const head = el("div", {class: "h"}); head.append(statusBadge(c.s), document.createTextNode(` ${c.d} · ${c.dt}`));
+      tip.append(head, el("div", {}, c.l));
+      for (const sr of series) {
+        const r = el("div", {class: "r"}), nm = el("span", {class: "nm"}), k = el("span", {class: "key"});
+        k.style.background = sr.color; nm.append(k, document.createTextNode(sr.name));
+        r.append(el("b", {}, fmt(c[sr.k], c[sr.k] < 1 ? 4 : 0, " TF/s")), nm);
+        tip.append(r);
+      }
+      if (hasRef) tip.append(el("div", {}, `speedup ${fmt(c.x, 3, "×")}`));
+      if (c.n) tip.append(el("div", {class: "note"}, c.n));
+      const bx = box.getBoundingClientRect();
+      tip.style.display = "block";
+      let lx = ev.clientX - bx.left + 14; if (lx + tip.offsetWidth > bx.width) lx -= tip.offsetWidth + 28;
+      tip.style.left = lx + "px"; tip.style.top = "20px";
+    };
+    const hide = () => { tip.style.display = "none"; };
+    cs.forEach((c, i) => {
+      const x0 = x0of(i) + (slot - grp) / 2, g = s("g", {tabindex: 0});
+      series.forEach((sr, j) => {
+        const v = c[sr.k];
+        if (!v) return;
+        g.append(s("rect", {x: x0 + j * (BAR + GAP), y: y(v), width: BAR, height: Math.max(0, y(0) - y(v)), rx: 1.5, fill: sr.color}));
+      });
+      const lx = x0of(i) + slot / 2;
+      g.append(el("text", {svg: 1, x: lx, y: y(0) + 10, "text-anchor": "end",
+                           transform: `rotate(-50 ${lx} ${y(0) + 10})`}, label(c)));
+      // Hit area: the whole slot, top to bottom, so a short bar is as easy to hover as a tall one.
+      g.append(s("rect", {x: x0of(i), y: m.t, width: slot, height: Hh - m.t - m.b, fill: "transparent"}));
+      g.addEventListener("pointermove", (ev) => show(ev, c)); g.addEventListener("pointerleave", hide);
+      g.addEventListener("focus", () => { const bb = g.getBoundingClientRect(); show({clientX: bb.right}, c); });
+      g.addEventListener("blur", hide);
+      svg.append(g);
+    });
+    const scroll = el("div", {class: "scroll"});
+    scroll.append(svg);
+    box.prepend(scroll, yaxis);
+  }
+
   // ---- table: the accessible view of everything above.
   function sortableTable(box, cols, rows, sortKey, redraw) {
     const {key, dir} = state[sortKey];
@@ -783,7 +917,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   $("range").value = String(state.range);
   const saveHash = () => {
     const p = new URLSearchParams();
-    if (state.platform !== "b200") p.set("platform", state.platform);
+    p.set("platform", state.platform);
     if (state.op !== "all") p.set("op", state.op);
     if (state.range !== 30) p.set("nights", state.range);
     if (state.ev) p.set("ev", state.ev);
@@ -1102,16 +1236,14 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
     td.append(d);
   }
 
-  function render() { banner(); controls(); inputs(); tiles(); trend(); evCard(); dist(); table(); versions(); howto(); saveHash(); }
-  $("platform").onchange = (e) => { state.platform = e.target.value; state.trendScroll = null; state.ev = null; state.op = "all"; state.inputs = {}; state.group = "op"; state.hidden.clear(); render(); };
+  function render() { banner(); controls(); inputs(); tiles(); trend(); evCard(); dist(); cases(); table(); versions(); howto(); saveHash(); }
+  $("platform").onchange = (e) => { state.platform = e.target.value; state.trendScroll = null; state.hidden.clear(); render(); };
   $("range").onchange = (e) => { state.range = Number(e.target.value); state.trendScroll = null; render(); };
   $("dir").onchange = (e) => { state.dir = e.target.value; state.rows = 50; render(); };
   $("dtype").onchange = (e) => { state.dtype = e.target.value; state.rows = 50; render(); };
   $("group").onchange = (e) => { state.group = e.target.value; state.hidden.clear(); state.sortSum = {key: null, dir: 1}; render(); };
   $("op").onchange = (e) => {
     state.op = e.target.value;
-    state.inputs = {};
-    state.group = state.op === "all" ? "op" : "none";
     state.hidden.clear();
     state.rows = 50; state.sort = {key: null, dir: 1}; render(); };
   $("theme").onclick = () => {
@@ -1120,7 +1252,8 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
     r.dataset.theme = dark ? "light" : "dark";
     saveHash();
   };
-  window.addEventListener("resize", () => { trend(); dist(); });
+  window.addEventListener("resize", () => { trend(); dist(); cases(); });
+  $("cases-sort").onchange = (e) => { state.casesSort = e.target.value; cases(); };
   render();
 })();
 </script>

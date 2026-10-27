@@ -131,6 +131,106 @@ def amd_register_class_anchor(
 
 
 @tl.builtin
+def amd_dot(
+    a,
+    b,
+    acc,
+    register_class: tl.constexpr = None,
+    mfma_order: tl.constexpr = "auto",
+    accumulator_role: tl.constexpr = "transient",
+    resident_operand: tl.constexpr = None,
+    initialize: tl.constexpr = False,
+    _semantic=None,
+):
+    """The AMD dot: ``acc + a @ b`` with register placement, MFMA order and
+    accumulator lifetime as separate options.
+
+    ``register_class`` (``None``, ``"agpr"`` or ``"vgpr"``) is the register
+    file requested for the MFMA accumulator input (C) and result (D);
+    ``None`` leaves the choice to LLVM. ``mfma_order`` selects how the product
+    is lowered. ``accumulator_role`` (``"transient"``, the default, or
+    ``"persistent"``) is the accumulator's lifetime contract: phase-local, or
+    carried across phases.
+
+    ``mfma_order="auto"`` (default) is one logical ``tt.dot``, lowered by the
+    AMD backend to LLVM-visible MFMA intrinsics whose order the compiler owns:
+    LLVM's schedulers, or the backend's MFMA scheduler when the kernel is
+    compiled with ``schedule_hint="mfma-schedule"`` on gfx950. Every element
+    type ``tl.dot`` accepts is accepted, and with no ``register_class`` the
+    call is identical to ``tl.dot``. A register class is recorded on the dot
+    as ``amdg.cd_regclass`` (``"a"`` or ``"v"``); the MFMA lowering then wraps
+    each tile's accumulator in an empty inline asm with a tied ``"=a,0"`` /
+    ``"=v,0"`` constraint, right before the tile's first MFMA and right after
+    its last. No instruction is emitted. This is the mechanism of Gluon's
+    ``gl.amd.cdna3.mfma(..., cd_regclass=...)``. The pins sit next to their
+    own MFMAs, tile by tile, which is what lets LLVM drop the AGPR/VGPR copies
+    around a large accumulator; anchoring the whole accumulator at one source
+    point with :func:`amd_register_class_anchor` does not. A logical dot is
+    phase-local by construction, so this order takes ``accumulator_role=
+    "transient"`` only, and ``resident_operand`` and ``initialize`` do not
+    apply. ``register_class`` is AMD-only and currently verified on gfx950.
+
+    ``mfma_order="explicit"`` keeps the source order of the native MFMA
+    fragment chains: one SSA chain per output fragment, updated in K-major,
+    N-major, M-minor order, lowered to native ROCDL MFMA intrinsics. This is
+    the lowering of :func:`amd_scheduled_mfma`, which is this call under its
+    original name; see it for the full contract. ``accumulator_role`` selects
+    the chain's lifetime; a persistent chain pins its accumulator in the
+    ``register_class`` (``None`` is ``auto``, AGPRs) with side-effecting
+    inline asm and gets completion waits where its results reach opaque
+    consumers. ``resident_operand`` (``0`` or ``1``) selects the left or right
+    input for AGPR placement on the persistent path, ``"unconstrained"`` leaves
+    input placement to LLVM, and ``initialize=True``
+    starts every chain from zero, ignoring ``acc``. The inputs must be
+    matching BF16 or F16 dot operands with ``kWidth`` 4 or 8 and ``acc`` an
+    F32 accumulator in the corresponding unit-tile MFMA layout;
+    :func:`amd_mfma_commit` applies to the results as usual.
+
+    ``a`` and ``b`` are the dot operands, ``acc`` the F32 accumulator.
+    """
+    register_class = tl._unwrap_if_constexpr(register_class)
+    mfma_order = tl._unwrap_if_constexpr(mfma_order)
+    accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
+    resident_operand = tl._unwrap_if_constexpr(resident_operand)
+    initialize = tl._unwrap_if_constexpr(initialize)
+    assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), "a and b must be distributed tensors"
+    assert isinstance(acc, tl.tensor) and acc.type.is_block(), "acc must be a distributed tensor"
+    assert register_class in (None, "agpr",
+                              "vgpr"), f'register_class must be None, "agpr", or "vgpr", got {register_class!r}'
+    assert mfma_order in ("auto", "explicit"), f'mfma_order must be "auto" or "explicit", got {mfma_order!r}'
+    assert accumulator_role in ("transient",
+                                "persistent"), ('accumulator_role must be either "transient" or "persistent"')
+    assert resident_operand is None or resident_operand == "unconstrained" or (
+        isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
+        and resident_operand in (0, 1)), 'resident_operand must be None, 0, 1, or "unconstrained"'
+    assert isinstance(initialize, bool), "initialize must be a constexpr bool"
+    if mfma_order == "explicit":
+        resident_role = {None: "none", 0: "lhs", 1: "rhs", "unconstrained": "unconstrained"}[resident_operand]
+        accumulator_class = "auto" if register_class is None else register_class
+        handle = _semantic.builder.create_amd_scheduled_mfma(
+            a.handle,
+            b.handle,
+            acc.handle,
+            resident_role,
+            accumulator_role,
+            accumulator_class,
+            initialize,
+        )
+        return tl.tensor(handle, acc.type)
+    assert accumulator_role == "transient", (
+        'mfma_order="auto" is a logical dot, phase-local by construction: it carries no persistent-chain '
+        'contract. Pin the accumulator with register_class, or use mfma_order="explicit".')
+    assert resident_operand is None and initialize is False, (
+        'resident_operand and initialize apply to mfma_order="explicit" only')
+    result = _semantic.dot(a, b, acc, input_precision=None, max_num_imprecise_acc=None, out_dtype=acc.dtype)
+    if register_class is not None:
+        assert _semantic.builder.options.backend_name == "hip", "register_class is only supported on AMD targets"
+        cd_regclass = {"agpr": "a", "vgpr": "v"}[register_class]
+        result.handle.set_attr("amdg.cd_regclass", _semantic.builder.get_string_attr(cd_regclass))
+    return result
+
+
+@tl.builtin
 def amd_scheduled_mfma(
     a,
     b,
@@ -143,9 +243,12 @@ def amd_scheduled_mfma(
 ):
     """Update native CDNA3/CDNA4 MFMA fragments with explicit lifetime contracts.
 
-    Unlike ``tl.dot``, which represents one logical matrix product and carries
-    no accumulator-lifetime or register-class contract, this operation exposes
-    independent native fragment chains in source order.
+    This is :func:`amd_dot` with ``mfma_order="explicit"`` under its original
+    name (``accumulator_register_class`` is ``amd_dot``'s ``register_class``);
+    both spellings lower identically. Unlike ``tl.dot``, which represents one
+    logical matrix product and carries no accumulator-lifetime or
+    register-class contract, this operation exposes independent native
+    fragment chains in source order.
 
     With ``initialize=False``, computes ``acc + a @ b`` over native fragments.
     The operation keeps one SSA chain per output fragment and creates updates
@@ -214,32 +317,17 @@ def amd_scheduled_mfma(
     distributed over waves, with one batch per wave. All active lanes of a wave
     must execute the operation uniformly.
     """
-    resident_operand = tl._unwrap_if_constexpr(resident_operand)
-    accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
-    accumulator_register_class = tl._unwrap_if_constexpr(accumulator_register_class)
-    initialize = tl._unwrap_if_constexpr(initialize)
-    assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), ("a and b must be distributed tensors")
-    assert isinstance(acc, tl.tensor), "acc must be a distributed tensor"
-    assert resident_operand is None or resident_operand == "unconstrained" or (
-        isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
-        and resident_operand in (0, 1)), 'resident_operand must be None, 0, 1, or "unconstrained"'
-    assert accumulator_role in ("transient",
-                                "persistent"), ('accumulator_role must be either "transient" or "persistent"')
-    assert accumulator_register_class in (None, "agpr",
-                                          "vgpr"), ("accumulator_register_class must be None, \"agpr\", or \"vgpr\"")
-    assert isinstance(initialize, bool), "initialize must be a constexpr bool"
-    resident_role = {None: "none", 0: "lhs", 1: "rhs", "unconstrained": "unconstrained"}[resident_operand]
-    accumulator_class = ("auto" if accumulator_register_class is None else accumulator_register_class)
-    handle = _semantic.builder.create_amd_scheduled_mfma(
-        a.handle,
-        b.handle,
-        acc.handle,
-        resident_role,
-        accumulator_role,
-        accumulator_class,
-        initialize,
+    return amd_dot(
+        a,
+        b,
+        acc,
+        register_class=accumulator_register_class,
+        mfma_order="explicit",
+        accumulator_role=accumulator_role,
+        resident_operand=resident_operand,
+        initialize=initialize,
+        _semantic=_semantic,
     )
-    return tl.tensor(handle, acc.type)
 
 
 @tl.builtin

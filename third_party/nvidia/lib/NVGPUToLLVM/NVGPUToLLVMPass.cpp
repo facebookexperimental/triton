@@ -609,7 +609,9 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, std::string exclusive,
       // Non-TLX 2-CTA AutoWS: this code runs only in the default warp group's
       // exit path. Workers are in the switch loop and cannot participate in a
       // cluster-wide barrier, so use a CTA-level barrier instead.
-      NVVM::BarrierOp::create(b, loc);
+      // Warp-specialized groups may reach different copies of this barrier,
+      // so it must not require all threads to reach the same instruction.
+      NVVM::BarrierOp::create(b, loc, Value{}, Value{}, /*aligned=*/false);
     }
     PTXBuilder ptxBuilder;
     // Calculate the predicate in the inline asm to avoid creating long

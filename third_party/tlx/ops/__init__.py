@@ -61,6 +61,7 @@ enforce it yet raises `UnsupportedOp` rather than being silently ignored.
 from __future__ import annotations
 
 import functools
+import math
 
 from torch.compiler import assume_constant_result
 
@@ -160,8 +161,8 @@ def mm(a, b, *, out=None, space=None):
     if space_name is None:
         space_name = spec.default_space
     if out is None:
-        return fn(a, b, space=space_name)
-    return fn(a, b, out=out, space=space_name)
+        return fn(a, b, space=space_name, invariance=invariance)
+    return fn(a, b, out=out, space=space_name, invariance=invariance)
 
 
 def mm_bias_grad(dout, input_act, *, out=None, space=None):
@@ -616,16 +617,18 @@ def flash_attn_varlen_backward(q, k, v, o, do, lse, plan, sm_scale=None, causal=
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_expcast=False):
-    """MXFP8 attention over contiguous BF16 ``(Z, H, N_CTX, HEAD_DIM)`` tensors.
+    """Differentiable MXFP8 attention over contiguous BF16 Q/K/V.
 
-    Q, K, V and the softmax probabilities are quantized internally to E4M3
-    data with E8M0 scales: per 32x32 block for Q and K, per 32 keys for V and
-    the probabilities. gfx950 quantizes as Blackwell does, but its ping-pong
-    kernel (non-causal, and causal at sequence lengths divisible by 512)
-    computes the probabilities with an approximate exp2 (see
-    kernels/flash_attn_mxfp8/gfx950.py), and the two agree to within the
-    quantization error rather than bitwise. Head dim 128 and sequence lengths
-    divisible by 256. Blackwell returns BF16 gradients; gfx950 is forward only.
+    Inputs have identical [batch, heads, sequence, 128] shapes with sequence
+    lengths divisible by 256. Both architectures return BF16 gradients.
+    Both architectures use 32x32 Q/K blocks. On gfx950, calls where autograd
+    records Q, K or V use a training forward with hardware exp2 that saves
+    separate row maxima and log2 normalization terms, the statistics backward
+    recomputes P from. Other calls use the faster inference ping-pong kernel
+    (non-causal, and causal at sequence lengths divisible by 512), whose
+    approximate exp2 makes its output differ from the training forward by
+    about 0.04 relative RMS, less than either differs from BF16 attention.
+    See the kernel module for the recipes.
     ``p_expcast=True`` (Blackwell only) encodes the forward probabilities with
     ExpCast-FP8 instead of exp2 (see kernels/flash_attn_mxfp8/sm100.py).
     """
@@ -634,6 +637,8 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
     if q.shape != k.shape or q.shape != v.shape:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have identical shapes; "
                            f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if any(size == 0 for size in q.shape):
+        raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects nonempty Q/K/V dimensions")
     if q.dtype != k.dtype or q.dtype != v.dtype or q.device != k.device or q.device != v.device:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have the same dtype and device")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
@@ -645,7 +650,9 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], N_CTX=q.shape[-2])
     check_backward(spec, q, k, v)
     _check_enforced("flash_attn_mxfp8", spec, invariance)
-    return fn(q, k, v, causal, sm_scale, space=space_name, p_expcast=p_expcast)
+    import torch
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, causal, sm_scale, space=space_name, p_expcast=p_expcast)
 
 
 def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None, causal=False, *,
@@ -659,8 +666,8 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
     parity. K/V may have fewer heads than Q (GQA) if they divide its head count.
     Causal masking is bottom-right aligned: query ``i`` sees keys
     ``j <= i + k_len - q_len``, and a query row that sees no key returns zeros.
-    `sm_scale` defaults to `HEAD_DIM ** -0.5`. Returns the output only (no
-    log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
+    `sm_scale` defaults to `HEAD_DIM ** -0.5` and must be positive and finite.
+    Returns the output only (no log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
     uninitialized.
     """
     import torch
@@ -680,6 +687,8 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
         raise InvalidInput("tlx.ops.flash_attn_varlen expects all tensors on one device")
     space_name, invariance = _normalize_space_arg("flash_attn_varlen", space)
     _check_single_config_space("flash_attn_varlen", space_name)
+    if sm_scale is not None and not 0 < sm_scale < math.inf:
+        raise InvalidInput(f"tlx.ops.flash_attn_varlen expects a positive finite sm_scale; got {sm_scale!r}")
     fn, spec = impl_for("flash_attn_varlen", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2])
     check_backward(spec, q, k, v)
@@ -760,36 +769,50 @@ def kimi_delta_attention(q, k, v, g, beta, *, scale=1.0, cu_seqlens=None, cu_seq
     return fn(q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, space=space_name)
 
 
-def kda_paged_prefill(q, k, v, g, beta, *, scale=1.0, initial_state, cu_seqlens, space=None):
-    """Prepared-input chunked KDA prefill for packed `[1, T, H, 128]` tensors.
+def kda_paged_prefill(q, k, v, g, beta, *, scale=1.0, initial_state=None, cu_seqlens, A_log=None, dt_bias=None,
+                      lower_bound=None, beta_is_raw=False, state_pool=None, state_indices=None, space=None):
+    """Chunked KDA prefill for packed `[1, T, H, 128]` tensors.
 
-    `g` contains per-channel log decays and `beta` is sigmoid-applied.
-    State is FP32 and V-major: `[N, H, 128, 128]`. This op is currently
-    forward-only. ``space=`` takes no search space today; a ``Space`` is
-    accepted only to carry a ``BitwiseInvarianceSpec``, which is validated
-    but not enforced yet.
+    By default `g` contains per-channel log decays, `q`/`k` are l2-normalized
+    and `beta` is sigmoid-applied. Passing `A_log` and `dt_bias` takes raw
+    inputs instead: `q`/`k` are normalized in the kernel and `g` is the gate
+    pre-activation, mapped to `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`,
+    or to `-exp(A_log) * softplus(g + dt_bias)` without a lower bound.
+    `beta_is_raw` applies the sigmoid to `beta`.
+
+    State is FP32 and V-major: a dense `initial_state` `[N, H, 128, 128]`, or a
+    `state_pool` `[slots, H, 128, 128]` with `state_indices` `[N]` naming each
+    sequence's slot, updated in place. This op is currently forward-only.
+    ``space=`` takes no search space today; a ``Space`` is accepted only to
+    carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
     """
     space_name, invariance = _normalize_space_arg("kda_paged_prefill", space)
     _check_single_config_space("kda_paged_prefill", space_name)
     fn, spec = impl_for("kda_paged_prefill", device=q.device)
     check_inputs(spec, dtype=q.dtype, KEY_DIM=q.shape[-1], VALUE_DIM=v.shape[-1])
-    check_backward(spec, q, k, v, g, beta, initial_state)
+    check_backward(spec, q, k, v, g, beta, initial_state, state_pool, A_log, dt_bias)
     _check_enforced("kda_paged_prefill", spec, invariance)
-    return fn(q, k, v, g, beta, scale=scale, initial_state=initial_state, cu_seqlens=cu_seqlens)
+    return fn(q, k, v, g, beta, scale=scale, initial_state=initial_state, cu_seqlens=cu_seqlens, A_log=A_log,
+              dt_bias=dt_bias, lower_bound=lower_bound, beta_is_raw=beta_is_raw, state_pool=state_pool,
+              state_indices=state_indices)
 
 
 def kda_recurrent_decode(q, k, v, g, beta, *, scale=1.0, state_pool, read_indices, write_indices, cu_seqlens,
-                         space=None):
+                         A_log=None, dt_bias=None, lower_bound=None, beta_is_raw=False, space=None):
     """Forward-only indexed KDA recurrence over an FP32 V-major state pool.
 
-    ``space=`` takes no search space today; a ``Space`` is accepted only to
-    carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
+    Inputs are prepared (l2-normalized q/k, log decay g, activated beta) unless
+    `A_log` and `dt_bias` are passed, in which case they are raw, as for
+    `kda_paged_prefill`. ``space=`` takes no search space today; a ``Space`` is
+    accepted only to carry a ``BitwiseInvarianceSpec``, which is validated but
+    not enforced yet.
     """
     space_name, invariance = _normalize_space_arg("kda_recurrent_decode", space)
     _check_single_config_space("kda_recurrent_decode", space_name)
     fn, spec = impl_for("kda_recurrent_decode", device=q.device)
     check_inputs(spec, dtype=q.dtype, KEY_DIM=q.shape[-1], VALUE_DIM=v.shape[-1])
-    check_backward(spec, q, k, v, g, beta, state_pool)
+    check_backward(spec, q, k, v, g, beta, state_pool, A_log, dt_bias)
     _check_enforced("kda_recurrent_decode", spec, invariance)
     return fn(q, k, v, g, beta, scale=scale, state_pool=state_pool, read_indices=read_indices,
-              write_indices=write_indices, cu_seqlens=cu_seqlens)
+              write_indices=write_indices, cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias, lower_bound=lower_bound,
+              beta_is_raw=beta_is_raw)

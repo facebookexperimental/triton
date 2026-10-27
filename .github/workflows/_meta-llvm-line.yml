@@ -10,7 +10,11 @@ on:
       verify_workflows: { type: string, required: true }
       dry_run:          { type: boolean, required: false, default: false }
 
-permissions: read-all
+permissions:
+  contents: read
+  actions: read
+  issues: write
+  pull-requests: write
 
 jobs:
   update:
@@ -40,8 +44,10 @@ jobs:
       - name: Update bump and issue
         working-directory: target
         env:
-          # The app token's push starts the GPU workflows; a GITHUB_TOKEN push would not.
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # git push uses the app token from the checkout above: its push starts the GPU
+          # workflows, a GITHUB_TOKEN push would not. The app cannot comment on issues, so
+          # gh (reads and issue/PR writes) uses GITHUB_TOKEN.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
