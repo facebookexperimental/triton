@@ -1,5 +1,6 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "unittest/Util/ScopedAllowNpot.h"
 
 #include "mlir/Support/LLVM.h"
 #include "llvm/Support/Signals.h"
@@ -693,6 +694,7 @@ TEST_F(LinearLayoutTest, InvertAndCompose_IdentityInDim) {
 // Test invertAndCompose with non-power-of-2 dimensions
 // Exercises the modular CRT-based least-squares solver path
 TEST_F(LinearLayoutTest, InvertAndCompose_NonPow2) {
+  ScopedAllowNpot npot;
   // Create a simple layout with dimension 3 (non-pow2)
   // Layout A: maps in1 -> out (dimension 3)
   // Bases: 1, 1 (mod 3: 0->0, 1->1, 2->1, 3->2)
@@ -717,6 +719,7 @@ TEST_F(LinearLayoutTest, InvertAndCompose_NonPow2) {
 }
 
 TEST_F(LinearLayoutTest, NumConsecutiveInOut) {
+  ScopedAllowNpot npot;
   EXPECT_EQ(
       1,
       LinearLayout::identity1D(1, S("in"), S("out")).getNumConsecutiveInOut());
@@ -795,6 +798,20 @@ TEST_F(LinearLayoutTest, EqualsChecksOutDimSizes) {
                                    /*requireSurjective=*/false)));
 }
 
+TEST_F(LinearLayoutTest, NpotOutDimRequiresFlag) {
+  ScopedAllowNpot off(nullptr);
+  auto create = [&](int32_t size) {
+    LinearLayout::BasesT bases;
+    bases[S("in")] = {{1}};
+    return LinearLayout::tryCreate(bases, {{S("out"), size}},
+                                   /*requireSurjective=*/false);
+  };
+  EXPECT_TRUE(create(4).has_value());
+  EXPECT_FALSE(create(3).has_value());
+  ScopedAllowNpot on;
+  EXPECT_TRUE(create(3).has_value());
+}
+
 TEST_F(LinearLayoutTest, ResizeInDim) {
   auto layout = LinearLayout::identity1D(4, S("in"), S("out"));
   EXPECT_EQ(layout.resizeInDim(S("in"), 16),
@@ -844,6 +861,7 @@ TEST_F(LinearLayoutTest, SublayoutIsZero) {
 }
 
 TEST_F(LinearLayoutTest, FreeVariableMasks) {
+  ScopedAllowNpot npot;
   using llvm::to_vector;
   using AR = llvm::ArrayRef<std::pair<StringAttr, int32_t>>;
 
@@ -898,6 +916,7 @@ TEST_F(LinearLayoutTest, FreeVariableMasks) {
 //      minimalCvtLayout would quotient the register dim away and collapse to a
 //      no-op. isModular() flags the layout so the guard refuses the collapse.
 TEST_F(LinearLayoutTest, ModularRelayoutIsNotIdentity) {
+  ScopedAllowNpot npot;
   // Two distinct modular maps over Z/6: strides 1 and 5. They are genuinely
   // different permutations of {0..5} but the conservative free-variable mask is
   // identical (no zero bases in either) -> the old isExpensiveView fast path
@@ -915,6 +934,7 @@ TEST_F(LinearLayoutTest, ModularRelayoutIsNotIdentity) {
 }
 
 TEST_F(LinearLayoutTest, ModularRegisterDimNotQuotientedAway) {
+  ScopedAllowNpot npot;
   // A non-identity modular register map (stride 5 over Z/6). The GF(2) identity
   // predicate used by squareSublayoutIsIdentity treats basis 5 (== 0b101) as
   // "not identity" only for bit 0; but for a modular map the round-trip is not
@@ -1304,6 +1324,7 @@ TEST_F(LinearLayoutTest, Divide_EliminateOutDim) {
 }
 
 TEST_F(LinearLayoutTest, Divide_Modular) {
+  ScopedAllowNpot npot;
   // Case 1: modular(6) * modular(4), both left and right
   {
     auto B = LinearLayout::modularStrided1D(6, 1, S("in"), S("out"));
@@ -1326,6 +1347,7 @@ TEST_F(LinearLayoutTest, Divide_Modular) {
 }
 
 TEST_F(LinearLayoutTest, Divide_Modular_2D_Mixed) {
+  ScopedAllowNpot npot;
   auto B = LinearLayout::identity1D(4, S("in"), S("out1")) *
            LinearLayout::modularStrided1D(3, 1, S("in2"), S("out2"));
   auto C = LinearLayout::identity1D(2, S("in"), S("out1")) *
@@ -1409,6 +1431,7 @@ TEST_F(LinearLayoutTest, ColumnActionApplyValues) {
 //===----------------------------------------------------------------------===//
 
 TEST_F(LinearLayoutTest, ModularStrided1D_Size3) {
+  ScopedAllowNpot npot;
   // Test modularStrided1D with size=3 (smallest non-pow2)
   LinearLayout layout = LinearLayout::modularStrided1D(3, 1, S("in"), S("out"));
 
@@ -1430,6 +1453,7 @@ TEST_F(LinearLayoutTest, ModularStrided1D_Size3) {
 }
 
 TEST_F(LinearLayoutTest, ModularStrided1D_WithStride) {
+  ScopedAllowNpot npot;
   // Test modularStrided1D with stride != 1
   LinearLayout layout = LinearLayout::modularStrided1D(6, 2, S("in"), S("out"));
 
@@ -1457,6 +1481,7 @@ TEST_F(LinearLayoutTest, ModularStrided1D_WithStride) {
 // ============================================================================
 
 TEST_F(LinearLayoutTest, InvertAndCompose_Modular_MultiDim_LCM) {
+  ScopedAllowNpot npot;
   // Test that lstsqModular uses LCM instead of max for multiple NPOT output
   // dims This is a regression test for NPOT-I1: lstsqModular was using
   // max(outDimSizes) as working modulus, which is incorrect for
@@ -1510,6 +1535,7 @@ TEST_F(LinearLayoutTest, InvertAndCompose_Modular_MultiDim_LCM) {
 }
 
 TEST_F(LinearLayoutTest, TryInvertAndCompose_ModularStatus) {
+  ScopedAllowNpot npot;
   auto makeLayout = [&](StringRef inDim, int32_t basis, int32_t size) {
     BasesT bases;
     bases[S(inDim)].push_back({basis});
@@ -1538,6 +1564,7 @@ TEST_F(LinearLayoutTest, TryInvertAndCompose_ModularStatus) {
 
 // Test multi-dimensional NPOT layouts
 TEST_F(LinearLayoutTest, IsModularSurjectiveMultiDim) {
+  ScopedAllowNpot npot;
   // Create a 2D layout with NPOT dimensions: 3x6
   // out0: dim=3, out1: dim=6
   LinearLayout::BasesT bases2D;
@@ -1582,6 +1609,7 @@ TEST_F(LinearLayoutTest, IsModularSurjectiveMultiDim) {
 }
 
 TEST_F(LinearLayoutTest, Pow2AdditiveSurjectivityRegression) {
+  ScopedAllowNpot npot;
   // CORRECTNESS regression (T274241798 #1): apply() composes modular out-dims
   // with ADD+mod, but checkPow2Surjectivity previously used a GF(2)/XOR-rank
   // check. Bases {1,3,4,8} over out-dim size 12 are NON-surjective under
@@ -1611,6 +1639,7 @@ TEST_F(LinearLayoutTest, Pow2AdditiveSurjectivityRegression) {
 }
 
 TEST_F(LinearLayoutTest, SurjectivityTruncationRegression) {
+  ScopedAllowNpot npot;
   // operator* with same inDim+outDim produces 6 non-zero bases for modulus 27,
   // exceeding ceil(log2(27))=5. Old truncation gave false negative.
   auto inner = LinearLayout::modularStrided1D(3, 1, S("A"), S("out"));
@@ -1626,6 +1655,7 @@ TEST_F(LinearLayoutTest, SurjectivityTruncationRegression) {
 //===----------------------------------------------------------------------===//
 
 TEST_F(LinearLayoutTest, MixedShapeSurjectivityUsesPerDimAlgebra) {
+  ScopedAllowNpot npot;
   LinearLayout layout({{S("in"), {{1, 0}, {3, 0}, {0, 1}, {0, 2}, {0, 4}}}},
                       {{S("pow2"), 4}, {S("npot"), 6}},
                       /*requireSurjective=*/false);
@@ -1635,6 +1665,7 @@ TEST_F(LinearLayoutTest, MixedShapeSurjectivityUsesPerDimAlgebra) {
 }
 
 TEST_F(LinearLayoutTest, MixedShape_OperatorStar_SharedDim) {
+  ScopedAllowNpot npot;
   // When inner and outer share an output dim, sizes multiply (not shift).
   // inner: 4 -> dim0=4; outer: 6 -> dim0=6. Product should be 24, not 64.
   auto inner = LinearLayout::identity1D(4, S("register"), S("dim0"));
@@ -1654,6 +1685,7 @@ TEST_F(LinearLayoutTest, MixedShape_OperatorStar_SharedDim) {
 }
 
 TEST_F(LinearLayoutTest, MixedShape_ReshapeOuts) {
+  ScopedAllowNpot npot;
   // Flatten/unflatten roundtrip for mixed layout.
   auto mixed = LinearLayout::identity1D(4, S("in"), S("dim0")) *
                LinearLayout::modularStrided1D(6, 1, S("in2"), S("dim1"));
@@ -1675,6 +1707,7 @@ TEST_F(LinearLayoutTest, MixedShape_ReshapeOuts) {
 // invertAndCompose with mixed pow2 + NPOT output dims.
 // Exercises lstsqModular dispatch when only some dims are NPOT.
 TEST_F(LinearLayoutTest, InvertAndCompose_Mixed_Pow2AndNPOT) {
+  ScopedAllowNpot npot;
   // Layout A: in(32) -> dim0(4, pow2) x dim1(6, NPOT)
   LinearLayout::BasesT basesA;
   auto &bsA = basesA[S("in")];
@@ -1720,6 +1753,7 @@ TEST_F(LinearLayoutTest, InvertAndCompose_Mixed_Pow2AndNPOT) {
 
 // Prove XOR and ADD diverge for NPOT dim, and layout picks the right algebra.
 TEST_F(LinearLayoutTest, MixedShape_XorVsAdd_Divergence) {
+  ScopedAllowNpot npot;
   // dim0=8 (pow2, uses XOR), dim1=6 (NPOT, uses ADD+UREM)
   auto pow2Part = LinearLayout::identity1D(8, S("in"), S("dim0"));
   auto npotPart = LinearLayout::modularStrided1D(6, 1, S("in2"), S("dim1"));
@@ -1743,6 +1777,7 @@ TEST_F(LinearLayoutTest, MixedShape_XorVsAdd_Divergence) {
 
 // Verify isOutDimModular is preserved through compose and invertAndCompose.
 TEST_F(LinearLayoutTest, MixedShape_Compose_PreservesPerDimModular) {
+  ScopedAllowNpot npot;
   // Build a mixed layout: dim0=4 (pow2), dim1=6 (NPOT)
   auto mixed = LinearLayout::identity1D(4, S("in"), S("dim0")) *
                LinearLayout::modularStrided1D(6, 1, S("in2"), S("dim1"));
@@ -1811,6 +1846,7 @@ TEST_F(LinearLayoutTest, MixedShape_Compose_PreservesPerDimModular) {
 // Verify that final-UREM produces the same result as per-step UREM for all
 // inputs, confirming the codegen optimization is algebraically equivalent.
 TEST_F(LinearLayoutTest, CarryFreeEquivalence_FinalUremEqualsPerStep) {
+  ScopedAllowNpot npot;
   for (int size : {3, 6, 48}) {
     auto layout = LinearLayout::modularStrided1D(size, 1, S("in"), S("out"));
     int nBits = layout.getInDimSizeLog2(S("in"));
@@ -1840,6 +1876,7 @@ TEST_F(LinearLayoutTest, CarryFreeEquivalence_FinalUremEqualsPerStep) {
 //===----------------------------------------------------------------------===//
 
 TEST_F(LinearLayoutTest, MixedShape_Apply_NpotXNpot) {
+  ScopedAllowNpot npot;
   // Jagged tensor shapes: (33, 48), (3, 768)
   // Grouped operation shapes: (12, 48), (6, 96)
   struct Shape {
@@ -1877,6 +1914,7 @@ TEST_F(LinearLayoutTest, MixedShape_Apply_NpotXNpot) {
 }
 
 TEST_F(LinearLayoutTest, PseudoinvertNPOT) {
+  ScopedAllowNpot npot;
   // pseudoinvert must not crash on NPOT output dimensions.
   for (int size : {3, 5, 6, 7, 9, 10, 12}) {
     auto layout = LinearLayout::modularIdentity1D(size, S("in"), S("out"));
@@ -1893,6 +1931,7 @@ TEST_F(LinearLayoutTest, PseudoinvertNPOT) {
 }
 
 TEST_F(LinearLayoutTest, ModularIdentity1D_ExhaustiveApply) {
+  ScopedAllowNpot npot;
   // Brute-force verify apply() covers every value in [0, dim).
   for (int dim : {3, 5, 6, 7, 9, 10, 12, 15}) {
     auto layout = LinearLayout::modularIdentity1D(dim, S("in"), S("out"));
@@ -1915,6 +1954,7 @@ TEST_F(LinearLayoutTest, ModularIdentity1D_ExhaustiveApply) {
 
 // Compose two modular layouts sharing an output dimension.
 TEST_F(LinearLayoutTest, ComposeModularSharedOutDim) {
+  ScopedAllowNpot npot;
   // 1D: inner maps in->dim0(6), outer maps dim0->out(6) with stride 2.
   auto inner = LinearLayout::modularStrided1D(6, 1, S("in"), S("dim0"));
   auto outer = LinearLayout::modularStrided1D(6, 2, S("dim0"), S("out"));
@@ -1945,6 +1985,7 @@ TEST_F(LinearLayoutTest, ComposeModularSharedOutDim) {
 
 // Flatten a 2D NPOT layout to 1D then unflatten back; verify round-trip.
 TEST_F(LinearLayoutTest, ReshapeOutsNPOT_FlattenUnflattenRoundtrip) {
+  ScopedAllowNpot npot;
   // [3, 5] -> [15] -> [3, 5]
   auto original = LinearLayout::modularStrided1D(3, 1, S("in1"), S("out0")) *
                   LinearLayout::modularStrided1D(5, 1, S("in2"), S("out1"));
@@ -1979,6 +2020,7 @@ TEST_F(LinearLayoutTest, ReshapeOutsNPOT_FlattenUnflattenRoundtrip) {
 
 // Verify round-trip: A.invertAndCompose(B).compose(B) == A for modular layouts.
 TEST_F(LinearLayoutTest, InvertAndCompose_ModularRoundTrip) {
+  ScopedAllowNpot npot;
   // 1D round-trips with various NPOT dim sizes and coprime strides.
   struct Case {
     int size, strideA, strideB;
@@ -2006,6 +2048,7 @@ TEST_F(LinearLayoutTest, InvertAndCompose_ModularRoundTrip) {
 // conversion with NPOT dimensions (e.g. size 12). Verifies that all output
 // values remain in bounds and the solution is correct.
 TEST_F(LinearLayoutTest, InvertAndCompose_MultiRepNPOT) {
+  ScopedAllowNpot npot;
   // A: 2 input dims (register, lane), output dim with NPOT size 12.
   // Simulates a layout where multiple reps tile an NPOT dimension.
   auto A = LinearLayout::modularIdentity1D(12, S("register"), S("dim0")) *
@@ -2050,6 +2093,7 @@ TEST_F(LinearLayoutTest, InvertAndCompose_MultiRepNPOT) {
 // Multi-rep NPOT invertAndCompose with mixed pow2 and NPOT output dims.
 // Simulates shared memory conversion for a tensor with shape like [32, 12].
 TEST_F(LinearLayoutTest, InvertAndCompose_MultiRepMixedNPOT) {
+  ScopedAllowNpot npot;
   // A: maps register -> (dim0=8, dim1=12)
   // Shear family: some bases touch only pow2 dim, others touch NPOT dim.
   LinearLayout::BasesT basesA;
@@ -2099,6 +2143,7 @@ TEST_F(LinearLayoutTest, InvertAndCompose_MultiRepMixedNPOT) {
 // This exercises the code path where lstsq splits output dims into pow2
 // (solved via GF(2) RREF) and NPOT (solved via lstsqModular), then combines.
 TEST_F(LinearLayoutTest, Lstsq_PerDimFactoredSolve_MixedPow2NPOT) {
+  ScopedAllowNpot npot;
   // A: maps input(128) -> dim0(8, pow2) x dim1(12, NPOT)
   // Simulates the split-dim layout: dim0 uses XOR, dim1 uses ADD+mod.
   // Bases are decoupled: pow2 bases have S=0 in dim1, NPOT bases have S=0 in
@@ -2150,6 +2195,7 @@ TEST_F(LinearLayoutTest, Lstsq_PerDimFactoredSolve_MixedPow2NPOT) {
 
 // Test per-dim factored solve with multi-input-dim layout (register + lane).
 TEST_F(LinearLayoutTest, Lstsq_PerDimFactoredSolve_MultiInputDim) {
+  ScopedAllowNpot npot;
   // A: maps (register x lane) -> dim0(4, pow2) x dim1(6, NPOT)
   auto A_pow2 = LinearLayout::identity1D(4, S("register"), S("dim0"));
   auto A_npot = LinearLayout::modularStrided1D(6, 1, S("lane"), S("dim1"));
@@ -2181,6 +2227,7 @@ TEST_F(LinearLayoutTest, Lstsq_PerDimFactoredSolve_MultiInputDim) {
 // Verify modularIdentity1D(6, ...) composes correctly with other layouts,
 // simulating NPOT kWidth=6 for NVFp4 K=96.
 TEST_F(LinearLayoutTest, ModularIdentity1D_KWidth6_Compose) {
+  ScopedAllowNpot npot;
   // kWidth=6 register layout along K dimension
   auto regs = LinearLayout::modularIdentity1D(6, S("register"), S("dimK"));
 

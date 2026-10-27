@@ -1,4 +1,5 @@
 #include "triton/Tools/LayoutUtils.h"
+#include "unittest/Util/ScopedAllowNpot.h"
 
 #include "mlir/Support/LLVM.h"
 #include "llvm/Support/Signals.h"
@@ -46,6 +47,7 @@ TEST_F(LayoutUtilsTest, SquareSublayoutIsIdentity) {
 }
 
 TEST_F(LayoutUtilsTest, IdentityStandardNDModular) {
+  ScopedAllowNpot npot;
   auto actual = identityStandardND(S("in"), {4, 6}, {1, 0});
   auto expected = LinearLayout::modularIdentity1D(6, S("in"), S("dim1")) *
                   LinearLayout::identity1D(4, S("in"), S("dim0"));

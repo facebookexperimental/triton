@@ -32,6 +32,7 @@
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -350,6 +351,20 @@ template <typename CondT> void check(CondT &&cond, const char *msg) {
     throw py::value_error(msg);
 }
 
+// Upstream checkInvariants' check and message, but recoverable.
+void checkPow2OutDimSizes(ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
+  if (tt::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+    return;
+  for (auto [outDim, size] : outDims) {
+    if (llvm::isPowerOf2_32(size))
+      continue;
+    std::string msg = "Invalid out-dim size " + std::to_string(size) +
+                      " for out-dim '" + outDim.str() +
+                      "'.  Out-dim sizes must be powers of 2.\n";
+    throw py::value_error(msg.c_str());
+  }
+}
+
 } // namespace
 
 void init_gluon_ir(py::module_ &m) {
@@ -424,6 +439,7 @@ void init_gluon_ir(py::module_ &m) {
              auto kWarp = mlir::StringAttr::get(ctx, "warp");
              auto kBlock = mlir::StringAttr::get(ctx, "block");
              auto outDims = tt::standardOutDimPairs(ctx, shape);
+             checkPow2OutDimSizes(outDims);
              auto ll = tt::LinearLayout({{kReg, regBases},
                                          {kLane, laneBases},
                                          {kWarp, warpBases},
@@ -438,6 +454,9 @@ void init_gluon_ir(py::module_ &m) {
            [](GluonOpBuilder &self, Attribute layout,
               std::vector<int64_t> &shape) -> py::object {
              auto ctx = self.getContext();
+             // Before toLinearLayout, whose flag-off checkInvariants is fatal.
+             if (isa<ttg::DistributedEncodingTrait>(layout))
+               checkPow2OutDimSizes(tt::standardOutDimPairs(ctx, shape));
              auto linearLayout = ttg::toLinearLayout(shape, layout);
 
              if (isa<ttg::DistributedEncodingTrait>(layout)) {
