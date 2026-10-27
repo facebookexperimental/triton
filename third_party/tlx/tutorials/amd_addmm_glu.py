@@ -144,30 +144,22 @@ def tlx_addmm_glu_kernel_optimized(
     tl.assume(sc0 > 0)
     tl.assume(sc1 > 0)
 
-    # Launcher skips empty matrices and supplies an exact tile grid.
-    tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(axis=0)
 
     # Num pids along M dim
-    tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
 
     # Num pids along N dim
-    tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
-    tl.assume(grid_mn > 0)
 
     # Remap pids via L2 swizzle
-    tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
-    tl.assume(pid >= 0)
 
     # Num pids in the group (of shared rows along M dim pids)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    tl.assume(num_pid_in_group > 0)
 
     # Which group we are in
     group_id = pid // num_pid_in_group
@@ -177,17 +169,14 @@ def tlx_addmm_glu_kernel_optimized(
 
     # Either GROUP_SIZE_M or smaller due to last group cutting off early
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    tl.assume(group_size_m > 0)
 
     # Which pid along m dim
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_SIZE_M >= 0) & (pid_m * BLOCK_SIZE_M <= 2147483647 - (BLOCK_SIZE_M - 1)))
 
     # Which pid along n dim
     pid_n = (pid % num_pid_in_group) // group_size_m
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    tl.assume(pid_m <= (M - 1) // BLOCK_SIZE_M)
-    tl.assume(pid_n <= (N - 1) // BLOCK_SIZE_N)
+    tl.assume((pid_n * BLOCK_SIZE_N >= 0) & (pid_n * BLOCK_SIZE_N <= 2147483647 - (BLOCK_SIZE_N - 1)))
 
     # Get offsets this pid is responsible for in m dim
     offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
@@ -323,8 +312,6 @@ def tlx_addmm_glu_kernel_optimized(
 
 
 def run_kernel_optimized(a, b, bias, y, out, cfg):
-    if out.numel() == 0:
-        return
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
@@ -397,30 +384,22 @@ def tlx_addmm_glu_kernel_optimized_async(
     tl.assume(sc0 > 0)
     tl.assume(sc1 > 0)
 
-    # Launcher skips empty matrices and supplies an exact tile grid.
-    tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(axis=0)
 
     # Num pids along M dim
-    tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
 
     # Num pids along N dim
-    tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
-    tl.assume(grid_mn > 0)
 
     # Remap pids via L2 swizzle
-    tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
-    tl.assume(pid >= 0)
 
     # Num pids in the group (of shared rows along M dim pids)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    tl.assume(num_pid_in_group > 0)
 
     # Which group we are in
     group_id = pid // num_pid_in_group
@@ -430,17 +409,14 @@ def tlx_addmm_glu_kernel_optimized_async(
 
     # Either GROUP_SIZE_M or smaller due to last group cutting off early
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    tl.assume(group_size_m > 0)
 
     # Which pid along m dim
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_SIZE_M >= 0) & (pid_m * BLOCK_SIZE_M <= 2147483647 - (BLOCK_SIZE_M - 1)))
 
     # Which pid along n dim
     pid_n = (pid % num_pid_in_group) // group_size_m
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    tl.assume(pid_m <= (M - 1) // BLOCK_SIZE_M)
-    tl.assume(pid_n <= (N - 1) // BLOCK_SIZE_N)
+    tl.assume((pid_n * BLOCK_SIZE_N >= 0) & (pid_n * BLOCK_SIZE_N <= 2147483647 - (BLOCK_SIZE_N - 1)))
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -559,8 +535,6 @@ def tlx_addmm_glu_kernel_optimized_async(
 
 
 def run_kernel_optimized_async(a, b, bias, y, out, cfg):
-    if out.numel() == 0:
-        return
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
@@ -635,30 +609,19 @@ def tlx_addmm_glu_kernel_simple_async(
     tl.assume(sc0 > 0)
     tl.assume(sc1 > 0)
 
-    # Launcher skips empty matrices and supplies an exact tile grid.
-    tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(axis=0)
-    tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     grid_mn = num_pid_m * num_pid_n
-    tl.assume(grid_mn > 0)
-    tl.assume(pid < num_pid_m * num_pid_n)
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
-    tl.assume(pid >= 0)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    tl.assume(num_pid_in_group > 0)
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    tl.assume(group_size_m > 0)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_SIZE_M >= 0) & (pid_m * BLOCK_SIZE_M <= 2147483647 - (BLOCK_SIZE_M - 1)))
     pid_n = (pid % num_pid_in_group) // group_size_m
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    tl.assume(pid_m <= (M - 1) // BLOCK_SIZE_M)
-    tl.assume(pid_n <= (N - 1) // BLOCK_SIZE_N)
+    tl.assume((pid_n * BLOCK_SIZE_N >= 0) & (pid_n * BLOCK_SIZE_N <= 2147483647 - (BLOCK_SIZE_N - 1)))
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -739,19 +702,12 @@ def tlx_addmm_glu_kernel_persistent(
 
     NUM_BUFFERS: tl.constexpr = 3
 
-    # Launcher skips empty matrices; bounds preserve padded tile coordinates.
-    tl.assume((M > 0) & (N > 0))
     start_pid = tl.program_id(axis=0)
 
-    tl.assume(M <= 2147483647 - (BLOCK_SIZE_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    tl.assume(num_pid_m <= (2147483647 - NUM_CUS) // num_pid_n)
     num_tiles = num_pid_m * num_pid_n
-    tl.assume(num_tiles > 0)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    tl.assume(num_pid_in_group > 0)
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
@@ -763,25 +719,15 @@ def tlx_addmm_glu_kernel_persistent(
     for tile_id in tl.range(start_pid, num_tiles, NUM_CUS):
         # Apply XCD swizzle to the flat tile_id for L2 locality
         swizzled = chiplet_transform_chunked(tile_id, num_tiles, NUM_XCDS, XCD_CHUNK)
-        tl.assume(swizzled >= 0)
 
         # Delinearize swizzled tile_id
         group_id = swizzled // num_pid_in_group
-        tl.assume(group_id < (num_pid_m - 1) // GROUP_SIZE_M + 1)
         first_pid_m = group_id * GROUP_SIZE_M
-        rows_left = num_pid_m - first_pid_m
-        tl.assume((rows_left > 0) & (rows_left <= num_pid_m))
-        group_size_m = min(rows_left, GROUP_SIZE_M)
-        tl.assume(group_size_m > 0)
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + ((swizzled % num_pid_in_group) % group_size_m)
+        tl.assume((pid_m * BLOCK_SIZE_M >= 0) & (pid_m * BLOCK_SIZE_M <= 2147483647 - (BLOCK_SIZE_M - 1)))
         pid_n = (swizzled % num_pid_in_group) // group_size_m
-        tl.assume(pid_m >= 0)
-        tl.assume(pid_n >= 0)
-        tl.assume(pid_m <= (M - 1) // BLOCK_SIZE_M)
-        tl.assume(pid_n <= (N - 1) // BLOCK_SIZE_N)
-        # Grouped mapping stays inside the matrix tile grid.
-        tl.assume(pid_m < num_pid_m)
-        tl.assume(pid_n < num_pid_n)
+        tl.assume((pid_n * BLOCK_SIZE_N >= 0) & (pid_n * BLOCK_SIZE_N <= 2147483647 - (BLOCK_SIZE_N - 1)))
 
         offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -875,8 +821,6 @@ def tlx_addmm_glu_kernel_persistent(
 
 
 def run_kernel_persistent(a, b, bias, y, out, cfg, num_cus):
-    if out.numel() == 0:
-        return
     M, K = a.shape
     _, N = b.shape
     grid = (min(num_cus, triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"])), )
@@ -912,8 +856,6 @@ def run_kernel_persistent(a, b, bias, y, out, cfg, num_cus):
 
 
 def run_kernel_simple_async(a, b, bias, y, out, cfg):
-    if out.numel() == 0:
-        return
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
