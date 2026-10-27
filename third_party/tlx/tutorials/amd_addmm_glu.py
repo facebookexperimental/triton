@@ -1063,8 +1063,6 @@ def run_kernel_baseline(bias, a, b, y, cfg):
     M, K = a.shape
     K2, N = b.shape
     out = torch.empty((M, N), device=a.device, dtype=torch.float16)
-    if out.numel() == 0:
-        return out
     grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
     tlx_addmm_glu_kernel_baseline[grid](
         a,

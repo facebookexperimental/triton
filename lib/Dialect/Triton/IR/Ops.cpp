@@ -1816,8 +1816,8 @@ LogicalResult ReturnOp::verify() {
       return emitError() << "type of return operand " << i << " ("
                          << getOperand(i).getType()
                          << ") doesn't match function result type ("
-                         << results[i] << ")" << " in function @"
-                         << function.getName();
+                         << results[i] << ")"
+                         << " in function @" << function.getName();
 
   return success();
 }

@@ -955,13 +955,13 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
                                   ShapedType dstTy) {
   if (srcTy.getElementType() != dstTy.getElementType()) {
     return op->emitOpError("source element type ")
-           << srcTy << " must match " << "destination element type "
-           << dstTy.getElementType();
+           << srcTy << " must match "
+           << "destination element type " << dstTy.getElementType();
   }
   if (srcTy.getShape() != dstTy.getShape()) {
     return op->emitOpError("source shape [")
-           << srcTy.getShape() << "] must match [" << "destination shape "
-           << dstTy.getShape() << "]";
+           << srcTy.getShape() << "] must match ["
+           << "destination shape " << dstTy.getShape() << "]";
   }
   return success();
 }
