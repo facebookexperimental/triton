@@ -1070,13 +1070,11 @@ def test_async_dot_scaled_2cta(device, BLOCK_M, N, SCALE_MODE, WARP_SPECIALIZED,
                     tlx.barrier_wait(bar_b_scale, tl.constexpr(0))
                     a_scale_operand = a_scale_tile[0]
                     b_scale_operand = b_scale_tile[0]
-                    tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
-                    tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
                     if B_SCALE_IN_TMEM:
-                        # AFTER the publication wait: both CTAs' TMAs complete,
-                        # so the paired cp never reads stale peer SMEM.
                         tlx.tmem_copy(b_scale_tile[0], b_scale_tmem[0])
                         b_scale_operand = b_scale_tmem[0]
+                    tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
+                    tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
                     tlx.async_dot_scaled(
                         a_tile[0],
                         b_tile[0],
@@ -1180,13 +1178,11 @@ def test_async_dot_scaled_2cta(device, BLOCK_M, N, SCALE_MODE, WARP_SPECIALIZED,
             tlx.barrier_wait(bar_b_scale, tl.constexpr(0))
             a_scale_operand = a_scale_tile[0]
             b_scale_operand = b_scale_tile[0]
-            tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
-            tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
             if B_SCALE_IN_TMEM:
-                # AFTER the publication wait: both CTAs' TMAs complete, so the
-                # paired cp never reads stale peer SMEM.
                 tlx.tmem_copy(b_scale_tile[0], b_scale_tmem[0])
                 b_scale_operand = b_scale_tmem[0]
+            tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
+            tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
             tlx.async_dot_scaled(
                 a_tile[0],
                 b_tile[0],
