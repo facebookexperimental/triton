@@ -26,9 +26,9 @@ def runner(monkeypatch, tmp_path):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("seq", [256, 1024])
 def test_flex_forward_mod(runner, tmp_path, mod, dtype, seq):
-    tensors, score_mod, block_mask, opts = runner.inputs(mod, seq, batch=1, heads=2, dim=128, dtype=dtype)
-    stock, reference = runner.compile_arm(tensors, score_mod, block_mask, opts, None, tmp_path / "stock.py")
-    tlx, result = runner.compile_arm(tensors, score_mod, block_mask, opts, "force", tmp_path / "tlx.py")
+    tensors, score_mod, block_mask = runner.inputs(mod, seq, batch=1, heads=2, dim=128, dtype=dtype)
+    stock, reference = runner.compile_arm(tensors, score_mod, block_mask, None, tmp_path / "stock.py")
+    tlx, result = runner.compile_arm(tensors, score_mod, block_mask, "force", tmp_path / "tlx.py")
     if mod == "document_mask":
         independent = runner.document_reference(tensors, seq, 1)
         torch.testing.assert_close(reference, independent, atol=2e-2, rtol=2e-2)

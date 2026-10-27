@@ -27,9 +27,9 @@ def runner(monkeypatch, tmp_path):
     "mod", ("rel", "alibi", "document_mask", "causal", "prefix_lm", "sliding_window", "softcap", "head_bias", "noop"))
 @pytest.mark.parametrize("seq,dim", [(129, 64), (257, 128)])
 def test_flex_forward_mod_tail(runner, tmp_path, record_property, mod, seq, dim):
-    tensors, score_mod, block_mask, opts = runner.inputs(mod, seq, batch=3, heads=2, dim=dim)
-    _, ref = runner.compile_arm(tensors, score_mod, block_mask, opts, None, tmp_path / "stock.py")
-    replay, got = runner.compile_arm(tensors, score_mod, block_mask, opts, "force", tmp_path / "tlx.py")
+    tensors, score_mod, block_mask = runner.inputs(mod, seq, batch=3, heads=2, dim=dim)
+    _, ref = runner.compile_arm(tensors, score_mod, block_mask, None, tmp_path / "stock.py")
+    replay, got = runner.compile_arm(tensors, score_mod, block_mask, "force", tmp_path / "tlx.py")
     if mod == "document_mask":
         independent = runner.document_reference(tensors, seq, 3)
         torch.testing.assert_close(got, independent, atol=2e-2, rtol=2e-2)
@@ -67,9 +67,9 @@ def test_flex_forward_empty_rows_cross_attention(runner, tmp_path):
 def test_flex_forward_graph_replay_after_dynamo_reset(runner, tmp_path):
     import gc
 
-    tensors, score_mod, block_mask, opts = runner.inputs("head_bias", 128, batch=8, heads=16, dim=128)
-    stock_replay, ref = runner.compile_arm(tensors, score_mod, block_mask, opts, None, tmp_path / "stock.py")
-    tlx_replay, got = runner.compile_arm(tensors, score_mod, block_mask, opts, "force", tmp_path / "tlx.py")
+    tensors, score_mod, block_mask = runner.inputs("head_bias", 128, batch=8, heads=16, dim=128)
+    stock_replay, ref = runner.compile_arm(tensors, score_mod, block_mask, None, tmp_path / "stock.py")
+    tlx_replay, got = runner.compile_arm(tensors, score_mod, block_mask, "force", tmp_path / "tlx.py")
     torch._dynamo.reset()
     gc.collect()
     for _ in range(3):

@@ -52,11 +52,10 @@ def document_reference(tensors, seq, batch):
     return torch.cat(pieces, dim=2)
 
 
-def inputs(mod, seq, batch=8, heads=16, dim=128, tritonbench_document_config=False, dtype=torch.bfloat16):
+def inputs(mod, seq, batch=8, heads=16, dim=128, dtype=torch.bfloat16):
     torch.manual_seed(42)
     score_mod = None
     mask_mod = None
-    opts = {}
     shape = (batch, heads, seq, dim)
     if mod in ("causal", "alibi", "softcap"):
         mask_mod = lambda b, h, m, n: m >= n
@@ -82,28 +81,18 @@ def inputs(mod, seq, batch=8, heads=16, dim=128, tritonbench_document_config=Fal
             return (docs[m] == docs[n]) & (m - offsets[docs[m]] >= n - offsets[docs[n]])
 
         shape = (1, heads, batch * seq, dim)
-        if tritonbench_document_config:
-            opts = {"BLOCK_M": 128, "BLOCK_N": 32, "fwd_num_warps": 8, "fwd_num_stages": 4}
     block_mask = None
     if mask_mod is not None:
         with config.patch({"triton.tlx_mode": None}):
             block_mask = torch.compile(create_block_mask)(mask_mod, 1, 1, shape[2], shape[2], device="cuda")
     q, k, v = [torch.rand(shape, device="cuda", dtype=dtype) for _ in range(3)]
-    return (q, k, v), score_mod, block_mask, opts
+    return (q, k, v), score_mod, block_mask
 
 
-def compile_arm(tensors, score_mod, block_mask, opts, mode, out, offline=None):
-
-    def override(original):
-
-        def append(**kwargs):
-            kwargs.update(offline)
-            return original(**kwargs)
-
-        return append
+def compile_arm(tensors, score_mod, block_mask, mode, out):
 
     def fn(q, k, v):
-        return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask, kernel_options=opts)
+        return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
 
     from torch._inductor.codecache import PyCodeCache
     modules = []
@@ -115,16 +104,10 @@ def compile_arm(tensors, score_mod, block_mask, opts, mode, out, offline=None):
         return module
 
     torch._dynamo.reset()
-    with mock.patch.object(PyCodeCache, "load_by_key_path", load), contextlib.ExitStack() as patch, config.patch(
+    with mock.patch.object(PyCodeCache, "load_by_key_path", load), config.patch(
         {"triton.tlx_mode": mode, "max_autotune": False, "max_autotune_gemm": False, "force_disable_caches": True}):
-        if offline is not None and mode:
-            from triton.language.extra.tlx.inductor import flex_attention_templates as templates
-            for name, template in vars(templates).items():
-                if name.endswith("_flex_attention_template"):
-                    patch.enter_context(
-                        mock.patch.object(template, "maybe_append_choice", override(template.maybe_append_choice)))
         compiled = torch.compile(fn, fullgraph=True, dynamic=False)
-        result, sources = run_and_get_code(compiled, *tensors)
+        _, sources = run_and_get_code(compiled, *tensors)
         # Capture before Dynamo reset can invalidate the selected TLX mode.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -183,54 +166,30 @@ def plot_results(rows, output, arch):
     plt.close(fig)
 
 
-def _install_flex_adapter():
-    # Install before both arms; this wheel lacks the general registry's tma_inner_dim.
-    from torch._inductor.choices import InductorChoices
+@contextlib.contextmanager
+def flex_adapter():
+    # Avoid the general registry's tma_inner_dim dependency on older torch wheels.
     from torch._inductor.runtime import triton_heuristics
-    from triton.language.extra.tlx.inductor.flex_attention_templates import append_tlx_flex
+    from triton.language.extra.tlx.inductor.choices import TLXInductorChoices
 
-    class FlexChoices(InductorChoices):
-
-        @staticmethod
-        def uuid():
-            return "tlx-flex-offline-v2"
-
-        def append_flex_attention_choices(self, choices, configs, input_nodes, subgraphs, layout, kernel_options,
-                                          sparse_q_block_size, sparse_kv_block_size):
-            return append_tlx_flex(choices, configs, input_nodes, subgraphs, layout, kernel_options,
-                                   sparse_q_block_size, sparse_kv_block_size)
-
-    config.inductor_choices_class = FlexChoices
-    triton_heuristics.tlx_only_cuda_options = lambda: ["ctas_per_cga"]
     original_meta = triton_heuristics.CachingAutotuner._create_compile_meta
-    if getattr(original_meta, "_tlx_flex_adapter", False):
-        return
 
     def compile_meta(self, cfg):
         meta = original_meta(self, cfg)
         if self.device_props.type == "hip":
-            opts = self.inductor_meta.get("config_args", {})
             backend = dict(meta.get("backend_options", {}))
+            opts = self.inductor_meta.get("config_args", {})
             for name in ("matrix_instr_nonkdim", "waves_per_eu", "kpack"):
                 if name in opts:
                     backend[name] = opts[name]
             meta["backend_options"] = backend
         return meta
 
-    compile_meta._tlx_flex_adapter = True
-    triton_heuristics.CachingAutotuner._create_compile_meta = compile_meta
-
-
-@contextlib.contextmanager
-def flex_adapter():
-    from torch._inductor.runtime import triton_heuristics
     with (
-            mock.patch.object(triton_heuristics, "tlx_only_cuda_options", triton_heuristics.tlx_only_cuda_options),
-            mock.patch.object(triton_heuristics.CachingAutotuner, "_create_compile_meta",
-                              triton_heuristics.CachingAutotuner._create_compile_meta),
-            config.patch({"inductor_choices_class": config.inductor_choices_class, "compile_threads": 1}),
+            mock.patch.object(triton_heuristics, "tlx_only_cuda_options", lambda: ["ctas_per_cga"]),
+            mock.patch.object(triton_heuristics.CachingAutotuner, "_create_compile_meta", compile_meta),
+            config.patch({"inductor_choices_class": TLXInductorChoices, "compile_threads": 1}),
     ):
-        _install_flex_adapter()
         yield
 
 
@@ -241,7 +200,6 @@ class FlexAttentionShape(NamedTuple):
     dim: int
     mod: str
     dtype: str = "bfloat16"
-    tritonbench_document_config: bool = False
 
 
 SHAPE_SUITES = FocusRegistry(
@@ -251,11 +209,6 @@ SHAPE_SUITES = FocusRegistry(
         FocusSuite("builtin", OP, includes=MODS),
         FocusSuite("fp16", OP,
                    tuple(FlexAttentionShape(8, 16, 2**i, 128, mod, "float16") for mod in MODS for i in range(7, 15))),
-        FocusSuite(
-            "tritonbench_document", OP,
-            tuple(
-                FlexAttentionShape(8, 16, 2**i, 128, "document_mask", tritonbench_document_config=True)
-                for i in range(7, 15))),
     ),
     {"gfx950": ("builtin", ), "sm100": ("builtin", )},
 )
@@ -268,24 +221,17 @@ def shapes(synthetic=False, suites=None):
 
 def cases(synthetic=False, suites=None):
     return [
-        Case(
-            OP, driver.arch(), entry.dtype, tuple(entry),
-            label=f"{entry.mod} B={entry.batch} H={entry.heads} S={entry.seq} D={entry.dim} {entry.dtype}" +
-            (" tritonbench config" if entry.tritonbench_document_config else ""))
+        Case(OP, driver.arch(), entry.dtype, tuple(entry[:-1]),
+             label=f"{entry.mod} B={entry.batch} H={entry.heads} S={entry.seq} D={entry.dim} {entry.dtype}")
         for entry in shapes(synthetic, suites)
     ]
-
-
-def _cache_root():
-    root = ARTIFACT_DIR / f"flex_attention.{driver.arch()}.{os.getpid()}"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 def prepare(case, space):
     if space != "heuristic":
         raise ValueError("TorchTLX flex uses offline heuristic configs; max_autotune stays disabled")
-    root = _cache_root()
+    root = ARTIFACT_DIR / f"flex_attention.{driver.arch()}.{os.getpid()}"
+    root.mkdir(parents=True, exist_ok=True)
     cache_env = {
         name: str(root / subdir)
         for name, subdir in (("TORCHINDUCTOR_CACHE_DIR", "inductor"), ("TRITON_CACHE_DIR", "triton"),
@@ -295,13 +241,12 @@ def prepare(case, space):
         Path(directory).mkdir(exist_ok=True)
     with mock.patch.dict(os.environ, cache_env), mock.patch.object(triton.knobs.cache, "dir",
                                                                    cache_env["TRITON_CACHE_DIR"]), flex_adapter():
-        entry = FlexAttentionShape(*case.shape)
-        tensors, score_mod, block_mask, opts = inputs(entry.mod, entry.seq, entry.batch, entry.heads, entry.dim,
-                                                      entry.tritonbench_document_config,
-                                                      dtype=getattr(torch, entry.dtype))
+        entry = FlexAttentionShape(*case.shape, dtype=case.dtype)
+        tensors, score_mod, block_mask = inputs(entry.mod, entry.seq, entry.batch, entry.heads, entry.dim,
+                                                dtype=getattr(torch, entry.dtype))
         name = case.key.replace("/", "_")
-        ref, ref_result = compile_arm(tensors, score_mod, block_mask, opts, None, root / f"{name}.stock.py")
-        tlx, result = compile_arm(tensors, score_mod, block_mask, opts, "force", root / f"{name}.tlx.py")
+        ref, ref_result = compile_arm(tensors, score_mod, block_mask, None, root / f"{name}.stock.py")
+        tlx, result = compile_arm(tensors, score_mod, block_mask, "force", root / f"{name}.tlx.py")
     reference = document_reference(tensors, entry.seq, entry.batch) if entry.mod == "document_mask" else ref_result
     stock_accuracy, _ = _accuracy(ref_result, reference)
     extra = {"stock_accuracy": stock_accuracy, "max_abs_error": (result.float() - reference.float()).abs().max().item()}
@@ -331,13 +276,9 @@ def finalize(results, env):
     output = ARTIFACT_DIR / f"{OP}.{driver.arch()}.{uuid4().hex[:8]}"
     output.mkdir(parents=True, exist_ok=True)
     rows = [{
-        "mod":
-        r.case.shape[4], "seq":
-        r.case.shape[2], "ratio":
-        r.speedup if r.speedup is not None else float("nan"), "stock_accuracy":
-        r.extra.get("stock_accuracy"), "group":
-        f"B={r.case.shape[0]} H={r.case.shape[1]} D={r.case.shape[3]} {r.case.dtype}" +
-        (" tritonbench config" if r.case.shape[-1] else "")
+        "mod": r.case.shape[4], "seq": r.case.shape[2], "ratio": r.speedup if r.speedup is not None else float("nan"),
+        "stock_accuracy": r.extra.get("stock_accuracy"), "group":
+        f"B={r.case.shape[0]} H={r.case.shape[1]} D={r.case.shape[3]} {r.case.dtype}"
     } for r in results]
     plot_results(rows, output, driver.arch())
     env["plot"] = str(output / "ratios.png")

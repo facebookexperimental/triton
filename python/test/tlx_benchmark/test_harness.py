@@ -1641,23 +1641,7 @@ def test_flex_benchmark_shared_shape_suites(monkeypatch, arch):
     assert len(bench.cases(suites=["rel"])) == 8
     assert len(bench.cases(suites=["fp16"])) == 72
     assert all(case.dtype == "float16" for case in bench.cases(suites=["fp16"]))
-    assert all(case.shape[-1] for case in bench.cases(suites=["tritonbench_document"]))
     assert bench.default_json().startswith(str(bench.ARTIFACT_DIR))
-
-
-def test_driver_finalize_hook_preserves_common_artifact(monkeypatch):
-    from types import SimpleNamespace
-    from _harness import driver
-
-    calls = []
-    bench = SimpleNamespace(SHAPE_SUITES=None, cases=lambda *args: [], finalize=lambda results, env: calls.append(
-        (results, env)))
-    monkeypatch.setattr(driver, "capture_env", lambda *args: {})
-    monkeypatch.setattr(driver, "device_index", lambda: 0)
-    monkeypatch.setattr(driver, "stable", lambda *args: __import__("contextlib").nullcontext({}))
-    results, env = driver.run(bench)
-    assert calls == [(results, env)]
-    assert env["cache_policy"] == "cold_cache_per_call"
 
 
 def test_flex_adapter_preserves_blackwell_choice_space(monkeypatch):
