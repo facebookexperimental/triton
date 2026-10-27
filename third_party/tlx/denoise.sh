@@ -93,6 +93,7 @@ elif [[ "$GPU_VENDOR" == "amd" ]]; then
 fi
 
 NUMA_NODE=""
+RUN_ENV=()
 if [[ "$GPU_VENDOR" == "nvidia" ]]; then
     PCI_BUS_ID=$(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=pci.bus_id --format=csv,noheader | tr '[:upper:]' '[:lower:]')
     # nvidia-smi uses an eight-digit PCI domain; sysfs uses four digits.
@@ -114,15 +115,32 @@ elif [[ "$GPU_VENDOR" == "amd" ]]; then
     if [[ -n "$AMD_PCI_BUS_ID" && -r "$NUMA_NODE_FILE" ]]; then
         NUMA_NODE=$(<"$NUMA_NODE_FILE")
     fi
+    # HIP numbers GPUs in ROCr's order, not rocm-smi's, so HIP_VISIBLE_DEVICES
+    # as a HIP index would run on a different card from the one locked above.
+    # Pin the command to that card by its ROCr UUID, found by PCI bus in
+    # rocminfo (BDFID = bus << 8 | device << 3 | function).
+    ROCR_UUID=""
+    [[ -n "$AMD_PCI_BUS_ID" ]] && ROCR_UUID=$(rocminfo 2>/dev/null | awk -v bus="$((16#$(cut -d: -f2 <<< "$AMD_PCI_BUS_ID")))" '
+        $1 == "Agent" {uuid = ""; gpu = 0; bdf = ""}
+        $1 == "Uuid:" {uuid = $2}
+        $1 == "Device" && $2 == "Type:" {gpu = ($3 == "GPU")}
+        $1 == "BDFID:" {bdf = $2}
+        gpu && uuid ~ /^GPU-[0-9a-fA-F]+$/ && bdf != "" && int(bdf / 256) == bus {print uuid; exit}')
+    if [[ -n "$ROCR_UUID" ]]; then
+        echo "Running on GPU $HIP_VISIBLE_DEVICES ($ROCR_UUID)"
+        RUN_ENV=(env -u HIP_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES="$ROCR_UUID")
+    else
+        echo "Warning: no ROCr UUID for GPU $HIP_VISIBLE_DEVICES; HIP may run on a different card" >&2
+    fi
 fi
 
 if [[ "$NUMA_NODE" =~ ^[0-9]+$ ]]; then
     echo "Binding CPU and memory to NUMA node $NUMA_NODE"
-    numactl --membind="$NUMA_NODE" --cpunodebind="$NUMA_NODE" "$@"
+    numactl --membind="$NUMA_NODE" --cpunodebind="$NUMA_NODE" "${RUN_ENV[@]}" "$@"
     COMMAND_STATUS=$?
 else
     echo "Warning: Could not determine a valid GPU-local NUMA node; running without NUMA binding" >&2
-    "$@"
+    "${RUN_ENV[@]}" "$@"
     COMMAND_STATUS=$?
 fi
 
