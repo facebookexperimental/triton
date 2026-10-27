@@ -9,18 +9,24 @@ from torch.nn.attention.flex_attention import create_block_mask
 from triton._internal_testing import is_hip_cdna4
 
 pytestmark = [
-    pytest.mark.skipif(not is_hip_cdna4(), reason="requires gfx950"),
     pytest.mark.skipif(not hasattr(InductorChoices, "append_flex_attention_choices"),
                        reason="requires the FlexAttention choices hook"),
 ]
 
 
 @pytest.fixture
-def runner(monkeypatch, tmp_path):
+def benchmark(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "tlx_benchmark"))
     import bench_torchtlx_flex_attention as module
-    with module.flex_adapter():
-        yield module
+    return module
+
+
+@pytest.fixture
+def runner(benchmark):
+    if not is_hip_cdna4():
+        pytest.skip("requires gfx950")
+    with benchmark.flex_adapter():
+        yield benchmark
 
 
 @pytest.mark.parametrize(
@@ -75,3 +81,27 @@ def test_flex_forward_graph_replay_after_dynamo_reset(runner, tmp_path):
     for _ in range(3):
         torch.testing.assert_close(stock_replay(), ref, atol=0, rtol=0)
         torch.testing.assert_close(tlx_replay(), got, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["cuda", "hip"])
+def test_flex_adapter_routes_backend_options(monkeypatch, benchmark, backend):
+    from types import SimpleNamespace
+    from torch._inductor import config
+    from torch._inductor.runtime import triton_heuristics
+
+    monkeypatch.setattr(triton_heuristics, "tlx_only_cuda_options", lambda: [])
+    monkeypatch.setattr(triton_heuristics.CachingAutotuner, "_create_compile_meta", lambda self, cfg: {"num_warps": 4})
+    original_choices = config.inductor_choices_class
+    original_meta = triton_heuristics.CachingAutotuner._create_compile_meta
+    with benchmark.flex_adapter():
+        autotuner = SimpleNamespace(device_props=SimpleNamespace(type=backend),
+                                    inductor_meta={"config_args": {"waves_per_eu": 1, "matrix_instr_nonkdim": 32}})
+        meta = triton_heuristics.CachingAutotuner._create_compile_meta(autotuner, None)
+        assert triton_heuristics.tlx_only_cuda_options() == ["ctas_per_cga"]
+        if backend == "hip":
+            assert meta["backend_options"] == {"waves_per_eu": 1, "matrix_instr_nonkdim": 32}
+        else:
+            assert meta == {"num_warps": 4}
+    assert config.inductor_choices_class is original_choices
+    assert triton_heuristics.CachingAutotuner._create_compile_meta is original_meta
+    assert triton_heuristics.tlx_only_cuda_options() == []

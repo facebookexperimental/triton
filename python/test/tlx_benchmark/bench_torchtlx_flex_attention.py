@@ -1,7 +1,9 @@
 """TorchTLX FlexAttention forward comparison with max_autotune disabled."""
 from __future__ import annotations
 
+import argparse
 import contextlib
+import json
 import math
 import os
 import sys
@@ -270,21 +272,45 @@ def annotate(result):
         result.notes.append("Stock fails per-document SDPA accuracy; no stock performance ratio reported")
 
 
-def finalize(results, env):
+_, default_json, run, _main = driver.bind(sys.modules[__name__])
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--json")
+    parser.add_argument("--list-suites", action="store_true")
+    parser.add_argument("--list-suite")
+    args, _ = parser.parse_known_args(argv)
+    if args.list_suites or args.list_suite:
+        return _main(argv)
+    path = Path(args.json) if args.json else ARTIFACT_DIR / f"{OP}.{uuid4().hex[:8]}" / "results.json"
+    if args.json is None:
+        argv.extend(["--json", str(path)])
+    previous_mtime = path.stat().st_mtime_ns if path.exists() else None
+    status = _main(argv)
+    if not path.exists() or path.stat().st_mtime_ns == previous_mtime:
+        return status
+    artifact = json.loads(path.read_text())
+    results = artifact["results"]
     if not results:
-        return
-    output = ARTIFACT_DIR / f"{OP}.{driver.arch()}.{uuid4().hex[:8]}"
+        return status
+    output = path.parent / path.stem
     output.mkdir(parents=True, exist_ok=True)
-    rows = [{
-        "mod": r.case.shape[4], "seq": r.case.shape[2], "ratio": r.speedup if r.speedup is not None else float("nan"),
-        "stock_accuracy": r.extra.get("stock_accuracy"), "group":
-        f"B={r.case.shape[0]} H={r.case.shape[1]} D={r.case.shape[3]} {r.case.dtype}"
-    } for r in results]
-    plot_results(rows, output, driver.arch())
-    env["plot"] = str(output / "ratios.png")
-
-
-_, default_json, run, main = driver.bind(sys.modules[__name__])
+    rows = []
+    for result in results:
+        case = result["case"]
+        batch, heads, seq, dim, mod = case["shape"]
+        rows.append({
+            "mod": mod, "seq": seq, "ratio": result["speedup"] if result["speedup"] is not None else float("nan"),
+            "stock_accuracy": result["extra"].get("stock_accuracy"), "group":
+            f"B={batch} H={heads} D={dim} {case['dtype']}"
+        })
+    plot_results(rows, output, results[0]["case"]["arch"])
+    artifact["env"]["plot"] = str(output / "ratios.png")
+    path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+    print(f"plot: {artifact['env']['plot']}")
+    return status
 
 
 def supported():
