@@ -54,6 +54,20 @@ def _compute_split_k(M, N, K, target_waves=4):
 # =========================================================================== #
 
 
+def _checked_tile_count(m, n, block_m, block_n, group_m, step=0):
+    if min(m, n) < 0 or min(block_m, block_n, group_m) <= 0:
+        raise ValueError("Dimensions must be nonnegative; tile and group sizes must be positive")
+    if m == 0 or n == 0:
+        return 0
+    limit = 2**31 - 1
+    if m > limit - (block_m - 1) or n > limit - (block_n - 1):
+        raise ValueError("Ceiling-division sum exceeds signed 32-bit range")
+    tiles_m, tiles_n = triton.cdiv(m, block_m), triton.cdiv(n, block_n)
+    if tiles_m * tiles_n > limit - step or group_m * tiles_n > limit:
+        raise ValueError("Tile grid or group exceeds signed 32-bit range")
+    return tiles_m * tiles_n
+
+
 @triton.autotune(
     configs=[
         triton.Config(
@@ -87,11 +101,15 @@ def _stock_triton_kernel(
     tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(0)
     tl.assume(pid >= 0)
-    # Ceiling-division sums can exceed i32 for valid positive dimensions.
-    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_M)
-    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_N)
+    tl.assume(M <= 2147483647 - (BLOCK_M - 1))
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    tl.assume(N <= 2147483647 - (BLOCK_N - 1))
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    tl.assume(num_pid_m <= 2147483647 // num_pid_n)
+    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
     tl.assume(pid < num_pid_m * num_pid_n)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tl.assume(num_pid_in_group > 0)
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
@@ -105,8 +123,8 @@ def _stock_triton_kernel(
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :].to(tl.int64) * stride_bn
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
@@ -117,7 +135,7 @@ def _stock_triton_kernel(
     c = acc.to(tl.float16)
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None].to(tl.int64) + stride_cn * offs_cn[None, :].to(tl.int64)
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
@@ -128,7 +146,7 @@ def stock_triton_matmul(a, b):
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     if M == 0 or N == 0:
         return c
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )
+    grid = lambda META: (_checked_tile_count(M, N, META["BLOCK_M"], META["BLOCK_N"], META["GROUP_SIZE_M"]), )
     _stock_triton_kernel[grid](
         a,
         b,
@@ -193,11 +211,15 @@ def _skinny_atomic_kernel(
     pid = tl.program_id(0)
     tl.assume(pid >= 0)
     pid_k = tl.program_id(1)
-    # Ceiling-division sums can exceed i32 for valid positive dimensions.
-    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_M)
-    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_N)
+    tl.assume(M <= 2147483647 - (BLOCK_M - 1))
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    tl.assume(N <= 2147483647 - (BLOCK_N - 1))
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    tl.assume(num_pid_m <= 2147483647 // num_pid_n)
+    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
     tl.assume(pid < num_pid_m * num_pid_n)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tl.assume(num_pid_in_group > 0)
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
@@ -213,8 +235,8 @@ def _skinny_atomic_kernel(
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
-    b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn
+    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + (k_start + offs_k[None, :]) * stride_ak
+    b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :].to(tl.int64) * stride_bn
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K_PER_SPLIT, BLOCK_K)):
         k_remaining = k_end - (k_start + k * BLOCK_K)
@@ -227,7 +249,7 @@ def _skinny_atomic_kernel(
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None].to(tl.int64) + stride_cn * offs_cn[None, :].to(tl.int64)
     if SPLIT_K == 1:
         tl.store(c_ptrs, c, mask=c_mask)
     else:
@@ -246,7 +268,7 @@ def skinny_atomic_matmul(a, b):
     else:
         c = torch.empty((M, N), device=a.device, dtype=torch.float16)
     grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+        _checked_tile_count(M, N, META["BLOCK_M"], META["BLOCK_N"], META["GROUP_SIZE_M"]),
         split_k,
     )
     _skinny_atomic_kernel[grid](
@@ -313,11 +335,15 @@ def _twopass_compute_kernel(
     pid = tl.program_id(0)
     tl.assume(pid >= 0)
     pid_k = tl.program_id(1)
-    # Ceiling-division sums can exceed i32 for valid positive dimensions.
-    num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_M)
-    num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_N)
+    tl.assume(M <= 2147483647 - (BLOCK_M - 1))
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    tl.assume(N <= 2147483647 - (BLOCK_N - 1))
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    tl.assume(num_pid_m <= 2147483647 // num_pid_n)
+    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
     tl.assume(pid < num_pid_m * num_pid_n)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tl.assume(num_pid_in_group > 0)
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
@@ -333,8 +359,8 @@ def _twopass_compute_kernel(
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
-    b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn
+    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + (k_start + offs_k[None, :]) * stride_ak
+    b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :].to(tl.int64) * stride_bn
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K_PER_SPLIT, BLOCK_K)):
         k_remaining = k_end - (k_start + k * BLOCK_K)
@@ -347,7 +373,8 @@ def _twopass_compute_kernel(
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    scratch_ptrs = scratch_ptr + pid_k * stride_sk + offs_cm[:, None] * stride_sm + offs_cn[None, :] * stride_sn
+    scratch_ptrs = scratch_ptr + pid_k * stride_sk + offs_cm[:, None].to(tl.int64) * stride_sm + offs_cn[None, :].to(
+        tl.int64) * stride_sn
     tl.store(scratch_ptrs, acc, mask=c_mask)
 
 
@@ -409,7 +436,7 @@ def skinny_twopass_matmul(a, b):
         # No split-K needed, just use a simple matmul (reuse atomic kernel with SPLIT_K=1)
         c = torch.empty((M, N), device=a.device, dtype=torch.float16)
         grid = lambda META: (
-            triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+            _checked_tile_count(M, N, META["BLOCK_M"], META["BLOCK_N"], META["GROUP_SIZE_M"]),
             1,
         )
         _skinny_atomic_kernel[grid](
@@ -433,7 +460,7 @@ def skinny_twopass_matmul(a, b):
     # Pass 1: compute partials into fp32 scratch buffer [split_k, M, N]
     scratch = torch.empty((split_k, M, N), device=a.device, dtype=torch.float32)
     grid1 = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+        _checked_tile_count(M, N, META["BLOCK_M"], META["BLOCK_N"], META["GROUP_SIZE_M"]),
         split_k,
     )
     _twopass_compute_kernel[grid1](
@@ -456,7 +483,7 @@ def skinny_twopass_matmul(a, b):
 
     # Pass 2: reduce across split_k -> fp16 output
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
-    grid2 = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )
+    grid2 = lambda META: (_checked_tile_count(M, N, META["BLOCK_M"], META["BLOCK_N"], 1), )
     _twopass_reduce_kernel[grid2](
         scratch,
         c,

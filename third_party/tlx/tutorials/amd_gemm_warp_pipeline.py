@@ -20,6 +20,20 @@ NUM_XCDS = 8
 XCD_CHUNK = 8
 
 
+def _checked_tile_count(m, n, block_m, block_n, group_m, step=0):
+    if min(m, n) < 0 or min(block_m, block_n, group_m) <= 0:
+        raise ValueError("Dimensions must be nonnegative; tile and group sizes must be positive")
+    if m == 0 or n == 0:
+        return 0
+    limit = 2**31 - 1
+    if m > limit - (block_m - 1) or n > limit - (block_n - 1):
+        raise ValueError("Ceiling-division sum exceeds signed 32-bit range")
+    tiles_m, tiles_n = triton.cdiv(m, block_m), triton.cdiv(n, block_n)
+    if tiles_m * tiles_n > limit - step or group_m * tiles_n > limit:
+        raise ValueError("Tile grid or group exceeds signed 32-bit range")
+    return tiles_m * tiles_n
+
+
 @triton.jit
 def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk_size: tl.constexpr):
     """Group adjacent PIDs onto the same XCD in chunks of chunk_size for L2 reuse.
@@ -65,15 +79,20 @@ def matmul_kernel_warp_pipeline(
     if (M > 0) & (N > 0):
         pid = tl.program_id(0)
         tl.assume(pid >= 0)
-        # Ceiling-division sums can exceed i32 for valid positive dimensions.
-        num_pid_m = tl.cdiv(tl.cast(M, tl.int64), BLOCK_M)
-        num_pid_n = tl.cdiv(tl.cast(N, tl.int64), BLOCK_N)
+        tl.assume(M <= 2147483647 - (BLOCK_M - 1))
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        tl.assume(N <= 2147483647 - (BLOCK_N - 1))
+        num_pid_n = tl.cdiv(N, BLOCK_N)
+        tl.assume(num_pid_m <= 2147483647 // num_pid_n)
+        tl.assume(num_pid_n <= 2147483647 // GROUP_M)
         grid_mn = num_pid_m * num_pid_n
+        tl.assume(grid_mn > 0)
         if pid < grid_mn:
             pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
             tl.assume(pid >= 0)
 
             num_pid_in_group = GROUP_M * num_pid_n
+            tl.assume(num_pid_in_group > 0)
             group_id = pid // num_pid_in_group
             first_pid_m = group_id * GROUP_M
             group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
@@ -91,8 +110,8 @@ def matmul_kernel_warp_pipeline(
             offs_k = tl.arange(0, BLOCK_K)
 
             # Base offsets — recompute full pointer from tile_id * BLOCK_K
-            a_base_off = offs_m[:, None] * stride_am
-            b_base_off = offs_n[None, :] * stride_bn
+            a_base_off = offs_m[:, None].to(tl.int64) * stride_am
+            b_base_off = offs_n[None, :].to(tl.int64) * stride_bn
 
             K_ITERS = tl.cdiv(K, BLOCK_K)
 
@@ -155,7 +174,7 @@ def matmul_kernel_warp_pipeline(
             c = acc.to(tlx.dtype_of(c_ptr))
             offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
             offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-            c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+            c_ptrs = c_ptr + stride_cm * offs_cm[:, None].to(tl.int64) + stride_cn * offs_cn[None, :].to(tl.int64)
             c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
             tl.store(c_ptrs, c, mask=c_mask)
 
@@ -189,8 +208,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, config=None) -> torch.Tensor:
     assert M % BLOCK_M == 0 and N % BLOCK_N == 0 and K % BLOCK_K == 0, \
         "M, N, K must be multiples of their block sizes"
 
+    grid = (_checked_tile_count(M, N, BLOCK_M, BLOCK_N, GROUP_M), )
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
     matmul_kernel_warp_pipeline[grid](
         a,
         b,
