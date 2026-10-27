@@ -97,6 +97,9 @@ def _stock_triton_kernel(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+    # Last tile starts at or before the last matrix element.
+    tl.assume(pid_m <= (index_m - 1) // BLOCK_M)
+    tl.assume(pid_n <= (index_n - 1) // BLOCK_N)
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % index_n
     offs_k = tl.arange(0, BLOCK_K)
@@ -198,6 +201,9 @@ def _skinny_atomic_kernel(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+    # Last tile starts at or before the last matrix element.
+    tl.assume(pid_m <= (index_m - 1) // BLOCK_M)
+    tl.assume(pid_n <= (index_n - 1) // BLOCK_N)
     k_start = pid_k * K_PER_SPLIT
     k_end = min(k_start + K_PER_SPLIT, K)
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m
@@ -313,6 +319,9 @@ def _twopass_compute_kernel(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+    # Last tile starts at or before the last matrix element.
+    tl.assume(pid_m <= (index_m - 1) // BLOCK_M)
+    tl.assume(pid_n <= (index_n - 1) // BLOCK_N)
     k_start = pid_k * K_PER_SPLIT
     k_end = min(k_start + K_PER_SPLIT, K)
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % index_m

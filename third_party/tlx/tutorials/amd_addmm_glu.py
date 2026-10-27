@@ -742,10 +742,16 @@ def tlx_addmm_glu_kernel_persistent(
 
         # Delinearize swizzled tile_id
         group_id = swizzled // num_pid_in_group
+        tl.assume(group_id < tl.cdiv(num_pid_m, GROUP_SIZE_M))
         first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        rows_left = num_pid_m - first_pid_m
+        tl.assume((rows_left > 0) & (rows_left <= num_pid_m))
+        group_size_m = min(rows_left, GROUP_SIZE_M)
         pid_m = first_pid_m + ((swizzled % num_pid_in_group) % group_size_m)
         pid_n = (swizzled % num_pid_in_group) // group_size_m
+        # Grouped mapping stays inside the matrix tile grid.
+        tl.assume(pid_m < num_pid_m)
+        tl.assume(pid_n < num_pid_n)
 
         offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % index_m
         offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % index_n
