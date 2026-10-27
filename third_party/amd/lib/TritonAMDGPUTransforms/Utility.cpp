@@ -1,7 +1,6 @@
 #include "Utility.h"
 
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
-#include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
@@ -19,43 +18,6 @@
 namespace tt = triton;
 namespace ttg = triton::gpu;
 using mlir::triton::amdgpu::TargetFeatures;
-
-static Value registerIdentity(Value value) {
-  while (Operation *op = value.getDefiningOp()) {
-    if (!isa<tt::BroadcastOp, tt::ExpandDimsOp, tt::SplatOp>(op))
-      break;
-    value = op->getOperand(0);
-  }
-  return value;
-}
-
-unsigned estimateTensorRegisters(Value value) {
-  value = registerIdentity(value);
-  auto type = dyn_cast<RankedTensorType>(value.getType());
-  if (!type || !type.getEncoding() || !type.getElementType().isIntOrFloat() ||
-      matchPattern(value, m_Constant()))
-    return 0;
-  return llvm::divideCeil(
-      ttg::getTotalElemsPerThread(type) * type.getElementTypeBitWidth(), 32u);
-}
-
-unsigned estimateLoopRegisterPressure(scf::ForOp loop, Liveness &liveness,
-                                      Operation *point) {
-  DenseSet<Value> live;
-  for (Value value : liveness.getLiveIn(loop.getBody()))
-    live.insert(registerIdentity(value));
-  for (Value value : loop.getRegionIterArgs())
-    live.insert(registerIdentity(value));
-  // Include values live across enclosing regions, not only their captures.
-  for (Operation *op = point; op && op != loop; op = op->getParentOp())
-    for (Value value :
-         liveness.getLiveness(op->getBlock())->currentlyLiveValues(op))
-      live.insert(registerIdentity(value));
-  unsigned pressure = 0;
-  for (Value value : live)
-    pressure += estimateTensorRegisters(value);
-  return pressure;
-}
 
 namespace {
 

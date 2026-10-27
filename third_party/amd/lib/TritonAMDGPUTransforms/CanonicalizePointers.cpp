@@ -1,6 +1,4 @@
 #include "TritonAMDGPUTransforms/Passes.h"
-#include "Utility.h"
-#include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
@@ -185,102 +183,6 @@ Value createTruncIOffset(RewriterBase &rewriter, Location loc, Value offset,
 }
 
 using ScalarToSplatMap = llvm::SmallMapVector<std::pair<Value, Type>, Value, 8>;
-
-static SmallVector<arith::MulIOp> collectAddressProducts(tt::FuncOp func) {
-  SmallVector<arith::MulIOp> candidates;
-  DenseSet<Value> visited;
-  SmallVector<Value> pending;
-  func.walk([&](tt::AddPtrOp op) { pending.push_back(op.getOffset()); });
-  while (!pending.empty()) {
-    Value value = pending.pop_back_val();
-    if (!visited.insert(value).second)
-      continue;
-    Operation *op = value.getDefiningOp();
-    if (!op)
-      continue;
-    if (isa<arith::ExtSIOp, arith::ExtUIOp>(op))
-      if (auto mul = op->getOperand(0).getDefiningOp<arith::MulIOp>())
-        candidates.push_back(mul);
-    if (isa<arith::ArithDialect>(op->getDialect()) ||
-        isa<tt::BroadcastOp, tt::ExpandDimsOp, tt::SplatOp>(op))
-      llvm::append_range(pending, op->getOperands());
-  }
-  return candidates;
-}
-
-static bool distributeAddressProduct(arith::MulIOp mul, scf::ForOp loop,
-                                     Liveness &liveness,
-                                     DenseMap<Operation *, unsigned> &pressure,
-                                     unsigned budget, IRRewriter &rewriter) {
-  for (unsigned side : llvm::seq(2u)) {
-    auto factor = mul->getOperand(side).getDefiningOp<tt::SplatOp>();
-    auto sum = mul->getOperand(1 - side).getDefiningOp<arith::AddIOp>();
-    if (!factor || !sum || !loop.isDefinedOutsideOfLoop(factor.getSrc()))
-      continue;
-    for (unsigned term : llvm::seq(2u)) {
-      auto uniform = sum->getOperand(term).getDefiningOp<tt::SplatOp>();
-      Value lane = sum->getOperand(1 - term);
-      if (!uniform || loop.isDefinedOutsideOfLoop(uniform.getSrc()) ||
-          !loop.isDefinedOutsideOfLoop(lane))
-        continue;
-      auto [it, inserted] = pressure.try_emplace(loop, 0);
-      if (inserted)
-        it->second = estimateLoopRegisterPressure(loop, liveness);
-      unsigned extra = estimateTensorRegisters(lane);
-      LDBG("address product pressure " << it->second << " + " << extra);
-      if (it->second + extra >= budget)
-        continue;
-      it->second += extra;
-      Location loc = mul.getLoc();
-      rewriter.setInsertionPoint(loop);
-      Value invariantFactor =
-          tt::SplatOp::create(rewriter, loc, lane.getType(), factor.getSrc());
-      Value invariant =
-          arith::MulIOp::create(rewriter, loc, lane, invariantFactor);
-      rewriter.setInsertionPoint(mul);
-      Value scalar = arith::MulIOp::create(rewriter, loc, uniform.getSrc(),
-                                           factor.getSrc());
-      Value splat = tt::SplatOp::create(rewriter, loc, mul.getType(), scalar);
-      Value replacement =
-          arith::AddIOp::create(rewriter, loc, splat, invariant);
-      mul.getResult().replaceAllUsesWith(replacement);
-      return true;
-    }
-  }
-  return false;
-}
-
-// Distribute within the narrow ring; extension stays around the rebuilt sum.
-static void distributeAddressProducts(tt::FuncOp func) {
-  auto candidates = collectAddressProducts(func);
-  if (candidates.empty())
-    return;
-
-  Liveness liveness(func);
-  DenseMap<Operation *, unsigned> pressure;
-  DenseSet<Operation *> rewritten;
-  IRRewriter rewriter(func.getContext());
-  // Conservative 256-slot estimate includes accumulators, not just VGPRs.
-  // Hoisting trades a vector multiply for a longer-lived tensor.
-  unsigned budget = 256;
-  if (auto limit =
-          func->getParentOfType<ModuleOp>()->getAttrOfType<IntegerAttr>(
-              ttg::AttrMaxRegistersName))
-    budget = std::min(budget, static_cast<unsigned>(limit.getInt()));
-  for (arith::MulIOp mul : candidates) {
-    if (rewritten.contains(mul))
-      continue;
-    auto loop = mul->getParentOfType<scf::ForOp>();
-    if (!loop)
-      continue;
-    auto type = dyn_cast<RankedTensorType>(mul.getType());
-    if (!type || !type.getEncoding())
-      continue;
-    if (distributeAddressProduct(mul, loop, liveness, pressure, budget,
-                                 rewriter))
-      rewritten.insert(mul);
-  }
-}
 
 // Helper function to determine if the given `op` is a constant tensor and in
 // that case return the scalar value.
@@ -2233,8 +2135,6 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
   });
   if (walkResult.wasInterrupted())
     return;
-
-  distributeAddressProducts(func);
 
   FatPointers fatPrs;
   PatternRewriter rewriter(&getContext());
