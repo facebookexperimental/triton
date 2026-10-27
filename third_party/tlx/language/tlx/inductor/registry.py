@@ -3655,3 +3655,9 @@ AlgorithmSelectorCache.__call__ = _tlx_algorithm_selector_call  # type: ignore[m
 from .reduction_epilogue import install as install_reduction_epilogue
 
 install_reduction_epilogue()
+
+# Route eligible SDPA flash-attention calls through the flex lowering when
+# tlx_config.sdpa_to_flex is on (no-op otherwise).
+from .sdpa_to_flex import register_sdpa_to_flex
+
+register_sdpa_to_flex()

@@ -71,7 +71,7 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 .tip{position:fixed;pointer-events:none;background:var(--surface-1);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;padding:7px 9px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.12);opacity:0;z-index:10;max-width:360px;white-space:pre-line}
 </style></head><body><div class="viz-root"><div class="wrap">
 <header><div><h1>CI health: facebookexperimental/triton</h1>
-<p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every 3 h</p></div>
+<p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every hour</p></div>
 <button class="theme" id="themeBtn" type="button">Toggle theme</button></header>
 <div class="branchbar filterbar"><span class="muted">Branch</span><span class="seg" id="branch-sel"></span><span id="ops-filters" hidden><span class="muted">GPU</span><span class="seg" id="o-gpu"></span><span class="muted">Time range</span><span class="seg" id="o-range"></span></span></div>
 <div class="tabrows">
@@ -160,7 +160,7 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <p class="note">Each row is a commit that moved <code>cmake/meta-llvm-info.json</code> to a new LLVM release, with a link to the fork commits it added over the previous pin (over the upstream pin for the first).</p></div>
 </section>
 
-<p class="muted" style="margin-top:28px">Rebuilt every 3 h from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
+<p class="muted" style="margin-top:28px">Rebuilt every hour from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
 </div><div class="tip" id="tip"></div></div>
 <script>
 const REPO="https://github.com/facebookexperimental/triton";
@@ -215,22 +215,20 @@ function renderMain(m,l,branch){
   const group=(name,wf)=>`<tr class="grp"><td colspan="${P.length+1}">${name} <span class="muted">${wf}</span></td></tr>`;
   const SC={pass:["c-pass","✓","pass"],new:["c-new","✕","new failure: this commit broke it"],known:["c-known","●","still failing from an earlier commit"],setup:["c-setup","⚠","job failed in setup"],blocked:["c-blocked","⊘","skipped: an earlier step failed"],skip:["c-na","○","skipped: path selection found nothing this suite tests"],running:["c-na","…","running, no result yet"],na:["c-na","–","not run on this commit"]};
   const at=Object.fromEntries(m.pushes.map((p,i)=>[p.sha,i]));
-  // ✕ and ● cells link to the commit that broke them: ✕ is this commit, ● the commit its failure started at.
-  const COMMIT="https://github.com/facebookexperimental/triton/commit/";
-  const link=(st,c,list,html)=>{const to=st==="new"?c.sha:st==="known"&&list&&list.length?list[0].sha:"";
-    return to?`<a class="cell-link" href="${COMMIT}${esc(to)}">${html}</a>`:html};
+  // A cell links to the run that produced it; the column header links to the commit.
+  const link=(st,run,html)=>st!=="na"&&run&&run.url?`<a class="cell-link" href="${esc(run.url)}">${html}</a>`:html;
   // A known cell's tooltip names the commit(s) its failures started at.
   const blame=list=>list&&list.length?"\nstarted at:\n"+list.map(b=>`${b.sha.slice(0,9)} ${(b.title||"").slice(0,70)}`).join("\n"):"";
   // A step gets a row only while it ran on at least one of the commits shown.
   const steps=g=>(m.steps[g]||[]).filter(r=>P.some(c=>(r.cells[at[c.sha]]||"na")!=="na")).map(r=>`<tr><td class="gl step" data-tip="${esc(r.step)}">${esc(r.group)}</td>`+P.map((c,i)=>{
             const gs=c.gpu&&c.gpu.cells[g],k=gs==="skip"||gs==="running"?gs:r.cells[at[c.sha]]||"na",[cl,t,d]=SC[k];
       const from=k==="known"&&r.since?r.since[at[c.sha]]:null,b=blame(from);
-      return `<td${i?"":` class="latest"`}>${link(k,c,from,`<div class="cell ${cl}" data-tip="${esc(`${g} · ${r.step}\n${tip(c)}\n${d}${b}`)}">${t}</div>`)}</td>`}).join("")+"</tr>").join("");
+      return `<td${i?"":` class="latest"`}>${link(k,c.gpu,`<div class="cell ${cl}" data-tip="${esc(`${g} · ${r.step}\n${tip(c)}\n${d}${b}`)}">${t}</div>`)}</td>`}).join("")+"</tr>").join("");
   const row=(label,x,cell,since)=>`<tr><td class="gl"${x===m.gpus[label]?` data-g="${label}"`:""}>${x===m.gpus[label]?`${OPEN[label]?"▾":"▸"} `:""}${label}</td>`+P.map((c,i)=>{
       // The Latest cell is the newest commit's own state: a verdict when the row ran there, else why it did not.
       const st=cell(c),[cl,t,d]=C[st],b=st==="known"?blame(since(c)):"";
       const div=`<div class="cell${i?"":" wide"} ${!i&&st==="known"?"c-new":cl}" data-tip="${esc(`${label} · ${tip(c)}\n${d}${b}`)}">${i?t:LATEST[st]}</div>`;
-      return `<td${i?"":` class="latest"`}>${link(st,c,since(c),div)}</td>`}).join("")+"</tr>";
+      return `<td${i?"":` class="latest"`}>${link(st,label==="LIT"?c.lit:c.gpu,div)}</td>`}).join("")+"</tr>";
   $("m-grid").innerHTML="<tr><th></th>"+P.map((c,i)=>{const n=prOf(c);return `<th${i?"":` class="latest"`}>${i?"":"Latest<br>"}<a href="https://github.com/facebookexperimental/triton/commit/${esc(c.sha)}" data-tip="${esc(tip(c))}">${n?"#"+esc(n):esc(c.sha.slice(0,7))}</a><br><span class="muted">T+${hrs(c)}h</span></th>`}).join("")+"</tr>"+
     group("GPU Tests","gpu-tests.yml")+["H100","B200","MI350"].map(g=>row(g,m.gpus[g],c=>c.gpu?c.gpu.cells[g]:"na",c=>c.gpu&&c.gpu.since&&c.gpu.since[g])+(OPEN[g]?steps(g):"")).join("")+
     group("LIT Tests","compiler.yml")+(l?row("LIT",l,c=>c.lit?c.lit.cell:"na",c=>c.lit&&c.lit.since):`<tr><td class="gl">LIT</td><td colspan="${P.length}" class="muted" style="font-size:12px">runs on pushes to main only, not on ${esc(branch)}</td></tr>`);

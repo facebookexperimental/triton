@@ -4741,5 +4741,344 @@ class TestTargetDetection(TestCase):
             target.current_target.cache_clear()
 
 
+# Extern fallback calls; the bare op name also appears in "Original ATen" comments.
+_SDPA_FWD_CALL = "aten._scaled_dot_product_flash_attention.default("
+_SDPA_BWD_CALL = "aten._scaled_dot_product_flash_attention_backward.default("
+
+
+def _rel_l2(out, ref):
+    out, ref = out.float(), ref.float()
+    return ((out - ref).norm() / ref.norm()).item()
+
+
+@instantiate_parametrized_tests
+class TestSdpaToFlex(TestCase):
+    """tlx_config.sdpa_to_flex: SDPA flash attention lowered through flex on sm90.
+
+    Eligible calls (sm90, bf16/fp16, D in {80, 96}, Lq <= 32, no dropout, not causal)
+    must reach the flex template in fwd and bwd and match stock PT2; others keep the
+    aten fallback.
+    The flag is set process-wide because the lazy backward compile reads it.
+    """
+
+    def _compile_fw_bw(self, fn, q, kv, routed, disable_caches=True):
+        q = q.detach().requires_grad_(True)
+        kv = kv.detach().requires_grad_(True)
+        saved = tlx_config.sdpa_to_flex
+        tlx_config.sdpa_to_flex = routed
+        try:
+            torch._dynamo.reset()
+            with config.patch({"force_disable_caches": disable_caches}):
+                out, code = run_fw_bw_and_get_code(lambda: torch.compile(fn)(q, kv))
+        finally:
+            tlx_config.sdpa_to_flex = saved
+        return out, (q.grad, kv.grad), "\n".join(code)
+
+    @staticmethod
+    def _sdpa_shared_kv(q, kv):
+        return torch.nn.functional.scaled_dot_product_attention(q, kv, kv)
+
+    def _inputs(self, B, Lq, Lkv, D):
+        torch.manual_seed(0)
+        q = torch.randn(B, 1, Lq, D, device=GPU_TYPE, dtype=torch.bfloat16)
+        kv = torch.randn(B, 1, Lkv, D, device=GPU_TYPE, dtype=torch.bfloat16)
+        return q, kv
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("Lq,Lkv,D,shared_kv", (
+        (32, 1920, 80, True),
+        (32, 200, 96, True),
+        (16, 100, 80, True),
+        (32, 1536, 80, False),
+    ))
+    def test_routes_eligible(self, Lq, Lkv, D, shared_kv):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        q, kv = self._inputs(8, Lq, Lkv, D)
+        v = None if shared_kv else torch.randn_like(kv)
+
+        def fn(q, k):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, k if v is None else v)
+
+        out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True)
+        ref, ref_grads, ref_code = self._compile_fw_bw(fn, q, kv, routed=False)
+        self.assertRegex(code, r"triton_tem_fused_\w*scaled_dot_product_flash_attention_backward")
+        self.assertNotIn(_SDPA_FWD_CALL, code)
+        self.assertNotIn(_SDPA_BWD_CALL, code)
+        self.assertIn(_SDPA_FWD_CALL, ref_code)
+        self.assertIn(_SDPA_BWD_CALL, ref_code)
+        for got, want in zip((out, *grads), (ref, *ref_grads)):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_ineligible_keeps_fallback(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        q, kv = self._inputs(8, 32, 200, 128)
+        _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
+        self.assertIn(_SDPA_FWD_CALL, code)
+
+        # Causal with Lq == Lkv so SDPA still picks flash attention.
+        q, kv = self._inputs(8, 32, 32, 80)
+        _, _, code = self._compile_fw_bw(
+            lambda q, k: torch.nn.functional.scaled_dot_product_attention(q, k, k, is_causal=True),
+            q,
+            kv,
+            routed=True,
+        )
+        self.assertIn(_SDPA_FWD_CALL, code)
+
+        q, kv = self._inputs(8, 64, 1536, 80)
+        _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
+        self.assertIn(_SDPA_FWD_CALL, code)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_flag_is_in_cache_key(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        q, kv = self._inputs(8, 32, 200, 80)
+        _, _, off = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=False, disable_caches=False)
+        _, _, on = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True, disable_caches=False)
+        self.assertIn(_SDPA_FWD_CALL, off)
+        self.assertNotIn(_SDPA_FWD_CALL, on)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("Lq,Lkv,D", ((32, 1920, 80), (32, 200, 96), (16, 100, 80)))
+    def test_kv_sum_writes_dk_plus_dv_once(self, Lq, Lkv, D):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        q, kv = self._inputs(8, Lq, Lkv, D)
+        with config.patch({"triton.tlx_mode": "force"}):
+            out, grads, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
+        with config.patch({"triton.tlx_mode": None}):
+            ref, ref_grads, ref_code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
+        self.assertIn(_SM90_BWD_MARKER, code)
+        self.assertIn("TLX_KV_SUM : tl.constexpr = True", code)
+        self.assertNotIn(_SM90_BWD_MARKER, ref_code)
+        for got, want in zip((out, *grads), (ref, *ref_grads)):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_kv_sum_with_distinct_kv_buffers(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        # Equal values in separate buffers whose gradients still meet in one add, as when
+        # saved-activation hooks split an aliased K=V.
+        def fn(q, kv):
+            return torch.nn.functional.scaled_dot_product_attention(q, kv, kv.clone())
+
+        q, kv = self._inputs(8, 32, 300, 96)
+        with config.patch({"triton.tlx_mode": "force"}):
+            out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True)
+        with config.patch({"triton.tlx_mode": None}):
+            ref, ref_grads, _ = self._compile_fw_bw(fn, q, kv, routed=True)
+        self.assertIn("TLX_KV_SUM : tl.constexpr = True", code)
+        for got, want in zip((out, *grads), (ref, *ref_grads)):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_kv_sum_with_fp32_upcast_chains(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        # Separate casts of an fp32 K=V upcast dK and dV to fp32 before the add; the
+        # template rounds dK + dV once, so the KV grad stays within one bf16 rounding.
+        def fn(q, kv):
+            return torch.nn.functional.scaled_dot_product_attention(q, kv.to(q.dtype), kv.to(q.dtype))
+
+        q, kv = self._inputs(8, 32, 1920, 80)
+        kv = kv.float()
+        with config.patch({"triton.tlx_mode": "force"}):
+            out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True)
+        with config.patch({"triton.tlx_mode": None}):
+            ref, ref_grads, _ = self._compile_fw_bw(fn, q, kv, routed=True)
+        self.assertIn("TLX_KV_SUM : tl.constexpr = True", code)
+        self.assertEqual(grads[1].dtype, torch.float32)
+        for got, want in zip((out, grads[0]), (ref, ref_grads[0])):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
+        self.assertLessEqual(_rel_l2(grads[1], ref_grads[1]), 4e-3)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_kv_sum_needs_tlx_choices_handler(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+        from torch._inductor.choices import InductorChoices
+        from torch._inductor.virtualized import V
+
+        # A handler created while TLX was off stays in place after TLX is turned on. The
+        # handler is per thread, so keep the backward compile on this thread.
+        q, kv = self._inputs(8, 32, 200, 96)
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                torch.autograd.set_multithreading_enabled(False),
+                V.set_choices_handler(InductorChoices()),
+        ):
+            out, grads, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
+        with config.patch({"triton.tlx_mode": None}):
+            ref, ref_grads, _ = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
+        self.assertNotIn("TLX_KV_SUM : tl.constexpr = True", code)
+        for got, want in zip((out, *grads), (ref, *ref_grads)):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_separate_kv_keeps_dk_and_dv(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        q, k = self._inputs(8, 32, 1536, 80)
+        v = torch.randn_like(k, requires_grad=True)
+
+        def fn(q, k):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+        with config.patch({"triton.tlx_mode": "force"}):
+            out, grads, code = self._compile_fw_bw(fn, q, k, routed=True)
+        self.assertIn(_SM90_BWD_MARKER, code)
+        self.assertIn("TLX_KV_SUM : tl.constexpr = False", code)
+
+
+class TestKvGradSumPattern(TestCase):
+    """sdpa_to_flex._kv_grad_sum on hand-built backward graphs."""
+
+    @staticmethod
+    def _graph(chain_k, chain_v, extra_dv_user=False):
+        import operator
+
+        g = torch.fx.Graph()
+        bwd = g.call_function(torch.ops.aten._scaled_dot_product_flash_attention_backward.default, ())
+        dq = g.call_function(operator.getitem, (bwd, 0))
+        dk = g.call_function(operator.getitem, (bwd, 1))
+        dv = g.call_function(operator.getitem, (bwd, 2))
+        for target, args in chain_k:
+            dk = g.call_function(target, (dk, *args))
+        for target, args in chain_v:
+            dv = g.call_function(target, (dv, *args))
+        outputs = [dq, g.call_function(torch.ops.aten.add.Tensor, (dv, dk))]
+        if extra_dv_user:
+            outputs.append(dv)
+        g.output(tuple(outputs))
+        return bwd
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_pattern(self):
+        from triton.language.extra.tlx.inductor.sdpa_to_flex import _kv_grad_sum
+
+        aten, prims = torch.ops.aten, torch.ops.prims
+        job_chain = [(prims.convert_element_type.default, (torch.float32, )), (aten.squeeze.dim, (1, ))]
+        self.assertTrue(_kv_grad_sum(self._graph([], [])))
+        self.assertTrue(_kv_grad_sum(self._graph(job_chain, job_chain)))
+        self.assertFalse(_kv_grad_sum(self._graph(job_chain, job_chain[:1])))
+        self.assertFalse(_kv_grad_sum(self._graph([(aten.squeeze.dim, (1, ))], [(aten.squeeze.dim, (2, ))])))
+        self.assertFalse(_kv_grad_sum(self._graph([], [], extra_dv_user=True)))
+        self.assertFalse(_kv_grad_sum(self._graph([(aten.mul.Tensor, (2.0, ))], [(aten.mul.Tensor, (2.0, ))])))
+
+
+# A constexpr only the sm90 TLX flex backward template takes (TLX_KV_SUM also reaches
+# stock choices through the kernel options).
+_SM90_BWD_MARKER = "SHARED_KV : tl.constexpr"
+
+
+@instantiate_parametrized_tests
+class TestSm90FlexBackward(TestCase):
+    """sm90 TLX flex-attention backward template (short queries).
+
+    Under tlx_mode=force it must replace the stock backward for eligible calls and match
+    stock PT2 in out, logsumexp and grads; ineligible calls keep the stock kernel.
+    """
+
+    @staticmethod
+    def _compile_fw_bw(q, k, v, mode, **flex_kwargs):
+        from torch.nn.attention.flex_attention import flex_attention
+
+        shared_kv = v is k
+        q, k, v = (t.detach().requires_grad_(True) for t in (q, k, v))
+        if shared_kv:
+            v = k
+        torch._dynamo.reset()
+
+        def fn(q, k, v):
+            return flex_attention(q, k, v, return_lse=True, **flex_kwargs)
+
+        def fw_bw():
+            out, lse = torch.compile(fn)(q, k, v)
+            out.backward(
+                torch.randn(out.shape, device=out.device, dtype=out.dtype,
+                            generator=torch.Generator(out.device).manual_seed(1)))
+            return out, lse
+
+        with config.patch({"triton.tlx_mode": mode, "force_disable_caches": True}):
+            (out, lse), code = run_and_get_code(fw_bw)
+        grads = tuple(t.grad for t in ((q, k) if shared_kv else (q, k, v)))
+        return (out, lse, *grads), "\n".join(code)
+
+    @staticmethod
+    def _inputs(B, Hq, Lq, Lkv, D, shared_kv, Hkv=None):
+        torch.manual_seed(0)
+        q = torch.randn(B, Hq, Lq, D, device=GPU_TYPE, dtype=torch.bfloat16)
+        k = torch.randn(B, Hkv or Hq, Lkv, D, device=GPU_TYPE, dtype=torch.bfloat16)
+        return q, k, k if shared_kv else torch.randn_like(k)
+
+    def _check(self, q, k, v, eligible, **flex_kwargs):
+        got, code = self._compile_fw_bw(q, k, v, "force", **flex_kwargs)
+        want, ref_code = self._compile_fw_bw(q, k, v, None, **flex_kwargs)
+        self.assertNotIn(_SM90_BWD_MARKER, ref_code)
+        if not eligible:
+            self.assertNotIn(_SM90_BWD_MARKER, code)
+            return
+        self.assertIn(_SM90_BWD_MARKER, code)
+        self.assertEqual(len(got), len(want))
+        for g, w in zip(got, want):
+            self.assertLessEqual(_rel_l2(g, w), 1e-2)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("Lq,Lkv,D,shared_kv", (
+        (32, 1920, 80, True),
+        (32, 300, 96, True),
+        (16, 100, 80, True),
+        (32, 1536, 80, False),
+        (64, 200, 128, False),
+        (1, 77, 64, True),
+    ))
+    def test_matches_stock(self, Lq, Lkv, D, shared_kv):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        self._check(*self._inputs(16, 2, Lq, Lkv, D, shared_kv), eligible=True)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_score_mod_and_single_block_mask(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        B, H, Lq, Lkv = 4, 2, 32, 200
+        block_mask = create_block_mask(lambda b, h, m, n: n <= 150 + m, B, H, Lq, Lkv, device=GPU_TYPE,
+                                       BLOCK_SIZE=(128, 256))
+        self._check(
+            *self._inputs(B, H, Lq, Lkv, 96, True),
+            eligible=True,
+            block_mask=block_mask,
+            score_mod=lambda s, b, h, m, n: s + (m - n) * 0.01,
+        )
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_ineligible_keeps_stock(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        # Several KV blocks in the block mask.
+        block_mask = create_block_mask(lambda b, h, m, n: n <= 150 + m, 4, 2, 32, 1024, device=GPU_TYPE)
+        self._check(*self._inputs(4, 2, 32, 1024, 80, True), eligible=False, block_mask=block_mask)
+        # GQA and Q_LEN > 64.
+        self._check(*self._inputs(4, 4, 32, 300, 80, False, Hkv=1), eligible=False, enable_gqa=True)
+        self._check(*self._inputs(4, 2, 96, 300, 80, False), eligible=False)
+
+
 if __name__ == "__main__":
     run_tests()
