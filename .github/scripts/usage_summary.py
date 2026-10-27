@@ -72,6 +72,15 @@ METRICS = [
 ]
 
 
+def cgroup_bytes(value):
+    """A cgroup memory file's value for the report; empty means the file is missing."""
+    if not value:
+        return "n/a (no cgroup file)"
+    if value == "max":
+        return "none"
+    return f"{int(value) / GIB:.1f} GiB"
+
+
 def report(samples, cpus, gpus, memory_max, memory_peak):
     if len(samples) < 2:
         return "### Resource usage\n\nFewer than two samples; nothing to report.\n"
@@ -80,7 +89,7 @@ def report(samples, cpus, gpus, memory_max, memory_peak):
         "### Resource usage",
         "",
         f"{len(samples)} samples over {seconds:.0f} s. Pod: {cpus} CPUs, {gpus} visible GPU(s), "
-        f"memory limit {memory_max}, memory peak {memory_peak / GIB:.1f} GiB. GPU columns are GPU 0.",
+        f"memory limit {cgroup_bytes(memory_max)}, memory peak {cgroup_bytes(memory_peak)}. GPU columns are GPU 0.",
         "",
         "| Metric | mean | p50 | p90 | max |",
         "|---|---|---|---|---|",
@@ -96,7 +105,7 @@ def report(samples, cpus, gpus, memory_max, memory_peak):
         lines += ["", f"GPU utilization was at least 90% in {busy:.0f}% of samples and 0% in {idle:.0f}%."]
     lines += [
         "",
-        "Per minute (means; memory is the max):",
+        "Per minute (means; pod memory is the max):",
         "",
         "| Minute | GPU util (%) | GPU mem (GiB) | CPU busy (cores) | Pod mem (GiB) |",
         "|---|---|---|---|---|",
@@ -119,8 +128,8 @@ def main(argv=None):
     parser.add_argument("csv")
     parser.add_argument("--cpus", type=int, default=0)
     parser.add_argument("--gpus", type=int, default=0)
-    parser.add_argument("--memory-max", default="max")
-    parser.add_argument("--memory-peak", type=float, default=0)
+    parser.add_argument("--memory-max", default="")
+    parser.add_argument("--memory-peak", default="")
     args = parser.parse_args(argv)
     try:
         samples = series(load(args.csv))

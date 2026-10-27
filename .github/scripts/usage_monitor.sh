@@ -23,30 +23,29 @@ prefix="${2:-}"
 [ -n "${prefix}" ] || cmd=usage
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Print GPU 0 as util,memory_mib,memory_total_mib,power_w,sclk_mhz. rocm-smi's
+# Print GPU 0 as util,memory_mib,power_w. rocm-smi's
 # CSV columns are looked up by header name, since their order varies.
 rocm_gpu() {
-  timeout 5 rocm-smi -d 0 --showuse --showmeminfo vram --showpower --showclocks --csv 2>/dev/null | awk -F, '
+  timeout 5 rocm-smi -d 0 --showuse --showmeminfo vram --showpower --csv 2>/dev/null | awk -F, '
     NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
     NR == 2 {
-      sclk = $col["sclk clock speed:"]; gsub(/[^0-9.]/, "", sclk)
-      printf "%s,%.0f,%.0f,%s,%s\n", $col["GPU use (%)"], $col["VRAM Total Used Memory (B)"] / 1048576,
-        $col["VRAM Total Memory (B)"] / 1048576, $col["Current Socket Graphics Package Power (W)"], sclk
+      printf "%s,%.0f,%s\n", $col["GPU use (%)"], $col["VRAM Total Used Memory (B)"] / 1048576,
+        $col["Current Socket Graphics Package Power (W)"]
       exit
     }'
 }
 
 sample() {
   local parent="$1"
-  echo "time,cpu_usage_usec,memory_bytes,gpu_util_pct,gpu_memory_mib,gpu_memory_total_mib,gpu_power_w,gpu_sm_clock_mhz"
+  echo "time,cpu_usage_usec,memory_bytes,gpu_util_pct,gpu_memory_mib,gpu_power_w"
   while kill -0 "${parent}" 2> /dev/null; do
-    local t cpu mem g=",,,,"
+    local t cpu mem g=",,"
     t="$(date +%s.%N)"
     cpu="$(awk '$1 == "usage_usec" {print $2}' /sys/fs/cgroup/cpu.stat 2>/dev/null)"
     mem="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"
     if command -v nvidia-smi > /dev/null; then
       g="$(timeout 5 nvidia-smi --id=0 --format=csv,noheader,nounits \
-        --query-gpu=utilization.gpu,memory.used,memory.total,power.draw,clocks.sm 2>/dev/null | tr -d ' ')"
+        --query-gpu=utilization.gpu,memory.used,power.draw 2>/dev/null | tr -d ' ')"
     elif command -v rocm-smi > /dev/null; then
       g="$(rocm_gpu)"
     fi
@@ -74,8 +73,8 @@ case "${cmd}" in
     fi
     timeout 60 python3 "${here}/usage_summary.py" "${prefix}.csv" \
       --cpus "$(nproc)" --gpus "${gpus}" \
-      --memory-max "$(cat /sys/fs/cgroup/memory.max 2> /dev/null || echo max)" \
-      --memory-peak "$(cat /sys/fs/cgroup/memory.peak 2> /dev/null || echo 0)" \
+      --memory-max "$(cat /sys/fs/cgroup/memory.max 2> /dev/null)" \
+      --memory-peak "$(cat /sys/fs/cgroup/memory.peak 2> /dev/null)" \
       | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
     ;;
   *)
