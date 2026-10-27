@@ -177,3 +177,23 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.th
     tt.return %v : tensor<256x64xf16, #blocked6>
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+
+// CHECK-LABEL: @load_i64_byte_bound_overflow
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @load_i64_byte_bound_overflow(%base: !tt.ptr<f16>) -> tensor<256xf16, #blocked> {
+    %range = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
+    %wide = arith.extsi %range : tensor<256xi32, #blocked> to tensor<256xi64, #blocked>
+    %mask = arith.constant dense<1152921504606846975> : tensor<256xi64, #blocked>
+    %offset = arith.ori %wide, %mask : tensor<256xi64, #blocked>
+    %ptrs = tt.splat %base : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>, #blocked>
+    %ptr = tt.addptr %ptrs, %offset : tensor<256x!tt.ptr<f16>, #blocked>, tensor<256xi64, #blocked>
+    // CHECK-NOT: amdg.buffer_load
+    // CHECK: tt.load
+    %value = tt.load %ptr : tensor<256x!tt.ptr<f16>, #blocked>
+    tt.return %value : tensor<256xf16, #blocked>
+  }
+}
