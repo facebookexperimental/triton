@@ -66,55 +66,71 @@ class FakeApi:
         return self.issues[int(url.path.rsplit("/", 1)[1])]
 
 
-def decide(api, summary="AssertionError: assert 0.23 < 0.1"):
-    return fi.decide(api, REPO, TITLE, LABELS, summary, NOW)
+def decide(api, summary="AssertionError: assert 0.23 < 0.1", run_id=150):
+    """The reopen decision: the issue number to reopen, or "skip" / "file"."""
+    action, found = fi.decide(api, REPO, TITLE, LABELS, summary, NOW, run_id)
+    return found[0]["number"] if action == "reopen" else action
+
+
+def found(api):
+    return fi.decide(api, REPO, TITLE, LABELS, "AssertionError: assert 0.23 < 0.1", NOW, 150)[1]
 
 
 # --- reopen ---
 
 
 def test_a_recurrence_with_different_numbers_reopens_the_issue():
-    found, reopens, flaky = decide(FakeApi([issue(7)]))
-    assert (found["number"], reopens, flaky) == (7, 0, False)
+    issue_, reopens, flaky = found(FakeApi([issue(7)]))
+    assert (issue_["number"], reopens, flaky) == (7, 0, False)
+
+
+def test_numbers_in_any_format_do_not_split_one_error():
+    api = FakeApi([dict(issue(7), body=body("AssertionError: max diff: 9e-05"))])
+    assert decide(api, "AssertionError: max diff: 0.00012") == 7
 
 
 def test_a_different_error_files_a_new_issue_even_with_the_same_exception_type():
     api = FakeApi([dict(issue(7), body=body("RuntimeError: all CUDA-capable devices are busy"))])
-    assert decide(api, "RuntimeError: Triton Error [CUDA]: an illegal memory access") is None
+    assert decide(api, "RuntimeError: Triton Error [CUDA]: an illegal memory access") == "file"
+    api = FakeApi([dict(issue(7), body=body("[memcheck]\nInvalid __global__ read of size 4"))])
+    assert decide(api, "[memcheck]\nInvalid __global__ write of size 4") == "file"
+    assert decide(api, "[memcheck]\nInvalid __global__ read of size 8") == 7
 
 
-def test_an_open_issue_is_left_to_the_report_step():
-    assert decide(FakeApi([issue(7), issue(8, state="open")])) is None
+def test_an_open_issue_is_left_to_the_report_step_unless_a_newer_run_reported_it():
+    open_ = lambda run_id: dict(issue(8, state="open"), body=body(run_id=run_id))
+    assert decide(FakeApi([issue(7), open_(149)]), run_id=150) == "file"
+    assert decide(FakeApi([issue(7), open_(151)]), run_id=150) == "skip"
 
 
 def test_an_issue_search_still_shows_open_is_reopened_once_confirmed_closed():
-    assert decide(FakeApi([issue(7)], search_state={7: "open"}))[0]["number"] == 7
+    assert decide(FakeApi([issue(7)], search_state={7: "open"})) == 7
 
 
 def test_only_a_bot_close_within_a_week_reopens():
-    assert decide(FakeApi([issue(7, by="wychi")])) is None
-    assert decide(FakeApi([issue(7, hours_ago=7 * 24 + 1)])) is None
-    assert decide(FakeApi([issue(7, hours_ago=7 * 24 - 1)])) is not None
+    assert decide(FakeApi([issue(7, by="wychi")])) == "file"
+    assert decide(FakeApi([issue(7, hours_ago=7 * 24 + 1)])) == "file"
+    assert decide(FakeApi([issue(7, hours_ago=7 * 24 - 1)])) == 7
 
 
 def test_only_the_latest_close_counts():
-    assert decide(FakeApi([issue(7, hours_ago=30), issue(8, hours_ago=2, by="wychi")])) is None
-    assert decide(FakeApi([issue(7, hours_ago=30, by="wychi"), issue(8, hours_ago=2)]))[0]["number"] == 8
+    assert decide(FakeApi([issue(7, hours_ago=30), issue(8, hours_ago=2, by="wychi")])) == "file"
+    assert decide(FakeApi([issue(7, hours_ago=30, by="wychi"), issue(8, hours_ago=2)])) == 8
 
 
 def test_the_latest_close_is_found_among_many_refiles():
     refiles = [issue(n, hours_ago=13 - n) for n in range(1, 13)]  # #12 closed most recently, an hour ago
-    assert decide(FakeApi(refiles))[0]["number"] == 12
+    assert decide(FakeApi(refiles)) == 12
 
 
 def test_issues_of_other_titles_and_labels_are_not_reopened():
-    assert decide(FakeApi([issue(7, title=TITLE + "[x]")])) is None
-    assert decide(FakeApi([issue(7, labels=["cutracer"])])) is None
+    assert decide(FakeApi([issue(7, title=TITLE + "[x]")])) == "file"
+    assert decide(FakeApi([issue(7, labels=["cutracer"])])) == "file"
 
 
 def test_the_third_recurrence_is_flaky():
-    assert decide(FakeApi([issue(7)], reopened=1))[2] is False
-    assert decide(FakeApi([issue(7)], reopened=2))[2] is True
+    assert found(FakeApi([issue(7)], reopened=1))[2] is False
+    assert found(FakeApi([issue(7)], reopened=2))[2] is True
 
 
 def test_reopen_records_the_run_and_labels_only_when_flaky():
@@ -133,6 +149,7 @@ def run_main(monkeypatch, tmp_path, api):
     monkeypatch.setattr(fi, "gh", api)
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setenv("GITHUB_RUN_ID", "200")
     monkeypatch.setattr("sys.argv", [
         "x", "reopen", "--title", TITLE, "--labels", ",".join(LABELS), "--summary", "AssertionError: assert 1 < 0",
         "--sha", "s", "--run-url", RUN + "200"
@@ -144,12 +161,12 @@ def run_main(monkeypatch, tmp_path, api):
 
 def test_an_api_error_before_reopening_leaves_filing_to_the_report_step(monkeypatch, tmp_path):
     api = FakeApi([issue(7)], fail=lambda m, p: p.startswith("search/"))
-    assert run_main(monkeypatch, tmp_path, api) == "reopened=false\n"
+    assert run_main(monkeypatch, tmp_path, api) == "action=file\n"
 
 
 def test_an_api_error_after_reopening_does_not_file_a_duplicate(monkeypatch, tmp_path):
     api = FakeApi([issue(7)], fail=lambda m, p: p.endswith("/comments"))
-    assert run_main(monkeypatch, tmp_path, api) == "reopened=true\n"
+    assert run_main(monkeypatch, tmp_path, api) == "action=reopened\n"
 
 
 # --- reconcile ---

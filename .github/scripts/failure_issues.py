@@ -4,7 +4,8 @@
   failure_issues.py reopen --title T --labels a,b --summary S --sha SHA --run-url U
       If the failure's last issue was auto-closed within a week and failed with the same error, reopen it instead
       of filing a new one. An issue a person closed is never reopened. After MAX_REOPENS reopens, the next
-      recurrence labels it flaky. Writes reopened=true|false to GITHUB_OUTPUT; on false, or on any error, the
+      recurrence labels it flaky. Writes action=reopened|skip|file to GITHUB_OUTPUT: skip when the open issue
+      already records a newer run, so an older run cannot wind its status back. On file, or on any error, the
       report step files or updates the issue as before.
 
   failure_issues.py reconcile --prefix P --labels a,b --failures JSON --run-url U
@@ -38,17 +39,19 @@ def gh(method, path, fields=None, paginate=False):
     return [x for page in data for x in page] if paginate else data
 
 
+NUMBER = re.compile(r"0x[0-9a-fA-F]+|[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?")
+
+
 def same_error(a, b):
-    """Whether two failure summaries describe the same error: first lines equal once numbers are masked."""
-    norm = lambda s: re.sub(r"\d+(\.\d+)?", "N", (s or "").split("\n")[0].strip())
+    """Whether two failure summaries describe the same error: equal once numbers are masked."""
+    norm = lambda s: " ".join(NUMBER.sub("N", s or "").split())
     return norm(a) == norm(b)
 
 
 def summary_of(body):
-    """The summary line of the last failure an issue body recorded."""
-    marker = "### Summary\n```\n"
-    i = (body or "").find(marker)
-    return body[i + len(marker):].split("\n")[0] if i >= 0 else ""
+    """The summary of the last failure an issue body recorded."""
+    m = re.search(r"^### Summary\n```\n(.*?)\n```", body or "", re.M | re.S)
+    return m[1] if m else ""
 
 
 def run_id_of(body):
@@ -63,30 +66,32 @@ def record_failure(body, sha, run_url):
     return re.sub(r"^\| Run \| .*$", f"| Run | {run_url} |", body, flags=re.M)
 
 
-def decide(api, repo, title, labels, summary, now):
-    """(issue, reopens, flaky) for the closed issue to reopen, or None to leave filing to the report step."""
+def decide(api, repo, title, labels, summary, now, run_id):
+    """("reopen", (issue, reopens, flaky)), ("skip", None) when the open issue records a newer run, or
+    ("file", None) to leave filing to the report step."""
     quoted = title.replace('"', '\\"')
     q = " ".join([f"repo:{repo}", "is:issue", *[f'label:"{l}"' for l in labels], f'in:title "{quoted}"'])
-    found = api("GET", f"search/issues?sort=created&order=desc&per_page=100&q={quote(q, safe='')}")["items"]
+    found = api("GET", f"search/issues?per_page=100&q={quote(q, safe='')}")["items"]
     found = [i for i in found if i["title"] == title and "pull_request" not in i]
     # Search can lag a close by seconds, so confirm what it reports as open.
     issues = [api("GET", f"repos/{repo}/issues/{i['number']}") if i["state"] == "open" else i for i in found]
-    if any(i["state"] == "open" for i in issues):
-        return None  # the report step updates the open issue
+    open_issues = [i for i in issues if i["state"] == "open"]
+    if open_issues:
+        return ("skip" if any(run_id_of(i["body"]) > run_id for i in open_issues) else "file"), None
     closed = [i for i in issues if i.get("closed_at")]
     if not closed:
-        return None
+        return "file", None
     # Only the most recently closed issue counts: a person's close stands even if an older one was the bot's.
     issue = api("GET", f"repos/{repo}/issues/{max(closed, key=lambda i: i['closed_at'])['number']}")
     if (issue.get("closed_by") or {}).get("login") != BOT:
-        return None
+        return "file", None
     if now - dt.datetime.fromisoformat(issue["closed_at"].replace("Z", "+00:00")) > WINDOW:
-        return None
+        return "file", None
     if not same_error(summary_of(issue.get("body")), summary):
-        return None
+        return "file", None
     events = api("GET", f"repos/{repo}/issues/{issue['number']}/events?per_page=100")
     reopens = sum(e["event"] == "reopened" and (e.get("actor") or {}).get("login") == BOT for e in events)
-    return issue, reopens, reopens >= MAX_REOPENS
+    return "reopen", (issue, reopens, reopens >= MAX_REOPENS)
 
 
 def reopen(api, repo, issue, reopens, flaky, sha, run_url, reopened):
@@ -158,27 +163,28 @@ def main():
         reconcile(gh, repo, a.prefix, labels, a.failures, a.run_url, int(os.environ["GITHUB_RUN_ID"]))
         return
 
-    def output(value):
+    def output(action):
         with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write(f"reopened={value}\n")
+            f.write(f"action={action}\n")
 
     try:
-        found = decide(gh, repo, a.title, labels, a.summary, dt.datetime.now(dt.timezone.utc))
+        action, found = decide(gh, repo, a.title, labels, a.summary, dt.datetime.now(dt.timezone.utc),
+                               int(os.environ["GITHUB_RUN_ID"]))
     except (subprocess.CalledProcessError, KeyError, ValueError) as e:
         print(f"::warning::Reopen check failed; filing as usual: {e}")
-        found = None
-    if not found:
-        output("false")
+        action, found = "file", None
+    if action != "reopen":
+        output(action)
         return
     done = []
     try:
-        reopen(gh, repo, *found, a.sha, a.run_url, reopened=lambda: (output("true"), done.append(True)))
+        reopen(gh, repo, *found, a.sha, a.run_url, reopened=lambda: (output("reopened"), done.append(True)))
         print(f"Reopened #{found[0]['number']}{' as flaky' if found[2] else ''}: {a.title}")
     except subprocess.CalledProcessError as e:
         # Before the issue reopened, let the report step file; after, it is open and filing would duplicate it.
         print(f"::warning::Reopen did not finish: {e}")
         if not done:
-            output("false")
+            output("file")
 
 
 if __name__ == "__main__":

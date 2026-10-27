@@ -142,7 +142,7 @@ jobs:
             echo "__SUSPECTS_EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Reopen a recently auto-closed issue
+      - name: Reopen a recently auto-closed issue, or skip a stale report
         id: reopen
         env:
           GH_TOKEN: ${{ github.token }}
@@ -156,7 +156,7 @@ jobs:
             --summary "$SUMMARY" --sha "$SHA" --run-url "$RUN_URL"
 
       - name: Create or update nightly failure issue
-        if: steps.reopen.outputs.reopened != 'true'
+        if: steps.reopen.outputs.action != 'reopened' && steps.reopen.outputs.action != 'skip'
         uses: actions/github-script@v7
         with:
           script: |
