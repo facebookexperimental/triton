@@ -10,7 +10,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_cuda
+from triton._internal_testing import is_cuda, torch_dtype_name
 
 
 def _has_hopper():
@@ -392,3 +392,78 @@ def test_auto_tma_device_block_over_256(monkeypatch):
     torch.testing.assert_close(out, x * 2.0, atol=1e-2, rtol=1e-2)
     assert "tt.make_tensor_descriptor" in k.asm["ttir"], "expected a device descriptor"
     assert "tt.descriptor_load" in k.asm["ttir"], ("device-descriptor BLOCK_N=512 load must be auto-TMA promoted")
+
+
+@triton.jit
+def _desc_copy_kernel(desc):
+    desc.store([0, 0], desc.load([0, 0]))
+
+
+def _assert_recipes_match_explicit(k, x):
+    # Compare with a host TensorDescriptor; the pass sees signless ints, which map to unsigned.
+    from triton.backends.nvidia.driver import TMA_DTYPE_DEVICE_TO_HOST
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    ref = x.view({torch.int32: torch.uint32, torch.int64: torch.uint64}.get(x.dtype, x.dtype))
+    ref_k = _desc_copy_kernel.warmup(TensorDescriptor.from_tensor(ref, [64, 64]), grid=(1, ))
+    expected = TMA_DTYPE_DEVICE_TO_HOST[ref_k.metadata.tensordesc_meta[0]["elem_type"]]
+    recipes = k.metadata.auto_tma_recipes
+    assert recipes and all(r["elem_type"] == expected for r in recipes)
+
+
+@triton.jit
+def _copy_2d_kernel(x_ptr, out_ptr, M, N, stride_m, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x = tl.load(x_ptr + offs_m[:, None] * stride_m + offs_n[None, :], mask=mask)
+    tl.store(out_ptr + offs_m[:, None] * stride_m + offs_n[None, :], x, mask=mask)
+
+
+@pytest.mark.parametrize("dtype", [
+    torch.int8, torch.int16, torch.int32, torch.int64, torch.float16, torch.float32, torch.float64, torch.bfloat16,
+    torch.float8_e4m3fn, torch.float8_e5m2
+], ids=torch_dtype_name)
+def test_auto_tma_load_dtype_encoding(dtype):
+    # Masked copy of random bytes. Check the recipe before launch: a bad elem_type fails the launch.
+    M, N = 200, 304
+    x = torch.randint(0, 256, (M, N * dtype.itemsize), device="cuda", dtype=torch.uint8).view(dtype)
+    out = torch.zeros_like(x)
+    grid = (triton.cdiv(M, 64), triton.cdiv(N, 64))
+    k = _copy_2d_kernel.warmup(x, out, M, N, x.stride(0), BLOCK_M=64, BLOCK_N=64, grid=grid)
+    assert "tt.descriptor_load" in k.asm["ttir"]
+    _assert_recipes_match_explicit(k, x)
+    _copy_2d_kernel[grid](x, out, M, N, x.stride(0), BLOCK_M=64, BLOCK_N=64)
+    assert torch.equal(out.view(torch.uint8), x.view(torch.uint8))
+
+
+@triton.jit
+def _ws_atomic_add_2d_kernel(x_ptr, out_ptr, cnt_ptr, M, N, stride_m, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                             NUM_SMS: tl.constexpr):
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = tl.cdiv(M, BLOCK_M) * num_pid_n
+    for tile_id in tl.range(tl.program_id(0), num_tiles, NUM_SMS, warp_specialize=True):
+        offs_m = (tile_id // num_pid_n) * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = (tile_id % num_pid_n) * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        x = tl.load(x_ptr + offs_m[:, None] * stride_m + offs_n[None, :], mask=mask, other=0)
+        tl.atomic_add(out_ptr + offs_m[:, None] * stride_m + offs_n[None, :], x, mask=mask, sem="relaxed")
+        tl.atomic_add(cnt_ptr, 1, sem="relaxed")
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32, torch.float64], ids=torch_dtype_name)
+def test_auto_tma_atomic_add(dtype):
+    # The atomic consumes a promoted load. f64 (no TMA reduce-add) and the scalar counter stay plain atomics.
+    M, N = 512, 384
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    x, out = (torch.randint(-1000, 1000, (M, N), device="cuda").to(dtype) for _ in range(2))
+    ref, cnt = out + x, torch.zeros(1, device="cuda", dtype=torch.int32)
+    num_tiles = triton.cdiv(M, 64) * triton.cdiv(N, 64)
+    grid = (min(NUM_SMS, num_tiles), )
+    args = (x, out, cnt, M, N, x.stride(0))
+    kwargs = dict(BLOCK_M=64, BLOCK_N=64, NUM_SMS=NUM_SMS, num_warps=4)
+    k = _ws_atomic_add_2d_kernel.warmup(*args, **kwargs, grid=grid)
+    ttir = k.asm["ttir"]
+    assert "tt.descriptor_load" in ttir and ("tt.descriptor_reduce" in ttir) == (dtype != torch.float64)
+    _assert_recipes_match_explicit(k, x)
+    _ws_atomic_add_2d_kernel[grid](*args, **kwargs)
+    assert torch.equal(out, ref) and cnt.item() == num_tiles

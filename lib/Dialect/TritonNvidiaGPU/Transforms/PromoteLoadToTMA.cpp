@@ -48,21 +48,18 @@ namespace mlir::triton::nvidia_gpu {
 
 namespace {
 
-// CU_TENSOR_MAP_DATA_TYPE values (device-side; remapped to host in the
-// launcher).
+// Host CUtensorMapDataType values (cuda.h); fp8 is copied as u8.
 enum TMADataType {
   TMA_UINT8 = 0,
   TMA_UINT16 = 1,
   TMA_UINT32 = 2,
-  TMA_UINT64 = 3,
-  TMA_INT32 = 4,
+  TMA_INT32 = 3,
+  TMA_UINT64 = 4,
   TMA_INT64 = 5,
   TMA_FLOAT16 = 6,
   TMA_FLOAT32 = 7,
   TMA_FLOAT64 = 8,
   TMA_BFLOAT16 = 9,
-  TMA_FLOAT8_E4M3 = 13,
-  TMA_FLOAT8_E5M2 = 14,
 };
 
 static std::optional<int> getTMADataType(Type elemTy) {
@@ -73,9 +70,9 @@ static std::optional<int> getTMADataType(Type elemTy) {
     case 16:
       return TMA_UINT16;
     case 32:
-      return TMA_INT32;
+      return TMA_UINT32;
     case 64:
-      return TMA_INT64;
+      return TMA_UINT64;
     default:
       return std::nullopt;
     }
@@ -89,10 +86,9 @@ static std::optional<int> getTMADataType(Type elemTy) {
       return TMA_FLOAT32;
     if (floatTy.isF64())
       return TMA_FLOAT64;
-    if (llvm::isa<Float8E4M3FNType, Float8E4M3FNUZType>(floatTy))
-      return TMA_FLOAT8_E4M3;
-    if (llvm::isa<Float8E5M2Type, Float8E5M2FNUZType>(floatTy))
-      return TMA_FLOAT8_E5M2;
+    if (llvm::isa<Float8E4M3FNType, Float8E4M3FNUZType, Float8E5M2Type,
+                  Float8E5M2FNUZType>(floatTy))
+      return TMA_UINT8;
     return std::nullopt;
   }
   return std::nullopt;
@@ -1074,7 +1070,6 @@ struct Promotion {
 
 struct StorePromotion {
   Operation *op; // tt::StoreOp or tt::AtomicRMWOp(add/fadd)
-  Value value;   // stored / accumulated value tensor
   bool isAtomicAdd =
       false; // emit tt.descriptor_reduce(add), not descriptor_store
   DecomposedLoad decomp;
@@ -1311,7 +1306,6 @@ public:
           return;
         StorePromotion p;
         p.op = storeOp;
-        p.value = storeOp.getValue();
         p.decomp = decomp;
         p.shapeArgIndices = shapeArgs;
         p.useDeviceMode = needsDevice;
@@ -1325,6 +1319,12 @@ public:
       kernelFunc.walk([&](tt::AtomicRMWOp atomicOp) {
         tt::RMWOp rmw = atomicOp.getAtomicRmwOp();
         if (rmw != tt::RMWOp::ADD && rmw != tt::RMWOp::FADD)
+          return;
+        // TMA reduce-add has no s64/f64; those and scalars stay atomics.
+        auto valTy = dyn_cast<RankedTensorType>(atomicOp.getVal().getType());
+        if (!valTy ||
+            !AsyncTMAReduceOp::isSupportedReduceKind(
+                tt::DescriptorReduceKind::ADD, valTy.getElementType()))
           return;
         // descriptor_reduce carries no memory ordering or scope;
         // only promote relaxed atomics to avoid silently dropping
@@ -1392,7 +1392,6 @@ public:
           return;
         StorePromotion p;
         p.op = atomicOp;
-        p.value = atomicOp.getVal();
         p.isAtomicAdd = true;
         p.decomp = decomp;
         p.shapeArgIndices = shapeArgs;
@@ -1684,7 +1683,9 @@ public:
     for (auto &promo : storePromotions) {
       Operation *op = promo.op;
       int rank = promo.decomp.dims.size();
-      Value value = promo.value;
+      // Read the value off the op: Phase 2a may have erased its defining load.
+      Value value = promo.isAtomicAdd ? cast<tt::AtomicRMWOp>(op).getVal()
+                                      : cast<tt::StoreOp>(op).getValue();
       auto valTy = cast<RankedTensorType>(value.getType());
       Type elemTy = valTy.getElementType();
       Location loc = op->getLoc();
