@@ -33,34 +33,33 @@ tutorial API with a prepacked-scale contract, not a public `tlx.ops` API.
 ## Regular GEMM comparison on MI350X
 
 All paths compute the same `A @ B.T` with E4M3 operands, per-row/per-32 E8M0
-scales, and BF16 output. This uses the **regular**, not grouped, GEMM entrypoint
-from Primus-Turbo FlyDSL. The AITER column invokes its regular group-32 Triton
-kernel (package-default configuration; no tuned rows for these square shapes).
+scales, and BF16 output. Both AITER columns invoke **regular**, not grouped,
+GEMMs from AITER source `457b1151809a`. Its Triton path uses raw scales and
+row-major inputs; its gfx950 FlyDSL path uses raw scales and a 16x16-preshuffled
+weight matrix. For these square shapes, FlyDSL selected untuned heuristic tiles.
 Numbers are median microseconds per operation; TFLOPS is `2 * size**3 / time`.
 
-| M=N=K | TLX, cached scales | TLX, pack both + GEMM | AITER Triton, raw scales | Primus FlyDSL, raw scales |
+| M=N=K | TLX, cached scales | TLX, pack both + GEMM | AITER Triton, raw scales | AITER FlyDSL, preshuffled B |
 | ---: | ---: | ---: | ---: | ---: |
-| 1K | 7.19 µs / 299 TFLOPS | 16.92 µs / 127 TFLOPS | 8.02 µs / 268 TFLOPS | 17.96 µs / 120 TFLOPS |
-| 2K | 19.98 µs / 860 TFLOPS | 30.80 µs / 558 TFLOPS | 47.03 µs / 365 TFLOPS | 27.46 µs / 626 TFLOPS |
-| 4K | 60.91 µs / 2257 TFLOPS | 75.49 µs / 1821 TFLOPS | 356.60 µs / 385 TFLOPS | 53.39 µs / 2574 TFLOPS |
-| 8K | 452.97 µs / 2427 TFLOPS | 469.35 µs / 2343 TFLOPS | 2799.88 µs / 393 TFLOPS | 429.12 µs / 2562 TFLOPS |
-| 16K | 3806.39 µs / 2311 TFLOPS | 3852.94 µs / 2283 TFLOPS | 25258.56 µs / 348 TFLOPS | N/A (non-reproducible output) |
+| 1K | 6.13 µs / 350 TFLOPS | 15.47 µs / 139 TFLOPS | 7.44 µs / 289 TFLOPS | 5.94 µs / 362 TFLOPS |
+| 2K | 19.79 µs / 868 TFLOPS | 29.76 µs / 577 TFLOPS | 46.59 µs / 369 TFLOPS | 21.94 µs / 783 TFLOPS |
+| 4K | 55.80 µs / 2463 TFLOPS | 74.17 µs / 1853 TFLOPS | 358.40 µs / 384 TFLOPS | 128.66 µs / 1068 TFLOPS |
+| 8K | 453.75 µs / 2423 TFLOPS | 467.63 µs / 2351 TFLOPS | 2804.52 µs / 392 TFLOPS | 923.95 µs / 1190 TFLOPS |
+| 16K | 3815.74 µs / 2305 TFLOPS | 3844.23 µs / 2288 TFLOPS | 25220.40 µs / 349 TFLOPS | 8350.88 µs / 1053 TFLOPS |
 
 Seven graph-replay samples, 12 iterations/sample, two operations/replay;
 preallocated outputs. The TLX cached-scales column measures only GEMM, while
-its second column includes packing both scales on every call. Primus's regular
-call includes its fused preshuffle + GEMM; first-call autotuning is excluded.
+its second column includes packing both scales on every call. AITER FlyDSL
+measures GEMM only: the B preshuffle is done once before timing, and its
+E8M0 scales stay in row-major order. The current AITER FlyDSL runner was called
+directly because its public dispatcher tried to build an unavailable HIP
+helper in this container. There are no tuned square-shape rows, so the runner
+uses the dispatcher's heuristic fallback.
+
 The 1K/2K outputs were fully checked against an independent FP32 dequantized
 reference; a fixed-seed 128x128 sample was checked at 4K-16K, including after
-graph replay. All reported timings passed (`rtol=0.03`, `atol=0.5`). The 1K-8K
-Primus full outputs also matched exactly across three identical cold-cache
-runs. Measurements used physical GPU 7 with the default AUTO clock policy.
-
-The 16K Primus autotuner found no reproducible configuration. Direct testing
-confirmed that identical cold runs of its chosen regular-GEMM kernel changed
-the full output; six alternate configurations also changed output. That timing
-is excluded rather than publishing an invalid comparison. Sampled numerical
-closeness alone would not have detected this.
+graph replay. All reported timings passed (`rtol=0.03`, `atol=0.5`).
+Measurements used physical GPU 7 with the default AUTO clock policy.
 
 Clocks were **not** fixed: AMD documents that performance-determinism mode is
 unsupported on MI350, and this host rejected a manual maximum GFXCLK limit.
@@ -68,7 +67,7 @@ We restored AUTO after checking that control. The table reports interleaved
 medians, not fixed-clock peak performance. See [AMD SMI performance-level
 support](https://rocm.docs.amd.com/projects/amdsmi/en/docs-10.1.0/conceptual/perf-determinism.html).
 
-Environment: MI350X, TLX 3.9, PyTorch 2.16.0a0+rocm10.2.0a20261012,
-amd-aiter 0.1.24 (source `2ebbe6275b2a`), Primus-Turbo 0.0.0.dev1 (source
-`ca1fdd673172`), FlyDSL 0.3.4.1. Development benchmark scripts are not part
-of this tutorial; the comparison conditions and results are recorded above.
+Environment: MI350X, TLX commit `8dc562b7a2`, PyTorch
+2.16.0a0+rocm10.2.0a20261012, AITER source `457b1151809a`, FlyDSL 0.3.4.1.
+Development benchmark scripts are not part of this tutorial; the comparison
+conditions and results are recorded above.
