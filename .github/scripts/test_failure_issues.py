@@ -113,6 +113,10 @@ def test_only_a_bot_close_within_a_week_reopens():
     assert decide(FakeApi([issue(7, hours_ago=7 * 24 - 1)])) == 7
 
 
+def test_the_latest_close_is_chosen_by_close_time_not_result_order():
+    assert decide(FakeApi([issue(7, hours_ago=2), issue(8, hours_ago=30)])) == 7
+
+
 def test_only_the_latest_close_counts():
     assert decide(FakeApi([issue(7, hours_ago=30), issue(8, hours_ago=2, by="wychi")])) == "file"
     assert decide(FakeApi([issue(7, hours_ago=30, by="wychi"), issue(8, hours_ago=2)])) == 8
@@ -162,6 +166,11 @@ def run_main(monkeypatch, tmp_path, api):
 def test_an_api_error_before_reopening_leaves_filing_to_the_report_step(monkeypatch, tmp_path):
     api = FakeApi([issue(7)], fail=lambda m, p: p.startswith("search/"))
     assert run_main(monkeypatch, tmp_path, api) == "action=file\n"
+
+
+def test_a_stale_report_is_skipped(monkeypatch, tmp_path):
+    newer = dict(issue(7, state="open"), body=body(run_id=201))
+    assert run_main(monkeypatch, tmp_path, FakeApi([newer])) == "action=skip\n"
 
 
 def test_an_api_error_after_reopening_does_not_file_a_duplicate(monkeypatch, tmp_path):
