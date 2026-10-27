@@ -120,6 +120,15 @@ CATALOG: tuple[OpSpec, ...] = (
     ),
     OpSpec(
         op="addmm",
+        arch="gfx950",
+        variant="fused_gemm",
+        impl="triton.tlx.ops.kernels.addmm.gfx950:addmm",
+        invariant_vocab=_GEMM_DIMS,
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="addmm",
         arch="sm90",
         variant="tma_ws",
         impl="triton.tlx.ops.kernels.addmm.sm90:addmm",
