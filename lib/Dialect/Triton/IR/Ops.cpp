@@ -1,3 +1,4 @@
+#include <limits>
 #include <sstream>
 
 #include "mlir/IR/Builders.h"
@@ -38,6 +39,154 @@ void LoadOp::getEffects(
 
 namespace mlir {
 namespace triton {
+
+static arith::CmpIPredicate signedPredicate(arith::CmpIPredicate predicate) {
+  using P = arith::CmpIPredicate;
+  switch (predicate) {
+  case P::ult:
+    return P::slt;
+  case P::ule:
+    return P::sle;
+  case P::ugt:
+    return P::sgt;
+  case P::uge:
+    return P::sge;
+  default:
+    return predicate;
+  }
+}
+
+static bool refineOrderedEndpoints(arith::CmpIPredicate predicate,
+                                   bool isUnsigned, APInt &lo, APInt &hi,
+                                   const APInt &boundLo, const APInt &boundHi) {
+  auto less = [&](const APInt &a, const APInt &b) {
+    return isUnsigned ? a.ult(b) : a.slt(b);
+  };
+  APInt lower = boundLo, upper = boundHi;
+  using P = arith::CmpIPredicate;
+  switch (signedPredicate(predicate)) {
+  case P::slt:
+    if (isUnsigned ? upper.isZero() : upper.isMinSignedValue())
+      return false;
+    --upper;
+    [[fallthrough]];
+  case P::sle:
+    if (less(upper, hi))
+      hi = upper;
+    break;
+  case P::sgt:
+    if (isUnsigned ? lower.isMaxValue() : lower.isMaxSignedValue())
+      return false;
+    ++lower;
+    [[fallthrough]];
+  case P::sge:
+    if (less(lo, lower))
+      lo = lower;
+    break;
+  default:
+    llvm_unreachable("expected ordered integer comparison");
+  }
+  return true;
+}
+
+static ConstantIntRanges refineRange(arith::CmpIPredicate predicate,
+                                     const ConstantIntRanges &value,
+                                     const ConstantIntRanges &bound) {
+  using P = arith::CmpIPredicate;
+  bool isUnsigned = signedPredicate(predicate) != predicate;
+  APInt lo = isUnsigned ? value.umin() : value.smin();
+  APInt hi = isUnsigned ? value.umax() : value.smax();
+  APInt boundLo = isUnsigned ? bound.umin() : bound.smin();
+  APInt boundHi = isUnsigned ? bound.umax() : bound.smax();
+  if (predicate == P::eq) {
+    lo = llvm::APIntOps::smax(lo, boundLo);
+    hi = llvm::APIntOps::smin(hi, boundHi);
+  } else if (predicate == P::ne) {
+    if (boundLo == boundHi && lo != hi) {
+      if (lo == boundLo)
+        ++lo;
+      if (hi == boundHi)
+        --hi;
+    }
+  } else if (!refineOrderedEndpoints(predicate, isUnsigned, lo, hi, boundLo,
+                                     boundHi))
+    return value;
+  // Contradictions poison this result; they do not make its block unreachable.
+  if (isUnsigned ? hi.ult(lo) : hi.slt(lo))
+    return value;
+  ConstantIntRanges refined = isUnsigned
+                                  ? ConstantIntRanges::fromUnsigned(lo, hi)
+                                  : ConstantIntRanges::fromSigned(lo, hi);
+  return value.intersection(refined);
+}
+
+void RefineOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  if (!operands[0].isUninitialized() && !operands[1].isUninitialized())
+    setRange(getResult(), refineRange(getPredicate(), operands[0].getValue(),
+                                      operands[1].getValue()));
+}
+
+void MakeRangeOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), ConstantIntRanges::fromSigned(APInt(32, getStart()),
+                                                      APInt(32, getEnd() - 1)));
+}
+
+void GetProgramIdOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  int64_t maximum = std::numeric_limits<int32_t>::max();
+  if (auto mod = (*this)->getParentOfType<ModuleOp>())
+    for (Dialect *dialect : getContext()->getLoadedDialects())
+      if (const auto *bounds =
+              dialect->getRegisteredInterface<DialectLaunchBoundsInterface>())
+        if (std::optional<int64_t> bound =
+                bounds->getMaxProgramId(mod, getAxisAsInt()))
+          maximum = std::min(maximum, *bound);
+  setRange(getResult(),
+           ConstantIntRanges::fromSigned(APInt(32, 0), APInt(32, maximum)));
+}
+
+void SplatOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void ExpandDimsOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void BroadcastOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void ReshapeOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void TransOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void GatherOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void SplitOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  for (Value result : getResults())
+    setRange(result, operands.front());
+}
+
+void JoinOp::inferResultRangesFromOptional(ArrayRef<IntegerValueRange> operands,
+                                           SetIntLatticeFn setRange) {
+  setRange(getResult(), IntegerValueRange::join(operands[0], operands[1]));
+}
 
 //-- LoadOp --
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
@@ -1667,8 +1816,8 @@ LogicalResult ReturnOp::verify() {
       return emitError() << "type of return operand " << i << " ("
                          << getOperand(i).getType()
                          << ") doesn't match function result type ("
-                         << results[i] << ")"
-                         << " in function @" << function.getName();
+                         << results[i] << ")" << " in function @"
+                         << function.getName();
 
   return success();
 }

@@ -955,13 +955,13 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
                                   ShapedType dstTy) {
   if (srcTy.getElementType() != dstTy.getElementType()) {
     return op->emitOpError("source element type ")
-           << srcTy << " must match "
-           << "destination element type " << dstTy.getElementType();
+           << srcTy << " must match " << "destination element type "
+           << dstTy.getElementType();
   }
   if (srcTy.getShape() != dstTy.getShape()) {
     return op->emitOpError("source shape [")
-           << srcTy.getShape() << "] must match ["
-           << "destination shape " << dstTy.getShape() << "]";
+           << srcTy.getShape() << "] must match [" << "destination shape "
+           << dstTy.getShape() << "]";
   }
   return success();
 }
@@ -2112,6 +2112,21 @@ ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
                       AddrSpaceAttr::get(parser.getContext(), addrSpaceRet));
 
   return success();
+}
+
+void ConvertLayoutOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void RequireLayoutOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void ReleaseLayoutOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
 }
 
 } // namespace mlir::triton::gpu

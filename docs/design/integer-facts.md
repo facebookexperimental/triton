@@ -76,6 +76,7 @@ nonnegative when the sum can overflow. Signed division truncates toward zero;
 signed remainder has the dividend's sign. Analyze nonzero positive and negative
 divisor intervals separately.
 
+Operation `InferIntRangeInterface` methods supply ranges to MLIR dataflow.
 Constants, `make_range`, and target launch limits supply initial bounds.
 Tensor shape and layout operations preserve element ranges. Joins retain ranges
 that contain every executable incoming value. The MLIR range lattice owns loop
@@ -124,6 +125,6 @@ requires a new proof or equivalent semantic justification.
 
 ## References
 
-- [SCF loop contract](https://github.com/llvm/llvm-project/blob/a6533ab0f5a1df16ff3dbf7358fb79097c60855e/mlir/include/mlir/Dialect/SCF/IR/SCFOps.td#L178)
+- [SCF loop contract](https://github.com/facebookexperimental/llvm-project/blob/a6533ab0f5a1df16ff3dbf7358fb79097c60855e/mlir/include/mlir/Dialect/SCF/IR/SCFOps.td#L178)
 - [LLVM assume contract](https://llvm.org/docs/LangRef.html#llvm-assume-intrinsic)
 - [Range and materialization tests](../../test/Analysis/test-alignment.mlir)
