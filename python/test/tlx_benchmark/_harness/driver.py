@@ -197,7 +197,8 @@ def supported(bench) -> bool:
 
 def default_json(bench, suites=None) -> str:
     suite_suffix = "" if not suites else "." + "+".join(suites)
-    return f"/tmp/tlx_benchmark/{bench.OP}.{arch()}{suite_suffix}.json"
+    root = getattr(bench, "ARTIFACT_DIR", "/tmp/tlx_benchmark")
+    return f"{root}/{bench.OP}.{arch()}{suite_suffix}.json"
 
 
 def _selected_suite_names(bench, suites=None) -> tuple[str, ...]:
@@ -399,6 +400,9 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
     if not synthetic:
         env["shape_suites"] = list(_selected_suite_names(bench, suites))
     env["run"] = {k: info[k] for k in ("problems", "clock_trace", "elapsed_s") if k in info}
+    finalize = getattr(bench, "finalize", None)
+    if finalize is not None:
+        finalize(results, env)
     return results, env
 
 

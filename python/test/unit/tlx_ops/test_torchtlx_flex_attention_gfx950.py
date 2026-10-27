@@ -1,5 +1,4 @@
 """L1 for gfx950 FlexAttention forward with max_autotune disabled."""
-from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import pytest
@@ -18,17 +17,9 @@ pytestmark = [
 
 @pytest.fixture
 def runner(monkeypatch, tmp_path):
-    path = Path(__file__).resolve().parents[2] / "tlx_benchmark/bench_torchtlx_flex_attention.py"
-    spec = spec_from_file_location("gfx950_flex_benchmark", path)
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-    # Undo the adapter's process-local patches after each case.
-    from torch._inductor.runtime import triton_heuristics
-    monkeypatch.setattr(triton_heuristics, "tlx_only_cuda_options", triton_heuristics.tlx_only_cuda_options)
-    monkeypatch.setattr(triton_heuristics.CachingAutotuner, "_create_compile_meta",
-                        triton_heuristics.CachingAutotuner._create_compile_meta)
-    with config.patch({"inductor_choices_class": config.inductor_choices_class, "compile_threads": 1}):
-        module.install_flex_adapter()
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "tlx_benchmark"))
+    import bench_torchtlx_flex_attention as module
+    with module.flex_adapter():
         yield module
 
 
@@ -37,8 +28,6 @@ def runner(monkeypatch, tmp_path):
 @pytest.mark.parametrize("seq,dim", [(129, 64), (257, 128)])
 def test_flex_forward_mod_tail(runner, tmp_path, record_property, mod, seq, dim):
     tensors, score_mod, block_mask, opts = runner.inputs(mod, seq, batch=3, heads=2, dim=dim)
-    # Stock's forced document config fails accuracy with this compiler.
-    opts = {} if mod == "document_mask" else opts
     _, ref = runner.compile_arm(tensors, score_mod, block_mask, opts, None, tmp_path / "stock.py")
     replay, got = runner.compile_arm(tensors, score_mod, block_mask, opts, "force", tmp_path / "tlx.py")
     if mod == "document_mask":
