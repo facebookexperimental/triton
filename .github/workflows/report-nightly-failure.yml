@@ -149,10 +149,11 @@ jobs:
           TITLE: ${{ inputs.issue_title }}
           LABELS: ${{ inputs.labels }}
           SUMMARY: ${{ inputs.summary }}
+          SHA: ${{ inputs.sha }}
           RUN_URL: ${{ inputs.run_url }}
         run: |
-          python3 .github/scripts/reopen_failure_issue.py --repo "${GITHUB_REPOSITORY}" \
-            --title "$TITLE" --labels "$LABELS" --summary "$SUMMARY" --run-url "$RUN_URL"
+          python3 .github/scripts/failure_issues.py reopen --title "$TITLE" --labels "$LABELS" \
+            --summary "$SUMMARY" --sha "$SHA" --run-url "$RUN_URL"
 
       - name: Create or update nightly failure issue
         if: steps.reopen.outputs.reopened != 'true'
