@@ -14,6 +14,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
 from triton.tlx.ops.kernels.flash_attn.gfx950 import _sum_rows_chain4 as _cluster_sum_rows_chain4
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import matmul_kernel_warp_pipeline
+from triton.language.extra.tlx.tutorials import amd_addmm_glu
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -92,6 +93,57 @@ def test_grouped_gemm_ignores_outside_tiles(m, n):
                                                matrix_instr_nonkdim=16)
     expected = a @ b if m > 0 and n > 0 else torch.zeros_like(output)
     torch.testing.assert_close(output, expected, atol=0.015, rtol=0.015)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("operand", ["a", "b"])
+@pytest.mark.parametrize("family", [
+    "warp",
+    "stock_triton_matmul",
+    "skinny_atomic_matmul",
+    "skinny_twopass_matmul",
+    "tlx_optimized",
+    "tlx_optimized_async",
+    "tlx_simple_async",
+    "tlx_persistent",
+])
+def test_grouped_coordinates_large_strides(split_k_tutorial, family, operand):
+    a_values = torch.randn((3, 256), device=DEVICE, dtype=torch.float16) * 0.2
+    b_values = torch.randn((256, 3), device=DEVICE, dtype=torch.float16) * 0.2
+    # Third row/column crosses 2**31 elements with an i32 stride argument.
+    if operand == "a":
+        a = torch.empty_strided(a_values.shape, (1 << 30, 1), device=DEVICE, dtype=torch.float16)
+        a.copy_(a_values)
+        b = b_values
+    else:
+        a = a_values
+        b = torch.empty_strided(b_values.shape, (1, 1 << 30), device=DEVICE, dtype=torch.float16)
+        b.copy_(b_values)
+    reference = a_values @ b_values
+    if family == "warp":
+        output = torch.empty((3, 3), device=DEVICE, dtype=torch.float16)
+        compiled = matmul_kernel_warp_pipeline[(1, )](a, b, output, 3, 3, 256, a.stride(0), a.stride(1), b.stride(0),
+                                                      b.stride(1), output.stride(0), output.stride(1), BLOCK_M=256,
+                                                      BLOCK_N=256, BLOCK_K=64, GROUP_M=4, NUM_BUFFERS=2, NUM_XCDS=3,
+                                                      XCD_CHUNK=5, num_warps=8, num_stages=1, matrix_instr_nonkdim=16)
+        assert not re.search(r"arith.remsi .* : tensor<[^>]*xi64>", compiled.asm["ttir"])
+    elif family.startswith("tlx_"):
+        bias = torch.randn((3, ), device=DEVICE, dtype=torch.float16) * 0.2
+        y = torch.randn((3, 3), device=DEVICE, dtype=torch.float16) * 0.2
+        output = torch.empty((3, 3), device=DEVICE, dtype=torch.float16)
+        config = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=32, GROUP_SIZE_M=4, XCD_CHUNK=4, num_warps=4,
+                      matrix_instr_nonkdim=16, waves_per_eu=0)
+        if family == "tlx_optimized_async":
+            config["NUM_BUFFERS"] = 4
+        runner = getattr(amd_addmm_glu, "run_kernel_" + family.removeprefix("tlx_"))
+        if family == "tlx_persistent":
+            runner(a, b, bias, y, output, config, 1)
+        else:
+            runner(a, b, bias, y, output, config)
+        reference = amd_addmm_glu.pytorch_baseline(bias, a_values, b_values, y)
+    else:
+        output = getattr(split_k_tutorial, family)(a, b)
+    torch.testing.assert_close(output, reference, atol=0.015, rtol=0.015)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
