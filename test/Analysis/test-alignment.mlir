@@ -1,3 +1,4 @@
+// RUN: triton-opt %s -triton-materialize-integer-facts -test-integer-facts="generic=true" -test-print-alignment -verify-diagnostics=only-expected -split-input-file -o /dev/null
 // RUN: triton-opt %s -triton-materialize-integer-facts -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o %t.once
 // RUN: triton-opt %t.once -triton-materialize-integer-facts -split-input-file -o %t.twice
 // RUN: diff %t.once %t.twice
@@ -2556,4 +2557,51 @@ tt.func @different_bounds(%choose: i1, %x: i32, %y: i32, %bound_a: i32, %bound_b
   %check_a = arith.cmpi slt, %arg, %bound_a {test.proof = "unknown"} : i32
   %check_b = arith.cmpi slt, %arg, %bound_b {test.proof = "unknown"} : i32
   tt.return %arg : i32
+}
+
+// -----
+
+tt.func @generic_range_interfaces(%input: i32) {
+  %zero = arith.constant 0 : i32
+  %limit = arith.constant 16 : i32
+  %low = tt.refine %input, %zero {predicate = 5 : i64} : i32
+  %bounded = tt.refine %low, %limit {predicate = 2 : i64} : i32
+  %lower = arith.cmpi sge, %bounded, %zero {test.generic_proof = "proven"} : i32
+  %upper = arith.cmpi slt, %bounded, %limit {test.generic_proof = "proven"} : i32
+  %sibling = arith.cmpi slt, %input, %limit {test.generic_proof = "unknown"} : i32
+  %range = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32>
+  %expanded = tt.expand_dims %range {axis = 1 : i32} : tensor<4xi32> -> tensor<4x1xi32>
+  %broadcast = tt.broadcast %expanded : tensor<4x1xi32> -> tensor<4x2xi32>
+  %transposed = tt.trans %broadcast {order = array<i32: 1, 0>} : tensor<4x2xi32> -> tensor<2x4xi32>
+  %flat = tt.reshape %transposed : tensor<2x4xi32> -> tensor<8xi32>
+  %splat = tt.splat %bounded : i32 -> tensor<8xi32>
+  %joined = tt.join %flat, %splat : tensor<8xi32> -> tensor<8x2xi32>
+  %left, %right = tt.split %joined : tensor<8x2xi32> -> tensor<8xi32>
+  %indices = arith.constant dense<0> : tensor<8xi32>
+  %gather = tt.gather %left[%indices] {axis = 0 : i32} : (tensor<8xi32>, tensor<8xi32>) -> tensor<8xi32>
+  %tensor_limit = arith.constant dense<16> : tensor<8xi32>
+  %gather_bound = arith.cmpi slt, %gather, %tensor_limit {test.generic_proof = "proven"} : tensor<8xi32>
+  %split_bound = arith.cmpi slt, %right, %tensor_limit {test.generic_proof = "proven"} : tensor<8xi32>
+  tt.return
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#other = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @generic_target_and_layout_ranges() {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %max = arith.constant 16777214 : i32
+    %bound = arith.cmpi sle, %pid, %max {test.generic_proof = "proven"} : i32
+    %splat = tt.splat %pid : i32 -> tensor<256xi32, #blocked>
+    %converted = ttg.convert_layout %splat : tensor<256xi32, #blocked> -> tensor<256xi32, #other>
+    %required = ttg.require_layout %converted : tensor<256xi32, #other> -> tensor<256xi32, #other>
+    %released = ttg.release_layout %required : tensor<256xi32, #other> -> tensor<256xi32, #other>
+    %limit = arith.constant dense<16777214> : tensor<256xi32, #other>
+    %layout_bound = arith.cmpi sle, %released, %limit {test.generic_proof = "proven"} : tensor<256xi32, #other>
+    tt.return
+  }
 }

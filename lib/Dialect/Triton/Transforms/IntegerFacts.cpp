@@ -126,7 +126,7 @@ static bool preservesIntegerWidth(Operation *op, DataFlowSolver &solver) {
 struct TritonNarrowIntegerRangesPass
     : impl::TritonNarrowIntegerRangesBase<TritonNarrowIntegerRangesPass> {
   void runOnOperation() override {
-    auto solver = createIntegerRangeSolver(getOperation());
+    auto solver = createIntegerRangeSolver();
     if (failed(solver->initializeAndRun(getOperation())))
       return signalPassFailure();
     IntegerRangeRewriteListener listener(*solver);

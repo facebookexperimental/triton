@@ -9,7 +9,7 @@
 namespace mlir::triton {
 
 /// Create a solver for SSA integer ranges and target launch bounds.
-std::unique_ptr<DataFlowSolver> createIntegerRangeSolver(Operation *root);
+std::unique_ptr<DataFlowSolver> createIntegerRangeSolver();
 
 /// Find signed div/rem operations with nonnegative SSA dividends.
 LogicalResult collectNonNegativeDividends(Operation *root,
