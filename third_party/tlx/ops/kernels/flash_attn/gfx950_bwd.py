@@ -5306,25 +5306,12 @@ _D64_CAUSAL_GQA8_KV_SPLITS = 4
 # the FP32 range so the input-dependent score contribution retains headroom.
 _D64_RECIP_LSE_ENTROPY_LIMIT = torch.finfo(torch.float32).max / 2.0
 
-_D64_MHA_POSITIVE_JIT = tl.constexpr(_D64_MHA_POSITIVE)
-_D64_GQA_SIGNED_JIT = tl.constexpr(_D64_GQA_SIGNED)
-_D64_LSE_NATURAL_LOG_JIT = tl.constexpr(_D64_LSE_NATURAL_LOG)
-_D64_LSE_NEG_LOG2E_JIT = tl.constexpr(_D64_LSE_NEG_LOG2E)
-_D64_DELTA_POSITIVE_JIT = tl.constexpr(_D64_DELTA_POSITIVE)
-_D64_DELTA_NEGATED_JIT = tl.constexpr(_D64_DELTA_NEGATED)
-_D64_CAUSAL_GQA8_KV_SPLITS_JIT = tl.constexpr(_D64_CAUSAL_GQA8_KV_SPLITS)
-
 _D64_GQA_SPLIT_FAST = "split_fast"
 _D64_GQA_XCD = "xcd"
 _D64_GQA_XCD_N_FAST = "xcd_n_fast"
 
-_D64_GQA_INDEPENDENT_D32 = "independent_d32"
 _D64_GQA_INTERLEAVED_D32 = "interleaved_d32"
 _D64_GQA_DIRECT_D64 = "direct_d64"
-
-_D64_GQA_INDEPENDENT_D32_JIT = tl.constexpr(_D64_GQA_INDEPENDENT_D32)
-_D64_GQA_INTERLEAVED_D32_JIT = tl.constexpr(_D64_GQA_INTERLEAVED_D32)
-_D64_GQA_DIRECT_D64_JIT = tl.constexpr(_D64_GQA_DIRECT_D64)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -10531,6 +10518,8 @@ def _attn_bwd_dq_d64_causal_load_q64(
     STAT_MODE: tl.constexpr,
     q_op0_mn: tl.constexpr,
 ):
+    _D64_GQA_SIGNED_JIT: tl.constexpr = 1
+    _D64_MHA_POSITIVE_JIT: tl.constexpr = 0
     rows = row_start + tl.arange(0, 64)
     lse = tl.load(LSE + stats_base + rows, mask=rows < store_end, other=0.0)
     cols = tl.arange(0, D)
@@ -11353,6 +11342,8 @@ def _attn_bwd_dq_d64_causal_impl(
     STAT_MODE: tl.constexpr,
     Q3_REGISTER_CLASS: tl.constexpr,
 ):
+    _D64_GQA_SIGNED_JIT: tl.constexpr = 1
+    _D64_MHA_POSITIVE_JIT: tl.constexpr = 0
     tl.static_assert(D == 64)
     tl.static_assert(HQ % HKV == 0)
     tl.static_assert(SQ % 64 == 0 and SKV % 64 == 0 and SQ <= SKV)
@@ -11693,6 +11684,7 @@ def _attn_bwd_dq_d64_causal_mha_kernel(
     KV_PIPELINE_STAGES: tl.constexpr,
     Q3_REGISTER_CLASS: tl.constexpr = None,
 ):
+    _D64_MHA_POSITIVE_JIT: tl.constexpr = 0
     _attn_bwd_dq_d64_causal_impl(Q, K, V, O, DO, LSE, DELTA, DELTA, DQ, SM_SCALE, HQ, HKV, SQ, SKV, D, OWNER_ROWS,
                                  LOGICAL_N, USE_DQ_XCD, SKIP_OWNER_TAIL, OWNER_PID_BASE, LAUNCH_Q_TILES,
                                  OWNER_FRAGMENTS, GRID_OWNER_M, KV_PIPELINE_STAGES, _D64_MHA_POSITIVE_JIT,
@@ -11727,6 +11719,7 @@ def _attn_bwd_dq_d64_causal_gqa8_kernel(
     KV_PIPELINE_STAGES: tl.constexpr,
     Q3_REGISTER_CLASS: tl.constexpr = "agpr",
 ):
+    _D64_GQA_SIGNED_JIT: tl.constexpr = 1
     _attn_bwd_dq_d64_causal_impl(Q, K, V, O, DO, LSE, DELTA, LSE_TERM, DQ, SM_SCALE, HQ, HKV, SQ, SKV, D, OWNER_ROWS,
                                  LOGICAL_N, USE_DQ_XCD, SKIP_OWNER_TAIL, OWNER_PID_BASE, LAUNCH_Q_TILES,
                                  OWNER_FRAGMENTS, GRID_OWNER_M, KV_PIPELINE_STAGES, _D64_GQA_SIGNED_JIT,
@@ -12011,6 +12004,8 @@ def _attn_bwd_dkdv_d64_causal_mha_kernel(
     DELTA_MODE: tl.constexpr,
 ):
     """Two-wave BM32/BN64 causal MHA owner with direct publication."""
+    _D64_DELTA_POSITIVE_JIT: tl.constexpr = 0
+    _D64_LSE_NATURAL_LOG_JIT: tl.constexpr = 0
     tl.static_assert(HQ == HKV)
     tl.static_assert(D == 64)
     tl.static_assert(BLOCK_M == 32)
@@ -13050,6 +13045,7 @@ def _d64_gqa8_direct_d64_impl(
     q_op1_nd: tl.constexpr,
 ):
     """Carry only full-width FP32 dK/dV through the complete owner walk."""
+    _D64_CAUSAL_GQA8_KV_SPLITS_JIT: tl.constexpr = 4
     tl.static_assert(KV_SPLITS == _D64_CAUSAL_GQA8_KV_SPLITS_JIT)
     dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
     dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
@@ -13493,6 +13489,12 @@ def _attn_bwd_dkdv_d64_causal_gqa8_kernel(
     DELTA_MODE: tl.constexpr,
 ):
     """Resident-K/V causal D64 GQA8 producer with four fixed partials."""
+    _D64_CAUSAL_GQA8_KV_SPLITS_JIT: tl.constexpr = 4
+    _D64_DELTA_NEGATED_JIT: tl.constexpr = 1
+    _D64_GQA_DIRECT_D64_JIT: tl.constexpr = 'direct_d64'
+    _D64_GQA_INDEPENDENT_D32_JIT: tl.constexpr = 'independent_d32'
+    _D64_GQA_INTERLEAVED_D32_JIT: tl.constexpr = 'interleaved_d32'
+    _D64_LSE_NEG_LOG2E_JIT: tl.constexpr = 1
     tl.static_assert(D == 64 and BLOCK_M == 64 and (BLOCK_N == 64 or BLOCK_N == 128))
     tl.static_assert(HQ == HKV * 8)
     tl.static_assert(SQ % BLOCK_M == 0 and SKV % BLOCK_N == 0)
@@ -13724,6 +13726,7 @@ def _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel(
     KV_SPLITS: tl.constexpr,
 ):
     """Reduce split 0,1,2,3 in FP32, then narrow exactly once."""
+    _D64_CAUSAL_GQA8_KV_SPLITS_JIT: tl.constexpr = 4
     tl.static_assert(D == 64 and (BLOCK_N == 64 or BLOCK_N == 128) and SKV % BLOCK_N == 0)
     tl.static_assert(KV_SPLITS == _D64_CAUSAL_GQA8_KV_SPLITS_JIT)
     pid_n = tl.program_id(0)
