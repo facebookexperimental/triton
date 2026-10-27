@@ -127,7 +127,6 @@ elif [[ "$GPU_VENDOR" == "amd" ]]; then
         $1 == "BDFID:" {bdf = $2}
         gpu && uuid ~ /^GPU-[0-9a-fA-F]+$/ && bdf != "" && int(bdf / 256) == bus {print uuid; exit}')
     if [[ -n "$ROCR_UUID" ]]; then
-        echo "Running on GPU $HIP_VISIBLE_DEVICES ($ROCR_UUID)"
         RUN_ENV=(env -u HIP_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES="$ROCR_UUID")
     else
         echo "Warning: no ROCr UUID for GPU $HIP_VISIBLE_DEVICES; HIP may run on a different card" >&2
