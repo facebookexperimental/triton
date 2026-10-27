@@ -507,6 +507,7 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   return basis1D.reshapeOuts(outDims);
 }
 
+// Exclude segment-only dimensions from swizzle and vector-width selection.
 static LinearLayout projectSwizzledDimensions(const LinearLayout &layout) {
   SmallVector<StringAttr> dimensions;
   for (StringAttr dim : layout.getOutDimNames())
@@ -655,6 +656,7 @@ getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
 
 int32_t getVecBitwidthLdSt(const LinearLayout &src, const LinearLayout &dst,
                            int32_t bitwidth) {
+  // Vector width must use the same non-modular projection as the swizzle.
   if (src.isModular()) {
     auto srcPow2 = projectSwizzledDimensions(src);
     auto dstPow2 = projectSwizzledDimensions(dst);
