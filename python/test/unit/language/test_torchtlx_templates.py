@@ -3500,6 +3500,63 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                         self.assertEqual(1, len(choices))
                         self.assertIsInstance(choices[0], dict)
 
+    def test_flex_forward_offline_config_is_independent_of_stock_tiles(self):
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        choices = []
+        stock = self._forward_config()
+        stock.block_m, stock.block_n = 32, 32
+        with (
+                config.patch({"triton.tlx_mode": "force", "max_autotune": False}),
+                mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
+                mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                [stock, self._forward_config()],
+                self._forward_inputs(),
+                [object(), object()],
+                object(),
+                {},
+                128,
+                128,
+            )
+        self.assertEqual(1, len(choices))
+        self.assertEqual(
+            (128, 64, 4, 1, 0, 32, 1),
+            tuple(choices[0][name] for name in (
+                "BLOCK_M",
+                "BLOCK_N",
+                "num_warps",
+                "num_stages",
+                "waves_per_eu",
+                "matrix_instr_nonkdim",
+                "kpack",
+            )),
+        )
+
+    def test_flex_forward_offline_config_respects_sparse_block_geometry(self):
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        choices = []
+        with (
+                config.patch({"triton.tlx_mode": "force", "max_autotune": False}),
+                mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
+                mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                [self._forward_config()],
+                self._forward_inputs(),
+                [object(), object()],
+                object(),
+                {},
+                64,
+                32,
+            )
+        self.assertEqual(1, len(choices))
+        self.assertEqual((64, 32), (choices[0]["BLOCK_M"], choices[0]["BLOCK_N"]))
+
     def test_flex_backward_registration_honors_effective_bwd_overrides(self):
         """Compatible user overrides must take precedence over the stock config."""
         from triton.language.extra.tlx.inductor import flex_attention_templates
@@ -3926,7 +3983,7 @@ class TestFlexAttention(TestCase):
         with config.patch({
                 "triton.tlx_mode": "force",
                 "force_disable_caches": True,
-                "max_autotune": True,
+                "max_autotune": False,
         }):
             out, code = run_and_get_code(torch.compile(fn), q, k, v)
         return out, "\n".join(code)
@@ -4030,7 +4087,7 @@ class TestFlexAttention(TestCase):
         with config.patch({
                 "triton.tlx_mode": "force",
                 "force_disable_caches": True,
-                "max_autotune": True,
+                "max_autotune": False,
         }):
             (out, lse), code = run_and_get_code(
                 torch.compile(lambda q, k, v: flex_attention(q, k, v, block_mask=bm, scale=sm, return_lse=True)),

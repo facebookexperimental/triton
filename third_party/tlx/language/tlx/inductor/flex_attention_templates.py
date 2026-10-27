@@ -371,41 +371,54 @@ def _append_tlx_flex_amd(
     query,
     mutated_inputs,
 ):
-    """Append AMD (gfx950) flex-attention candidates: single-task MFMA/LDS body.
+    """Append one offline gfx950 forward choice, independently of stock tiles."""
+    if not configs:
+        return
+    opts = original_kernel_options.copy()
+    for name in list(opts):
+        if name.startswith("fwd_"):
+            opts[name[4:]] = opts.pop(name)
+        elif name.startswith("bwd_"):
+            opts.pop(name)
+    opts["USE_TMA"] = False
+    opts.setdefault("SPARSE_Q_BLOCK_SIZE", sparse_q_block_size)
+    opts.setdefault("SPARSE_KV_BLOCK_SIZE", sparse_kv_block_size)
 
-    Unlike the Blackwell path this uses no warp specialization / TMEM / TMA, so
-    USE_TMA / NUM_MMA_GROUPS are not set. num_warps follows the MFMA tile
-    (BLOCK_M / mfma_m rows per wave), capped at 8.
-    """
-    def amd_options():
-        opts = original_kernel_options.copy()
-        for k in list(opts.keys()):
-            if k.startswith("fwd_"):
-                opts[k[4:]] = opts.pop(k)
-            elif k.startswith("bwd_"):
-                opts.pop(k)
-        opts["USE_TMA"] = False
-        opts.setdefault("SPARSE_Q_BLOCK_SIZE", sparse_q_block_size)
-        opts.setdefault("SPARSE_KV_BLOCK_SIZE", sparse_kv_block_size)
-        return opts
+    head_dim = max(
+        opts.get("QK_HEAD_DIM_ROUNDED", query.get_size()[-1]),
+        opts.get("V_HEAD_DIM_ROUNDED", query.get_size()[-1]),
+    )
+    # Tuned offline at bf16 D=128; wider heads use a conservative fallback.
+    block_m, block_n = (128, 64) if head_dim <= 128 else (64, 32)
+    for name, tile in (("SPARSE_Q_BLOCK_SIZE", block_m), ("SPARSE_KV_BLOCK_SIZE", block_n)):
+        sparse_size = opts[name]
+        while tile >= 16 and (sparse_size < tile or sparse_size % tile):
+            tile //= 2
+        if tile < 16:
+            return
+        if name == "SPARSE_Q_BLOCK_SIZE":
+            block_m = tile
+        else:
+            block_n = tile
 
-    mfma_m = 32
-    for conf in configs:
-        opts = amd_options()
-        opts["BLOCK_M"] = conf.block_m
-        opts["BLOCK_N"] = conf.block_n
-        opts["num_warps"] = min(8, max(1, conf.block_m // mfma_m))
-        # TLX is hand-pipelined; disable Triton software pipelining.
-        opts["num_stages"] = 1
-        gfx950_flex_attention_template.maybe_append_choice(
-            choices=choices,
-            input_nodes=input_nodes,
-            layout=layout,
-            subgraphs=subgraphs,
-            mutated_inputs=mutated_inputs,
-            call_sizes=query.get_size(),
-            **opts,
-        )
+    opts.update(
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        num_warps=4,
+        num_stages=1,
+        waves_per_eu=0,
+        matrix_instr_nonkdim=min(32, block_m, block_n),
+        kpack=1,
+    )
+    gfx950_flex_attention_template.maybe_append_choice(
+        choices=choices,
+        input_nodes=input_nodes,
+        layout=layout,
+        subgraphs=subgraphs,
+        mutated_inputs=mutated_inputs,
+        call_sizes=query.get_size(),
+        **opts,
+    )
 
 
 _SM90_HEAD_DIMS = (64, 80, 96, 128)
