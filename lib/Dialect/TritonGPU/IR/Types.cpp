@@ -134,11 +134,10 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     ArrayRef<int64_t> layoutShape = dropPipeliningDim(shape, encoding);
     ArrayRef<int64_t> layoutAllocShape =
         dropPipeliningDim(allocShape, encoding);
-    bool hasLeadingSharedDim = isa<SharedEncodingTrait>(encoding) && rank != 0;
-    auto shapeToCheck =
-        hasLeadingSharedDim ? layoutShape.drop_front() : layoutShape;
+    bool isShared = isa<SharedEncodingTrait>(encoding);
+    auto shapeToCheck = isShared ? layoutShape.drop_front() : layoutShape;
     auto allocShapeToCheck =
-        hasLeadingSharedDim ? layoutAllocShape.drop_front() : layoutAllocShape;
+        isShared ? layoutAllocShape.drop_front() : layoutAllocShape;
     if (!llvm::all_of(shapeToCheck, llvm::isPowerOf2_64))
       return emitError()
              << "shape must have power-of-2 and non-zero dimensions; got "
