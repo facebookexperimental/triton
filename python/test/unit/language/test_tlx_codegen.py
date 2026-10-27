@@ -355,6 +355,24 @@ def test_async_task_rejects_unaligned_registers(kwargs, task_args):
 @pytest.mark.parametrize(
     "kwargs",
     [
+        {"num_regs": 264},
+        {"registers": 264},
+        {"num_regs": 512},
+        {"registers": 512},
+    ],
+)
+@pytest.mark.parametrize("task_args", [(), ("default", )])
+def test_async_task_rejects_over_limit_registers(kwargs, task_args):
+    with pytest.raises(ValueError, match="at most 256"):
+        if task_args:
+            tlx.async_task(*task_args, **kwargs)
+        else:
+            tlx.async_task(num_warps=1, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
         {"minRegAutoWS": 25},
         {"maxRegAutoWS": 153},
     ],
