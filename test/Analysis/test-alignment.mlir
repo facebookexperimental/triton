@@ -2600,3 +2600,38 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32,
     tt.return
   }
 }
+
+// -----
+
+// NARROW-LABEL: @narrow_tensor_multiply_flags
+// NARROW: arith.muli {{.*}} overflow<nuw> : tensor<4xi32>
+// NARROW: arith.extui {{.*}} : tensor<4xi32> to tensor<4xi64>
+tt.func @narrow_tensor_multiply_flags(%x: i64) -> tensor<4xi64> {
+  %lo = arith.constant 1073741824 : i64
+  %hi = arith.constant 2147483647 : i64
+  %lower = arith.cmpi sge, %x, %lo : i64
+  %upper = arith.cmpi sle, %x, %hi : i64
+  %inside = arith.andi %lower, %upper : i1
+  llvm.intr.assume %inside : i1
+  %values = tt.splat %x : i64 -> tensor<4xi64>
+  %two = arith.constant dense<2> : tensor<4xi64>
+  %product = arith.muli %values, %two overflow<nsw, nuw> : tensor<4xi64>
+  tt.return %product : tensor<4xi64>
+}
+
+// -----
+
+// NARROW-LABEL: @narrow_shift_flags
+// NARROW: arith.shli {{.*}} overflow<nuw> : i32
+// NARROW: arith.extui {{.*}} : i32 to i64
+tt.func @narrow_shift_flags(%x: i64) -> i64 {
+  %lo = arith.constant 1073741824 : i64
+  %hi = arith.constant 2147483647 : i64
+  %one = arith.constant 1 : i64
+  %lower = arith.cmpi sge, %x, %lo : i64
+  %upper = arith.cmpi sle, %x, %hi : i64
+  %inside = arith.andi %lower, %upper : i1
+  llvm.intr.assume %inside : i1
+  %shifted = arith.shli %x, %one overflow<nsw, nuw> : i64
+  tt.return %shifted : i64
+}
