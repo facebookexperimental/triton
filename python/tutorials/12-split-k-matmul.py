@@ -86,7 +86,6 @@ def _stock_triton_kernel(
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(0)
-    tl.assume(pid >= 0)
     tl.assume(M <= 2147483647 - (BLOCK_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_M)
     tl.assume(N <= 2147483647 - (BLOCK_N - 1))
@@ -107,8 +106,8 @@ def _stock_triton_kernel(
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :].to(tl.int64) * stride_bn
+    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
@@ -119,7 +118,7 @@ def _stock_triton_kernel(
     c = acc.to(tl.float16)
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None].to(tl.int64) + stride_cn * offs_cn[None, :].to(tl.int64)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
@@ -193,7 +192,6 @@ def _skinny_atomic_kernel(
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(0)
-    tl.assume(pid >= 0)
     pid_k = tl.program_id(1)
     tl.assume(M <= 2147483647 - (BLOCK_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -217,8 +215,8 @@ def _skinny_atomic_kernel(
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + (k_start + offs_k[None, :]) * stride_ak
-    b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :].to(tl.int64) * stride_bn
+    a_ptrs = a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
+    b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K_PER_SPLIT, BLOCK_K)):
         k_remaining = k_end - (k_start + k * BLOCK_K)
@@ -231,7 +229,7 @@ def _skinny_atomic_kernel(
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None].to(tl.int64) + stride_cn * offs_cn[None, :].to(tl.int64)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     if SPLIT_K == 1:
         tl.store(c_ptrs, c, mask=c_mask)
     else:
@@ -315,7 +313,6 @@ def _twopass_compute_kernel(
     # Launcher skips empty matrices and supplies an exact tile grid.
     tl.assume((M > 0) & (N > 0))
     pid = tl.program_id(0)
-    tl.assume(pid >= 0)
     pid_k = tl.program_id(1)
     tl.assume(M <= 2147483647 - (BLOCK_M - 1))
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -339,8 +336,8 @@ def _twopass_compute_kernel(
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + (k_start + offs_k[None, :]) * stride_ak
-    b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :].to(tl.int64) * stride_bn
+    a_ptrs = a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
+    b_ptrs = b_ptr + (k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K_PER_SPLIT, BLOCK_K)):
         k_remaining = k_end - (k_start + k * BLOCK_K)
@@ -353,8 +350,7 @@ def _twopass_compute_kernel(
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    scratch_ptrs = scratch_ptr + pid_k * stride_sk + offs_cm[:, None].to(tl.int64) * stride_sm + offs_cn[None, :].to(
-        tl.int64) * stride_sn
+    scratch_ptrs = scratch_ptr + pid_k * stride_sk + offs_cm[:, None] * stride_sm + offs_cn[None, :] * stride_sn
     tl.store(scratch_ptrs, acc, mask=c_mask)
 
 
