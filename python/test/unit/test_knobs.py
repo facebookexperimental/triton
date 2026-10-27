@@ -105,7 +105,7 @@ def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags
     assert len(calls) == 1
     actual_source, triple, processor, features, arguments = calls[0]
     assert actual_source == source
-    assert triple == compiler.amd.TARGET_TRIPLE
+    assert triple == compiler.amd.get_target_triple(arch)
     assert processor == arch
     assert features == ""
     assert arguments["flags"] == expected_flags
@@ -190,11 +190,11 @@ def test_amd_codegen_options_restored(option, capfd, fresh_knobs):
     options = dict(flags=[], enable_fp_fusion=True, disable_optimization=False, canonicalize_gep=False,
                    disabled_passes="", dump_ir=False, enable_timing=False)
     options[option] = True
-    compiler.compile_amdgpu(source, compiler.amd.TARGET_TRIPLE, "gfx942", "", **options)
+    compiler.compile_amdgpu(source, compiler.amd.get_target_triple("gfx942"), "gfx942", "", **options)
     assert capfd.readouterr().err
 
     options[option] = False
-    compiler.compile_amdgpu(source, compiler.amd.TARGET_TRIPLE, "gfx942", "", **options)
+    compiler.compile_amdgpu(source, compiler.amd.get_target_triple("gfx942"), "gfx942", "", **options)
     assert not capfd.readouterr().err
 
 
@@ -271,6 +271,24 @@ def test_amd_codegen_preserves_mir_replacement(fresh_knobs, monkeypatch):
     assert replacement_calls[0][0].startswith("/custom/mir/test_kernel_")
     assert replacement_calls[0][0].endswith(".txt")
     assert "s_endpgm" in assembly
+
+
+@pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
+def test_nvidia_register_pressure_scheduler_concurrent():
+    backend, source = _register_pressure_scheduler_kernel()
+
+    def emit(pressure_sensitive):
+        options = backend.parse_options({"ptx_version": 80, "sched4reg": pressure_sensitive})
+        return backend.make_ptx(source, {}, options, 90)
+
+    expected = {False: emit(False), True: emit(True)}
+    assert expected[False] != expected[True]
+
+    scheduling_policies = [bool(index % 2) for index in range(24)]
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(emit, scheduling_policies))
+
+    assert results == [expected[policy] for policy in scheduling_policies]
 
 
 def test_knobs_scope(fresh_knobs, monkeypatch):
