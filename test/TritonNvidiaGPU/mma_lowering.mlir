@@ -40,14 +40,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
   // CHECK-LABEL: two_cta_m64_scale_publication
   // CHECK-NOT: ttng.cluster_barrier
-  // CHECK: %[[A_SCALE:.*]] = ttng.tmem_alloc
-  // CHECK: ttng.tmem_copy {{.*}}, %[[A_SCALE]]
+  // Scale transfers are inserted AFTER the publication wait so the paired
+  // cp never reads peer SMEM before the peer's TMA completes (stale-read
+  // caused intermittent CTA1 zeros).
+  // CHECK: ttng.arrive_barrier {{.*}}#ttng.shared_cluster_memory
+  // CHECK-NEXT: ttng.wait_barrier
   // CHECK: %[[B_SCALE:.*]] = ttng.tmem_alloc
   // CHECK: ttg.memdesc_reinterpret
   // CHECK: ttg.local_load
   // CHECK: ttng.tmem_store {{.*}}, %[[B_SCALE]]
-  // CHECK: ttng.arrive_barrier {{.*}}#ttng.shared_cluster_memory
-  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK: %[[A_SCALE:.*]] = ttng.tmem_alloc
+  // CHECK: ttng.tmem_copy {{.*}}, %[[A_SCALE]]
   // CHECK: ttng.tc_gen5_mma_scaled {{.*}}, %[[A_SCALE]], %[[B_SCALE]]
   // CHECK-NOT: ttng.cluster_barrier
   tt.func public @two_cta_m64_scale_publication(

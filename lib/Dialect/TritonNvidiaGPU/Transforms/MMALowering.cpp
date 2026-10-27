@@ -209,11 +209,13 @@ struct TCGen5MMAScaleSharedToTmemConversion
         op, /*isA=*/false, op.getAType(), op.getBType(),
         aScaleType.getElementType(), bScaleType.getElementType());
     Operation *rhsPublicationBarrier = nullptr;
+    Operation *rhsPublicationWait = nullptr;
     if (isTwoCTAM64) {
       for (Operation *wait = op->getPrevNode(); wait;
            wait = wait->getPrevNode()) {
         if (isa<ClusterBarrierOp>(wait)) {
           rhsPublicationBarrier = wait;
+          rhsPublicationWait = wait;
           break;
         }
         if (isa<ClusterWaitOp>(wait)) {
@@ -221,6 +223,7 @@ struct TCGen5MMAScaleSharedToTmemConversion
                arrive = arrive->getPrevNode()) {
             if (isa<ClusterArriveOp>(arrive)) {
               rhsPublicationBarrier = arrive;
+              rhsPublicationWait = wait;
               break;
             }
             if (isa<ClusterWaitOp, ClusterBarrierOp, WaitBarrierOp,
@@ -240,6 +243,7 @@ struct TCGen5MMAScaleSharedToTmemConversion
                     areEquivalentBarrierViews(remote.getSrc(),
                                               waitBarrier.getBarrier())) {
                   rhsPublicationBarrier = arrive;
+                  rhsPublicationWait = wait;
                   break;
                 }
               }
@@ -274,7 +278,13 @@ struct TCGen5MMAScaleSharedToTmemConversion
 
     bool anyChanged = false;
     if (isa<ttg::SharedMemorySpaceAttr>(aScaleType.getMemorySpace())) {
-      if (rhsPublicationBarrier)
+      // Insert scale transfers AFTER the publication wait (both CTAs' TMAs
+      // complete) so the paired cp never reads stale peer SMEM. Inserting
+      // at the arrive raced with the peer's TMA and caused intermittent
+      // CTA1 zeros.
+      if (rhsPublicationWait)
+        rewriter.setInsertionPointAfter(rhsPublicationWait);
+      else if (rhsPublicationBarrier)
         rewriter.setInsertionPoint(rhsPublicationBarrier);
       FailureOr<bool> changed = lowerScaleToTmem(
           op.getAScaleMutable(), rewriter, blockM, aScaleBlockRepOrder);
@@ -286,7 +296,9 @@ struct TCGen5MMAScaleSharedToTmemConversion
     if (isa<ttg::SharedMemorySpaceAttr>(bScaleType.getMemorySpace())) {
       auto bScaleCTAMode = isTwoCTAM64 ? TensorMemoryCTAMode::TwoCTA_RHS
                                        : TensorMemoryCTAMode::DEFAULT;
-      if (rhsPublicationBarrier)
+      if (rhsPublicationWait)
+        rewriter.setInsertionPointAfter(rhsPublicationWait);
+      else if (rhsPublicationBarrier)
         rewriter.setInsertionPoint(rhsPublicationBarrier);
       FailureOr<bool> changed =
           lowerScaleToTmem(op.getBScaleMutable(), rewriter, blockN,
