@@ -17,12 +17,15 @@ on:
         type: string
 
 env:
-  GPU_WORKFLOW_NAME: Meta Triton MI350 Tests
+  # Issue-title scope. Off main it names the branch, so branches never share issues.
+  GPU_WORKFLOW_NAME: Meta Triton MI350 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
   TORCHINDUCTOR_TLX_MODE: "off"
 
 jobs:
   mi350-tritonbench-test:
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 180
     permissions:
@@ -81,9 +84,19 @@ jobs:
           TRITONBENCH_ROOT: ${{ github.workspace }}/tritonbench
         run: |
           bash ./.ci/tritonbench/test-gpu.sh
+      - name: Collect nightly failure (TritonBench)
+        id: parse
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && failure()
+        run: |
+          JOB="mi350-tritonbench-test"
+          TITLE="[nightly] ${GPU_WORKFLOW_NAME} / ${JOB} / amd-tritonbench"
+          FAILURES='[{"normalized_failure_id":"amd-tritonbench","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"'"${JOB}"'","summary":"TritonBench tests failed on MI350 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
+          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   mi350-tlx-test:
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 240
     permissions:
@@ -126,8 +139,24 @@ jobs:
         run: |
           set -eux
           pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+      - name: Collect nightly failures (TLX)
+        id: parse
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
+        run: |
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket mi350-tlx-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
+            --workflow "${GPU_WORKFLOW_NAME}" \
+            --job "mi350-tlx-test" \
+            ${FAILED_FLAG}
+
   mi350-gluon-test:
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 60
     permissions:
@@ -158,3 +187,145 @@ jobs:
         run: |
           set -eux
           pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
+      - name: Collect nightly failures (Gluon)
+        id: parse
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
+        run: |
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_gluon.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket mi350-gluon-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/gluon.xml \
+            --workflow "${GPU_WORKFLOW_NAME}" \
+            --job "mi350-gluon-test" \
+            ${FAILED_FLAG}
+
+  report-mi350-tritonbench:
+    needs: mi350-tritonbench-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.mi350-tritonbench-test.outputs.failures != '' && needs.mi350-tritonbench-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.mi350-tritonbench-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: Meta Triton MI350 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ inputs.ref }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: mi350
+
+  reconcile-mi350-tritonbench:
+    needs: mi350-tritonbench-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.mi350-tritonbench-test.result == 'success' || needs.mi350-tritonbench-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: Meta Triton MI350 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: mi350-tritonbench-test
+      failures: ${{ needs.mi350-tritonbench-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
+
+  report-mi350-tlx:
+    needs: mi350-tlx-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.mi350-tlx-test.outputs.failures != '' && needs.mi350-tlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.mi350-tlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: Meta Triton MI350 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ inputs.ref }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: mi350
+
+  reconcile-mi350-tlx:
+    needs: mi350-tlx-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.mi350-tlx-test.result == 'success' || needs.mi350-tlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: Meta Triton MI350 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: mi350-tlx-test
+      failures: ${{ needs.mi350-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
+
+  report-mi350-gluon:
+    needs: mi350-gluon-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.mi350-gluon-test.outputs.failures != '' && needs.mi350-gluon-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.mi350-gluon-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: Meta Triton MI350 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ inputs.ref }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: mi350
+
+  reconcile-mi350-gluon:
+    needs: mi350-gluon-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.mi350-gluon-test.result == 'success' || needs.mi350-gluon-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: Meta Triton MI350 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: mi350-gluon-test
+      failures: ${{ needs.mi350-gluon-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
