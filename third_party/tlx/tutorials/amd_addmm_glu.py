@@ -89,20 +89,6 @@ SIMPLE_BEST_CONFIG = {
 
 
 # L2 swizzling
-def _checked_tile_count(m, n, block_m, block_n, group_m, step=0):
-    if min(m, n) < 0 or min(block_m, block_n, group_m) <= 0:
-        raise ValueError("Dimensions must be nonnegative; tile and group sizes must be positive")
-    if m == 0 or n == 0:
-        return 0
-    limit = 2**31 - 1
-    if m > limit - (block_m - 1) or n > limit - (block_n - 1):
-        raise ValueError("Ceiling-division sum exceeds signed 32-bit range")
-    tiles_m, tiles_n = triton.cdiv(m, block_m), triton.cdiv(n, block_n)
-    if tiles_m * tiles_n > limit - step or group_m * tiles_n > limit:
-        raise ValueError("Tile grid or group exceeds signed 32-bit range")
-    return tiles_m * tiles_n
-
-
 @triton.jit
 def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk_size: tl.constexpr):
     """Group adjacent PIDs onto the same XCD in chunks of chunk_size for L2 reuse.
@@ -170,8 +156,6 @@ def tlx_addmm_glu_kernel_optimized(
     # Num pids along N dim
     tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    tl.assume(num_pid_m <= 2147483647 // num_pid_n)
-    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
@@ -347,7 +331,7 @@ def run_kernel_optimized(a, b, bias, y, out, cfg):
         return
     M, K = a.shape
     _, N = b.shape
-    grid = (_checked_tile_count(M, N, cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["GROUP_SIZE_M"]), )
+    grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
     return tlx_addmm_glu_kernel_optimized[grid](
         a,
         b,
@@ -429,8 +413,6 @@ def tlx_addmm_glu_kernel_optimized_async(
     # Num pids along N dim
     tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    tl.assume(num_pid_m <= 2147483647 // num_pid_n)
-    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
 
     # How many pids we have in total grid
     grid_mn = num_pid_m * num_pid_n
@@ -586,7 +568,7 @@ def run_kernel_optimized_async(a, b, bias, y, out, cfg):
         return
     M, K = a.shape
     _, N = b.shape
-    grid = (_checked_tile_count(M, N, cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["GROUP_SIZE_M"]), )
+    grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
     return tlx_addmm_glu_kernel_optimized_async[grid](
         a,
         b,
@@ -666,8 +648,6 @@ def tlx_addmm_glu_kernel_simple_async(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    tl.assume(num_pid_m <= 2147483647 // num_pid_n)
-    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
     grid_mn = num_pid_m * num_pid_n
     tl.assume(grid_mn > 0)
     tl.assume(pid < num_pid_m * num_pid_n)
@@ -775,7 +755,6 @@ def tlx_addmm_glu_kernel_persistent(
     tl.assume(N <= 2147483647 - (BLOCK_SIZE_N - 1))
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     tl.assume(num_pid_m <= (2147483647 - NUM_CUS) // num_pid_n)
-    tl.assume(num_pid_n <= 2147483647 // GROUP_SIZE_M)
     num_tiles = num_pid_m * num_pid_n
     tl.assume(num_tiles > 0)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -907,8 +886,7 @@ def run_kernel_persistent(a, b, bias, y, out, cfg, num_cus):
         return
     M, K = a.shape
     _, N = b.shape
-    grid = (min(num_cus,
-                _checked_tile_count(M, N, cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["GROUP_SIZE_M"], num_cus)), )
+    grid = (min(num_cus, triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"])), )
     return tlx_addmm_glu_kernel_persistent[grid](
         a,
         b,
@@ -945,7 +923,7 @@ def run_kernel_simple_async(a, b, bias, y, out, cfg):
         return
     M, K = a.shape
     _, N = b.shape
-    grid = (_checked_tile_count(M, N, cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["GROUP_SIZE_M"]), )
+    grid = (triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"]), )
     return tlx_addmm_glu_kernel_simple_async[grid](
         a,
         b,
