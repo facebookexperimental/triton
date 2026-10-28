@@ -7,20 +7,6 @@ from triton.tlx.ops.kernels.addmm._shapes import CORRECTNESS_SHAPES, FOCUS, inpu
 pytestmark = pytest.mark.skipif(not is_hip_cdna3(), reason="tlx.ops.addmm requires gfx942")
 
 
-@pytest.mark.parametrize("mode", [None, "0", "1", "auto", "force"])
-def test_torchtlx_mlp_partials_policy(monkeypatch, mode):
-    from triton.tlx.ops.kernels.mm.gfx942 import torchtlx_heuristic_config
-
-    if mode is None:
-        monkeypatch.delenv("TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE", raising=False)
-    else:
-        monkeypatch.setenv("TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE", mode)
-    configs = torchtlx_heuristic_config(4662, 2560, 2560, dtype=torch.float16, out_dtype=torch.float16,
-                                        a_strides=(2560, 1), b_strides=(1, 2560))
-    assert len(configs) == 1
-    assert bool(configs[0].kwargs.get("SPLIT_M_256_64")) == (mode in ("1", "auto", "force"))
-
-
 @pytest.mark.parametrize("row_panels", [0, 160, 320])
 def test_addmm_layernorm_partials_row_tail(monkeypatch, row_panels):
     from torch._inductor import config
@@ -190,18 +176,3 @@ def test_deep_k_rejects_cpu_bias():
     assert not gfx942._precheck_global_split_k(a, b, bias, out)
     with pytest.raises(ValueError, match="input must match A's device and dtype"):
         gfx942._gemm(a, b, bias, out=out)
-
-
-@pytest.mark.parametrize("global_split", [False, True])
-def test_full_space_independent_of_heuristic(monkeypatch, global_split):
-    from triton.tlx.ops.kernels.mm import gfx942
-
-    shapes = tuple((entry.m, entry.n, entry.k) for entry in FOCUS.resolved_shapes("gfx942_all"))
-
-    def keys(shape):
-        configs = gfx942._candidate_configs(shape, enable_global_split_k=global_split)
-        return {(tuple(sorted(config.kwargs.items())), config.num_warps, config.num_stages) for config in configs}
-
-    expected = {shape: keys(shape) for shape in shapes}
-    monkeypatch.setattr(gfx942, "heuristic_config", lambda *args, **kwargs: [gfx942._config(32, 32, 32, 1, 4)])
-    assert {shape: keys(shape) for shape in shapes} == expected

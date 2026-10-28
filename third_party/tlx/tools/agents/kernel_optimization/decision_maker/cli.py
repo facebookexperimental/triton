@@ -92,8 +92,6 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         help="deprecated compatibility option; tuning keeps the full space fixed",
     )
     parser.add_argument("--heuristic-rounds", type=int, default=5)
-    parser.add_argument("--stable-cv-max", type=float, default=0.03,
-                        help="maximum timing CV for stable full-space parity measurements (default: 0.03)")
     parser.add_argument(
         "--reference-kernel",
         type=Path,
@@ -649,7 +647,6 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
             budget=budget,
             search_rounds=args.search_rounds,
             heuristic_rounds=args.heuristic_rounds,
-            stable_cv_max=args.stable_cv_max,
             commit=args.commit_winner,
             commit_message=args.commit_message,
             vcs=args.vcs,
@@ -821,12 +818,10 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
         budget=budget,
         search_rounds=args.search_rounds,
         heuristic_rounds=args.heuristic_rounds,
-        stable_cv_max=args.stable_cv_max,
         commit=args.commit_winner,
         commit_message=None,
         vcs=args.vcs,
         initial_source=result.best_kernel,
-        device_environments=getattr(args, "_production_device_environments", ()),
     )
     task_result = {
         "task": "authoring",

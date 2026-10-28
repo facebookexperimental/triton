@@ -1031,27 +1031,20 @@ class CodexCandidateProvider:
                 if self.model:
                     command.extend(("--model", self.model))
                 command.append("-")
-                # Codex can emit large progress logs. Regular files avoid
-                # inherited nonblocking pipes failing with EAGAIN on stderr.
-                stderr_path = workspace / "stderr.log"
-                with (workspace / "stdout.log").open("w") as stdout, stderr_path.open("w") as stderr:
-                    completed = subprocess.run(
-                        command,
-                        input=prompt,
-                        text=True,
-                        stdout=stdout,
-                        stderr=stderr,
-                        timeout=self.timeout_seconds,
-                        check=False,
-                    )
+                completed = subprocess.run(
+                    command,
+                    input=prompt,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.timeout_seconds,
+                    check=False,
+                )
                 if completed.returncode != 0:
-                    with stderr_path.open("rb") as stderr:
-                        stderr.seek(0, 2)
-                        stderr.seek(max(0, stderr.tell() - 65536))
-                        diagnostic_tail = stderr.read().decode("utf-8", errors="replace")
-                    diagnostics = (completed.stderr or diagnostic_tail).strip().splitlines()
-                    raise RuntimeError(f"candidate generator exited with code {completed.returncode}: " +
-                                       " | ".join(diagnostics[-8:]))
+                    diagnostics = completed.stderr.strip().splitlines()
+                    raise RuntimeError(
+                        f"candidate generator exited with code {completed.returncode}: "
+                        + " | ".join(diagnostics[-8:])
+                    )
                 source = candidate_path.read_text()
                 if original_path.read_text() != context.current_source:
                     raise RuntimeError("candidate generator modified immutable original.py")
@@ -1062,7 +1055,9 @@ class CodexCandidateProvider:
                 )
                 if not isinstance(action, str):
                     if source != context.current_source:
-                        raise ValueError("non-candidate agent actions must leave candidate.py unchanged")
+                        raise ValueError(
+                            "non-candidate agent actions must leave candidate.py unchanged"
+                        )
                     return action
                 metadata = _read_candidate_metadata(
                     metadata_path,
@@ -1070,7 +1065,9 @@ class CodexCandidateProvider:
                     original_source=context.current_source,
                 )
         except FileNotFoundError as error:
-            raise RuntimeError("codex binary not found; install it or use --provider mock") from error
+            raise RuntimeError(
+                "codex binary not found; install it or use --provider mock"
+            ) from error
         if not source.strip():
             raise RuntimeError("candidate generator returned empty source")
         validate_replacement_source(source, context.current_source)

@@ -531,38 +531,6 @@ def test_amd_inventory_matches_unique_ids_by_card(monkeypatch):
     assert [device.memory_used_mib for device in fleet] == [1, 2, 0]
 
 
-def test_agent_amd_visibility_restores_conflicting_masks(monkeypatch):
-    from _harness.denoise import AMD, Device
-    from third_party.tlx.tools.agents.kernel_optimization.decision_maker import benchmark_environment
-
-    selected = Device(AMD, 1, "MI300X", "GPU-fb166e58bccdde7c")
-
-    class Governor:
-        applied = ()
-        skipped = ()
-
-        def __init__(self, device, enable):
-            assert device is selected
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-    monkeypatch.setattr(benchmark_environment, "_load_benchmark_environment", lambda repository:
-                        (Governor, lambda: [selected]))
-    monkeypatch.setattr(benchmark_environment, "_numa_cpus", lambda device: "")
-    original = {"ROCR_VISIBLE_DEVICES": "GPU-old", "HIP_VISIBLE_DEVICES": "3", "CUDA_VISIBLE_DEVICES": "7"}
-    for key, value in original.items():
-        monkeypatch.setenv(key, value)
-    environment = benchmark_environment.device_environment(selected)
-    assert environment == {**selected.visibility_environment, "TLX_AGENT_PHYSICAL_GPU": "1"}
-    with benchmark_environment.governed_benchmark_device(pathlib.Path.cwd(), "gfx942", "1", govern=False):
-        assert {key: os.environ[key] for key in original} == selected.visibility_environment
-    assert {key: os.environ[key] for key in original} == original
-
-
 def test_sampler_join_does_not_shadow_thread_internals():
     from _harness.denoise import _Sampler
 

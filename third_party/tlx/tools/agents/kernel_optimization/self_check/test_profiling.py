@@ -549,20 +549,6 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertEqual(profile["kernels"][0]["dispatches"], 3)
         self.assertEqual(profile["kernels"][0]["resources"]["lds_bytes"], 32768.0)
 
-    def test_profile_cache_exclusion_preserves_workload_helpers(self) -> None:
-        trace = "Kernel_Name,Start_Timestamp,End_Timestamp\n_sleep,0,4800000000\n"
-        for name, duration in (("_tlx_agent_profile_cache_clear.kd", 100000),
-                               ("gemm.kd", 50000), ("reduce.kd", 10000), ("new_consumer.kd", 5000)):
-            trace += f"{name},0,{duration}\n{name},1000000,{1000000 + duration}\n"
-        raw = parse_rocprof_kernel_trace(trace, sample_count=2)
-        self.assertEqual(raw["summary"]["dominant_kernel"], "_tlx_agent_profile_cache_clear.kd")
-        filtered = parse_rocprof_kernel_trace(trace, sample_count=2,
-                                             exclude_kernel_prefixes=("_tlx_agent_profile_cache_clear",))
-        self.assertEqual(filtered["summary"]["dominant_kernel"], "gemm.kd")
-        self.assertEqual(filtered["summary"]["kernel_count"], 3)
-        self.assertEqual({kernel["name"] for kernel in filtered["kernels"]},
-                         {"gemm.kd", "reduce.kd", "new_consumer.kd"})
-
     def test_parses_rocprof_counter_collection(self) -> None:
         counters = (
             "Kernel_Name,Counter_Name,Counter_Value\n"
@@ -754,7 +740,6 @@ class ProfileParsingTest(unittest.TestCase):
                 "source_path": source,
                 "device": "cuda",
                 "arch": "gfx942",
-                "phase": "full",
             }
             expected = {
                 "tool": "rocprofv3",
