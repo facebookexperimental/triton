@@ -92,7 +92,7 @@ void MemDescType::print(AsmPrinter &printer) const {
 bool mlir::triton::gpu::isLegalMemDescLayoutShape(ArrayRef<int64_t> shape,
                                                   Attribute encoding) {
   ArrayRef<int64_t> layoutShape = dropPipeliningDim(shape, encoding);
-  if (isa<SharedEncodingTrait>(encoding))
+  if (isa<SharedEncodingTrait>(encoding) && !layoutShape.empty())
     layoutShape = layoutShape.drop_front();
   return llvm::all_of(layoutShape, llvm::isPowerOf2_64);
 }
