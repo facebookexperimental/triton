@@ -42,6 +42,7 @@ namespace triton {
 
 void MakeRangeOp::inferResultRangesFromOptional(
     ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  // make_range(begin, end) yields the half-open interval [begin, end).
   setRange(getResult(), ConstantIntRanges::fromSigned(APInt(32, getStart()),
                                                       APInt(32, getEnd() - 1)));
 }

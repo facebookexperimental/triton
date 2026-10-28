@@ -20,6 +20,9 @@ struct IntegerAssumption {
 using IntegerAssumptions = DenseMap<Value, SmallVector<IntegerAssumption>>;
 
 /// Integer ranges with scoped assumptions and bounded loop simulation.
+/// A tensor's range is the union of its elements' ranges.
+/// Bounded loops retain ranges for loop-carried values instead of immediately
+/// widening them to the full integer range.
 struct TritonIntegerRangeAnalysis : dataflow::IntegerRangeAnalysis {
   using dataflow::IntegerRangeAnalysis::IntegerRangeAnalysis;
   using Base = dataflow::IntegerRangeAnalysis;
@@ -79,10 +82,12 @@ struct TritonIntegerRangeAnalysis : dataflow::IntegerRangeAnalysis {
       ArrayRef<dataflow::AbstractSparseLattice *> abstractLattices) override;
 
   /// Collect constant comparison bounds and their assumption sites.
+  /// Exclude constant operands when filterConstants is true.
   static IntegerAssumptions collectAssumptions(Operation *rootOp,
                                                bool filterConstants = true);
 
   /// Intersect inferred ranges with assumptions that dominate this use.
+  /// For example, K >= 0 and K < 128 constrain K to [0, 127].
   IntegerValueRange getRangeAt(Value value, Operation *use,
                                const IntegerValueRange &inferred) const;
 
@@ -109,6 +114,8 @@ struct TritonIntegerRangeAnalysis : dataflow::IntegerRangeAnalysis {
       int64_t>
       loopVisits;
 
+  // Each value can have several bounds, each with its own assumption site.
+  // The comparison may dominate uses where the assumption does not execute.
   IntegerAssumptions assumptions;
 
   /// The defaultTransferFunc is the default transfer function for this dataflow
