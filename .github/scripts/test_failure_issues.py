@@ -210,3 +210,76 @@ def test_reconcile_closes_nothing_without_a_per_test_signal():
     assert reconcile(api, [{"issue_title": PREFIX + "bucket", "fallback": True}]) == []
     assert fi.reconcile(api, REPO, PREFIX, LABELS, "not json", RUN, 150) == []
     assert api.writes == []
+
+
+# --- group ---
+
+
+class GroupApi:
+    """Issues, parents and sub-issue links as the group step sees them; records writes."""
+
+    def __init__(self, issues):
+        self.issues = {i["number"]: i for i in issues}
+        self.writes = []
+
+    def __call__(self, method, path, fields=None, paginate=False):
+        url = urlsplit(path)
+        number = lambda: int(re.search(r"issues/(\d+)", url.path)[1])
+        if method == "GET" and url.path == f"repos/{REPO}/issues":
+            want = set(parse_qs(url.query)["labels"][0].split(","))
+            return [
+                i for i in self.issues.values() if i["state"] == "open" and want <= {l["name"]
+                                                                                     for l in i["labels"]}
+            ]
+        if method == "GET" and url.path.endswith("/sub_issues"):
+            return [i for i in self.issues.values() if i.get("parent_issue_url", "").endswith(f"/issues/{number()}")]
+        if method == "GET" and "/commits/" in url.path:
+            return {"author": {"login": "author"}, "commit": {"message": "Break things (#77)\n\nbody"}}
+        if method == "GET":
+            return self.issues[number()]
+        self.writes.append((method, path, fields))
+        if method == "POST" and url.path == f"repos/{REPO}/issues":
+            parent = dict(fields, number=900, id=9000, state="open", labels=[{"name": fi.PARENT}])
+            self.issues[900] = parent
+            return parent
+        if method == "POST" and url.path.endswith("/sub_issues"):
+            child = next(i for i in self.issues.values() if i["id"] == fields["sub_issue_id"])
+            child["parent_issue_url"] = f"https://api.github.com/repos/{REPO}/issues/{number()}"
+        if method == "PATCH":
+            self.issues[number()]["state"] = fields["state"]
+        return {}
+
+
+def failing(number, first_seen, parent=None, labels=LABELS):
+    """An open per-test issue first seen at commit first_seen * 40."""
+    i = dict(issue(number, state="open", title=f"{PREFIX}t::test_{number}", labels=labels), id=number * 10,
+             body=f"<!-- bisect-meta\nbad_sha={first_seen * 40}\n-->\n" + body())
+    return dict(i, parent_issue_url=f"https://api.github.com/repos/{REPO}/issues/{parent}") if parent else i
+
+
+def parent(number, state="open"):
+    return dict(issue(number, state=state, title=f"CI failures first seen at {number}", labels=[fi.PARENT]),
+                id=number * 10)
+
+
+def test_a_failure_belongs_to_the_commit_where_it_was_first_seen():
+    # Push B still fails A's test (#1), an older test filed before parents existed (#4), and breaks two new ones.
+    api = GroupApi([parent(800), failing(1, "a", parent=800), failing(4, "a"), failing(2, "b"), failing(3, "b")])
+    fi.group(api, REPO, PREFIX, LABELS, "b" * 40, "main", RUN + "200")
+    assert api.issues[1]["parent_issue_url"].endswith("/issues/800")
+    assert "parent_issue_url" not in api.issues[4]
+    new_parent = api.issues[900]
+    assert new_parent["assignees"] == ["author"] and new_parent["title"].endswith("(#77)")
+    assert all(api.issues[n]["parent_issue_url"].endswith("/issues/900") for n in (2, 3))
+
+
+def test_a_parent_stays_open_exactly_while_a_non_flaky_sub_issue_is_open():
+    flaky = dict(failing(1, "a", parent=800), labels=[{"name": l} for l in LABELS + [fi.FLAKY]])
+    fixed = dict(failing(2, "a", parent=800), state="closed")
+    api = GroupApi([parent(800), flaky, fixed])
+    fi.group(api, REPO, PREFIX, LABELS, "c" * 40, "main", RUN + "200")
+    assert api.issues[800]["state"] == "closed"
+
+    api = GroupApi([parent(800, state="closed"), failing(2, "a", parent=800)])  # #2 failed again and reopened
+    fi.group(api, REPO, PREFIX, LABELS, "c" * 40, "main", RUN + "200")
+    assert api.issues[800]["state"] == "open"

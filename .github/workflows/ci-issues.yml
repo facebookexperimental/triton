@@ -1,7 +1,8 @@
 name: CI Failure Issues
 
-# Files and closes the failure issues of one test job. Each test job calls this
-# once, with always(), after it finishes.
+# Files and closes the failure issues of one test job, and groups new ones under
+# one parent issue per commit where they were first seen. Each test job calls
+# this once, with always(), after it finishes.
 #
 # Which runs file is decided here and nowhere else: scheduled runs, and pushes to
 # main or a release branch. The github context of a called workflow is the
@@ -83,3 +84,28 @@ jobs:
       job_name: ${{ inputs.job }}
       failures: ${{ inputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  group:
+    needs: [report, reconcile]
+    if: >-
+      always()
+      && (github.event_name == 'schedule' || github.event_name == 'push')
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - name: Group new failures under their commit's parent issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFIX: ${{ format('[nightly] {0}{1} / {2} / ', inputs.workflow, github.ref_name != 'main' && format(' ({0})', github.ref_name) || '', inputs.job) }}
+          SHA: ${{ inputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/failure_issues.py group --prefix "$PREFIX" --labels ci_issues,nightly \
+            --sha "$SHA" --run-url "$RUN_URL"

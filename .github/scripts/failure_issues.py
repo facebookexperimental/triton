@@ -12,7 +12,12 @@
       Close this job's open issues whose failure no longer appears. Leaves flaky issues for a person to close, and
       issues a newer run reported: pushes run concurrently, so an older run can finish after a newer one.
 
-GITHUB_REPOSITORY and GITHUB_RUN_ID come from the Actions environment.
+  failure_issues.py group --prefix P --labels a,b --sha SHA --run-url U
+      Group this job's issues under one parent per commit where failures were first seen, assigned to that
+      commit's author. Issues this run filed join the parent for SHA; issues already open keep their parent. A
+      parent reopens when one of its issues reopens, and closes when only flaky issues are left open.
+
+GITHUB_REPOSITORY, GITHUB_RUN_ID and GITHUB_REF_NAME come from the Actions environment.
 """
 import argparse
 import datetime as dt
@@ -27,6 +32,7 @@ BOT = "github-actions[bot]"
 WINDOW = dt.timedelta(days=7)
 MAX_REOPENS = 2
 FLAKY = "flaky"
+PARENT = "ci-parent"
 
 
 def gh(method, path, fields=None, paginate=False):
@@ -143,6 +149,67 @@ def reconcile(api, repo, prefix, labels, failures_json, run_url, run_id):
     return closed
 
 
+def first_seen_sha(body):
+    """The commit whose run filed the issue, from the bisect metadata the report writes once."""
+    m = re.search(r"^bad_sha=(\w+)", body or "", re.M)
+    return m[1] if m else ""
+
+
+def find_or_create_parent(api, repo, sha, branch, run_url, open_parents):
+    """The open parent for failures first seen at sha, created and assigned to the commit's author if missing."""
+    title = f"CI failures first seen at {sha[:7]}"
+    for p in open_parents:
+        if p["title"].startswith(title):
+            return p
+    commit = api("GET", f"repos/{repo}/commits/{sha}")
+    author = (commit.get("author") or {}).get("login")
+    pr = re.search(r"\(#(\d+)\)\s*$", commit["commit"]["message"].split("\n")[0])
+    title += f" (#{pr[1]})" if pr else ""
+    title += f" on {branch}" if branch != "main" else ""
+    body = (f"Tests started failing at {sha[:7]}{f' (#{pr[1]})' if pr else ''}, first seen in {run_url}. "
+            "Each failing test is a sub-issue; this issue closes when they are all fixed.\n\n"
+            "Please comment within a working day: fixing it (link the PR), reverting it, or not yours (say why, "
+            "and reassign). The first commit a failure is seen at is usually, not always, the cause; each "
+            "sub-issue lists the suspect range.")
+    fields = {"title": title, "body": body, "labels": [PARENT]}
+    try:
+        parent = api("POST", f"repos/{repo}/issues", dict(fields, assignees=[author] if author else []))
+    except subprocess.CalledProcessError:  # the author cannot be assigned: mention them instead
+        parent = api("POST", f"repos/{repo}/issues", dict(fields, body=f"@{author} {body}" if author else body))
+    open_parents.append(parent)
+    return parent
+
+
+def group(api, repo, prefix, labels, sha, branch, run_url):
+    """Attach this run's new issues to their commit's parent, then reopen and close parents."""
+    issues = [
+        i for i in api("GET", f"repos/{repo}/issues?state=open&labels={quote(','.join(labels))}&per_page=100",
+                       paginate=True) if i["title"].startswith(prefix) and "pull_request" not in i
+    ]
+    open_parents = api("GET", f"repos/{repo}/issues?state=open&labels={PARENT}&per_page=100", paginate=True)
+    new = [i for i in issues if not i.get("parent_issue_url") and first_seen_sha(i["body"]) == sha]
+    if new:
+        parent = find_or_create_parent(api, repo, sha, branch, run_url, open_parents)
+        for i in new:
+            api("POST", f"repos/{repo}/issues/{parent['number']}/sub_issues", {"sub_issue_id": i["id"]})
+    # A sub-issue that reopened (failed again within the reopen window) reopens its parent.
+    for url in {i["parent_issue_url"] for i in issues if i.get("parent_issue_url")}:
+        parent = api("GET", "repos/" + url.split("/repos/", 1)[1])
+        if parent["state"] == "closed":
+            api("PATCH", f"repos/{repo}/issues/{parent['number']}", {"state": "open"})
+            api("POST", f"repos/{repo}/issues/{parent['number']}/comments",
+                {"body": f"🔁 A sub-issue failed again in {run_url}; reopened."})
+            open_parents.append(parent)
+    for parent in open_parents:
+        subs = api("GET", f"repos/{repo}/issues/{parent['number']}/sub_issues?per_page=100")
+        left = [s for s in subs if s["state"] == "open"]
+        if subs and all(any(l["name"] == FLAKY for l in s["labels"]) for s in left):
+            note = "".join(f"\nStill open as flaky: #{s['number']}" for s in left)
+            api("POST", f"repos/{repo}/issues/{parent['number']}/comments",
+                {"body": f"✅ All sub-issues are fixed as of {run_url}.{note}"})
+            api("PATCH", f"repos/{repo}/issues/{parent['number']}", {"state": "closed", "state_reason": "completed"})
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -153,12 +220,18 @@ def main():
     c = sub.add_parser("reconcile")
     c.add_argument("--prefix", required=True)
     c.add_argument("--failures", default="")
-    for s in (r, c):
+    g = sub.add_parser("group")
+    g.add_argument("--prefix", required=True)
+    g.add_argument("--sha", required=True)
+    for s in (r, c, g):
         s.add_argument("--labels", required=True)
         s.add_argument("--run-url", required=True)
     a = p.parse_args()
     repo = os.environ["GITHUB_REPOSITORY"]
     labels = [l.strip() for l in a.labels.split(",") if l.strip()]
+    if a.cmd == "group":
+        group(gh, repo, a.prefix, labels, a.sha, os.environ.get("GITHUB_REF_NAME", "main"), a.run_url)
+        return
     if a.cmd == "reconcile":
         reconcile(gh, repo, a.prefix, labels, a.failures, a.run_url, int(os.environ["GITHUB_RUN_ID"]))
         return
