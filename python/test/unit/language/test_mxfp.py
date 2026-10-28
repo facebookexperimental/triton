@@ -1,6 +1,6 @@
 import pytest
 import torch
-from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
+from triton.tools.mxfp import MXFP4Tensor, MXFP6Tensor, MXScaleTensor
 
 
 class MXBaseTest:
@@ -93,6 +93,52 @@ class TestMXFP4Tensor(MXBaseTest):
 
     def test_empty_tensor(self, device):
         tensor = MXFP4Tensor(torch.tensor([], device=device))
+        assert tensor.to(torch.float32).numel() == 0
+
+
+class TestMXFP6Tensor(MXBaseTest):
+
+    @pytest.mark.parametrize("K, N", [(64, 128), (128, 256)])
+    @pytest.mark.parametrize("exp_width", [2, 3])
+    def test_roundtrip(self, K, N, device, exp_width):
+        tensor = MXFP6Tensor(size=(K, N), device=device, e=exp_width).random()
+        tensor2 = MXFP6Tensor(tensor.to(torch.float32), e=exp_width)
+        torch.testing.assert_close(tensor.data, tensor2.data)
+
+    @pytest.mark.parametrize("K, N, dim", [(64, 128, 0), (64, 128, 1)])
+    @pytest.mark.parametrize("exp_width", [2, 3])
+    def test_packed_tensor_dense(self, K, N, dim, device, exp_width):
+        tensor = MXFP6Tensor(size=(K, N), device=device, e=exp_width).random()
+        packed = tensor.to_packed_tensor(dim=dim)
+        # Dense storage: exactly 3 bytes per 4 values, no padding byte.
+        assert packed.size(dim) == (K if dim == 0 else N) * 3 // 4
+        assert packed.numel() * 4 == tensor.data.numel() * 3
+        unpacked = tensor.unpack_packed_tensor(packed, dim=dim)
+        torch.testing.assert_close(tensor.data, unpacked)
+
+    @pytest.mark.parametrize("exp_width", [2, 3])
+    def test_dense_group_of_16(self, device, exp_width):
+        # The scaled-dot quantum: 16 values occupy exactly 12 bytes.
+        tensor = MXFP6Tensor(size=(16, ), device=device, e=exp_width).random()
+        packed = tensor.to_packed_tensor(dim=0)
+        assert packed.shape == (12, )
+        torch.testing.assert_close(tensor.data, tensor.unpack_packed_tensor(packed, dim=0))
+
+    @pytest.mark.parametrize("exp_width", [2, 3])
+    def test_zero_values(self, exp_width, device):
+        test_values = torch.tensor([0.0, -0.0], device=device)
+        tensor = MXFP6Tensor(data=test_values, e=exp_width)
+        expected_encodings = torch.tensor([0b000000, 0b100000], dtype=torch.uint8, device=device)
+        assert torch.equal(tensor.data, expected_encodings)
+        torch.testing.assert_close(tensor.to(torch.float32), test_values)
+
+    def test_packing_requires_multiple_of_4(self, device):
+        tensor = MXFP6Tensor(torch.tensor([1, 2, 3], device=device), e=2)
+        with pytest.raises(AssertionError):
+            tensor.to_packed_tensor(dim=0)
+
+    def test_empty_tensor(self, device):
+        tensor = MXFP6Tensor(torch.tensor([], device=device), e=2)
         assert tensor.to(torch.float32).numel() == 0
 
 
