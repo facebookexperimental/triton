@@ -24,6 +24,23 @@ def _is_power_of_two(i):
 
 _get_int_dtype = constexpr_function(core.get_int_dtype)
 
+
+@constexpr_function
+def _next_power_of_two(i):
+    return 1 << (i - 1).bit_length()
+
+
+@constexpr_function
+def _sort_pad(dtype, descending):
+    # A value that sorts after every other.
+    if dtype.is_floating():
+        return float("-inf") if descending else float("inf")
+    bits = dtype.primitive_bitwidth
+    if dtype.is_int_signed():
+        return -(1 << (bits - 1)) if descending else (1 << (bits - 1)) - 1
+    return 0 if descending else (1 << bits) - 1
+
+
 # -----------------------
 # Standard library
 # -----------------------
@@ -482,6 +499,16 @@ def sort_impl(x, k: core.constexpr = None, dim: core.constexpr = None, descendin
         core.static_assert(_is_power_of_two(k), "topk: k must be a power of two")
         core.static_assert(k <= x.shape[_dim], "topk: k must not exceed the size of the selected dimension")
 
+    # An NPOT dim is sorted padded to the next power of two.
+    n: core.constexpr = x.shape[_dim]
+    core.static_assert(_is_power_of_two(x.numel // n), "sort over an NPOT dim other than the sorted one is unsupported")
+    if not _is_power_of_two(n):
+        p: core.constexpr = _next_power_of_two(n)
+        lanes = core.arange(0, p)
+        idx = core.broadcast_to(core.reshape(core.minimum(lanes, n - 1), [1] * _dim + [p]), x.shape[:-1] + [p])
+        pad = core.full(idx.shape, _sort_pad(x.dtype, descending), x.dtype)
+        x = core.where(lanes < n, core.gather(x, idx, _dim), pad)
+
     log_n: core.constexpr = _log2(x.shape[_dim])
     log_k: core.constexpr = log_n if k is None else _log2(k)
 
@@ -507,6 +534,9 @@ def sort_impl(x, k: core.constexpr = None, dim: core.constexpr = None, descendin
 
         # reshape back:
         x = core.reshape(h, x.shape[:-1] + [2**log_k])
+    if k is None and not _is_power_of_two(n):
+        idx = core.broadcast_to(core.reshape(core.arange(0, n), [1] * _dim + [n]), x.shape[:-1] + [n])
+        x = core.gather(x, idx, _dim)
     return x
 
 
