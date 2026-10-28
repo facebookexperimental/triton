@@ -725,8 +725,8 @@ def async_dot_scaled(
         shape.
 
     A_format : str
-        Element format string for operand A: "e2m1" for packed FP4, or "e4m3"
-        and "e5m2" for FP8.
+        Element format string for operand A: "e2m1" for packed FP4, "e2m3"
+        and "e3m2" for packed FP6, or "e4m3" and "e5m2" for FP8.
 
     B_scale : tlx.buffered_tensor
         Scaling factors for operand B, same semantics as A_scale.
@@ -763,7 +763,7 @@ def async_dot_scaled(
     version = 5 if cuda_compute_capability >= 100 else 3
     assert version == 5, "async_dot_scaled is only available on Blackwell"
 
-    supported_formats = {"e2m1", "e4m3", "e5m2"}
+    supported_formats = {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}
     A_format = tl._unwrap_if_constexpr(A_format)
     B_format = tl._unwrap_if_constexpr(B_format)
     assert A_format in supported_formats, f"Unsupported A_format: {A_format}"
