@@ -6,7 +6,7 @@ compile time.
 
 TODO: cover the config variants dropped with the tutorial copy of this kernel --
 RESCALE_OPT/USE_WHERE, the FAST_FIXED opt-out, NUM_CTAS=2, USE_WARP_BARRIER, and
-the backward HEAD_DIM x NUM_CTAS matrix. Nothing tests them today.
+backward HEAD_DIM=64 at either NUM_CTAS. Nothing tests them today.
 """
 import pytest
 import torch
@@ -82,3 +82,45 @@ def test_flash_attn_bwd_bf16_accuracy(Z, H, N_CTX, HEAD_DIM):
     for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
         rel_l2 = torch.linalg.vector_norm(got.float() - want.float()) / torch.linalg.vector_norm(want.float())
         assert rel_l2 < REL_PRECISION[torch.bfloat16]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_ctas", [1, 2])
+def test_flash_attn_bwd_pinned_config(num_ctas, causal, monkeypatch):
+    """The other backward tests run only the config autotuning picks, so pin each CTA count here.
+
+    Spills pass every correctness check, so also read local memory off the compiled kernel.
+    The 2-CTA kernel has regressed this way before: losing its single-warp-specialize
+    dispatch left values live across setmaxnreg, which ptxas spilled.
+    """
+    import triton
+    from triton.tlx.ops import flash_attn as tlx_flash_attn
+    from triton.tlx.ops.kernels.flash_attn import sm100
+
+    config = (sm100.configs_bwd_1cta if num_ctas == 1 else sm100.configs_bwd_2cta)[0]
+    compiled = []
+
+    def tuned_bwd_recording(space):
+        tuner = triton.autotune(configs=[config], key=["N_CTX", "HEAD_DIM"])(sm100._attn_bwd_ws)
+        run = tuner.run
+
+        def recording_run(*args, **kwargs):
+            compiled.append(run(*args, **kwargs))
+            return compiled[-1]
+
+        tuner.run = recording_run
+        return tuner
+
+    monkeypatch.setattr(sm100, "_tuned_bwd", tuned_bwd_recording)
+    q, k, v = _qkv(2, 4, 1024, 128, torch.bfloat16, requires_grad=True)
+    rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
+    do = torch.randn_like(q)
+
+    tlx_flash_attn(q, k, v, causal=causal, space="smoke").backward(do)
+    _sdpa(rq, rk, rv, causal).backward(do)
+
+    assert len(compiled) == 1
+    for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
+        rel_l2 = torch.linalg.vector_norm(got.float() - want.float()) / torch.linalg.vector_norm(want.float())
+        assert rel_l2 < REL_PRECISION[torch.bfloat16]
+    assert compiled[0].n_spills == 0, f"_attn_bwd_ws uses {4 * compiled[0].n_spills} bytes of local memory per thread"
