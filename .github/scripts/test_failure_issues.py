@@ -239,14 +239,15 @@ class GroupApi:
             return self.issues[number()]
         self.writes.append((method, path, fields))
         if method == "POST" and url.path == f"repos/{REPO}/issues":
-            parent = dict(fields, number=900, id=9000, state="open", labels=[{"name": fi.PARENT}])
-            self.issues[900] = parent
+            n = 900 + sum(any(l["name"] == fi.PARENT for l in i["labels"]) for i in self.issues.values())
+            parent = dict(fields, number=n, id=n * 10, state="open", labels=[{"name": fi.PARENT}])
+            self.issues[n] = parent
             return parent
         if method == "POST" and url.path.endswith("/sub_issues"):
             child = next(i for i in self.issues.values() if i["id"] == fields["sub_issue_id"])
             child["parent_issue_url"] = f"https://api.github.com/repos/{REPO}/issues/{number()}"
         if method == "PATCH":
-            self.issues[number()]["state"] = fields["state"]
+            self.issues[number()].update(fields)
         return {}
 
 
@@ -268,9 +269,19 @@ def test_a_failure_belongs_to_the_commit_where_it_was_first_seen():
     fi.group(api, REPO, PREFIX, LABELS, "b" * 40, "main", RUN + "200")
     assert api.issues[1]["parent_issue_url"].endswith("/issues/800")
     assert "parent_issue_url" not in api.issues[4]
-    new_parent = api.issues[900]
-    assert new_parent["assignees"] == ["author"] and new_parent["title"].endswith("(#77)")
-    assert all(api.issues[n]["parent_issue_url"].endswith("/issues/900") for n in (2, 3))
+    new_parent = next(i for n, i in api.issues.items() if n != 800 and i["labels"] == [{"name": fi.PARENT}])
+    assert new_parent["assignees"] == ["author"] and new_parent["title"] == "Test failures at bbbbbbb (#77): J"
+    assert all(api.issues[n]["parent_issue_url"].endswith(f"/issues/{new_parent['number']}") for n in (2, 3))
+
+
+def test_a_commit_has_one_parent_whichever_suites_fail():
+    lit = "[nightly] Compiler LIT Tests / lit-tests / "
+    api = GroupApi([failing(1, "b"), dict(failing(2, "b"), title=lit + "a.mlir")])
+    fi.group(api, REPO, PREFIX, LABELS, "b" * 40, "main", RUN + "200")
+    fi.group(api, REPO, lit, LABELS, "b" * 40, "main", RUN + "201")
+    parents = [i for i in api.issues.values() if any(l["name"] == fi.PARENT for l in i["labels"])]
+    assert len(parents) == 1 and parents[0]["title"] == "Test failures at bbbbbbb (#77): J, LIT"
+    assert api.issues[2]["parent_issue_url"].endswith(f"/issues/{parents[0]['number']}")
 
 
 def test_a_parent_stays_open_exactly_while_a_non_flaky_sub_issue_is_open():
