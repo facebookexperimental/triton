@@ -3,7 +3,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Matchers.h"
-#include "triton/Analysis/IntegerRange.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -1270,12 +1269,6 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
   visitors.append<TransOpAxisInfoVisitor>();
 }
 
-LogicalResult AxisInfoAnalysis::initialize(Operation *top) {
-  if (failed(collectNonNegativeDividends(top, nonNegativeDividends)))
-    return top->emitError("signed div/rem range analysis failed");
-  return SparseForwardDataFlowAnalysis::initialize(top);
-}
-
 void AxisInfoAnalysis::setToEntryState(dataflow::Lattice<AxisInfo> *lattice) {
   propagateIfChanged(lattice, lattice->join(AxisInfo::getPessimisticValueState(
                                   lattice->getAnchor())));
@@ -1569,6 +1562,22 @@ unsigned ModuleAxisInfoAnalysis::getMaskAlignment(Value mask, unsigned axis) {
     LDBG("-- " << axisStr);
   });
   return alignment;
+}
+
+AxisInfoAnalysis::LoadCallback
+ModuleAxisInfoAnalysis::getDefaultAnalysisLoader(ModuleOp mod) {
+  AxisInfoAnalysis::LoadCallback loader = nullptr;
+  for (Dialect *dialect : mod.getContext()->getLoadedDialects()) {
+    const auto *interface =
+        dialect->getRegisteredInterface<AxisInfoDialectInterface>();
+    if (!interface)
+      continue;
+    if (auto candidate = interface->getAnalysisLoader(mod)) {
+      assert(!loader && "multiple axis-info providers for one target");
+      loader = candidate;
+    }
+  }
+  return loader ? loader : AxisInfoAnalysis::loadDefaultAnalysis;
 }
 
 void ModuleAxisInfoAnalysis::initialize(

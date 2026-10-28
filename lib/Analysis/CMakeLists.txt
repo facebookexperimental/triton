@@ -1,6 +1,5 @@
 add_triton_library(TritonAnalysis
   AxisInfo.cpp
-  IntegerRange.cpp
   Allocation.cpp
   BufferRegion.cpp
   BufferIndexAnalysis.cpp

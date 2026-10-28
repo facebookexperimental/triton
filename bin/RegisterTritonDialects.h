@@ -76,6 +76,7 @@ void registerTestScopeIdAllocationPass();
 
 namespace mlir::triton::AMD {
 void registerSchedulingBarrierExternalModel(mlir::DialectRegistry &registry);
+void registerAxisInfoInterface(mlir::DialectRegistry &registry);
 } // namespace mlir::triton::AMD
 
 inline void registerTritonDialects(mlir::DialectRegistry &registry) {
@@ -208,4 +209,5 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::triton::gluon::GluonDialect, mlir::triton::tlx::TLXDialect>();
 
   mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
+  mlir::triton::AMD::registerAxisInfoInterface(registry);
 }
