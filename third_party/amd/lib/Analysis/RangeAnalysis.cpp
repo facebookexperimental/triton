@@ -225,12 +225,15 @@ IntegerValueRange TritonIntegerRangeAnalysis::getRangeAt(
   if (inferred.isUninitialized())
     return inferred;
   ConstantIntRanges range = inferred.getValue();
+  // assume y > 5; if cond { assume z < 3; x = y + z; }
+  // Both bounds apply to x; z's bound does not apply in the sibling branch.
   auto it = assumptions.find(value);
   if (it != assumptions.end())
     for (const IntegerAssumption &assumption : it->second)
       if (domInfo->properlyDominates(assumption.owner, use))
         range = range.intersection(assumption.range);
   // Intersection keeps signed and unsigned bounds separate; reconcile them.
+  // For 0 <= x <= 1024, signed bounds can be [0, 1024] while umax is UINT_MAX.
   range = range.intersection(
       ConstantIntRanges::fromSigned(range.smin(), range.smax()));
   range = range.intersection(
@@ -297,6 +300,7 @@ void TritonIntegerRangeAnalysis::defaultTransferFunc(
 
   dataflow::IntegerValueRangeLattice *lattice =
       resultsLattices[result.getResultNumber()];
+  // Join takes the range union. Monotone updates are required for convergence.
   ChangeResult changed = lattice->join(incomingRange);
   LLVM_DEBUG({
     OpPrintingFlags flags;
@@ -323,6 +327,7 @@ LogicalResult TritonIntegerRangeAnalysis::visitOperation(
       continue;
     }
     // Local assumptions must not narrow the defining value for sibling uses.
+    // Intersection with fixed assumption bounds preserves monotonicity.
     auto local = std::make_unique<dataflow::IntegerValueRangeLattice>(value);
     (void)local->join(getRangeAt(value, op, lattice->getValue()));
     inputs.push_back(local.get());
