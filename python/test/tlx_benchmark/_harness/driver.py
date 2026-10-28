@@ -27,7 +27,6 @@ import argparse
 import contextlib
 import dataclasses
 import functools
-import os
 from typing import Any, Callable, Iterable, Optional
 
 from . import report as report_mod
@@ -268,17 +267,20 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     # `measure` converts every timed iteration through flop_count, so both
     # providers come back in TFLOP/s with the dispersion measured on that
     # quantity rather than on latency.
+    tlx_notes, ref_notes = [], []
     tlx = measure(prep.tlx_fn, flop_count=prep.flop_count, replicates=DEFAULT_REPLICATES,
-                  grad_to_none=prep.grad_to_none, mode="gpu_events")
+                  grad_to_none=prep.grad_to_none, mode="gpu_events", notes=tlx_notes)
     ref = None
     if prep.ref_fn is not None:
         ref = measure(prep.ref_fn, flop_count=prep.flop_count, replicates=DEFAULT_REPLICATES,
-                      grad_to_none=prep.grad_to_none, mode="gpu_events")
+                      grad_to_none=prep.grad_to_none, mode="gpu_events", notes=ref_notes)
     host_us = host_overhead_us(prep.tlx_fn)
     ref_host_us = host_overhead_us(prep.ref_fn) if prep.ref_fn is not None else None
 
     result = verdict.judge(case, tlx, ref, tlx_host_us=host_us, compile_stat=compile_stat, correct=correct,
                            accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops)
+    # After the verdict's notes, which lead the nightly failure summary.
+    result.notes += [f"tlx: {n}" for n in tlx_notes] + [f"ref: {n}" for n in ref_notes]
     result.flop_count = prep.flop_count
     result.ref_host_us = ref_host_us
     result.extra = dict(prep.extra)
@@ -404,7 +406,7 @@ def main(bench, argv=None) -> int:
     parser = argparse.ArgumentParser(description=bench.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="auto", help="GPU index, or 'auto' (default) for the least-used one")
     parser.add_argument(
-        "--space", choices=("heuristic", "full", "smoke"), default=None,
+        "--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
         help=f"autotune search space (default {resolve_space(bench, None)}); the default is what this op "
         "uses by default, and measuring anything else measures a path users do not take")
     parser.add_argument("--head", type=int, default=None, metavar="N",
@@ -453,7 +455,8 @@ def main(bench, argv=None) -> int:
     # op dispatch independently derives the architecture from its input device.
     select(device)
     if device is not None:
-        os.environ[device.visibility_env] = str(device.index)
+        if not device.pin():
+            print(f"device: gpu{device.index} has no known UUID; not pinning it")
         print(f"device: gpu{device.index} {device.name} "
               f"({'least used' if args.device == 'auto' else 'requested'}, "
               f"{device.memory_used_mib:.0f} MiB in use)")

@@ -93,8 +93,13 @@ docs/sg_execution_times.rst
 .vscode
 .vs
 
-# Symlink after pip install
-python/triton/tlx
+# TLX op library. `ops` is symlinked in from third_party/tlx/ops after pip
+# install. The package initializer and optional PyTorch adapter are real
+# committed files; the latter remains lazy so importing Triton does not pull in
+# torch.
+python/triton/tlx/*
+!python/triton/tlx/__init__.py
+!python/triton/tlx/pytorch.py
 
 # Vim
 *.swp
