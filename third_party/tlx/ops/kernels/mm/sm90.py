@@ -364,7 +364,7 @@ def _prune_swap_configs(configs, nargs, **kwargs):
     ]
 
 
-def _swap_heuristic_config(M, N, K, *, invariance=None):
+def _swap_heuristic_config(M, N, K, b_row_major=True, *, invariance=None):
     # Arguments are the problem's (M, N, K).
     num_sms = _get_num_sms()
     block_m, block_n, block_k = 128, _swap_block_n(M), 128
@@ -378,26 +378,72 @@ def _swap_heuristic_config(M, N, K, *, invariance=None):
     return [_config(block_m, block_n, _deepest_ring(block_m, block_n, block_k, split_k), 1, split_k, block_k, True)]
 
 
-def heuristic_config(M, N, K, *, invariance=None):
+# Sub-wave heuristic cost model, fitted on H100 to the pinned-config timings of
+# the M ~ 706 merge-net shapes: MMA work on the busiest SM over a per-tile-width
+# efficiency, plus a split-K reduction's DRAM traffic and launch. Narrow tiles
+# re-read B from SMEM more often per MMA: 128x64 does 128x128's per-SM work 58%
+# slower on 706x2560x20992. A two-piece 192 tile matches a 128-wide one.
+_TILE_EFFICIENCY = {256: 1.0, 192: 1.0, 128: 1.0, 64: 0.6}
+_SM_MACS_PER_S = 2.8e12
+_DRAM_BYTES_PER_S = 2.5e12
+_REDUCE_LAUNCH_S = 1e-6
+
+
+def _heuristic_cost(M, N, K, block_m, block_n, split_k, num_sms):
+    units = _mn_tiles(M, N, block_m, block_n) * split_k
+    macs = triton.cdiv(units, num_sms) * block_m * block_n * triton.cdiv(triton.cdiv(K, 64), split_k) * 64
+    seconds = macs / (_SM_MACS_PER_S * _TILE_EFFICIENCY[block_n])
+    if split_k > 1:
+        # Write and re-read the fp32 partials, write C.
+        seconds += (2 * split_k * M * N * 4 + M * N * 2) / _DRAM_BYTES_PER_S + _REDUCE_LAUNCH_S
+    return seconds
+
+
+def _heuristic_stages(block_m, block_n, split_k):
+    num_stages = 8 if block_n == 64 else 6
+    while num_stages > 2 and not _fits_smem(block_m, block_n, num_stages, split_k):
+        num_stages -= 1
+    return num_stages
+
+
+def heuristic_config(M, N, K, b_row_major=True, *, invariance=None):
+    """One config per shape. B's layout matters because the non-power-of-two
+    tiles need a K-major B; the default, row-major, never picks them."""
     num_sms = _get_num_sms()
     block_m, block_n = (256, 128) if M > N else (128, 256)
-    if _mn_tiles(M, N, block_m, block_n) >= num_sms:
+    wide_tiles = _mn_tiles(M, N, block_m, block_n)
+    if wide_tiles >= 2 * num_sms:
         # Square shapes favor 128x256 tiles. The 4-stage ring (the SMEM max)
         # wins at large K but regresses some tall shapes with K <= 512.
         return [_config(block_m, block_n, 4 if K >= 1024 else 3)]
-    # Too few output tiles to fill the GPU: shrink the tile, then split K.
-    block_m, block_n = 128, 128 if N > 64 else 64
-    mn_tiles = _mn_tiles(M, N, block_m, block_n)
+    # Under two waves of the wide tile, wave quantization dominates: take the
+    # power-of-two tile and K split the cost model rates fastest, preferring
+    # fewer splits, then the larger tile, on a tie.
+    tiles = [(block_m, block_n), (128, 128), (128, 64)] if N > 64 else [(128, 64)]
     fixed = gemm_fixed_split_k(invariance)
-    if fixed is not None:
-        split_k = fixed
-    else:
-        split_k = max([s for s in _SPLIT_K_CHOICES if mn_tiles * s <= num_sms and _split_k_valid(K, s)], default=1)
-    num_stages = 6 if block_n == 128 else 8
-    while num_stages > 2 and not _fits_smem(block_m, block_n, num_stages, split_k):
-        num_stages -= 1
+    candidates = []
+    for bm, bn in tiles:
+        for split_k in (1, ) + _SPLIT_K_CHOICES if fixed is None else (fixed, ):
+            if fixed is None and split_k > 1 and (_mn_tiles(M, N, bm, bn) * split_k > num_sms
+                                                  or not _split_k_valid(K, split_k)):
+                continue
+            candidates.append((_heuristic_cost(M, N, K, bm, bn, split_k, num_sms), split_k, -bm * bn, bm, bn))
+    cost, split_k, _, block_m, block_n = min(candidates)
+    # The two-piece 192 tile, for a K-major B: on a tie with 128x128, and against
+    # a wider tile only when it cuts the cost by 10% (706x3072x12288: 100.8 vs
+    # 118.6 us; 706x20992x512, 6% by the model: 33.4 vs 32.8 us). The 96 tile at
+    # best ties a power-of-two tile here.
+    if not b_row_major and N > 128 and split_k == 1:
+        margin = 0.9 if block_m * block_n > 128 * 128 else 1.0
+        if _heuristic_cost(M, N, K, 128, 192, 1, num_sms) <= margin * cost:
+            block_m, block_n = 128, 192
+    num_stages = _heuristic_stages(block_m, block_n, split_k)
     assert _fits_smem(block_m, block_n, num_stages, split_k)
-    return [_config(block_m, block_n, num_stages, group_size_m=1, split_k=split_k)]
+    # Row-major tile order only where the full-space prune keeps it (N <= 512,
+    # and split-K, whose configs are all G=1); otherwise the grouped order wins
+    # (706x2560x2560: 23.6 vs 29.2 us, 706x2560x20992: 130 vs 167 us).
+    group_size_m = 1 if split_k > 1 or N <= 512 else 8
+    return [_config(block_m, block_n, num_stages, group_size_m=group_size_m, split_k=split_k)]
 
 
 @triton.jit
@@ -856,7 +902,13 @@ def _prune_small_k_configs(configs, nargs, **kwargs):
 def _small_k_heuristic_config(M, N, K):
     if M <= _SWAP_AB_MAX_M:
         return [_small_k_config(16, 32, 64, 2, 2)]
-    return [_small_k_config(128, 128, 64, 8, 3)]
+    # The largest tile that still gives two waves of CTAs, else the smallest:
+    # one-tile-per-CTA work has no persistent loop to balance it (706x256x256:
+    # 64x64 runs 3.6 us, 128x128 4.8 us; 706x3536x128: 64x128 5.6, 128x128 6.2).
+    for bm, bn, warps in ((128, 128, 8), (64, 128, 4), (64, 64, 4)):
+        if _mn_tiles(M, N, bm, bn) >= 2 * _get_num_sms():
+            break
+    return [_small_k_config(bm, bn, 64, warps, 3)]
 
 
 @triton.jit
@@ -1185,7 +1237,8 @@ def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, strid
         num_tiles = triton.cdiv(kernel_m, meta["BM"]) * triton.cdiv(kernel_n, meta["BN"]) * meta["SPLIT_K"]
         return (min(num_sms, num_tiles), )
 
-    shape = (M, N, K) if space == "heuristic" else None
+    # The heuristic picks non-power-of-two tiles only for a K-major B.
+    shape = (M, N, K, b_row_major) if space == "heuristic" else None
     kernel = _tuned(space, shape, swap_ab, bias is not None, invariance=invariance)
     kernel[grid](
         _descriptor(a_src),
