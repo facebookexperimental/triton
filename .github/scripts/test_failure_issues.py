@@ -215,6 +215,10 @@ def test_reconcile_closes_nothing_without_a_per_test_signal():
 # --- group ---
 
 
+def labels_of(issue):
+    return {l["name"] for l in issue["labels"]}
+
+
 class GroupApi:
     """Issues, parents and sub-issue links as the group step sees them; records writes."""
 
@@ -226,17 +230,15 @@ class GroupApi:
         url = urlsplit(path)
         number = lambda: int(re.search(r"issues/(\d+)", url.path)[1])
         if method == "GET" and url.path == f"repos/{REPO}/issues":
-            want = set(parse_qs(url.query)["labels"][0].split(","))
-            return [
-                i for i in self.issues.values() if i["state"] == "open" and want <= {l["name"]
-                                                                                     for l in i["labels"]}
-            ]
+            args = {k: v[0] for k, v in parse_qs(url.query).items()}
+            want = set(args["labels"].split(","))
+            return [i for i in self.issues.values() if i["state"] == args["state"] and want <= labels_of(i)]
         if method == "GET" and url.path.endswith("/sub_issues"):
             return [i for i in self.issues.values() if i.get("parent_issue_url", "").endswith(f"/issues/{number()}")]
-        if method == "GET" and "/commits/" in url.path:
-            return {"author": {"login": "author"}, "commit": {"message": "Break things (#77)\n\nbody"}}
+        if method == "GET" and "/commits/" in url.path:  # a commit whose author is not linked to a GitHub user
+            return {"author": None, "commit": {"message": "Break things (#77)\n\nbody"}}
         if method == "GET":
-            return self.issues[number()]
+            return self.issues.get(number(), {"user": {"login": "author"}})  # #77 is the commit's PR
         self.writes.append((method, path, fields))
         if method == "POST" and url.path == f"repos/{REPO}/issues":
             n = 900 + sum(any(l["name"] == fi.PARENT for l in i["labels"]) for i in self.issues.values())
@@ -279,9 +281,16 @@ def test_a_commit_has_one_parent_whichever_jobs_fail():
     api = GroupApi([failing(1, "b"), dict(failing(2, "b"), title=lit + "a.mlir")])
     fi.group(api, REPO, PREFIX, LABELS, "b" * 40, "main", RUN + "200")
     fi.group(api, REPO, lit, LABELS, "b" * 40, "main", RUN + "201")
-    parents = [i for i in api.issues.values() if any(l["name"] == fi.PARENT for l in i["labels"])]
+    parents = [i for i in api.issues.values() if fi.PARENT in labels_of(i)]
     assert len(parents) == 1 and parents[0]["title"] == "Test failures at bbbbbbb (#77): j, lit-tests"
     assert api.issues[2]["parent_issue_url"].endswith(f"/issues/{parents[0]['number']}")
+
+    # A passing run closed the parent; a later run of the same commit finds a new failure.
+    parents[0]["state"] = "closed"
+    api.issues[3] = failing(3, "b")
+    fi.group(api, REPO, PREFIX, LABELS, "b" * 40, "main", RUN + "202")
+    assert [i for i in api.issues.values() if fi.PARENT in labels_of(i)] == parents
+    assert parents[0]["state"] == "open" and api.issues[3]["parent_issue_url"] == api.issues[2]["parent_issue_url"]
 
 
 def test_a_parent_stays_open_exactly_while_a_non_flaky_sub_issue_is_open():

@@ -156,21 +156,32 @@ def first_seen_sha(body):
 
 
 def find_or_create_parent(api, repo, sha, job, branch, run_url, open_parents):
-    """The open parent for failures first seen at sha, with job in its title. A new parent is assigned to the
-    commit's author. Parents are found by a marker in the body, since their titles grow as jobs join."""
+    """The parent for failures first seen at sha, with job in its title, reopened if a passing run closed it. A new
+    parent is assigned to the author of the commit's PR. Parents are found by a marker in the body, since their
+    titles grow as jobs join."""
     marker = f"<!-- ci-parent sha={sha} -->"
-    parent = next((p for p in open_parents if marker in (p.get("body") or "")), None)
+    recent = api("GET", f"repos/{repo}/issues?state=closed&labels={PARENT}&sort=updated&direction=desc&per_page=100")
+    parent = next((p for p in open_parents + recent if marker in (p.get("body") or "")), None)
     if parent:
-        head, jobs = parent["title"].split(": ", 1)
+        if parent["state"] == "closed":
+            api("PATCH", f"repos/{repo}/issues/{parent['number']}", {"state": "open"})
+            api("POST", f"repos/{repo}/issues/{parent['number']}/comments",
+                {"body": f"🔁 More tests failed at this commit in {run_url}; reopened."})
+            parent["state"] = "open"
+            open_parents.append(parent)
+        head, _, jobs = parent["title"].partition(": ")
         names, on, rest = jobs.partition(" on ")
-        if job not in names.split(", "):
+        if jobs and job not in names.split(", "):  # a person may have retitled it
             title = f"{head}: {names}, {job}{on}{rest}"
             api("PATCH", f"repos/{repo}/issues/{parent['number']}", {"title": title})
             parent["title"] = title
         return parent
     commit = api("GET", f"repos/{repo}/commits/{sha}")
-    author = (commit.get("author") or {}).get("login")
     pr = re.search(r"\(#(\d+)\)\s*$", commit["commit"]["message"].split("\n")[0])
+    # The PR's author wrote the change; a commit's author can be unlinked to any GitHub user. A PR is also an
+    # issue, so the issues permission is enough to read it.
+    author = api("GET", f"repos/{repo}/issues/{pr[1]}")["user"]["login"] if pr else (commit.get("author")
+                                                                                     or {}).get("login")
     at = f"{sha[:7]}{f' (#{pr[1]})' if pr else ''}"
     title = f"Test failures at {at}: {job}" + (f" on {branch}" if branch != "main" else "")
     body = (f"Tests started failing at {at}, first seen in {run_url}. Each failing test is a sub-issue; this "
