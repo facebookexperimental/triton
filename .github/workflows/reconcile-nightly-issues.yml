@@ -32,6 +32,11 @@ on:
         required: false
         type: string
         default: ""
+      title_prefixes:
+        description: JSON array of title prefixes, used instead of title_prefix when not empty.
+        required: false
+        type: string
+        default: ""
       labels:
         description: Comma-separated labels of this job's issues.
         required: false
@@ -57,9 +62,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PREFIX: ${{ inputs.title_prefix || format('[nightly] {0} / {1} / ', inputs.workflow_name, inputs.job_name) }}
+          PREFIXES: ${{ inputs.title_prefixes }}
           LABELS: ${{ inputs.labels }}
           FAILURES: ${{ inputs.failures }}
           RUN_URL: ${{ inputs.run_url }}
         run: |
-          python3 .github/scripts/failure_issues.py reconcile --prefix "$PREFIX" --labels "$LABELS" \
+          args=(--prefix "$PREFIX")
+          if [[ -n "$PREFIXES" ]]; then
+            readarray -t prefixes < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["PREFIXES"])))')
+            args=()
+            for prefix in "${prefixes[@]}"; do args+=(--prefix "$prefix"); done
+          fi
+          python3 .github/scripts/failure_issues.py reconcile "${args[@]}" --labels "$LABELS" \
             --failures "$FAILURES" --run-url "$RUN_URL"

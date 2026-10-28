@@ -50,3 +50,16 @@ MEMCHECK_MIXED = MEMCHECK_API_ONLY.replace(
     "=========     at kernel+0x10 in k.py:3\n"
     "========= ERROR SUMMARY: 3 errors",
 )
+# Errors outside the kernel under test on the B200 runner: a cuBLAS launch
+# synccheck could not track (from a test's torch reference matmul), and a
+# runtime-API out-of-memory error under memcheck.
+OUTSIDE_THE_KERNEL = """\
+========= COMPUTE-SANITIZER
+========= Internal Sanitizer Error: The Sanitizer encountered an error while launching nvjet_sm100_hsh_64x8_64x16_1x4_h_bz_NNT and didn't track the launch. Errors might go undetected. (One or more of the parameters is invalid)
+=========
+========= Program hit cudaErrorMemoryAllocation (error 2) due to "out of memory" on CUDA API call to cudaMalloc.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::CUDACachingAllocator::Native::DeviceCachingAllocator::malloc [0x519b0] in libc10_cuda.so
+=========
+========= ERROR SUMMARY: 2 errors
+"""

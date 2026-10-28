@@ -10,19 +10,23 @@ def render(results: list[dict], kernel: str | None, cmd: list[str]) -> str:
         f"Kernel: `{kernel or 'all'}`  ",
         f"Command: `{' '.join(cmd)}`",
         "",
-        "| Tool | Outcome | Device errors | Host API errors | Test exit |",
-        "|---|---|---|---|---|",
+        "| Tests | Tool | Outcome | Device errors | Host API errors | Untracked launches | Test exit |",
+        "|---|---|---|---|---|---|---|",
     ]
     for result in results:
         count = "-" if result["count"] is None else result["count"]
         exit_code = "timeout" if result["timed_out"] else result["returncode"]
-        api_errors = result.get("api_errors", "-")
-        lines.append(f"| {result['tool']} | {result['outcome']} | {count} | {api_errors} | {exit_code} |")
-    lines += ["", "`none` means the sanitizer reported nothing for what the test ran; it is not proof of no race."]
+        tests = " ".join(arg for arg in result["cmd"] if arg.split("::")[0].endswith(".py")) or "-"
+        lines.append(f"| `{tests}` | {result['tool']} | {result['outcome']} | {count} | "
+                     f"{result.get('api_errors', '-')} | {result.get('sanitizer_errors', '-')} | {exit_code} |")
+    lines += [
+        "", "`none` means the sanitizer reported nothing for what the test ran; it is not proof of no race. "
+        "A non-zero test exit means some tests did not run to the end, so their kernels may be unchecked."
+    ]
     for result in results:
         if result["outcome"] != "findings":
             continue
-        lines += ["", f"### {result['tool']}", "", "```"]
+        lines += ["", f"### {result['tool']}: `{' '.join(result['cmd'])}`", "", "```"]
         lines += result["report"] or ["(no report lines parsed; see the uploaded log)"]
         lines += ["```"]
         for finding in result.get("findings", []):

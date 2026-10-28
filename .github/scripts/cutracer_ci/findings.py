@@ -73,12 +73,12 @@ def add_to_summary(entry: dict, tool: str, lines: list[str]) -> None:
         entry["summary"] += "\n\n(more reports in the run's logs)"
 
 
-def failure_list(results: list[dict], cmd: list[str], title_prefix: str, job: str) -> list[dict]:
+def failure_list(results: list[dict], title_prefix: str, job: str) -> list[dict]:
     """The run's findings, one entry per kernel and source file, for the issue workflows."""
     entries: dict[str, dict] = {}
     for result in results:
         tool = result["tool"]
-        repro = f"cutracer compute-sanitizer --tool {tool} -- {shlex.join(cmd)}"
+        repro = f"cutracer compute-sanitizer --tool {tool} -- {shlex.join(result['cmd'])}"
         if result["outcome"] == "infra":
             why = "timed out" if result["timed_out"] else "produced no summary"
             finding = f"{tool} incomplete"
@@ -88,6 +88,10 @@ def failure_list(results: list[dict], cmd: list[str], title_prefix: str, job: st
         if result["outcome"] != "findings":
             continue
         for report in result["reports"] or [{"header": f"{result['count']} error(s)"}]:
+            # A report in a kernel the run did not compile is in a library the
+            # test called, such as cuDNN for a reference result, not in Triton.
+            if report.get("kernel") and "kernels" in result and report["kernel"] not in result["kernels"]:
+                continue
             finding, line = finding_id(report), describe(tool, report)
             entry = entries.setdefault(finding, failure_entry(finding, title_prefix, job, "", repro, False))
             raw = entry["raw_failure_ids"].split("\n") if entry["raw_failure_ids"] else []

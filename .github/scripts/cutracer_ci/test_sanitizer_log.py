@@ -1,7 +1,8 @@
 import pytest
 
 import sanitizer_log
-from sample_logs import MEMCHECK_API_ONLY, MEMCHECK_MIXED, RACECHECK_CLEAN, RACECHECK_HAZARD, SYNCCHECK_CLEAN, SYNCCHECK_ERROR
+from sample_logs import (MEMCHECK_API_ONLY, MEMCHECK_MIXED, OUTSIDE_THE_KERNEL, RACECHECK_CLEAN, RACECHECK_HAZARD,
+                         SYNCCHECK_CLEAN, SYNCCHECK_ERROR)
 from sanitizer_log import classify, device_reports, report_lines
 
 
@@ -14,13 +15,23 @@ def test_racecheck_clean_is_none():
 
 
 def test_error_summary_tools():
-    assert classify("synccheck", SYNCCHECK_ERROR) == {"outcome": "findings", "count": 1, "api_errors": 0}
-    assert classify("memcheck", SYNCCHECK_CLEAN) == {"outcome": "none", "count": 0, "api_errors": 0}
+    assert classify("synccheck",
+                    SYNCCHECK_ERROR) == {"outcome": "findings", "count": 1, "api_errors": 0, "sanitizer_errors": 0}
+    assert classify("memcheck",
+                    SYNCCHECK_CLEAN) == {"outcome": "none", "count": 0, "api_errors": 0, "sanitizer_errors": 0}
 
 
-def test_host_api_errors_are_not_device_findings():
-    assert classify("memcheck", MEMCHECK_API_ONLY) == {"outcome": "none", "count": 0, "api_errors": 2}
-    assert classify("memcheck", MEMCHECK_MIXED) == {"outcome": "findings", "count": 1, "api_errors": 2}
+# A finding is an error in device code the test launched. Errors the sanitizer
+# also counts but that lie outside that code -- a failed host API call, a launch
+# it could not track -- must not become issues against a kernel.
+def test_errors_outside_the_kernel_are_not_device_findings():
+    assert classify("memcheck",
+                    MEMCHECK_API_ONLY) == {"outcome": "none", "count": 0, "api_errors": 2, "sanitizer_errors": 0}
+    assert classify("memcheck",
+                    MEMCHECK_MIXED) == {"outcome": "findings", "count": 1, "api_errors": 2, "sanitizer_errors": 0}
+    assert classify("synccheck",
+                    OUTSIDE_THE_KERNEL) == {"outcome": "none", "count": 0, "api_errors": 1, "sanitizer_errors": 1}
+    assert device_reports(OUTSIDE_THE_KERNEL) == []
 
 
 @pytest.mark.parametrize("log", ["", "========= COMPUTE-SANITIZER\n", "Segmentation fault\n"])
