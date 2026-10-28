@@ -164,7 +164,7 @@ def test_hstu_cross_attn_stream_k(dtype, num_softmax_heads, lengths_kv, lengths_
     _run(lengths_kv, lengths_q, heads=2, num_softmax_heads=num_softmax_heads, dtype=dtype,
          check_backward=num_softmax_heads > 0)
     assert calls
-    # Every raised handoff flag is reset by the program that consumes it, so the next launch starts clean.
+    # Each split tile's merge resets its handoff counter, so the next launch starts clean.
     for flags in _forward_stream_k._FLAGS.values():
         assert int(flags.abs().sum()) == 0
 

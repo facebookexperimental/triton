@@ -2,12 +2,13 @@
 
 Work is the flattened space of (sequence, head, q tile, 64-row KV block) units. One program per CU takes an equal
 contiguous range of a cost space in which every q tile is ``ph`` units of fixed cost followed by its KV blocks, and
-walks it as segments of single q tiles. A segment covering a whole tile stores the output; a program's first
-segment, when it starts mid-tile, stores a normalized fp32 partial (and base-2 LSE) in slot p and raises flag p.
-The program that holds the tile's first block merges those partials in registers and stores the output.
+walks it as segments of single q tiles. A segment covering a whole tile stores the output. The programs sharing a
+split tile each leave a normalized fp32 partial (and base-2 LSE) and count in at the counter of the program holding
+the tile's first block; the last to count in merges the partials and stores the output. Usually that is the holder
+of the first block, which reaches the tile last and merges its own share from registers.
 
-Owners wait only on higher-numbered programs, so every program must be resident at once: the grid is one
-workgroup per CU, and each workgroup takes a CU's LDS. The flags are self-cleaning (each is reset by its consumer),
+No program waits on another, so a launch completes however few of its programs are resident at a time (a CU mask,
+or CUs held by other kernels, only slows it down). The counters are self-cleaning (each merge resets its counter),
 so one zeroed buffer per (device, stream) serves every eager launch, and each captured graph keeps its own across
 replays.
 """
@@ -719,52 +720,66 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
     row_ok = (start_m + local_m) < seq_len_q
     offs_d = _lanes(HEAD_DIM)
     mma_st: tl.constexpr = _mma()
-    # Fixup: the program holding a tile's first block folds in the partials of the later programs covering the
-    # rest of it (each such partial is that program's first segment, in slot p).
+    # Handoff for a q tile split over programs p_lo (holding its first block) .. p_hi: each leaves a normalized partial
+    # and counts in at Flags[p_lo]; whoever counts in last merges the partials in program order and stores the
+    # output. No program waits on another, so progress never depends on which programs are resident.
     mid = b0 > 0
-    v_last = tl.load(tab + Z_PAD + 2 + z) + t_lin * (nb + ph) + ph + nb - 1
-    p_hi = tl.where((b0 == 0) & (b1 < nb), _owner(v_last, W, P).to(tl.int32), p)
+    split = mid | (b1 < nb)
+    owner = split & (b0 == 0)
+    v0 = tl.load(tab + Z_PAD + 2 + z) + t_lin * (nb + ph) + ph
+    p_lo = tl.where(mid, _owner(v0, W, P).to(tl.int32), p)
+    p_hi = tl.where(split, _owner(v0 + nb - 1, W, P).to(tl.int32), p)
+    # With fewer units than programs some ranges are empty and never count in. (With the fixed tile cost every
+    # range spans >= 6 cost positions, so none is.)
+    n_prod = tl.where(W >= P, p_hi - p_lo, (p_hi + 1) * W // P - (p_lo + 1) * W // P)
+    # The owner reaches the tile at the end of its range and the others at the start of theirs, so usually all of
+    # them have counted in and it merges from registers without leaving a partial.
+    seen = tl.atomic_add(Flags + p, 0, sem="acquire", scope="gpu", mask=owner)
+    publish = mid | (owner & (seen != n_prod))
+    # The owner's partial gets its own slot: slot p may still hold this program's first-segment partial.
+    slot = tl.where(mid, p, P + p).to(tl.int64)
+    # Rows past the sequence hold finite values (their q rows load as zeros) that the merge never stores.
+    tl.store(_part_ptrs(Part + slot * (BLOCK_M * HEAD_DIM)), _to_part(tlx.require_layout(acc, mma_st)), mask=publish)
     if IS_SOFTMAX:
-        m = tlx.release_layout(lse)
-        l = tl.full([BLOCK_M], 1.0, tl.float32)
-    for pp in range(p + 1, p_hi + 1):
-        # With fewer units than programs some ranges are empty and raise no flag. (With the fixed tile cost every
-        # range spans >= 6 cost positions, so none is.)
-        if (W >= P) or ((pp + 1) * W // P > pp * W // P):
-            while tl.atomic_cas(Flags + pp, 1, 0, sem="acquire", scope="gpu") != 1:
-                pass
-            tl.debug_barrier()
-            x = _from_part(tl.load(_part_ptrs(Part + pp.to(tl.int64) * (BLOCK_M * HEAD_DIM))))
+        tl.store(PartLse + slot * BLOCK_M + local_m, lse, mask=row_ok & publish)
+    local_m = _wait_stores(local_m)
+    tl.debug_barrier()
+    arrived = tl.atomic_add(Flags + p_lo, 1, sem="acq_rel", scope="gpu", mask=publish)
+    merge = (owner & (seen == n_prod)) | (publish & (arrived == n_prod))
+    if merge:
+        if mid:
+            acc = _from_part(tl.load(_part_ptrs(Part + (P + p_lo).to(tl.int64) * (BLOCK_M * HEAD_DIM))))
             if IS_SOFTMAX:
-                lse_s = tl.load(PartLse + pp.to(tl.int64) * BLOCK_M + local_m, mask=row_ok, other=0.0)
-                m_new = tl.maximum(m, lse_s)
-                c_old = tl.math.exp2(m - m_new)
-                c_s = tl.math.exp2(lse_s - m_new)
-                acc = acc * c_old[:, None] + x * c_s[:, None]
-                l = l * c_old + c_s
-                m = m_new
-            else:
-                acc = acc + x
-    if IS_SOFTMAX:
-        acc = acc * (1.0 / l)[:, None]
-        lse = m + tl.math.log2(l)
-    final = b0 == 0
-    slot = p.to(tl.int64)
-    # Both stores are issued with disjoint masks; a branch here costs registers across the epilogue.
+                lse = tl.load(PartLse + (P + p_lo).to(tl.int64) * BLOCK_M + local_m, mask=row_ok, other=0.0)
+        if IS_SOFTMAX:
+            m = tlx.release_layout(lse)
+            l = tl.full([BLOCK_M], 1.0, tl.float32)
+        for pp in range(p_lo + 1, p_hi + 1):
+            if (W >= P) or ((pp + 1) * W // P > pp * W // P):
+                x = _from_part(tl.load(_part_ptrs(Part + pp.to(tl.int64) * (BLOCK_M * HEAD_DIM))))
+                if IS_SOFTMAX:
+                    lse_s = tl.load(PartLse + pp.to(tl.int64) * BLOCK_M + local_m, mask=row_ok, other=0.0)
+                    m_new = tl.maximum(m, lse_s)
+                    c_old = tl.math.exp2(m - m_new)
+                    c_s = tl.math.exp2(lse_s - m_new)
+                    acc = acc * c_old[:, None] + x * c_s[:, None]
+                    l = l * c_old + c_s
+                    m = m_new
+                else:
+                    acc = acc + x
+        if IS_SOFTMAX:
+            acc = acc * (1.0 / l)[:, None]
+            lse = m + tl.math.log2(l)
+        tl.atomic_xchg(Flags + p_lo, 0, sem="relaxed", scope="gpu")
+    final = (not split) | merge
     # Register-local store layout (as the dense kernel's epilogue): no LDS staging, no staging addresses.
     out_layout: tl.constexpr = tlx.layout(shape=((32, 2, 8), (8, 8)), stride=((128, 8, 4096), (1, 16)))
     o_ptrs = Out + row0 * stride_om + off_h * stride_oh + (local_m[:, None] * stride_om + offs_d[None, :])
     o_mask = (row_ok & final)[:, None] & (offs_d[None, :] < HEAD_DIM)
     tl.store(tlx.require_layout(o_ptrs, out_layout), tlx.require_layout(acc.to(Out.dtype.element_ty), out_layout),
              mask=tlx.require_layout(o_mask, out_layout))
-    # Rows past the sequence hold finite values (their q rows load as zeros) that the owner never stores.
-    tl.store(_part_ptrs(Part + slot * (BLOCK_M * HEAD_DIM)), _to_part(tlx.require_layout(acc, mma_st)), mask=not final)
     if IS_SOFTMAX:
         tl.store(M + row0 * stride_mm + off_h + local_m * stride_mm, lse, mask=row_ok & final)
-        tl.store(PartLse + slot * BLOCK_M + local_m, lse, mask=row_ok & (not final))
-    local_m = _wait_stores(local_m)
-    tl.debug_barrier()
-    tl.atomic_xchg(Flags + p, 1, sem="release", scope="gpu", mask=mid)
     return u + (b1 - b0)
 
 
@@ -863,7 +878,7 @@ _FLAGS = {}
 
 
 def _flags(device: torch.device, num_programs: int) -> torch.Tensor:
-    """Zeroed handoff flags for launches on the current stream; every raised flag is consumed (reset to 0)."""
+    """Zeroed handoff counters for launches on the current stream; the merge of each split tile resets its counter."""
     if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         # Traced through (export under AOTI_LOWER): a cached tensor would leak out of the trace. Captured: graphs
         # share a capture stream but may replay concurrently, so each takes flags from its own pool.
@@ -887,8 +902,7 @@ def stream_k_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, Z: int
 def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets: torch.Tensor,
                  seq_offsets_q: torch.Tensor, alpha: float, attn_scale: torch.Tensor, G: int, out: torch.Tensor,
                  M: Optional[torch.Tensor], num_cus: int) -> None:
-    """Writes `out` and, for softmax (`M` given), the base-2 LSE `M`. Launches one program per CU: they must all
-    become resident (no persistent kernel or CU mask keeping CUs from this launch), or the fixup waits forever."""
+    """Writes `out` and, for softmax (`M` given), the base-2 LSE `M`. Launches one program per CU."""
     H, D = q.shape[1], q.shape[2]
     Z = seq_offsets.numel() - 1
     is_softmax = M is not None
@@ -898,8 +912,8 @@ def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets:
         return
     P = num_cus
     z_pad = 1 << (max(Z, 2) - 1).bit_length()
-    part = torch.empty((P, BLOCK_M, D), device=q.device, dtype=torch.float32)
-    part_lse = torch.empty((P, BLOCK_M), device=q.device, dtype=torch.float32)
+    part = torch.empty((2 * P, BLOCK_M, D), device=q.device, dtype=torch.float32)
+    part_lse = torch.empty((2 * P, BLOCK_M), device=q.device, dtype=torch.float32)
     tab = torch.empty((P, 2 * z_pad + 4), device=q.device, dtype=torch.int32)
     m_arg = M if is_softmax else part_lse
     _hstu_cross_attn_fwd_stream_k[(P, )](
