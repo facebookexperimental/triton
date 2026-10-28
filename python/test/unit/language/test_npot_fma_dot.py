@@ -27,13 +27,19 @@ def _dot_kernel(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, PREC
 
 @requires_gpu
 @requires_npot
-@pytest.mark.parametrize("K, dtype, prec", [(24, torch.float16, None), (24, torch.float32, "ieee")])
+@pytest.mark.parametrize("K, dtype, prec", [(24, torch.float16, None), (24, torch.float32, "ieee"),
+                                            (32, torch.float32, "ieee")])
 def test_npot_fma_dot_k(K, dtype, prec):
     M, N = 64, 64
     torch.manual_seed(0)
     a = torch.randn(M, K, device="cuda", dtype=dtype)
     b = torch.randn(K, N, device="cuda", dtype=dtype)
     c = torch.empty(M, N, device="cuda", dtype=torch.float32)
+    if K == 24:
+        # The 64x24 A operand has no legal shared memdesc to stage through.
+        with pytest.raises(RuntimeError, match="'tt.dot' op on an NPOT tensor is unsupported"):
+            _dot_kernel[(1, )](a, b, c, M=M, N=N, K=K, PREC=prec)
+        return
     h = _dot_kernel[(1, )](a, b, c, M=M, N=N, K=K, PREC=prec)
     ttgir = h.asm["ttgir"]
     assert not any(mma in ttgir for mma in ("nvidia_mma", "warp_group_dot", "tc_gen5_mma")), "expected the FMA path"

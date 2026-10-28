@@ -497,7 +497,58 @@ def test_visibility_variable_follows_the_vendor():
     from _harness.denoise import AMD, NVIDIA, Device
 
     assert Device(NVIDIA, 2, "NVIDIA B200").visibility_env == "CUDA_VISIBLE_DEVICES"
-    assert Device(AMD, 2, "MI350X").visibility_env == "HIP_VISIBLE_DEVICES"
+    assert Device(AMD, 2, "MI350X").visibility_env == "ROCR_VISIBLE_DEVICES"
+
+
+def test_pin_by_uuid_never_by_smi_index(monkeypatch):
+    from _harness.denoise import AMD, NVIDIA, Device
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    assert Device(NVIDIA, 2, "NVIDIA B200", uuid="GPU-abc").pin()
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-abc"
+
+    # denoise.sh exports HIP_VISIBLE_DEVICES=4; HIP would apply it on top of the
+    # ROCR pin and see no GPU at all.
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "4")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    assert not Device(AMD, 2, "MI350X").pin()
+    assert Device(AMD, 2, "MI350X", uuid="GPU-46c1d72dcdc11989").pin()
+    assert os.environ["ROCR_VISIBLE_DEVICES"] == "GPU-46c1d72dcdc11989"
+    assert "HIP_VISIBLE_DEVICES" not in os.environ and "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
+# rocminfo lists GPU agents in a different order from rocm-smi's cards, as on a
+# real MI350 host, so matching by position instead of PCI bus picks the wrong GPU.
+_ROCM_SMI_VRAM_BUS = """device,PCI Bus,VRAM Total Memory (B),VRAM Total Used Memory (B)
+card0,0000:08:00.0,309220868096,30000000000
+card1,0000:88:00.0,309220868096,808349696
+"""
+_ROCMINFO = """Agent 1
+  Uuid:                    CPU-XX
+  Device Type:             CPU
+Agent 2
+  Uuid:                    GPU-46c1d72dcdc11989
+  Device Type:             GPU
+  BDFID:                   34816
+Agent 3
+  Uuid:                    GPU-be8bd961d1e61412
+  Device Type:             GPU
+  BDFID:                   2048
+"""
+
+
+def test_amd_devices_get_the_rocr_uuid_of_their_pci_bus(monkeypatch):
+    import _harness.denoise as denoise_mod
+
+    monkeypatch.setattr(denoise_mod, "vendor", lambda: denoise_mod.AMD)
+    monkeypatch.setattr(denoise_mod, "_rocm", lambda args: _ROCM_SMI_VRAM_BUS if "--showbus" in args else None)
+    monkeypatch.setattr(denoise_mod, "_rocminfo", lambda: _ROCMINFO)
+    monkeypatch.setattr(denoise_mod, "_amd_name", lambda index: "MI350X")
+
+    card0, card1 = denoise_mod.list_devices()
+    assert [(d.index, d.uuid) for d in (card0, card1)] == [(0, "GPU-be8bd961d1e61412"), (1, "GPU-46c1d72dcdc11989")]
+    assert denoise_mod.select_device("auto").uuid == "GPU-46c1d72dcdc11989"
 
 
 def test_sampler_join_does_not_shadow_thread_internals():

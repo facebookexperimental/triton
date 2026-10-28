@@ -1,0 +1,43 @@
+{{def_kernel("A", "B")}}
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+
+    {{tma_descriptor("desc_a", "A",
+        [BLOCK_M, BLOCK_K] if A_ROW_MAJOR else [BLOCK_K, BLOCK_M],
+        [0, 1] if A_ROW_MAJOR else [1, 0]
+    )}}
+    {{tma_descriptor("desc_b", "B",
+        [BLOCK_K, BLOCK_N] if B_ROW_MAJOR else [BLOCK_N, BLOCK_K],
+        [0, 1] if B_ROW_MAJOR else [1, 0]
+    )}}
+
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    first_pid_m = (pid // num_pid_in_group) * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    # TMA coordinates must be int32; a dynamic M makes the tile ids int64.
+    offs_m = (pid_m * BLOCK_M).to(tl.int32)
+    offs_n = (pid_n * BLOCK_N).to(tl.int32)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = (k * BLOCK_K).to(tl.int32)
+        if A_ROW_MAJOR:
+            a = desc_a.load([offs_m, offs_k])
+        else:
+            a = desc_a.load([offs_k, offs_m]).T
+        if B_ROW_MAJOR:
+            b = desc_b.load([offs_k, offs_n])
+        else:
+            b = desc_b.load([offs_n, offs_k]).T
+        acc = tl.dot(a, b, acc)
+
+    # A pointer store: a TMA store would need its descriptor built on the
+    # device (Inductor has no host-side descriptors for outputs), which costs
+    # this one-tile kernel more than the store saves.
+    {{store_output(("offs_m", "offs_n"), "acc", indent_width=4, val_shape=("BLOCK_M", "BLOCK_N"), block_indexing=True)}}

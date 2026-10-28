@@ -568,7 +568,11 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
   }
   if (packedAxis)
     shape[*packedAxis] *= 2;
-  if (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout)) {
+  // Flag off keeps upstream's allocation size (no pow2 rounding).
+  static const bool allowNpot =
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+  if (allowNpot &&
+      (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout))) {
     unsigned tileRank = getCGALayout(layout).getRank();
     size_t firstTileDim = shape.size() > tileRank ? shape.size() - tileRank : 0;
     for (size_t i = firstTileDim; i < shape.size(); ++i) {
@@ -1672,6 +1676,24 @@ void NvidiaMmaEncodingAttr::print(AsmPrinter &printer) const {
   maybePrintCGALayout(printer, getCGALayout());
 
   printer << ", instrShape = [" << getInstrShape() << "]}>";
+}
+
+LogicalResult
+NvidiaMmaEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                              unsigned versionMajor, unsigned,
+                              ArrayRef<unsigned>, CGAEncodingAttr,
+                              ArrayRef<unsigned> instrShape) {
+  // toLinearLayout turns the instruction M and N into identity1D repeat
+  // counts, which must be powers of two.
+  if (instrShape.size() < 2)
+    return success();
+  unsigned mIdx = versionMajor == 3 ? 0 : instrShape.size() - 2;
+  if (!llvm::isPowerOf2_32(instrShape[mIdx]) ||
+      !llvm::isPowerOf2_32(instrShape[mIdx + 1]))
+    return emitError() << "NVIDIA MMA instrShape with an NPOT M or N is not "
+                          "yet supported, got instrShape = ["
+                       << instrShape << "]";
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -3044,6 +3066,10 @@ LogicalResult DotOperandEncodingAttr::verify(
     if (kWidth == 0 && (parentAttr.isAmpere() || parentAttr.isHopper()))
       return emitError() << "ttg.dot_op kWidth parameter is mandatory for "
                             "Ampere or Hopper MMA parent";
+    if (kWidth != 0 && !llvm::isPowerOf2_32(kWidth))
+      return emitError() << "ttg.dot_op NPOT kWidth parameter is not yet "
+                            "supported for Ampere or Hopper MMA parent, got: "
+                         << kWidth;
     if (opIdx != 0 && parentAttr.isHopper())
       return emitError()
              << "ttg.dot_op opIdx parameter must be 0 for "
@@ -4694,6 +4720,38 @@ bool triton::gpu::isInnermostContiguous(MemDescType type, unsigned numElems) {
   actual = actual.transposeOuts(revOut).flattenOuts();
 
   return actual.getNumConsecutiveInOut() >= numElems;
+}
+
+bool triton::gpu::isContiguousSharedMemoryLayout(MemDescType type) {
+  auto layout = dyn_cast<SwizzledSharedEncodingAttr>(type.getEncoding());
+  return layout && layout.getOrder().size() == 1 && layout.getVec() == 1 &&
+         layout.getPerPhase() == 1 && layout.getMaxPhase() == 1 &&
+         type.getShape() == dropPipeliningDim(type.getAllocShape(), layout);
+}
+
+LogicalResult triton::gpu::verifyMBarrierOpInterface(Operation *op) {
+  for (Value barrier : cast<MBarrierOpInterface>(op).getBarriers()) {
+    auto type = cast<MemDescType>(barrier.getType());
+    if (!(type.getElementType().isInteger(64) && type.getRank() == 1 &&
+          type.getShape()[0] <= lookupNumCTAs(op)))
+      return op->emitOpError("barrier allocation must be a descriptor of "
+                             "Nxi64 type with N <= number of CTAs");
+    if (!isContiguousSharedMemoryLayout(type))
+      return op->emitOpError("barrier must have a contiguous shared-memory "
+                             "layout without subviews");
+    auto cgaLayout = getCGALayout(type.getEncoding()).getLinearLayout();
+    auto kBlock = StringAttr::get(op->getContext(), "block");
+    int i = 0;
+    for (const auto &basis : cgaLayout.getBases().lookup(kBlock)) {
+      if (basis[0] != 0 && basis[0] != int64_t(1) << i)
+        return op->emitOpError(
+            "broadcasted cluster barriers require bases to be the sequence "
+            "1, 2, 4, 8, ... perhaps with zero bases interleaved.");
+      if (basis[0] != 0)
+        ++i;
+    }
+  }
+  return success();
 }
 
 LinearLayout triton::gpu::inferReshapeLinearLayout(TensorOrMemDesc srcTy,

@@ -6,6 +6,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/StrUtil.h"
+#include "unittest/Util/ScopedAllowNpot.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/Signals.h"
 #include <gmock/gmock.h>
@@ -180,6 +181,7 @@ TEST_F(LinearLayoutConversionsTest, SimpleBlocked) {
 }
 
 TEST_F(LinearLayoutConversionsTest, NpotFmaDotUsesModularIdentity) {
+  ScopedAllowNpot npot;
   auto parent =
       blocked({1, 1}, {1, 32}, {1, 4}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
   auto encoding = dot(parent, /*idx=*/0, /*kWidth=*/0);
@@ -192,6 +194,7 @@ TEST_F(LinearLayoutConversionsTest, NpotFmaDotUsesModularIdentity) {
 }
 
 TEST_F(LinearLayoutConversionsTest, NpotMfmaUsesModularIdentity) {
+  ScopedAllowNpot npot;
   auto encoding = mfma(/*version=*/4, /*warps=*/{4, 1},
                        /*instrShape=*/{32, 32, 16}, /*isTransposed=*/false);
   auto layout = toLinearLayout({128, 96}, encoding);
@@ -407,7 +410,7 @@ TEST_F(LinearLayoutConversionsTest, Blocked4D) {
                                    {3, 2, 1, 0}));
   EXPECT_EQ(ll, LinearLayout(
                     {
-                        {S("register"), {{0, 0, 0, 0}, {0, 0, 0, 0}}},
+                        {S("register"), {}},
                         {S("lane"),
                          {{0, 0, 0, 0},
                           {0, 0, 0, 0},
@@ -2718,6 +2721,7 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlocked) {
 }
 
 TEST_F(LinearLayoutConversionsTest, SliceOfBlockedPreservesNpotSize) {
+  ScopedAllowNpot npot;
   auto parent = blocked({1, 4}, {4, 8}, {4, 1}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
   auto layout = toLinearLayout({48}, slice(parent, 0));
 

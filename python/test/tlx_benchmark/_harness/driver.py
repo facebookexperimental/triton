@@ -27,7 +27,6 @@ import argparse
 import contextlib
 import dataclasses
 import functools
-import os
 from typing import Any, Callable, Iterable, Optional
 
 from . import report as report_mod
@@ -456,7 +455,8 @@ def main(bench, argv=None) -> int:
     # op dispatch independently derives the architecture from its input device.
     select(device)
     if device is not None:
-        os.environ[device.visibility_env] = str(device.index)
+        if not device.pin():
+            print(f"device: gpu{device.index} has no known UUID; not pinning it")
         print(f"device: gpu{device.index} {device.name} "
               f"({'least used' if args.device == 'auto' else 'requested'}, "
               f"{device.memory_used_mib:.0f} MiB in use)")

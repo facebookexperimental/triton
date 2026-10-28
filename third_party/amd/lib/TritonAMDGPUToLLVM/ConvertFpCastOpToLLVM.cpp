@@ -7,8 +7,8 @@
 //  - software fallback conversion paths for FP32/FP16/BF16/FP8 variants,
 //  - hardware-accelerated packed conversion paths selected by ISA family
 //    (CDNA3, CDNA4, GFX1250+),
-//  - round-mode aware handling (RTNE/RTZ), saturation, NaN/Inf and subnormal
-//    semantics.
+//  - round-mode aware handling (RTNE/RTZ/RS), saturation, NaN/Inf and
+//    subnormal semantics.
 //
 //===----------------------------------------------------------------------===//
 
@@ -2432,6 +2432,164 @@ struct FpToFpOpConversion
     return elemsPerThread[order.back()];
   }
 
+  // Lower fp32 -> fp8/fp16/bf16 with stochastic rounding
+  // (RoundingMode::RS) using the CDNA stochastic-rounding conversion
+  // instructions:
+  //   - V_CVT_SR_FP8_F32 / V_CVT_SR_BF8_F32 convert one f32 to an fp8 byte
+  //     selected by byteSel, with a per-element 32-bit seed. The fp8 encoding
+  //     follows the architecture: FNUZ on CDNA3, OCP on CDNA4+.
+  //   - V_CVT_SR_F16_F32 / V_CVT_SR_BF16_F32 (CDNA4) convert one f32 to an
+  //     f16/bf16 word selected by wordSel, with a per-element seed.
+  //   - V_CVT_SR_PK_F16_F32 / V_CVT_SR_PK_BF16_F32 (CDNA5, i.e. gfx1250)
+  //     convert two f32 to a packed f16/bf16 pair with a single seed split
+  //     16/16 between them.
+  // The hardware adds only part of the seed to the source mantissa before
+  // truncating: V_CVT_SR_FP8_F32 adds seed[31:12] (E4M3 discards 20
+  // mantissa bits), V_CVT_SR_BF8_F32 adds seed[31:11] (E5M2 discards 21),
+  // and the f16/bf16 converts discard 13/16 bits (CDNA3/CDNA4 ISA
+  // manuals). Seeds must therefore carry entropy in the consumed high
+  // bits (e.g. a Philox counter-based RNG); a counter or zero-extended
+  // narrow random leaves them all-zero and silently degrades to
+  // truncation toward zero.
+  SmallVector<Value>
+  lowerFpToFpWithStochRounding(triton::FpToFpOp op, OpAdaptor /*adaptor*/,
+                               ConversionPatternRewriter &rewriter, Type elemTy,
+                               MultipleOperandsRange operands,
+                               Location loc) const {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto srcElementType = getElementTypeOrSelf(op.getSrc());
+    auto dstElementType = getElementTypeOrSelf(op.getResult());
+
+    if (!isa<Float32Type>(srcElementType)) {
+      op->emitError("Stochastic rounding only supports fp32 source, got ")
+          << srcElementType;
+      return {};
+    }
+    if (!op.getRbits()) {
+      op->emitError("Stochastic rounding mode requires an rbits operand");
+      return {};
+    }
+
+    bool isE4M3 = isa<Float8E4M3FNType, Float8E4M3FNUZType>(dstElementType);
+    bool isE5M2 = isa<Float8E5M2Type, Float8E5M2FNUZType>(dstElementType);
+    bool isOCPFp8HW = isCDNA4OrHigher(isaFamily);
+    bool isFp16SRHW =
+        isaFamily == ISAFamily::CDNA4 || isaFamily == ISAFamily::GFX1250;
+    if (isa<Float8E4M3FNType, Float8E5M2Type>(dstElementType) && !isOCPFp8HW) {
+      op->emitError("Stochastic rounding to OCP fp8 requires CDNA4 or higher");
+      return {};
+    }
+    if (isa<Float8E4M3FNUZType, Float8E5M2FNUZType>(dstElementType) &&
+        !hasFnuzFp8HW(isaFamily)) {
+      op->emitError("Stochastic rounding to FNUZ fp8 requires CDNA3");
+      return {};
+    }
+    if ((dstElementType.isF16() || dstElementType.isBF16()) && !isFp16SRHW) {
+      op->emitError(
+          "Stochastic rounding to fp16/bf16 requires CDNA4 or higher");
+      return {};
+    }
+    if (!isE4M3 && !isE5M2 && !dstElementType.isF16() &&
+        !dstElementType.isBF16()) {
+      op->emitError("Unsupported stochastic rounding destination type ")
+          << dstElementType;
+      return {};
+    }
+
+    setFunctionAttributes(op);
+
+    // Each operand group holds one (src, seed) element pair.
+    SmallVector<Value> srcVals;
+    SmallVector<Value> seedVals;
+    for (auto it = operands.begin(); it != operands.end(); ++it) {
+      srcVals.push_back((*it)[0]);
+      seedVals.push_back((*it)[1]);
+    }
+    const size_t numRealElements = srcVals.size();
+
+    // Convert 4 elements at a time into one i32, chaining the byte-selecting
+    // SR instructions. Pad with undef; the extra bytes are discarded.
+    if (isE4M3 || isE5M2) {
+      while (srcVals.size() % 4 != 0) {
+        srcVals.push_back(b.undef(f32_ty));
+        seedVals.push_back(b.undef(i32_ty));
+      }
+      SmallVector<Value> outVals;
+      auto fp8x4VecTy = vec_ty(elemTy, 4);
+      for (size_t i = 0; i < srcVals.size(); i += 4) {
+        Value acc = b.undef(i32_ty);
+        for (int j = 0; j < 4; ++j) {
+          if (isE4M3)
+            acc = ROCDL::CvtSrFp8F32Op::create(rewriter, loc, i32_ty,
+                                               srcVals[i + j], seedVals[i + j],
+                                               acc, /*byteSel=*/j);
+          else
+            acc = ROCDL::CvtSrBf8F32Op::create(rewriter, loc, i32_ty,
+                                               srcVals[i + j], seedVals[i + j],
+                                               acc, /*byteSel=*/j);
+        }
+        Value vec = b.bitcast(acc, fp8x4VecTy);
+        for (int j = 0; j < 4; ++j)
+          outVals.push_back(b.extract_element(elemTy, vec, b.i32_val(j)));
+      }
+      outVals.resize(numRealElements);
+      return outVals;
+    }
+
+    // Convert 2 elements at a time into one <2 x f16/bf16>. No ROCDL
+    // dialect ops exist for these; call the intrinsics directly.
+    Type v2Ty = vec_ty(elemTy, 2);
+    while (srcVals.size() % 2 != 0) {
+      srcVals.push_back(b.undef(f32_ty));
+      seedVals.push_back(b.undef(i32_ty));
+    }
+    SmallVector<Value> outVals;
+    // CDNA5 (gfx1250) converts both elements with one packed instruction
+    // fed by a single seed split 16/16; CDNA4 chains two word-selecting
+    // converts with one seed each.
+    bool usePk = isaFamily == ISAFamily::GFX1250;
+    StringRef intrinsic;
+    if (dstElementType.isF16())
+      intrinsic = usePk ? "llvm.amdgcn.cvt.sr.pk.f16.f32"
+                        : "llvm.amdgcn.cvt.sr.f16.f32";
+    else
+      intrinsic = usePk ? "llvm.amdgcn.cvt.sr.pk.bf16.f32"
+                        : "llvm.amdgcn.cvt.sr.bf16.f32";
+    for (size_t i = 0; i < srcVals.size(); i += 2) {
+      Value acc;
+      if (usePk) {
+        // Each packed lane carries 16 seed bits, but f16 discards only 13
+        // mantissa bits (bf16 discards 16). The CDNA5 ISA forms
+        // S0.b32 + S2[15:0] and S1.b32 + S2[31:16] and then converts, so
+        // an unmasked f16 seed would add whole ulps; mask f16 lanes to
+        // the discarded width.
+        int32_t seedMask = dstElementType.isF16() ? 0x1fff : 0xffff;
+        Value lo = b.and_(i32_ty, seedVals[i], b.i32_val(seedMask));
+        Value hi = b.and_(i32_ty, seedVals[i + 1], b.i32_val(seedMask));
+        Value seed = b.or_(i32_ty, lo, b.shl(i32_ty, hi, b.i32_val(16)));
+        acc = LLVM::createLLVMIntrinsicCallOp(
+                  rewriter, loc, intrinsic, v2Ty,
+                  ValueRange{srcVals[i], srcVals[i + 1], seed})
+                  ->getResult(0);
+      } else {
+        acc = b.undef(v2Ty);
+        acc = LLVM::createLLVMIntrinsicCallOp(
+                  rewriter, loc, intrinsic, v2Ty,
+                  ValueRange{acc, srcVals[i], seedVals[i], b.false_val()})
+                  ->getResult(0);
+        acc =
+            LLVM::createLLVMIntrinsicCallOp(
+                rewriter, loc, intrinsic, v2Ty,
+                ValueRange{acc, srcVals[i + 1], seedVals[i + 1], b.true_val()})
+                ->getResult(0);
+      }
+      outVals.push_back(b.extract_element(elemTy, acc, b.i32_val(0)));
+      outVals.push_back(b.extract_element(elemTy, acc, b.i32_val(1)));
+    }
+    outVals.resize(numRealElements);
+    return outVals;
+  }
+
   SmallVector<Value> createDestOps(triton::FpToFpOp op, OpAdaptor adaptor,
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
@@ -2441,6 +2599,10 @@ struct FpToFpOpConversion
     auto dstElementType = getElementTypeOrSelf(op.getResult());
 
     auto roundingMode = op.getRounding();
+    if (roundingMode == RoundingMode::RS)
+      return lowerFpToFpWithStochRounding(op, adaptor, rewriter, elemTy,
+                                          operands, loc);
+
     auto maybeMaxElementsPerThread = getNumContiguousElementsPerThread(op);
     if (!maybeMaxElementsPerThread) {
       op->emitError(

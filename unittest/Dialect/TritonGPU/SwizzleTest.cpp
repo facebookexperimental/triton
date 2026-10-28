@@ -5,6 +5,7 @@
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
+#include "unittest/Util/ScopedAllowNpot.h"
 
 #include "mlir/Support/LLVM.h"
 #include "llvm/Support/Signals.h"
@@ -461,6 +462,7 @@ TEST_F(SwizzleTest, Test64x128F16BlockedLinear32Bank) {
 }
 
 TEST_F(SwizzleTest, MixedLayoutPreservesPow2TileSwizzle) {
+  ScopedAllowNpot npot;
   auto kReg = S("register");
   auto kLane = S("lane");
   auto kWarp = S("warp");

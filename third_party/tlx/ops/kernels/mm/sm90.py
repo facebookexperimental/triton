@@ -364,7 +364,7 @@ def _prune_swap_configs(configs, nargs, **kwargs):
     ]
 
 
-def _swap_heuristic_config(M, N, K, *, invariance=None):
+def _swap_heuristic_config(M, N, K, b_row_major=True, *, invariance=None):
     # Arguments are the problem's (M, N, K).
     num_sms = _get_num_sms()
     block_m, block_n, block_k = 128, _swap_block_n(M), 128
@@ -378,31 +378,100 @@ def _swap_heuristic_config(M, N, K, *, invariance=None):
     return [_config(block_m, block_n, _deepest_ring(block_m, block_n, block_k, split_k), 1, split_k, block_k, True)]
 
 
-def heuristic_config(M, N, K, *, invariance=None):
+# Sub-wave heuristic cost model, fitted on H100 to the pinned-config timings of
+# the M ~ 706 merge-net shapes: MMA work on the busiest SM over a per-tile-width
+# efficiency, plus a split-K reduction's DRAM traffic and launch. Narrow tiles
+# re-read B from SMEM more often per MMA: 128x64 does 128x128's per-SM work 58%
+# slower on 706x2560x20992. A two-piece 192 tile matches a 128-wide one.
+_TILE_EFFICIENCY = {256: 1.0, 192: 1.0, 128: 1.0, 64: 0.6}
+_SM_MACS_PER_S = 2.8e12
+_DRAM_BYTES_PER_S = 2.5e12
+_REDUCE_LAUNCH_S = 1e-6
+
+
+def _heuristic_cost(M, N, K, block_m, block_n, split_k, num_sms):
+    units = _mn_tiles(M, N, block_m, block_n) * split_k
+    macs = triton.cdiv(units, num_sms) * block_m * block_n * triton.cdiv(triton.cdiv(K, 64), split_k) * 64
+    seconds = macs / (_SM_MACS_PER_S * _TILE_EFFICIENCY[block_n])
+    if split_k > 1:
+        # Write and re-read the fp32 partials, write C.
+        seconds += (2 * split_k * M * N * 4 + M * N * 2) / _DRAM_BYTES_PER_S + _REDUCE_LAUNCH_S
+    return seconds
+
+
+def _heuristic_stages(block_m, block_n, split_k):
+    num_stages = 8 if block_n == 64 else 6
+    while num_stages > 2 and not _fits_smem(block_m, block_n, num_stages, split_k):
+        num_stages -= 1
+    return num_stages
+
+
+def heuristic_config(M, N, K, b_row_major=True, *, invariance=None):
+    """One config per shape. B's layout matters because the non-power-of-two
+    tiles need a K-major B; the default, row-major, never picks them."""
     num_sms = _get_num_sms()
     block_m, block_n = (256, 128) if M > N else (128, 256)
-    if _mn_tiles(M, N, block_m, block_n) >= num_sms:
+    wide_tiles = _mn_tiles(M, N, block_m, block_n)
+    if wide_tiles >= 2 * num_sms:
         # Square shapes favor 128x256 tiles. The 4-stage ring (the SMEM max)
         # wins at large K but regresses some tall shapes with K <= 512.
         return [_config(block_m, block_n, 4 if K >= 1024 else 3)]
-    # Too few output tiles to fill the GPU: shrink the tile, then split K.
-    block_m, block_n = 128, 128 if N > 64 else 64
-    mn_tiles = _mn_tiles(M, N, block_m, block_n)
+    # Under two waves of the wide tile, wave quantization dominates: take the
+    # power-of-two tile and K split the cost model rates fastest, preferring
+    # fewer splits, then the larger tile, on a tie.
+    tiles = [(block_m, block_n), (128, 128), (128, 64)] if N > 64 else [(128, 64)]
     fixed = gemm_fixed_split_k(invariance)
-    if fixed is not None:
-        split_k = fixed
-    else:
-        split_k = max([s for s in _SPLIT_K_CHOICES if mn_tiles * s <= num_sms and _split_k_valid(K, s)], default=1)
-    num_stages = 6 if block_n == 128 else 8
-    while num_stages > 2 and not _fits_smem(block_m, block_n, num_stages, split_k):
-        num_stages -= 1
+    candidates = []
+    for bm, bn in tiles:
+        for split_k in (1, ) + _SPLIT_K_CHOICES if fixed is None else (fixed, ):
+            if fixed is None and split_k > 1 and (_mn_tiles(M, N, bm, bn) * split_k > num_sms
+                                                  or not _split_k_valid(K, split_k)):
+                continue
+            candidates.append((_heuristic_cost(M, N, K, bm, bn, split_k, num_sms), split_k, -bm * bn, bm, bn))
+    cost, split_k, _, block_m, block_n = min(candidates)
+    # The two-piece 192 tile, for a K-major B: on a tie with 128x128, and against
+    # a wider tile only when it cuts the cost by 10% (706x3072x12288: 100.8 vs
+    # 118.6 us; 706x20992x512, 6% by the model: 33.4 vs 32.8 us). The 96 tile at
+    # best ties a power-of-two tile here.
+    if not b_row_major and N > 128 and split_k == 1:
+        margin = 0.9 if block_m * block_n > 128 * 128 else 1.0
+        if _heuristic_cost(M, N, K, 128, 192, 1, num_sms) <= margin * cost:
+            block_m, block_n = 128, 192
+    num_stages = _heuristic_stages(block_m, block_n, split_k)
     assert _fits_smem(block_m, block_n, num_stages, split_k)
-    return [_config(block_m, block_n, num_stages, group_size_m=1, split_k=split_k)]
+    # Row-major tile order only where the full-space prune keeps it (N <= 512,
+    # and split-K, whose configs are all G=1); otherwise the grouped order wins
+    # (706x2560x2560: 23.6 vs 29.2 us, 706x2560x20992: 130 vs 167 us).
+    group_size_m = 1 if split_k > 1 or N <= 512 else 8
+    return [_config(block_m, block_n, num_stages, group_size_m=group_size_m, split_k=split_k)]
 
 
 @triton.jit
-def _reduce_split_k_kernel(workspace_ptr, c_ptr, M, N, ROWS_PER_SPLIT, SPLIT_K: tl.constexpr, BLOCK_M: tl.constexpr,
-                           BLOCK_N: tl.constexpr, OUTPUT_DTYPE: tl.constexpr):
+def _bias_vec(bias_ptr, offset, n, stride, SIZE: tl.constexpr, ADD_BIAS: tl.constexpr):
+    """bias[offset:+SIZE] in fp32 for tlx.ops.addmm's (N,) bias (stride 0
+    broadcasts a scalar). Issued before the mainloop so the load overlaps the MMAs."""
+    if ADD_BIAS:
+        idx = offset + tl.arange(0, SIZE)
+        return tl.load(bias_ptr + idx * stride, mask=idx < n, other=0.0).to(tl.float32)
+    else:
+        return tl.zeros((1, ), dtype=tl.float32)
+
+
+@triton.jit
+def _add_bias(acc, bias_vec, ADD_BIAS: tl.constexpr, ALONG_ROWS: tl.constexpr):
+    """acc plus a `_bias_vec` vector, one value per column, or per row when ALONG_ROWS."""
+    if not ADD_BIAS:
+        return acc
+    elif ALONG_ROWS:
+        return acc + bias_vec[:, None]
+    else:
+        return acc + bias_vec[None, :]
+
+
+@triton.jit
+def _reduce_split_k_kernel(workspace_ptr, c_ptr, bias_ptr, M, N, ROWS_PER_SPLIT, stride_bias, SPLIT_K: tl.constexpr,
+                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, OUTPUT_DTYPE: tl.constexpr,
+                           ADD_BIAS: tl.constexpr):
     offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
@@ -410,21 +479,26 @@ def _reduce_split_k_kernel(workspace_ptr, c_ptr, M, N, ROWS_PER_SPLIT, SPLIT_K: 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for s in tl.static_range(SPLIT_K):
         acc += tl.load(workspace_ptr + s * ROWS_PER_SPLIT * N + offs, mask=mask, other=0.0)
+    bias_vec = _bias_vec(bias_ptr, tl.program_id(1) * BLOCK_N, N, stride_bias, BLOCK_N, ADD_BIAS)
+    acc = _add_bias(acc, bias_vec, ADD_BIAS, False)
     tl.store(c_ptr + offs, acc.to(OUTPUT_DTYPE), mask=mask)
 
 
-def _reduce_split_k(workspace, c, M, N, split_k):
+def _reduce_split_k(workspace, c, M, N, split_k, bias=None, stride_bias=0):
     block_m, block_n = 16, 128
     _reduce_split_k_kernel[(triton.cdiv(M, block_m), triton.cdiv(N, block_n))](
         workspace,
         c,
+        c if bias is None else bias,
         M,
         N,
         workspace.shape[0] // split_k,
+        stride_bias,
         SPLIT_K=split_k,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         OUTPUT_DTYPE=_TORCH_TO_TL[c.dtype],
+        ADD_BIAS=bias is not None,
     )
 
 
@@ -432,7 +506,9 @@ def _reduce_post_hook(nargs, exception=None):
     # Autotuning times the split-K partial pass plus its reduction.
     if exception is None and nargs["SPLIT_K"] > 1:
         c = nargs["c_desc"].base
-        _reduce_split_k(nargs["workspace_desc"].base, c, c.shape[0], c.shape[1], nargs["SPLIT_K"])
+        bias = nargs["bias_ptr"] if nargs["ADD_BIAS"] else None
+        _reduce_split_k(nargs["workspace_desc"].base, c, c.shape[0], c.shape[1], nargs["SPLIT_K"], bias,
+                        nargs["stride_bias"])
 
 
 @triton.jit
@@ -507,9 +583,11 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
     b_tail2_desc,
     c_tail_desc,
     c_tail2_desc,
+    bias_ptr,
     M,
     N,
     K,
+    stride_bias,
     NUM_SMS: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
@@ -523,8 +601,11 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
     A_EVICTION: tl.constexpr,
     SPLIT_K: tl.constexpr,
     SWAP_AB: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     block_m_split: tl.constexpr = BM // NUM_MMA_GROUPS
+    # Split-K adds the bias in its reduction instead.
+    TILE_BIAS: tl.constexpr = ADD_BIAS and SPLIT_K == 1
     # A non-power-of-two BN runs as up to three power-of-two pieces (e.g.
     # 192 = 128 + 64), each with its own B ring, WGMMA and output store.
     N0: tl.constexpr = _n_piece(BN, 0)
@@ -626,6 +707,11 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                 offset_cm = offset_am + block_m_split * consumer_id
 
                 if N_TAIL > 0:
+                    # Pieces never run under swap-AB, so the bias runs along the columns.
+                    bias0 = _bias_vec(bias_ptr, offset_bn, N, stride_bias, N0, TILE_BIAS)
+                    bias1 = _bias_vec(bias_ptr, offset_bn + N0, N, stride_bias, N_TAIL, TILE_BIAS)
+                    bias2 = _bias_vec(bias_ptr, offset_bn + N0 + N_TAIL, N, stride_bias, N_TAIL2 if N_TAIL2 > 0 else 8,
+                                      TILE_BIAS and N_TAIL2 > 0)
                     acc0 = tl.zeros((block_m_split, N0), dtype=tl.float32)
                     acc1 = tl.zeros((block_m_split, N_TAIL), dtype=tl.float32)
                     # An unused third piece still needs a placeholder to thread through.
@@ -634,6 +720,10 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                         (k_hi - k_lo) * BK, a, b, b_tail, b_tail2, acc0, acc1, acc2, bars_empty_a, bars_full_a,
                         bars_empty_b, bars_full_b, buf, phase, consumer_id, BK, NUM_STAGES, A_ROW_MAJOR, N_TAIL,
                         N_TAIL2)
+                    acc0 = _add_bias(acc0, bias0, TILE_BIAS, False)
+                    acc1 = _add_bias(acc1, bias1, TILE_BIAS, False)
+                    if N_TAIL2 > 0:
+                        acc2 = _add_bias(acc2, bias2, TILE_BIAS, False)
                     if NPOT_SUBTILE:
                         sub: tl.constexpr = N_TAIL // 2
                         s_0 = tlx.local_view(c_smem_sub, 2 * consumer_id)
@@ -662,6 +752,11 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                         if N_TAIL2 > 0:
                             tlx.async_descriptor_store(c_tail2_desc, slot2, [offset_cm, offset_bn + N0 + N_TAIL])
                 else:
+                    # The bias runs along C's N: the kernel's columns, or its rows under swap-AB.
+                    if SWAP_AB:
+                        bias_vec = _bias_vec(bias_ptr, offset_cm, M, stride_bias, block_m_split, TILE_BIAS)
+                    else:
+                        bias_vec = _bias_vec(bias_ptr, offset_bn, N, stride_bias, BN, TILE_BIAS)
                     acc, buf, phase = _consume_tile(
                         (k_hi - k_lo) * BK,
                         a,
@@ -678,6 +773,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                         A_ROW_MAJOR,
                         B_ROW_MAJOR,
                     )
+                    acc = _add_bias(acc, bias_vec, TILE_BIAS, SWAP_AB)
                     _store_tile(acc, out_desc, c_smem, c_smem_t, offset_cm, offset_bn, split_id, num_pid_m, num_pid_n,
                                 M, consumer_id, block_m_split, BM, BN, SPLIT_K, SWAP_AB, EPILOGUE_SUBTILE)
 
@@ -806,13 +902,19 @@ def _prune_small_k_configs(configs, nargs, **kwargs):
 def _small_k_heuristic_config(M, N, K):
     if M <= _SWAP_AB_MAX_M:
         return [_small_k_config(16, 32, 64, 2, 2)]
-    return [_small_k_config(128, 128, 64, 8, 3)]
+    # The largest tile that still gives two waves of CTAs, else the smallest:
+    # one-tile-per-CTA work has no persistent loop to balance it (706x256x256:
+    # 64x64 runs 3.6 us, 128x128 4.8 us; 706x3536x128: 64x128 5.6, 128x128 6.2).
+    for bm, bn, warps in ((128, 128, 8), (64, 128, 4), (64, 64, 4)):
+        if _mn_tiles(M, N, bm, bn) >= 2 * _get_num_sms():
+            break
+    return [_small_k_config(bm, bn, 64, warps, 3)]
 
 
 @triton.jit
-def _small_k_kernel(a_desc, b_desc, c_desc, workspace_desc, M, N, K, BM: tl.constexpr, BN: tl.constexpr,
-                    BK: tl.constexpr, GROUP_SIZE_M: tl.constexpr, SPLIT_K: tl.constexpr, A_ROW_MAJOR: tl.constexpr,
-                    B_ROW_MAJOR: tl.constexpr):
+def _small_k_kernel(a_desc, b_desc, c_desc, workspace_desc, bias_ptr, M, N, K, stride_bias, BM: tl.constexpr,
+                    BN: tl.constexpr, BK: tl.constexpr, GROUP_SIZE_M: tl.constexpr, SPLIT_K: tl.constexpr,
+                    A_ROW_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr, ADD_BIAS: tl.constexpr):
     pid = tl.program_id(0)
     split_id = tl.program_id(1)
     num_pid_m = tl.cdiv(M, BM)
@@ -825,6 +927,8 @@ def _small_k_kernel(a_desc, b_desc, c_desc, workspace_desc, M, N, K, BM: tl.cons
     offs_m = pid_m * BM
     offs_n = pid_n * BN
     k_lo, k_hi = _k_tile_range(K, split_id, BK, SPLIT_K)
+    # Split-K adds the bias in its reduction instead.
+    bias_vec = _bias_vec(bias_ptr, offs_n, N, stride_bias, BN, ADD_BIAS and SPLIT_K == 1)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(k_lo, k_hi):
         offs_k = k * BK
@@ -841,16 +945,51 @@ def _small_k_kernel(a_desc, b_desc, c_desc, workspace_desc, M, N, K, BM: tl.cons
         # Each split owns a tile-padded slab of num_pid_m * BM rows.
         workspace_desc.store([split_id * num_pid_m * BM + offs_m, offs_n], acc)
     else:
+        acc = _add_bias(acc, bias_vec, ADD_BIAS, False)
         c_desc.store([offs_m, offs_n], acc.to(tlx.dtype_of(c_desc)))
 
 
+# tlx.ops.addmm runs the same kernels with ADD_BIAS, through JIT objects that
+# opt out of the native fast-dispatch cache: with it on, alternating calls
+# that hit different autotune keys (shapes) in one process launched a kernel
+# or config chosen for another key and returned wrong results.
+_ws_kernel_bias = triton.jit(c_cache=False)(matmul_kernel_tma_ws_hopper_cooperative.fn)
+_small_k_kernel_bias = triton.jit(c_cache=False)(_small_k_kernel.fn)
+
+# The bias load's layout conversion takes SMEM scratch that the WS kernel's
+# ring sizing, which fills SMEM, does not leave room for.
+_BIAS_SMEM_HEADROOM = 12 * 1024
+
+
+def _with_bias_headroom(configs):
+    """WS configs with the ring shortened where the bias scratch would not fit."""
+    out = []
+    for c in configs:
+        kw = dict(c.kwargs)
+        while kw["NUM_STAGES"] > 2 and _smem_bytes(kw["BM"], kw["BN"], kw["BK"], kw["NUM_STAGES"], kw["SPLIT_K"],
+                                                   swap_ab=kw["SWAP_AB"]) + _BIAS_SMEM_HEADROOM > _MAX_SMEM:
+            kw["NUM_STAGES"] -= 1
+        out.append(c if kw ==
+                   c.kwargs else triton.Config(kw, num_warps=c.num_warps, num_stages=c.num_stages, pre_hook=c.pre_hook))
+    return out
+
+
+def _bias_prune(prune):
+
+    def prune_with_headroom(configs, nargs, **kwargs):
+        return _with_bias_headroom(prune(configs, nargs, **kwargs))
+
+    return prune_with_headroom
+
+
 @functools.lru_cache(maxsize=None)
-def _tuned_small_k(space, shape=None):
+def _tuned_small_k(space, shape=None, add_bias=False):
+    kernel = _small_k_kernel_bias if add_bias else _small_k_kernel
     if space == "heuristic":
-        return triton.autotune(configs=_small_k_heuristic_config(*shape), key=["M", "N", "K"])(_small_k_kernel)
+        return triton.autotune(configs=_small_k_heuristic_config(*shape), key=["M", "N", "K"])(kernel)
     return triton.autotune(configs=_small_k_configs(), key=["M", "N", "K"],
                            prune_configs_by={"early_config_prune":
-                                             _prune_small_k_configs}, post_hook=_reduce_post_hook)(_small_k_kernel)
+                                             _prune_small_k_configs}, post_hook=_reduce_post_hook)(kernel)
 
 
 @triton.jit
@@ -884,18 +1023,18 @@ def _store_tile(acc, out_desc, c_smem, c_smem_t, offset_cm, offset_bn, split_id,
             )
 
 
-def _tuned(space, shape=None, swap_ab=False, *, invariance=None):
+def _tuned(space, shape=None, swap_ab=False, add_bias=False, *, invariance=None):
     """Autotuned kernel per search space, keyed on the effective fixed schedule.
 
     Every non-empty invariance spec currently maps to the same `SPLIT_K`, so
     `dims("M")`, `dims("K")` and `all()` share one autotuner instead of
     retuning identical schedules.
     """
-    return _tuned_for_fixed(space, shape, swap_ab, gemm_fixed_split_k(invariance))
+    return _tuned_for_fixed(space, shape, swap_ab, gemm_fixed_split_k(invariance), add_bias)
 
 
 @functools.lru_cache(maxsize=None)
-def _tuned_for_fixed(space, shape, swap_ab, fixed):
+def _tuned_for_fixed(space, shape, swap_ab, fixed, add_bias=False):
     prune_configs_by = None
     if space == "heuristic":
         fixed_spec = None if fixed is None else _FIXED_SPEC
@@ -903,7 +1042,8 @@ def _tuned_for_fixed(space, shape, swap_ab, fixed):
             *shape, invariance=fixed_spec)
     elif space == "full":
         configs = _swap_configs() if swap_ab else CONFIGS()
-        prune_configs_by = {"early_config_prune": _prune_swap_configs if swap_ab else _prune_full_configs}
+        prune = _prune_swap_configs if swap_ab else _prune_full_configs
+        prune_configs_by = {"early_config_prune": _bias_prune(prune) if add_bias else prune}
     elif space == "smoke":
         configs = SMOKE_CONFIGS()
     else:
@@ -911,6 +1051,9 @@ def _tuned_for_fixed(space, shape, swap_ab, fixed):
                            "expected 'heuristic', 'full', or 'smoke'")
     if fixed is not None:
         configs = [c for c in configs if c.kwargs.get("SPLIT_K", 1) == fixed]
+    if add_bias:
+        # Also up front: the autotuner skips pruning when one config is left.
+        configs = _with_bias_headroom(configs)
     # Pruning depends on the operand layouts (non-power-of-two tiles need a
     # K-major B), so a config tuned for one layout must not serve another.
     return triton.autotune(
@@ -918,7 +1061,7 @@ def _tuned_for_fixed(space, shape, swap_ab, fixed):
         key=["M", "N", "K", "A_ROW_MAJOR", "B_ROW_MAJOR"],
         prune_configs_by=prune_configs_by,
         post_hook=_reduce_post_hook,
-    )(matmul_kernel_tma_ws_hopper_cooperative)
+    )(_ws_kernel_bias if add_bias else matmul_kernel_tma_ws_hopper_cooperative)
 
 
 _tuned.cache_clear = _tuned_for_fixed.cache_clear
@@ -1026,19 +1169,26 @@ def mm(a, b, *, out=None, space="full", invariance=None):
     if space not in ("heuristic", "full", "smoke"):
         raise InvalidInput(f"sm90 tlx.ops.mm does not provide search space {space!r}; "
                            "expected 'heuristic', 'full', or 'smoke'")
+    return _run(a, b, c, M, N, K, space, invariance=invariance)
+
+
+def _run(a, b, c, M, N, K, space, bias=None, stride_bias=0, invariance=None):
+    """c = a @ b (+ an (N,) bias with element stride `stride_bias`, for
+    tlx.ops.addmm) on the faster of the WS and small-K kernels."""
     # A contiguous view of each operand's storage; for these, is_contiguous()
     # is ambiguous only on extent-1 dims, so descriptors use canonical strides.
     a_rm = a.is_contiguous()
     b_rm = b.is_contiguous()
     a_store = a if a_rm else a.T
     b_store = b if b_rm else b.T
-    args = (a_store, b_store, a_rm, b_rm, c, M, N, K, space)
+    args = (a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias, stride_bias)
     launchers = {"ws": functools.partial(_launch_ws, *args, invariance=invariance)}
     # A fixed schedule keeps one kernel: the small-K kernel accumulates K in
     # different steps, so mixing the two would break bitwise invariance.
     if gemm_fixed_split_k(invariance) is None and _small_k_candidate(M, N, K, space):
         launchers["small_k"] = functools.partial(_launch_small_k, *args)
-    launchers[_select_path(space, (M, N, K, a_rm, b_rm, a.dtype), launchers)]()
+    key = (M, N, K, a_rm, b_rm, a.dtype) + (() if bias is None else ("bias", ))
+    launchers[_select_path(space, key, launchers)]()
     return c
 
 
@@ -1046,20 +1196,22 @@ def _descriptor(t):
     return TensorDescriptor(t, t.shape, [t.shape[1], 1], [1, 1])
 
 
-def _launch_small_k(a_store, b_store, a_rm, b_rm, c, M, N, K, space):
-    kernel = _tuned_small_k(space, (M, N, K) if space == "heuristic" else None)
+def _launch_small_k(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, stride_bias=0):
+    shape = (M, N, K) if space == "heuristic" else None
+    kernel = _tuned_small_k(space, shape) if bias is None else _tuned_small_k(space, shape, True)
     # The pre_hook swaps in an fp32 workspace once SPLIT_K is known.
     workspace_desc = _descriptor(c)
     grid = lambda meta: (triton.cdiv(M, meta["BM"]) * triton.cdiv(N, meta["BN"]), meta["SPLIT_K"])  # noqa: E731
-    kernel[grid](_descriptor(a_store), _descriptor(b_store), _descriptor(c), workspace_desc, M, N, K, A_ROW_MAJOR=a_rm,
-                 B_ROW_MAJOR=b_rm)
+    kernel[grid](_descriptor(a_store), _descriptor(b_store), _descriptor(c), workspace_desc,
+                 c if bias is None else bias, M, N, K, stride_bias, A_ROW_MAJOR=a_rm, B_ROW_MAJOR=b_rm, ADD_BIAS=bias
+                 is not None)
     # post_hook only fires while benchmarking, so reduce here for the real launch.
     split_k = kernel.best_config.kwargs["SPLIT_K"]
     if split_k > 1:
-        _reduce_split_k(workspace_desc.base, c, M, N, split_k)
+        _reduce_split_k(workspace_desc.base, c, M, N, split_k, bias, stride_bias)
 
 
-def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, invariance=None):
+def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, stride_bias=0, invariance=None):
     swap_ab = _use_swap_ab(M, space)
     if swap_ab:
         # Run the same kernel on (B^T, A^T) and write C^T tiles back to C. B^T
@@ -1085,7 +1237,9 @@ def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, invariance=None)
         num_tiles = triton.cdiv(kernel_m, meta["BM"]) * triton.cdiv(kernel_n, meta["BN"]) * meta["SPLIT_K"]
         return (min(num_sms, num_tiles), )
 
-    kernel = _tuned(space, (M, N, K) if space == "heuristic" else None, swap_ab, invariance=invariance)
+    # The heuristic picks non-power-of-two tiles only for a K-major B.
+    shape = (M, N, K, b_row_major) if space == "heuristic" else None
+    kernel = _tuned(space, shape, swap_ab, bias is not None, invariance=invariance)
     kernel[grid](
         _descriptor(a_src),
         _descriptor(b_src),
@@ -1095,9 +1249,11 @@ def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, invariance=None)
         b_tail2_desc,
         c_tail_desc,
         c_tail2_desc,
+        c if bias is None else bias,
         kernel_m,
         kernel_n,
         K,
+        stride_bias,
         NUM_SMS=num_sms,
         A_ROW_MAJOR=a_row_major,
         B_ROW_MAJOR=b_row_major,
@@ -1105,8 +1261,9 @@ def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, invariance=None)
         # keeping it in L2 serves the repeat reads. Larger N regresses slightly.
         # Under swap-AB the kernel's A is B, streamed once.
         A_EVICTION="evict_last" if N <= 1024 and not swap_ab else "",
+        ADD_BIAS=bias is not None,
     )
     # post_hook only fires while benchmarking, so reduce here for the real launch.
     split_k = kernel.best_config.kwargs["SPLIT_K"]
     if split_k > 1:
-        _reduce_split_k(workspace_desc.base, c, M, N, split_k)
+        _reduce_split_k(workspace_desc.base, c, M, N, split_k, bias, stride_bias)

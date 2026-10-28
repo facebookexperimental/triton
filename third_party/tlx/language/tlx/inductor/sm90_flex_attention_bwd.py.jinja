@@ -1,0 +1,204 @@
+{{def_kernel("Q", "K", "V", "LSE", "DELTA", "DO", "DQ", "DV", "KV_NUM_BLKS", "KV_IDX", "Q_NUM_BLKS", "Q_IDX", "FULL_KV_NUM_BLKS", "FULL_KV_IDX", "FULL_Q_NUM_BLKS", "FULL_Q_IDX")}}
+    # TLX flex-attention backward for Hopper (sm90) with short queries.
+    # Same contract as Inductor's flex_backwards template: dK through store_output, dQ and
+    # dV into the mutated DQ / DV buffers.
+    #
+    # One CTA per (batch, head) makes a single pass over K/V: the whole query block
+    # (Q_LEN <= BLOCK_Q) stays in SMEM, so dQ accumulates in registers and K/V are read
+    # once, unlike the stock split into dK/dV and dQ programs. The KV block is the wgmma M
+    # dimension: S^T = K Q^T and dP^T = V dO^T, then dV = P^T dO and dK = dS^T Q with P^T
+    # and dS^T as register operands, and dQ^T += K^T dS^T through SMEM.
+    # With TLX_KV_SUM, dK + dV share one accumulator and are written once to the dK output;
+    # DV is left untouched (the caller replaces dV by zeros).
+    # Eligibility (see flex_attention_templates.py): no GQA, single sparse Q and KV blocks,
+    # TMA-compatible Q/K/V/dO with uniformly strided (batch, head) pairs.
+
+    stride_qz, stride_qh, stride_qm, stride_qd = {{stride("Q")}}
+    stride_kz, stride_kh, stride_kn, stride_kd = {{stride("K")}}
+    stride_vz, stride_vh, stride_vn, stride_vd = {{stride("V")}}
+    stride_doz, stride_doh, stride_dom, stride_dod = {{stride("DO")}}
+    stride_dqz, stride_dqh, stride_dqm, stride_dqd = {{stride("DQ")}}
+    stride_dvz, stride_dvh, stride_dvm, stride_dvd = {{stride("DV")}}
+
+    ZQ = {{size("Q", 0)}}
+    HQ = {{size("Q", 1)}}
+    Q_LEN = {{size("Q", 2)}}
+    KV_LEN = {{size("K", 2)}}
+
+    MATMUL_PRECISION = Q.dtype.element_ty
+    RCP_LN2: tl.constexpr = 1.44269504
+    Q_BYTES: tl.constexpr = BLOCK_Q * (QK_HEAD_DIM_ROUNDED + V_HEAD_DIM_ROUNDED) * 2
+    KV_BYTES: tl.constexpr = BLOCK_N * (QK_HEAD_DIM_ROUNDED + (0 if SHARED_KV else V_HEAD_DIM_ROUNDED)) * 2
+
+    off_zh = tl.program_id(0)
+    off_z = off_zh // HQ
+    off_h = off_zh % HQ
+    zh = off_zh.to(tl.int32)
+
+    desc_q = tl.make_tensor_descriptor(
+        base=Q, shape=[ZQ * HQ, Q_LEN, QK_HEAD_DIM], strides=[stride_qh if HQ > 1 else stride_qz, stride_qm, 1],
+        block_shape=[1, BLOCK_Q, QK_HEAD_DIM_ROUNDED],
+    )
+    desc_do = tl.make_tensor_descriptor(
+        base=DO, shape=[ZQ * HQ, Q_LEN, V_HEAD_DIM], strides=[stride_doh if HQ > 1 else stride_doz, stride_dom, 1],
+        block_shape=[1, BLOCK_Q, V_HEAD_DIM_ROUNDED],
+    )
+    desc_k = tl.make_tensor_descriptor(
+        base=K, shape=[ZQ * HQ, KV_LEN, QK_HEAD_DIM], strides=[stride_kh if HQ > 1 else stride_kz, stride_kn, 1],
+        block_shape=[1, BLOCK_N, QK_HEAD_DIM_ROUNDED],
+    )
+    q_tile3 = tlx.local_alloc((1, BLOCK_Q, QK_HEAD_DIM_ROUNDED), MATMUL_PRECISION, 1)
+    do_tile3 = tlx.local_alloc((1, BLOCK_Q, V_HEAD_DIM_ROUNDED), MATMUL_PRECISION, 1)
+    k_tiles = tlx.local_alloc((1, BLOCK_N, QK_HEAD_DIM_ROUNDED), MATMUL_PRECISION, NUM_KV_BUFFERS)
+    if SHARED_KV:
+        desc_v = desc_k
+        v_tiles = k_tiles
+    else:
+        desc_v = tl.make_tensor_descriptor(
+            base=V, shape=[ZQ * HQ, KV_LEN, V_HEAD_DIM], strides=[stride_vh if HQ > 1 else stride_vz, stride_vn, 1],
+            block_shape=[1, BLOCK_N, V_HEAD_DIM_ROUNDED],
+        )
+        v_tiles = tlx.local_alloc((1, BLOCK_N, V_HEAD_DIM_ROUNDED), MATMUL_PRECISION, NUM_KV_BUFFERS)
+    ds_tile = tlx.local_alloc((BLOCK_N, BLOCK_Q), MATMUL_PRECISION, 1)
+    q_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    kv_fulls = tlx.alloc_barriers(num_barriers=NUM_KV_BUFFERS, arrive_count=1)
+
+    num_iters = tl.cdiv(KV_LEN, BLOCK_N)
+    tlx.barrier_expect_bytes(q_full[0], Q_BYTES)
+    tlx.async_descriptor_load(desc_q, q_tile3[0], [zh, 0, 0], q_full[0])
+    tlx.async_descriptor_load(desc_do, do_tile3[0], [zh, 0, 0], q_full[0])
+    for s in tl.static_range(NUM_KV_BUFFERS):
+        if s < num_iters:
+            tlx.barrier_expect_bytes(kv_fulls[s], KV_BYTES)
+            tlx.async_descriptor_load(desc_k, k_tiles[s], [zh, s * BLOCK_N, 0], kv_fulls[s])
+            if not SHARED_KV:
+                tlx.async_descriptor_load(desc_v, v_tiles[s], [zh, s * BLOCK_N, 0], kv_fulls[s])
+
+    sparse_z = off_z % {{size("KV_NUM_BLKS", 0)}}
+    sparse_h = off_h % {{size("KV_NUM_BLKS", 1)}}
+    stride_kv_num_blks_z, stride_kv_num_blks_h, _ = {{stride("KV_NUM_BLKS")}}
+    sparse_offset = sparse_z * stride_kv_num_blks_z + sparse_h * stride_kv_num_blks_h
+    kv_num_blocks = tl.load(KV_NUM_BLKS + sparse_offset)
+    if HAS_FULL_BLOCKS:
+        kv_num_blocks += tl.load(FULL_KV_NUM_BLKS + sparse_offset)
+    # Single sparse Q and KV blocks: the row is either fully skipped or fully visited, and
+    # mask_mod is applied even on a full block, which is exact.
+    tile_visible = kv_num_blocks > 0
+
+    offs_q = tl.arange(0, BLOCK_Q)
+    offs_d = tl.arange(0, QK_HEAD_DIM_ROUNDED)
+    offs_vd = tl.arange(0, V_HEAD_DIM_ROUNDED)
+    q_ok = offs_q < Q_LEN
+    lse = tl.load(LSE + off_zh * Q_LEN + offs_q, mask=q_ok, other=0.0)
+    lse = tl.where(lse == -float("inf"), 0.0, lse)
+    Di = tl.load(DELTA + off_zh * Q_LEN + offs_q, mask=q_ok, other=0.0)
+    m = get_bounded_indices(offs_q[None, :], Q_LEN)
+
+    tlx.barrier_wait(q_full[0], 0)
+    q_tile = tlx.local_reshape(q_tile3[0], [BLOCK_Q, QK_HEAD_DIM_ROUNDED])
+    do_tile = tlx.local_reshape(do_tile3[0], [BLOCK_Q, V_HEAD_DIM_ROUNDED])
+    dqT = tl.zeros([QK_HEAD_DIM_ROUNDED, BLOCK_Q], dtype=tl.float32)
+
+    for i in range(0, num_iters):
+        buf = i % NUM_KV_BUFFERS
+        tlx.barrier_wait(kv_fulls[buf], (i // NUM_KV_BUFFERS) & 1)
+        k_tile = tlx.local_reshape(k_tiles[buf], [BLOCK_N, QK_HEAD_DIM_ROUNDED])
+        v_tile = tlx.local_reshape(v_tiles[buf], [BLOCK_N, V_HEAD_DIM_ROUNDED])
+
+        qkT = tlx.async_dot(k_tile, tlx.local_trans(q_tile))
+        dpT = tlx.async_dot(v_tile, tlx.local_trans(do_tile))
+        qkT = tlx.async_dot_wait(1, qkT)
+        qkT *= SM_SCALE
+
+        offs_n = i * BLOCK_N + tl.arange(0, BLOCK_N)
+        n = get_bounded_indices(offs_n[:, None], KV_LEN)
+        pre_mod_scores = qkT
+        {{ modification(
+            subgraph_number=0,
+            output_name="post_mod_scores",
+            score="qkT",
+            b="off_z",
+            h="off_h",
+            m="m",
+            n="n",
+            out="qkT",
+            input_shapes={
+                "score": ("BLOCK_N", "BLOCK_Q"),
+                "m": ("1", "BLOCK_Q"),
+                "n": ("BLOCK_N", "1"),
+            },
+            input_dtypes={"b": "index", "h": "index", "m": "index", "n": "index"}
+        ) | indent_except_first(2) }}
+
+        {{ modification(
+            subgraph_number=2,
+            output_name="mask_mod_output",
+            b="off_z",
+            h="off_h",
+            m="m",
+            n="n",
+            input_shapes={
+                "m": ("1", "BLOCK_Q"),
+                "n": ("BLOCK_N", "1"),
+            },
+            input_dtypes={"b": "index", "h": "index", "m": "index", "n": "index"}
+        ) | indent_except_first(2) }}
+        mask_mod_output = mask_mod_output & (offs_n[:, None] < KV_LEN) & q_ok[None, :] & tile_visible
+        post_mod_scores = tl.where(mask_mod_output, post_mod_scores, float("-inf"))
+        pT = tl.math.exp2(post_mod_scores * RCP_LN2 - lse[None, :])
+
+        dpT = tlx.async_dot_wait(0, dpT)
+        dsT = pT * (dpT - Di[None, :])
+        {{ modification(
+            subgraph_number=1,
+            output_name="grad_scores",
+            score="pre_mod_scores",
+            b="off_z",
+            h="off_h",
+            m="m",
+            n="n",
+            grad_score_mod="dsT",
+            input_shapes={
+                "score": ("BLOCK_N", "BLOCK_Q"),
+                "grad_score_mod": ("BLOCK_N", "BLOCK_Q"),
+                "m": ("1", "BLOCK_Q"),
+                "n": ("BLOCK_N", "1"),
+            },
+            input_dtypes={"b": "index", "h": "index", "m": "index", "n": "index"}
+        ) | indent_except_first(2) }}
+        # SM_SCALE folds into dS once, covering both dK and dQ.
+        dsT = tl.where(mask_mod_output, grad_scores, 0.0) * SM_SCALE
+        dsT = dsT.to(MATMUL_PRECISION)
+        tlx.local_store(ds_tile[0], dsT)
+        tlx.fence_async_shared()
+        tl.debug_barrier()
+
+        if TLX_KV_SUM:
+            dk = tlx.async_dot(pT.to(MATMUL_PRECISION), do_tile)
+            dk = tlx.async_dot(dsT, q_tile, dk)
+        else:
+            dv = tlx.async_dot(pT.to(MATMUL_PRECISION), do_tile)
+            dk = tlx.async_dot(dsT, q_tile)
+        dqT = tlx.async_dot(tlx.local_trans(k_tile), ds_tile[0], dqT)
+        dqT = tlx.async_dot_wait(0, dqT)
+
+        # All dots on this stage have retired.
+        if i + NUM_KV_BUFFERS < num_iters:
+            tlx.barrier_expect_bytes(kv_fulls[buf], KV_BYTES)
+            tlx.async_descriptor_load(desc_k, k_tiles[buf], [zh, (i + NUM_KV_BUFFERS) * BLOCK_N, 0], kv_fulls[buf])
+            if not SHARED_KV:
+                tlx.async_descriptor_load(desc_v, v_tiles[buf], [zh, (i + NUM_KV_BUFFERS) * BLOCK_N, 0], kv_fulls[buf])
+
+        idx_n = offs_n[:, None]
+        if not TLX_KV_SUM:
+            idx_vd = offs_vd[None, :]
+            tl.store(DV + off_z * stride_dvz + off_h * stride_dvh + idx_n * stride_dvm + idx_vd * stride_dvd, dv,
+                     mask=(idx_n < KV_LEN) & (idx_vd < V_HEAD_DIM))
+        index_n = idx_n
+        index_k = offs_d[None, :]
+        mask = (index_n < KV_LEN) & (index_k < QK_HEAD_DIM)
+        {{store_output(("off_z", "off_h", "index_n", "index_k"), "dk", "mask", indent_width=8, val_shape=("BLOCK_N", "QK_HEAD_DIM_ROUNDED"))}}
+
+    dq = tl.trans(dqT)
+    tl.store(DQ + off_z * stride_dqz + off_h * stride_dqh + offs_q[:, None] * stride_dqm + offs_d[None, :] * stride_dqd,
+             dq, mask=q_ok[:, None] & (offs_d[None, :] < QK_HEAD_DIM))

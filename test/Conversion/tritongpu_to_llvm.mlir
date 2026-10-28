@@ -2948,6 +2948,7 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.target = "cuda:120"} {
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1, 16], threadsPerWarp = [4, 4, 2], warpsPerCTA = [8, 1, 1], order = [2, 1, 0]}>
 #linear = #ttg.linear<{register = [[0, 0], [0, 0], [0, 0], [0, 0]], lane = [[0, 0], [0, 1], [0, 2], [1, 0], [2, 0]], warp = [[4, 0], [8, 0], [16, 0]], block = []}>
+#linear1 = #ttg.linear<{register = [], lane = [[0, 0], [0, 1], [0, 2], [1, 0], [2, 0]], warp = [[4, 0], [8, 0], [16, 0]], block = []}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 
@@ -2962,11 +2963,12 @@ tt.func private @expand_dims_linear_layout() -> tensor<1x4xi32, #linear> {
 // CHECK-LABEL: llvm.func internal @reshape_linear_layout_broadcasting
 // CHECK-SAME: (%[[ARG0:.*]]: !llvm.struct<(bf16)>
 tt.func private @reshape_linear_layout_broadcasting(%arg0: tensor<32x4xbf16, #linear>) -> tensor<32x4x1xbf16, #blocked> {
-  %0 = tt.reshape %arg0 : tensor<32x4xbf16, #linear> -> tensor<32x4x1xbf16, #blocked>
+  %0 = ttg.convert_layout %arg0 : tensor<32x4xbf16, #linear> -> tensor<32x4xbf16, #linear1>
+  %1 = tt.reshape %0 : tensor<32x4xbf16, #linear1> -> tensor<32x4x1xbf16, #blocked>
   // CHECK: %[[ELT:.*]] = llvm.extractvalue %[[ARG0]][0]
   // CHECK: %[[RESHAPED:.*]] = llvm.insertvalue %[[ELT]]
   // CHECK: llvm.return %[[RESHAPED]] : !llvm.struct<(bf16)>
-  tt.return %0 : tensor<32x4x1xbf16, #blocked>
+  tt.return %1 : tensor<32x4x1xbf16, #blocked>
 }
 
 }

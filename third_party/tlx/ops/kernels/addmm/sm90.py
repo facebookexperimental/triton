@@ -34,6 +34,8 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..mm import sm90 as _mm
+
 # Handoff ring depth per M-half group for the partitioned epilogue. Depth
 # 2 measures the same as depth 1 (the store keeps up), so this stays 1.
 
@@ -1288,6 +1290,69 @@ def _launch_np(bias, a, b, c, M, N, K, stride_ym, stride_yn, space):
     return c
 
 
+# --- GEMM path shared with tlx.ops.mm -----------------------------------------
+#
+# TMA-capable inputs with a bias constant along M run the sm90 mm kernels, which
+# take an optional (N,) bias in their epilogue; see `_mm._run`.
+
+
+def _mm_path_eligible(a, b, c):
+    """Operands the mm kernels' TMA descriptors can address: row- or
+    column-major A and B, contiguous C, 16-byte-aligned bases and rows."""
+    if not (a.is_contiguous() or a.T.is_contiguous()) or not (b.is_contiguous() or b.T.is_contiguous()):
+        return False
+    if not c.is_contiguous():
+        return False
+    for t in (a if a.is_contiguous() else a.T, b if b.is_contiguous() else b.T, c):
+        if t.data_ptr() % 16 != 0 or (t.shape[1] * t.element_size()) % 16 != 0:
+            return False
+    return True
+
+
+# --- N = 1 (matrix-vector) ---------------------------------------------------
+#
+# A single output column has no MMA shape and no TMA-legal row stride; it is a
+# bandwidth-bound row reduction over A, so each program reduces BLOCK_M rows.
+
+
+def _gemv_configs():
+    return [
+        triton.Config({"BLOCK_M": bm, "BLOCK_K": bk}, num_warps=w)
+        for bm, bk, w in ((8, 128, 4), (16, 128, 4), (16, 256, 4), (32, 128, 4), (32, 64, 2), (64, 64, 4))
+    ]
+
+
+@functools.lru_cache(maxsize=None)
+def _tuned_gemv(space):
+    configs = _gemv_configs() if space == "full" else [triton.Config({"BLOCK_M": 16, "BLOCK_K": 128}, num_warps=4)]
+    return triton.autotune(configs=configs, key=["M", "K"])(addmm_kernel_gemv)
+
+
+# c_cache=False for the reason given at mm's `_ws_kernel_bias`.
+@triton.jit(c_cache=False)
+def addmm_kernel_gemv(a_ptr, b_ptr, bias_ptr, c_ptr, M, K, stride_am, stride_ak, stride_bk, stride_cm,
+                      BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < M
+    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        cols = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        col_mask = cols < K
+        a = tl.load(a_ptr + rows[:, None] * stride_am + cols[None, :] * stride_ak,
+                    mask=row_mask[:, None] & col_mask[None, :], other=0.0)
+        w = tl.load(b_ptr + cols * stride_bk, mask=col_mask, other=0.0)
+        acc += a.to(tl.float32) * w.to(tl.float32)[None, :]
+    # With N = 1 an (N,) bias is a single value.
+    out = tl.sum(acc, axis=1) + tl.load(bias_ptr).to(tl.float32)
+    tl.store(c_ptr + rows * stride_cm, out.to(c_ptr.dtype.element_ty), mask=row_mask)
+
+
+def _launch_gemv(bias, a, b, c, M, K, space):
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), )  # noqa: E731
+    _tuned_gemv(space)[grid](a, b, bias, c, M, K, a.stride(0), a.stride(1), b.stride(0), c.stride(0))
+    return c
+
+
 def addmm(input, a, b, *, out=None, space="heuristic"):
     """Fused ``input + a @ b`` on Hopper.
 
@@ -1295,16 +1360,20 @@ def addmm(input, a, b, *, out=None, space="heuristic"):
     ``(M, N)`` result. Matrix and input scale factors are both one. This op is
     currently forward-only.
 
-    TMA-capable inputs run on the warp-specialized kernel: few-tile
-    shapes (see ``_use_np_path``) take the non-persistent kernel, other
-    small shapes (see ``_use_direct_path``) run faster on the
-    direct-load kernel; anything else (misaligned bases, exotic strides,
-    or K/N not multiples of 16) also falls back to direct-load.
+    In the "full" and "heuristic" spaces, a bias that is constant along M --
+    ``(N,)``, ``(1, N)`` or a scalar -- with row- or column-major A and B
+    with 16-byte-aligned bases and rows runs the tlx.ops.mm kernels with the
+    bias added in their epilogue (see ``_mm._run``), and N = 1 runs a
+    matrix-vector kernel (``_launch_gemv``). Other inputs (e.g. an ``(M, 1)``
+    or ``(M, N)`` bias), and the "smoke" and "heuristic_2cta" spaces, run the
+    original kernels below: the warp-specialized kernel, the non-persistent
+    kernel for few-tile shapes (``_use_np_path``) or the direct-load kernel.
 
-    `space` selects the search space -- "heuristic" (one config) for
-    correctness, "full" for perf, "smoke" for path coverage, and
-    "heuristic_2cta" for the heuristic tile pinned to two CTAs (with a
-    1-CTA fallback when clustering is illegal for the shape).
+    `space` selects the search space -- "full" (the default via the catalog)
+    autotunes, "heuristic" picks one config, "smoke" covers the original
+    kernels' lowering paths, and "heuristic_2cta" pins the original kernel's
+    heuristic tile to two CTAs (with a 1-CTA fallback when clustering is
+    illegal for the shape).
     """
     M, N, K = _validate_operands(a, b, out)
     stride_ym, stride_yn = _bias_strides(input, M, N, a)
@@ -1312,6 +1381,11 @@ def addmm(input, a, b, *, out=None, space="heuristic"):
     if M == 0 or N == 0:
         return c
 
+    if space in ("full", "heuristic") and K > 0 and stride_ym == 0:
+        if N == 1:
+            return _launch_gemv(input, a, b, c, M, K, space)
+        if _mm_path_eligible(a, b, c):
+            return _mm._run(a, b, c, M, N, K, space, bias=input, stride_bias=stride_yn)
     if _tma_eligible(a, b, c, N, K):
         if _use_np_path(M, N, K):
             return _launch_np(input, a, b, c, M, N, K, stride_ym, stride_yn, space)
