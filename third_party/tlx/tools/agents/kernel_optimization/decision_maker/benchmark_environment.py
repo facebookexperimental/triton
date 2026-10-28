@@ -127,7 +127,7 @@ def governed_benchmark_devices(
 
 def device_environment(device: Any) -> dict[str, str]:
     environment = {
-        device.visibility_env: str(device.index),
+        **getattr(device, "visibility_environment", {device.visibility_env: str(device.index)}),
         "TLX_AGENT_PHYSICAL_GPU": str(device.index),
     }
     cpus = _numa_cpus(device)
@@ -147,9 +147,9 @@ def governed_benchmark_device(
     """Select and govern a GPU before any framework initializes its context."""
     Governor, list_devices = _load_benchmark_environment(repository)
     device = _select_device(list_devices(), spec, arch)
-    visibility_key = device.visibility_env
-    previous_visibility = os.environ.get(visibility_key)
-    os.environ[visibility_key] = str(device.index)
+    visibility = getattr(device, "visibility_environment", {device.visibility_env: str(device.index)})
+    previous_visibility = {key: os.environ.get(key) for key in visibility}
+    os.environ.update(visibility)
     selection = "least used" if spec == "auto" else "selected"
     print(
         f"[tlx-agent] device: gpu{device.index} {device.name} ({selection}, {device.memory_used_mib:.0f} MiB in use)",
@@ -164,7 +164,8 @@ def governed_benchmark_device(
                 print(f"[tlx-agent] denoise: SKIPPED {step}", file=sys.stderr, flush=True)
             yield device
     finally:
-        if previous_visibility is None:
-            os.environ.pop(visibility_key, None)
-        else:
-            os.environ[visibility_key] = previous_visibility
+        for key, value in previous_visibility.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value

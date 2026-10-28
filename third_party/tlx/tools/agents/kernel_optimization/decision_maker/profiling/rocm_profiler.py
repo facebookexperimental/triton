@@ -68,7 +68,7 @@ def find_rocprofv3(environment: Mapping[str, str] | None = None) -> Path | None:
 
 
 def parse_rocprof_kernel_trace(
-    csv_text: str, *, sample_count: int = 3
+    csv_text: str, *, sample_count: int = 3, exclude_kernel_prefixes: Sequence[str] = ()
 ) -> dict[str, Any]:
     if sample_count <= 0:
         raise ValueError("sample_count must be positive")
@@ -90,6 +90,8 @@ def parse_rocprof_kernel_trace(
     resources: dict[str, dict[str, float]] = {}
     for row in reader:
         name = str(row.get(name_key, "")).strip()
+        if exclude_kernel_prefixes and name.startswith(tuple(exclude_kernel_prefixes)):
+            continue
         start = _float(row.get(start_key))
         end = _float(row.get(end_key))
         if not name or start is None or end is None or end <= start:
@@ -179,6 +181,7 @@ def collect_rocprofv3(
     timeout_seconds: float = 900.0,
     environment: Mapping[str, str] | None = None,
     counter_workload: Sequence[str] | None = None,
+    exclude_kernel_prefixes: Sequence[str] = (),
 ) -> dict[str, Any]:
     if not workload:
         raise ValueError("rocprofv3 workload must not be empty")
@@ -217,7 +220,7 @@ def collect_rocprofv3(
         }
     try:
         profile = parse_rocprof_kernel_trace(
-            trace_files[0].read_text(), sample_count=sample_count
+            trace_files[0].read_text(), sample_count=sample_count, exclude_kernel_prefixes=exclude_kernel_prefixes
         )
     except (OSError, UnicodeDecodeError, csv.Error) as error:
         return {

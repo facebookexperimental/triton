@@ -40,7 +40,7 @@ def governor(pytestconfig):
     device = select_device(pytestconfig.getoption("--gpu"))
     driver.select(device)
     if device is not None:
-        os.environ[device.visibility_env] = str(device.index)
+        os.environ.update(device.visibility_environment)
         print(f"\ndevice: gpu{device.index} {device.name} ({device.memory_used_mib:.0f} MiB in use)")
     with Governor(device) as gov:
         for step in gov.applied:

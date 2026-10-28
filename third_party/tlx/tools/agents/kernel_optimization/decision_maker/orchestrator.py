@@ -726,6 +726,14 @@ class DecisionMaker:
             final_profiler_diagnostics = _profiler_regression_diagnostics(
                 baseline, final_profile
             )
+            store.write_json(
+                "final_revalidation.json",
+                {
+                    "experiment_id": best_experiment_id,
+                    "performance": final_profile,
+                    "profiler_diagnostics": final_profiler_diagnostics,
+                },
+            )
         else:
             final_profile = baseline
 

@@ -69,11 +69,13 @@ from ..optimizer.agent import (
     AgentSourceResearchRequest,
     CandidateContext,
     CandidateProposal,
+    CodexCandidateProvider,
     FixedCandidateProvider,
     MockLLMProvider,
     _build_prompt,
     _read_candidate_metadata,
 )
+
 from ..optimizer.source import (
     apply_candidate_diff,
     extract_python_source,
@@ -207,6 +209,28 @@ class ScoringTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "not valid Python"):
             extract_python_source("```python\nif:\n```")
+
+    def test_codex_provider_captures_progress_in_regular_files(self) -> None:
+        import os
+        import stat
+        import subprocess
+
+        request = KernelOptimizationRequest(kernel_source="VALUE = 1\n", harness_path=Path(__file__),
+                                            cases=(InputCase("target", {}), ), target=KernelTarget("fake", "fake"),
+                                            budget=OptimizationBudget(), output_dir=Path("/tmp/tlx-agent-test"))
+        context = CandidateContext(1, 0, request.kernel_source, _performance(("target", 100.0)), ())
+
+        def run(command, **kwargs):
+            self.assertNotIn("capture_output", kwargs)
+            for name in ("stdout", "stderr"):
+                self.assertTrue(stat.S_ISREG(os.fstat(kwargs[name].fileno()).st_mode))
+            kwargs["stderr"].write("x" * 100000 + "\nconcrete generator failure\n")
+            kwargs["stderr"].flush()
+            return subprocess.CompletedProcess(command, 1)
+
+        with patch("subprocess.run", side_effect=run), self.assertRaisesRegex(RuntimeError,
+                                                                              "concrete generator failure"):
+            CodexCandidateProvider().propose(request, context)
 
     def test_codex_prompt_has_generic_and_target_guidance(self) -> None:
         target_guidance = (
@@ -1094,34 +1118,29 @@ class ScoringTest(unittest.TestCase):
         )
 
     def test_tuning_edits_only_the_heuristic(self) -> None:
-        source = (
-            "def _configs():\n"
-            "    return list(range(16))\n\n"
-            "CONFIGS = _configs\n\n"
-            "def heuristic_config():\n"
-            "    return 1\n"
-        )
+        source = ("def _configs():\n"
+                  "    return list(range(16))\n\n"
+                  "CONFIGS = _configs\n\n"
+                  "def heuristic_config():\n"
+                  "    return 1\n")
         candidate = source.replace("return 1\n", "return 2\n")
         cases = (InputCase("a", {}), )
         performance = PerformanceSummary(
-            cases=(
-                CaseEvaluation(
-                    case_id="a",
-                    verification=VerificationResult(
-                        True,
-                        metrics={
-                            "full_config_count": 16,
-                            "full_best_config": "kernel: VALUE=1",
-                            "heuristic_config": "VALUE=1",
-                            "full_space_parity": 1.0,
-                            "heuristic_config_count": 1,
-                            "parity_stable": True,
-                        },
-                    ),
-                    timing=TimingSamples((1.0, 1.0, 1.0)),
+            cases=(CaseEvaluation(
+                case_id="a",
+                verification=VerificationResult(
+                    True,
+                    metrics={
+                        "full_config_count": 16,
+                        "full_best_config": "kernel: VALUE=1",
+                        "heuristic_config": "VALUE=1",
+                        "full_space_parity": 1.0,
+                        "heuristic_config_count": 1,
+                        "parity_stable": True,
+                    },
                 ),
-            ),
-        )
+                timing=TimingSamples((1.0, 1.0, 1.0)),
+            ), ), )
         optimization_result = KernelOptimizationResult(
             success=True,
             best_kernel=candidate,
@@ -1142,10 +1161,10 @@ class ScoringTest(unittest.TestCase):
             oracle_harness = Mock()
             oracle_harness.evaluate.return_value = performance
             with (
-                patch.object(tuning_module, "production_cases", return_value=cases),
-                patch.object(tuning_module, "_validate_device_arch"),
-                patch.object(tuning_module, "SubprocessHarness", return_value=oracle_harness),
-                patch.object(tuning_module, "KernelOptimizer", return_value=optimizer),
+                    patch.object(tuning_module, "production_cases", return_value=cases),
+                    patch.object(tuning_module, "_validate_device_arch"),
+                    patch.object(tuning_module, "SubprocessHarness", return_value=oracle_harness),
+                    patch.object(tuning_module, "KernelOptimizer", return_value=optimizer),
             ):
                 exit_code, result = tuning_module.run_tuning(
                     repository=root,
@@ -1157,6 +1176,7 @@ class ScoringTest(unittest.TestCase):
                     budget=OptimizationBudget(),
                     search_rounds=99,
                     heuristic_rounds=3,
+                    stable_cv_max=0.05,
                     commit=False,
                     commit_message=None,
                     vcs="git",
@@ -1167,6 +1187,7 @@ class ScoringTest(unittest.TestCase):
             optimizer.optimize.assert_called_once()
             request = optimizer.optimize.call_args.args[0]
             self.assertEqual(request.kernel_source, source)
+            self.assertEqual(request.target.evaluation_policy["stable_cv_max"], 0.05)
             self.assertEqual(
                 request.target.environment["TLX_AGENT_EDITABLE_SYMBOLS"],
                 "heuristic_config",
@@ -1506,56 +1527,55 @@ class CliTest(unittest.TestCase):
                 artifacts_dir=root / "out",
                 stopping_reason="budget_exhausted",
             )
-            args = _parse_args(
-                [
-                    "--task",
-                    "authoring",
-                    "--op",
-                    "mm",
-                    "--arch",
-                    "gfx942",
-                    "--suite",
-                    "gfx942_all",
-                    "--tune-after-authoring",
-                    "--output-dir",
-                    str(root / "out"),
-                    "--harness",
-                    str(Path(__file__)),
-                    "--cases",
-                    str(cases),
-                    "--target",
-                    str(target),
-                    "--provider",
-                    "mock",
-                    "--no-commit-winner",
-                ]
-            )
+            args = _parse_args([
+                "--task",
+                "authoring",
+                "--op",
+                "mm",
+                "--arch",
+                "gfx942",
+                "--suite",
+                "gfx942_all",
+                "--tune-after-authoring",
+                "--output-dir",
+                str(root / "out"),
+                "--harness",
+                str(Path(__file__)),
+                "--cases",
+                str(cases),
+                "--target",
+                str(target),
+                "--provider",
+                "mock",
+                "--no-commit-winner",
+            ])
+            args._production_device_environments = ({"HIP_VISIBLE_DEVICES": "3"}, )
             optimizer = Mock()
             optimizer.optimize.return_value = result
             tuning_result = {"task": "tuning", "summary": {"success": True}}
             with (
-                patch.object(
-                    cli_module,
-                    "_resolve_harness_paths",
-                    return_value=(Path(__file__), cases, target),
-                ),
-                patch.object(cli_module, "KernelOptimizer", return_value=optimizer),
-                patch.object(
-                    tuning_module,
-                    "run_tuning",
-                    return_value=(0, tuning_result),
-                ) as run_tuning,
-                redirect_stdout(io.StringIO()),
+                    patch.object(
+                        cli_module,
+                        "_resolve_harness_paths",
+                        return_value=(Path(__file__), cases, target),
+                    ),
+                    patch.object(cli_module, "KernelOptimizer", return_value=optimizer),
+                    patch.object(
+                        tuning_module,
+                        "run_tuning",
+                        return_value=(0, tuning_result),
+                    ) as run_tuning,
+                    redirect_stdout(io.StringIO()),
             ):
                 exit_code = _run_task(args, environment_ready=True)
 
             self.assertEqual(exit_code, 0)
+            self.assertEqual(run_tuning.call_args.kwargs["initial_source"], "AUTHORED = True\n")
             self.assertEqual(
-                run_tuning.call_args.kwargs["initial_source"], "AUTHORED = True\n"
+                run_tuning.call_args.kwargs["device_environments"],
+                args._production_device_environments,
             )
-            self.assertEqual(
-                run_tuning.call_args.kwargs["output_dir"], root / "out" / "tuning"
-            )
+            self.assertEqual(run_tuning.call_args.kwargs["output_dir"], root / "out" / "tuning")
             self.assertTrue((root / "out" / "task_result.json").is_file())
 
     def test_tuning_device_selection_prefers_matching_arch_then_memory(self) -> None:
@@ -1861,18 +1881,16 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(gfx942.name, "gfx942.py")
         self.assertEqual(infer_kernel_path(repository, "mm", "B200").name, "sm100.py")
         self.assertEqual(len(production_cases("mm", "gfx942_all")), 81)
-        self.assertEqual(
-            _tuning_symbols(gfx942.read_text()), ("_configs", "heuristic_config")
-        )
+        self.assertEqual(_tuning_symbols(gfx942.read_text()), ("_configs", "heuristic_config"))
         sm100 = infer_kernel_path(repository, "mm", "sm100")
         self.assertEqual(
             _tuning_symbols(sm100.read_text()),
             ("get_cuda_autotune_config", "heuristic_config"),
         )
         gfx950 = infer_kernel_path(repository, "mm", "gfx950")
-        self.assertEqual(
-            _tuning_symbols(gfx950.read_text()), ("_configs", "heuristic_config")
-        )
+        # The generated gfx950 kernel does not export a full-space CONFIGS factory.
+        with self.assertRaisesRegex(SystemExit, "module-level CONFIGS factory"):
+            _tuning_symbols(gfx950.read_text())
         for arch, kernel in (("gfx942", gfx942), ("gfx950", gfx950), ("sm100", sm100)):
             result = mm_harness.build(kernel.read_text(), {"architecture": arch})
             self.assertTrue(result["success"], result.get("diagnostics"))
@@ -1887,13 +1905,113 @@ class HarnessTest(unittest.TestCase):
         from ..decision_maker.tuning_harnesses.mm import _install_candidate
 
         marker = object()
-        candidate = SimpleNamespace(mm=lambda a, b, *, space: (marker, space))
+        candidate = SimpleNamespace(mm=lambda a, b, *, space, invariance=None: (marker, space))
         a = torch.empty((8, 8), dtype=torch.float16)
         b = torch.empty((8, 8), dtype=torch.float16)
         for arch in ("gfx942", "gfx950", "sm100"):
             with self.subTest(arch=arch):
                 op = _install_candidate(candidate, arch)
                 self.assertEqual(op(a, b, space="full"), (marker, "full"))
+
+    def test_infers_addmm_shared_kernel(self) -> None:
+        repository = Path(__file__).resolve().parents[6]
+        self.assertEqual(
+            infer_kernel_path(repository, "addmm", "gfx942"),
+            infer_kernel_path(repository, "mm", "gfx942"),
+        )
+
+    def test_addmm_split_k_harness_records_and_replays_launch_pair(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+        import triton
+        from ..decision_maker.tuning_harnesses import addmm
+
+        a = torch.randn((4, 16), dtype=torch.float16)
+        b = torch.randn((16, 8), dtype=a.dtype)
+        bias = torch.randn(8, dtype=a.dtype)
+        configs = [triton.Config({"SPLIT_K": split}, num_warps=4, num_stages=2) for split in (1, 2)]
+        calls = []
+
+        def launch(a, b, bias, out, workspace, config):
+            calls.append(config.kwargs["SPLIT_K"])
+            self.assertEqual(workspace.dtype, torch.float32)
+            out.copy_(torch.addmm(bias, a, b))
+            return out
+
+        module = SimpleNamespace(
+            _candidate_configs=lambda *args, **kwargs: configs,
+            _launch_global_split_k_config=launch,
+            _global_split_k_shape=lambda *args: True,
+            _precheck_global_split_k=lambda *args: True,
+            _tuned=lambda *args: None,
+        )
+        module._launch_global_split_k = lambda a, b, bias, out, space: launch(
+            a, b, bias, out, torch.empty((8, 8), dtype=torch.float32), configs[0])
+        module._gemm = lambda a, b, bias, out, space: module._launch_global_split_k(a, b, bias, out, space)
+        key = addmm._key(a, b)
+        record = {}
+
+        def measure(fn, quantiles):
+            fn()
+            return [float(3 - calls[-1])] * len(quantiles)
+
+        with patch.dict(addmm._bias_inputs, {key: bias}), patch.object(addmm, "_autotune_bench", measure):
+            op = addmm._install_candidate(module, "gfx942")
+            with addmm._record_tuners(record):
+                result = op(a, b, space="full")
+            tuner = record["matmul_kernel_gfx942"]
+            self.assertIs(tuner.best_config, configs[1])
+            self.assertEqual(len(tuner.configs_timings), 2)
+            winner = "matmul_kernel_gfx942: " + addmm._base._format_config(configs[0])
+            with addmm._oracle_winner({"module": module, "op": op}, a, b, winner) as fixed:
+                fixed()
+                self.assertEqual(calls[-1], 1)
+            self.assertEqual(tuner.configs, configs)
+            # Authoring can broaden dispatch beyond the incumbent shape/dtype
+            # helper; the recorded split winner must still replay its reducer.
+            module._global_split_k_shape = lambda *args: False
+            module._precheck_global_split_k = lambda *args: False
+            winner = "matmul_kernel_gfx942: " + addmm._base._format_config(configs[1])
+            with addmm._oracle_winner({"module": module, "op": op}, a, b, winner) as fixed:
+                fixed()
+                self.assertEqual(calls[-1], 2)
+            self.assertEqual(tuner.configs, configs)
+            op(a, b, space="heuristic")
+            self.assertEqual(calls[-1], 1)
+            torch.testing.assert_close(result, torch.addmm(bias, a, b))
+
+    def test_addmm_tuning_harness_preserves_bias_and_full_space(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+
+        from ..decision_maker.tuning_harnesses import addmm
+
+        case = {
+            "parameters": {
+                "m": 8,
+                "n": 8,
+                "k": 8,
+                "dtype": "fp16",
+                "a_strides": (8, 1),
+                "b_strides": (1, 8),
+                "bias_strides": (1, ),
+            }
+        }
+        a, b = addmm._inputs(case, "cpu")
+        bias = addmm._bias_inputs[addmm._key(a, b)]
+        calls = []
+
+        def gemm(a, b, input, *, out=None, space="heuristic"):
+            calls.append((input, space))
+            return torch.addmm(input, a, b)
+
+        op = addmm._install_candidate(SimpleNamespace(_gemm=gemm), "gfx942")
+        torch.testing.assert_close(op(a, b, space="full"), torch.addmm(bias, a, b))
+        self.assertIs(calls[0][0], bias)
+        self.assertEqual(calls[0][1], "full")
+        torch.testing.assert_close(addmm._reference_addmm(a, b), torch.addmm(bias, a, b))
 
     def test_mm_heuristic_benchmark_remeasures_oracle_winner(self) -> None:
         import torch
@@ -1937,22 +2055,130 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(spaces, ["full", "heuristic"])
         self.assertEqual(result["metrics"]["full_space_parity"], 1.0)
 
+    def test_mm_profiler_uses_evaluated_space(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+
+        from ..decision_maker.tuning_harnesses import mm
+
+        tensor = torch.empty((1, 1))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            case = {"case_id": "a"}
+            case_path = path / "case.json"
+            case_path.write_text(json.dumps(case))
+            for space in ("full", "heuristic"):
+                with self.subTest(space=space):
+                    artifact = {
+                        "phase": space,
+                        "arch": "gfx942",
+                        "device": "cpu",
+                        "source_path": path / "candidate.py",
+                        "records": {"a": {"full_best_config": "full winner", "heuristic_config": "heuristic choice"}},
+                    }
+                    with patch.object(mm, "collect_rocprofv3", return_value={}) as collect:
+                        profile = mm.profile(artifact, case, {"artifacts_dir": str(path), "tools": ["rocprofv3"]})
+                    command = collect.call_args.args[0]
+                    self.assertEqual(command[command.index("--space") + 1], space)
+                    self.assertEqual(profile["profiled_config"],
+                                     "heuristic choice" if space == "heuristic" else "full winner")
+
+                    calls = []
+                    arguments = SimpleNamespace(case_json=case_path, candidate=path / "candidate.py", arch="gfx942",
+                                                device="cpu", winner="full winner", space=space, warmup_launches=3)
+                    op = lambda a, b, *, space: calls.append(space)
+                    with (
+                            patch.object(mm, "_inputs", return_value=(tensor, tensor)),
+                            patch.object(mm, "_load_module"),
+                            patch.object(mm, "_install_candidate", return_value=op),
+                            patch.object(mm.torch.cuda, "synchronize"),
+                            patch.object(mm, "_oracle_winner",
+                                         return_value=nullcontext(lambda: op(tensor, tensor, space="full"))) as oracle,
+                    ):
+                        mm._run_profile_workload(arguments)
+                    self.assertEqual(calls, [space] * 13)
+                    self.assertEqual(oracle.call_count, 1 if space == "full" else 0)
+
+    def test_mm_profile_steady_warmup_preserves_evaluated_space(self) -> None:
+        import os
+        from types import SimpleNamespace
+
+        import torch
+
+        from ..decision_maker.tuning_harnesses import mm
+
+        tensor = torch.empty((1, 1))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            case = {"case_id": "a"}
+            case_path = path / "case.json"
+            case_path.write_text(json.dumps(case))
+            for space in ("full", "heuristic"):
+                with self.subTest(space=space):
+                    artifact = {
+                        "phase": space,
+                        "arch": "gfx942",
+                        "device": "cpu",
+                        "source_path": path / "candidate.py",
+                        "records": {"a": {"full_best_config": "full winner", "heuristic_config": "heuristic choice"}},
+                    }
+                    with (
+                            patch.dict(os.environ, {"TLX_AGENT_PROFILE_WARMUP_LAUNCHES": "256"}),
+                            patch.object(mm, "collect_rocprofv3", return_value={"summary": {"dominant_kernel": "gemm.kd"}}) as native,
+                            patch.object(mm, "collect_amd_att", return_value={"valid": True}) as att,
+                    ):
+                        profile = mm.profile(artifact, case, {"artifacts_dir": str(path), "tools": ["rocprofv3", "amd_att"]})
+                    command = native.call_args.args[0]
+                    self.assertEqual(command[command.index("--space") + 1], space)
+                    self.assertEqual(command[command.index("--warmup-launches") + 1], "256")
+                    self.assertEqual(profile["profile_warmup_launches"], 256)
+                    self.assertEqual(att.call_args.kwargs["iteration"], 261)
+                    self.assertIs(att.call_args.args[0], command)
+
+                    calls = []
+                    arguments = SimpleNamespace(case_json=case_path, candidate=path / "candidate.py", arch="gfx942",
+                                                device="cpu", winner="full winner", space=space, warmup_launches=256)
+                    op = lambda a, b, *, space: calls.append(space)
+                    with (
+                            patch.object(mm, "_inputs", return_value=(tensor, tensor)),
+                            patch.object(mm, "_load_module"),
+                            patch.object(mm, "_install_candidate", return_value=op),
+                            patch.object(mm.torch.cuda, "synchronize"),
+                            patch.object(mm, "_oracle_winner", return_value=nullcontext(lambda: op(tensor, tensor, space="full"))),
+                    ):
+                        mm._run_profile_workload(arguments)
+                    self.assertEqual(calls, [space] * 266)
+
     def test_mm_oracle_winner_restores_cached_tuner(self) -> None:
+        from types import SimpleNamespace
+
         import torch
         import triton
 
         from ..decision_maker.tuning_harnesses import mm
 
         configs = [triton.Config({"BLOCK_M": m}, num_warps=4, num_stages=2) for m in (64, 128)]
-        tuner = Mock(configs=configs)
+        cached = {"launch": configs[0]}
+        tuner = SimpleNamespace(configs=configs, _tlx_fast_configs=cached)
         module = Mock(_precheck_local_split_u=Mock(return_value=False), _tuned=Mock(return_value=tuner))
-        artifact = {"module": module, "op": Mock()}
+
+        def op(a, b, *, space):
+            selected = tuner._tlx_fast_configs.get("launch", tuner.configs[0])
+            tuner._tlx_fast_configs["launch"] = selected
+            return selected
+
+        artifact = {"module": module, "op": op}
         tensor = torch.empty((1, 1))
         for config in configs:
             winner = f"kernel: {mm._format_config(config)}"
-            with mm._oracle_winner(artifact, tensor, tensor, winner):
+            with mm._oracle_winner(artifact, tensor, tensor, winner) as launch:
                 self.assertEqual(tuner.configs, [config])
+                self.assertIs(launch(), config)
+                self.assertIs(launch(), config)
             self.assertIs(tuner.configs, configs)
+            self.assertIs(tuner._tlx_fast_configs, cached)
+            self.assertEqual(cached, {"launch": configs[0]})
 
     def test_benchmark_metrics_are_attached_to_verification(self) -> None:
         harness_path = Path(__file__).with_name("fixtures") / "fake_harness.py"
@@ -1976,6 +2202,50 @@ class HarnessTest(unittest.TestCase):
                     ],
                     0.99,
                 )
+
+    def test_mm_queued_profile_preserves_space_and_rejects_uncertified_queue(self) -> None:
+        import os
+        from types import SimpleNamespace
+        import torch
+        from ..decision_maker.tuning_harnesses import mm
+
+        tensor = torch.empty((1, 1))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            case = {"case_id": "a"}
+            case_path = path / "case.json"
+            case_path.write_text(json.dumps(case))
+            for space in ("full", "heuristic"):
+                artifact = {"phase": space, "arch": "gfx942", "device": "cpu",
+                            "source_path": path / "candidate.py",
+                            "records": {"a": {"full_best_config": "full winner", "heuristic_config": "heuristic choice"}}}
+                with patch.dict(os.environ, {"TLX_AGENT_PROFILE_QUEUED": "1", "TLX_AGENT_PROFILE_WARMUP_LAUNCHES": "3"}), \
+                        patch.object(mm, "collect_rocprofv3", return_value={"summary": {"dominant_kernel": "gemm.kd"}}) as native, \
+                        patch.object(mm, "collect_amd_att", return_value={"valid": True}) as att:
+                    profile = mm.profile(artifact, case, {"artifacts_dir": str(path), "tools": ["rocprofv3", "amd_att"]})
+                self.assertIn("--queued-profile", native.call_args.args[0])
+                self.assertEqual(native.call_args.kwargs["exclude_kernel_prefixes"], ("_tlx_agent_profile_cache_clear",))
+                self.assertTrue(profile["profile_queue_certified"])
+                self.assertEqual(att.call_args.kwargs["iteration"], 9)
+                calls = []
+                op = lambda a, b, *, space: calls.append(space)
+                arguments = SimpleNamespace(case_json=case_path, candidate=path / "candidate.py", arch="gfx942",
+                                            device="cpu", winner="full winner", space=space, warmup_launches=3, queued_profile=True)
+                def queued(launch, count):
+                    for _ in range(count):
+                        launch()
+                    return [0.01] * count
+                with patch.object(mm, "_inputs", return_value=(tensor, tensor)), patch.object(mm, "_load_module"), \
+                        patch.object(mm, "_install_candidate", return_value=op), \
+                        patch.object(mm, "_oracle_winner", return_value=nullcontext(lambda: op(tensor, tensor, space="full"))), \
+                        patch.object(mm, "_queued_profile_samples", side_effect=queued):
+                    mm._run_profile_workload(arguments)
+                    self.assertEqual(calls, [space] * 13)
+                    with patch.object(mm, "_queued_profile_samples", return_value=None), \
+                            self.assertRaisesRegex(RuntimeError, "could not certify"):
+                        mm._run_profile_workload(arguments)
+                    self.assertEqual(calls, [space] * 13)
+
 
 
 class CommitBodyTest(unittest.TestCase):
@@ -2758,54 +3028,40 @@ class KernelOptimizerTest(unittest.TestCase):
     def test_failed_final_revalidation_restores_baseline_best_profile(self) -> None:
         baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
         candidate_source = "LATENCY_US = 80\nCORRECT = True\n"
-        baseline = PerformanceSummary(
-            cases=(
-                CaseEvaluation(
-                    case_id="a",
-                    verification=VerificationResult(True),
-                    timing=TimingSamples((100.0, 100.0)),
-                    profile={"marker": "baseline"},
-                ),
-            )
-        )
-        candidate = PerformanceSummary(
-            cases=(
-                CaseEvaluation(
-                    case_id="a",
-                    verification=VerificationResult(True),
-                    timing=TimingSamples((80.0, 80.0)),
-                    profile={"marker": "candidate"},
-                ),
-            )
-        )
-        rejected_final = PerformanceSummary(
-            cases=(
-                CaseEvaluation(
-                    case_id="a",
-                    verification=VerificationResult(True),
-                    timing=TimingSamples((120.0, 120.0)),
-                    profile={"marker": "rejected-final"},
-                ),
-            )
-        )
+        baseline = PerformanceSummary(cases=(CaseEvaluation(
+            case_id="a",
+            verification=VerificationResult(True),
+            timing=TimingSamples((100.0, 100.0)),
+            profile={"marker": "baseline"},
+        ), ))
+        candidate = PerformanceSummary(cases=(CaseEvaluation(
+            case_id="a",
+            verification=VerificationResult(True),
+            timing=TimingSamples((80.0, 80.0)),
+            profile={"marker": "candidate"},
+        ), ))
+        rejected_final = PerformanceSummary(cases=(CaseEvaluation(
+            case_id="a",
+            verification=VerificationResult(True),
+            timing=TimingSamples((120.0, 120.0)),
+            profile={"marker": "rejected-final"},
+        ), ))
         harness = Mock()
         harness.evaluate.side_effect = [baseline, candidate, rejected_final]
-        provider = FixedCandidateProvider(
-            [CandidateProposal(candidate_source, "faster before final revalidation")]
-        )
+        provider = FixedCandidateProvider([CandidateProposal(candidate_source, "faster before final revalidation")])
 
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory)
             with patch.object(
-                optimizer_module,
-                "SubprocessHarness",
-                return_value=harness,
+                    optimizer_module,
+                    "SubprocessHarness",
+                    return_value=harness,
             ):
                 result = KernelOptimizer(provider).optimize(
                     KernelOptimizationRequest(
                         kernel_source=baseline_source,
                         harness_path=output_dir / "unused_harness.py",
-                        cases=(InputCase("a", {}),),
+                        cases=(InputCase("a", {}), ),
                         target=KernelTarget("fake", "fake"),
                         budget=OptimizationBudget(
                             max_rounds=1,
@@ -2814,8 +3070,7 @@ class KernelOptimizerTest(unittest.TestCase):
                             benchmark_repetitions=2,
                         ),
                         output_dir=output_dir,
-                    )
-                )
+                    ))
             baseline_profile = _read_json(output_dir / "baseline_profile.json")
             best_profile = _read_json(output_dir / "best_profile.json")
             final_profile = _read_json(output_dir / "experiments/final/profile.json")
@@ -2824,11 +3079,12 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertEqual(result.stopping_reason, "finalist_revalidation_failed")
             self.assertEqual(result.best_kernel, baseline_source)
             self.assertEqual(result.final.cases[0].profile["marker"], "baseline")
-            self.assertEqual(
-                (output_dir / "best_kernel.py").read_text(), baseline_source
-            )
+            self.assertEqual((output_dir / "best_kernel.py").read_text(), baseline_source)
             self.assertEqual(best_profile, baseline_profile)
             self.assertEqual(final_profile, baseline_profile)
+            revalidation = _read_json(output_dir / "final_revalidation.json")
+            self.assertEqual(revalidation["performance"]["cases"][0]["profile"]["marker"], "rejected-final")
+            self.assertEqual(revalidation["performance"]["cases"][0]["timing"]["samples_us"], [120.0, 120.0])
 
     def test_optimizer_uses_profile_policy_and_records_profile_paths(self) -> None:
         provider = FixedCandidateProvider(

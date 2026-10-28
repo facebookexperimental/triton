@@ -34,7 +34,10 @@ MIN_REASONABLE_FULL_CONFIGS = 16
 
 
 def infer_kernel_path(repository: Path, op: str, arch: str) -> Path:
-    path = repository / "third_party" / "tlx" / "ops" / "kernels" / op / f"{canonical_arch(arch)}.py"
+    # gfx942 addmm uses the shared GEMM implementation, including its full
+    # configuration space and heuristic policy.
+    implementation_op = "mm" if op == "addmm" and canonical_arch(arch) == "gfx942" else op
+    path = repository / "third_party" / "tlx" / "ops" / "kernels" / implementation_op / f"{canonical_arch(arch)}.py"
     if not path.is_file():
         raise SystemExit(f"no production TLX kernel at {path}")
     return path
@@ -75,7 +78,10 @@ def run_tuning(
     vcs: str,
     initial_source: str | None = None,
     device_environments: tuple[dict[str, str], ...] = (),
+    stable_cv_max: float = 0.03,
 ) -> tuple[int, dict[str, Any]]:
+    if not 0 < stable_cv_max <= 1:
+        raise ValueError("stable_cv_max must be in (0, 1]")
     kernel_path = infer_kernel_path(repository, op, arch)
     original_source = initial_source if initial_source is not None else kernel_path.read_text()
     cases = production_cases(op, suite)
@@ -147,7 +153,7 @@ def run_tuning(
             "aggregate_min": 0.98,
             "per_case_min": 0.95,
             "max_heuristic_configs": 1,
-            "stable_cv_max": 0.03,
+            "stable_cv_max": stable_cv_max,
             "profile_complete_per_measurement": True,
             "minimum_full_config_count": MIN_REASONABLE_FULL_CONFIGS,
             "progressive": True,
@@ -192,6 +198,7 @@ def run_tuning(
         "kernel": str(kernel_path),
         "winner_experiment_id": heuristic_result.winner_experiment_id,
         "heuristic_speedup": heuristic_result.final.aggregate_speedup,
+        "stable_cv_max": stable_cv_max,
         "best_kernel": str(output_dir / "best_kernel.py"),
         "full_space_oracle": str(oracle_path),
         "recall_before": recall_before,
@@ -345,7 +352,7 @@ def _tuning_target(op: str, arch: str) -> KernelTarget:
         backend = "cuda"
     else:
         raise SystemExit(f"cannot infer GPU backend from --arch {arch!r}")
-    is_amd_mm = backend == "hip" and op == "mm"
+    is_amd_mm = backend == "hip" and op in {"mm", "addmm"}
     return KernelTarget(
         backend=backend,
         architecture=architecture,
@@ -358,11 +365,16 @@ def _tuning_target(op: str, arch: str) -> KernelTarget:
             "native-profiler and ATT evidence to identify the bottleneck, and cite the measured "
             "headroom behind each optimization direction. "
             "After two rejected parameter-only hypotheses, use profiler evidence and repository "
-            "research to propose a structural kernel hypothesis."),
+            "research to propose a structural kernel hypothesis. "
+            + ("The gfx942 addmm MLP target (M,N,K)=(4662,2560,2560) must keep SPLIT_K=1 "
+               "so its output can support row-partial reduction epilogues. Preserve bias addition "
+               "and the final dtype conversion. The new 160-row panel algorithm is measured only "
+               "on that exact shape; restrict its dispatch to that measured algorithm switch "
+               "unless additional shapes are validated." if op == "addmm" and architecture == "gfx942" else "")),
         optimization_skills=(("optimize-amd-gemm", ) if is_amd_mm else ()),
         evaluation_policy={
-            "require_native_profiler": architecture == "gfx942" and op == "mm",
-            "require_roofline": architecture == "gfx942" and op == "mm",
+            "require_native_profiler": architecture == "gfx942" and op in {"mm", "addmm"},
+            "require_roofline": architecture == "gfx942" and op in {"mm", "addmm"},
             "parameter_hypothesis_limit": 2,
         },
         supported_experiment_kinds=(ExperimentKind.PROMOTABLE, ExperimentKind.HUMAN_REVIEW),

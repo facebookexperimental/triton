@@ -8,6 +8,7 @@ import importlib.util
 import inspect
 import json
 import math
+import os
 import statistics
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from typing import Any
 
 import torch
 import triton
+import triton.language as tl
 
 
 def _repository_root() -> Path:
@@ -234,10 +236,29 @@ def profile(
     if not artifacts_dir:
         record["profiling_error"] = "profile request has no artifacts_dir"
         return record
-    winner = str(record.get("full_best_config", ""))
+    space = "heuristic" if artifact["phase"] == "heuristic" else "full"
+    winner = str(record.get("heuristic_config" if space == "heuristic" else "full_best_config", ""))
     if not winner:
-        record["profiling_error"] = "benchmark did not record a full-space winner"
+        record["profiling_error"] = f"benchmark did not record a {space} config"
         return record
+    record["profiled_space"] = space
+    record["profiled_config"] = winner
+    warmup_launches = int(os.environ.get("TLX_AGENT_PROFILE_WARMUP_LAUNCHES", "3"))
+    if not 1 <= warmup_launches <= 10000:
+        raise ValueError("TLX_AGENT_PROFILE_WARMUP_LAUNCHES must be between 1 and 10000")
+    record["profile_warmup_launches"] = warmup_launches
+    record["profile_measured_launches"] = 10
+    record["native_cache_policy"] = "warm inputs without benchmark cache clearing"
+    queued_profile = os.environ.get("TLX_AGENT_PROFILE_QUEUED", "0") == "1"
+    workload_options = {}
+    native_options = {}
+    if queued_profile:
+        workload_options["queued_profile"] = True
+        native_options["exclude_kernel_prefixes"] = ("_tlx_agent_profile_cache_clear",)
+        record["profile_queue_requested"] = True
+        record["profile_queue_gate_cycles"] = 10000000000
+        record["profile_compile_launches"] = 1
+        record["native_cache_policy"] = "cache cleared before every certified queued workload call"
     artifacts_path = Path(str(artifacts_dir))
     case_path = artifacts_path / "case.json"
     case_path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,6 +269,9 @@ def profile(
         artifact["device"],
         str(artifact["arch"]),
         winner,
+        space=space,
+        warmup_launches=warmup_launches,
+        **workload_options,
     )
     level = str(request.get("level", "summary"))
     if "rocprofv3" in tools:
@@ -257,22 +281,22 @@ def profile(
             level=level,
             sample_count=5,
             timeout_seconds=300.0,
+            **native_options,
         )
+        if queued_profile:
+            native = record["rocprofv3"]
+            record["profile_queue_certified"] = bool(native.get("summary")) and not native.get("error")
     if "amd_att" in tools:
         rocprof = record.get("rocprofv3", {})
         summary = rocprof.get("summary", {}) if isinstance(rocprof, Mapping) else {}
         kernel_filter = str(summary.get("dominant_kernel", "")).removesuffix(".kd")
-        record["amd_att"] = (
-            collect_amd_att(
-                workload,
-                artifacts_path,
-                kernel_filter=kernel_filter,
-                iteration=3,
-                timeout_seconds=300.0,
-            )
-            if kernel_filter
-            else {"error": "AMD ATT requires a dominant rocprofv3 kernel"}
-        )
+        record["amd_att"] = (collect_amd_att(
+            workload,
+            artifacts_path,
+            kernel_filter=kernel_filter,
+            iteration=warmup_launches + 5 + int(queued_profile),
+            timeout_seconds=300.0,
+        ) if kernel_filter else {"error": "AMD ATT requires a dominant rocprofv3 kernel"})
     if "rocprofv3" in tools:
         record["roofline"] = _roofline(case, record["rocprofv3"], str(artifact["arch"]), artifact["device"])
     return record
@@ -330,8 +354,12 @@ def _profile_workload_command(
     device: str,
     arch: str,
     winner: str,
+    *,
+    space: str = "full",
+    warmup_launches: int = 3,
+    queued_profile: bool = False,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(Path(__file__).resolve()),
         "--profile-workload",
@@ -345,7 +373,49 @@ def _profile_workload_command(
         arch,
         "--winner",
         winner,
+        "--space",
+        space,
+        "--warmup-launches",
+        str(warmup_launches),
     ]
+    if queued_profile:
+        command.append("--queued-profile")
+    return command
+
+
+@triton.jit
+def _tlx_agent_profile_cache_clear(cache, size: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(cache + offsets, 0, mask=offsets < size)
+
+
+def _queued_profile_samples(launch, count):
+    # Give the cache clear an owned name so only profiling infrastructure is
+    # excluded from native summaries. All kernels submitted by launch remain.
+    sys.path.insert(0, str(_REPO_ROOT / "python/test/tlx_benchmark"))
+    from _harness.measure import _gated_run
+
+    driver = triton.runtime.driver.active
+    original_clear_cache = driver.clear_cache
+
+    def clear_cache(cache):
+        size = cache.numel()
+        _tlx_agent_profile_cache_clear[(triton.cdiv(size, 1024),)](cache, size, 1024, num_warps=4)
+
+    driver.clear_cache = clear_cache
+    try:
+        # Compile both kernels before starting the gate; JIT work can take
+        # longer than the gate itself. This one workload dispatch is recorded
+        # separately from the queued warmups and measured calls.
+        clear_cache(driver.get_empty_cache_for_benchmark())
+        launch()
+        driver.get_device_interface().synchronize()
+        # Profiling callbacks are slower than ordinary launches. One long gate
+        # keeps every warmup and measured call ahead of the GPU, without retry
+        # launches changing the ATT matching-dispatch index.
+        return _gated_run(launch, count, 10000000000, None)
+    finally:
+        driver.clear_cache = original_clear_cache
 
 
 def _run_profile_workload(arguments: argparse.Namespace) -> int:
@@ -357,13 +427,22 @@ def _run_profile_workload(arguments: argparse.Namespace) -> int:
         "op": _install_candidate(module, arguments.arch),
         "device": arguments.device,
     }
-    with _oracle_winner(artifact, a, b, arguments.winner) as launch:
-        for _ in range(3):
-            launch()
-        torch.cuda.synchronize()
-        for _ in range(10):
-            launch()
-        torch.cuda.synchronize()
+    selected = (contextlib.nullcontext(lambda: artifact["op"](a, b, space="heuristic"))
+                if arguments.space == "heuristic" else _oracle_winner(artifact, a, b, arguments.winner))
+    with selected as launch:
+        if getattr(arguments, "queued_profile", False):
+            count = arguments.warmup_launches + 10
+            samples = _queued_profile_samples(launch, count)
+            if samples is None:
+                raise RuntimeError("native profiling workload could not certify its GPU queue")
+            print(json.dumps({"profile_queue_certified": True, "launch_count": count, "compile_launches": 1}), flush=True)
+        else:
+            for _ in range(arguments.warmup_launches):
+                launch()
+            torch.cuda.synchronize()
+            for _ in range(10):
+                launch()
+            torch.cuda.synchronize()
     return 0
 
 
@@ -375,6 +454,9 @@ def _parse_profile_arguments() -> argparse.Namespace:
     parser.add_argument("--device", required=True)
     parser.add_argument("--arch", required=True)
     parser.add_argument("--winner", required=True)
+    parser.add_argument("--space", choices=("full", "heuristic"), default="full")
+    parser.add_argument("--warmup-launches", type=int, default=3)
+    parser.add_argument("--queued-profile", action="store_true")
     return parser.parse_args()
 
 
@@ -443,11 +525,19 @@ def _oracle_winner(artifact: Mapping[str, Any], a, b, winner: str):
     # _tuned is lru_cached without strides: restore so same-shape cases still resolve their own winner.
     # A single-config Autotuner bypasses its cache, so the cache needs no clearing.
     original = tuner.configs
+    # The production launcher also caches a direct launch after two calls.
+    # Isolate that cache so it cannot bypass this explicitly selected config.
+    fast_configs = getattr(tuner, "_tlx_fast_configs", None)
+    tuner._tlx_fast_configs = {}
     tuner.configs = selected
     try:
         yield lambda: artifact["op"](a, b, space="full")
     finally:
         tuner.configs = original
+        if fast_configs is None:
+            del tuner._tlx_fast_configs
+        else:
+            tuner._tlx_fast_configs = fast_configs
 
 
 def _best_configs(tuners: Mapping[str, Any]) -> str:

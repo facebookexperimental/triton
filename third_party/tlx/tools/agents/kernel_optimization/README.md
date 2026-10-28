@@ -84,7 +84,7 @@ group. Large profile payloads (>1MB inline JSON) are spilled to
 TLX-agent exposes two tasks:
 
 - `authoring`: optimize kernel implementation source against its target harness.
-- `tuning`: expand a production configuration space and distill its full-space
+- `tuning`: measure a production configuration space and distill its full-space
   winners into a heuristic dispatch policy.
 
 Run standalone authoring from the Triton source repository root:
@@ -126,13 +126,41 @@ python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
 spell it explicitly. `--tune-after-authoring` instead infers `authoring`;
 production authoring without that flag should pass `--task authoring`
 explicitly.
+For gfx942 addmm, `--op addmm` evaluates the recorded bias tensors through
+`tlx.ops.addmm` and edits the shared `ops/kernels/mm/gfx942.py` implementation.
+Use `--suite gfx942_all` to benchmark the production addmm shapes.
+Use `--task authoring --tune-after-authoring --heuristic-rounds 1` to follow
+kernel authoring with one round updating `heuristic_config` against its full
+configuration space. Add `--no-commit-winner` to keep the results as artifacts.
+The addmm harness uses the production queued GPU-event metric and IQR outlier
+policy, recording raw and retained sample counts. Global split-K addmm
+configurations measure the complete GEMM and reducer launch pair; heuristic
+measurements retain the production launcher. Failed finalist measurements
+are preserved in `final_revalidation.json` even when the winner rolls back.
+`--stable-cv-max` controls which parity measurements count as stable (default
+0.03); it is separate from `--max-cv`. The parity targets remain 98% aggregate
+and 95% per stable shape.
+Run the local L2 comparisons from this Git checkout on gfx942:
+
+```bash
+python python/test/tlx_benchmark/bench_addmm.py --suite gfx942_all
+python python/test/tlx_benchmark/bench_torchtlx_addmm.py --suite gfx942_all
+```
+
+The TorchTLX runner requires a PyTorch build exposing the torchTLX integration;
+the local setup used PyTorch `2.15.0.dev20260827+rocm7.2` with the ROCm runtime
+libraries on `LD_LIBRARY_PATH`. The public ops runner also works with the local
+PyTorch `2.10.0+rocm7.0` environment. Both commands use the same 27-shape suite.
+
 The former `--objective kernel|heuristic-policy` spelling is deprecated and
 accepted only as a compatibility alias.
 
 The tuning task selects the least-used GPU matching `--arch`, sets its
 visibility before PyTorch initializes, applies the benchmark clock/power
 governor, and binds the process to the GPU-local NUMA node. Use `--device N` to
-pin a physical GPU, `--no-govern` for an intentionally ungoverned run, or
+pin a physical GPU. On AMD, N is the `rocm-smi` card index; the runner binds
+that card by UUID so HIP enumeration cannot select a different card.
+Use `--no-govern` for an intentionally ungoverned run, or
 `--no-commit-winner` for artifact-only execution. Artifacts default to
 `/tmp/tlx-agent-<arch>-<op>-<suite>`.
 
@@ -313,6 +341,25 @@ evidence. A case that beats its HBM roofline by more than 5% (operands cached ac
 replays) records `exceeds_roofline` and stays in the baseline without a limiter. No vendor-library baseline enters the decision loop. The raw viewer bundles remain
 separate artifacts. Set `TLX_ROCPROFV3` when rocprofv3 is not on `PATH` and
 `ROCPROF_ATT_LIBRARY_PATH` when its matching decoder is not discoverable.
+
+For gfx942 MM/addmm steady-state profiling, set
+`TLX_AGENT_PROFILE_WARMUP_LAUNCHES=256` for the entire authoring or tuning run.
+The workload uses this many warmup launches before its ten measured launches;
+ATT captures the fifth measured launch. Profiles record both launch counts so
+the full-space reference and heuristic candidate can use the same protocol.
+The default remains three warmup launches. GPU-event benchmark samples keep
+their existing cache policy.
+
+For native timings comparable to the production queued benchmark, also set
+`TLX_AGENT_PROFILE_QUEUED=1` for both the reference and candidate. This compiles
+the workload once, then queues the warmups and ten measured calls behind a GPU
+gate, clearing the benchmark cache before every queued call. An uncertified
+queue fails the workload. ATT still selects the fifth measured call, accounting
+for the separate compile launch. Native summaries exclude only the harness's
+`_tlx_agent_profile_cache_clear` kernel; workload producers, reducers, and
+consumers remain included. Profiles record the queue certificate, gate cycles,
+compile launch count, and cache policy. The default profiling protocol remains
+ordinary submissions.
 
 For an initial AMD smoke run, disable automatic commits and use a small search budget:
 

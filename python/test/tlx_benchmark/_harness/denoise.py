@@ -493,7 +493,17 @@ class Device:
 
     @property
     def visibility_env(self) -> str:
+        if self.vendor == AMD and self.uuid:
+            return "ROCR_VISIBLE_DEVICES"
         return "CUDA_VISIBLE_DEVICES" if self.vendor == NVIDIA else "HIP_VISIBLE_DEVICES"
+
+    @property
+    def visibility_environment(self) -> dict[str, str]:
+        if self.vendor == AMD and self.uuid:
+            # HIP ordinals can differ from rocm-smi card ordinals. Select the
+            # governed card by its HSA UUID, then expose its one HIP device.
+            return {"ROCR_VISIBLE_DEVICES": self.uuid, "HIP_VISIBLE_DEVICES": "0", "CUDA_VISIBLE_DEVICES": "0"}
+        return {self.visibility_env: str(self.index)}
 
     @property
     def power_target_w(self) -> Optional[int]:
@@ -540,6 +550,20 @@ def list_devices() -> list[Device]:
         return found
     if which == AMD:
         out = _rocm(["--showmeminfo", "vram", "--csv"]) or ""
+        unique_ids = {}
+        id_lines = (_rocm(["--showuniqueid", "--csv"]) or "").splitlines()
+        if id_lines and "unique id" in id_lines[0].lower():
+            for line in id_lines[1:]:
+                fields = [part.strip() for part in line.split(",")]
+                if len(fields) < 2 or not fields[0].lower().startswith("card"):
+                    continue
+                try:
+                    card = int(fields[0][4:])
+                    unique_id = int(fields[1], 16)
+                except ValueError:
+                    continue
+                if 0 < unique_id < 2**64:
+                    unique_ids[card] = f"GPU-{unique_id:016x}"
         found = []
         for line in out.splitlines()[1:]:
             f = [x.strip() for x in line.split(",")]
@@ -547,7 +571,9 @@ def list_devices() -> list[Device]:
                 used = _num(f[2])
                 idx = "".join(c for c in f[0] if c.isdigit())
                 if idx:
-                    found.append(Device(AMD, int(idx), _amd_name(int(idx)), None, (used or 0.0) / 1024 / 1024))
+                    found.append(
+                        Device(AMD, int(idx), _amd_name(int(idx)), unique_ids.get(int(idx)),
+                               (used or 0.0) / 1024 / 1024))
         return found
     return []
 
