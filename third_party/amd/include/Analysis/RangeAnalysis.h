@@ -13,31 +13,20 @@ class FuncOp;
 
 namespace mlir::triton::AMD {
 
-/// This struct (analysis) adapt's upstream's IntegerRangeAnalysis (inferring
-/// lower/upperbounds on integer constants) to our needs.
-/// Specifically there are 2 points of extension:
-///
-/// 1. Support for GetProgramIdOp, MakeRangeOp, SplatOp, ExpandDimsOp. *Note*,
-/// upstream already supports range inference for shaped types such as tensors
-/// (here we just implement effectively implement the interfaces for our ops).
-///    * Upstream's semantics for "range of shape type" is union over ranges of
-///    elements.
-///    * We do not use tablegen to implement
-///    DeclareOpInterfaceMethods<InferIntRangeInterface, ["inferResultRanges"]>
-///    in order to keep the entire implementation contained/encapsulated.
-///
-/// 2. Support for inference "through loops". Upstream's analysis conservatively
-/// inferences [min_int, max_int] for loop carried values (and therefore loop
-/// body values). Here we attempt to do better by analysis the loop bounds and
-/// "abstractly interpreting" the loop when loop bounds are statically known.
-/// See visitRegionSuccessors.
+struct IntegerAssumption {
+  ConstantIntRanges range;
+  Operation *owner;
+};
+using IntegerAssumptions = DenseMap<Value, SmallVector<IntegerAssumption>>;
+
+/// Integer ranges with scoped assumptions and bounded loop simulation.
 struct TritonIntegerRangeAnalysis : dataflow::IntegerRangeAnalysis {
   using dataflow::IntegerRangeAnalysis::IntegerRangeAnalysis;
   using Base = dataflow::IntegerRangeAnalysis;
-  TritonIntegerRangeAnalysis(
-      DataFlowSolver &solver,
-      const DenseMap<Value, SetVector<Operation *>> &assumptions,
-      DominanceInfo *dominanceInfo, bool assumeNoArithOverflow_ = false)
+  TritonIntegerRangeAnalysis(DataFlowSolver &solver,
+                             const IntegerAssumptions &assumptions,
+                             DominanceInfo *dominanceInfo,
+                             bool assumeNoArithOverflow_ = false)
       : dataflow::IntegerRangeAnalysis(solver), assumptions(assumptions),
         domInfo(dominanceInfo), assumeNoArithOverflow(assumeNoArithOverflow_) {}
 
@@ -46,10 +35,6 @@ struct TritonIntegerRangeAnalysis : dataflow::IntegerRangeAnalysis {
   void setPidBound(int axis, int64_t maxPID) { pidBounds[axis] = maxPID; }
 
   void setToEntryState(dataflow::IntegerValueRangeLattice *lattice) override;
-
-  void initializeFuncOp(triton::FuncOp funcOp);
-
-  LogicalResult initialize(Operation *top) override;
 
   LogicalResult visitOperation(
       Operation *op,
@@ -93,22 +78,13 @@ struct TritonIntegerRangeAnalysis : dataflow::IntegerRangeAnalysis {
       RegionSuccessor successor,
       ArrayRef<dataflow::AbstractSparseLattice *> abstractLattices) override;
 
-  /// Collect all operands that participate in assumptions (see description of
-  /// `assumptions` field below) under the rootOp. By default, operands that can
-  /// be folded to constants are excluded.
-  static DenseMap<Value, SetVector<Operation *>>
-  collectAssumptions(Operation *rootOp, bool filterConstants = true);
+  /// Collect constant comparison bounds and their assumption sites.
+  static IntegerAssumptions collectAssumptions(Operation *rootOp,
+                                               bool filterConstants = true);
 
-  /// Construct the tightest/narrowest range possible using all the assumptions
-  /// that `anchor` participates in. For example, the pattern
-  ///   %assumesltlhs = arith.cmpi sge, %K, %c0 : i32
-  ///   llvm.intr.assume %assumesltlhs : i1
-  ///   %assumesltlhs = arith.cmpi slt, %K, %c128 : i32
-  ///   llvm.intr.assume %assumesltlhs : i1
-  /// for %K, will produce a final range
-  ///   [0, 2147483647] ∩ [-2147483648, 128] = [0, 128]
-  std::optional<ConstantIntRanges> maybeGetAssumedRange(Value anchor,
-                                                        Block *useBlock) const;
+  /// Intersect inferred ranges with assumptions that dominate this use.
+  IntegerValueRange getRangeAt(Value value, Operation *use,
+                               const IntegerValueRange &inferred) const;
 
   int64_t getTotalLoopTripCount(LoopLikeOpInterface loop);
 
@@ -133,15 +109,7 @@ struct TritonIntegerRangeAnalysis : dataflow::IntegerRangeAnalysis {
       int64_t>
       loopVisits;
 
-  /// `assumptions` maps from values to (possibly) any operations that satisfy
-  /// the pattern
-  ///   %assumesltlhs = arith.cmpi sge, %K, %c0 : i32
-  ///   llvm.intr.assume %assumesltlhs : i1
-  ///   %assumesltlhs = arith.cmpi slt, %K, %c128 : i32
-  ///   llvm.intr.assume %assumesltlhs : i1
-  /// If one uses collectAssumptions below then `assumptions` will look like
-  /// %K -> {arith.cmpi slt..., arith.cmpi sge}.
-  llvm::DenseMap<Value, SetVector<Operation *>> assumptions;
+  IntegerAssumptions assumptions;
 
   /// The defaultTransferFunc is the default transfer function for this dataflow
   /// problem.
@@ -163,8 +131,6 @@ private:
       ArrayRef<const dataflow::IntegerValueRangeLattice *> operands,
       ArrayRef<dataflow::IntegerValueRangeLattice *> resultsLattices);
 
-  DenseSet<Value> signedIntValues;
-  llvm::SmallMapVector<Value, ConstantIntRanges, 2> opResultAssumption;
   DominanceInfo *domInfo = nullptr;
   bool assumeNoArithOverflow = false;
 
@@ -183,9 +149,6 @@ bool isEmptyInitializedRange(ConstantIntRanges rv);
 
 void populateFoldTrueCmpIOpPatterns(RewritePatternSet &patterns,
                                     DataFlowSolver *solver);
-
-void initializeFuncOps(Operation *op,
-                       TritonIntegerRangeAnalysis *rangeAnalysis);
 
 } // namespace mlir::triton::AMD
 

@@ -1,6 +1,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/Pass.h"
 #include "third_party/amd/include/Analysis/RangeAnalysis.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
@@ -21,13 +22,17 @@ struct TestAMDRangeAnalysisPass
     return "print the result of the tritonamdgpu-range-analysis pass";
   }
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<amdgpu::TritonAMDGPUDialect>();
+  }
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     ModuleOp mod = getOperation();
 
     // Collect assumptions in the function
-    DenseMap<Value, SetVector<Operation *>> assumptions =
+    AMD::IntegerAssumptions assumptions =
         AMD::TritonIntegerRangeAnalysis::collectAssumptions(getOperation());
     std::shared_ptr<DataFlowSolver> solver = createDataFlowSolver();
     AMD::TritonIntegerRangeAnalysis *rangeAnalysis =
@@ -43,7 +48,6 @@ struct TestAMDRangeAnalysisPass
         rangeAnalysis->setPidBound(axis, attr.getInt());
     }
 
-    AMD::initializeFuncOps(mod, rangeAnalysis);
     if (failed(solver->initializeAndRun(getOperation())))
       return signalPassFailure();
 

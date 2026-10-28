@@ -1078,3 +1078,40 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32}
     tt.return %3 : tensor<1024xf32, #blocked0>
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: tt.func @branch_local_assumption
+  tt.func @branch_local_assumption(%base: !tt.ptr<f32>, %x: i32, %branch: i1) {
+    %zero = arith.constant 0 : i32
+    %limit = arith.constant 63 : i32
+    %lo = arith.cmpi sge, %x, %zero : i32
+    %hi = arith.cmpi sle, %x, %limit : i32
+    %bounds = arith.andi %lo, %hi : i1
+    %ptrs = tt.splat %base : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %value = arith.constant dense<0.0> : tensor<256xf32, #blocked>
+    // CHECK: scf.if
+    scf.if %branch {
+      // CHECK: tt.store
+      %before = tt.splat %x : i32 -> tensor<256xi32, #blocked>
+      %p0 = tt.addptr %ptrs, %before : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+      tt.store %p0, %value : tensor<256x!tt.ptr<f32>, #blocked>
+      llvm.intr.assume %bounds : i1
+      // CHECK: amdg.buffer_store
+      %after = tt.splat %x : i32 -> tensor<256xi32, #blocked>
+      %p1 = tt.addptr %ptrs, %after : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+      tt.store %p1, %value : tensor<256x!tt.ptr<f32>, #blocked>
+    // CHECK: } else {
+    } else {
+      // CHECK-NOT: amdg.buffer_store
+      // CHECK: tt.store
+      %sibling = tt.splat %x : i32 -> tensor<256xi32, #blocked>
+      %p2 = tt.addptr %ptrs, %sibling : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+      tt.store %p2, %value : tensor<256x!tt.ptr<f32>, #blocked>
+    }
+    // CHECK: tt.return
+    tt.return
+  }
+}
