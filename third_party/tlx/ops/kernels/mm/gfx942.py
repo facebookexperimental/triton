@@ -5,7 +5,6 @@ full autotune space. Short-M ``mm`` shapes use an intra-CTA K split instead.
 """
 
 import functools
-import os
 from typing import NamedTuple
 
 import torch
@@ -1877,10 +1876,8 @@ def torchtlx_heuristic_config(M, N, K, *, dtype, out_dtype, a_strides, b_strides
     """Share the fixed shape policy with Inductor, preserving scaled epilogues."""
     enable = (dtype == torch.float16 and out_dtype == torch.float16 and a_strides == (K, 1) and b_strides == (1, K)
               and alpha == 1 and beta == 1)
-    if (enable and (M, N, K) == (4662, 2560, 2560)
-            and os.environ.get("TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE", "0").lower() in ("1", "auto", "force")):
-        # Shared-B row panels reduce the measured addmm -> LayerNorm latency
-        # from about 173 us to 160 us with unsplit K and FP16 rounding intact.
+    if enable and (M, N, K) == (4662, 2560, 2560):
+        # Shared-B row panels reduce padding while preserving increasing K order.
         return [_template_config((320, 128, 64, 4, 8), NUM_XCDS=1, XCD_CHUNK=1, SPLIT_M_256_64=True)]
     if enable and 4178 <= M <= 4942 and (N, K) in _TORCHTLX_PROD_TILES:
         # The register-only template favors different tiles than the tlx.ops

@@ -627,13 +627,7 @@ def install() -> None:
             return FusionResult.fuse(True)
         # Candidates without row-partial support raise RowPartialsUnsupported
         # while compiling and drop out of the fused benchmark.
-        # Newer nightly builds use the epilogue benchmark switch for templates.
-        benchmark_option = (
-            "benchmark_template_fusion"
-            if hasattr(config, "benchmark_template_fusion")
-            else "benchmark_epilogue_fusion"
-        )
-        with config.patch({benchmark_option: True}):
+        with config.patch({"benchmark_template_fusion": True}):
             return original_speedup_by_fusion(self, node1, node2)
 
     Scheduler.speedup_by_fusion = patched_speedup_by_fusion

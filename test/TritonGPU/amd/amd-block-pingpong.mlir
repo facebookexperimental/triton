@@ -84,8 +84,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: ttg.local_load {{.*}} -> tensor<16x256xbf16, #ttg.dot_op<{{.*}}kWidth = 4
 // CHECK: ttg.local_load {{.*}} -> tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 4
 // CHECK: ttg.local_load {{.*}} -> tensor<16x256xbf16, #ttg.dot_op<{{.*}}kWidth = 4
-// CHECK: tt.dot {{.*}}tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 4
-// CHECK: tt.dot {{.*}}tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 4
+// CHECK: %[[PACKED_FIRST:.+]] = tt.dot {{.*}}tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 4
+// CHECK: tt.dot {{.*}}, %[[PACKED_FIRST]] : tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 4
 // CHECK-NS3-LABEL: @pingpong_packed_k32(
 // CHECK-NS3-NOT: ttg.memdesc_subslice
 // CHECK-NS3: tt.dot

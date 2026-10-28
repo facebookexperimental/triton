@@ -90,8 +90,8 @@ from triton.tlx.ops.kernels.mm.gfx942 import matmul_kernel_gfx942
     idx_m1 = rows1[:, None]
     mask0 = (idx_m0 < M) & (idx_n < N)
     mask1 = (idx_m1 < M) & (idx_n < N)
-    {{reduction_store_output(("idx_m0", "idx_n"), "acc0", "mask0", partial_index="pid_n", partial_columns="BLOCK_N", val_shape=("BASE_PANEL_M", "BLOCK_N"))}}
-    {{reduction_store_output(("idx_m1", "idx_n"), "acc1", "mask1", partial_index="pid_n", partial_columns="BLOCK_N", val_shape=("PANEL_M", "BLOCK_N"))}}
+    {{store_output(("idx_m0", "idx_n"), "acc0", "mask0", val_shape=("BASE_PANEL_M", "BLOCK_N"))}}
+    {{store_output(("idx_m1", "idx_n"), "acc1", "mask1", val_shape=("PANEL_M", "BLOCK_N"))}}
 {% else %}
     input_rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
     input_cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
@@ -187,6 +187,6 @@ from triton.tlx.ops.kernels.mm.gfx942 import matmul_kernel_gfx942
     idx_m = rows[:, None]
     idx_n = cols[None, :]
     mask = (idx_m < M) & (idx_n < N)
-    {{reduction_store_output(("idx_m", "idx_n"), "acc", "mask", partial_index="pid_n", partial_columns="BLOCK_N", val_shape=("BLOCK_M", "BLOCK_N"))}}
+    {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
 {% endif %}
 {% endif %}
