@@ -108,6 +108,21 @@ static void createRegRealloc(TritonLLVMIRRewriter &b, int curRegs,
   NVVM::SetMaxRegisterOp::create(b, b.getLoc(), adjRegs, action);
 }
 
+static void foldSingleWarpPartitionWarpIds(ModuleOp mod) {
+  SmallVector<WarpIdOp> warpIds;
+  mod.walk([&](WarpIdOp op) {
+    if (getWarpGroupStartWarpId(op->getBlock()))
+      warpIds.push_back(op);
+  });
+  for (WarpIdOp op : warpIds) {
+    // If the partition has only one warp, the relative warp ID is always 0.
+    if (lookupNumWarps(op) == 1) {
+      TritonLLVMIRRewriter b(op.getLoc(), op);
+      b.replaceOp(op, b.i32_val(0));
+    }
+  }
+}
+
 static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
                                          const NVIDIA::TargetInfo &targetInfo) {
   SmallVector<WarpSpecializeOp> wsOps;
@@ -286,6 +301,8 @@ struct ConvertWarpSpecializeToLLVM
     pm.addPass(createReconcileUnrealizedCastsPass());
     if (failed(runPipeline(pm, mod)))
       return signalPassFailure();
+
+    foldSingleWarpPartitionWarpIds(mod);
 
     unsigned threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
     SmallVector<int32_t> partitionBarrierIds =
