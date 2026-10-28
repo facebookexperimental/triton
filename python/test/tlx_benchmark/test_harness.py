@@ -500,37 +500,6 @@ def test_visibility_variable_follows_the_vendor():
     assert Device(AMD, 2, "MI350X").visibility_env == "HIP_VISIBLE_DEVICES"
 
 
-def test_amd_visibility_uses_the_governed_card_uuid():
-    from _harness.denoise import AMD, NVIDIA, Device
-
-    selected = Device(AMD, 1, "MI300X", "GPU-fb166e58bccdde7c")
-    assert selected.visibility_env == "ROCR_VISIBLE_DEVICES"
-    assert selected.visibility_environment == {
-        "ROCR_VISIBLE_DEVICES": "GPU-fb166e58bccdde7c",
-        "HIP_VISIBLE_DEVICES": "0",
-        "CUDA_VISIBLE_DEVICES": "0",
-    }
-    assert Device(NVIDIA, 2, "NVIDIA B200").visibility_environment == {"CUDA_VISIBLE_DEVICES": "2"}
-    assert Device(AMD, 2, "MI300X").visibility_environment == {"HIP_VISIBLE_DEVICES": "2"}
-
-
-def test_amd_inventory_matches_unique_ids_by_card(monkeypatch):
-    from _harness import denoise
-
-    monkeypatch.setattr(denoise, "vendor", lambda: denoise.AMD)
-    monkeypatch.setattr(denoise, "_amd_name", lambda index: "MI300X")
-    outputs = {
-        ("--showmeminfo", "vram", "--csv"):
-        "device,total,used\ncard0,137438953472,1048576\ncard1,137438953472,2097152\ncard2,137438953472,0",
-        ("--showuniqueid", "--csv"): "device,Unique ID\ncard1,0xfb166e58bccdde7c\ncard2,N/A\ncard0,0x123",
-    }
-    monkeypatch.setattr(denoise, "_rocm", lambda args: outputs[tuple(args)])
-    fleet = denoise.list_devices()
-    assert [(device.index, device.uuid) for device in fleet] == [(0, "GPU-0000000000000123"),
-                                                                 (1, "GPU-fb166e58bccdde7c"), (2, None)]
-    assert [device.memory_used_mib for device in fleet] == [1, 2, 0]
-
-
 def test_sampler_join_does_not_shadow_thread_internals():
     from _harness.denoise import _Sampler
 

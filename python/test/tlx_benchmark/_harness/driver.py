@@ -456,7 +456,7 @@ def main(bench, argv=None) -> int:
     # op dispatch independently derives the architecture from its input device.
     select(device)
     if device is not None:
-        os.environ.update(device.visibility_environment)
+        os.environ[device.visibility_env] = str(device.index)
         print(f"device: gpu{device.index} {device.name} "
               f"({'least used' if args.device == 'auto' else 'requested'}, "
               f"{device.memory_used_mib:.0f} MiB in use)")
