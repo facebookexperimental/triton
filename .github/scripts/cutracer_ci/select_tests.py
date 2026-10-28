@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Choose the tests a CUTracer sanitizer run checks on each NVIDIA GPU.
 
-A manual run checks the test it names on the GPU it names. A pull request
-checks:
+A manual run checks the test it names on the GPU it names. The scheduled scan,
+or a manual run that names no test, checks each GPU's list in ``scan/``. A pull
+request checks:
 
     TLX kernel changes   on each GPU a changed file targets, that GPU's test
                          files that the repo's kernel_test_selection.py maps
@@ -18,6 +19,16 @@ Kernel files name the GPU they target: ``sm100`` or ``blackwell`` for B200,
 CUTracer instruments through NVBit. A test file runs on B200 when its name has
 ``sm100``, on H100 when it has ``sm90``, and on both with ``sm90up``; other
 test files, such as benchmarks and the tutorial correctness suite, do not run.
+
+The scan lists cover what a pull request does not: compiler changes reach the
+kernels only through tests. Each holds the TLX tests for its GPU (by the same
+name markers, plus ``sm90up`` and ``any``) and the tests of compiler paths that
+emit synchronization: pipelining, automatic warp specialization, TMA, CLC and
+2-CTA lowering. Large test files are cut to named protocol and configuration
+functions so a run fits in about two hours on B200 and one on H100. Left out:
+elementwise and compile-only tests, which have no asynchronous ordering to
+check (``test_core.py`` alone runs over an hour without CUTracer), and tests
+that fail without CUTracer.
 
 Each GPU's list goes to ``$GITHUB_OUTPUT`` as ``<gpu>=<json>``; an empty list
 means that GPU has nothing to check.
@@ -35,6 +46,7 @@ import tempfile
 from pathlib import Path
 
 SELECTOR = Path(__file__).resolve().parents[1] / "kernel_test_selection.py"
+SCAN_LISTS = Path(__file__).resolve().parent / "scan"
 GPUS = ("b200", "h100")
 SELF_TESTS = {
     "b200": "python/test/unit/tlx_ops/test_flash_attn_sm100.py::test_flash_attn_fwd[1-1-256-64-False-fp16]",
@@ -94,15 +106,23 @@ def select(changed: list[str]) -> dict[str, list[str]]:
     return tests
 
 
+def scan_list(gpu: str) -> list[str]:
+    lines = (SCAN_LISTS / f"{gpu}.txt").read_text().splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--test", help="The test a manual run names.")
     source.add_argument("--changed-files", type=Path, help="Files a pull request changes, one per line.")
+    source.add_argument("--scan", action="store_true", help="Each GPU's scan list.")
     parser.add_argument("--gpu", choices=GPUS, default="b200", help="The GPU a manual run uses.")
     args = parser.parse_args(argv)
 
-    if args.test:
+    if args.scan:
+        tests = {gpu: scan_list(gpu) for gpu in GPUS}
+    elif args.test:
         tests = {gpu: [args.test] if gpu == args.gpu else [] for gpu in GPUS}
     else:
         tests = select(args.changed_files.read_text().split())

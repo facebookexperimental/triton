@@ -116,7 +116,11 @@ def reopen(api, repo, issue, reopens, flaky, sha, run_url, reopened):
 
 
 def reconcile(api, repo, prefix, labels, failures_json, run_url, run_id):
-    """Close this job's recovered issues; returns the numbers closed."""
+    """Close this job's recovered issues; returns the numbers closed.
+
+    ``prefix`` is one title prefix or a tuple of them; an issue is this job's if
+    its title starts with any.
+    """
     try:
         failures = json.loads((failures_json or "").strip() or "[]")
     except ValueError as e:
@@ -242,7 +246,7 @@ def main():
     r.add_argument("--summary", default="")
     r.add_argument("--sha", required=True)
     c = sub.add_parser("reconcile")
-    c.add_argument("--prefix", required=True)
+    c.add_argument("--prefix", required=True, action="append", help="Repeat for several title prefixes.")
     c.add_argument("--failures", default="")
     g = sub.add_parser("group")
     g.add_argument("--prefix", required=True)
@@ -257,7 +261,7 @@ def main():
         group(gh, repo, a.prefix, labels, a.sha, os.environ.get("GITHUB_REF_NAME", "main"), a.run_url)
         return
     if a.cmd == "reconcile":
-        reconcile(gh, repo, a.prefix, labels, a.failures, a.run_url, int(os.environ["GITHUB_RUN_ID"]))
+        reconcile(gh, repo, tuple(a.prefix), labels, a.failures, a.run_url, int(os.environ["GITHUB_RUN_ID"]))
         return
 
     def output(action):

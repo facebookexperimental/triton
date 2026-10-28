@@ -15,7 +15,12 @@ _RACECHECK_SUMMARY_RE = re.compile(
 _REPORT_LINE_RE = re.compile(r"^=+\s+(?!ERROR SUMMARY|RACECHECK SUMMARY|COMPUTE-SANITIZER)(\S.*)$", re.MULTILINE)
 _REPORT_HEADER_RE = re.compile(r"^=+ (?!ERROR SUMMARY|RACECHECK SUMMARY|COMPUTE-SANITIZER|Target application)(\S.*)$",
                                re.MULTILINE)
-_API_ERROR_PREFIX = "Program hit CUDA_ERROR_"
+# Errors outside the kernel under test, which Compute Sanitizer still counts
+# in ERROR SUMMARY: a host CUDA API call that failed (driver "CUDA_ERROR_..."
+# or runtime "cudaError...", such as out of memory under memcheck), and a
+# launch the sanitizer could not track, such as cuBLAS's nvjet kernels.
+_API_ERROR_PREFIX = "Program hit "
+_SANITIZER_ERROR_PREFIX = "Internal Sanitizer Error"
 # A report line split into its "=" prefix, indent and text.
 _LINE_RE = re.compile(r"^=+( *)(.*)$")
 # Faulting device PC: "at <kernel>+0x<offset>", plus " in <file>:<line>" when
@@ -24,7 +29,7 @@ _LOCATION_RE = re.compile(r"\bat (\S+?)\+0x[0-9a-fA-F]+(?: in (\S+?):(\d+))?")
 # Host backtrace lines: long, and they say nothing about the kernel.
 _HOST_LINE = ("Host Frame:", "Saved host backtrace")
 _NOT_A_REPORT = ("COMPUTE-SANITIZER", "ERROR SUMMARY", "RACECHECK SUMMARY", "Target application",
-                 "Warning: Maximum number of hazards", _API_ERROR_PREFIX)
+                 "Warning: Maximum number of hazards", _API_ERROR_PREFIX, _SANITIZER_ERROR_PREFIX)
 MAX_REPORT_LINES = 20
 
 
@@ -43,9 +48,16 @@ def classify(tool: str, log_text: str) -> dict:
     match = _ERROR_SUMMARY_RE.search(log_text)
     if match is None:
         return {"outcome": "infra", "count": None}
-    api_errors = sum(header.startswith(_API_ERROR_PREFIX) for header in _REPORT_HEADER_RE.findall(log_text))
-    count = max(int(match.group(1)) - api_errors, 0)
-    return {"outcome": "findings" if count else "none", "count": count, "api_errors": api_errors}
+    headers = _REPORT_HEADER_RE.findall(log_text)
+    api_errors = sum(header.startswith(_API_ERROR_PREFIX) for header in headers)
+    sanitizer_errors = sum(header.startswith(_SANITIZER_ERROR_PREFIX) for header in headers)
+    count = max(int(match.group(1)) - api_errors - sanitizer_errors, 0)
+    return {
+        "outcome": "findings" if count else "none",
+        "count": count,
+        "api_errors": api_errors,
+        "sanitizer_errors": sanitizer_errors,
+    }
 
 
 def device_reports(log_text: str) -> list[dict]:
@@ -54,7 +66,8 @@ def device_reports(log_text: str) -> list[dict]:
     ``lines`` is the report as the sanitizer printed it, without the host
     backtrace. ``kernel``, ``file`` and ``line`` are None when the log does not
     give them; ``file`` is a basename, and source_paths.resolve_paths fills in
-    ``path``. Host API errors and the sanitizer's own banners are not reports.
+    ``path``. Host API errors, untracked launches and the sanitizer's own banners
+    are not reports.
     """
     reports = []
     current = None

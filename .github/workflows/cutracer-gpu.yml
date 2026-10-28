@@ -53,6 +53,22 @@ on:
       wheel_sha256:
         required: true
         type: string
+      job_minutes:
+        description: Job limit
+        required: true
+        type: number
+      sanitize_minutes:
+        description: Limit of the sanitizer step
+        required: true
+        type: number
+      file_minutes:
+        description: Limit of one sanitizer tool on one test file
+        required: true
+        type: number
+      delay_minutes:
+        description: Limit of the random-delay step
+        required: true
+        type: number
 
 permissions:
   contents: read
@@ -67,12 +83,15 @@ jobs:
       KERNEL: ${{ inputs.kernel }}
       TOOLS: ${{ inputs.tools }}
       GPU: ${{ inputs.gpu }}
-    # Setup takes about 4 minutes. The step limits below fit the rest inside
-    # the job's limit, so a slow run ends as incomplete with its logs uploaded
-    # instead of being cancelled. They allow about 1.5x the time the full
-    # sm90 flash-attention test file took on an H100: memcheck 6.4 minutes,
-    # random delay 7.
-    timeout-minutes: 40
+    # Setup takes about 4 minutes. The step limits fit the rest inside the
+    # job's limit, so a slow run ends as incomplete with its logs uploaded
+    # instead of being cancelled. For a pull request they allow about 1.5x the
+    # time the full sm90 flash-attention test file took on an H100: memcheck
+    # 6.4 minutes, random delay 7. For the scan they allow about 1.5x what it
+    # took on devgpus: synccheck 25 minutes and random delay 75 on a B200, 14
+    # and 46 on an H100, plus memcheck, whose time on the runner's newer
+    # sanitizer is not measured yet.
+    timeout-minutes: ${{ inputs.job_minutes }}
     permissions:
       id-token: write
       contents: read
@@ -114,8 +133,10 @@ jobs:
           cuda-arch: ${{ inputs.cuda_arch }}
       - name: Run sanitizers
         id: sanitize
-        timeout-minutes: 22
+        timeout-minutes: ${{ inputs.sanitize_minutes }}
         env:
+          FILE_MINUTES: ${{ inputs.file_minutes }}
+          SANITIZE_MINUTES: ${{ inputs.sanitize_minutes }}
           TESTS: ${{ inputs.tests }}
         run: |
           . "${SETUP_SCRIPT}"
@@ -135,7 +156,8 @@ jobs:
             --tools "${TOOLS}" \
             --kernel "${KERNEL}" \
             --out "${RUNNER_TEMP}/cutracer" \
-            --timeout-minutes 10 \
+            --timeout-minutes "${FILE_MINUTES}" \
+            --deadline-minutes "$((SANITIZE_MINUTES - 5))" \
             "${ISSUES[@]}" \
             -- python -m pytest "${TEST_IDS[@]}" --import-mode=importlib -q -p no:cacheprovider
       # See random_delay.py: a test that passes without CUTracer and fails
@@ -143,7 +165,7 @@ jobs:
       - name: Run tests under random delay
         id: delay
         if: ${{ !cancelled() && steps.sanitize.outcome != 'skipped' }}
-        timeout-minutes: 10
+        timeout-minutes: ${{ inputs.delay_minutes }}
         env:
           TESTS: ${{ inputs.tests }}
           SANITIZER_FAILURES: ${{ steps.sanitize.outputs.failures }}
@@ -186,7 +208,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cutracer-sanitizer-${{ inputs.gpu }}
-          path: ${{ runner.temp }}/cutracer
+          # The Triton caches only serve the run itself; for the scan they come
+          # to about 400 MB.
+          path: |
+            ${{ runner.temp }}/cutracer
+            !${{ runner.temp }}/cutracer/**/triton-cache/**
           if-no-files-found: warn
           retention-days: 30
 
@@ -226,22 +252,19 @@ jobs:
   reconcile:
     needs: sanitize
     # Runs after a successful sanitize job that produced a list; an empty
-    # output means no list was produced, not that nothing was found. Each call
-    # closes only within one kernel or tool this run checked, so a run of one
-    # test never closes another kernel's issue.
+    # output means no list was produced, not that nothing was found. It closes
+    # only within the kernels and tools this run checked, so a run of one test
+    # never closes another kernel's issue. One call covers them all: the scan
+    # checks about 200 kernels.
     if: needs.sanitize.outputs.reconcile_prefixes != ''
     permissions:
       contents: read
       issues: write
-    strategy:
-      fail-fast: false
-      matrix:
-        title_prefix: ${{ fromJSON(needs.sanitize.outputs.reconcile_prefixes) }}
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
       workflow_name: CUTracer Sanitizer
       job_name: sanitize-${{ inputs.gpu }}
       failures: ${{ needs.sanitize.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      title_prefix: ${{ matrix.title_prefix }}
+      title_prefixes: ${{ needs.sanitize.outputs.reconcile_prefixes }}
       labels: cutracer

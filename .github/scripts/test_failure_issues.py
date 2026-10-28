@@ -195,6 +195,16 @@ def test_reconcile_closes_recovered_issues_of_this_job_only():
     assert ("PATCH", f"repos/{REPO}/issues/1", {"state": "closed", "state_reason": "completed"}) in api.writes
 
 
+def test_one_reconcile_covers_several_prefixes_and_nothing_else():
+    api = FakeApi([
+        issue(1, state="open", title="[CUTracer][B200] k1 in a.py"),
+        issue(2, state="open", title="[CUTracer][B200] k2 in b.py"),
+        issue(3, state="open", title="[CUTracer][B200] k3 in c.py"),
+    ])
+    prefixes = ("[CUTracer][B200] k1 in ", "[CUTracer][B200] k2 in ")
+    assert fi.reconcile(api, REPO, prefixes, LABELS, "[]", RUN + "150", 150) == [1, 2]
+
+
 def test_reconcile_leaves_flaky_issues_open():
     assert reconcile(FakeApi([issue(1, state="open", labels=LABELS + ["flaky"])]), []) == []
 

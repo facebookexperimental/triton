@@ -1,6 +1,9 @@
+import os
+from pathlib import Path
+
 import pytest
 
-from select_tests import SELF_TESTS, main, select
+from select_tests import GPUS, SELF_TESTS, TEST_MARKERS, main, named_gpus, scan_list, select
 
 FA = "third_party/tlx/ops/kernels/flash_attn"
 FA_SM100_TEST = "python/test/unit/tlx_ops/test_flash_attn_sm100.py"
@@ -54,3 +57,18 @@ def test_pull_request_reads_the_changed_files(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     main(["--changed-files", str(changed)])
     assert output.read_text() == "b200=[]\nh100=[]\n"
+
+
+# A renamed or moved test must not drop out of the scan unnoticed, and a scan
+# list must not hold a test for the other GPU.
+@pytest.mark.parametrize("gpu", GPUS)
+def test_scan_list_names_existing_tests_for_its_gpu(gpu):
+    repo = Path(__file__).resolve().parents[3]
+    for test in scan_list(gpu):
+        path, *names = test.split("[")[0].split("::")
+        assert (repo / path).is_file(), test
+        source = (repo / path).read_text()
+        for name in names:
+            assert f"def {name}(" in source or f"class {name}" in source, test
+        named = named_gpus(os.path.basename(path), TEST_MARKERS)
+        assert not named or gpu in named, test

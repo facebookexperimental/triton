@@ -3,11 +3,13 @@ import os
 import stat
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
 
 from sample_logs import SYNCCHECK_CLEAN, SYNCCHECK_ERROR
+import sanitize
 from sanitize import main
 
 
@@ -105,7 +107,7 @@ def test_rejects_unknown_tool(fake_env):
 
 
 def test_main_writes_the_failure_list_only_when_asked(fake_env, monkeypatch):
-    _fake_cutracer(fake_env, {"synccheck": SYNCCHECK_ERROR, "memcheck": SYNCCHECK_CLEAN})
+    _fake_cutracer(fake_env, {"synccheck": SYNCCHECK_ERROR, "memcheck": SYNCCHECK_CLEAN}, kernel="_attn_fwd_ws")
     output = fake_env / "github_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     _run(fake_env)
@@ -113,10 +115,10 @@ def test_main_writes_the_failure_list_only_when_asked(fake_env, monkeypatch):
     _run(fake_env, "--issue-title-prefix", "[CUTracer][B200]", "--issue-job", "sanitize-b200")
     values = dict(line.partition("=")[::2] for line in output.read_text().splitlines())
     assert [(f["issue_title"], f["job_name"]) for f in json.loads(values["failures"])] == [
-        ("[CUTracer][B200] _attn_fwd_ws in sm100.py", "sanitize-b200"),
+        ("[CUTracer][B200] _attn_fwd_ws in /x/sm100.py", "sanitize-b200"),
     ]
-    # No kernel compiled in the fake run, so only the tools' prefixes.
     assert json.loads(values["reconcile_prefixes"]) == [
+        "[CUTracer][B200] _attn_fwd_ws in ",
         "[CUTracer][B200] synccheck incomplete",
         "[CUTracer][B200] memcheck incomplete",
     ]
@@ -160,3 +162,75 @@ def test_a_tool_that_did_not_finish_the_tests_checks_no_kernel(fake_env, monkeyp
         "[CUTracer][B200] synccheck incomplete",
         "[CUTracer][B200] memcheck incomplete",
     ]
+
+
+# A sanitizer error aborts its kernel and leaves a sticky CUDA error that fails
+# every later test in the process, so each test file needs its own process; a
+# case named on its own gets one too, for cases too large to share.
+def test_each_test_file_runs_in_its_own_process(fake_env):
+    _fake_cutracer(fake_env, {"synccheck": SYNCCHECK_ERROR, "memcheck": SYNCCHECK_CLEAN})
+    out = fake_env / "out"
+    main([
+        "--tools", "synccheck,memcheck", "--out",
+        str(out), "--", "python", "-m", "pytest", "a.py::t1", "b.py", "a.py::t2", "a.py::t3[big]", "-q"
+    ])
+    runs = [(r["tool"], r["cmd"][3:]) for r in json.loads((out / "results.json").read_text())["results"]]
+    assert runs == [
+        ("synccheck", ["a.py::t1", "a.py::t2", "-q"]),
+        ("memcheck", ["a.py::t1", "a.py::t2", "-q"]),
+        ("synccheck", ["b.py", "-q"]),
+        ("memcheck", ["b.py", "-q"]),
+        ("synccheck", ["a.py::t3[big]", "-q"]),
+        ("memcheck", ["a.py::t3[big]", "-q"]),
+    ]
+
+
+# A tool that times out must not leave the sanitizer or its tests running, or
+# the next test file would share the GPU with them.
+@pytest.mark.parametrize("ending", ["wait", "exit 245"])  # timed out; crashed with its tests running
+def test_a_tool_run_leaves_nothing_running(fake_env, ending):
+    script = fake_env / "bin" / "cutracer"
+    script.parent.mkdir()
+    pid_file = fake_env / "child.pid"
+    script.write_text(f"#!/bin/sh\nsleep 60 &\necho $! > {pid_file}\n{ending}\n")
+    script.chmod(0o755)
+    result = sanitize.run_tool("synccheck", ["python", "-c", "pass"], fake_env / "out", 1, fake_env / "cache")
+    assert result["outcome"] == "infra"
+    # Killed, so at most a zombie waiting for init to reap it, once the
+    # signal lands.
+    stat = Path(f"/proc/{int(pid_file.read_text())}/stat")
+    for _ in range(100):
+        if not stat.exists() or stat.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("the tool's child is still running")
+
+
+# A run that reaches its deadline still publishes what it found, and reports
+# the files it did not run, so reconcile closes nothing on its account.
+def test_a_run_past_its_deadline_reports_the_rest_as_not_run(fake_env, monkeypatch):
+    _fake_cutracer(fake_env, {"synccheck": SYNCCHECK_ERROR}, kernel="_attn_fwd_ws")
+    clock = iter([0, 0, 120])  # start, file a, file b
+    monkeypatch.setattr(sanitize.time, "monotonic", lambda: next(clock))
+    output = fake_env / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    out = fake_env / "out"
+    main([
+        "--tools", "synccheck", "--out",
+        str(out), "--deadline-minutes", "1", "--issue-title-prefix", "[CUTracer][B200]", "--", "python", "-m", "pytest",
+        "a.py", "b.py"
+    ])
+    results = json.loads((out / "results.json").read_text())["results"]
+    assert [(r["cmd"][3], r["outcome"]) for r in results] == [("a.py", "findings"), ("b.py", "infra")]
+    failures = json.loads(dict(line.partition("=")[::2] for line in output.read_text().splitlines())["failures"])
+    assert {f["issue_title"]
+            for f in failures
+            } == {"[CUTracer][B200] _attn_fwd_ws in /x/sm100.py", "[CUTracer][B200] synccheck incomplete"}
+
+
+# A tool that produced no summary checked nothing, even if the tests passed,
+# so its file's kernels must not be offered for closing.
+def test_a_tool_without_a_summary_does_not_count_its_kernels_as_checked(fake_env, monkeypatch):
+    _fake_cutracer(fake_env, {"synccheck": SYNCCHECK_CLEAN}, kernel="_attn_fwd_ws")
+    assert "[CUTracer][B200] _attn_fwd_ws in " not in _prefixes(fake_env, monkeypatch)

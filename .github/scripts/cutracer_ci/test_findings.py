@@ -15,7 +15,7 @@ def _found(tool, *reports):
 
 
 def _failures(*results):
-    return failure_list(list(results), CMD, "[CUTracer][B200]", "sanitize-b200")
+    return failure_list([{"cmd": CMD, **result} for result in results], "[CUTracer][B200]", "sanitize-b200")
 
 
 def test_reports_against_one_kernel_share_an_entry_across_tools():
@@ -60,6 +60,14 @@ def test_unresolved_path_falls_back_to_basename_then_kernel_then_unattributed():
                _report("C", kernel=None, path=None)))
     assert [e["normalized_failure_id"] for e in entries] == ["_attn_fwd_ws in sm100.py", "_attn_fwd_ws", "unattributed"]
     assert entries[1]["raw_failure_ids"] == "synccheck: B in _attn_fwd_ws"
+
+
+# A sanitizer report in a kernel the run did not compile is in a library the
+# test called (cuDNN computing a reference result), not in a Triton kernel.
+def test_reports_in_kernels_the_run_did_not_compile_are_not_filed():
+    result = _found("synccheck", _report("Divergent", kernel="cudnn_sdpa_bprop"), _report("Missing init"))
+    result["kernels"] = ["_attn_fwd_ws"]
+    assert [e["normalized_failure_id"] for e in _failures(result)] == ["_attn_fwd_ws in " + FA_PATH]
 
 
 def test_summary_is_capped():

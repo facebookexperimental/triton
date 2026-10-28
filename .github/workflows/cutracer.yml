@@ -5,10 +5,13 @@ name: CUTracer Sanitizer
 # because then the job checked nothing. A pull request checks each TLX kernel
 # it changes on the NVIDIA GPU it targets (B200 for sm100, H100 for sm90), or a
 # self-test on each GPU when it changes this pipeline (see select_tests.py); a
-# manual run checks the test it names on the GPU it names. CUTracer instruments
-# through NVBit, so AMD kernels are not checked. A manual run on main
-# files each finding as an issue, one per GPU, kernel and source file, labeled
-# cutracer, and closes the issues of kernels it checked that came back clean.
+# manual run checks the test it names on the GPU it names. A daily scan, or a
+# manual run that names no test, checks each GPU's list in
+# .github/scripts/cutracer_ci/scan/, which covers the compiler changes pull
+# requests do not. CUTracer instruments through NVBit, so AMD kernels are not
+# checked. A run of main (scheduled, or manual without a ref) files each
+# finding as an issue, one per GPU, kernel and source file, labeled cutracer,
+# and closes the issues of kernels it checked that came back clean.
 # It also files one issue per test function that passes without CUTracer but
 # fails twice under random delay; those stay open until closed by hand.
 # Pull requests report in the job summary only, and fail only on such a race
@@ -26,8 +29,8 @@ on:
         required: false
         type: string
       test:
-        description: Pytest node id or test file that launches the kernel
-        required: true
+        description: Pytest node id or test file that launches the kernel; empty runs the scan on both GPUs
+        required: false
         type: string
       gpu:
         description: GPU to run the test on
@@ -51,6 +54,9 @@ on:
         description: Random-delay length in nanoseconds
         required: false
         type: string
+  # In the hours the GPU runners are mostly idle.
+  schedule:
+    - cron: "0 8 * * *"
   # The select job decides what these changes need checked.
   pull_request:
     paths:
@@ -66,7 +72,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: cutracer-sanitizer-${{ github.ref }}
+  # A manual run on main must not cancel the scheduled scan, or the reverse.
+  group: cutracer-sanitizer-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -81,6 +88,7 @@ jobs:
     outputs:
       b200: ${{ steps.select.outputs.b200 }}
       h100: ${{ steps.select.outputs.h100 }}
+      scan: ${{ steps.select.outputs.scan }}
       known_b200: ${{ steps.known.outputs.b200 }}
       known_h100: ${{ steps.known.outputs.h100 }}
     steps:
@@ -95,12 +103,17 @@ jobs:
           TEST: ${{ inputs.test }}
           GPU: ${{ inputs.gpu }}
         run: |
+          scan=false
           if [[ "${GITHUB_EVENT_NAME}" == pull_request ]]; then
             git diff --name-only HEAD^1 HEAD > "${RUNNER_TEMP}/changed.txt"
             python3 .github/scripts/cutracer_ci/select_tests.py --changed-files "${RUNNER_TEMP}/changed.txt"
-          else
+          elif [[ -n "${TEST}" ]]; then
             python3 .github/scripts/cutracer_ci/select_tests.py --test "${TEST}" --gpu "${GPU}"
+          else
+            scan=true
+            python3 .github/scripts/cutracer_ci/select_tests.py --scan
           fi
+          echo "scan=${scan}" >> "${GITHUB_OUTPUT}"
       # Races already on main have an open issue; they must not fail this run.
       - name: Find known races
         id: known
@@ -142,10 +155,15 @@ jobs:
       cuda_arch: sm_100
       tests: ${{ needs.select.outputs.b200 }}
       known_races: ${{ needs.select.outputs.known_b200 }}
+      # Longer limits for the scan; see cutracer-gpu.yml.
+      job_minutes: ${{ needs.select.outputs.scan == 'true' && 225 || 40 }}
+      sanitize_minutes: ${{ needs.select.outputs.scan == 'true' && 90 || 22 }}
+      file_minutes: ${{ needs.select.outputs.scan == 'true' && 20 || 10 }}
+      delay_minutes: ${{ needs.select.outputs.scan == 'true' && 120 || 10 }}
       # The one place that decides whether this run files and closes issues:
-      # only a run of main's code speaks for main. It closes only the issues
+      # only a run of main's code speaks for main (a scheduled run has no ref). It closes only the issues
       # of kernels it checked (see findings.py).
-      file_issues: ${{ github.ref == 'refs/heads/main' && inputs.ref == '' }}
+      file_issues: ${{ github.ref == 'refs/heads/main' && (inputs.ref || '') == '' }}
       ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
       kernel: ${{ inputs.kernel || '' }}
       tools: ${{ inputs.tools || 'synccheck,memcheck' }}
@@ -170,7 +188,12 @@ jobs:
       cuda_arch: sm_90
       tests: ${{ needs.select.outputs.h100 }}
       known_races: ${{ needs.select.outputs.known_h100 }}
-      file_issues: ${{ github.ref == 'refs/heads/main' && inputs.ref == '' }}
+      # Longer limits for the scan; see cutracer-gpu.yml.
+      job_minutes: ${{ needs.select.outputs.scan == 'true' && 165 || 40 }}
+      sanitize_minutes: ${{ needs.select.outputs.scan == 'true' && 60 || 22 }}
+      file_minutes: ${{ needs.select.outputs.scan == 'true' && 20 || 10 }}
+      delay_minutes: ${{ needs.select.outputs.scan == 'true' && 90 || 10 }}
+      file_issues: ${{ github.ref == 'refs/heads/main' && (inputs.ref || '') == '' }}
       ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
       kernel: ${{ inputs.kernel || '' }}
       tools: ${{ inputs.tools || 'synccheck,memcheck' }}
