@@ -1583,6 +1583,10 @@ def test_mm_full_space_passes_complete_register_signature(monkeypatch):
             return launch
 
     monkeypatch.setattr(_gfx950, "_register_kernel", FakeTuner())
+    # The full space includes the heuristic plan, so remove it to reach the register fallback.
+    for name in ("_optimized_dispatch_for", "_dispatch_for", "_dispatch_plan", "heuristic_config"):
+        monkeypatch.setattr(_gfx950, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(_gfx950, "_range_dispatch_candidates", lambda *args, **kwargs: [])
     assert tlx_mm(a, b, out=out, space="full") is out
     args = captured["args"]
     assert args[0] is a

@@ -898,6 +898,36 @@ class TestTLXTemplates(TestCase):
             self.assertIn("_reduce_k_kernel", generated)
             torch.testing.assert_close(compiled(bias, a, b), expected, atol=0.05, rtol=0.05)
 
+    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    @parametrize("op_name", ("mm", "addmm", "bmm"))
+    def test_tlx_gfx950_templates_without_max_autotune(self, op_name):
+        torch.manual_seed(0)
+        if op_name == "bmm":
+            a = torch.randn((8, 256, 272), device=GPU_TYPE, dtype=torch.float16)
+            b = torch.randn((8, 272, 256), device=GPU_TYPE, dtype=torch.float16)
+            args, fn = (a, b), torch.bmm
+        else:
+            a = torch.randn((1024, 1024), device=GPU_TYPE, dtype=torch.float16)
+            b = torch.randn((1024, 1024), device=GPU_TYPE, dtype=torch.float16).t()
+            if op_name == "mm":
+                args, fn = (a, b), torch.mm
+            else:
+                bias = torch.randn((1024, ), device=GPU_TYPE, dtype=torch.float16)
+                args, fn = (bias, a, b), torch.addmm
+        torch._dynamo.reset()
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "max_autotune": False,
+                "max_autotune_gemm": False,
+                "fx_graph_cache": False,
+                "fx_graph_remote_cache": False,
+        }):
+            compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+            actual, code = run_and_get_code(compiled, *args)
+        torch.testing.assert_close(actual, fn(*args), atol=0.05, rtol=0.05)
+        # Inductor names a kernel lowered from a TLX template triton_tem_fused_tlx_<op>.
+        self.assertIn(f"tem_fused_tlx_{op_name}", "\n".join(code))
+
     @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
     @parametrize("shape", ((440, 4096, 1093), (902, 4096, 1091), (440, 4096, 2048)))
     def test_tlx_gfx942_addmm(self, shape):

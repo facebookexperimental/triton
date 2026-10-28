@@ -23172,15 +23172,7 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
             use_compiled_cache = _can_use_range_register_compiled_cache()
             if use_compiled_cache:
                 dispatch = _RANGE_TUNED_PLAN_CACHE.get(_range_tuned_plan_cache_key(a, b, out))
-        if dispatch is None:
-            candidates = _range_dispatch_candidates(m, n, k, a.dtype, a.element_size(), a.stride(), b.stride())
-            if len(candidates) == 1:
-                dispatch = candidates[0]
-            elif candidates:
-                return _launch_range_autotuned(a, b, out, candidates)
-            else:
-                return _launch_register(a, b, out=out)
-    else:
+    if dispatch is None:
         # Preserve the measured family selector for dense TN inputs.  The broader
         # master heuristic remains the fallback for layouts such as row-major B
         # that are outside the promoted selector's validated domain.
@@ -23207,6 +23199,19 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
                 b.stride(),
                 invariance=invariance,
             )
+        if space == "full":
+            # The full space must not lose to the heuristic, so the heuristic plan
+            # is a candidate too. It leads the list because an unstable autotune
+            # winner falls back to index 0.
+            candidates = _range_dispatch_candidates(m, n, k, a.dtype, a.element_size(), a.stride(), b.stride())
+            if dispatch is not None:
+                candidates = [dispatch] + [c for c in candidates if c != dispatch]
+            if len(candidates) == 1:
+                dispatch = candidates[0]
+            elif candidates:
+                return _launch_range_autotuned(a, b, out, candidates)
+            else:
+                return _launch_register(a, b, out=out)
     if dispatch is None:
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
