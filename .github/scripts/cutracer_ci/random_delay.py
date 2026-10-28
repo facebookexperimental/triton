@@ -215,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
         parts = []
         if not plain_run.finished:
             parts.append("incomplete: the run without CUTracer did not finish")
+        if not plain:
+            parts.append("not run: the run without CUTracer recorded no test, see its log")
         known = [test for test in confirmed if normalize(test) in known_races]
         new = len(confirmed) - len(known)
         new_race |= new > 0

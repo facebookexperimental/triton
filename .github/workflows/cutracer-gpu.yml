@@ -117,6 +117,13 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
+          # pytest's importlib mode leaves a test's own directory off sys.path, so a
+          # helper beside the test, such as mm_test_utils.py, would not import.
+          for test in "${TEST_IDS[@]}"; do
+            dir="${test%%::*}"; [[ -d "${dir}" ]] || dir="$(dirname "${dir}")"
+            PYTHONPATH="${PWD}/${dir}${PYTHONPATH:+:${PYTHONPATH}}"
+          done
+          export PYTHONPATH
           ISSUES=()
           if [[ "${FILE_ISSUES}" == true ]]; then
             ISSUES=(--issue-title-prefix "[CUTracer][${GPU^^}]" --issue-job "sanitize-${GPU}")
@@ -141,6 +148,13 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
+          # pytest's importlib mode leaves a test's own directory off sys.path, so a
+          # helper beside the test, such as mm_test_utils.py, would not import.
+          for test in "${TEST_IDS[@]}"; do
+            dir="${test%%::*}"; [[ -d "${dir}" ]] || dir="$(dirname "${dir}")"
+            PYTHONPATH="${PWD}/${dir}${PYTHONPATH:+:${PYTHONPATH}}"
+          done
+          export PYTHONPATH
           ISSUES=()
           if [[ "${FILE_ISSUES}" == true ]]; then
             ISSUES=(--issue-title-prefix "[CUTracer][${GPU^^}]" --issue-job "sanitize-${GPU}")
