@@ -998,10 +998,10 @@ bool isCompletionManagedByWarpSpecialization(ttng::MMAv5OpInterface mma) {
 
 scf::ForOp lowerMMA(ttng::MMAv5OpInterface mma, scf::ForOp forOp,
                     CoarseSchedule &schedule) {
-  Value alloc = mma.getAccumulator();
-
   if (isCompletionManagedByWarpSpecialization(mma))
     return forOp;
+
+  Value alloc = mma.getAccumulator();
 
   int mmaSelfLatency = getSelfLatencyFromAttr(mma.getOperation());
   if (mmaSelfLatency == 0) {
