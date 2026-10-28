@@ -101,15 +101,6 @@ inline bool npotSafeForLinearLayout(Attribute encoding) {
   return false;
 }
 
-// Whether both layouts support modular conversion.
-inline bool npotCvtSafe(RankedTensorType srcTy, RankedTensorType dstTy) {
-  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
-    return true;
-  }
-  return npotSafeForLinearLayout(srcTy.getEncoding()) &&
-         npotSafeForLinearLayout(dstTy.getEncoding());
-}
-
 // Returns whether the op is a "view op", i.e. doesn't move any data
 bool isView(Operation *op);
 

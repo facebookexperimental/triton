@@ -5454,6 +5454,20 @@ def test_local_reshape_compiles_gfx1250(device):
     assert len(compiled.asm["amdgcn"]) > 0
 
 
+@triton.jit
+def _npot_local_reshape_kernel(ROWS: tl.constexpr, COLS: tl.constexpr):
+    buffers = tlx.local_alloc((ROWS, COLS), tl.float32, 1)
+    tlx.local_reshape(tlx.local_view(buffers, 0), [COLS, ROWS])
+
+
+def test_npot_local_reshape_rejected_with_flag(monkeypatch):
+    monkeypatch.setenv("TRITON_ALLOW_NPOT", "1")
+    run_parser(_npot_local_reshape_kernel, args=(128, 32), target=SM90)
+    with pytest.raises(CompilationError) as e:
+        run_parser(_npot_local_reshape_kernel, args=(96, 32), target=SM90)
+    assert "NPOT reshape is not yet supported" in str(e.value.__cause__)
+
+
 def test_dot_scaled_tiles_per_warp_attr_gfx1250():
     compiled = _compile_dot_scaled_tiles_per_warp((2, 2))
     assert "amdg.wmma_tiles_per_warp = array<i32: 2, 2>" in compiled.asm["ttir"]

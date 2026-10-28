@@ -725,9 +725,6 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
       continue;
     srcTy = srcTy.cloneWithEncoding(srcEnc);
     auto dstTy = srcTy.cloneWithEncoding(physicalEncoding);
-    // Skip encodings without modular layout support.
-    if (!npotCvtSafe(srcTy, dstTy))
-      continue;
     // Leave force_shuffle absent so this detached op models the default path.
     OperationState state(op->getLoc(), ConvertLayoutOp::getOperationName());
     state.addOperands(operand);
@@ -3184,11 +3181,6 @@ public:
       // Collect converts whose scratch would push SMEM over budget.
       SmallVector<ConvertLayoutOp> candidates;
       funcOp->walk([&](ConvertLayoutOp cvt) {
-        auto srcTy = cvt.getSrc().getType();
-        auto dstTy = cvt.getType();
-        // Skip encodings without modular layout support.
-        if (!npotCvtSafe(srcTy, dstTy))
-          return;
         if (!cvtNeedsSharedMemory(cvt))
           return;
         candidates.push_back(cvt);
