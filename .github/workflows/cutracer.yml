@@ -47,6 +47,10 @@ on:
         description: cutracer version on PyPI
         required: false
         type: string
+      delay_ns:
+        description: Random-delay length in nanoseconds
+        required: false
+        type: string
   # The select job decides what these changes need checked.
   pull_request:
     paths:
@@ -146,6 +150,7 @@ jobs:
       kernel: ${{ inputs.kernel || '' }}
       tools: ${{ inputs.tools || 'synccheck,memcheck' }}
       cutracer_version: ${{ inputs.cutracer_version || '0.4.0' }}
+      delay_ns: ${{ inputs.delay_ns || '10000' }}
       wheel_url: ${{ needs.build.outputs.wheel_url }}
       wheel_filename: ${{ needs.build.outputs.wheel_filename }}
       wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
@@ -170,6 +175,7 @@ jobs:
       kernel: ${{ inputs.kernel || '' }}
       tools: ${{ inputs.tools || 'synccheck,memcheck' }}
       cutracer_version: ${{ inputs.cutracer_version || '0.4.0' }}
+      delay_ns: ${{ inputs.delay_ns || '10000' }}
       wheel_url: ${{ needs.build.outputs.wheel_url }}
       wheel_filename: ${{ needs.build.outputs.wheel_filename }}
       wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
