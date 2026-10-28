@@ -20,6 +20,17 @@ FWD_RTOL = 1.6e-2
 requires_gfx950 = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 
 
+@pytest.fixture
+def no_tf32():
+    """Disable TF32 without monkeypatch (pytest 9.2 teardown fails on the
+    dynamic cuBLASModule.allow_tf32 attribute; GitHub #4435)."""
+    matmul = torch.backends.cuda.matmul
+    prev = matmul.allow_tf32
+    matmul.allow_tf32 = False
+    yield
+    matmul.allow_tf32 = prev
+
+
 def _fwd_atol(num_softmax_heads):
     # Softmax rows land about one bf16 ULP from the reference on near-zero
     # outputs; silu matches tighter.
@@ -241,10 +252,10 @@ def test_hstu_cross_attn_each_curated_config_is_correct(index, splits, num_softm
     ([256] * 6, [127, 128, 129, 255, 256, 257]),
     ([256, 33, 31, 0], [129, 1, 128, 257]),
 ])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_backward_tails(monkeypatch, variant, q_lengths, kv_lengths):
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(0)
     device = "cuda"
     q_offsets = torch.tensor([0] + q_lengths, device=device, dtype=torch.int64).cumsum(0)
@@ -412,8 +423,8 @@ def test_hstu_cross_attn_gfx950_backward_rejects_removed_variants(monkeypatch, q
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("variant", ["v3_ttgir", "fp32_pipeline_qdo"])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_backward_query_dispatch(monkeypatch, variant):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     torch.manual_seed(17)
@@ -502,9 +513,9 @@ def _assert_cross_attention_fp32_close(actual, expected):
     ("retained", 256, 1, True, 256, torch.int64),
     ("fallback", 65, 2, False, 128, torch.int32),
 ])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_saved_tensor_layouts(monkeypatch, route, batch, heads, shared_kv, cap, offset_dtype):
     """Accept equivalent saved tensors with padded row and offset strides."""
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     torch.manual_seed(301)
@@ -692,9 +703,9 @@ def test_hstu_cross_attn_gfx950_retained_delta_widen_before_addressing():
     pytest.param(2, True, [0, 31, 256, 255], [257, 0, 1024, 129], False, id="compact-eight-warps"),
     pytest.param(1, True, [0, 31, 256, 255, 1], [0, 1, 129, 2048, 257], True, id="coarse-ragged"),
 ])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_fast_backward_reuse(monkeypatch, variant, heads, shared_kv, q_lengths, kv_lengths,
                                                     coarse):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     q_offsets = torch.tensor([0] + q_lengths, device="cuda", dtype=torch.int64).cumsum(0)
@@ -773,9 +784,9 @@ def test_hstu_cross_attn_gfx950_fast_backward_reuse(monkeypatch, variant, heads,
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("variant", ["v3_ttgir", "fp32_pipeline_qdo"])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_fallback_noncontiguous_dout_reuse(monkeypatch, variant):
     """Normalize changed gradient strides before fallback preprocessing."""
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     batch, cap = 65, 128
@@ -820,6 +831,7 @@ def test_hstu_cross_attn_gfx950_fallback_noncontiguous_dout_reuse(monkeypatch, v
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("variant", [None, "fp32_pipeline_qdo"])
 @pytest.mark.parametrize("cap", [383, 384, 512, 1024])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_coarse_boundary_preservation(monkeypatch, variant, cap):
     """Preserve baseline dKV accuracy at the coarse dispatch boundary.
 
@@ -827,7 +839,6 @@ def test_hstu_cross_attn_gfx950_coarse_boundary_preservation(monkeypatch, varian
     This exceeds the separate strict oracle gate of 0.005.
     Require baseline agreement and no increase in that FP32 error.
     """
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     q_lengths = [0, 31, 256, 255, 1]
@@ -885,8 +896,8 @@ def test_hstu_cross_attn_gfx950_coarse_boundary_preservation(monkeypatch, varian
 @pytest.mark.parametrize("variant", [None, "fp32_pipeline_qdo"])
 @pytest.mark.parametrize("cap", [256, 512, 2048])
 @pytest.mark.parametrize("alpha", [1.0 / 128, -1.0 / 128])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_retained_backward_reuse(monkeypatch, variant, cap, alpha):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     q_lengths = [0, 31, 256, 255, 1] + [0] * 2043
@@ -1031,12 +1042,12 @@ def test_hstu_cross_attn_gfx950_compact_single_key_gradient(monkeypatch, heads, 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("variant", [None, "fp32_pipeline_qdo"])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_compact_kv_partition_reuse(monkeypatch, variant):
     """Check both KV partitions with query tails and repeated backward calls."""
     heads = 1
     q_lengths = [31, 256, 255, 1]
     kv_lengths = [1023, 1024, 1025, 2047]
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     q_offsets = torch.tensor([0] + q_lengths, device="cuda", dtype=torch.int64).cumsum(0)
@@ -1074,11 +1085,11 @@ def test_hstu_cross_attn_gfx950_compact_kv_partition_reuse(monkeypatch, variant)
 @pytest.mark.parametrize("variant", ["v3_ttgir", "fp32_pipeline_qdo"])
 @pytest.mark.parametrize("cap", [1, 128])
 @pytest.mark.parametrize("alpha", [1.0 / 128, -1.0 / 128])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_fallback_single_key_gradient(monkeypatch, variant, cap, alpha):
     """A one-key softmax has zero score derivatives for every query."""
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     q_lengths = ([0, 1, 31, 32, 33, 127, 255, 256] * 9)[:65]
     q_offsets = torch.tensor([0] + q_lengths, device="cuda", dtype=torch.int64).cumsum(0)
     kv_offsets = torch.arange(66, device="cuda", dtype=torch.int64)
@@ -1110,11 +1121,11 @@ def test_hstu_cross_attn_gfx950_fallback_single_key_gradient(monkeypatch, varian
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("cap", [384, 512, 2048])
 @pytest.mark.parametrize("alpha", [1.0 / 128, -1.0 / 128])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_coarse_single_key_gradient(monkeypatch, cap, alpha):
     """A one-key softmax has zero score derivatives for every query."""
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     q_lengths = ([0, 1, 31, 32, 33, 127, 255, 256] * 9)[:64]
     q_offsets = torch.tensor([0] + q_lengths, device="cuda", dtype=torch.int64).cumsum(0)
     kv_offsets = torch.arange(65, device="cuda", dtype=torch.int64)
@@ -1307,8 +1318,8 @@ def test_hstu_cross_attn_gfx950_coarse_single_key_finite_extreme(cap, value, alp
 @pytest.mark.parametrize("variant", [None, "fp32_pipeline_qdo"])
 @pytest.mark.parametrize("cap", [256, 512, 1024, 2048])
 @pytest.mark.parametrize("alpha", [1.0 / 128, -1.0 / 128])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_retained_fixed_query_reuse(monkeypatch, variant, cap, alpha):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     q_lengths = [256] * 256
@@ -1365,8 +1376,8 @@ def test_hstu_cross_attn_gfx950_retained_fixed_query_reuse(monkeypatch, variant,
 @pytest.mark.parametrize("variant", ["fp32_pipeline_qdo", "v3_ttgir_fp32_pipeline_qdo"])
 @pytest.mark.parametrize("cap", [128])
 @pytest.mark.parametrize("alpha", [1.0 / 128, -1.0 / 128])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_generic_packed_query_reuse(monkeypatch, variant, cap, alpha):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     q_lengths = [256] * 65
@@ -1423,8 +1434,8 @@ def test_hstu_cross_attn_gfx950_generic_packed_query_reuse(monkeypatch, variant,
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("ragged_q", [False, True])
 @pytest.mark.parametrize("alpha", [1.0 / 128, -1.0 / 128])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_native_query_view_reuse(monkeypatch, ragged_q, alpha):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     cap = 384
@@ -1483,8 +1494,8 @@ def test_hstu_cross_attn_gfx950_native_query_view_reuse(monkeypatch, ragged_q, a
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("variant", [None, "fp32_pipeline_qdo"])
 @pytest.mark.parametrize("alpha", [1.0 / 128, -1.0 / 128])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_cached_delta_1024_reuse(monkeypatch, variant, alpha):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     cap = 1024
@@ -1534,8 +1545,8 @@ def test_hstu_cross_attn_gfx950_cached_delta_1024_reuse(monkeypatch, variant, al
 @pytest.mark.parametrize("ragged_q", [False, True])
 @pytest.mark.parametrize("ragged_k", [False, True])
 @pytest.mark.parametrize("alpha", [1.0 / 128, -1.0 / 128])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_packed_kv384_reuse(monkeypatch, ragged_q, ragged_k, alpha):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     monkeypatch.setattr(xa, "_SPACE", "smoke")
     cap = 384
@@ -1754,6 +1765,7 @@ def test_hstu_cross_attn_gfx950_backward_op_dispatch_mode(monkeypatch):
     ("pipeline", 2048, 128),
     ("small_separate", 5, 128),
 ])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_public_fullgraph_backward(monkeypatch, route, batch, cap):
     """Keep optimized backward launches inside the public custom-op boundary."""
     import functools
@@ -1762,7 +1774,6 @@ def test_hstu_cross_attn_gfx950_public_fullgraph_backward(monkeypatch, route, ba
     from triton.tlx.ops import _catalog, hstu_cross_attn
     from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(307)
     q_lengths = [31, 33, 0, 64] + [0] * (batch - 4)
     kv_lengths = [65, 0, 1, cap] + [0] * (batch - 4)
@@ -1836,13 +1847,13 @@ def test_hstu_cross_attn_gfx950_public_fullgraph_backward(monkeypatch, route, ba
 
 @requires_gfx950
 @pytest.mark.parametrize("cap", [128, 384])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_folded_gqa_default_backward(monkeypatch, cap):
     """Keep folded GQA on the generic backward route."""
     from triton.tlx.ops import hstu_cross_attn
     from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
 
     monkeypatch.setattr(gfx950, "_SPACE", "smoke")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(311)
     batch = 2048
     q_lengths = [31, 33, 0, 128] + [0] * (batch - 4)
@@ -1889,12 +1900,12 @@ def test_hstu_cross_attn_gfx950_folded_gqa_default_backward(monkeypatch, cap):
 
 @requires_gfx950
 @pytest.mark.parametrize("route,batch,shared_kv", [("compact", 4, True), ("small", 5, False)])
+@pytest.mark.usefixtures("no_tf32")
 def test_hstu_cross_attn_gfx950_int32_explicit_fast_route(monkeypatch, route, batch, shared_kv):
     """Keep int32 offsets on the requested fast route inside the custom op."""
     from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
 
     monkeypatch.setattr(gfx950, "_SPACE", "smoke")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(309)
     q_lengths = [31, 33, 0, 64, 16][:batch]
     kv_lengths = [65, 0, 1, 128, 65][:batch]
