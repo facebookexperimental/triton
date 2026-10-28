@@ -318,9 +318,25 @@ bool DotScaledOp::verifyDims() {
     if (this->getLhsKPack())
       aKdim *= 2;
   }
+  if (this->getAElemType() == ScaleDotElemType::E2M3 ||
+      this->getAElemType() == ScaleDotElemType::E3M2) {
+    // fp6 shapes count logical values; global storage is dense (4
+    // values per 3 bytes), consumed in groups of 16 values.
+    if (this->getLhsKPack()) {
+      if (aKdim % 16 != 0)
+        return false;
+    }
+  }
   if (this->getBElemType() == ScaleDotElemType::E2M1) {
     if (this->getRhsKPack())
       bKdim *= 2;
+  }
+  if (this->getBElemType() == ScaleDotElemType::E2M3 ||
+      this->getBElemType() == ScaleDotElemType::E3M2) {
+    if (this->getRhsKPack()) {
+      if (bKdim % 16 != 0)
+        return false;
+    }
   }
 
   return aKdim == bKdim;
@@ -357,6 +373,16 @@ LogicalResult DotScaledOp::verify() {
   if (this->getAElemType() == ScaleDotElemType::E2M1) {
     if (this->getLhsKPack())
       k *= 2;
+  }
+  if (this->getAElemType() == ScaleDotElemType::E2M3 ||
+      this->getAElemType() == ScaleDotElemType::E3M2) {
+    // fp6 shapes count logical values; global storage is dense (4
+    // values per 3 bytes), consumed in groups of 16 values.
+    if (this->getLhsKPack()) {
+      if (k % 16 != 0)
+        return this->emitError("logical K dim must be a multiple of 16 for "
+                               "fp6 (groups of 16 values / 12 bytes)");
+    }
   }
   auto cShape = this->getC().getType().getShape();
   int64_t mDim = cShape[cShape.size() - 2];
@@ -416,10 +442,24 @@ LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
     if (llvm::product_of(*scaleShape) == 1)
       return 0;
 
-    int64_t unpackFactor = (format == ScaleDotElemType::E2M1 && kPack) ? 2 : 1;
     int64_t kdim = operandShape[opIdx == 0 ? operandShape.size() - 1
-                                           : operandShape.size() - 2] *
-                   unpackFactor;
+                                           : operandShape.size() - 2];
+    if (format == ScaleDotElemType::E2M1 && kPack) {
+      kdim *= 2;
+    } else if ((format == ScaleDotElemType::E2M3 ||
+                format == ScaleDotElemType::E3M2) &&
+               kPack) {
+      // fp6 shapes count logical values; global storage is dense (4
+      // values per 3 bytes), consumed in groups of 16 values.
+      if (kdim % 16 != 0) {
+        std::ostringstream oss;
+        oss << "logical K dim " << kdim
+            << " must be a multiple of 16 for fp6 (groups of 16 values / "
+               "12 bytes)";
+        errMsg = oss.str();
+        return 0;
+      }
+    }
     int32_t scaleFactor = kdim / (*scaleShape)[scaleShape->size() - 1];
     if (scaleFactor != 16 && scaleFactor != 32) {
       std::ostringstream oss;
