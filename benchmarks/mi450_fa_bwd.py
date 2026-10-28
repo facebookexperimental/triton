@@ -297,7 +297,7 @@ def compile_kernel(config, artifacts, shape, *, compile_options=None, constants_
         constants["DQ_SLICES"] = max(1, shape[3] // config.block_n // 16) if config.cluster_dq else 1
     for name, field in (("OCC1", "occ1"), ("OCC1_K_BANDS", "occ1_k_bands"), ("OCC1_PREFETCH", "occ1_prefetch"),
                         ("OCC1_SCHED", "occ1_sched"), ("PHASE_IGLP", "phase_iglp"), ("OCC1_DQ_FIRST", "occ1_dq_first"),
-                        ("OCC1_LOAD_AFTER_DK", "occ1_load_after_dk")):
+                        ("OCC1_LOAD_AFTER_DK", "occ1_load_after_dk"), ("OCC1_PAD_K", "occ1_pad_k")):
         if name in kernel_fn.arg_names:
             constants[name] = getattr(config, field)
     # Mirror the fa_backward launch: split dK/dV stores and the tail-split
