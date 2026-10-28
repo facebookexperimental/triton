@@ -37,7 +37,7 @@ def test_npot_fma_dot_k(K, dtype, prec):
     c = torch.empty(M, N, device="cuda", dtype=torch.float32)
     if K == 24:
         # The 64x24 A operand has no legal shared memdesc to stage through.
-        with pytest.raises(RuntimeError, match="NPOT dot operand is not yet supported"):
+        with pytest.raises(RuntimeError, match="'tt.dot' op on an NPOT tensor is unsupported"):
             _dot_kernel[(1, )](a, b, c, M=M, N=N, K=K, PREC=prec)
         return
     h = _dot_kernel[(1, )](a, b, c, M=M, N=N, K=K, PREC=prec)

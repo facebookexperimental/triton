@@ -596,6 +596,8 @@ class HIPBackend(BaseBackend):
             mod.set_attr(f"ttg.cluster-dim-{axis}", ir.builder(mod.context).get_int32_attr(dim))
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+        if knobs.language.allow_npot:
+            passes.ttir.add_npot_pad(pm)
         passes.ttir.add_convert_to_ttgpuir(
             pm,
             f"hip:{options.arch}",
