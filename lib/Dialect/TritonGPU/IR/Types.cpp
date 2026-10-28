@@ -89,14 +89,6 @@ void MemDescType::print(AsmPrinter &printer) const {
   printer << ">";
 }
 
-bool mlir::triton::gpu::isLegalMemDescLayoutShape(ArrayRef<int64_t> shape,
-                                                  Attribute encoding) {
-  ArrayRef<int64_t> layoutShape = dropPipeliningDim(shape, encoding);
-  if (isa<SharedEncodingTrait>(encoding))
-    layoutShape = layoutShape.drop_front();
-  return llvm::all_of(layoutShape, llvm::isPowerOf2_64);
-}
-
 LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
                                   ArrayRef<int64_t> shape, Type elementType,
                                   Attribute encoding, Attribute memorySpace,
@@ -139,11 +131,18 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     // Every layout dimension must be a power of 2; only a leading pipeline
     // dimension and a shared buffer's first dimension may have another
     // positive size.
-    if (!isLegalMemDescLayoutShape(shape, encoding))
+    ArrayRef<int64_t> layoutShape = dropPipeliningDim(shape, encoding);
+    ArrayRef<int64_t> layoutAllocShape =
+        dropPipeliningDim(allocShape, encoding);
+    bool isShared = isa<SharedEncodingTrait>(encoding);
+    auto shapeToCheck = isShared ? layoutShape.drop_front() : layoutShape;
+    auto allocShapeToCheck =
+        isShared ? layoutAllocShape.drop_front() : layoutAllocShape;
+    if (!llvm::all_of(shapeToCheck, llvm::isPowerOf2_64))
       return emitError()
              << "shape must have power-of-2 and non-zero dimensions; got "
              << shape;
-    if (!isLegalMemDescLayoutShape(allocShape, encoding))
+    if (!llvm::all_of(allocShapeToCheck, llvm::isPowerOf2_64))
       return emitError()
              << "alloc shape must have power-of-2 and non-zero dimensions; got "
              << allocShape;

@@ -89,18 +89,8 @@ LogicalResult lowerLdStMatrix(
       0) {
     return failure();
   }
-  auto activeRegLayout = regLayout;
   auto memLayout = toLinearLayout(memDescType);
-  if (activeRegLayout.isModular()) {
-    auto allocShape = getAllocationShapePerCTA(memDescType);
-    memLayout = toLinearLayout(allocShape, memDescType.getEncoding());
-    SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
-    for (auto dim : activeRegLayout.getOutDimNames())
-      paddedOutDims.push_back({dim, memLayout.getOutDimSize(dim)});
-    activeRegLayout = LinearLayout(activeRegLayout.getBases(), paddedOutDims,
-                                   /*requireSurjective=*/false);
-  }
-  auto cvt = activeRegLayout.invertAndCompose(memLayout);
+  auto cvt = regLayout.invertAndCompose(memLayout);
   auto kBlock = StringAttr::get(loc.getContext(), "block");
   // ldmatrix/stmatrix does not support shared::cluster
   auto maybeSublayout = cvt.quotient({kBlock});
@@ -351,9 +341,8 @@ struct AsyncRemoteShmemReduceOpConversion
                                                         llvmElemTy, rewriter);
     auto regLayout =
         toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
-    auto [physicalRegLayout, sharedLayout] =
-        getPhysicalLayouts(regLayout, dstTy);
-    auto cvt = invertAndComposeBlockLocal(sharedLayout, physicalRegLayout);
+    auto sharedLayout = toLinearLayoutIgnoringPadding(dstTy);
+    auto cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
     auto vals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
 
     auto barrierTy = cast<MemDescType>(op.getBarrier().getType());

@@ -1939,6 +1939,21 @@ def test_npot_to_linear_layout_rejected_without_flag(monkeypatch):
     assert "Invalid out-dim size 3 for out-dim 'dim0'.  Out-dim sizes must be powers of 2." in str(e.value.__cause__)
 
 
+@pytest.mark.parametrize("M, N, layout, message", [
+    (64, 64, ttgl.DotOperandLayout(operand_index=0, parent=_MMA_V2_16X8, k_width=3),
+     "ttg.dot_op NPOT kWidth parameter is not yet supported for Ampere or Hopper MMA parent, got: 3"),
+    (4, 64,
+     ttgl.DistributedLinearLayout(reg_bases=[[1, 0], [2, 0]], lane_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+                                  warp_bases=[[0, 32], [0, 0]], block_bases=[], shape=[3, 64]),
+     "Invalid out-dim size 3 for out-dim 'dim0'.  Out-dim sizes must be powers of 2."),
+], ids=["dot_op_kwidth3", "linear_shape3"])
+def test_npot_layout_rejected_with_flag(M, N, layout, message, monkeypatch):
+    monkeypatch.setenv("TRITON_ALLOW_NPOT", "1")
+    with pytest.raises(CompilationError) as e:
+        run_parser(_npot_layout_kernel, *make_args(M, N, layout), target=HOPPER_TARGET)
+    assert message in str(e.value.__cause__)
+
+
 @gluon.jit
 def _npot_smem_kernel(shape: ttgl.constexpr):
     layout: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0])
@@ -1956,6 +1971,36 @@ def test_npot_shared_memdesc_leading_dim_accepted(flag, monkeypatch):
     with pytest.raises(CompilationError) as e:
         run_parser(_npot_smem_kernel, *make_args((64, 96)), target=HOPPER_TARGET)
     assert "shape must have power-of-2 and non-zero dimensions; got 64, 96" in str(e.value.__cause__)
+
+
+@gluon.jit
+def _npot_smem_reshape_kernel(shape: ttgl.constexpr, new_shape: ttgl.constexpr):
+    layout: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    ttgl.allocate_shared_memory(ttgl.int32, shape, layout).reshape(new_shape)
+
+
+@pytest.mark.parametrize("shape, new_shape, message", [
+    ([3, 32, 32], [96, 32], "NPOT reshape is not yet supported"),
+], ids=["smem_3x32x32"])
+def test_npot_smem_reshape_rejected_with_flag(shape, new_shape, message, monkeypatch):
+    monkeypatch.setenv("TRITON_ALLOW_NPOT", "1")
+    run_parser(_npot_smem_reshape_kernel, *make_args([64, 32], [32, 64]), target=HOPPER_TARGET)
+    with pytest.raises(CompilationError) as e:
+        run_parser(_npot_smem_reshape_kernel, *make_args(shape, new_shape), target=HOPPER_TARGET)
+    assert message in str(e.value.__cause__)
+
+
+@gluon.jit
+def _npot_tensor_kernel(shape: ttgl.constexpr):
+    ttgl.full(shape, 0, ttgl.int32, ttgl.BlockedLayout([1], [32], [4], [0]))
+
+
+def test_npot_distributed_tensor_rejected_with_flag(monkeypatch):
+    monkeypatch.setenv("TRITON_ALLOW_NPOT", "1")
+    run_parser(_npot_tensor_kernel, *make_args([128]), target=HOPPER_TARGET)
+    with pytest.raises(CompilationError) as e:
+        run_parser(_npot_tensor_kernel, *make_args([96]), target=HOPPER_TARGET)
+    assert "Shape element 0 must be a power of 2" in str(e.value.__cause__)
 
 
 def test_tensor_layout_type_changed():

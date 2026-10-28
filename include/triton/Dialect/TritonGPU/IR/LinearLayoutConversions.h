@@ -55,6 +55,10 @@ LinearLayout toLinearLayout(TensorOrMemDesc type);
 // with the allocShape as the shape, otherwise the layout will be incorrect!
 LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout);
 
+// Under TRITON_ALLOW_NPOT, `shape` with every NPOT extent rounded up to a power
+// of two; NPOT layouts are built on this cover. Without the flag, `shape`.
+SmallVector<int64_t> getNpotCoverShape(ArrayRef<int64_t> shape);
+
 // Returns true if the layouts differ only in the order of their register
 // basis vectors. Reordering those vectors changes the order of values within a
 // thread, but not the set of tensor elements owned by each lane/warp/block.

@@ -59,9 +59,7 @@ LogicalResult lowerLocalStore(
   assert(regLayout.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
          "expected register broadcasting to be removed by the caller");
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
-  auto [physicalRegLayout, sharedLayout] =
-      getPhysicalLayouts(regLayout, memDescTy);
-  regLayout = std::move(physicalRegLayout);
+  auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
   auto cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
                  rewriter, targetInfo, nullptr, clusterCTARank, barrierPtr);
@@ -193,9 +191,7 @@ public:
 
     auto regLayout =
         toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
-    auto [physicalRegLayout, sharedLayout] =
-        getPhysicalLayouts(regLayout, memDescTy);
-    regLayout = std::move(physicalRegLayout);
+    auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
     auto cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
 
     std::optional<std::pair<Value, Value>> distributedCoordinates;
