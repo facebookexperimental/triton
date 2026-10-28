@@ -35,7 +35,7 @@ from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import (
 
 
 @triton.jit
-def _forward_state(Q, K, V, O, LSE, HQ: tl.constexpr, HK: tl.constexpr, N: tl.constexpr):
+def _forward_state(Q, K, V, O, LSE, HQ: tl.constexpr, HK: tl.constexpr, N: tl.constexpr, CAUSAL: tl.constexpr = False):
     head = tl.program_id(1)
     kv_head = head // HQ * HK + head % HQ // (HQ // HK)
     rows = tl.program_id(0) * 64 + tl.arange(0, 64)
@@ -50,6 +50,9 @@ def _forward_state(Q, K, V, O, LSE, HQ: tl.constexpr, HK: tl.constexpr, N: tl.co
         k = tl.load(K + offsets)
         v = tl.load(V + offsets)
         scores = tl.dot(q, tl.trans(k)) * (128**-0.5 * 1.4426950408889634)
+        if CAUSAL:
+            # Key 0 is always visible, so every row's running maximum is finite.
+            scores = tl.where(keys[None, :] <= rows[:, None], scores, float("-inf"))
         new_max = tl.maximum(maximum, tl.max(scores, 1))
         alpha = tl.exp2(maximum - new_max)
         p = tl.exp2(scores - new_max[:, None])
@@ -60,7 +63,7 @@ def _forward_state(Q, K, V, O, LSE, HQ: tl.constexpr, HK: tl.constexpr, N: tl.co
     tl.store(LSE + head.to(tl.int64) * N + rows, (maximum + tl.log2(total)) * 0.6931471805599453)
 
 
-def make_case(shape, reference=False, seed=0):
+def make_case(shape, reference=False, seed=0, causal=False):
     b, hq, hk, n = shape
     torch.manual_seed(seed)
     q, do = [torch.randn((b, hq, n, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
@@ -68,7 +71,7 @@ def make_case(shape, reference=False, seed=0):
     o = torch.empty_like(q)
     lse = torch.empty((b, hq, n), device="cuda", dtype=torch.float32)
     if not reference:
-        _forward_state[(n // 64, b * hq)](q, k, v, o, lse, hq, hk, n, num_warps=4)
+        _forward_state[(n // 64, b * hq)](q, k, v, o, lse, hq, hk, n, causal, num_warps=4)
         return (q, k, v, o, do, lse), None
     dq = torch.empty_like(q, dtype=torch.float32)
     dk, dv = [torch.zeros_like(k, dtype=torch.float32) for _ in range(2)]
@@ -79,6 +82,8 @@ def make_case(shape, reference=False, seed=0):
             kr = k[batch, kh].float().requires_grad_()
             vr = v[batch, kh].float().requires_grad_()
             scores = qr @ kr.T * 128**-0.5
+            if causal:
+                scores = scores.masked_fill(~torch.ones_like(scores, dtype=torch.bool).tril(), float("-inf"))
             probs = scores.softmax(-1)
             out = probs @ vr
             grads = torch.autograd.grad(out, (qr, kr, vr), do[batch, head].float())
@@ -102,7 +107,7 @@ def errors(actual, expected):
     return result
 
 
-def fp32_backward_reference(case, *, query_block=256, head_block=4):
+def fp32_backward_reference(case, *, query_block=256, head_block=4, causal=False):
     """Independent chunked PyTorch reference, with full FP32 softmax/gradients.
 
     Recompute probabilities from Q/K rather than using the providers' forward
@@ -131,6 +136,10 @@ def fp32_backward_reference(case, *, query_block=256, head_block=4):
                     queries = q[batch, first:last, start:end].float()
                     dout = do[batch, first:last, start:end].float()
                     scores = torch.bmm(queries, keys.transpose(1, 2)) * d**-0.5
+                    if causal:
+                        hidden = torch.arange(n, device=q.device)[None, :] > torch.arange(start, end,
+                                                                                          device=q.device)[:, None]
+                        scores = scores.masked_fill(hidden, float("-inf"))
                     probs = scores.softmax(-1)
                     dp = torch.bmm(dout, values.transpose(1, 2))
                     ds = probs * (dp - (probs * dp).sum(-1, keepdim=True)) * d**-0.5
@@ -148,8 +157,9 @@ def fp32_backward_reference(case, *, query_block=256, head_block=4):
 class AiterBackward:
     """Call the default gfx1250 ASM kernels, including fresh dQ zeroing."""
 
-    def __init__(self, case, library, split_batches=True):
+    def __init__(self, case, library, split_batches=True, causal=False):
         self.case = case
+        self.causal = causal
         q, k, v, o, do, lse = case
         self.b, self.hq, self.n, _ = q.shape
         self.hk = k.shape[1]
@@ -167,7 +177,7 @@ class AiterBackward:
         self.dk, self.dv = torch.empty_like(k), torch.empty_like(v)
         self.lib = ctypes.CDLL(str(Path(library).resolve()))
         self.fn = self.lib.mi450_aiter_bwd
-        self.fn.argtypes = [ctypes.c_void_p] * 11 + [ctypes.c_int] * 4 + [ctypes.c_float, ctypes.c_void_p]
+        self.fn.argtypes = [ctypes.c_void_p] * 11 + [ctypes.c_int] * 5 + [ctypes.c_float, ctypes.c_void_p]
         self.fn.restype = ctypes.c_float
 
     def __call__(self):
@@ -175,7 +185,8 @@ class AiterBackward:
         tensors = (q, k, v, o, do, lse, self.delta, self.dqa, self.dq, self.dk_exp, self.dv_exp)
         start = 0
         for chunk in self.batch_chunks:
-            status = self.fn(*(t[start:].data_ptr() for t in tensors), chunk, self.hq, self.hk, self.n, 128**-0.5,
+            status = self.fn(*(t[start:].data_ptr() for t in tensors), chunk, self.hq, self.hk, self.n,
+                             int(self.causal), 128**-0.5,
                              torch.cuda.current_stream().cuda_stream)
             if status < 0:
                 raise RuntimeError(f"aiter did not select a kernel: {status}")
@@ -300,6 +311,8 @@ def compile_kernel(config, artifacts, shape, *, compile_options=None, constants_
                         ("OCC1_LOAD_AFTER_DK", "occ1_load_after_dk")):
         if name in kernel_fn.arg_names:
             constants[name] = getattr(config, field)
+    if "CAUSAL" in kernel_fn.arg_names:
+        constants["CAUSAL"] = False
     # Mirror the fa_backward launch: split dK/dV stores and the tail-split
     # partition change the epilogue and the pointer signature.
     b, hq, hk, n = shape
@@ -480,21 +493,25 @@ def main():
     parser.add_argument("--sustained-seconds", type=float, default=0,
                         help="Additional continuous bench with clock/power telemetry; 0 disables")
     parser.add_argument("--num-cus", type=int, default=192, help="CU count for offline compile policy selection")
+    parser.add_argument("--causal", action="store_true",
+                        help="Causal mask; TFLOPS then count half of the 10·B·Hq·N²·D non-causal FLOPs")
     args = parser.parse_args()
     if args.sustained_seconds < 0 or args.sustained_seconds and args.mode != "bench":
         parser.error("--sustained-seconds requires bench mode and a non-negative duration")
     shape = tuple(map(int, args.shape.split(",")))
     overrides = json.loads(args.config) if args.config else {}
     config = select_config(shape[-1], *shape[:3], num_cus=args.num_cus if args.mode == "compile" else None,
-                           packed_dq=overrides.get("packed_dq", True))
+                           packed_dq=overrides.get("packed_dq", True), causal=args.causal)
     config = dataclasses.replace(config, **overrides)
     kernel_sha256 = hashlib.sha256(
         Path(__file__).parents[1].joinpath(
             "third_party/tlx/ops/kernels/flash_attn/gfx1250_bwd.py").read_bytes()).hexdigest()
     identity = measurement_identity()
+    flops = (5 if args.causal else 10) * shape[0] * shape[1] * shape[3]**2 * 128
 
     def emit(record):
         record["time"] = time.time()
+        record["causal"] = args.causal
         record["kernel_sha256"] = kernel_sha256
         record["experiment"] = os.environ.get("MI450_EXPERIMENT", "initial")
         record.update(identity)
@@ -505,16 +522,21 @@ def main():
 
     if args.mode == "compile":
         emit({
-            "mode": "compile", "shape": shape, "config": dataclasses.asdict(config),
-            **compile_kernel(config, args.artifacts, shape)
+            "mode":
+            "compile", "shape":
+            shape, "config":
+            dataclasses.asdict(config), **compile_kernel(
+                config, args.artifacts, shape, constants_overrides=dict(CAUSAL=True, DQ_SLICES=_dq_slices(
+                    config, shape[3], True)) if args.causal else None, compiler_options_fn=lambda c: _compiler_options(
+                    c, shape[3], args.causal))
         })
         return
     if not os.environ.get("GPU_LOCK_HELD"):
         raise RuntimeError("Run GPU modes under gpu-lock and pass GPU_LOCK_HELD through Docker")
-    case, reference = make_case(shape, reference=args.mode == "check")
+    case, reference = make_case(shape, reference=args.mode == "check", causal=args.causal)
     if args.fp32_reference and args.mode == "bench":
-        reference = fp32_backward_reference(case)
-    workspace = allocate_workspace(case[0], case[1], config=config)
+        reference = fp32_backward_reference(case, causal=args.causal)
+    workspace = allocate_workspace(case[0], case[1], config=config, causal=args.causal)
     configs = [config]
     if args.mode in ("tune", "pipeline"):
         if args.mode == "tune":
@@ -528,36 +550,42 @@ def main():
                 dataclasses.replace(config, stages=stages, unroll=unroll)
                 for stages, unroll in itertools.product((2, 3, 4), (1, 2, 4, 8))
             ]
-        check_case, check_reference = make_case((1, 4, 2, 512), reference=True)
-        check_workspace = allocate_workspace(check_case[0], check_case[1], config=config)
+        check_case, check_reference = make_case((1, 4, 2, 512), reference=True, causal=args.causal)
+        check_workspace = allocate_workspace(check_case[0], check_case[1], config=config, causal=args.causal)
     for config in configs:
         record = {"mode": args.mode, "shape": shape, "provider": "tlx", "config": dataclasses.asdict(config)}
         try:
             if args.mode == "check":
-                record["errors"] = errors(fa_backward(*case, config=config, workspace=workspace), reference)
+                record["errors"] = errors(fa_backward(*case, causal=args.causal, config=config, workspace=workspace),
+                                          reference)
                 # A second invocation catches missing per-call accumulator clearing.
-                record["repeat_errors"] = errors(fa_backward(*case, config=config, workspace=workspace), reference)
+                record["repeat_errors"] = errors(
+                    fa_backward(*case, causal=args.causal, config=config, workspace=workspace), reference)
             else:
                 if args.fp32_reference and args.mode == "bench":
-                    record["errors"] = errors(fa_backward(*case, config=config, workspace=workspace), reference)
-                    record["repeat_errors"] = errors(fa_backward(*case, config=config, workspace=workspace), reference)
+                    record["errors"] = errors(
+                        fa_backward(*case, causal=args.causal, config=config, workspace=workspace), reference)
+                    record["repeat_errors"] = errors(
+                        fa_backward(*case, causal=args.causal, config=config, workspace=workspace), reference)
                 if args.mode in ("tune", "pipeline"):
-                    record["errors"] = errors(fa_backward(*check_case, config=config, workspace=check_workspace),
-                                              check_reference)
-                samples = benchmark(lambda: fa_backward(*case, config=config, workspace=workspace), args.repeat_ms)
+                    record["errors"] = errors(
+                        fa_backward(*check_case, causal=args.causal, config=config, workspace=check_workspace),
+                        check_reference)
+                samples = benchmark(lambda: fa_backward(*case, causal=args.causal, config=config, workspace=workspace),
+                                    args.repeat_ms)
                 record.update(ms=statistics.median(samples), samples_ms=samples,
-                              tflops=10 * shape[0] * shape[1] * shape[3]**2 * 128 / statistics.median(samples) / 1e9)
+                              tflops=flops / statistics.median(samples) / 1e9)
                 if args.sustained_seconds:
                     record["sustained"] = sustained_benchmark(
-                        lambda: fa_backward(*case, config=config, workspace=workspace), record["ms"],
-                        args.sustained_seconds)
+                        lambda: fa_backward(*case, causal=args.causal, config=config, workspace=workspace),
+                        record["ms"], args.sustained_seconds)
             emit(record)
         except Exception as exc:
             if args.mode not in ("tune", "pipeline"):
                 raise
             emit({**record, "error": str(exc)})
     if args.aiter_library:
-        aiter = AiterBackward(case, args.aiter_library, split_batches=not args.aiter_unsplit)
+        aiter = AiterBackward(case, args.aiter_library, split_batches=not args.aiter_unsplit, causal=args.causal)
         record = {"mode": args.mode, "shape": shape, "provider": "aiter", "batch_chunks": aiter.batch_chunks}
         if args.mode == "check":
             record["errors"] = errors(aiter(), reference)
@@ -569,7 +597,7 @@ def main():
                     record["errors"] = errors(aiter(), reference)
             samples = benchmark(aiter, args.repeat_ms)
             record.update(ms=statistics.median(samples), samples_ms=samples,
-                          tflops=10 * shape[0] * shape[1] * shape[3]**2 * 128 / statistics.median(samples) / 1e9)
+                          tflops=flops / statistics.median(samples) / 1e9)
             if args.sustained_seconds:
                 record["sustained"] = sustained_benchmark(aiter, record["ms"], args.sustained_seconds)
         emit(record)

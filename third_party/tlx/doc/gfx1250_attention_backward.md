@@ -1,10 +1,11 @@
 # Attention backward on MI450 (gfx1250)
 
 `third_party/tlx/ops/kernels/flash_attn/gfx1250_bwd.py` implements a
-non-causal, head-dimension-128, BF16 flash-attention backward for gfx1250. It
-supports MHA and GQA (`Hq % Hkv == 0`) with equal Q and KV lengths. The entry
-point is `fa_backward(q, k, v, o, do, lse, sm_scale=None, *, config=None,
-workspace=None)` on contiguous BHND tensors with FP32 LSE. It returns dQ, dK
+head-dimension-128, BF16 flash-attention backward for gfx1250, non-causal or
+causal. It supports MHA and GQA (`Hq % Hkv == 0`) with equal Q and KV lengths.
+The entry point is `fa_backward(q, k, v, o, do, lse, sm_scale=None,
+causal=False, *, config=None, workspace=None)` on contiguous BHND tensors with
+FP32 LSE. It returns dQ, dK
 and dV in BF16.
 
 The kernel ports the delayed-dQ schedule of the gfx950 backward
@@ -62,6 +63,80 @@ There are two schedules. `select_config` picks one per shape.
   fills the 192 CUs evenly. `tail_splits` splits only the KV owners of the
   incomplete final dispatch round. The other workgroups keep direct BF16 dK/dV
   stores, and only the tail owners write FP32 partials.
+
+### Causal attention
+
+Causal attention (query row `r` sees keys `0..r`) runs only the occupancy-1
+kernel without dispatch-tail splits.
+
+- KV tile `j` sees only query rows `>= 256·j`. Its pass iterates over a
+  compacted outer index that skips the fully masked 64-row Q tiles of every
+  head in the group. A helper maps that index back to the flattened Q tile
+  for TDM loads and dQ rows. The TDM ring slot follows the compacted index.
+- Only the first four outers of each head cross the diagonal. Each pass
+  visits every head's diagonal outers first, in their own loop, which masks
+  the exponent to `-inf` before `exp2`, so P and dS are zero above the
+  diagonal. The steady loop then runs the non-causal phase with no mask or
+  branch. Splitting the loop this way was worth −3% to −14% at MHA and up to
+  −5% at short GQA, against a single loop with a runtime mask branch. With
+  four splits, one diagonal outer per head is left, and the split loop
+  spills, so that case keeps one loop in head-major order.
+- The delayed dQ of a phase-0 step targets the last row tile of the previous
+  compacted outer, which may belong to the previous query head.
+- Work per KV tile falls linearly with `j`, and a head's tiles launch as one
+  cluster that finishes with its heaviest tile. As in AITER's causal kernel,
+  each workgroup therefore runs two passes, tile `i` and then tile `NT−1−i`,
+  so every workgroup in a cluster does the same work. Grid X and the cluster
+  are halved. Each cluster still covers every KV tile of its dQ slice, so the
+  dQ atomics keep SE scope. Without pairing, causal 4K–8K ran at about 0.85×
+  AITER; pairing made 4K–16K 20–36% faster.
+- Pairing halves the grid, so short and GQA grids can leave the last
+  dispatch round partly empty. For GQA, `q_splits` of 2 or 4 split every
+  pass. Split `s` owns the outers `o` with `o % S == s` in every KV tile, so
+  all contributors to a dQ row stay in one cluster, and each split writes a
+  private FP32 dK/dV slice that convert sums. The selector splits in two
+  when the last round is at most half full and in four on GQA grids of at
+  least eight rounds: −5% to −11% at those shapes. MHA passes are too short
+  to amortize a split, and lost up to 30%.
+- The Q/dO ring, statistics and dS buffers are allocated once for both
+  passes. V offsets come from pinned 1D ranges, and dK/dV are stored per band
+  from the WMMA layout, so no layout conversion needs LDS beside the rings
+  (209 KiB in total).
+- The preprocess and convert kernels are unchanged.
+- Skipping the dQ WMMAs of fully masked KV bands in the diagonal loop with
+  uniform branches was rejected: the branches break the band schedule and
+  spill at MHA (+7% to +12%), for at most −1.7% at GQA.
+- The pair loop keeps more values live around each pass, so causal keeps
+  one resident dQ K band (none with four splits): −0.2% to −1.2%.
+- Also measured and rejected: running tiles unpaired (+15% to +75%, the
+  clusters finish with their heaviest tile), issuing the next pass's Q/dO
+  ring with its K load (neutral), and loading the next pass's V before the
+  dK/dV stores (+30% to +44% at MHA).
+
+The main loop has no spills. The pass prologue, drain and epilogue spill
+152–164 bytes per pass, because the pass loop keeps a few more values live at
+the 1,024-VGPR limit. Non-causal configurations compile to the same ISA as
+before.
+
+Causal timings from the same A0 setup, one round per shape. TFLOPS count
+5·B·Hq·N²·128 FLOPs, half the non-causal convention:
+
+| Shape (B,Hq,Hkv,N) | AITER | FP32 dQ | Packed dQ | FP32 / AITER | Packed / AITER |
+|---|---:|---:|---:|---:|---:|
+| 16,16,16,1K | 527 | 574 | 633 | 1.09 | 1.20 |
+| 16,16,16,2K | 690 | 795 | 841 | 1.15 | 1.22 |
+| 16,16,16,4K | 785 | 998 | 1041 | 1.27 | 1.32 |
+| 16,16,16,8K | 843 | 1123 | 1152 | 1.33 | 1.37 |
+| 16,16,16,16K | 870 | 1185 | 1223 | 1.36 | 1.41 |
+| 8,64,8,1K | 511 | 570 | 617 | 1.12 | 1.21 |
+| 16,64,8,1K | 524 | 618 | 675 | 1.18 | 1.29 |
+| 8,64,8,2K | 667 | 798 | 863 | 1.20 | 1.29 |
+| 8,64,8,4K | 770 | 910 | 991 | 1.18 | 1.29 |
+| 8,64,8,8K | 834 | 1067 | 1123 | 1.28 | 1.35 |
+| 8,64,8,16K | 864 | 1138 | 1199 | 1.32 | 1.39 |
+
+AITER runs its `causal_br` assembly kernel. With equal lengths, bottom-right
+causal is ordinary causal.
 
 ### Compiler support used by the kernel
 
@@ -154,6 +229,9 @@ The tests cover:
   loop.
 - Correctness of the ping-pong, clustered and occupancy-1 paths against a
   PyTorch reference, including uneven Q splits and dispatch-tail splits.
+- Causal correctness for MHA and GQA from N = 512 to 8K in both dQ
+  precisions and 1, 2 or 4 Q splits, with NaN-poisoned workspaces, and
+  rejection of unsupported causal configs.
 
 Tests that compile or run kernels skip on targets other than gfx1250.
 Selector and validation tests run on any host.
@@ -186,8 +264,11 @@ without a GPU and saves the assembly together with resource usage.
 
 ## Limitations
 
-- Non-causal only, D = 128, BF16 inputs, and N must be a multiple of the KV
-  tile (256, or 128 for the BN128 path) with N ≥ 256.
+- D = 128, BF16 inputs, and N must be a multiple of the KV tile (256, or 128
+  for the BN128 path) with N ≥ 256.
+- Causal attention requires `N/256` in {2, 4, 8, 16} or a multiple of 32
+  (paired tiles per cluster). It supports `q_splits` of 1, 2 or 4 (each
+  split needs two outers of the shortest pass), but not `tail_splits`.
 - Sliding windows, dropout and variable-length batches are not supported.
 - One query-head group's FP32 dQ workspace must fit in the 2 GiB signed
   buffer range: `(Hq/Hkv)·N·128 < 2²⁹`.

@@ -1700,19 +1700,20 @@ def _compile_attention_backward_kernel(config, shape, *, compile_options=None, c
     from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _compiler_options, _delayed_bwd_kernel
 
     b, hq, hk, n = shape
-    constants = dict(
-        HQ=hq, HK=hk, N=n, SM_SCALE=128**-0.5, BM=config.block_m, BN=config.block_n, NW=config.num_warps,
-        TDM=config.use_tdm, STAGES=config.stages, DELAYED=config.delayed, UNROLL=config.unroll,
-        FRAGMENT_FENCES=config.fragment_fences, FRAGMENT_FENCE_MASK=config.fragment_fence_mask,
-        FRAGMENTED=config.fragmented, RESIDENT_KV=config.resident_kv, ORDERED=config.ordered,
-        PACKED_DQ=config.packed_dq, REMATERIALIZE=config.rematerialize, OUTER_M=config.outer_m,
-        ASYNC_STATS=config.async_stats, Q_SPLITS=config.q_splits, REUSE_Q=config.reuse_q, PINGPONG=config.pingpong,
-        SPREAD_DQ=config.spread_dq, LOG2_LSE=config.log2_lse, CACHE_SCORE_K=config.cache_score_k,
-        TILE_MAJOR=config.tile_major, PARTITION_LDS=config.partition_lds, FRONT_REGIONS=config.front_regions,
-        BRIDGE_REGIONS=config.bridge_regions, CLUSTER_DQ=config.cluster_dq,
-        DQ_SLICES=max(1, n // config.block_n // 16) if config.cluster_dq else 1, OCC1=config.occ1,
-        OCC1_K_BANDS=config.occ1_k_bands, OCC1_PREFETCH=config.occ1_prefetch, OCC1_SCHED=config.occ1_sched,
-        PHASE_IGLP=config.phase_iglp, OCC1_DQ_FIRST=config.occ1_dq_first, OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk)
+    constants = dict(HQ=hq, HK=hk, N=n, SM_SCALE=128**-0.5, BM=config.block_m, BN=config.block_n, NW=config.num_warps,
+                     TDM=config.use_tdm, STAGES=config.stages, DELAYED=config.delayed, UNROLL=config.unroll,
+                     FRAGMENT_FENCES=config.fragment_fences, FRAGMENT_FENCE_MASK=config.fragment_fence_mask,
+                     FRAGMENTED=config.fragmented, RESIDENT_KV=config.resident_kv, ORDERED=config.ordered,
+                     PACKED_DQ=config.packed_dq, REMATERIALIZE=config.rematerialize, OUTER_M=config.outer_m,
+                     ASYNC_STATS=config.async_stats, Q_SPLITS=config.q_splits, REUSE_Q=config.reuse_q,
+                     PINGPONG=config.pingpong, SPREAD_DQ=config.spread_dq, LOG2_LSE=config.log2_lse,
+                     CACHE_SCORE_K=config.cache_score_k, TILE_MAJOR=config.tile_major,
+                     PARTITION_LDS=config.partition_lds, FRONT_REGIONS=config.front_regions,
+                     BRIDGE_REGIONS=config.bridge_regions, CLUSTER_DQ=config.cluster_dq,
+                     DQ_SLICES=max(1, n // config.block_n //
+                                   16) if config.cluster_dq else 1, OCC1=config.occ1, OCC1_K_BANDS=config.occ1_k_bands,
+                     OCC1_PREFETCH=config.occ1_prefetch, OCC1_SCHED=config.occ1_sched, PHASE_IGLP=config.phase_iglp,
+                     OCC1_DQ_FIRST=config.occ1_dq_first, OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, CAUSAL=False)
     constants["SPLIT_KV_STORES"] = config.occ1 and config.packed_dq and config.q_splits > 1
     tail_splits = getattr(config, "tail_splits", 1)
     tail_base = tail_owners = 0
@@ -2433,6 +2434,95 @@ def test_attention_backward_occ1_correctness(shape, q_splits, packed_dq, monkeyp
         assert nrmse(actual[0], production[0][0]) <= bound
         if not packed_dq:
             assert all(nrmse(value, ref) <= 1e-4 for value, ref in zip(actual[1:], production[0][1:]))
+
+
+def _attention_backward_causal_config(packed_dq, q_splits=1):
+    import dataclasses
+
+    return dataclasses.replace(_attention_backward_occ1_config(packed_dq, q_splits=q_splits),
+                               occ1_k_bands=0 if q_splits == 4 else 1)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("packed_dq", [False, True])
+@pytest.mark.parametrize("shape,q_splits", [
+    ((1, 1, 1, 512), 1),
+    ((2, 4, 4, 1024), 1),
+    ((1, 4, 4, 4096), 1),
+    ((1, 2, 2, 8192), 1),
+    # GROUP > 1 restarts each query head at the KV tile's first unmasked row.
+    ((1, 8, 2, 512), 1),
+    ((1, 8, 2, 2048), 1),
+    ((2, 64, 8, 512), 1),
+    # Splits interleave each tile's outers; two dQ slices at 16K.
+    ((1, 4, 4, 1024), 2),
+    ((2, 8, 2, 1024), 2),
+    ((2, 8, 2, 1024), 4),
+    ((1, 64, 8, 512), 4),
+    ((1, 2, 2, 16384), 2),
+])
+def test_attention_backward_causal_correctness(shape, q_splits, packed_dq, monkeypatch):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import allocate_workspace, fa_backward, select_config
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.manual_seed(2709)
+    b, hq, hk, n = shape
+    q, dout = [torch.randn((b, hq, n, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    k, v = [torch.randn((b, hk, n, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    qr, kr, vr = [t.float().requires_grad_() for t in (q, k, v)]
+    scores = qr @ kr.repeat_interleave(hq // hk, 1).transpose(-1, -2) * 128**-0.5
+    causal = torch.ones((n, n), device="cuda", dtype=torch.bool).tril()
+    scores = scores.masked_fill(~causal, float("-inf"))
+    out = scores.softmax(-1) @ vr.repeat_interleave(hq // hk, 1)
+    expected = torch.autograd.grad(out, (qr, kr, vr), dout.float())
+    case = (q, k, v, out.detach().bfloat16(), dout, scores.detach().logsumexp(-1))
+    config = _attention_backward_causal_config(packed_dq, q_splits)
+    if q_splits == 1:
+        assert select_config(n, b, hq, hk, num_cus=192, packed_dq=packed_dq, causal=True) == config
+    workspace = allocate_workspace(q, k, config=config, causal=True)
+
+    def nrmse(value, ref):
+        return ((value.float() - ref.float()).square().mean() / ref.float().square().mean()).sqrt().item()
+
+    for call in range(3):
+        for buffer in workspace:
+            buffer.fill_(float("nan"))
+        actual = fa_backward(*case, causal=True, config=config, workspace=workspace)
+        assert all(torch.isfinite(value).all() for value in actual)
+        assert all(nrmse(value, ref) < 0.012 for value, ref in zip(actual, expected))
+
+
+@pytest.mark.parametrize("shape,splits", [
+    ((16, 16, 16, 2048), 1),
+    ((8, 64, 8, 1024), 1),
+    ((16, 64, 8, 1024), 2),
+    ((8, 64, 8, 2048), 2),
+    ((8, 64, 8, 4096), 1),
+    ((8, 64, 8, 8192), 2),
+    ((8, 64, 8, 16384), 4),
+    ((12, 64, 8, 1024), 1),
+])
+@pytest.mark.parametrize("packed_dq", [False, True])
+def test_attention_backward_causal_split_selection(shape, splits, packed_dq):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import select_config
+
+    config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq, causal=True)
+    assert config == _attention_backward_causal_config(packed_dq, splits)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("changes", [dict(q_splits=3), dict(q_splits=4), dict(tail_splits=3), dict(occ1=False)])
+def test_attention_backward_causal_validation(changes):
+    import dataclasses
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import fa_backward
+
+    b, hq, hk, n = 2, 4, 4, 1024
+    q, o, do = [torch.randn((b, hq, n, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    k, v = [torch.randn((b, hk, n, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    lse = torch.zeros((b, hq, n), device="cuda", dtype=torch.float32)
+    config = dataclasses.replace(_attention_backward_occ1_config(True), **changes)
+    with pytest.raises(ValueError, match="causal gfx1250 backward requires OCC1 without tail splits"):
+        fa_backward(q, k, v, o, do, lse, causal=True, config=config)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

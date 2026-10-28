@@ -4,6 +4,8 @@ Port of PR #2709's two-slot dS bridge to wave32 WMMA. A workgroup owns
 one KV tile and loops over all Q tiles of its query-head group. Current dK
 and previous dQ have independent accumulator chains. The final dQ tile is
 drained explicitly. dK/dV stay resident across both Q tiles and GQA heads.
+Causal attention skips each KV tile's fully masked Q tiles and masks only
+the tiles that cross the diagonal.
 """
 
 import dataclasses
@@ -167,13 +169,48 @@ def _select_config_base(n, b=None, hq=None, hk=None, *, num_cus=None, packed_dq=
     return dataclasses.replace(config, **pingpong) if n >= 896 else config
 
 
-def select_config(n, b=None, hq=None, hk=None, *, num_cus=None, packed_dq=True):
+def _occ1_config(packed_dq, q_splits=1, tail_splits=1):
+    # WMMA queuing (HW_REG_WAVE_SCHED_MODE bit 2) won 0.4-2.0% on 24 of the 26
+    # OCC1 points and lost on none.
+    return BackwardConfig(block_m=32, num_warps=4, stages=3, ordered=True, packed_dq=packed_dq, outer_m=64,
+                          async_stats=True, queue_wmma=True, regalloc=True, q_splits=q_splits, waves_per_eu=1,
+                          convert_block=8192 if q_splits > 1 and packed_dq else 4096, tile_major=True, cluster_dq=True,
+                          occ1=True, occ1_k_bands=2, tail_splits=tail_splits, occ1_load_after_dk=True)
+
+
+def _causal_splits(n, b, hq, hk, num_cus):
+    """Split paired causal GQA workgroups when the last dispatch round is sparse.
+
+    A split repeats each pass's setup and writes FP32 dK/dV partials. Paired
+    rounds on the 192-CU part favored two splits when the last round was at
+    most half full (-5% to -12%), and four on grids of at least eight rounds
+    (-4% to -8% at 16K). MHA passes are too short to amortize a split.
+    """
+    if b is None or hq is None or hk is None or hq == hk or n % 512:
+        return 1
+    if num_cus is None:
+        num_cus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    owners = b * hk * (n // 512)
+    if owners < num_cus or owners % num_cus == 0:
+        return 1
+    if owners % num_cus <= num_cus // 2:
+        return 2
+    return 4 if owners >= 8 * num_cus else 1
+
+
+def select_config(n, b=None, hq=None, hk=None, *, num_cus=None, packed_dq=True, causal=False):
     """Select a measured eight-wave or occupancy-one backward policy.
 
     OCC1 coverage is keyed by attention class, sequence length and precision.
     A class is enabled only where every sampled batch clears the paired gate.
     The n-only API and unmeasured branch conditions retain the base policy.
+    Causal attention runs only the single-split occupancy-one kernel.
     """
+    if causal:
+        splits = _causal_splits(n, b, hq, hk, num_cus)
+        # The pair loop keeps more values live around each pass, so fewer
+        # resident dQ K bands won 0.2-1.2% (and none at four splits).
+        return dataclasses.replace(_occ1_config(packed_dq, splits), occ1_k_bands=0 if splits == 4 else 1)
     config = _select_config_base(n, b, hq, hk, num_cus=num_cus, packed_dq=packed_dq)
     if b is None or hq is None or hk is None:
         return config
@@ -231,15 +268,10 @@ def select_config(n, b=None, hq=None, hk=None, *, num_cus=None, packed_dq=True):
     # The measured two-way MHA 1K tail is FP32-only; packed keeps one split.
     if num_cus == 192 and (b, hq, hk, n, packed_dq) == (16, 16, 16, 1024, False):
         tail_splits = 2
-    # WMMA queuing (HW_REG_WAVE_SCHED_MODE bit 2) won 0.4-2.0% on 24 of the 26
-    # OCC1 points and lost on none.
-    return BackwardConfig(block_m=32, num_warps=4, stages=3, ordered=True, packed_dq=packed_dq, outer_m=64,
-                          async_stats=True, queue_wmma=True, regalloc=True, q_splits=q_splits, waves_per_eu=1,
-                          convert_block=8192 if q_splits > 1 and packed_dq else 4096, tile_major=True, cluster_dq=True,
-                          occ1=True, occ1_k_bands=2, tail_splits=tail_splits, occ1_load_after_dk=True)
+    return _occ1_config(packed_dq, q_splits, tail_splits)
 
 
-def _compiler_options(config, n=None):
+def _compiler_options(config, n=None, causal=False):
     options = dict(num_warps=config.num_warps, num_stages=1, enable_fp_fusion=True, waves_per_eu=config.waves_per_eu)
     for name in ("sink_insts_to_avoid_spills", "reverse_local_assignment", "regclass_priority_trumps_globalness"):
         value = getattr(config, name)
@@ -249,21 +281,31 @@ def _compiler_options(config, n=None):
     if config.cluster_dq:
         # Grid X holds one split's KV tiles; each cluster group owns a dQ slice.
         nt = n // 256 if n is not None and n % 256 == 0 else 0
-        if (not config.tile_major or config.block_n != 256 or not (nt in (2, 4, 8, 16) or nt > 0 and nt % 16 == 0)):
+        if causal:
+            # Each causal workgroup owns a pair of KV tiles.
+            if nt % 2 or nt // 2 not in (1, 2, 4, 8) and nt // 2 % 16:
+                raise ValueError("causal cluster_dq requires NT in {2, 4, 8, 16} or a multiple of 32")
+            nt //= 2
+        elif (not config.tile_major or config.block_n != 256 or not (nt in (2, 4, 8, 16) or nt > 0 and nt % 16 == 0)):
             raise ValueError("cluster_dq requires tile_major, BN256 and NT in {2, 4, 8, 16} or a multiple of 16")
         options["ctas_per_cga"] = (min(nt, 16), 1, 1)
     return options
 
 
-def _dq_slices(config, n):
-    return max(1, n // config.block_n // 16) if config.cluster_dq else 1
+def _dq_slices(config, n, causal=False):
+    # Causal workgroups own a pair of KV tiles, halving grid X.
+    tiles = n // config.block_n // (2 if causal else 1)
+    return max(1, tiles // 16) if config.cluster_dq else 1
 
 
 @triton.jit
 def _issue_tile(Q, DO, q_desc, do_desc, qb, dob, step, N: tl.constexpr, BM: tl.constexpr, STAGES: tl.constexpr,
                 TDM: tl.constexpr, lse_desc=None, delta_desc=None, lseb=None, db=None,
-                ASYNC_STATS: tl.constexpr = False, PINGPONG: tl.constexpr = False):
-    slot = step % STAGES
+                ASYNC_STATS: tl.constexpr = False, PINGPONG: tl.constexpr = False, slot=None):
+    # Causal OCC1 skips masked rows, so its ring slot follows the compacted
+    # iteration rather than the row tile.
+    if slot is None:
+        slot = step % STAGES
     if PINGPONG:
         # Waves 0..3 own every TDM request. With the half-step phase shift,
         # the trailing group has not reached its next issue when the leading
@@ -290,6 +332,30 @@ def _issue_tile(Q, DO, q_desc, do_desc, qb, dob, step, N: tl.constexpr, BM: tl.c
         else:
             tlx.async_amd_descriptor_load(lse_desc, tlx.local_view(lseb, slot), [0, step * BM], clamp_bounds=False)
             tlx.async_amd_descriptor_load(delta_desc, tlx.local_view(db, slot), [0, step * BM], clamp_bounds=False)
+
+
+@triton.jit
+def _causal_outer(it, first_outer, head_outers, OUTERS: tl.constexpr, GROUP: tl.constexpr, SPLITS: tl.constexpr = 1,
+                  split=0, DIAG: tl.constexpr = 4):
+    # Map a compacted causal iteration to its flattened outer tile. Every head
+    # in the group starts at the KV tile's first unmasked query row. Below four
+    # splits, a pass visits the DIAG diagonal outers of every head first, then
+    # the rest, so the steady loop needs no mask. Split s owns the outers o with
+    # o % SPLITS == s in every KV tile, so all contributors to a dQ row share
+    # one cluster; first_outer is a multiple of four, so the shares are equal.
+    if GROUP == 1:
+        return first_outer + split + it * SPLITS
+    elif SPLITS == 4:
+        # One diagonal outer per head: keep head-major order in a single loop.
+        per_head = head_outers // SPLITS
+        return it // per_head * OUTERS + first_outer + split + it % per_head * SPLITS
+    else:
+        steady = tl.maximum(head_outers // SPLITS - DIAG, 1)
+        diagonal = it < GROUP * DIAG
+        rest = it - GROUP * DIAG
+        head = tl.where(diagonal, it // DIAG, rest // steady)
+        k = tl.where(diagonal, it % DIAG, DIAG + rest % steady)
+        return head * OUTERS + first_outer + split + k * SPLITS
 
 
 @triton.jit
@@ -485,7 +551,7 @@ def _delayed_bwd_kernel(
         OCC1_K_BANDS: tl.constexpr = 0, OCC1_PREFETCH: tl.constexpr = True, OCC1_SCHED: tl.constexpr = False,
         PHASE_IGLP: tl.constexpr = -1, SPLIT_KV_STORES: tl.constexpr = False, TAIL_DK=None, TAIL_DV=None,
         TAIL_SPLITS: tl.constexpr = 1, TAIL_BASE: tl.constexpr = 0, TAIL_OWNERS: tl.constexpr = 0,
-        OCC1_DQ_FIRST: tl.constexpr = False, OCC1_LOAD_AFTER_DK: tl.constexpr = False):
+        OCC1_DQ_FIRST: tl.constexpr = False, OCC1_LOAD_AFTER_DK: tl.constexpr = False, CAUSAL: tl.constexpr = False):
     if OCC1:
         tl.static_assert(NW == 4 and BN == 256 and BM == 32 and (OUTER_M == 64 or OUTER_M == 128))
         tl.static_assert(TDM and DELAYED and CLUSTER_DQ and TILE_MAJOR and ASYNC_STATS and not PINGPONG)
@@ -519,6 +585,17 @@ def _delayed_bwd_kernel(
         else:
             outer_start, outer_stop = split * outer_count // Q_SPLITS, (split + 1) * outer_count // Q_SPLITS
         step_start, step_stop = outer_start * PHASES, outer_stop * PHASES
+        OUTERS: tl.constexpr = N // OUTER_M
+        # Causal diagonal outers per head and split.
+        DIAG: tl.constexpr = BN // OUTER_M // Q_SPLITS
+        if CAUSAL:
+            # Every split of the shortest pass still seeds the TDM ring, and
+            # splits interleave the four outers of each KV tile's diagonal.
+            tl.static_assert(TAIL_SPLITS == 1 and GROUP * BN // OUTER_M // Q_SPLITS >= STAGES - 1)
+            tl.static_assert(Q_SPLITS == 1 or Q_SPLITS == 2 or Q_SPLITS == 4)
+        else:
+            first_outer, head_outers = 0, OUTERS
+            iter_start, iter_stop = outer_start, outer_stop
         q_base = (batch.to(tl.int64) * HQ + kv_head * GROUP) * N * 128
         kv_base = (batch.to(tl.int64) * HK + kv_head) * N * 128
         stats_base = (batch.to(tl.int64) * HQ + kv_head * GROUP) * N
@@ -553,206 +630,338 @@ def _delayed_bwd_kernel(
         dq_lhs: tl.constexpr = tlx.dot_operand_layout(0, dq_mma, k_width=8)
         dq_rhs: tl.constexpr = tlx.dot_operand_layout(1, dq_mma, k_width=8)
         kb = tlx.local_alloc((256, 128), tl.bfloat16, 1)
-        # V is loaded directly into its lifetime-long operand, avoiding a second
-        # persistent LDS image. K retains an LDS image for the nonresident bands.
-        kv_offsets = (kv_tile * 256 + tl.arange(0, 256))[:, None] * 128 + tl.arange(0, 128)[None, :]
-        v = tlx.buffer_load(V, tlx.require_layout(kv_offsets, lhs))
-        k_desc = tl.make_tensor_descriptor(K, [N, 128], [128, 1], [256, 128])
-        tlx.async_amd_descriptor_load(k_desc, tlx.local_view(kb, 0), [kv_tile * 256, 0], clamp_bounds=False)
-        qb = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES)
-        dob = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES)
-        lseb = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
-        db = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
-        dsb = tlx.local_alloc((32, 256), tl.bfloat16, 2, layout=_ds_shared_layout(32, 256))
-        q_desc = tl.make_tensor_descriptor(Q, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
-        do_desc = tl.make_tensor_descriptor(DO, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
-        lse_desc = tl.make_tensor_descriptor(LSE, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
-        delta_desc = tl.make_tensor_descriptor(Delta, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
-        tlx.async_amd_descriptor_wait(0)
-        k = tlx.local_load(tlx.local_view(kb, 0), layout=lhs)
-        resident = ()
-        for band in tl.static_range(K_BANDS):
-            resident += (tlx.local_load(tlx.local_slice(tlx.local_view(kb, 0), [band * 32, 0], [32, 128]),
-                                        layout=dq_rhs), )
-        dks = (tlx.zeros((128, 32), tl.float32, layout=mma), tlx.zeros(
-            (128, 32), tl.float32, layout=mma), tlx.zeros(
-                (128, 32), tl.float32, layout=mma), tlx.zeros(
-                    (128, 32), tl.float32, layout=mma), tlx.zeros(
-                        (128, 32), tl.float32, layout=mma), tlx.zeros(
-                            (128, 32), tl.float32, layout=mma), tlx.zeros(
-                                (128, 32), tl.float32, layout=mma), tlx.zeros((128, 32), tl.float32, layout=mma))
-        dvs = (tlx.zeros((128, 32), tl.float32, layout=mma), tlx.zeros(
-            (128, 32), tl.float32, layout=mma), tlx.zeros(
-                (128, 32), tl.float32, layout=mma), tlx.zeros(
-                    (128, 32), tl.float32, layout=mma), tlx.zeros(
-                        (128, 32), tl.float32, layout=mma), tlx.zeros(
-                            (128, 32), tl.float32, layout=mma), tlx.zeros(
-                                (128, 32), tl.float32, layout=mma), tlx.zeros((128, 32), tl.float32, layout=mma))
-        tlx.local_store(tlx.local_view(dsb, 1), tl.zeros((32, 256), tl.bfloat16))
-        # The TDM wait-count pass takes the minimum over all paths, so a skippable
-        # prologue issue lowers the loop's wait to one outstanding load. Issue
-        # unconditionally whenever every split is long enough.
-        for initial in tl.static_range(STAGES - 1):
-            if outer_count // Q_SPLITS > initial:
-                _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer_start + initial, N, OUTER_M, STAGES, True, lse_desc,
-                            delta_desc, lseb, db, True)
-            elif outer_start + initial < outer_stop:
-                _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer_start + initial, N, OUTER_M, STAGES, True, lse_desc,
-                            delta_desc, lseb, db, True)
-        tl.debug_barrier()
-        # occ1-outer-begin: statically unrolled BM32 phases, one outer tile ahead.
-        for outer in tl.range(outer_start, outer_stop):
-            if outer + STAGES - 1 < outer_stop:
-                _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer + STAGES - 1, N, OUTER_M, STAGES, True, lse_desc,
-                            delta_desc, lseb, db, True)
-            tlx.async_amd_descriptor_wait(4 * (STAGES - 1))
-            if outer + STAGES - 1 >= outer_stop:
-                tlx.async_amd_descriptor_wait(0)
-            early_qt = None
-            for phase in tl.static_range(PHASES):
-                step = outer * PHASES + phase
-                qv = tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * 32, 0], [32, 128])
-                dov = tlx.local_slice(tlx.local_view(dob, outer % STAGES), [phase * 32, 0], [32, 128])
-                if phase == 0:
-                    qt = tlx.local_load(tlx.local_trans(qv), layout=rhs, relaxed=True)
-                else:
-                    qt1 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * 32, 32],
-                                                        [32, 32])), layout=rhs, relaxed=True)
-                    qt2 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * 32, 64],
-                                                        [32, 32])), layout=rhs, relaxed=True)
-                    qt3 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * 32, 96],
-                                                        [32, 32])), layout=rhs, relaxed=True)
-                    qt = tl.cat(tl.cat(early_qt, qt1, dim=0), tl.cat(qt2, qt3, dim=0), dim=0)
-                qt = tlx.require_layout(qt, rhs, pin=False)
-                scores = tl.dot(k, qt, tlx.zeros((256, 32), tl.float32, layout=mma))
-                dot = tlx.local_load(tlx.local_trans(dov), layout=rhs, relaxed=True)
-                dp = tl.dot(v, dot, tlx.zeros((256, 32), tl.float32, layout=mma))
-                lse = tl.reshape(
-                    tlx.local_load(tlx.local_slice(tlx.local_view(lseb, outer % STAGES), [0, phase * 32], [1, 32])),
-                    (32, ))
-                delta = tl.reshape(
-                    tlx.local_load(tlx.local_slice(tlx.local_view(db, outer % STAGES), [0, phase * 32], [1, 32])),
-                    (32, ))
-                if LOG2_LSE:
-                    p = tl.exp2(scores * (SM_SCALE * 1.4426950408889634) - lse[None, :])
-                else:
-                    p = tl.exp2(scores * (SM_SCALE * 1.4426950408889634) - lse[None, :] * 1.4426950408889634)
-                ds = (p * (dp - delta[None, :])).to(tl.bfloat16)
-                # Read the first dV half before dS stores enter the DS queue.
-                do_out = tlx.local_load(tlx.local_slice(tlx.local_view(dob, outer % STAGES), [phase * 32, 0], [32, 64]),
-                                        layout=rhs, relaxed=True)
-                tlx.local_store(tlx.local_view(dsb, phase % 2), tl.trans(ds))
-                p_native = ()
-                for dv_band in tl.static_range(4):
-                    if dv_band < 2:
-                        # LLVM otherwise re-clusters both conversions before dV.
-                        tlx.amd_sched_barrier(0)
-                        p_piece = tlx.extract_slice(p, [128, 32], [dv_band * 128, 0])
-                        p_native += (tlx.require_layout(p_piece.to(tl.bfloat16), lhs, pin=False), )
-                        tlx.amd_sched_barrier(0)
-                    a = p_native[dv_band % 2]
-                    b = tlx.extract_slice(do_out, [32, 32], [0, (dv_band // 2) * 32])
-                    updated_dv = _wmma(a, b, tlx.require_layout(dvs[dv_band], mma, pin=False), ORDERED)
-                    dvs = dvs[:dv_band] + (updated_dv, ) + dvs[dv_band + 1:]
-                pv = tl.cat(p_native[0], p_native[1], dim=0)
-                do_out = tlx.local_load(
-                    tlx.local_slice(tlx.local_view(dob, outer % STAGES), [phase * 32, 64], [32, 64]), layout=rhs,
-                    relaxed=True)
-                # Cover initial bridge dS/Q reads with the final dV half.
-                previous = tlx.local_view(dsb, 1 - phase % 2)
-                kb_view = tlx.local_view(kb, 0)
-                ds_band = tlx.local_load(tlx.local_slice(previous, [0, 0], [32, 32]), layout=dq_lhs, relaxed=True)
-                q_part = tlx.local_load(tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * 32, 0], [32, 32]),
-                                        layout=rhs, relaxed=True)
-                dvs = _occ1_dv_half(pv, do_out, dvs, mma, lhs, rhs, False, ORDERED)
-                ds = tlx.require_layout(ds, lhs, pin=False)
-                dq0 = tlx.zeros((32, 64), tl.float32, layout=dq_mma)
-                dq1 = tlx.zeros((32, 64), tl.float32, layout=dq_mma)
-                k0, k1 = _occ1_k_band(kb_view, resident, 0, K_BANDS, dq_rhs)
-                for band in tl.static_range(8):
-                    if SCHED:
-                        tlx.amd_sched_barrier(0)
-                    if PREFETCH and band < 7 and not OCC1_LOAD_AFTER_DK:
-                        next_ds = tlx.local_load(tlx.local_slice(previous, [0, (band + 1) * 32], [32, 32]),
-                                                 layout=dq_lhs, relaxed=True)
-                        next_k0, next_k1 = _occ1_k_band(kb_view, resident, band + 1, K_BANDS, dq_rhs)
-                        if band % 2 == 0 and band < 6:
-                            next_q = tlx.local_load(
-                                tlx.local_slice(tlx.local_view(qb, outer % STAGES),
-                                                [phase * 32, ((band + 2) // 2) * 32], [32, 32]), layout=rhs,
-                                relaxed=True)
-                    if phase + 1 < PHASES and band == 6:
-                        # The next phase shares this completed TDM outer.
-                        early_qt = tlx.local_load(
-                            tlx.local_trans(
-                                tlx.local_slice(tlx.local_view(qb, outer % STAGES), [(phase + 1) * 32, 0], [32, 32])),
-                            layout=rhs, relaxed=True)
-                    ds_current = tlx.extract_slice(ds, [128, 32], [(band % 2) * 128, 0])
-                    if OCC1_DQ_FIRST:
-                        dq0 = _wmma(ds_band, k0, dq0, ORDERED)
-                        dq1 = _wmma(ds_band, k1, dq1, ORDERED)
-                    updated = _wmma(ds_current, q_part, tlx.require_layout(dks[band], mma, pin=False), ORDERED)
-                    dks = dks[:band] + (updated, ) + dks[band + 1:]
-                    if PREFETCH and band < 7 and OCC1_LOAD_AFTER_DK:
-                        tlx.amd_sched_barrier(0)
-                        next_ds = tlx.local_load(tlx.local_slice(previous, [0, (band + 1) * 32], [32, 32]),
-                                                 layout=dq_lhs, relaxed=True)
-                        next_k0, next_k1 = _occ1_k_band(kb_view, resident, band + 1, K_BANDS, dq_rhs)
-                        if band % 2 == 0 and band < 6:
-                            next_q = tlx.local_load(
-                                tlx.local_slice(tlx.local_view(qb, outer % STAGES),
-                                                [phase * 32, ((band + 2) // 2) * 32], [32, 32]), layout=rhs,
-                                relaxed=True)
-                        tlx.amd_sched_barrier(0)
-                    if not OCC1_DQ_FIRST:
-                        dq0 = _wmma(ds_band, k0, dq0, ORDERED)
-                        dq1 = _wmma(ds_band, k1, dq1, ORDERED)
-                    if band < 7:
-                        if PREFETCH:
-                            ds_band, k0, k1 = next_ds, next_k0, next_k1
-                            if band % 2 == 1:
-                                q_part = next_q
-                        else:
-                            ds_band = tlx.local_load(tlx.local_slice(previous, [0, (band + 1) * 32], [32, 32]),
-                                                     layout=dq_lhs, relaxed=True)
-                            k0, k1 = _occ1_k_band(kb_view, resident, band + 1, K_BANDS, dq_rhs)
-                            if band % 2 == 1:
-                                q_part = tlx.local_load(
-                                    tlx.local_slice(tlx.local_view(qb, outer % STAGES),
-                                                    [phase * 32, ((band + 1) // 2) * 32], [32, 32]), layout=rhs,
-                                    relaxed=True)
-                dq = tl.cat(dq0, dq1, dim=1)
-                _dq_atomic(dq, DQA, tl.maximum(step - 1, step_start), SM_SCALE if PACKED_DQ else 1.0, 32, dq_mma,
-                           PACKED_DQ, False, True, True, OCC1_LOAD_AFTER_DK)
-                if PHASE_IGLP >= 0:
-                    tlx.amd_iglp_opt(PHASE_IGLP)
-                # dS(i) is visible to all waves before phase i+1; all Q/dO reads
-                # finish before this outer ring slot can be overwritten.
+        if CAUSAL:
+            # Both passes share these buffers. The non-causal order is unchanged.
+            qb = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES)
+            dob = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES)
+            lseb = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
+            db = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
+            dsb = tlx.local_alloc((32, 256), tl.bfloat16, 2, layout=_ds_shared_layout(32, 256))
+            q_desc = tl.make_tensor_descriptor(Q, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
+            do_desc = tl.make_tensor_descriptor(DO, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
+            lse_desc = tl.make_tensor_descriptor(LSE, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
+            delta_desc = tl.make_tensor_descriptor(Delta, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
+        # Causal work falls linearly with the KV tile, so each causal workgroup
+        # pairs tile i with tile NT-1-i. The dQ slice above follows tile i, so
+        # both passes stay inside the cluster that owns it.
+        # One runtime pass body keeps the first pass's values from living
+        # across the second; the non-causal single pass folds away.
+        for pair in tl.range(0, 1 + CAUSAL):
+            if CAUSAL:
+                kv_tile = tl.where(pair == 0, tl.program_id(0), N // BN - 1 - tl.program_id(0))
+                # The previous pass's drain may still read the K image and dS ring.
                 tlx.workgroup_barrier()
-        # occ1-outer-end
-        dq0 = tlx.zeros((32, 64), tl.float32, layout=dq_mma)
-        dq1 = tlx.zeros((32, 64), tl.float32, layout=dq_mma)
-        for band in tl.static_range(8):
-            ds_band = tlx.local_load(tlx.local_slice(tlx.local_view(dsb, 1), [0, band * 32], [32, 32]), layout=dq_lhs)
-            k0, k1 = _occ1_k_band(tlx.local_view(kb, 0), resident, band, K_BANDS, dq_rhs)
-            dq0 = _wmma(ds_band, k0, dq0, ORDERED)
-            dq1 = _wmma(ds_band, k1, dq1, ORDERED)
-        _dq_atomic(tl.cat(dq0, dq1, dim=1), DQA, step_stop - 1, SM_SCALE if PACKED_DQ else 1.0, 32, dq_mma, PACKED_DQ,
-                   False, True, True)
-        dk = tl.cat(tl.cat(tl.cat(dks[0], dks[1], dim=0), tl.cat(dks[2], dks[3], dim=0), dim=1),
-                    tl.cat(tl.cat(dks[4], dks[5], dim=0), tl.cat(dks[6], dks[7], dim=0), dim=1), dim=1)
-        dv = tl.cat(tl.cat(tl.cat(dvs[0], dvs[1], dim=0), tl.cat(dvs[2], dvs[3], dim=0), dim=1),
-                    tl.cat(tl.cat(dvs[4], dvs[5], dim=0), tl.cat(dvs[6], dvs[7], dim=0), dim=1), dim=1)
-        if TAIL_SPLITS > 1:
-            # Program IDs make this branch uniform across the whole workgroup.
-            if is_tail:
-                compact_base = (split.to(tl.int64) * TAIL_OWNERS + owner.to(tl.int64) - TAIL_BASE -
-                                kv_tile.to(tl.int64)) * BN * 128
-                DK += compact_base
-                DV += compact_base
+                # KV tile j meets only query rows >= 256j of each head. Iterate
+                # over the unmasked outers; the last is still the group's last row.
+                first_outer = kv_tile * (BN // OUTER_M)
+                head_outers = OUTERS - first_outer
+                iter_start, iter_stop = 0, GROUP * head_outers // Q_SPLITS
+            # V is loaded directly into its lifetime-long operand, avoiding a second
+            # persistent LDS image. K retains an LDS image for the nonresident bands.
+            if CAUSAL:
+                # Pin the 1D pieces: the pass-invariant column broadcast is hoisted
+                # out of the pair loop, past where require_layout propagation reaches.
+                kv_rows = tlx.require_layout(kv_tile * 256 + tl.arange(0, 256), tlx.slice_layout(lhs, 1))
+                kv_cols = tlx.require_layout(tl.arange(0, 128), tlx.slice_layout(lhs, 0))
+                kv_offsets = kv_rows[:, None] * 128 + kv_cols[None, :]
+            else:
+                kv_offsets = (kv_tile * 256 + tl.arange(0, 256))[:, None] * 128 + tl.arange(0, 128)[None, :]
+            v = tlx.buffer_load(V, tlx.require_layout(kv_offsets, lhs))
+            k_desc = tl.make_tensor_descriptor(K, [N, 128], [128, 1], [256, 128])
+            tlx.async_amd_descriptor_load(k_desc, tlx.local_view(kb, 0), [kv_tile * 256, 0], clamp_bounds=False)
+            if not CAUSAL:
+                qb = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES)
+                dob = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES)
+                lseb = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
+                db = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
+                dsb = tlx.local_alloc((32, 256), tl.bfloat16, 2, layout=_ds_shared_layout(32, 256))
+                q_desc = tl.make_tensor_descriptor(Q, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
+                do_desc = tl.make_tensor_descriptor(DO, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
+                lse_desc = tl.make_tensor_descriptor(LSE, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
+                delta_desc = tl.make_tensor_descriptor(Delta, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
+            tlx.async_amd_descriptor_wait(0)
+            k = tlx.local_load(tlx.local_view(kb, 0), layout=lhs)
+            resident = ()
+            for band in tl.static_range(K_BANDS):
+                resident += (tlx.local_load(tlx.local_slice(tlx.local_view(kb, 0), [band * 32, 0], [32, 128]),
+                                            layout=dq_rhs), )
+            dks = (tlx.zeros((128, 32), tl.float32, layout=mma), tlx.zeros(
+                (128, 32), tl.float32, layout=mma), tlx.zeros(
+                    (128, 32), tl.float32, layout=mma), tlx.zeros(
+                        (128, 32), tl.float32, layout=mma), tlx.zeros(
+                            (128, 32), tl.float32, layout=mma), tlx.zeros(
+                                (128, 32), tl.float32, layout=mma), tlx.zeros(
+                                    (128, 32), tl.float32, layout=mma), tlx.zeros((128, 32), tl.float32, layout=mma))
+            dvs = (tlx.zeros((128, 32), tl.float32, layout=mma), tlx.zeros(
+                (128, 32), tl.float32, layout=mma), tlx.zeros(
+                    (128, 32), tl.float32, layout=mma), tlx.zeros(
+                        (128, 32), tl.float32, layout=mma), tlx.zeros(
+                            (128, 32), tl.float32, layout=mma), tlx.zeros(
+                                (128, 32), tl.float32, layout=mma), tlx.zeros(
+                                    (128, 32), tl.float32, layout=mma), tlx.zeros((128, 32), tl.float32, layout=mma))
+            tlx.local_store(tlx.local_view(dsb, 1), tl.zeros((32, 256), tl.bfloat16))
+            # The TDM wait-count pass takes the minimum over all paths, so a skippable
+            # prologue issue lowers the loop's wait to one outstanding load. Issue
+            # unconditionally whenever every split is long enough.
+            for initial in tl.static_range(STAGES - 1):
+                if CAUSAL:
+                    # Every KV tile has at least GROUP * BN / OUTER_M outers.
+                    _issue_tile(
+                        Q, DO, q_desc, do_desc, qb, dob,
+                        _causal_outer(iter_start + initial, first_outer, head_outers, OUTERS, GROUP, Q_SPLITS, split,
+                                      DIAG), N, OUTER_M, STAGES, True, lse_desc, delta_desc, lseb, db, True,
+                        slot=(iter_start + initial) % STAGES)
+                elif outer_count // Q_SPLITS > initial:
+                    _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer_start + initial, N, OUTER_M, STAGES, True,
+                                lse_desc, delta_desc, lseb, db, True)
+                elif outer_start + initial < outer_stop:
+                    _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer_start + initial, N, OUTER_M, STAGES, True,
+                                lse_desc, delta_desc, lseb, db, True)
+            tl.debug_barrier()
+            # occ1-outer-begin: statically unrolled BM32 phases, one outer tile ahead.
+            # Causal passes run the diagonal outers in their own masked loop.
+            # Four splits leave one diagonal outer per head and spill when the
+            # loop is split, so they keep a single loop with a runtime mask.
+            REGIONS: tl.constexpr = 2 if CAUSAL and Q_SPLITS < 4 else 1
+            for region in tl.static_range(REGIONS):
+                if REGIONS == 2:
+                    region_start = iter_start if region == 0 else GROUP * DIAG
+                    region_stop = GROUP * DIAG if region == 0 else iter_stop
+                else:
+                    region_start, region_stop = iter_start, iter_stop
+                for it in tl.range(region_start, region_stop):
+                    if CAUSAL:
+                        outer = _causal_outer(it, first_outer, head_outers, OUTERS, GROUP, Q_SPLITS, split, DIAG)
+                    else:
+                        outer = it
+                    slot = it % STAGES
+                    if it + STAGES - 1 < iter_stop:
+                        if CAUSAL:
+                            _issue_tile(
+                                Q, DO, q_desc, do_desc, qb, dob,
+                                _causal_outer(it + STAGES - 1, first_outer, head_outers, OUTERS, GROUP, Q_SPLITS, split,
+                                              DIAG), N, OUTER_M, STAGES, True, lse_desc, delta_desc, lseb, db, True,
+                                slot=(it + STAGES - 1) % STAGES)
+                        else:
+                            _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer + STAGES - 1, N, OUTER_M, STAGES, True,
+                                        lse_desc, delta_desc, lseb, db, True)
+                    tlx.async_amd_descriptor_wait(4 * (STAGES - 1))
+                    if it + STAGES - 1 >= iter_stop:
+                        tlx.async_amd_descriptor_wait(0)
+                    early_qt = None
+                    for phase in tl.static_range(PHASES):
+                        step = outer * PHASES + phase
+                        qv = tlx.local_slice(tlx.local_view(qb, slot), [phase * 32, 0], [32, 128])
+                        dov = tlx.local_slice(tlx.local_view(dob, slot), [phase * 32, 0], [32, 128])
+                        if phase == 0:
+                            qt = tlx.local_load(tlx.local_trans(qv), layout=rhs, relaxed=True)
+                        else:
+                            qt1 = tlx.local_load(
+                                tlx.local_trans(tlx.local_slice(tlx.local_view(qb, slot), [phase * 32, 32], [32, 32])),
+                                layout=rhs, relaxed=True)
+                            qt2 = tlx.local_load(
+                                tlx.local_trans(tlx.local_slice(tlx.local_view(qb, slot), [phase * 32, 64], [32, 32])),
+                                layout=rhs, relaxed=True)
+                            qt3 = tlx.local_load(
+                                tlx.local_trans(tlx.local_slice(tlx.local_view(qb, slot), [phase * 32, 96], [32, 32])),
+                                layout=rhs, relaxed=True)
+                            qt = tl.cat(tl.cat(early_qt, qt1, dim=0), tl.cat(qt2, qt3, dim=0), dim=0)
+                        qt = tlx.require_layout(qt, rhs, pin=False)
+                        scores = tl.dot(k, qt, tlx.zeros((256, 32), tl.float32, layout=mma))
+                        dot = tlx.local_load(tlx.local_trans(dov), layout=rhs, relaxed=True)
+                        dp = tl.dot(v, dot, tlx.zeros((256, 32), tl.float32, layout=mma))
+                        lse = tl.reshape(
+                            tlx.local_load(tlx.local_slice(tlx.local_view(lseb, slot), [0, phase * 32], [1, 32])),
+                            (32, ))
+                        delta = tl.reshape(
+                            tlx.local_load(tlx.local_slice(tlx.local_view(db, slot), [0, phase * 32], [1, 32])), (32, ))
+                        if LOG2_LSE:
+                            exponent = scores * (SM_SCALE * 1.4426950408889634) - lse[None, :]
+                        else:
+                            exponent = scores * (SM_SCALE * 1.4426950408889634) - lse[None, :] * 1.4426950408889634
+                        if CAUSAL and region == 0:
+                            # Only diagonal outers hide KV rows past the query row.
+                            q_offset = (outer % OUTERS) * OUTER_M + phase * 32 - kv_tile * BN
+                            if REGIONS == 2 or q_offset < BN - 1:
+                                kv_rows = tlx.rematerialized_range(0, BN, 27092, placement=step)
+                                q_rows = q_offset + tlx.rematerialized_range(0, 32, 27093, placement=step)
+                                visible = tlx.require_layout(kv_rows[:, None] <= q_rows[None, :], mma, pin=False)
+                                hidden = tlx.require_layout(tl.full((BN, 32), float("-inf"), tl.float32), mma,
+                                                            pin=False)
+                                exponent = tlx.require_layout(tl.where(visible, exponent, hidden), mma, pin=False)
+                        p = tl.exp2(exponent)
+                        ds = (p * (dp - delta[None, :])).to(tl.bfloat16)
+                        # Read the first dV half before dS stores enter the DS queue.
+                        do_out = tlx.local_load(tlx.local_slice(tlx.local_view(dob, slot), [phase * 32, 0], [32, 64]),
+                                                layout=rhs, relaxed=True)
+                        tlx.local_store(tlx.local_view(dsb, phase % 2), tl.trans(ds))
+                        p_native = ()
+                        for dv_band in tl.static_range(4):
+                            if dv_band < 2:
+                                # LLVM otherwise re-clusters both conversions before dV.
+                                tlx.amd_sched_barrier(0)
+                                p_piece = tlx.extract_slice(p, [128, 32], [dv_band * 128, 0])
+                                p_native += (tlx.require_layout(p_piece.to(tl.bfloat16), lhs, pin=False), )
+                                tlx.amd_sched_barrier(0)
+                            a = p_native[dv_band % 2]
+                            b = tlx.extract_slice(do_out, [32, 32], [0, (dv_band // 2) * 32])
+                            updated_dv = _wmma(a, b, tlx.require_layout(dvs[dv_band], mma, pin=False), ORDERED)
+                            dvs = dvs[:dv_band] + (updated_dv, ) + dvs[dv_band + 1:]
+                        pv = tl.cat(p_native[0], p_native[1], dim=0)
+                        do_out = tlx.local_load(tlx.local_slice(tlx.local_view(dob, slot), [phase * 32, 64], [32, 64]),
+                                                layout=rhs, relaxed=True)
+                        # Cover initial bridge dS/Q reads with the final dV half.
+                        previous = tlx.local_view(dsb, 1 - phase % 2)
+                        kb_view = tlx.local_view(kb, 0)
+                        ds_band = tlx.local_load(tlx.local_slice(previous, [0, 0], [32, 32]), layout=dq_lhs,
+                                                 relaxed=True)
+                        q_part = tlx.local_load(tlx.local_slice(tlx.local_view(qb, slot), [phase * 32, 0], [32, 32]),
+                                                layout=rhs, relaxed=True)
+                        dvs = _occ1_dv_half(pv, do_out, dvs, mma, lhs, rhs, False, ORDERED)
+                        ds = tlx.require_layout(ds, lhs, pin=False)
+                        dq0 = tlx.zeros((32, 64), tl.float32, layout=dq_mma)
+                        dq1 = tlx.zeros((32, 64), tl.float32, layout=dq_mma)
+                        k0, k1 = _occ1_k_band(kb_view, resident, 0, K_BANDS, dq_rhs)
+                        for band in tl.static_range(8):
+                            if SCHED:
+                                tlx.amd_sched_barrier(0)
+                            if PREFETCH and band < 7 and not OCC1_LOAD_AFTER_DK:
+                                next_ds = tlx.local_load(tlx.local_slice(previous, [0, (band + 1) * 32], [32, 32]),
+                                                         layout=dq_lhs, relaxed=True)
+                                next_k0, next_k1 = _occ1_k_band(kb_view, resident, band + 1, K_BANDS, dq_rhs)
+                                if band % 2 == 0 and band < 6:
+                                    next_q = tlx.local_load(
+                                        tlx.local_slice(tlx.local_view(qb, slot), [phase * 32, ((band + 2) // 2) * 32],
+                                                        [32, 32]), layout=rhs, relaxed=True)
+                            if phase + 1 < PHASES and band == 6:
+                                # The next phase shares this completed TDM outer.
+                                early_qt = tlx.local_load(
+                                    tlx.local_trans(
+                                        tlx.local_slice(tlx.local_view(qb, slot), [(phase + 1) * 32, 0], [32, 32])),
+                                    layout=rhs, relaxed=True)
+                            ds_current = tlx.extract_slice(ds, [128, 32], [(band % 2) * 128, 0])
+                            if OCC1_DQ_FIRST:
+                                dq0 = _wmma(ds_band, k0, dq0, ORDERED)
+                                dq1 = _wmma(ds_band, k1, dq1, ORDERED)
+                            updated = _wmma(ds_current, q_part, tlx.require_layout(dks[band], mma, pin=False), ORDERED)
+                            dks = dks[:band] + (updated, ) + dks[band + 1:]
+                            if PREFETCH and band < 7 and OCC1_LOAD_AFTER_DK:
+                                tlx.amd_sched_barrier(0)
+                                next_ds = tlx.local_load(tlx.local_slice(previous, [0, (band + 1) * 32], [32, 32]),
+                                                         layout=dq_lhs, relaxed=True)
+                                next_k0, next_k1 = _occ1_k_band(kb_view, resident, band + 1, K_BANDS, dq_rhs)
+                                if band % 2 == 0 and band < 6:
+                                    next_q = tlx.local_load(
+                                        tlx.local_slice(tlx.local_view(qb, slot), [phase * 32, ((band + 2) // 2) * 32],
+                                                        [32, 32]), layout=rhs, relaxed=True)
+                                tlx.amd_sched_barrier(0)
+                            if not OCC1_DQ_FIRST:
+                                dq0 = _wmma(ds_band, k0, dq0, ORDERED)
+                                dq1 = _wmma(ds_band, k1, dq1, ORDERED)
+                            if band < 7:
+                                if PREFETCH:
+                                    ds_band, k0, k1 = next_ds, next_k0, next_k1
+                                    if band % 2 == 1:
+                                        q_part = next_q
+                                else:
+                                    ds_band = tlx.local_load(tlx.local_slice(previous, [0, (band + 1) * 32], [32, 32]),
+                                                             layout=dq_lhs, relaxed=True)
+                                    k0, k1 = _occ1_k_band(kb_view, resident, band + 1, K_BANDS, dq_rhs)
+                                    if band % 2 == 1:
+                                        q_part = tlx.local_load(
+                                            tlx.local_slice(tlx.local_view(qb, slot),
+                                                            [phase * 32, ((band + 1) // 2) * 32], [32, 32]), layout=rhs,
+                                            relaxed=True)
+                        dq = tl.cat(dq0, dq1, dim=1)
+                        if CAUSAL and phase == 0:
+                            # The previous outer may belong to the previous head. The
+                            # first iteration adds the zeroed dS buffer to a valid row.
+                            previous_outer = _causal_outer(tl.maximum(it - 1, 0), first_outer, head_outers, OUTERS,
+                                                           GROUP, Q_SPLITS, split, DIAG)
+                            dq_step = previous_outer * PHASES + PHASES - 1
+                        elif CAUSAL and Q_SPLITS > 1:
+                            # step_start belongs to the flat split, not this compacted one.
+                            dq_step = step - 1
+                        else:
+                            dq_step = tl.maximum(step - 1, step_start)
+                        _dq_atomic(dq, DQA, dq_step, SM_SCALE if PACKED_DQ else 1.0, 32, dq_mma, PACKED_DQ, False, True,
+                                   True, OCC1_LOAD_AFTER_DK)
+                        if PHASE_IGLP >= 0:
+                            tlx.amd_iglp_opt(PHASE_IGLP)
+                        # dS(i) is visible to all waves before phase i+1; all Q/dO reads
+                        # finish before this outer ring slot can be overwritten.
+                        tlx.workgroup_barrier()
+            # occ1-outer-end
+            dq0 = tlx.zeros((32, 64), tl.float32, layout=dq_mma)
+            dq1 = tlx.zeros((32, 64), tl.float32, layout=dq_mma)
+            for band in tl.static_range(8):
+                ds_band = tlx.local_load(tlx.local_slice(tlx.local_view(dsb, 1), [0, band * 32], [32, 32]),
+                                         layout=dq_lhs)
+                k0, k1 = _occ1_k_band(tlx.local_view(kb, 0), resident, band, K_BANDS, dq_rhs)
+                dq0 = _wmma(ds_band, k0, dq0, ORDERED)
+                dq1 = _wmma(ds_band, k1, dq1, ORDERED)
+            drain_step = step_stop - 1
+            if CAUSAL:
+                # kv_tile is never negative. Depending on it keeps the drain offsets
+                # in this pass instead of hoisting them live across both main loops.
+                drain_step += tl.minimum(kv_tile, 0)
+                if Q_SPLITS > 1:
+                    drain_step = (
+                        _causal_outer(iter_stop - 1, first_outer, head_outers, OUTERS, GROUP, Q_SPLITS, split, DIAG) *
+                        PHASES + PHASES - 1)
+            _dq_atomic(tl.cat(dq0, dq1, dim=1), DQA, drain_step, SM_SCALE if PACKED_DQ else 1.0, 32, dq_mma, PACKED_DQ,
+                       False, True, True)
+            dk = tl.cat(tl.cat(tl.cat(dks[0], dks[1], dim=0), tl.cat(dks[2], dks[3], dim=0), dim=1),
+                        tl.cat(tl.cat(dks[4], dks[5], dim=0), tl.cat(dks[6], dks[7], dim=0), dim=1), dim=1)
+            dv = tl.cat(tl.cat(tl.cat(dvs[0], dvs[1], dim=0), tl.cat(dvs[2], dvs[3], dim=0), dim=1),
+                        tl.cat(tl.cat(dvs[4], dvs[5], dim=0), tl.cat(dvs[6], dvs[7], dim=0), dim=1), dim=1)
+            if TAIL_SPLITS > 1:
+                # Program IDs make this branch uniform across the whole workgroup.
+                if is_tail:
+                    compact_base = (split.to(tl.int64) * TAIL_OWNERS + owner.to(tl.int64) - TAIL_BASE -
+                                    kv_tile.to(tl.int64)) * BN * 128
+                    DK += compact_base
+                    DV += compact_base
+                    # Each split writes every element of its private FP32 slice once.
+                    output_layout: tl.constexpr = tlx.layout(shape=((8, 4, 4), (4, 8)), stride=((4, 32, 128), (1, 512)))
+                    thread = tlx.thread_id(0)
+                    lane_base = (((thread >> 3) & 15) * 128 + (thread & 7) * 4)
+                    lane_base = tl.inline_asm_elementwise("", "=v,0", [lane_base], dtype=tl.int32, is_pure=True, pack=1)
+                    lane_base = lane_base & ((1 << 29) - 4)
+                    offsets = lane_base + ((tl.arange(0, 128)[:, None] & (16 | 32 | 64)) * 128 +
+                                           (tl.arange(0, 32)[None, :] & (1 | 2)))
+                    offsets = tlx.require_layout(offsets, output_layout)
+                    for band in tl.static_range(8):
+                        native = tlx.require_layout(dks[band], mma)
+                        value = tlx.require_layout(native, output_layout)
+                        base = DK + (kv_tile * 256 + (band % 2) * 128) * 128 + (band // 2) * 32
+                        tlx.buffer_store(value, base, offsets, contiguity=4)
+                    for band in tl.static_range(8):
+                        native = tlx.require_layout(dvs[band], mma)
+                        value = tlx.require_layout(native, output_layout)
+                        base = DV + (kv_tile * 256 + (band % 2) * 128) * 128 + (band // 2) * 32
+                        tlx.buffer_store(value, base, offsets, contiguity=4)
+                else:
+                    tl.store(TAIL_DK + kv_offsets, dk * SM_SCALE)
+                    tl.store(TAIL_DV + kv_offsets, dv)
+            elif CAUSAL:
+                # Store each band from its WMMA layout: an epilogue layout
+                # conversion would need LDS beside the rings live across passes.
+                for band in tl.static_range(8):
+                    band_offsets = ((kv_tile * 256 + (band % 2) * 128 + tl.arange(0, 128))[:, None] * 128 +
+                                    (band // 2) * 32 + tl.arange(0, 32)[None, :])
+                    band_offsets = tlx.require_layout(band_offsets, mma)
+                    dk_band = tlx.require_layout(dks[band], mma)
+                    dv_band = tlx.require_layout(dvs[band], mma)
+                    if Q_SPLITS > 1:
+                        # Each split owns a private FP32 slice in both precisions;
+                        # convert sums them.
+                        tl.store(DK + band_offsets, dk_band)
+                        tl.store(DV + band_offsets, dv_band)
+                    else:
+                        tl.store(DK + band_offsets, (dk_band * SM_SCALE).to(tl.bfloat16))
+                        tl.store(DV + band_offsets, dv_band.to(tl.bfloat16))
+            elif SPLIT_KV_STORES:
                 # Each split writes every element of its private FP32 slice once.
                 output_layout: tl.constexpr = tlx.layout(shape=((8, 4, 4), (4, 8)), stride=((4, 32, 128), (1, 512)))
                 thread = tlx.thread_id(0)
@@ -772,54 +981,31 @@ def _delayed_bwd_kernel(
                     value = tlx.require_layout(native, output_layout)
                     base = DV + (kv_tile * 256 + (band % 2) * 128) * 128 + (band // 2) * 32
                     tlx.buffer_store(value, base, offsets, contiguity=4)
+            elif Q_SPLITS > 1:
+                # Band coordinates use a 32-column tensor, independent of the
+                # global 128-column stride. Pin native ownership before converting
+                # one band, then retire its DEV-scope atomics before the next band.
+                output_layout: tl.constexpr = tlx.layout(shape=((32, 4), (32, )), stride=((1, 32), (128, )))
+                thread = tlx.thread_id(0)
+                atomic_base = (thread >> 5) * 128 + (thread & 31)
+                atomic_base = tl.inline_asm_elementwise("", "=v,0", [atomic_base], dtype=tl.int32, is_pure=True, pack=1)
+                atomic_base = atomic_base & ((1 << 29) - 1)
+                offsets = atomic_base + ((tl.arange(0, 128)[:, None] & ~3) * 128 + tl.zeros((1, 32), tl.int32))
+                offsets = tlx.require_layout(offsets, output_layout)
+                for band in tl.static_range(8):
+                    native = tlx.require_layout(dks[band], mma)
+                    value = tlx.require_layout(native, output_layout)
+                    base = DK + (kv_tile * 256 + (band % 2) * 128) * 128 + (band // 2) * 32
+                    tlx.buffer_atomic_add(base, offsets, value, sem="relaxed", scope="gpu")
+                for band in tl.static_range(8):
+                    native = tlx.require_layout(dvs[band], mma)
+                    value = tlx.require_layout(native, output_layout)
+                    base = DV + (kv_tile * 256 + (band % 2) * 128) * 128 + (band // 2) * 32
+                    tlx.buffer_atomic_add(base, offsets, value, sem="relaxed", scope="gpu")
             else:
-                tl.store(TAIL_DK + kv_offsets, dk * SM_SCALE)
-                tl.store(TAIL_DV + kv_offsets, dv)
-        elif SPLIT_KV_STORES:
-            # Each split writes every element of its private FP32 slice once.
-            output_layout: tl.constexpr = tlx.layout(shape=((8, 4, 4), (4, 8)), stride=((4, 32, 128), (1, 512)))
-            thread = tlx.thread_id(0)
-            lane_base = (((thread >> 3) & 15) * 128 + (thread & 7) * 4)
-            lane_base = tl.inline_asm_elementwise("", "=v,0", [lane_base], dtype=tl.int32, is_pure=True, pack=1)
-            lane_base = lane_base & ((1 << 29) - 4)
-            offsets = lane_base + ((tl.arange(0, 128)[:, None] & (16 | 32 | 64)) * 128 + (tl.arange(0, 32)[None, :] &
-                                                                                          (1 | 2)))
-            offsets = tlx.require_layout(offsets, output_layout)
-            for band in tl.static_range(8):
-                native = tlx.require_layout(dks[band], mma)
-                value = tlx.require_layout(native, output_layout)
-                base = DK + (kv_tile * 256 + (band % 2) * 128) * 128 + (band // 2) * 32
-                tlx.buffer_store(value, base, offsets, contiguity=4)
-            for band in tl.static_range(8):
-                native = tlx.require_layout(dvs[band], mma)
-                value = tlx.require_layout(native, output_layout)
-                base = DV + (kv_tile * 256 + (band % 2) * 128) * 128 + (band // 2) * 32
-                tlx.buffer_store(value, base, offsets, contiguity=4)
-        elif Q_SPLITS > 1:
-            # Band coordinates use a 32-column tensor, independent of the
-            # global 128-column stride. Pin native ownership before converting
-            # one band, then retire its DEV-scope atomics before the next band.
-            output_layout: tl.constexpr = tlx.layout(shape=((32, 4), (32, )), stride=((1, 32), (128, )))
-            thread = tlx.thread_id(0)
-            atomic_base = (thread >> 5) * 128 + (thread & 31)
-            atomic_base = tl.inline_asm_elementwise("", "=v,0", [atomic_base], dtype=tl.int32, is_pure=True, pack=1)
-            atomic_base = atomic_base & ((1 << 29) - 1)
-            offsets = atomic_base + ((tl.arange(0, 128)[:, None] & ~3) * 128 + tl.zeros((1, 32), tl.int32))
-            offsets = tlx.require_layout(offsets, output_layout)
-            for band in tl.static_range(8):
-                native = tlx.require_layout(dks[band], mma)
-                value = tlx.require_layout(native, output_layout)
-                base = DK + (kv_tile * 256 + (band % 2) * 128) * 128 + (band // 2) * 32
-                tlx.buffer_atomic_add(base, offsets, value, sem="relaxed", scope="gpu")
-            for band in tl.static_range(8):
-                native = tlx.require_layout(dvs[band], mma)
-                value = tlx.require_layout(native, output_layout)
-                base = DV + (kv_tile * 256 + (band % 2) * 128) * 128 + (band // 2) * 32
-                tlx.buffer_atomic_add(base, offsets, value, sem="relaxed", scope="gpu")
-        else:
-            tl.store(DK + kv_offsets, dk * SM_SCALE)
-            tl.store(DV + kv_offsets, dv)
-        tlx.async_amd_descriptor_wait(0)
+                tl.store(DK + kv_offsets, dk * SM_SCALE)
+                tl.store(DV + kv_offsets, dv)
+            tlx.async_amd_descriptor_wait(0)
     else:
         if TILE_MAJOR:
             kv_head = tl.program_id(1)
@@ -1510,13 +1696,13 @@ def _tail_partition(config, b, hk, n):
     return owners // 192 * 192, owners % 192
 
 
-def allocate_workspace(q, k, *, config=None, packed_dq=None):
+def allocate_workspace(q, k, *, config=None, packed_dq=None, causal=False):
     """Allocate the five legacy buffers and optional FP32 dK/dV partials."""
     config = config or select_config(q.shape[-2], q.shape[0], q.shape[1], k.shape[1],
-                                     packed_dq=True if packed_dq is None else packed_dq)
+                                     packed_dq=True if packed_dq is None else packed_dq, causal=causal)
     if packed_dq is None:
         packed_dq = config.packed_dq
-    dq_slices = _dq_slices(config, q.shape[-2])
+    dq_slices = _dq_slices(config, q.shape[-2], causal)
     dqa_shape = (dq_slices, ) + q.shape if dq_slices > 1 else q.shape
     workspace = (torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32),
                  torch.empty(dqa_shape, device=q.device, dtype=torch.bfloat16 if packed_dq else torch.float32),
@@ -1526,7 +1712,7 @@ def allocate_workspace(q, k, *, config=None, packed_dq=None):
         if config.tail_splits > 1:
             partial_shape = (config.tail_splits, tail_owners, config.block_n, 128)
         else:
-            partial_shape = (config.q_splits, ) + k.shape if config.occ1 and config.packed_dq else k.shape
+            partial_shape = (config.q_splits, ) + k.shape if config.occ1 and (config.packed_dq or causal) else k.shape
         workspace += (torch.empty(partial_shape, device=k.device,
                                   dtype=torch.float32), torch.empty(partial_shape, device=k.device,
                                                                     dtype=torch.float32))
@@ -1543,12 +1729,17 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
         raise ValueError("invalid batch/head counts")
     if q.device.type != "cuda":
         raise ValueError("inputs must be on a GPU")
-    config = config or select_config(n, b, hq, hk)
-    compiler_options = _compiler_options(config, n)
+    config = config or select_config(n, b, hq, hk, causal=causal)
+    compiler_options = _compiler_options(config, n, causal)
     if config.block_n not in (128, 256) or config.block_m not in (16, 32, 64) or config.num_warps not in (2, 4, 8, 16):
         raise ValueError("unsupported WMMA tile or wave count")
-    if causal or d != 128 or n < 256 or n % config.block_n or n % config.block_m:
-        raise ValueError("gfx1250 backward requires non-causal D128 and tile-aligned N >= 256")
+    if d != 128 or n < 256 or n % config.block_n or n % config.block_m:
+        raise ValueError("gfx1250 backward requires D128 and tile-aligned N >= 256")
+    if causal and (not config.occ1 or config.tail_splits != 1 or config.q_splits not in (1, 2, 4) or
+                   (hq // hk) * config.block_n //
+                   (config.outer_m or config.block_m) // config.q_splits < config.stages - 1):
+        raise ValueError("causal gfx1250 backward requires OCC1 without tail splits, q_splits in {1, 2, 4} "
+                         "and STAGES-1 outers per split")
     if config.stages not in (2, 3, 4) or config.unroll not in (1, 2, 4, 8):
         raise ValueError("unsupported pipeline depth or unroll")
     if not isinstance(config.fragment_fence_mask, int) or not 0 <= config.fragment_fence_mask <= 0xFFF:
@@ -1639,13 +1830,13 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
         raise ValueError("requires gfx1250")
     if (hq // hk) * n * 128 >= (1 << 29):
         raise ValueError("one query-head group's FP32 dQ workspace must fit in the signed 2-GiB buffer range")
-    workspace = workspace if workspace is not None else allocate_workspace(q, k, config=config)
+    workspace = workspace if workspace is not None else allocate_workspace(q, k, config=config, causal=causal)
     partials = config.q_splits > 1 or config.tail_splits > 1
     tail_base, tail_owners = _tail_partition(config, b, hk, n)
     base_buffers = 7 if partials else 5
     if len(workspace) != base_buffers + int(config.log2_lse):
         raise ValueError("workspace does not match q_splits")
-    dq_slices = _dq_slices(config, n)
+    dq_slices = _dq_slices(config, n, causal)
     dqa_shape = (dq_slices, ) + q.shape if dq_slices > 1 else q.shape
     delta, dqa, dq, dk, dv = workspace[:5]
     dka, dva = workspace[5:7] if partials else (None, None)
@@ -1657,7 +1848,7 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
         if config.tail_splits > 1:
             partial_shape = (config.tail_splits, tail_owners, config.block_n, d)
         else:
-            partial_shape = (config.q_splits, ) + k.shape if config.occ1 and config.packed_dq else k.shape
+            partial_shape = (config.q_splits, ) + k.shape if config.occ1 and (config.packed_dq or causal) else k.shape
         specifications += [(dka, partial_shape, torch.float32), (dva, partial_shape, torch.float32)]
     if config.log2_lse:
         specifications.append((lse_log2, q.shape[:-1], torch.float32))
@@ -1670,13 +1861,15 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
     _run_bwd_preprocess(o, do, delta, lse=lse if config.log2_lse else None, lse_log2=lse_log2,
                         block_m=config.preprocess_block, native_lse=config.log2_lse)
     _run_bwd_zero_dq(dqa, b * hq, n, d, block_m=config.preprocess_block, dq_slices=dq_slices,
-                     dk_acc=None if config.tail_splits > 1 or config.occ1 and config.packed_dq else dka,
-                     dv_acc=None if config.tail_splits > 1 or config.occ1 and config.packed_dq else dva, heads=hq,
-                     kv_heads=hk)
+                     dk_acc=None if config.tail_splits > 1 or config.occ1 and (config.packed_dq or causal) else dka,
+                     dv_acc=None if config.tail_splits > 1 or config.occ1 and (config.packed_dq or causal) else dva,
+                     heads=hq, kv_heads=hk)
     grid = (n // config.block_n, hk, b * config.q_splits) if config.tile_major else (hk, n // config.block_n,
                                                                                      b * config.q_splits)
     if config.tail_splits > 1:
         grid = (tail_base + tail_owners * config.tail_splits, 1, 1)
+    if causal:
+        grid = (n // config.block_n // 2, hk, b * config.q_splits)
     _delayed_bwd_kernel[grid](
         q, k, v, do, lse_log2 if config.log2_lse else lse, delta, dqa, dka if dka is not None else dk,
         dva if dva is not None else dv, HQ=hq, HK=hk, N=n, SM_SCALE=d**-0.5 if sm_scale is None else sm_scale,
@@ -1689,10 +1882,11 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
         TILE_MAJOR=config.tile_major, PARTITION_LDS=config.partition_lds, FRONT_REGIONS=config.front_regions,
         BRIDGE_REGIONS=config.bridge_regions, CLUSTER_DQ=config.cluster_dq, DQ_SLICES=dq_slices, OCC1=config.occ1,
         OCC1_K_BANDS=config.occ1_k_bands, OCC1_PREFETCH=config.occ1_prefetch, OCC1_SCHED=config.occ1_sched,
-        PHASE_IGLP=config.phase_iglp, SPLIT_KV_STORES=config.occ1 and config.packed_dq and config.q_splits > 1,
-        TAIL_DK=dk if config.tail_splits > 1 else None, TAIL_DV=dv if config.tail_splits > 1 else None,
-        TAIL_SPLITS=config.tail_splits, TAIL_BASE=tail_base, TAIL_OWNERS=tail_owners,
-        OCC1_DQ_FIRST=config.occ1_dq_first, OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, **compiler_options)
+        PHASE_IGLP=config.phase_iglp, SPLIT_KV_STORES=config.occ1 and (config.packed_dq or causal)
+        and config.q_splits > 1, TAIL_DK=dk if config.tail_splits > 1 else None,
+        TAIL_DV=dv if config.tail_splits > 1 else None, TAIL_SPLITS=config.tail_splits, TAIL_BASE=tail_base,
+        TAIL_OWNERS=tail_owners, OCC1_DQ_FIRST=config.occ1_dq_first, OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk,
+        CAUSAL=causal, **compiler_options)
     if config.tail_splits > 1:
         convert_size = tail_owners * config.block_n * d
         convert_dk = dk.reshape(-1)[tail_base * config.block_n * d:]
@@ -1701,7 +1895,7 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
     else:
         convert_size = k.numel()
         convert_dk, convert_dv = dk, dv
-        kv_slices = config.q_splits if config.occ1 and config.packed_dq else 1
+        kv_slices = config.q_splits if config.occ1 and (config.packed_dq or causal) else 1
     _convert_outputs[(triton.cdiv(q.numel(),
                                   config.convert_block), )](dqa, dq, dka if dka is not None else dqa,
                                                             dva if dva is not None else dqa, convert_dk, convert_dv,
