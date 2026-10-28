@@ -8,7 +8,7 @@
 namespace mlir::triton {
 
 // Sets TRITON_ALLOW_NPOT for one scope ("1" by default, nullptr unsets it) and
-// restores the previous value. Flag-off LinearLayout rejects NPOT out-dims.
+// restores the previous value.
 class ScopedAllowNpot {
 public:
   explicit ScopedAllowNpot(const char *value = "1") {
