@@ -61,8 +61,7 @@ static FailureOr<SmallVector<int>> getNormalizedTaskIds(Operation *op) {
     Operation *parent = op->getParentOp();
     taskIds = parent->getAttrOfType<DenseI32ArrayAttr>("async_task_id");
     if (!taskIds)
-      taskIds =
-          parent->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName);
+      taskIds = parent->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName);
   }
   if (!taskIds)
     return failure();
@@ -79,9 +78,8 @@ static FailureOr<SmallVector<int>> getNormalizedTaskIds(Operation *op) {
 static LogicalResult materializePartition(Operation *op) {
   FailureOr<SmallVector<int>> ids = getNormalizedTaskIds(op);
   if (failed(ids))
-    return op->emitError(
-        "MetaToNVWSConvert requires a non-empty, non-negative "
-        "async_task_id or ttg.partition assignment on ")
+    return op->emitError("MetaToNVWSConvert requires a non-empty, non-negative "
+                         "async_task_id or ttg.partition assignment on ")
            << op->getName() << " with attributes " << op->getAttrDictionary();
 
   auto expected = DenseI32ArrayAttr::get(op->getContext(), *ids);
@@ -108,8 +106,7 @@ static LogicalResult promoteMetaWarpSpecializeRoots(FuncOp func) {
   });
 
   for (scf::ForOp scheduled : scheduledLoops) {
-    FailureOr<SmallVector<int>> scheduledIds =
-        getNormalizedTaskIds(scheduled);
+    FailureOr<SmallVector<int>> scheduledIds = getNormalizedTaskIds(scheduled);
     if (failed(scheduledIds))
       return scheduled.emitError(
           "MetaToNVWSConvert cannot determine the task domain of the Meta "
@@ -154,10 +151,9 @@ static LogicalResult promoteMetaWarpSpecializeRoots(FuncOp func) {
       }
     }
 
-    const StringRef rootAttrs[] = {kWarpSpecializeAttrName,
-                                   kWarpSpecializeTagAttrName,
-                                   kPartitionStagesAttrName,
-                                   kPartitionTypesAttrName};
+    const StringRef rootAttrs[] = {
+        kWarpSpecializeAttrName, kWarpSpecializeTagAttrName,
+        kPartitionStagesAttrName, kPartitionTypesAttrName};
     for (StringRef name : rootAttrs) {
       if (Attribute attr = scheduled->getAttr(name)) {
         root->setAttr(name, attr);
@@ -317,8 +313,9 @@ inferResultPartition(Operation *op, unsigned resultIndex,
   return result;
 }
 
-static LogicalResult materializePartitionOutputs(
-    Operation *op, DenseSet<Operation *> &consumedExternalTaskIds) {
+static LogicalResult
+materializePartitionOutputs(Operation *op,
+                            DenseSet<Operation *> &consumedExternalTaskIds) {
   if (!isa<scf::ForOp, scf::IfOp, ReduceOp>(op) || op->getNumResults() == 0)
     return success();
   // A second conversion after NVWSInsertAllocas and memory planning must retain
@@ -336,8 +333,8 @@ static LogicalResult materializePartitionOutputs(
     SetVector<int> ids =
         inferResultPartition(op, index, consumedExternalTaskIds);
     if (ids.empty())
-      return op->emitError(
-          "MetaToNVWSConvert cannot determine partition.outputs for result ")
+      return op->emitError("MetaToNVWSConvert cannot determine "
+                           "partition.outputs for result ")
              << index;
     for (int id : ids) {
       if (!opPartitions.contains(id))
@@ -558,11 +555,9 @@ static SmemPlanPolicy getEffectiveSmemPlanPolicy(FuncOp func) {
          parent = parent->getParentOfType<scf::ForOp>())
       loopChain.push_back(parent);
     for (scf::ForOp loop : llvm::reverse(loopChain)) {
-      if (auto attr =
-              loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
         policy.allocAlgo = attr.getInt();
-      if (auto attr =
-              loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
+      if (auto attr = loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
         policy.circularReuse = attr.getValue();
     }
   });
@@ -571,15 +566,13 @@ static SmemPlanPolicy getEffectiveSmemPlanPolicy(FuncOp func) {
 
 static unsigned computeMemDescBytes(MemDescType type) {
   int64_t numElements = 0;
-  if (auto padded =
-          dyn_cast<PaddedSharedEncodingAttr>(type.getEncoding())) {
+  if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(type.getEncoding())) {
     SmallVector<int64_t> unpaddedShape = getShapePerCTA(type);
     numElements = padded.getPaddedSize(unpaddedShape);
   } else {
     numElements = product<int64_t>(getAllocationShapePerCTA(type));
   }
-  return static_cast<unsigned>(numElements * type.getElementTypeBitWidth() /
-                               8);
+  return static_cast<unsigned>(numElements * type.getElementTypeBitWidth() / 8);
 }
 
 static bool areReuseTypesCompatible(MemDescType host, MemDescType reuser) {
@@ -646,8 +639,8 @@ static LogicalResult translateReuseTargets(FuncOp func) {
       candidate->setAttr("buffer.id", IntegerAttr::get(i32, targetId));
       candidate->setAttr(
           "buffer.start",
-          IntegerAttr::get(
-              i32, nextStart[originalId.getInt()]++ % copies.getInt()));
+          IntegerAttr::get(i32,
+                           nextStart[originalId.getInt()]++ % copies.getInt()));
       candidate->removeAttr("allocation.reuseTarget");
     }
   }
@@ -807,8 +800,7 @@ static void completePlannedTmemAllocTaskIds(FuncOp func) {
   func.walk<WalkOrder::PreOrder>([&](TMEMStoreOp store) {
     auto alloc = store.getDst().getDefiningOp<TMEMAllocOp>();
     if (!alloc || alloc.getSrc() || !isNestedInWarpSpecializeLoop(alloc) ||
-        succeeded(getNormalizedTaskIds(alloc)) ||
-        storeTaskIds.contains(alloc))
+        succeeded(getNormalizedTaskIds(alloc)) || storeTaskIds.contains(alloc))
       return;
     FailureOr<SmallVector<int>> ids = getNormalizedTaskIds(store);
     if (succeeded(ids))
@@ -883,8 +875,7 @@ static LogicalResult convertFunc(FuncOp func) {
   WalkResult outputResult = func.walk<WalkOrder::PostOrder>([&](Operation *op) {
     if (!isWarpSpecializeLoop(op) && !isNestedInWarpSpecializeLoop(op))
       return WalkResult::advance();
-    if (failed(
-            materializePartitionOutputs(op, consumedExternalTaskIds)))
+    if (failed(materializePartitionOutputs(op, consumedExternalTaskIds)))
       return WalkResult::interrupt();
     return WalkResult::advance();
   });
