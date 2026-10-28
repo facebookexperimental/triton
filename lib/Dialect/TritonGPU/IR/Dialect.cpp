@@ -568,7 +568,11 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
   }
   if (packedAxis)
     shape[*packedAxis] *= 2;
-  if (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout)) {
+  // Flag off keeps upstream's allocation size (no pow2 rounding).
+  static const bool allowNpot =
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+  if (allowNpot &&
+      (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout))) {
     unsigned tileRank = getCGALayout(layout).getRank();
     size_t firstTileDim = shape.size() > tileRank ? shape.size() - tileRank : 0;
     for (size_t i = firstTileDim; i < shape.size(); ++i) {
@@ -1672,6 +1676,24 @@ void NvidiaMmaEncodingAttr::print(AsmPrinter &printer) const {
   maybePrintCGALayout(printer, getCGALayout());
 
   printer << ", instrShape = [" << getInstrShape() << "]}>";
+}
+
+LogicalResult
+NvidiaMmaEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                              unsigned versionMajor, unsigned,
+                              ArrayRef<unsigned>, CGAEncodingAttr,
+                              ArrayRef<unsigned> instrShape) {
+  // toLinearLayout turns the instruction M and N into identity1D repeat
+  // counts, which must be powers of two.
+  if (instrShape.size() < 2)
+    return success();
+  unsigned mIdx = versionMajor == 3 ? 0 : instrShape.size() - 2;
+  if (!llvm::isPowerOf2_32(instrShape[mIdx]) ||
+      !llvm::isPowerOf2_32(instrShape[mIdx + 1]))
+    return emitError() << "NVIDIA MMA instrShape with an NPOT M or N is not "
+                          "yet supported, got instrShape = ["
+                       << instrShape << "]";
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -3044,6 +3066,10 @@ LogicalResult DotOperandEncodingAttr::verify(
     if (kWidth == 0 && (parentAttr.isAmpere() || parentAttr.isHopper()))
       return emitError() << "ttg.dot_op kWidth parameter is mandatory for "
                             "Ampere or Hopper MMA parent";
+    if (kWidth != 0 && !llvm::isPowerOf2_32(kWidth))
+      return emitError() << "ttg.dot_op NPOT kWidth parameter is not yet "
+                            "supported for Ampere or Hopper MMA parent, got: "
+                         << kWidth;
     if (opIdx != 0 && parentAttr.isHopper())
       return emitError()
              << "ttg.dot_op opIdx parameter must be 0 for "

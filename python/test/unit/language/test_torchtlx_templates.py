@@ -718,10 +718,13 @@ class TestTLXTemplates(TestCase):
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_blackwell_template_is_arch_gated(self):
+        from torch._inductor.kernel.mm import mm_template
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
 
         existing_template = object()
         h100_templates = [existing_template]
+        h100_addmm_templates = [mm_template]
+        h100_addmm_aten_templates = [existing_template]
         scaled_mm_templates = [existing_template]
         kernel_inputs = _mm_kernel_inputs_stub()
         with mock.patch.object(_tlx_mm, "is_rocm", return_value=False), mock.patch.object(_tlx_mm,
@@ -729,6 +732,8 @@ class TestTLXTemplates(TestCase):
             target.return_value.is_blackwell = False
             target.return_value.is_hopper = True
             h100_result = _tlx_mm.append_tlx(h100_templates, "mm", kernel_inputs)
+            h100_addmm_result = _tlx_mm.append_tlx(h100_addmm_templates, "addmm", kernel_inputs)
+            h100_addmm_aten_result = _tlx_mm.append_tlx(h100_addmm_aten_templates, "addmm", kernel_inputs)
 
             target.return_value.is_blackwell = True
             target.return_value.is_hopper = False
@@ -736,7 +741,13 @@ class TestTLXTemplates(TestCase):
             mm_result = _tlx_mm.append_tlx([], "mm", kernel_inputs)
 
         self.assertIs(h100_result, h100_templates)
-        self.assertEqual(h100_templates, [existing_template, _tlx_mm.hopper_gemm_ws_template])
+        hopper = [_tlx_mm.hopper_gemm_ws_template, _tlx_mm.hopper_gemm_small_k_template]
+        self.assertEqual(h100_templates, [existing_template, *hopper])
+        self.assertIs(h100_addmm_result, h100_addmm_templates)
+        self.assertEqual(h100_addmm_templates, [mm_template, *hopper])
+        # tuned_addmm's aten / subgraph choice sets keep the unexpanded bias.
+        self.assertIs(h100_addmm_aten_result, h100_addmm_aten_templates)
+        self.assertEqual(h100_addmm_aten_templates, [existing_template])
         self.assertIs(scaled_mm_result, scaled_mm_templates)
         self.assertEqual(scaled_mm_templates, [existing_template])
         self.assertEqual(mm_result, [_tlx_mm.blackwell_gemm_ws_template])
@@ -811,6 +822,14 @@ class TestTLXTemplates(TestCase):
             [template.uid for template in templates if template.uid in expected],
             expected,
         )
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_sm90_torch_addmm_is_cataloged(self):
+        from triton.tlx.ops._catalog import impl_for
+        from triton.tlx.ops.kernels.addmm import sm90_torch
+
+        addmm_impl, _ = impl_for("addmm_torchtlx", arch="sm90")
+        self.assertIs(addmm_impl, sm90_torch.addmm)
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_gfx942_torch_providers_are_cataloged(self):
@@ -2363,9 +2382,37 @@ class TestTLXTemplates(TestCase):
         self.assertIn("_reduce_k", code_str)
 
 
+def _operands(shape, layout, dtype):
+    m, n, k = shape
+    a = (torch.randn(k, m, device=GPU_TYPE, dtype=dtype).t() if layout[0] == "t" else torch.randn(
+        m, k, device=GPU_TYPE, dtype=dtype))
+    b = (torch.randn(n, k, device=GPU_TYPE, dtype=dtype).t() if layout[1] == "t" else torch.randn(
+        k, n, device=GPU_TYPE, dtype=dtype))
+    return a, b
+
+
+# Markers of the Hopper TLX templates in generated code: the WS template's
+# consumer loop and the small-K template's descriptor loads.
+_HOPPER_WS = "_consume_tile"
+_HOPPER_SMALL_K = "desc_a.load"
+# max_autotune is required for addmm (mm works without it): without max_autotune
+# or max_autotune_gemm, tuned_addmm returns an ATen-only choice before any template
+# is considered, and tlx_mode=force then has no candidate (NoValidChoicesError).
+_HOPPER_ADDMM_PATCH = {
+    "max_autotune": True,
+    "triton.tlx_mode": "force",
+    "force_disable_caches": True,
+    "enable_caching_generated_triton_templates": False,
+}
+
+
 @instantiate_parametrized_tests
 @unittest.skipIf(not is_hopper(), "Need H100 for the Hopper GEMM template")
 class TestHopperMMTemplate(TestCase):
+
+    def _assert_hopper_tlx(self, code):
+        generated = "\n".join(code)
+        self.assertTrue(_HOPPER_WS in generated or _HOPPER_SMALL_K in generated)
 
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     @parametrize("shape,layout", (
@@ -2392,14 +2439,16 @@ class TestHopperMMTemplate(TestCase):
         }):
             actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
         torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
-        self.assertIn("_consume_tile", "\n".join(code))
+        # K = 64 also offers the small-K template; autotuning picks either.
+        self._assert_hopper_tlx(code)
         if n % 8 == 0:
             torch.testing.assert_close(tlx_mm(a, b), expected, atol=2e-2, rtol=2e-2)
 
     @parametrize("n", (256, 259))
     def test_fused_epilogue(self, n):
-        a = torch.randn(259, 328, device=GPU_TYPE, dtype=torch.bfloat16)
-        b = torch.randn(n, 328, device=GPU_TYPE, dtype=torch.bfloat16).t()
+        # K past the few-tile small-K region, so force mode runs the WS template.
+        a = torch.randn(259, 1096, device=GPU_TYPE, dtype=torch.bfloat16)
+        b = torch.randn(n, 1096, device=GPU_TYPE, dtype=torch.bfloat16).t()
 
         def mm_gelu(a, b):
             return torch.nn.functional.gelu(a @ b)
@@ -2415,6 +2464,166 @@ class TestHopperMMTemplate(TestCase):
         generated = "\n".join(code)
         self.assertIn("_consume_tile", generated)
         self.assertNotIn("triton_poi_", generated)
+
+    def test_fused_epilogue_ring_depth(self):
+        from triton.language.extra.tlx.inductor.registry import _hopper_ws_fused_epilogue_stages
+
+        def meta(bm, bn, stages):
+            return {
+                "BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": 64, "NUM_STAGES": stages, "BLOCK_M_SPLIT": bm // 2,
+                "slice_size": bn // 4, "SWAP_AB": False
+            }
+
+        # 128x256 with a 4-deep ring leaves no room for the epilogue scratch tile.
+        self.assertEqual(_hopper_ws_fused_epilogue_stages(meta(128, 256, 4)), 3)
+        self.assertEqual(_hopper_ws_fused_epilogue_stages(meta(128, 256, 3)), 3)
+        self.assertEqual(_hopper_ws_fused_epilogue_stages(meta(128, 128, 6)), 6)
+
+    def test_fused_epilogue_with_full_smem_ring(self):
+        # Residual epilogue (x * y + z) on the deepest 128x256 ring: without
+        # shedding a stage the fused kernel exceeds SMEM and fails to compile.
+        from triton.tlx.ops.kernels.mm import sm90
+
+        m, n, k = 706, 4096, 256
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.float16).t()
+        y = torch.randn(m, n, device=GPU_TYPE, dtype=torch.float16)
+        z = torch.randn(m, n, device=GPU_TYPE, dtype=torch.float16)
+
+        def mm_residual(a, b, y, z):
+            return (a @ b) * y + z
+
+        with mock.patch.object(sm90, "heuristic_config", lambda *args: [sm90._config(128, 256, 4)]), config.patch({
+                "triton.tlx_mode":
+                "force",
+                "test_configs.autotune_choice_name_regex":
+                "tlx_hopper_gemm_ws",
+                "force_disable_caches":
+                True,
+                "enable_caching_generated_triton_templates":
+                False,
+        }):
+            actual, code = run_and_get_code(torch.compile(mm_residual), a, b, y, z)
+        expected = ((a.float() @ b.float()) * y.float() + z.float()).to(torch.float16)
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+        generated = "\n".join(code)
+        self.assertIn("_consume_tile", generated)
+        self.assertIn("NUM_STAGES : tl.constexpr = 3", generated)
+        self.assertNotIn("triton_poi_", generated)
+
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    @parametrize("bias_shape", ("n", "mn"))
+    # K = 1096 keeps a ragged last K step while staying out of the few-tile
+    # small-K region (K <= 1024), so force mode runs the WS template.
+    @parametrize("shape,layout", (
+        ((264, 256, 1096), "nn"),
+        ((264, 256, 1096), "nt"),
+        ((264, 256, 1096), "tn"),
+        ((264, 256, 1096), "tt"),
+        ((259, 264, 1096), "nt"),
+    ))
+    def test_addmm(self, dtype, bias_shape, shape, layout):
+        m, n, k = shape
+        a = (torch.randn(k, m, device=GPU_TYPE, dtype=dtype).t() if layout[0] == "t" else torch.randn(
+            m, k, device=GPU_TYPE, dtype=dtype))
+        b = (torch.randn(n, k, device=GPU_TYPE, dtype=dtype).t() if layout[1] == "t" else torch.randn(
+            k, n, device=GPU_TYPE, dtype=dtype))
+        bias = torch.randn(n if bias_shape == "n" else (m, n), device=GPU_TYPE, dtype=dtype)
+        expected = (bias.float() + a.float() @ b.float()).to(dtype)
+        # Inductor only offers templates for addmm under max-autotune.
+        with config.patch({
+                "max_autotune": True,
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.addmm), bias, a, b)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("_consume_tile", "\n".join(code))
+
+    @parametrize("op", ("mm", "addmm"))
+    @parametrize("m", (1, 7, 64))
+    # Column-major A of M = 1 or 7 has no TMA-legal row stride.
+    @parametrize("layout", ("nn", "nt"))
+    def test_swap_ab(self, op, m, layout):
+        """M <= 64 runs swap-AB, as tlx.ops.mm does: the kernel tiles C^T and the
+        epilogue transposes each tile back into C's coordinates."""
+        a, b = _operands((m, 1000, 512), layout, torch.float16)
+        bias = torch.randn(1000, device=GPU_TYPE, dtype=torch.float16)
+        fn, args = ((torch.mm, (a, b)) if op == "mm" else (torch.addmm, (bias, a, b)))
+        expected = (a.float() @ b.float() + (bias.float() if op == "addmm" else 0)).half()
+        with config.patch(_HOPPER_ADDMM_PATCH):
+            actual, code = run_and_get_code(torch.compile(fn), *args)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        generated = "\n".join(code)
+        self.assertIn(_HOPPER_WS, generated)
+        self.assertIn("tl.trans(acc)", generated)
+
+    @parametrize("block_n", (192, 96))
+    @parametrize("bias_shape", ("n", "mn"))
+    def test_addmm_npot_tile(self, block_n, bias_shape):
+        """A two-piece N tile (192 = 128 + 64, 96 = 64 + 32), with the bias added
+        to each of the six equal epilogue subtiles. B is K-major."""
+        from triton.tlx.ops.kernels.mm import sm90
+
+        m, n, k = 2136, 1000, 448
+        a, b = _operands((m, n, k), "nt", torch.float16)
+        bias = torch.randn(n if bias_shape == "n" else (m, n), device=GPU_TYPE, dtype=torch.float16)
+        conf = next(c for c in sm90._npot_configs() if c.kwargs["BN"] == block_n)
+        with mock.patch.object(sm90, "heuristic_config", return_value=[conf]), config.patch(_HOPPER_ADDMM_PATCH):
+            actual, code = run_and_get_code(torch.compile(torch.addmm), bias, a, b)
+        torch.testing.assert_close(actual, (bias.float() + a.float() @ b.float()).half(), atol=2e-2, rtol=2e-2)
+        self.assertIn("_consume_tile_pieces", "\n".join(code))
+
+    @parametrize("op", ("mm", "addmm_n", "addmm_mn", "mm_gelu"))
+    @parametrize("swap_ab", (False, True))
+    def test_split_k(self, op, swap_ab):
+        """K split across work units: each writes an fp32 partial to the split-K
+        workspace and _reduce_k_kernel sums them, adds the bias and replays any
+        fused epilogue. M is ragged and K leaves a short last split."""
+        from triton.tlx.ops.kernels.mm import sm90
+
+        m, n, k = (7, 1000, 64 * 41) if swap_ab else (264, 1000, 64 * 41)
+        a, b = _operands((m, n, k), "nt", torch.float16)
+        bias = torch.randn(n if op != "addmm_mn" else (m, n), device=GPU_TYPE, dtype=torch.float16)
+        ref = a.float() @ b.float()
+        if op == "mm":
+            fn, args, expected = torch.mm, (a, b), ref
+        elif op == "mm_gelu":
+            fn, args, expected = (lambda x, y: torch.nn.functional.gelu(x @ y)), (a, b), torch.nn.functional.gelu(ref)
+        else:
+            fn, args, expected = torch.addmm, (bias, a, b), bias.float() + ref
+        if swap_ab:
+            conf = sm90._config(128, 16, 4, 1, 4, 128, True)
+            pin = mock.patch.object(sm90, "_swap_heuristic_config", return_value=[conf])
+        else:
+            conf = sm90._config(128, 128, 4, group_size_m=1, split_k=4)
+            pin = mock.patch.object(sm90, "heuristic_config", return_value=[conf])
+        with pin, config.patch(_HOPPER_ADDMM_PATCH):
+            actual, code = run_and_get_code(torch.compile(fn), *args)
+        torch.testing.assert_close(actual, expected.half(), atol=3e-2, rtol=3e-2)
+        generated = "\n".join(code)
+        self.assertIn("split_k_ws", generated)
+        self.assertIn("_reduce_k", generated)
+
+    @parametrize("op", ("mm", "addmm"))
+    @parametrize("shape,layout", (
+        ((264, 256, 128), "nt"),
+        ((264, 264, 64), "nn"),
+        ((7, 4992, 128), "nt"),
+    ))
+    def test_small_k(self, op, shape, layout):
+        """tlx.ops.mm's small-K kernel as a template, restricted to it."""
+        m, n, k = shape
+        a, b = _operands(shape, layout, torch.float16)
+        bias = torch.randn(n, device=GPU_TYPE, dtype=torch.float16)
+        fn, args = ((torch.mm, (a, b)) if op == "mm" else (torch.addmm, (bias, a, b)))
+        expected = (a.float() @ b.float() + (bias.float() if op == "addmm" else 0)).half()
+        with config.patch({**_HOPPER_ADDMM_PATCH, "test_configs.autotune_choice_name_regex":
+                           "tlx_hopper_gemm_small_k"}):
+            actual, code = run_and_get_code(torch.compile(fn), *args)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn(_HOPPER_SMALL_K, "\n".join(code))
 
 
 class TestInterWaveTemplateCodegen(TestCase):

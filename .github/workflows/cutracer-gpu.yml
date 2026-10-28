@@ -1,0 +1,247 @@
+name: CUTracer Sanitizer (one GPU)
+# Called by cutracer.yml once per NVIDIA GPU: runs the selected tests under
+# Compute Sanitizer and random delay on that GPU's runner, then files and closes
+# that GPU's issues. See cutracer.yml for what is checked and when.
+on:
+  workflow_call:
+    inputs:
+      gpu:
+        description: GPU key, e.g. b200; also names the job and the artifact
+        required: true
+        type: string
+      runner:
+        description: Runner label for this GPU
+        required: true
+        type: string
+      cuda_arch:
+        description: Architecture to build cutracer.so for, e.g. sm_100
+        required: true
+        type: string
+      tests:
+        description: JSON list of test ids or files
+        required: true
+        type: string
+      known_races:
+        description: "JSON: test function -> open random-delay issue number, for this GPU"
+        required: true
+        type: string
+      file_issues:
+        description: Whether this run files and closes issues
+        required: true
+        type: boolean
+      ref:
+        required: true
+        type: string
+      kernel:
+        required: true
+        type: string
+      tools:
+        required: true
+        type: string
+      cutracer_version:
+        required: true
+        type: string
+      delay_ns:
+        required: true
+        type: string
+      wheel_url:
+        required: true
+        type: string
+      wheel_filename:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sanitize:
+    runs-on: ${{ inputs.runner }}
+    env:
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+      CUDA_VERSION: "13.4"
+      FILE_ISSUES: ${{ inputs.file_issues }}
+      KERNEL: ${{ inputs.kernel }}
+      TOOLS: ${{ inputs.tools }}
+      GPU: ${{ inputs.gpu }}
+    # Setup takes about 4 minutes. The step limits below fit the rest inside
+    # the job's limit, so a slow run ends as incomplete with its logs uploaded
+    # instead of being cancelled. They allow about 1.5x the time the full
+    # sm90 flash-attention test file took on an H100: memcheck 6.4 minutes,
+    # random delay 7.
+    timeout-minutes: 40
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    outputs:
+      # The random-delay step appends its entries to the sanitizer's; if it
+      # did not finish, the sanitizer's list stands alone.
+      failures: ${{ steps.delay.outputs.failures || steps.sanitize.outputs.failures }}
+      reconcile_prefixes: ${{ steps.sanitize.outputs.reconcile_prefixes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Install test dependencies
+        run: |
+          . "${SETUP_SCRIPT}"
+          uv pip install pytest
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
+      - name: Set up CUTracer
+        uses: ./.github/actions/setup-cutracer
+        env:
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          cuda-version: ${{ env.CUDA_VERSION }}
+          cutracer-version: ${{ inputs.cutracer_version }}
+          cuda-arch: ${{ inputs.cuda_arch }}
+      - name: Run sanitizers
+        id: sanitize
+        timeout-minutes: 22
+        env:
+          TESTS: ${{ inputs.tests }}
+        run: |
+          . "${SETUP_SCRIPT}"
+          readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
+          # pytest's importlib mode leaves a test's own directory off sys.path, so a
+          # helper beside the test, such as mm_test_utils.py, would not import.
+          for test in "${TEST_IDS[@]}"; do
+            dir="${test%%::*}"; [[ -d "${dir}" ]] || dir="$(dirname "${dir}")"
+            PYTHONPATH="${PWD}/${dir}${PYTHONPATH:+:${PYTHONPATH}}"
+          done
+          export PYTHONPATH
+          ISSUES=()
+          if [[ "${FILE_ISSUES}" == true ]]; then
+            ISSUES=(--issue-title-prefix "[CUTracer][${GPU^^}]" --issue-job "sanitize-${GPU}")
+          fi
+          python3 .github/scripts/cutracer_ci/sanitize.py \
+            --tools "${TOOLS}" \
+            --kernel "${KERNEL}" \
+            --out "${RUNNER_TEMP}/cutracer" \
+            --timeout-minutes 10 \
+            "${ISSUES[@]}" \
+            -- python -m pytest "${TEST_IDS[@]}" --import-mode=importlib -q -p no:cacheprovider
+      # See random_delay.py: a test that passes without CUTracer and fails
+      # twice under random delay points to a race the sanitizers cannot see.
+      - name: Run tests under random delay
+        id: delay
+        if: ${{ !cancelled() && steps.sanitize.outcome != 'skipped' }}
+        timeout-minutes: 10
+        env:
+          TESTS: ${{ inputs.tests }}
+          SANITIZER_FAILURES: ${{ steps.sanitize.outputs.failures }}
+          KNOWN_RACES: ${{ inputs.known_races }}
+          DELAY_NS: ${{ inputs.delay_ns }}
+        run: |
+          . "${SETUP_SCRIPT}"
+          readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
+          # pytest's importlib mode leaves a test's own directory off sys.path, so a
+          # helper beside the test, such as mm_test_utils.py, would not import.
+          for test in "${TEST_IDS[@]}"; do
+            dir="${test%%::*}"; [[ -d "${dir}" ]] || dir="$(dirname "${dir}")"
+            PYTHONPATH="${PWD}/${dir}${PYTHONPATH:+:${PYTHONPATH}}"
+          done
+          export PYTHONPATH
+          ISSUES=()
+          if [[ "${FILE_ISSUES}" == true ]]; then
+            ISSUES=(--issue-title-prefix "[CUTracer][${GPU^^}]" --issue-job "sanitize-${GPU}")
+          fi
+          # CUTracer also writes a file per kernel launch, hundreds of MB for a
+          # test file; only its main log and the delay configs go into the
+          # uploaded logs. A config replays a failure with --delay-load-path.
+          OUT="${RUNNER_TEMP}/random-delay"
+          LOGS="${RUNNER_TEMP}/cutracer/random-delay"
+          status=0
+          python3 .github/scripts/cutracer_ci/random_delay.py \
+            --cutracer-so "${CUTRACER_SO}" \
+            --kernel "${KERNEL}" \
+            --delay-ns "${DELAY_NS}" \
+            --out "${OUT}" \
+            --logs "${LOGS}" \
+            --sanitizer-failures "${SANITIZER_FAILURES}" \
+            --known-races "${KNOWN_RACES}" \
+            "${ISSUES[@]}" \
+            "${TEST_IDS[@]}" || status=$?
+          cp "${OUT}"/cutracer_main_*.log "${LOGS}/" || true
+          exit "${status}"
+      - name: Upload sanitizer logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cutracer-sanitizer-${{ inputs.gpu }}
+          path: ${{ runner.temp }}/cutracer
+          if-no-files-found: warn
+          retention-days: 30
+
+  report:
+    needs: sanitize
+    # A failed sanitize job still reports its fallback items.
+    if: always() && needs.sanitize.outputs.failures != '' && needs.sanitize.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.sanitize.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: CUTracer Sanitizer
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      # No platform: a finding is often older than the last green nightly, so
+      # bisecting it would blame an unrelated PR.
+      platform: ""
+      labels: cutracer
+
+  reconcile:
+    needs: sanitize
+    # Runs after a successful sanitize job that produced a list; an empty
+    # output means no list was produced, not that nothing was found. Each call
+    # closes only within one kernel or tool this run checked, so a run of one
+    # test never closes another kernel's issue.
+    if: needs.sanitize.outputs.reconcile_prefixes != ''
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        title_prefix: ${{ fromJSON(needs.sanitize.outputs.reconcile_prefixes) }}
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: CUTracer Sanitizer
+      job_name: sanitize-${{ inputs.gpu }}
+      failures: ${{ needs.sanitize.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      title_prefix: ${{ matrix.title_prefix }}
+      labels: cutracer

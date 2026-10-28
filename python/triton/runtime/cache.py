@@ -283,14 +283,22 @@ def make_so_cache_key(version_hash, signature, constants, ids, **kwargs):
     return _base32(key)
 
 
+def _sha256_file(path) -> str:
+    # In chunks: the hashed files include shared libraries of hundreds of MB.
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1024**2):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 @functools.lru_cache()
 def triton_key():
     import pkgutil
     TRITON_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     contents = []
     # frontend
-    with open(__file__, "rb") as f:
-        contents += [hashlib.sha256(f.read()).hexdigest()]
+    contents += [_sha256_file(__file__)]
     # compiler
     path_prefixes = [
         (os.path.join(TRITON_PATH, "compiler"), "triton.compiler."),
@@ -298,31 +306,21 @@ def triton_key():
     ]
     for path, prefix in path_prefixes:
         for lib in pkgutil.walk_packages([path], prefix=prefix):
-            with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
-                contents += [hashlib.sha256(f.read()).hexdigest()]
+            contents += [_sha256_file(lib.module_finder.find_spec(lib.name).origin)]
 
     # backend
-    libtriton_hash = hashlib.sha256()
     ext = sysconfig.get_config_var("EXT_SUFFIX").split(".")[-1]
-    with open(os.path.join(TRITON_PATH, "_C", f"libtriton.{ext}"), "rb") as f:
-        while True:
-            chunk = f.read(1024**2)
-            if not chunk:
-                break
-            libtriton_hash.update(chunk)
-    contents.append(libtriton_hash.hexdigest())
+    contents.append(_sha256_file(os.path.join(TRITON_PATH, "_C", f"libtriton.{ext}")))
     # language
     language_path = os.path.join(TRITON_PATH, 'language')
     for lib in pkgutil.walk_packages([language_path], prefix="triton.language."):
-        with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
-            contents += [hashlib.sha256(f.read()).hexdigest()]
+        contents += [_sha256_file(lib.module_finder.find_spec(lib.name).origin)]
     # third-party TLX
     from pathlib import Path
     for tlx_sub_folder in ["language", "compiler"]:
         tlx_path = str(Path(TRITON_PATH).parent.parent / "third_party" / "tlx" / tlx_sub_folder)
         for lib in pkgutil.walk_packages([tlx_path], prefix="tlx."):
-            with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
-                contents += [hashlib.sha256(f.read()).hexdigest()]
+            contents += [_sha256_file(lib.module_finder.find_spec(lib.name).origin)]
     return f'{__version__}' + '-'.join(contents)
 
 

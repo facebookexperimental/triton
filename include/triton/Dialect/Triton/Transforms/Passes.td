@@ -188,4 +188,21 @@ def CudaWarnings : Pass<"test-cuda-warnings", "mlir::ModuleOp"> {
   ];
 }
 
+def TritonNpotPad : Pass<"triton-npot-pad", "mlir::ModuleOp"> {
+  let summary = "Pad NPOT tensors to the next power of two";
+  let description = [{
+    Runs only under TRITON_ALLOW_NPOT, just before ConvertTritonToTritonGPU.
+    Every tensor dim that is not a power of two is widened to the next power of
+    two, and pad lanes are kept away from memory and from live results. An op
+    the pass cannot pad fails to compile with an error and leaves the IR
+    unchanged.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
 #endif

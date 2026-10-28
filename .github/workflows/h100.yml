@@ -17,7 +17,8 @@ on:
         type: string
 
 env:
-  GPU_WORKFLOW_NAME: Meta Triton H100 Tests
+  # Scopes the issue titles. Off main it names the branch, as ci-issues.yml does.
+  GPU_WORKFLOW_NAME: Meta Triton H100 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
   MAX_JOBS: 16
   TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
@@ -94,7 +95,7 @@ jobs:
           setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Parse test failures (TLX)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always()
         uses: ./.github/actions/parse-test-failures
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
@@ -158,7 +159,7 @@ jobs:
           python -m pytest python/test/unit/runtime/ --import-mode=importlib -v --junitxml=/tmp/runtime-unit.xml
       - name: Parse test failures (runtime)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always()
         uses: ./.github/actions/parse-test-failures
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
@@ -169,86 +170,35 @@ jobs:
           budget: /tmp/runtime-unit.xml=30
           setup-script: ${{ env.SETUP_SCRIPT }}
 
-  report-h100-tlx:
+  # File and close failure issues; ci-issues.yml decides which runs file.
+  issues-h100-tlx:
     needs: h100-tlx-test
-    if: always() && github.event_name == 'schedule' && needs.h100-tlx-test.outputs.failures != '' && needs.h100-tlx-test.outputs.failures != '[]'
+    if: always()
     permissions:
       contents: read
       issues: write
       actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.h100-tlx-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
+    uses: ./.github/workflows/ci-issues.yml
     with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: Meta Triton H100 Tests
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ inputs.ref }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      platform: h100
-
-  report-h100-runtime:
-    needs: h100-runtime-test
-    if: always() && github.event_name == 'schedule' && needs.h100-runtime-test.outputs.failures != '' && needs.h100-runtime-test.outputs.failures != '[]'
-    permissions:
-      contents: read
-      issues: write
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.h100-runtime-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
-    with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: Meta Triton H100 Tests
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ inputs.ref }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      platform: h100
-
-  reconcile-h100-tlx:
-    needs: h100-tlx-test
-    if: always() && github.event_name == 'schedule' && (needs.h100-tlx-test.result == 'success' || needs.h100-tlx-test.result == 'failure')
-    permissions:
-      contents: read
-      issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
-    with:
-      workflow_name: Meta Triton H100 Tests
-      job_name: h100-tlx-test
+      workflow: Meta Triton H100 Tests
+      job: h100-tlx-test
+      result: ${{ needs.h100-tlx-test.result }}
       failures: ${{ needs.h100-tlx-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
+      platform: h100
 
-  reconcile-h100-runtime:
+  issues-h100-runtime:
     needs: h100-runtime-test
-    if: always() && github.event_name == 'schedule' && (needs.h100-runtime-test.result == 'success' || needs.h100-runtime-test.result == 'failure')
+    if: always()
     permissions:
       contents: read
       issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
+      actions: read
+    uses: ./.github/workflows/ci-issues.yml
     with:
-      workflow_name: Meta Triton H100 Tests
-      job_name: h100-runtime-test
+      workflow: Meta Triton H100 Tests
+      job: h100-runtime-test
+      result: ${{ needs.h100-runtime-test.result }}
       failures: ${{ needs.h100-runtime-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
+      platform: h100

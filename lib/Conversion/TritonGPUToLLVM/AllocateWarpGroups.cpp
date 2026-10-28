@@ -1,3 +1,5 @@
+#include <optional>
+
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
@@ -202,19 +204,17 @@ struct AllocateWarpGroups
     if (!needsRegisterOptimization)
       return;
 
-    // Determine the maximum number of registers per thread. This may have
-    // been set by the user.
     int threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
-    int maxnreg;
+    std::optional<int> userMaxnreg;
     if (auto maxnregAttr =
-            mod->getAttrOfType<IntegerAttr>(AttrMaxRegistersName)) {
-      maxnreg = maxnregAttr.getInt();
-    } else {
-      // Assume the user wants to use all 64K registers.
-      maxnreg = (64 * 1024) / (baseNumWarps + numExtraWarpGroups * 4) /
-                threadsPerWarp;
-      maxnreg = maxnreg / 8 * 8;
-    }
+            mod->getAttrOfType<IntegerAttr>(AttrMaxRegistersName))
+      userMaxnreg = maxnregAttr.getInt();
+    // Launch allocation assumed when neither the user nor fully explicit
+    // partition requests determine it: the whole 64K register file.
+    int fallbackMaxnreg = (64 * 1024) /
+                          (baseNumWarps + numExtraWarpGroups * 4) /
+                          threadsPerWarp;
+    fallbackMaxnreg = fallbackMaxnreg / 8 * 8;
 
     struct WarpGroupInfo {
       SmallVector<Region *> partitions;
@@ -227,6 +227,10 @@ struct AllocateWarpGroups
       int32_t estRegs;
       int numWarps;
     };
+
+    // The launch register count is a single module attribute and must cover
+    // every warp-specialize op, so it is the max over all ops.
+    int launchMaxnreg = -1;
 
     // Compute register allocation for each warp specialize op.
     mod.walk([&](WarpSpecializeOp op) {
@@ -280,13 +284,44 @@ struct AllocateWarpGroups
       int totalWarps = baseNumWarps;
       for (const WarpGroupInfo &wg : warpGroups)
         totalWarps += wg.numWarps;
-      int remainingRegs = maxnreg * totalWarps * threadsPerWarp;
-      int sharingThreads = 0;
+      int totalThreads = totalWarps * threadsPerWarp;
 
       int defaultRegs = -1;
-      if (defaultRegsAttr) {
+      if (defaultRegsAttr)
         defaultRegs = minRegistersForRegion(
             op.getDefaultRegion(), laterInstrumentation, *defaultRegsAttr);
+
+      // When every partition (default included) requests registers
+      // explicitly, the requested total determines the launch allocation:
+      // sum(num_warps * registers) over all warp groups, spread over all
+      // threads and rounded up to a multiple of 8.
+      bool allExplicit = defaultRegsAttr && *defaultRegsAttr > 0 && regsAttr;
+      for (int32_t regs : requestedRegisters)
+        allExplicit = allExplicit && regs > 0;
+      int computedMaxnreg = fallbackMaxnreg;
+      if (allExplicit) {
+        int totalRequestedRegs = defaultRegs * baseNumWarps * threadsPerWarp;
+        for (const WarpGroupInfo &wg : warpGroups)
+          totalRequestedRegs +=
+              wg.maxRequestedRegs * (int)wg.numWarps * threadsPerWarp;
+        int avgRegs = llvm::divideCeil(totalRequestedRegs, totalThreads);
+        computedMaxnreg = std::clamp<int>(llvm::divideCeil(avgRegs, 8) * 8,
+                                          24, std::max(24, fallbackMaxnreg));
+        if (userMaxnreg && *userMaxnreg != computedMaxnreg)
+          op.emitWarning()
+              << "ttg.maxnreg is inconsistent with fully specified partition "
+                 "register counts: the partitions request "
+              << totalRequestedRegs << " registers in total ("
+              << computedMaxnreg
+              << " per thread at launch), but ttg.maxnreg=" << *userMaxnreg
+              << " was provided; the provided value takes precedence";
+      }
+      int maxnreg = userMaxnreg
+                        ? *userMaxnreg
+                        : (allExplicit ? computedMaxnreg : fallbackMaxnreg);
+      int remainingRegs = maxnreg * totalThreads;
+      int sharingThreads = 0;
+      if (defaultRegsAttr) {
         remainingRegs -= defaultRegs * baseNumWarps * threadsPerWarp;
       } else {
         sharingThreads += baseNumWarps * threadsPerWarp;
@@ -322,12 +357,14 @@ struct AllocateWarpGroups
       }
 
       op.setActualRegisters(maxnregsPerPartition);
-
-      // Set the initial max number of registers. This is needed for PTXAS to
-      // cooperate.
-      mod->setAttr(AttrMaxRegistersName,
-                   Builder(op.getContext()).getI32IntegerAttr(maxnreg));
+      launchMaxnreg = std::max(launchMaxnreg, maxnreg);
     });
+
+    // Set the initial max number of registers. This is needed for PTXAS to
+    // cooperate.
+    if (launchMaxnreg > 0)
+      mod->setAttr(AttrMaxRegistersName,
+                   Builder(mod.getContext()).getI32IntegerAttr(launchMaxnreg));
   }
 };
 } // namespace
