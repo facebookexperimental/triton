@@ -294,3 +294,7 @@ def test_a_parent_stays_open_exactly_while_a_non_flaky_sub_issue_is_open():
     api = GroupApi([parent(800, state="closed"), failing(2, "a", parent=800)])  # #2 failed again and reopened
     fi.group(api, REPO, PREFIX, LABELS, "c" * 40, "main", RUN + "200")
     assert api.issues[800]["state"] == "open"
+
+    api = GroupApi([parent(800, state="closed"), flaky])  # closed with only the flaky sub-issue left open
+    fi.group(api, REPO, PREFIX, LABELS, "c" * 40, "main", RUN + "200")
+    assert api.issues[800]["state"] == "closed" and api.writes == []

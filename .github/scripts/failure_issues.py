@@ -198,9 +198,15 @@ def group(api, repo, prefix, labels, sha, branch, run_url):
     if new:
         parent = find_or_create_parent(api, repo, sha, prefix.split(" / ")[1], branch, run_url, open_parents)
         for i in new:
-            api("POST", f"repos/{repo}/issues/{parent['number']}/sub_issues", {"sub_issue_id": i["id"]})
-    # A sub-issue that reopened (failed again within the reopen window) reopens its parent.
-    for url in {i["parent_issue_url"] for i in issues if i.get("parent_issue_url")}:
+            try:
+                api("POST", f"repos/{repo}/issues/{parent['number']}/sub_issues", {"sub_issue_id": i["id"]})
+            except subprocess.CalledProcessError as e:  # a parent holds at most 100; the rest stay unparented
+                print(f"::warning::Could not attach #{i['number']} to #{parent['number']}: {e}")
+                break
+    # A sub-issue that failed again (reopened within the reopen window) reopens its parent; a flaky one does not,
+    # since a parent closes while flaky sub-issues stay open.
+    flaky = lambda i: any(l["name"] == FLAKY for l in i["labels"])
+    for url in {i["parent_issue_url"] for i in issues if i.get("parent_issue_url") and not flaky(i)}:
         parent = api("GET", "repos/" + url.split("/repos/", 1)[1])
         if parent["state"] == "closed":
             api("PATCH", f"repos/{repo}/issues/{parent['number']}", {"state": "open"})
@@ -210,7 +216,7 @@ def group(api, repo, prefix, labels, sha, branch, run_url):
     for parent in open_parents:
         subs = api("GET", f"repos/{repo}/issues/{parent['number']}/sub_issues?per_page=100")
         left = [s for s in subs if s["state"] == "open"]
-        if subs and all(any(l["name"] == FLAKY for l in s["labels"]) for s in left):
+        if subs and all(flaky(s) for s in left):
             note = "".join(f"\nStill open as flaky: #{s['number']}" for s in left)
             api("POST", f"repos/{repo}/issues/{parent['number']}/comments",
                 {"body": f"✅ All sub-issues are fixed as of {run_url}.{note}"})
