@@ -1,3 +1,4 @@
+#include "Analysis/AxisInfoExt.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
@@ -405,6 +406,7 @@ void init_triton_amd(py::module_ &m) {
     // registry.insert<mlir::ROCDL::ROCDLDialect>();
     mlir::registerROCDLDialectTranslation(registry);
     mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
+    mlir::triton::AMD::registerAxisInfoInterface(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });

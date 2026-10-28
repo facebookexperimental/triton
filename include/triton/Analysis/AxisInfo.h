@@ -2,6 +2,7 @@
 #define TRITON_ANALYSIS_AXISINFO_H
 
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
+#include "mlir/IR/DialectInterface.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -236,7 +237,6 @@ protected:
 
 public:
   AxisInfoAnalysis(DataFlowSolver &solver);
-  LogicalResult initialize(Operation *top) override;
   using dataflow::SparseForwardDataFlowAnalysis<
       dataflow::Lattice<AxisInfo>>::getLatticeElement;
 
@@ -249,6 +249,15 @@ public:
   using LoadCallback = decltype(&AxisInfoAnalysis::loadDefaultAnalysis);
 };
 
+/// Backend selection for shared passes that consume axis information.
+class AxisInfoDialectInterface
+    : public DialectInterface::Base<AxisInfoDialectInterface> {
+public:
+  explicit AxisInfoDialectInterface(Dialect *dialect) : Base(dialect) {}
+  virtual AxisInfoAnalysis::LoadCallback
+  getAnalysisLoader(ModuleOp mod) const = 0;
+};
+
 // Module level axis info analysis based on the call graph, assuming that we do
 // not have recursive functions.
 //
@@ -258,14 +267,17 @@ public:
 // unique axis info.
 using AxisInfoMapT = DenseMap<Value, AxisInfo>;
 class ModuleAxisInfoAnalysis : public CallGraph<AxisInfoMapT> {
+  static AxisInfoAnalysis::LoadCallback getDefaultAnalysisLoader(ModuleOp mod);
+
 public:
   // AxisInfoAnalysis::LoadCallback loads the per-function analysis pass into
   // the DataFlowSolver. This allows passes derived from AxisInfoAnalysis to
   // re-use the module level analysis framework.
-  explicit ModuleAxisInfoAnalysis(ModuleOp moduleOp,
-                                  AxisInfoAnalysis::LoadCallback loadAnalysis =
-                                      AxisInfoAnalysis::loadDefaultAnalysis)
+  explicit ModuleAxisInfoAnalysis(
+      ModuleOp moduleOp, AxisInfoAnalysis::LoadCallback loadAnalysis = nullptr)
       : CallGraph<AxisInfoMapT>(moduleOp) {
+    if (!loadAnalysis)
+      loadAnalysis = getDefaultAnalysisLoader(moduleOp);
     SmallVector<FunctionOpInterface> funcs;
     walk<WalkOrder::PreOrder, WalkOrder::PostOrder>(
         // Pre-order edge walk callback
