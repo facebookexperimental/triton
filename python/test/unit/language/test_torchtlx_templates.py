@@ -3530,6 +3530,32 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     tuple(choices[0][name]
                           for name in ("num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim", "kpack")))
 
+    def test_flex_forward_autotune_and_wide_head(self):
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        stock = self._forward_config()
+        stock.block_m, stock.block_n = 64, 32
+        cases = ((True, 128, [(128, 64), (64, 32), (128, 128)]), (False, 256, []), (True, 256, []))
+        for max_autotune, head_dim, expected in cases:
+            with self.subTest(max_autotune=max_autotune, head_dim=head_dim):
+                choices = []
+                with (
+                        config.patch({"triton.tlx_mode": "force", "max_autotune": max_autotune}),
+                        mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
+                        mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
+                ):
+                    flex_attention_templates.append_tlx_flex(
+                        choices,
+                        [stock, self._forward_config()],
+                        self._forward_inputs(head_dim=head_dim),
+                        [object(), object()],
+                        object(),
+                        {},
+                        128,
+                        128,
+                    )
+                self.assertEqual(expected, [(c["BLOCK_M"], c["BLOCK_N"]) for c in choices])
+
     def test_flex_backward_registration_honors_effective_bwd_overrides(self):
         """Compatible user overrides must take precedence over the stock config."""
         from triton.language.extra.tlx.inductor import flex_attention_templates

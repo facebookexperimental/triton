@@ -88,16 +88,30 @@
             tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, buf),
                                    mask=offs_n[:, None] < KV_LEN)
         tlx.async_load_commit_group([tok_k, tok_v])
+    # Block indices are loaded one iteration ahead and consumed after the next
+    # top-of-loop wait, keeping their round trip off the prefetch's critical
+    # path. Scalar or masked loads would force an immediate vmcnt(0)
+    # (readfirstlane / branch phi), so they are clamped lane vectors.
+    lane_zero = tl.zeros([BLOCK_N], dtype=tl.int32)
+    last_kv = tl.maximum(kv_num_blocks - 1, 0)
+    ahead_cur = tl.load(kv_indices + lane_zero, eviction_policy="evict_last")
+    ahead_next = tl.load(kv_indices + tl.minimum(1, last_kv) + lane_zero, eviction_policy="evict_last")
     for _sn in range(0, block_n_end):
         wait = tlx.async_load_wait_group(0)
+        offset = BLOCK_N
+        if not BLOCKS_ARE_CONTIGUOUS:
+            offset = tl.where((_sn + 1) % SPARSE_KV_MULTIPLE == 0,
+                              (ahead_next - ahead_cur) * SPARSE_KV_BLOCK_SIZE - (SPARSE_KV_MULTIPLE - 1) * BLOCK_N,
+                              BLOCK_N)
+            ahead_idx = (_sn + 1) // SPARSE_KV_MULTIPLE
+            ahead_cur = tl.load(kv_indices + tl.minimum(ahead_idx, last_kv) + lane_zero,
+                                eviction_policy="evict_last")
+            ahead_next = tl.load(kv_indices + tl.minimum(ahead_idx + 1, last_kv) + lane_zero,
+                                 eviction_policy="evict_last")
 
         kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_tiles, buf)), token=wait, relaxed=True)
         qk = tl.dot(q, kt)
 
-        offset = get_offset_for_next_block(
-            _sn, kv_indices, kv_num_blocks,
-            SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
-        )
         next_offs_n = offs_n + offset
         next_buf = (buf + 1) % NUM_KV_BUFFERS
         if _sn + 1 < block_n_end:
@@ -181,16 +195,25 @@
                 tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, buf),
                                        mask=offs_n[:, None] < KV_LEN)
             tlx.async_load_commit_group([tok_k, tok_v])
+        last_fkv = tl.maximum(fkv_num_blocks - 1, 0)
+        ahead_cur = tl.load(fkv_indices + lane_zero, eviction_policy="evict_last")
+        ahead_next = tl.load(fkv_indices + tl.minimum(1, last_fkv) + lane_zero, eviction_policy="evict_last")
         for _sn in range(0, fblock_n_end):
             wait = tlx.async_load_wait_group(0)
+            offset = BLOCK_N
+            if not BLOCKS_ARE_CONTIGUOUS:
+                offset = tl.where((_sn + 1) % SPARSE_KV_MULTIPLE == 0,
+                                  (ahead_next - ahead_cur) * SPARSE_KV_BLOCK_SIZE - (SPARSE_KV_MULTIPLE - 1) * BLOCK_N,
+                                  BLOCK_N)
+                ahead_idx = (_sn + 1) // SPARSE_KV_MULTIPLE
+                ahead_cur = tl.load(fkv_indices + tl.minimum(ahead_idx, last_fkv) + lane_zero,
+                                    eviction_policy="evict_last")
+                ahead_next = tl.load(fkv_indices + tl.minimum(ahead_idx + 1, last_fkv) + lane_zero,
+                                     eviction_policy="evict_last")
 
             kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_tiles, buf)), token=wait, relaxed=True)
             qk = tl.dot(q, kt)
 
-            offset = get_offset_for_next_block(
-                _sn, fkv_indices, fkv_num_blocks,
-                SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
-            )
             next_offs_n = offs_n + offset
             next_buf = (buf + 1) % NUM_KV_BUFFERS
             if _sn + 1 < fblock_n_end:

@@ -73,6 +73,9 @@ def inputs(mod, seq, batch=8, heads=16, dim=128, dtype=torch.bfloat16):
         mask_mod = lambda b, h, m, n: (n < 128) | (m >= n)
     elif mod == "sliding_window":
         mask_mod = lambda b, h, m, n: (m - n <= 4096) & (m >= n)
+    elif mod == "strided":
+        # Odd 128-blocks lose their upper half: both partial and full KV block lists have gaps.
+        mask_mod = lambda b, h, m, n: (m >= n) & ((n // 64) % 4 != 3)
     elif mod == "document_mask":
         lengths = document_lengths(seq, batch)
         offsets = torch.tensor([0] + lengths, device="cuda", dtype=torch.int32).cumsum(0)
@@ -301,10 +304,10 @@ def main(argv=None):
     for result in results:
         case = result["case"]
         batch, heads, seq, dim, mod = case["shape"]
+        valid = result["status"] != "error" and result["speedup"] is not None
         rows.append({
-            "mod": mod, "seq": seq, "ratio": result["speedup"] if result["speedup"] is not None else float("nan"),
-            "stock_accuracy": result["extra"].get("stock_accuracy"), "group":
-            f"B={batch} H={heads} D={dim} {case['dtype']}"
+            "mod": mod, "seq": seq, "ratio": result["speedup"] if valid else float("nan"), "stock_accuracy":
+            result["extra"].get("stock_accuracy"), "group": f"B={batch} H={heads} D={dim} {case['dtype']}"
         })
     plot_results(rows, output, results[0]["case"]["arch"])
     artifact["env"]["plot"] = str(output / "ratios.png")

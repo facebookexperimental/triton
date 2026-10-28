@@ -47,6 +47,15 @@ def test_flex_forward_mod_tail(runner, tmp_path, record_property, mod, seq, dim)
     torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("dim", [64, 128])
+def test_flex_forward_noncontiguous_kv_blocks(runner, tmp_path, dim):
+    # Contiguous KV block lists make every jump equal BLOCK_N and hide offset bugs.
+    tensors, score_mod, block_mask = runner.inputs("strided", 1025, batch=2, heads=2, dim=dim)
+    _, ref = runner.compile_arm(tensors, score_mod, block_mask, None, tmp_path / "stock.py")
+    _, got = runner.compile_arm(tensors, score_mod, block_mask, "force", tmp_path / "tlx.py")
+    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
+
+
 def test_flex_forward_empty_rows_cross_attention(runner, tmp_path):
     torch.manual_seed(0)
     q = torch.randn(2, 4, 257, 128, device="cuda", dtype=torch.bfloat16)
