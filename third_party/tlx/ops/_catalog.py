@@ -127,6 +127,7 @@ CATALOG: tuple[OpSpec, ...] = (
         # Warp-specialized TMA kernel with a direct-load fallback, so no
         # alignment rule to fail and no TMA requirement.
         requires=frozenset(),
+        default_space="full",
     ),
     OpSpec(
         op="addmm",

@@ -18,7 +18,8 @@ def test_addmm(m, n, k, a_strides, b_strides, bias_strides, dtype_name):
     torch.manual_seed(m + n + k)
     bias, a, b = inputs((m, n, k, a_strides, b_strides, bias_strides, dtype_name), dtype)
     out = torch.empty((m, n), device="cuda", dtype=dtype)
-    actual = tlx_addmm(bias, a, b, out=out)
+    # One config per shape; the default "full" space would autotune each one.
+    actual = tlx_addmm(bias, a, b, out=out, space="heuristic")
     expected = torch.addmm(bias, a, b)
 
     assert actual is out
@@ -342,3 +343,184 @@ def test_addmm_direct_routing():
     assert (kw["BLOCK_M"], kw["BLOCK_N"], kw["BLOCK_K"]) == (128, 64, 32)
     kw = sm90.heuristic_config(256, 1024, 512)[0].kwargs
     assert (kw["BLOCK_M"], kw["BLOCK_N"], kw["BLOCK_K"]) == (64, 128, 32)
+
+
+# --- GEMM path shared with tlx.ops.mm ----------------------------------------
+
+
+def _bias(kind, m, n, dtype=torch.float16):
+    shapes = {"1d": (n, ), "1n": (1, n), "m1": (m, 1), "mn": (m, n), "scalar": (1, 1)}
+    return torch.randn(shapes[kind], device="cuda", dtype=dtype)
+
+
+def _operand(rows, cols, row_major, dtype=torch.float16):
+    if row_major:
+        return torch.randn((rows, cols), device="cuda", dtype=dtype)
+    return torch.randn((cols, rows), device="cuda", dtype=dtype).T
+
+
+def _npot_config(mm, block_n):
+    return next(c for c in mm._npot_configs() if c.kwargs["BN"] == block_n)
+
+
+# Biases constant along M, the ones the mm-backed path takes.
+BIAS_KINDS = ["1d", "1n", "scalar"]
+# Pinned kernel per case: (path, M, N, K, B row-major, config factory).
+MM_PATH_CASES = {
+    "ws": ("ws", 72, 1000, 64 * 41, True, lambda mm: mm._config(128, 128, 4)),
+    "ws_split_k": ("ws", 72, 1000, 64 * 41, True, lambda mm: mm._config(128, 128, 4, split_k=3)),
+    "ws_bn256": ("ws", 300, 1000, 64 * 7, True, lambda mm: mm._config(128, 256, 3)),
+    # Two-piece N tiles (B K-major only): subtiled (192) and whole-slot (160) epilogues.
+    "ws_npot192": ("ws", 200, 1000, 64 * 7, False, lambda mm: _npot_config(mm, 192)),
+    "ws_npot160": ("ws", 200, 1000, 64 * 7, False, lambda mm: _npot_config(mm, 160)),
+    "small_k": ("small_k", 72, 1000, 192, True, lambda mm: mm._small_k_config(64, 128, 64, 4, 3)),
+    "small_k_split_k":
+    ("small_k", 72, 1000, 64 * 41, False, lambda mm: mm._small_k_config(64, 128, 64, 4, 3, split_k=3)),
+}
+
+
+@pytest.fixture
+def mm_path(monkeypatch):
+    """Pin the mm kernels addmm runs to one kernel and one config."""
+    mm = sm90._mm
+
+    def clear():
+        mm._tuned.cache_clear()
+        mm._tuned_small_k.cache_clear()
+        mm._PATH_CACHE.clear()
+
+    def pin(path, config):
+        monkeypatch.setattr(mm, "_FORCE_PATH", path)
+        if path == "ws":
+            monkeypatch.setattr(mm, "CONFIGS", lambda: [config])
+        else:
+            monkeypatch.setattr(mm, "_small_k_configs", lambda: [config])
+        clear()
+
+    yield pin
+    clear()
+
+
+@pytest.mark.parametrize("case", list(MM_PATH_CASES))
+@pytest.mark.parametrize("bias_kind", BIAS_KINDS)
+def test_mm_path_bias(mm_path, case, bias_kind):
+    """Each bias layout on each mm kernel, including split-K (bias added in the
+    reduction) and two-piece N tiles (bias per piece)."""
+    from triton.tlx.ops import addmm as tlx_addmm
+
+    path, m, n, k, b_row_major, make_config = MM_PATH_CASES[case]
+    torch.manual_seed(0)
+    mm_path(path, make_config(sm90._mm))
+    a = _operand(m, k, True)
+    b = _operand(k, n, b_row_major)
+    bias = _bias(bias_kind, m, n)
+    actual = tlx_addmm(bias, a, b, space="full")
+    torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=0.05, rtol=0.05)
+
+
+@pytest.mark.parametrize("bias_kind", BIAS_KINDS)
+@pytest.mark.parametrize("m", [1, 7, 64])
+def test_mm_path_swap_ab_bias(bias_kind, m):
+    """Skinny M runs swap-AB, where the bias runs along the kernel's rows."""
+    from triton.tlx.ops import addmm as tlx_addmm
+
+    torch.manual_seed(m)
+    a = _operand(m, 2624, True)
+    b = _operand(2624, 1000, False)
+    bias = _bias(bias_kind, m, 1000)
+    actual = tlx_addmm(bias, a, b, space="heuristic")
+    torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=0.05, rtol=0.05)
+
+
+def test_mm_path_alternating_keys(mm_path, monkeypatch):
+    """Alternate shapes, each its own autotune key, over two candidate configs.
+    With the native fast dispatch on, a repeat call of an earlier key launched
+    a kernel or config chosen for another key."""
+    from triton.tlx.ops import addmm as tlx_addmm
+
+    mm_path("ws", None)
+    monkeypatch.setattr(sm90._mm, "CONFIGS", lambda: [sm90._mm._config(128, 128, 4), sm90._mm._config(128, 64, 6)])
+    monkeypatch.setattr(
+        sm90._mm, "_swap_configs",
+        lambda: [sm90._mm._config(128, 16, 4, swap_ab=True),
+                 sm90._mm._config(128, 32, 4, swap_ab=True)])
+    sm90._mm._tuned.cache_clear()
+    torch.manual_seed(0)
+    cases = []
+    for m, n, k in ((7, 4096, 1024), (200, 640, 1024)):
+        a, b = _operand(m, k, True), _operand(k, n, False)
+        for kind in ("1d", "scalar"):
+            bias = _bias(kind, m, n)
+            cases.append((bias, a, b, torch.addmm(bias, a, b)))
+    for _ in range(3):
+        for bias, a, b, expected in cases:
+            torch.testing.assert_close(tlx_addmm(bias, a, b, space="full"), expected, atol=0.05, rtol=0.05)
+
+
+def test_mm_path_split_k_is_deterministic(mm_path):
+    from triton.tlx.ops import addmm as tlx_addmm
+
+    mm_path("ws", sm90._mm._config(128, 128, 4, split_k=4))
+    torch.manual_seed(0)
+    a, b = _operand(200, 64 * 64, True), _operand(64 * 64, 512, False)
+    bias = _bias("1d", 200, 512)
+    first = tlx_addmm(bias, a, b, space="full")
+    assert sm90._mm._tuned("full", None, False, True).best_config.kwargs["SPLIT_K"] == 4
+    for _ in range(3):
+        assert torch.equal(tlx_addmm(bias, a, b, space="full"), first)
+    torch.testing.assert_close(first, torch.addmm(bias, a, b), atol=0.05, rtol=0.05)
+
+
+@pytest.mark.parametrize("m, k", [(706, 272), (7, 4096), (1000, 8192)])
+@pytest.mark.parametrize("bias_kind", ["1d", "scalar"])
+@pytest.mark.parametrize("a_row_major", [True, False])
+@pytest.mark.parametrize("space", ["full", "heuristic"])
+def test_gemv(m, k, bias_kind, a_row_major, space):
+    """N = 1 runs the matrix-vector kernel, for any A layout."""
+    from triton.tlx.ops import addmm as tlx_addmm
+
+    torch.manual_seed(k)
+    a = _operand(m, k, a_row_major)
+    b = _operand(k, 1, False)
+    bias = _bias(bias_kind, m, 1)
+    actual = tlx_addmm(bias, a, b, space=space)
+    torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=0.05, rtol=0.05)
+
+
+def test_mm_path_eligibility():
+    f16 = torch.float16
+    c = torch.empty((64, 256), device="cuda", dtype=f16)
+    a = torch.empty((64, 512), device="cuda", dtype=f16)
+    b = torch.empty((512, 256), device="cuda", dtype=f16)
+    assert sm90._mm_path_eligible(a, b, c)
+    assert sm90._mm_path_eligible(torch.empty((512, 64), device="cuda", dtype=f16).T, b.T.contiguous().T, c)
+    # A row of 607 halves is not 16-byte aligned, so TMA cannot address it.
+    a607 = torch.empty((64, 607), device="cuda", dtype=f16)
+    assert not sm90._mm_path_eligible(a607, torch.empty((607, 256), device="cuda", dtype=f16), c)
+    # Neither layout of a strided slice is contiguous.
+    assert not sm90._mm_path_eligible(torch.empty((64, 1024), device="cuda", dtype=f16)[:, ::2], b, c)
+
+
+@pytest.mark.parametrize("n", [1, 1000])
+@pytest.mark.parametrize("bias_kind", ["m1", "mn"])
+def test_bias_varying_along_m_runs_original_kernels(monkeypatch, n, bias_kind):
+    """The mm-backed and matrix-vector paths take only a bias constant along M."""
+    from triton.tlx.ops import addmm as tlx_addmm
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("bias varying along M took the mm-backed path")
+
+    monkeypatch.setattr(sm90._mm, "_run", unexpected)
+    monkeypatch.setattr(sm90, "_launch_gemv", unexpected)
+    torch.manual_seed(n)
+    a, b = _operand(200, 512, True), _operand(512, n, False)
+    bias = _bias(bias_kind, 200, n)
+    actual = tlx_addmm(bias, a, b, space="full")
+    torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=0.05, rtol=0.05)
+
+
+def test_default_space_is_full():
+    from triton.tlx.ops._catalog import CATALOG
+
+    spec = next(s for s in CATALOG if s.op == "addmm" and s.arch == "sm90")
+    assert spec.default_space == "full"
