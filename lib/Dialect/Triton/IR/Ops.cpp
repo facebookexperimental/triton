@@ -1,3 +1,4 @@
+#include <limits>
 #include <sstream>
 
 #include "mlir/IR/Builders.h"
@@ -38,6 +39,68 @@ void LoadOp::getEffects(
 
 namespace mlir {
 namespace triton {
+
+void MakeRangeOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  // make_range(begin, end) yields the half-open interval [begin, end).
+  setRange(getResult(), ConstantIntRanges::fromSigned(APInt(32, getStart()),
+                                                      APInt(32, getEnd() - 1)));
+}
+
+void GetProgramIdOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  int64_t maximum = std::numeric_limits<int32_t>::max();
+  if (auto mod = (*this)->getParentOfType<ModuleOp>())
+    for (Dialect *dialect : getContext()->getLoadedDialects())
+      if (const auto *bounds =
+              dialect->getRegisteredInterface<DialectLaunchBoundsInterface>())
+        if (std::optional<int64_t> bound =
+                bounds->getMaxProgramId(mod, getAxisAsInt()))
+          maximum = std::min(maximum, *bound);
+  setRange(getResult(),
+           ConstantIntRanges::fromSigned(APInt(32, 0), APInt(32, maximum)));
+}
+
+void SplatOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void ExpandDimsOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void BroadcastOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void ReshapeOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void TransOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void GatherOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void SplitOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  for (Value result : getResults())
+    setRange(result, operands.front());
+}
+
+void JoinOp::inferResultRangesFromOptional(ArrayRef<IntegerValueRange> operands,
+                                           SetIntLatticeFn setRange) {
+  setRange(getResult(), IntegerValueRange::join(operands[0], operands[1]));
+}
 
 //-- LoadOp --
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,

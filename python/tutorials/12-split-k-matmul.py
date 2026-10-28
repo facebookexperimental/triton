@@ -91,7 +91,9 @@ def _stock_triton_kernel(
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + (pid % group_size_m)
+    tl.assume((pid_m * BLOCK_M >= 0) & (pid_m * BLOCK_M <= 2147483647 - (BLOCK_M - 1)))
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume((pid_n * BLOCK_N >= 0) & (pid_n * BLOCK_N <= 2147483647 - (BLOCK_N - 1)))
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
@@ -185,7 +187,9 @@ def _skinny_atomic_kernel(
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_M >= 0) & (pid_m * BLOCK_M <= 2147483647 - (BLOCK_M - 1)))
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume((pid_n * BLOCK_N >= 0) & (pid_n * BLOCK_N <= 2147483647 - (BLOCK_N - 1)))
     k_start = pid_k * K_PER_SPLIT
     k_end = min(k_start + K_PER_SPLIT, K)
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
@@ -293,7 +297,9 @@ def _twopass_compute_kernel(
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_M >= 0) & (pid_m * BLOCK_M <= 2147483647 - (BLOCK_M - 1)))
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume((pid_n * BLOCK_N >= 0) & (pid_n * BLOCK_N <= 2147483647 - (BLOCK_N - 1)))
     k_start = pid_k * K_PER_SPLIT
     k_end = min(k_start + K_PER_SPLIT, K)
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M

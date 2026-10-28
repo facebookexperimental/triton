@@ -1,6 +1,8 @@
 """TLX layout tests -- CDNA4 (gfx950)."""
 import math
 import re
+import importlib.util
+from pathlib import Path
 
 import pytest
 import torch
@@ -11,6 +13,94 @@ import triton.language.extra.tlx as tlx
 from triton.tlx.ops.kernels.flash_attn.gfx950 import _sum_rows_chain4 as _cluster_sum_rows_chain4
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+@pytest.fixture(scope="module")
+def split_k_tutorial():
+    path = Path(__file__).resolve().parents[3] / "tutorials" / "12-split-k-matmul.py"
+    spec = importlib.util.spec_from_file_location("split_k_tutorial_test", path)
+    tutorial = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tutorial)
+    for kernel in vars(tutorial).values():
+        if isinstance(kernel, triton.runtime.Autotuner):
+            kernel.configs = kernel.configs[:1]
+    return tutorial
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("method", ["stock_triton_matmul", "skinny_atomic_matmul", "skinny_twopass_matmul"])
+@pytest.mark.parametrize("m,n", [(64, 96), (288, 160), (1, 32), (32, 1), (1, 1)])
+def test_split_k_grouped_coordinates(split_k_tutorial, method, m, n):
+    a = torch.randn((m, 256), device=DEVICE, dtype=torch.float16) * 0.2
+    b = torch.randn((256, n), device=DEVICE, dtype=torch.float16) * 0.2
+    output = getattr(split_k_tutorial, method)(a, b)
+    torch.testing.assert_close(output, a @ b, atol=0.015, rtol=0.015)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("base", [-128, -64, -4, 0, 128, 2147483584])
+@pytest.mark.parametrize("divisor", [-64, -4, 4, 64])
+@pytest.mark.parametrize("op", ["div", "rem"])
+@pytest.mark.parametrize("indirect", [False, True])
+def test_signed_div_rem_contiguous_boundary(base, divisor, op, indirect):
+
+    @triton.jit
+    def kernel(output, table, base, DIVISOR: tl.constexpr, OP: tl.constexpr, INDIRECT: tl.constexpr, L: tl.constexpr):
+        lanes = tlx.require_layout(tl.arange(0, 1024), L)
+        values = base + lanes
+        if OP == "div":
+            result = values // DIVISOR
+        else:
+            result = values % DIVISOR
+        if INDIRECT:
+            if OP == "rem":
+                index = result + 64
+            else:
+                index = result & 255
+            result = tl.load(table + index)
+        tl.store(output + lanes, result)
+
+    layout = tlx.layout(shape=((64, 4), (4, )), stride=((4, 256), (1, )))
+    output = torch.empty((1024, ), dtype=torch.int32, device=DEVICE)
+    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
+    kernel[(1, )](output, table, base, divisor, op, indirect, layout)
+    values = (torch.arange(1024, dtype=torch.int64, device=DEVICE) + base).to(torch.int32)
+    quotient = torch.div(values, divisor, rounding_mode="trunc")
+    expected = quotient if op == "div" else values - quotient * divisor
+    if indirect:
+        index = expected + 64 if op == "rem" else expected & 255
+        expected = table[index.to(torch.int64)]
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("modulus", [-17, 17])
+@pytest.mark.parametrize("group", [-7, 7])
+@pytest.mark.parametrize("base", [-128, 0, 2147483584])
+def test_signed_div_rem_dynamic_program_mapping(modulus, group, base):
+
+    @triton.jit
+    def kernel(output, table, modulus, group, base, L: tl.constexpr):
+        pid = tl.program_id(0)
+        mapped = (pid % modulus) // group
+        lanes = tlx.require_layout(tl.arange(0, 1024), L)
+        values = mapped * 128 + base + lanes
+        remainder = values % 64
+        quotient = values // 64
+        result = tl.load(table + (remainder + 64)) + tl.load(table + (quotient & 255))
+        tl.store(output + pid * 1024 + lanes, result)
+
+    layout = tlx.layout(shape=((64, 4), (4, )), stride=((4, 256), (1, )))
+    output = torch.empty((32, 1024), dtype=torch.int32, device=DEVICE)
+    table = torch.arange(256, dtype=torch.int32, device=DEVICE) * 3 + 7
+    kernel[(32, )](output, table, modulus, group, base, layout)
+    pid = torch.arange(32, dtype=torch.int64, device=DEVICE)
+    mapped = torch.div(torch.fmod(pid, modulus), group, rounding_mode="trunc")
+    values = (mapped[:, None] * 128 + base + torch.arange(1024, device=DEVICE)).to(torch.int32)
+    remainder = torch.fmod(values, 64)
+    quotient = torch.div(values, 64, rounding_mode="trunc")
+    expected = table[(remainder + 64).long()] + table[(quotient & 255).long()]
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 @triton.jit

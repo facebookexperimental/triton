@@ -172,9 +172,11 @@ def tlx_addmm_glu_kernel_optimized(
 
     # Which pid along m dim
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_SIZE_M >= 0) & (pid_m * BLOCK_SIZE_M <= 2147483647 - (BLOCK_SIZE_M - 1)))
 
     # Which pid along n dim
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume((pid_n * BLOCK_SIZE_N >= 0) & (pid_n * BLOCK_SIZE_N <= 2147483647 - (BLOCK_SIZE_N - 1)))
 
     # Get offsets this pid is responsible for in m dim
     offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
@@ -410,9 +412,11 @@ def tlx_addmm_glu_kernel_optimized_async(
 
     # Which pid along m dim
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_SIZE_M >= 0) & (pid_m * BLOCK_SIZE_M <= 2147483647 - (BLOCK_SIZE_M - 1)))
 
     # Which pid along n dim
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume((pid_n * BLOCK_SIZE_N >= 0) & (pid_n * BLOCK_SIZE_N <= 2147483647 - (BLOCK_SIZE_N - 1)))
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -615,7 +619,9 @@ def tlx_addmm_glu_kernel_simple_async(
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_SIZE_M >= 0) & (pid_m * BLOCK_SIZE_M <= 2147483647 - (BLOCK_SIZE_M - 1)))
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume((pid_n * BLOCK_SIZE_N >= 0) & (pid_n * BLOCK_SIZE_N <= 2147483647 - (BLOCK_SIZE_N - 1)))
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -719,7 +725,9 @@ def tlx_addmm_glu_kernel_persistent(
         first_pid_m = group_id * GROUP_SIZE_M
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + ((swizzled % num_pid_in_group) % group_size_m)
+        tl.assume((pid_m * BLOCK_SIZE_M >= 0) & (pid_m * BLOCK_SIZE_M <= 2147483647 - (BLOCK_SIZE_M - 1)))
         pid_n = (swizzled % num_pid_in_group) // group_size_m
+        tl.assume((pid_n * BLOCK_SIZE_N >= 0) & (pid_n * BLOCK_SIZE_N <= 2147483647 - (BLOCK_SIZE_N - 1)))
 
         offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N

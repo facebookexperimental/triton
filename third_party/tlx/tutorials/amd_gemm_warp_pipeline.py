@@ -73,7 +73,9 @@ def matmul_kernel_warp_pipeline(
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    tl.assume((pid_m * BLOCK_M >= 0) & (pid_m * BLOCK_M <= 2147483647 - (BLOCK_M - 1)))
     pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume((pid_n * BLOCK_N >= 0) & (pid_n * BLOCK_N <= 2147483647 - (BLOCK_N - 1)))
 
     # Precompute row/col offsets (these are per-thread, not carried in loop)
     offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M

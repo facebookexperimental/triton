@@ -2114,4 +2114,19 @@ ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
   return success();
 }
 
+void ConvertLayoutOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void RequireLayoutOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
+void ReleaseLayoutOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
 } // namespace mlir::triton::gpu

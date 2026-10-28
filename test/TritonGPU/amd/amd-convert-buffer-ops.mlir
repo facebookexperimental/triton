@@ -575,6 +575,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %c5_i32 = arith.constant 7 : i32
     %c7_i32 = arith.constant 5 : i32
     %zeros = arith.constant dense<0> : tensor<8xi32, #blocked>
+    // Note:
+    // elmtIdx = %6 = %4 + %5, value-range(%4) = [0,7], value-range(%5) = [0, umax]
+    // %5 = max([0,8] + arg3, [8,16) + arg2), to make %6 * sizeof(bf16) <= 2G - 2byte
+    // arg3 ∈ [0, 1G-1-8-7 = 1073741808), arg2 ∈  [-8, 1G-1-15-8=1073741800]
+    %cmp1 = arith.cmpi sge, %arg2, %c0_i32 : i32
+    llvm.intr.assume %cmp1 : i1
+    %cmp2 = arith.cmpi sge, %arg3, %c0_i32 : i32
+    llvm.intr.assume %cmp2 : i1
+    %arg_up2 = arith.constant 1073741800 : i32
+    %arg_up3 = arith.constant 1073741808 : i32
+    %cmp3 = arith.cmpi slt, %arg2, %arg_up2 : i32
+    %cmp4 = arith.cmpi slt, %arg3, %arg_up3 : i32
+    llvm.intr.assume %cmp3 : i1
+    llvm.intr.assume %cmp4 : i1
+
     %0 = arith.extui %arg2 : i32 to i64
     %1 = arith.remui %arg2, %c2_i32 : i32
     %2 = arith.cmpi eq, %1, %c0_i32 : i32
@@ -597,21 +612,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %6 = arith.addi %4, %5 : tensor<8xi32, #blocked>
     %7 = tt.splat %arg0 : !tt.ptr<bf16> -> tensor<8x!tt.ptr<bf16>, #blocked>
     %8 = tt.addptr %7, %6 : tensor<8x!tt.ptr<bf16>, #blocked>, tensor<8xi32, #blocked>
-
-    // Note:
-    // elmtIdx = %6 = %4 + %5, value-range(%4) = [0,7], value-range(%5) = [0, umax]
-    // %5 = max([0,8] + arg3, [8,16) + arg2), to make %6 * sizeof(bf16) <= 2G - 2byte
-    // arg3 ∈ [0, 1G-1-8-7 = 1073741808), arg2 ∈  [-8, 1G-1-15-8=1073741800]
-    %cmp1 = arith.cmpi sge, %arg2, %c0_i32 : i32
-    llvm.intr.assume %cmp1 : i1
-    %cmp2 = arith.cmpi sge, %arg3, %c0_i32 : i32
-    llvm.intr.assume %cmp2 : i1
-    %arg_up2 = arith.constant 1073741800 : i32
-    %arg_up3 = arith.constant 1073741808 : i32
-    %cmp3 = arith.cmpi slt, %arg2, %arg_up2 : i32
-    %cmp4 = arith.cmpi slt, %arg3, %arg_up3 : i32
-    llvm.intr.assume %cmp3 : i1
-    llvm.intr.assume %cmp4 : i1
 
     // COMMON: %[[loaded:.*]] = amdg.buffer_load %arg0[%{{.*}}]
     %9 = tt.load %8: tensor<8x!tt.ptr<bf16>, #blocked>
@@ -756,6 +756,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %1 = tt.expand_dims %0 {axis = 1 : i32} : tensor<256xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256x1xi32, #blocked>
     %cmp = arith.cmpi sgt, %arg6, %c0_i32 : i32
     llvm.intr.assume %cmp : i1
+    %arg6_up = arith.constant 4210752: i32
+    %cmp2 = arith.cmpi slt, %arg6, %arg6_up : i32
+    llvm.intr.assume %cmp2 : i1
     %2 = tt.splat %arg6 : i32 -> tensor<256x1xi32, #blocked>
     %3 = arith.muli %1, %2 : tensor<256x1xi32, #blocked>
     %4 = tt.addptr %arg0, %c32_i32 : !tt.ptr<f16>, i32
@@ -777,9 +780,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     // Note: offset(i.e. elmtIdx) = bcast0 + bcast1
     //   = arange(0, 64) + arg6 * arange(0, 256)
     // to make elmtIdx * sizeof(f16) ∈  [0, 2G], arg6 must be in [0, 4210752]
-    %arg6_up = arith.constant 4210752: i32
-    %cmp2 = arith.cmpi slt, %arg6, %arg6_up : i32
-    llvm.intr.assume %cmp2 : i1
+
 
     // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] stride = %arg[[#stride]] into %arg10
     %12 = ttg.async_copy_global_to_local %11, %arg10 : tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
@@ -989,6 +990,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %1 = tt.expand_dims %0 {axis = 1 : i32} : tensor<256xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256x1xi32, #blocked>
     %cmp = arith.cmpi sgt, %arg6, %c0_i32 : i32
     llvm.intr.assume %cmp : i1
+    %arg6_up = arith.constant 4210752: i32
+    %cmp2 = arith.cmpi slt, %arg6, %arg6_up : i32
+    llvm.intr.assume %cmp2 : i1
     %2 = tt.splat %arg6 : i32 -> tensor<256x1xi32, #blocked>
     %3 = arith.muli %1, %2 : tensor<256x1xi32, #blocked>
     %4 = tt.addptr %arg0, %c32_i32 : !tt.ptr<f16>, i32
@@ -1000,9 +1004,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %10 = tt.splat %4 : !tt.ptr<f16> -> tensor<256x64x!tt.ptr<f16>, #blocked>
     %11 = tt.addptr %10, %9 : tensor<256x64x!tt.ptr<f16>, #blocked>, tensor<256x64xi32, #blocked>
 
-    %arg6_up = arith.constant 4210752: i32
-    %cmp2 = arith.cmpi slt, %arg6, %arg6_up : i32
-    llvm.intr.assume %cmp2 : i1
+
 
     // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr:.*]][%[[offset:.*]]]{{.*}}into %arg10
     %12 = ttg.async_copy_global_to_local %11, %arg10 : tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>

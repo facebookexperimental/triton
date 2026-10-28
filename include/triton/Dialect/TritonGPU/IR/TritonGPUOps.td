@@ -14,6 +14,7 @@ include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
 include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
 include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td" // RegionBranchOpInterface
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
@@ -31,7 +32,8 @@ class TTG_Op<string mnemonic, list<Trait> traits = []>
              traits, [VerifyTensorLayoutsTrait, VerifyMemDescLayoutsTrait])> {}
 
 def TTG_ConvertLayoutOp
-    : TTG_Op<"convert_layout", [SameOperandsAndResultShape,
+    : TTG_Op<"convert_layout", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, SameOperandsAndResultShape,
                                 SameOperandsAndResultElementType, Pure]> {
   let summary = "convert layout";
 
@@ -46,7 +48,8 @@ def TTG_ConvertLayoutOp
 }
 
 def TTG_RequireLayoutOp
-    : TTG_Op<"require_layout", [SameOperandsAndResultShape,
+    : TTG_Op<"require_layout", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, SameOperandsAndResultShape,
                                 SameOperandsAndResultElementType,
                                 AxisInfoPassthroughTrait, Pure]> {
   let summary = "preserve a user-requested layout boundary";
@@ -67,7 +70,8 @@ def TTG_RequireLayoutOp
 }
 
 def TTG_ReleaseLayoutOp
-    : TTG_Op<"release_layout", [SameOperandsAndResultShape,
+    : TTG_Op<"release_layout", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, SameOperandsAndResultShape,
                                 SameOperandsAndResultElementType,
                                 AxisInfoPassthroughTrait, Pure]> {
   let summary = "end a user-requested layout region";

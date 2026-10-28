@@ -1801,11 +1801,17 @@ def test_amd_standalone_addmm_stock_triton_shapes(M, N, K):
 
 
 @pytest.mark.parametrize("K", [256, 512, 1024])
-@pytest.mark.parametrize("kernel_name", _AMD_ADDMM_GLU_KERNELS)
+@pytest.mark.parametrize("kernel_name,shape", [(kernel, None) for kernel in _AMD_ADDMM_GLU_KERNELS] +
+                         [(kernel, shape)
+                          for kernel in ("tlx_optimized_async", "tlx_simple_async")
+                          for shape in ((1152, 1280), (257, 259), (1, 128),
+                                        (128, 1))] + [("tlx_optimized", (1152, 1280))] + [("tlx_persistent", shape)
+                                                                                          for shape in ((1152, 1280),
+                                                                                                        (1, 128))])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_amd_addmm_glu(kernel_name, K):
+def test_amd_addmm_glu(kernel_name, K, shape):
     assert tuple(_amd_addmm_glu_registry) == _AMD_ADDMM_GLU_KERNELS, "registry drifted from the parametrize list"
-    M, N = _amd_addmm_glu_M, _amd_addmm_glu_N
+    M, N = shape if shape is not None else (_amd_addmm_glu_M, _amd_addmm_glu_N)
     torch.manual_seed(0)
     a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
     b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)

@@ -5,9 +5,12 @@
 
 namespace mlir::triton::AMD {
 
+void registerAxisInfoInterface(DialectRegistry &registry);
+
 class AxisInfoAnalysisExt : public triton::AxisInfoAnalysis {
 public:
   AxisInfoAnalysisExt(DataFlowSolver &solver);
+  LogicalResult initialize(Operation *top) override;
 
   static triton::AxisInfoAnalysis *loadAnalysis(DataFlowSolver *solver);
 };

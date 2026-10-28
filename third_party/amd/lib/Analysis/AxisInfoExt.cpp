@@ -1,5 +1,7 @@
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
+#include "third_party/amd/include/Analysis/RangeAnalysis.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include <numeric>
 
@@ -79,12 +81,61 @@ public:
     return isa<amdgpu::RematerializedRangeOp>(op);
   }
 };
+class AMDAxisInfoDialectInterface final : public AxisInfoDialectInterface {
+public:
+  using AxisInfoDialectInterface::AxisInfoDialectInterface;
+
+  AxisInfoAnalysis::LoadCallback
+  getAnalysisLoader(ModuleOp mod) const override {
+    auto target = mod->getAttrOfType<StringAttr>("ttg.target");
+    if (target && target.getValue().starts_with("hip:"))
+      return AxisInfoAnalysisExt::loadAnalysis;
+    return nullptr;
+  }
+};
 } // namespace
+
+void registerAxisInfoInterface(DialectRegistry &registry) {
+  registry.addExtension(
+      +[](MLIRContext *, amdgpu::TritonAMDGPUDialect *dialect) {
+        dialect->addInterfaces<AMDAxisInfoDialectInterface>();
+      });
+}
 
 AxisInfoAnalysisExt::AxisInfoAnalysisExt(DataFlowSolver &solver)
     : triton::AxisInfoAnalysis(solver) {
   visitors.append<ExtractSliceOpAxisInfoVisitor,
                   RematerializedRangeOpAxisInfoVisitor>();
+}
+
+LogicalResult AxisInfoAnalysisExt::initialize(Operation *top) {
+  SmallVector<Operation *> queries;
+  top->walk([&](Operation *op) {
+    if (isa<arith::DivSIOp, arith::RemSIOp>(op) &&
+        isa<RankedTensorType>(op->getResult(0).getType()))
+      queries.push_back(op);
+  });
+  if (!queries.empty()) {
+    DominanceInfo dominance(top);
+    auto rangeSolver = createDataFlowSolver();
+    auto *ranges = rangeSolver->load<TritonIntegerRangeAnalysis>(
+        TritonIntegerRangeAnalysis::collectAssumptions(top), &dominance);
+    if (failed(rangeSolver->initializeAndRun(top)))
+      return top->emitError("AMD integer range analysis failed");
+    for (Operation *op : queries) {
+      Value dividend = op->getOperand(0);
+      const auto *lattice =
+          rangeSolver->lookupState<dataflow::IntegerValueRangeLattice>(
+              dividend);
+      if (!lattice)
+        continue;
+      IntegerValueRange range =
+          ranges->getRangeAt(dividend, op, lattice->getValue());
+      if (!range.isUninitialized() && range.getValue().smin().isNonNegative())
+        nonNegativeDividends.insert(op);
+    }
+  }
+  return triton::AxisInfoAnalysis::initialize(top);
 }
 
 triton::AxisInfoAnalysis *
