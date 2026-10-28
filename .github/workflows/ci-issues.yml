@@ -1,0 +1,85 @@
+name: CI Failure Issues
+
+# Files and closes the failure issues of one test job. Each test job calls this
+# once, with always(), after it finishes.
+#
+# Which runs file is decided here and nowhere else: scheduled runs, and pushes to
+# main or a release branch. The github context of a called workflow is the
+# caller's, so github.event_name and github.ref are those of the calling run.
+
+on:
+  workflow_call:
+    inputs:
+      workflow:
+        description: Workflow name; scopes the issue titles. Off main, the branch is appended.
+        required: true
+        type: string
+      job:
+        description: Name of the test job.
+        required: true
+        type: string
+      result:
+        description: The test job's result (needs.<job>.result).
+        required: true
+        type: string
+      failures:
+        description: The test job's JSON failure list from parse-test-failures.
+        required: false
+        type: string
+        default: ""
+      sha:
+        description: Git SHA the test job tested.
+        required: true
+        type: string
+      platform:
+        description: Platform key for the deep-bisect runner; empty disables bisection.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  report:
+    if: >-
+      always()
+      && (github.event_name == 'schedule' || github.event_name == 'push')
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+      && inputs.failures != '' && inputs.failures != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(inputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ inputs.workflow }}${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ inputs.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: ${{ inputs.platform }}
+
+  reconcile:
+    if: >-
+      always()
+      && (github.event_name == 'schedule' || github.event_name == 'push')
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+      && (inputs.result == 'success' || inputs.result == 'failure')
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ inputs.workflow }}${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: ${{ inputs.job }}
+      failures: ${{ inputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
