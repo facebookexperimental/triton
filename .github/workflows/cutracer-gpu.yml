@@ -41,6 +41,9 @@ on:
       cutracer_version:
         required: true
         type: string
+      delay_ns:
+        required: true
+        type: string
       wheel_url:
         required: true
         type: string
@@ -145,6 +148,7 @@ jobs:
           TESTS: ${{ inputs.tests }}
           SANITIZER_FAILURES: ${{ steps.sanitize.outputs.failures }}
           KNOWN_RACES: ${{ inputs.known_races }}
+          DELAY_NS: ${{ inputs.delay_ns }}
         run: |
           . "${SETUP_SCRIPT}"
           readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
@@ -168,6 +172,7 @@ jobs:
           python3 .github/scripts/cutracer_ci/random_delay.py \
             --cutracer-so "${CUTRACER_SO}" \
             --kernel "${KERNEL}" \
+            --delay-ns "${DELAY_NS}" \
             --out "${OUT}" \
             --logs "${LOGS}" \
             --sanitizer-failures "${SANITIZER_FAILURES}" \
