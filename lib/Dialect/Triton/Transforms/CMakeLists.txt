@@ -9,6 +9,7 @@ add_triton_library(TritonTransforms
   LoopInvariantCodeMotion.cpp
   LoopPeeling.cpp
   LoopUnroll.cpp
+  NpotPad.cpp
   ReorderBroadcast.cpp
   RewriteTensorDescriptorToPointer.cpp
   SimplifySingleTripWhile.cpp
@@ -27,4 +28,5 @@ add_triton_library(TritonTransforms
   MLIRSCFToControlFlow
   MLIRSCFTransforms
   TritonIR
+  TritonGPUIR
 )
