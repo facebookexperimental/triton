@@ -1599,3 +1599,32 @@ def test_mxfp8_backward_check_rejects_nonfinite_reference():
     passed, message = _backward_close_enough(actual, reference, inputs, torch.ones_like(reference))
     assert not passed
     assert "reference contains nonfinite" in message
+
+
+def _run_with_failure(monkeypatch, gpu_usable_after):
+    """Run five cases where the third raises; returns the results."""
+    from _harness import driver
+
+    def fake_run_case(_bench, case, *, space, cold=True, latency_mode="wallclock"):
+        if case.shape == (2, ):
+            raise RuntimeError("CUDA error: unspecified launch failure")
+        return Result(case=case, status=Status.OK)
+
+    monkeypatch.setattr(driver, "run_case", fake_run_case)
+    monkeypatch.setattr(driver, "_gpu_usable", lambda: gpu_usable_after)
+    monkeypatch.setattr(driver, "capture_env", lambda *a, **k: {})
+    monkeypatch.setattr(driver, "stable", __import__("contextlib").contextmanager(lambda *a, **k: iter([{}])))
+    results, _ = driver.run(_FakeBench(directions=("fwd", ), n=5), space="full")
+    return results
+
+
+def test_a_case_that_breaks_the_gpu_is_reported_once_and_ends_the_run(monkeypatch):
+    # After a sticky device error every later case would fail with it; they are
+    # not reported as failures of their own.
+    results = _run_with_failure(monkeypatch, gpu_usable_after=False)
+    assert [r.status for r in results] == [Status.OK, Status.OK, Status.ERROR]
+    assert results[-1].notes[-1] == "2 later cases not run: this case broke the GPU context"
+
+    # An ordinary error leaves the GPU usable, so the remaining cases still run.
+    results = _run_with_failure(monkeypatch, gpu_usable_after=True)
+    assert [r.status for r in results] == [Status.OK, Status.OK, Status.ERROR, Status.OK, Status.OK]
