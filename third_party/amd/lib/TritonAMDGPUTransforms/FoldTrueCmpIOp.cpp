@@ -14,14 +14,12 @@ struct TritonAMDFoldTrueCmpIOpPass
     : impl::TritonAMDFoldTrueCmpIBase<TritonAMDFoldTrueCmpIOpPass> {
 
   void runOnOperation() override {
-    DenseMap<Value, SetVector<Operation *>> assumptions =
+    AMD::IntegerAssumptions assumptions =
         AMD::TritonIntegerRangeAnalysis::collectAssumptions(getOperation());
     ModuleOp mod = getOperation();
     std::unique_ptr<DataFlowSolver> solver = createDataFlowSolver();
-    AMD::TritonIntegerRangeAnalysis *rangeAnalysis =
-        solver->load<AMD::TritonIntegerRangeAnalysis>(
-            assumptions, &getAnalysis<DominanceInfo>());
-    AMD::initializeFuncOps(mod, rangeAnalysis);
+    solver->load<AMD::TritonIntegerRangeAnalysis>(
+        assumptions, &getAnalysis<DominanceInfo>());
     if (failed(solver->initializeAndRun(getOperation())))
       return signalPassFailure();
 

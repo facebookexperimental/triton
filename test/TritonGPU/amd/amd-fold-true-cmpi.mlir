@@ -39,7 +39,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 // CHECK:           %[[VAL_1:.*]] = arith.constant true
 // CHECK:           %[[VAL_2:.*]] = arith.constant 1024 : i32
 // CHECK:           %[[VAL_3:.*]] = tt.get_program_id x : i32
-// CHECK:           llvm.intr.assume %[[VAL_1]] : i1
+// CHECK:           %[[BOUND:.*]] = arith.cmpi sle, %[[VAL_3]], %[[VAL_2]] : i32
+// CHECK:           llvm.intr.assume %[[BOUND]] : i1
 // CHECK:           llvm.intr.assume %[[VAL_1]] : i1
 // CHECK:           %[[VAL_4:.*]] = arith.muli %[[VAL_3]], %[[VAL_2]] : i32
 // CHECK:           %[[VAL_5:.*]] = tt.addptr %[[VAL_0]], %[[VAL_4]] : !tt.ptr<f32>, i32
@@ -147,15 +148,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 // CHECK:           %[[VAL_33:.*]]:6 = scf.for
 // CHECK:             scf.yield
 // CHECK:           }
-// CHECK-NEXT:      %[[VAL_54:.*]] = ttg.local_load %[[VAL_55:.*]]#4 : !ttg.memdesc<128x32xf16, #[[$ATTR_3]], #[[$ATTR_5]], mutable> -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #[[$ATTR_2]], kWidth = 2}>>
+// CHECK:           %[[VAL_54:.*]] = ttg.local_load %[[VAL_55:.*]]#4 : !ttg.memdesc<128x32xf16, #[[$ATTR_3]], #[[$ATTR_5]], mutable> -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #[[$ATTR_2]], kWidth = 2}>>
 // CHECK-NEXT:      %[[VAL_56:.*]] = ttg.local_load %[[VAL_55]]#5 : !ttg.memdesc<32x128xf16, #[[$ATTR_4]], #[[$ATTR_5]], mutable> -> tensor<32x128xf16, #ttg.dot_op<{opIdx = 1, parent = #[[$ATTR_2]], kWidth = 2}>>
 // CHECK-NEXT:      %[[VAL_57:.*]] = arith.mulf %[[VAL_56]], %[[VAL_8]] : tensor<32x128xf16, #ttg.dot_op<{opIdx = 1, parent = #[[$ATTR_2]], kWidth = 2}>>
-// CHECK-NEXT:      llvm.intr.assume %[[VAL_7]] : i1
-// CHECK-NEXT:      %[[VAL_58:.*]] = tt.dot %[[VAL_54]], %[[VAL_57]], %[[VAL_55]]#2 : tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #[[$ATTR_2]], kWidth = 2}>> * tensor<32x128xf16, #ttg.dot_op<{opIdx = 1, parent = #[[$ATTR_2]], kWidth = 2}>> -> tensor<128x128xf32, #[[$ATTR_2]]>
-// CHECK-NEXT:      ttg.local_dealloc %[[VAL_23]] : !ttg.memdesc<1x128x32xf16, #[[$ATTR_3]], #[[$ATTR_5]], mutable>
-// CHECK-NEXT:      ttg.local_dealloc %[[VAL_24]] : !ttg.memdesc<1x32x128xf16, #[[$ATTR_4]], #[[$ATTR_5]], mutable>
-// CHECK-NEXT:      tt.return %[[VAL_58]] : tensor<128x128xf32, #[[$ATTR_2]]>
-// CHECK-NEXT:      }
+// CHECK-NEXT:      %[[COND:.*]] = arith.cmpi sge,
+// CHECK-NEXT:      llvm.intr.assume %[[COND]] : i1
+// CHECK-NEXT:      %[[RESULT:.*]] = scf.if %[[COND]]
+// CHECK:             tt.dot
+// CHECK:           } else {
+// CHECK:             scf.yield
+// CHECK:           }
+// CHECK:           arith.select %[[COND]], %[[RESULT]],
+// CHECK:           ttg.local_dealloc
+// CHECK:           tt.return
 
 // -----
 
