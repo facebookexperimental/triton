@@ -1700,19 +1700,20 @@ def _compile_attention_backward_kernel(config, shape, *, compile_options=None, c
     from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _compiler_options, _delayed_bwd_kernel
 
     b, hq, hk, n = shape
-    constants = dict(
-        HQ=hq, HK=hk, N=n, SM_SCALE=128**-0.5, BM=config.block_m, BN=config.block_n, NW=config.num_warps,
-        TDM=config.use_tdm, STAGES=config.stages, DELAYED=config.delayed, UNROLL=config.unroll,
-        FRAGMENT_FENCES=config.fragment_fences, FRAGMENT_FENCE_MASK=config.fragment_fence_mask,
-        FRAGMENTED=config.fragmented, RESIDENT_KV=config.resident_kv, ORDERED=config.ordered,
-        PACKED_DQ=config.packed_dq, REMATERIALIZE=config.rematerialize, OUTER_M=config.outer_m,
-        ASYNC_STATS=config.async_stats, Q_SPLITS=config.q_splits, REUSE_Q=config.reuse_q, PINGPONG=config.pingpong,
-        SPREAD_DQ=config.spread_dq, LOG2_LSE=config.log2_lse, CACHE_SCORE_K=config.cache_score_k,
-        TILE_MAJOR=config.tile_major, PARTITION_LDS=config.partition_lds, FRONT_REGIONS=config.front_regions,
-        BRIDGE_REGIONS=config.bridge_regions, CLUSTER_DQ=config.cluster_dq,
-        DQ_SLICES=max(1, n // config.block_n // 16) if config.cluster_dq else 1, OCC1=config.occ1,
-        OCC1_K_BANDS=config.occ1_k_bands, OCC1_PREFETCH=config.occ1_prefetch, OCC1_SCHED=config.occ1_sched,
-        PHASE_IGLP=config.phase_iglp, OCC1_DQ_FIRST=config.occ1_dq_first, OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk)
+    constants = dict(HQ=hq, HK=hk, N=n, SM_SCALE=128**-0.5, BM=config.block_m, BN=config.block_n, NW=config.num_warps,
+                     TDM=config.use_tdm, STAGES=config.stages, DELAYED=config.delayed, UNROLL=config.unroll,
+                     FRAGMENT_FENCES=config.fragment_fences, FRAGMENT_FENCE_MASK=config.fragment_fence_mask,
+                     FRAGMENTED=config.fragmented, RESIDENT_KV=config.resident_kv, ORDERED=config.ordered,
+                     PACKED_DQ=config.packed_dq, REMATERIALIZE=config.rematerialize, OUTER_M=config.outer_m,
+                     ASYNC_STATS=config.async_stats, Q_SPLITS=config.q_splits, REUSE_Q=config.reuse_q,
+                     PINGPONG=config.pingpong, SPREAD_DQ=config.spread_dq, LOG2_LSE=config.log2_lse,
+                     CACHE_SCORE_K=config.cache_score_k, TILE_MAJOR=config.tile_major,
+                     PARTITION_LDS=config.partition_lds, FRONT_REGIONS=config.front_regions,
+                     BRIDGE_REGIONS=config.bridge_regions, CLUSTER_DQ=config.cluster_dq,
+                     DQ_SLICES=max(1, n // config.block_n // 16) if config.cluster_dq else 1, OCC1=config.occ1,
+                     OCC1_K_BANDS=config.occ1_k_bands, OCC1_PREFETCH=config.occ1_prefetch, OCC1_SCHED=config.occ1_sched,
+                     PHASE_IGLP=config.phase_iglp, OCC1_DQ_FIRST=config.occ1_dq_first,
+                     OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, OCC1_PAD_K=config.occ1_pad_k)
     constants["SPLIT_KV_STORES"] = config.occ1 and config.packed_dq and config.q_splits > 1
     tail_splits = getattr(config, "tail_splits", 1)
     tail_base = tail_owners = 0
@@ -2319,7 +2320,15 @@ def _attention_backward_occ1_config(packed_dq, *, q_splits=1):
     return BackwardConfig(block_m=32, num_warps=4, stages=3, ordered=True, packed_dq=packed_dq, outer_m=64,
                           async_stats=True, queue_wmma=True, regalloc=True, q_splits=q_splits, waves_per_eu=1,
                           convert_block=8192 if q_splits > 1 and packed_dq else 4096, tile_major=True, cluster_dq=True,
-                          occ1=True, occ1_k_bands=2, occ1_load_after_dk=True)
+                          occ1=True, occ1_k_bands=2, occ1_load_after_dk=True, occ1_pad_k=not packed_dq or q_splits == 1)
+
+
+def _attention_backward_occ1_pad_k(config):
+    import dataclasses
+
+    # Split packed kernels keep the unpadded K image; padding spills them.
+    pad_k = not config.packed_dq or config.q_splits == 1 and config.tail_splits == 1
+    return dataclasses.replace(config, occ1_pad_k=pad_k) if config.occ1 else config
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -2456,7 +2465,7 @@ def test_attention_backward_occ1_assembly(shape, q_splits, packed_dq):
     assembly = kernel.asm["amdgcn"]
     assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
     assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
-    assert kernel.metadata.shared == 209392
+    assert kernel.metadata.shared == (215520 if config.occ1_pad_k else 211440)
     loop = _attention_backward_isa_loop(assembly)
     if q_splits > 1:
         # Guaranteed prologue TDM issues must keep the two-stage lookahead;
@@ -2501,7 +2510,7 @@ def test_attention_backward_occ1_war_flags_default_off():
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("shape,expected_drains", [((16, 16, 16, 16384), 32), ((8, 64, 8, 8192), 31)])
+@pytest.mark.parametrize("shape,expected_drains", [((16, 16, 16, 16384), 31), ((8, 64, 8, 8192), 31)])
 @pytest.mark.parametrize("packed_dq", [False, True])
 def test_attention_backward_occ1_war_drain_assembly(shape, expected_drains, packed_dq):
     import dataclasses
@@ -2519,7 +2528,7 @@ def test_attention_backward_occ1_war_drain_assembly(shape, expected_drains, pack
         assembly = kernel.asm["amdgcn"]
         assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
         assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
-        assert kernel.metadata.shared == 209392
+        assert kernel.metadata.shared == (215520 if config.occ1_pad_k else 211440)
         loop = _attention_backward_isa_loop(assembly)
         drains.append(sum("s_wait_alu depctr_va_vdst(0)" in line for line in loop))
         assert not any("s_wait_xcnt" in line for line in loop)
@@ -2587,7 +2596,7 @@ def test_attention_backward_occ1_selection(shape, packed_dq, occ1):
     policy = measured.get(tuple(shape) + (packed_dq, ))
     if policy is not None:
         expected = dataclasses.replace(expected, q_splits=policy[0], tail_splits=policy[1], convert_block=policy[2])
-    assert config == expected
+    assert config == _attention_backward_occ1_pad_k(expected)
 
 
 @pytest.mark.parametrize("packed_dq", [False, True])
@@ -2612,10 +2621,11 @@ def test_attention_backward_occ1_split_selection(shape, enabled, packed_dq):
     config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
     if enabled:
         if tuple(shape) in ((8, 64, 8, 1024), (16, 64, 8, 1024)):
-            assert config == dataclasses.replace(_attention_backward_occ1_config(packed_dq), tail_splits=3)
+            assert config == _attention_backward_occ1_pad_k(
+                dataclasses.replace(_attention_backward_occ1_config(packed_dq), tail_splits=3))
             assert config.convert_block == 4096
         else:
-            assert config == _attention_backward_occ1_config(packed_dq, q_splits=3)
+            assert config == _attention_backward_occ1_pad_k(_attention_backward_occ1_config(packed_dq, q_splits=3))
             assert config.convert_block == (8192 if packed_dq else 4096)
     else:
         assert config == _select_config_base(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
@@ -2719,12 +2729,13 @@ def test_attention_backward_occ1_tail_assembly(shape, packed_dq):
     import dataclasses
     import re
 
-    config = dataclasses.replace(_attention_backward_occ1_config(packed_dq), tail_splits=3)
+    config = _attention_backward_occ1_pad_k(
+        dataclasses.replace(_attention_backward_occ1_config(packed_dq), tail_splits=3))
     kernel = _compile_attention_backward_kernel(config, shape)
     assembly = kernel.asm["amdgcn"]
     assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
     assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
-    assert kernel.metadata.shared == 209392
+    assert kernel.metadata.shared == (215520 if config.occ1_pad_k else 211440)
     loop = _attention_backward_isa_loop(assembly)
     waits = [int(x, 0) for line in loop for x in re.findall(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)", line)]
     assert 8 in waits and 1 not in waits
@@ -2825,7 +2836,8 @@ def test_attention_backward_occ1_tail_selection(shape, packed_dq):
     from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import select_config
 
     config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
-    assert config == dataclasses.replace(_attention_backward_occ1_config(packed_dq), tail_splits=3)
+    assert config == _attention_backward_occ1_pad_k(
+        dataclasses.replace(_attention_backward_occ1_config(packed_dq), tail_splits=3))
     assert config.q_splits == 1 and config.convert_block == 4096
     assert select_config(shape[-1], *shape[:3], num_cus=384, packed_dq=packed_dq).tail_splits == 1
 
@@ -2861,7 +2873,7 @@ def test_attention_backward_occ1_dispatch_tail_selection(shape, packed_dq, q_spl
     config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
     expected = dataclasses.replace(_attention_backward_occ1_config(packed_dq, q_splits=q_splits),
                                    tail_splits=tail_splits, convert_block=convert_block)
-    assert config == expected
+    assert config == _attention_backward_occ1_pad_k(expected)
     # Each additional policy is measured on exactly the explicit 192-CU tuple.
     other = select_config(shape[-1], *shape[:3], num_cus=384, packed_dq=packed_dq)
     assert other.q_splits == 1 and other.tail_splits == 1

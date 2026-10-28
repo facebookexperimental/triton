@@ -17,15 +17,19 @@ from .gfx950_bwd import _run_bwd_preprocess, _run_bwd_zero_dq
 
 
 @triton.constexpr_function
-def _ds_shared_layout(bm, bn):
+def _ds_shared_layout(bm, bn, conflict_free=False):
     # Match the score WMMA's per-lane Q registers so publishing dS uses
     # vector LDS stores. Its inverse view supplies the delayed-dQ transpose.
+    # conflict_free pads 16 bytes per 256 and per 512: the stores' lanes 0-15
+    # stride 32 bytes and the transposed reads pair rows 512 bytes apart, so
+    # both otherwise hit each of 64 banks twice per 16-lane pass.
     q_bits = [1, 2, 4] + [1 << bit for bit in range(4, bm.bit_length() - 1)]
     q_bases = [[bit, 0] for bit in q_bits]
     lane_bases = [[0, bit] for bit in (1, 2, 4, 8)] + [[8, 0]]
     kv_bases = [[0, 1 << bit] for bit in range(4, bn.bit_length() - 1)]
     bases = q_bases + lane_bases + kv_bases
-    return tlx.padded_shared_layout_encoding.with_bases([(512, 16)], bases, [bm, bn])
+    padding = [(128, 8), (256, 8)] if conflict_free else [(512, 16)]
+    return tlx.padded_shared_layout_encoding.with_bases(padding, bases, [bm, bn])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,6 +96,9 @@ class BackwardConfig:
     # Experimental WMMA order and prefetch placement; gated independently.
     occ1_dq_first: bool = False
     occ1_load_after_dk: bool = False
+    # Pad K rows by 32 bytes so the loop's transposed K reads avoid bank
+    # conflicts. Its extra address registers spill split packed kernels.
+    occ1_pad_k: bool = False
     phase_iglp: int = -1
     # Split only the final dispatch-round KV owners; one preserves legacy code.
     tail_splits: int = 1
@@ -236,7 +243,8 @@ def select_config(n, b=None, hq=None, hk=None, *, num_cus=None, packed_dq=True):
     return BackwardConfig(block_m=32, num_warps=4, stages=3, ordered=True, packed_dq=packed_dq, outer_m=64,
                           async_stats=True, queue_wmma=True, regalloc=True, q_splits=q_splits, waves_per_eu=1,
                           convert_block=8192 if q_splits > 1 and packed_dq else 4096, tile_major=True, cluster_dq=True,
-                          occ1=True, occ1_k_bands=2, tail_splits=tail_splits, occ1_load_after_dk=True)
+                          occ1=True, occ1_k_bands=2, tail_splits=tail_splits, occ1_load_after_dk=True,
+                          occ1_pad_k=not packed_dq or q_splits == 1 and tail_splits == 1)
 
 
 def _compiler_options(config, n=None):
@@ -485,7 +493,8 @@ def _delayed_bwd_kernel(
         OCC1_K_BANDS: tl.constexpr = 0, OCC1_PREFETCH: tl.constexpr = True, OCC1_SCHED: tl.constexpr = False,
         PHASE_IGLP: tl.constexpr = -1, SPLIT_KV_STORES: tl.constexpr = False, TAIL_DK=None, TAIL_DV=None,
         TAIL_SPLITS: tl.constexpr = 1, TAIL_BASE: tl.constexpr = 0, TAIL_OWNERS: tl.constexpr = 0,
-        OCC1_DQ_FIRST: tl.constexpr = False, OCC1_LOAD_AFTER_DK: tl.constexpr = False):
+        OCC1_DQ_FIRST: tl.constexpr = False, OCC1_LOAD_AFTER_DK: tl.constexpr = False,
+        OCC1_PAD_K: tl.constexpr = False):
     if OCC1:
         tl.static_assert(NW == 4 and BN == 256 and BM == 32 and (OUTER_M == 64 or OUTER_M == 128))
         tl.static_assert(TDM and DELAYED and CLUSTER_DQ and TILE_MAJOR and ASYNC_STATS and not PINGPONG)
@@ -552,7 +561,13 @@ def _delayed_bwd_kernel(
         rhs: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
         dq_lhs: tl.constexpr = tlx.dot_operand_layout(0, dq_mma, k_width=8)
         dq_rhs: tl.constexpr = tlx.dot_operand_layout(1, dq_mma, k_width=8)
-        kb = tlx.local_alloc((256, 128), tl.bfloat16, 1)
+        if OCC1_PAD_K:
+            # Loop reads of K are transposed: lanes 8-15 take the next 16 bytes
+            # of rows 0-7, so a 16-byte row pad maps them onto lanes 1-7's banks.
+            kb = tlx.local_alloc((256, 128), tl.bfloat16, 1,
+                                 layout=tlx.padded_shared_layout_encoding.with_identity_for([(128, 16)], [256, 128]))
+        else:
+            kb = tlx.local_alloc((256, 128), tl.bfloat16, 1)
         # V is loaded directly into its lifetime-long operand, avoiding a second
         # persistent LDS image. K retains an LDS image for the nonresident bands.
         kv_offsets = (kv_tile * 256 + tl.arange(0, 256))[:, None] * 128 + tl.arange(0, 128)[None, :]
@@ -563,7 +578,7 @@ def _delayed_bwd_kernel(
         dob = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES)
         lseb = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
         db = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
-        dsb = tlx.local_alloc((32, 256), tl.bfloat16, 2, layout=_ds_shared_layout(32, 256))
+        dsb = tlx.local_alloc((32, 256), tl.bfloat16, 2, layout=_ds_shared_layout(32, 256, True))
         q_desc = tl.make_tensor_descriptor(Q, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
         do_desc = tl.make_tensor_descriptor(DO, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
         lse_desc = tl.make_tensor_descriptor(LSE, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
@@ -1571,7 +1586,7 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
         if (hq // hk) * n // outer_m < config.q_splits:
             raise ValueError("every OCC1 split must contain an outer tile")
     elif (config.occ1_k_bands or config.occ1_sched or config.occ1_dq_first or config.occ1_load_after_dk
-          or config.phase_iglp != -1 or not config.occ1_prefetch):
+          or config.occ1_pad_k or config.phase_iglp != -1 or not config.occ1_prefetch):
         raise ValueError("OCC1 scheduling options require OCC1")
     if (config.occ1_dq_first or config.occ1_load_after_dk) and not config.occ1_prefetch:
         raise ValueError("OCC1 WMMA reorder experiments require band prefetch")
@@ -1692,7 +1707,8 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
         PHASE_IGLP=config.phase_iglp, SPLIT_KV_STORES=config.occ1 and config.packed_dq and config.q_splits > 1,
         TAIL_DK=dk if config.tail_splits > 1 else None, TAIL_DV=dv if config.tail_splits > 1 else None,
         TAIL_SPLITS=config.tail_splits, TAIL_BASE=tail_base, TAIL_OWNERS=tail_owners,
-        OCC1_DQ_FIRST=config.occ1_dq_first, OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, **compiler_options)
+        OCC1_DQ_FIRST=config.occ1_dq_first, OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, OCC1_PAD_K=config.occ1_pad_k,
+        **compiler_options)
     if config.tail_splits > 1:
         convert_size = tail_owners * config.block_n * d
         convert_dk = dk.reshape(-1)[tail_base * config.block_n * d:]
