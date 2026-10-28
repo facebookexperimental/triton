@@ -3720,9 +3720,8 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
       // optimizeTMALoads, so caching them would leave a dangling pointer;
       // getSrcOp() must rediscover their replacement from alloc users.
       bool isSubtiledProducer =
-          producerOp &&
-          (isa<ttng::SubtiledRegionOp>(producerOp) ||
-           producerOp->getParentOfType<ttng::SubtiledRegionOp>());
+          producerOp && (isa<ttng::SubtiledRegionOp>(producerOp) ||
+                         producerOp->getParentOfType<ttng::SubtiledRegionOp>());
       if (producerOp != allocOp && isSubtiledProducer)
         post->cachedSrcOp = producerOp;
     }
