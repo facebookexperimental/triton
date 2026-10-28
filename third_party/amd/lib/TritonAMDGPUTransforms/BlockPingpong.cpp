@@ -482,17 +482,20 @@ LogicalResult Pingponger::genLocalSlice(OpBuilder &builder, Value v,
   // Each slice cannot be smaller than the smallest supported mfma width.
   if (sliceWidth < 16)
     return failure();
-  // A K slice must not retain a layout whose minimal K tile is wider than
-  // the slice. Otherwise the layout duplicates operands, and the small-K
-  // correction in MFMA lowering also scales the incoming accumulator of the
-  // chained dot. Reduce per-lane packing to preserve the slice's K extent.
-  auto mfmaEncoding = cast<ttg::AMDMfmaEncodingAttr>(dotEncoding);
-  int64_t layoutK = mfmaEncoding.getInstrShapeForOperand(kWidth, opIdx)[kIdx];
-  int64_t sliceKWidth =
-      std::min<int64_t>(kWidth, kWidth * sliceWidth / layoutK);
-  if (sliceKWidth <
-      std::max<int64_t>(32 / elementType.getIntOrFloatBitWidth(), 1))
-    return failure();
+  int64_t sliceKWidth = kWidth;
+  auto arch = getAMDArch(forOp->getParentOfType<ModuleOp>());
+  if (arch && arch->split(':').first == "gfx942") {
+    // A K slice must not retain a layout whose minimal K tile is wider than
+    // the slice. Otherwise the layout duplicates operands, and the small-K
+    // correction in MFMA lowering also scales the incoming accumulator of the
+    // chained dot. Limit this packing correction to the validated gfx942 path.
+    auto mfmaEncoding = cast<ttg::AMDMfmaEncodingAttr>(dotEncoding);
+    int64_t layoutK = mfmaEncoding.getInstrShapeForOperand(kWidth, opIdx)[kIdx];
+    sliceKWidth = std::min<int64_t>(kWidth, kWidth * sliceWidth / layoutK);
+    if (sliceKWidth <
+        std::max<int64_t>(32 / elementType.getIntOrFloatBitWidth(), 1))
+      return failure();
+  }
   auto dotOperandEnc = ttg::DotOperandEncodingAttr::get(
       builder.getContext(), opIdx, dotEncoding, sliceKWidth);
   auto subviewDescType = ttg::MemDescType::get(

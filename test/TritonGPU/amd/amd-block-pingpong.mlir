@@ -1,5 +1,6 @@
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-block-pingpong="num-stages=2" | FileCheck %s
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-block-pingpong="num-stages=3" | FileCheck %s --check-prefixes CHECK-NS3
+// RUN: sed 's/hip:gfx942/hip:gfx950/g' %s | triton-opt -split-input-file --tritonamdgpu-block-pingpong="num-stages=2" | FileCheck %s --check-prefix=CHECK-GFX950
 
 //CHECK-LABEL: pingpong_small
 //CHECK: ttg.local_load
@@ -89,6 +90,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-NS3-LABEL: @pingpong_packed_k32(
 // CHECK-NS3-NOT: ttg.memdesc_subslice
 // CHECK-NS3: tt.dot
+// The gfx942 packing correction must not change gfx950 operand layouts.
+// CHECK-GFX950-LABEL: @pingpong_packed_k32(
+// CHECK-GFX950: ttg.local_load {{.*}} -> tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: ttg.local_load {{.*}} -> tensor<16x256xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: ttg.local_load {{.*}} -> tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: ttg.local_load {{.*}} -> tensor<16x256xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: %[[UNCHANGED_FIRST:.+]] = tt.dot {{.*}}tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: tt.dot {{.*}}, %[[UNCHANGED_FIRST]] : tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 8
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [16, 4], warpsPerCTA = [8, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [4, 16], warpsPerCTA = [1, 8], order = [0, 1]}>
 #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 4], instrShape = [16, 16, 16], isTransposed = true}>
