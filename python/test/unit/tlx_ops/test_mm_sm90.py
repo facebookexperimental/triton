@@ -163,6 +163,51 @@ def test_full_space_prune_fills_the_gpu(M, N, K):
     assert best > num_sms // 2
 
 
+@pytest.mark.parametrize("M, N, K, group_size_m", [(706, 2560, 2560, 8), (706, 2560, 20992, 8),
+                                                   (706, 512, 20992, 1),  # split-K
+                                                   (706, 512, 512, 1),  # N <= 512
+                                                   ])
+def test_heuristic_tile_order_matches_full_space(M, N, K, group_size_m):
+    # The sub-wave heuristic tile follows the full-space prune: row-major order
+    # only for N <= 512 or split-K, grouped order otherwise.
+    kw = sm90.heuristic_config(M, N, K)[0].kwargs
+    assert kw["GROUP_SIZE_M"] == group_size_m
+    full = sm90._prune_full_configs(sm90.CONFIGS(), {"M": M, "N": N, "K": K})
+    assert any(c.kwargs["GROUP_SIZE_M"] == group_size_m and c.kwargs["SPLIT_K"] == kw["SPLIT_K"] for c in full)
+
+
+@pytest.mark.parametrize("M, N, K, b_row_major, tile", [
+    # Non-power-of-two tiles for a K-major B (measured best on H100).
+    (706, 3072, 12288, False, (128, 192, 1)),
+    (706, 6144, 3072, False, (128, 192, 1)),
+    # ... but not where a power-of-two tile ties it.
+    (706, 2048, 7072, False, (128, 128, 1)),
+    (706, 20992, 512, False, (128, 256, 1)),
+    (706, 8192, 2560, False, (128, 192, 1)),
+    # ... never for a row-major B.
+    (706, 8192, 2560, True, (128, 128, 1)),
+    # A narrow whole-K tile over a split one when both fill the GPU alike.
+    (706, 1280, 2560, True, (128, 64, 1)),
+    (706, 288, 2048, True, (128, 64, 4)),
+    (706, 256, 20992, True, (128, 128, 11)),
+    (706, 2560, 20992, True, (128, 128, 1)),
+])
+def test_sub_wave_heuristic_picks(M, N, K, b_row_major, tile):
+    kw = sm90.heuristic_config(M, N, K, b_row_major)[0].kwargs
+    assert (kw["BM"], kw["BN"], kw["SPLIT_K"]) == tile
+    assert sm90._fits_smem(kw["BM"], kw["BN"], kw["NUM_STAGES"], kw["SPLIT_K"])
+
+
+@pytest.mark.parametrize("M, N, K, tile", [
+    (706, 256, 256, (64, 64)),
+    (706, 3536, 128, (64, 128)),
+    (8192, 8192, 128, (128, 128)),
+])
+def test_small_k_heuristic_fills_two_waves(M, N, K, tile):
+    kw = sm90._small_k_heuristic_config(M, N, K)[0].kwargs
+    assert (kw["BM"], kw["BN"]) == tile
+
+
 def test_split_k_is_deterministic():
     # Guards the fixed-order workspace reduction: switching split-K to fp32
     # atomics or TMA reduce-add would make results depend on CTA scheduling.

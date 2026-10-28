@@ -33,6 +33,17 @@ def _persistent_mm_grid_split_k(*args, cdiv, min):
 
 
 @SymbolicGridFn
+def _hopper_ws_grid(m, n, meta, *, cdiv, min):
+    """Persistent grid for the Hopper WS template over (tile, K split) work
+    units; under SWAP_AB the kernel tiles C^T, so its M extent is N and its N
+    extent is M."""
+    if meta.get("SWAP_AB", False):
+        m, n = n, m
+    units = cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]) * meta.get("SPLIT_K", 1)
+    return (min(meta["NUM_SMS"], units), 1, 1)
+
+
+@SymbolicGridFn
 def _mm_grid_split_k(m, n, meta, *, cdiv):
     """Non-persistent grid for the warp-pipe addmm: one program per (tile, K-split).
 
@@ -84,8 +95,16 @@ blackwell_gemm_ws_template = TritonTemplate(
 
 hopper_gemm_ws_template = TritonTemplate(
     name="tlx_hopper_gemm_ws",
-    grid=_persistent_mm_grid_split_k,
+    grid=_hopper_ws_grid,
     source=load_tlx_template("hopper_gemm_ws"),
+)
+
+# tlx.ops.mm's small-K kernel: one tile per CTA, software-pipelined tl.dot. With
+# only a few K steps the WS kernel's fixed cost dominates.
+hopper_gemm_small_k_template = TritonTemplate(
+    name="tlx_hopper_gemm_small_k",
+    grid=_mm_grid_split_k,
+    source=load_tlx_template("hopper_gemm_small_k"),
 )
 
 # TLX warp-pipelined addmm template (MI350X/gfx950), col-major B only.
@@ -209,9 +228,25 @@ def append_tlx(templates, op_name, kernel_inputs):
         return _append_tlx_amd(templates, op_name)
     if current_target().is_blackwell:
         return _append_tlx_blackwell(templates, op_name)
-    if current_target().is_hopper and op_name == "mm":
-        if hopper_gemm_ws_template not in templates:
-            templates.append(hopper_gemm_ws_template)
+    if current_target().is_hopper:
+        return _append_tlx_hopper(templates, op_name)
+    return templates
+
+
+def _append_tlx_hopper(templates, op_name):
+    if op_name == "addmm":
+        # tuned_addmm issues several get_template_configs calls; only the unified
+        # one (with the stock mm_template) passes the bias expanded to [M, N],
+        # which the template epilogue indexes in 2-D.
+        from torch._inductor.kernel.mm import mm_template
+
+        if mm_template.uid not in {getattr(t, "uid", None) for t in templates}:
+            return templates
+    elif op_name != "mm":
+        return templates
+    for template in (hopper_gemm_ws_template, hopper_gemm_small_k_template):
+        if template not in templates:
+            templates.append(template)
     return templates
 
 
