@@ -11,7 +11,7 @@ from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
-from triton.language.extra.tlx.tutorials import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials import amd_fa_tdm_pipelined as _gfx1250_attention
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
@@ -30,7 +30,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
@@ -7255,7 +7255,290 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
     assert "wmma" in amdgcn
 
 
-def test_gfx1250_mxgemm_tdm_split_compiles():
+@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
+@pytest.mark.parametrize("cluster_size,multicast,group_m", [
+    (2, True, 8),
+    (4, True, 4),
+    (4, True, 8),
+    (4, False, 4),
+])
+@pytest.mark.parametrize("remap_mode", [0, 2])
+def test_gfx1250_mxgemm_persistent_multicast_compiles(dtype_b, block_k, cluster_size, multicast, group_m, remap_mode):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, 3, block_k, XCD_REMAP_MODE=remap_mode, GROUP_SIZE_M=group_m,
+                                                  CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=multicast)
+    assert compiled.metadata.num_ctas == 1
+    assert compiled.metadata.ctas_per_cga == (cluster_size, 1, 1)
+    assert compiled.metadata.shared <= 320 * 1024
+    assert "amdg.cluster_barrier_arrive" in compiled.asm["ttgir"]
+    assert "amdg.cluster_barrier_wait" in compiled.asm["ttgir"]
+    assert (" multicast " in compiled.asm["ttgir"]) == multicast
+    asm = compiled.asm["amdgcn"]
+    assert "ds_load_b128" in asm and "ds_store_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
+
+
+@pytest.mark.parametrize("changes,valid", [
+    ({}, True),
+    ({"group_m": 8}, True),
+    ({"num_programs": 32}, True),
+    ({"xcd_remap": "none"}, True),
+    ({"xcd_remap": "none", "group_m": 8}, True),
+    ({"xcd_remap": "none", "num_xcds": 1, "xcd_chunk": 1}, True),
+    ({"xcd_remap": "balanced"}, False),
+    ({"num_xcds": 4}, False),
+    ({"xcd_chunk": 1}, False),
+    ({"num_xcds": 0}, False),
+    ({"cluster_size": 3}, False),
+    ({"group_m": 2}, False),
+    ({"M": 2304}, False),
+    ({"N": 768}, False),
+    ({"num_programs": 24}, False),
+    ({"num_programs": 48}, False),
+    ({"num_programs": 0}, False),
+    ({"persistent": False}, False),
+    ({"cluster_barrier_interval": 0}, True),
+    ({"cluster_barrier_interval": 4}, True),
+    ({"cluster_barrier_interval": -1}, False),
+    ({"cluster_barrier_interval": 1.5}, False),
+])
+def test_gfx1250_mxgemm_persistent_cluster_config_validation(changes, valid):
+    config = dict(M=2048, N=1024, num_programs=16, persistent=True, block_m=256, block_n=256, group_m=4,
+                  xcd_remap="chunked", num_xcds=8, xcd_chunk=2, cluster_size=4)
+    config.update(changes)
+    if valid:
+        _gfx1250_mxfp._validate_mxfp_scheduling(**config)
+    else:
+        with pytest.raises(ValueError):
+            _gfx1250_mxfp._validate_mxfp_scheduling(**config)
+
+
+@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
+@pytest.mark.parametrize("remap_mode", [0, 2])
+@pytest.mark.parametrize("interval", [0, 4])
+def test_gfx1250_mxgemm_cluster_barrier_interval_compiles(dtype_b, block_k, remap_mode, interval):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, 3, block_k, CLUSTER_SIZE=4, GROUP_SIZE_M=4,
+                                                  XCD_REMAP_MODE=remap_mode, CLUSTER_BARRIER_INTERVAL=interval)
+    ttgir = compiled.asm["ttgir"]
+    assert ("amdg.cluster_barrier_arrive" in ttgir) == (interval > 0)
+    assert ("amdg.cluster_barrier_wait" in ttgir) == (interval > 0)
+    assert " multicast " in ttgir
+    asm = compiled.asm["amdgcn"]
+    assert "ds_load_b128" in asm and "ds_store_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
+
+
+def _strip_tdm_hazard_waits(asm):
+    """Drop the TDM issue-limit waits the AMDGPU hazard recognizer inserts.
+
+    GCNHazardRecognizer::fixTDM emits ``s_wait_tensorcnt 10`` immediately
+    before a TDM instruction unless an earlier wait already bounds the count
+    by ten. It only caps the number of outstanding TDM operations and never
+    drains the queues these schedule checks reason about.
+    """
+    lines = asm.splitlines(keepends=True)
+    return "".join(line for line, following in zip(lines, lines[1:] + [""])
+                   if not (re.fullmatch(r"\s*s_wait_tensorcnt 0xa\s*", line)
+                           and re.match(r"\s*tensor_(?:load_to|store_from)_lds\b", following)))
+
+
+def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constants):
+    kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
+    signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr="*fp32", a_scale="*u8",
+                     b_scale="*u8")
+    # Match bench.py's aligned, sub-2GB tensors and specialize the dimensions
+    # and strides so the persistent kernel can fold descriptor/tile setup.
+    attrs = {(kernel.arg_names.index(name), ): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+             for name in signature}
+    m, n, k = (constants.get(dim, 8192) for dim in ("M", "N", "K"))
+    config = dict(M=m, N=n, K=k, stride_am=k, stride_bn=k // 2 if dtype_b == "e2m1" else k, stride_cm=n,
+                  stride_as=k * 4, stride_bs=k * 4, DTYPE_B=dtype_b, BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k,
+                  GROUP_SIZE_M=8, NUM_BUFFERS=num_buffers, NUM_PROGRAMS=256, CROSS_TILE_PREFETCH=block_k == 128,
+                  XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
+                  CLUSTER_BARRIER_INTERVAL=1, CLUSTER_LAYOUT="linear")
+    config.update(constants)
+    src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
+                              options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
+    compiled.asm["amdgcn"] = _strip_tdm_hazard_waits(compiled.asm["amdgcn"])
+    return compiled
+
+
+@pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("k, output_c_slots", [(8192, None), (4096, None), (4096, 3), (16384, 3)])
+def test_gfx1250_mxgemm_static_slot_unroll_keeps_operands_in_place(cluster_size, k, output_c_slots):
+    extra = {} if output_c_slots is None else dict(OUTPUT_C_SLOTS=output_c_slots)
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=k, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=4,
+                                                  CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                                  STATIC_SLOT_UNROLL=True, **extra)
+    asm = compiled.asm["amdgcn"]
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    # Peeled, unrolled, and remainder steps share the output's native WMMA
+    # layout: no accumulator conversions, so three C slots fit in LDS.
+    assert "ttg.convert_layout" not in compiled.asm["ttgir"]
+    assert compiled.metadata.shared <= 320 * 1024
+    assert asm.count("tensor_store_from_lds") == 8
+    # The peeled first step reads the tile's zero accumulators as WMMA inline
+    # constants instead of zeroing 512 accumulator VGPRs.
+    wmmas = re.findall(r"^\s+v_wmma_scale_f32_16x16x128_f8f6f4 .*$", asm, re.MULTILINE)
+    # Drop register-name comments such as "/*v[272:287]*/" before matching.
+    wmmas = [re.sub(r"\s*/\*.*?\*/", "", wmma) for wmma in wmmas]
+    assert sum(bool(re.search(r"\], 0, ", wmma)) for wmma in wmmas) == 64
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    bodies = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            bodies.append("\n".join(lines[labels[branch[1]]:i]))
+    # One iteration covers every ring slot. Each step's next-stage operands are
+    # loaded straight into the registers the following step reads, so the
+    # steady loop carries no operand register copies. Cluster rendezvous adds a
+    # second back edge around the same body; check the innermost one.
+    steady = [body for body in bodies if body.count("v_wmma_scale_f32_16x16x128_f8f6f4") == 3 * 64]
+    assert steady
+    body = min(steady, key=len)
+    assert body.count("tensor_load_to_lds") == 3 * 2
+    assert not re.search(r"\bv_(?:dual_)?mov_b(?:32|64)\b", body)
+
+
+@pytest.mark.parametrize("dtype_b,num_buffers,block_k", [
+    ("e2m1", 2, 128),
+    ("e2m1", 3, 128),
+    ("e2m1", 2, 256),
+    ("e2m1", 3, 256),
+    ("e4m3", 2, 256),
+    ("e4m3", 3, 128),
+    ("e4m3", 4, 128),
+    ("e2m1", 4, 128),
+])
+@pytest.mark.parametrize("k", [4096, 8192])
+@pytest.mark.parametrize("cluster_size,barrier_interval", [(1, 1), (4, 4)], ids=["unclustered", "periodic-cluster"])
+def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, cluster_size, barrier_interval,
+                                                          k):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, K=k, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=barrier_interval)
+    asm = compiled.asm["amdgcn"]
+    assert "ds_load_b128" in asm and "ds_store_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
+    assert compiled.metadata.shared <= 320 * 1024
+    assert asm.count("tensor_store_from_lds") == (4 if block_k == 256 else (16 if num_buffers == 4 else 8))
+    grouped_prefetch = block_k == 128 and num_buffers == 4 and dtype_b == "e4m3"
+    assert ("sched_group_barrier" in asm) == grouped_prefetch
+    if dtype_b == "e4m3" and block_k == 128 and num_buffers == 3:
+        # One steady body and one rolled tail retain the native K128 work.
+        # Expanding the tail per ring slot used to duplicate three full bodies.
+        native_mma = re.findall(r"^\s+v_wmma_scale_f32_16x16x128_f8f6f4\s", asm, re.MULTILINE)
+        assert len(native_mma) <= 128, "duplicated native A8W8 compute bodies in the persistent tail"
+
+    # Find the innermost loop containing both compute and a TDM refill. Merely
+    # emitting both kinds of instructions is insufficient: the regression put
+    # every WMMA before the tensor wait, exposing all subsequent operand reads.
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    # The K tail is a loop of similar size; it branches on the next tile.
+    body = min(
+        loops, key=lambda body:
+        (sum("v_wmma" in inst for inst in body), sum("s_cbranch" in inst for inst in body), len(body)))
+    assert not any("scratch_" in inst for inst in body), "register spills in the steady K loop"
+    if dtype_b == "e4m3" and block_k == 128:
+        # Each wave selects its data/scale base once, outside the K loop.
+        # The fused refills then need only their K advances; the three-stage
+        # dynamic loop reads scales first and advances one more base.
+        scales_first = num_buffers == 3
+        assert sum("s_add_nc_u64" in inst for inst in body) <= (3 if scales_first else 2)
+    wait = next(i for i, inst in enumerate(body) if "s_wait_tensorcnt" in inst)
+    load = next(i for i, inst in enumerate(body) if i > wait and "ds_load_b128" in inst)
+    # A periodic cluster barrier can put the refill block before the compute
+    # block in assembly order. Do not count the next iteration's WMMAs as
+    # overlap: independent matrix work must remain in the refill block itself.
+    block_end = next((i for i in range(load + 1, len(body)) if re.match(r"(?:\.LBB\d+_\d+:|; %bb\.\d+:)", body[i])),
+                     len(body))
+    assert any("v_wmma" in inst for inst in body[load + 1:block_end]), "no matrix work overlaps the next operand loads"
+    if grouped_prefetch:
+        # Four independent prefetch regions retain their own scheduling IDs.
+        for sync_id in (101, 102, 103, 104):
+            assert f"SyncID({sync_id})" in "\n".join(body)
+    if block_k == 256 and dtype_b == "e2m1":
+        deferred = sum("v_wmma" in inst for inst in body[wait + 1:block_end])
+        assert deferred >= 64, "too little deferred matrix work covers the refill"
+
+
+@pytest.mark.parametrize("dtype_b,num_buffers", [("e4m3", 2), ("e4m3", 3), ("e4m3", 4), ("e2m1", 3)])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_gfx1250_mxgemm_output_staging_waits_on_reuse(dtype_b, num_buffers, cluster_size):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, 128, K=4096, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=4)
+    lines = compiled.asm["amdgcn"].splitlines()
+    stores = [i for i, line in enumerate(lines) if "tensor_store_from_lds" in line]
+    assert len(stores) >= 3
+    output_start = max(i for i in range(stores[0]) if re.match(r"(?:\.LBB\d+_\d+:|; %bb\.\d+:)", lines[i]))
+    # The first two slots are free. Waiting here would drain next-tile
+    # A/B transfers instead of protecting an outstanding output reader.
+    assert not any("s_wait_tensorcnt" in line for line in lines[output_start:stores[1]])
+    # The third chunk reuses slot zero, so the older C transfer must finish
+    # before the first local store into that slot, leaving slot one in flight.
+    reuse = lines[stores[1] + 1:stores[2]]
+    wait = next(i for i, line in enumerate(reuse) if re.search(r"s_wait_tensorcnt\s+(?:0x0*1|1)\b", line))
+    write = next(i for i, line in enumerate(reuse) if "ds_store_" in line)
+    assert wait < write
+
+
+@pytest.mark.parametrize("k", [4096, 8192])
+def test_gfx1250_mxgemm_a8w4_handoff_preserves_slot_stride(k):
+    compiled = _compile_gfx1250_mxgemm_persistent("e2m1", 3, 256, K=k, CROSS_TILE_PREFETCH=True, CLUSTER_SIZE=4,
+                                                  CLUSTER_BARRIER_INTERVAL=4)
+    ttgir, asm = compiled.asm["ttgir"], compiled.asm["amdgcn"]
+    alias = re.search(
+        r"ttg.memdesc_reinterpret %\w+ \{tlx.storage_alias_view\} : "
+        r"!ttg.memdesc<3x256x256xf8E4M3FN, (#\w+),.*? -> !ttg.memdesc<3x128x128xf32, (#\w+),", ttgir)
+    assert alias, "C must reuse the three A slots: " + "\n".join(
+        line for line in ttgir.splitlines() if "local_alloc" in line or "memdesc_reinterpret" in line)
+    paddings = {
+        name: (int(interval), int(padding))
+        for name, interval, padding in re.findall(r"(#\w+) = #ttg.padded_shared<\[(\d+):\+(\d+)\]", ttgir)
+    }
+    strides = []
+    for layout, elements, width in ((alias[1], 256 * 256, 1), (alias[2], 128 * 128, 4)):
+        interval, padding = paddings[layout]
+        strides.append((elements + elements // interval * padding) * width)
+    # Functional simulation can retire stores too quickly to expose an alias
+    # race. Retiring C slot i must free exactly A slot i, including padding.
+    assert strides[0] == strides[1], "C-slot retirement does not protect the corresponding A-slot refill"
+    assert compiled.metadata.shared <= 320 * 1024
+    assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
+    assert asm.count("tensor_store_from_lds") == 4
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+
+
+@pytest.mark.parametrize("dtype_b,buffers,prefetch,error", [("e2m1", 2, True, "CROSS_TILE_PREFETCH=False"),
+                                                            ("e4m3", 3, False, "2 buffers")])
+def test_gfx1250_mxgemm_persistent_output_reuse_rejects_conflict(dtype_b, buffers, prefetch, error):
+    a = torch.empty((256, 1024), dtype=torch.float8_e4m3fn, device="meta")
+    b = torch.empty((256, 512 if dtype_b == "e2m1" else 1024), dtype=torch.uint8, device="meta")
+    scale = torch.empty((2, 4096), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match=error):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, scale, scale, BLOCK_M=256, BLOCK_N=256, BLOCK_K=256, TRANSPOSE_B=True,
+                                           NUM_BUFFERS=buffers, DTYPE_A="e4m3", DTYPE_B=dtype_b, SCHEDULE="sliceMNK",
+                                           TDM_FUSION="partial", PERSISTENT=True, CROSS_TILE_PREFETCH=prefetch)
+
+
+@pytest.mark.parametrize("DTYPE_B", ["e4m3", "e2m1"])
+@pytest.mark.parametrize("TDM_SPLIT", [False, True])
+@pytest.mark.parametrize("BLOCK_M", [128, 256])
+@pytest.mark.parametrize("BLOCK_K", [128, 256])
+def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K):
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile as triton_compile
 
@@ -7263,7 +7546,7 @@ def test_gfx1250_mxgemm_tdm_split_compiles():
         fn=_gfx1250_mxfp.mxgemm_tdm_pipelined_kernel,
         signature={
             "a_ptr": "*fp8e4nv",
-            "b_ptr": "*u8",
+            "b_ptr": "*u8" if DTYPE_B == "e2m1" else "*fp8e4nv",
             "c_ptr": "*fp32",
             "a_scale": "*i8",
             "b_scale": "*i8",
@@ -7280,20 +7563,21 @@ def test_gfx1250_mxgemm_tdm_split_compiles():
         },
         constexprs={
             "DTYPE_A": "e4m3",
-            "DTYPE_B": "e2m1",
+            "DTYPE_B": DTYPE_B,
             "SCALE_BLOCK": 32,
-            "BLOCK_M": 256,
+            "BLOCK_M": BLOCK_M,
             "BLOCK_N": 256,
-            "BLOCK_K": 256,
+            "BLOCK_K": BLOCK_K,
             "GROUP_SIZE_M": 8,
             "TRANSPOSE_B": True,
-            "NUM_BUFFERS": 3,
+            "NUM_BUFFERS": 4 if BLOCK_K == 128 else (3 if DTYPE_B == "e2m1" else 2),
             "SCALE_PRESHUFFLE": True,
             "WITH_A_SCALE": True,
             "SCHEDULE": "sliceMNK",
             "TDM_FUSION": "partial",
             "L2_PREFETCH_DISTANCE": -1,
-            "TDM_SPLIT": True,
+            "TDM_SPLIT": TDM_SPLIT,
+            "TILES_PER_WARP": (2, 2),
         },
     )
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
@@ -7301,10 +7585,34 @@ def test_gfx1250_mxgemm_tdm_split_compiles():
     amdgcn = compiled.asm["amdgcn"]
     assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
     assert "amdg.async_tdm_copy_local_to_global" in ttgir
-    assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    if TDM_SPLIT:
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+    # K128 stages need one native K128 contribution per output quadrant.
+    # Two padded K64 halves pass numerical checks but double the matrix work.
+    lines = amdgcn.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    body = min(loops, key=len)
+    assert sum("v_wmma" in inst for inst in body) == BLOCK_M * 256 // (4 * 16 * 16) * (BLOCK_K // 128)
+    assert not any("scratch_" in inst for inst in body)
+    assert compiled.metadata.shared <= 320 * 1024
+    # Scale distributions must survive the loop edge without an LDS exchange.
+    # Output quadrants should vectorize directly, avoiding paired-address
+    # stores and their high-register DATA1 path.
+    lds_stores = re.findall(r"\bds_store_\w+", amdgcn)
+    assert set(lds_stores) == {"ds_store_b128"}
+    assert len(lds_stores) == BLOCK_M * 256 // (4 * 32 * 4)
+    assert amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds") == 1
 
 
 def test_gfx1250_attn_fwd_tdm_pipelined_compiles():
