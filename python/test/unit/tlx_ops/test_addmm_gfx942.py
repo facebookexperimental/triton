@@ -7,6 +7,70 @@ from triton.tlx.ops.kernels.addmm._shapes import CORRECTNESS_SHAPES, FOCUS, inpu
 pytestmark = pytest.mark.skipif(not is_hip_cdna3(), reason="tlx.ops.addmm requires gfx942")
 
 
+@pytest.mark.parametrize("mode", [None, "0", "1", "auto", "force"])
+def test_torchtlx_mlp_partials_policy(monkeypatch, mode):
+    from triton.tlx.ops.kernels.mm.gfx942 import torchtlx_heuristic_config
+
+    if mode is None:
+        monkeypatch.delenv("TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE", raising=False)
+    else:
+        monkeypatch.setenv("TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE", mode)
+    configs = torchtlx_heuristic_config(4662, 2560, 2560, dtype=torch.float16, out_dtype=torch.float16,
+                                        a_strides=(2560, 1), b_strides=(1, 2560))
+    assert len(configs) == 1
+    assert bool(configs[0].kwargs.get("SPLIT_M_256_64")) == (mode in ("1", "auto", "force"))
+
+
+@pytest.mark.parametrize("row_panels", [0, 160, 320])
+def test_addmm_layernorm_partials_row_tail(monkeypatch, row_panels):
+    from torch._inductor import config
+    from torch._inductor.utils import run_and_get_code
+
+    if not hasattr(config.triton, "tlx_mode"):
+        pytest.skip("torch lacks TorchTLX integration")
+    import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+    if row_panels:
+        from triton.tlx.ops.kernels.mm import gfx942
+
+        tile = gfx942._config(row_panels, 128 if row_panels == 320 else 256, 64, 4, 8, split_m_128_32=row_panels == 160)
+        if row_panels == 320:
+            tile.kwargs["SPLIT_M_256_64"] = True
+        tile.kwargs["NUM_XCDS"] = 1
+        tile.kwargs["XCD_CHUNK"] = 1
+        monkeypatch.setattr(gfx942, "torchtlx_heuristic_config", lambda *args, **kwargs: [tile])
+
+    monkeypatch.setenv("TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE", "force")
+    m, n, k = 392, 256, 256
+    torch.manual_seed(123)
+    bias, a, b = inputs((m, n, k, (k, 1), (1, k), (1, ), "fp16"), torch.float16)
+    scale = torch.randn(n, device="cuda", dtype=a.dtype)
+    offset = torch.randn_like(scale)
+
+    def model(bias, a, b, scale, offset):
+        value = torch.addmm(bias, a, b)
+        return torch.nn.functional.layer_norm(value, (n, ), scale, offset, 1e-5)
+
+    with torch.no_grad(), config.patch({
+            "triton.tlx_mode": "allow",
+            "max_autotune": True,
+            "max_autotune_gemm_backends": "ATEN,TRITON",
+            "benchmark_epilogue_fusion": True,
+            "force_disable_caches": True,
+            "enable_caching_generated_triton_templates": False,
+    }):
+        args = (bias, a, b, scale, offset)
+        compiled = torch.compile(model, fullgraph=True)
+        actual, code = run_and_get_code(compiled, *args)
+        source = "\n".join(code)
+        assert "row_stats_ws" in source
+        assert "_row_consumer" in source
+        torch.testing.assert_close(actual, model(*args), atol=0.05, rtol=0.05)
+        a.neg_()
+        bias.add_(1)
+        torch.testing.assert_close(compiled(*args), model(*args), atol=0.05, rtol=0.05)
+
+
 @pytest.mark.parametrize("m,n,k,a_strides,b_strides,bias_strides,dtype_name", CORRECTNESS_SHAPES)
 def test_addmm(m, n, k, a_strides, b_strides, bias_strides, dtype_name):
     from triton.tlx.ops import addmm as tlx_addmm
@@ -20,6 +84,15 @@ def test_addmm(m, n, k, a_strides, b_strides, bias_strides, dtype_name):
 
     assert actual is out
     torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+
+    if dtype == torch.bfloat16 and (m, n, k) == (819200, 1024, 192):
+        # Reusing an output after reading it must observe subsequent streaming stores.
+        for update in (a.neg_, a.zero_):
+            update()
+            bias.add_(1)
+            actual = tlx_addmm(bias, a, b, out=out)
+            assert actual is out
+            torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=0.05, rtol=0.05)
 
     del bias, a, b, out, actual, expected
     torch.cuda.empty_cache()
@@ -117,3 +190,18 @@ def test_deep_k_rejects_cpu_bias():
     assert not gfx942._precheck_global_split_k(a, b, bias, out)
     with pytest.raises(ValueError, match="input must match A's device and dtype"):
         gfx942._gemm(a, b, bias, out=out)
+
+
+@pytest.mark.parametrize("global_split", [False, True])
+def test_full_space_independent_of_heuristic(monkeypatch, global_split):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    shapes = tuple((entry.m, entry.n, entry.k) for entry in FOCUS.resolved_shapes("gfx942_all"))
+
+    def keys(shape):
+        configs = gfx942._candidate_configs(shape, enable_global_split_k=global_split)
+        return {(tuple(sorted(config.kwargs.items())), config.num_warps, config.num_stages) for config in configs}
+
+    expected = {shape: keys(shape) for shape in shapes}
+    monkeypatch.setattr(gfx942, "heuristic_config", lambda *args, **kwargs: [gfx942._config(32, 32, 32, 1, 4)])
+    assert {shape: keys(shape) for shape in shapes} == expected

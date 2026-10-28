@@ -193,6 +193,7 @@ gfx950_addmm_persistent_warppipe_template = TritonTemplate(
 
 # Templates whose every output store goes through reduction_store_output.
 for _template in (
+    gfx942_addmm_template,
     gfx950_addmm_warppipe_template,
     gfx950_addmm_persistent_warppipe_template,
     gfx950_mm_interwave_template,

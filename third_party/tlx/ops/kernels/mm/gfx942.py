@@ -5,6 +5,7 @@ full autotune space. Short-M ``mm`` shapes use an intra-CTA K split instead.
 """
 
 import functools
+import os
 from typing import NamedTuple
 
 import torch
@@ -341,6 +342,8 @@ def _direct_matmul_kernel_gfx942(
     USE_PIPELINED_POINTER_LOADS: tl.constexpr = False,
     TILE_ID=0,
     OVERRIDE_TILE_ID: tl.constexpr = False,
+    SPLIT_M_256_64: tl.constexpr = False,
+    USE_STREAMING_BF16_STORES: tl.constexpr = False,
 ):
     """Register-staged GEMM with per-operand cache and XCD policy."""
     pid = TILE_ID.to(tl.int32) if OVERRIDE_TILE_ID else tl.program_id(0).to(tl.int32)
@@ -395,21 +398,22 @@ def _direct_matmul_kernel_gfx942(
             K,
             SECOND_WIDTH=128,
         )
-    elif SPLIT_M_128_32 or SPLIT_M_128_64:
+    elif SPLIT_M_128_32 or SPLIT_M_128_64 or SPLIT_M_256_64:
         # Two power-of-two row panels consume the same B registers before
         # the next K iteration. No asynchronous storage or alias is added.
-        PANEL_M: tl.constexpr = 64 if SPLIT_M_128_64 else 32
-        tl.static_assert(BLOCK_M == 128 + PANEL_M)
+        BASE_PANEL_M: tl.constexpr = 256 if SPLIT_M_256_64 else 128
+        PANEL_M: tl.constexpr = 64 if SPLIT_M_128_64 or SPLIT_M_256_64 else 32
+        tl.static_assert(BLOCK_M == BASE_PANEL_M + PANEL_M)
         if SPLIT_M_128_32:
             tl.static_assert(K % BLOCK_K == 0)
         base_m = pid_m * BLOCK_M
         base_n = pid_n * BLOCK_N
-        offs_m0 = (base_m + tl.arange(0, 128).to(tl.int32)) % M
-        offs_m1 = (base_m + 128 + tl.arange(0, PANEL_M).to(tl.int32)) % M
+        offs_m0 = (base_m + tl.arange(0, BASE_PANEL_M).to(tl.int32)) % M
+        offs_m1 = (base_m + BASE_PANEL_M + tl.arange(0, PANEL_M).to(tl.int32)) % M
         offs_n = (base_n + tl.arange(0, BLOCK_N).to(tl.int32)) % N
         offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
 
-        acc0 = tl.zeros((128, BLOCK_N), tl.float32)
+        acc0 = tl.zeros((BASE_PANEL_M, BLOCK_N), tl.float32)
         acc1 = tl.zeros((PANEL_M, BLOCK_N), tl.float32)
         k_main = (K // BLOCK_K) * BLOCK_K
         for k in range(0, k_main, BLOCK_K):
@@ -460,8 +464,8 @@ def _direct_matmul_kernel_gfx942(
             acc0 = tl.dot(a0, b, acc0, allow_tf32=False, out_dtype=tl.float32)
             acc1 = tl.dot(a1, b, acc1, allow_tf32=False, out_dtype=tl.float32)
 
-        rows0 = base_m + tl.arange(0, 128).to(tl.int32)
-        rows1 = base_m + 128 + tl.arange(0, PANEL_M).to(tl.int32)
+        rows0 = base_m + tl.arange(0, BASE_PANEL_M).to(tl.int32)
+        rows1 = base_m + BASE_PANEL_M + tl.arange(0, PANEL_M).to(tl.int32)
         cols = base_n + tl.arange(0, BLOCK_N).to(tl.int32)
         idx_n = cols[None, :]
         idx_m0 = rows0[:, None]
@@ -503,17 +507,31 @@ def _direct_matmul_kernel_gfx942(
         # same compiler-managed pointer pipeline. Operand ownership follows
         # reg_m/reg_n; the masked epilogue remains the unique output writer.
         SMALL_POINTER_TILE: tl.constexpr = (((M == 902 and ((N == 2048 and (K == 2048 or K == 4096)) or
-                                                            (N == 4096 and (K == 1091 or K == 2048 or K == 6656)))) or
+                                                            (N == 4096 and
+                                                             (K == 1091 or K == 2048 or K == 6656 or K == 7552)))) or
                                              (M == 440 and ((N == 2048 and (K == 2048 or K == 4096)) or
                                                             (N == 4096 and (K == 1093 or K == 2048 or K == 6400)))))
                                             and (BLOCK_M == 64 or BLOCK_M == 128) and (BLOCK_N == 64 or BLOCK_N == 128))
         # Keep the buffer policy for other layouts and element types.
-        PIPELINED_POINTERS: tl.constexpr = (USE_PIPELINED_POINTER_LOADS and tlx.dtype_of(a_ptr) == tl.float16
-                                            and tlx.dtype_of(b_ptr) == tl.float16 and stride_am == K and stride_ak == 1
-                                            and stride_bk == 1 and stride_bn == K
-                                            and ((BLOCK_M == 128 and BLOCK_N == 128) or SMALL_POINTER_TILE)
-                                            and (BLOCK_K == 64 or (SMALL_POINTER_TILE and
-                                                                   (BLOCK_K == 128 or BLOCK_K == 256))))
+        # Explicit buffer loads are excluded from compiler pipeline discovery.
+        # Trial generic loads only for the measured BF16 deep-K specialization,
+        # retaining its tile, K step, and compiler-owned publish/reuse ordering.
+        BF16_POINTER_TILE: tl.constexpr = (tlx.dtype_of(a_ptr) == tl.bfloat16 and tlx.dtype_of(b_ptr) == tl.bfloat16 and
+                                           (((M, N, K) == (1024, 6144, 20480) and BLOCK_M == 128 and BLOCK_N == 128
+                                             and BLOCK_K == 64 and tlx.num_warps() == 4) or
+                                            ((M, N, K) == (61440, 2048, 5120) and BLOCK_M == 128 and
+                                             (BLOCK_N == 128 or BLOCK_N == 256) and (BLOCK_K == 32 or BLOCK_K == 64) and
+                                             (tlx.num_warps() == 4 or tlx.num_warps() == 8)) or
+                                            ((M, N, K) == (819200, 1024, 192) and BLOCK_M == 256 and BLOCK_N == 128 and
+                                             (BLOCK_K == 32 or BLOCK_K == 64) and tlx.num_warps() == 8) or
+                                            ((M, N, K) == (4096, 1894, 242432) and BLOCK_M == 64 and BLOCK_N == 64 and
+                                             (BLOCK_K == 128 or BLOCK_K == 256) and
+                                             (tlx.num_warps() == 4 or tlx.num_warps() == 8))))
+        PIPELINED_POINTERS: tl.constexpr = (
+            USE_PIPELINED_POINTER_LOADS and stride_am == K and stride_ak == 1 and stride_bk == 1 and stride_bn == K
+            and (BF16_POINTER_TILE or (tlx.dtype_of(a_ptr) == tl.float16 and tlx.dtype_of(b_ptr) == tl.float16 and
+                                       ((BLOCK_M == 128 and BLOCK_N == 128) or SMALL_POINTER_TILE) and
+                                       (BLOCK_K == 64 or (SMALL_POINTER_TILE and (BLOCK_K == 128 or BLOCK_K == 256))))))
         USE_BUFFER_A: tl.constexpr = (not USE_SINGLE_STAGE_POINTER_LOADS and not PIPELINED_POINTERS
                                       and not USE_I64_A_OFFSETS and 0 <= stride_am and stride_am <= 0x7fffffff
                                       and 0 <= stride_ak and stride_ak <= 0x7fffffff
@@ -743,7 +761,11 @@ def _direct_matmul_kernel_gfx942(
             first_offsets = rows * stride_cm + pid_n * BLOCK_N
             tl.store(c_ptr + first_offsets, first, mask=(rows < M) & (shift == 1) & (pid_n * BLOCK_N < N))
         else:
-            tl.store(c_ptr + c_offsets, acc, mask=mask)
+            # Diagnostic: match the vendor's streaming stores on the large
+            # BF16 output. The same mask and logical elements are written.
+            streaming_bf16: tl.constexpr = (USE_STREAMING_BF16_STORES and (M, N, K) == (819200, 1024, 192)
+                                            and tlx.dtype_of(c_ptr) == tl.bfloat16)
+            tl.store(c_ptr + c_offsets, acc, mask=mask, cache_modifier=".cs" if streaming_bf16 else "")
 
 
 @triton.jit
@@ -940,6 +962,8 @@ def matmul_kernel_gfx942(
     SPLIT_K: tl.constexpr = 1,
     SPLIT_ORDER_CHUNK: tl.constexpr = 1,
     LAUNCH_XCD_CHUNK: tl.constexpr = 0,
+    SPLIT_M_256_64: tl.constexpr = False,
+    USE_STREAMING_BF16_STORES: tl.constexpr = False,
 ):
     """Dispatch one autotune candidate to its selected GEMM implementation."""
     if SPLIT_K > 1:
@@ -1020,6 +1044,8 @@ def matmul_kernel_gfx942(
             USE_N_EDGE_PANELS,
             USE_N_INTERIOR_PANELS,
             USE_PIPELINED_POINTER_LOADS=USE_PIPELINED_POINTER_LOADS,
+            SPLIT_M_256_64=SPLIT_M_256_64,
+            USE_STREAMING_BF16_STORES=USE_STREAMING_BF16_STORES,
         )
 
 
@@ -1172,8 +1198,13 @@ def _smoke_configs():
 SMOKE_CONFIGS = _smoke_configs
 
 
-def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuning=True):
+def _full_space_incumbent_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuning=True):
     """Choose one configuration without runtime autotuning."""
+    # Only the measured MLP algorithm switch selects shared-B row panels with unsplit K.
+    if (M, N, K) == (4662, 2560, 2560):
+        config = _config(160, 256, 64, 4, 8, split_m_128_32=True)
+        config.kwargs["XCD_CHUNK"] = 1
+        return [config]
     # Offline paired cold-cache trials select the K step and output tile
     # within the existing compiler-managed pointer pipeline. Retain the
     # incumbent below for rows whose trials were inconclusive.
@@ -1184,6 +1215,7 @@ def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuni
         (440, 2048, 4096): (64, 64, 128, 8),
         (440, 2048, 2048): (64, 64, 256, 8),
     }
+    # Measured short-M pipeline cases retain their incumbent tile and K step.
     if enable_short_m_tuning and (M, N, K) in short_m_pipeline_configs:
         block_m, block_n, block_k, num_warps = short_m_pipeline_configs[M, N, K]
         config = _config(block_m, block_n, block_k, 8, num_warps)
@@ -1203,35 +1235,46 @@ def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuni
         (440, 2048, 2048): (64, 64, 8),
         (440, 4096, 1093): (64, 64, 4),
     }
+    # Remaining measured short-M cases retain their incumbent output granularity.
     if (M, N, K) in short_m_tiles:
         block_m, block_n, num_warps = short_m_tiles[M, N, K]
         config = _config(block_m, block_n, 64, 8, num_warps)
         config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
         return [config]
+    # The existing guarded deep-K family retains its measured global split-K schedule.
     if enable_global_split_k and _global_split_k_shape(M, N, K):
         # Balance the narrow grids within two waves of the 304-CU device.
         # The wider grid favors fewer partial planes after 38 row tiles.
         row_tiles = triton.cdiv(M, 128)
         split_k = {256: 8, 512: 4, 1280: 3, 2560: 4}[N]
+        # Narrow outputs cap partial planes to keep the grid within two device waves.
         if N in (256, 512):
             split_k = min(split_k, (2 * 304) // (row_tiles * triton.cdiv(N, 128)))
+        # Larger row grids need fewer partial planes for the wide output family.
         elif N == 2560 and row_tiles > 38:
             split_k = 2
         config = _config(128, 128, 128, 16, 4, split_k=split_k)
         # Offline paired trials select the split-work order and B reuse group.
         # These options are confined to the guarded FP16 production family.
         group_m, num_xcds, chunk = 16, 8, 2
+        # The narrowest measured output retains its single-XCD work order.
         if N == 256:
             num_xcds, chunk = 1, 4
+        # The 512-column family chooses B reuse according to row-grid size.
         elif N == 512:
+            # Shorter row grids retain the compact single-XCD reuse group.
             if row_tiles <= 34:
                 group_m, num_xcds, chunk = 4, 1, 1
+            # Larger row grids retain a single-row reuse group.
             elif row_tiles > 38:
                 group_m, num_xcds = 1, 1
+        # The intermediate-width family retains single-XCD scheduling.
         elif N == 1280:
             group_m, num_xcds = 8, 1
+            # Larger intermediate-width grids use smaller reuse groups and chunks.
             if row_tiles > 38:
                 group_m, chunk = 4, 1
+        # Short wide-output grids retain the larger split-order chunk.
         elif row_tiles <= 34:
             chunk = 32
         config.kwargs.update(
@@ -1241,6 +1284,7 @@ def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuni
             enable_sched_group_barrier_scheduler=True,
             sched_group_barrier_mfma_per_dwordx4=2,
         )
+        # Larger 512-column grids retain their measured launch striping override.
         if N == 512 and row_tiles > 34:
             config.kwargs.update(LAUNCH_XCD_CHUNK=8, NUM_XCDS=1, GROUP_M=16,
                                  SPLIT_ORDER_CHUNK=1 if row_tiles <= 35 else 2)
@@ -1259,6 +1303,7 @@ def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuni
         (2048, 2560),
     ):
         config = _config(128, 128, 64, 16, 4)
+        # Only production pairs with conclusive pointer-pipeline trials enable that path.
         if (N, K) not in ((18688, 256), (8192, 1280)):
             config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
         return [config]
@@ -1348,9 +1393,116 @@ def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuni
     return [_config(256, 256, 64, 4, 8)]
 
 
+def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuning=True):
+    """Select one measured configuration while retaining the incumbent fallback."""
+    # The validated MLP1280 algorithm switch shares B across 160 rows and retains unsplit K.
+    if (M, N, K) == (4662, 2560, 1280):
+        config = _config(160, 256, 64, 4, 8, split_m_128_32=True)
+        config.kwargs["XCD_CHUNK"] = 1
+        return [config]
+    # Short aligned reductions select the measured 64-square BK128 kpack2 pointer winner where larger tiles leave regret.
+    if (enable_short_m_tuning and 384 < M <= 1024 and 2048 <= N <= 4096 and 2048 <= K <= 4096 and K % 128 == 0
+            and (N <= 2048 or M <= 512) and (M > 512 or N >= 4096 or K >= 4096)):
+        config = _config(64, 64, 128, 8, 4, kpack=2)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    # Tall shallow reductions are memory limited at 31% of the ceiling and select the paired streaming pointer winner.
+    if M >= 65536 and 512 <= N <= 2048 and K <= 256:
+        config = _config(256, 128, 32, 16, 8)
+        config.kwargs.update(USE_STREAMING_BF16_STORES=True, USE_PIPELINED_POINTER_LOADS=True)
+        return [config]
+    # Compact deep reductions are compute limited at 12% of the ceiling and select the paired BK256 four-wave pointer winner.
+    if 2048 < M <= 4096 and 1024 <= N <= 2048 and K >= 16 * N and K % 256 == 0:
+        config = _config(64, 64, 256, 4, 4)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    # Wide K-dominant row grids select the full-space kpack2 pointer tile against the 25%-of-ceiling compute baseline.
+    if 768 < M <= 1024 and N >= 4096 and K >= 2 * N and K % 64 == 0:
+        config = _config(128, 128, 64, 16, 4, kpack=2)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    # Tall aligned deep reductions select the paired four-wave pointer tile against the 32%-of-ceiling compute baseline.
+    if M >= 16384 and N >= 1024 and K > 256 and K >= 2 * N and K % 32 == 0:
+        config = _config(128, 256, 32, 16, 4)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    return _full_space_incumbent_config(M, N, K, enable_global_split_k=enable_global_split_k,
+                                        enable_short_m_tuning=enable_short_m_tuning)
+
+
 def _candidate_configs(shape, enable_local_split_u=False, enable_global_split_k=False):
     """Return the candidate universe, including a shape-specific incumbent."""
     configs = CONFIGS()
+    if shape in ((4662, 2560, 1280), (4662, 1280, 2560)):
+        # Extend the existing disjoint row-panel algorithms to the two
+        # remaining MLP projections only in the offline search space.
+        # 160x128 or 320x128 produces ~300 CTAs for these output shapes.
+        for bm, bn, flag in ((160, 128, "SPLIT_M_128_32"), (160, 256, "SPLIT_M_128_32"), (320, 128, "SPLIT_M_256_64")):
+            for group in (4, 8):
+                for chunk in (1, 8):
+                    config = _config(bm, bn, 64, group, 8)
+                    config.kwargs.update({flag: True, "XCD_CHUNK": chunk})
+                    configs.append(config)
+
+    if shape in ((902, 2048, 4096), (902, 4096, 7552), (902, 4096, 6656), (902, 4096, 2048), (902, 2048, 2048),
+                 (902, 4096, 1091), (440, 2048, 4096), (440, 4096, 6400), (440, 4096, 2048), (440, 2048,
+                                                                                              2048), (440, 4096, 1093)):
+        # Vendor traces favor MT128x64x128 for short-M FP16. The existing
+        # compiler-pointer path supports these logical tiles and zero-filled
+        # ragged K tails; retain every current buffer/pointer incumbent.
+        for bm, bn, bk in ((128, 64, 128), (128, 128, 64), (64, 64, 128)):
+            for kpack in (1, 2):
+                for xcds in (1, 8):
+                    config = _config(bm, bn, bk, 8, 4, kpack=kpack)
+                    config.kwargs.update(USE_PIPELINED_POINTER_LOADS=True, NUM_XCDS=xcds)
+                    configs.append(config)
+
+    # Diagnostic full-space expansion of the measured compiler-managed load
+    # pipeline to the other BF16 production cases. Keep all buffer incumbents.
+    pointer_trials = {
+        (61440, 2048, 5120): [(128, 256, 32, 16, 4, 2), (128, 256, 32, 16, 4, 3), (128, 256, 64, 16, 4, 2),
+                              (128, 128, 64, 16, 4, 2), (128, 128, 64, 16, 4, 3), (128, 256, 32, 16, 8, 2)],
+        (819200, 1024, 192): [(256, 128, 32, 16, 8, 2), (256, 128, 32, 16, 8, 3), (256, 128, 64, 16, 8, 2)],
+        (4096, 1894, 242432): [(64, 64, 128, 4, 8, 2), (64, 64, 128, 4, 8, 3), (64, 64, 256, 4, 8, 2),
+                               (64, 64, 128, 4, 4, 2), (64, 64, 128, 4, 4, 3), (64, 64, 256, 4, 4, 2)],
+    }
+    for bm, bn, bk, group, warps, stages in pointer_trials.get(shape, []):
+        trial = _config(bm, bn, bk, group, warps, kpack=1)
+        trial.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        trial.num_stages = stages
+        configs.append(trial)
+    if shape == (819200, 1024, 192):
+        # Vendor ATT uses buffer_store_dwordx4 ... nt while the incumbent
+        # uses temporal stores. Isolate the output hint on both load routes.
+        for pointers in (False, True):
+            trial = _config(256, 128, 32, 16, 8)
+            trial.kwargs['USE_STREAMING_BF16_STORES'] = True
+            if pointers:
+                trial.kwargs['USE_PIPELINED_POINTER_LOADS'] = True
+            configs.append(trial)
+    if shape == (1024, 6144, 20480):
+        # Keep the incumbent buffer-load candidate; trial only load staging.
+        config = _config(128, 128, 64, 16, 4, kpack=2)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        configs.append(config)
+    if shape == (4662, 2560, 2560):
+        # Expose the existing shared-B 128+32 row panels in the full search.
+        for group_m in (1, 4, 8):
+            for num_xcds, xcd_chunk in ((1, 1), (8, 1), (8, 4), (8, 8)):
+                config = _config(160, 256, 64, group_m, 8, split_m_128_32=True)
+                config.kwargs.update(NUM_XCDS=num_xcds, XCD_CHUNK=xcd_chunk)
+                configs.append(config)
+        # Test 256+64 rows with the same output area and shared B128 tile.
+        # With one XCD, chunk sizes are equivalent; retain one representative.
+        for group_m in (1, 4, 8):
+            for num_xcds, xcd_chunk in ((1, 1), (8, 1), (8, 4), (8, 8)):
+                config = _config(320, 128, 64, group_m, 8)
+                config.kwargs.update(
+                    NUM_XCDS=num_xcds,
+                    XCD_CHUNK=xcd_chunk,
+                    SPLIT_M_256_64=True,
+                )
+                configs.append(config)
     if shape == (262144, 1195, 2373):
         # Append the two-panel decomposition without removing incumbents.
         configs.append(
@@ -1457,7 +1609,7 @@ def _candidate_configs(shape, enable_local_split_u=False, enable_global_split_k=
         # split factors for the new decomposition.
         configs.extend(
             _config(128, 128, block_k, 16, 4, split_k=split) for block_k in (64, 128) for split in (2, 3, 4, 6, 8))
-    incumbent = heuristic_config(*shape, enable_global_split_k=enable_global_split_k)[0]
+    incumbent = _full_space_incumbent_config(*shape, enable_global_split_k=enable_global_split_k)[0]
     incumbent_key = (incumbent.kwargs, incumbent.num_warps, incumbent.num_stages)
     if not any((config.kwargs, config.num_warps, config.num_stages) == incumbent_key for config in configs):
         configs.append(incumbent)
@@ -1824,6 +1976,11 @@ def torchtlx_heuristic_config(M, N, K, *, dtype, out_dtype, a_strides, b_strides
     """Share the fixed shape policy with Inductor, preserving scaled epilogues."""
     enable = (dtype == torch.float16 and out_dtype == torch.float16 and a_strides == (K, 1) and b_strides == (1, K)
               and alpha == 1 and beta == 1)
+    if (enable and (M, N, K) == (4662, 2560, 2560)
+            and os.environ.get("TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE", "0").lower() in ("1", "auto", "force")):
+        # Shared-B row panels reduce the measured addmm -> LayerNorm latency
+        # from about 173 us to 160 us with unsplit K and FP16 rounding intact.
+        return [_template_config((320, 128, 64, 4, 8), NUM_XCDS=1, XCD_CHUNK=1, SPLIT_M_256_64=True)]
     if enable and 4178 <= M <= 4942 and (N, K) in _TORCHTLX_PROD_TILES:
         # The register-only template favors different tiles than the tlx.ops
         # buffer-load path on these production rows.

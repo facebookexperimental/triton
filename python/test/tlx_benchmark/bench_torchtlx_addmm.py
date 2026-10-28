@@ -1,4 +1,4 @@
-"""Perf guardrail for TorchTLX ``addmm`` on gfx950."""
+"""Perf guardrail for TorchTLX ``addmm`` on gfx942 and gfx950."""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ import sys
 import torch
 
 try:
-    from triton.tlx.ops.kernels.addmm import gfx950_torch
+    from triton.tlx.ops.kernels.addmm import gfx942_torch, gfx950_torch
     from triton.tlx.ops.kernels.addmm._shapes import FOCUS as SHAPE_SUITES
     from triton.tlx.ops.kernels.addmm._shapes import SYNTHETIC, flops, inputs, label
 except ImportError:  # not the fbtriton fork
-    gfx950_torch = None
+    gfx942_torch = gfx950_torch = None
     SHAPE_SUITES = None
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -31,7 +31,7 @@ REL_PRECISION = {"float16": 2e-2, "bfloat16": 2e-2}
 def shapes(synthetic: bool = False, suites=None) -> list:
     if gfx950_torch is None:
         return []
-    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes("gfx950", suites))
+    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
 
 
 def cases(synthetic: bool = False, suites=None) -> list[Case]:
@@ -46,8 +46,9 @@ def prepare(case: Case, space: str) -> Prepared:
     dtype = getattr(torch, case.dtype)
     bias, a, b = inputs([m, n, k, a_strides, b_strides, bias_strides, case.dtype], dtype)
 
-    tlx_fn = lambda: gfx950_torch.addmm(bias, a, b, mode="force")  # noqa: E731
-    ref_fn = lambda: gfx950_torch.ref(bias, a, b)  # noqa: E731
+    provider = {"gfx942": gfx942_torch, "gfx950": gfx950_torch}[case.arch]
+    tlx_fn = lambda: provider.addmm(bias, a, b, mode="force")  # noqa: E731
+    ref_fn = lambda: provider.ref(bias, a, b)  # noqa: E731
     return Prepared(
         tlx_fn=tlx_fn,
         ref_fn=ref_fn,
