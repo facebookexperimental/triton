@@ -36,6 +36,21 @@ from triton.runtime.jit import MockTensor
 import triton.language as tl
 from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 
+
+@filecheck_test
+@gluon.jit
+def test_atomic_poll_tensor():
+    # CHECK-LABEL: test_atomic_poll_tensor
+    layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
+    offsets = ttgl.arange(0, 128, layout=layout)
+    ptrs = offsets.to(ttgl.int64).to(ttgl.pointer_type(ttgl.int32), bitcast=True)
+    # CHECK: tt.atomic_poll acquire, gpu, {{.*}} : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked> -> tensor<128xi1, #blocked>
+    result = ttgl.atomic_poll(ptrs, 1)
+    ttgl.static_assert(result.type.layout == layout)
+    # CHECK: tt.atomic_poll acquire, gpu, {{.*}} timeout {{.*}} : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked> -> tensor<128xi1, #blocked>
+    ttgl.atomic_poll(ptrs, offsets, timeout_ns=0)
+
+
 TARGET_PAT = re.compile('ttg.target = "[^"]*"')
 # HIP backend can add this attribute to function parameters
 PTRRANGE_PAT = re.compile("(, )?tt.pointer_range = 32 : i32")
@@ -285,6 +300,34 @@ def test_nvmma_layout_rank_mangling():
     assert len(set(specializations)) == 2
     assert "!ttg.memdesc<16x16xf16" in module_text
     assert "!ttg.memdesc<2x16x16xf16" in module_text
+
+
+@gluon.jit
+def anchor_tmem_linear_layout(ll: ttgl.constexpr):
+    # Side-effecting body keeps both specializations alive in the parsed
+    # module (an empty body gets eliminated); cf. allocate_with_nvmma_layout.
+    ttgl.barrier()
+
+
+@gluon.jit
+def tmem_linear_layout_kernel():
+    layout_a: ttgl.constexpr = ttgl.to_linear_layout(TensorMemoryLayout(block=(128, 128), col_stride=1), (128, 128))
+    layout_b: ttgl.constexpr = ttgl.to_linear_layout(TensorMemoryLayout(block=(64, 64), col_stride=1), (128, 128))
+    anchor_tmem_linear_layout(layout_a)
+    anchor_tmem_linear_layout(layout_b)
+
+
+def test_tmem_linear_layout_mangling():
+    # Layouts with the same shape but different bases must get distinct
+    # specializations of the nested function. The mangled names contain
+    # non-identifier characters, so the symbols are printed quoted.
+    module = run_parser(tmem_linear_layout_kernel, target=BLACKWELL_TARGET)
+    module_text = module.str_nodebug()
+
+    specializations = re.findall(
+        r'tt\.func private @"([^"]*test_frontend\.anchor_tmem_linear_layout[^"]*)"', module_text)
+    assert len(specializations) == 2
+    assert len(set(specializations)) == 2
 
 
 @filecheck_test
@@ -1855,6 +1898,64 @@ def test_mlir_attr_error():
         run_parser(kernel)
 
     assert "order must be a permutation of 0..(rank-1), but was [1]" in str(e.value.__cause__)
+
+
+@gluon.jit
+def _npot_layout_kernel(M: ttgl.constexpr, N: ttgl.constexpr, layout: ttgl.constexpr):
+    src: ttgl.constexpr = ttgl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0])
+    ttgl.convert_layout(ttgl.full([M, N], 0, ttgl.float16, src), layout)
+
+
+_MMA_V2_16X8 = ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1], instr_shape=[16, 8])
+
+
+@pytest.mark.parametrize("M, N, layout, message", [
+    (64, 64, ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1], instr_shape=[16, 24]),
+     "NVIDIA MMA instrShape with an NPOT M or N is not yet supported, got instrShape = [16, 24]"),
+    (64, 64, ttgl.DotOperandLayout(operand_index=0, parent=_MMA_V2_16X8, k_width=3),
+     "ttg.dot_op NPOT kWidth parameter is not yet supported for Ampere or Hopper MMA parent, got: 3"),
+    (4, 64,
+     ttgl.DistributedLinearLayout(reg_bases=[[1, 0], [2, 0]], lane_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+                                  warp_bases=[[0, 32], [0, 0]], block_bases=[], shape=[3, 64]),
+     "Invalid out-dim size 3 for out-dim 'dim0'.  Out-dim sizes must be powers of 2."),
+], ids=["mma_instr_n24", "dot_op_kwidth3", "linear_shape3"])
+def test_npot_layout_rejected_without_flag(M, N, layout, message, monkeypatch):
+    monkeypatch.delenv("TRITON_ALLOW_NPOT", raising=False)
+    with pytest.raises(CompilationError) as e:
+        run_parser(_npot_layout_kernel, *make_args(M, N, layout), target=HOPPER_TARGET)
+    assert message in str(e.value.__cause__)
+
+
+def test_npot_to_linear_layout_rejected_without_flag(monkeypatch):
+    monkeypatch.delenv("TRITON_ALLOW_NPOT", raising=False)
+
+    @gluon.jit
+    def kernel():
+        layout: ttgl.constexpr = ttgl.to_linear_layout(ttgl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0]), [3, 64])
+        ttgl.static_print(layout)
+
+    with pytest.raises(CompilationError) as e:
+        run_parser(kernel, target=HOPPER_TARGET)
+    assert "Invalid out-dim size 3 for out-dim 'dim0'.  Out-dim sizes must be powers of 2." in str(e.value.__cause__)
+
+
+@gluon.jit
+def _npot_smem_kernel(shape: ttgl.constexpr):
+    layout: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    ttgl.allocate_shared_memory(ttgl.int32, shape, layout)
+
+
+@pytest.mark.parametrize("flag", [None, "1"], ids=["unset", "flag1"])
+def test_npot_shared_memdesc_leading_dim_accepted(flag, monkeypatch):
+    if flag is None:
+        monkeypatch.delenv("TRITON_ALLOW_NPOT", raising=False)
+    else:
+        monkeypatch.setenv("TRITON_ALLOW_NPOT", flag)
+    # Like upstream, only a shared buffer's first dim may be NPOT.
+    run_parser(_npot_smem_kernel, *make_args((96, 64)), target=HOPPER_TARGET)
+    with pytest.raises(CompilationError) as e:
+        run_parser(_npot_smem_kernel, *make_args((64, 96)), target=HOPPER_TARGET)
+    assert "shape must have power-of-2 and non-zero dimensions; got 64, 96" in str(e.value.__cause__)
 
 
 def test_tensor_layout_type_changed():

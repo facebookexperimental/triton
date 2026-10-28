@@ -27,7 +27,6 @@ import argparse
 import contextlib
 import dataclasses
 import functools
-import os
 from typing import Any, Callable, Iterable, Optional
 
 from . import report as report_mod
@@ -301,6 +300,19 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     return result
 
 
+def _gpu_usable() -> bool:
+    """Whether this process's GPU context still works. A sticky device error, such
+    as an illegal memory access, breaks it for good: every later GPU call fails
+    with the same error."""
+    import torch
+
+    try:
+        torch.ones(1, device="cuda").sum().item()
+        return True
+    except torch.AcceleratorError:
+        return False
+
+
 def _errored(case: Case, exc: Exception) -> Result:
     result = Result(case=case, status=Status.ERROR)
     result.notes.append(f"{type(exc).__name__}: {exc}")
@@ -372,7 +384,7 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
     results = []
     sampled = set()
     with stable(device_index()) as info:
-        for case in cases:
+        for i, case in enumerate(cases):
             cold = cold_mode == "all" or (cold_mode == "first" and case.direction not in sampled)
             if cold:
                 sampled.add(case.direction)
@@ -380,6 +392,11 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
                 results.append(run_case(bench, case, space=space, cold=cold, latency_mode=latency_mode))
             except Exception as exc:  # a broken case must not hide the others
                 results.append(_errored(case, exc))
+                if not _gpu_usable():
+                    # Every later case would fail with this case's error; report it once.
+                    results[-1].notes.append(
+                        f"{len(cases) - i - 1} later cases not run: this case broke the GPU context")
+                    break
     # The autotune space is part of what a number means: a heuristic-space
     # latency and a full-space latency for the same shape differ by 4x, so two
     # artifacts are only comparable when this matches. Same for the reference --
@@ -456,7 +473,8 @@ def main(bench, argv=None) -> int:
     # op dispatch independently derives the architecture from its input device.
     select(device)
     if device is not None:
-        os.environ[device.visibility_env] = str(device.index)
+        if not device.pin():
+            print(f"device: gpu{device.index} has no known UUID; not pinning it")
         print(f"device: gpu{device.index} {device.name} "
               f"({'least used' if args.device == 'auto' else 'requested'}, "
               f"{device.memory_used_mib:.0f} MiB in use)")

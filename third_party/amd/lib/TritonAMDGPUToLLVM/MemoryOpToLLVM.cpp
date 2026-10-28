@@ -1962,7 +1962,10 @@ public:
           Value current = updatedFragments[accumulatorIndex];
           Value operandA = (*maybeA)[m * numRepK + k];
           Value operandB = (*maybeB)[n * numRepK + k];
-          if (isPersistent) {
+          // "unconstrained" leaves persistent operand classes to LLVM. An
+          // operand pin consumes its input, so a pin on a freshly loaded LDS
+          // operand forces the load wait at the pin rather than at the MFMA.
+          if (isPersistent && op.getResidentOperand() != "unconstrained") {
             LLVM::InlineAsmOp pinA, pinB;
             FailureOr<Value> constrainedA = constrainMfmaFragmentRegisterClass(
                 operandA, aStorage, rewriter, loc, /*hasSideEffects=*/false,

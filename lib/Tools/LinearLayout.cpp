@@ -9,6 +9,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/ModularArithmetic.h"
 #include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetOperations.h"
 #include "llvm/ADT/StringRef.h"
@@ -227,6 +228,11 @@ LinearLayout::checkInvariants(bool requireSurjective) {
   // NPOT dims allow bases >= size (modular reduction via ADD+UREM).
   SmallVector<StringAttr> outDimNames = llvm::to_vector(getOutDimNames());
   for (const auto &[outDim, size] : outDims) {
+    if (!llvm::isPowerOf2_32(size) &&
+        !mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT")) {
+      return "Invalid out-dim size " + std::to_string(size) + " for out-dim '" +
+             outDim.str() + "'.  Out-dim sizes must be powers of 2.\n";
+    }
     if (size <= 0) {
       return "Invalid out-dim size " + std::to_string(size) + " for out-dim '" +
              outDim.str() + "'.  Out-dim sizes must be positive.\n";

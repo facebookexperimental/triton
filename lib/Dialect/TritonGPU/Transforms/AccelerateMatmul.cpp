@@ -21,6 +21,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
@@ -1134,6 +1135,31 @@ static void decomposeMixedModeDotOp(ModuleOp mod, int computeCapability) {
   });
 }
 
+// Under TRITON_ALLOW_NPOT, no NVIDIA lowering has a plan for a tt.dot whose
+// result M or N is not a power of two (MMAv3 asserts or aborts later; MMAv5,
+// MMAv2 and FMA fail to legalize it), so reject it by name before any rewrite.
+constexpr llvm::StringLiteral kNpotNvidiaDotResultExtent =
+    "NPOT NVIDIA dot: no MMA or FMA lowering admits a result M or N extent "
+    "that is not a power of two";
+
+static bool rejectNpotNvidiaDotResults(ModuleOp m) {
+  if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+    return false;
+  bool rejected = false;
+  m.walk([&](DotOp op) {
+    RankedTensorType retType = op.getType();
+    if (!retType.getEncoding() ||
+        isa<NvidiaMmaEncodingAttr>(retType.getEncoding()))
+      return;
+    if (llvm::all_of(retType.getShape().take_back(2),
+                     [](int64_t d) { return llvm::isPowerOf2_64(d); }))
+      return;
+    op->emitError(kNpotNvidiaDotResultExtent);
+    rejected = true;
+  });
+  return rejected;
+}
+
 // Transpose scaled_dot ops that have a scale on lhs.
 static void transposeDotOp(DotScaledOp dotOp) {
   // two_ctas means the CTA pair splits M, so it cannot be carried across a
@@ -1155,7 +1181,9 @@ static void transposeDotOp(DotScaledOp dotOp) {
   Value result = DotScaledOp::create(
       builder, dotOp.getLoc(), cTransposed.getType(), rhsTransposed,
       lhsTransposed, cTransposed, dotOp.getBScale(), dotOp.getAScale(),
-      dotOp.getBElemType(), dotOp.getAElemType(), dotOp.getFastMath());
+      dotOp.getBElemType(), dotOp.getAElemType(), dotOp.getFastMath(),
+      /*lhs_k_pack=*/dotOp.getRhsKPack(),
+      /*rhs_k_pack=*/dotOp.getLhsKPack());
   Operation *transposedResult =
       TransOp::create(builder, result.getLoc(), result, transOrder);
   dotOp.replaceAllUsesWith(transposedResult);
@@ -1175,6 +1203,30 @@ static void transposeDots(ModuleOp m) {
   }
 }
 
+// On sm_12x, ScaledBlockedToMMA has no plan for an NPOT operand or scale under
+// TRITON_ALLOW_NPOT: its scale layout asserts or fails to verify, and release
+// builds lower the dot silently. Reject such dots before any IR change.
+static bool rejectNpotScaledDecompositions(ModuleOp m, int computeCapability) {
+  if (computeCapability / 10 != 12 ||
+      !triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+    return false;
+  auto isNpot = [](Value v) {
+    return v && llvm::any_of(cast<RankedTensorType>(v.getType()).getShape(),
+                             [](int64_t d) { return !llvm::isPowerOf2_64(d); });
+  };
+  bool rejected = false;
+  m.walk([&](DotScaledOp op) {
+    if (!op.getAScale() || !op.getBScale() ||
+        llvm::none_of(op->getOperands(), isNpot) ||
+        isa_and_nonnull<MmaEncodingTrait>(op.getType().getEncoding()))
+      return;
+    op->emitError("NPOT dot_scaled: decomposing a scaled operand or scale with "
+                  "a non-power-of-two extent is unsupported");
+    rejected = true;
+  });
+  return rejected;
+}
+
 #define GEN_PASS_DEF_TRITONGPUACCELERATEMATMUL
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
@@ -1188,11 +1240,16 @@ public:
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
+    if (rejectNpotNvidiaDotResults(m))
+      return signalPassFailure();
 
     auto computeCapability = getNVIDIAComputeCapability(m);
     // We could do this generically if we manage to improve the heuristics
     // reverted in these two PRs https://github.com/triton-lang/triton/pull/5834
     // https://github.com/triton-lang/triton/pull/5837
+    // Named NPOT rejects must precede transposeDots, which rewrites the IR.
+    if (rejectNpotScaledDecompositions(m, computeCapability))
+      return signalPassFailure();
     transposeDots(m);
 
     mlir::RewritePatternSet patterns(context);

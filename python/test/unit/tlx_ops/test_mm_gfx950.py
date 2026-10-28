@@ -7,9 +7,11 @@ import torch
 import triton
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx import ops as tlx_ops
-from triton.tlx.ops import InvalidInput, UnsupportedOp
+from triton.tlx.ops import BitwiseInvarianceSpec, InvalidInput, UnsupportedOp
 from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
 from triton.tlx.ops.kernels.mm import gfx950 as _gfx950
+
+from mm_test_utils import run_mm_invariance_case
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
@@ -434,8 +436,8 @@ def test_mm_wave_grid_compiled_cache_rejects_changed_globals(monkeypatch):
 
 @pytest.mark.parametrize("space", ["heuristic", "full"])
 @pytest.mark.parametrize("n", [240, 256])
-def test_mm_narrow_direct_range_is_batch_invariant(n, space):
-    m, k = 25601, 1280
+@pytest.mark.parametrize("m,k", [(25601, 1280), (30721, 1536)])
+def test_mm_narrow_direct_range_is_batch_invariant(m, k, n, space):
     torch.manual_seed(71)
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((k, n), device="cuda", dtype=a.dtype)
@@ -445,7 +447,9 @@ def test_mm_narrow_direct_range_is_batch_invariant(n, space):
     full = torch.full((m, n), float("nan"), device=a.device, dtype=a.dtype)
     assert tlx_ops.mm(a, b, out=full, space=space) is full
     _assert_range_result(full, a @ b)
-    for prefix_m in (1, 159, 160, 161, 20320, 20321, m - 1):
+    for prefix_m in (1, 159, 160, 161, 20320, 20321, 30560, 30561, m - 1):
+        if prefix_m >= m:
+            continue
         prefix = torch.full((prefix_m, n), float("nan"), device=a.device, dtype=a.dtype)
         assert tlx_ops.mm(a[:prefix_m], b, out=prefix, space=space) is prefix
         assert torch.equal(prefix.view(torch.int16), full[:prefix_m].view(torch.int16)), prefix_m
@@ -475,7 +479,7 @@ def test_mm_narrow_direct_range_boundaries():
         assert is_narrow_direct == direct, (m, n, k, a_padding, b_padding, dtype)
 
 
-@pytest.mark.parametrize("warps_n,direct_chunk", [(2, 64), (4, 128)])
+@pytest.mark.parametrize("warps_n,direct_chunk", [(2, 64), (4, 64), (4, 128)])
 def test_mm_direct_a_tail_preserves_four_and_eight_wave_loads(warps_n, direct_chunk):
     m, n, k = 319, 248, 256
     torch.manual_seed(73)
@@ -939,7 +943,7 @@ def test_mm_caches_public_catalog_lookup(monkeypatch):
         calls += 1
         assert op == "mm"
         assert device == a.device
-        return (lambda _a, _b, *, out, space: out), spec
+        return (lambda _a, _b, *, out, space, invariance=None: out), spec
 
     monkeypatch.setattr(tlx_ops, "impl_for", counting_impl_for)
     tlx_ops._mm_impl_for_device.cache_clear()
@@ -1954,3 +1958,341 @@ def test_mm_matches_aten_for_cancellation(n, k, pattern_period, segment_k):
     actual = matmul(a, b)
     expected = torch.matmul(a, b)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+_INVARIANCE_SPECS = [
+    BitwiseInvarianceSpec.dims("M"),
+    BitwiseInvarianceSpec.dims("K"),
+    BitwiseInvarianceSpec.all(),
+]
+
+_INVARIANCE_SHAPES = [
+    (64, 1920, 1536, (1536, 1), (1920, 1), "bf16"),
+    (2048, 1024, 1000, (1000, 1), (1024, 1), "bf16"),
+    (512, 512, 48, (48, 1), (512, 1), "bf16"),
+    (7, 8192, 2048, (2048, 1), (8192, 1), "fp16"),
+    # TN persistent specialization: full-M run uses the persistent kernel.
+    (1024, 6144, 4096, (4096, 1), (1, 4096), "fp16"),
+    # Unaligned K keeps a sequential range fallback instead of raising.
+    (2048, 512, 1001, (1001, 1), (1, 1001), "bf16"),
+]
+
+
+@pytest.mark.parametrize("spec", _INVARIANCE_SPECS)
+@pytest.mark.parametrize("m,n,k,a_strides,b_strides,dtype_name", _INVARIANCE_SHAPES)
+def test_mm_invariance(spec, m, n, k, a_strides, b_strides, dtype_name):
+    """A non-empty spec gives exact M-slice equality (public `tlx.ops.mm`)."""
+    run_mm_invariance_case("gfx950", m, n, k, a_strides, b_strides, dtype_name, spec)
+
+
+def _assert_sequential_dispatch(dispatch, fixed=1):
+    """Reject every K-splitting plan a fixed schedule must prune."""
+    assert dispatch is not None
+    path, plan = dispatch
+    assert path not in ("local_split_u", "streamk", "ragged_n", "m192n256")
+    if path == "lds":
+        assert plan[2] == fixed
+    if path == "inter_wave":
+        assert plan is not None and plan["SPLIT_K"] == fixed
+    if path == "wave_grid":
+        assert _gfx950._wave_grid_is_sequential(plan, fixed)
+
+
+def test_heuristic_prunes_split_k():
+    """A fixed schedule prunes K-splitting plans from the dispatch (no launch)."""
+    invariance = BitwiseInvarianceSpec.dims("K")
+    # (7, 8192, 2048) fp16 selects a LocalSplitU plan by default.
+    default = _gfx950._dispatch_plan(7, 8192, 2048, torch.float16, 2)
+    assert default[0] == "local_split_u"
+    pruned = _gfx950._dispatch_plan(7, 8192, 2048, torch.float16, 2, invariance=invariance)
+    _assert_sequential_dispatch(pruned)
+    # (677, 4096, 8192) bf16 selects a split-K LDS plan by default.
+    default = _gfx950._dispatch_plan(677, 4096, 8192, torch.bfloat16, 2)
+    assert default == ("lds", (192, 256, 4))
+    pruned = _gfx950._dispatch_plan(677, 4096, 8192, torch.bfloat16, 2, invariance=invariance)
+    _assert_sequential_dispatch(pruned)
+    # Persistent shapes stay eligible: the kernel reduces K sequentially
+    # within one program per output tile.
+    pruned = _gfx950._dispatch_plan(1024, 6144, 4096, torch.float16, 2, invariance=invariance)
+    assert pruned == ("persistent", "mt224x128_k4096")
+
+
+def test_heuristic_unaligned_k_keeps_sequential_fallback():
+    """Unaligned K keeps a sequential range fallback under the spec (no launch)."""
+    strides_a, strides_b = (1001, 1), (1, 1001)
+    default = _gfx950.heuristic_config(2048, 512, 1001, torch.bfloat16, 2, strides_a, strides_b)
+    assert default[0] == "range_register"
+    pruned = _gfx950.heuristic_config(2048, 512, 1001, torch.bfloat16, 2, strides_a, strides_b,
+                                      invariance=BitwiseInvarianceSpec.dims("M"))
+    assert pruned == default
+
+
+def test_heuristic_split_k_inter_wave_promotion_stays_sequential(monkeypatch):
+    """A split-K inter-wave promotion stays sequential under the spec (no launch)."""
+    shape = (2048, 25408, 10240)
+    monkeypatch.setitem(_gfx950._BF16_INTER_WAVE_PROMOTIONS, shape, {"TILE": (256, 256), "SPLIT_K": 4})
+    _gfx950._dispatch_plan.cache_clear()
+    try:
+        pruned = _gfx950._dispatch_plan(*shape, torch.bfloat16, 2, invariance=BitwiseInvarianceSpec.dims("K"))
+    finally:
+        _gfx950._dispatch_plan.cache_clear()
+    _assert_sequential_dispatch(pruned)
+
+
+def test_full_space_fixed_takes_sequential_register(monkeypatch):
+    """`space="full"` under a fixed schedule launches the register path (no launch)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    a = SimpleNamespace(is_cuda=True, shape=(64, 128), dtype=torch.bfloat16, device="cuda:0")
+    a.stride = lambda: (128, 1)
+    b = SimpleNamespace(shape=(128, 64), dtype=torch.bfloat16, device="cuda:0")
+    b.stride = lambda: (64, 1)
+    # `mm` validates `out` is a `torch.Tensor` before the mocked launch;
+    # use a tensor-spec mock so this GPU-free test passes validation.
+    out = MagicMock(spec=torch.Tensor)
+    out.shape = (64, 64)
+    out.dtype = torch.bfloat16
+    out.device = "cuda:0"
+    sentinel = object()
+    monkeypatch.setattr(_gfx950, "_launch_register", lambda x, y, out=None: sentinel)
+    monkeypatch.setattr(
+        _gfx950, "_launch_range_autotuned", lambda *args:
+        (_ for _ in ()).throw(AssertionError("full+fixed must not autotune range candidates")))
+    assert _gfx950.mm(a, b, out=out, space="full", invariance=BitwiseInvarianceSpec.dims("K")) is sentinel
+
+
+def test_mm_invariance_full_space():
+    """End-to-end M-slice equality through `Space("full", ...)` (public `tlx.ops.mm`)."""
+    from triton.tlx.ops import Space, mm as tlx_mm
+
+    spec = BitwiseInvarianceSpec.dims("M")
+    space = Space("full", invariance=spec)
+    a = operand(64, 1536, (1536, 1), torch.bfloat16)
+    b = operand(1536, 1920, (1920, 1), torch.bfloat16)
+    full = tlx_mm(a, b, space=space)
+    rerun = tlx_mm(a[:32], b, space=space)
+    assert torch.equal(full[:32], rerun)
+    ref = torch.matmul(a, b)
+    torch.testing.assert_close(full, ref, atol=8e-3 * ref.abs().max().item(), rtol=8e-3)
+    torch.cuda.empty_cache()
+
+
+def _dyadic_gemm_operands(m, n, k, dtype, transposed_b):
+    torch.manual_seed(97)
+    a = torch.randint(-2, 3, (m, k), device="cuda", dtype=torch.int16).to(dtype) * 0.125
+    shape = (n, k) if transposed_b else (k, n)
+    b = torch.randint(-2, 3, shape, device="cuda", dtype=torch.int16).to(dtype) * 0.125
+    return a, b.T if transposed_b else b
+
+
+@pytest.mark.parametrize("m,n,k", [
+    (511, 2048, 4096),
+    (677, 2048, 4096),
+    (704, 2048, 4096),
+    (896, 1536, 3072),
+    (1023, 2048, 4096),
+    (677, 2048, 4224),
+    (677, 2049, 4352),
+    (2048, 3840, 2048),
+    (2048, 4096, 960),
+    (2048, 4096, 1024),
+    (2048, 4096, 4096),
+    (2048, 4096, 4160),
+    (3072, 5120, 2048),
+    (3073, 5120, 2112),
+    (2032, 2048, 7072),
+])
+def test_mm_tn_boundaries_preserve_values_and_prefix(m, n, k):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, True)
+    actual = tlx_ops.mm(a, b, space="heuristic")
+    torch.testing.assert_close(actual, a @ b, rtol=0, atol=0)
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), actual[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("m,n,k", [(677, 2048, 4096), (3072, 5120, 2048), (2032, 2048, 7072)])
+@pytest.mark.parametrize("step,padding,offset", [(1, 0, 0), (2, 0, 0), (1, 1, 1), (1, 350000, 0)])
+def test_mm_tn_preserves_output_storage_and_rebinding(m, n, k, step, padding, offset):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, True)
+    expected = a @ b
+    row_stride = n * step + padding
+    for space in ("heuristic", "full"):
+        storage = torch.full((offset + m * row_stride + 8, ), float("nan"), device="cuda", dtype=a.dtype)
+        out = torch.as_strided(storage, (m, n), (row_stride, step), storage_offset=offset)
+        assert tlx_ops.mm(a, b, out=out, space=space) is out
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        body = storage[offset:offset + m * row_stride].view(m, row_stride)
+        if step == 2:
+            assert body[:, 1:n * step:2].isnan().all()
+        if padding:
+            assert body[:, n * step:].isnan().all()
+        assert storage[:offset].isnan().all() and storage[-8:].isnan().all()
+        rebound = torch.full((m, n), float("nan"), device="cuda", dtype=a.dtype)
+        assert tlx_ops.mm(a, b, out=rebound, space=space) is rebound
+        torch.testing.assert_close(rebound, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("a_padding,b_padding", [
+    (0, 32),
+    (8, 8),
+    (16, 16),
+    (24, 56),
+    (32, 64),
+    (64, 96),
+    (128, 160),
+])
+def test_mm_tn_long_k_padding_and_prefix(a_padding, b_padding):
+    m, n, k = 2032, 2048, 7072
+    values_a, values_b = _dyadic_gemm_operands(m, n, k, torch.float16, True)
+    a = torch.empty_strided((m, k), (k + a_padding, 1), dtype=values_a.dtype, device="cuda")
+    b = torch.empty_strided((k, n), (1, k + b_padding), dtype=values_b.dtype, device="cuda")
+    a.copy_(values_a)
+    b.copy_(values_b)
+    expected = a @ b
+    row_stride = n + 600000
+    storage = torch.full((m * row_stride + 8, ), float("nan"), device="cuda", dtype=a.dtype)
+    out = torch.as_strided(storage, (m, n), (row_stride, 1))
+    assert tlx_ops.mm(a, b, out=out, space="heuristic") is out
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert storage[:m * row_stride].view(m, row_stride)[:, n:].isnan().all()
+    assert storage[-8:].isnan().all()
+    rebound = torch.full((m, n), float("nan"), device="cuda", dtype=a.dtype)
+    assert tlx_ops.mm(a, b, out=rebound, space="heuristic") is rebound
+    torch.testing.assert_close(rebound, expected, rtol=0, atol=0)
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), out[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("k,a_padding,b_padding", [(196864, 64, 96), (242432, 0, 0), (242944, 32, 64)])
+def test_mm_bf16_long_k_preserves_output_storage_and_prefix(k, a_padding, b_padding):
+    m, n = 4096, 1894
+    values_a, values_b = _dyadic_gemm_operands(m, n, k, torch.bfloat16, True)
+    a = torch.empty_strided((m, k), (k + a_padding, 1), dtype=values_a.dtype, device="cuda")
+    b = torch.empty_strided((k, n), (1, k + b_padding), dtype=values_b.dtype, device="cuda")
+    a.copy_(values_a)
+    b.copy_(values_b)
+    del values_a, values_b
+    expected = a @ b
+    actual = tlx_ops.mm(a, b, space="heuristic")
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for step in (1, 2):
+        storage = torch.full((m, n * step + 16), float("nan"), device="cuda", dtype=a.dtype)
+        out = storage[:, 8:8 + n * step:step]
+        assert tlx_ops.mm(a, b, out=out, space="heuristic") is out
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        assert storage[:, :8].isnan().all()
+        assert storage[:, 8 + n * step:].isnan().all()
+        if step == 2:
+            assert storage[:, 9:8 + n * step:step].isnan().all()
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), actual[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("dtype_name,m,n,k", [
+    ("bf16", 524288, 512, 192),
+    ("fp16", 262144, 256, 256),
+])
+@pytest.mark.parametrize("step,padding,offset", [(1, 0, 0), (2, 0, 0), (1, 1, 1), (1, 4096, 0)])
+def test_mm_cached_b_preserves_output_storage_and_prefix(dtype_name, m, n, k, step, padding, offset):
+    dtype = torch.bfloat16 if dtype_name == "bf16" else torch.float16
+    a, b = _dyadic_gemm_operands(m, n, k, dtype, dtype_name == "bf16")
+    row_stride = n * step + padding
+    storage = torch.full((offset + m * row_stride + 8, ), float("nan"), device="cuda", dtype=dtype)
+    out = torch.as_strided(storage, (m, n), (row_stride, step), storage_offset=offset)
+    assert tlx_ops.mm(a, b, out=out, space="heuristic") is out
+    torch.testing.assert_close(out, a @ b, rtol=0, atol=0)
+    body = storage[offset:offset + m * row_stride].view(m, row_stride)
+    if step == 2:
+        assert body[:, 1:n * step:2].isnan().all()
+    if padding:
+        assert body[:, n * step:].isnan().all()
+    assert storage[:offset].isnan().all() and storage[-8:].isnan().all()
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), out[:16].view(torch.int16))
+
+
+def test_mm_cached_b_rejects_i32_offset_overflow():
+    m, n, k = 524288, 512, 192
+    dense = _gfx950._optimized_geometry_config(m, n, k, torch.bfloat16, 2, (k, 1), (n, 1))
+    assert dense is not None and dense[0] == "cached_b_lds"
+    b_strides = (2**26, 1)
+    assert _gfx950._optimized_geometry_config(m, n, k, torch.bfloat16, 2, (k, 1), b_strides) is None
+    assert _gfx950.heuristic_config(m, n, k, torch.bfloat16, 2, (k, 1), b_strides)[0] == "register"
+
+
+@pytest.mark.parametrize("m,n,k", [
+    (32768, 4096, 1536),
+    (32768, 4352, 1664),
+    (32769, 4352, 1664),
+    (32832, 5120, 1792),
+    (61632, 5120, 2176),
+])
+def test_mm_grouped_xcd_covers_partial_grid(m, n, k):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, False)
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=a.dtype)
+    assert tlx_ops.mm(a, b, out=out, space="heuristic") is out
+    torch.testing.assert_close(out, a @ b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m,n,k", [(33024, 5120, 1792), (819200, 192, 1024)])
+@pytest.mark.parametrize("step,padding,offset", [(1, 0, 0), (2, 0, 0), (1, 1, 1), (1, 35000, 0)])
+def test_mm_row_major_output_storage_and_prefix(m, n, k, step, padding, offset):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, False)
+    expected = a @ b
+    row_stride = n * step + padding
+    for space in ("heuristic", "full"):
+        storage = torch.full((offset + m * row_stride + 8, ), float("nan"), device="cuda", dtype=a.dtype)
+        out = torch.as_strided(storage, (m, n), (row_stride, step), storage_offset=offset)
+        assert tlx_ops.mm(a, b, out=out, space=space) is out
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        body = storage[offset:offset + m * row_stride].view(m, row_stride)
+        if step == 2:
+            assert body[:, 1:n * step:2].isnan().all()
+        if padding:
+            assert body[:, n * step:].isnan().all()
+        assert storage[:offset].isnan().all() and storage[-8:].isnan().all()
+        rebound = torch.full((m, n), float("nan"), device="cuda", dtype=a.dtype)
+        assert tlx_ops.mm(a, b, out=rebound, space=space) is rebound
+        torch.testing.assert_close(rebound, expected, rtol=0, atol=0)
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), out[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("m,n,k", [(33024, 5120, 1792), (819200, 192, 1024)])
+@pytest.mark.parametrize("a_padding,b_padding", [(8, 16), (16, 0), (24, 0), (32, 32), (64, 64), (128, 256)])
+def test_mm_row_major_padded_operands(m, n, k, a_padding, b_padding):
+    values_a, values_b = _dyadic_gemm_operands(m, n, k, torch.float16, False)
+    a = torch.empty_strided((m, k), (k + a_padding, 1), dtype=values_a.dtype, device="cuda")
+    b = torch.empty_strided((k, n), (n + b_padding, 1), dtype=values_b.dtype, device="cuda")
+    a.copy_(values_a)
+    b.copy_(values_b)
+    expected = a @ b
+    for space in ("heuristic", "full"):
+        actual = tlx_ops.mm(a, b, space=space)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), actual[:16].view(torch.int16))
+
+
+@pytest.mark.parametrize("m,n,k", [
+    (63, 32768, 192),
+    (64, 32768, 192),
+    (127, 33153, 192),
+    (128, 33153, 256),
+    (129, 32768, 192),
+    (128, 32767, 192),
+    (128, 32768, 128),
+    (128, 32768, 320),
+])
+def test_mm_short_k_transposed_family_boundaries(m, n, k):
+    a, b = _dyadic_gemm_operands(m, n, k, torch.float16, True)
+    actual = tlx_ops.mm(a, b, space="heuristic")
+    torch.testing.assert_close(actual, a @ b, rtol=0, atol=0)
+    for space in ("heuristic", "full"):
+        prefix = tlx_ops.mm(a[:16], b, space=space)
+        assert torch.equal(prefix.view(torch.int16), actual[:16].view(torch.int16))

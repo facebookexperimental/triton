@@ -74,6 +74,7 @@ from .mem_ops import (
     update_tensor_descriptor,
 )
 from .mma_ops import (
+    amd_dot,
     amd_mfma_commit,
     amd_register_class_anchor,
     amd_register_resident,
@@ -127,6 +128,7 @@ from .types import (
     TMemCTAMode,
 )
 from .utility import (
+    amd_scaled_downcast_fp8,
     async_task_replica_id,
     clock64,
     cluster_cta_rank,
@@ -171,6 +173,7 @@ __all__ = [
     "nv_mma_shared_layout_encoding",
     "storage_kind",
     "layout",
+    "amd_dot",
     "amd_mfma_commit",
     "amd_register_class_anchor",
     "amd_register_resident",
@@ -264,6 +267,7 @@ __all__ = [
     "release_layout",
     "tcgen05_commit",
     # utility
+    "amd_scaled_downcast_fp8",
     "cluster_cta_rank",
     "cluster_size_1d",
     "thread_id",

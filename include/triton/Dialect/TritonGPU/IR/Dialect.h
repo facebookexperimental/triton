@@ -378,6 +378,10 @@ ArrayRef<T> dropPipeliningDim(ArrayRef<T> shape, Attribute layout) {
   return shape.take_back(cast<LayoutEncodingTrait>(layout).getRank());
 }
 
+// The layout-shape rule MemDescType::verify enforces, exported so producers
+// can check a shape before building the type.
+bool isLegalMemDescLayoutShape(ArrayRef<int64_t> shape, Attribute encoding);
+
 // Returns the number of elements per CTA in the allocation's linear address
 // space. This does not include padding introduced by padded shared layouts.
 // Leading pipelining dimensions count full allocation stages, including any
@@ -452,6 +456,9 @@ bool areLayoutsEquivalent(ArrayRef<int64_t> shape, LayoutEncodingTrait lhs,
 
 // Return true if the innermost numElems are contiguous.
 bool isInnermostContiguous(MemDescType type, unsigned numElems);
+
+// Return true for a full buffer with rank-one swizzled_shared(1, 1, 1).
+bool isContiguousSharedMemoryLayout(MemDescType type);
 
 LinearLayout inferReshapeLinearLayout(TensorOrMemDesc srcTy,
                                       ArrayRef<int64_t> dstShape);

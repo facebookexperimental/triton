@@ -428,6 +428,8 @@ class compilation_knobs(base_knobs):
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     store_binary_only: env_bool = env_bool("TRITON_STORE_BINARY_ONLY")
     always_compile: env_bool = env_bool("TRITON_ALWAYS_COMPILE")
+    # Perfetto trace of compilation; see triton/tools/compile_trace.py
+    compile_trace: env_opt_str = env_opt_str("TRITON_COMPILE_TRACE")
     # TODO: Use enum to constrain / 'typecheck' the values
     use_ir_loc: env_opt_str = env_opt_str("USE_IR_LOC")
     use_ptx_loc: env_bool = env_bool("USE_PTX_LOC")
@@ -584,6 +586,12 @@ class runtime_knobs(base_knobs):
     # Hook for inspecting compiler pipeline stages
     add_stages_inspection_hook: Optional[PipelineStagesHook] = None
 
+    # Shared C dispatcher and FastCache controls apply to all supported backends.
+    # Keep the environment names stable for existing users.
+    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER", True)
+    use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE", True)
+    enable_c_cache: env_bool = env_bool("TRITON_ENABLE_C_CACHE", True)
+
 
 class language_knobs(base_knobs):
     fp32_default: env_opt_str = env_opt_str("TRITON_F32_DEFAULT")
@@ -607,6 +615,46 @@ class nvidia_knobs(base_knobs):
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
+    # Re-issue tcgen05 MMAs that share operand A so A is read once through the
+    # collector buffer (see triton-nvidia-mma-collector-reuse).
+    disable_mma_collector_reuse: env_bool = env_bool("TRITON_DISABLE_MMA_COLLECTOR_REUSE")
+
+    # Deprecated aliases. Use knobs.runtime for shared dispatcher controls.
+    @property
+    def use_triton_dispatcher(self) -> bool:
+        return runtime.use_triton_dispatcher
+
+    @use_triton_dispatcher.setter
+    def use_triton_dispatcher(self, value: bool) -> None:
+        runtime.use_triton_dispatcher = value
+
+    @use_triton_dispatcher.deleter
+    def use_triton_dispatcher(self) -> None:
+        del runtime.use_triton_dispatcher
+
+    @property
+    def use_autotune_c_cache(self) -> bool:
+        return runtime.use_autotune_c_cache
+
+    @use_autotune_c_cache.setter
+    def use_autotune_c_cache(self, value: bool) -> None:
+        runtime.use_autotune_c_cache = value
+
+    @use_autotune_c_cache.deleter
+    def use_autotune_c_cache(self) -> None:
+        del runtime.use_autotune_c_cache
+
+    @property
+    def enable_c_cache(self) -> bool:
+        return runtime.enable_c_cache
+
+    @enable_c_cache.setter
+    def enable_c_cache(self, value: bool) -> None:
+        runtime.enable_c_cache = value
+
+    @enable_c_cache.deleter
+    def enable_c_cache(self) -> None:
+        del runtime.enable_c_cache
 
     # Environment used to spawn the NVIDIA tools above. `None` inherits the
     # current environment. Packagers whose interpreter runs with an environment
@@ -646,13 +694,7 @@ class nvidia_knobs(base_knobs):
     # Read-only TLX looped-barrier remarks; does not enable barrier promotion.
     report_tlx_barrier_hotspots: env_bool = env_bool("TRITON_REPORT_BARRIER_HOTSPOTS")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
-    # Default ON; opt out with TRITON_USE_C_DISPATCHER=0.
-    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER", True)
     auto_tma: env_bool = env_bool("TRITON_AUTO_TMA")
-    # Default ON; opt out with TRITON_AUTOTUNE_USE_C_CACHE=0.
-    use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE", True)
-    # Default ON; opt out with TRITON_ENABLE_C_CACHE=0.
-    enable_c_cache: env_bool = env_bool("TRITON_ENABLE_C_CACHE", True)
     auto_tma_device: env_bool = env_bool("TRITON_AUTO_TMA_DEVICE")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.

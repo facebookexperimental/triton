@@ -28,7 +28,7 @@ void init_triton_analysis(py::module_ &m) {
       .def(py::init<mlir::ModuleOp>());
   py::class_<mlir::ModuleMembarAnalysis>(m, "membar")
       .def(py::init<mlir::ModuleAllocation &>())
-      .def("run", &mlir::ModuleMembarAnalysis::run);
+      .def("run", [](mlir::ModuleMembarAnalysis &analysis) { analysis.run(); });
 }
 
 void init_triton_passes_common(py::module_ &m) {
@@ -54,6 +54,7 @@ void init_triton_passes_ttir(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_uplift_while_to_for", createTritonUpliftWhileToFor);
   ADD_PASS_WRAPPER_0("add_triton_licm", createTritonLoopInvariantCodeMotion);
   ADD_PASS_WRAPPER_0("add_loop_aware_cse", createTritonLoopAwareCSE);
+  ADD_PASS_WRAPPER_0("add_npot_pad", createTritonNpotPad);
   ADD_PASS_OPTION_WRAPPER_4("add_convert_to_ttgpuir",
                             createConvertTritonToTritonGPU, const std::string &,
                             int, int, int);

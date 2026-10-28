@@ -2592,3 +2592,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   }
 }
+
+// -----
+
+// An unconstrained persistent update keeps its result pin but adds no input
+// register-class pins, so loaded inputs are waited for at the MFMA itself.
+//
+// CHECK-LABEL: llvm.func @persistent_unconstrained_operands
+// CHECK-NOT: "=v,0"
+// CHECK: rocdl.mfma.f32.16x16x32.bf16
+// CHECK-NOT: "=v,0"
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "", "=a,0"
+// CHECK: llvm.return
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @persistent_unconstrained_operands(
+      %a: tensor<16x32xbf16, #lhs>,
+      %b: tensor<32x16xbf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "unconstrained" accumulator "persistent"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #lhs>,
+          tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma>
+          -> tensor<16x16xf32, #mma>
+    tt.return
+  }
+}

@@ -2,6 +2,7 @@
 import gc
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -717,6 +718,46 @@ def _amd_scheduled_mfma_lds_loop_kernel(a_ptr, b_ptr, output_ptr, iterations):
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
     output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
     tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_lds_operand_wait_kernel(a_ptr, b_ptr, output_ptr, RESIDENT: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 64 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a_local = tlx.local_alloc((16, 64), tl.bfloat16, 1)
+    b_local = tlx.local_alloc((64, 64), tl.bfloat16, 1)
+    tlx.local_store(tlx.local_view(a_local, 0), a)
+    tlx.local_store(tlx.local_view(b_local, 0), b)
+    tl.debug_barrier()
+    # Chain X reads register-resident operands; it is independent work that
+    # can hide chain Y's LDS loads.
+    xa = tlx.local_load(tlx.local_slice(tlx.local_view(a_local, 0), [0, 0], [16, 32]), layout=dot0, relaxed=True)
+    xb = tlx.local_load(tlx.local_slice(tlx.local_view(b_local, 0), [0, 0], [32, 64]), layout=dot1, relaxed=True)
+    xa = tlx.amd_register_resident(xa, register_class="vgpr", registers_per_group=4)
+    xb = tlx.amd_register_resident(xb, register_class="vgpr", registers_per_group=4)
+    tl.debug_barrier()
+    ya = tlx.local_load(tlx.local_slice(tlx.local_view(a_local, 0), [0, 32], [16, 32]), layout=dot0, relaxed=True)
+    yb = tlx.local_load(tlx.local_slice(tlx.local_view(b_local, 0), [32, 0], [32, 64]), layout=dot1, relaxed=True)
+    acc_x = tlx.zeros((16, 64), tl.float32, layout=mma)
+    for _ in tl.static_range(4):
+        acc_x = tlx.amd_scheduled_mfma(xa, xb, acc_x, accumulator_role="transient")
+    acc_y = tlx.zeros((16, 64), tl.float32, layout=mma)
+    acc_y = tlx.amd_scheduled_mfma(ya, yb, acc_y, accumulator_role="persistent", resident_operand=RESIDENT)
+    acc_x, acc_y = tlx.amd_mfma_commit((acc_x, acc_y))
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, acc_x + acc_y)
 
 
 @triton.jit
@@ -2041,6 +2082,70 @@ def test_amd_scheduled_mfma_inferred_lds_loop_correct_gfx950():
     torch.testing.assert_close(actual, 3.0 * (a.float() @ b.float()), atol=6e-4, rtol=6e-4)
 
 
+def _vgprs(operand):
+    """Return the VGPR numbers named by one ISA operand such as v8 or v[8:11]."""
+    match = re.fullmatch(r"v(\d+)|v\[(\d+):(\d+)\]", operand)
+    if match is None:
+        return set()
+    if match.group(1) is not None:
+        return {int(match.group(1))}
+    return set(range(int(match.group(2)), int(match.group(3)) + 1))
+
+
+def _early_lds_waits(amdgcn):
+    """Count LDS waits issued before an MFMA that reads no LDS-loaded register.
+
+    Only the region after the last barrier before the final MFMA is examined.
+    """
+    lines = [line.strip() for line in amdgcn.splitlines()]
+    lines = [line for line in lines if line and not line.startswith((";", "."))]
+    last_mfma = max(i for i, line in enumerate(lines) if line.startswith("v_mfma"))
+    start = max(i for i, line in enumerate(lines[:last_mfma]) if line.startswith("s_barrier")) + 1
+    loaded = set()
+    early = 0
+    pending_wait = False
+    for line in lines[start:last_mfma + 1]:
+        opcode, _, rest = line.partition(" ")
+        operands = [operand.strip() for operand in rest.split(",")]
+        if opcode.startswith("ds_read"):
+            loaded |= _vgprs(operands[0])
+        elif opcode == "s_waitcnt" and "lgkmcnt" in rest:
+            pending_wait = True
+        elif opcode.startswith("v_mfma") and pending_wait:
+            sources = _vgprs(operands[1]) | _vgprs(operands[2])
+            early += not (sources & loaded)
+            pending_wait = False
+    return early
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_unconstrained_lds_operand_wait_gfx950():
+    """An unconstrained persistent MFMA waits for its LDS operands at the MFMA.
+
+    Pinned inputs are consumed by their pins, so LLVM waits for the loads
+    before independent MFMAs. The pinned case is a control for the detector.
+    """
+    torch.manual_seed(0)
+    a = torch.randn((16, 64), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
+    expected = 4.0 * (a[:, :32].float() @ b[:32].float()) + a[:, 32:].float() @ b[32:].float()
+    early_waits = {}
+    for resident in (None, "unconstrained"):
+        actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+        compiled = _amd_scheduled_mfma_lds_operand_wait_kernel[(1, )](
+            a,
+            b,
+            actual,
+            RESIDENT=resident,
+            num_warps=4,
+            matrix_instr_nonkdim=16,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+        early_waits[resident] = _early_lds_waits(compiled.asm["amdgcn"])
+    assert early_waits[None] > 0
+    assert early_waits["unconstrained"] == 0
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_amd_scheduled_mfma_persistent_32x32_correct_gfx950():
     torch.manual_seed(0)
@@ -2876,6 +2981,38 @@ def test_masked_unaligned_vector_load_correctness_gfx950(device):
 
 
 @triton.jit
+def _amd_scaled_downcast_fp8_rounding_kernel(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(X + offsets, offsets < N, 0.0)
+    result = tlx.amd_scaled_downcast_fp8(values, 256.0)
+    tl.store(Y + offsets, result, offsets < N)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("block", [128, 256, 512])
+def test_amd_scaled_downcast_fp8_rounding_gfx950(device, block):
+    levels = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    midpoints = (levels[:-1] + levels[1:]) * (0.5 / 256.0)
+    neighbors = torch.cat((torch.nextafter(midpoints, torch.full_like(midpoints, -float("inf"))), midpoints,
+                           torch.nextafter(midpoints, torch.full_like(midpoints, float("inf")))))
+    # 1.8125 * 256 = 464 is the midpoint above 448 and rounds down to it.
+    positive = torch.cat((levels / 256.0, neighbors, torch.tensor([1.75, 1.8125])))
+    # Values beyond the E4M3 range are not clamped; they convert to NaN.
+    overflow = torch.tensor([2.0, 1.0e30, float("nan")])
+    values = torch.cat((positive, -positive, overflow, -overflow)).to(torch.float32)
+    finite = torch.cat((torch.ones(2 * positive.numel(),
+                                   dtype=torch.bool), torch.zeros(2 * overflow.numel(), dtype=torch.bool)))
+    expected = (values[finite] * 256.0).to(torch.float8_e4m3fn)
+    inputs = values.to(device)
+    actual = torch.empty(values.numel(), device=device, dtype=torch.float8_e4m3fn)
+    _amd_scaled_downcast_fp8_rounding_kernel[(triton.cdiv(values.numel(), block), )](inputs, actual, values.numel(),
+                                                                                     block, num_warps=2)
+    actual = actual.cpu()
+    torch.testing.assert_close(actual.view(torch.uint8)[finite], expected.view(torch.uint8), atol=0, rtol=0)
+    assert torch.isnan(actual.float()[~finite]).all()
+
+
+@triton.jit
 def _amd_scheduled_mfma_column_subtiles_kernel(
     a_ptr,
     b_ptr,
@@ -3055,3 +3192,68 @@ def test_amd_scheduled_mfma_single_subtile_mapping_gfx950(initialize):
         selected += initial[16:32, 0:16]
     expected[16:32, 0:16] = selected
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@triton.jit
+def _stoch_round_kernel_gfx950(x_ptr, rbits_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offsets)
+    rbits = tl.load(rbits_ptr + offsets)
+    y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
+    tl.store(y_ptr + offsets, y)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "dst_dtype, expected_inst",
+    [
+        ("float8_e5m2", "v_cvt_sr_bf8_f32"),
+        ("float8_e4m3fn", "v_cvt_sr_fp8_f32"),
+        ("float16", "v_cvt_sr_f16_f32"),
+        ("bfloat16", "v_cvt_sr_bf16_f32"),
+    ],
+)
+def test_stoch_round_gfx950(dst_dtype, expected_inst):
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float8_e5m2": torch.float8_e5m2,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+    }
+    dst_dtype_torch = dtype_map[dst_dtype]
+
+    SIZE = 256
+    a = torch.randn([SIZE], dtype=torch.float32, device="cuda")
+    rbits = ((torch.arange(SIZE, device="cuda", dtype=torch.int64) * 2654435761) % 2**32).to(torch.int32)
+    b = torch.empty([SIZE], dtype=torch.float32, device="cuda").to(dst_dtype_torch)
+    kernel = _stoch_round_kernel_gfx950[(1, )](a, rbits, b, BLOCK_SIZE=SIZE, num_warps=1)
+    assert expected_inst in kernel.asm["amdgcn"]
+
+    a_f32 = a.float()
+    b_back = b.float()
+    assert not torch.isnan(b_back).any(), "Stochastic rounding produced NaN"
+    assert not torch.isinf(b_back).any(), "Stochastic rounding produced Inf"
+
+    exact_mask = b_back == a_f32
+    if exact_mask.any():
+        b_ref = a_f32.to(dst_dtype_torch)
+        assert torch.equal(b[exact_mask], b_ref[exact_mask])
+
+    needs_rounding = ~exact_mask
+    if needs_rounding.any():
+        # Stochastic rounding returns one of the two representable neighbors
+        # of the source, so the error must stay below one ulp of the
+        # destination at the source magnitude.
+        mantissa_bits = {"float8_e5m2": 2, "float8_e4m3fn": 3, "float16": 10, "bfloat16": 7}[dst_dtype]
+        min_step = {
+            "float8_e5m2": 2.0**-16,
+            "float8_e4m3fn": 2.0**-9,
+            "float16": 2.0**-24,
+            "bfloat16": 2.0**-133,
+        }[dst_dtype]
+        exponent = torch.floor(torch.log2(torch.abs(a_f32[needs_rounding]).clamp(min=1e-30)))
+        ulp = torch.ldexp(torch.ones_like(exponent), (exponent - mantissa_bits).to(torch.int32))
+        ulp = torch.maximum(ulp, torch.tensor(min_step, device=ulp.device, dtype=ulp.dtype))
+        diff = torch.abs(b_back[needs_rounding] - a_f32[needs_rounding])
+        assert (diff <= ulp).all(), (f"Stochastic rounding error exceeds one ulp: max diff = {diff.max()}, "
+                                     f"max ulp = {ulp.max()}")

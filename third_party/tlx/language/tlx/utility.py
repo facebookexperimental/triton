@@ -1,5 +1,6 @@
 import re
 import builtins
+import math
 
 import triton.language.core as tl
 import triton.runtime.driver as driver
@@ -16,6 +17,41 @@ def is_amd_tdm_target(arch):
     if not isinstance(arch, str) or not arch.startswith("gfx"):
         return False
     return _amd.supports_tdm(arch)
+
+
+@tl.builtin
+def amd_scaled_downcast_fp8(value, scale: tl.constexpr, dtype: tl.constexpr = tl.float8e4nv, _semantic=None):
+    """Convert ``value * scale`` from FP32 to FP8 on gfx950.
+
+    ``scale`` must be a compile-time power of two from 2^-127 to 2^126. The
+    conversion instruction divides by the E8M0 scale ``1 / scale``, emitted as
+    ``amdg.scaled_downcast_fp8`` with ``scale_const = 127 - log2(scale)``, so
+    no separate FP32 multiply is needed. ``dtype`` is ``tl.float8e4nv``
+    (E4M3FN, the default) or ``tl.float8e5`` (E5M2). Rounding is
+    round-to-nearest-even; NaNs and values beyond the FP8 range convert to
+    NaN. The result keeps the input's layout.
+    """
+    options = _semantic.builder.options
+    if options.backend_name != "hip" or options.arch != "gfx950":
+        raise NotImplementedError("tlx.amd_scaled_downcast_fp8 requires gfx950")
+    value = _semantic.to_tensor(value)
+    if not value.type.is_block() or value.dtype != tl.float32:
+        raise TypeError("value must be an FP32 tensor")
+    dtype = tl._unwrap_if_constexpr(dtype)
+    if dtype not in (tl.float8e4nv, tl.float8e5):
+        raise TypeError("dtype must be tl.float8e4nv or tl.float8e5")
+    scale = tl._unwrap_if_constexpr(scale)
+    if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("scale must be a positive compile-time power of two")
+    mantissa, exponent = math.frexp(scale)
+    log2_scale = exponent - 1
+    # E8M0 byte 0 (2^-127) lowers to a zero divisor, and 255 is NaN.
+    if mantissa != 0.5 or not -127 <= log2_scale <= 126:
+        raise ValueError("scale must be a power of two from 2^-127 to 2^126")
+    result_ty = tl.block_type(dtype, value.type.shape)
+    handle = _semantic.builder.create_amd_scaled_downcast_fp8(value.handle, dtype.to_ir(_semantic.builder),
+                                                              127 - log2_scale)
+    return tl.tensor(handle, result_ty)
 
 
 def cuda_parse_arch(arch):
@@ -245,7 +281,7 @@ def stoch_round(
     """
     Hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions.
 
-    Requires Blackwell GPU (compute capability >= 100).
+    Requires Blackwell GPU (compute capability >= 100), or CDNA3/CDNA4/CDNA5 on AMD.
 
     Semantics:
         y = tlx.stoch_round(src, dst_ty, rand_bits)
@@ -254,28 +290,56 @@ def stoch_round(
         cvt.rs.satfinite.{e4m3x4,e5m2x4}.f32  d, {a,b,c,d}, rbits  (for FP8)
         cvt.rs.satfinite.{bf16x2,f16x2}.f32   d, {a,b}, rbits      (for BF16/F16)
 
+    Maps to GCN (on AMD):
+        v_cvt_sr_fp8_f32 / v_cvt_sr_bf8_f32  (for FP8, one element per seed)
+        v_cvt_sr_f16_f32 / v_cvt_sr_bf16_f32 (for F16/BF16 on CDNA4)
+        v_cvt_sr_pk_f16_f32 / v_cvt_sr_pk_bf16_f32 (for F16/BF16 on CDNA5,
+            i.e. gfx1250; packed pairs sharing one seed)
+    The fp8 encoding follows the architecture: FNUZ on CDNA3 (gfx942),
+    OCP on CDNA4 (gfx950) and CDNA5 (gfx1250).
+
     Args:
         src:
             Source FP32 tensor. Shape defines output shape.
         dst_ty:
-            Destination dtype: tl.float8e5, tl.float8e4nv, tl.float16, or tl.bfloat16
+            Destination dtype. On CUDA: tl.float8e5, tl.float8e4nv, tl.float16,
+            or tl.bfloat16. On CDNA4/CDNA5: the same four. On CDNA3:
+            tl.float8e4b8 or tl.float8e5b16 (FNUZ fp8 only).
         rand_bits:
             Random bits (uint32 tensor) for entropy, must match src shape
 
     Returns:
         Tensor with dtype dst_ty and shape matching src.
     """
-    capability = int(cuda_parse_arch(_semantic.builder.options.arch))
-    assert capability >= 100, (f"stoch_round requires compute capability >= 100 (Blackwell GPU), "
-                               f"current capability: {capability}")
+    if isinstance(dst_ty, tl.constexpr):
+        dst_ty = dst_ty.value
+    arch = _semantic.builder.options.arch
+    if isinstance(arch, str) and arch.startswith("gfx"):
+        # CDNA3 (gfx942) converts to FNUZ fp8 only; CDNA4 (gfx950) and CDNA5
+        # (gfx1250) convert to OCP fp8/f16/bf16. Older CDNA has no
+        # stochastic-rounding support.
+        # Strip any ":feature" suffix (e.g. "gfx942:sramecc+:xnack-") before
+        # matching the version.
+        gfx_version = arch.split(":")[0].removeprefix("gfx")
+        if gfx_version in ("950", "1250"):
+            supported_dst = [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16]
+        elif gfx_version == "942":
+            supported_dst = [tl.float8e4b8, tl.float8e5b16]
+        else:
+            raise AssertionError(f"stoch_round requires gfx942 (CDNA3, FNUZ fp8 only), gfx950 (CDNA4), or "
+                                 f"gfx1250 (CDNA5), got arch {arch}")
+    else:
+        capability = int(cuda_parse_arch(arch))
+        assert capability >= 100, (f"stoch_round requires compute capability >= 100 (Blackwell GPU), "
+                                   f"current capability: {capability}")
+        supported_dst = [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16]
     src_ty = src.type
     src_sca_ty = src_ty.scalar
 
     assert src_sca_ty == tl.float32, (f"Stochastic rounding only supports fp32 source, got {src_sca_ty}. "
                                       f"Source must be float32.")
-    assert dst_ty in [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16
-                      ], (f"Stochastic rounding only supports fp8/fp16/bf16 destination, got {dst_ty}. "
-                          f"Supported types: float8e5 (fp8 E5M2), float8e4nv (fp8 E4M3FN), float16, bfloat16")
+    assert dst_ty in supported_dst, (f"Stochastic rounding does not support destination {dst_ty} on arch {arch}. "
+                                     f"Supported types: {', '.join(str(t) for t in supported_dst)}")
 
     rbits_ty = rand_bits.type
     if src_ty.is_block() and rbits_ty.is_block():

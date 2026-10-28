@@ -151,12 +151,15 @@ alias expansion metadata. Aliasing is intra-CTA: descriptors may alias within
 one CTA row, but not across different CTA rows.
 
 Compiler-owned shared-memory scratch has no SSA memdesc for BufferRegion
-analysis to discover. After shared-memory allocation, ConSan reads the
-operation's `allocation.offset` and `allocation.size`, adds that static interval
-to the canonical region registry, and instruments it with the corresponding
-constant state mask. This covers scratch used by layout conversions, reductions,
-gathers, atomic result broadcasts, and target-specific operations without
-introducing a separate runtime address ABI.
+analysis to discover. After shared-memory allocation, ConSan reads a call's
+`allocation.offset` and `allocation.size`, adds that static interval to the
+canonical region registry, and instruments it with the corresponding
+constant state mask, summarizing the callee frame without introducing a
+separate runtime address ABI. Operation-local scratch (layout conversions,
+reductions, gathers, atomic result broadcasts, and target-specific
+operations) is currently not instrumented: those checks are disabled
+upstream (#11533) while a hang is under investigation, so races involving
+that scratch may go undetected.
 
 Allocation must therefore run before ConSan. A transform that introduces a
 scratch-using operation after allocation must rerun allocation before ConSan.
@@ -306,12 +309,10 @@ The common hook implementation covers these TritonGPU operations:
   `ttg.local_atomic_scatter_rmw`: barrier-tracked shared-memory writes. Scatter
   and atomic scatter RMW conservatively cover their full destination
   descriptors because their indices are runtime values.
+- Non-atomic `ttg.local_scatter` additionally rejects conflicting values for the
+  same destination. Equal-value duplicates and atomic scatter collisions remain
+  valid.
 - `ttg.local_alloc` with a source: barrier-tracked shared-memory write.
-- Any operation with allocator-provided operation-local shared scratch: a
-  synchronous generic-proxy write over its allocated byte interval in its owning
-  CTA. Cross-CTA scratch reads follow intrinsic synchronization, and atomic
-  writes are issued only by producer CTAs. Forced warp-shuffle conversions
-  publish no scratch metadata because allocation reserves no scratch for them.
 - Function calls with allocator-provided virtual shared-memory frames: a
   synchronous generic-proxy write over the whole callee frame in the current
   CTA. This includes nested callees because each virtual frame is sized from
@@ -320,6 +321,11 @@ The common hook implementation covers these TritonGPU operations:
 
 These shared-memory effects are generic-proxy accesses for the proxy-ordering
 model.
+
+Operation-local compiler scratch is not instrumented. Races involving that
+scratch, including reuse while asynchronous accesses are pending, may therefore
+go undetected. Call-frame summaries and explicit shared-memory accesses remain
+instrumented.
 
 TMA-style and CLC cross-CTA writes become visible in the CTA rows reached by the
 memory effect. Read transfers update the current CTA row.

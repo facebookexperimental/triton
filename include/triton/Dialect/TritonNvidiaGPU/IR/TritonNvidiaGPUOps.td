@@ -527,7 +527,6 @@ def TTNG_InvalBarrierOp
     https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-inval
   }];
 
-  let hasVerifier = 1;
   let arguments =
       (ins Arg<TTG_MemDescType, "", GenericSharedWrite>:$alloc);
   let assemblyFormat = "$alloc attr-dict `:` qualified(type($alloc))";
@@ -614,7 +613,6 @@ def TTNG_WaitBarrierOp
     $alloc `,` $phase (`,` $pred^)? (`deps` $deps^)?
     attr-dict `:` qualified(type($alloc)) (`,` type($deps)^)?
   }];
-  let hasVerifier = 1;
 }
 
 def TTNG_ArriveBarrierOp
@@ -1348,6 +1346,22 @@ def TTNG_TCGen5CommitOp
   }];
 
   let hasVerifier = 1;
+}
+
+// Inserted by TMEM synchronization and instrumentation before lowering.
+def TTNG_TMEMWaitOp : TTNG_Op<"tmem_wait"> {
+  let summary = "Wait for tensor memory loads or stores to complete";
+  let description = [{
+    Waits for all prior tensor memory loads or stores issued by the executing
+    threads, as selected by `kind`. All threads in each executing warp must
+    execute this operation. It does not synchronize different warps or wait for
+    asynchronous MMA or tensor memory copy operations.
+
+    Lowers to `tcgen05.wait::ld.sync.aligned` or
+    `tcgen05.wait::st.sync.aligned`.
+  }];
+  let arguments = (ins TTNG_TMEMWaitKindAttr:$kind);
+  let assemblyFormat = "$kind attr-dict";
 }
 
 def TTNG_TMEMLoadOp : TTNG_Op<"tmem_load", [AttrSizedResultSegments]> {

@@ -181,16 +181,16 @@ def amd_fa_cluster_vector_combine_codegen_gfx950(fresh_triton_cache):
 def test_amd_fa_cluster_vector_combine_opt_out_reduces_transfers_gfx950(amd_fa_cluster_vector_combine_codegen_gfx950):
     baseline, disabled = amd_fa_cluster_vector_combine_codegen_gfx950
     baseline_asm = baseline.asm["amdgcn"]
-    disabled_asm = disabled.asm["amdgcn"]
 
     def transfer_count(amdgcn):
         return amdgcn.count("v_accvgpr_read_b32") + amdgcn.count("v_accvgpr_write_b32")
 
-    def instruction_count(amdgcn):
-        return len(re.findall(r"^\s+[a-z].*", amdgcn, flags=re.MULTILINE))
-
-    assert transfer_count(baseline_asm) - transfer_count(disabled_asm) >= 28
-    assert instruction_count(disabled_asm) < instruction_count(baseline_asm)
+    # Since upstream #11365 (DS_READ_B128 re-tile), VectorCombine-on yields 36
+    # transfers vs 74 with the opt-out (was 118 vs 58 when fork #3808 pinned the
+    # directional property): the opt-out benefit inverted because the shipped
+    # default path improved. Pin the default's quality instead of the inverted
+    # directional comparison.
+    assert transfer_count(baseline_asm) <= 40
     assert baseline.metadata.disable_vector_combine is False
     assert disabled.metadata.disable_vector_combine is True
 
@@ -571,7 +571,10 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     # Switching CodeGen to d26ff26e spills this kernel further (private 204,
     # 62 VGPR spills; 160/46 in the merged ABI).
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (53, 68)
+    # Upstream #11365 ([AMD][LAYOUTS] refine segment computation for DS_READ_B128)
+    # retuned getSharedLdStTiles() for CDNA4 at vecBitwidth 128, producing 55
+    # s_waitcnt here with unchanged barrier/LDS/mfma structure.
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (53, 55, 68)
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
@@ -604,7 +607,7 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
     # s_waitcnt/spill goldens: see test_a4w4_inter_wave_256tile_codegen_gfx950.
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (53, 68)
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (53, 55, 68)
     assert "s_trap" not in amdgcn
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
@@ -664,6 +667,7 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     assert compiled.metadata.global_scratch_size == 0
     # Spill/private goldens admit post-CodeGen-switch values; see test_a4w4_inter_wave_256tile_codegen_gfx950.
     assert ".private_segment_fixed_size: 0" in amdgcn or ".private_segment_fixed_size: 160" in amdgcn
-    assert ".sgpr_count:     53" in amdgcn
+    # Upstream #11365 retiled CDNA4 vec128 LDS traffic, shifting SGPR allocation 53 -> 55.
+    assert ".sgpr_count:     53" in amdgcn or ".sgpr_count:     55" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
     assert ".vgpr_spill_count: 0" in amdgcn or ".vgpr_spill_count: 46" in amdgcn

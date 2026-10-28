@@ -20,21 +20,21 @@ choosing another space. `mm` and `addmm` also accept `out=` for implementations
 that support a preallocated output.
 
 `space=` defaults to "heuristic" -- a single config chosen analytically -- for
-any op that offers one, so that a first call stays interactive. The exception
-is `mm` on sm90, whose full space is only 8 configs; it defaults to "full".
-Measured on
-B200, `mm` at `space="full"` takes 221-285s on a cold Triton cache (348 configs
-compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
-tens of GB of autotune workspaces; at "heuristic" the same call is under a
-second. On implementations that provide it, pass `space="full"` explicitly to
-buy back the tuned configs, which are worth up to ~4x on small shapes. The
+most ops that offer one, so that a first call stays interactive. `mm` on sm90
+and sm100 defaults to "full" instead: sm90's full space prunes to 8-28 configs per shape, and
+on sm100 the tuned configs are worth up to ~4x on small shapes and beat the
+heuristic on skinny, long-K shapes. The cost on sm100 is the first call per
+shape: on B200, `mm` at `space="full"` takes 221-285s on a cold Triton cache
+(348 configs compiled and benchmarked for a 1024x1024x1024 product) and also
+accumulates tens of GB of autotune workspaces; at "heuristic" the same call is
+under a second. Pass `space="heuristic"` explicitly for a fast first call. The
 gfx950 implementation currently provides only `"heuristic"`.
 
 Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
-ship a bad config. Each needs its own `heuristic_config` before it can follow
-`mm`. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
+ship a bad config. Each needs its own `heuristic_config` before it can offer a
+fast first call. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
 configs are measurably faster; pass `space="heuristic"` for a fast first call.
 `hstu_cross_attn` on gfx950 defaults to "curated": at head dims 64 and 128 it
 tunes eight forward configs picked from its 144-config "full" grid, which come
@@ -50,22 +50,71 @@ explicit first-order attention gradients from an existing forward result.
 Prepare the immutable sequence plan once, then reuse it for backward calls;
 this explicit API accepts inputs requiring gradients but does not build an
 autograd graph for higher-order derivatives.
+
+`space=` also accepts a `Space`, which bundles the search-space name with a
+`BitwiseInvarianceSpec` naming the logical dims that may vary across calls
+while overlapping outputs stay bitwise identical. Unknown dim names raise
+`InvalidInput` before dispatch; a non-empty spec on an op that does not
+enforce it yet raises `UnsupportedOp` rather than being silently ignored.
 """
 
 from __future__ import annotations
 
 import functools
+import math
 
 from torch.compiler import assume_constant_result
 
-from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_backward, check_inputs, impl_for
+from ._catalog import (
+    InvalidInput,
+    UnsupportedBackward,
+    UnsupportedOp,
+    any_enforces_invariance,
+    check_backward,
+    check_inputs,
+    impl_for,
+    invariant_vocab_for,
+)
+from ._invariance import BitwiseInvarianceSpec, Space, normalize_space
 
 __all__ = [
     "mm", "mm_bias_grad", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
     "flash_attn_varlen", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
     "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
-    "UnsupportedBackward", "InvalidInput"
+    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
+
+
+def _normalize_space_arg(op, space):
+    """Split `space=` into (search-space name, resolved invariance spec).
+
+    Unknown dim names raise `InvalidInput` here, before dispatch. A non-empty
+    spec raises `UnsupportedOp` here when no arch entry enforces it yet; ops
+    with partial enforcement re-check the dispatched entry afterwards.
+    """
+    name, spec = normalize_space(space)
+    resolved = spec.resolve(invariant_vocab_for(op))
+    if resolved.needs_bitwise() and not any_enforces_invariance(op):
+        raise UnsupportedOp(f"tlx.ops.{op} does not enforce bitwise_invariance_spec yet")
+    return name, resolved
+
+
+def _check_enforced(op, entry, invariance):
+    """Refuse an invariance request the dispatched entry does not enforce."""
+    if invariance.needs_bitwise() and not entry.enforces_invariance:
+        raise UnsupportedOp(f"tlx.ops.{op} does not enforce bitwise_invariance_spec yet on {entry.arch}")
+
+
+def _check_single_config_space(op, space_name):
+    """Reject a search-space name on an op with a single fixed config.
+
+    Such ops accept only `space=None` (implementation default) or the
+    canonical single-config scope `"heuristic"` (also the `Space` carrier
+    name for an invariance request). Anything else names a tuning space
+    the op does not provide and must not be silently ignored.
+    """
+    if space_name is not None and space_name != "heuristic":
+        raise InvalidInput(f"tlx.ops.{op} does not provide space={space_name!r}")
 
 
 @functools.lru_cache(maxsize=None)
@@ -79,10 +128,13 @@ def mm(a, b, *, out=None, space=None):
 
     This op is currently forward-only.
 
-    `space=None` uses the implementation's default: "full" on sm90, otherwise
-    a single analytically chosen config so the first call stays interactive.
+    `space=None` uses the implementation's default: "full" on sm90 and sm100,
+    otherwise a single analytically chosen config so the first call stays
+    interactive. Pass `space="heuristic"` for a fast first call on sm100.
     Pass `space="full"` to implementations that expose a full autotune space;
     unsupported spaces raise `InvalidInput`. See the module docstring.
+    `space=` also accepts a `Space` carrying a `BitwiseInvarianceSpec` over
+    the M/N/K vocabulary.
     """
     if a.ndim != 2 or b.ndim != 2:
         raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
@@ -93,6 +145,7 @@ def mm(a, b, *, out=None, space=None):
     if a.dtype != b.dtype or a.device != b.device:
         raise InvalidInput("tlx.ops.mm operands must have the same dtype and device; "
                            f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
+    space_name, invariance = _normalize_space_arg("mm", space)
     fn, spec = _mm_impl_for_device(a.device)
     if spec.accepts is None:
         check_inputs(spec, dtype=a.dtype)
@@ -104,11 +157,12 @@ def mm(a, b, *, out=None, space=None):
         check_inputs(spec, dtype=a.dtype, M=a.shape[0], N=b.shape[1], K=a.shape[1],
                      row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]), elem_bytes=a.element_size())
     check_backward(spec, a, b)
-    if space is None:
-        space = spec.default_space
+    _check_enforced("mm", spec, invariance)
+    if space_name is None:
+        space_name = spec.default_space
     if out is None:
-        return fn(a, b, space=space)
-    return fn(a, b, out=out, space=space)
+        return fn(a, b, space=space_name, invariance=invariance)
+    return fn(a, b, out=out, space=space_name, invariance=invariance)
 
 
 def mm_bias_grad(dout, input_act, *, out=None, space=None):
@@ -170,7 +224,8 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
 
     ``space`` defaults to "full" (autotune; the first call per shape compiles
     and benchmarks the pruned space). "heuristic" launches one shape-picked
-    config without autotuning.
+    config without autotuning. A ``Space`` is also accepted; its invariance
+    request is validated but not enforced yet.
     """
     import torch
 
@@ -208,22 +263,26 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
                                f"got shape={tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
         if any(torch._C._overlaps(out, tensor) for tensor in tensors):
             raise InvalidInput("tlx.ops.mm_mxfp8 out must not overlap any input")
-    if space not in ("heuristic", "full"):
-        raise InvalidInput(f"tlx.ops.mm_mxfp8 does not provide space={space!r}")
+    space_name, invariance = _normalize_space_arg("mm_mxfp8", space)
+    if space_name not in ("heuristic", "full"):
+        raise InvalidInput(f"tlx.ops.mm_mxfp8 does not provide space={space_name!r}")
 
     fn, spec = impl_for("mm_mxfp8", device=a.device)
     tma_tensors = tensors if out is None else (*tensors, out)
     check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
     check_backward(spec, *tensors, out)
-    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space)
+    _check_enforced("mm_mxfp8", spec, invariance)
+    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space_name)
 
 
-def grouped_gemm(group_a, group_b):
+def grouped_gemm(group_a, group_b, *, space=None):
     """Run a ragged group of FP16 ``A[i] @ B[i]`` products.
 
     ``A[i]`` must be rank-2 row-major. ``B[i]`` must be a rank-2 column-major
     view with K contiguous. The operation is currently forward-only;
     architecture-specific alignment restrictions may also apply.
+    ``space=`` takes no search space today; a ``Space`` is accepted only to
+    carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
     """
     import torch
 
@@ -264,6 +323,8 @@ def grouped_gemm(group_a, group_b):
             raise InvalidInput("tlx.ops.grouped_gemm operands must share a dtype and device; "
                                f"tensor {index} is ({tensor.dtype}, {tensor.device}), expected ({dtype}, {device})")
 
+    space_name, invariance = _normalize_space_arg("grouped_gemm", space)
+    _check_single_config_space("grouped_gemm", space_name)
     fn, spec = impl_for("grouped_gemm", device=device)
     # TMA implementations describe A, the zero-copy B.T view, and C as
     # row-major tensors. Direct-load implementations ignore these facts.
@@ -277,6 +338,7 @@ def grouped_gemm(group_a, group_b):
         elem_bytes=group_a[0].element_size(),
     )
     check_backward(spec, *group_a, *group_b)
+    _check_enforced("grouped_gemm", spec, invariance)
     return fn(group_a, group_b)
 
 
@@ -339,7 +401,7 @@ def _check_grouped_gemm_mxfp8_out(out, tensors, *, GM, N, device):
         raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 out must not overlap any input")
 
 
-def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout="natural"):
+def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout="natural", space=None):
     """Run a forward-only SM100 or gfx950 grouped GEMM over pre-quantized MXFP8 inputs.
 
     ``x`` is contiguous ``[GM, K]`` and ``w`` is contiguous ``[G, N, K]``
@@ -351,6 +413,8 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
     nonnegative, every prefix is 128-aligned, and the final sum is ``GM``.
     The BF16 result has shape ``[GM, N]``; a supplied ``out`` is returned by
     identity. ``num_sms`` defaults to all SMs (CUs on AMD) on ``x.device``.
+    ``space=`` takes no search space today; a ``Space`` is accepted only to
+    carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
     """
     import torch
 
@@ -395,6 +459,8 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
                                f"[1, {device_sms}] for {x.device}; got {num_sms!r}")
     _check_grouped_gemm_mxfp8_out(out, tensors, GM=GM, N=N, device=x.device)
 
+    space_name, invariance = _normalize_space_arg("grouped_gemm_mxfp8", space)
+    _check_single_config_space("grouped_gemm_mxfp8", space_name)
     fn, spec = impl_for("grouped_gemm_mxfp8", device=x.device)
     tma_tensors = (x, x_scale, w, w_scale) if out is None else (x, x_scale, w, w_scale, out)
     check_inputs(
@@ -408,6 +474,7 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
         base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors),
     )
     check_backward(spec, x, x_scale, w, w_scale, split_sizes, out)
+    _check_enforced("grouped_gemm_mxfp8", spec, invariance)
     return fn(
         x,
         x_scale,
@@ -420,17 +487,27 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
     )
 
 
-def addmm(input, a, b, *, out=None, space="heuristic"):
+def addmm(input, a, b, *, out=None, space=None):
     """Fused ``input + a @ b`` for two-dimensional fp16/bf16 matrices.
 
     ``input`` may be ``(N,)`` or two-dimensional and broadcastable to the
     ``(M, N)`` result. Matrix and input scale factors are both one. This op is
     currently forward-only.
+
+    `space=None` uses the implementation's default: "full" on sm90, otherwise
+    "heuristic". ``space=`` also accepts a ``Space``; its invariance request is
+    validated but not enforced yet.
     """
+    space_name, invariance = _normalize_space_arg("addmm", space)
     fn, spec = impl_for("addmm", device=a.device)
+    if space_name is None:
+        space_name = spec.default_space
+    if space_name not in ("heuristic", "full", "smoke", "heuristic_2cta"):
+        raise InvalidInput(f"tlx.ops.addmm does not provide space={space_name!r}")
     check_inputs(spec, dtype=a.dtype)
     check_backward(spec, input, a, b)
-    return fn(input, a, b, out=out, space=space)
+    _check_enforced("addmm", spec, invariance)
+    return fn(input, a, b, out=out, space=space_name)
 
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
@@ -440,20 +517,22 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise InvalidInput("tlx.ops.flash_attn expects rank-4 Q/K/V tensors")
-    if space not in ("full", "smoke"):
-        raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space!r}")
+    space_name, invariance = _normalize_space_arg("flash_attn", space)
+    if space_name not in ("full", "smoke"):
+        raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space_name!r}")
     fn, spec = impl_for("flash_attn", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
     check_backward(spec, q, k, v)
+    _check_enforced("flash_attn", spec, invariance)
     # Triton's launcher uses the process' current device rather than deriving it
     # from pointer arguments. Keep compilation and launch on the input device;
     # the context manager restores the caller's current device afterwards.
     import torch
     with torch.cuda.device(q.device):
-        return fn(q, k, v, causal, sm_scale, space=space)
+        return fn(q, k, v, causal, sm_scale, space=space_name)
 
 
-def prepare_flash_attn_varlen_backward(cu_seqlens_q, cu_seqlens_k):
+def prepare_flash_attn_varlen_backward(cu_seqlens_q, cu_seqlens_k, *, space=None):
     """Prepare reusable packed-attention backward metadata from int32 offsets.
 
     The two rank-1 CUDA tensors must describe the same nonempty batch. Their
@@ -466,6 +545,8 @@ def prepare_flash_attn_varlen_backward(cu_seqlens_q, cu_seqlens_k):
     owned by the plan as immutable; the caller's original offsets may be
     modified after preparation. The plan also enables eligible compact dS
     backward implementations without repeating host synchronization.
+    ``space=`` takes no search space today; a ``Space`` is accepted only to
+    carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
     """
     import torch
 
@@ -478,8 +559,11 @@ def prepare_flash_attn_varlen_backward(cu_seqlens_q, cu_seqlens_k):
         raise InvalidInput("cu_seqlens_q and cu_seqlens_k must be on the same device")
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
         raise InvalidInput("cu_seqlens_q and cu_seqlens_k must describe the same batch")
+    space_name, invariance = _normalize_space_arg("prepare_flash_attn_varlen_backward", space)
+    _check_single_config_space("prepare_flash_attn_varlen_backward", space_name)
     fn, spec = impl_for("prepare_flash_attn_varlen_backward", device=cu_seqlens_q.device)
     check_inputs(spec, dtype=cu_seqlens_q.dtype)
+    _check_enforced("prepare_flash_attn_varlen_backward", spec, invariance)
     with torch.cuda.device(cu_seqlens_q.device):
         if torch.cuda.is_current_stream_capturing():
             raise InvalidInput("prepare_flash_attn_varlen_backward must run outside CUDA graph capture")
@@ -489,7 +573,8 @@ def prepare_flash_attn_varlen_backward(cu_seqlens_q, cu_seqlens_k):
             raise InvalidInput(f"tlx.ops.prepare_flash_attn_varlen_backward: {error}") from error
 
 
-def flash_attn_varlen_backward(q, k, v, o, do, lse, plan, sm_scale=None, causal=False, *, dq_atomic_fp32=True):
+def flash_attn_varlen_backward(q, k, v, o, do, lse, plan, sm_scale=None, causal=False, *, dq_atomic_fp32=True,
+                               space=None):
     """Return explicit first-order dQ/dK/dV for packed BF16 D128 attention.
 
     Q/K/V use ``(tokens, heads, head_dim)`` order. Supply the existing forward
@@ -523,8 +608,11 @@ def flash_attn_varlen_backward(q, k, v, o, do, lse, plan, sm_scale=None, causal=
         raise InvalidInput("flash_attn_varlen_backward inputs must be on the same device")
     if torch.are_deterministic_algorithms_enabled():
         raise UnsupportedOp("flash_attn_varlen_backward does not provide deterministic gradients")
+    space_name, invariance = _normalize_space_arg("flash_attn_varlen_backward", space)
+    _check_single_config_space("flash_attn_varlen_backward", space_name)
     fn, spec = impl_for("flash_attn_varlen_backward", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
+    _check_enforced("flash_attn_varlen_backward", spec, invariance)
     scale = q.shape[-1]**-0.5 if sm_scale is None else sm_scale
     with torch.cuda.device(q.device), torch.no_grad():
         try:
@@ -534,16 +622,18 @@ def flash_attn_varlen_backward(q, k, v, o, do, lse, plan, sm_scale=None, causal=
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_expcast=False):
-    """MXFP8 attention over contiguous BF16 ``(Z, H, N_CTX, HEAD_DIM)`` tensors.
+    """Differentiable MXFP8 attention over contiguous BF16 Q/K/V.
 
-    Q, K, V and the softmax probabilities are quantized internally to E4M3
-    data with E8M0 scales: per 32x32 block for Q and K, per 32 keys for V and
-    the probabilities. gfx950 quantizes as Blackwell does, but its ping-pong
-    kernel (non-causal, and causal at sequence lengths divisible by 512)
-    computes the probabilities with an approximate exp2 (see
-    kernels/flash_attn_mxfp8/gfx950.py), and the two agree to within the
-    quantization error rather than bitwise. Head dim 128 and sequence lengths
-    divisible by 256. Blackwell returns BF16 gradients; gfx950 is forward only.
+    Inputs have identical [batch, heads, sequence, 128] shapes with sequence
+    lengths divisible by 256. Both architectures return BF16 gradients.
+    Both architectures use 32x32 Q/K blocks. On gfx950, calls where autograd
+    records Q, K or V use a training forward with hardware exp2 that saves
+    separate row maxima and log2 normalization terms, the statistics backward
+    recomputes P from. Other calls use the faster inference ping-pong kernel
+    (non-causal, and causal at sequence lengths divisible by 512), whose
+    approximate exp2 makes its output differ from the training forward by
+    about 0.04 relative RMS, less than either differs from BF16 attention.
+    See the kernel module for the recipes.
     ``p_expcast=True`` (Blackwell only) encodes the forward probabilities with
     ExpCast-FP8 instead of exp2 (see kernels/flash_attn_mxfp8/sm100.py).
     """
@@ -552,19 +642,26 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
     if q.shape != k.shape or q.shape != v.shape:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have identical shapes; "
                            f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if any(size == 0 for size in q.shape):
+        raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects nonempty Q/K/V dimensions")
     if q.dtype != k.dtype or q.dtype != v.dtype or q.device != k.device or q.device != v.device:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have the same dtype and device")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects contiguous Q/K/V tensors")
-    if space not in ("full", "smoke"):
-        raise InvalidInput(f"tlx.ops.flash_attn_mxfp8 does not provide space={space!r}")
+    space_name, invariance = _normalize_space_arg("flash_attn_mxfp8", space)
+    if space_name not in ("full", "smoke"):
+        raise InvalidInput(f"tlx.ops.flash_attn_mxfp8 does not provide space={space_name!r}")
     fn, spec = impl_for("flash_attn_mxfp8", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], N_CTX=q.shape[-2])
     check_backward(spec, q, k, v)
-    return fn(q, k, v, causal, sm_scale, space=space, p_expcast=p_expcast)
+    _check_enforced("flash_attn_mxfp8", spec, invariance)
+    import torch
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, causal, sm_scale, space=space_name, p_expcast=p_expcast)
 
 
-def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None, causal=False):
+def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None, causal=False, *,
+                      space=None):
     """Forward-only attention over packed ``(tokens, heads, HEAD_DIM)`` fp16/bf16 sequences.
 
     Sequence ``b`` owns query rows ``cu_seqlens_q[b]:cu_seqlens_q[b + 1]`` and
@@ -574,8 +671,8 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
     parity. K/V may have fewer heads than Q (GQA) if they divide its head count.
     Causal masking is bottom-right aligned: query ``i`` sees keys
     ``j <= i + k_len - q_len``, and a query row that sees no key returns zeros.
-    `sm_scale` defaults to `HEAD_DIM ** -0.5`. Returns the output only (no
-    log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
+    `sm_scale` defaults to `HEAD_DIM ** -0.5` and must be positive and finite.
+    Returns the output only (no log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
     uninitialized.
     """
     import torch
@@ -593,9 +690,14 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
         raise InvalidInput("tlx.ops.flash_attn_varlen expects int32 (batch + 1,) cu_seqlens_q and cu_seqlens_k")
     if any(t.device != q.device for t in (k, v, cu_seqlens_q, cu_seqlens_k)):
         raise InvalidInput("tlx.ops.flash_attn_varlen expects all tensors on one device")
+    space_name, invariance = _normalize_space_arg("flash_attn_varlen", space)
+    _check_single_config_space("flash_attn_varlen", space_name)
+    if sm_scale is not None and not 0 < sm_scale < math.inf:
+        raise InvalidInput(f"tlx.ops.flash_attn_varlen expects a positive finite sm_scale; got {sm_scale!r}")
     fn, spec = impl_for("flash_attn_varlen", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2])
     check_backward(spec, q, k, v)
+    _check_enforced("flash_attn_varlen", spec, invariance)
     with torch.cuda.device(q.device):
         return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal))
 
@@ -611,12 +713,14 @@ def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, cau
     Causal-only: `causal=False` raises `InvalidInput`. The argument is kept so
     the intent is stated at the call site rather than assumed.
     """
+    space_name, invariance = _normalize_space_arg("hstu_attn_dev", space)
     fn, spec = impl_for("hstu_attn_dev", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], causal=causal)
     check_backward(spec, q, k, v)
+    _check_enforced("hstu_attn_dev", spec, invariance)
     return fn(q, k, v, seq_offsets, max_seq_len, alpha if alpha is not None else 1.0 / q.shape[-1], causal=causal,
               attn_scale=attn_scale, num_targets=num_targets, max_attn_len=max_attn_len,
-              contextual_seq_len=contextual_seq_len, space=space)
+              contextual_seq_len=contextual_seq_len, space=space_name)
 
 
 _HSTU_CROSS_ATTN_IMPLS = {}
@@ -644,15 +748,17 @@ def hstu_cross_attn(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, s
         raise InvalidInput("tlx.ops.hstu_cross_attn takes seq_offsets_q and max_q_len together")
     if seq_offsets_q is None:
         seq_offsets_q, max_q_len = seq_offsets, max_seq_len
+    space_name, invariance = _normalize_space_arg("hstu_cross_attn", space)
     # Read from a global cache so Dynamo can guard the callable and catalog specification.
     fn, spec = _HSTU_CROSS_ATTN_IMPLS[_hstu_cross_attn_impl_key(q.device)]
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
     check_backward(spec, q, k, v)
+    _check_enforced("hstu_cross_attn", spec, invariance)
     import torch
     with torch.cuda.device(q.device):
         return fn(q, k, v, seq_offsets, seq_offsets_q, max_seq_len, max_q_len, attn_scale,
                   alpha if alpha is not None else q.shape[-1]**-0.5, num_softmax_heads=num_softmax_heads,
-                  num_targets=num_targets, causal=causal, shared_kv=shared_kv, space=space)
+                  num_targets=num_targets, causal=causal, shared_kv=shared_kv, space=space_name)
 
 
 def kimi_delta_attention(q, k, v, g, beta, *, scale=1.0, cu_seqlens=None, cu_seqlens_cpu=None, space="full"):
@@ -660,29 +766,58 @@ def kimi_delta_attention(q, k, v, g, beta, *, scale=1.0, cu_seqlens=None, cu_seq
 
     Returns the TritonBench-compatible `(output, None)` pair.
     """
+    space_name, invariance = _normalize_space_arg("kimi_delta_attention", space)
     fn, spec = impl_for("kimi_delta_attention", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
     check_backward(spec, q, k, v, g, beta)
-    return fn(q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, space=space)
+    _check_enforced("kimi_delta_attention", spec, invariance)
+    return fn(q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, space=space_name)
 
 
-def kda_paged_prefill(q, k, v, g, beta, *, scale=1.0, initial_state, cu_seqlens):
-    """Prepared-input chunked KDA prefill for packed `[1, T, H, 128]` tensors.
+def kda_paged_prefill(q, k, v, g, beta, *, scale=1.0, initial_state=None, cu_seqlens, A_log=None, dt_bias=None,
+                      lower_bound=None, beta_is_raw=False, state_pool=None, state_indices=None, space=None):
+    """Chunked KDA prefill for packed `[1, T, H, 128]` tensors.
 
-    `g` contains per-channel log decays and `beta` is sigmoid-applied.
-    State is FP32 and V-major: `[N, H, 128, 128]`. This op is currently
-    forward-only.
+    By default `g` contains per-channel log decays, `q`/`k` are l2-normalized
+    and `beta` is sigmoid-applied. Passing `A_log` and `dt_bias` takes raw
+    inputs instead: `q`/`k` are normalized in the kernel and `g` is the gate
+    pre-activation, mapped to `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`,
+    or to `-exp(A_log) * softplus(g + dt_bias)` without a lower bound.
+    `beta_is_raw` applies the sigmoid to `beta`.
+
+    State is FP32 and V-major: a dense `initial_state` `[N, H, 128, 128]`, or a
+    `state_pool` `[slots, H, 128, 128]` with `state_indices` `[N]` naming each
+    sequence's slot, updated in place. This op is currently forward-only.
+    ``space=`` takes no search space today; a ``Space`` is accepted only to
+    carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
     """
+    space_name, invariance = _normalize_space_arg("kda_paged_prefill", space)
+    _check_single_config_space("kda_paged_prefill", space_name)
     fn, spec = impl_for("kda_paged_prefill", device=q.device)
     check_inputs(spec, dtype=q.dtype, KEY_DIM=q.shape[-1], VALUE_DIM=v.shape[-1])
-    check_backward(spec, q, k, v, g, beta, initial_state)
-    return fn(q, k, v, g, beta, scale=scale, initial_state=initial_state, cu_seqlens=cu_seqlens)
+    check_backward(spec, q, k, v, g, beta, initial_state, state_pool, A_log, dt_bias)
+    _check_enforced("kda_paged_prefill", spec, invariance)
+    return fn(q, k, v, g, beta, scale=scale, initial_state=initial_state, cu_seqlens=cu_seqlens, A_log=A_log,
+              dt_bias=dt_bias, lower_bound=lower_bound, beta_is_raw=beta_is_raw, state_pool=state_pool,
+              state_indices=state_indices)
 
 
-def kda_recurrent_decode(q, k, v, g, beta, *, scale=1.0, state_pool, read_indices, write_indices, cu_seqlens):
-    """Forward-only indexed KDA recurrence over an FP32 V-major state pool."""
+def kda_recurrent_decode(q, k, v, g, beta, *, scale=1.0, state_pool, read_indices, write_indices, cu_seqlens,
+                         A_log=None, dt_bias=None, lower_bound=None, beta_is_raw=False, space=None):
+    """Forward-only indexed KDA recurrence over an FP32 V-major state pool.
+
+    Inputs are prepared (l2-normalized q/k, log decay g, activated beta) unless
+    `A_log` and `dt_bias` are passed, in which case they are raw, as for
+    `kda_paged_prefill`. ``space=`` takes no search space today; a ``Space`` is
+    accepted only to carry a ``BitwiseInvarianceSpec``, which is validated but
+    not enforced yet.
+    """
+    space_name, invariance = _normalize_space_arg("kda_recurrent_decode", space)
+    _check_single_config_space("kda_recurrent_decode", space_name)
     fn, spec = impl_for("kda_recurrent_decode", device=q.device)
     check_inputs(spec, dtype=q.dtype, KEY_DIM=q.shape[-1], VALUE_DIM=v.shape[-1])
-    check_backward(spec, q, k, v, g, beta, state_pool)
+    check_backward(spec, q, k, v, g, beta, state_pool, A_log, dt_bias)
+    _check_enforced("kda_recurrent_decode", spec, invariance)
     return fn(q, k, v, g, beta, scale=scale, state_pool=state_pool, read_indices=read_indices,
-              write_indices=write_indices, cu_seqlens=cu_seqlens)
+              write_indices=write_indices, cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias, lower_bound=lower_bound,
+              beta_is_raw=beta_is_raw)

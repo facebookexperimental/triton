@@ -7,16 +7,19 @@ module.exports = async ({github, context, jobName, platform}) => {
   });
   const cutoff = new Date(current.created_at);
   const gpu = [ "h100", "b200", "mi350" ].includes(platform);
-  // Keep pre-migration history available until the new parent has green runs.
-  const workflows = gpu ? [ current.workflow_id, `${platform}.yml` ]
-                        : [ current.workflow_id ];
+  // Keep pre-migration history available until the new parent has green runs:
+  // the per-GPU workflows', and gpu-tests.yml's for suites that moved to
+  // gpu-tests-nightly.yml.
+  const workflows =
+      gpu ? [ current.workflow_id, "gpu-tests.yml", `${platform}.yml` ]
+          : [ current.workflow_id ];
   const candidates = [];
   for (const workflow_id of workflows) {
     const {data} = await github.rest.actions.listWorkflowRuns({
       ...repo,
       workflow_id,
-      branch : "main",
-      event : "schedule",
+      branch : current.head_branch,
+      event : current.event,
       status : gpu ? "completed" : "success",
       per_page : 30,
     });
@@ -35,8 +38,10 @@ module.exports = async ({github, context, jobName, platform}) => {
           filter : "latest",
           per_page : 100,
         });
-    const matching = jobs.filter(
-        job => job.name === jobName || job.name === `${platform} / ${jobName}`);
+    // Called per GPU as "h100 / <job>" (gpu-tests.yml) or as a matrix value,
+    // "tritonbench (h100) / <job>" (gpu-tests-nightly.yml).
+    const matching = jobs.filter(job => job.name === jobName ||
+                                        job.name.endsWith(` / ${jobName}`));
     if (matching.length &&
         matching.every(job => job.conclusion === "success")) {
       return run.head_sha;

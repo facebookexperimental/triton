@@ -1,23 +1,24 @@
 name: Meta LLVM update (one line)
-# Called by meta-llvm-update.yml once per release line. update pushes the bump
-# branch and tracking issue; verify builds wheels from that branch only when its
-# content changed; report comments the outcome on the issue, or on the PR once a
-# person has opened it.
+# Called by meta-llvm-update.yml once per release line. Pushing the bump branch
+# starts the line's GPU workflows on it (their push trigger); the updater turns
+# their result into the line's issue on a later run.
 on:
   workflow_call:
     inputs:
-      target:      { type: string, required: true }
-      fork_branch: { type: string, required: true }
-      dry_run:     { type: boolean, required: false, default: false }
+      target:           { type: string, required: true }
+      fork_branch:      { type: string, required: true }
+      verify_workflows: { type: string, required: true }
+      dry_run:          { type: boolean, required: false, default: false }
 
-permissions: read-all
+permissions:
+  contents: read
+  actions: read
+  issues: write
+  pull-requests: write
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    outputs:
-      changed: ${{ steps.bump.outputs.changed }}
-      sha: ${{ steps.bump.outputs.sha }}
     steps:
       - name: Mint app token
         id: app-token
@@ -40,11 +41,13 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           sparse-checkout: cmake
 
-      - name: Prepare bump
-        id: bump
+      - name: Update bump and issue
         working-directory: target
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # git push uses the app token from the checkout above: its push starts the GPU
+          # workflows, a GITHUB_TOKEN push would not. The app cannot comment on issues, so
+          # gh (reads and issue/PR writes) uses GITHUB_TOKEN.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -52,37 +55,5 @@ jobs:
           python3 ../updater/.github/scripts/meta_llvm_update.py \
             --target "${{ inputs.target }}" \
             --fork-branch "${{ inputs.fork_branch }}" \
+            --verify-workflows "${{ inputs.verify_workflows }}" \
             ${{ inputs.dry_run && '--dry-run' || '' }}
-
-  verify:
-    needs: update
-    if: needs.update.outputs.changed == 'true'
-    uses: ./.github/workflows/wheels_fb.yml
-    with:
-      ref: ${{ needs.update.outputs.sha }}
-      pythons: '["cp312"]'
-
-  report:
-    needs: [update, verify]
-    if: always() && needs.update.outputs.changed == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Mint app token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
-      - name: Check out updater scripts (default branch)
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/scripts
-
-      - name: Report build check
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          python3 .github/scripts/meta_llvm_update.py --target "${{ inputs.target }}" \
-            --report "${{ needs.verify.result }}" \
-            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

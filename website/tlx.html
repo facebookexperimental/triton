@@ -23,6 +23,7 @@
       <nav><a href="tlx.html" aria-current="page">Overview</a>
 <a class="sub" href="#optimize-tlx-kernels">Optimize TLX kernels</a>
 <a class="sub" href="#hardware-tags">Hardware tags</a>
+<a class="sub" href="#per-hardware-support">Per-hardware support</a>
 <a href="buffers.html">Memory</a>
 <a href="global-memory.html">Global memory access</a>
 <a href="async-memory.html">Async memory access</a>
@@ -34,6 +35,11 @@
 <a href="utilities.html">Other operations</a>
 <a href="kernels.html">Tutorial kernels</a>
 <a href="tlx-ops.html">High-performance kernels</a>
+<a href="tlx-sm90.html">TLX on sm90 (Hopper)</a>
+<a href="tlx-sm100.html">TLX on sm100 (Blackwell)</a>
+<a href="tlx-gfx942.html">TLX on gfx942 (MI300)</a>
+<a href="tlx-gfx950.html">TLX on gfx950 (MI350)</a>
+<a href="tlx-gfx1250.html">TLX on gfx1250 (RDNA4)</a>
 <a href="testing.html">Testing</a>
 <a href="resources.html">Further reading</a></nav>
     </aside>
@@ -54,7 +60,13 @@
 <p>Every operation below is tagged with the targets it runs on, using the architecture ids from <code>triton._internal_testing</code> — the same vocabulary the rest of this repo uses:</p>
 <table><thead><tr><th>Tag</th><th>Hardware</th></tr></thead><tbody><tr><td><code>sm90</code></td><td>NVIDIA Hopper</td></tr><tr><td><code>sm100</code></td><td>NVIDIA Blackwell</td></tr><tr><td><code>sm90+</code></td><td>Hopper and newer NVIDIA</td></tr><tr><td><code>gfx942</code></td><td>AMD MI300 (CDNA3)</td></tr><tr><td><code>gfx950</code></td><td>AMD MI350 (CDNA4)</td></tr><tr><td><code>gfx942+</code></td><td>MI300 and newer AMD</td></tr><tr><td><code>gfx1250</code></td><td>AMD RDNA4</td></tr><tr><td><code>amd</code></td><td>All AMD targets</td></tr></tbody></table>
 <p>A trailing <code>?</code> (e.g. <code>gfx942+?</code>) marks availability that has <strong>not been confirmed yet</strong> and needs verification. An absent vendor means this document makes no claim for that vendor, not necessarily that the op is unsupported.</p>
-<p>Note: async copies (<code>async_load</code> and its commit/wait groups) and the AMD buffer ops require <strong>gfx950</strong> — they are <strong>not</strong> available on gfx942. <code>barrier_arrive</code> on AMD requires <code>arrive_count == 1</code>.</p></article>
+<p>Note: async copies (<code>async_load</code> and its commit/wait groups) and the AMD buffer ops require <strong>gfx950</strong> — they are <strong>not</strong> available on gfx942. <code>barrier_arrive</code> on AMD requires <code>arrive_count == 1</code>.</p>
+<h2 id="per-hardware-support">Per-hardware support</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><a href="tlx-gfx950.html">TLX on gfx950 (MI350)</a></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><a href="tlx-gfx942.html">TLX on gfx942 (MI300)</a></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><a href="tlx-sm100.html">TLX on sm100 (Blackwell)</a></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><a href="tlx-sm90.html">TLX on sm90 (Hopper)</a></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><a href="tlx-gfx1250.html">TLX on gfx1250 (RDNA4)</a></div></div></article>
 <footer class="pager"><a class="next" href="buffers.html">Memory →</a></footer>
     </main>
   </div>

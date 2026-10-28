@@ -16,6 +16,7 @@ split's partials.
 """
 
 import contextlib
+import inspect
 import time
 from types import SimpleNamespace
 
@@ -23,19 +24,41 @@ import pytest
 import torch
 import triton
 from triton._internal_testing import is_blackwell
+from triton.tlx.ops import BitwiseInvarianceSpec
+from triton.tlx.ops._catalog import invariant_vocab_for
 from triton.tlx.ops.kernels.mm import sm100
-from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
+from triton.tlx.ops.kernels.mm._shapes import SM100_CORRECTNESS_SHAPES, operand
 
-from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case
+from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case, run_mm_invariance_case
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires sm100")
 
 ARCH = "sm100"
+_GEMM_VOCAB = invariant_vocab_for("mm")
 
 _LONG_K_BF16_SKIP_REASON = "Long-K BF16 output currently exceeds the numerical tolerance"
 
 
-@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", CORRECTNESS_SHAPES)
+def test_mm_default_space_is_full(monkeypatch):
+    """`space=None` on sm100 dispatches to the tuned space, not the heuristic."""
+    import triton.tlx.ops as tlx_ops
+    from triton.tlx.ops._catalog import impl_for
+
+    _, spec = impl_for("mm", ARCH)
+    seen = {}
+
+    def record(a, b, *, out=None, space, invariance=None):
+        seen["space"] = space
+        return torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=a.dtype)
+
+    monkeypatch.setattr(tlx_ops, "_mm_impl_for_device", lambda device: (record, spec))
+    a = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    tlx_ops.mm(a, b)
+    assert seen["space"] == "full"
+
+
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", SM100_CORRECTNESS_SHAPES)
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     if (M, N, K, a_strides, b_strides, dtype_name) == (384, 384, 19459, (1, 384), (384, 1), "bf16"):
         pytest.skip(_LONG_K_BF16_SKIP_REASON)
@@ -193,7 +216,7 @@ def _pinned_config(overrides):
     """Force ``space="heuristic"`` to compile exactly one config."""
     original = sm100.heuristic_config
 
-    def one_config(M, N, K):
+    def one_config(M, N, K, *, invariance=None):
         cfg = sm100.get_heuristic_config(M, N, K, sm100._get_num_sms())
         assert cfg is not None, f"no heuristic config for {M}x{N}x{K}"
         cfg = dict(cfg)
@@ -275,3 +298,191 @@ def test_mm_rejects_unsupported_backward():
     with torch.no_grad():
         out = tlx_mm(a, b)
     assert not out.requires_grad
+
+
+@contextlib.contextmanager
+def _pinned_explicit(cfg):
+    """Force ``space="heuristic"`` to run exactly ``cfg``."""
+    original = sm100.heuristic_config
+    num_ctas = cfg.get("NUM_CTAS", 1)
+
+    def one_config(M, N, K, invariance=None):
+        return [
+            triton.Config(cfg, num_warps=4, num_stages=1, pre_hook=sm100.matmul_tma_set_block_size_hook,
+                          ctas_per_cga=(num_ctas, 1, 1) if num_ctas > 1 else None)
+        ]
+
+    sm100.heuristic_config = one_config
+    sm100._tuned.cache_clear()
+    try:
+        yield
+    finally:
+        sm100.heuristic_config = original
+        sm100._tuned.cache_clear()
+
+
+# Each N is fit by the non-power-of-two BLOCK_SIZE_N with less padding than by
+# its largest power-of-two piece, which the pruner requires to keep the config.
+NPOT_BLOCK_N_CASES = [
+    # (M, N, K, NUM_CTAS, BLOCK_SIZE_N, EPILOGUE_SUBTILE, NUM_MMA_GROUPS, SPLIT_K, b_row_major)
+    (512, 784, 512, 2, 160, 4, 1, 1, False),  # 128 + 32; 784 = 4.9 x 160
+    (512, 784, 512, 2, 160, 4, 1, 1, True),
+    (512, 784, 512, 2, 208, 8, 1, 1, False),  # 128 + 64 + 16, 2-CTA (8 B rows of the 16 piece per CTA)
+    (384, 296, 256, 1, 208, 8, 2, 1, True),  # 1-CTA, 2 groups, ragged N
+    (384, 296, 256, 1, 96, 2, 1, 1, False),  # 64 + 32
+    (256, 144, 256, 1, 144, 8, 2, 1, True),  # 128 + 16 = 144 exactly
+    (256, 784, 4096, 2, 224, 4, 1, 4, False),  # 128 + 64 + 32, split-K through the workspace
+]
+
+
+@pytest.mark.parametrize("M, N, K, NUM_CTAS, BLOCK_N, EPILOGUE_SUBTILE, NUM_MMA_GROUPS, SPLIT_K, b_row_major",
+                         NPOT_BLOCK_N_CASES)
+def test_npot_block_n_matches_reference(M, N, K, NUM_CTAS, BLOCK_N, EPILOGUE_SUBTILE, NUM_MMA_GROUPS, SPLIT_K,
+                                        b_row_major):
+    """A non-power-of-two BLOCK_SIZE_N (run as power-of-two MMAs) computes ``a @ b``."""
+    from triton.tlx.ops import mm as tlx_mm
+
+    cfg = {
+        "BLOCK_SIZE_M": 128 * NUM_MMA_GROUPS,
+        "BLOCK_SIZE_N": BLOCK_N,
+        "BLOCK_SIZE_K": 128 if BLOCK_N <= 160 else 64,
+        "GROUP_SIZE_M": 8,
+        "NUM_SMEM_BUFFERS": 2,
+        "NUM_TMEM_BUFFERS": 1,
+        "NUM_MMA_GROUPS": NUM_MMA_GROUPS,
+        "EPILOGUE_SUBTILE": EPILOGUE_SUBTILE,
+        "NUM_CTAS": NUM_CTAS,
+        "SPLIT_K": SPLIT_K,
+        "INTERLEAVE_EPILOGUE": 0,
+        "USE_WARP_BARRIER": False,
+    }
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, generator=gen)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16, generator=gen)
+    if not b_row_major:
+        b = b.t().contiguous().t()
+    with _pinned_explicit(cfg):
+        out = tlx_mm(a, b, space="heuristic")
+        chosen = sm100._tuned("heuristic", (M, N, K)).best_config.kwargs
+        assert chosen["BLOCK_SIZE_N"] == BLOCK_N, f"pin was defeated by config pruning; ran {chosen}"
+    ref = a.float() @ b.float()
+    torch.testing.assert_close(out.float(), ref, atol=REL_PRECISION[torch.bfloat16] * ref.abs().max().item(), rtol=0)
+
+
+def _npot_config(block_n, epilogue_subtile=4, num_ctas=1):
+    return triton.Config({
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 8,
+        "NUM_SMEM_BUFFERS": 2,
+        "NUM_TMEM_BUFFERS": 1,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": epilogue_subtile,
+        "NUM_CTAS": num_ctas,
+        "SPLIT_K": 1,
+        "INTERLEAVE_EPILOGUE": 0,
+    })
+
+
+@pytest.mark.parametrize("block_n, tail_count", [(128, 0), (160, 1), (208, 2)])
+@pytest.mark.parametrize("num_ctas", [1, 2])
+@pytest.mark.parametrize("b_row_major", [False, True])
+def test_kernel_positional_prefix_and_optional_tail_descriptors(block_n, tail_count, num_ctas, b_row_major):
+    """Old positional launches and new keyword tails bind to the same pre-hook."""
+    c = SimpleNamespace(shape=(128, 784))
+    a_desc = SimpleNamespace(block_shape=[1, 1])
+    b_desc = SimpleNamespace(block_shape=[1, 1])
+    c_desc = SimpleNamespace(base=c, block_shape=[1, 1])
+    workspace_desc = SimpleNamespace(base=c, block_shape=[1, 1])
+    tails = {name: SimpleNamespace(block_shape=[1, 1]) for name in ("b_tail_desc", "b_tail2_desc")[:tail_count]}
+    cfg = _npot_config(block_n, epilogue_subtile=8, num_ctas=num_ctas)
+    bound = inspect.signature(sm100.matmul_kernel_tma_ws_blackwell.fn).bind(a_desc, b_desc, c_desc, workspace_desc, 128,
+                                                                            784, 64, **cfg.kwargs, NUM_SMS=148,
+                                                                            B_ROW_MAJOR=b_row_major, **tails)
+    bound.apply_defaults()
+    nargs = bound.arguments
+    assert (nargs["M"], nargs["N"], nargs["K"]) == (128, 784, 64)
+    for name in ("b_tail_desc", "b_tail2_desc")[tail_count:]:
+        assert nargs[name] is None
+    sm100.matmul_tma_set_block_size_hook(nargs)
+    assert a_desc.block_shape == [128, 64]
+    for i, name in enumerate(("b_desc", "b_tail_desc", "b_tail2_desc")[:tail_count + 1]):
+        per_cta = sm100._n_piece(block_n, i) // num_ctas
+        expected = [64, per_cta] if b_row_major else [per_cta, 64]
+        assert nargs[name].block_shape == expected
+    assert c_desc.block_shape == workspace_desc.block_shape == [128, 16]
+    assert workspace_desc.base is c
+
+
+@pytest.mark.parametrize("num_ctas", [1, 2])
+def test_kernel_legacy_positional_launch_matches_reference(num_ctas):
+    """A power-of-two caller needs no tail descriptors, including through autotune."""
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16, generator=gen)
+    b = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16, generator=gen)
+    c = torch.empty_like(a)
+    descriptors = [TensorDescriptor(t, t.shape, t.stride(), [1, 1]) for t in (a, b, c, c)]
+    cfg = triton.Config(
+        _npot_config(128, epilogue_subtile=4, num_ctas=num_ctas).kwargs, num_warps=4, num_stages=1,
+        pre_hook=sm100.matmul_tma_set_block_size_hook, ctas_per_cga=(num_ctas, 1, 1) if num_ctas > 1 else None)
+    kernel = triton.autotune(configs=[cfg], key=["M", "N", "K"])(sm100.matmul_kernel_tma_ws_blackwell)
+    kernel[(4, )](*descriptors, 256, 256, 256, NUM_SMS=sm100._get_num_sms())
+    ref = a.float() @ b.float()
+    torch.testing.assert_close(c.float(), ref, atol=REL_PRECISION[torch.bfloat16] * ref.abs().max().item(), rtol=0)
+
+
+def test_n_piece_decomposition():
+    assert [sm100._n_piece(208, i) for i in range(4)] == [128, 64, 16, 0]
+    assert [sm100._n_piece(256, i) for i in range(2)] == [256, 0]
+
+
+def test_preprocess_drops_npot_block_n_that_does_not_reduce_padding():
+    """N = 1024 is fit exactly by 128; 160 only adds padding."""
+    assert sm100.preprocess_configs([_npot_config(160)], {"M": 1024, "N": 1024, "K": 4096}) == []
+
+
+def test_preprocess_drops_unsupported_npot_block_n():
+    shape = {"M": 1024, "N": 784, "K": 4096}
+    assert sm100.preprocess_configs([_npot_config(208, epilogue_subtile=8)], shape)
+    # 240 = 128 + 64 + 32 + 16: more than three pieces.
+    assert sm100.preprocess_configs([_npot_config(240, epilogue_subtile=8)], shape) == []
+    # The 16-wide piece is narrower than a 32-wide epilogue slice.
+    assert sm100.preprocess_configs([_npot_config(208, epilogue_subtile=4)], shape) == []
+
+
+_INVARIANCE_SPECS = [
+    BitwiseInvarianceSpec.dims("M"),
+    BitwiseInvarianceSpec.dims("K"),
+    BitwiseInvarianceSpec.all(),
+]
+
+_INVARIANCE_SHAPES = [
+    # Undersaturated: the default heuristic selects split-K here.
+    (1024, 256, 16384, (16384, 1), (256, 1), "bf16"),
+    (2048, 2048, 2048, (2048, 1), (2048, 1), "bf16"),
+]
+
+
+@pytest.mark.parametrize("spec", _INVARIANCE_SPECS)
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _INVARIANCE_SHAPES)
+def test_mm_invariance(spec, M, N, K, a_strides, b_strides, dtype_name):
+    """A non-empty spec gives exact M-slice equality."""
+    run_mm_invariance_case(ARCH, M, N, K, a_strides, b_strides, dtype_name, spec)
+
+
+@pytest.mark.parametrize("spec", _INVARIANCE_SPECS)
+def test_heuristic_prunes_split_k(spec):
+    """A fixed schedule prunes split-K from the heuristic config (no launch)."""
+    default = sm100.get_heuristic_config(1024, 256, 16384, num_sms=148)
+    assert default["SPLIT_K"] > 1
+    pruned = sm100.get_heuristic_config(1024, 256, 16384, num_sms=148, invariance=spec.resolve(_GEMM_VOCAB))
+    assert pruned["SPLIT_K"] == 1
+
+
+def test_eligible_configs_filter():
+    """The full-space filter keeps the single fixed SPLIT_K (no launch)."""
+    cfgs = [triton.Config({"SPLIT_K": sk}, num_warps=4) for sk in (1, 2, 4)]
+    assert [c.kwargs["SPLIT_K"] for c in sm100._eligible_configs(cfgs, 1)] == [1]

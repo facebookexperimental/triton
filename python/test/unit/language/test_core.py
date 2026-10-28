@@ -6,6 +6,7 @@ import re
 from typing import Optional
 import math
 import textwrap
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -1258,7 +1259,7 @@ def test_math_erf_op(dtype, member_fn, device):
 
 
 @pytest.mark.interpreter
-@pytest.mark.parametrize("dtype", [dtype for dtype in ["float32", "float64"]])
+@pytest.mark.parametrize("dtype", ["float16", "float32", "float64"])
 def test_math_fma_op(dtype, device):
     check_type_supported(dtype, device)
     SIZE = 128
@@ -1272,14 +1273,67 @@ def test_math_fma_op(dtype, device):
         z = tl.math.fma(x, y, w)
         tl.store(Z + off, z)
 
-    torch_dtype = torch.float32 if dtype == "float32" else torch.float64
-    x = torch.randn(SIZE, dtype=torch_dtype, device=device)
-    y = torch.randn(SIZE, dtype=torch_dtype, device=device)
-    w = torch.randn(SIZE, dtype=torch_dtype, device=device)
-    z_ref = x * y + w
-    z_tri = torch.zeros_like(x)
-    kernel[(1, )](z_tri, x, y, w, SIZE=SIZE, num_warps=4)
-    torch.testing.assert_close(z_tri, z_ref)
+    def fma_ref(x, y, w):
+        # Rational arithmetic keeps the product exact, so the result is rounded
+        # once as an fma requires.
+        exact = [Fraction(float(a)) * Fraction(float(b)) + Fraction(float(c)) for a, b, c in zip(x, y, w)]
+        return np.array([float(e) for e in exact], dtype=x.dtype)
+
+    rs = RandomState(17)
+    x = numpy_random((SIZE, ), dtype_str=dtype, rs=rs)
+    y = numpy_random((SIZE, ), dtype_str=dtype, rs=rs)
+    w = numpy_random((SIZE, ), dtype_str=dtype, rs=rs)
+    # Let half of the addends cancel the rounded product, the sharpest case.
+    w[SIZE // 2:] = -(x[SIZE // 2:] * y[SIZE // 2:])
+
+    x_tri = to_triton(x, device=device, dst_type=dtype)
+    y_tri = to_triton(y, device=device, dst_type=dtype)
+    w_tri = to_triton(w, device=device, dst_type=dtype)
+    z_tri = to_triton(np.zeros_like(x), device=device, dst_type=dtype)
+    kernel[(1, )](z_tri, x_tri, y_tri, w_tri, SIZE=SIZE, num_warps=4)
+
+    np.testing.assert_equal(fma_ref(x, y, w), to_numpy(z_tri))
+
+
+@pytest.mark.interpreter
+def test_math_fma_op_special_values(device):
+    check_type_supported('float64', device)
+
+    @triton.jit
+    def kernel(Z, X, Y, W, SIZE: tl.constexpr):
+        off = tl.arange(0, SIZE)
+        x = tl.load(X + off)
+        y = tl.load(Y + off)
+        w = tl.load(W + off)
+        z = tl.math.fma(x, y, w)
+        tl.store(Z + off, z)
+
+    finfo = np.finfo(np.float64)
+    inf, nan = float('inf'), float('nan')
+    cases = [
+        # x, y, w, expected
+        (nan, 1.0, 1.0, nan),
+        (inf, 0.0, 1.0, nan),
+        (2.0, 3.0, inf, inf),
+        (-finfo.max, finfo.max, inf, inf),
+        (-0.0, 1.0, -0.0, -0.0),
+        (1.0, 1.0, -1.0, 0.0),
+        (finfo.max, 2.0, finfo.max, inf),
+        (-finfo.smallest_subnormal, 0.5, 0.0, -0.0),
+    ]
+    x, y, w, expected = (np.array(column, dtype=np.float64) for column in zip(*cases))
+
+    x_tri = to_triton(x, device=device, dst_type='float64')
+    y_tri = to_triton(y, device=device, dst_type='float64')
+    w_tri = to_triton(w, device=device, dst_type='float64')
+    z_tri = to_triton(np.zeros_like(x), device=device, dst_type='float64')
+    kernel[(1, )](z_tri, x_tri, y_tri, w_tri, SIZE=len(cases))
+
+    z = to_numpy(z_tri)
+    np.testing.assert_equal(z, expected)
+    # assert_equal treats -0.0 and 0.0 as equal; NaN signs are unspecified.
+    finite = ~np.isnan(expected)
+    np.testing.assert_equal(np.signbit(z[finite]), np.signbit(expected[finite]))
 
 
 @pytest.mark.interpreter
@@ -1677,6 +1731,26 @@ def test_atomic_poll(dtype, bit_width, sem, scope, device):
         fence_sem = "acq_rel" if torch.cuda.get_device_capability()[0] < 9 else "acquire"
         assert ptx.count(f"fence.{fence_sem}.{scope};") == (sem == "acquire")
         assert "%globaltimer" not in ptx
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("block_size", [1, 16, 128, 512])
+@pytest.mark.parametrize("timeout", [None, 0])
+def test_atomic_poll_tensor_results(block_size, timeout, device):
+
+    @triton.jit
+    def kernel(flags, out, BLOCK: tl.constexpr, TIMEOUT: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        matched = tl.atomic_poll(flags + offsets, offsets + 1, timeout_ns=TIMEOUT)
+        tl.store(out + offsets, matched)
+
+    expected = torch.arange(1, block_size + 1, dtype=torch.int32, device=device)
+    flags = expected.clone()
+    if timeout is not None:
+        flags[::2] = 0
+    out = torch.empty(block_size, dtype=torch.bool, device=device)
+    kernel[(1, )](flags, out, block_size, timeout, num_warps=4)
+    assert torch.equal(out, flags == expected)
 
 
 def test_atomic_poll_no_timeout_uses_no_shared_memory(device):
@@ -3033,10 +3107,7 @@ def get_reduced_dtype(dtype_str, op):
 
 
 def get_reduce_input(dtype_str, shape):
-    # limit the range of integers so that reduce ops do not overflow
-    low = (0 if dtype_str in uint_dtypes else -10 if dtype_str in integral_dtypes else None)
-    high = 10 if dtype_str in integral_dtypes else None
-    return numpy_random(shape, dtype_str=dtype_str, low=low, high=high)
+    return numpy_random(shape, dtype_str=dtype_str)
 
 
 @pytest.mark.interpreter
@@ -3105,7 +3176,10 @@ def test_reduce1d(op, dtype_str, shape, num_ctas, device):
     kernel[(1, )](x_tri, z_tri, BLOCK=shape, num_ctas=num_ctas)
     z_tri = to_numpy(z_tri)
     # compare
-    if op == "sum":
+    if op == "sum" and dtype_str in integral_dtypes:
+        # Integer sums wrap around, so a relative tolerance is meaningless.
+        np.testing.assert_equal(z_ref, z_tri)
+    elif op == "sum":
         np.testing.assert_allclose(z_ref, z_tri, rtol=0.01)
     else:
         if "tie-break-left" in op:
@@ -3278,7 +3352,10 @@ def test_reduce(op, dtype_str, shape, axis, keep_dims, num_ctas, device):
     z_tri = to_numpy(z_tri)
 
     # compare
-    if op == "sum":
+    if op == "sum" and dtype_str in integral_dtypes:
+        # Integer sums wrap around, so a relative tolerance is meaningless.
+        np.testing.assert_equal(z_ref, z_tri)
+    elif op == "sum":
         np.testing.assert_allclose(z_ref, z_tri, rtol=0.01)
     else:
         if op in ("argmin", "argmax"):
@@ -7980,10 +8057,16 @@ def test_override_arch(arch, env_var_override, device, fresh_knobs):
             h = simple.warmup(data, out, arch=arch, grid=(1, ))
         ttgir_gfx = re.search(r"hip:(\w+)", h.asm["ttgir"])
         ttgir_warp = re.search(r'"ttg.threads-per-warp" = (\d+)', h.asm["ttgir"])
-        amdgcn_gfx = re.search(r'\.amdgcn_target "amdgcn-amd-amdhsa-[^-]*-(\w+)"', h.asm["amdgcn"])
+        amdgcn_target = re.search(r'\.amdgcn_target "(amdgpu[^-]*)-amd-amdhsa-[^-]*-(\w+)"', h.asm["amdgcn"])
+        expected_triple_arch = {
+            "gfx942": "amdgpu9.42",
+            "gfx950": "amdgpu9.50",
+            "gfx1200": "amdgpu12.00",
+        }
         assert ttgir_gfx.group(1) == arch
         assert int(ttgir_warp.group(1)) == (32 if arch == "gfx1200" else 64)
-        assert amdgcn_gfx.group(1) == arch
+        assert amdgcn_target.group(1) == expected_triple_arch[arch]
+        assert amdgcn_target.group(2) == arch
 
 
 def test_num_ctas_pre_sm90(device, fresh_knobs):

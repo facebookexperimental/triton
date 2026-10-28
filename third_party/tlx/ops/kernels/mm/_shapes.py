@@ -52,6 +52,30 @@ FOCUS_SUITES = (
         ),
     ),
     FocusSuite(
+        # Small-M inference GEMMs: A [M, K] row-major times W^T, W [N, K], with
+        # M ~ 700 or ~ 7.
+        name="sm90_1",
+        op="mm",
+        shapes=(
+            MMShape(706, 2560, 2560, (2560, 1), (1, 2560), "fp16"),
+            MMShape(706, 8192, 2560, (2560, 1), (1, 2560), "fp16"),
+            MMShape(706, 128, 3536, (3536, 1), (1, 3536), "fp16"),
+            MMShape(706, 3536, 128, (128, 1), (1, 128), "fp16"),
+            MMShape(7, 16384, 4096, (4096, 1), (1, 4096), "fp16"),
+            MMShape(7, 4096, 4096, (4096, 1), (1, 4096), "fp16"),
+            MMShape(7, 1024, 4992, (4992, 1), (1, 4992), "fp16"),
+            MMShape(7, 4992, 128, (128, 1), (1, 128), "fp16"),
+            MMShape(706, 2560, 20992, (20992, 1), (1, 20992), "fp16"),
+            MMShape(706, 512, 20992, (20992, 1), (1, 20992), "fp16"),
+            MMShape(706, 256, 20992, (20992, 1), (1, 20992), "fp16"),
+            MMShape(706, 20992, 512, (512, 1), (1, 512), "fp16"),
+            MMShape(706, 20992, 256, (256, 1), (1, 256), "fp16"),
+            MMShape(706, 1024, 3536, (3536, 1), (1, 3536), "fp16"),
+            MMShape(706, 2048, 7072, (7072, 1), (1, 7072), "fp16"),
+            MMShape(7, 4096, 7168, (7168, 1), (1, 7168), "fp16"),
+        ),
+    ),
+    FocusSuite(
         name="sm100_1",
         op="mm",
         shapes=(
@@ -643,7 +667,7 @@ FOCUS_SUITES = (
 )
 
 DEFAULT_SUITES = {
-    "sm90": ("sm90_baseline", ),
+    "sm90": ("sm90_baseline", "sm90_1"),
     "sm100": ("sm100_1", ),
     "gfx950": ("gfx950_all", ),
     "gfx942": ("gfx942_all", ),
@@ -652,6 +676,9 @@ FOCUS = FocusRegistry("mm", FOCUS_SUITES, DEFAULT_SUITES)
 
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 SM90_FOCUS = FOCUS.shapes("sm90")
+# sm90_1 is tuned and tested for Hopper; Blackwell does not run it.
+SM100_CORRECTNESS_SHAPES = tuple(shape for shape in CORRECTNESS_SHAPES
+                                 if shape not in frozenset(FOCUS.resolved_shapes("sm90_1")))
 
 
 def operand(rows, cols, strides, dtype, device="cuda"):

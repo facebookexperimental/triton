@@ -1,9 +1,9 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CI health · facebookexperimental/triton</title>
 <style>
-.viz-root{color-scheme:light;--page:#f9f9f7;--surface-1:#fcfcfb;--text-primary:#0b0b0b;--text-secondary:#52514e;--text-muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--series-1:#2a78d6;--neutral:#c3c2b7;--critical:#d03b3b;--good:#0ca30c;--warning:#c98500;--serious:#ec835a;--wash:rgba(11,11,11,.04);--crit-wash:rgba(208,59,59,.07);--warn-wash:rgba(237,161,0,.08)}
-@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) .viz-root{color-scheme:dark;--page:#0d0d0d;--surface-1:#1a1a19;--text-primary:#fff;--text-secondary:#c3c2b7;--text-muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;--neutral:#4a4a46;--wash:rgba(255,255,255,.05);--crit-wash:rgba(208,59,59,.14);--warn-wash:rgba(237,161,0,.12)}}
-:root[data-theme="dark"] .viz-root{color-scheme:dark;--page:#0d0d0d;--surface-1:#1a1a19;--text-primary:#fff;--text-secondary:#c3c2b7;--text-muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;--neutral:#4a4a46;--wash:rgba(255,255,255,.05);--crit-wash:rgba(208,59,59,.14);--warn-wash:rgba(237,161,0,.12)}
+.viz-root{color-scheme:light;--page:#f9f9f7;--surface-1:#fcfcfb;--text-primary:#0b0b0b;--text-secondary:#52514e;--text-muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--ord-0:#86b6ef;--ord-1:#5598e7;--ord-2:#2a78d6;--ord-3:#1c5cab;--ord-ink-0:#0b0b0b;--ord-ink-1:#0b0b0b;--ord-ink-2:#fff;--ord-ink-3:#fff;--neutral:#c3c2b7;--critical:#d03b3b;--good:#0ca30c;--warning:#c98500;--serious:#ec835a;--wash:rgba(11,11,11,.04);--crit-wash:rgba(208,59,59,.07);--warn-wash:rgba(237,161,0,.08)}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) .viz-root{color-scheme:dark;--page:#0d0d0d;--surface-1:#1a1a19;--text-primary:#fff;--text-secondary:#c3c2b7;--text-muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--ord-0:#184f95;--ord-1:#256abf;--ord-2:#3987e5;--ord-3:#86b6ef;--ord-ink-0:#fff;--ord-ink-1:#fff;--ord-ink-2:#0b0b0b;--ord-ink-3:#0b0b0b;--neutral:#4a4a46;--wash:rgba(255,255,255,.05);--crit-wash:rgba(208,59,59,.14);--warn-wash:rgba(237,161,0,.12)}}
+:root[data-theme="dark"] .viz-root{color-scheme:dark;--page:#0d0d0d;--surface-1:#1a1a19;--text-primary:#fff;--text-secondary:#c3c2b7;--text-muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--ord-0:#184f95;--ord-1:#256abf;--ord-2:#3987e5;--ord-3:#86b6ef;--ord-ink-0:#fff;--ord-ink-1:#fff;--ord-ink-2:#0b0b0b;--ord-ink-3:#0b0b0b;--neutral:#4a4a46;--wash:rgba(255,255,255,.05);--crit-wash:rgba(208,59,59,.14);--warn-wash:rgba(237,161,0,.12)}
 *{box-sizing:border-box}body{margin:0}
 .viz-root{background:var(--page);color:var(--text-primary);min-height:100vh;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:28px 20px 64px}
 .wrap{max-width:1080px;margin:0 auto}
@@ -13,6 +13,8 @@ h1{font-size:23px;margin:0 0 2px;font-weight:650}h2{font-size:16px;margin:0;font
 button.theme{background:var(--surface-1);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer;font:inherit;font-size:12px}
 nav.tabs{display:flex;gap:2px;margin:18px 0 0;border-bottom:1px solid var(--border);flex-wrap:wrap}
 nav.tabs button{background:none;border:0;border-bottom:3px solid transparent;margin-bottom:-1px;padding:8px 14px;font:inherit;font-size:14px;color:var(--text-secondary);cursor:pointer;display:inline-flex;gap:8px;align-items:center}
+.tabrows{display:grid;grid-template-columns:auto 1fr;column-gap:10px;align-items:center;margin-top:14px;border-bottom:1px solid var(--border)}
+.tabrows nav.tabs{margin:0;border-bottom:0}
 nav.tabs button:hover{color:var(--text-primary)}nav.tabs button[aria-selected="true"]{color:var(--text-primary);font-weight:620;border-bottom-color:var(--text-primary)}
 nav.tabs .badge{font-size:11.5px;font-weight:600;border-radius:999px;padding:0 7px;border:1px solid currentColor}
 section[hidden]{display:none}section{margin-top:18px}
@@ -21,7 +23,8 @@ section[hidden]{display:none}section{margin-top:18px}
 .card{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-top:14px}
 .grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:14px}
 .grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
-@media (max-width:820px){.grid3,.grid4{grid-template-columns:1fr}}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+@media (max-width:820px){.grid2,.grid3,.grid4{grid-template-columns:1fr}}
 .strip th.latest{color:var(--text-primary);font-weight:700;font-family:inherit;font-size:11px;line-height:1.25}.strip th.latest a{font-weight:700}
 .strip td.latest,.strip th.latest{padding:3px 12px 3px 3px;border-right:1px solid var(--axis)}
 .strip td.latest .cell{width:auto;min-width:104px;padding:0 10px;height:30px;font-size:13.5px;white-space:nowrap;box-shadow:0 0 0 2px var(--text-primary)}
@@ -34,11 +37,18 @@ a{color:var(--series-1)}
 details{margin-top:6px}summary{cursor:pointer;color:var(--text-secondary);font-size:13px;font-weight:600}
 .strip{border-collapse:separate;border-spacing:3px;width:auto}.strip td,.strip th{border:0;padding:0}
 .strip th{font-weight:500;color:var(--text-muted);font-size:10.5px;text-align:center;font-family:ui-monospace,monospace;padding:0 2px}
+.strip a.cell-link{text-decoration:none;display:block}.strip a.cell-link .cell{cursor:pointer}.strip a.cell-link:hover .cell{outline:2px solid var(--text-primary);outline-offset:1px}
+.strip td.gl.step{font-size:12.5px;font-weight:500;padding-left:16px;color:var(--text-secondary)}.strip td.gl[data-g]{cursor:pointer}
+.strip tr.grp td{font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--text-muted);font-weight:650;padding:12px 0 2px}.strip tr.grp .muted{text-transform:none;letter-spacing:0;font-weight:400;font-family:var(--mono,monospace)}
 .strip td.gl{font-size:14px;font-weight:650;color:var(--text-primary);padding-right:12px;white-space:nowrap;vertical-align:middle;width:170px;min-width:170px}
 .strip td{vertical-align:middle}
 .cell{width:46px;height:24px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;cursor:default}
 .c-pass{background:rgba(12,163,12,.14);color:var(--good)}.c-known{background:rgba(237,161,0,.20);color:var(--warning)}
 .c-new{background:var(--critical);color:#fff}.c-setup{background:rgba(236,131,90,.22);color:var(--serious)}.c-na{background:var(--wash);color:var(--text-muted)}.c-blocked{background:var(--wash);color:var(--warning)}
+.branchbar{display:flex;gap:10px;align-items:center;margin-top:14px}.branchbar .seg{margin-left:0}
+/* The page's filters (branch; GPU and time range on the Operations tab) stay in reach while scrolling. */
+.filterbar{position:sticky;top:0;z-index:5;margin-top:12px;padding:8px 12px;border-radius:10px;border:1px solid color-mix(in srgb,var(--series-1) 35%,var(--border));background:color-mix(in srgb,var(--series-1) 12%,var(--page));box-shadow:0 2px 6px rgba(0,0,0,.08)}
+.filterbar .muted{color:var(--text-secondary);font-weight:600}#ops-filters{display:inline-flex;gap:10px;align-items:center;margin-left:14px}#ops-filters[hidden]{display:none}
 .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-left:auto}
 .seg button{background:var(--surface-1);border:0;border-right:1px solid var(--border);padding:4px 12px;font:inherit;font-size:12.5px;color:var(--text-secondary);cursor:pointer}
 .seg button:last-child{border-right:0}.seg button[aria-pressed="true"]{background:var(--wash);color:var(--text-primary);font-weight:650}
@@ -46,45 +56,61 @@ details{margin-top:6px}summary{cursor:pointer;color:var(--text-secondary);font-s
 .legend .cell{width:22px;height:16px;font-size:10px}.legend i.sw{width:10px;height:10px;border-radius:3px;display:inline-block}
 .callout{border-left:4px solid var(--series-1);background:var(--surface-1);border-radius:0 10px 10px 0;padding:12px 14px;margin-top:14px;font-size:14px}.callout b{font-size:15px}
 .tile{background:var(--page);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
-.tile .k{font-size:12px;color:var(--text-muted)}.tile .big{font-size:20px;font-weight:650;font-variant-numeric:tabular-nums}.tile .d{font-size:12px;color:var(--text-secondary)}
+.tile .k{font-size:12px;color:var(--text-muted)}.tile .big{font-size:20px;font-weight:650;font-variant-numeric:tabular-nums}.tile .big code{font-size:16px;background:none;padding:0}.tile .d{font-size:12px;color:var(--text-secondary)}
 .tag{display:inline-block;font-size:11px;border-radius:999px;padding:0 7px;border:1px solid var(--border);color:var(--text-secondary);white-space:nowrap}
 .tag.main{border-color:var(--warning);color:var(--warning)}.tag.own{border-color:var(--critical);color:var(--critical)}.tag.ci{border-color:var(--serious);color:var(--serious)}
 svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-muted);font-size:10.5px;font-family:inherit}svg.bars line{stroke:var(--grid)}
 .subsec{display:flex;align-items:baseline;gap:10px;margin:20px 0 -4px}.subsec h3{font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--text-muted);margin:0}
+.trig{display:grid;grid-template-columns:96px minmax(0,1fr) 250px;gap:6px 14px;align-items:center;margin-top:12px}
+.trig .name{font-weight:650}.trig .name .muted{display:block;font-weight:400}
+.hbar{display:flex;gap:2px;height:22px}.hbar span{display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:600;overflow:hidden;white-space:nowrap;min-width:3px}
+.hbar span:first-child{border-radius:4px 0 0 4px}.hbar span:last-child{border-radius:0 4px 4px 0}.hbar span:only-child{border-radius:4px}
+.trig .sub{grid-column:2;font-size:12px;color:var(--text-muted);margin-top:-4px}
 .note{font-size:12px;color:var(--text-muted);margin:8px 0 0}
 .empty{color:var(--text-muted);font-size:13px;margin:6px 0 0}
 .tip{position:fixed;pointer-events:none;background:var(--surface-1);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;padding:7px 9px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.12);opacity:0;z-index:10;max-width:360px;white-space:pre-line}
 </style></head><body><div class="viz-root"><div class="wrap">
 <header><div><h1>CI health: facebookexperimental/triton</h1>
-<p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every 3 h</p></div>
+<p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every hour</p></div>
 <button class="theme" id="themeBtn" type="button">Toggle theme</button></header>
-<nav class="tabs" role="tablist">
-<button role="tab" data-tab="main" aria-selected="true">Main <span class="badge" id="b-main"></span></button>
-<button role="tab" data-tab="sched" aria-selected="false">Nightly &amp; perf <span class="badge" id="b-sched"></span></button>
+<div class="branchbar filterbar"><span class="muted">Branch</span><span class="seg" id="branch-sel"></span><span id="ops-filters" hidden><span class="muted">GPU</span><span class="seg" id="o-gpu"></span><span class="muted">Time range</span><span class="seg" id="o-range"></span></span></div>
+<div class="tabrows">
+<span class="muted">Tests</span><nav class="tabs" role="tablist" aria-label="Tests">
+<button role="tab" data-tab="main" aria-selected="true">Push <span class="badge" id="b-main"></span></button>
+<button role="tab" data-tab="sched" aria-selected="false">Scheduled <span class="badge" id="b-sched"></span></button>
 <button role="tab" data-tab="pr" aria-selected="false">Pull requests <span class="badge na">author-owned</span></button>
-<button role="tab" data-tab="ops" aria-selected="false">Operations <span class="badge" id="b-ops"></span></button>
 </nav>
+<span class="muted">Health</span><nav class="tabs" role="tablist" aria-label="Health">
+<button role="tab" data-tab="perf" aria-selected="false">Perf <span class="badge" id="b-perf"></span></button>
+<button role="tab" data-tab="ops" aria-selected="false">Operations <span class="badge" id="b-ops"></span></button>
+<button role="tab" data-tab="llvm" aria-selected="false">LLVM pins <span class="badge" id="b-llvm"></span></button>
+</nav>
+</div>
 <p class="empty" id="nodata" hidden>No data collected yet.</p>
 
 <section id="main" role="tabpanel">
-<div class="shead"><h2>Main</h2><span class="q">Did a push to main break something new?</span><span class="owner">Owner: on-call / commit author</span></div>
-<div class="subsec"><h3>GPU Tests</h3><span class="muted">push runs of Meta Triton GPU Tests (<code>gpu-tests.yml</code>)</span></div>
-<div id="m-build"></div>
-<div class="card"><h3>By GPU: verdict and the last pushes, newest first (T+N h = pushed N hours before the data time)</h3><table class="strip" id="m-grid"></table>
-<div class="legend"><span><i class="cell c-pass">✓</i>all pass</span><span><i class="cell c-new">✕</i>new failure</span><span><i class="cell c-known">●</i>known failures only</span><span><i class="cell c-setup">⚠</i>setup failure, no test result</span><span><i class="cell c-na">–</i>not run (path filter or build failed)</span></div></div>
-<div class="card"><div class="chead"><h3 style="margin:0">By test step</h3><span class="seg" id="m-step-sel"></span></div>
-<table class="strip" id="m-steps" style="margin-top:8px"></table>
-<div class="legend"><span><i class="cell c-pass">✓</i>pass</span><span><i class="cell c-new">✕</i>new failure</span><span><i class="cell c-known">●</i>known failure</span><span><i class="cell c-setup">⚠</i>job failed in setup</span><span><i class="cell c-blocked">⊘</i>skipped: an earlier step failed</span><span><i class="cell c-na">–</i>not run</span></div>
-<p class="note">A step that shows ⊘ or – for several pushes is a blind spot: the GPU's verdict cannot see it.</p></div>
+<div class="shead"><h2>Push</h2><span class="q" id="m-q">Did a push to main break something new?</span><span class="owner">Owner: on-call / commit author</span></div>
+<div id="m-build"></div><div id="t-build"></div>
+<div class="card"><h3>By commit: each test group on the last pushes, newest first (T+N h = pushed N hours before the data time)</h3><table class="strip" id="m-grid"></table>
+<div class="legend"><span><i class="cell c-pass">✓</i>all pass</span><span><i class="cell c-new">✕</i>new failure: this commit broke it</span><span><i class="cell c-known">●</i>still failing from an earlier commit</span><span><i class="cell c-setup">⚠</i>setup or build failure, no test result</span><span><i class="cell c-blocked">⊘</i>step skipped: an earlier step failed</span><span><i class="cell c-setup">?</i>job failed, log unavailable</span><span><i class="cell c-na">…</i>running</span><span><i class="cell c-na">○</i>skipped: nothing this suite tests changed</span><span><i class="cell c-na">–</i>not run on this commit</span></div>
+<p class="note">The Latest column is the newest commit only; the failure tables below keep each suite's last result. Click a GPU to show or hide its test steps; a GPU with failures opens on its own. A step that shows ⊘ or – for several pushes is a blind spot: the GPU's verdict cannot see it.</p></div>
 <div class="card"><h3>New failures: tests that passed on the previous push and fail now</h3><div id="m-new"></div>
-<p class="note">A test is <b>new</b> when it failed on this push and passed on the previous push that ran its step on the same GPU. Pushes where the step was skipped or hit a setup failure do not count. On the step's next result it moves to Known, keeping the push it first failed at. The last column checks the scheduled run of the same commit: a failure it reproduces is real, one it does not is a flake candidate.</p></div>
+<p class="note">A test is <b>new</b> when it failed on this push and passed on the previous push that ran it (for a GPU test, the same step on the same GPU). Pushes where it was skipped, or hit a setup or build failure, do not count. On its next result it moves to Known, keeping the push it first failed at. The last column checks the scheduled GPU run of the same commit: a failure it reproduces is real, one it does not is a flake candidate.</p></div>
 <div class="card"><details open id="m-known-d"><summary id="m-known-s">Known failures</summary><div id="m-known"></div></details>
 <details><summary id="m-setup-s">Setup failures</summary><div id="m-setup"></div><p class="note">A setup failure leaves no test result for that job, so the next push compares against the last push that has one.</p></details></div>
 </section>
 
 <section id="sched" role="tabpanel" hidden>
-<div class="shead"><h2>Nightly &amp; perf</h2><span class="q">Did the nightly release ship, and did perf regress?</span><span class="owner">Owner: release / perf owners</span></div>
+<div class="shead"><h2>Scheduled</h2><span class="q">Did last night's scheduled runs pass?</span><span class="owner">Owner: release owners</span></div>
 <div class="card"><h3>Nightly release (<code>nightly-fbtriton.yml</code>)</h3><div class="grid4" id="n-rel"></div></div>
+<div class="card"><h3>GPU tests, nightly (<code>gpu-tests-nightly.yml</code>): TritonBench</h3><div id="n-gpu"></div>
+<p class="note">Suites too slow for PRs and pushes run here once a day. Each row is the latest run on that GPU.</p></div>
+<div class="card"><h3>TLX ops bench (<code>nightly-tlx-ops-bench.yml</code>)</h3><div id="n-bench"></div>
+<p class="note">Times every tlx.ops op against its reference on each GPU after each nightly release. Each row is the latest run on that GPU, with the ops whose bench failed; per-case numbers are on the <a href="../bench/">TLX ops bench dashboard</a>.</p></div>
+</section>
+
+<section id="perf" role="tabpanel" hidden>
+<div class="shead"><h2>Perf</h2><span class="q">Did a TLX op get slower or faster over the last two nights?</span><span class="owner">Owner: perf owners</span></div>
 <div class="card"><h3>Perf events from the TLX ops bench, last two nights</h3><div id="n-perf"></div>
 <p class="note">An event is a case whose TLX TFLOP/s moved 10% or more from one night to the next and still holds the night after. The latest night cannot be confirmed yet. Full per-kernel history is on the <a href="../bench/">TLX ops bench dashboard</a>.</p></div>
 </section>
@@ -98,18 +124,43 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <section id="ops" role="tabpanel" hidden>
 <div class="shead"><h2>Operations</h2><span class="q">Is CI itself healthy, and what does it cost?</span><span class="owner">Owner: CI maintainers</span></div>
 <div class="grid4" style="margin-top:14px" id="o-tiles"></div>
-<div class="card"><h3>Smart trigger: what the <code>select</code> job ran, last 7 days</h3><div id="o-select"></div><div id="o-select-a"></div>
-<p class="note">PR and push runs should run only the GPUs their changed paths touch, and skip the build when none are touched. Scheduled and manual runs should run every GPU. A fallback means the changed paths were unavailable, so every suite ran.</p></div>
-<div class="card"><h3>GPU hours per day, by run outcome</h3>
-<div class="legend"><span><i class="sw" style="background:var(--good)"></i>passed</span><span><i class="sw" style="background:var(--critical)"></i>test or build failure</span><span><i class="sw" style="background:var(--serious)"></i>setup failure</span><span><i class="sw" style="background:var(--neutral)"></i>cancelled</span></div>
-<svg class="bars" id="o-hours" viewBox="0 0 720 190"></svg>
-<p class="note">Job start-to-finish time on GPU runners, all triggers. Setup failures and cancelled runs are spent GPU time that produced no test result.</p></div>
-<div class="card"><h3>Job duration, last 7 days vs the 7 before (minutes)</h3><div id="o-jobs"></div>
+<div class="card"><h3>Smart trigger: which GPU types each run tested</h3><div id="o-select-a"></div>
+<div class="legend"><span><i class="sw" style="background:var(--ord-3)"></i>all 3</span><span><i class="sw" style="background:var(--ord-2)"></i>2 of 3</span><span><i class="sw" style="background:var(--ord-1)"></i>1 of 3</span><span><i class="sw" style="background:var(--ord-0)"></i>none (build skipped too)</span></div>
+<div id="o-select"></div>
+<p class="note">The <code>select</code> job picks the GPU types (H100, B200, MI350) whose code a change touches. PR and push runs should skip the rest; a "GPU suite" is one GPU type's tests in one run. Scheduled and manual runs must test all three. A fallback means the changed paths were unavailable, so every suite ran.</p></div>
+<div class="card"><h3>GPU hours and runs per day, by run outcome</h3>
+<div class="legend"><span><i class="sw" style="background:var(--good)"></i>passed</span><span><i class="sw" style="background:var(--critical)"></i>test failure</span><span><i class="sw" style="background:var(--warning)"></i>build failure</span><span><i class="sw" style="background:var(--serious)"></i>setup failure</span><span><i class="sw" style="background:var(--neutral)"></i>cancelled</span></div>
+<h3 class="muted" style="margin-top:10px">GPU hours</h3><svg class="bars" id="o-hours" viewBox="0 0 720 190"></svg>
+<h3 class="muted" style="margin-top:10px">Runs</h3><svg class="bars" id="o-runs" viewBox="0 0 720 190"></svg>
+<p class="note">GPU hours are job start-to-finish time on GPU runners, all triggers. Setup failures and cancelled runs are spent GPU time that produced no test result. A build failure stops the run before its GPU jobs, so it shows in runs, not hours. Runs count only runs that used GPU time or failed the build.</p></div>
+<div class="card"><h3>GPU minutes per run</h3>
+<div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>push</span><span><i class="sw" style="background:var(--series-2)"></i>PR</span><span class="muted">median per day</span></div>
+<svg class="bars" id="o-per-run" viewBox="0 0 720 190"></svg>
+<p class="note">Push and PR runs that passed or failed tests. Cancelled runs and setup or build failures stopped early and are left out. Hover a day for the 25th and 75th percentiles. A PR run tests only the GPUs its paths touch, so the spread mixes one-GPU and all-GPU runs.</p></div>
+<div class="card"><h3>Queue time: waiting for a GPU runner (minutes)</h3>
+<div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>B200</span><span><i class="sw" style="background:var(--series-2)"></i>H100</span><span><i class="sw" style="background:var(--series-3)"></i>MI350</span><span class="muted">median per day (per hour, in the 3-day range)</span></div>
+<svg class="bars" id="o-queue" viewBox="0 0 720 190"></svg><div id="o-queue-t" style="margin-top:12px"></div>
+<p class="note">Time from a GPU job being queued to a runner picking it up, all triggers, jobs that ran. Each line is the day's median (the hour's, in the 3-day range); hover for the 25th and 75th percentiles. "Last to finish" is how often that GPU's job was the last one on a PR run: that job decides when the PR gets its result, so its queue is the wait the queue tile reports.</p></div>
+<div class="card"><h3>GPU jobs running at once</h3>
+<div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>B200</span><span><i class="sw" style="background:var(--series-2)"></i>H100</span><span><i class="sw" style="background:var(--series-3)"></i>MI350</span><span class="muted">peak per day (per hour, in the 3-day range)</span></div>
+<svg class="bars" id="o-conc" viewBox="0 0 720 190"></svg>
+<p class="note">The most GPU jobs of each type running at the same moment, from job start and finish times; hover for the time-weighted average and the most jobs waiting for a runner. Every branch and trigger counts, since they share the runners. Only this repository's CI workflows are counted: other repositories share some runner pools, so a flat peak with jobs waiting means the pool is full, not that demand stopped.</p></div>
+<div class="card"><h3 id="o-jobs-h">Job duration (minutes)</h3><div id="o-jobs"></div>
 <p class="note">The slowest 10% shows stalls the median hides, such as a wheel download that stalls.</p></div>
+<div class="card"><h3 id="o-slow-h">Slowest tests, main pushes (seconds)</h3><div id="o-slow"></div>
+<p class="note">From pytest's <code>--durations</code> list in each GPU test job of a push to main: each step prints only its 25 slowest test phases (setup, call or teardown), so "Runs" counts how often a test was among them. A test's time is the sum of its listed phases. Ranked by median time.</p></div>
 <div class="card"><h3>Setup failures, last 7 days, by step</h3><div id="o-setup"></div></div>
 </section>
 
-<p class="muted" style="margin-top:28px">Rebuilt every 3 h from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
+<section id="llvm" role="tabpanel" hidden>
+<div class="shead"><h2>LLVM pins</h2><span class="q" id="l-q">Which LLVM does the branch build against, and is a newer one waiting?</span><span class="owner">Owner: LLVM release owners</span></div>
+<div class="card"><h3>LLVM release</h3><div class="grid2" id="l-current"></div></div>
+<div class="card"><h3>Upgrade</h3><div id="l-status" style="font-size:14px"></div></div>
+<div class="card"><h3>Pin updates, newest first</h3><div id="l-history"></div>
+<p class="note">Each row is a commit that moved <code>cmake/meta-llvm-info.json</code> to a new LLVM release, with a link to the fork commits it added over the previous pin (over the upstream pin for the first).</p></div>
+</section>
+
+<p class="muted" style="margin-top:28px">Rebuilt every hour from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
 </div><div class="tip" id="tip"></div></div>
 <script>
 const REPO="https://github.com/facebookexperimental/triton";
@@ -124,90 +175,241 @@ const table=(head,rows,num=[])=>rows.length?`<table><tr>${head.map((h,i)=>`<th c
 const tile=(k,big,d,cls="")=>`<div class="tile"><div class="k">${k}</div><div class="big ${cls}">${big}</div><div class="d">${d}</div></div>`;
 const badge=(id,text,cls)=>{const b=$(id);b.textContent=text;b.className="badge "+cls};
 
-function renderMain(m){
+function renderLit(l){
+  $("t-build").innerHTML="";
+  if(!l)return null;
+  if(l.unknown)$("t-build").innerHTML=`<div class="banner"><b class="bad">✕ LIT job failed</b> at <a href="${esc(l.unknown.url)}">${esc(l.unknown.sha.slice(0,9))}</a>, ${ago(l.unknown.t)}, and its log is unavailable, so which tests failed is unknown.</div>`;
+  if(l.build)$("t-build").innerHTML=`<div class="banner"><b class="bad">✕ LIT build failed</b> at <a href="${esc(l.build.url)}">${esc(l.build.sha.slice(0,9))}</a>, ${ago(l.build.t)}. lit did not run on this push; its verdict is from its last result.</div>`;
+  return l;
+}
+
+let OPEN=null;
+function renderMain(m,l,branch){
+  if(OPEN===null||OPEN.branch!==branch)OPEN=Object.fromEntries(["H100","B200","MI350"].map(g=>[g,m.gpus[g].verdict==="new"||m.gpus[g].verdict==="known"]).concat([["branch",branch]]));
   $("m-build").innerHTML=m.build?`<div class="banner"><b class="bad">✕ Build failed</b> at ${sha(m.build.sha)} ${pr(m.build.pr)} ${who(m.build.author)}, ${ago(m.build.t)}: ${esc(m.build.step)}. No GPU tests ran on this push; each GPU's verdict is from its last result.</div>`:"";
   const all=k=>["H100","B200","MI350"].flatMap(g=>m.gpus[g][k]);
   const S={reproduced:`<span class="bad">✕ reproduced</span><br><span class="muted">not flaky</span>`,"not reproduced":`<span class="warn">✓ passed</span><br><span class="muted">flake candidate</span>`,none:`<span class="na">no scheduled run yet</span>`};
-  $("m-new").innerHTML=table(["GPU","Test","First failed at","Previous push (passed)","Scheduled run, same commit"],
-    all("new").map(i=>[i.gpu,`<code>${esc(i.id)}</code><br><span class="muted">${esc(i.job)} · ${esc(i.step)}</span>${i.msg?`<br><span class="muted">${esc(i.msg.slice(0,160))}</span>`:""}`,
-      `${sha(i.first_sha)} ${pr(i.first_pr)}<br>${who(i.first_author)} · ${ago(i.first_t)}`,i.prev_sha?sha(i.prev_sha):`<span class="muted">first result</span>`,S[i.sched]]));
-  const known=all("known");
+  // GPU and LIT failures share one row shape: Suite, Test, First failed at, ...
+  const litItems=k=>(l?l[k]:[]).map(f=>({...f,gpu:"LIT",where:"compiler.yml"}));
+  const testCell=(i,msg)=>`<code>${esc(i.id)}</code><br><span class="muted">${esc(i.where||`${i.job} · ${i.step}`)}</span>${msg&&i.msg?`<br><span class="muted">${esc(i.msg.slice(0,160))}</span>`:""}`;
+  const firstCell=i=>i.gpu==="LIT"?`<a href="${esc(i.first_url)}">${esc(i.first_sha.slice(0,9))}</a> · ${ago(i.first_t)}<br><span class="muted">${esc(i.first_title.slice(0,70))}</span>`:`${sha(i.first_sha)} ${pr(i.first_pr)}<br>${who(i.first_author)} · ${ago(i.first_t)}`;
+  $("m-new").innerHTML=table(["Suite","Test","First failed at","Previous push (passed)","Scheduled run, same commit"],
+    [...all("new"),...litItems("new")].map(i=>[i.gpu,testCell(i,true),firstCell(i),i.prev_sha?sha(i.prev_sha):`<span class="muted">first result</span>`,i.gpu==="LIT"?`<span class="na">not checked for LIT</span>`:S[i.sched]]));
+  const known=[...all("known"),...litItems("known")];
   $("m-known-s").textContent=`Known failures (${known.length}): carried over from an earlier push`;
-  $("m-known").innerHTML=table(["GPU","Test","First failed at","Pushes in a row","Last passed"],
-    known.map(i=>[i.gpu,`<code>${esc(i.id)}</code><br><span class="muted">${esc(i.job)} · ${esc(i.step)}</span>`,`${sha(i.first_sha)} ${pr(i.first_pr)} ${who(i.first_author)}<br><span class="muted">${ago(i.first_t)}</span>`,i.streak,i.prev_sha?sha(i.prev_sha):`<span class="muted">never seen passing</span>`]),[3]);
+  $("m-known").innerHTML=table(["Suite","Test","First failed at","Pushes in a row","Last passed"],
+    known.map(i=>[i.gpu,testCell(i,true),firstCell(i),i.streak,i.prev_sha?sha(i.prev_sha):`<span class="muted">never seen passing</span>`]),[3]);
   $("m-setup-s").textContent=`Setup failures (${m.setup.length} in the last 10 pushes)`;
   $("m-setup").innerHTML=table(["Push","GPU","Job","Step"],m.setup.map(s=>[`${sha(s.sha)} <span class="muted">${ago(s.t)}</span>`,s.gpu,esc(s.job),esc(s.step)]));
-  const C={pass:["c-pass","✓","all tests pass"],new:["c-new","✕","new failure"],known:["c-known","●","known failures only"],setup:["c-setup","⚠","setup failure, no test result"],na:["c-na","–","not run"]};
-  // The Latest cell shows the GPU's verdict, which comes from its last result even when the latest push skipped it.
-  const V={new:"c-new",known:"c-known",passing:"c-pass",none:"c-na"};
-  const verdict=g=>{const x=m.gpus[g];return {new:`✕ ${x.new.length} new`,known:`● ${x.known.length} known`,passing:"✓ Passing",none:"no results"}[x.verdict]};
-  const latestCell=(g,p)=>{const x=m.gpus[g],stale=p.cells[g]==="na"&&x.sha?`\nnot run on this push; verdict from ${x.sha.slice(0,9)} (${ago(x.t)})`:"";
-    return `<td class="latest"><div class="cell wide ${V[x.verdict]}" data-tip="${esc(`${g} · ${p.sha.slice(0,9)} · ${ago(p.t)}\n${p.title}${stale}`)}">${verdict(g)}</div></td>`};
-  const P=[...m.pushes].reverse(),hrs=p=>Math.round((ASOF-new Date(p.t))/36e5);
-  $("m-grid").innerHTML="<tr><th></th>"+P.map((p,i)=>`<th${i?"":` class="latest"`}>${i?"":"Latest<br>"}<a href="${esc(p.url)}" data-tip="${esc(`${p.sha.slice(0,9)} · ${p.t.replace("T"," ").slice(0,16)} UTC (${ago(p.t)})\n${p.title}`)}">T+${hrs(p)}h</a></th>`).join("")+"</tr>"+
-    ["H100","B200","MI350"].map(g=>`<tr><td class="gl">${g}</td>`+P.map((p,i)=>{if(!i)return latestCell(g,p);const [cl,t,d]=C[p.cells[g]];
-      return `<td><div class="cell ${cl}" data-tip="${esc(`${g} · ${p.sha.slice(0,9)} · ${ago(p.t)}\n${p.title}\n${d}`)}">${t}</div></td>`}).join("")+"</tr>").join("");
-  const SC={pass:["c-pass","✓","pass"],new:["c-new","✕","new failure"],known:["c-known","●","known failure"],setup:["c-setup","⚠","job failed in setup"],blocked:["c-blocked","⊘","skipped: an earlier step failed"],na:["c-na","–","not run"]};
-  const rank={new:0,known:1,passing:2,none:3};
-  let sel=["H100","B200","MI350"].sort((a,b)=>rank[m.gpus[a].verdict]-rank[m.gpus[b].verdict])[0];
-  const drawSteps=()=>{
-    $("m-step-sel").innerHTML=["H100","B200","MI350"].map(g=>`<button type="button" data-g="${g}" aria-pressed="${g===sel}">${g}</button>`).join("");
-    for(const b of $("m-step-sel").querySelectorAll("button"))b.onclick=()=>{sel=b.dataset.g;drawSteps()};
-    const rows=m.steps[sel]||[];
-    if(!rows.length){$("m-steps").innerHTML=`<tr><td class="empty">No test step results for ${sel} in these pushes.</td></tr>`;return}
-    $("m-steps").innerHTML="<tr><th></th>"+P.map((p,i)=>`<th${i?"":` class="latest"`}>${i?"":"Latest<br>"}T+${hrs(p)}h</th>`).join("")+"</tr>"+
-      rows.map(r=>{const cells=[...r.cells].reverse();return `<tr><td class="gl" data-tip="${esc(r.step)}" style="font-size:13px">${esc(r.group)}</td>`+cells.map((c,i)=>{const [cl,t,d]=SC[c],p=P[i];
-        return `<td${i?"":` class="latest"`}><div class="cell ${cl}" data-tip="${esc(`${sel} · ${r.step}\n${p.sha.slice(0,9)} · ${ago(p.t)}\n${d}`)}">${t}</div></td>`}).join("")+"</tr>"}).join("")};
-  drawSteps();
-  const n=all("new").length;
-  if(m.build)badge("b-main","✕ build","bad");else if(n)badge("b-main",`✕ ${n} new`,"bad");else if(known.length)badge("b-main","● known only","warn");else badge("b-main","✓","ok");
+  // One grid: a column per commit, a row per test group. GPU and LIT runs of the same push share a column.
+  const C={pass:["c-pass","✓","all tests pass"],new:["c-new","✕","new failure: this commit broke it"],known:["c-known","●","still failing from an earlier commit"],setup:["c-setup","⚠","setup failure, no test result"],build:["c-setup","⚠","build failed, no lit result"],skip:["c-na","○","skipped: path selection found nothing this suite tests"],running:["c-na","…","running, no result yet"],unknown:["c-setup","?","job failed; its log is unavailable, so the result is unknown"],na:["c-na","–","not run on this commit"]};
+  const LATEST={pass:"✓ Passing",new:"✕ New failure",known:"✕ Failing",skip:"○ Not run",running:"… Running",na:"– Not run",setup:"⚠ Setup failed",build:"⚠ Build failed",unknown:"? Failed, no log"};
+  const cols=new Map();
+  for(const p of m.pushes)cols.set(p.sha,{sha:p.sha,t:p.t,title:p.title,pr:p.pr,gpu:p});
+  for(const p of l?l.pushes:[]){const c=cols.get(p.sha)||{sha:p.sha,t:p.t,title:p.title,pr:null};c.lit=p;if(p.t<c.t)c.t=p.t;cols.set(p.sha,c)}
+  // Each source keeps only its last pushes; drop columns older than the shorter history so a missing cell means "not run".
+  const full=[m.pushes,l&&l.pushes].filter(x=>x&&x.length>=12).map(x=>x[0].t),cut=full.length?full.reduce((a,b)=>a>b?a:b):"";
+  const P=[...cols.values()].filter(c=>c.t>=cut).sort((a,b)=>a.t<b.t?-1:1).slice(-12).reverse();
+  const hrs=p=>Math.round((ASOF-new Date(p.t))/36e5),prOf=c=>c.pr||((c.title||"").match(/\(#(\d+)\)\s*$/)||[])[1];
+  const tip=c=>`${c.sha.slice(0,9)} · ${c.t.replace("T"," ").slice(0,16)} UTC (${ago(c.t)})\n${c.title}`;
+  const group=(name,wf)=>`<tr class="grp"><td colspan="${P.length+1}">${name} <span class="muted">${wf}</span></td></tr>`;
+  const SC={pass:["c-pass","✓","pass"],new:["c-new","✕","new failure: this commit broke it"],known:["c-known","●","still failing from an earlier commit"],setup:["c-setup","⚠","job failed in setup"],blocked:["c-blocked","⊘","skipped: an earlier step failed"],skip:["c-na","○","skipped: path selection found nothing this suite tests"],running:["c-na","…","running, no result yet"],na:["c-na","–","not run on this commit"]};
+  const at=Object.fromEntries(m.pushes.map((p,i)=>[p.sha,i]));
+  // A cell links to the run that produced it; the column header links to the commit.
+  const link=(st,run,html)=>st!=="na"&&run&&run.url?`<a class="cell-link" href="${esc(run.url)}">${html}</a>`:html;
+  // A known cell's tooltip names the commit(s) its failures started at.
+  const blame=list=>list&&list.length?"\nstarted at:\n"+list.map(b=>`${b.sha.slice(0,9)} ${(b.title||"").slice(0,70)}`).join("\n"):"";
+  // A step gets a row only while it ran on at least one of the commits shown.
+  const steps=g=>(m.steps[g]||[]).filter(r=>P.some(c=>(r.cells[at[c.sha]]||"na")!=="na")).map(r=>`<tr><td class="gl step" data-tip="${esc(r.step)}">${esc(r.group)}</td>`+P.map((c,i)=>{
+            const gs=c.gpu&&c.gpu.cells[g],k=gs==="skip"||gs==="running"?gs:r.cells[at[c.sha]]||"na",[cl,t,d]=SC[k];
+      const from=k==="known"&&r.since?r.since[at[c.sha]]:null,b=blame(from);
+      return `<td${i?"":` class="latest"`}>${link(k,c.gpu,`<div class="cell ${cl}" data-tip="${esc(`${g} · ${r.step}\n${tip(c)}\n${d}${b}`)}">${t}</div>`)}</td>`}).join("")+"</tr>").join("");
+  const row=(label,x,cell,since)=>`<tr><td class="gl"${x===m.gpus[label]?` data-g="${label}"`:""}>${x===m.gpus[label]?`${OPEN[label]?"▾":"▸"} `:""}${label}</td>`+P.map((c,i)=>{
+      // The Latest cell is the newest commit's own state: a verdict when the row ran there, else why it did not.
+      const st=cell(c),[cl,t,d]=C[st],b=st==="known"?blame(since(c)):"";
+      const div=`<div class="cell${i?"":" wide"} ${!i&&st==="known"?"c-new":cl}" data-tip="${esc(`${label} · ${tip(c)}\n${d}${b}`)}">${i?t:LATEST[st]}</div>`;
+      return `<td${i?"":` class="latest"`}>${link(st,label==="LIT"?c.lit:c.gpu,div)}</td>`}).join("")+"</tr>";
+  $("m-grid").innerHTML="<tr><th></th>"+P.map((c,i)=>{const n=prOf(c);return `<th${i?"":` class="latest"`}>${i?"":"Latest<br>"}<a href="https://github.com/facebookexperimental/triton/commit/${esc(c.sha)}" data-tip="${esc(tip(c))}">${n?"#"+esc(n):esc(c.sha.slice(0,7))}</a><br><span class="muted">T+${hrs(c)}h</span></th>`}).join("")+"</tr>"+
+    group("GPU Tests","gpu-tests.yml")+["H100","B200","MI350"].map(g=>row(g,m.gpus[g],c=>c.gpu?c.gpu.cells[g]:"na",c=>c.gpu&&c.gpu.since&&c.gpu.since[g])+(OPEN[g]?steps(g):"")).join("")+
+    group("LIT Tests","compiler.yml")+(l?row("LIT",l,c=>c.lit?c.lit.cell:"na",c=>c.lit&&c.lit.since):`<tr><td class="gl">LIT</td><td colspan="${P.length}" class="muted" style="font-size:12px">runs on pushes to main only, not on ${esc(branch)}</td></tr>`);
+  for(const td of $("m-grid").querySelectorAll("td[data-g]"))td.onclick=()=>{OPEN[td.dataset.g]=!OPEN[td.dataset.g];renderMain(m,l,branch)};
+  const lit=l||{new:[],known:[]};
+  const n=all("new").length+lit.new.length;
+  if(m.build||lit.build)badge("b-main","✕ build","bad");else if(lit.unknown)badge("b-main","✕ LIT failed","bad");else if(n)badge("b-main",`✕ ${n} new`,"bad");else if(known.length)badge("b-main",`✕ ${known.length} failing`,"bad");else badge("b-main","✓","ok");
 }
 
 function renderNightly(nt){
   const r=nt.release,res=c=>c==="success"?`<span class="ok">✓ ${c}</span>`:c?`<span class="bad">✕ ${esc(c)}</span>`:`<span class="na">–</span>`;
   $("n-rel").innerHTML=r?tile("Last nightly run",res(r.conclusion),`<a href="${esc(r.url)}">run</a> · ${ago(r.t)}`)+tile("Wheel build",res(r.build),"")+tile("Publish",res(r.publish),"")+tile("Published, last 7 nights",`${r.published_7} of ${r.nights_7}`,""):`<p class="empty">No nightly runs collected.</p>`;
+  const G={passed:`<span class="ok">✓ passed</span>`,test:`<span class="bad">✕ tests failed</span>`,setup:`<span class="warn">⚠ setup failed</span>`,cancelled:`<span class="na">cancelled</span>`};
+  // One row per GPU: the latest run of a daily GPU workflow. Returns how many GPUs failed on tests.
+  const perGpu=(id,v)=>{const gpus=["H100","B200","MI350"].filter(g=>v&&v[g]);
+    $(id).innerHTML=table(["GPU","Last run","Failing tests","Passed, last 7 days"],gpus.map(g=>{const x=v[g];
+      return [g,`${G[x.result]||esc(x.result)}${x.setup?` <span class="muted">${esc(x.setup)}</span>`:""}<br><a href="${esc(x.url)}">${sha(x.sha)}</a> <span class="muted">${ago(x.t)}</span>`,
+        x.fails.length?x.fails.map(f=>`<code>${esc(f.id)}</code>${f.msg?`<br><span class="muted">${esc(f.msg.slice(0,120))}</span>`:""}`).join("<br>"):`<span class="muted">none</span>`,`${x.passed_7} / ${x.runs_7}`]}),[3]);
+    return gpus.filter(g=>v[g].result==="test").length};
+  const gpuRed=perGpu("n-gpu",nt.gpu)+perGpu("n-bench",nt.bench);
+  if(r&&r.conclusion!=="success")badge("b-sched","✕ release","bad");else if(gpuRed)badge("b-sched",`✕ ${gpuRed} GPU run${gpuRed>1?"s":""}`,"bad");else badge("b-sched","✓","ok");
+}
+
+function renderPerf(nt){
   $("n-perf").innerHTML=table(["GPU","Night","Op","Change","Signature","Suspect commits"],nt.perf.map(e=>[esc(e.platform),`${esc(e.date)}${e.unconfirmed?`<br><span class="muted">unconfirmed</span>`:""}`,`<code>${esc(e.op)}</code>`,
     `${e.n_slower?`<span class="bad">▼ ${e.n_slower} slower</span>`:""}${e.n_slower&&e.n_faster?"<br>":""}${e.n_faster?`<span class="ok">▲ ${e.n_faster} faster</span>`:""}`,esc(e.signature||""),
     (e.suspects||[]).map(s=>`${sha(s.sha)} ${pr(s.pr)} <span class="muted">${esc((s.title||"").slice(0,60))}</span>`).join("<br>")+(e.compare?`<br><a href="${esc(e.compare)}">${esc(e.range||"compare")}</a>`:"")]));
   const slower=nt.perf.filter(e=>e.n_slower&&!e.unconfirmed).length;
-  if(r&&r.conclusion!=="success")badge("b-sched","✕ release","bad");else if(slower)badge("b-sched",`${slower} slower`,"bad");else badge("b-sched","✓","ok");
+  if(slower)badge("b-perf",`${slower} slower`,"bad");else badge("b-perf","✓","ok");
 }
 
-function renderPR(list){
+function renderPR(list,branch="main"){
   const R={tests:p=>`<span class="${p.whose==="main"?"warn":"bad"}">✕ ${p.n_failed} test${p.n_failed>1?"s":""}</span>`,setup:()=>`<span class="infra">⚠ setup</span>`,build:()=>`<span class="bad">✕ build</span>`,passed:()=>`<span class="ok">✓</span>`,running:()=>`<span class="na">running</span>`,cancelled:()=>`<span class="na">cancelled</span>`};
-  const W={author:`<span class="tag own">author</span>`,main:`<span class="tag main">fails on main</span>`,ci:`<span class="tag ci">setup: CI</span>`};
+  const W={author:`<span class="tag own">author</span>`,main:`<span class="tag main">fails on ${esc(branch)}</span>`,ci:`<span class="tag ci">setup: CI</span>`};
   $("p-list").innerHTML=table(["PR","Author","GPUs run","Result","Whose"],list.map(p=>[`${p.pr?pr(p.pr):esc(p.branch)} <a href="${esc(p.url)}">${esc(p.title.slice(0,70))}</a><br><span class="muted">${ago(p.t)}</span>`,who(p.author),p.gpus.length?p.gpus.join(" · "):`<span class="na">none</span>`,(R[p.result]||(()=>esc(p.result)))(p),`${W[p.whose]||""} ${esc(p.note)}`]));
 }
 
+const GPUS=["H100","B200","MI350"];
+// The Operations tab's time ranges in days, as in OPS_RANGES of ci_health_rules.py; the 3-day range draws hourly charts.
+const RANGES=[3,7,14,30];let RANGE=30;
+// The Operations tab's GPU filter: "All" or one of GPUS.
+let OGPU="All",BRANCH="main";
+// The view lives in the URL hash, "#<tab>?branch=...&gpu=...&range=...", so a link opens the same view. Defaults
+// are left out of it.
+const VIEW=(()=>{const [tab,q=""]=location.hash.slice(1).split("?");return {tab,p:new URLSearchParams(q)}})();
+let TAB=VIEW.tab;
+if(RANGES.includes(+VIEW.p.get("range")))RANGE=+VIEW.p.get("range");
+if(GPUS.includes(VIEW.p.get("gpu")))OGPU=VIEW.p.get("gpu");
+function saveView(){const p=new URLSearchParams();
+  if(BRANCH!=="main")p.set("branch",BRANCH);if(OGPU!=="All")p.set("gpu",OGPU);if(RANGE!==30)p.set("range",RANGE);
+  history.replaceState(null,"","#"+(TAB||"main")+(p.size?"?"+p:""))}
+const OUT=["passed","test","build","setup","cancelled"],OUT_C=["var(--good)","var(--critical)","var(--warning)","var(--serious)","var(--neutral)"];
+const X0=34,YB=165;
+function axes(D,top,fmt,every=2,XR=720){let s="";const w=(XR-X0)/D.length;
+  for(const v of [0,top/2,top]){const y=YB-v/top*150;s+=`<line x1="${X0}" x2="${XR}" y1="${y}" y2="${y}"/><text x="${X0-6}" y="${y+3}" text-anchor="end">${fmt(v)}</text>`}
+  // The last label ends at the plot's right edge, so it is not clipped.
+  D.forEach((x,i)=>{if((D.length-1-i)%every===0)s+=i===D.length-1?`<text x="${XR}" y="${YB+16}" text-anchor="end">${x.day.slice(5)}</text>`:`<text x="${X0+i*w+w/2}" y="${YB+16}" text-anchor="middle">${x.day.slice(5)}</text>`});return s}
+function stacked(D,unit,every){
+  const max=Math.max(1,...D.map(x=>OUT.reduce((a,k)=>a+x[k],0))),top=Math.ceil(max/10)*10,w=(720-X0)/D.length,sc=v=>v/top*150;let s=axes(D,top,Math.round,every);
+  D.forEach((x,i)=>{let y=YB;const tt=esc(`${x.day}\n`+OUT.map(k=>`${k}: ${x[k]}${unit}`).join("\n"));
+    OUT.forEach((k,j)=>{const h=sc(x[k]);y-=h;if(h>0)s+=`<rect x="${X0+i*w+4}" y="${y+1}" width="${w-8}" height="${Math.max(h-2,0.5)}" rx="2" fill="${OUT_C[j]}" data-tip="${tt}"/>`})});
+  return s}
+function lines(D,S,unit,every,noun="jobs",val=v=>v.p50,tip=null){
+  const XR=670,w=(XR-X0)/D.length,max=Math.max(1,...D.flatMap(x=>S.map(([k])=>val(x[k])??0))),top=max>10?Math.ceil(max/10)*10:Math.ceil(max),
+    y=v=>YB-v/top*150,cx=i=>X0+i*w+w/2;
+  let s=axes(D,top,v=>String(Math.round(v)),every,XR);
+  const ends=[];
+  for(const [k,c] of S){let d="",cmd="M",end=null;
+    D.forEach((x,i)=>{const v=val(x[k]);if(v==null){cmd="M";return}d+=`${cmd}${cx(i)},${y(v)}`;cmd="L";end=[cx(i),y(v)]});
+    s+=`<path d="${d}" fill="none" stroke="${c}" stroke-width="2" stroke-linejoin="round"/>`;
+    if(end){s+=`<circle cx="${end[0]}" cy="${end[1]}" r="3.5" fill="${c}" stroke="var(--surface-1)" stroke-width="2"/>`;ends.push({k,x:end[0],y:end[1]})}}
+  // Direct labels at the line ends, pushed apart (bottom up) so close values do not overlap.
+  ends.sort((a,b)=>b.y-a.y).forEach((e,i,a)=>{e.ly=i?Math.min(e.y,a[i-1].ly-11):Math.min(e.y,YB);
+    s+=`<text x="${e.x+8}" y="${e.ly+3.5}" style="fill:var(--text-secondary)">${e.k}</text>`});
+  D.forEach((x,i)=>{const tt=esc(tip?tip(x):`${x.day}  median (25th–75th percentile)\n`+S.map(([k])=>`${k}: ${x[k].p50??"–"}${unit} (${x[k].p25??"–"}–${x[k].p75??"–"}), ${x[k].n} ${noun}`).join("\n"));
+    s+=`<rect x="${X0+i*w}" y="${YB-150}" width="${w}" height="150" fill="transparent" data-tip="${tt}"/>`});
+  return s}
+
+const TR={pull_request:"PR",push:"push",schedule:"scheduled",workflow_dispatch:"manual"};
+function renderSelect(D,anomalies){
+  const T={};
+  for(const d of D)for(const [e,x] of Object.entries(d.triggers)){
+    const a=T[e]??={runs:0,gpus:{0:0,1:0,2:0,3:0},build_skipped:0,fallback:0,per_gpu:{H100:0,B200:0,MI350:0}};
+    a.runs+=x.runs;a.build_skipped+=x.build_skipped;a.fallback+=x.fallback;
+    for(const k in x.gpus)a.gpus[k]+=x.gpus[k];for(const g in x.per_gpu)a.per_gpu[g]+=x.per_gpu[g]}
+  const SEG=[["3","all 3"],["2","2 of 3"],["1","1 of 3"],["0","none"]],FULL=["schedule","workflow_dispatch"];
+  const first=D.find(d=>Object.keys(d.triggers).length);
+  $("o-select").innerHTML=(first&&first!==D[0]?`<p class="muted" style="margin:8px 0 0">Selection data starts ${first.day.slice(5)}, when gpu-tests.yml replaced the per-GPU workflows.</p>`:"")+
+    (Object.keys(T).length?Object.keys(TR).filter(e=>T[e]).map(e=>{const x=T[e];
+    const bar=SEG.filter(([k])=>x.gpus[k]).map(([k,l])=>{const n=x.gpus[k],f=n/x.runs;
+      return `<span style="flex:${n};background:var(--ord-${k});color:var(--ord-ink-${k})" data-tip="${esc(`${TR[e]}: ${n} of ${x.runs} runs tested ${l} GPU types`)}">${f>=0.06?n:""}</span>`}).join("");
+    const suites=3*x.runs,ran=GPUS.reduce((a,g)=>a+x.per_gpu[g],0),partial=x.runs-x.gpus["3"];
+    const verdict=FULL.includes(e)?(partial?`<span class="bad">✕ ${partial} run${partial>1?"s":""} skipped a GPU type</span>`:`<span class="ok">✓ every run tested all 3</span>`)
+      :`skipped <b>${suites-ran}</b> of ${suites} GPU suites (${Math.round(100*(suites-ran)/suites)}%)`;
+    const extra=[x.build_skipped!==x.gpus["0"]?`build skipped on ${x.build_skipped}, not ${x.gpus["0"]}`:"",x.fallback?`<span class="warn">${x.fallback} fell back to all</span>`:""].filter(Boolean).join(" · ");
+    return `<div class="trig"><div class="name">${TR[e]}<span class="muted">${x.runs} runs</span></div><div class="hbar">${bar}</div><div>${verdict}</div>
+      <div class="sub">ran ${GPUS.map(g=>`${g} ${Math.round(100*x.per_gpu[g]/x.runs)}%`).join(" · ")} of runs${extra?" · "+extra:""}</div></div>`}).join(""):`<p class="empty">No runs with a selection in this range.</p>`);
+  const AK={failed:`<span class="bad">✕ select failed</span>`,partial:`<span class="bad">✕ partial full run</span>`,fallback:`<span class="warn">● fell back to all</span>`};
+  const A=anomalies.filter(a=>a.t.slice(0,10)>=D[0].day);
+  $("o-select-a").innerHTML=A.length?`<h3 class="bad" style="margin-top:8px">Runs where the trigger misbehaved</h3>`+table(["Run","Trigger","What happened"],A.map(a=>[`<a href="${esc(a.url)}">${esc(a.sha.slice(0,9))}</a> ${pr(a.pr)} <span class="muted">${ago(a.t)}</span>`,TR[a.event]||esc(a.event),`${AK[a.kind]} <span class="muted">${esc(a.detail)}</span>`])):`<p class="ok" style="margin:6px 0 0">✓ No failed selections, fallbacks or partial full runs.</p>`}
+
+// A pytest node id as two lines, file then test, so long parametrized ids fit a table cell.
+function testId(id){const i=id.indexOf("::");if(i<0)return `<code>${esc(id)}</code>`;
+  return `<code class="muted">${esc(id.slice(0,i))}</code><br><code style="overflow-wrap:anywhere">${esc(id.slice(i+2))}</code>`}
 function renderOps(o){
   const t=o.tiles,pct=x=>x==null?"–":(100*x).toFixed(0)+"%",d=t.gpu_h_prev_7d?Math.round(100*(t.gpu_h_7d-t.gpu_h_prev_7d)/t.gpu_h_prev_7d):null;
   $("o-tiles").innerHTML=tile("GPU hours, last 7 days",t.gpu_h_7d.toLocaleString(),`prior 7 days: ${t.gpu_h_prev_7d.toLocaleString()}${d==null?"":` · ${d>0?"▲":"▼"} ${Math.abs(d)}%`}`)+
     tile("Setup failures, gpu-tests.yml runs",pct(t.setup_rate),`${t.setup_n} of ${t.runs_n} finished runs · ${t.setup_mi350} on MI350`,t.setup_n?"infra":"")+
-    tile("Queue time, median",t.queue_p50==null?"–":t.queue_p50+" min",`slowest 10%: ${t.queue_p90??"–"} min`)+
+    tile("PR wait for a GPU runner, median",t.queue_p50==null?"–":t.queue_p50+" min",`slowest 10%: ${t.queue_p90??"–"} min · the PR's last job to finish`)+
     tile("Cancelled PR runs",t.pr_n?pct(t.cancelled_pr/t.pr_n):"–",`${t.cancelled_pr} of ${t.pr_n} PR runs · ${t.cancelled_gpu_h} GPU h`);
-  const D=o.gpu_hours,K=["passed","test","setup","cancelled"],C=["var(--good)","var(--critical)","var(--serious)","var(--neutral)"];
-  const max=Math.max(1,...D.map(x=>K.reduce((a,k)=>a+x[k],0))),top=Math.ceil(max/10)*10,x0=34,w=(720-x0)/D.length,yb=165,sc=v=>v/top*150;let s="";
-  for(const v of [0,top/2,top]){const y=yb-sc(v);s+=`<line x1="${x0}" x2="720" y1="${y}" y2="${y}"/><text x="${x0-6}" y="${y+3}" text-anchor="end">${Math.round(v)}</text>`}
-  D.forEach((x,i)=>{let y=yb;const tt=esc(`${x.day}\n`+K.map(k=>`${k}: ${x[k]} h`).join("\n"));
-    K.forEach((k,j)=>{const h=sc(x[k]);y-=h;if(h>0)s+=`<rect x="${x0+i*w+4}" y="${y+1}" width="${w-8}" height="${Math.max(h-2,0.5)}" rx="2" fill="${C[j]}" data-tip="${tt}"/>`});
-    if(i%2===0)s+=`<text x="${x0+i*w+w/2}" y="${yb+16}" text-anchor="middle">${x.day.slice(5)}</text>`});
-  $("o-hours").innerHTML=s;
-  $("o-jobs").innerHTML=table(["Job","Runs","Median","Slowest 10%","Before, slowest 10%","Slowest step (median / slowest 10%)"],o.jobs.map(j=>[`<code>${esc(j.job)}</code>`,j.n,j.p50,`<span class="${j.p90_prev&&j.p90>1.5*j.p90_prev?"bad":""}">${j.p90}</span>`,j.p90_prev??"–",j.slowest_step?`${esc(j.slowest_step)} <span class="muted">(${j.slowest_p50} / ${j.slowest_p90})</span>`:""]),[1,2,3,4]);
-  $("o-setup").innerHTML=table(["Step","GPU","Jobs","Triggers"],o.setup_steps.map(r=>[esc(r.step),r.gpu,r.n,Object.entries(r.triggers).map(([k,v])=>`${v} ${esc(k.replace("pull_request","PR"))}`).join(" · ")]),[2]);
-  const sel=o.select,TR={pull_request:"PR",push:"push",schedule:"scheduled",workflow_dispatch:"manual"};
-  $("o-select").innerHTML=table(["Trigger","Runs","0 GPUs","1","2","3 GPUs","H100","B200","MI350","Build skipped","Fell back to all"],
-    Object.entries(sel.triggers).map(([e,x])=>[TR[e]||esc(e),x.runs,x.gpus["0"],x.gpus["1"],x.gpus["2"],x.gpus["3"],x.per_gpu.H100,x.per_gpu.B200,x.per_gpu.MI350,x.build_skipped,x.fallback?`<span class="warn">${x.fallback}</span>`:0]),[1,2,3,4,5,6,7,8,9,10]);
-  const AK={failed:`<span class="bad">✕ select failed</span>`,partial:`<span class="bad">✕ partial full run</span>`,fallback:`<span class="warn">● fell back to all</span>`};
-  $("o-select-a").innerHTML=sel.anomalies.length?`<h3 style="margin-top:12px">Runs where the trigger misbehaved</h3>`+table(["Run","Trigger","What happened"],sel.anomalies.map(a=>[`<a href="${esc(a.url)}">${esc(a.sha.slice(0,9))}</a> ${pr(a.pr)} <span class="muted">${ago(a.t)}</span>`,TR[a.event]||esc(a.event),`${AK[a.kind]} <span class="muted">${esc(a.detail)}</span>`])):`<p class="empty">No failed selections, fallbacks or partial full runs.</p>`;
-  const bad=sel.anomalies.filter(a=>a.kind!=="fallback").length;
+  const Q=o.queue,C=o.concurrency,SER={B200:"var(--series-1)",H100:"var(--series-2)",MI350:"var(--series-3)"},draw=()=>{
+    $("o-gpu").innerHTML=["All",...GPUS].map(g=>`<button type="button" data-g="${g}" aria-pressed="${g===OGPU}">${g}</button>`).join("");
+    for(const b of $("o-gpu").querySelectorAll("button"))b.onclick=()=>{OGPU=b.dataset.g;saveView();draw()};
+    $("o-range").innerHTML=RANGES.map(n=>`<button type="button" data-n="${n}" aria-pressed="${n===RANGE}">${n} days</button>`).join("");
+    for(const b of $("o-range").querySelectorAll("button"))b.onclick=()=>{RANGE=+b.dataset.n;saveView();draw()};
+    // The 3-day range draws queue time and concurrency per hour; a daily chart there has only three points.
+    const last=D=>D.slice(-RANGE),every=RANGE>14?7:RANGE>7?2:1,hourly=RANGE===3,v=OGPU==="All"?o:o.by_gpu[OGPU];
+    const S=(OGPU==="All"?["B200","H100","MI350"]:[OGPU]).map(g=>[g,SER[g]]),mine=x=>OGPU==="All"||x.gpu===OGPU;
+    $("o-hours").innerHTML=stacked(last(v.gpu_hours)," h",every);
+    $("o-runs").innerHTML=stacked(last(v.runs),"",every);
+    $("o-per-run").innerHTML=lines(last(v.per_run),[["push","var(--series-1)"],["PR","var(--series-2)"]]," min",every,"runs");
+    $("o-queue").innerHTML=lines(hourly?Q.hours:last(Q.days),S," min",hourly?12:every,"jobs");
+    $("o-conc").innerHTML=lines(hourly?C.hours:last(C.days),S,"",hourly?12:every,"jobs",x=>x.peak,
+      x=>`${x.day}  peak running (average) · peak waiting\n`+S.map(([k])=>`${k}: ${x[k].peak??"–"} (${x[k].mean??"–"}) · ${x[k].wait_peak??"–"} waiting`).join("\n"));
+    renderSelect(last(o.select.days),o.select.anomalies);
+    $("o-queue-t").innerHTML=table(["GPU, last 7 days","Jobs","Median","Slowest 10%","Last to finish on a PR"],Q.gpus.filter(mine).map(g=>[g.gpu,g.n,g.p50??"–",g.p90??"–",g.last_pct==null?"–":`${Math.round(100*g.last_pct)}% <span class="muted">of ${Q.pr_n}</span>`]),[1,2,3,4]);
+    $("o-jobs-h").textContent=`Job duration, last ${RANGE} days vs the ${RANGE} before (minutes)`;
+    $("o-slow-h").textContent=`Slowest tests, main pushes, last ${RANGE} days (seconds)`;
+    $("o-jobs").innerHTML=table(["GPU","Job","Runs","Median","Slowest 10%","Before, slowest 10%","Slowest step (median / slowest 10%)"],o.jobs[RANGE].filter(mine).map(j=>[j.gpu,`<code>${esc(j.job)}</code>`,j.n,j.p50,`<span class="${j.p90_prev&&j.p90>1.5*j.p90_prev?"bad":""}">${j.p90}</span>`,j.p90_prev??"–",j.slowest_step?`${esc(j.slowest_step)} <span class="muted">(${j.slowest_p50} / ${j.slowest_p90})</span>`:""]),[2,3,4,5]);
+    const ST=o.slow_tests[RANGE],slow=GPUS.filter(g=>OGPU==="All"||g===OGPU).flatMap(g=>(ST[g]?.tests||[]).map(x=>({...x,gpu:g,runs:ST[g].runs}))).sort((a,b)=>b.p50-a.p50).slice(0,10);
+    $("o-slow").innerHTML=slow.length?table(["GPU","Test","Step","Median","Slowest","Runs"],slow.map(x=>[x.gpu,testId(x.id),esc(x.step),x.p50,x.max,`${x.n} <span class="muted">of ${x.runs}</span>`]),[3,4,5]):`<p class="empty">No durations recorded for main pushes in the last ${RANGE} days.</p>`;
+    $("o-setup").innerHTML=table(["Step","GPU","Jobs","Triggers"],o.setup_steps.filter(mine).map(r=>[esc(r.step),r.gpu,r.n,Object.entries(r.triggers).map(([k,v])=>`${v} ${esc(k.replace("pull_request","PR"))}`).join(" · ")]),[2])};
+  draw();
+  const week=new Date(ASOF-7*864e5).toISOString(),bad=o.select.anomalies.filter(a=>a.kind!=="fallback"&&a.t>=week).length;
   if(bad)badge("b-ops",`✕ trigger`,"bad");else if(t.setup_n)badge("b-ops",`⚠ ${pct(t.setup_rate)} setup`,"infra");else badge("b-ops","✓","ok");
 }
 
+const LLVM_REPO="https://github.com/facebookexperimental/llvm-project";
+function renderLLVM(u,branch){
+  const tag=t=>t?`<code>${esc(t)}</code>`:`<span class="na">–</span>`;
+  const forkSha=h=>h?`<a href="${LLVM_REPO}/commit/${h}"><code>${esc(h.slice(0,12))}</code></a>`:"–";
+  const forkPR=c=>c.pr?`<a href="${LLVM_REPO}/pull/${c.pr}">#${c.pr}</a> `:`${forkSha(c.sha)} `;
+  const changes=cs=>cs==null?`<span class="muted">first pin</span>`:cs.length?cs.map(c=>`${forkPR(c)}${esc(c.title.slice(0,90))}`).join("<br>"):`<span class="muted">no fork changes</span>`;
+  const p=u.pinned,n=u.newest,since=(u.history||[]).find(h=>p&&h.tag===p.tag);
+  $("l-q").textContent=`Which LLVM does ${branch} build against, and is a newer one waiting?`;
+  const compare=(from,to,text)=>`<a href="${LLVM_REPO}/compare/${esc(from)}...${esc(to)}"><code>${esc(text)}</code></a>`;
+  $("l-current").innerHTML=p?tile("Pinned (<code>cmake/meta-llvm-info.json</code>)",tag(p.tag),`${forkSha(p.llvm_hash)} on ${compare(u.fork_branch+"_upstream_pin",p.llvm_hash,u.fork_branch)}`+
+    (since?`<br>pinned ${esc(since.t.slice(0,10))} by ${since.pr?pr(since.pr):sha(since.sha)} · ${ago(since.t)}`:""))+
+    tile(`Newest on <code>${esc(u.fork_branch)}</code>`,n?tag(n.tag):"–",!n?"no release built yet":u.status==="current"?"same as pinned"
+      :`${forkSha(n.llvm_hash)} · ${compare(p.llvm_hash,n.llvm_hash,"changes since pinned")}<br>published ${esc((n.published_at||"").slice(0,10))} · ${ago(n.published_at)}`,u.status==="new"?"warn":""):`<p class="empty">No LLVM pin data collected yet.</p>`;
+  // Is a newer release waiting, and where is its upgrade?
+  const issues=(u.issues||[]).map(i=>`<a href="${esc(i.url)}">#${i.number}</a> ${esc(i.title)} <span class="muted">${ago(i.created_at)}</span>`).join("<br>");
+  const upgrade=u.pr?`<span style="font-weight:620">Upgrade PR:</span> ${pr(u.pr.number)} ${esc(u.pr.title)} <span class="muted">${who(u.pr.author)} · opened ${ago(u.pr.created_at)}</span>`+(issues?`<br><span class="muted">Tracking issue:</span> ${issues}`:"")
+    :issues?`<span style="font-weight:620">Upgrade PR:</span> not opened yet; open it from the command in ${issues}`
+    :`<span style="font-weight:620">Upgrade PR:</span> <span class="muted">none yet; the bump bot files an issue once the new release passes GPU tests.</span>`;
+  const sub=html=>`<div style="margin-top:10px;font-size:13px">${html}</div>`;
+  if(u.status==="current"){$("l-status").innerHTML=`<b class="ok">✓ Up to date.</b> ${tag(p.tag)} is the newest release of <code>${esc(u.fork_branch)}</code>.`+(u.pr||issues?sub(upgrade):"");badge("b-llvm","✓","ok")}
+  else if(u.status==="new"){$("l-status").innerHTML=`<b class="warn">● New LLVM available:</b> ${tag(n.tag)}, published ${ago(n.published_at)}.`+
+    (u.pending&&u.pending.length?sub(`It adds ${u.pending.length} fork change${u.pending.length>1?"s":""}:<br>${changes(u.pending)}`):"")+sub(upgrade);badge("b-llvm","● new","warn")}
+  else{$("l-status").innerHTML=`<span class="na">No LLVM pin data collected yet.</span>`;badge("b-llvm","–","na")}
+  const cmp=h=>{const from=h.prev_hash||`${u.fork_branch}_upstream_pin`;return `<a href="${LLVM_REPO}/compare/${esc(from)}...${esc(h.llvm_hash)}"><code>${esc(h.prev_hash?h.prev_hash.slice(0,8):"upstream pin")}...${esc(h.llvm_hash.slice(0,8))}</code></a>`};
+  $("l-history").innerHTML=table(["Date","Triton PR","LLVM release","LLVM changes"],(u.history||[]).map(h=>[esc(h.t.slice(0,10)),h.pr?pr(h.pr):sha(h.sha),tag(h.tag),cmp(h)]));
+}
+
+// The page shows one tracked branch at a time, picked with the chips above the tabs.
+function renderBranches(d){
+  if(d.branches[VIEW.p.get("branch")])BRANCH=VIEW.p.get("branch");
+  const draw=()=>{const cur=BRANCH;
+    $("branch-sel").innerHTML=Object.keys(d.branches).map(b=>`<button type="button" data-b="${esc(b)}" aria-pressed="${b===cur}">${esc(b)}</button>`).join("");
+    for(const b of $("branch-sel").querySelectorAll("button"))b.onclick=()=>{BRANCH=b.dataset.b;saveView();draw()};
+    $("m-q").textContent=`Did a push to ${cur} break something new?`;
+    const v=d.branches[cur];renderMain(v.main,renderLit(v.lit),cur);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderOps(v.ops);renderLLVM(v.bump,cur)};
+  draw()}
+
 function show(id){if(!$(id)||!$(id).matches("section"))id="main";
+  TAB=id;
   for(const b of document.querySelectorAll("nav.tabs button"))b.setAttribute("aria-selected",b.dataset.tab===id);
-  for(const s of document.querySelectorAll("section[role=tabpanel]"))s.hidden=s.id!==id}
-for(const b of document.querySelectorAll("nav.tabs button"))b.onclick=()=>{history.replaceState(null,"","#"+b.dataset.tab);show(b.dataset.tab)};
-show(location.hash.slice(1));
+  for(const s of document.querySelectorAll("section[role=tabpanel]"))s.hidden=s.id!==id;
+  $("ops-filters").hidden=id!=="ops"}
+for(const b of document.querySelectorAll("nav.tabs button"))b.onclick=()=>{TAB=b.dataset.tab;saveView();show(TAB)};
+show(TAB);
 const tip=$("tip");
 document.addEventListener("mousemove",e=>{const el=e.target.closest("[data-tip]");if(!el){tip.style.opacity=0;return}tip.textContent=el.dataset.tip;tip.style.opacity=1;
   let x=e.clientX+14,y=e.clientY+14;if(x+tip.offsetWidth>innerWidth-8)x=e.clientX-tip.offsetWidth-14;if(y+tip.offsetHeight>innerHeight-8)y=e.clientY-tip.offsetHeight-14;tip.style.left=x+"px";tip.style.top=y+"px"});
@@ -215,5 +417,5 @@ $("themeBtn").onclick=()=>{const r=document.documentElement;r.dataset.theme=(r.d
 fetch("data.json").then(r=>r.json()).then(d=>{
   if(!d.asof){$("nodata").hidden=false;$("asof").textContent="never";for(const s of document.querySelectorAll("section"))s.hidden=true;return}
   ASOF=new Date(d.asof);$("asof").textContent=d.asof.replace("T"," ").slice(0,16)+" UTC";
-  renderMain(d.main);renderNightly(d.nightly);renderPR(d.pr);renderOps(d.ops)});
+  renderBranches(d)});
 </script></body></html>

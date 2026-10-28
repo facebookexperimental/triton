@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const findLastGreen = require('./last_green_nightly.js');
 
-function fixture(runs, jobs = {}) {
+function fixture(runs, jobs = {}, current = {}) {
   const requests = [];
   const github = {
     rest : {
@@ -11,6 +11,9 @@ function fixture(runs, jobs = {}) {
           data : {
             workflow_id : 99,
             created_at : '2026-10-05T06:00:00Z',
+            head_branch : 'main',
+            event : 'schedule',
+            ...current,
           }
         }),
         listWorkflowRuns : async args => {
@@ -33,6 +36,17 @@ function fixture(runs, jobs = {}) {
 function run(id, created_at, conclusion = 'failure') {
   return {id, created_at, conclusion, head_sha : `sha-${id}`};
 }
+
+test('history comes from the failing run\'s own branch and event', async () => {
+  const api =
+      fixture({99 : []}, {}, {head_branch : 'release/3.8.x', event : 'push'});
+  await findLastGreen({...api, jobName : 'b200-tlx-test', platform : 'b200'});
+  assert.ok(api.requests.length > 0);
+  for (const args of api.requests) {
+    assert.equal(args.branch, 'release/3.8.x');
+    assert.equal(args.event, 'push');
+  }
+});
 
 test('a failed sibling does not hide a successful GPU job', async () => {
   const api = fixture({99 : [ run(1, '2026-10-05T00:00:00Z') ]}, {
@@ -103,3 +117,38 @@ test('compiler reporting continues to use successful workflow runs',
        assert.equal(api.requests.length, 1);
        assert.equal(api.requests[0].status, 'success');
      });
+
+test('a suite moved to gpu-tests-nightly.yml finds its gpu-tests.yml history',
+     async () => {
+       const api = fixture(
+           {'gpu-tests.yml' : [ run(1, '2026-10-04T12:00:00Z', 'failure') ]}, {
+             1 : [
+               {name : 'h100 / h100-tritonbench-test', conclusion : 'success'}
+             ],
+           });
+       assert.equal(
+           await findLastGreen(
+               {...api, jobName : 'h100-tritonbench-test', platform : 'h100'}),
+           'sha-1');
+       assert.deepEqual(api.requests.map(r => r.workflow_id),
+                        [ 99, 'gpu-tests.yml', 'h100.yml' ]);
+     });
+
+test('a matrix-called job in gpu-tests-nightly.yml is matched', async () => {
+  const api = fixture({99 : [ run(1, '2026-10-04T12:00:00Z', 'failure') ]}, {
+    1 : [
+      {
+        name : 'tritonbench (b200) / b200-tritonbench-test',
+        conclusion : 'failure'
+      },
+      {
+        name : 'tritonbench (h100) / h100-tritonbench-test',
+        conclusion : 'success'
+      },
+    ],
+  });
+  assert.equal(
+      await findLastGreen(
+          {...api, jobName : 'h100-tritonbench-test', platform : 'h100'}),
+      'sha-1');
+});

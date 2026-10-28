@@ -348,31 +348,42 @@ bool canSinkUseChainPast(Value buffer, ArrayRef<Operation *> useChain,
       break;
     }
   }
-  // A TMEM epilogue load can carry the constraints from its own arrive
-  // barrier.  Use those constraints even when the global barrier-reorder
-  // knob is disabled: this moves only the load/use chain (and its matching
-  // arrive), rather than globally raising and sinking every WS barrier in the
-  // block.
-  if (opConstraints || isWSBarrierReorderEnabled()) {
-    // Once the load chain has picked up its own arrive, it may pass another
-    // WS arrive: both operations only delay signals.  This mirrors
-    // sinkWSArrives, but is deliberately limited to the one epilogue chain.
-    // Both arrives must carry WS barrier constraints; an unconstrained arrive
-    // has no channel to prove independence against, so it stays subject to
-    // canAdvanceWSBarrier.
-    auto chainArrive = dyn_cast<ArriveBarrierOp>(useChain.back());
-    auto nextArrive = dyn_cast<ArriveBarrierOp>(next);
-    bool arrivesCanSwap =
-        chainArrive && nextArrive &&
-        hasWSBarrierConstraints(chainArrive.getConstraints()) &&
-        hasWSBarrierConstraints(nextArrive.getConstraints());
-    if (!arrivesCanSwap && !canAdvanceWSBarrier(opConstraints, next))
-      return false;
-  } else {
-    // Legacy safe behavior: don't sink past barrier signals, since they may
-    // guard the liverange of the buffer.
-    if (isa<ArriveBarrierOp>(next))
-      return false;
+  // A load may always sink past an arrive barrier that provably guards only
+  // other buffers: the arrive orders accesses to its guarded set, and the
+  // sinking chain touches disjoint storage, so no happens-before the barrier
+  // establishes can involve the chain. This holds regardless of the
+  // barrier-reorder knob: it is a proof about this pair, not normalization.
+  bool disjointArrive = false;
+  if (auto nextArrive = dyn_cast<ArriveBarrierOp>(next))
+    disjointArrive = isDisjointFromGuardedBuffers(getBufferIdForValue(buffer),
+                                                  nextArrive.getConstraints());
+  if (!disjointArrive) {
+    // A TMEM epilogue load can carry the constraints from its own arrive
+    // barrier.  Use those constraints even when the global barrier-reorder
+    // knob is disabled: this moves only the load/use chain (and its matching
+    // arrive), rather than globally raising and sinking every WS barrier in
+    // the block.
+    if (opConstraints || isWSBarrierReorderEnabled()) {
+      // Once the load chain has picked up its own arrive, it may pass another
+      // WS arrive: both operations only delay signals.  This mirrors
+      // sinkWSArrives, but is deliberately limited to the one epilogue chain.
+      // Both arrives must carry WS barrier constraints; an unconstrained
+      // arrive has no channel to prove independence against, so it stays
+      // subject to canAdvanceWSBarrier.
+      auto chainArrive = dyn_cast<ArriveBarrierOp>(useChain.back());
+      auto nextArrive = dyn_cast<ArriveBarrierOp>(next);
+      bool arrivesCanSwap =
+          chainArrive && nextArrive &&
+          hasWSBarrierConstraints(chainArrive.getConstraints()) &&
+          hasWSBarrierConstraints(nextArrive.getConstraints());
+      if (!arrivesCanSwap && !canAdvanceWSBarrier(opConstraints, next))
+        return false;
+    } else {
+      // Legacy safe behavior: don't sink past barrier signals, since they may
+      // guard the liverange of the buffer.
+      if (isa<ArriveBarrierOp>(next))
+        return false;
+    }
   }
   if (!isMemoryEffectFree(next) && !isPlainTMAStoreTokenWait(next)) {
     SmallVector<MemoryEffects::EffectInstance> effects;
@@ -517,8 +528,16 @@ DenseMap<Operation *, DictionaryAttr> buildTMemLoadConstraints(Block &block) {
     for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
       if (!canAdvanceWSBarrier(constraints, cur))
         break;
-      if (isa<TMEMLoadOp>(cur))
-        memOpConstraints[cur] = dict;
+      auto load = dyn_cast<TMEMLoadOp>(cur);
+      if (!load)
+        continue;
+      // Don't attribute the arrive to a load it provably does not guard:
+      // the load must stay free to sink past it rather than carry it along
+      // as its own.
+      if (isDisjointFromGuardedBuffers(getBufferIdForValue(load.getSrc()),
+                                       constraints))
+        continue;
+      memOpConstraints[cur] = dict;
     }
   }
 

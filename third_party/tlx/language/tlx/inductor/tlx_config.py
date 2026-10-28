@@ -36,6 +36,12 @@ allow_min_speedup: float = float(
     os.environ.get("TORCHINDUCTOR_TLX_ALLOW_MIN_SPEEDUP", "1.0")
 )
 
+# Lower eligible SDPA flash-attention calls (see sdpa_to_flex.eligible) through the
+# flex-attention lowering so flex templates can serve SDPA callers. Read at forward
+# compile and again at the lazy backward compile, so set it process-wide (env var):
+# toggling it around a compile call pairs a flex forward with an FA2 backward.
+sdpa_to_flex: bool = os.environ.get("TORCHINDUCTOR_TLX_SDPA_TO_FLEX", "0") == "1"
+
 @contextmanager
 def patch(**kwargs: object) -> Generator[None, None, None]:
     """Context manager to temporarily override TLX config values."""

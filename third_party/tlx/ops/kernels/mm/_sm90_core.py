@@ -46,30 +46,50 @@ def _allocate_buffers(a_desc, b_desc, BM: tl.constexpr, BN: tl.constexpr, BK: tl
 
 
 @triton.jit
+def _k_tile_range(K, split_id, BK: tl.constexpr, SPLIT_K: tl.constexpr):
+    k_tiles = tl.cdiv(K, BK)
+    if SPLIT_K == 1:
+        return 0, k_tiles
+    # Callers prune SPLIT_K so that every split owns at least one K tile; an
+    # empty split would leave the consumer waiting on a barrier forever.
+    k_tiles_per_split = tl.cdiv(k_tiles, SPLIT_K)
+    k_lo = split_id * k_tiles_per_split
+    return k_lo, min(k_lo + k_tiles_per_split, k_tiles)
+
+
+@triton.jit
 def _run_producer(M, N, K, a_desc, b_desc, a, b, bars_empty_a, bars_full_a, bars_empty_b, bars_full_b,
                   NUM_SMS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                   GROUP_SIZE_M: tl.constexpr, NUM_STAGES: tl.constexpr, NUM_MMA_GROUPS: tl.constexpr,
-                  A_ROW_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr, A_EVICTION: tl.constexpr):
+                  A_ROW_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr, A_EVICTION: tl.constexpr,
+                  SPLIT_K: tl.constexpr = 1, b_tail_desc=None, b_tail=None, N_TAIL: tl.constexpr = 0, b_tail2_desc=None,
+                  b_tail2=None, N_TAIL2: tl.constexpr = 0):
+    # BN is the tile's main power-of-two N piece; N_TAIL (and N_TAIL2) > 0 add
+    # K-major B pieces after it, loaded onto the same full barrier.
     block_m_split: tl.constexpr = BM // NUM_MMA_GROUPS
+    BN_TILE: tl.constexpr = BN + N_TAIL + N_TAIL2
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BM)
-    num_pid_n = tl.cdiv(N, BN)
-    num_tiles = num_pid_m * num_pid_n
+    num_pid_n = tl.cdiv(N, BN_TILE)
+    num_mn_tiles = num_pid_m * num_pid_n
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     phase = 1
     buf = 0
 
-    for tile_id in range(start_pid, num_tiles, NUM_SMS):
-        group_id = tile_id // num_pid_in_group
+    for tile_id in range(start_pid, num_mn_tiles * SPLIT_K, NUM_SMS):
+        mn_tile_id = tile_id % num_mn_tiles
+        group_id = mn_tile_id // num_pid_in_group
         first_pid_m = group_id * GROUP_SIZE_M
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-        pid_n = (tile_id % num_pid_in_group) // group_size_m
-        offset_am = pid_m * BM
-        offset_bn = pid_n * BN
+        pid_m = first_pid_m + ((mn_tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (mn_tile_id % num_pid_in_group) // group_size_m
+        # TMA coordinates must be int32; a dynamic M/N/K makes these int64.
+        offset_am = (pid_m * BM).to(tl.int32)
+        offset_bn = (pid_n * BN_TILE).to(tl.int32)
+        k_lo, k_hi = _k_tile_range(K, tile_id // num_mn_tiles, BK, SPLIT_K)
 
-        for k in range(0, tl.cdiv(K, BK)):
-            offset_k = k * BK
+        for k in range(k_lo, k_hi):
+            offset_k = (k * BK).to(tl.int32)
 
             empty_a_0 = tlx.local_view(bars_empty_a, buf)
             full_a_0 = tlx.local_view(bars_full_a, buf)
@@ -103,7 +123,7 @@ def _run_producer(M, N, K, a_desc, b_desc, a, b, bars_empty_a, bars_full_a, bars
             tlx.barrier_wait(empty_b, phase)
             tlx.barrier_expect_bytes(
                 full_b,
-                BN * BK * tlx.size_of(tlx.dtype_of(b_desc)),
+                BN_TILE * BK * tlx.size_of(tlx.dtype_of(b_desc)),
             )
             data_b = tlx.local_view(b, buf)
             if B_ROW_MAJOR:
@@ -120,6 +140,11 @@ def _run_producer(M, N, K, a_desc, b_desc, a, b, bars_empty_a, bars_full_a, bars
                     [offset_bn, offset_k],
                     full_b,
                 )
+            if N_TAIL > 0:
+                tlx.async_descriptor_load(b_tail_desc, tlx.local_view(b_tail, buf), [offset_bn + BN, offset_k], full_b)
+            if N_TAIL2 > 0:
+                tlx.async_descriptor_load(b_tail2_desc, tlx.local_view(b_tail2, buf),
+                                          [offset_bn + BN + N_TAIL, offset_k], full_b)
 
             a_1_index = buf + NUM_STAGES
             empty_a_1 = tlx.local_view(bars_empty_a, a_1_index)
@@ -220,6 +245,12 @@ def _split_acc(acc, block_m_split: tl.constexpr, BN: tl.constexpr):
     acc_hi = tl.permute(tl.reshape(acc_hi, (block_m_split, 2, BN // 4)), (0, 2, 1))
     acc_2, acc_3 = tl.split(acc_hi)
     return acc_0, acc_1, acc_2, acc_3
+
+
+@triton.jit
+def _split_acc2(acc, block_m_split: tl.constexpr, BN: tl.constexpr):
+    acc = tl.permute(tl.reshape(acc, (block_m_split, 2, BN // 2)), (0, 2, 1))
+    return tl.split(acc)
 
 
 @triton.jit

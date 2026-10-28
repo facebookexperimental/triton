@@ -37,3 +37,11 @@ makes no claim for that vendor, not necessarily that the op is unsupported.
 Note: async copies (`async_load` and its commit/wait groups) and the AMD buffer
 ops require **gfx950** — they are **not** available on gfx942. `barrier_arrive`
 on AMD requires `arrive_count == 1`.
+
+## Per-hardware support
+
+- [TLX on gfx950 (MI350)](tlx-gfx950.html)
+- [TLX on gfx942 (MI300)](tlx-gfx942.html)
+- [TLX on sm100 (Blackwell)](tlx-sm100.html)
+- [TLX on sm90 (Hopper)](tlx-sm90.html)
+- [TLX on gfx1250 (RDNA4)](tlx-gfx1250.html)

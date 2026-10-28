@@ -1,4 +1,3 @@
-#include "lib/Target/LLVMIR/LLVMPasses.h"
 #include "mlir/IR/BuiltinOps.h" // mlir::ModuleOp
 #include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
@@ -12,6 +11,8 @@
 #include "llvm/CodeGen/MIRParser/MIRParser.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/SchedulerRegistry.h"
+#include "llvm/CodeGen/SelectionDAGISel.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/IRBuilder.h"
@@ -33,9 +34,11 @@
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Parallel.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/VCSRevision.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
@@ -43,10 +46,11 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
 #include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Scalar/InstSimplifyPass.h"
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <nanobind/make_iterator.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
@@ -59,6 +63,14 @@
 #include <unordered_set>
 
 namespace py = nanobind;
+
+namespace llvm {
+struct BreakStructPhiNodesPass
+    : OptionalPassInfoMixin<BreakStructPhiNodesPass> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+  static StringRef name() { return "BreakStructPhiNodesPass"; }
+};
+} // namespace llvm
 
 using namespace llvm;
 
@@ -158,6 +170,31 @@ struct LLVMOptionSettings {
       setFlag("print-after-all", true);
   }
 };
+
+thread_local bool scheduleForRegisters = false;
+
+ScheduleDAGSDNodes *createTritonDAGScheduler(SelectionDAGISel *selector,
+                                             CodeGenOptLevel optLevel) {
+  // LLVM's scheduler callback has no user-data argument. Keep the requested
+  // policy local to the thread performing this compilation.
+  if (scheduleForRegisters && selector->TM.getTargetTriple().isNVPTX())
+    return createBURRListDAGScheduler(selector, optLevel);
+  return createDefaultScheduler(selector, optLevel);
+}
+
+void installTritonDAGScheduler() {
+  auto options = llvm::cl::getRegisteredOptions();
+  auto option = options.find("pre-RA-sched");
+  if (option == options.end())
+    throw std::runtime_error("LLVM SelectionDAG scheduler option is missing");
+  using SchedulerOption =
+      llvm::cl::opt<RegisterScheduler::FunctionPassCtor, false,
+                    RegisterPassParser<RegisterScheduler>>;
+  // LLD resets LLVM options when linking HSACO. Make the dispatcher the default
+  // so subsequent NVIDIA compilations retain their per-compilation policy.
+  static_cast<SchedulerOption *>(option->second)
+      ->setInitialValue(createTritonDAGScheduler);
+}
 
 std::unique_ptr<TargetMachine>
 createTargetMachine(llvm::Module *module, std::string proc,
@@ -516,7 +553,8 @@ void init_triton_llvm(py::module_ &m) {
           "__iter__",
           [](llvm::Module::FunctionListType &s) {
             return py::make_iterator<py::rv_policy::reference>(
-                py::handle(), "iterator", s.begin(), s.end());
+                py::type<llvm::Module::FunctionListType>(), "iterator",
+                s.begin(), s.end());
           },
           py::keep_alive<0, 1>());
 
@@ -704,8 +742,7 @@ void init_triton_llvm(py::module_ &m) {
       [](llvm::Module *mod, const llvm::OptimizationLevel &opt,
          std::string arch, std::string features, std::vector<std::string> flags,
          bool enable_fp_fusion, bool disable_slp_vectorizer,
-         bool disable_vector_combine, bool expand_masked_div_rem,
-         bool scalarize_packed_fops) {
+         bool disable_vector_combine, bool expand_masked_div_rem) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
         // Declare the same flags as codegen even though IR optimization does
@@ -747,6 +784,11 @@ void init_triton_llvm(py::module_ &m) {
         }
         if (mlir::triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
           standardInstr.registerCallbacks(passInstrCb, &mam);
+          enablePassInstrumentation = true;
+        }
+        TimeProfilingPassesHandler timeProfiling;
+        if (llvm::timeTraceProfilerEnabled()) {
+          timeProfiling.registerCallbacks(passInstrCb);
           enablePassInstrumentation = true;
         }
         if (enablePassInstrumentation)
@@ -819,12 +861,6 @@ void init_triton_llvm(py::module_ &m) {
           mpm.addPass(AddressSanitizerPass(Opts));
         }
         mpm.addPass(pb.buildPerModuleDefaultPipeline(opt));
-        if (scalarize_packed_fops) {
-          FunctionPassManager fpm;
-          fpm.addPass(ScalarizePackedFOpsPass());
-          fpm.addPass(InstSimplifyPass());
-          mpm.addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));
-        }
         if (expand_masked_div_rem)
           mpm.addPass(ExpandMaskedDivRemPass());
         mpm.run(*mod, mam);
@@ -839,7 +875,6 @@ void init_triton_llvm(py::module_ &m) {
       py::arg("disable_slp_vectorizer") = false,
       py::arg("disable_vector_combine") = false,
       py::arg("expand_masked_div_rem") = false,
-      py::arg("scalarize_packed_fops") = false,
       py::call_guard<py::gil_scoped_release>());
 
   m.def(
@@ -852,6 +887,8 @@ void init_triton_llvm(py::module_ &m) {
         {
           // when allow_threads goes out of scope, gil will be released
           py::gil_scoped_release allow_threads;
+          llvm::SaveAndRestore schedulingPolicy(scheduleForRegisters,
+                                                sched4reg);
           // create LLVM module from C++
           llvm::LLVMContext context;
           std::unique_ptr<llvm::MemoryBuffer> buffer =
@@ -961,12 +998,39 @@ void init_triton_llvm(py::module_ &m) {
       LLVMInitializeAMDGPUTargetMC();
       LLVMInitializeAMDGPUAsmParser();
       LLVMInitializeAMDGPUAsmPrinter();
+
+      // Installed exactly once, before any target compilation. The dispatcher
+      // reads thread-local state and is safe for parallel codegen.
+      installTritonDAGScheduler();
     });
     // Disable LLVM's internal parallelism. Triton kernels produce small LLVM
     // modules where pass-level parallelism is not beneficial, and LLVM's global
     // thread pool is not fork-safe: a forked child inherits the pool's state
     // but not its threads, causing SIGABRT on use or cleanup.
     llvm::parallel::strategy = llvm::hardware_concurrency(1);
+  });
+
+  // Per-thread LLVM time-trace profiler, used by triton.tools.compile_trace.
+  // begin returns the steady_clock time the profiler's timestamps are relative
+  // to (CLOCK_MONOTONIC on Linux, like Python's time.monotonic_ns), or -1 if a
+  // profiler is already running on this thread.
+  m.def("time_trace_begin", [](unsigned granularityUs) -> int64_t {
+    if (llvm::timeTraceProfilerEnabled())
+      return -1;
+    auto start = std::chrono::steady_clock::now();
+    llvm::timeTraceProfilerInitialize(granularityUs, "triton");
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               start.time_since_epoch())
+        .count();
+  });
+  m.def("time_trace_end", []() -> std::string {
+    if (!llvm::timeTraceProfilerEnabled())
+      return "";
+    SmallString<0> json;
+    llvm::raw_svector_ostream os(json);
+    llvm::timeTraceProfilerWrite(os);
+    llvm::timeTraceProfilerCleanup();
+    return std::string(json);
   });
 
   m.def("link_extern_libs", [](llvm::Module *dstMod,

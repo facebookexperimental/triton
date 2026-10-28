@@ -1,0 +1,66 @@
+name: Parse test failures
+description: >-
+  Parse a test job's JUnit XML or LIT log into the failure list that
+  report-nightly-failure.yml and reconcile-nightly-issues.yml take.
+inputs:
+  workflow:
+    description: Workflow name; scopes the issue titles
+    required: true
+  job:
+    description: Job name; scopes the issue titles
+    required: true
+  failed:
+    description: "'true' when the tests failed; adds a job-level item if no test failure parses"
+    required: true
+  bucket:
+    description: Id of that job-level item
+    required: false
+    default: job-failed-no-parseable-failures
+  junit:
+    description: Space-separated JUnit XML paths
+    required: false
+    default: ""
+  budget:
+    description: Space-separated <xml>=<timeout-minutes> pairs; reports passing steps close to timing out
+    required: false
+    default: ""
+  lit-log:
+    description: LIT output log, parsed instead of JUnit XML
+    required: false
+    default: ""
+  setup-script:
+    description: Script to source first, for runners whose python3 needs it
+    required: false
+    default: ""
+outputs:
+  failures:
+    description: JSON failure list
+    value: ${{ steps.parse.outputs.failures }}
+runs:
+  using: composite
+  steps:
+    - name: Parse failures
+      id: parse
+      shell: bash
+      env:
+        WORKFLOW: ${{ inputs.workflow }}
+        JOB: ${{ inputs.job }}
+        FAILED: ${{ inputs.failed }}
+        BUCKET: ${{ inputs.bucket }}
+        JUNIT: ${{ inputs.junit }}
+        BUDGET: ${{ inputs.budget }}
+        LIT_LOG: ${{ inputs.lit-log }}
+        SETUP_SCRIPT: ${{ inputs.setup-script }}
+      run: |
+        [[ -z "${SETUP_SCRIPT}" ]] || . "${SETUP_SCRIPT}"
+        ARGS=(--workflow "${WORKFLOW}" --job "${JOB}" --bucket "${BUCKET}")
+        [[ "${FAILED}" != true ]] || ARGS+=(--failed)
+        # The list reaches later jobs through GITHUB_OUTPUT. Keep it out of the
+        # job log, which internal CI signal cards read for their highlight.
+        if [[ -n "${LIT_LOG}" ]]; then
+          python3 .github/scripts/parse_lit_failures.py --log "${LIT_LOG}" "${ARGS[@]}" > /dev/null
+        else
+          for b in ${BUDGET}; do ARGS+=(--budget "${b}"); done
+          # shellcheck disable=SC2086  # JUNIT is a space-separated list
+          python3 .github/scripts/parse_junit_failures.py --junit ${JUNIT} "${ARGS[@]}" > /dev/null
+        fi

@@ -1,0 +1,121 @@
+name: TritonBench
+# TritonBench on one GPU, called by gpu-tests-nightly.yml once per platform: run it on the
+# prebuilt wheel, then file or close the nightly issue for that GPU on scheduled runs. The
+# platform's runner and names are looked up below; its setup lives in actions/setup-tritonbench.
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: h100, b200 or mi350
+        required: true
+        type: string
+      wheel_url:
+        required: true
+        type: string
+      wheel_filename:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
+
+env:
+  # Nightly issues are titled by the per-GPU workflow names they had before this workflow.
+  GPU_WORKFLOW_NAME: ${{ fromJSON('{"h100":"Meta Triton H100 Tests","b200":"Meta Triton B200 Tests","mi350":"Meta Triton MI350 Tests"}')[inputs.platform] }}
+  TORCHINDUCTOR_TLX_MODE: "off"
+
+jobs:
+  test:
+    name: ${{ inputs.platform }}-tritonbench-test
+    runs-on: ${{ fromJSON('{"h100":"linux-gcp-h100","b200":"nvidia-dgx-b200","mi350":"linux-fb-triton-mi350-1"}')[inputs.platform] }}
+    timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    outputs:
+      failures: ${{ steps.collect.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Set up TritonBench
+        uses: ./.github/actions/setup-tritonbench
+        with:
+          platform: ${{ inputs.platform }}
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
+      - name: Run TritonBench
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
+        run: |
+          if [ "${PLATFORM}" = mi350 ]; then
+            export TRITONBENCH_ROOT="${GITHUB_WORKSPACE}/tritonbench"
+            # Import test files by path so same-named test modules do not collide (#4001).
+            export PYTEST_ADDOPTS=--import-mode=importlib
+          else
+            . "${SETUP_SCRIPT}"
+            export TRITONBENCH_ROOT="${TRITONBENCH_ROOT:-/workspace/tritonbench}"
+          fi
+          bash ./.ci/tritonbench/test-gpu.sh
+      - name: Collect nightly failure (TritonBench)
+        id: collect
+        if: always() && github.event_name == 'schedule' && failure()
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          # MI350's bucket kept its older name, so its open issue still matches.
+          BUCKET: ${{ inputs.platform == 'mi350' && 'amd-tritonbench' || format('{0}-tritonbench', inputs.platform) }}
+          GPU: ${{ fromJSON('{"h100":"H100","b200":"B200","mi350":"MI350"}')[inputs.platform] }}
+        run: |
+          JOB="${PLATFORM}-tritonbench-test"
+          TITLE="[nightly] ${GPU_WORKFLOW_NAME} / ${JOB} / ${BUCKET}"
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"'"${JOB}"'","summary":"TritonBench tests failed on '"${GPU}"' (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
+          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
+
+  report:
+    needs: test
+    if: always() && github.event_name == 'schedule' && needs.test.outputs.failures != '' && needs.test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ fromJSON('{"h100":"Meta Triton H100 Tests","b200":"Meta Triton B200 Tests","mi350":"Meta Triton MI350 Tests"}')[inputs.platform] }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: ${{ inputs.platform }}
+
+  reconcile:
+    needs: test
+    if: always() && github.event_name == 'schedule' && (needs.test.result == 'success' || needs.test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ fromJSON('{"h100":"Meta Triton H100 Tests","b200":"Meta Triton B200 Tests","mi350":"Meta Triton MI350 Tests"}')[inputs.platform] }}
+      job_name: ${{ inputs.platform }}-tritonbench-test
+      failures: ${{ needs.test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

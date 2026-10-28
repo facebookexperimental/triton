@@ -405,8 +405,8 @@ class TestJITProxyOptionBinding(TestCase):
             scope = group.scope()
             scope.__enter__()
             self.addCleanup(scope.__exit__, None, None, None)
-        knobs.nvidia.use_triton_dispatcher = True
-        knobs.nvidia.use_autotune_c_cache = True
+        knobs.runtime.use_triton_dispatcher = True
+        knobs.runtime.use_autotune_c_cache = True
         knobs.autotuning.listener = None
         knobs.runtime.debug = False
         knobs.runtime.sanitize_overflow = False
@@ -459,8 +459,8 @@ class TestJITProxyOptionBinding(TestCase):
             (knobs.compilation, "always_compile", True),
             (knobs.compilation, "instrumentation_mode", "fpsan"),
             (knobs.compilation, "fpsan_homomorphic_casts", True),
-            (knobs.nvidia, "use_triton_dispatcher", False),
-            (knobs.nvidia, "use_autotune_c_cache", False),
+            (knobs.runtime, "use_triton_dispatcher", False),
+            (knobs.runtime, "use_autotune_c_cache", False),
             (knobs.autotuning, "listener", lambda *args, **kwargs: None),
         )
         for owner, name, value in states:
@@ -628,7 +628,7 @@ class TestJITProxyOptionBinding(TestCase):
                                                                     True), (knobs.compilation, "always_compile", True),
                                    (knobs.compilation, "instrumentation_mode",
                                     "fpsan"), (knobs.compilation, "fpsan_homomorphic_casts",
-                                               True), (knobs.nvidia, "use_triton_dispatcher", False)):
+                                               True), (knobs.runtime, "use_triton_dispatcher", False)):
             with self.subTest(option=name):
                 kernel, proxy, cached, fallback, dispatch = self._create_proxy()
                 self.assertIs(proxy(), cached)
@@ -913,8 +913,8 @@ class TestHIPJITProxyOptions(TestCase):
         def write(out, value):
             tl.store(out, value)
 
-        with knobs.nvidia.scope(), knobs.amd.scope():
-            knobs.nvidia.use_triton_dispatcher = True
+        with knobs.runtime.scope(), knobs.amd.scope():
+            knobs.runtime.use_triton_dispatcher = True
             knobs.amd.use_buffer_ops = True
             out = torch.empty(1, device=_get_device(), dtype=torch.int32)
             first = write[(1, )](out, 3)
@@ -944,8 +944,8 @@ class TestHIPJITProxyOptions(TestCase):
             if stages is None:
                 return "hip_native_cache_isolation", "hip_native_cache_isolation_hash"
 
-        with knobs.nvidia.scope(), knobs.runtime.scope():
-            knobs.nvidia.use_triton_dispatcher = True
+        with knobs.runtime.scope():
+            knobs.runtime.use_triton_dispatcher = True
             knobs.runtime.add_stages_inspection_hook = None
             out = torch.empty(1, device=_get_device(), dtype=torch.int32)
             first = write[(1, )](out, 3)
@@ -973,8 +973,8 @@ class TestHIPJITProxyOptions(TestCase):
         def options_kernel(out, SCALE: tl.constexpr = 3):
             tl.store(out, SCALE)
 
-        with knobs.nvidia.scope():
-            knobs.nvidia.use_triton_dispatcher = True
+        with knobs.runtime.scope():
+            knobs.runtime.use_triton_dispatcher = True
             out = torch.empty(1, device=_get_device(), dtype=torch.int32)
             options = {"num_warps": 4, "num_stages": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}
             first = options_kernel[(1, )](out, **options)

@@ -73,4 +73,53 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     } {async_task_id = array<i32: 0, 1, 2>, tt.warp_specialize}
     tt.return
   }
+
+  // TMA lowering replaces and erases each descriptor producer. Process another
+  // channel after the reused pair so reuse-state traversal revisits channels
+  // whose original producer is gone. Producer lookup must find the live copy
+  // through its allocation instead of retaining the erased operation.
+  //
+  // CHECK-LABEL: @reuse_group_after_tma_replacement
+  // CHECK: ttg.local_alloc {{.*}}buffer.id = 0 : i32
+  // CHECK-NOT: ttg.local_alloc {{.*}}buffer.id = 0 : i32
+  // CHECK: ttg.warp_specialize
+  // CHECK: default {
+  // CHECK: ttng.wait_barrier
+  // CHECK: ttg.local_load
+  // CHECK: partition0(
+  // CHECK: ttng.wait_barrier
+  // CHECK: ttg.local_load
+  // CHECK: partition1(
+  // CHECK-COUNT-3: ttng.async_tma_copy_global_to_local
+  // CHECK-NOT: nvws.descriptor_load
+  // CHECK: tt.return
+  tt.func public @reuse_group_after_tma_replacement(
+      %a_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %b_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %c_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %out0: !tt.ptr<f16>, %out1: !tt.ptr<f16>) {
+    %a = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %b = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %c = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 1 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %c0 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 0 : i32
+    %c1 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 1 : i32
+    %c4 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 4 : i32
+    %ptrs0 = tt.splat %out0 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    %ptrs1 = tt.splat %out1 {async_task_id = array<i32: 1>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    scf.for %iv = %c0 to %c4 step %c1 : i32 {
+      nvws.descriptor_load %a_desc[%c0, %c0] 16384 %a {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      nvws.descriptor_load %b_desc[%c0, %c0] 16384 %b {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %b0 = ttg.local_load %b {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      tt.store %ptrs0, %b0 {async_task_id = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      %a1 = ttg.local_load %a {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %b1 = ttg.local_load %b {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %sum = arith.addf %a1, %b1 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #blocked>
+      tt.store %ptrs1, %sum {async_task_id = array<i32: 1>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      nvws.descriptor_load %c_desc[%c0, %c0] 16384 %c {async_task_id = array<i32: 2>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %c0_value = ttg.local_load %c {async_task_id = array<i32: 0>, loop.cluster = 3 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      tt.store %ptrs0, %c0_value {async_task_id = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      scf.yield {async_task_id = array<i32: 0, 1, 2>}
+    } {async_task_id = array<i32: 0, 1, 2>, tt.warp_specialize}
+    tt.return
+  }
 }

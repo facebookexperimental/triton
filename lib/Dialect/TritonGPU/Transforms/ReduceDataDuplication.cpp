@@ -31,27 +31,34 @@ class TritonGPUReduceDataDuplicationPass
 public:
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    mod.walk([&](triton::gpu::ConvertLayoutOp cvtOp) -> void {
+    mod.walk([&](triton::gpu::ConvertLayoutOp cvtOp) -> WalkResult {
       OpBuilder builder(cvtOp);
       auto srcType = cast<RankedTensorType>(cvtOp.getSrc().getType());
       auto dstType = cast<RankedTensorType>(cvtOp.getType());
       auto srcEncoding = srcType.getEncoding();
       if (isa<triton::gpu::SharedEncodingTrait>(srcEncoding))
-        return;
+        return WalkResult::advance();
       auto dstDotOp =
           dyn_cast<triton::gpu::DotOperandEncodingAttr>(dstType.getEncoding());
       if (!dstDotOp)
-        return;
+        return WalkResult::advance();
       if (!cvtNeedsSharedMemory(cvtOp))
-        return;
+        return WalkResult::advance();
       auto order = getOrderForMemory(srcType);
       auto sharedMemorySpace =
           triton::gpu::SharedMemorySpaceAttr::get(srcType.getContext());
+      auto sharedEncoding = triton::gpu::SwizzledSharedEncodingAttr::get(
+          mod.getContext(), dstDotOp, srcType.getShape(), order,
+          triton::gpu::getCGALayout(srcEncoding), srcType.getElementType());
+      if (!isLegalMemDescLayoutShape(dstType.getShape(), sharedEncoding)) {
+        cvtOp.emitError("shared-memory staging of an NPOT dot operand is not "
+                        "yet supported (a non-leading dim is not a power of "
+                        "2)");
+        signalPassFailure();
+        return WalkResult::interrupt();
+      }
       auto tmpType = triton::gpu::MemDescType::get(
-          dstType.getShape(), dstType.getElementType(),
-          triton::gpu::SwizzledSharedEncodingAttr::get(
-              mod.getContext(), dstDotOp, srcType.getShape(), order,
-              triton::gpu::getCGALayout(srcEncoding), srcType.getElementType()),
+          dstType.getShape(), dstType.getElementType(), sharedEncoding,
           sharedMemorySpace);
       auto tmp = triton::gpu::LocalAllocOp::create(builder, cvtOp.getLoc(),
                                                    tmpType, cvtOp.getSrc());
@@ -59,6 +66,7 @@ public:
           builder, cvtOp.getLoc(), dstType, tmp);
       cvtOp.replaceAllUsesWith(newConvert.getResult());
       cvtOp.erase();
+      return WalkResult::advance();
     });
   }
 };

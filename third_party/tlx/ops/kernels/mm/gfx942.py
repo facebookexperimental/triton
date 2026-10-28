@@ -12,6 +12,9 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.inductor.reduce_k import _reduce_k_kernel
+
+from ..._invariance import gemm_fixed_split_k
 
 
 class _LocalSplitUPlan(NamedTuple):
@@ -25,6 +28,7 @@ class _LocalSplitUPlan(NamedTuple):
 # Debug/ablation toggle. Eligibility remains restricted by
 # ``_precheck_local_split_u`` below.
 ENABLE_LOCAL_SPLIT_U = True
+ENABLE_GLOBAL_SPLIT_K = True
 
 _MEASURED_LOCAL_SPLIT_U_PLANS = {
     # These cover the current gfx942_2 focus shapes and can be generalized after broader measurements.
@@ -333,9 +337,13 @@ def _direct_matmul_kernel_gfx942(
     PACK_FP16_STORES: tl.constexpr = False,
     USE_N_EDGE_PANELS: tl.constexpr = False,
     USE_N_INTERIOR_PANELS: tl.constexpr = False,
+    USE_SINGLE_STAGE_POINTER_LOADS: tl.constexpr = False,
+    USE_PIPELINED_POINTER_LOADS: tl.constexpr = False,
+    TILE_ID=0,
+    OVERRIDE_TILE_ID: tl.constexpr = False,
 ):
     """Register-staged GEMM with per-operand cache and XCD policy."""
-    pid = tl.program_id(0).to(tl.int32)
+    pid = TILE_ID.to(tl.int32) if OVERRIDE_TILE_ID else tl.program_id(0).to(tl.int32)
     grid_m = tl.cdiv(M, BLOCK_M)
     grid_n = tl.cdiv(N, BLOCK_N)
     grid_mn = grid_m * grid_n
@@ -491,18 +499,48 @@ def _direct_matmul_kernel_gfx942(
         # Buffer descriptors use signed-i32 byte bounds. Keep generic pointer
         # loads for wide/negative strides and views that exceed the descriptor.
         # Include the final element's full byte width, not only its start.
-        USE_BUFFER_A: tl.constexpr = (not USE_I64_A_OFFSETS and 0 <= stride_am and stride_am <= 0x7fffffff
+        # The measured short-M family also uses smaller output tiles in the
+        # same compiler-managed pointer pipeline. Operand ownership follows
+        # reg_m/reg_n; the masked epilogue remains the unique output writer.
+        SMALL_POINTER_TILE: tl.constexpr = (((M == 902 and ((N == 2048 and (K == 2048 or K == 4096)) or
+                                                            (N == 4096 and (K == 1091 or K == 2048 or K == 6656)))) or
+                                             (M == 440 and ((N == 2048 and (K == 2048 or K == 4096)) or
+                                                            (N == 4096 and (K == 1093 or K == 2048 or K == 6400)))))
+                                            and (BLOCK_M == 64 or BLOCK_M == 128) and (BLOCK_N == 64 or BLOCK_N == 128))
+        # Keep the buffer policy for other layouts and element types.
+        PIPELINED_POINTERS: tl.constexpr = (USE_PIPELINED_POINTER_LOADS and tlx.dtype_of(a_ptr) == tl.float16
+                                            and tlx.dtype_of(b_ptr) == tl.float16 and stride_am == K and stride_ak == 1
+                                            and stride_bk == 1 and stride_bn == K
+                                            and ((BLOCK_M == 128 and BLOCK_N == 128) or SMALL_POINTER_TILE)
+                                            and (BLOCK_K == 64 or (SMALL_POINTER_TILE and
+                                                                   (BLOCK_K == 128 or BLOCK_K == 256))))
+        USE_BUFFER_A: tl.constexpr = (not USE_SINGLE_STAGE_POINTER_LOADS and not PIPELINED_POINTERS
+                                      and not USE_I64_A_OFFSETS and 0 <= stride_am and stride_am <= 0x7fffffff
                                       and 0 <= stride_ak and stride_ak <= 0x7fffffff
                                       and ((M - 1) * stride_am + (K - 1) * stride_ak + 1) *
-                                      (a_ptr.dtype.element_ty.primitive_bitwidth // 8) <= 0x7ffffffe)
-        USE_BUFFER_B: tl.constexpr = (not USE_I64_B_OFFSETS and 0 <= stride_bk and stride_bk <= 0x7fffffff
+                                      (tlx.dtype_of(a_ptr).primitive_bitwidth // 8) <= 0x7ffffffe)
+        USE_BUFFER_B: tl.constexpr = (not USE_SINGLE_STAGE_POINTER_LOADS and not PIPELINED_POINTERS
+                                      and not USE_I64_B_OFFSETS and 0 <= stride_bk and stride_bk <= 0x7fffffff
                                       and 0 <= stride_bn and stride_bn <= 0x7fffffff
                                       and ((K - 1) * stride_bk + (N - 1) * stride_bn + 1) *
-                                      (b_ptr.dtype.element_ty.primitive_bitwidth // 8) <= 0x7ffffffe)
+                                      (tlx.dtype_of(b_ptr).primitive_bitwidth // 8) <= 0x7ffffffe)
         PACKED_K_LOADS: tl.constexpr = (USE_PACKED_K_LOADS and USE_BUFFER_A and USE_BUFFER_B
-                                        and a_ptr.dtype.element_ty == tl.float16 and stride_ak == 1 and stride_bk == 1
+                                        and tlx.dtype_of(a_ptr) == tl.float16 and stride_ak == 1 and stride_bk == 1
                                         and BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 64)
-        if PACKED_K_LOADS:
+        SHORT_PACKED_K_LOADS: tl.constexpr = (USE_BUFFER_A and USE_BUFFER_B and tlx.dtype_of(a_ptr) == tl.float16
+                                              and tlx.dtype_of(b_ptr) == tl.float16 and stride_ak == 1
+                                              and stride_bk == 1 and BLOCK_M == 64 and BLOCK_N == 64 and BLOCK_K == 64
+                                              and K >= 64 and K < 256 and tlx.num_warps() == 4)
+        if SHORT_PACKED_K_LOADS:
+            packed_a: tl.constexpr = tlx.layout(
+                shape=((8, 8, 4), (8, 2)),
+                stride=((8, 64, 512), (1, 2048)),
+            )
+            packed_b: tl.constexpr = tlx.layout(
+                shape=((8, 8, 4), (8, 2)),
+                stride=((512, 1, 8), (64, 32)),
+            )
+        elif PACKED_K_LOADS:
             # Each of 512 threads owns four independent groups of eight K
             # elements. These are consecutive physical elements even when
             # the outer strides are odd. No alignment fact is asserted.
@@ -577,7 +615,8 @@ def _direct_matmul_kernel_gfx942(
             b = tlx.local_load(b_slot)
             acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
         else:
-            for k in range(0, k_main, BLOCK_K):
+            LOOP_STAGES: tl.constexpr = 1 if USE_SINGLE_STAGE_POINTER_LOADS else None
+            for k in tl.range(0, k_main, BLOCK_K, num_stages=LOOP_STAGES):
                 if USE_I64_A_OFFSETS:
                     a_offsets = (reg_m.to(tl.int64)[:, None] * stride_am +
                                  (k + offs_k[None, :]).to(tl.int64) * stride_ak)
@@ -588,7 +627,7 @@ def _direct_matmul_kernel_gfx942(
                                  reg_n.to(tl.int64)[None, :] * stride_bn)
                 else:
                     b_offsets = (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-                if PACKED_K_LOADS:
+                if PACKED_K_LOADS or SHORT_PACKED_K_LOADS:
                     # Pin only the global-load ownership boundary; tl.dot
                     # retains its native consumer layout and synchronization.
                     a_offsets = tlx.require_layout(a_offsets, packed_a)
@@ -599,7 +638,7 @@ def _direct_matmul_kernel_gfx942(
                     a = tlx.buffer_load(a_ptr, a_offsets, contiguity=1)
                 else:
                     a = tl.load(a_ptr + a_offsets)
-                if not PACKED_K_LOADS:
+                if not (PACKED_K_LOADS or SHORT_PACKED_K_LOADS):
                     if USE_BUFFER_B:
                         b = tlx.buffer_load(b_ptr, b_offsets, contiguity=1)
                     else:
@@ -708,6 +747,158 @@ def _direct_matmul_kernel_gfx942(
 
 
 @triton.jit
+def _global_split_matmul_kernel_gfx942(
+    a_ptr,
+    b_ptr,
+    workspace_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    XCD_CHUNK: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    SPLIT_ORDER_CHUNK: tl.constexpr = 1,
+    LAUNCH_XCD_CHUNK: tl.constexpr = 0,
+):
+    # Balance contiguous K-block ranges: the first EXTRA_BLOCKS splits
+    # receive one extra block, so ranges differ by at most BLOCK_K.
+    # Each (output tile, split) still exclusively owns its fp32 partial.
+    # Only the final range can contain a ragged block; its constexpr
+    # length retains the helper's masked, zero-filled tail path.
+    K_BLOCKS: tl.constexpr = tl.cdiv(K, BLOCK_K)
+    BASE_BLOCKS: tl.constexpr = K_BLOCKS // SPLIT_K
+    EXTRA_BLOCKS: tl.constexpr = K_BLOCKS % SPLIT_K
+    SHORT_K: tl.constexpr = BASE_BLOCKS * BLOCK_K
+    LONG_K: tl.constexpr = (BASE_BLOCKS + 1) * BLOCK_K
+    FINAL_K: tl.constexpr = K - ((SPLIT_K - 1) * BASE_BLOCKS + EXTRA_BLOCKS) * BLOCK_K
+    tl.static_assert(BASE_BLOCKS > 0)
+    tl.static_assert(FINAL_K > 0)
+    tl.static_assert(workspace_ptr.dtype.element_ty == tl.float32)
+    # Use the existing single-stage pointer producer for N=512 and N=2560.
+    # Slice addressing, fp32 partial ownership and reducer ordering stay
+    # identical for full and final slices; ragged K loads still zero-fill.
+    POINTER_LOADS: tl.constexpr = (4178 <= M and M <= 4942 and (N == 512 or N == 2560) and K == 18688
+                                   and tlx.dtype_of(a_ptr) == tl.float16 and tlx.dtype_of(b_ptr) == tl.float16
+                                   and stride_am == K and stride_ak == 1 and stride_bk == 1 and stride_bn == K
+                                   and BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 128)
+    TILES: tl.constexpr = tl.cdiv(M, BLOCK_M) * tl.cdiv(N, BLOCK_N)
+    flat = tl.program_id(0)
+    # Permute complete eight-XCD launch groups; leave the short tail
+    # unchanged so the padded launch remains a bijection.
+    if LAUNCH_XCD_CHUNK > 0:
+        total: tl.constexpr = tl.cdiv(TILES, SPLIT_ORDER_CHUNK) * SPLIT_ORDER_CHUNK * SPLIT_K
+        aligned: tl.constexpr = (total // (8 * LAUNCH_XCD_CHUNK)) * (8 * LAUNCH_XCD_CHUNK)
+        if flat < aligned:
+            xcd = flat % 8
+            local = flat // 8
+            group = (local // LAUNCH_XCD_CHUNK) * (8 * LAUNCH_XCD_CHUNK)
+            flat = group + xcd * LAUNCH_XCD_CHUNK + local % LAUNCH_XCD_CHUNK
+    split = (flat // SPLIT_ORDER_CHUNK) % SPLIT_K
+    tile = (flat // (SPLIT_ORDER_CHUNK * SPLIT_K)) * SPLIT_ORDER_CHUNK + flat % SPLIT_ORDER_CHUNK
+    if tile < TILES:
+        # prefix(split) = split * BASE_BLOCKS + min(split, EXTRA_BLOCKS).
+        # Consecutive prefixes partition [0, K_BLOCKS), with no gaps/overlap.
+        # Loads only read immutable A/B; all valid partial elements are stored
+        # once before the current-stream reducer consumes the complete planes.
+        start_k = (split * BASE_BLOCKS + tl.minimum(split, EXTRA_BLOCKS)) * BLOCK_K
+        a_slice = a_ptr + start_k * stride_ak
+        b_slice = b_ptr + start_k * stride_bk
+        partial = workspace_ptr + split * M * N
+        if split == SPLIT_K - 1:
+            _direct_matmul_kernel_gfx942(
+                a_slice,
+                b_slice,
+                partial,
+                partial,
+                M,
+                N,
+                FINAL_K,
+                stride_am,
+                stride_ak,
+                stride_bk,
+                stride_bn,
+                0,
+                0,
+                N,
+                1,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                GROUP_M,
+                NUM_XCDS,
+                XCD_CHUNK,
+                False,
+                USE_SINGLE_STAGE_POINTER_LOADS=POINTER_LOADS,
+                TILE_ID=tile,
+                OVERRIDE_TILE_ID=True,
+            )
+        elif split < EXTRA_BLOCKS:
+            _direct_matmul_kernel_gfx942(
+                a_slice,
+                b_slice,
+                partial,
+                partial,
+                M,
+                N,
+                LONG_K,
+                stride_am,
+                stride_ak,
+                stride_bk,
+                stride_bn,
+                0,
+                0,
+                N,
+                1,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                GROUP_M,
+                NUM_XCDS,
+                XCD_CHUNK,
+                False,
+                USE_SINGLE_STAGE_POINTER_LOADS=POINTER_LOADS,
+                TILE_ID=tile,
+                OVERRIDE_TILE_ID=True,
+            )
+        else:
+            _direct_matmul_kernel_gfx942(
+                a_slice,
+                b_slice,
+                partial,
+                partial,
+                M,
+                N,
+                SHORT_K,
+                stride_am,
+                stride_ak,
+                stride_bk,
+                stride_bn,
+                0,
+                0,
+                N,
+                1,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                GROUP_M,
+                NUM_XCDS,
+                XCD_CHUNK,
+                False,
+                USE_SINGLE_STAGE_POINTER_LOADS=POINTER_LOADS,
+                TILE_ID=tile,
+                OVERRIDE_TILE_ID=True,
+            )
+
+
+@triton.jit
 def matmul_kernel_gfx942(
     a_ptr,
     b_ptr,
@@ -745,9 +936,35 @@ def matmul_kernel_gfx942(
     PACK_FP16_STORES: tl.constexpr = False,
     USE_N_EDGE_PANELS: tl.constexpr = False,
     USE_N_INTERIOR_PANELS: tl.constexpr = False,
+    USE_PIPELINED_POINTER_LOADS: tl.constexpr = False,
+    SPLIT_K: tl.constexpr = 1,
+    SPLIT_ORDER_CHUNK: tl.constexpr = 1,
+    LAUNCH_XCD_CHUNK: tl.constexpr = 0,
 ):
     """Dispatch one autotune candidate to its selected GEMM implementation."""
-    if USE_LOCAL_SPLIT_U:
+    if SPLIT_K > 1:
+        _global_split_matmul_kernel_gfx942(
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            M,
+            N,
+            K,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            GROUP_M,
+            NUM_XCDS,
+            XCD_CHUNK,
+            SPLIT_K,
+            SPLIT_ORDER_CHUNK,
+            LAUNCH_XCD_CHUNK,
+        )
+    elif USE_LOCAL_SPLIT_U:
         _local_split_u_kernel_gfx942(
             a_ptr,
             b_ptr,
@@ -802,10 +1019,11 @@ def matmul_kernel_gfx942(
             PACK_FP16_STORES,
             USE_N_EDGE_PANELS,
             USE_N_INTERIOR_PANELS,
+            USE_PIPELINED_POINTER_LOADS=USE_PIPELINED_POINTER_LOADS,
         )
 
 
-def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kpack=1, split_m_128_32=False):
+def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kpack=1, split_m_128_32=False, split_k=1):
     # This overlaps register-staged global loads; it is not an explicit
     # two-buffer LDS allocation.
     meta = {
@@ -818,6 +1036,8 @@ def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kp
         "waves_per_eu": waves_per_eu,
         "kpack": kpack,
     }
+    if split_k > 1:
+        meta["SPLIT_K"] = split_k
     if split_m_128_32:
         meta["SPLIT_M_128_32"] = True
     return triton.Config(meta, num_warps=num_warps, num_stages=2)
@@ -952,8 +1172,96 @@ def _smoke_configs():
 SMOKE_CONFIGS = _smoke_configs
 
 
-def heuristic_config(M, N, K):
-    """Choose one direct-load configuration without runtime autotuning."""
+def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuning=True):
+    """Choose one configuration without runtime autotuning."""
+    # Offline paired cold-cache trials select the K step and output tile
+    # within the existing compiler-managed pointer pipeline. Retain the
+    # incumbent below for rows whose trials were inconclusive.
+    short_m_pipeline_configs = {
+        (902, 4096, 6656): (128, 128, 128, 8),
+        (902, 4096, 2048): (128, 128, 128, 8),
+        (902, 4096, 1091): (128, 64, 64, 8),
+        (440, 2048, 4096): (64, 64, 128, 8),
+        (440, 2048, 2048): (64, 64, 256, 8),
+    }
+    if enable_short_m_tuning and (M, N, K) in short_m_pipeline_configs:
+        block_m, block_n, block_k, num_warps = short_m_pipeline_configs[M, N, K]
+        config = _config(block_m, block_n, block_k, 8, num_warps)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    # Offline cold-cache trials choose output granularity for the short-M
+    # family. Keep the square incumbent where smaller tiles were inconclusive.
+    short_m_tiles = {
+        (902, 2048, 4096): (64, 64, 4),
+        (902, 4096, 7552): (128, 128, 8),
+        (902, 4096, 6656): (128, 128, 8),
+        (902, 4096, 2048): (128, 128, 8),
+        (902, 2048, 2048): (64, 64, 4),
+        (440, 2048, 4096): (64, 64, 4),
+        (440, 4096, 6400): (64, 64, 4),
+        (440, 4096, 2048): (64, 64, 4),
+        (440, 2048, 2048): (64, 64, 8),
+        (440, 4096, 1093): (64, 64, 4),
+    }
+    if (M, N, K) in short_m_tiles:
+        block_m, block_n, num_warps = short_m_tiles[M, N, K]
+        config = _config(block_m, block_n, 64, 8, num_warps)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    if enable_global_split_k and _global_split_k_shape(M, N, K):
+        # Balance the narrow grids within two waves of the 304-CU device.
+        # The wider grid favors fewer partial planes after 38 row tiles.
+        row_tiles = triton.cdiv(M, 128)
+        split_k = {256: 8, 512: 4, 1280: 3, 2560: 4}[N]
+        if N in (256, 512):
+            split_k = min(split_k, (2 * 304) // (row_tiles * triton.cdiv(N, 128)))
+        elif N == 2560 and row_tiles > 38:
+            split_k = 2
+        config = _config(128, 128, 128, 16, 4, split_k=split_k)
+        # Offline paired trials select the split-work order and B reuse group.
+        # These options are confined to the guarded FP16 production family.
+        group_m, num_xcds, chunk = 16, 8, 2
+        if N == 256:
+            num_xcds, chunk = 1, 4
+        elif N == 512:
+            if row_tiles <= 34:
+                group_m, num_xcds, chunk = 4, 1, 1
+            elif row_tiles > 38:
+                group_m, num_xcds = 1, 1
+        elif N == 1280:
+            group_m, num_xcds = 8, 1
+            if row_tiles > 38:
+                group_m, chunk = 4, 1
+        elif row_tiles <= 34:
+            chunk = 32
+        config.kwargs.update(
+            GROUP_M=group_m,
+            NUM_XCDS=num_xcds,
+            SPLIT_ORDER_CHUNK=chunk,
+            enable_sched_group_barrier_scheduler=True,
+            sched_group_barrier_mfma_per_dwordx4=2,
+        )
+        if N == 512 and row_tiles > 34:
+            config.kwargs.update(LAUNCH_XCD_CHUNK=8, NUM_XCDS=1, GROUP_M=16,
+                                 SPLIT_ORDER_CHUNK=1 if row_tiles <= 35 else 2)
+        return [config]
+    # Offline cold-cache trials favor square tiles with a longer K step
+    # for the eight shallow-K production rows. Bound this rule to the
+    # production M range and exact (N, K) pairs; select one config only.
+    if 4178 <= M <= 4942 and (N, K) in (
+        (18688, 512),
+        (2560, 2560),
+        (8192, 2560),
+        (18688, 256),
+        (2560, 1280),
+        (1280, 2560),
+        (8192, 1280),
+        (2048, 2560),
+    ):
+        config = _config(128, 128, 64, 16, 4)
+        if (N, K) not in ((18688, 256), (8192, 1280)):
+            config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
     # This measured large-N case uses the split-panel algorithm to share each B tile across 160 output rows.
     if (M, N, K) == (2048, 10240, 25408):
         return [_config(160, 512, 32, 8, 8, split_m_128_32=True)]
@@ -1040,7 +1348,7 @@ def heuristic_config(M, N, K):
     return [_config(256, 256, 64, 4, 8)]
 
 
-def _candidate_configs(shape, enable_local_split_u=False):
+def _candidate_configs(shape, enable_local_split_u=False, enable_global_split_k=False):
     """Return the candidate universe, including a shape-specific incumbent."""
     configs = CONFIGS()
     if shape == (262144, 1195, 2373):
@@ -1144,7 +1452,12 @@ def _candidate_configs(shape, enable_local_split_u=False):
             ))
     if enable_local_split_u:
         configs.append(_local_split_u_config(_FULL_LOCAL_SPLIT_U_PLANS[shape]))
-    incumbent = heuristic_config(*shape)[0]
+    if enable_global_split_k and _global_split_k_shape(*shape):
+        # Offline only: retain all unsplit candidates and expose bounded
+        # split factors for the new decomposition.
+        configs.extend(
+            _config(128, 128, block_k, 16, 4, split_k=split) for block_k in (64, 128) for split in (2, 3, 4, 6, 8))
+    incumbent = heuristic_config(*shape, enable_global_split_k=enable_global_split_k)[0]
     incumbent_key = (incumbent.kwargs, incumbent.num_warps, incumbent.num_stages)
     if not any((config.kwargs, config.num_warps, config.num_stages) == incumbent_key for config in configs):
         configs.append(incumbent)
@@ -1155,7 +1468,7 @@ def _candidate_configs(shape, enable_local_split_u=False):
 def _tuned(space, shape=None, enable_local_split_u=False):
     """Autotuned GEMM kernel per search space."""
     if space == "heuristic":
-        configs = heuristic_config(*shape)
+        configs = heuristic_config(*shape, enable_global_split_k=False)
     elif space == "full":
         configs = _candidate_configs(shape, enable_local_split_u)
     elif space == "smoke":
@@ -1245,14 +1558,124 @@ def _needs_i64_offsets(tensor):
     return max_element_offset * tensor.element_size() > (1 << 31) - 1
 
 
-def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
+def _global_split_k_shape(M, N, K):
+    return ENABLE_GLOBAL_SPLIT_K and 4178 <= M <= 4942 and K == 18688 and N in (256, 512, 1280, 2560)
+
+
+def _precheck_global_split_k(a, b, bias, out):
+    M, K = a.shape
+    N = b.shape[1]
+    return (_global_split_k_shape(M, N, K) and a.dtype == torch.float16 and b.dtype == torch.float16
+            and out.dtype == torch.float16 and a.stride() == (K, 1) and b.stride() == (1, K) and out.is_contiguous()
+            and (bias is None or (bias.dtype == torch.float16 and bias.device == a.device and bias.ndim == 1
+                                  and bias.shape[0] == N and bias.stride(0) == 1)))
+
+
+_FULL_GLOBAL_SPLIT_K_CONFIGS = {}
+
+
+def _launch_global_split_k_config(a, b, bias, out, workspace, config):
+    M, K = a.shape
+    N = b.shape[1]
+    split_k = config.kwargs.get("SPLIT_K", 1)
+    meta = dict(config.kwargs)
+    meta.update(num_warps=config.num_warps, num_stages=config.num_stages)
+    tiles = triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"])
+    chunk = meta.get("SPLIT_ORDER_CHUNK", 1)
+    grid = (triton.cdiv(tiles, chunk) * chunk * split_k, ) if split_k > 1 else (tiles, )
+    target = workspace if split_k > 1 else out
+    bias_arg = bias if bias is not None else out
+    matmul_kernel_gfx942[grid](
+        a,
+        b,
+        bias_arg,
+        target,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        0,
+        1,
+        N,
+        1,
+        ADD_BIAS=bias is not None and split_k == 1,
+        matrix_instr_nonkdim=16,
+        **meta,
+    )
+    if split_k > 1:
+        # Both launches use the current stream: all producers finish before
+        # the reducer reads. Every valid workspace element is overwritten
+        # each call; no zeroing or atomics, and bias/cast happen exactly once.
+        _reduce_k_kernel[(triton.cdiv(M, 32), triton.cdiv(N, 32))](
+            workspace,
+            out,
+            bias_arg,
+            M,
+            N,
+            SPLIT_K=split_k,
+            BLOCK_SIZE_M=32,
+            BLOCK_SIZE_N=32,
+            OUTPUT_DTYPE=tl.float16,
+            HAS_BIAS=bias is not None,
+            STRIDE_BIAS_M=0,
+            STRIDE_BIAS_N=1,
+        )
+    return out
+
+
+def _launch_global_split_k(a, b, bias, out, space):
+    shape = (a.shape[0], b.shape[1], a.shape[1])
+    if space == "heuristic":
+        config = heuristic_config(*shape)[0]
+        workspace = torch.empty((config.kwargs["SPLIT_K"] * shape[0], shape[1]), device=a.device, dtype=torch.float32)
+    else:
+        # Explicit offline full-space tuning measures the complete launch
+        # pair. Production heuristic dispatch never enters this selection.
+        key = (_full_config_key(a, b), tuple(bias.stride()) if bias is not None else None)
+        config = _FULL_GLOBAL_SPLIT_K_CONFIGS.get(key)
+        workspace = torch.empty((8 * shape[0], shape[1]), device=a.device, dtype=torch.float32)
+        if config is None:
+            from triton.testing import do_bench_cudagraph
+            best_ms = float("inf")
+            for trial in _candidate_configs(shape, enable_global_split_k=True):
+
+                def run():
+                    return _launch_global_split_k_config(a, b, bias, out, workspace, trial)
+
+                try:
+                    run()
+                    elapsed_ms = do_bench_cudagraph(run)
+                except triton.OutOfResources:
+                    continue
+                if elapsed_ms < best_ms:
+                    best_ms, config = elapsed_ms, trial
+            if config is None:
+                raise RuntimeError("No valid gfx942 full-space GEMM configuration")
+            _FULL_GLOBAL_SPLIT_K_CONFIGS[key] = config
+    return _launch_global_split_k_config(a, b, bias, out, workspace, config)
+
+
+def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
+    """Direct-load GEMM with measured LocalSplitU fast paths.
+
+    TODO: let the user specify only LocalSplitU (so long as it's internally consistent).
+    """
+    # A fixed schedule prunes the LocalSplitU plans; the standard direct-load
+    # configs reduce K sequentially.
+    fixed = gemm_fixed_split_k(invariance)
     M, N, K = _validate_operands(a, b, out)
     bias_strides = _bias_strides(bias, M, N, a) if bias is not None else (0, 0)
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    enable_local_split_u = _precheck_local_split_u(a, b, bias)
-    if space == "heuristic" and (M, N, K) in _MEASURED_LOCAL_SPLIT_U_PLANS:
+    if space in ("heuristic", "full") and _global_split_k_shape(M, N, K) and _precheck_global_split_k(a, b, bias, out):
+        return _launch_global_split_k(a, b, bias, out, space)
+
+    enable_local_split_u = _precheck_local_split_u(a, b, bias) and fixed is None
+    if space == "heuristic" and fixed is None and (M, N, K) in _MEASURED_LOCAL_SPLIT_U_PLANS:
         plan = _MEASURED_LOCAL_SPLIT_U_PLANS[(M, N, K)]
         return _launch_local_split_u(a, b, out, plan)
 
@@ -1270,7 +1693,7 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
         fast_configs = getattr(kernel, "_tlx_fast_configs", None)
         if fast_configs is None:
             fast_configs = kernel._tlx_fast_configs = {}
-        fast_key = (_full_config_key(a, b), bias is not None, bias_strides)
+        fast_key = (_full_config_key(a, b), bias is not None, bias_strides, fixed)
         cached = fast_configs.get(fast_key)
         if cached is not None and cached[1]:
             config = cached[0]
@@ -1318,10 +1741,99 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
     return out
 
 
-def mm(a, b, *, out=None, space="heuristic"):
+def mm(a, b, *, out=None, space="heuristic", invariance=None):
     """Compute ``a @ b`` using the gfx942 direct-load GEMM kernel."""
-    return _gemm(a, b, out=out, space=space)
+    return _gemm(a, b, out=out, space=space, invariance=invariance)
 
 
 # Compatibility entry point used by the kernel-optimization agent.
 matmul = mm
+
+_THREADS_LSR_NK = frozenset((
+    (2048, 4096),
+    (2048, 2048),
+    (4096, 2048),
+    (4096, 7552),
+    (4096, 6656),
+    (4096, 6400),
+    (4096, 1091),
+    (4096, 1093),
+))
+
+
+def _template_config(tile, **extra):
+    config = _config(*tile)
+    config.kwargs.update(extra)
+    return config
+
+
+# Offline template sweeps, confirmed in tritonbench (>=3% over the shared policy).
+# (18688, 512) gains 1.09x GEMM-only with 128x128x64 g4 w8 but loses 2% fused in
+# the DCN epilogue, so it keeps the shared policy.
+_TORCHTLX_PROD_TILES = {
+    (2560, 2560): ((256, 256, 64, 8, 8), {"XCD_CHUNK": 4}),
+    (2560, 1280): ((256, 256, 64, 16, 8), {"XCD_CHUNK": 4, "waves_per_eu": 2}),
+    (1280, 2560): ((128, 128, 64, 8, 4), {"XCD_CHUNK": 4, "kpack": 2}),
+    (8192, 1280): ((256, 256, 64, 4, 8), {"XCD_CHUNK": 4, "waves_per_eu": 2}),
+}
+
+# Exact bf16 focus shapes, confirmed against the shared policy on the template.
+_TORCHTLX_BF16_TILES = {
+    (61440, 2048, 5120): ((256, 256, 64, 4, 8), {"XCD_CHUNK": 16, "waves_per_eu": 2}),
+    (1024, 6144, 20480): ((128, 128, 64, 4, 4), {"XCD_CHUNK": 4, "waves_per_eu": 2}),
+    (819200, 1024, 192): ((256, 128, 32, 16, 8), {"XCD_CHUNK": 1}),
+    (4096, 1894, 242432): ((64, 64, 256, 4, 8), {"XCD_CHUNK": 1}),
+}
+
+
+def _threads_lsr_config(M, N, K):
+    # Threads LSR expert GEMMs: bands come from offline template sweeps over the
+    # prod M range (100-1518); scheduling knobs are tuned at the median batch.
+    # Odd K leaves rows 2-byte aligned, so those rows use packed K loads.
+    odd_k = {"PACKED_K_LOADS": True}
+    if M <= 256:
+        return _template_config((64, 64, 256, 4, 8))
+    if M <= 640 and N == 2048:
+        if K == 4096:
+            return _template_config((64, 64, 128, 8, 4), XCD_CHUNK=4, kpack=2)
+        return _template_config((64, 64, 256, 1, 8), XCD_CHUNK=1, kpack=2, waves_per_eu=2)
+    if M <= 640 and (N, K) == (4096, 6400):
+        return _template_config((64, 128, 128, 4, 8), XCD_CHUNK=8, kpack=2)
+    if M <= 640 and K % 64 != 0:
+        return _template_config((64, 64, 128, 1, 4), kpack=2, **odd_k)
+    if M <= 640 and K == 2048:
+        return _template_config((64, 128, 128, 1, 8), XCD_CHUNK=4, kpack=2)
+    if M <= 640:
+        return _template_config((64, 128, 128, 4, 8))
+    if M <= 1024 and K % 64 != 0:
+        return _template_config((128, 64, 128, 4, 8), XCD_CHUNK=2, kpack=2, **odd_k)
+    if M <= 1024 and (N, K) == (2048, 4096):
+        return _template_config((64, 128, 128, 1, 8), XCD_CHUNK=2, kpack=2)
+    if M <= 1024 and N == 2048:
+        return _template_config((128, 64, 64, 4, 8))
+    if M <= 1024 and K in (7552, 6656):
+        return _template_config((128, 128, 128, 16, 8), XCD_CHUNK=4, waves_per_eu=2, kpack=2)
+    if M <= 1024:
+        return _template_config((128, 128, 128, 16, 8))
+    if N == 4096 and M <= 1360:
+        return _template_config((64, 128, 128, 4, 8))
+    return _template_config((128, 128, 128, 16, 8))
+
+
+def torchtlx_heuristic_config(M, N, K, *, dtype, out_dtype, a_strides, b_strides, alpha=1, beta=1):
+    """Share the fixed shape policy with Inductor, preserving scaled epilogues."""
+    enable = (dtype == torch.float16 and out_dtype == torch.float16 and a_strides == (K, 1) and b_strides == (1, K)
+              and alpha == 1 and beta == 1)
+    if enable and 4178 <= M <= 4942 and (N, K) in _TORCHTLX_PROD_TILES:
+        # The register-only template favors different tiles than the tlx.ops
+        # buffer-load path on these production rows.
+        tile, extra = _TORCHTLX_PROD_TILES[N, K]
+        return [_template_config(tile, **extra)]
+    if enable and M <= 1536 and (N, K) in _THREADS_LSR_NK:
+        return [_threads_lsr_config(M, N, K)]
+    bf16 = (dtype == torch.bfloat16 and out_dtype == torch.bfloat16 and a_strides == (K, 1) and b_strides == (1, K)
+            and alpha == 1 and beta == 1)
+    if bf16 and (M, N, K) in _TORCHTLX_BF16_TILES:
+        tile, extra = _TORCHTLX_BF16_TILES[M, N, K]
+        return [_template_config(tile, **extra)]
+    return heuristic_config(M, N, K, enable_global_split_k=enable, enable_short_m_tuning=False)

@@ -648,7 +648,7 @@ class CompiledKernel:
         self._dispatcher = None
         self._dispatch_arg_indices = None
         self._num_kernel_args = None
-        if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+        if (knobs.runtime.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
                 and "launch_metadata" in self.asm):
             try:
                 if self.metadata.target.backend == "hip":
@@ -766,7 +766,7 @@ class CompiledKernel:
                     device = driver.active.get_current_device()
                     stream = driver.active.get_current_stream(device)
                 dispatcher = self._dispatcher
-                if (knobs.nvidia.use_triton_dispatcher and dispatcher is not None
+                if (knobs.runtime.use_triton_dispatcher and dispatcher is not None
                         and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook
                         and len(args) == len(self.src.signature)):
                     dispatcher(*grid_tuple, stream, *(args[index] for index in self._dispatch_arg_indices))
@@ -775,7 +775,7 @@ class CompiledKernel:
                     self.run(*grid_tuple, stream, self.function, self.packed_metadata, launch_metadata,
                              knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
 
-            if knobs.nvidia.use_triton_dispatcher and self._dispatcher is None:
+            if knobs.runtime.use_triton_dispatcher and self._dispatcher is None:
                 warnings.warn(
                     f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
                     f"falling back to Python runner",
@@ -784,7 +784,7 @@ class CompiledKernel:
             return runner
 
         dispatcher = getattr(self, '_dispatcher', None)
-        if (knobs.nvidia.use_triton_dispatcher and dispatcher is not None and not callable(grid)
+        if (knobs.runtime.use_triton_dispatcher and dispatcher is not None and not callable(grid)
                 and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook):
             # Try to create a _TritonJITRunner for maximum speed
             try:
@@ -835,7 +835,7 @@ class CompiledKernel:
             self.run(grid[0], grid[1], grid[2], stream, self.function, self.packed_metadata, launch_metadata,
                      knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
 
-        if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+        if (knobs.runtime.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
                 and dispatcher is None):
             warnings.warn(
                 f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "

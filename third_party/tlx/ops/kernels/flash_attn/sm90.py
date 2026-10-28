@@ -45,7 +45,6 @@ _DEFAULT_BLOCK_M = 128
 # because the serving batch may be symbolic.
 _NON_PERSISTENT_N_CTX_LIMIT = 4 * _DEFAULT_BLOCK_M
 # Profile-selected on H100 to avoid consumer spills without reducing CTA residency.
-_FWD_CONSUMER_REGISTERS = tl.constexpr(240)
 _DEFAULT_ROW_SCHEDULE = {
     "ROW_REVERSE_HEAD_GROUP": 0,
     "ROW_REVERSE_MAX": 0,
@@ -390,6 +389,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                                     NUM_MMA_WARPS: tl.constexpr,  #
                                     NUM_MMA_GROUPS: tl.constexpr,  #
                                     ):
+    _FWD_CONSUMER_REGISTERS: tl.constexpr = 240
     tl.static_assert(BLOCK_N <= HEAD_DIM or (HEAD_DIM == 64 and BLOCK_N == 128))
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     SERIALIZE_QK: tl.constexpr = (CAUSAL and not USE_BM192) or HEAD_DIM == 128
@@ -1334,7 +1334,14 @@ class _attention(torch.autograd.Function):
             "RANK3_DESC": rank3_desc,
         }
         _host_descriptor_pre_hook(nargs)
-        torch._library.capture_triton(_attn_fwd_ws_pipelined_pingpong.fn)[grid](
+        # capture_triton files each call's TMA descriptors in torch's
+        # process-wide kernel side table and never frees them, and desc_o pins
+        # o, so in eager mode every call would leak its output. Only
+        # torch.compile needs the wrapper.
+        kernel = _attn_fwd_ws_pipelined_pingpong.fn
+        if torch.compiler.is_compiling():
+            kernel = torch._library.capture_triton(kernel)
+        kernel[grid](
             sm_scale,
             M,
             q.shape[0],
