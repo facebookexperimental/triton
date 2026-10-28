@@ -90,6 +90,25 @@ def matmul_kernel(  #
         tl.store(output_ptrs, accumulator)
 
 
+@pytest.mark.skipif(not is_hip_cdna3(), reason="requires CDNA3 block pingpong")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("block_k", [32, 64])
+@pytest.mark.parametrize("num_stages", [1, 2])
+def test_matmul_pingpong_packed_k_slices(dtype, block_k, num_stages, device):
+    # The two-cluster K=32 schedule slices packed operands into K=16 dots.
+    # Later dots must retain the accumulator produced by preceding slices.
+    torch.manual_seed(23)
+    m, n, k = 256, 256, 256
+    a = torch.randn((m, k), device=device, dtype=dtype)
+    b = torch.randn((n, k), device=device, dtype=dtype).T
+    out = torch.empty((m, n), device=device, dtype=torch.float32)
+    matmul_kernel[(1, )](a, b, out, m, n, k, *a.stride(), *b.stride(), *out.stride(), BLOCK_M=m, BLOCK_N=n,
+                         BLOCK_K=block_k, NUM_STAGES=num_stages, num_warps=8, num_stages=num_stages, kpack=2,
+                         matrix_instr_nonkdim=16)
+    reference = a.float() @ b.float()
+    torch.testing.assert_close(out, reference, atol=1e-2, rtol=8e-3)
+
+
 @triton.jit
 def matmul_i4_m_minor_kernel(w4_ptr, rhs_ptr, output_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                              BLOCK_K: tl.constexpr):
