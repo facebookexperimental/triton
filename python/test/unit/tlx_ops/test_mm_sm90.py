@@ -198,6 +198,28 @@ def test_sub_wave_heuristic_picks(M, N, K, b_row_major, tile):
     assert sm90._fits_smem(kw["BM"], kw["BN"], kw["NUM_STAGES"], kw["SPLIT_K"])
 
 
+@pytest.mark.parametrize("M, N, K", [(38400, 256, 640), (81920, 256, 704), (2252800, 256, 256)])
+def test_tall_narrow_n_takes_128x128(M, N, K):
+    """Past two waves of the wide tile, a tall product with N <= 256 runs
+    128x128 in both spaces: the heuristic picks it and the full-space prune
+    keeps it."""
+    kw = sm90.heuristic_config(M, N, K)[0].kwargs
+    assert (kw["BM"], kw["BN"], kw["SPLIT_K"], kw["GROUP_SIZE_M"]) == (128, 128, 1, 1)
+    full = sm90._prune_full_configs(sm90.CONFIGS(), {"M": M, "N": N, "K": K})
+    assert any((c.kwargs["BM"], c.kwargs["BN"]) == (128, 128) for c in full)
+    # A wider N still prefers the wide tile.
+    kw = sm90.heuristic_config(M, 1024, K)[0].kwargs
+    assert (kw["BM"], kw["BN"]) in ((256, 128), (128, 256))
+
+
+def test_small_k_space_has_deep_k_64x64():
+    tiles = {
+        sm90._small_k_tile(c)
+        for c in sm90._prune_small_k_configs(sm90._small_k_configs(), {"M": 600, "N": 128, "K": 576})
+    }
+    assert (64, 64, 128, 4, 3) in tiles
+
+
 @pytest.mark.parametrize("M, N, K, tile", [
     (706, 256, 256, (64, 64)),
     (706, 3536, 128, (64, 128)),

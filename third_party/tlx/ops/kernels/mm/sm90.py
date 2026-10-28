@@ -227,7 +227,11 @@ def _keep_config(c, M, N, K, num_sms):
     # Smaller tiles only pay off when bigger ones leave SMs idle.
     if bn == 64 and _mn_tiles(M, N, 128, 128) >= num_sms:
         return False
-    if bm == 128 and bn == 128 and N > 128 and _mn_tiles(M, N, 128, 256) >= 2 * num_sms:
+    # Past two waves of 128x256 tiles the wide tile wins, except where N <= 256
+    # spans one wide tile: there 128x128 halves the B panel each CTA streams and
+    # matches or beats it (addmm 38400x640x256: 37.4 vs 43.3 us; 81920x704x256:
+    # 77.2 vs 82.9 us).
+    if bm == 128 and bn == 128 and N > 256 and _mn_tiles(M, N, 128, 256) >= 2 * num_sms:
         return False
     if split_k > 1:
         mn_tiles = _mn_tiles(M, N, bm, bn)
@@ -413,6 +417,10 @@ def heuristic_config(M, N, K, b_row_major=True, *, invariance=None):
     block_m, block_n = (256, 128) if M > N else (128, 256)
     wide_tiles = _mn_tiles(M, N, block_m, block_n)
     if wide_tiles >= 2 * num_sms:
+        if N <= 256 < M:
+            # A tall product one wide tile across: 128x128 halves the B panel
+            # each CTA streams (see _keep_config), in row-major order (N <= 512).
+            return [_config(128, 128, _heuristic_stages(128, 128, 1), group_size_m=1)]
         # Square shapes favor 128x256 tiles. The 4-stage ring (the SMEM max)
         # wins at large K but regresses some tall shapes with K <= 512.
         return [_config(block_m, block_n, 4 if K >= 1024 else 3)]
@@ -844,6 +852,10 @@ _SMALL_K_TILES = (
     (64, 128, 128, 4, 2),
     (64, 256, 64, 8, 3),
     (64, 64, 64, 4, 3),
+    (64, 64, 64, 4, 4),
+    # A deep-K 64x64 tile for few-tile shapes with K of a few hundred
+    # (addmm 600x576x128: 4.3 us vs 5.2 for the WS 128x64 pick).
+    (64, 64, 128, 4, 3),
     (128, 64, 64, 4, 3),
     (128, 128, 32, 4, 4),
     (128, 128, 64, 4, 3),
