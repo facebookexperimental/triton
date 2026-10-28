@@ -154,11 +154,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
-                   ttg.target = "hip:gfx942",
+                   ttg.target = "hip:gfx942:sramecc+:xnack-",
                    "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK-LABEL: @gfx942_is_conservative
-  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, #blocked>
-  tt.func @gfx942_is_conservative(
+  // gfx942 also supports byte-aligned vector accesses.
+  // CHECK: #[[$GFX942_WIDE:.*]] = #ttg.blocked<{sizePerThread = [4]
+  // CHECK-LABEL: @gfx942_unaligned_vector_load
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$GFX942_WIDE]]>
+  tt.func @gfx942_unaligned_vector_load(
       %base: !tt.ptr<f16> {tt.divisibility = 16 : i32},
       %unaligned: i32) -> tensor<1024xf16, #blocked> {
     %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
