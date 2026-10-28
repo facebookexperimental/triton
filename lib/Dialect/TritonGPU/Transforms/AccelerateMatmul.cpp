@@ -909,6 +909,14 @@ public:
       return failure();
     if (retShapePerCTA[0] < 128 || retShapePerCTA[1] < 16)
       return failure();
+    // fp6 (4 values per 3 bytes) cannot tile the tcgen05 K dimension today;
+    // route it to the decompose (upcast) path instead of native MMAv5.
+    if (dotOp.getAElemType() == ScaleDotElemType::E2M3 ||
+        dotOp.getAElemType() == ScaleDotElemType::E3M2 ||
+        dotOp.getBElemType() == ScaleDotElemType::E2M3 ||
+        dotOp.getBElemType() == ScaleDotElemType::E3M2) {
+      return rewriter.notifyMatchFailure(dotOp, "fp6 uses decompose upcast");
+    }
     Location loc = dotOp.getLoc();
     // operands
     Value a = dotOp.getA();
