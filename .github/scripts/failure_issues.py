@@ -155,23 +155,16 @@ def first_seen_sha(body):
     return m[1] if m else ""
 
 
-def suite_name(job):
-    """The test suite a job runs, for parent titles: mi350-tlx-test -> MI350 TLX, lit-tests -> LIT."""
-    words = re.sub(r"-tests?$", "", job).split("-")
-    names = {"tlx": "TLX", "torchtlx": "TorchTLX", "lit": "LIT", "mi350": "MI350", "h100": "H100", "b200": "B200"}
-    return " ".join(names.get(w, w.capitalize()) for w in words)
-
-
-def find_or_create_parent(api, repo, sha, suite, branch, run_url, open_parents):
-    """The open parent for failures first seen at sha, with suite in its title. A new parent is assigned to the
-    commit's author. Parents are found by a marker in the body, since their titles grow as suites join."""
+def find_or_create_parent(api, repo, sha, job, branch, run_url, open_parents):
+    """The open parent for failures first seen at sha, with job in its title. A new parent is assigned to the
+    commit's author. Parents are found by a marker in the body, since their titles grow as jobs join."""
     marker = f"<!-- ci-parent sha={sha} -->"
     parent = next((p for p in open_parents if marker in (p.get("body") or "")), None)
     if parent:
-        head, suites = parent["title"].split(": ", 1)
-        names, on, rest = suites.partition(" on ")
-        if suite not in names.split(", "):
-            title = f"{head}: {names}, {suite}{on}{rest}"
+        head, jobs = parent["title"].split(": ", 1)
+        names, on, rest = jobs.partition(" on ")
+        if job not in names.split(", "):
+            title = f"{head}: {names}, {job}{on}{rest}"
             api("PATCH", f"repos/{repo}/issues/{parent['number']}", {"title": title})
             parent["title"] = title
         return parent
@@ -179,7 +172,7 @@ def find_or_create_parent(api, repo, sha, suite, branch, run_url, open_parents):
     author = (commit.get("author") or {}).get("login")
     pr = re.search(r"\(#(\d+)\)\s*$", commit["commit"]["message"].split("\n")[0])
     at = f"{sha[:7]}{f' (#{pr[1]})' if pr else ''}"
-    title = f"Test failures at {at}: {suite}" + (f" on {branch}" if branch != "main" else "")
+    title = f"Test failures at {at}: {job}" + (f" on {branch}" if branch != "main" else "")
     body = (f"Tests started failing at {at}, first seen in {run_url}. Each failing test is a sub-issue; this "
             "issue closes when they are all fixed.\n\n"
             "Please comment within a working day: fixing it (link the PR), reverting it, or not yours (say why, "
@@ -203,8 +196,7 @@ def group(api, repo, prefix, labels, sha, branch, run_url):
     open_parents = api("GET", f"repos/{repo}/issues?state=open&labels={PARENT}&per_page=100", paginate=True)
     new = [i for i in issues if not i.get("parent_issue_url") and first_seen_sha(i["body"]) == sha]
     if new:
-        parent = find_or_create_parent(api, repo, sha, suite_name(prefix.split(" / ")[1]), branch, run_url,
-                                       open_parents)
+        parent = find_or_create_parent(api, repo, sha, prefix.split(" / ")[1], branch, run_url, open_parents)
         for i in new:
             api("POST", f"repos/{repo}/issues/{parent['number']}/sub_issues", {"sub_issue_id": i["id"]})
     # A sub-issue that reopened (failed again within the reopen window) reopens its parent.

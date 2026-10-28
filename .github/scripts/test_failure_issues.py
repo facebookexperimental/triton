@@ -270,17 +270,17 @@ def test_a_failure_belongs_to_the_commit_where_it_was_first_seen():
     assert api.issues[1]["parent_issue_url"].endswith("/issues/800")
     assert "parent_issue_url" not in api.issues[4]
     new_parent = next(i for n, i in api.issues.items() if n != 800 and i["labels"] == [{"name": fi.PARENT}])
-    assert new_parent["assignees"] == ["author"] and new_parent["title"] == "Test failures at bbbbbbb (#77): J"
+    assert new_parent["assignees"] == ["author"] and new_parent["title"] == "Test failures at bbbbbbb (#77): j"
     assert all(api.issues[n]["parent_issue_url"].endswith(f"/issues/{new_parent['number']}") for n in (2, 3))
 
 
-def test_a_commit_has_one_parent_whichever_suites_fail():
+def test_a_commit_has_one_parent_whichever_jobs_fail():
     lit = "[nightly] Compiler LIT Tests / lit-tests / "
     api = GroupApi([failing(1, "b"), dict(failing(2, "b"), title=lit + "a.mlir")])
     fi.group(api, REPO, PREFIX, LABELS, "b" * 40, "main", RUN + "200")
     fi.group(api, REPO, lit, LABELS, "b" * 40, "main", RUN + "201")
     parents = [i for i in api.issues.values() if any(l["name"] == fi.PARENT for l in i["labels"])]
-    assert len(parents) == 1 and parents[0]["title"] == "Test failures at bbbbbbb (#77): J, LIT"
+    assert len(parents) == 1 and parents[0]["title"] == "Test failures at bbbbbbb (#77): j, lit-tests"
     assert api.issues[2]["parent_issue_url"].endswith(f"/issues/{parents[0]['number']}")
 
 
