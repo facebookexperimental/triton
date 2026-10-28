@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 from ._layouts import (SharedLayout, DistributedLayout, BlockedLayout, DotOperandLayout, AutoLayout, CoalescedLayout,
                        SharedLinearLayout, _get_shape_per_cta)
 from triton._C.libtriton import ir
+from triton._utils import is_power_of_two
 import triton.language.core as tl_core
 from triton.language.core import (
     aggregate_replace,
@@ -154,6 +155,10 @@ class distributed_type(block_type):
         layout = _unwrap_if_constexpr(layout)
         shape = _unwrap_if_constexpr(shape)
         super().__init__(element_ty, shape)
+        # TRITON_ALLOW_NPOT admits NPOT shapes only on layout-less tensors.
+        for i, d in enumerate(self.shape):
+            if not is_power_of_two(d):
+                raise ValueError(f"Shape element {i} must be a power of 2")
         self.layout = layout
         self.name = f"<{self.shape}, {self.element_ty}, {self.layout}>"
         assert isinstance(layout, DistributedLayout), "tensor layout must be a DistributedLayout"

@@ -2,6 +2,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include <cstdlib>
@@ -141,28 +142,33 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
                                       allocation.getSharedMemorySize()));
 }
 
-LogicalResult verifyNpotModularOpsSupported(ModuleOp mod) {
+// The layout of an NPOT shared tile is built on its pow2 cover, so the
+// allocation must hold at least as many elements as the cover's allocation.
+static bool isNpotSharedCover(Type type) {
+  auto memDesc = dyn_cast<MemDescType>(type);
+  if (!memDesc || !isa<SharedEncodingTrait>(memDesc.getEncoding()))
+    return false;
+  Attribute encoding = memDesc.getEncoding();
+  ArrayRef<int64_t> allocShape = memDesc.getAllocShape();
+  auto tile = dropPipeliningDim(allocShape, encoding);
+  SmallVector<int64_t> cover(allocShape);
+  llvm::copy(getNpotCoverShape(tile), cover.end() - tile.size());
+  if (llvm::equal(cover, allocShape))
+    return false;
+  return getAllocationElems(encoding, allocShape) <
+         getAllocationElems(encoding, cover);
+}
+
+LogicalResult verifyNpotTypesSupported(ModuleOp mod) {
   if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
     return success();
-  auto isNpot = [](Type type) {
-    auto tensorTy = dyn_cast<RankedTensorType>(type);
-    return tensorTy && hasNpotShape(tensorTy);
-  };
   bool rejected = false;
   mod.walk([&](Operation *op) {
-    if (!isa<triton::ReduceOp, triton::ScanOp, triton::HistogramOp,
-             triton::GatherOp>(op))
-      return;
-    // A histogram gates on its input only: NPOT bins over a power-of-two
-    // input are exact.
-    if (llvm::none_of(op->getOperandTypes(), isNpot) &&
-        (isa<triton::HistogramOp>(op) ||
-         llvm::none_of(op->getResultTypes(), isNpot)))
-      return;
-    op->emitError() << "NPOT " << op->getName()
-                    << " operations are not yet supported with modular "
-                       "tensor layouts";
-    rejected = true;
+    if (llvm::any_of(op->getOperandTypes(), isNpotSharedCover) ||
+        llvm::any_of(op->getResultTypes(), isNpotSharedCover)) {
+      op->emitError() << "NPOT shared memory descriptors are not yet supported";
+      rejected = true;
+    }
   });
   return failure(rejected);
 }

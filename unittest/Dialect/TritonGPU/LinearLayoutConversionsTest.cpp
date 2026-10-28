@@ -180,29 +180,16 @@ TEST_F(LinearLayoutConversionsTest, SimpleBlocked) {
                           {S("dim0")}));
 }
 
-TEST_F(LinearLayoutConversionsTest, NpotFmaDotUsesModularIdentity) {
+TEST_F(LinearLayoutConversionsTest, NpotMemoryLayoutsUsePow2Cover) {
   ScopedAllowNpot npot;
-  auto parent =
-      blocked({1, 1}, {1, 32}, {1, 4}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
-  auto encoding = dot(parent, /*idx=*/0, /*kWidth=*/0);
-  auto layout = toLinearLayout({16, 96}, encoding);
-  auto pow2Cover = toLinearLayout({16, 128}, encoding);
-  auto expected =
-      LinearLayout(pow2Cover.getBases(), {{S("dim0"), 16}, {S("dim1"), 96}},
-                   /*requireSurjective=*/true);
-  EXPECT_EQ(layout, expected);
-}
-
-TEST_F(LinearLayoutConversionsTest, NpotMfmaUsesModularIdentity) {
-  ScopedAllowNpot npot;
-  auto encoding = mfma(/*version=*/4, /*warps=*/{4, 1},
-                       /*instrShape=*/{32, 32, 16}, /*isTransposed=*/false);
-  auto layout = toLinearLayout({128, 96}, encoding);
-  auto pow2Cover = toLinearLayout({128, 128}, encoding);
-  auto expected =
-      LinearLayout(pow2Cover.getBases(), {{S("dim0"), 128}, {S("dim1"), 96}},
-                   /*requireSurjective=*/true);
-  EXPECT_EQ(layout, expected);
+  // A shared layout of an NPOT shape is built on its pow2 cover.
+  auto swizzled = shared(4, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  LinearLayout cover = toLinearLayout({128, 64}, swizzled);
+  EXPECT_EQ(toLinearLayout({96, 64}, swizzled), cover);
+  // An NPOT subview of a shared_linear allocation keeps that cover.
+  auto sharedLinear =
+      SharedLinearEncodingAttr::get(&ctx, cover, /*layoutAlignment=*/16);
+  EXPECT_EQ(toLinearLayout({96, 64}, sharedLinear), cover);
 }
 
 TEST_F(LinearLayoutConversionsTest, CTADuplication) {
@@ -2720,9 +2707,14 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlocked) {
                          {S("dim0")}));
 }
 
-TEST_F(LinearLayoutConversionsTest, SliceOfBlockedPreservesNpotSize) {
-  ScopedAllowNpot npot;
+TEST_F(LinearLayoutConversionsTest, SliceOfBlockedUsesNpotCover) {
   auto parent = blocked({1, 4}, {4, 8}, {4, 1}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+#ifndef NDEBUG
+  // Without the flag an NPOT extent still aborts.
+  EXPECT_DEATH(toLinearLayout({48}, slice(parent, 0)),
+               "desiredSize % actualSize == 0");
+#endif
+  ScopedAllowNpot npot;
   auto layout = toLinearLayout({48}, slice(parent, 0));
 
   EXPECT_EQ(layout,
@@ -2730,8 +2722,7 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlockedPreservesNpotSize) {
                           {S("lane"), {{4}, {8}, {16}, {0}, {0}}},
                           {S("warp"), {{0}, {0}}},
                           {S("block"), {}}},
-                         {{S("dim0"), 48}}, /*requireSurjective=*/true));
-  EXPECT_TRUE(layout.isModular());
+                         {{S("dim0"), 64}}, /*requireSurjective=*/true));
 }
 
 TEST_F(LinearLayoutConversionsTest, SliceWithShape1) {

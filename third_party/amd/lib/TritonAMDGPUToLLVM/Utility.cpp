@@ -821,9 +821,7 @@ unsigned getVectorSize(Value ptr, ModuleAxisInfoAnalysis &axisAnalysisPass) {
     return 1;
   auto contiguity = getContiguity(ptr, axisAnalysisPass);
   auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
-  unsigned vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
-  // No-op for pow2; clamps the NPOT sizePerThread misalign (see NVIDIA).
-  return clampVecSizeForNpot(vec, tensorTy);
+  return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
 }
 
 unsigned
@@ -838,19 +836,15 @@ getVectorSizeIgnoringAlignment(Value ptr,
     contiguity =
         std::min<unsigned>(contiguity, axisInfo->getContiguity(order[0]));
   unsigned pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
-  unsigned vec = std::min<unsigned>(128 / pointeeBitWidth,
-                                    std::max<unsigned>(contiguity, 1));
-  return clampVecSizeForNpot(vec, tensorTy);
+  return std::min<unsigned>(128 / pointeeBitWidth,
+                            std::max<unsigned>(contiguity, 1));
 }
 
 unsigned getVectorSize(Value ptr, Value offset,
                        ModuleAxisInfoAnalysis &axisAnalysisPass) {
   auto contiguity = getContiguity(ptr, offset, axisAnalysisPass);
   auto pointeeBitWidth = triton::getPointeeBitWidth(ptr.getType());
-  unsigned vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
-  auto tensorTy =
-      dyn_cast<RankedTensorType>(getPointerTypeWithShape(ptr, offset));
-  return clampVecSizeForNpot(vec, tensorTy);
+  return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
 }
 
 Type scaleDotElemTypeToMLIRType(MLIRContext *ctx, triton::ScaleDotElemType t) {

@@ -149,8 +149,7 @@ struct LoadStoreConversionBase {
         targetInfo.getPtxVersion() >= 88) {
       maxVecBits = 256;
     }
-    unsigned vec = std::min<unsigned>(maxVecBits / pointeeBitWidth, contiguity);
-    return clampVecSizeForNpot(vec, tensorTy);
+    return std::min<unsigned>(maxVecBits / pointeeBitWidth, contiguity);
   }
 
   unsigned getMaskAlignment(Value mask) const {
@@ -1153,15 +1152,6 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto smemObj =
         getSharedMemoryObjectFromStruct(loc, llDst, resElemTy, rewriter);
     auto smemLayout = ttg::toLinearLayout(dstTy);
-    if (srcLayout.isModular()) {
-      auto allocShape = ttg::getAllocationShapePerCTA(dstTy);
-      smemLayout = ttg::toLinearLayout(allocShape, dstTy.getEncoding());
-      SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
-      for (auto dim : srcLayout.getOutDimNames())
-        paddedOutDims.push_back({dim, smemLayout.getOutDimSize(dim)});
-      srcLayout = LinearLayout(srcLayout.getBases(), paddedOutDims,
-                               /*requireSurjective=*/false);
-    }
     auto cvt = srcLayout.invertAndCompose(smemLayout);
     if (!cvt.isTrivialOver({str_attr("block")})) {
       return emitError(loc,

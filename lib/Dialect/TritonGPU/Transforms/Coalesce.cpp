@@ -10,8 +10,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/StrUtil.h"
-#include "triton/Tools/Sys/GetEnv.h"
-#include "llvm/ADT/bit.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "tritongpu-coalesce"
@@ -39,9 +37,6 @@ static Attribute pickDescriptorLoadStoreLayout(int numWarps, int threadsPerWarp,
   int maxVectorSize = 128 / type.getElementTypeBitWidth();
 
   int vectorSize = std::min(numElemsPerThread, maxVectorSize);
-  // Blocked params must be pow2; the modular layout carries the NPOT remainder.
-  if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
-    vectorSize = llvm::bit_floor(static_cast<unsigned>(vectorSize));
   SmallVector<unsigned> sizePerThread(type.getRank(), 1);
   sizePerThread.back() = vectorSize;
 
@@ -84,32 +79,6 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
   void runOnOperation() override {
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
-
-    // Modular layouts can have multiple physical slots for one logical tensor
-    // element. Loads and stores tolerate equivalent duplicate values, but an
-    // atomic would apply the update more than once. Reject until lowering can
-    // predicate a canonical representative for every modular alias class.
-    if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT")) {
-      bool hasUnsupportedAtomic = false;
-      moduleOp.walk([&](Operation *op) {
-        if (!isa<triton::AtomicRMWOp, triton::AtomicCASOp>(op))
-          return;
-        Value ptr = getMemAccessPtr(op);
-        auto type = dyn_cast<RankedTensorType>(ptr.getType());
-        if (!type || llvm::all_of(type.getShape(), [](int64_t dim) {
-              return llvm::isPowerOf2_64(dim);
-            }))
-          return;
-        op->emitError("NPOT atomic operations are not yet supported with "
-                      "modular tensor layouts");
-        hasUnsupportedAtomic = true;
-      });
-      if (hasUnsupportedAtomic) {
-        signalPassFailure();
-        return;
-      }
-    }
-
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
     // For each i/o operation, we determine what layout
@@ -160,10 +129,6 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
         int maxPerThread = 128 / elemBits;
         unsigned perThread = std::min<int>(
             maxPerThread, std::max<int>(numElems / numThreads, 1));
-        // Blocked params must be pow2; the modular layout carries the NPOT
-        // remainder.
-        if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
-          perThread = llvm::bit_floor(perThread);
 
         SmallVector<unsigned> sizePerThread(resultType.getRank(), 1);
         sizePerThread[order[0]] = perThread;

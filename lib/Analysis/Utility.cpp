@@ -1221,33 +1221,6 @@ unsigned getNumScratchElements(ArrayRef<unsigned> shape) {
   return product<unsigned>(shape);
 }
 
-// NPOT K must align to the 32-byte MMA K granule.
-static bool isNpotMmaKAligned(int64_t k, Type elementType) {
-  if (llvm::isPowerOf2_64(k))
-    return true;
-  int64_t bitwidth = elementType.getIntOrFloatBitWidth();
-  return (k * bitwidth) % 256 == 0;
-}
-
-static bool isMmaOutputShapeSupported(ArrayRef<int64_t> shape, int version) {
-  assert(shape.size() >= 2 && "MMA output must have M and N dimensions");
-  int64_t m = shape[shape.size() - 2];
-  int64_t n = shape[shape.size() - 1];
-
-  if (version == 2) {
-    return llvm::none_of(shape, [](int64_t dim) {
-      return dim > 0 && !llvm::isPowerOf2_64(dim);
-    });
-  }
-  if (version == 3) {
-    int64_t mAlignment = llvm::isPowerOf2_64(m) ? 64 : 16;
-    return m % mAlignment == 0 && n % 8 == 0;
-  }
-  assert(version == 5 && "unexpected MMA version with output constraints");
-  bool mOk = llvm::isPowerOf2_64(m) ? m % 64 == 0 : m <= 128 && m % 16 == 0;
-  return mOk && llvm::isPowerOf2_64(n) && n % 8 == 0;
-}
-
 bool supportMMA(triton::DotOp op, int version) {
   // Refer to mma section for the data type supported by Volta and Hopper
   // Tensor Core in
@@ -1264,6 +1237,7 @@ bool supportMMA(triton::DotOp op, int version) {
     int k = typeA.getShape().back();
     auto retType = op.getType();
     auto retShapePerCTA = getShapePerCTA(retType);
+    auto rank = retShapePerCTA.size();
     int numWarps = lookupNumWarps(op);
     // Allow int8 * int8 -> int32 for MMAv5, reject other integer combinations
     if (aElemTy.isInteger() || bElemTy.isInteger() ||
@@ -1281,12 +1255,8 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    // BlockedToMMAv5 puts A (MxK) in an NVMMA shared memdesc, and only the
-    // leading dimension of a shared memdesc may be non-power-of-two
-    // (MemDescType::verify), so an NPOT K has no legal A operand.
-    if (!llvm::isPowerOf2_64(k))
-      return false;
-    if (!isMmaOutputShapeSupported(retShapePerCTA, version))
+    if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
+          retShapePerCTA[rank - 1] % 8 == 0))
       return false;
     if (aElemTy.isF64() || bElemTy.isF64() ||
         retType.getElementType().isF64()) {
@@ -1304,16 +1274,14 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    if (!isNpotMmaKAligned(k, aElemTy))
-      return false;
     auto retShapePerCTA = getShapePerCTA(retType);
     auto rank = retShapePerCTA.size();
     int numWarps = lookupNumWarps(op);
     // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.
     if (rank == 3)
       return false;
-    if (!(numWarps % 4 == 0 &&
-          isMmaOutputShapeSupported(retShapePerCTA, version) &&
+    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&
+          retShapePerCTA[rank - 1] % 8 == 0 &&
           (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy) ||
            aElemTy.isInteger(8) || aElemTy.isF16() || aElemTy.isBF16() ||
            aElemTy.isF32()))) {
@@ -1325,12 +1293,6 @@ bool supportMMA(triton::DotOp op, int version) {
         cast<RankedTensorType>(op.getType()).getElementType().isF32()) {
       return false;
     }
-  }
-  if (version == 2) {
-    int64_t k = op.getA().getType().getShape().back();
-    if (!isNpotMmaKAligned(k, aElemTy) ||
-        !isMmaOutputShapeSupported(getShapePerCTA(op.getType()), version))
-      return false;
   }
   if (aElemTy.isF32() && bElemTy.isF32()) {
     assert(op.getInputPrecision() == InputPrecision::TF32);
