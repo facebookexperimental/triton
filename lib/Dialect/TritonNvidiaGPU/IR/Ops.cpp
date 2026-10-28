@@ -1640,6 +1640,13 @@ static LogicalResult verifyScaledLHSOperand(Operation *op, Type elementType,
                                             TensorMemoryEncodingAttr encoding,
                                             ScaleDotElemType aType,
                                             ScaleDotElemType bType) {
+  if (aType == ScaleDotElemType::E2M3 || aType == ScaleDotElemType::E3M2) {
+    if (!elementType.isInteger(8))
+      return op->emitOpError(
+          "expected e2m3/e3m2 LHS operand to have i8 storage");
+    return success();
+  }
+
   if (aType == ScaleDotElemType::E2M1) {
     if (!elementType.isInteger(8))
       return op->emitOpError("expected e2m1 LHS operand to have i8 storage");
@@ -1828,6 +1835,19 @@ bool TCGen5MMAScaledOp::verifyDims() {
     aKdim *= 2;
   if (this->getBType() == ScaleDotElemType::E2M1 && !transB)
     bKdim *= 2;
+  // fp6 pads the K dim to the unpacked width.
+  if ((this->getAType() == ScaleDotElemType::E2M3 ||
+       this->getAType() == ScaleDotElemType::E3M2) &&
+      !transA) {
+    if (aKdim % 4 != 0)
+      return false;
+  }
+  if ((this->getBType() == ScaleDotElemType::E2M3 ||
+       this->getBType() == ScaleDotElemType::E3M2) &&
+      !transB) {
+    if (bKdim % 4 != 0)
+      return false;
+  }
 
   return aKdim == bKdim;
 }
@@ -1929,6 +1949,12 @@ int64_t TCGen5MMAScaledOp::getBlockK() {
   bool transA = isScaledMMATransposed(getA().getType(), /*isLhs=*/true);
   if (this->getAType() == ScaleDotElemType::E2M1 && !transA)
     blockK *= 2;
+  if ((this->getAType() == ScaleDotElemType::E2M3 ||
+       this->getAType() == ScaleDotElemType::E3M2) &&
+      !transA) {
+    // fp6 pads the K dim to the unpacked width; blockK is already unpacked.
+    assert(blockK % 4 == 0);
+  }
   return blockK;
 }
 
