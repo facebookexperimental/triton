@@ -122,6 +122,24 @@ def NVWSLowerSemaphore : Pass<"nvws-lower-semaphore", "mlir::ModuleOp"> {
   ];
 }
 
+def NVWSMetaToNVWSConvert
+    : Pass<"nvws-meta-to-nvws-convert", "mlir::ModuleOp"> {
+  let summary = "Convert Meta warp-specialization planning metadata to NVWS IR";
+
+  let description = [{
+    Mechanically converts the output of the Meta warp-specialization planning
+    prefix into the representation consumed by the NVWS mechanism passes. The
+    pass does not choose partitions, schedules, buffers, or synchronization.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def NVWSLowerAref : Pass<"nvws-lower-aref", "mlir::ModuleOp"> {
   let summary = "Convert nvws.aref.* to ttng.*barrier* ops.";
 
