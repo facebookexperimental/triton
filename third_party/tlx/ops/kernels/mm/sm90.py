@@ -798,11 +798,28 @@ _SMALL_K_MAX = 256
 # N tiles per A tile to reuse; on 706x20992x128 WS ran 17.4 us vs 21.1 us here.
 _SMALL_K_MAX_N = 8192
 
+# Few-tile GEMMs with K up to 1024 also run faster one 64x64 tile per CTA: on
+# 44 such H100 shapes (M 300-4096, N 64-2048, K 384-2048) the small-K kernel
+# beat the WS heuristic pick by 15% (geomean; 600x128x576: 4.2 vs 5.2 us) up to
+# three waves of 64x64 tiles and K = 1024, and was never 3% slower inside them.
+# Past that WS's pipelining and A reuse win (706x64x2048: 8.6 vs 7.9 us).
+_FEW_TILE_SMALL_K_MAX_K = 1024
+_FEW_TILE_SMALL_K_MAX_WAVES = 3
+
+
+def _few_tile_small_k(M, N, K):
+    return (M > _SWAP_AB_MAX_M and K <= _FEW_TILE_SMALL_K_MAX_K
+            and _mn_tiles(M, N, 64, 64) <= _FEW_TILE_SMALL_K_MAX_WAVES * _get_num_sms())
+
 
 def _use_small_k(M, N, K, space):
     # The smoke space pins one WS config (see SMOKE_CONFIGS) so tests that
     # select it cover the WS lowering path; it never takes the small-K kernel.
-    if space == "smoke" or K > _SMALL_K_MAX:
+    if space == "smoke":
+        return False
+    if _few_tile_small_k(M, N, K):
+        return True
+    if K > _SMALL_K_MAX:
         return False
     if M <= _SWAP_AB_MAX_M:
         # One or two K steps: a small-M tile beats swap-AB's warp-specialized
@@ -914,6 +931,13 @@ def _prune_small_k_configs(configs, nargs, **kwargs):
 def _small_k_heuristic_config(M, N, K):
     if M <= _SWAP_AB_MAX_M:
         return [_small_k_config(16, 32, 64, 2, 2)]
+    if K > _SMALL_K_MAX:
+        # A few-tile GEMM (see _few_tile_small_k): 64x64 tiles, with a deep K
+        # step while they fit two waves (300x512x1024: 5.9 vs 6.6 us for BK=64),
+        # a shallow one past that (600x2048x576: 6.4 vs 8.9 us).
+        if _mn_tiles(M, N, 64, 64) <= 2 * _get_num_sms():
+            return [_small_k_config(64, 64, 128, 4, 3)]
+        return [_small_k_config(64, 64, 64, 4, 4)]
     # The largest tile that still gives two waves of CTAs, else the smallest:
     # one-tile-per-CTA work has no persistent loop to balance it (706x256x256:
     # 64x64 runs 3.6 us, 128x128 4.8 us; 706x3536x128: 64x128 5.6, 128x128 6.2).
@@ -1090,8 +1114,10 @@ def _small_k_candidate(M, N, K, space):
     if space != "full":
         return _use_small_k(M, N, K, space)
     # Past the small-K range, one-tile-per-CTA (with split-K) can beat the
-    # persistent WS kernel only on skinny shapes that underfill the GPU.
-    return K <= _SMALL_K_MAX or (min(M, N) <= _SKINNY_MAX_MN and _mn_tiles(M, N, 128, 128) < _get_num_sms())
+    # persistent WS kernel only on skinny shapes that underfill the GPU, and on
+    # few-tile shapes with K up to 1024.
+    return (K <= _SMALL_K_MAX or _few_tile_small_k(M, N, K)
+            or (min(M, N) <= _SKINNY_MAX_MN and _mn_tiles(M, N, 128, 128) < _get_num_sms()))
 
 
 def _select_path(space, key, launchers):

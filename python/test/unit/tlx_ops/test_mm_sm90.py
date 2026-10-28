@@ -212,6 +212,40 @@ def test_tall_narrow_n_takes_128x128(M, N, K):
     assert (kw["BM"], kw["BN"]) in ((256, 128), (128, 256))
 
 
+@pytest.mark.parametrize("M, N, K, tile", [
+    # Few-tile, K up to 1024: 64x64 tiles, deep K step within two waves.
+    (600, 128, 576, (64, 64, 128)),
+    (706, 512, 1024, (64, 64, 128)),
+    (600, 2048, 576, (64, 64, 64)),
+    # Past three waves of 64x64 tiles, or past K = 1024, or skinny M: not small-K.
+    (2048, 1024, 768, None),
+    (706, 256, 1536, None),
+    (32, 512, 768, None),
+])
+def test_few_tile_small_k_heuristic(M, N, K, tile):
+    assert sm90._use_small_k(M, N, K, "heuristic") == (tile is not None)
+    assert sm90._use_small_k(M, N, K, "smoke") is False
+    if tile is not None:
+        kw = sm90._small_k_heuristic_config(M, N, K)[0].kwargs
+        assert (kw["BM"], kw["BN"], kw["BK"]) == tile
+        # The full space times the small-K kernel against WS there too.
+        assert sm90._small_k_candidate(M, N, K, "full")
+
+
+def test_few_tile_small_k_is_correct():
+    from triton.tlx.ops import addmm as tlx_addmm
+    from triton.tlx.ops import mm as tlx_mm
+
+    torch.manual_seed(0)
+    for M, N, K in ((600, 128, 576), (600, 2048, 576)):
+        a = _operand(M, K, True)
+        b = _operand(K, N, False)
+        bias = torch.randn(N, device="cuda", dtype=torch.float16)
+        _assert_close(tlx_mm(a, b, space="heuristic"), torch.matmul(a, b))
+        torch.testing.assert_close(tlx_addmm(bias, a, b, space="heuristic"), torch.addmm(bias, a, b), atol=5e-2,
+                                   rtol=5e-2)
+
+
 def test_small_k_space_has_deep_k_64x64():
     tiles = {
         sm90._small_k_tile(c)

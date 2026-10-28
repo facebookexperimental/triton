@@ -2446,8 +2446,9 @@ class TestHopperMMTemplate(TestCase):
 
     @parametrize("n", (256, 259))
     def test_fused_epilogue(self, n):
-        a = torch.randn(259, 328, device=GPU_TYPE, dtype=torch.bfloat16)
-        b = torch.randn(n, 328, device=GPU_TYPE, dtype=torch.bfloat16).t()
+        # K past the few-tile small-K region, so force mode runs the WS template.
+        a = torch.randn(259, 1096, device=GPU_TYPE, dtype=torch.bfloat16)
+        b = torch.randn(n, 1096, device=GPU_TYPE, dtype=torch.bfloat16).t()
 
         def mm_gelu(a, b):
             return torch.nn.functional.gelu(a @ b)
@@ -2512,12 +2513,14 @@ class TestHopperMMTemplate(TestCase):
 
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     @parametrize("bias_shape", ("n", "mn"))
+    # K = 1096 keeps a ragged last K step while staying out of the few-tile
+    # small-K region (K <= 1024), so force mode runs the WS template.
     @parametrize("shape,layout", (
-        ((264, 256, 328), "nn"),
-        ((264, 256, 328), "nt"),
-        ((264, 256, 328), "tn"),
-        ((264, 256, 328), "tt"),
-        ((259, 264, 328), "nt"),
+        ((264, 256, 1096), "nn"),
+        ((264, 256, 1096), "nt"),
+        ((264, 256, 1096), "tn"),
+        ((264, 256, 1096), "tt"),
+        ((259, 264, 1096), "nt"),
     ))
     def test_addmm(self, dtype, bias_shape, shape, layout):
         m, n, k = shape
