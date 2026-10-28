@@ -223,8 +223,7 @@ public:
                      size_t partitionSize)
       : operation(operation), funcAllocMap(funcAllocMap),
         allocation(allocation), scratchSizeGetter(scratchSizeGetter),
-        useMetaWSLifetimeWorkaround(
-            tools::getBoolEnv("TRITON_USE_META_WS")),
+        useMetaWSLifetimeWorkaround(tools::getBoolEnv("TRITON_USE_META_WS")),
         partitionSize(partitionSize) {
     run();
   }
