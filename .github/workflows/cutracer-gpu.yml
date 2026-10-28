@@ -41,6 +41,9 @@ on:
       cutracer_version:
         required: true
         type: string
+      delay_ns:
+        required: true
+        type: string
       wheel_url:
         required: true
         type: string
@@ -117,6 +120,13 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
+          # pytest's importlib mode leaves a test's own directory off sys.path, so a
+          # helper beside the test, such as mm_test_utils.py, would not import.
+          for test in "${TEST_IDS[@]}"; do
+            dir="${test%%::*}"; [[ -d "${dir}" ]] || dir="$(dirname "${dir}")"
+            PYTHONPATH="${PWD}/${dir}${PYTHONPATH:+:${PYTHONPATH}}"
+          done
+          export PYTHONPATH
           ISSUES=()
           if [[ "${FILE_ISSUES}" == true ]]; then
             ISSUES=(--issue-title-prefix "[CUTracer][${GPU^^}]" --issue-job "sanitize-${GPU}")
@@ -138,9 +148,17 @@ jobs:
           TESTS: ${{ inputs.tests }}
           SANITIZER_FAILURES: ${{ steps.sanitize.outputs.failures }}
           KNOWN_RACES: ${{ inputs.known_races }}
+          DELAY_NS: ${{ inputs.delay_ns }}
         run: |
           . "${SETUP_SCRIPT}"
           readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
+          # pytest's importlib mode leaves a test's own directory off sys.path, so a
+          # helper beside the test, such as mm_test_utils.py, would not import.
+          for test in "${TEST_IDS[@]}"; do
+            dir="${test%%::*}"; [[ -d "${dir}" ]] || dir="$(dirname "${dir}")"
+            PYTHONPATH="${PWD}/${dir}${PYTHONPATH:+:${PYTHONPATH}}"
+          done
+          export PYTHONPATH
           ISSUES=()
           if [[ "${FILE_ISSUES}" == true ]]; then
             ISSUES=(--issue-title-prefix "[CUTracer][${GPU^^}]" --issue-job "sanitize-${GPU}")
@@ -154,6 +172,7 @@ jobs:
           python3 .github/scripts/cutracer_ci/random_delay.py \
             --cutracer-so "${CUTRACER_SO}" \
             --kernel "${KERNEL}" \
+            --delay-ns "${DELAY_NS}" \
             --out "${OUT}" \
             --logs "${LOGS}" \
             --sanitizer-failures "${SANITIZER_FAILURES}" \
