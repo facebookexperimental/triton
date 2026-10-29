@@ -318,9 +318,23 @@ bool DotScaledOp::verifyDims() {
     if (this->getLhsKPack())
       aKdim *= 2;
   }
+  if (isMXFP6ScaleType(this->getAElemType())) {
+    // fp6 shapes count logical values; global storage is dense,
+    // consumed in groups of 16 values (12 bytes).
+    if (this->getLhsKPack()) {
+      if (aKdim % 16 != 0)
+        return false;
+    }
+  }
   if (this->getBElemType() == ScaleDotElemType::E2M1) {
     if (this->getRhsKPack())
       bKdim *= 2;
+  }
+  if (isMXFP6ScaleType(this->getBElemType())) {
+    if (this->getRhsKPack()) {
+      if (bKdim % 16 != 0)
+        return false;
+    }
   }
 
   return aKdim == bKdim;
@@ -353,10 +367,29 @@ LogicalResult DotScaledOp::verify() {
   if (rank < 2)
     return this->emitError("operands must be at least 2D");
 
+  // fp6 has no non-K-packed representation (unlike e2m1, which can pack
+  // along M/N): dense packing exists only along K, so reject it here
+  // rather than failing obscurely in lowering.
+  if (isMXFP6ScaleType(this->getAElemType()) && !this->getLhsKPack())
+    return this->emitError("fp6 lhs operand must be packed along K "
+                           "(lhs_k_pack must be true)");
+  if (isMXFP6ScaleType(this->getBElemType()) && !this->getRhsKPack())
+    return this->emitError("fp6 rhs operand must be packed along K "
+                           "(rhs_k_pack must be true)");
+
   auto k = aShape[rank - 1];
   if (this->getAElemType() == ScaleDotElemType::E2M1) {
     if (this->getLhsKPack())
       k *= 2;
+  }
+  if (isMXFP6ScaleType(this->getAElemType())) {
+    // fp6 shapes count logical values; global storage is dense,
+    // consumed in groups of 16 values (12 bytes).
+    if (this->getLhsKPack()) {
+      if (k % 16 != 0)
+        return this->emitError("logical K dim must be a multiple of 16 for "
+                               "fp6 (groups of 16 values / 12 bytes)");
+    }
   }
   auto cShape = this->getC().getType().getShape();
   int64_t mDim = cShape[cShape.size() - 2];
@@ -411,15 +444,31 @@ LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
                                  std::optional<ArrayRef<int64_t>> scaleShape,
                                  int opIdx, ScaleDotElemType format,
                                  bool kPack) -> int32_t {
+    if (isMXFP6ScaleType(format) && !kPack) {
+      errMsg = "fp6 operands must be packed along K (kPack must be true)";
+      return 0;
+    }
     if (!scaleShape)
       return 0;
     if (llvm::product_of(*scaleShape) == 1)
       return 0;
 
-    int64_t unpackFactor = (format == ScaleDotElemType::E2M1 && kPack) ? 2 : 1;
     int64_t kdim = operandShape[opIdx == 0 ? operandShape.size() - 1
-                                           : operandShape.size() - 2] *
-                   unpackFactor;
+                                           : operandShape.size() - 2];
+    if (format == ScaleDotElemType::E2M1 && kPack) {
+      kdim *= 2;
+    } else if (isMXFP6ScaleType(format) && kPack) {
+    // fp6 shapes count logical values; global storage is dense,
+    // consumed in groups of 16 values (12 bytes).
+      if (kdim % 16 != 0) {
+        std::ostringstream oss;
+        oss << "logical K dim " << kdim
+            << " must be a multiple of 16 for fp6 (groups of 16 values / "
+               "12 bytes)";
+        errMsg = oss.str();
+        return 0;
+      }
+    }
     int32_t scaleFactor = kdim / (*scaleShape)[scaleShape->size() - 1];
     if (scaleFactor != 16 && scaleFactor != 32) {
       std::ostringstream oss;
