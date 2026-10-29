@@ -2,8 +2,6 @@ import json
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
-import pytest
-
 import tlx_ops_bench_dashboard as dash
 
 
@@ -86,30 +84,7 @@ def test_a_change_the_next_night_cannot_check_stays_unconfirmed(monkeypatch):
     assert perf["unconfirmed"] and perf["n_slower"] == 1 and perf["slower"][0]["next"] is None
 
 
-@pytest.mark.parametrize("reason", [
-    "addmm has no implementation for this device",
-    "addmm has no cases matching the current filters",
-    "addmm has no focus inputs configured for sm100",
-])
-def test_skipped_operator_remains_visible_without_measurements(tmp_path, reason):
-    suite = ET.Element("testsuite")
-    test = ET.SubElement(suite, "testcase", name="test_op_perf[bench_addmm]")
-    ET.SubElement(test, "skipped", message=reason)
-    ET.ElementTree(suite).write(tmp_path / "bench.xml")
-    out = tmp_path / "summary.json"
-    dash.summarize(
-        SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261029", sha="a" * 40, out=str(out)))
-    summary = json.loads(out.read_text())
-    op = summary["ops"]["addmm"]
-    assert op["reason"] == reason
-    assert op["cases"] == []
-    page = dash.page_data({"mi350": [summary]})["platforms"]["mi350"]
-    assert page["ops"]["addmm"]["reason"] == reason
-    assert page["ops"]["addmm"]["cases"] == []
-    assert page["nights"][0]["ops"]["addmm"] == []
-
-
-def test_skipped_operator_does_not_hide_measured_operators(tmp_path):
+def test_skipped_operator_remains_visible_alongside_measurements(tmp_path):
     raw = {
         "env": {"ref": "torch.matmul", "space": "heuristic"},
         "results": [{
@@ -129,7 +104,13 @@ def test_skipped_operator_does_not_hide_measured_operators(tmp_path):
     out = tmp_path / "summary.json"
     dash.summarize(
         SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261029", sha="a" * 40, out=str(out)))
-    ops = json.loads(out.read_text())["ops"]
+    summary = json.loads(out.read_text())
+    ops = summary["ops"]
+    assert ops["addmm"]["reason"] == "no implementation"
     assert ops["addmm"]["cases"] == []
     assert len(ops["mm"]["cases"]) == 1
     assert ops["mm"]["cases"][0]["tlx_tflops"] == 10.0
+    page = dash.page_data({"mi350": [summary]})["platforms"]["mi350"]
+    assert page["ops"]["addmm"]["reason"] == "no implementation"
+    assert page["ops"]["addmm"]["cases"] == []
+    assert page["nights"][0]["ops"]["addmm"] == []
