@@ -788,6 +788,8 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
 
     expected = {
         "triton.tlx.ops.kernels.addmm._shapes": {
+            "sm90": (),
+            "sm100": (),
             "gfx942": ("gfx942_all", ),
             "gfx950": ("gfx950_all", ),
         },

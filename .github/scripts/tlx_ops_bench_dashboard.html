@@ -250,7 +250,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
           ? [{...describe(op, i), s: STATUS_OF[cell[0]], x: cell[1], t: cell[2], r: cell[3], n: cell[4] || ""}] : []))}]))}));
       const last = history[history.length - 1];
       platforms[name] = {...p, history, latest: Object.fromEntries(Object.entries(p.ops).map(([op, o]) =>
-        [op, {ref: o.ref, space: o.space, cold: o.cold, cases: last.ops[op].cases}]))};
+        [op, {ref: o.ref, space: o.space, cold: o.cold, reason: o.reason, cases: last.ops[op].cases}]))};
       if (!date || last.date > date) date = last.date;
     }
     return {platforms, date, repo: (raw && raw.repo) || "facebookexperimental/triton", tag: (raw && raw.tag) || "tlx-ops-bench",
@@ -356,6 +356,10 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
              link(`${REPO}/actions/workflows/nightly-tlx-ops-bench.yml`, "Nightly TLX.ops Bench"),
              document.createTextNode(" workflow; per-night summaries are on the "),
              link(`${REPO}/releases/tag/${DATA.tag}`, DATA.tag), document.createTextNode(" release."));
+    for (const op of scopeOps()) {
+      const reason = p.latest[op].reason;
+      if (reason) b.append(el("p", {class: "note"}, `${op}: no benchmark data. ${reason}.`));
+    }
   }
 
   function controls() {
@@ -378,7 +382,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const os = $("op");
     os.textContent = "";
     os.append(el("option", {value: "all"}, "All ops"));
-    for (const n of Object.keys(plat().latest)) os.append(el("option", {value: n}, n));
+    for (const [n, o] of Object.entries(plat().latest)) os.append(el("option", {value: n}, o.reason ? `${n} (no data)` : n));
     os.value = state.op;
     const dts = [...new Set(scopeOps().flatMap((n) => plat().latest[n].cases.map((c) => c.dt)))].sort();
     if (state.dtype !== "all" && !dts.includes(state.dtype)) state.dtype = "all";
@@ -494,8 +498,10 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const ops = groups.filter((g) => H.some((n) => val(n, g)));
     const by = state.group === "op" || state.group === "none" ? "" : `, by ${groupLabel()}`;
     $("trend-title").textContent = (byTflops ? `${state.op}: TLX TFLOP/s per night` : "Geomean speedup per night") + by;
-    $("trend-sub").textContent = byTflops ? "This op has no reference, so throughput is the number to track."
-                                          : "Solid line: parity with the reference. Dashed line: the 0.9× PIP floor.";
+    const unavailable = single && plat().latest[state.op].reason;
+    $("trend-sub").textContent = unavailable ? "No benchmark measurements were recorded."
+      : byTflops ? "This op has no reference, so throughput is the number to track."
+                : "Solid line: parity with the reference. Dashed line: the 0.9× PIP floor.";
     const legend = $("trend-legend");
     legend.textContent = "";
     if (ops.length > 1) {
@@ -737,7 +743,8 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     [...$("cases-sort").options].forEach((op) => { op.disabled = !hasRef && (op.value === "r" || op.value === "x"); });
     $("cases-title").textContent = (hasRef ? `${state.op}: TLX vs reference TFLOP/s per case, latest night` : `${state.op}: TLX TFLOP/s per case, latest night`);
     const skipped = all.length - cs.length;
-    $("cases-sub").textContent = (hasRef ? `Each pair is one case: ${o.ref} next to TLX. ` : "No reference, so one TLX bar per case. ")
+    $("cases-sub").textContent = o.reason ? "No throughput measurements were recorded."
+      : (hasRef ? `Each pair is one case: ${o.ref} next to TLX. ` : "No reference, so one TLX bar per case. ")
       + (hasRef ? "Hover a case for its inputs and speedup." : "Hover a case for its inputs.") + (skipped ? ` ${skipped} errored case(s) have no timing and appear only in the table.` : "");
     // Bar labels: the inputs that vary across this op's cases and are short enough to read, joined by ×.
     const keys = groupOptions().filter((g) => g.startsWith("in.")).map((g) => g.slice(3))
@@ -867,9 +874,9 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       const cases = groupCases(L, g, groups), kept = cases.filter(matches), a = aggOf(cases);
       const c = (st) => kept.filter((x) => x.s === st).length;
       return {op: groupName(g), ref: byOp ? L[g].ref || "–" : "", n: kept.length, ok: c("ok"), noisy: c("noisy"), pip: c("pip"),
-              error: c("error"), tflops: a.tflops, speedup: a.speedup, ...evCompare(g, groups)};
-    }).filter((r) => r.n);
-    sortableTable($("summary"), [["op", groupLabel()], ...(byOp ? [["ref", "reference"]] : []), ["n", "cases", 1], ["ok", "ok", 1],
+              error: c("error"), tflops: a.tflops, speedup: a.speedup, reason: byOp ? L[g].reason || "" : "", ...evCompare(g, groups)};
+    }).filter((r) => r.n || r.reason);
+    sortableTable($("summary"), [["op", groupLabel()], ...(byOp ? [["ref", "reference"], ["reason", "no data reason"]] : []), ["n", "cases", 1], ["ok", "ok", 1],
       ["noisy", "noisy", 1], ["pip", "PIP", 1], ["error", "ERROR", 1], ["tflops", "TLX TF/s", 1], ["speedup", "speedup", 1]],
       sumRows, "sortSum", table);
     const H = plat().history;
@@ -966,7 +973,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       const script = BENCH[op] || "–", space = o.space || "–", cold = o.cold;
       const tr = el("tr");
       const c = el("td"); c.append(el("code", {}, script));
-      tr.append(el("td", {}, op), c, el("td", {}, o.ref || "none (TFLOP/s only)"), el("td", {}, space),
+      tr.append(el("td", {}, op), c, el("td", {}, o.ref || (o.reason ? "not measured" : "none (TFLOP/s only)")), el("td", {}, space),
                 el("td", {}, {all: "every case", first: "first case per direction", none: "not timed"}[cold] || "–"));
       tb.append(tr);
     }
@@ -1236,7 +1243,7 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
     td.append(d);
   }
 
-  function render() { banner(); controls(); inputs(); tiles(); trend(); evCard(); dist(); cases(); table(); versions(); howto(); saveHash(); }
+  function render() { controls(); banner(); inputs(); tiles(); trend(); evCard(); dist(); cases(); table(); versions(); howto(); saveHash(); }
   $("platform").onchange = (e) => { state.platform = e.target.value; state.trendScroll = null; state.hidden.clear(); render(); };
   $("range").onchange = (e) => { state.range = Number(e.target.value); state.trendScroll = null; render(); };
   $("dir").onchange = (e) => { state.dir = e.target.value; state.rows = 50; render(); };
