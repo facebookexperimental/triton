@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from sample_logs import SYNCCHECK_CLEAN, SYNCCHECK_ERROR
+from sample_logs import PEER_BARRIER, SYNCCHECK_CLEAN, SYNCCHECK_ERROR
 import sanitize
 from sanitize import main
 
@@ -200,7 +200,10 @@ def test_a_tool_run_leaves_nothing_running(fake_env, ending):
     # signal lands.
     stat = Path(f"/proc/{int(pid_file.read_text())}/stat")
     for _ in range(100):
-        if not stat.exists() or stat.read_text().split()[2] == "Z":
+        try:
+            if stat.read_text().split()[2] == "Z":
+                break
+        except OSError:  # reaped
             break
         time.sleep(0.01)
     else:
@@ -233,4 +236,10 @@ def test_a_run_past_its_deadline_reports_the_rest_as_not_run(fake_env, monkeypat
 # so its file's kernels must not be offered for closing.
 def test_a_tool_without_a_summary_does_not_count_its_kernels_as_checked(fake_env, monkeypatch):
     _fake_cutracer(fake_env, {"synccheck": SYNCCHECK_CLEAN}, kernel="_attn_fwd_ws")
+    assert "[CUTracer][B200] _attn_fwd_ws in " not in _prefixes(fake_env, monkeypatch)
+
+
+# Errors the sanitizer did not print may be in any kernel the file compiled.
+def test_unprinted_errors_do_not_count_their_kernels_as_checked(fake_env, monkeypatch):
+    _fake_cutracer(fake_env, {"synccheck": SYNCCHECK_CLEAN, "memcheck": PEER_BARRIER}, kernel="_attn_fwd_ws")
     assert "[CUTracer][B200] _attn_fwd_ws in " not in _prefixes(fake_env, monkeypatch)

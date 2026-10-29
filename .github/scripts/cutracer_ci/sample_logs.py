@@ -63,3 +63,18 @@ OUTSIDE_THE_KERNEL = """\
 =========
 ========= ERROR SUMMARY: 2 errors
 """
+
+# A 2-CTA TMA load in CTA 1 signalling the pair's mbarrier in CTA 0, past the
+# print limit.
+PEER_BARRIER = """\
+========= COMPUTE-SANITIZER
+========= Invalid __remote_shared__ write of size 8 bytes
+=========     at matmul_kernel_tma_ws_blackwell+0xbb0 in sm100.py:327
+=========     by thread (0,0,0) in block (1,0,0)
+=========     Barrier at 0x4400 in CTA 0 is not located in destination CTA
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: triton_launch_kernel [0xbff9] in cuda_utils.cpython-312-x86_64-linux-gnu.so
+=========
+========= ERROR SUMMARY: 2370 errors
+========= ERROR SUMMARY: 2369 errors were not printed. Use --print-limit option to adjust the number of printed errors
+"""

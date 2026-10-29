@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 
 _ERROR_SUMMARY_RE = re.compile(r"^=+ ERROR SUMMARY: (\d+) errors?", re.MULTILINE)
+# Errors past --print-limit (default 100): counted in ERROR SUMMARY, but
+# their kind and kernel are unknown.
+_NOT_PRINTED_RE = re.compile(r"^=+ ERROR SUMMARY: (\d+) errors? were not printed", re.MULTILINE)
 _RACECHECK_SUMMARY_RE = re.compile(
     r"^=+ RACECHECK SUMMARY: (\d+) hazards? displayed \((\d+) errors?, (\d+) warnings?\)",
     re.MULTILINE,
@@ -21,6 +24,10 @@ _REPORT_HEADER_RE = re.compile(r"^=+ (?!ERROR SUMMARY|RACECHECK SUMMARY|COMPUTE-
 # launch the sanitizer could not track, such as cuBLAS's nvjet kernels.
 _API_ERROR_PREFIX = "Program hit "
 _SANITIZER_ERROR_PREFIX = "Internal Sanitizer Error"
+# memcheck flags a TMA load that signals an mbarrier in the peer CTA, but the
+# PTX ISA allows that under .cta_group::2 (cp.async.bulk.tensor). NVIDIA's own
+# 2-CTA cuBLAS kernels get the same report.
+_PEER_BARRIER = "is not located in destination CTA"
 # A report line split into its "=" prefix, indent and text.
 _LINE_RE = re.compile(r"^=+( *)(.*)$")
 # Faulting device PC: "at <kernel>+0x<offset>", plus " in <file>:<line>" when
@@ -51,13 +58,21 @@ def classify(tool: str, log_text: str) -> dict:
     headers = _REPORT_HEADER_RE.findall(log_text)
     api_errors = sum(header.startswith(_API_ERROR_PREFIX) for header in headers)
     sanitizer_errors = sum(header.startswith(_SANITIZER_ERROR_PREFIX) for header in headers)
-    count = max(int(match.group(1)) - api_errors - sanitizer_errors, 0)
+    peer_barrier = sum(_is_peer_barrier(report) for report in _reports(log_text))
+    not_printed = sum(int(n) for n in _NOT_PRINTED_RE.findall(log_text))
+    count = max(int(match.group(1)) - api_errors - sanitizer_errors - peer_barrier - not_printed, 0)
     return {
         "outcome": "findings" if count else "none",
         "count": count,
         "api_errors": api_errors,
         "sanitizer_errors": sanitizer_errors,
+        "peer_barrier": peer_barrier,
+        "not_printed": not_printed,
     }
+
+
+def _is_peer_barrier(report: dict) -> bool:
+    return any(_PEER_BARRIER in line for line in report["lines"])
 
 
 def device_reports(log_text: str) -> list[dict]:
@@ -66,9 +81,13 @@ def device_reports(log_text: str) -> list[dict]:
     ``lines`` is the report as the sanitizer printed it, without the host
     backtrace. ``kernel``, ``file`` and ``line`` are None when the log does not
     give them; ``file`` is a basename, and source_paths.resolve_paths fills in
-    ``path``. Host API errors, untracked launches and the sanitizer's own banners
-    are not reports.
+    ``path``. Host API errors, untracked launches, peer-CTA barrier signals and
+    the sanitizer's own banners are not reports.
     """
+    return [report for report in _reports(log_text) if not _is_peer_barrier(report)]
+
+
+def _reports(log_text: str) -> list[dict]:
     reports = []
     current = None
     for raw in log_text.splitlines():

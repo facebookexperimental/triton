@@ -114,7 +114,15 @@ jobs:
       - name: Install test dependencies
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install pytest
+          # expecttest: the torchtlx tests import torch's test case, which needs it.
+          uv pip install pytest expecttest
+      # torchao: flash_attn_mxfp8 quantizes its inputs with it.
+      - name: Install torchao
+        timeout-minutes: 10
+        uses: ./.github/actions/install-torchao
+        with:
+          platform: ${{ inputs.gpu }}
+          setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Install prebuilt Triton
         uses: ./.github/actions/install-prebuilt-triton
         env:

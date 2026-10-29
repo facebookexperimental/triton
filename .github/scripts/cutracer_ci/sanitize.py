@@ -157,11 +157,13 @@ def main(argv: list[str] | None = None) -> int:
         # A kernel counts as checked only if every tool ran the tests to the end,
         # in every group that compiled it: the cache is shared across tools, and
         # a sanitizer abort leaves a sticky CUDA error that can stop later tests
-        # from launching their kernels.
+        # from launching their kernels. Errors the sanitizer did not print may
+        # be in any of them.
         kernels = compiled_kernels(triton_cache)
         for result in group_results:
             result["kernels"] = kernels
-        if all(result["returncode"] == 0 and result["outcome"] != "infra" for result in group_results):
+        if all(result["returncode"] == 0 and result["outcome"] != "infra" and not result.get("not_printed")
+               for result in group_results):
             clean += [kernel for kernel in kernels if kernel not in clean]
         else:
             unfinished.update(kernels)

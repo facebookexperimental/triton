@@ -1,8 +1,8 @@
 import pytest
 
 import sanitizer_log
-from sample_logs import (MEMCHECK_API_ONLY, MEMCHECK_MIXED, OUTSIDE_THE_KERNEL, RACECHECK_CLEAN, RACECHECK_HAZARD,
-                         SYNCCHECK_CLEAN, SYNCCHECK_ERROR)
+from sample_logs import (MEMCHECK_API_ONLY, MEMCHECK_MIXED, OUTSIDE_THE_KERNEL, PEER_BARRIER, RACECHECK_CLEAN,
+                         RACECHECK_HAZARD, SYNCCHECK_CLEAN, SYNCCHECK_ERROR)
 from sanitizer_log import classify, device_reports, report_lines
 
 
@@ -14,24 +14,32 @@ def test_racecheck_clean_is_none():
     assert classify("racecheck", RACECHECK_CLEAN)["outcome"] == "none"
 
 
+def _counts(outcome, count, api_errors, sanitizer_errors, peer_barrier=0, not_printed=0):
+    return dict(outcome=outcome, count=count, api_errors=api_errors, sanitizer_errors=sanitizer_errors,
+                peer_barrier=peer_barrier, not_printed=not_printed)
+
+
 def test_error_summary_tools():
-    assert classify("synccheck",
-                    SYNCCHECK_ERROR) == {"outcome": "findings", "count": 1, "api_errors": 0, "sanitizer_errors": 0}
-    assert classify("memcheck",
-                    SYNCCHECK_CLEAN) == {"outcome": "none", "count": 0, "api_errors": 0, "sanitizer_errors": 0}
+    assert classify("synccheck", SYNCCHECK_ERROR) == _counts("findings", 1, 0, 0)
+    assert classify("memcheck", SYNCCHECK_CLEAN) == _counts("none", 0, 0, 0)
 
 
 # A finding is an error in device code the test launched. Errors the sanitizer
 # also counts but that lie outside that code -- a failed host API call, a launch
 # it could not track -- must not become issues against a kernel.
 def test_errors_outside_the_kernel_are_not_device_findings():
-    assert classify("memcheck",
-                    MEMCHECK_API_ONLY) == {"outcome": "none", "count": 0, "api_errors": 2, "sanitizer_errors": 0}
-    assert classify("memcheck",
-                    MEMCHECK_MIXED) == {"outcome": "findings", "count": 1, "api_errors": 2, "sanitizer_errors": 0}
-    assert classify("synccheck",
-                    OUTSIDE_THE_KERNEL) == {"outcome": "none", "count": 0, "api_errors": 1, "sanitizer_errors": 1}
+    assert classify("memcheck", MEMCHECK_API_ONLY) == _counts("none", 0, 2, 0)
+    assert classify("memcheck", MEMCHECK_MIXED) == _counts("findings", 1, 2, 0)
+    assert classify("synccheck", OUTSIDE_THE_KERNEL) == _counts("none", 0, 1, 1)
     assert device_reports(OUTSIDE_THE_KERNEL) == []
+
+
+# The PTX ISA lets a .cta_group::2 TMA load signal an mbarrier in the peer CTA;
+# memcheck reports it anyway. Errors past the print limit are not findings
+# either: their kind is unknown (sanitize.py keeps their kernels unchecked).
+def test_peer_cta_barrier_signals_are_not_findings():
+    assert classify("memcheck", PEER_BARRIER) == _counts("none", 0, 0, 0, peer_barrier=1, not_printed=2369)
+    assert device_reports(PEER_BARRIER) == []
 
 
 @pytest.mark.parametrize("log", ["", "========= COMPUTE-SANITIZER\n", "Segmentation fault\n"])

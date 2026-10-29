@@ -10,18 +10,22 @@ def render(results: list[dict], kernel: str | None, cmd: list[str]) -> str:
         f"Kernel: `{kernel or 'all'}`  ",
         f"Command: `{' '.join(cmd)}`",
         "",
-        "| Tests | Tool | Outcome | Device errors | Host API errors | Untracked launches | Test exit |",
-        "|---|---|---|---|---|---|---|",
+        "| Tests | Tool | Outcome | Device errors | Host API errors | Untracked launches | Peer-CTA barrier | Not printed "
+        "| Test exit |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for result in results:
         count = "-" if result["count"] is None else result["count"]
         exit_code = "timeout" if result["timed_out"] else result["returncode"]
         tests = " ".join(arg for arg in result["cmd"] if arg.split("::")[0].endswith(".py")) or "-"
         lines.append(f"| `{tests}` | {result['tool']} | {result['outcome']} | {count} | "
-                     f"{result.get('api_errors', '-')} | {result.get('sanitizer_errors', '-')} | {exit_code} |")
+                     f"{result.get('api_errors', '-')} | {result.get('sanitizer_errors', '-')} | "
+                     f"{result.get('peer_barrier', '-')} | {result.get('not_printed', '-')} | {exit_code} |")
     lines += [
         "", "`none` means the sanitizer reported nothing for what the test ran; it is not proof of no race. "
-        "A non-zero test exit means some tests did not run to the end, so their kernels may be unchecked."
+        "A non-zero test exit means some tests did not run to the end, so their kernels may be unchecked. "
+        "Peer-CTA barrier reports are 2-CTA TMA signals the PTX ISA allows; they are not counted. "
+        "Errors past the print limit are not counted either, and keep the file's kernels from counting as checked."
     ]
     for result in results:
         if result["outcome"] != "findings":
