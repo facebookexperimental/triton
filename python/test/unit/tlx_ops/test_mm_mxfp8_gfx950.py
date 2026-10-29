@@ -7,7 +7,6 @@ import torch
 
 from triton._internal_testing import is_hip_cdna4, swizzle_scale_to_5d
 
-
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
 
@@ -19,10 +18,8 @@ def _inputs(m, n, k, *, sf_layout):
     a_scale_bytes = torch.randint(125, 128, (m, k // 32), device="cuda", dtype=torch.uint8, generator=generator)
     b_scale_bytes = torch.randint(125, 128, (n, k // 32), device="cuda", dtype=torch.uint8, generator=generator)
     if sf_layout == "cublas_blocked":
-        a_scale = swizzle_scale_to_5d(a_scale_bytes.view(1, m, k // 32), m // 128,
-                                      k // 128).view(torch.float8_e8m0fnu)
-        b_scale = swizzle_scale_to_5d(b_scale_bytes.view(1, n, k // 32), n // 128,
-                                      k // 128).view(torch.float8_e8m0fnu)
+        a_scale = swizzle_scale_to_5d(a_scale_bytes.view(1, m, k // 32), m // 128, k // 128).view(torch.float8_e8m0fnu)
+        b_scale = swizzle_scale_to_5d(b_scale_bytes.view(1, n, k // 32), n // 128, k // 128).view(torch.float8_e8m0fnu)
     else:
         a_scale = a_scale_bytes.view(torch.float8_e8m0fnu)
         b_scale = b_scale_bytes.view(torch.float8_e8m0fnu)
@@ -54,8 +51,8 @@ def test_mm_mxfp8_gfx950_catalog_entry():
     assert implementation is mm_mxfp8
 
 
-@pytest.mark.parametrize("shape", [(128, 128, 128), (256, 384, 512), (1024, 1024, 1024),
-                                    (2048, 2048, 2048), (4096, 4096, 4096)])
+@pytest.mark.parametrize("shape", [(128, 128, 128), (256, 384, 512), (1024, 1024, 1024), (2048, 2048, 2048),
+                                   (4096, 4096, 4096)])
 @pytest.mark.parametrize("sf_layout", ["natural", "cublas_blocked"])
 def test_mm_mxfp8_gfx950_public_numerics(shape, sf_layout):
     from triton.tlx.ops import mm_mxfp8
@@ -71,10 +68,8 @@ def test_mm_mxfp8_gfx950_default_space_and_blocked_parity():
 
     natural, scale_bytes = _inputs(256, 384, 512, sf_layout="natural")
     a, a_scale, b, b_scale = natural
-    blocked_a = swizzle_scale_to_5d(a_scale.view(torch.uint8).view(1, 256, 16), 2,
-                                    4).view(torch.float8_e8m0fnu)
-    blocked_b = swizzle_scale_to_5d(b_scale.view(torch.uint8).view(1, 384, 16), 3,
-                                    4).view(torch.float8_e8m0fnu)
+    blocked_a = swizzle_scale_to_5d(a_scale.view(torch.uint8).view(1, 256, 16), 2, 4).view(torch.float8_e8m0fnu)
+    blocked_b = swizzle_scale_to_5d(b_scale.view(torch.uint8).view(1, 384, 16), 3, 4).view(torch.float8_e8m0fnu)
     natural_out = mm_mxfp8(*natural)
     blocked_out = mm_mxfp8(a, blocked_a, b, blocked_b, sf_layout="cublas_blocked")
     _check_sample(natural_out, natural, scale_bytes)

@@ -493,8 +493,20 @@ def _regular_quad_kernel(
     smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
-            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
-            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [1, 0],
+            [32, 0],
+            [64, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
         ],
         [HALF, BK],
     )
@@ -575,9 +587,8 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
 
     k_major = sf_layout == "natural"
     as_packed, bs_packed = prepare_scales(a_scale, b_scale, gm=m, g=1, n=n, k=k, sf_layout=sf_layout,
-                                           k_major_chunks=k_major)
-    quad_safe = (128 * k <= _MAX_BUFFER_BYTES and all(t.data_ptr() % 16 == 0
-                                                      for t in (a, b, as_packed, bs_packed)))
+                                          k_major_chunks=k_major)
+    quad_safe = (128 * k <= _MAX_BUFFER_BYTES and all(t.data_ptr() % 16 == 0 for t in (a, b, as_packed, bs_packed)))
     bm, bn, stages, warps, use_quad = _pick_regular_config(m, n, k, quad_safe=quad_safe)
     if use_quad:
         _regular_quad_kernel[(m // 256 * (n // 256), )](
