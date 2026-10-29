@@ -174,16 +174,16 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   Block *switchLoop = b.createBlock(entry);
   b.setInsertionPointToStart(header);
 
-  // `tlx.async_tasks(less_reg_header=True)` is a hacky tuning knob. By default
-  // the warp ID comes from a plain %tid.x read, and LLVM CSEs the partitions'
-  // own %tid.x reads into it, so %tid.x is computed in this header and kept
-  // live all the way into the partitions. For unknown reasons, PTXAS may then
-  // decide to spill it to local memory. With the knob set, %tid.x is read and
-  // turned into the warp ID inside one opaque inline-PTX block, so each
-  // partition reads %tid.x on its own instead.
+  // `tlx.async_tasks(no_ws_header_tid_reuse=True)` is a hacky tuning knob. By
+  // default the warp ID comes from a plain %tid.x read, and LLVM CSEs the
+  // partitions' own %tid.x reads into it, so %tid.x is computed in this header
+  // and kept live all the way into the partitions. For unknown reasons, PTXAS
+  // may then decide to spill it to local memory. With the knob set, %tid.x is
+  // read and turned into the warp ID inside one opaque inline-PTX block, so
+  // each partition reads %tid.x on its own instead.
   Value wid;
   auto mod = func->getParentOfType<ModuleOp>();
-  if (mod && mod->hasAttr("tlx.less_reg_header")) {
+  if (mod && mod->hasAttr("tlx.no_ws_header_tid_reuse")) {
     PTXBuilder widBuilder;
     auto &widInstr = *widBuilder.create(
         "{\n mov.u32 $0, %tid.x;\n shr.u32 $0, $0, " +

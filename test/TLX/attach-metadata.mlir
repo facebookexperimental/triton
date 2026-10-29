@@ -240,13 +240,13 @@ module {
 
 // -----
 
-// A `tlx.less_reg_header` marker on the warp_specialize op is propagated to the
-// module (NVIDIA target), where the warp-specialize lowering reads it.
+// A `tlx.no_ws_header_tid_reuse` marker on the warp_specialize op is propagated
+// to the module (NVIDIA target), where the warp-specialize lowering reads it.
 // CHECK: module attributes {
-// CHECK-SAME: tlx.less_reg_header
+// CHECK-SAME: tlx.no_ws_header_tid_reuse
 module {
-  tt.func @kernel_less_reg_header() {
-    ttg.warp_specialize() attributes {tlx.less_reg_header}
+  tt.func @kernel_no_ws_header_tid_reuse() {
+    ttg.warp_specialize() attributes {tlx.no_ws_header_tid_reuse}
     default {
       ttg.warp_yield
     }

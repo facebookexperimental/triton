@@ -1775,7 +1775,7 @@ public:
       bool hasExclusiveWS = false;
       bool hasNoEndingClusterSync = false;
       bool hasLessRegMMA = false;
-      bool hasLessRegHeader = false;
+      bool hasNoWsHeaderTidReuse = false;
       std::optional<int32_t> mbarrierTryWaitSuspendNs;
       mod.walk([&](ttg::WarpSpecializeOp op) {
         ++numWarpSpecializeOps;
@@ -1785,8 +1785,8 @@ public:
           hasNoEndingClusterSync = true;
         if (op->hasAttr("tlx.less_reg_mma"))
           hasLessRegMMA = true;
-        if (op->hasAttr("tlx.less_reg_header"))
-          hasLessRegHeader = true;
+        if (op->hasAttr("tlx.no_ws_header_tid_reuse"))
+          hasNoWsHeaderTidReuse = true;
         if (auto attr = op->getAttrOfType<IntegerAttr>(
                 "tlx.mbarrier_try_wait_suspend_ns")) {
           int32_t value = attr.getInt();
@@ -1802,11 +1802,11 @@ public:
       // NVIDIA MMA lowering reads this off the module.
       if (hasLessRegMMA)
         mod->setAttr("tlx.less_reg_mma", b.getUnitAttr());
-      // `less_reg_header`: hacky knob for when PTXAS spills a %tid.x that is
-      // computed in the warp-specialize header and kept live into the tasks.
-      // The NVIDIA warp-specialize lowering reads this off the module.
-      if (hasLessRegHeader)
-        mod->setAttr("tlx.less_reg_header", b.getUnitAttr());
+      // `no_ws_header_tid_reuse`: hacky knob for when PTXAS spills a %tid.x
+      // that is computed in the warp-specialize header and kept live into the
+      // tasks. The NVIDIA warp-specialize lowering reads this off the module.
+      if (hasNoWsHeaderTidReuse)
+        mod->setAttr("tlx.no_ws_header_tid_reuse", b.getUnitAttr());
       if (hasExclusiveWS) {
         if (numWarpSpecializeOps != 1) {
           mod.emitError()

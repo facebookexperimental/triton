@@ -21,7 +21,7 @@
 | `no_ending_cluster_sync` | This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False. |
 | `mbarrier_try_wait_suspend_ns` | On Blackwell, use the four-operand `mbarrier.try_wait.parity` form with this suspend hint for waits in the kernel. `None` is unspecified, `0` explicitly disables the hint, and positive values enable it. If multiple `async_tasks` regions specify a value, the minimum explicit value is used module-wide. Default to None. |
 | `less_reg_mma` | Give each MMA (wgmma / tcgen05) its own SMEM operand address computation instead of letting LLVM share one across distant MMAs. Trades a few extra ALU ops for much shorter live ranges, which can avoid register spills in MMA-heavy tasks (e.g. FA4 backward). NVIDIA only. Default to False. |
-| `less_reg_header` | Hacky tuning knob. For unknown reasons, ptxas may spill `%tid.x` to local memory when it is computed in the warp-specialize header and kept live into the tasks. This computes the header's warp ID in opaque inline PTX so each task reads `%tid.x` on its own instead of reusing the same one from the header. Only worth trying if a kernel shows such a spill. NVIDIA only. Default to False. |
+| `no_ws_header_tid_reuse` | Hacky tuning knob. For unknown reasons, ptxas may spill `%tid.x` to local memory when it is computed in the warp-specialize header and kept live into the tasks. This computes the header's warp ID in opaque inline PTX so each task reads `%tid.x` on its own instead of reusing the same one from the header. Only worth trying if a kernel shows such a spill. NVIDIA only. Default to False. |
 
 ### async_task Parameters
 
