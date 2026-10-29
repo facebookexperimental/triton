@@ -43,6 +43,7 @@ SYNTHETIC: tuple[MMShape, ...] = (
 )
 
 FOCUS_SUITES = (
+    FocusSuite(name="sm90_all", op="mm", includes=("sm90_baseline", "sm90_1")),
     FocusSuite(
         name="sm90_baseline",
         op="mm",
