@@ -7420,3 +7420,73 @@ def test_amd_scaled_downcast_fp8_rejects_scalar_input():
     source = ASTSource(_amd_scaled_downcast_fp8_scalar_kernel, signature={"value": "fp32", "Y": "*fp8e4nv"})
     with pytest.raises(CompilationError, match="value must be an FP32 tensor"):
         triton_compile(source, target=GPUTarget("hip", "gfx950", 64))
+
+
+@triton.jit
+def _buffered_stage_rows(buffers, slot, ROWS: tl.constexpr, COLS: tl.constexpr):
+    # Returning a slice of an indexed stage must keep the stage's allocation
+    # shape in the helper's result type.
+    return tlx.local_slice(buffers[slot], [0, 0], [ROWS, COLS])
+
+
+def test_buffered_tensor_helper_returns_stage_slice():
+
+    @triton.jit
+    def kernel(output_ptr, slot):
+        layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[64, 4]], [32, 64], [1, 0])
+        buffers = tlx.local_alloc((32, 64), tl.float32, 3, layout=layout)
+        offsets = tl.arange(0, 16)[:, None] * 64 + tl.arange(0, 64)[None, :]
+        view = _buffered_stage_rows(buffers, slot, 16, 64)
+        tlx.local_store(view, offsets.to(tl.float32))
+        tl.store(output_ptr + offsets, tlx.local_load(view))
+
+    compiled = triton_compile(ASTSource(kernel, signature=dict(output_ptr="*fp32", slot="i32")),
+                              target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4))
+    assert re.search(r"!ttg\.memdesc<16x64xf32, [^>]*, 32x64>", compiled.asm["ttgir"])
+
+
+@triton.jit
+def _buffered_select_store(view, output_ptr):
+    offsets = tl.arange(0, 16)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    tlx.local_store(view, offsets.to(tl.float32))
+    tl.store(output_ptr + offsets, tlx.local_load(view))
+
+
+def test_buffered_tensor_select_matching_views():
+
+    @triton.jit
+    def kernel(output_ptr, slot, cond):
+        # Different rings, but both views are 16x64 slices of 32x64 stages.
+        a = tlx.local_alloc((32, 64), tl.float32, 3)
+        b = tlx.local_alloc((32, 64), tl.float32, 2)
+        if cond > 0:
+            view = tlx.local_slice(a[slot], [0, 0], [16, 64])
+        else:
+            view = tlx.local_slice(b[slot], [16, 0], [16, 64])
+        _buffered_select_store(view, output_ptr)
+
+    compiled = triton_compile(ASTSource(kernel, signature=dict(output_ptr="*fp32", slot="i32", cond="i32")),
+                              target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4))
+    assert "scf.if" in compiled.asm["ttgir"]
+
+
+def test_buffered_tensor_select_rejects_different_allocation_shapes():
+
+    @triton.jit
+    def kernel(output_ptr, slot, cond):
+        # Both views are 16x64, but only one is a slice of a larger stage. A
+        # memdesc type includes its allocation shape, so they cannot merge.
+        a = tlx.local_alloc((32, 64), tl.float32, 3)
+        b = tlx.local_alloc((16, 64), tl.float32, 3)
+        if cond > 0:
+            view = tlx.local_slice(a[slot], [0, 0], [16, 64])
+        else:
+            view = b[slot]
+        _buffered_select_store(view, output_ptr)
+
+    with pytest.raises(CompilationError) as err:
+        triton_compile(ASTSource(kernel, signature=dict(output_ptr="*fp32", slot="i32", cond="i32")),
+                       target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4))
+    message = str(err.value)
+    assert "Mismatched type for view" in message
+    assert "32x64>" in message and "16x64xf32" in message
