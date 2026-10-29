@@ -1,5 +1,6 @@
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-block-pingpong="num-stages=2" | FileCheck %s
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-block-pingpong="num-stages=3" | FileCheck %s --check-prefixes CHECK-NS3
+// RUN: sed 's/hip:gfx942/hip:gfx950/g' %s | triton-opt -split-input-file --tritonamdgpu-block-pingpong="num-stages=2" | FileCheck %s --check-prefix=CHECK-GFX950
 
 //CHECK-LABEL: pingpong_small
 //CHECK: ttg.local_load
@@ -74,6 +75,70 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttg.local_dealloc %21 : !ttg.memdesc<1x128x64xf16, #shared, #smem, mutable>
     ttg.local_dealloc %22 : !ttg.memdesc<1x64x128xf16, #shared1, #smem, mutable>
     tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: @pingpong_packed_k32(
+// CHECK: ttg.local_load {{.*}} -> tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 4
+// CHECK: ttg.local_load {{.*}} -> tensor<16x256xbf16, #ttg.dot_op<{{.*}}kWidth = 4
+// CHECK: ttg.local_load {{.*}} -> tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 4
+// CHECK: ttg.local_load {{.*}} -> tensor<16x256xbf16, #ttg.dot_op<{{.*}}kWidth = 4
+// CHECK: %[[PACKED_FIRST:.+]] = tt.dot {{.*}}tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 4
+// CHECK: tt.dot {{.*}}, %[[PACKED_FIRST]] : tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 4
+// CHECK-NS3-LABEL: @pingpong_packed_k32(
+// CHECK-NS3-NOT: ttg.memdesc_subslice
+// CHECK-NS3: tt.dot
+// The gfx942 packing correction must not change gfx950 operand layouts.
+// CHECK-GFX950-LABEL: @pingpong_packed_k32(
+// CHECK-GFX950: ttg.local_load {{.*}} -> tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: ttg.local_load {{.*}} -> tensor<16x256xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: ttg.local_load {{.*}} -> tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: ttg.local_load {{.*}} -> tensor<16x256xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: %[[UNCHANGED_FIRST:.+]] = tt.dot {{.*}}tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+// CHECK-GFX950: tt.dot {{.*}}, %[[UNCHANGED_FIRST]] : tensor<256x16xbf16, #ttg.dot_op<{{.*}}kWidth = 8
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [16, 4], warpsPerCTA = [8, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [4, 16], warpsPerCTA = [1, 8], order = [0, 1]}>
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 4], instrShape = [16, 16, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+#shared1 = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @pingpong_packed_k32(%a: !tt.ptr<bf16>, %b: !tt.ptr<bf16>) -> tensor<256x256xf32, #mma> {
+    %c0 = arith.constant 0 : i32
+    %c32 = arith.constant 32 : i32
+    %c64 = arith.constant 64 : i32
+    %zero = arith.constant dense<0.0> : tensor<256x256xf32, #mma>
+    %ap = tt.splat %a : !tt.ptr<bf16> -> tensor<256x32x!tt.ptr<bf16>, #blocked>
+    %bp = tt.splat %b : !tt.ptr<bf16> -> tensor<32x256x!tt.ptr<bf16>, #blocked1>
+    %am = ttg.local_alloc : () -> !ttg.memdesc<1x256x32xbf16, #shared, #smem, mutable>
+    %bm = ttg.local_alloc : () -> !ttg.memdesc<1x32x256xbf16, #shared1, #smem, mutable>
+    %av = ttg.memdesc_index %am[%c0] : !ttg.memdesc<1x256x32xbf16, #shared, #smem, mutable> -> !ttg.memdesc<256x32xbf16, #shared, #smem, mutable>
+    %bv = ttg.memdesc_index %bm[%c0] : !ttg.memdesc<1x32x256xbf16, #shared1, #smem, mutable> -> !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable>
+    %a0 = tt.load %ap : tensor<256x32x!tt.ptr<bf16>, #blocked>
+    %b0 = tt.load %bp : tensor<32x256x!tt.ptr<bf16>, #blocked1>
+    ttg.local_store %a0, %av : tensor<256x32xbf16, #blocked> -> !ttg.memdesc<256x32xbf16, #shared, #smem, mutable>
+    ttg.local_store %b0, %bv : tensor<32x256xbf16, #blocked1> -> !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable>
+    %result:3 = scf.for %k = %c0 to %c64 step %c32 iter_args(%acc = %zero, %ac = %av, %bc = %bv) -> (tensor<256x256xf32, #mma>, !ttg.memdesc<256x32xbf16, #shared, #smem, mutable>, !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable>) : i32 {
+      %an = tt.addptr %a, %k : !tt.ptr<bf16>, i32
+      %anp = tt.splat %an : !tt.ptr<bf16> -> tensor<256x32x!tt.ptr<bf16>, #blocked>
+      %nexta = tt.load %anp : tensor<256x32x!tt.ptr<bf16>, #blocked>
+      %al = ttg.local_load %ac : !ttg.memdesc<256x32xbf16, #shared, #smem, mutable> -> tensor<256x32xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+      %bn = tt.addptr %b, %k : !tt.ptr<bf16>, i32
+      %bnp = tt.splat %bn : !tt.ptr<bf16> -> tensor<32x256x!tt.ptr<bf16>, #blocked1>
+      %nextb = tt.load %bnp : tensor<32x256x!tt.ptr<bf16>, #blocked1>
+      %bl = ttg.local_load %bc : !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable> -> tensor<32x256xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
+      %dot = tt.dot %al, %bl, %acc : tensor<256x32xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<32x256xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>> -> tensor<256x256xf32, #mma>
+      %av1 = ttg.memdesc_index %am[%c0] : !ttg.memdesc<1x256x32xbf16, #shared, #smem, mutable> -> !ttg.memdesc<256x32xbf16, #shared, #smem, mutable>
+      %bv1 = ttg.memdesc_index %bm[%c0] : !ttg.memdesc<1x32x256xbf16, #shared1, #smem, mutable> -> !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable>
+      ttg.local_store %nexta, %av1 : tensor<256x32xbf16, #blocked> -> !ttg.memdesc<256x32xbf16, #shared, #smem, mutable>
+      ttg.local_store %nextb, %bv1 : tensor<32x256xbf16, #blocked1> -> !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable>
+      scf.yield %dot, %av1, %bv1 : tensor<256x256xf32, #mma>, !ttg.memdesc<256x32xbf16, #shared, #smem, mutable>, !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable>
+    }
+    ttg.local_dealloc %bm : !ttg.memdesc<1x32x256xbf16, #shared1, #smem, mutable>
+    ttg.local_dealloc %am : !ttg.memdesc<1x256x32xbf16, #shared, #smem, mutable>
+    tt.return %result#0 : tensor<256x256xf32, #mma>
   }
 }
 

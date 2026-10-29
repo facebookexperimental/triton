@@ -209,6 +209,11 @@ loads with explicit warp masks. These kernels were ported from `tlx-amd-meta`:
 | [`amd_fa_tdm_pipelined.py`](amd_fa_tdm_pipelined.py) | `attn_fwd_tdm_pipelined` implements non-causal BF16 attention with FP32 output and a hand-written K/V pipeline. |
 | [`amd_grouped_gemm_gfx1250/`](amd_grouped_gemm_gfx1250/README.md) | `grouped_gemm_phase0` accepts ragged pointer tables; `grouped_gemm_tdm` accepts packed A `[sum(M_g), K]`, B `[G, N, K]`, and int32 group offsets. |
 
+The MXFP tutorial accepts `--tiles_per_warp M N` (or
+`TILES_PER_WARP=(M, N)` in its Python API and `matmul` config) to compare
+gfx1250 WMMA layouts. It defaults to `2 2`; the CLI compares `1 1`,
+`2 1`, `1 2`, and `2 2`.
+
 The grouped TDM path requires each group M to be a multiple of `block_m`,
 N to be a multiple of `block_n`, and K to be a multiple of 128 with enough
 tiles to fill the ring. Cross-tile prefetch requires dedicated C staging,

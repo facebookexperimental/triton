@@ -7,6 +7,31 @@ from triton.tlx.ops.kernels.addmm._shapes import CORRECTNESS_SHAPES, FOCUS, inpu
 pytestmark = pytest.mark.skipif(not is_hip_cdna3(), reason="tlx.ops.addmm requires gfx942")
 
 
+@pytest.mark.parametrize("row_panels", [160, 320])
+def test_torchtlx_addmm_row_panel_tail(monkeypatch, row_panels):
+    from torch._inductor import config
+    from torch._inductor.utils import run_and_get_code
+
+    if not hasattr(config.triton, "tlx_mode"):
+        pytest.skip("torch lacks TorchTLX integration")
+    import triton.language.extra.tlx.inductor.registry  # noqa: F401
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    tile = gfx942._template_config((row_panels, 128 if row_panels == 320 else 256, 64, 4, 8), NUM_XCDS=1, XCD_CHUNK=1,
+                                   SPLIT_M_128_32=row_panels == 160, SPLIT_M_256_64=row_panels == 320)
+    monkeypatch.setattr(gfx942, "torchtlx_heuristic_config", lambda *args, **kwargs: [tile])
+    torch.manual_seed(123)
+    bias, a, b = inputs((392, 256, 256, (256, 1), (1, 256), (1, ), "fp16"), torch.float16)
+    with config.patch({"triton.tlx_mode": "force", "max_autotune": False, "force_disable_caches": True}):
+        compiled = torch.compile(torch.addmm, fullgraph=True)
+        actual, code = run_and_get_code(compiled, bias, a, b)
+        assert "acc1" in "\n".join(code)
+        torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=0.05, rtol=0.05)
+        a.neg_()
+        bias.add_(1)
+        torch.testing.assert_close(compiled(bias, a, b), torch.addmm(bias, a, b), atol=0.05, rtol=0.05)
+
+
 @pytest.mark.parametrize("m,n,k,a_strides,b_strides,bias_strides,dtype_name", CORRECTNESS_SHAPES)
 def test_addmm(m, n, k, a_strides, b_strides, bias_strides, dtype_name):
     from triton.tlx.ops import addmm as tlx_addmm
@@ -20,6 +45,15 @@ def test_addmm(m, n, k, a_strides, b_strides, bias_strides, dtype_name):
 
     assert actual is out
     torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+
+    if dtype == torch.bfloat16 and (m, n, k) == (819200, 1024, 192):
+        # Reusing an output after reading it must observe subsequent streaming stores.
+        for update in (a.neg_, a.zero_):
+            update()
+            bias.add_(1)
+            actual = tlx_addmm(bias, a, b, out=out)
+            assert actual is out
+            torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=0.05, rtol=0.05)
 
     del bias, a, b, out, actual, expected
     torch.cuda.empty_cache()

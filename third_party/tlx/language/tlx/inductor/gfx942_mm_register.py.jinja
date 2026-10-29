@@ -63,6 +63,36 @@ from triton.tlx.ops.kernels.mm.gfx942 import matmul_kernel_gfx942
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
 
+{% if SPLIT_M_128_32 or SPLIT_M_256_64 %}
+    # Two row panels share each B tile while retaining increasing K order.
+    # Non-power-of-two row tiles reduce padding on the MLP target.
+    BASE_PANEL_M: tl.constexpr = 256 if {{SPLIT_M_256_64}} else 128
+    PANEL_M: tl.constexpr = 64 if {{SPLIT_M_256_64}} else 32
+    tl.static_assert(BLOCK_M == BASE_PANEL_M + PANEL_M)
+    tl.static_assert(EVEN_K)
+    rows0 = pid_m * BLOCK_M + tl.arange(0, BASE_PANEL_M).to(tl.int32)
+    rows1 = pid_m * BLOCK_M + BASE_PANEL_M + tl.arange(0, PANEL_M).to(tl.int32)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
+    offs_m0 = rows0 % M
+    offs_m1 = rows1 % M
+    offs_n = cols % N
+    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
+    acc0 = tl.zeros((BASE_PANEL_M, BLOCK_N), dtype=ACC_TYPE)
+    acc1 = tl.zeros((PANEL_M, BLOCK_N), dtype=ACC_TYPE)
+    for k in range(0, K, BLOCK_K):
+        b = tl.load(B + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn)
+        a0 = tl.load(A + offs_m0[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak)
+        a1 = tl.load(A + offs_m1[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak)
+        acc0 = tl.dot(a0, b, acc0, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+        acc1 = tl.dot(a1, b, acc1, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+    idx_n = cols[None, :]
+    idx_m0 = rows0[:, None]
+    idx_m1 = rows1[:, None]
+    mask0 = (idx_m0 < M) & (idx_n < N)
+    mask1 = (idx_m1 < M) & (idx_n < N)
+    {{store_output(("idx_m0", "idx_n"), "acc0", "mask0", val_shape=("BASE_PANEL_M", "BLOCK_N"))}}
+    {{store_output(("idx_m1", "idx_n"), "acc1", "mask1", val_shape=("PANEL_M", "BLOCK_N"))}}
+{% else %}
     input_rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
     input_cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
     offs_m = (
@@ -158,4 +188,5 @@ from triton.tlx.ops.kernels.mm.gfx942 import matmul_kernel_gfx942
     idx_n = cols[None, :]
     mask = (idx_m < M) & (idx_n < N)
     {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
+{% endif %}
 {% endif %}

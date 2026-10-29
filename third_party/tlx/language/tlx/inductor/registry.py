@@ -22,6 +22,7 @@ import contextlib
 import dataclasses
 import logging
 import os
+import re
 from typing import Any, Generator
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,16 @@ from torch._inductor.template_heuristics.triton import (
     TMATemplateConfigMixin,
 )
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
-from torch._inductor.utils import can_use_tma, get_num_sms, tma_inner_dim
+from torch._inductor.utils import can_use_tma, get_num_sms
+
+try:
+    from torch._inductor.utils import tma_inner_dim
+except ImportError:
+    def tma_inner_dim(strides):
+        from torch._inductor.virtualized import V
+
+        inner = [i for i, stride in enumerate(strides) if V.graph.sizevars.statically_known_equals(stride, 1)]
+        return inner[0] if len(inner) == 1 else None
 
 from ..hw import resources
 from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
@@ -73,6 +83,7 @@ from . import tlx_config
 from .mm_templates import (
     amd_bmm_shared_a_template,
     blackwell_gemm_ws_template,
+    hopper_gemm_small_k_template,
     hopper_gemm_ws_template,
     gfx942_addmm_template,
     gfx942_mm_template,
@@ -818,6 +829,26 @@ def _candidate_scorer_evaluate(
     return best_config
 
 
+def _host_tma_operands(kernel_inputs) -> dict[str, bool]:
+    """Which of A's and B's TMA descriptors the launcher builds on the host.
+
+    A device-built descriptor costs every CTA a descriptor write and fence before
+    its first load. The Python launcher builds host descriptors from integer dims
+    and, where it supports it, from dynamic sizes the kernel takes as args (A's M
+    under a dynamic batch), read at launch. Any other operand is passed as a
+    plain pointer and its descriptor is built on the device.
+    """
+    from torch._inductor.runtime import triton_heuristics
+
+    launch_dims = getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False) and not V.graph.cpp_wrapper
+    dim_types = (int, sympy.Integer, sympy.Symbol) if launch_dims else (int, sympy.Integer)
+    a_host, b_host = (
+        all(isinstance(dim, dim_types) for dim in (*mat.get_size(), *mat.get_stride()))
+        for mat in kernel_inputs.mat1mat2()
+    )
+    return {"HOST_SIDE_TMA": a_host or b_host, "HOST_TMA_A": a_host, "HOST_TMA_B": b_host}
+
+
 @register_template_heuristic(
     hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="mm"
 )
@@ -841,50 +872,138 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
         return inputs.dtype(inputs._mat1_idx) == inputs.dtype(inputs._mat2_idx)
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
-        from triton.tlx.ops.kernels.mm.sm90 import (
-            CONFIGS,
-            _config,
-            _prune_full_configs,
-            heuristic_config,
-        )
+        from triton.tlx.ops.kernels.mm import sm90
 
         m, n, k = kernel_inputs.mnk_hinted()
         if min(m, n, k) <= 0:
             return
-        # The Inductor template has no split-K reduction and no N pieces; keep
-        # whole-K, power-of-two-N configs.
-        if config.triton.tlx_mode == "allow":
-            configs = _prune_full_configs(CONFIGS(), {"M": m, "N": n, "K": k})
+        strides = kernel_inputs.strides_hinted()
+        a_row_major = tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1
+        b_row_major = tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1
+        allow = config.triton.tlx_mode == "allow"
+        if not allow and sm90._use_small_k(m, n, k, "heuristic"):
+            # As tlx.ops.mm's heuristic, leave a few-K-step shape to the small-K
+            # template: autotuning cannot tell few-microsecond kernels apart.
+            return
+        # Skinny M runs swap-AB, as in tlx.ops.mm: the kernel computes C^T with
+        # the problem's N as its M.
+        swap_ab = m <= sm90._SWAP_AB_MAX_M
+        if swap_ab:
+            configs = (sm90._prune_swap_configs(sm90._swap_configs(), {"M": n, "N": m, "K": k})
+                       if allow else sm90._swap_heuristic_config(m, n, k))
         else:
-            configs = heuristic_config(m, n, k)
-            if configs[0].kwargs["SPLIT_K"] > 1:
-                meta = configs[0].kwargs
-                configs = [_config(meta["BM"], meta["BN"], meta["NUM_STAGES"], meta["GROUP_SIZE_M"])]
+            configs = (sm90._prune_full_configs(sm90.CONFIGS(), {"M": m, "N": n, "K": k}, B_ROW_MAJOR=b_row_major)
+                       if allow else sm90.heuristic_config(m, n, k, b_row_major))
+        # Split-K configs write fp32 partials that torchTLX's _reduce_k_kernel
+        # sums, adding the bias with alpha = beta = 1 only; otherwise run whole-K.
+        scalars = getattr(kernel_inputs, "_scalars", None) or {}
+        if scalars.get("alpha", 1) != 1 or scalars.get("beta", 1) != 1:
+            if allow:
+                configs = [conf for conf in configs if conf.kwargs["SPLIT_K"] == 1]
+            else:
+                configs = [self._whole_k(sm90, conf) for conf in configs]
+        host_tma = _host_tma_operands(kernel_inputs)
+        # Non-power-of-two tiles run only as two equal-subtile pieces (192, 96).
         configs = [
             conf for conf in configs
-            if conf.kwargs["SPLIT_K"] == 1 and conf.kwargs["BN"] & (conf.kwargs["BN"] - 1) == 0
+            if sm90._is_pow2(conf.kwargs["BN"]) or (sm90._npot_subtile(conf.kwargs["BN"]) and not b_row_major)
         ]
-        strides = kernel_inputs.strides_hinted()
         for conf in configs:
             meta = conf.kwargs
+            n_tail = sm90._n_piece(meta["BN"], 1)
+            split_k = meta["SPLIT_K"]
             yield {
                 "BLOCK_M": meta["BM"],
                 "BLOCK_N": meta["BN"],
                 "BLOCK_K": meta["BK"],
                 "BLOCK_M_SPLIT": meta["BM"] // meta["NUM_MMA_GROUPS"],
-                "slice_size": meta["BN"] // 4,
+                "slice_size": n_tail // 2 if n_tail else meta["BN"] // 4,
+                "N_TAIL": n_tail,
+                "SWAP_AB": swap_ab,
+                "SPLIT_K": split_k,
                 "GROUP_SIZE_M": meta["GROUP_SIZE_M"],
                 "NUM_STAGES": meta["NUM_STAGES"],
                 "NUM_MMA_GROUPS": meta["NUM_MMA_GROUPS"],
                 "NUM_SMS": get_num_sms(),
-                "A_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1,
-                "B_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1,
-                "A_EVICTION": repr("evict_last" if n <= 1024 else ""),
-                "TMA_EPILOGUE_STORE": int(n % 8 == 0),
+                # Under swap-AB the kernel's A is B^T and its B is A^T.
+                "A_ROW_MAJOR": (not b_row_major) if swap_ab else a_row_major,
+                "B_ROW_MAJOR": (not a_row_major) if swap_ab else b_row_major,
+                # A few N tiles reuse each A panel back to back; under swap-AB
+                # the kernel's A is B, streamed once.
+                "A_EVICTION": repr("evict_last" if n <= 1024 and not swap_ab else ""),
+                # Split-K stores partials through pointers; the reducer writes C.
+                "TMA_EPILOGUE_STORE": int(n % 8 == 0 and split_k == 1),
+                # A and B descriptors built on the host, as tlx.ops.mm does,
+                # rather than by every CTA before its first load.
+                **host_tma,
                 "num_stages": conf.num_stages,
                 "num_warps": conf.num_warps,
                 "ACC_TYPE": "tl.float32",
             }
+
+    @staticmethod
+    def _whole_k(sm90, conf):
+        meta = conf.kwargs
+        if meta["SPLIT_K"] == 1:
+            return conf
+        if meta["SWAP_AB"]:
+            stages = sm90._deepest_ring(meta["BM"], meta["BN"], meta["BK"], 1)
+            return sm90._config(meta["BM"], meta["BN"], stages, meta["GROUP_SIZE_M"], 1, meta["BK"], True)
+        return sm90._config(meta["BM"], meta["BN"], meta["NUM_STAGES"], meta["GROUP_SIZE_M"])
+
+
+@register_template_heuristic(
+    hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="addmm"
+)
+class HopperGemmWSAddMMConfigHeuristic(AddMMConfigMixin, HopperGemmWSConfigHeuristic):
+    """addmm on the SM90 WS template; the bias rides the template's epilogue."""
+
+
+@register_template_heuristic(
+    hopper_gemm_small_k_template.uid, "cuda", register=not IS_ROCM, op_name="mm"
+)
+class HopperGemmSmallKConfigHeuristic(HopperGemmWSConfigHeuristic):
+    """tlx.ops.mm's small-K kernel, offered where tlx.ops.mm would consider it."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        from triton.tlx.ops.kernels.mm import sm90
+
+        m, n, k = kernel_inputs.mnk_hinted()
+        if min(m, n, k) <= 0:
+            return
+        if config.triton.tlx_mode == "allow":
+            if not sm90._small_k_candidate(m, n, k, "full"):
+                return
+            configs = sm90._prune_small_k_configs(sm90._small_k_configs(), {"M": m, "N": n, "K": k})
+        else:
+            if not sm90._use_small_k(m, n, k, "heuristic"):
+                return
+            configs = sm90._small_k_heuristic_config(m, n, k)
+        strides = kernel_inputs.strides_hinted()
+        host_tma = _host_tma_operands(kernel_inputs)
+        for conf in configs:
+            meta = conf.kwargs
+            if meta["SPLIT_K"] > 1:
+                continue
+            yield {
+                "BLOCK_M": meta["BM"],
+                "BLOCK_N": meta["BN"],
+                "BLOCK_K": meta["BK"],
+                "GROUP_SIZE_M": meta["GROUP_SIZE_M"],
+                "A_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1,
+                "B_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1,
+                **host_tma,
+                "num_stages": conf.num_stages,
+                "num_warps": conf.num_warps,
+                "ACC_TYPE": "tl.float32",
+            }
+
+
+@register_template_heuristic(
+    hopper_gemm_small_k_template.uid, "cuda", register=not IS_ROCM, op_name="addmm"
+)
+class HopperGemmSmallKAddMMConfigHeuristic(AddMMConfigMixin, HopperGemmSmallKConfigHeuristic):
+    """addmm on the SM90 small-K template; the bias rides the template's epilogue."""
 
 
 class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
@@ -1334,10 +1453,12 @@ class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
             alpha=scalars.get("alpha", 1), beta=scalars.get("beta", 1),
         ):
             meta = dict(config.kwargs)
-            if meta.pop("SPLIT_M_128_32", False) or meta.pop(
+            if meta.pop("SPLIT_M_128_64", False) or meta.pop(
                 "USE_LOCAL_SPLIT_U", False
             ):
                 continue
+            meta.setdefault("SPLIT_M_128_32", False)
+            meta.setdefault("SPLIT_M_256_64", False)
             meta.setdefault("SPLIT_K", 1)
             meta.setdefault("SPLIT_ORDER_CHUNK", 1)
             meta.setdefault("LAUNCH_XCD_CHUNK", 0)
@@ -1501,7 +1622,20 @@ def _gfx950_register_plan_for(m, n, k):
     return _gfx950_register_intermediate_config(m, n, k)
 
 
-class _Gfx950InterWaveTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class _Gfx950TLXModeMixin:
+    """Run on gfx950 whenever torchTLX is enabled.
+
+    torchTLX is independent of max_autotune; the ROCm GEMM base heuristic would
+    otherwise offer these templates only under it.
+    """
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if config.triton.tlx_mode in ("allow", "force"):
+            return _is_gfx950()
+        return super().should_run(inputs)
+
+
+class _Gfx950InterWaveTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Shared config gate for the gfx950 a16w16 inter-wave kernel.
 
     The reference kernel consumes row-major A directly and relies on a fixed
@@ -1626,9 +1760,7 @@ class Gfx950MMInterWaveTemplateConfigHeuristic(
     register=IS_ROCM,
     op_name="mm",
 )
-class Gfx950MMLocalSplitUTemplateConfigHeuristic(
-    ROCmMMTemplateConfigHeuristic
-):
+class Gfx950MMLocalSplitUTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Offer LocalSplitU only for its two validated small-M shapes."""
 
     # (M, N, K): (TILE_M, TILE_N, LOCAL_SPLIT_U, WAVE_K, K_WIDTH)
@@ -1683,7 +1815,7 @@ class Gfx950MMLocalSplitUTemplateConfigHeuristic(
     register=IS_ROCM,
     op_name="mm",
 )
-class Gfx950MMRegisterTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class Gfx950MMRegisterTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Offer the register fallback only when its geometry policy selects it."""
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
@@ -1740,9 +1872,7 @@ class Gfx950MMRegisterTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
     register=IS_ROCM,
     op_name="mm",
 )
-class Gfx950MMPersistentTemplateConfigHeuristic(
-    ROCmMMTemplateConfigHeuristic
-):
+class Gfx950MMPersistentTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Offer the N160/N192 persistent kernels only for their tuned shapes."""
 
     PERSISTENT_CONFIGS = {
@@ -1802,9 +1932,7 @@ class Gfx950AddMMInterWaveTemplateConfigHeuristic(
 @register_template_heuristic(
     gfx950_addmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="addmm"
 )
-class Gfx950AddMMWarpPipeConfigHeuristic(
-    AddMMConfigMixin, ROCmMMTemplateConfigHeuristic
-):
+class Gfx950AddMMWarpPipeConfigHeuristic(AddMMConfigMixin, _Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """TLX warp-pipelined addmm heuristic for ROCm (col-major B, MI350X/gfx950).
 
     Hand-pipelined (num_stages=1): async-prefetches NUM_BUFFERS K-tiles into multi-buffered
@@ -2005,7 +2133,7 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
 @register_template_heuristic(
     gfx950_bmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
 )
-class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class Gfx950BMMWarpPipeConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """TLX warp-pipelined bmm heuristic for ROCm (MI350X/gfx950).
 
     Same warp-pipe core as the addmm (async_load prefetch into multi-buffered LDS + MFMA via
@@ -2137,7 +2265,7 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
 @register_template_heuristic(
     amd_bmm_shared_a_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
 )
-class ROCmBMMSharedATemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class ROCmBMMSharedATemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Validated gfx950 shared-LHS BMM configs.
 
     This is deliberately a separate candidate from the general BMM warp-pipe.
@@ -3215,6 +3343,11 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
             range_val = range_tree.var_ranges[old_name]
             del range_tree.var_ranges[old_name]
             range_tree.var_ranges[symbol] = range_val
+            # Keep block-shape inference in sync with the renamed symbol, as
+            # store_output does; prefix-input loads (addmm bias) look it up.
+            if self.range_tree_nodes.get(old_name) is lookup_output:
+                del self.range_tree_nodes[old_name]
+            self.range_tree_nodes[symbol] = lookup_output
             intermediate_lines.extend(
                 self._generate_index_from_tma_index(
                     name,
@@ -3269,7 +3402,8 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
         # Their stores are redirected to assignments by _TLXComputeOnlyHandler.
         fused = self.epilogue_fn(*epilogue_args)
         V.kernel.cse.store_cache[self.output_node.get_name()] = fused
-        self.body.writeline(f"{result_name} = {fused}")
+        # Emit into compute, after the prefix-input loads that ``fused`` uses.
+        self.compute.writeline(f"{result_name} = {fused}")
 
         # Mark that the template output buffer was "stored" for CSE purposes
         self.store_buffer_names.add(self.output_node.get_name())
@@ -3323,6 +3457,52 @@ _orig_codegen_template_body = getattr(
 )
 
 
+def _hopper_ws_fused_epilogue_stages(meta: dict[str, Any]) -> int:
+    """Ring depth for a Hopper WS template that has epilogue nodes fused in.
+
+    Autotuning sizes the ring for the bare GEMM, and the deepest configs use
+    nearly all SMEM. Fused epilogue inputs are loaded and converted to the
+    accumulator layout through SMEM scratch, one fp32 (BLOCK_M_SPLIT, slice_size)
+    tile, which pushes those configs over the limit; Inductor's fusion benchmark
+    then sees a compile failure and rejects the fusion. Shed ring stages until
+    that tile fits.
+    """
+    from triton.tlx.ops.kernels.mm import sm90
+
+    stages = meta["NUM_STAGES"]
+    reserve = meta["BLOCK_M_SPLIT"] * meta["slice_size"] * 4
+
+    def smem(num_stages: int) -> int:
+        return sm90._smem_bytes(meta["BLOCK_M"], meta["BLOCK_N"], meta["BLOCK_K"], num_stages, 1,
+                                swap_ab=bool(meta.get("SWAP_AB", False)))
+
+    while stages > 2 and smem(stages) + reserve > sm90._MAX_SMEM:
+        stages -= 1
+    return stages
+
+
+_HOPPER_WS_META_KEYS = frozenset({"NUM_STAGES", "BLOCK_M_SPLIT", "slice_size", "N_TAIL", "SWAP_AB"})
+
+
+def _maybe_shrink_ring_for_fused_epilogue(kernel, epilogue_nodes) -> None:  # type: ignore[no-untyped-def]
+    # Identified by its meta: the render callable may be wrapped by other
+    # patches, so the template object is not reachable from here.
+    meta = kernel.meta
+    if not epilogue_nodes or not _HOPPER_WS_META_KEYS <= meta.keys() or not current_target().is_hopper:
+        return
+    if meta.get("SPLIT_K", 1) != 1:
+        return
+    stages = _hopper_ws_fused_epilogue_stages(meta)
+    if stages == meta["NUM_STAGES"]:
+        return
+    # The ring depth reaches the kernel only through its constexpr define;
+    # meta is shared with the unfused renders of this choice, so copy it.
+    kernel.defines = re.sub(r"^NUM_STAGES : tl\.constexpr = \d+$", f"NUM_STAGES : tl.constexpr = {stages}",
+                            kernel.defines, flags=re.M)
+    kernel.meta = {**meta, "NUM_STAGES": stages}
+    log.debug("tlx_hopper_gemm_ws: NUM_STAGES %d -> %d to fit the fused epilogue", meta["NUM_STAGES"], stages)
+
+
 def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
     self,
     scheduling,
@@ -3334,6 +3514,7 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
     render,
 ):
     split_k = getattr(self, "_tlx_split_k", 1)
+    _maybe_shrink_ring_for_fused_epilogue(self, epilogue_nodes)
     # Set _final_output_name so output_ptr() resolves to the fused output.
     if epilogue_nodes and getattr(self, "_tlx_reduction_epilogue_plan", None) is None:
         last_names = epilogue_nodes[-1].get_buffer_names()

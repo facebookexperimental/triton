@@ -487,18 +487,23 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
     )
 
 
-def addmm(input, a, b, *, out=None, space="heuristic"):
+def addmm(input, a, b, *, out=None, space=None):
     """Fused ``input + a @ b`` for two-dimensional fp16/bf16 matrices.
 
     ``input`` may be ``(N,)`` or two-dimensional and broadcastable to the
     ``(M, N)`` result. Matrix and input scale factors are both one. This op is
-    currently forward-only. ``space=`` also accepts a ``Space``; its invariance
-    request is validated but not enforced yet.
+    currently forward-only.
+
+    `space=None` uses the implementation's default: "full" on sm90, otherwise
+    "heuristic". ``space=`` also accepts a ``Space``; its invariance request is
+    validated but not enforced yet.
     """
     space_name, invariance = _normalize_space_arg("addmm", space)
+    fn, spec = impl_for("addmm", device=a.device)
+    if space_name is None:
+        space_name = spec.default_space
     if space_name not in ("heuristic", "full", "smoke", "heuristic_2cta"):
         raise InvalidInput(f"tlx.ops.addmm does not provide space={space_name!r}")
-    fn, spec = impl_for("addmm", device=a.device)
     check_inputs(spec, dtype=a.dtype)
     check_backward(spec, input, a, b)
     _check_enforced("addmm", spec, invariance)

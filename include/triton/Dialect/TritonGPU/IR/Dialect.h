@@ -378,6 +378,10 @@ ArrayRef<T> dropPipeliningDim(ArrayRef<T> shape, Attribute layout) {
   return shape.take_back(cast<LayoutEncodingTrait>(layout).getRank());
 }
 
+// The layout-shape rule MemDescType::verify enforces, exported so producers
+// can check a shape before building the type.
+bool isLegalMemDescLayoutShape(ArrayRef<int64_t> shape, Attribute encoding);
+
 // Returns the number of elements per CTA in the allocation's linear address
 // space. This does not include padding introduced by padded shared layouts.
 // Leading pipelining dimensions count full allocation stages, including any

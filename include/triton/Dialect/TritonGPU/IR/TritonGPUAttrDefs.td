@@ -1338,6 +1338,8 @@ For example, the matrix L corresponding to blockTileSize=[32,16] is:
       ArrayRefParameter<"unsigned">:$warpsPerCTA, "CGAEncodingAttr":$CGALayout,
       ArrayRefParameter<"unsigned">:$instrShape);
 
+  let genVerifyDecl = 1;
+
   let extraClassDeclaration = extraDistributedDeclaration#[{
     bool isVolta() const;
     bool isTuring() const;

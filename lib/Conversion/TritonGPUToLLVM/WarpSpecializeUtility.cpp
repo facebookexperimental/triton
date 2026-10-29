@@ -457,6 +457,14 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
     const TargetInfoBase &targetInfo, const WarpSpecializeCallbacks &callbacks,
     unsigned switchLoopBarrierIdx) {
   auto mod = func->getParentOfType<ModuleOp>();
+  // Single-WS dispatch sends each worker warp to one partition and then exits,
+  // so a second region (e.g. one synthesized for a cluster sync) would never
+  // run its worker partitions.
+  if (hasSingleWarpSpecialize(mod) && wsOps.size() != 1)
+    return mlir::emitError(func.getLoc(),
+                           "single-warp-specialize lowering requires exactly "
+                           "one warp_specialize op, but found ")
+           << wsOps.size();
   // this is the block of ret
   Block *switchExit = new Block;
   TritonLLVMIRRewriter b(func.getLoc(), ctx);

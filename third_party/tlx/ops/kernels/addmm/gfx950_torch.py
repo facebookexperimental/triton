@@ -22,13 +22,11 @@ def addmm(bias, a, b, *, mode="allow"):
     """Run ``torch.addmm`` with the gfx950 TLX templates enabled.
 
     ``allow`` makes TLX compete with stock Inductor choices; ``force`` retains
-    only TLX candidates. Addmm needs max-autotune enabled to enter its template
-    selection path, unlike the Blackwell ``mm`` lowering.
+    only TLX candidates.
     """
-    settings = {"triton.tlx_mode": mode, "max_autotune": True}
-    if mode == "force":
-        settings["max_autotune_gemm_backends"] = "TRITON"
-    with config.patch(settings):
+    # torchTLX is independent of max_autotune: TLX configs come from the
+    # template heuristics.
+    with config.patch({"triton.tlx_mode": mode, "max_autotune": False, "max_autotune_gemm": False}):
         return _compiled(mode)(bias, a, b)
 
 

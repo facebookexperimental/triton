@@ -127,6 +127,7 @@ CATALOG: tuple[OpSpec, ...] = (
         # Warp-specialized TMA kernel with a direct-load fallback, so no
         # alignment rule to fail and no TMA requirement.
         requires=frozenset(),
+        default_space="full",
     ),
     OpSpec(
         op="addmm",
@@ -238,6 +239,17 @@ CATALOG: tuple[OpSpec, ...] = (
         impl="triton.language.extra.tlx.inductor.gfx950_torch:mm",
         dtypes=_FP16,
         requires=frozenset(),
+    ),
+    OpSpec(
+        # TorchTLX providers are benchmark/catalog entries rather than public
+        # wrappers: their API is torch.addmm, with TLX selected by Inductor.
+        op="addmm_torchtlx",
+        arch="sm90",
+        variant="inductor_hopper_gemm_ws",
+        impl="triton.tlx.ops.kernels.addmm.sm90_torch:addmm",
+        dtypes=_FP16,
+        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
+        requires=frozenset({"tma"}),
     ),
     OpSpec(
         # TorchTLX providers are benchmark/catalog entries rather than public
@@ -391,7 +403,7 @@ CATALOG: tuple[OpSpec, ...] = (
     OpSpec(
         op="hstu_cross_attn",
         arch="gfx950",
-        variant="tlx_split_kv",
+        variant="tlx",
         impl="triton.tlx.ops.kernels.hstu_cross_attn.gfx950:hstu_cross_attn",
         invariant_vocab=_HSTU_DIMS,
         dtypes=_FP16,
