@@ -31,13 +31,9 @@ REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 # future benchmark-only exclusions.
 FAILED_SHAPES = set()
 
-#: Focus shapes each arch's `tlx.ops.mm` is known to decline with
-#: `InvalidInput`, so they have no tlx number to measure. On sm100 these are
-#: operands whose TMA row stride is not 16-byte aligned, plus padded operands
-#: (leading stride wider than the row), which the kernel feeds to TMA
-#: transposed. Listed rather than derived from the catalog: if the op starts
-#: declining a shape not listed here, that case still fails as an ERROR. Remove
-#: an entry once the op accepts it, or that shape stays unmeasured.
+#: Focus shapes each arch's `tlx.ops.mm` declines with `InvalidInput`. Listed
+#: rather than derived from the catalog, so a shape the op newly declines still
+#: fails as an ERROR. Remove an entry once the op accepts it.
 DECLINED_SHAPES = {
     "sm100":
     frozenset({
