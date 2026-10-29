@@ -350,10 +350,12 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
             nxt = 1 - cur
             tlx.async_load_wait_group(0)
             tl.debug_barrier()
-            s, acc0, acc1, acc2, acc3 = _qk_pv_interleaved(
-                q0, q1, q2, q3, p, tlx.local_view(k_buf, nxt), tlx.local_view(v_buf, cur), acc0, acc1, acc2, acc3,
-                vp + (blk + 1) * v_step, tlx.local_view(v_buf, nxt), kp + tl.minimum(blk + 2, last) * k_step,
-                tlx.local_view(k_buf, cur), BLOCK_N)
+            v_next = vp + (blk + 1) * v_step
+            k_next = kp + tl.minimum(blk + 2, last) * k_step
+            s, acc0, acc1, acc2, acc3 = _qk_pv_interleaved(q0, q1, q2, q3, p, tlx.local_view(k_buf, nxt),
+                                                           tlx.local_view(v_buf, cur), acc0, acc1, acc2, acc3, v_next,
+                                                           tlx.local_view(v_buf, nxt), k_next,
+                                                           tlx.local_view(k_buf, cur), BLOCK_N)
             m_i, l_i, p, acc0, acc1, acc2, acc3 = _softmax(s, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
                                                            Q.dtype.element_ty)
         tlx.async_load_wait_group(0)
