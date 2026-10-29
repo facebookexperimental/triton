@@ -5561,13 +5561,122 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   return true;
 }
 
+// Collects the single-use layout conversions between `v` and its producer.
+// Returns null if a conversion on the way has another user, since
+// TMemSplitLoadPattern would leave such a conversion in place.
+static Value stripSingleUseConvertLayouts(Value v,
+                                          SmallVectorImpl<Operation *> &cvts) {
+  while (auto cvt = v.getDefiningOp<ttg::ConvertLayoutOp>()) {
+    if (!cvt->hasOneUse())
+      return Value();
+    cvts.push_back(cvt);
+    v = cvt.getSrc();
+  }
+  return v;
+}
+
+static bool isRewrittenBySplitLoad(tt::SplitOp split,
+                                   DenseSet<Operation *> &chainCvts,
+                                   bool fromOuterSplit, unsigned depth);
+
+// Whether every use of `v`, looking through single-use layout conversions, is
+// a local_store/local_alloc (which absorb the per-subtile conversion
+// TMemSplitLoadPattern creates) or the reshape of a nested split that the
+// pattern also rewrites.
+static bool feedsOnlySmemOrSplitLoad(Value v, DenseSet<Operation *> &chainCvts,
+                                     unsigned depth) {
+  for (Operation *user : v.getUsers()) {
+    if (isa<ttg::LocalStoreOp, ttg::LocalAllocOp>(user))
+      continue;
+    if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(user)) {
+      if (!cvt->hasOneUse() ||
+          !feedsOnlySmemOrSplitLoad(cvt.getResult(), chainCvts, depth))
+        return false;
+      chainCvts.insert(cvt);
+      continue;
+    }
+    auto reshape = dyn_cast<tt::ReshapeOp>(user);
+    if (!reshape || !reshape->hasOneUse())
+      return false;
+    auto trans = dyn_cast<tt::TransOp>(*reshape->user_begin());
+    if (!trans || !trans->hasOneUse())
+      return false;
+    Operation *next = *trans->user_begin();
+    while (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(next)) {
+      if (!cvt->hasOneUse())
+        return false;
+      next = *cvt->user_begin();
+    }
+    auto inner = dyn_cast<tt::SplitOp>(next);
+    if (!inner || !isRewrittenBySplitLoad(inner, chainCvts,
+                                          /*fromOuterSplit=*/true, depth + 1))
+      return false;
+  }
+  return true;
+}
+
+// Whether TMemSplitLoadPattern (OptimizeTMemLayouts) will rewrite `split`
+// into per-subtile TMEM loads, removing the tmem_load -> reshape -> trans ->
+// split chain and the layout conversions on it. Mirrors that pattern's match
+// conditions. A nested split (`fromOuterSplit`) is fed by a result of an outer
+// split that the pattern rewrites first. Requires the whole chain to be in one
+// partition, since a cross-partition channel would hide the tmem_load. The
+// conversions on the chain are collected into `chainCvts`.
+static bool isRewrittenBySplitLoad(tt::SplitOp split,
+                                   DenseSet<Operation *> &chainCvts,
+                                   bool fromOuterSplit, unsigned depth) {
+  if (depth > 3)
+    return false;
+  SmallVector<Operation *> cvts;
+  Value transResult = stripSingleUseConvertLayouts(split.getSrc(), cvts);
+  auto trans = transResult ? transResult.getDefiningOp<tt::TransOp>() : nullptr;
+  if (!trans || !trans->hasOneUse() ||
+      trans.getOrder() != ArrayRef<int>({0, 2, 1}))
+    return false;
+  auto reshape = trans.getSrc().getDefiningOp<tt::ReshapeOp>();
+  if (!reshape || !reshape->hasOneUse())
+    return false;
+  Value reshapeSrc = stripSingleUseConvertLayouts(reshape.getSrc(), cvts);
+  if (!reshapeSrc)
+    return false;
+  auto shape = reshape.getResult().getType().getShape();
+  if (shape[0] != cast<RankedTensorType>(reshapeSrc.getType()).getShape()[0] ||
+      shape[2] < 8)
+    return false;
+  int numWarps = ttg::lookupNumWarps(split);
+  if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
+    return false;
+  Operation *producer = reshapeSrc.getDefiningOp();
+  if (auto tmemLoad = dyn_cast_or_null<ttng::TMEMLoadOp>(producer)) {
+    int mDim = ttg::getShapePerCTA(tmemLoad.getSrc().getType())[0];
+    if (mDim != 64 && mDim != 128)
+      return false;
+  } else if (!fromOuterSplit || !isa_and_nonnull<tt::SplitOp>(producer)) {
+    return false;
+  }
+  SmallVector<Operation *> chainOps(cvts.begin(), cvts.end());
+  chainOps.append({trans, reshape, producer});
+  auto taskIds = getAsyncTaskIds(split);
+  if (llvm::any_of(chainOps, [&](Operation *op) {
+        return getAsyncTaskIds(op) != taskIds;
+      }))
+    return false;
+  for (Value result : split->getResults())
+    if (!feedsOnlySmemOrSplitLoad(result, chainCvts, depth))
+      return false;
+  chainCvts.insert(cvts.begin(), cvts.end());
+  return true;
+}
+
 // Op scratch (layout conversions, reductions, ...) is placed by
 // AllocateSharedMemoryNv after planning, and the planned buffers are live from
 // function entry through the warp_specialize. Reserve one slot sized to the
 // largest single op scratch, skipping scratch after the last WS loop (the
-// planned buffers are dead by then). This is an approximation: it over-reserves
-// when a later pass shrinks or drops the op (TMemSplitLoadPattern subtiling,
-// tritongpu-optimize-partition-warps), and under-reserves when several
+// planned buffers are dead by then). Conversions on an epilogue subtiling
+// chain that TMemSplitLoadPattern rewrites into per-subtile TMEM loads are
+// skipped when the subtiles only feed SMEM. This is an approximation: it
+// over-reserves when a later pass shrinks or drops the op
+// (tritongpu-optimize-partition-warps), and under-reserves when several
 // partitions have scratch, since scratch in different warp_specialize regions
 // interferes. An under-reservation fails at launch and Inductor falls back to
 // num_stages=1.
@@ -5604,10 +5713,21 @@ static uint64_t estimateOpScratchBytes(triton::FuncOp funcOp) {
   if (!lastWSAnchor)
     return 0;
 
+  DenseSet<Operation *> splitLoadCvts;
+  funcOp->walk([&](tt::SplitOp split) {
+    DenseSet<Operation *> chainCvts;
+    if (isRewrittenBySplitLoad(split, chainCvts, /*fromOuterSplit=*/false,
+                               /*depth=*/0))
+      splitLoadCvts.insert(chainCvts.begin(), chainCvts.end());
+  });
+
   uint64_t peak = 0;
   funcOp->walk([&](Operation *op) {
     // Tensor-map scratch is reserved separately.
     if (isa<ttng::TensormapCreateOp>(op))
+      return;
+    // TMemSplitLoadPattern removes conversions on a subtiling chain.
+    if (splitLoadCvts.contains(op))
       return;
     // Canonicalization folds a conversion into local_store/local_alloc users.
     if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op);
