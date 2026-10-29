@@ -2,6 +2,8 @@
 Helper classes for working with low precision floating point types that
 align with the opencompute (OCP) microscaling (MX) specification.
   * MXFP4Tensor: 4-bit E2M1 floating point data
+  * MXFP6Tensor: 6-bit E2M3/E3M2 floating point data, densely packed
+    in groups of 16 values per 12 bytes (96 bits, no padding)
   * MXScaleTensor: 8-bit E8M0 floating point data
 Reference: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 """
@@ -212,6 +214,151 @@ class MXFP4Tensor:
             data = data[tuple(indices)]
 
         return data.type(torch.uint8)
+
+
+class MXFP6Tensor:
+    """Six-bit E2M3/E3M2 data with dense packing.
+
+    Storage is dense: values are packed LSB-first in groups of 16 per
+    12 bytes (96 bits) with no padding byte. `tl.dot_scaled` consumes
+    operands in those groups, so dimensions fed to a scaled dot must
+    hold a multiple of 16 values (a multiple of 12 packed bytes).
+    """
+
+    def __init__(self, data=None, size=None, device=None, e=2):
+        assert e in (2, 3), f"e must be 2 (E2M3) or 3 (E3M2), got {e}"
+        self.device = device
+        self.s_shift = 5
+        self.e_size = e
+        self.m_size = 5 - e
+        if data is not None:
+            assert isinstance(data, torch.Tensor), "Parameter data must be a torch tensor"
+            self.device = data.device
+            self.data = self._from_float(data)
+        elif size is not None:
+            self.size = size if isinstance(size, tuple) else (size, )
+        else:
+            raise ValueError("Either parameter data or size must be provided")
+
+    def ravel(self):
+        return self.data.ravel()
+
+    def random(self):
+        upper_bound = 7.5 if self.e_size == 2 else 28.0
+        data = (2 * torch.rand(self.size, dtype=torch.float32, device=self.device) - 1) * upper_bound
+        self.data = self._from_float(data)
+        return self
+
+    def to(self, dtype):
+        assert dtype == torch.float32, "Currently only float32 is supported for fp6e2m3/fp6e3m2 to float conversion"
+        data = self.data
+        e_shift = self.m_size
+        e_mask = 0x3 if self.e_size == 2 else 0x7
+        m_mask = 0x3 if self.m_size == 2 else 0x7
+        sign_bits = ((data >> self.s_shift) & 0x1).type(dtype)
+        exp_bits = ((data >> e_shift) & e_mask).type(dtype)
+        mant_bits = (data & m_mask).type(dtype)
+        value = torch.zeros_like(sign_bits)
+        is_zero = (exp_bits == 0) & (mant_bits == 0)
+        non_zero_mask = ~is_zero
+        if non_zero_mask.any():
+            s_nz = sign_bits[non_zero_mask]
+            e_nz = exp_bits[non_zero_mask]
+            m_nz = mant_bits[non_zero_mask]
+            sign = torch.pow(-1, s_nz)
+            e_bias = 1 if self.e_size == 2 else 3
+            m_factor = 0.25 if self.m_size == 2 else 0.125
+            exponent = torch.where(e_nz == 0, torch.full_like(e_nz, 1 - e_bias), e_nz - e_bias)
+            mantissa = torch.where(e_nz == 0, m_nz * m_factor, 1.0 + m_nz * m_factor)
+            value[non_zero_mask] = sign * torch.pow(2, exponent) * mantissa
+        value[is_zero & (sign_bits == 1)] *= -1
+        return value.type(torch.float32)
+
+    def _from_float(self, values):
+        sign = torch.signbit(values).type(torch.uint8)
+        abs_values = torch.abs(values)
+        is_zero = abs_values == 0
+        is_invalid = torch.isnan(values) | torch.isinf(values)
+        e_shift = self.m_size
+        e_range = 4 if self.e_size == 2 else 8
+        e_bits = torch.arange(0, e_range, dtype=torch.uint8, device=self.device)
+        m_range = 4 if self.m_size == 2 else 8
+        m_factor = 0.25 if self.m_size == 2 else 0.125
+        m_bits = torch.arange(0, m_range, dtype=torch.uint8, device=self.device)
+        e_bias = 1 if self.e_size == 2 else 3
+        candidate_values, candidate_e, candidate_m = [], [], []
+        for exp in e_bits:
+            exponent = (1 - e_bias) if exp == 0 else exp.item() - e_bias
+            for mant in m_bits:
+                significand = mant * m_factor if exp == 0 else 1.0 + mant * m_factor
+                candidate_values.append(significand * (2**exponent))
+                candidate_e.append(exp)
+                candidate_m.append(mant)
+        candidates = torch.tensor(candidate_values, dtype=torch.float32, device=self.device)
+        candidate_e = torch.tensor(candidate_e, dtype=torch.uint8, device=self.device)
+        candidate_m = torch.tensor(candidate_m, dtype=torch.uint8, device=self.device)
+        abs_flat = abs_values.view(-1)
+        abs_flat[is_invalid.view(-1)] = candidates.max().item()
+        errors = torch.abs(abs_flat.unsqueeze(1) - candidates.unsqueeze(0))
+        min_errors, _ = torch.min(errors, dim=1, keepdim=True)
+        if torch.any(errors == min_errors):
+            tie_breaker = (candidate_m.unsqueeze(0).expand(abs_flat.shape[0], -1) == 0).type(torch.int32)
+            errors = errors - (tie_breaker * 1e-6)
+        best_indices = torch.argmin(errors, dim=1)
+        exp_sel = candidate_e[best_indices].view(abs_values.shape)
+        mant_sel = candidate_m[best_indices].view(abs_values.shape)
+        exp_sel[is_zero] = 0
+        mant_sel[is_zero] = 0
+        return ((sign << self.s_shift) | (exp_sel << e_shift) | mant_sel).type(torch.uint8)
+
+    def to_packed_tensor(self, dim):
+        """Packs fp6 values densely (no padding) along `dim`.
+
+        Packing works in subgroups of 4 values per 3 bytes, so the
+        dimension size must be a multiple of 4. Scaled-dot operands
+        additionally require whole groups of 16 values (12 packed bytes).
+        """
+        data = self.data
+        assert 0 <= dim < data.ndim, "The dimension to pack along is not within the range of tensor dimensions"
+        size_along_dim = data.size(dim)
+        assert size_along_dim % 4 == 0, "Dim must be multiple of 4"
+        new_shape = list(data.shape)
+        new_shape[dim] = size_along_dim // 4
+        new_shape.insert(dim + 1, 4)
+        data = data.reshape(*new_shape)
+        elem0 = data.select(dim + 1, 0)
+        elem1 = data.select(dim + 1, 1)
+        elem2 = data.select(dim + 1, 2)
+        elem3 = data.select(dim + 1, 3)
+        out0 = (elem1 << 6) | elem0
+        out1 = (elem2 << 4) | ((elem1 >> 2) & 0xF)
+        out2 = (elem3 << 2) | ((elem2 >> 4) & 0x3)
+        packed = torch.stack((out0, out1, out2), dim=dim + 1)
+        out_shape = list(data.shape)
+        out_shape[dim] = size_along_dim * 3 // 4
+        del out_shape[dim + 1]
+        return packed.reshape(*out_shape)
+
+    def unpack_packed_tensor(self, packed_tensor, dim):
+        """Inverse of `to_packed_tensor`; the packed dim must be a multiple of 3."""
+        size_along_dim = packed_tensor.size(dim)
+        assert size_along_dim % 3 == 0, "Packed dim must be multiple of 3"
+        new_shape = list(packed_tensor.shape)
+        new_shape[dim] = size_along_dim // 3
+        new_shape.insert(dim + 1, 3)
+        packed_tensor = packed_tensor.reshape(*new_shape)
+        byte0 = packed_tensor.select(dim + 1, 0)
+        byte1 = packed_tensor.select(dim + 1, 1)
+        byte2 = packed_tensor.select(dim + 1, 2)
+        out0 = byte0 & 0x3F
+        out1 = ((byte1 << 2) & 0x3C) | ((byte0 >> 6) & 0x3)
+        out2 = ((byte2 << 4) & 0x30) | ((byte1 >> 4) & 0xF)
+        out3 = (byte2 >> 2) & 0x3F
+        unpacked = torch.stack((out0, out1, out2, out3), dim=dim + 1)
+        out_shape = list(packed_tensor.shape)
+        out_shape[dim] = size_along_dim * 4 // 3
+        del out_shape[dim + 1]
+        return unpacked.reshape(*out_shape).type(torch.uint8)
 
 
 class MXScaleTensor:
