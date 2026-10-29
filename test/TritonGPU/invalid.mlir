@@ -1210,3 +1210,53 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
     tt.return %result : tensor<64xf32, #carried>
   }
 }
+
+// -----
+
+// A reshaped partitioned view must keep its pieces: four 32-row pieces of a
+// 128-row view cannot be described along a single dimension of [2, 64, 128].
+#piece_inv = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [32, 128]}>
+#piece_inv3 = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [2, 16, 128]}>
+#part_inv = #ttg.partitioned_shared<{numPartitions = 4, numGroups = 1, partitionDim = 0, partitionLayout = #piece_inv}>
+#part_inv3 = #ttg.partitioned_shared<{numPartitions = 4, numGroups = 1, partitionDim = 1, partitionLayout = #piece_inv3}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @memdesc_reshape_partitioned_unsupported(%d : !ttg.memdesc<128x128xi8, #part_inv, #smem, mutable>) {
+    // expected-error @+1 {{cannot infer the encoding of a reshaped}}
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<128x128xi8, #part_inv, #smem, mutable> -> !ttg.memdesc<2x64x128xi8, #part_inv3, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// The result must use the inferred partitioned encoding: folding a group-major
+// view gives four 32-row groups, not two 64-row groups.
+#piece_groups = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [4, 32, 128]}>
+#piece_wrong = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [64, 128]}>
+#part_groups = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #piece_groups}>
+#part_wrong = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #piece_wrong}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @memdesc_reshape_partitioned_wrong_result(%d : !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable>) {
+    // expected-error @+1 {{expected result type}}
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable> -> !ttg.memdesc<256x128xi8, #part_wrong, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Partitioned reshapes are inferred from power-of-two layouts only; an NPOT
+// leading dimension is rejected instead of being misread.
+#piece_npot = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#part_npot = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #piece_npot}>
+#dst_npot = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [2, 1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @memdesc_reshape_partitioned_npot(%d : !ttg.memdesc<192x128xi8, #part_npot, #smem, mutable>) {
+    // expected-error @+1 {{cannot infer the encoding of a reshaped}}
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<192x128xi8, #part_npot, #smem, mutable> -> !ttg.memdesc<192x2x64xi8, #dst_npot, #smem, mutable>
+    tt.return
+  }
+}

@@ -1024,7 +1024,14 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
       isa<ttg::PinnedEncodingTrait>(bufEncoding) || isUserPinnedMemDesc(buf);
   while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(bufEncoding))
     bufEncoding = pinned.getPinnedLayout();
-  if (isa<ttg::PaddedSharedEncodingAttr>(bufEncoding))
+  // Partitioned TDM buffers retain the physical partition mapping while the
+  // descriptor pass derives padding (including an unpadded layout) from the
+  // per-partition encoding.
+  Attribute innerEncoding = bufEncoding;
+  if (auto partitioned =
+          dyn_cast<ttg::PartitionedSharedEncodingAttr>(bufEncoding))
+    innerEncoding = partitioned.getPartitionLayout();
+  if (isa<ttg::PaddedSharedEncodingAttr>(innerEncoding))
     return bufEncoding;
 
   if (isExplicit) {
@@ -1033,12 +1040,13 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
     // Only preserve it when pinned; generic default allocations still need
     // the descriptor-compatible encoding selected below.
     if (auto swizzled =
-            dyn_cast<ttg::SwizzledSharedEncodingAttr>(bufEncoding)) {
+            dyn_cast<ttg::SwizzledSharedEncodingAttr>(innerEncoding)) {
       if (swizzled.getMaxPhase() == 1)
         return bufEncoding;
     }
     tdmOp->emitError()
-        << "TDM operand requires a padded or non-swizzled shared encoding, "
+        << "TDM operand requires a padded, partitioned padded, or non-swizzled "
+           "shared encoding, "
            "but the view carries "
         << bufEncoding
         << ". Pass `layout=tlx.padded_shared_layout_encoding(...)` to "

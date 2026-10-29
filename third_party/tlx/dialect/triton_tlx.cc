@@ -558,6 +558,13 @@ void init_triton_tlx_ir(py::module_ &m) {
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, std::move(ll)));
            })
+      .def("make_partitioned_shared_encoding_attr",
+           [](TritonOpBuilder &self, unsigned numPartitions, unsigned numGroups,
+              unsigned partitionDim, Attribute partitionLayout) -> Attribute {
+             return ttg::PartitionedSharedEncodingAttr::get(
+                 self.getContext(), numPartitions, numGroups, partitionDim,
+                 cast<ttg::SharedEncodingTrait>(partitionLayout));
+           })
       .def("make_shared_linear_encoding_attr",
            [](TritonOpBuilder &self,
               std::vector<std::vector<int32_t>> offsetBases,

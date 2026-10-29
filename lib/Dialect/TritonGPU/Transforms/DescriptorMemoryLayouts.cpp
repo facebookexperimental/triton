@@ -68,6 +68,26 @@ SharedEncodingTrait updateEncodingForShape(Operation *op,
                                            RankedTensorType tensorType) {
   auto ctx = encoding.getContext();
   auto cgaLayout = getCGALayout(encoding);
+  if (auto partitioned = dyn_cast<PartitionedSharedEncodingAttr>(encoding)) {
+    auto pieceShape = llvm::to_vector(tensorType.getShape());
+    unsigned dim = partitioned.getPartitionDim();
+    unsigned pieces = partitioned.getNumLogicalPieces();
+    if (dim >= pieceShape.size() || pieceShape[dim] % pieces != 0) {
+      constexpr auto msg = "tensor descriptor shape does not fit its shared "
+                           "memory partitions";
+      if (op)
+        op->emitError(msg);
+      llvm::report_fatal_error(msg);
+    }
+    pieceShape[dim] /= pieces;
+    auto pieceType =
+        RankedTensorType::get(pieceShape, tensorType.getElementType());
+    auto pieceEncoding =
+        updateEncodingForShape(op, partitioned.getPartitionLayout(), pieceType);
+    return PartitionedSharedEncodingAttr::get(
+        ctx, partitioned.getNumPartitions(), partitioned.getNumGroups(), dim,
+        pieceEncoding);
+  }
   if (auto nvmmaEnc = dyn_cast<NVMMASharedEncodingAttr>(encoding)) {
     auto existingCga = nvmmaEnc.getCGALayout();
     if (!existingCga)

@@ -544,3 +544,54 @@ module attributes {"ttg.target" = "hip:gfx1260", "ttg.num-ctas" = 1 : i32, "ttg.
     tt.return
   }
 }
+
+// -----
+
+// Reshaping a partitioned view keeps its partitions. Folding a group-major
+// view [G, 2 * r, C] (one group along dim 1) into [G * 2 * r, C] gives G groups
+// along dim 0, and the reverse reshape unfolds them again: both keep pieces
+// p, p + 2, ... contiguous in partition p.
+#piece_rows = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [32, 128]}>
+#piece_groups = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [4, 32, 128]}>
+#part_rows = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 4, partitionDim = 0, partitionLayout = #piece_rows}>
+#part_groups = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #piece_groups}>
+// Splitting a non-partitioned dimension reshapes each piece.
+#piece_half = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 128]}>
+#piece_split = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [128, 2, 64]}>
+#part_half = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #piece_half}>
+#part_split = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #piece_split}>
+// Unpadded pieces become shared-linear layouts.
+#piece_swizzled = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#piece_linear = #ttg.shared_linear<{offset = [[1], [2], [4]], block = []}, alignment = 16>
+#part_swizzled = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #piece_swizzled}>
+#part_linear = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #piece_linear}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: memdesc_reshape_partitioned_fold_groups
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<256x128xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_fold_groups(%d : !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable> -> !ttg.memdesc<256x128xi8, #part_rows, #smem, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: memdesc_reshape_partitioned_unfold_groups
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<4x64x128xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_unfold_groups(%d : !ttg.memdesc<256x128xi8, #part_rows, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<256x128xi8, #part_rows, #smem, mutable> -> !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: memdesc_reshape_partitioned_split_inner
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<256x2x64xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_split_inner(%d : !ttg.memdesc<256x128xi8, #part_half, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<256x128xi8, #part_half, #smem, mutable> -> !ttg.memdesc<256x2x64xi8, #part_split, #smem, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: memdesc_reshape_partitioned_unpadded
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<32xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_unpadded(%d : !ttg.memdesc<4x8xi8, #part_swizzled, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<4x8xi8, #part_swizzled, #smem, mutable> -> !ttg.memdesc<32xi8, #part_linear, #smem, mutable>
+    tt.return
+  }
+}
