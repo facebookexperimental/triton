@@ -333,6 +333,7 @@ def test_flash_attn_varlen_traces_for_export_and_compile():
     torch.testing.assert_close(torch.compile(attend, fullgraph=True)(q, kv, cu_q, cu_k), eager)
 
 
+@pytest.mark.skip(reason="Re-enable when the H100 CI PyTorch wheel includes pytorch#201258 (D125369038).")
 def test_flash_attn_varlen_aoti_package_matches_eager(tmp_path):
     """AOTInductor with the autotune settings production lowering uses; full tiles keep the in-kernel TMA store."""
     torch.manual_seed(20)
@@ -384,6 +385,7 @@ def test_flash_attn_varlen_compiles_with_dynamic_shapes():
     assert counter.frame_count == 1
 
 
+@pytest.mark.skip(reason="Re-enable when the H100 CI PyTorch wheel includes pytorch#202409 (D127915035).")
 def test_flash_attn_varlen_compiles_with_unaligned_base():
     """A compiled launch whose example inputs already sit off a 16-byte boundary; Inductor does not realign them."""
     torch.manual_seed(20)
