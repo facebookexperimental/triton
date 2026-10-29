@@ -181,6 +181,8 @@ FOCUS_SUITES = (
 )
 
 DEFAULT_SUITES = {
+    "sm90": (),
+    "sm100": (),
     "gfx942": ("gfx942_all", ),
     "gfx950": ("gfx950_all", ),
 }
