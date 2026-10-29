@@ -7,6 +7,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton {
@@ -65,6 +66,58 @@ bool padsOnlyGroupLeads(ArrayRef<int64_t> src, ArrayRef<int64_t> dst) {
   return true;
 }
 
+bool combines(ValueRange operands, Value lhs, Value rhs) {
+  return operands.size() == 2 && ((operands[0] == lhs && operands[1] == rhs) ||
+                                  (operands[0] == rhs && operands[1] == lhs));
+}
+
+// The exact identity of a single-op combiner, else null. getNeutralElement
+// gives +0.0 for addf, and for float max/min an inf or NaN that some types
+// lack; for those the largest finite value is exact.
+TypedAttr identityOf(Operation *combiner) {
+  Type type = combiner->getResult(0).getType();
+  Builder b(type.getContext());
+  if (isa<arith::AddFOp>(combiner))
+    return b.getFloatAttr(type, -0.0);
+  bool isNum = isa<arith::MaxNumFOp, arith::MinNumFOp>(combiner);
+  if (isNum || isa<arith::MaximumFOp, arith::MinimumFOp>(combiner)) {
+    const llvm::fltSemantics &sem = cast<FloatType>(type).getFloatSemantics();
+    bool isMax = isa<arith::MaximumFOp, arith::MaxNumFOp>(combiner);
+    if (isNum ? !APFloat::semanticsHasNaN(sem) : !APFloat::semanticsHasInf(sem))
+      return b.getFloatAttr(type, APFloat::getLargest(sem, /*Negative=*/isMax));
+  }
+  return arith::getNeutralElement(combiner).value_or(TypedAttr());
+}
+
+// True if each result is a select, max, min, and or or of its two inputs, so
+// combine(x, x) == x and the last live lane can stand in for the pad lanes.
+bool isIdempotent(Region &combine) {
+  Block &block = combine.front();
+  unsigned n = block.getNumArguments() / 2;
+  for (auto [k, result] :
+       llvm::enumerate(block.getTerminator()->getOperands())) {
+    Operation *def = result.getDefiningOp();
+    if (!def)
+      return false;
+    std::optional<ValueRange> inputs =
+        llvm::TypeSwitch<Operation *, std::optional<ValueRange>>(def)
+            .Case([](arith::SelectOp op) {
+              return std::optional<ValueRange>(op->getOperands().drop_front());
+            })
+            .Case<arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp,
+                  arith::MinimumFOp, arith::MaxSIOp, arith::MinSIOp,
+                  arith::MaxUIOp, arith::MinUIOp, arith::AndIOp, arith::OrIOp>(
+                [](Operation *op) {
+                  return std::optional<ValueRange>(op->getOperands());
+                })
+            .Default(std::optional<ValueRange>());
+    if (!inputs ||
+        !combines(*inputs, block.getArgument(k), block.getArgument(n + k)))
+      return false;
+  }
+  return true;
+}
+
 class Padder {
 public:
   LogicalResult admit(Operation *op);
@@ -73,6 +126,9 @@ public:
 private:
   Value live(Operation *user, RankedTensorType orig);
   template <typename OpT> void andLive(OpT op, RankedTensorType orig);
+  void fill(OpOperand &operand, RankedTensorType orig, TypedAttr value);
+  void padLanes(Operation *op, RankedTensorType orig, unsigned axis,
+                ArrayRef<TypedAttr> identities);
 
   SmallVector<std::function<void()>> fixups;
   DenseMap<std::pair<Region *, Type>, Value> liveCache;
@@ -118,6 +174,58 @@ template <typename OpT> void Padder::andLive(OpT op, RankedTensorType orig) {
     mask = arith::AndIOp::create(b, op.getLoc(), old, mask);
   }
   op.getMaskMutable().assign(mask);
+}
+
+// Pad lanes of `operand` take `value`.
+void Padder::fill(OpOperand &operand, RankedTensorType orig, TypedAttr value) {
+  Operation *op = operand.getOwner();
+  OpBuilder b(op);
+  auto type = cast<RankedTensorType>(operand.get().getType());
+  Value pad = arith::ConstantOp::create(b, op->getLoc(),
+                                        DenseElementsAttr::get(type, value));
+  operand.set(arith::SelectOp::create(b, op->getLoc(), live(op, orig),
+                                      operand.get(), pad));
+}
+
+// Pad lanes of each source take its identity, or else (no identities) a copy
+// of the last live lane along `axis`.
+void Padder::padLanes(Operation *op, RankedTensorType orig, unsigned axis,
+                      ArrayRef<TypedAttr> identities) {
+  for (OpOperand &src : op->getOpOperands()) {
+    if (!identities.empty()) {
+      fill(src, orig, identities[src.getOperandNumber()]);
+      continue;
+    }
+    OpBuilder b(op);
+    auto type = cast<RankedTensorType>(src.get().getType());
+    Value last = arith::ConstantOp::create(
+        b, op->getLoc(),
+        DenseElementsAttr::get(type.clone(b.getI32Type()),
+                               b.getI32IntegerAttr(orig.getDimSize(axis) - 1)));
+    Value copy = GatherOp::create(b, op->getLoc(), src.get(), last, axis);
+    src.set(arith::SelectOp::create(b, op->getLoc(), live(op, orig), src.get(),
+                                    copy));
+  }
+}
+
+// A result that combines only its own pair of block args (k and n+k) is
+// independent of the others, so each source pads with its own identity. Empty
+// unless every result has one.
+SmallVector<TypedAttr> identitiesOf(Region &combine) {
+  Block &block = combine.front();
+  unsigned n = block.getNumArguments() / 2;
+  SmallVector<TypedAttr> identities;
+  for (auto [k, result] :
+       llvm::enumerate(block.getTerminator()->getOperands())) {
+    Operation *def = result.getDefiningOp();
+    if (!def || !combines(def->getOperands(), block.getArgument(k),
+                          block.getArgument(n + k)))
+      return {};
+    identities.push_back(identityOf(def));
+    if (!identities.back())
+      return {};
+  }
+  return identities;
 }
 
 // Padding moves an element unless each NPOT dim leads its group, so each live
@@ -246,6 +354,74 @@ LogicalResult Padder::admit(Operation *op) {
       fixups.push_back([reshape, src, dst] { relayout(reshape, src, dst); });
     else if (reshape.getAllowReorder())
       fixups.push_back([reshape]() mutable { reshape.setAllowReorder(false); });
+    return success();
+  }
+  // A forward scan needs no pad value, since pad lanes come last.
+  auto reduce = dyn_cast<ReduceOp>(op);
+  auto scan = dyn_cast<ScanOp>(op);
+  if (reduce || scan) {
+    auto orig = cast<RankedTensorType>(op->getOperand(0).getType());
+    unsigned axis = reduce ? reduce.getAxis() : scan.getAxis();
+    if (llvm::isPowerOf2_64(orig.getDimSize(axis)) ||
+        (scan && !scan.getReverse()))
+      return success();
+    SmallVector<TypedAttr> identities = identitiesOf(op->getRegion(0));
+    if (identities.empty() && !isIdempotent(op->getRegion(0)))
+      return op->emitOpError(
+          "over an NPOT axis with a combiner that has no pad value is "
+          "unsupported");
+    fixups.push_back([this, op, orig, axis, identities] {
+      padLanes(op, orig, axis, identities);
+    });
+    return success();
+  }
+  if (auto hist = dyn_cast<HistogramOp>(op)) {
+    auto type = cast<RankedTensorType>(hist.getSrc().getType());
+    if (isNpot(type.getShape()))
+      fixups.push_back([this, hist, type] { andLive(hist, type); });
+    return success();
+  }
+  // Pad lanes gather index 0, never past the source.
+  if (auto gather = dyn_cast<GatherOp>(op)) {
+    RankedTensorType type = gather.getIndices().getType();
+    if (isNpot(type.getShape()))
+      fixups.push_back([this, gather, type]() mutable {
+        fill(gather.getIndicesMutable(), type,
+             Builder(gather.getContext()).getZeroAttr(type.getElementType()));
+      });
+    return success();
+  }
+  if (auto rmw = dyn_cast<AtomicRMWOp>(op)) {
+    auto type = cast<RankedTensorType>(rmw.getPtr().getType());
+    fixups.push_back([this, rmw, type] { andLive(rmw, type); });
+    return success();
+  }
+  // A padded K is zero-filled on both operands and a scale pad is 1. A padded
+  // M or N only adds rows and columns that the store masks.
+  if (isa<DotOp, DotScaledOp>(op)) {
+    auto a = cast<RankedTensorType>(op->getOperand(0).getType());
+    if (!isNpot(a.getShape().take_back()))
+      return success();
+    SmallVector<std::pair<OpOperand *, bool>> operands = {
+        {&op->getOpOperand(0), false}, {&op->getOpOperand(1), false}};
+    if (auto scaled = dyn_cast<DotScaledOp>(op))
+      for (MutableOperandRange scale :
+           {scaled.getAScaleMutable(), scaled.getBScaleMutable()})
+        if (!scale.empty())
+          operands.push_back({&scale[0], true});
+    Builder b(op->getContext());
+    for (auto [operand, isScale] : operands) {
+      auto orig = cast<RankedTensorType>(operand->get().getType());
+      Type elem = orig.getElementType();
+      TypedAttr value = b.getZeroAttr(elem);
+      // Integer scale 127 is 1.0 as E8M0 (bias 127), a finite 1.875 as UE5M3.
+      if (isScale && isa<FloatType>(elem))
+        value = b.getFloatAttr(elem, 1.0);
+      else if (isScale)
+        value = b.getIntegerAttr(elem, 127);
+      fixups.push_back(
+          [this, operand, orig, value] { fill(*operand, orig, value); });
+    }
     return success();
   }
   return op->emitOpError("on an NPOT tensor is unsupported");
