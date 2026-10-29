@@ -588,7 +588,7 @@ void init_gluon_ir(py::module_ &m) {
              auto cgaLayout = buildCgaLayoutAttr(ctx, cgaBases, rank);
              return self.getChecked<ttg::NVMMASharedEncodingAttr>(
                  ctx, swizzleByteWidth, transposed, elementBitwidth, fp4Padded,
-                 cgaLayout);
+                 cgaLayout, /*fp6Padded=*/false);
            })
       .def("get_auto_layout",
            [](GluonOpBuilder &self) -> Attribute {
