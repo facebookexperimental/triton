@@ -615,34 +615,41 @@ void init_triton_tlx_ir(py::module_ &m) {
                      ttng::TensorMemoryScalesBlockRepOrder::MN_THEN_K,
                      static_cast<ttng::TensorMemoryCTAMode>(ctaMode)));
            })
-      .def("make_nv_mma_shared_encoding_attr",
-           [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              std::vector<unsigned> order, Type &elemType,
-              std::vector<unsigned> CTAsPerCGA,
-              std::vector<unsigned> CTASplitNum, std::vector<unsigned> CTAOrder,
-              bool fp4Padded, bool swizzled) {
-             /* Validation logic for user defined layout encoding begin */
-             assert(shape.size() == order.size());
-             assert(order.size() == CTAsPerCGA.size());
-             assert(CTAsPerCGA.size() == CTASplitNum.size());
-             assert(CTASplitNum.size() == CTAOrder.size());
-             /* Validation logic for user defined layout encoding end */
+      .def(
+          "make_nv_mma_shared_encoding_attr",
+          [](TritonOpBuilder &self, std::vector<int64_t> shape,
+             std::vector<unsigned> order, Type &elemType,
+             std::vector<unsigned> CTAsPerCGA,
+             std::vector<unsigned> CTASplitNum, std::vector<unsigned> CTAOrder,
+             bool fp4Padded, bool swizzled, bool fp6Padded) {
+            /* Validation logic for user defined layout encoding begin */
+            assert(shape.size() == order.size());
+            assert(order.size() == CTAsPerCGA.size());
+            assert(CTAsPerCGA.size() == CTASplitNum.size());
+            assert(CTASplitNum.size() == CTAOrder.size());
+            /* Validation logic for user defined layout encoding end */
 
-             auto context = self.getBuilder().getContext();
-             auto CTALayout =
-                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
-             if (swizzled) {
-               return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
-                   context, shape, order, CTALayout, elemType, fp4Padded));
-             } else {
-               // For 1D tensors, transposed is meaningless — set to false so
-               // that isTMACompatibleEncoding accepts the encoding.
-               bool transposed = order.size() > 1 ? (order[0] == 0) : false;
-               return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
-                   context, /*swizzlingByteWidth=*/0, transposed,
-                   elemType.getIntOrFloatBitWidth(), fp4Padded, CTALayout));
-             }
-           })
+            auto context = self.getBuilder().getContext();
+            auto CTALayout =
+                makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
+            if (swizzled) {
+              return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
+                  context, shape, order, CTALayout, elemType, fp4Padded,
+                  fp6Padded));
+            } else {
+              // For 1D tensors, transposed is meaningless — set to false so
+              // that isTMACompatibleEncoding accepts the encoding.
+              bool transposed = order.size() > 1 ? (order[0] == 0) : false;
+              return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
+                  context, /*swizzlingByteWidth=*/0, transposed,
+                  elemType.getIntOrFloatBitWidth(), fp4Padded, CTALayout,
+                  fp6Padded));
+            }
+          },
+          py::arg("shape"), py::arg("order"), py::arg("elemType"),
+          py::arg("CTAsPerCGA"), py::arg("CTASplitNum"), py::arg("CTAOrder"),
+          py::arg("fp4Padded"), py::arg("swizzled"),
+          py::arg("fp6Padded") = false)
       .def("make_nv_mma_tiled_shared_linear_encoding_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> atomShape,
               std::vector<unsigned> order, Type &elemType,

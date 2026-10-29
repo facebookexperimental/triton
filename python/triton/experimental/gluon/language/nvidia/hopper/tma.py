@@ -48,11 +48,14 @@ class _tensor_descriptor_type_base(base_type):
 
     @property
     def nbytes_per_cta(self) -> int:
+        nbytes = self.block_type.nbytes
+        if self.layout.fp6_padded:
+            nbytes = nbytes * 3 // 4
         cga_layout = self.layout.cga_layout
         if len(cga_layout) == 0:
-            return self.block_type.nbytes
+            return nbytes
         num_cta_splits = 2**sum(any(x != 0 for x in basis) for basis in cga_layout)
-        return self.block_type.nbytes // num_cta_splits
+        return nbytes // num_cta_splits
 
     def _to_ir(self, builder: ir.builder) -> ir.type:
         raise NotImplementedError
@@ -168,6 +171,8 @@ def _emit_alignment_check(desc, coord, fn_name: str, arg_name: str, _semantic=No
     align_bytes = 16
     if desc.layout.fp4_padded:
         align_bytes = 64
+    elif desc.layout.fp6_padded:
+        align_bytes = 128
     dtype = desc.dtype
     assert dtype.primitive_bitwidth % 8 == 0, f"unexpected sub-byte dtype {dtype}"
     elem_bytes = dtype.primitive_bitwidth // 8
@@ -180,9 +185,11 @@ def _emit_alignment_check(desc, coord, fn_name: str, arg_name: str, _semantic=No
     rem = coord.__mod__(align_val, _semantic=_semantic)
     is_zero = rem.__eq__(zero, _semantic=_semantic)
 
-    fp4_padded = "with fp4_padded=True " if desc.layout.fp4_padded else ""
+    padding = "with fp4_padded=True " if desc.layout.fp4_padded else ""
+    if desc.layout.fp6_padded:
+        padding = "with fp6_padded=True "
     ttgl.device_assert(
-        is_zero, f"{fn_name} {fp4_padded}{arg_name} must be {align_bytes}-byte aligned, "
+        is_zero, f"{fn_name} {padding}{arg_name} must be {align_bytes}-byte aligned, "
         f"i.e. a multiple of {align} for dtype={dtype.codegen_name()}", _semantic=_semantic)
 
 
