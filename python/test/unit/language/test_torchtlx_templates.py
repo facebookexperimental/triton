@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 import contextlib
+import functools
 import inspect
 import unittest
 from unittest import mock
@@ -2589,6 +2590,40 @@ class TestHopperMMTemplate(TestCase):
         self.assertIn(_HOPPER_WS, generated)
         self.assertIn("tl.trans(acc)", generated)
 
+    @parametrize("template,marker,k", (
+        # Past the few-tile small-K range (K <= 1024), so the WS heuristic keeps it.
+        ("tlx_hopper_gemm_ws", _HOPPER_WS, 1096),
+        # The WS heuristic leaves a few-K-step shape to the small-K template.
+        ("tlx_hopper_gemm_small_k", _HOPPER_SMALL_K, 256),
+    ))
+    @parametrize("op", ("mm", "addmm"))
+    def test_dynamic_m(self, template, marker, k, op):
+        """A dynamic M leaves A's TMA descriptor with a symbolic shape. A launcher
+        that reads dynamic sizes at launch builds it on the host; otherwise it is
+        built on the device. B's, all static, stays on the host either way. A
+        second M reuses the compiled kernel and must not reuse A's descriptor."""
+        from torch._inductor.runtime import triton_heuristics
+
+        bias = torch.randn(256, device=GPU_TYPE, dtype=torch.float16)
+        fn = torch.mm if op == "mm" else functools.partial(torch.addmm, bias)
+        with config.patch({**_HOPPER_ADDMM_PATCH, "test_configs.autotune_choice_name_regex": template}):
+            compiled = torch.compile(fn)
+            for m in (706, 300):
+                a, b = _operands((m, 256, k), "nt", torch.float16)
+                torch._dynamo.mark_dynamic(a, 0)
+                expected = (a.float() @ b.float() + (bias.float() if op == "addmm" else 0)).half()
+                actual, code = run_and_get_code(compiled, a, b)
+                torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+                if m == 706:
+                    generated = "\n".join(code)
+        self.assertIn(marker, generated)
+        self.assertNotIn("desc_b = tl.make_tensor_descriptor(", generated)
+        if getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False):
+            self.assertNotIn("tl.make_tensor_descriptor(base=arg_A", generated)
+            self.assertRegex(generated, r"'arg_A': \{'block_shape': \[[0-9, ]+\], 'shape': \['ks0'")
+        else:
+            self.assertIn("desc_a = tl.make_tensor_descriptor(", generated)
+
     @parametrize("block_n", (192, 96))
     @parametrize("bias_shape", ("n", "mn"))
     def test_addmm_npot_tile(self, block_n, bias_shape):
@@ -3032,6 +3067,22 @@ class TestSplitK(TestCase):
 
 class TestReduceKKernel(TestCase):
     """Direct unit tests for the split-K reduction kernel."""
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(not torch.cuda.is_available() or torch.version.hip is not None, "Need a CUDA GPU")
+    def test_reduce_k_cost_excludes_benchmark_floor(self):
+        """The split-K reducer charge is its warm kernel time. Timed with Inductor's
+        benchmarker it also carried that benchmarker's per-sample floor, which the
+        candidate's own timing already includes: 5.6 us charged for a 1.2 us kernel."""
+        from torch._inductor.runtime.benchmarking import benchmarker
+        from triton.language.extra.tlx.inductor import reduce_k
+
+        reduce_k._reduce_k_cost_cache.clear()
+        cost = reduce_k.reduce_k_cost_ms(20, 2048, 2, torch.float16, True)
+        x = torch.empty(1, device=GPU_TYPE)
+        floor = benchmarker.benchmark_gpu(x.zero_)
+        self.assertGreater(cost, 0)
+        self.assertLess(cost, floor)
 
     def test_aoti_reduce_k_emission(self):
         from torch._inductor.virtualized import V

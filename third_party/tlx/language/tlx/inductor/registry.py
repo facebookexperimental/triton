@@ -829,6 +829,26 @@ def _candidate_scorer_evaluate(
     return best_config
 
 
+def _host_tma_operands(kernel_inputs) -> dict[str, bool]:
+    """Which of A's and B's TMA descriptors the launcher builds on the host.
+
+    A device-built descriptor costs every CTA a descriptor write and fence before
+    its first load. The Python launcher builds host descriptors from integer dims
+    and, where it supports it, from dynamic sizes the kernel takes as args (A's M
+    under a dynamic batch), read at launch. Any other operand is passed as a
+    plain pointer and its descriptor is built on the device.
+    """
+    from torch._inductor.runtime import triton_heuristics
+
+    launch_dims = getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False) and not V.graph.cpp_wrapper
+    dim_types = (int, sympy.Integer, sympy.Symbol) if launch_dims else (int, sympy.Integer)
+    a_host, b_host = (
+        all(isinstance(dim, dim_types) for dim in (*mat.get_size(), *mat.get_stride()))
+        for mat in kernel_inputs.mat1mat2()
+    )
+    return {"HOST_SIDE_TMA": a_host or b_host, "HOST_TMA_A": a_host, "HOST_TMA_B": b_host}
+
+
 @register_template_heuristic(
     hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="mm"
 )
@@ -882,6 +902,7 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
                 configs = [conf for conf in configs if conf.kwargs["SPLIT_K"] == 1]
             else:
                 configs = [self._whole_k(sm90, conf) for conf in configs]
+        host_tma = _host_tma_operands(kernel_inputs)
         # Non-power-of-two tiles run only as two equal-subtile pieces (192, 96).
         configs = [
             conf for conf in configs
@@ -914,7 +935,7 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
                 "TMA_EPILOGUE_STORE": int(n % 8 == 0 and split_k == 1),
                 # A and B descriptors built on the host, as tlx.ops.mm does,
                 # rather than by every CTA before its first load.
-                "HOST_SIDE_TMA": True,
+                **host_tma,
                 "num_stages": conf.num_stages,
                 "num_warps": conf.num_warps,
                 "ACC_TYPE": "tl.float32",
@@ -959,6 +980,7 @@ class HopperGemmSmallKConfigHeuristic(HopperGemmWSConfigHeuristic):
                 return
             configs = sm90._small_k_heuristic_config(m, n, k)
         strides = kernel_inputs.strides_hinted()
+        host_tma = _host_tma_operands(kernel_inputs)
         for conf in configs:
             meta = conf.kwargs
             if meta["SPLIT_K"] > 1:
@@ -970,7 +992,7 @@ class HopperGemmSmallKConfigHeuristic(HopperGemmWSConfigHeuristic):
                 "GROUP_SIZE_M": meta["GROUP_SIZE_M"],
                 "A_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1,
                 "B_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1,
-                "HOST_SIDE_TMA": True,
+                **host_tma,
                 "num_stages": conf.num_stages,
                 "num_warps": conf.num_warps,
                 "ACC_TYPE": "tl.float32",
