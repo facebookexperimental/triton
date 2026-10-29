@@ -188,14 +188,28 @@ def test_npot_reshape(M, N):
 
 @requires_gpu
 @requires_npot
+@pytest.mark.parametrize("M, N", [(3, 32), (4, 32)])
+def test_npot_sum_axis_none(M, N):
+    """axis=None flattens with an allow_reorder reshape, which pads as an ordered
+    one. The +1 makes loaded pad lanes nonzero. (4, 32) is the pow2 control."""
+
+    @triton.jit
+    def kernel(X, Out, M: tl.constexpr, N: tl.constexpr):
+        idx = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+        tl.store(Out, tl.sum(tl.load(X + idx) + 1))
+
+    torch.manual_seed(0)
+    x = torch.randint(-50, 50, (M, N), device="cuda", dtype=torch.int32)
+    out = torch.empty(1, device="cuda", dtype=torch.int32)
+    kernel[(1, )](x, out, M=M, N=N)
+    assert out.item() == (x + 1).sum().item(), f"M={M},N={N}"
+
+
+@requires_gpu
+@requires_npot
 @pytest.mark.parametrize("M, N", [(16, 48), (33, 48)])
-@pytest.mark.xfail(
-    reason="NPOT axis-reduction lowering (ReduceOpToLLVM) "
-    "not yet implemented; separate from the convert guards.", strict=False)
 def test_npot_sum_axis1(M, N):
-    """Per-axis reduction over a modular 2D layout. Documents the still-open
-    NPOT reduce-lowering gap (weighted sum is permutation-sensitive). xfail:
-    tracked separately from the convert guards."""
+    """A sum over an NPOT axis: pad lanes hold the identity, -0.0."""
 
     @triton.jit
     def kernel(X, W, Out, M: tl.constexpr, N: tl.constexpr):
@@ -211,3 +225,151 @@ def test_npot_sum_axis1(M, N):
     kernel[(1, )](x, w, out, M=M, N=N)
     ref = (x * w).sum(dim=1)
     assert _rel_err(out, ref) < 1e-3, f"wsum M={M},N={N}"
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N", [96, 128])
+def test_npot_reduce_two_sums(N):
+    """Two sums in one reduce pad each input with its own identity. The +1 makes
+    loaded pad lanes nonzero. N=128 is the pow2 control."""
+
+    @triton.jit
+    def _sum2(a0, a1, b0, b1):
+        return a0 + b0, a1 + b1
+
+    @triton.jit
+    def kernel(X, Y, Out, N: tl.constexpr):
+        i = tl.arange(0, N)
+        s, t = tl.reduce((tl.load(X + i) + 1, tl.load(Y + i) + 1), 0, _sum2)
+        tl.store(Out, s)
+        tl.store(Out + 1, t)
+
+    torch.manual_seed(0)
+    x, y = torch.randint(-50, 50, (2, N), device="cuda", dtype=torch.int32)
+    out = torch.empty(2, device="cuda", dtype=torch.int32)
+    kernel[(1, )](x, y, out, N=N)
+    assert out.tolist() == [(x + 1).sum().item(), (y + 1).sum().item()], f"N={N}"
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N", [96, 128])
+@pytest.mark.parametrize("op", ["argmax", "argmin"])
+def test_npot_argmax_nan(op, N):
+    """argmax/argmin pad value and index with a copy of the last live lane, as
+    every live value loses to a pad 0. With a NaN the result depends on the
+    reduction tree even at pow2, so only its range is checked."""
+
+    @triton.jit
+    def kernel(X, Out, N: tl.constexpr, MAX: tl.constexpr):
+        x = tl.load(X + tl.arange(0, N))
+        tl.store(Out, tl.argmax(x, 0) if MAX else tl.argmin(x, 0))
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn(N, device="cuda", generator=g).abs() + 1
+    x = -x if op == "argmax" else x
+    out = torch.empty(2, device="cuda", dtype=torch.int32)
+    kernel[(1, )](x, out, N=N, MAX=op == "argmax")
+    ref = getattr(torch, op)(x).item()
+    x[37] = float("nan")
+    kernel[(1, )](x, out[1:], N=N, MAX=op == "argmax")
+    idx, nan_idx = out.tolist()
+    assert idx == ref and 0 <= nan_idx < N, f"{op} N={N}: {idx} vs {ref}, NaN {nan_idx}"
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N", [96, 128])
+@pytest.mark.parametrize("op", ["sum", "max"])
+def test_npot_reverse_scan(op, N):
+    """A reverse scan reads the pad lanes first: a sum pads with 0, a max with
+    INT_MIN. The +1 makes loaded pad lanes nonzero, and x[N-1] is the smallest
+    value, so a pad above x[N-1] would win the last max."""
+
+    @triton.jit
+    def _max(a, b):
+        return tl.maximum(a, b)
+
+    @triton.jit
+    def kernel(X, Out, N: tl.constexpr, SUM: tl.constexpr):
+        i = tl.arange(0, N)
+        x = tl.load(X + i) + 1
+        if SUM:
+            y = tl.cumsum(x, 0, reverse=True)
+        else:
+            y = tl.associative_scan(x, 0, _max, reverse=True)
+        tl.store(Out + i, y)
+
+    torch.manual_seed(0)
+    x = torch.randint(-50, 50, (N, ), device="cuda", dtype=torch.int32)
+    x[-1] = -100
+    out = torch.empty_like(x)
+    kernel[(1, )](x, out, N=N, SUM=op == "sum")
+    flip = (x + 1).flip(0)
+    ref = (flip.cumsum(0) if op == "sum" else flip.cummax(0).values).flip(0).to(torch.int32)
+    assert torch.equal(out, ref), f"{op} N={N}"
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N", [96, 128])
+def test_npot_histogram(N):
+    """Pad lanes load 0, a bin-0 canary; the live mask keeps them uncounted."""
+
+    @triton.jit
+    def kernel(X, Out, N: tl.constexpr, B: tl.constexpr):
+        tl.store(Out + tl.arange(0, B), tl.histogram(tl.load(X + tl.arange(0, N)), B))
+
+    x = torch.randint(1, 16, (N, ), device="cuda", dtype=torch.int32)
+    out = torch.empty(16, device="cuda", dtype=torch.int32)
+    kernel[(1, )](x, out, N=N, B=16)
+    assert torch.equal(out, torch.bincount(x, minlength=16).to(torch.int32))
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N", [96, 128])
+def test_npot_gather(N):
+    """Reverse a vector with tl.gather; idx = N-1-i is negative in the pad lanes,
+    which gather index 0 instead."""
+
+    @triton.jit
+    def kernel(X, Out, N: tl.constexpr):
+        i = tl.arange(0, N)
+        tl.store(Out + i, tl.gather(tl.load(X + i), N - 1 - i, 0))
+
+    x = torch.full((128, ), float("nan"), device="cuda")
+    x[:N] = torch.randn(N, device="cuda")
+    out = torch.full((128, ), -1.0, device="cuda")
+    kernel[(1, )](x, out, N=N)
+    assert torch.equal(out[:N], x[:N].flip(0)) and bool((out[N:] == -1.0).all())
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N", [96, 128])
+def test_npot_atomics(N):
+    """atomic_add masks the pad lanes, so the canary past N is untouched;
+    atomic_cas has no mask and fails to compile with an error at N=96."""
+
+    @triton.jit
+    def add(Z, N: tl.constexpr):
+        tl.atomic_add(Z + tl.arange(0, N), 1.0)
+
+    @triton.jit
+    def cas(Z, N: tl.constexpr):
+        i = tl.arange(0, N)
+        tl.atomic_cas(Z + i, i, i + 1)
+
+    z = torch.zeros(128, device="cuda")
+    z[N:] = -1.0
+    add[(1, )](z, N=N)
+    assert bool((z[:N] == 1.0).all()) and bool((z[N:] == -1.0).all())
+    c = torch.arange(N, device="cuda", dtype=torch.int32)
+    if N == 96:
+        with pytest.raises(RuntimeError, match="'tt.atomic_cas' op on an NPOT tensor is unsupported"):
+            cas[(1, )](c, N=N)
+    else:
+        cas[(1, )](c, N=N)
+        assert torch.equal(c, torch.arange(1, N + 1, device="cuda", dtype=torch.int32))
