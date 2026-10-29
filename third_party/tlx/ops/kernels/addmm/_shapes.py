@@ -27,6 +27,29 @@ SYNTHETIC: tuple[AddMMShape, ...] = (
 # PERF: The odd-K fallback stays synthetic-only until it is competitive.
 FOCUS_SUITES = (
     FocusSuite(
+        name="sm90_representative",
+        op="addmm",
+        shapes=(
+            AddMMShape(2176, 2176, 2176, (2176, 1), (2176, 1), (1, ), "fp16"),
+            AddMMShape(2176, 2176, 2176, (2176, 1), (2176, 1), (1, ), "bf16"),
+            AddMMShape(7, 4096, 4096, (4096, 1), (1, 4096), (1, ), "fp16"),
+            AddMMShape(706, 8192, 2560, (2560, 1), (1, 2560), (1, ), "fp16"),
+            AddMMShape(706, 2560, 20992, (20992, 1), (1, 20992), (1, ), "fp16"),
+            AddMMShape(706, 8192, 2560, (2560, 1), (1, 2560), (8192, 1), "fp16"),
+        ),
+    ),
+    FocusSuite(
+        name="sm100_representative",
+        op="addmm",
+        shapes=(
+            AddMMShape(2304, 12800, 32768, (32768, 1), (12800, 1), (1, ), "bf16"),
+            AddMMShape(800, 1056, 589824, (589824, 1), (1056, 1), (1, ), "bf16"),
+            AddMMShape(589824, 2048, 512, (512, 1), (2048, 1), (1, ), "bf16"),
+            AddMMShape(2304, 65536, 1024, (1024, 1), (65536, 1), (1, ), "bf16"),
+            AddMMShape(2304, 12800, 32768, (32768, 1), (12800, 1), (12800, 1), "bf16"),
+        ),
+    ),
+    FocusSuite(
         name="gfx942_1",
         op="addmm",
         shapes=(
@@ -181,6 +204,8 @@ FOCUS_SUITES = (
 )
 
 DEFAULT_SUITES = {
+    "sm90": ("sm90_representative", ),
+    "sm100": ("sm100_representative", ),
     "gfx942": ("gfx942_all", ),
     "gfx950": ("gfx950_all", ),
 }
