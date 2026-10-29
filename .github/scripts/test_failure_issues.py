@@ -185,6 +185,21 @@ def reconcile(api, failures, run_id=150):
     return fi.reconcile(api, REPO, PREFIX, LABELS, json.dumps(failures), RUN + str(run_id), run_id)
 
 
+def test_only_a_newer_result_for_this_issue_supersedes_a_failure():
+    api = FakeApi([issue(7, state="open")])
+    assert fi.reconcile(api, REPO, "[nightly] W / other / ", LABELS, "[]", RUN + "201", 201) == []
+    assert api.writes == []
+    assert decide(api, run_id=200) == "file"
+    assert reconcile(api, [], run_id=201) == [7]
+    fields = next(fields for method, path, fields in api.writes if method == "PATCH")
+    closed = dict(issue(7), **fields)
+    assert fi.summary_of(closed["body"]) == fi.summary_of(body())
+    assert f"| Run | {RUN}100 |" in closed["body"]
+    assert decide(FakeApi([closed]), run_id=200) == "skip"
+    assert decide(FakeApi([closed]), "RuntimeError: a different error", run_id=200) == "skip"
+    assert decide(FakeApi([closed]), run_id=202) == 7
+
+
 def test_reconcile_closes_recovered_issues_of_this_job_only():
     api = FakeApi([
         issue(1, state="open", title=PREFIX + "t::gone"),
@@ -192,7 +207,8 @@ def test_reconcile_closes_recovered_issues_of_this_job_only():
         issue(3, state="open", title="[nightly] W / other / t::gone"),
     ])
     assert reconcile(api, [{"issue_title": PREFIX + "t::still"}]) == [1]
-    assert ("PATCH", f"repos/{REPO}/issues/1", {"state": "closed", "state_reason": "completed"}) in api.writes
+    fields = next(fields for method, path, fields in api.writes if method == "PATCH")
+    assert fields["state"] == "closed" and fields["state_reason"] == "completed"
 
 
 def test_reconcile_leaves_flaky_issues_open():
