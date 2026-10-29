@@ -318,8 +318,18 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
                                                BLOCK_N)
             tok_k = tlx.async_load(kp + tl.minimum(blk + 2, last) * k_step, tlx.local_view(k_buf, cur))
             tlx.async_load_commit_group([tok_k])
-            s, acc1, acc2, acc3 = _mfma_stage_part1(q2, q3, p, s, v1, tlx.local_view(k_buf, nxt), tlx.local_view(v_buf, cur),
-                                                    acc1, acc2, acc3)
+            s, acc1, acc2, acc3 = _mfma_stage_part1(
+                q2,
+                q3,
+                p,
+                s,
+                v1,
+                tlx.local_view(k_buf, nxt),
+                tlx.local_view(v_buf, cur),
+                acc1,
+                acc2,
+                acc3,
+            )
             m_i, l_i, p, acc0, acc1, acc2, acc3 = _softmax(s, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
                                                            Q.dtype.element_ty)
         tlx.async_load_wait_group(0)
