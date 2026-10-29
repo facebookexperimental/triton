@@ -250,6 +250,11 @@ def main():
         help="Stable bucket id for the fallback item emitted when --failed is set.",
     )
     parser.add_argument(
+        "--tests-did-not-run",
+        action="store_true",
+        help="The job failed before its test steps ran, so its items are external-dependency failures.",
+    )
+    parser.add_argument(
         "--budget",
         action="append",
         default=[],
@@ -274,6 +279,9 @@ def main():
     # Appended after the fallback guards: a slow-step item must not suppress the
     # job-level fallback that a genuine failure needs.
     items += build_slow_items([parse_budget(b) for b in args.budget], args.slow_threshold, args.workflow, args.job)
+    if args.tests_did_not_run:
+        for item in items:
+            item.update(external_dep=True, external_dep_reason="test steps did not run")
     payload = json.dumps(items)
 
     # TODO(scuba): in a follow-up, also emit a metrics row per failure

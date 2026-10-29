@@ -14,8 +14,9 @@
 
   failure_issues.py group --prefix P --labels a,b --sha SHA --run-url U
       Group this job's issues under one parent per commit where failures were first seen, assigned to that
-      commit's author. Issues this run filed join the parent for SHA; issues already open keep their parent. A
-      parent reopens when one of its issues reopens, and closes when only flaky issues are left open.
+      commit's author. Issues this run filed join the parent for SHA, except external-dependency failures, which
+      no commit caused; issues already open keep their parent. A parent reopens when one of its issues reopens,
+      and closes when only flaky issues are left open.
 
 GITHUB_REPOSITORY, GITHUB_RUN_ID and GITHUB_REF_NAME come from the Actions environment.
 """
@@ -164,6 +165,11 @@ def first_seen_sha(body):
     return m[1] if m else ""
 
 
+def external_dep(body):
+    """Whether the report classified the failure as an external dependency, not a code change."""
+    return re.search(r"^external_dep=true$", body or "", re.M) is not None
+
+
 def find_or_create_parent(api, repo, sha, job, branch, run_url, open_parents):
     """The parent for failures first seen at sha, with job in its title, reopened if a passing run closed it. A new
     parent is assigned to the author of the commit's PR. Parents are found by a marker in the body, since their
@@ -214,7 +220,12 @@ def group(api, repo, prefix, labels, sha, branch, run_url):
                        paginate=True) if i["title"].startswith(prefix) and "pull_request" not in i
     ]
     open_parents = api("GET", f"repos/{repo}/issues?state=open&labels={PARENT}&per_page=100", paginate=True)
-    new = [i for i in issues if not i.get("parent_issue_url") and first_seen_sha(i["body"]) == sha]
+    # An external-dependency failure (busy GPU, network, a job that failed before its tests ran) says nothing
+    # about the commit, so it is filed but never blamed on one.
+    new = [
+        i for i in issues
+        if not i.get("parent_issue_url") and first_seen_sha(i["body"]) == sha and not external_dep(i["body"])
+    ]
     if new:
         parent = find_or_create_parent(api, repo, sha, prefix.split(" / ")[1], branch, run_url, open_parents)
         for i in new:

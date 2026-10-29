@@ -220,6 +220,7 @@ jobs:
               "<!-- bisect-meta",
               "good_sha=" + goodSha,
               "bad_sha=" + sha,
+              "external_dep=" + externalDep,
               "platform=" + platform,
               "normalized_id=" + normalizedId,
               "repro=" + repro,
