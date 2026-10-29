@@ -297,8 +297,19 @@ static std::pair<unsigned, unsigned>
 kBaseForWmmaScale(Type aElemType, Type bElemType, unsigned mDim, unsigned nDim,
                   unsigned kDim) {
   constexpr unsigned warpSize = 32;
-  unsigned packedKA = llvm::isa<Float4E2M1FNType>(aElemType) ? kDim / 2 : kDim;
-  unsigned packedKB = llvm::isa<Float4E2M1FNType>(bElemType) ? kDim / 2 : kDim;
+  auto packedK = [](Type elemType, unsigned kDim) {
+    if (llvm::isa<Float4E2M1FNType>(elemType))
+      return kDim / 2;
+    if (llvm::isa<Float6E2M3FNType, Float6E3M2FNType>(elemType)) {
+      // fp6 packs groups of 16 values per 12 bytes; the x3/4 byte
+      // conversion steps within a group by 4 values.
+      assert(kDim % 4 == 0);
+      return kDim * 3 / 4;
+    }
+    return kDim;
+  };
+  unsigned packedKA = packedK(aElemType, kDim);
+  unsigned packedKB = packedK(bElemType, kDim);
   unsigned depthA = warpSize / mDim;
   unsigned depthB = warpSize / nDim;
   return {packedKA / depthA, packedKB / depthB};
