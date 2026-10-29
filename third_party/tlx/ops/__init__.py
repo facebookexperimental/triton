@@ -401,7 +401,7 @@ def _check_grouped_gemm_mxfp8_out(out, tensors, *, GM, N, device):
         raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 out must not overlap any input")
 
 
-def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout="natural", space=None):
+def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, sf_layout="natural", space=None):
     """Run a forward-only SM100 or gfx950 grouped GEMM over pre-quantized MXFP8 inputs.
 
     ``x`` is contiguous ``[GM, K]`` and ``w`` is contiguous ``[G, N, K]``
@@ -412,7 +412,7 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
     ``split_sizes`` stays on device: the kernel validates that values are
     nonnegative, every prefix is 128-aligned, and the final sum is ``GM``.
     The BF16 result has shape ``[GM, N]``; a supplied ``out`` is returned by
-    identity. ``num_sms`` defaults to all SMs (CUs on AMD) on ``x.device``.
+    identity.
     ``space=`` takes no search space today; a ``Space`` is accepted only to
     carry a ``BitwiseInvarianceSpec``, which is validated but not enforced yet.
     """
@@ -452,11 +452,6 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
                            f"got {[tensor.device for tensor in tensors]}")
 
     _check_grouped_gemm_mxfp8_scales(x_scale, w_scale, w, GM=GM, G=G, N=N, K=K, sf_layout=sf_layout)
-    if num_sms is not None:
-        device_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-        if type(num_sms) is not int or not 1 <= num_sms <= device_sms:
-            raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 num_sms must be an int in "
-                               f"[1, {device_sms}] for {x.device}; got {num_sms!r}")
     _check_grouped_gemm_mxfp8_out(out, tensors, GM=GM, N=N, device=x.device)
 
     space_name, invariance = _normalize_space_arg("grouped_gemm_mxfp8", space)
@@ -482,7 +477,6 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
         w_scale,
         split_sizes,
         out=out,
-        num_sms=num_sms,
         sf_layout=sf_layout,
     )
 

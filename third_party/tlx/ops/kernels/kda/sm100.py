@@ -31,6 +31,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.runtime.jit import constexpr_function
 
+from ..._holdout import num_sms as _num_sms
+
 
 @triton.jit
 def _add_f32x2(a, b):
@@ -2210,11 +2212,11 @@ def _sequence_work_order(
     if cpu_offsets is None:
         return None
     n_seq = cpu_offsets.numel() - 1
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    if n_seq * heads <= num_sms and not pack_chunk_offsets:
+    launch_sms = _num_sms(device)
+    if n_seq * heads <= launch_sms and not pack_chunk_offsets:
         return None
     lengths = cpu_offsets[1:] - cpu_offsets[:-1]
-    if n_seq * heads <= num_sms:
+    if n_seq * heads <= launch_sms:
         order = torch.arange(n_seq, dtype=torch.int32)
     else:
         order = torch.argsort(lengths, stable=True, descending=True).to(torch.int32)
@@ -2355,7 +2357,7 @@ def kimi_delta_attention_ws_fwd(  # noqa: C901
             # the fused CTA's total register allocation.
             register_budget = (56, 152, 152)
     n_work = n_seq * H
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = _num_sms(q.device)
     grid = (min(8 * num_sms, n_work), )
     # Per (sequence, head): [decay range or beta, ||A||_inf], written by the
     # main kernel and read by the bounded recurrence.
@@ -2567,7 +2569,7 @@ def kimi_delta_attention_ws_bwd(
     dq2, dk2, dv2, dg2 = (x.view(T, HD) for x in (dq, dk, dv, dg))
     beta2 = beta.view(T, H)
     dbeta2 = dbeta.view(T, H)
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = _num_sms(q.device)
     # Match the forward grid's larger work queue for variable sequence lengths.
     grid = (min(8 * num_sms, n_seq * H), )
     compact_d64 = (D == 64 and d_final_state is None and os.environ.get("KDA_WS_EXPERIMENT_D64_TWO_CTA") == "1")

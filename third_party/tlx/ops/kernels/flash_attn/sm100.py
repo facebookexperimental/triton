@@ -3479,8 +3479,6 @@ class _attention(torch.autograd.Function):
 
         triton.set_allocator(alloc_fn)
 
-        # NUM_SMS = torch.cuda.get_device_properties(q.device).multi_processor_count
-
         def grid_persistent(meta):
             n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
             num_ctas = meta.get("NUM_CTAS", 1)

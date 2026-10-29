@@ -30,6 +30,8 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import num_sms as _num_sms
+
 VEC_SIZE = 32
 OUTPUT_DTYPE = tl.bfloat16
 
@@ -53,11 +55,6 @@ DEFAULT_CONFIG = {
     "SPLIT_K": 1,
     "PEELED_FIRST_K": False,
 }
-
-
-@functools.lru_cache(maxsize=None)
-def _num_sms(device_index):
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def _select_group_size_m(M, N, block_m):

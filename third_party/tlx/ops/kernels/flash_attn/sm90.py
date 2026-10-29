@@ -14,6 +14,8 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import num_sms as _num_sms
+
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
@@ -1289,7 +1291,7 @@ class _attention(torch.autograd.Function):
 
         triton.set_allocator(alloc_fn)
 
-        NUM_SMS = torch.cuda.get_device_properties(q.device).multi_processor_count
+        launch_sms = _num_sms(q.device)
         if config is None:
             selected_configs = _prune_configs_by_head_dim(
                 configs,
@@ -1313,7 +1315,7 @@ class _attention(torch.autograd.Function):
             q.shape,
             q.dtype,
             block_m,
-            NUM_SMS,
+            launch_sms,
             use_bm192=use_bm192,
         )
 

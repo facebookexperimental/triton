@@ -288,13 +288,12 @@ out = triton.tlx.ops.grouped_gemm_mxfp8(
     w_scale,
     split_sizes,
     out=None,
-    num_sms=None,
     sf_layout="natural",
 )
 ```
 
 The exact public signature is
-`(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None,
+`(x, x_scale, w, w_scale, split_sizes, *, out=None,
 sf_layout='natural')`. This is a forward-only operation for SM100 (compute
 capability 10.0) and gfx950 (MI350/MI355X): E4M3 inputs and E8M0 scale factors
 produce a contiguous BF16 result. It has no backward implementation or fallback
@@ -338,9 +337,8 @@ Both scale tensors are contiguous E8M0. `sf_layout` accepts exactly these values
 
 The result shape is `[GM, N]`. If `out` is supplied, it must be a contiguous,
 non-overlapping BF16 tensor of that exact shape on `x.device`, and the operation
-returns the same tensor object. `num_sms=None` launches one persistent CTA per SM
-on the input device; an explicit `num_sms` must be an integer from 1 through the
-device SM count.
+returns the same tensor object. Each launch sizes its persistent grid to
+the input device (respecting any SM/CU holdout).
 
 The SM100 implementation uses fixed, shape-selected 1CTA and 2CTA configurations
 with a dynamic atomic tile scheduler; it does not autotune. Large, sufficiently
@@ -349,8 +347,8 @@ the 1CTA path. Each launch owns a counter initialized to zero; that reset is par
 of CUDA graph capture and is replayed before the kernel, so repeated graph
 replays traverse all tiles.
 
-The gfx950 implementation launches one persistent workgroup per CU (`num_sms`
-counts CUs) with an XCD-aware static tile stride, so it needs no counter and is
+The gfx950 implementation launches one persistent workgroup per CU
+with an XCD-aware static tile stride, so it needs no counter and is
 graph-safe. When 256x256 tiles fill the device it uses the 2x2-quadrant
 `warp_pipeline_stage` engine of the FP16 gfx950 grouped GEMM, with each
 half-tile's scales copied direct-to-LDS alongside its data. Smaller problems

@@ -18,7 +18,6 @@ TLX local-memory async copies stage the walk's per-chunk operands.
 
 from __future__ import annotations
 
-import functools
 from itertools import pairwise
 
 import torch
@@ -27,6 +26,8 @@ import triton.language as tl
 from triton.language.extra import tlx
 from triton.language.extra.libdevice import fast_dividef
 from triton.runtime.jit import constexpr_function
+
+from ..._holdout import num_sms as _num_cus
 
 CHUNK_SIZE = 64
 SUBCHUNK_SIZE = 16
@@ -862,11 +863,6 @@ def _scan_groups(num_sequences: int, heads: int, num_chunks: int, block_value: i
     if chunks_per_sequence < 24 or groups < 4 or (unsplit_fills and chunks_per_sequence < 48):
         return 1
     return groups
-
-
-@functools.cache
-def _num_cus(device: int) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def _launch_state_scan(t, num_sequences, heads, num_chunks, key_dim, value_dim):
