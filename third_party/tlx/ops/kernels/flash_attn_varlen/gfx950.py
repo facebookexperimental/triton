@@ -36,6 +36,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
+from ..._holdout import num_sms as _num_cus
+
 BLOCK_M = 64
 BLOCK_N = 64
 NUM_WARPS = 4
@@ -368,11 +370,6 @@ def _split_plan(bh, num_m_blocks, cus):
                 and bh * (items_per_bh - num_m_blocks) <= MAX_PARTIALS):
             return split, items_per_bh, max_splits
     return 0, num_m_blocks, 1
-
-
-@functools.lru_cache(maxsize=None)
-def _num_cus(device):
-    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 _free_counters = {}

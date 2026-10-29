@@ -17,6 +17,8 @@ import triton.language.extra.tlx as tlx
 from triton.runtime import _allocation
 from triton.tlx.ops.kernels.grouped_gemm_mxfp8._scales import prepare_scales
 
+from ..._holdout import num_sms as _num_sms
+
 _BLOCK_SIZE_M = 128
 _BLOCK_SIZE_N = 256
 _BLOCK_SIZE_K = 128
@@ -925,7 +927,6 @@ def grouped_gemm_mxfp8(
     split_sizes: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
-    num_sms: int | None = None,
     sf_layout: str = "natural",
 ) -> torch.Tensor:
     """Launch the forward-only SM100 MXFP8 grouped GEMM backend."""
@@ -983,9 +984,7 @@ def grouped_gemm_mxfp8(
             k=k,
             sf_layout=sf_layout,
         )
-        launch_sms = (torch.cuda.get_device_properties(device).multi_processor_count if num_sms is None else num_sms)
-        if launch_sms <= 0:
-            raise ValueError("num_sms must be positive")
+        launch_sms = _num_sms(device)
 
         num_ctas = _select_num_ctas(gm=gm, n=n, k=k, launch_sms=launch_sms)
         config = _CONFIG_2CTA_SPEC if num_ctas == 2 else _CONFIG_SPEC

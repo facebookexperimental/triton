@@ -35,6 +35,7 @@ from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..mm import sm90 as _mm
+from ..._holdout import num_sms as _get_num_sms
 
 # Handoff ring depth per M-half group for the partitioned epilogue. Depth
 # 2 measures the same as depth 1 (the store keeps up), so this stays 1.
@@ -1070,11 +1071,6 @@ def _space_configs(space, shape, configs_fn, smoke_fn, heuristic_fn):
     if space == "smoke":
         return smoke_fn()
     raise ValueError(f"Unknown sm90 addmm search space: {space!r}")
-
-
-@functools.lru_cache(maxsize=None)
-def _get_num_sms():
-    return torch.cuda.get_device_properties("cuda").multi_processor_count
 
 
 @functools.lru_cache(maxsize=None)

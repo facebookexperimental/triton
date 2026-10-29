@@ -37,16 +37,16 @@ _GENERIC = {
 _ENGINES = pytest.mark.parametrize("config", [_QUAD, _GENERIC], ids=["quad", "generic"])
 
 
-def _call(inputs, *, out=None, num_sms=None, sf_layout="natural"):
+def _call(inputs, *, out=None, sf_layout="natural"):
     from triton.tlx.ops import grouped_gemm_mxfp8
 
-    return grouped_gemm_mxfp8(*inputs, out=out, num_sms=num_sms, sf_layout=sf_layout)
+    return grouped_gemm_mxfp8(*inputs, out=out, sf_layout=sf_layout)
 
 
-def _call_backend(inputs, config, *, out=None, num_sms=None, sf_layout="natural"):
+def _call_backend(inputs, config, *, out=None, sf_layout="natural"):
     from triton.tlx.ops.kernels.grouped_gemm_mxfp8.gfx950 import grouped_gemm_mxfp8
 
-    return grouped_gemm_mxfp8(*inputs, out=out, num_sms=num_sms, sf_layout=sf_layout, config=config)
+    return grouped_gemm_mxfp8(*inputs, out=out, sf_layout=sf_layout, config=config)
 
 
 def _patterned_e4m3(shape, *, salt, device):
@@ -129,7 +129,7 @@ def _run_invalid_split_values(split_sizes):
     inputs, _ = _make_numerical_inputs((128, 0))
     invalid = torch.tensor(split_sizes, device="cuda", dtype=torch.int32)
     inputs = inputs[:4] + (invalid, )
-    _call(inputs, num_sms=1)
+    _call(inputs)
     torch.cuda.synchronize()
 
 
@@ -342,14 +342,14 @@ def test_grouped_gemm_mxfp8_gfx950_rank_and_natural_blocked_parity(config, weigh
 
 
 @_ENGINES
-def test_grouped_gemm_mxfp8_gfx950_deterministic_out_identity_and_num_sms(config):
+def test_grouped_gemm_mxfp8_gfx950_deterministic_out_identity(config):
     inputs, reference = _make_numerical_inputs((512, 384, 256), n=512, k=1024)
     out = torch.empty(reference.shape, device="cuda", dtype=torch.bfloat16)
-    baseline = _call_backend(inputs, config, out=out, num_sms=3).clone()
+    baseline = _call_backend(inputs, config, out=out).clone()
     _assert_correct(baseline, reference)
     for _ in range(3):
         out.fill_(float("nan"))
-        returned = _call_backend(inputs, config, out=out, num_sms=3)
+        returned = _call_backend(inputs, config, out=out)
         assert returned is out
         assert torch.equal(returned, baseline)
 

@@ -26,13 +26,12 @@ def _replace(inputs, index, value):
     return tuple(updated)
 
 
-def _call(inputs, *, out=None, num_sms=None, sf_layout="natural"):
+def _call(inputs, *, out=None, sf_layout="natural"):
     from triton.tlx.ops import grouped_gemm_mxfp8
 
     return grouped_gemm_mxfp8(
         *inputs,
         out=out,
-        num_sms=num_sms,
         sf_layout=sf_layout,
     )
 
@@ -179,7 +178,7 @@ def _assert_correct(actual, reference):
 def _run_invalid_split_values(split_sizes):
     inputs, _ = _make_numerical_inputs((128, 0))
     invalid = torch.tensor(split_sizes, device="cuda", dtype=torch.int32)
-    _call(_replace(inputs, 4, invalid), num_sms=1)
+    _call(_replace(inputs, 4, invalid))
     torch.cuda.synchronize()
 
 
@@ -235,7 +234,7 @@ import inspect
 import sys
 from triton.tlx import ops
 assert 'triton.tlx.ops.kernels.grouped_gemm_mxfp8.sm100' not in sys.modules
-assert str(inspect.signature(ops.grouped_gemm_mxfp8)) == "(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout='natural', space=None)"
+assert str(inspect.signature(ops.grouped_gemm_mxfp8)) == "(x, x_scale, w, w_scale, split_sizes, *, out=None, sf_layout='natural', space=None)"
 assert 'grouped_gemm_mxfp8' in ops.__all__
 """
     subprocess.run([sys.executable, "-c", script], check=True)
@@ -248,11 +247,10 @@ def test_grouped_gemm_mxfp8_catalog_resolves_fixed_implementation():
     implementation, spec = impl_for("grouped_gemm_mxfp8", arch="sm100")
     assert implementation is grouped_gemm_mxfp8
     assert not spec.supports_backward
-    assert str(
-        inspect.signature(implementation)) == ("(x: 'torch.Tensor', x_scale: 'torch.Tensor', w: 'torch.Tensor', "
-                                               "w_scale: 'torch.Tensor', split_sizes: 'torch.Tensor', *, "
-                                               "out: 'torch.Tensor | None' = None, num_sms: 'int | None' = None, "
-                                               "sf_layout: 'str' = 'natural') -> 'torch.Tensor'")
+    assert str(inspect.signature(implementation)) == ("(x: 'torch.Tensor', x_scale: 'torch.Tensor', w: 'torch.Tensor', "
+                                                      "w_scale: 'torch.Tensor', split_sizes: 'torch.Tensor', *, "
+                                                      "out: 'torch.Tensor | None' = None, "
+                                                      "sf_layout: 'str' = 'natural') -> 'torch.Tensor'")
 
 
 def test_grouped_gemm_mxfp8_fixed_config_resources_are_legal():
@@ -356,7 +354,7 @@ def test_grouped_gemm_mxfp8_rejects_dtypes_layouts_and_devices_before_resolution
 
 
 @requires_cuda
-def test_grouped_gemm_mxfp8_rejects_scale_contract_num_sms_and_out_before_resolution(monkeypatch):
+def test_grouped_gemm_mxfp8_rejects_scale_contract_and_out_before_resolution(monkeypatch):
     inputs = _dummy_inputs(device="cuda")
     _assert_invalid_before_resolution(monkeypatch, inputs, "sf_layout", sf_layout="blocked")
     _assert_invalid_before_resolution(
@@ -371,11 +369,6 @@ def test_grouped_gemm_mxfp8_rejects_scale_contract_num_sms_and_out_before_resolu
         "must contain exactly",
         sf_layout="cublas_blocked",
     )
-
-    for invalid_num_sms in (0, -1, True, 1.5):
-        _assert_invalid_before_resolution(monkeypatch, inputs, "num_sms must be an int", num_sms=invalid_num_sms)
-    device_sms = torch.cuda.get_device_properties(inputs[0].device).multi_processor_count
-    _assert_invalid_before_resolution(monkeypatch, inputs, "num_sms must be an int", num_sms=device_sms + 1)
 
     _assert_invalid_before_resolution(monkeypatch, inputs, "tensor or None", out=object())
     _assert_invalid_before_resolution(
@@ -397,10 +390,9 @@ def test_grouped_gemm_mxfp8_lazy_dispatch_forwards_public_keywords(monkeypatch):
     spec = next(spec for spec in CATALOG if (spec.op, spec.arch) == ("grouped_gemm_mxfp8", "sm100"))
     observed = {}
 
-    def fake_implementation(x, x_scale, w, w_scale, split_sizes, *, out, num_sms, sf_layout):
+    def fake_implementation(x, x_scale, w, w_scale, split_sizes, *, out, sf_layout):
         observed.update(
             out=out,
-            num_sms=num_sms,
             sf_layout=sf_layout,
             w_rank=w.ndim,
             scale_ranks=(x_scale.ndim, w_scale.ndim),
@@ -408,10 +400,9 @@ def test_grouped_gemm_mxfp8_lazy_dispatch_forwards_public_keywords(monkeypatch):
         return torch.empty((x.shape[0], w.shape[0] // split_sizes.shape[0]), device=x.device, dtype=torch.bfloat16)
 
     monkeypatch.setattr(ops, "impl_for", lambda *args, **kwargs: (fake_implementation, spec))
-    result = _call(inputs, num_sms=1, sf_layout="natural")
+    result = _call(inputs, sf_layout="natural")
     assert observed == {
         "out": None,
-        "num_sms": 1,
         "sf_layout": "natural",
         "w_rank": 2,
         "scale_ranks": (2, 2),
@@ -472,7 +463,7 @@ def test_grouped_gemm_mxfp8_native_2cta_selected_path():
 
     assert sm100._select_num_ctas(gm=512, n=4096, k=2048, launch_sms=2) == 2
     inputs, reference = _make_numerical_inputs((256, 256), n=4096, k=2048)
-    _assert_correct(_call(inputs, num_sms=2), reference)
+    _assert_correct(_call(inputs), reference)
 
 
 @requires_sm100
@@ -482,7 +473,7 @@ def test_grouped_gemm_mxfp8_native_2cta_n3072():
     assert sm100._select_num_ctas(gm=512, n=3072, k=2048, launch_sms=2) == 2
     assert sm100._select_num_ctas(gm=512, n=2048, k=2048, launch_sms=2) == 1
     inputs, reference = _make_numerical_inputs((256, 256), n=3072, k=2048)
-    _assert_correct(_call(inputs, num_sms=2), reference)
+    _assert_correct(_call(inputs), reference)
 
 
 @requires_sm100
@@ -491,7 +482,7 @@ def test_grouped_gemm_mxfp8_native_2cta_odd_partner():
 
     assert sm100._select_num_ctas(gm=384, n=4096, k=2048, launch_sms=2) == 2
     inputs, reference = _make_numerical_inputs((128, 256), n=4096, k=2048)
-    _assert_correct(_call(inputs, num_sms=2), reference)
+    _assert_correct(_call(inputs), reference)
 
 
 @requires_sm100
@@ -501,7 +492,7 @@ def test_grouped_gemm_mxfp8_static_2cta_crosses_groups_and_tile_orders():
     split_sizes = (4096, 128)
     assert sm100._select_num_ctas(gm=sum(split_sizes), n=4096, k=2048, launch_sms=2) == 2
     inputs, reference = _make_numerical_inputs(split_sizes, n=4096, k=2048)
-    _assert_correct(_call(inputs, num_sms=2), reference)
+    _assert_correct(_call(inputs), reference)
 
 
 @requires_sm100
@@ -511,7 +502,7 @@ def test_grouped_gemm_mxfp8_static_2cta_zero_and_uneven_splits():
     split_sizes = (0, 128, 0, 256, 0)
     assert sm100._select_num_ctas(gm=sum(split_sizes), n=4096, k=2048, launch_sms=2) == 2
     inputs, reference = _make_numerical_inputs(split_sizes, n=4096, k=2048)
-    _assert_correct(_call(inputs, num_sms=2), reference)
+    _assert_correct(_call(inputs), reference)
 
 
 @requires_sm100
@@ -522,12 +513,12 @@ def test_grouped_gemm_mxfp8_static_2cta_multiple_waves_are_deterministic():
     assert sm100._select_num_ctas(gm=sum(split_sizes), n=4096, k=2048, launch_sms=2) == 2
     inputs, reference = _make_numerical_inputs(split_sizes, n=4096, k=2048)
     out = torch.empty(reference.shape, device="cuda", dtype=torch.bfloat16)
-    baseline = _call(inputs, out=out, num_sms=2).clone()
+    baseline = _call(inputs, out=out).clone()
     _assert_correct(baseline, reference)
 
     for _ in range(3):
         out.fill_(float("nan"))
-        returned = _call(inputs, out=out, num_sms=2)
+        returned = _call(inputs, out=out)
         assert returned is out
         assert torch.equal(returned, baseline)
 
@@ -546,11 +537,11 @@ def test_grouped_gemm_mxfp8_static_2cta_cuda_graph_replay():
     )
     out = torch.empty(reference.shape, device="cuda", dtype=torch.bfloat16)
 
-    _call(inputs, out=out, num_sms=2, sf_layout="cublas_blocked")
+    _call(inputs, out=out, sf_layout="cublas_blocked")
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _call(inputs, out=out, num_sms=2, sf_layout="cublas_blocked")
+        captured = _call(inputs, out=out, sf_layout="cublas_blocked")
     assert captured is out
 
     for _ in range(3):
@@ -594,10 +585,10 @@ def test_grouped_gemm_mxfp8_rank_and_natural_blocked_parity(weight_rank, n):
     ],
     ids=["balanced", "aligned_skew", "zero_expert_positions"],
 )
-def test_grouped_gemm_mxfp8_split_distributions_out_identity_and_num_sms(split_sizes):
+def test_grouped_gemm_mxfp8_split_distributions_out_identity(split_sizes):
     inputs, reference = _make_numerical_inputs(split_sizes)
     out = torch.full(reference.shape, float("nan"), device="cuda", dtype=torch.bfloat16)
-    returned = _call(inputs, out=out, num_sms=2)
+    returned = _call(inputs, out=out)
     assert returned is out
     _assert_correct(returned, reference)
 
@@ -615,12 +606,12 @@ def test_grouped_gemm_mxfp8_permutation_sensitive_scale_exponents():
 def test_grouped_gemm_mxfp8_multiple_waves_are_deterministic():
     inputs, reference = _make_numerical_inputs((512, 384, 256), n=512)
     out = torch.empty(reference.shape, device="cuda", dtype=torch.bfloat16)
-    baseline = _call(inputs, out=out, num_sms=2).clone()
+    baseline = _call(inputs, out=out).clone()
     _assert_correct(baseline, reference)
 
     for _ in range(3):
         out.fill_(float("nan"))
-        returned = _call(inputs, out=out, num_sms=2)
+        returned = _call(inputs, out=out)
         assert returned is out
         assert torch.equal(returned, baseline)
 
@@ -630,11 +621,11 @@ def test_grouped_gemm_mxfp8_cuda_graph_replay_resets_dynamic_counter():
     inputs, reference = _make_numerical_inputs((512, 384), n=512, sf_layout="cublas_blocked")
     out = torch.empty(reference.shape, device="cuda", dtype=torch.bfloat16)
 
-    _call(inputs, out=out, num_sms=2, sf_layout="cublas_blocked")
+    _call(inputs, out=out, sf_layout="cublas_blocked")
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _call(inputs, out=out, num_sms=2, sf_layout="cublas_blocked")
+        captured = _call(inputs, out=out, sf_layout="cublas_blocked")
     assert captured is out
 
     for _ in range(3):

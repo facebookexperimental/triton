@@ -29,8 +29,6 @@ the column coordinate.
   than to Triton's global scratch, so no launch path needs a Triton allocator.
 """
 
-import functools
-
 import torch
 import triton
 import triton.language as tl
@@ -39,6 +37,8 @@ from torch._library.triton import wrap_triton
 from torch._subclasses.fake_tensor import FakeTensor
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+from ..._holdout import num_sms as _num_sms
 
 BLOCK_M = 128
 NUM_MMA_GROUPS = 2
@@ -347,11 +347,6 @@ def _flash_attn_varlen_fwd(
                         tl.store(o_ptrs, o_tile, mask=row_ok)
                 tile_idx = _next_tile(tile_id_smem, tile_fulls, tile_empties, accum_cnt_tile, NUM_TILE_BUFFERS)
                 accum_cnt_tile += 1
-
-
-@functools.lru_cache(maxsize=None)
-def _num_sms(device):
-    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def _has_address(x):

@@ -35,6 +35,7 @@ except ImportError:
     tlx = None
     HAS_TLX = False
 
+from ..._holdout import num_sms as _num_sms
 from ._stubs import (
     autotune_max_seq_len,
     switch_to_contiguous_if_needed,
@@ -5222,7 +5223,7 @@ def tlx_hstu_attention_fwd(
     # pyrefly: ignore [bad-argument-type]
     triton.set_allocator(alloc_fn)
 
-    num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    num_sms = _num_sms(q.device)
     grid = lambda meta: (  # noqa E731
         min(num_sms, H * Z * triton.cdiv(max_seq_len, meta["BLOCK_M"])), )
     _tuned_fwd(_SPACE)[grid](

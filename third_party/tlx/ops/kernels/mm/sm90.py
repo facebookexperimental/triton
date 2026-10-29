@@ -16,6 +16,7 @@ import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..._catalog import InvalidInput
+from ..._holdout import num_sms as _get_num_sms
 from ..._invariance import BitwiseInvarianceSpec, gemm_fixed_split_k
 from ._shapes import SM90_FOCUS
 from ._sm90_core import _allocate_buffers, _consume_tile, _k_tile_range, _run_producer, _split_acc, _split_acc2, _store_subtile
@@ -27,11 +28,6 @@ _SPLIT_K_CHOICES = (2, 3, 4, 5, 6, 8, 11, 16, 22, 32)
 _MIN_K_TILES_PER_SPLIT = 4
 _TORCH_TO_TL = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
 _FIXED_SPEC = BitwiseInvarianceSpec.dims("K")
-
-
-@functools.lru_cache(maxsize=1)
-def _get_num_sms():
-    return torch.cuda.get_device_properties("cuda").multi_processor_count
 
 
 @triton.constexpr_function

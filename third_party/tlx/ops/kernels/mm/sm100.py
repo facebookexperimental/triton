@@ -16,18 +16,11 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import num_sms as _get_num_sms
 from ..._invariance import BitwiseInvarianceSpec, gemm_fixed_split_k
 from . import _sm100_core as _core
 
 _FIXED_SPEC = BitwiseInvarianceSpec.dims("K")
-
-
-# Cached SM count — never changes during program lifetime.
-# Calling torch.cuda.get_device_properties() on every matmul() call
-# adds measurable overhead that degrades benchmark throughput on fast kernels.
-@functools.lru_cache(maxsize=1)
-def _get_num_sms():
-    return torch.cuda.get_device_properties("cuda").multi_processor_count
 
 
 def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
