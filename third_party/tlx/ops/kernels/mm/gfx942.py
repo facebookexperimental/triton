@@ -342,6 +342,7 @@ def _direct_matmul_kernel_gfx942(
     TILE_ID=0,
     OVERRIDE_TILE_ID: tl.constexpr = False,
     USE_STREAMING_BF16_STORES: tl.constexpr = False,
+    USE_BUFFER_INTRINSICS: tl.constexpr = False,
 ):
     """Register-staged GEMM with per-operand cache and XCD policy."""
     pid = TILE_ID.to(tl.int32) if OVERRIDE_TILE_ID else tl.program_id(0).to(tl.int32)
@@ -660,12 +661,16 @@ def _direct_matmul_kernel_gfx942(
                     b_offsets = tl.max_contiguous(tl.multiple_of(b_offsets, [8, 1]), [8, 1])
                     a = tl.load(a_ptr + a_offsets)
                     b = tl.load(b_ptr + b_offsets)
-                elif USE_BUFFER_A:
-                    a = tlx.buffer_load(a_ptr, a_offsets, contiguity=1)
                 else:
-                    a = tl.load(a_ptr + a_offsets)
-                if not (PACKED_K_LOADS or SHORT_PACKED_K_LOADS or UNALIGNED_K_LOADS):
-                    if USE_BUFFER_B:
+                    # Plain loads still lower to buffer loads when the range fits,
+                    # and unlike tlx.buffer_load they keep BlockPingpong applicable.
+                    # Split-K inlines three K loops whose pipelined LDS would sum
+                    # past 64 KiB, so it keeps the unstaged buffer intrinsics.
+                    if USE_BUFFER_INTRINSICS and USE_BUFFER_A:
+                        a = tlx.buffer_load(a_ptr, a_offsets, contiguity=1)
+                    else:
+                        a = tl.load(a_ptr + a_offsets)
+                    if USE_BUFFER_INTRINSICS and USE_BUFFER_B:
                         b = tlx.buffer_load(b_ptr, b_offsets, contiguity=1)
                     else:
                         b = tl.load(b_ptr + b_offsets)
@@ -842,7 +847,37 @@ def _global_split_matmul_kernel_gfx942(
         a_slice = a_ptr + start_k * stride_ak
         b_slice = b_ptr + start_k * stride_bk
         partial = workspace_ptr + split * M * N
-        if split == SPLIT_K - 1:
+        # Equal slices need one inlined K loop, whose pipelined LDS fits, so
+        # they take the plain-load (BlockPingpong) path.
+        UNIFORM: tl.constexpr = EXTRA_BLOCKS == 0 and FINAL_K == SHORT_K and not POINTER_LOADS
+        if UNIFORM:
+            _direct_matmul_kernel_gfx942(
+                a_slice,
+                b_slice,
+                partial,
+                partial,
+                M,
+                N,
+                SHORT_K,
+                stride_am,
+                stride_ak,
+                stride_bk,
+                stride_bn,
+                0,
+                0,
+                N,
+                1,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                GROUP_M,
+                NUM_XCDS,
+                XCD_CHUNK,
+                False,
+                TILE_ID=tile,
+                OVERRIDE_TILE_ID=True,
+            )
+        elif split == SPLIT_K - 1:
             _direct_matmul_kernel_gfx942(
                 a_slice,
                 b_slice,
@@ -869,6 +904,7 @@ def _global_split_matmul_kernel_gfx942(
                 USE_SINGLE_STAGE_POINTER_LOADS=POINTER_LOADS,
                 TILE_ID=tile,
                 OVERRIDE_TILE_ID=True,
+                USE_BUFFER_INTRINSICS=True,
             )
         elif split < EXTRA_BLOCKS:
             _direct_matmul_kernel_gfx942(
@@ -897,6 +933,7 @@ def _global_split_matmul_kernel_gfx942(
                 USE_SINGLE_STAGE_POINTER_LOADS=POINTER_LOADS,
                 TILE_ID=tile,
                 OVERRIDE_TILE_ID=True,
+                USE_BUFFER_INTRINSICS=True,
             )
         else:
             _direct_matmul_kernel_gfx942(
@@ -925,6 +962,7 @@ def _global_split_matmul_kernel_gfx942(
                 USE_SINGLE_STAGE_POINTER_LOADS=POINTER_LOADS,
                 TILE_ID=tile,
                 OVERRIDE_TILE_ID=True,
+                USE_BUFFER_INTRINSICS=True,
             )
 
 
@@ -1638,6 +1676,77 @@ def _bf16_split_k_config(M, N, K):
     return _config(128, 128, 128, 4, 4, split_k=_BF16_SPLIT_K_SHAPES[M, N, K])
 
 
+# Occupancy-aware mm planner for grids the shape rules underfill. Rates are
+# fitted from measured MI300X sweeps: tile-K elements per second for one full
+# wave of 304 CUs, relative to 256x256x64. Split-K slices keep the unstaged
+# buffer loads, so they have their own rates.
+_FILL_WAVE_RATE = 1.23e12
+_FILL_TILE_RATES = {
+    (32, 64, 128, 4): 0.1176,
+    (32, 128, 128, 4): 0.1362,
+    (64, 32, 128, 4): 0.1189,
+    (64, 64, 64, 4): 0.1673,
+    (64, 64, 128, 4): 0.1678,
+    (64, 64, 256, 8): 0.1606,
+    (64, 128, 64, 4): 0.2439,
+    (128, 64, 64, 4): 0.2138,
+    (128, 128, 64, 4): 0.4746,
+    (128, 256, 32, 4): 0.5720,
+    (256, 32, 64, 4): 0.1445,
+    (128, 256, 64, 8): 0.7167,
+    (256, 128, 64, 8): 0.6090,
+    (256, 256, 64, 8): 1.0000,
+}
+_FILL_SPLIT_RATES = {
+    (32, 64, 128, 4): 0.1341,
+    (64, 64, 128, 4): 0.1941,
+    (128, 128, 64, 4): 0.3513,
+}
+_FILL_SPLITS = (2, 3, 4, 6, 8, 12, 16)
+
+
+def _fill_plan(M, N, K, allow_split):
+    """Return the config with the least wave-quantized time, or None outside its regime."""
+    cus = 304
+    if M < 32 or not (triton.cdiv(M, 128) * triton.cdiv(N, 128) < 4 * cus or (N <= 256 and M <= 65536)):
+        return None
+
+    def slots(tile):
+        # Tiles of at most 8192 outputs fit two workgroups per CU.
+        return 2 if tile[0] * tile[1] <= 8192 else 1
+
+    def wave_time(tile, tiles, k, rates=_FILL_TILE_RATES):
+        return (triton.cdiv(tiles, cus * slots(tile)) * tile[0] * tile[1] * triton.cdiv(k, tile[2]) * tile[2] /
+                (rates[tile] * _FILL_WAVE_RATE))
+
+    best, best_split, best_time = None, 1, float("inf")
+    for tile in _FILL_TILE_RATES:
+        if tile[0] > 2 * M or tile[1] > 2 * max(N, 32):
+            continue
+        t = wave_time(tile, triton.cdiv(M, tile[0]) * triton.cdiv(N, tile[1]), K)
+        if t < best_time:
+            best, best_split, best_time = tile, 1, t
+    for tile in _FILL_SPLIT_RATES if allow_split else ():
+        tiles = triton.cdiv(M, tile[0]) * triton.cdiv(N, tile[1])
+        if tile[0] > 2 * M or tile[1] > 2 * max(N, 32) or tiles >= 2 * cus:
+            continue
+        for split in _FILL_SPLITS:
+            k_blocks = triton.cdiv(K, tile[2])
+            if k_blocks // split < 3:
+                continue
+            # Equal slices run the plain-load loop at the direct rate. fp32
+            # partials are written once and read back once by the reducer.
+            uniform = K % tile[2] == 0 and k_blocks % split == 0
+            t = (wave_time(tile, tiles * split,
+                           triton.cdiv(k_blocks, split) * tile[2], _FILL_TILE_RATES if uniform else _FILL_SPLIT_RATES) +
+                 (split + 1) * M * N * 4 / 3e12 + 6e-6)
+            if t < best_time:
+                best, best_split, best_time = tile, split, t
+    # Row-major tile order measured at least as fast as GROUP_M swizzling on these small grids.
+    group_m = 8 if best_split > 1 else 1
+    return _config(best[0], best[1], best[2], group_m, best[3], split_k=best_split)
+
+
 def _precheck_global_split_k(a, b, bias, out):
     M, K = a.shape
     N = b.shape[1]
@@ -1765,6 +1874,25 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
         plan = _MEASURED_LOCAL_SPLIT_U_PLANS[(M, N, K)]
         return _launch_local_split_u(a, b, out, plan)
 
+    launch_meta = {}
+    # The planner was fitted on bias-free, K-contiguous 16-bit mm; addmm and
+    # the measured split paths keep their own rules.
+    fill = None
+    if (space == "heuristic" and bias is None and not _global_split_k_shape(M, N, K)
+            and (M, N, K) not in _MEASURED_LOCAL_SPLIT_U_PLANS):
+        fill = _fill_plan(M, N, K, allow_split=fixed is None and ENABLE_GLOBAL_SPLIT_K)
+    if fill is not None and not (a.dtype in (torch.float16, torch.bfloat16) and a.stride(1) == 1 and b.stride(0) == 1
+                                 and not _needs_i64_offsets(a) and not _needs_i64_offsets(b)
+                                 and not _needs_i64_offsets(out)):
+        fill = None
+    if fill is not None and fill.kwargs.get("SPLIT_K", 1) > 1 and not out.is_contiguous():
+        fill = _fill_plan(M, N, K, allow_split=False)
+    if fill is not None and fill.kwargs.get("SPLIT_K", 1) > 1:
+        workspace = torch.empty((fill.kwargs["SPLIT_K"] * M, N), device=a.device, dtype=torch.float32)
+        return _launch_global_split_k_config(a, b, None, out, workspace, fill)
+    if fill is not None:
+        launch_meta = dict(fill.kwargs, num_warps=fill.num_warps, num_stages=fill.num_stages)
+
     def grid(meta):
         if meta.get("USE_LOCAL_SPLIT_U", False):
             return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
@@ -1774,7 +1902,6 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
     kernel = _tuned(space, shape, space == "full" and enable_local_split_u)
     fast_configs = None
     fast_key = None
-    launch_meta = {}
     if space == "full":
         fast_configs = getattr(kernel, "_tlx_fast_configs", None)
         if fast_configs is None:
