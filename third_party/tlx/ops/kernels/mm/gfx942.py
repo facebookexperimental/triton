@@ -541,6 +541,15 @@ def _direct_matmul_kernel_gfx942(
                                               and tlx.dtype_of(b_ptr) == tl.float16 and stride_ak == 1
                                               and stride_bk == 1 and BLOCK_M == 64 and BLOCK_N == 64 and BLOCK_K == 64
                                               and K >= 64 and K < 256 and tlx.num_warps() == 4)
+        # Odd K leaves rows 2-byte aligned, but each thread's eight K elements
+        # stay contiguous, and gfx942 buffer loads accept unaligned dwordx4.
+        UNALIGNED_K_LOADS: tl.constexpr = (K % 8 != 0 and stride_ak == 1 and stride_bk == 1 and BLOCK_K % 8 == 0
+                                           and tlx.dtype_of(a_ptr).primitive_bitwidth == 16
+                                           and tlx.dtype_of(b_ptr).primitive_bitwidth == 16 and not PACKED_K_LOADS
+                                           and not SHORT_PACKED_K_LOADS and not USE_SINGLE_STAGE_POINTER_LOADS
+                                           and not USE_I64_A_OFFSETS and not USE_I64_B_OFFSETS
+                                           and ((M - 1) * stride_am + K) * 2 <= 0x7ffffffe
+                                           and (K + (N - 1) * stride_bn) * 2 <= 0x7ffffffe)
         if SHORT_PACKED_K_LOADS:
             packed_a: tl.constexpr = tlx.layout(
                 shape=((8, 8, 4), (8, 2)),
@@ -644,11 +653,18 @@ def _direct_matmul_kernel_gfx942(
                     b_offsets = tlx.require_layout(b_offsets, packed_b)
                     a = tlx.buffer_load(a_ptr, a_offsets, contiguity=8)
                     b = tlx.buffer_load(b_ptr, b_offsets, contiguity=8)
+                elif UNALIGNED_K_LOADS:
+                    # The hints let coalescing give each thread eight K elements;
+                    # the loads become buffer loads, which carry no alignment.
+                    a_offsets = tl.max_contiguous(tl.multiple_of(a_offsets, [1, 8]), [1, 8])
+                    b_offsets = tl.max_contiguous(tl.multiple_of(b_offsets, [8, 1]), [8, 1])
+                    a = tl.load(a_ptr + a_offsets)
+                    b = tl.load(b_ptr + b_offsets)
                 elif USE_BUFFER_A:
                     a = tlx.buffer_load(a_ptr, a_offsets, contiguity=1)
                 else:
                     a = tl.load(a_ptr + a_offsets)
-                if not (PACKED_K_LOADS or SHORT_PACKED_K_LOADS):
+                if not (PACKED_K_LOADS or SHORT_PACKED_K_LOADS or UNALIGNED_K_LOADS):
                     if USE_BUFFER_B:
                         b = tlx.buffer_load(b_ptr, b_offsets, contiguity=1)
                     else:
@@ -1232,7 +1248,7 @@ def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuni
     short_m_pipeline_configs = {
         (902, 4096, 6656): (128, 128, 128, 8),
         (902, 4096, 2048): (128, 128, 128, 8),
-        (902, 4096, 1091): (128, 64, 64, 8),
+        (902, 4096, 1091): (128, 128, 64, 8),
         (440, 2048, 4096): (64, 64, 128, 8),
         (440, 2048, 2048): (64, 64, 256, 8),
     }
@@ -1614,12 +1630,25 @@ def _global_split_k_shape(M, N, K):
     return ENABLE_GLOBAL_SPLIT_K and 4178 <= M <= 4942 and K == 18688 and N in (256, 512, 1280, 2560)
 
 
+# Three K splits lift 384 BF16 output tiles (1.3 waves) to 1152 (3.8 waves).
+_BF16_SPLIT_K_SHAPES = {(1024, 6144, 20480): 3}
+
+
+def _bf16_split_k_config(M, N, K):
+    return _config(128, 128, 128, 4, 4, split_k=_BF16_SPLIT_K_SHAPES[M, N, K])
+
+
 def _precheck_global_split_k(a, b, bias, out):
     M, K = a.shape
     N = b.shape[1]
-    return (_global_split_k_shape(M, N, K) and a.dtype == torch.float16 and b.dtype == torch.float16
-            and out.dtype == torch.float16 and a.stride() == (K, 1) and b.stride() == (1, K) and out.is_contiguous()
-            and (bias is None or (bias.dtype == torch.float16 and bias.device == a.device and bias.ndim == 1
+    dtype = a.dtype
+    if dtype == torch.float16:
+        shape_ok = _global_split_k_shape(M, N, K)
+    else:
+        shape_ok = dtype == torch.bfloat16 and ENABLE_GLOBAL_SPLIT_K and (M, N, K) in _BF16_SPLIT_K_SHAPES
+    return (shape_ok and b.dtype == dtype and out.dtype == dtype and a.stride() == (K, 1) and b.stride() == (1, K)
+            and out.is_contiguous()
+            and (bias is None or (bias.dtype == dtype and bias.device == a.device and bias.ndim == 1
                                   and bias.shape[0] == N and bias.stride(0) == 1)))
 
 
@@ -1670,7 +1699,7 @@ def _launch_global_split_k_config(a, b, bias, out, workspace, config):
             SPLIT_K=split_k,
             BLOCK_SIZE_M=32,
             BLOCK_SIZE_N=32,
-            OUTPUT_DTYPE=tl.float16,
+            OUTPUT_DTYPE=tl.float16 if out.dtype == torch.float16 else tl.bfloat16,
             HAS_BIAS=bias is not None,
             STRIDE_BIAS_M=0,
             STRIDE_BIAS_N=1,
@@ -1680,8 +1709,9 @@ def _launch_global_split_k_config(a, b, bias, out, workspace, config):
 
 def _launch_global_split_k(a, b, bias, out, space):
     shape = (a.shape[0], b.shape[1], a.shape[1])
+    bf16 = a.dtype == torch.bfloat16
     if space == "heuristic":
-        config = heuristic_config(*shape)[0]
+        config = _bf16_split_k_config(*shape) if bf16 else heuristic_config(*shape)[0]
         workspace = torch.empty((config.kwargs["SPLIT_K"] * shape[0], shape[1]), device=a.device, dtype=torch.float32)
     else:
         # Explicit offline full-space tuning measures the complete launch
@@ -1692,7 +1722,10 @@ def _launch_global_split_k(a, b, bias, out, space):
         if config is None:
             from triton.testing import do_bench_cudagraph
             best_ms = float("inf")
-            for trial in _candidate_configs(shape, enable_global_split_k=True):
+            trials = _candidate_configs(shape, enable_global_split_k=True)
+            if bf16:
+                trials.append(_bf16_split_k_config(*shape))
+            for trial in trials:
 
                 def run():
                     return _launch_global_split_k_config(a, b, bias, out, workspace, trial)
@@ -1723,7 +1756,8 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    if space in ("heuristic", "full") and _global_split_k_shape(M, N, K) and _precheck_global_split_k(a, b, bias, out):
+    if (space in ("heuristic", "full") and (_global_split_k_shape(M, N, K) or (M, N, K) in _BF16_SPLIT_K_SHAPES)
+            and _precheck_global_split_k(a, b, bias, out)):
         return _launch_global_split_k(a, b, bias, out, space)
 
     enable_local_split_u = _precheck_local_split_u(a, b, bias) and fixed is None
