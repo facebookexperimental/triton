@@ -27,12 +27,12 @@ def issue(number, state="closed", hours_ago=5, by=fi.BOT, title=TITLE, labels=LA
 
 
 class FakeApi:
-    """GitHub as the scripts see it. Search filters by label and title substring, honors per_page, returns
-    results unsorted unless sort=created is asked, and may report a stale state (search_state)."""
+    """GitHub as the scripts see it. Listing filters by label, state and `since`; search filters by label and
+    title substring but its index misses the issues in `unindexed`, as GitHub's did for #4518."""
 
-    def __init__(self, issues, reopened=0, search_state=None, fail=None):
+    def __init__(self, issues, reopened=0, unindexed=(), fail=None):
         self.issues = {i["number"]: i for i in issues}
-        self.reopened, self.search_state, self.fail = reopened, search_state or {}, fail
+        self.reopened, self.unindexed, self.fail = reopened, set(unindexed), fail
         self.writes = []
 
     def __call__(self, method, path, fields=None, paginate=False):
@@ -47,10 +47,9 @@ class FakeApi:
             labels = re.findall(r'label:"([^"]+)"', args["q"])
             title = re.search(r'in:title "(.*)"$', args["q"])[1]
             hits = [
-                dict(i, state=self.search_state.get(i["number"], i["state"]))
-                for i in self.issues.values()
-                if title.lower() in i["title"].lower() and set(labels) <= {l["name"]
-                                                                           for l in i["labels"]}
+                i for i in self.issues.values() if i["number"] not in self.unindexed
+                and title.lower() in i["title"].lower() and set(labels) <= {l["name"]
+                                                                            for l in i["labels"]}
             ]
             if args.get("sort") == "created":
                 hits.sort(key=lambda i: -i["number"])
@@ -59,9 +58,11 @@ class FakeApi:
             return [{"event": "reopened", "actor": {"login": fi.BOT}}] * self.reopened
         if url.path == f"repos/{REPO}/issues":
             want = set(args["labels"].split(","))
+            since = args.get("since", "")
             return [
-                i for i in self.issues.values() if i["state"] == "open" and want <= {l["name"]
-                                                                                     for l in i["labels"]}
+                i for i in self.issues.values() if i["state"] == args.get("state", "open")
+                and want <= {l["name"]
+                             for l in i["labels"]} and (i["state"] == "open" or i["closed_at"] >= since)
             ]
         return self.issues[int(url.path.rsplit("/", 1)[1])]
 
@@ -103,8 +104,9 @@ def test_an_open_issue_is_left_to_the_report_step_unless_a_newer_run_reported_it
     assert decide(FakeApi([issue(7), open_(151)]), run_id=150) == "skip"
 
 
-def test_an_issue_search_still_shows_open_is_reopened_once_confirmed_closed():
-    assert decide(FakeApi([issue(7)], search_state={7: "open"})) == 7
+def test_an_issue_missing_from_the_search_index_is_still_found():
+    assert decide(FakeApi([dict(issue(7, state="open"), body=body(run_id=151))], unindexed={7})) == "skip"
+    assert decide(FakeApi([issue(7)], unindexed={7})) == 7
 
 
 def test_only_a_bot_close_within_a_week_reopens():
@@ -164,7 +166,7 @@ def run_main(monkeypatch, tmp_path, api):
 
 
 def test_an_api_error_before_reopening_leaves_filing_to_the_report_step(monkeypatch, tmp_path):
-    api = FakeApi([issue(7)], fail=lambda m, p: p.startswith("search/"))
+    api = FakeApi([issue(7)], fail=lambda m, p: p.startswith(f"repos/{REPO}/issues?"))
     assert run_main(monkeypatch, tmp_path, api) == "action=file\n"
 
 
