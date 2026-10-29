@@ -10,7 +10,9 @@ name: CUTracer Sanitizer
 # files each finding as an issue, one per GPU, kernel and source file, labeled
 # cutracer, and closes the issues of kernels it checked that came back clean.
 # It also files one issue per test function that passes without CUTracer but
-# fails twice under random delay; those stay open until closed by hand.
+# fails twice under random delay; those stay open until closed by hand. Every run
+# but a pull request reduces each such failure with cutracer reduce to the few
+# delayed instructions that still trigger it.
 # Pull requests report in the job summary only, and fail only on such a race
 # in a test function that has no open issue yet.
 #

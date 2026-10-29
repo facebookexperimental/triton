@@ -1263,7 +1263,6 @@ def matmul_kernel_tma_ws_blackwell(
 
     with tlx.async_tasks(
             exclusive=True,
-            no_ending_cluster_sync=True,
             mbarrier_try_wait_suspend_ns=50000,
     ):
         with tlx.async_task("default"):  # epilogue consumer

@@ -152,18 +152,73 @@ def test_hstu_cross_attn_gqa(heads_kv):
 
 
 @requires_gfx950
-@pytest.mark.parametrize("splits", [2, 3, 8])
-@pytest.mark.parametrize("num_softmax_heads", [0, 1, 2])
-def test_hstu_cross_attn_split_kv(splits, num_softmax_heads, monkeypatch):
-    # The split heuristic only fires on large shapes; force the count. The KV
-    # lengths give empty chunks, partial last blocks and several full blocks
-    # per chunk, and the backward reads the merged M.
-    from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_softmax_heads", [0, 2])
+@pytest.mark.parametrize(
+    "lengths_kv,lengths_q",
+    [
+        # Fewer (q tile, KV block) units than CUs: most programs get no work.
+        ([256, 100, 64, 0], [128, 31, 64, 5]),
+        # Tiles split across programs, ranges spanning several tiles, empty q and KV sequences.
+        ([3000, 0, 1500, 640, 2048, 33], [700, 300, 0, 513, 1024, 256]),
+        # Enough q tiles that the partition charges each one a fixed cost.
+        ([512] * 64, [800] * 64),
+    ],
+)
+def test_hstu_cross_attn_stream_k(dtype, num_softmax_heads, lengths_kv, lengths_q, monkeypatch):
+    from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k, gfx950
 
-    monkeypatch.setenv(gfx950.KV_SPLITS_ENV, str(splits))
-    torch.manual_seed(1009)
-    _run([0, 5, 64, 100, 257, 640, 1000], [3, 17, 64, 65, 128, 129, 200], heads=2, num_softmax_heads=num_softmax_heads,
-         dtype=torch.bfloat16, check_backward=True)
+    calls = []
+    stream_k_fwd = gfx950.stream_k_fwd
+    monkeypatch.setattr(gfx950, "stream_k_fwd", lambda *args: calls.append(args) or stream_k_fwd(*args))
+    torch.manual_seed(1021)
+    _run(lengths_kv, lengths_q, heads=2, num_softmax_heads=num_softmax_heads, dtype=dtype,
+         check_backward=num_softmax_heads > 0)
+    assert calls
+    # Each split tile's merge resets its handoff counter, so the next launch starts clean.
+    for flags in _forward_stream_k._FLAGS.values():
+        assert int(flags.abs().sum()) == 0
+
+
+def _inference_inputs(lengths_kv, lengths_q, heads=2, dim=128, dtype=torch.bfloat16):
+    device = torch.device("cuda")
+    seq_offsets = _offsets(torch.tensor(lengths_kv, device=device))
+    seq_offsets_q = _offsets(torch.tensor(lengths_q, device=device))
+
+    def rand(total):
+        return torch.empty((total, heads, dim), dtype=dtype, device=device).uniform_(-0.1, 0.1)
+
+    max_kv_len, max_q_len = max(lengths_kv), max(lengths_q)
+    attn_scale = torch.tensor(1.0 / (max_kv_len + max_q_len), device=device)
+    return dict(q=rand(int(seq_offsets_q[-1])), k=rand(int(seq_offsets[-1])), v=rand(int(seq_offsets[-1])),
+                seq_offsets=seq_offsets, seq_offsets_q=seq_offsets_q, max_seq_len=max_kv_len, max_q_len=max_q_len,
+                attn_scale=attn_scale, alpha=dim**-0.5, num_softmax_heads=heads)
+
+
+@requires_gfx950
+def test_hstu_cross_attn_stream_k_cuda_graphs():
+    # Graphs captured on the shared default capture stream each take their own flags, not the eager cache's.
+    from triton.tlx.ops import hstu_cross_attn
+    from triton.tlx.ops.kernels.hstu_cross_attn import _forward_stream_k
+
+    torch.manual_seed(1031)
+    inputs = [_inference_inputs([3000, 1500, 640], [700, 513, 256]), _inference_inputs([512] * 8, [800] * 8)]
+    with torch.inference_mode():
+        eager = [hstu_cross_attn(**a).clone() for a in inputs]
+        cached = set(_forward_stream_k._FLAGS)
+        graphs, outs = [], []
+        for a in inputs:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outs.append(hstu_cross_attn(**a))
+            graphs.append(graph)
+        assert set(_forward_stream_k._FLAGS) == cached
+        for _ in range(3):
+            for graph in graphs:
+                graph.replay()
+        torch.cuda.synchronize()
+    for out, ref in zip(outs, eager):
+        assert torch.equal(out, ref)
 
 
 @requires_gfx950
@@ -203,8 +258,8 @@ def test_hstu_cross_attn_curated_space_narrows_the_grid_per_head_dim():
     # A head dim with no curated list tunes the whole grid.
     for head_dim in (16, 32, 256):
         assert xa._prune_fwd_to_curated(grid, {}, HEAD_DIM=head_dim) == grid
-    for kernel in (xa._tlx_gfx950_cross_attn_fwd, xa._tlx_gfx950_cross_attn_fwd_split_kv):
-        assert len(kernel.curated.configs) == len(kernel.full.configs) == len(grid)
+    kernel = xa._tlx_gfx950_cross_attn_fwd
+    assert len(kernel.curated.configs) == len(kernel.full.configs) == len(grid)
     # The backward space is small already, so its curated space is the full one.
     assert xa._tlx_gfx950_cross_attn_bwd.curated is xa._tlx_gfx950_cross_attn_bwd.full
 
@@ -229,21 +284,53 @@ def test_hstu_cross_attn_defaults_to_the_curated_space(monkeypatch):
 
 @requires_gfx950
 @pytest.mark.parametrize("num_softmax_heads", [0, 1])
-@pytest.mark.parametrize("splits", [1, 3])
 @pytest.mark.parametrize("index", range(8))
-def test_hstu_cross_attn_each_curated_config_is_correct(index, splits, num_softmax_heads, monkeypatch):
-    # Autotuning only runs the configs that win, so pin each curated config in
-    # turn, through the plain forward (1 split) and the split-KV forward.
+def test_hstu_cross_attn_each_curated_config_is_correct(index, num_softmax_heads, monkeypatch):
+    # Autotuning only runs the configs that win, so pin each curated config in turn.
     xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
     curated = xa._fwd_curated_configs()
     assert len(curated) == len(xa._FWD_CURATED) == 8
-    for kernel in (xa._tlx_gfx950_cross_attn_fwd, xa._tlx_gfx950_cross_attn_fwd_split_kv):
-        monkeypatch.setattr(kernel.curated, "configs", [curated[index]])
-        monkeypatch.setattr(kernel.curated, "cache", {})
-    monkeypatch.setenv(xa.KV_SPLITS_ENV, str(splits))
+    kernel = xa._tlx_gfx950_cross_attn_fwd
+    monkeypatch.setattr(kernel.curated, "configs", [curated[index]])
+    monkeypatch.setattr(kernel.curated, "cache", {})
+    monkeypatch.setenv(xa.STREAM_K_ENV, "0")
     torch.manual_seed(1013)
     _run([0, 5, 64, 100, 257, 640, 1000], [3, 17, 64, 65, 128, 129, 200], heads=2, num_softmax_heads=num_softmax_heads,
          dtype=torch.bfloat16, check_backward=True, space="curated")
+
+
+@requires_gfx950
+@pytest.mark.parametrize("alpha_sign", [1.0, -1.0])
+@pytest.mark.parametrize("nonkdim", [16, 32])
+def test_hstu_cross_attn_lazy_softmax_rescale(nonkdim, alpha_sign, monkeypatch):
+    # BF16 softmax with distinct K/V on the double-buffered path rescales lazily. Key norms ramp up along each
+    # sequence, so row maxima grow between KV blocks both by more and by less than the rescale threshold; a negative
+    # alpha takes the path that negates q.
+    from triton.tlx.ops import hstu_cross_attn
+    from triton.tlx.ops.kernels.hstu_cross_attn._reference import pytorch_hstu_cross_mha
+
+    xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
+    config = next(c for c in xa._fwd_curated_configs()
+                  if c.num_stages == 2 and c.kwargs["matrix_instr_nonkdim"] == nonkdim)
+    kernel = xa._tlx_gfx950_cross_attn_fwd
+    monkeypatch.setattr(kernel.curated, "configs", [config])
+    monkeypatch.setattr(kernel.curated, "cache", {})
+    monkeypatch.setenv(xa.STREAM_K_ENV, "0")
+    torch.manual_seed(1031)
+    lengths_kv, lengths_q, heads, dim = [1000, 129, 64, 7], [200, 65, 1, 64], 2, 64
+    seq_offsets = _offsets(torch.tensor(lengths_kv, device="cuda"))
+    seq_offsets_q = _offsets(torch.tensor(lengths_q, device="cuda"))
+    ramp = torch.cat([torch.linspace(0.1, 6.0, n, device="cuda") for n in lengths_kv])
+    q = torch.randn(sum(lengths_q), heads, dim, device="cuda").bfloat16()
+    k = (torch.randn(sum(lengths_kv), heads, dim, device="cuda") * ramp[:, None, None]).bfloat16()
+    v = torch.empty_like(k).uniform_(-1, 1)
+    attn_scale = torch.tensor(1.0 / 1000, device="cuda")
+    alpha = alpha_sign * dim**-0.5
+    out = hstu_cross_attn(q, k, v, seq_offsets, max(lengths_kv), attn_scale, alpha=alpha, seq_offsets_q=seq_offsets_q,
+                          max_q_len=max(lengths_q), num_softmax_heads=1, space="curated")
+    ref = pytorch_hstu_cross_mha(max(lengths_q), max(lengths_kv), alpha, q.float(), k.float(), v.float(), attn_scale,
+                                 seq_offsets_q, seq_offsets, num_softmax_heads=1)
+    torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=FWD_RTOL)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")

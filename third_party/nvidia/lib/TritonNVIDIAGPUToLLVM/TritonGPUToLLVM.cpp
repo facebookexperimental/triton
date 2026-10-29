@@ -512,16 +512,25 @@ LogicalResult ConvertTritonGPUToLLVM::prepareModule(ModuleOp mod,
   if (failed(maybeInsertClusterSync(mod, coveredInitOps)))
     return failure();
 
-  // Ordinary later cluster syncs may introduce synthetic WS regions during
-  // lowering. Reserve dispatch state before allocation, even if the original
-  // kernel had only one WS region.
-  if (!coveredInitOps.empty())
-    mod->removeAttr("ttg.single-warp-specialize");
+  // Single-WS lowering handles exactly one warp_specialize region, but lowering
+  // adds a synthetic region for each cluster sync that worker warps must join.
+  // Those regions need the multi-region dispatch loop, whose shared-memory
+  // state allocation must reserve. The cluster barrier insertion passes below
+  // run after allocation and add syncs only on SM90+ in logical multi-CTA
+  // modules, so conservatively drop single-WS for those.
+  bool droppedSingleWS = false;
+  if (triton::gpu::hasSingleWarpSpecialize(mod) &&
+      (NVIDIA::needsSyntheticWarpSpecialize(mod) ||
+       (computeCapability >= 90 &&
+        triton::gpu::TritonGPUDialect::getNumCTAs(mod) > 1))) {
+    mod->removeAttr(triton::gpu::AttrSingleWarpSpecializeName);
+    droppedSingleWS = true;
+  }
 
   ModuleAllocation allocation(
       mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
                targetInfo));
-  if (!coveredInitOps.empty())
+  if (!coveredInitOps.empty() || droppedSingleWS)
     triton::gpu::attachAllocationSizeAndOffsetAttr(mod, allocation);
   mlir::triton::nvidia_gpu::runClusterBarrierInsertion(allocation,
                                                        computeCapability);
