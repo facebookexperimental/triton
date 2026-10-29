@@ -225,7 +225,7 @@ def test_async_amd_desc_load_fused_correctness_gfx1250(device):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
-@pytest.mark.parametrize("row_offset,col_offset", [(-32, 0), (0, 64), (96, 96)])
+@pytest.mark.parametrize("row_offset,col_offset", [(-32, 0), (0, -32), (0, 64), (96, 96)])
 @pytest.mark.parametrize("clamp,set_bounds,pred", [(False, False, True), (True, False, True), (False, True, True),
                                                    (False, False, False)])
 def test_tdm_fused_positioned_offsets(device, row_offset, col_offset, clamp, set_bounds, pred):
@@ -234,13 +234,17 @@ def test_tdm_fused_positioned_offsets(device, row_offset, col_offset, clamp, set
     output = torch.empty((2, 64, 64), device=device, dtype=torch.float16)
     _tdm_fused_positioned_kernel[(1, )](a, b, output, row_offset, col_offset, pred, clamp, set_bounds)
     for index, source in enumerate((a, b)):
-        expected = source[32 + row_offset:96 + row_offset, col_offset:64 + col_offset].clone()
+        # Address the backing allocation directly: an unclamped negative
+        # column offset reads the preceding row's padding before column zero.
+        rows = 32 + row_offset + torch.arange(64, device=device)
+        cols = col_offset + torch.arange(64, device=device)
+        expected = source.flatten()[rows[:, None] * 256 + cols[None, :]]
         if set_bounds:
             expected[16:, :] = 0
             expected[:, 32:] = 0
         elif clamp:
             rows = 0 if row_offset < 0 else min(64, max(0, 128 - row_offset))
-            cols = min(64, max(0, 128 - col_offset))
+            cols = 0 if col_offset < 0 else min(64, max(0, 128 - col_offset))
             expected[rows:, :] = 0
             expected[:, cols:] = 0
         if index == 0 and not pred:
