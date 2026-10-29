@@ -30,8 +30,9 @@ packed as `uint8` along the K dimension with `lhs_k_pack`/`rhs_k_pack` true
 (the default); non-K-packed FP6 is rejected. The frontend builds
 `tt.dot_scaled` with `ScaleDotElemType::E2M3`/`E3M2`, and the IR verifier
 enforces the packing contract: with K-packing, a logical K dimension that is
-not a multiple of 4 is an error, and on the NVIDIA side the storage element
-type must be `i8`. Scale metadata follows the existing MX convention (e8m0
+not a multiple of 16 is an error (16 FP6 values form one 96-bit /
+12-byte dense group), and on the NVIDIA side the storage element type
+must be `i8`. Scale metadata follows the existing MX convention (e8m0
 scales, one per 32 values along K) with FP6-aware scale-factor deduction.
 
 The Triton interpreter (`TRITON_INTERPRET=1`) unpacks and decodes FP6, so
@@ -69,28 +70,42 @@ physically a `uint8` tensor; the 6-bit values are dense LSB-first packed
 codes inside the byte stream, packed along the K axis (last dim for LHS
 `[M, K]`, dim 0 for RHS `[K, N]`):
 
-- Every 4 consecutive logical values `e0..e3` (24 bits) occupy 3 bytes:
+- Within each 16-value group, every 4 consecutive logical values
+  `e0..e3` (24 bits) occupy 3 bytes:
   `b0 = e0 | e1[1:0]<<6`, `b1 = e1[5:2] | e2[3:0]<<4`,
   `b2 = e2[5:4] | e3<<2`. Code `i` lives in bits `[6*i, 6*i+6)` of the
   byte stream.
-- K logical elements therefore produce `3K/4` bytes of real packed data.
-- The physical K extent is then **padded back up to K bytes** with a trailing
-  quarter of zero bytes. A logical `[M, K]` FP6 matrix is a physical
-  `[M, K]` uint8 tensor: `[3K/4 packed bytes | K/4 ignored padding]` per row.
+- K logical elements therefore produce `3K/4` bytes of real packed data
+  (16 values per 12-byte group).
+  Host storage (`MXFP6Tensor`) is exactly that dense stream: a logical
+  `[M, K]` FP6 matrix is a physical `[M, 3K/4]` uint8 tensor with no
+  padding byte. This follows the group-of-16 granularity suggested
+  upstream: 16 FP6 values occupy 96 bits (12 bytes, three 32-bit words),
+  and gfx950 consumes 32 values (two such groups) per step.
+- Some kernels expand the dense stream into a logical-width register /
+  shared-memory tile on load (leading `3K/4` slots hold bytes, trailing
+  quarter masked off), and the Blackwell TMA path inserts padding bytes
+  in shared memory for the `mxf8f6f4` container format. Those are
+  on-chip/load-time representations of the same dense global stream,
+  not the host storage format.
 
-Consequences of the padded layout:
+Consequences of the dense layout:
 
-- Byte stride along K is 1:1 with logical elements, so row addressing is
-  trivial (`row_start = base + m*K` bytes) and every tile/offset computation
-  in "elements" doubles as a byte computation.
-- K must be a multiple of 4 (asserted in the IR verifier, the frontend, the
-  interpreter, and the lowering).
-- 25% of the bytes moved/stored are padding. This trades bandwidth for
-  addressing simplicity.
+- The tensor-level divisibility step is K % 16: 16 values per 96-bit
+  group. This is asserted in the frontend, the IR verifiers, and the
+  interpreter. Host packing alone only needs groups of 4 values
+  (3 bytes); the % 16 rule is the scaled-dot contract layered on top.
+- In `MXFP6Tensor` storage no bytes are padding: dense storage saves
+  25% of HBM traffic and footprint versus a padded 4-values-per-4-bytes
+  layout. The Blackwell TLX operator separately accepts logical-width
+  input tensors whose trailing quarter is ignored padding.
 - The 3-byte groups do not align to 16-byte lines (lcm(3,16)=48), so group
   boundaries drift within any 16-byte chunk. Unpacking code must assemble
   values from bytes spanning line boundaries; this is purely a consumer-side
   (register/smem) concern once alignment-safe movement is guaranteed.
+- Finer % 4 steps appear only inside lowering, where offsets/extents
+  within an already-validated % 16 tile step by 4 values (3 bytes); they
+  are not a tensor-level contract and do not admit K % 4 tensors.
 
 Scales are a separate plain uint8 tensor (e8m0, one scale per 32 K-elements)
 with no packing.
@@ -108,25 +123,31 @@ semantics are unchanged from uint8 loads.
 ### TMA (NVIDIA)
 
 There is no 6-bit TMA descriptor element type, and no FP6-specific TMA
-support. By design, FP6 tiles move through TMA as UINT8 tensors, which makes
-the padded layout of section 2 TMA-ready with one extra constraint:
+support. By design, FP6 tiles move through TMA as UINT8 tensors. The
+Blackwell native path additionally uses the padded shared-memory
+container of section 2 (`.b6x16_p32`), with one extra constraint. The
+descriptors formed in this stack today are over logical-width tensors
+(physical `[M, K]` uint8, dense stream in the leading `3K/4` of each
+row, as the Blackwell TLX operator takes), so their row stride is
+K bytes:
 
 - Tensor-map base address must be 16-byte aligned. This is free for normally
   allocated tensors, and every row starts 16-byte aligned as long as the row
   stride (K bytes) is a multiple of 16.
 - Non-inner strides must be multiples of 16 bytes, so a 2D TMA descriptor
-  over an FP6 tensor requires **K a multiple of 16** -- stricter than the
-  multiple-of-4 packing requirement. K values that are multiples of 4 but not
-  16 cannot use 2D TMA directly (1D bulk copies or `cp.async` remain
-  available).
-- Inner box dims must be multiples of 16 bytes, mapping 1:1 to logical
-  elements thanks to the padding.
+  over a logical-width FP6 tensor requires **K a multiple of 16** -- the
+  same step as the tensor-level contract of section 2, not a stricter
+  rule. Describing the dense `[M, 3K/4]` `MXFP6Tensor` stream directly
+  instead makes the row stride `3K/4` bytes, which is a multiple of 16
+  only when **K is a multiple of 64**; for K a multiple of 16 but not
+  64, 1D bulk copies or `cp.async` remain the fallback for the dense
+  stream.
+- Inner box dims must be multiples of 16 bytes.
 - Swizzle modes (32B/64B/128B) apply on the shared-memory side purely in byte
   terms, so standard swizzle selection works unchanged.
-- Cost: TMA moves the padding quarter too (25% dead bytes). A fully dense
-  (unpadded) layout would still be TMA-describable as uint8 when `3K/4` is a
-  multiple of 16, but byte index would no longer equal logical index and
-  every block-K offset would need x3/4 math with 4-element-boundary care.
+- TMA completion counts the packed global bytes (`3/4` of the logical
+  width); for the native path, padding is inserted in the shared-memory
+  container. It is not part of `MXFP6Tensor` storage.
 
 See `design/triton_tma_multicast.md` for TMA background; the same descriptor
 mechanics apply, with uint8 as the element type.
@@ -139,7 +160,7 @@ gfx1250. As with TMA, FP6 has no descriptor-level type: tiles move as packed
 uint8 bytes through the existing descriptor load path, and unpacking happens
 downstream. The standing TDM guidance applies unchanged -- in particular,
 keeping the inner-most block dim at 256 bytes for good TDM performance,
-which in the padded layout is 256 logical K elements.
+which in the logical-width load layout is 256 logical K elements.
 
 ### Async loads and pipelining
 
@@ -180,28 +201,29 @@ of two unless NPOT is explicitly enabled (gated by `TRITON_ALLOW_NPOT=1` /
 `knobs.language.allow_npot`, enforced in the frontend shape checks). FP6 fits
 this world as follows:
 
-- The only new divisibility rule is K % 4 == 0, which every power-of-two
-  K >= 4 already satisfies; in practice blocks use K = 64/128.
-- The padded-K global layout keeps byte addressing aligned with logical
-  addressing, so blocked/linear layouts over the uint8 tensor need no new
-  basis kinds.
+- The tensor-level divisibility rule is K % 16 == 0 (one 96-bit dense
+  group), which every power-of-two K >= 16 already satisfies; in practice
+  blocks use K = 64/128. Host packing by itself only requires % 4.
+- Kernels load the dense global stream into logical-width tiles, so
+  blocked/linear layouts over the uint8 tensor need no new basis kinds.
 - The shared-memory MMA operand view is the one place that reasons in packed
   bytes rather than logical elements: instruction K extents and K coordinates
   are converted with x3/4 math (sections 7 and 9). Byte-K extents such as 48
   or 96 are already non-powers-of-two, and the descriptor builder compares
   exact extents (not log2 sizes) precisely so these packed extents work.
 - The WMMA FP6 instruction shape `[16, 16, 96]` shows the same principle at
-  the instruction level: logical K 96 (a multiple of 4, not a power of two)
+  the instruction level: logical K 96 (a multiple of 16, not a power of two)
   with packed byte-K 72.
 
 ### If/when NPOT support is added
 
-The FP6 packing math itself is NPOT-agnostic: the % 4 asserts and x3/4
-conversions work for any K that is a multiple of 4, so K values like 12, 20,
-48, or 96 (multiples of 4, not powers of two) would flow through packing,
-scale-shape deduction (already % 4-based), and the smem/TMEM coord mapping
-unchanged. What NPOT enablement would additionally require is all in generic
-infrastructure, not FP6-specific:
+The FP6 packing math itself is NPOT-agnostic: the host-side % 4 packing
+and the lowering's intra-tile % 4 step math work for any multiple of 4,
+but the scaled-dot tensor contract requires multiples of 16, so K values
+like 48 or 96 (multiples of 16, not powers of two) would flow through
+packing, scale-shape deduction, and the smem/TMEM coord mapping
+unchanged once NPOT shapes are allowed. What NPOT enablement would
+additionally require is all in generic infrastructure, not FP6-specific:
 
 - Block tiling and swizzled/padded shared layouts that assume power-of-two
   bases would need NPOT-aware bases for the affected dims.
@@ -269,10 +291,11 @@ mapping lives at the MMA operand boundary, not in the memory subsystem.
 End to end, `tl.dot_scaled` with an FP6 operand compiles as follows:
 
 1. **Frontend** validates formats, requires K-packed uint8 storage for FP6,
-   computes unpacked dims (identity for FP6: packed K is already the padded
-   width), and deduces scale factors with FP6-aware K divisibility.
+   computes unpacked dims (identity for FP6: tensor shapes count logical
+   values, asserted % 16 for the 96-bit dense group), and deduces scale
+   factors with FP6-aware K divisibility.
 2. **IR** `tt.dot_scaled` carries `ScaleDotElemType::E2M3`/`E3M2`; verifiers
-   reject K dimensions not divisible by 4 (with K-pack) and non-i8 storage
+   reject K dimensions not divisible by 16 (with K-pack) and non-i8 storage
    on NVIDIA.
 3. **Accelerator matching refuses native FP6 MMA**: the NVIDIA MMAv5 pattern
    fails with "fp6 uses decompose upcast" ("fp6 cannot tile the tcgen05 K
@@ -320,8 +343,9 @@ execution keeps TMEM FP6-free via decompose-then-upcast.
 
 - FP6 requires K-packing; non-K-packed FP6 is rejected ("NYI: fp6 without
   K-packing").
-- K must be a multiple of 4 everywhere; 2D TMA descriptors additionally need
-  K a multiple of 16.
+- K must be a multiple of 16 at the tensor level everywhere (16 values
+  per 96-bit / 12-byte dense group); 2D TMA descriptors need the same
+  step. % 4 steps remain only as intra-tile lowering math.
 - No packed FP6 stores and no device-side FP6 quantize op exist; FP6
   production is host-side.
 - Native FP6 MMA (tcgen05/MFMA/WMMA consuming 6-bit data) is designed in the
