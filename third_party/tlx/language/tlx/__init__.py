@@ -107,8 +107,10 @@ from .types import (
     nv_mma_layout,
     nv_mma_shared_layout_encoding,
     padded_shared_layout_encoding,
+    partitioned_shared_layout_encoding,
     shared_linear_layout_encoding,
     amd_mfma_layout,
+    amd_wmma_layout,
     slice_layout,
     dot_operand_layout,
     reuse_group,
@@ -260,6 +262,7 @@ __all__ = [
     # mma_ops
     "dot_scaled",
     "require_amd_wmma_layout",
+    "amd_wmma_layout",
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",

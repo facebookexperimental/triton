@@ -1,5 +1,6 @@
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
@@ -42,13 +43,45 @@ static void sinkLayoutConversions(triton::FuncOp funcOp) {
   }
 }
 
+// Consecutive cond_barriers in a block open and close a window in which the
+// two warp groups are phase-shifted (e.g. around a ping-pong loop). A
+// conversion that exchanges data through shared memory inserts a workgroup
+// barrier; inside the window that barrier pairs with a different barrier in
+// the other group, so it may read data the other group has not written. Move
+// conversions out of the window, after its closing cond_barrier, when no use
+// precedes it.
+static void sinkLayoutConversionsPastCondBarriers(triton::FuncOp funcOp) {
+  funcOp.walk([](Block *block) {
+    SmallVector<triton::amdgpu::CondBarrierOp> barriers;
+    for (auto barrier : block->getOps<triton::amdgpu::CondBarrierOp>())
+      barriers.push_back(barrier);
+    for (size_t i = 0; i + 1 < barriers.size(); i += 2) {
+      Operation *open = barriers[i], *close = barriers[i + 1];
+      SmallVector<ttg::ConvertLayoutOp> convertOps;
+      for (auto it = std::next(Block::iterator(open)),
+                ie = Block::iterator(close);
+           it != ie; ++it)
+        if (auto convert = dyn_cast<ttg::ConvertLayoutOp>(&*it))
+          convertOps.push_back(convert);
+      for (auto convert : llvm::reverse(convertOps)) {
+        Operation *user = getFirstUseInSameBlock(convert);
+        if (!user || close->isBeforeInBlock(user))
+          convert->moveAfter(close);
+      }
+    }
+  });
+}
+
 } // namespace
 
 struct TritonAMDGPUSinkLayoutConversionsPass
     : public impl::TritonAMDGPUSinkLayoutConversionsBase<
           TritonAMDGPUSinkLayoutConversionsPass> {
 
-  void runOnOperation() override { sinkLayoutConversions(getOperation()); }
+  void runOnOperation() override {
+    sinkLayoutConversions(getOperation());
+    sinkLayoutConversionsPastCondBarriers(getOperation());
+  }
 };
 
 } // namespace mlir

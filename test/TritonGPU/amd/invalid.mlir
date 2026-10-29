@@ -1369,7 +1369,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %row: i32
   ) {
     %zero = arith.constant 0 : i32
-    // expected-error @+1 {{dynamic subslices do not support partitioned shared encodings}}
     %view = ttg.memdesc_dynamic_subslice %src[%row, %zero] : !ttg.memdesc<8x16xf16, #partitioned_dynamic, #smem_dynamic, mutable> -> !ttg.memdesc<1x16xf16, #partitioned_dynamic, #smem_dynamic, mutable, 8x16>
     tt.return
   }

@@ -534,7 +534,41 @@ struct MemDescDynamicSubsliceOpConversion
          llvm::zip_equal(smemObj.getOffsets(), adaptor.getOffsets()))
       offsetVals.push_back(b.add(oldOffset, dynamicOffset));
 
-    SharedMemoryObject resultObj(smemObj.getBases(), llvmElemTy, offsetVals);
+    SmallVector<Value> newBases = llvm::to_vector(smemObj.getBases());
+    auto encoding = srcTy.getEncoding();
+    auto part = dyn_cast<PartitionedSharedEncodingAttr>(encoding);
+    if (part && newBases.size() > 1) {
+      auto dynamicOffsets = llvm::to_vector(adaptor.getOffsets());
+      auto layoutOffsets = dropPipeliningDim<Value>(dynamicOffsets, encoding);
+      auto allocShape = dropPipeliningDim(srcTy.getAllocShape(), encoding);
+      if (layoutOffsets.size() != adaptor.getOffsets().size()) {
+        int64_t stride = getAllocationElems(encoding, allocShape);
+        stride /= newBases.size();
+        Value offset = b.mul(adaptor.getOffsets().front(), b.i32_val(stride));
+        // Apply padding based on the amount we move the base ptr, as
+        // MemDescIndexOp does.
+        if (auto padEnc = getPaddedEncoding(encoding)) {
+          auto paddingShifts = getPaddedSharedShifts(
+              padEnc, srcTy.getElementTypeBitWidth(), /*offsetInBytes=*/false);
+          offset = applyPadding(loc, rewriter, offset, paddingShifts);
+        }
+        for (Value &base : newBases)
+          base = b.gep(base.getType(), llvmElemTy, base, offset);
+      }
+      // As for static subslices, tile-aligned coordinates are bit-disjoint
+      // from the slice's local coordinates, and partitions vary faster than
+      // groups. Rotate the physical bases by the partition of the logical
+      // piece that the runtime offset selects.
+      auto shapePerCTA = getShapePerCTA(part, allocShape);
+      unsigned dim = part.getPartitionDim();
+      int64_t pieceSize = shapePerCTA[dim] / part.getNumLogicalPieces();
+      Value shift = b.urem(b.udiv(layoutOffsets[dim], b.i32_val(pieceSize)),
+                           b.i32_val(part.getNumPartitions()));
+      Value vector = LLVM::buildBasePtrVector(loc, rewriter, newBases);
+      for (unsigned i = 0; i < newBases.size(); ++i)
+        newBases[i] = b.extract_element(vector, b.xor_(shift, b.i32_val(i)));
+    }
+    SharedMemoryObject resultObj(newBases, llvmElemTy, offsetVals);
     rewriter.replaceOp(
         op, getStructFromSharedMemoryObject(loc, resultObj, rewriter));
     return success();

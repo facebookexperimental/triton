@@ -1,4 +1,6 @@
 // RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 | FileCheck %s
+// RUN: not triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 2>&1 | FileCheck %s --check-prefix=CLUSTER-ERROR
+// CLUSTER-ERROR: error: 'amdg.buffer_atomic_rmw' op cluster_scope requires gfx1250
 
 // Test buffer atomic RMW fadd with f32 on gfx1250
 // Verifies correct cache policy with SCOPE_DEV and fence generation
@@ -109,5 +111,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 27
     %ret4 = amdg.buffer_load %arg0[%offset] cacheModifier = cv evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
     tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: buffer_atomic_cluster_no_return
+  tt.func @buffer_atomic_cluster_no_return(%ptr: !tt.ptr<f32>, %offsets: tensor<32xi32, #blocked>, %values: tensor<32xf32, #blocked>) {
+    // CHECK: llvm.mlir.constant(8 : i32)
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"
+    %unused = amdg.buffer_atomic_rmw fadd, relaxed, gpu, %values, %ptr[%offsets] {cluster_scope = true} : !tt.ptr<f32> -> tensor<32xf32, #blocked>
+    tt.return
+  }
+  // CHECK-LABEL: buffer_atomic_cluster_return
+  tt.func @buffer_atomic_cluster_return(%ptr: !tt.ptr<f32>, %offsets: tensor<32xi32, #blocked>, %values: tensor<32xf32, #blocked>) -> tensor<32xf32, #blocked> {
+    // CHECK: llvm.mlir.constant(9 : i32)
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"
+    %old = amdg.buffer_atomic_rmw fadd, relaxed, gpu, %values, %ptr[%offsets] {cluster_scope = true} : !tt.ptr<f32> -> tensor<32xf32, #blocked>
+    tt.return %old : tensor<32xf32, #blocked>
+  }
+  // CHECK-LABEL: buffer_atomic_default_return
+  tt.func @buffer_atomic_default_return(%ptr: !tt.ptr<f32>, %offsets: tensor<32xi32, #blocked>, %values: tensor<32xf32, #blocked>) -> tensor<32xf32, #blocked> {
+    // CHECK: llvm.mlir.constant(17 : i32)
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"
+    %old = amdg.buffer_atomic_rmw fadd, relaxed, gpu, %values, %ptr[%offsets] : !tt.ptr<f32> -> tensor<32xf32, #blocked>
+    tt.return %old : tensor<32xf32, #blocked>
   }
 }

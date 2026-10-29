@@ -558,6 +558,24 @@ void init_triton_tlx_ir(py::module_ &m) {
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, std::move(ll)));
            })
+      .def("make_partitioned_shared_encoding_attr",
+           [](TritonOpBuilder &self, unsigned numPartitions, unsigned numGroups,
+              unsigned partitionDim, Attribute partitionLayout) -> Attribute {
+             auto shared = dyn_cast<ttg::SharedEncodingTrait>(partitionLayout);
+             if (!shared)
+               throw std::runtime_error(
+                   "partition layout must be a shared-memory encoding");
+             auto context = self.getContext();
+             auto emitDiagnostic = [&]() {
+               return mlir::emitError(UnknownLoc::get(context));
+             };
+             auto result = ttg::PartitionedSharedEncodingAttr::getChecked(
+                 emitDiagnostic, context, numPartitions, numGroups,
+                 partitionDim, shared);
+             if (!result)
+               throw std::runtime_error("invalid partitioned shared encoding");
+             return result;
+           })
       .def("make_shared_linear_encoding_attr",
            [](TritonOpBuilder &self,
               std::vector<std::vector<int32_t>> offsetBases,
@@ -1758,14 +1776,15 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_buffer_atomic_rmw",
           [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
              Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
-             std::optional<Value> mask, uint32_t contiguity) -> Value {
+             std::optional<Value> mask, uint32_t contiguity,
+             bool clusterScope) -> Value {
             return self.create<ttag::BufferAtomicRMWOp>(
                 value.getType(), op, ptr, offsets, value, Value() /*stride*/,
-                sem, scope, mask.value_or(Value()), contiguity);
+                sem, scope, mask.value_or(Value()), contiguity, clusterScope);
           },
           py::arg("op"), py::arg("ptr"), py::arg("offsets"), py::arg("value"),
           py::arg("sem"), py::arg("scope"), py::arg("mask").none(),
-          py::arg("contiguity"))
+          py::arg("contiguity"), py::arg("cluster_scope") = false)
       .def(
           "create_buffer_load_to_local",
           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,

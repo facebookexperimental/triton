@@ -359,8 +359,9 @@ def TTG_MemDescDynamicSubsliceOp
     keep the result in bounds and satisfy the same tile-alignment contract as
     static subslice offsets; violating either condition is undefined behavior.
 
-    Dynamic partition selection is not supported, so partitioned shared
-    encodings are rejected by the verifier.
+    For partitioned shared encodings, the logical offset also selects the
+    physical partition. The tile-alignment contract applies across partition
+    boundaries as well as within a partition.
   }];
 
   let arguments = (ins TTG_MemDescType:$src, Variadic<I32>:$offsets);
