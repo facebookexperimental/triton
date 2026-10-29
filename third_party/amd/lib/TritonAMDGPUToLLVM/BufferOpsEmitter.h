@@ -82,7 +82,7 @@ struct BufferEmitter {
 
   // Emit a predicated rocdl.raw.ptr.buffer.atomic.* RMWOp
   Value emitAtomicRMW(RMWOp rmwType, Type type, Value rsrcDesc, Value offset,
-                      Value data, Value pred, bool hasUsers);
+                      Value data, Value pred, bool hasUsers, bool clusterScope);
 
   // Emit a predicated rocdl.raw.ptr.buffer.atomic.cmpswap
   Value emitAtomicCAS(Type type, Value rsrcDesc, Value offset, Value casCmpVal,
@@ -101,8 +101,8 @@ private:
 
   // Fill buffer atomics arguments
   void fillCommonArgsAtomics(Type type, Value rsrcDesc, Value vOffsetElems,
-                             Value pred, bool hasUsers, int32_t &aux,
-                             SmallVector<Value> &args);
+                             Value pred, bool hasUsers, bool clusterScope,
+                             int32_t &aux, SmallVector<Value> &args);
 
   // Given a type, the buffer type can be either the same type
   // or a packed version. E.g., a vector of 8xfp16 can be bitcasted to

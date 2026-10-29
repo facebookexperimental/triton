@@ -169,7 +169,8 @@ Value BufferEmitter::emitAtomicCAS(Type type, Value rsrcDesc, Value offset,
   // and amdg.buffer_atomic_cas
   SmallVector<Value, 6> args{casStoreVal, casCmpVal};
   int32_t aux = 0;
-  fillCommonArgsAtomics(type, rsrcDesc, offset, pred, hasUsers, aux, args);
+  fillCommonArgsAtomics(type, rsrcDesc, offset, pred, hasUsers, false, aux,
+                        args);
 
   Value data = ROCDL::RawPtrBufferAtomicCmpSwap::create(
       rewriter, loc, bufferType, args[0], args[1], args[2], args[3], args[4],
@@ -181,7 +182,7 @@ Value BufferEmitter::emitAtomicCAS(Type type, Value rsrcDesc, Value offset,
 
 Value BufferEmitter::emitAtomicRMW(RMWOp rmwType, Type type, Value rsrcDesc,
                                    Value offset, Value data, Value pred,
-                                   bool hasUsers) {
+                                   bool hasUsers, bool clusterScope) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   VectorType vecTy = cast<VectorType>(data.getType());
   Type bufferType = getBufferOpType(type, true);
@@ -190,7 +191,8 @@ Value BufferEmitter::emitAtomicRMW(RMWOp rmwType, Type type, Value rsrcDesc,
 
   SmallVector<Value, 6> args{data};
   int32_t aux = 0;
-  fillCommonArgsAtomics(type, rsrcDesc, offset, pred, hasUsers, aux, args);
+  fillCommonArgsAtomics(type, rsrcDesc, offset, pred, hasUsers, clusterScope,
+                        aux, args);
 
   // TODO:
   //   The ops in ROCDL (e.g., RawPtrBufferAtomicFaddOp) have no return value,
@@ -316,7 +318,8 @@ void BufferEmitter::fillCommonArgs(Type type, Value rsrcDesc,
 
 void BufferEmitter::fillCommonArgsAtomics(Type type, Value rsrcDesc,
                                           Value vOffsetElems, Value pred,
-                                          bool hasUsers, int32_t &aux,
+                                          bool hasUsers, bool clusterScope,
+                                          int32_t &aux,
                                           SmallVector<Value> &args) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   // 1. Create the (masked) offset
@@ -334,7 +337,7 @@ void BufferEmitter::fillCommonArgsAtomics(Type type, Value rsrcDesc,
   // 2. Set the sgprOffset to 0
   Value sgprOffset = b.int_val(32, 0);
 
-  aux = targetInfo.getBufferAtomicCachePolicy(hasUsers);
+  aux = targetInfo.getBufferAtomicCachePolicy(hasUsers, clusterScope);
 
   // 4. Add the arguments
   args.push_back(rsrcDesc);

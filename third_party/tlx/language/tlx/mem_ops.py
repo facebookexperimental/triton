@@ -195,7 +195,9 @@ def buffer_atomic_add(
     adjacency width used to select packed atomics; values greater than one
     also anchor the selected layout so later optimization cannot invalidate
     that promise. FP16 and BF16 atomics require width two, including a mask
-    that is uniform across each adjacent pair.
+    that is uniform across each adjacent pair. ``scope="cluster"`` opts into
+    gfx1250 shader-engine scope: the caller must launch every workgroup
+    updating the same location in one cluster.
     """
     _verify_buffer_ops(ptr, offsets, mask)
 
@@ -220,7 +222,9 @@ def buffer_atomic_add(
 
     atomic_op = ir.ATOMIC_OP.FADD if value.dtype.is_floating() else ir.ATOMIC_OP.ADD
     semantic = _semantic._str_to_sem(sem)
-    sync_scope = _semantic._str_to_scope(scope)
+    scope = tl._unwrap_if_constexpr(scope)
+    cluster_scope = scope == "cluster"
+    sync_scope = _semantic._str_to_scope("gpu" if cluster_scope else scope)
     handle = _semantic.builder.create_buffer_atomic_rmw(
         atomic_op,
         ptr.handle,
@@ -230,6 +234,7 @@ def buffer_atomic_add(
         sync_scope,
         mask.handle if mask is not None else None,
         contiguity,
+        cluster_scope,
     )
     if contiguity > 1:
         # Lowering trusts this width as a per-thread adjacency guarantee.
@@ -1879,7 +1884,8 @@ def async_amd_descriptor_load(
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     layout = result.type.layout
-    if (not getattr(layout, "_tlx_default", False) and not isinstance(layout, tlx.padded_shared_layout_encoding)):
+    if (not getattr(layout, "_tlx_default", False)
+            and not isinstance(layout, (tlx.padded_shared_layout_encoding, tlx.partitioned_shared_layout_encoding))):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(

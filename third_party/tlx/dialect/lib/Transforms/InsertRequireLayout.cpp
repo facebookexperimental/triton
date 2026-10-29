@@ -1027,6 +1027,23 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
   if (isa<ttg::PaddedSharedEncodingAttr>(bufEncoding))
     return bufEncoding;
 
+  if (auto partitioned =
+          dyn_cast<ttg::PartitionedSharedEncodingAttr>(bufEncoding)) {
+    // Descriptor assignment uses the inner row layout, while the memdesc
+    // retains separate physical partition buffers. Do not collapse it to
+    // the inner padded encoding or retag it with a default allocation.
+    Attribute inner = partitioned.getPartitionLayout();
+    while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(inner))
+      inner = pinned.getPinnedLayout();
+    if (isa<ttg::PaddedSharedEncodingAttr>(inner))
+      return bufEncoding;
+    if (auto swizzled = dyn_cast<ttg::SwizzledSharedEncodingAttr>(inner)) {
+      if (swizzled.getMaxPhase() == 1)
+        return bufEncoding;
+    }
+    isExplicit = true;
+  }
+
   if (isExplicit) {
     // maxPhase=1 is an unpadded layout supported by TDM, including the
     // fallback for tiles wider than the descriptor's padding interval limit.
