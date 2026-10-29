@@ -403,7 +403,7 @@ CATALOG: tuple[OpSpec, ...] = (
     OpSpec(
         op="hstu_cross_attn",
         arch="gfx950",
-        variant="tlx_split_kv",
+        variant="tlx",
         impl="triton.tlx.ops.kernels.hstu_cross_attn.gfx950:hstu_cross_attn",
         invariant_vocab=_HSTU_DIMS,
         dtypes=_FP16,
