@@ -9,7 +9,8 @@ import triton
 import triton.language as tl
 from triton import knobs
 
-from triton._internal_testing import is_cuda, is_hip
+from triton._internal_testing import (is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250, is_hip_rdna3,
+                                      is_hip_rdna4, is_hip_rdna4m)
 
 
 def _allow_npot():
@@ -373,3 +374,78 @@ def test_npot_atomics(N):
     else:
         cas[(1, )](c, N=N)
         assert torch.equal(c, torch.arange(1, N + 1, device="cuda", dtype=torch.int32))
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("M, N, K", [(32, 32, 96), (48, 80, 32), (32, 32, 128)])
+def test_npot_dot(M, N, K):
+    """A padded K is zero-filled on both operands; the +1 makes the loaded pad
+    lanes nonzero. A padded M or N only adds rows and columns that the store
+    masks. (32, 32, 128) is the pow2 control."""
+
+    @triton.jit
+    def kernel(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+        m = tl.arange(0, M)
+        n = tl.arange(0, N)
+        k = tl.arange(0, K)
+        a = tl.load(A + m[:, None] * K + k[None, :]) + 1.0
+        b = tl.load(B + k[:, None] * N + n[None, :]) + 1.0
+        tl.store(C + m[:, None] * N + n[None, :], tl.dot(a, b))
+
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    c = torch.full((M, N), float("nan"), device="cuda")
+    kernel[(1, )](a, b, c, M=M, N=N, K=K)
+    torch.testing.assert_close(c, ((a + 1).double() @ (b + 1).double()).float(), atol=1e-2, rtol=1e-2)
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("K", [96, 128])
+def test_npot_dot_scaled(K):
+    """mxfp8 with K=96: scale pad lanes take 127 (1.0). The kernel inverts the
+    stored scales, so a loaded pad lane would be 0xFF (NaN). K=128 is the pow2
+    control."""
+    if is_cuda():
+        cc = torch.cuda.get_device_capability()
+        if cc < (8, 9):
+            pytest.skip("float8e4nv not supported on CUDA < 8.9")
+    if is_hip() and not (is_hip_cdna3() or is_hip_cdna4() or is_hip_rdna3() or is_hip_rdna4m() or is_hip_rdna4()
+                         or is_hip_gfx1250()):
+        pytest.skip("scaled_dot(e4m3, e4m3) only implemented for CDNA3, CDNA4, RDNA3, RDNA4, and above")
+
+    @triton.jit
+    def kernel(A, SA, B, SB, C, K: tl.constexpr):
+        m = tl.arange(0, 32)
+        k = tl.arange(0, K)
+        s = tl.arange(0, K // 32)
+        a = tl.load(A + m[:, None] * K + k[None, :])
+        b = tl.load(B + k[:, None] * 32 + m[None, :])
+        sa = ~tl.load(SA + m[:, None] * (K // 32) + s[None, :])
+        sb = ~tl.load(SB + m[:, None] * (K // 32) + s[None, :])
+        tl.store(C + m[:, None] * 32 + m[None, :], tl.dot_scaled(a, sa, "e4m3", b, sb, "e4m3"))
+
+    torch.manual_seed(0)
+    a = torch.randn(32, K, device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn(K, 32, device="cuda").to(torch.float8_e4m3fn)
+    sa = torch.randint(120, 134, (32, K // 32), device="cuda", dtype=torch.uint8)
+    sb = torch.randint(120, 134, (32, K // 32), device="cuda", dtype=torch.uint8)
+    c = torch.empty(32, 32, device="cuda")
+    kernel[(1, )](a, ~sa, b, ~sb, c, K=K)
+    if K != 128:
+        # The NPOT claim is equality with padding: the same kernel on the inputs
+        # zero-extended to K=128 (pad scale 127 is 1.0) gives the same bits.
+        F, n = torch.nn.functional, 128 - K
+        a2, b2 = F.pad(a.float(), (0, n)).to(a.dtype), F.pad(b.float(), (0, 0, 0, n)).to(b.dtype)
+        sa2, sb2 = F.pad(sa, (0, n // 32), value=127), F.pad(sb, (0, n // 32), value=127)
+        c2 = torch.empty_like(c)
+        kernel[(1, )](a2, ~sa2, b2, ~sb2, c2, K=128)
+        torch.testing.assert_close(c, c2, atol=0, rtol=0)
+        return
+    scale = lambda s: torch.exp2(s.double() - 127).repeat_interleave(32, dim=1)
+    ref = (a.double() * scale(sa)) @ (b.double() * scale(sb).T)
+    # On HIP, test_core.py test_scaled_dot's tolerance for e4m3.
+    atol, rtol = (1e-5, 1e-2) if is_hip() else (1e-3, 1e-3)
+    torch.testing.assert_close(c, ref.float(), atol=atol, rtol=rtol)

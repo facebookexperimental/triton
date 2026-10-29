@@ -396,6 +396,34 @@ LogicalResult Padder::admit(Operation *op) {
     fixups.push_back([this, rmw, type] { andLive(rmw, type); });
     return success();
   }
+  // A padded K is zero-filled on both operands and a scale pad is 1. A padded
+  // M or N only adds rows and columns that the store masks.
+  if (isa<DotOp, DotScaledOp>(op)) {
+    auto a = cast<RankedTensorType>(op->getOperand(0).getType());
+    if (!isNpot(a.getShape().take_back()))
+      return success();
+    SmallVector<std::pair<OpOperand *, bool>> operands = {
+        {&op->getOpOperand(0), false}, {&op->getOpOperand(1), false}};
+    if (auto scaled = dyn_cast<DotScaledOp>(op))
+      for (MutableOperandRange scale :
+           {scaled.getAScaleMutable(), scaled.getBScaleMutable()})
+        if (!scale.empty())
+          operands.push_back({&scale[0], true});
+    Builder b(op->getContext());
+    for (auto [operand, isScale] : operands) {
+      auto orig = cast<RankedTensorType>(operand->get().getType());
+      Type elem = orig.getElementType();
+      TypedAttr value = b.getZeroAttr(elem);
+      // Integer scale 127 is 1.0 as E8M0 (bias 127), a finite 1.875 as UE5M3.
+      if (isScale && isa<FloatType>(elem))
+        value = b.getFloatAttr(elem, 1.0);
+      else if (isScale)
+        value = b.getIntegerAttr(elem, 127);
+      fixups.push_back(
+          [this, operand, orig, value] { fill(*operand, orig, value); });
+    }
+    return success();
+  }
   return op->emitOpError("on an NPOT tensor is unsupported");
 }
 
