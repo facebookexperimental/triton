@@ -879,6 +879,11 @@ _SMALL_K_TILES = (
     (128, 128, 64, 8, 3),
     (128, 128, 128, 8, 2),
     (128, 256, 64, 8, 3),
+    # Narrow-N tiles with a deep BK=128 ring, for N of a few hundred or less:
+    # 600x2048->256, 600x960->256, 600x592->1.
+    (64, 32, 128, 4, 5),
+    (64, 16, 128, 4, 5),
+    (64, 128, 128, 4, 4),
 )
 # Skinny-M tiles for M <= 64, where the WGMMA M of 64 would be mostly padding.
 _SKINNY_SMALL_K_TILES = (
@@ -889,6 +894,10 @@ _SKINNY_SMALL_K_TILES = (
     (16, 64, 32, 2, 3),
     (32, 64, 64, 4, 2),
     (16, 32, 128, 2, 1),
+    # One tile per CTA streaming all of K through a 5-deep BK=128 ring, for
+    # mid-K skinny GEMMs (20x2048->3072, 20x1024->6144).
+    (32, 32, 128, 4, 5),
+    (32, 64, 128, 4, 5),
 )
 
 
@@ -1102,8 +1111,6 @@ def _tuned_for_fixed(space, shape, swap_ab, fixed, add_bias=False):
 
 _tuned.cache_clear = _tuned_for_fixed.cache_clear
 
-_SKINNY_MAX_MN = 256
-
 # (M, N, K, A row-major, B row-major, dtype) -> path chosen by the full space.
 _PATH_CACHE = {}
 # Tests pin one path, e.g. to exercise a pinned config of that kernel.
@@ -1116,8 +1123,7 @@ def _small_k_candidate(M, N, K, space):
     # Past the small-K range, one-tile-per-CTA (with split-K) can beat the
     # persistent WS kernel only on skinny shapes that underfill the GPU, and on
     # few-tile shapes with K up to 1024.
-    return (K <= _SMALL_K_MAX or _few_tile_small_k(M, N, K)
-            or (min(M, N) <= _SKINNY_MAX_MN and _mn_tiles(M, N, 128, 128) < _get_num_sms()))
+    return (K <= _SMALL_K_MAX or _few_tile_small_k(M, N, K) or _mn_tiles(M, N, 128, 128) < _get_num_sms())
 
 
 def _select_path(space, key, launchers):

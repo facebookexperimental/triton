@@ -495,7 +495,10 @@ def test_small_k_prune_splits_only_past_small_k():
     (7, 4992, 128, {"ws", "small_k"}),
     (7, 4096, 4096, {"ws", "small_k"}),
     (706, 3536, 128, {"ws", "small_k"}),
-    (706, 2560, 2560, {"ws"}),
+    # One wave of 128x128 tiles (120 on 132 SMs): the small-K kernel competes.
+    (706, 2560, 2560, {"ws", "small_k"}),
+    # Past one wave with K > 1024: WS only.
+    (706, 6144, 2560, {"ws"}),
 ])
 def test_full_space_selects_fastest_candidate(monkeypatch, M, N, K, candidates):
     from triton.tlx.ops import mm as tlx_mm
