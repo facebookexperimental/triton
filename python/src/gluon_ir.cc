@@ -32,7 +32,6 @@
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
-#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -353,8 +352,6 @@ template <typename CondT> void check(CondT &&cond, const char *msg) {
 
 // Upstream checkInvariants' check and message, but recoverable.
 void checkPow2OutDimSizes(ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
-  if (tt::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
-    return;
   for (auto [outDim, size] : outDims) {
     if (llvm::isPowerOf2_32(size))
       continue;
@@ -918,7 +915,18 @@ void init_gluon_ir(py::module_ &m) {
       .def("create_memdesc_reshape",
            [](GluonOpBuilder &self, Value src,
               std::vector<int64_t> &shape) -> Value {
-             return self.create<ttg::MemDescReshapeOp>(src, shape);
+             // The (src, shape) builder only asserts that inference succeeds.
+             std::string msg;
+             llvm::raw_string_ostream os(msg);
+             ScopedDiagnosticHandler handler(
+                 self.getContext(),
+                 [&](Diagnostic &diag) { printDiagStr(os, diag); });
+             ttg::MemDescType dstTy;
+             if (failed(ttg::MemDescReshapeOp::inferReturnTypes(
+                     self.getContext(), self.getLastLoc(),
+                     cast<ttg::MemDescType>(src.getType()), shape, dstTy)))
+               throw std::runtime_error(os.str());
+             return self.create<ttg::MemDescReshapeOp>(dstTy, src);
            })
       .def("create_memdesc_reinterpret",
            [](GluonOpBuilder &self, Type resultType, Value src) -> Value {

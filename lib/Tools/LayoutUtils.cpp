@@ -1,5 +1,6 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/GenericSwizzling.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
@@ -76,6 +77,14 @@ LinearLayout invertAndComposeBlockLocal(const LinearLayout &A,
                       /*requireSurjective=*/false);
 }
 
+// Under TRITON_ALLOW_NPOT an NPOT extent is held by its pow2 cover; the
+// coordinates past the extent are dead.
+static int64_t getCoverSize(int64_t size) {
+  if (!mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+    return size;
+  return llvm::PowerOf2Ceil(size);
+}
+
 LinearLayout
 ensureLayoutNotLargerThan(const LinearLayout &layout,
                           const llvm::SmallDenseMap<StringAttr, int64_t> &shape,
@@ -91,26 +100,12 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
 
   for (auto outDim : llvm::enumerate(layout.getOutDimNames())) {
     auto outDimName = outDim.value();
-    // actualSize/desiredSize are the true (possibly NPOT) sizes; span/
-    // shrinkTarget are their pow2-rounded counterparts used for basis counting.
     int32_t actualSize = layout.getOutDimSize(outDimName);
-    int32_t desiredSize = shape.lookup(outDimName);
+    int32_t desiredSize = getCoverSize(shape.lookup(outDimName));
     if (actualSize <= desiredSize) {
       continue;
     }
-    // NPOT desiredSize: shrink to the next pow2 and let the out-dim clamp below
-    // set the real size; modular reduction handles the overshoot at lowering.
-    // Zeroing the boundary basis instead would drop real elements. Pow2: no-op.
-    int32_t shrinkTarget =
-        llvm::isPowerOf2_32(desiredSize)
-            ? desiredSize
-            : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
-    // Count the shrink against the pow2 basis span, not the NPOT out-dim size
-    // (else a basis terminates early). Identity for pow2 actualSize.
-    int32_t span = llvm::isPowerOf2_32(actualSize)
-                       ? actualSize
-                       : static_cast<int32_t>(llvm::NextPowerOf2(actualSize));
-    assert(span % shrinkTarget == 0);
+    assert(actualSize % desiredSize == 0);
     // <inDimName, basisIdx, outValue>
     std::vector<std::tuple<StringAttr, int, int>> sortedBases;
     for (auto [inDimName, basis] : bases) {
@@ -126,7 +121,7 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
     // From the largest basis to the smallest.
     llvm::sort(sortedBases,
                [](auto a, auto b) { return std::get<2>(a) > std::get<2>(b); });
-    for (size_t i = 0; i < sortedBases.size() && span > shrinkTarget;) {
+    for (size_t i = 0; i < sortedBases.size() && actualSize > desiredSize;) {
       int outValue = std::get<2>(sortedBases[i]);
       do {
         auto inDimName = std::get<0>(sortedBases[i]);
@@ -138,9 +133,9 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
         }
       } while (i < sortedBases.size() &&
                std::get<2>(sortedBases[i]) == outValue);
-      // Duplicate bases encode the same output bit and shrink the span only
+      // Duplicate bases encode the same output bit and halve actualSize only
       // after every copy has been removed.
-      span >>= 1;
+      actualSize >>= 1;
     }
   }
   if (!broadcastRegisters) {
@@ -154,7 +149,8 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
   }
   auto outDims = layout.getOutDims();
   for (auto &[outDim, outDimSize] : outDims) {
-    outDimSize = std::min<int32_t>(outDimSize, shape.lookup(outDim));
+    outDimSize =
+        std::min<int32_t>(outDimSize, getCoverSize(shape.lookup(outDim)));
   }
 
   return LinearLayout(std::move(bases), std::move(outDims),
@@ -182,28 +178,9 @@ LinearLayout ensureLayoutNotSmallerThan(
   LinearLayout ret = layout;
   for (StringAttr outDimName : layout.getOutDimNames()) {
     int32_t actualSize = layout.getOutDimSize(outDimName);
-    int32_t desiredSize = shape.lookup(outDimName);
-    // Already covers the shape. This also handles a modular NPOT actualSize
-    // (e.g. re-lowering an already-built modular LinearEncodingAttr whose
-    // out-dim equals the shape): such a layout needs no growth, and the
-    // pow2 grow path below does not apply to it. Symmetric with
-    // ensureLayoutNotLargerThan's true-size early-exit.
-    if (actualSize >= desiredSize)
-      continue;
-    // Only a pow2 layout can still be too small here; grow it to the next
-    // pow2 >= an NPOT desiredSize (else desiredSize/actualSize floors, e.g.
-    // 192/128 == 1, and the register dim never grows, dropping real
-    // elements). A later ensureLayoutNotLargerThan clamps to the true NPOT
-    // size. Pow2: no-op.
-    assert(llvm::isPowerOf2_32(actualSize));
-    int32_t growTarget =
-        llvm::isPowerOf2_32(desiredSize)
-            ? desiredSize
-            : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
-    if (actualSize >= growTarget)
-      continue;
-    assert(growTarget % actualSize == 0);
-    ret *= LinearLayout::identity1D(growTarget / actualSize, kDim, outDimName);
+    int32_t desiredSize = getCoverSize(shape.lookup(outDimName));
+    assert(actualSize > desiredSize || desiredSize % actualSize == 0);
+    ret *= LinearLayout::identity1D(desiredSize / actualSize, kDim, outDimName);
     assert(ret.getOutDimSize(outDimName) >= desiredSize);
   }
   return ret;
@@ -234,13 +211,6 @@ standardOutDimPairs(MLIRContext *ctx, ArrayRef<int64_t> dstShape) {
 // Returns a 1D -> ND layout into [dim0, dim1, ...] that's equivalent to
 // creating a 1D -> 1D mapping of size product(shape) and then reshaping to
 // permute(shape, order).
-LinearLayout identity1DForShape(int32_t size, StringAttr inDim,
-                                StringAttr outDim) {
-  if (size == 0 || llvm::isPowerOf2_32(size))
-    return LinearLayout::identity1D(size, inDim, outDim);
-  return LinearLayout::modularIdentity1D(size, inDim, outDim);
-}
-
 LinearLayout identityStandardND(StringAttr inDimName, ArrayRef<unsigned> shape,
                                 ArrayRef<unsigned> order) {
   assert(shape.size() == order.size());
@@ -254,7 +224,7 @@ LinearLayout identityStandardND(StringAttr inDimName, ArrayRef<unsigned> shape,
   for (int i = 0; i < shape.size(); i++) {
     // Start with the most-minor dimension, which is order[0].
     int dim = order[i];
-    ret *= identity1DForShape(shape[dim], inDimName, outDimNames[dim]);
+    ret *= LinearLayout::identity1D(shape[dim], inDimName, outDimNames[dim]);
   }
   return ret;
 }
@@ -391,7 +361,7 @@ std::optional<ColumnAction> regPermForDivide(const LinearLayout &A,
   llvm::DenseMap<StringAttr, unsigned> log2QuotSize;
   for (StringAttr out : A.getOutDimNames()) {
     log2QuotSize[out] =
-        A.getOutDimSizeBits(out) - BBroadcast.getOutDimSizeBits(out);
+        A.getOutDimSizeLog2(out) - BBroadcast.getOutDimSizeLog2(out);
     if (log2QuotSize[out] < 0)
       return std::nullopt;
   }

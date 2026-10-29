@@ -126,8 +126,7 @@ bool filterWarpLocalScratchReuse(Operation *op1, Operation *op2,
     return false;
   auto srcLayout = triton::gpu::toLinearLayout(srcTy);
   auto dstLayout = triton::gpu::toLinearLayout(dstTy);
-  if (srcLayout.isModular() || dstLayout.isModular() ||
-      !srcLayout.isInjective() || !dstLayout.isInjective())
+  if (!srcLayout.isInjective() || !dstLayout.isInjective())
     return false;
   // Equal types can select different lowerings through forceWarpShuffle.
   // Both operations must actually use the shared-memory scratch image.

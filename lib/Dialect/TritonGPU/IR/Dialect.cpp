@@ -236,22 +236,6 @@ bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
                      ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
   auto llSrc = toLinearLayout(srcShape, srcEncoding);
   auto llDst = toLinearLayout(dstShape, dstEncoding);
-  // NPOT: getFreeVariableMasks() cannot distinguish two different ADD-mod-N
-  // maps, so distinct modular layouts compare "cheap" and callers skip the
-  // relayout -> scramble. A shape-changing modular view can never be proven a
-  // true no-op (the `llSrc != llDst` LinearLayout compare has holes for
-  // modular maps: some genuine reshapes still compare equal/"cheap" and fall
-  // through to a silent no-op repack in ViewOpToLLVM). Conservatively treat any
-  // modular view whose src and dst shapes differ as expensive so it is
-  // loud-rejected / routed through the real remap rather than silently
-  // scrambled. Same-shape modular views (identity) stay cheap. pow2 unaffected
-  // (isModular() is false).
-  if (llSrc.isModular() || llDst.isModular()) {
-    static const bool allowNpot =
-        mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-    if (allowNpot && srcShape != dstShape)
-      return true;
-  }
   // In case there are replicated value we need to make sure the new and old
   // layout have matching masks.
   for (auto [srcMask, dstMask] :
@@ -1389,34 +1373,12 @@ static CGAEncodingAttr linearToCGAEncodingAttr(const LinearLayout &ll) {
 // LinearEncodingTrait shared implementations
 //===----------------------------------------------------------------------===//
 
-// basesPerDim/orderPerDim need each basis of `dimName` to own at most one
-// output coordinate. Flattening the outputs (hasPowerOfTwoBases) checks that
-// only when every output size is a power of two, so NPOT layouts go per basis.
-static bool hasPerDimBases(const LinearLayout &ll, StringAttr dimName) {
-  auto isPow2Out = [&](StringAttr outDim) {
-    return llvm::isPowerOf2_32(ll.getOutDimSize(outDim));
-  };
-  if (llvm::all_of(ll.getOutDimNames(), isPow2Out))
-    return hasPowerOfTwoBases(
-        ll.sublayout({dimName}, llvm::to_vector(ll.getOutDimNames())));
-  return llvm::all_of(ll.getBases().lookup(dimName), [&](const auto &basis) {
-    int owners = 0;
-    for (auto [outDim, value] : llvm::zip(ll.getOutDimNames(), basis)) {
-      if (value == 0)
-        continue;
-      if (++owners > 1)
-        return false;
-      if (isPow2Out(outDim) && !llvm::isPowerOf2_32(value))
-        return false;
-    }
-    return true;
-  });
-}
-
 SmallVector<unsigned> LinearEncodingTrait::basesPerDim(const LinearLayout &ll,
                                                        StringAttr dimName,
                                                        bool skipBroadcast) {
-  if (!hasPerDimBases(ll, dimName))
+  auto dimLayout =
+      ll.sublayout({dimName}, llvm::to_vector(ll.getOutDimNames()));
+  if (!hasPowerOfTwoBases(dimLayout))
     llvm_unreachable("basesPerDim cannot decompose swizzled bases into "
                      "per-dimension counts.");
   auto rank = ll.getNumOutDims();
@@ -1426,7 +1388,9 @@ SmallVector<unsigned> LinearEncodingTrait::basesPerDim(const LinearLayout &ll,
 SmallVector<unsigned>
 LinearEncodingTrait::orderPerDim(const LinearLayout &ll, StringAttr dimName,
                                  ArrayRef<unsigned> defaultOrder) {
-  if (!hasPerDimBases(ll, dimName))
+  auto dimLayout =
+      ll.sublayout({dimName}, llvm::to_vector(ll.getOutDimNames()));
+  if (!hasPowerOfTwoBases(dimLayout))
     llvm_unreachable(
         "orderPerDim cannot determine dimension order for swizzled bases.");
   return orderPerDimImpl(ll, dimName, defaultOrder);
@@ -2141,7 +2105,7 @@ SharedLinearEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   LinearLayout withoutBroadcast =
       linearLayout.removeZeroBasesAlongDim(kOffset).removeZeroBasesAlongDim(
           kBlock);
-  if (!withoutBroadcast.isModular() && !withoutBroadcast.isInvertible()) {
+  if (!withoutBroadcast.isInvertible()) {
     return emitError()
            << "After removing the zero bases the layout must be bijective";
   }
@@ -3753,17 +3717,7 @@ struct TritonGPUInferLayoutInterface
     auto result =
         inferReshapeOpLegacyEncoding(srcShape, srcEnc, dstShape, dstEnc);
     if (succeeded(result)) {
-      // A modular (NPOT) reshape can get a legacy default->default encoding
-      // that looks like a cheap register no-op but is NOT order-preserving
-      // (getFreeVariableMasks cannot tell two ADD-mod-N maps apart). Lowering
-      // that as a no-op repack (ReshapeOpConversion) silently scrambles data in
-      // opt builds (the assert(!isExpensiveView) there is compiled out). If the
-      // inferred view is expensive, fall through to the LinearLayout-based
-      // inference (real remap / loud-fail) instead of returning the scrambling
-      // no-op. pow2 is unaffected: isExpensiveView's modular branch never
-      // fires, so pow2 default->default stays cheap -> byte-identical.
-      if (!isExpensiveView(srcShape, srcEnc, dstShape, dstEnc))
-        return result;
+      return result;
     }
     if (!isa<DistributedEncodingTrait>(srcEnc)) {
       return emitOptionalError(loc,
@@ -4067,30 +4021,10 @@ struct TritonGPUVerifyTensorLayoutInterface
     }
     if (llvm::any_of(rankedTy.getShape(),
                      [](int64_t i) { return !llvm::isPowerOf2_64(i); })) {
-      static const bool allowNpot =
-          mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-      if (!allowNpot) {
-        return makeErr() << "Layout has shape " << rankedTy.getShape()
-                         << ", but the tensor it's attached to has shape "
-                         << rankedTy.getShape()
-                         << " which is not a power of two.";
-      }
-      // Layouts whose modular (non-power-of-2) lowering is implemented.
-      // Dot-operand and MMA encodings (Nvidia WGMMA/MMAv5, AMD MFMA/WMMA) are
-      // admitted so an NPOT tl.dot's operand/result tensors pass verification
-      // under the flag; the modular LinearLayout they resolve to is lowered by
-      // the encoding-agnostic ADD+UREM path in applyLinearLayout.
-      if (!isa<BlockedEncodingAttr, SliceEncodingAttr, LinearEncodingAttr,
-               DotOperandEncodingAttr, NvidiaMmaEncodingAttr,
-               AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(layout)) {
-        return makeErr()
-               << "NPOT layout not yet supported: tensor shape "
-               << rankedTy.getShape()
-               << " has a non-power-of-2 dimension that is not supported by "
-                  "this distributed layout's lowering in this build yet "
-                  "(TRITON_ALLOW_NPOT only enables shapes handled by a landed "
-                  "NPOT slice).";
-      }
+      return makeErr() << "Layout has shape " << rankedTy.getShape()
+                       << ", but the tensor it's attached to has shape "
+                       << rankedTy.getShape()
+                       << " which is not a power of two.";
     }
     auto ll = toLinearLayout(rankedTy);
     ModuleOp module = op->getParentOfType<ModuleOp>();
@@ -4295,7 +4229,7 @@ std::string mlir::triton::gpu::getDistributedLayoutStr(LinearLayout &ll,
   StringAttr kWarp = StringAttr::get(ctx, "warp");
   StringAttr kBlock = StringAttr::get(ctx, "block");
 
-  int64_t tensorSize = ll.getTotalOutDimSizeProduct();
+  int64_t tensorSize = ll.getTotalOutDimSize();
   std::vector<std::string> elementMapping(tensorSize);
   std::vector<std::string> threadMapping;
   auto shape = convertType<int64_t>(llvm::to_vector(ll.getOutDimSizes()));
@@ -4526,6 +4460,44 @@ void TritonGPUDialect::initialize() {
   MemDescType::attachInterface<MemDescModel>(*getContext());
 }
 
+// Under TRITON_ALLOW_NPOT only encoding-less TTIR tensors may be NPOT. Op
+// traits miss block arguments and ops without TensorSizeTrait, so check every
+// value under the module or func that carries ttg.num-warps.
+static LogicalResult verifyEncodedTensorSizes(Operation *root) {
+  auto isNpotEncoded = [](Type type, int64_t &numElements) {
+    auto tensorTy = dyn_cast<RankedTensorType>(type);
+    if (!tensorTy || !tensorTy.getEncoding() || !tensorTy.hasStaticShape())
+      return false;
+    numElements = tensorTy.getNumElements();
+    return (numElements & (numElements - 1)) != 0;
+  };
+  WalkResult result = root->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    int64_t numElements = 0;
+    for (Type type : op->getResultTypes()) {
+      if (isNpotEncoded(type, numElements)) {
+        op->emitError("Number of elements must be power-of-two, but ")
+            << *op << " doesn't follow the rule (" << numElements << ")"
+            << " elements";
+        return WalkResult::interrupt();
+      }
+    }
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region) {
+        for (BlockArgument arg : block.getArguments()) {
+          if (isNpotEncoded(arg.getType(), numElements)) {
+            op->emitError("Number of elements must be power-of-two, but ")
+                << arg << " doesn't follow the rule (" << numElements << ")"
+                << " elements";
+            return WalkResult::interrupt();
+          }
+        }
+      }
+    }
+    return WalkResult::advance();
+  });
+  return failure(result.wasInterrupted());
+}
+
 LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
                                                          NamedAttribute attr) {
   // Verify that dialect attributes are attached to the right ops.
@@ -4541,6 +4513,9 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
            << attr.getName()
            << " which is expected only on `module` or `tt.func` ops";
   }
+  if (attr.getName() == AttrNumWarpsName && isa<ModuleOp, FuncOp>(op) &&
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+    return verifyEncodedTensorSizes(op);
 
   return success();
 }
