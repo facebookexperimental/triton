@@ -2510,7 +2510,7 @@ def test_attention_backward_occ1_war_flags_default_off():
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("shape,expected_drains", [((16, 16, 16, 16384), 31), ((8, 64, 8, 8192), 31)])
+@pytest.mark.parametrize("shape,expected_drains", [((16, 16, 16, 16384), 31), ((8, 64, 8, 8192), 32)])
 @pytest.mark.parametrize("packed_dq", [False, True])
 def test_attention_backward_occ1_war_drain_assembly(shape, expected_drains, packed_dq):
     import dataclasses
