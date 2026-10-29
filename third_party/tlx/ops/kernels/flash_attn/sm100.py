@@ -2816,7 +2816,7 @@ def _attn_bwd_ws(
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
 
-    with tlx.async_tasks(exclusive=True, less_reg_mma=True):
+    with tlx.async_tasks(exclusive=True, less_reg_mma=True, less_reg_header=True):
         # compute
         with tlx.async_task("default"):
             blk_idx = 0

@@ -169,6 +169,7 @@ def visit_withAsyncTasks(self, node):
     no_ending_cluster_sync = False
     mbarrier_try_wait_suspend_ns = None
     less_reg_mma = False
+    less_reg_header = False
     for kw in getattr(ws_context, "keywords", []):
         if kw.arg == "exclusive":
             exclusive = bool(_unwrap_if_constexpr(self.visit(kw.value)))
@@ -180,6 +181,8 @@ def visit_withAsyncTasks(self, node):
                 raise ValueError("mbarrier_try_wait_suspend_ns must be a non-negative integer")
         elif kw.arg == "less_reg_mma":
             less_reg_mma = bool(_unwrap_if_constexpr(self.visit(kw.value)))
+        elif kw.arg == "less_reg_header":
+            less_reg_header = bool(_unwrap_if_constexpr(self.visit(kw.value)))
 
     with enter_sub_region(self) as sr:
         liveins, _ = sr
@@ -305,6 +308,8 @@ def visit_withAsyncTasks(self, node):
             )
         if less_reg_mma:
             ws_op.set_attr("tlx.less_reg_mma", self.builder.get_unit_attr())
+        if less_reg_header:
+            ws_op.set_attr("tlx.less_reg_header", self.builder.get_unit_attr())
 
         # dry visit async task body to calculate captures
         index = 0

@@ -237,3 +237,22 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// A `tlx.less_reg_header` marker on the warp_specialize op is propagated to the
+// module (NVIDIA target), where the warp-specialize lowering reads it.
+// CHECK: module attributes {
+// CHECK-SAME: tlx.less_reg_header
+module {
+  tt.func @kernel_less_reg_header() {
+    ttg.warp_specialize() attributes {tlx.less_reg_header}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}

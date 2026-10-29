@@ -64,6 +64,7 @@ class async_tasks:
         no_ending_cluster_sync=False,
         mbarrier_try_wait_suspend_ns=None,
         less_reg_mma=False,
+        less_reg_header=False,
         **kwargs,
     ):
         self.exclusive = core._unwrap_if_constexpr(exclusive)
@@ -74,6 +75,11 @@ class async_tasks:
         # a few extra ALU ops for a much shorter live range, which avoids
         # register spilling in MMA-heavy tasks (e.g. FA4 backward).
         self.less_reg_mma = core._unwrap_if_constexpr(less_reg_mma)
+        # Hacky tuning knob. For unknown reasons, ptxas may spill %tid.x to
+        # local memory when it is computed in the warp-specialize header and
+        # kept live all the way into the tasks. This hides the header's %tid.x
+        # read in opaque inline PTX so each task reads %tid.x on its own.
+        self.less_reg_header = core._unwrap_if_constexpr(less_reg_header)
         if self.mbarrier_try_wait_suspend_ns is not None:
             if not isinstance(self.mbarrier_try_wait_suspend_ns, int) or self.mbarrier_try_wait_suspend_ns < 0:
                 raise ValueError("mbarrier_try_wait_suspend_ns must be a non-negative integer")
