@@ -65,11 +65,15 @@ def prepare(case: Case, space: str) -> Prepared:
     backward = case.direction == "bwd"
     dtype = getattr(torch, case.dtype)
     q, k, v, g, beta, cu_seqlens = inputs(B, T, H, head_dim, dtype, requires_grad=backward)
+    # The forward sizes its saved scratch from host offsets. Without this copy
+    # it reads them back from the GPU on every call, and that sync leaves
+    # nothing queued ahead of the GPU to time.
+    cu_seqlens_cpu = cu_seqlens.cpu()
 
     # The op returns a TritonBench-compatible `(output, None)` pair; the index
     # is free and keeps the closure returning something differentiable.
     tlx_fwd = lambda: tlx_kda(  # noqa: E731
-        q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens, space=space)[0]
+        q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, space=space)[0]
 
     flop_count = flops(*case.shape, case.direction)
     extra = {"chunks": (B * T) // CHUNK, "chunk": CHUNK}
