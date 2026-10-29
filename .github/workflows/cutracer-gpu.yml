@@ -71,8 +71,9 @@ jobs:
     # the job's limit, so a slow run ends as incomplete with its logs uploaded
     # instead of being cancelled. They allow about 1.5x the time the full
     # sm90 flash-attention test file took on an H100: memcheck 6.4 minutes,
-    # random delay 7.
-    timeout-minutes: 40
+    # random delay 7. Runs other than pull requests add up to 9 minutes of
+    # cutracer reduce.
+    timeout-minutes: 50
     permissions:
       id-token: write
       contents: read
@@ -143,12 +144,14 @@ jobs:
       - name: Run tests under random delay
         id: delay
         if: ${{ !cancelled() && steps.sanitize.outcome != 'skipped' }}
-        timeout-minutes: 10
+        timeout-minutes: 20
         env:
           TESTS: ${{ inputs.tests }}
           SANITIZER_FAILURES: ${{ steps.sanitize.outputs.failures }}
           KNOWN_RACES: ${{ inputs.known_races }}
           DELAY_NS: ${{ inputs.delay_ns }}
+          # Pull requests do not reduce: they would reduce a known race on every push.
+          REDUCE_BUDGET_S: ${{ github.event_name != 'pull_request' && '540' || '0' }}
         run: |
           . "${SETUP_SCRIPT}"
           readarray -t TEST_IDS < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["TESTS"])))')
@@ -164,8 +167,9 @@ jobs:
             ISSUES=(--issue-title-prefix "[CUTracer][${GPU^^}]" --issue-job "sanitize-${GPU}")
           fi
           # CUTracer also writes a file per kernel launch, hundreds of MB for a
-          # test file; only its main log and the delay configs go into the
-          # uploaded logs. A config replays a failure with --delay-load-path.
+          # test file; only its main log and the delay configs, minimal ones
+          # from cutracer reduce included, go into the uploaded logs. A config
+          # replays a failure with --delay-load-path.
           OUT="${RUNNER_TEMP}/random-delay"
           LOGS="${RUNNER_TEMP}/cutracer/random-delay"
           status=0
@@ -177,6 +181,7 @@ jobs:
             --logs "${LOGS}" \
             --sanitizer-failures "${SANITIZER_FAILURES}" \
             --known-races "${KNOWN_RACES}" \
+            --reduce-budget-s "${REDUCE_BUDGET_S}" \
             "${ISSUES[@]}" \
             "${TEST_IDS[@]}" || status=$?
           cp "${OUT}"/cutracer_main_*.log "${LOGS}/" || true
