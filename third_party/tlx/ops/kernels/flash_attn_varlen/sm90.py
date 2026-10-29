@@ -22,6 +22,11 @@ the column coordinate.
   those scores are masked to ``-inf`` before the softmax, so they weigh 0.
 - The last query tile of a sequence is written with a row mask, because a TMA
   store would spill into the next sequence's rows.
+- The output is a single pointer argument. Full tiles are stored through a TMA
+  descriptor that the kernel builds from that pointer, so a traced launch, where
+  Inductor copies each mutated argument separately, keeps the TMA store. The
+  descriptor is written to a slot of a small buffer the launch passes in rather
+  than to Triton's global scratch, so no launch path needs a Triton allocator.
 """
 
 import functools
@@ -30,6 +35,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from torch._library.triton import wrap_triton
 from torch._subclasses.fake_tensor import FakeTensor
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -43,6 +49,13 @@ CONSUMER_REGISTERS = 240
 LOG2E = 1.4426950408889634
 NUM_TILE_BUFFERS = 3
 CLAIM_AHEAD = 2
+TMA_STORE = True
+
+
+@tl.core.builtin
+def _descriptor_slots(ptr, num, _semantic=None):
+    """``num`` 128-byte tensor descriptor slots starting at ``ptr``, indexed like ``tlx.allocate_tensor_descriptor``."""
+    return tlx.tensor_descriptor_ptr(ptr.handle, tl.core._unwrap_if_constexpr(num), 128)
 
 
 @triton.jit
@@ -107,11 +120,12 @@ def _flash_attn_varlen_fwd(
     desc_q,
     desc_k,
     desc_v,
-    desc_o,
     Out,
+    DescSlots,
     CuQ,
     CuK,
     Counter,
+    tokens_q,
     stride_ot,
     stride_oh,
     qk_scale,
@@ -123,6 +137,7 @@ def _flash_attn_varlen_fwd(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    TMA_STORE: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
     NUM_TILE_BUFFERS: tl.constexpr,
     CLAIM_AHEAD: tl.constexpr,
@@ -223,6 +238,10 @@ def _flash_attn_varlen_fwd(
             accum_cnt_q = 0
             accum_cnt_tile = 0
             cid: tl.constexpr = tlx.async_task_replica_id()
+            if TMA_STORE:
+                slots = _descriptor_slots(DescSlots + prog_id * NUM_MMA_GROUPS * 128, NUM_MMA_GROUPS)
+                desc_o = tlx.make_tensor_descriptor(slots[cid], Out, shape=[tokens_q, H * HEAD_DIM],
+                                                    strides=[stride_ot, 1], block_shape=[BLOCK_M_SPLIT, HEAD_DIM])
 
             # Bootstrap the pingpong sequence once before the persistent tile loop.
             if SERIALIZE_QK and cid == 1:
@@ -322,7 +341,7 @@ def _flash_attn_varlen_fwd(
                     # A row that sees no key has l_i = 0 and writes 0.
                     inv_l = 1.0 / tl.where(l_i == 0.0, 1.0, l_i)
                     o_tile = (acc * inv_l[:, None]).to(Out.dtype.element_ty)
-                    if m_block * BLOCK_M + (cid + 1) * BLOCK_M_SPLIT <= q_len:
+                    if TMA_STORE and m_block * BLOCK_M + (cid + 1) * BLOCK_M_SPLIT <= q_len:
                         desc_o.store([q_start + m_block * BLOCK_M + cid * BLOCK_M_SPLIT, off_h * HEAD_DIM], o_tile)
                     else:
                         tl.store(o_ptrs, o_tile, mask=row_ok)
@@ -335,23 +354,40 @@ def _num_sms(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def _has_address(x):
+    try:
+        x.data_ptr()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _unaligned(x):
+    if _has_address(x):
+        return x.data_ptr() % 16 != 0
+    # A traced tensor has no address, but its storage offset still places it. Inductor realigns a misaligned
+    # runtime input only when the traced one was aligned, so an unaligned traced input must be copied here.
+    return (x.storage_offset() * x.element_size()) % 16 != 0
+
+
 def _rows(x):
     """``x`` as a TMA-addressable ``(tokens, heads * head_dim)`` matrix: heads dense in a row, rows 16-byte aligned."""
     tokens, heads, head_dim = x.shape
     if (heads > 1 and x.stride(1) != head_dim) or x.stride(2) != 1 or (x.stride(0) * x.element_size()) % 16 != 0:
         x = x.contiguous()
-    if x.data_ptr() % 16 != 0:
+    if _unaligned(x):
         # `contiguous()` returns a contiguous input as is, so only a copy moves the base.
         x = x.clone()
-    return x
-
-
-def _descriptor(x, rows):
-    return TensorDescriptor(x, [x.shape[0], x.shape[1] * x.shape[2]], [x.stride(0), 1], [rows, x.shape[2]])
+    return x.view(tokens, heads * head_dim)
 
 
 def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scale, causal):
-    """Launch the forward; inputs are validated by ``tlx.ops.flash_attn_varlen``."""
+    """Launch the forward; inputs are validated by ``tlx.ops.flash_attn_varlen``.
+
+    The launch goes through ``wrap_triton`` and every host descriptor is built with ``from_tensor`` over a 2-D view,
+    so ``torch.compile`` and AOTInductor can trace it. The output descriptor is built inside the kernel from the
+    output pointer, in a descriptor slot this launch allocates, so it needs no Triton allocator.
+    """
     if isinstance(q, FakeTensor):
         return torch.empty_like(q)
     tokens_q, heads, head_dim = q.shape
@@ -368,17 +404,21 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scal
         return out.zero_()
     block_n = 128
     num_buffers = 3 if head_dim == 64 and not causal else 2
-    desc_q = _descriptor(_rows(q), BLOCK_M // NUM_MMA_GROUPS)
-    desc_k = _descriptor(_rows(k), block_n)
-    desc_v = _descriptor(_rows(v), block_n)
-    desc_o = _descriptor(out, BLOCK_M // NUM_MMA_GROUPS)
-    grid = (min(total_tiles, _num_sms(q.device)), )
+    split = BLOCK_M // NUM_MMA_GROUPS
+    out_rows = out.view(tokens_q, heads * head_dim)
+    desc_q = TensorDescriptor.from_tensor(_rows(q), [split, head_dim])
+    desc_k = TensorDescriptor.from_tensor(_rows(k), [block_n, head_dim])
+    desc_v = TensorDescriptor.from_tensor(_rows(v), [block_n, head_dim])
     counter = torch.zeros(1, device=q.device, dtype=torch.int32)
-    _flash_attn_varlen_fwd[grid](desc_q,
-                                 desc_k, desc_v, desc_o, out, cu_seqlens_q, cu_seqlens_k, counter, out.stride(0),
-                                 out.stride(1), sm_scale * LOG2E, heads, heads // kv_heads, num_m_blocks, total_tiles,
-                                 HEAD_DIM=head_dim, BLOCK_M=BLOCK_M, BLOCK_N=block_n, CAUSAL=causal,
-                                 NUM_BUFFERS=num_buffers, NUM_TILE_BUFFERS=NUM_TILE_BUFFERS, CLAIM_AHEAD=CLAIM_AHEAD,
-                                 NUM_MMA_WARPS=NUM_MMA_WARPS, NUM_MMA_GROUPS=NUM_MMA_GROUPS,
-                                 CONSUMER_REGISTERS=CONSUMER_REGISTERS, num_warps=4, num_stages=1)
+    # AOTI captures the build device's SM count. On smaller GPUs, queued CTAs own their first tiles until scheduled.
+    num_sms = _num_sms(q.device)
+    desc_slots = torch.empty(num_sms * NUM_MMA_GROUPS * 128, device=q.device, dtype=torch.int8)
+    kernel = wrap_triton(_flash_attn_varlen_fwd)[(num_sms, )]
+    with torch.cuda.device(q.device):
+        kernel(desc_q, desc_k, desc_v, out_rows, desc_slots, cu_seqlens_q, cu_seqlens_k, counter, tokens_q,
+               out_rows.stride(0), head_dim, sm_scale * LOG2E, heads, heads // kv_heads, num_m_blocks, total_tiles,
+               HEAD_DIM=head_dim, BLOCK_M=BLOCK_M, BLOCK_N=block_n, CAUSAL=causal, TMA_STORE=TMA_STORE,
+               NUM_BUFFERS=num_buffers, NUM_TILE_BUFFERS=NUM_TILE_BUFFERS, CLAIM_AHEAD=CLAIM_AHEAD,
+               NUM_MMA_WARPS=NUM_MMA_WARPS, NUM_MMA_GROUPS=NUM_MMA_GROUPS, CONSUMER_REGISTERS=CONSUMER_REGISTERS,
+               num_warps=4, num_stages=1)
     return out
