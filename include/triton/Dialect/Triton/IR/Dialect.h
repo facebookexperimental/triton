@@ -132,6 +132,12 @@ LogicalResult verifyDescriptorLoadStoreOp(Operation *op,
                                           TensorDescInterface desc,
                                           ShapedType tensor);
 
+// True for the MXFP6 scale element types (OCP FP6 e2m3/e3m2), which share
+// the dense-packed K contract in the scaled-dot verifiers.
+inline bool isMXFP6ScaleType(ScaleDotElemType type) {
+  return type == ScaleDotElemType::E2M3 || type == ScaleDotElemType::E3M2;
+}
+
 LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
                                 std::optional<ArrayRef<int64_t>> lhsScaleShape,
                                 ScaleDotElemType lhsFormat, bool lhsKPack,
