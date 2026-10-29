@@ -46,12 +46,17 @@ TEST_F(LayoutUtilsTest, SquareSublayoutIsIdentity) {
   EXPECT_TRUE(squareSublayoutIsIdentity(l3, {S("in1"), S("in2")}));
 }
 
-TEST_F(LayoutUtilsTest, IdentityStandardNDModular) {
+TEST_F(LayoutUtilsTest, EnsureLayoutNotSmallerThanNpotCover) {
+  auto layout = LinearLayout::identity1D(64, S("register"), S("dim0"));
+#ifndef NDEBUG
+  // Without the flag an NPOT extent still aborts.
+  EXPECT_DEATH(ensureLayoutNotSmallerThan(layout, {{S("dim0"), 192}}),
+               "isPowerOf2_32");
+#endif
   ScopedAllowNpot npot;
-  auto actual = identityStandardND(S("in"), {4, 6}, {1, 0});
-  auto expected = LinearLayout::modularIdentity1D(6, S("in"), S("dim1")) *
-                  LinearLayout::identity1D(4, S("in"), S("dim0"));
-  EXPECT_EQ(actual, expected);
+  // 192 / 64 floors to 3; the layout grows to the cover 256 instead.
+  EXPECT_EQ(ensureLayoutNotSmallerThan(layout, {{S("dim0"), 192}}),
+            LinearLayout::identity1D(256, S("register"), S("dim0")));
 }
 
 TEST_F(LayoutUtilsTest, OutputBasisMask) {

@@ -708,6 +708,9 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 
   Attribute dstEncoding;
   if (Attribute srcEnc = srcTy.getEncoding()) {
+    if (!llvm::equal(getNpotCoverShape(srcTy.getShape()), srcTy.getShape()) ||
+        !llvm::equal(getNpotCoverShape(dstShape), dstShape))
+      return emitOptionalError(loc, "NPOT reshape is not yet supported");
     if (failed(inferMemDescReshapeOpEncoding(srcTy.getShape(), srcEnc, dstShape,
                                              dstEncoding)))
       return failure();

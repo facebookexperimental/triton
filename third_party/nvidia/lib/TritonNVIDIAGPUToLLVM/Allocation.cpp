@@ -35,7 +35,7 @@ struct AllocateSharedMemoryNv
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    if (failed(mlir::triton::gpu::verifyNpotModularOpsSupported(mod)))
+    if (failed(mlir::triton::gpu::verifyNpotTypesSupported(mod)))
       return signalPassFailure();
     mlir::triton::NVIDIA::TargetInfo targetInfo(computeCapability, ptxVersion);
     ModuleAllocation allocation(
@@ -91,7 +91,7 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   // The smem has the same CGA layout as srcLayout, so use that instead.
   // Remove the number of elements duplicated in the CGA layout.
   auto nBlocks = product(triton::gpu::getCTASplitNum(srcTy.getEncoding()));
-  return smem.getTotalOutDimSizeProduct() / (reps * nBlocks);
+  return smem.getTotalOutDimSize() / (reps * nBlocks);
 }
 
 std::function<unsigned(Operation *)>
