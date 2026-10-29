@@ -34,8 +34,8 @@ Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can offer a
-fast first call. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
-configs are measurably faster; pass `space="heuristic"` for a fast first call.
+fast first call. `mm_mxfp8` defaults to "full" on sm100 because its tuned configs are measurably
+faster; gfx950 uses "heuristic". Pass `space="heuristic"` for a fast first call.
 `hstu_cross_attn` on gfx950 defaults to "curated": at head dims 64 and 128 it
 tunes eight forward configs picked from its 144-config "full" grid, which come
 within a few percent of it; other head dims tune the whole grid.
@@ -211,7 +211,7 @@ def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
                            f"got {a_scale.numel()} and {b_scale.numel()}")
 
 
-def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space=None):
     """``a @ b.T`` over pre-quantized MXFP8 inputs, returning BF16 ``[M, N]``.
 
     ``a`` is contiguous E4M3 ``[M, K]`` and ``b`` is contiguous E4M3 ``[N, K]``
@@ -222,9 +222,9 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     ``MXTensor.to_mx(..., is_swizzled_scales=True)``. A supplied ``out`` is
     returned by identity. Forward-only.
 
-    ``space`` defaults to "full" (autotune; the first call per shape compiles
-    and benchmarks the pruned space). "heuristic" launches one shape-picked
-    config without autotuning. A ``Space`` is also accepted; its invariance
+    ``space=None`` uses "full" on sm100 (autotuning) and "heuristic" on gfx950.
+    "heuristic" launches one shape-picked config without autotuning; gfx950
+    provides only this space. A ``Space`` is also accepted; its invariance
     request is validated but not enforced yet.
     """
     import torch
@@ -264,10 +264,12 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
         if any(torch._C._overlaps(out, tensor) for tensor in tensors):
             raise InvalidInput("tlx.ops.mm_mxfp8 out must not overlap any input")
     space_name, invariance = _normalize_space_arg("mm_mxfp8", space)
-    if space_name not in ("heuristic", "full"):
+    if space_name is not None and space_name not in ("heuristic", "full"):
         raise InvalidInput(f"tlx.ops.mm_mxfp8 does not provide space={space_name!r}")
 
     fn, spec = impl_for("mm_mxfp8", device=a.device)
+    if space_name is None:
+        space_name = spec.default_space
     tma_tensors = tensors if out is None else (*tensors, out)
     check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
     check_backward(spec, *tensors, out)

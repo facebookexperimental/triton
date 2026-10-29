@@ -118,7 +118,7 @@ def _assert_invalid_before_resolution(monkeypatch, inputs, match, **kwargs):
 def test_mm_mxfp8_catalog_entry():
     from triton.tlx.ops._catalog import CATALOG, InvalidInput, check_inputs, has_impl
 
-    specs = [spec for spec in CATALOG if spec.op == "mm_mxfp8"]
+    specs = [spec for spec in CATALOG if (spec.op, spec.arch) == ("mm_mxfp8", "sm100")]
     assert len(specs) == 1
     spec = specs[0]
     assert spec.arch == "sm100"
@@ -142,7 +142,7 @@ import inspect
 import sys
 from triton.tlx import ops
 assert 'triton.tlx.ops.kernels.mm_mxfp8.sm100' not in sys.modules
-assert str(inspect.signature(ops.mm_mxfp8)) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space='full')"
+assert str(inspect.signature(ops.mm_mxfp8)) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space=None)"
 assert 'mm_mxfp8' in ops.__all__
 """
     subprocess.run([sys.executable, "-c", script], check=True)
