@@ -200,6 +200,11 @@ def default_json(bench, suites=None) -> str:
     return f"/tmp/tlx_benchmark/{bench.OP}.{arch()}{suite_suffix}.json"
 
 
+def missing_focus_default(bench, *, synthetic=False, suites=None) -> bool:
+    registry = bench.SHAPE_SUITES
+    return not synthetic and suites is None and registry is not None and arch() not in registry.defaults
+
+
 def _selected_suite_names(bench, suites=None) -> tuple[str, ...]:
     registry = bench.SHAPE_SUITES
     return () if registry is None else registry.selected_suite_names(arch(), suites)
@@ -478,6 +483,9 @@ def main(bench, argv=None) -> int:
         print(f"device: gpu{device.index} {device.name} "
               f"({'least used' if args.device == 'auto' else 'requested'}, "
               f"{device.memory_used_mib:.0f} MiB in use)")
+    if missing_focus_default(bench, synthetic=args.synthetic, suites=args.suite):
+        print(f"{bench.OP} has no focus inputs configured for {arch()}; nothing measured")
+        return 0
     try:
         if not args.synthetic:
             _selected_suite_names(bench, args.suite)

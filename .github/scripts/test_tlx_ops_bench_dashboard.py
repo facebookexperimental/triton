@@ -89,6 +89,7 @@ def test_a_change_the_next_night_cannot_check_stays_unconfirmed(monkeypatch):
 @pytest.mark.parametrize("reason", [
     "addmm has no implementation for this device",
     "addmm has no cases matching the current filters",
+    "addmm has no focus inputs configured for sm100",
 ])
 def test_skipped_operator_remains_visible_without_measurements(tmp_path, reason):
     suite = ET.Element("testsuite")

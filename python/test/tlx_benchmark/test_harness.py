@@ -788,8 +788,6 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
 
     expected = {
         "triton.tlx.ops.kernels.addmm._shapes": {
-            "sm90": (),
-            "sm100": (),
             "gfx942": ("gfx942_all", ),
             "gfx950": ("gfx950_all", ),
         },
@@ -1019,6 +1017,22 @@ def test_suite_listing_shows_an_explicit_empty_default():
 
     bench = type("Bench", (), {"SHAPE_SUITES": FocusRegistry("fake", (), {"gfx950": ()})})
     assert driver.suite_listing(bench) == "gfx950 default => (none)"
+
+
+@pytest.mark.parametrize("arch", ["sm90", "sm100"])
+def test_unconfigured_focus_coverage_does_not_override_requested_inputs(monkeypatch, arch):
+    import bench_addmm
+    from _harness import driver
+
+    monkeypatch.setattr(driver, "arch", lambda: arch)
+    assert driver.missing_focus_default(bench_addmm)
+    assert not driver.missing_focus_default(bench_addmm, synthetic=True)
+    assert bench_addmm.cases(synthetic=True)
+    assert not driver.missing_focus_default(bench_addmm, suites=("gfx950_1", ))
+    assert bench_addmm.cases(suites=("gfx950_1", ))
+    assert not driver.missing_focus_default(bench_addmm, suites=("missing", ))
+    with pytest.raises(ValueError, match="unknown focus suite"):
+        bench_addmm.cases(suites=("missing", ))
 
 
 def test_suite_shape_listing_shows_typed_shapes():
