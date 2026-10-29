@@ -1715,6 +1715,7 @@ def _compile_attention_backward_kernel(config, shape, *, compile_options=None, c
                      PHASE_IGLP=config.phase_iglp, OCC1_DQ_FIRST=config.occ1_dq_first,
                      OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, OCC1_PAD_K=config.occ1_pad_k)
     constants["SPLIT_KV_STORES"] = config.occ1 and config.packed_dq and config.q_splits > 1
+    constants["MERGE_STATS"] = config.merge_stats
     tail_splits = getattr(config, "tail_splits", 1)
     tail_base = tail_owners = 0
     if tail_splits > 1:
@@ -1727,6 +1728,10 @@ def _compile_attention_backward_kernel(config, shape, *, compile_options=None, c
     signature = {name: "*bf16" for name in ("Q", "K", "V", "DO")}
     signature.update({name: "*fp32" for name in ("LSE", "Delta")})
     signature["DQA"] = "*bf16" if config.packed_dq else "*fp32"
+    if config.merge_stats:
+        signature["STATS_STRIDE"] = "i32"
+    else:
+        constants["STATS_STRIDE"] = 0
     signature.update({name: "*fp32" if config.q_splits > 1 else "*bf16" for name in ("DK", "DV")})
     if tail_splits > 1:
         signature.update(DK="*fp32", DV="*fp32", TAIL_DK="*bf16", TAIL_DV="*bf16")
@@ -1734,7 +1739,8 @@ def _compile_attention_backward_kernel(config, shape, *, compile_options=None, c
     if config.occ1:
         # Match runtime specialization: these buffers have a known byte range.
         qe, ke = b * hq * n * 128, b * hk * n * 128
-        sizes = dict(Q=qe * 2, K=ke * 2, V=ke * 2, DO=qe * 2, LSE=b * hq * n * 4, Delta=b * hq * n * 4,
+        sizes = dict(Q=qe * 2, K=ke * 2, V=ke * 2, DO=qe * 2, LSE=b * hq * n * 4,
+                     Delta=b * hq * n * 4 * (2 if config.merge_stats else 1),
                      DQA=qe * (2 if config.packed_dq else 4) * constants["DQ_SLICES"],
                      DK=ke * (4 * config.q_splits if config.q_splits > 1 else 2),
                      DV=ke * (4 * config.q_splits if config.q_splits > 1 else 2))
@@ -2320,7 +2326,8 @@ def _attention_backward_occ1_config(packed_dq, *, q_splits=1):
     return BackwardConfig(block_m=32, num_warps=4, stages=3, ordered=True, packed_dq=packed_dq, outer_m=64,
                           async_stats=True, queue_wmma=True, regalloc=True, q_splits=q_splits, waves_per_eu=1,
                           convert_block=8192 if q_splits > 1 and packed_dq else 4096, tile_major=True, cluster_dq=True,
-                          occ1=True, occ1_k_bands=2, occ1_load_after_dk=True, occ1_pad_k=not packed_dq or q_splits == 1)
+                          occ1=True, occ1_k_bands=2, occ1_load_after_dk=True, occ1_pad_k=not packed_dq or q_splits == 1,
+                          log2_lse=True, merge_stats=True)
 
 
 def _attention_backward_occ1_pad_k(config):
@@ -2465,15 +2472,17 @@ def test_attention_backward_occ1_assembly(shape, q_splits, packed_dq):
     assembly = kernel.asm["amdgcn"]
     assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
     assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
-    assert kernel.metadata.shared == (215520 if config.occ1_pad_k else 211440)
+    assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
     loop = _attention_backward_isa_loop(assembly)
+    # One merged LSE/Delta request joins Q and dO; a fourth request stalls the issue.
+    assert sum("tensor_load_to_lds" in line for line in loop) == 3
     if q_splits > 1:
         # Guaranteed prologue TDM issues must keep the two-stage lookahead;
         # a skippable prologue path previously clamped this wait to 0x1.
         tensor_waits = [
             int(value, 0) for line in loop for value in re.findall(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)", line)
         ]
-        assert 8 in tensor_waits
+        assert 6 in tensor_waits
         assert 1 not in tensor_waits
     wmma = sum("v_wmma_" in line for line in loop)
     lds = sum(bool(re.match(r"\s*ds_load", line)) for line in loop)
@@ -2528,12 +2537,12 @@ def test_attention_backward_occ1_war_drain_assembly(shape, expected_drains, pack
         assembly = kernel.asm["amdgcn"]
         assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
         assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
-        assert kernel.metadata.shared == (215520 if config.occ1_pad_k else 211440)
+        assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
         loop = _attention_backward_isa_loop(assembly)
         drains.append(sum("s_wait_alu depctr_va_vdst(0)" in line for line in loop))
         assert not any("s_wait_xcnt" in line for line in loop)
         waits = [int(value, 0) for line in loop for value in re.findall(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)", line)]
-        assert 8 in waits
+        assert 6 in waits
         assert 1 not in waits
     # Count instructions rather than matching source text or fixed line numbers.
     assert drains[0] == expected_drains
@@ -2735,10 +2744,10 @@ def test_attention_backward_occ1_tail_assembly(shape, packed_dq):
     assembly = kernel.asm["amdgcn"]
     assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
     assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
-    assert kernel.metadata.shared == (215520 if config.occ1_pad_k else 211440)
+    assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
     loop = _attention_backward_isa_loop(assembly)
     waits = [int(x, 0) for line in loop for x in re.findall(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)", line)]
-    assert 8 in waits and 1 not in waits
+    assert 6 in waits and 1 not in waits
     assert sum("v_wmma_" in line for line in loop) == 320
     assert all("scope:SCOPE_SE" in line for line in loop if "buffer_atomic_" in line)
     assert not any("SCOPE_DEV" in line and "atomic_" in line for line in assembly.splitlines())

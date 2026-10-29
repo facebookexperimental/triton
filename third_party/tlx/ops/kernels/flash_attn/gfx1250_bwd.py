@@ -114,6 +114,9 @@ class BackwardConfig:
     # Pad K rows by 32 bytes so the loop's transposed K reads avoid bank
     # conflicts. Its extra address registers spill split packed kernels.
     occ1_pad_k: bool = False
+    # Store Delta and the log2 LSE as rows of one buffer and fetch both with one
+    # TDM request. A fourth request per tile stalled its issue for ~110 cycles.
+    merge_stats: bool = False
     phase_iglp: int = -1
     # Split only the final dispatch-round KV owners; one preserves legacy code.
     tail_splits: int = 1
@@ -259,7 +262,8 @@ def select_config(n, b=None, hq=None, hk=None, *, num_cus=None, packed_dq=True):
                           async_stats=True, queue_wmma=True, regalloc=True, q_splits=q_splits, waves_per_eu=1,
                           convert_block=8192 if q_splits > 1 and packed_dq else 4096, tile_major=True, cluster_dq=True,
                           occ1=True, occ1_k_bands=2, tail_splits=tail_splits, occ1_load_after_dk=True,
-                          occ1_pad_k=not packed_dq or q_splits == 1 and tail_splits == 1)
+                          occ1_pad_k=not packed_dq or q_splits == 1 and tail_splits == 1, log2_lse=True,
+                          merge_stats=True)
 
 
 def _compiler_options(config, n=None):
@@ -285,7 +289,8 @@ def _dq_slices(config, n):
 @triton.jit
 def _issue_tile(Q, DO, q_desc, do_desc, qb, dob, step, N: tl.constexpr, BM: tl.constexpr, STAGES: tl.constexpr,
                 TDM: tl.constexpr, lse_desc=None, delta_desc=None, lseb=None, db=None,
-                ASYNC_STATS: tl.constexpr = False, PINGPONG: tl.constexpr = False, ROW_PERM: tl.constexpr = False):
+                ASYNC_STATS: tl.constexpr = False, PINGPONG: tl.constexpr = False, ROW_PERM: tl.constexpr = False,
+                MERGE_STATS: tl.constexpr = False):
     slot = step % STAGES
     if PINGPONG:
         # Waves 0..3 own every TDM request. With the half-step phase shift,
@@ -318,6 +323,8 @@ def _issue_tile(Q, DO, q_desc, do_desc, qb, dob, step, N: tl.constexpr, BM: tl.c
             delta_next = tlx.update_tensor_descriptor(delta_desc, add_offsets=[0, step * BM], clamp_bounds=False)
             tlx.async_amd_descriptor_load_fused([(lse_next, tlx.local_view(lseb, slot), 0b0001),
                                                  (delta_next, tlx.local_view(db, slot), 0b0010)])
+        elif MERGE_STATS:
+            tlx.async_amd_descriptor_load(lse_desc, tlx.local_view(lseb, slot), [0, step * BM], clamp_bounds=False)
         else:
             tlx.async_amd_descriptor_load(lse_desc, tlx.local_view(lseb, slot), [0, step * BM], clamp_bounds=False)
             tlx.async_amd_descriptor_load(delta_desc, tlx.local_view(db, slot), [0, step * BM], clamp_bounds=False)
@@ -516,8 +523,8 @@ def _delayed_bwd_kernel(
         OCC1_K_BANDS: tl.constexpr = 0, OCC1_PREFETCH: tl.constexpr = True, OCC1_SCHED: tl.constexpr = False,
         PHASE_IGLP: tl.constexpr = -1, SPLIT_KV_STORES: tl.constexpr = False, TAIL_DK=None, TAIL_DV=None,
         TAIL_SPLITS: tl.constexpr = 1, TAIL_BASE: tl.constexpr = 0, TAIL_OWNERS: tl.constexpr = 0,
-        OCC1_DQ_FIRST: tl.constexpr = False, OCC1_LOAD_AFTER_DK: tl.constexpr = False,
-        OCC1_PAD_K: tl.constexpr = False):
+        OCC1_DQ_FIRST: tl.constexpr = False, OCC1_LOAD_AFTER_DK: tl.constexpr = False, OCC1_PAD_K: tl.constexpr = False,
+        MERGE_STATS: tl.constexpr = False, STATS_STRIDE=0):
     if OCC1:
         tl.static_assert(NW == 4 and BN == 256 and BM == 32 and (OUTER_M == 64 or OUTER_M == 128))
         tl.static_assert(TDM and DELAYED and CLUSTER_DQ and TILE_MAJOR and ASYNC_STATS and not PINGPONG)
@@ -600,15 +607,24 @@ def _delayed_bwd_kernel(
         qd_layout: tl.constexpr = _row_perm_layouts(OUTER_M)[0]
         qb = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES, layout=qd_layout)
         dob = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES, layout=qd_layout)
-        lseb = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
-        db = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
+        if MERGE_STATS:
+            lseb = tlx.local_alloc((2, OUTER_M), tl.float32, STAGES)
+            db = lseb
+        else:
+            lseb = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
+            db = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
         dsb = tlx.local_alloc((32, 256), tl.bfloat16, 2, layout=_ds_shared_layout(32, 256, True))
         q_desc = tl.make_tensor_descriptor(Q, [GROUP * N // 16, 8, 2, 128], [2048, 128, 1024, 1],
                                            [OUTER_M // 16, 8, 2, 128])
         do_desc = tl.make_tensor_descriptor(DO, [GROUP * N // 16, 8, 2, 128], [2048, 128, 1024, 1],
                                             [OUTER_M // 16, 8, 2, 128])
-        lse_desc = tl.make_tensor_descriptor(LSE, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
-        delta_desc = tl.make_tensor_descriptor(Delta, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
+        if MERGE_STATS:
+            # Row 0 is Delta, row 1 the log2 LSE copy, STATS_STRIDE floats later.
+            lse_desc = tl.make_tensor_descriptor(Delta, [2, GROUP * N], [STATS_STRIDE, 1], [2, OUTER_M])
+            delta_desc = lse_desc
+        else:
+            lse_desc = tl.make_tensor_descriptor(LSE, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
+            delta_desc = tl.make_tensor_descriptor(Delta, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
         tlx.async_amd_descriptor_wait(0)
         k = tlx.local_load(tlx.local_view(kb, 0), layout=lhs)
         resident = ()
@@ -636,17 +652,18 @@ def _delayed_bwd_kernel(
         for initial in tl.static_range(STAGES - 1):
             if outer_count // Q_SPLITS > initial:
                 _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer_start + initial, N, OUTER_M, STAGES, True, lse_desc,
-                            delta_desc, lseb, db, True, ROW_PERM=True)
+                            delta_desc, lseb, db, True, ROW_PERM=True, MERGE_STATS=MERGE_STATS)
             elif outer_start + initial < outer_stop:
                 _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer_start + initial, N, OUTER_M, STAGES, True, lse_desc,
-                            delta_desc, lseb, db, True, ROW_PERM=True)
+                            delta_desc, lseb, db, True, ROW_PERM=True, MERGE_STATS=MERGE_STATS)
         tl.debug_barrier()
         # occ1-outer-begin: statically unrolled BM32 phases, one outer tile ahead.
         for outer in tl.range(outer_start, outer_stop):
             if outer + STAGES - 1 < outer_stop:
                 _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer + STAGES - 1, N, OUTER_M, STAGES, True, lse_desc,
-                            delta_desc, lseb, db, True, ROW_PERM=True)
-            tlx.async_amd_descriptor_wait(4 * (STAGES - 1))
+                            delta_desc, lseb, db, True, ROW_PERM=True, MERGE_STATS=MERGE_STATS)
+            # Q, dO and the stats are one request each; separate LSE/Delta add one.
+            tlx.async_amd_descriptor_wait((3 if MERGE_STATS else 4) * (STAGES - 1))
             if outer + STAGES - 1 >= outer_stop:
                 tlx.async_amd_descriptor_wait(0)
             early_qt = None
@@ -672,8 +689,9 @@ def _delayed_bwd_kernel(
                 dot = tlx.local_load(tlx.local_trans(dov), layout=rhs, relaxed=True)
                 dp = tl.dot(v, dot, tlx.zeros((256, 32), tl.float32, layout=mma))
                 lse = tl.reshape(
-                    tlx.local_load(tlx.local_slice(tlx.local_view(lseb, outer % STAGES), [0, phase * 32], [1, 32])),
-                    (32, ))
+                    tlx.local_load(
+                        tlx.local_slice(tlx.local_view(lseb, outer % STAGES), [1 if MERGE_STATS else 0, phase * 32],
+                                        [1, 32])), (32, ))
                 delta = tl.reshape(
                     tlx.local_load(tlx.local_slice(tlx.local_view(db, outer % STAGES), [0, phase * 32], [1, 32])),
                     (32, ))
@@ -1571,7 +1589,10 @@ def allocate_workspace(q, k, *, config=None, packed_dq=None):
         workspace += (torch.empty(partial_shape, device=k.device,
                                   dtype=torch.float32), torch.empty(partial_shape, device=k.device,
                                                                     dtype=torch.float32))
-    if config.log2_lse:
+    if config.merge_stats:
+        stats = torch.empty((2, ) + q.shape[:-1], device=q.device, dtype=torch.float32)
+        workspace = (stats[0], ) + workspace[1:] + (stats[1], )
+    elif config.log2_lse:
         workspace += (torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32), )
     return workspace
 
@@ -1614,6 +1635,8 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
     elif (config.occ1_k_bands or config.occ1_sched or config.occ1_dq_first or config.occ1_load_after_dk
           or config.occ1_pad_k or config.phase_iglp != -1 or not config.occ1_prefetch):
         raise ValueError("OCC1 scheduling options require OCC1")
+    if config.merge_stats and (not config.occ1 or not config.log2_lse):
+        raise ValueError("merged stats loads require OCC1 and the log2 LSE copy")
     if (config.occ1_dq_first or config.occ1_load_after_dk) and not config.occ1_prefetch:
         raise ValueError("OCC1 WMMA reorder experiments require band prefetch")
     if not isinstance(config.phase_iglp, int) or config.phase_iglp not in (-1, 0, 1, 2, 3):
@@ -1702,6 +1725,8 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
         specifications += [(dka, partial_shape, torch.float32), (dva, partial_shape, torch.float32)]
     if config.log2_lse:
         specifications.append((lse_log2, q.shape[:-1], torch.float32))
+    if config.merge_stats and lse_log2.data_ptr() != delta.data_ptr() + 4 * delta.numel():
+        raise ValueError("merged stats need Delta and the log2 LSE in one [2, ...] buffer")
     for value, shape, dtype in specifications:
         if value.shape != shape or value.dtype != dtype or value.device != q.device or not value.is_contiguous():
             raise ValueError("invalid backward workspace")
@@ -1734,7 +1759,7 @@ def fa_backward(q, k, v, o, do, lse, sm_scale=None, causal=False, *, config=None
         TAIL_DK=dk if config.tail_splits > 1 else None, TAIL_DV=dv if config.tail_splits > 1 else None,
         TAIL_SPLITS=config.tail_splits, TAIL_BASE=tail_base, TAIL_OWNERS=tail_owners,
         OCC1_DQ_FIRST=config.occ1_dq_first, OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, OCC1_PAD_K=config.occ1_pad_k,
-        **compiler_options)
+        MERGE_STATS=config.merge_stats, STATS_STRIDE=delta.numel() if config.merge_stats else 0, **compiler_options)
     if config.tail_splits > 1:
         convert_size = tail_owners * config.block_n * d
         convert_dk = dk.reshape(-1)[tail_base * config.block_n * d:]
