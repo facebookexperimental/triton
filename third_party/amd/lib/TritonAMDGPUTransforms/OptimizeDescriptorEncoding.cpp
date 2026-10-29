@@ -19,6 +19,18 @@ using mlir::triton::amdgpu::TargetFeatures;
 
 namespace {
 
+static Attribute unwrapPinnedSharedLayout(Attribute encoding) {
+  while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
+    encoding = pinned.getPinnedLayout();
+  if (auto partitioned = dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
+    return ttg::PartitionedSharedEncodingAttr::get(
+        encoding.getContext(), partitioned.getNumPartitions(),
+        partitioned.getNumGroups(), partitioned.getPartitionDim(),
+        cast<ttg::SharedEncodingTrait>(
+            unwrapPinnedSharedLayout(partitioned.getPartitionLayout())));
+  return encoding;
+}
+
 // If all the transitive uses of the given value have are used by a convert to
 // the same dot operand encoding, return true and get the shared encoding that
 // needs to be used to be compatible with users' layouts.
@@ -148,14 +160,10 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
   Attribute desiredEncoding;
 
   auto mergeEncoding = [&](ttg::MemDescType memoryType) {
-    Attribute encoding = memoryType.getEncoding();
-    while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
-      encoding = pinned.getPinnedLayout();
-    if (auto partitioned =
-            dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
-      encoding = partitioned.getPartitionLayout();
-    while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
-      encoding = pinned.getPinnedLayout();
+    Attribute encoding = unwrapPinnedSharedLayout(memoryType.getEncoding());
+    // TDM lowering uses the descriptor's partition mapping to select the LDS
+    // base and distribute work across waves. Keeping only its padded child
+    // would make the descriptor and the destination disagree physically.
     encoding = getCompatibleSharedEncoding(encoding, memoryType.getShape(),
                                            memoryType.getElementType());
     if (!encoding)
@@ -254,6 +262,8 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding(
 
 bool AMDGPUAssignDescriptorMemoryLayouts::isCompatibleSharedEncoding(
     Attribute enc) {
+  if (auto partitioned = dyn_cast<ttg::PartitionedSharedEncodingAttr>(enc))
+    return isCompatibleSharedEncoding(partitioned.getPartitionLayout());
   return isa<ttg::PaddedSharedEncodingAttr, ttg::SwizzledSharedEncodingAttr>(
       enc);
 }
