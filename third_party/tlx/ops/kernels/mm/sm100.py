@@ -1131,11 +1131,8 @@ def matmul_kernel_tma_ws_blackwell(
     # Each of the three async tasks consumes CLC responses on both cluster CTAs.
     clc_context = tlx.clc_create_context(num_consumers=3 * NUM_CTAS, num_stages=NUM_CLC_STAGES)
 
-    # With 2 CTAs, CTA1 arrives on CTA0's barriers up to its last tile, so
-    # CTA0 must not exit before it: keep the compiler's ending cluster sync.
     with tlx.async_tasks(
             exclusive=True,
-            no_ending_cluster_sync=NUM_CTAS == 1,
             mbarrier_try_wait_suspend_ns=50000,
     ):
         with tlx.async_task("default"):  # epilogue consumer
