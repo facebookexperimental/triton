@@ -1036,6 +1036,12 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<ROCDL::SchedBarrier>(
                  static_cast<ROCDL::SchedGroupMask>(mask));
            })
+      .def("create_amd_sched_group_barrier",
+           [](TritonOpBuilder &self, int32_t mask, int32_t size,
+              int32_t groupId) {
+             self.create<ROCDL::SchedGroupBarrier>(
+                 static_cast<ROCDL::SchedGroupMask>(mask), size, groupId);
+           })
       .def("create_amd_iglp_opt",
            [](TritonOpBuilder &self, uint32_t variant) {
              self.create<ROCDL::IglpOpt>(variant);
@@ -1059,6 +1065,14 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_amd_cluster_barrier",
            [](TritonOpBuilder &self) -> void {
              self.create<amdgpu::ClusterBarrierArriveOp>();
+             self.create<amdgpu::ClusterBarrierWaitOp>();
+           })
+      .def("create_amd_cluster_arrive",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::ClusterBarrierArriveOp>();
+           })
+      .def("create_amd_cluster_wait",
+           [](TritonOpBuilder &self) -> void {
              self.create<amdgpu::ClusterBarrierWaitOp>();
            })
       .def("create_amd_cluster_cta_rank",

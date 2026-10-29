@@ -852,10 +852,14 @@ def test_grouped_gemm_multicast_config_validation(m_list, n, num_programs, valid
 
 
 @triton.jit
-def _amd_independent_cluster_ids(output):
+def _amd_independent_cluster_ids(output, SPLIT: tl.constexpr = False):
     pid = tl.program_id(0)
     rank = tlx.cluster_cta_rank()
-    tlx.cluster_barrier()
+    if SPLIT:
+        tlx.amd_cluster_arrive()
+        tlx.amd_cluster_wait()
+    else:
+        tlx.cluster_barrier()
     tl.store(output + pid, pid * 16 + rank)
 
 
@@ -867,20 +871,21 @@ def _amd_independent_cluster_ids(output):
     ("gfx950", None),
     ("gfx950", 1),
 ])
-def test_amd_cluster_barrier_compiles(arch, cluster_size):
+@pytest.mark.parametrize("split", [False, True])
+def test_amd_cluster_barrier_compiles(arch, cluster_size, split):
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
 
     options = dict(num_warps=4)
     if cluster_size is not None:
         options["ctas_per_cga"] = (cluster_size, 1, 1)
-    source = ASTSource(_amd_independent_cluster_ids, signature={"output": "*i32"})
+    source = ASTSource(_amd_independent_cluster_ids, signature={"output": "*i32"}, constexprs={"SPLIT": split})
     compiled = triton.compile(source, target=GPUTarget("hip", arch, 32 if arch == "gfx1250" else 64), options=options)
     ttgir = compiled.asm["ttgir"]
-    assert "ttg.barrier local" in ttgir
+    assert ("ttg.barrier local" in ttgir) == (not split)
     assert "amdg.cluster_barrier_arrive" in ttgir
     assert "amdg.cluster_barrier_wait" in ttgir
-    assert "s_barrier" in compiled.asm["amdgcn"]
+    assert ("s_barrier" in compiled.asm["amdgcn"]) == (not split or (cluster_size is not None and cluster_size > 1))
     multi_cta = cluster_size is not None and cluster_size > 1
     assert ("s_barrier_signal -3" in compiled.asm["amdgcn"]) == multi_cta
     assert ("s_barrier_wait -3" in compiled.asm["amdgcn"]) == multi_cta
@@ -1497,3 +1502,48 @@ def test_grouped_gemm_list_empty_m(block_m, staging, cross, m_tiles):
     for out, a, b in zip(outputs, cpu_a, cpu_b):
         expected = (a.float() @ b.float().T).half()
         torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+@triton.jit
+def _tdm_multicast_skew_kernel(a_ptr, b_ptr, out_ptr, CLUSTER_SIZE: tl.constexpr, BEFORE_LOAD: tl.constexpr,
+                               ITERS: tl.constexpr):
+    pid = tl.program_id(0)
+    rank = tlx.cluster_cta_rank()
+    a_desc = tl.make_tensor_descriptor(a_ptr, [ITERS * 32, 32], [32, 1], [32, 32])
+    b_desc = tl.make_tensor_descriptor(b_ptr, [ITERS * 32, 32], [32, 1], [32, 32])
+    a_buf = tlx.local_alloc((32, 32), tl.int32, 1)
+    b_buf = tlx.local_alloc((32, 32), tl.int32, 1)
+    a_view, b_view = tlx.local_view(a_buf, 0), tlx.local_view(b_buf, 0)
+    mask: tl.constexpr = (1 << CLUSTER_SIZE) - 1
+    offsets = tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]
+    for i in range(ITERS):
+        # Delay one CTA either before requesting, or while its LDS slot is live.
+        # Peers can advance several iterations, including reusing the same slot.
+        if BEFORE_LOAD and rank == 1:
+            tl.inline_asm_elementwise(".rept 4\ns_sleep 15\n.endr\ns_mov_b32 $0, 0", constraints="=s", args=[],
+                                      dtype=tl.int32, is_pure=False, pack=1)
+        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[i * 32, 0])
+        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[i * 32, 0])
+        tlx.async_amd_descriptor_load_fused([(ad, a_view, 5), (bd, b_view, 10)], multicast_masks=[mask, mask])
+        tlx.async_amd_descriptor_wait(0)
+        if not BEFORE_LOAD and rank == 1:
+            tl.inline_asm_elementwise(".rept 4\ns_sleep 15\n.endr\ns_mov_b32 $0, 0", constraints="=s", args=[],
+                                      dtype=tl.int32, is_pure=False, pack=1)
+        tlx.workgroup_barrier()
+        value = tlx.local_load(a_view) + tlx.local_load(b_view)
+        tl.store(out_ptr + (pid * ITERS + i) * 1024 + offsets, value)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("cluster_size", [2, 4])
+@pytest.mark.parametrize("before_load", [False, True])
+def test_tdm_multicast_skew_without_cluster_barriers(device, cluster_size, before_load):
+    iters = 8
+    a_cpu = torch.arange(iters * 1024, dtype=torch.int32).reshape(iters * 32, 32)
+    b_cpu = a_cpu * 7 + 11
+    a, b = a_cpu.to(device), b_cpu.to(device)
+    out = torch.empty((cluster_size, iters * 32, 32), device=device, dtype=torch.int32)
+    compiled = _tdm_multicast_skew_kernel[(cluster_size, )](a, b, out, cluster_size, before_load, iters, num_warps=4,
+                                                            ctas_per_cga=(cluster_size, 1, 1))
+    assert "amdg.cluster_barrier" not in compiled.asm["ttgir"]
+    torch.testing.assert_close(out.cpu(), (a_cpu + b_cpu).expand(cluster_size, -1, -1), atol=0, rtol=0)
