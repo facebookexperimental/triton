@@ -39,7 +39,16 @@ from torch._inductor.template_heuristics.triton import (
     TMATemplateConfigMixin,
 )
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
-from torch._inductor.utils import can_use_tma, get_num_sms, tma_inner_dim
+from torch._inductor.utils import can_use_tma, get_num_sms
+
+try:
+    from torch._inductor.utils import tma_inner_dim
+except ImportError:
+    def tma_inner_dim(strides):
+        from torch._inductor.virtualized import V
+
+        inner = [i for i, stride in enumerate(strides) if V.graph.sizevars.statically_known_equals(stride, 1)]
+        return inner[0] if len(inner) == 1 else None
 
 from ..hw import resources
 from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
@@ -1422,10 +1431,12 @@ class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
             alpha=scalars.get("alpha", 1), beta=scalars.get("beta", 1),
         ):
             meta = dict(config.kwargs)
-            if meta.pop("SPLIT_M_128_32", False) or meta.pop(
+            if meta.pop("SPLIT_M_128_64", False) or meta.pop(
                 "USE_LOCAL_SPLIT_U", False
             ):
                 continue
+            meta.setdefault("SPLIT_M_128_32", False)
+            meta.setdefault("SPLIT_M_256_64", False)
             meta.setdefault("SPLIT_K", 1)
             meta.setdefault("SPLIT_ORDER_CHUNK", 1)
             meta.setdefault("LAUNCH_XCD_CHUNK", 0)

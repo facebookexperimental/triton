@@ -341,6 +341,7 @@ def _direct_matmul_kernel_gfx942(
     USE_PIPELINED_POINTER_LOADS: tl.constexpr = False,
     TILE_ID=0,
     OVERRIDE_TILE_ID: tl.constexpr = False,
+    USE_STREAMING_BF16_STORES: tl.constexpr = False,
 ):
     """Register-staged GEMM with per-operand cache and XCD policy."""
     pid = TILE_ID.to(tl.int32) if OVERRIDE_TILE_ID else tl.program_id(0).to(tl.int32)
@@ -508,12 +509,21 @@ def _direct_matmul_kernel_gfx942(
                                                             (N == 4096 and (K == 1093 or K == 2048 or K == 6400)))))
                                             and (BLOCK_M == 64 or BLOCK_M == 128) and (BLOCK_N == 64 or BLOCK_N == 128))
         # Keep the buffer policy for other layouts and element types.
-        PIPELINED_POINTERS: tl.constexpr = (USE_PIPELINED_POINTER_LOADS and tlx.dtype_of(a_ptr) == tl.float16
-                                            and tlx.dtype_of(b_ptr) == tl.float16 and stride_am == K and stride_ak == 1
-                                            and stride_bk == 1 and stride_bn == K
-                                            and ((BLOCK_M == 128 and BLOCK_N == 128) or SMALL_POINTER_TILE)
-                                            and (BLOCK_K == 64 or (SMALL_POINTER_TILE and
-                                                                   (BLOCK_K == 128 or BLOCK_K == 256))))
+        # Compiler-managed pointer loads for the four measured BF16 production tiles.
+        BF16_POINTER_TILE: tl.constexpr = (tlx.dtype_of(a_ptr) == tl.bfloat16 and tlx.dtype_of(b_ptr) == tl.bfloat16
+                                           and (((M, N, K) == (1024, 6144, 20480) and BLOCK_M == 128 and BLOCK_N == 128
+                                                 and BLOCK_K == 64 and tlx.num_warps() == 4) or
+                                                ((M, N, K) == (61440, 2048, 5120) and BLOCK_M == 128 and BLOCK_N == 256
+                                                 and BLOCK_K == 32 and tlx.num_warps() == 4) or
+                                                ((M, N, K) == (819200, 1024, 192) and BLOCK_M == 256 and BLOCK_N == 128
+                                                 and BLOCK_K == 32 and tlx.num_warps() == 8) or
+                                                ((M, N, K) == (4096, 1894, 242432) and BLOCK_M == 64 and BLOCK_N == 64
+                                                 and BLOCK_K == 256 and tlx.num_warps() == 4)))
+        PIPELINED_POINTERS: tl.constexpr = (
+            USE_PIPELINED_POINTER_LOADS and stride_am == K and stride_ak == 1 and stride_bk == 1 and stride_bn == K
+            and (BF16_POINTER_TILE or (tlx.dtype_of(a_ptr) == tl.float16 and tlx.dtype_of(b_ptr) == tl.float16 and
+                                       ((BLOCK_M == 128 and BLOCK_N == 128) or SMALL_POINTER_TILE) and
+                                       (BLOCK_K == 64 or (SMALL_POINTER_TILE and (BLOCK_K == 128 or BLOCK_K == 256))))))
         USE_BUFFER_A: tl.constexpr = (not USE_SINGLE_STAGE_POINTER_LOADS and not PIPELINED_POINTERS
                                       and not USE_I64_A_OFFSETS and 0 <= stride_am and stride_am <= 0x7fffffff
                                       and 0 <= stride_ak and stride_ak <= 0x7fffffff
@@ -743,7 +753,11 @@ def _direct_matmul_kernel_gfx942(
             first_offsets = rows * stride_cm + pid_n * BLOCK_N
             tl.store(c_ptr + first_offsets, first, mask=(rows < M) & (shift == 1) & (pid_n * BLOCK_N < N))
         else:
-            tl.store(c_ptr + c_offsets, acc, mask=mask)
+            # Match the vendor's streaming stores on the large
+            # BF16 output. The same mask and logical elements are written.
+            streaming_bf16: tl.constexpr = (USE_STREAMING_BF16_STORES and (M, N, K) == (819200, 1024, 192)
+                                            and tlx.dtype_of(c_ptr) == tl.bfloat16)
+            tl.store(c_ptr + c_offsets, acc, mask=mask, cache_modifier=".cs" if streaming_bf16 else "")
 
 
 @triton.jit
@@ -940,6 +954,7 @@ def matmul_kernel_gfx942(
     SPLIT_K: tl.constexpr = 1,
     SPLIT_ORDER_CHUNK: tl.constexpr = 1,
     LAUNCH_XCD_CHUNK: tl.constexpr = 0,
+    USE_STREAMING_BF16_STORES: tl.constexpr = False,
 ):
     """Dispatch one autotune candidate to its selected GEMM implementation."""
     if SPLIT_K > 1:
@@ -1020,6 +1035,7 @@ def matmul_kernel_gfx942(
             USE_N_EDGE_PANELS,
             USE_N_INTERIOR_PANELS,
             USE_PIPELINED_POINTER_LOADS=USE_PIPELINED_POINTER_LOADS,
+            USE_STREAMING_BF16_STORES=USE_STREAMING_BF16_STORES,
         )
 
 
@@ -1174,6 +1190,42 @@ SMOKE_CONFIGS = _smoke_configs
 
 def heuristic_config(M, N, K, *, enable_global_split_k=True, enable_short_m_tuning=True):
     """Choose one configuration without runtime autotuning."""
+    # Shared-B row panels reduce padding for the measured MLP projection.
+    if (M, N, K) == (4662, 2560, 1280):
+        config = _config(160, 256, 64, 4, 8, split_m_128_32=True)
+        config.kwargs["XCD_CHUNK"] = 1
+        return [config]
+    # Short aligned reductions favor BK128, kpack2, and more output workgroups.
+    if (enable_short_m_tuning and 384 < M <= 1024 and 2048 <= N <= 4096 and 2048 <= K <= 4096 and K % 128 == 0
+            and (N <= 2048 or M <= 512) and (M > 512 or N >= 4096 or K >= 4096)):
+        config = _config(64, 64, 128, 8, 4, kpack=2)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    # Tall shallow reductions benefit from streaming output stores.
+    if M >= 65536 and 512 <= N <= 2048 and K <= 256:
+        config = _config(256, 128, 32, 16, 8)
+        config.kwargs.update(USE_STREAMING_BF16_STORES=True, USE_PIPELINED_POINTER_LOADS=True)
+        return [config]
+    # Compact deep reductions favor BK256 with four warps and pointer loads.
+    if 2048 < M <= 4096 and 1024 <= N <= 2048 and K >= 16 * N and K % 256 == 0:
+        config = _config(64, 64, 256, 4, 4)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    # Wide K-dominant row grids favor four warps and kpack2.
+    if 768 < M <= 1024 and N >= 4096 and K >= 2 * N and K % 64 == 0:
+        config = _config(128, 128, 64, 16, 4, kpack=2)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    # Tall aligned deep reductions favor rectangular tiles and pointer loads.
+    if M >= 16384 and N >= 1024 and K > 256 and K >= 2 * N and K % 32 == 0:
+        config = _config(128, 256, 32, 16, 4)
+        config.kwargs["USE_PIPELINED_POINTER_LOADS"] = True
+        return [config]
+    # Shared-B row panels reduce padding for the measured unsplit-K MLP target.
+    if (M, N, K) == (4662, 2560, 2560):
+        config = _config(160, 256, 64, 4, 8, split_m_128_32=True)
+        config.kwargs["XCD_CHUNK"] = 1
+        return [config]
     # Offline paired cold-cache trials select the K step and output tile
     # within the existing compiler-managed pointer pipeline. Retain the
     # incumbent below for rows whose trials were inconclusive.
@@ -1824,6 +1876,9 @@ def torchtlx_heuristic_config(M, N, K, *, dtype, out_dtype, a_strides, b_strides
     """Share the fixed shape policy with Inductor, preserving scaled epilogues."""
     enable = (dtype == torch.float16 and out_dtype == torch.float16 and a_strides == (K, 1) and b_strides == (1, K)
               and alpha == 1 and beta == 1)
+    if enable and (M, N, K) == (4662, 2560, 2560):
+        # Shared-B row panels reduce padding while preserving increasing K order.
+        return [_template_config((320, 128, 64, 4, 8), NUM_XCDS=1, XCD_CHUNK=1, SPLIT_M_256_64=True)]
     if enable and 4178 <= M <= 4942 and (N, K) in _TORCHTLX_PROD_TILES:
         # The register-only template favors different tiles than the tlx.ops
         # buffer-load path on these production rows.
