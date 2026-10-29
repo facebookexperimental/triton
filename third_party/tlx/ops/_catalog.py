@@ -174,6 +174,17 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
+        op="mm_mxfp8",
+        arch="gfx950",
+        variant="scaled_mfma",
+        impl="triton.tlx.ops.kernels.mm_mxfp8.gfx950:mm_mxfp8",
+        invariant_vocab=_GEMM_DIMS,
+        dtypes=frozenset({"float8_e4m3fn"}),
+        # A generic load path handles unaligned base pointers. The fast LDS
+        # path checks its descriptor span and pointer alignment at launch.
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="grouped_gemm_mxfp8",
         arch="sm100",
         variant="ws_persistent_mxfp8",

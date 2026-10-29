@@ -222,10 +222,10 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     ``MXTensor.to_mx(..., is_swizzled_scales=True)``. A supplied ``out`` is
     returned by identity. Forward-only.
 
-    ``space`` defaults to "full" (autotune; the first call per shape compiles
-    and benchmarks the pruned space). "heuristic" launches one shape-picked
-    config without autotuning. A ``Space`` is also accepted; its invariance
-    request is validated but not enforced yet.
+    ``space`` defaults to "full". On sm100 this autotunes a pruned space on
+    first use, while on gfx950 the current implementation has one shape-picked
+    schedule and treats "full" like "heuristic". A ``Space`` is also accepted;
+    its invariance request is validated but not enforced yet.
     """
     import torch
 

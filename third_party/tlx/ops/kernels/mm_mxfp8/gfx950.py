@@ -1,8 +1,10 @@
-"""Shared gfx950 MXFP8 tile bodies for regular and grouped GEMM."""
+"""gfx950 MXFP8 GEMM backend and tile bodies shared with grouped GEMM."""
 
+import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.tlx.ops.kernels.grouped_gemm_mxfp8._scales import prepare_scales
 
 # [128, 4] E8M0 scale slice (flat r * 4 + c): each lane copies one row's 4
 # contiguous bytes, so direct-to-LDS issues 32-bit copies. The two extra thread
@@ -96,17 +98,16 @@ def _quad_tile(
     HALF_N: tl.constexpr = BLOCK_SIZE_N // 2
     SC_STEP: tl.constexpr = 512  # one 128x4 scale atom per K-step
 
-    # Group M is a multiple of 128, so each 128-row A half-tile is one whole
+    # M is a multiple of 128, so each 128-row A half-tile is one whole
     # row block (wrapped to block 0 past the group end) and is addressed by a
     # scalar base plus one shared [128, BLOCK_K] offset tensor. Its scales are
     # exactly one 512-byte atom per K-step. Wrapped garbage rows/cols are dropped
     # by the masked store.
     offs_r = tl.arange(0, HALF_M)
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
-    # opaque_zero (runtime 0) keeps these tile-invariant lane offsets inside the
-    # tile. Hoisted above the persistent loop they spill, and the scratch reload
-    # at each tile's prologue forces s_waitcnt vmcnt(0), which drains the previous
-    # tile's output stores instead of overlapping them.
+    # For the persistent grouped caller, opaque_zero (runtime 0) keeps these
+    # tile-invariant lane offsets inside the tile. Hoisting them above the loop
+    # would spill and force a scratch reload that drains prior output stores.
     tile_off = offs_r[:, None] * K + offs_k[None, :] + opaque_zero * 256
     if K_MAJOR:
         sc_off = tlx.require_layout(
@@ -434,3 +435,187 @@ def _generic_tile(
         acc.to(tl.bfloat16),
         mask=(offs_cm[:, None] < m_size) & (offs_cn[None, :] < N),
     )
+
+
+@triton.jit
+def _regular_generic_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    as_ptr,
+    bs_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    STAGES: tl.constexpr,
+    K_MAJOR: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    _generic_tile(
+        pid // (N // BN),
+        pid % (N // BN),
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        as_ptr,
+        bs_ptr,
+        0,
+        M,
+        N,
+        K,
+        K // BK,
+        BLOCK_SIZE_M=BM,
+        BLOCK_SIZE_N=BN,
+        BLOCK_SIZE_K=BK,
+        NUM_STAGES=STAGES,
+        K_MAJOR=K_MAJOR,
+    )
+
+
+@triton.jit
+def _regular_quad_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    as_ptr,
+    bs_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    K_MAJOR: tl.constexpr,
+):
+    HALF: tl.constexpr = 128
+    BK: tl.constexpr = 128
+    # Pad each 1024-byte span by 32 bytes to break LDS bank conflicts.
+    smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [[1024, 32]],
+        [
+            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
+        ],
+        [HALF, BK],
+    )
+    data_dtype = tlx.dtype_of(a_ptr)
+    scale_dtype = tlx.dtype_of(as_ptr)
+    smem_a_top = tlx.local_alloc((HALF, BK), data_dtype, 2, layout=smem_layout)
+    smem_a_bot = tlx.local_alloc((HALF, BK), data_dtype, 2, layout=smem_layout)
+    smem_b_left = tlx.local_alloc((HALF, BK), data_dtype, 2, layout=smem_layout)
+    smem_b_right = tlx.local_alloc((HALF, BK), data_dtype, 2, layout=smem_layout)
+    if K_MAJOR:
+        scale_shape: tl.constexpr = (32, 16)
+    else:
+        scale_shape: tl.constexpr = (HALF, BK // 32)
+    smem_sa_top = tlx.local_alloc(scale_shape, scale_dtype, 2)
+    smem_sa_bot = tlx.local_alloc(scale_shape, scale_dtype, 2)
+    smem_sb_left = tlx.local_alloc(scale_shape, scale_dtype, 2)
+    smem_sb_right = tlx.local_alloc(scale_shape, scale_dtype, 2)
+
+    pid = tl.program_id(0)
+    _quad_tile(
+        pid // (N // 256),
+        pid % (N // 256),
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        as_ptr,
+        bs_ptr,
+        0,
+        M,
+        N,
+        K,
+        K // BK,
+        smem_a_top,
+        smem_a_bot,
+        smem_b_left,
+        smem_b_right,
+        smem_sa_top,
+        smem_sa_bot,
+        smem_sb_left,
+        smem_sb_right,
+        BLOCK_SIZE_M=256,
+        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_K=BK,
+        N_ALIGNED=True,
+        opaque_zero=pid // (1 << 30),
+        K_MAJOR=K_MAJOR,
+    )
+
+
+_MAX_BUFFER_BYTES = (1 << 31) - 2
+
+
+def _pick_regular_config(m: int, n: int, k: int, *, quad_safe: bool) -> tuple[int, int, int, int, bool]:
+    """Preserve the tuned square paths; use a generic tile for other shapes."""
+    if m == n == k == 1024:
+        return 64, 64, 3, 4, False
+    if m == n == k == 2048:
+        return 64, 128, 2, 4, False
+    if quad_safe and m % 256 == 0 and n % 256 == 0 and m * n >= 4096 * 4096:
+        return 256, 256, 1, 8, True
+    return 128, 128, 2, 4, False
+
+
+def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+    """gfx950 implementation of ``tlx.ops.mm_mxfp8`` (``a @ b.T``).
+
+    The public wrapper validates inputs. This backend has one shape-picked
+    schedule, so ``space='full'`` and ``'heuristic'`` currently select the same
+    kernel. Natural scales are packed K-major; cuBLAS-blocked scales remain in
+    their original byte order and use the corresponding scale-load path.
+    """
+    if space not in ("full", "heuristic"):
+        raise ValueError(f"unsupported gfx950 MXFP8 space {space!r}")
+    m, k = a.shape
+    n = b.shape[0]
+    if out is None:
+        out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
+
+    k_major = sf_layout == "natural"
+    as_packed, bs_packed = prepare_scales(a_scale, b_scale, gm=m, g=1, n=n, k=k, sf_layout=sf_layout,
+                                           k_major_chunks=k_major)
+    quad_safe = (128 * k <= _MAX_BUFFER_BYTES and all(t.data_ptr() % 16 == 0
+                                                      for t in (a, b, as_packed, bs_packed)))
+    bm, bn, stages, warps, use_quad = _pick_regular_config(m, n, k, quad_safe=quad_safe)
+    if use_quad:
+        _regular_quad_kernel[(m // 256 * (n // 256), )](
+            a,
+            b,
+            out,
+            as_packed,
+            bs_packed,
+            M=m,
+            N=n,
+            K=k,
+            K_MAJOR=k_major,
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        )
+    else:
+        _regular_generic_kernel[(m // bm * (n // bn), )](
+            a,
+            b,
+            out,
+            as_packed,
+            bs_packed,
+            M=m,
+            N=n,
+            K=k,
+            BM=bm,
+            BN=bn,
+            BK=128,
+            STAGES=stages,
+            K_MAJOR=k_major,
+            num_warps=warps,
+            num_stages=stages,
+            matrix_instr_nonkdim=16,
+            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        )
+    return out
+
+
+__all__ = ["mm_mxfp8"]

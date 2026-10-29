@@ -2,7 +2,7 @@
 
 Forward-only, persistent kernel for E4M3 operands, E8M0 per-32 microscales, and
 BF16 output. Its tile bodies are shared with regular MXFP8 GEMM in
-``tlx.ops.kernels.mxfp8_tiles_gfx950``. It reuses the FP16 gfx950 grouped
+``tlx.ops.kernels.mm_mxfp8.gfx950``. It reuses the FP16 gfx950 grouped
 GEMM pipeline
 (``grouped_gemm/gfx950.py``): a 256x256 output tile split into four 128x128
 quadrants, one double-buffered LDS allocation per operand half-tile, and an
@@ -29,7 +29,7 @@ from triton.tlx.ops.kernels.grouped_gemm.gfx950 import (
     NUM_XCDS,
 )
 from triton.tlx.ops.kernels.grouped_gemm_mxfp8._scales import prepare_scales
-from triton.tlx.ops.kernels.mxfp8_tiles_gfx950 import _generic_tile, _quad_tile
+from triton.tlx.ops.kernels.mm_mxfp8.gfx950 import _generic_tile, _quad_tile
 
 _BLOCK_K = 128
 # AMD buffer descriptors expose at most this many bytes from each scalar base.
