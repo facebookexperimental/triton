@@ -257,12 +257,11 @@ def _append_tlx_amd(templates, op_name):
         from torch._inductor.kernel.mm import aten_addmm, aten_mm, mm_template
 
         uids = {getattr(t, "uid", None) for t in templates}
+        default_set = not (inductor_config.max_autotune
+                           or inductor_config.max_autotune_gemm) and bool(uids & {aten_mm.uid, aten_addmm.uid})
+        if mm_template.uid not in uids and not default_set:
+            return templates
         if current_target().is_gfx942:
-            default_set = not (
-                inductor_config.max_autotune or inductor_config.max_autotune_gemm
-            ) and bool(uids & {aten_mm.uid, aten_addmm.uid})
-            if mm_template.uid not in uids and not default_set:
-                return templates
             template = (
                 gfx942_mm_template
                 if op_name == "mm"
@@ -270,8 +269,6 @@ def _append_tlx_amd(templates, op_name):
             )
             if template.uid not in uids:
                 templates.append(template)
-            return templates
-        if mm_template.uid not in uids:
             return templates
         if op_name == "mm":
             for template in (
@@ -312,8 +309,13 @@ def _append_tlx_amd(templates, op_name):
 
 
 def tlx_kernel_inputs(template, kernel_inputs, op_name):
-    """Expand default addmm bias inputs for the gfx942 template epilogue."""
-    if template is not gfx942_addmm_template or op_name != "addmm":
+    """Expand default addmm bias inputs for the AMD TLX addmm template epilogues."""
+    if op_name != "addmm" or template not in (
+            gfx942_addmm_template,
+            gfx950_addmm_interwave_template,
+            gfx950_addmm_warppipe_template,
+            gfx950_addmm_persistent_warppipe_template,
+    ):
         return kernel_inputs
     bias, mat1, mat2 = kernel_inputs.nodes()
     size = [mat1.get_size()[0], mat2.get_size()[1]]

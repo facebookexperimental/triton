@@ -1600,7 +1600,20 @@ def _gfx950_register_plan_for(m, n, k):
     return _gfx950_register_intermediate_config(m, n, k)
 
 
-class _Gfx950InterWaveTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class _Gfx950TLXModeMixin:
+    """Run on gfx950 whenever torchTLX is enabled.
+
+    torchTLX is independent of max_autotune; the ROCm GEMM base heuristic would
+    otherwise offer these templates only under it.
+    """
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if config.triton.tlx_mode in ("allow", "force"):
+            return _is_gfx950()
+        return super().should_run(inputs)
+
+
+class _Gfx950InterWaveTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Shared config gate for the gfx950 a16w16 inter-wave kernel.
 
     The reference kernel consumes row-major A directly and relies on a fixed
@@ -1725,9 +1738,7 @@ class Gfx950MMInterWaveTemplateConfigHeuristic(
     register=IS_ROCM,
     op_name="mm",
 )
-class Gfx950MMLocalSplitUTemplateConfigHeuristic(
-    ROCmMMTemplateConfigHeuristic
-):
+class Gfx950MMLocalSplitUTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Offer LocalSplitU only for its two validated small-M shapes."""
 
     # (M, N, K): (TILE_M, TILE_N, LOCAL_SPLIT_U, WAVE_K, K_WIDTH)
@@ -1782,7 +1793,7 @@ class Gfx950MMLocalSplitUTemplateConfigHeuristic(
     register=IS_ROCM,
     op_name="mm",
 )
-class Gfx950MMRegisterTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class Gfx950MMRegisterTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Offer the register fallback only when its geometry policy selects it."""
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
@@ -1839,9 +1850,7 @@ class Gfx950MMRegisterTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
     register=IS_ROCM,
     op_name="mm",
 )
-class Gfx950MMPersistentTemplateConfigHeuristic(
-    ROCmMMTemplateConfigHeuristic
-):
+class Gfx950MMPersistentTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Offer the N160/N192 persistent kernels only for their tuned shapes."""
 
     PERSISTENT_CONFIGS = {
@@ -1901,9 +1910,7 @@ class Gfx950AddMMInterWaveTemplateConfigHeuristic(
 @register_template_heuristic(
     gfx950_addmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="addmm"
 )
-class Gfx950AddMMWarpPipeConfigHeuristic(
-    AddMMConfigMixin, ROCmMMTemplateConfigHeuristic
-):
+class Gfx950AddMMWarpPipeConfigHeuristic(AddMMConfigMixin, _Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """TLX warp-pipelined addmm heuristic for ROCm (col-major B, MI350X/gfx950).
 
     Hand-pipelined (num_stages=1): async-prefetches NUM_BUFFERS K-tiles into multi-buffered
@@ -2104,7 +2111,7 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
 @register_template_heuristic(
     gfx950_bmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
 )
-class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class Gfx950BMMWarpPipeConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """TLX warp-pipelined bmm heuristic for ROCm (MI350X/gfx950).
 
     Same warp-pipe core as the addmm (async_load prefetch into multi-buffered LDS + MFMA via
@@ -2236,7 +2243,7 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
 @register_template_heuristic(
     amd_bmm_shared_a_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
 )
-class ROCmBMMSharedATemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class ROCmBMMSharedATemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Validated gfx950 shared-LHS BMM configs.
 
     This is deliberately a separate candidate from the general BMM warp-pipe.
