@@ -32,6 +32,21 @@ def _ds_shared_layout(bm, bn, conflict_free=False):
     return tlx.padded_shared_layout_encoding.with_bases(padding, bases, [bm, bn])
 
 
+@triton.constexpr_function
+def _row_perm_layouts(m):
+    # Store logical row 16a + 8h + j at physical row 16a + 2j + h with the TDM
+    # 16-byte row pad. Row reads (16 rows, one column) still cover all 16 bank
+    # groups, and transposed reads (rows 0-7 at two adjacent 16-byte columns)
+    # now land on even and odd groups instead of overlapping. TDM writes the
+    # permutation through a 4-D [m/16, 8, 2, 128] view with strides
+    # [16, 1, 8] rows.
+    col_bases = [[0, 1 << bit] for bit in range(7)]
+    row_bases = [[8, 0], [1, 0], [2, 0], [4, 0]] + [[1 << bit, 0] for bit in range(4, m.bit_length() - 1)]
+    view = tlx.padded_shared_layout_encoding.with_bases([(128, 8)], col_bases + row_bases, [m, 128])
+    tdm = tlx.padded_shared_layout_encoding.with_identity_for([(128, 8)], [m // 16, 8, 2, 128])
+    return view, tdm
+
+
 @dataclasses.dataclass(frozen=True)
 class BackwardConfig:
     """Measured policy and independently selectable scheduling experiments.
@@ -270,7 +285,7 @@ def _dq_slices(config, n):
 @triton.jit
 def _issue_tile(Q, DO, q_desc, do_desc, qb, dob, step, N: tl.constexpr, BM: tl.constexpr, STAGES: tl.constexpr,
                 TDM: tl.constexpr, lse_desc=None, delta_desc=None, lseb=None, db=None,
-                ASYNC_STATS: tl.constexpr = False, PINGPONG: tl.constexpr = False):
+                ASYNC_STATS: tl.constexpr = False, PINGPONG: tl.constexpr = False, ROW_PERM: tl.constexpr = False):
     slot = step % STAGES
     if PINGPONG:
         # Waves 0..3 own every TDM request. With the half-step phase shift,
@@ -281,6 +296,14 @@ def _issue_tile(Q, DO, q_desc, do_desc, qb, dob, step, N: tl.constexpr, BM: tl.c
         do_next = tlx.update_tensor_descriptor(do_desc, add_offsets=[step * BM, 0], clamp_bounds=False)
         tlx.async_amd_descriptor_load_fused([(q_next, tlx.local_view(qb, slot), 0b0011),
                                              (do_next, tlx.local_view(dob, slot), 0b1100)])
+    elif ROW_PERM:
+        tdm_layout: tl.constexpr = _row_perm_layouts(BM)[1]
+        tlx.async_amd_descriptor_load(
+            q_desc, tlx.local_reinterpret(tlx.local_view(qb, slot), tl.bfloat16, [BM // 16, 8, 2, 128], tdm_layout),
+            [step * (BM // 16), 0, 0, 0], clamp_bounds=False)
+        tlx.async_amd_descriptor_load(
+            do_desc, tlx.local_reinterpret(tlx.local_view(dob, slot), tl.bfloat16, [BM // 16, 8, 2, 128], tdm_layout),
+            [step * (BM // 16), 0, 0, 0], clamp_bounds=False)
     elif TDM:
         tlx.async_amd_descriptor_load(q_desc, tlx.local_view(qb, slot), [step * BM, 0], clamp_bounds=False)
         tlx.async_amd_descriptor_load(do_desc, tlx.local_view(dob, slot), [step * BM, 0], clamp_bounds=False)
@@ -574,13 +597,16 @@ def _delayed_bwd_kernel(
         v = tlx.buffer_load(V, tlx.require_layout(kv_offsets, lhs))
         k_desc = tl.make_tensor_descriptor(K, [N, 128], [128, 1], [256, 128])
         tlx.async_amd_descriptor_load(k_desc, tlx.local_view(kb, 0), [kv_tile * 256, 0], clamp_bounds=False)
-        qb = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES)
-        dob = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES)
+        qd_layout: tl.constexpr = _row_perm_layouts(OUTER_M)[0]
+        qb = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES, layout=qd_layout)
+        dob = tlx.local_alloc((OUTER_M, 128), tl.bfloat16, STAGES, layout=qd_layout)
         lseb = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
         db = tlx.local_alloc((1, OUTER_M), tl.float32, STAGES)
         dsb = tlx.local_alloc((32, 256), tl.bfloat16, 2, layout=_ds_shared_layout(32, 256, True))
-        q_desc = tl.make_tensor_descriptor(Q, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
-        do_desc = tl.make_tensor_descriptor(DO, [GROUP * N, 128], [128, 1], [OUTER_M, 128])
+        q_desc = tl.make_tensor_descriptor(Q, [GROUP * N // 16, 8, 2, 128], [2048, 128, 1024, 1],
+                                           [OUTER_M // 16, 8, 2, 128])
+        do_desc = tl.make_tensor_descriptor(DO, [GROUP * N // 16, 8, 2, 128], [2048, 128, 1024, 1],
+                                            [OUTER_M // 16, 8, 2, 128])
         lse_desc = tl.make_tensor_descriptor(LSE, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
         delta_desc = tl.make_tensor_descriptor(Delta, [1, GROUP * N], [GROUP * N, 1], [1, OUTER_M])
         tlx.async_amd_descriptor_wait(0)
@@ -610,16 +636,16 @@ def _delayed_bwd_kernel(
         for initial in tl.static_range(STAGES - 1):
             if outer_count // Q_SPLITS > initial:
                 _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer_start + initial, N, OUTER_M, STAGES, True, lse_desc,
-                            delta_desc, lseb, db, True)
+                            delta_desc, lseb, db, True, ROW_PERM=True)
             elif outer_start + initial < outer_stop:
                 _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer_start + initial, N, OUTER_M, STAGES, True, lse_desc,
-                            delta_desc, lseb, db, True)
+                            delta_desc, lseb, db, True, ROW_PERM=True)
         tl.debug_barrier()
         # occ1-outer-begin: statically unrolled BM32 phases, one outer tile ahead.
         for outer in tl.range(outer_start, outer_stop):
             if outer + STAGES - 1 < outer_stop:
                 _issue_tile(Q, DO, q_desc, do_desc, qb, dob, outer + STAGES - 1, N, OUTER_M, STAGES, True, lse_desc,
-                            delta_desc, lseb, db, True)
+                            delta_desc, lseb, db, True, ROW_PERM=True)
             tlx.async_amd_descriptor_wait(4 * (STAGES - 1))
             if outer + STAGES - 1 >= outer_stop:
                 tlx.async_amd_descriptor_wait(0)
