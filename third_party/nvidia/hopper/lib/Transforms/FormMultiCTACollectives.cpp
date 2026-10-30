@@ -52,6 +52,19 @@ bool isSupportedScalarCombiner(triton::ReduceOp reduce) {
                          arith::MinNumFOp, arith::MinimumFOp>(combiner);
 }
 
+bool hasOnlyConstantCaptures(triton::ReduceOp reduce) {
+  Block &body = reduce.getCombineOp().front();
+  return llvm::all_of(body.without_terminator(), [&](Operation &op) {
+    return llvm::all_of(op.getOperands(), [&](Value operand) {
+      if (auto argument = dyn_cast<BlockArgument>(operand))
+        return argument.getOwner() == &body;
+      Operation *def = operand.getDefiningOp();
+      return def && (def->getBlock() == &body ||
+                     def->hasTrait<OpTrait::ConstantLike>());
+    });
+  });
+}
+
 LogicalResult validateFunction(triton::FuncOp function, int axis, int size) {
   bool sawLocalRank = false;
   WalkResult result = function.walk([&](Operation *op) {
@@ -211,8 +224,21 @@ LogicalResult formCollective(triton::ReduceOp reduce, int axis, int size) {
   for (auto [from, to] :
        llvm::zip(source.getArguments(), target->getArguments()))
     mapping.map(from, to);
-  for (Operation &op : source.without_terminator())
+  for (Operation &op : source.without_terminator()) {
+    for (Value operand : op.getOperands()) {
+      if (mapping.contains(operand))
+        continue;
+      Operation *constant = operand.getDefiningOp();
+      if (!constant || !constant->hasTrait<OpTrait::ConstantLike>())
+        return reduce.emitError(
+            "multi_cta combine region may capture only constants");
+      Operation *clone = builder.clone(*constant);
+      for (auto [original, copy] :
+           llvm::zip(constant->getResults(), clone->getResults()))
+        mapping.map(original, copy);
+    }
     builder.clone(op, mapping);
+  }
   SmallVector<Value> results;
   for (Value result : source.getTerminator()->getOperands())
     results.push_back(mapping.lookupOrDefault(result));
@@ -292,6 +318,10 @@ public:
       if (reduce.hasDefinedOrdering() || !isSupportedScalarCombiner(reduce)) {
         reduce.emitError("multi_cta requires an unordered scalar f32 add, max, "
                          "or min reduction");
+        return signalPassFailure();
+      }
+      if (!hasOnlyConstantCaptures(reduce)) {
+        reduce.emitError("multi_cta combine region may capture only constants");
         return signalPassFailure();
       }
     }
