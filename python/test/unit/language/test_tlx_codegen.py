@@ -7435,3 +7435,38 @@ def test_amd_scaled_downcast_fp8_rejects_scalar_input():
     source = ASTSource(_amd_scaled_downcast_fp8_scalar_kernel, signature={"value": "fp32", "Y": "*fp8e4nv"})
     with pytest.raises(CompilationError, match="value must be an FP32 tensor"):
         triton_compile(source, target=GPUTarget("hip", "gfx950", 64))
+
+
+@triton.jit
+def _amd_sched_group_barrier_kernel(x_ptr, y_ptr, MASK: tl.constexpr, SIZE: tl.constexpr, SYNC_ID: tl.constexpr):
+    offsets = tl.arange(0, 64)
+    values = tl.load(x_ptr + offsets)
+    tlx.amd_sched_group_barrier(MASK, SIZE, SYNC_ID)
+    tl.store(y_ptr + offsets, values)
+
+
+def test_amd_sched_group_barrier_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_sched_group_barrier_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
+        constexprs={"MASK": 0x20, "SIZE": 1, "SYNC_ID": 7},
+    )
+    assert "call void @llvm.amdgcn.sched.group.barrier(i32 32, i32 1, i32 7)" in compiled.asm["llir"]
+    assert "sched_group_barrier" in compiled.asm["amdgcn"]
+
+
+@pytest.mark.parametrize("constants,error", [
+    ({"MASK": 0x1000}, "mask must use only"),
+    ({"MASK": False}, "mask must be a constexpr integer"),
+    ({"SIZE": -1}, "size must be a non-negative"),
+    ({"SIZE": 1.0}, "size must be a constexpr integer"),
+    ({"SYNC_ID": 1 << 31}, "sync_id must be a non-negative"),
+])
+def test_amd_sched_group_barrier_rejects_invalid_constants(constants, error):
+    config = dict(MASK=0x20, SIZE=1, SYNC_ID=0)
+    config.update(constants)
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.always_compile = True
+        with pytest.raises(CompilationError, match=error):
+            compile_for_gfx950(_amd_sched_group_barrier_kernel, signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
+                               constexprs=config)

@@ -7,12 +7,15 @@ from .barrier import (
     barrier_expect_bytes,
     barrier_wait,
     cluster_barrier,
+    amd_cluster_arrive,
+    amd_cluster_wait,
     cond_barrier,
     fence_mbarrier_init_cluster,
     named_barrier_arrive,
     named_barrier_wait,
     amd_iglp_opt,
     amd_sched_barrier,
+    amd_sched_group_barrier,
     workgroup_barrier,
 )
 from .dynamic_launch import (
@@ -247,6 +250,8 @@ __all__ = [
     "prefetch",
     # barriers
     "cluster_barrier",
+    "amd_cluster_arrive",
+    "amd_cluster_wait",
     "cond_barrier",
     "workgroup_barrier",
     "alloc_barriers",
@@ -259,6 +264,7 @@ __all__ = [
     "named_barrier_arrive",
     "amd_iglp_opt",
     "amd_sched_barrier",
+    "amd_sched_group_barrier",
     # mma_ops
     "dot_scaled",
     "require_amd_wmma_layout",

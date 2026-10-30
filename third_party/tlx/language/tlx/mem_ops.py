@@ -1941,8 +1941,10 @@ def async_amd_descriptor_load_fused(
     must select at most five recipients on gfx1250, including when its value
     is computed at runtime. Each recipient must issue the same source request
     to the same LDS offset.
-    The caller must synchronize accesses to destination shared memory across
-    recipient CTAs.
+    Only CTAs which issue matching requests receive a combined load. Late
+    requests are serviced separately after timeout, so cluster synchronization
+    is optional and only improves sharing. Each CTA must still synchronize its
+    local shared-memory accesses and wait for its own load completion.
     Omit the masks to infer multicast from distributed tensor layouts.
     """
     arch = _semantic.builder.options.arch
