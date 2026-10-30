@@ -583,7 +583,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   // CHECK-LABEL: masked_load_eviction
   tt.func @masked_load_eviction(%ptr: !llvm.ptr, %mask: i1, %falseVal: f32) -> f32 {
     // evict_first marks the load nontemporal.
-    // CHECK: llvm.load {{.*}} {nontemporal} : !llvm.ptr -> f32
+    // CHECK: llvm.load {{.*}} <nontemporal> : !llvm.ptr -> f32
     %ld = amdg.masked_load %ptr, %mask, %falseVal evictionPolicy = evict_first : (!llvm.ptr, i1, f32) -> f32
     tt.return %ld : f32
   }
