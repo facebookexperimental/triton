@@ -1522,3 +1522,56 @@ def test_grouped_gemm_list_empty_m(block_m, staging, cross, m_tiles):
     for out, a, b in zip(outputs, cpu_a, cpu_b):
         expected = (a.float() @ b.float().T).half()
         torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+@triton.jit
+def _partitioned_tdm_reshape_kernel(x_ptr, output_ptr, ROWS: tl.constexpr, K: tl.constexpr, R: tl.constexpr,
+                                    GROUP_MAJOR: tl.constexpr):
+    G: tl.constexpr = ROWS // R
+    if GROUP_MAJOR:
+        # [G, R, K] with R rows per group split into two pieces along dim 1.
+        # One TDM load fills each partition; read it back as a flat view.
+        piece: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[K, 8]], [G, R // 2, K], [2, 1, 0])
+        layout: tl.constexpr = tlx.partitioned_shared_layout_encoding(2, 1, 1, piece)
+        desc = tl.make_tensor_descriptor(x_ptr, [G, R, K], [R * K, K, 1], [G, R, K])
+        buf = tlx.local_alloc((G, R, K), tl.float16, 1, layout=layout)
+        view = tlx.local_view(buf, 0)
+        tlx.async_amd_descriptor_load(desc, view, [0, 0, 0])
+        tlx.async_amd_descriptor_wait(pendings=0)
+        flat = tlx.local_reshape(view, [ROWS, K])
+        x = tlx.local_load(flat)
+        offsets = tl.arange(0, ROWS)[:, None] * K + tl.arange(0, K)[None, :]
+        tl.store(output_ptr + offsets, x)
+    else:
+        # [ROWS, K] with G groups of two R / 2-row pieces along dim 0; read it
+        # back through the unfolded [G, R, K] view.
+        piece: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[K, 8]], [R // 2, K], [1, 0])
+        layout: tl.constexpr = tlx.partitioned_shared_layout_encoding(2, G, 0, piece)
+        desc = tl.make_tensor_descriptor(x_ptr, [ROWS, K], [K, 1], [ROWS, K])
+        buf = tlx.local_alloc((ROWS, K), tl.float16, 1, layout=layout)
+        view = tlx.local_view(buf, 0)
+        tlx.async_amd_descriptor_load(desc, view, [0, 0])
+        tlx.async_amd_descriptor_wait(pendings=0)
+        grouped = tlx.local_reshape(view, [G, R, K])
+        x = tlx.local_load(grouped)
+        offsets = (tl.arange(0, G)[:, None, None] * (R * K) + tl.arange(0, R)[None, :, None] * K +
+                   tl.arange(0, K)[None, None, :])
+        tl.store(output_ptr + offsets, x)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("group_major", [True, False])
+@pytest.mark.parametrize("ROWS, R", [(256, 128), (256, 64)])
+@pytest.mark.parametrize("num_warps", [2, 4, 8])
+def test_partitioned_tdm_load_reshape_gfx1250(device, group_major, ROWS, R, num_warps):
+    """TDM fills a partitioned buffer that is read back through a reshaped view.
+
+    With more warps than pieces, the extra warps of a group-major load must
+    split the groups rather than the pieces, so each warp's tile stays
+    contiguous in its partition.
+    """
+    K = 64
+    x = torch.randn(ROWS, K, dtype=torch.float16, device=device)
+    output = torch.empty_like(x)
+    _partitioned_tdm_reshape_kernel[(1, )](x, output, ROWS=ROWS, K=K, R=R, GROUP_MAJOR=group_major, num_warps=num_warps)
+    torch.testing.assert_close(x, output, atol=0, rtol=0)
