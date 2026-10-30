@@ -257,18 +257,35 @@ def test_flash_attn_varlen_contiguous_but_unaligned_base():
     torch.testing.assert_close(out.float(), _reference(q, k, v, cu, cu, False, 128**-0.5), **TOLERANCE[torch.float16])
 
 
-def test_flash_attn_varlen_k_and_v_may_be_one_tensor():
-    """Ranking models attend with the same history as keys and values."""
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("heads,kv_heads", [(2, 2), (4, 2)])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_flash_attn_varlen_k_and_v_may_be_one_tensor(causal, heads, kv_heads, head_dim):
+    """Ranking models attend with the same history as keys and values; one tile then serves as both."""
     from triton.tlx.ops import flash_attn_varlen
 
     torch.manual_seed(20)
-    lens_q, lens_k = [600, 400], [1000, 300]
-    q = torch.randn(sum(lens_q), 2, 128, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(sum(lens_k), 2, 128, device="cuda", dtype=torch.bfloat16)
+    lens_q, lens_k = [600, 400, 0, 129], [1000, 300, 50, 1]
+    q = torch.randn(sum(lens_q), heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(sum(lens_k), kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     cu_q, cu_k = _cu(lens_q), _cu(lens_k)
-    out = flash_attn_varlen(q, kv, kv, cu_q, cu_k, 600, 1000)
-    torch.testing.assert_close(out.float(), _reference(q, kv, kv, cu_q, cu_k, False, 128**-0.5),
+    out = flash_attn_varlen(q, kv, kv, cu_q, cu_k, 600, 1000, causal=causal)
+    torch.testing.assert_close(out.float(), _reference(q, kv, kv, cu_q, cu_k, causal, head_dim**-0.5),
                                **TOLERANCE[torch.bfloat16])
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_more_sequences_than_the_schedule_sorts(causal):
+    """Past `MAX_SORTED_SEQS` the schedule keeps index order; empty and tied sequences are fine either way."""
+    from triton.tlx.ops.kernels.flash_attn_varlen.sm90 import MAX_SORTED_SEQS
+
+    gen = torch.Generator().manual_seed(21)
+    for batch in (MAX_SORTED_SEQS, MAX_SORTED_SEQS + 7):
+        lens_q = torch.randint(0, 300, (batch, ), generator=gen).tolist()
+        lens_k = [
+            300 if i % 3 == 0 else n for i, n in enumerate(torch.randint(0, 500, (batch, ), generator=gen).tolist())
+        ]
+        _check(lens_q, lens_k, causal, dtype=torch.float16)
 
 
 def test_flash_attn_varlen_rejects_invalid_inputs():

@@ -16,8 +16,15 @@ the column coordinate.
 - Tiles are claimed dynamically: the producer takes the next tile index from a
   global atomic counter, two key blocks before it finishes issuing the current
   tile, and hands it to the consumers through a small shared memory ring. Programs
-  that draw short key lengths therefore take more tiles. A tile whose first row
-  is past its sequence's end is never handed out.
+  that draw short key lengths therefore take more tiles.
+- A one-program kernel launched first writes the schedule: sequences ranked
+  longest key side first, and the first tile of each rank. Claim ``t`` maps to
+  its tile by a binary search over those first tiles, so the longest tiles go
+  out first and the last wave is made of short ones. Only tiles that hold query
+  rows are scheduled. The same kernel zeroes the claim counter.
+- When K and V are one tensor, as when a ranking model passes the same history
+  as both, each key block is loaded once and serves as K for QK and as V for PV.
+- Key blocks that every row of a tile sees run in a loop without the score mask.
 - A key block that straddles a sequence end reads the next sequence's rows;
   those scores are masked to ``-inf`` before the softmax, so they weigh 0.
 - The last query tile of a sequence is written with a row mask, because a TMA
@@ -50,6 +57,8 @@ LOG2E = 1.4426950408889634
 NUM_TILE_BUFFERS = 3
 CLAIM_AHEAD = 2
 TMA_STORE = True
+# Sequences per launch that the schedule ranks by key length; a larger batch keeps index order.
+MAX_SORTED_SEQS = 32
 
 
 @tl.core.builtin
@@ -76,6 +85,59 @@ def _tile_info(tile_idx, CuQ, CuK, H, kv_group, num_m_blocks, BLOCK_M: tl.conste
 
 
 @triton.jit
+def _schedule(CuQ, CuK, Sched, batch, H, BLOCK_M: tl.constexpr, MAX_SORTED: tl.constexpr):
+    """Fill ``Sched`` with [tile counter, tile count, sequence of each rank, first tile of each rank].
+
+    Ranks put the longest key side first (ties in index order), so the persistent programs claim the longest tiles
+    first and the last wave is made of short ones. Only tiles that hold query rows are counted.
+    """
+    tl.store(Sched, 0)
+    seq = Sched + 2
+    first = Sched + 2 + batch
+    if batch <= MAX_SORTED:
+        i = tl.arange(0, MAX_SORTED)
+        ok = i < batch
+        q_len = tl.load(CuQ + i + 1, mask=ok, other=0) - tl.load(CuQ + i, mask=ok, other=0)
+        k_len = tl.where(ok, tl.load(CuK + i + 1, mask=ok, other=0) - tl.load(CuK + i, mask=ok, other=0), -1)
+        tiles = H * tl.cdiv(q_len, BLOCK_M)
+        # ahead[i, j]: sequence j is ranked before sequence i.
+        ahead = (k_len[None, :] > k_len[:, None]) | ((k_len[None, :] == k_len[:, None]) & (i[None, :] < i[:, None]))
+        rank = tl.sum(ahead.to(tl.int32), 1)
+        tl.store(seq + rank, i, mask=ok)
+        tl.store(first + rank, tl.sum(tl.where(ahead, tiles[None, :], 0), 1), mask=ok)
+        tl.store(Sched + 1, tl.sum(tiles, 0))
+    else:
+        total = 0
+        for c in range(0, batch, MAX_SORTED):
+            i = c + tl.arange(0, MAX_SORTED)
+            ok = i < batch
+            tiles = H * tl.cdiv(tl.load(CuQ + i + 1, mask=ok, other=0) - tl.load(CuQ + i, mask=ok, other=0), BLOCK_M)
+            tl.store(seq + i, i, mask=ok)
+            tl.store(first + i, total + tl.cumsum(tiles, 0) - tiles, mask=ok)
+            total += tl.sum(tiles, 0)
+        tl.store(Sched + 1, total)
+
+
+@triton.jit
+def _physical_tile(t, Sched, CuQ, batch, H, num_m_blocks, BLOCK_M: tl.constexpr):
+    """The ``_tile_info`` index of the ``t``-th scheduled tile; its rank is found by binary search over first tiles."""
+    first = Sched + 2 + batch
+    step = 1
+    while step * 2 <= batch:
+        step *= 2
+    r = 0
+    while step > 0:
+        cand = r + step
+        start = tl.load(first + cand, mask=cand < batch, other=t + 1)
+        r = tl.where(start <= t, cand, r)
+        step = step // 2
+    b = tl.load(Sched + 2 + r)
+    local = t - tl.load(first + r)
+    m_blocks = tl.cdiv(tl.load(CuQ + b + 1) - tl.load(CuQ + b), BLOCK_M)
+    return (b * H + local // m_blocks) * num_m_blocks + local % m_blocks
+
+
+@triton.jit
 def _mask_scores(qk, kv_idx, k_len, offs_m, causal_off, full_cols, BLOCK_N: tl.constexpr, CAUSAL: tl.constexpr):
     # Columns below `full_cols` are visible to every row of the tile, so a block that ends there needs no mask.
     if kv_idx + BLOCK_N > full_cols:
@@ -96,6 +158,46 @@ def _softmax_step(qk, m_i, l_i, qk_scale):
     p = tl.math.exp2(qk * qk_scale - m_safe[:, None])
     alpha = tl.math.exp2(m_i - m_safe)
     return m_ij, l_i * alpha + tl.sum(p, 1), p, alpha
+
+
+@triton.jit
+def _kv_block(blk, accum_cnt_kv, acc, m_i, l_i, p, q_tile, k_tiles, v_tiles, k_fulls, k_empties, v_fulls, v_empties,
+              k_len, offs_m, causal_off, full_cols, qk_scale, p_dtype: tl.constexpr, cid: tl.constexpr,
+              NUM_BUFFERS: tl.constexpr, BLOCK_N: tl.constexpr, CAUSAL: tl.constexpr, SERIALIZE_QK: tl.constexpr,
+              KV_SAME: tl.constexpr, APPLY_MASK: tl.constexpr):
+    """QK of key block ``blk`` overlapped with PV of block ``blk - 1``, then the softmax update of ``blk``."""
+    k_buf_id, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
+    tlx.barrier_wait(k_fulls[k_buf_id], k_phase)
+    k_tile = tlx.local_trans(k_tiles[k_buf_id])
+    if SERIALIZE_QK:
+        if cid == 0:
+            tlx.named_barrier_wait(9, 256)
+        else:
+            tlx.named_barrier_wait(10, 256)
+    qk = tlx.async_dot(q_tile, k_tile)
+    if SERIALIZE_QK:
+        if cid == 0:
+            tlx.named_barrier_arrive(10, 256)
+        else:
+            tlx.named_barrier_arrive(9, 256)
+
+    # pv of the previous block overlaps this block's qk
+    v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS)
+    if not KV_SAME:
+        tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
+    acc = tlx.async_dot(p.to(p_dtype), v_tiles[v_buf_id], acc)
+
+    qk = tlx.async_dot_wait(1, qk)
+    if APPLY_MASK:
+        qk = _mask_scores(qk, blk * BLOCK_N, k_len, offs_m, causal_off, full_cols, BLOCK_N, CAUSAL)
+    if not KV_SAME:
+        tlx.barrier_arrive(k_empties[k_buf_id], 1)
+    m_i, l_i, p, alpha = _softmax_step(qk, m_i, l_i, qk_scale)
+
+    acc = tlx.async_dot_wait(0, acc)
+    tlx.barrier_arrive(v_empties[v_buf_id], 1)
+    acc = acc * alpha[:, None]
+    return acc, m_i, l_i, p, accum_cnt_kv + 1
 
 
 @triton.jit
@@ -124,7 +226,7 @@ def _flash_attn_varlen_fwd(
     DescSlots,
     CuQ,
     CuK,
-    Counter,
+    Sched,
     tokens_q,
     stride_ot,
     stride_oh,
@@ -132,12 +234,13 @@ def _flash_attn_varlen_fwd(
     H,
     kv_group,
     num_m_blocks,
-    total_tiles,
+    batch,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
     TMA_STORE: tl.constexpr,
+    KV_SAME: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
     NUM_TILE_BUFFERS: tl.constexpr,
     CLAIM_AHEAD: tl.constexpr,
@@ -157,7 +260,6 @@ def _flash_attn_varlen_fwd(
 
     q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_MMA_GROUPS)
     k_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS)
-    v_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS)
 
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=1)
     q_empties = tlx.alloc_warp_barrier(
@@ -165,18 +267,25 @@ def _flash_attn_varlen_fwd(
         num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
         num_arrivals=1,
     )
+    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
     k_empties = tlx.alloc_warp_barrier(
         num_barriers=NUM_BUFFERS,
         num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
         num_arrivals=NUM_MMA_GROUPS,
     )
-    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
-    v_empties = tlx.alloc_warp_barrier(
-        num_barriers=NUM_BUFFERS,
-        num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
-        num_arrivals=NUM_MMA_GROUPS,
-    )
-    v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    if KV_SAME:
+        # One tile serves as K for QK and as V for PV; it is released after PV.
+        v_tiles = k_tiles
+        v_empties = k_empties
+        v_fulls = k_fulls
+    else:
+        v_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS)
+        v_empties = tlx.alloc_warp_barrier(
+            num_barriers=NUM_BUFFERS,
+            num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
+            num_arrivals=NUM_MMA_GROUPS,
+        )
+        v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
     tile_id_smem = tlx.local_alloc((1, ), tl.int32, NUM_TILE_BUFFERS)
     tile_fulls = tlx.alloc_barriers(num_barriers=NUM_TILE_BUFFERS, arrive_count=1)
     tile_empties = tlx.alloc_warp_barrier(
@@ -191,15 +300,16 @@ def _flash_attn_varlen_fwd(
             accum_cnt_kv = 0
             accum_cnt_q = 0
             accum_cnt_tile = 0
+            total_tiles = tl.load(Sched + 1)
             tile_idx = prog_id
             while tile_idx < total_tiles:
+                phys_idx = _physical_tile(tile_idx, Sched, CuQ, batch, H, num_m_blocks, BLOCK_M)
                 off_h, off_kh, q_start, q_len, k_start, k_len, m_block, n_kv = _tile_info(
-                    tile_idx, CuQ, CuK, H, kv_group, num_m_blocks, BLOCK_M, BLOCK_N, CAUSAL)
-                if m_block * BLOCK_M < q_len:
-                    _publish_tile(tile_idx, tile_id_smem, tile_fulls, tile_empties, accum_cnt_tile, NUM_TILE_BUFFERS)
-                    accum_cnt_tile += 1
+                    phys_idx, CuQ, CuK, H, kv_group, num_m_blocks, BLOCK_M, BLOCK_N, CAUSAL)
+                _publish_tile(phys_idx, tile_id_smem, tile_fulls, tile_empties, accum_cnt_tile, NUM_TILE_BUFFERS)
+                accum_cnt_tile += 1
                 next_tile = -1
-                if m_block * BLOCK_M < q_len and n_kv > 0:
+                if n_kv > 0:
                     q_phase = accum_cnt_q & 1
                     for cid in tl.static_range(NUM_MMA_GROUPS):
                         tlx.barrier_wait(q_empties[cid], q_phase ^ 1)
@@ -211,20 +321,22 @@ def _flash_attn_varlen_fwd(
                             q_fulls[cid],
                         )
                     for blk in range(0, n_kv):
-                        if blk == tl.maximum(n_kv - CLAIM_AHEAD, 0):
-                            next_tile = num_progs + tl.atomic_add(Counter, 1, sem="relaxed")
                         buf, phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
                         kv_row = k_start + blk * BLOCK_N
                         tlx.barrier_wait(k_empties[buf], phase ^ 1)
                         tlx.barrier_expect_bytes(k_fulls[buf], K_BYTES)
                         tlx.async_descriptor_load(desc_k, k_tiles[buf], [kv_row, off_kh * HEAD_DIM], k_fulls[buf])
-                        tlx.barrier_wait(v_empties[buf], phase ^ 1)
-                        tlx.barrier_expect_bytes(v_fulls[buf], V_BYTES)
-                        tlx.async_descriptor_load(desc_v, v_tiles[buf], [kv_row, off_kh * HEAD_DIM], v_fulls[buf])
+                        if not KV_SAME:
+                            tlx.barrier_wait(v_empties[buf], phase ^ 1)
+                            tlx.barrier_expect_bytes(v_fulls[buf], V_BYTES)
+                            tlx.async_descriptor_load(desc_v, v_tiles[buf], [kv_row, off_kh * HEAD_DIM], v_fulls[buf])
+                        # Claim after this block's loads are issued, so the atomic's latency does not delay them.
+                        if blk == tl.maximum(n_kv - CLAIM_AHEAD, 0):
+                            next_tile = num_progs + tl.atomic_add(Sched, 1, sem="relaxed")
                         accum_cnt_kv += 1
                     accum_cnt_q += 1
                 if next_tile < 0:
-                    next_tile = num_progs + tl.atomic_add(Counter, 1, sem="relaxed")
+                    next_tile = num_progs + tl.atomic_add(Sched, 1, sem="relaxed")
                 tile_idx = next_tile
             _publish_tile(-1, tile_id_smem, tile_fulls, tile_empties, accum_cnt_tile, NUM_TILE_BUFFERS)
 
@@ -289,47 +401,36 @@ def _flash_attn_varlen_fwd(
                             tlx.named_barrier_arrive(9, 256)
                     qk = tlx.async_dot_wait(0, qk)
                     qk = _mask_scores(qk, 0, k_len, offs_m, causal_off, full_cols, BLOCK_N, CAUSAL)
-                    tlx.barrier_arrive(k_empties[k_buf_id], 1)
+                    if not KV_SAME:
+                        tlx.barrier_arrive(k_empties[k_buf_id], 1)
                     # A single key block has finished its last QK read of Q.
                     if n_kv == 1:
                         tlx.barrier_arrive(q_empties[cid], 1)
                     m_i, l_i, p, alpha = _softmax_step(qk, m_i, l_i, qk_scale)
                     accum_cnt_kv += 1
 
-                    for blk in range(1, n_kv):
-                        k_buf_id, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
-                        tlx.barrier_wait(k_fulls[k_buf_id], k_phase)
-                        k_tile = tlx.local_trans(k_tiles[k_buf_id])
-                        if SERIALIZE_QK:
-                            if cid == 0:
-                                tlx.named_barrier_wait(9, 256)
-                            else:
-                                tlx.named_barrier_wait(10, 256)
-                        qk = tlx.async_dot(q_tiles[cid], k_tile)
-                        if SERIALIZE_QK:
-                            if cid == 0:
-                                tlx.named_barrier_arrive(10, 256)
-                            else:
-                                tlx.named_barrier_arrive(9, 256)
-
-                        # pv of the previous block overlaps this block's qk
-                        v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS)
-                        tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
-                        acc = tlx.async_dot(p.to(tlx.dtype_of(desc_k)), v_tiles[v_buf_id], acc)
-
-                        qk = tlx.async_dot_wait(1, qk)
-                        qk = _mask_scores(qk, blk * BLOCK_N, k_len, offs_m, causal_off, full_cols, BLOCK_N, CAUSAL)
-                        tlx.barrier_arrive(k_empties[k_buf_id], 1)
-                        m_i, l_i, p, alpha = _softmax_step(qk, m_i, l_i, qk_scale)
-
-                        acc = tlx.async_dot_wait(0, acc)
-                        tlx.barrier_arrive(v_empties[v_buf_id], 1)
-                        acc = acc * alpha[:, None]
-                        accum_cnt_kv += 1
+                    # Key blocks that every row sees run without the mask; the rest (at most the last, or the causal
+                    # diagonal) apply it.
+                    n_full = tl.maximum(full_cols // BLOCK_N, 1)
+                    for blk in range(1, n_full):
+                        acc, m_i, l_i, p, accum_cnt_kv = _kv_block(blk, accum_cnt_kv, acc, m_i, l_i, p, q_tiles[cid],
+                                                                   k_tiles, v_tiles, k_fulls, k_empties, v_fulls,
+                                                                   v_empties, k_len,
+                                                                   offs_m, causal_off, full_cols, qk_scale,
+                                                                   tlx.dtype_of(desc_k), cid, NUM_BUFFERS, BLOCK_N,
+                                                                   CAUSAL, SERIALIZE_QK, KV_SAME, False)
+                    for blk in range(n_full, n_kv):
+                        acc, m_i, l_i, p, accum_cnt_kv = _kv_block(blk, accum_cnt_kv, acc, m_i, l_i, p, q_tiles[cid],
+                                                                   k_tiles, v_tiles, k_fulls, k_empties, v_fulls,
+                                                                   v_empties, k_len,
+                                                                   offs_m, causal_off, full_cols, qk_scale,
+                                                                   tlx.dtype_of(desc_k), cid, NUM_BUFFERS, BLOCK_N,
+                                                                   CAUSAL, SERIALIZE_QK, KV_SAME, True)
 
                     # pv of the last block
                     v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS)
-                    tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
+                    if not KV_SAME:
+                        tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
                     acc = tlx.async_dot(p.to(tlx.dtype_of(desc_k)), v_tiles[v_buf_id], acc)
                     acc = tlx.async_dot_wait(1, acc)
                     if n_kv != 1:
@@ -370,6 +471,14 @@ def _unaligned(x):
     return (x.storage_offset() * x.element_size()) % 16 != 0
 
 
+def _same_tensor(k, v):
+    """Whether ``k`` and ``v`` are one tensor, as when a caller passes the same history as keys and values."""
+    if k is v:
+        return True
+    return (_has_address(k) and _has_address(v) and k.data_ptr() == v.data_ptr() and k.shape == v.shape
+            and k.stride() == v.stride())
+
+
 def _rows(x):
     """``x`` as a TMA-addressable ``(tokens, heads * head_dim)`` matrix: heads dense in a row, rows 16-byte aligned."""
     tokens, heads, head_dim = x.shape
@@ -403,21 +512,25 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scal
     if k.shape[0] == 0:
         return out.zero_()
     block_n = 128
-    num_buffers = 3 if head_dim == 64 and not causal else 2
+    kv_same = _same_tensor(k, v)
+    # A shared K/V tile frees the V buffers, so it takes one more stage than separate K and V.
+    num_buffers = 3 if (head_dim == 64 and not causal) or kv_same else 2
     split = BLOCK_M // NUM_MMA_GROUPS
     out_rows = out.view(tokens_q, heads * head_dim)
     desc_q = TensorDescriptor.from_tensor(_rows(q), [split, head_dim])
     desc_k = TensorDescriptor.from_tensor(_rows(k), [block_n, head_dim])
-    desc_v = TensorDescriptor.from_tensor(_rows(v), [block_n, head_dim])
-    counter = torch.zeros(1, device=q.device, dtype=torch.int32)
+    desc_v = desc_k if kv_same else TensorDescriptor.from_tensor(_rows(v), [block_n, head_dim])
+    sched = torch.empty(2 + 2 * batch, device=q.device, dtype=torch.int32)
     # AOTI captures the build device's SM count. On smaller GPUs, queued CTAs own their first tiles until scheduled.
     num_sms = _num_sms(q.device)
     desc_slots = torch.empty(num_sms * NUM_MMA_GROUPS * 128, device=q.device, dtype=torch.int8)
     kernel = wrap_triton(_flash_attn_varlen_fwd)[(num_sms, )]
     with torch.cuda.device(q.device):
-        kernel(desc_q, desc_k, desc_v, out_rows, desc_slots, cu_seqlens_q, cu_seqlens_k, counter, tokens_q,
-               out_rows.stride(0), head_dim, sm_scale * LOG2E, heads, heads // kv_heads, num_m_blocks, total_tiles,
-               HEAD_DIM=head_dim, BLOCK_M=BLOCK_M, BLOCK_N=block_n, CAUSAL=causal, TMA_STORE=TMA_STORE,
+        wrap_triton(_schedule)[(1, )](cu_seqlens_q, cu_seqlens_k, sched, batch, heads, BLOCK_M=BLOCK_M,
+                                      MAX_SORTED=MAX_SORTED_SEQS, num_warps=1)
+        kernel(desc_q, desc_k, desc_v, out_rows, desc_slots, cu_seqlens_q, cu_seqlens_k, sched, tokens_q,
+               out_rows.stride(0), head_dim, sm_scale * LOG2E, heads, heads // kv_heads, num_m_blocks, batch,
+               HEAD_DIM=head_dim, BLOCK_M=BLOCK_M, BLOCK_N=block_n, CAUSAL=causal, TMA_STORE=TMA_STORE, KV_SAME=kv_same,
                NUM_BUFFERS=num_buffers, NUM_TILE_BUFFERS=NUM_TILE_BUFFERS, CLAIM_AHEAD=CLAIM_AHEAD,
                NUM_MMA_WARPS=NUM_MMA_WARPS, NUM_MMA_GROUPS=NUM_MMA_GROUPS, CONSUMER_REGISTERS=CONSUMER_REGISTERS,
                num_warps=4, num_stages=1)
