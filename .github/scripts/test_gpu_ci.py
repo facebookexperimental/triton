@@ -515,7 +515,8 @@ def test_run_summary_explains_actual_placement(paths, offload, placement, gpu_jo
     assert f"Planned GPU jobs: {gpu_jobs}." in summary
     assert f"| gluon | {placement} |" in summary
     assert reason in summary and "Selection note" in summary
-    assert "`tested-sha`" in summary
+    assert "Selected commit: `tested-sha`." in summary
+    assert "Tested commit:" not in summary
     assert "not collected test cases" in summary
     for name in suites["cpu"]["gluon"]["gluon_skip_files"]:
         assert f"`{name}`" in summary
