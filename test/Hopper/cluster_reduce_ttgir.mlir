@@ -90,3 +90,55 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 4 : i32,
     tt.return %sum : f32
   }
 }
+
+// -----
+
+#tensor_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+
+// Bind protocol operands so unrelated stores or barriers cannot satisfy these checks.
+// CHECK-LABEL: @tensor_sum(
+// CHECK-SAME: %[[PARTIAL:[a-zA-Z0-9_]+]]: tensor<128xf32, #blocked>
+// CHECK: %[[RANK:[a-zA-Z0-9_]+]] = nvg.cluster_id
+// CHECK: %[[SLOTS:[a-zA-Z0-9_]+]] = ttg.local_alloc : () -> !ttg.memdesc<2x128xf32
+// CHECK: %[[LOCAL_SLOT:[a-zA-Z0-9_]+]] = ttg.memdesc_index %[[SLOTS]][%[[RANK]]]
+// CHECK: %[[BARRIER:[a-zA-Z0-9_]+]] = ttg.local_alloc : () -> !ttg.memdesc<1xi64
+// CHECK: ttng.init_barrier %[[BARRIER]], 1
+// CHECK: %[[ACTIVE:[a-zA-Z0-9_]+]] = arith.constant true
+// CHECK: ttng.barrier_expect %[[BARRIER]], 512, %[[ACTIVE]]
+// CHECK: ttng.cluster_arrive
+// CHECK: ttng.cluster_wait
+// CHECK: ttg.local_store %[[PARTIAL]], %[[LOCAL_SLOT]]
+// CHECK: %[[RANK0:[a-zA-Z0-9_]+]] = arith.constant 0 : i32
+// CHECK: %[[SEND0:[a-zA-Z0-9_]+]] = arith.cmpi ne, %[[RANK]], %[[RANK0]] : i32
+// CHECK: scf.if %[[SEND0]] {
+// CHECK: ttg.async_remote_shmem_store %[[PARTIAL]], rank %[[RANK0]], %[[LOCAL_SLOT]] barrier %[[BARRIER]]
+// CHECK: }
+// CHECK-NOT: ttg.async_remote_shmem_store
+// CHECK: %[[RANK1:[a-zA-Z0-9_]+]] = arith.constant 1 : i32
+// CHECK: %[[SEND1:[a-zA-Z0-9_]+]] = arith.cmpi ne, %[[RANK]], %[[RANK1]] : i32
+// CHECK: scf.if %[[SEND1]] {
+// CHECK: ttg.async_remote_shmem_store %[[PARTIAL]], rank %[[RANK1]], %[[LOCAL_SLOT]] barrier %[[BARRIER]]
+// CHECK: }
+// CHECK-NOT: ttg.async_remote_shmem_store
+// CHECK: %[[PHASE:[a-zA-Z0-9_]+]] = arith.constant 0 : i32
+// CHECK: ttng.wait_barrier %[[BARRIER]], %[[PHASE]], %[[ACTIVE]]
+// CHECK: %[[INDEX0:[a-zA-Z0-9_]+]] = arith.constant 0 : i32
+// CHECK: %[[VIEW0:[a-zA-Z0-9_]+]] = ttg.memdesc_index %[[SLOTS]][%[[INDEX0]]]
+// CHECK: %[[VALUE0:[a-zA-Z0-9_]+]] = ttg.local_load %[[VIEW0]]
+// CHECK: %[[INDEX1:[a-zA-Z0-9_]+]] = arith.constant 1 : i32
+// CHECK: %[[VIEW1:[a-zA-Z0-9_]+]] = ttg.memdesc_index %[[SLOTS]][%[[INDEX1]]]
+// CHECK: %[[VALUE1:[a-zA-Z0-9_]+]] = ttg.local_load %[[VIEW1]]
+// CHECK: %[[SUM:[a-zA-Z0-9_]+]] = arith.addf %[[VALUE0]], %[[VALUE1]] : tensor<128xf32, #blocked>
+// CHECK: ttg.barrier local
+// CHECK: tt.return %[[SUM]] : tensor<128xf32, #blocked>
+// CHECK-NOT: ttng.cluster_reduce
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @tensor_sum(%partial: tensor<128xf32, #tensor_blocked>) -> tensor<128xf32, #tensor_blocked> {
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<128xf32, #tensor_blocked>) -> tensor<128xf32, #tensor_blocked>
+    tt.return %result : tensor<128xf32, #tensor_blocked>
+  }
+}
