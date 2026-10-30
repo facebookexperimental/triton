@@ -30,6 +30,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -58,6 +59,10 @@ LogicalResult verifyMMAv5Op(Operation *op);
 #include "triton/Dialect/TritonNvidiaGPU/IR/Ops.h.inc"
 
 namespace mlir::triton::nvidia_gpu {
+
+// Kernel arguments are uniform; unsupported region results may vary across
+// ranks. Shared by formation and verification so convergence rules stay equal.
+bool mayDependOnClusterRank(Value value, int axis);
 
 struct PackedArithTypeInfo {
   llvm::StringLiteral suffix;
