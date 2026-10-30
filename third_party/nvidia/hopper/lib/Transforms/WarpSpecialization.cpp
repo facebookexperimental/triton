@@ -192,6 +192,16 @@ public:
       return bailOut(funcOp);
     }
 
+    // An MMA operand the TMA engine cannot write in the MMA's layout is staged
+    // through registers into a single buffer that the MMA's own partition both
+    // fills and reads asynchronously, with no barrier between them. Fall back
+    // to the non-specialized pipeline, which orders the store after the MMA.
+    if (hasRegisterStagedMMAOperand(funcOp)) {
+      LDBG("Warp specialization does not support register-staged MMA "
+           "operands. Skipping.");
+      return bailOut(funcOp);
+    }
+
     // Code partitioning cannot yet place communication channels in both sides
     // of an IfOp. An IfOp whose complete then/else region belongs to one task
     // does not need such a channel, however, and specialization already knows
