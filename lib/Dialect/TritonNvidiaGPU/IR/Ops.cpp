@@ -1859,6 +1859,13 @@ static LogicalResult verifyScaledLHSOperand(Operation *op, Type elementType,
                                             TensorMemoryEncodingAttr encoding,
                                             ScaleDotElemType aType,
                                             ScaleDotElemType bType) {
+  if (isMXFP6ScaleType(aType)) {
+    if (!elementType.isInteger(8))
+      return op->emitOpError(
+          "expected e2m3/e3m2 LHS operand to have i8 storage");
+    return success();
+  }
+
   if (aType == ScaleDotElemType::E2M1) {
     if (!elementType.isInteger(8))
       return op->emitOpError("expected e2m1 LHS operand to have i8 storage");
@@ -2047,6 +2054,19 @@ bool TCGen5MMAScaledOp::verifyDims() {
     aKdim *= 2;
   if (this->getBType() == ScaleDotElemType::E2M1 && !transB)
     bKdim *= 2;
+  // fp6 shapes count logical values, consumed in groups of 16 values
+  // (the MXFP6Tensor storage group), same as the tl.dot_scaled contract.
+  // aKdim/bKdim already hold the logical K dim for both transposed and
+  // non-transposed layouts (unlike e2m1, fp6 has no packing factor to
+  // adjust), so the % 16 check applies regardless of transpose.
+  if (isMXFP6ScaleType(this->getAType())) {
+    if (aKdim % 16 != 0)
+      return false;
+  }
+  if (isMXFP6ScaleType(this->getBType())) {
+    if (bKdim % 16 != 0)
+      return false;
+  }
 
   return aKdim == bKdim;
 }
@@ -2148,6 +2168,13 @@ int64_t TCGen5MMAScaledOp::getBlockK() {
   bool transA = isScaledMMATransposed(getA().getType(), /*isLhs=*/true);
   if (this->getAType() == ScaleDotElemType::E2M1 && !transA)
     blockK *= 2;
+  if (isMXFP6ScaleType(this->getAType())) {
+    // fp6 blockK counts logical values in groups of 16 values.
+    // Precondition, not a user-facing check: verifyDims() rejects
+    // non-%16 blockK for fp6 (transposed or not), so this can only
+    // fire on unverified IR built by transforms.
+    assert(blockK % 16 == 0);
+  }
   return blockK;
 }
 
