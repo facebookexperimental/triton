@@ -198,7 +198,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             memDescTransOp.getSrc().getType().getShape(), newOrder,
             mmaEncoding.getCGALayout(),
             memDescTransOp.getSrc().getType().getElementType(),
-            mmaEncoding.getFp4Padded());
+            mmaEncoding.getFp4Padded(), mmaEncoding.getFp6Padded());
       } else {
         // Other shared encodings (e.g. SwizzledShared, PaddedShared)
         // fall back on the dialect's transpose inference to push a result-side
