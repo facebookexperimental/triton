@@ -696,7 +696,7 @@ def selection_summary(plan, suites, sha, note=""):
         int(any(groups[name]["files"] for name in ("core", "correctness", "codegen"))) +
         int(any(groups[name]["files"] for name in ("runtime", "gluon"))) for groups in plan["gpu"].values())
     lines = [
-        "## Test selection", "", f"Tested commit: `{sha}`.", f"Wheel required: {'yes' if plan['build'] else 'no'}.",
+        "## Test selection", "", f"Selected commit: `{sha}`.", f"Wheel required: {'yes' if plan['build'] else 'no'}.",
         f"Planned GPU jobs: {gpu_jobs}. Planned CPU jobs: {int(bool(plan['cpu']))}.", ""
     ]
     if note:
