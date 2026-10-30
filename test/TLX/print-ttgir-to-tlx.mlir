@@ -1537,15 +1537,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // tlx.workgroup_barrier brackets its ttg.barrier with two rocdl.sched.barrier
 // guards, so it is only emittable on CDNA. The same barrier on an NVIDIA
-// target must fall through rather than inject ROCDL into the kernel.
+// target must not inject ROCDL into the kernel; tl.debug_barrier covers it.
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  // Assert the fall-through positively too: a bare CHECK-NOT would also pass
+  // Assert the replacement positively too: a bare CHECK-NOT would also pass
   // if the barrier were dropped from the output altogether.
   // CHECK-LABEL: def barrier_is_not_mapped_off_amd(
   // CHECK-NOT: tlx.workgroup_barrier()
-  // CHECK: {{UNSUPPORTED}}: no TLX mapping for ttg.barrier
+  // CHECK: tl.debug_barrier()
   tt.func public @barrier_is_not_mapped_off_amd(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
     ttg.barrier local
     %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
