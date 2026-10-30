@@ -142,3 +142,49 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return %result : tensor<128xf32, #tensor_blocked>
   }
 }
+
+// -----
+
+#loop_parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#loop_slice = #ttg.slice<{dim = 1, parent = #loop_parent}>
+
+// CHECK-LABEL: @loop_tensor_sum
+// CHECK: scf.for
+// CHECK-NOT: scf.yield
+// CHECK: ttng.init_barrier
+// CHECK-NOT: scf.yield
+// CHECK: ttng.barrier_expect {{.*}}, 512,
+// CHECK-NOT: scf.yield
+// CHECK: ttng.cluster_arrive
+// CHECK-NOT: scf.yield
+// CHECK: ttng.cluster_wait
+// CHECK-NOT: scf.yield
+// CHECK: ttg.async_remote_shmem_store
+// CHECK-NOT: scf.yield
+// CHECK: ttg.async_remote_shmem_store
+// CHECK-NOT: scf.yield
+// CHECK: ttng.wait_barrier
+// CHECK-NOT: scf.yield
+// CHECK: ttg.barrier local
+// CHECK: scf.yield
+// CHECK-NOT: ttng.cluster_reduce
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 2 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @loop_tensor_sum(%partial: tensor<128x32xf32, #loop_parent>) -> tensor<128xf32, #loop_slice> {
+    %pid = tt.get_program_id y : i32
+    %c2 = arith.constant 2 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2_index = arith.constant 2 : index
+    %zero = arith.constant dense<0.000000e+00> : tensor<128xf32, #loop_slice>
+    %result = scf.for %i = %c0 to %c2_index step %c1 iter_args(%acc = %zero) -> tensor<128xf32, #loop_slice> {
+      %reduced = "tt.reduce"(%partial) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        tt.reduce.return %sum : f32
+      }) {axis = 1 : i32, tt.multi_cta} : (tensor<128x32xf32, #loop_parent>) -> tensor<128xf32, #loop_slice>
+      scf.yield %reduced : tensor<128xf32, #loop_slice>
+    }
+    tt.return %result : tensor<128xf32, #loop_slice>
+  }
+}
