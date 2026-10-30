@@ -571,25 +571,135 @@ def test_gfx1250_mxgemm_tdm_tiles_per_warp(DTYPE_B, TILES_PER_WARP):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("BATCH,H,SEQLEN", [(1, 8, 1024),  # multi-head
-                                            (2, 4, 1024),  # multi-batch + multi-head
-                                            (1, 16, 2048),  # many heads, longer seqlen
-                                            (1, 2, 896),  # non-128-multiple -> masked remainder path
-                                            (1, 1, 640),  # small -> remainder peel path
-                                            ])
-def test_gfx1250_attn_fwd_tdm_pipelined(BATCH, H, SEQLEN):
+@pytest.mark.parametrize("BATCH,H,SEQLEN_Q,SEQLEN_K", [(1, 8, 1024, 1024), (2, 4, 1024, 1024), (1, 16, 2048, 2048),
+                                                       (1, 2, 896, 896), (1, 1, 640, 640),
+                                                       (1, 2, 63, 65),  # one partial key tile
+                                                       (1, 2, 128, 128),  # one full key tile
+                                                       (1, 2, 129, 129),  # two key tiles with partial Q/K boundaries
+                                                       (2, 2, 129, 257),  # partial Q and K tiles, independent lengths
+                                                       (1, 2, 897, 897),  # final K tile contains a single valid row
+                                                       (1, 2, 90000, 90000),  # long sequence with a partial final tile
+                                                       ])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gfx1250_attn_fwd_tdm_pipelined(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
     torch.manual_seed(0)
     D = 128
-    q = torch.randn((BATCH, H, SEQLEN, D), device=triton.runtime.driver.active.get_active_torch_device(),
-                    dtype=torch.bfloat16)
-    k = torch.randn((BATCH, H, SEQLEN, D), device=triton.runtime.driver.active.get_active_torch_device(),
-                    dtype=torch.bfloat16)
-    v = torch.randn((BATCH, H, SEQLEN, D), device=triton.runtime.driver.active.get_active_torch_device(),
-                    dtype=torch.bfloat16)
+    q = torch.randn((BATCH, H, SEQLEN_Q, D), device=triton.runtime.driver.active.get_active_torch_device(), dtype=dtype)
+    k = torch.randn((BATCH, H, SEQLEN_K, D), device=triton.runtime.driver.active.get_active_torch_device(), dtype=dtype)
+    v = torch.randn_like(k)
     sm_scale = 1.0 / (D**0.5)
     out = _gfx1250_attention.attn_fwd_tdm_pipelined(q, k, v, sm_scale)
-    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v).to(torch.float32)
-    torch.testing.assert_close(out.cpu(), ref.cpu(), atol=5e-2, rtol=5e-2)
+    assert torch.isfinite(out).all()
+    # Avoid a quadratic reference allocation for long attention, but check every
+    # output element for finiteness and sample both sides of tile boundaries.
+    if SEQLEN_Q > 2048:
+        boundaries = [0, 127, 128, 255, 256, 65535, 65536, SEQLEN_Q - 2, SEQLEN_Q - 1]
+        rows = torch.tensor(sorted({row for row in boundaries if 0 <= row < SEQLEN_Q}), device=q.device)
+        q_ref = q.index_select(2, rows)
+        actual = out.index_select(2, rows)
+    else:
+        q_ref, actual = q, out
+    scores = (q_ref.double() @ k.double().transpose(-1, -2)) * sm_scale
+    ref = scores.softmax(dim=-1) @ v.double()
+    atol, rtol = (2e-2, 1e-2) if dtype == torch.bfloat16 else (3e-3, 3e-3)
+    torch.testing.assert_close(actual.double(), ref, atol=atol, rtol=rtol)
+    # A loose absolute bound alone misses large relative errors at long lengths.
+    tolerance = 0.005 if dtype == torch.bfloat16 else 0.0008
+    assert (actual.double() - ref).square().mean().sqrt() < tolerance * ref.square().mean().sqrt()
+
+
+# Automatic narrow/medium routes plus a forced wide tile exercise every replay
+# geometry without allocating an unusually large adversarial attention input.
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seqlen_k,block_m,block_n", [(512, None, None), (1025, None, None), (1025, 256, 64)])
+@pytest.mark.parametrize("recovery_case", ["exp_overflow", "probability_overflow", "common_offset"])
+def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block_n, recovery_case):
+    torch.manual_seed(1)
+    device = triton.runtime.driver.active.get_active_torch_device()
+    q = torch.randn((1, 2, 257, 128), device=device, dtype=dtype)
+    k = torch.randn((1, 2, seqlen_k, 128), device=device, dtype=dtype)
+    v = torch.randn_like(k).abs().add_(0.25)
+    scale = 128**-0.5
+    _gfx1250_attention.attn_fwd_tdm_pipelined(q, k, v, scale, BLOCK_M=block_m, BLOCK_N=block_n)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = _gfx1250_attention.attn_fwd_tdm_pipelined(q, k, v, scale, BLOCK_M=block_m, BLOCK_N=block_n)
+
+    # Reuse one graph across ordinary -> unsafe -> ordinary inputs. The
+    # numerical decision must be recomputed on the device for every replay.
+    for unsafe in (False, True, False):
+        if not unsafe:
+            q.normal_()
+            k.normal_()
+        elif recovery_case == "exp_overflow":
+            q.fill_(1)
+            k.zero_()
+            k[:, :, 128:].fill_(16)
+        elif recovery_case == "probability_overflow":
+            q.zero_()
+            q[..., 0] = 1
+            k.zero_()
+            k[:, :, 128:, 0] = 200
+        else:
+            q.zero_()
+            q[..., 0] = 256
+            q[..., 1] = 1
+            k.zero_()
+            k[..., 0] = 256
+            k[..., 1] = torch.arange(k.shape[2], device=device) % 9 - 4
+        ref = ((q.double() @ k.double().transpose(-1, -2)) * scale).softmax(-1) @ v.double()
+        for _ in range(3):
+            graph.replay()
+            assert torch.isfinite(out).all()
+            tolerance = 0.005 if dtype == torch.bfloat16 else 0.0008
+            torch.testing.assert_close(out.double(), ref, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["offset", "padded", "odd_stride"])
+@pytest.mark.parametrize("block_m,block_n", [(64, 128), (128, 64), (256, 64)])
+def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, block_m, block_n):
+    torch.manual_seed(2)
+    device = triton.runtime.driver.active.get_active_torch_device()
+    batch, heads, sq, sk, dim = 2, 2, 257, 1025, 128
+
+    def inputs(length):
+        shape = (batch, heads, length, dim)
+        if layout == "offset":
+            tensor = torch.empty(batch * heads * length * dim + 1, dtype=dtype, device=device)[1:].view(shape)
+        else:
+            padding = 1 if layout == "odd_stride" else 16
+            tensor = torch.empty((*shape[:-1], dim + padding), dtype=dtype, device=device)[..., :dim]
+        return tensor.normal_()
+
+    q, k, v = inputs(sq), inputs(sk), inputs(sk)
+    scale = dim**-0.5
+    ref = ((q.double() @ k.double().transpose(-1, -2)) * scale).softmax(-1) @ v.double()
+    # A partial query tile must preserve storage on both sides of the output.
+    storage = torch.full((q.numel() + 512, ), -12345.0, device=device)
+    out = storage[256:-256].view(q.shape)
+    grid = (batch, heads, triton.cdiv(sq, block_m))
+
+    def launch():
+        _gfx1250_attention.attn_fwd_tdm_pipelined_kernel[grid](q, k, v, out, *q.stride(), *k.stride(), *v.stride(),
+                                                               *out.stride(), scale, sq, sk, block_m, block_n, dim,
+                                                               USE_FIXED_REFERENCE=True, num_warps=4, waves_per_eu=1)
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for _ in range(5):
+        out.fill_(float("nan"))
+        graph.replay()
+        assert torch.isfinite(out).all()
+        tolerance = 0.005 if dtype == torch.bfloat16 else 0.0008
+        torch.testing.assert_close(out.double(), ref, atol=tolerance, rtol=tolerance)
+        assert (out.double() - ref).square().mean().sqrt() < tolerance * ref.square().mean().sqrt()
+        assert (storage[:256] == -12345.0).all()
+        assert (storage[-256:] == -12345.0).all()
 
 
 test_gfx1250_grouped_gemm_phase0_ragged = _gfx1250_grouped.test_grouped_gemm_phase0_ragged_gfx1250
