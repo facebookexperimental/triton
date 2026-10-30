@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 import contextlib
+import functools
 import inspect
 import unittest
 from unittest import mock
@@ -2589,6 +2590,40 @@ class TestHopperMMTemplate(TestCase):
         self.assertIn(_HOPPER_WS, generated)
         self.assertIn("tl.trans(acc)", generated)
 
+    @parametrize("template,marker,k", (
+        # Past the few-tile small-K range (K <= 1024), so the WS heuristic keeps it.
+        ("tlx_hopper_gemm_ws", _HOPPER_WS, 1096),
+        # The WS heuristic leaves a few-K-step shape to the small-K template.
+        ("tlx_hopper_gemm_small_k", _HOPPER_SMALL_K, 256),
+    ))
+    @parametrize("op", ("mm", "addmm"))
+    def test_dynamic_m(self, template, marker, k, op):
+        """A dynamic M leaves A's TMA descriptor with a symbolic shape. A launcher
+        that reads dynamic sizes at launch builds it on the host; otherwise it is
+        built on the device. B's, all static, stays on the host either way. A
+        second M reuses the compiled kernel and must not reuse A's descriptor."""
+        from torch._inductor.runtime import triton_heuristics
+
+        bias = torch.randn(256, device=GPU_TYPE, dtype=torch.float16)
+        fn = torch.mm if op == "mm" else functools.partial(torch.addmm, bias)
+        with config.patch({**_HOPPER_ADDMM_PATCH, "test_configs.autotune_choice_name_regex": template}):
+            compiled = torch.compile(fn)
+            for m in (706, 300):
+                a, b = _operands((m, 256, k), "nt", torch.float16)
+                torch._dynamo.mark_dynamic(a, 0)
+                expected = (a.float() @ b.float() + (bias.float() if op == "addmm" else 0)).half()
+                actual, code = run_and_get_code(compiled, a, b)
+                torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+                if m == 706:
+                    generated = "\n".join(code)
+        self.assertIn(marker, generated)
+        self.assertNotIn("desc_b = tl.make_tensor_descriptor(", generated)
+        if getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False):
+            self.assertNotIn("tl.make_tensor_descriptor(base=arg_A", generated)
+            self.assertRegex(generated, r"'arg_A': \{'block_shape': \[[0-9, ]+\], 'shape': \['ks0'")
+        else:
+            self.assertIn("desc_a = tl.make_tensor_descriptor(", generated)
+
     @parametrize("block_n", (192, 96))
     @parametrize("bias_shape", ("n", "mn"))
     def test_addmm_npot_tile(self, block_n, bias_shape):
@@ -3032,6 +3067,22 @@ class TestSplitK(TestCase):
 
 class TestReduceKKernel(TestCase):
     """Direct unit tests for the split-K reduction kernel."""
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(not torch.cuda.is_available() or torch.version.hip is not None, "Need a CUDA GPU")
+    def test_reduce_k_cost_excludes_benchmark_floor(self):
+        """The split-K reducer charge is its warm kernel time. Timed with Inductor's
+        benchmarker it also carried that benchmarker's per-sample floor, which the
+        candidate's own timing already includes: 5.6 us charged for a 1.2 us kernel."""
+        from torch._inductor.runtime.benchmarking import benchmarker
+        from triton.language.extra.tlx.inductor import reduce_k
+
+        reduce_k._reduce_k_cost_cache.clear()
+        cost = reduce_k.reduce_k_cost_ms(20, 2048, 2, torch.float16, True)
+        x = torch.empty(1, device=GPU_TYPE)
+        floor = benchmarker.benchmark_gpu(x.zero_)
+        self.assertGreater(cost, 0)
+        self.assertLess(cost, floor)
 
     def test_aoti_reduce_k_emission(self):
         from torch._inductor.virtualized import V
@@ -3739,6 +3790,62 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                         self.assertEqual(1, len(choices))
                         self.assertIsInstance(choices[0], dict)
 
+    def test_flex_forward_offline_config(self):
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        stock = self._forward_config()
+        stock.block_m, stock.block_n = 32, 32
+        for sparse_q, sparse_kv, expected in ((128, 128, (128, 64)), (64, 32, (64, 32))):
+            with self.subTest(sparse_q=sparse_q, sparse_kv=sparse_kv):
+                choices = []
+                with (
+                        config.patch({"triton.tlx_mode": "force", "max_autotune": False}),
+                        mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
+                        mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
+                ):
+                    flex_attention_templates.append_tlx_flex(
+                        choices,
+                        [stock, self._forward_config()],
+                        self._forward_inputs(),
+                        [object(), object()],
+                        object(),
+                        {},
+                        sparse_q,
+                        sparse_kv,
+                    )
+                self.assertEqual(1, len(choices))
+                self.assertEqual(expected, (choices[0]["BLOCK_M"], choices[0]["BLOCK_N"]))
+                self.assertEqual(
+                    (4, 1, 0, 32, 1),
+                    tuple(choices[0][name]
+                          for name in ("num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim", "kpack")))
+
+    def test_flex_forward_autotune_and_wide_head(self):
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        stock = self._forward_config()
+        stock.block_m, stock.block_n = 64, 32
+        cases = ((True, 128, [(128, 64), (64, 32), (128, 128)]), (False, 256, []), (True, 256, []))
+        for max_autotune, head_dim, expected in cases:
+            with self.subTest(max_autotune=max_autotune, head_dim=head_dim):
+                choices = []
+                with (
+                        config.patch({"triton.tlx_mode": "force", "max_autotune": max_autotune}),
+                        mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
+                        mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
+                ):
+                    flex_attention_templates.append_tlx_flex(
+                        choices,
+                        [stock, self._forward_config()],
+                        self._forward_inputs(head_dim=head_dim),
+                        [object(), object()],
+                        object(),
+                        {},
+                        128,
+                        128,
+                    )
+                self.assertEqual(expected, [(c["BLOCK_M"], c["BLOCK_N"]) for c in choices])
+
     def test_flex_backward_registration_honors_effective_bwd_overrides(self):
         """Compatible user overrides must take precedence over the stock config."""
         from triton.language.extra.tlx.inductor import flex_attention_templates
@@ -4165,7 +4272,7 @@ class TestFlexAttention(TestCase):
         with config.patch({
                 "triton.tlx_mode": "force",
                 "force_disable_caches": True,
-                "max_autotune": True,
+                "max_autotune": False,
         }):
             out, code = run_and_get_code(torch.compile(fn), q, k, v)
         return out, "\n".join(code)
@@ -4269,7 +4376,7 @@ class TestFlexAttention(TestCase):
         with config.patch({
                 "triton.tlx_mode": "force",
                 "force_disable_caches": True,
-                "max_autotune": True,
+                "max_autotune": False,
         }):
             (out, lse), code = run_and_get_code(
                 torch.compile(lambda q, k, v: flex_attention(q, k, v, block_mask=bm, scale=sm, return_lse=True)),

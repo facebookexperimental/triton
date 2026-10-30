@@ -487,6 +487,29 @@ class amd_mfma_layout(layout_encoding):
                                                    self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
 
 
+class amd_wmma_layout(layout_encoding):
+    """Explicit AMD WMMA accumulator distribution for one CTA."""
+
+    def __init__(self, warp_bases, reg_bases=(), instr_shape=(16, 16, 128), version=3, transposed=True):
+        super().__init__()
+        self.warp_bases = [list(b) for b in tl._unwrap_if_constexpr(warp_bases)]
+        self.reg_bases = [list(b) for b in tl._unwrap_if_constexpr(reg_bases)]
+        self.instr_shape = list(tl._unwrap_if_constexpr(instr_shape))
+        self.version = int(version)
+        self.transposed = bool(transposed)
+        if len(self.instr_shape) != 3 or any(dim <= 0 for dim in self.instr_shape):
+            raise ValueError("instr_shape must contain three positive dimensions")
+        if any(len(basis) != 2 or any(value < 0 for value in basis) for basis in (*self.warp_bases, *self.reg_bases)):
+            raise ValueError("WMMA bases must contain two nonnegative coordinates")
+
+    def __repr__(self):
+        return f"amd_wmma_layout({vars(self)!r})"
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        return builder.make_amd_wmma_encoding_attr(self.version, self.transposed, self.warp_bases, self.reg_bases,
+                                                   self.instr_shape, 2)
+
+
 class slice_layout(layout_encoding):
     """Rank-reduced view of a distributed parent layout.
 

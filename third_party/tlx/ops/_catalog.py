@@ -51,6 +51,29 @@ _VARLEN_DIMS = frozenset({"TQ", "TKV", "H", "D"})
 _HSTU_DIMS = frozenset({"B", "LQ", "LKV", "H", "D"})
 _KDA_DIMS = frozenset({"T", "H", "D"})
 
+_NORM_MODULES = {
+    'sm100': ['layernorm', 'layernorm_add', 'rmsnorm', 'norm_fwd', 'norm_bwd', 'norm_backward_from_normalized'],
+    '_softmax': ['softmax', 'softmax_fwd', 'softmax_bwd'], '_fp4': [
+        'layernorm_mxfp4', 'rmsnorm_mxfp4', 'layernorm_nvfp4_quantize', 'rmsnorm_nvfp4_quantize',
+        'layernorm_nvfp4_quantize_inplace', 'nvfp4_quantize_normalized', 'layernorm_nvfp4_quantize_q0_jagged_transpose',
+        'layernorm_nvfp4_quantize_q0_jagged_transpose_inplace', 'compute_norm_nvfp4_global_scale'
+    ], '_fp4_bwd': ['layernorm_nvfp4_backward_from_x_norm_padded_dy'], '_mxfp8': [
+        'norm_quant_mxfp8_fwd', 'rmsnorm_mxfp8_quantize', 'layernorm_mxfp8_quantize',
+        'layernorm_mxfp8_quantize_numerics_preserving', 'layernorm_mxfp8_with_backward',
+        'layernorm_mxfp8_gdpa_with_backward', 'layernorm_mxfp8_gdpa_precomputed_no_normalized',
+        'rmsnorm_mxfp8_quantize_3232_2pass'
+    ], '_mxfp8_bwd': [
+        'rmsnorm_backward', 'rmsnorm_backward_from_x_norm', 'layernorm_backward', 'layernorm_backward_from_x_norm',
+        'rmsnorm_backward_quantize_dx_mxfp8', 'rmsnorm_backward_quantize_dx_mxfp8_precomputed',
+        'rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed',
+        'rmsnorm_backward_quantize_dx_mxfp8_from_output_recompute_q_precomputed'
+    ]
+}
+_NORM_AUTOGRAD = frozenset([
+    'layernorm', 'layernorm_add', 'rmsnorm', 'softmax', 'layernorm_mxfp8_with_backward',
+    'layernorm_mxfp8_gdpa_with_backward'
+])
+
 # A static table, not decorator self-registration: `impl` stays a string so
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
 # A missing (op, arch) is deferred, not an error -- the op raises on that arch.
@@ -440,6 +463,13 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
     ),
 )
+
+CATALOG += tuple(
+    OpSpec(op=op, arch=arch, variant="row_norm", impl=f"triton.tlx.ops.kernels.norm.{module}:{op}", dtypes=frozenset(
+        {"float16", "bfloat16", "float32"}), supports_backward=op in _NORM_AUTOGRAD)
+    for module, names in _NORM_MODULES.items()
+    for op in names
+    for arch in (("sm90", "sm100") if module in ("sm100", "_softmax") else ("sm100", )))
 
 _BY_KEY = {(s.op, s.arch): s for s in CATALOG}
 assert len(_BY_KEY) == len(CATALOG), "duplicate (op, arch) in CATALOG"

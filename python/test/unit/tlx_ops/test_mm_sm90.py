@@ -456,7 +456,7 @@ def test_small_k_split_k_config(monkeypatch, M, tile, split_k, a_row_major, b_ro
     sm90._tuned_small_k.cache_clear()
     try:
         actual = tlx_mm(a, b, space="full")
-        assert sm90._tuned_small_k("full", None).best_config.kwargs["SPLIT_K"] == split_k
+        assert sm90._tuned_small_k("full", None, False, dtype=a.dtype).best_config.kwargs["SPLIT_K"] == split_k
     finally:
         sm90._tuned_small_k.cache_clear()
     _assert_close(actual, torch.matmul(a, b))
@@ -471,7 +471,7 @@ def test_small_k_split_k_is_deterministic(monkeypatch):
     sm90._tuned_small_k.cache_clear()
     try:
         first = tlx_mm(a, b, space="full")
-        assert sm90._tuned_small_k("full", None).best_config.kwargs["SPLIT_K"] == 2
+        assert sm90._tuned_small_k("full", None, False, dtype=a.dtype).best_config.kwargs["SPLIT_K"] == 2
         for _ in range(3):
             assert torch.equal(tlx_mm(a, b, space="full"), first)
     finally:
@@ -495,7 +495,10 @@ def test_small_k_prune_splits_only_past_small_k():
     (7, 4992, 128, {"ws", "small_k"}),
     (7, 4096, 4096, {"ws", "small_k"}),
     (706, 3536, 128, {"ws", "small_k"}),
-    (706, 2560, 2560, {"ws"}),
+    # One wave of 128x128 tiles (120 on 132 SMs): the small-K kernel competes.
+    (706, 2560, 2560, {"ws", "small_k"}),
+    # Past one wave with K > 1024: WS only.
+    (706, 6144, 2560, {"ws"}),
 ])
 def test_full_space_selects_fastest_candidate(monkeypatch, M, N, K, candidates):
     from triton.tlx.ops import mm as tlx_mm
@@ -545,10 +548,10 @@ def test_npot_config_not_reused_across_b_layouts(monkeypatch):
         a = _operand(M, K, True)
         b_col = _operand(K, N, False)
         _assert_close(tlx_mm(a, b_col, space="full"), torch.matmul(a, b_col))
-        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == 192
+        assert sm90._tuned("full", None, False, dtype=a.dtype).best_config.kwargs["BN"] == 192
         b_row = b_col.contiguous()
         _assert_close(tlx_mm(a, b_row, space="full"), torch.matmul(a, b_row))
-        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == 128
+        assert sm90._tuned("full", None, False, dtype=a.dtype).best_config.kwargs["BN"] == 128
     finally:
         sm90._tuned.cache_clear()
 
@@ -567,7 +570,7 @@ def test_npot_block_n_config(block_n, a_row_major):
     num_stages = {c.kwargs["BN"]: c.kwargs["NUM_STAGES"] for c in sm90._npot_configs()}[block_n]
     with _pinned_full_config(128, block_n, num_stages):
         actual = tlx_mm(a, b, space="full")
-        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == block_n
+        assert sm90._tuned("full", None, False, dtype=a.dtype).best_config.kwargs["BN"] == block_n
 
     _assert_close(actual, torch.matmul(a, b))
 
