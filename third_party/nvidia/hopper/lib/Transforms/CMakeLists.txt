@@ -37,6 +37,7 @@ add_triton_library(NVHopperTransforms
   Plan2CTAExchange.cpp
   Materialize2CTAExchange.cpp
   FormMultiCTACollectives.cpp
+  LowerClusterReduceToTTGIR.cpp
   WarpSpecialization.cpp
   WarpSpecialization/CodePartitionUtility.cpp
   WarpSpecialization/WSAtomicBroadcast.cpp
