@@ -101,7 +101,7 @@ void lowerWaitBarrierOps(ModuleOp m) {
         builder, loc,
         /*resultTypes=*/TypeRange(), /*operands=*/ValueRange(),
         /*asm_string=*/asmStr, constraints, /*has_side_effects=*/true,
-        /*is_align_stack=*/false, LLVM::TailCallKind::None,
+        /*is_align_stack=*/false, LLVM::TailCallKind::None, /*convergent=*/false,
         /*asm_dialect=*/asmDialectAttr,
         /*operand_attrs=*/ArrayAttr()); // end spin wait
 
