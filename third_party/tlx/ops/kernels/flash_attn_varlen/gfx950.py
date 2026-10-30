@@ -43,9 +43,9 @@ import triton.language.extra.tlx as tlx
 BLOCK_M = 64
 BLOCK_N = 64
 NUM_WARPS = 4
-# Split launches whose splits walk at most this many 64-key blocks use 128-key
-# blocks: measured faster there, and split launches fill at most one workgroup
-# per CU, so the doubled LDS costs nothing.
+# Use BLOCK_N = BIG_BLOCK_N when each split-KV split has at most
+# BIG_BLOCK_N_MAX_SPLIT 64-key blocks. With splits this short the merging
+# workgroup finishes last, and its merge completes sooner with 128-key blocks.
 BIG_BLOCK_N = 128
 BIG_BLOCK_N_MAX_SPLIT = 10
 # Causal split: the smallest SPLIT >= 4 that gives every work item its own CU
