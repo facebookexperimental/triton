@@ -260,7 +260,8 @@ std::optional<int64_t> getLaneOffsetUpperBound(Value value, int64_t block) {
   StringRef name = def->getName().getStringRef();
   if (name != "tt.splat" && name != "tt.broadcast" &&
       name != "tt.expand_dims" && name != "arith.extsi" &&
-      name != "arith.extui" && name != "arith.index_cast")
+      name != "arith.extui" && name != "arith.index_cast" &&
+      name != "ttg.convert_layout")
     return std::nullopt;
   return getLaneOffsetUpperBound(def->getOperand(0), block);
 }
@@ -438,7 +439,8 @@ getUnitStrideOffsetUpperBound(Value value, Value induction, int64_t block,
   bool isAdd = name == "arith.addi";
   bool isUnary = name == "tt.splat" || name == "tt.broadcast" ||
                  name == "tt.expand_dims" || name == "arith.extsi" ||
-                 name == "arith.extui" || name == "arith.index_cast";
+                 name == "arith.extui" || name == "arith.index_cast" ||
+                 name == "ttg.convert_layout";
   if (!isAddPtr && !isAdd && !isUnary)
     return std::nullopt;
 
