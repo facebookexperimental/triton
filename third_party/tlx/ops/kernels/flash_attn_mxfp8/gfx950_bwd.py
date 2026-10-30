@@ -61,25 +61,32 @@ def _bwd_preprocess(O, DO, Delta, N, D: tl.constexpr, BLOCK: tl.constexpr):
 
 @triton.jit
 def _stage_query_inputs(qmem, domem, qdkmem, dodvmem, Q, DO, QDK, DODV, base, start, N, BM: tl.constexpr,
-                        D: tl.constexpr, SEQ_K_CONTIG: tl.constexpr, EVEN_N: tl.constexpr):
+                        D: tl.constexpr, SEQ_K_CONTIG: tl.constexpr, EVEN_N: tl.constexpr, NEED_DK: tl.constexpr,
+                        NEED_DV: tl.constexpr):
     rows = start + tl.arange(0, BM)
     offsets = rows[:, None] * D + tl.arange(0, D)[None, :]
     tlx.buffer_load_to_local(qmem[0], Q + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
-    tlx.buffer_load_to_local(domem[0], DO + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
+    if NEED_DK:
+        tlx.buffer_load_to_local(domem[0], DO + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
     if SEQ_K_CONTIG:
         seq_offsets = tl.arange(0, D)[:, None] * N + rows[None, :]
-        tlx.buffer_load_to_local(qdkmem[0], QDK + base, seq_offsets, EVEN_N | (rows[None, :] < N), 0.0)
-        tlx.buffer_load_to_local(dodvmem[0], DODV + base, seq_offsets, EVEN_N | (rows[None, :] < N), 0.0)
+        if NEED_DK:
+            tlx.buffer_load_to_local(qdkmem[0], QDK + base, seq_offsets, EVEN_N | (rows[None, :] < N), 0.0)
+        if NEED_DV:
+            tlx.buffer_load_to_local(dodvmem[0], DODV + base, seq_offsets, EVEN_N | (rows[None, :] < N), 0.0)
     else:
-        tlx.buffer_load_to_local(qdkmem[0], QDK + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
-        tlx.buffer_load_to_local(dodvmem[0], DODV + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
+        if NEED_DK:
+            tlx.buffer_load_to_local(qdkmem[0], QDK + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
+        if NEED_DV:
+            tlx.buffer_load_to_local(dodvmem[0], DODV + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
     tlx.async_load_commit_group()
 
 
 @triton.jit
 def _bwd_kv_owner(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N, sm_scale,
                   D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, SEQ_K_CONTIG: tl.constexpr,
-                  EVEN_N: tl.constexpr, LSE_SPLIT: tl.constexpr = False):
+                  EVEN_N: tl.constexpr, LSE_SPLIT: tl.constexpr = False, NEED_DK: tl.constexpr = True,
+                  NEED_DV: tl.constexpr = True):
     """One CTA owns the complete dK/dV reduction for BN keys."""
     key_tile = tl.program_id(1)
     head = tl.program_id(0).to(tl.int64)
@@ -90,33 +97,43 @@ def _bwd_kv_owner(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Del
     base = head * N * D
     sbase = head * N * (D // 32)
     k = tl.load(K + base + keys[:, None] * D + d[None, :], EVEN_N | (keys[:, None] < N), 0.0)
-    v = tl.load(V + base + keys[:, None] * D + d[None, :], EVEN_N | (keys[:, None] < N), 0.0)
     ks = tl.load(KS + sbase + keys[:, None] * (D // 32) + sd[None, :], EVEN_N | (keys[:, None] < N), 127)
-    vs = tl.load(VS + sbase + keys[:, None] * (D // 32) + sd[None, :], EVEN_N | (keys[:, None] < N), 127)
-    dk = tl.full((BN, D), 0.0, tl.float32)
-    dv = tl.full((BN, D), 0.0, tl.float32)
+    if NEED_DK:
+        v = tl.load(V + base + keys[:, None] * D + d[None, :], EVEN_N | (keys[:, None] < N), 0.0)
+        vs = tl.load(VS + sbase + keys[:, None] * (D // 32) + sd[None, :], EVEN_N | (keys[:, None] < N), 127)
+        dk = tl.full((BN, D), 0.0, tl.float32)
+    if NEED_DV:
+        dv = tl.full((BN, D), 0.0, tl.float32)
     shared_layout: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[1, 0])
     qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 1, layout=shared_layout)
-    domem = tlx.local_alloc((BM, D), tl.float8e4nv, 1, layout=shared_layout)
-    if SEQ_K_CONTIG:
-        qdkmem = tlx.local_alloc((D, BM), tl.float8e4nv, 1)
-        dodvmem = tlx.local_alloc((D, BM), tl.float8e4nv, 1)
+    if NEED_DK:
+        domem = tlx.local_alloc((BM, D), tl.float8e4nv, 1, layout=shared_layout)
+        if SEQ_K_CONTIG:
+            qdkmem = tlx.local_alloc((D, BM), tl.float8e4nv, 1)
+        else:
+            qdkmem = tlx.local_alloc((BM, D), tl.float8e4nv, 1, layout=shared_layout)
     else:
-        qdkmem = tlx.local_alloc((BM, D), tl.float8e4nv, 1, layout=shared_layout)
-        dodvmem = tlx.local_alloc((BM, D), tl.float8e4nv, 1, layout=shared_layout)
+        domem = None
+        qdkmem = None
+    if NEED_DV:
+        if SEQ_K_CONTIG:
+            dodvmem = tlx.local_alloc((D, BM), tl.float8e4nv, 1)
+        else:
+            dodvmem = tlx.local_alloc((BM, D), tl.float8e4nv, 1, layout=shared_layout)
+    else:
+        dodvmem = None
     begin = 0
     if CAUSAL:
         begin = (key_tile * BN // BM) * BM
     for start in range(begin, N, BM):
         queries = start + tl.arange(0, BM)
-        _stage_query_inputs(qmem, domem, qdkmem, dodvmem, Q, DO, QDK, DODV, base, start, N, BM, D, SEQ_K_CONTIG, EVEN_N)
-        # All four copies are committed together. Each slot is fully consumed
+        _stage_query_inputs(qmem, domem, qdkmem, dodvmem, Q, DO, QDK, DODV, base, start, N, BM, D, SEQ_K_CONTIG, EVEN_N,
+                            NEED_DK, NEED_DV)
+        # All requested copies are committed together. Each slot is fully consumed
         # before the next iteration overwrites it.
         tlx.async_load_wait_group(0)
         q = tlx.local_load(qmem[0])
-        do = tlx.local_load(domem[0])
         qs = tl.load(QS + sbase + queries[:, None] * (D // 32) + sd[None, :], EVEN_N | (queries[:, None] < N), 127)
-        dos = tl.load(DOS + sbase + queries[:, None] * (D // 32) + sd[None, :], EVEN_N | (queries[:, None] < N), 127)
         scores = tlx.dot_scaled(k, ks, "e4m3", q.T, qs, "e4m3")
         lse = tl.load(LSE + head * N + queries, EVEN_N | (queries < N), 0)
         if LSE_SPLIT:
@@ -129,29 +146,37 @@ def _bwd_kv_owner(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Del
         if CAUSAL:
             valid = valid & (keys[:, None] <= queries[None, :])
         p = tl.exp2(tl.where(valid, logits, -float("inf")))
-        dp = tlx.dot_scaled(v, vs, "e4m3", do.T, dos, "e4m3")
-        delta = tl.load(Delta + head * N + queries, EVEN_N | (queries < N), 0)
-        ds = tl.where(valid, p * (dp - delta[None, :]), 0.0)
-        ds8, dsk = _quantize_ds_square(ds, BN, BM)
-        p8 = _scaled_e4m3_pairs(p, tl.full((BN, BM // 2), 0.00390625, tl.float32))
-        ps = tl.full((BN, BM // 32), 119, tl.uint8)
-        if SEQ_K_CONTIG:
-            dodv = tlx.local_load(dodvmem[0]).T
-        else:
-            dodv = tlx.local_load(dodvmem[0])
-        dodvs = tl.load(DODVS + sbase + d[:, None] * (N // 32) + start // 32 + sq[None, :], start // 32 + sq[None, :]
-                        < N // 32, 127)
-        dv = tlx.dot_scaled(p8, ps, "e4m3", dodv, dodvs, "e4m3", dv)
-        if SEQ_K_CONTIG:
-            qdk = tlx.local_load(qdkmem[0]).T
-        else:
-            qdk = tlx.local_load(qdkmem[0])
-        qdks = tl.load(QDKS + sbase + d[:, None] * (N // 32) + start // 32 + sq[None, :], start // 32 + sq[None, :]
-                       < N // 32, 127)
-        dk = tlx.dot_scaled(ds8, dsk, "e4m3", qdk, qdks, "e4m3", dk)
+        if NEED_DK:
+            do = tlx.local_load(domem[0])
+            dos = tl.load(DOS + sbase + queries[:, None] * (D // 32) + sd[None, :], EVEN_N | (queries[:, None] < N),
+                          127)
+            dp = tlx.dot_scaled(v, vs, "e4m3", do.T, dos, "e4m3")
+            delta = tl.load(Delta + head * N + queries, EVEN_N | (queries < N), 0)
+            ds = tl.where(valid, p * (dp - delta[None, :]), 0.0)
+            ds8, dsk = _quantize_ds_square(ds, BN, BM)
+        if NEED_DV:
+            p8 = _scaled_e4m3_pairs(p, tl.full((BN, BM // 2), 0.00390625, tl.float32))
+            ps = tl.full((BN, BM // 32), 119, tl.uint8)
+            if SEQ_K_CONTIG:
+                dodv = tlx.local_load(dodvmem[0]).T
+            else:
+                dodv = tlx.local_load(dodvmem[0])
+            dodvs = tl.load(DODVS + sbase + d[:, None] * (N // 32) + start // 32 + sq[None, :],
+                            start // 32 + sq[None, :] < N // 32, 127)
+            dv = tlx.dot_scaled(p8, ps, "e4m3", dodv, dodvs, "e4m3", dv)
+        if NEED_DK:
+            if SEQ_K_CONTIG:
+                qdk = tlx.local_load(qdkmem[0]).T
+            else:
+                qdk = tlx.local_load(qdkmem[0])
+            qdks = tl.load(QDKS + sbase + d[:, None] * (N // 32) + start // 32 + sq[None, :], start // 32 + sq[None, :]
+                           < N // 32, 127)
+            dk = tlx.dot_scaled(ds8, dsk, "e4m3", qdk, qdks, "e4m3", dk)
     out = base + keys[:, None] * D + d[None, :]
-    tl.store(DK + out, dk * sm_scale, EVEN_N | (keys[:, None] < N))
-    tl.store(DV + out, dv, EVEN_N | (keys[:, None] < N))
+    if NEED_DK:
+        tl.store(DK + out, dk * sm_scale, EVEN_N | (keys[:, None] < N))
+    if NEED_DV:
+        tl.store(DV + out, dv, EVEN_N | (keys[:, None] < N))
 
 
 @triton.jit
@@ -226,13 +251,16 @@ def _bwd_q_owner(Q, K, KDQ, V, DO, QS, KS, KDQS, VS, DOS, LSE, Delta, DQ, N, sm_
 
 def launch_backward(do, do_dv, q, q_dk, k, k_dq, v, o, lse, q_scale, q_dk_scale, k_scale, k_dq_scale, v_scale, do_scale,
                     do_dv_scale, sm_scale, do_bf16, dq, dk, dv, delta, causal=False, block_m=64, block_n=128,
-                    lse_split=False):
+                    lse_split=False, needs_input_grad=(True, True, True)):
     """Launch deterministic owners into preallocated outputs.
 
     Public validation constrains this gfx950 kernel to dense MHA, D128 and
     contiguous masters. Low-level sequence lengths must be multiples of32;
     masked loads/stores support partial64/128 tiles.
     """
+    need_dq, need_dk, need_dv = needs_input_grad
+    if not any(needs_input_grad):
+        return None
     b, h, n, d = q.shape
     if d != 128 or n <= 0 or n % 32:
         raise ValueError("gfx950 MXFP8 backward requires D128 and positive N divisible by32")
@@ -243,22 +271,26 @@ def launch_backward(do, do_dv, q, q_dk, k, k_dq, v, o, lse, q_scale, q_dk_scale,
     if not math.isfinite(sm_scale):
         raise ValueError("gfx950 MXFP8 backward requires a finite sm_scale")
     lse_shape = (2, b, h, n) if lse_split else (b, h, n)
-    if lse.shape != lse_shape or delta.shape != (b, h, n):
+    if lse.shape != lse_shape or ((need_dq or need_dk) and (delta is None or delta.shape != (b, h, n))):
         raise ValueError("gfx950 MXFP8 backward requires matching softmax statistics and Delta shapes")
     assert block_m in (32, 64, 128) and block_n in (64, 128)
-    seq_k_contig = q_dk.stride(-2) == 1
-    assert all((x.stride(-2) == 1) == seq_k_contig for x in (k_dq, do_dv))
+    sequence_operands = [x for x, needed in ((q_dk, need_dk), (k_dq, need_dq), (do_dv, need_dv)) if needed]
+    seq_k_contig = sequence_operands[0].stride(-2) == 1
+    assert all((x.stride(-2) == 1) == seq_k_contig for x in sequence_operands)
     even_n = n % max(block_m, block_n) == 0
-    _bwd_preprocess[(triton.cdiv(n, 32), b * h)](o, do_bf16, delta, n, d, 32)
-    kv_kernel = _bwd_kv_owner[(b * h, triton.cdiv(n, block_n))](q, q_dk, k, v, do, do_dv, q_scale, q_dk_scale, k_scale,
-                                                                v_scale, do_scale, do_dv_scale, lse, delta, dk, dv, n,
-                                                                sm_scale, D=d, BM=block_m, BN=block_n, CAUSAL=causal,
-                                                                SEQ_K_CONTIG=seq_k_contig, EVEN_N=even_n,
-                                                                LSE_SPLIT=lse_split, enable_fp_fusion=not lse_split,
-                                                                num_warps=4, num_stages=1, matrix_instr_nonkdim=32)
-    _bwd_q_owner[(triton.cdiv(n, block_n), b * h)](q, k, k_dq, v, do, q_scale, k_scale, k_dq_scale, v_scale, do_scale,
-                                                   lse, delta, dq, n, sm_scale, D=d, BM=block_n, BN=block_m,
-                                                   CAUSAL=causal, SEQ_K_CONTIG=seq_k_contig, EVEN_N=even_n,
-                                                   LSE_SPLIT=lse_split, enable_fp_fusion=not lse_split, num_warps=4,
-                                                   num_stages=1, matrix_instr_nonkdim=32)
+    if need_dq or need_dk:
+        _bwd_preprocess[(triton.cdiv(n, 32), b * h)](o, do_bf16, delta, n, d, 32)
+    kv_kernel = None
+    if need_dk or need_dv:
+        kv_kernel = _bwd_kv_owner[(b * h, triton.cdiv(n, block_n))](
+            q, q_dk, k, v, do, do_dv, q_scale, q_dk_scale, k_scale, v_scale, do_scale, do_dv_scale, lse, delta, dk, dv,
+            n, sm_scale, D=d, BM=block_m, BN=block_n, CAUSAL=causal, SEQ_K_CONTIG=seq_k_contig, EVEN_N=even_n,
+            LSE_SPLIT=lse_split, NEED_DK=need_dk, NEED_DV=need_dv, enable_fp_fusion=not lse_split, num_warps=4,
+            num_stages=1, matrix_instr_nonkdim=32)
+    if need_dq:
+        _bwd_q_owner[(triton.cdiv(n, block_n),
+                      b * h)](q, k, k_dq, v, do, q_scale, k_scale, k_dq_scale, v_scale, do_scale, lse, delta, dq, n,
+                              sm_scale, D=d, BM=block_n, BN=block_m, CAUSAL=causal, SEQ_K_CONTIG=seq_k_contig,
+                              EVEN_N=even_n, LSE_SPLIT=lse_split, enable_fp_fusion=not lse_split, num_warps=4,
+                              num_stages=1, matrix_instr_nonkdim=32)
     return kv_kernel
