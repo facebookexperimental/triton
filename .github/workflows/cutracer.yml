@@ -62,6 +62,8 @@ on:
       - .github/workflows/cutracer.yml
       - .github/workflows/cutracer-gpu.yml
       - .github/scripts/cutracer_ci/**
+      - .github/scripts/gpu_test_selection.py
+      - .github/scripts/kernel_test_selection.py
       - .github/actions/setup-cutracer/**
 
 permissions:

@@ -31,12 +31,17 @@ jobs:
       h100: ${{ steps.select.outputs.h100 }}
       b200: ${{ steps.select.outputs.b200 }}
       mi350: ${{ steps.select.outputs.mi350 }}
+      cpu: ${{ steps.select.outputs.cpu }}
+      cpu_plan: ${{ steps.select.outputs.cpu_plan }}
+      h100_plan: ${{ steps.select.outputs.h100_plan }}
+      b200_plan: ${{ steps.select.outputs.b200_plan }}
+      mi350_plan: ${{ steps.select.outputs.mi350_plan }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Select affected GPU platforms
+      - name: Select test work
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
@@ -62,6 +67,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/h100.yml
     with:
+      plan: ${{ needs.select.outputs.h100_plan }}
       ref: ${{ needs.select.outputs.sha }}
       wheel_url: ${{ needs.build.outputs.wheel_url }}
       wheel_filename: ${{ needs.build.outputs.wheel_filename }}
@@ -77,6 +83,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/b200.yml
     with:
+      plan: ${{ needs.select.outputs.b200_plan }}
       ref: ${{ needs.select.outputs.sha }}
       wheel_url: ${{ needs.build.outputs.wheel_url }}
       wheel_filename: ${{ needs.build.outputs.wheel_filename }}
@@ -92,14 +99,91 @@ jobs:
       issues: write
     uses: ./.github/workflows/mi350.yml
     with:
+      plan: ${{ needs.select.outputs.mi350_plan }}
       ref: ${{ needs.select.outputs.sha }}
       wheel_url: ${{ needs.build.outputs.wheel_url }}
       wheel_filename: ${{ needs.build.outputs.wheel_filename }}
       wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
 
+  cpu-tests:
+    name: Compiler tests on CPU
+    needs: [select, build]
+    if: needs.select.outputs.cpu == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - name: Set up CPU environment
+        run: |
+          uv venv "${RUNNER_TEMP}/cpu-venv" --python 3.12
+          export VIRTUAL_ENV="${RUNNER_TEMP}/cpu-venv"
+          export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+          uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install numpy pytest pytest-xdist expecttest
+          echo "VIRTUAL_ENV=${VIRTUAL_ENV}" >> "${GITHUB_ENV}"
+          echo "${VIRTUAL_ENV}/bin" >> "${GITHUB_PATH}"
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      - name: Run codegen tests
+        if: fromJSON(needs.select.outputs.cpu_plan).codegen.files[0] != null
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(needs.select.outputs.cpu_plan).codegen) }}
+          junit: /tmp/cpu-codegen.xml
+      - name: Run Gluon frontend tests
+        if: fromJSON(needs.select.outputs.cpu_plan).gluon.files[0] != null
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(needs.select.outputs.cpu_plan).gluon) }}
+          junit: /tmp/cpu-gluon.xml
+      - name: Parse test failures
+        id: parse
+        if: always()
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: Meta Triton CPU Tests
+          job: cpu-tests
+          failed: ${{ job.status != 'success' }}
+          bucket: cpu-job-failed
+          junit: ${{ fromJSON(needs.select.outputs.cpu_plan).codegen.files[0] != null && '/tmp/cpu-codegen.xml' || '' }} ${{ fromJSON(needs.select.outputs.cpu_plan).gluon.files[0] != null && '/tmp/cpu-gluon.xml' || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-test-results
+          path: /tmp/cpu-*.xml
+          if-no-files-found: ignore
+
+  issues-cpu:
+    needs: [select, cpu-tests]
+    if: always() && needs.select.outputs.cpu == 'true'
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    uses: ./.github/workflows/ci-issues.yml
+    with:
+      workflow: Meta Triton CPU Tests
+      job: cpu-tests
+      result: ${{ needs.cpu-tests.result }}
+      failures: ${{ needs.cpu-tests.outputs.failures }}
+      sha: ${{ needs.select.outputs.sha }}
+
   gpu-tests:
     name: GPU tests
-    needs: [select, build, h100, b200, mi350]
+    needs: [select, build, h100, b200, mi350, cpu-tests]
     if: always() && github.repository_owner == 'facebookexperimental'
     runs-on: ubuntu-latest
     steps:
@@ -114,8 +198,8 @@ jobs:
           needs = json.loads(os.environ["NEEDS"])
           if needs["select"]["result"] != "success":
               raise SystemExit("GPU platform selection did not succeed")
-          for job in ("build", "h100", "b200", "mi350"):
-              selected = needs["select"]["outputs"][job] == "true"
+          for job in ("build", "h100", "b200", "mi350", "cpu-tests"):
+              selected = needs["select"]["outputs"]["cpu" if job == "cpu-tests" else job] == "true"
               if selected and needs[job]["result"] != "success":
                   raise SystemExit(f"{job}: {needs[job]['result']}")
           PY

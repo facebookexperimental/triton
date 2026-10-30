@@ -334,8 +334,9 @@ def test_aggregate_gate_rejects_failed_build_and_selected_tests(results, selecte
     script = gate["steps"][0]["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     needs = {name: {"result": result} for name, result in results.items()}
     needs["select"]["outputs"] = {
-        "build": str(selected).lower(), "h100": str(selected).lower(), "b200": "false", "mi350": "false"
+        "build": str(selected).lower(), "h100": str(selected).lower(), "b200": "false", "mi350": "false", "cpu": "false"
     }
+    needs["cpu-tests"] = {"result": "skipped"}
     for platform in ("b200", "mi350"):
         needs[platform] = {"result": "skipped"}
     result = subprocess.run([sys.executable, "-c", script], env=os.environ | {"NEEDS": json.dumps(needs)},
@@ -375,3 +376,126 @@ def test_workflows_share_one_build_and_pin_all_checkouts():
                     install = next(i for i, item in enumerate(steps) if item.get("name") == "Install Triton")
                     assert "sha256sum --check" in steps[install - 1]["run"]
     assert LEASE_SECONDS > int(workflow("build")["jobs"]["build"]["timeout-minutes"]) * 60
+
+
+@pytest.mark.parametrize("changed", [
+    "python/test/conftest.py",
+    "python/test/unit/tlx_ops/mm_test_utils.py",
+    "python/triton/runtime/jit.py",
+    "third_party/nvidia/backend/compiler.py",
+    "third_party/amd/backend/driver.py",
+    "third_party/tlx/ops/kernels/flash_attn/gfx950.py",
+    "unknown.py",
+])
+def test_execution_dependencies_keep_full_suites_on_the_gpu(changed):
+    from gpu_test_selection import SUITES, test_plan as plan_tests
+    suites = json.loads(SUITES.read_text())
+    plan = plan_tests(["lib/Analysis/Allocation.cpp", changed], ROOT, FILTERS, suites)
+    assert not plan["cpu"]
+    assert plan["gpu"]["b200"]["gluon"]["files"] == ["python/test/gluon"]
+    assert plan["gpu"]["mi350"]["gluon"]["files"] == ["python/test/gluon"]
+    assert plan["gpu"]["b200"]["codegen"]["files"]
+
+
+def test_fixture_only_changes_do_not_skip_tests():
+    from gpu_test_selection import SUITES, test_plan as plan_tests
+    plan = plan_tests(["python/test/conftest.py"], ROOT, FILTERS, json.loads(SUITES.read_text()))
+    assert not plan["cpu"]
+    for platform in plan["gpu"].values():
+        assert platform["core"]["files"] and platform["correctness"]["files"]
+    assert plan["gpu"]["h100"]["runtime"]["files"]
+
+
+def test_cpu_consumers_still_require_the_wheel():
+    from gpu_test_selection import SUITES, test_plan as plan_tests
+    plan = plan_tests(["lib/Analysis/Allocation.cpp"], ROOT, FILTERS, json.loads(SUITES.read_text()))
+    assert plan["cpu"]["codegen"]["files"]
+    assert plan["cpu"]["gluon"]["files"]
+    assert plan["build"]
+    assert not plan["gpu"]["b200"]["gluon"]["files"]
+    assert not plan["gpu"]["mi350"]["gluon"]["files"]
+
+
+def test_new_gluon_tests_and_reenabled_files_keep_gpu_coverage(tmp_path):
+    from gpu_test_selection import SUITES, cpu_eligible
+    spec = json.loads(SUITES.read_text())["cpu"]["gluon"]
+    directory = tmp_path / "python/test/gluon"
+    directory.mkdir(parents=True)
+    for path in spec["files"]:
+        (tmp_path / path).write_text("")
+    for filename in spec["gluon_skip_files"]:
+        (directory / filename).write_text("")
+    original = (ROOT / "python/test/gluon/conftest.py").read_text()
+    fixture = directory / "conftest.py"
+    fixture.write_text(original)
+    assert cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
+    extra = directory / "new_test.py"
+    extra.write_text("")
+    assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
+    extra.unlink()
+    fixture.write_text(original.replace("collect_ignore = sorted(_VERSION_SKEW_FILES)", "collect_ignore = []"))
+    assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
+
+
+@pytest.mark.parametrize("result", ["failure", "cancelled", "skipped"])
+def test_cpu_failure_reaches_the_final_check(result):
+    import os
+    import sys
+    parent = yaml.load((ROOT / ".github/workflows/gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
+    script = parent["jobs"]["gpu-tests"]["steps"][0]["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    needs = {name: {"result": "success"} for name in ("select", "build", "h100", "b200", "mi350")}
+    needs["cpu-tests"] = {"result": result}
+    needs["select"]["outputs"] = {name: "true" for name in ("build", "h100", "b200", "mi350", "cpu")}
+    proc = subprocess.run([sys.executable, "-c", script], env=os.environ | {"NEEDS": json.dumps(needs)},
+                          capture_output=True)
+    assert proc.returncode != 0
+
+
+def test_execution_preserves_the_selected_expression():
+    from run_selected_tests import command
+    plan = {"files": ["python/test/gluon/test_frontend.py"], "k": "test_a or test_b"}
+    argv = command(plan, 4, "results.xml")
+    assert argv[argv.index("-k") + 1] == plan["k"]
+    assert "python/test/gluon/test_frontend.py" in argv
+    with pytest.raises(ValueError):
+        command({"files": [], "k": ""}, 1, "results.xml")
+
+
+def test_cpu_routing_cannot_hide_new_gpu_only_skips(tmp_path):
+    from run_selected_tests import check_cpu_skips
+    report = tmp_path / "results.xml"
+    report.write_text('<testsuite><testcase><skipped message="requires a CUDA GPU"/></testcase></testsuite>')
+    with pytest.raises(ValueError, match="Unexpected skip"):
+        check_cpu_skips({"allowed_skips": []}, report)
+    report.write_text('<testsuite><testcase><skipped message="known target limitation"/></testcase></testsuite>')
+    check_cpu_skips({"allowed_skips": ["known target limitation"]}, report)
+
+
+def test_cpu_dependency_changes_remain_invalid_after_commit(tmp_path):
+    from gpu_test_selection import reviewed_changes
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    helper = tmp_path / "helper.py"
+    helper.write_text("value = 1\n")
+    subprocess.run(["git", "add", "helper.py"], cwd=tmp_path, check=True)
+    commit = ["git", "-c", "user.name=CI", "-c", "user.email=ci@example.invalid", "commit", "-qm", "test"]
+    subprocess.run(commit, cwd=tmp_path, check=True)
+    reviewed = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True).strip()
+    assert reviewed_changes(tmp_path, reviewed, ["helper.py"]) == []
+    helper.write_text("value = 2\n")
+    subprocess.run(["git", "add", "helper.py"], cwd=tmp_path, check=True)
+    subprocess.run(commit, cwd=tmp_path, check=True)
+    assert reviewed_changes(tmp_path, reviewed, ["helper.py"]) == ["helper.py"]
+
+
+def test_cpu_eligibility_rejects_an_overridden_ignore_policy(tmp_path):
+    from gpu_test_selection import SUITES, cpu_eligible
+    spec = json.loads(SUITES.read_text())["cpu"]["gluon"]
+    directory = tmp_path / "python/test/gluon"
+    directory.mkdir(parents=True)
+    for path in spec["files"]:
+        (tmp_path / path).write_text("")
+    for name in spec["gluon_skip_files"]:
+        (directory / name).write_text("")
+    source = (ROOT / "python/test/gluon/conftest.py").read_text()
+    (directory / "conftest.py").write_text(source + "\ncollect_ignore = []\n")
+    assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
