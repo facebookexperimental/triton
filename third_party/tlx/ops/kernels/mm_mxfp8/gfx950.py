@@ -455,8 +455,8 @@ def _regular_generic_kernel(
 ):
     pid = tl.program_id(0)
     _generic_tile(
-        pid // (N // BN),
-        pid % (N // BN),
+        pid // tl.cdiv(N, BN),
+        pid % tl.cdiv(N, BN),
         a_ptr,
         b_ptr,
         c_ptr,
@@ -607,7 +607,7 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
         )
     else:
-        _regular_generic_kernel[(m // bm * (n // bn), )](
+        _regular_generic_kernel[(triton.cdiv(m, bm) * triton.cdiv(n, bn), )](
             a,
             b,
             out,

@@ -18,8 +18,10 @@ def _inputs(m, n, k, *, sf_layout):
     a_scale_bytes = torch.randint(125, 128, (m, k // 32), device="cuda", dtype=torch.uint8, generator=generator)
     b_scale_bytes = torch.randint(125, 128, (n, k // 32), device="cuda", dtype=torch.uint8, generator=generator)
     if sf_layout == "cublas_blocked":
-        a_scale = swizzle_scale_to_5d(a_scale_bytes.view(1, m, k // 32), m // 128, k // 128).view(torch.float8_e8m0fnu)
-        b_scale = swizzle_scale_to_5d(b_scale_bytes.view(1, n, k // 32), n // 128, k // 128).view(torch.float8_e8m0fnu)
+        a_padded = torch.nn.functional.pad(a_scale_bytes, (0, 0, 0, -m % 128))
+        b_padded = torch.nn.functional.pad(b_scale_bytes, (0, 0, 0, -n % 128))
+        a_scale = swizzle_scale_to_5d(a_padded[None], (m + 127) // 128, k // 128).view(torch.float8_e8m0fnu)
+        b_scale = swizzle_scale_to_5d(b_padded[None], (n + 127) // 128, k // 128).view(torch.float8_e8m0fnu)
     else:
         a_scale = a_scale_bytes.view(torch.float8_e8m0fnu)
         b_scale = b_scale_bytes.view(torch.float8_e8m0fnu)
@@ -36,6 +38,14 @@ def _check_sample(out, inputs, scale_bytes):
     reference = a_dequant @ b_dequant.T
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out[:rows, :cols].float(), reference, rtol=0.03, atol=0.5)
+
+
+def _reference_slice(inputs, scale_bytes, row_slice, col_slice):
+    a, _, b, _ = inputs
+    a_scales, b_scales = scale_bytes
+    a_dequant = a[row_slice].float() * torch.exp2(a_scales[row_slice].float() - 127).repeat_interleave(32, dim=1)
+    b_dequant = b[col_slice].float() * torch.exp2(b_scales[col_slice].float() - 127).repeat_interleave(32, dim=1)
+    return a_dequant @ b_dequant.T
 
 
 def test_mm_mxfp8_gfx950_catalog_entry():
@@ -61,6 +71,29 @@ def test_mm_mxfp8_gfx950_public_numerics(shape, sf_layout):
     out = torch.empty((shape[0], shape[1]), dtype=torch.bfloat16, device="cuda")
     assert mm_mxfp8(*inputs, out=out, sf_layout=sf_layout, space="heuristic") is out
     _check_sample(out, inputs, scale_bytes)
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 128), (65, 73, 128), (129, 257, 256), (255, 130, 128)])
+@pytest.mark.parametrize("sf_layout", ["natural", "cublas_blocked"])
+def test_mm_mxfp8_gfx950_ragged_mn(shape, sf_layout):
+    from triton.tlx.ops import mm_mxfp8
+
+    inputs, scale_bytes = _inputs(*shape, sf_layout=sf_layout)
+    out = mm_mxfp8(*inputs, sf_layout=sf_layout)
+    reference = _reference_slice(inputs, scale_bytes, slice(None), slice(None))
+    assert out.shape == shape[:2]
+    torch.testing.assert_close(out.float(), reference, rtol=0.03, atol=0.5)
+
+
+@pytest.mark.parametrize("sf_layout", ["natural", "cublas_blocked"])
+def test_mm_mxfp8_gfx950_quad_odd_k_tail(sf_layout):
+    from triton.tlx.ops import mm_mxfp8
+
+    inputs, scale_bytes = _inputs(4096, 4096, 4224, sf_layout=sf_layout)
+    out = mm_mxfp8(*inputs, sf_layout=sf_layout)
+    for rows, cols in ((slice(0, 128), slice(0, 128)), (slice(-128, None), slice(-128, None))):
+        reference = _reference_slice(inputs, scale_bytes, rows, cols)
+        torch.testing.assert_close(out[rows, cols].float(), reference, rtol=0.03, atol=0.5)
 
 
 def test_mm_mxfp8_gfx950_default_space_and_blocked_parity():
