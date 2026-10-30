@@ -81,12 +81,13 @@ def record_failure(body, sha, run_url):
 def decide(api, repo, title, labels, summary, now, run_id):
     """("reopen", (issue, reopens, flaky)), ("skip", None) when the issue records a newer run, or
     ("file", None) to leave filing to the report step."""
-    quoted = title.replace('"', '\\"')
-    q = " ".join([f"repo:{repo}", "is:issue", *[f'label:"{l}"' for l in labels], f'in:title "{quoted}"'])
-    found = api("GET", f"search/issues?per_page=100&q={quote(q, safe='')}")["items"]
-    found = [i for i in found if i["title"] == title and "pull_request" not in i]
-    # Search can lag a close by seconds, so confirm what it reports as open.
-    issues = [api("GET", f"repos/{repo}/issues/{i['number']}") if i["state"] == "open" else i for i in found]
+    # List, never search: the search index can miss an issue for hours, and a missed issue gets filed twice.
+    # A close inside the reopen window updates the issue, so `since` keeps every closed issue that can matter.
+    since = (now - WINDOW).isoformat().replace("+00:00", "Z")
+    base = f"repos/{repo}/issues?labels={quote(','.join(labels))}&per_page=100"
+    found = (api("GET", f"{base}&state=open", paginate=True) +
+             api("GET", f"{base}&state=closed&since={since}", paginate=True))
+    issues = [i for i in found if i["title"] == title and "pull_request" not in i]
     open_issues = [i for i in issues if i["state"] == "open"]
     if open_issues:
         return ("skip" if any(run_id_of(i["body"]) > run_id for i in open_issues) else "file"), None
