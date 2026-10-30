@@ -5,7 +5,7 @@ A manual run checks the test it names on the GPU it names. A pull request
 checks:
 
     TLX kernel changes   on each GPU a changed file targets, that GPU's test
-                         files that the repo's kernel_test_selection.py maps
+                         files that the repo's gpu_test_selection.py maps
                          the changes to
     CUTracer CI changes  each GPU's SELF_TESTS entry, to show the pipeline
                          still works there
@@ -34,7 +34,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-SELECTOR = Path(__file__).resolve().parents[1] / "kernel_test_selection.py"
+SELECTOR = Path(__file__).resolve().parents[1] / "gpu_test_selection.py"
 GPUS = ("b200", "h100")
 SELF_TESTS = {
     "b200": "python/test/unit/tlx_ops/test_flash_attn_sm100.py::test_flash_attn_fwd[1-1-256-64-False-fp16]",
@@ -47,6 +47,8 @@ CUTRACER_CI_PATHS = (
     ".github/workflows/cutracer.yml",
     ".github/workflows/cutracer-gpu.yml",
     ".github/scripts/cutracer_ci/*",
+    ".github/scripts/gpu_test_selection.py",
+    ".github/scripts/kernel_test_selection.py",
     ".github/actions/setup-cutracer/*",
 )
 

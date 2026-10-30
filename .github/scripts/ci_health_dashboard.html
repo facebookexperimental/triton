@@ -224,9 +224,10 @@ function renderLit(l){
 
 let OPEN=null;
 function renderMain(m,l,branch){
-  if(OPEN===null||OPEN.branch!==branch)OPEN=Object.fromEntries(["H100","B200","MI350"].map(g=>[g,m.gpus[g].verdict==="new"||m.gpus[g].verdict==="known"]).concat([["branch",branch]]));
+  const platforms=["H100","B200","MI350","CPU"];
+  if(OPEN===null||OPEN.branch!==branch)OPEN=Object.fromEntries(platforms.map(g=>[g,m.gpus[g].verdict==="new"||m.gpus[g].verdict==="known"]).concat([["branch",branch]]));
   $("m-build").innerHTML=m.build?`<div class="banner"><b class="bad">✕ Build failed</b> at ${sha(m.build.sha)} ${pr(m.build.pr)} ${who(m.build.author)}, ${ago(m.build.t)}: ${esc(m.build.step)}. No GPU tests ran on this push; each GPU's verdict is from its last result.</div>`:"";
-  const all=k=>["H100","B200","MI350"].flatMap(g=>m.gpus[g][k]);
+  const all=k=>platforms.flatMap(g=>m.gpus[g][k]);
   const S={reproduced:`<span class="bad">✕ reproduced</span><br><span class="muted">not flaky</span>`,"not reproduced":`<span class="warn">✓ passed</span><br><span class="muted">flake candidate</span>`,none:`<span class="na">no scheduled run yet</span>`};
   // GPU and LIT failures share one row shape: Suite, Test, First failed at, ...
   const litItems=k=>(l?l[k]:[]).map(f=>({...f,gpu:"LIT",where:"compiler.yml"}));
@@ -239,7 +240,7 @@ function renderMain(m,l,branch){
   $("m-known").innerHTML=table(["Suite","Test","First failed at","Pushes in a row","Last passed"],
     known.map(i=>[i.gpu,testCell(i,true),firstCell(i),i.streak,i.prev_sha?sha(i.prev_sha):`<span class="muted">never seen passing</span>`]),[3]);
   $("m-setup-s").textContent=`Setup failures (${m.setup.length} in the last 10 pushes)`;
-  $("m-setup").innerHTML=table(["Push","GPU","Job","Step"],m.setup.map(s=>[`${sha(s.sha)} <span class="muted">${ago(s.t)}</span>`,s.gpu,esc(s.job),esc(s.step)]));
+  $("m-setup").innerHTML=table(["Push","Test platform","Job","Step"],m.setup.map(s=>[`${sha(s.sha)} <span class="muted">${ago(s.t)}</span>`,s.gpu,esc(s.job),esc(s.step)]));
   // One grid: a column per commit, a row per test group. GPU and LIT runs of the same push share a column.
   const C={pass:["c-pass","✓","all tests pass"],new:["c-new","✕","new failure: this commit broke it"],known:["c-known","●","still failing from an earlier commit"],setup:["c-setup","⚠","setup failure, no test result"],build:["c-setup","⚠","build failed, no lit result"],skip:["c-na","○","skipped: path selection found nothing this suite tests"],running:["c-na","…","running, no result yet"],unknown:["c-setup","?","job failed; its log is unavailable, so the result is unknown"],na:["c-na","–","not run on this commit"]};
   const LATEST={pass:"✓ Passing",new:"✕ New failure",known:"✕ Failing",skip:"○ Not run",running:"… Running",na:"– Not run",setup:"⚠ Setup failed",build:"⚠ Build failed",unknown:"? Failed, no log"};
@@ -270,6 +271,7 @@ function renderMain(m,l,branch){
       return `<td${i?"":` class="latest"`}>${link(st,label==="LIT"?c.lit:c.gpu,div)}</td>`}).join("")+"</tr>";
   $("m-grid").innerHTML="<tr><th></th>"+P.map((c,i)=>{const n=prOf(c);return `<th${i?"":` class="latest"`}>${i?"":"Latest<br>"}<a href="https://github.com/facebookexperimental/triton/commit/${esc(c.sha)}" data-tip="${esc(tip(c))}">${n?"#"+esc(n):esc(c.sha.slice(0,7))}</a><br><span class="muted">T+${hrs(c)}h</span></th>`}).join("")+"</tr>"+
     group("GPU Tests","gpu-tests.yml")+["H100","B200","MI350"].map(g=>row(g,m.gpus[g],c=>c.gpu?c.gpu.cells[g]:"na",c=>c.gpu&&c.gpu.since&&c.gpu.since[g])+(OPEN[g]?steps(g):"")).join("")+
+    group("CPU compiler tests","gpu-tests.yml")+row("CPU",m.gpus.CPU,c=>c.gpu?c.gpu.cells.CPU:"na",c=>c.gpu&&c.gpu.since&&c.gpu.since.CPU)+(OPEN.CPU?steps("CPU"):"")+
     group("LIT Tests","compiler.yml")+(l?row("LIT",l,c=>c.lit?c.lit.cell:"na",c=>c.lit&&c.lit.since):`<tr><td class="gl">LIT</td><td colspan="${P.length}" class="muted" style="font-size:12px">runs on pushes to main only, not on ${esc(branch)}</td></tr>`);
   for(const td of $("m-grid").querySelectorAll("td[data-g]"))td.onclick=()=>{OPEN[td.dataset.g]=!OPEN[td.dataset.g];renderMain(m,l,branch)};
   const lit=l||{new:[],known:[]};
@@ -302,7 +304,7 @@ function renderPerf(nt){
 function renderPR(list,branch="main"){
   const R={tests:p=>`<span class="${p.whose==="main"?"warn":"bad"}">✕ ${p.n_failed} test${p.n_failed>1?"s":""}</span>`,setup:()=>`<span class="infra">⚠ setup</span>`,build:()=>`<span class="bad">✕ build</span>`,passed:()=>`<span class="ok">✓</span>`,running:()=>`<span class="na">running</span>`,cancelled:()=>`<span class="na">cancelled</span>`};
   const W={author:`<span class="tag own">author</span>`,main:`<span class="tag main">fails on ${esc(branch)}</span>`,ci:`<span class="tag ci">setup: CI</span>`};
-  $("p-list").innerHTML=table(["PR","Author","GPUs run","Result","Whose"],list.map(p=>[`${p.pr?pr(p.pr):esc(p.branch)} <a href="${esc(p.url)}">${esc(p.title.slice(0,70))}</a><br><span class="muted">${ago(p.t)}</span>`,who(p.author),p.gpus.length?p.gpus.join(" · "):`<span class="na">none</span>`,(R[p.result]||(()=>esc(p.result)))(p),`${W[p.whose]||""} ${esc(p.note)}`]));
+  $("p-list").innerHTML=table(["PR","Author","Test platforms","Result","Whose"],list.map(p=>[`${p.pr?pr(p.pr):esc(p.branch)} <a href="${esc(p.url)}">${esc(p.title.slice(0,70))}</a><br><span class="muted">${ago(p.t)}</span>`,who(p.author),p.gpus.length?p.gpus.join(" · "):`<span class="na">none</span>`,(R[p.result]||(()=>esc(p.result)))(p),`${W[p.whose]||""} ${esc(p.note)}`]));
 }
 
 const GPUS=["H100","B200","MI350"];

@@ -6,6 +6,10 @@ on:
         description: Exact commit used to build the wheel
         required: true
         type: string
+      plan:
+        description: Explicit test work selected by the CPU planner
+        required: true
+        type: string
       wheel_url:
         required: true
         type: string
@@ -26,7 +30,7 @@ env:
 
 jobs:
   b200-tlx-test:
-    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).core.files[0] != null || fromJSON(inputs.plan).correctness.files[0] != null || fromJSON(inputs.plan).codegen.files[0] != null) }}
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
@@ -67,42 +71,36 @@ jobs:
           wheel-url: ${{ inputs.wheel_url }}
           wheel-filename: ${{ inputs.wheel_filename }}
           wheel-sha256: ${{ inputs.wheel_sha256 }}
-      - name: Select kernel-affected tests
-        id: select
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/select-kernel-tests
       - name: Run TLX core tests
         id: run_core_tests
+        if: fromJSON(inputs.plan).core.files[0] != null
         timeout-minutes: 90
-        uses: ./.github/actions/run-tlx-core-tests
+        uses: ./.github/actions/run-selected-tests
         with:
-          platform: b200
-          files: |
-            python/test/unit/language/test_tlx_*_any.py
-            python/test/unit/language/test_tlx_*sm90up*.py
-            python/test/unit/language/test_tlx_*sm100*.py
-            python/test/unit/tlx_ops/test_*_sm100.py
-          kernel-only: ${{ steps.select.outputs.kernel_only }}
+          suite: ${{ toJSON(fromJSON(inputs.plan).core) }}
+          workers: "4"
+          junit: /tmp/tlx-core.xml
           setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
+        if: fromJSON(inputs.plan).correctness.files[0] != null
         timeout-minutes: 30
-        uses: ./.github/actions/run-tlx-correctness-tests
+        uses: ./.github/actions/run-selected-tests
         with:
-          kernel-only: ${{ steps.select.outputs.kernel_only }}
-          correctness-mode: ${{ steps.select.outputs.correctness_mode }}
-          correctness-k: ${{ steps.select.outputs.correctness_k }}
+          suite: ${{ toJSON(fromJSON(inputs.plan).correctness) }}
+          workers: "4"
+          junit: /tmp/tlx-correctness.xml
           setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run device-agnostic TLX codegen tests
         id: run_codegen_tests
+        if: fromJSON(inputs.plan).codegen.files[0] != null
         timeout-minutes: 30
-        run: |
-          . "${SETUP_SCRIPT}"
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ] && ! grep -qxF "python/test/unit/language/test_tlx_codegen.py" /tmp/affected.txt; then
-            echo "kernel-only PR: codegen tests do not touch the changed kernel(s); skipping"
-            exit 0
-          fi
-          python -m pytest python/test/unit/language/test_tlx_codegen.py --import-mode=importlib -v --junitxml=/tmp/tlx-codegen.xml
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).codegen) }}
+          workers: "1"
+          junit: /tmp/tlx-codegen.xml
+          setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Parse test failures (TLX)
         id: parse
         if: always()
@@ -110,9 +108,9 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: b200-tlx-test
-          failed: ${{ steps.run_core_tests.outcome != 'success' || steps.run_correctness_tests.outcome != 'success' || steps.run_codegen_tests.outcome != 'success' }}
+          failed: ${{ job.status != 'success' }}
           bucket: b200-tlx-job-failed
-          junit: /tmp/tlx-core.xml /tmp/tlx-correctness.xml /tmp/tlx-codegen.xml
+          junit: ${{ fromJSON(inputs.plan).core.files[0] != null && '/tmp/tlx-core.xml' || '' }} ${{ fromJSON(inputs.plan).correctness.files[0] != null && '/tmp/tlx-correctness.xml' || '' }} ${{ fromJSON(inputs.plan).codegen.files[0] != null && '/tmp/tlx-codegen.xml' || '' }}
           budget: /tmp/tlx-core.xml=90 /tmp/tlx-correctness.xml=30 /tmp/tlx-codegen.xml=30
           setup-script: ${{ env.SETUP_SCRIPT }}
 
@@ -221,7 +219,7 @@ jobs:
           setup-script: ${{ env.SETUP_SCRIPT }}
 
   b200-gluon-test:
-    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).gluon.files[0] != null) }}
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
@@ -256,20 +254,16 @@ jobs:
           wheel-url: ${{ inputs.wheel_url }}
           wheel-filename: ${{ inputs.wheel_filename }}
           wheel-sha256: ${{ inputs.wheel_sha256 }}
-      - name: Select kernel-affected tests
-        id: select
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/select-kernel-tests
       - name: Run Gluon tests (python/test/gluon)
         id: run_gluon
+        if: fromJSON(inputs.plan).gluon.files[0] != null
         timeout-minutes: 50
-        run: |
-          . "${SETUP_SCRIPT}"
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ] && ! grep -q "^python/test/gluon/" /tmp/affected.txt; then
-            echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
-            exit 0
-          fi
-          python -m pytest python/test/gluon/ --import-mode=importlib -v --junitxml=/tmp/gluon.xml
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).gluon) }}
+          workers: "1"
+          junit: /tmp/gluon.xml
+          setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Parse test failures (Gluon)
         id: parse
         if: always()
@@ -277,7 +271,7 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: b200-gluon-test
-          failed: ${{ steps.run_gluon.outcome != 'success' }}
+          failed: ${{ job.status != 'success' }}
           bucket: b200-gluon-job-failed
           junit: /tmp/gluon.xml
           budget: /tmp/gluon.xml=50
