@@ -23,9 +23,18 @@ on:
       - '.github/scripts/test_ci_health.py'
       - '.github/scripts/test_ci_health_rules.py'
       - '.github/scripts/test_ci_health_logs.py'
+      - '.github/scripts/gpu_test_selection.py'
+      - '.github/gpu-test-paths.json'
+      - '.github/gpu-test-suites.json'
+      - '.github/scripts/run_selected_tests.py'
+      - '.github/actions/run-selected-tests/action.yml'
       - '.github/scripts/meta_llvm_bump.py'
       - '.github/workflows/ci-health.yml'
       - '.github/workflows/gpu-tests.yml'
+      - '.github/workflows/gpu-tests-nightly.yml'
+      - '.github/workflows/nightly-tlx-ops-bench.yml'
+      - '.github/workflows/tritonbench.yml'
+      - '.github/workflows/compiler.yml'
       - '.github/workflows/nightly-fbtriton.yml'
       - '.github/workflows/mi350.yml'
       - '.github/workflows/b200.yml'
@@ -49,11 +58,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python3 -m pip install pytest
+      - run: python3 -m pip install pytest PyYAML
       # Also checks that every test step in the GPU workflows maps to a dashboard group.
       - name: Run dashboard tests
         working-directory: .github/scripts
-        run: python3 -m pytest -q test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py
+        run: python3 -m pytest -s --tb=short test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py
 
   collect:
     if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'

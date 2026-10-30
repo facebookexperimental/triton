@@ -38,9 +38,9 @@ BUMP_PREFIX = "scratch/meta-llvm-bump/"
 GROUPS = [
     (r"^Run TLX (core|unit) tests$", "TLX core"),  # MI350 called it "unit" until its rename
     (r"^Run TLX tutorial correctness tests$", "Tutorial correctness"),
-    (r"^Run device-agnostic TLX codegen tests$", "TLX codegen"),
+    (r"^Run (device-agnostic TLX codegen|codegen) tests$", "TLX codegen"),
     (r"^Run TritonBench", "TritonBench"),
-    (r"^Run Gluon tests", "Gluon"),
+    (r"^Run Gluon (frontend )?tests", "Gluon"),
     (r"^Run runtime unit tests$", "Runtime"),
     (r"^Run host-default TLX L2 perf$", "TLX perf"),
     (r"^Run TorchTLX", "TorchTLX"),
@@ -60,7 +60,8 @@ JOB_GROUPS = [
 INFRA_STEP = re.compile(
     r"set up job|checkout|download prebuilt|install triton|upload wheel|build wheel|setup tritonbench|"
     r"authenticate|azure|aws|restore ccache|tune nvidia|fail if the build job|select kernel-affected|"
-    r"set up test environment|install prebuilt triton|resolve tritonbench ref|install tritonbench dependencies", re.I)
+    r"set up test environment|set up CPU environment|set up Python|install prebuilt triton|resolve tritonbench ref|install tritonbench dependencies",
+    re.I)
 
 
 def group_of(step):
@@ -95,6 +96,8 @@ def gpu_job(j):
 
 GPU_PREFIX = {"h100": "H100", "b200": "B200", "mi350": "MI350"}
 GPUS = ("H100", "B200", "MI350")
+TEST_PLATFORMS = (*GPUS, "CPU")
+CPU_JOB = "Compiler tests on CPU"
 #: Shared jobs of gpu-tests.yml that every GPU job needs: their failure is a build failure, not a setup failure.
 BUILD_JOBS = ("build", "select")
 #: How many pushes the Main tab's grid and setup counts look back.
@@ -163,6 +166,18 @@ def _gpu_jobs(run):
     return [(gpu_of(run, j), j) for j in run.get("jobs") or [] if gpu_of(run, j) and gpu_job(j)]
 
 
+def test_platform_of(run, job):
+    if run.get("wf") == "gpu-tests.yml" and job["name"] == CPU_JOB:
+        return "CPU"
+    return gpu_of(run, job)
+
+
+def _test_jobs(run):
+    return [(test_platform_of(run, job), job)
+            for job in run.get("jobs") or []
+            if test_platform_of(run, job) and (job["name"] == CPU_JOB or gpu_job(job))]
+
+
 def gpu_minutes(run):
     """GPU runner time of a run's jobs that ran. A skipped job used no runner, and GitHub can give it a started_at
     after its completed_at."""
@@ -209,7 +224,7 @@ def run_outcome(run):
         return "passed"
     if _build_failure(run):
         return "build"
-    for _, j in _gpu_jobs(run):
+    for _, j in _test_jobs(run):
         if any(group_of(s["name"]) and s["conclusion"] == "failure" for s in j["steps"]):
             return "test"
     return "setup"
@@ -275,7 +290,7 @@ def _history(pushes):
     state, last, names, seen, units = {}, {}, {}, collections.defaultdict(dict), collections.defaultdict(dict)
     blame = collections.defaultdict(lambda: collections.defaultdict(set))
     for i, run in enumerate(pushes):
-        for gpu, j in _gpu_jobs(run):
+        for gpu, j in _test_jobs(run):
             for s in j["steps"]:
                 res = step_result(j, s)
                 if res is None:
@@ -308,7 +323,7 @@ def _sched_result(runs, sha, unit, test_id):
     for run in runs:
         if run.get("wf") != "gpu-tests.yml" or run["event"] != "schedule" or run.get("head_sha") != sha:
             continue
-        for g, j in _gpu_jobs(run):
+        for g, j in _test_jobs(run):
             if g != gpu or job_key(j["name"]) != key:
                 continue
             for s in j["steps"]:
@@ -333,12 +348,12 @@ def main_view(runs, asof, branch="main"):
     retire = iso(t(asof) - dt.timedelta(days=RETIRE_DAYS))
     latest_steps = {}
     for run in pushes:
-        for gpu, j in _gpu_jobs(run):
+        for gpu, j in _test_jobs(run):
             if j["conclusion"] in RAN and run["created_at"] >= retire:
                 latest_steps[(gpu, job_key(j["name"]))] = {group_of(s["name"]) for s in j["steps"]} - {None}
     gpus = {}
-    for gpu in GPUS:
-        ran = [r for r in pushes if any(g == gpu and j["conclusion"] in RAN for g, j in _gpu_jobs(r))]
+    for gpu in TEST_PLATFORMS:
+        ran = [r for r in pushes if any(g == gpu and j["conclusion"] in RAN for g, j in _test_jobs(r))]
         out = {"verdict": "none", "new": [], "known": [], **(_commit(ran[-1]) if ran else {})}
         for unit, fails in state.items():
             if unit[0] != gpu or unit[2] not in latest_steps.get(unit[:2], ()):
@@ -366,8 +381,8 @@ def main_view(runs, asof, branch="main"):
     for i in range(max(0, len(pushes) - PUSH_GRID), len(pushes)):
         run, cells = pushes[i], {}
         broken = _build_failure(run)
-        for gpu in GPUS:
-            jobs = [j for g, j in _gpu_jobs(run) if g == gpu and j["conclusion"] in RAN]
+        for gpu in TEST_PLATFORMS:
+            jobs = [j for g, j in _test_jobs(run) if g == gpu and j["conclusion"] in RAN]
             st = seen[i].get(gpu, set())
             if broken or not jobs:
                 # skip: path selection did not pick this GPU, so nothing it tests changed.
@@ -386,7 +401,7 @@ def main_view(runs, asof, branch="main"):
             gpu: since(set().union(*(v
                                      for u, v in blame[i].items()
                                      if u[0] == gpu)))
-            for gpu in GPUS
+            for gpu in TEST_PLATFORMS
             if cells[gpu] == "known"
         }
         grid.append({
@@ -394,13 +409,15 @@ def main_view(runs, asof, branch="main"):
         })
 
     # Push runs still in progress have no result yet; they show as running so a missing cell is never ambiguous.
-    grid += [{**_commit(r), "title": r.get("title", ""), "url": r.get("url"), "cells": {g: "running"
-                                                                                        for g in GPUS}}
+    grid += [{
+        **_commit(r), "title": r.get("title", ""), "url": r.get("url"), "cells": {g: "running"
+                                                                                  for g in TEST_PLATFORMS}
+    }
              for r in _running(runs, "gpu-tests.yml", branch, asof)]
     steps = _step_grid(pushes, max(0, len(pushes) - PUSH_GRID), units, blame, since)
     setup = [{
         "sha": r.get("head_sha") or "", "t": r["created_at"], "gpu": g, "job": job_key(j["name"]), "step": setup_step(j)
-    } for r in pushes[-SETUP_WINDOW:] for g, j in _gpu_jobs(r) if setup_step(j)]
+    } for r in pushes[-SETUP_WINDOW:] for g, j in _test_jobs(r) if setup_step(j)]
     build = None
     if pushes and _build_failure(pushes[-1]):
         build = {**_commit(pushes[-1]), "step": _build_failure(pushes[-1])}
@@ -489,13 +506,13 @@ def _step_grid(pushes, start, units, blame, since):
     na (the job or the step did not run). Groups that never ran in the grid get no row. since maps a known cell's
     column to the push(es) its failures started at."""
     out = {}
-    for gpu in GPUS:
+    for gpu in TEST_PLATFORMS:
         rows, names, starts = {}, {}, {}
         for col, i in enumerate(range(start, len(pushes))):
             run = pushes[i]
             if _build_failure(run):
                 continue
-            for g, j in _gpu_jobs(run):
+            for g, j in _test_jobs(run):
                 if g != gpu or j["conclusion"] not in RAN:
                     continue
                 key, setup, failed_before = job_key(j["name"]), setup_step(j), False
@@ -539,7 +556,7 @@ def pr_view(runs, asof, main, branch="main"):
             latest[key] = run
     out = []
     for run in sorted(latest.values(), key=lambda r: r["created_at"], reverse=True):
-        jobs = _gpu_jobs(run)
+        jobs = _test_jobs(run)
         fails = {(g, job_key(j["name"]), f["id"]) for g, j in jobs for s in j["steps"] for f in s.get("failures") or []}
         outcome = run_outcome(run)
         row = {
@@ -547,7 +564,8 @@ def pr_view(runs, asof, main, branch="main"):
             "branch": run.get("branch"), "t": run["created_at"], "gpus":
             sorted({g
                     for g, j in jobs
-                    if j["conclusion"] in RAN}, key=GPUS.index), "n_failed": len(fails), "whose": None, "note": ""
+                    if j["conclusion"] in RAN},
+                   key=TEST_PLATFORMS.index), "n_failed": len(fails), "whose": None, "note": ""
         }
         if outcome is None:
             row["result"] = "running"

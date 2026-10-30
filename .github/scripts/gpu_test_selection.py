@@ -780,6 +780,9 @@ def main():
         selection_note = "Test selection could not be narrowed; full GPU coverage is retained."
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(json.dumps(plan, indent=2))
+    selection = {platform: any(step["files"] for step in steps.values()) for platform, steps in plan["gpu"].items()}
+    selection.update(build=plan["build"], cpu=bool(plan["cpu"]))
+    print(f"GPU selection for {sha}: {selection}")
     cpu_plan = {group: plan["cpu"].get(group, {"files": [], "k": ""}) for group in ("codegen", "gluon")}
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"sha={sha}\nbuild={str(plan['build']).lower()}\n")
