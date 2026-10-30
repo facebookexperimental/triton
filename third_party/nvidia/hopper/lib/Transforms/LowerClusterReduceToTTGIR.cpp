@@ -38,25 +38,30 @@ SmallVector<Value> cloneCombine(OpBuilder &builder, ClusterReduceOp op,
       [&](Value result) { return mapping.lookupOrDefault(result); });
 }
 
-SmallVector<Value> combineValues(OpBuilder &builder, ClusterReduceOp op,
-                                 ValueRange lhs, ValueRange rhs) {
+FailureOr<SmallVector<Value>> combineValues(OpBuilder &builder,
+                                            ClusterReduceOp op, ValueRange lhs,
+                                            ValueRange rhs) {
   if (!isa<RankedTensorType>(lhs.front().getType()))
     return cloneCombine(builder, op, lhs, rhs);
 
-  assert(lhs.size() == 1 && rhs.size() == 1 &&
-         "tensor cluster reductions have one component");
+  if (lhs.size() != 1 || rhs.size() != 1) {
+    op.emitError("tensor cluster reductions require one component");
+    return failure();
+  }
   Block &combine = op.getCombineOp().front();
   Operation *scalarCombiner =
       combine.getTerminator()->getOperand(0).getDefiningOp();
-  assert(scalarCombiner && scalarCombiner->getNumOperands() == 2 &&
-         scalarCombiner->getNumResults() == 1 &&
-         "tensor cluster reductions require a binary scalar combiner");
+  if (!scalarCombiner || scalarCombiner->getNumOperands() != 2 ||
+      scalarCombiner->getNumResults() != 1) {
+    op.emitError("tensor cluster reductions require a binary scalar combiner");
+    return failure();
+  }
 
   OperationState state(op.getLoc(), scalarCombiner->getName());
   state.addOperands({lhs.front(), rhs.front()});
   state.addTypes(lhs.front().getType());
   state.addAttributes(scalarCombiner->getAttrs());
-  return {builder.create(state)->getResult(0)};
+  return SmallVector<Value>{builder.create(state)->getResult(0)};
 }
 
 SmallVector<Value> reduceTuple(OpBuilder &builder, ClusterReduceOp op,
@@ -193,8 +198,14 @@ LogicalResult lowerCollective(ClusterReduceOp op) {
   };
 
   SmallVector<Value> results = loadRank(0);
-  for (int peer = 1; peer < groupSize; ++peer)
-    results = combineValues(builder, op, results, loadRank(peer));
+  for (int peer = 1; peer < groupSize; ++peer) {
+    auto combined = combineValues(builder, op, results, loadRank(peer));
+    if (failed(combined))
+      return failure();
+    results = std::move(*combined);
+  }
+  // All participating threads must finish the local fold before the shared
+  // memory can be reused by a following collective or iteration.
   ttg::BarrierOp::create(builder, loc, ttg::AddrSpace::Local);
   op.replaceAllUsesWith(results);
   op.erase();
