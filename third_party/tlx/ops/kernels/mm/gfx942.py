@@ -1646,16 +1646,21 @@ def _candidate_configs(shape, enable_local_split_u=False, enable_global_split_k=
 
 
 @functools.lru_cache(maxsize=None)
-def _tuned(space, shape=None, enable_local_split_u=False):
-    """Autotuned GEMM kernel per search space."""
-    if space == "heuristic":
+def _tuned(space, shape=None, enable_local_split_u=False, fixed_split_k=None):
+    """Autotuned GEMM kernel per search space and invariance policy."""
+    if space not in ("heuristic", "full", "smoke"):
+        raise ValueError(f"Unknown gfx942 MM search space: {space}")
+    if fixed_split_k is not None:
+        # Keep the K step, packing, and pipeline fixed across shapes and layouts.
+        config = _config(128, 128, 64, 16, 4)
+        config.num_stages = 1
+        configs = [config]
+    elif space == "heuristic":
         configs = heuristic_config(*shape, enable_global_split_k=False)
     elif space == "full":
         configs = _candidate_configs(shape, enable_local_split_u)
-    elif space == "smoke":
-        configs = SMOKE_CONFIGS()
     else:
-        raise ValueError(f"Unknown gfx942 MM search space: {space}")
+        configs = SMOKE_CONFIGS()
     keys = ["M", "N", "K", "ADD_BIAS"]
     if space == "full":
         keys += ["stride_am", "stride_ak", "stride_bk", "stride_bn"]
@@ -1972,7 +1977,8 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    if (space in ("heuristic", "full") and (_global_split_k_shape(M, N, K) or (M, N, K) in _BF16_SPLIT_K_SHAPES)
+    if (fixed is None and space in ("heuristic", "full")
+            and (_global_split_k_shape(M, N, K) or (M, N, K) in _BF16_SPLIT_K_SHAPES)
             and _precheck_global_split_k(a, b, bias, out)):
         return _launch_global_split_k(a, b, bias, out, space)
 
@@ -1985,7 +1991,7 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
     # The planner was fitted on bias-free, K-contiguous 16-bit mm; addmm and
     # the measured split paths keep their own rules.
     fill = None
-    if (space == "heuristic" and bias is None and not _global_split_k_shape(M, N, K)
+    if (fixed is None and space == "heuristic" and bias is None and not _global_split_k_shape(M, N, K)
             and (M, N, K) not in _MEASURED_LOCAL_SPLIT_U_PLANS):
         fill = _fill_plan(M, N, K, allow_split=fixed is None and ENABLE_GLOBAL_SPLIT_K)
     if fill is not None and not (a.dtype in (torch.float16, torch.bfloat16) and a.stride(1) == 1 and b.stride(0) == 1
@@ -2008,7 +2014,7 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
         return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
 
     shape = (M, N, K) if space in ("heuristic", "full") else None
-    kernel = _tuned(space, shape, space == "full" and enable_local_split_u)
+    kernel = _tuned(space, shape, space == "full" and enable_local_split_u, fixed)
     fast_configs = None
     fast_key = None
     if space == "full":
