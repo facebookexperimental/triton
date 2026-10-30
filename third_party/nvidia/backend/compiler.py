@@ -127,14 +127,14 @@ def get_ptx_version_from_options(options, arch: int):
 
 def get_llvm_flags():
     """LLVM command line flags used throughout NVIDIA LLVM lowering."""
-    return ["nvptx-mad-wide-opt", "nvptx-short-ptr"]
+    return ["nvptx-mad-wide-opt"]
 
 
 @functools.lru_cache()
 def get_features(options, arch: int):
     ptx_version = get_ptx_version_from_options(options, arch)
 
-    # PTX 8.6 is the max version supported by llvm 979132a0.
+    # PTX 9.4 is the max version supported by LLVM 18f9e623.
     #
     # To check if a newer PTX version is supported, increase this value
     # and run a test.  If it's not supported, LLVM will print a warning
@@ -262,6 +262,7 @@ class CUDAOptions:
     enable_tree_reduction: bool = False
     enable_nvptx_v2i32: bool = False
     sched4reg: bool = False
+    disable_lsr: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -1384,7 +1385,7 @@ class CUDABackend(BaseBackend):
         features = get_features(options, cap_llvm)
         triple = 'nvptx64-nvidia-cuda'
         flags = get_llvm_flags()
-        llvm.attach_datalayout(llvm_mod, triple, proc, features, flags, "shortptr")
+        llvm.attach_datalayout(llvm_mod, triple, proc, features, flags, abi="shortptr")
         if options.enable_reflect_ftz:
             nvidia.set_nvvm_reflect_ftz(llvm_mod)
 
@@ -1435,8 +1436,10 @@ class CUDABackend(BaseBackend):
         if opt.enable_nvptx_v2i32:
             flags.append("nvptx-v2i32")
         canonicalize_gep = is_enabled(opt, "fpsan")
+        enable_fpsan = is_enabled(opt, "fpsan")
         ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep,
-                                    "shortptr", sched4reg=opt.sched4reg)
+                                    sched4reg=opt.sched4reg, enable_fpsan=enable_fpsan, disable_lsr=opt.disable_lsr,
+                                    abi="shortptr")
         # Find kernel names (there should only be one)
         names = re.findall(r".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)", ret)
         assert len(names) == 1
