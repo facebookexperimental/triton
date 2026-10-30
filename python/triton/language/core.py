@@ -3401,6 +3401,10 @@ def _add_reduction_docstr(
             docstr += f"""
     :param {multi_cta_arg}: if true, combine the CTA-local result across every CTA in the physical cluster.
         The kernel must supply CTA-local partials and use supported write patterns.
+        Distinct output and statistics arguments must not alias at runtime.
+        The caller must also provide disjoint row/base slices and nonoverlapping
+        rank-zero statistics; formation rejects obvious shared buffer roots but
+        does not prove runtime aliasing between separate arguments.
     :type {multi_cta_arg}: bool"""
 
         func.__doc__ = docstr.format(name=name)
@@ -3443,7 +3447,11 @@ def reduce(
         ReductionOrderingBase instance (e.g. ``tl.ReductionOrdering.INNER_TREE``) for deterministic,
         layout-independent ordering.
     :type reduction_ordering: None | ReductionOrderingBase
-    :param multi_cta: combine this CTA-local partial across the physical CTA cluster
+    :param multi_cta: combine this CTA-local partial across the physical CTA cluster.
+        Distinct output and statistics arguments must not alias at runtime.
+        The caller must also provide disjoint row/base slices and nonoverlapping
+        rank-zero statistics; formation rejects obvious shared buffer roots but
+        does not prove runtime aliasing between separate arguments.
     :type multi_cta: bool
 
     """
