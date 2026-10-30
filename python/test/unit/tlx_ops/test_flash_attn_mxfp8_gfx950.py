@@ -39,6 +39,22 @@ def _sdpa(q, k, v, causal, scale):
     )
 
 
+def _sdpa_fp32_math_with_grads(q, k, v, do, causal, scale):
+    # WORKAROUND: ROCm's BF16 flash SDPA intermittently corrupts a head's
+    # output and gradients at B4/H32/N8192, so this reference runs FP32 math
+    # SDPA. One head at a time bounds its N*N score memory.
+    results = [torch.empty_like(q) for _ in range(4)]
+    for b in range(q.shape[0]):
+        for h in range(q.shape[1]):
+            inputs = [x[b, h].detach().float().requires_grad_() for x in (q, k, v)]
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                out = torch.nn.functional.scaled_dot_product_attention(*inputs, is_causal=causal, scale=scale)
+            grads = torch.autograd.grad(out, inputs, do[b, h].float())
+            for result, value in zip(results, (out.detach(), *grads)):
+                result[b, h] = value
+    return results
+
+
 def _mxfp8_saved_square_inputs(out, *, whole=False):
     """Reconstruct legacy LSE for direct backward API tests."""
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
@@ -2097,18 +2113,16 @@ def test_flash_attn_mxfp8_gfx950_backward_meta_shapes(causal, n_ctx, scale, seed
     torch.manual_seed(seed)
     q, k, v = [(torch.randn((4, 32, n_ctx, 128), device="cuda", dtype=torch.bfloat16) * 0.5).requires_grad_()
                for _ in range(3)]
-    rq, rk, rv = [x.detach().clone().requires_grad_() for x in (q, k, v)]
     do = torch.randn_like(q)
     out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke")
-    reference = torch.nn.functional.scaled_dot_product_attention(rq, rk, rv, is_causal=causal, scale=scale)
     out.backward(do)
-    reference.backward(do)
+    reference = _sdpa_fp32_math_with_grads(q, k, v, do, causal, scale)
     if scale <= 0.5:
-        torch.testing.assert_close(out, reference, atol=0.2, rtol=0)
+        torch.testing.assert_close(out, reference[0], atol=0.2, rtol=0)
     # At scale 1.3, Q/K FP8 quantization changes sharp softmax peaks: the
     # decoded-input FP32 reference also exceeds 0.2 at isolated elements.
     # Bound direction and magnitude against BF16 for every scale and tensor.
-    for actual, expected in ((out, reference), (q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
+    for actual, expected in zip((out, q.grad, k.grad, v.grad), reference):
         assert actual.dtype == torch.bfloat16
         assert torch.isfinite(actual).all()
         actual, expected = actual.float(), expected.float()
