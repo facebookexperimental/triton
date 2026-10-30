@@ -1628,3 +1628,50 @@ def test_amd_wmma_layout_constexpr_cache_identity():
 
     assert cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]])) == cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]]))
     assert cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]])) != cache_key(tlx.amd_wmma_layout([[0, 1], [1, 0]]))
+
+
+@triton.jit
+def _marker_ordering_add(lhs, rhs):
+    return lhs + rhs
+
+
+@triton.jit
+def _marker_ordering_kernel(OP: tl.constexpr, MARKED: tl.constexpr, ORDER: tl.constexpr):
+    x = tl.arange(0, 32).to(tl.float32)
+    if OP == "reduce":
+        value = tl.reduce(x, 0, _marker_ordering_add, multi_cta=MARKED, reduction_ordering=ORDER)
+    elif OP == "sum":
+        value = tl.sum(x, 0, multi_cta=MARKED, reduction_ordering=ORDER)
+    elif OP == "max":
+        value = tl.max(x, 0, multi_cta=MARKED, reduction_ordering=ORDER)
+    else:
+        value = tl.min(x, 0, multi_cta=MARKED, reduction_ordering=ORDER)
+    anchor(value)
+
+
+@pytest.mark.parametrize("op", ["reduce", "sum", "max", "min"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("marked", [False, True])
+def test_multi_cta_default_ordering(op, strict, marked):
+    with triton.knobs.language.scope():
+        triton.knobs.language.strict_reduction_ordering = strict
+        module = run_parser(_marker_ordering_kernel, args=(op, marked, None))
+    text = module.str_nodebug()
+    assert ("tt.multi_cta" in text) == marked
+    assert ('reduction_ordering = "inner_tree"' in text) == (strict and not marked)
+
+
+@pytest.mark.parametrize("op", ["reduce", "sum", "max", "min"])
+@pytest.mark.parametrize("strict", [False, True])
+def test_multi_cta_rejects_explicit_ordering(op, strict):
+    with triton.knobs.language.scope():
+        triton.knobs.language.strict_reduction_ordering = strict
+        with pytest.raises(CompilationError) as exc_info:
+            run_parser(_marker_ordering_kernel, args=(op, True, tl.ReductionOrdering.INNER_TREE))
+        error = exc_info.value
+        while error.__cause__ is not None:
+            error = error.__cause__
+        assert isinstance(error, ValueError)
+        assert str(error) == "multi_cta reductions require ReductionOrdering.UNORDERED"
+        module = run_parser(_marker_ordering_kernel, args=(op, True, tl.ReductionOrdering.UNORDERED))
+    assert "tt.multi_cta" in module.str_nodebug()
