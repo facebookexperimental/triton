@@ -2161,4 +2161,11 @@ def torchtlx_heuristic_config(M, N, K, *, dtype, out_dtype, a_strides, b_strides
     if bf16 and (M, N, K) in _TORCHTLX_BF16_TILES:
         tile, extra = _TORCHTLX_BF16_TILES[M, N, K]
         return [_template_config(tile, **extra)]
+    # Underfilled grids take the occupancy-aware tile, but only where the
+    # planner itself prefers a direct tile: the template has no stream-K, and
+    # the measured split-K and odd-K rules beat a forced direct tile.
+    if (enable or bf16) and K % 8 == 0 and not _global_split_k_shape(M, N, K):
+        fill = _fill_plan(M, N, K, allow_split=True)
+        if fill is not None and fill.kwargs.get("SPLIT_K", 1) == 1 and not fill.kwargs.get("STREAM_K", False):
+            return [fill]
     return heuristic_config(M, N, K, enable_global_split_k=enable, enable_short_m_tuning=False)
