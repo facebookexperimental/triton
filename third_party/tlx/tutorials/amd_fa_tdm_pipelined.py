@@ -86,8 +86,9 @@ def _softmax_part0(qk, m_i, scale_ln2):
 @triton.jit
 def _softmax_part1(p, l_i, acc, alpha, P_DTYPE: tl.constexpr, FIXED_REFERENCE: tl.constexpr):
     if FIXED_REFERENCE:
-        # Retain two partial sums per row; exchange lanes only at the end.
-        terms = tl.reshape(p, [p.shape[0], p.shape[1] // 16, 2, 8])
+        # Keep partial sums in registers; exchange lanes only at the end.
+        parts: tl.constexpr = l_i.shape[1]
+        terms = tl.reshape(p, [p.shape[0], p.shape[1] // (parts * 8), parts, 8])
         terms = tl.sum(tl.sum(terms, 3), 1)
         l_i += terms
     else:
@@ -170,8 +171,8 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
         strides=[stride_om, tl.constexpr(1)],
         block_shape=[BLOCK_M, HEAD_SZ],
     )
-    if BLOCK_M == 64 and BLOCK_N == 128 and HEAD_SZ == 128:
-        # Narrow query tiles benefit from eight-element K-row padding.
+    if HEAD_SZ == 128:
+        # Pad K rows for the transposed WMMA operand loads.
         k_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(HEAD_SZ, 8)], [BLOCK_N, HEAD_SZ],
                                                                                      [1, 0])
         k_buf = tlx.local_alloc((BLOCK_N, HEAD_SZ), tlx.dtype_of(k_ptr), NUM_BUFFERS, layout=k_layout)
@@ -188,7 +189,9 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     if FIXED_REFERENCE:
-        l_i = tl.zeros([BLOCK_M, 2], dtype=tl.float32)
+        # Wider query tiles benefit from packed updates to four partial sums.
+        parts: tl.constexpr = min(4 if BLOCK_M >= 128 else 2, BLOCK_N // 8)
+        l_i = tl.zeros([BLOCK_M, parts], dtype=tl.float32)
     else:
         l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SZ], dtype=tl.float32)
