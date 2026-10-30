@@ -73,7 +73,8 @@ def test_mm_mxfp8_gfx950_public_numerics(shape, sf_layout):
     _check_sample(out, inputs, scale_bytes)
 
 
-@pytest.mark.parametrize("shape", [(1, 1, 128), (65, 73, 128), (129, 257, 256), (255, 130, 128)])
+@pytest.mark.parametrize("shape", [(1, 1, 128), (65, 73, 128), (128, 129, 128), (129, 128, 128), (129, 257, 256),
+                                   (255, 130, 128)])
 @pytest.mark.parametrize("sf_layout", ["natural", "cublas_blocked"])
 def test_mm_mxfp8_gfx950_ragged_mn(shape, sf_layout):
     from triton.tlx.ops import mm_mxfp8
@@ -90,6 +91,10 @@ def test_mm_mxfp8_gfx950_quad_odd_k_tail(sf_layout):
     from triton.tlx.ops import mm_mxfp8
 
     inputs, scale_bytes = _inputs(4096, 4096, 4224, sf_layout=sf_layout)
+    # Only the 33rd K tile contributes; skipping or misaddressing the cold tail
+    # must produce the wrong output rather than being masked by the first 32.
+    inputs[0][:, :4096] = 0
+    inputs[2][:, :4096] = 0
     out = mm_mxfp8(*inputs, sf_layout=sf_layout)
     for rows, cols in ((slice(0, 128), slice(0, 128)), (slice(-128, None), slice(-128, None))):
         reference = _reference_slice(inputs, scale_bytes, rows, cols)
