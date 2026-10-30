@@ -7,6 +7,8 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
+
 namespace mlir {
 
 #define GEN_PASS_DEF_NVGPUFORMMULTICTACOLLECTIVES
@@ -45,6 +47,58 @@ bool isSupportedScalarCombiner(triton::ReduceOp reduce) {
   Operation *combiner = reduce.getSingleCombiner();
   return combiner && isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp,
                          arith::MinNumFOp, arith::MinimumFOp>(combiner);
+}
+
+LogicalResult validateFunction(triton::FuncOp function, int axis, int size) {
+  bool sawLocalRank = false;
+  WalkResult result = function.walk([&](Operation *op) {
+    if (isa<triton::CallOp>(op)) {
+      op->emitError("multi_cta does not support calls in v1");
+      return WalkResult::interrupt();
+    }
+    if (isa<ttg::WarpSpecializeOp>(op)) {
+      op->emitError("multi_cta does not support warp specialization in v1");
+      return WalkResult::interrupt();
+    }
+    auto pid = dyn_cast<triton::GetProgramIdOp>(op);
+    if (!pid || pid.getAxisAsInt() != axis)
+      return WalkResult::advance();
+    if (pid->getResult(0).use_empty()) {
+      pid.emitError("cluster-axis program ID must define local rank");
+      return WalkResult::interrupt();
+    }
+    for (OpOperand &use : pid->getResult(0).getUses()) {
+      Operation *owner = use.getOwner();
+      Value divisor;
+      if (auto rem = dyn_cast<arith::RemSIOp>(owner);
+          rem && rem.getLhs() == pid->getResult(0))
+        divisor = rem.getRhs();
+      else if (auto rem = dyn_cast<arith::RemUIOp>(owner);
+               rem && rem.getLhs() == pid->getResult(0))
+        divisor = rem.getRhs();
+      else {
+        pid.emitError(
+            "cluster-axis program ID may only be used as local_rank = "
+            "program_id % P");
+        return WalkResult::interrupt();
+      }
+      APInt divisorValue;
+      if (!matchPattern(divisor, m_ConstantInt(&divisorValue)) ||
+          divisorValue.getSExtValue() != size) {
+        owner->emitError("local-rank divisor must equal physical cluster size ")
+            << size;
+        return WalkResult::interrupt();
+      }
+      sawLocalRank = true;
+    }
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return failure();
+  if (!sawLocalRank)
+    return function.emitError(
+        "multi_cta requires local_rank = program_id(cluster_axis) % P");
+  return success();
 }
 
 LogicalResult formCollective(triton::ReduceOp reduce, int axis, int size) {
@@ -136,12 +190,16 @@ public:
       return signalPassFailure();
     }
 
+    llvm::SmallPtrSet<Operation *, 4> validatedFunctions;
     for (triton::ReduceOp reduce : reductions) {
       auto function = reduce->getParentOfType<triton::FuncOp>();
       if (!function || reduce->getBlock() != &function.getBody().front()) {
         reduce.emitError("multi_cta reduce must be in the tt.func entry block");
         return signalPassFailure();
       }
+      if (validatedFunctions.insert(function).second &&
+          failed(validateFunction(function, cluster->axis, cluster->size)))
+        return signalPassFailure();
       if (reduce.hasDefinedOrdering() || !isSupportedScalarCombiner(reduce)) {
         reduce.emitError("multi_cta requires an unordered scalar f32 add, max, "
                          "or min reduction");

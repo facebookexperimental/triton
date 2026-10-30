@@ -16,6 +16,9 @@
 // CHECK-NOT: ttng.cluster_reduce
 module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @marked_sum(%input: tensor<32xf32, #blocked>) -> f32 {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %rank = arith.remsi %pid, %c2 : i32
     %sum = "tt.reduce"(%input) ({
     ^bb0(%lhs: f32, %rhs: f32):
       %result = arith.addf %lhs, %rhs : f32
