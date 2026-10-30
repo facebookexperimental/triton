@@ -84,6 +84,35 @@ def _marked_max_kernel(
 
 
 @triton.jit
+def _warp_specialized_marker_kernel(
+    x,
+    y,
+    n,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+):
+    local_rank = tl.program_id(1) % NUM_CTAS
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for off in tl.range(
+            local_rank * BLOCK_SIZE,
+            n,
+            NUM_CTAS * BLOCK_SIZE,
+            warp_specialize=True,
+    ):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        values = tl.load(x + cols, mask=cols < n, other=0.0).to(tl.float32)
+        acc += values
+
+    result = tl.sum(acc, axis=0, multi_cta=True)
+    for off in tl.range(
+            local_rank * BLOCK_SIZE,
+            n,
+            NUM_CTAS * BLOCK_SIZE,
+    ):
+        tl.store(y + off, result, mask=off < n)
+
+
+@triton.jit
 def _non_bool_marker_kernel(
     x,
     y,
@@ -144,6 +173,32 @@ def test_marked_max_is_supported():
         cluster_dims=(1, 4, 1),
     )
     assert "async_remote_shmem_store" in compiled.asm["ttgir"]
+
+
+def test_reduce_marker_rejects_warp_specialization():
+    with pytest.raises(Exception) as exc_info:
+        _compile(
+            _warp_specialized_marker_kernel,
+            {"BLOCK_SIZE": 1024, "NUM_CTAS": 4},
+            cluster_dims=(1, 4, 1),
+        )
+    assert "multi_cta does not support warp specialization in v1" in str(exc_info.value)
+
+
+def test_reduce_marker_rejects_warp_specialization_sm90_without_meta_ws():
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = False
+        with pytest.raises(Exception) as exc_info:
+            triton.compile(
+                ASTSource(
+                    fn=_warp_specialized_marker_kernel,
+                    signature={"x": "*fp32", "y": "*fp32", "n": "i32"},
+                    constexprs={"BLOCK_SIZE": 1024, "NUM_CTAS": 4},
+                ),
+                target=GPUTarget("cuda", 90, 32),
+                options={"num_warps": 4, "cluster_dims": (1, 4, 1)},
+            )
+    assert "multi_cta does not support warp specialization in v1" in str(exc_info.value)
 
 
 def test_reduce_marker_requires_bool():

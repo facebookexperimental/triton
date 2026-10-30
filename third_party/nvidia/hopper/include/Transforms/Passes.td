@@ -348,7 +348,11 @@ def NVGPUFormMultiCTACollectives
     internal ttng.cluster_reduce without changing loops or stores.
   }];
   let options = [Option<"computeCapability", "compute-capability", "int32_t",
-                        "0", "NVIDIA compute capability">];
+                        "0", "NVIDIA compute capability">,
+                 Option<
+                     "autoWarpSpecialization", "auto-warp-specialization",
+                     "bool", "false",
+                     "whether Meta automatic warp specialization is enabled">];
   let dependentDialects = ["mlir::arith::ArithDialect",
                            "mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect",
