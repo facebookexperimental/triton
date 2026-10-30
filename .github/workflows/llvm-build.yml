@@ -172,6 +172,7 @@ jobs:
         -DLLVM_INSTALL_UTILS=ON
         -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU"
         -DLLVM_ENABLE_ZSTD=OFF
+        -DLLVM_ENABLE_LZMA=OFF
         $extra_cmake_flags
         llvm-project/llvm
 
@@ -196,6 +197,7 @@ jobs:
         -DLLVM_INSTALL_UTILS=ON
         -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU"
         -DLLVM_ENABLE_ZSTD=OFF
+        -DLLVM_ENABLE_LZMA=OFF
         llvm-project/llvm
 
         ninja -C llvm-project/build check-mlir install-distribution
