@@ -627,6 +627,7 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
         tlx.tlx_passes.add_tlx_insert_require_layout(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
         tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
 
