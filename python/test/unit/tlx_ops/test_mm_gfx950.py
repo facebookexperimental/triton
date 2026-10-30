@@ -7,8 +7,8 @@ import torch
 import triton
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx import ops as tlx_ops
-from triton.tlx.ops import BitwiseInvarianceSpec, InvalidInput, UnsupportedOp
-from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
+from triton.tlx.ops import BitwiseInvarianceSpec, InvalidInput, Space, UnsupportedOp
+from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, FOCUS, operand
 from triton.tlx.ops.kernels.mm import gfx950 as _gfx950
 
 from mm_test_utils import run_mm_invariance_case
@@ -1981,6 +1981,37 @@ _INVARIANCE_SHAPES = [
     (2048, 512, 1001, (1001, 1), (1, 1001), "bf16"),
 ]
 
+_SMALL_M_INVARIANCE_FALLBACK_SHAPES = [
+    (10304, 20926),
+    (224, 20926),
+    (80, 80),
+    (56768, 64),
+    (65462, 96),
+]
+
+
+@pytest.mark.parametrize("n,k", _SMALL_M_INVARIANCE_FALLBACK_SHAPES)
+def test_mm_small_m_invariance_fallback_has_one_schedule(n, k):
+    invariance = BitwiseInvarianceSpec.dims("M")
+    plans = [
+        _gfx950.heuristic_config(m, n, k, torch.float16, 2, (k, 1), (1, k), invariance=invariance)
+        for m in range(1, 17)
+    ]
+    assert plans[0][0] == "register"
+    assert all(plan == plans[0] for plan in plans)
+
+
+def test_mm_small_m_invariance_fallback_is_bitwise():
+    m, n, k = 16, 56768, 64
+    torch.manual_seed(91)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.float16).T
+    space = Space("heuristic", invariance=BitwiseInvarianceSpec.dims("M"))
+    full = tlx_ops.mm(a, b, space=space)
+    for prefix in range(1, m):
+        actual = tlx_ops.mm(a[:prefix], b, space=space)
+        assert torch.equal(actual.view(torch.int16), full[:prefix].view(torch.int16)), prefix
+
 
 @pytest.mark.parametrize("spec", _INVARIANCE_SPECS)
 @pytest.mark.parametrize("m,n,k,a_strides,b_strides,dtype_name", _INVARIANCE_SHAPES)
@@ -2000,6 +2031,42 @@ def _assert_sequential_dispatch(dispatch, fixed=1):
         assert plan is not None and plan["SPLIT_K"] == fixed
     if path == "wave_grid":
         assert _gfx950._wave_grid_is_sequential(plan, fixed)
+
+
+@pytest.mark.parametrize("shape", FOCUS.shapes("gfx950"))
+def test_mm_invariance_focus_shapes_have_small_m_dispatch(shape):
+    invariance = BitwiseInvarianceSpec.dims("M")
+    dtype = torch.float16 if shape.dtype == "fp16" else torch.bfloat16
+    for m in range(1, 17):
+        dispatch = _gfx950.heuristic_config(
+            m,
+            shape.n,
+            shape.k,
+            dtype,
+            2,
+            shape.a_strides,
+            shape.b_strides,
+            invariance=invariance,
+        )
+        _assert_sequential_dispatch(dispatch)
+
+
+def test_mm_focus_shapes_do_not_use_small_m_invariance_fallback(monkeypatch):
+    def fail(*_args):
+        raise AssertionError("normal dispatch reached the invariance-only fallback")
+
+    monkeypatch.setattr(_gfx950, "_small_m_invariance_register_config", fail)
+    for shape in FOCUS.shapes("gfx950"):
+        dtype = torch.float16 if shape.dtype == "fp16" else torch.bfloat16
+        _gfx950.heuristic_config(
+            shape.m,
+            shape.n,
+            shape.k,
+            dtype,
+            2,
+            shape.a_strides,
+            shape.b_strides,
+        )
 
 
 def test_heuristic_prunes_split_k():
