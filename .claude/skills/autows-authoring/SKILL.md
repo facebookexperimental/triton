@@ -567,7 +567,9 @@ by `tl.constexpr`:
 - **Memory allocation kwargs:** `smem_alloc_algo`, `tmem_alloc_algo`,
   `smem_budget`, `smem_circular_reuse`
 - **Register budget options:** `minRegAutoWS`, `maxRegAutoWS`, `pingpongAutoWS`
-- **2-CTA / multi-CTA:** `multi_cta=True` and `cluster_dims >= 2` with WS
+- **Multi-CTA collectives:** `multi_cta=True` belongs on `tl.reduce`/
+  `tl.sum`/`tl.max`/`tl.min`, not `tl.range`; the current beta implementation
+  requires a 2- or 4-CTA physical cluster and rejects AutoWS
 - **`early_tma_store_lowering`**
 
 ### Dual-mode kernel pattern

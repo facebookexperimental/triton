@@ -12,12 +12,6 @@ import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
-RUN_MULTI_CTA_REDUCTION_TESTS = False
-pytestmark = pytest.mark.skipif(
-    not RUN_MULTI_CTA_REDUCTION_TESTS,
-    reason="Multi-CTA reduction tests are re-enabled in D123952662 after migration to reduce markers",
-)
-
 
 @triton.jit
 def _marked_sum_kernel(
@@ -590,6 +584,11 @@ def test_reduce_marker_requires_bool():
             break
         cause = cause.__cause__
     assert cause is not None
+
+
+def test_multi_cta_loop_marker_removed():
+    with pytest.raises(TypeError, match="unexpected keyword argument 'multi_cta'"):
+        tl.range(0, 1, multi_cta=True)
 
 
 @pytest.fixture
