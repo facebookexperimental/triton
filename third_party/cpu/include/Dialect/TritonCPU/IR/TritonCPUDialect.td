@@ -7,6 +7,7 @@ def TritonCPU_Dialect : Dialect {
   let name = "triton_cpu";
 
   let cppNamespace = "::mlir::triton::cpu";
+  let useStrictPropertiesInAssemblyFormat = 0;
 
   let hasOperationAttrVerify = 1;
 
