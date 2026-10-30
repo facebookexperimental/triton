@@ -22,11 +22,13 @@
  */
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LLVM.h"
+#include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -42,6 +44,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
@@ -66,7 +69,70 @@ bool isClusterReduceType(Type type) {
          tensorType.getNumElements() > 0;
 }
 
+bool dependsOnClusterAxis(Value value, int axis,
+                          llvm::DenseSet<Value> &visited) {
+  if (!visited.insert(value).second)
+    return false;
+
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Operation *parent = argument.getOwner()->getParentOp();
+    auto loop = dyn_cast_or_null<scf::ForOp>(parent);
+    if (!loop)
+      return !isa_and_nonnull<triton::FuncOp>(parent);
+    if (argument == loop.getInductionVar())
+      return dependsOnClusterAxis(loop.getLowerBound(), axis, visited) ||
+             dependsOnClusterAxis(loop.getUpperBound(), axis, visited) ||
+             dependsOnClusterAxis(loop.getStep(), axis, visited);
+    unsigned index = argument.getArgNumber() - 1;
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    return dependsOnClusterAxis(loop.getInitArgs()[index], axis, visited) ||
+           dependsOnClusterAxis(yield.getResults()[index], axis, visited);
+  }
+
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (isa<triton::nvgpu::ClusterCTAIdOp, triton::CallOp>(def))
+    return true;
+  if (auto pid = dyn_cast<triton::GetProgramIdOp>(def))
+    return pid.getAxisAsInt() == axis;
+  if (auto loop = dyn_cast<scf::ForOp>(def)) {
+    unsigned index = cast<OpResult>(value).getResultNumber();
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    if (dependsOnClusterAxis(loop.getLowerBound(), axis, visited) ||
+        dependsOnClusterAxis(loop.getUpperBound(), axis, visited) ||
+        dependsOnClusterAxis(loop.getStep(), axis, visited) ||
+        dependsOnClusterAxis(loop.getInitArgs()[index], axis, visited) ||
+        dependsOnClusterAxis(yield.getResults()[index], axis, visited))
+      return true;
+  }
+  if (auto ifOp = dyn_cast<scf::IfOp>(def)) {
+    unsigned index = cast<OpResult>(value).getResultNumber();
+    if (dependsOnClusterAxis(ifOp.getCondition(), axis, visited))
+      return true;
+    for (Region *region : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
+      if (region->empty())
+        continue;
+      auto yield = cast<scf::YieldOp>(region->front().getTerminator());
+      if (dependsOnClusterAxis(yield.getResults()[index], axis, visited))
+        return true;
+    }
+  }
+  // Captures inside unknown regions are not explicit operands. Without a
+  // model for their control flow, uniform execution cannot be established.
+  if (def->getNumRegions() != 0 && !isa<scf::ForOp, scf::IfOp>(def))
+    return true;
+  return llvm::any_of(def->getOperands(), [&](Value operand) {
+    return dependsOnClusterAxis(operand, axis, visited);
+  });
+}
+
 } // namespace
+
+bool mayDependOnClusterRank(Value value, int axis) {
+  llvm::DenseSet<Value> visited;
+  return dependsOnClusterAxis(value, axis, visited);
+}
 
 LogicalResult ClusterReduceOp::verify() {
   unsigned arity = getPartials().size();
@@ -99,6 +165,23 @@ LogicalResult ClusterReduceOp::verify() {
   auto function = getOperation()->getParentOfType<triton::FuncOp>();
   if (!function)
     return emitOpError("must be contained in a tt.func");
+  if (!triton::isKernel(cast<FunctionOpInterface>(function.getOperation())))
+    return emitOpError("must be contained in a kernel tt.func");
+  Block *entry = &function.getBody().front();
+  if (getOperation()->getBlock() != entry) {
+    auto loop =
+        dyn_cast_or_null<scf::ForOp>(getOperation()->getBlock()->getParentOp());
+    if (!loop || loop->getBlock() != entry)
+      return emitOpError(
+          "must be in the function entry block or one directly nested "
+          "scf.for");
+    for (Value bound :
+         {loop.getLowerBound(), loop.getUpperBound(), loop.getStep()}) {
+      if (mayDependOnClusterRank(bound, getClusterAxis()))
+        return emitOpError(
+            "loop bounds and step must not depend on cluster rank");
+    }
+  }
   auto module = getOperation()->getParentOfType<ModuleOp>();
   if (!module)
     return emitOpError("must be contained in a module");
