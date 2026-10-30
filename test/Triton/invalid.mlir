@@ -618,6 +618,34 @@ module {
 
 // -----
 
+module {
+  tt.func @dot_scaled_fp6_lhs_non_kpack(
+    %a: tensor<16x32xi8>, %sa: tensor<16x1xi8>,
+    %b: tensor<32x16xi8>, %sb: tensor<16x1xi8>,
+    %c: tensor<16x16xf32>) -> tensor<16x16xf32> {
+    // expected-error @below {{fp6 lhs operand must be packed along K (lhs_k_pack must be true)}}
+    %d = tt.dot_scaled %a scale %sa, %b scale %sb, %c lhs = e2m3 rhs = e3m2 {fastMath = false, lhs_k_pack = false} :
+        tensor<16x32xi8>, tensor<16x1xi8> * tensor<32x16xi8>, tensor<16x1xi8> -> tensor<16x16xf32>
+    tt.return %d : tensor<16x16xf32>
+  }
+}
+
+// -----
+
+module {
+  tt.func @dot_scaled_fp6_rhs_non_kpack(
+    %a: tensor<16x32xi8>, %sa: tensor<16x1xi8>,
+    %b: tensor<32x16xi8>, %sb: tensor<16x1xi8>,
+    %c: tensor<16x16xf32>) -> tensor<16x16xf32> {
+    // expected-error @below {{fp6 rhs operand must be packed along K (rhs_k_pack must be true)}}
+    %d = tt.dot_scaled %a scale %sa, %b scale %sb, %c lhs = e2m3 rhs = e3m2 {fastMath = false, rhs_k_pack = false} :
+        tensor<16x32xi8>, tensor<16x1xi8> * tensor<32x16xi8>, tensor<16x1xi8> -> tensor<16x16xf32>
+    tt.return %d : tensor<16x16xf32>
+  }
+}
+
+// -----
+
 tt.func @unsplat_invalid(%arg0: tensor<128xf32>) {
   // expected-error @below {{source tensor must have exactly one element}}
   %0 = tt.unsplat %arg0 : tensor<128xf32>
