@@ -2500,6 +2500,7 @@ def _attn_bwd_ws(
     REUSE_DP_FOR_DQ: tl.constexpr = (BLOCK_M1 == 128) and (HEAD_DIM == 128) and (NUM_CTAS == 1)
 
     USE_2CTA: tl.constexpr = NUM_CTAS == 2
+    REDUCTION_WARPS: tl.constexpr = 4  # dQ reduction task
 
     # Compute bytes per element for each tensor type
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
@@ -2598,6 +2599,13 @@ def _attn_bwd_ws(
         dot_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)  # noqa: F841
         ds_peer_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)  # noqa: F841
         ds_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)  # noqa: F841
+        # End-of-kernel sync, replacing the compiler's cluster sync: the reduction
+        # task joins the default task on a named barrier (ID 15 is above the
+        # compiler's partition barrier IDs), then both CTAs' default tasks arrive
+        # on each CTA's end_bar.
+        END_NAMED_BAR: tl.constexpr = 15
+        END_NAMED_BAR_THREADS: tl.constexpr = (tlx.num_warps() + REDUCTION_WARPS) * 32  # default + reduction
+        end_bar = tlx.alloc_barriers(num_barriers=1, arrive_count=NUM_CTAS)
 
     tile_count = 0
 
@@ -2775,7 +2783,7 @@ def _attn_bwd_ws(
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
 
-    with tlx.async_tasks(exclusive=True, less_reg_mma=True):
+    with tlx.async_tasks(exclusive=True, less_reg_mma=True, no_ending_cluster_sync=USE_2CTA):
         # compute
         with tlx.async_task("default"):
             blk_idx = 0
@@ -2984,9 +2992,22 @@ def _attn_bwd_ws(
             else:
                 tlx.barrier_arrive(k_empties[kv_buf_id])
                 tlx.barrier_arrive(dk_empties[kv_buf_id])
+            if USE_2CTA:
+                # End-of-kernel sync (no_ending_cluster_sync): wait for this CTA's
+                # reduction to finish with TMEM, then rendezvous with the peer's
+                # default task, so neither CTA deallocates TMEM or exits while its
+                # own tasks or the peer still need it. The reduction is the only other
+                # task that reads TMEM or sends the peer arrives it doesn't wait on.
+                # The local step uses a named barrier because an mbarrier shared with
+                # the reduction task makes ptxas spill across setmaxnreg. Arriving on
+                # both CTAs' end_bar with constant ranks avoids needing the peer rank.
+                tlx.named_barrier_wait(END_NAMED_BAR, END_NAMED_BAR_THREADS)
+                tlx.barrier_arrive(end_bar[0], 1, remote_cta_rank=0)
+                tlx.barrier_arrive(end_bar[0], 1, remote_cta_rank=1)
+                tlx.barrier_wait(end_bar[0], 0)
 
         # reduction
-        with tlx.async_task(num_warps=4, registers=96):
+        with tlx.async_task(num_warps=REDUCTION_WARPS, registers=96):
             blk_idx = 0
             curr_m = start_m
             step_m = BLOCK_M1
@@ -3061,6 +3082,12 @@ def _attn_bwd_ws(
                 # Increment pointers.
                 curr_m += step_m
                 blk_idx += 1
+
+            if USE_2CTA:
+                # Done with TMEM and remote arrives (see the end-of-kernel sync in the
+                # default task). The store wait below only guards SMEM, which stays
+                # live until this warp exits.
+                tlx.named_barrier_arrive(END_NAMED_BAR, END_NAMED_BAR_THREADS)
 
             # Wait for the final tile
             tlx.async_descriptor_store_wait(0)
