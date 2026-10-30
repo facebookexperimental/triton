@@ -95,8 +95,8 @@ LogicalResult ClusterReduceOp::verify() {
     return emitOpError("cluster_axis must be in the range [0, 2]");
 
   auto function = getOperation()->getParentOfType<triton::FuncOp>();
-  if (!function || getOperation()->getBlock() != &function.getBody().front())
-    return emitOpError("must be directly in the tt.func entry block");
+  if (!function)
+    return emitOpError("must be contained in a tt.func");
   auto module = getOperation()->getParentOfType<ModuleOp>();
   if (!module)
     return emitOpError("must be contained in a module");
