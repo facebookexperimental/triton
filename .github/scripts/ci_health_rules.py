@@ -13,6 +13,8 @@ page_data() builds the data.json the page renders, one section per tab:
   nightly  the nightly release and the bench dashboard's perf events.
   pr       the latest run of each PR in the last 24 h, tagged by whose it is.
   ops      GPU hours, job durations and setup failures.
+  usage    GPU hours per day by activity (L1, L2, TritonBench, other tests, setup) and trigger.
+The runner occupancy (busy, idle and waiting per 15 minutes) is shared by every branch, so it sits beside them.
   bump     is the branch's Meta LLVM pin current, what a newer fork release
            would add, the open bump issues, and the pin's recent changes.
 No I/O.
@@ -20,6 +22,7 @@ No I/O.
 import collections
 import datetime as dt
 import re
+import zoneinfo
 
 #: The reusable workflows gpu-tests.yml calls, one per GPU. Their step names define the test steps.
 GPU_WORKFLOWS = ("mi350.yml", "b200.yml", "h100.yml")
@@ -112,6 +115,24 @@ SLOW_TOP = 10
 OUTCOMES = ("passed", "test", "build", "setup", "cancelled")
 #: A job that ran on no push for this long is retired (disabled or removed), and its failures no longer count.
 RETIRE_DAYS = 7
+#: Usage tab activities, in stacking order. A test group maps to one in ACTIVITY (else "Other tests"); a step with no
+#: group, and job time outside any step, is setup.
+ACTIVITIES = ("L1", "TritonBench", "Other tests", "L2", "Setup & overhead")
+ACTIVITY = {"TLX core": "L1", "TritonBench": "TritonBench", "TLX perf": "L2", "TLX ops bench": "L2"}
+#: Usage tab triggers, with their labels; any other event counts as "nightly & manual".
+USAGE_TRIGGERS = {"pull_request": "PR", "push": "push", "schedule": "scheduled"}
+#: Runner limit per GPU label over time (UTC, from that instant on), where it is known. B200 moved to an 8-runner
+#: scale set on 2026-10-27; before that its limit was not configured knowingly and held at the most jobs ever seen at
+#: once. A GPU without an entry uses the most jobs seen at once in the window.
+RUNNER_POOLS = {
+    "B200": [("2026-09-30T00:00:00Z", 6), ("2026-10-01T00:00:00Z", 5), ("2026-10-06T00:00:00Z", 4),
+             ("2026-10-06T06:22:00Z", 3), ("2026-10-27T02:54:00Z", 8)]
+}
+#: The occupancy grid's time zone and cell width. Most of the team works in Pacific time.
+OCC_TZ = zoneinfo.ZoneInfo("America/Los_Angeles")
+OCC_CELL_MIN = 15
+#: A queued job counts as waiting only after this many minutes: starting a runner normally takes a minute or two.
+WAIT_GRACE_MIN = 2
 
 #: Workflows whose runs hold GPU jobs.
 #: The TLX ops perf bench, run on each GPU after every nightly release ("b200 / bench").
@@ -940,6 +961,134 @@ def select_view(runs, asof):
     return {"days": [{"day": d, "triggers": by_day[d]} for d in days], "anomalies": anomalies}
 
 
+def activity_of(step_name):
+    g = group_of(step_name)
+    return "Setup & overhead" if g is None else ACTIVITY.get(g, "Other tests")
+
+
+def usage_view(runs, asof):
+    """GPU hours per day over OPS_DAYS, per GPU, by activity and by trigger. A job's hours count on the UTC day it
+    started; its steps go to their activities, clipped to the job, and time outside any step to setup. A step with no
+    end time ran until the next step started, or until the job ended."""
+    days = ops_days(t(asof))
+    act = {g: {d: dict.fromkeys(ACTIVITIES, 0.0) for d in days} for g in GPUS}
+    trig = {g: {d: collections.Counter() for d in days} for g in GPUS}
+    for r in runs:
+        if r.get("wf") not in GPU_RUN_WORKFLOWS or r["created_at"] > asof or not r.get("jobs"):
+            continue
+        for g, j in _gpu_jobs(r):
+            d = (j.get("started_at") or "")[:10]
+            if not _ran(j) or d not in act[g]:
+                continue
+            ja, jb = t(j["started_at"]), t(j["completed_at"])
+            total, counted = mins(j["started_at"], j["completed_at"]), 0.0
+            starts = [s.get("started_at") for s in j["steps"]]
+            for k, s in enumerate(j["steps"]):
+                if not s.get("started_at"):
+                    continue
+                end = s.get("completed_at") or next((x for x in starts[k + 1:] if x), None) or j["completed_at"]
+                m = max(0.0, (min(t(end), jb) - max(t(s["started_at"]), ja)).total_seconds() / 60)
+                act[g][d][activity_of(s["name"])] += m
+                counted += m
+            act[g][d]["Setup & overhead"] += max(0.0, total - counted)
+            trig[g][d][USAGE_TRIGGERS.get(r["event"], "nightly & manual")] += total
+    return {
+        "days": [{"day": d, **{g: {k: round(v / 60, 2)
+                                   for k, v in act[g][d].items()}
+                               for g in GPUS}}
+                 for d in days],
+        "triggers": [{"day": d, **{g: {k: round(v / 60, 2)
+                                       for k, v in trig[g][d].items()}
+                                   for g in GPUS}}
+                     for d in days],
+    }
+
+
+def _pool_at(gpu, minute_ts, observed):
+    steps = RUNNER_POOLS.get(gpu)
+    if not steps:
+        return observed
+    n = steps[0][1]
+    for since, size in steps:
+        if t(since) <= minute_ts:
+            n = size
+    return n
+
+
+def occupancy_view(runs, asof):
+    """Runner occupancy per GPU in OCC_CELL_MIN-minute cells over OPS_DAYS, from midnight (OCC_TZ) of the first day.
+    Per cell: the most jobs running, exact busy runner-minutes, idle minutes (no job running), minutes with every
+    runner busy, runner capacity (pool minutes), and minutes and job-minutes of waiting with every runner busy (full)
+    or not (part). A job waits from WAIT_GRACE_MIN after it was queued until it started. Every branch and trigger
+    counts, since they share the runners. As in concurrency_view, cells stop where the oldest recent run without
+    stored jobs began."""
+    now = t(asof)
+    first = now.astimezone(OCC_TZ).date() - dt.timedelta(days=OPS_DAYS - 1)
+    lo = dt.datetime.combine(first, dt.time(), OCC_TZ).astimezone(dt.timezone.utc)
+    recent = iso(now - dt.timedelta(hours=OPS_HOURS))
+    hi = min([
+        t(r["created_at"])
+        for r in runs
+        if r.get("wf") in GPU_RUN_WORKFLOWS and r.get("jobs") is None and recent <= r["created_at"] <= asof
+    ] + [now])
+    n = max(0, int((hi - lo).total_seconds() // 60))
+    n -= n % OCC_CELL_MIN
+    spans = {g: [] for g in GPUS}
+    for r in runs:
+        if r.get("wf") not in GPU_RUN_WORKFLOWS or r["created_at"] > asof:
+            continue
+        for g, j in _gpu_jobs(r):
+            if _ran(j):
+                spans[g].append((t(j.get("created_at") or j["started_at"]), t(j["started_at"]), t(j["completed_at"])))
+    minute = lambda x: int((x - lo).total_seconds() // 60)
+
+    def most_at_once(intervals):
+        """Per minute, the most intervals open at any moment of it, so a job shorter than a minute still counts."""
+        out, c, prev = [0] * n, 0, lo
+        for x, d in sorted([(a, 1) for a, b in intervals if a < b] + [(b, -1) for a, b in intervals if a < b],
+                           key=lambda e: (e[0], e[1])):
+            if c and x > prev:
+                for i in range(max(0, minute(prev)), min(n, -(-int((x - lo).total_seconds()) // 60))):
+                    out[i] = max(out[i], c)
+            c, prev = c + d, x
+        return out
+
+    out = {"t0": iso(lo), "cell_min": OCC_CELL_MIN, "tz": OCC_TZ.key, "gpus": {}}
+    cells = n // OCC_CELL_MIN
+    width = OCC_CELL_MIN * 60
+    for g in GPUS:
+        run = most_at_once([(a, b) for q, a, b in spans[g]])
+        wait = most_at_once([(q + dt.timedelta(minutes=WAIT_GRACE_MIN), a) for q, a, b in spans[g]])
+        busy = [0.0] * cells
+        for q, a, b in spans[g]:
+            # Exact busy seconds per cell, so busy hours equal the jobs' runner time.
+            x, end = max(a, lo), min(b, lo + dt.timedelta(minutes=n))
+            while x < end:
+                k = int((x - lo).total_seconds() // width)
+                y = min(end, lo + dt.timedelta(seconds=width * (k + 1)))
+                busy[k] += (y - x).total_seconds()
+                x = y
+        observed = max(run, default=0)
+        pool = [_pool_at(g, lo + dt.timedelta(minutes=i), observed) for i in range(n)]
+        c = collections.defaultdict(list)
+        for k in range(cells):
+            m = range(k * OCC_CELL_MIN, (k + 1) * OCC_CELL_MIN)
+            full = [i for i in m if wait[i] and run[i] >= pool[i]]
+            part = [i for i in m if wait[i] and run[i] < pool[i]]
+            c["run"].append(max(run[i] for i in m))
+            c["busy"].append(round(busy[k] / 60, 2))
+            c["idle"].append(sum(1 for i in m if run[i] == 0))
+            c["fullm"].append(sum(1 for i in m if run[i] >= pool[i]))
+            c["pool"].append(max(pool[i] for i in m))
+            c["cap"].append(sum(pool[i] for i in m))
+            c["wfull"].append(len(full))
+            c["wpart"].append(len(part))
+            c["jfull"].append(sum(wait[i] for i in full))
+            c["jpart"].append(sum(wait[i] for i in part))
+        out["gpus"][g] = {"pool_known": g in RUNNER_POOLS, **c}
+    return out
+
+
 def bump_view(line):
     """The Meta LLVM tab of one tracked branch, from its bump.json entry (None before the first snapshot).
     status: current (pins the newest fork release), new (a newer release is not pinned yet) or unknown."""
@@ -959,7 +1108,7 @@ def page_data(runs, asof, bench, bump=None):
         # The bench dashboard's perf events come from main's nightly bench.
         branches[b] = {
             "main": main, "lit": lit_view(rs, asof, b), "nightly": nightly_view(rs, asof, bench if b == "main" else {}),
-            "pr": pr_view(rs, asof, main, b), "ops": {**ops_view(rs, asof), "concurrency": concurrency}, "bump":
-            bump_view(((bump or {}).get("lines") or {}).get(b))
+            "pr": pr_view(rs, asof, main, b), "ops": {**ops_view(rs, asof), "concurrency": concurrency}, "usage":
+            usage_view(rs, asof), "bump": bump_view(((bump or {}).get("lines") or {}).get(b))
         }
-    return {"asof": asof, "branches": branches}
+    return {"asof": asof, "branches": branches, "occupancy": occupancy_view(runs, asof)}

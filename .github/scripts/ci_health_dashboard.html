@@ -69,6 +69,18 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 .note{font-size:12px;color:var(--text-muted);margin:8px 0 0}
 .empty{color:var(--text-muted);font-size:13px;margin:6px 0 0}
 .tip{position:fixed;pointer-events:none;background:var(--surface-1);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;padding:7px 9px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.12);opacity:0;z-index:10;max-width:360px;white-space:pre-line}
+/* Usage tab: activity colors (categorical slots 1-4, validated in this order) and the occupancy grid. */
+.viz-root{--a0:#2a78d6;--a1:#eb6834;--a2:#1baf7a;--a3:#eda100}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) .viz-root{--a0:#3987e5;--a1:#d95926;--a2:#199e70;--a3:#c98500}}
+:root[data-theme="dark"] .viz-root{--a0:#3987e5;--a1:#d95926;--a2:#199e70;--a3:#c98500}
+.tile .p{font-size:11.5px;color:var(--text-muted);margin-top:4px;border-top:1px solid var(--grid);padding-top:4px;font-variant-numeric:tabular-nums}.tile .p b{color:var(--text-secondary);font-weight:600}
+table.l1l2{table-layout:fixed}table.l1l2 th:first-child{width:90px}table.l1l2 tr:first-child th{color:var(--text-primary);font-size:13px}table.l1l2 td{font-size:13px}
+.q15{display:grid;grid-template-columns:104px repeat(96,minmax(0,1fr));gap:1px;margin-top:4px;align-items:center}
+.q15 .d{font-size:11px;color:var(--text-secondary);font-family:ui-monospace,monospace;white-space:nowrap}.q15 .d .muted{font-size:10px}
+.q15 .h{font-size:9.5px;color:var(--text-muted);font-family:ui-monospace,monospace;grid-column:span 12;border-left:1px solid var(--axis);padding-left:2px}
+.q15 .c{border-radius:2px}.q15 .c.idle{background:var(--wash)}.q15 .c.hr{box-shadow:inset 1px 0 0 var(--axis)}.q15 .c:hover{outline:1.5px solid var(--text-primary)}
+.idlebar span.idle{background:var(--wash);color:var(--text-secondary);border:1px solid var(--grid)}
+.gtitle{font-size:13px;font-weight:650;margin:14px 0 2px}
 </style></head><body><div class="viz-root"><div class="wrap">
 <header><div><h1>CI health: facebookexperimental/triton</h1>
 <p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every hour</p></div>
@@ -83,6 +95,7 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <span class="muted">Health</span><nav class="tabs" role="tablist" aria-label="Health">
 <button role="tab" data-tab="perf" aria-selected="false">Perf <span class="badge" id="b-perf"></span></button>
 <button role="tab" data-tab="ops" aria-selected="false">Operations <span class="badge" id="b-ops"></span></button>
+<button role="tab" data-tab="usage" aria-selected="false">Usage</button>
 <button role="tab" data-tab="llvm" aria-selected="false">LLVM pins <span class="badge" id="b-llvm"></span></button>
 </nav>
 </div>
@@ -122,12 +135,43 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 </section>
 
 <section id="ops" role="tabpanel" hidden>
-<div class="shead"><h2>Operations</h2><span class="q">Is CI itself healthy, and what does it cost?</span><span class="owner">Owner: CI maintainers</span></div>
+<div class="shead"><h2>Operations</h2><span class="q">Is CI itself healthy?</span><span class="owner">Owner: CI maintainers</span></div>
 <div class="grid4" style="margin-top:14px" id="o-tiles"></div>
 <div class="card"><h3>Smart trigger: which GPU types each run tested</h3><div id="o-select-a"></div>
 <div class="legend"><span><i class="sw" style="background:var(--ord-3)"></i>all 3</span><span><i class="sw" style="background:var(--ord-2)"></i>2 of 3</span><span><i class="sw" style="background:var(--ord-1)"></i>1 of 3</span><span><i class="sw" style="background:var(--ord-0)"></i>none (build skipped too)</span></div>
 <div id="o-select"></div>
 <p class="note">The <code>select</code> job picks the GPU types (H100, B200, MI350) whose code a change touches. PR and push runs should skip the rest; a "GPU suite" is one GPU type's tests in one run. Scheduled and manual runs must test all three. A fallback means the changed paths were unavailable, so every suite ran.</p></div>
+<div class="card"><h3 id="o-jobs-h">Job duration (minutes)</h3><div id="o-jobs"></div>
+<p class="note">The slowest 10% shows stalls the median hides, such as a wheel download that stalls.</p></div>
+<div class="card"><h3 id="o-slow-h">Slowest tests, main pushes (seconds)</h3><div id="o-slow"></div>
+<p class="note">From pytest's <code>--durations</code> list in each GPU test job of a push to main: each step prints only its 25 slowest test phases (setup, call or teardown), so "Runs" counts how often a test was among them. A test's time is the sum of its listed phases. Ranked by median time.</p></div>
+<div class="card"><h3>Setup failures, last 7 days, by step</h3><div id="o-setup"></div></div>
+</section>
+
+<section id="usage" role="tabpanel" hidden>
+<div class="shead"><h2>Usage</h2><span class="q">How much GPU time does CI use, on what, and how much room is left?</span><span class="owner">Owner: CI maintainers</span></div>
+<div class="grid4" style="margin-top:14px" id="u-tiles"></div>
+<div class="card"><h3>What L1 and L2 test</h3>
+<table class="l1l2">
+<tr><th></th><th>L1: correctness</th><th>L2: perf</th></tr>
+<tr><th>Test files</th><td><code>python/test/unit/tlx_ops/</code><br><code>python/test/unit/language/test_tlx_*</code></td><td><code>python/test/tlx_benchmark/bench_&lt;op&gt;.py</code>, run in CI through <code>test_ops_perf.py</code></td></tr>
+<tr><th>Runs</th><td>Every PR and push, on the GPUs its changes touch; every 6 hours on B200, H100 and MI350</td><td>Once a night, after the nightly release, on B200, H100 and MI350</td></tr>
+<tr><th>Notes</th><td>A PR that only changes kernels runs just the affected files. Up to 4 pytest workers share the GPU.</td><td>Each op has a 45-minute timeout. Results are on the <a href="../bench/">TLX ops bench dashboard</a>.</td></tr>
+</table></div>
+<div class="card"><h3>GPU hours per day, by what they ran</h3>
+<div class="legend" id="u-legend"></div>
+<svg class="bars" id="u-act" viewBox="0 0 720 190"></svg>
+<p class="note">Job start-to-finish time on GPU runners, every trigger, split by step. Days are UTC, and a job's hours count on the day it started. L1 is the "Run TLX core tests" step: <code>python/test/unit/tlx_ops/</code> plus the TLX language tests. L2 is the nightly <code>python/test/tlx_benchmark</code> run, and the 6-hourly perf step the GPU test jobs ran until #4044. Setup &amp; overhead is every step that is not a test (checkout, wheel download and install, environment setup, test selection), plus job time outside any step.</p></div>
+<div class="card"><h3>How busy the GPU runners are, and when jobs wait for one</h3>
+<div class="legend"><span class="muted">Share of all runner time in the range:</span><span><i class="sw" style="background:var(--series-1)"></i>busy</span><span><i class="sw" style="background:var(--wash);border:1px solid var(--grid)"></i>idle</span></div>
+<div id="u-occ"></div>
+<p class="note" style="font-size:13px;color:var(--text-secondary)">How to read the grid: each row is a day and each small box is 15 minutes, in Pacific time. The blue shades step up with the share of runners busy. A red box has a minute when every runner was busy and a job had waited 2+ min. A yellow box has a minute when a job had waited 2+ min while fewer of our jobs ran than the pool size. Hover over a box for the counts.</p>
+<div class="legend"><span><i class="sw" style="background:var(--wash);border:1px solid var(--grid)"></i>no jobs running</span><span><i class="sw" style="background:var(--ord-0)"></i>under a third of the runners busy</span><span><i class="sw" style="background:var(--ord-2)"></i>a third to two thirds busy</span><span><i class="sw" style="background:var(--ord-3)"></i>more than two thirds busy</span><span><i class="sw" style="background:var(--critical)"></i>all runners busy, a job waiting 2+ min</span><span><i class="sw" style="background:var(--warning)"></i>a job waiting 2+ min, runners look free</span></div>
+<div id="u-heat"></div>
+<p class="note">Yellow: our jobs waited while fewer of our jobs ran than the pool size. The job data does not show why.</p>
+<p class="note">The number after each date is the pool size that day. B200 has had 8 runners since the evening of Oct 26 (Pacific); before that, the number is the most jobs ever seen at once. H100 and MI350 limits are not visible to us, so theirs is the most jobs seen at once in the window. Every branch and trigger counts, since they share the runners, so this card does not change with the branch filter. Only this repository's jobs count: other repositories share some runner pools.</p></div>
+<div class="card"><h3>GPU hours by trigger</h3><div id="u-trig"></div>
+<p class="note">PR runs carry most of the load. Cancelled runs (superseded PR pushes) count here, and are broken out in the outcome chart below.</p></div>
 <div class="card"><h3>GPU hours and runs per day, by run outcome</h3>
 <div class="legend"><span><i class="sw" style="background:var(--good)"></i>passed</span><span><i class="sw" style="background:var(--critical)"></i>test failure</span><span><i class="sw" style="background:var(--warning)"></i>build failure</span><span><i class="sw" style="background:var(--serious)"></i>setup failure</span><span><i class="sw" style="background:var(--neutral)"></i>cancelled</span></div>
 <h3 class="muted" style="margin-top:10px">GPU hours</h3><svg class="bars" id="o-hours" viewBox="0 0 720 190"></svg>
@@ -145,11 +189,6 @@ svg.bars{width:100%;height:auto;display:block}svg.bars text{fill:var(--text-mute
 <div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>B200</span><span><i class="sw" style="background:var(--series-2)"></i>H100</span><span><i class="sw" style="background:var(--series-3)"></i>MI350</span><span class="muted">peak per day (per hour, in the 3-day range)</span></div>
 <svg class="bars" id="o-conc" viewBox="0 0 720 190"></svg>
 <p class="note">The most GPU jobs of each type running at the same moment, from job start and finish times; hover for the time-weighted average and the most jobs waiting for a runner. Every branch and trigger counts, since they share the runners. Only this repository's CI workflows are counted: other repositories share some runner pools, so a flat peak with jobs waiting means the pool is full, not that demand stopped.</p></div>
-<div class="card"><h3 id="o-jobs-h">Job duration (minutes)</h3><div id="o-jobs"></div>
-<p class="note">The slowest 10% shows stalls the median hides, such as a wheel download that stalls.</p></div>
-<div class="card"><h3 id="o-slow-h">Slowest tests, main pushes (seconds)</h3><div id="o-slow"></div>
-<p class="note">From pytest's <code>--durations</code> list in each GPU test job of a push to main: each step prints only its 25 slowest test phases (setup, call or teardown), so "Runs" counts how often a test was among them. A test's time is the sum of its listed phases. Ranked by median time.</p></div>
-<div class="card"><h3>Setup failures, last 7 days, by step</h3><div id="o-setup"></div></div>
 </section>
 
 <section id="llvm" role="tabpanel" hidden>
@@ -267,8 +306,9 @@ function renderPR(list,branch="main"){
 }
 
 const GPUS=["H100","B200","MI350"];
-// The Operations tab's time ranges in days, as in OPS_RANGES of ci_health_rules.py; the 3-day range draws hourly charts.
-const RANGES=[3,7,14,30];let RANGE=30;
+// The Operations and Usage tabs' time ranges in days, as in OPS_RANGES of ci_health_rules.py; the 3-day range draws
+// hourly charts.
+const RANGES=[3,7,14,30];let RANGE=7;
 // The Operations tab's GPU filter: "All" or one of GPUS.
 let OGPU="All",BRANCH="main";
 // The view lives in the URL hash, "#<tab>?branch=...&gpu=...&range=...", so a link opens the same view. Defaults
@@ -278,7 +318,7 @@ let TAB=VIEW.tab;
 if(RANGES.includes(+VIEW.p.get("range")))RANGE=+VIEW.p.get("range");
 if(GPUS.includes(VIEW.p.get("gpu")))OGPU=VIEW.p.get("gpu");
 function saveView(){const p=new URLSearchParams();
-  if(BRANCH!=="main")p.set("branch",BRANCH);if(OGPU!=="All")p.set("gpu",OGPU);if(RANGE!==30)p.set("range",RANGE);
+  if(BRANCH!=="main")p.set("branch",BRANCH);if(OGPU!=="All")p.set("gpu",OGPU);if(RANGE!==7)p.set("range",RANGE);
   history.replaceState(null,"","#"+(TAB||"main")+(p.size?"?"+p:""))}
 const OUT=["passed","test","build","setup","cancelled"],OUT_C=["var(--good)","var(--critical)","var(--warning)","var(--serious)","var(--neutral)"];
 const X0=34,YB=165;
@@ -333,7 +373,7 @@ function renderSelect(D,anomalies){
 // A pytest node id as two lines, file then test, so long parametrized ids fit a table cell.
 function testId(id){const i=id.indexOf("::");if(i<0)return `<code>${esc(id)}</code>`;
   return `<code class="muted">${esc(id.slice(0,i))}</code><br><code style="overflow-wrap:anywhere">${esc(id.slice(i+2))}</code>`}
-function renderOps(o){
+function renderOps(o,u,occ){
   const t=o.tiles,pct=x=>x==null?"–":(100*x).toFixed(0)+"%",d=t.gpu_h_prev_7d?Math.round(100*(t.gpu_h_7d-t.gpu_h_prev_7d)/t.gpu_h_prev_7d):null;
   $("o-tiles").innerHTML=tile("GPU hours, last 7 days",t.gpu_h_7d.toLocaleString(),`prior 7 days: ${t.gpu_h_prev_7d.toLocaleString()}${d==null?"":` · ${d>0?"▲":"▼"} ${Math.abs(d)}%`}`)+
     tile("Setup failures, gpu-tests.yml runs",pct(t.setup_rate),`${t.setup_n} of ${t.runs_n} finished runs · ${t.setup_mi350} on MI350`,t.setup_n?"infra":"")+
@@ -360,11 +400,63 @@ function renderOps(o){
     $("o-jobs").innerHTML=table(["GPU","Job","Runs","Median","Slowest 10%","Before, slowest 10%","Slowest step (median / slowest 10%)"],o.jobs[RANGE].filter(mine).map(j=>[j.gpu,`<code>${esc(j.job)}</code>`,j.n,j.p50,`<span class="${j.p90_prev&&j.p90>1.5*j.p90_prev?"bad":""}">${j.p90}</span>`,j.p90_prev??"–",j.slowest_step?`${esc(j.slowest_step)} <span class="muted">(${j.slowest_p50} / ${j.slowest_p90})</span>`:""]),[2,3,4,5]);
     const ST=o.slow_tests[RANGE],slow=GPUS.filter(g=>OGPU==="All"||g===OGPU).flatMap(g=>(ST[g]?.tests||[]).map(x=>({...x,gpu:g,runs:ST[g].runs}))).sort((a,b)=>b.p50-a.p50).slice(0,10);
     $("o-slow").innerHTML=slow.length?table(["GPU","Test","Step","Median","Slowest","Runs"],slow.map(x=>[x.gpu,testId(x.id),esc(x.step),x.p50,x.max,`${x.n} <span class="muted">of ${x.runs}</span>`]),[3,4,5]):`<p class="empty">No durations recorded for main pushes in the last ${RANGE} days.</p>`;
-    $("o-setup").innerHTML=table(["Step","GPU","Jobs","Triggers"],o.setup_steps.filter(mine).map(r=>[esc(r.step),r.gpu,r.n,Object.entries(r.triggers).map(([k,v])=>`${v} ${esc(k.replace("pull_request","PR"))}`).join(" · ")]),[2])};
+    $("o-setup").innerHTML=table(["Step","GPU","Jobs","Triggers"],o.setup_steps.filter(mine).map(r=>[esc(r.step),r.gpu,r.n,Object.entries(r.triggers).map(([k,v])=>`${v} ${esc(k.replace("pull_request","PR"))}`).join(" · ")]),[2]);
+    renderUsage(u,occ,every)};
   draw();
   const week=new Date(ASOF-7*864e5).toISOString(),bad=o.select.anomalies.filter(a=>a.kind!=="fallback"&&a.t>=week).length;
   if(bad)badge("b-ops",`✕ trigger`,"bad");else if(t.setup_n)badge("b-ops",`⚠ ${pct(t.setup_rate)} setup`,"infra");else badge("b-ops","✓","ok");
 }
+
+// Usage tab. Activities stack in this order, as ACTIVITIES in ci_health_rules.py.
+const ACTS=["L1","TritonBench","Other tests","L2","Setup & overhead"],ACT_C=["var(--a0)","var(--a1)","var(--a2)","var(--a3)","var(--neutral)"];
+const TRIGS=["PR","push","scheduled","nightly & manual"],TRIG_C={PR:"var(--series-2)",push:"var(--series-1)",scheduled:"var(--ord-3)","nightly & manual":"var(--neutral)"};
+const DOW=d=>["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(d+"T12:00:00Z").getUTCDay()];
+const PT=new Intl.DateTimeFormat("en-CA",{timeZone:"America/Los_Angeles",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"});
+function renderUsage(u,occ,every){
+  const gs=OGPU==="All"?GPUS:[OGPU],D=u.days.slice(-RANGE),TD=u.triggers.slice(-RANGE),f1=x=>x>=100?Math.round(x).toLocaleString():x.toFixed(1),pc=x=>Math.round(100*x)+"%";
+  const sum=(g,a)=>D.reduce((s,x)=>s+x[g][a],0),gtot=g=>ACTS.reduce((s,a)=>s+sum(g,a),0),all=a=>gs.reduce((s,g)=>s+sum(g,a),0),tot=gs.reduce((s,g)=>s+gtot(g),0)||1;
+  const per=f=>OGPU==="All"?`<div class="p">${GPUS.map(g=>`<b>${g}</b> ${f(g)}`).join(" · ")}</div>`:"";
+  const ut=(k,big,d,cls,p)=>`<div class="tile"><div class="k">${k}</div><div class="big ${cls||""}">${big}</div><div class="d">${d}</div>${p}</div>`;
+  // The last day is today (UTC) and only partly elapsed: average over the days that have passed.
+  const setupShare=all("Setup & overhead")/tot,elapsed=D.length-1+((ASOF-new Date(D[D.length-1].day+"T00:00:00Z"))/864e5);
+  $("u-tiles").innerHTML=ut("GPU hours",f1(tot)+" h",`${f1(tot/elapsed)} h per day`,"",per(g=>f1(gtot(g))+" h"))+
+    ut("L1 correctness tests",pc(all("L1")/tot),`${f1(all("L1"))} h`,"",per(g=>gtot(g)?pc(sum(g,"L1")/gtot(g)):"–"))+
+    ut("L2 perf bench",pc(all("L2")/tot),`${f1(all("L2"))} h${all("L2")>0.1?` · L1 uses ${Math.round(all("L1")/all("L2"))}× as much`:""}`,"",per(g=>f1(sum(g,"L2"))+" h"))+
+    ut("Setup &amp; overhead",pc(setupShare),`${f1(all("Setup & overhead"))} h of checkout, install and setup`,setupShare>0.2?"warn":"",per(g=>gtot(g)?pc(sum(g,"Setup & overhead")/gtot(g)):"–"));
+  $("u-legend").innerHTML=ACTS.map((a,i)=>`<span><i class="sw" style="background:${ACT_C[i]}"></i>${esc(a)} · ${f1(all(a))} h</span>`).join("");
+  // GPU hours per day, stacked by activity.
+  const day=x=>ACTS.map(a=>gs.reduce((s,g)=>s+x[g][a],0)),max=Math.max(1,...D.map(x=>day(x).reduce((a,b)=>a+b,0))),top=Math.ceil(max/10)*10,w=(720-X0)/D.length;
+  let s=axes(D,top,Math.round,every);
+  D.forEach((x,i)=>{const v=day(x);let y=YB;const tt=esc(`${DOW(x.day)} ${x.day}\n`+ACTS.map((a,j)=>`${a}: ${v[j].toFixed(1)} h`).join("\n"));
+    ACTS.forEach((a,j)=>{const h=v[j]/top*150;y-=h;if(h>0)s+=`<rect x="${X0+i*w+4}" y="${y+1}" width="${w-8}" height="${Math.max(h-2,0.5)}" rx="2" fill="${ACT_C[j]}" data-tip="${tt}"/>`})});
+  $("u-act").innerHTML=s;
+  // GPU hours by trigger.
+  $("u-trig").innerHTML=`<div class="legend">${TRIGS.map(k=>`<span><i class="sw" style="background:${TRIG_C[k]}"></i>${k}</span>`).join("")}</div>`+gs.map(g=>{
+    const tr=Object.fromEntries(TRIGS.map(k=>[k,TD.reduce((s,x)=>s+(x[g][k]||0),0)])),tt=TRIGS.reduce((s,k)=>s+tr[k],0)||1;
+    return `<div class="trig"><div class="name">${g}<span class="muted">${f1(tt)} h</span></div><div class="hbar">${TRIGS.filter(k=>tr[k]>0).map(k=>`<span data-tip="${esc(`${g} · ${k}\n${f1(tr[k])} GPU hours (${pc(tr[k]/tt)})`)}" style="flex:${tr[k]};background:${TRIG_C[k]};color:${k==="PR"||k==="push"?"#fff":"var(--text-primary)"}">${tr[k]/tt>0.08?pc(tr[k]/tt):""}</span>`).join("")}</div><div class="muted">${TRIGS.map(k=>`${k} ${f1(tr[k])}`).join(" · ")}</div></div>`}).join("");
+  renderOccupancy(occ,gs,f1,pc)}
+function renderOccupancy(occ,gs,f1,pc){
+  const t0=new Date(occ.t0).getTime(),step=occ.cell_min*6e4,N=occ.gpus[GPUS[0]].run.length;
+  const at=[...Array(N).keys()].map(i=>{const p=Object.fromEntries(PT.formatToParts(new Date(t0+i*step)).map(x=>[x.type,x.value]));return {day:`${p.year}-${p.month}-${p.day}`,slot:(+p.hour)*4+Math.floor(+p.minute/15)}});
+  const days=[...new Set(at.map(x=>x.day))].slice(-RANGE),idx=at.map((x,i)=>i).filter(i=>days.includes(at[i].day));
+  $("u-occ").innerHTML=`<div class="trig" style="grid-template-columns:96px minmax(0,1fr) 380px">`+gs.map(g=>{const c=occ.gpus[g],S=k=>idx.reduce((s,i)=>s+c[k][i],0);
+    const busy=S("busy")/60,avail=S("cap")/60||1,occR=busy/avail,jf=S("jfull")/60,jp=S("jpart")/60,pools=[...new Set(idx.map(i=>c.pool[i]))];
+    const poolTxt=pools.length>1?`${Math.min(...pools)} to ${Math.max(...pools)} runners`:`${pools[0]} runners${c.pool_known?"":", most seen"}`;
+    return `<div class="name">${g}<span class="muted">${poolTxt}</span></div><div class="hbar idlebar"><span data-tip="${esc(`${g}: runners were busy for ${f1(busy)} of ${f1(avail)} available runner-hours`)}" style="flex:${busy};background:var(--series-1);color:#fff">${occR>=0.18?pc(occR)+" busy":pc(occR)}</span><span class="idle" data-tip="${esc(`${g}: ${f1(avail-busy)} runner-hours with no job`)}" style="flex:${Math.max(0,avail-busy)}">${pc(1-occR)} idle</span></div><div class="muted">No job running ${pc(S("idle")/(idx.length*occ.cell_min||1))} of the time. All runners busy for ${f1(S("fullm")/60)} h in total. Jobs waited ${f1(jf+jp)} job-hours beyond their first 2 minutes: ${f1(jf)} with every runner busy, ${f1(jp)} while runners looked free.</div>`}).join("")+`</div>`;
+  // A slot holds two cells when the clock falls back (Nov 1, 01:00 PT twice): merge them so neither hour is lost.
+  const merge=(c,is)=>({run:Math.max(...is.map(i=>c.run[i])),pool:Math.max(...is.map(i=>c.pool[i])),busy:is.reduce((s,i)=>s+c.busy[i],0)/is.length,
+    wfull:is.reduce((s,i)=>s+c.wfull[i],0),wpart:is.reduce((s,i)=>s+c.wpart[i],0),twice:is.length>1});
+  const color=x=>{if(x.wfull)return "var(--critical)";if(x.wpart)return "var(--warning)";if(!x.run)return null;const r=x.run/x.pool;return r<1/3?"var(--ord-0)":r<2/3?"var(--ord-2)":"var(--ord-3)"};
+  const rowH=RANGE>14?10:RANGE>7?14:20;
+  $("u-heat").innerHTML=gs.map(g=>{const c=occ.gpus[g];
+    let h=`<div class="gtitle">${g}</div><div class="q15"><span></span>`+[0,3,6,9,12,15,18,21].map(x=>`<span class="h">${String(x).padStart(2,"0")}:00</span>`).join("");
+    for(const d of days){const mine=idx.filter(i=>at[i].day===d),dp=[...new Set(mine.map(i=>c.pool[i]))],row={};for(const i of mine)(row[at[i].slot]??=[]).push(i);
+      h+=`<span class="d">${DOW(d)} ${d.slice(5)} <span class="muted">· ${dp.length>1?`${dp[0]}→${dp[dp.length-1]}`:dp[0]}</span></span>`;
+      for(let s=0;s<96;s++){if(!row[s]){h+=`<span class="c" style="height:${rowH}px"></span>`;continue}
+        const x=merge(c,row[s]),col=color(x),tt=`${g} · ${DOW(d)} ${d.slice(5)}, ${String(s>>2).padStart(2,"0")}:${String((s&3)*15).padStart(2,"0")} PT${x.twice?" (both occurrences)":""}\nRunners busy: up to ${x.run} of ${x.pool} (average ${(x.busy/occ.cell_min).toFixed(1)})`+
+          (x.wfull?`\n${x.wfull} min with every runner busy and a job waiting`:"")+(x.wpart?`\n${x.wpart} min with a job waiting while runners looked free`:"");
+        h+=`<span class="c${col?"":" idle"}${s%4===0?" hr":""}" style="height:${rowH}px;${col?`background:${col}`:""}" data-tip="${esc(tt)}"></span>`}}
+    return h+`</div>`}).join("")}
 
 const LLVM_REPO="https://github.com/facebookexperimental/llvm-project";
 function renderLLVM(u,branch){
@@ -400,14 +492,14 @@ function renderBranches(d){
     $("branch-sel").innerHTML=Object.keys(d.branches).map(b=>`<button type="button" data-b="${esc(b)}" aria-pressed="${b===cur}">${esc(b)}</button>`).join("");
     for(const b of $("branch-sel").querySelectorAll("button"))b.onclick=()=>{BRANCH=b.dataset.b;saveView();draw()};
     $("m-q").textContent=`Did a push to ${cur} break something new?`;
-    const v=d.branches[cur];renderMain(v.main,renderLit(v.lit),cur);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderOps(v.ops);renderLLVM(v.bump,cur)};
+    const v=d.branches[cur];renderMain(v.main,renderLit(v.lit),cur);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderOps(v.ops,v.usage,d.occupancy);renderLLVM(v.bump,cur)};
   draw()}
 
 function show(id){if(!$(id)||!$(id).matches("section"))id="main";
   TAB=id;
   for(const b of document.querySelectorAll("nav.tabs button"))b.setAttribute("aria-selected",b.dataset.tab===id);
   for(const s of document.querySelectorAll("section[role=tabpanel]"))s.hidden=s.id!==id;
-  $("ops-filters").hidden=id!=="ops"}
+  $("ops-filters").hidden=id!=="ops"&&id!=="usage"}
 for(const b of document.querySelectorAll("nav.tabs button"))b.onclick=()=>{TAB=b.dataset.tab;saveView();show(TAB)};
 show(TAB);
 const tip=$("tip");
