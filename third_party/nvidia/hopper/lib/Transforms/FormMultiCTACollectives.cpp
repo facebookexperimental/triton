@@ -45,7 +45,13 @@ FailureOr<PhysicalCluster> getPhysicalCluster(ModuleOp module) {
 }
 
 bool isSupportedScalarCombiner(triton::ReduceOp reduce) {
-  if (reduce.getNumResults() != 1 || !reduce->getResult(0).getType().isF32())
+  if (reduce.getNumResults() != 1)
+    return false;
+  Type resultType = reduce->getResult(0).getType();
+  auto tensorType = dyn_cast<RankedTensorType>(resultType);
+  if (!resultType.isF32() &&
+      !(tensorType && tensorType.hasStaticShape() &&
+        tensorType.getElementType().isF32() && tensorType.getNumElements() > 0))
     return false;
   Operation *combiner = reduce.getSingleCombiner();
   return combiner && isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp,
@@ -316,8 +322,8 @@ public:
               validateCanonicalOwnership(reduce, cluster->axis, cluster->size)))
         return signalPassFailure();
       if (reduce.hasDefinedOrdering() || !isSupportedScalarCombiner(reduce)) {
-        reduce.emitError("multi_cta requires an unordered scalar f32 add, max, "
-                         "or min reduction");
+        reduce.emitError(
+            "multi_cta requires an unordered f32 add, max, or min reduction");
         return signalPassFailure();
       }
       if (!hasOnlyConstantCaptures(reduce)) {

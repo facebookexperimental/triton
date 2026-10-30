@@ -38,6 +38,27 @@ SmallVector<Value> cloneCombine(OpBuilder &builder, ClusterReduceOp op,
       [&](Value result) { return mapping.lookupOrDefault(result); });
 }
 
+SmallVector<Value> combineValues(OpBuilder &builder, ClusterReduceOp op,
+                                 ValueRange lhs, ValueRange rhs) {
+  if (!isa<RankedTensorType>(lhs.front().getType()))
+    return cloneCombine(builder, op, lhs, rhs);
+
+  assert(lhs.size() == 1 && rhs.size() == 1 &&
+         "tensor cluster reductions have one component");
+  Block &combine = op.getCombineOp().front();
+  Operation *scalarCombiner =
+      combine.getTerminator()->getOperand(0).getDefiningOp();
+  assert(scalarCombiner && scalarCombiner->getNumOperands() == 2 &&
+         scalarCombiner->getNumResults() == 1 &&
+         "tensor cluster reductions require a binary scalar combiner");
+
+  OperationState state(op.getLoc(), scalarCombiner->getName());
+  state.addOperands({lhs.front(), rhs.front()});
+  state.addTypes(lhs.front().getType());
+  state.addAttributes(scalarCombiner->getAttrs());
+  return {builder.create(state)->getResult(0)};
+}
+
 SmallVector<Value> reduceTuple(OpBuilder &builder, ClusterReduceOp op,
                                ValueRange tensors) {
   auto reduce = triton::ReduceOp::create(builder, op.getLoc(), tensors,
@@ -67,44 +88,74 @@ LogicalResult lowerCollective(ClusterReduceOp op) {
   ModuleOp module = op->getParentOfType<ModuleOp>();
   int64_t groupSize = op.getGroupSize();
   int64_t arity = op.getPartials().size();
-  int64_t expectedBytes = sizeof(float) * arity * (groupSize - 1);
+  Type componentType = op.getPartials().front().getType();
+  auto tensorType = dyn_cast<RankedTensorType>(componentType);
+  int64_t elements = tensorType ? tensorType.getNumElements() : 1;
+  int64_t expectedBytes = sizeof(float) * elements * arity * (groupSize - 1);
   if (expectedBytes > std::numeric_limits<int32_t>::max())
     return op.emitError("cluster-reduce transaction byte count exceeds i32");
 
-  auto cta1d = ttg::CGAEncodingAttr::fromSplitParams(context, {1}, {1}, {0});
-  auto smem1d =
-      ttg::SwizzledSharedEncodingAttr::get(context, 1, 1, 1, {0}, cta1d);
-  auto cta2d =
-      ttg::CGAEncodingAttr::fromSplitParams(context, {1, 1}, {1, 1}, {1, 0});
-  auto smem2d =
-      ttg::SwizzledSharedEncodingAttr::get(context, 1, 1, 1, {1, 0}, cta2d);
+  SmallVector<int64_t> slotShape = tensorType
+                                       ? llvm::to_vector(tensorType.getShape())
+                                       : SmallVector<int64_t>{1};
+  unsigned slotRank = slotShape.size();
+  SmallVector<unsigned> slotOrder;
+  for (unsigned dim = slotRank; dim > 0; --dim)
+    slotOrder.push_back(dim - 1);
+  SmallVector<unsigned> slotOnes(slotRank, 1);
+  auto slotCTA = ttg::CGAEncodingAttr::fromSplitParams(context, slotOnes,
+                                                       slotOnes, slotOrder);
+  auto slotEncoding = ttg::SwizzledSharedEncodingAttr::get(context, 1, 1, 1,
+                                                           slotOrder, slotCTA);
+
+  SmallVector<int64_t> bufferShape{groupSize};
+  llvm::append_range(bufferShape, slotShape);
+  unsigned bufferRank = bufferShape.size();
+  SmallVector<unsigned> bufferOrder;
+  for (unsigned dim = bufferRank; dim > 0; --dim)
+    bufferOrder.push_back(dim - 1);
+  SmallVector<unsigned> bufferOnes(bufferRank, 1);
+  auto bufferCTA = ttg::CGAEncodingAttr::fromSplitParams(
+      context, bufferOnes, bufferOnes, bufferOrder);
+  auto bufferEncoding = ttg::SwizzledSharedEncodingAttr::get(
+      context, 1, 1, 1, bufferOrder, bufferCTA);
   auto smemSpace = ttg::SharedMemorySpaceAttr::get(context);
-  int numWarps = ttg::lookupNumWarps(op);
-  int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(module);
-  auto exchangeEncoding = ttg::BlockedEncodingAttr::get(
-      context, {1}, {static_cast<unsigned>(threadsPerWarp)},
-      {static_cast<unsigned>(numWarps)}, {0}, cta1d);
-  auto exchangeType =
-      RankedTensorType::get({1}, builder.getF32Type(), exchangeEncoding);
-  auto bufferType = ttg::MemDescType::get({groupSize, 1}, builder.getF32Type(),
-                                          smem2d, smemSpace, true);
-  auto slotType =
-      ttg::MemDescType::get({1}, builder.getF32Type(), smem1d, smemSpace, true);
+  auto barrierCTA =
+      ttg::CGAEncodingAttr::fromSplitParams(context, {1}, {1}, {0});
+  auto barrierEncoding =
+      ttg::SwizzledSharedEncodingAttr::get(context, 1, 1, 1, {0}, barrierCTA);
+  RankedTensorType exchangeType;
+  if (tensorType) {
+    exchangeType = tensorType;
+  } else {
+    int numWarps = ttg::lookupNumWarps(op);
+    int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(module);
+    auto exchangeEncoding = ttg::BlockedEncodingAttr::get(
+        context, {1}, {static_cast<unsigned>(threadsPerWarp)},
+        {static_cast<unsigned>(numWarps)}, {0}, slotCTA);
+    exchangeType =
+        RankedTensorType::get({1}, builder.getF32Type(), exchangeEncoding);
+  }
+  auto bufferType = ttg::MemDescType::get(bufferShape, builder.getF32Type(),
+                                          bufferEncoding, smemSpace, true);
+  auto slotType = ttg::MemDescType::get(slotShape, builder.getF32Type(),
+                                        slotEncoding, smemSpace, true);
 
   Value rank =
       triton::nvgpu::ClusterCTAIdOp::create(builder, loc, builder.getI32Type());
   SmallVector<Value> partials, buffers, localSlots;
   for (Value partial : op.getPartials()) {
-    partials.push_back(
-        triton::SplatOp::create(builder, loc, exchangeType, partial));
+    partials.push_back(tensorType ? partial
+                                  : triton::SplatOp::create(
+                                        builder, loc, exchangeType, partial));
     Value buffer = ttg::LocalAllocOp::create(builder, loc, bufferType, Value());
     buffers.push_back(buffer);
     localSlots.push_back(
         ttg::MemDescIndexOp::create(builder, loc, slotType, buffer, rank));
   }
 
-  auto barrierType =
-      ttg::MemDescType::get({1}, builder.getI64Type(), smem1d, smemSpace, true);
+  auto barrierType = ttg::MemDescType::get({1}, builder.getI64Type(),
+                                           barrierEncoding, smemSpace, true);
   Value barrier = ttg::LocalAllocOp::create(builder, loc, barrierType, Value());
   ttng::InitBarrierOp::create(builder, loc, barrier, 1);
   Value pred = arith::ConstantIntOp::create(builder, loc, 1, 1);
@@ -138,12 +189,12 @@ LogicalResult lowerCollective(ClusterReduceOp op) {
       loaded.push_back(
           ttg::LocalLoadOp::create(builder, loc, exchangeType, slot));
     }
-    return reduceTuple(builder, op, loaded);
+    return tensorType ? loaded : reduceTuple(builder, op, loaded);
   };
 
   SmallVector<Value> results = loadRank(0);
   for (int peer = 1; peer < groupSize; ++peer)
-    results = cloneCombine(builder, op, results, loadRank(peer));
+    results = combineValues(builder, op, results, loadRank(peer));
   ttg::BarrierOp::create(builder, loc, ttg::AddrSpace::Local);
   op.replaceAllUsesWith(results);
   op.erase();
