@@ -1675,3 +1675,46 @@ def test_multi_cta_rejects_explicit_ordering(op, strict):
         assert str(error) == "multi_cta reductions require ReductionOrdering.UNORDERED"
         module = run_parser(_marker_ordering_kernel, args=(op, True, tl.ReductionOrdering.UNORDERED))
     assert "tt.multi_cta" in module.str_nodebug()
+
+
+def test_amd_partitioned_layout_constexpr_cache_identity():
+    import triton.language.extra.tlx as tlx
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(LAYOUT: tl.constexpr):
+        pass
+
+    def cache_key(layout):
+        return ASTSource(kernel, {"LAYOUT": "constexpr"}, {"LAYOUT": layout}).hash()
+
+    piece0 = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [128, 128])
+    piece1 = tlx.padded_shared_layout_encoding.with_identity_for([[256, 8]], [128, 128])
+    assert cache_key(piece0) != cache_key(piece1)
+    assert cache_key(tlx.partitioned_shared_layout_encoding(2, 1, 0, piece0)) == cache_key(
+        tlx.partitioned_shared_layout_encoding(2, 1, 0, piece0))
+    assert cache_key(tlx.partitioned_shared_layout_encoding(2, 1, 0, piece0)) != cache_key(
+        tlx.partitioned_shared_layout_encoding(2, 1, 0, piece1))
+    row_major = tlx.swizzled_shared_layout_encoding.make_default(2)
+    column_major = tlx.swizzled_shared_layout_encoding.make_default(2)
+    column_major.order = [0, 1]
+    assert cache_key(tlx.partitioned_shared_layout_encoding(2, 1, 0, row_major)) != cache_key(
+        tlx.partitioned_shared_layout_encoding(2, 1, 0, column_major))
+
+
+def test_amd_tdm_load_partitioned_destination():
+    import triton.language.extra.tlx as tlx
+    from triton.backends.compiler import GPUTarget
+
+    @triton.jit
+    def kernel():
+        ptr = tl.full((), 0, tl.int64).to(tl.pointer_type(tl.float16))
+        desc = tl.make_tensor_descriptor(ptr, [256, 256], [256, 1], [256, 256])
+        piece: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[256, 8]], [128, 256])
+        shared: tl.constexpr = tlx.partitioned_shared_layout_encoding(2, 1, 0, piece)
+        buf = tlx.local_alloc((256, 256), tl.float16, 1, layout=shared)
+        tlx.async_amd_descriptor_load(desc, tlx.local_view(buf, 0))
+
+    text = run_parser(kernel, kwargs={"num_warps": 8}, target=GPUTarget("hip", "gfx1250", 32)).str_nodebug()
+    assert "#ttg.partitioned_shared" in text
+    assert "amdg.async_tdm_copy_global_to_local" in text
