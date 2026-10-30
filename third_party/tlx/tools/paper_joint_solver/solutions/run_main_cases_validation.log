@@ -1,0 +1,6 @@
+fwd_subtiled_v7: solution, v2 IR, handoff, and draft scaffold validated
+fwd_v7: solution, v2 IR, handoff, and draft scaffold validated
+bwd_v7: solution, v2 IR, handoff, and draft scaffold validated
+bwd_lr4096_v7: solution, v2 IR, handoff, and draft scaffold validated
+solver_sources_sha256=42f28efe2e94f97c13fc4c8a7e0326aaf5fe2955d21c8a0793b24b7cf93ef237
+all draft audit-bundle checks rejected at the authoring approval gate

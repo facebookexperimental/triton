@@ -1,0 +1,42 @@
+{
+  "alias_sets": [],
+  "allocations": [],
+  "authoring_mode": "agent-assisted-manual-cuda",
+  "capacities": {
+    "physical_warps": 32,
+    "register_words": 65536,
+    "shared_bytes": 232448,
+    "tmem_columns": 512
+  },
+  "descriptors": [],
+  "lifetime_audit": [],
+  "pipelined_ir": {
+    "schema_version": "twill-pipelined-warp-ir-v2",
+    "sha256": "75dc1d84370d385293cc90024767c7fe19f2fd848814b68a92ea7e80586aeab7"
+  },
+  "resource_budget": {
+    "compiler_reported": {
+      "dynamic_smem_bytes": null,
+      "register_words": null,
+      "spill_bytes": null
+    },
+    "planned": {
+      "barrier_smem_bytes": null,
+      "dynamic_smem_bytes": null,
+      "per_warp_register_words": null,
+      "physical_warps": 31,
+      "register_words": null,
+      "tmem_columns": null
+    }
+  },
+  "review": {
+    "reviewer": null,
+    "status": "pending"
+  },
+  "schema_version": "twill-manual-cuda-memory-v1",
+  "status": "manual_completion_required",
+  "target": {
+    "cuda_arch": "sm_100a",
+    "gpu": "B200"
+  }
+}

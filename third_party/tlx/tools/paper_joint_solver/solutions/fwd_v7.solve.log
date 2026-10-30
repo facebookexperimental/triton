@@ -1,0 +1,6 @@
+[attempt] {'ii': 2, 'L': 4, 'stage': 'joint', 'result': 'unsat', 'seconds': 0.2}
+[attempt] {'ii': 3, 'L': 4, 'stage': 'joint', 'result': 'unsat', 'seconds': 0.5}
+[attempt] {'ii': 3, 'L': 5, 'stage': 'joint', 'result': 'sat', 'seconds': 0.7}
+[paper_joint_solver] sat after 1.4s -> solutions/fwd_v7.json
+[paper_joint_solver] wrote solutions/fwd_v7_ir.json
+[paper_joint_solver] wrote solutions/fwd_v7_handoff.json

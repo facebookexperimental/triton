@@ -1,0 +1,14 @@
+hostname=devgpu006.maz2.facebook.com
+lscpu_model_name=AMD EPYC 9654 96-Core Processor
+nproc=384
+watchdog_s=86400
+python_requested=/home/haowumark14/fbsource1/third-party/triton/beta/triton/.venv/bin/python
+SOLVER_LIB_PATH=/home/haowumark14/local/solver-lib:/data/users/haowumark14/fbsource5/fbcode/third-party-buck/platform010/build/gmp/lib
+PYTHONPATH=.
+python_executable=/home/haowumark14/fbsource1/third-party/triton/beta/triton/.venv/bin/python
+python_version=3.12.13+meta (3.12:3bb231a, Mar 03 2026, 12:38:32) [Clang 19.1.2 (ssh://git.vip.facebook.com/data/gitrepos/osmeta/external/llvm-pro
+module_pyscipopt_file=/home/haowumark14/fbsource1/third-party/triton/beta/triton/.venv/lib/python3.12/site-packages/pyscipopt/__init__.py
+module_yices_file=/home/haowumark14/fbsource1/third-party/triton/beta/triton/.venv/lib/python3.12/site-packages/yices/__init__.py
+module_paper_joint_solver_file=/data/users/haowumark14/fbsource5/third-party/triton/beta/triton/third_party/tlx/tools/paper_joint_solver/paper_joint_solver/__init__.py
+solver_sources_sha256=9c996b45262a0ec33fa2af162414801ce24257eb0b09c9bf723acb287e2f95cd
+prepared_sources_sha256=6eab67cdaa298b2e036fb33ba5220834ba16e87caeacf2288d0c51f271091439

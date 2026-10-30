@@ -1,0 +1,19 @@
+{
+  "schema_version": "twill-manual-cuda-handoff-v1",
+  "pipelined_ir": {
+    "schema_version": "twill-pipelined-warp-ir-v2",
+    "sha256": "fb2718496d24e6cb891ae0d69569750f7f50996b93a0a3c0b9a04a2c07d9fdba"
+  },
+  "solution_sha256": "6abd597cd8f8cc142c3ce596eba3394038796b11301bbb177207718d6fa4bf57",
+  "lowering": {
+    "paper_endpoint": "expert-manual-cuda-cpp",
+    "status": "not_performed",
+    "executable_generated": false,
+    "remaining_manual_steps": [
+      "memory_allocation",
+      "data_layout_conversion",
+      "synchronization_placement",
+      "instruction_selection"
+    ]
+  }
+}
