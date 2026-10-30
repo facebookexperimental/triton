@@ -803,6 +803,53 @@ class TestTLXTemplates(TestCase):
             self.assertEqual(heuristic.should_run(inputs), accepted)
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dtype", (torch.float32, torch.bfloat16))
+    @parametrize("allow_tf32", (True, False))
+    @parametrize("a_row_major", (True, False))
+    @parametrize("b_row_major", (True, False))
+    def test_tlx_matmul_ws_fp32_operand_layout(self, dtype, allow_tf32, a_row_major, b_row_major):
+        # The template runs FP32 as TF32, and tcgen05.mma rejects transposed FP32
+        # operands in shared memory: FP32 needs TF32, a row-major A and a
+        # column-major B (both K inner). Other dtypes are unaffected.
+        from torch._inductor.kernel_inputs import MMKernelInputs
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        m = k = n = 256
+        device = torch.device("cuda")
+        a_strides = (k, 1) if a_row_major else (1, m)
+        b_strides = (n, 1) if b_row_major else (1, k)
+        inputs = MMKernelInputs([
+            ir.Buffer(name="a", layout=ir.FixedLayout(device, dtype, [m, k], a_strides)),
+            ir.Buffer(name="b", layout=ir.FixedLayout(device, dtype, [k, n], b_strides)),
+        ])
+        graph = mock.Mock(sizevars=SizeVarAllocator(), unaligned_buffers=set())
+        heuristic = object.__new__(_tlx_registry.BlackwellGemmWSConfigHeuristic)
+        with (
+                V.set_graph_handler(graph),
+                mock.patch("torch.utils._triton.has_triton_tma_device", return_value=True),
+                mock.patch.object(_tlx_registry, "_mm_allow_tf32", return_value=allow_tf32),
+                config.patch({"triton.tlx_mode": "allow"}),
+        ):
+            accepted = dtype != torch.float32 or (allow_tf32 and a_row_major and not b_row_major)
+            self.assertEqual(heuristic.should_run(inputs), accepted)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_matmul_ws_smem_check_scales_with_operand_bytes(self):
+        # The config pool is sized for 2-byte operands; FP32 doubles the operand
+        # and epilogue staging buffers, so a config that fits at bf16 must be
+        # dropped at FP32 instead of failing to launch.
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        heuristic = _tlx_registry.BlackwellGemmWSConfigHeuristic
+        template_kwargs = {
+            "BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_SMEM_BUFFERS": 4, "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 1, "NUM_CTAS": 1, "EPILOGUE_SUBTILE": 2, "SPLIT_K": 1, "TMA_EPILOGUE_STORE": 1,
+        }
+        self.assertTrue(heuristic._fits_smem(template_kwargs, 2))
+        self.assertFalse(heuristic._fits_smem(template_kwargs, 4))
+        self.assertTrue(heuristic._fits_smem({**template_kwargs, "NUM_SMEM_BUFFERS": 2, "BLOCK_K": 32}, 4))
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_amd_mm_template_is_registered_once(self):
         from torch._inductor.kernel.mm import mm_template
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm

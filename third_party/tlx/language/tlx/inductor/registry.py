@@ -98,6 +98,16 @@ from .mm_templates import (
 )
 
 
+def _mm_allow_tf32(kernel_inputs: MMKernelInputs) -> bool:
+    """Whether Inductor runs this FP32 GEMM as TF32, as its own templates decide."""
+    try:
+        from torch._inductor.template_heuristics.triton import mm_allow_tf32
+    except ImportError:
+        return torch.backends.cuda.matmul.allow_tf32
+    m, n, k = kernel_inputs.mnk_symbolic()
+    return mm_allow_tf32(m, n, k, kernel_inputs.device_type)
+
+
 @dataclasses.dataclass
 class TlxGemmConfig(GemmConfig):
     """
@@ -1120,6 +1130,28 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             "A_ROW_MAJOR": mat1_inner_dim == 1,
             "B_ROW_MAJOR": mat2_inner_dim == 1,
         }
+
+    @staticmethod
+    def _has_unsupported_fp32_operands(kernel_inputs: KernelInputs) -> bool:
+        """Whether FP32 operands rule out the template.
+
+        The template's MMA runs FP32 inputs as TF32, so it is only an option when
+        TF32 is allowed. tcgen05.mma also rejects transposed FP32 operands in shared
+        memory, and the template loads both operands as stored, so A must be
+        row-major (K inner) and B column-major (K inner).
+        """
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            return False
+        idxs = (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)
+        if all(kernel_inputs.dtype(idx) != torch.float32 for idx in idxs):
+            return False
+        if not _mm_allow_tf32(kernel_inputs):
+            return True
+        strides = kernel_inputs.strides_hinted()
+        return not (
+            tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1
+            and tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 0
+        )
 
     @staticmethod
     def _has_unsupported_layout(kernel_inputs: KernelInputs) -> bool:
@@ -2460,6 +2492,9 @@ class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuri
         if self._has_unsupported_layout(inputs):
             log.debug("TLX blackwell_gemm_ws declined: unsupported TMA layout")
             return False
+        if self._has_unsupported_fp32_operands(inputs):
+            log.debug("TLX blackwell_gemm_ws declined: FP32 operands need TF32 and K-major layouts")
+            return False
         if config.triton.tlx_mode in ("allow", "force"):
             return True
         return super().should_run(inputs)
@@ -2468,6 +2503,42 @@ class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuri
         self, conf: GemmConfig
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         return get_tlx_config_key_and_kwargs(conf)
+
+    def _get_template_configs_impl(
+        self,
+        kernel_inputs: KernelInputs,
+        op_name: str,
+    ) -> Generator[dict[str, Any], None, None]:
+        # The config pool and the heuristic are sized for 2-byte operands. Wider
+        # operands (FP32) double the operand and epilogue staging SMEM, so drop
+        # the configs that would fail to launch with OutOfResources.
+        assert isinstance(kernel_inputs, MMKernelInputs), "Expect MMKernelInputs"
+        elem_bytes = kernel_inputs.dtype(kernel_inputs._mat1_idx).itemsize
+        for template_kwargs in super()._get_template_configs_impl(kernel_inputs, op_name):
+            if elem_bytes == resources.OPERAND_ELEM_BYTES or self._fits_smem(template_kwargs, elem_bytes):
+                yield template_kwargs
+
+    @classmethod
+    def _fits_smem(cls, template_kwargs: dict[str, Any], elem_bytes: int) -> bool:
+        tile = dataclasses.replace(
+            cls._tile(
+                template_kwargs["BLOCK_M"],
+                template_kwargs["BLOCK_N"],
+                template_kwargs["BLOCK_K"],
+                template_kwargs["NUM_SMEM_BUFFERS"],
+                template_kwargs["NUM_TMEM_BUFFERS"],
+                template_kwargs["NUM_MMA_GROUPS"],
+                template_kwargs["NUM_CTAS"],
+                template_kwargs["EPILOGUE_SUBTILE"],
+            ),
+            elem_bytes=elem_bytes,
+        )
+        return validate_config(
+            tile,
+            charge_epilogue=bool(template_kwargs.get("TMA_EPILOGUE_STORE", 1)),
+            split_k=template_kwargs.get("SPLIT_K", 1),
+            smem_margin=cls._SMEM_SAFETY_MARGIN,
+        )
 
     def __init__(self) -> None:
         super().__init__()
