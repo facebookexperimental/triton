@@ -306,6 +306,8 @@ void init_triton_hopper_passes(py::module_ &m) {
                      mlir::createNVGPUMaterialize2CTAExchange);
   ADD_PASS_OPTION_WRAPPER_1("add_form_multi_cta_collectives",
                             mlir::createNVGPUFormMultiCTACollectives, int);
+  ADD_PASS_WRAPPER_0("add_lower_cluster_reduce_to_ttgir",
+                     mlir::createNVGPULowerClusterReduceToTTGIR);
   ADD_PASS_WRAPPER_0("add_modulo_schedule", mlir::createNVGPUModuloSchedule);
   ADD_PASS_WRAPPER_0("add_list_schedule", mlir::createNVGPUListSchedule);
   ADD_PASS_WRAPPER_0("add_llm_schedule", mlir::createNVGPULLMSchedule);
