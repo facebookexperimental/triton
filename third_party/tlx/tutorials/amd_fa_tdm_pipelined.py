@@ -128,6 +128,10 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
                     stride_on, SM_SCALE: tl.constexpr, SEQLEN_Q: tl.constexpr, SEQLEN_K: tl.constexpr,
                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr, FIXED_REFERENCE: tl.constexpr):
     NUM_BUFFERS: tl.constexpr = 2
+    # The 128x64 fixed-reference schedule hides K-prefetch latency behind
+    # probability conversion and denominator updates; wider tiles prefer the
+    # original ordering to limit live operands.
+    PREFETCH_BEFORE_P: tl.constexpr = FIXED_REFERENCE and BLOCK_M == 128 and BLOCK_N == 64
     scale_ln2: tl.constexpr = SM_SCALE * RCP_LN2
 
     off_z = tl.program_id(0)
@@ -231,10 +235,13 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
             t_3 = block_id + 3 * BLOCK_N
 
             qk = _compute_qk_no_mask(q, k)
-            p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
+            if not PREFETCH_BEFORE_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
             v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
             tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, (iter_id + 1) % NUM_BUFFERS), [t_3, 0],
                                           clamp_bounds=True)
+            if PREFETCH_BEFORE_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
             acc = tl.dot(p, v, acc)
             p, alpha, m_i = _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE)
             k = _load_k(k_buf, iter_id % NUM_BUFFERS, 2)
@@ -249,10 +256,13 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
             t_3 = iter_id * BLOCK_N + 3 * BLOCK_N
 
             qk = _compute_qk(q, k, t_1, BLOCK_M, BLOCK_N, SEQLEN_K)
-            p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
+            if not PREFETCH_BEFORE_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
             v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
             tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, (iter_id + 1) % NUM_BUFFERS), [t_3, 0],
                                           clamp_bounds=True)
+            if PREFETCH_BEFORE_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
             acc = tl.dot(p, v, acc)
             p, alpha, m_i = _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE)
             k = _load_k(k_buf, iter_id % NUM_BUFFERS, 2)
