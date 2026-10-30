@@ -113,6 +113,29 @@ def _warp_specialized_marker_kernel(
 
 
 @triton.jit
+def _overlapping_store_marker_kernel(
+    x,
+    y,
+    n,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+):
+    local_rank = tl.program_id(1) % NUM_CTAS
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for off in tl.range(
+            local_rank * BLOCK_SIZE,
+            n,
+            NUM_CTAS * BLOCK_SIZE,
+    ):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        values = tl.load(x + cols, mask=cols < n, other=0.0).to(tl.float32)
+        acc += values
+
+    result = tl.sum(acc, axis=0, multi_cta=True)
+    tl.store(y, result)
+
+
+@triton.jit
 def _non_bool_marker_kernel(
     x,
     y,
@@ -199,6 +222,16 @@ def test_reduce_marker_rejects_warp_specialization_sm90_without_meta_ws():
                 options={"num_warps": 4, "cluster_dims": (1, 4, 1)},
             )
     assert "multi_cta does not support warp specialization in v1" in str(exc_info.value)
+
+
+def test_reduce_marker_rejects_overlapping_store():
+    with pytest.raises(Exception) as exc_info:
+        _compile(
+            _overlapping_store_marker_kernel,
+            {"BLOCK_SIZE": 1024, "NUM_CTAS": 4},
+            cluster_dims=(1, 4, 1),
+        )
+    assert ("multi_cta stores must be rank-strided or guarded by local_rank == 0" in str(exc_info.value))
 
 
 def test_reduce_marker_requires_bool():
