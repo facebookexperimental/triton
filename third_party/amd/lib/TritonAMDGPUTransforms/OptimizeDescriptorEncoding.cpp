@@ -173,6 +173,14 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
     // The TDM verifier separately checks that the tile's physical strides
     // agree with the preserved allocation layout.
     auto descTy = descriptor.getType();
+    // A descriptor whose tile does not split into the allocation's partition
+    // pieces (e.g. a rank-reducing one) cannot use its layout. Leave it to the
+    // fallback encoding; the TDM verifier then reports the mismatch.
+    if (auto partitioned =
+            dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding);
+        partitioned && !ttg::isPartitionedEncodingCompatibleWithShape(
+                           partitioned, descTy.getShape()))
+      return false;
     auto tensorTy = RankedTensorType::get(descTy.getShape(),
                                           descTy.getElementType(), encoding);
     encoding = ttg::updateEncodingForShape(

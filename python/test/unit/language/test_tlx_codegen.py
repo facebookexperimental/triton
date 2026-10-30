@@ -7435,3 +7435,21 @@ def test_amd_scaled_downcast_fp8_rejects_scalar_input():
     source = ASTSource(_amd_scaled_downcast_fp8_scalar_kernel, signature={"value": "fp32", "Y": "*fp8e4nv"})
     with pytest.raises(CompilationError, match="value must be an FP32 tensor"):
         triton_compile(source, target=GPUTarget("hip", "gfx950", 64))
+
+
+def test_amd_tdm_rank_reducing_load_rejects_partitioned_destination():
+
+    @triton.jit
+    def kernel(x_ptr):
+        # A rank-reducing [1, 128, 64] descriptor cannot address the pieces of
+        # a [128, 64] allocation partitioned along dim 0.
+        piece: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[64, 8]], [64, 64], [1, 0])
+        layout: tl.constexpr = tlx.partitioned_shared_layout_encoding(2, 1, 0, piece)
+        desc = tl.make_tensor_descriptor(x_ptr, [1, 128, 64], [8192, 64, 1], [1, 128, 64])
+        buf = tlx.local_alloc((128, 64), tl.float16, 1, layout=layout)
+        tlx.async_amd_descriptor_load(desc, tlx.local_view(buf, 0), [0, 0, 0])
+        tlx.async_amd_descriptor_wait(pendings=0)
+
+    with pytest.raises(RuntimeError, match="is inconsistent with the shared memory allocation layout"):
+        triton_compile(ASTSource(kernel, signature=dict(x_ptr="*fp16")), target=GPUTarget("hip", "gfx1250", 32),
+                       options=dict(num_warps=4))
