@@ -158,6 +158,39 @@ bool dependsOnLoop(Value value, ArrayRef<scf::ForOp> loops,
   });
 }
 
+bool dependsOnClusterAxis(Value value, int axis,
+                          llvm::SmallPtrSetImpl<Operation *> &visited) {
+  Operation *def = value.getDefiningOp();
+  if (!def || !visited.insert(def).second)
+    return false;
+  if (auto pid = dyn_cast<triton::GetProgramIdOp>(def))
+    return pid.getAxisAsInt() == axis;
+  return llvm::any_of(def->getOperands(), [&](Value operand) {
+    return dependsOnClusterAxis(operand, axis, visited);
+  });
+}
+
+LogicalResult validateCollectivePlacement(triton::ReduceOp reduce, int axis) {
+  auto function = reduce->getParentOfType<triton::FuncOp>();
+  Block *entry = &function.getBody().front();
+  if (reduce->getBlock() == entry)
+    return success();
+
+  auto loop = dyn_cast_or_null<scf::ForOp>(reduce->getBlock()->getParentOp());
+  if (!loop || loop->getBlock() != entry)
+    return reduce.emitError(
+        "multi_cta reduce must be in the function entry block or one directly "
+        "nested scf.for");
+  for (Value bound :
+       {loop.getLowerBound(), loop.getUpperBound(), loop.getStep()}) {
+    llvm::SmallPtrSet<Operation *, 16> visited;
+    if (dependsOnClusterAxis(bound, axis, visited))
+      return reduce.emitError(
+          "multi_cta loop bounds and step must not depend on cluster rank");
+  }
+  return success();
+}
+
 LogicalResult validateCanonicalOwnership(triton::ReduceOp reduce, int axis,
                                          int size) {
   auto function = reduce->getParentOfType<triton::FuncOp>();
@@ -311,10 +344,9 @@ public:
     llvm::SmallPtrSet<Operation *, 4> validatedFunctions;
     for (triton::ReduceOp reduce : reductions) {
       auto function = reduce->getParentOfType<triton::FuncOp>();
-      if (!function || reduce->getBlock() != &function.getBody().front()) {
-        reduce.emitError("multi_cta reduce must be in the tt.func entry block");
+      if (!function ||
+          failed(validateCollectivePlacement(reduce, cluster->axis)))
         return signalPassFailure();
-      }
       if (validatedFunctions.insert(function).second &&
           failed(validateFunction(function, cluster->axis, cluster->size)))
         return signalPassFailure();
