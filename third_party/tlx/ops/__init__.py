@@ -74,6 +74,7 @@ from ._catalog import (
     check_inputs,
     impl_for,
     invariant_vocab_for,
+    _target,
 )
 from ._invariance import BitwiseInvarianceSpec, Space, normalize_space
 from ._normalization import (
@@ -254,10 +255,12 @@ def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
     if sf_layout != "cublas_blocked":
         raise InvalidInput("tlx.ops.mm_mxfp8 sf_layout must be 'natural' or 'cublas_blocked'; "
                            f"got {sf_layout!r}")
-    # M, N and K are 128-aligned, so the 128x4 atoms need no padding.
-    if a_scale.numel() != M * K // 32 or b_scale.numel() != N * K // 32:
+    # Each 128x4 atom includes padded rows when M or N is ragged.
+    expected_a = ((M + 127) // 128) * 128 * (K // 32)
+    expected_b = ((N + 127) // 128) * 128 * (K // 32)
+    if a_scale.numel() != expected_a or b_scale.numel() != expected_b:
         raise InvalidInput("tlx.ops.mm_mxfp8 cublas_blocked scales must contain exactly "
-                           f"{M * K // 32} a-scale and {N * K // 32} b-scale bytes; "
+                           f"{expected_a} a-scale and {expected_b} b-scale bytes; "
                            f"got {a_scale.numel()} and {b_scale.numel()}")
 
 
@@ -265,17 +268,18 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     """``a @ b.T`` over pre-quantized MXFP8 inputs, returning BF16 ``[M, N]``.
 
     ``a`` is contiguous E4M3 ``[M, K]`` and ``b`` is contiguous E4M3 ``[N, K]``
-    (K-major, as for a linear weight); M, N and K must be multiples of 128.
+    (K-major, as for a linear weight); K must be a multiple of 128.
+    M and N may be ragged on gfx950; sm100 still requires 128-aligned rows.
     Each run of 32 values along K has one E8M0 scale. ``sf_layout="natural"``
     takes ``[M, K // 32]`` and ``[N, K // 32]`` scales; ``"cublas_blocked"``
     takes the swizzled byte layout returned by torchao's
     ``MXTensor.to_mx(..., is_swizzled_scales=True)``. A supplied ``out`` is
     returned by identity. Forward-only.
 
-    ``space`` defaults to "full" (autotune; the first call per shape compiles
-    and benchmarks the pruned space). "heuristic" launches one shape-picked
-    config without autotuning. A ``Space`` is also accepted; its invariance
-    request is validated but not enforced yet.
+    ``space`` defaults to "full". On sm100 this autotunes a pruned space on
+    first use, while on gfx950 the current implementation has one shape-picked
+    schedule and treats "full" like "heuristic". A ``Space`` is also accepted;
+    its invariance request is validated but not enforced yet.
     """
     import torch
 
@@ -290,9 +294,12 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     if b_k != K:
         raise InvalidInput("tlx.ops.mm_mxfp8 reduction dimensions must match; "
                            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
-    if min(M, N, K) <= 0 or M % 128 or N % 128 or K % 128:
-        raise InvalidInput("tlx.ops.mm_mxfp8 requires positive M, N and K divisible by 128; "
+    if min(M, N, K) <= 0 or K % 128:
+        raise InvalidInput("tlx.ops.mm_mxfp8 requires positive M and N and K divisible by 128; "
                            f"got M={M}, N={N}, K={K}")
+    if (M % 128 or N % 128) and (a.device.type != "cuda" or _target(a.device).key != "gfx950"):
+        raise InvalidInput("tlx.ops.mm_mxfp8 requires M and N divisible by 128 outside gfx950; "
+                           f"got M={M}, N={N}")
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
         raise InvalidInput("tlx.ops.mm_mxfp8 expects E4M3 a and b; "
                            f"got a.dtype={a.dtype}, b.dtype={b.dtype}")
