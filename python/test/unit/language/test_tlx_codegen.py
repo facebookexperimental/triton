@@ -131,6 +131,44 @@ def test_clc_response_type_mangle():
         assert clc_mangle != mbar_mangle, f"num={num}: {clc_mangle}"
 
 
+def test_buffered_tensor_type_equality_matches_mangle():
+    """Equal buffered tensor types share a mangled JIT helper name, and any
+    field that changes the IR type or lowering separates both, with or
+    without a concrete IR type."""
+    layout = tlx.swizzled_shared_layout_encoding.make_default(2)
+    column_major = tlx.swizzled_shared_layout_encoding.make_default(2)
+    column_major.order = [0, 1]
+
+    def buffered(**changes):
+        fields = dict(element_ty=tl.float16, shape=[64, 64], num=2, storage=tlx.storage_kind.smem, layout=layout)
+        return tlx.buffered_tensor_type(**{**fields, **changes})
+
+    base = buffered()
+    assert base == buffered() and base.mangle() == buffered().mangle()
+    for variant in (buffered(element_ty=tl.float32), buffered(shape=[32, 64]), buffered(num=3),
+                    buffered(storage=tlx.storage_kind.smemCluster), buffered(layout=column_major)):
+        assert variant != base
+        assert variant.mangle() != base.mangle()
+
+
+def test_mbarrier_type_identity():
+    """Warp barriers arrive per thread and cluster views use another memory
+    space, so neither may share a JIT helper with an ordinary barrier."""
+    local = tlx.mbarrier_type(1, None, tlx.storage_kind.smem)
+    for other in (tlx.mbarrier_type(1, None, tlx.storage_kind.smem,
+                                    is_warp_barrier=True), tlx.mbarrier_type(1, None, tlx.storage_kind.smemCluster)):
+        assert other != local
+        assert other.mangle() != local.mangle()
+
+
+def test_type_mangles_distinguish_unequal_types():
+    single, empty = tlx.tensor_descriptor_ptr_type(1), tlx.tensor_descriptor_ptr_type(0)
+    assert single != empty and single.mangle() != empty.mangle()
+    unsized = tlx.storage_alias_spec_type(tlx.storage_kind.smem)
+    zero = tlx.storage_alias_spec_type(tlx.storage_kind.smem, 0)
+    assert unsized != zero and unsized.mangle() != zero.mangle()
+
+
 HIP_TARGET_CDNA4 = GPUTarget("hip", "gfx950", 64)
 
 
