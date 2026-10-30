@@ -15,6 +15,7 @@ from triton import knobs
 from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton._instrumentation import instrument as _instrument, is_enabled
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
+from triton.magnon.flags import apply_enabled as _compile_iq_apply_enabled
 from triton.runtime.errors import PTXASError
 from triton.tools.compile_trace import run_subprocess
 
@@ -1502,7 +1503,7 @@ class CUDABackend(BaseBackend):
 
             # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX hash hits
             # the ACF store, append --apply-controls (version check + lookup live in the helper).
-            if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
+            if _compile_iq_apply_enabled():
                 try:
                     from triton.magnon.consume import acf_args_for
 
@@ -1573,7 +1574,7 @@ please share the reproducer above with Triton project.
         (skips re-ptxas on later processes) -- and stash it as a pending candidate. The first launch
         runs a plain-vs-ACF A/B and keeps the winner. Cubins live in the compile_iq ACF store + in
         memory only; Triton's compile cache stays plain. ACF makes no difference to the launch ABI."""
-        if not os.environ.get("TRITON_COMPILE_IQ_APPLY"):
+        if not _compile_iq_apply_enabled():
             return
         try:
             ptx = ck.asm.get("ptx")
