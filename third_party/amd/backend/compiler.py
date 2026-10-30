@@ -44,6 +44,8 @@ class _AMDGPUCodegenOptions(ctypes.Structure):
         ("canonicalize_gep", ctypes.c_uint8),
         ("dump_ir", ctypes.c_uint8),
         ("enable_timing", ctypes.c_uint8),
+        ("enable_misched", ctypes.c_uint8),
+        ("emit_object", ctypes.c_uint8),
     ]
 
 
@@ -97,8 +99,6 @@ def _upgrade_legacy_named_barrier_address_spaces(src: str) -> str:
     for intrinsic in _NAMED_BARRIER_INTRINSICS:
         upgraded = upgraded.replace(f"@{intrinsic}(ptr addrspace(3)", f"@{intrinsic}(ptr addrspace(15)")
     return upgraded
-
-
 def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flags: list[str], enable_fp_fusion: bool,
                    disable_optimization: bool, canonicalize_gep: bool, disabled_passes: str, dump_ir: bool,
                    enable_timing: bool) -> str:
@@ -109,7 +109,9 @@ def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flag
         # whereas textual IR has no backwards-compatibility guarantee.
         # Express fusion permission in the IR because newer LLVM versions no
         # longer honor TargetOptions::AllowFPOpFusion during code generation.
-        llvm_ir = llvm.to_bitcode(src, enable_fp_fusion)
+        # Adapt alias-scope domains to the format supported by the
+        # independently pinned AMD code generator.
+        llvm_ir = llvm.to_bitcode(src, enable_fp_fusion, legacy_alias_scopes=True)
     else:
         # LLVM commit 5bf967cb132b changed named-barrier intrinsic operands from
         # address space 3 to 15. The bitcode reader rejects the legacy signature
@@ -117,7 +119,7 @@ def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flag
         # the narrowly upgraded module as text.
         llvm_ir = upgraded_src.encode("utf-8")
     options = _AMDGPUCodegenOptions(
-        1,
+        2,
         triple.encode("utf-8"),
         processor.encode("utf-8"),
         features.encode("utf-8"),
@@ -210,18 +212,25 @@ def is_expert_scheduling_enabled(arch):
     return arch in ["gfx1250"]
 
 
-def get_llvm_flags(arch):
+def get_llvm_flags(options):
     """LLVM command line flags for every LLVM pipeline run of a compilation.
 
-    These are process-wide LLVM options: compilations sharing a process can only
-    run in parallel while they use identical flags. Prefer per-function LLVM
-    attributes (see make_llir) whenever LLVM offers one.
+    Each flag is either a bare option name, which is set to true, or
+    "name=value". These are process-wide LLVM options: compilations sharing a
+    process can only run in parallel while they use identical flags. Prefer
+    per-function LLVM attributes (see make_llir) whenever LLVM offers one.
     """
     flags = []
     # LLVM has no per-function attribute for the AMDGPU register pressure
     # trackers yet.
-    if arch in ["gfx942", "gfx950"]:
+    if options.arch in ["gfx942", "gfx950"]:
         flags.append("amdgpu-use-amdgpu-trackers")
+    # Discourage VGPR reuse that creates VALU-to-DS WAR hazards and requires
+    # s_wait_alu va_vdst waits in expert scheduling mode.
+    if options.arch == "gfx1250" and is_expert_scheduling_enabled(options.arch):
+        flags.append("amdgpu-anti-hints-for-va-vdst")
+    # User-requested options come last so they override the defaults above.
+    flags.extend(f"{name}={value}" for name, value in options.llvm_cl_opts)
     return flags
 
 
@@ -243,7 +252,7 @@ def get_amdgpu_codegen_features(arch, llvm_ir, disable_packed_fp32_ops=False):
     return ",".join(feature for feature in features if feature)
 
 
-def _parse_llvm_fn_attrs(attrs):
+def _parse_llvm_key_values(attrs, bare_value=""):
     if not isinstance(attrs, str):
         return tuple(attrs)
     parsed = []
@@ -251,7 +260,7 @@ def _parse_llvm_fn_attrs(attrs):
         name, sep, value = attr.partition("=")
         name = name.strip()
         if name:
-            parsed.append((name, value.strip() if sep else ""))
+            parsed.append((name, value.strip() if sep else bare_value))
     return tuple(parsed)
 
 
@@ -317,6 +326,10 @@ class HIPOptions:
     # Comma-separated LLVM function attributes; bare names are emitted as valueless attributes.
     # Example: llvm_fn_attrs="amdgpu-sched-strategy=iterative-ilp,noinline"
     llvm_fn_attrs: str | Tuple[Tuple[str, str], ...] = ""
+    # Comma-separated LLVM command line options applied to every LLVM pipeline run of this kernel;
+    # bare names are set to true. Option names omit the leading dash.
+    # Example: llvm_cl_opts="amdgpu-use-amdgpu-trackers,unroll-threshold=150"
+    llvm_cl_opts: str | Tuple[Tuple[str, str], ...] = ""
 
     # Cache-keyed LLVM register-pressure controls. Keeping these as explicit
     # backend options lets pressure-sensitive kernels opt in without changing
@@ -367,7 +380,8 @@ class HIPOptions:
             )
             object.__setattr__(self, "kpack", 1)
 
-        object.__setattr__(self, 'llvm_fn_attrs', _parse_llvm_fn_attrs(self.llvm_fn_attrs))
+        object.__setattr__(self, 'llvm_fn_attrs', _parse_llvm_key_values(self.llvm_fn_attrs))
+        object.__setattr__(self, 'llvm_cl_opts', _parse_llvm_key_values(self.llvm_cl_opts, bare_value="true"))
 
         if self.sched_group_barrier_mfma_per_dwordx4 <= 0:
             raise ValueError("sched_group_barrier_mfma_per_dwordx4 must be positive")
@@ -875,7 +889,7 @@ class HIPBackend(BaseBackend):
         target_features = ""
         if knobs.compilation.enable_asan:
             target_features = '+xnack'
-        llvm.attach_datalayout(llvm_mod, target_triple, options.arch, target_features, get_llvm_flags(options.arch), "")
+        llvm.attach_datalayout(llvm_mod, target_triple, options.arch, target_features, get_llvm_flags(options), "")
 
         # Set various control constants on the LLVM module so that device
         # libraries can resolve references to them.
@@ -919,9 +933,6 @@ class HIPBackend(BaseBackend):
         if knobs.compilation.enable_asan:
             kernel_fn.add_fn_target_feature("+xnack")
             kernel_fn.add_fn_asan_attr()
-        for name, value in options.llvm_fn_attrs:
-            kernel_fn.remove_fn_attr(name)
-            kernel_fn.add_fn_attr(name, value)
 
         # Hint the compiler that we'd like the firmware to set the kernel arguments
         # to user SGPRs so that the kernel does not need to s_load its arguments
@@ -953,9 +964,15 @@ class HIPBackend(BaseBackend):
                     fn.add_fn_attr("amdgpu-expert-scheduling-mode", "true")
 
         # Keep VectorCombine on by default for stable gfx950 BF16 and FP8 code generation.
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', get_llvm_flags(options.arch),
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', get_llvm_flags(options),
                              options.enable_fp_fusion, disable_vector_combine=(options.disable_vector_combine
                                                                                or options.arch != "gfx950"))
+
+        # Apply user-provided attributes after optimization so they take
+        # precedence over attributes managed above.
+        for name, value in options.llvm_fn_attrs:
+            kernel_fn.remove_fn_attr(name)
+            kernel_fn.add_fn_attr(name, value)
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
@@ -999,7 +1016,7 @@ class HIPBackend(BaseBackend):
         assert len(names) == 1
         metadata["name"] = names[0]
         # llvm -> hsaco
-        flags = _get_codegen_flags(options) + get_llvm_flags(options.arch)
+        flags = _get_codegen_flags(options) + get_llvm_flags(options)
         if is_expert_scheduling_enabled(options.arch):
             flags.append("amdgpu-expert-scheduling-mode")
         features = get_amdgpu_codegen_features(options.arch, src, options.disable_packed_fp32_ops)

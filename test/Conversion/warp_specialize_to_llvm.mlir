@@ -232,21 +232,21 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32, 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
 
 // AMD-LABEL: @rewrite_barriers
-// AMD-DAG: llvm.mlir.global internal @nbar1
-// AMD-DAG: llvm.mlir.global internal @nbar2
-// AMD-DAG: llvm.mlir.global internal @nbar3
-// AMD-DAG: llvm.mlir.global internal @nbar4
+// AMD-DAG: llvm.mlir.global internal @nbar1() {addr_space = 15 : i32}
+// AMD-DAG: llvm.mlir.global internal @nbar2() {addr_space = 15 : i32}
+// AMD-DAG: llvm.mlir.global internal @nbar3() {addr_space = 15 : i32}
+// AMD-DAG: llvm.mlir.global internal @nbar4() {addr_space = 15 : i32}
 
 llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   // AMD: bb{{[0-9]+}}:
   // AMD-NEXT: rocdl.barrier
 
   // Check that named barriers are used and that we have the correct counts:
-  // AMD-DAG-COUNT-6: rocdl.s.barrier.join
-  // AMD-DAG-COUNT-4: rocdl.s.barrier.signal.var {{.*}}, 4
-  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}}, 2
-  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}}, 1
-  // AMD-DAG-COUNT-6: rocdl.s.barrier.wait 1
+  // AMD-DAG-COUNT-6: rocdl.s.barrier.join {{.*}} : !llvm.ptr<15>
+  // AMD-DAG-COUNT-4: rocdl.s.barrier.signal.var {{.*}} member_cnt = 4
+  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}} member_cnt = 2
+  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}} member_cnt = 1
+  // AMD-DAG-COUNT-6: rocdl.s.barrier.wait id = 1
 
   rocdl.barrier
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 10>}
@@ -391,7 +391,7 @@ llvm.func @generate_switch_loop() attributes {allocation.offset = 32 : i32} {
   // CHECK: [[DEFAULT]]:
   // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
   // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
-  // CHECK-NEXT: llvm.br [[SWITCH_LOOP]] {loop_annotation = #llvm.loop_annotation<licm = <disable = true>>}
+  // CHECK-NEXT: llvm.br [[SWITCH_LOOP]] loop_annotation = <licm = <disable = true>>
 
   // CHECK: [[EXIT]]:
   // CHECK-NEXT: llvm.return
@@ -462,7 +462,7 @@ llvm.func @generate_switch_loop() attributes {allocation.offset = 32 : i32} {
   // AMD: [[DEFAULT]]:
   // AMD-NEXT: rocdl.barrier
   // AMD-NEXT: rocdl.barrier
-  // AMD-NEXT: llvm.br [[SWITCH_LOOP]] {loop_annotation = #llvm.loop_annotation<licm = <disable = true>>}
+  // AMD-NEXT: llvm.br [[SWITCH_LOOP]] loop_annotation = <licm = <disable = true>>
 
   // AMD: [[EXIT]]:
   // AMD-NEXT: llvm.return
@@ -593,9 +593,9 @@ llvm.func @pass_captures() attributes {allocation.offset = 32 : i32} {
 
   // CHECK: ^bb4:
   // CHECK-NEXT: [[ARG0_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 0] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // CHECK-NEXT: [[ARG0:%.*]] = llvm.load [[ARG0_PTR]] {alignment = 1 : i64}
+  // CHECK-NEXT: [[ARG0:%.*]] = llvm.load [[ARG0_PTR]] <alignment = 1>
   // CHECK-NEXT: [[ARG1_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 1] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // CHECK-NEXT: [[ARG1:%.*]] = llvm.load [[ARG1_PTR]] {alignment = 1 : i64}
+  // CHECK-NEXT: [[ARG1:%.*]] = llvm.load [[ARG1_PTR]] <alignment = 1>
   // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
   // CHECK-NEXT: "use"([[ARG0]], [[ARG1]])
   // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
@@ -603,17 +603,17 @@ llvm.func @pass_captures() attributes {allocation.offset = 32 : i32} {
   // CHECK: ^bb5:
   // CHECK: [[INS:%.*]]:2 = "produce"()
   // CHECK: [[ARG0_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 0] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // CHECK-NEXT: llvm.store [[INS]]#0, [[ARG0_PTR]] {alignment = 1 : i64}
+  // CHECK-NEXT: llvm.store [[INS]]#0, [[ARG0_PTR]] <alignment = 1>
   // CHECK-NEXT: [[ARG1_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 1] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // CHECK-NEXT: llvm.store [[INS]]#1, [[ARG1_PTR]] {alignment = 1 : i64}
+  // CHECK-NEXT: llvm.store [[INS]]#1, [[ARG1_PTR]] <alignment = 1>
   // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
   // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
 
   // AMD: ^bb4:
   // AMD-NEXT: [[ARG0_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 0] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // AMD-NEXT: [[ARG0:%.*]] = llvm.load [[ARG0_PTR]] {alignment = 1 : i64}
+  // AMD-NEXT: [[ARG0:%.*]] = llvm.load [[ARG0_PTR]] <alignment = 1>
   // AMD-NEXT: [[ARG1_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 1] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // AMD-NEXT: [[ARG1:%.*]] = llvm.load [[ARG1_PTR]] {alignment = 1 : i64}
+  // AMD-NEXT: [[ARG1:%.*]] = llvm.load [[ARG1_PTR]] <alignment = 1>
   // AMD-NEXT: rocdl.barrier
   // AMD-NEXT: "use"([[ARG0]], [[ARG1]])
   // AMD-NEXT: rocdl.barrier
@@ -621,9 +621,9 @@ llvm.func @pass_captures() attributes {allocation.offset = 32 : i32} {
   // AMD: ^bb5:
   // AMD: [[INS:%.*]]:2 = "produce"()
   // AMD: [[ARG0_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 0] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // AMD-NEXT: llvm.store [[INS]]#0, [[ARG0_PTR]] {alignment = 1 : i64}
+  // AMD-NEXT: llvm.store [[INS]]#0, [[ARG0_PTR]] <alignment = 1>
   // AMD-NEXT: [[ARG1_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 1] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // AMD-NEXT: llvm.store [[INS]]#1, [[ARG1_PTR]] {alignment = 1 : i64}
+  // AMD-NEXT: llvm.store [[INS]]#1, [[ARG1_PTR]] <alignment = 1>
   // AMD-NEXT: rocdl.barrier
   // AMD-NEXT: rocdl.barrier
 
