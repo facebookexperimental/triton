@@ -2,6 +2,7 @@
 import contextlib
 import functools
 import inspect
+import re
 import unittest
 from unittest import mock
 
@@ -2626,19 +2627,27 @@ class TestHopperMMTemplate(TestCase):
 
     @parametrize("block_n", (192, 96))
     @parametrize("bias_shape", ("n", "mn"))
-    def test_addmm_npot_tile(self, block_n, bias_shape):
+    @parametrize("n", (1000, 2048))
+    def test_addmm_npot_tile(self, block_n, bias_shape, n):
         """A two-piece N tile (192 = 128 + 64, 96 = 64 + 32), with the bias added
-        to each of the six equal epilogue subtiles. B is K-major."""
+        to each of the six equal epilogue subtiles. B is K-major. N = 2048 is a
+        multiple of every power-of-two block, so Inductor would drop the bias
+        load's mask, but the last tile still runs past N: the load must stay masked."""
         from triton.tlx.ops.kernels.mm import sm90
 
-        m, n, k = 2136, 1000, 448
+        m, k = 2136, 448
         a, b = _operands((m, n, k), "nt", torch.float16)
         bias = torch.randn(n if bias_shape == "n" else (m, n), device=GPU_TYPE, dtype=torch.float16)
         conf = next(c for c in sm90._npot_configs() if c.kwargs["BN"] == block_n)
         with mock.patch.object(sm90, "heuristic_config", return_value=[conf]), config.patch(_HOPPER_ADDMM_PATCH):
             actual, code = run_and_get_code(torch.compile(torch.addmm), bias, a, b)
         torch.testing.assert_close(actual, (bias.float() + a.float() @ b.float()).half(), atol=2e-2, rtol=2e-2)
-        self.assertIn("_consume_tile_pieces", "\n".join(code))
+        generated = "\n".join(code)
+        self.assertIn("_consume_tile_pieces", generated)
+        bias_loads = re.findall(r"tl\.load\(in_ptr\d+ \+ [^\n]*", generated)
+        self.assertTrue(bias_loads)
+        for load in bias_loads:
+            self.assertIn("ymask", load)
 
     @parametrize("op", ("mm", "addmm_n", "addmm_mn", "mm_gelu"))
     @parametrize("swap_ab", (False, True))
