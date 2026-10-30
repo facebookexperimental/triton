@@ -137,7 +137,10 @@ class TestTLXReductionEpilogue(TestCase):
         from triton.language.extra.tlx.inductor import reduction_epilogue
 
         scheduling_classes = [type("Scheduling", (), {}) for _ in range(2)]
-        scheduler_class = type("Scheduler", (), {"speedup_by_fusion": mock.Mock()})
+        scheduler_class = type("Scheduler", (), {
+            "speedup_by_fusion": mock.Mock(),
+            "benchmark_codegened_module": mock.Mock(return_value=(1.0, "")),
+        })
         kernel_class = type(
             "Kernel", (), {
                 name: mock.Mock()

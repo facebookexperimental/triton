@@ -11,6 +11,7 @@ import dataclasses
 import logging
 import math
 import os
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -57,6 +58,14 @@ _UNARY_OPS = {
 }
 _CONSUMER_MAX_BLOCK_N = 4096
 _CONSUMER_MAX_BLOCK_STATS = 1024
+_CONSUMER_MAX_BLOCK_ROWS = 8
+_CONSUMER_NUM_WARPS = 4
+# Consumer streaming throughput measured on MI300X (bytes per millisecond).
+_CONSUMER_BYTES_PER_MS = 2.0e9
+# A fused near-tie regresses steady state, so fusion must win by this factor.
+_FUSION_MIN_SPEEDUP = 1.05
+_CONSUMER_COST_MARKER = "# tlx_consumer_ms="
+_CONSUMER_COST_EMITTED = False
 _INSTALLED = False
 
 
@@ -89,6 +98,11 @@ class TlxReductionEpiloguePlan:
     final_value: GemmEpilogueIRExpression
     reductions: tuple[RowReduction, ...]
     columns: int
+    # Reductions recomputed from another one: (alias, target, output index, scale).
+    # sum((u - sum(u) / N)^2) -> welford_reduce(u) m2; sum(u) -> welford_reduce(u) mean * N.
+    aliases: tuple[tuple[RowReduction, RowReduction, int, float], ...] = ()
+    # External [M, N] inputs (e.g. residuals) the consumer re-reads.
+    tile_inputs: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,6 +138,17 @@ def _buffer_context(buffer: ComputedBuffer, rows: sympy.Expr, columns: int) -> _
     raise _Reject("unsupported epilogue buffer shape")
 
 
+def _is_tile_input(buffer: Buffer, rows: sympy.Expr, columns: int) -> bool:
+    """An external [M, N] input such as a residual, indexed like the GEMM tile."""
+    size = buffer.get_size()
+    sizevars = V.graph.sizevars
+    return (
+        len(size) == 2
+        and sizevars.statically_known_equals(size[0], rows)
+        and sizevars.statically_known_equals(size[1], columns)
+    )
+
+
 def _is_row_buffer(buffer: Buffer) -> bool:
     return all(V.graph.sizevars.statically_known_equals(s, 1) for s in buffer.get_size()[1:])
 
@@ -148,7 +173,39 @@ class _Validator:
         self.contexts = contexts
         self.columns = columns
         self.reductions: dict[RowReduction, None] = {}
+        self.aliases: dict[RowReduction, tuple[RowReduction, int, float]] = {}
+        self.tile_inputs: dict[str, None] = {}
         self.memo: dict[tuple[int, int, bool], bool] = {}
+
+    def _row_mean_source(self, expr: object) -> GemmEpilogueIRExpression | None:
+        """Return u when expr is sum(u) / N over all GEMM columns."""
+        if not isinstance(expr, GemmEpilogueIRExpression) or expr.op != "truediv":
+            return None
+        total, divisor = expr.args
+        if not isinstance(divisor, GemmEpilogueIRExpression) or divisor.op not in ("index_expr", "constant"):
+            return None
+        if float(divisor.args[0]) != float(self.columns):
+            return None
+        if isinstance(total, GemmEpilogueIRExpression) and total.op == "load" and total.args[0] in self.buffers:
+            total = total.args[2]
+        if isinstance(total, GemmEpilogueIRExpression) and total.op == "reduction" and total.args[2] == "sum":
+            return total.args[3]
+        return None
+
+    def _centered_square_source(self, source: object) -> GemmEpilogueIRExpression | None:
+        """Return u when source is (u - mean(u))^2, the summand of a centered second moment."""
+        if not isinstance(source, GemmEpilogueIRExpression):
+            return None
+        if source.op == "square":
+            centered = source.args[0]
+        elif source.op == "mul" and source.args[0] == source.args[1]:
+            centered = source.args[0]
+        else:
+            return None
+        if not isinstance(centered, GemmEpilogueIRExpression) or centered.op != "sub":
+            return None
+        value, mean = centered.args
+        return value if self._row_mean_source(mean) == value else None
 
     def _check_index(self, index: sympy.Expr, expected: sympy.Expr) -> None:
         if not V.graph.sizevars.statically_known_equals(index - expected, 0):
@@ -191,14 +248,26 @@ class _Validator:
             if buffer is None or ctx.column is None:
                 raise _Reject("unsupported external load")
             size, stride = buffer.get_size(), buffer.get_stride()
+            if _is_tile_input(buffer, self.gemm.get_size()[0], self.columns):
+                self._check_index(index, ctx.row * stride[0] + ctx.column * stride[1])
+                self.tile_inputs[name] = None
+                return False
             if len(size) != 1 or not V.graph.sizevars.statically_known_equals(size[0], self.columns):
-                raise _Reject("external input is not an [N] vector")
+                raise _Reject("external input is not an [N] vector or [M, N] tile")
             self._check_index(index, ctx.column * stride[0])
             return False
         if op == "reduction":
             if in_reduction:
                 raise _Reject("nested reduction")
             reduction_type, source = args[2], args[3]
+            centered = self._centered_square_source(source) if reduction_type == "sum" else None
+            if centered is not None:
+                if not self.visit(centered, ctx, in_reduction=True):
+                    raise _Reject("centered moment does not read the GEMM tile")
+                welford = RowReduction("welford_reduce", centered)
+                self.reductions[welford] = None
+                self.aliases[RowReduction(reduction_type, source)] = (welford, 1, 1.0)
+                return False
             if reduction_type not in _SUPPORTED_REDUCTIONS:
                 raise _Reject("unsupported reduction type")
             if reduction_type == "welford_reduce" and args[4] not in (0, 1, 2):
@@ -282,12 +351,19 @@ def plan_reduction_epilogue(
         return None
     if not validator.reductions:
         return None
+    for reduction in list(validator.reductions):
+        welford = RowReduction("welford_reduce", reduction.source)
+        if reduction.reduction_type == "sum" and welford in validator.reductions:
+            del validator.reductions[reduction]
+            validator.aliases[reduction] = (welford, 0, float(columns))
     return TlxReductionEpiloguePlan(
         raw_output=gemm.get_name(),
         final_output=final.get_name(),
         final_value=store.value,
         reductions=tuple(validator.reductions),
         columns=columns,
+        aliases=tuple((alias, *target) for alias, target in validator.aliases.items()),
+        tile_inputs=tuple(validator.tile_inputs),
     )
 
 
@@ -298,6 +374,26 @@ def _template_supports_row_partials(template: object) -> bool:
             return getattr(caller, "_tlx_row_partials", False)
         return any(getattr(choice, "_tlx_row_partials", False) for choice in template.choices)
     return False
+
+
+def _consumer_cost_ms(kernel: TritonTemplateKernel, plan: TlxReductionEpiloguePlan) -> float:
+    """Estimated runtime of the generated consumer from the bytes it streams."""
+    elements = V.graph.sizevars.optimization_hint(kernel.output_node.get_size()[0]) * plan.columns
+    names = (plan.raw_output, plan.final_output, *plan.tile_inputs)
+    return sum(elements * V.graph.get_buffer(name).get_dtype().itemsize for name in names) / _CONSUMER_BYTES_PER_MS
+
+
+def _module_consumer_cost_ms(module: Any) -> float:
+    # Only modules from a process that emitted row partials can carry the marker.
+    path = getattr(module, "__file__", None)
+    if not _CONSUMER_COST_EMITTED or path is None:
+        return 0.0
+    try:
+        with open(path) as f:
+            source = f.read()
+    except OSError:
+        return 0.0
+    return sum(float(ms) for ms in re.findall(_CONSUMER_COST_MARKER + r"([0-9.]+)", source))
 
 
 def can_fuse_reduction_epilogue(
@@ -319,13 +415,14 @@ class _Emitter:
         self.bind_load = bind_load
         self.bind_reduction = bind_reduction
         self.lines: list[str] = []
-        self.memo: dict[int, str] = {}
+        self.memo: dict[object, str] = {}
 
     def emit(self, expr: object) -> str:
         if not isinstance(expr, GemmEpilogueIRExpression):
             raise AssertionError(f"unexpected epilogue operand {expr!r}")
-        if id(expr) in self.memo:
-            return self.memo[id(expr)]
+        key = self._key(expr)
+        if key in self.memo:
+            return self.memo[key]
         op, args = expr.op, expr.args
         if op == "load":
             name, _, stored = args
@@ -342,8 +439,16 @@ class _Emitter:
             value = _UNARY_OPS[op].format(self.emit(args[0]))
         name = f"{self.prefix}{len(self.memo)}"
         self.lines.append(f"{name} = {value}")
-        self.memo[id(expr)] = name
+        self.memo[key] = name
         return name
+
+    @staticmethod
+    def _key(expr: GemmEpilogueIRExpression) -> object:
+        # Structurally equal subexpressions (e.g. repeated tile loads) share one SSA value.
+        try:
+            return hash(expr), expr
+        except TypeError:
+            return id(expr)
 
 
 def _stat_slots(plan: TlxReductionEpiloguePlan) -> list[int]:
@@ -378,9 +483,16 @@ def _workspace(kernel: TritonTemplateKernel, plan: TlxReductionEpiloguePlan, par
     return workspace
 
 
-def _vector_load(kernel: TritonTemplateKernel, name: str, columns: str, mask: str) -> str:
-    stride = kernel.kexpr(kernel.rename_indexing(V.graph.get_buffer(name).get_stride()[0]))
-    return f"tl.load({kernel.args.input(name)} + ({columns}) * ({stride}), mask={mask}, other=0.0).to(tl.float32)"
+def _vector_load(kernel: TritonTemplateKernel, name: str, columns: str, mask: str, rows: str | None = None) -> str:
+    buffer = V.graph.get_buffer(name)
+    strides = [kernel.kexpr(kernel.rename_indexing(s)) for s in buffer.get_stride()]
+    if len(strides) == 2:
+        if rows is None:
+            raise AssertionError("tile input needs a row index")
+        offset = f"({rows}) * ({strides[0]}) + ({columns}) * ({strides[1]})"
+    else:
+        offset = f"({columns}) * ({strides[0]})"
+    return f"tl.load({kernel.args.input(name)} + {offset}, mask={mask}, other=0.0).to(tl.float32)"
 
 
 def _partial_stat_lines(
@@ -394,12 +506,17 @@ def _partial_stat_lines(
     row_index, column_index = indices
     rows, columns = kernel.size(None, 0), kernel.size(None, 1)
     nblocks = kernel._tlx_reduction_nblocks
+    width = kernel._tlx_reduction_partial_columns
     out_dtype = triton_type(kernel.output_node.get_dtype())
     gemm = plan.raw_output
     column_mask = f"({column_index} < {columns})"
 
     def bind_load(name: str) -> str:
-        return "tlx_raw" if name == gemm else _vector_load(kernel, name, column_index, column_mask)
+        if name == gemm:
+            return "tlx_raw"
+        if len(V.graph.get_buffer(name).get_size()) == 2:
+            return _vector_load(kernel, name, column_index, mask, rows=row_index)
+        return _vector_load(kernel, name, column_index, column_mask)
 
     lines = [
         f"tlx_raw = {value}.to({out_dtype}).to(tl.float32)",
@@ -417,7 +534,7 @@ def _partial_stat_lines(
             lines.append(f"tl.store({ws}, tlx_sum{k}, mask=tlx_row_mask)")
             continue
         lines += [
-            f"tlx_count{k} = tl.sum({mask}.to(tl.float32), axis=1)",
+            f"tlx_count{k} = tl.where(tlx_row_mask, tl.minimum({width}, {columns} - ({partial_index}) * {width}), 0).to(tl.float32)",
             f"tlx_mean{k} = tlx_sum{k} / tl.maximum(tlx_count{k}, 1.0)",
             f"tlx_dev{k} = tl.where({mask}, {source} - tlx_mean{k}[:, None], 0.0)",
             f"tl.store({ws}, tlx_mean{k}, mask=tlx_row_mask)",
@@ -426,11 +543,21 @@ def _partial_stat_lines(
     return lines
 
 
+def _consumer_block_n(n: int) -> int:
+    """Column chunk for the consumer loop: an exact divisor of N avoids masked lanes."""
+    divisor = n & -n
+    if divisor >= 256:
+        return min(divisor, 1024)
+    return min(_CONSUMER_MAX_BLOCK_N, 1 << (n - 1).bit_length())
+
+
 def _consumer_body(kernel: TritonTemplateKernel, plan: TlxReductionEpiloguePlan, partial_columns: int) -> str:
-    """Combine row partials and evaluate the final epilogue expression per row."""
+    """Combine row partials and evaluate the final epilogue expression, a block of rows per program."""
     n = plan.columns
     nblocks = kernel._tlx_reduction_nblocks
-    block_n = min(_CONSUMER_MAX_BLOCK_N, 1 << (n - 1).bit_length())
+    block_n = _consumer_block_n(n)
+    block_rows = _consumer_block_rows(block_n)
+    kernel._tlx_reduction_consumer_rows = block_rows
     block_stats = min(_CONSUMER_MAX_BLOCK_STATS, 1 << max(nblocks - 1, 0).bit_length())
     rows = kernel.kexpr(kernel.rename_indexing(kernel.output_node.get_size()[0]))
     raw = kernel.args.output(plan.raw_output)
@@ -438,46 +565,65 @@ def _consumer_body(kernel: TritonTemplateKernel, plan: TlxReductionEpiloguePlan,
     out_dtype = triton_type(V.graph.get_buffer(plan.final_output).get_dtype())
     lines = [
         f"INDEX_DTYPE: tl.constexpr = {getattr(kernel, 'index_dtype', 'tl.int32')}",
-        "tlx_row = tl.program_id(0).to(tl.int64)",
+        f"tlx_row = tl.program_id(0).to(tl.int64) * {block_rows} + tl.arange(0, {block_rows}).to(tl.int64)",
+        f"tlx_rm = tlx_row < {rows}",
         f"tlx_stats = tl.arange(0, {block_stats})",
     ]
     values: dict[tuple[RowReduction, int], str] = {}
     for k, (reduction, slot) in enumerate(zip(plan.reductions, _stat_slots(plan))):
-        base = f"row_stats_ws + ({slot} * {rows} + tlx_row) * {nblocks}"
+        base = f"row_stats_ws + ({slot} * {rows} + tlx_row[:, None]) * {nblocks}"
         loop = [
             f"for tlx_p0 in range(0, {nblocks}, {block_stats}):",
-            "    tlx_p = tlx_p0 + tlx_stats",
-            f"    tlx_pm = tlx_p < {nblocks}",
+            "    tlx_p = (tlx_p0 + tlx_stats)[None, :]",
+            f"    tlx_pm = tlx_rm[:, None] & (tlx_p < {nblocks})",
             f"    tlx_part = tl.load({base} + tlx_p, mask=tlx_pm, other=0.0)",
         ]
+        zeros = f"tl.zeros([{block_rows}, {block_stats}], dtype=tl.float32)"
         if reduction.reduction_type == "sum":
-            lines += [f"tlx_acc{k} = tl.zeros([{block_stats}], dtype=tl.float32)", *loop, f"    tlx_acc{k} += tlx_part", f"tlx_red{k}_0 = tl.sum(tlx_acc{k}, axis=0)"]
-            values[(reduction, 0)] = f"tlx_red{k}_0"
+            lines += [f"tlx_acc{k} = {zeros}", *loop, f"    tlx_acc{k} += tlx_part", f"tlx_red{k}_0 = tl.sum(tlx_acc{k}, axis=1)"]
+            values[(reduction, 0)] = f"tlx_red{k}_0[:, None]"
             continue
         # Chan's parallel combine: partial counts are the valid columns per block.
         count = f"tl.where(tlx_pm, tl.minimum({partial_columns}, {n} - tlx_p * {partial_columns}), 0).to(tl.float32)"
         m2 = f"tl.load({base} + {rows} * {nblocks} + tlx_p, mask=tlx_pm, other=0.0)"
-        lines += [f"tlx_acc{k} = tl.zeros([{block_stats}], dtype=tl.float32)", *loop, f"    tlx_acc{k} += {count} * tlx_part", f"tlx_red{k}_0 = tl.sum(tlx_acc{k}, axis=0) / {float(n)!r}"]
-        lines += [f"tlx_acc{k} = tl.zeros([{block_stats}], dtype=tl.float32)", *loop, f"    tlx_dm = tlx_part - tlx_red{k}_0", f"    tlx_acc{k} += {m2} + {count} * tlx_dm * tlx_dm", f"tlx_red{k}_1 = tl.sum(tlx_acc{k}, axis=0)"]
-        values[(reduction, 0)] = f"tlx_red{k}_0"
-        values[(reduction, 1)] = f"tlx_red{k}_1"
+        lines += [f"tlx_acc{k} = {zeros}", *loop, f"    tlx_acc{k} += {count} * tlx_part", f"tlx_red{k}_0 = tl.sum(tlx_acc{k}, axis=1) / {float(n)!r}"]
+        lines += [f"tlx_acc{k} = {zeros}", *loop, f"    tlx_dm = tlx_part - tlx_red{k}_0[:, None]", f"    tlx_acc{k} += {m2} + {count} * tlx_dm * tlx_dm", f"tlx_red{k}_1 = tl.sum(tlx_acc{k}, axis=1)"]
+        values[(reduction, 0)] = f"tlx_red{k}_0[:, None]"
+        values[(reduction, 1)] = f"tlx_red{k}_1[:, None]"
         values[(reduction, 2)] = repr(float(n))
 
     def bind_load(name: str) -> str:
         if name == plan.raw_output:
-            return f"tl.load({raw} + tlx_row * {n} + tlx_cols, mask=tlx_cm, other=0.0).to(tl.float32)"
+            return f"tl.load({raw} + tlx_row[:, None] * {n} + tlx_cols[None, :], mask=tlx_m, other=0.0).to(tl.float32)"
+        if len(V.graph.get_buffer(name).get_size()) == 2:
+            return _vector_load(kernel, name, "tlx_cols[None, :]", "tlx_m", rows="tlx_row[:, None]")
         return _vector_load(kernel, name, "tlx_cols", "tlx_cm")
 
-    emitter = _Emitter("tlx_v", bind_load, lambda reduction, index: values[(reduction, index)])
+    aliases = {alias: (target, index, scale) for alias, target, index, scale in plan.aliases}
+
+    def bind_reduction(reduction: RowReduction, index: int) -> str:
+        if reduction not in aliases:
+            return values[(reduction, index)]
+        target, target_index, scale = aliases[reduction]
+        value = values[(target, target_index)]
+        return value if scale == 1.0 else f"({value} * {scale!r})"
+
+    emitter = _Emitter("tlx_v", bind_load, bind_reduction)
     result = emitter.emit(plan.final_value)
     lines += [
         f"for tlx_c0 in range(0, {n}, {block_n}):",
         f"    tlx_cols = tlx_c0 + tl.arange(0, {block_n})",
         f"    tlx_cm = tlx_cols < {n}",
+        "    tlx_m = tlx_rm[:, None] & tlx_cm[None, :]",
         *(f"    {line}" for line in emitter.lines),
-        f"    tl.store({final} + tlx_row * {n} + tlx_cols, {result}.to({out_dtype}), mask=tlx_cm)",
+        f"    tl.store({final} + tlx_row[:, None] * {n} + tlx_cols[None, :], {result}.to({out_dtype}), mask=tlx_m)",
     ]
     return "\n".join(lines) + "\n"
+
+
+def _consumer_block_rows(block_n: int) -> int:
+    # A single-row 2D block compiles poorly; keep at least two rows per program.
+    return max(2, min(_CONSUMER_MAX_BLOCK_ROWS, 2048 // block_n))
 
 
 def _resolve_columns(kernel: TritonTemplateKernel, expression: int | str) -> int:
@@ -511,6 +657,7 @@ def reduction_store_output(
         raise RowPartialsUnsupported("row-partial epilogues require SPLIT_K=1")
     width = _resolve_columns(kernel, partial_columns)
     _workspace(kernel, plan, width)
+    first_store = not kernel._tlx_row_partials_emitted
     kernel._tlx_row_partials_emitted = True
 
     raw_name = plan.raw_output
@@ -520,6 +667,10 @@ def reduction_store_output(
     def store_with_partials(name, index, store_value, mode=None):  # type: ignore[no-untyped-def]
         result = original_store(name, index, store_value, mode)
         if name == raw_name:
+            if first_store:
+                global _CONSUMER_COST_EMITTED
+                _CONSUMER_COST_EMITTED = True
+                kernel.compute.writeline(f"{_CONSUMER_COST_MARKER}{_consumer_cost_ms(kernel, plan):.6f}")
             for line in _partial_stat_lines(kernel, plan, str(store_value), indices, mask, partial_index):
                 kernel.compute.writeline(line)
         return result
@@ -548,7 +699,8 @@ def emit_post_kernel(kernel: TritonTemplateKernel, wrapper: Any, kernel_name: st
     name = f"{kernel_name}_row_consumer"
     source = IndentedBuffer()
     source.splice(kernel.gen_common_triton_imports())
-    source.splice(kernel.jit_lines())
+    # The consumer streams rows; the GEMM's warp count does not fit it.
+    source.splice(re.sub(r"num_warps=\d+", f"num_warps={_CONSUMER_NUM_WARPS}", kernel.jit_lines()))
     source.writeline(f"def {name}({', '.join(arg.full_name() for arg in argdefs)}):")
     with source.indent():
         source.splice(body)
@@ -565,7 +717,7 @@ def emit_post_kernel(kernel: TritonTemplateKernel, wrapper: Any, kernel_name: st
     kernel_body = compile_wrapper.getvalue()
     wrapper.src_to_kernel[kernel_body] = name
     wrapper.define_kernel(name, kernel_body, "# TorchTLX reduction epilogue consumer")
-    grid_args = [kernel.output_node.get_size()[0], sympy.Integer(1), sympy.Integer(1)]
+    grid_args = [CeilDiv(kernel.output_node.get_size()[0], kernel._tlx_reduction_consumer_rows), sympy.Integer(1), sympy.Integer(1)]
     wrapper.generate_kernel_call(
         name,
         [*call_args, *grid_args],
@@ -631,6 +783,19 @@ def install() -> None:
             return original_speedup_by_fusion(self, node1, node2)
 
     Scheduler.speedup_by_fusion = patched_speedup_by_fusion
+
+    original_benchmark = Scheduler.benchmark_codegened_module
+
+    def patched_benchmark(self, module, device):  # type: ignore[no-untyped-def]
+        # Fusion benchmarking times only the template kernel; the consumer it
+        # launches afterwards is charged from the marker in the kernel source.
+        ms, path = original_benchmark(self, module, device)
+        consumer_ms = _module_consumer_cost_ms(module)
+        if consumer_ms:
+            ms = (ms + consumer_ms) * _FUSION_MIN_SPEEDUP
+        return ms, path
+
+    Scheduler.benchmark_codegened_module = patched_benchmark
 
     original_codegen = TritonTemplateKernel.codegen_template_body
 
