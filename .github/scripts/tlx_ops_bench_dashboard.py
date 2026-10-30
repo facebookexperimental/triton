@@ -24,6 +24,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "facebookexperimental/triton")
 TAG = "tlx-ops-bench"
@@ -111,6 +112,15 @@ def summarize(args):
         ops[op] = {
             "ref": env.get("ref"), "space": env.get("space"), "cold_compile": env.get("cold_compile"), "cases": cases
         }
+    bench_ops = {f"test_op_perf[{script.removesuffix('.py')}]": op for op, script in BENCH_SCRIPT.items()}
+    for path in sorted(glob.glob(os.path.join(args.dir, "**", "*.xml"), recursive=True)):
+        for test in ET.parse(path).iter("testcase"):
+            op = bench_ops.get(test.get("name"))
+            skipped = test.find("skipped")
+            if op is not None and skipped is not None:
+                ops.setdefault(
+                    op,
+                    {"ref": None, "space": None, "cold_compile": None, "reason": skipped.get("message"), "cases": []})
     date = re.search(r"\.dev(\d{8})", args.version)
     gpu = env.get("gpu") or {}
     torch_version = env.get("torch") or ""
@@ -382,7 +392,8 @@ def page_data(runs):
         for night in nights:
             for name, op in night["ops"].items():
                 entry = ops.setdefault(name, {"cases": []})
-                entry.update(ref=op.get("ref"), space=op.get("space"), cold=op.get("cold_compile"))
+                entry.update(ref=op.get("ref"), space=op.get("space"), cold=op.get("cold_compile"),
+                             reason=op.get("reason"))
                 index = catalog.setdefault(name, {})
                 for c in op["cases"]:
                     if c["key"] not in index:
