@@ -49,7 +49,7 @@ def _allocate_buffers(a_desc, b_desc, BM: tl.constexpr, BN: tl.constexpr, BK: tl
 def _k_tile_range(K, split_id, BK: tl.constexpr, SPLIT_K: tl.constexpr):
     k_tiles = tl.cdiv(K, BK)
     if SPLIT_K == 1:
-        return 0, k_tiles
+        return k_tiles * 0, k_tiles
     # Callers prune SPLIT_K so that every split owns at least one K tile; an
     # empty split would leave the consumer waiting on a barrier forever.
     k_tiles_per_split = tl.cdiv(k_tiles, SPLIT_K)
