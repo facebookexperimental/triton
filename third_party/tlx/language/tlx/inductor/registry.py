@@ -279,7 +279,10 @@ def _select_group_size_m(M: int, N: int, block_m: int) -> int:
 
 
 def _is_config_valid(
-    config: dict[str, Any], tma_epilogue_store: bool = False, smem_margin: int = 0
+    config: dict[str, Any],
+    tma_epilogue_store: bool = False,
+    smem_margin: int = 0,
+    elem_bytes: int = resources.OPERAND_ELEM_BYTES,
 ) -> bool:
     """Check if a config is valid based on hardware constraints.
 
@@ -287,7 +290,7 @@ def _is_config_valid(
     ``resources.estimate_smem``.
     """
     return validate_config(
-        BlackwellWSGemmConfig.from_dict(config),
+        dataclasses.replace(BlackwellWSGemmConfig.from_dict(config), elem_bytes=elem_bytes),
         charge_epilogue=tma_epilogue_store,
         split_k=config.get("SPLIT_K", 1),
         smem_margin=smem_margin,
@@ -1100,18 +1103,22 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         num_mma_groups: int,
         num_ctas: int,
         epilogue_subtile: int,
+        elem_bytes: int = resources.OPERAND_ELEM_BYTES,
     ) -> bool:
         """Validate the final tile's structural rules and SMEM with a safety margin."""
         return validate_config(
-            cls._tile(
-                block_m,
-                block_n,
-                block_k,
-                num_smem_buffers,
-                num_tmem_buffers,
-                num_mma_groups,
-                num_ctas,
-                epilogue_subtile,
+            dataclasses.replace(
+                cls._tile(
+                    block_m,
+                    block_n,
+                    block_k,
+                    num_smem_buffers,
+                    num_tmem_buffers,
+                    num_mma_groups,
+                    num_ctas,
+                    epilogue_subtile,
+                ),
+                elem_bytes=elem_bytes,
             ),
             charge_epilogue=True,
             smem_margin=cls._SMEM_SAFETY_MARGIN,
@@ -1191,6 +1198,10 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         m, n, k = kernel_inputs.mnk_hinted()
         num_sms = get_num_sms()
         is_allow_mode = config.triton.tlx_mode == "allow"
+        # The config pool and the heuristic are sized for 2-byte operands; wider
+        # operands (FP32) double the operand and epilogue staging SMEM.
+        elem_bytes = kernel_inputs.dtype(kernel_inputs._mat1_idx).itemsize
+        wide_operands = elem_bytes != resources.OPERAND_ELEM_BYTES
 
         # Try heuristic config selection first (matches tlx_matmul_ws behavior).
         # Always validate without TMA epilogue store, matching upstream TLX.
@@ -1248,7 +1259,9 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             # config — autotuning configs provide fallback if this is skipped.
             # In force mode, always yield since it's the only config.
             BLOCK_K = template_kwargs["BLOCK_K"]
-            skip_heuristic = is_allow_mode and not self._is_valid_config_with_margin(
+            # A wide-operand heuristic config that cannot launch falls through to
+            # the pool in force mode too.
+            skip_heuristic = (is_allow_mode or wide_operands) and not self._is_valid_config_with_margin(
                 BLOCK_M,
                 BLOCK_N,
                 BLOCK_K,
@@ -1257,6 +1270,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 heuristic_config["NUM_MMA_GROUPS"],
                 NUM_CTAS,
                 heuristic_config["EPILOGUE_SUBTILE"],
+                elem_bytes,
             )
             heuristic_yielded = False
             if skip_heuristic:
@@ -1279,7 +1293,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                     yield template_kwargs
                     heuristic_yielded = True
                 else:
-                    for tma_kwargs in self._yield_tma_variants(template_kwargs):
+                    for tma_kwargs in self._yield_tma_variants(template_kwargs, elem_bytes):
                         yield tma_kwargs
                         heuristic_yielded = True
 
@@ -1352,6 +1366,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 NUM_MMA_GROUPS,
                 NUM_CTAS,
                 EPILOGUE_SUBTILE,
+                elem_bytes,
             ):
                 continue
 
@@ -1363,11 +1378,12 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 }
 
             # Yield TMA epilogue store variant(s)
-            yield from self._yield_tma_variants(template_kwargs)
+            yield from self._yield_tma_variants(template_kwargs, elem_bytes)
 
     @staticmethod
     def _yield_tma_variants(
         template_kwargs: dict[str, Any],
+        elem_bytes: int = resources.OPERAND_ELEM_BYTES,
     ) -> Generator[dict[str, Any], None, None]:
         """Yield TMA_EPILOGUE_STORE=1 (preferred) or TMA=0 fallback.
 
@@ -1398,14 +1414,14 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             # but can fail after fusion adds SMEM in the final codegen.
             _TMA_SMEM_MARGIN = 8192
             if _is_config_valid(
-                config_dict, tma_epilogue_store=True, smem_margin=_TMA_SMEM_MARGIN
+                config_dict, tma_epilogue_store=True, smem_margin=_TMA_SMEM_MARGIN, elem_bytes=elem_bytes
             ):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
             else:
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 0}
         else:
             # 2-CTA requires TMA (tl.store incompatible with MultiCTAReduction)
-            if _is_config_valid(config_dict, tma_epilogue_store=True):
+            if _is_config_valid(config_dict, tma_epilogue_store=True, elem_bytes=elem_bytes):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
 
 
@@ -2503,42 +2519,6 @@ class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuri
         self, conf: GemmConfig
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         return get_tlx_config_key_and_kwargs(conf)
-
-    def _get_template_configs_impl(
-        self,
-        kernel_inputs: KernelInputs,
-        op_name: str,
-    ) -> Generator[dict[str, Any], None, None]:
-        # The config pool and the heuristic are sized for 2-byte operands. Wider
-        # operands (FP32) double the operand and epilogue staging SMEM, so drop
-        # the configs that would fail to launch with OutOfResources.
-        assert isinstance(kernel_inputs, MMKernelInputs), "Expect MMKernelInputs"
-        elem_bytes = kernel_inputs.dtype(kernel_inputs._mat1_idx).itemsize
-        for template_kwargs in super()._get_template_configs_impl(kernel_inputs, op_name):
-            if elem_bytes == resources.OPERAND_ELEM_BYTES or self._fits_smem(template_kwargs, elem_bytes):
-                yield template_kwargs
-
-    @classmethod
-    def _fits_smem(cls, template_kwargs: dict[str, Any], elem_bytes: int) -> bool:
-        tile = dataclasses.replace(
-            cls._tile(
-                template_kwargs["BLOCK_M"],
-                template_kwargs["BLOCK_N"],
-                template_kwargs["BLOCK_K"],
-                template_kwargs["NUM_SMEM_BUFFERS"],
-                template_kwargs["NUM_TMEM_BUFFERS"],
-                template_kwargs["NUM_MMA_GROUPS"],
-                template_kwargs["NUM_CTAS"],
-                template_kwargs["EPILOGUE_SUBTILE"],
-            ),
-            elem_bytes=elem_bytes,
-        )
-        return validate_config(
-            tile,
-            charge_epilogue=bool(template_kwargs.get("TMA_EPILOGUE_STORE", 1)),
-            split_k=template_kwargs.get("SPLIT_K", 1),
-            smem_margin=cls._SMEM_SAFETY_MARGIN,
-        )
 
     def __init__(self) -> None:
         super().__init__()

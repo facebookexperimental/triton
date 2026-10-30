@@ -841,13 +841,18 @@ class TestTLXTemplates(TestCase):
         from triton.language.extra.tlx.inductor import registry as _tlx_registry
 
         heuristic = _tlx_registry.BlackwellGemmWSConfigHeuristic
+        tile = (128, 128, 64, 4, 2, 1, 1, 2)  # BM, BN, BK, smem, tmem, groups, ctas, subtile
+        self.assertTrue(heuristic._is_valid_config_with_margin(*tile))
+        self.assertFalse(heuristic._is_valid_config_with_margin(*tile, 4))
+        # A tile whose FP32 operands fit only without the TMA epilogue staging
+        # buffer falls back to the tl.store epilogue rather than being dropped.
         template_kwargs = {
-            "BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_SMEM_BUFFERS": 4, "NUM_TMEM_BUFFERS": 2,
-            "NUM_MMA_GROUPS": 1, "NUM_CTAS": 1, "EPILOGUE_SUBTILE": 2, "SPLIT_K": 1, "TMA_EPILOGUE_STORE": 1,
+            "BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "NUM_SMEM_BUFFERS": 3, "NUM_TMEM_BUFFERS": 1,
+            "NUM_MMA_GROUPS": 1, "NUM_CTAS": 1, "EPILOGUE_SUBTILE": 1, "SPLIT_K": 1,
         }
-        self.assertTrue(heuristic._fits_smem(template_kwargs, 2))
-        self.assertFalse(heuristic._fits_smem(template_kwargs, 4))
-        self.assertTrue(heuristic._fits_smem({**template_kwargs, "NUM_SMEM_BUFFERS": 2, "BLOCK_K": 32}, 4))
+        tma = [kw["TMA_EPILOGUE_STORE"] for kw in heuristic._yield_tma_variants(template_kwargs)]
+        tma_fp32 = [kw["TMA_EPILOGUE_STORE"] for kw in heuristic._yield_tma_variants(template_kwargs, 4)]
+        self.assertEqual((tma, tma_fp32), ([1], [0]))
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_amd_mm_template_is_registered_once(self):
