@@ -864,3 +864,113 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return %sum : f32
   }
 }
+
+// -----
+
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 1, parent = #parent}>
+// CHECK-LABEL: @swapped_tensor_addf
+// CHECK: ttg.async_remote_shmem_store
+// CHECK: arith.addf {{.*}} : tensor<128xf32
+// CHECK-NOT: ttng.cluster_reduce
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @swapped_tensor_addf(%input: tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice> {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %result = "tt.reduce"(%input) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %v = arith.addf %rhs, %lhs : f32
+      tt.reduce.return %v : f32
+    }) {axis = 1 : i32, tt.multi_cta} : (tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice>
+    tt.return %result : tensor<128xf32, #slice>
+  }
+}
+
+// -----
+
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 1, parent = #parent}>
+// CHECK-LABEL: @swapped_tensor_maxnumf
+// CHECK: ttg.async_remote_shmem_store
+// CHECK: arith.maxnumf {{.*}} : tensor<128xf32
+// CHECK-NOT: ttng.cluster_reduce
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @swapped_tensor_maxnumf(%input: tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice> {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %result = "tt.reduce"(%input) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %v = arith.maxnumf %rhs, %lhs : f32
+      tt.reduce.return %v : f32
+    }) {axis = 1 : i32, tt.multi_cta} : (tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice>
+    tt.return %result : tensor<128xf32, #slice>
+  }
+}
+
+// -----
+
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 1, parent = #parent}>
+// CHECK-LABEL: @swapped_tensor_maximumf
+// CHECK: ttg.async_remote_shmem_store
+// CHECK: arith.maximumf {{.*}} : tensor<128xf32
+// CHECK-NOT: ttng.cluster_reduce
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @swapped_tensor_maximumf(%input: tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice> {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %result = "tt.reduce"(%input) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %v = arith.maximumf %rhs, %lhs : f32
+      tt.reduce.return %v : f32
+    }) {axis = 1 : i32, tt.multi_cta} : (tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice>
+    tt.return %result : tensor<128xf32, #slice>
+  }
+}
+
+// -----
+
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 1, parent = #parent}>
+// CHECK-LABEL: @swapped_tensor_minnumf
+// CHECK: ttg.async_remote_shmem_store
+// CHECK: arith.minnumf {{.*}} : tensor<128xf32
+// CHECK-NOT: ttng.cluster_reduce
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @swapped_tensor_minnumf(%input: tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice> {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %result = "tt.reduce"(%input) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %v = arith.minnumf %rhs, %lhs : f32
+      tt.reduce.return %v : f32
+    }) {axis = 1 : i32, tt.multi_cta} : (tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice>
+    tt.return %result : tensor<128xf32, #slice>
+  }
+}
+
+// -----
+
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 1, parent = #parent}>
+// CHECK-LABEL: @swapped_tensor_minimumf
+// CHECK: ttg.async_remote_shmem_store
+// CHECK: arith.minimumf {{.*}} : tensor<128xf32
+// CHECK-NOT: ttng.cluster_reduce
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @swapped_tensor_minimumf(%input: tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice> {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %result = "tt.reduce"(%input) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %v = arith.minimumf %rhs, %lhs : f32
+      tt.reduce.return %v : f32
+    }) {axis = 1 : i32, tt.multi_cta} : (tensor<128x32xf32, #parent>) -> tensor<128xf32, #slice>
+    tt.return %result : tensor<128xf32, #slice>
+  }
+}
