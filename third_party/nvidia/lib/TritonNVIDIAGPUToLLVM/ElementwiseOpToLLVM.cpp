@@ -378,7 +378,9 @@ struct FpToFpOpConversion
           "unsupported rounding mode for f32->bf16 conversion: " +
           stringifyRoundingMode(rounding) + "\n");
     }
-    return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, bf16_ty, {v})
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, bf16_ty,
+                                           {v, /*pzo=*/b.false_val()})
         .getResult(0);
   }
 
@@ -1057,6 +1059,11 @@ void mlir::triton::NVIDIA::populateElementwiseOpToLLVMPatterns(
 
   mlir::triton::populateElementwiseOpToLLVMPatterns(
       typeConverter, patterns, axisInfoAnalysis, targetInfo, benefit);
+
+  // Preserve mul.hi selection when InstCombine turns input extensions into
+  // masks.
+  patterns.add<ElementwiseOpConversion<MulhiUIOp, LLVM::UMulHOp>>(
+      typeConverter, axisInfoAnalysis, benefit.getBenefit() + 1);
 
 #define POPULATE_OP(SRC_OP, DST_OP)                                            \
   patterns.add<ElementwiseOpConversion<SRC_OP, DST_OP>>(                       \

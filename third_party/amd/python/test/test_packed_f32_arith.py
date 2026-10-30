@@ -109,7 +109,7 @@ def test_gfx1250_packed_f32_in_llir(gfx1250_kernel):
     llir = gfx1250_kernel.asm["llir"]
     func_body = get_func_body_llir(llir)
 
-    packed_fop = re.compile(r"f(mul|sub|add) <2 x float>")
+    packed_fop = re.compile(r"f(mul|sub|add)(?:\s+[a-z]+)* <2 x float>")
     assert packed_fop.search(func_body), ("Expected packed <2 x float> fmul/fsub/fadd in LLVM IR for gfx1250")
 
     # Both fmul and fsub must exist for ISel FMA contraction
