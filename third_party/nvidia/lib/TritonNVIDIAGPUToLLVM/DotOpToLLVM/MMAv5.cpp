@@ -31,8 +31,9 @@ public:
     // We take the full layout even when it is a subview
     // We'll just iterate the real shape when calling tmemLoad tho
     unsigned storageElementBitWidth = memTy.getElementTypeBitWidth();
+    bool isFp6 = storageElementBitWidth == 8 && logicalElementBitWidth == 6;
     assert(logicalElementBitWidth > 0 &&
-           storageElementBitWidth % logicalElementBitWidth == 0 &&
+           (isFp6 || storageElementBitWidth % logicalElementBitWidth == 0) &&
            "logical element bit width must divide TMEM storage bit width");
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     Value address = tb.ptrtoint(i32_ty, tmemBase);
@@ -47,10 +48,18 @@ public:
     // MMAv5 supplies a logical K coordinate, while byte-backed FP4 memdescs
     // use packed K coordinates. This applies to both dense and fp4Padded FP4;
     // the memdesc layout handles any additional physical padding.
-    unsigned packingFactor = storageElementBitWidth / logicalElementBitWidth;
-    assert(b % packingFactor == 0 &&
-           "logical K coordinate must be aligned to packed storage");
-    b /= packingFactor;
+    if (storageElementBitWidth == 8 && logicalElementBitWidth == 6) {
+      // fp6 packs groups of 16 values per 12 bytes; b steps by 4 values
+      // within a group for the x3/4 byte conversion.
+      assert(b % 4 == 0 &&
+             "logical K coordinate must be a multiple of 4 for fp6");
+      b = b * 3 / 4;
+    } else {
+      unsigned packingFactor = storageElementBitWidth / logicalElementBitWidth;
+      assert(b % packingFactor == 0 &&
+             "logical K coordinate must be aligned to packed storage");
+      b /= packingFactor;
+    }
     auto dims = to_vector(ll.getInDimNames());
     auto rowCol = ll.apply({{dims[0], a}, {dims[1], b}});
     int row = rowCol[0].second;
@@ -648,14 +657,15 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
   std::unique_ptr<DotOpMmaMemLoader> aLoader;
   bool transA = false;
   auto isFp4a = op.numBitsPerElementA == 4;
+  auto isFp6a = op.numBitsPerElementA == 6;
   if (aInTmem) {
     aLoader =
         std::make_unique<DotOpMmaV5TmemLoader>(DotOpMmaV5TmemLoader::build(
             loc, rewriter, aTensorTy, baseA, op.numBitsPerElementA));
   } else {
-    auto loader =
-        DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
-                                  aOperandShape, 0, 5, lessRegMMA, isFp4a);
+    auto loader = DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
+                                            aOperandShape, 0, 5, lessRegMMA,
+                                            isFp4a, std::nullopt, isFp6a);
     if (failed(loader)) {
       return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
                                   "operand A in shared memory ")
@@ -667,8 +677,10 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
   }
 
   auto isFp4b = op.numBitsPerElementB == 4;
-  auto bLoader = DotOpMmaSmemLoader::build(
-      loc, rewriter, bTensorTy, baseB, bOperandShape, 1, 5, lessRegMMA, isFp4b);
+  auto isFp6b = op.numBitsPerElementB == 6;
+  auto bLoader =
+      DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB, bOperandShape,
+                                1, 5, lessRegMMA, isFp4b, std::nullopt, isFp6b);
   if (failed(bLoader)) {
     return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
                                 "operand B in shared memory ")

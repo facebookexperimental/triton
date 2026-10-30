@@ -344,6 +344,55 @@ def _unpack_e2m1(data, axis):
     return np.moveaxis(unpacked, -1, axis)
 
 
+def _unpack_fp6_to_u6(data):
+    # Operand tensors count logical values: the leading 3/4 of the packed
+    # dim hold dense bytes (groups of 16 codes per 12 bytes; within a
+    # group, code i is in bits [6*i, 6*i+6)); the trailing quarter is
+    # masked-load padding. Global storage itself is dense; kernels
+    # expand it to this width on load.
+    assert data.dtype == np.uint8
+    # Logical K follows the MXFP6Tensor storage contract (groups of 16
+    # values), same as the frontend and IR verifiers.
+    assert data.shape[-1] % 16 == 0
+    data = data[..., :data.shape[-1] * 3 // 4]
+    grouped = data.reshape(data.shape[:-1] + (data.shape[-1] // 3, 3))
+    b0 = grouped[..., 0].astype(np.uint16)
+    b1 = grouped[..., 1].astype(np.uint16)
+    b2 = grouped[..., 2].astype(np.uint16)
+    codes = np.empty(data.shape[:-1] + (grouped.shape[-2] * 4, ), dtype=np.uint8)
+    codes[..., 0::4] = b0 & np.uint16(0x3F)
+    codes[..., 1::4] = ((b0 >> np.uint16(6)) | (b1 << np.uint16(2))) & np.uint16(0x3F)
+    codes[..., 2::4] = ((b1 >> np.uint16(4)) | (b2 << np.uint16(4))) & np.uint16(0x3F)
+    codes[..., 3::4] = (b2 >> np.uint16(2)) & np.uint16(0x3F)
+    return codes
+
+
+def _fp6_to_f32(codes, num_exp_bits, bias):
+    # OCP MX FP6: no Inf/NaN encodings; subnormals supported.
+    assert codes.dtype == np.uint8
+    codes = codes.astype(np.int32)
+    num_mant_bits = 5 - num_exp_bits
+    signs = (codes >> 5) != 0
+    exp = (codes >> num_mant_bits) & ((1 << num_exp_bits) - 1)
+    mant = (codes & ((1 << num_mant_bits) - 1)).astype(np.float32)
+    scale = np.float32(2.0)**(exp - bias).astype(np.float32)
+    sub_scale = np.float32(2.0)**np.float32(1 - bias)
+    values = np.where(exp != 0, (np.float32(1.0) + mant / np.float32(1 << num_mant_bits)) * scale,
+                      (mant / np.float32(1 << num_mant_bits)) * sub_scale)
+    return np.where(signs, -values, values)
+
+
+def _unpack_fp6(data, axis, format_enum):
+    data = np.moveaxis(data, axis, -1)
+    codes = _unpack_fp6_to_u6(data)
+    if format_enum == _ir.ScaleDotElemTypeTY.E2M3:
+        unpacked = _fp6_to_f32(codes, 2, 1)
+    else:
+        assert format_enum == _ir.ScaleDotElemTypeTY.E3M2
+        unpacked = _fp6_to_f32(codes, 3, 3)
+    return np.moveaxis(unpacked, -1, axis)
+
+
 def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack, is_rhs):
     if format_enum == _ir.ScaleDotElemTypeTY.E2M1:
         if is_rhs:
@@ -351,6 +400,10 @@ def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack,
         else:
             unpack_axis = -1 if k_pack else -2
         value = _unpack_e2m1(value_handle.data, unpack_axis)
+    elif format_enum in (_ir.ScaleDotElemTypeTY.E2M3, _ir.ScaleDotElemTypeTY.E3M2):
+        assert k_pack, "interpreter: fp6 only supports K-packed inputs"
+        unpack_axis = -2 if is_rhs else -1
+        value = _unpack_fp6(value_handle.data, unpack_axis, format_enum)
     else:
         value = _mxfp_value_handle_to_float32(value_handle)
 

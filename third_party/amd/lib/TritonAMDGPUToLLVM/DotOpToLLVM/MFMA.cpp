@@ -26,6 +26,7 @@
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Matchers.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
@@ -687,12 +688,13 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
 
     auto supportsTypes = [](ScaleDotElemType elemType) {
       return elemType == ScaleDotElemType::E2M1 ||
+             isMXFP6ScaleType(elemType) ||
              elemType == ScaleDotElemType::E4M3 ||
              elemType == ScaleDotElemType::E5M2;
     };
 
     if (!supportsTypes(aElemType) || !supportsTypes(bElemType)) {
-      llvm::report_fatal_error("NYI: mxfp6\n");
+      llvm::report_fatal_error("NYI: unsupported mx type\n");
     }
 
     int64_t kDimOperandSize = aTensorTy.getShape().back();
@@ -716,8 +718,19 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     StringRef intrinsicName = maybeMfmaIntrinsic->name;
     unsigned kBase = maybeMfmaIntrinsic->kBase;
     // Two fp4 are packed into an uint8.
-    unsigned aKBase = aElemType == ScaleDotElemType::E2M1 ? kBase / 2 : kBase;
-    unsigned bKBase = bElemType == ScaleDotElemType::E2M1 ? kBase / 2 : kBase;
+    auto packedKBase = [](ScaleDotElemType elemType, unsigned kBase) {
+      if (elemType == ScaleDotElemType::E2M1)
+        return kBase / 2;
+      if (isMXFP6ScaleType(elemType)) {
+        // fp6 packs groups of 16 values per 12 bytes; the x3/4 byte
+        // conversion steps within a group by 4 values.
+        assert(kBase % 4 == 0);
+        return kBase * 3 / 4;
+      }
+      return kBase;
+    };
+    unsigned aKBase = packedKBase(aElemType, kBase);
+    unsigned bKBase = packedKBase(bElemType, kBase);
 
     int aKWidth = aKBase;
     int bKWidth = bKBase;

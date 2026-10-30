@@ -16,6 +16,11 @@ inline bool isFp4Padded(Attribute encoding) {
   return mmaEnc && mmaEnc.getFp4Padded();
 }
 
+inline bool isFp6Padded(Attribute encoding) {
+  auto mmaEnc = dyn_cast<gpu::NVMMASharedEncodingAttr>(encoding);
+  return mmaEnc && mmaEnc.getFp6Padded();
+}
+
 triton::gpu::SharedEncodingTrait
 getEncodingFromDescriptor(Operation *op, RankedTensorType tensorType,
                           Value desc);

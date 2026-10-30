@@ -67,6 +67,18 @@ int getWmmaVersion(ISAFamily isaFamily) {
   return 0;
 }
 
+// Logical K count of a scaled-dot operand along its packed dim: fp4
+// packs 2 values per byte; fp6 shapes already count logical values
+// (groups of 16 values / 12 bytes, asserted as a precondition -- the
+// IR verifier guarantees it for verified ops).
+static int64_t getScaledDotLogicalK(ScaleDotElemType elemType, int64_t k) {
+  if (elemType == ScaleDotElemType::E2M1)
+    return k * 2;
+  if (isMXFP6ScaleType(elemType))
+    assert(k % 16 == 0);
+  return k;
+}
+
 static bool hasAsymmetricMfmaBroadcastOperand(unsigned mDim, unsigned nDim) {
   // The MFMA lowering handles these asymmetric instruction shapes by
   // broadcasting the narrow operand with the cbsz/abid intrinsic operands.
@@ -317,6 +329,10 @@ FailureOr<MfmaIntrinsic> chooseMfmaInstruction(tt::DotScaledOp dot,
     // Since two fp4 are packed into int8, to get the correct K dim size, we
     // need to multiply it by 2.
     inputKDim *= 2;
+  }
+  if (isMXFP6ScaleType(dot.getAElemType()) && dot.getLhsKPack()) {
+    // fp6 shapes count logical values (dense global storage).
+    assert(inputKDim % 16 == 0);
   }
   Type aElemType = scaleDotElemTypeToMLIRType(ctx, dot.getAElemType());
   Type bElemType = scaleDotElemTypeToMLIRType(ctx, dot.getBElemType());
@@ -905,6 +921,13 @@ public:
         elemType == ScaleDotElemType::FP16)
       return v;
 
+    // 1.5) fp6 has no fused ScaledUpcast op; use the common gather-based
+    // upcast from the base class.
+    if (isMXFP6ScaleType(elemType)) {
+      return ttg::DecomposeScaledBlocked::scaleArg(rewriter, dotOp, opIdx,
+                                                   computeType);
+    }
+
     // 2) If it's non-scaled F8F4, we reuse the common path
     if (!scale) {
       return ttg::DecomposeScaledBlocked::scaleArg(rewriter, dotOp, opIdx,
@@ -1028,12 +1051,20 @@ public:
     ScaleDotElemType bElemType = dotOp.getBElemType();
     auto supportsTypes = [](ScaleDotElemType elemType) {
       return elemType == ScaleDotElemType::E2M1 ||
+             isMXFP6ScaleType(elemType) ||
              elemType == ScaleDotElemType::E4M3 ||
              elemType == ScaleDotElemType::E5M2;
     };
 
     if (!supportsTypes(aElemType) || !supportsTypes(bElemType)) {
-      return rewriter.notifyMatchFailure(dotOp, "NYI: mxfp6");
+      return rewriter.notifyMatchFailure(dotOp, "NYI: unsupported mx type");
+    }
+
+    // fp6 (groups of 16 values per 12 bytes) cannot tile the MFMA K
+    // dimension today; route it to the decompose (upcast) path instead
+    // of the native instruction.
+    if (isMXFP6ScaleType(aElemType) || isMXFP6ScaleType(bElemType)) {
+      return rewriter.notifyMatchFailure(dotOp, "fp6 uses decompose upcast");
     }
 
     bool bothScalesAbsent = !aScale && !bScale;
@@ -1140,8 +1171,8 @@ public:
         int64_t nonKDim = idx == 0 ? valShape[0] : valShape[1];
         int64_t k = idx == 0 ? valShape[1] : valShape[0];
         ScaleDotElemType &elemType = idx == 0 ? aElemType : bElemType;
-        int packSize = elemType == ScaleDotElemType::E2M1 ? 2 : 1;
-        shape = {nonKDim, k * packSize / 32};
+        int64_t logicalK = getScaledDotLogicalK(elemType, k);
+        shape = {nonKDim, logicalK / 32};
       } else {
         shape = llvm::to_vector(scale.getType().getShape());
       }
@@ -1218,12 +1249,20 @@ public:
     ScaleDotElemType bElemType = dotOp.getBElemType();
     auto supportsTypes = [](ScaleDotElemType elemType) {
       return elemType == ScaleDotElemType::E2M1 ||
+             isMXFP6ScaleType(elemType) ||
              elemType == ScaleDotElemType::E4M3 ||
              elemType == ScaleDotElemType::E5M2;
     };
 
     if (!supportsTypes(aElemType) || !supportsTypes(bElemType)) {
       return rewriter.notifyMatchFailure(dotOp, "Not supported yet mxfp type");
+    }
+
+    // fp6 (groups of 16 values per 12 bytes) cannot tile the WMMA K
+    // dimension today; route it to the decompose (upcast) path instead
+    // of the native instruction.
+    if (isMXFP6ScaleType(aElemType) || isMXFP6ScaleType(bElemType)) {
+      return rewriter.notifyMatchFailure(dotOp, "fp6 uses decompose upcast");
     }
 
     unsigned scaleFactor = dotOp.deduceScaleFactor();
@@ -1258,6 +1297,11 @@ public:
         ctx, wmmaVersion, ctaLayout, true, cgaLayout, {mDim, nDim, kDim});
     auto wmmaPackedEnc = ttg::AMDWmmaEncodingAttr::get(
         ctx, wmmaVersion, ctaLayout, true, cgaLayout, {mDim, nDim, kDim / 2});
+    // fp6 packs groups of 16 values per 12 bytes along K. Built lazily:
+    // {16,16,96} is not a valid WMMA instruction shape, so creating it
+    // eagerly fails the
+    // Attr::get() verifier in assertion builds for every scaled dot,
+    // including fp8/fp4 which never use it.
 
     auto newRetType =
         RankedTensorType::get(oldShape, oldRetType.getElementType(), wmmaEnc);
@@ -1284,10 +1328,19 @@ public:
 
     auto convertInputLayout = [&](TensorValue v, unsigned opIdx,
                                   bool isFp4) -> TensorValue {
-      auto parent = isFp4 ? wmmaPackedEnc : wmmaEnc;
+      ScaleDotElemType elemType = opIdx == 0 ? aElemType : bElemType;
+      bool isFp6 = isMXFP6ScaleType(elemType);
+      ttg::AMDWmmaEncodingAttr parent = wmmaEnc;
+      if (isFp4)
+        parent = wmmaPackedEnc;
+      else if (isFp6)
+        parent = ttg::AMDWmmaEncodingAttr::get(ctx, wmmaVersion, ctaLayout,
+                                               true, cgaLayout,
+                                               {mDim, nDim, kDim * 3 / 4});
       auto vType = v.getType();
       auto newEnc = DotOperandEncodingAttr::get(ctx, opIdx, parent, 16);
       bool kPacked = opIdx == 0 ? dotOp.getLhsKPack() : dotOp.getRhsKPack();
+      assert((!isFp6 || kPacked) && "fp6 requires K-packed inputs");
       if (isFp4 && !kPacked) {
         auto newConvert = createLocalLoadPackedTransposed(
             rewriter, dotOp.getLoc(), v, newEnc, opIdx);
@@ -1351,8 +1404,8 @@ public:
         int64_t nonKDim = idx == 0 ? valShape[0] : valShape[1];
         int64_t k = idx == 0 ? valShape[1] : valShape[0];
         ScaleDotElemType &elemType = idx == 0 ? aElemType : bElemType;
-        int packSize = elemType == ScaleDotElemType::E2M1 ? 2 : 1;
-        shape = {nonKDim, k * packSize / scaleFactor};
+        int64_t logicalK = getScaledDotLogicalK(elemType, k);
+        shape = {nonKDim, logicalK / scaleFactor};
         std::tie(scaleType, scaleValue) = getDefaultScaleTypeValue(idx);
       } else {
         scaleType = scale.getType().getElementType();

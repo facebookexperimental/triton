@@ -62,15 +62,17 @@ public:
   DotOpMmaSmemLoader() = default;
 
   DotOpMmaSmemLoader(MMASMEMDescriptor desc, Value baseSrcb128,
-                     LinearLayout llInv, bool lessRegMMA)
+                     LinearLayout llInv, bool lessRegMMA, bool isFp6 = false,
+                     bool fp6Trans = false)
       : desc(desc), baseSrcb128(baseSrcb128), ll(std::move(llInv)),
-        lessRegMMA(lessRegMMA) {}
+        lessRegMMA(lessRegMMA), isFp6(isFp6), fp6Trans(fp6Trans) {}
 
   static FailureOr<DotOpMmaSmemLoader>
   build(Location loc, RewriterBase &rewriter, gpu::MemDescType memTy,
         Value smemBase, ArrayRef<unsigned> instrShape, unsigned MNdim,
         int mmaVersion, bool lessRegMMA, bool isFp4 = false,
-        std::optional<RankedTensorType> mmaTy = std::nullopt) {
+        std::optional<RankedTensorType> mmaTy = std::nullopt,
+        bool isFp6 = false) {
     auto ctx = rewriter.getContext();
     auto kOffset = str_attr("offset");
     // The handling of subviews is not as fine as it could be
@@ -86,6 +88,7 @@ public:
     }
     auto llInv = memLayout.pseudoinvert();
     auto bitwidth = memTy.getElementType().getIntOrFloatBitWidth();
+    assert(!(isFp4 && isFp6));
     if (isFp4) {
       // hacky but well
       auto dims = to_vector(llInv.getInDimNames());
@@ -94,15 +97,18 @@ public:
       bitwidth /= 2;
       // The instr_shape comes in number of elements already
     }
+    // For fp6 the layout stays in packed bytes; the K extent and coordinates
+    // are converted to bytes in the overload below.
     return build(loc, rewriter, llInv, bitwidth, smemBase, instrShape, MNdim,
-                 mmaVersion, lessRegMMA, mmaTy);
+                 mmaVersion, lessRegMMA, mmaTy, isFp6);
   }
 
   static FailureOr<DotOpMmaSmemLoader>
   build(Location loc, RewriterBase &rewriter, const LinearLayout &ll,
         int bitwidth, Value smemBase, ArrayRef<unsigned> instrShape,
         unsigned MNdim, int mmaVersion, bool lessRegMMA,
-        std::optional<RankedTensorType> mmaTy = std::nullopt) {
+        std::optional<RankedTensorType> mmaTy = std::nullopt,
+        bool isFp6 = false) {
     // ll is a map from two dimensions (dim0, dim1) or (row, col) into offsets
     // and blocks
     auto ctx = rewriter.getContext();
@@ -116,6 +122,20 @@ public:
     assert(mmaTy.has_value() == (mmaVersion == 3));
     assert(MNdim < 2);
     assert(instrShape.size() == 2);
+    // fp6 packs groups of 16 values per 12 bytes. The layout is in packed bytes, so
+    // express the K extent of the instruction shape in bytes as well. The
+    // K entry is at index 1 for operand A ([M, K]) and 0 for B ([K, N]).
+    SmallVector<unsigned> instrShapeBytes(instrShape.begin(), instrShape.end());
+    bool fp6Trans = false;
+    if (isFp6) {
+      unsigned kIdx = 1 - MNdim;
+      assert(instrShape[kIdx] % 4 == 0);
+      instrShapeBytes[kIdx] = instrShape[kIdx] * 3 / 4;
+      // Detect the packed (K) dim the same way the fp4 path does: it is the
+      // contiguous dim.
+      auto dims = to_vector(ll.getInDimNames());
+      fp6Trans = ll.getBasis(dims[0], 0, kOffset) == 1;
+    }
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
     // Due to having a 16B alignment, we can compute the offsets in 128b
@@ -154,27 +174,43 @@ public:
       baseSrcb128 = b.add(baseSrcb128, warpStrideb128);
     }
 
-    for (auto [dim, instrSize] : llvm::zip(ll.getInDimNames(), instrShape)) {
+    for (auto [dim, instrSize] :
+         llvm::zip(ll.getInDimNames(), instrShapeBytes)) {
       if (instrSize <= ll.getInDimSize(dim))
         continue;
       auto inDims = ll.getInDims();
       return mlir::emitError(loc)
-             << "instruction shape [" << instrShape[0] << ", " << instrShape[1]
+             << "instruction shape [" << instrShapeBytes[0] << ", "
+             << instrShapeBytes[1]
              << "] is too large for the layout with block size ["
              << inDims[0].second << ", " << inDims[1].second << "]";
     }
 
-    auto desc = getDescriptor(loc, ll, instrShape, bitwidth, MNdim, mmaVersion);
+    auto desc =
+        getDescriptor(loc, ll, instrShapeBytes, bitwidth, MNdim, mmaVersion);
     if (failed(desc))
       return failure();
 
-    return DotOpMmaSmemLoader{*desc, baseSrcb128, ll, lessRegMMA};
+    return DotOpMmaSmemLoader{*desc,      baseSrcb128, ll,
+                              lessRegMMA, isFp6,       fp6Trans};
   }
 
   Value smemLoad(int a, int b, ConversionPatternRewriter &rewriter,
                  Location loc, int kSize = 0) const {
     auto *ctx = loc.getContext();
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
+    if (isFp6) {
+      // The layout is in packed bytes (groups of 16 values per 12
+      // bytes); convert the logical K coordinate. The packed dim is
+      // dims[0] iff fp6Trans.
+      if (fp6Trans) {
+        assert(a % 4 == 0);
+        a = a * 3 / 4;
+      } else {
+        assert(b % 4 == 0);
+        b = b * 3 / 4;
+      }
+    }
     auto dims = to_vector(ll.getInDimNames());
     assert(to_vector(ll.getOutDimNames()) ==
            llvm::to_vector(
@@ -257,6 +293,8 @@ private:
   // Initialized here, unlike its neighbours, because the defaulted default
   // constructor is used (`DotOpMmaSmemLoader aLoader;` in WGMMA.cpp).
   bool lessRegMMA = false;
+  bool isFp6 = false;
+  bool fp6Trans = false;
 
   static FailureOr<MMASMEMDescriptor>
   getDescriptor(Location loc, const LinearLayout &ll,
@@ -287,13 +325,15 @@ private:
     if (swizzling == 0 && MNContig) {
       std::swap(leadingDim, stridedDim);
     }
+    // Compare exact extents (not log2) so non-power-of-2 packed extents
+    // (e.g. fp6 byte K) are handled. Identical for power-of-2 inputs.
     auto log2RowsTile = shmemTileInv.getInDimSizeLog2(dims[leadingDim]);
-    if (llvm::Log2_32(instrShape[leadingDim]) > log2RowsTile) {
+    if (instrShape[leadingDim] > (1u << log2RowsTile)) {
       lbo = ll.getBasis(dims[leadingDim], log2RowsTile, kOffset);
     }
 
     auto log2ColsTile = shmemTileInv.getInDimSizeLog2(dims[stridedDim]);
-    if (llvm::Log2_32(instrShape[stridedDim]) > log2ColsTile) {
+    if (instrShape[stridedDim] > (1u << log2ColsTile)) {
       sbo = ll.getBasis(dims[stridedDim], log2ColsTile, kOffset);
     }
 
