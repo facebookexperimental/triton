@@ -209,7 +209,7 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
         ttng::getDescriptorLoadBytes(cast<ttg::MemDescType>(buffer.getType()));
     auto nvwsLoad = builder.createWithAsyncTaskIds<ttnvws::DescriptorLoadOp>(
         load.getLoc(), load.getDesc(), load.getIndices(), txCount, buffer,
-        load.getCache(), load.getEvict());
+        load.getCachePolicyAttr());
     nvwsLoad->setAttrs(load->getAttrs());
 
     if (soleStore) {

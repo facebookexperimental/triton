@@ -10,12 +10,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: %[[c_mask:.*]] = llvm.mlir.constant(true) : i1
         // CHECK: %[[offset:.*]] = llvm.select %[[c_mask]]
         // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[offset]], {{.*}}, {{.*}}
-        %ret = amdg.buffer_load %arg0[%offset] cacheModifier = cs : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+        %ret = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = cs, eviction_policy = evict_normal>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         // evict_last never weakens the .cv bypass: sc0|sc1 stays 17 on CDNA
         // (RDNA3 lowers the same policy to aux 7).
         // CDNA: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 17
         // RDNA: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 7
-        %ret2 = amdg.buffer_load %arg0[%offset] cacheModifier = cv evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+        %ret2 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = cv, eviction_policy = evict_last>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         tt.return
   }
 }
@@ -124,19 +124,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: %[[offset:.*]] = llvm.select %[[mask]]
         // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, %[[offset]], {{.*}}, {{.*}}
         %c256_i32 = arith.constant 256 : i32
-        amdg.buffer_store %value, %arg0[%offset] cacheModifier = cs stride = %c256_i32 : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+        amdg.buffer_store %value, %arg0[%offset] stride = %c256_i32 {cachePolicy = #tt.cache_policy<cache_modifier = cs, eviction_policy = evict_normal>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         // evict_first sets the nt bit on CDNA (0 -> 2); RDNA3 lowers it to 7.
         // CDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 2
         // RDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 7
-        amdg.buffer_store %value, %arg0[%offset] evictionPolicy = evict_first : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+        amdg.buffer_store %value, %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_first>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         // evict_last clears the nt bit that .cs sets (3 -> 1).
         // CHECK: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 1
-        amdg.buffer_store %value, %arg0[%offset] cacheModifier = cs evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+        amdg.buffer_store %value, %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = cs, eviction_policy = evict_last>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         // evict_last never weakens the .wt bypass: sc0|sc1 stays 17 on CDNA
         // (RDNA3 lowers the same case to aux 1).
         // CDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 17
         // RDNA: rocdl.raw.ptr.buffer.store {{.*}}, {{.*}}, {{.*}}, {{.*}}, 1
-        amdg.buffer_store %value, %arg0[%offset] cacheModifier = wt evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+        amdg.buffer_store %value, %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = wt, eviction_policy = evict_last>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         tt.return
   }
 }

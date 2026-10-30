@@ -1630,7 +1630,9 @@ void init_triton_tlx_ir(py::module_ &m) {
             return self.create<ttg::AsyncCopyGlobalToLocalOp>(
                 ptrTensor, result, mask.value_or(Value()),
                 other.value_or(Value()), bulkSize.value_or(Value()),
-                barrier.value_or(Value()), cacheModifier, evictionPolicy,
+                barrier.value_or(Value()),
+                buildCachePolicy(self.getBuilder(), cacheModifier,
+                                 evictionPolicy),
                 isVolatile, useBulk);
           },
           py::arg("ptrTensor"), py::arg("result"), py::arg("mask").none(),
@@ -1737,9 +1739,9 @@ void init_triton_tlx_ir(py::module_ &m) {
                                                     ptrType.getPointeeType(),
                                                     offsetsType.getEncoding());
             return self.create<ttag::BufferLoadOp>(
-                resultType, ptr, offsets, Value() /*stride*/, cache,
-                tt::EvictionPolicy::NORMAL, mask.value_or(Value()),
-                other.value_or(Value()), contiguity);
+                resultType, ptr, offsets, Value() /*stride*/,
+                buildCachePolicy(self.getBuilder(), cache),
+                mask.value_or(Value()), other.value_or(Value()), contiguity);
           },
           py::arg("ptr"), py::arg("offsets"), py::arg("mask").none(),
           py::arg("other").none(), py::arg("cache"), py::arg("contiguity"))
@@ -1749,8 +1751,9 @@ void init_triton_tlx_ir(py::module_ &m) {
              std::optional<Value> mask, tt::CacheModifier cache,
              uint32_t contiguity) -> OpState {
             return self.create<ttag::BufferStoreOp>(
-                storedValue, ptr, offsets, Value() /*stride*/, cache,
-                tt::EvictionPolicy::NORMAL, mask.value_or(Value()), contiguity);
+                storedValue, ptr, offsets, Value() /*stride*/,
+                buildCachePolicy(self.getBuilder(), cache),
+                mask.value_or(Value()), contiguity);
           },
           py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
           py::arg("mask").none(), py::arg("cache"), py::arg("contiguity"))
@@ -1773,8 +1776,8 @@ void init_triton_tlx_ir(py::module_ &m) {
              tt::CacheModifier cache, uint32_t contiguity) -> Value {
             return self.create<ttag::BufferLoadToLocalOp>(
                 dest, ptr, offsets, mask.value_or(Value()),
-                other.value_or(Value()), Value() /*stride*/, cache,
-                tt::EvictionPolicy::NORMAL, contiguity);
+                other.value_or(Value()), Value() /*stride*/,
+                buildCachePolicy(self.getBuilder(), cache), contiguity);
           },
           py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
           py::arg("mask").none(), py::arg("other").none(), py::arg("cache"),

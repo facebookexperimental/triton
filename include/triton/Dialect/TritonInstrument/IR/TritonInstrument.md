@@ -42,15 +42,26 @@ same buffer.
 
 ## Thread Model
 
-- Base threads: the default thread plus warp-specialization partitions, up to
-  16 logical threads.
-- Peer classes: TMA, Tensor Core, and CLC threads model operations that are not
-  ordered with base threads. Each active class has one peer per base thread.
-- Total logical threads: up to 64; only classes used by the entry point are
-  assigned slots.
+ConSan uses logical thread ids rather than hardware lane ids. The number of base
+threads, `N`, is one plus the largest warp-specialize partition count in the
+entry point: one without warp specialization, and at most 16.
 
-Logical thread IDs are in `[0, 64)`. State dimensions are power-of-two padded
-where required by the distributed layout.
+- Base threads occupy `[0, N)`. The default region is thread 0;
+  warp-specialize partition regions use `partition_index + 1`.
+- TMA, Tensor Core (`tcgen05`), and CLC peer classes are enabled only if used
+  by the entry point. Each gets `N` consecutive ids, appended after the base
+  threads in that order; absent classes reserve no ids.
+- There are at most 64 logical threads per CTA. Base-thread and all-thread
+  tensor axes are padded to powers of two.
+
+Read/write visibility and barrier read-tracking masks use 32 bits when at most
+32 logical threads are allocated, otherwise 64 bits. Packed barrier-state words
+and proxy-access visibility/tracking masks remain 64 bits.
+
+For a base thread, `getThreadPeersMask` returns that thread plus its enabled
+peers. For a peer thread, it returns only that thread. Commit-count tracking
+uses the padded base-thread columns; peer ids are folded back with `thread % N`
+where commit counters are involved.
 
 ## Auxiliary State
 
@@ -89,6 +100,11 @@ shared-cluster global scratch memory. Logical state shapes are:
 - `waiting` (scratch, `<Cbar x K x Cthr x i32>`): waiting flags and phases.
 - `activeMasks` (scratch, `<C x i32>`): active base-thread masks.
 - `lock` (scratch pointer, `i32`): serializes instrumentation updates.
+
+Mask lanes in `writeVisibility`, `readVisibility`, and `readTracking` use
+32 bits when at most 32 logical threads are allocated, otherwise 64 bits
+(see Thread Model); `i64` above is the wide form. Packed `barrierStates`
+words remain 64 bits.
 
 Buffer and barrier descriptors are CTA-agnostic. CTA-qualified scratch axes
 identify the buffer row, barrier row, logical thread, or visibility mask to

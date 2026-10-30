@@ -488,8 +488,8 @@ bool isLayoutAnchor(Operation *op) {
   // local_load is expensive as it reads from shared memory with specific layout
   if (isa<triton::gpu::LocalLoadOp>(op))
     return isExpensiveLocalLoad(op);
-  if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicRMWOp,
-          AtomicCASOp, triton::nvidia_gpu::TMEMLoadOp>(op) ||
+  if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicOpInterface,
+          triton::nvidia_gpu::TMEMLoadOp>(op) ||
       op->getName().getStringRef() == "tti.dot_i8")
     return true;
   if (auto gatherOp = dyn_cast<GatherOp>(op))
@@ -1633,9 +1633,8 @@ void LayoutPropagation::resolveConflicts() {
       continue;
     }
     Attribute encoding = *info.encodings.begin();
-    bool isLoadOrStore =
-        op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
-    if (op && isa<AtomicRMWOp, AtomicCASOp>(op) && !axisInfoAnalysis)
+    bool isLoadOrStore = op && isa<LoadOp, StoreOp, AtomicOpInterface>(op);
+    if (op && isa<AtomicOpInterface>(op) && !axisInfoAnalysis)
       axisInfoAnalysis = std::make_unique<ModuleAxisInfoAnalysis>(
           funcOp->getParentOfType<ModuleOp>());
     // Rank lexicographically: widest single relayout, then total relayout
@@ -1649,7 +1648,7 @@ void LayoutPropagation::resolveConflicts() {
     // Atomics are excluded for a different reason: score.first is the vector
     // width the hardware will actually issue, and cost will trade it away --
     // see @atomic_vector_width_beats_relayout_cost.
-    bool costRankable = !(op && isa<AtomicRMWOp, AtomicCASOp>(op)) &&
+    bool costRankable = !(op && isa<AtomicOpInterface>(op)) &&
                         llvm::none_of(info.encodings, [](Attribute e) {
                           e = getEffectiveLayoutEncoding(e);
                           return isa<MmaEncodingTrait, DotOperandEncodingAttr,

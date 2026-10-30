@@ -95,19 +95,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
   tt.func @buffer_load_eviction(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %offset : tensor<128xi32, #blocked0>{tt.divisibility=16:i32}) {
     // evict_first with no modifier: SCOPE_CU(0) | TH_NT(1) = 1
     // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 1
-    %ret0 = amdg.buffer_load %arg0[%offset] evictionPolicy = evict_first : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    %ret0 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_first>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
     // evict_last with no modifier: SCOPE_CU(0) | TH_HT(2) = 2
     // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 2
-    %ret1 = amdg.buffer_load %arg0[%offset] evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    %ret1 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_last>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
     // evict_last with .cg keeps device scope: SCOPE_DEV(16) | TH_HT(2) = 18
     // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 18
-    %ret2 = amdg.buffer_load %arg0[%offset] cacheModifier = cg evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    %ret2 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = cg, eviction_policy = evict_last>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
     // evict_first never weakens the .cv bypass: SCOPE_SYS(24) | TH_LU(3) = 27
     // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 27
-    %ret3 = amdg.buffer_load %arg0[%offset] cacheModifier = cv evictionPolicy = evict_first : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    %ret3 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = cv, eviction_policy = evict_first>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
     // evict_last never weakens the .cv bypass either: SCOPE_SYS(24) | TH_LU(3) = 27
     // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 27
-    %ret4 = amdg.buffer_load %arg0[%offset] cacheModifier = cv evictionPolicy = evict_last : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    %ret4 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = cv, eviction_policy = evict_last>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
     tt.return
   }
 }
