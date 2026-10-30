@@ -1541,19 +1541,30 @@ def _convert_outputs(DQA, DQ, DKA, DVA, DK, DV, SIZE: tl.constexpr, KV_SIZE: tl.
         KV_BLOCK: tl.constexpr = BLOCK * KV_SIZE // SIZE
         BALANCED: tl.constexpr = (KV_SLICES > 1 and SIZE != KV_SIZE and SIZE % KV_SIZE == 0
                                   and (BLOCK * KV_SIZE) % SIZE == 0 and KV_BLOCK >= 1024 and KV_BLOCK % 1024 == 0)
-        if BALANCED:
+        SMALL: tl.constexpr = (KV_SLICES > 1 and SIZE != KV_SIZE and SIZE % KV_SIZE == 0
+                               and (BLOCK * KV_SIZE) % SIZE == 0 and KV_BLOCK >= 1 and KV_BLOCK < 1024
+                               and (KV_BLOCK % 128 == 0 or 128 % KV_BLOCK == 0))
+        # Below 128 values per program, one program in each group of TILE // KV_BLOCK takes a full tile.
+        TILE: tl.constexpr = 128 if KV_BLOCK < 128 else KV_BLOCK
+        GROUP_PROGRAMS: tl.constexpr = TILE // KV_BLOCK if SMALL else 1
+        if SMALL:
+            partial_offsets = (tl.program_id(0) // GROUP_PROGRAMS).to(tl.int64) * TILE + tl.arange(0, TILE)
+            small_layout: tl.constexpr = tlx.layout(shape=((128, ), (TILE // 128, )), stride=((1, ), (128, )))
+            partial_offsets = tlx.require_layout(partial_offsets, small_layout)
+        elif BALANCED:
             partial_offsets = tl.program_id(0).to(tl.int64) * KV_BLOCK + tl.arange(0, KV_BLOCK)
             partial_layout: tl.constexpr = tlx.layout(shape=((128, ), (8, KV_BLOCK // 1024)), stride=((8, ), (1, 1024)))
             partial_offsets = tlx.require_layout(partial_offsets, partial_layout)
         else:
             partial_offsets = block_base + tl.arange(0, BLOCK)
-        dk = tl.load(DKA + partial_offsets, partial_offsets < KV_SIZE, 0)
-        dv = tl.load(DVA + partial_offsets, partial_offsets < KV_SIZE, 0)
-        for partial_slice in tl.static_range(1, KV_SLICES):
-            dk += tl.load(DKA + partial_slice * KV_SIZE + partial_offsets, partial_offsets < KV_SIZE, 0)
-            dv += tl.load(DVA + partial_slice * KV_SIZE + partial_offsets, partial_offsets < KV_SIZE, 0)
-        tl.store(DK + partial_offsets, dk * SM_SCALE, partial_offsets < KV_SIZE)
-        tl.store(DV + partial_offsets, dv, partial_offsets < KV_SIZE)
+        if GROUP_PROGRAMS == 1 or tl.program_id(0) % GROUP_PROGRAMS == 0:
+            dk = tl.load(DKA + partial_offsets, partial_offsets < KV_SIZE, 0)
+            dv = tl.load(DVA + partial_offsets, partial_offsets < KV_SIZE, 0)
+            for partial_slice in tl.static_range(1, KV_SLICES):
+                dk += tl.load(DKA + partial_slice * KV_SIZE + partial_offsets, partial_offsets < KV_SIZE, 0)
+                dv += tl.load(DVA + partial_slice * KV_SIZE + partial_offsets, partial_offsets < KV_SIZE, 0)
+            tl.store(DK + partial_offsets, dk * SM_SCALE, partial_offsets < KV_SIZE)
+            tl.store(DV + partial_offsets, dv, partial_offsets < KV_SIZE)
 
 
 def _tail_partition(config, b, hk, n):
