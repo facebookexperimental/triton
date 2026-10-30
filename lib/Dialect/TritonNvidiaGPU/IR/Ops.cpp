@@ -22,10 +22,13 @@
  */
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LLVM.h"
+#include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -41,16 +44,232 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <limits>
 
 using namespace mlir::triton::gpu;
 
 namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
+
+namespace {
+
+bool isClusterReduceType(Type type) {
+  if (type.isF32())
+    return true;
+  auto tensorType = dyn_cast<RankedTensorType>(type);
+  return tensorType && tensorType.hasStaticShape() &&
+         tensorType.getRank() > 0 && tensorType.getElementType().isF32() &&
+         tensorType.getNumElements() > 0;
+}
+
+bool dependsOnClusterAxis(Value value, int axis,
+                          llvm::DenseSet<Value> &visited) {
+  if (!visited.insert(value).second)
+    return false;
+
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Operation *parent = argument.getOwner()->getParentOp();
+    auto loop = dyn_cast_or_null<scf::ForOp>(parent);
+    if (!loop)
+      return !isa_and_nonnull<triton::FuncOp>(parent);
+    if (argument == loop.getInductionVar())
+      return dependsOnClusterAxis(loop.getLowerBound(), axis, visited) ||
+             dependsOnClusterAxis(loop.getUpperBound(), axis, visited) ||
+             dependsOnClusterAxis(loop.getStep(), axis, visited);
+    unsigned index = argument.getArgNumber() - 1;
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    return dependsOnClusterAxis(loop.getInitArgs()[index], axis, visited) ||
+           dependsOnClusterAxis(yield.getResults()[index], axis, visited);
+  }
+
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (isa<triton::nvgpu::ClusterCTAIdOp, triton::CallOp>(def))
+    return true;
+  if (auto pid = dyn_cast<triton::GetProgramIdOp>(def))
+    return pid.getAxisAsInt() == axis;
+  if (auto loop = dyn_cast<scf::ForOp>(def)) {
+    unsigned index = cast<OpResult>(value).getResultNumber();
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    if (dependsOnClusterAxis(loop.getLowerBound(), axis, visited) ||
+        dependsOnClusterAxis(loop.getUpperBound(), axis, visited) ||
+        dependsOnClusterAxis(loop.getStep(), axis, visited) ||
+        dependsOnClusterAxis(loop.getInitArgs()[index], axis, visited) ||
+        dependsOnClusterAxis(yield.getResults()[index], axis, visited))
+      return true;
+  }
+  if (auto ifOp = dyn_cast<scf::IfOp>(def)) {
+    unsigned index = cast<OpResult>(value).getResultNumber();
+    if (dependsOnClusterAxis(ifOp.getCondition(), axis, visited))
+      return true;
+    for (Region *region : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
+      if (region->empty())
+        continue;
+      auto yield = cast<scf::YieldOp>(region->front().getTerminator());
+      if (dependsOnClusterAxis(yield.getResults()[index], axis, visited))
+        return true;
+    }
+  }
+  // Captures inside unknown regions are not explicit operands. Without a
+  // model for their control flow, uniform execution cannot be established.
+  if (def->getNumRegions() != 0 && !isa<scf::ForOp, scf::IfOp>(def))
+    return true;
+  return llvm::any_of(def->getOperands(), [&](Value operand) {
+    return dependsOnClusterAxis(operand, axis, visited);
+  });
+}
+
+} // namespace
+
+bool mayDependOnClusterRank(Value value, int axis) {
+  llvm::DenseSet<Value> visited;
+  return dependsOnClusterAxis(value, axis, visited);
+}
+
+LogicalResult ClusterReduceOp::verify() {
+  unsigned arity = getPartials().size();
+  if (arity < 1 || arity > 2)
+    return emitOpError("requires one or two partial components");
+  if (getNumResults() != arity)
+    return emitOpError("requires one result for each partial component");
+
+  Type componentType = getPartials().front().getType();
+  if (!isClusterReduceType(componentType))
+    return emitOpError(
+        "requires scalar f32 or non-empty, positive-rank, statically shaped "
+        "f32 tensors");
+  for (auto [partial, result] : llvm::zip(getPartials(), getResults())) {
+    if (partial.getType() != componentType || result.getType() != componentType)
+      return emitOpError("requires equal operand and result types");
+  }
+  if (arity == 2 && !componentType.isF32())
+    return emitOpError("two-component reductions require scalar f32 state");
+  if (auto tensorType = dyn_cast<RankedTensorType>(componentType);
+      tensorType && !tensorType.getEncoding())
+    return emitOpError("tensor partials require an encoding");
+
+  int64_t groupSize = getGroupSize();
+  if (groupSize != 2 && groupSize != 4)
+    return emitOpError("group_size must be 2 or 4");
+  if (getClusterAxis() < 0 || getClusterAxis() > 2)
+    return emitOpError("cluster_axis must be in the range [0, 2]");
+
+  auto function = getOperation()->getParentOfType<triton::FuncOp>();
+  if (!function)
+    return emitOpError("must be contained in a tt.func");
+  if (!triton::isKernel(cast<FunctionOpInterface>(function.getOperation())))
+    return emitOpError("must be contained in a kernel tt.func");
+  Block *entry = &function.getBody().front();
+  if (getOperation()->getBlock() != entry) {
+    auto loop =
+        dyn_cast_or_null<scf::ForOp>(getOperation()->getBlock()->getParentOp());
+    if (!loop || loop->getBlock() != entry)
+      return emitOpError(
+          "must be in the function entry block or one directly nested "
+          "scf.for");
+    for (Value bound :
+         {loop.getLowerBound(), loop.getUpperBound(), loop.getStep()}) {
+      if (mayDependOnClusterRank(bound, getClusterAxis()))
+        return emitOpError(
+            "loop bounds and step must not depend on cluster rank");
+    }
+  }
+  auto module = getOperation()->getParentOfType<ModuleOp>();
+  if (!module)
+    return emitOpError("must be contained in a module");
+  if (gpu::TritonGPUDialect::getNumCTAs(module) != 1)
+    return emitOpError("requires logical ttg.num-ctas to equal 1");
+
+  SmallVector<int> clusterDims = gpu::TritonGPUDialect::getClusterDims(module);
+  for (unsigned axis = 0; axis < clusterDims.size(); ++axis) {
+    int expected = axis == static_cast<unsigned>(getClusterAxis())
+                       ? static_cast<int>(groupSize)
+                       : 1;
+    if (clusterDims[axis] != expected)
+      return emitOpError()
+             << "requires a one-dimensional physical cluster matching "
+                "cluster_axis and group_size; got ("
+             << clusterDims[0] << ", " << clusterDims[1] << ", "
+             << clusterDims[2] << ")";
+  }
+
+  uint64_t elements =
+      componentType.isF32()
+          ? 1
+          : cast<RankedTensorType>(componentType).getNumElements();
+  uint64_t factor = static_cast<uint64_t>(groupSize - 1) * arity;
+  if (elements > std::numeric_limits<int32_t>::max() / sizeof(float) / factor)
+    return emitOpError("remote transaction byte count exceeds int32_t");
+  return success();
+}
+
+LogicalResult ClusterReduceOp::verifyRegions() {
+  Region &combine = getCombineOp();
+  if (combine.empty() || !llvm::hasSingleElement(combine))
+    return emitOpError("requires one non-empty single-block combine region");
+
+  unsigned arity = getPartials().size();
+  Block &block = combine.front();
+  if (block.getNumArguments() != 2 * arity ||
+      llvm::any_of(block.getArgumentTypes(),
+                   [](Type type) { return !type.isF32(); }))
+    return emitOpError(
+        "combine region requires two f32 arguments per component");
+
+  auto returnOp = dyn_cast<ClusterReduceReturnOp>(block.getTerminator());
+  if (!returnOp || returnOp.getResults().size() != arity ||
+      llvm::any_of(returnOp->getOperandTypes(),
+                   [](Type type) { return !type.isF32(); }))
+    return emitOpError(
+        "combine region must return one f32 value per component");
+
+  if (isa<RankedTensorType>(getPartials().front().getType())) {
+    auto operations = block.without_terminator();
+    if (!llvm::hasSingleElement(operations))
+      return emitOpError(
+          "tensor combine region must contain exactly one binary add, max, or "
+          "min operation");
+    Operation &combiner = *operations.begin();
+    if (!isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp,
+             arith::MinNumFOp, arith::MinimumFOp>(combiner) ||
+        combiner.getNumOperands() != 2 || combiner.getNumResults() != 1 ||
+        !((combiner.getOperand(0) == block.getArgument(0) &&
+           combiner.getOperand(1) == block.getArgument(1)) ||
+          (combiner.getOperand(0) == block.getArgument(1) &&
+           combiner.getOperand(1) == block.getArgument(0))) ||
+        returnOp.getResults().front() != combiner.getResult(0))
+      return emitOpError(
+          "tensor combine region must be a direct binary add, max, or min of "
+          "its two arguments");
+  }
+
+  WalkResult result = combine.walk([&](Operation *nested) {
+    for (Value operand : nested->getOperands()) {
+      Region *parent = operand.getParentRegion();
+      if (parent != &combine && !combine.isAncestor(parent)) {
+        nested->emitOpError(
+            "cluster reduction combine region cannot capture values");
+        return WalkResult::interrupt();
+      }
+    }
+    if (!isa<ClusterReduceReturnOp>(nested) &&
+        (!isMemoryEffectFree(nested) || !isSpeculatable(nested))) {
+      nested->emitOpError(
+          "cluster reduction combine operations must be pure and speculatable");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return failure(result.wasInterrupted());
+}
 
 LogicalResult MapToRemoteBufferOp::verify() {
   // src and result should have the same type except MemorySpace

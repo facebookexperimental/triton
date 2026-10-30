@@ -1352,7 +1352,7 @@ class tensor(base_value):
     def ceil(self) -> tensor:
         ...
 
-    def reduce(self, axis, combine_fn, keep_dims=False) -> tensor:
+    def reduce(self, axis, combine_fn, keep_dims=False, multi_cta=False) -> tensor:
         ...
 
     def associative_scan(self, axis, combine_fn, reverse=False, reduction_ordering=None) -> tensor:
@@ -3366,6 +3366,7 @@ def _add_reduction_docstr(
     tie_break_arg: str = None,
     dtype_arg: str = None,
     reduction_ordering_arg: str = None,
+    multi_cta_arg: str = None,
 ) -> Callable[[T], T]:
 
     def _decorator(func: T) -> T:
@@ -3396,6 +3397,15 @@ def _add_reduction_docstr(
             docstr += f"""
     :param {reduction_ordering_arg}: specifies the ordering strategy for the reduction. When None (default), the reduction order is layout-dependent and may vary across configurations. Pass a ReductionOrderingBase instance (e.g. ``tl.ReductionOrdering.INNER_TREE``) for deterministic, layout-independent ordering.
     :type {reduction_ordering_arg}: None | ReductionOrderingBase"""
+        if multi_cta_arg is not None:
+            docstr += f"""
+    :param {multi_cta_arg}: if true, combine the CTA-local result across every CTA in the physical cluster.
+        The kernel must supply CTA-local partials and use supported write patterns.
+        Distinct output and statistics arguments must not alias at runtime.
+        The caller must also provide disjoint row/base slices and nonoverlapping
+        rank-zero statistics; formation rejects obvious shared buffer roots but
+        does not prove runtime aliasing between separate arguments.
+    :type {multi_cta_arg}: bool"""
 
         func.__doc__ = docstr.format(name=name)
         return func
@@ -3418,6 +3428,7 @@ def reduce(
     combine_fn,
     keep_dims=False,
     reduction_ordering=None,
+    multi_cta=False,
     _semantic=None,
     _generator=None,
 ):
@@ -3436,6 +3447,12 @@ def reduce(
         ReductionOrderingBase instance (e.g. ``tl.ReductionOrdering.INNER_TREE``) for deterministic,
         layout-independent ordering.
     :type reduction_ordering: None | ReductionOrderingBase
+    :param multi_cta: combine this CTA-local partial across the physical CTA cluster.
+        Distinct output and statistics arguments must not alias at runtime.
+        The caller must also provide disjoint row/base slices and nonoverlapping
+        rank-zero statistics; formation rejects obvious shared buffer roots but
+        does not prove runtime aliasing between separate arguments.
+    :type multi_cta: bool
 
     """
     if isinstance(input, tensor):
@@ -3445,6 +3462,7 @@ def reduce(
             combine_fn,
             keep_dims=keep_dims,
             reduction_ordering=reduction_ordering,
+            multi_cta=multi_cta,
             _semantic=_semantic,
             _generator=_generator,
         )[0]
@@ -3472,8 +3490,11 @@ def reduce(
     axis = _unwrap_if_constexpr(axis)
     keep_dims = _unwrap_if_constexpr(keep_dims)
     reduction_ordering = _unwrap_if_constexpr(reduction_ordering)
+    multi_cta = _unwrap_if_constexpr(multi_cta)
+    if not isinstance(multi_cta, bool):
+        raise TypeError(f"multi_cta must be a bool, got {type(multi_cta)}")
     if reduction_ordering is None:
-        if knobs.language.strict_reduction_ordering:
+        if knobs.language.strict_reduction_ordering and not multi_cta:
             reduction_ordering = ReductionOrdering.INNER_TREE
         else:
             reduction_ordering = ReductionOrdering.UNORDERED
@@ -3481,6 +3502,8 @@ def reduce(
         raise TypeError("CompositeReductionOrdering is not yet supported")
     if not isinstance(reduction_ordering, ReductionOrdering):
         raise TypeError(f"reduction_ordering must be None or a ReductionOrdering, got {type(reduction_ordering)}")
+    if multi_cta and reduction_ordering != ReductionOrdering.UNORDERED:
+        raise ValueError("multi_cta reductions require ReductionOrdering.UNORDERED")
     if axis is not None:
         axis = _wrap_axis(axis, len(input[0].shape))
     # `reduction_ordering` is an fbtriton-LOCAL extension (introduced by #1100,
@@ -3498,9 +3521,17 @@ def reduce(
     #     would re-break every sync.
     #   * this guard lives next to the fbtriton-local feature it accommodates and adapts
     #     automatically if Gluon's signature ever changes.
-    if "reduction_ordering" in inspect.signature(_semantic.reduction).parameters:
-        ret = _semantic.reduction(input, axis, make_combine_region, reduction_ordering=reduction_ordering)
+    semantic_params = inspect.signature(_semantic.reduction).parameters
+    if "reduction_ordering" in semantic_params:
+        if multi_cta and "multi_cta" not in semantic_params:
+            raise ValueError("multi_cta reductions are unavailable in this frontend")
+        kwargs = {"reduction_ordering": reduction_ordering}
+        if "multi_cta" in semantic_params:
+            kwargs["multi_cta"] = multi_cta
+        ret = _semantic.reduction(input, axis, make_combine_region, **kwargs)
     else:
+        if multi_cta:
+            raise ValueError("multi_cta reductions are unavailable in this frontend")
         ret = _semantic.reduction(input, axis, make_combine_region)
     if keep_dims:
         if axis is not None:
@@ -4183,7 +4214,6 @@ class AutoWSLoopOptions(base_value):
                                                         metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
     flatten: bool | constexpr = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
     warp_specialize: bool | constexpr = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
-    multi_cta: bool | constexpr = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
     disable_licm: bool | constexpr = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
     data_partition_factor: int | constexpr | None = field(default=None,
                                                           metadata=_loop_attr("tt.data_partition_factor", "int32"))
@@ -4240,13 +4270,6 @@ class range(AutoWSLoopOptions):
         The compiler will attempt to partition memory, MMA, and vector
         operations in the loop into separate async partitions. This will
         increase the total number of warps required by the kernel.
-    :param multi_cta: Enable multi-CTA reduction on the loop. The compiler
-        will partition loop iterations across CTAs in a cluster and
-        automatically generate cross-CTA reduction (via Distributed Shared
-        Memory) for any ``tl.sum`` / ``tl.reduce`` that consumes the loop's
-        accumulator. Requires ``ctas_per_cga`` to be set in the kernel
-        launch config (e.g., via ``triton.Config``). Only supported on
-        SM90+ (Hopper/Blackwell) GPUs.
     :param disable_licm: Tells the compiler it shouldn't hoist loop invariant
         code outside the loop. This is often useful to avoid creating long liveranges
         within a loop.

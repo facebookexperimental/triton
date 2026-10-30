@@ -2203,3 +2203,268 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+#cluster_reduce_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_composite_tensor_combiner(%partial: tensor<128xf32, #cluster_reduce_blocked>) -> tensor<128xf32, #cluster_reduce_blocked> {
+    // expected-error @+1 {{tensor combine region must contain exactly one binary add, max, or min operation}}
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      %scaled = arith.mulf %sum, %rhs : f32
+      "ttng.cluster_reduce.return"(%scaled) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<128xf32, #cluster_reduce_blocked>) -> tensor<128xf32, #cluster_reduce_blocked>
+    tt.return %result : tensor<128xf32, #cluster_reduce_blocked>
+  }
+}
+
+// -----
+
+#cluster_placement_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_conditional_placement(%partial: tensor<128xf32, #cluster_placement_blocked>, %condition: i1) -> tensor<128xf32, #cluster_placement_blocked> {
+    %result = scf.if %condition -> tensor<128xf32, #cluster_placement_blocked> {
+      // expected-error @+1 {{must be in the function entry block or one directly nested scf.for}}
+      %reduced = "ttng.cluster_reduce"(%partial) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<128xf32, #cluster_placement_blocked>) -> tensor<128xf32, #cluster_placement_blocked>
+      scf.yield %reduced : tensor<128xf32, #cluster_placement_blocked>
+    } else {
+      scf.yield %partial : tensor<128xf32, #cluster_placement_blocked>
+    }
+    tt.return %result : tensor<128xf32, #cluster_placement_blocked>
+  }
+}
+
+// -----
+
+#cluster_loop_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_rank_dependent_loop(%partial: tensor<128xf32, #cluster_loop_blocked>) -> tensor<128xf32, #cluster_loop_blocked> {
+    %pid = tt.get_program_id x : i32
+    %lower = arith.index_cast %pid : i32 to index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %result = scf.for %i = %lower to %c4 step %c1 iter_args(%acc = %partial) -> tensor<128xf32, #cluster_loop_blocked> {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %reduced = "ttng.cluster_reduce"(%acc) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<128xf32, #cluster_loop_blocked>) -> tensor<128xf32, #cluster_loop_blocked>
+      scf.yield %reduced : tensor<128xf32, #cluster_loop_blocked>
+    }
+    tt.return %result : tensor<128xf32, #cluster_loop_blocked>
+  }
+}
+
+// -----
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_group_size(%partial: f32) -> f32 {
+    // expected-error @+1 {{group_size must be 2 or 4}}
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 3 : i32} : (f32) -> f32
+    tt.return %result : f32
+  }
+}
+
+// -----
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_group_mismatch(%partial: f32) -> f32 {
+    // expected-error @+1 {{requires a one-dimensional physical cluster matching cluster_axis and group_size; got (2, 1, 1)}}
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 4 : i32} : (f32) -> f32
+    tt.return %result : f32
+  }
+}
+
+// -----
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_non_f32(%partial: i32) -> i32 {
+    // expected-error @+1 {{requires scalar f32 or non-empty, positive-rank, statically shaped f32 tensors}}
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (i32) -> i32
+    tt.return %result : i32
+  }
+}
+
+// -----
+
+#cluster_reduce_k2_tensor = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_k2_tensor(%a: tensor<32xf32, #cluster_reduce_k2_tensor>, %b: tensor<32xf32, #cluster_reduce_k2_tensor>) -> (tensor<32xf32, #cluster_reduce_k2_tensor>, tensor<32xf32, #cluster_reduce_k2_tensor>) {
+    // expected-error @+1 {{two-component reductions require scalar f32 state}}
+    %result:2 = "ttng.cluster_reduce"(%a, %b) ({
+    ^bb0(%lhs_a: f32, %lhs_b: f32, %rhs_a: f32, %rhs_b: f32):
+      %sum_a = arith.addf %lhs_a, %rhs_a : f32
+      %sum_b = arith.addf %lhs_b, %rhs_b : f32
+      "ttng.cluster_reduce.return"(%sum_a, %sum_b) : (f32, f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<32xf32, #cluster_reduce_k2_tensor>, tensor<32xf32, #cluster_reduce_k2_tensor>) -> (tensor<32xf32, #cluster_reduce_k2_tensor>, tensor<32xf32, #cluster_reduce_k2_tensor>)
+    tt.return %result#0, %result#1 : tensor<32xf32, #cluster_reduce_k2_tensor>, tensor<32xf32, #cluster_reduce_k2_tensor>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_while_collective_bound(%input: f32) {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %bound = scf.while (%k = %c0) : (i32) -> i32 {
+      %cond = arith.cmpi slt, %k, %rank : i32
+      scf.condition(%cond) %k : i32
+    } do {
+    ^bb0(%k: i32):
+      %next = arith.addi %k, %c1 : i32
+      scf.yield %next : i32
+    }
+    scf.for %i = %c0 to %bound step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_execute_region_collective_bound(%input: f32) {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %bound = scf.execute_region -> i32 {
+      scf.yield %rank : i32
+    }
+    scf.for %i = %c0 to %bound step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_index_switch_collective_bound(%input: f32) {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %selector = arith.constant 0 : index
+    %bound = scf.index_switch %selector -> i32
+    case 0 {
+      scf.yield %rank : i32
+    }
+    default {
+      scf.yield %c0 : i32
+    }
+    scf.for %i = %c0 to %bound step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func private @reject_private_helper(%input: f32, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = nvg.cluster_id
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      // expected-error @+1 {{must be contained in a kernel tt.func}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_cluster_rank_bound(%input: f32, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = nvg.cluster_id
+    scf.for %i = %c0 to %rank step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func private @return_cluster_rank() -> i32 {
+    %rank = nvg.cluster_id
+    tt.return %rank : i32
+  }
+  tt.func public @reject_call_bound(%input: f32, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %bound = tt.call @return_cluster_rank() : () -> i32
+    scf.for %i = %c0 to %bound step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}

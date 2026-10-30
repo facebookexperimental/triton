@@ -930,6 +930,8 @@ class CUDABackend(BaseBackend):
         if knobs.language.allow_npot:
             passes.ttir.add_npot_pad(pm)
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        nvidia.passes.hopper.add_form_multi_cta_collectives(pm, capability, knobs.nvidia.use_meta_ws)
+        nvidia.passes.hopper.add_lower_cluster_reduce_to_ttgir(pm)
         # Check user-visible tt.dot 2-CTA legality before lowering rewrites
         # dot dependencies into TMEM alloc/load/store chains.
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
@@ -1148,7 +1150,6 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_lower_clc(pm)
         smem_budget = _max_shared_mem_for_capability(capability)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
-        nvidia.passes.hopper.add_multi_cta_reduction(pm)
         # TODO: Find the optimal place in the pipeline for this pass.
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
         if knobs.nvidia.enable_interleave_tmem:

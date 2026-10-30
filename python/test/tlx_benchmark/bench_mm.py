@@ -8,7 +8,7 @@ import sys
 import torch
 
 from triton.tlx.ops.kernels.mm._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, flops, label, operand
+from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, MMShape, flops, label, operand
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -31,10 +31,63 @@ REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 # future benchmark-only exclusions.
 FAILED_SHAPES = set()
 
+#: Focus shapes each arch's `tlx.ops.mm` declines with `InvalidInput`. Listed
+#: rather than derived from the catalog, so a shape the op newly declines still
+#: fails as an ERROR. Remove an entry once the op accepts it.
+DECLINED_SHAPES = {
+    "sm100":
+    frozenset({
+        MMShape(256, 1056, 294912, (1, 256), (1088, 1), "bf16"),
+        MMShape(1024, 65536, 2304, (1, 1024), (131072, 1), "bf16"),
+        MMShape(1024, 65536, 1152, (1, 1024), (131072, 1), "bf16"),
+        MMShape(2048, 12800, 1152, (1, 2048), (89600, 1), "bf16"),
+        MMShape(7, 4096, 1152, (1, 7), (4096, 1), "bf16"),
+        MMShape(7, 2048, 1152, (1, 7), (2048, 1), "bf16"),
+        MMShape(2048, 15044, 1152, (1, 2048), (15072, 1), "bf16"),
+        MMShape(1152, 15044, 2048, (2048, 1), (15072, 1), "bf16"),
+        MMShape(1024, 65536, 1152, (1, 1024), (196608, 1), "bf16"),
+        MMShape(1152, 16672, 3840, (3840, 1), (16704, 1), "bf16"),
+        MMShape(1152, 256, 16672, (16704, 1), (256, 1), "bf16"),
+        MMShape(1056, 1056, 2304, (1, 1088), (1088, 1), "bf16"),
+        MMShape(3840, 16672, 1152, (1, 3840), (16704, 1), "bf16"),
+        MMShape(1152, 1024, 15044, (15072, 1), (1024, 1), "bf16"),
+        MMShape(1152, 16672, 256, (256, 1), (16704, 1), "bf16"),
+        MMShape(256, 15042, 1152, (1, 256), (15042, 1), "bf16"),
+        MMShape(2304, 1056, 1056, (1088, 1), (1, 1056), "bf16"),
+        MMShape(2304, 1056, 1056, (1088, 1), (1056, 1), "bf16"),
+        MMShape(1152, 4096, 7, (7, 1), (4096, 1), "bf16"),
+        MMShape(705178, 6, 6, (6, 1), (6, 1), "bf16"),
+        MMShape(1024, 15044, 1152, (1, 1024), (15072, 1), "bf16"),
+        MMShape(1536, 16672, 1152, (1, 1536), (16704, 1), "bf16"),
+        MMShape(1152, 2048, 7, (7, 1), (2048, 1), "bf16"),
+        MMShape(705178, 6, 6, (6, 1), (1, 6), "bf16"),
+        MMShape(1152, 512, 15044, (15072, 1), (512, 1), "bf16"),
+        MMShape(1152, 16672, 1536, (1536, 1), (16704, 1), "bf16"),
+        MMShape(503599, 6, 6, (6, 1), (6, 1), "bf16"),
+        MMShape(7, 7, 198339, (1, 7), (7, 1), "bf16"),
+        MMShape(386515, 6, 6, (6, 1), (6, 1), "bf16"),
+        MMShape(503599, 6, 6, (6, 1), (1, 6), "bf16"),
+        MMShape(386937, 7, 7, (7, 1), (7, 1), "bf16"),
+        MMShape(1152, 256, 15044, (15072, 1), (256, 1), "bf16"),
+        MMShape(256, 16672, 1152, (1, 256), (16704, 1), "bf16"),
+        MMShape(1056, 1056, 1152, (1, 1088), (1088, 1), "bf16"),
+        MMShape(7, 7, 222929, (1, 7), (7, 1), "bf16"),
+        MMShape(115066, 4, 4, (4, 1), (4, 1), "bf16"),
+        MMShape(1152, 1056, 1056, (1088, 1), (1, 1056), "bf16"),
+        MMShape(313230, 7, 7, (7, 1), (7, 1), "bf16"),
+        MMShape(386515, 6, 6, (6, 1), (1, 6), "bf16"),
+        MMShape(117574, 4, 4, (4, 1), (4, 1), "bf16"),
+        MMShape(512, 15044, 1152, (1, 512), (15072, 1), "bf16"),
+        MMShape(10, 10, 75315, (1, 10), (10, 1), "bf16"),
+    }),
+}
+
 
 def shapes(synthetic: bool = False, suites=None) -> list:
-    entries = SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites)
-    return [entry for entry in entries if tuple(entry) not in FAILED_SHAPES]
+    arch = driver.arch()
+    entries = SYNTHETIC if synthetic else SHAPE_SUITES.shapes(arch, suites)
+    skip = FAILED_SHAPES | DECLINED_SHAPES.get(arch, frozenset())
+    return [entry for entry in entries if tuple(entry) not in skip]
 
 
 def cases(synthetic: bool = False, suites=None) -> list[Case]:

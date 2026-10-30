@@ -1588,3 +1588,90 @@ def test_const_ptr_is_constant_addrspace():
         tl.store(Out + offs, tl.load(In + offs, mask=mask), mask=mask)
 
     run_filecheck_test(kernel, args=(MockTensor(tl.float32), MockTensor(tl.float32), 8, 128))
+
+
+def test_amd_wmma_layout_pins_dot_scaled_layout():
+    import triton.language.extra.tlx as tlx
+    from triton.backends.compiler import GPUTarget
+
+    @triton.jit
+    def kernel():
+        mma: tl.constexpr = tlx.amd_wmma_layout([[0, 2], [2, 0]], [[0, 1], [1, 0]], instr_shape=(16, 16, 128))
+        a = tlx.require_layout(tl.full((64, 128), 1.0, tl.float8e4nv), tlx.dot_operand_layout(0, mma, 16))
+        b = tlx.require_layout(tl.full((128, 64), 1.0, tl.float8e4nv), tlx.dot_operand_layout(1, mma, 16))
+        acc = tlx.require_layout(tl.zeros((64, 64), tl.float32), mma)
+        scale_a = tl.full((64, 4), 127, tl.uint8)
+        scale_b = tl.full((64, 4), 127, tl.uint8)
+        acc = tl.dot_scaled(a, scale_a, "e4m3", b, scale_b, "e4m3", acc)
+        out = tlx.local_alloc((64, 64), tl.float32, 1)
+        tlx.local_store(tlx.local_view(out, 0), acc)
+
+    module = run_parser(kernel, kwargs={"num_warps": 4}, target=GPUTarget("hip", "gfx1250", 32))
+    text = module.str_nodebug()
+    assert "tt.dot_scaled" in text
+    assert ("#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = [[0, 1], [1, 0]], "
+            "warp = [[0, 2], [2, 0]]}, instrShape = [16, 16, 128]}>") in text
+    assert "-> tensor<64x64xf32, #tlx.no_verify_layout<#shared1>>" in text
+    assert "#shared1 = #tlx.user_layout<#mma>" in text
+
+
+def test_amd_wmma_layout_constexpr_cache_identity():
+    import triton.language.extra.tlx as tlx
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(LAYOUT: tl.constexpr):
+        pass
+
+    def cache_key(layout):
+        return ASTSource(kernel, {"LAYOUT": "constexpr"}, {"LAYOUT": layout}).hash()
+
+    assert cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]])) == cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]]))
+    assert cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]])) != cache_key(tlx.amd_wmma_layout([[0, 1], [1, 0]]))
+
+
+@triton.jit
+def _marker_ordering_add(lhs, rhs):
+    return lhs + rhs
+
+
+@triton.jit
+def _marker_ordering_kernel(OP: tl.constexpr, MARKED: tl.constexpr, ORDER: tl.constexpr):
+    x = tl.arange(0, 32).to(tl.float32)
+    if OP == "reduce":
+        value = tl.reduce(x, 0, _marker_ordering_add, multi_cta=MARKED, reduction_ordering=ORDER)
+    elif OP == "sum":
+        value = tl.sum(x, 0, multi_cta=MARKED, reduction_ordering=ORDER)
+    elif OP == "max":
+        value = tl.max(x, 0, multi_cta=MARKED, reduction_ordering=ORDER)
+    else:
+        value = tl.min(x, 0, multi_cta=MARKED, reduction_ordering=ORDER)
+    anchor(value)
+
+
+@pytest.mark.parametrize("op", ["reduce", "sum", "max", "min"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("marked", [False, True])
+def test_multi_cta_default_ordering(op, strict, marked):
+    with triton.knobs.language.scope():
+        triton.knobs.language.strict_reduction_ordering = strict
+        module = run_parser(_marker_ordering_kernel, args=(op, marked, None))
+    text = module.str_nodebug()
+    assert ("tt.multi_cta" in text) == marked
+    assert ('reduction_ordering = "inner_tree"' in text) == (strict and not marked)
+
+
+@pytest.mark.parametrize("op", ["reduce", "sum", "max", "min"])
+@pytest.mark.parametrize("strict", [False, True])
+def test_multi_cta_rejects_explicit_ordering(op, strict):
+    with triton.knobs.language.scope():
+        triton.knobs.language.strict_reduction_ordering = strict
+        with pytest.raises(CompilationError) as exc_info:
+            run_parser(_marker_ordering_kernel, args=(op, True, tl.ReductionOrdering.INNER_TREE))
+        error = exc_info.value
+        while error.__cause__ is not None:
+            error = error.__cause__
+        assert isinstance(error, ValueError)
+        assert str(error) == "multi_cta reductions require ReductionOrdering.UNORDERED"
+        module = run_parser(_marker_ordering_kernel, args=(op, True, tl.ReductionOrdering.UNORDERED))
+    assert "tt.multi_cta" in module.str_nodebug()

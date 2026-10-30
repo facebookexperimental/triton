@@ -1,15 +1,7 @@
 {{def_kernel("Q", "K", "V", "LSE", "MAX", "KV_NUM_BLKS", "KV_IDX", "FULL_KV_NUM_BLKS", "FULL_KV_IDX")}}
-    # tlx_gfx950_flex_attention: TLX AMD (CDNA4 / gfx950) FlexAttention forward kernel.
-    #
-    # Single-task (no warp specialization: MI350 has no WS) online-softmax FA with
-    # the FlexAttention scaffolding shared with the Blackwell template — block-sparse
-    # KV iteration, score_mod/mask_mod via modification() macros, logsumexp/max.
-    # AMD compute engine:
-    #   * K/V staged to LDS via tlx.async_load (K and V committed in ONE group),
-    #   * Q@K^T through tlx.local_trans + MFMA tl.dot,
-    #   * P@V through MFMA tl.dot, accumulated in registers.
-    # No TMEM / TMA / tcgen05 (Blackwell-only).
 
+    # tlx_gfx950_flex_attention
+    # Commit K/V together so one wait covers both LDS reads.
     tl.static_assert(SPARSE_Q_BLOCK_SIZE >= BLOCK_M and SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0)
     tl.static_assert(SPARSE_KV_BLOCK_SIZE >= BLOCK_N and SPARSE_KV_BLOCK_SIZE % BLOCK_N == 0)
 
@@ -41,7 +33,6 @@
     K = K + k_offset
     V = V + v_offset
 
-    # Sparse block setup (identical to the Blackwell template)
     SPARSE_Z = {{size("KV_NUM_BLKS", 0)}}
     SPARSE_HQ = {{size("KV_NUM_BLKS", 1)}}
     sparse_idx_z = off_zq % SPARSE_Z
@@ -55,7 +46,6 @@
     sparse_kv_num_blks_offset = sparse_hz_offset * stride_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
     sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
 
-    # ===================== CONSTANTS =====================
     NUM_KV_BUFFERS: tl.constexpr = 2
     RCP_LN2: tl.constexpr = 1.44269504  # log2(e): change of base for exp2 softmax
 
@@ -63,25 +53,22 @@
     offs_d = tl.arange(0, QK_HEAD_DIM_ROUNDED)
     offs_vd = tl.arange(0, V_HEAD_DIM_ROUNDED)
 
-    # ---- Load Q tile into registers ----
     q = tl.load(
         Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk,
         mask=(offs_m[:, None] < Q_LEN) & (offs_d[None, :] < QK_HEAD_DIM),
         other=0.0,
     )
 
-    # ---- LDS staging buffers for K / V ----
     k_tiles = tlx.local_alloc((BLOCK_N, QK_HEAD_DIM_ROUNDED), MATMUL_PRECISION, NUM_KV_BUFFERS)
     v_tiles = tlx.local_alloc((BLOCK_N, V_HEAD_DIM_ROUNDED), MATMUL_PRECISION, NUM_KV_BUFFERS)
 
-    # ---- Softmax accumulators (registers) ----
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, V_HEAD_DIM_ROUNDED], dtype=tl.float32)
 
     qk_scale = SM_SCALE
+    m = get_bounded_indices(offs_m[:, None], Q_LEN if not IS_DIVISIBLE else None)
 
-    # ===================== NORMAL BLOCKS (score_mod AND mask_mod) =====================
     kv_indices = KV_IDX + sparse_kv_idx_offset
     kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE
     kv_num_blocks = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
@@ -89,9 +76,7 @@
 
     offs_n = kv_start + tl.arange(0, BLOCK_N)
     buf = 0
-    for _sn in range(0, block_n_end):
-        # Stage K/V for this block into LDS. Commit K and V in ONE group: separate
-        # groups + wait_group(0) mis-syncs the LDS reads on gfx950 (garbage/NaN).
+    if block_n_end > 0:
         k_ptrs = K + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
         v_ptrs = V + offs_n[:, None] * stride_vn + offs_vd[None, :] * stride_vk
         if IS_DIVISIBLE:
@@ -103,13 +88,46 @@
             tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, buf),
                                    mask=offs_n[:, None] < KV_LEN)
         tlx.async_load_commit_group([tok_k, tok_v])
+    # Block indices are loaded one iteration ahead and consumed after the next
+    # top-of-loop wait, keeping their round trip off the prefetch's critical
+    # path. Scalar or masked loads would force an immediate vmcnt(0)
+    # (readfirstlane / branch phi), so they are clamped lane vectors.
+    lane_zero = tl.zeros([BLOCK_N], dtype=tl.int32)
+    last_kv = tl.maximum(kv_num_blocks - 1, 0)
+    ahead_cur = tl.load(kv_indices + lane_zero, eviction_policy="evict_last")
+    ahead_next = tl.load(kv_indices + tl.minimum(1, last_kv) + lane_zero, eviction_policy="evict_last")
+    for _sn in range(0, block_n_end):
         wait = tlx.async_load_wait_group(0)
+        offset = BLOCK_N
+        if not BLOCKS_ARE_CONTIGUOUS:
+            offset = tl.where((_sn + 1) % SPARSE_KV_MULTIPLE == 0,
+                              (ahead_next - ahead_cur) * SPARSE_KV_BLOCK_SIZE - (SPARSE_KV_MULTIPLE - 1) * BLOCK_N,
+                              BLOCK_N)
+            ahead_idx = (_sn + 1) // SPARSE_KV_MULTIPLE
+            ahead_cur = tl.load(kv_indices + tl.minimum(ahead_idx, last_kv) + lane_zero,
+                                eviction_policy="evict_last")
+            ahead_next = tl.load(kv_indices + tl.minimum(ahead_idx + 1, last_kv) + lane_zero,
+                                 eviction_policy="evict_last")
 
         kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_tiles, buf)), token=wait, relaxed=True)
         qk = tl.dot(q, kt)
 
+        next_offs_n = offs_n + offset
+        next_buf = (buf + 1) % NUM_KV_BUFFERS
+        if _sn + 1 < block_n_end:
+            k_ptrs = K + next_offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+            v_ptrs = V + next_offs_n[:, None] * stride_vn + offs_vd[None, :] * stride_vk
+            if IS_DIVISIBLE:
+                tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_tiles, next_buf))
+                tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, next_buf))
+            else:
+                tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_tiles, next_buf),
+                                       mask=next_offs_n[:, None] < KV_LEN)
+                tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, next_buf),
+                                       mask=next_offs_n[:, None] < KV_LEN)
+            tlx.async_load_commit_group([tok_k, tok_v])
+
         qk = qk * qk_scale
-        m = get_bounded_indices(offs_m[:, None], Q_LEN if not IS_DIVISIBLE else None)
         n = get_bounded_indices(offs_n[None, :], KV_LEN if not IS_DIVISIBLE else None)
 
         {{ modification(
@@ -141,7 +159,6 @@
         post_mod_scores = tl.where(mask_mod_output, post_mod_scores, float("-inf"))
         post_mod_scores = post_mod_scores * RCP_LN2
 
-        # Online softmax update
         m_ij = tl.maximum(m_i, tl.max(post_mod_scores, 1))
         if not ROWS_GUARANTEED_SAFE:
             m_ij_masked = tl.where(m_ij == float("-inf"), 0, m_ij)
@@ -156,14 +173,9 @@
         acc = tl.dot(p.to(MATMUL_PRECISION), v, acc)
         m_i = m_ij
 
-        offset = get_offset_for_next_block(
-            _sn, kv_indices, kv_num_blocks,
-            SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
-        )
-        offs_n = offs_n + offset
-        buf = (buf + 1) % NUM_KV_BUFFERS
+        offs_n = next_offs_n
+        buf = next_buf
 
-    # ===================== FULL BLOCKS (score_mod ONLY, skip mask_mod) =====================
     if HAS_FULL_BLOCKS:
         fkv_indices = FULL_KV_IDX + sparse_kv_idx_offset
         fkv_start = tl.load(fkv_indices) * SPARSE_KV_BLOCK_SIZE
@@ -171,7 +183,7 @@
         fblock_n_end = tl.minimum(fkv_num_blocks * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
         offs_n = fkv_start + tl.arange(0, BLOCK_N)
 
-        for _sn in range(0, fblock_n_end):
+        if fblock_n_end > 0:
             k_ptrs = K + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
             v_ptrs = V + offs_n[:, None] * stride_vn + offs_vd[None, :] * stride_vk
             if IS_DIVISIBLE:
@@ -183,13 +195,41 @@
                 tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, buf),
                                        mask=offs_n[:, None] < KV_LEN)
             tlx.async_load_commit_group([tok_k, tok_v])
+        last_fkv = tl.maximum(fkv_num_blocks - 1, 0)
+        ahead_cur = tl.load(fkv_indices + lane_zero, eviction_policy="evict_last")
+        ahead_next = tl.load(fkv_indices + tl.minimum(1, last_fkv) + lane_zero, eviction_policy="evict_last")
+        for _sn in range(0, fblock_n_end):
             wait = tlx.async_load_wait_group(0)
+            offset = BLOCK_N
+            if not BLOCKS_ARE_CONTIGUOUS:
+                offset = tl.where((_sn + 1) % SPARSE_KV_MULTIPLE == 0,
+                                  (ahead_next - ahead_cur) * SPARSE_KV_BLOCK_SIZE - (SPARSE_KV_MULTIPLE - 1) * BLOCK_N,
+                                  BLOCK_N)
+                ahead_idx = (_sn + 1) // SPARSE_KV_MULTIPLE
+                ahead_cur = tl.load(fkv_indices + tl.minimum(ahead_idx, last_fkv) + lane_zero,
+                                    eviction_policy="evict_last")
+                ahead_next = tl.load(fkv_indices + tl.minimum(ahead_idx + 1, last_fkv) + lane_zero,
+                                     eviction_policy="evict_last")
 
             kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_tiles, buf)), token=wait, relaxed=True)
             qk = tl.dot(q, kt)
 
+            next_offs_n = offs_n + offset
+            next_buf = (buf + 1) % NUM_KV_BUFFERS
+            if _sn + 1 < fblock_n_end:
+                k_ptrs = K + next_offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+                v_ptrs = V + next_offs_n[:, None] * stride_vn + offs_vd[None, :] * stride_vk
+                if IS_DIVISIBLE:
+                    tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_tiles, next_buf))
+                    tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, next_buf))
+                else:
+                    tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_tiles, next_buf),
+                                           mask=next_offs_n[:, None] < KV_LEN)
+                    tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, next_buf),
+                                           mask=next_offs_n[:, None] < KV_LEN)
+                tlx.async_load_commit_group([tok_k, tok_v])
+
             qk = qk * qk_scale
-            m = get_bounded_indices(offs_m[:, None], Q_LEN if not IS_DIVISIBLE else None)
             n = get_bounded_indices(offs_n[None, :], KV_LEN if not IS_DIVISIBLE else None)
 
             {{ modification(
@@ -222,14 +262,9 @@
             acc = tl.dot(p.to(MATMUL_PRECISION), v, acc)
             m_i = m_ij
 
-            offset = get_offset_for_next_block(
-                _sn, fkv_indices, fkv_num_blocks,
-                SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
-            )
-            offs_n = offs_n + offset
-            buf = (buf + 1) % NUM_KV_BUFFERS
+            offs_n = next_offs_n
+            buf = next_buf
 
-    # ===================== EPILOGUE: normalize + store =====================
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     acc = acc / l_safe[:, None]
 

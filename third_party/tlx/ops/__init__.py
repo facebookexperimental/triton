@@ -76,12 +76,62 @@ from ._catalog import (
     invariant_vocab_for,
 )
 from ._invariance import BitwiseInvarianceSpec, Space, normalize_space
+from ._normalization import (
+    compute_norm_nvfp4_global_scale,
+    layernorm,
+    layernorm_add,
+    layernorm_backward,
+    layernorm_backward_from_x_norm,
+    layernorm_mxfp4,
+    layernorm_mxfp8_gdpa_precomputed_no_normalized,
+    layernorm_mxfp8_gdpa_with_backward,
+    layernorm_mxfp8_quantize,
+    layernorm_mxfp8_quantize_numerics_preserving,
+    layernorm_mxfp8_with_backward,
+    layernorm_nvfp4_backward_from_x_norm_padded_dy,
+    layernorm_nvfp4_quantize,
+    layernorm_nvfp4_quantize_inplace,
+    layernorm_nvfp4_quantize_q0_jagged_transpose,
+    layernorm_nvfp4_quantize_q0_jagged_transpose_inplace,
+    norm_backward_from_normalized,
+    norm_bwd,
+    norm_fwd,
+    norm_quant_mxfp8_fwd,
+    nvfp4_quantize_normalized,
+    rmsnorm,
+    rmsnorm_backward,
+    rmsnorm_backward_from_x_norm,
+    rmsnorm_backward_quantize_dx_mxfp8,
+    rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed,
+    rmsnorm_backward_quantize_dx_mxfp8_from_output_recompute_q_precomputed,
+    rmsnorm_backward_quantize_dx_mxfp8_precomputed,
+    rmsnorm_mxfp4,
+    rmsnorm_mxfp8_quantize,
+    rmsnorm_mxfp8_quantize_3232_2pass,
+    rmsnorm_nvfp4_quantize,
+    softmax,
+    softmax_bwd,
+    softmax_fwd,
+)
 
 __all__ = [
     "mm", "mm_bias_grad", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
     "flash_attn_varlen", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
     "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
     "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+]
+__all__ += [
+    'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
+    'layernorm_backward_from_x_norm', 'layernorm_mxfp4', 'layernorm_mxfp8_gdpa_precomputed_no_normalized',
+    'layernorm_mxfp8_gdpa_with_backward', 'layernorm_mxfp8_quantize', 'layernorm_mxfp8_quantize_numerics_preserving',
+    'layernorm_mxfp8_with_backward', 'layernorm_nvfp4_backward_from_x_norm_padded_dy', 'layernorm_nvfp4_quantize',
+    'layernorm_nvfp4_quantize_inplace', 'layernorm_nvfp4_quantize_q0_jagged_transpose',
+    'layernorm_nvfp4_quantize_q0_jagged_transpose_inplace', 'norm_backward_from_normalized', 'norm_bwd', 'norm_fwd',
+    'norm_quant_mxfp8_fwd', 'nvfp4_quantize_normalized', 'rmsnorm', 'rmsnorm_backward', 'rmsnorm_backward_from_x_norm',
+    'rmsnorm_backward_quantize_dx_mxfp8', 'rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed',
+    'rmsnorm_backward_quantize_dx_mxfp8_from_output_recompute_q_precomputed',
+    'rmsnorm_backward_quantize_dx_mxfp8_precomputed', 'rmsnorm_mxfp4', 'rmsnorm_mxfp8_quantize',
+    'rmsnorm_mxfp8_quantize_3232_2pass', 'rmsnorm_nvfp4_quantize', 'softmax', 'softmax_bwd', 'softmax_fwd'
 ]
 
 

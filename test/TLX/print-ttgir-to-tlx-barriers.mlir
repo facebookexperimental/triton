@@ -186,3 +186,33 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Warp specialization embeds the consumer release of a TMA store staging
+// buffer in the store's token wait: once the store has read the buffer, the
+// wait arrives on the barrier the producer waits on before refilling it.
+// Printed as a bare store wait, the producer never sees the release and a
+// persistent kernel deadlocks on its second tile.
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def store_wait_releases_buffer(
+  // CHECK: [[EMPTY:[a-z_0-9]+]] = tlx.alloc_barriers(1)
+  // CHECK: tlx.async_descriptor_store(
+  // CHECK-NEXT: tlx.async_descriptor_store_wait(0)
+  // CHECK-NEXT: tlx.barrier_arrive([[EMPTY]])
+  // CHECK-NEXT: tlx.async_descriptor_store_wait(0)
+  // CHECK-NEXT: tlx.barrier_arrive([[EMPTY]], pred=
+  tt.func public @store_wait_releases_buffer(%desc: !tt.tensordesc<128x128xbf16, #shared1>, %buf: !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>, %x: i32, %c: i1) attributes {noinline = false} {
+    %true = arith.constant true
+    %empty = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %empty, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %t = ttng.async_tma_copy_local_to_global %desc[%x, %x] %buf : !tt.tensordesc<128x128xbf16, #shared1>, !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %t, %empty[%true] : !ttg.async.token, !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.async_tma_store_token_wait %t, %empty[%c] : !ttg.async.token, !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}

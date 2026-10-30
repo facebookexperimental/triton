@@ -4,9 +4,9 @@
   failure_issues.py reopen --title T --labels a,b --summary S --sha SHA --run-url U
       If the failure's last issue was auto-closed within a week and failed with the same error, reopen it instead
       of filing a new one. An issue a person closed is never reopened. After MAX_REOPENS reopens, the next
-      recurrence labels it flaky. Writes action=reopened|skip|file to GITHUB_OUTPUT: skip when the open issue
-      already records a newer run, so an older run cannot wind its status back. On file, or on any error, the
-      report step files or updates the issue as before.
+      recurrence labels it flaky. Writes action=reopened|skip|file to GITHUB_OUTPUT: skip when the issue
+      already records a newer failing or passing run, so an older run cannot wind its status back. On file, or on
+      any error, the report step files or updates the issue as before.
 
   failure_issues.py reconcile --prefix P --labels a,b --failures JSON --run-url U
       Close this job's open issues whose failure no longer appears. Leaves flaky issues for a person to close, and
@@ -61,9 +61,15 @@ def summary_of(body):
 
 
 def run_id_of(body):
-    """The id of the run that last reported the failure, from the issue's status table; 0 if absent."""
-    m = re.search(r"^\| Run \| \S*/actions/runs/(\d+)", body or "", re.M)
-    return int(m[1]) if m else 0
+    """The newest run recorded as failing or resolving the issue; 0 if absent."""
+    runs = re.findall(r"(?:^\| Run \| \S*/actions/runs/|<!-- ci-resolved run=)(\d+)", body or "", re.M)
+    return max(map(int, runs), default=0)
+
+
+def record_resolution(body, run_id):
+    """Record the resolving run without changing the last failure's SHA, run or summary."""
+    body = re.sub(r"\n?<!-- ci-resolved run=\d+ -->", "", body or "").rstrip()
+    return f"{body}\n\n<!-- ci-resolved run={run_id} -->\n"
 
 
 def record_failure(body, sha, run_url):
@@ -73,14 +79,15 @@ def record_failure(body, sha, run_url):
 
 
 def decide(api, repo, title, labels, summary, now, run_id):
-    """("reopen", (issue, reopens, flaky)), ("skip", None) when the open issue records a newer run, or
+    """("reopen", (issue, reopens, flaky)), ("skip", None) when the issue records a newer run, or
     ("file", None) to leave filing to the report step."""
-    quoted = title.replace('"', '\\"')
-    q = " ".join([f"repo:{repo}", "is:issue", *[f'label:"{l}"' for l in labels], f'in:title "{quoted}"'])
-    found = api("GET", f"search/issues?per_page=100&q={quote(q, safe='')}")["items"]
-    found = [i for i in found if i["title"] == title and "pull_request" not in i]
-    # Search can lag a close by seconds, so confirm what it reports as open.
-    issues = [api("GET", f"repos/{repo}/issues/{i['number']}") if i["state"] == "open" else i for i in found]
+    # List, never search: the search index can miss an issue for hours, and a missed issue gets filed twice.
+    # A close inside the reopen window updates the issue, so `since` keeps every closed issue that can matter.
+    since = (now - WINDOW).isoformat().replace("+00:00", "Z")
+    base = f"repos/{repo}/issues?labels={quote(','.join(labels))}&per_page=100"
+    found = (api("GET", f"{base}&state=open", paginate=True) +
+             api("GET", f"{base}&state=closed&since={since}", paginate=True))
+    issues = [i for i in found if i["title"] == title and "pull_request" not in i]
     open_issues = [i for i in issues if i["state"] == "open"]
     if open_issues:
         return ("skip" if any(run_id_of(i["body"]) > run_id for i in open_issues) else "file"), None
@@ -89,6 +96,8 @@ def decide(api, repo, title, labels, summary, now, run_id):
         return "file", None
     # Only the most recently closed issue counts: a person's close stands even if an older one was the bot's.
     issue = api("GET", f"repos/{repo}/issues/{max(closed, key=lambda i: i['closed_at'])['number']}")
+    if run_id_of(issue["body"]) > run_id:
+        return "skip", None
     if (issue.get("closed_by") or {}).get("login") != BOT:
         return "file", None
     if now - dt.datetime.fromisoformat(issue["closed_at"].replace("Z", "+00:00")) > WINDOW:
@@ -143,7 +152,8 @@ def reconcile(api, repo, prefix, labels, failures_json, run_url, run_id):
                 f"✅ Auto-closing: this failure identity no longer appears in the latest run ({run_url}). "
                 "A new issue will be filed automatically if it recurs."
             })
-        api("PATCH", f"repos/{repo}/issues/{issue['number']}", {"state": "closed", "state_reason": "completed"})
+        api("PATCH", f"repos/{repo}/issues/{issue['number']}",
+            {"state": "closed", "state_reason": "completed", "body": record_resolution(issue["body"], run_id)})
         closed.append(issue["number"])
     print(f'Reconcile complete for "{prefix}": closed {len(closed)} issue(s).')
     return closed

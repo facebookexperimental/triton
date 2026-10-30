@@ -1,3 +1,7 @@
+import json
+from types import SimpleNamespace
+import xml.etree.ElementTree as ET
+
 import tlx_ops_bench_dashboard as dash
 
 
@@ -78,3 +82,35 @@ def test_a_change_the_next_night_cannot_check_stays_unconfirmed(monkeypatch):
     ]
     perf = dash.events(nights)[1]["perf"]["mm"]
     assert perf["unconfirmed"] and perf["n_slower"] == 1 and perf["slower"][0]["next"] is None
+
+
+def test_skipped_operator_remains_visible_alongside_measurements(tmp_path):
+    raw = {
+        "env": {"ref": "torch.matmul", "space": "heuristic"},
+        "results": [{
+            "case":
+            {"op": "mm", "key": "mm/gfx950/float16/256", "input": "((), {})", "direction": "fwd", "dtype": "float16"},
+            "status": "ok",
+            "speedup": 1.0,
+            "tlx": {"mean": 10.0},
+            "ref": {"mean": 10.0},
+        }],
+    }
+    (tmp_path / "mm.json").write_text(json.dumps(raw))
+    suite = ET.Element("testsuite")
+    test = ET.SubElement(suite, "testcase", name="test_op_perf[bench_addmm]")
+    ET.SubElement(test, "skipped", message="no implementation")
+    ET.ElementTree(suite).write(tmp_path / "bench.xml")
+    out = tmp_path / "summary.json"
+    dash.summarize(
+        SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261029", sha="a" * 40, out=str(out)))
+    summary = json.loads(out.read_text())
+    ops = summary["ops"]
+    assert ops["addmm"]["reason"] == "no implementation"
+    assert ops["addmm"]["cases"] == []
+    assert len(ops["mm"]["cases"]) == 1
+    assert ops["mm"]["cases"][0]["tlx_tflops"] == 10.0
+    page = dash.page_data({"mi350": [summary]})["platforms"]["mi350"]
+    assert page["ops"]["addmm"]["reason"] == "no implementation"
+    assert page["ops"]["addmm"]["cases"] == []
+    assert page["nights"][0]["ops"]["addmm"] == []

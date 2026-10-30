@@ -371,32 +371,37 @@ def _append_tlx_flex_amd(
     query,
     mutated_inputs,
 ):
-    """Append AMD (gfx950) flex-attention candidates: single-task MFMA/LDS body.
+    """Append the offline gfx950 forward choice; max_autotune adds stock-derived tiles."""
+    from torch._inductor import config
 
-    Unlike the Blackwell path this uses no warp specialization / TMEM / TMA, so
-    USE_TMA / NUM_MMA_GROUPS are not set. num_warps follows the MFMA tile
-    (BLOCK_M / mfma_m rows per wave), capped at 8.
-    """
-    def amd_options():
-        opts = original_kernel_options.copy()
-        for k in list(opts.keys()):
-            if k.startswith("fwd_"):
-                opts[k[4:]] = opts.pop(k)
-            elif k.startswith("bwd_"):
-                opts.pop(k)
-        opts["USE_TMA"] = False
-        opts.setdefault("SPARSE_Q_BLOCK_SIZE", sparse_q_block_size)
-        opts.setdefault("SPARSE_KV_BLOCK_SIZE", sparse_kv_block_size)
-        return opts
+    if not configs:
+        return
+    base = original_kernel_options.copy()
+    for name in list(base):
+        if name.startswith("fwd_"):
+            base[name[4:]] = base.pop(name)
+        elif name.startswith("bwd_"):
+            base.pop(name)
+    base["USE_TMA"] = False
+    base.setdefault("SPARSE_Q_BLOCK_SIZE", sparse_q_block_size)
+    base.setdefault("SPARSE_KV_BLOCK_SIZE", sparse_kv_block_size)
 
-    mfma_m = 32
-    for conf in configs:
-        opts = amd_options()
-        opts["BLOCK_M"] = conf.block_m
-        opts["BLOCK_N"] = conf.block_n
-        opts["num_warps"] = min(8, max(1, conf.block_m // mfma_m))
-        # TLX is hand-pipelined; disable Triton software pipelining.
-        opts["num_stages"] = 1
+    head_dim = max(
+        base.get("QK_HEAD_DIM_ROUNDED", query.get_size()[-1]),
+        base.get("V_HEAD_DIM_ROUNDED", query.get_size()[-1]),
+    )
+    # Tuned offline at bf16 D<=128; wider heads stay on stock until measured.
+    if head_dim > 128:
+        return
+
+    def fit(tile, sparse_size):
+        while tile >= 16 and (sparse_size < tile or sparse_size % tile):
+            tile //= 2
+        return tile if tile >= 16 else None
+
+    def append(block_m, block_n, **knobs):
+        opts = base.copy()
+        opts.update(BLOCK_M=block_m, BLOCK_N=block_n, num_stages=1, **knobs)
         gfx950_flex_attention_template.maybe_append_choice(
             choices=choices,
             input_nodes=input_nodes,
@@ -406,6 +411,16 @@ def _append_tlx_flex_amd(
             call_sizes=query.get_size(),
             **opts,
         )
+
+    block_m = fit(128, base["SPARSE_Q_BLOCK_SIZE"])
+    block_n = fit(64, base["SPARSE_KV_BLOCK_SIZE"])
+    if block_m and block_n:
+        append(block_m, block_n, num_warps=4, waves_per_eu=0, matrix_instr_nonkdim=min(32, block_m, block_n), kpack=1)
+    if config.max_autotune:
+        for conf in configs:
+            if (fit(conf.block_m, base["SPARSE_Q_BLOCK_SIZE"]) == conf.block_m
+                    and fit(conf.block_n, base["SPARSE_KV_BLOCK_SIZE"]) == conf.block_n):
+                append(conf.block_m, conf.block_n, num_warps=min(8, max(1, conf.block_m // 32)))
 
 
 _SM90_HEAD_DIMS = (64, 80, 96, 128)
