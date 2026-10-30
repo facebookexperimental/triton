@@ -19,6 +19,30 @@ pytestmark = pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942")
 ARCH = "gfx942"
 
 
+@pytest.mark.parametrize("m,n,k", [(2048, 1536, 8192), (1000, 777, 3001)])
+@pytest.mark.parametrize("bias", [False, True])
+def test_stream_k_matches_reference_and_is_deterministic(m, n, k, bias):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    torch.manual_seed(m + n + k)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.float16).t()
+    c = torch.randn((n, ), device="cuda", dtype=torch.float16) if bias else None
+    config = gfx942._config(256, 128, 64, 8, 8)
+    first = gfx942._launch_streamk(a, b, c, torch.empty((m, n), device="cuda", dtype=torch.float16), config)
+    second = gfx942._launch_streamk(a, b, c, torch.empty((m, n), device="cuda", dtype=torch.float16), config)
+    expected = torch.mm(a, b) if c is None else torch.addmm(c, a, b)
+    torch.testing.assert_close(first, expected, atol=0.05, rtol=0.05)
+    assert torch.equal(first, second)
+
+
+def test_planner_uses_stream_k_only_without_invariance():
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    assert gfx942._fill_plan(2032, 2560, 18688, allow_split=True).kwargs.get("STREAM_K")
+    assert not gfx942._fill_plan(2032, 2560, 18688, allow_split=False).kwargs.get("STREAM_K")
+
+
 @pytest.mark.parametrize("m", [4178, 4942])
 @pytest.mark.parametrize("n", [256, 512, 1280, 2560])
 def test_deep_k_batch_boundaries(m, n):
