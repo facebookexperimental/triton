@@ -2166,6 +2166,9 @@ def torchtlx_heuristic_config(M, N, K, *, dtype, out_dtype, a_strides, b_strides
     # the measured split-K and odd-K rules beat a forced direct tile.
     if (enable or bf16) and K % 8 == 0 and not _global_split_k_shape(M, N, K):
         fill = _fill_plan(M, N, K, allow_split=True)
-        if fill is not None and fill.kwargs.get("SPLIT_K", 1) == 1 and not fill.kwargs.get("STREAM_K", False):
+        # 32-row tiles measured slower in the template than in tlx.ops
+        # (279x8192x2048: 0.72 vs 0.85 of hipBLASLt for the incumbent).
+        if (fill is not None and fill.kwargs.get("SPLIT_K", 1) == 1 and not fill.kwargs.get("STREAM_K", False)
+                and fill.kwargs["BLOCK_M"] >= 64):
             return [fill]
     return heuristic_config(M, N, K, enable_global_split_k=enable, enable_short_m_tuning=False)
