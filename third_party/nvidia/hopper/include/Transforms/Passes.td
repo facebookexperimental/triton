@@ -3,7 +3,8 @@
 
 include "mlir/Pass/PassBase.td"
 
-def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"> {
+def NVGPUWarpSpecialization
+    : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"> {
   let summary = "Automatic Warp specialization for NVIDIA GPU";
 
   let description = [{
@@ -17,84 +18,77 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
                            "mlir::triton::nvgpu::NVGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
                            "mlir::triton::nvws::NVWSDialect"];
-  let options = [
-    Option<"numStages", "num-stages",
-           "int32_t", /*default*/"3",
-           "number of buffers for warp specialization">,
-    Option<"capability", "capability",
-           "int32_t", /*default*/"100",
-           "NVIDIA compute capability">,
-    Option<"pingpongAutoWS", "pingpong-auto-ws",
-           "bool", /*default*/"false",
-           "Enable ping pong barrier insertion around critical regions">,
-    Option<"dumpIntermediateSteps", "dump-intermediate-steps",
-             "bool", /*default*/"false",
-             "Dump intermediate steps">,
-    Option<"smemBudget", "smem-budget",
-             "int32_t", /*default*/"0",
-             "SMEM budget in bytes (0 = auto-detect from target)">,
-    Option<"generateSubtiledRegion", "generate-subtiled-region",
-             "bool", /*default*/"false",
-             "Generate SubtiledRegionOp from epilogue split patterns">,
-    Option<"tilePrefetchDepth", "tile-prefetch-depth",
-             "int32_t", /*default*/"1",
-             "Number of buffers for the dynamic-persistent tile-id broadcast "
-             "channel (cross-partition run-once atomic support)">,
-    Option<"tmaStorePipelining", "tma-store-pipelining",
-             "bool", /*default*/"true",
-             "Enable TMA store wait annotation, validation, and reordering">
-    ];
+  let options =
+      [Option<"numStages", "num-stages", "int32_t", /*default*/ "3",
+              "number of buffers for warp specialization">,
+       Option<"capability", "capability", "int32_t", /*default*/ "100",
+              "NVIDIA compute capability">,
+       Option<"pingpongAutoWS", "pingpong-auto-ws", "bool", /*default*/ "false",
+              "Enable ping pong barrier insertion around critical regions">,
+       Option<"dumpIntermediateSteps", "dump-intermediate-steps", "bool",
+              /*default*/ "false", "Dump intermediate steps">,
+       Option<"smemBudget", "smem-budget", "int32_t", /*default*/ "0",
+              "SMEM budget in bytes (0 = auto-detect from target)">,
+       Option<"generateSubtiledRegion", "generate-subtiled-region", "bool",
+              /*default*/ "false",
+              "Generate SubtiledRegionOp from epilogue split patterns">,
+       Option<"tilePrefetchDepth", "tile-prefetch-depth", "int32_t",
+              /*default*/ "1",
+              "Number of buffers for the dynamic-persistent tile-id broadcast "
+              "channel (cross-partition run-once atomic support)">,
+       Option<"tmaStorePipelining", "tma-store-pipelining", "bool",
+              /*default*/ "true",
+              "Enable TMA store wait annotation, validation, and reordering">];
 }
 
-def NVGPUTestWSTaskPartition : Pass<"nvgpu-test-ws-task-partition", "mlir::ModuleOp"> {
+def NVGPUTestWSTaskPartition
+    : Pass<"nvgpu-test-ws-task-partition", "mlir::ModuleOp"> {
   let summary = "test warp specialization task partition";
 
-  let description = "This pass computes a warp schedule partition by annoating anchor operations with async task ids";
+  let description = "This pass computes a warp schedule partition by annoating "
+                    "anchor operations with async task ids";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
-  let options = [
-    Option<"numWarpGroups", "num-warp-groups",
-           "int32_t", /*default*/"0",
-           "number of warp groups for warp specialization">
-  ];
+  let options = [Option<"numWarpGroups", "num-warp-groups", "int32_t",
+                        /*default*/ "0",
+                        "number of warp groups for warp specialization">];
 }
 
-def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::ModuleOp"> {
+def NVGPUTestWSMemoryPlanner
+    : Pass<"nvgpu-test-ws-memory-planner", "mlir::ModuleOp"> {
   let summary = "test warp specialization memory planner";
 
   let description = "This pass computes a memory configuration for autoWS";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvws::NVWSDialect"];
-  let options = [
-    Option<"numBuffers", "num-buffers",
-           "int32_t", /*default*/"0",
-           "number of buffering for warp specialization">,
-    Option<"smemAllocAlgo", "smem-alloc-algo",
-           "int32_t", /*default*/"1",
-           "SMEM allocation algorithm: 0 = original, 1 = WSBuffer-based (default)">,
-    Option<"smemBudget", "smem-budget",
-           "int32_t", /*default*/"0",
-           "SMEM budget in bytes (0 = auto-detect from target)">,
-    Option<"smemCircularReuse", "smem-circular-reuse",
-           "bool", /*default*/"false",
-           "Enable circular buffer reuse for SMEM allocation">,
-    Option<"smemPlanSearch", "smem-plan-search",
-           "bool", /*default*/"false",
-           "Allocate SMEM via the plan-space beam search (default off)">,
-    Option<"reserveAuxiliarySmem", "reserve-auxiliary-smem",
-           "bool", /*default*/"true",
-           "Reserve SMEM for post-planning barriers, captures, tensor-map scratch, and op scratch">,
-    Option<"readDecisionFile", "read-decision-file",
-           "std::string", /*default*/"\"\"",
-           "path to JSON file containing buffer decisions to apply">,
-    Option<"writeDecisionFile", "write-decision-file",
-           "std::string", /*default*/"\"\"",
-           "path to JSON file to write buffer decisions to">
-  ];
+  let options =
+      [Option<"numBuffers", "num-buffers", "int32_t", /*default*/ "0",
+              "number of buffering for warp specialization">,
+       Option<"smemAllocAlgo", "smem-alloc-algo", "int32_t", /*default*/ "1",
+              "SMEM allocation algorithm: 0 = original, 1 = WSBuffer-based "
+              "(default)">,
+       Option<"smemBudget", "smem-budget", "int32_t", /*default*/ "0",
+              "SMEM budget in bytes (0 = auto-detect from target)">,
+       Option<"smemCircularReuse", "smem-circular-reuse", "bool",
+              /*default*/ "false",
+              "Enable circular buffer reuse for SMEM allocation">,
+       Option<"smemPlanSearch", "smem-plan-search", "bool", /*default*/ "false",
+              "Allocate SMEM via the plan-space beam search (default off)">,
+       Option<"reserveAuxiliarySmem", "reserve-auxiliary-smem", "bool",
+              /*default*/ "true",
+              "Reserve SMEM for post-planning barriers, captures, tensor-map "
+              "scratch, and op scratch">,
+       Option<"readDecisionFile", "read-decision-file", "std::string",
+              /*default*/ "\"\"",
+              "path to JSON file containing buffer decisions to apply">,
+       Option<"writeDecisionFile", "write-decision-file", "std::string",
+              /*default*/ "\"\"",
+              "path to JSON file to write buffer decisions to">];
 }
 
-def NVGPUTestWSTaskIdPropagate : Pass<"nvgpu-test-taskid-propagate", "mlir::ModuleOp"> {
+def NVGPUTestWSTaskIdPropagate
+    : Pass<"nvgpu-test-taskid-propagate", "mlir::ModuleOp"> {
   let summary = "test warp specialization task id propagation";
 
   let description = [{
@@ -105,14 +99,13 @@ def NVGPUTestWSTaskIdPropagate : Pass<"nvgpu-test-taskid-propagate", "mlir::Modu
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 
-  let options = [
-    Option<"numWarpGroups", "num-warp-groups",
-           "int32_t", /*default*/"0",
-           "number of warp groups for warp specialization">
-  ];
+  let options = [Option<"numWarpGroups", "num-warp-groups", "int32_t",
+                        /*default*/ "0",
+                        "number of warp groups for warp specialization">];
 }
 
-def NVGPUTestWSAtomicBroadcast : Pass<"nvgpu-test-ws-atomic-broadcast", "mlir::ModuleOp"> {
+def NVGPUTestWSAtomicBroadcast
+    : Pass<"nvgpu-test-ws-atomic-broadcast", "mlir::ModuleOp"> {
   let summary = "test warp specialization dynamic-tile atomic/CLC broadcast";
 
   let description = [{
@@ -127,73 +120,72 @@ def NVGPUTestWSAtomicBroadcast : Pass<"nvgpu-test-ws-atomic-broadcast", "mlir::M
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 
-  let options = [
-    Option<"tilePrefetchDepth", "tile-prefetch-depth",
-           "int32_t", /*default*/"1",
-           "broadcast channel depth (SMEM slot multi-buffering)">
-  ];
+  let options = [Option<"tilePrefetchDepth", "tile-prefetch-depth", "int32_t",
+                        /*default*/ "1",
+                        "broadcast channel depth (SMEM slot multi-buffering)">];
 }
 
 def NVGPUWSDataPartition : Pass<"nvgpu-ws-data-partition", "mlir::ModuleOp"> {
   let summary = "warp specialization data partition";
 
-  let description = "This pass partitions operations into multiple suboperations which operate on smaller data shapes";
+  let description = "This pass partitions operations into multiple "
+                    "suboperations which operate on smaller data shapes";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
-  let options = [
-    Option<"numWarpGroups", "num-warp-groups",
-           "int32_t", /*default*/"0",
-           "number of warp groups for warp specialization">
-  ];
+  let options = [Option<"numWarpGroups", "num-warp-groups", "int32_t",
+                        /*default*/ "0",
+                        "number of warp groups for warp specialization">];
 }
 
-def NVGPUTestWSCodePartition: Pass<"nvgpu-test-ws-code-partition", "mlir::ModuleOp"> {
+def NVGPUTestWSCodePartition
+    : Pass<"nvgpu-test-ws-code-partition", "mlir::ModuleOp"> {
   let summary = "test warp specialization code partition";
 
-  let description = "This pass generates warp specialized code baed on task id attributes.";
+  let description =
+      "This pass generates warp specialized code baed on task id attributes.";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
                            "mlir::triton::nvws::NVWSDialect"];
-  let options = [
-    Option<"numBuffers", "num-buffers",
-           "int32_t", /*default*/"0",
-           "number of buffering for producer-consumer">,
-    Option<"numWarpGroups", "num-warp-groups",
-           "int32_t", /*default*/"0",
-           "number of warp groups for warp specialization">,
-    Option<"requestedRegisters", "requested-registers",
-           "int32_t", /*default*/"232",
-           "number of register requested for computation group">
-  ];
+  let options = [Option<"numBuffers", "num-buffers", "int32_t", /*default*/ "0",
+                        "number of buffering for producer-consumer">,
+                 Option<"numWarpGroups", "num-warp-groups", "int32_t",
+                        /*default*/ "0",
+                        "number of warp groups for warp specialization">,
+                 Option<"requestedRegisters", "requested-registers", "int32_t",
+                        /*default*/ "232",
+                        "number of register requested for computation group">];
 }
 
-def NVGPUTestPingPongSync : Pass<"nvgpu-test-ping-pong-sync", "mlir::ModuleOp"> {
+def NVGPUTestPingPongSync
+    : Pass<"nvgpu-test-ping-pong-sync", "mlir::ModuleOp"> {
   let summary = "test ping pong sync";
 
-  let description = "This pass inserts named barriers to enforce ping pong around critical resources";
+  let description = "This pass inserts named barriers to enforce ping pong "
+                    "around critical resources";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
-  let options = [
-    Option<"numWarpGroups", "num-warp-groups",
-           "int32_t", /*default*/"0",
-           "number of warp groups for warp specialization">,
-    Option<"capability", "capability",
-           "int32_t", /*default*/"10",
-           "NVIDIA compute capability">
-  ];
+  let options = [Option<"numWarpGroups", "num-warp-groups", "int32_t",
+                        /*default*/ "0",
+                        "number of warp groups for warp specialization">,
+                 Option<"capability", "capability", "int32_t", /*default*/ "10",
+                        "NVIDIA compute capability">];
 }
 
 def NVGPUTest1DTMEMAlloc : Pass<"nvgpu-test-1D-tmem-alloc", "mlir::ModuleOp"> {
-  let summary = "test allocating tmem for a 1D tensor that should be passed across partitions.";
+  let summary = "test allocating tmem for a 1D tensor that should be passed "
+                "across partitions.";
 
-  let description = "This pass takes producers with tmem.start and establishes a TMEM allocation for communication with other partitions.";
+  let description =
+      "This pass takes producers with tmem.start and establishes a TMEM "
+      "allocation for communication with other partitions.";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
-def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir::ModuleOp"> {
+def NVGPUTestWSBufferAllocation
+    : Pass<"nvgpu-test-ws-buffer-allocation", "mlir::ModuleOp"> {
   let summary = "test buffer allocation";
 
   let description = "This pass creates buffers for each async task channel.";
@@ -202,35 +194,37 @@ def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir:
                            "mlir::triton::nvws::NVWSDialect"];
 }
 
-def NVGPUTestWSHoistTMEMStore : Pass<"nvgpu-test-ws-hoist-tmem-store", "mlir::ModuleOp"> {
+def NVGPUTestWSHoistTMEMStore
+    : Pass<"nvgpu-test-ws-hoist-tmem-store", "mlir::ModuleOp"> {
   let summary = "test hoisting loop-invariant TMEM stores";
 
-  let description = "This pass hoists loop-invariant TMEM stores out of outer loops.";
+  let description =
+      "This pass hoists loop-invariant TMEM stores out of outer loops.";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
-def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> {
+def NVGPUTestPingPongPrep
+    : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> {
   let summary = "test ping pong preprocessing";
 
-  let description = "This pass groups expensive operations into ping-pong regions.";
+  let description =
+      "This pass groups expensive operations into ping-pong regions.";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 
-  let options = [
-    Option<"numWarpGroups", "num-warp-groups",
-           "int32_t", /*default*/"0",
-           "number of warp groups for warp specialization">,
-    Option<"capability", "capability",
-           "int32_t", /*default*/"10",
-           "NVIDIA compute capability">,
-    Option<"numStages", "num-stages",
-           "int32_t", /*default*/"3",
-           "number of stages for software pipelining">,
+  let options = [Option<"numWarpGroups", "num-warp-groups", "int32_t",
+                        /*default*/ "0",
+                        "number of warp groups for warp specialization">,
+                 Option<"capability", "capability", "int32_t", /*default*/ "10",
+                        "NVIDIA compute capability">,
+                 Option<"numStages", "num-stages", "int32_t", /*default*/ "3",
+                        "number of stages for software pipelining">,
   ];
 }
 
-def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleOp"> {
+def NVGPUWSTMAStoreLowering
+    : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleOp"> {
   let summary = "Lower descriptor stores to async TMA copies via shared memory";
 
   let description = [{
@@ -257,7 +251,8 @@ def NVGPUSinkBroadcast : Pass<"nvgpu-sink-broadcast", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::TritonDialect"];
 }
 
-def NVGPUTestAnnotateTMAStoreWaits : Pass<"nvgpu-test-annotate-tma-store-waits", "mlir::ModuleOp"> {
+def NVGPUTestAnnotateTMAStoreWaits
+    : Pass<"nvgpu-test-annotate-tma-store-waits", "mlir::ModuleOp"> {
   let summary = "Annotate TMA store waits with can_rotate_by_buffer_count";
 
   let description = [{
@@ -271,7 +266,8 @@ def NVGPUTestAnnotateTMAStoreWaits : Pass<"nvgpu-test-annotate-tma-store-waits",
   let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-def NVGPUTestTMAStoreTokenWaitReorder : Pass<"nvgpu-test-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
+def NVGPUTestTMAStoreTokenWaitReorder
+    : Pass<"nvgpu-test-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
   let summary = "Reschedule TMA store waits using the SWP CoarseSchedule";
 
   let description = [{
@@ -296,8 +292,10 @@ def NVGPUTestTMAStoreTokenWaitReorder : Pass<"nvgpu-test-tma-store-token-wait-re
   let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering", "mlir::ModuleOp"> {
-  let summary = "Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp";
+def NVGPUTMAStoreTokenWaitLowering
+    : Pass<"nvgpu-tma-store-token-wait-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + "
+                "ArriveBarrierOp";
 
   let description = [{
     This pass splits `ttng.async_tma_store_token_wait` ops that have attached
@@ -311,7 +309,8 @@ def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering",
   let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {
+def NVGPUPartitionSchedulingMeta
+    : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {
   let summary = "Meta warp specialization partitioning pass";
 
   let description = [{
@@ -321,35 +320,37 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
     assign to each operation.
   }];
 
-  let options = [
-    Option<"mergeEpilogue", "merge-epilogue",
-           "bool", /*default*/"false",
-           "If true, merge epilogue ops into the correction/reduction partition "
-           "(or computation partition if neither exists)">,
-    Option<"mergeEpilogueToComputation", "merge-epilogue-to-computation",
-           "bool", /*default*/"false",
-           "If true, merge epilogue ops directly into computation[dpId] "
-           "partitions, even if correction/reduction exists">,
-    Option<"mergeCorrection", "merge-correction",
-           "bool", /*default*/"false",
+  let options =
+      [Option<"mergeEpilogue", "merge-epilogue", "bool", /*default*/ "false",
+              "If true, merge epilogue ops into the correction/reduction "
+              "partition "
+              "(or computation partition if neither exists)">,
+       Option<"mergeEpilogueToComputation", "merge-epilogue-to-computation",
+              "bool", /*default*/ "false",
+              "If true, merge epilogue ops directly into computation[dpId] "
+              "partitions, even if correction/reduction exists">,
+       Option<
+           "mergeCorrection", "merge-correction", "bool", /*default*/ "false",
            "If true, merge correction ops into computation[dpId] partitions">,
-    Option<"mergeReduction", "merge-reduction",
-           "bool", /*default*/"false",
-           "If true, merge reduction ops into computation[dpId] partitions">,
-    Option<"separateEpilogueStore", "separate-epilogue-store",
-           "bool", /*default*/"false",
-           "If true, place epilogue store ops in a dedicated 1-warp partition">
-  ];
+       Option<"mergeReduction", "merge-reduction", "bool", /*default*/ "false",
+              "If true, merge reduction ops into computation[dpId] partitions">,
+       Option<"separateEpilogueStore", "separate-epilogue-store", "bool",
+              /*default*/ "false",
+              "If true, place epilogue store ops in a dedicated 1-warp "
+              "partition">];
 }
 
-def NVGPUMultiCTAReduction : Pass<"nvgpu-multi-cta-reduction", "mlir::ModuleOp"> {
-  let summary = "Multi-CTA reduction for NVIDIA GPU";
+def NVGPUFormMultiCTACollectives
+    : Pass<"nvgpu-form-multi-cta-collectives", "mlir::ModuleOp"> {
+  let summary = "Form beta physical-cluster reductions";
   let description = [{
-    Detects scf.for loops with tt.multi_cta attribute and partitions loop
-    iterations across CTAs in a cluster. Post-loop tt.reduce ops are
-    transformed into cross-CTA reduction using DSM.
+    Rewrites supported tt.reduce operations carrying tt.multi_cta into an
+    internal ttng.cluster_reduce without changing loops or stores.
   }];
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+  let options = [Option<"computeCapability", "compute-capability", "int32_t",
+                        "0", "NVIDIA compute capability">];
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
@@ -376,14 +377,13 @@ def NVGPUInsert2CTASync : Pass<"nvgpu-insert-2cta-sync", "mlir::ModuleOp"> {
     lapping a single barrier's phase bit.
   }];
 
-  let dependentDialects = [
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
-    "mlir::triton::nvgpu::NVGPUDialect"
-  ];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvgpu::NVGPUDialect"];
 }
 
-def NVGPUAnalyze2CTADependencies : Pass<"nvgpu-analyze-2cta-dependencies", "mlir::ModuleOp"> {
+def NVGPUAnalyze2CTADependencies
+    : Pass<"nvgpu-analyze-2cta-dependencies", "mlir::ModuleOp"> {
   let summary = "Classify dependencies between 2-CTA MMA operations";
 
   let description = [{
@@ -395,10 +395,8 @@ def NVGPUAnalyze2CTADependencies : Pass<"nvgpu-analyze-2cta-dependencies", "mlir
     for the exchange.
   }];
 
-  let dependentDialects = [
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
 def NVGPUPlan2CTAExchange : Pass<"nvgpu-plan-2cta-exchange", "mlir::ModuleOp"> {
@@ -412,13 +410,12 @@ def NVGPUPlan2CTAExchange : Pass<"nvgpu-plan-2cta-exchange", "mlir::ModuleOp"> {
     after warp specialization by a separate lowering pass.
   }];
 
-  let dependentDialects = [
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-def NVGPUMaterialize2CTAExchange : Pass<"nvgpu-materialize-2cta-exchange", "mlir::ModuleOp"> {
+def NVGPUMaterialize2CTAExchange
+    : Pass<"nvgpu-materialize-2cta-exchange", "mlir::ModuleOp"> {
   let summary = "Materialize planned 2-CTA peer exchanges with DSMEM stores";
 
   let description = [{
@@ -430,17 +427,15 @@ def NVGPUMaterialize2CTAExchange : Pass<"nvgpu-materialize-2cta-exchange", "mlir
     tile without another shared allocation or cluster rendezvous.
   }];
 
-  let dependentDialects = [
-    "mlir::arith::ArithDialect",
-    "mlir::scf::SCFDialect",
-    "mlir::triton::TritonDialect",
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
-    "mlir::triton::nvgpu::NVGPUDialect"
-  ];
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::scf::SCFDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvgpu::NVGPUDialect"];
 }
 
-def NVGPU2CTATransformLoads : Pass<"nvgpu-2cta-transform-loads", "mlir::ModuleOp"> {
+def NVGPU2CTATransformLoads
+    : Pass<"nvgpu-2cta-transform-loads", "mlir::ModuleOp"> {
   let summary = "Transform B matrix loads for 2-CTA MMA operations";
 
   let description = [{
@@ -459,11 +454,9 @@ def NVGPU2CTATransformLoads : Pass<"nvgpu-2cta-transform-loads", "mlir::ModuleOp
     and before insert_2cta_sync.
   }];
 
-  let dependentDialects = [
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
-    "mlir::triton::nvgpu::NVGPUDialect"
-  ];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvgpu::NVGPUDialect"];
 }
 
 #endif // NV_TRANSFORMS_PASSES

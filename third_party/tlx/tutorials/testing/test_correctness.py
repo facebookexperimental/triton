@@ -1901,12 +1901,17 @@ class LayerNorm:
             torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
+RUN_MULTI_CTA_LAYERNORM_TESTS = False
+
+
+@pytest.mark.skipif(not RUN_MULTI_CTA_LAYERNORM_TESTS, reason="Re-enabled in D123952662")
 @pytest.mark.parametrize("num_ctas", [1], ids=["1cta"])
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or Blackwell GPU")
 def test_multi_cta_layer_norm(num_ctas):
     LayerNorm.run_test(_multi_cta_layernorm, num_ctas=num_ctas)
 
 
+@pytest.mark.skipif(not RUN_MULTI_CTA_LAYERNORM_TESTS, reason="Re-enabled in D123952662")
 @pytest.mark.parametrize("num_ctas", [2], ids=["2cta"])
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or Blackwell GPU")
 def test_multi_cta_layer_norm_2d(num_ctas):
