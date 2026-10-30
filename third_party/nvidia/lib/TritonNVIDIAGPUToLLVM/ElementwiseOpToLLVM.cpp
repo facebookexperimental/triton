@@ -341,7 +341,32 @@ static ConverterT makeConverterFromPtx(const std::string &ptxAsm, Type inType,
   return converter;
 }
 
-// Attempts to use vectorized conversions via inline PTX when possible.
+static StringRef stringifyLLVMRoundingMode(triton::RoundingMode rounding) {
+  // clang-format off
+  switch (rounding) {
+  case triton::RoundingMode::RTNE: return "round.tonearest";
+  case triton::RoundingMode::RTZ: return "round.towardzero";
+  }
+  // clang-format on
+  llvm_unreachable("unknown rounding mode");
+}
+
+// Keep the rounding mode visible to LLVM so it can select native conversions
+// and fold an f32 intermediate in f16 <-> bf16 conversions.
+static Value convertFpTrunc(Location loc, ConversionPatternRewriter &rewriter,
+                            Type dstType, Value value,
+                            triton::RoundingMode rounding) {
+  StringRef mode = stringifyLLVMRoundingMode(rounding);
+  Value metadata = LLVM::MetadataAsValueOp::create(
+      rewriter, loc,
+      LLVM::MDStringAttr::get(rewriter.getContext(),
+                              rewriter.getStringAttr(mode)));
+  return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, "llvm.fptrunc.round",
+                                         dstType, {value, metadata})
+      .getResult(0);
+}
+
+// Use packed conversions where the target supports them.
 struct FpToFpOpConversion
     : public ElementwiseOpConversionBase<FpToFpOp, FpToFpOpConversion> {
   using ElementwiseOpConversionBase<
@@ -358,56 +383,6 @@ struct FpToFpOpConversion
                                  ConversionPatternRewriter &rewriter,
                                  const Value &v) {
     return LLVM::FPExtOp::create(rewriter, loc, f32_ty, v);
-  }
-
-  static Value convertFp32ToBf16(Location loc,
-                                 ConversionPatternRewriter &rewriter,
-                                 const Value &v, const RoundingMode rounding) {
-    StringRef name;
-    switch (rounding) {
-    case RoundingMode::RTNE:
-      name = "llvm.nvvm.f2bf16.rn";
-      break;
-    case RoundingMode::RTZ:
-      name = "llvm.nvvm.f2bf16.rz";
-      break;
-    default:
-      emitError(loc) << "unsupported rounding mode for f32->bf16 conversion: "
-                     << stringifyRoundingMode(rounding) << "\n";
-      llvm::report_fatal_error(
-          "unsupported rounding mode for f32->bf16 conversion: " +
-          stringifyRoundingMode(rounding) + "\n");
-    }
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
-    return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, bf16_ty,
-                                           {v, /*pzo=*/b.false_val()})
-        .getResult(0);
-  }
-
-  static Value convertFp32ToFp16(Location loc,
-                                 ConversionPatternRewriter &rewriter,
-                                 const Value &v, const RoundingMode rounding) {
-    PTXBuilder builder;
-    StringRef ptx;
-    switch (rounding) {
-    case RoundingMode::RTNE:
-      ptx = "cvt.rn.f16.f32";
-      break;
-    case RoundingMode::RTZ:
-      ptx = "cvt.rz.f16.f32";
-      break;
-    default:
-      emitError(loc) << "unsupported rounding mode for f32->f16 conversion: "
-                     << stringifyRoundingMode(rounding) << "\n";
-      llvm::report_fatal_error(
-          "unsupported rounding mode for f32->f16 conversion: " +
-          stringifyRoundingMode(rounding) + "\n");
-    }
-    auto &cvt = *builder.create(ptx.str());
-    auto res = builder.newOperand("=h");
-    auto operand = builder.newOperand(v, "r");
-    cvt(res, operand);
-    return builder.launch(rewriter, loc, f16_ty, false);
   }
 
   std::pair<ConverterT, size_t>
@@ -647,32 +622,23 @@ struct FpToFpOpConversion
       }
     }
 
-    if (srcElementType.isF16() && dstElementType.isF32()) {
-      return llvm::to_vector(llvm::map_range(operands[0], [&](Value v) {
-        return convertFp16ToFp32(loc, rewriter, v);
-      }));
-    }
-
-    if (srcElementType.isF32() && dstElementType.isF16()) {
-      assert(roundingMode.has_value() &&
-             "rounding mode must be specified for fp32->fp16 conversion");
-      SmallVector<Value> outVals;
-      for (Value v : operands[0]) {
-        outVals.push_back(
-            convertFp32ToFp16(loc, rewriter, v, roundingMode.value()));
-      }
-      return outVals;
-    }
-
-    if (srcElementType.isF32() && dstElementType.isBF16()) {
-      assert(roundingMode.has_value() &&
-             "rounding mode must be specified for fp32->bf16 conversion");
-      SmallVector<Value> outVals;
-      for (Value v : operands[0]) {
-        outVals.push_back(
-            convertFp32ToBf16(loc, rewriter, v, roundingMode.value()));
-      }
-      return outVals;
+    if (isa<Float16Type, BFloat16Type, Float32Type, Float64Type>(
+            srcElementType) &&
+        isa<Float16Type, BFloat16Type, Float32Type, Float64Type>(
+            dstElementType)) {
+      Value value = operands[0][0];
+      if (srcElementType == dstElementType)
+        return {value};
+      unsigned srcWidth = srcElementType.getIntOrFloatBitWidth();
+      unsigned dstWidth = dstElementType.getIntOrFloatBitWidth();
+      if (srcWidth < dstWidth)
+        return {LLVM::FPExtOp::create(rewriter, loc, elemTy, value)};
+      // LLVM casts require different bit widths. Expose the intermediate so
+      // NVPTX can select a direct f16 <-> bf16 conversion when supported.
+      if (srcWidth == dstWidth)
+        value = LLVM::FPExtOp::create(rewriter, loc, f32_ty, value);
+      return {convertFpTrunc(loc, rewriter, elemTy, value,
+                             roundingMode.value_or(RoundingMode::RTNE))};
     }
 
     bool useFP16IntermediateSrc =
@@ -691,7 +657,7 @@ struct FpToFpOpConversion
     }
     if (useFP16IntermediateSrc)
       for (Value &v : inVals)
-        v = convertFp32ToFp16(loc, rewriter, v, RoundingMode::RTZ);
+        v = convertFpTrunc(loc, rewriter, f16_ty, v, RoundingMode::RTZ);
     inVals.resize(numElements, b.undef(typeConverter->convertType(srcType)));
     SmallVector<Value> outVals = cvtFunc(loc, rewriter, inVals);
     assert(outVals.size() == inVals.size());
