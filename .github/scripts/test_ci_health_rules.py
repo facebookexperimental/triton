@@ -449,8 +449,8 @@ def test_failed_select_is_an_anomaly():
 
 def test_page_data_has_one_section_per_tab():
     data = r.page_data([push(1, tlx())], stamp(23), {})
-    assert set(data) == {"asof", "branches"}
-    assert all(set(v) == {"main", "lit", "nightly", "pr", "ops", "bump"} for v in data["branches"].values())
+    assert set(data) == {"asof", "branches", "occupancy"}
+    assert all(set(v) == {"main", "lit", "nightly", "pr", "ops", "usage", "bump"} for v in data["branches"].values())
 
 
 def test_every_test_step_in_the_gpu_workflows_maps_to_a_group():
@@ -669,3 +669,33 @@ def test_job_durations_and_slow_tests_follow_the_range():
     assert j7["n"] == 1 and j7["p90_prev"] is not None  # the 10-day-old run is in the 7 days before
     (j14, ) = v["jobs"]["14"]
     assert j14["n"] == 2 and j14["p90_prev"] is None
+
+
+def test_usage_counts_each_job_minute_once():
+    """Activity hours add up to the jobs' runner time: a step goes to one activity, and time outside steps to setup."""
+    j = tlx()
+    j["completed_at"] = "2026-10-12T00:30:00Z"
+    j["steps"] = [
+        {"name": "Checkout", "conclusion": "success", "started_at": stamp(0), "completed_at": "2026-10-12T00:05:00Z"},
+        {
+            "name": CORE, "conclusion": "success", "started_at": "2026-10-12T00:06:00Z", "completed_at":
+            "2026-10-12T00:24:00Z"
+        },
+    ]
+    day = {x["day"]: x for x in r.usage_view([push(0, j)], stamp(23))["days"]}["2026-10-12"]["B200"]
+    assert day["L1"] == 0.3 and day["Setup & overhead"] == 0.2 and sum(day.values()) == 0.5
+
+
+def test_occupancy_calls_waiting_capacity_bound_only_when_every_runner_is_busy():
+    # MI350's pool is the most jobs seen at once (2). A job queued behind both waits with the pool full; one queued
+    # at 11:00 that started at 11:20 waited while every runner was free.
+    runs = [
+        push(1, span("mi350", 10, 0, 10, 30), span("mi350", 10, 0, 10, 30), span("mi350", 10, 30, 10, 40, created_m=0)),
+        push(2, span("mi350", 11, 20, 11, 30, created_m=0))
+    ]
+    o = r.occupancy_view(runs, stamp(23))
+    g, t0 = o["gpus"]["MI350"], r.t(o["t0"])
+    cell = lambda h, m: int((r.t(f"2026-10-12T{h:02d}:{m:02d}:00Z") - t0).total_seconds() // 900)
+    assert g["pool"][cell(10, 0)] == 2
+    assert (g["wfull"][cell(10, 0)], g["wpart"][cell(10, 0)]) == (13, 0)
+    assert (g["wfull"][cell(11, 0)], g["wpart"][cell(11, 0)]) == (0, 13)
