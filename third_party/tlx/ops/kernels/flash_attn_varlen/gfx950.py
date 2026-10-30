@@ -29,7 +29,8 @@ CUs), so the tiles stay small and the time is per-tile latency:
   their unnormalized fp32 partial and release a per-tile counter; the merger
   acquires it, folds the partials in, writes the output and resets the
   counter. A tile's splits are adjacent items of one XCD's run, so the merger
-  is dispatched after the splits it waits for.
+  is dispatched after the splits it waits for. Splits of at most
+  BIG_BLOCK_N_MAX_SPLIT 64-key blocks walk 128-key blocks instead.
 """
 
 import functools
@@ -42,6 +43,11 @@ import triton.language.extra.tlx as tlx
 BLOCK_M = 64
 BLOCK_N = 64
 NUM_WARPS = 4
+# Split launches whose splits walk at most this many 64-key blocks use 128-key
+# blocks: measured faster there, and split launches fill at most one workgroup
+# per CU, so the doubled LDS costs nothing.
+BIG_BLOCK_N = 128
+BIG_BLOCK_N_MAX_SPLIT = 10
 # Causal split: the smallest SPLIT >= 4 that gives every work item its own CU
 # and stores at most 64 partials (each partial's release writes back its XCD's
 # L2, so more splits than that cost more than they save).
@@ -306,14 +312,20 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
         full = tl.maximum(tl.minimum(full, n_blocks), lo)
 
     # Padded rows and the dense bases [[0, 1] .. [0, 64], [16, 0], [32, 0],
-    # [1, 0] .. [8, 0]] keep the K^T and V chunk reads free of bank conflicts.
-    kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)],
-        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0], [4, 0], [8, 0]],
-        [BLOCK_N, HEAD_DIM])
+    # [1, 0] .. [8, 0]] keep the K^T and V chunk reads free of bank conflicts;
+    # a 128-row block is two such 64-row halves.
+    if BLOCK_N == 64:
+        kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [(512, 16)], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0],
+                          [4, 0], [8, 0]], [BLOCK_N, HEAD_DIM])
+    else:
+        tl.static_assert(BLOCK_N == 128)
+        kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [(512, 16)], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0],
+                          [4, 0], [8, 0], [64, 0]], [BLOCK_N, HEAD_DIM])
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 2, layout=kv_layout)
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, 2, layout=kv_layout)
-    q_slot = tlx.local_view(v_buf, 1)
+    q_slot = tlx.local_slice(tlx.local_view(v_buf, 1), [0, 0], [BLOCK_M, HEAD_DIM])
     tok_q = tlx.async_load(q_ptrs, q_slot, mask=row_ok[:, None])
     tlx.async_load_commit_group([tok_q])
     tlx.async_load_wait_group(0)
@@ -474,10 +486,11 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scal
         else:
             part, count = scratch
     n_items = bh * items_per_bh
+    block_n = BIG_BLOCK_N if 0 < split <= BIG_BLOCK_N_MAX_SPLIT else BLOCK_N
     grid = (_run_length(n_items, max_splits) * 8, )
     _flash_attn_varlen_fwd[grid](q, k, v, out, cu_seqlens_q, cu_seqlens_k, part, count, q.stride(0), q.stride(1),
                                  k.stride(0), k.stride(1), v.stride(0), v.stride(1), out.stride(0), out.stride(1),
                                  sm_scale * 1.4426950408889634, heads, heads // k.shape[1], num_m_blocks, items_per_bh,
-                                 n_items, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=head_dim, IS_CAUSAL=causal,
+                                 n_items, BLOCK_M=BLOCK_M, BLOCK_N=block_n, HEAD_DIM=head_dim, IS_CAUSAL=causal,
                                  SPLIT=split, num_warps=NUM_WARPS, waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1)
     return out
