@@ -78,6 +78,14 @@ LogicalResult validateFunction(triton::FuncOp function, int axis, int size) {
       op->emitError("multi_cta does not support calls in v1");
       return WalkResult::interrupt();
     }
+    // SM90 specialization may carry these annotations without enabling the
+    // Meta AutoWS option. Every physical CTA must execute the collective with
+    // the same warps, so reject annotated and materialized specialization.
+    if (op->hasAttr("tt.warp_specialize") || op->hasAttr("async_task_id") ||
+        op->hasAttr("ttg.partition")) {
+      op->emitError("multi_cta does not support warp specialization in v1");
+      return WalkResult::interrupt();
+    }
     if (isa<ttg::WarpSpecializeOp>(op)) {
       op->emitError("multi_cta does not support warp specialization in v1");
       return WalkResult::interrupt();
@@ -328,6 +336,11 @@ public:
         computeCapability != 103) {
       module.emitError(
           "multi_cta requires NVIDIA compute capability 90, 100, or 103");
+      return signalPassFailure();
+    }
+    if (autoWarpSpecialization) {
+      module.emitError(
+          "multi_cta does not support automatic warp specialization in v1");
       return signalPassFailure();
     }
     if (ttg::TritonGPUDialect::getNumCTAs(module) != 1) {
