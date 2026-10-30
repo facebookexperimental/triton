@@ -666,7 +666,7 @@ def _delayed_bwd_kernel(
             tlx.async_amd_descriptor_wait((3 if MERGE_STATS else 4) * (STAGES - 1))
             if outer + STAGES - 1 >= outer_stop:
                 tlx.async_amd_descriptor_wait(0)
-            early_qt = None
+            early_qt = ()
             for phase in tl.static_range(PHASES):
                 step = outer * PHASES + phase
                 qv = tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * 32, 0], [32, 128])
@@ -674,16 +674,13 @@ def _delayed_bwd_kernel(
                 if phase == 0:
                     qt = tlx.local_load(tlx.local_trans(qv), layout=rhs, relaxed=True)
                 else:
-                    qt1 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * 32, 32],
-                                                        [32, 32])), layout=rhs, relaxed=True)
                     qt2 = tlx.local_load(
                         tlx.local_trans(tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * 32, 64],
                                                         [32, 32])), layout=rhs, relaxed=True)
                     qt3 = tlx.local_load(
                         tlx.local_trans(tlx.local_slice(tlx.local_view(qb, outer % STAGES), [phase * 32, 96],
                                                         [32, 32])), layout=rhs, relaxed=True)
-                    qt = tl.cat(tl.cat(early_qt, qt1, dim=0), tl.cat(qt2, qt3, dim=0), dim=0)
+                    qt = tl.cat(tl.cat(early_qt[0], early_qt[1], dim=0), tl.cat(qt2, qt3, dim=0), dim=0)
                 qt = tlx.require_layout(qt, rhs, pin=False)
                 scores = tl.dot(k, qt, tlx.zeros((256, 32), tl.float32, layout=mma))
                 dot = tlx.local_load(tlx.local_trans(dov), layout=rhs, relaxed=True)
@@ -743,12 +740,13 @@ def _delayed_bwd_kernel(
                                 tlx.local_slice(tlx.local_view(qb, outer % STAGES),
                                                 [phase * 32, ((band + 2) // 2) * 32], [32, 32]), layout=rhs,
                                 relaxed=True)
-                    if phase + 1 < PHASES and band == 6:
-                        # The next phase shares this completed TDM outer.
-                        early_qt = tlx.local_load(
+                    if phase + 1 < PHASES and band >= 6:
+                        # The next phase shares this completed TDM outer. Loading
+                        # its first two Q slices here shortens its scores wait.
+                        early_qt += (tlx.local_load(
                             tlx.local_trans(
-                                tlx.local_slice(tlx.local_view(qb, outer % STAGES), [(phase + 1) * 32, 0], [32, 32])),
-                            layout=rhs, relaxed=True)
+                                tlx.local_slice(tlx.local_view(qb, outer % STAGES), [(phase + 1) * 32, (band - 6) * 32],
+                                                [32, 32])), layout=rhs, relaxed=True), )
                     ds_current = tlx.extract_slice(ds, [128, 32], [(band % 2) * 128, 0])
                     if OCC1_DQ_FIRST:
                         dq0 = _wmma(ds_band, k0, dq0, ORDERED)
