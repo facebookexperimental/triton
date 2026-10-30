@@ -408,7 +408,9 @@ def test_fixture_only_changes_do_not_skip_tests():
 
 def test_cpu_consumers_still_require_the_wheel():
     from gpu_test_selection import SUITES, test_plan as plan_tests
-    plan = plan_tests(["lib/Analysis/Allocation.cpp"], ROOT, FILTERS, json.loads(SUITES.read_text()))
+    suites = json.loads(SUITES.read_text())
+    suites["reviewed_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    plan = plan_tests(["lib/Analysis/Allocation.cpp"], ROOT, FILTERS, suites)
     assert plan["cpu"]["codegen"]["files"]
     assert plan["cpu"]["gluon"]["files"]
     assert plan["build"]
@@ -510,6 +512,7 @@ def test_cpu_eligibility_rejects_an_overridden_ignore_policy(tmp_path):
 def test_run_summary_explains_actual_placement(paths, offload, placement, gpu_jobs, reason):
     from gpu_test_selection import SUITES, selection_summary, test_plan as plan_tests
     suites = json.loads(SUITES.read_text())
+    suites["reviewed_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     plan = plan_tests(paths, ROOT, FILTERS, suites, offload=offload)
     summary = selection_summary(plan, suites, "tested-sha", "Selection note")
     assert f"Planned GPU jobs: {gpu_jobs}." in summary
