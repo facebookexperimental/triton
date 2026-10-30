@@ -21,7 +21,7 @@
 Stored run record, one JSON object per line in the month of created_at; a later
 line for the same id replaces an earlier one:
   {id, wf, event, status, conclusion, created_at, head_sha, title, url, branch, pr, author,
-   select: {h100, b200, mi350, build, fallback} | null (gpu-tests.yml only),
+   select: {h100, b200, mi350, build, cpu?, fallback} | null (gpu-tests.yml only),
    jobs: [{name, conclusion, created_at, started_at, completed_at, labels,
            steps: [{name, conclusion, started_at, completed_at,
                     failures?: [{id, msg}], slowest?: [{id, s}]}]}] | null until the run completes}
@@ -185,7 +185,7 @@ def _pr_and_author(run, api):
 
 def _attach_failures(jobs, text, wf="gpu-tests.yml"):
     for j in jobs:
-        if j["conclusion"] != "failure" or rules.gpu_of({"wf": wf}, j) is None:
+        if j["conclusion"] != "failure" or rules.test_platform_of({"wf": wf}, j) is None:
             continue
         try:
             logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"), wf != rules.BENCH_WF)
