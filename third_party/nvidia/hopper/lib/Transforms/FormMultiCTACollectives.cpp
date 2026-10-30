@@ -54,7 +54,7 @@ bool isSupportedScalarCombiner(triton::ReduceOp reduce) {
   Type resultType = reduce->getResult(0).getType();
   auto tensorType = dyn_cast<RankedTensorType>(resultType);
   if (!resultType.isF32() &&
-      !(tensorType && tensorType.hasStaticShape() &&
+      !(tensorType && tensorType.getRank() > 0 && tensorType.hasStaticShape() &&
         tensorType.getElementType().isF32() && tensorType.getNumElements() > 0))
     return false;
   Operation *combiner = reduce.getSingleCombiner();

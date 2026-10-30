@@ -2203,3 +2203,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+#cluster_reduce_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_composite_tensor_combiner(%partial: tensor<128xf32, #cluster_reduce_blocked>) -> tensor<128xf32, #cluster_reduce_blocked> {
+    // expected-error @+1 {{tensor combine region must contain exactly one binary add, max, or min operation}}
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      %scaled = arith.mulf %sum, %rhs : f32
+      "ttng.cluster_reduce.return"(%scaled) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<128xf32, #cluster_reduce_blocked>) -> tensor<128xf32, #cluster_reduce_blocked>
+    tt.return %result : tensor<128xf32, #cluster_reduce_blocked>
+  }
+}
