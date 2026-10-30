@@ -1114,10 +1114,11 @@ def CallOp : TT_Op<"call", [CallOpInterface,
   }];
 }
 
-def FuncOp
-    : TT_Op<"func", [AffineScope, AutomaticAllocationScope, CallableOpInterface,
-                     FunctionOpInterface, IsolatedFromAbove, OpAsmOpInterface,
-                     HasParent<"ModuleOp">]> {
+def FuncOp : TT_Op<"func", [
+    AffineScope, AutomaticAllocationScope, CallableOpInterface,
+    SymbolName, SymbolVisibility, FunctionOpInterface, IsolatedFromAbove,
+    OpAsmOpInterface, HasParent<"ModuleOp">
+]> {
   let summary = "An operation with a name containing a single `SSACFG` region";
   let description = [{
     Operations within the function cannot implicitly capture values defined
