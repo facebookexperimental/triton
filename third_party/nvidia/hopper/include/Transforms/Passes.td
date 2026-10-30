@@ -355,6 +355,16 @@ def NVGPUFormMultiCTACollectives
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
+def NVGPULowerClusterReduceToTTGIR
+    : Pass<"nvgpu-lower-cluster-reduce-to-ttgir", "mlir::ModuleOp"> {
+  let summary = "Lower cluster reductions to DSMEM TTGIR primitives";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::scf::SCFDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvgpu::NVGPUDialect"];
+}
+
 def NVGPUInsert2CTASync : Pass<"nvgpu-insert-2cta-sync", "mlir::ModuleOp"> {
   let summary = "Insert cross-CTA synchronization for 2-CTA MMA operations";
 
