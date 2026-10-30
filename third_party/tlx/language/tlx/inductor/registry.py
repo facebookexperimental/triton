@@ -98,6 +98,16 @@ from .mm_templates import (
 )
 
 
+def _mm_allow_tf32(kernel_inputs: MMKernelInputs) -> bool:
+    """Whether Inductor runs this FP32 GEMM as TF32, as its own templates decide."""
+    try:
+        from torch._inductor.template_heuristics.triton import mm_allow_tf32
+    except ImportError:
+        return torch.backends.cuda.matmul.allow_tf32
+    m, n, k = kernel_inputs.mnk_symbolic()
+    return mm_allow_tf32(m, n, k, kernel_inputs.device_type)
+
+
 @dataclasses.dataclass
 class TlxGemmConfig(GemmConfig):
     """
@@ -269,7 +279,10 @@ def _select_group_size_m(M: int, N: int, block_m: int) -> int:
 
 
 def _is_config_valid(
-    config: dict[str, Any], tma_epilogue_store: bool = False, smem_margin: int = 0
+    config: dict[str, Any],
+    tma_epilogue_store: bool = False,
+    smem_margin: int = 0,
+    elem_bytes: int = resources.OPERAND_ELEM_BYTES,
 ) -> bool:
     """Check if a config is valid based on hardware constraints.
 
@@ -277,7 +290,7 @@ def _is_config_valid(
     ``resources.estimate_smem``.
     """
     return validate_config(
-        BlackwellWSGemmConfig.from_dict(config),
+        dataclasses.replace(BlackwellWSGemmConfig.from_dict(config), elem_bytes=elem_bytes),
         charge_epilogue=tma_epilogue_store,
         split_k=config.get("SPLIT_K", 1),
         smem_margin=smem_margin,
@@ -1090,18 +1103,22 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         num_mma_groups: int,
         num_ctas: int,
         epilogue_subtile: int,
+        elem_bytes: int = resources.OPERAND_ELEM_BYTES,
     ) -> bool:
         """Validate the final tile's structural rules and SMEM with a safety margin."""
         return validate_config(
-            cls._tile(
-                block_m,
-                block_n,
-                block_k,
-                num_smem_buffers,
-                num_tmem_buffers,
-                num_mma_groups,
-                num_ctas,
-                epilogue_subtile,
+            dataclasses.replace(
+                cls._tile(
+                    block_m,
+                    block_n,
+                    block_k,
+                    num_smem_buffers,
+                    num_tmem_buffers,
+                    num_mma_groups,
+                    num_ctas,
+                    epilogue_subtile,
+                ),
+                elem_bytes=elem_bytes,
             ),
             charge_epilogue=True,
             smem_margin=cls._SMEM_SAFETY_MARGIN,
@@ -1120,6 +1137,28 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             "A_ROW_MAJOR": mat1_inner_dim == 1,
             "B_ROW_MAJOR": mat2_inner_dim == 1,
         }
+
+    @staticmethod
+    def _has_unsupported_fp32_operands(kernel_inputs: KernelInputs) -> bool:
+        """Whether FP32 operands rule out the template.
+
+        The template's MMA runs FP32 inputs as TF32, so it is only an option when
+        TF32 is allowed. tcgen05.mma also rejects transposed FP32 operands in shared
+        memory, and the template loads both operands as stored, so A must be
+        row-major (K inner) and B column-major (K inner).
+        """
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            return False
+        idxs = (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)
+        if all(kernel_inputs.dtype(idx) != torch.float32 for idx in idxs):
+            return False
+        if not _mm_allow_tf32(kernel_inputs):
+            return True
+        strides = kernel_inputs.strides_hinted()
+        return not (
+            tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1
+            and tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 0
+        )
 
     @staticmethod
     def _has_unsupported_layout(kernel_inputs: KernelInputs) -> bool:
@@ -1159,6 +1198,10 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         m, n, k = kernel_inputs.mnk_hinted()
         num_sms = get_num_sms()
         is_allow_mode = config.triton.tlx_mode == "allow"
+        # The config pool and the heuristic are sized for 2-byte operands; wider
+        # operands (FP32) double the operand and epilogue staging SMEM.
+        elem_bytes = kernel_inputs.dtype(kernel_inputs._mat1_idx).itemsize
+        wide_operands = elem_bytes != resources.OPERAND_ELEM_BYTES
 
         # Try heuristic config selection first (matches tlx_matmul_ws behavior).
         # Always validate without TMA epilogue store, matching upstream TLX.
@@ -1216,7 +1259,9 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             # config — autotuning configs provide fallback if this is skipped.
             # In force mode, always yield since it's the only config.
             BLOCK_K = template_kwargs["BLOCK_K"]
-            skip_heuristic = is_allow_mode and not self._is_valid_config_with_margin(
+            # A wide-operand heuristic config that cannot launch falls through to
+            # the pool in force mode too.
+            skip_heuristic = (is_allow_mode or wide_operands) and not self._is_valid_config_with_margin(
                 BLOCK_M,
                 BLOCK_N,
                 BLOCK_K,
@@ -1225,6 +1270,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 heuristic_config["NUM_MMA_GROUPS"],
                 NUM_CTAS,
                 heuristic_config["EPILOGUE_SUBTILE"],
+                elem_bytes,
             )
             heuristic_yielded = False
             if skip_heuristic:
@@ -1247,7 +1293,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                     yield template_kwargs
                     heuristic_yielded = True
                 else:
-                    for tma_kwargs in self._yield_tma_variants(template_kwargs):
+                    for tma_kwargs in self._yield_tma_variants(template_kwargs, elem_bytes):
                         yield tma_kwargs
                         heuristic_yielded = True
 
@@ -1320,6 +1366,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 NUM_MMA_GROUPS,
                 NUM_CTAS,
                 EPILOGUE_SUBTILE,
+                elem_bytes,
             ):
                 continue
 
@@ -1331,11 +1378,12 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 }
 
             # Yield TMA epilogue store variant(s)
-            yield from self._yield_tma_variants(template_kwargs)
+            yield from self._yield_tma_variants(template_kwargs, elem_bytes)
 
     @staticmethod
     def _yield_tma_variants(
         template_kwargs: dict[str, Any],
+        elem_bytes: int = resources.OPERAND_ELEM_BYTES,
     ) -> Generator[dict[str, Any], None, None]:
         """Yield TMA_EPILOGUE_STORE=1 (preferred) or TMA=0 fallback.
 
@@ -1366,14 +1414,14 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             # but can fail after fusion adds SMEM in the final codegen.
             _TMA_SMEM_MARGIN = 8192
             if _is_config_valid(
-                config_dict, tma_epilogue_store=True, smem_margin=_TMA_SMEM_MARGIN
+                config_dict, tma_epilogue_store=True, smem_margin=_TMA_SMEM_MARGIN, elem_bytes=elem_bytes
             ):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
             else:
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 0}
         else:
             # 2-CTA requires TMA (tl.store incompatible with MultiCTAReduction)
-            if _is_config_valid(config_dict, tma_epilogue_store=True):
+            if _is_config_valid(config_dict, tma_epilogue_store=True, elem_bytes=elem_bytes):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
 
 
@@ -2459,6 +2507,9 @@ class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuri
         """
         if self._has_unsupported_layout(inputs):
             log.debug("TLX blackwell_gemm_ws declined: unsupported TMA layout")
+            return False
+        if self._has_unsupported_fp32_operands(inputs):
+            log.debug("TLX blackwell_gemm_ws declined: FP32 operands need TF32 and K-major layouts")
             return False
         if config.triton.tlx_mode in ("allow", "force"):
             return True
