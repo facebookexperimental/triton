@@ -1028,11 +1028,12 @@ def _bias_prune(prune):
 
 
 @functools.lru_cache(maxsize=None)
-def _tuned_small_k(space, shape=None, add_bias=False):
+def _tuned_small_k(space, shape=None, add_bias=False, *, dtype=None):
     kernel = _small_k_kernel_bias if add_bias else _small_k_kernel
     if space == "heuristic":
-        return triton.autotune(configs=_small_k_heuristic_config(*shape), key=["M", "N", "K"])(kernel)
-    return triton.autotune(configs=_small_k_configs(), key=["M", "N", "K"],
+        return triton.autotune(configs=_small_k_heuristic_config(*shape),
+                               key=["M", "N", "K", "A_ROW_MAJOR", "B_ROW_MAJOR"])(kernel)
+    return triton.autotune(configs=_small_k_configs(), key=["M", "N", "K", "A_ROW_MAJOR", "B_ROW_MAJOR"],
                            prune_configs_by={"early_config_prune":
                                              _prune_small_k_configs}, post_hook=_reduce_post_hook)(kernel)
 
@@ -1068,18 +1069,18 @@ def _store_tile(acc, out_desc, c_smem, c_smem_t, offset_cm, offset_bn, split_id,
             )
 
 
-def _tuned(space, shape=None, swap_ab=False, add_bias=False, *, invariance=None):
+def _tuned(space, shape=None, swap_ab=False, add_bias=False, *, invariance=None, dtype=None):
     """Autotuned kernel per search space, keyed on the effective fixed schedule.
 
     Every non-empty invariance spec currently maps to the same `SPLIT_K`, so
     `dims("M")`, `dims("K")` and `all()` share one autotuner instead of
     retuning identical schedules.
     """
-    return _tuned_for_fixed(space, shape, swap_ab, gemm_fixed_split_k(invariance), add_bias)
+    return _tuned_for_fixed(space, shape, swap_ab, gemm_fixed_split_k(invariance), add_bias, dtype=dtype)
 
 
 @functools.lru_cache(maxsize=None)
-def _tuned_for_fixed(space, shape, swap_ab, fixed, add_bias=False):
+def _tuned_for_fixed(space, shape, swap_ab, fixed, add_bias=False, *, dtype=None):
     prune_configs_by = None
     if space == "heuristic":
         fixed_spec = None if fixed is None else _FIXED_SPEC
@@ -1242,7 +1243,7 @@ def _descriptor(t):
 
 def _launch_small_k(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, stride_bias=0):
     shape = (M, N, K) if space == "heuristic" else None
-    kernel = _tuned_small_k(space, shape) if bias is None else _tuned_small_k(space, shape, True)
+    kernel = _tuned_small_k(space, shape, bias is not None, dtype=a_store.dtype)
     # The pre_hook swaps in an fp32 workspace once SPLIT_K is known.
     workspace_desc = _descriptor(c)
     grid = lambda meta: (triton.cdiv(M, meta["BM"]) * triton.cdiv(N, meta["BN"]), meta["SPLIT_K"])  # noqa: E731
@@ -1283,7 +1284,7 @@ def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, strid
 
     # The heuristic picks non-power-of-two tiles only for a K-major B.
     shape = (M, N, K, b_row_major) if space == "heuristic" else None
-    kernel = _tuned(space, shape, swap_ab, bias is not None, invariance=invariance)
+    kernel = _tuned(space, shape, swap_ab, bias is not None, invariance=invariance, dtype=a_store.dtype)
     kernel[grid](
         _descriptor(a_src),
         _descriptor(b_src),

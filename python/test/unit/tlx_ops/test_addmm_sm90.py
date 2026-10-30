@@ -465,7 +465,7 @@ def test_mm_path_split_k_is_deterministic(mm_path):
     a, b = _operand(200, 64 * 64, True), _operand(64 * 64, 512, False)
     bias = _bias("1d", 200, 512)
     first = tlx_addmm(bias, a, b, space="full")
-    assert sm90._mm._tuned("full", None, False, True).best_config.kwargs["SPLIT_K"] == 4
+    assert sm90._mm._tuned("full", None, False, True, dtype=a.dtype).best_config.kwargs["SPLIT_K"] == 4
     for _ in range(3):
         assert torch.equal(tlx_addmm(bias, a, b, space="full"), first)
     torch.testing.assert_close(first, torch.addmm(bias, a, b), atol=0.05, rtol=0.05)

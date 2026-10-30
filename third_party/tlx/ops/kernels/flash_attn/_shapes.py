@@ -29,6 +29,7 @@ SYNTHETIC: tuple[FlashAttentionShape, ...] = (
 )
 
 FOCUS_SUITES = (
+    FocusSuite(name="sm90_all", op="flash_attn", includes=("sm90_1", )),
     FocusSuite(
         name="sm90_1",
         op="flash_attn",
