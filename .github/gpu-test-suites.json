@@ -1,0 +1,95 @@
+{
+  "reviewed_revision": "3854fb8fc5b2d4550784bc3964cb3eff6909e563",
+  "platforms": {
+    "h100": {
+      "core": [
+        "python/test/unit/language/test_tlx_*_any.py",
+        "python/test/unit/language/test_tlx_*sm90up*.py",
+        "python/test/unit/language/test_tlx_*sm90.py",
+        "python/test/unit/tlx_ops/test_*_sm90.py"
+      ],
+      "runtime": [
+        "python/test/unit/runtime/"
+      ]
+    },
+    "b200": {
+      "core": [
+        "python/test/unit/language/test_tlx_*_any.py",
+        "python/test/unit/language/test_tlx_*sm90up*.py",
+        "python/test/unit/language/test_tlx_*sm100*.py",
+        "python/test/unit/tlx_ops/test_*_sm100.py"
+      ],
+      "gluon": [
+        "python/test/gluon/"
+      ]
+    },
+    "mi350": {
+      "core": [
+        "python/test/unit/language/test_tlx_*_any.py",
+        "python/test/unit/language/test_tlx_*hip*.py",
+        "python/test/unit/language/test_tlx_*gfx950*.py",
+        "python/test/unit/tlx_ops/test_*_hip.py",
+        "python/test/unit/tlx_ops/test_*_gfx950.py"
+      ],
+      "gluon": [
+        "python/test/gluon/"
+      ]
+    }
+  },
+  "cpu": {
+    "codegen": {
+      "allowed_skips": [],
+      "files": [
+        "python/test/unit/language/test_tlx_codegen.py"
+      ],
+      "dependencies": [
+        "python/",
+        "third_party/tlx/language/",
+        "third_party/tlx/tutorials/",
+        "third_party/tlx/ops/",
+        "third_party/nvidia/backend/",
+        "third_party/amd/backend/",
+        "third_party/cpu/backend/",
+        "setup.py",
+        "pyproject.toml"
+      ]
+    },
+    "gluon": {
+      "allowed_skips": [
+        "slice \\(\\d+, \\d+\\) below the minimum partition extent",
+        "fbtriton: known-failing on the pinned Gluon build .* TODO\\(gluon-ci\\)\\.",
+        "triton-tensor-layout binary not found"
+      ],
+      "files": [
+        "python/test/gluon/test_frontend.py",
+        "python/test/gluon/test_layout.py",
+        "python/test/gluon/test_layout_format_view.py"
+      ],
+      "dependencies": [
+        "python/",
+        "third_party/tlx/language/",
+        "third_party/tlx/tutorials/",
+        "third_party/tlx/ops/",
+        "third_party/nvidia/backend/",
+        "third_party/amd/backend/",
+        "third_party/cpu/backend/",
+        "setup.py",
+        "pyproject.toml"
+      ],
+      "gluon_skip_files": [
+        "test_consan.py",
+        "test_core.py",
+        "test_fpsan.py",
+        "test_lowerings.py"
+      ],
+      "gluon_skip_tests": [
+        "test_frontend.py::test_nv_tma_descriptor_load_kernel[",
+        "test_frontend.py::test_nv_tma_descriptor_store_kernel[",
+        "test_frontend.py::test_amd_mfma[",
+        "test_frontend.py::test_amd_wmma_scaled_scalar[",
+        "test_frontend.py::test_amd_mbarrier[",
+        "test_layout_format_view.py::test_format_view_kernel"
+      ]
+    }
+  }
+}
