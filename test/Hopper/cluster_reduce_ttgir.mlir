@@ -1,6 +1,14 @@
 // RUN: triton-opt %s -split-input-file \
+// RUN:   --nvgpu-form-multi-cta-collectives=compute-capability=90 \
+// RUN:   --nvgpu-lower-cluster-reduce-to-ttgir --verify-each --verify-diagnostics | FileCheck %s
+// RUN: triton-opt %s -split-input-file \
 // RUN:   --nvgpu-form-multi-cta-collectives=compute-capability=100 \
-// RUN:   --nvgpu-lower-cluster-reduce-to-ttgir --verify-each | FileCheck %s
+// RUN:   --nvgpu-lower-cluster-reduce-to-ttgir --verify-each --verify-diagnostics | FileCheck %s
+// RUN: not triton-opt %s -split-input-file \
+// RUN:   --nvgpu-form-multi-cta-collectives='compute-capability=100 auto-warp-specialization=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=AUTOWS
+
+// AUTOWS: error: multi_cta does not support automatic warp specialization in v1
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 
@@ -186,5 +194,59 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 2 : i32,
       scf.yield %reduced : tensor<128xf32, #loop_slice>
     }
     tt.return %result : tensor<128xf32, #loop_slice>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_task_id(%input: tensor<32xf32, #blocked>) -> f32 {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    // expected-error @+1 {{multi_cta does not support warp specialization in v1}}
+    %rank = arith.remsi %pid, %c2 {async_task_id = array<i32: 0>} : i32
+    %sum = "tt.reduce"(%input) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %result = arith.addf %lhs, %rhs : f32
+      tt.reduce.return %result : f32
+    }) {axis = 0 : i32, tt.multi_cta} : (tensor<32xf32, #blocked>) -> f32
+    tt.return %sum : f32
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_partition(%input: tensor<32xf32, #blocked>) -> f32 {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    // expected-error @+1 {{multi_cta does not support warp specialization in v1}}
+    %rank = arith.remsi %pid, %c2 {ttg.partition = array<i32: 0>} : i32
+    %sum = "tt.reduce"(%input) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %result = arith.addf %lhs, %rhs : f32
+      tt.reduce.return %result : f32
+    }) {axis = 0 : i32, tt.multi_cta} : (tensor<32xf32, #blocked>) -> f32
+    tt.return %sum : f32
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_warp_specialize_marker(%input: tensor<32xf32, #blocked>) -> f32 {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    // expected-error @+1 {{multi_cta does not support warp specialization in v1}}
+    %sum = "tt.reduce"(%input) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %result = arith.addf %lhs, %rhs : f32
+      tt.reduce.return %result : f32
+    }) {axis = 0 : i32, tt.multi_cta, tt.warp_specialize} : (tensor<32xf32, #blocked>) -> f32
+    tt.return %sum : f32
   }
 }
