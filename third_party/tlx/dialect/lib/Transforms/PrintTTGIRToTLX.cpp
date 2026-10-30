@@ -63,6 +63,7 @@
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -2254,6 +2255,99 @@ void printSimplifiedOp(
     return;
   }
 
+  // Device-side TMA descriptors: global_scratch_alloc + tensormap_create +
+  // reinterpret_tensor_descriptor are what tl.make_tensor_descriptor lowers
+  // to, and map back onto the TLX descriptor-pointer API.
+  if (auto alloc = dyn_cast<ttg::GlobalScratchAllocOp>(op)) {
+    if (alloc.getAlignment() == 128 && alloc.getNbytes() % 128 == 0) {
+      os << getValueName(alloc.getResult(), argSubstitutionMap)
+         << " = tlx.allocate_tensor_descriptor(num=" << alloc.getNbytes() / 128
+         << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  if (auto create = dyn_cast<ttng::TensormapCreateOp>(op)) {
+    // tensormap dims are innermost-first, strides in bytes without the unit
+    // innermost one; the TLX API takes the tensor's own order and units.
+    unsigned rank = create.getRank();
+    auto ptrTy = cast<tt::PointerType>(create.getGlobalAddress().getType());
+    unsigned elemBits = ptrTy.getPointeeType().getIntOrFloatBitWidth();
+    // Byte strides only convert back to element strides for whole-byte
+    // elements; packed sub-byte data is addressed through an i8 pointer.
+    if (elemBits % 8 != 0) {
+      op->emitError("tensormap_create over a sub-byte element type does not "
+                    "round-trip to TLX");
+      os << "# unsupported: tensormap_create over " << ptrTy.getPointeeType();
+      printLocComment(op, os);
+      return;
+    }
+    unsigned elemBytes = elemBits / 8;
+    // The box is clipped to the swizzle width, so prefer the block shape the
+    // reinterpreted descriptor carries. Without one (the pointer reaches its
+    // reinterpret through another value), the box still round-trips:
+    // make_tensor_descriptor clips a block to the same box and swizzle, so
+    // the tensormap it writes is the same.
+    SmallVector<int64_t> blockShape;
+    for (Operation *user : create.getDescPtr().getUsers())
+      if (auto reinterpret = dyn_cast<ttng::ReinterpretTensorDescOp>(user))
+        blockShape = llvm::to_vector(
+            reinterpret.getResult().getType().getBlockType().getShape());
+    os << "tlx.make_tensor_descriptor("
+       << getValueName(create.getDescPtr(), argSubstitutionMap) << ", "
+       << getValueName(create.getGlobalAddress(), argSubstitutionMap)
+       << ", shape=[";
+    for (unsigned i = 0; i < rank; ++i) {
+      if (i > 0)
+        os << ", ";
+      os << getValueName(create.getGlobalDim()[rank - 1 - i],
+                         argSubstitutionMap);
+    }
+    os << "], strides=[";
+    for (unsigned i = 0; i + 1 < rank; ++i) {
+      Value stride = create.getGlobalStride()[rank - 2 - i];
+      APInt bytes;
+      if (matchPattern(stride, m_ConstantInt(&bytes)))
+        os << bytes.getSExtValue() / elemBytes;
+      else
+        os << "(" << getValueName(stride, argSubstitutionMap) << " // "
+           << elemBytes << ")";
+      os << ", ";
+    }
+    os << "1], block_shape=[";
+    for (unsigned i = 0; i < rank; ++i) {
+      if (i > 0)
+        os << ", ";
+      if (blockShape.size() == rank)
+        os << blockShape[i];
+      else
+        os << getValueName(create.getBoxDim()[rank - 1 - i],
+                           argSubstitutionMap);
+    }
+    os << "]";
+    if (create.getFillMode() == 1)
+      os << ", padding_option=\"nan\"";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (auto reinterpret = dyn_cast<ttng::ReinterpretTensorDescOp>(op)) {
+    if (reinterpret.getRawDesc().getDefiningOp<ttg::GlobalScratchAllocOp>()) {
+      RankedTensorType blockTy =
+          reinterpret.getResult().getType().getBlockType();
+      os << getValueName(reinterpret.getResult(), argSubstitutionMap)
+         << " = tlx.reinterpret_tensor_descriptor("
+         << getValueName(reinterpret.getRawDesc(), argSubstitutionMap)
+         << ", block_shape=[";
+      llvm::interleaveComma(blockTy.getShape(), os);
+      os << "], dtype=" << getElementTypeName(blockTy.getElementType()) << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // ttng.async_tma_reduce: the TLX API represents a TMA reduction as an
   // async descriptor store with store_reduce set.
   if (opName == "ttng.async_tma_reduce" && op->getNumOperands() >= 3) {
@@ -3097,6 +3191,8 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       //   - dot-qualified:       desc_q, desc_q.shape.0, desc_q.stride.1, ...
       // Detection is type-driven (the leading arg is !tt.tensordesc), so we
       // support both; keep the descriptor value and drop the expansion args.
+      // Names are compared after sanitization, which spells the dot-qualified
+      // form desc_q_shape_0, desc_q_stride_1, ...
       SmallVector<std::string> argNames;
       for (unsigned i = 0; i < funcOp.getNumArguments(); ++i)
         argNames.push_back(
@@ -3113,9 +3209,14 @@ void printBlock(Block &block, llvm::raw_ostream &os,
               next[name.size()] == '_' &&
               std::all_of(next.begin() + name.size() + 1, next.end(),
                           [](char c) { return std::isdigit(c); });
+          StringRef rest = next.drop_front(name.size());
           bool dotExpansion = next.starts_with(name) &&
-                              next.size() > name.size() &&
-                              next[name.size()] == '.';
+                              (rest.consume_front("_shape_") ||
+                               rest.consume_front("_stride_")) &&
+                              !rest.empty() &&
+                              std::all_of(rest.begin(), rest.end(), [](char c) {
+                                return std::isdigit(c);
+                              });
           if (underscoreExpansion || dotExpansion)
             skipArgs.insert(argNames[j]);
           else
