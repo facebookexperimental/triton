@@ -1,4 +1,5 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
@@ -8,6 +9,8 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #include "llvm/ADT/SmallPtrSet.h"
+
+#include <optional>
 
 namespace mlir {
 
@@ -98,6 +101,89 @@ LogicalResult validateFunction(triton::FuncOp function, int axis, int size) {
   if (!sawLocalRank)
     return function.emitError(
         "multi_cta requires local_rank = program_id(cluster_axis) % P");
+  return success();
+}
+
+std::optional<int64_t> getConstantInt(Value value) {
+  APInt constant;
+  if (!matchPattern(value, m_ConstantInt(&constant)))
+    return std::nullopt;
+  return constant.getSExtValue();
+}
+
+std::optional<int64_t> getRankBlock(Value lowerBound,
+                                    ArrayRef<Value> localRanks) {
+  auto mul = lowerBound.getDefiningOp<arith::MulIOp>();
+  if (!mul)
+    return std::nullopt;
+  auto match = [&](Value rank, Value block) -> std::optional<int64_t> {
+    if (!llvm::is_contained(localRanks, rank))
+      return std::nullopt;
+    auto value = getConstantInt(block);
+    return value && *value > 0 ? value : std::nullopt;
+  };
+  if (auto block = match(mul.getLhs(), mul.getRhs()))
+    return block;
+  return match(mul.getRhs(), mul.getLhs());
+}
+
+bool dependsOnLoop(Value value, ArrayRef<scf::ForOp> loops,
+                   llvm::SmallPtrSetImpl<Operation *> &visited) {
+  Operation *def = value.getDefiningOp();
+  if (!def || !visited.insert(def).second)
+    return false;
+  if (auto loop = dyn_cast<scf::ForOp>(def))
+    return llvm::is_contained(loops, loop);
+  return llvm::any_of(def->getOperands(), [&](Value operand) {
+    return dependsOnLoop(operand, loops, visited);
+  });
+}
+
+LogicalResult validateCanonicalOwnership(triton::ReduceOp reduce, int axis,
+                                         int size) {
+  auto function = reduce->getParentOfType<triton::FuncOp>();
+  SmallVector<Value> localRanks;
+  function.walk([&](triton::GetProgramIdOp pid) {
+    if (pid.getAxisAsInt() != axis)
+      return;
+    for (OpOperand &use : pid->getResult(0).getUses())
+      if (auto rem = dyn_cast<arith::RemSIOp>(use.getOwner()))
+        localRanks.push_back(rem.getResult());
+      else if (auto rem = dyn_cast<arith::RemUIOp>(use.getOwner()))
+        localRanks.push_back(rem.getResult());
+  });
+
+  SmallVector<scf::ForOp> shardLoops;
+  function.walk([&](scf::ForOp loop) {
+    auto block = getRankBlock(loop.getLowerBound(), localRanks);
+    auto step = getConstantInt(loop.getStep());
+    if (block && step && *step == *block * size)
+      shardLoops.push_back(loop);
+  });
+
+  bool hasMemory = false;
+  WalkResult memoryResult = function.walk([&](Operation *op) {
+    if (!isa<triton::LoadOp, triton::StoreOp>(op))
+      return WalkResult::advance();
+    hasMemory = true;
+    auto loop = op->getParentOfType<scf::ForOp>();
+    if (!loop || !llvm::is_contained(shardLoops, loop)) {
+      op->emitError("multi_cta memory accesses must be in canonical "
+                    "rank-strided loops");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (memoryResult.wasInterrupted())
+    return failure();
+  if (!hasMemory)
+    return success();
+  for (Value partial : reduce.getOperands()) {
+    llvm::SmallPtrSet<Operation *, 16> visited;
+    if (!dependsOnLoop(partial, shardLoops, visited))
+      return reduce.emitError(
+          "multi_cta partial must depend on a canonical rank-strided loop");
+  }
   return success();
 }
 
@@ -199,6 +285,9 @@ public:
       }
       if (validatedFunctions.insert(function).second &&
           failed(validateFunction(function, cluster->axis, cluster->size)))
+        return signalPassFailure();
+      if (failed(
+              validateCanonicalOwnership(reduce, cluster->axis, cluster->size)))
         return signalPassFailure();
       if (reduce.hasDefinedOrdering() || !isSupportedScalarCombiner(reduce)) {
         reduce.emitError("multi_cta requires an unordered scalar f32 add, max, "
