@@ -1120,3 +1120,48 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 }
+
+// -----
+
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#cols = #ttg.slice<{dim = 0, parent = #parent}>
+#rows = #ttg.slice<{dim = 1, parent = #parent}>
+#linear = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-LABEL: @converted_2d_store
+// CHECK: ttg.async_remote_shmem_store
+// CHECK: ttg.convert_layout
+// CHECK: tt.store
+// CHECK-NOT: ttng.cluster_reduce
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 2 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @converted_2d_store(%output: !tt.ptr<f32>, %n: i32, %input: tensor<4x32xf32, #parent>) {
+    %pid = tt.get_program_id y : i32
+    %c2 = arith.constant 2 : i32
+    %c32 = arith.constant 32 : i32
+    %c64 = arith.constant 64 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %lower = arith.muli %rank, %c32 : i32
+    %r = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32, #rows>
+    %strides = tt.splat %n : i32 -> tensor<4xi32, #rows>
+    %row_offsets = arith.muli %r, %strides : tensor<4xi32, #rows>
+    %row_expanded = tt.expand_dims %row_offsets {axis = 1 : i32} : tensor<4xi32, #rows> -> tensor<4x1xi32, #parent>
+    %row_offsets2d = tt.broadcast %row_expanded : tensor<4x1xi32, #parent> -> tensor<4x32xi32, #parent>
+    %base = tt.splat %output : !tt.ptr<f32> -> tensor<4x32x!tt.ptr<f32>, #parent>
+    %row_ptrs = tt.addptr %base, %row_offsets2d : tensor<4x32x!tt.ptr<f32>, #parent>, tensor<4x32xi32, #parent>
+    %sum = "tt.reduce"(%input) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %v = arith.addf %lhs, %rhs : f32
+      tt.reduce.return %v : f32
+    }) {axis = 1 : i32, tt.multi_cta} : (tensor<4x32xf32, #parent>) -> tensor<4xf32, #rows>
+    scf.for %off = %lower to %n step %c64 : i32 {
+      %lane = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32, #linear>
+      %iv = tt.splat %off : i32 -> tensor<32xi32, #linear>
+      %offsets = arith.addi %iv, %lane : tensor<32xi32, #linear>
+      %converted = ttg.convert_layout %offsets : tensor<32xi32, #linear> -> tensor<32xi32, #cols>
+      %expanded = tt.expand_dims %converted {axis = 0 : i32} : tensor<32xi32, #cols> -> tensor<1x32xi32, #parent>
+      %offsets2d = tt.broadcast %expanded : tensor<1x32xi32, #parent> -> tensor<4x32xi32, #parent>
+      %ptrs = tt.addptr %row_ptrs, %offsets2d : tensor<4x32x!tt.ptr<f32>, #parent>, tensor<4x32xi32, #parent>
+      tt.store %ptrs, %input : tensor<4x32x!tt.ptr<f32>, #parent>
+    }
+    tt.return
+  }
+}
