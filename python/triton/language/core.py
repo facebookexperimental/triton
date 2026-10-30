@@ -4214,7 +4214,6 @@ class AutoWSLoopOptions(base_value):
                                                         metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
     flatten: bool | constexpr = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
     warp_specialize: bool | constexpr = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
-    multi_cta: bool | constexpr = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
     disable_licm: bool | constexpr = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
     data_partition_factor: int | constexpr | None = field(default=None,
                                                           metadata=_loop_attr("tt.data_partition_factor", "int32"))
@@ -4271,13 +4270,6 @@ class range(AutoWSLoopOptions):
         The compiler will attempt to partition memory, MMA, and vector
         operations in the loop into separate async partitions. This will
         increase the total number of warps required by the kernel.
-    :param multi_cta: Enable multi-CTA reduction on the loop. The compiler
-        will partition loop iterations across CTAs in a cluster and
-        automatically generate cross-CTA reduction (via Distributed Shared
-        Memory) for any ``tl.sum`` / ``tl.reduce`` that consumes the loop's
-        accumulator. Requires ``ctas_per_cga`` to be set in the kernel
-        launch config (e.g., via ``triton.Config``). Only supported on
-        SM90+ (Hopper/Blackwell) GPUs.
     :param disable_licm: Tells the compiler it shouldn't hoist loop invariant
         code outside the loop. This is often useful to avoid creating long liveranges
         within a loop.
