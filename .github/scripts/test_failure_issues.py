@@ -325,3 +325,15 @@ def test_a_parent_stays_open_exactly_while_a_non_flaky_sub_issue_is_open():
     api = GroupApi([parent(800, state="closed"), flaky])  # closed with only the flaky sub-issue left open
     fi.group(api, REPO, PREFIX, LABELS, "c" * 40, "main", RUN + "200")
     assert api.issues[800]["state"] == "closed" and api.writes == []
+
+
+def test_an_external_dependency_failure_is_never_blamed_on_a_commit():
+    # The MI350 setup timeouts at 23f2829 opened a parent blaming that commit, though no test ran.
+    infra = dict(failing(2, "b"), body=f"<!-- bisect-meta\nbad_sha={'b' * 40}\nexternal_dep=true\n-->\n" + body())
+    api = GroupApi([infra])
+    fi.group(api, REPO, PREFIX, LABELS, "b" * 40, "main", RUN + "200")
+    assert api.writes == [] and "parent_issue_url" not in api.issues[2]
+
+    api = GroupApi([infra, failing(3, "b")])
+    fi.group(api, REPO, PREFIX, LABELS, "b" * 40, "main", RUN + "200")
+    assert "parent_issue_url" not in api.issues[2] and "parent_issue_url" in api.issues[3]

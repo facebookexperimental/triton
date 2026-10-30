@@ -12,6 +12,10 @@ inputs:
   failed:
     description: "'true' when the tests failed; adds a job-level item if no test failure parses"
     required: true
+  tests-ran:
+    description: "'false' when the job failed before its test steps ran; marks its items as external-dependency failures (JUnit only)"
+    required: false
+    default: "true"
   bucket:
     description: Id of that job-level item
     required: false
@@ -46,6 +50,7 @@ runs:
         WORKFLOW: ${{ inputs.workflow }}
         JOB: ${{ inputs.job }}
         FAILED: ${{ inputs.failed }}
+        TESTS_RAN: ${{ inputs.tests-ran }}
         BUCKET: ${{ inputs.bucket }}
         JUNIT: ${{ inputs.junit }}
         BUDGET: ${{ inputs.budget }}
@@ -61,6 +66,7 @@ runs:
           python3 .github/scripts/parse_lit_failures.py --log "${LIT_LOG}" "${ARGS[@]}" > /dev/null
         else
           for b in ${BUDGET}; do ARGS+=(--budget "${b}"); done
+          [[ "${TESTS_RAN}" != false ]] || ARGS+=(--tests-did-not-run)
           # shellcheck disable=SC2086  # JUNIT is a space-separated list
           python3 .github/scripts/parse_junit_failures.py --junit ${JUNIT} "${ARGS[@]}" > /dev/null
         fi
