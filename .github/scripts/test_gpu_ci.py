@@ -499,3 +499,25 @@ def test_cpu_eligibility_rejects_an_overridden_ignore_policy(tmp_path):
     source = (ROOT / "python/test/gluon/conftest.py").read_text()
     (directory / "conftest.py").write_text(source + "\ncollect_ignore = []\n")
     assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
+
+
+@pytest.mark.parametrize("paths,offload,placement,gpu_jobs,reason", [
+    (["lib/Analysis/Allocation.cpp"], True, "CPU", 4, "match the CPU audit"),
+    (["python/triton/runtime/jit.py"], True, "GPU", 6, "current diff changes Python"),
+    (["README.md"], True, "Not selected", 0, "No work for this suite"),
+    (["lib/Analysis/Allocation.cpp"], False, "GPU", 6, "CPU offload is disabled"),
+])
+def test_run_summary_explains_actual_placement(paths, offload, placement, gpu_jobs, reason):
+    from gpu_test_selection import SUITES, selection_summary, test_plan as plan_tests
+    suites = json.loads(SUITES.read_text())
+    plan = plan_tests(paths, ROOT, FILTERS, suites, offload=offload)
+    summary = selection_summary(plan, suites, "tested-sha", "Selection note")
+    assert f"Planned GPU jobs: {gpu_jobs}." in summary
+    assert f"| gluon | {placement} |" in summary
+    assert reason in summary and "Selection note" in summary
+    assert "`tested-sha`" in summary
+    assert "not collected test cases" in summary
+    for name in suites["cpu"]["gluon"]["gluon_skip_files"]:
+        assert f"`{name}`" in summary
+    assert "does not introduce these exclusions" in summary
+    assert "not a new skip decision" in summary
