@@ -62,7 +62,8 @@ bool isClusterReduceType(Type type) {
     return true;
   auto tensorType = dyn_cast<RankedTensorType>(type);
   return tensorType && tensorType.hasStaticShape() &&
-         tensorType.getElementType().isF32() && tensorType.getNumElements() > 0;
+         tensorType.getRank() > 0 && tensorType.getElementType().isF32() &&
+         tensorType.getNumElements() > 0;
 }
 
 } // namespace
@@ -77,7 +78,8 @@ LogicalResult ClusterReduceOp::verify() {
   Type componentType = getPartials().front().getType();
   if (!isClusterReduceType(componentType))
     return emitOpError(
-        "requires scalar f32 or non-empty statically shaped f32 tensors");
+        "requires scalar f32 or non-empty, positive-rank, statically shaped "
+        "f32 tensors");
   for (auto [partial, result] : llvm::zip(getPartials(), getResults())) {
     if (partial.getType() != componentType || result.getType() != componentType)
       return emitOpError("requires equal operand and result types");
@@ -145,6 +147,26 @@ LogicalResult ClusterReduceOp::verifyRegions() {
                    [](Type type) { return !type.isF32(); }))
     return emitOpError(
         "combine region must return one f32 value per component");
+
+  if (isa<RankedTensorType>(getPartials().front().getType())) {
+    auto operations = block.without_terminator();
+    if (!llvm::hasSingleElement(operations))
+      return emitOpError(
+          "tensor combine region must contain exactly one binary add, max, or "
+          "min operation");
+    Operation &combiner = *operations.begin();
+    if (!isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp,
+             arith::MinNumFOp, arith::MinimumFOp>(combiner) ||
+        combiner.getNumOperands() != 2 || combiner.getNumResults() != 1 ||
+        !((combiner.getOperand(0) == block.getArgument(0) &&
+           combiner.getOperand(1) == block.getArgument(1)) ||
+          (combiner.getOperand(0) == block.getArgument(1) &&
+           combiner.getOperand(1) == block.getArgument(0))) ||
+        returnOp.getResults().front() != combiner.getResult(0))
+      return emitOpError(
+          "tensor combine region must be a direct binary add, max, or min of "
+          "its two arguments");
+  }
 
   WalkResult result = combine.walk([&](Operation *nested) {
     for (Value operand : nested->getOperands()) {
