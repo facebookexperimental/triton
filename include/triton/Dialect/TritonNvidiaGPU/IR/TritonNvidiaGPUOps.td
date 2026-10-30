@@ -192,6 +192,8 @@ def TTNG_ClusterReduceOp
       I32Attr:$group_size);
   let results = (outs Variadic<TT_Type>:$results);
   let regions = (region SizedRegion<1>:$combine_op);
+  let hasVerifier = 1;
+  let hasRegionVerifier = 1;
 }
 
 def TTNG_ClusterReduceReturnOp
