@@ -117,7 +117,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.select.outputs.sha }}
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
