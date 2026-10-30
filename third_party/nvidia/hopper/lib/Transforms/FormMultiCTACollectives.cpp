@@ -4,7 +4,9 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -94,6 +96,10 @@ LogicalResult validateFunction(triton::FuncOp function, int axis, int size) {
       op->emitError("multi_cta does not support warp specialization in v1");
       return WalkResult::interrupt();
     }
+    if (isa<triton::nvgpu::ClusterCTAIdOp>(op)) {
+      sawLocalRank = true;
+      return WalkResult::advance();
+    }
     auto pid = dyn_cast<triton::GetProgramIdOp>(op);
     if (!pid || pid.getAxisAsInt() != axis)
       return WalkResult::advance();
@@ -131,7 +137,8 @@ LogicalResult validateFunction(triton::FuncOp function, int axis, int size) {
     return failure();
   if (!sawLocalRank)
     return function.emitError(
-        "multi_cta requires local_rank = program_id(cluster_axis) % P");
+        "multi_cta requires local_rank = program_id(cluster_axis) % P or "
+        "cluster_cta_rank()");
   return success();
 }
 
@@ -491,20 +498,12 @@ bool isCanonicalUnitStrideAddress(Value value, Value induction, int64_t block,
       .has_value();
 }
 
-bool dependsOnClusterAxis(Value value, int axis,
-                          llvm::SmallPtrSetImpl<Operation *> &visited) {
-  Operation *def = value.getDefiningOp();
-  if (!def || !visited.insert(def).second)
-    return false;
-  if (auto pid = dyn_cast<triton::GetProgramIdOp>(def))
-    return pid.getAxisAsInt() == axis;
-  return llvm::any_of(def->getOperands(), [&](Value operand) {
-    return dependsOnClusterAxis(operand, axis, visited);
-  });
-}
-
 LogicalResult validateCollectivePlacement(triton::ReduceOp reduce, int axis) {
   auto function = reduce->getParentOfType<triton::FuncOp>();
+  if (!function ||
+      !triton::isKernel(cast<FunctionOpInterface>(function.getOperation())))
+    return reduce.emitError(
+        "multi_cta reduce must be contained in a kernel tt.func");
   Block *entry = &function.getBody().front();
   if (reduce->getBlock() == entry)
     return success();
@@ -516,8 +515,7 @@ LogicalResult validateCollectivePlacement(triton::ReduceOp reduce, int axis) {
         "nested scf.for");
   for (Value bound :
        {loop.getLowerBound(), loop.getUpperBound(), loop.getStep()}) {
-    llvm::SmallPtrSet<Operation *, 16> visited;
-    if (dependsOnClusterAxis(bound, axis, visited))
+    if (ttng::mayDependOnClusterRank(bound, axis))
       return reduce.emitError(
           "multi_cta loop bounds and step must not depend on cluster rank");
   }
@@ -564,6 +562,9 @@ LogicalResult validateMemorySafety(triton::ReduceOp reduce, int axis,
                                    int size) {
   auto function = reduce->getParentOfType<triton::FuncOp>();
   SmallVector<Value> localRanks;
+  function.walk([&](triton::nvgpu::ClusterCTAIdOp rank) {
+    localRanks.push_back(rank.getResult());
+  });
   function.walk([&](triton::GetProgramIdOp pid) {
     if (pid.getAxisAsInt() != axis)
       return;
