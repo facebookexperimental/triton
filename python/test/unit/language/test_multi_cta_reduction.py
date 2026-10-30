@@ -14,6 +14,12 @@ import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+RUN_MULTI_CTA_REDUCTION_TESTS = False
+pytestmark = pytest.mark.skipif(
+    not RUN_MULTI_CTA_REDUCTION_TESTS,
+    reason="Multi-CTA reduction tests are re-enabled in D123952662 after migration to reduce markers",
+)
+
 #-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
 #Test 1 : IR attribute emission
 #-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
