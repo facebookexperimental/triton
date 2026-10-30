@@ -1906,8 +1906,8 @@ class TritonSemantic(Generic[TensorTy]):
             res_ty = scalar_ty
         return self.tensor(x, res_ty)
 
-    def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn,
-                  reduction_ordering=None) -> Tuple[TensorTy, ...]:
+    def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn, reduction_ordering=None,
+                  multi_cta: bool = False) -> Tuple[TensorTy, ...]:
         if axis is None:
             inputs = tuple(self.reshape(t, [t.numel.value], can_reorder=True) for t in inputs)
             axis = 0
@@ -1921,6 +1921,8 @@ class TritonSemantic(Generic[TensorTy]):
         reduce_op = self.builder.create_reduce(
             [t.handle for t in inputs], axis,
             reduction_ordering=reduction_ordering.name if reduction_ordering is not None else "")
+        if multi_cta:
+            reduce_op.set_attr("tt.multi_cta", self.builder.get_unit_attr())
         region_builder_fn(reduce_op)
         assert reduce_op.verify()
 
