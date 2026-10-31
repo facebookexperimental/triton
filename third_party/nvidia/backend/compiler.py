@@ -1450,7 +1450,8 @@ class CUDABackend(BaseBackend):
             # Note: if this flag is removed, the source var name and type info will be lost when ptx was compiled into cubin
             #           and we may not be able to see them in cuda-gdb
             ret = re.sub(r",\s*debug|debug,\s*", "", ret)
-        ret = normalize_ptx_file_metadata(ret)
+        if not knobs.nvidia.preserve_ptx_source_paths:
+            ret = normalize_ptx_file_metadata(ret)
         if knobs.nvidia.dump_nvptx:
             print("// -----// NVPTX Dump //----- //")
             print(ret)

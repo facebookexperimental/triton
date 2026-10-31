@@ -7,7 +7,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper_or_newer, is_interpreter
+from triton._internal_testing import is_cuda, is_hopper_or_newer, is_interpreter
 from triton._filecheck import run_filecheck
 
 
@@ -584,3 +584,17 @@ def test_while_block_arg_carries_init_handle_loc(fresh_triton_cache):
 @pytest.fixture(autouse=True)
 def with_line_info(fresh_knobs):
     fresh_knobs.compilation.disable_line_info = False
+
+
+@pytest.mark.parametrize("preserve", ["0", "1"])
+def test_ptx_source_paths(monkeypatch, preserve: str, fresh_triton_cache):
+    if is_interpreter() or not is_cuda():
+        pytest.skip("PTX source path virtualization is NVIDIA-only")
+
+    monkeypatch.setenv("TRITON_PRESERVE_PTX_SOURCE_PATHS", preserve)
+    kernel_single.device_caches.clear()
+    kernel_info = kernel_single.warmup(torch.float32, torch.float32, BLOCK=128, grid=(1, ))
+    file_directives = [line for line in kernel_info.asm["ptx"].splitlines() if line.lstrip().startswith(".file")]
+    expected = f'"{__file__}"' if preserve == "1" else '"<source>/test_line_info.py", 0, 0'
+    assert any(expected in line for line in file_directives), file_directives
+    kernel_single.device_caches.clear()
