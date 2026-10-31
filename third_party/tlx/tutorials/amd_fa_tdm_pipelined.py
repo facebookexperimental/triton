@@ -130,10 +130,11 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr, FIXED_REFERENCE: tl.constexpr,
                     QUERY_TILES_FIRST: tl.constexpr):
     NUM_BUFFERS: tl.constexpr = 2
-    # The 128x64 fixed-reference schedule hides K-prefetch latency behind
-    # probability conversion and denominator updates; wider tiles prefer the
-    # original ordering to limit live operands.
-    PREFETCH_BEFORE_P: tl.constexpr = FIXED_REFERENCE and BLOCK_M == 128 and BLOCK_N == 64
+    # Carry low-precision P across iterations to shorten FP32 live ranges.
+    PREPARE_NEXT_P: tl.constexpr = FIXED_REFERENCE and BLOCK_M == 128 and BLOCK_N == 64
+    # Overlap initial Q/K/V transfers where the extra LDS lifetime pays off.
+    PREFETCH_Q: tl.constexpr = HEAD_SZ == 128 and (BLOCK_M == 32 or
+                                                   (BLOCK_M == 64 and SEQLEN_K < 512)) and SEQLEN_K <= 768
     scale_ln2: tl.constexpr = SM_SCALE * RCP_LN2
 
     off_z = tl.program_id(0)
@@ -157,8 +158,9 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
     )
     q_buf = tlx.local_alloc((BLOCK_M, HEAD_SZ), tlx.dtype_of(q_ptr), 1)
     tlx.async_amd_descriptor_load(q_desc, tlx.local_view(q_buf, 0), [off_m, 0], clamp_bounds=True)
-    tlx.async_amd_descriptor_wait(0)
-    q = tlx.local_load(tlx.local_view(q_buf, 0))
+    if not PREFETCH_Q:
+        tlx.async_amd_descriptor_wait(0)
+        q = tlx.local_load(tlx.local_view(q_buf, 0))
 
     # --- K / V TDM descriptors (block = [BLOCK_N, HEAD_SZ]) ---
     k_desc = tl.make_tensor_descriptor(
@@ -209,6 +211,9 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
         for key_start in tl.static_range(0, SEQLEN_K, BLOCK_N):
             tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, 0), [key_start, 0], clamp_bounds=True)
             tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, 0), [key_start, 0], clamp_bounds=True)
+            if PREFETCH_Q and key_start == 0:
+                tlx.async_amd_descriptor_wait(2)
+                q = tlx.local_load(tlx.local_view(q_buf, 0))
             k = _load_k(k_buf, 0, 1)
             qk = _compute_qk(q, k, key_start, BLOCK_M, BLOCK_N, SEQLEN_K)
             if key_start == 0:
@@ -227,6 +232,9 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
         tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, 1), [BLOCK_N, 0], clamp_bounds=True)
         tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, 0), [0, 0], clamp_bounds=True)
 
+        if PREFETCH_Q:
+            tlx.async_amd_descriptor_wait(3)
+            q = tlx.local_load(tlx.local_view(q_buf, 0))
         k = _load_k(k_buf, 0, 2)
         qk = _compute_qk(q, k, 0, BLOCK_M, BLOCK_N, SEQLEN_K)
         p, alpha, m_i = _softmax_part0(qk, m_i, scale_ln2)
@@ -236,6 +244,8 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
 
         k = _load_k(k_buf, 1, 3)
 
+        if PREPARE_NEXT_P:
+            p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, True)
         iter_id = 0
         # ---------------- Steady state (hot loop, no masking) ----------------
         # The fixed-reference loop benefits from fewer live iterations. Retain
@@ -246,15 +256,15 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
             t_3 = block_id + 3 * BLOCK_N
 
             qk = _compute_qk_no_mask(q, k)
-            if not PREFETCH_BEFORE_P:
+            if not PREPARE_NEXT_P:
                 p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
             v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
             tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, (iter_id + 1) % NUM_BUFFERS), [t_3, 0],
                                           clamp_bounds=True)
-            if PREFETCH_BEFORE_P:
-                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
             acc = tl.dot(p, v, acc)
             p, alpha, m_i = _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE)
+            if PREPARE_NEXT_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, True)
             k = _load_k(k_buf, iter_id % NUM_BUFFERS, 2)
             tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, iter_id % NUM_BUFFERS), [t_2, 0],
                                           clamp_bounds=True)
@@ -267,15 +277,15 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
             t_3 = iter_id * BLOCK_N + 3 * BLOCK_N
 
             qk = _compute_qk(q, k, t_1, BLOCK_M, BLOCK_N, SEQLEN_K)
-            if not PREFETCH_BEFORE_P:
+            if not PREPARE_NEXT_P:
                 p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
             v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
             tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, (iter_id + 1) % NUM_BUFFERS), [t_3, 0],
                                           clamp_bounds=True)
-            if PREFETCH_BEFORE_P:
-                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
             acc = tl.dot(p, v, acc)
             p, alpha, m_i = _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE)
+            if PREPARE_NEXT_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, True)
             k = _load_k(k_buf, iter_id % NUM_BUFFERS, 2)
             tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, iter_id % NUM_BUFFERS), [t_2, 0],
                                           clamp_bounds=True)
@@ -286,7 +296,8 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
         t_2 = epilogue_offset + 2 * BLOCK_N
         t_3 = epilogue_offset + 3 * BLOCK_N
 
-        p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
+        if not PREPARE_NEXT_P:
+            p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
         v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
         acc = tl.dot(p, v, acc)
 
@@ -366,9 +377,12 @@ def _select_tile_sizes(batch, heads, seqlen_q, seqlen_k, head_size, compute_unit
         return 128, 128
     # Smaller query tiles fill otherwise idle CUs on short inputs.
     query_blocks = batch * heads * triton.cdiv(seqlen_q, 128)
-    if seqlen_k <= 1024 and query_blocks < compute_units:
-        # Two waves help moderate K loops and severely underfilled grids.
+    if query_blocks < compute_units:
         narrow_blocks = batch * heads * triton.cdiv(seqlen_q, 64)
+        # Long K loops also benefit from filling otherwise idle CUs.
+        if seqlen_k > 1024:
+            return (32 if narrow_blocks <= compute_units // 2 else 64), 128
+        # Two waves help moderate K loops and severely underfilled grids.
         if seqlen_k >= 512 and narrow_blocks < compute_units:
             if seqlen_k <= 768 or narrow_blocks <= compute_units // 8:
                 return 32, 128

@@ -572,7 +572,8 @@ def test_gfx1250_mxgemm_tdm_tiles_per_warp(DTYPE_B, TILES_PER_WARP):
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("BATCH,H,SEQLEN_Q,SEQLEN_K", [(1, 8, 1024, 1024), (2, 4, 1024, 1024), (1, 16, 2048, 2048),
-                                                       (1, 2, 896, 896), (1, 1, 640, 640),
+                                                       (1, 2, 896, 896), (1, 1, 640, 640), (1, 8, 2048, 2048),
+                                                       (1, 2, 4096, 4096),  # underfilled long-K grids
                                                        (1, 2, 63, 65),  # one partial key tile
                                                        (1, 2, 128, 128),  # one full key tile
                                                        (1, 2, 129, 129),  # two key tiles with partial Q/K boundaries
@@ -594,7 +595,7 @@ def test_gfx1250_attn_fwd_tdm_pipelined(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
     # Avoid a quadratic reference allocation for long attention, but check every
     # output element for finiteness and sample both sides of tile boundaries.
     if SEQLEN_Q > 2048:
-        boundaries = [0, 127, 128, 255, 256, 65535, 65536, SEQLEN_Q - 2, SEQLEN_Q - 1]
+        boundaries = [0, 31, 32, 63, 64, 127, 128, 255, 256, 65535, 65536, SEQLEN_Q - 2, SEQLEN_Q - 1]
         rows = torch.tensor(sorted({row for row in boundaries if 0 <= row < SEQLEN_Q}), device=q.device)
         q_ref = q.index_select(2, rows)
         actual = out.index_select(2, rows)
@@ -609,12 +610,12 @@ def test_gfx1250_attn_fwd_tdm_pipelined(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
     assert (actual.double() - ref).square().mean().sqrt() < tolerance * ref.square().mean().sqrt()
 
 
-# Automatic narrow/medium/long-K routes plus a forced wide tile exercise replay
+# Automatic narrow/long-K routes plus forced medium/wide tiles exercise replay
 # without allocating an unusually large adversarial query sequence.
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("seqlen_k,block_m,block_n", [(512, None, None), (1025, None, None), (1025, 256, 64),
-                                                      (65537, None, None)])
+@pytest.mark.parametrize("seqlen_k,block_m,block_n", [(512, None, None), (1025, None, None), (1025, 128, 64),
+                                                      (1025, 256, 64), (65537, None, None)])
 @pytest.mark.parametrize("recovery_case", ["exp_overflow", "probability_overflow", "common_offset"])
 def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block_n, recovery_case):
     torch.manual_seed(1)
@@ -666,13 +667,21 @@ def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("layout", ["offset", "padded", "odd_stride"])
-@pytest.mark.parametrize("block_m,block_n,query_tiles_first", [(32, 128, False), (64, 128, False), (128, 64, False),
-                                                               (256, 64, False),
-                                                               pytest.param(128, 64, True, id="query_first")])
-def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, block_m, block_n, query_tiles_first):
+@pytest.mark.parametrize("seqlen_k,block_m,block_n,query_tiles_first", [
+    (1025, 32, 128, False),
+    (1025, 64, 128, False),
+    (1025, 128, 64, False),
+    (1025, 256, 64, False),
+    pytest.param(1025, 128, 64, True, id="query_first"),
+    # Q prefetch overlaps K/V in both the two-tile and longer startup paths.
+    (129, 64, 128, False),
+    (257, 64, 128, False),
+    (257, 32, 128, False),
+])
+def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, seqlen_k, block_m, block_n, query_tiles_first):
     torch.manual_seed(2)
     device = triton.runtime.driver.active.get_active_torch_device()
-    batch, heads, sq, sk, dim = 2, 2, 257, 1025, 128
+    batch, heads, sq, sk, dim = 2, 2, 257, seqlen_k, 128
 
     def inputs(length):
         shape = (batch, heads, length, dim)
