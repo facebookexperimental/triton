@@ -439,26 +439,23 @@ def has_meta_llvm_info(base_dir: Optional[str] = None) -> bool:
 
 
 def load_llvm_info(base_dir: Optional[str] = None) -> dict:
-    # cmake/llvm-info.json and cmake/llvm-build-info.json are OAI's pins and
-    # stay untouched so upstream cherry-picks apply cleanly.
-    # cmake/meta-llvm-info.json, when present, names the Meta LLVM fork build
-    # and must sit on the core revision OAI builds: llvm-build-info.json, which
-    # llvm-info.json trails until OAI publishes that revision's bundles.
+    # cmake/llvm-info.json is OAI's pin and stays untouched so upstream
+    # cherry-picks apply cleanly. cmake/meta-llvm-info.json, when present,
+    # names the Meta LLVM fork build and must sit on OAI's pin.
+    # INVARIANT: compare against llvm-info.json, the LLVM the Triton sources
+    # are written against. llvm-build-info.json only requests the next OAI
+    # build and moves days before the sources do.
     cmake_dir = os.path.join(base_dir or get_base_dir(), "cmake")
     with open(os.path.join(cmake_dir, "llvm-info.json"), "r") as llvm_info_file:
         oai_info = json.load(llvm_info_file)
     if not has_meta_llvm_info(base_dir):
         return {**oai_info, "release_base_url": OAI_LLVM_RELEASE_BASE_URL}
-    oai_hash = oai_info["llvm_hash"]
-    build_info_path = os.path.join(cmake_dir, "llvm-build-info.json")
-    if os.path.exists(build_info_path):
-        with open(build_info_path, "r") as build_info_file:
-            oai_hash = json.load(build_info_file)["llvm_hash"]
     with open(os.path.join(cmake_dir, "meta-llvm-info.json"), "r") as meta_info_file:
         meta_info = json.load(meta_info_file)
-    if meta_info["based_on_oai_llvm_hash"] != oai_hash:
+    if meta_info["based_on_oai_llvm_hash"] != oai_info["llvm_hash"]:
         raise RuntimeError(f"cmake/meta-llvm-info.json is based on OAI LLVM {meta_info['based_on_oai_llvm_hash'][:12]} "
-                           f"but OAI pins {oai_hash[:12]}; rebuild the Meta LLVM on the new OAI pin")
+                           f"but cmake/llvm-info.json pins {oai_info['llvm_hash'][:12]}; "
+                           "rebuild the Meta LLVM on the new OAI pin")
     return meta_info
 
 
