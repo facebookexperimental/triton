@@ -3,7 +3,7 @@ TDM-pipelined Flash-Attention forward for AMD gfx1250 (TLX).
 
 Uses the gfx1250 TDM (tensor-descriptor) async-copy engine to stream K/V
 tiles from global memory into double-buffered LDS, with WMMA matmuls via
-``tl.dot`` and an online-softmax accumulator.
+``tl.dot`` and an FP32 accumulator. Supports BF16/FP16 dense noncausal MHA.
 
 Key TLX primitives:
   tl.make_tensor_descriptor                       -> TDM tensor descriptor
@@ -17,6 +17,12 @@ Key TLX primitives:
 The software pipeline is hand-written (no auto-pipeliner): 3 iters are
 peeled across the prologue+epilogue with a steady-state hot loop in
 between, and K/V are double-buffered in LDS via TDM async copies.
+
+For sufficiently long D128 inputs, the fast pass keeps the first key tile's
+row maximum and defers denominator reductions. It uses RNE probabilities in
+the input dtype and retries a workgroup with stable online softmax if its
+shift, denominator, or output is unsafe. Recovery happens on the device on
+every invocation, including graph replay. Short inputs retain online softmax.
 """
 import torch
 
@@ -48,7 +54,11 @@ def _load_k(k_buf, slot, wait_count):
 @triton.jit
 def _load_v(v_buf, slot, wait_count):
     tlx.async_amd_descriptor_wait(wait_count)
-    return tlx.local_load(tlx.local_view(v_buf, slot))
+    value = tlx.local_load(tlx.local_view(v_buf, slot))
+    # All waves must finish reading the current K/V stages before any wave
+    # can issue the next prefetch into their reusable LDS buffers.
+    tlx.workgroup_barrier()
+    return value
 
 
 @triton.jit
@@ -67,41 +77,76 @@ def _compute_qk_no_mask(q, k):
 @triton.jit
 def _softmax_part0(qk, m_i, scale_ln2):
     m_ij = tl.maximum(m_i, tl.max(qk, 1))
-    m_ij_scaled = m_ij * scale_ln2
-    q_shifted = scale_ln2 * qk - m_ij_scaled[:, None]
+    q_shifted = (qk - m_ij[:, None]) * scale_ln2
     p = tl.math.exp2(q_shifted)
-    alpha = tl.math.exp2(scale_ln2 * m_i - m_ij_scaled)
+    alpha = tl.math.exp2((m_i - m_ij) * scale_ln2)
     return p, alpha, m_ij
 
 
 @triton.jit
-def _softmax_part1(p, l_i, acc, alpha):
-    l_ij = tl.sum(p, 1)
-    acc = acc * alpha[:, None]
-    p_bf16 = p.to(tl.bfloat16, fp_downcast_rounding="rtz")
-    l_i = l_i * alpha + l_ij
-    return p_bf16, l_i, acc
+def _softmax_part1(p, l_i, acc, alpha, P_DTYPE: tl.constexpr, FIXED_REFERENCE: tl.constexpr):
+    if FIXED_REFERENCE:
+        # Keep partial sums in registers; exchange lanes only at the end.
+        parts: tl.constexpr = l_i.shape[1]
+        terms = tl.reshape(p, [p.shape[0], p.shape[1] // (parts * 8), parts, 8])
+        terms = tl.sum(tl.sum(terms, 3), 1)
+        l_i += terms
+    else:
+        l_ij = tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+    p_low = p.to(P_DTYPE)
+    return p_low, l_i, acc
 
 
 @triton.jit
-def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr,  #
-                                  stride_qz, stride_qh, stride_qm, stride_qk,  #
-                                  stride_kz, stride_kh, stride_kn, stride_kk,  #
-                                  stride_vz, stride_vh, stride_vn, stride_vk,  #
-                                  stride_oz, stride_oh, stride_om, stride_on,  #
-                                  SM_SCALE: tl.constexpr,  #
-                                  SEQLEN_Q: tl.constexpr,  #
-                                  SEQLEN_K: tl.constexpr,  #
-                                  BLOCK_M: tl.constexpr,  #
-                                  BLOCK_N: tl.constexpr,  #
-                                  HEAD_SZ: tl.constexpr,  #
-                                  ):
+def _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE: tl.constexpr):
+    if FIXED_REFERENCE:
+        p = tl.math.exp2(scale_ln2 * qk - (m_i * scale_ln2)[:, None])
+        alpha = tl.full(m_i.shape, 1.0, tl.float32)
+        return p, alpha, m_i
+    else:
+        return _softmax_part0(qk, m_i, scale_ln2)
+
+
+@triton.jit
+def _needs_online_replay(acc, denominator, reference, scale_ln2, row_start, SEQLEN_Q: tl.constexpr):
+    # Each valid row has a unit contribution from the first tile. Reject lost
+    # normalization or overflow, including overflow when P is converted to FP16.
+    max_denominator: tl.constexpr = 1.e30  # Leave FP32 headroom for normalization.
+    max_reference_shift: tl.constexpr = 64.0  # Bound scale-minus-shift cancellation.
+    fp32_max: tl.constexpr = 3.402823466e38
+    bad_output = tl.sum((~(tl.abs(acc) <= fp32_max)).to(tl.int32), 1) > 0
+    bad_row = (~((denominator > 0) & (denominator < max_denominator)))
+    bad_row |= (tl.abs(reference * scale_ln2) > max_reference_shift) | bad_output
+    valid = row_start + tl.arange(0, acc.shape[0]) < SEQLEN_Q
+    return tl.sum((valid & bad_row).to(tl.int32), 0) > 0
+
+
+@triton.jit
+def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
+                    stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om,
+                    stride_on, SM_SCALE: tl.constexpr, SEQLEN_Q: tl.constexpr, SEQLEN_K: tl.constexpr,
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr, FIXED_REFERENCE: tl.constexpr,
+                    QUERY_TILES_FIRST: tl.constexpr):
     NUM_BUFFERS: tl.constexpr = 2
+    # Carry low-precision P across iterations to shorten FP32 live ranges.
+    PREPARE_NEXT_P: tl.constexpr = FIXED_REFERENCE and BLOCK_M == 128 and BLOCK_N == 64
+    # Overlap initial Q/K/V transfers where the extra LDS lifetime pays off.
+    PREFETCH_Q: tl.constexpr = HEAD_SZ == 128 and (BLOCK_M == 32 or
+                                                   (BLOCK_M == 64 and SEQLEN_K < 512)) and SEQLEN_K <= 768
     scale_ln2: tl.constexpr = SM_SCALE * RCP_LN2
 
     off_z = tl.program_id(0)
-    off_h = tl.program_id(1)
-    off_m = tl.program_id(2) * BLOCK_M
+    if QUERY_TILES_FIRST:
+        # Group query tiles when many long heads compete for cache.
+        query_blocks: tl.constexpr = tl.cdiv(SEQLEN_Q, BLOCK_M)
+        tile = tl.program_id(1) + tl.num_programs(1) * tl.program_id(2)
+        off_h = tile // query_blocks
+        off_m = (tile % query_blocks) * BLOCK_M
+    else:
+        off_h = tl.program_id(1)
+        off_m = tl.program_id(2) * BLOCK_M
 
     # --- Q: TDM-load once into LDS, then local_load into the dot-operand
     # layout directly (no register-layout conversion in the prologue). ---
@@ -112,9 +157,10 @@ def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr,  #
         block_shape=[BLOCK_M, HEAD_SZ],
     )
     q_buf = tlx.local_alloc((BLOCK_M, HEAD_SZ), tlx.dtype_of(q_ptr), 1)
-    tlx.async_amd_descriptor_load(q_desc, tlx.local_view(q_buf, 0), [off_m, 0], clamp_bounds=False)
-    tlx.async_amd_descriptor_wait(0)
-    q = tlx.local_load(tlx.local_view(q_buf, 0))
+    tlx.async_amd_descriptor_load(q_desc, tlx.local_view(q_buf, 0), [off_m, 0], clamp_bounds=True)
+    if not PREFETCH_Q:
+        tlx.async_amd_descriptor_wait(0)
+        q = tlx.local_load(tlx.local_view(q_buf, 0))
 
     # --- K / V TDM descriptors (block = [BLOCK_N, HEAD_SZ]) ---
     k_desc = tl.make_tensor_descriptor(
@@ -135,7 +181,13 @@ def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr,  #
         strides=[stride_om, tl.constexpr(1)],
         block_shape=[BLOCK_M, HEAD_SZ],
     )
-    k_buf = tlx.local_alloc((BLOCK_N, HEAD_SZ), tlx.dtype_of(k_ptr), NUM_BUFFERS)
+    if HEAD_SZ == 128:
+        # Pad K rows for the transposed WMMA operand loads.
+        k_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(HEAD_SZ, 8)], [BLOCK_N, HEAD_SZ],
+                                                                                     [1, 0])
+        k_buf = tlx.local_alloc((BLOCK_N, HEAD_SZ), tlx.dtype_of(k_ptr), NUM_BUFFERS, layout=k_layout)
+    else:
+        k_buf = tlx.local_alloc((BLOCK_N, HEAD_SZ), tlx.dtype_of(k_ptr), NUM_BUFFERS)
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_SZ), tlx.dtype_of(v_ptr), NUM_BUFFERS)
     o_buf = tlx.local_alloc((BLOCK_M, HEAD_SZ), tlx.dtype_of(o_ptr), 1)
 
@@ -146,90 +198,128 @@ def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr,  #
         n_blocks_n = n_blocks_n - 1
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    if FIXED_REFERENCE:
+        # Wider query tiles benefit from packed updates to four partial sums.
+        parts: tl.constexpr = min(4 if BLOCK_M >= 128 else 2, BLOCK_N // 8)
+        l_i = tl.zeros([BLOCK_M, parts], dtype=tl.float32)
+    else:
+        l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SZ], dtype=tl.float32)
 
-    block_min = 0
-    block_max = n_blocks_n * BLOCK_N
+    if SEQLEN_K <= 2 * BLOCK_N:
+        # One or two key tiles do not amortize the long pipeline's fill/drain.
+        for key_start in tl.static_range(0, SEQLEN_K, BLOCK_N):
+            tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, 0), [key_start, 0], clamp_bounds=True)
+            tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, 0), [key_start, 0], clamp_bounds=True)
+            if PREFETCH_Q and key_start == 0:
+                tlx.async_amd_descriptor_wait(2)
+                q = tlx.local_load(tlx.local_view(q_buf, 0))
+            k = _load_k(k_buf, 0, 1)
+            qk = _compute_qk(q, k, key_start, BLOCK_M, BLOCK_N, SEQLEN_K)
+            if key_start == 0:
+                p, alpha, m_i = _softmax_part0(qk, m_i, scale_ln2)
+            else:
+                p, alpha, m_i = _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE)
+            p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
+            v = _load_v(v_buf, 0, 0)
+            acc = tl.dot(p, v, acc)
+    else:
+        block_min = 0
+        block_max = n_blocks_n * BLOCK_N
 
-    # ---------------- Prologue ----------------
-    tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, 0), [0, 0], clamp_bounds=False)
-    tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, 1), [BLOCK_N, 0], clamp_bounds=False)
-    tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, 0), [0, 0], clamp_bounds=False)
+        # ---------------- Prologue ----------------
+        tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, 0), [0, 0], clamp_bounds=True)
+        tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, 1), [BLOCK_N, 0], clamp_bounds=True)
+        tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, 0), [0, 0], clamp_bounds=True)
 
-    k = _load_k(k_buf, 0, 2)
-    qk = _compute_qk(q, k, 0, BLOCK_M, BLOCK_N, SEQLEN_K)
-    p, alpha, m_i = _softmax_part0(qk, m_i, scale_ln2)
-
-    tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, 0), [2 * BLOCK_N, 0], clamp_bounds=False)
-    tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, 1), [BLOCK_N, 0], clamp_bounds=False)
-
-    k = _load_k(k_buf, 1, 3)
-
-    iter_id = 0
-    # ---------------- Steady state (hot loop, no masking) ----------------
-    # Unroll by 2 so the scheduler can hoist softmax VALU/TRANS work across
-    # the back-edge into adjacent WMMA shadows (better co-execution packing).
-    for block_id in tl.range(block_min, block_max, BLOCK_N, loop_unroll_factor=2):
-        t_2 = block_id + 2 * BLOCK_N
-        t_3 = block_id + 3 * BLOCK_N
-
-        qk = _compute_qk_no_mask(q, k)
-        p, l_i, acc = _softmax_part1(p, l_i, acc, alpha)
-        v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
-        tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, (iter_id + 1) % NUM_BUFFERS), [t_3, 0],
-                                      clamp_bounds=False)
-        acc = tl.dot(p, v, acc)
+        if PREFETCH_Q:
+            tlx.async_amd_descriptor_wait(3)
+            q = tlx.local_load(tlx.local_view(q_buf, 0))
+        k = _load_k(k_buf, 0, 2)
+        qk = _compute_qk(q, k, 0, BLOCK_M, BLOCK_N, SEQLEN_K)
         p, alpha, m_i = _softmax_part0(qk, m_i, scale_ln2)
-        k = _load_k(k_buf, iter_id % NUM_BUFFERS, 2)
-        tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, iter_id % NUM_BUFFERS), [t_2, 0],
-                                      clamp_bounds=False)
-        iter_id += 1
 
-    # ---------------- Remainder (masked steady iter) ----------------
-    if has_remainder:
-        t_1 = iter_id * BLOCK_N + BLOCK_N
-        t_2 = iter_id * BLOCK_N + 2 * BLOCK_N
-        t_3 = iter_id * BLOCK_N + 3 * BLOCK_N
+        tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, 0), [2 * BLOCK_N, 0], clamp_bounds=True)
+        tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, 1), [BLOCK_N, 0], clamp_bounds=True)
 
-        qk = _compute_qk(q, k, t_1, BLOCK_M, BLOCK_N, SEQLEN_K)
-        p, l_i, acc = _softmax_part1(p, l_i, acc, alpha)
+        k = _load_k(k_buf, 1, 3)
+
+        if PREPARE_NEXT_P:
+            p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, True)
+        iter_id = 0
+        # ---------------- Steady state (hot loop, no masking) ----------------
+        # The fixed-reference loop benefits from fewer live iterations. Retain
+        # the original short online schedule where the extra state is affordable.
+        unroll: tl.constexpr = 2 if not FIXED_REFERENCE and SEQLEN_K < 512 else 1
+        for block_id in tl.range(block_min, block_max, BLOCK_N, loop_unroll_factor=unroll):
+            t_2 = block_id + 2 * BLOCK_N
+            t_3 = block_id + 3 * BLOCK_N
+
+            qk = _compute_qk_no_mask(q, k)
+            if not PREPARE_NEXT_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
+            v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
+            tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, (iter_id + 1) % NUM_BUFFERS), [t_3, 0],
+                                          clamp_bounds=True)
+            acc = tl.dot(p, v, acc)
+            p, alpha, m_i = _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE)
+            if PREPARE_NEXT_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, True)
+            k = _load_k(k_buf, iter_id % NUM_BUFFERS, 2)
+            tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, iter_id % NUM_BUFFERS), [t_2, 0],
+                                          clamp_bounds=True)
+            iter_id += 1
+
+        # ---------------- Remainder (masked steady iter) ----------------
+        if has_remainder:
+            t_1 = iter_id * BLOCK_N + BLOCK_N
+            t_2 = iter_id * BLOCK_N + 2 * BLOCK_N
+            t_3 = iter_id * BLOCK_N + 3 * BLOCK_N
+
+            qk = _compute_qk(q, k, t_1, BLOCK_M, BLOCK_N, SEQLEN_K)
+            if not PREPARE_NEXT_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
+            v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
+            tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, (iter_id + 1) % NUM_BUFFERS), [t_3, 0],
+                                          clamp_bounds=True)
+            acc = tl.dot(p, v, acc)
+            p, alpha, m_i = _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE)
+            if PREPARE_NEXT_P:
+                p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, True)
+            k = _load_k(k_buf, iter_id % NUM_BUFFERS, 2)
+            tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, iter_id % NUM_BUFFERS), [t_2, 0],
+                                          clamp_bounds=True)
+            iter_id += 1
+
+        # ---------------- Epilogue ----------------
+        epilogue_offset = (iter_id - 1) * BLOCK_N
+        t_2 = epilogue_offset + 2 * BLOCK_N
+        t_3 = epilogue_offset + 3 * BLOCK_N
+
+        if not PREPARE_NEXT_P:
+            p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
         v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
-        tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_buf, (iter_id + 1) % NUM_BUFFERS), [t_3, 0],
-                                      clamp_bounds=False)
         acc = tl.dot(p, v, acc)
-        p, alpha, m_i = _softmax_part0(qk, m_i, scale_ln2)
-        k = _load_k(k_buf, iter_id % NUM_BUFFERS, 2)
-        tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, iter_id % NUM_BUFFERS), [t_2, 0],
-                                      clamp_bounds=False)
-        iter_id += 1
 
-    # ---------------- Epilogue ----------------
-    epilogue_offset = (iter_id - 1) * BLOCK_N
-    t_2 = epilogue_offset + 2 * BLOCK_N
-    t_3 = epilogue_offset + 3 * BLOCK_N
+        qk = _compute_qk(q, k, t_2, BLOCK_M, BLOCK_N, SEQLEN_K)
+        p, alpha, m_i = _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE)
 
-    p, l_i, acc = _softmax_part1(p, l_i, acc, alpha)
-    v = _load_v(v_buf, iter_id % NUM_BUFFERS, 2)
-    acc = tl.dot(p, v, acc)
+        k = _load_k(k_buf, iter_id % NUM_BUFFERS, 1)
+        tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, iter_id % NUM_BUFFERS), [t_3, 0], clamp_bounds=True)
 
-    qk = _compute_qk(q, k, t_2, BLOCK_M, BLOCK_N, SEQLEN_K)
-    p, alpha, m_i = _softmax_part0(qk, m_i, scale_ln2)
+        qk = _compute_qk(q, k, t_3, BLOCK_M, BLOCK_N, SEQLEN_K)
+        p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
+        v = _load_v(v_buf, (iter_id + 1) % NUM_BUFFERS, 1)
+        acc = tl.dot(p, v, acc)
 
-    k = _load_k(k_buf, iter_id % NUM_BUFFERS, 1)
-    tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_buf, iter_id % NUM_BUFFERS), [t_3, 0], clamp_bounds=False)
-
-    qk = _compute_qk(q, k, t_3, BLOCK_M, BLOCK_N, SEQLEN_K)
-    p, l_i, acc = _softmax_part1(p, l_i, acc, alpha)
-    v = _load_v(v_buf, (iter_id + 1) % NUM_BUFFERS, 1)
-    acc = tl.dot(p, v, acc)
-
-    p, alpha, m_i = _softmax_part0(qk, m_i, scale_ln2)
-    p, l_i, acc = _softmax_part1(p, l_i, acc, alpha)
-    v = _load_v(v_buf, iter_id % NUM_BUFFERS, 0)
-    acc = tl.dot(p, v, acc)
+        p, alpha, m_i = _softmax_later(qk, m_i, scale_ln2, FIXED_REFERENCE)
+        p, l_i, acc = _softmax_part1(p, l_i, acc, alpha, q.dtype, FIXED_REFERENCE)
+        v = _load_v(v_buf, iter_id % NUM_BUFFERS, 0)
+        acc = tl.dot(p, v, acc)
 
     # ---------------- Output ----------------
+    if FIXED_REFERENCE:
+        l_i = tl.sum(l_i, 1)
     l_recip = 1.0 / l_i[:, None]
     acc = acc * l_recip
     # TDM store via LDS: acc -> LDS (native ds_write from the WMMA layout)
@@ -237,20 +327,102 @@ def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr,  #
     # on the WMMA accumulator.
     o_view = tlx.local_view(o_buf, 0)
     tlx.local_store(o_view, acc.to(o_ptr.dtype.element_ty))
-    tlx.async_amd_descriptor_store(o_desc, o_view, [off_m, 0], clamp_bounds=False)
+    tlx.async_amd_descriptor_store(o_desc, o_view, [off_m, 0], clamp_bounds=True)
     tlx.async_amd_descriptor_wait(0)
 
+    if FIXED_REFERENCE:
+        # The completed store above is provisional: recovery overwrites it.
+        return _needs_online_replay(acc, l_i, m_i, scale_ln2, off_m, SEQLEN_Q)
+    return False
 
-def attn_fwd_tdm_pipelined(q, k, v, sm_scale, BLOCK_M=128, BLOCK_N=128):
+
+# Keep uncommon recovery out of the fast loop's register schedule.
+@triton.jit(noinline=True)
+def _online_replay(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
+                   stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om,
+                   stride_on, SM_SCALE: tl.constexpr, SEQLEN_Q: tl.constexpr, SEQLEN_K: tl.constexpr,
+                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr,
+                   QUERY_TILES_FIRST: tl.constexpr):
+    _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
+                    stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om,
+                    stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ, False, QUERY_TILES_FIRST)
+
+
+@triton.jit
+def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz,
+                                  stride_kh, stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk,
+                                  stride_oz, stride_oh, stride_om, stride_on, SM_SCALE: tl.constexpr,
+                                  SEQLEN_Q: tl.constexpr, SEQLEN_K: tl.constexpr, BLOCK_M: tl.constexpr,
+                                  BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr,
+                                  USE_FIXED_REFERENCE: tl.constexpr = False, QUERY_TILES_FIRST: tl.constexpr = False):
+    if USE_FIXED_REFERENCE:
+        retry = _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz,
+                                stride_kh, stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz,
+                                stride_oh, stride_om, stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N,
+                                HEAD_SZ, True, QUERY_TILES_FIRST)
+        if retry:
+            _online_replay(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
+                           stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh,
+                           stride_om, stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ,
+                           QUERY_TILES_FIRST)
+    else:
+        _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
+                        stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh,
+                        stride_om, stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ, False,
+                        QUERY_TILES_FIRST)
+
+
+def _select_tile_sizes(batch, heads, seqlen_q, seqlen_k, head_size, compute_units):
+    if head_size != 128:
+        return 128, 128
+    # Smaller query tiles fill otherwise idle CUs on short inputs.
+    query_blocks = batch * heads * triton.cdiv(seqlen_q, 128)
+    if query_blocks < compute_units:
+        narrow_blocks = batch * heads * triton.cdiv(seqlen_q, 64)
+        # Long K loops also benefit from filling otherwise idle CUs.
+        if seqlen_k > 1024:
+            return (32 if narrow_blocks <= compute_units // 2 else 64), 128
+        # Two waves help moderate K loops and severely underfilled grids.
+        if seqlen_k >= 512 and narrow_blocks < compute_units:
+            if seqlen_k <= 768 or narrow_blocks <= compute_units // 8:
+                return 32, 128
+        return 64, 128
+    if seqlen_k < 512:
+        return 128, 128
+    # Wider query tiles amortize K/V traffic, provided enough workgroups remain
+    # to fill the GPU. Shorter inputs use the spill-free 128x64 schedule.
+    wide = seqlen_k >= 4096 and batch * heads * (seqlen_q // 256) >= compute_units
+    return (256 if wide else 128), 64
+
+
+def _use_query_tiles_first(heads, seqlen_k, head_size):
+    return head_size == 128 and seqlen_k >= 65536 and heads >= 32
+
+
+def attn_fwd_tdm_pipelined(q, k, v, sm_scale, BLOCK_M=None, BLOCK_N=None):
+    """Dense noncausal BHSD attention with BF16/FP16 inputs and FP32 output.
+
+    Q/K/V share batch, head count and head size; K/V share sequence length.
+    The head dimension must be contiguous and sm_scale positive. Explicit
+    tile overrides retain the original default of 128 for the other dimension.
+    """
     BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ = q.shape
     SEQLEN_K = k.shape[2]
+    if BLOCK_M is None and BLOCK_N is None:
+        compute_units = torch.cuda.get_device_properties(q.device).multi_processor_count
+        BLOCK_M, BLOCK_N = _select_tile_sizes(BATCH, NUM_Q_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_SZ, compute_units)
+    else:
+        BLOCK_M = 128 if BLOCK_M is None else BLOCK_M
+        BLOCK_N = 128 if BLOCK_N is None else BLOCK_N
+    use_fixed = HEAD_SZ == 128 and SEQLEN_K >= 512
     o = torch.empty_like(q, dtype=torch.float32)
     grid = (BATCH, NUM_Q_HEADS, (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M)
     attn_fwd_tdm_pipelined_kernel[grid](
         q, k, v, o,  #
         *q.stride(), *k.stride(), *v.stride(), *o.stride(),  #
-        sm_scale, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ,  #
-        num_warps=4, waves_per_eu=1)
+        sm_scale, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ, use_fixed,  #
+        QUERY_TILES_FIRST=_use_query_tiles_first(NUM_Q_HEADS, SEQLEN_K, HEAD_SZ),
+        num_warps=2 if HEAD_SZ == 128 and BLOCK_M == 32 else 4, waves_per_eu=1)
     return o
 
 
