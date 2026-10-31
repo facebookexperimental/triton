@@ -578,7 +578,8 @@ def test_gfx1250_mxgemm_tdm_tiles_per_warp(DTYPE_B, TILES_PER_WARP):
                                                        (1, 2, 129, 129),  # two key tiles with partial Q/K boundaries
                                                        (2, 2, 129, 257),  # partial Q and K tiles, independent lengths
                                                        (1, 2, 897, 897),  # final K tile contains a single valid row
-                                                       (1, 2, 90000, 90000),  # long sequence with a partial final tile
+                                                       (2, 3, 129, 65537),  # long-K fallback across batches/heads
+                                                       (1, 40, 90000, 90000),  # long heads, partial tiles
                                                        ])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gfx1250_attn_fwd_tdm_pipelined(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
@@ -608,19 +609,25 @@ def test_gfx1250_attn_fwd_tdm_pipelined(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
     assert (actual.double() - ref).square().mean().sqrt() < tolerance * ref.square().mean().sqrt()
 
 
-# Automatic narrow/medium routes plus a forced wide tile exercise every replay
-# geometry without allocating an unusually large adversarial attention input.
+# Automatic narrow/medium/long-K routes plus a forced wide tile exercise replay
+# without allocating an unusually large adversarial query sequence.
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("seqlen_k,block_m,block_n", [(512, None, None), (1025, None, None), (1025, 256, 64)])
+@pytest.mark.parametrize("seqlen_k,block_m,block_n", [(512, None, None), (1025, None, None), (1025, 256, 64),
+                                                      (65537, None, None)])
 @pytest.mark.parametrize("recovery_case", ["exp_overflow", "probability_overflow", "common_offset"])
 def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block_n, recovery_case):
     torch.manual_seed(1)
     device = triton.runtime.driver.active.get_active_torch_device()
-    q = torch.randn((1, 2, 257, 128), device=device, dtype=dtype)
-    k = torch.randn((1, 2, seqlen_k, 128), device=device, dtype=dtype)
+    heads = 32 if seqlen_k >= 65536 else 2
+    q = torch.randn((1, heads, 257, 128), device=device, dtype=dtype)
+    k = torch.randn((1, heads, seqlen_k, 128), device=device, dtype=dtype)
     v = torch.randn_like(k).abs().add_(0.25)
     scale = 128**-0.5
+    # Mix safe and unsafe heads so replaying the wrong tile cannot repair all
+    # outputs accidentally through a different permutation of workgroups.
+    q_bad = q[:, -1:] if heads >= 32 else q
+    k_bad = k[:, -1:] if heads >= 32 else k
     _gfx1250_attention.attn_fwd_tdm_pipelined(q, k, v, scale, BLOCK_M=block_m, BLOCK_N=block_n)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -633,21 +640,21 @@ def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block
             q.normal_()
             k.normal_()
         elif recovery_case == "exp_overflow":
-            q.fill_(1)
-            k.zero_()
-            k[:, :, 128:].fill_(16)
+            q_bad.fill_(1)
+            k_bad.zero_()
+            k_bad[:, :, 128:].fill_(16)
         elif recovery_case == "probability_overflow":
-            q.zero_()
-            q[..., 0] = 1
-            k.zero_()
-            k[:, :, 128:, 0] = 200
+            q_bad.zero_()
+            q_bad[..., 0] = 1
+            k_bad.zero_()
+            k_bad[:, :, 128:, 0] = 200
         else:
-            q.zero_()
-            q[..., 0] = 256
-            q[..., 1] = 1
-            k.zero_()
-            k[..., 0] = 256
-            k[..., 1] = torch.arange(k.shape[2], device=device) % 9 - 4
+            q_bad.zero_()
+            q_bad[..., 0] = 256
+            q_bad[..., 1] = 1
+            k_bad.zero_()
+            k_bad[..., 0] = 256
+            k_bad[..., 1] = torch.arange(k_bad.shape[2], device=device) % 9 - 4
         ref = ((q.double() @ k.double().transpose(-1, -2)) * scale).softmax(-1) @ v.double()
         for _ in range(3):
             graph.replay()
@@ -659,8 +666,10 @@ def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("layout", ["offset", "padded", "odd_stride"])
-@pytest.mark.parametrize("block_m,block_n", [(64, 128), (128, 64), (256, 64)])
-def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, block_m, block_n):
+@pytest.mark.parametrize("block_m,block_n,query_tiles_first", [(32, 128, False), (64, 128, False), (128, 64, False),
+                                                               (256, 64, False),
+                                                               pytest.param(128, 64, True, id="query_first")])
+def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, block_m, block_n, query_tiles_first):
     torch.manual_seed(2)
     device = triton.runtime.driver.active.get_active_torch_device()
     batch, heads, sq, sk, dim = 2, 2, 257, 1025, 128
@@ -685,7 +694,9 @@ def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, block_m, block_n)
     def launch():
         _gfx1250_attention.attn_fwd_tdm_pipelined_kernel[grid](q, k, v, out, *q.stride(), *k.stride(), *v.stride(),
                                                                *out.stride(), scale, sq, sk, block_m, block_n, dim,
-                                                               USE_FIXED_REFERENCE=True, num_warps=4, waves_per_eu=1)
+                                                               USE_FIXED_REFERENCE=True,
+                                                               QUERY_TILES_FIRST=query_tiles_first,
+                                                               num_warps=2 if block_m == 32 else 4, waves_per_eu=1)
 
     launch()
     graph = torch.cuda.CUDAGraph()

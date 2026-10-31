@@ -127,7 +127,8 @@ def _needs_online_replay(acc, denominator, reference, scale_ln2, row_start, SEQL
 def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
                     stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om,
                     stride_on, SM_SCALE: tl.constexpr, SEQLEN_Q: tl.constexpr, SEQLEN_K: tl.constexpr,
-                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr, FIXED_REFERENCE: tl.constexpr):
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr, FIXED_REFERENCE: tl.constexpr,
+                    QUERY_TILES_FIRST: tl.constexpr):
     NUM_BUFFERS: tl.constexpr = 2
     # The 128x64 fixed-reference schedule hides K-prefetch latency behind
     # probability conversion and denominator updates; wider tiles prefer the
@@ -136,8 +137,15 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
     scale_ln2: tl.constexpr = SM_SCALE * RCP_LN2
 
     off_z = tl.program_id(0)
-    off_h = tl.program_id(1)
-    off_m = tl.program_id(2) * BLOCK_M
+    if QUERY_TILES_FIRST:
+        # Group query tiles when many long heads compete for cache.
+        query_blocks: tl.constexpr = tl.cdiv(SEQLEN_Q, BLOCK_M)
+        tile = tl.program_id(1) + tl.num_programs(1) * tl.program_id(2)
+        off_h = tile // query_blocks
+        off_m = (tile % query_blocks) * BLOCK_M
+    else:
+        off_h = tl.program_id(1)
+        off_m = tl.program_id(2) * BLOCK_M
 
     # --- Q: TDM-load once into LDS, then local_load into the dot-operand
     # layout directly (no register-layout conversion in the prologue). ---
@@ -322,10 +330,11 @@ def _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm,
 def _online_replay(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
                    stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om,
                    stride_on, SM_SCALE: tl.constexpr, SEQLEN_Q: tl.constexpr, SEQLEN_K: tl.constexpr,
-                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr):
+                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr,
+                   QUERY_TILES_FIRST: tl.constexpr):
     _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
                     stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om,
-                    stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ, False)
+                    stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ, False, QUERY_TILES_FIRST)
 
 
 @triton.jit
@@ -334,20 +343,22 @@ def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_
                                   stride_oz, stride_oh, stride_om, stride_on, SM_SCALE: tl.constexpr,
                                   SEQLEN_Q: tl.constexpr, SEQLEN_K: tl.constexpr, BLOCK_M: tl.constexpr,
                                   BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr,
-                                  USE_FIXED_REFERENCE: tl.constexpr = False):
+                                  USE_FIXED_REFERENCE: tl.constexpr = False, QUERY_TILES_FIRST: tl.constexpr = False):
     if USE_FIXED_REFERENCE:
         retry = _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz,
                                 stride_kh, stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz,
                                 stride_oh, stride_om, stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N,
-                                HEAD_SZ, True)
+                                HEAD_SZ, True, QUERY_TILES_FIRST)
         if retry:
             _online_replay(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
                            stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh,
-                           stride_om, stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ)
+                           stride_om, stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ,
+                           QUERY_TILES_FIRST)
     else:
         _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh,
                         stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz, stride_oh,
-                        stride_om, stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ, False)
+                        stride_om, stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ, False,
+                        QUERY_TILES_FIRST)
 
 
 def _select_tile_sizes(batch, heads, seqlen_q, seqlen_k, head_size, compute_units):
@@ -356,6 +367,11 @@ def _select_tile_sizes(batch, heads, seqlen_q, seqlen_k, head_size, compute_unit
     # Smaller query tiles fill otherwise idle CUs on short inputs.
     query_blocks = batch * heads * triton.cdiv(seqlen_q, 128)
     if seqlen_k <= 1024 and query_blocks < compute_units:
+        # Two waves help moderate K loops and severely underfilled grids.
+        narrow_blocks = batch * heads * triton.cdiv(seqlen_q, 64)
+        if seqlen_k >= 512 and narrow_blocks < compute_units:
+            if seqlen_k <= 768 or narrow_blocks <= compute_units // 8:
+                return 32, 128
         return 64, 128
     if seqlen_k < 512:
         return 128, 128
@@ -363,6 +379,10 @@ def _select_tile_sizes(batch, heads, seqlen_q, seqlen_k, head_size, compute_unit
     # to fill the GPU. Shorter inputs use the spill-free 128x64 schedule.
     wide = seqlen_k >= 4096 and batch * heads * (seqlen_q // 256) >= compute_units
     return (256 if wide else 128), 64
+
+
+def _use_query_tiles_first(heads, seqlen_k, head_size):
+    return head_size == 128 and seqlen_k >= 65536 and heads >= 32
 
 
 def attn_fwd_tdm_pipelined(q, k, v, sm_scale, BLOCK_M=None, BLOCK_N=None):
@@ -387,7 +407,8 @@ def attn_fwd_tdm_pipelined(q, k, v, sm_scale, BLOCK_M=None, BLOCK_N=None):
         q, k, v, o,  #
         *q.stride(), *k.stride(), *v.stride(), *o.stride(),  #
         sm_scale, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ, use_fixed,  #
-        num_warps=4, waves_per_eu=1)
+        QUERY_TILES_FIRST=_use_query_tiles_first(NUM_Q_HEADS, SEQLEN_K, HEAD_SZ),
+        num_warps=2 if HEAD_SZ == 128 and BLOCK_M == 32 else 4, waves_per_eu=1)
     return o
 
 
