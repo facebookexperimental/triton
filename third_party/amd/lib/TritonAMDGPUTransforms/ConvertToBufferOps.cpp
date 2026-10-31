@@ -572,15 +572,15 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
           }
           return triton::amdgpu::BufferLoadOp::create(
               rewriter, op->getLoc(), op.getType(), basePtr, tensorOffset,
-              blockStride, op.getCache(), op.getEvict(), maybeMask, maybeOther,
+              blockStride, op.getCachePolicyAttr(), maybeMask, maybeOther,
               contig);
         } else if constexpr (std::is_same_v<
                                  SourceOp,
                                  triton::gpu::AsyncCopyGlobalToLocalOp>) {
           return triton::amdgpu::BufferLoadToLocalOp::create(
               rewriter, op->getLoc(), op.getType(), op.getResult(), basePtr,
-              tensorOffset, maybeMask, maybeOther, blockStride, op.getCache(),
-              op.getEvict(), op.getContiguity());
+              tensorOffset, maybeMask, maybeOther, blockStride,
+              op.getCachePolicyAttr(), op.getContiguity());
         } else {
           static_assert(always_false<SourceOp>::value,
                         "Unsupported type in ConvertTritonLoadToBufferLoad");
@@ -646,8 +646,8 @@ struct ConvertTritonStoreToBufferStore
           op->getLoc(), op);
 
       rewriter.replaceOpWithNewOp<triton::amdgpu::BufferStoreOp>(
-          op, op.getValue(), basePtr, tensorOffset, blockStride, op.getCache(),
-          op.getEvict(), maybeMask, contig);
+          op, op.getValue(), basePtr, tensorOffset, blockStride,
+          op.getCachePolicyAttr(), maybeMask, contig);
       return success();
     }
     LDBG("Failed to convert: " << op);

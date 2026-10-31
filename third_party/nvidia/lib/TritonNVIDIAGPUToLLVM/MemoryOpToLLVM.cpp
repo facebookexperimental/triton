@@ -353,7 +353,8 @@ struct AsyncRemoteShmemReduceOpConversion
         toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
     auto [physicalRegLayout, sharedLayout] =
         getPhysicalLayouts(regLayout, dstTy);
-    auto cvt = invertAndComposeBlockLocal(sharedLayout, physicalRegLayout);
+    auto kBlock = str_attr("block");
+    auto cvt = invertAndComposeLocal(sharedLayout, physicalRegLayout, {kBlock});
     auto vals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
 
     auto barrierTy = cast<MemDescType>(op.getBarrier().getType());
@@ -442,15 +443,16 @@ struct AsyncSharedStoreOpConversion
         loc, adaptor.getMbarrier(),
         typeConverter->convertType(mbarrierTy.getElementType()), rewriter);
 
+    auto kBlock = str_attr("block");
     auto regLayout = toLinearLayout(srcTy);
     auto freeVarMasks = regLayout.getFreeVariableMasks();
-    freeVarMasks[str_attr("block")] = 0;
+    freeVarMasks[kBlock] = 0;
     Value threadPred =
         emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
     Value mapPred = threadPred ? threadPred : b.true_val();
     regLayout = regLayout.removeZeroBasesAlongDim(str_attr("register"));
     auto sharedLayout = toLinearLayoutIgnoringPadding(dstTy);
-    auto cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
+    auto cvt = invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
     auto values = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
     Value currentCTAId = targetInfo.getClusterCTAId(rewriter, loc);
     Value mbarrierPtr = mbarrierMemObj.getBase();
@@ -575,9 +577,8 @@ public:
       return success();
     }
 
-    finalizeTensorAtomicResults(op, info.valuesTy, rewriter, results,
-                                info.llvmElemTy, b, info.threadPred, targetInfo,
-                                getTypeConverter());
+    finalizeAtomicResults(op, rewriter, results, info.llvmElemTy, b,
+                          info.threadPred, targetInfo, getTypeConverter());
     return success();
   }
 

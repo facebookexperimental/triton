@@ -1328,6 +1328,8 @@ class CUDABackend(BaseBackend):
         # (e.g. test_warpgroup_reduction returns 0). Meta Triton keeps the pre-#9535
         # behavior: NVGPUToLLVM relativizes the warp-group tid and runs before WS
         # lowering.
+        # Lower Proton segment values before warp specialization captures partition operands.
+        instrument(pm, point="llvmir-to-llvm", context=mod.context)
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)
         nvidia.passes.ttnvgpuir.add_warp_specialize_to_llvm(pm)
         passes.common.add_canonicalizer(pm)
@@ -1337,8 +1339,6 @@ class CUDABackend(BaseBackend):
         passes.convert.add_nvvm_to_llvm(pm)
         if (not knobs.compilation.disable_line_info and not knobs.compilation.dump_ir_extract_di_local_variables):
             passes.llvmir.add_di_scope(pm)
-
-        instrument(pm, point="llvmir-to-llvm", context=mod.context)
 
         try:
             pm.run(mod, "make_llir")
@@ -1619,6 +1619,7 @@ please share the reproducer above with Triton project.
             stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options, capability)
             stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options, capability)
         elif language == Language.GLUON:
+            stages["glir"] = lambda src, metadata: src
             stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(src, metadata, options, capability)
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
         stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.target.arch)

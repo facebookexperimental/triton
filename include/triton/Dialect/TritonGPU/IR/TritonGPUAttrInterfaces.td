@@ -245,11 +245,21 @@ def DeclareLinearEncodingMethods
 
 def MmaEncodingTrait : AttrInterface<"MmaEncodingTrait"> {
   let cppNamespace = "::mlir::triton::gpu";
-  let methods = [InterfaceMethod<
-                     "Get the order of reps (tiles of this layout that tile "
-                     "the whole tensor). The fastest-changing axis first",
-                     "SmallVector<unsigned>", "getRepOrderForOperand",
-                     (ins "int":$opIdx)>,
+  let methods = [
+    InterfaceMethod<"Get the order of reps (tiles of this layout that tile the whole tensor). The fastest-changing axis first",
+                    "SmallVector<unsigned>",
+                    "getRepOrderForOperand",
+                    (ins "int":$opIdx)>,
+    InterfaceMethod<"Convert a dot operand whose parent is this MMA layout to a LinearLayout.",
+                    "LinearLayout",
+                    "dotOperandToLinearLayout",
+                    (ins "::mlir::Attribute":$dotOp,
+                         "ArrayRef<int64_t>":$shape),
+                    /*methodBody=*/[{}],
+                    /*defaultImplementation=*/[{
+                      llvm::report_fatal_error(
+                          "this MMA layout is not a valid dot-operand parent");
+                    }]>,
   ];
 }
 
