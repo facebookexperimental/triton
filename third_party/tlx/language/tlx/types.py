@@ -1,4 +1,5 @@
 import enum
+import hashlib
 from abc import abstractmethod
 from typing import List, Optional, Tuple
 
@@ -1305,7 +1306,7 @@ class storage_alias_spec_type(tl.base_type):
         return f"storage_alias_spec_type(storage={self._storage.value}{size_str})"
 
     def mangle(self) -> str:
-        size_part = f"_{self._buffer_size_bytes}" if self._buffer_size_bytes else ""
+        size_part = "" if self._buffer_size_bytes is None else f"_{self._buffer_size_bytes}"
         return f"storage_alias_spec_{self._storage.value}{size_part}"
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
@@ -1362,7 +1363,8 @@ class buffered_tensor(tl.base_value):
         self.handle = handle
         # Block shape
         self.shape = shape
-        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout)
+        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout,
+                                         ir_type=handle.get_type() if handle is not None else None)
         # Following the practice in pytorch, dtype is scalar type
         self.dtype = element_ty
 
@@ -1390,6 +1392,7 @@ class buffered_tensor_type(tl.block_type):
         num: int,
         storage: storage_kind,
         layout: Optional[shared_layout_encoding] = None,
+        ir_type=None,
     ):
         super().__init__(element_ty, shape)
         # Storage
@@ -1398,6 +1401,10 @@ class buffered_tensor_type(tl.block_type):
         self.layout = layout
         # Buffer number. 0 means a single buffer, 1+ means a buffer array.
         self.num = num
+        # Views carry an allocation shape and concrete encoding that cannot be
+        # reconstructed from their logical shape and frontend layout alone.
+        # Keep that type across JIT calls, just as the descriptor value does.
+        self._ir_type = ir_type
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
         value = buffered_tensor(
@@ -1410,24 +1417,40 @@ class buffered_tensor_type(tl.block_type):
         )
         return value, cursor + 1
 
+    def _identity(self) -> tuple:
+        # Everything that distinguishes values of this type: equality and
+        # mangling both derive from it, so JIT helpers specialize exactly per
+        # distinct type. The concrete IR type, when present, also fixes the
+        # allocation shape and resolved encoding. Without one, the frontend
+        # storage and layout still keep differently placed buffers apart.
+        return (self.element_ty, tuple(self.shape), self.num, self.storage, self.layout,
+                None if self._ir_type is None else str(self._ir_type))
+
+    def _mangle_prefix(self) -> str:
+        return f"buffered_{self.scalar.mangle()}"
+
     def mangle(self) -> str:
-        elt = self.scalar.mangle()
         shape = "_".join(map(str, self.shape))
         if self.num > 0:
             shape += f"_{self.num}"
-        return f"buffered_{elt}S{shape}"
+        digest = hashlib.sha256(repr(self._identity()).encode()).hexdigest()[:16]
+        return f"{self._mangle_prefix()}S{shape}_{self.storage.value}M{digest}"
 
     def __str__(self) -> str:
-        return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}>"
+        # Two views can differ only in their IR type (e.g. the allocation
+        # shape), so show it to make type mismatches readable.
+        ir_type = "" if self._ir_type is None else f", {self._ir_type}"
+        return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}{ir_type}>"
 
     def __eq__(self, other) -> bool:
-        return (type(self) is type(other) and self.shape == other.shape and self.layout == other.layout
-                and self.num == other.num)
+        return type(self) is type(other) and self._identity() == other._identity()
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
         out.append(self.to_ir(builder))
 
     def to_ir(self, builder: ir.builder) -> None:
+        if self._ir_type is not None:
+            return self._ir_type
         shape = self.shape
         if self.num >= 1:
             shape = [self.num] + list(shape)
@@ -1490,6 +1513,13 @@ class mbarrier_type(buffered_tensor_type):
         super().__init__(tl.int64, [1], num, storage, layout)
         self.is_warp_barrier = is_warp_barrier
 
+    def _identity(self) -> tuple:
+        # Warp barriers arrive per thread; ordinary ones once per CTA.
+        return super()._identity() + (self.is_warp_barrier, )
+
+    def _mangle_prefix(self) -> str:
+        return "mbarrier"
+
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
         value = mbarrier(handles[cursor], self.num, self.layout, self.storage, is_warp_barrier=self.is_warp_barrier)
         return value, cursor + 1
@@ -1549,11 +1579,11 @@ class clc_response_type(buffered_tensor_type):
         value = clc_response(handles[cursor], self.num, self.layout)
         return value, cursor + 1
 
-    def mangle(self) -> str:
+    def _mangle_prefix(self) -> str:
         # Distinct from buffered_tensor_type/mbarrier_type, whose mangles are
         # derived from the (placeholder) int64 element type and would otherwise
         # collide with this one for the same shape.
-        return f"clc_response_{self.num}"
+        return "clc_response"
 
     def to_ir(self, builder: ir.builder) -> None:
         if self.num >= 1:
@@ -1679,9 +1709,7 @@ class tensor_descriptor_ptr_type(tl.pointer_type):
         return f"tensor_descriptor_ptr_type(num={self.num}, size={self.size})"
 
     def mangle(self) -> str:
-        if self.num > 1:
-            return f"tensor_desc_ptr_{self.num}_{self.size}"
-        return f"tensor_desc_ptr_{self.size}"
+        return f"tensor_desc_ptr_{self.num}_{self.size}"
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int):
         return tensor_descriptor_ptr(handles[cursor], self.num, self.size), cursor + 1
