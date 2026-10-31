@@ -1,0 +1,83 @@
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad | FileCheck %s
+
+// A padded K is zero-filled on both operands, by the load's `other` when the
+// operand is a load, as a hand-padded kernel does.
+// CHECK-LABEL: @dot_k
+tt.func @dot_k(%pa: !tt.ptr<f16>, %pb: !tt.ptr<f16>) {
+  // CHECK: %[[ZA:.*]] = arith.constant dense<0.000000e+00> : tensor<16x128xf16>
+  // CHECK-NEXT: %[[A:.*]] = tt.load %{{.*}}, %{{.*}}, %[[ZA]] : tensor<16x128x!tt.ptr<f16>>
+  // CHECK: %[[ZB:.*]] = arith.constant dense<0.000000e+00> : tensor<128x16xf16>
+  // CHECK-NEXT: %[[B:.*]] = tt.load %{{.*}}, %{{.*}}, %[[ZB]] : tensor<128x16x!tt.ptr<f16>>
+  // CHECK-NOT: arith.select
+  // CHECK: tt.dot %[[A]], %[[B]], %{{.*}} : tensor<16x128xf16> * tensor<128x16xf16> -> tensor<16x16xf32>
+  %sa = tt.splat %pa : !tt.ptr<f16> -> tensor<16x96x!tt.ptr<f16>>
+  %a = tt.load %sa : tensor<16x96x!tt.ptr<f16>>
+  %sb = tt.splat %pb : !tt.ptr<f16> -> tensor<96x16x!tt.ptr<f16>>
+  %b = tt.load %sb : tensor<96x16x!tt.ptr<f16>>
+  %c = arith.constant dense<0.0> : tensor<16x16xf32>
+  %d = tt.dot %a, %b, %c : tensor<16x96xf16> * tensor<96x16xf16> -> tensor<16x16xf32>
+  tt.return
+}
+
+// -----
+
+// A scaled dot also pads its e8m0 scales with 127, a scale of 1.
+// CHECK-LABEL: @dot_scaled_k
+tt.func @dot_scaled_k(%pa: !tt.ptr<f8E4M3FN>, %ps: !tt.ptr<i8>) {
+  // CHECK-COUNT-2: arith.constant dense<0.000000e+00> : tensor<{{16x128|128x16}}xf8E4M3FN>
+  // CHECK: %[[ONE:.*]] = arith.constant dense<127> : tensor<16x4xi8>
+  // CHECK-NEXT: %[[S:.*]] = tt.load %{{.*}}, %{{.*}}, %[[ONE]] : tensor<16x4x!tt.ptr<i8>>
+  // CHECK-NOT: arith.select
+  // CHECK: tt.dot_scaled %{{.*}} scale %[[S]], %{{.*}} scale %[[S]], %{{.*}} lhs = e4m3 rhs = e4m3
+  %sa = tt.splat %pa : !tt.ptr<f8E4M3FN> -> tensor<16x96x!tt.ptr<f8E4M3FN>>
+  %a = tt.load %sa : tensor<16x96x!tt.ptr<f8E4M3FN>>
+  %sb = tt.splat %pa : !tt.ptr<f8E4M3FN> -> tensor<96x16x!tt.ptr<f8E4M3FN>>
+  %b = tt.load %sb : tensor<96x16x!tt.ptr<f8E4M3FN>>
+  %ss = tt.splat %ps : !tt.ptr<i8> -> tensor<16x3x!tt.ptr<i8>>
+  %s = tt.load %ss : tensor<16x3x!tt.ptr<i8>>
+  %c = arith.constant dense<0.0> : tensor<16x16xf32>
+  %d = tt.dot_scaled %a scale %s, %b scale %s, %c lhs = e4m3 rhs = e4m3 {fastMath = false} : tensor<16x96xf8E4M3FN>, tensor<16x3xi8> * tensor<96x16xf8E4M3FN>, tensor<16x3xi8> -> tensor<16x16xf32>
+  tt.return
+}
+
+// -----
+
+// A padded M or N needs no fill: the store masks the extra rows and columns.
+// CHECK-LABEL: @dot_mn
+tt.func @dot_mn(%pa: !tt.ptr<f16>) {
+  // CHECK-NOT: arith.select
+  // CHECK: tt.dot %{{.*}} : tensor<64x32xf16> * tensor<32x128xf16> -> tensor<64x128xf32>
+  %sa = tt.splat %pa : !tt.ptr<f16> -> tensor<48x32x!tt.ptr<f16>>
+  %a = tt.load %sa : tensor<48x32x!tt.ptr<f16>>
+  %sb = tt.splat %pa : !tt.ptr<f16> -> tensor<32x80x!tt.ptr<f16>>
+  %b = tt.load %sb : tensor<32x80x!tt.ptr<f16>>
+  %c = arith.constant dense<0.0> : tensor<48x80xf32>
+  %d = tt.dot %a, %b, %c : tensor<48x32xf16> * tensor<32x80xf16> -> tensor<48x80xf32>
+  tt.return
+}
+
+// -----
+
+// The fill folds through a transpose. A load whose `other` is not the fill, or
+// a non-load operand (exp(0) is 1), keeps the select.
+// CHECK-LABEL: @dot_k_select
+tt.func @dot_k_select(%p: !tt.ptr<f16>) {
+  // CHECK: %[[Z:.*]] = arith.constant dense<0.000000e+00> : tensor<16x128xf16>
+  // CHECK-NEXT: %[[B:.*]] = tt.load %{{.*}}, %{{.*}}, %[[Z]] : tensor<16x128x!tt.ptr<f16>>
+  // CHECK: %[[BT:.*]] = tt.trans %[[B]]
+  // CHECK: %[[SA:.*]] = arith.select %{{.*}} : tensor<16x128xi1>, tensor<16x128xf16>
+  // CHECK-NEXT: tt.dot %[[SA]], %[[BT]]
+  // CHECK: %[[SE:.*]] = arith.select %{{.*}} : tensor<16x128xi1>, tensor<16x128xf16>
+  // CHECK-NEXT: tt.dot %[[SE]], %[[BT]]
+  %ptr = tt.splat %p : !tt.ptr<f16> -> tensor<16x96x!tt.ptr<f16>>
+  %m = arith.constant dense<true> : tensor<16x96xi1>
+  %one = arith.constant dense<1.0> : tensor<16x96xf16>
+  %a = tt.load %ptr, %m, %one : tensor<16x96x!tt.ptr<f16>>
+  %b = tt.load %ptr : tensor<16x96x!tt.ptr<f16>>
+  %bt = tt.trans %b {order = array<i32: 1, 0>} : tensor<16x96xf16> -> tensor<96x16xf16>
+  %c = arith.constant dense<0.0> : tensor<16x16xf32>
+  %d = tt.dot %a, %bt, %c : tensor<16x96xf16> * tensor<96x16xf16> -> tensor<16x16xf32>
+  %e = math.exp %a : tensor<16x96xf16>
+  %f = tt.dot %e, %bt, %d : tensor<16x96xf16> * tensor<96x16xf16> -> tensor<16x16xf32>
+  tt.return
+}
