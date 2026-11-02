@@ -1134,11 +1134,16 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
       // Empty, meaning the element is not defined
       bases[kRow].push_back({0, 0});
     }
-    bases[kRow].push_back({16, 0});
-    bases[kRow].push_back({32, 0});
+    // A row slice (fewer than 64 rows) spans only the first lane quadrants.
+    for (int32_t row = 16; row < std::min<int64_t>(shapePerCTA[0], blockM);
+         row *= 2)
+      bases[kRow].push_back({row, 0});
     tile = LinearLayout(std::move(bases), dims);
   } else {
-    tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) * colLayout;
+    // A row slice (fewer than blockM rows) spans only its own lanes.
+    int32_t rows = isM64TwoCTA ? blockM
+                               : std::min<int64_t>(blockM, shapePerCTA[0]);
+    tile *= LinearLayout::identity1D(rows, kRow, dims[0]) * colLayout;
     if (isM64TwoCTA) {
       auto bases = tile.getBases();
       bases[kRow].push_back(bases[kCol].back());

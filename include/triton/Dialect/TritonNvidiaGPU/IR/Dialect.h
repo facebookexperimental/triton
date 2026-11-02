@@ -153,8 +153,11 @@ inline const char *getOpShape(TMemAccessAtom atom) {
   llvm_unreachable("Unknown TMemAccessAtom");
 }
 
+// With `withWarp`, warp w of a warpgroup accesses lanes [32w, 32w + 32);
+// `numWarpBases` is log2 of the number of those warps (2 for a full warpgroup,
+// fewer for a task of 1 or 2 warps).
 LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
-                           bool withWarp);
+                           bool withWarp, int numWarpBases = 2);
 
 TMemAllocation getTmemAllocSizes(gpu::MemDescType memDescType);
 
