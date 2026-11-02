@@ -851,8 +851,8 @@ class TritonSemantic(Generic[TensorTy]):
         if ((src_sca_ty.is_bf16() and dst_sca_ty.is_fp16()) or (src_sca_ty.is_fp16() and dst_sca_ty.is_bf16())):
             if self.builder.options.backend_name != "cpu":
                 return self.tensor(
-                    self.builder.create_fp_to_fp(input.handle, dst_ty.to_ir(self.builder),
-                                                 ir.ROUNDING_MODE.RTNE), dst_ty)
+                    self.builder.create_fp_to_fp(input.handle, dst_ty.to_ir(self.builder), ir.ROUNDING_MODE.RTNE),
+                    dst_ty)
 
         if src_sca_ty.is_fp8e4b15() or dst_sca_ty.is_fp8e4b15():
             assert self.builder.codegen_fns.get("convert_custom_types") is not None, (
