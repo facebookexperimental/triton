@@ -118,7 +118,7 @@ static Attribute shrinkSwizzleForShape(Attribute layout,
 
   return ttg::NVMMASharedEncodingAttr::get(
       layout.getContext(), swizzle, nvmma.getTransposed(), eltBitWidth,
-      nvmma.getFp4Padded(), nvmma.getCGALayout());
+      nvmma.getFp4Padded(), nvmma.getCGALayout(), nvmma.getFp6Padded());
 }
 
 struct BLoadTrace {

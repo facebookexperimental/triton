@@ -434,14 +434,27 @@ def NVMMASharedEncodingAttr
   // operand in MMAv5 scaled dot, which needs to be in the special padded layout
   // as described in
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#packing-format-used-for-matrix-a-and-b-by-kind-mxf8f6f4-in-shared-memory
+  // fp6Padded uses 16-byte containers holding 16 densely packed FP6 values
+  // followed by four padding bytes. Shapes and coordinates count FP6 values;
+  // the linear layout addresses the padded byte containers. TMA reads dense
+  // global FP6 through .b6x16_p32 and inserts the padding.
   let parameters = (ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
       "unsigned":$elementBitWidth, "bool":$fp4Padded,
-      "CGAEncodingAttr":$CGALayout);
+      "CGAEncodingAttr":$CGALayout,
+      DefaultValuedParameter<"bool", "false">:$fp6Padded);
 
-  let builders = [AttrBuilder<
-      (ins "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
-          "CGAEncodingAttr":$CGALayout, "Type":$eltTy, "bool":$fp4Padded),
-      [{
+  let builders =
+      [AttrBuilder<(ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
+                       "unsigned":$elementBitWidth, "bool":$fp4Padded,
+                       "CGAEncodingAttr":$CGALayout),
+                   [{
+        return $_get(context, swizzlingByteWidth, transposed, elementBitWidth,
+                     fp4Padded, CGALayout, false);
+      }]>,
+       AttrBuilder<(ins "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+                       "CGAEncodingAttr":$CGALayout, "Type":$eltTy,
+                       "bool":$fp4Padded, CArg<"bool", "false">:$fp6Padded),
+                   [{
         auto shapePerCTA = getShapePerCTA(CGALayout.getCTASplitNum(), shape);
         int32_t swizzlingByteWidth = 0;
         unsigned eleBitWidth = eltTy.getIntOrFloatBitWidth();
@@ -467,7 +480,7 @@ def NVMMASharedEncodingAttr
           swizzlingByteWidth = 0;
         }
         bool transposed = order.size() > 1 && order[0] == 0;
-        return $_get(context, swizzlingByteWidth, transposed, eleBitWidth, fp4Padded, CGALayout);
+        return $_get(context, swizzlingByteWidth, transposed, eleBitWidth, fp4Padded, CGALayout, fp6Padded);
     }]>];
 
   let extraClassDeclaration = extraBaseClassDeclaration#[{
