@@ -38,7 +38,7 @@ def test_split_k_grouped_coordinates(split_k_tutorial, method, m, n):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-@pytest.mark.parametrize("base", [-128, -64, -4, 0, 128, 2147483584])
+@pytest.mark.parametrize("base", [-128, -64, -4, 0, 128, torch.iinfo(torch.int32).max - 63])
 @pytest.mark.parametrize("divisor", [-64, -4, 4, 64])
 @pytest.mark.parametrize("op", ["div", "rem"])
 @pytest.mark.parametrize("indirect", [False, True])
@@ -76,7 +76,7 @@ def test_signed_div_rem_contiguous_boundary(base, divisor, op, indirect):
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 @pytest.mark.parametrize("modulus", [-17, 17])
 @pytest.mark.parametrize("group", [-7, 7])
-@pytest.mark.parametrize("base", [-128, 0, 2147483584])
+@pytest.mark.parametrize("base", [-128, 0, torch.iinfo(torch.int32).max - 63])
 def test_signed_div_rem_dynamic_program_mapping(modulus, group, base):
 
     @triton.jit

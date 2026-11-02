@@ -13,6 +13,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
+INT32_MAX = tl.constexpr(tl.int32.get_int_max_value())
+
 # gfx950 has 8 XCDs per chip; chunked remap improves L2 reuse.
 # XCD_CHUNK=8 was empirically best for the 256x256x64 tile at 4K-8K (per-XCD
 # group of 8 PIDs aligns with the GROUP_M=16 row partitioning).
@@ -73,9 +75,9 @@ def matmul_kernel_warp_pipeline(
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    tl.assume((pid_m * BLOCK_M >= 0) & (pid_m * BLOCK_M <= 2147483647 - (BLOCK_M - 1)))
+    tl.assume((pid_m * BLOCK_M >= 0) & (pid_m * BLOCK_M <= INT32_MAX - (BLOCK_M - 1)))
     pid_n = (pid % num_pid_in_group) // group_size_m
-    tl.assume((pid_n * BLOCK_N >= 0) & (pid_n * BLOCK_N <= 2147483647 - (BLOCK_N - 1)))
+    tl.assume((pid_n * BLOCK_N >= 0) & (pid_n * BLOCK_N <= INT32_MAX - (BLOCK_N - 1)))
 
     # Precompute row/col offsets (these are per-thread, not carried in loop)
     offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
