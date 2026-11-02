@@ -683,7 +683,14 @@ private:
     if (!resTy)
       return constancy;
     auto shape = resTy.getShape();
-    // Signed truncation breaks constant groups at negative multiples.
+    // Let g = gcd(lhs contiguity, lhs divisibility, rhs divisibility).
+    // Each contiguous lhs group splits into g-element subgroups whose bases
+    // are multiples of g. A constant nonzero divisor is also a multiple of g,
+    // so no subgroup crosses a multiple of its magnitude. For nonnegative
+    // dividends, the quotient is constant within each subgroup, even for a
+    // negative divisor. Full-dimension contiguity is unnecessary.
+    // Signed truncation breaks this for negative dividends: [-4,-3,-2,-1] / 4
+    // gives [-1,0,0,0], despite an aligned base and full contiguity.
     constexpr bool isUnsigned = std::is_same_v<OpTy, arith::DivUIOp>;
     if ((isUnsigned || nonNegative.contains(op)) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
@@ -734,7 +741,13 @@ private:
       return BinaryOpVisitorImpl<OpTy>::getContiguity(op, lhs, rhs, dim);
     auto shape = resTy.getShape();
     int64_t contiguity = 1;
-    // Signed remainder jumps after a negative multiple: [0, -3, -2, -1].
+    // Let g = gcd(lhs contiguity, lhs divisibility, rhs divisibility).
+    // Each g-element subgroup has a base divisible by g; a constant nonzero
+    // divisor has magnitude divisible by g. For nonnegative dividends, no
+    // remainder reset occurs inside a subgroup, so its remainders increase
+    // by one. The proof applies to each contiguous group independently and
+    // to either divisor sign; full-dimension contiguity is unnecessary.
+    // Negative dividends break it: [-4,-3,-2,-1] % 4 gives [0,-3,-2,-1].
     constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
     if ((isUnsigned || nonNegative.contains(op)) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
