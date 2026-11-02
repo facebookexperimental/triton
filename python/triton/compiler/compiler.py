@@ -15,6 +15,7 @@ from .. import __version__, knobs
 from .._C.libtriton import get_cache_invalidating_env_vars, ir
 from ..backends import backends
 from ..backends.compiler import BaseBackend, GPUTarget, Language
+from ..magnon.flags import apply_enabled as _compile_iq_apply_enabled, collect_enabled as _compile_iq_collect_enabled
 from ..runtime.autotuner import OutOfResources
 from ..runtime.cache import (
     get_cache_key,
@@ -481,7 +482,7 @@ def _maybe_apply_compile_iq(compiled_kernel):
 
     NO-ACF SASS in compilation cache is never overwritten
     """
-    if not os.environ.get("TRITON_COMPILE_IQ_APPLY"):
+    if not _compile_iq_apply_enabled():
         return compiled_kernel
     try:
         backend = make_backend(compiled_kernel.metadata.target)
@@ -611,7 +612,7 @@ class CompiledKernel:
         self._run = run
         # compile_iq: dump a collection task on the first launch through `run`. Gated by
         # TRITON_COMPILE_IQ_COLLECT; reaches kernels that bypass the JITFunction.run hook.
-        if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
+        if _compile_iq_collect_enabled():
             from triton.magnon.collector import wrap_launcher
             self._run = wrap_launcher(self, run)
         # not enough shared memory to run the kernel

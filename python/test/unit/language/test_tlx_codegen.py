@@ -1795,6 +1795,92 @@ def _unsupported_i16_buffer_atomic_kernel(atomic_ptr):
     tlx.buffer_atomic_add(atomic_ptr, offsets, values)
 
 
+@triton.jit
+def _availability_local_index_kernel(x_ptr, indices_ptr, output_ptr, SCATTER: tl.constexpr):
+    offsets = tl.arange(0, 256)
+    values = tl.load(x_ptr + offsets)
+    indices = tl.load(indices_ptr + offsets)
+    buffers = tlx.local_alloc((256, ), tl.float32, 1)
+    shared = tlx.local_view(buffers, 0)
+    if SCATTER:
+        tlx.local_store(shared, tl.zeros((256, ), tl.float32))
+        tlx.local_scatter(shared, values, indices, 0)
+        result = tlx.local_load(shared)
+    else:
+        tlx.local_store(shared, values)
+        result = tlx.local_gather(shared, indices, 0)
+    tl.store(output_ptr + offsets, result)
+
+
+@pytest.mark.parametrize("target", [GFX942, GFX950, GFX1250], ids=["gfx942", "gfx950", "gfx1250"])
+@pytest.mark.parametrize("scatter", [False, True], ids=["gather", "scatter"])
+def test_availability_local_index_compiles_amd(target, scatter):
+    compiled = compile_for_target(
+        _availability_local_index_kernel,
+        signature={"x_ptr": "*fp32", "indices_ptr": "*i32", "output_ptr": "*fp32"},
+        constexprs={"SCATTER": scatter},
+        target=target,
+    )
+    operation = "scatter" if scatter else "gather"
+    assert f"ttg.local_{operation}" in compiled.asm["ttgir"]
+    assert compiled.asm["amdgcn"]
+
+
+@triton.jit
+def _availability_buffer_atomic_kernel(x_ptr, atomic_ptr, LANES: tl.constexpr):
+    layout: tl.constexpr = tlx.layout(shape=((LANES, 4), (2, )), stride=((2, LANES * 2), (1, )))
+    offsets = tlx.require_layout(tl.arange(0, LANES * 8).to(tl.int32), layout, pin=False)
+    values = tlx.require_layout(tl.load(x_ptr + offsets), layout, pin=False)
+    tlx.buffer_atomic_add(atomic_ptr, offsets, values, sem="relaxed", contiguity=2)
+
+
+@pytest.mark.parametrize(
+    "target,dtype",
+    [
+        pytest.param(target, dtype, id=f"{target.arch}-{dtype}")
+        for target in [GFX942, GFX950, GFX1250]
+        for dtype in ["fp16", "bf16", "fp32", "fp64", "i32", "i64"]
+        if not (target == GFX942 and dtype == "bf16")
+    ],
+)
+def test_availability_buffer_atomic_add_compiles_amd(target, dtype):
+    compiled = compile_for_target(
+        _availability_buffer_atomic_kernel,
+        signature={"x_ptr": f"*{dtype}", "atomic_ptr": f"*{dtype}"},
+        constexprs={"LANES": target.warp_size},
+        target=target,
+    )
+    assert "amdg.buffer_atomic_rmw" in compiled.asm["ttgir"]
+    assert "buffer_atomic" in compiled.asm["amdgcn"]
+
+
+def test_availability_buffer_atomic_bf16_rejects_gfx942():
+    with pytest.raises(RuntimeError, match="fadd is unsupported for this type on the target"):
+        compile_for_gfx942(
+            _availability_buffer_atomic_kernel,
+            signature={"x_ptr": "*bf16", "atomic_ptr": "*bf16"},
+            constexprs={"LANES": 64},
+        )
+
+
+def test_availability_buffer_load_to_local_rejects_gfx1250():
+    with pytest.raises(RuntimeError, match="BufferLoadToLocal unsupported on target architecture"):
+        compile_for_gfx1250(
+            _buffer_load_to_local_contiguity_subslice_kernel,
+            signature={"x_ptr": "*bf16"},
+            constexprs={},
+        )
+
+
+def test_availability_scheduled_mfma_rejects_gfx1250():
+    with pytest.raises(RuntimeError, match="supported only on CDNA3.*CDNA4"):
+        compile_for_gfx1250(
+            _amd_scheduled_mfma_gfx942_kernel,
+            signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "output_ptr": "*fp32"},
+            constexprs={"PERSISTENT": False, "TRANSPOSED": True, "INSTR_K": 16},
+        )
+
+
 def _load_tlx_gfx9_gemm_bench_module(module_name="_tlx_amd_test_gfx9_bench"):
     repo_root = Path(__file__).resolve().parents[4]
     bench_path = (repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "a16w16" / "bench.py")
