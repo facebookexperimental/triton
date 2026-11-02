@@ -3,6 +3,7 @@ add_library(TritonTestAnalysis
   TestAxisInfo.cpp
   TestAllocation.cpp
   TestBufferRegion.cpp
+  TestIntegerRange.cpp
   TestMembar.cpp
   TestPrintNesting.cpp
 )

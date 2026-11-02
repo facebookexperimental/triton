@@ -289,7 +289,6 @@ void TritonIntegerRangeAnalysis::setToEntryState(
 
 void TritonIntegerRangeAnalysis::defaultTransferFunc(
     Operation *op, Value resultVal,
-    ArrayRef<const dataflow::IntegerValueRangeLattice *> srcLattices,
     ArrayRef<dataflow::IntegerValueRangeLattice *> resultsLattices,
     const IntegerValueRange &incomingRange) {
 
@@ -319,26 +318,19 @@ LogicalResult TritonIntegerRangeAnalysis::visitOperation(
     Operation *op,
     ArrayRef<const dataflow::IntegerValueRangeLattice *> operands,
     ArrayRef<dataflow::IntegerValueRangeLattice *> resultsLattices) {
-  SmallVector<const dataflow::IntegerValueRangeLattice *> inputs;
-  SmallVector<std::unique_ptr<dataflow::IntegerValueRangeLattice>> storage;
-  for (auto [value, lattice] : llvm::zip(op->getOperands(), operands)) {
-    if (!assumptions.contains(value)) {
-      inputs.push_back(lattice);
-      continue;
-    }
-    // Local assumptions must not narrow the defining value for sibling uses.
-    // Intersection with fixed assumption bounds preserves monotonicity.
-    auto local = std::make_unique<dataflow::IntegerValueRangeLattice>(value);
-    (void)local->join(getRangeAt(value, op, lattice->getValue()));
-    inputs.push_back(local.get());
-    storage.push_back(std::move(local));
-  }
+  SmallVector<IntegerValueRange> inputs;
+  inputs.reserve(operands.size());
+  // Keep assumed bounds local to this use; sibling uses retain their ranges.
+  // Intersection with fixed bounds preserves monotonicity.
+  for (auto [value, lattice] : llvm::zip(op->getOperands(), operands))
+    inputs.push_back(assumptions.contains(value)
+                         ? getRangeAt(value, op, lattice->getValue())
+                         : lattice->getValue());
   return visitOperationHelper(op, inputs, resultsLattices);
 }
 
 LogicalResult TritonIntegerRangeAnalysis::visitOperationHelper(
-    Operation *op,
-    ArrayRef<const dataflow::IntegerValueRangeLattice *> operands,
+    Operation *op, ArrayRef<IntegerValueRange> operands,
     ArrayRef<dataflow::IntegerValueRangeLattice *> resultsLattices) {
   LDBG("Inferring ranges for " << *op);
 
@@ -346,9 +338,9 @@ LogicalResult TritonIntegerRangeAnalysis::visitOperationHelper(
   // IntegerRangeAnalysis::visitOperation except we do not "short-cicruit" the
   // analysis by inferring a maximum range for loop results (instead we
   // perform a check based on visit counts in visitRegionSuccessors).
-  auto joinCallback = [&op, &operands, &resultsLattices,
+  auto joinCallback = [&op, &resultsLattices,
                        this](Value v, const IntegerValueRange &incomingRange) {
-    this->defaultTransferFunc(op, v, operands, resultsLattices, incomingRange);
+    this->defaultTransferFunc(op, v, resultsLattices, incomingRange);
   };
 
   // Ops with fixed/constant ranges.
@@ -372,27 +364,16 @@ LogicalResult TritonIntegerRangeAnalysis::visitOperationHelper(
     return success();
   }
 
-  SmallVector<IntegerValueRange> argIntValueRanges = llvm::map_to_vector(
-      operands, [](const dataflow::IntegerValueRangeLattice *lattice) {
-        return lattice->getValue();
-      });
-
   if (isa<arith::DivSIOp, arith::RemSIOp>(op)) {
-    if (!argIntValueRanges[0].isUninitialized() &&
-        !argIntValueRanges[1].isUninitialized())
+    if (!operands[0].isUninitialized() && !operands[1].isUninitialized())
       joinCallback(op->getResult(0),
-                   inferSignedDivRem(op, argIntValueRanges[0].getValue(),
-                                     argIntValueRanges[1].getValue()));
-    return success();
-  }
-
-  if (auto sliceOp = dyn_cast<triton::amdgpu::ExtractSliceOp>(op)) {
-    joinCallback(sliceOp->getResult(0), argIntValueRanges[0]);
+                   inferSignedDivRem(op, operands[0].getValue(),
+                                     operands[1].getValue()));
     return success();
   }
 
   if (auto inferrable = dyn_cast<InferIntRangeInterface>(op)) {
-    inferrable.inferResultRangesFromOptional(argIntValueRanges, joinCallback);
+    inferrable.inferResultRangesFromOptional(operands, joinCallback);
     return success();
   }
 

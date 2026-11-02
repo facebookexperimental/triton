@@ -123,19 +123,16 @@ struct TritonIntegerRangeAnalysis : dataflow::IntegerRangeAnalysis {
   /// @param[in] op: the Operation in question
   /// @param[in] result: a particular value defined by this op. Note that op
   ///            may define multiple values.
-  /// @param[in] srcLattices: lattices of all source operands
   /// @param[in] destLattices: lattices all all result values
   /// @param[in] incomingRange: the value-range inffered for result
   void defaultTransferFunc(
       Operation *op, Value result,
-      ArrayRef<const dataflow::IntegerValueRangeLattice *> srcLattices,
       ArrayRef<dataflow::IntegerValueRangeLattice *> destLattices,
       const IntegerValueRange &incomingRange);
 
 private:
   LogicalResult visitOperationHelper(
-      Operation *op,
-      ArrayRef<const dataflow::IntegerValueRangeLattice *> operands,
+      Operation *op, ArrayRef<IntegerValueRange> operands,
       ArrayRef<dataflow::IntegerValueRangeLattice *> resultsLattices);
 
   DominanceInfo *domInfo = nullptr;

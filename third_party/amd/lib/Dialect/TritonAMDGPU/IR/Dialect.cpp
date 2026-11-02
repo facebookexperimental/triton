@@ -642,6 +642,11 @@ std::optional<LinearLayout> ScaledDowncastFp8Op::computeScaleLayout(
   return computeScaledCastScaleLayout(outputLayout, axis, elementsPerScale);
 }
 
+void ExtractSliceOp::inferResultRangesFromOptional(
+    ArrayRef<IntegerValueRange> operands, SetIntLatticeFn setRange) {
+  setRange(getResult(), operands.front());
+}
+
 LogicalResult ExtractSliceOp::verify() {
   // Basic type/rank checks.
   auto srcTypeVal = getSource().getType();
