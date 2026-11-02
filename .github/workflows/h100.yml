@@ -44,10 +44,15 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - name: Tune Nvidia GPU
+        id: gpu_health
+        # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 6
         run: |
-          sudo nvidia-smi -pm 1
+          timeout 60 sudo nvidia-smi -pm 1
           sudo ldconfig
-          nvidia-smi
+          timeout 60 nvidia-smi
+          . "${SETUP_SCRIPT}"
+          timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
       - name: Install test dependencies
         run: |
           . "${SETUP_SCRIPT}"
@@ -104,6 +109,7 @@ jobs:
           bucket: h100-tlx-job-failed
           junit: /tmp/tlx-core.xml /tmp/tlx-correctness.xml
           budget: /tmp/tlx-core.xml=60 /tmp/tlx-correctness.xml=30
+          gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
           setup-script: ${{ env.SETUP_SCRIPT }}
 
   h100-runtime-test:
@@ -125,10 +131,15 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - name: Tune Nvidia GPU
+        id: gpu_health
+        # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 6
         run: |
-          sudo nvidia-smi -pm 1
+          timeout 60 sudo nvidia-smi -pm 1
           sudo ldconfig
-          nvidia-smi
+          timeout 60 nvidia-smi
+          . "${SETUP_SCRIPT}"
+          timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
       - name: Install test dependencies
         run: |
           . "${SETUP_SCRIPT}"
@@ -168,6 +179,7 @@ jobs:
           bucket: h100-runtime-job-failed
           junit: /tmp/runtime-unit.xml
           budget: /tmp/runtime-unit.xml=30
+          gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
           setup-script: ${{ env.SETUP_SCRIPT }}
 
   # File and close failure issues; ci-issues.yml decides which runs file.
