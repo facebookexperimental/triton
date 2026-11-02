@@ -645,7 +645,94 @@ LogicalResult MemDescReshapeOp::verify() {
   if (failed(inferReturnTypes(getContext(), getLoc(), srcType,
                               dstType.getShape(), expectedTy)))
     return failure();
-  return OpTrait::impl::verifyEquivalentMemDescType(expectedTy, dstType);
+  if (failed(OpTrait::impl::verifyEquivalentMemDescType(expectedTy, dstType)))
+    return emitError("expected result type ") << expectedTy;
+  return success();
+}
+
+// Infer the encoding of a reshaped partitioned view. Reshape the view's
+// (offset, partition) -> element mapping, then read the partition structure
+// back from it: the partition bases step along one dimension by the piece
+// size, and the remaining pieces along that dimension form the groups,
+// addressed by the top offset bits. The other offset bits describe
+// one piece. Padding depends only on the offset within a partition, so a padded
+// piece keeps its intervals; other pieces become shared-linear layouts.
+static LogicalResult
+inferPartitionedReshapeEncoding(ArrayRef<int64_t> srcShape,
+                                PartitionedSharedEncodingAttr enc,
+                                ArrayRef<int64_t> dstShape, Attribute &dstEnc) {
+  auto *ctx = enc.getContext();
+  // Reading pieces and groups back from basis bits assumes power-of-two
+  // shapes. NPOT views have modular layouts, whose bases add instead of XOR.
+  if (getNumCTAs(enc) != 1 || !llvm::all_of(srcShape, llvm::isPowerOf2_64) ||
+      !llvm::all_of(dstShape, llvm::isPowerOf2_64))
+    return failure();
+  LinearLayout dstLL = reshapeLayout(
+      ctx, toLinearLayoutIgnoringPadding(srcShape, enc), dstShape);
+  auto kOffset = StringAttr::get(ctx, "offset");
+  auto kBlock = StringAttr::get(ctx, "block");
+  auto kPartition = StringAttr::get(ctx, "partition");
+  if (!dstLL.hasInDim(kPartition))
+    return failure();
+
+  // The first partition basis is the start of partition 1's first piece,
+  // which gives the partition dimension and the piece size. The final layout
+  // comparison checks the remaining bases.
+  const auto &partitionBases = dstLL.getBases().lookup(kPartition);
+  if (partitionBases.empty())
+    return failure();
+  ArrayRef<int32_t> firstBasis = partitionBases.front();
+  auto nonZero = [](int32_t v) { return v != 0; };
+  if (llvm::count_if(firstBasis, nonZero) != 1)
+    return failure();
+  unsigned partitionDim =
+      llvm::find_if(firstBasis, nonZero) - firstBasis.begin();
+  int64_t pieceSize = firstBasis[partitionDim];
+  if (!llvm::isPowerOf2_64(pieceSize))
+    return failure();
+  unsigned numPartitions = enc.getNumPartitions();
+  int64_t numPieces = dstShape[partitionDim] / pieceSize;
+  if (numPieces % numPartitions != 0)
+    return failure();
+  unsigned numGroups = numPieces / numPartitions;
+
+  // The top offset bits select the group; the rest address one piece.
+  auto pieceOffsetBases = dstLL.getBases().lookup(kOffset);
+  unsigned groupBits = llvm::Log2_32(numGroups);
+  if (pieceOffsetBases.size() < groupBits)
+    return failure();
+  pieceOffsetBases.resize(pieceOffsetBases.size() - groupBits);
+  SmallVector<int64_t> pieceShape(dstShape);
+  pieceShape[partitionDim] = pieceSize;
+  SmallVector<std::pair<StringAttr, int32_t>> pieceOutDims;
+  for (auto [name, size] :
+       llvm::zip_equal(standardOutDimNames(ctx, dstShape.size()), pieceShape))
+    pieceOutDims.emplace_back(name, size);
+  LinearLayout::BasesT pieceBases;
+  pieceBases[kOffset] = std::move(pieceOffsetBases);
+  pieceBases[kBlock] = dstLL.hasInDim(kBlock)
+                           ? dstLL.getBases().lookup(kBlock)
+                           : std::vector<std::vector<int32_t>>{};
+  auto pieceLL = LinearLayout::tryCreate(std::move(pieceBases), pieceOutDims,
+                                         /*requireSurjective=*/true);
+  if (!pieceLL)
+    return failure();
+
+  SharedEncodingTrait pieceEnc;
+  if (auto padded =
+          dyn_cast<PaddedSharedEncodingAttr>(enc.getPartitionLayout()))
+    pieceEnc = PaddedSharedEncodingAttr::get(ctx, padded.getIntervals(),
+                                             padded.getPaddings(), *pieceLL);
+  else
+    pieceEnc = SharedLinearEncodingAttr::get(
+        ctx, *pieceLL,
+        cast<SharedEncodingTrait>(enc.getPartitionLayout()).getAlignment());
+  auto candidate = PartitionedSharedEncodingAttr::get(
+      ctx, numPartitions, numGroups, partitionDim, pieceEnc);
+  if (toLinearLayoutIgnoringPadding(dstShape, candidate) != dstLL)
+    return failure();
+  dstEnc = candidate;
+  return success();
 }
 
 static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
@@ -677,6 +764,11 @@ static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
         }
       }
     }
+  } else if (auto partitioned =
+                 dyn_cast<PartitionedSharedEncodingAttr>(srcEnc)) {
+    // The generic shared-linear fallback would drop the partition bases.
+    return inferPartitionedReshapeEncoding(srcShape, partitioned, dstShape,
+                                           dstEnc);
   } else if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(srcEnc)) {
     LinearLayout ll = padded.getLinearComponent();
     LinearLayout dst = reshapeLayout(ctx, ll, dstShape);
@@ -710,7 +802,8 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
   if (Attribute srcEnc = srcTy.getEncoding()) {
     if (failed(inferMemDescReshapeOpEncoding(srcTy.getShape(), srcEnc, dstShape,
                                              dstEncoding)))
-      return failure();
+      return emitOptionalError(loc, "cannot infer the encoding of a reshaped ",
+                               srcEnc, " shared memory view");
   }
 
   SmallVector<int64_t> dstAllocShape =

@@ -86,9 +86,9 @@ SmallVector<unsigned> distributeTDMWarps(ArrayRef<int64_t> blockShape,
 //   1. Start with numLogicalPieces warps along partitionDim (one per piece).
 //      If numWarps < numLogicalPieces, use all warps and emit multiple TDM
 //      instructions.
-//   2. Subdivide partition pieces along partitionDim (adding more warps), but
-//      ONLY when partitionDim is not the innermost dimension.
-//   3. Distribute remaining warps to non-partition, non-inner dimensions.
+//   2. Distribute the remaining warps outermost-first over the non-inner
+//      dimensions, subdividing partition pieces along partitionDim in turn,
+//      so that each warp's chunk is contiguous within its piece.
 //
 // The innermost dimension (numDims-1) is never subdivided beyond the initial
 // partition assignment.  TDM writes data as a linear element stream with LDS
@@ -103,8 +103,6 @@ std::pair<SmallVector<unsigned>, unsigned> distributeTDMWarpsAlignToPartition(
   unsigned numDims = blockShape.size();
   unsigned partitionDim = partitionedEnc.getPartitionDim();
   unsigned numLogicalPieces = partitionedEnc.getNumLogicalPieces();
-  int64_t pieceSize =
-      blockShape[partitionDim] / static_cast<int64_t>(numLogicalPieces);
   unsigned innerDim = numDims - 1;
 
   assert(partitionDim < numDims && "partitionDim out of range");
@@ -116,28 +114,20 @@ std::pair<SmallVector<unsigned>, unsigned> distributeTDMWarpsAlignToPartition(
   unsigned numTDMInstructions =
       llvm::divideCeil(numLogicalPieces, warpsAlongPartition);
 
-  // Subdivide partition pieces to absorb more warps, but only when
-  // partitionDim != innerDim.  Subdividing the innermost dimension would
-  // make the per-warp row width narrower than the inner layout row,
-  // misaligning TDM's linear padding with the shared memory row structure.
-  int remainingWarps = numWarps / warpsAlongPartition;
-  if (partitionDim != innerDim) {
-    while (remainingWarps >= 2 &&
-           pieceSize % ((warpsAlongPartition / numLogicalPieces) * 2) == 0 &&
-           static_cast<int64_t>(warpsAlongPartition * 2) <=
-               blockShape[partitionDim]) {
-      warpsAlongPartition *= 2;
-      remainingWarps /= 2;
-    }
-  }
-
   SmallVector<unsigned> warps(numDims, 1);
   warps[partitionDim] = warpsAlongPartition;
 
-  // Distribute remaining warps to non-partition, non-inner dimensions.
-  for (unsigned i = 0; i < numDims && remainingWarps > 1; ++i) {
-    if (i == partitionDim || i == innerDim)
-      continue;
+  // Spread the remaining warps outermost-first, as distributeTDMWarps does.
+  // TDM writes each warp's tile as one contiguous run in its partition piece,
+  // so a dimension may only be split once every outer dimension is down to
+  // one element per warp. Splitting the partition dimension first would give
+  // a warp rows from several outer slices of the piece, e.g. both groups of a
+  // [G, P * r, K] tile partitioned along dim 1, and write them contiguously.
+  // Never split the innermost dimension beyond the initial partition
+  // assignment: the per-warp row width would no longer match the inner
+  // layout's rows, misaligning TDM's linear padding.
+  int remainingWarps = numWarps / warpsAlongPartition;
+  for (unsigned i = 0; i < innerDim && remainingWarps > 1; ++i) {
     while (remainingWarps > 1 &&
            static_cast<int64_t>(warps[i] * 2) <= blockShape[i]) {
       warps[i] *= 2;

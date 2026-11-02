@@ -235,6 +235,21 @@ module attributes {"ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+// A descriptor that describes only one piece of a partitioned allocation
+// cannot place the other pieces, so it must carry the partitioned layout.
+#piece_layout = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [64, 64]}>
+#part_layout = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #piece_layout}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_load_partitioned_alloc_piece_descriptor(%desc: !tt.tensordesc<128x64xf16, #piece_layout>, %buf: !ttg.memdesc<128x64xf16, #part_layout, #smem, mutable>) {
+    // expected-error @+1 {{is inconsistent with the shared memory allocation layout}}
+    %token = amdg.async_tdm_copy_global_to_local %desc into %buf : !tt.tensordesc<128x64xf16, #piece_layout> -> !ttg.memdesc<128x64xf16, #part_layout, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // Matching padding alone does not make a transposed view TDM-compatible.
 #desc_layout = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
 #view_layout = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>

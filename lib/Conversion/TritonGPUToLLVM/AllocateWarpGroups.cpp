@@ -211,9 +211,8 @@ struct AllocateWarpGroups
       userMaxnreg = maxnregAttr.getInt();
     // Launch allocation assumed when neither the user nor fully explicit
     // partition requests determine it: the whole 64K register file.
-    int fallbackMaxnreg = (64 * 1024) /
-                          (baseNumWarps + numExtraWarpGroups * 4) /
-                          threadsPerWarp;
+    int fallbackMaxnreg =
+        (64 * 1024) / (baseNumWarps + numExtraWarpGroups * 4) / threadsPerWarp;
     fallbackMaxnreg = fallbackMaxnreg / 8 * 8;
 
     struct WarpGroupInfo {
@@ -305,8 +304,8 @@ struct AllocateWarpGroups
           totalRequestedRegs +=
               wg.maxRequestedRegs * (int)wg.numWarps * threadsPerWarp;
         int avgRegs = llvm::divideCeil(totalRequestedRegs, totalThreads);
-        computedMaxnreg = std::clamp<int>(llvm::divideCeil(avgRegs, 8) * 8,
-                                          24, std::max(24, fallbackMaxnreg));
+        computedMaxnreg = std::clamp<int>(llvm::divideCeil(avgRegs, 8) * 8, 24,
+                                          std::max(24, fallbackMaxnreg));
         if (userMaxnreg && *userMaxnreg != computedMaxnreg)
           op.emitWarning()
               << "ttg.maxnreg is inconsistent with fully specified partition "

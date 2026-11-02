@@ -7,7 +7,6 @@ from typing import Tuple, List, Dict, Callable, TypeVar, Optional
 import math
 import numpy as np
 import time
-from fractions import Fraction
 
 import triton
 import triton.language as tl
@@ -258,25 +257,6 @@ def _umulhi_64(a, b):
     return ((int(a) & mask) * (int(b) & mask)) >> 64
 
 
-def _fma_fp64(a, b, c):
-    # Numpy has no fused multiply-add, and float64 has no wider type to hold the
-    # product exactly, so round the exact rational value instead.
-    if math.isnan(a) or math.isnan(b) or math.isnan(c) or math.isinf(a) or math.isinf(b):
-        return a * b + c
-    if math.isinf(c):
-        return c
-    exact = Fraction(a) * Fraction(b) + Fraction(c)
-    if exact == 0:
-        # Only zero operands can make this a negative zero.
-        return a * b + c if a * b == 0.0 and c == 0.0 else 0.0
-    sign = 1.0 if exact > 0 else -1.0
-    try:
-        ret = float(exact)
-    except OverflowError:
-        return math.copysign(math.inf, sign)
-    return ret if ret != 0.0 else math.copysign(0.0, sign)
-
-
 def _e8m0_to_f32(scale):
     assert scale.dtype in (np.uint8, np.int8)
     scale = scale.astype(np.uint8)
@@ -344,6 +324,55 @@ def _unpack_e2m1(data, axis):
     return np.moveaxis(unpacked, -1, axis)
 
 
+def _unpack_fp6_to_u6(data):
+    # Operand tensors count logical values: the leading 3/4 of the packed
+    # dim hold dense bytes (groups of 16 codes per 12 bytes; within a
+    # group, code i is in bits [6*i, 6*i+6)); the trailing quarter is
+    # masked-load padding. Global storage itself is dense; kernels
+    # expand it to this width on load.
+    assert data.dtype == np.uint8
+    # Logical K follows the MXFP6Tensor storage contract (groups of 16
+    # values), same as the frontend and IR verifiers.
+    assert data.shape[-1] % 16 == 0
+    data = data[..., :data.shape[-1] * 3 // 4]
+    grouped = data.reshape(data.shape[:-1] + (data.shape[-1] // 3, 3))
+    b0 = grouped[..., 0].astype(np.uint16)
+    b1 = grouped[..., 1].astype(np.uint16)
+    b2 = grouped[..., 2].astype(np.uint16)
+    codes = np.empty(data.shape[:-1] + (grouped.shape[-2] * 4, ), dtype=np.uint8)
+    codes[..., 0::4] = b0 & np.uint16(0x3F)
+    codes[..., 1::4] = ((b0 >> np.uint16(6)) | (b1 << np.uint16(2))) & np.uint16(0x3F)
+    codes[..., 2::4] = ((b1 >> np.uint16(4)) | (b2 << np.uint16(4))) & np.uint16(0x3F)
+    codes[..., 3::4] = (b2 >> np.uint16(2)) & np.uint16(0x3F)
+    return codes
+
+
+def _fp6_to_f32(codes, num_exp_bits, bias):
+    # OCP MX FP6: no Inf/NaN encodings; subnormals supported.
+    assert codes.dtype == np.uint8
+    codes = codes.astype(np.int32)
+    num_mant_bits = 5 - num_exp_bits
+    signs = (codes >> 5) != 0
+    exp = (codes >> num_mant_bits) & ((1 << num_exp_bits) - 1)
+    mant = (codes & ((1 << num_mant_bits) - 1)).astype(np.float32)
+    scale = np.float32(2.0)**(exp - bias).astype(np.float32)
+    sub_scale = np.float32(2.0)**np.float32(1 - bias)
+    values = np.where(exp != 0, (np.float32(1.0) + mant / np.float32(1 << num_mant_bits)) * scale,
+                      (mant / np.float32(1 << num_mant_bits)) * sub_scale)
+    return np.where(signs, -values, values)
+
+
+def _unpack_fp6(data, axis, format_enum):
+    data = np.moveaxis(data, axis, -1)
+    codes = _unpack_fp6_to_u6(data)
+    if format_enum == _ir.ScaleDotElemTypeTY.E2M3:
+        unpacked = _fp6_to_f32(codes, 2, 1)
+    else:
+        assert format_enum == _ir.ScaleDotElemTypeTY.E3M2
+        unpacked = _fp6_to_f32(codes, 3, 3)
+    return np.moveaxis(unpacked, -1, axis)
+
+
 def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack, is_rhs):
     if format_enum == _ir.ScaleDotElemTypeTY.E2M1:
         if is_rhs:
@@ -351,6 +380,10 @@ def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack,
         else:
             unpack_axis = -1 if k_pack else -2
         value = _unpack_e2m1(value_handle.data, unpack_axis)
+    elif format_enum in (_ir.ScaleDotElemTypeTY.E2M3, _ir.ScaleDotElemTypeTY.E3M2):
+        assert k_pack, "interpreter: fp6 only supports K-packed inputs"
+        unpack_axis = -2 if is_rhs else -1
+        value = _unpack_fp6(value_handle.data, unpack_axis, format_enum)
     else:
         value = _mxfp_value_handle_to_float32(value_handle)
 
@@ -372,7 +405,6 @@ def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack,
 np_erf_fp32 = np.vectorize(_erf, otypes=[np.float32])
 np_erf_fp64 = np.vectorize(_erf, otypes=[np.float64])
 np_umulhi_u64 = np.vectorize(_umulhi_64, otypes=[np.uint64])
-np_fma_fp64 = np.vectorize(_fma_fp64, otypes=[np.float64])
 
 
 class ExtraFunctions:
@@ -536,16 +568,19 @@ class InterpreterBuilder:
         return TensorHandle(np.array([self.grid_dim[axis]], dtype=np.int32), tl.int32)
 
     # memory ops
-    def create_load(self, ptr, _0, _1, is_volatile):
+    def get_cache_policy(self, cache_modifier, eviction_policy):
+        return None
+
+    def create_load(self, ptr, cache_policy, is_volatile):
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
         other = None
-        return self.create_masked_load(ptr, mask, other, _0, _1, is_volatile)
+        return self.create_masked_load(ptr, mask, other, cache_policy, is_volatile)
 
-    def create_store(self, ptr, val, _0, _1):
+    def create_store(self, ptr, val, cache_policy):
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
-        return self.create_masked_store(ptr, val, mask, None, None)
+        return self.create_masked_store(ptr, val, mask, cache_policy)
 
-    def create_masked_load(self, ptrs, mask, other, cache_modifier, eviction_policy, is_volatile):
+    def create_masked_load(self, ptrs, mask, other, cache_policy, is_volatile):
         dtype_tt = ptrs.get_element_ty()
         dtype_np = _get_np_dtype(dtype_tt)
         if other is None:
@@ -553,7 +588,7 @@ class InterpreterBuilder:
         ret = _interpreter.load(ptrs.data, mask.data, other.data, dtype_np)
         return TensorHandle(ret, dtype_tt)
 
-    def create_masked_store(self, ptrs, value, mask, cache_modifier, eviction_policy):
+    def create_masked_store(self, ptrs, value, mask, cache_policy):
         return _interpreter.store(ptrs.data, value.data, mask.data)
 
     # casting ops
@@ -708,10 +743,12 @@ class InterpreterBuilder:
 
     def create_fma(self, x, y, z):
         # An fma rounds once, but multiplying and then adding rounds twice.
-        # float64 has the precision to round the narrower types correctly.
+        # float64 intermediate rounding is safe for float16, but not float32.
         dtype = z.data.dtype
         if dtype == np.float64:
-            ret = np_fma_fp64(x.data, y.data, z.data)
+            ret = _interpreter.fma_fp64(*np.broadcast_arrays(x.data, y.data, z.data))
+        elif dtype == np.float32:
+            ret = _interpreter.fma_fp32(*np.broadcast_arrays(x.data, y.data, z.data))
         else:
             product = np.multiply(x.data, y.data, dtype=np.float64)
             ret = np.add(product, z.data, dtype=np.float64).astype(dtype)
@@ -836,13 +873,19 @@ class InterpreterBuilder:
         sem = self.ir_sem_to_interpreter_sem[sem]
         return TensorHandle(_interpreter.atomic_cas(ptr.data, cmp.data, val.data, sem), cmp.dtype.scalar)
 
+    def create_atomic_load(self, ptr, mask, sem, scope):
+        return self.create_masked_load(ptr, mask, None, None, None, True)
+
+    def create_atomic_store(self, ptr, val, mask, sem, scope):
+        return self.create_masked_store(ptr, val, mask, None, None)
+
     def create_atomic_poll(self, ptr, expected, timeout_ns, sem, scope):
         matched = np.zeros(ptr.data.shape, dtype=np.bool_)
         start_ns = time.perf_counter_ns() if timeout_ns is not None else None
         for index in np.ndindex(ptr.data.shape):
             element_ptr = TensorHandle(np.asarray(ptr.data[index]), ptr.dtype)
             while True:
-                value = self.create_load(element_ptr, None, None, True)
+                value = self.create_load(element_ptr, None, True)
                 if value.data.item() == expected.data[index]:
                     matched[index] = True
                     break
@@ -904,8 +947,7 @@ class InterpreterBuilder:
         desc.validate()
         return desc
 
-    def create_descriptor_load(self, desc: TensorDescHandle, indices: List[TensorHandle], cache_modifier,
-                               eviction_policy, multicast=None):
+    def create_descriptor_load(self, desc: TensorDescHandle, indices: List[TensorHandle], cache_policy, multicast=None):
         assert isinstance(desc, TensorDescHandle)
         ptrs, mask = desc.materialize_pointers(indices)
         dtype_tt = ptrs.get_element_ty()
@@ -917,22 +959,20 @@ class InterpreterBuilder:
             other = TensorHandle(np.full_like(ptrs.data, float('nan'), dtype=dtype_np), dtype_tt)
         else:
             raise ValueError(f"unsupported padding {padding}")
-        return self.create_masked_load(ptrs, mask, other, cache_modifier=cache_modifier,
-                                       eviction_policy=eviction_policy, is_volatile=False)
+        return self.create_masked_load(ptrs, mask, other, cache_policy=cache_policy, is_volatile=False)
 
     def create_descriptor_store(self, desc: TensorDescHandle, value: TensorHandle, indices: List[TensorHandle]):
         ptrs, mask = desc.materialize_pointers(indices)
-        return self.create_masked_store(ptrs, value, mask, None, None)
+        return self.create_masked_store(ptrs, value, mask, None)
 
     def create_descriptor_gather(self, desc: TensorDescHandle, x_offsets: TensorHandle, y_offset: TensorHandle, type):
         dtype = desc.base.dtype.element_ty
         np_dtype = _get_np_dtype(dtype)
         result = np.zeros([x_offsets.data.shape[0], desc.block_shape[-1]], dtype=np_dtype)
-        cache_modifier = None
-        eviction_policy = None
+        cache_policy = None
         for i, x_offset in enumerate(x_offsets.data):
             indices = [TensorHandle(x_offset, tl.int32), y_offset]
-            result[i, :] = self.create_descriptor_load(desc, indices, cache_modifier, eviction_policy).data
+            result[i, :] = self.create_descriptor_load(desc, indices, cache_policy).data
         return TensorHandle(result, dtype)
 
     def create_descriptor_scatter(self, desc: TensorDescHandle, value: TensorHandle, x_offsets: TensorHandle,

@@ -144,13 +144,13 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
       llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(descLayout);
   auto allocPartitioned =
       llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(allocLayout);
+  // A partitioned allocation needs the same partitioned descriptor layout: TDM
+  // lowering places each warp's tile through the descriptor's layout, so a
+  // descriptor that describes only one piece writes the wrong LDS locations.
+  // Every check below therefore compares against the full allocation layout.
   Attribute effectiveAllocLayout = allocLayout;
-  if (!descPartitioned && allocPartitioned)
-    effectiveAllocLayout = allocPartitioned.getPartitionLayout();
 
-  bool compatible =
-      descLayout == allocLayout || (!descPartitioned && allocPartitioned &&
-                                    descLayout == effectiveAllocLayout);
+  bool compatible = descLayout == allocLayout;
   std::optional<LinearLayout> rankReducedDescLayout;
   // Rank-reducing descriptor loads drop leading unit dimensions from the
   // allocation, so compare the projected physical layout with the allocation.
@@ -1842,7 +1842,8 @@ LogicalResult AsyncCopyLocalToGlobalOp::verify() {
   if (!isa<gpu::SharedMemorySpaceAttr>(srcTy.getMemorySpace()))
     return emitOpError("source must be in shared memory");
 
-  return success();
+  return triton::verifyCachePolicy(getOperation(), getCachePolicyAttr(),
+                                   triton::CachePolicyOperation::Store);
 }
 
 LogicalResult AsyncTDMFusedCopyGlobalToLocalOp::verify() {

@@ -317,23 +317,21 @@ def BufferLoadOp
       with the given layout and mask.
       This allows to use buffer_load even if the alignment cannot be proven based on IR.
     }];
-  let arguments =
-      (ins Arg<TT_Ptr, "Global memory scalar base pointer to load from",
-               [MemRead<GlobalMemory>]>:$ptr,
-          I32Tensor:$offsets, Optional<I32>:$stride,
-          DefaultValuedAttr<TT_CacheModifierAttr,
-                            "::mlir::triton::CacheModifier::NONE">:$cache,
-          DefaultValuedAttr<TT_EvictionPolicyAttr,
-                            "triton::EvictionPolicy::NORMAL">:$evict,
-          Optional<TT_BoolTensor>:$mask, Optional<TT_Tensor>:$other,
-          DefaultValuedAttr<I32Attr, "1">:$contiguity);
+  let arguments = (ins
+      Arg<TT_Ptr, "Global memory scalar base pointer to load from", [MemRead<GlobalMemory>]>:$ptr,
+      I32Tensor:$offsets,
+      Optional<I32>:$stride,
+      OptionalAttr<AnyAttr>:$cachePolicy,
+      Optional<TT_BoolTensor>:$mask,
+      Optional<TT_Tensor>:$other,
+      DefaultValuedAttr<I32Attr, "1">:$contiguity
+    );
   let results = (outs TT_Tensor:$result);
 
   let hasVerifier = 1;
 
   let assemblyFormat = [{
       $ptr `[` $offsets `]` (`,` $mask^)? (`,` $other^)?
-      oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
       (`stride` `=` $stride^)?
       attr-dict `:` qualified(type($ptr)) `->` type($result)
     }];
@@ -371,26 +369,23 @@ def BufferLoadToLocalOp
       elements available in the final offsets and mask layout. This allows
       buffer_load_to_local to vectorize when alignment or mask uniformity cannot be proven from the IR.
     }];
-  let arguments =
-      (ins Arg<
-           TTG_MemDescType,
-           "Shared memory slice to write to", GenericSharedWrite>:$dest,
-          Arg<TT_Ptr, "Global memory scalar base pointer to load from",
-              [MemRead<GlobalMemory>]>:$ptr,
-          I32Tensor:$offsets, Optional<TT_BoolTensor>:$mask,
-          Optional<TT_Tensor>:$other, Optional<I32>:$stride,
-          DefaultValuedAttr<TT_CacheModifierAttr,
-                            "::mlir::triton::CacheModifier::NONE">:$cache,
-          DefaultValuedAttr<TT_EvictionPolicyAttr,
-                            "triton::EvictionPolicy::NORMAL">:$evict,
-          DefaultValuedAttr<I32Attr, "1">:$contiguity);
+  let arguments = (ins
+      Arg<TTG_MemDescType, "Shared memory slice to write to", GenericSharedWrite>:$dest,
+      Arg<TT_Ptr, "Global memory scalar base pointer to load from", [MemRead<GlobalMemory>]>:$ptr,
+      I32Tensor:$offsets,
+      Optional<TT_BoolTensor>:$mask,
+      Optional<TT_Tensor>:$other,
+      Optional<I32>:$stride,
+      OptionalAttr<AnyAttr>:$cachePolicy,
+      DefaultValuedAttr<I32Attr, "1">:$contiguity
+    );
   let results = (outs TTG_AsyncToken:$token);
 
   let hasVerifier = 1;
 
   let assemblyFormat = [{
       $ptr `[` $offsets `]` (`mask` `=` $mask^)? (`other` `=` $other^)? (`stride` `=` $stride^)?
-      oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict) `into` $dest
+      oilist(`cachePolicy` `=` $cachePolicy) `into` $dest
       attr-dict `:` qualified(type($ptr)) `[` type($offsets) `]` type($other) `->` type($dest)
     }];
 }
@@ -543,20 +538,17 @@ def BufferStoreOp
       with the given layout and mask.
       This allows to use buffer_store even if the alignment cannot be proven based on IR.
     }];
-  let arguments = (ins TT_Tensor:$value,
-      Arg<TT_Ptr, "Global memory scalar base pointer to write to",
-          [MemWrite<GlobalMemory>]>:$ptr,
-      I32Tensor:$offsets, Optional<I32>:$stride,
-      DefaultValuedAttr<TT_CacheModifierAttr,
-                        "mlir::triton::CacheModifier::NONE">:$cache,
-      DefaultValuedAttr<TT_EvictionPolicyAttr,
-                        "triton::EvictionPolicy::NORMAL">:$evict,
+  let arguments = (ins
+      TT_Tensor:$value,
+      Arg<TT_Ptr, "Global memory scalar base pointer to write to", [MemWrite<GlobalMemory>]>:$ptr,
+      I32Tensor:$offsets,
+      Optional<I32>:$stride,
+      OptionalAttr<AnyAttr>:$cachePolicy,
       Optional<TT_BoolTensor>:$mask,
       DefaultValuedAttr<I32Attr, "1">:$contiguity);
 
   let assemblyFormat = [{
       $value `,` $ptr `[` $offsets `]` (`,` $mask^)?
-      oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
       (`stride` `=` $stride^)?
       attr-dict `:` qualified(type($ptr)) `->` type($value)
     }];
@@ -1149,20 +1141,19 @@ def AsyncCopyLocalToGlobalOp
     This allows op to use async_copy_local_to_global even if the alignment cannot be proven based on IR.
   }];
 
-  let arguments = (ins Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
-      Arg<TT_PtrTensor, "", [MemWrite<GlobalMemory>]>:$dst,
-      Optional<I1Tensor>:$mask,
-      DefaultValuedAttr<TT_CacheModifierAttr,
-                        "triton::CacheModifier::NONE">:$cache,
-      DefaultValuedAttr<TT_EvictionPolicyAttr,
-                        "triton::EvictionPolicy::NORMAL">:$evict,
-      DefaultValuedAttr<I32Attr, "1">:$contiguity);
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
+    Arg<TT_PtrTensor, "", [MemWrite<GlobalMemory>]>:$dst,
+    Optional<I1Tensor>:$mask,
+    OptionalAttr<AnyAttr>:$cachePolicy,
+    DefaultValuedAttr<I32Attr, "1">:$contiguity
+  );
 
   let results = (outs TTG_AsyncToken:$token);
 
   let assemblyFormat = [{
     $src `,` $dst (`mask` $mask^)?
-    oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
+    oilist(`cachePolicy` `=` $cachePolicy)
     attr-dict `:` qualified(type($src)) `->` type($dst)
   }];
 }

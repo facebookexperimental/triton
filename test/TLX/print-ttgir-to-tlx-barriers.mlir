@@ -105,6 +105,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
+  // A constant-true predicate is left out: inlined it would be the Python
+  // literal `True`, which barrier_arrive cannot take a handle from. AutoWS
+  // attaches one to unconditional releases.
+  // CHECK-LABEL: def arrive_with_constant_true(
+  // CHECK: tlx.barrier_arrive({{[a-z_0-9]+}})
+  tt.func public @arrive_with_constant_true() attributes {noinline = false} {
+    %true = arith.constant true
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 1, %true : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+
   // A perThread arrive needs no keyword: barrier_arrive picks the per-thread
   // lowering off the barrier, which alloc_warp_barrier restores.
   // CHECK-LABEL: def per_thread_arrive(

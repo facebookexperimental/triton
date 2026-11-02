@@ -2596,7 +2596,7 @@ void printSimplifiedOp(
     int64_t count = countAttr ? countAttr.getInt() : 1;
     if (count != 1)
       os << ", " << count;
-    if (op->getNumOperands() >= 2)
+    if (op->getNumOperands() >= 2 && !isConstantTrue(op->getOperand(1)))
       os << ", pred=" << getValueName(op->getOperand(1), argSubstitutionMap);
     os << ")";
     printLocComment(op, os);
@@ -2732,6 +2732,13 @@ void printSimplifiedOp(
   if (auto barrier = dyn_cast<ttg::BarrierOp>(op)) {
     if (isAMDTarget(op) && barrier.getAddrSpace() == ttg::AddrSpace::Local) {
       os << "tlx.workgroup_barrier()";
+      printLocComment(op, os);
+      return;
+    }
+    // tl.debug_barrier fences every address space, so it covers any subset;
+    // warp specialization uses this to publish its barrier inits.
+    if (!isAMDTarget(op)) {
+      os << "tl.debug_barrier()";
       printLocComment(op, os);
       return;
     }

@@ -611,6 +611,9 @@ class nvidia_knobs(base_knobs):
     ptxas_options: env_opt_str = env_opt_str("PTXAS_OPTIONS")
     mock_ptx_version: env_opt_str = env_opt_str("TRITON_MOCK_PTX_VERSION")
     dump_ptxas_log: env_bool = env_bool("TRITON_DUMP_PTXAS_LOG")
+    # Keep real source paths in PTX .file directives instead of virtualizing them
+    # to <source>/<basename>, so profilers like ncu can resolve the source files.
+    preserve_ptx_source_paths: env_bool = env_bool("TRITON_PRESERVE_PTX_SOURCE_PATHS")
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
