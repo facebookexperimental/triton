@@ -4662,7 +4662,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
-
 // -----
 
 // We previously had a bug where we did not correctly track values with multiple

@@ -395,8 +395,9 @@ struct Transform2CTALoads
         getCompatibleEncoding(origEncoding, newBlockShape, splitDim, ctx);
     auto halfResultType =
         RankedTensorType::get(newBlockShape, elemType, newEncoding);
-    auto newDescLoad = tt::DescriptorLoadOp::create(
-        builder, loc, halfResultType, newDesc, newIndices);
+    auto newDescLoad =
+        tt::DescriptorLoadOp::create(builder, loc, halfResultType, newDesc,
+                                     newIndices, descLoad.getCachePolicyAttr());
     newDescLoad->setAttr("two_cta_b", builder.getUnitAttr());
 
     builder.setInsertionPoint(lhsAlloc);
@@ -548,8 +549,9 @@ struct Transform2CTALoads
     auto halfResultType =
         RankedTensorType::get(newResultShape, elemType, newEncoding);
 
-    auto newDescLoad = tt::DescriptorLoadOp::create(
-        builder, loc, halfResultType, newDesc, newIndices);
+    auto newDescLoad =
+        tt::DescriptorLoadOp::create(builder, loc, halfResultType, newDesc,
+                                     newIndices, descLoad.getCachePolicyAttr());
     // Mark as a 2-CTA B-operand load so WS passes can identify it
     // without complex value tracing through pipeline buffers.
     newDescLoad->setAttr("two_cta_b", builder.getUnitAttr());

@@ -17,11 +17,11 @@ namespace ttng = mlir::triton::nvidia_gpu;
 
 bool isCrossCTALoadStore(ttg::MemDescType memDescTy, RankedTensorType regTy) {
   auto kRegister = StringAttr::get(memDescTy.getContext(), "register");
+  auto kBlock = StringAttr::get(memDescTy.getContext(), "block");
   LinearLayout regLayout =
       ttg::toLinearLayout(regTy).removeZeroBasesAlongDim(kRegister);
-  LinearLayout conversion = invertAndComposeBlockLocal(
-      ttg::toLinearLayoutIgnoringPadding(memDescTy), regLayout);
-  auto kBlock = StringAttr::get(memDescTy.getContext(), "block");
+  LinearLayout conversion = invertAndComposeLocal(
+      ttg::toLinearLayoutIgnoringPadding(memDescTy), regLayout, {kBlock});
   return !conversion.isIdentityOnOutDim(kBlock);
 }
 
@@ -53,7 +53,7 @@ bool isCrossCTAGatherScatter(ttg::MemDescType memDescTy, RankedTensorType regTy,
                                axisDim);
   indexedLayout = indexedLayout.transposeOuts(allDims);
   LinearLayout conversion =
-      invertAndComposeBlockLocal(sharedLayout, indexedLayout);
+      invertAndComposeLocal(sharedLayout, indexedLayout, {kBlock});
   return !conversion.isIdentityOnOutDim(kBlock);
 }
 

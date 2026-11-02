@@ -168,9 +168,10 @@ static unsigned dsWriteCountOf(Operation *op) {
 
   LinearLayout regLayout = triton::gpu::toLinearLayout(regTy);
   LinearLayout cvt = LinearLayout::empty();
+  StringAttr kBlock = StringAttr::get(op->getContext(), "block");
   if (triton::gpu::isPaddedEncoding(memTy.getEncoding())) {
-    cvt = triton::invertAndComposeBlockLocal(
-        triton::gpu::paddedLinearLayout(memTy), regLayout);
+    cvt = triton::invertAndComposeLocal(triton::gpu::paddedLinearLayout(memTy),
+                                        regLayout, {kBlock});
   } else {
     LinearLayout sharedLayout = triton::gpu::toLinearLayout(memTy);
     if (regLayout.isModular()) {
@@ -183,7 +184,7 @@ static unsigned dsWriteCountOf(Operation *op) {
       regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
                                /*requireSurjective=*/false);
     }
-    cvt = triton::invertAndComposeBlockLocal(sharedLayout, regLayout);
+    cvt = triton::invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
   }
   cvt = triton::actionRemoveBroadcastedRegs(cvt).apply(cvt);
   std::optional<int> maxVec;

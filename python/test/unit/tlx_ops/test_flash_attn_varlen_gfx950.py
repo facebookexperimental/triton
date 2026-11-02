@@ -102,13 +102,17 @@ def test_flash_attn_varlen_split_plan():
                 assert bh * (items_per_bh - num_m_blocks) <= MAX_PARTIALS
 
 
+@pytest.mark.parametrize("big_block_n_max_split", [0, 1 << 30])
 @pytest.mark.parametrize(
     "lengths,heads,kv_heads",
     [([1000], 1, 1), ([1000] * 10, 1, 1), ([1200] * 10, 1, 1), ([700, 1200, 950, 801, 1100, 760, 1000], 1, 1),
      ([1000, 640], 4, 2)],
 )
-def test_flash_attn_varlen_causal_split(lengths, heads, kv_heads):
-    """Causal shapes whose query tiles are split by key range and merged."""
+def test_flash_attn_varlen_causal_split(lengths, heads, kv_heads, big_block_n_max_split, monkeypatch):
+    """Causal shapes whose query tiles are split by key range and merged, with 64- and 128-key blocks."""
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950
+
+    monkeypatch.setattr(gfx950, "BIG_BLOCK_N_MAX_SPLIT", big_block_n_max_split)
     torch.manual_seed(20)
     _check(lengths, lengths, True, heads=heads, kv_heads=kv_heads)
 

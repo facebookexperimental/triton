@@ -3107,6 +3107,11 @@ LogicalResult DotOperandEncodingAttr::verify(
     return success();
   }
 
+  // Accept any MMA-like parent by interface, so an out-of-tree matmul layout
+  // can be a valid dot-operand parent without being enumerated here.
+  if (mlir::isa<MmaEncodingTrait>(parent))
+    return success();
+
   return emitError() << "ttg.dot_op unexpected parent layout: " << parent;
 }
 
@@ -3721,6 +3726,13 @@ struct TritonGPUInferLayoutInterface
     }
     if (!expected || !got)
       return failure();
+    // Padded encodings, including partitioned ones that wrap a padded piece,
+    // are uniqued by their padding and linear component, so equivalent
+    // layouts are identical attributes. They also have no padding-aware
+    // linear layout to compare.
+    if (isPaddedEncoding(expected) || isPaddedEncoding(got))
+      return emitOptionalError(loc, "Expected result encoding ", expected,
+                               " but was ", got);
 
     auto expectedLL =
         toLinearLayout(shape, cast<LayoutEncodingTrait>(expected));

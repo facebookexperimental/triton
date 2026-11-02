@@ -15,6 +15,10 @@
 #include "triton/Dialect/Triton/IR/Dialect.h.inc"
 #include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/Triton/IR/OpsEnums.h.inc"
+
+#define GET_ATTRDEF_CLASSES
+#include "triton/Dialect/Triton/IR/AttrDefs.h.inc"
+
 #include "triton/Dialect/Triton/IR/Traits.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 
@@ -28,6 +32,26 @@ struct GlobalMemory : public SideEffects::Resource::Base<GlobalMemory> {
   StringRef getName() const final { return "<GlobalMemory>"; }
   SideEffects::Resource *getParent() const override { return nullptr; }
 };
+
+enum class CachePolicyOperation { Load, Store };
+
+// Allows memory operations to validate cache policy attributes without
+// depending on the dialect that defines the policy.
+class DialectCachePolicyInterface
+    : public DialectInterface::Base<DialectCachePolicyInterface> {
+public:
+  DialectCachePolicyInterface(Dialect *dialect) : Base(dialect) {}
+
+  virtual LogicalResult
+  verifyCachePolicy(Attribute cachePolicy, CachePolicyOperation operation,
+                    function_ref<InFlightDiagnostic()> emitError) const = 0;
+};
+
+LogicalResult verifyCacheModifier(CacheModifier modifier,
+                                  CachePolicyOperation operation,
+                                  function_ref<InFlightDiagnostic()> emitError);
+LogicalResult verifyCachePolicy(Operation *op, Attribute cachePolicy,
+                                CachePolicyOperation operation);
 
 class DialectInferLayoutInterface
     : public DialectInterface::Base<DialectInferLayoutInterface> {
@@ -131,6 +155,12 @@ LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
 LogicalResult verifyDescriptorLoadStoreOp(Operation *op,
                                           TensorDescInterface desc,
                                           ShapedType tensor);
+
+// True for the MXFP6 scale element types (OCP FP6 e2m3/e3m2), which share
+// the dense-packed K contract in the scaled-dot verifiers.
+inline bool isMXFP6ScaleType(ScaleDotElemType type) {
+  return type == ScaleDotElemType::E2M3 || type == ScaleDotElemType::E3M2;
+}
 
 LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
                                 std::optional<ArrayRef<int64_t>> lhsScaleShape,

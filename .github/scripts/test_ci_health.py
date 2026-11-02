@@ -209,7 +209,7 @@ def test_render_writes_every_section(tmp_path):
     page = (out / "index.html").read_text()
     data = json.loads((out / "data.json").read_text())
     assert 'fetch("data.json"' in page and 'data-tab="ops"' in page
-    assert data["asof"] == "2026-10-12T02:00:00Z" and set(data) == {"asof", "branches"}
+    assert data["asof"] == "2026-10-12T02:00:00Z" and set(data) == {"asof", "branches", "occupancy"}
 
 
 def test_render_survives_bench_failure(tmp_path, monkeypatch):

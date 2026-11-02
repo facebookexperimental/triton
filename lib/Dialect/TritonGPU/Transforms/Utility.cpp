@@ -176,9 +176,7 @@ getOrderFromContiguity(const SmallVector<int64_t> &arr) {
 Value getMemAccessPtr(Operation *op) {
   if (auto ld = dyn_cast<triton::LoadOp>(op))
     return ld.getPtr();
-  if (auto atomic = dyn_cast<triton::AtomicRMWOp>(op))
-    return atomic.getPtr();
-  if (auto atomic = dyn_cast<triton::AtomicCASOp>(op))
+  if (auto atomic = dyn_cast<triton::AtomicOpInterface>(op))
     return atomic.getPtr();
   if (auto copy = dyn_cast<triton::gpu::AsyncCopyGlobalToLocalOp>(op))
     return copy.getSrc();
@@ -197,6 +195,8 @@ unsigned getElementBitWidth(RankedTensorType type) {
 
 static std::optional<unsigned>
 getAtomicWriteElementsPerThreadCap(Operation *op) {
+  if (isa<triton::AtomicLoadOp, triton::AtomicStoreOp>(op))
+    return 1;
   if (isa<triton::AtomicCASOp>(op))
     return 1;
 
@@ -850,7 +850,7 @@ bool canBeRematerialized(Operation *op) {
     return !isExpensiveLoadOrStore(op);
   if (isa<ttg::LocalLoadOp>(op))
     return !isExpensiveLocalLoad(op);
-  if (isa<AtomicRMWOp, AtomicCASOp, DotOpInterface>(op))
+  if (isa<AtomicOpInterface, DotOpInterface>(op))
     return false;
   if (auto gather = dyn_cast<GatherOp>(op))
     return !gather.getEfficientLayout();

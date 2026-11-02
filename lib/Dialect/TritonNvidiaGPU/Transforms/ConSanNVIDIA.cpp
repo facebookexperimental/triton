@@ -171,7 +171,8 @@ public:
     if (!info) {
       if (!isa<ttng::BarrierExpectOp, ttng::TCGen5CommitOp,
                ttng::ArriveBarrierOp, ttng::TMEMShiftOp, ttng::AsyncTMAGatherOp,
-               ttng::AsyncTMACopyGlobalToLocalOp, ttng::CLCTryCancelOp>(op))
+               ttng::AsyncTMACopyGlobalToLocalOp, ttng::CLCTryCancelOp,
+               ttng::AsyncCopyMbarrierArriveOp>(op))
         return std::nullopt;
       info.emplace();
       info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
@@ -321,6 +322,13 @@ public:
       info->barriers.push_back(
           {arriveOp.getBarrier(), nullptr, (int)arriveOp.getCount()});
     }
+    if (auto arriveOp = dyn_cast<ttng::AsyncCopyMbarrierArriveOp>(op)) {
+      int count = arriveOp.getNoIncrement() ? ttg::lookupNumWarps(op) * 32 : 0;
+      info->barriers.push_back(
+          {arriveOp.getBarrier(), nullptr, count,
+           MemEffectsOpInfo::BarrierTrackingMode::AsyncCopies});
+    }
+
     if (!namedOperands.empty()) {
       SmallVector<MemEffectsOpInfo::Effects> effects;
       for (auto [value, name] : namedOperands)

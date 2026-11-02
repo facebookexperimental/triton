@@ -399,6 +399,26 @@ TEST_F(LinearLayoutTest, InvertAndCompose_Simple) {
   EXPECT_EQ(composition.compose(l2), l1);
 }
 
+TEST_F(LinearLayoutTest, InvertAndCompose_OverlappingIdentityDims) {
+  auto layout = [&](int warpBasis) {
+    return LinearLayout({{S("register"), {{32}}},
+                         {S("lane"), {{1}, {2}, {4}, {8}, {16}}},
+                         {S("warp"), {{warpBasis}, {128}}},
+                         {S("block"), {}}},
+                        {S("dim0")});
+  };
+  auto src = layout(64);
+  auto dst = layout(96);
+  EXPECT_EQ(dst.invertAndCompose(src).compose(src), dst);
+  EXPECT_EQ(src.invertAndCompose(dst).compose(dst), src);
+}
+
+TEST_F(LinearLayoutTest, Invert_UnitInputDim) {
+  LinearLayout layout({{S("x"), {{1}}}, {S("unit"), {}}}, {S("x")});
+  EXPECT_EQ(layout.invert(),
+            LinearLayout({{S("x"), {{1, 0}}}}, {S("x"), S("unit")}));
+}
+
 TEST_F(LinearLayoutTest, Lstsq) {
   LinearLayout superset({{S("storage"), {{1, 1}, {2, 0}}}},
                         {{S("x"), 4}, {S("y"), 2}},
@@ -590,7 +610,7 @@ TEST_F(LinearLayoutTest, InvertAndComposeBlockLocal) {
 
   EXPECT_FALSE(
       regLayout.invertAndCompose(memLayout).isIdentityOnOutDim(S("block")));
-  auto local = invertAndComposeBlockLocal(memLayout, regLayout);
+  auto local = invertAndComposeLocal(memLayout, regLayout, {S("block")});
   auto expected =
       LinearLayout({{S("register"), {}},
                     {S("lane"), {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}}},
@@ -613,8 +633,8 @@ TEST_F(LinearLayoutTest, InvertAndComposeBlockLocal) {
                    {S("dim")});
   EXPECT_FALSE(partiallyDistributedReg.invertAndCompose(partiallyBroadcastMem)
                    .isIdentityOnOutDim(S("block")));
-  auto partiallyLocal = invertAndComposeBlockLocal(partiallyBroadcastMem,
-                                                   partiallyDistributedReg);
+  auto partiallyLocal = invertAndComposeLocal(
+      partiallyBroadcastMem, partiallyDistributedReg, {S("block")});
   auto partiallyExpected =
       LinearLayout({{S("register"), {}},
                     {S("lane"), {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}}},
@@ -634,7 +654,7 @@ TEST_F(LinearLayoutTest, InvertAndComposeBlockLocal) {
                                      {S("warp"), {}},
                                      {S("block"), {{1}}}},
                                     {S("dim")});
-  EXPECT_EQ(invertAndComposeBlockLocal(partitionedMem, transposedReg),
+  EXPECT_EQ(invertAndComposeLocal(partitionedMem, transposedReg, {S("block")}),
             transposedReg.invertAndCompose(partitionedMem));
 }
 

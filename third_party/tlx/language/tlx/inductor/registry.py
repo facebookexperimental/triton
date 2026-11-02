@@ -3325,6 +3325,17 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
         lengths = [V.graph.sizevars.simplify(s) for s in self.output_node.get_size()]
         assert len(indices) == len(lengths)
 
+        # Inductor drops a load's mask when the extent is a multiple of the
+        # largest block it could pick (a power of two, e.g. N = 2048 vs YBLOCK
+        # up to 1024). A non-power-of-two template tile (BLOCK_N = 192 or 96)
+        # still runs past such an extent, so its epilogue loads keep every mask.
+        if any(
+            isinstance(v, int) and v > 0 and v & (v - 1)
+            for k, v in self.meta.items()
+            if k.startswith("BLOCK_")
+        ):
+            self.optimize_mask = False
+
         self.template_out = val
 
         # Use the tma_store index setup path (same as store_output with
