@@ -30,13 +30,16 @@ of this repo uses:
 | `gfx1250` | AMD RDNA4 |
 | `amd` | All AMD targets |
 
-A trailing `?` (e.g. `gfx942+?`) marks availability that has **not been
-confirmed yet** and needs verification. An absent vendor means this document
-makes no claim for that vendor, not necessarily that the op is unsupported.
+Tags describe compiler support; per-hardware pages call out API restrictions
+and distinguish source implementation from target-specific test coverage.
+An omitted vendor makes no support claim, rather than implying unsupported hardware.
 
-Note: async copies (`async_load` and its commit/wait groups) and the AMD buffer
-ops require **gfx950** — they are **not** available on gfx942. `barrier_arrive`
-on AMD requires `arrive_count == 1`.
+AMD buffer operations are available on gfx942, gfx950, and gfx1250, with
+operation-specific dtype and copy-width restrictions. The explicit
+`buffer_load_to_local` operation targets gfx942/gfx950; gfx1250 uses separate
+TDM or pointer-based copy paths. See [global memory access](global-memory.html)
+and [async memory access](async-memory.html). `barrier_arrive` on AMD requires
+`arrive_count == 1`.
 
 ## Per-hardware support
 
