@@ -413,6 +413,18 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_backward=False,
     ),
     OpSpec(
+        op="mla_window_attn",
+        arch="sm90",
+        variant="overlapped_row_blocks",
+        impl="triton.tlx.ops.kernels.mla_window_attn.sm90:mla_window_attn",
+        invariant_vocab=_ROW_DIMS,
+        dtypes=frozenset({"float16"}),
+        # The warp-specialized kernel reads the projection weights by TMA: their data must start on a 16-byte boundary.
+        accepts=lambda d: d.get("D") in (128, 256) and d.get("HEAD_DIM") in
+        (64, 128) and all(ptr % 16 == 0 for ptr in d.get("base_ptrs", ())),
+        supports_backward=False,
+    ),
+    OpSpec(
         op="swiglu_ffn",
         arch="sm90",
         variant="tlx_ws_persistent",
