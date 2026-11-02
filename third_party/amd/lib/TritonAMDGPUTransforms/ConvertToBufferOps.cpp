@@ -133,9 +133,7 @@ bool isFuncArgWith32bitPtrRange(mlir::Value value) {
 // Pure query: check whether the pointer can be lowered to buffer ops.
 // This function must not modify IR. The actual offset truncation (i64 -> i32)
 // is handled separately by truncateOffsetToI32().
-bool canUseBufferOps(Value ptr,
-                     const DenseMap<Value, SetVector<Operation *>> &assumptions,
-                     std::shared_ptr<DataFlowSolver> solver,
+bool canUseBufferOps(Value ptr, std::shared_ptr<DataFlowSolver> solver,
                      bool analyzeSmallTensorOfst) {
   // 1. Check if the pointer is uniform: i.e., if it comes from a uniform
   // pointer(splatted) and non-uniform offset addition.
@@ -241,13 +239,10 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
   using OpRewritePattern::OpRewritePattern;
 
   ConvertTritonAtomicCASOpToBufferAtomicCAS(
-      mlir::MLIRContext *context,
-      DenseMap<Value, SetVector<Operation *>> &assumptions,
-      ModuleAxisInfoAnalysis &axisAnalysisPass,
+      mlir::MLIRContext *context, ModuleAxisInfoAnalysis &axisAnalysisPass,
       std::shared_ptr<DataFlowSolver> solver, bool analyzeSmallTensorOfst_)
       : mlir::OpRewritePattern<triton::AtomicCASOp>(context),
-        assumptions(assumptions), axisAnalysisPass(axisAnalysisPass),
-        solver(std::move(solver)),
+        axisAnalysisPass(axisAnalysisPass), solver(std::move(solver)),
         analyzeSmallTensorOfst(analyzeSmallTensorOfst_) {}
 
   mlir::LogicalResult
@@ -258,7 +253,7 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
     auto sem = op.getSem();
     auto scope = op.getScope();
 
-    if (!canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
+    if (!canUseBufferOps(ptr, solver, analyzeSmallTensorOfst)) {
       return rewriter.notifyMatchFailure(op, "canUseBufferOps check failed");
     }
 
@@ -325,8 +320,6 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
   }
 
 private:
-  // Assumptions collected through the function
-  const DenseMap<Value, SetVector<Operation *>> &assumptions;
   ModuleAxisInfoAnalysis &axisAnalysisPass;
   std::shared_ptr<DataFlowSolver> solver;
   bool analyzeSmallTensorOfst;
@@ -337,14 +330,12 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
   using OpRewritePattern::OpRewritePattern;
 
   ConvertTritonAtomicRMWOpToBufferAtomicRMW(
-      mlir::MLIRContext *context,
-      DenseMap<Value, SetVector<Operation *>> &assumptions,
-      ModuleAxisInfoAnalysis &axisAnalysisPass,
+      mlir::MLIRContext *context, ModuleAxisInfoAnalysis &axisAnalysisPass,
       std::shared_ptr<DataFlowSolver> solver,
       const TargetFeatures &targetFeatures, bool analyzeSmallTensorOfst_)
       : mlir::OpRewritePattern<triton::AtomicRMWOp>(context),
-        assumptions(assumptions), axisAnalysisPass(axisAnalysisPass),
-        solver(std::move(solver)), targetFeatures(targetFeatures),
+        axisAnalysisPass(axisAnalysisPass), solver(std::move(solver)),
+        targetFeatures(targetFeatures),
         analyzeSmallTensorOfst(analyzeSmallTensorOfst_) {}
 
   mlir::LogicalResult
@@ -358,7 +349,7 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
 
     // In addition to the `canUseBufferOps` check, we should ensure that
     // 1. Perform the canUseBufferOps check
-    if (!canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
+    if (!canUseBufferOps(ptr, solver, analyzeSmallTensorOfst)) {
       return rewriter.notifyMatchFailure(op, "canUseBufferOps check failed");
     }
 
@@ -492,8 +483,6 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
   }
 
 private:
-  // Assumptions collected through the function
-  DenseMap<Value, SetVector<Operation *>> assumptions;
   ModuleAxisInfoAnalysis &axisAnalysisPass;
   std::shared_ptr<DataFlowSolver> solver;
   TargetFeatures targetFeatures;
@@ -509,13 +498,12 @@ template <typename SourceOp>
 struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
   using OpRewritePattern<SourceOp>::OpRewritePattern;
 
-  ConvertTritonLoadToBufferLoad(
-      mlir::MLIRContext *context,
-      DenseMap<Value, SetVector<Operation *>> &assumptions,
-      ModuleAxisInfoAnalysis &axisAnalysisPass,
-      std::shared_ptr<DataFlowSolver> solver, bool analyzeSmallTensorOfst_,
-      StringRef targetArch_)
-      : mlir::OpRewritePattern<SourceOp>(context), assumptions(assumptions),
+  ConvertTritonLoadToBufferLoad(mlir::MLIRContext *context,
+                                ModuleAxisInfoAnalysis &axisAnalysisPass,
+                                std::shared_ptr<DataFlowSolver> solver,
+                                bool analyzeSmallTensorOfst_,
+                                StringRef targetArch_)
+      : mlir::OpRewritePattern<SourceOp>(context),
         axisAnalysisPass(axisAnalysisPass), solver(std::move(solver)),
         analyzeSmallTensorOfst(analyzeSmallTensorOfst_),
         targetArch(targetArch_) {}
@@ -536,7 +524,7 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
         return rewriter.notifyMatchFailure(op, "volatile load");
     }
 
-    if (canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
+    if (canUseBufferOps(ptr, solver, analyzeSmallTensorOfst)) {
       auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
       Value tensorPtr = addPtrOp.getPtr();
       Value offset = addPtrOp.getOffset();
@@ -598,8 +586,6 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
   }
 
 private:
-  // Assumptions collected through the function
-  DenseMap<Value, SetVector<Operation *>> assumptions;
   ModuleAxisInfoAnalysis &axisAnalysisPass;
   std::shared_ptr<DataFlowSolver> solver;
   bool analyzeSmallTensorOfst;
@@ -610,14 +596,12 @@ struct ConvertTritonStoreToBufferStore
     : public mlir::OpRewritePattern<triton::StoreOp> {
   using OpRewritePattern::OpRewritePattern;
 
-  ConvertTritonStoreToBufferStore(
-      mlir::MLIRContext *context,
-      DenseMap<Value, SetVector<Operation *>> &assumptions,
-      ModuleAxisInfoAnalysis &axisAnalysisPass,
-      std::shared_ptr<DataFlowSolver> solver, bool analyzeSmallTensorOfst_)
+  ConvertTritonStoreToBufferStore(mlir::MLIRContext *context,
+                                  ModuleAxisInfoAnalysis &axisAnalysisPass,
+                                  std::shared_ptr<DataFlowSolver> solver,
+                                  bool analyzeSmallTensorOfst_)
       : mlir::OpRewritePattern<triton::StoreOp>(context),
-        assumptions(assumptions), axisAnalysisPass(axisAnalysisPass),
-        solver(std::move(solver)),
+        axisAnalysisPass(axisAnalysisPass), solver(std::move(solver)),
         analyzeSmallTensorOfst(analyzeSmallTensorOfst_) {}
 
   mlir::LogicalResult
@@ -626,7 +610,7 @@ struct ConvertTritonStoreToBufferStore
     LDBG("Try to convert: " << op);
     Value ptr = op.getPtr();
 
-    if (canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
+    if (canUseBufferOps(ptr, solver, analyzeSmallTensorOfst)) {
       auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
       Value tensorPtr = addPtrOp.getPtr();
       Value offset = addPtrOp.getOffset();
@@ -655,8 +639,6 @@ struct ConvertTritonStoreToBufferStore
   }
 
 private:
-  // Assumptions collected through the function
-  DenseMap<Value, SetVector<Operation *>> assumptions;
   ModuleAxisInfoAnalysis &axisAnalysisPass;
   std::shared_ptr<DataFlowSolver> solver;
   bool analyzeSmallTensorOfst;
@@ -679,38 +661,34 @@ struct TritonAMDGPUConvertToBufferOpsPass
     TargetFeatures targetFeatures{targetArch};
 
     // Collect assumptions in the function
-    DenseMap<Value, SetVector<Operation *>> assumptions =
+    AMD::IntegerAssumptions assumptions =
         AMD::TritonIntegerRangeAnalysis::collectAssumptions(getOperation());
     std::shared_ptr<DataFlowSolver> solver = createDataFlowSolver();
 
-    AMD::TritonIntegerRangeAnalysis *rangeAnalysis =
-        solver->load<AMD::TritonIntegerRangeAnalysis>(
-            assumptions, &getAnalysis<DominanceInfo>());
-    AMD::initializeFuncOps(mod, rangeAnalysis);
+    solver->load<AMD::TritonIntegerRangeAnalysis>(
+        assumptions, &getAnalysis<DominanceInfo>());
     if (failed(solver->initializeAndRun(getOperation())))
       return signalPassFailure();
 
     AMD::ModuleAxisInfoAnalysis axisInfoAnalysis(mod);
     patterns.add<ConvertTritonLoadToBufferLoad<tt::LoadOp>>(
-        context, assumptions, axisInfoAnalysis, solver,
-        this->analyzeSmallTensorOfst, targetArch);
-    patterns.add<ConvertTritonStoreToBufferStore>(context, assumptions,
-                                                  axisInfoAnalysis, solver,
-                                                  this->analyzeSmallTensorOfst);
+        context, axisInfoAnalysis, solver, this->analyzeSmallTensorOfst,
+        targetArch);
+    patterns.add<ConvertTritonStoreToBufferStore>(
+        context, axisInfoAnalysis, solver, this->analyzeSmallTensorOfst);
     if (targetFeatures.supportsBufferLoadToLocal()) {
       patterns
           .add<ConvertTritonLoadToBufferLoad<ttg::AsyncCopyGlobalToLocalOp>>(
-              context, assumptions, axisInfoAnalysis, solver,
-              this->analyzeSmallTensorOfst, targetArch);
+              context, axisInfoAnalysis, solver, this->analyzeSmallTensorOfst,
+              targetArch);
     }
 
     if (this->allowBufferAtomics && targetFeatures.supportsBufferAtomicRMW())
       patterns.add<ConvertTritonAtomicRMWOpToBufferAtomicRMW>(
-          context, assumptions, axisInfoAnalysis, solver, targetFeatures,
+          context, axisInfoAnalysis, solver, targetFeatures,
           this->analyzeSmallTensorOfst);
     patterns.add<ConvertTritonAtomicCASOpToBufferAtomicCAS>(
-        context, assumptions, axisInfoAnalysis, solver,
-        this->analyzeSmallTensorOfst);
+        context, axisInfoAnalysis, solver, this->analyzeSmallTensorOfst);
 
     if (applyPatternsGreedily(mod, std::move(patterns)).failed())
       signalPassFailure();

@@ -10,6 +10,8 @@ add_triton_library(TritonAMDAnalysis
   LINK_LIBS PUBLIC
   MLIRAnalysis
   MLIRLLVMDialect
+  TritonAnalysis
+  TritonAMDGPUIR
   TritonIR
   TritonGPUIR
 )

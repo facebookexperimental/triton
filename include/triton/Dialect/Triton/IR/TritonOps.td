@@ -6,6 +6,7 @@ include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
 include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
 include "mlir/IR/SymbolInterfaces.td"              // SymbolUserOpInterface
 include "mlir/IR/OpAsmInterface.td"                // OpAsmOpInterface
 include "mlir/Interfaces/FunctionInterfaces.td"    // FunctionOpInterface
@@ -474,7 +475,8 @@ def TT_AtomicCASOp
 //
 // Shape Manipulation Ops
 //
-def TT_SplatOp : TT_Op<"splat", [Pure, SameOperandsAndResultElementType,
+def TT_SplatOp : TT_Op<"splat", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure, SameOperandsAndResultElementType,
                                  SameOperandsAndResultEncoding]> {
   let summary = "splat";
 
@@ -499,7 +501,8 @@ def TT_UnsplatOp
 }
 
 def TT_ExpandDimsOp
-    : TT_Op<"expand_dims", [Pure,
+    : TT_Op<"expand_dims", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure,
                             DeclareOpInterfaceMethods<InferTypeOpInterface>,
                             SameOperandsAndResultElementType]> {
   let summary = "expand_dims";
@@ -514,7 +517,8 @@ def TT_ExpandDimsOp
   let hasFolder = 1;
 }
 
-def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType]> {
+def TT_ReshapeOp : TT_Op<"reshape", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure, SameOperandsAndResultElementType]> {
   let summary = "reinterpret a tensor to a different shape. It may change "
                 "elements order if the attribute is set.";
   let description = [{
@@ -543,7 +547,8 @@ def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType]> {
   }];
 }
 
-def TT_BroadcastOp : TT_Op<"broadcast", [Pure, SameOperandsAndResultElementType,
+def TT_BroadcastOp : TT_Op<"broadcast", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure, SameOperandsAndResultElementType,
                                          SameOperandsAndResultEncoding]> {
   let summary = "broadcast a tensor";
 
@@ -564,7 +569,8 @@ def TT_BroadcastOp : TT_Op<"broadcast", [Pure, SameOperandsAndResultElementType,
   let hasVerifier = 1;
 }
 
-def TT_JoinOp : TT_Op<"join", [Pure, SameTypeOperands]> {
+def TT_JoinOp : TT_Op<"join", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure, SameTypeOperands]> {
   let summary = "join two tensors along a new, minor dimension";
   let description = [{
         For example, if the two input tensors are 4x8xf32, returns a tensor of
@@ -583,7 +589,8 @@ def TT_JoinOp : TT_Op<"join", [Pure, SameTypeOperands]> {
   let hasFolder = 1;
 }
 
-def TT_SplitOp : TT_Op<"split", [Pure, InferTypeOpAdaptorWithIsCompatible,
+def TT_SplitOp : TT_Op<"split", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure, InferTypeOpAdaptorWithIsCompatible,
                                  TypesMatchWith<"outLHS and outRHS types match",
                                                 "outLHS", "outRHS", "$_self">,
 ]> {
@@ -602,7 +609,8 @@ def TT_SplitOp : TT_Op<"split", [Pure, InferTypeOpAdaptorWithIsCompatible,
   let hasFolder = 1;
 }
 
-def TT_TransOp : TT_Op<"trans", [Pure, TransposeOpInterface,
+def TT_TransOp : TT_Op<"trans", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure, TransposeOpInterface,
                                  InferTensorTypeOpWithLayoutEquivalence,
                                  SameOperandsAndResultElementType]> {
 
@@ -648,7 +656,8 @@ def TT_TransOp : TT_Op<"trans", [Pure, TransposeOpInterface,
 //
 // SPMD Ops
 //
-def TT_GetProgramIdOp : TT_Op<"get_program_id", [Pure]> {
+def TT_GetProgramIdOp : TT_Op<"get_program_id", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure]> {
   let arguments = (ins TT_ProgramDim:$axis);
 
   let results = (outs I32:$result);
@@ -897,7 +906,8 @@ def TT_ExternElementwiseOp
 //
 // Make Range Op
 //
-def TT_MakeRangeOp : TT_Op<"make_range", [Pure]> {
+def TT_MakeRangeOp : TT_Op<"make_range", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure]> {
   let summary = "make range";
 
   let description = [{
@@ -978,7 +988,8 @@ def TT_HistogramOp
 // Gather Op
 //
 def TT_GatherOp
-    : TT_Op<"gather", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+    : TT_Op<"gather", [DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRangesFromOptional"]>, Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "local gather operation";
   let description = [{
     Gather elements from the input tensor using the indices tensor along a

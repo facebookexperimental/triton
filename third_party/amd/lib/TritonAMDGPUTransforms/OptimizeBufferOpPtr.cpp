@@ -541,14 +541,11 @@ struct TritonAMDGPUOptimizeBufferOpPtrPass
   void runOnOperation() override {
     FuncOp funcOp = getOperation();
 
-    DenseMap<Value, SetVector<Operation *>> assumptions =
+    AMD::IntegerAssumptions assumptions =
         AMD::TritonIntegerRangeAnalysis::collectAssumptions(funcOp);
     std::shared_ptr<DataFlowSolver> solver = createDataFlowSolver();
     DominanceInfo *dominanceInfo = &getAnalysis<DominanceInfo>();
-    AMD::TritonIntegerRangeAnalysis *rangeAnalysis =
-        solver->load<AMD::TritonIntegerRangeAnalysis>(assumptions,
-                                                      dominanceInfo);
-    AMD::initializeFuncOps(funcOp, rangeAnalysis);
+    solver->load<AMD::TritonIntegerRangeAnalysis>(assumptions, dominanceInfo);
     if (failed(solver->initializeAndRun(funcOp))) {
       LDBG("Integer range analysis failed to initialize, exiting");
       return;

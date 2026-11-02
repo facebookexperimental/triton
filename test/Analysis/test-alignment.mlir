@@ -1,4 +1,243 @@
-// RUN: triton-opt %s -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
+// RUN: sed 's/expected-core-/expected-/g' %s | triton-opt -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
+// RUN: sed 's/expected-amd-/expected-/g' %s | triton-opt -test-print-amd-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
+
+// -----
+
+tt.func @negative_dividend_dynamic_remainder(%input: i32, %divisor: i32) {
+  %zero = arith.constant 0 : i32
+  %lower = arith.constant -1024 : i32
+  %bounded = arith.cmpi sge, %input, %lower : i32
+  %negative = arith.cmpi slt, %input, %zero : i32
+  llvm.intr.assume %bounded : i1
+  llvm.intr.assume %negative : i1
+  %rem = arith.remsi %input, %divisor : i32
+  %minus_one = arith.constant -1 : i32
+  %mapped = arith.divsi %rem, %minus_one : i32
+  %tile = arith.constant 128 : i32
+  %base = arith.muli %mapped, %tile : i32
+  %bases = tt.splat %base : i32 -> tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %bases, %lanes : tensor<128xi32>
+  %four = arith.constant dense<4> : tensor<128xi32>
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [4], divisibility = [4], constancy = [1]}}
+  %result = arith.remsi %indices, %four : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_unknown_divisor_sign(%group: i32) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %mapped = arith.divsi %pid, %group : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %mapped, %tile : i32
+    %bases = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %bases, %lane : tensor<128xi32>
+    %divisor = arith.constant dense<16> : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+    %remainder = arith.remsi %coordinate, %divisor : tensor<128xi32>
+    tt.return
+  }
+
+  tt.func @launch_bound_dynamic_remapping(%modulus: i32, %group: i32) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %within_group = arith.remsi %pid, %modulus : i32
+    %mapped = arith.divsi %within_group, %group : i32
+    %zero = arith.constant 0 : i32
+    %positive = arith.cmpi sge, %mapped, %zero : i32
+    llvm.intr.assume %positive : i1
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %mapped, %tile : i32
+    %bases = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %bases, %lane : tensor<128xi32>
+    %divisor = arith.constant dense<16> : tensor<128xi32>
+    // expected-remark @below {{contiguity = [16], divisibility = [16], constancy = [1]}}
+    %remainder = arith.remsi %coordinate, %divisor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16]}}
+    %quotient = arith.divsi %coordinate, %divisor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_x_safe(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [16], divisibility = [16], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_x_overflow(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 256 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<256xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<256xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<256xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<256xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<256xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx1100"} {
+  tt.func @launch_bound_wave32_safe(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 64 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<64xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 64 : i32} : tensor<64xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<64xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<64xi32>
+    // expected-remark @below {{contiguity = [16], divisibility = [16], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<64xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<64xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx1100"} {
+  tt.func @launch_bound_wave32_overflow(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_y_unbounded(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id y : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @launch_bound_z_unbounded(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id z : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 4 : i32, ttg.target = "hip:gfx1250"} {
+  tt.func @launch_bound_cluster_safe(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 128 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<128xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<128xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<128xi32>
+    // expected-remark @below {{contiguity = [16], divisibility = [16], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<128xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<128xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:90"} {
+  tt.func @launch_bound_other_target(%divisor: i32 {tt.divisibility = 16 : i32}) {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %pid = tt.get_program_id x : i32
+    %tile = arith.constant 64 : i32
+    %base = arith.muli %pid, %tile : i32
+    %base_tensor = tt.splat %base : i32 -> tensor<64xi32>
+    %lane = tt.make_range {start = 0 : i32, end = 64 : i32} : tensor<64xi32>
+    %coordinate = arith.addi %base_tensor, %lane : tensor<64xi32>
+    %divisor_tensor = tt.splat %divisor : i32 -> tensor<64xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %remainder = arith.remsi %coordinate, %divisor_tensor : tensor<64xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    %quotient = arith.divsi %coordinate, %divisor_tensor : tensor<64xi32>
+    tt.return
+  }
+}
+
+
+
+// -----
 
 tt.func @cast() {
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = 1}}
@@ -428,7 +667,8 @@ tt.func @div(%arg0: i32 {tt.divisibility = 16 : i32}) {
   %3 = arith.divui %1, %0 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = 64}}
   %4 = arith.constant dense<64> : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [64], constant_value = <none>}}
   %5 = arith.divsi %0, %4 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %6 = arith.divsi %4, %0 : tensor<128xi32>
@@ -440,7 +680,8 @@ tt.func @div(%arg0: i32 {tt.divisibility = 16 : i32}) {
   %9 = arith.divui %0, %8 : tensor<128xi32>
   // expected-remark @below {{contiguity = [128], divisibility = [8192], constancy = [1], constant_value = <none>}}
   %10 = tt.make_range {end = 8320 : i32, start = 8192 : i32} : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [64], constant_value = <none>}}
   %11 = arith.divsi %10, %4 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [2], constancy = [1], constant_value = 2}}
   %12 = arith.constant 2 : i32
@@ -457,7 +698,8 @@ tt.func @div(%arg0: i32 {tt.divisibility = 16 : i32}) {
   %17 = arith.divsi %arg0, %16 : i32
   // expected-remark @below {{contiguity = [1], divisibility = [2], constancy = [128], constant_value = 2}}
   %18 = arith.constant dense<2> : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [2], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [2], constant_value = <none>}}
   %19 = arith.divsi %0, %18 : tensor<128xi32>
   tt.return
 }
@@ -476,7 +718,8 @@ tt.func @rem() {
   %3 = arith.remui %1, %0 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = 64}}
   %4 = arith.constant dense<64> : tensor<128xi32>
-  // expected-remark @below {{contiguity = [64], divisibility = [64], constancy = [1], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [64], divisibility = [64], constancy = [1], constant_value = <none>}}
   %5 = arith.remsi %0, %4 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %6 = arith.remsi %4, %0 : tensor<128xi32>
@@ -486,7 +729,8 @@ tt.func @rem() {
   %8 = arith.remui %0, %7 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = 192}}
   %9 = arith.constant dense<192> : tensor<128xi32>
-  // expected-remark @below {{contiguity = [64], divisibility = [64], constancy = [1], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [64], divisibility = [64], constancy = [1], constant_value = <none>}}
   %10 = arith.remsi %0, %9 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %11 = arith.remsi %9, %0 : tensor<128xi32>
@@ -496,7 +740,8 @@ tt.func @rem() {
   %13 = arith.remsi %0, %12 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %14 = arith.remsi %12, %0 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [32], divisibility = [32], constancy = [1], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [32], divisibility = [32], constancy = [1], constant_value = <none>}}
   %15 = arith.remsi %12, %4 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %16 = arith.remsi %4, %12 : tensor<128xi32>
@@ -521,10 +766,11 @@ tt.func @rem_partial_groups(%divisor: tensor<32xi32> {tt.divisibility = 2 : i32,
   %eight = arith.constant dense<8> : tensor<32xi32>
   %two = arith.constant dense<2> : tensor<32xi32>
   %partial_range = arith.remui %range, %eight : tensor<32xi32>
-  // The same issue occurs with a partially contiguous dividend.
-  // expected-remark @below {{contiguity = [1], divisibility = [1]}}
+  // Nonnegative [0, ..., 7] groups preserve [0, 1] remainder pairs.
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [2], divisibility = [2]}}
   %partial_lhs_signed = arith.remsi %partial_range, %two : tensor<32xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1]}}
+  // expected-remark @below {{contiguity = [2], divisibility = [2]}}
   %partial_lhs_unsigned = arith.remui %partial_range, %two : tensor<32xi32>
   tt.return
 }
@@ -550,10 +796,6 @@ tt.func @rem_unit_contiguity(
 
 // -----
 
-// NOTE: unsigned remui no longer keeps partial-group contiguity (upstream
-// PR11546 soundness test pins unit below); %within_group collapses. Re-derive
-// the D122462298 MI350 relaxation in rem_partial_groups-compatible form if
-// paged-decode perf regresses.
 tt.func @partial_div_rem_groups() {
   // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
   %n = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
@@ -567,16 +809,15 @@ tt.func @partial_div_rem_groups() {
   // [0 x 8, 1 x 8, ..., 7 x 8] repeated twice.
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %group = arith.divui %token, %c8 : tensor<128xi32>
-  // Eight [0, ..., 7] runs exist, but partial-group inference is disabled:
-  // unit result (see NOTE above).
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // Contiguous groups [0, ..., 7].
+  // expected-remark @below {{contiguity = [8], divisibility = [8], constancy = [1], constant_value = <none>}}
   %within_group = arith.remui %token, %c8 : tensor<128xi32>
   tt.return
 }
 
 // -----
 
-// Signed div/rem must not apply the partial-group relaxation. These facts can
+// Signed div/rem need a sign proof for partial groups. These facts can
 // describe local runs such as [-4, -3, -2, -1, 8, 9, 10, 11], for which
 // truncation toward zero produces neither four equal quotients nor a
 // four-element contiguous remainder run.
@@ -588,6 +829,197 @@ tt.func @signed_partial_div_rem_is_conservative(
   %quotient = arith.divsi %lhs, %four : tensor<8xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %remainder = arith.remsi %lhs, %four : tensor<8xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_bounded_tile() {
+  %pid = tt.get_program_id x : i32
+  %limit = arith.constant 16777216 : i32
+  %valid = arith.cmpi ult, %pid, %limit : i32
+  llvm.intr.assume %valid : i1
+  %tile = arith.constant 128 : i32
+  %base = arith.muli %pid, %tile : i32
+  %bases = tt.splat %base : i32 -> tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %bases, %lanes : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [64]}}
+  %quotient = arith.divsi %indices, %divisor : tensor<128xi32>
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [64], divisibility = [64], constancy = [1]}}
+  %remainder = arith.remsi %indices, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_tile_can_wrap() {
+  %pid = tt.get_program_id x : i32
+  %tile = arith.constant 128 : i32
+  %base = arith.muli %pid, %tile : i32
+  %bases = tt.splat %base : i32 -> tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %bases, %lanes : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %quotient = arith.divsi %indices, %divisor : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %remainder = arith.remsi %indices, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_assumption_follows_ssa(%base: i32 {tt.divisibility = 128 : i32}, %cond: i1) {
+  %zero = arith.constant 0 : i32
+  %limit = arith.constant 2147483520 : i32
+  %positive = arith.cmpi sge, %base, %zero : i32
+  %bounded = arith.cmpi sle, %base, %limit : i32
+  %bases = tt.splat %base : i32 -> tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %bases, %lanes : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %before = arith.divsi %indices, %divisor : tensor<128xi32>
+  scf.if %cond {
+    llvm.intr.assume %positive : i1
+    llvm.intr.assume %bounded : i1
+    // Earlier computations retain their original SSA facts.
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+    %inside = arith.divsi %indices, %divisor : tensor<128xi32>
+    %local_bases = tt.splat %base : i32 -> tensor<128xi32>
+    %local_indices = arith.addi %local_bases, %lanes : tensor<128xi32>
+    // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [64]}}
+    %local = arith.divsi %local_indices, %divisor : tensor<128xi32>
+  } else {
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+    %sibling = arith.divsi %indices, %divisor : tensor<128xi32>
+  }
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %outside = arith.divsi %indices, %divisor : tensor<128xi32>
+  llvm.intr.assume %positive : i1
+  llvm.intr.assume %bounded : i1
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %after = arith.divsi %indices, %divisor : tensor<128xi32>
+  %new_bases = tt.splat %base : i32 -> tensor<128xi32>
+  %new_indices = arith.addi %new_bases, %lanes : tensor<128xi32>
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [64]}}
+  %new = arith.divsi %new_indices, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_partial_groups_with_proof() {
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %sixtyfour = arith.constant dense<64> : tensor<128xi32>
+  %eight = arith.constant dense<8> : tensor<128xi32>
+  %groups = arith.remui %lanes, %sixtyfour : tensor<128xi32>
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8]}}
+  %quotient = arith.divsi %groups, %eight : tensor<128xi32>
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [8], divisibility = [8], constancy = [1]}}
+  %remainder = arith.remsi %groups, %eight : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_bounded_loop() {
+  %zero = arith.constant 0 : i32
+  %end = arith.constant 1024 : i32
+  %step = arith.constant 128 : i32
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  scf.for %iv = %zero to %end step %step : i32 {
+    %bases = tt.splat %iv : i32 -> tensor<128xi32>
+    %indices = arith.addi %bases, %lanes : tensor<128xi32>
+    // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [64]}}
+    %quotient = arith.divsi %indices, %divisor : tensor<128xi32>
+    // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+    // expected-amd-remark@+1 {{contiguity = [64], divisibility = [64], constancy = [1]}}
+    %remainder = arith.remsi %indices, %divisor : tensor<128xi32>
+  }
+  tt.return
+}
+
+// -----
+
+tt.func @signed_wrapping_add() {
+  %base = arith.constant dense<2147483584> : tensor<128xi32>
+  %lanes = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  %indices = arith.addi %base, %lanes : tensor<128xi32>
+  %divisor = arith.constant dense<64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %quotient = arith.divsi %indices, %divisor : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1]}}
+  %remainder = arith.remsi %indices, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+// Full contiguous inputs may start at a negative divisor multiple.
+tt.func @signed_full_div_rem_is_conservative(
+    %lhs: tensor<128xi32> {tt.contiguity = 128 : i32, tt.divisibility = 64 : i32}) {
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = 64}}
+  %positive = arith.constant dense<64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = -64}}
+  %negative = arith.constant dense<-64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %quotient_positive = arith.divsi %lhs, %positive : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %quotient_negative = arith.divsi %lhs, %negative : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %remainder_positive = arith.remsi %lhs, %positive : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %remainder_negative = arith.remsi %lhs, %negative : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_negative_range_div_rem() {
+  // expected-remark @below {{contiguity = [128], divisibility = [64], constancy = [1], constant_value = <none>}}
+  %range = tt.make_range {start = -64 : i32, end = 64 : i32} : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = -64}}
+  %divisor = arith.constant dense<-64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %quotient = arith.divsi %range, %divisor : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %remainder = arith.remsi %range, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @signed_remainder_preserves_element_divisibility(
+    %lhs: tensor<128xi32> {tt.divisibility = 16 : i32}) {
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = -64}}
+  %divisor = arith.constant dense<-64> : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [16], constancy = [1], constant_value = <none>}}
+  %remainder = arith.remsi %lhs, %divisor : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+// A divisor that changes within the dimension does not preserve group bases.
+tt.func @remainder_partial_divisor_constancy(
+    %rhs: tensor<128xi32> {tt.constancy = 2 : i32, tt.divisibility = 4 : i32}) {
+  // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
+  %range = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %signed = arith.remsi %range, %rhs : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %unsigned = arith.remui %range, %rhs : tensor<128xi32>
   tt.return
 }
 
@@ -775,17 +1207,20 @@ tt.func @cmp_partial_contiguous() {
   %1 = arith.constant dense<8> : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [32], constancy = [128], constant_value = 32}}
   %3 = arith.constant dense<32> : tensor<128xi32>
-  // expected-remark @below {{contiguity = [32], divisibility = [32], constancy = [1], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [32], divisibility = [32], constancy = [1], constant_value = <none>}}
   %4 = arith.remsi %0, %3 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %5 = arith.cmpi eq, %4, %1 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %6 = arith.cmpi ne, %4, %1 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %7 = arith.cmpi slt, %4, %1 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %8 = arith.cmpi sle, %4, %1 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %9 = arith.cmpi sge, %4, %1 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %10 = arith.cmpi sgt, %4, %1 : tensor<128xi32>
@@ -795,25 +1230,30 @@ tt.func @cmp_partial_contiguous() {
   %12 = arith.cmpi ne, %1, %4 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %13 = arith.cmpi slt, %1, %4 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %14 = arith.cmpi sle, %1, %4 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %15 = arith.cmpi sge, %1, %4 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %16 = arith.cmpi sgt, %1, %4 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [16], constancy = [128], constant_value = 48}}
   %17 = arith.constant dense<48> : tensor<128xi32>
-  // expected-remark @below {{contiguity = [16], divisibility = [16], constancy = [1], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [16], divisibility = [16], constancy = [1], constant_value = <none>}}
   %18 = arith.remsi %0, %17 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %19 = arith.cmpi eq, %18, %3 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %20 = arith.cmpi ne, %18, %3 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
   %21 = arith.cmpi slt, %18, %3 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %22 = arith.cmpi sle, %18, %3 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
   %23 = arith.cmpi sge, %18, %3 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %24 = arith.cmpi sgt, %18, %3 : tensor<128xi32>
@@ -823,11 +1263,13 @@ tt.func @cmp_partial_contiguous() {
   %26 = arith.cmpi ne, %3, %18 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %27 = arith.cmpi slt, %3, %18 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none>}}
   %28 = arith.cmpi sle, %3, %18 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %29 = arith.cmpi sge, %3, %18 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [16], constant_value = <none}}
   %30 = arith.cmpi sgt, %3, %18 : tensor<128xi32>
   tt.return
 }
@@ -839,11 +1281,13 @@ tt.func @logic() {
   %0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = 64}}
   %1 = arith.constant dense<64> : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [64], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [64], constant_value = <none>}}
   %2 = arith.divsi %0, %1 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [8], constancy = [128], constant_value = 8}}
   %3 = arith.constant dense<8> : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %4 = arith.divsi %0, %3 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %5 = arith.andi %0, %1 : tensor<128xi32>
@@ -851,11 +1295,14 @@ tt.func @logic() {
   %6 = arith.ori %0, %1 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %7 = arith.xori %0, %1 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %8 = arith.andi %2, %4 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %9 = arith.ori %2, %4 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %10 = arith.xori %2, %4 : tensor<128xi32>
   tt.return
 }
@@ -1148,25 +1595,32 @@ tt.func @load_constancy(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg1:
   %eight = arith.constant dense<8> : tensor<1024xi32>
   // expected-remark @below {{contiguity = [1024], divisibility = [1073741824], constancy = [1]}}
   %1 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32>
-  // expected-remark @below {{constancy = [16]}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{constancy = [16]}}
   %2 = arith.divsi %1, %sixteen : tensor<1024xi32>
   // expected-remark @below {{constancy = [1024]}}
   %3 = tt.splat %arg0 : !tt.ptr<i32> -> tensor<1024x!tt.ptr<i32>>
   // expected-remark @below {{constancy = [1024]}}
   %4 = tt.splat %arg1 : i32 -> tensor<1024xi32>
-  // expected-remark @below {{constancy = [8]}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{constancy = [8]}}
   %5 = arith.divsi %1, %eight : tensor<1024xi32>
-  // expected-remark @below {{constancy = [8]}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{constancy = [8]}}
   %6 = arith.cmpi slt, %5, %4 : tensor<1024xi32>
-  // expected-remark @below {{constancy = [16]}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [4], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{constancy = [16]}}
   %7 = tt.addptr %3, %2 : tensor<1024x!tt.ptr<i32>>, tensor<1024xi32>
-  // expected-remark @below {{constancy = [16]}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{constancy = [16]}}
   %8 = tt.load %7 : tensor<1024x!tt.ptr<i32>>
-  // expected-remark @below {{constancy = [8]}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{constancy = [8]}}
   %9 = tt.load %7, %6 : tensor<1024x!tt.ptr<i32>>
   // expected-remark @below {{constancy = [1]}}
   %10 = tt.load %7, %6, %1 : tensor<1024x!tt.ptr<i32>>
-  // expected-remark @below {{constancy = [8]}}
+  // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-amd-remark@+1 {{constancy = [8]}}
   %11 = tt.load %7, %6, %5 : tensor<1024x!tt.ptr<i32>>
   tt.return
 }
@@ -1623,4 +2077,33 @@ tt.func @negative_constants() {
   // expected-remark @below {{contiguity = [1], divisibility = [8], constancy = [128], constant_value = 8}}
   %sum = arith.addi %neg8_dense, %sixteen : tensor<128xi32>
   tt.return
+}
+
+// -----
+
+module attributes {ttg.target = "hip:gfx950"} {
+  tt.func @shared_pass_selects_amd_ranges() {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %lane = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+    %eight = arith.constant dense<8> : tensor<16xi32>
+    // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8]}}
+    %quotient = arith.divsi %lane, %eight : tensor<16xi32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {ttg.target = "cuda:90"} {
+  tt.func @shared_pass_keeps_cuda_conservative() {
+    %true = arith.constant true
+    amdg.cond_barrier %true
+    %lane = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+    %eight = arith.constant dense<8> : tensor<16xi32>
+    // expected-core-remark@+2 {{contiguity = [1], divisibility = [1], constancy = [1]}}
+    // expected-amd-remark@+1 {{contiguity = [1], divisibility = [1], constancy = [8]}}
+    %quotient = arith.divsi %lane, %eight : tensor<16xi32>
+    tt.return
+  }
 }

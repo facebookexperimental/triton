@@ -662,9 +662,12 @@ private:
 template <typename OpTy>
 class DivOpAxisInfoVisitor final : public BinaryOpVisitorImpl<OpTy> {
 public:
-  using BinaryOpVisitorImpl<OpTy>::BinaryOpVisitorImpl;
+  explicit DivOpAxisInfoVisitor(const DenseSet<Operation *> &nonNegative)
+      : nonNegative(nonNegative) {}
 
 private:
+  const DenseSet<Operation *> &nonNegative;
+
   int64_t getContiguity(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                         int dim) override {
     // lhs / 1 = lhs
@@ -680,22 +683,16 @@ private:
     if (!resTy)
       return constancy;
     auto shape = resTy.getShape();
-    // Case: lhs contiguous, rhs constant.
-    // lhs: d_lhs * k, d_lhs * k + 1, ..., d_lhs * k + n
-    // rhs: d_rhs * p, d_rhs * p, ..., d_rhs * p
-    // lhs / rhs = d_lhs * k / (d_rhs * p), (d_lhs * k + 1) / (d_rhs * p),
-    // ..., (d_lhs * k + n) / (d_rhs * p)
-    // Because d_lhs % d_rhs = 0 || d_rhs % d_lhs = 0,
-    // the minimal constancy is gcd(d_lhs, d_rhs).
-    // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
-    // we need to use another gcd to get the actual constancy.
-    // Full-dimension contiguity is not required for unsigned division. A
-    // partially contiguous numerator still produces constant runs when the
-    // run boundaries are aligned to the divisor. Signed division cannot use
-    // this relaxation without a non-negativity proof because it truncates
-    // toward zero. Preserve the pre-existing full-dimension inference there.
+    // Let g = gcd(lhs contiguity, lhs divisibility, rhs divisibility).
+    // Each contiguous lhs group splits into g-element subgroups whose bases
+    // are multiples of g. A constant nonzero divisor is also a multiple of g,
+    // so no subgroup crosses a multiple of its magnitude. For nonnegative
+    // dividends, the quotient is constant within each subgroup, even for a
+    // negative divisor. Full-dimension contiguity is unnecessary.
+    // Signed truncation breaks this for negative dividends: [-4,-3,-2,-1] / 4
+    // gives [-1,0,0,0], despite an aligned base and full contiguity.
     constexpr bool isUnsigned = std::is_same_v<OpTy, arith::DivUIOp>;
-    if ((isUnsigned || AxisInfoVisitor::isContiguousDim(lhs, shape, dim)) &&
+    if ((isUnsigned || nonNegative.contains(op)) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       constancy = std::max(constancy,
                            gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
@@ -731,9 +728,12 @@ private:
 template <typename OpTy>
 class RemOpAxisInfoVisitor final : public BinaryOpVisitorImpl<OpTy> {
 public:
-  using BinaryOpVisitorImpl<OpTy>::BinaryOpVisitorImpl;
+  explicit RemOpAxisInfoVisitor(const DenseSet<Operation *> &nonNegative)
+      : nonNegative(nonNegative) {}
 
 private:
+  const DenseSet<Operation *> &nonNegative;
+
   int64_t getContiguity(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                         int dim) override {
     auto resTy = dyn_cast<RankedTensorType>(op.getType());
@@ -741,16 +741,15 @@ private:
       return BinaryOpVisitorImpl<OpTy>::getContiguity(op, lhs, rhs, dim);
     auto shape = resTy.getShape();
     int64_t contiguity = 1;
-    // lhs contiguous, rhs constant
-    // lhs: d_lhs * k, d_lhs * k + 1, ..., d_lhs * k + n
-    // rhs: d_rhs * p, d_rhs * p, ..., d_rhs * p
-    // lhs % rhs = d_lhs * k % (d_rhs * p), (d_lhs * k + 1) % (d_rhs * p),
-    // ..., (d_lhs * k + n) % (d_rhs * p)
-    // Because d_lhs % d_rhs = 0 || d_rhs % d_lhs = 0,
-    // The minimal contiguity is gcd(d_lhs, d_rhs).
-    // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
-    // we need to use another gcd to get the actual contiguity.
-    if (AxisInfoVisitor::isContiguousDim(lhs, shape, dim) &&
+    // Let g = gcd(lhs contiguity, lhs divisibility, rhs divisibility).
+    // Each g-element subgroup has a base divisible by g; a constant nonzero
+    // divisor has magnitude divisible by g. For nonnegative dividends, no
+    // remainder reset occurs inside a subgroup, so its remainders increase
+    // by one. The proof applies to each contiguous group independently and
+    // to either divisor sign; full-dimension contiguity is unnecessary.
+    // Negative dividends break it: [-4,-3,-2,-1] % 4 gives [0,-3,-2,-1].
+    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
+    if ((isUnsigned || nonNegative.contains(op)) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       contiguity = gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
                        rhs.getDivisibility(dim));
@@ -1256,10 +1255,14 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
                   AddSubOpAxisInfoVisitor<arith::AddIOp>,
                   AddSubOpAxisInfoVisitor<arith::SubIOp>>();
   visitors.append<MulIOpAxisInfoVisitor>();
-  visitors.append<DivOpAxisInfoVisitor<arith::DivSIOp>,
-                  DivOpAxisInfoVisitor<arith::DivUIOp>>();
-  visitors.append<RemOpAxisInfoVisitor<arith::RemSIOp>,
-                  RemOpAxisInfoVisitor<arith::RemUIOp>>();
+  visitors.append(std::make_unique<DivOpAxisInfoVisitor<arith::DivSIOp>>(
+      nonNegativeDividends));
+  visitors.append(std::make_unique<DivOpAxisInfoVisitor<arith::DivUIOp>>(
+      nonNegativeDividends));
+  visitors.append(std::make_unique<RemOpAxisInfoVisitor<arith::RemSIOp>>(
+      nonNegativeDividends));
+  visitors.append(std::make_unique<RemOpAxisInfoVisitor<arith::RemUIOp>>(
+      nonNegativeDividends));
   visitors.append<BroadcastOpAxisInfoVisitor>();
   visitors.append<SplatOpAxisInfoVisitor>();
   visitors.append<ExpandDimsOpAxisInfoVisitor>();
@@ -1572,6 +1575,22 @@ unsigned ModuleAxisInfoAnalysis::getMaskAlignment(Value mask, unsigned axis) {
     LDBG("-- " << axisStr);
   });
   return alignment;
+}
+
+AxisInfoAnalysis::LoadCallback
+ModuleAxisInfoAnalysis::getDefaultAnalysisLoader(ModuleOp mod) {
+  AxisInfoAnalysis::LoadCallback loader = nullptr;
+  for (Dialect *dialect : mod.getContext()->getLoadedDialects()) {
+    const auto *interface =
+        dialect->getRegisteredInterface<AxisInfoDialectInterface>();
+    if (!interface)
+      continue;
+    if (auto candidate = interface->getAnalysisLoader(mod)) {
+      assert(!loader && "multiple axis-info providers for one target");
+      loader = candidate;
+    }
+  }
+  return loader ? loader : AxisInfoAnalysis::loadDefaultAnalysis;
 }
 
 void ModuleAxisInfoAnalysis::initialize(
