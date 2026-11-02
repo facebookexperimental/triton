@@ -11,6 +11,7 @@ from triton import knobs
 
 from triton._internal_testing import (is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250, is_hip_rdna3,
                                       is_hip_rdna4, is_hip_rdna4m)
+from triton.compiler.errors import CompilationError
 
 
 def _allow_npot():
@@ -449,3 +450,57 @@ def test_npot_dot_scaled(K):
     # On HIP, test_core.py test_scaled_dot's tolerance for e4m3.
     atol, rtol = (1e-5, 1e-2) if is_hip() else (1e-3, 1e-3)
     torch.testing.assert_close(c, ref.float(), atol=atol, rtol=rtol)
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N", [96, 128])
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int32, torch.uint8])
+def test_npot_sort(dtype, descending, N):
+    """sort and topk pad an NPOT dim with the value that sorts last, so the
+    extremes of the dtype (+-inf for floats) in live lanes stay in place. N=128
+    is the pow2 control."""
+
+    @triton.jit
+    def kernel(X, Out, Top, N: tl.constexpr, DESC: tl.constexpr):
+        x = tl.load(X + tl.arange(0, N))
+        tl.store(Out + tl.arange(0, N), tl.sort(x, descending=DESC))
+        tl.store(Top + tl.arange(0, 32), tl.topk(x, 32, descending=DESC))
+
+    torch.manual_seed(0)
+    if dtype.is_floating_point:
+        x = torch.randn(N, device="cuda")
+        lo, hi = float("-inf"), float("inf")
+    else:
+        lo, hi = torch.iinfo(dtype).min, torch.iinfo(dtype).max
+        x = torch.randint(lo, hi, (N, ), device="cuda", dtype=dtype)
+    x[5], x[7] = hi, lo
+    out, top = torch.empty_like(x), torch.empty(32, device="cuda", dtype=dtype)
+    kernel[(1, )](x, out, top, N=N, DESC=descending)
+    ref = torch.sort(x, descending=descending).values
+    assert torch.equal(out, ref) and torch.equal(top, ref[:32])
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("M", [3, 4])
+def test_npot_sort_other_dim(M):
+    """Sorting a tensor with an NPOT dim other than the sorted one fails to
+    compile with an error, raised inside sort, so it is in the exception's cause
+    chain. M=4 is the pow2 control."""
+
+    @triton.jit
+    def kernel(X, Out, M: tl.constexpr):
+        idx = tl.arange(0, M)[:, None] * 32 + tl.arange(0, 32)[None, :]
+        tl.store(Out + idx, tl.sort(tl.load(X + idx)))
+
+    x = torch.randn(M, 32, device="cuda")
+    out = torch.empty_like(x)
+    if M & (M - 1):
+        with pytest.raises(CompilationError) as e:
+            kernel[(1, )](x, out, M=M)
+        assert "sort over an NPOT dim other than the sorted one is unsupported" in str(e.getrepr())
+    else:
+        kernel[(1, )](x, out, M=M)
+        assert torch.equal(out, torch.sort(x).values)
