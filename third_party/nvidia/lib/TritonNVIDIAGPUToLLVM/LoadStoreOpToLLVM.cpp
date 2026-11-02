@@ -1111,10 +1111,13 @@ struct AsyncCopyGlobalToLocalOpConversion
       Value tid = getThreadId(rewriter, loc);
       Value pred = b.icmp_eq(tid, b.i32_val(0));
 
-      // Emit cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes
+      // The `.shared::cluster` destination (PTX 8.0) rather than `.shared::cta`
+      // (PTX 8.6), so ptxas 12.4 accepts it; a CTA's own shared address is a
+      // valid shared::cluster address.
       ::mlir::triton::PTXBuilder ptxBuilder;
       auto &bulkCopy = *ptxBuilder.create<>(
-          "@$0 cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+          "@$0 "
+          "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
           "[$1], [$2], $3, [$4];");
       bulkCopy({ptxBuilder.newOperand(pred, "b"),
                 ptxBuilder.newOperand(dstBase, "r"),

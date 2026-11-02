@@ -151,7 +151,7 @@ def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
 
     # Verify PTX contains the bulk copy instructions
     ptx = kernel.asm["ptx"]
-    assert "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes" in ptx, (
+    assert "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes" in ptx, (
         "Expected cp.async.bulk gmem->smem in PTX")
     assert "cp.async.bulk.global.shared::cta.bulk_group" in ptx, "Expected cp.async.bulk smem->gmem in PTX"
 
@@ -199,7 +199,7 @@ def test_async_load_bulk(CHUNK_SIZE, device):
 
     # Verify PTX contains the bulk copy instruction
     ptx = kernel.asm["ptx"]
-    assert "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes" in ptx, (
+    assert "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes" in ptx, (
         "Expected cp.async.bulk gmem->smem in PTX")
 
     # Verify correctness
