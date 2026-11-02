@@ -87,8 +87,10 @@ def TritonAMDGPUSinkLayoutConversions
   let description = [{
     This pass sinks layout conversions after the last dealloc but before the first use in their block.
     This helps to avoid unnecessary shared memory allocation.
-    It also moves conversions between a pair of amdg.cond_barrier ops after the
-    closing barrier, where both warp groups are back in phase.
+    It also moves conversions between amdg.cond_barrier(p) and a following
+    amdg.cond_barrier(~p) in the same block after the closing barrier, where both
+    warp groups are back in phase. Barriers whose predicates are not provably
+    complementary are left alone.
   }];
 
   let dependentDialects = [];
