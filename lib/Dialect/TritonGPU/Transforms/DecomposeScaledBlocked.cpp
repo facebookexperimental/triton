@@ -4,7 +4,9 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LogicalResult.h"
 
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -46,6 +48,33 @@ DecomposeScaledBlocked::matchAndRewrite(DotScaledOp scaledDotOp,
     return rewriter.notifyMatchFailure(scaledDotOp,
                                        "expected blocked result encoding");
 
+  // fp6 upcast requires K-packing (groups of 16 values per 12 bytes). The
+  // IR verifier rejects non-K-packed fp6, so this only fires on
+  // unverified IR built by transforms; fail gracefully there too.
+  if ((isMXFP6ScaleType(scaledDotOp.getAElemType()) &&
+       !scaledDotOp.getLhsKPack()) ||
+      (isMXFP6ScaleType(scaledDotOp.getBElemType()) &&
+       !scaledDotOp.getRhsKPack())) {
+    return rewriter.notifyMatchFailure(scaledDotOp,
+                                       "NYI: fp6 without K-packing");
+  }
+
+  // fp6 operand shapes count logical values in groups of 16. Reject
+  // other K extents gracefully here (before any IR is created); the IR
+  // verifier already rejects them for verified ops.
+  for (int opIdx : {0, 1}) {
+    auto elemType =
+        opIdx == 0 ? scaledDotOp.getAElemType() : scaledDotOp.getBElemType();
+    if (!isMXFP6ScaleType(elemType))
+      continue;
+    auto operandTy =
+        (opIdx == 0 ? scaledDotOp.getA() : scaledDotOp.getB()).getType();
+    int kDim = opIdx == 0 ? operandTy.getRank() - 1 : operandTy.getRank() - 2;
+    if (operandTy.getShape()[kDim] % 16 != 0)
+      return rewriter.notifyMatchFailure(
+          scaledDotOp, "fp6 K dimension must be a multiple of 16");
+  }
+
   // Types
   auto computeType = getComputeType(scaledDotOp.getAElemType(),
                                     scaledDotOp.getBElemType(), rewriter);
@@ -61,10 +90,16 @@ DecomposeScaledBlocked::matchAndRewrite(DotScaledOp scaledDotOp,
         "cannot decompose dot_scaled with UE5M3 (int8 block-16) scales and "
         "f16 compute type: scales up to 114688 overflow f16");
 
-  auto scaledA = scaleArg(rewriter, scaledDotOp, 0, computeType);
-  scaledA = cvtDotOperand(rewriter, scaledDotOp, 0, scaledA);
-  auto scaledB = scaleArg(rewriter, scaledDotOp, 1, computeType);
-  scaledB = cvtDotOperand(rewriter, scaledDotOp, 1, scaledB);
+  auto scaledAOr = scaleArg(rewriter, scaledDotOp, 0, computeType);
+  if (failed(scaledAOr))
+    return rewriter.notifyMatchFailure(scaledDotOp,
+                                       "failed to scale lhs operand");
+  auto scaledA = cvtDotOperand(rewriter, scaledDotOp, 0, *scaledAOr);
+  auto scaledBOr = scaleArg(rewriter, scaledDotOp, 1, computeType);
+  if (failed(scaledBOr))
+    return rewriter.notifyMatchFailure(scaledDotOp,
+                                       "failed to scale rhs operand");
+  auto scaledB = cvtDotOperand(rewriter, scaledDotOp, 1, *scaledBOr);
   auto newDot = DotOp::create(rewriter, scaledDotOp.getLoc(), scaledA, scaledB,
                               scaledDotOp.getC());
 
@@ -193,7 +228,7 @@ DecomposeScaledBlocked::scaleTo16(PatternRewriter &rewriter,
   return cast<TypedValue<RankedTensorType>>(scaleFP);
 }
 
-TypedValue<RankedTensorType> DecomposeScaledBlocked::broadcastScale(
+FailureOr<TypedValue<RankedTensorType>> DecomposeScaledBlocked::broadcastScale(
     PatternRewriter &rewriter, DotScaledOp scaledDotOp,
     TypedValue<RankedTensorType> scale, int dim, Attribute dstEncoding) const {
   auto loc = scale.getLoc();
@@ -221,12 +256,14 @@ TypedValue<RankedTensorType> DecomposeScaledBlocked::broadcastScale(
   auto result = interface->inferReshapeOpEncoding(
       resultShape, dstEncoding, broadcastShape, broadcastEncoding,
       /*allowReorder=*/false, loc);
-  assert(succeeded(result));
+  if (failed(result))
+    return failure();
   Attribute srcEncoding;
   result = interface->inferReshapeOpEncoding(expandedShape, broadcastEncoding,
                                              scaleTy.getShape(), srcEncoding,
                                              /*allowReorder=*/false, loc);
-  assert(succeeded(result));
+  if (failed(result))
+    return failure();
 
   auto srcType = scaleTy.cloneWithEncoding(srcEncoding);
 
@@ -250,10 +287,11 @@ TypedValue<RankedTensorType> DecomposeScaledBlocked::broadcastScale(
   auto resultType =
       RankedTensorType::get(resultShape, scaleTy.getElementType(), dstEncoding);
   // Reshape to fold in the broadcasted dimension and get the final result.
-  return ReshapeOp::create(rewriter, loc, resultType, broadcastScale);
+  auto reshaped = ReshapeOp::create(rewriter, loc, resultType, broadcastScale);
+  return cast<TypedValue<RankedTensorType>>(reshaped.getResult());
 }
 
-TypedValue<RankedTensorType> DecomposeScaledBlocked::maskNan(
+FailureOr<TypedValue<RankedTensorType>> DecomposeScaledBlocked::maskNan(
     PatternRewriter &rewriter, DotScaledOp scaledDotOp,
     TypedValue<RankedTensorType> mxfp, TypedValue<RankedTensorType> scale,
     int dim) const {
@@ -284,8 +322,11 @@ TypedValue<RankedTensorType> DecomposeScaledBlocked::maskNan(
                               constFF)
             .getResult());
   }
-  auto cond = broadcastScale(rewriter, scaledDotOp, scaleIsNan, dim,
-                             mxfp.getType().getEncoding());
+  auto condOr = broadcastScale(rewriter, scaledDotOp, scaleIsNan, dim,
+                               mxfp.getType().getEncoding());
+  if (failed(condOr))
+    return failure();
+  auto cond = *condOr;
 
   // Create NaN
   auto mxfpTy = mxfp.getType();
@@ -298,22 +339,308 @@ TypedValue<RankedTensorType> DecomposeScaledBlocked::maskNan(
   return cast<TypedValue<RankedTensorType>>(result.getResult());
 }
 
-TypedValue<RankedTensorType>
+// Convert packed fp6 codes (i32 values 0..63) to computeType floats.
+// Matches the interpreter: denormals and zero via (m/2^mbits) * 2^(1-bias),
+// normals via (1 + m/2^mbits) * 2^(e-bias), times the sign. Every intermediate
+// value is exactly representable, so computing directly in f16/bf16 is exact.
+static TypedValue<RankedTensorType>
+fp6BitsToFloat(PatternRewriter &rewriter, TypedValue<RankedTensorType> codes,
+               int ebits, int mbits, int bias, FloatType computeType) {
+  auto loc = codes.getLoc();
+  auto i32Ty = codes.getType();
+  auto fTy = i32Ty.clone(computeType);
+  auto i32 = rewriter.getI32Type();
+  auto i32Splat = [&](int64_t val) {
+    return arith::ConstantOp::create(
+               rewriter, loc, i32Ty,
+               SplatElementsAttr::get(i32Ty, rewriter.getIntegerAttr(i32, val)))
+        .getResult();
+  };
+  auto fSplat = [&](double val) {
+    return arith::ConstantOp::create(
+               rewriter, loc, fTy,
+               SplatElementsAttr::get(fTy,
+                                      rewriter.getFloatAttr(computeType, val)))
+        .getResult();
+  };
+  // 2^k for the small k used here, without <cmath>.
+  auto pow2 = [](int k) {
+    return k >= 0 ? double(1 << k) : 1.0 / double(1 << -k);
+  };
+
+  Value c = codes;
+  // Bit 5 is the sign for both e2m3 and e3m2.
+  Value s = arith::AndIOp::create(
+      rewriter, loc,
+      arith::ShRUIOp::create(rewriter, loc, c, i32Splat(ebits + mbits)),
+      i32Splat(1));
+  Value e = arith::AndIOp::create(
+      rewriter, loc, arith::ShRUIOp::create(rewriter, loc, c, i32Splat(mbits)),
+      i32Splat((1 << ebits) - 1));
+  Value m = arith::AndIOp::create(rewriter, loc, c, i32Splat((1 << mbits) - 1));
+
+  Value isDenorm = arith::CmpIOp::create(
+      rewriter, loc, arith::CmpIPredicate::eq, e, i32Splat(0));
+  Value mF = arith::UIToFPOp::create(rewriter, loc, fTy, m);
+  // Multiply by the reciprocal: some backends have no f16/bf16 divide, and the
+  // product is exact for these dyadic constants.
+  Value mantFrac = arith::MulFOp::create(rewriter, loc, mF,
+                                         fSplat(1.0 / double(1 << mbits)));
+
+  // 2^(e-bias) via f32 bit construction: exact, and avoids a select chain.
+  // e == 0 takes the denormal path, so its (valid) power of two is unused.
+  Value expBits = arith::ShLIOp::create(
+      rewriter, loc,
+      arith::AddIOp::create(
+          rewriter, loc,
+          arith::SubIOp::create(rewriter, loc, e, i32Splat(bias)),
+          i32Splat(127)),
+      i32Splat(23));
+  Value pow2F32 = BitcastOp::create(rewriter, loc,
+                                    i32Ty.clone(rewriter.getF32Type()), expBits)
+                      .getResult();
+  // Exact powers of two, so the required rounding mode is immaterial.
+  Value pow2E = FpToFpOp::create(rewriter, loc, fTy, pow2F32,
+                                 RoundingModeAttr::get(rewriter.getContext(),
+                                                       RoundingMode::RTNE))
+                    .getResult();
+  Value normal = arith::MulFOp::create(
+      rewriter, loc,
+      arith::AddFOp::create(rewriter, loc, fSplat(1.0), mantFrac), pow2E);
+  Value denorm =
+      arith::MulFOp::create(rewriter, loc, mantFrac, fSplat(pow2(1 - bias)));
+  Value mag = arith::SelectOp::create(rewriter, loc, isDenorm, denorm, normal);
+  Value isNeg = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ne,
+                                      s, i32Splat(0));
+  Value negMag = arith::NegFOp::create(rewriter, loc, mag);
+  return cast<TypedValue<RankedTensorType>>(
+      arith::SelectOp::create(rewriter, loc, isNeg, negMag, mag).getResult());
+}
+
+// Warp-local gather layout, mirroring OptimizeThreadLocality's
+// setOptimizedGatherLayout. Gathers created here run after that pass, so the
+// recipe is applied directly; the shared-memory fallback miscompiles.
+static BlockedEncodingAttr
+computeWarpLocalGatherLayout(MLIRContext *ctx, RankedTensorType srcType,
+                             ArrayRef<int64_t> idxShape, unsigned axis,
+                             unsigned numThreadsPerWarp, unsigned numWarps) {
+  unsigned rank = srcType.getRank();
+  assert(rank > 1);
+  SmallVector<unsigned> threadsPerWarp(rank);
+  SmallVector<unsigned> warpsPerCTA(rank);
+  SmallVector<unsigned> order;
+  order.push_back(axis);
+  unsigned maxThreadsInAxis =
+      std::min<unsigned>(srcType.getDimSize(axis), numThreadsPerWarp);
+  threadsPerWarp[axis] = maxThreadsInAxis;
+  unsigned threadsToAlloc = numThreadsPerWarp / maxThreadsInAxis;
+  for (unsigned dim : getThreadOrder(srcType)) {
+    if (dim == axis)
+      continue;
+    order.push_back(dim);
+    unsigned nextThreadAlloc =
+        std::min<unsigned>(srcType.getDimSize(dim), threadsToAlloc);
+    threadsPerWarp[dim] = nextThreadAlloc;
+    threadsToAlloc /= nextThreadAlloc;
+  }
+  warpsPerCTA[axis] = 1;
+  unsigned warpsToAlloc = numWarps;
+  for (unsigned dim : getWarpOrder(srcType)) {
+    if (dim == axis)
+      continue;
+    // threadsPerWarp[dim] was capped at getDimSize(dim) in the thread
+    // loop above, so warpsCanFit is at least 1 for any real dim size.
+    unsigned warpsCanFit = srcType.getDimSize(dim) / threadsPerWarp[dim];
+    assert(warpsCanFit != 0);
+    unsigned nextWarpAlloc = std::min<unsigned>(warpsCanFit, warpsToAlloc);
+    warpsPerCTA[dim] = nextWarpAlloc;
+    warpsToAlloc /= nextWarpAlloc;
+  }
+  SmallVector<unsigned> sizePerThread(rank, 1);
+  sizePerThread[axis] =
+      std::max<int64_t>(srcType.getDimSize(axis), idxShape[axis]) /
+      threadsPerWarp[axis];
+  threadsPerWarp[axis] *= threadsToAlloc;
+  warpsPerCTA[axis] *= warpsToAlloc;
+  assert(product(threadsPerWarp) == numThreadsPerWarp);
+  assert(product(warpsPerCTA) == numWarps);
+  auto baseLayout = cast<LayoutEncodingTrait>(srcType.getEncoding());
+  auto cgaLayout = getCGALayout(baseLayout);
+  return BlockedEncodingAttr::get(ctx, sizePerThread, threadsPerWarp,
+                                  warpsPerCTA, order, cgaLayout);
+}
+
+FailureOr<TypedValue<RankedTensorType>>
+DecomposeScaledBlocked::upcastFp6(PatternRewriter &rewriter,
+                                  DotScaledOp scaledDotOp, int opIdx,
+                                  FloatType computeType) const {
+  auto v = opIdx == 0 ? scaledDotOp.getA() : scaledDotOp.getB();
+  auto elemType =
+      opIdx == 0 ? scaledDotOp.getAElemType() : scaledDotOp.getBElemType();
+  int ebits, mbits, bias;
+  if (elemType == ScaleDotElemType::E2M3) {
+    ebits = 2;
+    mbits = 3;
+    bias = 1;
+  } else if (elemType == ScaleDotElemType::E3M2) {
+    ebits = 3;
+    mbits = 2;
+    bias = 3;
+  } else {
+    return failure();
+  }
+
+  auto loc = v.getLoc();
+  auto vTy = v.getType();
+  int rank = vTy.getRank();
+  int kDim = opIdx == 0 ? rank - 1 : rank - 2;
+  // Operand shapes count logical values (groups of 16). Global storage
+  // is dense (groups of 16 values per 12 bytes); loads expand it to
+  // logical width, so the leading 3/4 of the K dim hold dense bytes
+  // and the trailing quarter is ignored padding.
+  if (vTy.getShape()[kDim] % 16 != 0)
+    return failure();
+
+  SmallVector<int64_t> outShape(to_vector(vTy.getShape()));
+
+  // 0) Gather the two bytes feeding each output code directly at output
+  // positions. Output K-coordinate j = 4t+i decodes packed triple t as
+  //   v = ((lo >> s_lo) & m_lo) | ((hi << s_hi) & m_hi)
+  // with per-output constants.
+  auto *ctx = rewriter.getContext();
+  auto mod = scaledDotOp->getParentOfType<ModuleOp>();
+  int numWarps = lookupNumWarps(scaledDotOp);
+  int threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
+  auto idxEnc = computeWarpLocalGatherLayout(ctx, vTy, outShape, kDim,
+                                             threadsPerWarp, numWarps);
+  auto i32 = rewriter.getI32Type();
+  auto idxTy = RankedTensorType::get(outShape, i32, idxEnc);
+
+  // Per-output K-coordinate j = cumsum(ones) - 1 along K. A scan is
+  // used (rather than make_range + broadcast) so that j is produced
+  // directly in the warp-local gather layout (idxEnc) that the gathers
+  // below require. Triple (b0, b1, b2) holds v0 = b0[5:0],
+  // v1 = b0[7:6]|b1[3:0]<<2, v2 = b1[7:4]|b2[1:0]<<4, v3 = b2[7:2]; the
+  // two bytes and the shift/mask tables below are computed
+  // arithmetically from j.
+  auto i32Splat = [&](int64_t val) {
+    return arith::ConstantOp::create(
+               rewriter, loc, idxTy,
+               SplatElementsAttr::get(idxTy, rewriter.getIntegerAttr(i32, val)))
+        .getResult();
+  };
+  auto scan = ScanOp::create(rewriter, loc, ValueRange{i32Splat(1)}, kDim,
+                             /*reverse=*/false, StringAttr());
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    Region &combineOp = scan.getCombineOp();
+    Block *body = rewriter.createBlock(&combineOp);
+    Value acc = body->addArgument(i32, loc);
+    Value cur = body->addArgument(i32, loc);
+    rewriter.setInsertionPointToEnd(body);
+    Value sum = arith::AddIOp::create(rewriter, loc, acc, cur);
+    OperationState retState(loc, ScanReturnOp::getOperationName());
+    retState.addOperands(sum);
+    rewriter.create(retState);
+  }
+  Value j =
+      arith::SubIOp::create(rewriter, loc, scan->getResult(0), i32Splat(1))
+          .getResult();
+  Value t = arith::DivUIOp::create(rewriter, loc, j, i32Splat(4)).getResult();
+  Value i = arith::RemUIOp::create(rewriter, loc, j, i32Splat(4)).getResult();
+  Value threeT =
+      arith::MulIOp::create(rewriter, loc, t, i32Splat(3)).getResult();
+  Value iGe2 = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::uge,
+                                     i, i32Splat(2))
+                   .getResult();
+  Value loOff =
+      arith::SelectOp::create(
+          rewriter, loc, iGe2,
+          arith::SubIOp::create(rewriter, loc, i, i32Splat(1)), i32Splat(0))
+          .getResult();
+  Value loIdx = arith::AddIOp::create(rewriter, loc, threeT, loOff).getResult();
+  Value hiOff =
+      arith::MinUIOp::create(rewriter, loc, i, i32Splat(2)).getResult();
+  Value hiIdx = arith::AddIOp::create(rewriter, loc, threeT, hiOff).getResult();
+  Value is1 = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, i,
+                                    i32Splat(1))
+                  .getResult();
+  Value is2 = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, i,
+                                    i32Splat(2))
+                  .getResult();
+  Value is3 = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, i,
+                                    i32Splat(3))
+                  .getResult();
+  auto sel4 = [&](int v0, int v1, int v2, int v3) {
+    Value s23 =
+        arith::SelectOp::create(rewriter, loc, is3, i32Splat(v3), i32Splat(v0))
+            .getResult();
+    Value s12 = arith::SelectOp::create(rewriter, loc, is2, i32Splat(v2), s23)
+                    .getResult();
+    return arith::SelectOp::create(rewriter, loc, is1, i32Splat(v1), s12)
+        .getResult();
+  };
+  // Worked example (j = 5): t = 1, i = 1, so the code is
+  // (b3 >> 6 & 3) | (b4 << 2 & 60).
+  Value sLo = sel4(0, 6, 4, 2);
+  Value mLo = sel4(63, 3, 15, 63);
+  Value sHi = sel4(0, 2, 4, 0);
+  Value mHi = sel4(0, 60, 48, 0);
+  Value cvtSrc =
+      ConvertLayoutOp::create(rewriter, loc, vTy.cloneWithEncoding(idxEnc), v)
+          .getResult();
+  auto gatherLo = GatherOp::create(rewriter, loc, cvtSrc, loIdx, kDim);
+  gatherLo.setEfficientLayout(true);
+  auto gatherHi = GatherOp::create(rewriter, loc, cvtSrc, hiIdx, kDim);
+  gatherHi.setEfficientLayout(true);
+  if (!GatherLoweringHelper(gatherLo).isWarpLocal() ||
+      !GatherLoweringHelper(gatherHi).isWarpLocal()) {
+    rewriter.eraseOp(gatherHi);
+    rewriter.eraseOp(gatherLo);
+    return failure();
+  }
+  Value lo = gatherLo.getResult();
+  Value hi = gatherHi.getResult();
+  auto laneTy = cast<RankedTensorType>(lo.getType()).clone(i32);
+
+  // 1) Decode each output code from its two bytes. K stays in place.
+  Value lo32 = arith::ExtUIOp::create(rewriter, loc, laneTy, lo);
+  Value hi32 = arith::ExtUIOp::create(rewriter, loc, laneTy, hi);
+  auto codes = cast<TypedValue<RankedTensorType>>(
+      arith::OrIOp::create(
+          rewriter, loc,
+          arith::AndIOp::create(
+              rewriter, loc, arith::ShRUIOp::create(rewriter, loc, lo32, sLo),
+              mLo),
+          arith::AndIOp::create(rewriter, loc,
+                                arith::ShLIOp::create(rewriter, loc, hi32, sHi),
+                                mHi))
+          .getResult());
+  return fp6BitsToFloat(rewriter, codes, ebits, mbits, bias, computeType);
+}
+
+FailureOr<TypedValue<RankedTensorType>>
 DecomposeScaledBlocked::scaleArg(PatternRewriter &rewriter,
                                  DotScaledOp scaledDotOp, int opIdx,
                                  FloatType computeType) const {
   auto v = opIdx == 0 ? scaledDotOp.getA() : scaledDotOp.getB();
   auto scale = opIdx == 0 ? scaledDotOp.getAScale() : scaledDotOp.getBScale();
-  auto isFp4 =
-      ScaleDotElemType::E2M1 ==
-      (opIdx == 0 ? scaledDotOp.getAElemType() : scaledDotOp.getBElemType());
+  auto elemType =
+      opIdx == 0 ? scaledDotOp.getAElemType() : scaledDotOp.getBElemType();
+  auto isFp4 = ScaleDotElemType::E2M1 == elemType;
+  auto isFp6 = isMXFP6ScaleType(elemType);
 
   auto loc = v.getLoc();
   auto rank = v.getType().getRank();
   auto kDim = opIdx == 0 ? rank - 1 : rank - 2;
 
   // 0) Upcast value to computeType (fp16/bf16)
-  if (isFp4) {
+  if (isFp6) {
+    auto upcastOr = upcastFp6(rewriter, scaledDotOp, opIdx, computeType);
+    if (failed(upcastOr))
+      return failure();
+    v = *upcastOr;
+  } else if (isFp4) {
     bool kPack =
         opIdx == 0 ? scaledDotOp.getLhsKPack() : scaledDotOp.getRhsKPack();
     int packedDim = kPack ? kDim : (opIdx == 0 ? rank - 2 : rank - 1);
@@ -327,8 +654,11 @@ DecomposeScaledBlocked::scaleArg(PatternRewriter &rewriter,
     return v;
 
   // 1) Cast scale to fp16/bf16, broadcast it and convert its layout
-  auto reshapeScale = extendAndBroadcastScale(rewriter, scaledDotOp, scale,
-                                              computeType, v.getType(), opIdx);
+  auto reshapeScaleOr = extendAndBroadcastScale(
+      rewriter, scaledDotOp, scale, computeType, v.getType(), opIdx);
+  if (failed(reshapeScaleOr))
+    return failure();
+  auto reshapeScale = *reshapeScaleOr;
 
   // 2) Multiply
   auto mxfp = cast<TypedValue<RankedTensorType>>(
@@ -338,7 +668,8 @@ DecomposeScaledBlocked::scaleArg(PatternRewriter &rewriter,
   return maskNan(rewriter, scaledDotOp, mxfp, scale, kDim);
 }
 
-TypedValue<RankedTensorType> DecomposeScaledBlocked::extendAndBroadcastScale(
+FailureOr<TypedValue<RankedTensorType>>
+DecomposeScaledBlocked::extendAndBroadcastScale(
     PatternRewriter &rewriter, DotScaledOp scaledDotOp,
     TypedValue<RankedTensorType> &scale, FloatType computeType,
     RankedTensorType dstType, int opIdx) const {

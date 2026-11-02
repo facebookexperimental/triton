@@ -1,4 +1,5 @@
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Support/LogicalResult.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 namespace mlir::triton::gpu {
@@ -26,23 +27,24 @@ protected:
   TypedValue<RankedTensorType>
   decodeUE5M3To16(PatternRewriter &rewriter, TypedValue<RankedTensorType> scale,
                   FloatType computeType) const;
-  TypedValue<RankedTensorType>
+  FailureOr<TypedValue<RankedTensorType>>
   broadcastScale(PatternRewriter &rewriter, DotScaledOp scaledDotOp,
                  TypedValue<RankedTensorType> scale, int dim,
                  Attribute dstEncoding) const;
-  TypedValue<RankedTensorType> maskNan(PatternRewriter &rewriter,
-                                       DotScaledOp scaledDotOp,
-                                       TypedValue<RankedTensorType> mxfp,
-                                       TypedValue<RankedTensorType> scale,
-                                       int dim) const;
-  virtual TypedValue<RankedTensorType> scaleArg(PatternRewriter &rewriter,
-                                                DotScaledOp scaledDotOp,
-                                                int opIdx,
-                                                FloatType computeType) const;
+  FailureOr<TypedValue<RankedTensorType>>
+  maskNan(PatternRewriter &rewriter, DotScaledOp scaledDotOp,
+          TypedValue<RankedTensorType> mxfp, TypedValue<RankedTensorType> scale,
+          int dim) const;
+  virtual FailureOr<TypedValue<RankedTensorType>>
+  scaleArg(PatternRewriter &rewriter, DotScaledOp scaledDotOp, int opIdx,
+           FloatType computeType) const;
+  FailureOr<TypedValue<RankedTensorType>>
+  upcastFp6(PatternRewriter &rewriter, DotScaledOp scaledDotOp, int opIdx,
+            FloatType computeType) const;
   TypedValue<RankedTensorType>
   cvtDotOperand(PatternRewriter &rewriter, DotScaledOp scaledDotOp, int opIdx,
                 TypedValue<RankedTensorType> v) const;
-  TypedValue<RankedTensorType>
+  FailureOr<TypedValue<RankedTensorType>>
   extendAndBroadcastScale(PatternRewriter &rewriter, DotScaledOp scaledDotOp,
                           TypedValue<RankedTensorType> &scale,
                           FloatType computeType, RankedTensorType dstType,
