@@ -1205,6 +1205,52 @@ class TestTLXTemplates(TestCase):
         "Need Blackwell with device-side TMA support in Triton",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("epilogue", ("plain", "subtiled", "interleaved"))
+    def test_tlx_matmul_ws_tma_epilogue_stores_output_dtype(self, epilogue):
+        # A bf16 GEMM whose result is cast to fp32 fuses the cast into the
+        # template, so the TMA epilogue stages an fp32 output from bf16 operands.
+        # The staged value must take the output's dtype, not the operands'.
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        heuristic_config = {
+            "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8, "NUM_SMEM_BUFFERS": 3,
+            "NUM_TMEM_BUFFERS": 2, "NUM_MMA_GROUPS": 1, "EPILOGUE_SUBTILE": 1, "NUM_CTAS": 1, "SPLIT_K": 1
+        }
+        if epilogue != "plain":
+            heuristic_config.update(BLOCK_SIZE_M=256, NUM_MMA_GROUPS=2, NUM_SMEM_BUFFERS=2)
+        if epilogue == "subtiled":
+            heuristic_config.update(EPILOGUE_SUBTILE=2)
+        if epilogue == "interleaved":
+            heuristic_config.update(INTERLEAVE_EPILOGUE=1)
+
+        a = torch.randn(1024, 1024, device=GPU_TYPE, dtype=torch.bfloat16)
+        b = torch.randn(1024, 1024, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        def mm_to_fp32(a, b):
+            return (a @ b).float()
+
+        with (
+                mock.patch.object(_tlx_registry, "get_heuristic_config", lambda *args, **kwargs: dict(heuristic_config)),
+                tlx_config.patch(use_heuristic_config=True),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "enable_caching_generated_triton_templates": False,
+                }),
+        ):
+            actual, code = run_and_get_code(torch.compile(mm_to_fp32), a, b)
+
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual, a.float() @ b.float(), atol=1e-2, rtol=1e-2)
+        generated = "\n".join(code)
+        self.assertIn("async_descriptor_store(desc_c", generated)
+        self.assertNotIn("triton_poi_", generated)
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_matmul_ws_small_m_configs(self):
         from triton.language.extra.tlx.inductor import registry as _tlx_registry
 
