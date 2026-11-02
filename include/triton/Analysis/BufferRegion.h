@@ -350,6 +350,10 @@ private:
 
   BufferRegionView getAllocView(Value allocation, uint32_t storageBase,
                                 llvm::ArrayRef<uint32_t> partitionBases = {});
+  /// All bytes of a single-partition shared allocation, for shapes that have no
+  /// linear layout. None without allocation analysis results.
+  std::optional<BufferRegionView>
+  getWholeAllocView(Value allocation, llvm::ArrayRef<uint32_t> offsets);
   BufferRegionView getSubView(Type type, const BufferRegionView &view,
                               uint32_t storageOffset = 0,
                               uint32_t byteOffset = 0,
