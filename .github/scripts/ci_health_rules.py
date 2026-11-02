@@ -59,8 +59,9 @@ JOB_GROUPS = [
 #: A failed step matching this is an infrastructure failure, not a test result.
 INFRA_STEP = re.compile(
     r"set up job|checkout|download prebuilt|install triton|upload wheel|build wheel|setup tritonbench|"
-    r"authenticate|azure|aws|restore ccache|tune nvidia|fail if the build job|select kernel-affected|"
-    r"set up test environment|install prebuilt triton|resolve tritonbench ref|install tritonbench dependencies", re.I)
+    r"authenticate|azure|aws|restore ccache|tune nvidia|check amd gpu|fail if the build job|"
+    r"select kernel-affected|set up test environment|install prebuilt triton|resolve tritonbench ref|"
+    r"install tritonbench dependencies", re.I)
 
 
 def group_of(step):

@@ -4,11 +4,12 @@ name: CI Health
 # compiler.yml (LIT), runs of nightly-fbtriton.yml, and each tracked
 # branch's Meta LLVM pin, into the
 # 'ci-health' release, for the /ci/ dashboard
-# that pages.yml renders after each successful collection. Never deploys. On
-# pull requests it only runs the dashboard's tests.
+# that pages.yml renders after each successful collection. Never deploys. It also
+# opens an issue when a GPU runner pool stops picking up jobs (runner_health.py).
+# On pull requests it only runs the tests.
 on:
   schedule:
-    - cron: '17 * * * *'
+    - cron: '2,17,32,47 * * * *'
   workflow_dispatch:
     inputs:
       since:
@@ -20,9 +21,11 @@ on:
       - '.github/scripts/ci_health_rules.py'
       - '.github/scripts/ci_health_logs.py'
       - '.github/scripts/ci_health_dashboard.html'
+      - '.github/scripts/runner_health.py'
       - '.github/scripts/test_ci_health.py'
       - '.github/scripts/test_ci_health_rules.py'
       - '.github/scripts/test_ci_health_logs.py'
+      - '.github/scripts/test_runner_health.py'
       - '.github/scripts/meta_llvm_bump.py'
       - '.github/workflows/ci-health.yml'
       - '.github/workflows/gpu-tests.yml'
@@ -53,7 +56,7 @@ jobs:
       # Also checks that every test step in the GPU workflows maps to a dashboard group.
       - name: Run dashboard tests
         working-directory: .github/scripts
-        run: python3 -m pytest -q test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py
+        run: python3 -m pytest -q test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py test_runner_health.py
 
   collect:
     if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'
@@ -86,3 +89,19 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC2046
           gh release upload ci-health data/state.json $(cat data/changed.txt) --clobber
+
+  runners:
+    if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read     # list queued and running jobs
+      issues: write     # open and close runner pool issues
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - name: Check GPU runner pools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/runner_health.py

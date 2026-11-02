@@ -61,7 +61,7 @@ def main():
         waited = int((now - rules.t(job["created_at"])).total_seconds() // 60)
         body = (f"No `{pool}` runner has picked up a job for {waited} minutes, and none of its jobs is running.\n\n"
                 f"Longest-waiting job: {job['html_url']}\n\n"
-                f"Opened by runner-health.yml; it closes this issue once a job runs on `{pool}` again.")
+                f"Opened by ci-health.yml; it closes this issue once a job runs on `{pool}` again.")
         number = gh("POST", f"repos/{repo}/issues", {"title": title_of(pool), "body": body, "labels": LABELS})["number"]
         print(f"{pool}: down, opened #{number}")
     for pool, issue in open_pools.items():

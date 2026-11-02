@@ -83,7 +83,7 @@ table.l1l2{table-layout:fixed}table.l1l2 th:first-child{width:90px}table.l1l2 tr
 .gtitle{font-size:13px;font-weight:650;margin:14px 0 2px}
 </style></head><body><div class="viz-root"><div class="wrap">
 <header><div><h1>CI health: facebookexperimental/triton</h1>
-<p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every hour</p></div>
+<p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every 15 minutes</p></div>
 <button class="theme" id="themeBtn" type="button">Toggle theme</button></header>
 <div class="branchbar filterbar"><span class="muted">Branch</span><span class="seg" id="branch-sel"></span><span id="ops-filters" hidden><span class="muted">GPU</span><span class="seg" id="o-gpu"></span><span class="muted">Time range</span><span class="seg" id="o-range"></span></span></div>
 <div class="tabrows">
@@ -199,7 +199,7 @@ table.l1l2{table-layout:fixed}table.l1l2 th:first-child{width:90px}table.l1l2 tr
 <p class="note">Each row is a commit that moved <code>cmake/meta-llvm-info.json</code> to a new LLVM release, with a link to the fork commits it added over the previous pin (over the upstream pin for the first).</p></div>
 </section>
 
-<p class="muted" style="margin-top:28px">Rebuilt every hour from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
+<p class="muted" style="margin-top:28px">Rebuilt every 15 minutes from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
 </div><div class="tip" id="tip"></div></div>
 <script>
 const REPO="https://github.com/facebookexperimental/triton";
