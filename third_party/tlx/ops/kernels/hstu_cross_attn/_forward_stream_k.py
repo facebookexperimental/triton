@@ -631,7 +631,7 @@ def _from_part(x):
 
 @triton.jit
 def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph,
-             P: tl.constexpr, p, u, u1, k_buf, v_buf, stride_qm: tl.constexpr, stride_qh: tl.constexpr,
+             P: tl.constexpr, p, u, u1, q_buf, k_buf, v_buf, stride_qm: tl.constexpr, stride_qh: tl.constexpr,
              stride_kn: tl.constexpr, stride_kh: tl.constexpr, stride_vn: tl.constexpr, stride_vh: tl.constexpr,
              stride_om: tl.constexpr, stride_oh: tl.constexpr, stride_mm: tl.constexpr, G: tl.constexpr,
              QK_SCALE: tl.constexpr, IS_SOFTMAX: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr,
@@ -672,10 +672,15 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
     row_ok = (start_m + local_m) < seq_len_q
     row0 = (seq_start_q + start_m).to(tl.int64)
     q_ptrs = Q + row0 * stride_qm + off_h * stride_qh + (local_m[:, None] * stride_qm + offs_d[None, :])
+    # Copied straight to LDS: a register load needs a relayout through LDS anyway, and its staging registers spill.
     if start_m + BLOCK_M <= seq_len_q:
-        q = tl.load(q_ptrs, cache_modifier=".cg")
+        tok_q = tlx.async_load(q_ptrs, tlx.local_view(q_buf, 0), cache_modifier=".cg")
+        tlx.async_load_commit_group([tok_q])
     else:
-        q = tl.load(q_ptrs, mask=row_ok[:, None], other=0.0, cache_modifier=".cg")
+        tok_q = tlx.async_load(q_ptrs, tlx.local_view(q_buf, 0), mask=row_ok[:, None], other=0.0,
+                               cache_modifier=".cg")
+        tlx.async_load_commit_group([tok_q])
+    q = tlx.local_load(tlx.local_view(q_buf, 0), token=tlx.async_load_wait_group(0))
     kv_base = (seq_start_kv + kv_lo).to(tl.int64)
     k_ptrs = K + kv_base * stride_kn + off_h_kv * stride_kh + offs_n[:, None] * stride_kn + offs_d[None, :]
     v_ptrs = V + kv_base * stride_vn + off_h_kv * stride_vh + offs_n[:, None] * stride_vn + offs_d[None, :]
@@ -857,19 +862,23 @@ def _hstu_cross_attn_fwd_stream_k(
                                                                           [BLOCK_N, HEAD_DIM])
     v_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 32)], kv_offset_bases,
                                                                           [BLOCK_N, HEAD_DIM])
+    q_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(1024, 8)], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0], [128, 0],
+                      [1, 0], [2, 0], [4, 0], [8, 0]], [BLOCK_M, HEAD_DIM])
+    q_buf = tlx.local_alloc((BLOCK_M, HEAD_DIM), tlx.dtype_of(Q), 1, layout=q_layout)
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(K), 2, layout=k_layout)
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(V), 2, layout=v_layout)
     # Statically unrolled: in a runtime loop LLVM hoists the per-segment address math out of it and spills.
     for _ in tl.static_range(MAX_SEGMENTS):
         if u < u1:
             u = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph,
-                         P, p, u, u1, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh,
+                         P, p, u, u1, q_buf, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh,
                          stride_om, stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD,
                          LOG2_Z_PAD, True, PIPE_STAGES, RESCALE_THRESHOLD)
     # Rare: ranges spanning more than MAX_SEGMENTS q tiles (short KV sequences).
     while u < u1:
         u = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph, P, p,
-                     u, u1, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh, stride_om,
+                     u, u1, q_buf, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh, stride_om,
                      stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD, LOG2_Z_PAD,
                      False, PIPE_STAGES, RESCALE_THRESHOLD)
 
