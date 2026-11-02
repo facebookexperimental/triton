@@ -250,22 +250,22 @@
    tlx.async_descriptor_load(a_desc, buffer, offsets=[offs_m, offs_k], barrier=mbar)
    ```
 
-- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)` **[sm90+, gfx950]**
+- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)` **[sm90+, gfx942+]**
 
    Load a chunk of data from global memory into a local memory buffer asynchronously.
 
    The operation returns a token object which can be used to track the completion of the operation.
 
-   **MI350X caveat:** When `mask` is provided, callers should also provide `other`—typically `0.0` for numerical kernels. Elements for which `mask=True` are copied from global memory into the destination local buffer. For elements where `mask=False`, `other` is written only if it is provided. Otherwise, the corresponding LDS locations retain unspecified, potentially stale contents from an earlier use of the buffer.
+   On AMD, the non-bulk path uses target-specific direct-to-LDS lowering or a synchronous fallback when the copy cannot be issued directly. Direct transfers require 32 bits per lane on gfx942, 32 or 128 bits on gfx950, or 32, 64, or 128 bits on gfx1250. A supported API does not guarantee a hardware-asynchronous transfer. The `bulk=True` path is NVIDIA-specific; use TDM descriptor loads on gfx1250 for descriptor-based transfers. See the [AMD copy lowering](third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp).
 
-   For example, in FlashAttention, when the sequence length is not a multiple of `BLOCK_N`, the final `V` tile contains masked-out rows. If `other` is omitted, those rows may contain unspecified values, including bit patterns representing NaN or infinity. These values can propagate through the subsequent matrix multiplication and produce incorrect output. Use `other=0.0` for such padded tiles.
+   **Masked copies:** The TLX frontend defaults `other` to `0.0` when `mask` is provided and `other` is omitted. Pass another `other` value explicitly if the masked-out elements need a different fill. This applies to the non-bulk copy path; bulk mode does not accept `mask` or `other`. See the [frontend implementation](third_party/tlx/language/tlx/mem_ops.py).
 
 
-- `tlx.async_load_commit_group(tokens)` **[sm90+, gfx950]**
+- `tlx.async_load_commit_group(tokens)` **[sm90+, gfx942+]**
 
    Commits all prior initiated but uncommitted async_load ops an async group. Optionally, each token represents a tracked async load operation.
 
-- `tlx.async_load_wait_group(pendings, tokens)` **[sm90+, gfx950]**
+- `tlx.async_load_wait_group(pendings, tokens)` **[sm90+, gfx942+]**
 
    Wait for completion of prior asynchronous copy operations. The `pendings` argument indicates the number of in-flight operations not completed.
    Optionally, each token represents a tracked async commit group operation.
@@ -273,7 +273,9 @@
 
 ## `tlx.buffer_load_to_local`
 
-Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume.
+**[gfx942, gfx950]**
+
+Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume. Unlike pointer-based `async_load`, this explicit buffer operation is rejected on gfx1250 by the [target verifier](third_party/amd/lib/Dialect/TritonAMDGPU/IR/Dialect.cpp); use the TDM path there.
 
 ```python
 token = tlx.buffer_load_to_local(
@@ -302,7 +304,7 @@ token = tlx.buffer_load_to_local(
 Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw.ptr.buffer.load.async.lds` — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.
 
 **Requirements.** The direct-to-LDS copy has the following hardware constraints:
-- **Vector width.** Each thread's load must reach a supported direct-to-LDS width (**32 or 128 bits**). If it can only be vectorized to a smaller width, it cannot be lowered.
+- **Vector width.** Each thread's load must reach **32 bits on gfx942**, or **32 or 128 bits on gfx950**. If it can only be vectorized to a smaller width, it cannot be lowered. These widths come from the [target feature checks](third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp).
 - **Provable pointer/offset alignment.** The compiler must be able to *prove* the alignment that vector width needs.
 - **Mask alignment.** If `mask` is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose `True`/`False` boundary cannot be proven vector-aligned (e.g. `offs < K` for a runtime `K`) forces per-element vectorization and cannot lower.
 

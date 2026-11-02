@@ -1,9 +1,9 @@
 # TLX on gfx942 (AMD MI300 / CDNA3)
 
-MI300X: CDNA3 MFMA, per-CU LDS, explicit buffer loads. Unlike gfx950,
-async global-to-LDS copies are not profitable here, so kernels stage
-through registers with direct buffer loads plus explicit LDS. Tags follow
-[tlx.md](tlx.html); a trailing `?` marks unconfirmed availability.
+MI300X: CDNA3 MFMA, per-CU LDS, explicit buffer loads. The catalog GEMM
+stages through registers with direct buffer loads plus explicit LDS.
+The compiler also supports direct-to-LDS copies with 32-bit per-lane
+transfers. Tags follow [tlx.md](tlx.html).
 
 ## Supported `tlx.ops`
 
@@ -48,7 +48,12 @@ Register-staged loads are the primary path on this target
 | Builtin | Purpose |
 |---|---|
 | `buffer_load` / `buffer_store` | Global access via scalar base + i32 offsets |
-| `buffer_atomic_add`? | Buffer atomic add; unconfirmed on gfx942 |
+| `buffer_atomic_add` | FP16/FP32/FP64/int32/int64 buffer addition; BF16 is rejected on gfx942 |
+| `buffer_load_to_local` | Direct global-to-LDS buffer copy; 32-bit per-lane transfer required |
+
+FP16 atomics require two contiguous elements per thread and a pair-uniform
+mask. These limits follow the [target feature checks](third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp)
+and [buffer-atomic lowering](third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp).
 
 ### Layout control
 
@@ -103,13 +108,9 @@ Register-staged loads are the primary path on this target
 | `thread_id` / `num_warps` | Thread id / kernel warp count |
 | `warp_all` / `warp_any` | Lane votes |
 
-## Not on this target
+## Copy and scheduling limits
 
-- `async_load`, `async_load_commit_group`, `async_load_wait_group`:
-  async copies require gfx950.
-- `buffer_load_to_local`: direct-to-LDS path requires gfx950; use
-  register-staged `buffer_load` + `local_store` instead.
-- `warp_pipeline_stage`: CDNA4+ cluster scheduling; not available here.
-- `extract_slice`, `rematerialized_range`: used by gfx950 kernels;
-  unconfirmed here.
-- TDM descriptor ops (`async_amd_descriptor_*`) are gfx1250+.
+- `async_load` and its commit/wait groups have an AMD lowering on gfx942. Direct-to-LDS copies require a legal 32-bit per-lane transfer; pointer-based copies can fall back to a synchronous transfer. See [async memory access](async-memory.html).
+- `extract_slice` and `rematerialized_range` have target-independent AMD lowering; they are not restricted to gfx950. See the [slice lowering](third_party/amd/lib/TritonAMDGPUDialectToLLVM/ExtractSliceOpToLLVM.cpp) and [range lowering](third_party/amd/lib/TritonAMDGPUToLLVM/MemoryOpToLLVM.cpp).
+- `warp_pipeline_stage` accepts HIP targets, including gfx942, but its existing target-specific examples exercise gfx950/gfx1250. Source availability is not a gfx942 runtime validation claim; see the [pipeline implementation](third_party/amd/lib/TritonAMDGPUTransforms/WarpPipeliner.cpp).
+- TDM descriptor operations (`async_amd_descriptor_*`) require the gfx1250 target family and are rejected on gfx942.

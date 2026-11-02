@@ -75,6 +75,7 @@ datatypes. Tags follow [tlx.md](tlx.html).
 | `padded_shared_layout_encoding` | Padded SMEM layout |
 | `shared_linear_layout_encoding` | Explicit linear SMEM mapping |
 | `DummyRegisterLayoutEncoding` | Placeholder layout resolved post-inline |
+| `nv_mma_shared_layout_encoding` | NVIDIA shared-memory layout used by Blackwell TMA and MMA operands |
 | `tensor_memory_layout_encoding` / `make_tensor_memory_layout` | TMEM layouts |
 | `tensor_memory_scales_layout_encoding` / `make_tensor_memory_scales_layout` | TMEM scale layouts |
 | `TMemCTAMode` | TMEM CTA-mode enum |
@@ -122,7 +123,5 @@ datatypes. Tags follow [tlx.md](tlx.html).
 - TMA descriptors need 16-byte-aligned row strides and a trailing
   stride of 1; the `mm`/`flash_attn` catalog entries enforce this via
   `accepts`.
-- `packed_add4/sub4/mul4/fma4` target sm103+ PTX and are unconfirmed
-  here (`?`).
-- `nv_mma_layout` / `nv_mma_shared_layout_encoding` are Hopper WGMMA
-  layouts; unconfirmed on Blackwell (`?`).
+- `packed_add4`, `packed_sub4`, `packed_mul4`, and `packed_fma4` require SM103+ and PTX 9.4. They are rejected on SM100; the [packed-arithmetic tests](python/test/unit/language/test_tlx_packed_arith_sm103up.py) cover SM100 rejection and SM103 code generation.
+- `nv_mma_layout` describes a Hopper WGMMA register accumulator, not a Blackwell TMEM accumulator. Use `tensor_memory_layout_encoding` for Blackwell `async_dot` accumulators. This is distinct from `nv_mma_shared_layout_encoding`, which Blackwell uses for TMA and MMA shared-memory operands; see the [compute implementation](third_party/tlx/language/tlx/mma_ops.py).
