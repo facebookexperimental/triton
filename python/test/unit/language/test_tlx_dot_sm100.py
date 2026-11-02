@@ -2220,3 +2220,38 @@ class TestToMxfp8:
         ref_scale, ref_data = self._reference_mxfp8_quantize(input_data.cpu(), VEC, torch_dtype)
         torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
         assert torch.equal(scale_out.cpu(), ref_scale.reshape(-1))
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("disable_nv_fence_insertion", [False, True])
+def test_async_dot_disable_nv_fence_insertion(device, disable_nv_fence_insertion):
+    """The disable_nv_fence_insertion option drops FenceInsertion's consumer-side fence before the MMA and keeps the
+    kernel's own producer-side fence."""
+
+    @triton.jit
+    def kernel(a_ptr, b_ptr, c_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        a_smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 1)[0]
+        b_smem = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, 1)[0]
+        tlx.local_store(a_smem, tl.load(a_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :]))
+        tlx.local_store(b_smem, tl.load(b_ptr + offs_k[:, None] * BLOCK_N + offs_n[None, :]))
+        tlx.fence_async_shared()
+        # A memory op between the kernel's fence and the MMA, so the compiler's fence is not a duplicate.
+        acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, 1, tlx.storage_kind.tmem)[0]
+        tlx.local_store(acc_tmem, tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
+        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarriers=[], out_dtype=tl.float32)
+        c = tlx.local_load(acc_tmem).to(tl.float16)
+        tl.store(c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], c)
+
+    torch.manual_seed(0)
+    M, N, K = 64, 64, 32
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b = torch.randn((K, N), device=device, dtype=torch.float16)
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+    compiled = kernel[(1, )](a, b, c, BLOCK_M=M, BLOCK_N=N, BLOCK_K=K,
+                             disable_nv_fence_insertion=disable_nv_fence_insertion)
+
+    assert compiled.asm["ttgir"].count("ttng.fence_async_shared") == (1 if disable_nv_fence_insertion else 2)
+    torch.testing.assert_close(c, torch.matmul(a, b))
