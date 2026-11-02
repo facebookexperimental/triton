@@ -2306,13 +2306,21 @@ def async_store(
 @tl.builtin
 def async_descriptor_store_wait(
     pendings: tl.constexpr,
+    read_only: tl.constexpr = False,
     _semantic=None,
 ) -> None:
     """
     Wait for completion of prior asynchronous TMA store operations.
+
+    With ``read_only=True``, only wait until the stores have finished reading
+    their shared-memory sources (``cp.async.bulk.wait_group.read``), not until
+    their writes are visible in global memory. That is enough before the source
+    buffer is written again.
     """
     pendings = tl._unwrap_if_constexpr(pendings)
-    _semantic.builder.create_async_TMA_store_wait(pendings)
+    read_only = tl._unwrap_if_constexpr(read_only)
+    assert isinstance(read_only, bool), f"read_only must be a constexpr bool, got {type(read_only).__name__}"
+    _semantic.builder.create_async_TMA_store_wait(pendings, read_only)
 
 
 @tl.builtin

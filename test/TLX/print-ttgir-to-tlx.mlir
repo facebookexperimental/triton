@@ -1083,6 +1083,15 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 
+  // CHECK: def read_only_store_wait(
+  // CHECK: tlx.async_descriptor_store_wait(0)
+  // CHECK: tlx.async_descriptor_store_wait(1, read_only=True)
+  tt.func public @read_only_store_wait() {
+    ttng.async_tma_store_wait {pendings = 0 : i32}
+    ttng.async_tma_store_wait {pendings = 1 : i32, read_only}
+    tt.return
+  }
+
   // CHECK: def diagnostic_memory_ops(
   // CHECK: var_{{[0-9_]+}} = tlx.local_slice({{.*}}, [128, 0], [128, 64])
   // CHECK: tlx.async_remote_shmem_copy(
