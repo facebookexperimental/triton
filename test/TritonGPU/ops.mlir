@@ -344,6 +344,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#tmem128 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 32, colStride = 1>
+#tmem64 = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @tmem_subslice_rows_within_block
+  // CHECK: ttng.tmem_subslice {{.*}} -> !ttg.memdesc<64x32xf32, #{{.*}}, #ttng.tensor_memory, mutable, 128x32>
+  // CHECK: ttng.tmem_subslice {{.*}} -> !ttg.memdesc<32x64xf32, #{{.*}}, #ttng.tensor_memory, mutable, 64x64>
+  tt.func @tmem_subslice_rows_within_block(%m128: !ttg.memdesc<128x32xf32, #tmem128, #ttng.tensor_memory, mutable>, %m64: !ttg.memdesc<64x64xf32, #tmem64, #ttng.tensor_memory, mutable>) {
+    %rows128 = ttng.tmem_subslice %m128 {offset = 64 : i32, dim = 0 : i32} : !ttg.memdesc<128x32xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x32xf32, #tmem128, #ttng.tensor_memory, mutable, 128x32>
+    %rows64 = ttng.tmem_subslice %m64 {offset = 32 : i32, dim = 0 : i32} : !ttg.memdesc<64x64xf32, #tmem64, #ttng.tensor_memory, mutable> -> !ttg.memdesc<32x64xf32, #tmem64, #ttng.tensor_memory, mutable, 64x64>
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK: #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = {{\[\[1, 0, 0, 0, 0\]\]}}}>
 #shared_rank_5 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0, 0, 0, 0]]}>
 #smem = #ttg.shared_memory
