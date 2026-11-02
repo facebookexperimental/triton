@@ -221,6 +221,8 @@ private:
 class AxisInfoAnalysis : public dataflow::SparseForwardDataFlowAnalysis<
                              dataflow::Lattice<AxisInfo>> {
 protected:
+  // Key by div/rem use: an assumption may prove its dividend nonnegative
+  // here without dominating other uses of the same value.
   DenseSet<Operation *> nonNegativeDividends;
   AxisInfoVisitorList visitors;
 
