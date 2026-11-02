@@ -251,6 +251,9 @@ def _a4w4_skinny_kernel(
         pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
         pid_n = (pid % num_pid_in_group) // group_size_m
 
+    tl.assume((pid_m * BLOCK_M >= 0) & (pid_m * BLOCK_M <= 2147483647 - (BLOCK_M - 1)))
+    tl.assume((pid_n * BLOCK_N >= 0) & (pid_n * BLOCK_N <= 2147483647 - (BLOCK_N - 1)))
+
     smem_a = tlx.local_alloc((BLOCK_M, BKP), tlx.dtype_of(a_ptr), BUFFER_COUNT, layout=shared_tile_a)
     smem_b = tlx.local_alloc((BLOCK_N, BKP), tlx.dtype_of(b_ptr), BUFFER_COUNT, layout=shared_tile_b)
     if BLOCK_M == 32:
