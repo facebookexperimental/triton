@@ -1128,20 +1128,31 @@ void init_triton_tlx_ir(py::module_ &m) {
              Value pred = self.create<arith::ConstantIntOp>(1, 1);
              self.create<ttng::TMEMStoreOp>(dst, src, pred);
            })
-      .def("create_tmem_subslice",
-           [](TritonOpBuilder &self, Value &src, int offset,
-              int size) -> mlir::Value {
-             // TMEMSubSliceOp::verify() already checks src/dst layouts. Keep
-             // these lightweight frontend shape checks close to construction.
-             auto srcTy = dyn_cast<triton::gpu::MemDescType>(src.getType());
-             assert(srcTy != nullptr && "Expect MemDescType for src");
-             auto shape = srcTy.getShape();
-             assert(!shape.empty() && "Expect non-empty shape for src");
-             auto dimN = shape.back();
-             assert(offset >= 0 && offset < dimN && "Invalid offset");
-             assert(size > 0 && size <= dimN - offset && "Invalid size");
-             return self.create<ttng::TMEMSubSliceOp>(src, offset, size);
-           })
+      .def(
+          "create_tmem_subslice",
+          [](TritonOpBuilder &self, Value &src, int offset, int size,
+             int dim) -> mlir::Value {
+            // TMEMSubSliceOp::verify() already checks src/dst layouts. Keep
+            // these lightweight frontend shape checks close to construction.
+            auto srcTy = dyn_cast<triton::gpu::MemDescType>(src.getType());
+            assert(srcTy != nullptr && "Expect MemDescType for src");
+            auto shape = srcTy.getShape();
+            assert(!shape.empty() && "Expect non-empty shape for src");
+            int rank = shape.size();
+            if (dim < 0)
+              dim += rank;
+            assert(dim >= 0 && dim < rank && "Invalid dim");
+            auto extent = shape[dim];
+            assert(offset >= 0 && offset < extent && "Invalid offset");
+            assert(size > 0 && size <= extent - offset && "Invalid size");
+            if (dim == rank - 1)
+              return self.create<ttng::TMEMSubSliceOp>(src, offset, size);
+            // Rows of a 2D descriptor (TMEM lanes).
+            assert(rank == 2 && "Only 2D descriptors can be sliced by rows");
+            return self.create<ttng::TMEMSubSliceOp>(src, offset, size, dim);
+          },
+          py::arg("src"), py::arg("offset"), py::arg("size"),
+          py::arg("dim") = -1)
       .def(
           "create_tcgen5_dot",
           [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,

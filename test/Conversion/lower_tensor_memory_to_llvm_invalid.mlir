@@ -15,3 +15,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %loaded : tensor<128x128xf32, #v4>
   }
 }
+
+// -----
+
+// A task of 2 warps reaches only the TMEM lanes of its own warps. A register bit
+// on row 64 of a whole 128-row buffer would put warp 0 on lanes 64-95.
+
+#l2 = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0]], block = []}>
+#v2 = #tlx.user_layout<#tlx.no_verify_layout<#l2>>
+#tmem128x16 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 16, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @two_warps_past_their_lanes(%src: !ttg.memdesc<128x16xf32, #tmem128x16, #ttng.tensor_memory, mutable>) -> tensor<128x16xf32, #v2> {
+    // expected-error@+2 {{A task of 2 warp(s) can only access the TMEM rows in the lanes of its own warps}}
+    // expected-error@+1 {{failed to legalize operation 'ttng.tmem_load' that was explicitly marked illegal}}
+    %loaded = ttng.tmem_load %src : !ttg.memdesc<128x16xf32, #tmem128x16, #ttng.tensor_memory, mutable> -> tensor<128x16xf32, #v2>
+    tt.return %loaded : tensor<128x16xf32, #v2>
+  }
+}

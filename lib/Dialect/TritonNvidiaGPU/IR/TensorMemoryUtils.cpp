@@ -210,9 +210,12 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
   // We store the instruction, the resulting reps layout, the permutation and
   // the number of registers per message
   std::optional<TMemLdStEncodingInfo> msgInfo;
+  // A task of 1 or 2 warps covers only the lanes of its own warps.
+  int numWarpBases = std::min(2, cvt.getInDimSizeLog2(S("warp")));
   for (auto atom : {TMemAccessAtom::I32x32b, TMemAccessAtom::I16x256b,
                     TMemAccessAtom::I16x64b, TMemAccessAtom::I16x128b}) {
-    auto tile = getTileLayout(ctx, atom, unpacked, /*withWarp=*/true);
+    auto tile =
+        getTileLayout(ctx, atom, unpacked, /*withWarp=*/true, numWarpBases);
     auto maybeReps = getVec(cvt, tile, maxnreg);
     if (maybeReps) {
       // Cannot match more than one
@@ -226,7 +229,7 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
     // Quotient by the smaller tile and then, if possible, we set the
     // secondHalfOffset to the last kLane basis
     auto tile = getTileLayout(ctx, TMemAccessAtom::I16x32bx2, unpacked,
-                              /*withWarp=*/true);
+                              /*withWarp=*/true, numWarpBases);
     auto maybeReps = getVec(cvt, tile, maxnreg);
     if (maybeReps) {
       auto [reps, perm, numRegsPerMessage] = std::move(*maybeReps);
@@ -297,11 +300,37 @@ computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
     return failure();
   }
   cvt = maybeSublayout.value();
-  // Warps 0-3 must map to row=32 and row=64 whether with broadcasting or not
-  if (!(regLayout.getBasis(kWarp, 0) == memLayout.getBasis(kRow, 5) &&
-        regLayout.getBasis(kWarp, 1) == memLayout.getBasis(kRow, 6))) {
+  // Warps 0-3 must map to row=32 and row=64 whether with broadcasting or not.
+  // A task of 1 or 2 warps has only the first of these bases (it accesses a
+  // row slice held in the lanes of its own warps).
+  int numWarpBases = std::min(2, regLayout.getInDimSizeLog2(kWarp));
+  bool warpsMatch = memLayout.getInDimSizeLog2(kRow) >= 5 + numWarpBases;
+  for (int i = 0; warpsMatch && i < numWarpBases; ++i)
+    warpsMatch =
+        regLayout.getBasis(kWarp, i) == memLayout.getBasis(kRow, 5 + i);
+  if (!warpsMatch) {
     if (emitError) {
       emitError() << "warps=1,2 must map to rows=32,64. Got:\n"
+                  << regLayout.toString() << "\n"
+                  << memLayout.toString();
+    }
+    return failure();
+  }
+  // Such a task reaches only the lanes of its own warps, so the memory must
+  // hold no row past them. A row slice keeps the row bits of its source with
+  // the bases past the slice set to zero, so the bit count alone cannot tell
+  // a slice from a whole buffer.
+  bool rowsInWarps = true;
+  for (int i = 5 + numWarpBases;
+       numWarpBases < 2 && rowsInWarps && i < memLayout.getInDimSizeLog2(kRow);
+       ++i)
+    rowsInWarps = llvm::all_of(memLayout.getBasis(kRow, i),
+                               [](int32_t b) { return b == 0; });
+  if (!rowsInWarps) {
+    if (emitError) {
+      emitError() << "A task of " << (1 << numWarpBases)
+                  << " warp(s) can only access the TMEM rows in the lanes of "
+                     "its own warps. Got:\n"
                   << regLayout.toString() << "\n"
                   << memLayout.toString();
     }
@@ -311,8 +340,8 @@ computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
   // automatically in `invertAndCompose` if we had a different dimension name
   // for these rows. We can do this in the future if needed.
   auto bases = cvt.getBases();
-  bases[kWarp][0] = {32, 0};
-  bases[kWarp][1] = {64, 0};
+  for (int i = 0; i < numWarpBases; ++i)
+    bases[kWarp][i] = {32 << i, 0};
   cvt = LinearLayout(std::move(bases), cvt.getOutDims(),
                      /*isSurjective=*/cvt.isSurjective());
 

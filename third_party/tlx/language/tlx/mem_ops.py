@@ -905,22 +905,36 @@ def subslice(
     local_allocated_buffer: tlx.buffered_tensor,
     offset: int,
     size: int,
+    dim: int = -1,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """
-    Returns a subslice of the buffer (in TMEM). The source has to be 128xN and the slicing is
-    along the innermost dimension.
+    Returns a subslice of the buffer (in TMEM). The source has to be 128xN or 64xN. The slicing is
+    along the innermost dimension by default; dim=0 slices the rows (TMEM lanes) of a 2D buffer.
+
+    A row slice is how a task of fewer than 4 warps addresses TMEM: warp w of a warpgroup can only
+    access lanes [32 * (w % 4), 32 * (w % 4) + 32), so such a task may only load or store the rows
+    held in the lanes of its own warps (for example, a 2-warp task starting at warp 4k + 2 owns rows
+    64-127 of a 128xN buffer, or rows 32-63 of a 64xN buffer). Warp i of the task accesses the
+    rows of lane quadrant i of the slice; pin the task with `warp_group_start_id` so that this is
+    its own quadrant, and pass the register layout to `local_load` or `local_store` explicitly (`layout=`).
 
     :param local_allocated_buffer: the source buffer
     :param offset: the start offset of the subslice, in terms of number of elements
     :param size: the size of the subslice, in terms of number of elements
+    :param dim: the sliced dimension: -1 (innermost, default) or 0 (rows of a 2D buffer)
     """
     # this is for TMEM subslice
+    dim = tl._unwrap_if_constexpr(dim)
+    offset = tl._unwrap_if_constexpr(offset)
+    size = tl._unwrap_if_constexpr(size)
     assert local_allocated_buffer.type.storage == tlx.storage_kind.tmem, "subslice is only supported for tmem"
     assert isinstance(local_allocated_buffer.type, tl.block_type), "subslice src is not block type"
-    subslice_shape = [dim for dim in local_allocated_buffer.type.shape[:-1]] + [size]
+    shape = list(local_allocated_buffer.type.shape)
+    assert dim in (-1, len(shape) - 1) or (dim == 0 and len(shape) == 2), "subslice dim must be -1 or 0 (2D rows)"
+    subslice_shape = shape[:-1] + [size] if dim in (-1, len(shape) - 1) else [size] + shape[1:]
     return tlx.buffered_tensor(
-        _semantic.builder.create_tmem_subslice(local_allocated_buffer.handle, offset, size),
+        _semantic.builder.create_tmem_subslice(local_allocated_buffer.handle, offset, size, dim),
         local_allocated_buffer.type.element_ty,
         subslice_shape,
         local_allocated_buffer.type.num,
@@ -1259,18 +1273,29 @@ def local_scatter(
 def local_store(
     dst: tlx.buffered_tensor,
     src: tl.tensor,
+    layout=None,
     _semantic=None,
 ) -> tl.tensor:
     """
     Store a distributed tensor into a buffer in local or tensor memory.
+
+    ``layout`` (optional, tensor memory only) pins the register layout the value
+    is stored from, written as a ``tlx.layout(...)`` (Shape:Stride) as for
+    ``local_load``. A task of 1 or 2 warps storing into a row slice must pass it.
     """
     storage = dst.type.storage
+    layout = tl._unwrap_if_constexpr(layout)
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
-        tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, dst)
-        src_handle = _semantic.builder.create_require_layout(src.handle, tmem_compatible_layout_encoding)
+        if layout is not None:
+            enc = layout.to_ir(_semantic.builder, dst.type.shape, dst.type.element_ty)
+            src_handle = _semantic.builder.create_require_layout(src.handle, enc, pin=True)
+        else:
+            tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, dst)
+            src_handle = _semantic.builder.create_require_layout(src.handle, tmem_compatible_layout_encoding)
         return tl.tensor(_semantic.builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
+    assert layout is None, "local_store only takes a layout for tensor memory"
     return tl.tensor(_semantic.builder.create_local_store(dst.handle, src.handle), tl.void)
 
 
