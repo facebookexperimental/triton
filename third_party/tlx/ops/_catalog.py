@@ -50,6 +50,7 @@ _ATTN_DIMS = frozenset({"B", "H", "SQ", "SKV", "D"})
 _VARLEN_DIMS = frozenset({"TQ", "TKV", "H", "D"})
 _HSTU_DIMS = frozenset({"B", "LQ", "LKV", "H", "D"})
 _KDA_DIMS = frozenset({"T", "H", "D"})
+_ROW_DIMS = frozenset({"T", "D"})
 
 _NORM_MODULES = {
     'sm100': ['layernorm', 'layernorm_add', 'rmsnorm', 'norm_fwd', 'norm_bwd', 'norm_backward_from_normalized'],
@@ -408,6 +409,18 @@ CATALOG: tuple[OpSpec, ...] = (
         invariant_vocab=_VARLEN_DIMS,
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+        requires=frozenset({"tma"}),
+        supports_backward=False,
+    ),
+    OpSpec(
+        op="swiglu_ffn",
+        arch="sm90",
+        variant="tlx_ws_persistent",
+        impl="triton.tlx.ops.kernels.swiglu_ffn.sm90:swiglu_ffn",
+        invariant_vocab=_ROW_DIMS,
+        dtypes=frozenset({"float16"}),
+        # TMA reads the weights: their data must start on a 16-byte boundary.
+        accepts=lambda d: d.get("D") in (128, 256) and all(ptr % 16 == 0 for ptr in d.get("base_ptrs", ())),
         requires=frozenset({"tma"}),
         supports_backward=False,
     ),
