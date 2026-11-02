@@ -263,6 +263,10 @@ class CUDAOptions:
     enable_tree_reduction: bool = False
     enable_nvptx_v2i32: bool = False
     sched4reg: bool = False
+    # Skip the FenceInsertion pass, which adds a fence.proxy.async before MMAs and TMA stores or reductions that
+    # read shared memory written through the generic proxy. The kernel is then responsible for those fences. The
+    # post-allocation ProxyFenceInsertion pass still runs.
+    disable_nv_fence_insertion: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -1178,7 +1182,8 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_report_tlx_barrier_hotspots(pm)
         if knobs.nvidia.promote_mbarrier_to_named_barrier:
             nvidia.passes.ttnvgpuir.add_promote_mbarrier_to_named_barrier(pm)
-        nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
+        if not opt.disable_nv_fence_insertion:
+            nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
         nvidia.passes.ttnvgpuir.add_hoist_mbarrier_lifecycle(pm, capability)
         passes.common.add_sccp(pm)
