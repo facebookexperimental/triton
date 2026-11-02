@@ -1019,7 +1019,10 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
-            if not (knobs.nvidia.use_modulo_schedule or knobs.nvidia.use_joint_schedule):
+            # FPSan emulates floating-point MMA with integer arithmetic. Flattened
+            # persistent loops and warp specialization can cause excessive spills.
+            if not is_enabled(opt, "fpsan") and not (knobs.nvidia.use_modulo_schedule
+                                                     or knobs.nvidia.use_joint_schedule):
                 passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
@@ -1074,7 +1077,11 @@ class CUDABackend(BaseBackend):
             # passes below.
             ran_list_schedule = (knobs.nvidia.use_list_schedule and not knobs.nvidia.use_llm_schedule
                                  and not knobs.nvidia.use_joint_schedule and knobs.nvidia.use_modulo_schedule is None)
-            if ran_list_schedule:
+            # FPSan (integer-emulated MMA) spills excessively under warp
+            # specialization: skip every WS path below, matching upstream intent.
+            if is_enabled(opt, "fpsan"):
+                pass
+            elif ran_list_schedule:
                 # List scheduling is a no-warp-specialization transform: it
                 # writes only loop.stage/loop.cluster (+ tt.modulo_ii marker) and
                 # feeds the pipeliner directly. Running either WS path here would
@@ -1303,13 +1310,20 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
+        nvidia.passes.ttgpuir.add_membar(pm, capability, ptx_version)
+        nvidia.passes.ttnvgpuir.add_tmem_wait_insertion(pm)
+        if is_enabled(options, "consan"):
+            passes.ttgpuir.add_concurrency_sanitizer(pm)
+            passes.gluon.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
+        nvidia.passes.ttnvgpuir.add_cluster_barrier_mbar_allocator(pm)
+        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         if capability // 10 >= 10 and not knobs.nvidia.disable_mma_collector_reuse:
             nvidia.passes.ttnvgpuir.add_mma_collector_reuse(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(
             pm,
             capability,
             ptx_version,
-            is_enabled(options, "consan"),
             options.enable_tree_reduction,
         )
         nvidia.passes.ttnvgpuir.add_initialize_ws_cluster_barriers(pm, capability, ptx_version)

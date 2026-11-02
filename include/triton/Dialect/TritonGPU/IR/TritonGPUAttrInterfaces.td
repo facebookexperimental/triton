@@ -28,13 +28,17 @@ def SharedEncodingTrait : AttrInterface<"SharedEncodingTrait"> {
   let description = [{
     Common trait describing shared memory.
   }];
-  let methods = [InterfaceMethod<"Return the default alignment for the layout.",
-                                 "int32_t", "getAlignment", (ins), [{}],
-                                 [{ return 16; }]>,
+  let methods = [
+    InterfaceMethod<"Return the default alignment for the layout.",
+                    "int32_t", "getAlignment", (ins), [{}], [{ return 16; }]>,
+    InterfaceMethod<"Convert to LinearLayout.",
+                    "LinearLayout",
+                    "toLinearLayout",
+                    (ins "ArrayRef<int64_t>":$shape)>,
   ];
 }
-def DeclareSharedEncodingMethods
-    : DeclareAttrInterfaceMethods<SharedEncodingTrait, ["getAlignment"]>;
+def DeclareSharedEncodingMethods : DeclareAttrInterfaceMethods<
+  SharedEncodingTrait, ["getAlignment", "toLinearLayout"]>;
 
 // Marker interface for encodings that the user pinned explicitly and that
 // layout passes must treat as fixed (e.g. an anchor in

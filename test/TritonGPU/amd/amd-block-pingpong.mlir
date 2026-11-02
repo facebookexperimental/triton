@@ -274,7 +274,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK: %[[SLICEB1:.+]] = ttg.local_load
 // CHECK: rocdl.sched.barrier none
 // CHECK: tt.load
-// CHECK: rocdl.s.barrier
+// CHECK: ttg.barrier local
 // CHECK: rocdl.sched.barrier none
 // CHECK: rocdl.s.setprio 1
 // CHECK: %[[DOT0:.+]] = tt.dot %[[SLICEA0]], %[[SLICEB0]]
@@ -672,7 +672,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: %[[SLICEB1:.+]] = ttg.local_load
 // CHECK: rocdl.sched.barrier none
 // CHECK: tt.load
-// CHECK: rocdl.s.barrier
+// CHECK: ttg.barrier local
 // CHECK: rocdl.sched.barrier none
 // CHECK: rocdl.s.setprio 1
 // CHECK: %[[DOT0:.+]] = tt.dot %[[SLICEA0]], %[[SLICEB0]]
@@ -1037,7 +1037,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 //CHECK: ttg.local_load
 //CHECK: rocdl.sched.barrier
 //CHECK: tt.load
-//CHECK: rocdl.s.barrier
+//CHECK: ttg.barrier local
 //CHECK: rocdl.sched.barrier
 //CHECK: rocdl.s.setprio 1
 //CHECK: tt.dot
@@ -1150,7 +1150,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK: %[[SLICEB1:.+]] = ttg.local_load
 // CHECK: rocdl.sched.barrier none
 // CHECK: tt.load
-// CHECK: rocdl.s.barrier
+// CHECK: ttg.barrier local
 // CHECK: rocdl.sched.barrier none
 // CHECK: rocdl.s.setprio 1
 // CHECK: %[[DOT0:.+]] = tt.dot %[[SLICEA0]], %[[SLICEB0]]
@@ -1556,7 +1556,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: %[[SLICEB1:.+]] = ttg.local_load
 // CHECK: rocdl.sched.barrier none
 // CHECK: tt.load
-// CHECK: rocdl.s.barrier
+// CHECK: ttg.barrier local
 // CHECK: rocdl.sched.barrier none
 // CHECK: rocdl.s.setprio 1
 // CHECK: %[[DOT0:.+]] = tt.dot %[[SLICEA0]], %[[SLICEB0]]

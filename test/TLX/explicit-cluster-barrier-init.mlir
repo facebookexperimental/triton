@@ -1,5 +1,5 @@
-// RUN: triton-opt -split-input-file --inline --allocate-shared-memory-nv --convert-triton-gpu-to-llvm=compute-capability=90 %s | FileCheck %s
-// RUN: triton-opt -split-input-file --inline --allocate-shared-memory-nv --convert-triton-gpu-to-llvm=compute-capability=100 %s | FileCheck %s
+// RUN: triton-opt -split-input-file --inline --allocate-shared-memory-nv --triton-nvidia-gpu-membar=compute-capability=90 --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm=compute-capability=90 %s | FileCheck %s
+// RUN: triton-opt -split-input-file --inline --allocate-shared-memory-nv --triton-nvidia-gpu-membar=compute-capability=100 --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm=compute-capability=100 %s | FileCheck %s
 
 // No remote consumers or paired MMA: the explicit request alone bootstraps
 // the physical cluster while retaining logical num-ctas=1.

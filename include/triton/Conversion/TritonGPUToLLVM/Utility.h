@@ -53,6 +53,11 @@ createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
 
 namespace mlir::triton {
 
+// The address of the descriptor's logical origin in its memory space.
+Value getMemDescAddress(RewriterBase &rewriter, Location loc,
+                        const LLVMTypeConverter *typeConverter,
+                        gpu::MemDescType type, Value lowered);
+
 // Shared by backend-specific and generic local-load conversion patterns so a
 // named group produces one lane/warp rematerialization point even when its
 // loads take different lowering paths.

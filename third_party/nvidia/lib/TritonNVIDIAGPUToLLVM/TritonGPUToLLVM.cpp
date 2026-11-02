@@ -1,9 +1,6 @@
-#include "TritonNVIDIAGPUToLLVM/Passes.h"
-#include "TritonNVIDIAGPUToLLVM/Utility.h"
-
-#include "Allocation.h"
 #include "Dialect/NVGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
+#include "TritonNVIDIAGPUToLLVM/Passes.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
@@ -27,11 +24,9 @@
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
-#include "triton/Dialect/Gluon/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
-#include "triton/Dialect/TritonInstrument/Transforms/ConSanTargetHooks.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/NamedBarrier.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierInsertion.h"
@@ -110,20 +105,13 @@ struct ConvertTritonGPUToLLVM
   ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion)
       : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion}) {}
   ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
-                         bool enableConcurrencySanitizer)
-      : ConvertTritonGPUToLLVMBase(
-            {computeCapability, ptxVersion, enableConcurrencySanitizer}) {}
-  ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
-                         bool enableConcurrencySanitizer,
                          bool enableTreeReduction)
-      : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion,
-                                    enableConcurrencySanitizer,
-                                    enableTreeReduction}) {}
+      : ConvertTritonGPUToLLVMBase(
+            {computeCapability, ptxVersion, enableTreeReduction}) {}
 
   void runOnOperation() override;
 
 private:
-  LogicalResult prepareModule(ModuleOp mod, TargetInfo &targetInfo);
   LogicalResult lowerFunctions(ModuleOp mod, LLVMTypeConverter &typeConverter,
                                TargetInfo &targetInfo);
   void populateConversionPatterns(LLVMTypeConverter &typeConverter,
@@ -468,13 +456,6 @@ void ConvertTritonGPUToLLVM::runOnOperation() {
   ModuleOp mod = getOperation();
   TargetInfo targetInfo(computeCapability, ptxVersion);
 
-  // These analyses and transformations require high-level shared-memory ops,
-  // so they must all run before dialect conversion starts.
-  if (failed(prepareModule(mod, targetInfo))) {
-    signalPassFailure();
-    return;
-  }
-
   mlir::LowerToLLVMOptions option(context);
   option.overrideIndexBitwidth(32);
   TritonGPUToLLVMTypeConverter typeConverter(context, option, targetInfo);
@@ -497,78 +478,6 @@ void ConvertTritonGPUToLLVM::runOnOperation() {
   }
 
   finalizeModule(mod);
-}
-
-LogicalResult ConvertTritonGPUToLLVM::prepareModule(ModuleOp mod,
-                                                    TargetInfo &targetInfo) {
-  // Assign warp-specialization barrier IDs before shared-memory allocation.
-  mlir::triton::nvidia_gpu::NamedBarrierIdAllocator barrierAllocator(mod);
-  if (failed(mlir::triton::nvidia_gpu::ensureWarpSpecializeBarrierIds(
-          mod, barrierAllocator)))
-    return failure();
-
-  // Hoisting must precede allocation so liveness sees the entry prologue.
-  SetVector<Operation *> coveredInitOps;
-  if (failed(maybeInsertClusterSync(mod, coveredInitOps)))
-    return failure();
-
-  // Single-WS lowering handles exactly one warp_specialize region, but lowering
-  // adds a synthetic region for each cluster sync that worker warps must join.
-  // Those regions need the multi-region dispatch loop, whose shared-memory
-  // state allocation must reserve. The cluster barrier insertion passes below
-  // run after allocation and add syncs only on SM90+ in logical multi-CTA
-  // modules, so conservatively drop single-WS for those.
-  bool droppedSingleWS = false;
-  if (triton::gpu::hasSingleWarpSpecialize(mod) &&
-      (NVIDIA::needsSyntheticWarpSpecialize(mod) ||
-       (computeCapability >= 90 &&
-        triton::gpu::TritonGPUDialect::getNumCTAs(mod) > 1))) {
-    mod->removeAttr(triton::gpu::AttrSingleWarpSpecializeName);
-    droppedSingleWS = true;
-  }
-
-  ModuleAllocation allocation(
-      mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
-               targetInfo));
-  if (!coveredInitOps.empty() || droppedSingleWS)
-    triton::gpu::attachAllocationSizeAndOffsetAttr(mod, allocation);
-  mlir::triton::nvidia_gpu::runClusterBarrierInsertion(allocation,
-                                                       computeCapability);
-  if (failed(mlir::triton::nvidia_gpu::runCrossCTAMBarrierInitSyncInsertion(
-          allocation, computeCapability, coveredInitOps.getArrayRef())))
-    return failure();
-
-  ModuleMembarAnalysis membarPass(allocation, canSkipBarSync);
-  membarPass.run();
-  mlir::PassManager waitPm(mod.getContext());
-  waitPm.addPass(ttng::createTritonNvidiaGPUTMemWaitInsertionPass());
-  if (failed(waitPm.run(mod)))
-    return failure();
-
-  if (enableConcurrencySanitizer) {
-    auto hooks = mlir::triton::instrument::createConSanHooks("nvidia");
-    if (!hooks) {
-      mod.emitError("no ConSan hooks registered for nvidia");
-      return failure();
-    }
-    if (failed(mlir::triton::instrument::runConcurrencySanitizer(mod, *hooks)))
-      return failure();
-
-    // Normalize instrumentation-generated IR before allocation and lowering.
-    mlir::PassManager cleanupPm(mod.getContext());
-    cleanupPm.addPass(mlir::triton::gluon::createGluonCanonicalize());
-    cleanupPm.addPass(mlir::createCSEPass());
-    if (failed(cleanupPm.run(mod)))
-      return failure();
-  }
-
-  mlir::triton::nvidia_gpu::runClusterBarrierMbarAllocator(mod);
-  mod.walk([&](triton::gpu::GlobalScratchAllocOp) -> WalkResult {
-    mlir::triton::gpu::runGlobalScratchMemoryAllocation(mod);
-    return WalkResult::interrupt();
-  });
-
-  return success();
 }
 
 LogicalResult ConvertTritonGPUToLLVM::lowerFunctions(
@@ -721,44 +630,9 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability,
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
-                                 bool enableConcurrencySanitizer) {
-  return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
-                                                  enableConcurrencySanitizer);
-}
-
-std::unique_ptr<OperationPass<ModuleOp>>
-createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
-                                 bool enableConcurrencySanitizer,
                                  bool enableTreeReduction) {
   return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
-                                                  enableConcurrencySanitizer,
                                                   enableTreeReduction);
-}
-
-bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,
-                            bool /*beforeIsRead*/, bool /*afterIsRead*/,
-                            Allocation * /*allocation*/) {
-  // These mbarrier ops are single threaded, so are always synchronized wrt.
-  // each other.
-  if (isa<ttng::InitBarrierOp, ttng::InvalBarrierOp, ttng::BarrierExpectOp>(
-          before) &&
-      isa<ttng::InitBarrierOp, ttng::InvalBarrierOp, ttng::BarrierExpectOp>(
-          after))
-    return true;
-
-  // wait_barrier will never run ahead of the load it's waiting on
-  if (isa<ttng::TMALoadLikeOpInterface>(before) &&
-      isa<ttng::WaitBarrierOp>(after))
-    return true;
-
-  // Identical same-width commutative atomics can be freely reordered.
-  auto beforeAtomic = dyn_cast<triton::gpu::LocalAtomicScatterRMWOp>(before);
-  auto afterAtomic = dyn_cast<triton::gpu::LocalAtomicScatterRMWOp>(after);
-  return beforeAtomic && afterAtomic && beforeAtomic.isCommutative() &&
-         afterAtomic.isCommutative() &&
-         beforeAtomic.getAtomicRmwOp() == afterAtomic.getAtomicRmwOp() &&
-         beforeAtomic.getDst().getType().getElementType() ==
-             afterAtomic.getDst().getType().getElementType();
 }
 
 } // namespace mlir::triton

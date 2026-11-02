@@ -362,6 +362,7 @@ def TT_AtomicStoreOp : TT_Op<"atomic_store", [
     }];
 
     let hasVerifier = 1;
+    let hasCanonicalizeMethod = 1;
 }
 
 def TT_AtomicPollOp : TT_Op<"atomic_poll", [
@@ -583,9 +584,12 @@ def TT_JoinOp : TT_Op<"join", [Pure, SameTypeOperands]> {
   let hasFolder = 1;
 }
 
-def TT_SplitOp : TT_Op<"split", [Pure, InferTypeOpAdaptorWithIsCompatible,
-                                 TypesMatchWith<"outLHS and outRHS types match",
-                                                "outLHS", "outRHS", "$_self">,
+def TT_SplitOp : TT_Op<"split", [
+  Pure,
+  SameResultsType,
+  InferTypeOpAdaptorWithIsCompatible,
+  TypesMatchWith<"outLHS and outRHS types match",
+                  "outLHS", "outRHS", "$_self">,
 ]> {
   let summary = "splits a tensor into two, along its last dimension";
   let description = [{
@@ -939,7 +943,7 @@ def TT_ElementwiseInlineAsmOp
 
   let arguments = (ins StrAttr:$asm_string, StrAttr:$constraints,
       BoolAttr:$pure, I32Attr:$packed_element,
-      Variadic<AnyTypeOf<[TT_Type]>>:$args);
+      Variadic<AnyType>:$args);
   let results = (outs Variadic<TT_Type>:$result);
 
   let assemblyFormat = [{

@@ -200,6 +200,11 @@ static bool filterFn(Operation *lhs, Operation *rhs, bool /*lhsIsRead*/,
   TMemAccessKind lhsKind = getTMemAccessKind(lhs);
   TMemAccessKind rhsKind = getTMemAccessKind(rhs);
 
+  // filterFn only runs for ops already collected into TMEM sync slices, so a
+  // None kind here means a TMEM-effecting op of unknown kind: fail closed.
+  if (lhsKind == TMemAccessKind::None || rhsKind == TMemAccessKind::None)
+    return false;
+
   bool war =
       lhsKind == TMemAccessKind::Load && rhsKind == TMemAccessKind::Store;
   bool raw =

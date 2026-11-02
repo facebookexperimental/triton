@@ -203,7 +203,6 @@ def _elementwise_max(a, b):
                             multi_cta_arg="multi_cta")
 def max(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False,
         reduction_ordering: core.constexpr = None, multi_cta: core.constexpr = False):
-    input = core._promote_bfloat16_to_float32(input)
     if return_indices:
         core.static_assert(not multi_cta, "multi_cta does not support indexed reductions")
         if return_indices_tie_break_left:
@@ -270,7 +269,6 @@ def _elementwise_min(a, b):
                             multi_cta_arg="multi_cta")
 def min(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False,
         reduction_ordering: core.constexpr = None, multi_cta: core.constexpr = False):
-    input = core._promote_bfloat16_to_float32(input)
     if return_indices:
         core.static_assert(not multi_cta, "multi_cta does not support indexed reductions")
         if return_indices_tie_break_left:
@@ -331,16 +329,6 @@ def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None, reducti
     # Pick a default dtype for the reduction if one was not specified.
     out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
     input = input.to(out_dtype)
-
-    # Facebook. begin
-    input = core._promote_bfloat16_to_float32(input)
-    # Both torch.sum and Triton default promote bfloat16 to float32 before reduce
-    # and PTX does `add.f32` while Triton Beta generates `add.bf16x2`.
-    # The latter one makes more sense to me while this patch keeps Triton Beta
-    # consistent with Triton default first. More details are discussed at
-    # https://fb.workplace.com/groups/1405155842844877/posts/24616028937997573/?comment_id=24616575671276233&reply_comment_id=24617223141211486
-    # Facebook. end
-
     return core.reduce(input, axis, _sum_combine, keep_dims=keep_dims, reduction_ordering=reduction_ordering,
                        multi_cta=multi_cta)
 
@@ -384,9 +372,6 @@ def reduce_or(input, axis, keep_dims=False):
 @jit
 @core._add_scan_docstr("cumsum", dtype_arg="dtype")
 def cumsum(input, axis=0, reverse=False, dtype: core.constexpr = None, reduction_ordering: core.constexpr = None):
-    # todo rename this to a generic function name
-
-    input = core._promote_bfloat16_to_float32(input)
     out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
     input = input.to(out_dtype)
     return core.associative_scan(input, axis, _sum_combine, reverse, reduction_ordering=reduction_ordering)
@@ -402,10 +387,10 @@ def _prod_combine(a, b):
 
 @core._tensor_member_fn
 @jit
-@core._add_scan_docstr("cumprod")
-def cumprod(input, axis=0, reverse=False, reduction_ordering: core.constexpr = None):
-    # todo rename this to a generic function name
-    input = core._promote_bfloat16_to_float32(input)
+@core._add_scan_docstr("cumprod", dtype_arg="dtype")
+def cumprod(input, axis=0, reverse=False, dtype: core.constexpr = None, reduction_ordering: core.constexpr = None):
+    out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
+    input = input.to(out_dtype)
     return core.associative_scan(input, axis, _prod_combine, reverse, reduction_ordering=reduction_ordering)
 
 
