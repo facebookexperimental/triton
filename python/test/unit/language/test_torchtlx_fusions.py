@@ -9,6 +9,7 @@ Usage:
 import os
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -1313,6 +1314,165 @@ class TestTorchTLXEpilogueFusion(TestCase):
 
         torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
         self._assert_reduction_epilogue_fused(code, fused=False)
+
+
+def is_gfx942():
+    """True on AMD MI300X (gfx942)."""
+    try:
+        from triton.language.extra.tlx.hw.target import current_target
+    except ImportError:
+        return False
+    return current_target().is_gfx942
+
+
+@instantiate_parametrized_tests
+class TestGfx942ReductionEpilogue(TestCase):
+
+    def _centered_swish_norm(self, value):
+        value = value.to(torch.float32)
+        value = value - value.mean(dim=-1, keepdim=True)
+        value = value / torch.sqrt(torch.square(value).mean(dim=-1, keepdim=True) + 1e-5)
+        value = value.to(torch.float16)
+        return value * torch.sigmoid(value)
+
+    def _gated_swish_norm(self, value, norm_weight, norm_bias, *, clip=False):
+        dtype = value.dtype
+        value = value.to(torch.float32)
+        centered = value - value.mean(dim=[-1], keepdim=True)
+        if clip:
+            centered = torch.clip(centered, -65504.0, 65504.0)
+        normed = torch.nn.functional.rms_norm(centered, [value.shape[-1]], weight=None, eps=1e-5)
+        normed = normed * norm_weight.to(torch.float32) + norm_bias.to(torch.float32)
+        return (value * torch.sigmoid(normed)).to(dtype)
+
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("epilogue",
+                 ("layernorm", "rmsnorm", "centered_swish_norm", "centered_swish_norm_residual", "gated_swish_norm",
+                  "centered_swish_norm_wide_tile", "centered_swish_norm_tail_tile", "clipped_gated_swish_norm"))
+    def test_gfx942_reduction_epilogue_is_fused(self, epilogue: str):
+        """addmm + row-normalization epilogues lower to the gfx942 template with row partials and a consumer."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        m, k, n = (4662, 2560, 2560) if epilogue == "centered_swish_norm_wide_tile" else (1000, 512, 2560)
+        if epilogue == "centered_swish_norm_tail_tile":
+            m, k, n = 1000, 512, 2600
+        fp16 = {"device": GPU_TYPE, "dtype": torch.float16}
+        x = torch.randn((m, k), **fp16)
+        weight = torch.randn((n, k), **fp16) / k**0.5
+        bias = torch.randn((n, ), **fp16)
+        res = torch.randn((m, n), **fp16)
+        scale = torch.randn((n, ), **fp16)
+        shift = torch.randn((n, ), **fp16)
+
+        def layer(x, weight, bias, res, scale, shift):
+            value = torch.nn.functional.linear(x, weight, bias)
+            if epilogue in ("layernorm", "rmsnorm"):
+                return _normalize(value, scale, shift, epilogue)
+            if epilogue == "gated_swish_norm":
+                return self._gated_swish_norm(value, scale, shift)
+            if epilogue == "clipped_gated_swish_norm":
+                return self._gated_swish_norm(value, scale, shift, clip=True)
+            if epilogue == "centered_swish_norm_residual":
+                value = res + value
+            return self._centered_swish_norm(value)
+
+        with torch.no_grad(), mock.patch.dict(os.environ, {"TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE": "force"}):
+            expected = layer(x, weight, bias, res, scale, shift)
+            torch._dynamo.reset()
+            with config.patch({"triton.tlx_mode": "allow", "force_disable_caches": True}):
+                with ExitStack() as stack:
+                    if epilogue in ("centered_swish_norm_wide_tile", "centered_swish_norm_tail_tile"):
+                        from triton import Config
+
+                        stack.enter_context(
+                            mock.patch(
+                                "triton.tlx.ops.kernels.mm.gfx942.torchtlx_heuristic_config",
+                                return_value=[
+                                    Config(
+                                        {
+                                            "BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 8, "NUM_XCDS": 1,
+                                            "XCD_CHUNK": 1, "SPLIT_K": 1
+                                        }, num_warps=8, num_stages=1)
+                                ],
+                            ))
+                    actual, code = run_and_get_code(torch.compile(layer, fullgraph=True), x, weight, bias, res, scale,
+                                                    shift)
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        source = "\n".join(code)
+        if epilogue == "clipped_gated_swish_norm":
+            self.assertNotIn("_row_consumer", source)
+            return
+        self.assertIn("tlx_gfx942_addmm", source)
+        self.assertIn("row_stats_ws", source)
+        self.assertIn("_row_consumer", source)
+        self.assertIn("'tlx_consumer_ms':", source)
+        if epilogue in ("centered_swish_norm_wide_tile", "centered_swish_norm_tail_tile"):
+            self.assertIn("pid_n * 2 + 1", source)
+        if epilogue == "centered_swish_norm_tail_tile":
+            self.assertIn("((pid_n * 2 + 1) < 21)", source)
+
+
+@instantiate_parametrized_tests
+class TestReductionEpilogueGuards(TestCase):
+
+    def test_consumer_cost_uses_metadata_without_source_file(self):
+        from triton.language.extra.tlx.inductor.reduction_epilogue import _module_consumer_cost_ms
+
+        module = SimpleNamespace(triton_=SimpleNamespace(inductor_meta={"config_args": {"tlx_consumer_ms": 0.025}}))
+        self.assertEqual(_module_consumer_cost_ms(module), 0.025)
+        self.assertEqual(_module_consumer_cost_ms(SimpleNamespace()), 0.0)
+        module.triton_.inductor_meta["config_args"] = {}
+        self.assertEqual(_module_consumer_cost_ms(module), 0.0)
+
+    @parametrize("enabled", (False, True))
+    @parametrize("rblock", (None, 1024, 4096))
+    def test_persistent_inner_reduction_guard(self, enabled, rblock):
+        import sympy
+        from torch._inductor.runtime.hints import ReductionHint
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor.choices import TLXInductorChoices
+
+        features = SimpleNamespace(
+            reduction_numel=sympy.Integer(4096),
+            get_reduction_hint=lambda: ReductionHint.INNER,
+            strict_reduction_rblock=lambda: rblock,
+            has_strict_multirow_reduction=lambda: False,
+        )
+        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())), \
+                tlx_config.patch(gfx942_persistent_inner_reductions=enabled), \
+                config.patch({"triton.tlx_mode": "allow", "triton.persistent_reductions": True,
+                              "triton.multi_kernel": False}), \
+                mock.patch("triton.language.extra.tlx.inductor.registry._is_gfx942", return_value=True):
+            self.assertEqual(TLXInductorChoices.should_use_persistent_reduction(features, False), enabled
+                             and rblock != 1024)
+
+    @parametrize("row_offset", (0, 1))
+    def test_centered_moment_checks_mean_row_index(self, row_offset):
+        import sympy
+        from torch._inductor.ir import Buffer, FixedLayout
+        from torch._inductor.kernel.loop_ir_epilogue_lowering import GemmEpilogueIRExpression as Expr
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor.reduction_epilogue import _Context, _Reject, _Validator
+
+        row, column = sympy.symbols("row column", integer=True)
+        gemm = Buffer(name="gemm", layout=FixedLayout(torch.device("cuda"), torch.float16, [4, 2560]))
+        total_buffer = Buffer(name="total", layout=FixedLayout(torch.device("cuda"), torch.float32, [4, 1]))
+        value = Expr("load", ("gemm", row * 2560 + column, None))
+        total = Expr("reduction", (torch.float32, torch.float32, "sum", value))
+        mean = Expr("truediv", (Expr("load",
+                                     ("total", row + row_offset, total)), Expr("constant", (2560, torch.float32))))
+        source = Expr("square", (Expr("sub", (value, mean)), ))
+        validator = _Validator(gemm, {"total": total_buffer}, {}, 2560)
+        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())):
+            if row_offset:
+                with self.assertRaises(_Reject):
+                    validator._centered_square_source(source, _Context(row, column))
+            else:
+                self.assertEqual(validator._centered_square_source(source, _Context(row, column)), value)
 
 
 if __name__ == "__main__":
