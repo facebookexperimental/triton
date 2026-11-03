@@ -1315,6 +1315,51 @@ class TestTorchTLXEpilogueFusion(TestCase):
         torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
         self._assert_reduction_epilogue_fused(code, fused=False)
 
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template fusion codegen API (old ROCm nightly)",
+    )
+    def test_tlx_matmul_norm_cpp_wrapper_autotune_at_compile_time(self):
+        """The fused norm compiles under the C++ wrapper with compile-time autotuning.
+
+        That codegen builds example args for every kernel call and recognizes a
+        workspace only by its name (``^(workspace|semaphore)``, see
+        ``PythonWrapperCodegen._generate_kernel_call_helper``); a row-stat
+        workspace named otherwise hit "V.graph.get_buffer(arg) and raw_arg can't
+        be None at the same time" (AOTI lowering of an MI350 ads model).
+        """
+        norm_kind, (m, k, n) = GEMM_NORM_TEST_CASES[0]
+        dtype = torch.bfloat16
+        inputs = (
+            torch.randn((m, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+        )
+
+        def matmul_norm(x, weight, gemm_bias, scale, norm_bias):
+            return _normalize(torch.addmm(gemm_bias, x, weight.t()), scale, norm_bias, norm_kind)
+
+        with torch.no_grad():
+            expected = matmul_norm(*inputs)
+            with config.patch({
+                    **self._FORCE_CONFIG,
+                    "cpp_wrapper": True,
+                    "triton.autotune_at_compile_time": True,
+            }):
+                actual, code = run_and_get_code(torch.compile(matmul_norm, fullgraph=True), *inputs)
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        source = "\n".join(code)
+        self.assertIn("_row_consumer", source)
+        self.assertIn("workspace_row_stats_", source)
+
 
 def is_gfx942():
     """True on AMD MI300X (gfx942)."""
