@@ -241,11 +241,20 @@ def _softmax_block_masked(state, q, k_ptrs, v_ptrs, start_n, kv_len, k_buf, v_bu
 
 
 @triton.jit
-def _silu(qk, ALPHA: tl.constexpr):
-    """`silu(qk * ALPHA)` as `qk * rcp(fma(e, 1/ALPHA, 1/ALPHA))`, with e = exp2(-qk * ALPHA * log2(e))."""
+def _silu_q(q, ALPHA: tl.constexpr):
+    """Q times -ALPHA * log2(e), rounded once to Q's type: its scores are the exponents of SiLU's sigmoid."""
     NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * LOG2E
-    INV_ALPHA: tl.constexpr = 1.0 / ALPHA
-    return qk * fast_dividef(1.0, tl.fma(tl.math.exp2(qk * NEG_ALPHA_LOG2E), INV_ALPHA, INV_ALPHA))
+    layout: tl.constexpr = tlx.dot_operand_layout(0, _mma(), k_width=8)
+    q = tlx.require_layout(q, layout, pin=True)
+    return tlx.require_layout((q.to(tl.float32) * NEG_ALPHA_LOG2E).to(q.dtype), layout, pin=True)
+
+
+@triton.jit
+def _silu(s):
+    """`silu(qk * ALPHA)` from s = qk * -ALPHA * log2(e) (a `_silu_q` score), as
+    `s * rcp(fma(exp2(s), -log2(e), -log2(e)))`."""
+    NEG_LOG2E: tl.constexpr = -LOG2E
+    return s * fast_dividef(1.0, tl.fma(tl.math.exp2(s), NEG_LOG2E, NEG_LOG2E))
 
 
 @triton.jit
@@ -344,8 +353,7 @@ def _qk_pieces(q, kt):
 @triton.jit
 def _qk_silu(q, kt, h, ALPHA: tl.constexpr):
     """`_qk_pieces(q, kt)` and `_silu(h)` (as `q.dtype`), woven."""
-    NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * LOG2E
-    INV_ALPHA: tl.constexpr = 1.0 / ALPHA
+    NEG_LOG2E: tl.constexpr = -LOG2E
     mma: tl.constexpr = _mma()
     q = tlx.require_layout(q, tlx.dot_operand_layout(0, mma, k_width=8), pin=False)
     q0 = tlx.extract_slice(q, [q.shape[0], 16], [0, 0])
@@ -360,35 +368,31 @@ def _qk_silu(q, kt, h, ALPHA: tl.constexpr):
     a = tlx.zeros((q.shape[0], 32), tl.float32, layout=mma)
     b = tlx.zeros((q.shape[0], 32), tl.float32, layout=mma)
     a = _mfma(q0, kt[0], a)
-    ta = ha * NEG_ALPHA_LOG2E
     b = _mfma(q0, kt[1], b)
-    ea = tl.math.exp2(ta)
+    ea = tl.math.exp2(ha)
     a = _mfma(q1, kt[2], a)
-    da = tl.fma(ea, INV_ALPHA, INV_ALPHA)
-    tb = hb * NEG_ALPHA_LOG2E
+    da = tl.fma(ea, NEG_LOG2E, NEG_LOG2E)
     b = _mfma(q1, kt[3], b)
     ra = fast_dividef(1.0, da)
     a = _mfma(q2, kt[4], a)
     pa = ha * ra
-    eb = tl.math.exp2(tb)
+    eb = tl.math.exp2(hb)
     b = _mfma(q2, kt[5], b)
-    db = tl.fma(eb, INV_ALPHA, INV_ALPHA)
-    tc = hc * NEG_ALPHA_LOG2E
+    db = tl.fma(eb, NEG_LOG2E, NEG_LOG2E)
     a = _mfma(q3, kt[6], a)
     rb = fast_dividef(1.0, db)
     b = _mfma(q3, kt[7], b)
     pb = hb * rb
-    ec = tl.math.exp2(tc)
+    ec = tl.math.exp2(hc)
     a = _mfma(q4, kt[8], a)
-    dc = tl.fma(ec, INV_ALPHA, INV_ALPHA)
-    td = hd * NEG_ALPHA_LOG2E
+    dc = tl.fma(ec, NEG_LOG2E, NEG_LOG2E)
     b = _mfma(q4, kt[9], b)
     rc = fast_dividef(1.0, dc)
     a = _mfma(q5, kt[10], a)
     pc = hc * rc
-    ed = tl.math.exp2(td)
+    ed = tl.math.exp2(hd)
     b = _mfma(q5, kt[11], b)
-    dd = tl.fma(ed, INV_ALPHA, INV_ALPHA)
+    dd = tl.fma(ed, NEG_LOG2E, NEG_LOG2E)
     a = _mfma(q6, kt[12], a)
     rd = fast_dividef(1.0, dd)
     b = _mfma(q6, kt[13], b)
@@ -406,8 +410,7 @@ def _qk_silu(q, kt, h, ALPHA: tl.constexpr):
 def _pv_silu(acc, p_dot, v, h, ALPHA: tl.constexpr):
     """`_attn_dot_pv_mfma(acc, p_dot, v)` from `_v_pieces` (each D32 tile's K16 steps in order, bit for bit) and
     `_silu(h)` (as `p_dot.dtype`), woven."""
-    NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * LOG2E
-    INV_ALPHA: tl.constexpr = 1.0 / ALPHA
+    NEG_LOG2E: tl.constexpr = -LOG2E
     mma: tl.constexpr = _mma()
     p_dot = tlx.require_layout(p_dot, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
     acc = tlx.require_layout(acc, mma, pin=False)
@@ -421,35 +424,31 @@ def _pv_silu(acc, p_dot, v, h, ALPHA: tl.constexpr):
     c3 = tlx.extract_slice(acc, [acc.shape[0], 32], [0, 96])
     ha, hb, hc, hd = _chunks(h)
     c0 = _mfma(p0, v[0], c0)
-    ta = ha * NEG_ALPHA_LOG2E
     c1 = _mfma(p0, v[1], c1)
-    ea = tl.math.exp2(ta)
+    ea = tl.math.exp2(ha)
     c2 = _mfma(p0, v[2], c2)
-    da = tl.fma(ea, INV_ALPHA, INV_ALPHA)
-    tb = hb * NEG_ALPHA_LOG2E
+    da = tl.fma(ea, NEG_LOG2E, NEG_LOG2E)
     c3 = _mfma(p0, v[3], c3)
     ra = fast_dividef(1.0, da)
     c0 = _mfma(p1, v[4], c0)
     pa = ha * ra
-    eb = tl.math.exp2(tb)
+    eb = tl.math.exp2(hb)
     c1 = _mfma(p1, v[5], c1)
-    db = tl.fma(eb, INV_ALPHA, INV_ALPHA)
-    tc = hc * NEG_ALPHA_LOG2E
+    db = tl.fma(eb, NEG_LOG2E, NEG_LOG2E)
     c2 = _mfma(p1, v[6], c2)
     rb = fast_dividef(1.0, db)
     c3 = _mfma(p1, v[7], c3)
     pb = hb * rb
-    ec = tl.math.exp2(tc)
+    ec = tl.math.exp2(hc)
     c0 = _mfma(p2, v[8], c0)
-    dc = tl.fma(ec, INV_ALPHA, INV_ALPHA)
-    td = hd * NEG_ALPHA_LOG2E
+    dc = tl.fma(ec, NEG_LOG2E, NEG_LOG2E)
     c1 = _mfma(p2, v[9], c1)
     rc = fast_dividef(1.0, dc)
     c2 = _mfma(p2, v[10], c2)
     pc = hc * rc
-    ed = tl.math.exp2(td)
+    ed = tl.math.exp2(hd)
     c3 = _mfma(p2, v[11], c3)
-    dd = tl.fma(ed, INV_ALPHA, INV_ALPHA)
+    dd = tl.fma(ed, NEG_LOG2E, NEG_LOG2E)
     c0 = _mfma(p3, v[12], c0)
     rd = fast_dividef(1.0, dd)
     c1 = _mfma(p3, v[13], c1)
@@ -489,7 +488,7 @@ def _silu_step(acc, p_lo, qk_hi, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_bu
 def _silu_pipelined(acc, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_kn, stride_vn, ALPHA: tl.constexpr,
                     BLOCK_N: tl.constexpr):
     """Pipeline over `n_blocks` (>= PIPE_STAGES, odd) unmasked KV blocks, with Q's copy the oldest outstanding group.
-    Returns the accumulator and Q."""
+    Returns the accumulator and the `_silu_q` Q."""
     tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k0])
     tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0))
@@ -498,11 +497,11 @@ def _silu_pipelined(acc, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_k
     tlx.async_load_commit_group([tok_k1])
 
     wait0 = tlx.async_load_wait_group(2)
-    q = tlx.local_load(tlx.local_view(q_buf, 0), token=wait0)
+    q = _silu_q(tlx.local_load(tlx.local_view(q_buf, 0), token=wait0), ALPHA)
     kt0 = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 0)), token=wait0, relaxed=True)
     qk = tl.dot(q, kt0)
     qk_lo, qk_hi = _split_cols(qk)
-    p_lo = _silu(qk_lo, ALPHA).to(q.dtype)
+    p_lo = _silu(qk_lo).to(q.dtype)
     tl.debug_barrier()
     tok_k2 = tlx.async_load(k_ptrs + 2 * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k2])
@@ -517,13 +516,13 @@ def _silu_pipelined(acc, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_k
                                               stride_kn, stride_vn, ALPHA, BLOCK_N, 0, 1)
         acc, p_lo, qk_hi, kt_dot = _silu_step(acc, p_lo, qk_hi, q, kt_dot, k_ptrs, v_ptrs, block_n + 1, k_buf, v_buf,
                                               stride_kn, stride_vn, ALPHA, BLOCK_N, 1, 0)
-    p_c = _concat_cols(p_lo, _silu(qk_hi, ALPHA).to(q.dtype))
+    p_c = _concat_cols(p_lo, _silu(qk_hi).to(q.dtype))
     nm1 = n_blocks - 1
     qk = _qk_pieces(q, kt_dot)
     tlx.async_load_wait_group(2)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
     acc = _attn_dot_pv_mfma(acc, p_c, v_dot)
-    p_c = _silu(qk, ALPHA)
+    p_c = _silu(qk)
     _attn_war_barrier(False)
     tok_vlast = tlx.async_load(v_ptrs + nm1 * BLOCK_N * stride_vn, tlx.local_view(v_buf, 0))
     tlx.async_load_commit_group([tok_vlast])
@@ -534,7 +533,7 @@ def _silu_pipelined(acc, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_k
     tlx.async_load_wait_group(1)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 1), relaxed=True)
     acc = _attn_dot_pv_mfma(acc, p_c.to(q.dtype), v_dot)
-    p_c = _silu(qk, ALPHA)
+    p_c = _silu(qk)
 
     tlx.async_load_wait_group(0)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
@@ -552,7 +551,7 @@ def _silu_block_masked(acc, q, k_ptrs, v_ptrs, start_n, kv_len, k_buf, v_buf, st
     tlx.async_load_commit_group([tok_k, tok_v])
     wait = tlx.async_load_wait_group(0)
     kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 0)), token=wait)
-    p = tl.where(mask_n[None, :], _silu(_qk_mfma(q, kt), ALPHA), 0.0)
+    p = tl.where(mask_n[None, :], _silu(_qk_mfma(q, kt)), 0.0)
     v = tlx.local_load(tlx.local_view(v_buf, 0), token=wait)
     return _attn_dot_pv_mfma(acc, p.to(q.dtype), v)
 
@@ -719,7 +718,7 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
                                      BLOCK_N)
             n_done = n_pipe
         else:
-            q = tlx.local_load(tlx.local_view(q_buf, 0), token=tlx.async_load_wait_group(0))
+            q = _silu_q(tlx.local_load(tlx.local_view(q_buf, 0), token=tlx.async_load_wait_group(0)), QK_SCALE)
             n_done = 0
         for start_n in tl.range(n_done * BLOCK_N, kv_len, BLOCK_N, num_stages=1):
             acc = _silu_block_masked(acc, q, k_ptrs, v_ptrs, start_n, kv_len, k_buf, v_buf, stride_kn, stride_vn,
