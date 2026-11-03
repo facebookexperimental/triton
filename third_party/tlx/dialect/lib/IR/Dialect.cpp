@@ -182,6 +182,15 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         });
   }
 
+  // TLX keeps the strict explicit-layout invariant for broadcast (pre-pick
+  // trait behavior); upstream #11759 relaxed it for TritonGPU/Gluon via this
+  // hook. Revisit if TLX adopts relaxed broadcast layouts.
+  LogicalResult
+  verifyBroadcastOpEncoding(RankedTensorType srcType,
+                            RankedTensorType dstType) const override {
+    return success(srcType.getEncoding() == dstType.getEncoding());
+  }
+
   LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                                    Attribute retEncoding,
                                    std::optional<Location> loc) const override {
