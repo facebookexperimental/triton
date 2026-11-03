@@ -5435,5 +5435,437 @@ class TestSm90FlexBackward(TestCase):
         self._check(*self._inputs(4, 2, 96, 300, 80, False), eligible=False)
 
 
+class TestWarppipeInt32Gate(TestCase):
+    """Stride-aware int32 admission for the gfx950 warp-pipe templates (P2561566366).
+
+    CPU-runnable: real Inductor SizeVars + stub input nodes, no device.
+    """
+
+    class _Node:
+        """Minimal IR-node stand-in: the gates only read size/stride/dtype."""
+
+        def __init__(self, size, stride, dtype=torch.float16):
+            self._size = size
+            self._stride = stride
+            self._dtype = dtype
+
+        def get_size(self):
+            return self._size
+
+        def get_stride(self):
+            return self._stride
+
+        def get_dtype(self):
+            return self._dtype
+
+    def _graph(self, sizevars=None):
+        graph = mock.Mock(sizevars=sizevars or SizeVarAllocator())
+        graph.get_current_device_or_throw.return_value = torch.device("cuda")
+        return graph
+
+    def _addmm_inputs(self, m, n, k, a_strides, b_strides):
+        from torch._inductor.kernel_inputs import MMKernelInputs
+
+        bias = self._Node((n, ), (1, ))
+        a = self._Node((m, k), a_strides)
+        b = self._Node((k, n), b_strides)
+        return MMKernelInputs([bias, a, b], out_dtype=torch.float16, mat1_idx=1, mat2_idx=2)
+
+    def _bmm_inputs(self, batch, m, n, k, a_strides, b_strides):
+        from torch._inductor.kernel_inputs import MMKernelInputs
+
+        a = self._Node((batch, m, k), a_strides)
+        b = self._Node((batch, k, n), b_strides)
+        return MMKernelInputs([a, b], out_dtype=torch.float16, mat1_idx=0, mat2_idx=1)
+
+    def _configs(self, heuristic_cls, kernel_inputs, op_name, sizevars=None):
+        from triton.language.extra.tlx.hw.resources import DeviceLimits
+        from triton.language.extra.tlx.inductor import registry
+
+        heuristic = heuristic_cls()
+        gfx950 = DeviceLimits.for_arch("gfx950")
+        with (
+                V.set_graph_handler(self._graph(sizevars)),
+                mock.patch.object(registry, "_amd_num_xcds", return_value=8),
+                mock.patch.object(registry, "get_num_sms", return_value=256),
+                mock.patch.object(DeviceLimits, "current", return_value=gfx950),
+                mock.patch.object(registry, "current_target", return_value=mock.Mock(key="gfx950")),
+        ):
+            return list(heuristic._get_template_configs_impl(kernel_inputs, op_name))
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_storage_span_elems(self):
+        from triton.language.extra.tlx.inductor.registry import _storage_span_elems
+
+        self.assertEqual(_storage_span_elems((4, 8), (8, 1)), 32)
+        self.assertEqual(_storage_span_elems((4, 8), (16, 1)), 56)
+        self.assertIsNone(_storage_span_elems((4, 8), (8, )))
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_guard_discipline_symbolic_m(self):
+        """The recompile-guard branch, with real SizeVars (no mocks).
+
+        - Fitting example hint -> admitted, bound recorded as a guard.
+        - Exceeding example hint -> declined, no guard recorded.
+        - Unbacked M (runtime-only) -> declined.
+        """
+        from torch._dynamo.source import ConstantSource
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic, )
+
+        int32_max = torch.iinfo(torch.int32).max
+
+        def _backed_m(hint, name="m"):
+            shape_env = ShapeEnv()
+            m = shape_env.create_symbol(hint, ConstantSource(name))
+            return shape_env, m
+
+        # Fitting hint: admitted, guard recorded.
+        shape_env, m = _backed_m(1024)
+        sizevars = SizeVarAllocator(shape_env)
+        kernel_inputs = self._addmm_inputs(m, 192, 2048, a_strides=(2048, 1), b_strides=(1, 2048))
+        configs = self._configs(
+            Gfx950AddMMWarpPipeConfigHeuristic,
+            kernel_inputs,
+            "addmm",
+            sizevars=sizevars,
+        )
+        self.assertGreater(len(configs), 0)
+        self.assertGreater(len(shape_env.guards), 0)
+
+        # Exceeding hint: declined.
+        shape_env, m = _backed_m(2_000_000)
+        sizevars = SizeVarAllocator(shape_env)
+        kernel_inputs = self._addmm_inputs(m, 192, 2048, a_strides=(2048, 1), b_strides=(1, 2048))
+        self.assertGreater(2_000_000 * 2048, int32_max)
+        configs = self._configs(
+            Gfx950AddMMWarpPipeConfigHeuristic,
+            kernel_inputs,
+            "addmm",
+            sizevars=sizevars,
+        )
+        self.assertEqual(configs, [])
+
+        # Unbacked M: declined without guarding.
+        shape_env = ShapeEnv()
+        m = shape_env.create_unbacked_symint().node.expr
+        sizevars = SizeVarAllocator(shape_env)
+        kernel_inputs = self._addmm_inputs(m, 192, 2048, a_strides=(2048, 1), b_strides=(1, 2048))
+        configs = self._configs(
+            Gfx950AddMMWarpPipeConfigHeuristic,
+            kernel_inputs,
+            "addmm",
+            sizevars=sizevars,
+        )
+        self.assertEqual(configs, [])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_declines_pitched_a_with_small_mk(self):
+        """The P2561566366 repro at gate level: M*K fits, true span wraps."""
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic, )
+
+        m, k, n = 3072, 401408, 256
+        int32_max = torch.iinfo(torch.int32).max
+        self.assertLess(m * k, int32_max)
+        pitched = (m - 1) * 2 * k + k
+        self.assertGreater(pitched, int32_max)
+
+        kernel_inputs = self._addmm_inputs(m, n, k, a_strides=(2 * k, 1), b_strides=(1, k))
+        configs = self._configs(Gfx950AddMMWarpPipeConfigHeuristic, kernel_inputs, "addmm")
+        self.assertEqual(configs, [])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_admits_contiguous_a_at_same_mk(self):
+        """Paired admit: same M/K/N with contiguous A fits, so the decline above is stride-caused."""
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic, )
+
+        m, k, n = 3072, 401408, 256
+        int32_max = torch.iinfo(torch.int32).max
+        self.assertLess(m * k, int32_max)
+
+        kernel_inputs = self._addmm_inputs(m, n, k, a_strides=(k, 1), b_strides=(1, k))
+        configs = self._configs(Gfx950AddMMWarpPipeConfigHeuristic, kernel_inputs, "addmm")
+        self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_admits_fitting_static_shapes(self):
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic, )
+
+        kernel_inputs = self._addmm_inputs(4096, 192, 2048, a_strides=(2048, 1), b_strides=(1, 2048))
+        configs = self._configs(Gfx950AddMMWarpPipeConfigHeuristic, kernel_inputs, "addmm")
+        self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_declines_row_major_b(self):
+        """S1: copy-needing B is declined, never converted (NameError).
+
+        Exercises adjust_kernel_inputs + gate together: a B that would need
+        a copy is still declined after adjust (render unreachable), while
+        col-major B passes through adjust without a copy and is admitted.
+        """
+        from torch._inductor.ir import ExternKernel
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic,
+            Gfx950AddMMPersistentWarpPipeConfigHeuristic,
+        )
+
+        def _fake_require_stride_order(node, order):
+            strides = node.get_stride()
+            if len(strides) >= 2 and strides[-2] == 1:
+                return node
+            size = node.get_size()
+            return self._Node((size[-2], size[-1]), (1, size[-2]))
+
+        kernel_inputs = self._addmm_inputs(4096, 192, 2048, a_strides=(2048, 1), b_strides=(192, 1))
+        for heuristic_cls in (
+                Gfx950AddMMWarpPipeConfigHeuristic,
+                Gfx950AddMMPersistentWarpPipeConfigHeuristic,
+        ):
+            with self.subTest(heuristic=heuristic_cls.__name__):
+                # The gate declines the original row-major B before any copy
+                # can render, so the NameError path is unreachable.
+                configs = self._configs(heuristic_cls, kernel_inputs, "addmm")
+                self.assertEqual(configs, [])
+                # And adjust would have needed a copy here: without the gate
+                # above, rendering the adjusted (copied) B is what faulted.
+                heuristic = heuristic_cls()
+                with mock.patch.object(
+                        ExternKernel,
+                        "require_stride_order",
+                        side_effect=_fake_require_stride_order,
+                ):
+                    adjusted = heuristic.adjust_kernel_inputs(kernel_inputs, "addmm")
+                self.assertIsNot(
+                    adjusted.nodes()[adjusted._mat2_idx],
+                    kernel_inputs.nodes()[kernel_inputs._mat2_idx],
+                )
+
+        kernel_inputs = self._addmm_inputs(4096, 192, 2048, a_strides=(2048, 1), b_strides=(1, 2048))
+        heuristic = Gfx950AddMMWarpPipeConfigHeuristic()
+        with mock.patch.object(
+                ExternKernel,
+                "require_stride_order",
+                side_effect=_fake_require_stride_order,
+        ):
+            adjusted = heuristic.adjust_kernel_inputs(kernel_inputs, "addmm")
+        self.assertIs(
+            adjusted.nodes()[adjusted._mat2_idx],
+            kernel_inputs.nodes()[kernel_inputs._mat2_idx],
+        )
+        configs = self._configs(Gfx950AddMMWarpPipeConfigHeuristic, adjusted, "addmm")
+        self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_bmm_declines_strided_within_batch(self):
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950BMMWarpPipeConfigHeuristic, )
+
+        m, k, n = 3072, 401408, 64
+        int32_max = torch.iinfo(torch.int32).max
+        self.assertLess(m * k, int32_max)
+        pitched = (m - 1) * 2 * k + k
+        self.assertGreater(pitched, int32_max)
+
+        kernel_inputs = self._bmm_inputs(
+            2,
+            m,
+            n,
+            k,
+            a_strides=(m * k, 2 * k, 1),
+            b_strides=(k * n, n, 1),
+        )
+        configs = self._configs(Gfx950BMMWarpPipeConfigHeuristic, kernel_inputs, "bmm")
+        self.assertEqual(configs, [])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_bmm_admits_contiguous_a_at_same_mkn(self):
+        """Paired admit: same M/K/N with contiguous within-batch A fits."""
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950BMMWarpPipeConfigHeuristic, )
+
+        m, k, n = 3072, 401408, 64
+        int32_max = torch.iinfo(torch.int32).max
+        self.assertLess(m * k, int32_max)
+
+        kernel_inputs = self._bmm_inputs(
+            2,
+            m,
+            n,
+            k,
+            a_strides=(m * k, k, 1),
+            b_strides=(k * n, n, 1),
+        )
+        configs = self._configs(Gfx950BMMWarpPipeConfigHeuristic, kernel_inputs, "bmm")
+        self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_bmm_admits_fitting_static_shapes(self):
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950BMMWarpPipeConfigHeuristic, )
+
+        kernel_inputs = self._bmm_inputs(
+            8,
+            256,
+            256,
+            272,
+            a_strides=(256 * 272, 272, 1),
+            b_strides=(272 * 256, 256, 1),
+        )
+        configs = self._configs(Gfx950BMMWarpPipeConfigHeuristic, kernel_inputs, "bmm")
+        self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_bmm_ignores_batch_span(self):
+        """The batch advance is int64: only the within-batch span is gated."""
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950BMMWarpPipeConfigHeuristic, )
+
+        batch, m, n, k = 2**20, 128, 128, 128
+        full_span = (batch - 1) * m * k + m * k
+        self.assertGreater(full_span, torch.iinfo(torch.int32).max)
+
+        kernel_inputs = self._bmm_inputs(
+            batch,
+            m,
+            n,
+            k,
+            a_strides=(m * k, k, 1),
+            b_strides=(k * n, n, 1),
+        )
+        configs = self._configs(Gfx950BMMWarpPipeConfigHeuristic, kernel_inputs, "bmm")
+        self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_int32_boundary_span(self):
+        """Span == INT32_MAX admits, INT32_MAX + 1 declines (no off-by-one)."""
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic, )
+
+        int32_max = torch.iinfo(torch.int32).max
+        m = 32768
+        # Just under: m*k fits; just over: m*k wraps. No allocation, gate only.
+        k_fit, k_over = 65535, 65536
+        self.assertLess(m * k_fit, int32_max)
+        self.assertGreater(m * k_over, int32_max)
+
+        kernel_inputs = self._addmm_inputs(m, 192, k_fit, a_strides=(k_fit, 1), b_strides=(1, k_fit))
+        configs = self._configs(Gfx950AddMMWarpPipeConfigHeuristic, kernel_inputs, "addmm")
+        self.assertGreater(len(configs), 0)
+
+        kernel_inputs = self._addmm_inputs(m, 192, k_over, a_strides=(k_over, 1), b_strides=(1, k_over))
+        configs = self._configs(Gfx950AddMMWarpPipeConfigHeuristic, kernel_inputs, "addmm")
+        self.assertEqual(configs, [])
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_pitched_a_e2e_matches_eager(self):
+        """Row-pitched A with fitting span: admitted warp-pipe matches eager."""
+        m, k, n = 256, 512, 128
+        dtype = torch.float16
+        base = torch.randn(m, 4 * k, device=GPU_TYPE, dtype=dtype)
+        a = torch.as_strided(base, size=(m, k), stride=(4 * k, 1))
+        w = torch.randn(n, k, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(n, device=GPU_TYPE, dtype=dtype)
+        b = w.t()
+
+        def addmm(bias, a, b):
+            return torch.addmm(bias, a, b)
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(addmm), bias, a, b)
+
+        expected = torch.addmm(bias, a, b)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_addmm_large_admitted_e2e_matches_eager(self):
+        """Larger admitted shape on the int32 path matches eager.
+
+        A literal just-under-INT32_MAX e2e would need ~4GB; this exercises
+        the admitted int32 path at a feasible 32MB instead, while the exact
+        boundary is pinned at gate level above.
+        """
+        m, k, n = 2048, 8192, 256
+        dtype = torch.float16
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=dtype)
+        w = torch.randn(n, k, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(n, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        expected = (a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_persistent_tile_fit_rejects_s2_tile(self):
+        """S2: the persistent (128,256,64,NB3) tile exceeds gfx950 LDS."""
+        from triton.language.extra.tlx.hw.resources import DeviceLimits
+        from triton.language.extra.tlx.inductor import registry
+        from triton.language.extra.tlx.inductor.registry import _warppipe_tile_fits
+
+        gfx950 = DeviceLimits.for_arch("gfx950")
+        with (
+                mock.patch.object(DeviceLimits, "current", return_value=gfx950),
+                mock.patch.object(registry, "current_target", return_value=mock.Mock(key="gfx950")),
+        ):
+            self.assertTrue(_warppipe_tile_fits(128, 256, 64, 3, elem_bytes=2, use_async=True))
+            self.assertFalse(_warppipe_tile_fits(
+                128,
+                256,
+                64,
+                3,
+                elem_bytes=2,
+                use_async=True,
+                persistent=True,
+            ))
+            self.assertTrue(_warppipe_tile_fits(
+                128,
+                256,
+                64,
+                2,
+                elem_bytes=2,
+                use_async=True,
+                persistent=True,
+            ))
+            self.assertTrue(_warppipe_tile_fits(
+                128,
+                256,
+                64,
+                3,
+                elem_bytes=2,
+                use_async=False,
+                persistent=True,
+            ))
+
+
 if __name__ == "__main__":
     run_tests()
