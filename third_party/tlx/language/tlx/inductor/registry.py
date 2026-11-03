@@ -23,6 +23,7 @@ import dataclasses
 import logging
 import os
 import re
+import statistics
 import time
 from typing import Any, Generator
 
@@ -3964,6 +3965,34 @@ def _warm_interleaved_ms(fns):
     return [sorted(s.elapsed_time(e) / _STEADY_BATCH for s, e in per_fn)[_STEADY_ROUNDS // 2] for per_fn in events]
 
 
+# The 8 XCD L2s of MI300X total 32 MB; the 256 MB Infinity Cache stays warm.
+_L2_FLUSH_BYTES = 64 * 1024 * 1024
+
+
+def _producer_warm_ms(fns):
+    """Median per-call time of each fn with L2 cleared before every call, fns interleaved.
+
+    Models a reduction reading data the previous kernel just wrote: evicted from
+    L2 by that kernel, still resident in the Infinity Cache.
+    """
+    flush = torch.empty(_L2_FLUSH_BYTES // 4, dtype=torch.int, device="cuda")
+    for fn in fns:
+        for _ in range(3):
+            fn()
+    torch.cuda.synchronize()
+    events = [[] for _ in fns]
+    for _ in range(_STEADY_BATCH * _STEADY_ROUNDS):
+        for fn, per_fn in zip(fns, events):
+            flush.zero_()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            per_fn.append((start, end))
+    torch.cuda.synchronize()
+    return [statistics.median(s.elapsed_time(e) for s, e in per_fn) for per_fn in events]
+
+
 def _steady_state_ms(choices, multi_node, hint_override):
     """Median warm per-call ms per choice; None for a choice that fails to run."""
     from torch._dynamo.utils import counters
@@ -4051,6 +4080,63 @@ def _tlx_finalize_multi_template_buffers(self):
 
 
 Scheduler.finalize_multi_template_buffers = _tlx_finalize_multi_template_buffers  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
+# Persistent vs looped choice for reductions the gfx942 override made persistent.
+#
+# TLX compiles both variants as a MultiKernel (scheduling/local_buffer_retention).
+# The stock pick times each variant with a cleared cache and cloned arguments,
+# which misranks these memory-bound kernels. Re-running a reduction back to back
+# keeps its input in L2 and favors the multi-pass looped kernel, so each call is
+# timed after clearing only L2. Picks are not reused from the on-disk cache.
+# ---------------------------------------------------------------------------
+from torch._inductor.codegen.multi_kernel import MultiKernel, MultiKernelCall
+
+_TLX_MULTI_KERNELS: set[tuple[str, ...]] = set()
+_TLX_MULTI_KERNEL_NAMES: set[str] = set()
+_orig_multi_kernel_init = MultiKernel.__init__
+_orig_multi_kernel_call_init = MultiKernelCall.__init__
+_orig_benchmark_sub_kernels = MultiKernelCall.benchmark_sub_kernels
+
+
+def _tlx_multi_kernel_init(self, kernels):
+    _orig_multi_kernel_init(self, kernels)
+    if any(getattr(k, "_tlx_retime", False) for k in kernels):
+        _TLX_MULTI_KERNELS.add(tuple(k.kernel_name for k in kernels))
+        _TLX_MULTI_KERNEL_NAMES.add(self.kernel_name)
+
+
+def _is_tlx_multi_kernel(call) -> bool:
+    return tuple(k.inductor_meta.get("kernel_name") for k in call.kernels) in _TLX_MULTI_KERNELS
+
+
+def _tlx_multi_kernel_call_init(self, multi_kernel_name, kernels, arg_index):
+    _orig_multi_kernel_call_init(self, multi_kernel_name, kernels, arg_index)
+    if multi_kernel_name in _TLX_MULTI_KERNEL_NAMES and config.triton.multi_kernel <= 1:
+        self.disable_cache = True
+        self.picked_kernel = None
+
+
+def _tlx_benchmark_sub_kernels(self, *args, **kwargs):
+    if not _is_tlx_multi_kernel(self):
+        return _orig_benchmark_sub_kernels(self, *args, **kwargs)
+    fns = []
+    for index, kernel in enumerate(self.kernels):
+        cloned_args, cloned_kwargs = kernel.clone_args(*self._get_filtered_args(args, index), **kwargs)
+        fns.append(lambda kernel=kernel, a=cloned_args, kw=cloned_kwargs: kernel.run(*a, **kw))
+    timings = _producer_warm_ms(fns)
+    log.info(
+        "gfx942 reduction choice %s: %s",
+        [k.inductor_meta.get("kernel_name") for k in self.kernels],
+        ["%.4f ms" % t for t in timings],
+    )
+    return timings
+
+
+MultiKernel.__init__ = _tlx_multi_kernel_init  # type: ignore[method-assign]
+MultiKernelCall.__init__ = _tlx_multi_kernel_call_init  # type: ignore[method-assign]
+MultiKernelCall.benchmark_sub_kernels = _tlx_benchmark_sub_kernels  # type: ignore[method-assign]
 
 
 from .reduction_epilogue import install as install_reduction_epilogue
