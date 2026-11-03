@@ -568,10 +568,11 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   // tile. Instead of switching to the M dimension now, we continue extending
   // the layout along the remaining N dimension, and only then proceed along M,
   // following the tilesPerWarp configuration.
-  int64_t nTileSize = nDim * warpsPerCTAN * tilesPerWarpN;
-  int32_t nTileRepeats =
-      static_cast<int32_t>(llvm::divideCeil(shape[nIndex], nTileSize));
-  tileLayout *= identity1DForShape(nTileRepeats, kRegister, dimN);
+  // If the N dimension is not large enough to span multiple CTA tiles (i.e.,
+  // the first argument is 0), an empty layout is created, so this identity
+  // layout will not introduce any new registers.
+  tileLayout *= LinearLayout::identity1D(
+      shape[nIndex] / (nDim * warpsPerCTAN * tilesPerWarpN), kRegister, dimN);
   tileLayout *= LinearLayout::identity1D(tilesPerWarpM, kRegister, dimM);
 
   // Finally, extend the layout across warps in the M dimension.
@@ -1305,26 +1306,21 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
   if (auto distributed = dyn_cast<DistributedEncodingTrait>(layout)) {
     result = distributed.toLinearLayout(shape);
   } else {
-    // This helper has no error channel; relax the pow2 assert under the flag so
-    // an NPOT shape reaches a recoverable reject in the conversion patterns
-    // instead of aborting here.
-    static const bool allowNpot =
-        mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-    assert((allowNpot || llvm::all_of(shape,
-                                      [](int64_t dim) {
-                                        return llvm::isPowerOf2_32(dim) &&
-                                               dim >= 1;
-                                      })) &&
+    SmallVector<int64_t> coverShape = getNpotCoverShape(shape);
+    assert(llvm::all_of(coverShape,
+                        [](int64_t dim) {
+                          return llvm::isPowerOf2_32(dim) && dim >= 1;
+                        }) &&
            "shape must be a postive power of 2");
     if (auto shared = dyn_cast<SharedEncodingTrait>(layout)) {
-      result = shared.toLinearLayout(shape);
+      result = shared.toLinearLayout(coverShape);
     } else if (auto tensorMemoryEncoding =
                    dyn_cast<TensorMemoryEncodingAttr>(layout)) {
-      result = tensorMemoryToLinearLayout(shape, tensorMemoryEncoding);
+      result = tensorMemoryToLinearLayout(coverShape, tensorMemoryEncoding);
     } else if (auto tensorMemoryScalesEncoding =
                    dyn_cast<TensorMemoryScalesEncodingAttr>(layout)) {
-      result =
-          tensorMemoryScalesToLinearLayout(shape, tensorMemoryScalesEncoding);
+      result = tensorMemoryScalesToLinearLayout(coverShape,
+                                                tensorMemoryScalesEncoding);
     } else {
       assert(0 && "unknown layout");
     }
@@ -1348,7 +1344,7 @@ LinearLayout toLinearLayout(MemDescType type) {
     auto ll = toLinearLayout(allocShape, type.getEncoding());
     auto outDims = llvm::to_vector(ll.getOutDimNames());
     // Trim the shape
-    for (auto [dim, size] : llvm::zip_equal(outDims, shape))
+    for (auto [dim, size] : llvm::zip_equal(outDims, getNpotCoverShape(shape)))
       ll = ll.resizeOutDim(dim, size);
 
     auto kCol = StringAttr::get(type.getContext(), "col");
@@ -1383,6 +1379,16 @@ LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout) {
   auto *ctx = layout.getContext();
   return ctx->getLoadedDialect<TritonGPUDialect>()->toLinearLayout(shape,
                                                                    layout);
+}
+
+SmallVector<int64_t> getNpotCoverShape(ArrayRef<int64_t> shape) {
+  SmallVector<int64_t> cover(shape);
+  if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+    return cover;
+  for (int64_t &extent : cover)
+    if (extent > 0)
+      extent = static_cast<int64_t>(llvm::PowerOf2Ceil(extent));
+  return cover;
 }
 
 bool isLayoutEquivalentIgnoringRegisterOrder(const LinearLayout &lhs,
@@ -1477,7 +1483,7 @@ LinearLayout combineCtaCgaWithShape(LinearLayout ctaLayout,
   SmallVector<StringAttr> outDimNames = standardOutDimNames(ctx, rank);
 
   llvm::SmallDenseMap<StringAttr, int64_t> labeledShape;
-  for (auto [dim, size] : llvm::zip(outDimNames, shape)) {
+  for (auto [dim, size] : llvm::zip(outDimNames, getNpotCoverShape(shape))) {
     labeledShape[dim] = size;
   }
 

@@ -55,10 +55,7 @@ unsigned getNumScratchElemsSwizzledCvt(const LinearLayout &srcLayout,
   // Remove the number of elements duplicated in the CGA layout.
   auto nBlocks = product(triton::gpu::getCTASplitNum(
       gpu::LinearEncodingAttr::get(ctx, srcLayout)));
-  // Modular layouts size the padded input cover; pow2 keeps output sizing.
-  auto elems =
-      smem.isModular() ? smem.getTotalInDimSize() : smem.getTotalOutDimSize();
-  return elems / (reps * nBlocks);
+  return smem.getTotalOutDimSize() / (reps * nBlocks);
 }
 
 unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
