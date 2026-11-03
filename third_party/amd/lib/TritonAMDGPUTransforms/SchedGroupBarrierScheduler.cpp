@@ -174,16 +174,6 @@ static unsigned dsWriteCountOf(Operation *op) {
                                         regLayout, {kBlock});
   } else {
     LinearLayout sharedLayout = triton::gpu::toLinearLayout(memTy);
-    if (regLayout.isModular()) {
-      auto allocShape = triton::gpu::getAllocationShapePerCTA(memTy);
-      sharedLayout =
-          triton::gpu::toLinearLayout(allocShape, memTy.getEncoding());
-      SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
-      for (StringAttr dim : regLayout.getOutDimNames())
-        paddedOutDims.push_back({dim, sharedLayout.getOutDimSize(dim)});
-      regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
-                               /*requireSurjective=*/false);
-    }
     cvt = triton::invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
   }
   cvt = triton::actionRemoveBroadcastedRegs(cvt).apply(cvt);

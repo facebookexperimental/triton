@@ -106,45 +106,6 @@ def test_npot_copy_2d(M, N):
 
 
 @requires_gpu
-@requires_npot
-@pytest.mark.parametrize("col_major, M, N, dtype, num_warps", [
-    (False, 24, 32, torch.float16, 4),
-    (False, 24, 32, torch.float32, 8),
-    (True, 64, 24, torch.int8, 4),
-], ids=["rm_24x32_f16_nw4", "rm_24x32_f32_nw8", "cm_64x24_i8_nw4"])
-def test_npot_coalesce_pow2_size_per_thread(col_major, M, N, dtype, num_warps):
-    """z starts as a sentinel so unwritten elements are counted. The NPOT dim is
-    padded before Coalesce, so this checks the masked padded store."""
-
-    @triton.jit
-    def kernel(X, Y, Z, s, M: tl.constexpr, N: tl.constexpr, COL_MAJOR: tl.constexpr):
-        r = tl.arange(0, M)[:, None]
-        c = tl.arange(0, N)[None, :]
-        if COL_MAJOR:
-            off = r + c * s
-        else:
-            off = r * s + c
-        tl.store(Z + off, tl.load(X + off) + tl.load(Y + off))
-
-    g = torch.Generator(device="cuda").manual_seed(0)
-    if dtype.is_floating_point:
-        x = torch.randn(M * N, device="cuda", dtype=dtype, generator=g)
-        y = torch.randn(M * N, device="cuda", dtype=dtype, generator=g)
-        sentinel = -77.0
-    else:
-        x = torch.randint(-128, 128, (M * N, ), device="cuda", dtype=dtype, generator=g)
-        y = torch.randint(-128, 128, (M * N, ), device="cuda", dtype=dtype, generator=g)
-        sentinel = 77
-    z = torch.full((M * N, ), sentinel, device="cuda", dtype=dtype)
-    ref = x + y
-    kernel[(1, )](x, y, z, M if col_major else N, M=M, N=N, COL_MAJOR=col_major, num_warps=num_warps)
-    unwritten = int(((z == sentinel) & (ref != sentinel)).sum().item())
-    wrong = int((z != ref).sum().item())
-    assert unwritten == 0 and wrong == 0, (f"{M}x{N} {dtype} nw{num_warps}: {wrong}/{M * N} wrong, "
-                                           f"{unwritten} unwritten")
-
-
-@requires_gpu
 @pytest.mark.parametrize("size", [64, 128, 256, 1024])
 def test_pow2_control_elementwise(size):
     """Pow2 control: exercises the same elementwise lowering path as the NPOT

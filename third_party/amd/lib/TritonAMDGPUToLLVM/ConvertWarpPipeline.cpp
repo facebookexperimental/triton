@@ -1044,7 +1044,7 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
     // Reject before the ModuleAllocation below, as the allocation passes do.
-    if (failed(mlir::triton::gpu::verifyNpotModularOpsSupported(m)))
+    if (failed(mlir::triton::gpu::verifyNpotTypesSupported(m)))
       return signalPassFailure();
 
     mlir::triton::AMD::TargetInfo targetInfo(gfxArch.getValue());
