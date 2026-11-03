@@ -16429,6 +16429,16 @@ def _intermediate_register_config(m, n, k):
     }
 
 
+def _small_m_invariance_register_config(m, n, k):
+    """Return one M-independent sequential plan for the small-M fallback."""
+    config = _intermediate_register_config(m, n, k)
+    if k <= 64:
+        config.update(BLOCK_K=64, matrix_instr_nonkdim=32)
+    elif k <= 96:
+        config.update(BLOCK_K=32, matrix_instr_nonkdim=32)
+    return MappingProxyType(config)
+
+
 def _unsplit_register_config_for_shape(m, n, k, dtype=None):
     """Select a register configuration without estimating Split-K coverage."""
     shape = (m, n, k)
@@ -22919,6 +22929,14 @@ def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides, *, inva
     for path, plan in _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides):
         if _range_candidate_is_sequential(path, plan, fixed):
             return path, plan
+    # Small-M production shapes normally rely on exact or split-U plans.  A
+    # fixed schedule prunes split-U, and the bounded range families exclude
+    # very short K and K above 4096.  Keep one unsplit register plan across
+    # M=1..16 so a caller does not switch implementations as its batch grows.
+    max_offset = max((m - 1) * a_strides[0] + k - 1, (k - 1) * b_strides[0] + (n - 1) * b_strides[1], m * n)
+    if (m <= 16 and dtype in (torch.float16, torch.bfloat16) and min(m, n, k) > 0 and a_strides[1] == 1
+            and b_strides[0] == 1 and min(*a_strides, *b_strides) > 0 and max_offset * element_size < 2**31):
+        return "register", _small_m_invariance_register_config(m, n, k)
     return None
 
 
