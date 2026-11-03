@@ -45,8 +45,12 @@ Value sequenceGroup0(RewriterBase &rewriter, Location loc, Value group0) {
 // Read the 64-bit global address from dwords 2-3 of descriptor group 0.
 Value getTDMGlobalAddr(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
                        Value group0) {
-  return b.or_(b.zext(i64_ty, vecGet(b, group0, 2)),
-               b.shl(b.zext(i64_ty, vecGet(b, group0, 3)), b.i64_val(32)));
+  // Build each half in its own statement: argument evaluation order is
+  // unspecified, so nested calls would emit these ops in a compiler-dependent
+  // order.
+  Value lo = b.zext(i64_ty, vecGet(b, group0, 2));
+  Value hi = b.zext(i64_ty, vecGet(b, group0, 3));
+  return b.or_(lo, b.shl(hi, b.i64_val(32)));
 }
 
 // Add `byteOffset` to the 64-bit global address held in group0 dwords [2:3], in

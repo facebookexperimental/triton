@@ -12,10 +12,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK-DAG: llvm.zext{{.*}}i32 to i64
   // CHECK: llvm.mul{{.*}}: i64
   // Pin the dword indices so a wrong-dword (pred/lds) regression fails.
-  // CHECK: %[[HI_IDX:.+]] = llvm.mlir.constant(3 : i32)
-  // CHECK: llvm.extractelement %[[G0:.+]][%[[HI_IDX]] : i32] : vector<4xi32>
   // CHECK: %[[LO_IDX:.+]] = llvm.mlir.constant(2 : i32)
-  // CHECK: llvm.extractelement %[[G0]][%[[LO_IDX]] : i32] : vector<4xi32>
+  // CHECK: llvm.extractelement %[[G0:.+]][%[[LO_IDX]] : i32] : vector<4xi32>
+  // CHECK: %[[HI_IDX:.+]] = llvm.mlir.constant(3 : i32)
+  // CHECK: llvm.extractelement %[[G0]][%[[HI_IDX]] : i32] : vector<4xi32>
   // CHECK: %[[ADDR:.+]] = llvm.or {{.*}} : i64
   // CHECK: %[[NEW:.+]] = llvm.add %[[ADDR]], %{{.+}} : i64
   // CHECK: %[[LO:.+]] = llvm.trunc %[[NEW]] : i64 to i32
