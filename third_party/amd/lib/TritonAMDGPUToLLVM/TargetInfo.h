@@ -87,8 +87,6 @@ public:
                   triton::ReduceOp op, unsigned numLaneToReduce,
                   unsigned interleave) const override;
 
-  std::string getMulhiFuncName(Type resultElementTy) const override;
-
   void printf(RewriterBase &rewriter, Value formatStrStart,
               int formatStrByteCount, ValueRange args,
               ArrayRef<bool> isSigned = {}) const override;

@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --triton-nvidia-tma-lowering --allocate-shared-memory --triton-tensor-memory-allocation -test-print-membar | FileCheck --dump-input=fail --dump-input-context=30 %s
+// RUN: triton-opt %s -split-input-file --triton-nvidia-tma-lowering --allocate-shared-memory --triton-tensor-memory-allocation --triton-nvidia-gpu-membar='compute-capability=90 ptx-version=80' | FileCheck --dump-input=fail --dump-input-context=30 %s
 
 // -----
 
@@ -110,6 +110,54 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %cvt = ttg.convert_layout %value : tensor<256x128xf16, #blockedCallSrc> -> tensor<256x128xf16, #blockedCallDst>
     %dst = ttg.local_alloc : () -> !ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable>
     tt.call @forward_store_argument(%dst) : (!ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable>) -> ()
+    %result = ttg.local_load %dst : !ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable> -> tensor<256x128xf16, #blockedCallDst>
+    tt.return %cvt, %result : tensor<256x128xf16, #blockedCallDst>, tensor<256x128xf16, #blockedCallDst>
+  }
+
+  // An indexed call argument retains the allocation's reuse dependency.
+  // CHECK-LABEL: @cluster_call_indexed_argument_reuses_scratch
+  // CHECK: ttg.convert_layout{{.*}}allocation.offset = [[INDEXED_OFFSET:[0-9]+]]
+  // CHECK-DAG: ttg.local_alloc {allocation.offset = [[INDEXED_OFFSET]]
+  // CHECK-DAG: ttg.memdesc_index
+  // CHECK-DAG: ttng.cluster_arrive
+  // CHECK-DAG: ttng.cluster_wait
+  // CHECK: tt.call @forward_store_argument
+  tt.func @cluster_call_indexed_argument_reuses_scratch(%slot: i32) -> (tensor<256x128xf16, #blockedCallDst>, tensor<256x128xf16, #blockedCallDst>) {
+    %c1 = arith.constant 1 : i32
+    %index = arith.andi %slot, %c1 : i32
+    %value = arith.constant dense<0.0> : tensor<256x128xf16, #blockedCallSrc>
+    %cvt = ttg.convert_layout %value : tensor<256x128xf16, #blockedCallSrc> -> tensor<256x128xf16, #blockedCallDst>
+    %stages = ttg.local_alloc : () -> !ttg.memdesc<2x256x128xf16, #sharedCall, #ttg.shared_memory, mutable>
+    %dst = ttg.memdesc_index %stages[%index] : !ttg.memdesc<2x256x128xf16, #sharedCall, #ttg.shared_memory, mutable> -> !ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable>
+    tt.call @forward_store_argument(%dst) : (!ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable>) -> ()
+    %result = ttg.local_load %dst : !ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable> -> tensor<256x128xf16, #blockedCallDst>
+    tt.return %cvt, %result : tensor<256x128xf16, #blockedCallDst>, tensor<256x128xf16, #blockedCallDst>
+  }
+
+  tt.func private @store_indexed_argument(%stages: !ttg.memdesc<2x256x128xf16, #sharedCall, #ttg.shared_memory, mutable>, %slot: i32) attributes {noinline = true} {
+    %c1 = arith.constant 1 : i32
+    %index = arith.andi %slot, %c1 : i32
+    %dst = ttg.memdesc_index %stages[%index] : !ttg.memdesc<2x256x128xf16, #sharedCall, #ttg.shared_memory, mutable> -> !ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable>
+    %value = arith.constant dense<3.0> : tensor<256x128xf16, #blockedCallDst>
+    ttg.local_store %value, %dst : tensor<256x128xf16, #blockedCallDst> -> !ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable>
+    tt.return
+  }
+
+  // Indexing inside the callee must retain the caller allocation's effects.
+  // CHECK-LABEL: @cluster_callee_indexed_argument_reuses_scratch
+  // CHECK: ttg.convert_layout{{.*}}allocation.offset = [[CALLEE_INDEXED_OFFSET:[0-9]+]]
+  // CHECK-DAG: ttg.local_alloc {allocation.offset = [[CALLEE_INDEXED_OFFSET]]
+  // CHECK-DAG: ttng.cluster_arrive
+  // CHECK-DAG: ttng.cluster_wait
+  // CHECK: tt.call @store_indexed_argument
+  tt.func @cluster_callee_indexed_argument_reuses_scratch(%slot: i32) -> (tensor<256x128xf16, #blockedCallDst>, tensor<256x128xf16, #blockedCallDst>) {
+    %value = arith.constant dense<0.0> : tensor<256x128xf16, #blockedCallSrc>
+    %cvt = ttg.convert_layout %value : tensor<256x128xf16, #blockedCallSrc> -> tensor<256x128xf16, #blockedCallDst>
+    %stages = ttg.local_alloc : () -> !ttg.memdesc<2x256x128xf16, #sharedCall, #ttg.shared_memory, mutable>
+    tt.call @store_indexed_argument(%stages, %slot) : (!ttg.memdesc<2x256x128xf16, #sharedCall, #ttg.shared_memory, mutable>, i32) -> ()
+    %c1 = arith.constant 1 : i32
+    %index = arith.andi %slot, %c1 : i32
+    %dst = ttg.memdesc_index %stages[%index] : !ttg.memdesc<2x256x128xf16, #sharedCall, #ttg.shared_memory, mutable> -> !ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable>
     %result = ttg.local_load %dst : !ttg.memdesc<256x128xf16, #sharedCall, #ttg.shared_memory, mutable> -> tensor<256x128xf16, #blockedCallDst>
     tt.return %cvt, %result : tensor<256x128xf16, #blockedCallDst>, tensor<256x128xf16, #blockedCallDst>
   }
@@ -1089,8 +1137,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @cluster_clc_with_per_cta_barrier
   // CHECK: ttng.init_barrier
   // CHECK-NEXT: ttng.fence_mbarrier_init_release_cluster
-  // CHECK-NEXT: ttng.cluster_barrier {relaxed = true}
-  // CHECK-NEXT: ttng.clc_try_cancel
+  // CHECK-NEXT: ttng.cluster_arrive {relaxed = true, tlx.cluster_sync_bootstrap}
+  // CHECK-NEXT: ttng.cluster_wait {tlx.cluster_sync_bootstrap}
+  // CHECK: ttng.clc_try_cancel
   // CHECK: tt.return
   tt.func @cluster_clc_with_per_cta_barrier() {
     %true = arith.constant true
@@ -1212,8 +1261,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @cluster_tc_gen5_commit_multicast_with_per_cta_barrier
   // CHECK: ttng.init_barrier
   // CHECK-NEXT: ttng.fence_mbarrier_init_release_cluster
-  // CHECK-NEXT: ttng.cluster_barrier {relaxed = true}
-  // CHECK-NEXT: ttng.tc_gen5_commit
+  // CHECK-NEXT: ttng.cluster_arrive {relaxed = true, tlx.cluster_sync_bootstrap}
+  // CHECK-NEXT: ttng.cluster_wait {tlx.cluster_sync_bootstrap}
+  // CHECK: ttng.tc_gen5_commit
   // CHECK: tt.return
   tt.func @cluster_tc_gen5_commit_multicast_with_per_cta_barrier(%desc: !ttg.memdesc<128x128xf16, #sharedCommit, #smem>) {
     %barrier = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #barrierCommit, #smem, mutable>
@@ -1520,8 +1570,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @cluster_arrive_barrier_multicast_init_sync
   // CHECK: ttng.init_barrier
   // CHECK-NEXT: ttng.fence_mbarrier_init_release_cluster
-  // CHECK-NEXT: ttng.cluster_barrier {relaxed = true}
-  // CHECK-NEXT: ttng.arrive_barrier
+  // CHECK-NEXT: ttng.cluster_arrive {relaxed = true, tlx.cluster_sync_bootstrap}
+  // CHECK-NEXT: ttng.cluster_wait {tlx.cluster_sync_bootstrap}
+  // CHECK: ttng.arrive_barrier
   tt.func @cluster_arrive_barrier_multicast_init_sync() {
     %c0 = arith.constant 0 : i32
     %barrier = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #barrierEncMC, #smem, mutable>
@@ -1596,5 +1647,36 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
     ttng.wait_barrier %bar, %c1, %true deps %page : !ttg.memdesc<2xi64, #barrier, #smem, mutable>, !ttg.memdesc<64xi32, #shared, #smem, mutable>
     ttng.inval_barrier %bar : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
     tt.return
+  }
+}
+
+// -----
+
+#histSplit = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[1]]}>
+#histBroadcast = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[0]]}>
+
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // The first histogram's remote reads must finish before the second one
+  // initializes the same scratch, even though that histogram is CTA-local.
+  // CHECK-LABEL: @cross_cta_histogram_scratch_reuse
+  // CHECK: tt.histogram {{.*}}allocation.offset = [[HIST_SCRATCH:[0-9]+]]
+  // CHECK-NEXT: ttng.cluster_arrive
+  // CHECK-NEXT: ttng.cluster_wait
+  // CHECK-NEXT: tt.histogram {{.*}}allocation.offset = [[HIST_SCRATCH]]
+  tt.func @cross_cta_histogram_scratch_reuse(%input: tensor<2048xi32, #histSplit>, %local: tensor<2048xi32, #histBroadcast>) -> (tensor<512xi32, #histSplit>, tensor<512xi32, #histBroadcast>) {
+    %hist = tt.histogram %input : tensor<2048xi32, #histSplit> -> tensor<512xi32, #histSplit>
+    %next = tt.histogram %local : tensor<2048xi32, #histBroadcast> -> tensor<512xi32, #histBroadcast>
+    tt.return %hist, %next : tensor<512xi32, #histSplit>, tensor<512xi32, #histBroadcast>
+  }
+
+  // Fully replicated inputs do not need cross-CTA histogram communication.
+  // CHECK-LABEL: @local_histogram_scratch_reuse
+  // CHECK: tt.histogram
+  // CHECK-NOT: ttng.cluster_barrier
+  // CHECK: tt.histogram
+  tt.func @local_histogram_scratch_reuse(%input: tensor<2048xi32, #histBroadcast>, %local: tensor<2048xi32, #histBroadcast>) -> (tensor<512xi32, #histSplit>, tensor<512xi32, #histBroadcast>) {
+    %hist = tt.histogram %input : tensor<2048xi32, #histBroadcast> -> tensor<512xi32, #histSplit>
+    %next = tt.histogram %local : tensor<2048xi32, #histBroadcast> -> tensor<512xi32, #histBroadcast>
+    tt.return %hist, %next : tensor<512xi32, #histSplit>, tensor<512xi32, #histBroadcast>
   }
 }

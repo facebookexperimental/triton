@@ -146,6 +146,13 @@ public:
     return bufferIds;
   }
 
+  /// Returns the current function's entry arguments aliased by a value.
+  ArrayRef<unsigned> getAliasedArgumentIndices(Value value) const {
+    auto it = argumentAliases.find(value);
+    return it == argumentAliases.end() ? ArrayRef<unsigned>{}
+                                       : it->second.getArrayRef();
+  }
+
   /// Returns the scratch buffer id of the given value.
   BufferId getBufferId(Operation *operation) const {
     if (opScratch.count(operation)) {
@@ -261,6 +268,7 @@ private:
   OpScratchMapT opVirtual;
   ValueBufferMapT valueBuffer;
   AliasBufferMapT aliasBuffer;
+  DenseMap<Value, llvm::SmallSetVector<unsigned, 2>> argumentAliases;
   BufferSetT bufferSet;
   size_t sharedMemorySize = 0;
 

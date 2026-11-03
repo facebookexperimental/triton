@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 --cse| FileCheck %s
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --triton-amdgpu-membar=gfx-arch=gfx942 --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 --cse| FileCheck %s
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --test-tritonamdgpu-membar --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 --cse | FileCheck %s
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory | FileCheck %s --check-prefix=ALLOC
 

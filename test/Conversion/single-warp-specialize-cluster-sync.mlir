@@ -1,5 +1,5 @@
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' | FileCheck %s --check-prefix=LOWER
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' --initialize-ws-cluster-barriers='compute-capability=100 ptx-version=87' --convert-warp-specialize-to-llvm | FileCheck %s --check-prefix=WS
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' | FileCheck %s --check-prefix=LOWER
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' --initialize-ws-cluster-barriers='compute-capability=100 ptx-version=87' --convert-warp-specialize-to-llvm | FileCheck %s --check-prefix=WS
 
 // Single-WS lowering supports exactly one warp_specialize region. The module
 // keeps it unless lowering adds a synthetic region for worker warps to join a

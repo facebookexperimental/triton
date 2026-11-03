@@ -98,6 +98,26 @@ struct CachePolicy {
   ttng::CachePolicyAttr detailed;
 };
 
+bool isDefaultCachePolicy(CachePolicy policy,
+                          triton::CacheModifier defaultModifier) {
+  if ((policy.modifier != triton::CacheModifier::NONE &&
+       policy.modifier != defaultModifier) ||
+      policy.legacy != triton::EvictionPolicy::NORMAL)
+    return false;
+  if (!policy.detailed)
+    return true;
+
+  using Priority = ttng::CacheEvictionPriority;
+  auto l1 = policy.detailed.getL1();
+  if ((l1 != Priority::NONE && l1 != Priority::EVICT_NORMAL) ||
+      policy.detailed.getL2PrefetchSize())
+    return false;
+  auto l2 = policy.detailed.getL2Primary();
+  return l2 == Priority::NONE ||
+         (l2 == Priority::EVICT_NORMAL &&
+          policy.detailed.getL2Fraction().getValueAsDouble() == 1.0);
+}
+
 FailureOr<Value> createCachePolicy(CachePolicy cachePolicy,
                                    ConversionPatternRewriter &rewriter,
                                    Location loc, int computeCapability,
@@ -152,6 +172,8 @@ FailureOr<Value> createCachePolicy(CachePolicy cachePolicy,
     else
       fractionBuffer = "1.0";
     std::string fractionStr = fractionBuffer.str().str();
+    if (fractionStr.find_first_of(".eE") == std::string::npos)
+      fractionStr += ".0";
     auto *fractionOpr = ptxBuilder.newConstantOperand(fractionStr);
     policy(dstOpr, fractionOpr);
 
@@ -348,8 +370,7 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
     }
 
     // vectorized iteration through all the pointer/mask/other elements
-    const int valueElemNBits =
-        std::max(8u, valueElemTy.getIntOrFloatBitWidth());
+    const int valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
     const int numVecs = numElems / vec;
 
     const size_t scalarizedContiguousRun =
@@ -359,6 +380,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
                               << " valueElemNBits = " << valueElemNBits << " "
                               << op.getType());
     SmallVector<Value> loadedVals;
+    const bool useNativeLoad =
+        !mask && isDefaultCachePolicy(*cachePolicy, triton::CacheModifier::CA);
     // The L2 cache policy register is loop-invariant; create it once instead of
     // re-emitting an identical createpolicy per vectorized load.
     FailureOr<Value> l2Policy =
@@ -373,6 +396,14 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
     int64_t l2PrefetchSize =
         l2PrefetchSizeAttr ? l2PrefetchSizeAttr.getInt() : 0;
     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
+      if (useNativeLoad) {
+        Type loadTy = vec == 1 ? valueElemTy : vec_ty(valueElemTy, vec);
+        Value loaded = b.load(loadTy, ptrElems[vecStart],
+                              vec * valueElemNBits / 8, op.getIsVolatile());
+        auto values = unpackLLVector(loc, loaded, rewriter);
+        loadedVals.append(values.begin(), values.end());
+        continue;
+      }
       // TODO: optimization when ptr is GEP with constant offset
       const size_t runStart = vecStart - vecStart % scalarizedContiguousRun;
       const size_t in_off = (vecStart - runStart) * valueElemNBits / 8;
@@ -576,8 +607,7 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
                        << mask << "\n";
     }
 
-    const size_t dtsize =
-        std::max<int>(1, valueElemTy.getIntOrFloatBitWidth() / 8);
+    const size_t dtsize = valueElemTy.getIntOrFloatBitWidth() / 8;
     const size_t valueElemNBits = dtsize * 8;
 
     const size_t scalarizedContiguousRun =
@@ -589,6 +619,9 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
                                                     targetInfo, op);
     const int numVecs = elemsPerThread / vec;
+    const bool useNativeStore =
+        !threadPred && !llMask &&
+        isDefaultCachePolicy(*cachePolicy, triton::CacheModifier::WB);
     // The L2 cache policy register is loop-invariant; create it once instead of
     // re-emitting an identical createpolicy per vectorized store.
     FailureOr<Value> l2Policy =
@@ -598,6 +631,15 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     Value l2PolicyReg = *l2Policy;
     StringRef l1Policy = getL1EvictionPriority(*cachePolicy);
     for (size_t vecStart = 0; vecStart < elemsPerThread; vecStart += vec) {
+      if (useNativeStore) {
+        Value storeVal =
+            vec == 1
+                ? valueElems[vecStart]
+                : packLLVector(loc, ArrayRef(valueElems).slice(vecStart, vec),
+                               rewriter);
+        b.store(storeVal, ptrElems[vecStart], vec * dtsize);
+        continue;
+      }
       // TODO: optimization when ptr is AddPtr with constant offset
       const size_t runStart = vecStart - vecStart % scalarizedContiguousRun;
       const size_t in_off = (vecStart - runStart) * valueElemNBits / 8;
@@ -621,8 +663,6 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
           const size_t elemOffset = vecStart + wordIdx * wordNElems + elemIdx;
           assert(elemOffset < valueElems.size());
           Value elem = valueElems[elemOffset];
-          if (elem.getType().isInteger(1))
-            elem = b.sext(i8_ty, elem);
           elem = b.bitcast(elem, valueElemTy);
 
           llWord = b.insert_element(wordTy, llWord, elem, b.i32_val(elemIdx));
@@ -844,7 +884,8 @@ public:
     unsigned vec, vecOrig;
     int numElems, packed;
     if (tensorTy) {
-      vec = getVectorSize(ptr);
+      // Atomics support at most 128 bits, including on Blackwell.
+      vec = std::min<unsigned>(getVectorSize(ptr), 128 / valueElemNBits);
       if (llMask) {
         vec = std::min<unsigned>(vec, getMaskAlignment(op.getMask()));
       }
@@ -1258,15 +1299,13 @@ struct AsyncCopyGlobalToLocalOpConversion
       auto *copySize = ptxBuilder.newConstantOperand(nBytes);
       auto *srcSize = copySize;
       if (hasMask) {
-        // We don't use predicate in this case, setting src-size to 0
-        // if there's any mask. cp.async will automatically fill the
-        // remaining slots with 0 if cp-size > src-size.
+        // A masked copy still writes zeros to its shared-memory destination.
         // XXX(Keren): Always assume other = 0 for now.
         // When 'other != 0' is supported, we will need to fold the
         // op.getMask() and redundantDataMask() into the same predicate, the
         // way it is done for LoadOp.
-        auto selectOp = b.select(maskElem, b.i32_val(nBytes), b.i32_val(0));
-        srcSize = ptxBuilder.newOperand(selectOp, "r");
+        auto ignoreSrc = b.xor_(maskElem, b.true_val());
+        srcSize = ptxBuilder.newOperand(ignoreSrc, "b");
       }
       copyAsyncOp(dstOperand, srcOperand, copySize, srcSize)
           .maybePredicate(threadPred);

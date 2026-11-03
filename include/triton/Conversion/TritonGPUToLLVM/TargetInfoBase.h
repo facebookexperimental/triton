@@ -88,7 +88,6 @@ public:
                           unsigned numLaneToReduce,
                           unsigned interleave) const = 0;
 
-  virtual std::string getMulhiFuncName(Type resultElementTy) const = 0;
   // Emits LLVM code with |rewriter| to print a message following the given
   // format from the device. |formatStrStart| is the pointer to the start of
   // the format string global variable; |args| are the arguments to fill

@@ -42,7 +42,8 @@ def TritonAMDGPUAccelerateMatmul
     (e.g., AMD matrix cores)
   }];
 
-  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
+  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::math::MathDialect"];
 
   let options =
       [Option<"gfxArch", "gfx-arch", "std::string", /*default=*/"std::string{}",

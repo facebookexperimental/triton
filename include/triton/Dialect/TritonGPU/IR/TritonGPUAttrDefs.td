@@ -191,6 +191,10 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
     }]>,
   ];
 
+  let extraClassDeclaration = [{
+    LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
+  }];
+
   let hasCustomAssemblyFormat = 1;
   let genVerifyDecl = 1;
 }
@@ -309,6 +313,8 @@ For identity mappings a short form based on order and shape is used to increase 
     // Returns the total number of elements including padding given the input
     // tensor shape.
     int64_t getPaddedSize(ArrayRef<int64_t> shape) const;
+
+    LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
   }];
   let hasCustomAssemblyFormat = 1;
   let genVerifyDecl = 1;
@@ -370,6 +376,8 @@ def PartitionedSharedEncodingAttr
     unsigned getNumLogicalPieces() const {
       return getNumPartitions() * getNumGroups();
     }
+
+    LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
   }];
 
   let hasCustomAssemblyFormat = 1;
@@ -583,6 +591,9 @@ Swizzling examples (matrix is filled with numbers 0, 1, 2, .. columns*rows-1):
       "unsigned":$maxPhase, ArrayRefParameter<"unsigned">:$order,
       "CGAEncodingAttr":$CGALayout);
 
+  let extraClassDeclaration = [{
+    LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
+  }];
   let hasCustomAssemblyFormat = 1;
 }
 

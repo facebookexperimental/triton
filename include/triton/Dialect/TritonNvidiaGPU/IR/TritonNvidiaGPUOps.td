@@ -581,6 +581,7 @@ def TTNG_WaitBarrierOp
                                DeclareOpInterfaceMethods<
                                    MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "wait until the mbarrier phase completes.";
+  let hasCanonicalizeMethod = 1;
 
   let description = [{
     Blocks the program progress until the mbarrier object in `alloc` completes
@@ -867,6 +868,7 @@ def TTNG_AsyncTMACopyGlobalToLocalOp
                DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "copy data based on descriptor from global memory to local "
                 "memory asynchronously";
+  let hasCanonicalizeMethod = 1;
 
   let description = [{
     This operation copies data from global memory to local memory
@@ -1090,6 +1092,7 @@ def TTNG_AsyncTMAGatherOp
                DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "gather data based on descriptor from global memory to local "
                 "memory asynchronously";
+  let hasCanonicalizeMethod = 1;
 
   let description = [{
     This operation gathers multiple rows of data from a global memory matrix to
@@ -1309,6 +1312,7 @@ def TTNG_TCGen5CommitOp
                              DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary =
       "make an mbarrier track completion of all prior async tcgen5 ops";
+  let hasCanonicalizeMethod = 1;
 
   let description = [{
     The `ttng.tc_gen5_commit` is an asynchronous operation that makes the
@@ -1466,6 +1470,7 @@ def TTNG_TMEMStoreOp
     : TTNG_Op<
           "tmem_store", [DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "Store a distributed tensor into a buffer in tensor memory";
+  let hasCanonicalizeMethod = 1;
 
   let description = [{
     This is similar to ttg.local_store except the source layout is restricted to
