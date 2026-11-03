@@ -142,14 +142,18 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
       actualSize >>= 1;
     }
   }
+  auto radices = layout.getInputRadices();
   if (!broadcastRegisters) {
     std::vector<std::vector<int32_t>> newBasesRegister;
+    std::vector<int32_t> newRadicesRegister;
     for (auto [idx, basis] : llvm::enumerate(bases[kRegister])) {
       if (broadcastedDims.find(idx) == broadcastedDims.end()) {
         newBasesRegister.push_back(std::move(basis));
+        newRadicesRegister.push_back(radices[kRegister][idx]);
       }
     }
     bases[kRegister] = std::move(newBasesRegister);
+    radices[kRegister] = std::move(newRadicesRegister);
   }
   auto outDims = layout.getOutDims();
   for (auto &[outDim, outDimSize] : outDims) {
@@ -157,7 +161,7 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
         std::min<int32_t>(outDimSize, getCoverSize(shape.lookup(outDim)));
   }
 
-  return LinearLayout(std::move(bases), std::move(outDims),
+  return LinearLayout(std::move(bases), std::move(radices), std::move(outDims),
                       /*requireSurjective=*/false);
 }
 
@@ -328,16 +332,19 @@ LinearLayout renameLinearLayoutDims(
   auto outRenames = getRenames(layout.getOutDimNames(), outDimRenames);
 
   LinearLayout::BasesT bases;
+  LinearLayout::RadicesT radices;
   for (auto [inDim, inDimBases] : layout.getBases()) {
     StringAttr renamed = inRenames.lookup(inDim);
     bases.insert({renamed ? renamed : inDim, inDimBases});
+    radices.insert(
+        {renamed ? renamed : inDim, layout.getInputRadices().lookup(inDim)});
   }
   SmallVector<std::pair<StringAttr, int32_t>> outDims;
   for (auto [outDim, size] : layout.getOutDims()) {
     StringAttr renamed = outRenames.lookup(outDim);
     outDims.push_back({renamed ? renamed : outDim, size});
   }
-  return LinearLayout(std::move(bases), outDims,
+  return LinearLayout(std::move(bases), std::move(radices), outDims,
                       /*requireSurjective=*/layout.isSurjective());
 }
 
@@ -426,7 +433,8 @@ ColumnAction actionRemoveBroadcastedRegs(const LinearLayout &layout) {
       permOrder.push_back(i);
     }
   }
-  return ColumnAction(permOrder, kReg, bases.size());
+  return ColumnAction(permOrder, kReg, bases.size(),
+                      layout.getInputRadices(kReg));
 }
 std::pair<int64_t, ColumnAction>
 actionAdditiveStrides(const LinearLayout &layout, const LinearLayout addrLayout,
