@@ -198,7 +198,6 @@ void emitMetricRecords(MetricBuffer &metricBuffer, uint64_t *hostBasePtr,
     default:
       throw std::runtime_error("[PROTON] Unsupported metric type index: " +
                                std::to_string(metricTypeIndex));
-      break;
     }
 
     wordOffset += metricDesc.size;
