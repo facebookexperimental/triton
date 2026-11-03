@@ -1592,8 +1592,8 @@ void init_triton_tlx_ir(py::module_ &m) {
                                                  evictionPolicy);
            })
       .def("create_async_TMA_store_wait",
-           [](TritonOpBuilder &self, int pendings) {
-             self.create<ttng::TMAStoreWaitOp>(pendings);
+           [](TritonOpBuilder &self, int pendings, bool readOnly) {
+             self.create<ttng::TMAStoreWaitOp>(pendings, readOnly);
            })
       .def("create_async_store",
            [](TritonOpBuilder &self, Value src, Value dst, Value size) -> void {

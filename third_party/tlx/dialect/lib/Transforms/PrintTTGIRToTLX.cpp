@@ -2433,7 +2433,10 @@ void printSimplifiedOp(
     int pendings = 0;
     if (auto pendingsAttr = op->getAttrOfType<IntegerAttr>("pendings"))
       pendings = pendingsAttr.getInt();
-    os << "tlx.async_descriptor_store_wait(" << pendings << ")";
+    os << "tlx.async_descriptor_store_wait(" << pendings;
+    if (op->hasAttr("read_only"))
+      os << ", read_only=True";
+    os << ")";
     printLocComment(op, os);
     return;
   }
