@@ -2578,6 +2578,21 @@ LogicalResult TMEMSubSliceOp::verify() {
   srcShape = dropPipeliningDim(srcShape, srcTy.getEncoding());
   dstShape = dropPipeliningDim(dstShape, dstTy.getEncoding());
   dim = sliceDim - (srcTy.getRank() - srcShape.size());
+  // A row slice within one block holds the rows in the TMEM lanes of a group
+  // of whole warps (slices of whole blocks select columns instead).
+  auto tmemEncoding = dyn_cast<TensorMemoryEncodingAttr>(srcEncoding);
+  if (dim == 0 && tmemEncoding && dstShape[0] < tmemEncoding.getBlockM()) {
+    int64_t blockM = tmemEncoding.getBlockM();
+    int64_t minRows = blockM == 128 ? 32 : 16;
+    int64_t rows = dstShape[0];
+    bool twoCTAs = tmemEncoding.getTwoCTAs() ||
+                   tmemEncoding.getCtaMode() != TensorMemoryCTAMode::DEFAULT;
+    if (srcShape[0] > blockM || twoCTAs || !llvm::isPowerOf2_64(rows) ||
+        rows < minRows || offset % rows != 0)
+      return emitOpError("A row slice must cover a power of two of at least ")
+             << minRows << " rows of a single-CTA " << blockM
+             << "-row block, at a multiple of its size";
+  }
   auto srcLL = toLinearLayout(srcTy);
   if (offset & (dstShape[dim] - 1)) {
     // An unaligned slice can carry through the logical bits between its

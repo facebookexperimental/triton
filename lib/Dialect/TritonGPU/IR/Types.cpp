@@ -174,7 +174,9 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     allocShape = dropPipeliningDim(allocShape, enc);
     auto ctaSplit = enc.getCGALayout().getCTASplitNum();
     auto blockN = std::min<int32_t>(enc.getBlockN(), shape.back());
-    if (shape[shape.size() - 2] < enc.getBlockM() * ctaSplit[0] ||
+    // A row slice (tmem_subslice with dim = 0) may hold fewer rows than a
+    // block; its allocation may not.
+    if (allocShape[allocShape.size() - 2] < enc.getBlockM() * ctaSplit[0] ||
         shape[shape.size() - 1] < blockN * ctaSplit[1]) {
       return emitError() << "the tensor shape must be at least "
                          << enc.getBlockM() * ctaSplit[0] << "x"

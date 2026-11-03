@@ -1623,7 +1623,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   tt.func public @tmem_subslice_row_too_small() {
     %md = ttng.tmem_alloc : () -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // expected-error @+1 {{the tensor shape must be at least 128x128. Got 64, 128}}
+    // expected-error @+1 {{A row slice must cover a power of two of at least 32 rows of a single-CTA 128-row block}}
     %sub = ttng.tmem_subslice %md {offset = 0 : i32, dim = 0 : i32} : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x128xf32, #tmem, #ttng.tensor_memory, mutable, 256x128>
     tt.return
   }
@@ -1636,6 +1636,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   tt.func public @tmem_subslice_row_offset_exceed(%md: !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
     // expected-error @+1 {{The split offset may not exceed the source shape}}
     %sub = ttng.tmem_subslice %md {offset = 256 : i32, dim = 0 : i32} : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 256x128>
+    tt.return
+  }
+}
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1, ctaMode = twocta_rhs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func public @tmem_subslice_row_two_cta_m64(%md: !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    // expected-error @+1 {{A row slice must cover a power of two of at least 16 rows of a single-CTA 64-row block}}
+    %sub = ttng.tmem_subslice %md {offset = 0 : i32, dim = 0 : i32} : !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<32x64xf32, #tmem, #ttng.tensor_memory, mutable, 64x64>
     tt.return
   }
 }

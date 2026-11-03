@@ -177,7 +177,7 @@ uint32_t getTMemSubSliceOffset(MemDescType memDescType, int32_t offset,
 }
 
 LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
-                           bool withWarp) {
+                           bool withWarp, int numWarpBases) {
   auto str_attr = [&](StringRef str) { return StringAttr::get(ctx, str); };
   auto kReg = str_attr("register");
   auto kLane = str_attr("lane");
@@ -214,8 +214,9 @@ LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
   if (withWarp) {
     auto nCol = tile.getOutDimSize(kCol);
     auto bases = tile.getBases();
-    bases[kWarp].push_back({32, 0});
-    bases[kWarp].push_back({64, 0});
+    auto &warpBases = bases[kWarp];
+    for (int i = 0; i < numWarpBases; ++i)
+      warpBases.push_back({32 << i, 0});
     tile = LinearLayout(std::move(bases), {{kRow, 128}, {kCol, nCol}}, false);
   }
   return tile;
