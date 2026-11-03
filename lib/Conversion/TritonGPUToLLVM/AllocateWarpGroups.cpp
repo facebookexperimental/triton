@@ -290,8 +290,11 @@ struct AllocateWarpGroups
       SmallVector<WarpGroupPartition> orderedPartitions;
       for (auto [startId, partition, estRegs, numWarps] : llvm::zip(
                startIds, op.getPartitionRegions(), requestedRegisters, arr)) {
-        int minRegs = minRegistersForRegion(*partition, laterInstrumentation,
-                                            std::max(estRegs, kMinRegisters));
+        // Preserve beta's -1 unspecified sentinel: clamp only explicitly
+        // requested (positive) estimates up to NVVM's legal minimum.
+        int minRegs = minRegistersForRegion(
+            *partition, laterInstrumentation,
+            estRegs > 0 ? std::max(estRegs, kMinRegisters) : estRegs);
         orderedPartitions.push_back({startId, partition, minRegs, numWarps});
       }
       llvm::sort(orderedPartitions,
