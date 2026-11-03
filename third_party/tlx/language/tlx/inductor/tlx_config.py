@@ -42,6 +42,12 @@ allow_min_speedup: float = float(
 # toggling it around a compile call pairs a flex forward with an FA2 backward.
 sdpa_to_flex: bool = os.environ.get("TORCHINDUCTOR_TLX_SDPA_TO_FLEX", "0") == "1"
 
+# Experimental: extends every gfx942 INNER reduction's persistent threshold.
+# Coverage so far is limited to the SwishWithNorm fusion benchmarks.
+gfx942_persistent_inner_reductions: bool = (
+    os.environ.get("TORCHINDUCTOR_TLX_GFX942_PERSISTENT_INNER_REDUCTIONS", "0") == "1"
+)
+
 @contextmanager
 def patch(**kwargs: object) -> Generator[None, None, None]:
     """Context manager to temporarily override TLX config values."""
