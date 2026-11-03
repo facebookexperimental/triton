@@ -46,6 +46,40 @@ TEST_F(LayoutUtilsTest, SquareSublayoutIsIdentity) {
   EXPECT_TRUE(squareSublayoutIsIdentity(l3, {S("in1"), S("in2")}));
 }
 
+TEST_F(LayoutUtilsTest, MixedRadixHelpersKeepRadices) {
+  // register = 3 * d1 + d0 with a zero d0 basis.
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{0}, {4}};
+  bases[S("lane")] = {{1}, {2}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {3, 2};
+  radices[S("lane")] = {2, 2};
+  LinearLayout ll(bases, radices, {{S("dim0"), 8}}, true);
+
+  // d1 maps past the extent and is dropped with its radix.
+  LinearLayout shrunk = ensureLayoutNotLargerThan(ll, {{S("dim0"), 4}},
+                                                  /*broadcastRegisters=*/false);
+  EXPECT_THAT(shrunk.getInputRadices(S("register")), ::testing::ElementsAre(3));
+  EXPECT_EQ(shrunk.getOutDimSize(S("dim0")), 4);
+
+  LinearLayout renamed = renameLinearLayoutDims(ll, {{S("lane"), S("l")}}, {});
+  EXPECT_EQ(renamed.getInputRadices(S("register")),
+            ll.getInputRadices(S("register")));
+  EXPECT_THAT(renamed.getInputRadices(S("l")), ::testing::ElementsAre(2, 2));
+
+  // The zero radix-3 digit is dropped; values are indexed 3 * d1 + d0.
+  SmallVector<Value> values;
+  for (intptr_t i = 0; i < 6; ++i)
+    values.push_back(Value::getFromOpaquePointer(reinterpret_cast<void *>(i)));
+  SmallVector<Value> unique = actionRemoveBroadcastedRegs(ll).apply(values);
+  EXPECT_THAT(llvm::map_to_vector(unique,
+                                  [](Value v) {
+                                    return reinterpret_cast<intptr_t>(
+                                        v.getAsOpaquePointer());
+                                  }),
+              ::testing::ElementsAre(0, 3));
+}
+
 TEST_F(LayoutUtilsTest, EnsureLayoutNotSmallerThanNpotCover) {
   auto layout = LinearLayout::identity1D(64, S("register"), S("dim0"));
 #ifndef NDEBUG

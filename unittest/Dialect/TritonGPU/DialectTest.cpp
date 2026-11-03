@@ -3,9 +3,17 @@
 #include <gtest/gtest.h>
 
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/PatternMatch.h"
+// Utility.h has global using-directives.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wheader-hygiene"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#pragma clang diagnostic pop
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Signals.h"
 
 template <typename T> static std::string stringifyLLVMType(const T &t) {
@@ -563,6 +571,77 @@ TEST_F(LinearEncodingTest, DistributedEncodingToLinearEncoding) {
         if (useCGA && !is_dot_op_with_block_parent(distributedEncoding)) {
           ASSERT_EQ(baseCGALayout.getCTAOrder(), linearCGALayout.getCTAOrder());
         }
+      }
+    }
+  }
+}
+
+// Evaluates the integer ops applyLinearLayout emits; block argument i is
+// args[i].
+static uint32_t evalLowered(Value v, ArrayRef<uint32_t> args) {
+  if (auto arg = dyn_cast<BlockArgument>(v))
+    return args[arg.getArgNumber()];
+  Operation *op = v.getDefiningOp();
+  if (auto constant = dyn_cast<LLVM::ConstantOp>(op))
+    return cast<IntegerAttr>(constant.getValue()).getInt();
+  if (auto select = dyn_cast<LLVM::SelectOp>(op))
+    return evalLowered(select.getCondition(), args)
+               ? evalLowered(select.getTrueValue(), args)
+               : evalLowered(select.getFalseValue(), args);
+  uint32_t x = evalLowered(op->getOperand(0), args);
+  uint32_t y = evalLowered(op->getOperand(1), args);
+  return llvm::TypeSwitch<Operation *, uint32_t>(op)
+      .Case([&](LLVM::ICmpOp cmp) {
+        EXPECT_EQ(cmp.getPredicate(), LLVM::ICmpPredicate::eq);
+        return uint32_t(x == y);
+      })
+      .Case([&](LLVM::AndOp) { return x & y; })
+      .Case([&](LLVM::OrOp) { return x | y; })
+      .Case([&](LLVM::XOrOp) { return x ^ y; })
+      .Case([&](LLVM::ShlOp) { return x << y; })
+      .Case([&](LLVM::LShrOp) { return x >> y; })
+      .Case([&](LLVM::UDivOp) { return x / y; })
+      .Default([&](Operation *) {
+        ADD_FAILURE() << "unexpected " << op->getName().getStringRef().str();
+        return 0u;
+      });
+}
+
+// The lowered apply() matches the host apply() on every input; the radix-2
+// control takes the shift-concatenated path.
+TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
+  ctx.getOrLoadDialect<LLVM::LLVMDialect>();
+  auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  auto reg = s("register"), lane = s("lane");
+  LinearLayout::BasesT bases;
+  bases[reg] = {{0, 0}, {1, 0}};
+  bases[lane] = {{2, 0}, {0, 1}};
+  LinearLayout::RadicesT radices;
+  radices[reg] = {3, 2};
+  radices[lane] = {2, 2};
+  SmallVector<std::pair<StringAttr, int32_t>> outDims = {{s("dim0"), 4},
+                                                         {s("dim1"), 2}};
+  LinearLayout mixed(bases, radices, outDims, /*requireSurjective=*/true);
+  LinearLayout radix2(bases, outDims, /*requireSurjective=*/true);
+  Location loc = UnknownLoc::get(&ctx);
+  Type i32 = IntegerType::get(&ctx, 32);
+  for (const LinearLayout &layout : {mixed, radix2}) {
+    OwningOpRef<ModuleOp> module = ModuleOp::create(loc);
+    IRRewriter rewriter(&ctx);
+    rewriter.setInsertionPointToStart(module->getBody());
+    auto fn = LLVM::LLVMFuncOp::create(
+        rewriter, loc, "apply", LLVM::LLVMFunctionType::get(i32, {i32, i32}));
+    Block *entry = fn.addEntryBlock(rewriter);
+    rewriter.setInsertionPointToStart(entry);
+    auto lowered = applyLinearLayout(
+        loc, rewriter, layout,
+        {{reg, entry->getArgument(0)}, {lane, entry->getArgument(1)}});
+    for (uint32_t r = 0; r < layout.getInDimSize(reg); ++r) {
+      for (uint32_t l = 0; l < 4; ++l) {
+        auto expected = layout.apply({{reg, r}, {lane, l}});
+        for (auto [got, want] : llvm::zip_equal(lowered, expected))
+          EXPECT_EQ(evalLowered(got.second, {r, l}), want.second)
+              << "register " << r << " lane " << l << layout;
       }
     }
   }
