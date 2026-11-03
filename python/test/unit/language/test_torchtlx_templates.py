@@ -3260,6 +3260,80 @@ class TestMaybeOverrideBestChoice(TestCase):
             result = maybe_override_best_choice(tlx_choice, timings)
         self.assertIs(result, tlx_choice)
 
+    def _unfused_pick(self, timings, steady=None):
+        from triton.language.extra.tlx.inductor import registry
+
+        node = mock.MagicMock()
+        node.choice_timings.return_value = timings
+        if steady is None:
+            retime = mock.patch.object(registry, "_steady_state_ms", side_effect=RuntimeError("no device"))
+        else:
+            retime = mock.patch.object(registry, "_steady_state_ms", return_value=steady)
+        with retime:
+            return registry._unfused_min_choice(node)[0]
+
+    def test_unfused_steady_retime_keeps_extern(self):
+        # Autotune ranked TLX first; warm back-to-back timing shows hipBLASLt faster.
+        tlx_choice = self._make_choice("tlx_gfx942_addmm")
+        extern_choice = self._make_choice("addmm", is_extern=True)
+        pick = self._unfused_pick({tlx_choice: 0.0367, extern_choice: 0.0371}, steady=(0.0350, 0.0293))
+        self.assertIs(pick, extern_choice)
+
+    def test_unfused_steady_retime_keeps_tlx(self):
+        tlx_choice = self._make_choice("tlx_gfx942_addmm")
+        extern_choice = self._make_choice("addmm", is_extern=True)
+        pick = self._unfused_pick({tlx_choice: 0.090, extern_choice: 0.100}, steady=(0.090, 0.100))
+        self.assertIs(pick, tlx_choice)
+
+    def test_unfused_retime_failure_uses_autotune_margin(self):
+        tlx_choice = self._make_choice("tlx_gfx942_addmm")
+        extern_choice = self._make_choice("addmm", is_extern=True)
+        self.assertIs(self._unfused_pick({tlx_choice: 0.0807, extern_choice: 0.0810}), extern_choice)
+        self.assertIs(self._unfused_pick({tlx_choice: 0.090, extern_choice: 0.100}), tlx_choice)
+
+    def test_unfused_invalid_steady_uses_autotune_margin(self):
+        from torch._dynamo.utils import counters
+
+        tlx_choice = self._make_choice("tlx_gfx942_addmm")
+        extern_choice = self._make_choice("addmm", is_extern=True)
+        counters.clear()
+        for steady in ((0.0, 0.0293), (float("nan"), 0.0293), (0.0350, float("inf"))):
+            self.assertIs(self._unfused_pick({tlx_choice: 0.0367, extern_choice: 0.0371}, steady=steady), extern_choice)
+        self.assertEqual(counters["inductor"]["tlx_gfx942_steady_retime_failed"], 3)
+        self.assertIs(self._unfused_pick({tlx_choice: 0.0, extern_choice: 0.0371}, steady=(0.0, 0.0293)), extern_choice)
+
+    def test_unfused_retime_failure_is_per_choice(self):
+        tlx_choice = self._make_choice("tlx_gfx942_addmm")
+        extern_choice = self._make_choice("addmm", is_extern=True)
+        timings = {tlx_choice: 0.090, extern_choice: 0.100}
+        self.assertIs(self._unfused_pick(timings, steady=(None, 0.0293)), extern_choice)
+        self.assertIs(self._unfused_pick(timings, steady=(0.0350, None)), tlx_choice)
+
+    def test_steady_state_ms_isolates_failing_choice(self):
+        from torch._dynamo.utils import counters
+        from torch._inductor.select_algorithm import AlgorithmSelectorCache
+        from triton.language.extra.tlx.inductor import registry
+
+        tlx_choice = self._make_choice("tlx_gfx942_addmm")
+        tlx_choice.bmreq.make_run_fn.side_effect = RuntimeError("launch failed")
+        extern_choice = self._make_choice("addmm", is_extern=True)
+        extern_fn = mock.MagicMock()
+        extern_choice.bmreq = mock.MagicMock()
+        extern_choice.bmreq.make_run_fn.return_value = extern_fn
+        args = mock.MagicMock()
+        args.get_benchmark_tensors.return_value.unpack.return_value = ((), None)
+        event = mock.MagicMock()
+        event.return_value.elapsed_time.return_value = 0.3
+        counters.clear()
+        with mock.patch.object(AlgorithmSelectorCache, "get_inputs", return_value=args), \
+                mock.patch.object(AlgorithmSelectorCache, "_uses_layout_preserving_inputs", return_value=False), \
+                mock.patch.object(torch.cuda, "Event", event), mock.patch.object(torch.cuda, "synchronize"):
+            tlx_ms, extern_ms = registry._steady_state_ms((tlx_choice, extern_choice), mock.MagicMock(), None)
+        self.assertIsNone(tlx_ms)
+        self.assertAlmostEqual(extern_ms, 0.03)
+        self.assertEqual(extern_fn.call_count, 1 + registry._STEADY_BATCH * (registry._STEADY_ROUNDS + 1))
+        self.assertEqual(counters["inductor"]["tlx_gfx942_steady_retime_failed"], 1)
+
 
 # --- Heuristic Rule Tests ---
 # Each rule in get_heuristic_config() gets (1) config selection assertions and
