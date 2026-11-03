@@ -375,3 +375,24 @@ def test_workflows_share_one_build_and_pin_all_checkouts():
                     install = next(i for i, item in enumerate(steps) if item.get("name") == "Install Triton")
                     assert "sha256sum --check" in steps[install - 1]["run"]
     assert LEASE_SECONDS > int(workflow("build")["jobs"]["build"]["timeout-minutes"]) * 60
+
+
+def test_failed_build_is_filed_like_a_failing_test(tmp_path):
+    import os
+
+    jobs = yaml.load((ROOT / ".github/workflows/gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)["jobs"]
+    caller = next(
+        j for j in jobs.values()
+        if j.get("uses") == "./.github/workflows/ci-issues.yml" and j["with"]["result"] == "${{ needs.build.result }}")
+    source = caller["with"]["failures"].split(".")[1]
+    assert "needs.build.result == 'failure'" in jobs[source]["if"]
+    step = next(s for s in jobs[source]["steps"] if s.get("uses") == "./.github/actions/parse-test-failures")
+    action = yaml.load((ROOT / ".github/actions/parse-test-failures/action.yml").read_text(), Loader=yaml.BaseLoader)
+    inputs = {name: spec.get("default", "") for name, spec in action["inputs"].items()} | step["with"]
+    out = tmp_path / "out"
+    env = os.environ | {name.upper().replace("-", "_"): value for name, value in inputs.items()}
+    env |= {"WORKFLOW": "Meta Triton GPU Tests", "GITHUB_OUTPUT": str(out)}
+    subprocess.run(["bash", "-e", "-c", action["runs"]["steps"][0]["run"]], cwd=ROOT, env=env, check=True)
+    [item] = json.loads(out.read_text().split("=", 1)[1])
+    assert item["issue_title"] == "[nightly] Meta Triton GPU Tests / build / build-job-failed"
+    assert item["fallback"] is True

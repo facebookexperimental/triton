@@ -52,6 +52,42 @@ jobs:
     with:
       ref: ${{ needs.select.outputs.sha }}
 
+  build-failures:
+    needs: build
+    if: always() && needs.build.result == 'failure'
+    runs-on: ubuntu-latest
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+      - name: Parse build failure
+        id: parse
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ github.workflow }}${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+          job: build
+          failed: true
+          bucket: build-job-failed
+
+  # File and close the build's failure issue; ci-issues.yml decides which runs file.
+  issues-build:
+    needs: [select, build, build-failures]
+    # A failed build without its parsed item would read as recovered and close its issue.
+    if: always() && (needs.build.result == 'success' || needs.build-failures.result == 'success')
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    uses: ./.github/workflows/ci-issues.yml
+    with:
+      workflow: ${{ github.workflow }}
+      job: build
+      result: ${{ needs.build.result }}
+      failures: ${{ needs.build-failures.outputs.failures }}
+      sha: ${{ needs.select.outputs.sha }}
+
   h100:
     needs: [select, build]
     if: needs.select.outputs.h100 == 'true'

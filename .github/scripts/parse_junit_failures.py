@@ -251,7 +251,7 @@ def build_bucket_item(bucket, workflow, job):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--junit", nargs="+", required=True, help="JUnit XML file(s)")
+    parser.add_argument("--junit", nargs="*", required=True, help="JUnit XML file(s); none for a job without tests")
     parser.add_argument("--workflow", required=True, help="Workflow name (for title)")
     parser.add_argument("--job", required=True, help="Job name (for title)")
     parser.add_argument("--output-name", default="failures", help="GITHUB_OUTPUT key to write")
