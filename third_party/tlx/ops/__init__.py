@@ -117,9 +117,9 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
-    "flash_attn_varlen", "swiglu_ffn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
-    "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
-    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "flash_attn_varlen", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention",
+    "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward",
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -757,6 +757,70 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
     _check_enforced("flash_attn_varlen", spec, invariance)
     with torch.cuda.device(q.device):
         return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal))
+
+
+def _check_lora(name, proj, d_model, out_features):
+    """Check a low-rank projection ``(down, norm, up)``: ``(rank, d_model)``, ``(rank,)``, ``(out_features, rank)``."""
+    if not isinstance(proj, (tuple, list)) or len(proj) != 3:
+        raise InvalidInput(f"tlx.ops.mla_window_attn expects {name}=(down, norm, up)")
+    down, norm, up = proj
+    rank = down.shape[0] if down.ndim == 2 else -1
+    if (down.shape != (rank, d_model) or norm.shape != (rank, ) or up.shape != (out_features, rank)
+            or rank not in (16, 32, 64, 128)):
+        raise InvalidInput(f"tlx.ops.mla_window_attn expects {name} weights of shapes (rank, {d_model}), (rank,) "
+                           f"and ({out_features}, rank) with rank in (16, 32, 64, 128); got "
+                           f"{[tuple(t.shape) for t in proj]}")
+
+
+def mla_window_attn(x, cu_seqlens, norm_weight, q_proj, kv_proj, gate_proj, *, num_heads, window_size, norm_eps=1e-6,
+                    lora_eps=1e-6, space=None):
+    """Gated sliding-window self-attention with low-rank (MLA-style) projections, forward only, fp16.
+
+    ``x`` is ``(tokens, d_model)`` packed sequences; sequence ``b`` owns rows ``cu_seqlens[b]:cu_seqlens[b + 1]``
+    (int32, ``(batch + 1,)``, starting at 0 and ending at ``tokens``). Each projection is a tuple
+    ``(down, norm, up)`` of ``nn.Linear``/RMS-norm weights, and with ``h = rms_norm(x, norm_weight, norm_eps)``,
+    ``lora(p) = rms_norm(h @ p.down.T, p.norm, lora_eps) @ p.up.T``:
+
+    - ``q = lora(q_proj)`` and ``gate = sigmoid(lora(gate_proj))`` have ``d_model`` columns;
+    - ``lora(kv_proj)`` has ``2 * d_model`` columns, which hold, for each head in turn, that head's k then v.
+
+    Returns ``x + attention(q, k, v) * gate`` with ``num_heads`` heads of ``d_model // num_heads`` columns, scale
+    ``head_dim ** -0.5``, and ``window_size=(left, right)``: query ``i`` sees keys ``i - left .. i + right`` of its own
+    sequence. Supported: ``d_model`` in (128, 256), ``head_dim`` in (64, 128), ranks in (16, 32, 64, 128),
+    ``0 <= left``, ``0 <= right``, ``left + right <= 32``. The projection weights are read by TMA, so their data must
+    start on a 16-byte boundary (fresh allocations and parameters do; a view with an odd element offset does not).
+    """
+    import torch
+    if x.ndim != 2 or norm_weight.shape != (x.shape[1], ):
+        raise InvalidInput("tlx.ops.mla_window_attn expects x of shape (tokens, d_model) and norm_weight of "
+                           f"shape (d_model,); got {tuple(x.shape)} and {tuple(norm_weight.shape)}")
+    d_model = x.shape[1]
+    if type(num_heads) is not int or num_heads < 1 or d_model % num_heads != 0:
+        raise InvalidInput(f"tlx.ops.mla_window_attn expects num_heads dividing d_model; got {num_heads!r}")
+    _check_lora("q_proj", q_proj, d_model, d_model)
+    _check_lora("kv_proj", kv_proj, d_model, 2 * d_model)
+    _check_lora("gate_proj", gate_proj, d_model, d_model)
+    weights = (norm_weight, *q_proj, *kv_proj, *gate_proj)
+    if any(t.dtype != x.dtype for t in weights):
+        raise InvalidInput("tlx.ops.mla_window_attn expects every weight in x's dtype")
+    if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2 or cu_seqlens.dtype != torch.int32:
+        raise InvalidInput("tlx.ops.mla_window_attn expects int32 (batch + 1,) cu_seqlens with batch >= 1")
+    if any(t.device != x.device for t in (cu_seqlens, *weights)):
+        raise InvalidInput("tlx.ops.mla_window_attn expects all tensors on one device")
+    if (not isinstance(window_size, (tuple, list)) or len(window_size) != 2
+            or any(type(w) is not int or w < 0 for w in window_size) or sum(window_size) > 32):
+        raise InvalidInput("tlx.ops.mla_window_attn expects window_size=(left, right) with non-negative ints and "
+                           f"left + right <= 32; got {window_size!r}")
+    space_name, invariance = _normalize_space_arg("mla_window_attn", space)
+    _check_single_config_space("mla_window_attn", space_name)
+    fn, spec = impl_for("mla_window_attn", device=x.device)
+    check_inputs(spec, dtype=x.dtype, D=d_model, HEAD_DIM=d_model // num_heads,
+                 base_ptrs=tuple(p[i].data_ptr() for p in (q_proj, kv_proj, gate_proj) for i in (0, 2)))
+    check_backward(spec, x, *weights)
+    _check_enforced("mla_window_attn", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, cu_seqlens, norm_weight, tuple(q_proj), tuple(kv_proj), tuple(gate_proj), num_heads,
+                  tuple(window_size), float(norm_eps), float(lora_eps))
 
 
 def swiglu_ffn(x, norm_weight, w1, w2, w3, *, eps=1e-5, space=None):
