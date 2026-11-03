@@ -1082,6 +1082,11 @@ void mlir::triton::NVIDIA::populateElementwiseOpToLLVMPatterns(
   mlir::triton::populateElementwiseOpToLLVMPatterns(typeConverter, patterns,
                                                     axisInfoAnalysis, benefit);
 
+  // Preserve mul.hi selection when InstCombine turns input extensions into
+  // masks.
+  patterns.add<ElementwiseOpConversion<MulhiUIOp, LLVM::UMulHOp>>(
+      typeConverter, axisInfoAnalysis, benefit.getBenefit() + 1);
+
 #define POPULATE_OP(SRC_OP, DST_OP)                                            \
   patterns.add<ElementwiseOpConversion<SRC_OP, DST_OP>>(                       \
       typeConverter, axisInfoAnalysis, benefit)
