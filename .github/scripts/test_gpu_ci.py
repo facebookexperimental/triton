@@ -16,19 +16,25 @@ FILTERS = json.loads(PATH_FILTERS.read_text())
 
 
 @pytest.mark.parametrize("path,expected", [
-    ("lib/Dialect/Triton/Transforms/Combine.cpp", {"h100", "b200", "mi350"}),
+    ("lib/Dialect/Triton/Transforms/Combine.cpp", {"h100", "b200", "mi350", "gfx1250"}),
     ("third_party/nvidia/backend/compiler.py", {"h100", "b200"}),
-    ("third_party/amd/backend/compiler.py", {"mi350"}),
+    ("third_party/amd/backend/compiler.py", {"mi350", "gfx1250"}),
     ("third_party/tlx/ops/kernels/mm/sm100.py", {"b200"}),
     ("third_party/tlx/ops/kernels/mm/sm90.py", {"h100"}),
     ("third_party/tlx/ops/kernels/mm/gfx950.py", {"mi350"}),
-    ("python/test/unit/language/test_tlx_dot_hip_or_sm90.py", {"h100", "mi350"}),
+    ("third_party/tlx/ops/kernels/mm/gfx1250.py", {"gfx1250"}),
+    ("python/test/unit/language/test_tlx_dot_hip_or_sm90.py", {"h100", "mi350", "gfx1250"}),
+    ("python/test/unit/language/test_tlx_amd_gfx1250.py", {"gfx1250"}),
     ("python/test/unit/language/test_tlx_codegen.py", {"b200"}),
+    ("python/test/unit/language/test_tlx_codegen_gfx1250.py", {"gfx1250"}),
+    ("python/test/unit/language/test_tlx_amd_hip.py", {"mi350"}),
     ("README.md", set()),
     ("docs/index.rst", set()),
     ("test/Triton/ops.mlir", set()),
     (".agents/skills/example/script.py", set()),
-    (".github/workflows/build.yml", {"h100", "b200", "mi350"}),
+    (".github/workflows/build.yml", {"h100", "b200", "mi350", "gfx1250"}),
+    (".github/workflows/gfx1250.yml", {"gfx1250"}),
+    (".github/actions/setup-rocjitsu/action.yml", {"gfx1250"}),
 ])
 def test_platform_paths(path, expected):
     selected = select_platforms([path], FILTERS)
@@ -334,13 +340,37 @@ def test_aggregate_gate_rejects_failed_build_and_selected_tests(results, selecte
     script = gate["steps"][0]["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     needs = {name: {"result": result} for name, result in results.items()}
     needs["select"]["outputs"] = {
-        "build": str(selected).lower(), "h100": str(selected).lower(), "b200": "false", "mi350": "false"
+        "build": str(selected).lower(), "h100": str(selected).lower(), "b200": "false", "mi350": "false", "gfx1250":
+        "false"
     }
-    for platform in ("b200", "mi350"):
+    for platform in ("b200", "mi350", "gfx1250"):
         needs[platform] = {"result": "skipped"}
     result = subprocess.run([sys.executable, "-c", script], env=os.environ | {"NEEDS": json.dumps(needs)},
                             capture_output=True)
     assert (result.returncode == 0) == success, result.stderr.decode()
+
+
+def test_aggregate_gate_rejects_failed_gfx1250_emulation():
+    import os
+    import sys
+
+    parent = yaml.load((ROOT / ".github/workflows/gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
+    gate = parent["jobs"]["gpu-tests"]
+    script = gate["steps"][0]["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    needs = {name: {"result": "skipped"} for name in ("build", "h100", "b200", "mi350")}
+    needs["select"] = {
+        "result": "success",
+        "outputs": {"build": "true", "h100": "false", "b200": "false", "mi350": "false", "gfx1250": "true"},
+    }
+    needs["build"] = {"result": "success"}
+    needs["gfx1250"] = {"result": "failure"}
+    result = subprocess.run([sys.executable, "-c", script], env=os.environ | {"NEEDS": json.dumps(needs)},
+                            capture_output=True)
+    assert result.returncode != 0
+    needs["gfx1250"] = {"result": "success"}
+    result = subprocess.run([sys.executable, "-c", script], env=os.environ | {"NEEDS": json.dumps(needs)},
+                            capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
 
 
 def test_workflows_share_one_build_and_pin_all_checkouts():

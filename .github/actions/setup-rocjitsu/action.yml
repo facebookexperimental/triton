@@ -1,0 +1,37 @@
+name: Set up gfx1250 emulation (roc-jitsu)
+description: >
+  Locate the ROCm SDK in the job container, verify the roc-jitsu functional
+  emulator (`mirage`) and its gfx1250 (MI450) device model, and export
+  ROCM_ROOT, ROCJITSU_CONFIG, ROCJITSU and TRITON_AMD_BITCODE_PATH for later
+  steps. No GPU is used: every kernel runs on CPU threads under the emulator.
+  Mirrors the "Setup gfx1250 emulation" step of upstream Triton's
+  integration-tests-amd-rocjitsu job (triton-lang/triton).
+runs:
+  using: composite
+  steps:
+    - name: Set up gfx1250 emulation
+      shell: bash
+      run: |
+        set -xeo pipefail
+        # The emulator provides the only gfx1250 device; hide any host GPUs
+        # so a misconfigured runner cannot silently test real hardware.
+        unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+        rocm-sdk init
+        ROCM_ROOT="$(rocm-sdk path --root)"
+        echo "ROCM_ROOT=${ROCM_ROOT}" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=${ROCM_ROOT}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+        echo "${ROCM_ROOT}/bin" >> "$GITHUB_PATH"
+        test -f "${ROCM_ROOT}/lib/libamdhip64.so"
+        test -x "${ROCM_ROOT}/bin/mirage"
+        config="${ROCM_ROOT}/share/rocjitsu/configs/gfx1250_mi455x.json"
+        if [ ! -f "${config}" ]; then
+          config="${ROCM_ROOT}/share/rocjitsu/configs/gfx1250.json"
+        fi
+        test -f "${config}"
+        bitcode="${ROCM_ROOT}/lib/llvm/amdgcn/bitcode"
+        for name in asanrtl ockl ocml; do
+          test -f "${bitcode}/${name}.bc"
+        done
+        echo "TRITON_AMD_BITCODE_PATH=${bitcode}" >> "$GITHUB_ENV"
+        echo "ROCJITSU_CONFIG=${config}" >> "$GITHUB_ENV"
+        echo "ROCJITSU=${ROCM_ROOT}/bin/mirage run --in-process --config ${config} --" >> "$GITHUB_ENV"
