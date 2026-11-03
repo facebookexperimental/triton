@@ -1692,16 +1692,35 @@ def TTNG_TensormapCreateOp
   let hasVerifier = 1;
 }
 
-def TTNG_AsyncStoreOp : TTNG_Op<"async_store"> {
-  let summary = "Async store from shared to global memory";
+def TTNG_AsyncStoreOp
+    : TTNG_Op<"async_store",
+              [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Async store or reduce from shared to global memory";
   let description = [{
     Copies `size` bytes from shared memory to global memory using
     cp.async.bulk.global.shared::cta.bulk_group. Completion tracked
     via cp.async.bulk.commit_group / cp.async.bulk.wait_group.
     The predicate (threadIdx.x == 0) is auto-generated in the LLVM lowering.
+
+    A `store_reduce` other than NONE instead reduces the source elements into
+    global memory with cp.reduce.async.bulk (no tensor map). The source and
+    destination element types must match and select the PTX type.
+    `store_reduce_signed` selects signed integer MIN/MAX; ADD and bitwise
+    reductions operate on the same bits for signed and unsigned integers, and
+    INC/DEC require unsigned 32-bit elements.
   }];
-  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-      Arg<TT_Ptr, "", [MemWrite<GlobalMemory>]>:$dst, I32:$size);
+  let arguments = (ins TTG_MemDescType:$src, TT_Ptr:$dst, I32:$size,
+      DefaultValuedAttr<TT_DescriptorReduceKindAttr,
+                       "::mlir::triton::DescriptorReduceKind::NONE">:$store_reduce,
+      DefaultValuedAttr<BoolAttr, "false">:$store_reduce_signed);
+  let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    // Returns the PTX type suffix of a cp.reduce.async.bulk (including
+    // `noftz.` for f16/bf16 ADD), or failure if the reduction is unsupported.
+    static ::mlir::FailureOr<std::string>
+    getReducePtxType(::mlir::triton::DescriptorReduceKind kind,
+                     ::mlir::Type elementType, bool isSigned);
+  }];
 
   let assemblyFormat = [{
     $src `,` $dst `,` $size

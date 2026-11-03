@@ -1595,10 +1595,17 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, int pendings, bool readOnly) {
              self.create<ttng::TMAStoreWaitOp>(pendings, readOnly);
            })
-      .def("create_async_store",
-           [](TritonOpBuilder &self, Value src, Value dst, Value size) -> void {
-             self.create<ttng::AsyncStoreOp>(src, dst, size);
-           })
+      .def(
+          "create_async_store",
+          [](TritonOpBuilder &self, Value src, Value dst, Value size,
+             tt::DescriptorReduceKind storeReduce,
+             bool storeReduceSigned) -> void {
+            self.create<ttng::AsyncStoreOp>(src, dst, size, storeReduce,
+                                            storeReduceSigned);
+          },
+          py::arg("src"), py::arg("dst"), py::arg("size"),
+          py::arg("store_reduce") = tt::DescriptorReduceKind::NONE,
+          py::arg("store_reduce_signed") = false)
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);

@@ -160,6 +160,105 @@ def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("dtype, op, ptx", [
+    (torch.float32, "add", "add.f32"),
+    (torch.bfloat16, "add", "add.noftz.bf16"),
+    (torch.int32, "max", "max.s32"),
+    (torch.int32, "xor", "xor.b32"),
+])
+def test_async_store_reduce(dtype, op, ptx, device):
+    """Test the non-tensor bulk reduce (cp.reduce.async.bulk) via async_store(store_reduce=...)."""
+
+    @triton.jit
+    def bulk_reduce_kernel(src_ptr, dst_ptr, N: tl.constexpr, OP: tl.constexpr):
+        smem = tlx.local_alloc((N, ), src_ptr.dtype.element_ty, num=1)
+        bars = tlx.alloc_barriers(1, arrive_count=1)
+        bar = bars[0]
+        buf = smem[0]
+        NBYTES: tl.constexpr = N * src_ptr.dtype.element_ty.primitive_bitwidth // 8
+        tlx.barrier_expect_bytes(bar, NBYTES)
+        tlx.async_load(src_ptr, buf, bulk=True, barrier=bar)
+        tlx.barrier_wait(bar, 0)
+        tlx.async_store(dst_ptr, buf, NBYTES, store_reduce=OP)
+        tlx.async_descriptor_store_wait(0)
+
+    N = 256
+    if dtype.is_floating_point:
+        src = torch.randn(N, dtype=dtype, device=device)
+        dst = torch.randn(N, dtype=dtype, device=device)
+    else:
+        src = torch.randint(-1000, 1000, (N, ), dtype=dtype, device=device)
+        dst = torch.randint(-1000, 1000, (N, ), dtype=dtype, device=device)
+    expected = {"add": torch.add, "max": torch.maximum, "xor": torch.bitwise_xor}[op](dst, src)
+
+    kernel = bulk_reduce_kernel[(1, )](src, dst, N, op, num_warps=1)
+
+    assert "store_reduce" in kernel.asm["ttgir"]
+    assert f"cp.reduce.async.bulk.global.shared::cta.bulk_group.{ptx}" in kernel.asm["ptx"]
+    torch.testing.assert_close(dst, expected)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_async_store_reduce_from_registers(device):
+    """Bulk reduce of SMEM written by all warps: needs a proxy fence and a CTA barrier before the issue."""
+
+    @triton.jit
+    def reg_reduce_kernel(src_ptr, dst_ptr, N: tl.constexpr, ROUNDS: tl.constexpr):
+        smem = tlx.local_alloc((N, ), tl.float32, num=2)
+        offs = tl.arange(0, N)
+        for r in tl.static_range(ROUNDS):
+            buf = smem[r % 2]
+            # Reusing a buffer only needs its previous bulk reduce to finish reading.
+            tlx.async_descriptor_store_wait(1, read_only=True)
+            tlx.local_store(buf, tl.load(src_ptr + r * N + offs))
+            tlx.async_store(dst_ptr, buf, N * 4, store_reduce="add")
+        tlx.async_descriptor_store_wait(0)
+
+    N, ROUNDS = 1024, 4
+    src = torch.randn(ROUNDS * N, dtype=torch.float32, device=device)
+    dst = torch.randn(N, dtype=torch.float32, device=device)
+    expected = dst + src.view(ROUNDS, N).sum(0)
+
+    kernel = reg_reduce_kernel[(1, )](src, dst, N, ROUNDS, num_warps=4)
+
+    assert "fence.proxy.async.shared::cta" in kernel.asm["ptx"]
+    torch.testing.assert_close(dst, expected)
+
+
+_BULK_REDUCE_PTX_TYPES = (
+    [("add", torch.int32, "s32"), ("add", torch.uint32, "u32"), ("add", torch.int64, "u64"),
+     ("add", torch.uint64, "u64"), ("add", torch.float32, "f32"), ("add", torch.float64, "f64"),
+     ("add", torch.float16, "noftz.f16"), ("add", torch.bfloat16, "noftz.bf16")] +
+    [(op, dtype, ptx_type)
+     for op in ("min", "max")
+     for dtype, ptx_type in [(torch.int32, "s32"), (torch.uint32, "u32"), (torch.int64, "s64"), (torch.uint64, "u64"),
+                             (torch.float16, "f16"), (torch.bfloat16, "bf16")]] +
+    [(op, dtype, ptx_type)
+     for op in ("and", "or", "xor")
+     for dtype, ptx_type in [(torch.int32, "b32"), (torch.uint32, "b32"), (torch.int64, "b64"), (torch.uint64, "b64")]] +
+    [("inc", torch.uint32, "u32"), ("dec", torch.uint32, "u32")])
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("op, dtype, ptx_type", _BULK_REDUCE_PTX_TYPES)
+def test_async_store_reduce_ptxas(op, dtype, ptx_type, device):
+    """Compile (no launch) every op/type pair the verifier accepts, so ptxas checks the emitted instruction."""
+
+    @triton.jit
+    def bulk_reduce_compile_kernel(dst_ptr, N: tl.constexpr, OP: tl.constexpr):
+        smem = tlx.local_alloc((N, ), dst_ptr.dtype.element_ty, num=1)
+        NBYTES: tl.constexpr = N * dst_ptr.dtype.element_ty.primitive_bitwidth // 8
+        tlx.async_store(dst_ptr, smem[0], NBYTES, store_reduce=OP)
+        tlx.async_descriptor_store_wait(0)
+
+    dst = torch.empty(64, dtype=dtype, device=device)
+    kernel = bulk_reduce_compile_kernel.warmup(dst, 64, op, grid=(1, ), num_warps=1)
+
+    assert f"cp.reduce.async.bulk.global.shared::cta.bulk_group.{op}.{ptx_type}" in kernel.asm["ptx"]
+    assert kernel.asm["cubin"]
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
 def test_async_load_bulk(CHUNK_SIZE, device):
     """Test async_load with bulk=True (1D bulk copy via mbarrier)."""

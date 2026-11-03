@@ -2284,6 +2284,7 @@ def async_store(
     dst_global_ptr: tl.tensor,
     src_smem: tlx.buffered_tensor,
     size: tl.tensor,
+    store_reduce: str = "",
     _semantic=None,
 ) -> None:
     """
@@ -2292,20 +2293,56 @@ def async_store(
     cp.async.bulk.commit_group / cp.async.bulk.wait_group (use
     async_descriptor_store_wait to wait).
 
+    With `store_reduce`, the source elements are instead reduced into global
+    memory with cp.reduce.async.bulk, the non-tensor (no tensor map) form of a
+    TMA reduce. The source and destination element types must match and pick
+    the PTX type, which must be one of:
+
+    - "add": .u32, .s32, .u64, .f32, .f64, .f16, .bf16 (int64 also uses .u64,
+      since the bits are the same; .f16/.bf16 add is emitted with .noftz)
+    - "min", "max": .u32, .s32, .u64, .s64, .f16, .bf16
+    - "and", "or", "xor": .b32, .b64
+    - "inc", "dec": .u32
+
     The predicate (threadIdx.x == 0) is auto-generated in the LLVM lowering.
 
     Args:
         dst_global_ptr: Pointer to destination in global memory.
         src_smem: Shared memory buffer.
         size: Number of bytes to copy (must be a multiple of 16).
+        store_reduce: "" for a plain copy (default), or "add", "min", "max",
+            "and", "or", "xor", "inc", or "dec". Integer MIN/MAX use the
+            element type's signedness.
     """
+    store_reduce = tl._unwrap_if_constexpr(store_reduce)
+    reduce_kind_map = {
+        "add": ir.DESCRIPTOR_REDUCE_KIND.ADD,
+        "min": ir.DESCRIPTOR_REDUCE_KIND.MIN,
+        "max": ir.DESCRIPTOR_REDUCE_KIND.MAX,
+        "and": ir.DESCRIPTOR_REDUCE_KIND.AND,
+        "or": ir.DESCRIPTOR_REDUCE_KIND.OR,
+        "xor": ir.DESCRIPTOR_REDUCE_KIND.XOR,
+        "inc": ir.DESCRIPTOR_REDUCE_KIND.INC,
+        "dec": ir.DESCRIPTOR_REDUCE_KIND.DEC,
+    }
+    assert store_reduce == "" or store_reduce in reduce_kind_map, (
+        f"store_reduce must be '', 'add', 'min', 'max', 'and', 'or', 'xor', 'inc', or 'dec', got {store_reduce!r}")
+    reduce_kind = ir.DESCRIPTOR_REDUCE_KIND.NONE
+    reduce_signed = False
+    if store_reduce:
+        dst_dtype = dst_global_ptr.dtype.element_ty
+        assert src_smem.dtype == dst_dtype, (
+            f"async_store reduction source and destination types must match, got {src_smem.dtype} and {dst_dtype}")
+        reduce_kind = reduce_kind_map[store_reduce]
+        reduce_signed = dst_dtype.is_int_signed()
     if isinstance(size, tl.constexpr):
         size_handle = _semantic._convert_elem_to_ir_value(size.value, require_i64=False)
     elif isinstance(size, tl.tensor):
         size_handle = size.handle
     else:
         size_handle = _semantic._convert_elem_to_ir_value(size, require_i64=False)
-    _semantic.builder.create_async_store(src_smem.handle, dst_global_ptr.handle, size_handle)
+    _semantic.builder.create_async_store(src_smem.handle, dst_global_ptr.handle, size_handle, reduce_kind,
+                                         reduce_signed)
 
 
 @tl.builtin
