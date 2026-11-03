@@ -5,8 +5,8 @@ correctness caller autotunes a small space and wall-clock says nothing about
 compile time.
 
 TODO: cover the config variants dropped with the tutorial copy of this kernel --
-RESCALE_OPT/USE_WHERE, the FAST_FIXED opt-out, NUM_CTAS=2, USE_WARP_BARRIER, and
-backward HEAD_DIM=64 at either NUM_CTAS. Nothing tests them today.
+RESCALE_OPT/USE_WHERE, the FAST_FIXED opt-out, NUM_CTAS=2, and USE_WARP_BARRIER.
+Nothing tests them today.
 """
 import pytest
 import torch
@@ -84,9 +84,11 @@ def test_flash_attn_bwd_bf16_accuracy(Z, H, N_CTX, HEAD_DIM):
         assert rel_l2 < REL_PRECISION[torch.bfloat16]
 
 
+@pytest.mark.parametrize("dtype_name", ["fp16", "bf16"])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("num_ctas", [1, 2])
-def test_flash_attn_bwd_pinned_config(num_ctas, causal, monkeypatch):
+def test_flash_attn_bwd_pinned_config(num_ctas, causal, HEAD_DIM, dtype_name, monkeypatch):
     """The other backward tests run only the config autotuning picks, so pin each CTA count here.
 
     Spills pass every correctness check, so also read local memory off the compiled kernel.
@@ -112,7 +114,8 @@ def test_flash_attn_bwd_pinned_config(num_ctas, causal, monkeypatch):
         return tuner
 
     monkeypatch.setattr(sm100, "_tuned_bwd", tuned_bwd_recording)
-    q, k, v = _qkv(2, 4, 1024, 128, torch.bfloat16, requires_grad=True)
+    dtype = DTYPES[dtype_name]
+    q, k, v = _qkv(2, 4, 1024, HEAD_DIM, dtype, requires_grad=True)
     rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
     do = torch.randn_like(q)
 
@@ -122,5 +125,5 @@ def test_flash_attn_bwd_pinned_config(num_ctas, causal, monkeypatch):
     assert len(compiled) == 1
     for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
         rel_l2 = torch.linalg.vector_norm(got.float() - want.float()) / torch.linalg.vector_norm(want.float())
-        assert rel_l2 < REL_PRECISION[torch.bfloat16]
+        assert rel_l2 < REL_PRECISION[dtype]
     assert compiled[0].n_spills == 0, f"_attn_bwd_ws uses {4 * compiled[0].n_spills} bytes of local memory per thread"
