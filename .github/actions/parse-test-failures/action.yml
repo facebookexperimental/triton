@@ -28,6 +28,10 @@ inputs:
     description: LIT output log, parsed instead of JUnit XML
     required: false
     default: ""
+  gpu-unhealthy:
+    description: "'true' when the GPU health check failed; reports the runner instead of test output"
+    required: false
+    default: "false"
   setup-script:
     description: Script to source first, for runners whose python3 needs it
     required: false
@@ -50,6 +54,7 @@ runs:
         JUNIT: ${{ inputs.junit }}
         BUDGET: ${{ inputs.budget }}
         LIT_LOG: ${{ inputs.lit-log }}
+        GPU_UNHEALTHY: ${{ inputs.gpu-unhealthy }}
         SETUP_SCRIPT: ${{ inputs.setup-script }}
       run: |
         [[ -z "${SETUP_SCRIPT}" ]] || . "${SETUP_SCRIPT}"
@@ -61,6 +66,7 @@ runs:
           python3 .github/scripts/parse_lit_failures.py --log "${LIT_LOG}" "${ARGS[@]}" > /dev/null
         else
           for b in ${BUDGET}; do ARGS+=(--budget "${b}"); done
+          [[ "${GPU_UNHEALTHY}" != true ]] || ARGS+=(--gpu-unhealthy)
           # shellcheck disable=SC2086  # JUNIT is a space-separated list
           python3 .github/scripts/parse_junit_failures.py --junit ${JUNIT} "${ARGS[@]}" > /dev/null
         fi

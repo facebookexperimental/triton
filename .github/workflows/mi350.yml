@@ -51,6 +51,11 @@ jobs:
         with:
           backend: rocm
           arch: gfx950
+      - name: Check AMD GPU
+        id: gpu_health
+        # A runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 4
+        run: timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
       - name: Install prebuilt Triton
         uses: ./.github/actions/install-prebuilt-triton
         with:
@@ -89,6 +94,7 @@ jobs:
           bucket: mi350-tlx-job-failed
           junit: /tmp/tlx-core.xml /tmp/tlx-correctness.xml
           budget: /tmp/tlx-core.xml=90 /tmp/tlx-correctness.xml=30
+          gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
 
   mi350-torchtlx-test:
     # Temporarily disabled because the TorchTLX environment is brittle.
@@ -237,6 +243,12 @@ jobs:
           backend: rocm
           arch: gfx950
           packages: numpy pytest expecttest
+      - name: Check AMD GPU
+        id: gpu_health
+        if: steps.gluon.outputs.run == 'true'
+        # A runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 4
+        run: timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
       - name: Install prebuilt Triton
         if: steps.gluon.outputs.run == 'true'
         uses: ./.github/actions/install-prebuilt-triton
@@ -262,6 +274,7 @@ jobs:
           bucket: mi350-gluon-job-failed
           junit: /tmp/gluon.xml
           budget: /tmp/gluon.xml=50
+          gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
 
   # File and close failure issues; ci-issues.yml decides which runs file.
   issues-mi350-tlx:
