@@ -61,9 +61,7 @@ LogicalResult lowerLocalStore(
   assert(regLayout.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
          "expected register broadcasting to be removed by the caller");
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
-  auto [physicalRegLayout, sharedLayout] =
-      getPhysicalLayouts(regLayout, memDescTy);
-  regLayout = std::move(physicalRegLayout);
+  auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
   auto kBlock = str_attr("block");
   auto cvt = invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
@@ -196,9 +194,7 @@ public:
 
     auto regLayout =
         toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
-    auto [physicalRegLayout, sharedLayout] =
-        getPhysicalLayouts(regLayout, memDescTy);
-    regLayout = std::move(physicalRegLayout);
+    auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
     auto kBlock = str_attr("block");
     auto cvt = invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
 
