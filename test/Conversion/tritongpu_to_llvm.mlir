@@ -3660,12 +3660,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK: ballot
   // CHECK: ctpop
   // CHECK-NOT: llvm.atomicrmw
-  // CHECK: llvm.store {{.*}}!llvm.ptr<3>
+  // CHECK: st.shared
+  // (beta always emits predicated st.shared asm here, all PTX versions)
   // CHECK: nvvm.barrier
-  // CHECK: llvm.load {{.*}} : !llvm.ptr<3>
   // CHECK-NOT: llvm.atomicrmw
   // CHECK: nvvm.shfl.sync bfly
   // CHECK: llvm.add
+  // CHECK: llvm.load {{.*}} : !llvm.ptr<3>
   // CHECK-NOT: llvm.atomicrmw
   // CHECK: llvm.return
   tt.func private @histogram_one_bin_four_warps(%src: tensor<128xi32, #blocked>, %mask: tensor<128xi1, #blocked>) -> tensor<1xi32, #blocked> {
@@ -3714,12 +3715,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
   // CHECK: ballot
   // CHECK: ctpop
   // CHECK-NOT: llvm.atomicrmw
-  // CHECK: llvm.store {{.*}}!llvm.ptr<3>
+  // CHECK: st.shared
+  // (beta always emits predicated st.shared asm here, all PTX versions)
   // CHECK: nvvm.barrier
-  // CHECK: llvm.load {{.*}} : !llvm.ptr<3>
   // CHECK-NOT: llvm.atomicrmw
   // CHECK: nvvm.shfl.sync bfly
   // CHECK: llvm.add
+  // CHECK: llvm.load {{.*}} : !llvm.ptr<3>
   // CHECK-NOT: llvm.atomicrmw
   // CHECK: llvm.return
   tt.func @histogram_two_bins_two_warps(%src: tensor<64xi32, #blocked>, %mask: tensor<64xi1, #blocked>, %out_ptr: tensor<2x!tt.ptr<i32>, #blocked>) {
