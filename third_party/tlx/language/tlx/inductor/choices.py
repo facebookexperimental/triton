@@ -190,13 +190,13 @@ class TLXInductorChoices(InductorChoices):
     _GFX942_PERSISTENT_INNER_RNUMEL = 4096
 
     @staticmethod
-    def should_use_persistent_reduction(features, cooperative_reduction: bool) -> bool:
+    def _gfx942_persistent_override(features, cooperative_reduction: bool) -> bool:
         from torch._inductor.runtime.hints import ReductionHint
         from torch._inductor.virtualized import V
 
         from .registry import _is_gfx942
 
-        if (
+        if not (
             tlx_config.gfx942_persistent_inner_reductions
             and config.triton.tlx_mode is not None
             and config.triton.persistent_reductions
@@ -208,10 +208,22 @@ class TLXInductorChoices(InductorChoices):
                 TLXInductorChoices._GFX942_PERSISTENT_INNER_RNUMEL,
             )
         ):
-            rblock = features.strict_reduction_rblock()
-            if rblock is not None and not features.has_strict_multirow_reduction():
-                if not V.graph.sizevars.statically_known_geq(rblock, features.reduction_numel):
-                    return False
+            return False
+        rblock = features.strict_reduction_rblock()
+        if rblock is not None and not features.has_strict_multirow_reduction():
+            return V.graph.sizevars.statically_known_geq(rblock, features.reduction_numel)
+        return True
+
+    @staticmethod
+    def persistent_only_by_tlx(features, cooperative_reduction: bool) -> bool:
+        """Persistent because of the gfx942 override, where Inductor alone would loop."""
+        return TLXInductorChoices._gfx942_persistent_override(
+            features, cooperative_reduction
+        ) and not InductorChoices.should_use_persistent_reduction(features, cooperative_reduction)
+
+    @staticmethod
+    def should_use_persistent_reduction(features, cooperative_reduction: bool) -> bool:
+        if TLXInductorChoices._gfx942_persistent_override(features, cooperative_reduction):
             return True
         return InductorChoices.should_use_persistent_reduction(features, cooperative_reduction)
 

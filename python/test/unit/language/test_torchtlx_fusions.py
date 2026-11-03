@@ -1413,6 +1413,28 @@ class TestGfx942ReductionEpilogue(TestCase):
         if epilogue == "centered_swish_norm_tail_tile":
             self.assertIn("((pid_n * 2 + 1) < 21)", source)
 
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_gfx942_opt_in_persistent_reduction_compiles_both_variants(self):
+        """With the opt-in flag, a 2560-wide norm compiles both variants and runs the re-timed pick."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        value = torch.randn((1024, 2560), device=GPU_TYPE, dtype=torch.float16)
+
+        with torch.no_grad():
+            expected = self._centered_swish_norm(value)
+            torch._dynamo.reset()
+            with config.patch({"triton.tlx_mode": "allow", "force_disable_caches": True,
+                               "triton.multi_kernel": False}), \
+                    tlx_config.patch(gfx942_persistent_inner_reductions=True):
+                actual, code = run_and_get_code(torch.compile(self._centered_swish_norm, fullgraph=True), value)
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        source = "\n".join(code)
+        self.assertIn("multi_kernel", source)
+        self.assertIn("triton_per_", source)
+        self.assertIn("triton_red_", source)
+
 
 @instantiate_parametrized_tests
 class TestReductionEpilogueGuards(TestCase):
@@ -1448,6 +1470,28 @@ class TestReductionEpilogueGuards(TestCase):
                 mock.patch("triton.language.extra.tlx.inductor.registry._is_gfx942", return_value=True):
             self.assertEqual(TLXInductorChoices.should_use_persistent_reduction(features, False), enabled
                              and rblock != 1024)
+
+    @parametrize("reduction_numel", (1024, 4096))
+    def test_persistent_only_by_tlx(self, reduction_numel):
+        import sympy
+        from torch._inductor.runtime.hints import ReductionHint
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor.choices import TLXInductorChoices
+
+        features = SimpleNamespace(
+            reduction_numel=sympy.Integer(reduction_numel),
+            get_reduction_hint=lambda: ReductionHint.INNER,
+            strict_reduction_rblock=lambda: None,
+            has_strict_multirow_reduction=lambda: False,
+        )
+        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())), \
+                tlx_config.patch(gfx942_persistent_inner_reductions=True), \
+                config.patch({"triton.tlx_mode": "allow", "triton.persistent_reductions": True,
+                              "triton.multi_kernel": False}), \
+                mock.patch("triton.language.extra.tlx.inductor.registry._is_gfx942", return_value=True):
+            # Up to 1024 columns Inductor is already persistent; above it only the override is.
+            self.assertEqual(TLXInductorChoices.persistent_only_by_tlx(features, False), reduction_numel > 1024)
 
     @parametrize("row_offset", (0, 1))
     def test_centered_moment_checks_mean_row_index(self, row_offset):
