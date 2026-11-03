@@ -343,7 +343,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   Value mappedBarrier;
   if (barrierPtr.has_value()) {
     assert(ctaId && "barrier without ctaId");
-    mappedBarrier = mapa(rewriter, loc, barrierPtr.value(), ctaId, pred);
+    mappedBarrier = mapa(rewriter, loc, barrierPtr.value(), ctaId);
   }
 
   PTXBuilder builder;
@@ -400,8 +400,8 @@ void TargetInfo::copyBulkSharedToRemoteShared(RewriterBase &rewriter,
   // Elect one thread across all warps to issue the bulk copy.
   Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
   // Map dst and barrier to the remote CTA's address space via mapa.
-  Value remoteDstPtr = mapa(rewriter, loc, dstPtr, ctaId, pred);
-  Value remoteMbarPtr = mapa(rewriter, loc, barrierPtr, ctaId, pred);
+  Value remoteDstPtr = mapa(rewriter, loc, dstPtr, ctaId);
+  Value remoteMbarPtr = mapa(rewriter, loc, barrierPtr, ctaId);
 
   PTXBuilder ptxBuilder;
   auto &bulkCopy = *ptxBuilder.create<>(
