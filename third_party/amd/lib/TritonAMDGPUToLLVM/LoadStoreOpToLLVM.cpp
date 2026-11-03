@@ -2009,7 +2009,7 @@ struct BufferAtomicRMWOpConversion
 
       Value loadVal = bufferEmitter.emitAtomicRMW(
           atomicRmwAttr, vecTy, rsrcDesc, offsetElems[vecStart], storeVal, pred,
-          hasUsers);
+          hasUsers, op.getClusterScope());
       // Track the last op, so we can emit a fenceop after the loop
       lastRMWOp = loadVal.getDefiningOp();
 

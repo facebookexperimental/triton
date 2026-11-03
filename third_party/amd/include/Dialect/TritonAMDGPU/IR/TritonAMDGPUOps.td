@@ -434,6 +434,8 @@ def BufferAtomicRMWOp
         when it converts to the buffer ops because it is important for optimizing the cache memory access.
         Contiguity is the maximum number of elements that can be processed by one vector atomic with the given layout
         and mask. This preserves alignment information proven before canonicalizing the pointer to buffer form.
+        On gfx1250, cluster_scope opts into shader-engine scope instead of the default device scope.
+        The caller must place all workgroups updating each location in one cluster. Other targets reject this opt-in.
     }];
   let arguments = (ins TT_AtomicRMWAttr:$atomic_rmw_op,
       Arg<TT_Ptr, "Global memory pointer",
@@ -441,7 +443,8 @@ def BufferAtomicRMWOp
       I32Tensor:$offsets, TT_Tensor:$value, Optional<I32>:$stride,
       TT_MemSemanticAttr:$sem, TT_MemSyncScopeAttr:$scope,
       Optional<TT_BoolTensor>:$mask,
-      DefaultValuedAttr<I32Attr, "1">:$contiguity);
+      DefaultValuedAttr<I32Attr, "1">:$contiguity,
+      DefaultValuedAttr<BoolAttr, "false">:$cluster_scope);
   let results = (outs TT_Tensor:$result);
 
   let hasVerifier = 1;
