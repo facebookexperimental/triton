@@ -117,7 +117,7 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
-    "flash_attn_varlen", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
+    "flash_attn_varlen", "swiglu_ffn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
     "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
     "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
@@ -757,6 +757,36 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
     _check_enforced("flash_attn_varlen", spec, invariance)
     with torch.cuda.device(q.device):
         return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal))
+
+
+def swiglu_ffn(x, norm_weight, w1, w2, w3, *, eps=1e-5, space=None):
+    """RMS-normalized SwiGLU feed-forward with residual, forward only, fp16.
+
+    Returns ``x + (silu(n @ w1.T) * (n @ w3.T)) @ w2.T`` with ``n = rms_norm(x, norm_weight, eps)``, for ``x`` of shape
+    ``(tokens, d_model)``, ``norm_weight`` of ``d_model`` elements and ``(d_model, d_model)`` weights in ``nn.Linear``
+    layout. Supported: ``d_model`` in (128, 256). The weights are read by TMA, so their data must start on a 16-byte
+    boundary (fresh allocations and parameters do; a view with an odd element offset does not).
+    """
+    import torch
+    if x.ndim != 2 or norm_weight.numel() != x.shape[1]:
+        raise InvalidInput("tlx.ops.swiglu_ffn expects x of shape (tokens, d_model) and a norm_weight of d_model "
+                           f"elements; got {tuple(x.shape)} and {tuple(norm_weight.shape)}")
+    d_model = x.shape[1]
+    if any(w.shape != (d_model, d_model) for w in (w1, w2, w3)):
+        raise InvalidInput(f"tlx.ops.swiglu_ffn expects ({d_model}, {d_model}) weights; got "
+                           f"{[tuple(w.shape) for w in (w1, w2, w3)]}")
+    if any(t.dtype != x.dtype for t in (norm_weight, w1, w2, w3)):
+        raise InvalidInput("tlx.ops.swiglu_ffn expects every weight in x's dtype")
+    if any(t.device != x.device for t in (norm_weight, w1, w2, w3)):
+        raise InvalidInput("tlx.ops.swiglu_ffn expects all tensors on one device")
+    space_name, invariance = _normalize_space_arg("swiglu_ffn", space)
+    _check_single_config_space("swiglu_ffn", space_name)
+    fn, spec = impl_for("swiglu_ffn", device=x.device)
+    check_inputs(spec, dtype=x.dtype, D=d_model, base_ptrs=tuple(w.data_ptr() for w in (w1, w2, w3)))
+    check_backward(spec, x, norm_weight, w1, w2, w3)
+    _check_enforced("swiglu_ffn", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, norm_weight.reshape(d_model), w1, w2, w3, float(eps))
 
 
 def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=True, num_targets=None,

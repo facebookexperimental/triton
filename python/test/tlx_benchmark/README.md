@@ -13,7 +13,7 @@ python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`.
+`kda_prefill`, `kda_decode`, `swiglu_ffn`.
 
 ```
 options:
@@ -62,6 +62,7 @@ options:
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
 | `kda_decode` | none | absolute floor, currently unset -> reports only | heuristic |
+| `swiglu_ffn` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
