@@ -1414,7 +1414,7 @@ configs_bwd_2cta = [
             "NUM_COMPUTE_SLICES": 2,
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
-            "EPILOGUE_SUBTILE": 4,
+            "EPILOGUE_SUBTILE": 8,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": False,
             "NUM_CTAS": 2,
@@ -3016,7 +3016,7 @@ def _attn_bwd_ws(
                         [BLOCK_N1, DKV_STORE_NCOL],
                     )
                     dv = tlx.local_load(dv_slice)
-                    tlx.async_descriptor_store_wait(0)
+                    tlx.async_descriptor_store_wait(0, read_only=True)
                     tlx.local_store(sdv_store_buf[kv_buf_id], dv.to(tlx.dtype_of(desc_dv)))
                     tlx.async_descriptor_store(
                         desc_dv,
@@ -3040,14 +3040,14 @@ def _attn_bwd_ws(
                     )
                     dk = tlx.local_load(dk_slice)
                     dk *= sm_scale
-                    tlx.async_descriptor_store_wait(0)
+                    tlx.async_descriptor_store_wait(0, read_only=True)
                     tlx.local_store(sdk_store_buf[kv_buf_id], dk.to(tlx.dtype_of(desc_dk)))
                     tlx.async_descriptor_store(
                         desc_dk,
                         sdk_store_buf[kv_buf_id],
                         [batch, head, start_block_n, slice_id * DKV_STORE_NCOL],
                     )
-                tlx.async_descriptor_store_wait(0)
+                tlx.async_descriptor_store_wait(0, read_only=True)
                 # All staging stores done + MMA done reading k_tiles →
                 # safe for load task to refill both k_tiles and v_tiles.
                 #
@@ -3103,7 +3103,8 @@ def _attn_bwd_ws(
                         dq_slices = _split_n_2D(dq_full, DQ_PACK_ITERS)
                         for slice_id in tl.static_range(DQ_PACK_ITERS):
                             dq_smem = dq_store_buf[slice_id % DQ_STORE_STAGES]
-                            tlx.async_descriptor_store_wait(DQ_STORE_STAGES - 1)
+                            # Only the staging buffer's SMEM reads must finish before reuse.
+                            tlx.async_descriptor_store_wait(DQ_STORE_STAGES - 1, read_only=True)
                             tlx.local_store(dq_smem, dq_slices[slice_id].to(tlx.dtype_of(desc_dq)))
                             tlx.async_descriptor_store(
                                 desc_dq,
@@ -3128,7 +3129,7 @@ def _attn_bwd_ws(
                             )
                             dq = tlx.local_load(dq_slice)
                             dq = dq * LN2
-                            tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
+                            tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1, read_only=True)
                             tlx.local_store(
                                 dq_store_buf[dq_smem_idx],
                                 dq.to(tlx.dtype_of(desc_dq)),
@@ -3154,8 +3155,8 @@ def _attn_bwd_ws(
                 tile_n, tile_h, tile_b, clc_phase_consumer = _bwd_next_tile(clc_context, clc_phase_consumer, USE_CLC,
                                                                             NUM_CTAS)
 
-            # Wait for the final tile
-            tlx.async_descriptor_store_wait(0)
+            # Wait for the final tile's dQ reduces to finish reading SMEM
+            tlx.async_descriptor_store_wait(0, read_only=True)
 
         # mma
         with tlx.async_task(num_warps=1, registers=96):
