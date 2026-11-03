@@ -1834,3 +1834,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
     tt.return
   }
 }
+
+// -----
+
+// The non-tensor bulk store/reduce reads its source through the async proxy,
+// so a generic write to that buffer needs a proxy fence before it.
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @async_store_reduce_after_local_store
+  tt.func @async_store_reduce_after_local_store(%dst: !tt.ptr<f32>, %data: tensor<512xf32, #blocked>) {
+    %size = arith.constant 2048 : i32
+    %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<512xf32, #shared, #smem, mutable>
+    ttg.local_store %data, %buf : tensor<512xf32, #blocked> -> !ttg.memdesc<512xf32, #shared, #smem, mutable>
+    // CHECK: ttg.local_store
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
+    // CHECK-NEXT: ttng.async_store
+    ttng.async_store %buf, %dst, %size {store_reduce = 1 : i32} : !ttg.memdesc<512xf32, #shared, #smem, mutable>, !tt.ptr<f32>
+    tt.return
+  }
+}

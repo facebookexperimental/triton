@@ -2368,10 +2368,22 @@ struct AsyncStoreOpConversion
     Value pred = b.icmp_eq(tid, b.i32_val(0));
 
     // @pred cp.async.bulk.global.shared::cta.bulk_group [$1], [$2], $3;
+    // or, for a reduction (no tensor map):
+    // @pred cp.reduce.async.bulk.global.shared::cta.bulk_group.<op>.<type> ...
+    std::string inst = "@$0 cp.async.bulk.global.shared::cta.bulk_group";
+    auto kind = op.getStoreReduce();
+    if (kind != triton::DescriptorReduceKind::NONE) {
+      FailureOr<std::string> ptxType =
+          triton::nvidia_gpu::AsyncStoreOp::getReducePtxType(
+              kind, srcTy.getElementType(), op.getStoreReduceSigned());
+      if (failed(ptxType))
+        return op.emitOpError("unsupported bulk reduction");
+      inst = "@$0 cp.reduce.async.bulk.global.shared::cta.bulk_group." +
+             stringifyDescriptorReduceKind(kind).str() + "." + *ptxType;
+    }
+    inst += " [$1], [$2], $3;";
     ::mlir::triton::PTXBuilder ptxBuilder;
-    auto &bulkCopy =
-        *ptxBuilder.create<>("@$0 cp.async.bulk.global.shared::cta.bulk_group "
-                             "[$1], [$2], $3;");
+    auto &bulkCopy = *ptxBuilder.create<>(inst);
     bulkCopy(
         {ptxBuilder.newOperand(pred, "b"), ptxBuilder.newOperand(dstPtr, "l"),
          ptxBuilder.newOperand(srcBase, "r"), ptxBuilder.newOperand(size, "r")},
