@@ -1,0 +1,223 @@
+name: Meta Triton gfx1250 Tests (MI450 emulated)
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit used to build the wheel
+        required: true
+        type: string
+      wheel_url:
+        required: true
+        type: string
+      wheel_filename:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
+
+env:
+  # Scopes the issue titles. Off main it names the branch, as ci-issues.yml does.
+  GPU_WORKFLOW_NAME: Meta Triton gfx1250 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+  TORCHINDUCTOR_TLX_MODE: "off"
+  # Import test files by path, as in mi350.yml, so same-named test modules in
+  # different directories do not collide.
+  PYTEST_ADDOPTS: --import-mode=importlib
+  # The emulator is slow enough without line-info instrumentation (upstream
+  # Triton's gfx1250-rocjitsu job sets the same flag).
+  TRITON_DISABLE_LINE_INFO: "1"
+
+jobs:
+  gfx1250-rocjitsu-test:
+    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    # GitHub-hosted CPU cloud runner: MI450 (gfx1250) has no physical runner
+    # in this fleet, so roc-jitsu emulates it on CPU threads. The container
+    # gets no GPU devices (no /dev/kfd or /dev/dri), which also proves the
+    # lane cannot silently run on real hardware.
+    runs-on: ubuntu-latest
+    container:
+      # ROCm + PyTorch + roc-jitsu image with gfx1250 device code; the tag is
+      # the rocm-10.1 configuration in .github/amd-ci/build.py.
+      image: tritonci/triton-amd-ci:rocm10.1.0a20260820-pytorch2.15.0a0-gfx942-gfx950-gfx1250-r1
+      options: --security-opt seccomp=unconfined --user root
+    timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Select kernel-affected tests
+        id: select
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/select-kernel-tests
+      - name: Set up gfx1250 emulation
+        uses: ./.github/actions/setup-rocjitsu
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          python3 -m pip install pytest pytest-xdist pytest-timeout numpy expecttest
+      - name: Download prebuilt Triton wheel from GitHub artifacts
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        uses: actions/download-artifact@v4
+        with:
+          name: run_${{ github.run_id }}
+          path: ${{ runner.temp }}/prebuilt-wheel
+      - name: Install prebuilt Triton
+        shell: bash
+        env:
+          WHEEL_URL: ${{ inputs.wheel_url }}
+          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
+          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
+        run: |
+          set -euo pipefail
+          # The container image has no activated venv (unlike setup-test-env
+          # runners), so install the wheel with pip into its Python directly
+          # instead of via install-prebuilt-triton, which expects `uv pip`
+          # inside a venv. Download and checksum verification match it.
+          OUT="${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}"
+          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
+          if [ ! -f "${OUT}" ]; then
+            curl --fail --location --retry 3 --output "${OUT}" "${WHEEL_URL}"
+          fi
+          python3 -m zipfile -t "${OUT}" > /dev/null
+          printf '%s  %s\n' "${WHEEL_SHA256}" "${OUT}" | sha256sum --check
+          python3 -m pip install --force-reinstall --no-deps "${OUT}"
+          python3 - <<'PY'
+          import importlib.metadata as md
+
+          owners = md.packages_distributions().get("triton")
+          assert owners == ["fbtriton"], f"`triton` is provided by {owners}, expected only fbtriton"
+          print(f"triton package from fbtriton {md.version('fbtriton')}")
+          PY
+      - name: Check emulated gfx1250 target
+        shell: bash
+        run: |
+          # shellcheck disable=SC2086  # ROCJITSU is a command prefix
+          ${ROCJITSU} python3 -c "import triton; print(triton.runtime.driver.active.get_current_target())" \
+            | tee /tmp/rocjitsu-target.txt
+          grep -q gfx1250 /tmp/rocjitsu-target.txt
+      - name: Run TLX gfx1250 codegen tests
+        id: run_codegen_tests
+        timeout-minutes: 30
+        shell: bash
+        env:
+          KERNEL_ONLY: ${{ steps.select.outputs.kernel_only }}
+        run: |
+          set -euo pipefail
+          if [ "${KERNEL_ONLY}" = "true" ] && ! grep -qxF "python/test/unit/language/test_tlx_codegen_gfx1250.py" /tmp/affected.txt; then
+            echo "kernel-only PR: gfx1250 codegen tests do not touch the changed kernel(s); skipping"
+            exit 0
+          fi
+          # Compile-only: no mirage, so coverage holds even if the emulated steps are slow or flaky.
+          python3 -m pytest python/test/unit/language/test_tlx_codegen_gfx1250.py --import-mode=importlib -v --junitxml=/tmp/tlx-codegen-gfx1250.xml
+      - name: Run TLX core tests
+        id: run_core_tests
+        timeout-minutes: 90
+        shell: bash
+        env:
+          KERNEL_ONLY: ${{ steps.select.outputs.kernel_only }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FILES=(python/test/unit/language/test_tlx_*_any.py
+                 python/test/unit/language/test_tlx_dot_hip_or_sm90.py
+                 python/test/unit/language/test_tlx_*gfx1250*.py
+                 python/test/unit/tlx_ops/test_*_gfx1250.py)
+          # Compile-only gfx1250 tests run in the step above without the emulator.
+          mapfile -t FILES < <(printf '%s\n' "${FILES[@]}" | grep -v 'test_tlx_codegen_gfx1250\.py' || true)
+          [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
+          if [ "${KERNEL_ONLY}" = "true" ]; then
+            mapfile -t FILES < <(printf '%s\n' "${FILES[@]}" | grep -Fxf /tmp/affected.txt || true)
+            echo "kernel-only PR: ${#FILES[@]} TLX core file(s) touch the changed kernel(s)"
+            [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
+          fi
+          echo "gfx1250-rocjitsu collects:" "${FILES[@]}"
+          "${ROCM_ROOT}/bin/mirage" run --in-process \
+            --config "${ROCJITSU_CONFIG}" --cpu-thread-budget 4 -- \
+            python3 -m pytest "${FILES[@]}" --import-mode=importlib -v -n 4 \
+            --durations=25 --junitxml=/tmp/tlx-core.xml
+      - name: Run Gluon tests
+        id: run_gluon_tests
+        timeout-minutes: 60
+        shell: bash
+        env:
+          KERNEL_ONLY: ${{ steps.select.outputs.kernel_only }}
+        run: |
+          set -euo pipefail
+          if [ "${KERNEL_ONLY}" = "true" ] \
+              && ! grep -qE "^(python/test/gluon/|third_party/amd/python/test/test_(gluon_cdna5|tdm_copy))" /tmp/affected.txt; then
+            echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
+            exit 0
+          fi
+
+          run_rocjitsu_pytest() {
+            local workers="$1"
+            local budget="$2"
+            shift 2
+            "${ROCM_ROOT}/bin/mirage" run --in-process \
+              --config "${ROCJITSU_CONFIG}" \
+              --cpu-thread-budget "${budget}" -- \
+              python3 -m pytest --capture=tee-sys -rfs \
+              -n "${workers}" --durations=20 "$@"
+          }
+
+          # Same suites and emulator skips as upstream Triton's
+          # gfx1250-rocjitsu job (triton-lang/triton), with worker and thread
+          # budgets sized for a 4-vCPU GitHub-hosted runner.
+          run_rocjitsu_pytest 2 4 -s --tb=short \
+            third_party/amd/python/test/test_gluon_cdna5_consan.py \
+            --junitxml=/tmp/gluon-consan.xml
+          K_SKIP="(test_tensor_descriptor_load_store_nd_with_padding and int32-64-1)"
+          K_SKIP+=" or (test_cache_modifier and tdm_load_store_roundtrip_kernel)"
+          # Known emulator issues with TDM mbarrier completion and redundant warps.
+          K_SKIP+=" or test_tdm_mbarrier_last_load_covers_prior"
+          K_SKIP+=" or (test_tdm_gather_scatter_mbarrier_count and (redundant_single_chunk or redundant_multichunk))"
+          run_rocjitsu_pytest 4 4 \
+            third_party/amd/python/test/test_gluon_cdna5.py \
+            -k "not test_runtime_tensor_copy and not (${K_SKIP})" \
+            --junitxml=/tmp/gluon-cdna5.xml
+          run_rocjitsu_pytest 4 4 \
+            third_party/amd/python/test/test_gluon_cdna5.py \
+            -k "test_runtime_tensor_copy" \
+            --junitxml=/tmp/gluon-runtime-copy.xml
+          run_rocjitsu_pytest 4 4 \
+            third_party/amd/python/test/test_tdm_copy.py \
+            python/test/gluon/test_frontend.py \
+            python/test/gluon/test_fpsan.py \
+            --junitxml=/tmp/gluon-frontend.xml
+      - name: Parse test failures (roc-jitsu)
+        id: parse
+        if: always()
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: gfx1250-rocjitsu-test
+          failed: ${{ steps.run_codegen_tests.outcome != 'success' || steps.run_core_tests.outcome != 'success' || steps.run_gluon_tests.outcome != 'success' }}
+          bucket: gfx1250-rocjitsu-job-failed
+          junit: /tmp/tlx-codegen-gfx1250.xml /tmp/tlx-core.xml /tmp/gluon-consan.xml /tmp/gluon-cdna5.xml /tmp/gluon-runtime-copy.xml /tmp/gluon-frontend.xml
+          budget: /tmp/tlx-codegen-gfx1250.xml=30 /tmp/tlx-core.xml=90 /tmp/gluon-cdna5.xml=60
+
+  # File and close failure issues; ci-issues.yml decides which runs file.
+  # platform is empty: the deep-bisect runner needs a physical GPU, which
+  # this emulated lane does not have.
+  issues-gfx1250-rocjitsu:
+    needs: gfx1250-rocjitsu-test
+    if: always()
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    uses: ./.github/workflows/ci-issues.yml
+    with:
+      workflow: Meta Triton gfx1250 Tests
+      job: gfx1250-rocjitsu-test
+      result: ${{ needs.gfx1250-rocjitsu-test.result }}
+      failures: ${{ needs.gfx1250-rocjitsu-test.outputs.failures }}
+      sha: ${{ inputs.ref }}
+      platform: ""
