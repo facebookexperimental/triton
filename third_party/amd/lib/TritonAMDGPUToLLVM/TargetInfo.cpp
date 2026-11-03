@@ -181,8 +181,8 @@ Value TargetInfo::rematerializeDistributedCoordinate(RewriterBase &rewriter,
   auto inlineAsm = LLVM::InlineAsmOp::create(
       rewriter, loc, coordinate.getType(), ValueRange{coordinate}, "", "=v,0",
       /*has_side_effects=*/true,
-      /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-      operandAttrs);
+      /*is_align_stack=*/false, LLVM::TailCallKind::None, /*convergent=*/false,
+      asmDialect, operandAttrs);
   return inlineAsm->getResult(0);
 }
 
@@ -805,7 +805,7 @@ void TargetInfo::assertFail(RewriterBase &rewriter, Location loc,
       rewriter, loc, LLVM::LLVMVoidType::get(ctx), /*operands=*/ValueRange{},
       "s_trap 2", /*constraints=*/"",
       /*has_side_effects=*/true, /*is_align_stack=*/false,
-      LLVM::TailCallKind::None,
+      LLVM::TailCallKind::None, /*convergent=*/false,
       LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
       /*operand_attrs=*/ArrayAttr::get(ctx, {}));
 }
@@ -892,8 +892,9 @@ bool TargetInfo::supportsBufferAtomicFadd(mlir::Type elementType) const {
   return targetFeatures.supportsBufferAtomicFadd(elementType);
 }
 
-int32_t TargetInfo::getBufferAtomicCachePolicy(bool hasUsers) const {
-  return targetFeatures.getBufferAtomicCachePolicy(hasUsers);
+int32_t TargetInfo::getBufferAtomicCachePolicy(bool hasUsers,
+                                               bool clusterScope) const {
+  return targetFeatures.getBufferAtomicCachePolicy(hasUsers, clusterScope);
 }
 
 bool TargetInfo::supportsWaveId() const {

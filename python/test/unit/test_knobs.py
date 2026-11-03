@@ -76,7 +76,7 @@ def test_knobs_utils(fresh_knobs) -> None:
     ("gfx90a", True, None, [], False),
     ("gfx942", False, "1", ["amdgpu-use-amdgpu-trackers"], True),
     ("gfx950", True, "disable-lsr", ["amdgpu-use-amdgpu-trackers"], False),
-    ("gfx1250", True, "0", ["amdgpu-expert-scheduling-mode"], False),
+    ("gfx1250", True, "0", ["amdgpu-anti-hints-for-va-vdst", "amdgpu-expert-scheduling-mode"], False),
 ])
 def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags, disable_optimization, fresh_knobs,
                              monkeypatch):
@@ -408,7 +408,7 @@ def _register_pressure_scheduler_kernel():
     for lane in range(32):
         arithmetic.extend([
             f"  %seed{lane} = add i32 %seed, {lane + 1}",
-            f"  %high{lane} = mul i32 %seed{lane}, -766435501",
+            f"  %high{lane} = call i32 @llvm.umulh.i32(i32 %seed{lane}, i32 -766435501)",
             f"  %low{lane} = mul i32 %seed{lane}, -845247145",
             f"  %value{lane} = xor i32 %high{lane}, %low{lane}",
         ])
@@ -418,6 +418,7 @@ def _register_pressure_scheduler_kernel():
         ])
 
     source = ('target triple = "nvptx64-nvidia-cuda"\n'
+              'declare i32 @llvm.umulh.i32(i32, i32)\n'
               'define ptx_kernel void @scheduler_kernel(ptr addrspace(1) %out, i32 %seed) {\n' +
               "\n".join(arithmetic + stores) + "\n  ret void\n}\n")
     return backend, source
@@ -459,7 +460,7 @@ define ptx_kernel void @short_pointer_kernel(ptr addrspace(1) %out, i64 %offset)
 
 @pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
 @pytest.mark.parametrize("link_hip_first", [False, True])
-def test_nvidia_short_pointer_option(link_hip_first, fresh_triton_cache):
+def test_nvidia_short_pointer_abi(link_hip_first, fresh_triton_cache):
     from triton.backends.compiler import GPUTarget
 
     if link_hip_first:
@@ -473,6 +474,7 @@ def test_nvidia_short_pointer_option(link_hip_first, fresh_triton_cache):
     compiled = triton.compile(triton.compiler.ASTSource(empty_kernel, {}), target=GPUTarget("cuda", 90, 32))
     data_layout = next(line for line in compiled.asm["llir"].splitlines() if line.startswith("target datalayout"))
     assert "p3:32:32" in data_layout
+    assert "p5:32:32" in data_layout
 
     backend, source = _nvidia_short_pointer_kernel()
     options = backend.parse_options({"ptx_version": 80})

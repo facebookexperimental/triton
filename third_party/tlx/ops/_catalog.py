@@ -124,6 +124,15 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="int4_embedding",
+        arch="sm90",
+        variant="gather_dequant",
+        impl="triton.tlx.ops.kernels.int4_embedding.sm90:int4_embedding",
+        dtypes=frozenset({"uint8"}),
+        accepts=lambda d: d["D"] == 64 and all(p % 16 == 0 for p in d["base_ptrs"]),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="mm_bias_grad",
         arch="sm100",
         variant="ws_wgrad_bias",

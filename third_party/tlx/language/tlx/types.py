@@ -350,6 +350,9 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             numCTAsPerCGA=self.numCTAsPerCGA,
             numCTASplit=self.numCTASplit,
             numCTAOrder=self.numCTAOrder,
+            # Explicit bases map offsets to coordinates; permute their components.
+            offset_bases=None if self.offset_bases is None else [[base[d] for d in dims] for base in self.offset_bases],
+            block_bases=None if self.block_bases is None else [[base[d] for d in dims] for base in self.block_bases],
         )
 
     def to_ir(self, builder: ir.builder) -> None:

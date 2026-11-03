@@ -4092,6 +4092,7 @@ def test_compile_tdm_scatter(NUM_INDICES, BLOCK_M, BLOCK_N, dtype, index_dtype):
 
     k = triton.compile(gluon._runtime.GluonASTSource(tdm_scatter_kernel, signature, constexprs),
                        target=GPUTarget("hip", 'gfx1250', 32))
+    assert re.search(r"call .*@\S+_ws\(.*ptr addrspace\(15\) @nbar", k.asm["llir"])
     amdgcn = k.asm["amdgcn"]
 
     # Verify the scatter uses tensor store from lds

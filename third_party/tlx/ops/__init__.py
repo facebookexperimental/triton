@@ -116,10 +116,11 @@ from ._normalization import (
 )
 
 __all__ = [
-    "mm", "mm_bias_grad", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
-    "flash_attn_varlen", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention",
-    "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward",
-    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn",
+    "flash_attn_mxfp8", "flash_attn_varlen", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn",
+    "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward",
+    "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec",
+    "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -214,6 +215,37 @@ def mm(a, b, *, out=None, space=None):
     if out is None:
         return fn(a, b, space=space_name, invariance=invariance)
     return fn(a, b, out=out, space=space_name, invariance=invariance)
+
+
+def int4_embedding(weights, weights_offsets, indices, offsets, D, *, out=None, space=None):
+    """Return the FP16 rows ``indices`` select from INT4 tables, without pooling.
+
+    ``weights`` is the contiguous uint8 buffer of all tables, ``weights_offsets``
+    the int64 byte offset of each table, each row ``[fp16 scale, fp16 shift]``
+    and ``D / 2`` bytes of 4-bit values padded to a multiple of 16 bytes; within
+    each 32-bit word, nibble ``j`` holds column ``8 * w + [0, 4, 2, 6, 1, 5, 3, 7][j]``.
+    ``indices`` and ``offsets`` are int32, with
+    ``T * B + 1`` offsets for ``T`` tables of ``B`` bags. Returns a
+    ``[len(indices), D]`` FP16 tensor; row ``p`` is
+    ``fma(q, scale, shift)`` of row ``indices[p]`` of its table, rounded once,
+    and zeros where the index is negative.
+    ``out`` may supply that tensor. Only ``D = 64`` and Hopper are supported.
+    Forward only.
+    """
+    tensors = (weights, weights_offsets, indices, offsets)
+    if any(t.ndim != 1 for t in tensors):
+        raise InvalidInput("tlx.ops.int4_embedding expects rank-1 tensors")
+    if any(t.device != weights.device for t in tensors):
+        raise InvalidInput("tlx.ops.int4_embedding inputs must be on the same device")
+    if (str(weights_offsets.dtype), str(indices.dtype), str(offsets.dtype)) != ("torch.int64", "torch.int32",
+                                                                                "torch.int32"):
+        raise InvalidInput("tlx.ops.int4_embedding needs int64 weights_offsets and int32 indices and offsets")
+    if not all(t.is_contiguous() for t in tensors):
+        raise InvalidInput("tlx.ops.int4_embedding requires contiguous inputs")
+    _check_single_config_space("int4_embedding", space)
+    fn, spec = impl_for("int4_embedding", device=weights.device)
+    check_inputs(spec, dtype=weights.dtype, D=D, base_ptrs=tuple(t.data_ptr() for t in tensors))
+    return fn(weights, weights_offsets, indices, offsets, D, out=out, space=spec.default_space)
 
 
 def mm_bias_grad(dout, input_act, *, out=None, space=None):
