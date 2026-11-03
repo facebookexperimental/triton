@@ -1,9 +1,9 @@
-// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx942 ftz=True" --convert-builtin-func-to-llvm="ftz=True" | FileCheck %s --check-prefix=LLVM_FTZ
-// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950 ftz=True" --convert-builtin-func-to-llvm="ftz=True" | FileCheck %s --check-prefix=LLVM_FTZ
-// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx942 ftz=False" --convert-builtin-func-to-llvm="ftz=False" | FileCheck %s --check-prefix=LLVM_NO_FTZ
-// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx1250 ftz=True" --convert-builtin-func-to-llvm="gfx-arch=gfx1250 ftz=True" | FileCheck %s --check-prefix=CDNA5
-// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx1250 ftz=False" --convert-builtin-func-to-llvm="gfx-arch=gfx1250 ftz=False" | FileCheck %s --check-prefix=CDNA5
-// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950 ftz=False" --convert-builtin-func-to-llvm="ftz=False" | FileCheck %s --check-prefix=LLVM_NO_FTZ
+// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx942 ftz=true" --convert-builtin-func-to-llvm="ftz=true" | FileCheck %s --check-prefix=LLVM_FTZ
+// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950 ftz=true" --convert-builtin-func-to-llvm="ftz=true" | FileCheck %s --check-prefix=LLVM_FTZ
+// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx942 ftz=false" --convert-builtin-func-to-llvm="ftz=false" | FileCheck %s --check-prefix=LLVM_NO_FTZ
+// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx1250 ftz=true" --convert-builtin-func-to-llvm="gfx-arch=gfx1250 ftz=true" | FileCheck %s --check-prefix=CDNA5
+// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx1250 ftz=false" --convert-builtin-func-to-llvm="gfx-arch=gfx1250 ftz=false" | FileCheck %s --check-prefix=CDNA5
+// RUN: triton-opt %s --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950 ftz=false" --convert-builtin-func-to-llvm="ftz=false" | FileCheck %s --check-prefix=LLVM_NO_FTZ
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 

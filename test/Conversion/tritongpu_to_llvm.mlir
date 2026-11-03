@@ -62,7 +62,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
   // CHECK-LABEL: @native_volatile_load(
   tt.func private @native_volatile_load(%ptr: !tt.ptr<i32>) -> i32 {
-    // CHECK: %[[LOADED:.*]] = llvm.load volatile %arg0 {alignment = 4 : i64} : !llvm.ptr<1> -> i32
+    // CHECK: %[[LOADED:.*]] = llvm.load volatile %arg0 <alignment = 4> : !llvm.ptr<1> -> i32
     // CHECK: llvm.return %[[LOADED]] : i32
     %value = tt.load %ptr {isVolatile = true} : !tt.ptr<i32>
     tt.return %value : i32
@@ -186,9 +186,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @native_explicit_default_cache_policy(
   tt.func @native_explicit_default_cache_policy(%ptr: tensor<128x!tt.ptr<f32>, #blocked0>, %out: tensor<128x!tt.ptr<f32>, #blocked0>) {
     // CHECK-NOT: llvm.inline_asm
-    // CHECK: llvm.load {{.*}} {alignment = 4 : i64} : !llvm.ptr<1> -> f32
+    // CHECK: llvm.load {{.*}} <alignment = 4> : !llvm.ptr<1> -> f32
     // CHECK-NOT: llvm.inline_asm
-    // CHECK: llvm.store {{.*}} {alignment = 4 : i64} : f32, !llvm.ptr<1>
+    // CHECK: llvm.store {{.*}} <alignment = 4> : f32, !llvm.ptr<1>
     // CHECK-NOT: llvm.inline_asm
     // CHECK: llvm.return
     %value = tt.load %ptr {cachePolicy = #tt.cache_policy<cache_modifier = ca, eviction_policy = evict_normal>} : tensor<128x!tt.ptr<f32>, #blocked0>
@@ -198,8 +198,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
   // CHECK-LABEL: @native_normal_cache_policy(
   tt.func @native_normal_cache_policy(%ptr: tensor<128x!tt.ptr<f32>, #blocked0>, %out: tensor<128x!tt.ptr<f32>, #blocked0>) {
-    // CHECK: llvm.load {{.*}} {alignment = 4 : i64} : !llvm.ptr<1> -> f32
-    // CHECK: llvm.store {{.*}} {alignment = 4 : i64} : f32, !llvm.ptr<1>
+    // CHECK: llvm.load {{.*}} <alignment = 4> : !llvm.ptr<1> -> f32
+    // CHECK: llvm.store {{.*}} <alignment = 4> : f32, !llvm.ptr<1>
     // CHECK: llvm.return
     %value = tt.load %ptr {cachePolicy = #normal_cache_policy} : tensor<128x!tt.ptr<f32>, #blocked0>
     tt.store %out, %value {cachePolicy = #normal_cache_policy} : tensor<128x!tt.ptr<f32>, #blocked0>
@@ -272,10 +272,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32} {
     %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Load 4 elements from vector0
-    // CHECK-COUNT-4: llvm.load {{.*}} {alignment = 4 : i64} : !llvm.ptr<1> -> f32
+    // CHECK-COUNT-4: llvm.load {{.*}} <alignment = 4> : !llvm.ptr<1> -> f32
 
     // Load 4 elements from vector1
-    // CHECK-COUNT-4: llvm.load {{.*}} {alignment = 4 : i64} : !llvm.ptr<1> -> f32
+    // CHECK-COUNT-4: llvm.load {{.*}} <alignment = 4> : !llvm.ptr<1> -> f32
     %9 = tt.load %6 : tensor<256x!tt.ptr<f32>, #blocked0>
     %10 = tt.load %8 : tensor<256x!tt.ptr<f32>, #blocked0>
     %11 = arith.addf %9, %10 : tensor<256xf32, #blocked0>
@@ -283,7 +283,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32} {
     %13 = tt.addptr %12, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Store 4 elements to global
-    // CHECK-COUNT-4: llvm.store {{.*}} {alignment = 4 : i64} : f32, !llvm.ptr<1>
+    // CHECK-COUNT-4: llvm.store {{.*}} <alignment = 4> : f32, !llvm.ptr<1>
     tt.store %13, %11 : tensor<256x!tt.ptr<f32>, #blocked0>
     tt.return
   }
@@ -430,10 +430,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32} {
     %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Load 4 elements from A with single one vectorized load instruction
-    // CHECK: llvm.load {{.*}} {alignment = 16 : i64} : !llvm.ptr<1> -> vector<4xf32>
+    // CHECK: llvm.load {{.*}} <alignment = 16> : !llvm.ptr<1> -> vector<4xf32>
 
     // Load 4 elements from B with single one vectorized load instruction
-    // CHECK: llvm.load {{.*}} {alignment = 16 : i64} : !llvm.ptr<1> -> vector<4xf32>
+    // CHECK: llvm.load {{.*}} <alignment = 16> : !llvm.ptr<1> -> vector<4xf32>
 
     %9 = tt.load %6 : tensor<256x!tt.ptr<f32>, #blocked0>
     %10 = tt.load %8 : tensor<256x!tt.ptr<f32>, #blocked0>
@@ -442,7 +442,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32} {
     %13 = tt.addptr %12, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Store 4 elements to global with single one vectorized store instruction
-    // CHECK: llvm.store {{.*}} {alignment = 16 : i64} : vector<4xf32>, !llvm.ptr<1>
+    // CHECK: llvm.store {{.*}} <alignment = 16> : vector<4xf32>, !llvm.ptr<1>
     tt.store %13, %11 : tensor<256x!tt.ptr<f32>, #blocked0>
     tt.return
   }
@@ -497,10 +497,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Load 8 elements from A with four vectorized load instruction
-    // CHECK-COUNT-4: llvm.load {{.*}} {alignment = 8 : i64} : !llvm.ptr<1> -> vector<2xf32>
+    // CHECK-COUNT-4: llvm.load {{.*}} <alignment = 8> : !llvm.ptr<1> -> vector<2xf32>
 
     // Load 8 elements from B with four vectorized load instruction
-    // CHECK-COUNT-4: llvm.load {{.*}} {alignment = 8 : i64} : !llvm.ptr<1> -> vector<2xf32>
+    // CHECK-COUNT-4: llvm.load {{.*}} <alignment = 8> : !llvm.ptr<1> -> vector<2xf32>
 
     %9 = tt.load %6 : tensor<256x!tt.ptr<f32>, #blocked0>
     %10 = tt.load %8 : tensor<256x!tt.ptr<f32>, #blocked0>
@@ -509,7 +509,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     %13 = tt.addptr %12, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Store 8 elements to global with four vectorized store instruction
-    // CHECK-COUNT-4: llvm.store {{.*}} {alignment = 8 : i64} : vector<2xf32>, !llvm.ptr<1>
+    // CHECK-COUNT-4: llvm.store {{.*}} <alignment = 8> : vector<2xf32>, !llvm.ptr<1>
     tt.store %13, %11 : tensor<256x!tt.ptr<f32>, #blocked0>
     tt.return
   }
@@ -533,10 +533,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Load 8 elements from A with four vectorized load instruction
-    // CHECK-COUNT-4: llvm.load {{.*}} {alignment = 8 : i64} : !llvm.ptr<1> -> vector<2xf32>
+    // CHECK-COUNT-4: llvm.load {{.*}} <alignment = 8> : !llvm.ptr<1> -> vector<2xf32>
 
     // Load 8 elements from B with four vectorized load instruction
-    // CHECK-COUNT-4: llvm.load {{.*}} {alignment = 8 : i64} : !llvm.ptr<1> -> vector<2xf32>
+    // CHECK-COUNT-4: llvm.load {{.*}} <alignment = 8> : !llvm.ptr<1> -> vector<2xf32>
 
     %9 = tt.load %6 : tensor<256x!tt.ptr<f32>, #blocked0>
     %10 = tt.load %8 : tensor<256x!tt.ptr<f32>, #blocked0>
@@ -545,7 +545,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     %13 = tt.addptr %12, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Store 8 elements to global with four vectorized store instruction
-    // CHECK-COUNT-4: llvm.store {{.*}} {alignment = 8 : i64} : vector<2xf32>, !llvm.ptr<1>
+    // CHECK-COUNT-4: llvm.store {{.*}} <alignment = 8> : vector<2xf32>, !llvm.ptr<1>
     tt.store %13, %11 : tensor<256x!tt.ptr<f32>, #blocked0>
     tt.return
   }
@@ -569,10 +569,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Load 8 elements from A with two vectorized load instruction
-    // CHECK-COUNT-2: llvm.load {{.*}} {alignment = 16 : i64} : !llvm.ptr<1> -> vector<4xf32>
+    // CHECK-COUNT-2: llvm.load {{.*}} <alignment = 16> : !llvm.ptr<1> -> vector<4xf32>
 
     // Load 8 elements from B with two vectorized load instruction
-    // CHECK-COUNT-2: llvm.load {{.*}} {alignment = 16 : i64} : !llvm.ptr<1> -> vector<4xf32>
+    // CHECK-COUNT-2: llvm.load {{.*}} <alignment = 16> : !llvm.ptr<1> -> vector<4xf32>
 
     %9 = tt.load %6 : tensor<256x!tt.ptr<f32>, #blocked0>
     %10 = tt.load %8 : tensor<256x!tt.ptr<f32>, #blocked0>
@@ -581,7 +581,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     %13 = tt.addptr %12, %4 : tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xi32, #blocked0>
 
     // Store 8 elements to global with two vectorized store instruction
-    // CHECK-COUNT-2: llvm.store {{.*}} {alignment = 16 : i64} : vector<4xf32>, !llvm.ptr<1>
+    // CHECK-COUNT-2: llvm.store {{.*}} <alignment = 16> : vector<4xf32>, !llvm.ptr<1>
     tt.store %13, %11 : tensor<256x!tt.ptr<f32>, #blocked0>
     tt.return
   }
@@ -609,11 +609,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32} {
 
     // Load 2 element from vector0 without predicate
     // CHECK-NOT: llvm.cond_br
-    // CHECK-COUNT-2: llvm.load {{.*}} {alignment = 4 : i64} : !llvm.ptr<1> -> f32
+    // CHECK-COUNT-2: llvm.load {{.*}} <alignment = 4> : !llvm.ptr<1> -> f32
 
     // Load 2 elements from vector1 without predicate
     // CHECK-NOT: llvm.cond_br
-    // CHECK-COUNT-2: llvm.load {{.*}} {alignment = 4 : i64} : !llvm.ptr<1> -> f32
+    // CHECK-COUNT-2: llvm.load {{.*}} <alignment = 4> : !llvm.ptr<1> -> f32
     %9 = tt.load %6 : tensor<128x!tt.ptr<f32>, #slice>
     %10 = tt.load %8 : tensor<128x!tt.ptr<f32>, #slice>
     %11 = arith.addf %9, %10 : tensor<128xf32, #slice>
@@ -622,7 +622,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32} {
 
     // Store 2 element to global without predicate
     // CHECK-NOT: llvm.cond_br
-    // CHECK-COUNT-2: llvm.store {{.*}} {alignment = 4 : i64} : f32, !llvm.ptr<1>
+    // CHECK-COUNT-2: llvm.store {{.*}} <alignment = 4> : f32, !llvm.ptr<1>
     tt.store %13, %11 : tensor<128x!tt.ptr<f32>, #slice>
     tt.return
   }
@@ -2167,7 +2167,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: store_f32
   tt.func @store_f32(%arg0 : tensor<256x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<256xf32, #blocked0>) {
-    // CHECK-COUNT-2: llvm.store {{.*}} {alignment = 4 : i64} : f32, !llvm.ptr<1>
+    // CHECK-COUNT-2: llvm.store {{.*}} <alignment = 4> : f32, !llvm.ptr<1>
     tt.store %arg0, %arg1 : tensor<256x!tt.ptr<f32>, #blocked0>
     tt.return
   }
@@ -2686,7 +2686,7 @@ module attributes {"ttg.target" = "cuda:75", "ttg.num-ctas" = 1 : i32, "ttg.num-
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @vectorize_shmem_load
   // CHECK: llvm.load
-  // CHECK-SAME: {alignment = 8 : i64} : !llvm.ptr<3> -> vector<2xi32>
+  // CHECK-SAME: <alignment = 8> : !llvm.ptr<3> -> vector<2xi32>
   // CHECK-NOT: llvm.load
   tt.func public @vectorize_shmem_load(%shmem : !ttg.memdesc<16x16xi8, #shared, #smem>) {
     %0 = ttg.local_load %shmem : !ttg.memdesc<16x16xi8, #shared, #smem> -> tensor<16x16xi8, #blocked>
@@ -2701,7 +2701,7 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #smem = #ttg.shared_memory
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @vectorize_shmem_store
-  // CHECK-COUNT-4:  llvm.store {{.*}} {alignment = 16 : i64} : vector<4xi32>, !llvm.ptr<3>
+  // CHECK-COUNT-4:  llvm.store {{.*}} <alignment = 16> : vector<4xi32>, !llvm.ptr<3>
   tt.func public @vectorize_shmem_store(%block : tensor<64x64xi32, #blocked>) {
     %0 = ttg.local_alloc %block : (tensor<64x64xi32, #blocked>) -> !ttg.memdesc<64x64xi32, #shared, #smem>
     tt.return
@@ -3404,7 +3404,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     // CHECK: llvm.br
     cf.br ^bb1(%arg0 : tensor<16x4x!tt.ptr<i8>, #blocked>)
     ^bb1(%arg1: tensor<16x4x!tt.ptr<i8>, #blocked>):
-    // CHECK: llvm.load {{.*}} {alignment = 1 : i64} : !llvm.ptr<1> -> i8
+    // CHECK: llvm.load {{.*}} <alignment = 1> : !llvm.ptr<1> -> i8
       %0 = tt.load %arg1 : tensor<16x4x!tt.ptr<i8>, #blocked>
       tt.return
   }

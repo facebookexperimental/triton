@@ -378,7 +378,9 @@ struct FpToFpOpConversion
           "unsupported rounding mode for f32->bf16 conversion: " +
           stringifyRoundingMode(rounding) + "\n");
     }
-    return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, bf16_ty, {v})
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, bf16_ty,
+                                           {v, /*pzo=*/b.false_val()})
         .getResult(0);
   }
 

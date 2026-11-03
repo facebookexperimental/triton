@@ -4887,7 +4887,9 @@ def test_amd_scheduled_mfma_opaque_consumer_completion(target, version, instr_k,
         assert "ttg.convert_layout" in after_mfma[:after_mfma.index("tt.elementwise_inline_asm")]
         native_transfer = llir[mfma.end():opaque_consumer]
         assert re.search(r'store <\d+ x float>.*ptr addrspace\(3\)', native_transfer)
-        assert re.search(r'load <\d+ x float>, ptr addrspace\(3\)', native_transfer)
+        # LLVM 18 may scalarize the LDS reload; either width still proves the
+        # layout transfer goes through shared memory.
+        assert re.search(r'load (?:<\d+ x float>|float), ptr addrspace\(3\)', native_transfer)
 
     assert waits
     for wait in waits:
@@ -5024,7 +5026,9 @@ def test_amd_scheduled_mfma_memory_forward_completion(tmp_path, target, version,
     assert not re.search(r'asm sideeffect "[^"\n]*v_mfma_', llir)
     waits = list(re.finditer(r'asm sideeffect "(s_nop \d+(?:\\0As_nop \d+)*)", "([^"\n]*)"', llir))
     if consumer == "native":
-        assert "fadd float" in llir
+        # LLVM 18 prints fast-math flags between the opcode and the type
+        # (e.g. `fadd contract float`), as with the packed-f32 patterns.
+        assert re.search(r"fadd(?:\s+[a-z]+)* float", llir)
         assert not re.search(r'asm(?: sideeffect)? "[^"\n]*s_nop', llir)
         return
     assert len(waits) == 1
