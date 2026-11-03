@@ -36,6 +36,14 @@ def _assert_range_result(actual, expected):
         torch.testing.assert_close(actual[row:row + 64], expected[row:row + 64], atol=tolerance * amax, rtol=tolerance)
 
 
+def test_mm_fp16_lsr_k160_production_shape():
+    torch.manual_seed(83)
+    a = torch.randn((2496, 160), device="cuda", dtype=torch.float16)
+    b = torch.randn((22528, 160), device="cuda", dtype=torch.float16).T
+    actual = tlx_ops.mm(a, b)
+    _assert_range_result(actual, a @ b)
+
+
 @pytest.mark.parametrize("m,n,k,dtype_name,b_step", [
     (24, 1024, 768, "bf16", 1),
     (96, 1280, 1024, "bf16", 1),
