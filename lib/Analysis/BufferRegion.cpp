@@ -570,6 +570,34 @@ BufferRegionAnalysis::getAllocView(Value allocation, uint32_t storageBase,
   return getSubView(allocation.getType(), view);
 }
 
+std::optional<BufferRegionView>
+BufferRegionAnalysis::getWholeAllocView(Value allocationValue,
+                                        ArrayRef<uint32_t> offsets) {
+  Operation *op = allocationValue.getDefiningOp();
+  Allocation *allocation = getAllocation(op);
+  if (!allocation || offsets.size() != 1)
+    return std::nullopt;
+  SmallVector<Allocation::BufferId> ids =
+      allocation->getBufferIds(allocationValue);
+  if (ids.size() != 1)
+    return std::nullopt;
+  size_t size = allocation->getAllocatedSize(ids.front());
+  assert(size <= std::numeric_limits<uint32_t>::max());
+  uint32_t length = static_cast<uint32_t>(size);
+  BufferRegionView view;
+  view.storageBase = offsets.front();
+  view.allocation = op;
+  view.allocationFrame =
+      getOperationId(op->getParentOfType<FunctionOpInterface>());
+  view.region.baseOffset = offsets.front();
+  view.region.length = length;
+  AddressSet addresses = AddressSet::fromRange(offsets.front(), length);
+  unsigned numCTAs = ttg::lookupNumCTAs(op);
+  for (unsigned cta = 0; cta < numCTAs; ++cta)
+    view.region.ctaAddresses.emplace_back(cta, addresses);
+  return view;
+}
+
 BufferRegionView
 BufferRegionAnalysis::getSubView(Type type, const BufferRegionView &view,
                                  uint32_t storageOffset, uint32_t byteOffset,
@@ -792,8 +820,18 @@ LogicalResult BufferRegionAnalysis::visitOperation(
         getAllocationOffsets(localAllocOp, getAllocation(op));
     if (failed(offsets))
       return failure();
-    if (reachesNPOTLinearLayoutAssert(localAllocOp.getResult().getType()))
-      return propagateRegions(RegionInfo::getPessimisticValueState());
+    if (reachesNPOTLinearLayoutAssert(localAllocOp.getResult().getType())) {
+      // No linear layout describes this shape, but the allocation's bytes are
+      // known: cover all of them rather than all of shared memory. Views
+      // derived from it with power-of-two shapes (e.g. one mbarrier of a
+      // three-slot ring) still get exact footprints.
+      std::optional<BufferRegionView> whole =
+          getWholeAllocView(localAllocOp.getResult(), *offsets);
+      if (!whole)
+        return propagateRegions(RegionInfo::getPessimisticValueState());
+      regionInfo.views.insert(std::move(*whole));
+      return propagateRegions(regionInfo);
+    }
     ArrayRef<uint32_t> partitionBases = offsets->size() > 1
                                             ? ArrayRef<uint32_t>(*offsets)
                                             : ArrayRef<uint32_t>();

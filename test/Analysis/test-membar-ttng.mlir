@@ -532,3 +532,59 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.thr
     tt.return %result : tensor<16x16xf32, #cols>
   }
 }
+
+// -----
+
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// A three-slot mbarrier ring has no linear layout, but its accesses still cover
+// only its own bytes: a wait on another barrier after an arrive on the ring
+// needs no CTA barrier.
+// CHECK-LABEL: @npot_barrier_ring_disjoint_from_other_barrier
+tt.func @npot_barrier_ring_disjoint_from_other_barrier(%phase: i32) {
+  %c0 = arith.constant 0 : i32
+  %ring = ttg.local_alloc : () -> !ttg.memdesc<3xi64, #barrier_shared, #smem, mutable>
+  %other = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %slot = ttg.memdesc_index %ring[%c0] : !ttg.memdesc<3xi64, #barrier_shared, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  // CHECK: ttng.arrive_barrier
+  // CHECK-NEXT: ttng.wait_barrier
+  ttng.arrive_barrier %slot, 1 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %other, %phase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  tt.return
+}
+
+// Accesses through the same slot of the ring still conflict.
+// CHECK-LABEL: @npot_barrier_ring_same_slot
+tt.func @npot_barrier_ring_same_slot(%phase: i32) {
+  %c0 = arith.constant 0 : i32
+  %ring = ttg.local_alloc : () -> !ttg.memdesc<3xi64, #barrier_shared, #smem, mutable>
+  %slot = ttg.memdesc_index %ring[%c0] : !ttg.memdesc<3xi64, #barrier_shared, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  // CHECK: ttng.arrive_barrier
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttng.wait_barrier
+  ttng.arrive_barrier %slot, 1 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %slot, %phase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  tt.return
+}
+
+// A slot picked at run time may be any slot of the ring: it conflicts with
+// slot 0 but not with another allocation.
+// CHECK-LABEL: @npot_barrier_ring_dynamic_slot
+tt.func @npot_barrier_ring_dynamic_slot(%index: i32, %phase: i32) {
+  %c0 = arith.constant 0 : i32
+  %ring = ttg.local_alloc : () -> !ttg.memdesc<3xi64, #barrier_shared, #smem, mutable>
+  %other = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %any = ttg.memdesc_index %ring[%index] : !ttg.memdesc<3xi64, #barrier_shared, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %slot = ttg.memdesc_index %ring[%c0] : !ttg.memdesc<3xi64, #barrier_shared, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  // CHECK: ttng.arrive_barrier
+  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttng.wait_barrier
+  ttng.arrive_barrier %any, 1 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %other, %phase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %slot, %phase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  tt.return
+}
+}
