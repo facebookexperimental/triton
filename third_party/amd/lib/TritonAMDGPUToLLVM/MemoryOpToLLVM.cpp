@@ -783,8 +783,8 @@ constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
   auto identity = LLVM::InlineAsmOp::create(
       rewriter, loc, registerVectorTy, ValueRange{packed}, "", constraints,
       hasSideEffects,
-      /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-      operandAttrs);
+      /*is_align_stack=*/false, LLVM::TailCallKind::None, /*convergent=*/false,
+      asmDialect, operandAttrs);
   if (pin)
     *pin = identity;
   Value constrained = b.bitcast(identity->getResult(0), fragmentTy);
@@ -1173,7 +1173,7 @@ public:
                           /*asm_string=*/"", constraints,
                           /*has_side_effects=*/false,
                           /*is_align_stack=*/false, LLVM::TailCallKind::None,
-                          asmDialect, operandAttrs)
+                          /*convergent=*/false, asmDialect, operandAttrs)
                           .getRes();
 
     SmallVector<Value> constrainedElements;
@@ -1245,7 +1245,7 @@ public:
                             /*asm_string=*/"", constraints,
                             /*has_side_effects=*/true,
                             /*is_align_stack=*/false, LLVM::TailCallKind::None,
-                            asmDialect, operandAttrs)
+                            /*convergent=*/false, asmDialect, operandAttrs)
                             .getRes();
       if (elementsPerRegister == 1) {
         constrainedElements.push_back(asmResult);
@@ -1730,8 +1730,8 @@ public:
     auto inlineAsm = LLVM::InlineAsmOp::create(
         rewriter, loc, resultTy, operands, waitAsm, constraints,
         /*has_side_effects=*/true,
-        /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-        operandAttrs);
+        /*is_align_stack=*/false, LLVM::TailCallKind::None,
+        /*convergent=*/false, asmDialect, operandAttrs);
     Value constrained = inlineAsm->getResult(0);
 
     auto getConstrainedGroup = [&](size_t index) {
@@ -1775,8 +1775,8 @@ public:
       auto secondAsm = LLVM::InlineAsmOp::create(
           rewriter, second.getLoc(), secondResultTy, secondGroups, waitAsm,
           secondConstraints, /*has_side_effects=*/true,
-          /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-          operandAttrs);
+          /*is_align_stack=*/false, LLVM::TailCallKind::None,
+          /*convergent=*/false, asmDialect, operandAttrs);
       secondConstrained = secondAsm.getRes();
       // Keep this boundary recognizable until every reaching root has been
       // analyzed and both delays have been strengthened by the finalizer.
