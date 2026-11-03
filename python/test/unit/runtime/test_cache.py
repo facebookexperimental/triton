@@ -1410,7 +1410,7 @@ def test_module_unload_uses_loading_driver(monkeypatch, fresh_knobs):
     compiled = object.__new__(compiler.CompiledKernel)
     compiled.src = object()
     # fbtriton-only: _build_dispatcher reads metadata.target.
-    compiled.metadata = SimpleNamespace(shared=0, num_warps=1, target=None)
+    compiled.metadata = SimpleNamespace(shared=0, num_warps=1, target=None, warp_size=32)
     compiled.metadata_group = {}
     compiled.hash = "hash"
     compiled.name = "kernel"
