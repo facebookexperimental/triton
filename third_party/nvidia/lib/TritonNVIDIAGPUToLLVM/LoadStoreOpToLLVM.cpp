@@ -239,8 +239,7 @@ struct LoadStoreConversionBase {
         targetInfo.getPtxVersion() >= 88) {
       maxVecBits = 256;
     }
-    unsigned vec = std::min<unsigned>(maxVecBits / pointeeBitWidth, contiguity);
-    return clampVecSizeForNpot(vec, tensorTy);
+    return std::min<unsigned>(maxVecBits / pointeeBitWidth, contiguity);
   }
 
   unsigned getMaskAlignment(Value mask) const {
@@ -1234,15 +1233,6 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto smemObj =
         getSharedMemoryObjectFromStruct(loc, llDst, resElemTy, rewriter);
     auto smemLayout = ttg::toLinearLayout(dstTy);
-    if (srcLayout.isModular()) {
-      auto allocShape = ttg::getAllocationShapePerCTA(dstTy);
-      smemLayout = ttg::toLinearLayout(allocShape, dstTy.getEncoding());
-      SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
-      for (auto dim : srcLayout.getOutDimNames())
-        paddedOutDims.push_back({dim, smemLayout.getOutDimSize(dim)});
-      srcLayout = LinearLayout(srcLayout.getBases(), paddedOutDims,
-                               /*requireSurjective=*/false);
-    }
     auto cvt = srcLayout.invertAndCompose(smemLayout);
     if (!cvt.isTrivialOver({str_attr("block")})) {
       return emitError(loc,
@@ -2285,10 +2275,22 @@ struct AsyncStoreOpConversion
     Value pred = b.icmp_eq(tid, b.i32_val(0));
 
     // @pred cp.async.bulk.global.shared::cta.bulk_group [$1], [$2], $3;
+    // or, for a reduction (no tensor map):
+    // @pred cp.reduce.async.bulk.global.shared::cta.bulk_group.<op>.<type> ...
+    std::string inst = "@$0 cp.async.bulk.global.shared::cta.bulk_group";
+    auto kind = op.getStoreReduce();
+    if (kind != triton::DescriptorReduceKind::NONE) {
+      FailureOr<std::string> ptxType =
+          triton::nvidia_gpu::AsyncStoreOp::getReducePtxType(
+              kind, srcTy.getElementType(), op.getStoreReduceSigned());
+      if (failed(ptxType))
+        return op.emitOpError("unsupported bulk reduction");
+      inst = "@$0 cp.reduce.async.bulk.global.shared::cta.bulk_group." +
+             stringifyDescriptorReduceKind(kind).str() + "." + *ptxType;
+    }
+    inst += " [$1], [$2], $3;";
     ::mlir::triton::PTXBuilder ptxBuilder;
-    auto &bulkCopy =
-        *ptxBuilder.create<>("@$0 cp.async.bulk.global.shared::cta.bulk_group "
-                             "[$1], [$2], $3;");
+    auto &bulkCopy = *ptxBuilder.create<>(inst);
     bulkCopy(
         {ptxBuilder.newOperand(pred, "b"), ptxBuilder.newOperand(dstPtr, "l"),
          ptxBuilder.newOperand(srcBase, "r"), ptxBuilder.newOperand(size, "r")},

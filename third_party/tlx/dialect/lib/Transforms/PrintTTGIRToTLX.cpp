@@ -3350,7 +3350,8 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
         op.getNumResults() > 0) {
       // Detect combiner type by looking at ops in the body region
-      bool isMax = false, isMin = false, isSum = false;
+      bool isMax = false, isMin = false, isSum = false, isOr = false,
+           isXor = false;
       for (Region &bodyRegion : op.getRegions()) {
         for (Block &block : bodyRegion) {
           for (Operation &bodyOp : block) {
@@ -3365,6 +3366,10 @@ void printBlock(Block &block, llvm::raw_ostream &os,
               isMin = true;
             if (bodyOpName == "arith.addf" || bodyOpName == "arith.addi")
               isSum = true;
+            if (bodyOpName == "arith.ori")
+              isOr = true;
+            if (bodyOpName == "arith.xori")
+              isXor = true;
           }
         }
       }
@@ -3377,6 +3382,10 @@ void printBlock(Block &block, llvm::raw_ostream &os,
         os << "tl.min(";
       else if (isSum)
         os << "tl.sum(";
+      else if (isOr)
+        os << "tl.reduce_or(";
+      else if (isXor)
+        os << "tl.xor_sum(";
       else
         os << "tl.reduce(";
       os << getValueName(op.getOperand(0), argSubstitutionMap);
@@ -3525,7 +3534,8 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     // Special handling for tt.reduce in CF printer
     if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
         op.getNumResults() > 0) {
-      bool isMax = false, isMin = false, isSum = false;
+      bool isMax = false, isMin = false, isSum = false, isOr = false,
+           isXor = false;
       for (Region &bodyRegion : op.getRegions()) {
         for (Block &block : bodyRegion) {
           for (Operation &bodyOp : block) {
@@ -3540,6 +3550,10 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
               isMin = true;
             if (n == "arith.addf" || n == "arith.addi")
               isSum = true;
+            if (n == "arith.ori")
+              isOr = true;
+            if (n == "arith.xori")
+              isXor = true;
           }
         }
       }
@@ -3552,6 +3566,10 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
         os << "tl.min(";
       else if (isSum)
         os << "tl.sum(";
+      else if (isOr)
+        os << "tl.reduce_or(";
+      else if (isXor)
+        os << "tl.xor_sum(";
       else
         os << "tl.reduce(";
       os << getValueName(op.getOperand(0), argSubstitutionMap);

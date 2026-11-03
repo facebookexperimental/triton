@@ -1301,7 +1301,18 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value &src,
               std::vector<int64_t> shape) -> mlir::Value {
              Value reshapeSrc = materializeConcreteMemDesc(self, src);
-             return self.create<ttg::MemDescReshapeOp>(reshapeSrc, shape);
+             // The (src, shape) builder only asserts that inference succeeds.
+             std::string msg;
+             ScopedDiagnosticHandler handler(
+                 self.getContext(),
+                 [&](Diagnostic &diag) { msg += diag.str(); });
+             ttg::MemDescType dstTy;
+             if (failed(ttg::MemDescReshapeOp::inferReturnTypes(
+                     self.getContext(), self.getLastLoc(),
+                     cast<ttg::MemDescType>(reshapeSrc.getType()), shape,
+                     dstTy)))
+               throw std::runtime_error(msg);
+             return self.create<ttg::MemDescReshapeOp>(dstTy, reshapeSrc);
            })
       .def(
           "create_memdesc_reinterpret",
@@ -1595,10 +1606,17 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, int pendings, bool readOnly) {
              self.create<ttng::TMAStoreWaitOp>(pendings, readOnly);
            })
-      .def("create_async_store",
-           [](TritonOpBuilder &self, Value src, Value dst, Value size) -> void {
-             self.create<ttng::AsyncStoreOp>(src, dst, size);
-           })
+      .def(
+          "create_async_store",
+          [](TritonOpBuilder &self, Value src, Value dst, Value size,
+             tt::DescriptorReduceKind storeReduce,
+             bool storeReduceSigned) -> void {
+            self.create<ttng::AsyncStoreOp>(src, dst, size, storeReduce,
+                                            storeReduceSigned);
+          },
+          py::arg("src"), py::arg("dst"), py::arg("size"),
+          py::arg("store_reduce") = tt::DescriptorReduceKind::NONE,
+          py::arg("store_reduce_signed") = false)
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);

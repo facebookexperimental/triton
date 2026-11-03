@@ -1294,20 +1294,41 @@ def _attn_bwd_dq_postprocess(DQ_ACCUM, DQ_OUT,  #
                              N_CTX,  #
                              BLK: tl.constexpr, HALF_HD: tl.constexpr,  #
                              BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
+                             DQ_CHUNK_N: tl.constexpr = 0,  #
                              ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
-    off_h = tl.arange(0, HALF_HD)
-    q = off_m[:, None]
-    tile_base = (q // BLK) * BLK
-    local = q % BLK
-    for half in tl.range(0, 2, loop_unroll_factor=1):
-        h = off_h[None, :] + half * HALF_HD
-        packed_row = 2 * tile_base + local + BLK * half
-        src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + off_h[None, :]
-        val = tl.load(src)
-        dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
-        tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
+    if DQ_CHUNK_N > 0:
+        # Bulk-reduce layout: each BLK-query tile is a [2 * BLK, HALF_HD] region
+        # stored as HALF_HD // DQ_CHUNK_N column chunks. Inside a chunk, elements
+        # are ordered [col / 4][row][col % 4] so the dQ warps' 16-byte SMEM stores
+        # are bank-conflict free. Each tile is one contiguous range, so read it in
+        # memory order and transpose in registers rather than gather 16-byte
+        # pieces from global. One tile at a time keeps the transpose's SMEM
+        # scratch small enough for full occupancy.
+        NUM_TILES: tl.constexpr = BLOCK_M // BLK
+        NUM_CHUNKS: tl.constexpr = HALF_HD // DQ_CHUNK_N
+        for t in tl.static_range(NUM_TILES):
+            src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + (tl.program_id(0) * BLOCK_M + t * BLK) * HEAD_DIM
+            val = tl.load(src + tl.arange(0, BLK * HEAD_DIM)).to(DQ_OUT.dtype.element_ty)
+            # [chunk, col / 4, half, row, col % 4] -> [row, half, chunk, col / 4, col % 4]
+            val = val.reshape([NUM_CHUNKS, DQ_CHUNK_N // 4, 2, BLK, 4]).permute(3, 2, 0, 1, 4)
+            val = val.reshape([BLK, HEAD_DIM])
+            rows = tl.program_id(0) * BLOCK_M + t * BLK + tl.arange(0, BLK)
+            dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + rows[:, None] * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+            tl.store(dst, val)
+    else:
+        off_h = tl.arange(0, HALF_HD)
+        q = off_m[:, None]
+        tile_base = (q // BLK) * BLK
+        local = q % BLK
+        for half in tl.range(0, 2, loop_unroll_factor=1):
+            h = off_h[None, :] + half * HALF_HD
+            packed_row = 2 * tile_base + local + BLK * half
+            src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + off_h[None, :]
+            val = tl.load(src)
+            dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
+            tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
 
 
 @triton.jit
@@ -1345,6 +1366,7 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
 
     _bwd_selected_meta["BLOCK_M1"] = BLOCK_M1
     _bwd_selected_meta["NUM_CTAS"] = NUM_CTAS
+    _bwd_selected_meta["DQ_BULK_NCOL"] = nargs.get("DQ_BULK_NCOL", 0)
 
     # Reset dq accumulator to zeros before each autotuner warmup run.
     # dq uses TMA reduce-add, so stale values accumulate across runs.
@@ -1414,7 +1436,9 @@ configs_bwd_2cta = [
             "NUM_COMPUTE_SLICES": 2,
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
-            "EPILOGUE_SUBTILE": 4,
+            "EPILOGUE_SUBTILE": 8,
+            "DQ_BULK_NCOL": 16,
+            "DQ_BULK_STAGES": 2,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": False,
             "NUM_CTAS": 2,
@@ -2517,6 +2541,7 @@ def _attn_bwd_ws(
     desc_delta,
     M_ptr,
     delta_ptr,
+    dq_accum_ptr,
     H,
     Z,
     N_CTX,  #
@@ -2542,6 +2567,11 @@ def _attn_bwd_ws(
     USE_WARP_BARRIER: tl.constexpr = False,
     EPILOGUE_SUBTILE: tl.constexpr = 4,
     NUM_CTAS: tl.constexpr = 1,
+    # 2-CTA only: if > 0, reduce dQ with non-tensor bulk reduces of
+    # [BLOCK_M1, DQ_BULK_NCOL] chunks through a DQ_BULK_STAGES-deep ring (FA4
+    # style) instead of tensor-map reduces of DQ_SLICE_N-column slices.
+    DQ_BULK_NCOL: tl.constexpr = 0,
+    DQ_BULK_STAGES: tl.constexpr = 4,
 ):
     # Runtime error if NUM_BUFFERS_DO != 1
     tl.static_assert(NUM_BUFFERS_DO == 1)
@@ -2684,8 +2714,16 @@ def _attn_bwd_ws(
     DQ_STORE_M: tl.constexpr = BLOCK_M1 // NUM_CTAS
     DQ_SLICE_N: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     if USE_2CTA:
-        DQ_STORE_STAGES: tl.constexpr = 1 if EPILOGUE_SUBTILE == 4 else 2
-        dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_SLICE_N), tlx.dtype_of(desc_dq), DQ_STORE_STAGES)
+        if DQ_BULK_NCOL > 0:
+            # Unswizzled chunks ordered [col / 4][row][col % 4]: each one is
+            # copied to global memory as a single contiguous range, and a warp's
+            # 16-byte stores (one row per lane) land in consecutive bank groups.
+            DQ_RING_LAYOUT: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[2, 1, 0])
+            dq_store_buf = tlx.local_alloc((DQ_BULK_NCOL // 4, BLOCK_M1, 4), tlx.dtype_of(desc_dq), DQ_BULK_STAGES,
+                                           layout=DQ_RING_LAYOUT)
+        else:
+            DQ_STORE_STAGES: tl.constexpr = 1 if EPILOGUE_SUBTILE == 4 else 2
+            dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_SLICE_N), tlx.dtype_of(desc_dq), DQ_STORE_STAGES)
     else:
         DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
         dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
@@ -3016,7 +3054,7 @@ def _attn_bwd_ws(
                         [BLOCK_N1, DKV_STORE_NCOL],
                     )
                     dv = tlx.local_load(dv_slice)
-                    tlx.async_descriptor_store_wait(0)
+                    tlx.async_descriptor_store_wait(0, read_only=True)
                     tlx.local_store(sdv_store_buf[kv_buf_id], dv.to(tlx.dtype_of(desc_dv)))
                     tlx.async_descriptor_store(
                         desc_dv,
@@ -3040,14 +3078,14 @@ def _attn_bwd_ws(
                     )
                     dk = tlx.local_load(dk_slice)
                     dk *= sm_scale
-                    tlx.async_descriptor_store_wait(0)
+                    tlx.async_descriptor_store_wait(0, read_only=True)
                     tlx.local_store(sdk_store_buf[kv_buf_id], dk.to(tlx.dtype_of(desc_dk)))
                     tlx.async_descriptor_store(
                         desc_dk,
                         sdk_store_buf[kv_buf_id],
                         [batch, head, start_block_n, slice_id * DKV_STORE_NCOL],
                     )
-                tlx.async_descriptor_store_wait(0)
+                tlx.async_descriptor_store_wait(0, read_only=True)
                 # All staging stores done + MMA done reading k_tiles →
                 # safe for load task to refill both k_tiles and v_tiles.
                 #
@@ -3100,22 +3138,43 @@ def _attn_bwd_ws(
                                 remote_cta_rank=0,
                             )
                         dq_full = dq_full * LN2
-                        dq_slices = _split_n_2D(dq_full, DQ_PACK_ITERS)
-                        for slice_id in tl.static_range(DQ_PACK_ITERS):
-                            dq_smem = dq_store_buf[slice_id % DQ_STORE_STAGES]
-                            tlx.async_descriptor_store_wait(DQ_STORE_STAGES - 1)
-                            tlx.local_store(dq_smem, dq_slices[slice_id].to(tlx.dtype_of(desc_dq)))
-                            tlx.async_descriptor_store(
-                                desc_dq,
-                                dq_smem,
-                                [
-                                    batch,
-                                    head,
-                                    packed_row_base,
-                                    slice_id * DQ_SLICE_N,
-                                ],
-                                store_reduce="add",
-                            )
+                        if DQ_BULK_NCOL > 0:
+                            # This CTA's dQ for the m-block is a contiguous
+                            # [BLOCK_M1, HEAD_DIM // 2] region of dq_accum, stored
+                            # as column chunks (see _attn_bwd_dq_postprocess). Each
+                            # chunk is one contiguous bulk reduce, so L2 requests
+                            # stay full-line however narrow the chunk.
+                            DQ_BULK_ITERS: tl.constexpr = (HEAD_DIM // NUM_CTAS) // DQ_BULK_NCOL
+                            DQ_CHUNK_ELEMS: tl.constexpr = BLOCK_M1 * DQ_BULK_NCOL
+                            tl.static_assert(DQ_BULK_ITERS % DQ_BULK_STAGES == 0)
+                            dq_region = dq_accum_ptr + (off_chz + curr_m + dq_m_offset) * HEAD_DIM
+                            dq_chunks = _split_n_2D(dq_full, DQ_BULK_ITERS)
+                            for chunk_id in tl.static_range(DQ_BULK_ITERS):
+                                dq_smem = dq_store_buf[chunk_id % DQ_BULK_STAGES]
+                                tlx.async_descriptor_store_wait(DQ_BULK_STAGES - 1, read_only=True)
+                                dq_chunk = dq_chunks[chunk_id].to(tlx.dtype_of(desc_dq))
+                                dq_chunk = dq_chunk.reshape([BLOCK_M1, DQ_BULK_NCOL // 4, 4]).permute(1, 0, 2)
+                                tlx.local_store(dq_smem, dq_chunk)
+                                tlx.async_store(dq_region + chunk_id * DQ_CHUNK_ELEMS, dq_smem, DQ_CHUNK_ELEMS * 4,
+                                                store_reduce="add")
+                        else:
+                            dq_slices = _split_n_2D(dq_full, DQ_PACK_ITERS)
+                            for slice_id in tl.static_range(DQ_PACK_ITERS):
+                                dq_smem = dq_store_buf[slice_id % DQ_STORE_STAGES]
+                                # Only the staging buffer's SMEM reads must finish before reuse.
+                                tlx.async_descriptor_store_wait(DQ_STORE_STAGES - 1, read_only=True)
+                                tlx.local_store(dq_smem, dq_slices[slice_id].to(tlx.dtype_of(desc_dq)))
+                                tlx.async_descriptor_store(
+                                    desc_dq,
+                                    dq_smem,
+                                    [
+                                        batch,
+                                        head,
+                                        packed_row_base,
+                                        slice_id * DQ_SLICE_N,
+                                    ],
+                                    store_reduce="add",
+                                )
                     else:
                         HALF_HD: tl.constexpr = HEAD_DIM // 2
                         SLICES_PER_HALF: tl.constexpr = HALF_HD // DQ_REDUCE_NCOL
@@ -3128,7 +3187,7 @@ def _attn_bwd_ws(
                             )
                             dq = tlx.local_load(dq_slice)
                             dq = dq * LN2
-                            tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
+                            tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1, read_only=True)
                             tlx.local_store(
                                 dq_store_buf[dq_smem_idx],
                                 dq.to(tlx.dtype_of(desc_dq)),
@@ -3154,8 +3213,8 @@ def _attn_bwd_ws(
                 tile_n, tile_h, tile_b, clc_phase_consumer = _bwd_next_tile(clc_context, clc_phase_consumer, USE_CLC,
                                                                             NUM_CTAS)
 
-            # Wait for the final tile
-            tlx.async_descriptor_store_wait(0)
+            # Wait for the final tile's dQ reduces to finish reading SMEM
+            tlx.async_descriptor_store_wait(0, read_only=True)
 
         # mma
         with tlx.async_task(num_warps=1, registers=96):
@@ -3612,6 +3671,7 @@ class _attention(torch.autograd.Function):
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
             desc_m, desc_delta,  #
             M, delta,  #
+            dq_accum,  #
             N_HEAD, BATCH,  #
             N_CTX,  #
             desc_kt, desc_qt, desc_dot,  #
@@ -3621,12 +3681,14 @@ class _attention(torch.autograd.Function):
         )
 
         _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
+        _dq_chunk_n = _bwd_selected_meta["DQ_BULK_NCOL"] if _bwd_selected_meta["NUM_CTAS"] == 2 else 0
         post_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         _attn_bwd_dq_postprocess[post_grid](
             dq_accum, dq,  #
             N_CTX,  #
             BLK=_blk, HALF_HD=_HALF_HD,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
+            DQ_CHUNK_N=_dq_chunk_n,  #
         )
 
         return dq, dk, dv, None, None
