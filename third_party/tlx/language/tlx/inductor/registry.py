@@ -23,6 +23,7 @@ import dataclasses
 import logging
 import os
 import re
+import time
 from typing import Any, Generator
 
 log = logging.getLogger(__name__)
@@ -3913,6 +3914,143 @@ def _tlx_algorithm_selector_call(self, name, choices, *args, **kwargs):
 
 
 AlgorithmSelectorCache.__call__ = _tlx_algorithm_selector_call  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
+# Unfused near-ties on gfx942 keep the vendor GEMM.
+#
+# A MultiTemplateBuffer with no fused epilogue is finalized on its GEMM-only
+# autotune timing. On gfx942 the TLX template can win that timing by <1% and
+# then run 3-7% slower than hipBLASLt in steady state. Fused picks are made in
+# speedup_by_fusion and are not affected.
+# ---------------------------------------------------------------------------
+from torch._inductor.ir import MultiTemplateBuffer
+from torch._inductor.scheduler import Scheduler
+from torch._inductor.select_algorithm import ExternKernelCaller
+
+_GFX942_UNFUSED_MIN_SPEEDUP = 1.05
+_orig_get_min_choice = MultiTemplateBuffer.get_min_choice
+_orig_finalize_multi_template_buffers = Scheduler.finalize_multi_template_buffers
+
+
+# Autotune times each candidate alone with a cleared cache, which can misrank
+# a TLX template against hipBLASLt by more than their gap. The two finalists
+# are re-timed warm and back to back, the way they run inside a graph.
+_GFX942_STEADY_MIN_SPEEDUP = 1.03
+_STEADY_BATCH = 10
+_STEADY_ROUNDS = 7
+
+
+_RETIME_ERRORS = (AttributeError, AssertionError, RuntimeError, TypeError)
+_RETIME_FAILED = "tlx_gfx942_steady_retime_failed"
+
+
+def _warm_interleaved_ms(fns):
+    """Median per-call time of each fn, timed warm and back to back, fns interleaved."""
+    for fn in fns:
+        for _ in range(_STEADY_BATCH):
+            fn()
+    torch.cuda.synchronize()
+    events = [[] for _ in fns]
+    for _ in range(_STEADY_ROUNDS):
+        for fn, per_fn in zip(fns, events):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(_STEADY_BATCH):
+                fn()
+            end.record()
+            per_fn.append((start, end))
+    torch.cuda.synchronize()
+    return [sorted(s.elapsed_time(e) / _STEADY_BATCH for s, e in per_fn)[_STEADY_ROUNDS // 2] for per_fn in events]
+
+
+def _steady_state_ms(choices, multi_node, hint_override):
+    """Median warm per-call ms per choice; None for a choice that fails to run."""
+    from torch._dynamo.utils import counters
+    from torch._inductor.select_algorithm import AlgorithmSelectorCache
+
+    args = AlgorithmSelectorCache.get_inputs(
+        choices, list(multi_node.inputs), multi_node.layout, None, hint_override=hint_override
+    )
+    fns = {}
+    for i, choice in enumerate(choices):
+        try:
+            tensors = args.get_benchmark_tensors(AlgorithmSelectorCache._uses_layout_preserving_inputs(choice))
+            inputs, out = tensors.unpack()
+            fn = choice.bmreq.make_run_fn(*inputs, out=out)
+            fn()
+            torch.cuda.synchronize()
+        except _RETIME_ERRORS as e:
+            log.warning("gfx942 steady-state re-timing of %s failed: %r", choice.name, e)
+            counters["inductor"][_RETIME_FAILED] += 1
+            continue
+        fns[i] = fn
+    ms = dict(zip(fns, _warm_interleaved_ms(list(fns.values())))) if fns else {}
+    return [ms.get(i) for i in range(len(choices))]
+
+
+def _valid_ms(ms) -> bool:
+    return ms is not None and _math.isfinite(ms) and ms > 0
+
+
+def _keep_unfused_tlx(steady, tlx_autotune_ms, extern_autotune_ms) -> bool:
+    from torch._dynamo.utils import counters
+
+    if steady is not None:
+        tlx_ms, extern_ms = steady
+        if tlx_ms is None:
+            return False
+        if extern_ms is None:
+            return True
+        if _valid_ms(tlx_ms) and _valid_ms(extern_ms):
+            return extern_ms >= tlx_ms * _GFX942_STEADY_MIN_SPEEDUP
+        log.warning("gfx942 steady-state re-timing gave invalid times %r, using autotune timings", steady)
+        counters["inductor"][_RETIME_FAILED] += 1
+    if _valid_ms(tlx_autotune_ms) and _valid_ms(extern_autotune_ms):
+        return extern_autotune_ms >= tlx_autotune_ms * _GFX942_UNFUSED_MIN_SPEEDUP
+    return False
+
+
+def _unfused_min_choice(self, hint_override=None):
+    from torch._dynamo.utils import counters
+
+    choice, ms = _orig_get_min_choice(self, hint_override)
+    if not _is_tlx_choice(choice):
+        return choice, ms
+    timings = self.choice_timings(hint_override)
+    externs = [c for c in timings if isinstance(c, ExternKernelCaller)]
+    if not externs:
+        return choice, ms
+    extern = min(externs, key=timings.__getitem__)
+    start = time.perf_counter()
+    try:
+        steady = _steady_state_ms((choice, extern), self, hint_override)
+    except _RETIME_ERRORS as e:
+        log.warning("gfx942 steady-state re-timing of %s failed, using autotune timings: %r", self.get_name(), e)
+        counters["inductor"][_RETIME_FAILED] += 1
+        steady = None
+    keep_tlx = _keep_unfused_tlx(steady, ms, timings[extern])
+    log.info(
+        "gfx942 unfused GEMM %s: autotune tlx=%.4f extern=%.4f ms, steady tlx/extern=%s ms -> %s (%.1f ms)",
+        self.get_name(), ms, timings[extern], steady, "tlx" if keep_tlx else "extern",
+        (time.perf_counter() - start) * 1e3,
+    )
+    if keep_tlx:
+        return choice, ms
+    return extern, timings[extern]
+
+
+def _tlx_finalize_multi_template_buffers(self):
+    if config.triton.tlx_mode != "allow" or not _is_gfx942():
+        return _orig_finalize_multi_template_buffers(self)
+    MultiTemplateBuffer.get_min_choice = _unfused_min_choice  # type: ignore[method-assign]
+    try:
+        return _orig_finalize_multi_template_buffers(self)
+    finally:
+        MultiTemplateBuffer.get_min_choice = _orig_get_min_choice  # type: ignore[method-assign]
+
+
+Scheduler.finalize_multi_template_buffers = _tlx_finalize_multi_template_buffers  # type: ignore[method-assign]
 
 
 from .reduction_epilogue import install as install_reduction_epilogue
