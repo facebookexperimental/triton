@@ -53,7 +53,32 @@ bool hasPowerOfTwoBases(const LinearLayout &ll) {
       [](const auto &basis) { return llvm::isPowerOf2_32(basis.front()); });
 }
 
+// A Product layout is a mixed-radix permutation when every radix-2 digit sets
+// one output bit; checkInvariants makes each non-binary digit the unit owner of
+// one odd part, with no binary part.
+static bool hasSingleDigitProductBases(const LinearLayout &ll,
+                                       StringAttr inDim) {
+  for (int32_t digit = 0; digit < ll.getInDimSizeLog2(inDim); ++digit) {
+    int32_t bits = 0;
+    for (StringAttr outDim : ll.getOutDimNames())
+      bits += llvm::popcount(static_cast<uint32_t>(
+          ll.getBasisContribution(inDim, digit, outDim).binary));
+    if (bits > 1)
+      return false;
+  }
+  return true;
+}
+
 bool isPermutationMatrixLayout(const LinearLayout &ll) {
+  // flattenOuts requires power-of-two output sizes, so Product layouts take
+  // the per-output single-digit test instead.
+  if (ll.hasNonBinaryCarrier()) {
+    LinearLayout flattened = ll.flattenIns();
+    auto inDim = *flattened.getInDimNames().begin();
+    LinearLayout withoutBroadcast = flattened.removeZeroBasesAlongDim(inDim);
+    return withoutBroadcast.isInvertible() &&
+           hasSingleDigitProductBases(withoutBroadcast, inDim);
+  }
   if (!hasPowerOfTwoBases(ll))
     return false;
   LinearLayout flattened = ll.flattenIns().flattenOuts();
@@ -931,10 +956,39 @@ LogicalResult parseBool(AsmParser &parser, const NamedAttribute &attr,
   return parseBoolAttrValue(parser, attr.getValue(), value, desc);
 };
 
+// Parse `attr` as a list of integers each fitting int32 and exceeding
+// `minValue`, for the metadata field `what`. Separate from the unsigned
+// parseIntArrayAttr: metadata needs int32 values with a per-field minimum.
+std::optional<SmallVector<int32_t>> parseInt32ArrayAttr(AsmParser &parser,
+                                                        Attribute attr,
+                                                        StringRef what,
+                                                        int64_t minValue) {
+  auto arrayAttr = dyn_cast_or_null<ArrayAttr>(attr);
+  if (!arrayAttr) {
+    parser.emitError(parser.getCurrentLocation())
+        << "Expected integer list for '" << what << "'";
+    return std::nullopt;
+  }
+  SmallVector<int32_t> values;
+  for (Attribute value : arrayAttr) {
+    auto integer = dyn_cast<IntegerAttr>(value);
+    if (!integer || !integer.getValue().isSignedIntN(32) ||
+        integer.getValue().getSExtValue() <= minValue) {
+      parser.emitError(parser.getCurrentLocation())
+          << "Value for '" << what << "' must fit int32 and exceed "
+          << minValue;
+      return std::nullopt;
+    }
+    values.push_back(static_cast<int32_t>(integer.getValue().getSExtValue()));
+  }
+  return values;
+}
+
 std::optional<LinearLayout> parseLinearLayout(const DictionaryAttr &dict,
                                               AsmParser &parser,
                                               ArrayRef<std::string> inDimNames,
-                                              int serializedRank = 0) {
+                                              int serializedRank = 0,
+                                              bool allowMetadata = false) {
   LinearLayout::BasesT bases;
 
   // Parse the basis names in order (the order is relevant)
@@ -1007,6 +1061,79 @@ std::optional<LinearLayout> parseLinearLayout(const DictionaryAttr &dict,
         StringAttr::get(parser.getContext(), "dim" + llvm::Twine(i)));
   }
 
+  Attribute radicesRaw = dict.get("inputRadices");
+  Attribute outDimSizesRaw = dict.get("outDimSizes");
+  if ((radicesRaw || outDimSizesRaw) &&
+      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT")) {
+    // Explicit metadata is read only under the flag; otherwise the keys are
+    // ignored and the bases-only constructor below reads the layout exactly
+    // as before metadata existed (including its abort on rejected bases).
+    if (!allowMetadata) {
+      parser.emitError(parser.getCurrentLocation())
+          << "NPOT layout metadata is not yet supported on this encoding";
+      return std::nullopt;
+    }
+    auto radicesDict = dyn_cast_or_null<DictionaryAttr>(radicesRaw);
+    if (radicesRaw && !radicesDict) {
+      parser.emitError(parser.getCurrentLocation())
+          << "Expected inputRadices dictionary";
+      return std::nullopt;
+    }
+    if (radicesDict)
+      for (NamedAttribute entry : radicesDict)
+        if (!llvm::is_contained(inDimNames, entry.getName().getValue())) {
+          parser.emitError(parser.getCurrentLocation())
+              << "Unknown input dimension '" << entry.getName().getValue()
+              << "' in inputRadices";
+          return std::nullopt;
+        }
+    // An absent inputRadices entry means all radix 2, so printers may omit
+    // empty radix lists without a compensating injection here.
+    LinearLayout::RadicesT radices;
+    for (const std::string &inDimNameStr : inDimNames) {
+      auto inDimName = StringAttr::get(parser.getContext(), inDimNameStr);
+      Attribute entry = radicesDict ? radicesDict.get(inDimName) : Attribute{};
+      if (!entry) {
+        radices[inDimName] = std::vector<int32_t>(bases[inDimName].size(), 2);
+        continue;
+      }
+      auto values = parseInt32ArrayAttr(parser, entry, inDimNameStr,
+                                        /*minValue=*/1);
+      if (!values)
+        return std::nullopt;
+      radices[inDimName] = std::vector<int32_t>(values->begin(), values->end());
+    }
+
+    // Only inputRadices is optional: the printer always emits outDimSizes.
+    auto outDimSizesAttr = dyn_cast_or_null<ArrayAttr>(outDimSizesRaw);
+    if (!outDimSizesAttr) {
+      parser.emitError(parser.getCurrentLocation())
+          << "mixed-radix layouts require outDimSizes metadata";
+      return std::nullopt;
+    }
+    if (outDimSizesAttr.size() != outDimNames.size()) {
+      parser.emitError(parser.getCurrentLocation())
+          << "Mixed-radix output metadata must match layout rank "
+          << outDimNames.size();
+      return std::nullopt;
+    }
+    auto sizes = parseInt32ArrayAttr(parser, outDimSizesAttr, "outDimSizes",
+                                     /*minValue=*/0);
+    if (!sizes)
+      return std::nullopt;
+    SmallVector<std::pair<StringAttr, int32_t>> outDims;
+    for (auto [outDim, size] : llvm::zip(outDimNames, *sizes))
+      outDims.push_back({outDim, size});
+
+    std::string diagnostic;
+    auto layout =
+        LinearLayout::tryCreate(std::move(bases), std::move(radices), outDims,
+                                /*requireSurjective=*/true, &diagnostic);
+    if (!layout)
+      parser.emitError(parser.getCurrentLocation()) << diagnostic;
+    return layout;
+  }
+
   // Create LinearLayout
   return LinearLayout(std::move(bases), std::move(outDimNames));
 }
@@ -1041,6 +1168,26 @@ static void printLinearLayout(AsmPrinter &printer, const LinearLayout &ll,
                 }) +
            "]";
   });
+
+  // Radix-2 layouts print the legacy form: the bases-only constructor infers
+  // exactly that metadata.
+  if (ll.isRadix2())
+    return;
+
+  printer << ", inputRadices = {"
+          << join(llvm::make_first_range(bases), ", ",
+                  [&](StringAttr inDim) {
+                    return inDim.str() + " = [" +
+                           join(ll.getInputRadices(inDim), ", ",
+                                [](int32_t radix) {
+                                  return std::to_string(radix);
+                                }) +
+                           "]";
+                  })
+          << "}, outDimSizes = ["
+          << join(ll.getOutDimSizes(), ", ",
+                  [](int32_t size) { return std::to_string(size); })
+          << "]";
 }
 
 void mlir::triton::gpu::printCGAAttr(mlir::AsmPrinter &printer,
@@ -1284,7 +1431,9 @@ Attribute LinearEncodingAttr::parse(AsmParser &parser, Type type) {
     return {};
 
   std::vector<std::string> inDimNames = {"register", "lane", "warp", "block"};
-  auto maybeLL = parseLinearLayout(dict, parser, inDimNames);
+  auto maybeLL =
+      parseLinearLayout(dict, parser, inDimNames,
+                        /*serializedRank=*/0, /*allowMetadata=*/true);
   if (!maybeLL.has_value())
     return {};
 
@@ -1566,7 +1715,9 @@ Attribute GenericLinearEncodingAttr::parse(AsmParser &parser, Type type) {
     return {};
 
   std::vector<std::string> inDimNames = {"register", "lane", "warp", "block"};
-  auto maybeLL = parseLinearLayout(dict, parser, inDimNames);
+  auto maybeLL =
+      parseLinearLayout(dict, parser, inDimNames,
+                        /*serializedRank=*/0, /*allowMetadata=*/true);
   if (!maybeLL.has_value())
     return {};
 
@@ -4528,9 +4679,22 @@ void TritonGPUDialect::initialize() {
   MemDescType::attachInterface<MemDescModel>(*getContext());
 }
 
-// Under TRITON_ALLOW_NPOT only encoding-less TTIR tensors may be NPOT. Op
-// traits miss block arguments and ops without TensorSizeTrait, so check every
-// value under the module or func that carries ttg.num-warps.
+static WalkResult interruptOnMixedRadix(Attribute attr) {
+  bool mixed = false;
+  if (auto linear = dyn_cast<LinearEncodingAttr>(attr))
+    mixed = !linear.getLinearLayout().isRadix2();
+  else if (auto linear = dyn_cast<GenericLinearEncodingAttr>(attr))
+    mixed = !linear.getLinearLayout().isRadix2();
+  return mixed ? WalkResult::interrupt() : WalkResult::advance();
+}
+
+bool triton::gpu::isRadix2Encoding(Attribute layout) {
+  return !layout.walk(interruptOnMixedRadix).wasInterrupted();
+}
+
+// Under TRITON_ALLOW_NPOT only encoding-less TTIR tensors may be NPOT, and no
+// op lowers a mixed-radix layout yet. Op traits miss block arguments and ops
+// without TensorSizeTrait, so check every value under ttg.num-warps.
 static LogicalResult verifyEncodedTensorSizes(Operation *root) {
   auto isNpotEncoded = [](Type type, int64_t &numElements) {
     auto tensorTy = dyn_cast<RankedTensorType>(type);
@@ -4539,7 +4703,20 @@ static LogicalResult verifyEncodedTensorSizes(Operation *root) {
     numElements = tensorTy.getNumElements();
     return (numElements & (numElements - 1)) != 0;
   };
+  // The type walk also reaches slice parents and tensor descriptor encodings.
+  auto isMixedRadix = [](Type type) {
+    return type.walk(interruptOnMixedRadix).wasInterrupted();
+  };
   WalkResult result = root->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    bool mixed = llvm::any_of(op->getResultTypes(), isMixedRadix);
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        mixed |= llvm::any_of(block.getArgumentTypes(), isMixedRadix);
+    if (mixed) {
+      op->emitError("NPOT mixed-radix layout is not yet supported on ")
+          << op->getName();
+      return WalkResult::interrupt();
+    }
     int64_t numElements = 0;
     for (Type type : op->getResultTypes()) {
       if (isNpotEncoded(type, numElements)) {
