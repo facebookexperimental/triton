@@ -147,17 +147,20 @@ def _lazy_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, str
 
 
 @triton.jit
-def _softmax_pipelined(state, q, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_kn, stride_vn, QK_SCALE: tl.constexpr,
-                       BLOCK_N: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
-    """Lazy-rescale pipeline over `n_blocks` (>= PIPE_STAGES, odd) unmasked KV blocks."""
+def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_kn, stride_vn,
+                       QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
+    """Lazy-rescale pipeline over `n_blocks` (>= PIPE_STAGES, odd) unmasked KV blocks, with Q's copy the oldest
+    outstanding group. Returns the state and Q."""
+    # A commit group is every copy issued since the previous commit, whatever tokens it is given.
     tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0))
-    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0))
     tlx.async_load_commit_group([tok_k0])
+    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0))
     tlx.async_load_commit_group([tok_v0])
     tok_k1 = tlx.async_load(k_ptrs + BLOCK_N * stride_kn, tlx.local_view(k_buf, 1))
     tlx.async_load_commit_group([tok_k1])
 
     wait0 = tlx.async_load_wait_group(2)
+    q = tlx.local_load(tlx.local_view(q_buf, 0), token=wait0)
     kt0 = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 0)), token=wait0, relaxed=True)
     qk = tl.dot(q, kt0)
     state, p_c, _, _ = _vec1_lazy_split(state, qk, QK_SCALE, RESCALE_THRESHOLD)
@@ -203,7 +206,7 @@ def _softmax_pipelined(state, q, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
     state, p_dot = state.vec2_lazy_split(p_c, QK_SCALE, q.dtype, FP16_CAST_ROWSUM=False)
     acc = _attn_dot_pv_mfma(state.acc, p_dot, v_dot)
-    return SoftmaxState(acc, state.l_i, state.m_i)
+    return SoftmaxState(acc, state.l_i, state.m_i), q
 
 
 @triton.jit
@@ -483,17 +486,19 @@ def _silu_step(acc, p_lo, qk_hi, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_bu
 
 
 @triton.jit
-def _silu_pipelined(acc, q, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_kn, stride_vn, ALPHA: tl.constexpr,
+def _silu_pipelined(acc, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_kn, stride_vn, ALPHA: tl.constexpr,
                     BLOCK_N: tl.constexpr):
-    """Pipeline over `n_blocks` (>= PIPE_STAGES, odd) unmasked KV blocks."""
+    """Pipeline over `n_blocks` (>= PIPE_STAGES, odd) unmasked KV blocks, with Q's copy the oldest outstanding group.
+    Returns the accumulator and Q."""
     tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0))
-    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0))
     tlx.async_load_commit_group([tok_k0])
+    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0))
     tlx.async_load_commit_group([tok_v0])
     tok_k1 = tlx.async_load(k_ptrs + BLOCK_N * stride_kn, tlx.local_view(k_buf, 1))
     tlx.async_load_commit_group([tok_k1])
 
     wait0 = tlx.async_load_wait_group(2)
+    q = tlx.local_load(tlx.local_view(q_buf, 0), token=wait0)
     kt0 = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 0)), token=wait0, relaxed=True)
     qk = tl.dot(q, kt0)
     qk_lo, qk_hi = _split_cols(qk)
@@ -533,7 +538,7 @@ def _silu_pipelined(acc, q, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_kn, s
 
     tlx.async_load_wait_group(0)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
-    return _attn_dot_pv_mfma(acc, p_c.to(q.dtype), v_dot)
+    return _attn_dot_pv_mfma(acc, p_c.to(q.dtype), v_dot), q
 
 
 @triton.jit
@@ -680,26 +685,25 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
         tok_q = tlx.async_load(q_ptrs, tlx.local_view(q_buf, 0), mask=row_ok[:, None], other=0.0,
                                cache_modifier=".cg")
         tlx.async_load_commit_group([tok_q])
-    q = tlx.local_load(tlx.local_view(q_buf, 0), token=tlx.async_load_wait_group(0))
     kv_base = (seq_start_kv + kv_lo).to(tl.int64)
     k_ptrs = K + kv_base * stride_kn + off_h_kv * stride_kh + offs_n[:, None] * stride_kn + offs_d[None, :]
     v_ptrs = V + kv_base * stride_vn + off_h_kv * stride_vh + offs_n[:, None] * stride_vn + offs_d[None, :]
     n_full = kv_len // BLOCK_N
     # The previous segment's last LDS reads must finish before this segment's first copies land.
     tl.debug_barrier()
-
     if IS_SOFTMAX:
         state = SoftmaxState.create(BLOCK_M, HEAD_DIM)
         # One masked-tail loop per branch: a shared loop after the branch costs ~10% (the merged state).
         if PIPELINE and n_full >= PIPE_STAGES:
             # The paired steady state takes an odd block count; an extra block joins the masked tail.
             n_pipe = n_full - (n_full - 3) % 2
-            state = _softmax_pipelined(state, q, k_ptrs, v_ptrs, n_pipe, k_buf, v_buf, stride_kn, stride_vn, QK_SCALE,
-                                       BLOCK_N, RESCALE_THRESHOLD)
+            state, q = _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_pipe, k_buf, v_buf, stride_kn, stride_vn,
+                                          QK_SCALE, BLOCK_N, RESCALE_THRESHOLD)
             for start_n in tl.range(n_pipe * BLOCK_N, kv_len, BLOCK_N, num_stages=1):
                 state = _softmax_block_masked(state, q, k_ptrs, v_ptrs, start_n, kv_len, k_buf, v_buf, stride_kn,
                                               stride_vn, QK_SCALE, BLOCK_N)
         else:
+            q = tlx.local_load(tlx.local_view(q_buf, 0), token=tlx.async_load_wait_group(0))
             for start_n in tl.range(0, kv_len, BLOCK_N, num_stages=1):
                 state = _softmax_block_masked(state, q, k_ptrs, v_ptrs, start_n, kv_len, k_buf, v_buf, stride_kn,
                                               stride_vn, QK_SCALE, BLOCK_N)
@@ -711,9 +715,11 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
         acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
         if PIPELINE and n_full >= PIPE_STAGES:
             n_pipe = n_full - (n_full - 3) % 2
-            acc = _silu_pipelined(acc, q, k_ptrs, v_ptrs, n_pipe, k_buf, v_buf, stride_kn, stride_vn, QK_SCALE, BLOCK_N)
+            acc, q = _silu_pipelined(acc, q_buf, k_ptrs, v_ptrs, n_pipe, k_buf, v_buf, stride_kn, stride_vn, QK_SCALE,
+                                     BLOCK_N)
             n_done = n_pipe
         else:
+            q = tlx.local_load(tlx.local_view(q_buf, 0), token=tlx.async_load_wait_group(0))
             n_done = 0
         for start_n in tl.range(n_done * BLOCK_N, kv_len, BLOCK_N, num_stages=1):
             acc = _silu_block_masked(acc, q, k_ptrs, v_ptrs, start_n, kv_len, k_buf, v_buf, stride_kn, stride_vn,
