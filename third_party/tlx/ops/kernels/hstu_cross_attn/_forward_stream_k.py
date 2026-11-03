@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.core import _aggregate as aggregate
 from triton.language.extra.libdevice import fast_dividef
 from triton.runtime import driver
 
@@ -43,6 +44,8 @@ PIPE_STAGES = 4
 # Fixed cost of a q tile, in KV blocks, when the cost space charges one (see `_phantom`).
 PHANTOM_BLOCKS = 3
 LOG2E: tl.constexpr = tl.constexpr(1.4426950408889634)
+# N8 fragments of a softmax block's probabilities formed in its row-max (PV) stage; the rest in the next QK stage.
+LAZY_EXP_PV: tl.constexpr = tl.constexpr(5)
 _VGPR_ONLY = (("amdgpu-agpr-alloc", "0,0"), )
 
 
@@ -78,6 +81,66 @@ def _wait_stores(x):
 # while the full-tile multiply shrinks to one multiply per row.
 
 
+@aggregate
+class LazyFragments:
+    """A score tile as eight N8 fragments, the first `N_EXP` of them already probabilities."""
+    f0: tl.tensor
+    f1: tl.tensor
+    f2: tl.tensor
+    f3: tl.tensor
+    f4: tl.tensor
+    f5: tl.tensor
+    f6: tl.tensor
+    f7: tl.tensor
+
+
+@triton.jit
+def _lazy_frag(x, m_i, QK_SCALE: tl.constexpr, EXP: tl.constexpr):
+    """P of score fragment `x` if EXP, else `x`."""
+    if EXP:
+        return tl.math.exp2(x * QK_SCALE - m_i)
+    else:
+        return x
+
+
+@triton.jit
+def _lazy_exp_head(state, qk, QK_SCALE: tl.constexpr, N_EXP: tl.constexpr):
+    """`vec1_lazy_exp_split` with P formed for the first `N_EXP` N8 fragments."""
+    qk = tlx.require_layout(qk, _mma(), pin=True)
+    qk_a, qk_b, qk_c, qk_d = _chunks(qk)
+    qk_0, qk_1 = _split_cols(qk_a)
+    qk_2, qk_3 = _split_cols(qk_b)
+    qk_4, qk_5 = _split_cols(qk_c)
+    qk_6, qk_7 = _split_cols(qk_d)
+    m_i = tlx.release_layout(state.m_i)[:, None]
+    return LazyFragments(
+        _lazy_frag(qk_0, m_i, QK_SCALE, N_EXP > 0),
+        _lazy_frag(qk_1, m_i, QK_SCALE, N_EXP > 1),
+        _lazy_frag(qk_2, m_i, QK_SCALE, N_EXP > 2),
+        _lazy_frag(qk_3, m_i, QK_SCALE, N_EXP > 3),
+        _lazy_frag(qk_4, m_i, QK_SCALE, N_EXP > 4),
+        _lazy_frag(qk_5, m_i, QK_SCALE, N_EXP > 5),
+        _lazy_frag(qk_6, m_i, QK_SCALE, N_EXP > 6),
+        _lazy_frag(qk_7, m_i, QK_SCALE, N_EXP > 7),
+    )
+
+
+@triton.jit
+def _lazy_vec2(state, fr, QK_SCALE: tl.constexpr, out_dtype: tl.constexpr, N_EXP: tl.constexpr):
+    """`vec2_lazy_split` for `_lazy_exp_head(..., N_EXP)`: the remaining fragments' P, the cast and the row sum."""
+    m_i = tlx.release_layout(state.m_i)[:, None]
+    p_0 = _lazy_frag(fr.f0, m_i, QK_SCALE, N_EXP <= 0)
+    p_1 = _lazy_frag(fr.f1, m_i, QK_SCALE, N_EXP <= 1)
+    p_2 = _lazy_frag(fr.f2, m_i, QK_SCALE, N_EXP <= 2)
+    p_3 = _lazy_frag(fr.f3, m_i, QK_SCALE, N_EXP <= 3)
+    p_4 = _lazy_frag(fr.f4, m_i, QK_SCALE, N_EXP <= 4)
+    p_5 = _lazy_frag(fr.f5, m_i, QK_SCALE, N_EXP <= 5)
+    p_6 = _lazy_frag(fr.f6, m_i, QK_SCALE, N_EXP <= 6)
+    p_7 = _lazy_frag(fr.f7, m_i, QK_SCALE, N_EXP <= 7)
+    p = _unchunk(_concat_cols(p_0, p_1), _concat_cols(p_2, p_3), _concat_cols(p_4, p_5), _concat_cols(p_6, p_7))
+    return SoftmaxState(state.acc, state.l_i + tl.sum(p, 1), state.m_i), p.to(out_dtype)
+
+
 @triton.jit
 def _lazy_max(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
     if QK_SCALE > 0:
@@ -93,7 +156,7 @@ def _lazy_max(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr
 @triton.jit
 def _vec1_lazy_split(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
     state, score_delta, advance = _lazy_max(state, qk, QK_SCALE, RESCALE_THRESHOLD)
-    return state, state.vec1_lazy_exp_split(qk, QK_SCALE), score_delta, advance
+    return state, _lazy_exp_head(state, qk, QK_SCALE, LAZY_EXP_PV), score_delta, advance
 
 
 @triton.jit
@@ -118,7 +181,29 @@ def _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE: tl.constexpr, RESCALE_T
     acc = tl.dot(p2, v2, acc)
     acc = tl.dot(p3, v3, acc)
     state = SoftmaxState(acc, state.l_i, max_state.m_i)
-    return state, state.vec1_lazy_exp_split(qk, QK_SCALE), score_delta, advance
+    return state, _lazy_exp_head(state, qk, QK_SCALE, LAZY_EXP_PV), score_delta, advance
+
+
+@triton.jit
+def _pin(x):
+    """`x` through a side-effecting register anchor: what computes it stays ahead of the next fence."""
+    return tlx.amd_register_class_anchor(x, "vgpr")
+
+
+@triton.jit
+def _hold_exp(fr):
+    """Anchor the probabilities formed in a PV stage, so LLVM cannot sink them, as loop-carried values, past the
+    rescale branch into the next stage."""
+    return LazyFragments(_pin(fr.f0), _pin(fr.f1), _pin(fr.f2), _pin(fr.f3), _pin(fr.f4), fr.f5, fr.f6, fr.f7)
+
+
+@triton.jit
+def _weave_softmax(SYNC_ID: tl.constexpr):
+    """Schedule a softmax dot stage as 16 times one MFMA then up to five VALU or transcendental ops, which the
+    MFMA's 32 cycles hide."""
+    for _ in tl.static_range(16):
+        tlx.amd_sched_group_barrier(0x8, 1, SYNC_ID)
+        tlx.amd_sched_group_barrier(0x402, 5, SYNC_ID)
 
 
 @triton.jit
@@ -128,8 +213,9 @@ def _lazy_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, str
     """`_attn_inner_pipelined_lazy_step` (split VEC1, PV-woven VEC1) with the cheaper row max, and fp32 row sums
     for fp16 as well as bf16."""
     with tlx.warp_pipeline_stage("dot1"):
-        qk = tl.dot(q, kt_dot)
-        state, p_dot = state.vec2_lazy_split(p_c, QK_SCALE, q.dtype, FP16_CAST_ROWSUM=False)
+        qk = _qk_pieces(q, kt_dot)
+        state, p_dot = _lazy_vec2(state, p_c, QK_SCALE, q.dtype, LAZY_EXP_PV)
+        _weave_softmax(1)
     tlx.async_load_wait_group(1)
     with tlx.warp_pipeline_stage("mem1"):
         v_dot = tlx.local_load(tlx.local_view(v_buf, CUR_SLOT), relaxed=True)
@@ -137,9 +223,11 @@ def _lazy_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, str
         tlx.async_load_commit_group([tok_k])
     with tlx.warp_pipeline_stage("dot2"):
         state, p_c, delta_c, advance_c = _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+        p_c = _hold_exp(p_c)
+        _weave_softmax(2)
     tlx.async_load_wait_group(1)
     with tlx.warp_pipeline_stage("mem2"):
-        kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, CUR_SLOT)), relaxed=True)
+        kt_dot = _kt_pieces(k_buf, CUR_SLOT)
         tok_v = tlx.async_load(v_ptrs + (block_n + 2) * BLOCK_N * stride_vn, tlx.local_view(v_buf, CUR_SLOT))
         tlx.async_load_commit_group([tok_v])
         state = state.rescale_lazy(delta_c, advance_c)
@@ -170,7 +258,7 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     tok_k2 = tlx.async_load(k_ptrs + 2 * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k2])
     wait1 = tlx.async_load_wait_group(1)
-    kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 1)), token=wait1, relaxed=True)
+    kt_dot = _kt_pieces(k_buf, 1, wait1)
     tok_v1 = tlx.async_load(v_ptrs + BLOCK_N * stride_vn, tlx.local_view(v_buf, 1))
     tlx.async_load_commit_group([tok_v1])
 
@@ -183,10 +271,10 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
                                         stride_vn, QK_SCALE, BLOCK_N, 1, 0, RESCALE_THRESHOLD)
     # Drain the last three blocks without further prefetches.
     nm1 = n_blocks - 1
-    qk = tl.dot(q, kt_dot)
+    qk = _qk_pieces(q, kt_dot)
     tlx.async_load_wait_group(2)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
-    state, p_dot = state.vec2_lazy_split(p_c, QK_SCALE, q.dtype, FP16_CAST_ROWSUM=False)
+    state, p_dot = _lazy_vec2(state, p_c, QK_SCALE, q.dtype, LAZY_EXP_PV)
     state, p_c, delta_c, advance_c = _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
     state = state.rescale_lazy(delta_c, advance_c)
     _attn_war_barrier(False)
@@ -198,13 +286,13 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     qk = tl.dot(q, kt_dot)
     tlx.async_load_wait_group(1)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 1), relaxed=True)
-    state, p_dot = state.vec2_lazy_split(p_c, QK_SCALE, q.dtype, FP16_CAST_ROWSUM=False)
+    state, p_dot = _lazy_vec2(state, p_c, QK_SCALE, q.dtype, LAZY_EXP_PV)
     state, p_c, delta_c, advance_c = _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
     state = state.rescale_lazy(delta_c, advance_c)
 
     tlx.async_load_wait_group(0)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
-    state, p_dot = state.vec2_lazy_split(p_c, QK_SCALE, q.dtype, FP16_CAST_ROWSUM=False)
+    state, p_dot = _lazy_vec2(state, p_c, QK_SCALE, q.dtype, LAZY_EXP_PV)
     acc = _attn_dot_pv_mfma(state.acc, p_dot, v_dot)
     return SoftmaxState(acc, state.l_i, state.m_i), q
 
@@ -952,6 +1040,7 @@ def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets:
     part_lse = torch.empty((2 * P, BLOCK_M), device=q.device, dtype=torch.float32)
     tab = torch.empty((P, 2 * z_pad + 4), device=q.device, dtype=torch.int32)
     m_arg = M if is_softmax else part_lse
+    # Unpacked fp32 keeps the softmax VALU from stalling behind MFMAs; the woven SiLU is faster packed.
     _hstu_cross_attn_fwd_stream_k[(P, )](
         q, k, v, out, m_arg, part, part_lse, seq_offsets_q, seq_offsets, attn_scale, tab, _flags(q.device, P), Z, P=P,
         stride_qm=q.stride(0), stride_qh=q.stride(1), stride_kn=k.stride(0), stride_kh=k.stride(1),
@@ -960,4 +1049,4 @@ def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets:
         IS_SOFTMAX=is_softmax, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, Z_PAD=z_pad,
         LOG2_Z_PAD=max(1, (z_pad - 1).bit_length()), MAX_SEGMENTS=MAX_SEGMENTS, PHANTOM_BLOCKS=PHANTOM_BLOCKS,
         PIPE_STAGES=PIPE_STAGES, RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2,
-        llvm_fn_attrs=_VGPR_ONLY, enable_sched_group_barrier_scheduler=False)
+        llvm_fn_attrs=_VGPR_ONLY, enable_sched_group_barrier_scheduler=False, disable_packed_fp32_ops=is_softmax)
