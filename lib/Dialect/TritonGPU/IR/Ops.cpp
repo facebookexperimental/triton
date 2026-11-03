@@ -396,9 +396,10 @@ struct CanonicalizeConvertFromConvert
       // We insert at the point of the original op as there could be ops with
       // memory side-effects between the LocalLoad op and the ConvertLayout op.
       rewriter.setInsertionPoint(arg);
-      auto replacement = rewriter.replaceOpWithNewOp<LocalLoadOp>(
-          op, op->getResult(0).getType(), sharedLoad.getSrc(),
-          sharedLoad.getToken());
+      auto replacement = LocalLoadOp::create(
+          rewriter, sharedLoad.getLoc(), op->getResult(0).getType(),
+          sharedLoad.getSrc(), sharedLoad.getToken());
+      rewriter.replaceOp(op, replacement);
       // Preserve backend optimization metadata such as
       // ttg.amdg.syncedViaAsyncWait. Dropping it here makes the replacement
       // load conservatively wait for unrelated async LDS writes.
