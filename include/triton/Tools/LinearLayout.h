@@ -324,11 +324,17 @@ private:
                   /*size=getInDimSizeLog2(inDim)*/>
       bases;
 
+  // inputRadices[inDim][i] is the radix of input digit i, whose weight is the
+  // product of the preceding radices (2^i when all are 2). A digit whose radix
+  // is not 2 has an all-zero basis.
+  llvm::MapVector<StringAttr, std::vector<int32_t>> inputRadices;
+
   llvm::MapVector<StringAttr, int32_t /*size*/> outDims;
   int32_t rank = 0;
 
 public:
   using BasesT = decltype(bases);
+  using RadicesT = decltype(inputRadices);
 
   LinearLayout() = default;
 
@@ -396,10 +402,19 @@ public:
                         ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                         bool requireSurjective);
 
+  // Same, with explicit input radices (one per basis); empty means all 2.
+  explicit LinearLayout(BasesT bases, RadicesT inputRadices,
+                        ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                        bool requireSurjective);
+
   // Factory function that gracefully fails rather than asserts if the layout is
   // not well-formed.
   static std::optional<LinearLayout>
   tryCreate(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+            bool requireSurjective);
+  static std::optional<LinearLayout>
+  tryCreate(BasesT bases, RadicesT inputRadices,
+            ArrayRef<std::pair<StringAttr, int32_t>> outDims,
             bool requireSurjective);
 
   // Construct a LinearLayout from an explicit list of bases.  (This constructor
@@ -443,9 +458,20 @@ public:
   [[nodiscard]] LinearLayout squeezeOuts(StringAttr dim) const;
 
   const BasesT &getBases() const { return bases; }
+  const RadicesT &getInputRadices() const { return inputRadices; }
+  ArrayRef<int32_t> getInputRadices(StringAttr inDim) const {
+    auto it = inputRadices.find(inDim);
+    assert(it != inputRadices.end() && "inDim not found in layout");
+    return it->second;
+  }
+  int32_t getInputRadix(StringAttr inDim, int32_t pos) const {
+    return getInputRadices(inDim)[pos];
+  }
+  bool isRadix2() const;
 
   // Get the pos'th basis vector for the inDim -> outDim mapping.
-  // getBasis(inDim, pos) = L(0, ..., inDim = 2^pos, ..., 0).
+  // getBasis(inDim, pos) = L(0, ..., inDim = w, ..., 0), where w is the
+  // product of the radices below pos (2^pos when all radices are 2).
   ArrayRef<int32_t> getBasis(StringAttr inDim, int32_t pos) const {
     auto it = bases.find(inDim);
     assert(it != bases.end());
@@ -488,14 +514,14 @@ public:
   int32_t getNumInDims() const { return bases.size(); }
   int32_t getNumOutDims() const { return outDims.size(); }
 
-  // Asserts if the dimension is not present.
+  // Asserts if the dimension is not present.  This is the number of input
+  // digits, which is log2 of the size only when all radices are 2.
   int32_t getInDimSizeLog2(StringAttr inDim) const;
-  int32_t getInDimSize(StringAttr inDim) const {
-    return 1 << getInDimSizeLog2(inDim);
-  }
+  // The product of the dimension's input radices.
+  int32_t getInDimSize(StringAttr inDim) const;
 
   int32_t getTotalInDimSizeLog2() const;
-  int32_t getTotalInDimSize() const { return 1 << getTotalInDimSizeLog2(); }
+  int32_t getTotalInDimSize() const;
 
   // getOutDimSize(dim) == s means that there exists an input value that will
   // produce each output value in [0,s) (if the layout is surjective).
@@ -809,9 +835,13 @@ private:
   struct NoCheckInvariants {};
   LinearLayout(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                NoCheckInvariants);
+  LinearLayout(BasesT bases, RadicesT inputRadices,
+               ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+               NoCheckInvariants);
 
   [[nodiscard]] std::optional<std::string>
   checkInvariants(bool requireSurjective);
+  [[nodiscard]] std::optional<std::string> checkInputRadices() const;
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
@@ -842,12 +872,20 @@ private:
   SmallVector<size_t> action;
   StringAttr inDim;
   size_t inSizeLog2;
+  // Radix of each input digit; empty means all 2.
+  SmallVector<int32_t> inputRadices;
   bool m_isIdentity = true;
+
+  bool isRadix2() const {
+    return llvm::all_of(inputRadices, [](int32_t r) { return r == 2; });
+  }
 
 public:
   ColumnAction() = default;
-  ColumnAction(ArrayRef<size_t> action, StringAttr inDim, size_t inSizeLog2)
-      : action(action), inDim(inDim), inSizeLog2(inSizeLog2) {
+  ColumnAction(ArrayRef<size_t> action, StringAttr inDim, size_t inSizeLog2,
+               ArrayRef<int32_t> inputRadices = {})
+      : action(action), inDim(inDim), inSizeLog2(inSizeLog2),
+        inputRadices(inputRadices) {
     auto it = llvm::max_element(action);
     // Assert in the constructor... ugh
     assert(it == action.end() || *it < inSizeLog2);
