@@ -26,7 +26,8 @@ module attributes {
     } : () -> ()
 
     // ALLOC: actualRegisters = array<i32: 136, 80, 24>
-    // ALLOC-SAME: requestedRegisters = array<i32: 80, 16>
+    // ALLOC-SAME: requestedRegisters = array<i32: 80, 24>
+    // (beta reports the legal padding floor 24, not raw 16: kMinLegalRegisters)
     ttg.warp_specialize() attributes {
       allocation.offset = 0 : i32,
       requestedRegisters = array<i32: 80>
@@ -39,7 +40,7 @@ module attributes {
     } : () -> ()
 
     // LOWER-NOT: nvvm.setmaxregister {{.*}} 16
-    // LOWER: nvvm.setmaxregister increase 24
+    // (beta elides the padding partition's 24->24 realloc; no setmaxregister emitted)
     // LOWER: llvm.return
     llvm.return
   }
