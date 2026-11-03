@@ -26,6 +26,8 @@ import triton.language.extra.tlx as tlx
 from triton.tlx.ops.kernels.mm import _sm100_core as _mm_core
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import num_sms as _get_num_sms
+
 # slice_empty recycle handshake on per-slot static named barriers (one
 # unique ID per slot: base 3 + slot; paired handoff halves the slots,
 # so epi <= 8 needs IDs 3..6, inside the user range 3..15).
@@ -1518,11 +1520,6 @@ def _space_configs(space, shape, configs_fn, smoke_fn, heuristic_fn):
     if space == "smoke":
         return smoke_fn()
     raise ValueError(f"Unknown sm100 addmm search space: {space!r}")
-
-
-@functools.lru_cache(maxsize=None)
-def _get_num_sms():
-    return torch.cuda.get_device_properties("cuda").multi_processor_count
 
 
 @functools.lru_cache(maxsize=None)

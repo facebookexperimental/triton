@@ -126,6 +126,7 @@ import triton.language as tl
 
 # @manual=//triton:triton
 import triton.language.extra.tlx as tlx
+from ..._holdout import num_sms as _num_cus
 from ._backward_pipeline import _tlx_gfx950_cross_attn_v3_ttgir_bwd
 from ._backward_small import coarse_softmax_backward, compact_softmax_backward, small_softmax_backward
 from ._backward_retained import retained_softmax_backward
@@ -297,11 +298,6 @@ SEQ_SORT_MAX_Z: tl.constexpr = tl.constexpr(64)
 # small launches the ranking is pure overhead (~2% on the production shape).
 SEQ_SORT_MIN_PROGRAMS: tl.constexpr = tl.constexpr(512)
 FWD_SORT_BY_KV: tl.constexpr = tl.constexpr(os.environ.get("TLX_HSTU_CROSS_ATTN_SORT_BY_KV", "1") == "1")
-
-
-@functools.lru_cache(maxsize=None)
-def _num_cus(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 @triton.jit

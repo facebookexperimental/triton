@@ -17,6 +17,8 @@ from triton.language.extra.tlx.mxfp8_utils import (
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._holdout import num_sms as _num_sms
+
 try:
     from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
 except ImportError:
@@ -3143,11 +3145,11 @@ def attention_bwd(
 
     triton.set_allocator(alloc_fn)
 
-    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
+    launch_sms = _num_sms(device)
 
     def grid(meta):
         total_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H
-        n_progs = min(NUM_SMS, total_tiles)
+        n_progs = min(launch_sms, total_tiles)
         if causal:
             n_progs = max(n_progs, triton.cdiv(total_tiles, 2))
         return (

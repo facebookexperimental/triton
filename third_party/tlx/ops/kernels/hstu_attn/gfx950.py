@@ -57,6 +57,7 @@ import triton.language as tl
 
 import triton.language.extra.tlx as tlx
 
+from ..._holdout import device_sm_count
 from ._stubs import (
     autotune_max_seq_len,
     get_use_rtz,
@@ -5507,7 +5508,7 @@ def tlx_gfx950_ragged_attention_bwd(
     if fa_schedule:
         # The post-kernel conversion fully overwrites DQ when this is separate.
         dq_acc.zero_()
-        cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        cu_count = device_sm_count(q.device)
         num_xcds = max(1, min(GFX950_MAX_XCDS, cu_count // GFX950_CUS_PER_XCD))
         scheduled_z, use_sequence_xcd = _gfx950_fa_schedule_launch_sequences(Z, num_xcds)
         has_sequence_padding = scheduled_z != Z

@@ -20,6 +20,7 @@ from triton.language.core import _aggregate as aggregate
 from triton.language.extra.libdevice import fast_dividef
 
 from ..._catalog import InvalidInput
+from ..._holdout import num_sms as _num_sms
 from . import gfx950_bwd
 
 CLUSTER_BUF_DEPTH = 2
@@ -111,7 +112,7 @@ _CLUSTER_AUTOTUNE_KEY = [
     "STORE_LSE",
     "ALLOW_PRESCALE_Q",
 ]
-_CLUSTER_PERSISTENT_AUTOTUNE_KEY = [*_CLUSTER_WORKLOAD_KEY, "NUM_SMS", "NUM_XCDS"]
+_CLUSTER_PERSISTENT_AUTOTUNE_KEY = [*_CLUSTER_WORKLOAD_KEY, "NUM_XCDS"]
 
 
 @triton.jit
@@ -3168,7 +3169,6 @@ def _attn_fwd_cluster_persistent_pipeline(
     USE_DIRECT_LOAD: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     NUM_M_BLOCKS: tl.constexpr,
-    NUM_SMS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
 ):
     _assume_strides(
@@ -3196,7 +3196,7 @@ def _attn_fwd_cluster_persistent_pipeline(
     pid = tl.program_id(0)
     xcd = pid % NUM_XCDS
     local = pid // NUM_XCDS
-    NUM_LOCAL: tl.constexpr = NUM_SMS // NUM_XCDS
+    NUM_LOCAL = tl.num_programs(0) // NUM_XCDS
 
     # Match the non-persistent launcher: only the aligned LDS diagonal consumes
     # four slots; direct-load and ragged tiles retain the normal ring depth.
@@ -3495,16 +3495,19 @@ def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw
     num_xcds = kw.pop("NUM_XCDS", 8)
     if num_xcds <= 0:
         raise ValueError(f"cluster attention: NUM_XCDS must be positive, got {num_xcds}")
-    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-    num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
-    if num_sms < num_xcds:
-        raise ValueError(f"cluster attention: NUM_SMS ({num_sms}) must be >= NUM_XCDS ({num_xcds})")
-    if num_sms % num_xcds != 0:
-        raise ValueError(f"cluster attention: NUM_SMS ({num_sms}) must be divisible by NUM_XCDS ({num_xcds})")
+    if "NUM_SMS" in kw:
+        raise ValueError(
+            "cluster attention: NUM_SMS is not supported; the grid is sized from the device SM count and any SM carveout"
+        )
+    capped_sms = _num_sms(q.device)
+    grid_sms = capped_sms // num_xcds * num_xcds
+    if grid_sms < num_xcds:
+        raise ValueError(
+            f"cluster attention: capped SM count ({capped_sms}) cannot provide one program per XCD ({num_xcds})")
 
     o = torch.empty_like(q)
     m_blocks = triton.cdiv(N_CTX, block_m)
-    grid = (num_sms, )
+    grid = (grid_sms, )
     use_autotune = (use_direct_load is None and not has_explicit_num_warps and not has_explicit_waves_per_eu and not kw)
     kernel = (_attn_fwd_cluster_persistent_pipeline_autotuned
               if use_autotune else _attn_fwd_cluster_persistent_pipeline)
@@ -3515,7 +3518,6 @@ def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw
         "HEAD_DIM": D,
         "IS_CAUSAL": causal,
         "NUM_M_BLOCKS": m_blocks,
-        "NUM_SMS": num_sms,
         "NUM_XCDS": num_xcds,
         "waves_per_eu": waves_per_eu,
         **kw,

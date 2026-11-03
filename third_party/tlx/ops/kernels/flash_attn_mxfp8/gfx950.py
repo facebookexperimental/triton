@@ -39,10 +39,11 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
+from ..._holdout import num_sms
+
 _FP8 = torch.float8_e4m3fn
 _LOG2E = 1.4426950408889634
 _HEAD_DIM = 128
-_NUM_CUS = 256  # gfx950 as one whole device (compute partition SPX)
 
 
 def _default_config(causal, n_ctx):
@@ -1274,7 +1275,7 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         if v_scale.shape != k_scale.shape or v_scale.stride(2) != k_scale.stride(2):
             raise ValueError("V's scales must be laid out like K's")
         n_units = n_ctx // cfg["block_m"] // (2 if causal else 1) * batch * heads
-        grid = (min(n_units, _NUM_CUS), )
+        grid = (min(n_units, num_sms(q_fp8.device)), )
         args = (
             q_fp8,
             k_fp8,

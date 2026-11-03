@@ -37,14 +37,12 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
+from ..._holdout import num_sms as _num_sms
+
 # gfx950 has 8 XCDs
 NUM_XCDS = 8
 _ENV_LOCK = threading.Lock()
 _MAX_BUFFER_BYTES = (1 << 31) - 2
-
-
-def _num_sms(device):
-    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def _setup_env():

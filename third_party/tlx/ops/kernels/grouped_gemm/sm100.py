@@ -5,7 +5,6 @@ through its zero-copy row-major transpose view and transposed back in shared
 memory before MMA.
 """
 
-import functools
 from typing import Optional
 
 import torch
@@ -13,6 +12,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
+
+from ..._holdout import num_sms as _get_num_sms
 
 _MAX_SMEM_BYTES = 232448
 _SMEM_SAFETY_MARGIN_BYTES = 1024
@@ -163,11 +164,6 @@ def _pick_config(shapes, num_sms):
 def _alloc_tma_descriptor_buffer(size: int, _alignment: int, _stream: Optional[int]):
     device = torch.device("cuda", torch.cuda.current_device())
     return torch.empty(size, device=device, dtype=torch.int8)
-
-
-@functools.lru_cache(maxsize=None)
-def _get_num_sms(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 @triton.jit
