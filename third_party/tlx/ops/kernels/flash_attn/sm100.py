@@ -2384,6 +2384,7 @@ def _bwd_compute_inner_loop(
     P_BUF_OFFSET: tl.constexpr = 0,
     num_steps_override=0,
     qk_loaded=None,
+    qk_scale=1.0,
 ):
     # [BLOCK_N1, BLOCK_M1] row-major: lanes and the first 2 warp bits walk rows,
     # the last warp bit picks a 32-column chunk, registers hold 32 columns plus
@@ -2424,7 +2425,7 @@ def _bwd_compute_inner_loop(
         # causal mask to the logits via the R2P bitmask helper (keep query-cols
         # m >= key-row n), then exp2 (exp2(-inf) = 0), avoiding the per-element
         # ISETP arithmetic of `offs_m >= offs_n`.
-        sT = _sub_f32x2(qkT, m[None, :])
+        sT = _fma_f32x2(qkT, qk_scale, -m[None, :])
         if STAGE == 1:
             col_limit_left = (offs_n - curr_m)[:, None]
             sT = _apply_causal_mask(sT, col_limit_left, BLOCK_M1, keep_ge=True)
@@ -2867,7 +2868,8 @@ def _attn_bwd_ws(
                 tlx.storage_kind.tmem,
             )
 
-    LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
+    # K is unscaled: scores go to log2 units in fp32, and dQ = dS @ K * sm_scale.
+    qk_scale = sm_scale * 1.4426950408889634
 
     # 2-CTA setup
     if USE_2CTA:
@@ -2964,6 +2966,7 @@ def _attn_bwd_ws(
                         P_BUF_OFFSET=P_BUF_IDX,
                         num_steps_override=num_steps,
                         qk_loaded=qk_loaded,
+                        qk_scale=qk_scale,
                     )
                 else:
                     if STAGE & 1:
@@ -3012,6 +3015,7 @@ def _attn_bwd_ws(
                             cluster_cta_rank=cluster_cta_rank,
                             P_BUF_OFFSET=P_BUF_IDX,
                             qk_loaded=qk_loaded,
+                            qk_scale=qk_scale,
                         )
                     if STAGE & 2:
                         curr_m, blk_idx = _bwd_compute_inner_loop(
@@ -3059,6 +3063,7 @@ def _attn_bwd_ws(
                             cluster_cta_rank=cluster_cta_rank,
                             P_BUF_OFFSET=P_BUF_IDX,
                             qk_loaded=qk_loaded,
+                            qk_scale=qk_scale,
                         )
 
                 kv_buf_id, kv_phase = get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
@@ -3155,7 +3160,7 @@ def _attn_bwd_ws(
                                 1,
                                 remote_cta_rank=0,
                             )
-                        dq_full = dq_full * LN2
+                        dq_full = dq_full * sm_scale
                         if DQ_BULK_NCOL > 0:
                             # This CTA's dQ for the m-block is a contiguous
                             # [BLOCK_M1, HEAD_DIM // 2] region of dq_accum, stored
@@ -3204,7 +3209,7 @@ def _attn_bwd_ws(
                                 [BLOCK_M1, DQ_REDUCE_NCOL],
                             )
                             dq = tlx.local_load(dq_slice)
-                            dq = dq * LN2
+                            dq = dq * sm_scale
                             tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1, read_only=True)
                             tlx.local_store(
                                 dq_store_buf[dq_smem_idx],
@@ -3593,9 +3598,7 @@ class _attention(torch.autograd.Function):
         dq_accum = torch.zeros([BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM], device=q.device, dtype=torch.float32)
         PRE_BLOCK = 128
         BLK_SLICE_FACTOR = 2
-        RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
         arg_k = k
-        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
