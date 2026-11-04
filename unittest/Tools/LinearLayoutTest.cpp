@@ -1521,6 +1521,127 @@ TEST_F(MixedRadixTest, ColumnActionApplyValues) {
               ElementsAre(0, 3));
 }
 
+class ProductCarrierTest : public LinearLayoutTest {
+protected:
+  LinearLayout product(std::vector<std::vector<int32_t>> regBases,
+                       std::vector<int32_t> regRadices,
+                       ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
+    BasesT bases;
+    bases[S("register")] = std::move(regBases);
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    return LinearLayout(std::move(bases), std::move(radices), outDims,
+                        /*requireSurjective=*/false);
+  }
+
+  // in -> out identity of a non-power-of-two size: binary digits, then one odd
+  // digit.
+  LinearLayout exactIdentity1D(int32_t size, StringAttr in, StringAttr out) {
+    int32_t twoPart = LinearLayout::twoPartOf(size);
+    BasesT bases;
+    LinearLayout::RadicesT radices;
+    for (int32_t bit = 1; bit < twoPart; bit *= 2) {
+      bases[in].push_back({bit});
+      radices[in].push_back(2);
+    }
+    bases[in].push_back({twoPart});
+    radices[in].push_back(size / twoPart);
+    return LinearLayout(std::move(bases), std::move(radices), {{out, size}},
+                        /*requireSurjective=*/true);
+  }
+};
+
+TEST_F(ProductCarrierTest, InvariantsReject) {
+  auto build = [&](std::vector<std::vector<int32_t>> regBases,
+                   std::vector<int32_t> regRadices,
+                   ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
+    (void)product(std::move(regBases), std::move(regRadices), outDims);
+  };
+  EXPECT_DEATH(build({}, {}, {{S("x"), 0}}), "Out-dim sizes must be positive");
+  EXPECT_DEATH(build({{3}}, {2}, {{S("x"), 6}}),
+               "invalid radix-2 digit: it has an odd Product");
+  EXPECT_DEATH(build({{3}}, {3}, {{S("x"), 6}}),
+               "invalid non-binary digit: it has a binary Product");
+  EXPECT_DEATH(build({{2, 1}}, {3}, {{S("x"), 6}, {S("y"), 2}}),
+               "invalid input digit of radix 3 in in-dim 'register': its "
+               "basis must be zero on Binary outputs");
+  const char *unsupported = "NPOT layout not yet supported: each odd part "
+                            "needs one non-binary digit of that radix";
+  EXPECT_DEATH(build({{2, 2}}, {3}, {{S("x"), 6}, {S("y"), 6}}), unsupported);
+  EXPECT_DEATH(build({{2}, {4}}, {3, 3}, {{S("x"), 6}}), unsupported);
+  EXPECT_DEATH(build({{2}}, {5}, {{S("x"), 6}}), unsupported);
+  EXPECT_DEATH(build({{6}}, {9}, {{S("x"), 18}}), unsupported);
+}
+
+TEST_F(ProductCarrierTest, OnlyRadicesAdmitProductSizes) {
+  BasesT bases;
+  bases[S("register")] = {{1}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {2};
+  EXPECT_FALSE(LinearLayout::tryCreate(bases, {{S("x"), 6}}, false));
+  EXPECT_TRUE(LinearLayout::tryCreate(bases, radices, {{S("x"), 6}}, false));
+  EXPECT_TRUE(LinearLayout::tryCreate({}, {}, {{S("x"), 6}}, false));
+  EXPECT_DEATH((void)LinearLayout(bases, {{S("x"), 6}}, false),
+               "Out-dim sizes must be powers of 2");
+}
+
+TEST_F(ProductCarrierTest, SublayoutWithoutInDimsKeepsProductSize) {
+  // No in-dims leave an empty radices map, which still admits the size.
+  LinearLayout sub =
+      product({{1}}, {2}, {{S("dim"), 6}}).sublayout({}, {S("dim")});
+  EXPECT_EQ(sub.getOutDimSize(S("dim")), 6);
+}
+
+TEST_F(ProductCarrierTest, RankCountsOwnedOddCoordinates) {
+  // Odd part 5: the codomain rank is countr_zero(20) + 1, below Log2(20).
+  LinearLayout twenty = exactIdentity1D(20, S("register"), S("dim"));
+  EXPECT_TRUE(twenty.isSurjective());
+  EXPECT_TRUE(twenty.isInjective());
+  EXPECT_EQ(twenty.getTotalOutDimSize(), 20);
+  LinearLayout productBit = product({{1}}, {2}, {{S("dim"), 6}});
+  EXPECT_FALSE(productBit.isSurjective());
+  // A Product output alone keeps a layout off the radix-2 algorithms.
+  EXPECT_FALSE(productBit.isRadix2());
+  // A zero radix-2 digit after the odd digit: registers 0 and 6 collide.
+  EXPECT_FALSE(
+      product({{1}, {2}, {0}}, {2, 3, 2}, {{S("dim"), 6}}).isInjective());
+  // A broadcast non-binary digit adds no rank.
+  EXPECT_TRUE(
+      product({{1}, {2}, {0}}, {2, 3, 3}, {{S("dim"), 6}}).isSurjective());
+  // Odd coefficient 4: basis 16 is above the Log2(20) binary rows.
+  EXPECT_TRUE(
+      product({{1}, {2}, {16}}, {2, 2, 5}, {{S("dim"), 20}}).isSurjective());
+}
+
+TEST_F(ProductCarrierTest, EqualIgnoringOutDimSizesComparesTwoParts) {
+  // Basis 4 is odd coordinate 2 at size 6 and odd coordinate 1 at size 12.
+  EXPECT_FALSE(product({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
+                   .equalIgnoringOutDimSizes(
+                       product({{1}, {4}}, {2, 3}, {{S("dim"), 12}})));
+  EXPECT_TRUE(
+      product({{1}}, {2}, {{S("dim"), 6}})
+          .equalIgnoringOutDimSizes(product({{1}}, {2}, {{S("dim"), 10}})));
+}
+
+TEST_F(ProductCarrierTest, ReshapeInsAndRemoveZeroBasesKeepProduct) {
+  BasesT bases;
+  LinearLayout::RadicesT radices;
+  bases[S("register")] = {{1, 0}, {2, 0}};
+  radices[S("register")] = {2, 3};
+  bases[S("lane")] = {{0, 1}};
+  radices[S("lane")] = {2};
+  LinearLayout ll(bases, radices, {{S("x"), 6}, {S("y"), 2}},
+                  /*requireSurjective=*/true);
+  EXPECT_EQ(ll.flattenIns().reshapeIns({{S("register"), 6}, {S("lane"), 2}}),
+            ll);
+  bases[S("register")].push_back({0, 0});
+  radices[S("register")].push_back(2);
+  EXPECT_EQ(LinearLayout(bases, radices, ll.getOutDims(),
+                         /*requireSurjective=*/false)
+                .removeZeroBasesAlongDim(S("register")),
+            ll);
+}
+
 } // anonymous namespace
 } // namespace mlir::triton
 
