@@ -478,3 +478,107 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
     tt.return
   }
 }
+
+// -----
+
+#a = #ttg.linear<{register = [[0, 32], [1, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [3, 64]}>
+#flat = #ttg.linear<{register = [[32], [64]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A Product reshape to the regrouped source keeps every register in place.
+  // CHECK: module attributes {{.*}}ttg.shared = 0 : i32
+  // CHECK-LABEL: llvm.func @product_reshape
+  // CHECK-NOT: nvvm.shfl
+  // CHECK-NOT: nvvm.barrier
+  // CHECK: llvm.return
+  tt.func public @product_reshape(%p: !tt.ptr<f32>) {
+    %s = tt.splat %p : !tt.ptr<f32> -> tensor<3x64x!tt.ptr<f32>, #a>
+    %v = tt.load %s : tensor<3x64x!tt.ptr<f32>, #a>
+    %r = tt.reshape %v : tensor<3x64xf32, #a> -> tensor<192xf32, #flat>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<192x!tt.ptr<f32>, #flat>
+    tt.store %d, %r : tensor<192x!tt.ptr<f32>, #flat>
+    tt.return
+  }
+}
+
+// -----
+
+#b = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [0, 0]], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [64, 3]}>
+#flat = #ttg.linear<{register = [[64]], lane = [[1], [2], [4], [8], [16]], warp = [[32], [0]], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [192]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // No 192 layout keeps these registers, so warps with digit 1 = 0 store each
+  // element at row * 3 + column and every thread reloads after a barrier.
+  // CHECK: module attributes {{.*}}ttg.shared = 768 : i32
+  // CHECK-LABEL: llvm.func @moving_reshape
+  // CHECK: %[[Q:.*]] = llvm.udiv %{{.*}}, %{{.*}} : i32
+  // CHECK: %[[D:.*]] = llvm.urem %[[Q]], %{{.*}} : i32
+  // CHECK: %[[OWN:.*]] = llvm.icmp "eq" %[[D]], %{{.*}} : i32
+  // CHECK-NEXT: %[[PRED:.*]] = llvm.and %{{.*}}, %[[OWN]] : i1
+  // CHECK: llvm.mlir.constant(16 : i32) : i32
+  // CHECK: %[[THREE:.*]] = llvm.mlir.constant(3 : i32) : i32
+  // CHECK-NEXT: llvm.mul %{{.*}}, %[[THREE]] : i32
+  // CHECK: "@$2 st.shared.b32 [ $0 + 0 ], $1;"{{.*}} %[[PRED]] :
+  // CHECK-COUNT-2: "@$2 st.shared.b32 [ $0 + 0 ], $1;"
+  // CHECK-NEXT: nvvm.barrier
+  // CHECK-COUNT-3: llvm.load {{.*}} : !llvm.ptr<3> -> f32
+  // CHECK-NOT: ptr<3>
+  // CHECK: llvm.return
+  tt.func public @moving_reshape(%p: !tt.ptr<f32>) {
+    %s = tt.splat %p : !tt.ptr<f32> -> tensor<64x3x!tt.ptr<f32>, #b>
+    %v = tt.load %s : tensor<64x3x!tt.ptr<f32>, #b>
+    %r = tt.reshape %v : tensor<64x3xf32, #b> -> tensor<192xf32, #flat>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<192x!tt.ptr<f32>, #flat>
+    tt.store %d, %r : tensor<192x!tt.ptr<f32>, #flat>
+    tt.return
+  }
+}
+
+// -----
+
+#b = #ttg.linear<{register = [[32, 0], [0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [64, 3]}>
+#flat = #ttg.linear<{register = [[32], [64]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // Shared memory holds i1 as i8 and pointers as i64.
+  // CHECK: module attributes {{.*}}ttg.shared = 1536 : i32
+  // CHECK-LABEL: llvm.func @moving_reshape_i1_ptr
+  // CHECK: llvm.zext %{{.*}} : i1 to i8
+  // CHECK: llvm.store {{.*}} : vector<1xi8>, !llvm.ptr<3>
+  // CHECK: nvvm.barrier
+  // CHECK: llvm.load {{.*}} : !llvm.ptr<3> -> i8
+  // CHECK: llvm.trunc %{{.*}} : i8 to i1
+  // CHECK: llvm.ptrtoint %{{.*}} : !llvm.ptr<1> to i64
+  // CHECK: llvm.store {{.*}} : vector<1xi64>, !llvm.ptr<3>
+  // CHECK: nvvm.barrier
+  // CHECK: llvm.load {{.*}} : !llvm.ptr<3> -> i64
+  // CHECK: llvm.inttoptr %{{.*}} : i64 to !llvm.ptr<1>
+  tt.func public @moving_reshape_i1_ptr(%p: !tt.ptr<f32>) {
+    %s = tt.splat %p : !tt.ptr<f32> -> tensor<64x3x!tt.ptr<f32>, #b>
+    %v = tt.load %s : tensor<64x3x!tt.ptr<f32>, #b>
+    %m = arith.cmpf olt, %v, %v : tensor<64x3xf32, #b>
+    %rm = tt.reshape %m : tensor<64x3xi1, #b> -> tensor<192xi1, #flat>
+    %rp = tt.reshape %s : tensor<64x3x!tt.ptr<f32>, #b> -> tensor<192x!tt.ptr<f32>, #flat>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<192x!tt.ptr<f32>, #flat>
+    %x = tt.load %d : tensor<192x!tt.ptr<f32>, #flat>
+    tt.store %rp, %x, %rm : tensor<192x!tt.ptr<f32>, #flat>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#dst = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A pow2 reorder reshape to a layout other than the regroup stays in registers.
+  // CHECK: module attributes {{.*}}ttg.shared = 0 : i32
+  // CHECK-LABEL: llvm.func @pow2_reorder_reshape
+  // CHECK-NOT: nvvm.barrier
+  // CHECK: llvm.return
+  tt.func public @pow2_reorder_reshape(%p: !tt.ptr<f32>) {
+    %s = tt.splat %p : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #src>
+    %v = tt.load %s : tensor<256x!tt.ptr<f32>, #src>
+    %r = tt.reshape %v allow_reorder : tensor<256xf32, #src> -> tensor<128x2xf32, #dst>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<128x2x!tt.ptr<f32>, #dst>
+    tt.store %d, %r : tensor<128x2x!tt.ptr<f32>, #dst>
+    tt.return
+  }
+}

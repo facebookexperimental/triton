@@ -94,6 +94,11 @@ static unsigned getResultBroadcastScratchSize(Value result) {
 }
 
 unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+  if (auto reshape = dyn_cast<ReshapeOp>(op)) {
+    RankedTensorType srcTy = reshape.getSrc().getType();
+    if (gpu::isNpotSharedReshape(srcTy, reshape.getType()))
+      return srcTy.getNumElements() * getBitwidth(srcTy) / 8;
+  }
   if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
     return ReduceOpHelper(reduceOp).getScratchSizeInBytes();
   }

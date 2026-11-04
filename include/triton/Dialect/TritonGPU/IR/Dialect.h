@@ -444,6 +444,16 @@ inline bool isExpensiveView(Type srcType, Type dstType) {
                          tensorDstType.getShape(), tensorDstType.getEncoding());
 }
 
+// True iff the reshape moves elements through shared memory: an NPOT source
+// whose result is not its register regroup.
+bool isNpotSharedReshape(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
+                         ArrayRef<int64_t> dstShape, Attribute dstEncoding);
+inline bool isNpotSharedReshape(RankedTensorType srcType,
+                                RankedTensorType dstType) {
+  return isNpotSharedReshape(srcType.getShape(), srcType.getEncoding(),
+                             dstType.getShape(), dstType.getEncoding());
+}
+
 // Return a blocked encoding where the shape is distributed contiguously amongst
 // the threads, warps, CTAs with 1 element per threads.
 triton::gpu::BlockedEncodingAttr

@@ -324,6 +324,184 @@ Value emitCanonicalLayoutOwnerPredicate(
   return canonical;
 }
 
+// Elements per shared access on `dim`: the leading radix-2 register digits
+// stepping `dim` by 1, 2, 4, ..., cut to 16 bytes. Permutation layouts need no
+// other cut.
+static int32_t getSharedRunLength(const LinearLayout &layout, int32_t dim,
+                                  unsigned bitwidth) {
+  auto kReg =
+      StringAttr::get(layout.getInDimNames().begin()->getContext(), "register");
+  int32_t numDigits = layout.getNumLeadingRadix2Digits(kReg);
+  int32_t steps = 0;
+  while (steps < numDigits && (1 << steps) < 128 / int32_t(bitwidth) &&
+         layout.getBasis(kReg, steps)[dim] == 1 << steps)
+    ++steps;
+  return 1 << steps;
+}
+
+// One store, sync, load round of transferProductThroughSharedMemory.
+static SmallVector<Value> transferProductTile(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    const LinearLayout &srcLayout, const LinearLayout &dstLayout,
+    ArrayRef<Value> inVals, Type elemTy, Value smemBase,
+    const llvm::MapVector<StringAttr, int32_t> &srcFreeVariableMasks,
+    bool blockScope, Value laneId, Value warpId) {
+  auto *ctx = rewriter.getContext();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto kReg = str_attr("register");
+  auto kLane = str_attr("lane");
+  auto kWarp = str_attr("warp");
+  auto elemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+
+  auto getIndices = [&](const LinearLayout &layout, int32_t reg) {
+    SmallVector<std::pair<StringAttr, Value>> indices;
+    for (auto dim : layout.getInDimNames())
+      indices.push_back({dim, dim == kReg    ? b.i32_val(reg)
+                              : dim == kLane ? laneId
+                              : dim == kWarp ? warpId
+                                             : b.i32_val(0)});
+    return indices;
+  };
+  // A reshape is row-major on both sides. A conversion makes the dim with the
+  // fewest accesses fastest; ties keep dim 0.
+  unsigned bitwidth = elemTy.getIntOrFloatBitWidth();
+  int32_t srcRank = srcLayout.getNumOutDims();
+  int32_t dstRank = dstLayout.getNumOutDims();
+  int32_t numSrc = inVals.size();
+  int32_t numDst = dstLayout.getInDimSize(kReg);
+  SmallVector<unsigned> srcOrder = getMatrixOrder(srcRank, /*rowMajor=*/true);
+  SmallVector<unsigned> dstOrder = getMatrixOrder(dstRank, /*rowMajor=*/true);
+  int32_t srcRun = getSharedRunLength(srcLayout, srcRank - 1, bitwidth);
+  int32_t dstRun = getSharedRunLength(dstLayout, dstRank - 1, bitwidth);
+  if (llvm::equal(srcLayout.getOutDimSizes(), dstLayout.getOutDimSizes())) {
+    int32_t fastest = 0;
+    int32_t fewest = numSrc + numDst + 1;
+    for (int32_t dim = 0; dim < srcRank; ++dim) {
+      int32_t src = getSharedRunLength(srcLayout, dim, bitwidth);
+      int32_t dst = getSharedRunLength(dstLayout, dim, bitwidth);
+      if (numSrc / src + numDst / dst >= fewest)
+        continue;
+      fewest = numSrc / src + numDst / dst;
+      fastest = dim;
+      srcRun = src;
+      dstRun = dst;
+    }
+    srcOrder = {static_cast<unsigned>(fastest)};
+    for (int32_t dim = 0; dim < srcRank; ++dim)
+      if (dim != fastest)
+        srcOrder.push_back(dim);
+    dstOrder = srcOrder;
+  }
+
+  auto getPtr = [&](const LinearLayout &layout, ArrayRef<unsigned> order,
+                    ArrayRef<std::pair<StringAttr, Value>> indices) {
+    SmallVector<Value> coords;
+    SmallVector<unsigned> shape;
+    for (auto [outDim, coord] :
+         applyLinearLayout(loc, rewriter, layout, indices)) {
+      coords.push_back(coord);
+      shape.push_back(layout.getOutDimSize(outDim));
+    }
+    return b.gep(elemPtrTy, elemTy, smemBase,
+                 LLVM::linearize(rewriter, loc, coords, shape, order));
+  };
+
+  for (int32_t reg = 0; reg < numSrc; reg += srcRun) {
+    auto indices = getIndices(srcLayout, reg);
+    Value owner = emitCanonicalLayoutOwnerPredicate(
+        loc, rewriter, srcLayout, indices, srcFreeVariableMasks);
+    Value value = srcRun == 1
+                      ? inVals[reg]
+                      : packLLVector(loc, inVals.slice(reg, srcRun), rewriter);
+    targetInfo.storeShared(rewriter, loc, getPtr(srcLayout, srcOrder, indices),
+                           value, owner);
+  }
+  if (blockScope)
+    targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+  else
+    targetInfo.warpSync(loc, rewriter);
+
+  SmallVector<Value> outVals;
+  for (int32_t reg = 0; reg < numDst; reg += dstRun) {
+    Value ptr = getPtr(dstLayout, dstOrder, getIndices(dstLayout, reg));
+    if (dstRun == 1) {
+      outVals.push_back(b.load(elemTy, ptr));
+      continue;
+    }
+    Value vec = b.load(vec_ty(elemTy, dstRun), ptr);
+    llvm::append_range(outVals, unpackLLVector(loc, vec, rewriter));
+  }
+  return outVals;
+}
+
+SmallVector<Value> transferProductThroughSharedMemory(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    const LinearLayout &srcLayout, const LinearLayout &dstLayout,
+    ArrayRef<Value> inVals, Type elemTy, Value smemBase,
+    const llvm::MapVector<StringAttr, int32_t> &srcFreeVariableMasks,
+    bool blockScope,
+    std::optional<std::pair<Value, Value>> distributedCoordinates,
+    const ProductSharedTiling *tiling) {
+  Value laneId, warpId;
+  std::tie(laneId, warpId) = distributedCoordinates
+                                 ? *distributedCoordinates
+                                 : getLaneAndWarpId(rewriter, loc);
+  if (!tiling)
+    return transferProductTile(loc, rewriter, targetInfo, srcLayout, dstLayout,
+                               inVals, elemTy, smemBase, srcFreeVariableMasks,
+                               blockScope, laneId, warpId);
+  auto kReg = StringAttr::get(rewriter.getContext(), "register");
+  // Digit weights, and each tile register's register with the tiled digits 0.
+  auto tileRegisters = [&](const LinearLayout &layout, ArrayRef<int32_t> tiled,
+                           SmallVector<int32_t> &weights) {
+    SmallVector<int32_t> registers{0};
+    int32_t weight = 1;
+    for (auto [digit, radix] : llvm::enumerate(layout.getInputRadices(kReg))) {
+      weights.push_back(weight);
+      SmallVector<int32_t> next;
+      for (int32_t value = 0; value < radix; ++value)
+        for (int32_t reg : registers)
+          next.push_back(reg + value * weight);
+      if (!llvm::is_contained(tiled, int32_t(digit)))
+        registers = std::move(next);
+      weight *= radix;
+    }
+    return registers;
+  };
+  SmallVector<int32_t> srcWeights, dstWeights;
+  auto srcRegisters =
+      tileRegisters(srcLayout, tiling->sourceDigits, srcWeights);
+  auto dstRegisters =
+      tileRegisters(dstLayout, tiling->destinationDigits, dstWeights);
+  auto tileMasks = tiling->sourceTile.getFreeVariableMasks();
+  int32_t numTiles = srcLayout.getInDimSize(kReg) / srcRegisters.size();
+  SmallVector<Value> outVals(dstLayout.getInDimSize(kReg));
+  for (int32_t tile = 0; tile < numTiles; ++tile) {
+    // This tile's stores overwrite scratch the previous tile's loads read.
+    if (tile > 0 && blockScope)
+      targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+    else if (tile > 0)
+      targetInfo.warpSync(loc, rewriter);
+    int32_t srcBase = 0, dstBase = 0, rest = tile;
+    for (auto [srcDigit, dstDigit] :
+         llvm::zip_equal(tiling->sourceDigits, tiling->destinationDigits)) {
+      int32_t radix = srcLayout.getInputRadix(kReg, srcDigit);
+      srcBase += rest % radix * srcWeights[srcDigit];
+      dstBase += rest % radix * dstWeights[dstDigit];
+      rest /= radix;
+    }
+    SmallVector<Value> tileVals;
+    for (int32_t reg : srcRegisters)
+      tileVals.push_back(inVals[srcBase + reg]);
+    tileVals = transferProductTile(
+        loc, rewriter, targetInfo, tiling->sourceTile, tiling->destinationTile,
+        tileVals, elemTy, smemBase, tileMasks, blockScope, laneId, warpId);
+    for (auto [reg, value] : llvm::zip_equal(dstRegisters, tileVals))
+      outVals[dstBase + reg] = value;
+  }
+  return outVals;
+}
+
 } // namespace triton::gpu
 
 // Applies `layout` to `ins` on top of `constantOuts`. Radix-2 digits XOR the
