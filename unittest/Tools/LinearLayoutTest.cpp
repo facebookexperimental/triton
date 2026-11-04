@@ -1642,6 +1642,33 @@ TEST_F(ProductCarrierTest, ReshapeInsAndRemoveZeroBasesKeepProduct) {
             ll);
 }
 
+TEST_F(ProductCarrierTest, FreeVariableMasksFreeNonOwningDigits) {
+  // Digit 1 repeats digit 0's binary part and digit 3 is a zero odd digit;
+  // digit 2 owns the odd coordinates.
+  EXPECT_EQ(product({{1}, {1}, {2}, {0}}, {2, 2, 3, 3}, {{S("dim"), 6}})
+                .getFreeVariableMasks()
+                .lookup(S("register")),
+            0b1010);
+}
+
+TEST_F(ProductCarrierTest, MultiplyPlacesOddPartOnTop) {
+  auto kReg = S("register"), kOut = S("out");
+  // Inner's odd digit moves above outer's binary digits.
+  EXPECT_EQ(exactIdentity1D(6, kReg, kOut) *
+                LinearLayout::identity1D(4, kReg, kOut),
+            product({{1}, {8}, {2}, {4}}, {2, 3, 2, 2}, {{kOut, 24}}));
+  EXPECT_EQ(LinearLayout::identity1D(2, kReg, kOut) *
+                exactIdentity1D(6, kReg, kOut),
+            exactIdentity1D(12, kReg, kOut));
+}
+
+TEST_F(ProductCarrierTest, MultiplyRejectsTwoProductFactorsOnOneOutput) {
+  auto kReg = S("register"), kOut = S("out");
+  EXPECT_DEATH(
+      (void)(exactIdentity1D(3, kReg, kOut) * exactIdentity1D(5, kReg, kOut)),
+      "each odd part needs one non-binary digit");
+}
+
 } // anonymous namespace
 } // namespace mlir::triton
 
