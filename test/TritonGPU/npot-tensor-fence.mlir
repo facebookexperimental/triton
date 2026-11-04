@@ -1,8 +1,9 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -verify-diagnostics
+// RUN: env -u TRITON_ALLOW_NPOT not triton-opt %s -split-input-file -o /dev/null 2>&1 | FileCheck %s --check-prefix=OFF
 
-// Under TRITON_ALLOW_NPOT only encoding-less TTIR tensors may be NPOT. Every
-// tensor with an encoding keeps the power-of-two rule, including block
-// arguments and results of ops without the tensor-size trait.
+// Under TRITON_ALLOW_NPOT only TTIR tensors and exact Product layouts may be
+// NPOT. Every other encoded tensor keeps the power-of-two rule, including
+// block arguments and results of ops without the tensor-size trait.
 
 #b = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
@@ -41,5 +42,232 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c = arith.constant dense<1.0> : tensor<96xf32>
     %y = arith.addf %s, %c : tensor<96xf32>
     tt.return %y : tensor<96xf32>
+  }
+}
+
+// -----
+
+// An exact Product layout verifies on the ops that lower it.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+#q96 = #ttg.linear<{register = [[32]], lane = [[2], [1], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_96(%p: !tt.ptr<f32>) {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    %s = tt.splat %p : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>, #p96>
+    %a = tt.addptr %s, %r : tensor<96x!tt.ptr<f32>, #p96>, tensor<96xi32, #p96>
+    %v = tt.load %a : tensor<96x!tt.ptr<f32>, #p96>
+    %w = arith.addf %v, %v : tensor<96xf32, #p96>
+    %c = ttg.convert_layout %w : tensor<96xf32, #p96> -> tensor<96xf32, #q96>
+    %b = ttg.convert_layout %a : tensor<96x!tt.ptr<f32>, #p96> -> tensor<96x!tt.ptr<f32>, #q96>
+    tt.store %b, %c : tensor<96x!tt.ptr<f32>, #q96>
+    tt.return
+  }
+}
+
+// -----
+
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // expected-error @+1 {{NPOT Product layout is not yet supported on tt.func}}
+  tt.func @product_arg(%x: tensor<96xf32, #p96>) {
+    // OFF: [[@LINE+1]]:10: error: Operand 0 {{.*}} has an invalid layout: Layout has shape 96, but the tensor it's attached to has shape 96 which is not a power of two.
+    %c = ttg.convert_layout %x : tensor<96xf32, #p96> -> tensor<96xf32, #p96>
+    tt.return
+  }
+}
+
+// -----
+
+// An op that does not declare ProductLayoutOpInterface keeps the named reject.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_scan() {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    // expected-error @+1 {{NPOT Product layout is not yet supported on tt.scan}}
+    %s = "tt.scan"(%r) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%a: i32, %b: i32):
+      %t = arith.addi %a, %b : i32
+      tt.scan.return %t : i32
+    }) : (tensor<96xi32, #p96>) -> tensor<96xi32, #p96>
+    tt.return
+  }
+}
+
+// -----
+
+// Constants, carried values, print and assert take a Product layout; histogram
+// does not yet.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+#b = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_free_ops(%n: i32, %c: i1) {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    %two = arith.constant dense<2> : tensor<96xi32, #p96>
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %f = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %r) -> (tensor<96xi32, #p96>) : i32 {
+      %m = arith.muli %acc, %two : tensor<96xi32, #p96>
+      scf.yield %m : tensor<96xi32, #p96>
+    }
+    %if = scf.if %c -> (tensor<96xi32, #p96>) {
+      scf.yield %f : tensor<96xi32, #p96>
+    } else {
+      scf.yield %r : tensor<96xi32, #p96>
+    }
+    %w = scf.while (%a = %if) : (tensor<96xi32, #p96>) -> tensor<96xi32, #p96> {
+      scf.condition(%c) %a : tensor<96xi32, #p96>
+    } do {
+    ^bb0(%a: tensor<96xi32, #p96>):
+      scf.yield %a : tensor<96xi32, #p96>
+    }
+    cf.cond_br %c, ^bb1(%w : tensor<96xi32, #p96>), ^bb1(%r : tensor<96xi32, #p96>)
+  ^bb1(%x: tensor<96xi32, #p96>):
+    tt.print ": " {hex = false, isSigned = array<i32: 1>} : %x : tensor<96xi32, #p96>
+    %pos = arith.cmpi sge, %x, %r : tensor<96xi32, #p96>
+    tt.assert %pos, "x >= r" : tensor<96xi1, #p96>
+    // expected-error @+1 {{NPOT Product layout is not yet supported on tt.histogram}}
+    %h = tt.histogram %x : tensor<96xi32, #p96> -> tensor<16xi32, #b>
+    cf.br ^bb2
+  ^bb2:
+    tt.return
+  }
+}
+
+// -----
+
+// A Product layout of another shape is not exact.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_layout_on_192() {
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.make_range}}
+    %r = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #p96>
+    tt.return
+  }
+}
+
+// -----
+
+// A layout is exact where toLinearLayout covers each out dim exactly: a slice
+// of a Product layout, and a Product dim realized at extent 1.
+#p = #ttg.linear<{register = [[32, 0], [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [], block = [], inputRadices = {register = [3, 2, 2, 2, 2, 2, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96, 64]}>
+#q = #ttg.linear<{register = [[0, 32], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [], block = [], inputRadices = {register = [3, 2, 2, 2, 2, 2, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [64, 96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_slice_and_unit_dim(%x: i32) {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #ttg.slice<{dim = 1, parent = #p}>>
+    %m = tt.splat %x : i32 -> tensor<96x1xi32, #p>
+    %n = tt.splat %x : i32 -> tensor<64x1xi32, #q>
+    tt.return
+  }
+}
+
+// -----
+
+// Not exact: 96 does not shrink to the cover of 48.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_layout_on_48() {
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.make_range}}
+    %r = tt.make_range {end = 48 : i32, start = 0 : i32} : tensor<48xi32, #p96>
+    tt.return
+  }
+}
+
+// -----
+
+// Not exact: 96 realized at 32 does not cover it.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_layout_on_32() {
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.make_range}}
+    %r = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #p96>
+    tt.return
+  }
+}
+
+// -----
+
+// Not exact: a non-binary digit owns no odd part.
+#f96 = #ttg.linear<{register = [[32], [0]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_free_digit() {
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.make_range}}
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #f96>
+    tt.return
+  }
+}
+
+// -----
+
+// Lane, warp and block digits stay binary.
+#w96 = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16]], warp = [[32]], block = [], inputRadices = {register = [], lane = [2, 2, 2, 2, 2], warp = [3], block = []}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 3 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_odd_warp() {
+    // expected-error @+1 {{NPOT Product layout with a non-binary warp digit is not yet supported}}
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #w96>
+    tt.return
+  }
+}
+
+// -----
+
+// Index math is 32-bit, so the odd part is bounded.
+#big = #ttg.linear<{register = [[8]], lane = [[1], [2], [4], [0], [0]], warp = [], block = [], inputRadices = {register = [65537], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [524296]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_odd_part_above_65535() {
+    // expected-error @+1 {{NPOT Product layout with an odd part above 65535 is not yet supported}}
+    %r = tt.make_range {end = 524296 : i32, start = 0 : i32} : tensor<524296xi32, #big>
+    tt.return
+  }
+}
+
+// -----
+
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [[0]], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = [2]}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_two_ctas() {
+    // expected-error @+1 {{NPOT Product layout across CTAs is not yet supported}}
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    tt.return
+  }
+}
+
+// -----
+
+// A convert is admitted iff its Product plan is supported.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+#q96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [[0]], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = [2]}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_to_cross_cta() {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    // expected-error @+1 {{NPOT Product conversion with a non-singleton block input in the destination layout is not yet supported}}
+    %c = ttg.convert_layout %r : tensor<96xi32, #p96> -> tensor<96xi32, #q96>
+    tt.return
+  }
+}
+
+// -----
+
+// Planning builds both layouts and can assert on a non-Product side.
+#p = #ttg.linear<{register = [[4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 32]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [[1, 0], [2, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
+#b = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_to_fma_operand() {
+    %a = arith.constant dense<0.000000e+00> : tensor<128x96xf16, #p>
+    // expected-error @+1 {{NPOT conversion to or from a non-Product layout is not yet supported}}
+    %c = ttg.convert_layout %a : tensor<128x96xf16, #p> -> tensor<128x96xf16, #ttg.dot_op<{opIdx = 0, parent = #b}>>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[64]], lane = [[1], [2], [4], [8], [16]], warp = [[32]], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [2], block = []}, outDimSizes = [192]}>
+#dst = #ttg.linear<{register = [[64]], lane = [[2], [4], [8], [16], [32]], warp = [[1]], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [2], block = []}, outDimSizes = [192]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @product_shared_force_warp_shuffle() {
+    %r = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #src>
+    // expected-error @+1 {{NPOT Product conversion through shared memory is not yet supported with force_warp_shuffle}}
+    %c = ttg.convert_layout %r {force_warp_shuffle} : tensor<192xi32, #src> -> tensor<192xi32, #dst>
+    tt.return
   }
 }

@@ -7,6 +7,7 @@
 #include "unittest/Tools/ProductLayouts.h"
 
 #include "mlir/Parser/Parser.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Signals.h"
 #include <gtest/gtest.h>
 
@@ -553,6 +554,54 @@ TEST(Analysis, ProductConversionPlanSharesWithoutRegisterLaneBijection) {
     expectShared(planProductLayoutConversion(src, dst, {3, 8}), src,
                  Scope::Block);
   }
+}
+
+TEST(Analysis, ProductConversionQueriesFollowThePlan) {
+  setenv("TRITON_ALLOW_NPOT", "1", /*overwrite=*/1);
+  llvm::scope_exit restore([] { unsetenv("TRITON_ALLOW_NPOT"); });
+  MLIRContext ctx;
+  ctx.loadDialect<triton::TritonDialect, triton::gpu::TritonGPUDialect>();
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    #r384 = #ttg.linear<{register = [[1], [2], [128]], lane = [[4], [8], [16], [32], [64]], warp = [], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [384]}>
+    #r384t = #ttg.linear<{register = [[2], [128], [1]], lane = [[4], [8], [16], [32], [64]], warp = [], block = [], inputRadices = {register = [2, 3, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [384]}>
+    #w192 = #ttg.linear<{register = [[1], [64]], lane = [[2], [4], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
+    #w192t = #ttg.linear<{register = [[64], [1]], lane = [[4], [2], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [3, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
+    #s96 = #ttg.linear<{register = [[32], [16]], lane = [[1], [2], [4], [8], [0]], warp = [], block = [], inputRadices = {register = [3, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+    #s96t = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+    #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+    #swapped = #ttg.linear<{register = [[2], [1]], lane = [[4], [8], [16], [32], [64]], warp = [], block = []}>
+    module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+      tt.func @f() {
+        %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32, #r384>
+        %0 = ttg.convert_layout %r : tensor<384xi32, #r384> -> tensor<384xi32, #r384t>
+        %w = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #w192>
+        %1 = ttg.convert_layout %w : tensor<192xi32, #w192> -> tensor<192xi32, #w192t>
+        %s = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #s96>
+        %2 = ttg.convert_layout %s : tensor<96xi32, #s96> -> tensor<96xi32, #s96t>
+        %b = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+        %3 = ttg.convert_layout %b : tensor<128xi32, #blocked> -> tensor<128xi32, #swapped>
+        tt.return
+      }
+    }
+  )mlir",
+                                            &ctx);
+  ASSERT_TRUE(module);
+  // {has a plan, reorders registers, needs shared memory}: Register, Warp,
+  // Shared, and a power-of-two register permutation as the control.
+  SmallVector<std::tuple<bool, bool, bool>> expected = {{true, true, false},
+                                                        {true, false, false},
+                                                        {true, false, true},
+                                                        {false, true, false}};
+  SmallVector<std::tuple<bool, bool, bool>> actual;
+  module->walk([&](triton::gpu::ConvertLayoutOp cvt) {
+    auto srcTy = cvt.getSrc().getType();
+    auto dstTy = cvt.getType();
+    EXPECT_EQ(cvtNeedsSharedMemory(srcTy, dstTy), cvtNeedsSharedMemory(cvt));
+    actual.push_back({getProductConversionPlan(srcTy, dstTy).has_value(),
+                      cvtReordersRegisters(srcTy, dstTy),
+                      cvtNeedsSharedMemory(cvt)});
+  });
+  EXPECT_EQ(actual, expected);
 }
 
 } // namespace mlir

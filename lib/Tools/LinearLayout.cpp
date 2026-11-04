@@ -1175,21 +1175,28 @@ bool LinearLayout::sublayoutIsZero(ArrayRef<StringAttr> inDimNames,
 
 SmallVector<std::pair<StringAttr, int32_t>>
 LinearLayout::apply(ArrayRef<std::pair<StringAttr, int32_t>> ins) const {
-  assert(!hasNonBinaryCarrier());
   assertDimsEqualIgnoringOrder(llvm::make_first_range(ins), getInDimNames());
 
   SmallVector<std::pair<StringAttr, int32_t>> ret;
-  for (StringAttr outDim : getOutDimNames()) {
+  for (auto [outDim, outDimSize] : outDims) {
     int32_t outVal = 0;
+    // A Binary output has twoPart == size and no odd contributions.
+    int32_t twoPart = twoPartOf(outDimSize);
+    int64_t oddVal = 0;
     for (auto &[inDim, val] : ins) {
       ArrayRef<int32_t> radices = getInputRadices(inDim);
       if (llvm::any_of(radices, [](int32_t radix) { return radix != 2; })) {
-        // A nonzero digit XORs in its basis, as on the device.
+        // A nonzero digit XORs in its binary part, as on the device, and adds
+        // digit times its odd part modulo the odd part of the size.
         uint32_t quotient = val;
         for (auto [i, radix] : llvm::enumerate(radices)) {
-          if (quotient % radix != 0)
-            outVal ^= getBasis(inDim, i, outDim);
+          uint32_t digit = quotient % radix;
           quotient /= radix;
+          if (digit == 0)
+            continue;
+          auto [binary, odd] = getBasisContribution(inDim, i, outDim);
+          outVal ^= binary;
+          oddVal = (oddVal + int64_t{digit} * odd) % (outDimSize / twoPart);
         }
         continue;
       }
@@ -1198,7 +1205,7 @@ LinearLayout::apply(ArrayRef<std::pair<StringAttr, int32_t>> ins) const {
           outVal ^= getBasis(inDim, i, outDim);
       }
     }
-    ret.push_back({outDim, outVal});
+    ret.push_back({outDim, outVal + twoPart * static_cast<int32_t>(oddVal)});
   }
   return ret;
 }

@@ -411,6 +411,11 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   return width >= 32;
 }
 
+bool mlir::triton::hasRadix2Layout(tt::LoadOp load) {
+  auto ty = dyn_cast<RankedTensorType>(load.getType());
+  return !ty || ttg::toLinearLayout(ty).isRadix2();
+}
+
 void mlir::triton::serializeLatencies(ModuleOp module,
                                       DenseMap<Operation *, int> &opLatency) {
   auto helper = TritonDialect::getLoaded(module)->getLatencyAttrHelper();
@@ -434,7 +439,11 @@ DenseMap<Operation *, int> mlir::triton::deserializeLatencies(Operation *op) {
   auto latencyHelper = TritonDialect::getLoaded(op)->getLatencyAttrHelper();
   op->walk([&](Operation *op) {
     if (auto attr = latencyHelper.getAttr(op)) {
-      opLatency[op] = attr.getInt();
+      // An NPOT Product load is not yet supported in shared memory: drop its
+      // latency so it stays unpipelined.
+      auto load = dyn_cast<tt::LoadOp>(op);
+      if (!load || hasRadix2Layout(load))
+        opLatency[op] = attr.getInt();
       latencyHelper.removeAttr(op);
     }
   });

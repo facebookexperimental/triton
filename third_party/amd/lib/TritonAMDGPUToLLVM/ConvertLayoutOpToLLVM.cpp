@@ -2,6 +2,7 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 
 using ::mlir::triton::gpu::AMDMfmaEncodingAttr;
@@ -32,6 +33,9 @@ public:
     auto *ctx = op.getContext();
     StringAttr kReg = str_attr("register");
     StringAttr kLane = str_attr("lane");
+    // NPOT Product conversions lower in the common pattern.
+    if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
+      return failure();
     auto srcLayout =
         triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
     auto dstLayout =
@@ -702,6 +706,9 @@ public:
 
     auto ctx = op.getContext();
     StringAttr kRegister = mlir::StringAttr::get(ctx, "register");
+    // NPOT Product conversions lower in the common pattern.
+    if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
+      return failure();
     auto srcLayout =
         triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
     auto dstLayout =

@@ -283,6 +283,15 @@ planProductLayoutConversion(const triton::LinearLayout &srcLayout,
                             const triton::LinearLayout &dstLayout,
                             ArrayRef<int64_t> logicalShape);
 
+// The plan of a convert with a Product layout on either side, else nullopt.
+std::optional<ProductConversionPlan>
+getProductConversionPlan(RankedTensorType srcTy, RankedTensorType dstTy);
+
+// Scratch bytes of a convert with a Product layout, else nullopt: the whole
+// tensor for a Shared plan, 0 for the other plans.
+std::optional<unsigned>
+getProductConversionScratchBytes(triton::gpu::ConvertLayoutOp op);
+
 // Produces a warp-local decomposition.
 //
 // For permutation cases, the numbers of register and lane basis vectors may
@@ -373,6 +382,10 @@ bool hasOpOfAnyTypeInForwardSlice(Operation *liveOp) {
   }
   return false;
 }
+
+// A Product conversion answers from its plan.
+bool isCvtDimSync(RankedTensorType srcTy, RankedTensorType dstTy,
+                  StringAttr dim);
 
 bool isCvtDimSync(const triton::LinearLayout &srcLayout,
                   const triton::LinearLayout &dstLayout, StringAttr dim);

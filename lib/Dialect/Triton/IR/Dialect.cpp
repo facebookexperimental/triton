@@ -96,6 +96,19 @@ Value TritonInlinerInterface::handleResult(OpBuilder &, Operation *call,
   return result;
 }
 
+namespace {
+template <typename OpT>
+struct ProductLayoutModel
+    : ProductLayoutOpInterface::ExternalModel<ProductLayoutModel<OpT>, OpT> {};
+} // namespace
+
+// Upstream ops that lower a Product layout: a constant lowers per element,
+// control flow forwards values, and a conversion cast only retypes one.
+template <typename... OpTs>
+static void declareProductLayoutOps(MLIRContext &ctx) {
+  (OpTs::template attachInterface<ProductLayoutModel<OpTs>>(ctx), ...);
+}
+
 void TritonDialect::initialize() {
   registerTypes();
 
@@ -112,6 +125,11 @@ void TritonDialect::initialize() {
   // We can also add interface here.
   addInterfaces<TritonCachePolicyInterface>();
   addInterfaces<TritonInlinerInterface>();
+
+  declareProductLayoutOps<arith::ConstantOp, scf::ForOp, scf::IfOp,
+                          scf::WhileOp, scf::YieldOp, scf::ConditionOp,
+                          cf::BranchOp, cf::CondBranchOp,
+                          UnrealizedConversionCastOp>(*getContext());
 }
 
 Operation *TritonDialect::materializeConstant(OpBuilder &builder,
