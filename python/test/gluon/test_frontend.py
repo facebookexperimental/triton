@@ -2046,8 +2046,12 @@ def test_npot_shared_memdesc_leading_dim_accepted(flag, monkeypatch):
         monkeypatch.delenv("TRITON_ALLOW_NPOT", raising=False)
     else:
         monkeypatch.setenv("TRITON_ALLOW_NPOT", flag)
-    # Like upstream, only a shared buffer's first dim may be NPOT.
+    # Like upstream, a shared buffer's first dim may be NPOT. The flag also admits
+    # a compact NPOT buffer, which is laid out on its power-of-two cover.
     run_parser(_npot_smem_kernel, *make_args((96, 64)), target=HOPPER_TARGET)
+    if flag:
+        run_parser(_npot_smem_kernel, *make_args((64, 96)), target=HOPPER_TARGET)
+        return
     with pytest.raises(CompilationError) as e:
         run_parser(_npot_smem_kernel, *make_args((64, 96)), target=HOPPER_TARGET)
     assert "shape must have power-of-2 and non-zero dimensions; got 64, 96" in str(e.value.__cause__)
