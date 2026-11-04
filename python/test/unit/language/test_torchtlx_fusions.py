@@ -375,6 +375,42 @@ class TestTorchTLXEpilogueFusion(TestCase):
         not (has_tlx() and _HAS_BLACKWELL_TUTORIAL),
         "TLX Blackwell tutorial not available",
     )
+    def test_fp32_matmul_row_bias_bf16_epilogue_is_fused(self):
+        """An fp32 mm whose fused epilogue loads a row bias and stores bf16.
+
+        The output dtype differs from the operand dtype, and the bias load is
+        indexed by the renamed epilogue range symbol alone.
+        """
+
+        def linear_bf16_out(x, weight, bias):
+            return (x.float() @ weight.float().t() + bias.float()).to(torch.bfloat16)
+
+        m, k, n = 1152, 1024, 2048
+        x = torch.randn(m, k, device=GPU_TYPE, dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device=GPU_TYPE, dtype=torch.bfloat16) * 0.01
+        bias = torch.randn(n, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        with (
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "enable_caching_generated_triton_templates": False,
+                }),
+                tlx_config.patch(use_heuristic_config=False),
+        ):
+            actual, code = run_and_get_code(torch.compile(linear_bf16_out), x, weight, bias)
+
+        torch.testing.assert_close(actual, linear_bf16_out(x, weight, bias), atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem_fused_tlx", "\n".join(code))
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(
+        not (has_tlx() and _HAS_BLACKWELL_TUTORIAL),
+        "TLX Blackwell tutorial not available",
+    )
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_customized_matmul_relu_epilogue_is_fused(
         self,
