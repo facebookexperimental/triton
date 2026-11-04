@@ -175,6 +175,8 @@ private:
 
 public:
   static bool canHaveSharedEncoding(tt::LoadOp op) {
+    if (!hasRadix2Layout(op))
+      return false;
     // If used by an user with DotOp encoding, all the uses must be compatible.
     bool incompatible = false;
     getSharedEncIfAllUsersAreDotEnc(op.getResult(), incompatible);

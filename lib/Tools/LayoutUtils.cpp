@@ -899,6 +899,23 @@ SmallVector<Value> broadcastAs(const SmallVector<Value> &values,
   auto kReg = *layout.getInDimNames().begin();
   assert(kReg.str() == "register");
   uint32_t broadcastMask = layout.getFreeVariableMasks().lookup(kReg);
+  auto radices = layout.getInputRadices(kReg);
+  if (llvm::any_of(radices, [](int32_t radix) { return radix != 2; })) {
+    // A unique register is the mixed-radix number of the unmasked digits.
+    SmallVector<Value> ret;
+    for (int32_t i = 0; i < layout.getInDimSize(kReg); ++i) {
+      int32_t rest = i, srcIdx = 0, weight = 1;
+      for (auto [digit, radix] : llvm::enumerate(radices)) {
+        if (!(broadcastMask & (1u << digit))) {
+          srcIdx += rest % radix * weight;
+          weight *= radix;
+        }
+        rest /= radix;
+      }
+      ret.push_back(values[srcIdx]);
+    }
+    return ret;
+  }
   assert((layout.getInDimSize(kReg) / (1 << llvm::popcount(broadcastMask))) ==
          values.size());
 

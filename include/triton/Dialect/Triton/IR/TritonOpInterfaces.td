@@ -187,5 +187,15 @@ def AtomicOpInterface : OpInterface<"AtomicOpInterface"> {
   ];
 }
 
+def ProductLayoutOpInterface : OpInterface<"ProductLayoutOpInterface"> {
+  let description = [{
+    Marks an op whose lowering implements the exact plan for NPOT Product
+    layouts. Under TRITON_ALLOW_NPOT the verifier admits an exact Product layout
+    only on these ops and on elementwise ops.
+  }];
+
+  let cppNamespace = "::mlir::triton";
+}
+
 
 #endif // TRITON_OP_INTERFACES

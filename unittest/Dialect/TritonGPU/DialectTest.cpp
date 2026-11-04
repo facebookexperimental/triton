@@ -601,14 +601,18 @@ static uint32_t evalLowered(Value v, ArrayRef<uint32_t> args) {
       .Case([&](LLVM::ShlOp) { return x << y; })
       .Case([&](LLVM::LShrOp) { return x >> y; })
       .Case([&](LLVM::UDivOp) { return x / y; })
+      .Case([&](LLVM::URemOp) { return x % y; })
+      .Case([&](LLVM::AddOp) { return x + y; })
+      .Case([&](LLVM::MulOp) { return x * y; })
       .Default([&](Operation *) {
         ADD_FAILURE() << "unexpected " << op->getName().getStringRef().str();
         return 0u;
       });
 }
 
-// The lowered apply() matches the host apply() on every input; the radix-2
-// control takes the shift-concatenated path.
+// The lowered apply() matches the host apply() on every input. In the Product
+// layout dim0 = 12 and the radix-3 digit adds 2 to the odd part, so the sum
+// wraps; the radix-2 control takes the shift-concatenated path.
 TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
   ctx.getOrLoadDialect<LLVM::LLVMDialect>();
   auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
@@ -623,9 +627,12 @@ TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
                                                          {s("dim1"), 2}};
   LinearLayout mixed(bases, radices, outDims, /*requireSurjective=*/true);
   LinearLayout radix2(bases, outDims, /*requireSurjective=*/true);
+  bases[reg][0] = {8, 0};
+  outDims[0].second = 12;
+  LinearLayout product(bases, radices, outDims, /*requireSurjective=*/true);
   Location loc = UnknownLoc::get(&ctx);
   Type i32 = IntegerType::get(&ctx, 32);
-  for (const LinearLayout &layout : {mixed, radix2}) {
+  for (const LinearLayout &layout : {mixed, product, radix2}) {
     OwningOpRef<ModuleOp> module = ModuleOp::create(loc);
     IRRewriter rewriter(&ctx);
     rewriter.setInsertionPointToStart(module->getBody());
@@ -645,6 +652,33 @@ TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
       }
     }
   }
+}
+
+// Register counts multiply digit radices, and a run ends at the odd digit.
+TEST_F(LinearEncodingTest, ProductCountsUseRadices) {
+  auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  LinearLayout::BasesT bases;
+  bases[s("register")] = {{1, 0}, {2, 0}};
+  bases[s("lane")] = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}};
+  bases[s("warp")] = {{0, 32}};
+  bases[s("block")] = {};
+  LinearLayout::RadicesT radices;
+  radices[s("register")] = {2, 3};
+  radices[s("lane")] = {2, 2, 2, 2, 2};
+  radices[s("warp")] = {2};
+  radices[s("block")] = {};
+  LinearLayout layout(bases, radices, {{s("dim0"), 6}, {s("dim1"), 64}},
+                      /*requireSurjective=*/true);
+  auto linear = LinearEncodingAttr::get(&ctx, layout);
+  EXPECT_EQ(linear.getContigPerThread(), SmallVector<unsigned>({2, 1}));
+  // The interface getSizePerThread() asserts in getCGALayout on Product.
+  EXPECT_EQ(LinearEncodingTrait::getSizePerThread(layout, {1, 1}),
+            SmallVector<unsigned>({6, 1}));
+  auto pow2 = LinearLayout::identity1D(4, s("register"), s("dim0")) *
+              LinearLayout::identity1D(32, s("lane"), s("dim1")) *
+              LinearLayout::identity1D(2, s("warp"), s("dim0"));
+  EXPECT_EQ(LinearEncodingTrait::getSizePerThread(pow2, {1, 1}),
+            SmallVector<unsigned>({4, 1}));
 }
 } // namespace
 } // namespace mlir::triton::gpu
