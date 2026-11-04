@@ -383,6 +383,13 @@ Value emitRedundantThreadPredicate(
     ConversionPatternRewriter &rewriter, Location loc,
     const TargetInfoBase &targetInfo);
 
+// True iff every free-variable digit of `indices` is 0 (mixed radix), so each
+// output of `layout` has one canonical owner.
+Value emitCanonicalLayoutOwnerPredicate(
+    Location loc, RewriterBase &rewriter, const LinearLayout &layout,
+    ArrayRef<std::pair<StringAttr, Value>> indices,
+    const llvm::MapVector<StringAttr, int32_t> &freeVariableMasks);
+
 // Takes two values that may be boolean, or null to represent constant True.
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b);
 

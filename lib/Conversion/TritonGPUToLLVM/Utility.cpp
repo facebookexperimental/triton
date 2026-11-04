@@ -303,16 +303,47 @@ Value emitRedundantThreadPredicate(
   return pred;
 }
 
+Value emitCanonicalLayoutOwnerPredicate(
+    Location loc, RewriterBase &rewriter, const LinearLayout &layout,
+    ArrayRef<std::pair<StringAttr, Value>> indices,
+    const llvm::MapVector<StringAttr, int32_t> &freeVariableMasks) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value canonical = b.true_val();
+  for (auto [inDim, index] : indices) {
+    uint32_t mask = freeVariableMasks.lookup(inDim);
+    int32_t weight = 1;
+    for (auto [digit, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
+      if (mask & (1u << digit)) {
+        Value quotient = weight == 1 ? index : b.udiv(index, b.i32_val(weight));
+        Value value = b.urem(quotient, b.i32_val(radix));
+        canonical = b.and_(canonical, b.icmp_eq(value, b.i32_val(0)));
+      }
+      weight *= radix;
+    }
+  }
+  return canonical;
+}
+
 } // namespace triton::gpu
 
-// XORs into `outIndices` the image of `ins` digit by digit. Only radix-2
-// digits have a nonzero basis, and digit i of a dim has weight equal to the
-// product of the radices below it.
-static void
+// Applies `layout` to `ins` on top of `constantOuts`. Radix-2 digits XOR the
+// binary part; an odd digit adds into the odd part modulo the odd size, and
+// the index is binary + twoPart * odd.
+static SmallVector<std::pair<StringAttr, Value>>
 applyMixedRadixLayout(TritonLLVMOpBuilder &b, const LinearLayout &layout,
                       ArrayRef<std::pair<StringAttr, Value>> ins,
-                      SmallVector<std::pair<StringAttr, Value>> &outIndices) {
+                      ArrayRef<std::pair<StringAttr, int32_t>> constantOuts) {
   Value zero = b.i32_val(0);
+  SmallVector<Value> binaries, odds;
+  SmallVector<int64_t> oddBounds;
+  for (auto [outDim, constant] : constantOuts) {
+    int32_t twoPart = LinearLayout::twoPartOf(layout.getOutDimSize(outDim));
+    int32_t binary = constant % twoPart;
+    int32_t odd = constant / twoPart;
+    binaries.push_back(binary == 0 ? zero : b.i32_val(binary));
+    odds.push_back(odd == 0 ? Value() : b.i32_val(odd));
+    oddBounds.push_back(odd);
+  }
   for (auto [inDim, idx] : ins) {
     int32_t weight = 1;
     for (auto [digit, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
@@ -323,16 +354,44 @@ applyMixedRadixLayout(TritonLLVMOpBuilder &b, const LinearLayout &layout,
           quotient = b.lshr(idx, b.i32_val(llvm::Log2_32(weight)));
         else if (weight > 1)
           quotient = b.udiv(idx, b.i32_val(weight));
-        Value isZero = b.icmp_eq(b.and_(quotient, b.i32_val(1)), zero);
-        for (auto [outIdx, value] : llvm::zip(outIndices, basis)) {
-          if (value != 0)
-            outIdx.second =
-                b.xor_(outIdx.second, b.select(isZero, zero, b.i32_val(value)));
+        // XOR is exact: checkProductCarriers rejects odd radix-2 contributions.
+        if (radix == 2) {
+          Value isZero = b.icmp_eq(b.and_(quotient, b.i32_val(1)), zero);
+          for (auto [binary, value] : llvm::zip(binaries, basis)) {
+            if (value != 0)
+              binary = b.xor_(binary, b.select(isZero, zero, b.i32_val(value)));
+          }
+        } else {
+          Value value = b.urem(quotient, b.i32_val(radix));
+          for (auto [i, outDim] : llvm::enumerate(layout.getOutDimNames())) {
+            int32_t odd = layout.getBasisContribution(inDim, digit, outDim).odd;
+            if (odd == 0)
+              continue;
+            Value term = odd == 1 ? value : b.mul(value, b.i32_val(odd));
+            odds[i] = odds[i] ? b.add(odds[i], term) : term;
+            oddBounds[i] += int64_t{radix - 1} * odd;
+          }
         }
       }
       weight *= radix;
     }
   }
+  SmallVector<std::pair<StringAttr, Value>> outIndices;
+  for (auto [i, outDim] : llvm::enumerate(layout.getOutDimNames())) {
+    Value index = binaries[i];
+    if (odds[i]) {
+      int32_t size = layout.getOutDimSize(outDim);
+      int32_t twoPart = LinearLayout::twoPartOf(size);
+      Value odd = odds[i];
+      if (oddBounds[i] >= size / twoPart)
+        odd = b.urem(odd, b.i32_val(size / twoPart));
+      if (twoPart > 1)
+        odd = b.shl(odd, b.i32_val(llvm::Log2_32(twoPart)));
+      index = b.add(index, odd);
+    }
+    outIndices.push_back({outDim, index});
+  }
+  return outIndices;
 }
 
 SmallVector<std::pair<StringAttr, Value>>
@@ -368,10 +427,15 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
     }
   }
 
+  auto constantOuts = layout.apply(constantIns);
+  // The shift-concatenation below needs every input digit to be radix 2.
+  if (!nonConstantIns.empty() && !layout.isRadix2())
+    return applyMixedRadixLayout(b, layout, nonConstantIns, constantOuts);
+
   // Compute constant part of the output and wrap it as values
   Value zero = b.i32_val(0);
   SmallVector<std::pair<StringAttr, Value>> outIndices;
-  for (auto [outDimName, constant] : layout.apply(constantIns)) {
+  for (auto [outDimName, constant] : constantOuts) {
     if (constant == 0)
       outIndices.push_back({outDimName, zero});
     else
@@ -379,12 +443,6 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   }
 
   if (nonConstantIns.size() == 0) {
-    return outIndices;
-  }
-
-  // The shift-concatenation below needs every input digit to be radix 2.
-  if (!layout.isRadix2()) {
-    applyMixedRadixLayout(b, layout, nonConstantIns, outIndices);
     return outIndices;
   }
 
@@ -588,7 +646,18 @@ applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
     SmallVector<std::pair<StringAttr, Value>> combinedIndices;
     for (auto [base, regIdx] : llvm::zip(baseIndices, regIndices)) {
       assert(base.first == regIdx.first);
-      Value combined = b.xor_(base.second, b.i32_val(regIdx.second));
+      // A Product index is binary + twoPart * odd: XOR the binary part, then
+      // add the odd part modulo the size.
+      int32_t size = layout.getOutDimSize(base.first);
+      int32_t twoPart = LinearLayout::twoPartOf(size);
+      Value combined = b.xor_(base.second, b.i32_val(regIdx.second % twoPart));
+      if (int32_t regOdd = regIdx.second / twoPart) {
+        Value sum = b.add(combined, b.i32_val(regOdd * twoPart));
+        // Locals fix the op order; C++ leaves argument order unspecified.
+        Value wrap = b.icmp_uge(sum, b.i32_val(size));
+        Value reduced = b.sub(sum, b.i32_val(size));
+        combined = b.select(wrap, reduced, sum);
+      }
       combinedIndices.emplace_back(base.first, combined);
     }
 

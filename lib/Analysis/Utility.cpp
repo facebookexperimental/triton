@@ -1263,6 +1263,10 @@ bool GatherLoweringHelper::isWarpLocal() {
   RankedTensorType idxType = gatherOp.getIndices().getType();
   LinearLayout srcLayout = toLinearLayout(srcType);
   LinearLayout idxLayout = toLinearLayout(idxType);
+  // The warp-local emitter inverts the layouts, which mixed-radix digits do
+  // not support; the shared-memory path addresses each element.
+  if (!srcLayout.isRadix2() || !idxLayout.isRadix2())
+    return false;
 
   Builder b(gatherOp.getContext());
   StringAttr kBlock = b.getStringAttr("block");
@@ -1444,11 +1448,34 @@ static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
   return hasMmaFamily(srcTy.getEncoding()) || hasMmaFamily(dstTy.getEncoding());
 }
 
+std::optional<ProductConversionPlan>
+getProductConversionPlan(RankedTensorType srcTy, RankedTensorType dstTy) {
+  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy))
+    return std::nullopt;
+  // The LLVM struct holds only the unique register values.
+  auto kReg = StringAttr::get(srcTy.getContext(), "register");
+  return planProductLayoutConversion(
+      toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg),
+      toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg), dstTy.getShape());
+}
+
+std::optional<unsigned> getProductConversionScratchBytes(ConvertLayoutOp op) {
+  auto srcTy = op.getSrc().getType();
+  auto plan = getProductConversionPlan(srcTy, op.getType());
+  if (!plan)
+    return std::nullopt;
+  if (plan->transport != ProductConversionTransport::Shared)
+    return 0;
+  return product(srcTy.getShape()) * getBitwidth(srcTy) / 8;
+}
+
 bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
   // Modular MMA conversions can alias bases; use shared memory.
   if (npotMmaConversion(srcTy, dstTy)) {
     return false;
   }
+  if (auto plan = getProductConversionPlan(srcTy, dstTy))
+    return plan->transport == ProductConversionTransport::Register;
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1526,6 +1553,8 @@ bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
       return true;
     }
   }
+  if (auto plan = getProductConversionPlan(srcTy, dstTy))
+    return plan->transport == ProductConversionTransport::Shared;
   return !cvtReordersRegisters(srcTy, dstTy) &&
          !cvtNeedsWarpShuffle(srcTy, dstTy);
 }
@@ -1541,6 +1570,8 @@ bool cvtNeedsSharedMemory(triton::gpu::ConvertLayoutOp op) {
       return true;
     }
   }
+  if (auto plan = getProductConversionPlan(srcTy, dstTy))
+    return plan->transport == ProductConversionTransport::Shared;
   return !cvtReordersRegisters(srcTy, dstTy) && !cvtNeedsWarpShuffle(op);
 }
 
@@ -1567,6 +1598,13 @@ bool isCvtDimSync(const triton::LinearLayout &srcLayout,
   }
   return invertAndComposeLocal(srcLayout, dstLayout, {kBlock})
       .isIdentityOnOutDim(kBlock);
+}
+
+bool isCvtDimSync(RankedTensorType srcTy, RankedTensorType dstTy,
+                  StringAttr dim) {
+  if (auto plan = getProductConversionPlan(srcTy, dstTy))
+    return plan->scope != ProductConversionScope::Block || dim == "block";
+  return isCvtDimSync(toLinearLayout(srcTy), toLinearLayout(dstTy), dim);
 }
 
 namespace triton {
@@ -1614,8 +1652,7 @@ bool needsClusterBarrier(Operation *op) {
     return true;
   if (auto cvt = dyn_cast<gpu::ConvertLayoutOp>(op)) {
     auto kBlock = StringAttr::get(op->getContext(), "block");
-    return !isCvtDimSync(gpu::toLinearLayout(cvt.getSrc().getType()),
-                         gpu::toLinearLayout(cvt.getType()), kBlock);
+    return !isCvtDimSync(cvt.getSrc().getType(), cvt.getType(), kBlock);
   }
   if (auto reduce = dyn_cast<ReduceOp>(op))
     return !ReduceOpHelper(reduce).isReduceWithinCTA();

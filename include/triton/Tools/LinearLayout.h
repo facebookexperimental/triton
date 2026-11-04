@@ -486,6 +486,13 @@ public:
   int32_t getInputRadix(StringAttr inDim, int32_t pos) const {
     return getInputRadices(inDim)[pos];
   }
+  // The number of leading radix-2 digits of `inDim`; digit i below it has
+  // weight 2^i.
+  int32_t getNumLeadingRadix2Digits(StringAttr inDim) const {
+    ArrayRef<int32_t> radices = getInputRadices(inDim);
+    return llvm::find_if(radices, [](int32_t radix) { return radix != 2; }) -
+           radices.begin();
+  }
   // False for a non-binary input digit or a non-Binary output: the radix-2
   // algorithms below assert it.
   bool isRadix2() const;
