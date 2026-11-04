@@ -465,3 +465,28 @@ def test_npot_sort_other_dim(M):
     else:
         kernel[(1, )](x, out, M=M)
         assert torch.equal(out, torch.sort(x).values)
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N", [96, 128])
+def test_npot_reduce_no_pad_value_rejected(N):
+    """A subtract combiner has no pad value, so an NPOT reduce over it fails to
+    compile with an error. N=128 is the pow2 control and compiles."""
+
+    @triton.jit
+    def sub(a, b):
+        return a - b
+
+    @triton.jit
+    def kernel(X, Out, N: tl.constexpr):
+        tl.store(Out, tl.reduce(tl.load(X + tl.arange(0, N)), 0, sub))
+
+    x = torch.ones(N, device="cuda")
+    out = torch.empty(1, device="cuda")
+    if N == 128:
+        kernel[(1, )](x, out, N=N)
+        return
+    with pytest.raises(RuntimeError,
+                       match="'tt.reduce' op over an NPOT axis with a combiner that has no pad value is unsupported"):
+        kernel[(1, )](x, out, N=N)
