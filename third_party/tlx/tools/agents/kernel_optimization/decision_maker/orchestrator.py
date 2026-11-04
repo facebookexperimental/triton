@@ -55,6 +55,7 @@ from ..optimizer.agent import (
     AgentSourceResearchRequest,
     CandidateContext,
     CandidateProposal,
+    MAX_RECENT_EXPERIMENTS,
     CandidateProvider,
     CodexCandidateProvider,
 )
@@ -188,6 +189,7 @@ class DecisionMaker:
         best_source = request.kernel_source
         best_performance = baseline
         best_experiment_id = "baseline"
+        best_experiment = experiments[0]
         best_commit_title = ""
         best_commit_summary = ""
         best_profiles = baseline_profiles
@@ -245,12 +247,15 @@ class DecisionMaker:
                                 current_source=parent_source,
                                 current_performance=best_performance,
                                 previous_diagnostics=tuple(diagnostics),
-                                action_index=action_index,
+                                action_index=(round_index - 1)
+                                * request.budget.candidates_per_round
+                                + candidate_index,
                                 current_source_digest=source_digest(parent_source),
                                 remaining_agent_actions=(
-                                    request.budget.max_agent_actions_per_candidate
-                                    - action_index
-                                ),
+                                    request.budget.max_rounds - round_index + 1
+                                )
+                                * request.budget.candidates_per_round
+                                - candidate_index,
                                 remaining_diagnostic_actions=max(
                                     0,
                                     request.budget.max_diagnostic_actions_per_candidate
@@ -277,6 +282,16 @@ class DecisionMaker:
                                 source_research_saturation_threshold=(
                                     request.budget.source_research_saturation_threshold
                                 ),
+                                incumbent_experiment=best_experiment,
+                                recent_experiments=tuple(
+                                    experiments[-MAX_RECENT_EXPERIMENTS:]
+                                ),
+                                remaining_seconds=max(
+                                    0.0,
+                                    request.budget.max_total_seconds
+                                    - (time.monotonic() - start_time),
+                                ),
+                                candidate_only=True,
                             ),
                         )
                         if isinstance(action, CandidateProposal):
@@ -407,7 +422,10 @@ class DecisionMaker:
                             decision=preflight,
                             experiment_kind=proposal.experiment_kind,
                             change_scopes=tuple(
-                                sorted(proposal.change_scopes, key=lambda scope: scope.value)
+                                sorted(
+                                    proposal.change_scopes,
+                                    key=lambda scope: scope.value,
+                                )
                             ),
                             blast_radius=proposal.blast_radius,
                             experiment_payload_path=experiment_payload_path,
@@ -415,6 +433,9 @@ class DecisionMaker:
                             cumulative_patch_path=candidate_artifacts.cumulative_patch_path,
                             mutation_summary=proposal.summary,
                             hypothesis=proposal.hypothesis,
+                            hypothesis_kind=proposal.hypothesis_kind,
+                            escalation_reason=proposal.escalation_reason,
+                            research_evidence_ids=proposal.research_evidence_ids,
                             evidence=proposal.evidence,
                             expected_effect=proposal.expected_effect,
                             risk=proposal.risk,
@@ -558,7 +579,10 @@ class DecisionMaker:
                             decision=decision,
                             experiment_kind=proposal.experiment_kind,
                             change_scopes=tuple(
-                                sorted(proposal.change_scopes, key=lambda scope: scope.value)
+                                sorted(
+                                    proposal.change_scopes,
+                                    key=lambda scope: scope.value,
+                                )
                             ),
                             blast_radius=proposal.blast_radius,
                             experiment_payload_path=experiment_payload_path,
@@ -567,6 +591,9 @@ class DecisionMaker:
                             performance=performance,
                             mutation_summary=proposal.summary,
                             hypothesis=proposal.hypothesis,
+                            hypothesis_kind=proposal.hypothesis_kind,
+                            escalation_reason=proposal.escalation_reason,
+                            research_evidence_ids=proposal.research_evidence_ids,
                             evidence=proposal.evidence,
                             expected_effect=proposal.expected_effect,
                             risk=proposal.risk,
@@ -637,6 +664,7 @@ class DecisionMaker:
                             best_source = proposal.source
                             best_performance = performance
                             best_experiment_id = experiment_id
+                            best_experiment = experiment
                             best_commit_title = proposal.commit_title
                             best_commit_summary = proposal.commit_summary
                             best_profiles = perf_profiles
@@ -687,6 +715,34 @@ class DecisionMaker:
                             else None
                         ),
                         diagnostics=message,
+                        mutation_summary=(
+                            proposal.summary if proposal is not None else ""
+                        ),
+                        hypothesis=proposal.hypothesis if proposal is not None else "",
+                        hypothesis_kind=(
+                            proposal.hypothesis_kind
+                            if proposal is not None
+                            else "unknown"
+                        ),
+                        escalation_reason=(
+                            proposal.escalation_reason if proposal is not None else ""
+                        ),
+                        research_evidence_ids=(
+                            proposal.research_evidence_ids
+                            if proposal is not None
+                            else ()
+                        ),
+                        evidence=proposal.evidence if proposal is not None else "",
+                        expected_effect=(
+                            proposal.expected_effect if proposal is not None else ""
+                        ),
+                        risk=proposal.risk if proposal is not None else "",
+                        commit_title=(
+                            proposal.commit_title if proposal is not None else ""
+                        ),
+                        commit_summary=(
+                            proposal.commit_summary if proposal is not None else ""
+                        ),
                     )
                     _report_performance(
                         experiment_id,
