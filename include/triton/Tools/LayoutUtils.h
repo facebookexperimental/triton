@@ -220,6 +220,12 @@ SmallVector<StringAttr> supremum(const SmallVector<StringAttr> &x,
 LinearLayout reshapeLayout(MLIRContext *ctx, LinearLayout layout,
                            ArrayRef<int64_t> shape);
 
+// reshapeLayout for NPOT outputs: each new dim must take whole digits of the
+// row-major index, binary digits first and its odd digit last; else nullopt.
+std::optional<LinearLayout> tryReshapeLayout(MLIRContext *ctx,
+                                             const LinearLayout &layout,
+                                             ArrayRef<int64_t> shape);
+
 // Return a new layout with the dimensions transposed according to the given
 // order.
 LinearLayout transposeLinearLayout(LinearLayout layout, ArrayRef<int> order);

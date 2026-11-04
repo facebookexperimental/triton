@@ -221,6 +221,36 @@ TEST_F(LayoutUtilsTest, TransposeKeepsProductRadices) {
   EXPECT_EQ(transposeLinearLayout(transposed, {1, 0}), layout);
 }
 
+// A reshape regroups whole digits of the row-major index; each keeps its
+// coefficient. The size-1 warp input stays an input.
+TEST_F(LayoutUtilsTest, TryReshapeLayoutRegroupsWholeDigits) {
+  auto reg = S("register"), lane = S("lane"), dim0 = S("dim0");
+  auto rows = exactIdentity1D(3, reg, dim0) *
+              LinearLayout::identity1D(32, lane, S("dim1")) *
+              LinearLayout::identity1D(1, S("warp"), dim0);
+  auto flat = tryReshapeLayout(&ctx, rows, {96});
+  ASSERT_TRUE(flat.has_value());
+  EXPECT_EQ(flat->apply({{reg, 2}, {lane, 5}, {S("warp"), 0}}),
+            (SmallVector<std::pair<StringAttr, int32_t>>{{dim0, 69}}));
+  EXPECT_EQ(tryReshapeLayout(&ctx, *flat, {3, 32}), rows);
+  auto pow2 = LinearLayout::identity1D(4, reg, dim0) *
+              LinearLayout::identity1D(32, lane, S("dim1"));
+  EXPECT_EQ(tryReshapeLayout(&ctx, pow2, {8, 16}),
+            reshapeLayout(&ctx, pow2, {8, 16}));
+}
+
+// 32x3 -> 96 would put binary digits above an odd digit, and 96 -> 32x3 would
+// build the size-3 dim from binary digits.
+TEST_F(LayoutUtilsTest, TryReshapeLayoutRejectsSplitDigits) {
+  auto reg = S("register"), lane = S("lane");
+  auto oddFastest = LinearLayout::identity1D(32, lane, S("dim0")) *
+                    exactIdentity1D(3, reg, S("dim1"));
+  EXPECT_FALSE(tryReshapeLayout(&ctx, oddFastest, {96}).has_value());
+  EXPECT_FALSE(
+      tryReshapeLayout(&ctx, exactIdentity1D(96, reg, S("dim0")), {32, 3})
+          .has_value());
+}
+
 TEST_F(LayoutUtilsTest, ProductConversionScopeIsExact) {
   auto reg = S("register"), lane = S("lane"), warp = S("warp");
   auto block = S("block"), dim0 = S("dim0"), dim1 = S("dim1");

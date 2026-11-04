@@ -1015,6 +1015,69 @@ LinearLayout reshapeLayout(MLIRContext *ctx, LinearLayout layout,
       .transposeOuts(standardOutDimNames(ctx, rank));
 }
 
+namespace {
+// The digits of a row-major index into `shape`, least significant first: each
+// dim's binary digits, then one odd digit if its size is not a power of two.
+struct IndexDigits {
+  SmallVector<int32_t> radices;
+  SmallVector<int32_t> dimOf;
+  SmallVector<int32_t> firstOf;
+};
+
+IndexDigits getIndexDigits(ArrayRef<int64_t> shape) {
+  IndexDigits digits;
+  digits.firstOf.resize(shape.size());
+  for (int dim = shape.size() - 1; dim >= 0; --dim) {
+    digits.firstOf[dim] = digits.radices.size();
+    int32_t size = shape[dim];
+    int32_t twoPart = LinearLayout::twoPartOf(size);
+    digits.radices.append(llvm::Log2_32(twoPart), 2);
+    if (size != twoPart)
+      digits.radices.push_back(size / twoPart);
+    digits.dimOf.resize(digits.radices.size(), dim);
+  }
+  return digits;
+}
+} // namespace
+
+std::optional<LinearLayout> tryReshapeLayout(MLIRContext *ctx,
+                                             const LinearLayout &layout,
+                                             ArrayRef<int64_t> shape) {
+  auto srcDims = to_vector(layout.getOutDimNames());
+  SmallVector<int64_t> srcShape;
+  for (StringAttr dim : srcDims)
+    srcShape.push_back(layout.getOutDimSize(dim));
+  IndexDigits src = getIndexDigits(srcShape);
+  IndexDigits dst = getIndexDigits(shape);
+  if (src.radices != dst.radices)
+    return std::nullopt;
+  // Each coefficient keeps its digit; an odd digit sits above its new dim's
+  // binary digits, so its coefficient is scaled by their weight.
+  LinearLayout::BasesT bases;
+  for (const auto &[inDim, inDimBases] : layout.getBases()) {
+    auto &newBases = bases[inDim];
+    for (int32_t digit = 0, e = inDimBases.size(); digit < e; ++digit) {
+      std::vector<int32_t> basis(shape.size(), 0);
+      for (auto [i, outDim] : llvm::enumerate(srcDims)) {
+        auto [binary, odd] = layout.getBasisContribution(inDim, digit, outDim);
+        int32_t numBinary = llvm::Log2_32(
+            LinearLayout::twoPartOf(layout.getOutDimSize(outDim)));
+        for (int32_t pos = 0; pos <= numBinary; ++pos) {
+          int32_t coeff = pos < numBinary ? (binary >> pos) & 1 : odd;
+          if (coeff == 0)
+            continue;
+          int32_t flat = src.firstOf[i] + pos;
+          int32_t dim = dst.dimOf[flat];
+          basis[dim] += coeff << (flat - dst.firstOf[dim]);
+        }
+      }
+      newBases.push_back(std::move(basis));
+    }
+  }
+  return LinearLayout(std::move(bases), layout.getInputRadices(),
+                      standardOutDimPairs(ctx, shape), layout.isSurjective());
+}
+
 LinearLayout transposeLinearLayout(LinearLayout layout, ArrayRef<int> order) {
   // Transpose the tile layout.
   auto namedBases = layout.getBases();
