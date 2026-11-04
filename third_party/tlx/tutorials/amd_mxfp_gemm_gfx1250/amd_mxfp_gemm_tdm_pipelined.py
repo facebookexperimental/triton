@@ -263,6 +263,10 @@ def _mxgemm_issue_loads(
         else:
             # Without remapping, consecutive cluster CTAs cover consecutive
             # M tiles at the same N, so only B and its scales are shared.
+            # That holds only while the cluster stays within one M group,
+            # and a TDM multicast reaches at most five CTAs.
+            tl.static_assert(CLUSTER_SIZE <= GROUP_SIZE_M and CLUSTER_SIZE <= 4,
+                             "linear multicast clusters require CLUSTER_SIZE <= min(GROUP_SIZE_M, 4)")
             a_mask, b_mask = 0, (1 << CLUSTER_SIZE) - 1
         data_masks = [a_mask, b_mask]
         all_masks = [a_mask, b_mask, a_mask, b_mask]
@@ -2307,7 +2311,8 @@ def _mxfp_gemm_tflops(ms: float, M: int, N: int, K: int) -> float:
 
 
 def _validate_mxfp_scheduling(M, N, num_programs, *, persistent, block_m, block_n, group_m, xcd_remap, num_xcds,
-                              xcd_chunk, cluster_size, cluster_barrier_interval=1, cluster_layout="linear"):
+                              xcd_chunk, cluster_size, cluster_barrier_interval=1, cluster_layout="linear",
+                              cluster_multicast=True):
     if not isinstance(cluster_barrier_interval, int) or cluster_barrier_interval < 0:
         raise ValueError("CLUSTER_BARRIER_INTERVAL must be a nonnegative integer")
     if xcd_remap not in _XCD_REMAP_MODES:
@@ -2333,6 +2338,12 @@ def _validate_mxfp_scheduling(M, N, num_programs, *, persistent, block_m, block_
                          "(a multiple of the cluster columns for grid layouts)")
     if group_m % grid_rows:
         raise ValueError(f"CLUSTER_LAYOUT={cluster_layout} requires GROUP_SIZE_M divisible by {grid_rows}")
+    # A linear cluster multicasts B to all its CTAs, so they must share one N
+    # tile: the cluster may not span M groups. A TDM multicast also reaches at
+    # most five CTAs.
+    if cluster_layout == "linear" and cluster_multicast and cluster_size > min(group_m, 4):
+        raise ValueError("CLUSTER_LAYOUT=linear with multicast requires CLUSTER_SIZE <= min(GROUP_SIZE_M, 4); "
+                         "use a grid CLUSTER_LAYOUT for larger clusters")
     # Every cluster member must execute the same number of persistent tiles,
     # including taking the same has_next branches around cluster barriers.
     tiles = (M // block_m) * (N // block_n)
@@ -2458,7 +2469,8 @@ def mxgemm_tdm_pipelined(
     ``XCD_REMAP`` selects none, balanced, or chunked persistent program
     ordering. ``CLUSTER_SIZE`` groups workgroups whose matching TDM loads are
     multicast (``CLUSTER_MULTICAST``). ``CLUSTER_LAYOUT="linear"`` shares B
-    within a cluster; ``"2x2"``, ``"4x2"``, ``"2x4"``, ``"4x4"``, ``"8x2"``,
+    within a cluster of consecutive M tiles; with multicast it allows at most
+    ``min(GROUP_SIZE_M, 4)`` workgroups. ``"2x2"``, ``"4x2"``, ``"2x4"``, ``"4x4"``, ``"8x2"``,
     and ``"2x8"`` map an R x C cluster onto R M tiles by C N tiles, so each A
     tile is shared by C workgroups and each B tile by R. A cluster barrier
     every ``CLUSTER_BARRIER_INTERVAL`` K blocks (0: none) keeps the members'
@@ -2535,7 +2547,7 @@ def mxgemm_tdm_pipelined(
     _validate_mxfp_scheduling(M, N, NUM_PROGRAMS, persistent=PERSISTENT, block_m=BLOCK_M, block_n=BLOCK_N,
                               group_m=GROUP_SIZE_M, xcd_remap=XCD_REMAP, num_xcds=NUM_XCDS, xcd_chunk=XCD_CHUNK,
                               cluster_size=CLUSTER_SIZE, cluster_barrier_interval=CLUSTER_BARRIER_INTERVAL,
-                              cluster_layout=CLUSTER_LAYOUT)
+                              cluster_layout=CLUSTER_LAYOUT, cluster_multicast=CLUSTER_MULTICAST)
     c = torch.empty((M, N), device=a.device, dtype=_OUT_DTYPES[OUT_DTYPE])
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     a_scale_arg = a_scale if WITH_A_SCALE else b_scale
@@ -2675,10 +2687,13 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
 
     _validate_mxfp_scheduling(M, N, cfg.get("NUM_PROGRAMS"), persistent=False, block_m=cfg["BLOCK_M"],
                               block_n=cfg["BLOCK_N"], group_m=cfg["GROUP_SIZE_M"],
-                              xcd_remap=cfg.get("XCD_REMAP", "none"), num_xcds=cfg.get("NUM_XCDS", 8),
-                              xcd_chunk=cfg.get("XCD_CHUNK", 2), cluster_size=cfg.get("CLUSTER_SIZE", 1),
-                              cluster_barrier_interval=cfg.get("CLUSTER_BARRIER_INTERVAL",
-                                                               1), cluster_layout=cfg.get("CLUSTER_LAYOUT", "linear"))
+                              xcd_remap=cfg.get("XCD_REMAP",
+                                                "none"), num_xcds=cfg.get("NUM_XCDS",
+                                                                          8), xcd_chunk=cfg.get("XCD_CHUNK", 2),
+                              cluster_size=cfg.get("CLUSTER_SIZE",
+                                                   1), cluster_barrier_interval=cfg.get("CLUSTER_BARRIER_INTERVAL", 1),
+                              cluster_layout=cfg.get("CLUSTER_LAYOUT",
+                                                     "linear"), cluster_multicast=cfg.get("CLUSTER_MULTICAST", True))
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     grid = (triton.cdiv(M, cfg["BLOCK_M"]) * triton.cdiv(N, cfg["BLOCK_N"]), )

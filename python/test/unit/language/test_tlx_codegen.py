@@ -7301,6 +7301,15 @@ def test_gfx1250_mxgemm_persistent_multicast_compiles(dtype_b, block_k, cluster_
     ({"cluster_barrier_interval": 4}, True),
     ({"cluster_barrier_interval": -1}, False),
     ({"cluster_barrier_interval": 1.5}, False),
+    # Linear multicast clusters must stay within one M group (one N tile) and
+    # reach at most four CTAs.
+    ({"xcd_remap": "none", "cluster_size": 2}, True),
+    ({"xcd_remap": "none", "cluster_size": 4, "group_m": 8}, True),
+    ({"xcd_remap": "none", "cluster_size": 8, "group_m": 4}, False),
+    ({"xcd_remap": "none", "cluster_size": 8, "group_m": 8}, False),
+    ({"xcd_remap": "none", "cluster_size": 16, "group_m": 8}, False),
+    ({"xcd_remap": "none", "cluster_size": 16, "group_m": 8, "cluster_multicast": False}, True),
+    ({"xcd_remap": "none", "cluster_size": 16, "group_m": 8, "cluster_layout": "4x4"}, True),
 ])
 def test_gfx1250_mxgemm_persistent_cluster_config_validation(changes, valid):
     config = dict(M=2048, N=1024, num_programs=16, persistent=True, block_m=256, block_n=256, group_m=4,
