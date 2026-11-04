@@ -149,6 +149,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     PROPERTY CMAKE_CONFIGURE_DEPENDS
       "${CMAKE_CURRENT_SOURCE_DIR}/python/build_helpers.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/cmake/amd-llvm-info.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/meta-amd-llvm-info.json"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/amd/backend/codegen/CMakeLists.txt"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/amd/backend/codegen/amdgpu_codegen.cc"
       "${CMAKE_CURRENT_SOURCE_DIR}/include/triton/Tools/LLVMOptions.h"
