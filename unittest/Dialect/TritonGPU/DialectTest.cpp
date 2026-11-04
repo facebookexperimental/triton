@@ -13,6 +13,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "unittest/Tools/ProductLayouts.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Signals.h"
 
@@ -679,6 +680,54 @@ TEST_F(LinearEncodingTest, ProductCountsUseRadices) {
               LinearLayout::identity1D(2, s("warp"), s("dim0"));
   EXPECT_EQ(LinearEncodingTrait::getSizePerThread(pow2, {1, 1}),
             SmallVector<unsigned>({4, 1}));
+}
+
+// A 3x32 -> 96 reshape keeps every register only as the regrouped source.
+TEST_F(LinearEncodingTest, NpotReshapeKeepsRegisters) {
+  auto S = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  auto withWarpBlock = [&](LinearLayout ll) {
+    return ll * LinearLayout::identity1D(1, S("warp"), S("dim0")) *
+           LinearLayout::identity1D(1, S("block"), S("dim0"));
+  };
+  auto linear = [&](LinearLayout ll) {
+    return LinearEncodingAttr::get(&ctx, withWarpBlock(std::move(ll)));
+  };
+  auto flatLayout = [&](std::vector<std::vector<int32_t>> regBases,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> laneBases) {
+    int32_t size = 32;
+    for (int32_t radix : regRadices)
+      size *= radix;
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regBases);
+    bases[S("lane")] = std::move(laneBases);
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2};
+    return linear(LinearLayout(std::move(bases), std::move(radices),
+                               {{S("dim0"), size}},
+                               /*requireSurjective=*/true));
+  };
+  auto *inferLayout =
+      ctx.getOrLoadDialect<TritonGPUDialect>()
+          ->getRegisteredInterface<DialectInferLayoutInterface>();
+  Attribute src = linear(exactIdentity1D(3, S("register"), S("dim0")) *
+                         LinearLayout::identity1D(32, S("lane"), S("dim1")));
+  Attribute inferred;
+  ASSERT_TRUE(succeeded(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {96}, inferred, /*allowReorder=*/false, std::nullopt)));
+  Attribute flat = flatLayout({{32}}, {3}, {{1}, {2}, {4}, {8}, {16}});
+  EXPECT_EQ(inferred, flat);
+  EXPECT_FALSE(isExpensiveView({3, 32}, src, {96}, flat));
+  // Same counts and masks, lanes swapped: cheap for pow2, not for NPOT.
+  Attribute swapped = flatLayout({{32}}, {3}, {{2}, {1}, {4}, {8}, {16}});
+  EXPECT_TRUE(isExpensiveView({3, 32}, src, {96}, swapped));
+  Attribute pow2 =
+      linear(LinearLayout::identity1D(4, S("register"), S("dim0")) *
+             LinearLayout::identity1D(32, S("lane"), S("dim1")));
+  EXPECT_FALSE(isExpensiveView(
+      {4, 32}, pow2, {128},
+      flatLayout({{32}, {64}}, {2, 2}, {{2}, {1}, {4}, {8}, {16}})));
 }
 } // namespace
 } // namespace mlir::triton::gpu
