@@ -562,8 +562,8 @@ struct MemDescDynamicSubsliceOpConversion
       auto shapePerCTA = getShapePerCTA(part, allocShape);
       unsigned dim = part.getPartitionDim();
       int64_t pieceSize = shapePerCTA[dim] / part.getNumLogicalPieces();
-      Value shift = b.urem(b.udiv(layoutOffsets[dim], b.i32_val(pieceSize)),
-                           b.i32_val(part.getNumPartitions()));
+      Value pieceIndex = b.udiv(layoutOffsets[dim], b.i32_val(pieceSize));
+      Value shift = b.urem(pieceIndex, b.i32_val(part.getNumPartitions()));
       Value vector = LLVM::buildBasePtrVector(loc, rewriter, newBases);
       for (unsigned i = 0; i < newBases.size(); ++i)
         newBases[i] = b.extract_element(vector, b.xor_(shift, b.i32_val(i)));
