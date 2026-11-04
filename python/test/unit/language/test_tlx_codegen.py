@@ -7835,7 +7835,7 @@ def _compile_attention_backward_kernel(config, shape, *, compile_options=None, c
     tail_base = tail_owners = 0
     if tail_splits > 1:
         from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _tail_partition
-        tail_base, tail_owners = _tail_partition(config, b, hk, n)
+        tail_base, tail_owners = _tail_partition(config, b, hk, n, num_cus=192)
     constants.update(TAIL_SPLITS=tail_splits, TAIL_BASE=tail_base, TAIL_OWNERS=tail_owners)
     if tail_splits == 1:
         constants.update(TAIL_DK=None, TAIL_DV=None)
@@ -8424,7 +8424,18 @@ def test_attention_backward_occ1_tail_exact_round_rejected(b, hk, n):
 
     config = dataclasses.replace(_attention_backward_occ1_config(False), tail_splits=3)
     with pytest.raises(ValueError, match="nonempty dispatch tail"):
-        _tail_partition(config, b, hk, n)
+        _tail_partition(config, b, hk, n, num_cus=192)
+
+
+@pytest.mark.parametrize("num_cus,expected", [(192, (1920, 128)), (96, (2016, 32))])
+def test_attention_backward_occ1_tail_partition_num_cus(num_cus, expected):
+    import dataclasses
+
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _tail_partition
+
+    # B=16, HK=8, N=4096: 2048 KV owners; the tail is the final partial round.
+    config = dataclasses.replace(_attention_backward_occ1_config(False), tail_splits=3)
+    assert _tail_partition(config, 16, 8, 4096, num_cus=num_cus) == expected
 
 
 @pytest.mark.parametrize("shape,packed_dq,q_splits,tail_splits,convert_block", [((16, 16, 16, 2048), False, 1, 1, 4096),

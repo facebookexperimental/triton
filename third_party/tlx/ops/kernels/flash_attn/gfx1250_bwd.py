@@ -1569,15 +1569,18 @@ def _convert_outputs(DQA, DQ, DKA, DVA, DK, DV, SIZE: tl.constexpr, KV_SIZE: tl.
             tl.store(DV + partial_offsets, dv, partial_offsets < KV_SIZE)
 
 
-def _tail_partition(config, b, hk, n):
-    """Prefix/tail KV owners for the measured 192-CU occupancy-one policy."""
+def _tail_partition(config, b, hk, n, num_cus=None):
+    """Prefix/tail KV owners: the tail is the final partial round of num_cus workgroups."""
     if config.tail_splits == 1:
         return 0, 0
+    if num_cus is None:
+        num_cus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     nt = n // config.block_n
     owners = b * hk * nt
-    if not nt or 192 % nt or owners % 192 == 0:
-        raise ValueError("tail splits require NT dividing 192 and a nonempty dispatch tail")
-    return owners // 192 * 192, owners % 192
+    tail_base = owners // num_cus * num_cus
+    if not nt or tail_base == owners or tail_base % nt:
+        raise ValueError("tail splits require a nonempty dispatch tail that starts at a KV-head boundary")
+    return tail_base, owners - tail_base
 
 
 def allocate_workspace(q, k, *, config=None, packed_dq=None):
