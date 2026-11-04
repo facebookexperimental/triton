@@ -3657,12 +3657,12 @@ class TestFlexAttentionChoiceRegistration(TestCase):
         return [query, object(), object(), object(), object()] + [object() for _ in range(4)]
 
     @staticmethod
-    def _forward_config():
+    def _forward_config(block_m=128):
         return type(
             "ForwardConfig",
             (),
             {
-                "block_m": 128,
+                "block_m": block_m,
                 "block_n": 128,
                 "num_warps": 4,
                 "num_stages": 1,
@@ -3858,6 +3858,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                                 "current_target",
                                 return_value=type("Target", (), {"num_sms": 256})(),
                             ),
+                            mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_eligible",
+                                              return_value=True),
                     ):
                         flex_attention_templates.append_tlx_flex(
                             choices,
@@ -4337,6 +4339,224 @@ class TestFlexAttentionChoiceRegistration(TestCase):
             argument_names = [argument.id for argument in call.args]
             bound = utility_signature.bind(*argument_names)
             self.assertEqual("INDEX_DTYPE", bound.arguments["index_dtype"])
+
+
+@unittest.skipIf(not has_tlx(), "TLX not available")
+class TestBlackwellFlexAttentionChoices(TestCase):
+    """Blackwell forward FlexAttention candidate selection; mocked, needs no GPU."""
+
+    @staticmethod
+    def _append(configs, q_len=512, kernel_options=None, dtypes=(torch.bfloat16, ) * 3, is_blackwell=True, tma=True,
+                sparse_sizes=(128, 128)):
+        """TLX choices appended for a (2, 8, q_len, 128) query against 512-row keys and values."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        registration = TestFlexAttentionChoiceRegistration
+        qkv = [registration._Node([2, 8, rows, 128], dtype) for rows, dtype in zip((q_len, 512, 512), dtypes)]
+        target = type("Target", (), {"num_sms": 148, "is_blackwell": is_blackwell})()
+        choices = []
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=False),
+                mock.patch.object(flex_attention_templates, "blackwell_flex_attention_template",
+                                  registration._Template()),
+                mock.patch.object(flex_attention_templates, "current_target", return_value=target),
+                mock.patch("torch._inductor.utils.can_use_tma", return_value=tma),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                configs,
+                qkv + [object() for _ in range(6)],
+                [object(), object()],
+                object(),
+                kernel_options or {},
+                *sparse_sizes,
+            )
+        return choices
+
+    def test_block_m_selects_mma_groups(self):
+        """BLOCK_M 64 runs one MMA group, larger tiles two; short queries cap BLOCK_M at 64."""
+
+        def appended(q_len, block_ms, kernel_options=None):
+            configs = [TestFlexAttentionChoiceRegistration._forward_config(block_m) for block_m in block_ms]
+            return [(c["BLOCK_M"], c["NUM_MMA_GROUPS"]) for c in self._append(configs, q_len, kernel_options)]
+
+        self.assertEqual([(128, 2)], appended(512, [128]))
+        self.assertEqual([(64, 1)], appended(512, [64]))
+        self.assertEqual([], appended(512, [32]))
+        self.assertEqual([(64, 1)], appended(64, [128, 64]))
+        self.assertEqual([(128, 2)], appended(65, [128]))
+        self.assertEqual([(128, 2)], appended(64, [128], {"fwd_BLOCK_M": 128}))
+
+    def test_ineligible_inputs_add_no_candidate(self):
+        """TLX needs Blackwell, one bf16/fp16 dtype, TMA-compatible inputs, and tiles dividing the sparse blocks."""
+        configs = [TestFlexAttentionChoiceRegistration._forward_config(64)]
+        self.assertEqual(1, len(self._append(configs)))
+        fp8 = torch.float8_e4m3fn
+        for case, kwargs in (
+            ("not blackwell", {"is_blackwell": False}),
+            ("fp8", {"dtypes": (fp8, fp8, fp8)}),
+            ("fp32", {"dtypes": (torch.float32, ) * 3}),
+            ("fp8 kv", {"dtypes": (torch.bfloat16, fp8, fp8)}),
+            ("no tma", {"tma": False}),
+            ("sparse q", {"sparse_sizes": (32, 128)}),
+            ("sparse kv", {"sparse_sizes": (128, 64)}),
+        ):
+            with self.subTest(case):
+                self.assertEqual([], self._append(configs, **kwargs))
+
+    def test_num_stages_variants_share_one_candidate(self):
+        """TLX skips Triton software pipelining, so num_stages does not change the kernel."""
+        configs = [TestFlexAttentionChoiceRegistration._forward_config() for _ in range(2)]
+        configs[0].num_stages, configs[1].num_stages = 2, 3
+        self.assertEqual([1], [c["num_stages"] for c in self._append(configs)])
+
+
+@instantiate_parametrized_tests
+class TestBlackwellFlexAttention(TestCase):
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_choices_hook_available(),
+        "torch lacks append_flex_attention_choices",
+    )
+    @parametrize("block_m", (64, 128))
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_fully_masked_rows(self, block_m, dtype):
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        q = torch.randn(1, 2, block_m, 80, device=GPU_TYPE, dtype=dtype)
+        k = torch.randn(1, 2, 128, 80, device=GPU_TYPE, dtype=dtype)
+        v = torch.randn_like(k)
+        block_mask = create_block_mask(lambda b, h, m, n: m % 64 < 32, 1, 1, block_m, 128, device=GPU_TYPE)
+
+        def attention(q, k, v):
+            return flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                return_lse=True,
+                kernel_options={
+                    "FORCE_USE_FLEX_ATTENTION": True,
+                    "fwd_BLOCK_M": block_m,
+                    "fwd_BLOCK_N": 64,
+                },
+            )
+
+        patches = {"force_disable_caches": True, "max_autotune": False}
+        with config.patch({**patches, "triton.tlx_mode": None}):
+            expected = torch.compile(attention, dynamic=False)(q, k, v)
+        torch._dynamo.reset()
+        with config.patch({**patches, "triton.tlx_mode": "force"}):
+            (out, lse), code = run_and_get_code(torch.compile(attention, dynamic=False), q, k, v)
+
+        self.assertIn("tlx.async_dot", "\n".join(code))
+        torch.testing.assert_close((out, lse), expected, atol=1e-2, rtol=1e-2)
+        masked_rows = torch.arange(block_m, device=GPU_TYPE) % 64 >= 32
+        self.assertEqual(out[:, :, masked_rows], torch.zeros_like(out[:, :, masked_rows]))
+        self.assertTrue(torch.isneginf(lse[:, :, masked_rows]).all())
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_choices_hook_available(),
+        "torch lacks append_flex_attention_choices",
+    )
+    @parametrize("block_m", (64, 128))
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_empty_query_tiles(self, block_m, dtype):
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        heads = current_target().num_sms
+        q = torch.randn(2, heads, 256, 80, device=GPU_TYPE, dtype=dtype)
+        k = torch.randn(2, heads, 128, 80, device=GPU_TYPE, dtype=dtype)
+        v = torch.ones_like(k)
+        all_tiles = torch.tensor(False, device=GPU_TYPE)
+
+        def mask_mod(b, h, m, n):
+            return all_tiles | ((b == 0) & (m < 128))
+
+        block_mask = create_block_mask(mask_mod, 2, 1, 256, 128, device=GPU_TYPE)
+        all_tiles.fill_(True)
+        full_mask = create_block_mask(mask_mod, 2, 1, 256, 128, device=GPU_TYPE)
+        all_tiles.fill_(False)
+
+        def attention(q, k, v, block_mask):
+            return flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                return_lse=True,
+                kernel_options={
+                    "FORCE_USE_FLEX_ATTENTION": True,
+                    "fwd_BLOCK_M": block_m,
+                    "fwd_BLOCK_N": 64,
+                },
+            )
+
+        patches = {"force_disable_caches": True, "max_autotune": False}
+        with config.patch({**patches, "triton.tlx_mode": None}):
+            expected = torch.compile(attention, dynamic=False)(q, k, v, block_mask)
+        torch._dynamo.reset()
+        with config.patch({**patches, "triton.tlx_mode": "force"}):
+            compiled = torch.compile(attention, dynamic=False)
+            all_tiles.fill_(True)
+            _, code = run_and_get_code(compiled, q, k, v, full_mask)
+            all_tiles.fill_(False)
+            out, lse = compiled(q, k, v, block_mask)
+
+        self.assertIn("tlx.async_dot", "\n".join(code))
+        torch.testing.assert_close((out, lse), expected, atol=1e-2, rtol=1e-2)
+        empty_out = torch.cat((out[0, :, 128:].flatten(), out[1].flatten()))
+        empty_lse = torch.cat((lse[0, :, 128:].flatten(), lse[1].flatten()))
+        self.assertEqual(empty_out, torch.zeros_like(empty_out))
+        self.assertTrue(torch.isneginf(empty_lse).all())
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_choices_hook_available(),
+        "torch lacks append_flex_attention_choices",
+    )
+    @parametrize("head_dim,mask_block", ((100, 128), (64, 32)))
+    def test_force_keeps_stock_for_ineligible_inputs(self, head_dim, mask_block):
+        """A head dim TMA cannot address, or a mask block finer than the TLX tile, keeps the stock kernel."""
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(1, 2, 256, head_dim, device=GPU_TYPE, dtype=torch.bfloat16) for _ in range(3))
+        block_mask = create_block_mask(lambda b, h, m, n: m >= n, 1, 1, 256, 256, device=GPU_TYPE,
+                                       BLOCK_SIZE=mask_block)
+
+        def attention(q, k, v):
+            return flex_attention(q, k, v, block_mask=block_mask)
+
+        patches = {"force_disable_caches": True, "max_autotune": False}
+        with config.patch({**patches, "triton.tlx_mode": None}):
+            expected = torch.compile(attention, dynamic=False)(q, k, v)
+        torch._dynamo.reset()
+        with config.patch({**patches, "triton.tlx_mode": "force"}):
+            out, code = run_and_get_code(torch.compile(attention, dynamic=False), q, k, v)
+
+        self.assertNotIn("tlx.async_dot", "\n".join(code))
+        self.assertEqual(out, expected)
 
 
 @instantiate_parametrized_tests
