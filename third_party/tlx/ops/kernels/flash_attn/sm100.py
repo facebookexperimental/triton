@@ -916,7 +916,8 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     m += tl.math.log2(l)
                     offs_m = start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
-                    tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
+                    # The last M-block can run past N_CTX; its rows would land in the next head.
+                    tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]), mask=offs_m < N_CTX)
 
                     tlx.barrier_wait(acc_empties[cid], phase)
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
@@ -1250,7 +1251,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
             clc_phase_consumer = 0
             while tile_id != -1:
                 # initialize offsets
-                _, _, _, _, qo_offset_y, _ = _compute_offsets(
+                start_m, _, _, _, qo_offset_y, _ = _compute_offsets(
                     tile_id // NUM_CTAS,
                     H,
                     num_pid_n,
@@ -1264,9 +1265,12 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                 for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
                     group_id = cid * NUM_CTAS + cluster_cta_rank
                     tlx.barrier_wait(o_fulls[cid], phase)
-                    qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
-                    tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
-                    tlx.async_descriptor_store_wait(0)
+                    # desc_o flattens (Z, H, N_CTX), so a group past N_CTX would overwrite the next
+                    # head's rows. N_CTX % BLOCK_M_SPLIT == 0, so a group is either fully in or fully out.
+                    if start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT < N_CTX:
+                        qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
+                        tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
+                        tlx.async_descriptor_store_wait(0)
                     tlx.barrier_arrive(o_empties[cid])
 
                 tile_count += 1
