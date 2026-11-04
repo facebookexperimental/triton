@@ -426,10 +426,11 @@ public:
   static std::optional<LinearLayout>
   tryCreate(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
             bool requireSurjective);
+  // On failure, sets `*diagnostic` to the checkInvariants message.
   static std::optional<LinearLayout>
   tryCreate(BasesT bases, RadicesT inputRadices,
             ArrayRef<std::pair<StringAttr, int32_t>> outDims,
-            bool requireSurjective);
+            bool requireSurjective, std::string *diagnostic = nullptr);
 
   // Construct a LinearLayout from an explicit list of bases.  (This constructor
   // is needed because llvm::MapVector does not have a constructor that accepts

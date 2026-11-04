@@ -126,12 +126,14 @@ LinearLayout::tryCreate(BasesT bases,
 /*static*/ std::optional<LinearLayout>
 LinearLayout::tryCreate(BasesT bases, RadicesT inputRadices,
                         ArrayRef<std::pair<StringAttr, int32_t>> outDims,
-                        bool requireSurjective) {
+                        bool requireSurjective, std::string *diagnostic) {
   LinearLayout ll(std::move(bases), std::move(inputRadices), outDims,
                   NoCheckInvariants{});
   std::optional<std::string> error =
       ll.checkInvariants(requireSurjective, /*allowProductSizes=*/true);
   if (error) {
+    if (diagnostic)
+      *diagnostic = *error;
     return std::nullopt;
   }
   return ll;

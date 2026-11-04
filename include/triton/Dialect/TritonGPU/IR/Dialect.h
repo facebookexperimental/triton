@@ -193,6 +193,10 @@ bool isPermutationMatrixLayout(const LinearLayout &ll);
 // swizzling or a slice or DotOp of one of these.
 bool isGenericLinearEncoding(Attribute attr);
 
+// Returns whether every nested Linear/GenericLinear encoding has only radix-2
+// input digits. No other encoding parses other radices.
+bool isRadix2Encoding(Attribute layout);
+
 // Create a GenericLinearEncoding if the source isGenericLinearEncoding, and a
 // LinearEncoding otherwise.
 Attribute inferEncodingFromLinearLayout(MLIRContext *ctx, LinearLayout ll,
