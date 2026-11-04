@@ -948,6 +948,66 @@ getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
   return encoding;
 }
 
+FailureOr<LinearEncodingAttr>
+getProductEncoding(MLIRContext *context, ArrayRef<int64_t> shape, int numWarps,
+                   int threadsPerWarp, int numCTAs, unsigned vector,
+                   ArrayRef<unsigned> order) {
+  if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") ||
+      llvm::all_of(shape, llvm::isPowerOf2_64))
+    return failure();
+  auto twoParts = llvm::map_to_vector(shape, [](int64_t size) -> int64_t {
+    return LinearLayout::twoPartOf(size);
+  });
+  SmallVector<unsigned> blockedOrder(order);
+  if (blockedOrder.empty())
+    blockedOrder =
+        llvm::to_vector(llvm::reverse(llvm::seq<unsigned>(shape.size())));
+  SmallVector<unsigned> sizePerThread(shape.size(), 1);
+  sizePerThread[blockedOrder[0]] = vector;
+  auto blocked =
+      BlockedEncodingAttr::get(context, twoParts, sizePerThread, blockedOrder,
+                               numWarps, threadsPerWarp, numCTAs);
+  LinearLayout layout = toLinearLayout(twoParts, blocked);
+  auto kRegister = StringAttr::get(context, "register");
+  SmallVector<StringAttr> dims = standardOutDimNames(context, shape.size());
+  for (unsigned dim : llvm::seq<unsigned>(shape.size())) {
+    int64_t odd = shape[dim] / twoParts[dim];
+    if (odd == 1)
+      continue;
+    LinearLayout::BasesT bases;
+    bases[kRegister] = {{1}};
+    LinearLayout::RadicesT radices;
+    radices[kRegister] = {static_cast<int32_t>(odd)};
+    layout *= LinearLayout(std::move(bases), std::move(radices),
+                           {{dims[dim], odd}}, /*requireSurjective=*/true);
+  }
+  if (!hasProductConversionInputDims(layout))
+    return failure();
+  return LinearEncodingAttr::get(context, std::move(layout));
+}
+
+unsigned getProductVector(MLIRContext *context, ArrayRef<int64_t> shape,
+                          unsigned vector, ArrayRef<unsigned> order,
+                          int numWarps, int threadsPerWarp) {
+  assert(llvm::isPowerOf2_32(vector) && "vector must be a power of two");
+  auto kRegister = StringAttr::get(context, "register");
+  auto registers =
+      [&](unsigned v,
+          ArrayRef<unsigned> vectorOrder) -> std::optional<int32_t> {
+    auto product = getProductEncoding(context, shape, numWarps, threadsPerWarp,
+                                      /*numCTAs=*/1, v, vectorOrder);
+    if (failed(product))
+      return std::nullopt;
+    return product->getLinearLayout().getInDimSize(kRegister);
+  };
+  std::optional<int32_t> admitted = registers(1, {});
+  if (!admitted)
+    return vector;
+  while (vector > 1 && registers(vector, order) > admitted)
+    vector /= 2;
+  return vector;
+}
+
 static LogicalResult tryJoinOnAxis(MLIRContext *ctx, const LinearLayout &inLl,
                                    LinearLayout &outLl, bool fwdInference,
                                    int axis, std::optional<Location> loc) {

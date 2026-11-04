@@ -505,7 +505,8 @@ def TT_UnsplatOp
 def TT_ExpandDimsOp
     : TT_Op<"expand_dims", [Pure,
                             DeclareOpInterfaceMethods<InferTypeOpInterface>,
-                            SameOperandsAndResultElementType]> {
+                            SameOperandsAndResultElementType,
+                            ProductLayoutOpInterface]> {
   let summary = "expand_dims";
 
   let arguments = (ins TT_Tensor:$src, I32Attr:$axis);
@@ -549,7 +550,8 @@ def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType,
 }
 
 def TT_BroadcastOp : TT_Op<"broadcast", [Pure, SameOperandsAndResultElementType,
-                                         SameOperandsAndResultEncoding]> {
+                                         SameOperandsAndResultEncoding,
+                                         ProductLayoutOpInterface]> {
   let summary = "broadcast a tensor";
 
   let description = [{

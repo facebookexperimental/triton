@@ -460,6 +460,21 @@ triton::gpu::BlockedEncodingAttr
 getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
                           int numWarps, int threadsPerWarp, int numCTAs);
 
+// Under TRITON_ALLOW_NPOT, an NPOT `shape`'s Product layout with `vector`
+// elements along order[0] (default the last dim) and odd digits slowest. Fails
+// if pow2 or CTAs > 1.
+FailureOr<LinearEncodingAttr>
+getProductEncoding(MLIRContext *context, ArrayRef<int64_t> shape, int numWarps,
+                   int threadsPerWarp, int numCTAs, unsigned vector = 1,
+                   ArrayRef<unsigned> order = {});
+
+// The widest pow2 vector up to the pow2 `vector` along order[0] whose Product
+// layout of `shape` holds no more registers than the converter's layout (no
+// vector); `vector` unchanged if `shape` has no Product layout.
+unsigned getProductVector(MLIRContext *context, ArrayRef<int64_t> shape,
+                          unsigned vector, ArrayRef<unsigned> order,
+                          int numWarps, int threadsPerWarp);
+
 // Dump information about which threads/registers contain each of the tensor
 // elements.
 void dumpLayout(RankedTensorType tensorType);
