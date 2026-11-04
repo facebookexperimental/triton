@@ -305,6 +305,36 @@ Value emitRedundantThreadPredicate(
 
 } // namespace triton::gpu
 
+// XORs into `outIndices` the image of `ins` digit by digit. Only radix-2
+// digits have a nonzero basis, and digit i of a dim has weight equal to the
+// product of the radices below it.
+static void
+applyMixedRadixLayout(TritonLLVMOpBuilder &b, const LinearLayout &layout,
+                      ArrayRef<std::pair<StringAttr, Value>> ins,
+                      SmallVector<std::pair<StringAttr, Value>> &outIndices) {
+  Value zero = b.i32_val(0);
+  for (auto [inDim, idx] : ins) {
+    int32_t weight = 1;
+    for (auto [digit, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
+      ArrayRef<int32_t> basis = layout.getBasis(inDim, digit);
+      if (llvm::any_of(basis, [](int32_t v) { return v != 0; })) {
+        Value quotient = idx;
+        if (llvm::isPowerOf2_32(weight) && weight > 1)
+          quotient = b.lshr(idx, b.i32_val(llvm::Log2_32(weight)));
+        else if (weight > 1)
+          quotient = b.udiv(idx, b.i32_val(weight));
+        Value isZero = b.icmp_eq(b.and_(quotient, b.i32_val(1)), zero);
+        for (auto [outIdx, value] : llvm::zip(outIndices, basis)) {
+          if (value != 0)
+            outIdx.second =
+                b.xor_(outIdx.second, b.select(isZero, zero, b.i32_val(value)));
+        }
+      }
+      weight *= radix;
+    }
+  }
+}
+
 SmallVector<std::pair<StringAttr, Value>>
 applyLinearLayout(Location loc, RewriterBase &rewriter,
                   const LinearLayout &layout,
@@ -349,6 +379,12 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   }
 
   if (nonConstantIns.size() == 0) {
+    return outIndices;
+  }
+
+  // The shift-concatenation below needs every input digit to be radix 2.
+  if (!layout.isRadix2()) {
+    applyMixedRadixLayout(b, layout, nonConstantIns, outIndices);
     return outIndices;
   }
 
