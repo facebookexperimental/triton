@@ -228,6 +228,7 @@ public:
     // must fail the conversion instead of leaving the op behind. The rest of
     // the dialect stays unmarked: some of it is lowered later.
     addIllegalOp<triton::amdgpu::ScheduledMfmaOp>();
+    addIllegalOp<triton::amdgpu::ScheduledMfmaScaledOp>();
     addIllegalOp<triton::amdgpu::MfmaCommitOp>();
   }
 };

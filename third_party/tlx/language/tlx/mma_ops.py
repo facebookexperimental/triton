@@ -331,6 +331,55 @@ def amd_scheduled_mfma(
 
 
 @tl.builtin
+def amd_scheduled_mfma_scaled(
+    a,
+    b,
+    acc,
+    a_scale,
+    b_scale,
+    a_format: tl.constexpr,
+    b_format: tl.constexpr,
+    initialize: tl.constexpr = False,
+    _semantic=None,
+):
+    """Update native CDNA4 scaled-MFMA fragments from packed FP6 operands.
+
+    Scaled twin of :func:`amd_scheduled_mfma` for microscaling formats: ``a`` and ``b`` are
+    i8 tensors with logical-value shapes (per lane, the first 24 of every
+    32 K-ordered values are dense-packed code bytes (32/24/16 per step for FP8/FP6/FP4) and the rest zero
+    padding) in opIdx 0/1 dot-operand layouts with ``kWidth`` 8 under an
+    ``amd_mfma_layout`` with instruction shape 16x16x128 or 32x32x64, and
+    ``a_scale``/``b_scale`` are i8 E8M0 tensors of shape [M, logicalK/32] and
+    [N, logicalK/32] in MFMA scale layout order. ``a_format``/``b_format`` are
+    ``"e2m3"`` or ``"e3m2"``. Lowers to native ``v_mfma_scale_f32_*_f8f6f4``
+    ROCDL intrinsics in K-major, N-major, M-minor order with one SSA chain
+    per output fragment. Transient only: use :func:`amd_mfma_commit` for
+    explicit completion boundaries, as with ``amd_scheduled_mfma``.
+    """
+    a_format = tl._unwrap_if_constexpr(a_format)
+    b_format = tl._unwrap_if_constexpr(b_format)
+    initialize = tl._unwrap_if_constexpr(initialize)
+    _formats = ("e4m3", "e5m2", "e2m3", "e3m2", "e2m1")
+    assert a_format in _formats, f"a_format must be one of {_formats}, got {a_format!r}"
+    assert b_format in _formats, f"b_format must be one of {_formats}, got {b_format!r}"
+    assert isinstance(initialize, bool), "initialize must be a constexpr bool"
+    handle = _semantic.builder.create_amd_scheduled_mfma_scaled(
+        a.handle,
+        b.handle,
+        acc.handle,
+        a_scale.handle,
+        b_scale.handle,
+        a_format,
+        b_format,
+        "none",
+        "transient",
+        "auto",
+        initialize,
+    )
+    return tl.tensor(handle, acc.type)
+
+
+@tl.builtin
 def amd_mfma_commit(value, preserve=None, _semantic=None):
     """Apply an MFMA completion boundary and return every value unchanged.
 
