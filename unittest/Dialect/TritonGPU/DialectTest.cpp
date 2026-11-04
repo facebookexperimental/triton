@@ -728,6 +728,34 @@ TEST_F(LinearEncodingTest, NpotReshapeKeepsRegisters) {
   EXPECT_FALSE(isExpensiveView(
       {4, 32}, pow2, {128},
       flatLayout({{32}, {64}}, {2, 2}, {{2}, {1}, {4}, {8}, {16}})));
+  // A regroup wins over a given result; 3x32 -> 32x3 has none, so a given
+  // result is kept and inference without one fails.
+  Attribute given = swapped;
+  ASSERT_TRUE(succeeded(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {96}, given, /*allowReorder=*/false, std::nullopt)));
+  EXPECT_EQ(given, flat);
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{0, 1}};
+  bases[S("lane")] = {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {3};
+  radices[S("lane")] = {2, 2, 2, 2, 2};
+  Attribute moved = linear(LinearLayout(std::move(bases), std::move(radices),
+                                        {{S("dim0"), 32}, {S("dim1"), 3}},
+                                        /*requireSurjective=*/true));
+  given = moved;
+  ASSERT_TRUE(succeeded(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {32, 3}, given, /*allowReorder=*/false, std::nullopt)));
+  EXPECT_EQ(given, moved);
+  std::string error;
+  ScopedDiagnosticHandler handler(
+      &ctx, [&](Diagnostic &diag) { error = diag.str(); });
+  Attribute none;
+  EXPECT_TRUE(failed(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {32, 3}, none, /*allowReorder=*/false,
+      UnknownLoc::get(&ctx))));
+  EXPECT_EQ(error, "inferring a result layout for an NPOT reshape that "
+                   "moves elements between threads is not yet supported");
 }
 } // namespace
 } // namespace mlir::triton::gpu

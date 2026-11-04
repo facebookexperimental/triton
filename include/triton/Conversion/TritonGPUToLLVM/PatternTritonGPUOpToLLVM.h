@@ -50,6 +50,7 @@ void populateMakeRangeOpToLLVMPattern(LLVMTypeConverter &typeConverter,
 
 void populateViewOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                   RewritePatternSet &patterns,
+                                  const TargetInfoBase &targetInfo,
                                   PatternBenefit benefit);
 
 void populateMinMaxFOpToLLVMPattern(LLVMTypeConverter &typeConverter,

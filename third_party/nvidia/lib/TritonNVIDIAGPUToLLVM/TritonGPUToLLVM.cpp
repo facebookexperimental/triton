@@ -537,7 +537,8 @@ void ConvertTritonGPUToLLVM::populateConversionPatterns(
   mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
   mlir::populateGpuToNVVMConversionPatterns(typeConverter, patterns);
   mlir::ub::populateUBToLLVMConversionPatterns(typeConverter, patterns);
-  mlir::triton::populateViewOpToLLVMPatterns(typeConverter, patterns, benefit);
+  mlir::triton::populateViewOpToLLVMPatterns(typeConverter, patterns,
+                                             targetInfo, benefit);
   mlir::triton::populateAssertOpToLLVMPattern(typeConverter, patterns,
                                               targetInfo, benefit);
   mlir::triton::NVIDIA::populateMemoryOpToLLVMPatterns(

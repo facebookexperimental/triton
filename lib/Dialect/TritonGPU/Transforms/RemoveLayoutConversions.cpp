@@ -3043,7 +3043,7 @@ struct PruneLocalStoreOfReshapeConvert : public OpRewritePattern<LocalStoreOp> {
       return failure();
     if (failed(layoutInterface->inferReshapeOpEncoding(
             srcType.getShape(), srcType.getEncoding(), storeSrcType.getShape(),
-            reshapeEncoding, /*allowReorder=*/false, store.getLoc())))
+            reshapeEncoding, /*allowReorder=*/false, /*loc=*/std::nullopt)))
       return failure();
 
     auto reshapeType =

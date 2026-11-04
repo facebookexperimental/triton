@@ -270,10 +270,10 @@ SmallVector<unsigned> getContigPerThread(RankedTensorType type) {
 bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
                      ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
   auto llSrc = toLinearLayout(srcShape, srcEncoding);
-  auto llDst = toLinearLayout(dstShape, dstEncoding);
   // An NPOT view keeps its registers only as the regrouped source.
   if (llSrc.hasNonBinaryCarrier())
-    return tryReshapeLayout(srcEncoding.getContext(), llSrc, dstShape) != llDst;
+    return isNpotSharedReshape(srcShape, srcEncoding, dstShape, dstEncoding);
+  auto llDst = toLinearLayout(dstShape, dstEncoding);
   // In case there are replicated value we need to make sure the new and old
   // layout have matching masks.
   for (auto [srcMask, dstMask] :
@@ -284,6 +284,14 @@ bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
   }
   return getTotalElemsPerThread(srcEncoding, srcShape) !=
          getTotalElemsPerThread(dstEncoding, dstShape);
+}
+
+bool isNpotSharedReshape(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
+                         ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
+  auto src = toLinearLayout(srcShape, srcEncoding);
+  return src.hasNonBinaryCarrier() &&
+         tryReshapeLayout(srcEncoding.getContext(), src, dstShape) !=
+             toLinearLayout(dstShape, dstEncoding);
 }
 
 /* Utility function used by get.*Order methods of SliceEncodingAttr.
@@ -4115,6 +4123,13 @@ struct TritonGPUInferLayoutInterface
         dstEnc = inferEncodingFromLinearLayout(ctx, std::move(*dst), srcEnc);
         return success();
       }
+      // Otherwise a given destination is kept and the reshape moves elements
+      // through shared memory.
+      if (dstEnc)
+        return success();
+      return emitOptionalError(loc, "inferring a result layout for an NPOT "
+                                    "reshape that moves elements between "
+                                    "threads is not yet supported");
     }
     LinearLayout ll =
         inferReshapeLinearLayout(cast<TensorOrMemDesc>(srcTy), dstShape);
