@@ -1,0 +1,133 @@
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt --split-input-file %s --verify-diagnostics
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[1, 0]]>
+#tmem_space = #ttng.tensor_memory
+module attributes {"ttg.num-ctas" = 2 : i32} {
+  tt.func @multi_cta_physical_cover() {
+    // expected-error @+1 {{NPOT memdesc physical cover with multiple CTAs is not yet supported}}
+    %0 = ttng.tmem_alloc : () -> !ttg.memdesc<256x96xf32, #tmem, #tmem_space, mutable, 256x128>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
+#smem = #ttg.shared_memory
+// A register encoding has no physical cover.
+// expected-error @below {{shape must have power-of-2 and non-zero dimensions; got 8, 96}}
+!not_a_cover = !ttg.memdesc<8x96xf32, #blocked, #smem, mutable, 8x128>
+module {
+}
+
+// -----
+
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module {
+  // A view that passes the power-of-two shape test keeps the flag-off contract.
+  tt.func @pot_view_is_not_a_cover() {
+    // expected-error @+1 {{result shape and its alloc shape must match}}
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<48x64xf16, #nvmma, #smem, mutable, 64x64>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module {
+  tt.func @allocation_rank_mismatch() {
+    // expected-error @+1 {{NPOT memdesc with different logical and physical allocation ranks is not yet supported}}
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<8x48xi8, #shared, #smem, mutable, 2x3x8x64>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 1, order = [2, 1, 0]}>
+#smem = #ttg.shared_memory
+module {
+  tt.func @rank_three_cover() {
+    // expected-error @+1 {{NPOT memdesc physical cover with a layout rank other than 2 is not yet supported}}
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<2x8x48xi8, #shared, #smem, mutable, 2x8x64>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module {
+  tt.func @indexed_cover_suffix_is_valid(
+      %arg0: !ttg.memdesc<2x8x48xi8, #shared, #smem, mutable, 2x8x64>) {
+    %zero = arith.constant 0 : i32
+    %view = ttg.memdesc_index %arg0[%zero]
+        : !ttg.memdesc<2x8x48xi8, #shared, #smem, mutable, 2x8x64>
+          -> !ttg.memdesc<8x48xi8, #shared, #smem, mutable, 8x64>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module {
+  tt.func @indexed_cover_keeps_its_allocation(
+      %arg0: !ttg.memdesc<2x8x48xi8, #shared, #smem, mutable, 2x8x64>) {
+    %zero = arith.constant 0 : i32
+    // expected-error @+1 {{alloc shape must match shape for the result}}
+    %view = ttg.memdesc_index %arg0[%zero]
+        : !ttg.memdesc<2x8x48xi8, #shared, #smem, mutable, 2x8x64>
+          -> !ttg.memdesc<8x48xi8, #shared, #smem, mutable, 3x8x64>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+// A view of fewer buffers than its allocation.
+// expected-error @below {{NPOT memdesc allocation that does not match the encoding's physical cover is not yet supported}}
+!buffer_prefix_mismatch = !ttg.memdesc<2x8x48xi8, #shared, #smem, mutable, 3x8x64>
+module {
+}
+
+// -----
+
+#rotating = #ttg.amd_rotating_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+// Upstream getAllocationShapePerCTA rounds a swizzled_shared tile up to its
+// 4x64 cover but not an amd_rotating one, so this 3x64 allocation is too small.
+// expected-error @below {{NPOT memdesc allocation that does not match the encoding's physical cover is not yet supported}}
+!leading_npot_unpadded = !ttg.memdesc<3x48xi8, #rotating, #smem, mutable, 3x64>
+module {
+}
+
+// -----
+
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
+#smem = #ttg.shared_memory
+// The 4x128 cover is smaller than the 8x128 NVMMA core tile.
+// expected-error @below {{NPOT memdesc allocation that does not match the encoding's physical cover is not yet supported}}
+!nvmma_cover_below_core_tile = !ttg.memdesc<3x96xi8, #nvmma, #smem, mutable, 3x128>
+module {
+}
+
+// -----
+
+// A CTA split of an NPOT extent is also checked on a subslice's allocation.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0], [2, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @swizzled_subslice_of_extent6_split4(%arg0: !ttg.memdesc<6x64xf16, #shared, #smem, mutable>) {
+    // expected-error @+1 {{NPOT memdesc extent split across CTAs is not yet supported}}
+    %0 = ttg.memdesc_subslice %arg0 [0, 0] : !ttg.memdesc<6x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<2x64xf16, #shared, #smem, mutable, 6x64>
+    tt.return
+  }
+}

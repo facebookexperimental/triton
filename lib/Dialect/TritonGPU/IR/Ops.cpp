@@ -844,6 +844,8 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 }
 
 LogicalResult MemDescReinterpretOp::verify() {
+  if (failed(verifyNpotCoverOperands(*this)))
+    return failure();
   auto srcTy = getSrc().getType();
   auto dstTy = getType();
 
@@ -1086,7 +1088,7 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 }
 
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy) {
-  if (dstTy.getShape() != dstTy.getAllocShape())
+  if (dstTy.getShape() != dstTy.getAllocShape() && !isNpotPhysicalCover(dstTy))
     return op->emitOpError("result shape and its alloc shape must match");
 
   if (!src) {
@@ -1459,8 +1461,10 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("result shape must equal to srcShape[1:]");
   }
 
-  if (dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding()) !=
-      layoutShape) {
+  auto layoutAllocShape =
+      dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding());
+  bool hasPhysicalCover = isNpotPhysicalCover(srcTy);
+  if (layoutAllocShape != layoutShape && !hasPhysicalCover) {
     return emitError(
         "We only support memdesc_index of a multibuffer-prefix subview");
   }
@@ -1475,7 +1479,8 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("src and dst must have the same type of encoding");
   }
 
-  if (dstTy.getAllocShape() != dstTy.getShape()) {
+  if (dstTy.getAllocShape() !=
+      (hasPhysicalCover ? layoutAllocShape : dstTy.getShape())) {
     return emitError("alloc shape must match shape for the result");
   }
 
