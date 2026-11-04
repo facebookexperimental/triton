@@ -457,3 +457,24 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
     tt.return
   }
 }
+
+// -----
+
+#a = #ttg.linear<{register = [[0, 32], [1, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [3, 64]}>
+#b = #ttg.linear<{register = [[32, 0], [0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [64, 3]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A Product transpose keeps every register in place.
+  // CHECK: module attributes {{.*}}ttg.shared = 0 : i32
+  // CHECK-LABEL: llvm.func @product_transpose
+  // CHECK-NOT: nvvm.shfl
+  // CHECK-NOT: nvvm.barrier
+  // CHECK: llvm.return
+  tt.func public @product_transpose(%p: !tt.ptr<f32>) {
+    %s = tt.splat %p : !tt.ptr<f32> -> tensor<3x64x!tt.ptr<f32>, #a>
+    %v = tt.load %s : tensor<3x64x!tt.ptr<f32>, #a>
+    %t = tt.trans %v {order = array<i32: 1, 0>} : tensor<3x64xf32, #a> -> tensor<64x3xf32, #b>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<64x3x!tt.ptr<f32>, #b>
+    tt.store %d, %t : tensor<64x3x!tt.ptr<f32>, #b>
+    tt.return
+  }
+}
