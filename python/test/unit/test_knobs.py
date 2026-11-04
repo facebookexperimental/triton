@@ -72,14 +72,16 @@ def test_knobs_utils(fresh_knobs) -> None:
 
 
 # Beta enables expert scheduling on gfx1250 by default; upstream does not.
-@pytest.mark.parametrize(("arch", "enable_fp_fusion", "disable_opt", "expected_flags", "disable_optimization"), [
-    ("gfx90a", True, None, [], False),
-    ("gfx942", False, "1", ["amdgpu-use-amdgpu-trackers"], True),
-    ("gfx950", True, "disable-lsr", ["amdgpu-use-amdgpu-trackers"], False),
-    ("gfx1250", True, "0", ["amdgpu-anti-hints-for-va-vdst", "amdgpu-expert-scheduling-mode"], False),
-])
-def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags, disable_optimization, fresh_knobs,
-                             monkeypatch):
+@pytest.mark.parametrize(
+    ("arch", "enable_fp_fusion", "disable_opt", "expected_flags", "disable_optimization", "extra_options"), [
+        ("gfx90a", True, None, [], False, {}),
+        ("gfx942", False, "1", ["amdgpu-use-amdgpu-trackers"], True, {}),
+        ("gfx950", True, "disable-lsr", ["amdgpu-use-amdgpu-trackers"], False, {}),
+        ("gfx1250", True, "0", ["amdgpu-anti-hints-for-va-vdst", "amdgpu-expert-scheduling-mode"], False, {}),
+        ("gfx1250", True, "0", ["amdgpu-expert-scheduling-mode"], False, {"va_vdst_anti_hints": False}),
+    ])
+def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags, disable_optimization, extra_options,
+                             fresh_knobs, monkeypatch):
     from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
@@ -97,7 +99,7 @@ def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags
 
     warp_size = 32 if arch == "gfx1250" else 64
     backend = compiler.HIPBackend(GPUTarget("hip", arch, warp_size))
-    options = compiler.HIPOptions(arch=arch, enable_fp_fusion=enable_fp_fusion)
+    options = compiler.HIPOptions(arch=arch, enable_fp_fusion=enable_fp_fusion, **extra_options)
     source = "define amdgpu_kernel void @test_kernel() { ret void }"
     metadata = {}
     assembly = backend.make_amdgcn(source, metadata, options)
