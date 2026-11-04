@@ -117,10 +117,10 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn",
-    "flash_attn_mxfp8", "flash_attn_varlen", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn",
-    "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward",
-    "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec",
-    "Space"
+    "flash_attn_mxfp8", "flash_attn_varlen", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
+    "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
+    "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -883,6 +883,64 @@ def swiglu_ffn(x, norm_weight, w1, w2, w3, *, eps=1e-5, space=None):
     _check_enforced("swiglu_ffn", spec, invariance)
     with torch.cuda.device(x.device):
         return fn(x, norm_weight.reshape(d_model), w1, w2, w3, float(eps))
+
+
+def rmsnorm_cat(parts, weights, *, part_weights=None, eps=1e-5, space=None):
+    """RMSNorm over the row-wise concatenation of ``parts``, each optionally RMS-normalized first. Forward only.
+
+    ``parts`` are fp16/bf16 ``[B, n_i]`` or ``[B, R_i, C_i]`` tensors on one device, with any strides; a 3-D part is
+    flattened row-major and its ``C_i`` must be a power of two. ``part_weights[i]`` (``R_i * C_i`` elements) normalizes
+    part ``i`` with its own RMSNorm first; ``None`` (the default for every part) leaves it as is. For each of the one
+    to three ``weights`` (``N = sum R_i * C_i`` elements each) the result is a contiguous ``[B, N]`` tensor in the
+    parts' dtype::
+
+        cat = concat_i(part_i / sqrt(mean(part_i^2) + eps) * part_weights[i])
+        out = cat / sqrt(mean(cat^2) + eps) * weights[k]
+
+    The math is fp32; the normalized parts are rounded to the I/O dtype before the final norm, whose mean is taken
+    over the unrounded values. A row may hold at most 32768 elements, at most three parts may be normalized, and the
+    parts' row counts must split into at most six power-of-two pieces in all. Returns a list, one tensor per weight.
+
+    A row's outputs do not depend on the batch size or on the other rows. The same values in another memory layout,
+    or misaligned, can run another kernel that sums in another order, so its outputs can differ by an ulp.
+    """
+    import torch
+    if not isinstance(parts, (list, tuple)) or not parts:
+        raise InvalidInput("tlx.ops.rmsnorm_cat expects a non-empty list of parts")
+    if not isinstance(weights, (list, tuple)) or not 1 <= len(weights) <= 3:
+        raise InvalidInput("tlx.ops.rmsnorm_cat expects one to three output weights")
+    part_weights = [None] * len(parts) if part_weights is None else list(part_weights)
+    if len(part_weights) != len(parts):
+        raise InvalidInput("tlx.ops.rmsnorm_cat expects one part weight (or None) per part")
+    if any(not isinstance(p, torch.Tensor) or p.ndim not in (2, 3) for p in parts):
+        raise InvalidInput("tlx.ops.rmsnorm_cat expects rank-2 [B, n] or rank-3 [B, R, C] parts")
+    lead = parts[0]
+    if any(p.shape[0] != lead.shape[0] or p.dtype != lead.dtype or p.device != lead.device for p in parts):
+        raise InvalidInput("tlx.ops.rmsnorm_cat expects parts with one batch size, dtype and device")
+    if any(0 in p.shape[1:] for p in parts):
+        raise InvalidInput("tlx.ops.rmsnorm_cat expects every part to have at least one element per row")
+    if not 0 < eps < math.inf:
+        raise InvalidInput(f"tlx.ops.rmsnorm_cat expects a positive finite eps; got {eps!r}")
+    # A 2-D part is one row of n columns, or n rows of one column when n is not a power of two.
+    parts = [p if p.ndim == 3 else p.unsqueeze(1 if p.shape[1] & (p.shape[1] - 1) == 0 else 2) for p in parts]
+    n = sum(p.shape[1] * p.shape[2] for p in parts)
+    for p, w in zip(parts, part_weights):
+        if w is not None and (w.numel() != p.shape[1] * p.shape[2] or w.device != lead.device):
+            raise InvalidInput("tlx.ops.rmsnorm_cat expects each part weight to match its part's row size and device")
+    if any(w.numel() != n or w.device != lead.device for w in weights):
+        raise InvalidInput(f"tlx.ops.rmsnorm_cat expects every output weight to hold {n} elements on the parts' device")
+    space_name, invariance = _normalize_space_arg("rmsnorm_cat", space)
+    _check_single_config_space("rmsnorm_cat", space_name)
+    fn, spec = impl_for("rmsnorm_cat", device=lead.device)
+    check_inputs(spec, dtype=lead.dtype)
+    check_backward(spec, *parts, *weights, *(w for w in part_weights if w is not None))
+    _check_enforced("rmsnorm_cat", spec, invariance)
+    with torch.cuda.device(lead.device):
+        try:
+            return fn(parts, [w.reshape(-1).contiguous() for w in weights],
+                      [w if w is None else w.reshape(-1).contiguous() for w in part_weights], float(eps))
+        except ValueError as error:
+            raise InvalidInput(f"tlx.ops.rmsnorm_cat: {error}") from error
 
 
 def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=True, num_targets=None,

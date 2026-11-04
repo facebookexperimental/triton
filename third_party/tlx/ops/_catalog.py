@@ -446,6 +446,17 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_backward=False,
     ),
     OpSpec(
+        op="rmsnorm_cat",
+        arch="sm90",
+        variant="row_in_registers",
+        impl="triton.tlx.ops.kernels.norm._cat_sm90:rmsnorm_cat",
+        dtypes=_FP16,
+        # The register kernel takes any strides; the TLX kernel for the over-arch layout loads rows with cp.async.bulk
+        # and TMA, and runs only when `tlx_layout` proves 16-byte alignment.
+        requires=frozenset({"tma"}),
+        supports_backward=False,
+    ),
+    OpSpec(
         op="hstu_attn_dev",
         arch="sm100",
         variant="ws",
