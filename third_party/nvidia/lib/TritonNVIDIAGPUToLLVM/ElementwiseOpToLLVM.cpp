@@ -346,6 +346,7 @@ static StringRef stringifyLLVMRoundingMode(triton::RoundingMode rounding) {
   switch (rounding) {
   case triton::RoundingMode::RTNE: return "round.tonearest";
   case triton::RoundingMode::RTZ: return "round.towardzero";
+  case triton::RoundingMode::RS: break;
   }
   // clang-format on
   llvm_unreachable("unknown rounding mode");
