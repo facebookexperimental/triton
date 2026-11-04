@@ -7,6 +7,7 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 
 namespace mlir {
@@ -232,6 +233,55 @@ struct DecomposedWarpConversion {
   SmallVector<TranspositionInfo> mixedTranspositions;
   int nPack;
 };
+
+enum class ProductConversionTransport {
+  Register,
+  Warp,
+  Shared,
+};
+
+// Built only by the factories, so no plan is default or partial: rejected
+// (`rejection` only), shared (Shared transport) or factored (Register or Warp
+// transport, with the register/lane permutation factors).
+struct ProductConversionPlan {
+  static ProductConversionPlan rejected(std::string rejection);
+  static ProductConversionPlan
+  shared(triton::ProductConversionScope scope,
+         llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks);
+  // Register transport and scope when `map.laneMap` is the identity,
+  // otherwise Warp.
+  static ProductConversionPlan
+  factored(llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+           triton::ProductConversionInputMap map);
+
+  std::optional<ProductConversionTransport> transport;
+  std::optional<triton::ProductConversionScope> scope;
+  std::optional<std::string> rejection;
+  llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks;
+  // pReg takes a source register to its destination register in
+  // destinationRegisterOrder's input order; shuffleMap takes a destination
+  // lane to its source lane.
+  std::optional<DecomposedWarpConversion> warpFactors;
+  std::optional<triton::ColumnAction> destinationRegisterOrder;
+
+  bool supported() const { return !rejection.has_value(); }
+
+private:
+  ProductConversionPlan(
+      std::optional<ProductConversionTransport> transport,
+      std::optional<triton::ProductConversionScope> scope,
+      std::optional<std::string> rejection,
+      llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+      std::optional<DecomposedWarpConversion> warpFactors,
+      std::optional<triton::ColumnAction> destinationRegisterOrder);
+};
+
+// Plan a Product conversion in closed form. A failed preflight gives a
+// rejected plan; a register/lane map gives a factored plan, else a shared one.
+ProductConversionPlan
+planProductLayoutConversion(const triton::LinearLayout &srcLayout,
+                            const triton::LinearLayout &dstLayout,
+                            ArrayRef<int64_t> logicalShape);
 
 // Produces a warp-local decomposition.
 //

@@ -861,6 +861,106 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
           std::move(mixedTranspositions), nPack};
 }
 
+ProductConversionPlan::ProductConversionPlan(
+    std::optional<ProductConversionTransport> transport,
+    std::optional<ProductConversionScope> scope,
+    std::optional<std::string> rejection,
+    llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+    std::optional<DecomposedWarpConversion> warpFactors,
+    std::optional<ColumnAction> destinationRegisterOrder)
+    : transport(transport), scope(scope), rejection(std::move(rejection)),
+      sourceFreeVariableMasks(std::move(sourceFreeVariableMasks)),
+      warpFactors(std::move(warpFactors)),
+      destinationRegisterOrder(std::move(destinationRegisterOrder)) {}
+
+ProductConversionPlan ProductConversionPlan::rejected(std::string rejection) {
+  return ProductConversionPlan(std::nullopt, std::nullopt, std::move(rejection),
+                               {}, std::nullopt, std::nullopt);
+}
+
+ProductConversionPlan ProductConversionPlan::shared(
+    ProductConversionScope scope,
+    llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks) {
+  return ProductConversionPlan(ProductConversionTransport::Shared, scope,
+                               std::nullopt, std::move(sourceFreeVariableMasks),
+                               std::nullopt, std::nullopt);
+}
+
+ProductConversionPlan ProductConversionPlan::factored(
+    llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+    ProductConversionInputMap map) {
+  bool laneIdentity = squareSublayoutIsIdentity(
+      map.laneMap, to_vector(map.laneMap.getInDimNames()));
+  // shuffleMap reads each destination lane from its source lane: the inverse
+  // lane permutation, with no register, warp or block terms.
+  auto *ctx = map.laneMap.getInDimNames().begin()->getContext();
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  StringAttr kLane = StringAttr::get(ctx, "lane");
+  LinearLayout::BasesT shuffleBases;
+  shuffleBases[kReg].assign(
+      llvm::Log2_32_Ceil(map.registerMap.getInDimSize(kReg)), {0});
+  shuffleBases[kLane] = map.laneMap.invert().getBases().lookup(kLane);
+  shuffleBases[StringAttr::get(ctx, "warp")];
+  shuffleBases[StringAttr::get(ctx, "block")];
+  LinearLayout shuffleMap(std::move(shuffleBases),
+                          {{kLane, map.laneMap.getInDimSize(kLane)}},
+                          /*requireSurjective=*/false);
+  return ProductConversionPlan(
+      laneIdentity ? ProductConversionTransport::Register
+                   : ProductConversionTransport::Warp,
+      laneIdentity ? ProductConversionScope::Register
+                   : ProductConversionScope::Warp,
+      std::nullopt, std::move(sourceFreeVariableMasks),
+      DecomposedWarpConversion{std::move(map.registerMap),
+                               std::move(shuffleMap),
+                               /*mixedTranspositions=*/{}, /*nPack=*/0},
+      std::move(map.registerOrder));
+}
+
+ProductConversionPlan
+planProductLayoutConversion(const LinearLayout &srcLayout,
+                            const LinearLayout &dstLayout,
+                            ArrayRef<int64_t> logicalShape) {
+  using Plan = ProductConversionPlan;
+  auto dst = alignProductConversionOutDims(srcLayout, dstLayout, logicalShape);
+  if (!dst)
+    return Plan::rejected("NPOT Product conversion with mismatched or "
+                          "non-standard out dims is not yet supported");
+  auto reject = [](StringRef what, StringRef role) {
+    return Plan::rejected(("NPOT Product conversion with " + what + " in the " +
+                           role + " layout is not yet supported")
+                              .str());
+  };
+  using Role = std::pair<const LinearLayout *, StringRef>;
+  for (auto [layout, role] :
+       {Role{&srcLayout, "source"}, Role{&*dst, "destination"}}) {
+    if (!hasProductConversionInputDims(*layout))
+      return reject("a non-singleton block input", role);
+    // getFreeVariableMasks needs radix-2 or Product layouts.
+    if (!layout->isRadix2() && !layout->hasNonBinaryCarrier())
+      return reject("non-radix-2 digits on power-of-two outputs", role);
+    if (!coversAllLogicalOutputs(*layout, logicalShape))
+      return reject("incomplete logical output coverage", role);
+  }
+  auto hasRegisterAndLane = [](const LinearLayout &layout) {
+    auto inDims = to_vector(layout.getInDimNames());
+    return llvm::is_contained(inDims, "register") &&
+           llvm::is_contained(inDims, "lane");
+  };
+  if (!hasRegisterAndLane(srcLayout) || !hasRegisterAndLane(*dst))
+    return Plan::rejected("NPOT Product conversion without register and lane "
+                          "input dimensions is not yet supported");
+
+  auto masks = srcLayout.getFreeVariableMasks();
+  // The map moves only registers and lanes, so it also sets the scope, even
+  // when both layouts are replicated across warps.
+  if (auto map = mapProductConversionInputs(*dst, srcLayout))
+    return Plan::factored(std::move(masks), std::move(*map));
+  return Plan::shared(
+      classifyProductConversionScope(srcLayout, *dst, logicalShape),
+      std::move(masks));
+}
+
 static void computeTranspositionSelectors(
     SmallVector<DecomposedWarpConversion::TranspositionInfo>
         &mixedTranspositions,

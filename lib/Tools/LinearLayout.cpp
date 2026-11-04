@@ -979,7 +979,6 @@ std::optional<LinearLayout> divideRight(const LinearLayout &A,
 }
 
 LinearLayout operator*(LinearLayout inner, LinearLayout outer) {
-  assert(!inner.hasNonBinaryCarrier() && !outer.hasNonBinaryCarrier());
   // Check that dims common to outer and inner have the same relative order.
   auto inDims = supremum(llvm::to_vector(inner.getInDimNames()),
                          llvm::to_vector(outer.getInDimNames()));
@@ -990,17 +989,17 @@ LinearLayout operator*(LinearLayout inner, LinearLayout outer) {
   // consider, in order.  `inner` is more minor, so its dimensions come
   // first.
   llvm::MapVector<StringAttr, int32_t> inDimSizesLog2;
-  llvm::MapVector<StringAttr, int32_t> outDimSizesLog2;
+  llvm::MapVector<StringAttr, int32_t> outDimSizes;
   for (const auto &dim : inDims)
     inDimSizesLog2.insert({dim, 0});
   for (const auto &dim : outDims)
-    outDimSizesLog2.insert({dim, 0});
+    outDimSizes.insert({dim, 1});
   for (const auto &layout : {inner, outer}) {
     for (StringAttr inDim : layout.getInDimNames()) {
       inDimSizesLog2[inDim] += layout.getInDimSizeLog2(inDim);
     }
     for (StringAttr outDim : layout.getOutDimNames()) {
-      outDimSizesLog2[outDim] += layout.getOutDimSizeLog2(outDim);
+      outDimSizes[outDim] *= layout.getOutDimSize(outDim);
     }
   }
 
@@ -1010,25 +1009,29 @@ LinearLayout operator*(LinearLayout inner, LinearLayout outer) {
 
     // Fill with zeros.
     inDimBases = std::vector<std::vector<int32_t>>(
-        inDimSizeLog2, std::vector<int32_t>(outDimSizesLog2.size(), 0));
+        inDimSizeLog2, std::vector<int32_t>(outDimSizes.size(), 0));
 
-    for (auto [outDimIdx, outDimNameAndSize] :
-         llvm::enumerate(outDimSizesLog2)) {
+    for (auto [outDimIdx, outDimNameAndSize] : llvm::enumerate(outDimSizes)) {
       auto [outDimName, outDimSize] = outDimNameAndSize;
+      int32_t innerSize =
+          inner.hasOutDim(outDimName) ? inner.getOutDimSize(outDimName) : 1;
+      // On a Product output, outer digits land above inner's binary part and
+      // inner's odd part moves above them.
+      int32_t innerTwoPart = LinearLayout::twoPartOf(innerSize);
       if (inner.hasInDim(inDimName) && inner.hasOutDim(outDimName)) {
         for (int i = 0; i < inner.getInDimSizeLog2(inDimName); i++) {
-          inDimBases[i][outDimIdx] = inner.getBasis(inDimName, i, outDimName);
+          int32_t basis = inner.getBasis(inDimName, i, outDimName);
+          inDimBases[i][outDimIdx] =
+              basis % innerTwoPart +
+              basis / innerTwoPart * (outDimSize / innerSize * innerTwoPart);
         }
       }
       if (outer.hasInDim(inDimName) && outer.hasOutDim(outDimName)) {
         int offset =
             inner.hasInDim(inDimName) ? inner.getInDimSizeLog2(inDimName) : 0;
-        int shift = inner.hasOutDim(outDimName)
-                        ? inner.getOutDimSizeLog2(outDimName)
-                        : 0;
         for (int i = 0; i < outer.getInDimSizeLog2(inDimName); i++) {
           inDimBases[offset + i][outDimIdx] =
-              outer.getBasis(inDimName, i, outDimName) << shift;
+              outer.getBasis(inDimName, i, outDimName) * innerTwoPart;
         }
       }
     }
@@ -1044,11 +1047,8 @@ LinearLayout operator*(LinearLayout inner, LinearLayout outer) {
     }
   }
 
-  llvm::SmallVector<std::pair<StringAttr, int32_t>> outDimSizes;
-  for (auto [outDim, sizeLog2] : outDimSizesLog2) {
-    outDimSizes.push_back({outDim, 1 << sizeLog2});
-  }
-  return LinearLayout(std::move(allBases), std::move(allRadices), outDimSizes,
+  return LinearLayout(std::move(allBases), std::move(allRadices),
+                      llvm::to_vector(outDimSizes),
                       inner.isSurjective() && outer.isSurjective());
 }
 
@@ -1471,6 +1471,18 @@ LinearLayout LinearLayout::squeezeOuts(StringAttr dim) const {
 
 llvm::MapVector<StringAttr, int32_t>
 LinearLayout::getFreeVariableMasks() const {
+  if (hasNonBinaryCarrier()) {
+    // Mask bits are digit positions. The binary part frees radix-2 digits and
+    // zero non-binary digits; a digit owning an odd coordinate is not free.
+    llvm::MapVector<StringAttr, int32_t> ret =
+        binaryPart().getFreeVariableMasks();
+    for (const auto &[inDim, inDimBases] : bases)
+      for (auto [digit, basis] : llvm::enumerate(inDimBases))
+        if (getInputRadix(inDim, digit) != 2 &&
+            llvm::any_of(basis, [](int32_t b) { return b != 0; }))
+          ret[inDim] &= ~(int32_t{1} << digit);
+    return ret;
+  }
   assert(isRadix2());
   std::unique_ptr<uint64_t[]> mat = getMatrix(*this);
   int numRows = getTotalOutDimSizeLog2();

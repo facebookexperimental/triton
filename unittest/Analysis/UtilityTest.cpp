@@ -1,7 +1,10 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Analysis/BufferRegion.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
+#include "unittest/Tools/ProductLayouts.h"
 
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/Signals.h"
@@ -361,6 +364,195 @@ TEST(Analysis, BufferStatePlanKeepsLargeSparsePartitionsExact) {
   }
 
   expectFullCoveragePartition(regions);
+}
+
+namespace {
+
+using Bases = std::vector<std::vector<int32_t>>;
+using triton::exactIdentity1D;
+using triton::makeRegLaneLayout;
+
+triton::LinearLayout exactRegisters(MLIRContext &ctx, int32_t size,
+                                    int32_t blockSize = 1) {
+  auto S = [&](StringRef str) { return StringAttr::get(&ctx, str); };
+  return exactIdentity1D(size, S("register"), S("dim0")) *
+         triton::LinearLayout::zeros1D(1, S("lane"), S("dim0")) *
+         triton::LinearLayout::zeros1D(blockSize, S("block"), S("dim0"));
+}
+
+void expectRejection(const ProductConversionPlan &plan, StringRef message) {
+  ASSERT_TRUE(plan.rejection);
+  EXPECT_FALSE(plan.supported());
+  EXPECT_FALSE(plan.transport);
+  EXPECT_FALSE(plan.scope);
+  EXPECT_FALSE(plan.warpFactors);
+  EXPECT_FALSE(plan.destinationRegisterOrder);
+  EXPECT_EQ(*plan.rejection, message.str());
+}
+
+void expectShared(const ProductConversionPlan &plan,
+                  const triton::LinearLayout &src,
+                  triton::ProductConversionScope scope) {
+  ASSERT_TRUE(plan.supported());
+  EXPECT_EQ(plan.transport, ProductConversionTransport::Shared);
+  EXPECT_EQ(plan.scope, scope);
+  EXPECT_TRUE(
+      llvm::equal(plan.sourceFreeVariableMasks, src.getFreeVariableMasks()));
+  EXPECT_FALSE(plan.warpFactors);
+  EXPECT_FALSE(plan.destinationRegisterOrder);
+}
+
+} // namespace
+
+TEST(Analysis, ProductConversionPlanRejectsPreflightFailures) {
+  MLIRContext ctx;
+  auto exact = exactRegisters(ctx, 6);
+  expectRejection(
+      planProductLayoutConversion(triton::LinearLayout::empty(),
+                                  triton::LinearLayout::empty(), {}),
+      "NPOT Product conversion without register and lane input dimensions is "
+      "not yet supported");
+  expectRejection(
+      planProductLayoutConversion(exactRegisters(ctx, 3), exact, {6}),
+      "NPOT Product conversion with incomplete logical output coverage in the "
+      "source layout is not yet supported");
+  expectRejection(
+      planProductLayoutConversion(exact, exactRegisters(ctx, 3), {6}),
+      "NPOT Product conversion with incomplete logical output coverage in the "
+      "destination layout is not yet supported");
+  expectRejection(
+      planProductLayoutConversion(exactRegisters(ctx, 6, 2), exact, {6}),
+      "NPOT Product conversion with a non-singleton block input in the source "
+      "layout is not yet supported");
+  expectRejection(
+      planProductLayoutConversion(exact, exactRegisters(ctx, 6, 2), {6}),
+      "NPOT Product conversion with a non-singleton block input in the "
+      "destination layout is not yet supported");
+  // A zero radix-3 digit on power-of-two outputs has no free-variable masks.
+  Bases lanes = {{0, 1}, {0, 2}, {0, 4}};
+  auto mixedRadix =
+      makeRegLaneLayout(ctx, {{1, 0}, {2, 0}, {0, 0}}, {2, 2, 3}, lanes, {}, 4);
+  auto pow2 = makeRegLaneLayout(ctx, {{1, 0}, {2, 0}}, {2, 2}, lanes, {}, 4);
+  expectRejection(planProductLayoutConversion(mixedRadix, pow2, {4, 8}),
+                  "NPOT Product conversion with non-radix-2 digits on "
+                  "power-of-two outputs in the source layout is not yet "
+                  "supported");
+  expectRejection(planProductLayoutConversion(pow2, mixedRadix, {4, 8}),
+                  "NPOT Product conversion with non-radix-2 digits on "
+                  "power-of-two outputs in the destination layout is not yet "
+                  "supported");
+  auto misnamed = exactIdentity1D(6, StringAttr::get(&ctx, "register"),
+                                  StringAttr::get(&ctx, "dim1"));
+  expectRejection(planProductLayoutConversion(misnamed, misnamed, {6}),
+                  "NPOT Product conversion with mismatched or non-standard "
+                  "out dims is not yet supported");
+}
+
+TEST(Analysis, ProductConversionPlanFactorsRegisterAndLanePermutations) {
+  MLIRContext ctx;
+  auto reg = StringAttr::get(&ctx, "register");
+  auto lane = StringAttr::get(&ctx, "lane");
+  // `order` is destinationRegisterOrder applied to values 0..n-1, which are
+  // indexed by pReg's output.
+  auto expectFactored = [&](const triton::LinearLayout &src,
+                            const triton::LinearLayout &dst,
+                            ProductConversionTransport transport,
+                            const Bases &pReg, const Bases &shuffleMap,
+                            ArrayRef<intptr_t> order) {
+    auto plan = planProductLayoutConversion(
+        src, dst, {src.getOutDimSize(StringAttr::get(&ctx, "dim0")), 8});
+    ASSERT_TRUE(plan.supported());
+    EXPECT_EQ(plan.transport, transport);
+    EXPECT_EQ(plan.scope, transport == ProductConversionTransport::Register
+                              ? triton::ProductConversionScope::Register
+                              : triton::ProductConversionScope::Warp);
+    EXPECT_TRUE(
+        llvm::equal(plan.sourceFreeVariableMasks, src.getFreeVariableMasks()));
+    ASSERT_TRUE(plan.warpFactors && plan.destinationRegisterOrder);
+    EXPECT_EQ(plan.warpFactors->pReg.getBases().lookup(reg), pReg);
+    EXPECT_EQ(plan.warpFactors->shuffleMap.getBases().lookup(lane), shuffleMap);
+    SmallVector<Value> values;
+    for (intptr_t i = 0; i < static_cast<intptr_t>(order.size()); ++i)
+      values.push_back(
+          Value::getFromOpaquePointer(reinterpret_cast<void *>(i)));
+    SmallVector<intptr_t> ids;
+    for (Value v : plan.destinationRegisterOrder->apply(values))
+      ids.push_back(reinterpret_cast<intptr_t>(v.getAsOpaquePointer()));
+    EXPECT_EQ(ArrayRef<intptr_t>(ids), order);
+  };
+  Bases lanes = {{0, 1}, {0, 2}, {0, 4}};
+  Bases rotated = {{0, 2}, {0, 4}, {0, 1}};
+  {
+    // dst = 2 * src on the odd coordinate, so src -> dst is 3 mod 5.
+    SCOPED_TRACE("odd register swap");
+    expectFactored(makeRegLaneLayout(ctx, {{1, 0}}, {5}, lanes, {}, 5),
+                   makeRegLaneLayout(ctx, {{2, 0}}, {5}, lanes, {}, 5),
+                   ProductConversionTransport::Register, {{3}}, {{1}, {2}, {4}},
+                   {0, 1, 2, 3, 4});
+  }
+  {
+    SCOPED_TRACE("destination odd digit first");
+    expectFactored(makeRegLaneLayout(ctx, {{0, 4}, {1, 0}}, {2, 5},
+                                     {{0, 1}, {0, 2}}, {}, 5),
+                   makeRegLaneLayout(ctx, {{1, 0}, {0, 4}}, {5, 2},
+                                     {{0, 1}, {0, 2}}, {}, 5),
+                   ProductConversionTransport::Register, {{1}, {2}}, {{1}, {2}},
+                   {0, 2, 4, 6, 8, 1, 3, 5, 7, 9});
+  }
+  {
+    // operator* puts the odd digit between binary ones, as {2, 3, 2} here.
+    SCOPED_TRACE("lane permutation with the odd digit in the middle");
+    Bases registers = {{1, 0}, {2, 0}, {0, 1}};
+    expectFactored(
+        makeRegLaneLayout(ctx, registers, {2, 3, 2}, {{0, 2}, {0, 4}}, {}, 6),
+        makeRegLaneLayout(ctx, registers, {2, 3, 2}, {{0, 4}, {0, 2}}, {}, 6),
+        ProductConversionTransport::Warp, {{1}, {4}, {2}}, {{2}, {1}},
+        {0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11});
+  }
+  {
+    SCOPED_TRACE("pow2 control");
+    auto src = makeRegLaneLayout(ctx, {{1, 0}, {2, 0}}, {2, 2}, lanes, {}, 4);
+    auto dst = makeRegLaneLayout(ctx, {{1, 0}, {2, 0}}, {2, 2}, rotated, {}, 4);
+    expectFactored(src, dst, ProductConversionTransport::Warp, {{1}, {2}},
+                   {{2}, {4}, {1}}, {0, 1, 2, 3});
+    auto plan = planProductLayoutConversion(src, dst, {4, 8});
+    EXPECT_TRUE(plan.warpFactors->pReg.isRadix2());
+  }
+  {
+    // Each warp already holds every value it needs.
+    SCOPED_TRACE("identical layouts replicated across warps");
+    auto layout =
+        exactIdentity1D(3, reg, StringAttr::get(&ctx, "dim0")) *
+        triton::LinearLayout::identity1D(8, lane,
+                                         StringAttr::get(&ctx, "dim1")) *
+        triton::LinearLayout::zeros1D(2, StringAttr::get(&ctx, "warp"),
+                                      StringAttr::get(&ctx, "dim0"));
+    expectFactored(layout, layout, ProductConversionTransport::Register, {{1}},
+                   {{1}, {2}, {4}}, {0, 1, 2});
+  }
+}
+
+TEST(Analysis, ProductConversionPlanSharesWithoutRegisterLaneBijection) {
+  MLIRContext ctx;
+  using Scope = triton::ProductConversionScope;
+  {
+    SCOPED_TRACE("register bit moves to a lane");
+    auto src = makeRegLaneLayout(ctx, {{0, 1}, {1, 0}}, {2, 5},
+                                 {{0, 2}, {0, 4}}, {}, 5);
+    auto dst = makeRegLaneLayout(ctx, {{0, 2}, {1, 0}}, {2, 5},
+                                 {{0, 1}, {0, 4}}, {}, 5);
+    expectShared(planProductLayoutConversion(src, dst, {5, 8}), src,
+                 Scope::Warp);
+  }
+  {
+    SCOPED_TRACE("lane permutation is Product");
+    auto src = makeRegLaneLayout(ctx, {{0, 1}, {0, 2}, {0, 4}}, {2, 2, 2},
+                                 {{1, 0}}, {3}, 3);
+    auto dst = makeRegLaneLayout(ctx, {{0, 1}, {0, 2}, {0, 4}}, {2, 2, 2},
+                                 {{2, 0}}, {3}, 3);
+    expectShared(planProductLayoutConversion(src, dst, {3, 8}), src,
+                 Scope::Block);
+  }
 }
 
 } // namespace mlir
