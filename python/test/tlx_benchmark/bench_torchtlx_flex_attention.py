@@ -191,7 +191,7 @@ def flex_adapter():
         return meta
 
     with (
-            mock.patch.object(triton_heuristics, "tlx_only_cuda_options", lambda: ["ctas_per_cga"]),
+            mock.patch.object(triton_heuristics, "tlx_only_cuda_options", lambda: ["ctas_per_cga"], create=True),
             mock.patch.object(triton_heuristics.CachingAutotuner, "_create_compile_meta", compile_meta),
             config.patch({"inductor_choices_class": TLXInductorChoices, "compile_threads": 1}),
     ):
