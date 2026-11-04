@@ -3697,6 +3697,12 @@ class _attention(torch.autograd.Function):
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
             STAGE=stage,  #
+            # Every generic-proxy SMEM write that an MMA or TMA store reads is
+            # fenced by its writer before the barrier that publishes it, so skip
+            # the consumer-side fences Triton would add before each MMA. Those
+            # land on the K/V operands of Dot 1/Dot 2 (K/V alias the dK/dV
+            # staging) and stall the single MMA-issuing warp every iteration.
+            disable_nv_fence_insertion=True,  #
         )
 
         _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
