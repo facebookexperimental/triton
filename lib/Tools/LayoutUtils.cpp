@@ -1029,6 +1029,15 @@ LinearLayout transposeLinearLayout(LinearLayout layout, ArrayRef<int> order) {
       b = std::move(newB);
     }
   }
+  if (!layout.isRadix2()) {
+    // NPOT sizes are not inferable from bases: each dim takes its source's.
+    auto names = to_vector(layout.getOutDimNames());
+    SmallVector<std::pair<StringAttr, int32_t>> outDims;
+    for (auto [name, src] : llvm::zip_equal(names, order))
+      outDims.push_back({name, layout.getOutDimSize(names[src])});
+    return LinearLayout(std::move(namedBases), layout.getInputRadices(),
+                        outDims, /*requireSurjective=*/false);
+  }
   return LinearLayout(std::move(namedBases),
                       to_vector(layout.getOutDimNames()));
 }

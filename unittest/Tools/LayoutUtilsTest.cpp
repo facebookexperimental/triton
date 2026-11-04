@@ -206,6 +206,21 @@ TEST_F(LayoutUtilsTest, LogicalOutputCoverageNeedsOwnedOddCoordinate) {
   EXPECT_FALSE(coversAllLogicalOutputs(binaryOnly, {33}));
 }
 
+// A transpose moves each out dim's size and digits with its coordinate.
+TEST_F(LayoutUtilsTest, TransposeKeepsProductRadices) {
+  auto reg = S("register"), lane = S("lane"), dim0 = S("dim0");
+  auto dim1 = S("dim1");
+  auto layout =
+      exactIdentity1D(3, reg, dim0) * LinearLayout::identity1D(64, lane, dim1);
+  auto transposed = transposeLinearLayout(layout, {1, 0});
+  EXPECT_EQ(transposed.getOutDimSize(dim0), 64);
+  EXPECT_EQ(transposed.getOutDimSize(dim1), 3);
+  EXPECT_EQ(
+      transposed.apply({{reg, 2}, {lane, 39}}),
+      (SmallVector<std::pair<StringAttr, int32_t>>{{dim0, 39}, {dim1, 2}}));
+  EXPECT_EQ(transposeLinearLayout(transposed, {1, 0}), layout);
+}
+
 TEST_F(LayoutUtilsTest, ProductConversionScopeIsExact) {
   auto reg = S("register"), lane = S("lane"), warp = S("warp");
   auto block = S("block"), dim0 = S("dim0"), dim1 = S("dim1");
