@@ -68,6 +68,27 @@ static void pickDescriptorLoadStoreLayout(
   });
 }
 
+// The vector AxisInfo proves for this access, kept only as wide as adds no
+// registers to the layout the pad pass admitted (its vector check calls the
+// same helper).
+static FailureOr<LinearEncodingAttr>
+buildCoalescedProductEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                              Operation *op, int numWarps, int threadsPerWarp,
+                              unsigned maxVecBits) {
+  MLIRContext *ctx = op->getContext();
+  Value ptr = getMemAccessPtr(op);
+  auto type = cast<RankedTensorType>(ptr.getType());
+  AxisInfo &info = *axisInfoAnalysis.getAxisInfo(ptr);
+  SmallVector<unsigned> order = getOrderFromContiguity(info.getContiguity());
+  unsigned vector =
+      getProductVector(ctx, type.getShape(),
+                       getAxisInfoVector(info, type, type.getShape(), order[0],
+                                         numWarps * threadsPerWarp, maxVecBits),
+                       order, numWarps, threadsPerWarp);
+  return getProductEncoding(ctx, type.getShape(), numWarps, threadsPerWarp,
+                            /*numCTAs=*/1, vector, order);
+}
+
 struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
   using impl::TritonGPUCoalesceBase<CoalescePass>::TritonGPUCoalesceBase;
 
@@ -162,6 +183,14 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
         }
         if (pinned) {
           layoutMap[curr] = pinned;
+        } else if (!isRadix2Encoding(
+                       cast<RankedTensorType>(ptr.getType()).getEncoding())) {
+          // A Product layout has no CGA layout: without a Product rebuild, the
+          // access keeps its layout.
+          FailureOr<LinearEncodingAttr> product = buildCoalescedProductEncoding(
+              axisInfoAnalysis, curr, numWarps, threadsPerWarp, maxVecBits);
+          if (succeeded(product))
+            layoutMap[curr] = *product;
         } else {
           auto tensorType = cast<RankedTensorType>(ptr.getType());
           CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());
