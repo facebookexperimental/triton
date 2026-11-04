@@ -30,6 +30,7 @@
 #include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -1381,6 +1382,32 @@ verifyNativeMfmaLayout(Operation *op,
   return success();
 }
 
+static bool isScaledMfmaInstrShape(ArrayRef<unsigned> instrShape) {
+  return instrShape == ArrayRef<unsigned>({16, 16, 128}) ||
+         instrShape == ArrayRef<unsigned>({32, 32, 64});
+}
+
+// `mfma_commit` is the completion boundary for both unscaled and scaled
+// scheduled MFMA. Scaled CDNA4 shapes reuse the warp/tile invariants above
+// but are not valid shapes for unscaled `scheduled_mfma`, so only the
+// commit verifier accepts them here.
+static LogicalResult
+verifyMfmaLayoutForCommit(Operation *op,
+                          mlir::triton::gpu::AMDMfmaEncodingAttr mfma,
+                          const Twine &prefix) {
+  if (mfma.getVersion() == 4 && isScaledMfmaInstrShape(mfma.getInstrShape())) {
+    if (llvm::is_contained(mfma.getWarpsPerCTA(), 0u))
+      return op->emitOpError()
+             << prefix << "MFMA warpsPerCTA entries must be positive";
+    if (mfma.getTilesPerWarp().size() < mfma.getRank())
+      return op->emitOpError()
+             << prefix << "MFMA tilesPerWarp must have at least "
+             << mfma.getRank() << " entries";
+    return success();
+  }
+  return verifyNativeMfmaLayout(op, mfma, prefix);
+}
+
 LogicalResult MfmaCommitOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
     DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
@@ -1424,8 +1451,8 @@ LogicalResult MfmaCommitOp::verify() {
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
-      if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
-                                        "input " + Twine(index) + " ")))
+      if (failed(verifyMfmaLayoutForCommit(getOperation(), mfma,
+                                           "input " + Twine(index) + " ")))
         return failure();
       // SCF-to-CF turns a runtime loop's yielded accumulator into a loop-header
       // block argument used by the mutually exclusive body and exit blocks.
@@ -1445,7 +1472,8 @@ LogicalResult MfmaCommitOp::verify() {
     }
 
     if (tensorTy.getElementType().isBF16() ||
-        tensorTy.getElementType().isF16()) {
+        tensorTy.getElementType().isF16() ||
+        tensorTy.getElementType().isInteger(8)) {
       auto dot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
           unwrapTlxWrappers(tensorTy.getEncoding()));
       auto mfma = dot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(dot.getParent())
@@ -1455,15 +1483,21 @@ LogicalResult MfmaCommitOp::verify() {
           !llvm::is_contained({4u, 8u}, dot.getKWidth()))
         return emitOpError()
                << "input " << index
-               << " must use a matching BF16 or F16 dot-operand layout with "
-                  "kWidth=4/8";
+               << " must use a matching BF16, F16, or scaled i8 dot-operand "
+                  "layout with kWidth=4/8";
+      bool isScaled = isScaledMfmaInstrShape(mfma.getInstrShape());
+      if (tensorTy.getElementType().isInteger(8) != isScaled)
+        return emitOpError()
+               << "input " << index
+               << " i8 dot-operand dependencies require a scaled MFMA "
+                  "layout, and scaled layouts require i8 operands";
       if (*targetVersion != 0 && mfma.getVersion() != *targetVersion)
         return emitOpError()
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
-      if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
-                                        "input " + Twine(index) + " ")))
+      if (failed(verifyMfmaLayoutForCommit(getOperation(), mfma,
+                                           "input " + Twine(index) + " ")))
         return failure();
       ArrayRef<unsigned> instr = mfma.getInstrShape();
       int64_t fragmentElements =
@@ -1490,7 +1524,8 @@ LogicalResult MfmaCommitOp::verify() {
 
     return emitOpError()
            << "input " << index
-           << " must be an F32 MFMA result or BF16/F16 dot-operand dependency";
+           << " must be an F32 MFMA result or a BF16/F16/scaled-i8 "
+              "dot-operand dependency";
   }
   if (!hasMfmaResult)
     return emitOpError("requires at least one MFMA result");
@@ -1650,6 +1685,182 @@ LogicalResult ScheduledMfmaOp::verify() {
            << getAccumulatorRole()
            << "\" accumulator: CDNA3 scheduled MFMA currently requires VGPR "
               "accumulators. Use \"vgpr\".";
+  return success();
+}
+
+LogicalResult ScheduledMfmaScaledOp::verify() {
+  namespace ttg = mlir::triton::gpu;
+
+  if (failed(verifyWaveUniformExecution(getOperation())))
+    return failure();
+
+  FailureOr<unsigned> targetVersion = getScheduledMfmaVersion(getOperation());
+  if (failed(targetVersion))
+    return failure();
+  if (*targetVersion != 0 && *targetVersion != 4)
+    return emitOpError("scaled scheduled MFMA requires a CDNA4 target");
+
+  auto isScaledFormat = [](StringRef format) {
+    return format == "e4m3" || format == "e5m2" || format == "e2m3" ||
+           format == "e3m2" || format == "e2m1";
+  };
+  if (!isScaledFormat(getAFormat()))
+    return emitOpError("a_format must be one of \"e4m3\", \"e5m2\", \"e2m3\", "
+                       "\"e3m2\", \"e2m1\"");
+  if (!isScaledFormat(getBFormat()))
+    return emitOpError("b_format must be one of \"e4m3\", \"e5m2\", \"e2m3\", "
+                       "\"e3m2\", \"e2m1\"");
+  if (getAccumulatorRole() != "transient")
+    return emitOpError(
+        "accumulator_role must be \"transient\": persistent scaled MFMA "
+        "drain waits are not modeled yet");
+  if (getResidentOperand() != "none")
+    return emitOpError(
+        "resident_operand must be \"none\" for scaled scheduled MFMA");
+  if (getAccumulatorRegisterClass() != "auto")
+    return emitOpError(
+        "accumulator_register_class must be \"auto\" for scaled scheduled "
+        "MFMA");
+
+  auto aTy = getA().getType();
+  auto bTy = getB().getType();
+  auto accTy = getAcc().getType();
+  auto resultTy = getResult().getType();
+  int64_t rank = accTy.getRank();
+  if (rank != 2 || aTy.getRank() != rank || bTy.getRank() != rank)
+    return emitOpError("requires rank-2 operands and accumulator");
+  if (!aTy.getElementType().isInteger(8) ||
+      !bTy.getElementType().isInteger(8) || !accTy.getElementType().isF32())
+    return emitOpError(
+        "requires i8 packed microscaling operands and an F32 accumulator");
+  if (resultTy != accTy)
+    return emitOpError("result type must exactly match the accumulator type");
+  if (aTy.getShape()[0] != accTy.getShape()[0] ||
+      bTy.getShape()[1] != accTy.getShape()[1] ||
+      aTy.getShape()[1] != bTy.getShape()[0])
+    return emitOpError(
+        "operand and accumulator matrix shapes are inconsistent");
+
+  auto mfma = dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(
+      unwrapTlxWrappers(accTy.getEncoding()));
+  if (!mfma || mfma.getRank() != rank || mfma.getVersion() != 4 ||
+      !mfma.hasUnitTilesPerWarp() || mfma.getElementBitWidth() != 32)
+    return emitOpError(
+        "requires a CDNA4 F32 MFMA accumulator with unit tiles per wave");
+  // verifyNativeMfmaLayout only knows the unscaled CDNA4 shapes, so check
+  // its warp/tile invariants here and the scaled shapes below.
+  if (llvm::is_contained(mfma.getWarpsPerCTA(), 0u))
+    return emitOpError("MFMA warpsPerCTA entries must be positive");
+  if (mfma.getTilesPerWarp().size() < mfma.getRank())
+    return emitOpError("MFMA tilesPerWarp must have at least rank entries");
+  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+  if (instrShape != ArrayRef<unsigned>({16, 16, 128}) &&
+      instrShape != ArrayRef<unsigned>({32, 32, 64}))
+    return emitOpError(
+        "requires a scaled MFMA instruction shape of 16x16x128 or 32x32x64");
+
+  auto aDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(aTy.getEncoding()));
+  auto bDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(bTy.getEncoding()));
+  // The encoding window stays a power of two (8 packed bytes), as in the
+  // existing scaled MFMA path; a native step consumes three windows
+  // (24 packed bytes per lane).
+  if (!aDot || aDot.getOpIdx() != 0 || aDot.getKWidth() != 8 ||
+      aDot.getParent() != mfma)
+    return emitOpError(
+        "operand A must use the matching opIdx=0, kWidth=8 dot layout "
+        "(8-byte packed windows; 24 bytes per native step)");
+  if (!bDot || bDot.getOpIdx() != 1 || bDot.getKWidth() != 8 ||
+      bDot.getParent() != mfma)
+    return emitOpError(
+        "operand B must use the matching opIdx=1, kWidth=8 dot layout "
+        "(8-byte packed windows; 24 bytes per native step)");
+
+  // Operand shapes count logical FP6 values. Each lane holds 32 i8
+  // values per native step in K order: the first 24 are the packed bytes
+  // of 32 codes, the remaining 8 are zero padding (code 0 decodes to 0.0,
+  // so padded steps contribute nothing). A dense 96-byte layout needs a
+  // radix-3 K repeat in the dot-operand layout, which landed LinearLayout
+  // cannot express yet; the padded form lowers today.
+  int64_t logicalK = aTy.getShape()[1];
+  int64_t instrK = instrShape[2];
+  if (logicalK <= 0 || logicalK % instrK != 0)
+    return emitOpError(
+        "operand K dimension must be a positive multiple of the native "
+        "instruction K");
+  int64_t steps = logicalK / instrK;
+
+  ArrayRef<unsigned> warpsPerCTA = mfma.getWarpsPerCTA();
+  int64_t repM = aTy.getShape()[0] / (instrShape[0] * warpsPerCTA[0]);
+  int64_t repN = bTy.getShape()[1] / (instrShape[1] * warpsPerCTA[1]);
+  if (repM <= 0 || repN <= 0 ||
+      repM * instrShape[0] * warpsPerCTA[0] != aTy.getShape()[0] ||
+      repN * instrShape[1] * warpsPerCTA[1] != bTy.getShape()[1])
+    return emitOpError("operand M/N dimensions must tile the MFMA grid");
+  // Per-thread ownership is replication-aware: A is replicated across the
+  // N-warp dimension and B across the M-warp dimension, so dividing the
+  // logical element count by every CTA thread undercounts both operands
+  // and rejects every multi-wave grid except [1, 1]. `getTotalElemsPerThread`
+  // already reflects the dot-operand layout, including that replication,
+  // and matches the element count the lowering unpacks per lane.
+  if (ttg::getTotalElemsPerThread(aTy) != repM * steps * 32 ||
+      ttg::getTotalElemsPerThread(bTy) != repN * steps * 32)
+    return emitOpError(
+        "operand ownership does not match the packed MFMA K grid");
+  constexpr int64_t warpSize = 64;
+  int64_t elemsPerFragment = instrShape[0] * instrShape[1] / warpSize;
+  if (ttg::getTotalElemsPerThread(accTy) != repM * repN * elemsPerFragment)
+    return emitOpError(
+        "accumulator ownership does not match the native MFMA grid");
+
+  auto aScaleTy = getAScale().getType();
+  auto bScaleTy = getBScale().getType();
+  int64_t scaleK = logicalK / 32;
+  if (aScaleTy.getRank() != 2 || bScaleTy.getRank() != 2 ||
+      !aScaleTy.getElementType().isInteger(8) ||
+      !bScaleTy.getElementType().isInteger(8))
+    return emitOpError("requires rank-2 i8 E8M0 scale tensors");
+  if (aScaleTy.getShape() != ArrayRef<int64_t>({aTy.getShape()[0], scaleK}) ||
+      bScaleTy.getShape() != ArrayRef<int64_t>({bTy.getShape()[1], scaleK}))
+    return emitOpError(
+        "scale shapes must be [M, logicalK/32] and [N, logicalK/32]");
+  // Conversion assumes the MFMA scale layout register order (non-K tiles,
+  // then K steps): one scale byte per tile-step per lane.
+  if (ttg::getTotalElemsPerThread(aScaleTy) != repM * steps ||
+      ttg::getTotalElemsPerThread(bScaleTy) != repN * steps)
+    return emitOpError(
+        "scale ownership must hold one E8M0 byte per MFMA tile-step per "
+        "lane (MFMA scale layout)");
+  // Element count alone does not pin register order: two layouts can hold
+  // the same bytes per lane yet assign them to different (tile, step)
+  // pairs, silently scaling the wrong K step once `steps > 1` or the
+  // non-K repetition exceeds one. Require the exact scaled-MFMA layout
+  // the lowering indexes as `nonK * steps + step`.
+  if (!aScaleTy.getEncoding() || !bScaleTy.getEncoding())
+    return emitOpError("scale tensors must use the MFMA scale layout");
+  LinearLayout expectedAScale = ttg::chooseScaledMfmaScaleLayout(
+      getOperation()->getContext(), /*dotOperandIdx=*/0, aScaleTy.getShape(),
+      instrShape[0], mfma.getTilesPerWarp(), warpsPerCTA);
+  LinearLayout actualAScale =
+      ttg::toLinearLayout(aScaleTy.getShape(), aScaleTy.getEncoding());
+  if (actualAScale != expectedAScale)
+    return emitOpError("a_scale layout does not match the scaled MFMA scale "
+                       "layout (register order must be non-K tiles, then K "
+                       "steps)")
+           << "\nExpected layout: " << expectedAScale.toString()
+           << "\nGot layout: " << actualAScale.toString();
+  LinearLayout expectedBScale = ttg::chooseScaledMfmaScaleLayout(
+      getOperation()->getContext(), /*dotOperandIdx=*/1, bScaleTy.getShape(),
+      instrShape[0], mfma.getTilesPerWarp(), warpsPerCTA);
+  LinearLayout actualBScale =
+      ttg::toLinearLayout(bScaleTy.getShape(), bScaleTy.getEncoding());
+  if (actualBScale != expectedBScale)
+    return emitOpError("b_scale layout does not match the scaled MFMA scale "
+                       "layout (register order must be non-K tiles, then K "
+                       "steps)")
+           << "\nExpected layout: " << expectedBScale.toString()
+           << "\nGot layout: " << actualBScale.toString();
   return success();
 }
 

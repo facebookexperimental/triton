@@ -712,6 +712,14 @@ static FailureOr<int> getMfmaNumPasses(ArrayRef<unsigned> instrShape) {
   if (instrShape == ArrayRef<unsigned>({16, 16, 16}) ||
       instrShape == ArrayRef<unsigned>({16, 16, 32}))
     return 8;
+  // Scaled CDNA4 shapes move twice the operand bytes of their unscaled
+  // counterparts (32 i8 values per lane-step), so they occupy the pipeline
+  // for twice as many passes. Over-waiting at a commit boundary is safe;
+  // under-waiting would reintroduce the result-read hazard.
+  if (instrShape == ArrayRef<unsigned>({16, 16, 128}))
+    return 16;
+  if (instrShape == ArrayRef<unsigned>({32, 32, 64}))
+    return 32;
   return failure();
 }
 
@@ -794,23 +802,32 @@ constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
 // Build an asm snippet providing exactly `waitStates` MFMA wait states.
 //
 // `s_nop N` provides N+1 wait states, and N is a 4-bit field, so a single
-// instruction covers at most 16. Two are always enough here: the largest
-// requirement LLVM models for gfx950 is 20 wait states
-// (GFX940_XDL_N_PassWritesVGPROverlappedSrcABWaitStates for a 16-pass MFMA).
+// instruction covers at most 16. Scaled 32x32x64 commits need 36 states,
+// so emit as many full 16-state nops as required plus one remainder.
 //
 //    1  ->  "s_nop 0"
 //    4  ->  "s_nop 3"
 //   16  ->  "s_nop 15"
 //   18  ->  "s_nop 15\ns_nop 1"
 //   20  ->  "s_nop 15\ns_nop 3"
+//   36  ->  "s_nop 15\ns_nop 15\ns_nop 3"
 static std::string mfmaWaitStateAsm(int waitStates) {
   // A non-positive count would silently emit no padding at all, which is the
   // exact hazard this padding exists to prevent.
-  assert(waitStates > 0 && waitStates <= 32 &&
-         "MFMA wait states must be positive and fit in two s_nops");
-  if (waitStates <= 16)
-    return "s_nop " + std::to_string(waitStates - 1);
-  return "s_nop 15\ns_nop " + std::to_string(waitStates - 16 - 1);
+  assert(waitStates > 0 && waitStates <= 48 &&
+         "MFMA wait states must be positive and fit in three s_nops");
+  std::string asmText;
+  int remaining = waitStates;
+  while (remaining > 16) {
+    if (!asmText.empty())
+      asmText += "\n";
+    asmText += "s_nop 15";
+    remaining -= 16;
+  }
+  if (!asmText.empty())
+    asmText += "\n";
+  asmText += "s_nop " + std::to_string(remaining - 1);
+  return asmText;
 }
 
 // LLVM can forward a stored MFMA destination into a later load, including by
@@ -2056,6 +2073,214 @@ private:
   AMD::ScheduledMfmaLoweringState &scheduledMfmaState;
 };
 
+// Scaled twin of ScheduledMfmaOpConversion for microscaling formats. The
+// verifier guarantees the transient contract, CDNA4 scaled instruction shapes,
+// kWidth=8 packed-byte windows (24 bytes per native step), and one E8M0
+// byte per tile-step in MFMA scale layout order, so lowering only packs
+// fragments and emits the native ROCDL scaled MFMA intrinsic.
+class ScheduledMfmaScaledOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::ScheduledMfmaScaledOp> {
+public:
+  using OpAdaptor = triton::amdgpu::ScheduledMfmaScaledOp::Adaptor;
+
+  ScheduledMfmaScaledOpConversion(const LLVMTypeConverter &converter,
+                                  const AMD::TargetInfo &targetInfo,
+                                  PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::amdgpu::ScheduledMfmaScaledOp>(converter,
+                                                                      benefit),
+        targetInfo(targetInfo) {}
+
+  // Packed bytes one lane feeds per 32-value step, and the ROCDL
+  // MatrixFormat code, per microscaling format. The operand window is
+  // always 32 i8 slots; bytes past the packed count are zero padding.
+  static int64_t packedBytesPerStep(StringRef format) {
+    if (format == "e4m3" || format == "e5m2")
+      return 32;
+    if (format == "e2m3" || format == "e3m2")
+      return 24;
+    return 16; // e2m1
+  }
+  static int32_t matrixFormatCode(StringRef format) {
+    // Mirrors getMfmaF8F6F4MatrixFormat in DotOpToLLVM/MFMA.cpp.
+    if (format == "e4m3")
+      return 0;
+    if (format == "e5m2")
+      return 1;
+    if (format == "e2m3")
+      return 2;
+    if (format == "e3m2")
+      return 3;
+    return 4; // e2m1
+  }
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::ScheduledMfmaScaledOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto aTy = cast<RankedTensorType>(op.getA().getType());
+    auto bTy = cast<RankedTensorType>(op.getB().getType());
+    auto accTy = cast<RankedTensorType>(op.getAcc().getType());
+    auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
+    if (failed(verifyMfmaVersionMatchesTarget(op, mfma,
+                                              targetInfo.getISAFamily())))
+      return failure();
+    ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+    int64_t logicalK = aTy.getShape()[1];
+    int64_t steps = logicalK / instrShape[2];
+    ArrayRef<unsigned> warpsPerCTA = mfma.getWarpsPerCTA();
+    int64_t repM = aTy.getShape()[0] / (instrShape[0] * warpsPerCTA[0]);
+    int64_t repN = bTy.getShape()[1] / (instrShape[1] * warpsPerCTA[1]);
+
+    TritonLLVMOpBuilder b(loc, rewriter);
+    auto packOperand = [&](Value value, RankedTensorType ty, int64_t repNonK,
+                           StringRef format) -> FailureOr<SmallVector<Value>> {
+      int64_t validBytes = packedBytesPerStep(format);
+      SmallVector<Value> elems = unpackTensorElements(loc, value, rewriter, ty);
+      // Per step a lane holds 32 i8 values in K order: the first 24 are
+      // the packed bytes of 32 FP6 codes, the last 8 are zero padding.
+      SmallVector<int64_t> strides = computeStrides({1, repNonK, steps, 32});
+      if (elems.size() != static_cast<size_t>(repNonK * steps * 32))
+        return failure();
+      auto byteVecTy = vec_ty(i8_ty, validBytes);
+      auto dwordVecTy = vec_ty(i32_ty, validBytes / 4);
+      SmallVector<Value> fragments;
+      for (int64_t nonK = 0; nonK < repNonK; ++nonK) {
+        for (int64_t step = 0; step < steps; ++step) {
+          Value fragment = b.undef(byteVecTy);
+          for (int64_t byte = 0; byte < validBytes; ++byte) {
+            int64_t index = linearize({0, nonK, step, byte}, strides);
+            fragment = b.insert_element(byteVecTy, fragment, elems[index],
+                                        b.i32_val(byte));
+          }
+          fragments.push_back(b.bitcast(fragment, dwordVecTy));
+        }
+      }
+      return fragments;
+    };
+    FailureOr<SmallVector<Value>> maybeA =
+        packOperand(adaptor.getA(), aTy, repM, op.getAFormat());
+    FailureOr<SmallVector<Value>> maybeB =
+        packOperand(adaptor.getB(), bTy, repN, op.getBFormat());
+    if (failed(maybeA) || failed(maybeB))
+      return rewriter.notifyMatchFailure(
+          op, "operands do not match the verified packed MFMA grid");
+
+    auto packScales = [&](Value value, RankedTensorType ty,
+                          int64_t repNonK) -> FailureOr<SmallVector<Value>> {
+      SmallVector<Value> elems = unpackTensorElements(loc, value, rewriter, ty);
+      if (elems.size() != static_cast<size_t>(repNonK * steps))
+        return failure();
+      SmallVector<Value> scales;
+      for (int64_t nonK = 0; nonK < repNonK; ++nonK)
+        for (int64_t step = 0; step < steps; ++step)
+          scales.push_back(LLVM::ZExtOp::create(rewriter, loc, i32_ty,
+                                                elems[nonK * steps + step]));
+      return scales;
+    };
+    FailureOr<SmallVector<Value>> maybeAScale =
+        packScales(adaptor.getAScale(),
+                   cast<RankedTensorType>(op.getAScale().getType()), repM);
+    FailureOr<SmallVector<Value>> maybeBScale =
+        packScales(adaptor.getBScale(),
+                   cast<RankedTensorType>(op.getBScale().getType()), repN);
+    if (failed(maybeAScale) || failed(maybeBScale))
+      return rewriter.notifyMatchFailure(
+          op, "scales do not match the verified packed MFMA grid");
+
+    constexpr int64_t warpSize = 64;
+    int64_t elemsPerFragment = instrShape[0] * instrShape[1] / warpSize;
+    SmallVector<int64_t> accStrides =
+        computeStrides({1, repM, repN, elemsPerFragment});
+    SmallVector<Value> accElems =
+        unpackTensorElements(loc, adaptor.getAcc(), rewriter, accTy);
+    if (accElems.size() != static_cast<size_t>(repM * repN * elemsPerFragment))
+      return rewriter.notifyMatchFailure(
+          op, "accumulator element count does not match its MFMA grid");
+    Type accElemTy = getTypeConverter()->convertType(accTy.getElementType());
+    auto fragmentTy = vec_ty(accElemTy, elemsPerFragment);
+    SmallVector<Value> accFragments;
+    for (int64_t m = 0; m < repM; ++m) {
+      for (int64_t n = 0; n < repN; ++n) {
+        Value fragment = b.undef(fragmentTy);
+        for (int64_t index = 0; index < elemsPerFragment; ++index) {
+          int64_t linearIndex = linearize({0, m, n, index}, accStrides);
+          fragment = b.insert_element(fragmentTy, fragment,
+                                      accElems[linearIndex], b.i32_val(index));
+        }
+        accFragments.push_back(fragment);
+      }
+    }
+
+    Value zeroFragment;
+    if (op.getInitialize()) {
+      Attribute zeroAttr = rewriter.getZeroAttr(accElemTy);
+      auto zeroElements =
+          DenseElementsAttr::get(cast<ShapedType>(fragmentTy), zeroAttr);
+      zeroFragment =
+          LLVM::ConstantOp::create(rewriter, loc, fragmentTy, zeroElements);
+    }
+
+    StringRef intrinsicName =
+        instrShape[2] == 128
+            ? ROCDL::mfma_scale_f32_16x16x128_f8f6f4::getOperationName()
+            : ROCDL::mfma_scale_f32_32x32x64_f8f6f4::getOperationName();
+
+    SmallVector<Value> updated = accFragments;
+    for (int64_t step = 0; step < steps; ++step) {
+      for (int64_t n = 0; n < repN; ++n) {
+        for (int64_t m = 0; m < repM; ++m) {
+          Value operandA = (*maybeA)[m * steps + step];
+          Value operandB = (*maybeB)[n * steps + step];
+          Value scaleA = (*maybeAScale)[m * steps + step];
+          Value scaleB = (*maybeBScale)[n * steps + step];
+          int32_t cbsz = matrixFormatCode(op.getAFormat());
+          int32_t blgp = matrixFormatCode(op.getBFormat());
+          if (mfma.getIsTransposed()) {
+            std::swap(operandA, operandB);
+            std::swap(scaleA, scaleB);
+            std::swap(cbsz, blgp);
+          }
+          OperationState loweredOp(loc, intrinsicName);
+          loweredOp.addTypes(fragmentTy);
+          Value accIn = (op.getInitialize() && step == 0)
+                            ? zeroFragment
+                            : updated[m * repN + n];
+          loweredOp.addOperands({operandA, operandB, accIn, scaleA, scaleB});
+          loweredOp.addAttribute("cbsz",
+                                 ROCDL::MatrixFormatAttr::get(
+                                     rewriter.getContext(),
+                                     static_cast<ROCDL::MatrixFormat>(cbsz)));
+          loweredOp.addAttribute("blgp",
+                                 ROCDL::MatrixFormatAttr::get(
+                                     rewriter.getContext(),
+                                     static_cast<ROCDL::MatrixFormat>(blgp)));
+          loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(0));
+          loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(0));
+          updated[m * repN + n] = rewriter.create(loweredOp)->getResult(0);
+        }
+      }
+    }
+
+    for (int64_t m = 0; m < repM; ++m) {
+      for (int64_t n = 0; n < repN; ++n) {
+        Value fragment = updated[m * repN + n];
+        for (int64_t index = 0; index < elemsPerFragment; ++index) {
+          int64_t linearIndex = linearize({0, m, n, index}, accStrides);
+          accElems[linearIndex] =
+              b.extract_element(accElemTy, fragment, b.i32_val(index));
+        }
+      }
+    }
+    Value result = packTensorElements(loc, getTypeConverter(), accElems,
+                                      rewriter, op.getResult().getType());
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+
+private:
+  const AMD::TargetInfo &targetInfo;
+};
+
 class BarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::BarrierOp> {
 public:
@@ -2350,6 +2575,8 @@ void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
       typeConverter, transBenefit);
   patterns.add<MfmaCommitOpConversion, ScheduledMfmaOpConversion>(
       typeConverter, targetInfo, scheduledMfmaState, transBenefit);
+  patterns.add<ScheduledMfmaScaledOpConversion>(typeConverter, targetInfo,
+                                                transBenefit);
   patterns.add<BarrierOpConversion, MemoryCounterWaitOpConversion>(
       typeConverter, targetInfo, barrierBenefit);
 }

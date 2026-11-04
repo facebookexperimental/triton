@@ -986,11 +986,13 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
   let summary = "Commit native vector MFMA fragments with live dependencies";
   let description = [{
     Returns every input unchanged after applying the architecture-defined MFMA
-    result hazard. Inputs may be direct transient `scheduled_mfma` results
-    followed by dot-operand live dependencies, or a set of direct persistent
-    results at an epilogue boundary. Multiple independent native results can
-    therefore share one completion boundary without first assembling a
-    logical tensor.
+    result hazard. Inputs may be direct transient `scheduled_mfma` or
+    `scheduled_mfma_scaled` results followed by dot-operand live dependencies
+    (BF16/F16 for unscaled layouts, i8 for scaled layouts), or a set of
+    direct persistent results at an epilogue boundary. Multiple independent
+    native results can therefore share one completion boundary without first
+    assembling a logical tensor. CDNA4 scaled accumulator layouts
+    (16x16x128 and 32x32x64) are supported alongside the unscaled shapes.
 
     Distributed MFMA and dot layouts determine storage roles and native
     fragment widths for rank-two or rank-three tensors. Source code does not
@@ -1116,6 +1118,62 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     `accumulator` $accumulator_role
     `register_class` $accumulator_register_class `initialize` $initialize
     attr-dict `:` type($a) `,` type($b) `,` type($acc) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ScheduledMfmaScaledOp
+//===----------------------------------------------------------------------===//
+
+def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
+  let summary = "Execute native scaled MFMA fragments for microscaling operands";
+  let description = [{
+    Scaled twin of `scheduled_mfma`: computes the per-wave Cartesian product
+    of native `v_mfma_scale_f32_*_f8f6f4` fragments in `a` and `b`, replacing
+    every corresponding fragment in `acc`. LLVM determines the final
+    instruction schedule, as in `scheduled_mfma`.
+
+    `a` and `b` hold microscaling codes (formats named by
+    `a_format`/`b_format`: `e4m3`/`e5m2`, `e2m3`/`e3m2`, or `e2m1`) in
+    8-bit storage with logical-value shapes: each lane holds 32 values
+    per native step in K order, the first 32/24/16 bytes packed for
+    FP8/FP6/FP4 (16 FP6 values per 12 bytes; two FP4 codes per byte) and
+    the remaining bytes zero padding (code 0 decodes to 0.0). A dense
+    packed K layout needs a radix-3 repeat for FP6 that landed
+    LinearLayout cannot express yet, so v1 uses this padded form; each
+    lane feeds the packed bytes (8/6/4 x i32) per step through kWidth=8
+    dot-operand windows. `a_scale` and
+    `b_scale` hold one E8M0 byte per 32 logical values: shapes are
+    [M, logicalK/32] and [N, logicalK/32] in i8 storage.
+
+    Only the transient contract is supported today: `accumulator_role` must
+    be "transient", `resident_operand` must be "none", and
+    `accumulator_register_class` must be "auto"; persistent scaled chains
+    and their register pinning are not modeled yet. Completion is
+    represented separately by `mfma_commit`, as in `scheduled_mfma`:
+    `mfma_commit` accepts the scaled 16x16x128 and 32x32x64 accumulator
+    layouts (and live scaled i8 dot operands) and applies the modeled
+    scaled drain wait at the boundary.
+    CDNA4 (gfx950) only. All active lanes of a wave must execute this
+    operation uniformly.
+  }];
+
+  let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,
+      TT_Tensor:$a_scale, TT_Tensor:$b_scale, StrAttr:$a_format,
+      StrAttr:$b_format, StrAttr:$resident_operand,
+      StrAttr:$accumulator_role, StrAttr:$accumulator_register_class,
+      BoolAttr:$initialize);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $a `,` $b `,` $acc `scales` $a_scale `,` $b_scale
+    `formats` $a_format `,` $b_format `resident` $resident_operand
+    `accumulator` $accumulator_role
+    `register_class` $accumulator_register_class `initialize` $initialize
+    attr-dict `:` type($a) `,` type($b) `,` type($acc) `,` type($a_scale)
+    `,` type($b_scale) `->` type($result)
   }];
 
   let hasVerifier = 1;
