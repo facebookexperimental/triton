@@ -13,26 +13,30 @@ The attention kernels run workgroups of 8 warps on 256-row Q tiles, each
 warp owning 32 rows, over 128-key K/V tiles. Non-causal sequences that are a
 multiple of 512, and causal ones with a nonzero sm_scale, go to persistent
 kernels: one workgroup per CU runs the K/V tiles of its Q tiles as a single
-stream, the first tiles of the next Q tile overlapping the end of the last
-(causal Q tiles go heaviest first, snaking across the workgroups). Other
-calls get one workgroup per Q tile. K, V and their scales move through the
-tensor data mover (TDM) as 256-byte rows into LDS, with four K and V slots so
-loads run three tiles ahead; Q does too, except in the persistent kernels,
-which copy it with async loads. A step takes the current tile's exps and runs
-its PV WMMAs and the next tile's QK WMMAs, then the next tile's softmax up to
-the exp arguments, and the two halves of the workgroup ping-pong between the
-two stages (tlx.warp_pipeline_stage), so one half's softmax overlaps the
-other's WMMAs. P's block scales join the exp argument, so P comes out divided
-by them. As on gfx950, P is computed with a bit-trick exp2 instead of the
-hardware exp, the accumulators are only rescaled when a row max grows past a
-threshold, and P's row sums run on the matrix cores. Causal Q tiles stop at
-the diagonal, which crosses their last two K/V tiles; there the QK
-accumulator starts at -inf for the hidden keys.
+stream, the first tiles of the next Q tile overlapping the end of the last.
+Causal programs take their Q tiles from a host-built table that evens out
+their steps and, from 4096 on, keeps each XCD on a few heads at a time so
+their K/V stays in L2. Other calls get one workgroup per Q tile. K, V and
+their scales move through the tensor data mover (TDM) as 256-byte rows into
+LDS, with four K and V slots so loads run three tiles ahead; Q does too,
+except in the persistent kernels, which copy it with async loads. A step
+takes the current tile's exps and runs its PV WMMAs and the next tile's QK
+WMMAs, then the next tile's softmax up to the exp arguments, and the two
+halves of the workgroup ping-pong between the two stages
+(tlx.warp_pipeline_stage), so one half's softmax overlaps the other's WMMAs.
+P's block scales join the exp argument, so P comes out divided by them. As on
+gfx950, P is computed with a bit-trick exp2 instead of the hardware exp, the
+accumulators are only rescaled when a row max grows past a threshold, and P's
+row sums run on the matrix cores. Causal Q tiles stop at the diagonal, which
+crosses their last two K/V tiles; there the QK accumulator starts at -inf for
+the hidden keys.
 
 The bit-trick exp2 gives 2**x with a linear mantissa, biased high; P and its
 row sums share that bias. ``_launch_quantized(..., fast_exp=False)`` runs the
 kernel with the hardware exp instead.
 """
+
+import heapq
 
 import torch
 import triton
@@ -359,6 +363,12 @@ def _warp():
     # Warp w holds rows 32 w to 32 w + 31 of the scores.
     return tl.inline_asm_elementwise("v_readfirstlane_b32 $0, $1", "=s,v", [tlx.thread_id(0)], dtype=tl.int32,
                                      is_pure=True, pack=1) >> 5
+
+
+@triton.jit
+def _rcp(x):
+    # v_rcp_f32, within 1 ulp; 1.0 / x expands to a correctly rounded division.
+    return tl.inline_asm_elementwise("v_rcp_f32 $0, $1", "=v,v", [x], dtype=tl.float32, is_pure=True, pack=1)
 
 
 @triton.jit
@@ -701,7 +711,7 @@ def _mxfp8_fa_fwd_tdm(
     acc = _cat8(a0, a1, a2, a3, a4, a5, a6, a7)
 
     l_i = tl.max(l_acc, 1)
-    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+    inv_l = tl.where(l_i > 0, _rcp(l_i), 0.0)
     o_desc = tl.make_tensor_descriptor(Out + head, shape=[N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
                                        block_shape=[BLOCK_M, HEAD_DIM])
     tlx.async_amd_descriptor_wait(0)
@@ -943,7 +953,7 @@ def _mxfp8_fa_fwd_persistent(
                 t = _unpack_p8(t)
                 if u == 3:
                     l_i = tl.max(l_acc, 1)
-                    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+                    inv_l = tl.where(l_i > 0, _rcp(l_i), 0.0)
                     tlx.local_store(tlx.local_view(o_buf, 0),
                                     (_cat8(a0, a1, a2, a3, a4, a5, a6, a7) * inv_l[:, None]).to(tl.bfloat16))
                     a0 = tl.zeros([BLOCK_M, 16], tl.float32)
@@ -989,8 +999,8 @@ def _qk8m(q, q_scale, k_buf, ks_buf, slot, offs_m, key0, BLOCK_N: tl.constexpr, 
 
 @triton.jit
 def _ctile(k, pid, G, ZH, n_q, HEAD_ROWS):
-    # Q tile k of a causal program: the programs take the Q tiles longest
-    # first in a snake order, which evens out their steps. Returns its K/V
+    # Q tile k of a causal program without a schedule table: the programs take
+    # the Q tiles longest first in a snake order. Returns its K/V
     # rows, its index within its head, its global index and whether it exists.
     t = k * G + tl.where((k & 1) == 0, pid, G - 1 - pid)
     ok = t < ZH * n_q
@@ -998,6 +1008,15 @@ def _ctile(k, pid, G, ZH, n_q, HEAD_ROWS):
     c = t // ZH
     h = t - c * ZH
     mt = n_q - 1 - c
+    return h * HEAD_ROWS, mt, h * n_q + mt, ok
+
+
+@triton.jit
+def _ctile_tab(e, n_q, HEAD_ROWS):
+    # _ctile from a schedule entry (head << 8) | Q tile, negative past the end.
+    ok = e >= 0
+    h = tl.where(ok, e >> 8, 0)
+    mt = tl.where(ok, e & 255, n_q - 1)
     return h * HEAD_ROWS, mt, h * n_q + mt, ok
 
 
@@ -1031,6 +1050,9 @@ def _mxfp8_fa_fwd_persistent_causal(
     BLOCK_N: tl.constexpr,
     FAST_EXP: tl.constexpr,
     SPLIT: tl.constexpr,
+    Sched=None,
+    STRIDE=0,
+    TAB: tl.constexpr = False,
 ):
     # Causal, qk_scale != 0. Q tile m has 2 m + 2 K/V tiles, the last two
     # crossing the diagonal; a program runs its Q tiles' K/V tiles as one
@@ -1070,10 +1092,17 @@ def _mxfp8_fa_fwd_persistent_causal(
     # next step's TDM wait completes before step n - 1 rewrites o_buf, and
     # copies Q tile i + 2 into the slot Q tile i was read from in step n - 1
     # of i - 1. Q tile 0 meets the diagonal in its K/V tiles 0 and 1 too.
-    hb, mt, g, ok = _ctile(0, pid, G, ZH, n_q, HEAD_ROWS)
-    hb1, mt1, g1, ok1 = _ctile(1, pid, G, ZH, n_q, HEAD_ROWS)
-    hb2, mt2, g2, ok2 = _ctile(2, pid, G, ZH, n_q, HEAD_ROWS)
-    hb3, mt3, g3, ok3 = _ctile(3, pid, G, ZH, n_q, HEAD_ROWS)
+    if TAB:
+        sched = Sched + pid * STRIDE
+        hb, mt, g, ok = _ctile_tab(tl.load(sched), n_q, HEAD_ROWS)
+        hb1, mt1, g1, ok1 = _ctile_tab(tl.load(sched + 1), n_q, HEAD_ROWS)
+        hb2, mt2, g2, ok2 = _ctile_tab(tl.load(sched + 2), n_q, HEAD_ROWS)
+        hb3, mt3, g3, ok3 = _ctile_tab(tl.load(sched + 3), n_q, HEAD_ROWS)
+    else:
+        hb, mt, g, ok = _ctile(0, pid, G, ZH, n_q, HEAD_ROWS)
+        hb1, mt1, g1, ok1 = _ctile(1, pid, G, ZH, n_q, HEAD_ROWS)
+        hb2, mt2, g2, ok2 = _ctile(2, pid, G, ZH, n_q, HEAD_ROWS)
+        hb3, mt3, g3, ok3 = _ctile(3, pid, G, ZH, n_q, HEAD_ROWS)
     n_t = 2 * mt + 2
     n1 = 2 * mt1 + 2
     n2 = 2 * mt2 + 2
@@ -1123,9 +1152,12 @@ def _mxfp8_fa_fwd_persistent_causal(
     _copy_q(Q, Qs, q_buf, qs_buf, 0, tl.where(ok2, g2, g), n_q, N_CTX, BLOCK_M, HEAD_DIM, SCALE_K)
     tlx.async_amd_descriptor_wait(2)
 
-    n_rounds = total // G
-    last = tl.where((n_rounds & 1) == 0, pid, G - 1 - pid)
-    n_mine = n_rounds + tl.where(last < total - n_rounds * G, 1, 0)
+    if TAB:
+        n_mine = tl.load(Sched + G * STRIDE + pid)
+    else:
+        n_rounds = total // G
+        last = tl.where((n_rounds & 1) == 0, pid, G - 1 - pid)
+        n_mine = n_rounds + tl.where(last < total - n_rounds * G, 1, 0)
     b = 0
     # Only Q tile 0 meets the diagonal in its first two K/V tiles, and it comes
     # last. With SPLIT the crossings into the others run without masks, in a
@@ -1133,10 +1165,13 @@ def _mxfp8_fa_fwd_persistent_causal(
     # than the masks save unless the sequence is long.
     n_a = 0
     if SPLIT:
-        t1 = ZH * (n_q - 1)
-        r1 = t1 // G
-        last1 = tl.where((r1 & 1) == 0, pid, G - 1 - pid)
-        n_a = tl.maximum(tl.minimum(r1 + tl.where(last1 < t1 - r1 * G, 1, 0), n_mine) - 1, 0)
+        if TAB:
+            n_a = tl.load(Sched + G * STRIDE + G + pid)
+        else:
+            t1 = ZH * (n_q - 1)
+            r1 = t1 // G
+            last1 = tl.where((r1 & 1) == 0, pid, G - 1 - pid)
+            n_a = tl.maximum(tl.minimum(r1 + tl.where(last1 < t1 - r1 * G, 1, 0), n_mine) - 1, 0)
         for it in range(0, n_a):
             n_t = 2 * mt + 2
             n1 = 2 * mt1 + 2
@@ -1192,6 +1227,7 @@ def _mxfp8_fa_fwd_persistent_causal(
             mt4 = mt3
             g4 = g3
             ok4 = ok3
+            e4 = 0
             # Step n - 1 of Q tile i and step 0 of Q tile i + 1.
             for u in tl.range(0, 2, loop_unroll_factor=2):
                 if u == 1:
@@ -1241,7 +1277,7 @@ def _mxfp8_fa_fwd_persistent_causal(
                     t = _unpack_p8(t)
                     if u == 0:
                         l_i = tl.max(l_acc, 1)
-                        inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+                        inv_l = tl.where(l_i > 0, _rcp(l_i), 0.0)
                         tlx.local_store(tlx.local_view(o_buf, 0),
                                         (_cat8(a0, a1, a2, a3, a4, a5, a6, a7) * inv_l[:, None]).to(tl.bfloat16))
                         a0 = tl.zeros([BLOCK_M, 16], tl.float32)
@@ -1253,12 +1289,17 @@ def _mxfp8_fa_fwd_persistent_causal(
                         a6 = tl.zeros([BLOCK_M, 16], tl.float32)
                         a7 = tl.zeros([BLOCK_M, 16], tl.float32)
                         l_acc = tl.zeros([BLOCK_M, 16], tl.float32)
+                        if TAB:
+                            e4 = tl.load(sched + it + 4)
                     else:
                         _copy_q(Q, Qs, q_buf, qs_buf, (it + 1) & 1, tl.where(ok3, g3, g1), n_q, N_CTX, BLOCK_M,
                                 HEAD_DIM, SCALE_K)
                         # In a stage: a stage cannot take the division in it as
                         # an input.
-                        hb4, mt4, g4, ok4 = _ctile(it + 4, pid, G, ZH, n_q, HEAD_ROWS)
+                        if TAB:
+                            hb4, mt4, g4, ok4 = _ctile_tab(e4, n_q, HEAD_ROWS)
+                        else:
+                            hb4, mt4, g4, ok4 = _ctile(it + 4, pid, G, ZH, n_q, HEAD_ROWS)
             b = b_next
             hb = hb1
             mt = mt1
@@ -1330,6 +1371,7 @@ def _mxfp8_fa_fwd_persistent_causal(
         mt4 = mt3
         g4 = g3
         ok4 = ok3
+        e4 = 0
         # Step n - 1 of Q tile i and step 0 of Q tile i + 1.
         for u in tl.range(0, 2, loop_unroll_factor=2):
             if u == 1:
@@ -1377,7 +1419,7 @@ def _mxfp8_fa_fwd_persistent_causal(
                 t = _unpack_p8(t)
                 if u == 0:
                     l_i = tl.max(l_acc, 1)
-                    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+                    inv_l = tl.where(l_i > 0, _rcp(l_i), 0.0)
                     tlx.local_store(tlx.local_view(o_buf, 0),
                                     (_cat8(a0, a1, a2, a3, a4, a5, a6, a7) * inv_l[:, None]).to(tl.bfloat16))
                     a0 = tl.zeros([BLOCK_M, 16], tl.float32)
@@ -1389,12 +1431,17 @@ def _mxfp8_fa_fwd_persistent_causal(
                     a6 = tl.zeros([BLOCK_M, 16], tl.float32)
                     a7 = tl.zeros([BLOCK_M, 16], tl.float32)
                     l_acc = tl.zeros([BLOCK_M, 16], tl.float32)
+                    if TAB:
+                        e4 = tl.load(sched + it + 4)
                 else:
                     _copy_q(Q, Qs, q_buf, qs_buf, (it + 1) & 1, tl.where(ok3, g3, g1), n_q, N_CTX, BLOCK_M, HEAD_DIM,
                             SCALE_K)
                     # In a stage: a stage cannot take the division in it as
                     # an input.
-                    hb4, mt4, g4, ok4 = _ctile(it + 4, pid, G, ZH, n_q, HEAD_ROWS)
+                    if TAB:
+                        hb4, mt4, g4, ok4 = _ctile_tab(e4, n_q, HEAD_ROWS)
+                    else:
+                        hb4, mt4, g4, ok4 = _ctile(it + 4, pid, G, ZH, n_q, HEAD_ROWS)
         b = b_next
         hb = hb1
         mt = mt1
@@ -1428,6 +1475,112 @@ def _num_cus(device):
 # From here on the causal kernel's SPLIT copy pays for its instruction fetch.
 _SPLIT_N = 4096
 
+# A causal Q tile costs its steps plus about this many steps of switching.
+_TILE_SWITCH_STEPS = 3
+_SCHED = {}
+
+# CUs per XCD, each XCD with its own L2.
+_XCD_CUS = 32
+_SWAP_TILES = 128
+
+
+def _swap_balance(tiles, load, cost, n_prog, lo):
+    # Even out the busiest program by moves and swaps of the tiles of each
+    # program i from index lo(i) on.
+    improved = True
+    for _ in range(4 * n_prog):
+        if not improved:
+            break
+        improved = False
+        i = max(range(n_prog), key=load.__getitem__)
+        for j in sorted(range(n_prog), key=load.__getitem__):
+            if load[j] >= load[i]:
+                break
+            for a in range(lo(i), len(tiles[i])):
+                x = tiles[i][a]
+                for b in range(lo(j) - 1, len(tiles[j])):
+                    y = None if b < lo(j) else tiles[j][b]
+                    d = cost[x[1]] - (0 if y is None else cost[y[1]])
+                    if d > 0 and load[j] + d < load[i]:
+                        if y is None:
+                            tiles[j].append(tiles[i].pop(a))
+                        else:
+                            tiles[i][a], tiles[j][b] = y, x
+                        load[i] -= d
+                        load[j] += d
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+
+
+def _lpt_tail(tiles, load, rest, cost, n_prog, full):
+    heap = [(load[i], i) for i in range(n_prog)]
+    heapq.heapify(heap)
+    for t in sorted(rest, key=lambda t: -t[1]):
+        c, i = heapq.heappop(heap)
+        tiles[i].append(t)
+        load[i] = c + cost[t[1]]
+        heapq.heappush(heap, (load[i], i))
+    # The search runs over each program's last _SWAP_TILES tiles, the shortest.
+    _swap_balance(tiles, load, cost, n_prog, lambda i: max(full[i], len(tiles[i]) - _SWAP_TILES))
+
+
+def _grouped_tiles(zh, n_q, n_prog, n_xcd, cost, rounds_back):
+    # Rounds of pairs of Q tiles m and n_q - 1 - m of one head, which cost the
+    # same for every pair, so the programs of an XCD run a few heads at a time
+    # and share their K/V in L2. Workgroups go round-robin to the XCDs. The
+    # last rounds go longest first.
+    nx = n_xcd if n_prog % n_xcd == 0 else 1
+    L = n_prog // nx
+    seq = [(h, j) for h in range(zh) for j in range(n_q // 2)]
+    R = max(len(seq) // n_prog - rounds_back, 0)
+    tiles = [[] for _ in range(n_prog)]
+    for r in range(R):
+        for x in range(nx):
+            for i, (h, j) in enumerate(seq[(r * nx + x) * L:(r * nx + x + 1) * L]):
+                tiles[x + nx * ((i + r) % L)] += [(h, n_q - 1 - j), (h, j)]
+    load = [sum(cost[m] for _, m in t) for t in tiles]
+    full = [len(t) for t in tiles]
+    _lpt_tail(tiles, load, [(h, m) for h, j in seq[R * n_prog:] for m in (n_q - 1 - j, j)], cost, n_prog, full)
+    return tiles, load
+
+
+def _causal_sched(zh, n_q, n_prog, device):
+    # With few Q tiles per program the snake order leaves the programs
+    # unequal: spread the tiles by cost, longest first, then even out the
+    # busiest program by moves and swaps. Where it balances as well, group
+    # heads instead (_grouped_tiles). Rows of (head << 8) | Q tile, Q tile 0
+    # last, padded with -1 past each program's last, then the counts of Q
+    # tiles and of those SPLIT's first loop runs.
+    key = (zh, n_q, n_prog, device)
+    if key in _SCHED:
+        return _SCHED[key]
+    cost = [2 * m + 2 + _TILE_SWITCH_STEPS for m in range(n_q)]
+    tiles = [[] for _ in range(n_prog)]
+    load = [0] * n_prog
+    _lpt_tail(tiles, load, [(h, m) for m in range(n_q) for h in range(zh)], cost, n_prog, [0] * n_prog)
+    for p in tiles:
+        p.sort(key=lambda t: -t[1])
+    if n_q % 2 == 0 and n_q >= 16:
+        n_xcd = max(_num_cus(device) // _XCD_CUS, 1)
+        for k in (1, 2, 3, 4):
+            g_tiles, g_load = _grouped_tiles(zh, n_q, n_prog, n_xcd, cost, k)
+            if max(g_load) <= max(load):
+                tiles = g_tiles
+                break
+    for p in tiles:
+        p.sort(key=lambda t: t[1] == 0)
+    stride = max(len(p) for p in tiles) + 4
+    tab = []
+    for p in tiles:
+        tab += [h << 8 | m for h, m in p] + [-1] * (stride - len(p))
+    tab += [len(p) for p in tiles] + [max(sum(m > 0 for _, m in p) - 1, 0) for p in tiles]
+    _SCHED[key] = (torch.tensor(tab, dtype=torch.int32, device=device), stride)
+    return _SCHED[key]
+
 
 def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, *, fast_exp=True):
     """Launch on the outputs of ``quantize_mxfp8_qkv``. ``fast_exp`` computes P
@@ -1458,7 +1611,11 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         )
         return out
     if causal and sm_scale != 0:
-        _mxfp8_fa_fwd_persistent_causal[(min(batch * heads * n_m, _num_cus(q_fp8.device)), )](
+        n_prog = min(batch * heads * n_m, _num_cus(q_fp8.device))
+        # Table entries hold the Q tile in 8 bits.
+        tab = n_m <= 256
+        sched, stride = _causal_sched(batch * heads, n_m, n_prog, q_fp8.device) if tab else (out, 0)
+        _mxfp8_fa_fwd_persistent_causal[(n_prog, )](
             q_fp8,
             k_fp8,
             v_fp8,
@@ -1474,6 +1631,9 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
             BLOCK_N=_BLOCK_N,
             FAST_EXP=fast_exp,
             SPLIT=n_ctx >= _SPLIT_N,
+            Sched=sched,
+            STRIDE=stride,
+            TAB=tab,
             num_warps=8,
             waves_per_eu=2,
         )
