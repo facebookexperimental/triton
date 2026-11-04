@@ -151,25 +151,23 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #src = #ttg.linear<{register = [[32], [16]], lane = [[1], [2], [4], [8], [0]], warp = [], block = [], inputRadices = {register = [3, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
 #dst = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // Register 1 moves to lane 16, which no factored map expresses. Of each
-  // broadcast lane pair only lane bit 4 = 0 stores, and a warp sync suffices.
-  // Register 1 stores at odd part 1, so its address adds 1 << 5.
+  // Register 1 moves to lane 16, which no factored map expresses. Each odd
+  // slab is a 32-element pow2 transfer at its own offset, and a warp sync
+  // suffices.
   // CHECK: module attributes {{.*}}ttg.shared = 384 : i32
   // CHECK-LABEL: llvm.func @warp_shared
-  // CHECK: "@$2 st.shared.b32 [ $0 + 0 ], $1;"
-  // CHECK: %[[Q:.*]] = llvm.udiv %{{.*}}, %{{.*}} : i32
-  // CHECK: %[[DIGIT:.*]] = llvm.urem %[[Q]], %{{.*}} : i32
-  // CHECK: %[[OWNS:.*]] = llvm.icmp "eq" %[[DIGIT]], %{{.*}} : i32
-  // CHECK: %[[PRED:.*]] = llvm.and %{{.*}}, %[[OWNS]] : i1
-  // CHECK-NEXT: llvm.mlir.constant(0 : i32) : i32
-  // CHECK-NEXT: %[[ODD:.*]] = llvm.mlir.constant(1 : i32) : i32
-  // CHECK: %[[OFFSET:.*]] = llvm.shl %[[ODD]], %{{.*}} : i32
-  // CHECK-NEXT: llvm.add %{{.*}}, %[[OFFSET]] : i32
-  // CHECK: "@$2 st.shared.b32 [ $0 + 0 ], $1;"{{.*}} %[[PRED]] :
-  // CHECK: nvvm.bar.warp.sync
+  // CHECK: nvvm.stmatrix
+  // CHECK-NEXT: %[[S1:.*]] = llvm.mlir.constant(32 : i32) : i32
+  // CHECK-NEXT: llvm.getelementptr %[[BASE:.*]][%[[S1]]] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i32
+  // CHECK: nvvm.stmatrix
+  // CHECK-NEXT: %[[S2:.*]] = llvm.mlir.constant(64 : i32) : i32
+  // CHECK-NEXT: llvm.getelementptr %[[BASE]][%[[S2]]] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i32
+  // CHECK: nvvm.stmatrix
+  // CHECK-NEXT: llvm.mlir.constant(-1 : i32) : i32
+  // CHECK-NEXT: nvvm.bar.warp.sync
   // CHECK-NOT: nvvm.barrier
-  // CHECK: llvm.load {{.*}} : !llvm.ptr<3> -> i32
-  // CHECK-NOT: nvvm.barrier
+  // CHECK-COUNT-3: nvvm.ldmatrix {{.*}}, num = 1,
+  // CHECK-NOT: {{nvvm.barrier|matrix}}
   // CHECK: llvm.return
   tt.func public @warp_shared(%p: !tt.ptr<i32>) {
     %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #src>
@@ -185,15 +183,16 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #src = #ttg.linear<{register = [[64]], lane = [[1], [2], [4], [8], [16]], warp = [[32]], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [2], block = []}, outDimSizes = [192]}>
 #dst = #ttg.linear<{register = [[64], [0]], lane = [[2], [4], [8], [16], [32]], warp = [[1]], block = [], inputRadices = {register = [3, 2], lane = [2, 2, 2, 2, 2], warp = [2], block = []}, outDimSizes = [192]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // Element 1 moves to warp 1, so a CTA barrier orders the scratch. Pointers
+  // Element 1 moves to warp 1, so CTA barriers order the scratch. Pointers
   // move as i64, and each broadcast destination register pair loads once.
+  // The three odd slabs share one store, barrier and load phase.
   // CHECK: module attributes {{.*}}ttg.shared = 1536 : i32
   // CHECK-LABEL: llvm.func @block_shared
   // CHECK: llvm.ptrtoint %{{.*}} : !llvm.ptr<1> to i64
   // CHECK-COUNT-3: llvm.store %{{.*}} : vector<1xi64>, !llvm.ptr<3>
   // CHECK-NEXT: nvvm.barrier
   // CHECK-COUNT-3: llvm.load %{{.*}} : !llvm.ptr<3> -> i64
-  // CHECK-NOT: llvm.load {{.*}}ptr<3>
+  // CHECK-NOT: {{nvvm.barrier|ptr<3>}}
   // CHECK: llvm.inttoptr %{{.*}} : i64 to !llvm.ptr<1>
   tt.func public @block_shared(%p: !tt.ptr<i32>) {
     %r = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #src>
@@ -229,18 +228,14 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #src = #ttg.linear<{register = [[0], [1], [128]], lane = [[2], [4], [8], [16], [32]], warp = [[64]], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2], block = []}, outDimSizes = [384]}>
 #dst = #ttg.linear<{register = [[1], [2], [128]], lane = [[8], [16], [32], [64], [0]], warp = [[4]], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2], block = []}, outDimSizes = [384]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // Source register 0 broadcasts, so the six unique source values store
-  // unpredicated, and the second one seeds its address with coordinate 1.
+  // Source register 0 broadcasts, so each odd slab's two unique source values
+  // store unpredicated as one 2-vector.
+  // CHECK: module attributes {{.*}}ttg.shared = 1536 : i32
   // CHECK-LABEL: llvm.func @broadcast_source_register
-  // CHECK: llvm.store %{{.*}} : vector<1xi32>, !llvm.ptr<3>
-  // CHECK: llvm.mlir.constant(true) : i1
-  // CHECK-NEXT: llvm.mlir.constant(0 : i32) : i32
-  // CHECK-NEXT: %[[COORD:.*]] = llvm.mlir.constant(1 : i32) : i32
-  // CHECK-NEXT: %[[BIT:.*]] = llvm.mlir.constant(1 : i32) : i32
-  // CHECK-NEXT: llvm.and %{{.*}}, %[[BIT]] : i32
-  // CHECK: llvm.xor %[[COORD]], %{{.*}} : i32
-  // CHECK-COUNT-5: llvm.store %{{.*}} : vector<1xi32>, !llvm.ptr<3>
+  // CHECK-COUNT-3: llvm.store %{{.*}} : vector<2xi32>, !llvm.ptr<3>
   // CHECK-NEXT: nvvm.barrier
+  // CHECK-COUNT-6: llvm.load {{.*}} : !llvm.ptr<3> -> vector<2xi32>
+  // CHECK-NOT: {{nvvm.barrier|ptr<3> ->}}
   tt.func public @broadcast_source_register(%p: !tt.ptr<i32>) {
     %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32, #src>
     %c = ttg.convert_layout %r : tensor<384xi32, #src> -> tensor<384xi32, #dst>
@@ -255,11 +250,15 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #src = #ttg.linear<{register = [[8, 0], [0, 4]], lane = [[1, 0], [2, 0], [4, 0], [0, 1], [0, 2]], warp = [], block = [], inputRadices = {register = [3, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [24, 12]}>
 #dst = #ttg.linear<{register = [[0, 4], [8, 0]], lane = [[1, 0], [2, 0], [4, 0], [0, 1], [0, 2]], warp = [], block = [], inputRadices = {register = [3, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [24, 12]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // The odd register digits swap, so the values go through scratch, and each
-  // thread reads back only its own stores.
+  // The odd register digits swap, so the values go through scratch as 3 x 3
+  // slabs, and a warp sync suffices.
+  // CHECK: module attributes {{.*}}ttg.shared = 1152 : i32
   // CHECK-LABEL: llvm.func @register_shared
-  // CHECK: nvvm.bar.warp.sync
-  // CHECK-NOT: nvvm.barrier
+  // CHECK-COUNT-9: nvvm.stmatrix
+  // CHECK-NEXT: llvm.mlir.constant(-1 : i32) : i32
+  // CHECK-NEXT: nvvm.bar.warp.sync
+  // CHECK-COUNT-9: nvvm.ldmatrix
+  // CHECK-NOT: {{nvvm.barrier|matrix}}
   // CHECK: llvm.return
   tt.func public @register_shared(%p: !tt.ptr<f32>, %f: f32) {
     %v = tt.splat %f : f32 -> tensor<24x12xf32, #src>
@@ -317,6 +316,144 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
     cf.br ^bb1(%j, %b : i32, tensor<96xi32, #p>)
   ^bb3:
     tt.store %p, %a : tensor<96x!tt.ptr<i32>, #p>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [32, 0], [64, 0], [0, 32]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // Both sides move 8 f16 per access, so each 128x32 odd slab stores through
+  // stmatrix; dim 0 bits 32 and 64 are registers on both sides, so 4 phases.
+  // CHECK: module attributes {{.*}}ttg.shared = 6144 : i32
+  // CHECK-LABEL: llvm.func @block_shared_vectorized
+  // CHECK-COUNT-3: nvvm.stmatrix {{.*}} : !llvm.ptr<3>, i32, i32, i32, i32
+  // CHECK-NEXT: nvvm.barrier
+  // CHECK-COUNT-3: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xi32>
+  // CHECK-COUNT-6: nvvm.barrier
+  // CHECK-NOT: nvvm.barrier
+  tt.func public @block_shared_vectorized(%p: !tt.ptr<f16>) {
+    %s = tt.splat %p : !tt.ptr<f16> -> tensor<128x96x!tt.ptr<f16>, #src>
+    %v = tt.load %s : tensor<128x96x!tt.ptr<f16>, #src>
+    %c = ttg.convert_layout %v : tensor<128x96xf16, #src> -> tensor<128x96xf16, #dst>
+    %d = tt.splat %p : !tt.ptr<f16> -> tensor<128x96x!tt.ptr<f16>, #dst>
+    tt.store %d, %c : tensor<128x96x!tt.ptr<f16>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [8, 0], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0]], lane = [[0, 2], [0, 4], [1, 0], [2, 0], [4, 0]], warp = [[0, 8], [0, 16]], block = [], inputRadices = {register = [2, 2, 2, 3, 2, 2, 2], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 192]}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [32, 0], [64, 0], [0, 64]], lane = [[0, 8], [0, 16], [0, 32], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 192]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // An mma.sync accumulator to a store layout: dim 0 bits 16-64 are registers
+  // on both sides, so 8 phases each move one 16x64 rep of all three slabs.
+  // CHECK: module attributes {{.*}}ttg.shared = 6144 : i32
+  // CHECK-LABEL: llvm.func @accumulator_epilogue_tiles
+  // CHECK-COUNT-3: nvvm.stmatrix {{.*}} : !llvm.ptr<3>, i32, i32, i32, i32
+  // CHECK-NEXT: nvvm.barrier
+  // CHECK-COUNT-3: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xi32>
+  // CHECK-COUNT-14: nvvm.barrier
+  // CHECK-NOT: nvvm.barrier
+  tt.func public @accumulator_epilogue_tiles(%p: !tt.ptr<f16>, %f: f16) {
+    %v = tt.splat %f : f16 -> tensor<128x192xf16, #src>
+    %c = ttg.convert_layout %v : tensor<128x192xf16, #src> -> tensor<128x192xf16, #dst>
+    %d = tt.splat %p : !tt.ptr<f16> -> tensor<128x192x!tt.ptr<f16>, #dst>
+    tt.store %d, %c : tensor<128x192x!tt.ptr<f16>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [8, 0], [0, 8], [0, 16], [0, 32], [0, 64], [64, 0]], lane = [[0, 2], [0, 4], [1, 0], [2, 0], [4, 0]], warp = [[16, 0], [32, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [192, 128]}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 16], [0, 32], [8, 0], [16, 0], [32, 0], [64, 0]], lane = [[0, 2], [0, 4], [0, 8], [0, 64], [1, 0]], warp = [[2, 0], [4, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [192, 128]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A wgmma accumulator to a layout with dim 1 bits 16 and 32 in registers:
+  // the slabs move 4-vectors, and dim 0 bit 8 makes 2 phases.
+  // CHECK: module attributes {{.*}}ttg.shared = 24576 : i32
+  // CHECK-LABEL: llvm.func @accumulator_epilogue_middle_bit
+  // CHECK-COUNT-12: llvm.store {{.*}} : vector<4xi32>, !llvm.ptr<3>
+  // CHECK-NEXT: nvvm.barrier
+  // CHECK-COUNT-12: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xi32>
+  // CHECK-COUNT-2: nvvm.barrier
+  // CHECK-NOT: nvvm.barrier
+  tt.func public @accumulator_epilogue_middle_bit(%p: !tt.ptr<f16>, %f: f16) {
+    %v = tt.splat %f : f16 -> tensor<192x128xf16, #src>
+    %c = ttg.convert_layout %v : tensor<192x128xf16, #src> -> tensor<192x128xf16, #dst>
+    %d = tt.splat %p : !tt.ptr<f16> -> tensor<192x128x!tt.ptr<f16>, #dst>
+    tt.store %d, %c : tensor<192x128x!tt.ptr<f16>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 16]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 0]], warp = [], block = [], inputRadices = {register = [2, 2, 3, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [12, 32]}>
+#dst = #ttg.linear<{register = [[1, 0], [2, 0], [4, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [12, 32]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // Peeling the odd register digit leaves 4x32 slabs, each one stmatrix
+  // and one ldmatrix.
+  // CHECK: module attributes {{.*}}ttg.shared = 768 : i32
+  // CHECK-LABEL: llvm.func @run_ends_at_odd_digit
+  // CHECK-COUNT-3: nvvm.stmatrix {{.*}} : !llvm.ptr<3>, i32, i32, i32, i32
+  // CHECK: nvvm.bar.warp.sync
+  // CHECK-COUNT-3: nvvm.ldmatrix {{.*}}, num = 2,
+  // CHECK-NOT: {{st.shared|ptr<3> ->}}
+  tt.func public @run_ends_at_odd_digit(%p: !tt.ptr<f16>) {
+    %s = tt.splat %p : !tt.ptr<f16> -> tensor<12x32x!tt.ptr<f16>, #src>
+    %v = tt.load %s : tensor<12x32x!tt.ptr<f16>, #src>
+    %c = ttg.convert_layout %v : tensor<12x32xf16, #src> -> tensor<12x32xf16, #dst>
+    %d = tt.splat %p : !tt.ptr<f16> -> tensor<12x32x!tt.ptr<f16>, #dst>
+    tt.store %d, %c : tensor<12x32x!tt.ptr<f16>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[1], [4], [64]], lane = [[2], [8], [16], [32], [0]], warp = [], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
+#dst = #ttg.linear<{register = [[1], [64]], lane = [[2], [4], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // The second register digit steps by 4, not 2, so each slab stores
+  // 2-vectors.
+  // CHECK: module attributes {{.*}}ttg.shared = 768 : i32
+  // CHECK-LABEL: llvm.func @run_ends_at_gap
+  // CHECK-COUNT-6: llvm.store {{.*}} : vector<2xi32>, !llvm.ptr<3>
+  // CHECK: nvvm.bar.warp.sync
+  // CHECK-COUNT-3: llvm.load {{.*}} : !llvm.ptr<3> -> vector<2xi32>
+  // CHECK-NOT: {{nvvm.barrier|ptr<3> ->}}
+  tt.func public @run_ends_at_gap(%p: !tt.ptr<f32>) {
+    %s = tt.splat %p : !tt.ptr<f32> -> tensor<192x!tt.ptr<f32>, #src>
+    %v = tt.load %s : tensor<192x!tt.ptr<f32>, #src>
+    %c = ttg.convert_layout %v : tensor<192xf32, #src> -> tensor<192xf32, #dst>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<192x!tt.ptr<f32>, #dst>
+    tt.store %d, %c : tensor<192x!tt.ptr<f32>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 16]], lane = [[1, 0], [2, 0], [0, 1], [0, 2], [0, 4]], warp = [[0, 8]], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [2], block = []}, outDimSizes = [4, 48]}>
+#dst = #ttg.linear<{register = [[0, 16]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [1, 0]], warp = [[2, 0]], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [2], block = []}, outDimSizes = [4, 48]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // Both dims take one access per side, so each slab moves scalars.
+  // CHECK: module attributes {{.*}}ttg.shared = 768 : i32
+  // CHECK-LABEL: llvm.func @tie_keeps_dim0
+  // CHECK-COUNT-3: llvm.store {{.*}} : vector<1xi32>, !llvm.ptr<3>
+  // CHECK-NEXT: nvvm.barrier
+  // CHECK-COUNT-3: llvm.load {{.*}} : !llvm.ptr<3> -> i32
+  // CHECK-NOT: {{nvvm.barrier|ptr<3> ->}}
+  tt.func public @tie_keeps_dim0(%p: !tt.ptr<i32>) {
+    %s = tt.splat %p : !tt.ptr<i32> -> tensor<4x48x!tt.ptr<i32>, #src>
+    %v = tt.load %s : tensor<4x48x!tt.ptr<i32>, #src>
+    %c = ttg.convert_layout %v : tensor<4x48xi32, #src> -> tensor<4x48xi32, #dst>
+    %d = tt.splat %p : !tt.ptr<i32> -> tensor<4x48x!tt.ptr<i32>, #dst>
+    tt.store %d, %c : tensor<4x48x!tt.ptr<i32>, #dst>
     tt.return
   }
 }

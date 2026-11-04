@@ -144,3 +144,32 @@ module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.n
     tt.return
   }
 }
+
+// -----
+
+// A stores 2 f32 per access (lane 0 steps by 2) and B loads 4 (its odd
+// register digit starts at 128); B's register count differs, so no map. The
+// odd digit is a register on both sides, so each round moves one odd value.
+#src = #ttg.linear<{register = [[1], [128]], lane = [[2], [4], [8], [16], [32], [64]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [384]}>
+#dst = #ttg.linear<{register = [[1], [2], [128]], lane = [[4], [8], [16], [32], [64], [0]], warp = [], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [384]}>
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK: module attributes {{.*}}ttg.shared = 512 : i32
+  // CHECK-LABEL: llvm.func @wave_shared_vectorized
+  // CHECK: llvm.store {{.*}} : vector<2xf32>, !llvm.ptr<3>
+  // CHECK-NOT: llvm.store {{.*}} !llvm.ptr<3>
+  // CHECK: rocdl.wave.barrier
+  // CHECK-NOT: llvm.store {{.*}} !llvm.ptr<3>
+  // CHECK: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xf32>
+  // CHECK-NOT: !llvm.ptr<3> -> f32
+  // CHECK: rocdl.wave.barrier
+  // CHECK-COUNT-2: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xf32>
+  // CHECK-NOT: !llvm.ptr<3> -> f32
+  tt.func public @wave_shared_vectorized(%p: !tt.ptr<f32>) {
+    %s = tt.splat %p : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>, #src>
+    %v = tt.load %s : tensor<384x!tt.ptr<f32>, #src>
+    %c = ttg.convert_layout %v : tensor<384xf32, #src> -> tensor<384xf32, #dst>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>, #dst>
+    tt.store %d, %c : tensor<384x!tt.ptr<f32>, #dst>
+    tt.return
+  }
+}
