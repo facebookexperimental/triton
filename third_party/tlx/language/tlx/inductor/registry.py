@@ -2769,7 +2769,7 @@ def _tlx_tt_generate(self, input_nodes, layout, *args, **kwargs):  # type: ignor
             count=split_k * layout.size[0] * layout.size[1],
             zero_mode=WorkspaceZeroMode.UNINITIALIZED,
             device=layout.device,
-            outer_name=WorkspaceArg.unique_name("split_k_ws_"),
+            outer_name=WorkspaceArg.unique_name("workspace_split_k_"),
             inner_name="split_k_ws",
             dtype=torch.float32,
         )
