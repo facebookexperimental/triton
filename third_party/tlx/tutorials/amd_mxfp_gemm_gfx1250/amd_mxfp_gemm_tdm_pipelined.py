@@ -2380,6 +2380,11 @@ def _validate_tiles_per_warp(tiles_per_warp):
 
 _OUT_DTYPES = {"fp32": torch.float32, "fp16": torch.float16}
 
+# Compile options for every mxgemm_tdm_pipelined_kernel launch. gfx1250's
+# va_vdst anti-hints raise VGPR pressure; with BK256 FP8 B tiles they push the
+# kernel past the register file and into scratch spills.
+PIPELINED_COMPILE_OPTIONS = {"va_vdst_anti_hints": False}
+
 
 def mxgemm_tdm_pipelined(
         a: torch.Tensor,
@@ -2582,6 +2587,7 @@ def mxgemm_tdm_pipelined(
             TILES_PER_WARP=TILES_PER_WARP,
             num_warps=4,
             waves_per_eu=1,
+            **PIPELINED_COMPILE_OPTIONS,
         )
 
     if callable(BENCHMARK):
@@ -2710,6 +2716,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
         TILES_PER_WARP=_validate_tiles_per_warp(cfg.get("TILES_PER_WARP", (2, 2))),
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
+        **PIPELINED_COMPILE_OPTIONS,
     )
     return c
 

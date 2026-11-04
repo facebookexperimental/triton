@@ -7580,7 +7580,8 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K)
             "TILES_PER_WARP": (2, 2),
         },
     )
-    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
+                              options=_gfx1250_mxfp.PIPELINED_COMPILE_OPTIONS)
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
     assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
