@@ -2,7 +2,6 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include <cstdlib>
@@ -142,21 +141,10 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
                                       allocation.getSharedMemorySize()));
 }
 
-// The layout of an NPOT shared tile is built on its pow2 cover, so the
-// allocation must hold at least as many elements as the cover's allocation.
 static bool isNpotSharedCover(Type type) {
   auto memDesc = dyn_cast<MemDescType>(type);
-  if (!memDesc || !isa<SharedEncodingTrait>(memDesc.getEncoding()))
-    return false;
-  Attribute encoding = memDesc.getEncoding();
-  ArrayRef<int64_t> allocShape = memDesc.getAllocShape();
-  auto tile = dropPipeliningDim(allocShape, encoding);
-  SmallVector<int64_t> cover(allocShape);
-  llvm::copy(getNpotCoverShape(tile), cover.end() - tile.size());
-  if (llvm::equal(cover, allocShape))
-    return false;
-  return getAllocationElems(encoding, allocShape) <
-         getAllocationElems(encoding, cover);
+  return memDesc && isa<SharedEncodingTrait>(memDesc.getEncoding()) &&
+         !holdsNpotSharedCover(memDesc.getEncoding(), memDesc.getAllocShape());
 }
 
 LogicalResult verifyNpotTypesSupported(ModuleOp mod) {

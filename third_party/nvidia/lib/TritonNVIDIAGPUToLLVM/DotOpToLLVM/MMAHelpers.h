@@ -283,7 +283,8 @@ private:
       std::swap(leadingDim, stridedDim);
     }
     auto log2RowsTile = shmemTileInv.getInDimSizeLog2(dims[leadingDim]);
-    if (llvm::Log2_32(instrShape[leadingDim]) > log2RowsTile) {
+    // Ceil: an NPOT N that ends inside the second atom still needs the LBO.
+    if (llvm::Log2_32_Ceil(instrShape[leadingDim]) > log2RowsTile) {
       lbo = ll.getBasis(dims[leadingDim], log2RowsTile, kOffset);
     }
 
