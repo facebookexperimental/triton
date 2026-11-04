@@ -32,6 +32,18 @@ def _sdpa(q, k, v, causal):
     return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=q.shape[-1]**-0.5)
 
 
+def _sdpa_fp32_grads(q, k, v, do, causal):
+    grads = [torch.empty(q.shape, device=q.device) for _ in range(3)]
+    for b in range(q.shape[0]):
+        for h in range(q.shape[1]):
+            inputs = [x[b, h].detach().float().requires_grad_() for x in (q, k, v)]
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                out = _sdpa(*inputs, causal)
+            for grad, value in zip(grads, torch.autograd.grad(out, inputs, do[b, h].float())):
+                grad[b, h] = value
+    return grads
+
+
 def _assert_close(out, ref, dtype):
     precision = REL_PRECISION[dtype]
     torch.testing.assert_close(out, ref, atol=precision * ref.abs().max().item(), rtol=precision)
@@ -82,6 +94,36 @@ def test_flash_attn_bwd_bf16_accuracy(Z, H, N_CTX, HEAD_DIM):
     for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
         rel_l2 = torch.linalg.vector_norm(got.float() - want.float()) / torch.linalg.vector_norm(want.float())
         assert rel_l2 < REL_PRECISION[torch.bfloat16]
+
+
+@pytest.mark.parametrize("num_ctas", [1, 2])
+def test_flash_attn_bwd_rms_error_matches_sdpa(num_ctas, monkeypatch):
+    """Gradients carry no more rounding error than BF16 SDPA's backward from the same inputs.
+
+    Rounding a scaled operand to BF16 before an MMA, such as folding sm_scale / ln(2) into K,
+    raises the RMS error 1.2-1.5x while nearly every input still passes `_assert_close`.
+    """
+    import triton
+    from triton.tlx.ops import flash_attn as tlx_flash_attn
+    from triton.tlx.ops.kernels.flash_attn import sm100
+
+    config = (sm100.configs_bwd_1cta if num_ctas == 1 else sm100.configs_bwd_2cta)[0]
+
+    def tuned_bwd(space):
+        return triton.autotune(configs=[config], key=["N_CTX", "HEAD_DIM"])(sm100._attn_bwd_ws)
+
+    monkeypatch.setattr(sm100, "_tuned_bwd", tuned_bwd)
+    q, k, v = _qkv(2, 4, 1024, 64, torch.bfloat16, requires_grad=True)
+    rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
+    do = torch.randn_like(q)
+
+    tlx_flash_attn(q, k, v, causal=False, space="smoke").backward(do)
+    _sdpa(rq, rk, rv, causal=False).backward(do)
+
+    exact = _sdpa_fp32_grads(q, k, v, do, causal=False)
+    for name, got, want, ref in zip("qkv", (q.grad, k.grad, v.grad), (rq.grad, rk.grad, rv.grad), exact):
+        rms_got, rms_want = ((x.float() - ref).square().mean().sqrt().item() for x in (got, want))
+        assert rms_got < 1.1 * rms_want, f"d{name} RMS error {rms_got:.3e} vs BF16 SDPA {rms_want:.3e}"
 
 
 @pytest.mark.parametrize("dtype_name", ["fp16", "bf16"])

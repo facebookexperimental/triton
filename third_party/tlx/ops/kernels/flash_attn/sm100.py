@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2
 from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -2363,6 +2363,7 @@ def _bwd_compute_inner_loop(
     do_out_dtype,
     q_out_dtype,
     N_CTX,
+    qk_scale,
     NUM_BUFFERS_TMEM: tl.constexpr,
     NUM_BUFFERS_DS: tl.constexpr,
     BLOCK_M1: tl.constexpr,
@@ -2385,6 +2386,13 @@ def _bwd_compute_inner_loop(
     num_steps_override=0,
     qk_loaded=None,
 ):
+    # [BLOCK_N1, BLOCK_M1] row-major: lanes and the first 2 warp bits walk rows,
+    # the last warp bit picks a 32-column chunk, registers hold 32 columns plus
+    # the matching chunk in the other M-half.
+    HALF_SPLIT_LAYOUT: tl.constexpr = tlx.layout(
+        shape=((32, 4, 2), (32, 2)),
+        stride=((BLOCK_M1, 32 * BLOCK_M1, 32), (1, BLOCK_M1 // 2)),
+    )
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
     if num_steps_override > 0:
@@ -2403,16 +2411,21 @@ def _bwd_compute_inner_loop(
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
         tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
 
-        qkT = tlx.local_load(qk_tiles[tmem_buf_id])
         if USE_2CTA:
+            # Pin a 32x32b TMEM layout where each warpgroup holds 32 columns of
+            # each M-half (cols 0-31 + 64-95, or 32-63 + 96-127), so splitting
+            # dsT into M-halves below is a register-only split.
+            qkT = tlx.local_load(qk_tiles[tmem_buf_id], layout=HALF_SPLIT_LAYOUT)
             # S is in registers: Dot 5 may now write dQ over the upper half of the S region.
             tlx.barrier_arrive(qk_loaded[tmem_buf_id], 1, remote_cta_rank=0)
+        else:
+            qkT = tlx.local_load(qk_tiles[tmem_buf_id])
         m = tlx.local_load(sM_tiles[m_buf_id])
         # qkT/pT are transposed: [BLOCK_N1 (keys), BLOCK_M1 (queries)]. Apply the
         # causal mask to the logits via the R2P bitmask helper (keep query-cols
         # m >= key-row n), then exp2 (exp2(-inf) = 0), avoiding the per-element
         # ISETP arithmetic of `offs_m >= offs_n`.
-        sT = _sub_f32x2(qkT, m[None, :])
+        sT = _fma_f32x2(qkT, qk_scale, -m[None, :])
         if STAGE == 1:
             col_limit_left = (offs_n - curr_m)[:, None]
             sT = _apply_causal_mask(sT, col_limit_left, BLOCK_M1, keep_ge=True)
@@ -2435,7 +2448,10 @@ def _bwd_compute_inner_loop(
 
         # --- Phase 3: Compute dS = pT * (dpT - Di). ---
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
-        dpT = tlx.local_load(dp_tiles[tmem_buf_id])
+        if USE_2CTA:
+            dpT = tlx.local_load(dp_tiles[tmem_buf_id], layout=HALF_SPLIT_LAYOUT)
+        else:
+            dpT = tlx.local_load(dp_tiles[tmem_buf_id])
         tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
         Di = tlx.local_load(sD_tiles[d_buf_id])
         tlx.barrier_arrive(m_empties[m_buf_id])
@@ -2462,24 +2478,25 @@ def _bwd_compute_inner_loop(
             # phase is complete; arm it here, where the threads are already in step.
             tlx.barrier_expect_bytes(ds_peer_fulls[ds_buf_id], 2 * BLOCK_N1 * (BLOCK_M1 // NUM_CTAS))
             peer_rank = 1 - cluster_cta_rank
-            # Load own/peer M-columns from TMEM (dsT_tmem_tiles), store to SMEM.
+            # Split own/peer M-columns of dsT in registers, store to SMEM.
+            dsT_lo, dsT_hi = _split_n_2D(dsT, 2)
+            # Pick the SMEM destinations by rank, not the data: swapping the halves
+            # costs a SEL or MOV per register.
             if cluster_cta_rank == 0:
-                own_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                peer_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
-                                            [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
                 own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                # Same type as the ds_xchg_tiles view so either can flow out of the if.
+                lo_smem = tlx.local_reinterpret(own_smem, ds_tiles.dtype, [BLOCK_N1, BLOCK_M1 // NUM_CTAS],
+                                                layout=ds_xchg_tiles.type.layout, pin=False)
+                hi_smem = ds_xchg_tiles[ds_buf_id]
             else:
-                own_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
-                                           [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                peer_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
                 own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [BLOCK_N1, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-            own_data = tlx.local_load(own_tmem)
-            tlx.local_store(own_smem, own_data)
-            peer_data = tlx.local_load(peer_tmem)
-            # Signal dp_empties right after TMEM reload is done —
+                lo_smem = ds_xchg_tiles[ds_buf_id]
+                hi_smem = tlx.local_reinterpret(own_smem, ds_tiles.dtype, [BLOCK_N1, BLOCK_M1 // NUM_CTAS],
+                                                layout=ds_xchg_tiles.type.layout, pin=False)
+            tlx.local_store(lo_smem, dsT_lo)
             # dsT_tmem is no longer needed, MMA can overwrite dp/dq TMEM.
             tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
-            tlx.local_store(ds_xchg_tiles[ds_buf_id], peer_data)
+            tlx.local_store(hi_smem, dsT_hi)
             tlx.fence("async_shared")
             remote_dst = own_smem
             tlx.async_remote_shmem_copy(
@@ -2851,7 +2868,7 @@ def _attn_bwd_ws(
                 tlx.storage_kind.tmem,
             )
 
-    LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
+    qk_scale = sm_scale * 1.44269504  # 1/log(2)
 
     # 2-CTA setup
     if USE_2CTA:
@@ -2928,6 +2945,7 @@ def _attn_bwd_ws(
                         do_out_dtype,
                         q_out_dtype,
                         N_CTX,
+                        qk_scale,
                         NUM_BUFFERS_TMEM,
                         NUM_BUFFERS_DS,
                         BLOCK_M1,
@@ -2977,6 +2995,7 @@ def _attn_bwd_ws(
                             do_out_dtype,
                             q_out_dtype,
                             N_CTX,
+                            qk_scale,
                             NUM_BUFFERS_TMEM,
                             NUM_BUFFERS_DS,
                             BLOCK_M1,
@@ -3024,6 +3043,7 @@ def _attn_bwd_ws(
                             do_out_dtype,
                             q_out_dtype,
                             N_CTX,
+                            qk_scale,
                             NUM_BUFFERS_TMEM,
                             NUM_BUFFERS_DS,
                             BLOCK_M1,
@@ -3139,7 +3159,7 @@ def _attn_bwd_ws(
                                 1,
                                 remote_cta_rank=0,
                             )
-                        dq_full = dq_full * LN2
+                        dq_full = dq_full * sm_scale
                         if DQ_BULK_NCOL > 0:
                             # This CTA's dQ for the m-block is a contiguous
                             # [BLOCK_M1, HEAD_DIM // 2] region of dq_accum, stored
@@ -3188,7 +3208,7 @@ def _attn_bwd_ws(
                                 [BLOCK_M1, DQ_REDUCE_NCOL],
                             )
                             dq = tlx.local_load(dq_slice)
-                            dq = dq * LN2
+                            dq = dq * sm_scale
                             tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1, read_only=True)
                             tlx.local_store(
                                 dq_store_buf[dq_smem_idx],
@@ -3577,9 +3597,6 @@ class _attention(torch.autograd.Function):
         dq_accum = torch.zeros([BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM], device=q.device, dtype=torch.float32)
         PRE_BLOCK = 128
         BLK_SLICE_FACTOR = 2
-        RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
-        arg_k = k
-        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
@@ -3595,7 +3612,7 @@ class _attention(torch.autograd.Function):
         desc_shape = [BATCH, N_HEAD, N_CTX, HEAD_DIM]
         desc_strides = [N_HEAD * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, HEAD_DIM, 1]
         desc_k = TensorDescriptor(
-            arg_k,
+            k,
             shape=desc_shape,
             strides=desc_strides,
             block_shape=dummy_block,
@@ -3651,7 +3668,7 @@ class _attention(torch.autograd.Function):
             block_shape=[1],
         )
 
-        desc_kt = TensorDescriptor(arg_k, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+        desc_kt = TensorDescriptor(k, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
         desc_qt = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
         desc_dot = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
 

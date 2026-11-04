@@ -1867,7 +1867,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
 #rhs2 = #ttg.dot_op<{opIdx = 1, parent = #mma2, kWidth = 8}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @wave_commit_operand_layout_rank_mismatch(%acc: tensor<16x128xf32, #mma2>, %b: tensor<2x32x128xbf16, #rhs2>) {
-    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    // expected-error @+1 {{input 1 must use a matching BF16, F16, or scaled i8 dot-operand layout with kWidth=4/8}}
     %result, %preserved = amdg.mfma_commit %acc, %b : tensor<16x128xf32, #mma2>, tensor<2x32x128xbf16, #rhs2>
     tt.return
   }
@@ -2157,7 +2157,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.tar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @mfma_commit_missing_bf16_dependency_encoding_rank3(
       %acc: tensor<2x16x16xf32, #mma>, %dependency: tensor<2x32x16xbf16>) {
-    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    // expected-error @+1 {{input 1 must use a matching BF16, F16, or scaled i8 dot-operand layout with kWidth=4/8}}
     %result, %preserved = amdg.mfma_commit %acc, %dependency
         : tensor<2x16x16xf32, #mma>, tensor<2x32x16xbf16>
     tt.return
@@ -2171,7 +2171,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.tar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @mfma_commit_missing_f16_dependency_encoding_rank3(
       %acc: tensor<2x16x16xf32, #mma>, %dependency: tensor<2x32x16xf16>) {
-    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    // expected-error @+1 {{input 1 must use a matching BF16, F16, or scaled i8 dot-operand layout with kWidth=4/8}}
     %result, %preserved = amdg.mfma_commit %acc, %dependency
         : tensor<2x16x16xf32, #mma>, tensor<2x32x16xf16>
     tt.return
@@ -2245,7 +2245,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @mfma_commit_missing_bf16_dependency_encoding_rank2(
       %acc: tensor<16x16xf32, #mma>, %dependency: tensor<32x16xbf16>) {
-    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    // expected-error @+1 {{input 1 must use a matching BF16, F16, or scaled i8 dot-operand layout with kWidth=4/8}}
     %result, %preserved = amdg.mfma_commit %acc, %dependency
         : tensor<16x16xf32, #mma>, tensor<32x16xbf16>
     tt.return
@@ -2259,7 +2259,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @mfma_commit_missing_f16_dependency_encoding_rank2(
       %acc: tensor<16x16xf32, #mma>, %dependency: tensor<32x16xf16>) {
-    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    // expected-error @+1 {{input 1 must use a matching BF16, F16, or scaled i8 dot-operand layout with kWidth=4/8}}
     %result, %preserved = amdg.mfma_commit %acc, %dependency
         : tensor<16x16xf32, #mma>, tensor<32x16xf16>
     tt.return
