@@ -611,7 +611,8 @@ def TT_SplitOp : TT_Op<"split", [
 
 def TT_TransOp : TT_Op<"trans", [Pure, TransposeOpInterface,
                                  InferTensorTypeOpWithLayoutEquivalence,
-                                 SameOperandsAndResultElementType]> {
+                                 SameOperandsAndResultElementType,
+                                 ProductLayoutOpInterface]> {
 
   let summary = "rearrange the dimensions of a tensor";
   let description = [{
