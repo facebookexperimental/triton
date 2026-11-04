@@ -12,6 +12,16 @@ Change: recompute those values inside the tile. Make them depend on a runtime va
 
 Confirm: `vgpr_spills` and `reload_drains_after_stores` drop, and outputs stay bitwise identical.
 
+## Rematerialized Ranges Keep Coordinates Near Their Use
+
+Symptom: an epilogue coordinate tensor, such as the `tlx.require_layout` result feeding a `tlx.buffer_store` in a grouped GEMM, is computed before the main K loop even though it is only consumed in the epilogue. The offsets derive from program-static values, so nothing in the source keeps them inside the loop. The hoisted tensor stays live across the hot loop, and the store waits at the tile boundary. Wrapping the computation in `inline_asm` is not an option when the value feeds layout computation.
+
+Cause: LLVM LICM hoists loop-invariant coordinate arithmetic above the loop, and CSE merges identical ranges into one value defined at the earliest point. The value is cheap to recompute, but the hoisted form occupies registers for the whole pipeline.
+
+Change: replace `tl.arange` with `tlx.rematerialized_range(start, end, identity, placement=...)` at the use site. It returns the same values as `tl.arange`, but instances with distinct `identity` values are kept separate under CSE, so give each use site its own identity. Pass a scalar `placement` that is defined where the range is consumed; the loop induction variable is the reliable choice, because the scheduling dependency on it prevents the range from being hoisted out of that loop. Anchor epilogue offsets to the `while` induction variable rather than to a pre-loop value so they materialize in the epilogue. This is the pattern the FA backward kernel introduced (facebookexperimental/triton PR 2709).
+
+Confirm: the range arithmetic appears at the use site in TTGIR/AMDGCN instead of above the loop, boundary stalls drop, and outputs stay bitwise identical.
+
 ## Sub-Dword Operand Gathers Before MFMA
 
 Symptom: `hot_loop.ds_read_by_width` contains `u8` or `u16` reads, `byte_assembly_valu` (`v_perm_b32`, `v_lshl_or_b32`) is nonzero, and `nop_cycles` is high, all feeding `v_mfma_scale` or packed MFMA operands. Block-scale factors are the common case: each scaled MFMA packs four E8M0 bytes from different row groups into one VGPR.
