@@ -4,6 +4,53 @@
 #include "triton/Tools/LinearLayout.h"
 
 namespace mlir::triton {
+
+// Whether the layout reaches every coordinate of the box [0, N_d) given by
+// `logicalShape` (out dims dim0, dim1, ... in order). The image is a subgroup,
+// so this is a closed-form span check; malformed inputs are not covered.
+bool coversAllLogicalOutputs(const LinearLayout &layout,
+                             ArrayRef<int64_t> logicalShape);
+
+enum class ProductConversionScope {
+  Register,
+  Warp,
+  Block,
+};
+
+// `dstLayout` with its out dims in `srcLayout`'s order, or std::nullopt
+// unless the source out dims are dim0, dim1, ... of `logicalShape`'s rank and
+// the destination has the same out-dim names.
+std::optional<LinearLayout>
+alignProductConversionOutDims(const LinearLayout &srcLayout,
+                              const LinearLayout &dstLayout,
+                              ArrayRef<int64_t> logicalShape);
+
+// Whether every input dimension is register, lane, warp or a singleton block.
+bool hasProductConversionInputDims(const LinearLayout &layout);
+
+// The narrowest scope holding every canonical source owner and in-bounds
+// destination replica; Block if a non-radix-2 digit lies outside registers.
+// Requires planProductLayoutConversion's preflight to pass.
+ProductConversionScope
+classifyProductConversionScope(const LinearLayout &srcLayout,
+                               const LinearLayout &dstLayout,
+                               ArrayRef<int64_t> logicalShape);
+
+// Maps L with a(registerOrder(L(x))) == b(x). L's register output puts a's
+// radix-2 register digits first and its odd digit last, as a Product out dim
+// needs; registerOrder takes that order to a's flat register order.
+struct ProductConversionInputMap {
+  LinearLayout registerMap;
+  LinearLayout laneMap;
+  ColumnAction registerOrder;
+};
+
+// Closed form; std::nullopt when a and b differ in outs or in dims, have
+// non-radix-2 digits outside registers or L would move another dim, and for
+// some register/lane bijections too (T294601128).
+std::optional<ProductConversionInputMap>
+mapProductConversionInputs(const LinearLayout &a, const LinearLayout &b);
+
 // Is the sublayout defined from dimNames to dimNames the identity?
 // In particular, is the input and  output size in these dimensions
 // the same, and are the bases the identity?
