@@ -240,6 +240,22 @@ enum class ProductConversionTransport {
   Shared,
 };
 
+// Register digits both layouts share, each alone setting its out dim's odd
+// part or one binary bit. A Shared transfer loops over them, as the pow2 path
+// loops over reps, moving one tile per value.
+struct ProductSharedTiling {
+  SmallVector<int32_t> sourceDigits;
+  SmallVector<int32_t> destinationDigits;
+  triton::LinearLayout sourceTile;
+  triton::LinearLayout destinationTile;
+};
+
+// The odd slabs of a Shared transfer: each NPOT out dim's odd part peeled off
+// both layouts. nullopt unless that leaves pow2 slab layouts.
+std::optional<ProductSharedTiling>
+getProductSharedSlabs(const triton::LinearLayout &src,
+                      const triton::LinearLayout &dst);
+
 // Built only by the factories, so no plan is default or partial: rejected
 // (`rejection` only), shared (Shared transport) or factored (Register or Warp
 // transport, with the register/lane permutation factors).
@@ -263,6 +279,8 @@ struct ProductConversionPlan {
   // lane to its source lane.
   std::optional<DecomposedWarpConversion> warpFactors;
   std::optional<triton::ColumnAction> destinationRegisterOrder;
+  // Set by getProductConversionPlan, which knows the element bitwidth.
+  std::optional<ProductSharedTiling> sharedTiling;
 
   bool supported() const { return !rejection.has_value(); }
 
@@ -287,8 +305,8 @@ planProductLayoutConversion(const triton::LinearLayout &srcLayout,
 std::optional<ProductConversionPlan>
 getProductConversionPlan(RankedTensorType srcTy, RankedTensorType dstTy);
 
-// Scratch bytes of a convert with a Product layout, else nullopt: the whole
-// tensor for a Shared plan, 0 for the other plans.
+// Scratch bytes of a convert with a Product layout, else nullopt: one tile
+// (the whole tensor if untiled) for a Shared plan, 0 for the other plans.
 std::optional<unsigned>
 getProductConversionScratchBytes(triton::gpu::ConvertLayoutOp op);
 
