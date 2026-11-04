@@ -182,13 +182,27 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         });
   }
 
-  // TLX keeps the strict explicit-layout invariant for broadcast (pre-pick
-  // trait behavior); upstream #11759 relaxed it for TritonGPU/Gluon via this
-  // hook. Revisit if TLX adopts relaxed broadcast layouts.
+  // Upstream #11759 relaxed broadcast layouts: the result may differ from the
+  // source when no data moves between threads/registers (projection
+  // equality). Strip TLX wrappers on both sides so wrapper asymmetry alone
+  // never rejects an otherwise valid pair, then defer to the underlying
+  // source encoding's dialect check to preserve the upstream intent exactly.
+  // Pairs with no concrete source dialect (or a TLX-owned inner encoding)
+  // cannot delegate without recursing here, so they keep strict equality.
   LogicalResult
   verifyBroadcastOpEncoding(RankedTensorType srcType,
                             RankedTensorType dstType) const override {
-    return success(srcType.getEncoding() == dstType.getEncoding());
+    Attribute srcEnc = getEffectiveEncoding(srcType.getEncoding());
+    Attribute dstEnc = getEffectiveEncoding(dstType.getEncoding());
+    const triton::DialectInferLayoutInterface *delegate =
+        getInferLayoutInterfaceFor(srcEnc);
+    if (!delegate || delegate == this)
+      return success(srcType.getEncoding() == dstType.getEncoding());
+    return delegate->verifyBroadcastOpEncoding(
+        RankedTensorType::get(srcType.getShape(), srcType.getElementType(),
+                              srcEnc),
+        RankedTensorType::get(dstType.getShape(), dstType.getElementType(),
+                              dstEnc));
   }
 
   LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,

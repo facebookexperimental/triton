@@ -12,12 +12,15 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-try:
-    from . import build_helpers as bh
-except ImportError:  # build_helpers.py runs as a script
+if TYPE_CHECKING:
     import build_helpers as bh
+else:
+    try:
+        import build_helpers as bh
+    except ImportError:  # run as a package (e.g. setup.py imports python.meta_llvm)
+        from python import build_helpers as bh
 
 
 def enabled(base_dir: str) -> bool:

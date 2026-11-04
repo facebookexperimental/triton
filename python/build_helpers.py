@@ -18,12 +18,15 @@ import zipfile
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-try:
-    from . import meta_llvm
-except ImportError:  # run as a script
+if TYPE_CHECKING:
     import meta_llvm
+else:
+    try:
+        import meta_llvm
+    except ImportError:  # run as a package (e.g. setup.py imports python.build_helpers)
+        from python import meta_llvm
 
 
 def get_base_dir():
@@ -88,9 +91,10 @@ def find_therock_rocm_include_dir() -> Optional[str]:
     """
     rocm_sdk = Path(sys.executable).with_name("rocm-sdk")
     if not rocm_sdk.is_file():
-        rocm_sdk = shutil.which("rocm-sdk")
-    if rocm_sdk is None:
-        return None
+        found_sdk = shutil.which("rocm-sdk")
+        if found_sdk is None:
+            return None
+        rocm_sdk = Path(found_sdk)
     try:
         # Run the caller venv's rocm-sdk entry point in isolated mode so pip's
         # temporary PEP 517 import path cannot shadow its installed packages.
@@ -413,8 +417,8 @@ def get_llvm_system_suffix(helper_args: BuildHelperArgs):
             system_suffix = "ubuntu-arm64"
         elif arch == "x64":
             vglibc = tuple(map(int, platform.libc_ver()[1].split(".")))
-            vglibc = vglibc[0] * 100 + vglibc[1]
-            if vglibc > 228:
+            vglibc_num = vglibc[0] * 100 + vglibc[1]
+            if vglibc_num > 228:
                 # Ubuntu 24 LTS (v2.39)
                 # Ubuntu 22 LTS (v2.35)
                 # Ubuntu 20 LTS (v2.31)
@@ -706,9 +710,9 @@ def download_and_copy(name, src_func, dst_path, override_path, version, url_func
     download = not os.path.exists(src_path)
     if os.path.exists(dst_path) and system == "Linux" and shutil.which(dst_path) is not None:
         curr_version = subprocess.check_output([dst_path, "--version"]).decode("utf-8").strip()
-        curr_version = re.search(r"V([.|\d]+)", curr_version)
-        assert curr_version is not None, f"No version information for {dst_path}"
-        download = download or curr_version.group(1) != version
+        version_match = re.search(r"V([.|\d]+)", curr_version)
+        assert version_match is not None, f"No version information for {dst_path}"
+        download = download or version_match.group(1) != version
     if download:
         _download_and_extract(url, tmp_path, name, helper_args.archives_path)
     os.makedirs(os.path.split(dst_path)[0], exist_ok=True)

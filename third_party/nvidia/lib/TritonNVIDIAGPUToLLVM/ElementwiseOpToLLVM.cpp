@@ -360,6 +360,9 @@ static StringRef stringifyLLVMRoundingMode(triton::RoundingMode rounding) {
   switch (rounding) {
   case triton::RoundingMode::RTNE: return "round.tonearest";
   case triton::RoundingMode::RTZ: return "round.towardzero";
+  // RS (stochastic rounding) is intercepted by createDestOps and lowered
+  // through lowerFpToFpWithStochRounding; it never reaches this switch.
+  case triton::RoundingMode::RS: llvm_unreachable("unreachable rounding mode");
   }
   // clang-format on
   llvm_unreachable("unknown rounding mode");
