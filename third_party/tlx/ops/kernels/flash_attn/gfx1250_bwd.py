@@ -90,6 +90,16 @@ class BackwardConfig:
     # KV tiles on grid X instead of KV heads.
     tile_major: bool = False
     # Groups of up to 16 KV tiles share one shader engine and a private dQ slice.
+    # Invariant for the cluster-scope dQ atomics: every CTA that adds into the
+    # same element of the same dQ slice must be in the same cluster, because
+    # cluster-scope atomics are only coherent within it. The launch keeps this
+    # as follows. tile_major puts one KV head's NT tiles on consecutive grid-X
+    # CTAs, and ctas_per_cga = min(NT, 16) divides NT, so a cluster holds tiles
+    # of one (batch, KV head, split). Above 16 tiles, each 16-tile group writes
+    # its own dQ slice (_dq_slices). Q splits and tail splits own disjoint Q
+    # rows, and the tail-split grid starts the tail at a KV-head boundary
+    # (_tail_partition). A change to the grid mapping, cluster size or dQ
+    # slicing must preserve this.
     cluster_dq: bool = False
     # Split K/V by rows and dS by columns into two LDS partitions. Opposite
     # SIMD pairs walk opposite pieces in the delayed-dQ product.
