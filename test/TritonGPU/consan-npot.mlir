@@ -19,12 +19,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
-// A tensor cannot hold the NPOT tile of a shared physical cover, so ConSan
-// does not poison its pages; the power-of-two control's pages are.
+// A tensor cannot hold the NPOT tile of a compact shared allocation, so
+// ConSan does not poison its pages; the power-of-two control's pages are.
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [1, 0]}>
 #smem = #ttg.shared_memory
 // CHECK-LABEL: @swizzled_pages
-// CHECK: ttg.local_alloc {{.*}} -> !ttg.memdesc<2x64x96xf16, #shared, #smem, mutable, 2x64x128>
+// CHECK: ttg.local_alloc {{.*}} -> !ttg.memdesc<2x64x96xf16, #shared, #smem, mutable>
 // CHECK: ttg.local_alloc {{.*}} -> !ttg.memdesc<2x64x128xf16, #shared, #smem, mutable>
 // CHECK-COUNT-2: ttg.local_store {{.*}} -> !ttg.memdesc<64x128xf16
 // CHECK-NOT: ttg.local_store
@@ -32,7 +32,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 // OFF: shape must have power-of-2 and non-zero dimensions; got 2, 64, 96
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
   tt.func public @swizzled_pages() {
-    %0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2x64x96xf16, #shared, #smem, mutable, 2x64x128>
+    %0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2x64x96xf16, #shared, #smem, mutable>
     %1 = ttg.local_alloc {allocation.offset = 32768 : i32} : () -> !ttg.memdesc<2x64x128xf16, #shared, #smem, mutable>
     tt.return
   }

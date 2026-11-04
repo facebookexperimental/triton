@@ -16,6 +16,9 @@
 !tmem_scales_cover = !ttg.memdesc<128x6xi8, #ttng.tensor_memory_scales_encoding<>, #tmem_space, mutable, 128x8>
 // Power-of-two control: a compact TMEM allocation verifies.
 !tmem_pot_compact = !ttg.memdesc<128x128xf32, #tmem_n32, #tmem_space, mutable>
+// Compact NPOT swizzled and NVMMA allocations hold their own cover.
+!shared_npot = !ttg.memdesc<8x192xi8, #shared, #smem, mutable>
+!nvmma_npot = !ttg.memdesc<128x192xf16, #nvmma, #smem, mutable>
 !shared_cover = !ttg.memdesc<8x48xi8, #shared, #smem, mutable, 8x64>
 // A larger allocation holds the cover.
 !shared_overallocated = !ttg.memdesc<8x48xi8, #shared, #smem, mutable, 8x128>
@@ -31,6 +34,8 @@ module {
   tt.func @alloc_physical_covers() {
     %0 = ttng.tmem_alloc : () -> !tmem_npot
     %1 = ttng.tmem_alloc : () -> !tmem_multibuffer
+    %5 = ttg.local_alloc : () -> !shared_npot
+    %6 = ttg.local_alloc : () -> !nvmma_npot
     %7 = ttg.local_alloc : () -> !shared_cover
     %8 = ttg.local_alloc : () -> !shared_leading_npot
     %11 = ttg.local_alloc : () -> !nvmma_native_cover

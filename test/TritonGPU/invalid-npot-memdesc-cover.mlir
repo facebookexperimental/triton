@@ -111,6 +111,26 @@ module {
 
 // -----
 
+#rotating = #ttg.amd_rotating_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+// The same holds for a compact allocation.
+// expected-error @below {{NPOT memdesc allocation that does not match the encoding's physical cover is not yet supported}}
+!compact_unpadded = !ttg.memdesc<64x96xi8, #rotating, #smem, mutable>
+module {
+}
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_space = #ttng.tensor_memory
+// Only a shared allocation may be compact.
+// expected-error @below {{alloc shape must have power-of-2 and non-zero dimensions; got 128, 96}}
+!compact_tmem = !ttg.memdesc<128x96xf32, #tmem, #tmem_space, mutable>
+module {
+}
+
+// -----
+
 #nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
 #smem = #ttg.shared_memory
 // The 4x128 cover is smaller than the 8x128 NVMMA core tile.

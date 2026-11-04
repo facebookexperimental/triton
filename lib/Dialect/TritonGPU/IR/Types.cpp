@@ -140,7 +140,10 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
       return emitError()
              << "shape must have power-of-2 and non-zero dimensions; got "
              << shape;
-    if (!hasPow2MemDescLayoutShape(encoding, allocShape))
+    // A shared allocation with an NPOT tile is laid out and sized as its
+    // power-of-two cover, which verifyNpotPhysicalCover checks it holds.
+    if (!(npotCoverAllocShape && isa<SharedEncodingTrait>(encoding)) &&
+        !hasPow2MemDescLayoutShape(encoding, allocShape))
       return emitError()
              << "alloc shape must have power-of-2 and non-zero dimensions; got "
              << allocShape;
