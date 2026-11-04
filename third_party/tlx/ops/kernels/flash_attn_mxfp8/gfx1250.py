@@ -295,9 +295,7 @@ def _softmax(qk, m_i, qk_scale, offs_m, key0, BLOCK_M: tl.constexpr, BLOCK_N: tl
 
 @triton.jit
 def _p8(t, offs_m, key0, BLOCK_N: tl.constexpr, MASK: tl.constexpr, FAST_EXP: tl.constexpr, ZERO_SCALE: tl.constexpr):
-    # P as E4M3 from _softmax's exp arguments. The mfma stage takes the exps
-    # while its LDS reads land; in the softmax stage they would make it the
-    # longer of the two.
+    # P as E4M3 from _softmax's exp arguments.
     if FAST_EXP and not (MASK and ZERO_SCALE):
         w = _exp2_bf16(t).to(tl.uint16, bitcast=True)
     else:
@@ -357,13 +355,25 @@ def _ks16(ks_buf, slot, n: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.con
 
 
 @triton.jit
-def _qk16(q, q_scale, k, ks, offs_m, key0, n: tl.constexpr, MASK: tl.constexpr):
+def _warp():
+    # Warp w holds rows 32 w to 32 w + 31 of the scores.
+    return tl.inline_asm_elementwise("v_readfirstlane_b32 $0, $1", "=s,v", [tlx.thread_id(0)], dtype=tl.int32,
+                                     is_pure=True, pack=1) >> 5
+
+
+@triton.jit
+def _qk16(q, q_scale, k, ks, offs_m, key0, n: tl.constexpr, MASK: tl.constexpr, row0=0):
     init = None
     if MASK:
         # Piece n of _k_tile holds keys 32 (n // 2) + 8 (n % 2) + {0..7, 16..23}.
+        # Of the key pairs 32 q to 32 q + 31, a warp sees all for q < qt, none
+        # for q > qt, and for q == qt the triangle tri, which is the same for
+        # every warp: -2**127 doubles to -inf.
+        r = tl.arange(0, offs_m.shape[0]) % 32
         c = tl.arange(0, 16)
-        keys = key0 + 32 * (n // 2) + 8 * (n % 2) + (c & 7) + 2 * (c & 8)
-        init = tl.where(offs_m[:, None] >= keys[None, :], 0.0, float("-inf"))
+        tri = tl.where(r[:, None] - 2 * (c & 8)[None, :] >= (8 * (n % 2) + (c & 7))[None, :], 0.0, -2.0**127)
+        qt = _warp() - (key0 - row0) // 32
+        init = tri * tl.where(qt == n // 2, 2.0, 0.0) + tl.where(qt < n // 2, float("-inf"), 0.0)
     return tlx.dot_scaled(q, q_scale, "e4m3", k, ks, "e4m3", init, fast_math=True, tiles_per_warp=[2, 1])
 
 
@@ -437,7 +447,7 @@ def _pv8(p8, p_scale, a0, a1, a2, a3, a4, a5, a6, a7, l_acc, v_buf, vs_buf, slot
 
 @triton.jit
 def _mfma(q, q_scale, p8, p_scale, alpha, rescale, a0, a1, a2, a3, a4, a5, a6, a7, l_acc, k_buf, ks_buf, v_buf, vs_buf,
-          k_slot, v_slot, offs_m, key0, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, MASK: tl.constexpr):
+          k_slot, v_slot, offs_m, key0, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, MASK: tl.constexpr, row0=0):
     # The current tile's PV and row sums, then the next tile's scores, as one
     # WMMA pair per 16 output columns and per 16 keys. Each K tile's reads go
     # out between two PV pairs, so the reads queued behind the LDS do not hold
@@ -494,14 +504,14 @@ def _mfma(q, q_scale, p8, p_scale, alpha, rescale, a0, a1, a2, a3, a4, a5, a6, a
     k6 = _k16(k_buf, k_slot, 6, BLOCK_N, HEAD_DIM)
     k7 = _k16(k_buf, k_slot, 7, BLOCK_N, HEAD_DIM)
     tlx.amd_sched_barrier(0)
-    qk0 = _qk16(q, q_scale, k0, ks0, offs_m, key0, 0, MASK)
-    qk1 = _qk16(q, q_scale, k1, ks1, offs_m, key0, 1, MASK)
-    qk2 = _qk16(q, q_scale, k2, ks2, offs_m, key0, 2, MASK)
-    qk3 = _qk16(q, q_scale, k3, ks3, offs_m, key0, 3, MASK)
-    qk4 = _qk16(q, q_scale, k4, ks4, offs_m, key0, 4, MASK)
-    qk5 = _qk16(q, q_scale, k5, ks5, offs_m, key0, 5, MASK)
-    qk6 = _qk16(q, q_scale, k6, ks6, offs_m, key0, 6, MASK)
-    qk7 = _qk16(q, q_scale, k7, ks7, offs_m, key0, 7, MASK)
+    qk0 = _qk16(q, q_scale, k0, ks0, offs_m, key0, 0, MASK, row0)
+    qk1 = _qk16(q, q_scale, k1, ks1, offs_m, key0, 1, MASK, row0)
+    qk2 = _qk16(q, q_scale, k2, ks2, offs_m, key0, 2, MASK, row0)
+    qk3 = _qk16(q, q_scale, k3, ks3, offs_m, key0, 3, MASK, row0)
+    qk4 = _qk16(q, q_scale, k4, ks4, offs_m, key0, 4, MASK, row0)
+    qk5 = _qk16(q, q_scale, k5, ks5, offs_m, key0, 5, MASK, row0)
+    qk6 = _qk16(q, q_scale, k6, ks6, offs_m, key0, 6, MASK, row0)
+    qk7 = _qk16(q, q_scale, k7, ks7, offs_m, key0, 7, MASK, row0)
     qk = _cat8(qk0, qk1, qk2, qk3, qk4, qk5, qk6, qk7)
     return qk, a0, a1, a2, a3, a4, a5, a6, a7, l_acc
 
@@ -956,24 +966,24 @@ def _mxfp8_fa_fwd_persistent(
 
 
 @triton.jit
-def _qk8m(q, q_scale, k_buf, ks_buf, slot, offs_m, key0, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr):
+def _qk8m(q, q_scale, k_buf, ks_buf, slot, offs_m, key0, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, row0=0):
     # _qk8 for a K/V tile that may cross the diagonal.
     qk0 = _qk16(q, q_scale, _k16(k_buf, slot, 0, BLOCK_N, HEAD_DIM), _ks16(ks_buf, slot, 0, BLOCK_N, HEAD_DIM), offs_m,
-                key0, 0, True)
+                key0, 0, True, row0)
     qk1 = _qk16(q, q_scale, _k16(k_buf, slot, 1, BLOCK_N, HEAD_DIM), _ks16(ks_buf, slot, 1, BLOCK_N, HEAD_DIM), offs_m,
-                key0, 1, True)
+                key0, 1, True, row0)
     qk2 = _qk16(q, q_scale, _k16(k_buf, slot, 2, BLOCK_N, HEAD_DIM), _ks16(ks_buf, slot, 2, BLOCK_N, HEAD_DIM), offs_m,
-                key0, 2, True)
+                key0, 2, True, row0)
     qk3 = _qk16(q, q_scale, _k16(k_buf, slot, 3, BLOCK_N, HEAD_DIM), _ks16(ks_buf, slot, 3, BLOCK_N, HEAD_DIM), offs_m,
-                key0, 3, True)
+                key0, 3, True, row0)
     qk4 = _qk16(q, q_scale, _k16(k_buf, slot, 4, BLOCK_N, HEAD_DIM), _ks16(ks_buf, slot, 4, BLOCK_N, HEAD_DIM), offs_m,
-                key0, 4, True)
+                key0, 4, True, row0)
     qk5 = _qk16(q, q_scale, _k16(k_buf, slot, 5, BLOCK_N, HEAD_DIM), _ks16(ks_buf, slot, 5, BLOCK_N, HEAD_DIM), offs_m,
-                key0, 5, True)
+                key0, 5, True, row0)
     qk6 = _qk16(q, q_scale, _k16(k_buf, slot, 6, BLOCK_N, HEAD_DIM), _ks16(ks_buf, slot, 6, BLOCK_N, HEAD_DIM), offs_m,
-                key0, 6, True)
+                key0, 6, True, row0)
     qk7 = _qk16(q, q_scale, _k16(k_buf, slot, 7, BLOCK_N, HEAD_DIM), _ks16(ks_buf, slot, 7, BLOCK_N, HEAD_DIM), offs_m,
-                key0, 7, True)
+                key0, 7, True, row0)
     return _cat8(qk0, qk1, qk2, qk3, qk4, qk5, qk6, qk7)
 
 
@@ -1096,7 +1106,7 @@ def _mxfp8_fa_fwd_persistent_causal(
     tlx.async_amd_descriptor_wait(2)
     q = _tile(q_buf, 0, BLOCK_M, HEAD_DIM)
     q_scale = _tile(qs_buf, 0, BLOCK_M, SCALE_K)
-    qk = _qk8m(q, q_scale, k_buf, ks_buf, 0, offs_m, 0, BLOCK_N, HEAD_DIM)
+    qk = _qk8m(q, q_scale, k_buf, ks_buf, 0, offs_m, 0, BLOCK_N, HEAD_DIM, mt * BLOCK_M)
     t, p_scale, m_i, alpha, rescale = _softmax(qk, m_i, qk_scale, rows, 0, BLOCK_M, BLOCK_N, False, FAST_EXP, False)
     t = _unpack_p8(_p8(t, rows, 0, BLOCK_N, False, FAST_EXP, False))
     _issue_kv(k_desc, ks_desc, v_desc, vs_desc, k_buf, ks_buf, v_buf, vs_buf, r2, r3, o2, o3, 2, 3)
@@ -1104,7 +1114,7 @@ def _mxfp8_fa_fwd_persistent_causal(
     # Step 0 of Q tile 0.
     qk, a0, a1, a2, a3, a4, a5, a6, a7, l_acc = _mfma(q, q_scale, t, p_scale, alpha, rescale, a0, a1, a2, a3, a4, a5,
                                                       a6, a7, l_acc, k_buf, ks_buf, v_buf, vs_buf, 1, 0, offs_m,
-                                                      BLOCK_N, BLOCK_N, HEAD_DIM, True)
+                                                      BLOCK_N, BLOCK_N, HEAD_DIM, True, mt * BLOCK_M)
     t, p_scale, m_i, alpha, rescale = _softmax(qk, m_i, qk_scale, rows, 0, BLOCK_M, BLOCK_N, False, FAST_EXP, False)
     t = _p8(t, rows, 0, BLOCK_N, False, FAST_EXP, False)
     _issue_kv(k_desc, ks_desc, v_desc, vs_desc, k_buf, ks_buf, v_buf, vs_buf, r3, r4, o3, o4, 3, 0)
@@ -1161,7 +1171,8 @@ def _mxfp8_fa_fwd_persistent_causal(
                     qk, a0, a1, a2, a3, a4, a5, a6, a7, l_acc = _mfma(q, q_scale, t, p_scale, alpha, rescale, a0, a1,
                                                                       a2, a3, a4, a5, a6, a7, l_acc, k_buf, ks_buf,
                                                                       v_buf, vs_buf, (sl + 1) & 3, sl, offs_m,
-                                                                      (j + 1) * BLOCK_N, BLOCK_N, HEAD_DIM, True)
+                                                                      (j + 1) * BLOCK_N, BLOCK_N, HEAD_DIM, True,
+                                                                      mt * BLOCK_M)
                 tlx.async_amd_descriptor_wait(1)
                 with tlx.warp_pipeline_stage("softmax", priority=0):
                     t, p_scale, m_i, alpha, rescale = _softmax(qk, m_i, qk_scale, rows, 0, BLOCK_M, BLOCK_N, False,
@@ -1217,6 +1228,9 @@ def _mxfp8_fa_fwd_persistent_causal(
                         m_i = tl.where(rows < 0, m_i, float("-inf"))
                     t, p_scale, m_i, alpha, rescale = _softmax(qk, m_i, qk_scale, rows, 0, BLOCK_M, BLOCK_N, False,
                                                                FAST_EXP, False)
+                    if u == 0:
+                        # Its accumulators start at zero.
+                        rescale = rescale & False
                     t = _p8(t, rows, 0, BLOCK_N, False, FAST_EXP, False)
                     tlx.amd_sched_barrier(0)
                     vr, vo = _pos_rows(n_t + 2 + u, hb, n_t, hb1, n1, hb2, n2, hb3, ok1, ok2, ok3)
@@ -1295,7 +1309,7 @@ def _mxfp8_fa_fwd_persistent_causal(
                 qk, a0, a1, a2, a3, a4, a5, a6, a7, l_acc = _mfma(q, q_scale, t, p_scale, alpha, rescale, a0, a1, a2,
                                                                   a3, a4, a5, a6, a7, l_acc, k_buf, ks_buf, v_buf,
                                                                   vs_buf, (sl + 1) & 3, sl, offs_m, (j + 1) * BLOCK_N,
-                                                                  BLOCK_N, HEAD_DIM, True)
+                                                                  BLOCK_N, HEAD_DIM, True, mt * BLOCK_M)
             tlx.async_amd_descriptor_wait(1)
             with tlx.warp_pipeline_stage("softmax", priority=0):
                 t, p_scale, m_i, alpha, rescale = _softmax(qk, m_i, qk_scale, rows, 0, BLOCK_M, BLOCK_N, False,
@@ -1330,7 +1344,7 @@ def _mxfp8_fa_fwd_persistent_causal(
                     qk, a0, a1, a2, a3, a4, a5, a6, a7, l_acc = _mfma(q, q_scale, t, p_scale, alpha, rescale, a0, a1,
                                                                       a2, a3, a4, a5, a6, a7, l_acc, k_buf, ks_buf,
                                                                       v_buf, vs_buf, b_next, sl_last, offs_m1, 0,
-                                                                      BLOCK_N, HEAD_DIM, True)
+                                                                      BLOCK_N, HEAD_DIM, True, mt1 * BLOCK_M)
                 else:
                     v_sl = b_next
                     tlx.async_amd_descriptor_store(tlx.update_tensor_descriptor(o_desc, add_offsets=[g * BLOCK_M, 0]),
@@ -1338,7 +1352,7 @@ def _mxfp8_fa_fwd_persistent_causal(
                     qk, a0, a1, a2, a3, a4, a5, a6, a7, l_acc = _mfma(q, q_scale, t, p_scale, alpha, rescale, a0, a1,
                                                                       a2, a3, a4, a5, a6, a7, l_acc, k_buf, ks_buf,
                                                                       v_buf, vs_buf, (b_next + 1) & 3, b_next, offs_m1,
-                                                                      BLOCK_N, BLOCK_N, HEAD_DIM, True)
+                                                                      BLOCK_N, BLOCK_N, HEAD_DIM, True, mt1 * BLOCK_M)
             if u == 0:
                 tlx.async_amd_descriptor_wait(1)
             else:
@@ -1350,6 +1364,9 @@ def _mxfp8_fa_fwd_persistent_causal(
                     m_i = tl.where(rows < 0, m_i, float("-inf"))
                 t, p_scale, m_i, alpha, rescale = _softmax(qk, m_i, qk_scale, rows, 0, BLOCK_M, BLOCK_N, False,
                                                            FAST_EXP, False)
+                if u == 0:
+                    # Its accumulators start at zero.
+                    rescale = rescale & False
                 t = _p8(t, rows, 0, BLOCK_N, False, FAST_EXP, False)
                 tlx.amd_sched_barrier(0)
                 vr, vo = _pos_rows(n_t + 2 + u, hb, n_t, hb1, n1, hb2, n2, hb3, ok1, ok2, ok3)
@@ -1409,7 +1426,7 @@ def _num_cus(device):
 
 
 # From here on the causal kernel's SPLIT copy pays for its instruction fetch.
-_SPLIT_N = 8192
+_SPLIT_N = 4096
 
 
 def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, *, fast_exp=True):
