@@ -271,6 +271,9 @@ bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
                      ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
   auto llSrc = toLinearLayout(srcShape, srcEncoding);
   auto llDst = toLinearLayout(dstShape, dstEncoding);
+  // An NPOT view keeps its registers only as the regrouped source.
+  if (llSrc.hasNonBinaryCarrier())
+    return tryReshapeLayout(srcEncoding.getContext(), llSrc, dstShape) != llDst;
   // In case there are replicated value we need to make sure the new and old
   // layout have matching masks.
   for (auto [srcMask, dstMask] :
@@ -4105,6 +4108,14 @@ struct TritonGPUInferLayoutInterface
     auto ctx = srcEnc.getContext();
     auto fp32Type = IntegerType::get(ctx, 32, IntegerType::Unsigned);
     auto srcTy = RankedTensorType::get(srcShape, fp32Type, srcEnc);
+    // An NPOT reshape is inferred as the one that keeps every register.
+    LinearLayout src = toLinearLayout(srcTy);
+    if (src.hasNonBinaryCarrier()) {
+      if (auto dst = tryReshapeLayout(ctx, src, dstShape)) {
+        dstEnc = inferEncodingFromLinearLayout(ctx, std::move(*dst), srcEnc);
+        return success();
+      }
+    }
     LinearLayout ll =
         inferReshapeLinearLayout(cast<TensorOrMemDesc>(srcTy), dstShape);
 
