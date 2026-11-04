@@ -57,6 +57,14 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           uv pip install pytest pytest-xdist
+      - name: Install CUDA headers for AOTInductor
+        # AOTInductor compiles its C++ wrapper against CUDA headers. The image has no system CUDA toolkit, and torch's pip CUDA packages lack the crt headers.
+        run: |
+          . "${SETUP_SCRIPT}"
+          set -eux
+          CUDA_TOOLKIT=$(uv pip show cuda-toolkit | sed -n 's/^Version: //p')
+          uv pip install "cuda-toolkit[crt]==${CUDA_TOOLKIT}"
+          echo "CUDA_HOME=$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent.parent / "nvidia" / "cu13")')" >> "${GITHUB_ENV}"
       - name: Install torchao
         timeout-minutes: 10
         uses: ./.github/actions/install-torchao
