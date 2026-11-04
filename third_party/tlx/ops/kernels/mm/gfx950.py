@@ -16469,6 +16469,8 @@ def _register_kernel_impl(  # noqa: TR001
     PACK_B_PAIRS: tl.constexpr = False,
     B_PAIRS_PADDED: tl.constexpr = False,
     XCD_CHUNK_SIZE: tl.constexpr = 4,
+    USE_I64_A_OFFSETS: tl.constexpr = False,
+    USE_I64_B_OFFSETS: tl.constexpr = False,
 ):
     pid = tl.program_id(0).to(tl.int32)
     grid_m = (M + BLOCK_M - 1) // BLOCK_M
@@ -16502,19 +16504,31 @@ def _register_kernel_impl(  # noqa: TR001
     tl.assume(stride_bn > 0)
     reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
     reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+    if USE_I64_A_OFFSETS:
+        a_rows = reg_m.to(tl.int64)
+        a_cols = offs_k.to(tl.int64)
+    else:
+        a_rows = reg_m
+        a_cols = offs_k
+    if USE_I64_B_OFFSETS:
+        b_rows = offs_k.to(tl.int64)
+        b_cols = reg_n.to(tl.int64)
+    else:
+        b_rows = offs_k
+        b_cols = reg_n
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     full_k_tiles: tl.constexpr = K // BLOCK_K
     for k_idx in range(0, full_k_tiles):
         k = k_idx * BLOCK_K
-        a_ptrs = (a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak)
-        b_ptrs = (b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn)
+        a_ptrs = (a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak)
+        b_ptrs = (b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn)
         if (CACHE_A_CG or (M == 25600 and N == 256 and K == 256) or (M == 56768 and N == 128 and K == 64)
                 or (M == 65462 and N == 128 and K == 96)):
             a = tl.load(a_ptrs, cache_modifier=".cg")
         else:
             a = tl.load(a_ptrs)
         if PACK_B_PAIRS:
-            b = _load_paired_strided_b(b_ptr, k + offs_k, reg_n, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
+            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
         elif (CACHE_B_CG or (M == 128 and N == 2688 and K == 4416) or (M == 128 and N == 3456 and K == 2560)):
             b = tl.load(b_ptrs, cache_modifier=".cg")
         else:
@@ -16523,11 +16537,11 @@ def _register_kernel_impl(  # noqa: TR001
     if K % BLOCK_K != 0:
         k = full_k_tiles * BLOCK_K
         k_mask = offs_k < K - k
-        a_ptrs = (a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak)
-        b_ptrs = (b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn)
+        a_ptrs = (a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak)
+        b_ptrs = (b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn)
         a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
         if PACK_B_PAIRS:
-            b = _load_paired_strided_b(b_ptr, k + offs_k, reg_n, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
+            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
         elif CACHE_B_CG or (M == 128 and N == 2688 and K == 4416):
             b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0, cache_modifier=".cg")
         else:
@@ -16608,6 +16622,20 @@ def _register_kernel_args(a, b, bias, out):
         out.stride(0),
         out.stride(1),
     )
+
+
+def _register_i64_offsets(kernel_args, block_k):
+    """Select int64 operand offsets for `_register_kernel_impl` when 32 bits cannot hold them.
+
+    `kernel_args` is laid out as `_register_kernel_args` returns it. The kernel forms K offsets
+    up to K rounded up to `block_k`, so the masked K-tail lanes count.
+    """
+    m, n, k, stride_am, stride_ak, stride_bk, stride_bn = kernel_args[6:13]
+    k_extent = (k + block_k - 1) // block_k * block_k
+    return {
+        "USE_I64_A_OFFSETS": (m - 1) * stride_am + (k_extent - 1) * stride_ak >= 1 << 31,
+        "USE_I64_B_OFFSETS": (k_extent - 1) * stride_bk + (n - 1) * stride_bn >= 1 << 31,
+    }
 
 
 def _fragmented_register_kernel_args(a, b, out):
@@ -16704,6 +16732,7 @@ def _dense_tn_register_launcher(
                         ADD_BIAS=False,
                         WRITE_STATS=False,
                         IS_RMS_NORM=False,
+                        **_register_i64_offsets(kernel_args, config["BLOCK_K"]),
                         **config,
                         **launch_options,
                     )
@@ -16747,11 +16776,13 @@ def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False
         )(a, b, out)
     launch_options = _register_launch_options(m, n, k, config)
     grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
+    kernel_args = _register_kernel_args(a, b, bias, out)
     _register_kernel_impl[grid](
-        *_register_kernel_args(a, b, bias, out),
+        *kernel_args,
         ADD_BIAS=bias is not None,
         WRITE_STATS=False,
         IS_RMS_NORM=False,
+        **_register_i64_offsets(kernel_args, config["BLOCK_K"]),
         **config,
         **launch_options,
     )
@@ -16877,6 +16908,7 @@ def _launch_range_register_plan(a, b, *, config, out=None, _use_compiled_cache=N
         ADD_BIAS=False,
         WRITE_STATS=False,
         IS_RMS_NORM=False,
+        **_register_i64_offsets(runtime_args, config["BLOCK_K"]),
         **dict(config, **launch_options),
     )
     if use_compiled_cache:
@@ -17658,11 +17690,14 @@ def _launch_register(a, b, bias=None, config=None, out=None):
         out.stride(1),
     )
     grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
+    # BLOCK_K is chosen by the autotuner, so count the K tail of the largest candidate.
+    max_block_k = max(candidate.kwargs["BLOCK_K"] for candidate in _REGISTER_CONFIGS)
     _register_kernel[grid](
         *args,
         ADD_BIAS=bias is not None,
         WRITE_STATS=False,
         IS_RMS_NORM=False,
+        **_register_i64_offsets(args, max_block_k),
         **launch_options,
     )
     return out

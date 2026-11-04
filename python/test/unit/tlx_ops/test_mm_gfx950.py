@@ -18,14 +18,7 @@ pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 MAX_SECONDS_PER_CASE = 60
 
 # TODO: Re-enable shapes here when their direct-TLX correctness failures are fixed.
-FAILED_SHAPES = {
-    (384, 1152, 2536160, (1, 384), (1152, 1), "bf16"),
-    (384, 1152, 2617290, (1, 384), (1152, 1), "bf16"),
-    (384, 1152, 2701258, (1, 384), (1152, 1), "bf16"),
-    (2536160, 384, 1152, (1152, 1), (1, 1152), "bf16"),
-    (2617290, 384, 1152, (1152, 1), (1, 1152), "bf16"),
-    (2701258, 384, 1152, (1152, 1), (1, 1152), "bf16"),
-}
+FAILED_SHAPES = set()
 
 
 def _assert_range_result(actual, expected):
@@ -712,6 +705,31 @@ def test_mm_small_square_register_plan(m):
         atol=1e-3 * expected.abs().max().item(),
         rtol=1e-3,
     )
+
+
+@pytest.mark.parametrize("b_layout,launcher", [("row", "plan"), ("column", "plan"), ("row", "range")])
+def test_mm_register_plan_int64_operand_offsets(b_layout, launcher):
+    # Padded leading strides put row 127 of each operand past 2**31 elements, in
+    # the full K tile and the K tail. The column case uses the dense TN launcher.
+    m = n = k = 136
+    stride = 2**31 // 127 + 1
+    storage = torch.empty(135 * stride + 4 * k, device="cuda", dtype=torch.bfloat16)
+    if b_layout == "row":
+        a = storage.as_strided((m, k), (1, stride))
+        b = storage.as_strided((k, n), (stride, 1), 2 * k)
+    else:
+        a = storage.as_strided((m, k), (stride, 1))
+        b = storage.as_strided((k, n), (1, stride), 2 * k)
+    torch.manual_seed(97)
+    a_values = torch.randint(-2, 3, (m, k), device="cuda").to(torch.bfloat16)
+    b_values = torch.randint(-2, 3, (k, n), device="cuda").to(torch.bfloat16)
+    a.copy_(a_values)
+    b.copy_(b_values)
+    plan = _gfx950._fixed_register_plan(128, 64, 128, 4, 1, 8, 3, matrix_instr_nonkdim=32)
+    launch = _gfx950._launch_register_plan if launcher == "plan" else _gfx950._launch_range_register_plan
+    out = launch(a, b, config=plan)
+    expected = (a_values.float() @ b_values.float()).to(torch.bfloat16)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
 def test_mm_tuned_rectangular_register_plans():
