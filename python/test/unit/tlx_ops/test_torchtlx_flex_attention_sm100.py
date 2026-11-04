@@ -1,4 +1,5 @@
 """L1 for SM100 TorchTLX FlexAttention forward."""
+import re
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,42 @@ def test_flex_forward_mod(runner, tmp_path, mod, dtype, seq):
     if mod == "document_mask":
         independent = runner.document_reference(tensors, seq, 1)
         torch.testing.assert_close(reference, independent, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(result, reference, atol=2e-2, rtol=2e-2)
+    torch._dynamo.reset()
+    torch.testing.assert_close(stock(), reference, atol=0, rtol=0)
+    torch.testing.assert_close(tlx(), result, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "mod,q_len,kv_len,dim",
+    [
+        ("noop", 32, 1920, 80),
+        ("noop", 1, 77, 64),
+        ("noop", 512, 320, 80),
+        ("noop", 512, 320, 96),
+        ("causal", 512, 320, 80),
+        ("prefix_lm", 512, 320, 96),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flex_forward_one_group(runner, tmp_path, mod, q_len, kv_len, dim, dtype):
+    tensors, score_mod, block_mask = runner.inputs(mod, kv_len, batch=1, heads=2, dim=dim, dtype=dtype, q_len=q_len,
+                                                   block_size=(128, 64))
+    assert tensors[0].shape == (1, 2, q_len, dim)
+    assert tensors[1].shape == tensors[2].shape == (1, 2, kv_len, dim)
+    if block_mask is not None:
+        normal, full = block_mask.kv_num_blocks, block_mask.full_kv_num_blocks
+        total = normal + full
+        assert ((normal > 0) & (full > 0) & (total >= 3) & (total % 2 == 1)).any()
+    options = {"FORCE_USE_FLEX_ATTENTION": True}
+    stock, reference = runner.compile_arm(tensors, score_mod, block_mask, None, tmp_path / "stock.py",
+                                          kernel_options=options)
+    tlx, result = runner.compile_arm(tensors, score_mod, block_mask, "force", tmp_path / "tlx.py",
+                                     kernel_options=options)
+    source = (tmp_path / "tlx.py").read_text()
+    assert re.search(r"['\"]NUM_MMA_GROUPS['\"]:\s*1\b", source)
+    assert re.search(r"['\"]BLOCK_M['\"]:\s*64\b", source)
+    assert re.search(r"['\"]BLOCK_N['\"]:\s*64\b", source)
     torch.testing.assert_close(result, reference, atol=2e-2, rtol=2e-2)
     torch._dynamo.reset()
     torch.testing.assert_close(stock(), reference, atol=0, rtol=0)
