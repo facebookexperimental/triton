@@ -1277,18 +1277,23 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
 @triton.jit
 def _attn_bwd_preprocess(O, DO,  #
                          Delta,  #
+                         DQ_ACCUM,  #
                          N_CTX,  #
                          BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
                          ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
     off_n = tl.arange(0, HEAD_DIM)
+    offs = off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]
     # load
-    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :])
-    do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
+    o = tl.load(O + offs)
+    do = tl.load(DO + offs).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     # write-back
     tl.store(Delta + off_hz * N_CTX + off_m, delta)
+    # The packed dQ layout permutes rows only within BLOCK_M-aligned tiles, so
+    # this block's region of the accumulator is the same contiguous range.
+    tl.store(DQ_ACCUM + offs, tl.zeros([BLOCK_M, HEAD_DIM], tl.float32))
 
 
 @triton.jit
@@ -1369,11 +1374,6 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     _bwd_selected_meta["BLOCK_M1"] = BLOCK_M1
     _bwd_selected_meta["NUM_CTAS"] = NUM_CTAS
     _bwd_selected_meta["DQ_BULK_NCOL"] = nargs.get("DQ_BULK_NCOL", 0)
-
-    # Reset dq accumulator to zeros before each autotuner warmup run.
-    # dq uses TMA reduce-add, so stale values accumulate across runs.
-    # dk/dv don't need zeroing — they use use_acc=False on the first iteration.
-    nargs["desc_dq"].base.zero_()
 
     nargs["desc_q"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // NUM_CTAS]
     nargs["desc_do"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // NUM_CTAS]
@@ -3594,7 +3594,7 @@ class _attention(torch.autograd.Function):
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         _HALF_HD = ctx.HEAD_DIM // 2
-        # Zeroed by _bwd_host_descriptor_pre_hook_tlx, which the autotuner runs before every launch.
+        # Zeroed by _attn_bwd_preprocess (and between autotuning runs by _bwd_reset_dq_accum).
         dq_accum = torch.empty([BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM], device=q.device, dtype=torch.float32)
         PRE_BLOCK = 128
         BLK_SLICE_FACTOR = 2
@@ -3604,6 +3604,7 @@ class _attention(torch.autograd.Function):
         _attn_bwd_preprocess[pre_grid](
             o, do,  #
             delta,  #
+            dq_accum,  #
             N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
         )
@@ -3790,11 +3791,18 @@ def _tuned_fwd(space):
     )(_attn_fwd_ws)
 
 
+def _bwd_reset_dq_accum(nargs, reset_only=False):
+    # dQ is accumulated with TMA reduce-add, so re-zero it around each autotuning run.
+    # The autotuner calls this hook only while benchmarking, never on a regular launch.
+    nargs["desc_dq"].base.zero_()
+
+
 @functools.lru_cache(maxsize=None)
 def _tuned_bwd(space):
     return triton.autotune(
         configs={"full": BWD_CONFIGS_FULL, "smoke": BWD_CONFIGS_SMOKE}[space](),
         key=["N_CTX", "HEAD_DIM"],
+        pre_hook=_bwd_reset_dq_accum,
     )(_attn_bwd_ws)
 
 
