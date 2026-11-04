@@ -52,6 +52,13 @@ inline SmallVector<int64_t> getTMABlockShape(triton::gpu::MemDescType ty,
   return getTMABlockShape(ty.getEncoding(), shapePerCTA, packedSize, mode);
 }
 
+// TMA lowering splits each tile dimension into strided1D(shapePerCTA / box,
+// box) messages. getTMABlockShape's box splits a dimension into a power-of-two
+// count of power-of-two boxes exactly when the dimension is a power of 2.
+inline bool hasPow2TMAMessages(triton::gpu::MemDescType ty) {
+  return llvm::all_of(gpu::getShapePerCTA(ty), llvm::isPowerOf2_64);
+}
+
 inline SmallVector<int64_t> getTMABlockShape(triton::TensorDescInterface ty,
                                              bool packedSize,
                                              gpu::TMAMode mode) {
