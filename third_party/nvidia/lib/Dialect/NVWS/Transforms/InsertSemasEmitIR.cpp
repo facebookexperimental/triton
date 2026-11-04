@@ -441,8 +441,8 @@ getTmemMemberSlice(gpu::MemDescType source, const Member &member,
                    [](auto coordinate) { return coordinate.second != 0; }))
     return std::nullopt;
   int32_t offset = logical.back().second;
-  if (nvidia_gpu::getTMemSubSliceOffset(source, offset,
-                                       source.getRank() - 1) != columnOffset)
+  if (nvidia_gpu::getTMemSubSliceOffset(source, offset, source.getRank() - 1) !=
+      columnOffset)
     return std::nullopt;
 
   auto memberAllocation = nvidia_gpu::getTmemAllocSizes(member.type);
@@ -459,8 +459,7 @@ getTmemMemberSlice(gpu::MemDescType source, const Member &member,
         return false;
       // These layouts split a logical N bit across physical rows. Their
       // construction requires at least two columns per CTA.
-      if ((tmem.getCtaMode() ==
-               nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS ||
+      if ((tmem.getCtaMode() == nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS ||
            (tmem.getBlockM() == 64 && tmem.getTwoCTAs() &&
             tmem.getCtaMode() !=
                 nvidia_gpu::TensorMemoryCTAMode::TwoCTA_LHS)) &&
@@ -522,14 +521,14 @@ static Value emitTmemMemberView(OpBuilder &b, Location loc, const GroupDag &g,
   // Select the semaphore stage on the whole allocation before taking a
   // logical member's subview, so each stage keeps the physical backing stride.
   auto slice = getTmemMemberSlice(cast<gpu::MemDescType>(buffer.getType()),
-                                 member, primary);
+                                  member, primary);
   assert(slice && "TMEM member slice must be validated before emission");
   Value view = emitInto<nvidia_gpu::TMEMSubSliceOp>(
       b, loc, owner, stageCluster, buffer, slice->offset, slice->size,
       cast<gpu::MemDescType>(buffer.getType()).getRank() - 1);
   if (!sameViewType(view.getType(), target))
     view = emitInto<gpu::MemDescReinterpretOp>(b, loc, owner, stageCluster,
-                                              target, view);
+                                               target, view);
   return view;
 }
 static Value emitMixedCopyLocalView(OpBuilder &b, Location loc, Value owner,
@@ -628,8 +627,8 @@ static void materializeTokenlessMembers(EmitCtx &ctx,
       auto type = group->isTmem()
                       ? group->pieceTable.members[member.backingPrimary].type
                       : member.type;
-      auto view = gpu::MemDescIndexOp::create(
-          b, member.allocOp->getLoc(), type, backing[index], zero);
+      auto view = gpu::MemDescIndexOp::create(b, member.allocOp->getLoc(), type,
+                                              backing[index], zero);
       for (StringRef name :
            {"async_task_id", gpu::kPartitionAttrName,
             gpu::kWarpSpecializeTagAttrName, "loop.stage", "loop.cluster"})

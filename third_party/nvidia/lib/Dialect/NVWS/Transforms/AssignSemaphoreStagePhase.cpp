@@ -1116,10 +1116,9 @@ struct AssignStagePhase {
   //   - nvws.semaphore.buffer / nvws.semaphore.release
   //   - scf.for when the token is passed through iter_args
   //   - scf.yield when the token is yielded out of a region
-  std::optional<AccessKind>
-  classifyFirstAccessAfterAcquireOp(Value trackedToken, Block *block,
-                                    SemaphoreAcquireOp acquireOp,
-                                    DenseSet<std::pair<Value, Block *>> &visiting) {
+  std::optional<AccessKind> classifyFirstAccessAfterAcquireOp(
+      Value trackedToken, Block *block, SemaphoreAcquireOp acquireOp,
+      DenseSet<std::pair<Value, Block *>> &visiting) {
     if (!block || !trackedToken)
       return {};
 
@@ -1145,11 +1144,10 @@ struct AssignStagePhase {
       // continuations and merge the first access they prove.
       auto thenAccess = classifyFirstAccessAfterAcquireOp(
           trackedToken, ifOp.thenBlock(), acquireOp, visiting);
-      auto elseAccess = ifOp.elseBlock()
-                            ? classifyFirstAccessAfterAcquireOp(
-                                  trackedToken, ifOp.elseBlock(), acquireOp,
-                                  visiting)
-                            : std::nullopt;
+      auto elseAccess = ifOp.elseBlock() ? classifyFirstAccessAfterAcquireOp(
+                                               trackedToken, ifOp.elseBlock(),
+                                               acquireOp, visiting)
+                                         : std::nullopt;
       return mergeBranchAccess(thenAccess, elseAccess);
     } else if (auto forOp = dyn_cast<scf::ForOp>(eventOp)) {
       // The token is loop-carried. Remap it to the body iter arg and let the
@@ -1208,9 +1206,8 @@ struct AssignStagePhase {
           }
         }
         assert(nextToken && "token not found in yield");
-        auto nextAccess =
-            classifyFirstAccessAfterAcquireOp(nextToken, block, acquireOp,
-                                             visiting);
+        auto nextAccess = classifyFirstAccessAfterAcquireOp(
+            nextToken, block, acquireOp, visiting);
         auto exitAccess = classifyFirstAccessAfterAcquireOp(
             parentToken, forOp->getBlock(), acquireOp, visiting);
         return mergeContinuationAccess(nextAccess, exitAccess);

@@ -1062,16 +1062,16 @@ private:
     }
   }
   Node *materializeRelease(Tokens::Token &token, const Owner &owner,
-                           Node *acquire, Node *guard,
-                           Node *before = nullptr) {
+                           Node *acquire, Node *guard, Node *before = nullptr) {
     if (!token.producer || !token.last) {
       fail(token.last, "release has no exact source token");
       return nullptr;
     }
-    Node *release = newProtocolNode(
-        g, Node::Release,
-        before ? before->parent : guard ? guard->parent : token.last->parent,
-        owner);
+    Node *release = newProtocolNode(g, Node::Release,
+                                    before  ? before->parent
+                                    : guard ? guard->parent
+                                            : token.last->parent,
+                                    owner);
     release->payloads = token.payloads;
     assert(!release->payloads.empty() &&
            "token must retain completion payload");
@@ -1081,7 +1081,8 @@ private:
     if (before)
       spliceBefore(release, before);
     else
-      guard ? spliceAfter(release, guard) : spliceAfterLast(release, token.last);
+      guard ? spliceAfter(release, guard)
+            : spliceAfterLast(release, token.last);
     return release;
   }
   Node *insertRelease(const EdgeRec &edge, Node *acquire, Tokens &tokens,
@@ -1421,12 +1422,14 @@ private:
     // A completed branch token also supplies the next enclosing iteration's
     // deferred child entry. Preserve it even when read/read reuse left no
     // memory edge at the conditional's exit; bypass branches keep their input.
-    bool returnsDeferredEntry = hasDeferredEntry(region, owner) && input &&
+    bool returnsDeferredEntry =
+        hasDeferredEntry(region, owner) && input &&
         llvm::any_of(exits, [&](const BranchExit &branch) {
           return branch.completionReady && !branch.passesInput;
         });
-    bool hasOutput = returnsDeferredEntry ||
-        reusableUse(next, owner) || exitSources.contains(region) ||
+    bool hasOutput =
+        returnsDeferredEntry || reusableUse(next, owner) ||
+        exitSources.contains(region) ||
         llvm::any_of(exits, [&](const BranchExit &branch) {
           return !branch.exitEdges.empty() ||
                  branch.chain.supplies.count(boundaryKey(branch.exit, owner));
@@ -1498,7 +1501,8 @@ private:
     }
     const Tokens::Token *initial = loopInputs.findOpen(owner);
     if (!initial || initial->last->kind == Node::Enter) {
-      if (initial && llvm::none_of(deferredEntries, [&](const DeferredEntry &entry) {
+      if (initial &&
+          llvm::none_of(deferredEntries, [&](const DeferredEntry &entry) {
             return entry.enter == initial->last && entry.loop == region &&
                    entry.acquire == acquire;
           }))
@@ -1627,8 +1631,8 @@ private:
       Node *before = entry.loop;
       if (acquire->parent == before->parent && precedesInChain(acquire, before))
         before = acquire;
-      Node *release = materializeRelease(token, entry.owner, acquire, nullptr,
-                                         before);
+      Node *release =
+          materializeRelease(token, entry.owner, acquire, nullptr, before);
       Supply supply;
       supply.appendExecuted(release);
       applySupply(acquire, supply, channelCounts.lookup(findChannel(acquire)));
@@ -1647,7 +1651,8 @@ private:
       });
       if (!hasInitialSupply)
         return semaError(entry.loop->op)
-               << "deferred entry has neither an incoming token nor an initial supply";
+               << "deferred entry has neither an incoming token nor an initial "
+                  "supply";
     }
     deferredEntries.clear();
     return success();
@@ -1980,7 +1985,8 @@ private:
           anchor->payloads.front() == AsyncOp::NONE) {
         anchor->count += padding;
       } else {
-        filler = newProtocolNode(g, Node::Release, anchor->parent, anchor->owner);
+        filler =
+            newProtocolNode(g, Node::Release, anchor->parent, anchor->owner);
         filler->payloads = {AsyncOp::NONE};
         filler->tokenSource = anchor->tokenSource;
         filler->scheduleAnchor = anchor->scheduleAnchor;
