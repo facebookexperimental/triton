@@ -1669,6 +1669,24 @@ TEST_F(ProductCarrierTest, MultiplyRejectsTwoProductFactorsOnOneOutput) {
       "each odd part needs one non-binary digit");
 }
 
+TEST_F(ProductCarrierTest, Apply) {
+  LinearLayout six = exactIdentity1D(6, S("register"), S("dim"));
+  for (int32_t i = 0; i < 24; ++i)
+    EXPECT_EQ(six.apply({{S("register"), i}}).front().second, i % 6) << i;
+  // A Binary output beside a Product output keeps XOR arithmetic.
+  LinearLayout twoDims =
+      six * LinearLayout::identity1D(4, S("lane"), S("other"));
+  for (int32_t lane = 0; lane < 4; ++lane)
+    EXPECT_THAT(twoDims.apply({{S("register"), 5}, {S("lane"), lane}}),
+                ElementsAre(Pair(S("dim"), 5), Pair(S("other"), lane)));
+  // Odd coefficient 2 is a unit mod 3: digit 2 wraps to odd coordinate 1.
+  EXPECT_EQ(product({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
+                .apply({{S("register"), 4}})
+                .front()
+                .second,
+            2);
+}
+
 } // anonymous namespace
 } // namespace mlir::triton
 

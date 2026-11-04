@@ -100,15 +100,8 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
     if (auto cvtOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
       auto srcTy = cvtOp.getSrc().getType();
       auto dstTy = cvtOp.getType();
-      if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
-        // Use modular physical-cover sizing.
-        if (!cvtNeedsSharedMemory(cvtOp)) {
-          return 0;
-        }
-        auto elems = mlir::triton::getNumScratchElemsSwizzledCvt(srcTy, dstTy);
-        // Modular sub-byte values occupy one byte in shared memory.
-        return elems * std::max<unsigned>(getBitwidth(srcTy), 8) / 8;
-      }
+      if (auto bytes = getProductConversionScratchBytes(cvtOp))
+        return *bytes;
       if (!cvtNeedsSharedMemory(cvtOp))
         return 0;
       // In cuda we always swizzle
