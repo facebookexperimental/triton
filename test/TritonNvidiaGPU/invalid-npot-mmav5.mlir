@@ -137,3 +137,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A compact NPOT shared operand reaches the same check.
+#a = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#b = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @compact_n100(%a: !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>,
+                        %b: !ttg.memdesc<64x100xf16, #b, #ttg.shared_memory>,
+                        %c: !ttg.memdesc<128x100xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>,
+                        %p: i1) {
+    // expected-error @+1 {{NPOT MMAv5 shape 128x100 is unsupported: tcgen05.mma kind f16/tf32 SS K-major B cta_group::1 per-CTA M=128 requires N to be a multiple of 8 in [8, 256], got N=100}}
+    ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>, !ttg.memdesc<64x100xf16, #b, #ttg.shared_memory>, !ttg.memdesc<128x100xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+    tt.return
+  }
+}
+
+// -----
+
+#a = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
+#b = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @compact_k40(%a: !ttg.memdesc<128x40xf16, #a, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<40x128xf16, #b, #ttg.shared_memory>,
+                       %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+                       %p: i1) {
+    // expected-error @+1 {{NPOT MMAv5 K is not yet supported}}
+    ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x40xf16, #a, #ttg.shared_memory>, !ttg.memdesc<40x128xf16, #b, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
