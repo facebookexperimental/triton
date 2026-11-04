@@ -603,6 +603,76 @@ SmallVector<int64_t> getAllocationShapePerCTA(Type type) {
                                   tensorType.getShape());
 }
 
+// The layout of an NPOT extent is built on its power-of-two cover, so a CTA
+// split of that extent would not give each CTA getShapePerCTA rows. After
+// MemDescType::verify only a shared first dimension can be NPOT.
+static bool hasNpotSharedCtaSplit(Attribute layout,
+                                  ArrayRef<int64_t> allocShape) {
+  SmallVector<unsigned> ctaSplit = getCTASplitNum(layout);
+  return llvm::any_of(llvm::zip(ctaSplit, allocShape), [](auto splitAndExtent) {
+    auto [split, extent] = splitAndExtent;
+    return split > 1 && !llvm::isPowerOf2_64(extent);
+  });
+}
+
+bool isNpotPhysicalCover(MemDescType memDescTy) {
+  return isNpotPhysicalCover(memDescTy.getEncoding(), memDescTy.getShape());
+}
+
+LogicalResult verifyNpotCoverOperands(Operation *op) {
+  for (Value operand : op->getOperands())
+    if (auto type = dyn_cast<MemDescType>(operand.getType());
+        type && isNpotPhysicalCover(type))
+      return op->emitOpError("NPOT memdesc physical cover view on this "
+                             "consumer is not yet supported");
+  return success();
+}
+
+bool hasPow2MemDescLayoutShape(Attribute layout, ArrayRef<int64_t> shape) {
+  ArrayRef<int64_t> layoutShape = dropPipeliningDim(shape, layout);
+  if (isa<SharedEncodingTrait>(layout) && !layoutShape.empty())
+    layoutShape = layoutShape.drop_front();
+  return llvm::all_of(layoutShape, llvm::isPowerOf2_64);
+}
+
+bool isNpotPhysicalCover(Attribute layout, ArrayRef<int64_t> shape) {
+  // A register encoding has no allocation to cover.
+  return triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
+         isa<LayoutEncodingTrait>(layout) &&
+         !isa<DistributedEncodingTrait>(layout) &&
+         !hasPow2MemDescLayoutShape(layout, shape);
+}
+
+LogicalResult
+verifyNpotPhysicalCover(function_ref<InFlightDiagnostic()> emitError,
+                        Attribute layout, ArrayRef<int64_t> shape,
+                        ArrayRef<int64_t> allocShape) {
+  auto reject = [&](StringRef diagnostic) -> LogicalResult {
+    return emitError() << diagnostic;
+  };
+  if (allocShape.size() - shape.size() > 1)
+    return reject("NPOT memdesc with different logical and physical allocation "
+                  "ranks is not yet supported");
+  const unsigned rank = cast<LayoutEncodingTrait>(layout).getRank();
+  if (rank != 2)
+    return reject("NPOT memdesc physical cover with a layout rank other than 2 "
+                  "is not yet supported");
+  if (getNumCTAs(layout) != 1)
+    return reject(
+        "NPOT memdesc physical cover with multiple CTAs is not yet supported");
+  ArrayRef<int64_t> shapePrefix = shape.drop_back(rank);
+  ArrayRef<int64_t> allocPrefix = allocShape.drop_back(rank);
+  // The view's layout is its allocation's, which is built on the allocation's
+  // power-of-two cover; a TMEM allocation is already a power of two.
+  if (!std::equal(shapePrefix.begin(), shapePrefix.end(),
+                  allocPrefix.end() - shapePrefix.size()) ||
+      (isa<SharedEncodingTrait>(layout) &&
+       !holdsNpotSharedCover(layout, allocShape)))
+    return reject("NPOT memdesc allocation that does not match the encoding's "
+                  "physical cover is not yet supported");
+  return success();
+}
+
 int64_t getAllocationElems(Attribute encoding, ArrayRef<int64_t> shape,
                            ArrayRef<int64_t> allocShape) {
   assert(isa<SharedEncodingTrait>(encoding) &&
@@ -633,6 +703,22 @@ int64_t getAllocationElems(Attribute encoding, ArrayRef<int64_t> shape,
   if (auto partitioned = dyn_cast<PartitionedSharedEncodingAttr>(encoding))
     elems *= partitioned.getNumPartitions();
   return elems;
+}
+
+bool holdsNpotSharedCover(Attribute encoding, ArrayRef<int64_t> allocShape) {
+  auto tile = dropPipeliningDim(allocShape, encoding);
+  SmallVector<int64_t> cover(allocShape);
+  llvm::copy(getNpotCoverShape(tile), cover.end() - tile.size());
+  if (llvm::equal(cover, allocShape))
+    return true;
+  // An NVMMA cover smaller than its TMA block or core tile has no layout.
+  if (auto nvmma = dyn_cast<NVMMASharedEncodingAttr>(encoding);
+      nvmma && failed(nvmmaSharedToLinearLayout(
+                   getNpotCoverShape(tile), nvmma, TMAMode::Tiled,
+                   /*disableSwizzle=*/false, /*emitErrors=*/false)))
+    return false;
+  return getAllocationElems(encoding, allocShape) >=
+         getAllocationElems(encoding, cover);
 }
 
 SmallVector<unsigned> getMmaV2WarpsPerCTA(ArrayRef<int64_t> shape,
@@ -4282,6 +4368,12 @@ struct TritonGPUVerifyTensorLayoutInterface
     if (failed(verifyMemDescRank(layout, memDescTy, makeErr)) ||
         failed(verifyCTAs(layout, op, makeErr)))
       return failure();
+
+    if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
+        hasNpotSharedCtaSplit(
+            layout, dropPipeliningDim(memDescTy.getAllocShape(), layout)))
+      return makeErr()
+             << "NPOT memdesc extent split across CTAs is not yet supported";
 
     if (auto sharedLinearEnc = dyn_cast<SharedLinearEncodingAttr>(layout)) {
       auto shape = dropPipeliningDim(memDescTy.getAllocShape(), layout);
