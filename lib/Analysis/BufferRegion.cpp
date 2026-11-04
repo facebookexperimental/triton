@@ -70,6 +70,12 @@ uint64_t getAllocationOffset(ttng::TMEMAllocOp op) {
   return colOffset | (rowOffset << 16);
 }
 
+// An NPOT view is the leading box of its power-of-two cover: each NPOT extent
+// takes ceil(log2) bits of the inverse. Flag off, the cover is the shape.
+bool hasNpotLayoutExtent(ArrayRef<int64_t> layoutShape) {
+  return !llvm::equal(ttg::getNpotCoverShape(layoutShape), layoutShape);
+}
+
 unsigned getMemDescSize(ttg::MemDescType ty) {
   auto encoding = ty.getEncoding();
   auto shape = ttg::dropPipeliningDim(ty.getShape(), encoding);
@@ -96,8 +102,9 @@ unsigned getMemDescSize(ttg::MemDescType ty) {
   auto allocation = ttg::toLinearLayout(allocShape, encoding);
   auto view = allocation.pseudoinvert();
   auto logicalDims = llvm::to_vector(view.getInDimNames());
+  bool npotView = hasNpotLayoutExtent(shape);
   for (auto [dim, size] : llvm::zip_equal(logicalDims, shape))
-    view = view.resizeInDim(dim, size);
+    view = view.resizeInDim(dim, npotView ? llvm::PowerOf2Ceil(size) : size);
   auto offsetDim = StringAttr::get(ty.getContext(), "offset");
   // Zero physical bases are still owned by the allocation and its subviews.
   uint64_t zeroMask = (allocation.getInDimSize(offsetDim) - 1) &
@@ -179,6 +186,20 @@ MemDescFootprint getMemDescAddresses(
   SmallVector<StringAttr> dims = triton::standardOutDimNames(ctx, ty.getRank());
   ArrayRef<int64_t> shape = ty.getShape();
   uint64_t numPoints = product(shape);
+  bool npotView = hasNpotLayoutExtent(shape);
+  // An NPOT view walks the Gray code of its cover and keeps only the points
+  // whose coordinates lie inside the logical box.
+  auto isInsideBox = [&](uint64_t index) {
+    uint64_t gray = index ^ (index >> 1);
+    for (int64_t dimSize : shape) {
+      unsigned numBits = llvm::Log2_64_Ceil(dimSize);
+      if (static_cast<int64_t>(gray & ((uint64_t{1} << numBits) - 1)) >=
+          dimSize)
+        return false;
+      gray >>= numBits;
+    }
+    return true;
+  };
   uint32_t bitWidth = getIntOrFloatOrPtrBitWidth(ty.getElementType());
 
   StringAttr offsetName = StringAttr::get(ctx, "offset");
@@ -228,7 +249,8 @@ MemDescFootprint getMemDescAddresses(
   };
   SmallVector<PhysicalBasis> bases;
   for (auto [dim, dimSize] : llvm::zip_equal(dims, shape)) {
-    unsigned numBits = llvm::Log2_64(dimSize);
+    unsigned numBits =
+        npotView ? llvm::Log2_64_Ceil(dimSize) : llvm::Log2_64(dimSize);
     for (unsigned bit = 0; bit < numBits; ++bit) {
       auto basis = [&, dim = dim](StringAttr name) {
         return inverse.hasOutDim(name)
@@ -267,6 +289,9 @@ MemDescFootprint getMemDescAddresses(
     }
   }
 
+  if (npotView)
+    numPoints = uint64_t{1} << bases.size();
+
   PhysicalBasis physical;
   for (uint64_t index = 0; index < numPoints; ++index) {
     if (index != 0) {
@@ -277,6 +302,8 @@ MemDescFootprint getMemDescAddresses(
       physical.partition ^= basis.partition;
       physical.block ^= basis.block;
     }
+    if (npotView && !isInsideBox(index))
+      continue;
     addPhysicalAddress(physical.offset, physical.row, physical.col,
                        physical.partition, physical.block);
   }
