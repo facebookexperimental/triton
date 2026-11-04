@@ -112,6 +112,9 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   auto layoutEncoding = dyn_cast_if_present<LayoutEncodingTrait>(encoding);
   if (!layoutEncoding && !isDummyTMEM)
     return emitError() << encoding << " is not a valid encoding";
+  // A physical cover's allocation is verified once the checks below accept
+  // it; the TMEM checks drop its pipelining dimension.
+  std::optional<ArrayRef<int64_t>> npotCoverAllocShape;
   if (!isDummyTMEM) {
     auto rank = layoutEncoding.getRank();
     if (isa<nvidia_gpu::TensorMemoryEncodingAttr>(encoding)) {
@@ -131,21 +134,13 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     // Every layout dimension must be a power of 2; only a leading pipeline
     // dimension and a shared buffer's first dimension may have another
     // positive size.
-    ArrayRef<int64_t> layoutShape = dropPipeliningDim(shape, encoding);
-    ArrayRef<int64_t> layoutAllocShape =
-        dropPipeliningDim(allocShape, encoding);
-    bool isShared = isa<SharedEncodingTrait>(encoding);
-    auto shapeToCheck = isShared && !layoutShape.empty()
-                            ? layoutShape.drop_front()
-                            : layoutShape;
-    auto allocShapeToCheck = isShared && !layoutAllocShape.empty()
-                                 ? layoutAllocShape.drop_front()
-                                 : layoutAllocShape;
-    if (!llvm::all_of(shapeToCheck, llvm::isPowerOf2_64))
+    if (isNpotPhysicalCover(encoding, shape))
+      npotCoverAllocShape = allocShape;
+    else if (!hasPow2MemDescLayoutShape(encoding, shape))
       return emitError()
              << "shape must have power-of-2 and non-zero dimensions; got "
              << shape;
-    if (!llvm::all_of(allocShapeToCheck, llvm::isPowerOf2_64))
+    if (!hasPow2MemDescLayoutShape(encoding, allocShape))
       return emitError()
              << "alloc shape must have power-of-2 and non-zero dimensions; got "
              << allocShape;
@@ -315,6 +310,9 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     }
   }
 
+  if (npotCoverAllocShape)
+    return verifyNpotPhysicalCover(emitError, encoding, shape,
+                                   *npotCoverAllocShape);
   return success();
 }
 

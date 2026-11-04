@@ -393,6 +393,28 @@ ArrayRef<T> dropPipeliningDim(ArrayRef<T> shape, Attribute layout) {
 int64_t getAllocationElems(Attribute layout, ArrayRef<int64_t> shape,
                            ArrayRef<int64_t> allocShape = {});
 
+// Returns whether a shared allocation holds the footprint of its layout, which
+// is built on the power-of-two cover of allocShape.
+bool holdsNpotSharedCover(Attribute layout, ArrayRef<int64_t> allocShape);
+
+// MemDescType::verify's power-of-two test: every layout dimension but a leading
+// pipeline dimension and a shared buffer's first dimension is a power of 2.
+bool hasPow2MemDescLayoutShape(Attribute layout, ArrayRef<int64_t> shape);
+
+// Returns whether the memdesc (flag on) has a shape that MemDescType::verify's
+// power-of-two test would reject, i.e. a view inside its allocation's cover.
+// The component overload is for MemDescType::verify, before the type exists.
+bool isNpotPhysicalCover(MemDescType memDescTy);
+bool isNpotPhysicalCover(Attribute layout, ArrayRef<int64_t> shape);
+// Rejects an op that reads a physical cover through a memdesc operand.
+LogicalResult verifyNpotCoverOperands(Operation *op);
+
+// Verifies a physical cover once MemDescType::verify accepts its allocation.
+LogicalResult
+verifyNpotPhysicalCover(function_ref<InFlightDiagnostic()> emitError,
+                        Attribute layout, ArrayRef<int64_t> shape,
+                        ArrayRef<int64_t> allocShape);
+
 unsigned getNumCTAs(Attribute layout);
 
 // Returns the MMAv2 warp distribution for a matrix tile. This does not apply
