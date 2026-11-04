@@ -2,6 +2,7 @@
 #include "mlir/IR/OpImplementation.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include <numeric>
 
@@ -353,6 +354,10 @@ LogicalResult mlir::triton::tlx::NoVerifyLayoutAttr::verify(
     return emitError()
            << "no-verify layout must wrap a distributed tensor layout";
   }
+  if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
+      !ttg::isRadix2Encoding(layout))
+    return emitError() << "NPOT mixed-radix layout is not yet supported in a "
+                          "TLX layout wrapper";
   return success();
 }
 
@@ -429,6 +434,10 @@ LogicalResult mlir::triton::tlx::UserLayoutAttr::verify(
       !isa<ttg::SharedEncodingTrait>(layout))
     return emitError()
            << "user layout must wrap a distributed or shared layout";
+  if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
+      !ttg::isRadix2Encoding(layout))
+    return emitError() << "NPOT mixed-radix layout is not yet supported in a "
+                          "TLX layout wrapper";
   return success();
 }
 

@@ -542,6 +542,7 @@ def _fwd_mma_dots_1cta(
                 acc_tiles[1],
                 use_acc=use_acc,
                 mBarriers=mBarriers,
+                force_async=True,
             )
 
         acc1_init = True
@@ -598,6 +599,7 @@ def _fwd_mma_dots_1cta(
             acc_tiles[1],
             use_acc=use_acc,
             mBarriers=mBarriers,
+            force_async=True,
         )
 
     accum_cnt_qk += 1
@@ -1105,7 +1107,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                                 use_acc = acc1_init if slice_id == 0 else True
                                 mBarriers = [v_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
                                 tlx.async_dot(p_tiles[p_bufIdx], kv_slice, acc_tiles[1], use_acc=use_acc,
-                                              mBarriers=mBarriers, two_ctas=True)
+                                              mBarriers=mBarriers, force_async=True, two_ctas=True)
 
                             acc1_init = True
 
@@ -1135,7 +1137,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                             use_acc = acc1_init if slice_id == 0 else True
                             mBarriers = [acc_empties[1], v_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
                             tlx.async_dot(p_tiles[p_bufIdx], kv_slice, acc_tiles[1], use_acc=use_acc,
-                                          mBarriers=mBarriers, two_ctas=True)
+                                          mBarriers=mBarriers, force_async=True, two_ctas=True)
 
                         accum_cnt_qk += 1
                         accum_cnt_kv += 1

@@ -324,11 +324,17 @@ private:
                   /*size=getInDimSizeLog2(inDim)*/>
       bases;
 
+  // inputRadices[inDim][i] is the radix of input digit i, whose weight is the
+  // product of the preceding radices (2^i when all are 2). A digit whose radix
+  // is not 2 has an all-zero basis.
+  llvm::MapVector<StringAttr, std::vector<int32_t>> inputRadices;
+
   llvm::MapVector<StringAttr, int32_t /*size*/> outDims;
   int32_t rank = 0;
 
 public:
   using BasesT = decltype(bases);
+  using RadicesT = decltype(inputRadices);
 
   LinearLayout() = default;
 
@@ -396,11 +402,35 @@ public:
                         ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                         bool requireSurjective);
 
+  // Same, with explicit input radices (one per basis); empty means all 2.
+  // This constructor and its tryCreate admit any positive out-dim size, even
+  // with empty radices.
+  explicit LinearLayout(BasesT bases, RadicesT inputRadices,
+                        ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                        bool requireSurjective);
+
+  // A Product output splits each basis at its size's power-of-two factor:
+  // `binary` XORs in for a nonzero digit and `odd` is added digit times.
+  struct BasisContribution {
+    int32_t binary;
+    int32_t odd;
+  };
+  BasisContribution getBasisContribution(StringAttr inDim, int32_t pos,
+                                         StringAttr outDim) const;
+
+  // The largest power of two dividing a positive `size`.
+  static int32_t twoPartOf(int32_t size);
+
   // Factory function that gracefully fails rather than asserts if the layout is
   // not well-formed.
   static std::optional<LinearLayout>
   tryCreate(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
             bool requireSurjective);
+  // On failure, sets `*diagnostic` to the checkInvariants message.
+  static std::optional<LinearLayout>
+  tryCreate(BasesT bases, RadicesT inputRadices,
+            ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+            bool requireSurjective, std::string *diagnostic = nullptr);
 
   // Construct a LinearLayout from an explicit list of bases.  (This constructor
   // is needed because llvm::MapVector does not have a constructor that accepts
@@ -431,7 +461,11 @@ public:
       ArrayRef<std::pair<StringAttr, std::vector<std::vector<int32_t>>>> bases,
       ArrayRef<std::pair<StringAttr, int32_t>> outDims, bool requireSurjective);
 
-  bool isSurjective() const { return rank == getTotalOutDimSizeLog2(); }
+  bool isSurjective() const {
+    if (hasNonBinaryCarrier())
+      return rank == getProductCodomainRank();
+    return rank == getTotalOutDimSizeLog2();
+  }
   bool isInjective() const { return rank == getTotalInDimSizeLog2(); }
 
   bool isInvertible() const {
@@ -443,9 +477,27 @@ public:
   [[nodiscard]] LinearLayout squeezeOuts(StringAttr dim) const;
 
   const BasesT &getBases() const { return bases; }
+  const RadicesT &getInputRadices() const { return inputRadices; }
+  ArrayRef<int32_t> getInputRadices(StringAttr inDim) const {
+    auto it = inputRadices.find(inDim);
+    assert(it != inputRadices.end() && "inDim not found in layout");
+    return it->second;
+  }
+  int32_t getInputRadix(StringAttr inDim, int32_t pos) const {
+    return getInputRadices(inDim)[pos];
+  }
+  // False for a non-binary input digit or a non-Binary output: the radix-2
+  // algorithms below assert it.
+  bool isRadix2() const;
+  bool hasNonBinaryCarrier() const {
+    return !llvm::all_of(llvm::make_second_range(outDims), [](int32_t size) {
+      return llvm::isPowerOf2_32(size);
+    });
+  }
 
   // Get the pos'th basis vector for the inDim -> outDim mapping.
-  // getBasis(inDim, pos) = L(0, ..., inDim = 2^pos, ..., 0).
+  // getBasis(inDim, pos) = L(0, ..., inDim = w, ..., 0), where w is the
+  // product of the radices below pos (2^pos when all radices are 2).
   ArrayRef<int32_t> getBasis(StringAttr inDim, int32_t pos) const {
     auto it = bases.find(inDim);
     assert(it != bases.end());
@@ -488,14 +540,14 @@ public:
   int32_t getNumInDims() const { return bases.size(); }
   int32_t getNumOutDims() const { return outDims.size(); }
 
-  // Asserts if the dimension is not present.
+  // Asserts if the dimension is not present.  This is the number of input
+  // digits, which is log2 of the size only when all radices are 2.
   int32_t getInDimSizeLog2(StringAttr inDim) const;
-  int32_t getInDimSize(StringAttr inDim) const {
-    return 1 << getInDimSizeLog2(inDim);
-  }
+  // The product of the dimension's input radices.
+  int32_t getInDimSize(StringAttr inDim) const;
 
   int32_t getTotalInDimSizeLog2() const;
-  int32_t getTotalInDimSize() const { return 1 << getTotalInDimSizeLog2(); }
+  int32_t getTotalInDimSize() const;
 
   // getOutDimSize(dim) == s means that there exists an input value that will
   // produce each output value in [0,s) (if the layout is surjective).
@@ -513,12 +565,10 @@ public:
   //
   // Asserts if the dimension is not present.
   int32_t getOutDimSizeLog2(StringAttr outDim) const;
-  int32_t getOutDimSize(StringAttr outDim) const {
-    return 1 << getOutDimSizeLog2(outDim);
-  }
+  int32_t getOutDimSize(StringAttr outDim) const;
 
   int32_t getTotalOutDimSizeLog2() const;
-  int32_t getTotalOutDimSize() const { return 1 << getTotalOutDimSizeLog2(); }
+  int32_t getTotalOutDimSize() const;
 
   // Finds the number of consecutive input elements in the first input dimension
   // that map to consecutive output elements in the first output dimension.
@@ -809,9 +859,28 @@ private:
   struct NoCheckInvariants {};
   LinearLayout(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                NoCheckInvariants);
+  LinearLayout(BasesT bases, RadicesT inputRadices,
+               ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+               NoCheckInvariants);
 
   [[nodiscard]] std::optional<std::string>
-  checkInvariants(bool requireSurjective);
+  checkInvariants(bool requireSurjective, bool allowProductSizes);
+  [[nodiscard]] std::optional<std::string> checkInputRadices() const;
+  [[nodiscard]] std::optional<std::string> checkProductCarriers() const;
+  // A Product output (any size but a power of 2) XORs bases below the size's
+  // largest power-of-two factor and adds the odd part above it.
+  bool isProductOutDim(StringAttr outDim) const {
+    return !llvm::isPowerOf2_32(getOutDimSize(outDim));
+  }
+  // The rank of a layout that passed checkProductCarriers: the binary part's
+  // plus one per non-binary digit, which owns one odd coordinate or is zero.
+  int32_t getProductRank() const;
+
+  // Binary output bits plus one odd coordinate per Product output.
+  int32_t getProductCodomainRank() const;
+  // The GF(2) layout of the binary parts: Product outputs keep their
+  // power-of-two factor (checked non-binary digits have no binary part).
+  LinearLayout binaryPart() const;
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
@@ -842,12 +911,20 @@ private:
   SmallVector<size_t> action;
   StringAttr inDim;
   size_t inSizeLog2;
+  // Radix of each input digit; empty means all 2.
+  SmallVector<int32_t> inputRadices;
   bool m_isIdentity = true;
+
+  bool isRadix2() const {
+    return llvm::all_of(inputRadices, [](int32_t r) { return r == 2; });
+  }
 
 public:
   ColumnAction() = default;
-  ColumnAction(ArrayRef<size_t> action, StringAttr inDim, size_t inSizeLog2)
-      : action(action), inDim(inDim), inSizeLog2(inSizeLog2) {
+  ColumnAction(ArrayRef<size_t> action, StringAttr inDim, size_t inSizeLog2,
+               ArrayRef<int32_t> inputRadices = {})
+      : action(action), inDim(inDim), inSizeLog2(inSizeLog2),
+        inputRadices(inputRadices) {
     auto it = llvm::max_element(action);
     // Assert in the constructor... ugh
     assert(it == action.end() || *it < inSizeLog2);

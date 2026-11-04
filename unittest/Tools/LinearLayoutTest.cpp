@@ -1342,6 +1342,306 @@ TEST_F(LinearLayoutTest, invertAndCompose1) {
   EXPECT_TRUE(cvt.isTrivialOver(S("block")));
 }
 
+class MixedRadixTest : public LinearLayoutTest {
+protected:
+  // register = 3 * d1 + d0 with d0 < 3 (zero basis) and d1 < 2; lane < 2.
+  LinearLayout mixed(ArrayRef<int32_t> regRadices = {3, 2}) {
+    BasesT bases;
+    bases[S("register")] = {{0}, {1}};
+    bases[S("lane")] = {{2}};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = regRadices.vec();
+    radices[S("lane")] = {2};
+    return LinearLayout(bases, radices, {{S("dim0"), 4}}, true);
+  }
+};
+
+TEST_F(MixedRadixTest, TryCreateRejectsInvalidRadices) {
+  auto tryCreate = [&](BasesT bases, LinearLayout::RadicesT radices) {
+    return LinearLayout::tryCreate(std::move(bases), std::move(radices),
+                                   {{S("dim0"), 2}}, false);
+  };
+  BasesT reg;
+  reg[S("register")] = {{0}, {1}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {3};
+  EXPECT_FALSE(tryCreate(reg, radices)); // one radix for two bases
+  radices[S("register")] = {1, 2};
+  EXPECT_FALSE(tryCreate(reg, radices));
+  radices[S("register")] = {2, 3};
+  EXPECT_FALSE(tryCreate(reg, radices)); // radix 3 with basis 1
+  BasesT big;
+  big[S("register")].assign(20, {0});
+  LinearLayout::RadicesT bigRadices;
+  bigRadices[S("register")].assign(20, 3);
+  EXPECT_FALSE(tryCreate(big, bigRadices)); // 3^20 > INT32_MAX
+  // Controls: the same digits with valid radices, and a radix-2 layout above
+  // INT32_MAX.
+  radices[S("register")] = {3, 2};
+  EXPECT_TRUE(tryCreate(reg, radices));
+  big[S("register")].assign(31, {0});
+  EXPECT_TRUE(tryCreate(big, {}));
+}
+
+TEST_F(MixedRadixTest, Sizes) {
+  LinearLayout ll = mixed();
+  EXPECT_FALSE(ll.isRadix2());
+  EXPECT_EQ(ll.getInDimSize(S("register")), 6);
+  EXPECT_EQ(ll.getTotalInDimSize(), 12);
+  EXPECT_TRUE(ll.isSurjective());
+  EXPECT_FALSE(ll.isInjective());
+  EXPECT_EQ(mixed({2, 2}).getInDimSize(S("register")), 4);
+}
+
+TEST_F(MixedRadixTest, Apply) {
+  LinearLayout ll = mixed();
+  for (int32_t reg = 0; reg < 6; ++reg) {
+    EXPECT_EQ(
+        ll.apply({{S("register"), reg}, {S("lane"), 1}}),
+        (SmallVector<std::pair<StringAttr, int32_t>>{{S("dim0"), 2 + reg / 3}}))
+        << reg;
+  }
+  // Radix-2 control: register 2 sets d1.
+  EXPECT_EQ(mixed({2, 2}).apply({{S("register"), 2}, {S("lane"), 0}}),
+            (SmallVector<std::pair<StringAttr, int32_t>>{{S("dim0"), 1}}));
+}
+
+TEST_F(MixedRadixTest, PreconditionAsserts) {
+#ifdef NDEBUG
+  SUCCEED();
+#else
+  LinearLayout ll = mixed(), pow2 = mixed({2, 2});
+  ColumnAction action({0, 1}, S("register"), 2, {3, 2});
+  // Radix-2-only operations.
+  EXPECT_DEATH((void)ll.getFreeVariableMasks(), "isRadix2");
+  EXPECT_DEATH((void)ll.resizeInDim(S("register"), 8), "isRadix2");
+  EXPECT_DEATH(
+      (void)ll.compose(LinearLayout::identity1D(4, S("dim0"), S("out"))),
+      "isRadix2");
+  EXPECT_DEATH((void)ll.invertAndCompose(ll), "isRadix2");
+  EXPECT_DEATH((void)lstsq(ll, ll), "isRadix2");
+  EXPECT_DEATH((void)divideLeft(ll, ll), "isRadix2");
+  EXPECT_DEATH((void)divideRight(ll, ll), "isRadix2");
+  EXPECT_DEATH((void)ColumnAction::identity(S("register"), 2).apply(ll),
+               "isRadix2");
+  EXPECT_DEATH((void)action.apply(pow2), "isRadix2");
+  EXPECT_DEATH((void)action.inverse(), "isRadix2");
+  EXPECT_DEATH((void)action.leftCompose(action), "isRadix2");
+  // concatOuts needs equal radices, reshapeIns whole digits, and
+  // ColumnAction::apply one value per index.
+  BasesT zeros;
+  zeros[S("register")] = {{0}, {0}};
+  zeros[S("lane")] = {{0}};
+  LinearLayout::RadicesT swapped;
+  swapped[S("register")] = {2, 3};
+  swapped[S("lane")] = {2};
+  EXPECT_DEATH((void)ll.concatOuts(
+                   LinearLayout(zeros, swapped, {{S("dim1"), 1}}, false)),
+               "same input radices");
+  LinearLayout flat = ll.flattenIns();
+  EXPECT_DEATH((void)flat.reshapeIns({{S("register"), 2}, {S("lane"), 6}}),
+               "end on a digit");
+  EXPECT_DEATH((void)flat.reshapeIns({{S("register"), 6}}), "take every digit");
+  SmallVector<Value> four(4);
+  EXPECT_DEATH((void)action.apply(four), "different size");
+#endif
+}
+
+TEST_F(MixedRadixTest, EqualityAndHashSeeRadices) {
+  EXPECT_EQ(mixed(), mixed());
+  EXPECT_EQ(hash_value(mixed()), hash_value(mixed()));
+  EXPECT_NE(mixed(), mixed({2, 2}));
+  EXPECT_NE(hash_value(mixed()), hash_value(mixed({2, 2})));
+}
+
+TEST_F(MixedRadixTest, PrintShowsRadicesAndWeights) {
+  EXPECT_THAT(mixed().toString(),
+              ::testing::HasSubstr("register=1 (radix 3) -> (0)\n"
+                                   "   register=3 -> (1)\n"));
+}
+
+TEST_F(MixedRadixTest, ReshapeInsCutsAtDigitBoundaries) {
+  LinearLayout flat = mixed().flattenIns();
+  EXPECT_THAT(flat.getInputRadices(S("register")), ElementsAre(3, 2, 2));
+  EXPECT_EQ(flat.getInDimSize(S("register")), 12);
+  EXPECT_EQ(flat.reshapeIns({{S("register"), 6}, {S("lane"), 2}}), mixed());
+}
+
+TEST_F(MixedRadixTest, ProductConcatenatesDigits) {
+  auto reg2 = LinearLayout::identity1D(2, S("register"), S("dim1"));
+  EXPECT_THAT((mixed() * reg2).getInputRadices(S("register")),
+              ElementsAre(3, 2, 2));
+  EXPECT_THAT((reg2 * mixed()).getInputRadices(S("register")),
+              ElementsAre(2, 3, 2));
+}
+
+TEST_F(MixedRadixTest, StructuralOpsKeepRadices) {
+  LinearLayout ll = mixed() * LinearLayout::identity1D(2, S("lane"), S("dim1"));
+  auto keeps = [&](const LinearLayout &other) {
+    return llvm::equal(other.getInputRadices(), ll.getInputRadices());
+  };
+  EXPECT_EQ(
+      ll.sublayout({S("register")}, {S("dim0")}).getInputRadices(S("register")),
+      ll.getInputRadices(S("register")));
+  EXPECT_TRUE(keeps(ll.transposeOuts({S("dim1"), S("dim0")})));
+  EXPECT_TRUE(keeps(ll.transposeIns({S("lane"), S("register")})
+                        .transposeIns({S("register"), S("lane")})));
+  EXPECT_TRUE(
+      keeps(ll.sublayout({S("register")}, {S("dim0"), S("dim1")})
+                .concatIns(ll.sublayout({S("lane")}, {S("dim0"), S("dim1")}))));
+  BasesT zeros;
+  zeros[S("register")] = {{0}, {0}};
+  zeros[S("lane")] = {{0}, {0}};
+  EXPECT_TRUE(keeps(ll.concatOuts(
+      LinearLayout(zeros, ll.getInputRadices(), {{S("dim2"), 1}}, false))));
+  EXPECT_TRUE(keeps(ll.resizeOutDim(S("dim0"), 2)));
+  EXPECT_TRUE(keeps(ll.reshapeOuts({{S("flat"), 8}})));
+}
+
+TEST_F(MixedRadixTest, RemoveZeroBasesDropsTheirRadices) {
+  LinearLayout ll = mixed().removeZeroBasesAlongDim(S("register"));
+  EXPECT_THAT(ll.getInputRadices(S("register")), ElementsAre(2));
+  EXPECT_TRUE(ll.isRadix2());
+}
+
+TEST_F(MixedRadixTest, ColumnActionApplyValues) {
+  SmallVector<Value> values;
+  for (intptr_t i = 0; i < 6; ++i)
+    values.push_back(Value::getFromOpaquePointer(reinterpret_cast<void *>(i)));
+  auto ids = [](ArrayRef<Value> vals) {
+    return llvm::map_to_vector(vals, [](Value v) {
+      return reinterpret_cast<intptr_t>(v.getAsOpaquePointer());
+    });
+  };
+  // Output digit 0 is input digit 1 (radix 2), output digit 1 is input digit
+  // 0 (radix 3).
+  EXPECT_THAT(ids(ColumnAction({1, 0}, S("register"), 2, {3, 2}).apply(values)),
+              ElementsAre(0, 3, 1, 4, 2, 5));
+  EXPECT_THAT(ids(ColumnAction({1}, S("register"), 2, {3, 2}).apply(values)),
+              ElementsAre(0, 3));
+}
+
+class ProductCarrierTest : public LinearLayoutTest {
+protected:
+  LinearLayout product(std::vector<std::vector<int32_t>> regBases,
+                       std::vector<int32_t> regRadices,
+                       ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
+    BasesT bases;
+    bases[S("register")] = std::move(regBases);
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    return LinearLayout(std::move(bases), std::move(radices), outDims,
+                        /*requireSurjective=*/false);
+  }
+
+  // in -> out identity of a non-power-of-two size: binary digits, then one odd
+  // digit.
+  LinearLayout exactIdentity1D(int32_t size, StringAttr in, StringAttr out) {
+    int32_t twoPart = LinearLayout::twoPartOf(size);
+    BasesT bases;
+    LinearLayout::RadicesT radices;
+    for (int32_t bit = 1; bit < twoPart; bit *= 2) {
+      bases[in].push_back({bit});
+      radices[in].push_back(2);
+    }
+    bases[in].push_back({twoPart});
+    radices[in].push_back(size / twoPart);
+    return LinearLayout(std::move(bases), std::move(radices), {{out, size}},
+                        /*requireSurjective=*/true);
+  }
+};
+
+TEST_F(ProductCarrierTest, InvariantsReject) {
+  auto build = [&](std::vector<std::vector<int32_t>> regBases,
+                   std::vector<int32_t> regRadices,
+                   ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
+    (void)product(std::move(regBases), std::move(regRadices), outDims);
+  };
+  EXPECT_DEATH(build({}, {}, {{S("x"), 0}}), "Out-dim sizes must be positive");
+  EXPECT_DEATH(build({{3}}, {2}, {{S("x"), 6}}),
+               "invalid radix-2 digit: it has an odd Product");
+  EXPECT_DEATH(build({{3}}, {3}, {{S("x"), 6}}),
+               "invalid non-binary digit: it has a binary Product");
+  EXPECT_DEATH(build({{2, 1}}, {3}, {{S("x"), 6}, {S("y"), 2}}),
+               "invalid input digit of radix 3 in in-dim 'register': its "
+               "basis must be zero on Binary outputs");
+  const char *unsupported = "NPOT layout not yet supported: each odd part "
+                            "needs one non-binary digit of that radix";
+  EXPECT_DEATH(build({{2, 2}}, {3}, {{S("x"), 6}, {S("y"), 6}}), unsupported);
+  EXPECT_DEATH(build({{2}, {4}}, {3, 3}, {{S("x"), 6}}), unsupported);
+  EXPECT_DEATH(build({{2}}, {5}, {{S("x"), 6}}), unsupported);
+  EXPECT_DEATH(build({{6}}, {9}, {{S("x"), 18}}), unsupported);
+}
+
+TEST_F(ProductCarrierTest, OnlyRadicesAdmitProductSizes) {
+  BasesT bases;
+  bases[S("register")] = {{1}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {2};
+  EXPECT_FALSE(LinearLayout::tryCreate(bases, {{S("x"), 6}}, false));
+  EXPECT_TRUE(LinearLayout::tryCreate(bases, radices, {{S("x"), 6}}, false));
+  EXPECT_TRUE(LinearLayout::tryCreate({}, {}, {{S("x"), 6}}, false));
+  EXPECT_DEATH((void)LinearLayout(bases, {{S("x"), 6}}, false),
+               "Out-dim sizes must be powers of 2");
+}
+
+TEST_F(ProductCarrierTest, SublayoutWithoutInDimsKeepsProductSize) {
+  // No in-dims leave an empty radices map, which still admits the size.
+  LinearLayout sub =
+      product({{1}}, {2}, {{S("dim"), 6}}).sublayout({}, {S("dim")});
+  EXPECT_EQ(sub.getOutDimSize(S("dim")), 6);
+}
+
+TEST_F(ProductCarrierTest, RankCountsOwnedOddCoordinates) {
+  // Odd part 5: the codomain rank is countr_zero(20) + 1, below Log2(20).
+  LinearLayout twenty = exactIdentity1D(20, S("register"), S("dim"));
+  EXPECT_TRUE(twenty.isSurjective());
+  EXPECT_TRUE(twenty.isInjective());
+  EXPECT_EQ(twenty.getTotalOutDimSize(), 20);
+  LinearLayout productBit = product({{1}}, {2}, {{S("dim"), 6}});
+  EXPECT_FALSE(productBit.isSurjective());
+  // A Product output alone keeps a layout off the radix-2 algorithms.
+  EXPECT_FALSE(productBit.isRadix2());
+  // A zero radix-2 digit after the odd digit: registers 0 and 6 collide.
+  EXPECT_FALSE(
+      product({{1}, {2}, {0}}, {2, 3, 2}, {{S("dim"), 6}}).isInjective());
+  // A broadcast non-binary digit adds no rank.
+  EXPECT_TRUE(
+      product({{1}, {2}, {0}}, {2, 3, 3}, {{S("dim"), 6}}).isSurjective());
+  // Odd coefficient 4: basis 16 is above the Log2(20) binary rows.
+  EXPECT_TRUE(
+      product({{1}, {2}, {16}}, {2, 2, 5}, {{S("dim"), 20}}).isSurjective());
+}
+
+TEST_F(ProductCarrierTest, EqualIgnoringOutDimSizesComparesTwoParts) {
+  // Basis 4 is odd coordinate 2 at size 6 and odd coordinate 1 at size 12.
+  EXPECT_FALSE(product({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
+                   .equalIgnoringOutDimSizes(
+                       product({{1}, {4}}, {2, 3}, {{S("dim"), 12}})));
+  EXPECT_TRUE(
+      product({{1}}, {2}, {{S("dim"), 6}})
+          .equalIgnoringOutDimSizes(product({{1}}, {2}, {{S("dim"), 10}})));
+}
+
+TEST_F(ProductCarrierTest, ReshapeInsAndRemoveZeroBasesKeepProduct) {
+  BasesT bases;
+  LinearLayout::RadicesT radices;
+  bases[S("register")] = {{1, 0}, {2, 0}};
+  radices[S("register")] = {2, 3};
+  bases[S("lane")] = {{0, 1}};
+  radices[S("lane")] = {2};
+  LinearLayout ll(bases, radices, {{S("x"), 6}, {S("y"), 2}},
+                  /*requireSurjective=*/true);
+  EXPECT_EQ(ll.flattenIns().reshapeIns({{S("register"), 6}, {S("lane"), 2}}),
+            ll);
+  bases[S("register")].push_back({0, 0});
+  radices[S("register")].push_back(2);
+  EXPECT_EQ(LinearLayout(bases, radices, ll.getOutDims(),
+                         /*requireSurjective=*/false)
+                .removeZeroBasesAlongDim(S("register")),
+            ll);
+}
+
 } // anonymous namespace
 } // namespace mlir::triton
 
