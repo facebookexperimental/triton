@@ -44,6 +44,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -1095,6 +1096,14 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
   return success();
 }
 
+// Runs after verifyTMAEncoding, so other encodings keep its error.
+static LogicalResult verifyNpotTMATile(Operation *op, MemDescType memDesc) {
+  if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
+      !hasPow2TMAMessages(memDesc))
+    return op->emitOpError("NPOT TMA tile is not yet supported");
+  return success();
+}
+
 static LogicalResult verifyAsyncTMALoadOp(Operation *op,
                                           TensorDescInterface desc,
                                           TypedValue<MemDescType> barrier,
@@ -1103,7 +1112,8 @@ static LogicalResult verifyAsyncTMALoadOp(Operation *op,
     return failure();
   if (!resultType.getMutableMemory())
     return op->emitOpError("cannot store into immutable memory");
-  if (failed(verifyTMAEncoding(op, desc, resultType)))
+  if (failed(verifyTMAEncoding(op, desc, resultType)) ||
+      failed(verifyNpotTMATile(op, resultType)))
     return failure();
   auto block = StringAttr::get(op->getContext(), "block");
   uint32_t barrierMask =
@@ -1138,7 +1148,9 @@ static LogicalResult verifyAsyncTMAStoreOp(Operation *op,
       if (component >= size)
         return op->emitOpError(
             "source subview may have an origin in another CTA");
-  return verifyTMAEncoding(op, desc.getType(), srcType);
+  if (failed(verifyTMAEncoding(op, desc.getType(), srcType)))
+    return failure();
+  return verifyNpotTMATile(op, srcType);
 }
 
 static LogicalResult verifyAsyncTMAGatherScatterOp(Operation *op,
