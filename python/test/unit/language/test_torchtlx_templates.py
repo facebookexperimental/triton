@@ -2500,6 +2500,29 @@ class TestHopperMMTemplate(TestCase):
         self.assertIn("_consume_tile", generated)
         self.assertNotIn("triton_poi_", generated)
 
+    @parametrize("template,marker,k", (
+        ("tlx_hopper_gemm_ws", _HOPPER_WS, 1096),
+        ("tlx_hopper_gemm_small_k", _HOPPER_SMALL_K, 256),
+    ))
+    def test_fused_epilogue_reads_operand(self, template, marker, k):
+        """An epilogue that reads A (x * sigmoid(x @ w)) shares A's kernel arg, so
+        A's descriptor is built on the device while B's stays on the host."""
+        x = torch.randn(264, k, device=GPU_TYPE, dtype=torch.float16)
+        w = torch.randn(k, k, device=GPU_TYPE, dtype=torch.float16).t()
+
+        def gate(x, w):
+            return 2 * x * torch.sigmoid(x @ w)
+
+        with config.patch({**_HOPPER_ADDMM_PATCH, "test_configs.autotune_choice_name_regex": template}):
+            actual, code = run_and_get_code(torch.compile(gate), x, w)
+        expected = (2 * x.float() * torch.sigmoid(x.float() @ w.float())).half()
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        generated = "\n".join(code)
+        self.assertIn(marker, generated)
+        self.assertNotIn("triton_poi_", generated)
+        self.assertIn("desc_a = tl.make_tensor_descriptor(", generated)
+        self.assertNotIn("desc_b = tl.make_tensor_descriptor(", generated)
+
     def test_fused_epilogue_ring_depth(self):
         from triton.language.extra.tlx.inductor.registry import _hopper_ws_fused_epilogue_stages
 
