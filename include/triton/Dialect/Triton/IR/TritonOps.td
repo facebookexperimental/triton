@@ -518,7 +518,8 @@ def TT_ExpandDimsOp
   let hasFolder = 1;
 }
 
-def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType]> {
+def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType,
+                                     ProductLayoutOpInterface]> {
   let summary = "reinterpret a tensor to a different shape. It may change "
                 "elements order if the attribute is set.";
   let description = [{

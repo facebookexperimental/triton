@@ -25,21 +25,6 @@ using TranspositionInfo = DecomposedWarpConversion::TranspositionInfo;
 
 constexpr int kPtrBitWidth = 64;
 
-// Elements per shared access on `dim`: the leading radix-2 register digits
-// stepping `dim` by 1, 2, 4, ..., cut to 16 bytes. Permutation layouts need no
-// other cut.
-int32_t getSharedRunLength(const LinearLayout &layout, int32_t dim,
-                           unsigned bitwidth) {
-  auto kReg =
-      StringAttr::get(layout.getInDimNames().begin()->getContext(), "register");
-  int32_t numDigits = layout.getNumLeadingRadix2Digits(kReg);
-  int32_t steps = 0;
-  while (steps < numDigits && (1 << steps) < 128 / int32_t(bitwidth) &&
-         layout.getBasis(kReg, steps)[dim] == 1 << steps)
-    ++steps;
-  return 1 << steps;
-}
-
 struct ConvertLayoutOpConversion
     : public ConvertOpToLLVMPattern<ConvertLayoutOp> {
   const TargetInfoBase &targetInfo;
@@ -143,165 +128,6 @@ struct ConvertLayoutOpConversion
     return success();
   }
 
-  // Each output has one canonical source owner, which stores it in scratch;
-  // every destination register then loads its output. An access moves a run
-  // of consecutive registers, and the dim with the fewest accesses is fastest.
-  SmallVector<Value> transferProductTile(
-      Location loc, ConversionPatternRewriter &rewriter,
-      const LinearLayout &srcLayout, const LinearLayout &dstLayout,
-      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
-      const llvm::MapVector<StringAttr, int32_t> &srcFreeVariableMasks,
-      bool blockScope, Value laneId, Value warpId) const {
-    auto *ctx = rewriter.getContext();
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto kReg = str_attr("register");
-    auto kLane = str_attr("lane");
-    auto kWarp = str_attr("warp");
-    auto elemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
-
-    auto getIndices = [&](const LinearLayout &layout, int32_t reg) {
-      SmallVector<std::pair<StringAttr, Value>> indices;
-      for (auto dim : layout.getInDimNames())
-        indices.push_back({dim, dim == kReg    ? b.i32_val(reg)
-                                : dim == kLane ? laneId
-                                : dim == kWarp ? warpId
-                                               : b.i32_val(0)});
-      return indices;
-    };
-    // Ties keep dim 0 fastest.
-    unsigned bitwidth = llvmElemTy.getIntOrFloatBitWidth();
-    int32_t rank = srcLayout.getNumOutDims();
-    int32_t numSrc = inVals.size();
-    int32_t numDst = dstLayout.getInDimSize(kReg);
-    int32_t fastest = 0, srcRun = 1, dstRun = 1;
-    int32_t fewest = numSrc + numDst + 1;
-    for (int32_t dim = 0; dim < rank; ++dim) {
-      int32_t src = getSharedRunLength(srcLayout, dim, bitwidth);
-      int32_t dst = getSharedRunLength(dstLayout, dim, bitwidth);
-      if (numSrc / src + numDst / dst >= fewest)
-        continue;
-      fewest = numSrc / src + numDst / dst;
-      fastest = dim;
-      srcRun = src;
-      dstRun = dst;
-    }
-    SmallVector<unsigned> order{static_cast<unsigned>(fastest)};
-    for (int32_t dim = 0; dim < rank; ++dim)
-      if (dim != fastest)
-        order.push_back(dim);
-
-    auto getPtr = [&](const LinearLayout &layout,
-                      ArrayRef<std::pair<StringAttr, Value>> indices) {
-      SmallVector<Value> coords;
-      SmallVector<unsigned> shape;
-      for (auto [outDim, coord] :
-           applyLinearLayout(loc, rewriter, layout, indices)) {
-        coords.push_back(coord);
-        shape.push_back(layout.getOutDimSize(outDim));
-      }
-      return b.gep(elemPtrTy, llvmElemTy, smemBase,
-                   LLVM::linearize(rewriter, loc, coords, shape, order));
-    };
-
-    for (int32_t reg = 0; reg < numSrc; reg += srcRun) {
-      auto indices = getIndices(srcLayout, reg);
-      Value owner = emitCanonicalLayoutOwnerPredicate(
-          loc, rewriter, srcLayout, indices, srcFreeVariableMasks);
-      Value value =
-          srcRun == 1 ? inVals[reg]
-                      : packLLVector(loc, inVals.slice(reg, srcRun), rewriter);
-      targetInfo.storeShared(rewriter, loc, getPtr(srcLayout, indices), value,
-                             owner);
-    }
-    if (blockScope)
-      targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
-    else
-      targetInfo.warpSync(loc, rewriter);
-
-    SmallVector<Value> outVals;
-    for (int32_t reg = 0; reg < numDst; reg += dstRun) {
-      Value ptr = getPtr(dstLayout, getIndices(dstLayout, reg));
-      if (dstRun == 1) {
-        outVals.push_back(b.load(llvmElemTy, ptr));
-        continue;
-      }
-      Value vec = b.load(vec_ty(llvmElemTy, dstRun), ptr);
-      llvm::append_range(outVals, unpackLLVector(loc, vec, rewriter));
-    }
-    return outVals;
-  }
-
-  // A tiled plan repeats transferProductTile per tile in one tile of scratch.
-  SmallVector<Value> transferWithinBlockProduct(
-      Location loc, ConversionPatternRewriter &rewriter,
-      const LinearLayout &srcLayout, const LinearLayout &dstLayout,
-      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
-      const ProductConversionPlan &plan,
-      std::optional<std::pair<Value, Value>> distributedCoordinates) const {
-    Value laneId, warpId;
-    std::tie(laneId, warpId) = distributedCoordinates
-                                   ? *distributedCoordinates
-                                   : getLaneAndWarpId(rewriter, loc);
-    bool blockScope = plan.scope == triton::ProductConversionScope::Block;
-    if (!plan.sharedTiling)
-      return transferProductTile(
-          loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase,
-          plan.sourceFreeVariableMasks, blockScope, laneId, warpId);
-    const ProductSharedTiling &tiling = *plan.sharedTiling;
-    auto kReg = StringAttr::get(rewriter.getContext(), "register");
-    // Digit weights, and each tile register's register with the tiled digits 0.
-    auto tileRegisters = [&](const LinearLayout &layout,
-                             ArrayRef<int32_t> tiled,
-                             SmallVector<int32_t> &weights) {
-      SmallVector<int32_t> registers{0};
-      int32_t weight = 1;
-      for (auto [digit, radix] :
-           llvm::enumerate(layout.getInputRadices(kReg))) {
-        weights.push_back(weight);
-        SmallVector<int32_t> next;
-        for (int32_t value = 0; value < radix; ++value)
-          for (int32_t reg : registers)
-            next.push_back(reg + value * weight);
-        if (!llvm::is_contained(tiled, int32_t(digit)))
-          registers = std::move(next);
-        weight *= radix;
-      }
-      return registers;
-    };
-    SmallVector<int32_t> srcWeights, dstWeights;
-    auto srcRegisters =
-        tileRegisters(srcLayout, tiling.sourceDigits, srcWeights);
-    auto dstRegisters =
-        tileRegisters(dstLayout, tiling.destinationDigits, dstWeights);
-    auto tileMasks = tiling.sourceTile.getFreeVariableMasks();
-    int32_t numTiles = srcLayout.getInDimSize(kReg) / srcRegisters.size();
-    SmallVector<Value> outVals(dstLayout.getInDimSize(kReg));
-    for (int32_t tile = 0; tile < numTiles; ++tile) {
-      // This tile's stores overwrite scratch the previous tile's loads read.
-      if (tile > 0 && blockScope)
-        targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
-      else if (tile > 0)
-        targetInfo.warpSync(loc, rewriter);
-      int32_t srcBase = 0, dstBase = 0, rest = tile;
-      for (auto [srcDigit, dstDigit] :
-           llvm::zip_equal(tiling.sourceDigits, tiling.destinationDigits)) {
-        int32_t radix = srcLayout.getInputRadix(kReg, srcDigit);
-        srcBase += rest % radix * srcWeights[srcDigit];
-        dstBase += rest % radix * dstWeights[dstDigit];
-        rest /= radix;
-      }
-      SmallVector<Value> tileVals;
-      for (int32_t reg : srcRegisters)
-        tileVals.push_back(inVals[srcBase + reg]);
-      tileVals = transferProductTile(
-          loc, rewriter, tiling.sourceTile, tiling.destinationTile, tileVals,
-          llvmElemTy, smemBase, tileMasks, blockScope, laneId, warpId);
-      for (auto [reg, value] : llvm::zip_equal(dstRegisters, tileVals))
-        outVals[dstBase + reg] = value;
-    }
-    return outVals;
-  }
-
   SmallVector<Value> transferSwizzlingLocalMemImpl(
       Location loc, ConversionPatternRewriter &rewriter,
       const LinearLayout &srcLayout, const LinearLayout &dstLayout,
@@ -346,9 +172,12 @@ struct ConvertLayoutOpConversion
 
     // The owner predicate handles broadcast source registers.
     if (plan)
-      return transferWithinBlockProduct(loc, rewriter, srcLayout, dstLayout,
-                                        inVals, llvmElemTy, smemBase, *plan,
-                                        distributedCoordinates);
+      return transferProductThroughSharedMemory(
+          loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, llvmElemTy,
+          smemBase, plan->sourceFreeVariableMasks,
+          plan->scope == triton::ProductConversionScope::Block,
+          distributedCoordinates,
+          plan->sharedTiling ? &*plan->sharedTiling : nullptr);
 
     // Remove broadcasting in src
     auto removeBroadcastSrc = actionRemoveBroadcastedRegs(srcLayout);

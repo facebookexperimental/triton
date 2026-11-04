@@ -173,3 +173,33 @@ module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.n
     tt.return
   }
 }
+
+// -----
+
+// No 192 layout keeps these registers. Of each broadcast lane pair only lane
+// bit 5 = 0 stores, at row * 3 + column; every lane reloads after a barrier.
+#b = #ttg.linear<{register = [[32, 0], [0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 0]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [64, 3]}>
+#flat = #ttg.linear<{register = [[64]], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK: module attributes {{.*}}ttg.shared = 768 : i32
+  // CHECK-LABEL: llvm.func @wave_moving_reshape
+  // CHECK: %[[THREE:.*]] = llvm.mlir.constant(3 : i32) : i32
+  // CHECK: %[[Q:.*]] = llvm.udiv %{{.*}}, %{{.*}} : i32
+  // CHECK: %[[DIGIT:.*]] = llvm.urem %[[Q]], %{{.*}} : i32
+  // CHECK: %[[OWNS:.*]] = llvm.icmp "eq" %[[DIGIT]], %{{.*}} : i32
+  // CHECK: %[[PRED:.*]] = llvm.and %{{.*}}, %[[OWNS]] : i1
+  // CHECK: llvm.mul %{{.*}}, %[[THREE]] : i32
+  // CHECK: llvm.cond_br %[[PRED]]
+  // CHECK-NEXT: ^bb1:
+  // CHECK-NEXT: llvm.store {{.*}} : f32, !llvm.ptr<3>
+  // CHECK: rocdl.s.barrier
+  // CHECK-COUNT-3: llvm.load {{.*}} : !llvm.ptr<3> -> f32
+  tt.func public @wave_moving_reshape(%p: !tt.ptr<f32>) {
+    %s = tt.splat %p : !tt.ptr<f32> -> tensor<64x3x!tt.ptr<f32>, #b>
+    %v = tt.load %s : tensor<64x3x!tt.ptr<f32>, #b>
+    %r = tt.reshape %v : tensor<64x3xf32, #b> -> tensor<192xf32, #flat>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<192x!tt.ptr<f32>, #flat>
+    tt.store %d, %r : tensor<192x!tt.ptr<f32>, #flat>
+    tt.return
+  }
+}
