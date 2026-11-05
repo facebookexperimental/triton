@@ -76,6 +76,50 @@ def _wait_stores(x):
     return tl.inline_asm_elementwise("s_waitcnt vmcnt(0)", "=v,0", [x], dtype=x.dtype, is_pure=False, pack=1)
 
 
+@triton.jit
+def _kt_piece(k_buf, SLOT: tl.constexpr, K: tl.constexpr, N: tl.constexpr, token=None):
+    kt = tlx.local_load(tlx.local_slice(tlx.local_trans(tlx.local_view(k_buf, SLOT)), [16 * K, 32 * N], [16, 32]),
+                        token=token, relaxed=True)
+    return tlx.require_layout(kt, tlx.dot_operand_layout(1, _mma(), k_width=8), pin=False)
+
+
+@triton.jit
+def _kt_pieces(k_buf, SLOT: tl.constexpr, token=None):
+    """K^T as the B operands of the 16 MFMAs of `tl.dot(q, kt)`, [K16 step][N32 tile], each loaded on its own
+    (register slices of an LDS-loaded operand miscompile)."""
+    return (
+        _kt_piece(k_buf, SLOT, 0, 0, token),
+        _kt_piece(k_buf, SLOT, 0, 1, token),
+        _kt_piece(k_buf, SLOT, 1, 0, token),
+        _kt_piece(k_buf, SLOT, 1, 1, token),
+        _kt_piece(k_buf, SLOT, 2, 0, token),
+        _kt_piece(k_buf, SLOT, 2, 1, token),
+        _kt_piece(k_buf, SLOT, 3, 0, token),
+        _kt_piece(k_buf, SLOT, 3, 1, token),
+        _kt_piece(k_buf, SLOT, 4, 0, token),
+        _kt_piece(k_buf, SLOT, 4, 1, token),
+        _kt_piece(k_buf, SLOT, 5, 0, token),
+        _kt_piece(k_buf, SLOT, 5, 1, token),
+        _kt_piece(k_buf, SLOT, 6, 0, token),
+        _kt_piece(k_buf, SLOT, 6, 1, token),
+        _kt_piece(k_buf, SLOT, 7, 0, token),
+        _kt_piece(k_buf, SLOT, 7, 1, token),
+    )
+
+
+@triton.jit
+def _qk_pieces(q, kt):
+    """`tl.dot(q, kt)` from `_kt_pieces`: each N32 tile's K16 steps in order, as `tl.dot` issues them."""
+    mma: tl.constexpr = _mma()
+    q = tlx.require_layout(q, tlx.dot_operand_layout(0, mma, k_width=8), pin=False)
+    a = tlx.zeros((q.shape[0], 32), tl.float32, layout=mma)
+    b = tlx.zeros((q.shape[0], 32), tl.float32, layout=mma)
+    for k in tl.static_range(8):
+        a = tl.dot(tlx.extract_slice(q, [q.shape[0], 16], [0, 16 * k]), kt[2 * k], a)
+        b = tl.dot(tlx.extract_slice(q, [q.shape[0], 16], [0, 16 * k]), kt[2 * k + 1], b)
+    return _concat_cols(a, b)
+
+
 # --- Softmax: the dense FA lazy-rescale pipeline, with the row max taken before scaling. --------------------------
 # For QK_SCALE > 0, fl(max(qk) * s) == max(fl(qk * s)) because rounding is monotonic, so the frame is unchanged
 # while the full-tile multiply shrinks to one multiply per row.
@@ -345,37 +389,6 @@ def _silu(s):
 
 
 @triton.jit
-def _kt_piece(k_buf, SLOT: tl.constexpr, K: tl.constexpr, N: tl.constexpr, token=None):
-    kt = tlx.local_load(tlx.local_slice(tlx.local_trans(tlx.local_view(k_buf, SLOT)), [16 * K, 32 * N], [16, 32]),
-                        token=token, relaxed=True)
-    return tlx.require_layout(kt, tlx.dot_operand_layout(1, _mma(), k_width=8), pin=False)
-
-
-@triton.jit
-def _kt_pieces(k_buf, SLOT: tl.constexpr, token=None):
-    """K^T as the B operands of the 16 MFMAs of `tl.dot(q, kt)`, [K16 step][N32 tile], each loaded on its own
-    (register slices of an LDS-loaded operand miscompile)."""
-    return (
-        _kt_piece(k_buf, SLOT, 0, 0, token),
-        _kt_piece(k_buf, SLOT, 0, 1, token),
-        _kt_piece(k_buf, SLOT, 1, 0, token),
-        _kt_piece(k_buf, SLOT, 1, 1, token),
-        _kt_piece(k_buf, SLOT, 2, 0, token),
-        _kt_piece(k_buf, SLOT, 2, 1, token),
-        _kt_piece(k_buf, SLOT, 3, 0, token),
-        _kt_piece(k_buf, SLOT, 3, 1, token),
-        _kt_piece(k_buf, SLOT, 4, 0, token),
-        _kt_piece(k_buf, SLOT, 4, 1, token),
-        _kt_piece(k_buf, SLOT, 5, 0, token),
-        _kt_piece(k_buf, SLOT, 5, 1, token),
-        _kt_piece(k_buf, SLOT, 6, 0, token),
-        _kt_piece(k_buf, SLOT, 6, 1, token),
-        _kt_piece(k_buf, SLOT, 7, 0, token),
-        _kt_piece(k_buf, SLOT, 7, 1, token),
-    )
-
-
-@triton.jit
 def _v_piece(v_buf, SLOT: tl.constexpr, K: tl.constexpr, N: tl.constexpr):
     v = tlx.local_load(tlx.local_slice(tlx.local_view(v_buf, SLOT), [16 * K, 32 * N], [16, 32]), relaxed=True)
     return tlx.require_layout(v, tlx.dot_operand_layout(1, _mma(), k_width=4), pin=False)
@@ -422,19 +435,6 @@ def _chunks(x):
 @triton.jit
 def _unchunk(a, b, c, d):
     return _concat_cols(_concat_cols(a, b), _concat_cols(c, d))
-
-
-@triton.jit
-def _qk_pieces(q, kt):
-    """`tl.dot(q, kt)` from `_kt_pieces`: each N32 tile's K16 steps in order, as `tl.dot` issues them."""
-    mma: tl.constexpr = _mma()
-    q = tlx.require_layout(q, tlx.dot_operand_layout(0, mma, k_width=8), pin=False)
-    a = tlx.zeros((q.shape[0], 32), tl.float32, layout=mma)
-    b = tlx.zeros((q.shape[0], 32), tl.float32, layout=mma)
-    for k in tl.static_range(8):
-        a = tl.dot(tlx.extract_slice(q, [q.shape[0], 16], [0, 16 * k]), kt[2 * k], a)
-        b = tl.dot(tlx.extract_slice(q, [q.shape[0], 16], [0, 16 * k]), kt[2 * k + 1], b)
-    return _concat_cols(a, b)
 
 
 @triton.jit
