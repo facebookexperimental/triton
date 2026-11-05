@@ -13,9 +13,9 @@
 // CHECK: tt.store {{.*}} : tensor<96x64x!tt.ptr<f32>, #linear>
 // CHECK-NOT: ttg.convert_layout
 // LLVM-LABEL: llvm.func @tile_96x64
-// LLVM-COUNT-48: llvm.load {{.*}} : !llvm.ptr<1> -> f32
+// LLVM-COUNT-48: llvm.inline_asm {{.*}}ld.global.b32
 // LLVM-NOT: llvm.load {{.*}} !llvm.ptr<1>
-// LLVM-COUNT-48: llvm.store {{.*}} : f32, !llvm.ptr<1>
+// LLVM-COUNT-48: llvm.inline_asm {{.*}}st.global.b32
 // LLVM-NOT: llvm.store {{.*}} !llvm.ptr<1>
 tt.func @tile_96x64(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
   %m = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32>
@@ -48,9 +48,9 @@ tt.func @tile_96x64(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
 // CHECK: tt.store {{.*}} : tensor<64x96x!tt.ptr<f32>, #linear>
 // CHECK-NOT: ttg.convert_layout
 // LLVM-LABEL: llvm.func @tile_64x96
-// LLVM-COUNT-48: llvm.load {{.*}} : !llvm.ptr<1> -> f32
+// LLVM-COUNT-48: llvm.inline_asm {{.*}}ld.global.b32
 // LLVM-NOT: llvm.load {{.*}} !llvm.ptr<1>
-// LLVM-COUNT-48: llvm.store {{.*}} : f32, !llvm.ptr<1>
+// LLVM-COUNT-48: llvm.inline_asm {{.*}}st.global.b32
 // LLVM-NOT: llvm.store {{.*}} !llvm.ptr<1>
 tt.func @tile_64x96(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
   %m = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
@@ -83,9 +83,9 @@ tt.func @tile_64x96(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
 // CHECK: tt.store {{.*}} : tensor<64x64x!tt.ptr<f32>, #blocked>
 // CHECK-NOT: ttg.convert_layout
 // LLVM-LABEL: llvm.func @tile_64x64
-// LLVM-COUNT-32: llvm.load {{.*}} : !llvm.ptr<1> -> f32
+// LLVM-COUNT-32: llvm.inline_asm {{.*}}ld.global.b32
 // LLVM-NOT: llvm.load {{.*}} !llvm.ptr<1>
-// LLVM-COUNT-32: llvm.store {{.*}} : f32, !llvm.ptr<1>
+// LLVM-COUNT-32: llvm.inline_asm {{.*}}st.global.b32
 // LLVM-NOT: llvm.store {{.*}} !llvm.ptr<1>
 tt.func @tile_64x64(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
   %m = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>

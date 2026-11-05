@@ -4,7 +4,7 @@
 // A Product load takes its power-of-two control's vector: the [96, 64] tile at
 // four warps and 384 at one warp both load v4, as [128, 64] and 512 do.
 // W4-LABEL: @copy_96x64
-// W4-COUNT-12: llvm.load {{.*}} : !llvm.ptr<1> -> vector<4xf32>
+// W4-COUNT-12: llvm.inline_asm {{.*}}ld.global.v4.b32
 // W4-NOT: llvm.load {{.*}} !llvm.ptr<1>
 // W4: llvm.return
 tt.func @copy_96x64(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
@@ -22,7 +22,7 @@ tt.func @copy_96x64(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.p
 // -----
 
 // W4-LABEL: @copy_128x64
-// W4-COUNT-16: llvm.load {{.*}} : !llvm.ptr<1> -> vector<4xf32>
+// W4-COUNT-16: llvm.inline_asm {{.*}}ld.global.v4.b32
 // W4-NOT: llvm.load {{.*}} !llvm.ptr<1>
 // W4: llvm.return
 tt.func @copy_128x64(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
@@ -40,7 +40,7 @@ tt.func @copy_128x64(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.
 // -----
 
 // W1-LABEL: @copy_384
-// W1-COUNT-3: llvm.load {{.*}} : !llvm.ptr<1> -> vector<4xf32>
+// W1-COUNT-3: llvm.inline_asm {{.*}}ld.global.v4.b32
 // W1-NOT: llvm.load {{.*}} !llvm.ptr<1>
 // W1: llvm.return
 tt.func @copy_384(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
@@ -57,7 +57,7 @@ tt.func @copy_384(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr
 // -----
 
 // W1-LABEL: @copy_512
-// W1-COUNT-4: llvm.load {{.*}} : !llvm.ptr<1> -> vector<4xf32>
+// W1-COUNT-4: llvm.inline_asm {{.*}}ld.global.v4.b32
 // W1-NOT: llvm.load {{.*}} !llvm.ptr<1>
 // W1: llvm.return
 tt.func @copy_512(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
