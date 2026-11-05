@@ -7,6 +7,7 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 
 namespace mlir {
@@ -233,6 +234,82 @@ struct DecomposedWarpConversion {
   int nPack;
 };
 
+enum class ProductConversionTransport {
+  Register,
+  Warp,
+  Shared,
+};
+
+// Register digits both layouts share, each alone setting its out dim's odd
+// part or one binary bit. A Shared transfer loops over them, as the pow2 path
+// loops over reps, moving one tile per value.
+struct ProductSharedTiling {
+  SmallVector<int32_t> sourceDigits;
+  SmallVector<int32_t> destinationDigits;
+  triton::LinearLayout sourceTile;
+  triton::LinearLayout destinationTile;
+};
+
+// The odd slabs of a Shared transfer: each NPOT out dim's odd part peeled off
+// both layouts. nullopt unless that leaves pow2 slab layouts.
+std::optional<ProductSharedTiling>
+getProductSharedSlabs(const triton::LinearLayout &src,
+                      const triton::LinearLayout &dst);
+
+// Built only by the factories, so no plan is default or partial: rejected
+// (`rejection` only), shared (Shared transport) or factored (Register or Warp
+// transport, with the register/lane permutation factors).
+struct ProductConversionPlan {
+  static ProductConversionPlan rejected(std::string rejection);
+  static ProductConversionPlan
+  shared(triton::ProductConversionScope scope,
+         llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks);
+  // Register transport and scope when `map.laneMap` is the identity,
+  // otherwise Warp.
+  static ProductConversionPlan
+  factored(llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+           triton::ProductConversionInputMap map);
+
+  std::optional<ProductConversionTransport> transport;
+  std::optional<triton::ProductConversionScope> scope;
+  std::optional<std::string> rejection;
+  llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks;
+  // pReg takes a source register to its destination register in
+  // destinationRegisterOrder's input order; shuffleMap takes a destination
+  // lane to its source lane.
+  std::optional<DecomposedWarpConversion> warpFactors;
+  std::optional<triton::ColumnAction> destinationRegisterOrder;
+  // Set by getProductConversionPlan, which knows the element bitwidth.
+  std::optional<ProductSharedTiling> sharedTiling;
+
+  bool supported() const { return !rejection.has_value(); }
+
+private:
+  ProductConversionPlan(
+      std::optional<ProductConversionTransport> transport,
+      std::optional<triton::ProductConversionScope> scope,
+      std::optional<std::string> rejection,
+      llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+      std::optional<DecomposedWarpConversion> warpFactors,
+      std::optional<triton::ColumnAction> destinationRegisterOrder);
+};
+
+// Plan a Product conversion in closed form. A failed preflight gives a
+// rejected plan; a register/lane map gives a factored plan, else a shared one.
+ProductConversionPlan
+planProductLayoutConversion(const triton::LinearLayout &srcLayout,
+                            const triton::LinearLayout &dstLayout,
+                            ArrayRef<int64_t> logicalShape);
+
+// The plan of a convert with a Product layout on either side, else nullopt.
+std::optional<ProductConversionPlan>
+getProductConversionPlan(RankedTensorType srcTy, RankedTensorType dstTy);
+
+// Scratch bytes of a convert with a Product layout, else nullopt: one tile
+// (the whole tensor if untiled) for a Shared plan, 0 for the other plans.
+std::optional<unsigned>
+getProductConversionScratchBytes(triton::gpu::ConvertLayoutOp op);
+
 // Produces a warp-local decomposition.
 //
 // For permutation cases, the numbers of register and lane basis vectors may
@@ -323,6 +400,10 @@ bool hasOpOfAnyTypeInForwardSlice(Operation *liveOp) {
   }
   return false;
 }
+
+// A Product conversion answers from its plan.
+bool isCvtDimSync(RankedTensorType srcTy, RankedTensorType dstTy,
+                  StringAttr dim);
 
 bool isCvtDimSync(const triton::LinearLayout &srcLayout,
                   const triton::LinearLayout &dstLayout, StringAttr dim);

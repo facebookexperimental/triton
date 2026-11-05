@@ -369,7 +369,7 @@ def get_llvm_flags(options):
         flags.append("amdgpu-use-amdgpu-trackers")
     # Discourage VGPR reuse that creates VALU-to-DS WAR hazards and requires
     # s_wait_alu va_vdst waits in expert scheduling mode.
-    if options.arch == "gfx1250" and is_expert_scheduling_enabled(options.arch):
+    if options.va_vdst_anti_hints and options.arch == "gfx1250" and is_expert_scheduling_enabled(options.arch):
         flags.append("amdgpu-anti-hints-for-va-vdst")
     # User-requested options come last so they override the defaults above.
     flags.extend(f"{name}={value}" for name, value in options.llvm_cl_opts)
@@ -489,6 +489,12 @@ class HIPOptions:
     # with the generic unclustered high-RP strategy. This is cache-keyed and
     # per kernel so unrelated kernels retain the default pressure policy.
     disable_unclustered_high_rp_reschedule: bool = False
+    # gfx1250 expert scheduling: hint the register allocator away from VGPR
+    # reuse that would make a DS instruction wait for an in-flight VALU write
+    # (s_wait_alu va_vdst). The hints can raise VGPR pressure enough to spill,
+    # so kernels near the register limit can turn them off. No effect on other
+    # targets.
+    va_vdst_anti_hints: bool = True
 
     # Cache-keyed, per-kernel schedule-group-barrier planning. Keep this name
     # distinct from the pre-existing TTGIR dot-decomposition scheduler.
@@ -510,6 +516,8 @@ class HIPOptions:
             raise ValueError("enable_wmma_queuing must be a bool")
         if self.enable_wmma_queuing and self.arch != "gfx1250":
             raise ValueError("enable_wmma_queuing requires an AMD gfx1250 target")
+        if type(self.va_vdst_anti_hints) is not bool:
+            raise ValueError("va_vdst_anti_hints must be a bool")
 
         if self.ctas_per_cga is not None:
             dims = tuple(self.ctas_per_cga)
@@ -762,7 +770,7 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         if knobs.language.allow_npot:
-            passes.ttir.add_npot_pad(pm)
+            passes.ttir.add_npot_pad(pm, options.num_warps, options.warp_size, options.num_ctas)
         passes.ttir.add_convert_to_ttgpuir(
             pm,
             f"hip:{options.arch}",

@@ -360,6 +360,9 @@ constexpr int kProfileScratchBufferOffset = -1;
 constexpr int kGlobalScratchBufferOffset = -2;
 constexpr int kSharedMemoryOffset = -3;
 
+// Defined in triton/Analysis/Utility.h.
+struct ProductSharedTiling;
+
 namespace triton {
 
 namespace gpu {
@@ -384,6 +387,27 @@ Value emitRedundantThreadPredicate(
     const llvm::MapVector<StringAttr, int32_t> &freeVarMasks,
     ConversionPatternRewriter &rewriter, Location loc,
     const TargetInfoBase &targetInfo);
+
+// True iff every free-variable digit of `indices` is 0 (mixed radix), so each
+// output of `layout` has one canonical owner.
+Value emitCanonicalLayoutOwnerPredicate(
+    Location loc, RewriterBase &rewriter, const LinearLayout &layout,
+    ArrayRef<std::pair<StringAttr, Value>> indices,
+    const llvm::MapVector<StringAttr, int32_t> &freeVariableMasks);
+
+// Moves Product `inVals` from `srcLayout` to `dstLayout` through scratch at
+// `smemBase`: each element is stored once, by its canonical owner, then every
+// destination register loads its element. Runs of registers are vectorized.
+// A `tiling` repeats this per tile in one tile of scratch.
+SmallVector<Value> transferProductThroughSharedMemory(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    const LinearLayout &srcLayout, const LinearLayout &dstLayout,
+    ArrayRef<Value> inVals, Type elemTy, Value smemBase,
+    const llvm::MapVector<StringAttr, int32_t> &srcFreeVariableMasks,
+    bool blockScope,
+    std::optional<std::pair<Value, Value>> distributedCoordinates =
+        std::nullopt,
+    const ProductSharedTiling *tiling = nullptr);
 
 // Takes two values that may be boolean, or null to represent constant True.
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b);

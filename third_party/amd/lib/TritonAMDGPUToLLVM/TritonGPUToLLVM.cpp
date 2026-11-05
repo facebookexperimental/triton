@@ -495,7 +495,7 @@ struct ConvertTritonAMDGPUToLLVM
         enableTreeReduction);
     populatePatterns7(mlir::triton::populateScanOpToLLVMPatterns,
                       commonBenefit);
-    populatePatterns5(mlir::triton::populateViewOpToLLVMPatterns,
+    populatePatterns7(mlir::triton::populateViewOpToLLVMPatterns,
                       commonBenefit);
     AMD::populateHistogramOpToLLVMPatterns(typeConverter, patterns, targetInfo,
                                            AMDBenefit);

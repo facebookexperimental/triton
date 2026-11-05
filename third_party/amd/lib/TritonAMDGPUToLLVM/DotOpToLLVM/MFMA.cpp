@@ -26,6 +26,7 @@
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Matchers.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
@@ -689,16 +690,6 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     ScaleDotElemType aElemType = op.getAElemType();
     ScaleDotElemType bElemType = op.getBElemType();
 
-    auto supportsTypes = [](ScaleDotElemType elemType) {
-      return elemType == ScaleDotElemType::E2M1 ||
-             elemType == ScaleDotElemType::E4M3 ||
-             elemType == ScaleDotElemType::E5M2;
-    };
-
-    if (!supportsTypes(aElemType) || !supportsTypes(bElemType)) {
-      llvm::report_fatal_error("NYI: mxfp6\n");
-    }
-
     int64_t kDimOperandSize = aTensorTy.getShape().back();
 
     auto ctx = op.getContext();
@@ -720,8 +711,27 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     StringRef intrinsicName = maybeMfmaIntrinsic->name;
     unsigned kBase = maybeMfmaIntrinsic->kBase;
     // Two fp4 are packed into an uint8.
-    unsigned aKBase = aElemType == ScaleDotElemType::E2M1 ? kBase / 2 : kBase;
-    unsigned bKBase = bElemType == ScaleDotElemType::E2M1 ? kBase / 2 : kBase;
+    auto packedKBase = [](ScaleDotElemType elemType,
+                          unsigned kBase) -> FailureOr<unsigned> {
+      if (elemType == ScaleDotElemType::E2M1)
+        return kBase / 2;
+      if (isMXFP6ScaleType(elemType)) {
+        // fp6 packs groups of 16 values per 12 bytes; the x3/4 byte
+        // conversion steps within a group by 4 values.
+        if (kBase % 4 != 0)
+          return failure();
+        return kBase * 3 / 4;
+      }
+      return kBase;
+    };
+    auto aKBaseOr = packedKBase(aElemType, kBase);
+    auto bKBaseOr = packedKBase(bElemType, kBase);
+    if (failed(aKBaseOr) || failed(bKBaseOr))
+      return op.emitError("fp6 MFMA instruction K width ")
+             << kBase << " is not a multiple of 4, so it cannot be "
+             << "converted to packed bytes (x3/4)";
+    unsigned aKBase = *aKBaseOr;
+    unsigned bKBase = *bKBaseOr;
 
     int aKWidth = aKBase;
     int bKWidth = bKBase;

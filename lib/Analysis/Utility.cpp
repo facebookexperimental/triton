@@ -868,6 +868,288 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
           std::move(mixedTranspositions), nPack};
 }
 
+ProductConversionPlan::ProductConversionPlan(
+    std::optional<ProductConversionTransport> transport,
+    std::optional<ProductConversionScope> scope,
+    std::optional<std::string> rejection,
+    llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+    std::optional<DecomposedWarpConversion> warpFactors,
+    std::optional<ColumnAction> destinationRegisterOrder)
+    : transport(transport), scope(scope), rejection(std::move(rejection)),
+      sourceFreeVariableMasks(std::move(sourceFreeVariableMasks)),
+      warpFactors(std::move(warpFactors)),
+      destinationRegisterOrder(std::move(destinationRegisterOrder)) {}
+
+ProductConversionPlan ProductConversionPlan::rejected(std::string rejection) {
+  return ProductConversionPlan(std::nullopt, std::nullopt, std::move(rejection),
+                               {}, std::nullopt, std::nullopt);
+}
+
+ProductConversionPlan ProductConversionPlan::shared(
+    ProductConversionScope scope,
+    llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks) {
+  return ProductConversionPlan(ProductConversionTransport::Shared, scope,
+                               std::nullopt, std::move(sourceFreeVariableMasks),
+                               std::nullopt, std::nullopt);
+}
+
+ProductConversionPlan ProductConversionPlan::factored(
+    llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+    ProductConversionInputMap map) {
+  bool laneIdentity = squareSublayoutIsIdentity(
+      map.laneMap, to_vector(map.laneMap.getInDimNames()));
+  // shuffleMap reads each destination lane from its source lane: the inverse
+  // lane permutation, with no register, warp or block terms.
+  auto *ctx = map.laneMap.getInDimNames().begin()->getContext();
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  StringAttr kLane = StringAttr::get(ctx, "lane");
+  LinearLayout::BasesT shuffleBases;
+  shuffleBases[kReg].assign(
+      llvm::Log2_32_Ceil(map.registerMap.getInDimSize(kReg)), {0});
+  shuffleBases[kLane] = map.laneMap.invert().getBases().lookup(kLane);
+  shuffleBases[StringAttr::get(ctx, "warp")];
+  shuffleBases[StringAttr::get(ctx, "block")];
+  LinearLayout shuffleMap(std::move(shuffleBases),
+                          {{kLane, map.laneMap.getInDimSize(kLane)}},
+                          /*requireSurjective=*/false);
+  return ProductConversionPlan(
+      laneIdentity ? ProductConversionTransport::Register
+                   : ProductConversionTransport::Warp,
+      laneIdentity ? ProductConversionScope::Register
+                   : ProductConversionScope::Warp,
+      std::nullopt, std::move(sourceFreeVariableMasks),
+      DecomposedWarpConversion{std::move(map.registerMap),
+                               std::move(shuffleMap),
+                               /*mixedTranspositions=*/{}, /*nPack=*/0},
+      std::move(map.registerOrder));
+}
+
+// The register digit that alone sets `outDim`'s odd part (`bit` 0) or binary
+// `bit` in `layout`, with a unit basis on `outDim` only; -1 if there is none.
+// Like the pow2 reps, it keeps the leading digits that vectorize `outDim`.
+static int32_t findTileDigit(const LinearLayout &layout, StringAttr outDim,
+                             int32_t bit) {
+  bool odd = bit == 0;
+  int32_t size = layout.getOutDimSize(outDim);
+  int32_t twoPart = LinearLayout::twoPartOf(size);
+  auto kReg = StringAttr::get(outDim.getContext(), "register");
+  int32_t run = 0;
+  while (run < layout.getNumLeadingRadix2Digits(kReg) &&
+         layout.getBasis(kReg, run, outDim) == 1 << run)
+    ++run;
+  int32_t found = -1;
+  for (StringAttr inDim : layout.getInDimNames()) {
+    ArrayRef<int32_t> radices = layout.getInputRadices(inDim);
+    for (int32_t pos = 0, e = radices.size(); pos < e; ++pos) {
+      auto part = layout.getBasisContribution(inDim, pos, outDim);
+      if (odd ? part.odd == 0 : (part.binary & bit) == 0)
+        continue;
+      bool unit =
+          odd ? part.binary == 0 && part.odd == 1 &&
+                    radices[pos] == size / twoPart
+              : part.binary == bit && part.odd == 0 && radices[pos] == 2;
+      if (found >= 0 || inDim != kReg || pos < run || !unit ||
+          llvm::count(layout.getBasis(inDim, pos), 0) + 1 !=
+              int64_t(layout.getNumOutDims()))
+        return -1;
+      found = pos;
+    }
+  }
+  return found;
+}
+
+// `layout` without register digit `pos`, with `outDim` cut to `size` and its
+// binary bits above `bit` (if nonzero) moved down over it.
+static std::optional<LinearLayout> dropTileDigit(const LinearLayout &layout,
+                                                 int32_t pos, StringAttr outDim,
+                                                 int32_t size, int32_t bit) {
+  auto outDims = layout.getOutDims();
+  int32_t outIndex = layout.getOutDimIndex(outDim);
+  outDims[outIndex].second = size;
+  LinearLayout::BasesT bases;
+  LinearLayout::RadicesT radices;
+  for (StringAttr inDim : layout.getInDimNames()) {
+    auto &inBases = bases[inDim];
+    auto &inRadices = radices[inDim];
+    for (auto [digit, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
+      if (inDim == "register" && int32_t(digit) == pos)
+        continue;
+      auto basis = to_vector(layout.getBasis(inDim, digit));
+      auto part = layout.getBasisContribution(inDim, digit, outDim);
+      int32_t binary =
+          bit ? (part.binary & (bit - 1)) | (part.binary >> 1 & ~(bit - 1))
+              : part.binary;
+      basis[outIndex] = binary + LinearLayout::twoPartOf(size) * part.odd;
+      inBases.emplace_back(basis.begin(), basis.end());
+      inRadices.push_back(radix);
+    }
+  }
+  return LinearLayout::tryCreate(std::move(bases), std::move(radices), outDims,
+                                 /*requireSurjective=*/false);
+}
+
+// The pow2 cover of a Product `layout`: each digit of odd radix r becomes
+// ceil(log2 r) binary digits, so each out dim pads to its next power of two.
+static LinearLayout coverProductLayout(const LinearLayout &layout) {
+  auto outDims = layout.getOutDims();
+  for (auto &[outDim, size] : outDims)
+    size = llvm::PowerOf2Ceil(size);
+  LinearLayout::BasesT bases;
+  for (StringAttr inDim : layout.getInDimNames()) {
+    auto &inBases = bases[inDim];
+    for (auto [digit, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
+      auto basis = to_vector(layout.getBasis(inDim, digit));
+      if (radix == 2) {
+        inBases.emplace_back(basis.begin(), basis.end());
+        continue;
+      }
+      for (int32_t bit = 1; bit < radix; bit *= 2) {
+        auto &cover = inBases.emplace_back(basis.size(), 0);
+        for (auto [i, outDim] : llvm::enumerate(layout.getOutDimNames()))
+          if (basis[i] != 0)
+            cover[i] =
+                LinearLayout::twoPartOf(layout.getOutDimSize(outDim)) * bit;
+      }
+    }
+  }
+  return LinearLayout(std::move(bases), outDims, /*requireSurjective=*/false);
+}
+
+// The register digit positions of `layout`.
+static SmallVector<int32_t> registerDigits(const LinearLayout &layout) {
+  auto kReg =
+      StringAttr::get(layout.getInDimNames().begin()->getContext(), "register");
+  return to_vector(
+      llvm::seq<int32_t>(0, int32_t(layout.getInputRadices(kReg).size())));
+}
+
+// Peels the digit that alone sets `outDim`'s `bit` (its odd part if 0) off both
+// tiles, recording its original positions; false if a tile has none.
+static bool peelTileDigit(ProductSharedTiling &tiling,
+                          SmallVector<int32_t> &srcPositions,
+                          SmallVector<int32_t> &dstPositions, StringAttr outDim,
+                          int32_t bit) {
+  int32_t s = findTileDigit(tiling.sourceTile, outDim, bit);
+  int32_t d = findTileDigit(tiling.destinationTile, outDim, bit);
+  if (s < 0 || d < 0)
+    return false;
+  int32_t size = tiling.sourceTile.getOutDimSize(outDim);
+  size = bit ? size / 2 : LinearLayout::twoPartOf(size);
+  auto srcTile = dropTileDigit(tiling.sourceTile, s, outDim, size, bit);
+  auto dstTile = dropTileDigit(tiling.destinationTile, d, outDim, size, bit);
+  if (!srcTile || !dstTile)
+    return false;
+  tiling.sourceDigits.push_back(srcPositions[s]);
+  tiling.destinationDigits.push_back(dstPositions[d]);
+  srcPositions.erase(srcPositions.begin() + s);
+  dstPositions.erase(dstPositions.begin() + d);
+  tiling.sourceTile = std::move(*srcTile);
+  tiling.destinationTile = std::move(*dstTile);
+  return true;
+}
+
+std::optional<ProductSharedTiling>
+getProductSharedSlabs(const LinearLayout &src, const LinearLayout &dst) {
+  auto kReg =
+      StringAttr::get(src.getInDimNames().begin()->getContext(), "register");
+  if (src.getOutDims() != dst.getOutDims() || !src.hasInDim(kReg) ||
+      !dst.hasInDim(kReg))
+    return std::nullopt;
+  ProductSharedTiling slabs{{}, {}, src, dst};
+  auto srcPositions = registerDigits(src), dstPositions = registerDigits(dst);
+  for (auto [outDim, size] : src.getOutDims())
+    if (!llvm::isPowerOf2_32(size) &&
+        !peelTileDigit(slabs, srcPositions, dstPositions, outDim, /*bit=*/0))
+      return std::nullopt;
+  if (slabs.sourceDigits.empty() || !slabs.sourceTile.isRadix2() ||
+      !slabs.destinationTile.isRadix2())
+    return std::nullopt;
+  return slabs;
+}
+
+// The shared register digits of a Shared transfer, peeled in order until the
+// tile fits the scratch the pow2 path takes on the cover; nullopt when none is.
+static std::optional<ProductSharedTiling>
+tileProductSharedTransfer(const LinearLayout &src, const LinearLayout &dst,
+                          int bitwidth) {
+  auto inDims = to_vector(src.getInDimNames());
+  auto kReg = llvm::find(inDims, "register");
+  if (src.getOutDims() != dst.getOutDims() || kReg == inDims.end() ||
+      !dst.hasInDim(*kReg))
+    return std::nullopt;
+  ProductSharedTiling tiling{{}, {}, src, dst};
+  int64_t budget = getNumScratchElemsSwizzledCvt(
+      coverProductLayout(src), coverProductLayout(dst), bitwidth);
+  auto overBudget = [&] {
+    return product(to_vector(tiling.sourceTile.getOutDimSizes())) > budget;
+  };
+  auto srcPositions = registerDigits(src), dstPositions = registerDigits(dst);
+  for (bool changed = true; changed && overBudget();) {
+    changed = false;
+    for (StringAttr outDim : src.getOutDimNames()) {
+      // The odd part, then each binary bit from the top; a peel moves only the
+      // bits above it, which were already tried.
+      int32_t size = tiling.sourceTile.getOutDimSize(outDim);
+      SmallVector<int32_t> bits{0};
+      for (int32_t bit = LinearLayout::twoPartOf(size) / 2; bit > 0; bit /= 2)
+        bits.push_back(bit);
+      for (int32_t bit : bits) {
+        if (!overBudget())
+          break;
+        changed |=
+            peelTileDigit(tiling, srcPositions, dstPositions, outDim, bit);
+      }
+    }
+  }
+  if (tiling.sourceDigits.empty())
+    return std::nullopt;
+  return tiling;
+}
+
+ProductConversionPlan
+planProductLayoutConversion(const LinearLayout &srcLayout,
+                            const LinearLayout &dstLayout,
+                            ArrayRef<int64_t> logicalShape) {
+  using Plan = ProductConversionPlan;
+  auto dst = alignProductConversionOutDims(srcLayout, dstLayout, logicalShape);
+  if (!dst)
+    return Plan::rejected("NPOT Product conversion with mismatched or "
+                          "non-standard out dims is not yet supported");
+  auto reject = [](StringRef what, StringRef role) {
+    return Plan::rejected(("NPOT Product conversion with " + what + " in the " +
+                           role + " layout is not yet supported")
+                              .str());
+  };
+  using Role = std::pair<const LinearLayout *, StringRef>;
+  for (auto [layout, role] :
+       {Role{&srcLayout, "source"}, Role{&*dst, "destination"}}) {
+    if (!hasProductConversionInputDims(*layout))
+      return reject("a non-singleton block input", role);
+    // getFreeVariableMasks needs radix-2 or Product layouts.
+    if (!layout->isRadix2() && !layout->hasNonBinaryCarrier())
+      return reject("non-radix-2 digits on power-of-two outputs", role);
+    if (!coversAllLogicalOutputs(*layout, logicalShape))
+      return reject("incomplete logical output coverage", role);
+  }
+  auto hasRegisterAndLane = [](const LinearLayout &layout) {
+    auto inDims = to_vector(layout.getInDimNames());
+    return llvm::is_contained(inDims, "register") &&
+           llvm::is_contained(inDims, "lane");
+  };
+  if (!hasRegisterAndLane(srcLayout) || !hasRegisterAndLane(*dst))
+    return Plan::rejected("NPOT Product conversion without register and lane "
+                          "input dimensions is not yet supported");
+
+  auto masks = srcLayout.getFreeVariableMasks();
+  // The map moves only registers and lanes, so it also sets the scope, even
+  // when both layouts are replicated across warps.
+  if (auto map = mapProductConversionInputs(*dst, srcLayout))
+    return Plan::factored(std::move(masks), std::move(*map));
+  return Plan::shared(
+      classifyProductConversionScope(srcLayout, *dst, logicalShape),
+      std::move(masks));
+}
+
 static void computeTranspositionSelectors(
     SmallVector<DecomposedWarpConversion::TranspositionInfo>
         &mixedTranspositions,
@@ -1170,6 +1452,10 @@ bool GatherLoweringHelper::isWarpLocal() {
   RankedTensorType idxType = gatherOp.getIndices().getType();
   LinearLayout srcLayout = toLinearLayout(srcType);
   LinearLayout idxLayout = toLinearLayout(idxType);
+  // The warp-local emitter inverts the layouts, which mixed-radix digits do
+  // not support; the shared-memory path addresses each element.
+  if (!srcLayout.isRadix2() || !idxLayout.isRadix2())
+    return false;
 
   Builder b(gatherOp.getContext());
   StringAttr kBlock = b.getStringAttr("block");
@@ -1351,11 +1637,41 @@ static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
   return hasMmaFamily(srcTy.getEncoding()) || hasMmaFamily(dstTy.getEncoding());
 }
 
+std::optional<ProductConversionPlan>
+getProductConversionPlan(RankedTensorType srcTy, RankedTensorType dstTy) {
+  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy))
+    return std::nullopt;
+  // The LLVM struct holds only the unique register values.
+  auto kReg = StringAttr::get(srcTy.getContext(), "register");
+  auto src = toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
+  auto dst = toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg);
+  auto plan = planProductLayoutConversion(src, dst, dstTy.getShape());
+  if (plan.transport == ProductConversionTransport::Shared)
+    plan.sharedTiling = tileProductSharedTransfer(src, dst, getBitwidth(srcTy));
+  return plan;
+}
+
+std::optional<unsigned> getProductConversionScratchBytes(ConvertLayoutOp op) {
+  auto srcTy = op.getSrc().getType();
+  auto plan = getProductConversionPlan(srcTy, op.getType());
+  if (!plan)
+    return std::nullopt;
+  if (plan->transport != ProductConversionTransport::Shared)
+    return 0;
+  int64_t elements = product(srcTy.getShape());
+  if (plan->sharedTiling)
+    elements =
+        product(to_vector(plan->sharedTiling->sourceTile.getOutDimSizes()));
+  return elements * getBitwidth(srcTy) / 8;
+}
+
 bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
   // Modular MMA conversions can alias bases; use shared memory.
   if (npotMmaConversion(srcTy, dstTy)) {
     return false;
   }
+  if (auto plan = getProductConversionPlan(srcTy, dstTy))
+    return plan->transport == ProductConversionTransport::Register;
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1433,6 +1749,8 @@ bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
       return true;
     }
   }
+  if (auto plan = getProductConversionPlan(srcTy, dstTy))
+    return plan->transport == ProductConversionTransport::Shared;
   return !cvtReordersRegisters(srcTy, dstTy) &&
          !cvtNeedsWarpShuffle(srcTy, dstTy);
 }
@@ -1448,6 +1766,8 @@ bool cvtNeedsSharedMemory(triton::gpu::ConvertLayoutOp op) {
       return true;
     }
   }
+  if (auto plan = getProductConversionPlan(srcTy, dstTy))
+    return plan->transport == ProductConversionTransport::Shared;
   return !cvtReordersRegisters(srcTy, dstTy) && !cvtNeedsWarpShuffle(op);
 }
 
@@ -1474,6 +1794,13 @@ bool isCvtDimSync(const triton::LinearLayout &srcLayout,
   }
   return invertAndComposeLocal(srcLayout, dstLayout, {kBlock})
       .isIdentityOnOutDim(kBlock);
+}
+
+bool isCvtDimSync(RankedTensorType srcTy, RankedTensorType dstTy,
+                  StringAttr dim) {
+  if (auto plan = getProductConversionPlan(srcTy, dstTy))
+    return plan->scope != ProductConversionScope::Block || dim == "block";
+  return isCvtDimSync(toLinearLayout(srcTy), toLinearLayout(dstTy), dim);
 }
 
 namespace triton {
@@ -1545,8 +1872,7 @@ bool needsClusterBarrier(Operation *op) {
     return true;
   if (auto cvt = dyn_cast<gpu::ConvertLayoutOp>(op)) {
     auto kBlock = StringAttr::get(op->getContext(), "block");
-    return !isCvtDimSync(gpu::toLinearLayout(cvt.getSrc().getType()),
-                         gpu::toLinearLayout(cvt.getType()), kBlock);
+    return !isCvtDimSync(cvt.getSrc().getType(), cvt.getType(), kBlock);
   }
   if (auto reduce = dyn_cast<ReduceOp>(op))
     return !ReduceOpHelper(reduce).isReduceWithinCTA();

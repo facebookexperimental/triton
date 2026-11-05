@@ -100,6 +100,11 @@ unsigned getAtomicResultScratchSize(Value result) {
 }
 
 unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+  if (auto reshape = dyn_cast<ReshapeOp>(op)) {
+    RankedTensorType srcTy = reshape.getSrc().getType();
+    if (gpu::isNpotSharedReshape(srcTy, reshape.getType()))
+      return srcTy.getNumElements() * getBitwidth(srcTy) / 8;
+  }
   if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
     return ReduceOpHelper(reduceOp).getScratchSizeInBytes();
   }
@@ -123,6 +128,8 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   if (auto cvtLayout = dyn_cast<gpu::ConvertLayoutOp>(op)) {
     auto srcTy = cvtLayout.getSrc().getType();
     auto dstTy = cvtLayout.getType();
+    if (auto bytes = getProductConversionScratchBytes(cvtLayout))
+      return *bytes;
     if (!cvtNeedsSharedMemory(cvtLayout))
       return 0;
     // The generic pass uses swizzling

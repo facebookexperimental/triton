@@ -817,6 +817,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.kda._prefill_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.mla_window_attn._shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.norm._cat_shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.mm._shapes": {
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),
@@ -914,6 +915,7 @@ BENCH_MODULES = (
     "bench_kda_prefill",
     "bench_mla_window_attn",
     "bench_mm",
+    "bench_rmsnorm_cat",
     "bench_swiglu_ffn",
 )
 

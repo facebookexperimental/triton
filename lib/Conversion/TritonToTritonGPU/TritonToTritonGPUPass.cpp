@@ -182,6 +182,23 @@ struct TritonExpandDimsPattern
     Attribute _argEncoding = argType.getEncoding();
     if (!_argEncoding)
       return failure();
+    // A Product result keeps the converter's layout and the operand takes its
+    // slice, as below.
+    auto productTy =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+    if (!triton::gpu::isRadix2Encoding(productTy.getEncoding())) {
+      auto sliceTy =
+          argType.cloneWithEncoding(triton::gpu::SliceEncodingAttr::get(
+              getContext(), op.getAxis(),
+              cast<triton::gpu::DistributedEncodingTrait>(
+                  productTy.getEncoding())));
+      auto src = triton::gpu::ConvertLayoutOp::create(
+          rewriter, op.getLoc(), sliceTy, adaptor.getSrc());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::ExpandDimsOp>(
+                        op, src, adaptor.getAxis()),
+                    adaptor.getAttributes());
+      return success();
+    }
     auto argEncoding = cast<triton::gpu::BlockedEncodingAttr>(_argEncoding);
     // return shape
     auto retShape = argType.getShape().vec();
@@ -407,6 +424,18 @@ struct TritonBroadcastPattern
     auto srcEncoding = srcType.getEncoding();
     if (!srcEncoding)
       return failure();
+    // A Product result takes the converter's layout, and so does the operand.
+    auto productTy =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+    if (!triton::gpu::isRadix2Encoding(productTy.getEncoding())) {
+      auto src = triton::gpu::ConvertLayoutOp::create(
+          rewriter, op.getLoc(),
+          srcType.cloneWithEncoding(productTy.getEncoding()), adaptor.getSrc());
+      addNamedAttrs(
+          rewriter.replaceOpWithNewOp<triton::BroadcastOp>(op, productTy, src),
+          adaptor.getAttributes());
+      return success();
+    }
     auto origResultType = cast<RankedTensorType>(op.getType());
     Attribute resultEncoding = origResultType.getEncoding();
     // Byte-identical fast path: no result encoding or already matching.

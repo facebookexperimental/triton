@@ -916,7 +916,8 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     m += tl.math.log2(l)
                     offs_m = start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
-                    tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
+                    # The last M-block can run past N_CTX; its rows would land in the next head.
+                    tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]), mask=offs_m < N_CTX)
 
                     tlx.barrier_wait(acc_empties[cid], phase)
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
@@ -1250,7 +1251,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
             clc_phase_consumer = 0
             while tile_id != -1:
                 # initialize offsets
-                _, _, _, _, qo_offset_y, _ = _compute_offsets(
+                start_m, _, _, _, qo_offset_y, _ = _compute_offsets(
                     tile_id // NUM_CTAS,
                     H,
                     num_pid_n,
@@ -1264,9 +1265,12 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                 for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
                     group_id = cid * NUM_CTAS + cluster_cta_rank
                     tlx.barrier_wait(o_fulls[cid], phase)
-                    qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
-                    tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
-                    tlx.async_descriptor_store_wait(0)
+                    # desc_o flattens (Z, H, N_CTX), so a group past N_CTX would overwrite the next
+                    # head's rows. N_CTX % BLOCK_M_SPLIT == 0, so a group is either fully in or fully out.
+                    if start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT < N_CTX:
+                        qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
+                        tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
+                        tlx.async_descriptor_store_wait(0)
                     tlx.barrier_arrive(o_empties[cid])
 
                 tile_count += 1
@@ -1277,18 +1281,23 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
 @triton.jit
 def _attn_bwd_preprocess(O, DO,  #
                          Delta,  #
+                         DQ_ACCUM,  #
                          N_CTX,  #
                          BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
                          ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
     off_n = tl.arange(0, HEAD_DIM)
+    offs = off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]
     # load
-    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :])
-    do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
+    o = tl.load(O + offs)
+    do = tl.load(DO + offs).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     # write-back
     tl.store(Delta + off_hz * N_CTX + off_m, delta)
+    # The packed dQ layout permutes rows only within BLOCK_M-aligned tiles, so
+    # this block's region of the accumulator is the same contiguous range.
+    tl.store(DQ_ACCUM + offs, tl.zeros([BLOCK_M, HEAD_DIM], tl.float32))
 
 
 @triton.jit
@@ -1369,11 +1378,6 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     _bwd_selected_meta["BLOCK_M1"] = BLOCK_M1
     _bwd_selected_meta["NUM_CTAS"] = NUM_CTAS
     _bwd_selected_meta["DQ_BULK_NCOL"] = nargs.get("DQ_BULK_NCOL", 0)
-
-    # Reset dq accumulator to zeros before each autotuner warmup run.
-    # dq uses TMA reduce-add, so stale values accumulate across runs.
-    # dk/dv don't need zeroing — they use use_acc=False on the first iteration.
-    nargs["desc_dq"].base.zero_()
 
     nargs["desc_q"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // NUM_CTAS]
     nargs["desc_do"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // NUM_CTAS]
@@ -3594,7 +3598,8 @@ class _attention(torch.autograd.Function):
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         _HALF_HD = ctx.HEAD_DIM // 2
-        dq_accum = torch.zeros([BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM], device=q.device, dtype=torch.float32)
+        # Zeroed by _attn_bwd_preprocess (and between autotuning runs by _bwd_reset_dq_accum).
+        dq_accum = torch.empty([BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM], device=q.device, dtype=torch.float32)
         PRE_BLOCK = 128
         BLK_SLICE_FACTOR = 2
         assert N_CTX % PRE_BLOCK == 0
@@ -3603,6 +3608,7 @@ class _attention(torch.autograd.Function):
         _attn_bwd_preprocess[pre_grid](
             o, do,  #
             delta,  #
+            dq_accum,  #
             N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
         )
@@ -3697,6 +3703,12 @@ class _attention(torch.autograd.Function):
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
             STAGE=stage,  #
+            # Every generic-proxy SMEM write that an MMA or TMA store reads is
+            # fenced by its writer before the barrier that publishes it, so skip
+            # the consumer-side fences Triton would add before each MMA. Those
+            # land on the K/V operands of Dot 1/Dot 2 (K/V alias the dK/dV
+            # staging) and stall the single MMA-issuing warp every iteration.
+            disable_nv_fence_insertion=True,  #
         )
 
         _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
@@ -3783,11 +3795,18 @@ def _tuned_fwd(space):
     )(_attn_fwd_ws)
 
 
+def _bwd_reset_dq_accum(nargs, reset_only=False):
+    # dQ is accumulated with TMA reduce-add, so re-zero it around each autotuning run.
+    # The autotuner calls this hook only while benchmarking, never on a regular launch.
+    nargs["desc_dq"].base.zero_()
+
+
 @functools.lru_cache(maxsize=None)
 def _tuned_bwd(space):
     return triton.autotune(
         configs={"full": BWD_CONFIGS_FULL, "smoke": BWD_CONFIGS_SMOKE}[space](),
         key=["N_CTX", "HEAD_DIM"],
+        pre_hook=_bwd_reset_dq_accum,
     )(_attn_bwd_ws)
 
 

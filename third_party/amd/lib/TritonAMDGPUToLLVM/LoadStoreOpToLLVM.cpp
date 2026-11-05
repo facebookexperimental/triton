@@ -198,6 +198,24 @@ std::pair<Block *, Block *> emitBranch(RewriterBase &rewriter, Location loc,
   return {body, after};
 }
 
+SmallVector<int32_t> getRegisterRadices(Type type) {
+  if (auto tensorTy = dyn_cast<RankedTensorType>(type))
+    return llvm::to_vector(toLinearLayout(tensorTy).getInputRadices(
+        StringAttr::get(type.getContext(), "register")));
+  return {};
+}
+
+bool isCanonicalRegisterIndex(unsigned index, unsigned freeVarMask,
+                              ArrayRef<int32_t> radices) {
+  for (int32_t radix : radices) {
+    if ((freeVarMask & 1) && index % radix != 0)
+      return false;
+    index /= radix;
+    freeVarMask >>= 1;
+  }
+  return true;
+}
+
 bool isRedundantThreadPredWarpUniform(
     const llvm::MapVector<StringAttr, int32_t> &masks, MLIRContext *ctx) {
   return masks.lookup(StringAttr::get(ctx, "lane")) == 0;
@@ -1857,8 +1875,9 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     Value threadPred = emitRedundantThreadPredicateNonNull(
         freeVarMasks, rewriter, loc, targetInfo);
     uint32_t regMask = freeVarMasks[str_attr("register")];
+    auto registerRadices = getRegisterRadices(valueTy);
     for (size_t vecStart = 0; vecStart < elemsPerThread; vecStart += vec) {
-      if (!isCanonicalIndex(vecStart, regMask)) {
+      if (!isCanonicalRegisterIndex(vecStart, regMask, registerRadices)) {
         // Don't emit store ops for redundant elements within a thread
         continue;
       }
@@ -2228,8 +2247,9 @@ struct BufferStoreOpConversion
     Value threadPred = emitRedundantThreadPredicateNonNull(
         freeVarMasks, rewriter, loc, targetInfo);
     uint32_t regMask = freeVarMasks[str_attr("register")];
+    auto registerRadices = getRegisterRadices(valueTy);
     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
-      if (!isCanonicalIndex(vecStart, regMask)) {
+      if (!isCanonicalRegisterIndex(vecStart, regMask, registerRadices)) {
         // Don't emit store ops for redundant elements within a thread
         continue;
       }

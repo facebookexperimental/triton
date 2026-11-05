@@ -102,6 +102,15 @@ inline bool getModuleTwoCTAs(Operation *op) {
   return getModuleTwoCTAs(op->getParentOfType<ModuleOp>());
 }
 
+enum class Tcgen05Kind { F16OrTF32, F8F6F4, I8, BlockScaled };
+
+// Why a tcgen05.mma of this form cannot use per-CTA tile `m` x `n`, or nullopt
+// if it can (PTX ISA 9.7.18.2.1 Table 48, intersected with CUTLASS
+// mma_sm100_umma.hpp).
+std::optional<std::string>
+getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
+                             bool twoCTAs, unsigned m, unsigned n);
+
 // Returns the required ordering of repeated TMEM scale blocks for one
 // tcgen05 scaled-MMA operand.
 TensorMemoryScalesBlockRepOrder getTensorMemoryScalesBlockRepOrder(

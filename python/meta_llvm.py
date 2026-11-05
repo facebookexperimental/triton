@@ -1,9 +1,11 @@
 """Meta LLVM fork builds for facebookexperimental/triton.
 
-cmake/llvm-info.json is OAI's pin and stays byte-identical to upstream, so
-upstream picks apply cleanly. cmake/meta-llvm-info.json, when present, names
-the Meta LLVM fork build, which must sit on OAI's pin. build_helpers.py calls
-in here from two hooks; keep Meta's dependency logic in this file.
+cmake/llvm-info.json and cmake/amd-llvm-info.json are OAI's pins and stay
+byte-identical to upstream, so upstream picks apply cleanly.
+cmake/meta-llvm-info.json and cmake/meta-amd-llvm-info.json, when present,
+name the Meta fork builds, each of which must sit on its OAI pin.
+build_helpers.py calls in here from two hooks; keep Meta's dependency logic in
+this file.
 """
 
 import hashlib
@@ -27,20 +29,34 @@ def enabled(base_dir: str) -> bool:
     return os.path.exists(os.path.join(base_dir, "cmake", "meta-llvm-info.json"))
 
 
-def load_llvm_info(base_dir: Optional[str] = None) -> dict:
-    # INVARIANT: compare against llvm-info.json, the LLVM the Triton sources
-    # are written against. llvm-build-info.json only requests the next OAI
-    # build and moves days before the sources do.
+def _load_info(base_dir: Optional[str], oai_name: str, meta_name: str) -> dict:
+    # INVARIANT: compare against the OAI pin the Triton sources are written
+    # against. The *-build-info.json files only request the next OAI build and
+    # move days before the sources do.
     cmake_dir = os.path.join(base_dir or bh.get_base_dir(), "cmake")
-    with open(os.path.join(cmake_dir, "llvm-info.json"), "r") as llvm_info_file:
-        oai_info = json.load(llvm_info_file)
-    with open(os.path.join(cmake_dir, "meta-llvm-info.json"), "r") as meta_info_file:
+    with open(os.path.join(cmake_dir, oai_name), "r") as oai_info_file:
+        oai_info = json.load(oai_info_file)
+    with open(os.path.join(cmake_dir, meta_name), "r") as meta_info_file:
         meta_info = json.load(meta_info_file)
     if meta_info["based_on_oai_llvm_hash"] != oai_info["llvm_hash"]:
-        raise RuntimeError(f"cmake/meta-llvm-info.json is based on OAI LLVM {meta_info['based_on_oai_llvm_hash'][:12]} "
-                           f"but cmake/llvm-info.json pins {oai_info['llvm_hash'][:12]}; "
+        raise RuntimeError(f"cmake/{meta_name} is based on OAI LLVM {meta_info['based_on_oai_llvm_hash'][:12]} "
+                           f"but cmake/{oai_name} pins {oai_info['llvm_hash'][:12]}; "
                            "rebuild the Meta LLVM on the new OAI pin")
     return meta_info
+
+
+def load_llvm_info(base_dir: Optional[str] = None) -> dict:
+    return _load_info(base_dir, "llvm-info.json", "meta-llvm-info.json")
+
+
+def load_amd_llvm_info(base_dir: Optional[str] = None) -> dict:
+    return _load_info(base_dir, "amd-llvm-info.json", "meta-amd-llvm-info.json")
+
+
+def _fork_package(llvm_info: dict, prefix: str, system_suffix: str, **fields: str) -> "bh.Package":
+    name = f"{prefix}-{llvm_info['llvm_hash'][:8]}-{system_suffix}-{llvm_info['build_number']}"
+    return bh.Package(prefix, name, f"{llvm_info['release_base_url'].rstrip('/')}/{name}.tar.gz",
+                      sha256sum=llvm_info["sha256sum"][system_suffix], **fields)
 
 
 def llvm_package_for_suffix(system_suffix: str, base_dir: Optional[str] = None) -> "bh.Package":
@@ -49,18 +65,9 @@ def llvm_package_for_suffix(system_suffix: str, base_dir: Optional[str] = None) 
     if system_suffix not in sha256sums:
         raise RuntimeError(f"LLVM pre-compiled image is not available for {system_suffix} "
                            f"(published: {', '.join(sorted(sha256sums))}); set LLVM_SYSPATH to a local LLVM build")
-    name = f"llvm-{llvm_info['llvm_hash'][:8]}-{system_suffix}-{llvm_info['build_number']}"
-    return bh.Package(
-        "llvm",
-        name,
-        f"{llvm_info['release_base_url'].rstrip('/')}/{name}.tar.gz",
-        "LLVM_INCLUDE_DIRS",
-        "LLVM_LIBRARY_DIR",
-        "LLVM_SYSPATH",
-        # Stable symlink that doesn't include the revision.
-        sym_name=f"llvm-{system_suffix}",
-        sha256sum=sha256sums[system_suffix],
-    )
+    # Stable symlink that doesn't include the revision.
+    return _fork_package(llvm_info, "llvm", system_suffix, include_flag="LLVM_INCLUDE_DIRS",
+                         lib_flag="LLVM_LIBRARY_DIR", syspath_var_name="LLVM_SYSPATH", sym_name=f"llvm-{system_suffix}")
 
 
 def llvm_package(helper_args: "bh.BuildHelperArgs") -> "bh.Package":
@@ -77,8 +84,8 @@ def llvm_package(helper_args: "bh.BuildHelperArgs") -> "bh.Package":
 
 
 def build_amd_codegen(llvm_info: dict, helper_args: "bh.BuildHelperArgs", llvm_path: str) -> str:
-    # Builds against the core Meta LLVM with the host compiler, as libtriton
-    # does: the bundle's clang may not find a matching libstdc++.
+    # Builds with the host compiler, as libtriton does: a bundled clang may not
+    # find a matching libstdc++.
     revision = f'{llvm_info["llvm_hash"]}-{llvm_info["build_number"]}'
     system_suffix = bh.get_llvm_system_suffix(helper_args)
     source_path = os.path.join(bh.get_base_dir(), "third_party", "amd", "backend", "codegen")
@@ -123,11 +130,22 @@ def build_amd_codegen(llvm_info: dict, helper_args: "bh.BuildHelperArgs", llvm_p
     return os.path.join(install_path, "lib", bh.amd_codegen_library_name())
 
 
-def copy_amd_codegen(helper_args: "bh.BuildHelperArgs", library: str) -> None:
-    # The Meta LLVM fork carries AMDGPU fixes that OAI's codegen artifact lacks.
-    # TODO: build against a Meta AMD codegen LLVM once one is pinned.
+def amd_codegen_llvm(helper_args: "bh.BuildHelperArgs") -> tuple[dict, str]:
+    system_suffix = bh.get_llvm_system_suffix(helper_args)
+    if os.path.exists(os.path.join(bh.get_base_dir(), "cmake", "meta-amd-llvm-info.json")):
+        llvm_info = load_amd_llvm_info()
+        if system_suffix in llvm_info["sha256sum"]:
+            package = _fork_package(llvm_info, "amd-llvm", system_suffix, include_flag="", lib_flag="",
+                                    syspath_var_name="AMD_LLVM_SYSPATH")
+            return llvm_info, bh._get_thirdparty_package_cmake_vars(package, helper_args)["AMD_LLVM_SYSPATH"]
+    # Platforms without a Meta AMD codegen LLVM build against the core Meta LLVM.
     core_llvm = bh._get_thirdparty_package_cmake_vars(llvm_package(helper_args), helper_args)
-    source_path = build_amd_codegen(load_llvm_info(), helper_args, llvm_path=core_llvm["LLVM_SYSPATH"])
+    return load_llvm_info(), core_llvm["LLVM_SYSPATH"]
+
+
+def copy_amd_codegen(helper_args: "bh.BuildHelperArgs", library: str) -> None:
+    llvm_info, llvm_path = amd_codegen_llvm(helper_args)
+    source_path = build_amd_codegen(llvm_info, helper_args, llvm_path=llvm_path)
     if not os.path.isfile(source_path):
         raise RuntimeError(f"Cannot find AMD code generation at {source_path}; set TRITON_AMD_CODEGEN_PATH")
     destination_path = os.path.join(bh.get_base_dir(), "third_party", "amd", "backend", "lib", library)

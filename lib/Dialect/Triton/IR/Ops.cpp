@@ -1091,6 +1091,28 @@ void ReshapeOp::build(OpBuilder &builder, OperationState &state,
   build(builder, state, dstTy, src, allowReorder);
 }
 
+// The reshape verifier's layout rule; the reshape(reshape) fold asks it too.
+static LogicalResult verifyReshapeEncoding(RankedTensorType srcTy,
+                                           RankedTensorType dstTy,
+                                           bool allowReorder,
+                                           std::optional<Location> loc) {
+  Attribute srcEnc = srcTy.getEncoding();
+  Attribute dstEnc = dstTy.getEncoding();
+  if (!srcEnc || !dstEnc || encodingContainsTlxPlaceholder(srcEnc) ||
+      encodingContainsTlxPlaceholder(dstEnc))
+    return success();
+  Attribute inferredDstEnc = dstEnc;
+  auto layoutInterface =
+      cast<DialectInferLayoutInterface>(&srcEnc.getDialect());
+  auto result = layoutInterface->inferReshapeOpEncoding(
+      srcTy.getShape(), srcEnc, dstTy.getShape(), inferredDstEnc, allowReorder,
+      loc);
+  if (failed(result))
+    return failure();
+  return layoutInterface->verifyLayoutsAreEqual(dstTy.getShape(),
+                                                inferredDstEnc, dstEnc, loc);
+}
+
 LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
   if (op.getEfficientLayout())
     return failure();
@@ -1114,6 +1136,11 @@ LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
     // Allow reorder if either reshape allowed it
     const bool allowReorder =
         (op.getAllowReorder() || parentReshape.getAllowReorder());
+    // Keep both reshapes when the merged one would fail the verifier.
+    if (failed(verifyReshapeEncoding(parentReshape.getSrc().getType(),
+                                     op.getType(), allowReorder,
+                                     /*loc=*/std::nullopt)))
+      return failure();
     rewriter.replaceOpWithNewOp<ReshapeOp>(op, op.getType(),
                                            parentReshape.getSrc(), allowReorder,
                                            op.getEfficientLayout());
@@ -1169,16 +1196,7 @@ LogicalResult ReshapeOp::verify() {
   // inferred dst encoding is the same as the given dst encoding. We pass the
   // current dst encoding as a hint so that allowReorder reshapes are guaranteed
   // to produce the current encoding iff it is valid.
-  Attribute inferredDstEnc = dstEnc;
-  auto layoutInterface =
-      cast<DialectInferLayoutInterface>(&srcEnc.getDialect());
-  auto result = layoutInterface->inferReshapeOpEncoding(
-      srcTy.getShape(), srcEnc, dstTy.getShape(), inferredDstEnc,
-      getAllowReorder(), getLoc());
-  if (failed(result))
-    return failure();
-  return layoutInterface->verifyLayoutsAreEqual(
-      dstTy.getShape(), inferredDstEnc, dstEnc, getLoc());
+  return verifyReshapeEncoding(srcTy, dstTy, getAllowReorder(), getLoc());
 }
 
 //-- FpToFpOp --

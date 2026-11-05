@@ -133,7 +133,7 @@ bool filterWarpLocalScratchReuse(Operation *op1, Operation *op2,
   if (!mlir::cvtNeedsSharedMemory(first) || !mlir::cvtNeedsSharedMemory(second))
     return false;
   auto warp = StringAttr::get(op1->getContext(), "warp");
-  return mlir::isCvtDimSync(srcLayout, dstLayout, warp);
+  return mlir::isCvtDimSync(srcTy, dstTy, warp);
 }
 
 bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {

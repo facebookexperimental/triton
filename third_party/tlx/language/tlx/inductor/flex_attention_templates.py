@@ -186,6 +186,23 @@ def append_tlx_flex_backward(
     return choices
 
 
+def _blackwell_flex_fwd_eligible(query, key, value) -> bool:
+    """Forward calls the Blackwell template covers.
+
+    The template allocates TMEM, sizes its TMA loads for 2-byte q/k/v, and always
+    loads through TMA, so it needs the alignment stock flex checks with
+    ``can_use_tma`` before choosing TMA.
+    """
+    from torch._inductor.utils import can_use_tma
+
+    if not current_target().is_blackwell:
+        return False
+    dtype = query.get_dtype()
+    if dtype not in (torch.bfloat16, torch.float16) or key.get_dtype() != dtype or value.get_dtype() != dtype:
+        return False
+    return can_use_tma(query, key, value)
+
+
 def _append_tlx_flex_nvidia(
     choices,
     configs,
@@ -198,13 +215,20 @@ def _append_tlx_flex_nvidia(
     query,
     mutated_inputs,
 ):
-    """Append Blackwell flex-attention candidates: 4-task WS, 2 MMA groups.
+    """Append Blackwell flex-attention candidates: 4-task WS, 1 or 2 MMA groups.
 
-    One candidate per base config. The kernel body hard-codes NUM_MMA_GROUPS=2
-    and splits BLOCK_M across the two groups, so only base configs whose
-    per-group tile meets the tcgen05 MMA minimum (M >= 64, i.e. BLOCK_M >= 128)
-    yield a candidate.
+    One candidate per base config. BLOCK_M >= 128 splits across two MMA groups;
+    BLOCK_M == 64 runs as one group, the tcgen05 MMA minimum (M >= 64). Smaller
+    BLOCK_M, or a tile that does not divide the sparse block size, yields no
+    candidate. A static query length <= 64 caps BLOCK_M at 64, since rows past
+    the query of a larger tile are padding. fwd_BLOCK_M / fwd_BLOCK_N kernel
+    options take precedence over the base config, as for the stock template.
     """
+    import sympy
+
+    if not _blackwell_flex_fwd_eligible(*input_nodes[:3]):
+        return
+
     num_sms = current_target().num_sms
 
     def tlx_options():
@@ -231,18 +255,25 @@ def _append_tlx_flex_nvidia(
             **opts,
         )
 
-    # BLOCK_M_SPLIT = BLOCK_M // 2 per MMA group; skip base configs whose
-    # per-group tile falls below the tcgen05 minimum.
-    NUM_MMA_GROUPS = 2
     MIN_MMA_M = 64
+    q_len = query.get_size()[2]
+    short_q = isinstance(q_len, (int, sympy.Integer)) and q_len <= MIN_MMA_M
+    seen = set()
     for conf in configs:
-        if conf.block_m // NUM_MMA_GROUPS < MIN_MMA_M:
-            continue
         opts = tlx_options()
+        block_m = opts.setdefault("BLOCK_M", min(conf.block_m, MIN_MMA_M) if short_q else conf.block_m)
+        block_n = opts.setdefault("BLOCK_N", conf.block_n)
+        if block_m < MIN_MMA_M or opts["SPARSE_Q_BLOCK_SIZE"] % block_m or opts["SPARSE_KV_BLOCK_SIZE"] % block_n:
+            continue
+        # Capping BLOCK_M and pinning num_stages can make base configs identical.
+        key = (block_m, block_n, conf.num_warps)
+        if key in seen:
+            continue
+        seen.add(key)
         opts["num_warps"] = conf.num_warps
-        opts["num_stages"] = conf.num_stages
-        opts["BLOCK_M"] = conf.block_m
-        opts["BLOCK_N"] = conf.block_n
+        # TLX is hand-pipelined; disable Triton software pipelining.
+        opts["num_stages"] = 1
+        opts["NUM_MMA_GROUPS"] = 1 if block_m < 2 * MIN_MMA_M else 2
         append(opts)
 
 

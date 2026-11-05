@@ -183,6 +183,33 @@ class MetaLlvmInfoTest(unittest.TestCase):
                 package = build_helpers.get_llvm_package_info(helper_args)
         self.assertEqual("", package.url)
 
+    AMD_OAI_INFO_HASH = "d26ff26ef4e94a4de9ce5228ef5b32b5290cca8f"
+    AMD_OAI_BUILD_HASH = "6bc4aaf6641c56ee104f6200c96a6a571bc77052"
+    AMD_META = {
+        "based_on_oai_llvm_hash": AMD_OAI_INFO_HASH,
+        "llvm_hash": "127789233f2c0000000000000000000000000000",
+        "llvm_repository": "https://github.com/facebookexperimental/llvm-project",
+        "build_number": 1,
+        "release_base_url":
+        "https://github.com/facebookexperimental/llvm-project/releases/download/amd-llvm-12778923-1",
+        "sha256sum": {"ubuntu-x64": "meta-amd-ubuntu-x64"},
+    }
+
+    def _write_amd(self, base_dir: str, meta: dict) -> None:
+        cmake_dir = Path(base_dir) / "cmake"
+        (cmake_dir / "amd-llvm-info.json").write_text(json.dumps({"llvm_hash": self.AMD_OAI_INFO_HASH}))
+        (cmake_dir / "amd-llvm-build-info.json").write_text(json.dumps({"llvm_hash": self.AMD_OAI_BUILD_HASH}))
+        (cmake_dir / "meta-amd-llvm-info.json").write_text(json.dumps(meta))
+
+    def test_meta_amd_base_ignores_build_info(self) -> None:
+        # amd-llvm-build-info.json moves before the Triton sources adopt that LLVM.
+        with tempfile.TemporaryDirectory() as base_dir:
+            self._write(base_dir, self.META)
+            self._write_amd(base_dir, {**self.AMD_META, "based_on_oai_llvm_hash": self.AMD_OAI_BUILD_HASH})
+            with self.assertRaisesRegex(
+                    RuntimeError, "based on OAI LLVM 6bc4aaf6641c but cmake/amd-llvm-info.json pins d26ff26ef4e9"):
+                meta_llvm.load_amd_llvm_info(base_dir)
+
     def test_amd_codegen_builds_against_core_meta_llvm(self) -> None:
         with tempfile.TemporaryDirectory() as base_dir:
             self._write(base_dir, self.META)

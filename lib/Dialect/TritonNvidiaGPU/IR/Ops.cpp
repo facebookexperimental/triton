@@ -44,6 +44,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -1095,6 +1096,14 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
   return success();
 }
 
+// Runs after verifyTMAEncoding, so other encodings keep its error.
+static LogicalResult verifyNpotTMATile(Operation *op, MemDescType memDesc) {
+  if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
+      !hasPow2TMAMessages(memDesc))
+    return op->emitOpError("NPOT TMA tile is not yet supported");
+  return success();
+}
+
 static LogicalResult verifyAsyncTMALoadOp(Operation *op,
                                           TensorDescInterface desc,
                                           TypedValue<MemDescType> barrier,
@@ -1103,7 +1112,8 @@ static LogicalResult verifyAsyncTMALoadOp(Operation *op,
     return failure();
   if (!resultType.getMutableMemory())
     return op->emitOpError("cannot store into immutable memory");
-  if (failed(verifyTMAEncoding(op, desc, resultType)))
+  if (failed(verifyTMAEncoding(op, desc, resultType)) ||
+      failed(verifyNpotTMATile(op, resultType)))
     return failure();
   auto block = StringAttr::get(op->getContext(), "block");
   uint32_t barrierMask =
@@ -1138,7 +1148,9 @@ static LogicalResult verifyAsyncTMAStoreOp(Operation *op,
       if (component >= size)
         return op->emitOpError(
             "source subview may have an origin in another CTA");
-  return verifyTMAEncoding(op, desc.getType(), srcType);
+  if (failed(verifyTMAEncoding(op, desc.getType(), srcType)))
+    return failure();
+  return verifyNpotTMATile(op, srcType);
 }
 
 static LogicalResult verifyAsyncTMAGatherScatterOp(Operation *op,
@@ -1620,6 +1632,79 @@ static LogicalResult verifyCompletionBarrierLayout(Operation *op,
                                 "completion barrier");
 }
 
+std::optional<std::string>
+getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
+                             bool twoCTAs, unsigned m, unsigned n) {
+  StringRef kindName;
+  switch (kind) {
+  case Tcgen05Kind::F16OrTF32:
+    kindName = "f16/tf32";
+    break;
+  case Tcgen05Kind::F8F6F4:
+    kindName = "f8f6f4";
+    break;
+  case Tcgen05Kind::I8:
+    kindName = "i8";
+    break;
+  case Tcgen05Kind::BlockScaled:
+    kindName = "block-scaled";
+    break;
+  }
+  std::string reason;
+  llvm::raw_string_ostream os(reason);
+  os << "tcgen05.mma kind " << kindName << (aInTmem ? " TS" : " SS")
+     << (bMNMajor ? " MN-major B" : " K-major B")
+     << (twoCTAs ? " cta_group::2" : " cta_group::1") << " per-CTA M=" << m;
+  bool blockScaledM128 = kind == Tcgen05Kind::BlockScaled && !twoCTAs;
+  if (blockScaledM128 ? m != 128 : (m != 64 && m != 128)) {
+    os << " is not a legal M";
+    return reason;
+  }
+  // TS at M=128 (or 2-CTA), MN-major 8-bit B and i8 double the N step.
+  bool doubled =
+      (aInTmem && (m == 128 || twoCTAs)) || kind == Tcgen05Kind::I8 ||
+      (bMNMajor &&
+       (kind == Tcgen05Kind::F8F6F4 || kind == Tcgen05Kind::BlockScaled));
+  unsigned step = (twoCTAs ? 16 : 8) * (doubled ? 2 : 1);
+  bool i8N8 = kind == Tcgen05Kind::I8 && !twoCTAs && n == 8;
+  if (i8N8 || (n >= step && n <= 256 && n % step == 0))
+    return std::nullopt;
+  os << " requires N to be a multiple of " << step << " in [" << step
+     << ", 256], got N=" << n;
+  return reason;
+}
+
+// Admits an NPOT per-CTA tile only if the tcgen05 form is ISA-legal and the
+// instruction N divides the accumulator; NPOT M and K are not lowered yet.
+// NPOT memdesc shapes only verify under TRITON_ALLOW_NPOT, so POT is untouched.
+static LogicalResult verifyNpotMMAv5Tile(Operation *op, Tcgen05Kind kind,
+                                         MemDescType a, MemDescType b,
+                                         MemDescType d, int64_t k) {
+  auto dEnc = cast<TensorMemoryEncodingAttr>(d.getEncoding());
+  auto ctaShape =
+      getShapePerCTA(dEnc.getCGALayout().getCTASplitNum(), d.getShape());
+  if (llvm::isPowerOf2_64(ctaShape[0]) && llvm::isPowerOf2_64(ctaShape[1]) &&
+      llvm::isPowerOf2_64(k))
+    return success();
+  if (!llvm::isPowerOf2_64(k))
+    return op->emitOpError("NPOT MMAv5 K is not yet supported");
+  if (!llvm::isPowerOf2_64(ctaShape[0]))
+    return op->emitOpError("NPOT MMAv5 M is not yet supported");
+  unsigned n = std::min<unsigned>(dEnc.getBlockN(), ctaShape[1]);
+  auto bAttrs = getNvmmaSmemAttrs(b);
+  bool twoCTAs = getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
+  if (auto reason = getTcgen05IllegalShapeReason(
+          kind, isa<TensorMemoryEncodingAttr>(a.getEncoding()),
+          /*bMNMajor=*/!bAttrs || !bAttrs->transposed, twoCTAs,
+          dEnc.getBlockM(), n))
+    return op->emitOpError("NPOT MMAv5 shape ")
+           << dEnc.getBlockM() << "x" << n << " is unsupported: " << *reason;
+  if (ctaShape[1] % n != 0)
+    return op->emitOpError("NPOT MMAv5 N that is not a multiple of the "
+                           "instruction N is not yet supported");
+  return success();
+}
+
 LogicalResult TCGen5MMAOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
@@ -1733,7 +1818,12 @@ LogicalResult TCGen5MMAOp::verify() {
   // }
   // }
 
-  return success();
+  Tcgen05Kind tcgen05Kind = kind == MMADTypeKind::f8f6f4 ? Tcgen05Kind::F8F6F4
+                            : kind == MMADTypeKind::i8   ? Tcgen05Kind::I8
+                                                       : Tcgen05Kind::F16OrTF32;
+  return verifyNpotMMAv5Tile(*this, tcgen05Kind, getA().getType(),
+                             getB().getType(), retType,
+                             getA().getType().getDimSize(1));
 }
 
 void TCGen5MMAOp::getEffects(
@@ -2120,7 +2210,8 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   if (failed(verifyScaleEncoding(aScaleType, /*isA=*/true)) ||
       failed(verifyScaleEncoding(bScaleType, /*isA=*/false)))
     return failure();
-  return success();
+  return verifyNpotMMAv5Tile(*this, Tcgen05Kind::BlockScaled, getA().getType(),
+                             getB().getType(), getD().getType(), getBlockK());
 }
 
 void TCGen5MMAScaledOp::getEffects(
@@ -2705,8 +2796,27 @@ LogicalResult TMEMSubSliceOp::verify() {
              << minRows << " rows of a single-CTA " << blockM
              << "-row block, at a multiple of its size";
   }
+  // A slice can feed tcgen05 as an accumulator, so admit an NPOT width only if
+  // the most permissive form (SS, K-major B, f16) issues it; the consumer's
+  // verifier checks its own form.
+  if (!llvm::isPowerOf2_64(dstShape[dim])) {
+    auto tmemEnc = dyn_cast<TensorMemoryEncodingAttr>(dstEncoding);
+    // Rows are M and scales columns follow K; neither is lowered for NPOT yet.
+    if (dim == 0 || !tmemEnc)
+      return emitOpError("NPOT tmem_subslice extent ")
+             << dstShape[dim] << " in dim " << dim << " is not yet supported";
+    if (auto reason = getTcgen05IllegalShapeReason(
+            Tcgen05Kind::F16OrTF32, /*aInTmem=*/false, /*bMNMajor=*/false,
+            getModuleTwoCTAs(*this) || tlx::tlxEnablePairedMMA(*this),
+            tmemEnc.getBlockM(),
+            std::min<unsigned>(tmemEnc.getBlockN(), dstShape[1])))
+      return emitOpError("NPOT tmem_subslice width ")
+             << dstShape[1] << " is unsupported: " << *reason;
+  }
   auto srcLL = toLinearLayout(srcTy);
-  if (offset & (dstShape[dim] - 1)) {
+  // Masking with w - 1 misses carries for an NPOT width w (offset 32, w 96:
+  // 32 & 95 == 0), so mask with its power-of-two cover.
+  if (offset & (llvm::PowerOf2Ceil(dstShape[dim]) - 1)) {
     // An unaligned slice can carry through the logical bits between its
     // lowest set offset bit and the highest bit changed by the slice. For
     // example, an N-slice at offset 208 with size 256 spans [208, 463], so

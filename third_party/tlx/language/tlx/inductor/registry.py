@@ -3587,6 +3587,35 @@ def _maybe_shrink_ring_for_fused_epilogue(kernel, epilogue_nodes) -> None:  # ty
     log.debug("tlx_hopper_gemm_ws: NUM_STAGES %d -> %d to fit the fused epilogue", meta["NUM_STAGES"], stages)
 
 
+def _device_tma_for_epilogue_operands(kernel, epilogue_nodes) -> None:  # type: ignore[no-untyped-def]
+    """Build an operand's descriptor on the device when a fused epilogue reads it.
+
+    The template and the epilogue share one kernel arg per buffer, and a host
+    descriptor turns that arg into a tensordesc the epilogue's pointer loads
+    cannot use, so Inductor rejects the kernel at final codegen
+    (`_reject_if_template_host_tma`), after the fusion has been chosen.
+    """
+    meta = kernel.meta
+    if not epilogue_nodes or not any(meta.get(f"HOST_TMA_{name}") for name in ("A", "B")):
+        return
+    epilogue_reads = {dep.name for node in epilogue_nodes for dep in node.read_writes.reads}
+    named_inputs = kernel.input_nodes[kernel.prefix_args:len(kernel.input_nodes) - kernel.suffix_args]
+    overrides = {
+        f"HOST_TMA_{name}": False
+        for name, node in zip(("A", "B"), named_inputs)
+        if meta.get(f"HOST_TMA_{name}") and node.get_name() in epilogue_reads
+    }
+    if not overrides:
+        return
+    meta = {**meta, **overrides}
+    meta["HOST_SIDE_TMA"] = bool(meta.get("HOST_TMA_A") or meta.get("HOST_TMA_B"))
+    # render() is bound to the choice's shared meta dict, so _tlx_render
+    # applies these instead of the meta being mutated in place.
+    kernel._tlx_host_tma_overrides = {key: meta[key] for key in (*overrides, "HOST_SIDE_TMA")}
+    kernel.meta = meta
+    log.debug("tlx hopper template: device-side TMA for %s, read by the fused epilogue", sorted(overrides))
+
+
 def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
     self,
     scheduling,
@@ -3599,6 +3628,7 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
 ):
     split_k = getattr(self, "_tlx_split_k", 1)
     _maybe_shrink_ring_for_fused_epilogue(self, epilogue_nodes)
+    _device_tma_for_epilogue_operands(self, epilogue_nodes)
     # Set _final_output_name so output_ptr() resolves to the fused output.
     if epilogue_nodes and getattr(self, "_tlx_reduction_epilogue_plan", None) is None:
         last_names = epilogue_nodes[-1].get_buffer_names()
@@ -3674,7 +3704,11 @@ _orig_render = TritonTemplateKernel.render
 
 
 def _tlx_render(self, template, kwargs, record_input_dependent_tracked_event=False):  # type: ignore[no-untyped-def]
-    kwargs = {**kwargs, "TLX_REDUCTION_EPILOGUE": getattr(self, "_tlx_reduction_epilogue_plan", None) is not None}
+    kwargs = {
+        **kwargs,
+        **getattr(self, "_tlx_host_tma_overrides", {}),
+        "TLX_REDUCTION_EPILOGUE": getattr(self, "_tlx_reduction_epilogue_plan", None) is not None,
+    }
     # Register the paired prefetch hook for templates that expose a drain
     # boundary. It remains a no-op unless the config knob and eligibility both
     # permit moving a load.

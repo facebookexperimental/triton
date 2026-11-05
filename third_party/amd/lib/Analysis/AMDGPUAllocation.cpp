@@ -14,6 +14,8 @@ namespace mlir::triton::AMD {
 
 unsigned getConvertLayoutScratchInBytes(gpu::ConvertLayoutOp op,
                                         TargetInfoBase &targetInfo) {
+  if (auto bytes = getProductConversionScratchBytes(op))
+    return *bytes;
   if (!cvtNeedsSharedMemory(op))
     return 0;
   auto srcTy = op.getSrc().getType();

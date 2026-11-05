@@ -80,6 +80,26 @@ def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
         _assert_close(got, want, dtype)
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("N_CTX", [384, 640])
+def test_flash_attn_partial_last_m_block(N_CTX, causal):
+    """N_CTX not a multiple of the forward BLOCK_M: the last M-block must not spill into the next head."""
+    from triton.tlx.ops import flash_attn as tlx_flash_attn
+
+    dtype = torch.bfloat16
+    q, k, v = _qkv(2, 4, N_CTX, 128, dtype, requires_grad=True)
+    rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
+    do = torch.randn_like(q)
+
+    out = tlx_flash_attn(q, k, v, causal=causal, space="smoke")
+    ref = _sdpa(rq, rk, rv, causal)
+    _assert_close(out, ref, dtype)
+    out.backward(do)
+    ref.backward(do)
+    for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
+        _assert_close(got, want, dtype)
+
+
 @pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [[2, 4, 1024, 128], [1, 16, 4096, 128], [2, 32, 2048, 64]])
 def test_flash_attn_bwd_bf16_accuracy(Z, H, N_CTX, HEAD_DIM):
     from triton.tlx.ops import flash_attn as tlx_flash_attn

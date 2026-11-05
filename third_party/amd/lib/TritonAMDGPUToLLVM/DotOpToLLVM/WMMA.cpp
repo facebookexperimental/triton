@@ -28,6 +28,7 @@
 #include "Utility.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -599,23 +600,33 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
 
   unsigned kInstrSize = mnkDim[2];
 
-  auto aElemType = op.getAElemType();
-  bool isFp4A = aElemType == triton::ScaleDotElemType::E2M1;
-  int kDimA = isFp4A ? kInstrSize / 2 : kInstrSize;
+  auto packedKDim = [](triton::ScaleDotElemType elemType,
+                       int kInstrSize) -> FailureOr<int> {
+    if (elemType == triton::ScaleDotElemType::E2M1)
+      return kInstrSize / 2;
+    if (triton::isMXFP6ScaleType(elemType)) {
+      // fp6 packs groups of 16 values per 12 bytes; the x3/4 byte
+      // conversion steps within a group by 4 values.
+      if (kInstrSize % 4 != 0)
+        return failure();
+      return kInstrSize * 3 / 4;
+    }
+    return kInstrSize;
+  };
 
+  auto aElemType = op.getAElemType();
+  auto kDimAOr = packedKDim(aElemType, kInstrSize);
   auto bElemType = op.getBElemType();
-  bool isFp4B = bElemType == triton::ScaleDotElemType::E2M1;
-  int kDimB = isFp4B ? kInstrSize / 2 : kInstrSize;
+  auto kDimBOr = packedKDim(bElemType, kInstrSize);
+  if (failed(kDimAOr) || failed(kDimBOr))
+    return op.emitError("fp6 WMMA instruction K size ")
+           << kInstrSize << " is not a multiple of 4, so it cannot be "
+           << "converted to packed bytes (x3/4)";
+  int kDimA = *kDimAOr;
+  int kDimB = *kDimBOr;
 
   unsigned scaleFactor = op.deduceScaleFactor();
   int kDimScale = kInstrSize / scaleFactor;
-
-  bool isFp6A = (aElemType == triton::ScaleDotElemType::E2M3) ||
-                (aElemType == triton::ScaleDotElemType::E3M2);
-  bool isFp6B = (bElemType == triton::ScaleDotElemType::E2M3) ||
-                (bElemType == triton::ScaleDotElemType::E3M2);
-  if (isFp6A || isFp6B)
-    return op.emitError("NYI: FP6 scaled dot");
 
   Type scaledAElemType =
       LLVM::AMD::scaleDotElemTypeToMLIRType(op.getContext(), op.getAElemType());

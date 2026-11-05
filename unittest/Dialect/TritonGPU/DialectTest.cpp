@@ -13,6 +13,8 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "unittest/Tools/ProductLayouts.h"
+#include "unittest/Util/ScopedAllowNpot.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Signals.h"
 
@@ -595,14 +597,18 @@ static uint32_t evalLowered(Value v, ArrayRef<uint32_t> args) {
       .Case([&](LLVM::ShlOp) { return x << y; })
       .Case([&](LLVM::LShrOp) { return x >> y; })
       .Case([&](LLVM::UDivOp) { return x / y; })
+      .Case([&](LLVM::URemOp) { return x % y; })
+      .Case([&](LLVM::AddOp) { return x + y; })
+      .Case([&](LLVM::MulOp) { return x * y; })
       .Default([&](Operation *) {
         ADD_FAILURE() << "unexpected " << op->getName().getStringRef().str();
         return 0u;
       });
 }
 
-// The lowered apply() matches the host apply() on every input; the radix-2
-// control takes the shift-concatenated path.
+// The lowered apply() matches the host apply() on every input. In the Product
+// layout dim0 = 12 and the radix-3 digit adds 2 to the odd part, so the sum
+// wraps; the radix-2 control takes the shift-concatenated path.
 TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
   ctx.getOrLoadDialect<LLVM::LLVMDialect>();
   auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
@@ -617,9 +623,12 @@ TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
                                                          {s("dim1"), 2}};
   LinearLayout mixed(bases, radices, outDims, /*requireSurjective=*/true);
   LinearLayout radix2(bases, outDims, /*requireSurjective=*/true);
+  bases[reg][0] = {8, 0};
+  outDims[0].second = 12;
+  LinearLayout product(bases, radices, outDims, /*requireSurjective=*/true);
   Location loc = UnknownLoc::get(&ctx);
   Type i32 = IntegerType::get(&ctx, 32);
-  for (const LinearLayout &layout : {mixed, radix2}) {
+  for (const LinearLayout &layout : {mixed, product, radix2}) {
     OwningOpRef<ModuleOp> module = ModuleOp::create(loc);
     IRRewriter rewriter(&ctx);
     rewriter.setInsertionPointToStart(module->getBody());
@@ -638,6 +647,167 @@ TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
               << "register " << r << " lane " << l << layout;
       }
     }
+  }
+}
+
+// Register counts multiply digit radices, and a run ends at the odd digit.
+TEST_F(LinearEncodingTest, ProductCountsUseRadices) {
+  auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  LinearLayout::BasesT bases;
+  bases[s("register")] = {{1, 0}, {2, 0}};
+  bases[s("lane")] = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}};
+  bases[s("warp")] = {{0, 32}};
+  bases[s("block")] = {};
+  LinearLayout::RadicesT radices;
+  radices[s("register")] = {2, 3};
+  radices[s("lane")] = {2, 2, 2, 2, 2};
+  radices[s("warp")] = {2};
+  radices[s("block")] = {};
+  LinearLayout layout(bases, radices, {{s("dim0"), 6}, {s("dim1"), 64}},
+                      /*requireSurjective=*/true);
+  auto linear = LinearEncodingAttr::get(&ctx, layout);
+  EXPECT_EQ(linear.getContigPerThread(), SmallVector<unsigned>({2, 1}));
+  // The interface getSizePerThread() asserts in getCGALayout on Product.
+  EXPECT_EQ(LinearEncodingTrait::getSizePerThread(layout, {1, 1}),
+            SmallVector<unsigned>({6, 1}));
+  auto pow2 = LinearLayout::identity1D(4, s("register"), s("dim0")) *
+              LinearLayout::identity1D(32, s("lane"), s("dim1")) *
+              LinearLayout::identity1D(2, s("warp"), s("dim0"));
+  EXPECT_EQ(LinearEncodingTrait::getSizePerThread(pow2, {1, 1}),
+            SmallVector<unsigned>({4, 1}));
+}
+
+// A 3x32 -> 96 reshape keeps every register only as the regrouped source.
+TEST_F(LinearEncodingTest, NpotReshapeKeepsRegisters) {
+  auto S = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  auto withWarpBlock = [&](LinearLayout ll) {
+    return ll * LinearLayout::identity1D(1, S("warp"), S("dim0")) *
+           LinearLayout::identity1D(1, S("block"), S("dim0"));
+  };
+  auto linear = [&](LinearLayout ll) {
+    return LinearEncodingAttr::get(&ctx, withWarpBlock(std::move(ll)));
+  };
+  auto flatLayout = [&](std::vector<std::vector<int32_t>> regBases,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> laneBases) {
+    int32_t size = 32;
+    for (int32_t radix : regRadices)
+      size *= radix;
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regBases);
+    bases[S("lane")] = std::move(laneBases);
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2};
+    return linear(LinearLayout(std::move(bases), std::move(radices),
+                               {{S("dim0"), size}},
+                               /*requireSurjective=*/true));
+  };
+  auto *inferLayout =
+      ctx.getOrLoadDialect<TritonGPUDialect>()
+          ->getRegisteredInterface<DialectInferLayoutInterface>();
+  Attribute src = linear(exactIdentity1D(3, S("register"), S("dim0")) *
+                         LinearLayout::identity1D(32, S("lane"), S("dim1")));
+  Attribute inferred;
+  ASSERT_TRUE(succeeded(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {96}, inferred, /*allowReorder=*/false, std::nullopt)));
+  Attribute flat = flatLayout({{32}}, {3}, {{1}, {2}, {4}, {8}, {16}});
+  EXPECT_EQ(inferred, flat);
+  EXPECT_FALSE(isExpensiveView({3, 32}, src, {96}, flat));
+  // Same counts and masks, lanes swapped: cheap for pow2, not for NPOT.
+  Attribute swapped = flatLayout({{32}}, {3}, {{2}, {1}, {4}, {8}, {16}});
+  EXPECT_TRUE(isExpensiveView({3, 32}, src, {96}, swapped));
+  Attribute pow2 =
+      linear(LinearLayout::identity1D(4, S("register"), S("dim0")) *
+             LinearLayout::identity1D(32, S("lane"), S("dim1")));
+  EXPECT_FALSE(isExpensiveView(
+      {4, 32}, pow2, {128},
+      flatLayout({{32}, {64}}, {2, 2}, {{2}, {1}, {4}, {8}, {16}})));
+  // A regroup wins over a given result; 3x32 -> 32x3 has none, so a given
+  // result is kept and inference without one fails.
+  Attribute given = swapped;
+  ASSERT_TRUE(succeeded(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {96}, given, /*allowReorder=*/false, std::nullopt)));
+  EXPECT_EQ(given, flat);
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{0, 1}};
+  bases[S("lane")] = {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {3};
+  radices[S("lane")] = {2, 2, 2, 2, 2};
+  Attribute moved = linear(LinearLayout(std::move(bases), std::move(radices),
+                                        {{S("dim0"), 32}, {S("dim1"), 3}},
+                                        /*requireSurjective=*/true));
+  given = moved;
+  ASSERT_TRUE(succeeded(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {32, 3}, given, /*allowReorder=*/false, std::nullopt)));
+  EXPECT_EQ(given, moved);
+  std::string error;
+  ScopedDiagnosticHandler handler(
+      &ctx, [&](Diagnostic &diag) { error = diag.str(); });
+  Attribute none;
+  EXPECT_TRUE(failed(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {32, 3}, none, /*allowReorder=*/false,
+      UnknownLoc::get(&ctx))));
+  EXPECT_EQ(error, "inferring a result layout for an NPOT reshape that "
+                   "moves elements between threads is not yet supported");
+}
+
+// Each NPOT dim, in dim order, adds one odd register digit to the blocked
+// default of the power-of-two parts.
+TEST_F(LinearEncodingTest, ProductEncoding) {
+  auto S = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  ScopedAllowNpot npot;
+  auto product = getProductEncoding(&ctx, {3, 96}, /*numWarps=*/4,
+                                    /*threadsPerWarp=*/32, /*numCTAs=*/1);
+  ASSERT_TRUE(succeeded(product));
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{1, 0}, {0, 32}};
+  bases[S("lane")] = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}};
+  bases[S("warp")] = {{0, 0}, {0, 0}};
+  bases[S("block")] = {};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {3, 3};
+  radices[S("lane")] = {2, 2, 2, 2, 2};
+  radices[S("warp")] = {2, 2};
+  radices[S("block")] = {};
+  EXPECT_EQ(product->getLinearLayout(),
+            LinearLayout(bases, radices, {{S("dim0"), 3}, {S("dim1"), 96}},
+                         /*requireSurjective=*/false));
+  // Control: a power-of-two shape keeps the blocked default.
+  EXPECT_TRUE(failed(getProductEncoding(&ctx, {4, 32}, 4, 32, 1)));
+  // The verifier rejects a Product layout across CTAs.
+  EXPECT_TRUE(failed(getProductEncoding(&ctx, {3, 96}, 4, 32, 2)));
+  ScopedAllowNpot unset(nullptr);
+  EXPECT_TRUE(failed(getProductEncoding(&ctx, {3, 96}, 4, 32, 1)));
+}
+
+// The pad pass compares the widest vector first: `request` is the padded
+// side's f32 vector, kept only if the Product layout needs no more registers.
+// On a tie it compares slots (registers x lanes x warps) of both sides.
+TEST_F(LinearEncodingTest, ProductSlots) {
+  ScopedAllowNpot npot;
+  struct Case {
+    SmallVector<int64_t> shape;
+    int numWarps;
+    unsigned request, vector;
+    int32_t exact, padded;
+  };
+  for (const Case &c :
+       {Case{{384}, 1, 4, 4, 384, 512}, Case{{96}, 1, 4, 1, 96, 128}}) {
+    auto pow2 = llvm::map_to_vector(c.shape, [](int64_t size) {
+      return static_cast<int64_t>(llvm::PowerOf2Ceil(size));
+    });
+    unsigned vector =
+        getProductVector(&ctx, c.shape, c.request, {}, c.numWarps, 32);
+    EXPECT_EQ(vector, c.vector);
+    auto product = getProductEncoding(&ctx, c.shape, c.numWarps, 32, 1, vector);
+    ASSERT_TRUE(succeeded(product));
+    EXPECT_EQ(product->getLinearLayout().getTotalInDimSize(), c.exact);
+    EXPECT_EQ(getDefaultBlockedEncoding(&ctx, pow2, c.numWarps, 32, 1)
+                  .toLinearLayout(pow2)
+                  .getTotalInDimSize(),
+              c.padded);
   }
 }
 } // namespace

@@ -134,6 +134,11 @@ static LogicalResult setOptimizedGatherLayout(GatherOp op, RewriterBase &b) {
   unsigned rank = srcType.getRank();
   if (rank == 1)
     return failure();
+  // The blocked layout below tiles power-of-two dims only.
+  auto isNpotDim = [](int64_t d) { return !llvm::isPowerOf2_64(d); };
+  if (llvm::any_of(srcType.getShape(), isNpotDim) ||
+      llvm::any_of(idxType.getShape(), isNpotDim))
+    return failure();
   SmallVector<unsigned> threadsPerWarp(rank);
   SmallVector<unsigned> warpsPerCTA(rank);
   SmallVector<unsigned> order;

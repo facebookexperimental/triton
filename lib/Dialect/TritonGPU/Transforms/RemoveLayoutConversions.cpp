@@ -731,6 +731,12 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
     state.addTypes(dstTy);
     Operation *hypotheticalOp = Operation::create(state);
     auto cvt = cast<ConvertLayoutOp>(hypotheticalOp);
+    // A Product convert is sized by its plan, as the allocator sizes it.
+    if (auto bytes = getProductConversionScratchBytes(cvt)) {
+      hypotheticalOp->destroy();
+      cost += *bytes;
+      continue;
+    }
     bool needsSharedMemory = cvtNeedsSharedMemory(cvt);
     hypotheticalOp->destroy();
     if (needsSharedMemory) {
@@ -3037,7 +3043,7 @@ struct PruneLocalStoreOfReshapeConvert : public OpRewritePattern<LocalStoreOp> {
       return failure();
     if (failed(layoutInterface->inferReshapeOpEncoding(
             srcType.getShape(), srcType.getEncoding(), storeSrcType.getShape(),
-            reshapeEncoding, /*allowReorder=*/false, store.getLoc())))
+            reshapeEncoding, /*allowReorder=*/false, /*loc=*/std::nullopt)))
       return failure();
 
     auto reshapeType =
