@@ -293,8 +293,9 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
         if bm // num_mma_groups > 128:
             continue
 
-        # Skip if tiles are larger than the problem
-        if bm > M * 2 or bn > N * 2:
+        # Skip if tiles are larger than the problem; 64 is the smallest tile, so
+        # it stays eligible when M or N is below 32.
+        if bm > max(M * 2, 64) or bn > max(N * 2, 64):
             continue
 
         # Compute wave efficiency
