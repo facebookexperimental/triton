@@ -168,8 +168,7 @@ def _vec1_lazy_exp_fragments(state, qk, QK_SCALE: tl.constexpr, NUM_PROB_FRAGMEN
 
 
 @triton.jit
-def _vec2_lazy_split(state, fr, QK_SCALE: tl.constexpr, out_dtype: tl.constexpr,
-                     NUM_PROB_FRAGMENTS: tl.constexpr):
+def _vec2_lazy_split(state, fr, QK_SCALE: tl.constexpr, out_dtype: tl.constexpr, NUM_PROB_FRAGMENTS: tl.constexpr):
     """Finish deferred probabilities, cast the tile, and update its row sum."""
     m_i = tlx.release_layout(state.m_i)[:, None]
     p_0 = _maybe_exp_fragment(fr.f0, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 0)
@@ -203,8 +202,7 @@ def _vec1_lazy_split(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.co
 
 
 @triton.jit
-def _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE: tl.constexpr,
-                           RESCALE_THRESHOLD: tl.constexpr):
+def _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
     """`_attn_dot_pv_vec1_lazy` (BM256, split VEC1) with the cheaper row max."""
     tl.static_assert(state.acc.shape[0] == 256)
     mma: tl.constexpr = _mma()
@@ -238,8 +236,8 @@ def _anchor_vgpr(x):
 def _anchor_probability_fragments(fr):
     """Anchor the probabilities formed in a PV stage, so LLVM cannot sink them, as loop-carried values, past the
     rescale branch into the next stage."""
-    return LazySoftmaxFragments(_anchor_vgpr(fr.f0), _anchor_vgpr(fr.f1), _anchor_vgpr(fr.f2),
-                                _anchor_vgpr(fr.f3), _anchor_vgpr(fr.f4), fr.f5, fr.f6, fr.f7)
+    return LazySoftmaxFragments(_anchor_vgpr(fr.f0), _anchor_vgpr(fr.f1), _anchor_vgpr(fr.f2), _anchor_vgpr(fr.f3),
+                                _anchor_vgpr(fr.f4), fr.f5, fr.f6, fr.f7)
 
 
 @triton.jit
@@ -252,10 +250,9 @@ def _schedule_softmax_mfma_valu(SYNC_ID: tl.constexpr):
 
 
 @triton.jit
-def _softmax_lazy_pipeline_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
-                                stride_vn, QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr,
-                                CUR_SLOT: tl.constexpr, NEXT_SLOT: tl.constexpr,
-                                RESCALE_THRESHOLD: tl.constexpr):
+def _softmax_lazy_pipeline_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn, stride_vn,
+                                QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr,
+                                NEXT_SLOT: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
     """`_attn_inner_pipelined_lazy_step` (split VEC1, PV-woven VEC1) with the cheaper row max, and fp32 row sums
     for fp16 as well as bf16."""
     with tlx.warp_pipeline_stage("dot1"):
@@ -268,8 +265,7 @@ def _softmax_lazy_pipeline_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, 
         tok_k = tlx.async_load(k_ptrs + (block_n + 3) * BLOCK_N * stride_kn, tlx.local_view(k_buf, NEXT_SLOT))
         tlx.async_load_commit_group([tok_k])
     with tlx.warp_pipeline_stage("dot2"):
-        state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(
-            state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+        state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
         p_c = _anchor_probability_fragments(p_c)
         _schedule_softmax_mfma_valu(2)
     tlx.async_load_wait_group(1)
@@ -312,20 +308,19 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     # Pairs keep both ring slots static.
     for pair_idx in tl.range(0, (n_blocks - 3) // 2, num_stages=1):
         block_n = pair_idx * 2
-        state, p_c, kt_dot = _softmax_lazy_pipeline_step(
-            state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
-            stride_vn, QK_SCALE, BLOCK_N, 0, 1, RESCALE_THRESHOLD)
-        state, p_c, kt_dot = _softmax_lazy_pipeline_step(
-            state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n + 1, k_buf, v_buf, stride_kn,
-            stride_vn, QK_SCALE, BLOCK_N, 1, 0, RESCALE_THRESHOLD)
+        state, p_c, kt_dot = _softmax_lazy_pipeline_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf,
+                                                         stride_kn, stride_vn, QK_SCALE, BLOCK_N, 0, 1,
+                                                         RESCALE_THRESHOLD)
+        state, p_c, kt_dot = _softmax_lazy_pipeline_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n + 1, k_buf,
+                                                         v_buf, stride_kn, stride_vn, QK_SCALE, BLOCK_N, 1, 0,
+                                                         RESCALE_THRESHOLD)
     # Drain the last three blocks without further prefetches.
     nm1 = n_blocks - 1
     qk = _qk_pieces(q, kt_dot)
     tlx.async_load_wait_group(2)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
     state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
-    state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(
-        state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+    state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
     state = state.rescale_lazy(delta_c, advance_c)
     _attn_war_barrier(False)
     tok_vlast = tlx.async_load(v_ptrs + nm1 * BLOCK_N * stride_vn, tlx.local_view(v_buf, 0))
@@ -337,8 +332,7 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     tlx.async_load_wait_group(1)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 1), relaxed=True)
     state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
-    state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(
-        state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+    state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
     state = state.rescale_lazy(delta_c, advance_c)
 
     tlx.async_load_wait_group(0)
@@ -797,8 +791,7 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
         tok_q = tlx.async_load(q_ptrs, tlx.local_view(q_buf, 0), cache_modifier=".cg")
         tlx.async_load_commit_group([tok_q])
     else:
-        tok_q = tlx.async_load(q_ptrs, tlx.local_view(q_buf, 0), mask=row_ok[:, None], other=0.0,
-                               cache_modifier=".cg")
+        tok_q = tlx.async_load(q_ptrs, tlx.local_view(q_buf, 0), mask=row_ok[:, None], other=0.0, cache_modifier=".cg")
         tlx.async_load_commit_group([tok_q])
     kv_base = (seq_start_kv + kv_lo).to(tl.int64)
     k_ptrs = K + kv_base * stride_kn + off_h_kv * stride_kh + offs_n[:, None] * stride_kn + offs_d[None, :]
@@ -993,15 +986,15 @@ def _hstu_cross_attn_fwd_stream_k(
     for _ in tl.static_range(MAX_SEGMENTS):
         if u < u1:
             u = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph,
-                         P, p, u, u1, q_buf, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh,
-                         stride_om, stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD,
-                         LOG2_Z_PAD, True, PIPE_STAGES, RESCALE_THRESHOLD)
+                         P, p, u, u1, q_buf, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn,
+                         stride_vh, stride_om, stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M,
+                         BLOCK_N, Z_PAD, LOG2_Z_PAD, True, PIPE_STAGES, RESCALE_THRESHOLD)
     # Rare: ranges spanning more than MAX_SEGMENTS q tiles (short KV sequences).
     while u < u1:
         u = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph, P, p,
-                     u, u1, q_buf, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh, stride_om,
-                     stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD, LOG2_Z_PAD,
-                     False, PIPE_STAGES, RESCALE_THRESHOLD)
+                     u, u1, q_buf, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh,
+                     stride_om, stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD,
+                     LOG2_Z_PAD, False, PIPE_STAGES, RESCALE_THRESHOLD)
 
 
 _FLAGS = {}
