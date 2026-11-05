@@ -1,0 +1,25 @@
+name: Meta LLVM minimal-interface canary
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_sha:
+        required: true
+        type: string
+      kind:
+        required: true
+        type: choice
+        options: [core, amd]
+      build_number:
+        default: '99'
+        type: string
+jobs:
+  canary:
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/meta-llvm-build.yml
+    with:
+      llvm_sha: ${{ inputs.llvm_sha }}
+      kind: ${{ inputs.kind }}
+      build_number: ${{ inputs.build_number }}
+      publish: false
