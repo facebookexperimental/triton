@@ -109,10 +109,22 @@ jobs:
       with:
         path: llvm-build
 
-    - name: Fetch LLVM Build Metadata
+    - name: Override LLVM build manifest
+      if: inputs.llvm_build_info != ''
       shell: bash
       env:
         LLVM_BUILD_INFO: ${{ inputs.llvm_build_info }}
+        PACKAGE: ${{ matrix.package }}
+      run: |
+        if [[ "$PACKAGE" == "llvm" ]]; then
+          manifest=llvm-build/cmake/llvm-build-info.json
+        else
+          manifest=llvm-build/cmake/amd-llvm-build-info.json
+        fi
+        printf '%s\n' "$LLVM_BUILD_INFO" > "$manifest"
+
+    - name: Fetch LLVM Build Metadata
+      shell: bash
       run: |
         if [[ "${{ matrix.package }}" == "llvm" ]]; then
           LLVM_INFO=llvm-build/cmake/llvm-build-info.json
@@ -129,10 +141,6 @@ jobs:
           echo 'llvm_include_tests=OFF' >> "$GITHUB_ENV"
           echo 'llvm_build_targets=install-distribution' >> "$GITHUB_ENV"
           echo 'LLVM_DISTRIBUTION_COMPONENTS=llvm-headers;llvm-libraries;cmake-exports' >> "$GITHUB_ENV"
-        fi
-        if [[ -n "$LLVM_BUILD_INFO" ]]; then
-          LLVM_INFO="$(mktemp)"
-          printf '%s\n' "$LLVM_BUILD_INFO" > "$LLVM_INFO"
         fi
         LLVM_COMMIT_HASH="$(sed -n 's/.*"llvm_hash"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "${LLVM_INFO}")"
         echo "Found LLVM commit hash: ${LLVM_COMMIT_HASH}"
@@ -159,11 +167,16 @@ jobs:
         INSTALL_DIR="${{ matrix.package }}-${SHORT_LLVM_COMMIT_HASH}-${{ matrix.config.target-os }}-${{ matrix.config.arch }}-${LLVM_BUILD_NUMBER}"
         echo "LLVM installation directory name: ${INSTALL_DIR}"
         echo "llvm_install_dir=${INSTALL_DIR}" >> ${GITHUB_ENV}
-        if [[ "${{ matrix.package }}" != "amd-codegen" ]]; then
+        if [[ "${{ matrix.package }}" == "llvm" ]]; then
           echo "llvm_sdk_dir=${INSTALL_DIR}" >> "$GITHUB_ENV"
         else
           echo "llvm_sdk_dir=${{ github.workspace }}/llvm-project/install" >> "$GITHUB_ENV"
         fi
+
+    - name: Use SDK installation directory
+      if: inputs.llvm_build_info != ''
+      shell: bash
+      run: echo "llvm_sdk_dir=$llvm_install_dir" >> "$GITHUB_ENV"
 
     - name: Check for Existing LLVM Build
       id: llvm-build
