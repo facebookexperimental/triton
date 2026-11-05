@@ -796,6 +796,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         },
         "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
+            "gfx1250": ("gfx1250_1", ),
             "sm90": ("sm90_1", ),
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),
@@ -976,16 +977,17 @@ def test_flash_attn_forward_only_shapes_have_no_backward_case(monkeypatch):
     assert any(dirs == {"fwd", "bwd"} for dirs in directions.values())
 
 
-def test_space_resolves_to_each_ops_own_default():
+def test_space_resolves_to_each_ops_own_default(monkeypatch):
     import importlib
 
     from _harness import driver
 
-    # mm has a heuristic_config; the attention ops do not, and their kernels
-    # accept only "full"/"smoke" -- a shared "heuristic" default is a KeyError.
+    monkeypatch.setattr(driver, "arch", lambda: "sm100")
     assert driver.resolve_space(importlib.import_module("bench_mm"), None) == "heuristic"
     assert driver.resolve_space(importlib.import_module("bench_flash_attn"), None) == "full"
-    # An explicit choice still wins.
+    monkeypatch.setattr(driver, "arch", lambda: "gfx1250")
+    assert driver.resolve_space(importlib.import_module("bench_flash_attn"), None) == "heuristic"
+    assert driver.resolve_space(importlib.import_module("bench_flash_attn"), "full") == "full"
     assert driver.resolve_space(importlib.import_module("bench_mm"), "full") == "full"
 
 
@@ -1637,3 +1639,36 @@ def test_a_case_that_breaks_the_gpu_is_reported_once_and_ends_the_run(monkeypatc
     # An ordinary error leaves the GPU usable, so the remaining cases still run.
     results = _run_with_failure(monkeypatch, gpu_usable_after=True)
     assert [r.status for r in results] == [Status.OK, Status.OK, Status.ERROR, Status.OK, Status.OK]
+
+
+@pytest.mark.parametrize("uuid", ["GPU-0123456789abcdef", "GPU-XX"])
+def test_amd_arch_uses_rocr_agent_without_product_name(monkeypatch, uuid):
+    import _harness.denoise as denoise
+    monkeypatch.setattr(denoise, "vendor", lambda: denoise.AMD)
+    monkeypatch.setattr(denoise, "_rocm", lambda args: _ROCM_SMI_VRAM_BUS if "--showbus" in args else None)
+    monkeypatch.setattr(denoise, "_amd_name", lambda index: "AMD Radeon Graphics")
+    monkeypatch.setattr(
+        denoise, "_rocminfo", lambda: f"""Agent 1
+  Name: gfx1250
+  Uuid: {uuid}
+  Device Type: GPU
+  BDFID: 34816
+Agent 2
+  Name: gfx950
+  Uuid: GPU-abc123
+  Device Type: GPU
+  BDFID: 2048
+""")
+    card0, card1 = denoise.list_devices()
+    assert (card0.arch, card1.arch) == ("gfx950", "gfx1250")
+    assert card1.uuid == (None if uuid == "GPU-XX" else uuid)
+
+
+def test_gfx1250_governor_does_not_guess_clock_or_power_policy(monkeypatch):
+    from _harness.denoise import AMD, Device, Governor
+    governor = Governor(Device(AMD, 0, "AMD Radeon Graphics", gpu_arch="gfx1250"))
+    calls = []
+    monkeypatch.setattr(governor, "_sudo", lambda args: calls.append(args))
+    governor._govern_amd(governor.device)
+    assert not calls
+    assert governor.skipped

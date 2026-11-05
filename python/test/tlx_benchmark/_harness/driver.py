@@ -325,14 +325,12 @@ def _errored(case: Case, exc: Exception) -> Result:
 
 
 def resolve_space(bench, space: Optional[str]) -> str:
-    """`None` means "whatever this op's own default is".
-
-    Ops do not share one: `mm` has a `heuristic_config` and defaults to it,
-    while `flash_attn`/`hstu_attn_dev`/`kimi_delta_attention` have none and
-    their kernels accept only "full" or "smoke" -- passing a global default of
-    "heuristic" to those is a KeyError, not a slow path.
-    """
-    return space or getattr(bench, "DEFAULT_SPACE", "heuristic")
+    """Resolve an explicit space or the adapter's default for the selected GPU."""
+    if space is not None:
+        return space
+    if hasattr(bench, "default_space"):
+        return bench.default_space()
+    return getattr(bench, "DEFAULT_SPACE", "heuristic")
 
 
 #: How often to pay the cold-compile pass.

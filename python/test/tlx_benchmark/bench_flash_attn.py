@@ -22,10 +22,12 @@ from _harness import Case, Prepared, close_enough, driver  # noqa: E402
 
 OP = "flash_attn"
 REF_NAME = "torch.nn.functional.scaled_dot_product_attention"
-#: No `heuristic_config` yet, so the op's own default is a full autotune -- see
-#: the `tlx.ops` module docstring. Measuring "smoke" instead would measure a
-#: path no user takes, so the suite pays the compile time and raises the cap.
-DEFAULT_SPACE = "full"
+
+
+def default_space():
+    return "heuristic" if driver.arch() == "gfx1250" else "full"
+
+
 #: Which SDPA kernel torch would dispatch. Earns a column because the headline
 #: speedup is unreadable without it: 1.4x over `math` is a broken benchmark,
 #: 1.4x over cuDNN is a result.
@@ -58,6 +60,10 @@ def shapes(synthetic: bool = False, suites=None) -> list:
     # entry instead of turning every synthetic case into an InvalidInput row.
     if synthetic and arch == "gfx950":
         entries = (entry._replace(dtype="bf16") for entry in entries)
+    if arch == "gfx1250":
+        entries = (entry for entry in entries if entry.head_dim == 128 and not entry.causal)
+        if synthetic:
+            entries = (entry._replace(dtype=dtype) for entry in entries for dtype in ("fp16", "bf16"))
     return list(entries)
 
 
@@ -66,7 +72,7 @@ def cases(synthetic: bool = False, suites=None) -> list[Case]:
         Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry[5]]).removeprefix("torch."), shape=tuple(entry[:5]),
              direction=direction, label=label(*entry, direction))
         for entry in shapes(synthetic, suites)
-        for direction in (("fwd", ) if entry in FORWARD_ONLY else DIRECTIONS)
+        for direction in (("fwd", ) if driver.arch() == "gfx1250" or entry in FORWARD_ONLY else DIRECTIONS)
     ]
 
 

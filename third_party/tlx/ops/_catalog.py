@@ -333,6 +333,7 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma"}),
         supports_backward=True,
+        default_space="full",
     ),
     OpSpec(
         op="flash_attn",
@@ -344,6 +345,7 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma", "tmem"}),
         supports_backward=True,
+        default_space="full",
     ),
     OpSpec(
         op="flash_attn",
@@ -355,6 +357,16 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset(),
         supports_backward=True,
+        default_space="full",
+    ),
+    OpSpec(
+        op="flash_attn",
+        arch="gfx1250",
+        variant="tdm_pipelined",
+        impl="triton.tlx.ops.kernels.flash_attn.gfx1250:flash_attn",
+        invariant_vocab=_ATTN_DIMS,
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
     ),
     OpSpec(
         op="prepare_flash_attn_varlen_backward",
