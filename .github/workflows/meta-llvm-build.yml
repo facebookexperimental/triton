@@ -220,6 +220,7 @@ jobs:
       llvm_build_info: ${{ needs.prepare.outputs.llvm_build_info }}
       matrix_exclude: ${{ needs.prepare.outputs.matrix_exclude }}
       ninja_args: -j4
+      cmake_args: ${{ inputs.kind == 'amd' && '-DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF' || '' }}
 
   validate:
     name: Validate ${{ matrix.config['target-os'] }}-${{ matrix.config.arch }} SDK
