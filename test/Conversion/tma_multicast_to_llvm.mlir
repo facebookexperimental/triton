@@ -3,6 +3,8 @@
 #blocked_bcast = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[0, 0]]}>
 #shared_bar_bcast = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #shared_gather_bcast = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
+#shared_bar_cta = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#shared_split = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
@@ -21,6 +23,46 @@ tt.func public @tma_gather_multicast(%arg0: !tt.tensordesc<1x128xbf16, #shared_g
   ttng.async_tma_gather %arg0[%arg2, %arg3] %arg4, %arg1, %arg5 {multicast} : !tt.tensordesc<1x128xbf16, #shared_gather_bcast>, tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked_bcast}>>, i32, !ttg.memdesc<1xi64, #shared_bar_bcast, #smem, mutable>, !ttg.memdesc<32x128xbf16, #shared_gather_bcast, #smem, mutable>, i1
 
   // CHECK: ret void
+  tt.return
+}
+
+// A broadcast destination layout with no explicit targets: the lead CTA of the
+// group issues one copy multicast to both CTAs.
+// CHECK-LABEL: @tma_copy_multicast_from_layout
+tt.func public @tma_copy_multicast_from_layout(%desc: !tt.tensordesc<64x64xbf16, #shared_gather_bcast>, %bar: !ttg.memdesc<2xi64, #shared_bar_cta, #smem, mutable>, %buf: !ttg.memdesc<64x64xbf16, #shared_gather_bcast, #smem, mutable>, %x: i32, %y: i32) {
+  %true = arith.constant true
+  // CHECK: [[RANK:%.*]] = tail call i32 @llvm.nvvm.read.ptx.sreg.cluster.ctarank()
+  // CHECK: and i32 [[RANK]], 1
+  // CHECK: [[LEAD:%.*]] = icmp eq i32 {{%.*}}, 0
+  // CHECK: [[PRED:%.*]] = and i1 [[LEAD]], {{%.*}}
+  // CHECK: "@$0 cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [$1], [$2, {$3, $4}], [$5], $6;", "b,r,l,r,r,r,h"
+  // CHECK-SAME: (i1 [[PRED]], ptr addrspace(3) {{%.*}}, ptr nonnull %0, i32 %4, i32 %3, ptr addrspace(3) {{%.*}}, i32 3)
+  ttng.async_tma_copy_global_to_local %desc[%x, %y] %buf, %bar, %true {multicast} : !tt.tensordesc<64x64xbf16, #shared_gather_bcast>, !ttg.memdesc<2xi64, #shared_bar_cta, #smem, mutable> -> !ttg.memdesc<64x64xbf16, #shared_gather_bcast, #smem, mutable>
+  tt.return
+}
+
+// CHECK-LABEL: @tma_copy_multicast_explicit_targets
+tt.func public @tma_copy_multicast_explicit_targets(%desc: !tt.tensordesc<64x64xbf16, #shared_gather_bcast>, %bar: !ttg.memdesc<2xi64, #shared_bar_cta, #smem, mutable>, %buf: !ttg.memdesc<64x64xbf16, #shared_gather_bcast, #smem, mutable>, %x: i32, %y: i32, %targets: i32) {
+  %true = arith.constant true
+  // Explicit recipients win over the layout's group.
+  // CHECK: "@$0 cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [$1], [$2, {$3, $4}], [$5], $6;", "b,r,l,r,r,r,h"
+  // CHECK-SAME: i32 %5)
+  ttng.async_tma_copy_global_to_local %desc[%x, %y] %buf, %bar, %true, %targets {multicast} : !tt.tensordesc<64x64xbf16, #shared_gather_bcast>, !ttg.memdesc<2xi64, #shared_bar_cta, #smem, mutable> -> !ttg.memdesc<64x64xbf16, #shared_gather_bcast, #smem, mutable>
+  tt.return
+}
+
+// CHECK-LABEL: @tma_copy_split_no_multicast
+tt.func public @tma_copy_split_no_multicast(%desc: !tt.tensordesc<128x64xbf16, #shared_split>, %bar: !ttg.memdesc<2xi64, #shared_bar_cta, #smem, mutable>, %buf: !ttg.memdesc<128x64xbf16, #shared_split, #smem, mutable>, %x: i32, %y: i32) {
+  %true = arith.constant true
+  // A layout split across the CTAs: each CTA copies its own 64 rows, no multicast.
+  // CHECK: [[RANK:%.*]] = tail call i32 @llvm.nvvm.read.ptx.sreg.cluster.ctarank()
+  // CHECK: [[SHL:%.*]] = shl i32 [[RANK]], 6
+  // CHECK: [[ROW_OFF:%.*]] = and i32 [[SHL]], 64
+  // CHECK: [[ROW:%.*]] = add i32 %3, [[ROW_OFF]]
+  // CHECK-NOT: multicast
+  // CHECK: "@$0 cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [$1], [$2, {$3, $4}], [$5];", "b,r,l,r,r,r"
+  // CHECK-SAME: i32 %4, i32 [[ROW]],
+  ttng.async_tma_copy_global_to_local %desc[%x, %y] %buf, %bar, %true : !tt.tensordesc<128x64xbf16, #shared_split>, !ttg.memdesc<2xi64, #shared_bar_cta, #smem, mutable> -> !ttg.memdesc<128x64xbf16, #shared_split, #smem, mutable>
   tt.return
 }
 
