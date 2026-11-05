@@ -13,28 +13,10 @@ on:
   workflow_dispatch:
   workflow_call:
     inputs:
-      package:
-        description: SDK to build, llvm or amd-llvm
-        required: true
-        type: string
-      config:
-        description: Platform configuration from the caller's matrix, as JSON
-        required: true
-        type: string
-      llvm_repository:
-        required: true
-        type: string
-      llvm_ref:
-        description: Exact LLVM commit to build
-        required: true
-        type: string
-      build_number:
-        required: true
-        type: string
-      cmake_args:
-        description: Additional CMake options for Unix SDK builds
-        default: ''
-        type: string
+      package: {type: string, default: ''}
+      llvm_build_info: {type: string, default: ''}
+      matrix_exclude: {type: string, default: '[]'}
+      ninja_args: {type: string, default: ''}
 
 env:
   SCCACHE_DIR: ${{ github.workspace }}/sccache
@@ -52,7 +34,6 @@ jobs:
       packages: ${{ steps.packages.outputs.packages }}
     steps:
     - uses: actions/checkout@v6
-      if: inputs.package == ''
       with:
         fetch-depth: 0
     - name: Select changed LLVM packages
@@ -61,25 +42,15 @@ jobs:
         EVENT_NAME: ${{ github.event_name }}
         BASE_SHA: ${{ github.event.before }}
         HEAD_SHA: ${{ github.sha }}
-        REQUESTED_PACKAGE: ${{ inputs.package }}
-        REQUESTED_REF: ${{ inputs.llvm_ref }}
-        REQUESTED_BUILD_NUMBER: ${{ inputs.build_number }}
+        CALL_PACKAGE: ${{ inputs.package }}
       run: |
         python3 - <<'PYTHON'
         import json
         import os
-        import re
         import subprocess
 
-        if os.environ["REQUESTED_PACKAGE"]:
-            package = os.environ["REQUESTED_PACKAGE"]
-            if package not in {"llvm", "amd-llvm"}:
-                raise ValueError("package must be llvm or amd-llvm")
-            if not re.fullmatch(r"[0-9a-f]{40}", os.environ["REQUESTED_REF"]):
-                raise ValueError("llvm_ref must be a full commit SHA")
-            if not re.fullmatch(r"[0-9]+", os.environ["REQUESTED_BUILD_NUMBER"]):
-                raise ValueError("build_number must be an integer")
-            packages = [package]
+        if os.environ["CALL_PACKAGE"]:
+            packages = [os.environ["CALL_PACKAGE"]]
         elif os.environ["EVENT_NAME"] == "workflow_dispatch":
             packages = ["llvm", "amd-codegen"]
         else:
@@ -101,7 +72,7 @@ jobs:
 
   build:
     needs: prepare
-    if: inputs.package == '' && needs.prepare.outputs.packages != '[]'
+    if: needs.prepare.outputs.packages != '[]'
     name: Build ${{ matrix.package }} on ${{ matrix.config.runner }}
     runs-on: ${{ matrix.config.runs_on }}
     container: ${{ matrix.config.container }}
@@ -110,6 +81,7 @@ jobs:
       fail-fast: true
       matrix:
         package: ${{ fromJson(needs.prepare.outputs.packages) }}
+        exclude: ${{ fromJSON(inputs.matrix_exclude || '[]') }}
         config:
         - {runner: 'Ubuntu 22.04', runs_on: 'ubuntu-22.04', target-os: 'ubuntu', arch: 'x64'}
         - {runner: 'Ubuntu 22.04 ARM64', runs_on: 'ubuntu-22.04-arm', target-os: 'ubuntu', arch: 'arm64'}
@@ -121,10 +93,9 @@ jobs:
         # MSVC 14.5x from VS 2026 runs out of heap on AMDGPU tables and ICEs on mlir-tblgen for ARM64; pin to 14.44.
         - {runner: 'Windows 11 ARM64', runs_on: 'windows-11-arm', target-os: 'windows', arch: 'arm64', msvc_arch: 'arm64', msvc_toolset: '14.44'}
 
-    steps: &llvm-build-steps
+    steps:
 
     - name: Checkout Repo
-      if: inputs.package == ''
       uses: actions/checkout@v6
       with:
         path: llvm-build
@@ -140,6 +111,8 @@ jobs:
 
     - name: Fetch LLVM Build Metadata
       shell: bash
+      env:
+        LLVM_BUILD_INFO: ${{ inputs.llvm_build_info }}
       run: |
         if [[ "${{ matrix.package }}" == "llvm" ]]; then
           MANIFEST=llvm-build/cmake/llvm-build-info.json
@@ -157,15 +130,19 @@ jobs:
           echo 'llvm_build_targets=install-distribution' >> "$GITHUB_ENV"
           echo 'LLVM_DISTRIBUTION_COMPONENTS=llvm-headers;llvm-libraries;cmake-exports' >> "$GITHUB_ENV"
         fi
-        LLVM_COMMIT_HASH="${REQUESTED_LLVM_REF:-$(jq -r '.llvm_hash' "$MANIFEST")}"
+        if [[ -n "$LLVM_BUILD_INFO" ]]; then
+          MANIFEST="$(mktemp)"
+          printf '%s\n' "$LLVM_BUILD_INFO" > "$MANIFEST"
+        fi
+        LLVM_COMMIT_HASH="$(jq -r '.llvm_hash' "$MANIFEST")"
         echo "Found LLVM commit hash: ${LLVM_COMMIT_HASH}"
         echo "llvm_commit_hash=${LLVM_COMMIT_HASH}" >> ${GITHUB_ENV}
 
-        LLVM_REPOSITORY="${REQUESTED_LLVM_REPOSITORY:-$(jq -r '.repository // "llvm/llvm-project"' "$MANIFEST")}"
+        LLVM_REPOSITORY="$(jq -r '.repository // "llvm/llvm-project"' "$MANIFEST")"
         echo "Found LLVM repository: ${LLVM_REPOSITORY}"
         echo "llvm_repository=${LLVM_REPOSITORY}" >> ${GITHUB_ENV}
 
-        LLVM_BUILD_NUMBER="${REQUESTED_BUILD_NUMBER:-$(jq -r '.build_number' "$MANIFEST")}"
+        LLVM_BUILD_NUMBER="$(jq -r '.build_number' "$MANIFEST")"
         echo "Found LLVM build number: ${LLVM_BUILD_NUMBER}"
         echo "llvm_build_number=${LLVM_BUILD_NUMBER}" >> "$GITHUB_ENV"
 
@@ -183,7 +160,7 @@ jobs:
         fi
 
     - name: Check LLVM Build Does Not Exist
-      if: inputs.package == ''
+      if: inputs.llvm_build_info == ''
       shell: bash
       run: |
         URL="https://oaitriton.blob.core.windows.net/public/llvm-builds/${{ env.llvm_install_dir }}.tar.gz"
@@ -240,6 +217,8 @@ jobs:
 
     - name: Configure, Build, Test, and Install LLVM (Ubuntu, CentOS, and macOS)
       if: matrix.config.target-os == 'ubuntu' || matrix.config.target-os == 'almalinux' || matrix.config.target-os == 'macos'
+      env:
+        NINJA_ARGS: ${{ inputs.ninja_args }}
       run: >
         cmake -GNinja -Bllvm-project/build
         -DCMAKE_BUILD_TYPE=Release
@@ -262,11 +241,10 @@ jobs:
         -DLLVM_LINK_LLVM_DYLIB=OFF
         -DLLVM_ENABLE_ZSTD=OFF
         -DLLVM_ENABLE_LZMA=OFF
-        ${EXTRA_LLVM_CMAKE_ARGS:-}
         $extra_cmake_flags
         llvm-project/llvm
 
-        cmake --build llvm-project/build --target ${{ env.llvm_build_targets }}
+        ninja -C llvm-project/build ${{ env.llvm_build_targets }} ${NINJA_ARGS:-}
 
     - name: Configure, Build, Test, and Install LLVM (Windows)
       if: matrix.config.target-os == 'windows'
@@ -295,48 +273,6 @@ jobs:
 
         ninja -C llvm-project/build ${{ env.llvm_build_targets }}
 
-
-    - name: Check relocated SDK consumer
-      if: inputs.package != '' && runner.os != 'Windows'
-      shell: bash
-      run: |
-        sdk="$RUNNER_TEMP/llvm-sdk-relocated"
-        consumer="$RUNNER_TEMP/llvm-sdk-consumer"
-        mv "$llvm_install_dir" "$sdk"
-        test -f "$sdk/include/llvm/IR/Module.h"
-        test -f "$sdk/lib/libLLVMAMDGPUCodeGen.a"
-        if [[ "${{ matrix.package }}" == "llvm" ]]; then
-          test -f "$sdk/lib/cmake/mlir/MLIRConfig.cmake"
-          "$sdk/bin/mlir-tblgen" --version
-        fi
-        mkdir -p "$consumer"
-        cat > "$consumer/CMakeLists.txt" <<'CMAKE'
-        cmake_minimum_required(VERSION 3.20)
-        project(llvm_sdk_consumer LANGUAGES C CXX)
-        find_package(LLVM REQUIRED CONFIG)
-        add_executable(sdk_consumer main.cpp)
-        target_compile_features(sdk_consumer PRIVATE cxx_std_17)
-        target_include_directories(sdk_consumer PRIVATE ${LLVM_INCLUDE_DIRS})
-        add_definitions(${LLVM_DEFINITIONS})
-        llvm_map_components_to_libnames(llvm_libs Core Support)
-        target_link_libraries(sdk_consumer PRIVATE ${llvm_libs})
-        CMAKE
-        cat > "$consumer/main.cpp" <<'CPP'
-        #include <llvm/IR/LLVMContext.h>
-        #include <llvm/IR/Module.h>
-        int main() {
-          llvm::LLVMContext context;
-          llvm::Module module("sdk", context);
-          return module.getName() == "sdk" ? 0 : 1;
-        }
-        CPP
-        cmake -G Ninja -S "$consumer" -B "$consumer/build" \
-          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-          -DLLVM_DIR="$sdk/lib/cmake/llvm" \
-          -DCMAKE_DISABLE_FIND_PACKAGE_LibLZMA=TRUE
-        cmake --build "$consumer/build"
-        "$consumer/build/sdk_consumer"
-        mv "$sdk" "$llvm_install_dir"
 
     - name: Build Standalone AMD Codegen
       if: matrix.package == 'amd-codegen'
@@ -376,18 +312,14 @@ jobs:
 
     - name: Package Build Artifacts
       shell: bash
-      run: |
-        tar czf "${{ env.llvm_install_dir }}.tar.gz" "${{ env.llvm_install_dir }}"
-        if [[ -n "${REQUESTED_LLVM_REF:-}" ]]; then
-          sha256sum "${{ env.llvm_install_dir }}.tar.gz" > "${{ env.llvm_install_dir }}.tar.gz.sha256"
-        fi
+      run: tar czf "${{ env.llvm_install_dir }}.tar.gz" "${{ env.llvm_install_dir }}"
 
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v7
       with:
         name: ${{ matrix.package }}-${{ matrix.config.target-os }}-${{ matrix.config.arch }}
         path: |
-          ${{ github.workspace }}/${{ env.llvm_install_dir }}.tar.gz*
+          ${{ github.workspace }}/${{ env.llvm_install_dir }}.tar.gz
 
     - name: Azure login
       if: ${{ (github.repository == 'triton-lang/triton') && github.ref_name == 'main' }}
@@ -417,25 +349,3 @@ jobs:
 
     - name: Dump Sccache Statistics
       run: sccache --show-stats
-
-  sdk:
-    needs: prepare
-    if: inputs.package != ''
-    name: Build ${{ matrix.package }} on ${{ matrix.config.runner }}
-    runs-on: ${{ matrix.config.runs_on }}
-    container: ${{ matrix.config.container }}
-    permissions:
-      contents: read
-    env:
-      REQUESTED_LLVM_REPOSITORY: ${{ inputs.llvm_repository }}
-      REQUESTED_LLVM_REF: ${{ inputs.llvm_ref }}
-      REQUESTED_BUILD_NUMBER: ${{ inputs.build_number }}
-      EXTRA_LLVM_CMAKE_ARGS: ${{ inputs.cmake_args }}
-      CMAKE_BUILD_PARALLEL_LEVEL: '4'
-    strategy:
-      fail-fast: false
-      matrix:
-        package: ${{ fromJSON(needs.prepare.outputs.packages) }}
-        config:
-          - ${{ fromJSON(inputs.config) }}
-    steps: *llvm-build-steps
