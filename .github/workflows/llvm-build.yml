@@ -17,6 +17,7 @@ on:
       llvm_build_info: {type: string, default: ''}
       matrix_exclude: {type: string, default: '[]'}
       ninja_args: {type: string, default: ''}
+      cmake_args: {type: string, default: ''}
 
 env:
   SCCACHE_DIR: ${{ github.workspace }}/sccache
@@ -219,6 +220,7 @@ jobs:
       if: matrix.config.target-os == 'ubuntu' || matrix.config.target-os == 'almalinux' || matrix.config.target-os == 'macos'
       env:
         NINJA_ARGS: ${{ inputs.ninja_args }}
+        EXTRA_CMAKE_ARGS: ${{ inputs.cmake_args }}
       run: >
         cmake -GNinja -Bllvm-project/build
         -DCMAKE_BUILD_TYPE=Release
@@ -241,7 +243,7 @@ jobs:
         -DLLVM_LINK_LLVM_DYLIB=OFF
         -DLLVM_ENABLE_ZSTD=OFF
         -DLLVM_ENABLE_LZMA=OFF
-        $extra_cmake_flags
+        $extra_cmake_flags ${EXTRA_CMAKE_ARGS:-}
         llvm-project/llvm
 
         ninja -C llvm-project/build ${{ env.llvm_build_targets }} ${NINJA_ARGS:-}
