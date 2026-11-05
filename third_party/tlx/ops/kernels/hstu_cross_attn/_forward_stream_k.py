@@ -44,8 +44,6 @@ PIPE_STAGES = 4
 # Fixed cost of a q tile, in KV blocks, when the cost space charges one (see `_phantom`).
 PHANTOM_BLOCKS = 3
 LOG2E: tl.constexpr = tl.constexpr(1.4426950408889634)
-# N8 fragments of a softmax block's probabilities formed in its row-max (PV) stage; the rest in the next QK stage.
-LAZY_EXP_PV: tl.constexpr = tl.constexpr(5)
 _VGPR_ONLY = (("amdgpu-agpr-alloc", "0,0"), )
 
 
@@ -126,8 +124,8 @@ def _qk_pieces(q, kt):
 
 
 @aggregate
-class LazyFragments:
-    """A score tile as eight N8 fragments, the first `N_EXP` of them already probabilities."""
+class LazySoftmaxFragments:
+    """A score tile as eight N8 fragments, with a leading probability prefix."""
     f0: tl.tensor
     f1: tl.tensor
     f2: tl.tensor
@@ -139,17 +137,17 @@ class LazyFragments:
 
 
 @triton.jit
-def _lazy_frag(x, m_i, QK_SCALE: tl.constexpr, EXP: tl.constexpr):
-    """P of score fragment `x` if EXP, else `x`."""
-    if EXP:
+def _maybe_exp_fragment(x, m_i, QK_SCALE: tl.constexpr, FORM_PROBABILITY: tl.constexpr):
+    """Form a probability from score fragment `x` when requested."""
+    if FORM_PROBABILITY:
         return tl.math.exp2(x * QK_SCALE - m_i)
     else:
         return x
 
 
 @triton.jit
-def _lazy_exp_head(state, qk, QK_SCALE: tl.constexpr, N_EXP: tl.constexpr):
-    """`vec1_lazy_exp_split` with P formed for the first `N_EXP` N8 fragments."""
+def _vec1_lazy_exp_fragments(state, qk, QK_SCALE: tl.constexpr, NUM_PROB_FRAGMENTS: tl.constexpr):
+    """Split the score tile and form probabilities for its leading fragments."""
     qk = tlx.require_layout(qk, _mma(), pin=True)
     qk_a, qk_b, qk_c, qk_d = _chunks(qk)
     qk_0, qk_1 = _split_cols(qk_a)
@@ -157,36 +155,37 @@ def _lazy_exp_head(state, qk, QK_SCALE: tl.constexpr, N_EXP: tl.constexpr):
     qk_4, qk_5 = _split_cols(qk_c)
     qk_6, qk_7 = _split_cols(qk_d)
     m_i = tlx.release_layout(state.m_i)[:, None]
-    return LazyFragments(
-        _lazy_frag(qk_0, m_i, QK_SCALE, N_EXP > 0),
-        _lazy_frag(qk_1, m_i, QK_SCALE, N_EXP > 1),
-        _lazy_frag(qk_2, m_i, QK_SCALE, N_EXP > 2),
-        _lazy_frag(qk_3, m_i, QK_SCALE, N_EXP > 3),
-        _lazy_frag(qk_4, m_i, QK_SCALE, N_EXP > 4),
-        _lazy_frag(qk_5, m_i, QK_SCALE, N_EXP > 5),
-        _lazy_frag(qk_6, m_i, QK_SCALE, N_EXP > 6),
-        _lazy_frag(qk_7, m_i, QK_SCALE, N_EXP > 7),
+    return LazySoftmaxFragments(
+        _maybe_exp_fragment(qk_0, m_i, QK_SCALE, NUM_PROB_FRAGMENTS > 0),
+        _maybe_exp_fragment(qk_1, m_i, QK_SCALE, NUM_PROB_FRAGMENTS > 1),
+        _maybe_exp_fragment(qk_2, m_i, QK_SCALE, NUM_PROB_FRAGMENTS > 2),
+        _maybe_exp_fragment(qk_3, m_i, QK_SCALE, NUM_PROB_FRAGMENTS > 3),
+        _maybe_exp_fragment(qk_4, m_i, QK_SCALE, NUM_PROB_FRAGMENTS > 4),
+        _maybe_exp_fragment(qk_5, m_i, QK_SCALE, NUM_PROB_FRAGMENTS > 5),
+        _maybe_exp_fragment(qk_6, m_i, QK_SCALE, NUM_PROB_FRAGMENTS > 6),
+        _maybe_exp_fragment(qk_7, m_i, QK_SCALE, NUM_PROB_FRAGMENTS > 7),
     )
 
 
 @triton.jit
-def _lazy_vec2(state, fr, QK_SCALE: tl.constexpr, out_dtype: tl.constexpr, N_EXP: tl.constexpr):
-    """`vec2_lazy_split` for `_lazy_exp_head(..., N_EXP)`: the remaining fragments' P, the cast and the row sum."""
+def _vec2_lazy_split(state, fr, QK_SCALE: tl.constexpr, out_dtype: tl.constexpr,
+                     NUM_PROB_FRAGMENTS: tl.constexpr):
+    """Finish deferred probabilities, cast the tile, and update its row sum."""
     m_i = tlx.release_layout(state.m_i)[:, None]
-    p_0 = _lazy_frag(fr.f0, m_i, QK_SCALE, N_EXP <= 0)
-    p_1 = _lazy_frag(fr.f1, m_i, QK_SCALE, N_EXP <= 1)
-    p_2 = _lazy_frag(fr.f2, m_i, QK_SCALE, N_EXP <= 2)
-    p_3 = _lazy_frag(fr.f3, m_i, QK_SCALE, N_EXP <= 3)
-    p_4 = _lazy_frag(fr.f4, m_i, QK_SCALE, N_EXP <= 4)
-    p_5 = _lazy_frag(fr.f5, m_i, QK_SCALE, N_EXP <= 5)
-    p_6 = _lazy_frag(fr.f6, m_i, QK_SCALE, N_EXP <= 6)
-    p_7 = _lazy_frag(fr.f7, m_i, QK_SCALE, N_EXP <= 7)
+    p_0 = _maybe_exp_fragment(fr.f0, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 0)
+    p_1 = _maybe_exp_fragment(fr.f1, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 1)
+    p_2 = _maybe_exp_fragment(fr.f2, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 2)
+    p_3 = _maybe_exp_fragment(fr.f3, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 3)
+    p_4 = _maybe_exp_fragment(fr.f4, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 4)
+    p_5 = _maybe_exp_fragment(fr.f5, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 5)
+    p_6 = _maybe_exp_fragment(fr.f6, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 6)
+    p_7 = _maybe_exp_fragment(fr.f7, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 7)
     p = _unchunk(_concat_cols(p_0, p_1), _concat_cols(p_2, p_3), _concat_cols(p_4, p_5), _concat_cols(p_6, p_7))
     return SoftmaxState(state.acc, state.l_i + tl.sum(p, 1), state.m_i), p.to(out_dtype)
 
 
 @triton.jit
-def _lazy_max(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
+def _vec1_lazy_max(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
     if QK_SCALE > 0:
         m_ij = SoftmaxState._row_max(qk) * QK_SCALE
     else:
@@ -199,12 +198,13 @@ def _lazy_max(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr
 
 @triton.jit
 def _vec1_lazy_split(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
-    state, score_delta, advance = _lazy_max(state, qk, QK_SCALE, RESCALE_THRESHOLD)
-    return state, _lazy_exp_head(state, qk, QK_SCALE, LAZY_EXP_PV), score_delta, advance
+    state, score_delta, advance = _vec1_lazy_max(state, qk, QK_SCALE, RESCALE_THRESHOLD)
+    return state, _vec1_lazy_exp_fragments(state, qk, QK_SCALE, 5), score_delta, advance
 
 
 @triton.jit
-def _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
+def _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE: tl.constexpr,
+                           RESCALE_THRESHOLD: tl.constexpr):
     """`_attn_dot_pv_vec1_lazy` (BM256, split VEC1) with the cheaper row max."""
     tl.static_assert(state.acc.shape[0] == 256)
     mma: tl.constexpr = _mma()
@@ -220,29 +220,30 @@ def _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE: tl.constexpr, RESCALE_T
     v2 = tlx.extract_slice(v_dot, [16, v_dot.shape[1]], [32, 0])
     v3 = tlx.extract_slice(v_dot, [16, v_dot.shape[1]], [48, 0])
     acc = tl.dot(p0, v0, acc)
-    max_state, score_delta, advance = _lazy_max(state, qk, QK_SCALE, RESCALE_THRESHOLD)
+    max_state, score_delta, advance = _vec1_lazy_max(state, qk, QK_SCALE, RESCALE_THRESHOLD)
     acc = tl.dot(p1, v1, acc)
     acc = tl.dot(p2, v2, acc)
     acc = tl.dot(p3, v3, acc)
     state = SoftmaxState(acc, state.l_i, max_state.m_i)
-    return state, _lazy_exp_head(state, qk, QK_SCALE, LAZY_EXP_PV), score_delta, advance
+    return state, _vec1_lazy_exp_fragments(state, qk, QK_SCALE, 5), score_delta, advance
 
 
 @triton.jit
-def _pin(x):
+def _anchor_vgpr(x):
     """`x` through a side-effecting register anchor: what computes it stays ahead of the next fence."""
     return tlx.amd_register_class_anchor(x, "vgpr")
 
 
 @triton.jit
-def _hold_exp(fr):
+def _anchor_probability_fragments(fr):
     """Anchor the probabilities formed in a PV stage, so LLVM cannot sink them, as loop-carried values, past the
     rescale branch into the next stage."""
-    return LazyFragments(_pin(fr.f0), _pin(fr.f1), _pin(fr.f2), _pin(fr.f3), _pin(fr.f4), fr.f5, fr.f6, fr.f7)
+    return LazySoftmaxFragments(_anchor_vgpr(fr.f0), _anchor_vgpr(fr.f1), _anchor_vgpr(fr.f2),
+                                _anchor_vgpr(fr.f3), _anchor_vgpr(fr.f4), fr.f5, fr.f6, fr.f7)
 
 
 @triton.jit
-def _weave_softmax(SYNC_ID: tl.constexpr):
+def _schedule_softmax_mfma_valu(SYNC_ID: tl.constexpr):
     """Schedule a softmax dot stage as 16 times one MFMA then up to five VALU or transcendental ops, which the
     MFMA's 32 cycles hide."""
     for _ in tl.static_range(16):
@@ -251,24 +252,26 @@ def _weave_softmax(SYNC_ID: tl.constexpr):
 
 
 @triton.jit
-def _lazy_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn, stride_vn,
-               QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr, NEXT_SLOT: tl.constexpr,
-               RESCALE_THRESHOLD: tl.constexpr):
+def _softmax_lazy_pipeline_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
+                                stride_vn, QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr,
+                                CUR_SLOT: tl.constexpr, NEXT_SLOT: tl.constexpr,
+                                RESCALE_THRESHOLD: tl.constexpr):
     """`_attn_inner_pipelined_lazy_step` (split VEC1, PV-woven VEC1) with the cheaper row max, and fp32 row sums
     for fp16 as well as bf16."""
     with tlx.warp_pipeline_stage("dot1"):
         qk = _qk_pieces(q, kt_dot)
-        state, p_dot = _lazy_vec2(state, p_c, QK_SCALE, q.dtype, LAZY_EXP_PV)
-        _weave_softmax(1)
+        state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
+        _schedule_softmax_mfma_valu(1)
     tlx.async_load_wait_group(1)
     with tlx.warp_pipeline_stage("mem1"):
         v_dot = tlx.local_load(tlx.local_view(v_buf, CUR_SLOT), relaxed=True)
         tok_k = tlx.async_load(k_ptrs + (block_n + 3) * BLOCK_N * stride_kn, tlx.local_view(k_buf, NEXT_SLOT))
         tlx.async_load_commit_group([tok_k])
     with tlx.warp_pipeline_stage("dot2"):
-        state, p_c, delta_c, advance_c = _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
-        p_c = _hold_exp(p_c)
-        _weave_softmax(2)
+        state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(
+            state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+        p_c = _anchor_probability_fragments(p_c)
+        _schedule_softmax_mfma_valu(2)
     tlx.async_load_wait_group(1)
     with tlx.warp_pipeline_stage("mem2"):
         kt_dot = _kt_pieces(k_buf, CUR_SLOT)
@@ -309,17 +312,20 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     # Pairs keep both ring slots static.
     for pair_idx in tl.range(0, (n_blocks - 3) // 2, num_stages=1):
         block_n = pair_idx * 2
-        state, p_c, kt_dot = _lazy_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
-                                        stride_vn, QK_SCALE, BLOCK_N, 0, 1, RESCALE_THRESHOLD)
-        state, p_c, kt_dot = _lazy_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n + 1, k_buf, v_buf, stride_kn,
-                                        stride_vn, QK_SCALE, BLOCK_N, 1, 0, RESCALE_THRESHOLD)
+        state, p_c, kt_dot = _softmax_lazy_pipeline_step(
+            state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
+            stride_vn, QK_SCALE, BLOCK_N, 0, 1, RESCALE_THRESHOLD)
+        state, p_c, kt_dot = _softmax_lazy_pipeline_step(
+            state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n + 1, k_buf, v_buf, stride_kn,
+            stride_vn, QK_SCALE, BLOCK_N, 1, 0, RESCALE_THRESHOLD)
     # Drain the last three blocks without further prefetches.
     nm1 = n_blocks - 1
     qk = _qk_pieces(q, kt_dot)
     tlx.async_load_wait_group(2)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
-    state, p_dot = _lazy_vec2(state, p_c, QK_SCALE, q.dtype, LAZY_EXP_PV)
-    state, p_c, delta_c, advance_c = _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+    state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
+    state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(
+        state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
     state = state.rescale_lazy(delta_c, advance_c)
     _attn_war_barrier(False)
     tok_vlast = tlx.async_load(v_ptrs + nm1 * BLOCK_N * stride_vn, tlx.local_view(v_buf, 0))
@@ -330,13 +336,14 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     qk = tl.dot(q, kt_dot)
     tlx.async_load_wait_group(1)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 1), relaxed=True)
-    state, p_dot = _lazy_vec2(state, p_c, QK_SCALE, q.dtype, LAZY_EXP_PV)
-    state, p_c, delta_c, advance_c = _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+    state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
+    state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(
+        state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
     state = state.rescale_lazy(delta_c, advance_c)
 
     tlx.async_load_wait_group(0)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
-    state, p_dot = _lazy_vec2(state, p_c, QK_SCALE, q.dtype, LAZY_EXP_PV)
+    state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
     acc = _attn_dot_pv_mfma(state.acc, p_dot, v_dot)
     return SoftmaxState(acc, state.l_i, state.m_i), q
 
