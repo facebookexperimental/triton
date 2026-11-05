@@ -11,6 +11,7 @@
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/WarpSpecialization.h"
@@ -24,11 +25,13 @@ namespace {
 
 struct WarpGroupBuilder : public OpBuilder {
   WarpGroupBuilder(Block *block, Block::iterator insertPoint,
-                   size_t partitionId)
-      : OpBuilder(block, insertPoint), partitionId(partitionId) {}
+                   size_t partitionId, bool useSemaphores)
+      : OpBuilder(block, insertPoint), partitionId(partitionId),
+        useSemaphores(useSemaphores) {}
 
   IRMapping mapping;
   size_t partitionId;
+  bool useSemaphores;
 };
 
 // This is computed per loop and partition
@@ -144,6 +147,16 @@ void mapRange(ValueRange fromRange, ValueRange toRange, IRMapping &mapping) {
 void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions);
 
+bool isNestedInWarpSpecializedLoop(scf::ForOp forOp) {
+  for (Operation *parent = forOp->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto parentForOp = dyn_cast<scf::ForOp>(parent);
+    if (parentForOp && parentForOp->hasAttr(kWarpSpecializeAttrName))
+      return true;
+  }
+  return false;
+}
+
 void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
                 const PartitionSet &partitions) {
   auto forOpPartitions = getPartitionIds(forOp);
@@ -164,6 +177,12 @@ void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
     auto newForOp =
         scf::ForOp::create(b, forOp.getLoc(), lb, ub, step, initArgs);
     newForOp->setAttrs(forOp->getAttrs());
+    if (b.useSemaphores && forOp->hasAttr(kScheduledMaxStageAttrName)) {
+      newForOp->setAttr(kScheduledMaxStageAttrName,
+                        b.getI32IntegerAttr(partition->getStage()));
+      if (isNestedInWarpSpecializedLoop(forOp))
+        newForOp->setAttr(kWarpSpecializeAttrName, b.getUnitAttr());
+    }
     if (forOp->hasAttr(kPartitionOutputsAttrName)) {
       newForOp->removeAttr(kPartitionOutputsAttrName);
     }
@@ -445,7 +464,8 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
 
 } // namespace
 
-LogicalResult triton::gpu::partitionLoop(LoopLikeOpInterface loop) {
+static LogicalResult partitionLoopImpl(LoopLikeOpInterface loop,
+                                       bool useSemaphores) {
   FailureOr<PartitionSet> partitionsOr = PartitionSet::fromLoop(loop);
   if (failed(partitionsOr))
     return failure();
@@ -533,7 +553,8 @@ LogicalResult triton::gpu::partitionLoop(LoopLikeOpInterface loop) {
   for (Region &region : wgOp.getPartitionRegions()) {
     auto partitionId = builders.size();
     auto &block = region.emplaceBlock();
-    builders.push_back(WarpGroupBuilder(&block, block.end(), partitionId));
+    builders.push_back(
+        WarpGroupBuilder(&block, block.end(), partitionId, useSemaphores));
   }
 
   SmallVector<Operation *> opsToErase;
@@ -630,6 +651,10 @@ LogicalResult triton::gpu::partitionLoop(LoopLikeOpInterface loop) {
   return success();
 }
 
+LogicalResult triton::gpu::partitionLoop(LoopLikeOpInterface loop) {
+  return partitionLoopImpl(loop, /*useSemaphores=*/false);
+}
+
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -658,7 +683,7 @@ void PartitionLoops::runOnOperation() {
   });
 
   for (LoopLikeOpInterface loop : loops) {
-    if (failed(partitionLoop(loop)))
+    if (failed(partitionLoopImpl(loop, useSemaphores)))
       return signalPassFailure();
   }
 }

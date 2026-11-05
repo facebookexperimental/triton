@@ -22,7 +22,9 @@ def TritonGPUPipeline : Pass<"tritongpu-pipeline", "mlir::ModuleOp"> {
            "number of pipeline stages">,
     Option<"dumpIntermediateSteps", "dump-intermediate-steps",
            "bool", /*default*/"false",
-           "Dump intermediate steps">
+           "Dump intermediate steps">,
+    Option<"useMetaNVWS", "use-meta-nvws", "bool", /*default*/"false",
+           "pipeline the selected Meta-to-NVWS semaphore path">
   ];
 }
 
@@ -126,7 +128,14 @@ def TritonGPUAutomaticWarpSpecialization : Pass<"tritongpu-automatic-warp-specia
 
   let options = [
     Option<"numStages", "num-stages", "int32_t", /*default*/"3",
-           "number of pipeline stages">
+           "number of pipeline stages">,
+    Option<"useSemaphores", "use-semaphores", "bool", /*default*/"false",
+           "use NVWS semaphores instead of Aref synchronization">,
+    Option<"useMetaPartitioner", "use-meta-partitioner", "bool",
+           /*default*/"false",
+           "use Meta planning with NVWS semaphore synchronization">,
+    Option<"smemBudget", "smem-budget", "int32_t", /*default*/"0",
+           "SMEM budget in bytes for Meta-to-NVWS memory planning">
   ];
 }
 
@@ -159,6 +168,11 @@ def TritonGPUPartitionLoops : Pass<"tritongpu-partition-loops", "mlir::ModuleOp"
     between any of the partitions.
   }];
 
+  let options = [
+    Option<"useSemaphores", "use-semaphores", "bool", /*default*/"false",
+           "preserve the semaphore pipeline's partition-local schedules">
+  ];
+
   let dependentDialects = [
     "mlir::triton::gpu::TritonGPUDialect",
     "triton::nvws::NVWSDialect"
@@ -188,7 +202,9 @@ def TritonGPUPartitionScheduling : Pass<"tritongpu-partition-scheduling", "mlir:
     Option<"mergeEpilogueIntoComputation", "merge-epilogue-into-computation",
            "bool", /*default*/"false",
            "If true, merge epilogue stores into the computation partition "
-           "instead of creating a separate epilogue partition">
+           "instead of creating a separate epilogue partition">,
+    Option<"useSemaphores", "use-semaphores", "bool", /*default*/"false",
+           "allow regular load/store communication through NVWS semaphores">
   ];
 }
 

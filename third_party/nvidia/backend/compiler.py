@@ -943,6 +943,14 @@ class CUDABackend(BaseBackend):
         if opt.clc and knobs.nvidia.use_meta_ws:
             raise ValueError("clc=True does not support Meta AutoWS; use tl.clc_tile_scheduler()")
 
+        # The Meta bridge takes precedence over native Meta, followed by the
+        # default-planner semaphore path. Both opt-ins are Blackwell-only.
+        use_nvws_meta = capability // 10 >= 10 and knobs.nvidia.use_nvws_meta
+        use_meta_ws = knobs.nvidia.use_meta_ws and not use_nvws_meta
+        use_nvws_semaphores = use_nvws_meta or (capability // 10 >= 10 and
+                                               knobs.nvidia.use_nvws_semaphores and not use_meta_ws)
+        ran_meta_nvws = False
+
         # Set maxnreg on all kernels, if it was provided.
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
@@ -986,7 +994,7 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_npot_pad(pm, opt.num_warps, 32, opt.num_ctas, f"cuda:{capability}", 0, opt.num_stages,
                                      False)
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
-        nvidia.passes.hopper.add_form_multi_cta_collectives(pm, capability, knobs.nvidia.use_meta_ws)
+        nvidia.passes.hopper.add_form_multi_cta_collectives(pm, capability, use_meta_ws)
         nvidia.passes.hopper.add_lower_cluster_reduce_to_ttgir(pm)
         # Check user-visible tt.dot 2-CTA legality before lowering rewrites
         # dot dependencies into TMEM alloc/load/store chains.
@@ -1124,8 +1132,9 @@ class CUDABackend(BaseBackend):
             uses_custom_schedule = (knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
                                     or knobs.nvidia.use_list_schedule or knobs.nvidia.use_joint_schedule)
             if not uses_custom_schedule:
-                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                use_meta_schedule = use_meta_ws or use_nvws_meta
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_schedule)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_schedule)
             # The elif chain above gives the llm/joint/modulo schedulers
             # priority over the list scheduler, so gate the WS skip on the arm
             # that actually RAN, not on the raw knob — with e.g. joint+list both
@@ -1145,11 +1154,25 @@ class CUDABackend(BaseBackend):
                 # as a modulo schedule and demands partition attrs the list
                 # scheduler never emits). So skip WS entirely.
                 pass
-            elif not knobs.nvidia.use_meta_ws:
+            elif not use_meta_ws:
                 # clc=True can use upstream WS for a single CTA on SM100+.
                 # Meta AutoWS and physical clusters remain unsupported.
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
-                    passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
+                    if use_nvws_meta:
+                        nvidia.passes.hopper.add_tma_store_lowering(pm)
+                        nvidia.passes.hopper.add_sink_broadcast(pm)
+                        passes.ttgpuir.add_warp_specialize(
+                            pm,
+                            num_stages=opt.num_stages,
+                            use_semaphores=True,
+                            use_meta_partitioner=True,
+                            smem_budget=_max_shared_mem_for_capability(capability),
+                        )
+                        ran_meta_nvws = True
+                    elif use_nvws_semaphores:
+                        passes.ttgpuir.add_warp_specialize(pm, opt.num_stages, use_semaphores=True)
+                    else:
+                        passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
                 nvidia.passes.hopper.add_tma_store_lowering(pm)
@@ -1178,8 +1201,8 @@ class CUDABackend(BaseBackend):
                 # overwrites it, which silently miscompiles kernels that have a
                 # separate epilogue-store partition.
                 if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2:
-                    passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
+                    passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_ws)
+            passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled, use_meta_nvws=ran_meta_nvws)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and opt.allowDependentTwoCTA):
                 nvidia.passes.hopper.add_materialize_2cta_exchange(pm)
@@ -1194,7 +1217,7 @@ class CUDABackend(BaseBackend):
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
             # MMAv5.cpp's inline ClusterArriveOp.
-            if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws:
+            if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and use_meta_ws:
                 nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
             passes.ttir.add_triton_licm(pm)
@@ -1225,7 +1248,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
-        if capability // 10 >= 9 and knobs.nvidia.use_meta_ws:
+        if capability // 10 >= 9 and (use_meta_ws or ran_meta_nvws):
             passes.ttgpuir.add_optimize_partition_warps(pm)
         # Promote only after partition warps are final: the baked count is
         # derived from task sizes, which optimize-partition-warps shrinks.

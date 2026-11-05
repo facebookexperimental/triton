@@ -620,6 +620,8 @@ class nvidia_knobs(base_knobs):
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
+    use_nvws_semaphores: env_bool = env_bool("TRITON_NVWS_USE_SEMAPHORES")
+    use_nvws_meta: env_bool = env_bool("TRITON_NVWS_USE_META")
     # Re-issue tcgen05 MMAs that share operand A so A is read once through the
     # collector buffer (see triton-nvidia-mma-collector-reuse).
     disable_mma_collector_reuse: env_bool = env_bool("TRITON_DISABLE_MMA_COLLECTOR_REUSE")

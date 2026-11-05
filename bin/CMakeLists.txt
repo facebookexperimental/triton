@@ -67,6 +67,8 @@ add_dependencies(triton-llvm-opt intrinsics_gen)
 target_compile_options(triton-llvm-opt PRIVATE ${TRITON_DISABLE_EH_RTTI_FLAGS})
 target_link_libraries(triton-llvm-opt PRIVATE
   TritonLLVMIR
+  # GPU transforms include the optional Meta-to-NVWS planning pipeline.
+  NVHopperTransforms
 
   LLVMAnalysis
   LLVMCore

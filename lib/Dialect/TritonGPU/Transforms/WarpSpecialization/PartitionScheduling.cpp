@@ -411,14 +411,16 @@ bool isCLC(Node *node) {
   return flags & Flags::CLC;
 }
 
-bool hasEligibleMemoryOps(Graph *graph) {
+bool hasEligibleMemoryOps(Graph *graph, bool useSemaphores) {
   bool found = false;
   graph->walk([&](Node *node) {
     if (!node->isOp() || found)
       return;
     auto flags = getNodeFlags(node);
-    // We cannot handle none descriptor memory operations
-    if (flags & (Flags::LOAD | Flags::STORE))
+    // Aref specialization requires descriptor accesses. The semaphore path
+    // also materializes communication for regular loads and stores.
+    if (flags & (Flags::LOAD | Flags::STORE) ||
+        (useSemaphores && isa<triton::LoadOp, triton::StoreOp>(node->getOp())))
       found = true;
   });
   return found;
@@ -1633,7 +1635,7 @@ private:
         partition->dump();
     });
 
-    if (!hasEligibleMemoryOps(graph.get()))
+    if (!hasEligibleMemoryOps(graph.get(), useSemaphores))
       return;
 
     serialize(idx, op, graph.get());

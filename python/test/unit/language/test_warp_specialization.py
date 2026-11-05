@@ -51,6 +51,76 @@ def _assert_clc_ws_ir(compiled):
     assert ttgir.count("ttng.clc_try_cancel ") == 1
 
 
+@pytest.mark.parametrize("use_meta_ws, use_semaphores, use_nvws_meta, expected", [
+    (False, False, False, "aref"),
+    (False, True, False, "semaphores"),
+    (True, False, False, "meta"),
+    (True, True, False, "meta"),
+    (False, False, True, "meta_nvws"),
+    (False, True, True, "meta_nvws"),
+    (True, False, True, "meta_nvws"),
+    (True, True, True, "meta_nvws"),
+])
+@pytest.mark.skipif(is_hip(), reason="checks NVIDIA compiler pipeline selection")
+@pytest.mark.disable_warmup(reason="checks compiler pipeline dispatch without a JIT launch")
+def test_warp_specialize_pipeline_flag_precedence(use_meta_ws, use_semaphores, use_nvws_meta, expected, monkeypatch,
+                                                fresh_compilation_knobs):
+    from triton._C.libtriton import nvidia as nvidia_lib, passes
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    aws_calls = []
+    meta_calls = []
+    pipeline_calls = []
+    schedule_calls = []
+    add_warp_specialize = passes.ttgpuir.add_warp_specialize
+    add_hopper_warpspec = nvidia_lib.passes.hopper.add_hopper_warpspec
+    add_pipeline = passes.ttgpuir.add_pipeline
+    add_assign_latencies = passes.ttgpuir.add_assign_latencies
+
+    def record_warp_specialize(*args, **kwargs):
+        aws_calls.append((kwargs.get("use_semaphores", False), kwargs.get("use_meta_partitioner", False)))
+        return add_warp_specialize(*args, **kwargs)
+
+    def record_hopper_warpspec(*args, **kwargs):
+        meta_calls.append(True)
+        return add_hopper_warpspec(*args, **kwargs)
+
+    def record_pipeline(*args, **kwargs):
+        pipeline_calls.append(kwargs.get("use_meta_nvws", False))
+        return add_pipeline(*args, **kwargs)
+
+    def record_assign_latencies(*args, **kwargs):
+        schedule_calls.append(args[2])
+        return add_assign_latencies(*args, **kwargs)
+
+    monkeypatch.setattr(passes.ttgpuir, "add_warp_specialize", record_warp_specialize)
+    monkeypatch.setattr(nvidia_lib.passes.hopper, "add_hopper_warpspec", record_hopper_warpspec)
+    monkeypatch.setattr(passes.ttgpuir, "add_pipeline", record_pipeline)
+    monkeypatch.setattr(passes.ttgpuir, "add_assign_latencies", record_assign_latencies)
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = use_meta_ws
+        triton.knobs.nvidia.use_nvws_semaphores = use_semaphores
+        triton.knobs.nvidia.use_nvws_meta = use_nvws_meta
+        triton.knobs.compilation.always_compile = True
+
+        @triton.jit
+        def dispatch_kernel(out):
+            tl.store(out, 0)
+
+        triton.compile(
+            ASTSource(fn=dispatch_kernel, signature={"out": "*i32"}, constexprs={}),
+            target=GPUTarget("cuda", 100, 32),
+        )
+
+    expected_aws = {"aref": [(False, False)], "semaphores": [(True, False)], "meta": [], "meta_nvws": [(True, True)]}
+    assert aws_calls == expected_aws[expected]
+    assert meta_calls == ([True] if expected == "meta" else [])
+    assert pipeline_calls == [expected == "meta_nvws"]
+    assert schedule_calls == [expected in ("meta", "meta_nvws")]
+
+
 @pytest.mark.skipif(is_hip(), reason="warp specialization is not supported on hip devices")
 @pytest.mark.skipif(not is_hopper_or_blackwell(), reason="Requires Hopper or Blackwell")
 @pytest.mark.disable_warmup(reason="compiles an explicit IR fixture rather than a JIT launch")
