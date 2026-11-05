@@ -3307,7 +3307,7 @@ def test_varlen_d128_fp32_dq_atomics_gfx950(monkeypatch, max_q, q_heads, kv_head
     assert exact_kwargs["BLOCK_M"] == 16 and exact_kwargs["BLOCK_N"] == 256
     assert exact_kwargs["reverse_local_assignment"] is True
     assert exact_kwargs["enable_sched_group_barrier_scheduler"] is False
-    assert exact_kwargs["llvm_fn_attrs"] == (("amdgpu-sched-strategy", "max-ilp"), )
+    assert exact_kwargs["llvm_fn_attrs"] == (("amdgpu-sched-strategy", "iterative-minreg"), )
     assert exact_kwargs["SORT_TASKS"] is False
     assert not ({
         "sink_insts_to_avoid_spills",

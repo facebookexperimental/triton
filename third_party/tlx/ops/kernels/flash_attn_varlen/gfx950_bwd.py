@@ -6128,7 +6128,7 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
             matrix_instr_nonkdim=16,
             reverse_local_assignment=True,
             enable_sched_group_barrier_scheduler=False,
-            llvm_fn_attrs=() if chunked_prefix_fp32_case else (("amdgpu-sched-strategy", "max-ilp"), ),
+            llvm_fn_attrs=() if chunked_prefix_fp32_case else (("amdgpu-sched-strategy", "iterative-minreg"), ),
         )
     elif (block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N):
         wide_core = _varlen_bwd_interleaved_bm32_kernel
