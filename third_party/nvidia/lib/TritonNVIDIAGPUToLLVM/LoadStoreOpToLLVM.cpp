@@ -1381,19 +1381,21 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       // the cluster -- a cluster barrier (#9510), multicast, or a 2-CTA group;
       // otherwise it is CTA-local. The barrier component keys on the barrier
       // layout (not the SMEM layout), matching #9510.
-      auto multicastMask = op.getMulticastTargets();
+      // Explicit recipients (TLX) or the broadcast group of the destination
+      // layout (Gluon `multicast=True`).
+      Value targets = op.getMulticastTargets() ? op.getMulticastTargets()
+                                               : multicastMask;
       // The current Hopper toolchain emits PTX < 8.6, where shared::cta TMA
       // loads are not accepted. Conservatively use cluster scope on Hopper;
       // keep CTA scope on Blackwell.
       bool clusterScope = computeCapability < 100 || crossCTABarrier ||
-                          multicast || multicastMask != nullptr ||
-                          op.getTwoCta();
+                          multicast || targets != nullptr || op.getTwoCta();
       std::string tmaInst = "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
                             "d.shared::" + (clusterScope ? "cluster" : "cta") +
                             ".global.mbarrier::complete_tx::bytes";
       if (op.getTwoCta())
         tmaInst += ".cta_group::2";
-      if (multicastMask != nullptr)
+      if (targets != nullptr)
         tmaInst += ".multicast::cluster";
       // Add L2 cache hint modifier if eviction policy is specified
       if (l2PolicyReg)
@@ -1421,8 +1423,8 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       operands.push_back(
           ptxBuilderTMA.newOperand(barrierMemObj.getBase(), "r"));
       tmaInst += "}], [$" + std::to_string(operandIdx++) + "]";
-      if (multicastMask != nullptr) {
-        operands.push_back(ptxBuilderTMA.newOperand(multicastMask, "h"));
+      if (targets != nullptr) {
+        operands.push_back(ptxBuilderTMA.newOperand(targets, "h"));
         tmaInst += ", $" + std::to_string(operandIdx++);
       }
       // Add L2 cache policy operand if specified
