@@ -330,7 +330,7 @@ def _softmax_block_masked(state, q, k_ptrs, v_ptrs, start_n, kv_len, k_buf, v_bu
 
 @triton.jit
 def _silu_q(q, ALPHA: tl.constexpr):
-    """Q times -ALPHA * log2(e), rounded once to Q's type: its scores are the exponents of SiLU's sigmoid."""
+    """Pre-scale Q by -ALPHA * log2(e) so QK directly yields the base-2 exponent for SiLU."""
     NEG_ALPHA_LOG2E: tl.constexpr = -ALPHA * LOG2E
     layout: tl.constexpr = tlx.dot_operand_layout(0, _mma(), k_width=8)
     q = tlx.require_layout(q, layout, pin=True)
@@ -339,8 +339,7 @@ def _silu_q(q, ALPHA: tl.constexpr):
 
 @triton.jit
 def _silu(s):
-    """`silu(qk * ALPHA)` from s = qk * -ALPHA * log2(e) (a `_silu_q` score), as
-    `s * rcp(fma(exp2(s), -log2(e), -log2(e)))`."""
+    """`silu(qk * ALPHA)` as `s * rcp(fma(exp2(s), -log2(e), -log2(e)))`, where s = -qk * ALPHA * log2(e)."""
     NEG_LOG2E: tl.constexpr = -LOG2E
     return s * fast_dividef(1.0, tl.fma(tl.math.exp2(s), NEG_LOG2E, NEG_LOG2E))
 
