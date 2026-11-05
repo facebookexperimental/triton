@@ -5,9 +5,11 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -119,10 +121,169 @@ bool isIdempotent(Region &combine) {
   return true;
 }
 
+SmallVector<Value> npotValues(Operation *op) {
+  SmallVector<Value> values(op->getOperands());
+  llvm::append_range(values, op->getResults());
+  for (Region &region : op->getRegions())
+    for (Block &block : region)
+      llvm::append_range(values, block.getArguments());
+  llvm::erase_if(values, [](Value v) { return !touchesNpot(v.getType()); });
+  return values;
+}
+
+// Groups the NPOT tensors connected through their ops (a connected component
+// of the def-use graph). A connected component keeps its shape iff its ops
+// lower a Product layout, each access keeps its padded vector, and its Product
+// layouts take fewer slots in sum than its padded Blocked layouts.
+class ExactComponents {
+public:
+  ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp, int numCTAs);
+  bool contains(Value v) const {
+    return !paddedComponents.contains(components.getLeaderValue(v));
+  }
+  bool contains(Operation *op) const {
+    SmallVector<Value> values = npotValues(op);
+    return !values.empty() && contains(values.front());
+  }
+
+private:
+  llvm::EquivalenceClasses<Value> components;
+  DenseSet<Value> paddedComponents;
+};
+
+ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
+                                 int numCTAs) {
+  mod.walk([&](Operation *op) {
+    SmallVector<Value> values = npotValues(op);
+    for (Value v : values)
+      components.unionSets(values.front(), v);
+    // A value forwarded along control flow and the region argument, parent
+    // result or block argument it becomes take one layout.
+    auto terminator = dyn_cast<RegionBranchTerminatorOpInterface>(op);
+    if (auto parent = terminator
+                          ? dyn_cast<RegionBranchOpInterface>(op->getParentOp())
+                          : nullptr) {
+      RegionBranchSuccessorMapping mapping;
+      parent.getSuccessorOperandInputMapping(mapping,
+                                             RegionBranchPoint(terminator));
+      for (auto &[operand, inputs] : mapping)
+        for (Value input : inputs)
+          if (touchesNpot(input.getType()))
+            components.unionSets(operand->get(), input);
+    }
+    if (auto branch = dyn_cast<BranchOpInterface>(op))
+      for (OpOperand &operand : op->getOpOperands())
+        if (std::optional<BlockArgument> arg =
+                branch.getSuccessorBlockArgument(operand.getOperandNumber());
+            arg && touchesNpot(arg->getType()))
+          components.unionSets(operand.get(), *arg);
+  });
+  MLIRContext *ctx = mod.getContext();
+  // A value reaching expand_dims or a growing broadcast rides its
+  // consumer's threads, so tiles alone decide the connected component: carried
+  // values are excluded from both slot sums.
+  auto isCarried = [&](Value v) {
+    SmallVector<Value> worklist{v};
+    DenseSet<Value> seen{v};
+    while (!worklist.empty()) {
+      Value cur = worklist.pop_back_val();
+      auto curShaped = cast<RankedTensorType>(cur.getType());
+      for (Operation *user : cur.getUsers()) {
+        if (isa<ExpandDimsOp>(user))
+          return true;
+        if (auto bcast = dyn_cast<BroadcastOp>(user)) {
+          if (auto resTy = dyn_cast<RankedTensorType>(bcast.getType());
+              resTy && resTy.getNumElements() > curShaped.getNumElements())
+            return true;
+        }
+        if (user->getNumResults() != 1)
+          continue;
+        Value res = user->getResult(0);
+        auto resTy = dyn_cast<RankedTensorType>(res.getType());
+        if (resTy && resTy.getShape() == curShaped.getShape() &&
+            seen.insert(res).second)
+          worklist.push_back(res);
+      }
+    }
+    return false;
+  };
+  DenseSet<Value> carried;
+  mod.walk([&](Operation *op) {
+    for (Value v : npotValues(op))
+      if (isa<RankedTensorType>(v.getType()) && isCarried(v))
+        carried.insert(v);
+  });
+  // Adds v's slots (registers x lanes x warps) under its Product and Blocked
+  // layouts to sum; false if v cannot take a Product layout.
+  auto addSlots = [&](Value v, std::pair<int64_t, int64_t> &sum) {
+    auto type = dyn_cast<RankedTensorType>(v.getType());
+    if (!type || type.getEncoding())
+      return false;
+    FailureOr<gpu::LinearEncodingAttr> exact = gpu::getProductEncoding(
+        ctx, type.getShape(), numWarps, threadsPerWarp, numCTAs);
+    if (failed(exact))
+      return false;
+    if (carried.contains(v))
+      return true;
+    ArrayRef<int64_t> pow2 = padded(type).getShape();
+    auto pad = gpu::getDefaultBlockedEncoding(ctx, pow2, numWarps,
+                                              threadsPerWarp, numCTAs);
+    sum.first += exact->getLinearLayout().getTotalInDimSize();
+    sum.second += pad.toLinearLayout(pow2).getTotalInDimSize();
+    return true;
+  };
+  // Vector first, per the spec: a load or store must keep the vector AxisInfo
+  // proves for its padded pointer along the dim Coalesce vectorizes.
+  std::optional<ModuleAxisInfoAnalysis> axisInfo;
+  auto keepsVector = [&](Operation *op) {
+    Value ptr =
+        llvm::TypeSwitch<Operation *, Value>(op)
+            .Case<LoadOp, StoreOp>([](auto access) { return access.getPtr(); })
+            .Default(Value());
+    auto type = ptr ? dyn_cast<RankedTensorType>(ptr.getType()) : nullptr;
+    if (!type || !isNpot(type.getShape()))
+      return true;
+    if (!axisInfo)
+      axisInfo.emplace(mod);
+    const AxisInfo &info = *axisInfo->getAxisInfo(ptr);
+    // Coalesce's getOrderFromContiguity, which TritonTransforms can't link.
+    auto order =
+        llvm::to_vector(llvm::reverse(llvm::seq<unsigned>(type.getRank())));
+    llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+      return info.getContiguity(x) > info.getContiguity(y);
+    });
+    int64_t threads = int64_t(numWarps) * threadsPerWarp;
+    unsigned pow2Vector = getAxisInfoVector(info, type, padded(type).getShape(),
+                                            order[0], threads);
+    unsigned vector =
+        getAxisInfoVector(info, type, type.getShape(), order[0], threads);
+    return gpu::getProductVector(ctx, type.getShape(), vector, order, numWarps,
+                                 threadsPerWarp) >= pow2Vector;
+  };
+  DenseMap<Value, std::pair<int64_t, int64_t>> slots;
+  DenseSet<Value> seen;
+  mod.walk([&](Operation *op) {
+    SmallVector<Value> values = npotValues(op);
+    if (values.empty())
+      return;
+    Value leader = components.getLeaderValue(values.front());
+    if (!gpu::isProductLayoutOp(op) || !keepsVector(op))
+      paddedComponents.insert(leader);
+    for (Value v : values)
+      if (seen.insert(v).second && !addSlots(v, slots[leader]))
+        paddedComponents.insert(leader);
+  });
+  // Summed over the connected component: a thin index value may take more
+  // slots than its padded layout while the tile it addresses takes fewer.
+  for (auto &[leader, sum] : slots)
+    if (sum.first >= sum.second)
+      paddedComponents.insert(leader);
+}
+
 class Padder {
 public:
   LogicalResult admit(Operation *op);
-  void apply(ModuleOp mod);
+  void apply(ModuleOp mod, const ExactComponents &exact);
 
 private:
   Value live(Operation *user, RankedTensorType orig);
@@ -451,10 +612,10 @@ LogicalResult Padder::admit(Operation *op) {
   return op->emitOpError("on an NPOT tensor is unsupported");
 }
 
-void Padder::apply(ModuleOp mod) {
-  auto retype = [](Value value) {
+void Padder::apply(ModuleOp mod, const ExactComponents &exact) {
+  auto retype = [&](Value value) {
     if (auto type = dyn_cast<RankedTensorType>(value.getType());
-        type && isNpot(type.getShape()))
+        type && isNpot(type.getShape()) && !exact.contains(value))
       value.setType(padded(type));
   };
   mod.walk([&](Operation *op) {
@@ -470,14 +631,20 @@ void Padder::apply(ModuleOp mod) {
 } // namespace
 
 struct NpotPadPass : impl::TritonNpotPadBase<NpotPadPass> {
+  using impl::TritonNpotPadBase<NpotPadPass>::TritonNpotPadBase;
+
   // Admits every op before changing any, so an error leaves the IR unchanged.
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    ExactComponents exact(mod, numWarps, threadsPerWarp, numCTAs);
     Padder padder;
-    if (mod.walk([&](Operation *op) { return WalkResult(padder.admit(op)); })
+    if (mod.walk([&](Operation *op) {
+             return WalkResult(exact.contains(op) ? success()
+                                                  : padder.admit(op));
+           })
             .wasInterrupted())
       return signalPassFailure();
-    padder.apply(mod);
+    padder.apply(mod, exact);
   }
 };
 

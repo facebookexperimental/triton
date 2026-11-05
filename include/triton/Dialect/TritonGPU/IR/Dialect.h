@@ -197,6 +197,12 @@ bool isGenericLinearEncoding(Attribute attr);
 // input digits. No other encoding parses other radices.
 bool isRadix2Encoding(Attribute layout);
 
+// Whether `op` lowers a Product layout: it is elementwise or declares
+// ProductLayoutOpInterface. The verifier admits a Product layout only on these
+// ops, and the NPOT pad pass keeps a connected component's shape only if all
+// its ops are.
+bool isProductLayoutOp(Operation *op);
+
 // Create a GenericLinearEncoding if the source isGenericLinearEncoding, and a
 // LinearEncoding otherwise.
 Attribute inferEncodingFromLinearLayout(MLIRContext *ctx, LinearLayout ll,

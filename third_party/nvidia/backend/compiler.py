@@ -966,7 +966,7 @@ class CUDABackend(BaseBackend):
         dump_enabled = pm.enable_debug()
         emuTF32 = capability // 10 >= 8
         if knobs.language.allow_npot:
-            passes.ttir.add_npot_pad(pm)
+            passes.ttir.add_npot_pad(pm, opt.num_warps, 32, opt.num_ctas)
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         nvidia.passes.hopper.add_form_multi_cta_collectives(pm, capability, knobs.nvidia.use_meta_ws)
         nvidia.passes.hopper.add_lower_cluster_reduce_to_ttgir(pm)
