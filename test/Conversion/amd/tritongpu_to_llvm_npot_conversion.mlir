@@ -110,17 +110,24 @@ module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.n
 #p = #ttg.linear<{register = [[64], [0]], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [3, 2], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
 module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   // CHECK-LABEL: llvm.func @broadcast_register_store
-  // CHECK: llvm.store %{{.*}}, %[[P0:[0-9]+]]
-  // CHECK: llvm.store %{{.*}}, %[[P1:[0-9]+]]
-  // CHECK: llvm.store %{{.*}}, %[[P2:[0-9]+]]
-  // CHECK: llvm.store %{{.*}}, %[[P0]]
-  // CHECK: llvm.store %{{.*}}, %[[P1]]
-  // CHECK: llvm.store %{{.*}}, %[[P2]]
+  // CHECK-COUNT-3: llvm.store {{.*}} : vector<1xi32>, !llvm.ptr<1>
+  // CHECK-NOT: llvm.store
+  // CHECK: llvm.return
   tt.func public @broadcast_register_store(%p: !tt.ptr<i32>) {
     %r = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #p>
     %s = tt.splat %p : !tt.ptr<i32> -> tensor<192x!tt.ptr<i32>, #p>
     %a = tt.addptr %s, %r : tensor<192x!tt.ptr<i32>, #p>, tensor<192xi32, #p>
     tt.store %a, %r : tensor<192x!tt.ptr<i32>, #p>
+    tt.return
+  }
+
+  // CHECK-LABEL: llvm.func @broadcast_register_buffer_store
+  // CHECK-COUNT-3: rocdl.raw.ptr.buffer.store
+  // CHECK-NOT: rocdl.raw.ptr.buffer.store
+  // CHECK: llvm.return
+  tt.func public @broadcast_register_buffer_store(%p: !tt.ptr<i32>) {
+    %r = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #p>
+    amdg.buffer_store %r, %p[%r] : !tt.ptr<i32> -> tensor<192xi32, #p>
     tt.return
   }
 }
