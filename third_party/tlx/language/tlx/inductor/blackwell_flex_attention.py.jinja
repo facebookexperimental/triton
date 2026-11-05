@@ -7,6 +7,9 @@
     #   Task 3            : MMA via tlx.async_dot (Q@K^T, P@V)
     #   Task 4            : TMA Load (Q, K, V)
     #
+    # NUM_MMA_GROUPS splits BLOCK_M into 64-row (or larger) MMA groups: 2 for
+    # BLOCK_M >= 128, 1 for BLOCK_M == 64.
+    #
     # Memory hierarchy:
     #   SMEM: Q tiles (split), K tiles, V tiles (double buffered)
     #   TMEM: QK scores, P values, accumulator, alpha/l/m corrections
@@ -45,7 +48,7 @@
     # TMA descriptors
     desc_q = tl.make_tensor_descriptor(
         base=Q, shape=[Q_LEN, QK_HEAD_DIM], strides=[stride_qm, 1],
-        block_shape=[BLOCK_M // 2, QK_HEAD_DIM_ROUNDED],
+        block_shape=[BLOCK_M // NUM_MMA_GROUPS, QK_HEAD_DIM_ROUNDED],
     )
     desc_k = tl.make_tensor_descriptor(
         base=K, shape=[KV_LEN, QK_HEAD_DIM], strides=[stride_kn, 1],
@@ -71,7 +74,7 @@
     sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
 
     # ===================== CONSTANTS =====================
-    NUM_MMA_GROUPS: tl.constexpr = 2
+    tl.static_assert(NUM_MMA_GROUPS == 1 or NUM_MMA_GROUPS == 2)
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     NUM_KV_BUFFERS: tl.constexpr = 2
     NUM_QK_BUFFERS: tl.constexpr = 1
@@ -141,10 +144,14 @@
             for cid in tl.static_range(NUM_MMA_GROUPS):
                 tlx.barrier_wait(l_fulls[cid], 0)
                 l_val = tlx.local_load(l_smem[cid])
+                l_val = tl.where(l_val == 0.0, 1.0, l_val)
                 m_val = tlx.local_load(m_smem[cid])
 
-                tlx.barrier_wait(acc_empties[cid], 0)
-                acc_val = tlx.local_load(acc_tmem[cid])
+                if total_blocks > 0:
+                    tlx.barrier_wait(acc_empties[cid], 0)
+                    acc_val = tlx.local_load(acc_tmem[cid])
+                else:
+                    acc_val = tl.zeros([BLOCK_M_SPLIT, V_HEAD_DIM_ROUNDED], tl.float32)
                 acc_val = acc_val / l_val
                 lse_val = tl.reshape(m_val, [BLOCK_M_SPLIT]) + tl.math.log2(tl.reshape(l_val, [BLOCK_M_SPLIT]))
 
@@ -349,85 +356,110 @@
                 fkv_num_blocks_m = tl.load(FULL_KV_NUM_BLKS + sparse_kv_num_blks_offset)
                 total_blocks_m = total_blocks_m + tl.minimum(fkv_num_blocks_m * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
 
-            # Wait for Q to be loaded (ONCE, before the loop)
-            tlx.barrier_wait(q_fulls[0], 0)
-            tlx.barrier_wait(q_fulls[1], 0)
+            for cid in tl.static_range(NUM_MMA_GROUPS):
+                tlx.barrier_wait(q_fulls[cid], 0)
 
-            # ---- Peeled first iteration (block 0) ----
-            accum_cnt_m = 0
-            k_buf = 0
-            v_buf = 0
+            if NUM_MMA_GROUPS == 1:
+                # One group: Q@K[i] then P@V[i]. Q@K[i] waits on P[i-1] (via P@V[i-1]),
+                # so softmax has finished reading QK before it is overwritten.
+                accum_cnt_m = 0
+                acc_init = False
+                for _block in range(0, total_blocks_m):
+                    kv_buf = accum_cnt_m % NUM_KV_BUFFERS
+                    kv_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
+                    qk_phase = accum_cnt_m & 1
 
-            # Q[0]@K[0] → QK[0]
-            tlx.barrier_wait(k_fulls[0], 0)
-            k_t = tlx.local_trans(k_tiles[0])
-            tlx.async_dot(q_tiles[0], k_t, qk_tmem[0], use_acc=False, mBarriers=[qk_fulls[0]])
-            # Q[1]@K[0] → QK[1], release K[0]
-            tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False, mBarriers=[qk_fulls[1], k_empties[0]])
+                    # Q@K[i] -> QK, release K[i]
+                    tlx.barrier_wait(k_fulls[kv_buf], kv_phase)
+                    k_t = tlx.local_trans(k_tiles[kv_buf])
+                    tlx.async_dot(q_tiles[0], k_t, qk_tmem[0], use_acc=False,
+                                  mBarriers=[qk_fulls[0], k_empties[kv_buf]])
 
-            # P[0]@V[0] → acc[0] (first write, use_acc=False)
-            tlx.barrier_wait(v_fulls[0], 0)
-            tlx.barrier_wait(p_fulls[0], 0)
-            tlx.barrier_wait(acc_fulls[0], 0)
-            tlx.async_dot(p_tmem[0], v_tiles[0], acc_tmem[0], use_acc=False, force_async=True)
+                    # P@V[i] -> acc, release V[i]
+                    tlx.barrier_wait(v_fulls[kv_buf], kv_phase)
+                    tlx.barrier_wait(p_fulls[0], qk_phase)
+                    tlx.barrier_wait(acc_fulls[0], qk_phase)
+                    tlx.async_dot(p_tmem[0], v_tiles[kv_buf], acc_tmem[0],
+                                  use_acc=acc_init, mBarriers=[v_empties[kv_buf]])
+                    acc_init = True
+                    accum_cnt_m += 1
+                if total_blocks_m > 0:
+                    tlx.tcgen05_commit(acc_empties[0])
+            elif total_blocks_m > 0:
+                # ---- Peeled first iteration (block 0) ----
+                accum_cnt_m = 0
+                k_buf = 0
+                v_buf = 0
 
-            acc1_init = False
-
-            # ---- Interleaved loop (blocks 1..N-1) ----
-            for _block in range(1, total_blocks_m):
-                v_buf_prev = accum_cnt_m % NUM_KV_BUFFERS
-                qk_phase_prev = accum_cnt_m & 1
-
-                accum_cnt_m = accum_cnt_m + 1
-                k_buf = accum_cnt_m % NUM_KV_BUFFERS
-                v_buf = accum_cnt_m % NUM_KV_BUFFERS
-                k_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
-                qk_phase = accum_cnt_m & 1
-
-                # Q[0]@K[i] → QK[0]
-                tlx.barrier_wait(k_fulls[k_buf], k_phase)
-                k_t = tlx.local_trans(k_tiles[k_buf])
+                # Q[0]@K[0] → QK[0]
+                tlx.barrier_wait(k_fulls[0], 0)
+                k_t = tlx.local_trans(k_tiles[0])
                 tlx.async_dot(q_tiles[0], k_t, qk_tmem[0], use_acc=False, mBarriers=[qk_fulls[0]])
+                # Q[1]@K[0] → QK[1], release K[0]
+                tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False, mBarriers=[qk_fulls[1], k_empties[0]])
 
-                # P[1]@V[i-1] → acc[1] (INTERLEAVED from previous iteration!)
-                tlx.barrier_wait(p_fulls[1], qk_phase_prev)
-                tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
-                tlx.async_dot(p_tmem[1], v_tiles[v_buf_prev], acc_tmem[1],
-                              use_acc=acc1_init, mBarriers=[v_empties[v_buf_prev]])
-                acc1_init = True
+                # P[0]@V[0] → acc[0] (first write, use_acc=False)
+                tlx.barrier_wait(v_fulls[0], 0)
+                tlx.barrier_wait(p_fulls[0], 0)
+                tlx.barrier_wait(acc_fulls[0], 0)
+                tlx.async_dot(p_tmem[0], v_tiles[0], acc_tmem[0], use_acc=False, force_async=True)
 
-                # Q[1]@K[i] → QK[1], release K[i]
-                tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False,
-                              mBarriers=[qk_fulls[1], k_empties[k_buf]])
+                acc1_init = False
 
-                # P[0]@V[i] → acc[0] (accumulate)
-                v_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
-                tlx.barrier_wait(v_fulls[v_buf], v_phase)
-                tlx.barrier_wait(p_fulls[0], qk_phase)
-                tlx.barrier_wait(acc_fulls[0], qk_phase)
-                tlx.async_dot(p_tmem[0], v_tiles[v_buf], acc_tmem[0],
-                              use_acc=True, force_async=True)
+                # ---- Interleaved loop (blocks 1..N-1) ----
+                for _block in range(1, total_blocks_m):
+                    v_buf_prev = accum_cnt_m % NUM_KV_BUFFERS
+                    qk_phase_prev = accum_cnt_m & 1
 
-            # ---- Cleanup: final P[1]@V[last] ----
-            qk_phase = accum_cnt_m & 1
-            tlx.tcgen05_commit(acc_empties[0])
+                    accum_cnt_m = accum_cnt_m + 1
+                    k_buf = accum_cnt_m % NUM_KV_BUFFERS
+                    v_buf = accum_cnt_m % NUM_KV_BUFFERS
+                    k_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
+                    qk_phase = accum_cnt_m & 1
 
-            tlx.barrier_wait(p_fulls[1], qk_phase)
-            tlx.barrier_wait(acc_fulls[1], qk_phase)
-            tlx.async_dot(p_tmem[1], v_tiles[v_buf], acc_tmem[1],
-                          use_acc=acc1_init,
-                          mBarriers=[acc_empties[1], v_empties[v_buf]])
+                    # Q[0]@K[i] → QK[0]
+                    tlx.barrier_wait(k_fulls[k_buf], k_phase)
+                    k_t = tlx.local_trans(k_tiles[k_buf])
+                    tlx.async_dot(q_tiles[0], k_t, qk_tmem[0], use_acc=False, mBarriers=[qk_fulls[0]])
+
+                    # P[1]@V[i-1] → acc[1] (INTERLEAVED from previous iteration!)
+                    tlx.barrier_wait(p_fulls[1], qk_phase_prev)
+                    tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
+                    tlx.async_dot(p_tmem[1], v_tiles[v_buf_prev], acc_tmem[1],
+                                  use_acc=acc1_init, mBarriers=[v_empties[v_buf_prev]])
+                    acc1_init = True
+
+                    # Q[1]@K[i] → QK[1], release K[i]
+                    tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False,
+                                  mBarriers=[qk_fulls[1], k_empties[k_buf]])
+
+                    # P[0]@V[i] → acc[0] (accumulate)
+                    v_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
+                    tlx.barrier_wait(v_fulls[v_buf], v_phase)
+                    tlx.barrier_wait(p_fulls[0], qk_phase)
+                    tlx.barrier_wait(acc_fulls[0], qk_phase)
+                    tlx.async_dot(p_tmem[0], v_tiles[v_buf], acc_tmem[0],
+                                  use_acc=True, force_async=True)
+
+                # ---- Cleanup: final P[1]@V[last] ----
+                qk_phase = accum_cnt_m & 1
+                tlx.tcgen05_commit(acc_empties[0])
+
+                tlx.barrier_wait(p_fulls[1], qk_phase)
+                tlx.barrier_wait(acc_fulls[1], qk_phase)
+                tlx.async_dot(p_tmem[1], v_tiles[v_buf], acc_tmem[1],
+                              use_acc=acc1_init,
+                              mBarriers=[acc_empties[1], v_empties[v_buf]])
 
         # ================================================================
         # TASK 4: LOAD  (1 warp, TMA loads for Q, K, V)
         # ================================================================
         with tlx.async_task(num_warps=1, registers=24):
-            # Load Q[0] and Q[1] via TMA (once)
+            # Load one Q tile per MMA group via TMA (once)
             q_base = (q_start * BLOCK_M).to(tl.int32)
-            tlx.barrier_expect_bytes(q_fulls[0], dtype_bytes * BLOCK_M_SPLIT * QK_HEAD_DIM_ROUNDED)
-            tlx.async_descriptor_load(desc_q, q_tiles[0], [q_base, 0], q_fulls[0])
-            tlx.barrier_expect_bytes(q_fulls[1], dtype_bytes * BLOCK_M_SPLIT * QK_HEAD_DIM_ROUNDED)
-            tlx.async_descriptor_load(desc_q, q_tiles[1], [q_base + BLOCK_M_SPLIT, 0], q_fulls[1])
+            for cid in tl.static_range(NUM_MMA_GROUPS):
+                tlx.barrier_expect_bytes(q_fulls[cid], dtype_bytes * BLOCK_M_SPLIT * QK_HEAD_DIM_ROUNDED)
+                tlx.async_descriptor_load(desc_q, q_tiles[cid], [q_base + cid * BLOCK_M_SPLIT, 0], q_fulls[cid])
 
             # Sparse indices for load
             kv_indices_ld = KV_IDX + sparse_kv_idx_offset

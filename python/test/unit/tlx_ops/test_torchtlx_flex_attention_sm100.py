@@ -53,18 +53,19 @@ def test_flex_adapter_preserves_blackwell_choice_space(monkeypatch, benchmark):
         choices.append(kwargs)
 
     monkeypatch.setattr(templates, "_use_amd_flex_template", lambda: False)
-    monkeypatch.setattr(templates, "current_target", lambda: SimpleNamespace(num_sms=148))
+    monkeypatch.setattr(templates, "current_target", lambda: SimpleNamespace(num_sms=148, is_blackwell=True))
+    monkeypatch.setattr(torch._inductor.utils, "can_use_tma", lambda *args: True)
     monkeypatch.setattr(templates, "blackwell_flex_attention_template", SimpleNamespace(maybe_append_choice=append))
     configs = [
         SimpleNamespace(block_m=m, block_n=n, num_warps=w, num_stages=s)
         for m, n, w, s in ((128, 64, 4, 2), (256, 128, 8, 3))
     ]
-    query = SimpleNamespace(get_size=lambda: [8, 16, 4096, 128])
+    query = SimpleNamespace(get_size=lambda: [8, 16, 4096, 128], get_dtype=lambda: torch.bfloat16)
     choices = ["stock"]
     with benchmark.flex_adapter(), config.patch({"triton.tlx_mode": "force", "max_autotune": False}):
-        config.inductor_choices_class().append_flex_attention_choices(choices, configs, [query] + [object()] * 8,
+        config.inductor_choices_class().append_flex_attention_choices(choices, configs, [query] * 3 + [object()] * 6,
                                                                       [object(), object()], object(), {}, 256, 128)
-    assert [(c["BLOCK_M"], c["BLOCK_N"], c["num_warps"], c["num_stages"]) for c in choices] == [(128, 64, 4, 2),
-                                                                                                (256, 128, 8, 3)]
+    assert [(c["BLOCK_M"], c["BLOCK_N"], c["num_warps"], c["num_stages"]) for c in choices] == [(128, 64, 4, 1),
+                                                                                                (256, 128, 8, 1)]
     assert all(c["USE_TMA"] and c["NUM_SMS"] == 148 for c in choices)
     assert all("waves_per_eu" not in c and "matrix_instr_nonkdim" not in c for c in choices)
