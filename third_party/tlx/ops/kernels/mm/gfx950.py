@@ -2032,9 +2032,62 @@ def _wg_plan(m, n, k):
 
 # Register-staged wave-grid kernels.
 @triton.jit
+def _apply_fused_bias(
+    value,
+    bias_ptr,
+    rows,
+    cols,
+    stride_bias_m,
+    stride_bias_n,
+    mask,
+    ADD_BIAS: tl.constexpr,
+):
+    if ADD_BIAS:
+        bias = tl.load(
+            bias_ptr + rows[:, None] * stride_bias_m + cols[None, :] * stride_bias_n,
+            mask=mask,
+            other=0.0,
+        )
+        value += bias.to(tl.float32)
+    return value
+
+
+@triton.jit
+def _apply_fused_bias_column_broadcast(
+    value,
+    bias_ptr,
+    rows,
+    cols,
+    stride_bias_m,
+    stride_bias_n,
+    m: tl.constexpr,
+    mask,
+    ADD_BIAS: tl.constexpr,
+):
+    if ADD_BIAS and stride_bias_n == 0:
+        bias = tl.load(
+            bias_ptr + rows * stride_bias_m,
+            mask=rows < m,
+            other=0.0,
+        )
+        return value + bias[:, None].to(tl.float32)
+    return _apply_fused_bias(
+        value,
+        bias_ptr,
+        rows,
+        cols,
+        stride_bias_m,
+        stride_bias_n,
+        mask,
+        ADD_BIAS,
+    )
+
+
+@triton.jit
 def _wg_kernel_register_mi16_wave_grid(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -2043,6 +2096,8 @@ def _wg_kernel_register_mi16_wave_grid(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     MI_WAVE_TILE_M: tl.constexpr,
@@ -2050,6 +2105,7 @@ def _wg_kernel_register_mi16_wave_grid(
     WARPS_M: tl.constexpr,
     WARPS_N: tl.constexpr,
     PREFETCH_NEXT: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Short-K MI16 grid whose global loads directly produce dot operands."""
     block_k: tl.constexpr = 32
@@ -2164,19 +2220,30 @@ def _wg_kernel_register_mi16_wave_grid(
             ])
 
     for row in tl.static_range(MI_WAVE_TILE_M):
+        output_mask = (rows[row][:, None] < M) & (cols[None, :] < N)
+        value = _apply_fused_bias(
+            accumulators[row],
+            bias_ptr,
+            rows[row],
+            cols,
+            stride_bias_m,
+            stride_bias_n,
+            output_mask,
+            ADD_BIAS,
+        )
         output_ptrs = tlx.require_layout(
             c_ptr + rows[row][:, None] * stride_cm + cols[None, :] * stride_cn,
             mma,
             pin=False,
         )
         output_mask = tlx.require_layout(
-            (rows[row][:, None] < M) & (cols[None, :] < N),
+            output_mask,
             mma,
             pin=False,
         )
         tl.store(
             output_ptrs,
-            accumulators[row].to(c_ptr.dtype.element_ty),
+            value.to(c_ptr.dtype.element_ty),
             mask=output_mask,
         )
 
@@ -2185,6 +2252,7 @@ def _wg_kernel_register_mi16_wave_grid(
 def _wg_kernel_register_split_m2(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -2193,12 +2261,15 @@ def _wg_kernel_register_split_m2(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     M_HEAD: tl.constexpr,
     M_TAIL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Register-staged GEMM with two reusable power-of-two M fragments."""
     block_m: tl.constexpr = M_HEAD + M_TAIL
@@ -2278,15 +2349,37 @@ def _wg_kernel_register_split_m2(
 
     head_ptrs = (c_ptr + head_rows[:, None] * stride_cm + cols[None, :] * stride_cn)
     tail_ptrs = (c_ptr + tail_rows[:, None] * stride_cm + cols[None, :] * stride_cn)
+    head_mask = (head_rows[:, None] < M) & (cols[None, :] < N)
+    tail_mask = (tail_rows[:, None] < M) & (cols[None, :] < N)
+    acc_head = _apply_fused_bias(
+        acc_head,
+        bias_ptr,
+        head_rows,
+        cols,
+        stride_bias_m,
+        stride_bias_n,
+        head_mask,
+        ADD_BIAS,
+    )
+    acc_tail = _apply_fused_bias(
+        acc_tail,
+        bias_ptr,
+        tail_rows,
+        cols,
+        stride_bias_m,
+        stride_bias_n,
+        tail_mask,
+        ADD_BIAS,
+    )
     tl.store(
         head_ptrs,
         acc_head.to(c_ptr.dtype.element_ty),
-        mask=(head_rows[:, None] < M) & (cols[None, :] < N),
+        mask=head_mask,
     )
     tl.store(
         tail_ptrs,
         acc_tail.to(c_ptr.dtype.element_ty),
-        mask=(tail_rows[:, None] < M) & (cols[None, :] < N),
+        mask=tail_mask,
     )
 
 
@@ -2294,6 +2387,7 @@ def _wg_kernel_register_split_m2(
 def _wg_kernel_register_split_m3(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -2302,6 +2396,8 @@ def _wg_kernel_register_split_m3(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     M0: tl.constexpr,
@@ -2309,6 +2405,7 @@ def _wg_kernel_register_split_m3(
     M2: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Three-fragment form of the shared-B register pipeline."""
     block_m: tl.constexpr = M0 + M1 + M2
@@ -2345,20 +2442,26 @@ def _wg_kernel_register_split_m3(
         acc1 = tl.dot(a1, b_value, acc1, allow_tf32=False, out_dtype=tl.float32)
         acc2 = tl.dot(a2, b_value, acc2, allow_tf32=False, out_dtype=tl.float32)
 
+    mask0 = (rows0[:, None] < M) & (cols[None, :] < N)
+    mask1 = (rows1[:, None] < M) & (cols[None, :] < N)
+    mask2 = (rows2[:, None] < M) & (cols[None, :] < N)
+    acc0 = _apply_fused_bias(acc0, bias_ptr, rows0, cols, stride_bias_m, stride_bias_n, mask0, ADD_BIAS)
+    acc1 = _apply_fused_bias(acc1, bias_ptr, rows1, cols, stride_bias_m, stride_bias_n, mask1, ADD_BIAS)
+    acc2 = _apply_fused_bias(acc2, bias_ptr, rows2, cols, stride_bias_m, stride_bias_n, mask2, ADD_BIAS)
     tl.store(
         c_ptr + rows0[:, None] * stride_cm + cols[None, :] * stride_cn,
         acc0.to(c_ptr.dtype.element_ty),
-        mask=(rows0[:, None] < M) & (cols[None, :] < N),
+        mask=mask0,
     )
     tl.store(
         c_ptr + rows1[:, None] * stride_cm + cols[None, :] * stride_cn,
         acc1.to(c_ptr.dtype.element_ty),
-        mask=(rows1[:, None] < M) & (cols[None, :] < N),
+        mask=mask1,
     )
     tl.store(
         c_ptr + rows2[:, None] * stride_cm + cols[None, :] * stride_cn,
         acc2.to(c_ptr.dtype.element_ty),
-        mask=(rows2[:, None] < M) & (cols[None, :] < N),
+        mask=mask2,
     )
 
 
@@ -13212,6 +13315,7 @@ def _wg_mi32_direct_pgr2_step(
 def _wg_kernel_regular_mi32_wave_grid(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -13220,6 +13324,8 @@ def _wg_kernel_regular_mi32_wave_grid(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     MI_WAVE_TILE_M: tl.constexpr,
@@ -13228,6 +13334,7 @@ def _wg_kernel_regular_mi32_wave_grid(
     WARPS_N: tl.constexpr,
     DIRECT_TO_LDS: tl.constexpr,
     DIRECT_CHUNK: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Regular MI32 wave grid with a parameterized one-stage K64 pipeline."""
     BLOCK_K: tl.constexpr = 64
@@ -13601,13 +13708,24 @@ def _wg_kernel_regular_mi32_wave_grid(
                 accumulators[row * b_group_count + group],
                 mma,
                 pin=False,
-            )).to(c_ptr.dtype.element_ty)
+            ))
+            mask = (rows[:, None] < M) & (cols[None, :] < N)
+            value = _apply_fused_bias(
+                value,
+                bias_ptr,
+                rows,
+                cols,
+                stride_bias_m,
+                stride_bias_n,
+                mask,
+                ADD_BIAS,
+            ).to(c_ptr.dtype.element_ty)
             ptrs = (c_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn)
             if use_output_mask:
                 tl.store(
                     ptrs,
                     value,
-                    mask=(rows[:, None] < M) & (cols[None, :] < N),
+                    mask=mask,
                 )
             else:
                 tl.store(ptrs, value)
@@ -13616,11 +13734,14 @@ def _wg_kernel_regular_mi32_wave_grid(
 @triton.jit
 def _wg_store_mi16_wave_grid_output(
     c_ptr,
+    bias_ptr,
     accumulators,
     pid_m,
     pid_n,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     m: tl.constexpr,
     n: tl.constexpr,
     block_m: tl.constexpr,
@@ -13633,27 +13754,41 @@ def _wg_store_mi16_wave_grid_output(
     wide_epilogue: tl.constexpr,
     use_mask: tl.constexpr,
     mma: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
     accumulators_committed: tl.constexpr = False,
     store_cache: tl.constexpr = "",
+    prefetched_bias=None,
+    PREFETCH_BIAS: tl.constexpr = False,
+    FUSED_GROUP_FRAGMENTS: tl.constexpr = 2,
 ):
     """Commit and store one regular MI16 accumulator grid."""
     use_wide_epilogue: tl.constexpr = (wide_epilogue and stride_cn == 1
                                        and a_group_m * stride_cm + N_GROUP_FRAGMENTS * TILE * stride_cn < 1 << 30)
-    use_permlane_epilogue: tl.constexpr = (m == 2_496 and n == 22_528 and block_m == 192 and block_n == 128
-                                           and a_group_m == 32 and b_group_n == 32 and a_row_count == 6
-                                           and b_group_count == 4 and stride_cn == 1)
+    use_permlane_epilogue: tl.constexpr = (not ADD_BIAS and m == 2_496 and n == 22_528 and block_m == 192
+                                           and block_n == 128 and a_group_m == 32 and b_group_n == 32
+                                           and a_row_count == 6 and b_group_count == 4 and stride_cn == 1)
+    fused_group_fragments: tl.constexpr = FUSED_GROUP_FRAGMENTS
+    commit_row_wise: tl.constexpr = row_wise or (ADD_BIAS and use_wide_epilogue)
     if tl.cdiv(m, block_m) * block_m * stride_cm + tl.cdiv(n, block_n) * block_n * stride_cn >= 1 << 30:
         pid_m = pid_m.to(tl.int64)
         pid_n = pid_n.to(tl.int64)
-    if not row_wise:
+    if not commit_row_wise:
         if not accumulators_committed:
             accumulators = tlx.amd_mfma_commit(
                 tl.tuple([
                     tlx.require_layout(accumulators[index], mma, pin=False)
                     for index in range(a_row_count * b_group_count)
                 ]))
+    if ADD_BIAS and stride_bias_n == 0:
+        row_biases = tl.tuple([
+            tl.load(
+                bias_ptr + (pid_m * block_m + row * a_group_m + tl.arange(0, a_group_m)) * stride_bias_m,
+                mask=pid_m * block_m + row * a_group_m + tl.arange(0, a_group_m) < m,
+                other=0.0,
+            ).to(tl.float32) for row in range(a_row_count)
+        ])
     for row in tl.static_range(a_row_count):
-        if row_wise and not accumulators_committed:
+        if commit_row_wise and not accumulators_committed:
             row_values = tlx.amd_mfma_commit(
                 tl.tuple([
                     tlx.require_layout(
@@ -13665,6 +13800,8 @@ def _wg_store_mi16_wave_grid_output(
         else:
             row_values = tl.tuple([accumulators[row * b_group_count + group] for group in range(b_group_count)])
         rows = (pid_m * block_m + row * a_group_m + tl.arange(0, a_group_m))
+        if ADD_BIAS and stride_bias_n == 0:
+            row_bias = row_biases[row]
         if use_permlane_epilogue:
             for wide_group in tl.static_range(b_group_count // 2):
                 local_rows = tl.arange(0, a_group_m)
@@ -13698,6 +13835,45 @@ def _wg_store_mi16_wave_grid_output(
                         tlx.buffer_store(value, c_base, offsets, mask=permlane_mask, cache=store_cache)
                 else:
                     tlx.buffer_store(value, c_base, offsets, contiguity=8, cache=store_cache)
+        elif use_wide_epilogue and ADD_BIAS:
+            tl.static_assert(a_group_m == TILE)
+            tl.static_assert(b_group_n == TILE)
+            for wide_group in tl.static_range(b_group_count // fused_group_fragments):
+                local_cols = tl.arange(0, fused_group_fragments * TILE)
+                cols = pid_n * block_n + wide_group * fused_group_fragments * b_group_n + local_cols
+                committed = tl.tuple([
+                    tlx.require_layout(
+                        row_values[wide_group * fused_group_fragments + index],
+                        mma,
+                        pin=False,
+                    ) for index in range(fused_group_fragments)
+                ])
+                value = tl.cat(committed[0], committed[1], dim=1)
+                if fused_group_fragments == 4:
+                    value = tl.cat(value, tl.cat(committed[2], committed[3], dim=1), dim=1)
+                mask = (rows[:, None] < m) & (cols[None, :] < n)
+                if PREFETCH_BIAS:
+                    value += prefetched_bias[wide_group].to(tl.float32)
+                elif stride_bias_n == 0:
+                    value += row_bias[:, None]
+                else:
+                    value = _apply_fused_bias_column_broadcast(
+                        value,
+                        bias_ptr,
+                        rows,
+                        cols,
+                        stride_bias_m,
+                        stride_bias_n,
+                        m,
+                        mask,
+                        ADD_BIAS,
+                    )
+                value = value.to(c_ptr.dtype.element_ty)
+                ptrs = c_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn
+                if use_mask:
+                    tl.store(ptrs, value, mask=mask, cache_modifier=store_cache)
+                else:
+                    tl.store(ptrs, value, cache_modifier=store_cache)
         elif use_wide_epilogue:
             tl.static_assert(a_group_m == TILE)
             tl.static_assert(b_group_n == TILE)
@@ -13728,6 +13904,18 @@ def _wg_store_mi16_wave_grid_output(
                     dim=1,
                 )
                 value = tl.cat(lo, hi, dim=1)
+                wide_mask = (rows[:, None] < m) & (cols[None, :] < n)
+                value = _apply_fused_bias_column_broadcast(
+                    value,
+                    bias_ptr,
+                    rows,
+                    cols,
+                    stride_bias_m,
+                    stride_bias_n,
+                    m,
+                    wide_mask,
+                    ADD_BIAS,
+                )
                 value = tlx.require_layout(
                     value.to(c_ptr.dtype.element_ty),
                     _C_STORE_32X128_LAYOUT,
@@ -13739,20 +13927,33 @@ def _wg_store_mi16_wave_grid_output(
                     if full_region:
                         tlx.buffer_store(value, c_base, offsets, contiguity=8, cache=store_cache)
                     else:
-                        wide_mask = (rows[:, None] < m) & (cols[None, :] < n)
                         wide_mask = tlx.require_layout(wide_mask, _C_STORE_32X128_LAYOUT, pin=False)
                         tlx.buffer_store(value, c_base, offsets, mask=wide_mask, cache=store_cache)
                 else:
                     tlx.buffer_store(value, c_base, offsets, contiguity=8, cache=store_cache)
         for group in tl.static_range(
-            (b_group_count // N_GROUP_FRAGMENTS * N_GROUP_FRAGMENTS if use_wide_epilogue else 0),
+            (b_group_count // (fused_group_fragments if ADD_BIAS else N_GROUP_FRAGMENTS) *
+             (fused_group_fragments if ADD_BIAS else N_GROUP_FRAGMENTS) if use_wide_epilogue else 0),
                 b_group_count,
         ):
             cols = (pid_n * block_n + group * b_group_n + tl.arange(0, b_group_n))
             ptrs = (c_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn)
-            value = row_values[group].to(c_ptr.dtype.element_ty)
+            fragment_mask = (rows[:, None] < m) & (cols[None, :] < n)
+            if ADD_BIAS and stride_bias_n == 0:
+                value = (row_values[group] + row_bias[:, None]).to(c_ptr.dtype.element_ty)
+            else:
+                value = _apply_fused_bias_column_broadcast(
+                    row_values[group],
+                    bias_ptr,
+                    rows,
+                    cols,
+                    stride_bias_m,
+                    stride_bias_n,
+                    m,
+                    fragment_mask,
+                    ADD_BIAS,
+                ).to(c_ptr.dtype.element_ty)
             if use_mask:
-                fragment_mask = (rows[:, None] < m) & (cols[None, :] < n)
                 tl.store(
                     ptrs,
                     value,
@@ -13782,11 +13983,14 @@ def _wg_cached_b_tile_coords(tile, tile_count: tl.constexpr, grid_m: tl.constexp
 @triton.jit
 def _wg_store_cached_b_output(
     c_ptr,
+    bias_ptr,
     accumulators,
     pid_m,
     pid_n,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     M: tl.constexpr,
     N: tl.constexpr,
     block_m: tl.constexpr,
@@ -13796,6 +14000,10 @@ def _wg_store_cached_b_output(
     warps_m: tl.constexpr,
     mma: tl.constexpr,
     wide: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+    prefetched_bias,
+    PREFETCH_BIAS: tl.constexpr,
+    FUSED_GROUP_FRAGMENTS: tl.constexpr,
 ):
     group_m: tl.constexpr = 16 * warps_m
     if warps_m == 4 and wide:
@@ -13821,17 +14029,57 @@ def _wg_store_cached_b_output(
                 cols = tl.arange(0, 128)
                 offsets = tlx.require_layout(rows[:, None] * stride_cm + cols[None, :] * stride_cn, store_layout,
                                              pin=False)
+                global_rows = row_base + rows
+                global_cols = col_base + cols
+                mask = (global_rows[:, None] < M) & (global_cols[None, :] < N)
+                value = _apply_fused_bias(
+                    value,
+                    bias_ptr,
+                    global_rows,
+                    global_cols,
+                    stride_bias_m,
+                    stride_bias_n,
+                    mask,
+                    ADD_BIAS,
+                )
                 value = tlx.require_layout(value.to(c_ptr.dtype.element_ty), store_layout)
                 tlx.buffer_store(value, base, offsets, contiguity=8, cache=".cs")
     else:
-        _wg_store_mi16_wave_grid_output(c_ptr, accumulators, pid_m, pid_n, stride_cm, stride_cn, M, N, block_m, block_n,
-                                        group_m, 32, mi_m, mi_n, False, wide, False, mma, store_cache=".cs")
+        _wg_store_mi16_wave_grid_output(
+            c_ptr,
+            bias_ptr,
+            accumulators,
+            pid_m,
+            pid_n,
+            stride_cm,
+            stride_cn,
+            stride_bias_m,
+            stride_bias_n,
+            M,
+            N,
+            block_m,
+            block_n,
+            group_m,
+            32,
+            mi_m,
+            mi_n,
+            False,
+            wide,
+            False,
+            mma,
+            ADD_BIAS,
+            store_cache=".cs",
+            prefetched_bias=prefetched_bias,
+            PREFETCH_BIAS=PREFETCH_BIAS,
+            FUSED_GROUP_FRAGMENTS=FUSED_GROUP_FRAGMENTS,
+        )
 
 
 @triton.jit
 def _wg_kernel_cached_b_lds(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -13840,6 +14088,8 @@ def _wg_kernel_cached_b_lds(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     MI_WAVE_TILE_M: tl.constexpr,
@@ -13848,6 +14098,9 @@ def _wg_kernel_cached_b_lds(
     PROGRAM_COUNT: tl.constexpr,
     GROUP_M: tl.constexpr,
     WIDE: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+    PREFETCH_BIAS: tl.constexpr,
+    FUSED_GROUP_FRAGMENTS: tl.constexpr,
 ):
     tl.static_assert(K % 64 == 0 and K >= 128 and K <= 256)
     tl.static_assert(WARPS_M == 2 or WARPS_M == 4)
@@ -13871,6 +14124,20 @@ def _wg_kernel_cached_b_lds(
     ])
     program = tl.program_id(0)
     first_pid_m, pid_n = _wg_cached_b_tile_coords(program, tile_count, grid_m, grid_n, GROUP_M, 1)
+    if PREFETCH_BIAS:
+        bias_rows = tl.arange(0, group_m)
+        bias_width: tl.constexpr = FUSED_GROUP_FRAGMENTS * 32
+        prefetched_bias = tl.tuple([
+            tl.load(
+                bias_ptr + bias_rows[:, None] * stride_bias_m +
+                (pid_n * block_n + group * bias_width + tl.arange(0, bias_width))[None, :] * stride_bias_n,
+                mask=((bias_rows[:, None] < M) &
+                      ((pid_n * block_n + group * bias_width + tl.arange(0, bias_width))[None, :] < N)),
+                other=0.0,
+            ) for group in range(MI_WAVE_TILE_N // FUSED_GROUP_FRAGMENTS)
+        ])
+    else:
+        prefetched_bias = None
     for kb in tl.static_range(K // 64):
         b_values = tl.tuple([
             _wg_wave_grid_global_load_pgr2_b_half(b_ptr, pid_n, kb, group, 0, block_m, block_n, MI_WAVE_TILE_M, 64, 32,
@@ -13923,14 +14190,41 @@ def _wg_kernel_cached_b_lds(
                 _wg_wave_grid_global_load_a(a_ptr, future_pid_m, 0, row, group_m, 32, block_m, 64, stride_am, stride_ak,
                                             M, cache_policy=".ca") for row in range(MI_WAVE_TILE_M)
             ])
-        _wg_store_cached_b_output(c_ptr, accumulators, pid_m, pid_n, stride_cm, stride_cn, M, N, block_m, block_n,
-                                  MI_WAVE_TILE_M, MI_WAVE_TILE_N, WARPS_M, mma, WIDE)
+        _wg_store_cached_b_output(
+            c_ptr,
+            bias_ptr,
+            accumulators,
+            pid_m,
+            pid_n,
+            stride_cm,
+            stride_cn,
+            stride_bias_m,
+            stride_bias_n,
+            M,
+            N,
+            block_m,
+            block_n,
+            MI_WAVE_TILE_M,
+            MI_WAVE_TILE_N,
+            WARPS_M,
+            mma,
+            WIDE,
+            ADD_BIAS,
+            prefetched_bias,
+            PREFETCH_BIAS,
+            FUSED_GROUP_FRAGMENTS,
+        )
 
 
-def _launch_cached_b(a, b, out, plan):
-    wide = out.stride(1) == 1 and out.stride(0) % 8 == 0 and out.data_ptr() % 16 == 0
+def _launch_cached_b(a, b, out, plan, bias=None):
+    wide = (out.stride(1) == 1 and out.stride(0) % 8 == 0 and out.data_ptr() % 16 == 0
+            and (bias is None or plan["WARPS_M"] == 2))
     _wg_kernel_cached_b_lds[(plan["PROGRAM_COUNT"], )](
-        a, b, out, a.shape[0], b.shape[1], a.shape[1], *a.stride(), *b.stride(), *out.stride(), **plan, WIDE=wide,
+        a, b, bias if bias is not None else out, out, a.shape[0], b.shape[1], a.shape[1], *a.stride(), *b.stride(),
+        *(bias.stride() if bias is not None else (0, 0)), *out.stride(), **plan, WIDE=wide, ADD_BIAS=bias is not None,
+        PREFETCH_BIAS=bias is not None and bias.stride(0) == 0 and plan["WARPS_M"] == 2 and wide,
+        FUSED_GROUP_FRAGMENTS=(4 if bias is not None and bias.stride(0) == 0 and
+                               (a.shape[0], b.shape[1], a.shape[1]) == (819_200, 1_024, 192) else 2),
         num_warps=2 * plan["WARPS_M"], num_stages=1, matrix_instr_nonkdim=16, regclass_priority_trumps_globalness=True,
         reverse_local_assignment=True, sink_insts_to_avoid_spills=True, disable_unclustered_high_rp_reschedule=True)
     return out
@@ -14084,6 +14378,7 @@ def _wg_k160_winner_persistent_body(a_ptr, b_ptr, c_ptr, stride_cm: tl.constexpr
 def _wg_kernel_persistent_mi16_wave_grid_generic(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -14092,6 +14387,8 @@ def _wg_kernel_persistent_mi16_wave_grid_generic(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     MI_WAVE_TILE_M: tl.constexpr,
@@ -14103,6 +14400,7 @@ def _wg_kernel_persistent_mi16_wave_grid_generic(
     ROW_WISE_EPILOGUE: tl.constexpr,
     WIDE_EPILOGUE: tl.constexpr,
     PGR2_LATE_READ_COUNT: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Run a compact persistent PGR2 loop over strided output tiles."""
     block_k: tl.constexpr = BLOCK_K
@@ -14400,11 +14698,14 @@ def _wg_kernel_persistent_mi16_wave_grid_generic(
             )
         _wg_store_mi16_wave_grid_output(
             c_ptr,
+            bias_ptr,
             accumulators,
             pid_m,
             pid_n,
             stride_cm,
             stride_cn,
+            stride_bias_m,
+            stride_bias_n,
             M,
             N,
             block_m,
@@ -14417,6 +14718,7 @@ def _wg_kernel_persistent_mi16_wave_grid_generic(
             WIDE_EPILOGUE,
             M % block_m != 0 or N % block_n != 0,
             mma,
+            ADD_BIAS,
         )
 
     tile_id = program + (tiles_per_program - 1) * PROGRAM_COUNT
@@ -14479,11 +14781,14 @@ def _wg_kernel_persistent_mi16_wave_grid_generic(
         )
     _wg_store_mi16_wave_grid_output(
         c_ptr,
+        bias_ptr,
         accumulators,
         pid_m,
         pid_n,
         stride_cm,
         stride_cn,
+        stride_bias_m,
+        stride_bias_n,
         M,
         N,
         block_m,
@@ -14496,6 +14801,7 @@ def _wg_kernel_persistent_mi16_wave_grid_generic(
         WIDE_EPILOGUE,
         M % block_m != 0 or N % block_n != 0,
         mma,
+        ADD_BIAS,
     )
 
 
@@ -14503,6 +14809,7 @@ def _wg_kernel_persistent_mi16_wave_grid_generic(
 def _wg_kernel_persistent_mi16_wave_grid(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -14511,6 +14818,8 @@ def _wg_kernel_persistent_mi16_wave_grid(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     MI_WAVE_TILE_M: tl.constexpr,
@@ -14522,12 +14831,13 @@ def _wg_kernel_persistent_mi16_wave_grid(
     ROW_WISE_EPILOGUE: tl.constexpr,
     WIDE_EPILOGUE: tl.constexpr,
     PGR2_LATE_READ_COUNT: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
     K160_WINNER: tl.constexpr,
 ):
     if K160_WINNER:
         tl.static_assert(M == 2_496 and N == 22_528 and K == 160)
         tl.static_assert(MI_WAVE_TILE_M == 5 and MI_WAVE_TILE_N == 8 and WARPS_M == 2 and WARPS_N == 2)
-        tl.static_assert(BLOCK_K == 32 and PROGRAM_COUNT == 912)
+        tl.static_assert(BLOCK_K == 32 and PROGRAM_COUNT == 912 and not ADD_BIAS)
         tl.static_assert(stride_am == 160 and stride_ak == 1 and stride_bk == 1 and stride_bn == 160)
         tl.static_assert(stride_cm == 22_528 and stride_cn == 1)
         mma: tl.constexpr = tlx.amd_mfma_layout(
@@ -14543,6 +14853,7 @@ def _wg_kernel_persistent_mi16_wave_grid(
         _wg_kernel_persistent_mi16_wave_grid_generic(
             a_ptr,
             b_ptr,
+            bias_ptr,
             c_ptr,
             M,
             N,
@@ -14551,6 +14862,8 @@ def _wg_kernel_persistent_mi16_wave_grid(
             stride_ak,
             stride_bk,
             stride_bn,
+            stride_bias_m,
+            stride_bias_n,
             stride_cm,
             stride_cn,
             MI_WAVE_TILE_M,
@@ -14562,6 +14875,7 @@ def _wg_kernel_persistent_mi16_wave_grid(
             ROW_WISE_EPILOGUE,
             WIDE_EPILOGUE,
             PGR2_LATE_READ_COUNT,
+            ADD_BIAS,
         )
 
 
@@ -14580,6 +14894,7 @@ def _wg_grouped_xcd_program(program, program_count: tl.constexpr, num_xcds: tl.c
 def _wg_kernel_regular_mi16_wave_grid(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -14588,6 +14903,8 @@ def _wg_kernel_regular_mi16_wave_grid(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     MI_WAVE_TILE_M: tl.constexpr,
@@ -14613,6 +14930,7 @@ def _wg_kernel_regular_mi16_wave_grid(
     LOOP_UNROLL_FACTOR: tl.constexpr,
     SPLIT_K: tl.constexpr,
     PAIR_BALANCED_SPLIT_K: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
     XCD_GROUP_SIZE: tl.constexpr = 1,
     EXACT_LDS: tl.constexpr = False,
     DOT_MODE: tl.constexpr = "persistent",
@@ -15935,11 +16253,14 @@ def _wg_kernel_regular_mi16_wave_grid(
                 )
         _wg_store_mi16_wave_grid_output(
             c_ptr,
+            bias_ptr,
             accumulators,
             pid_m,
             pid_n,
             stride_cm,
             stride_cn,
+            stride_bias_m,
+            stride_bias_n,
             M,
             N,
             block_m,
@@ -15952,6 +16273,7 @@ def _wg_kernel_regular_mi16_wave_grid(
             WIDE_EPILOGUE,
             M % block_m != 0 or N % block_n != 0,
             mma,
+            ADD_BIAS,
             single_regular_k64 or (PGR2_OPERANDS and not DIRECT_TO_LDS and DOT_MODE == "logical"),
         )
 
@@ -16024,7 +16346,7 @@ def _wg_streamk_tail_schedule(m, n, k, plan):
     return full_rounds, full_n, tail_split
 
 
-def _wg_launch_streamk_tail(a, b, out, plan, schedule):
+def _wg_launch_streamk_tail(a, b, out, plan, schedule, bias=None):
     """Compose persistent full waves with a deterministic Split-K N tail."""
     full_rounds, full_n, tail_split = schedule
     full_plan = dict(plan)
@@ -16047,12 +16369,14 @@ def _wg_launch_streamk_tail(a, b, out, plan, schedule):
     _wg_matmul(
         a,
         b[:, :full_n],
+        bias=None if bias is None else bias[:, :full_n],
         out=out[:, :full_n],
         _candidate_plan=full_plan,
     )
     _wg_matmul(
         a,
         b[:, full_n:],
+        bias=None if bias is None else bias[:, full_n:],
         out=out[:, full_n:],
         _candidate_plan=tail_plan,
         _split_k=tail_split,
@@ -16066,6 +16390,7 @@ def _wg_matmul(
     a,
     b,
     *,
+    bias=None,
     out=None,
     use_intra_wave_pipeline=True,
     _candidate_plan=None,
@@ -16104,10 +16429,13 @@ def _wg_matmul(
         raise ValueError("output must match the GEMM shape, dtype, and device; "
                          f"got shape={tuple(out.shape)}, dtype={out.dtype}, "
                          f"device={out.device}")
+    if bias is not None:
+        if bias.shape != (m, n) or bias.dtype != a.dtype or bias.device != a.device:
+            raise ValueError("bias must match the GEMM output shape, dtype, and device")
     if _split_k is None:
         streamk_schedule = _wg_streamk_tail_schedule(m, n, k, plan)
         if streamk_schedule is not None:
-            return _wg_launch_streamk_tail(a, b, out, plan, streamk_schedule)
+            return _wg_launch_streamk_tail(a, b, out, plan, streamk_schedule, bias=bias)
     if _split_k is None:
         _split_k = plan.get("split_k", 1)
     if _reduce_tile is None:
@@ -16138,6 +16466,7 @@ def _wg_matmul(
     operands = (
         a,
         b,
+        bias if bias is not None else out,
         out,
         m,
         n,
@@ -16146,12 +16475,14 @@ def _wg_matmul(
         a.stride(1),
         b.stride(0),
         b.stride(1),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
         out.stride(0),
         out.stride(1),
     )
     compiled_key = None
-    if (plan["kind"] == "regular_mi16_wave_grid" and _split_k == 1 and not plan.get("persistent_program_count", 0)
-            and _can_use_wave_grid_compiled_cache()):
+    if (bias is None and plan["kind"] == "regular_mi16_wave_grid" and _split_k == 1
+            and not plan.get("persistent_program_count", 0) and _can_use_wave_grid_compiled_cache()):
         kernel = _wg_kernel_regular_mi16_wave_grid
         try:
             compiled_key = (
@@ -16185,6 +16516,7 @@ def _wg_matmul(
         common = dict(
             BLOCK_N=block_n,
             BLOCK_K=plan["block_k"],
+            ADD_BIAS=bias is not None,
             num_warps=plan["num_warps"],
             num_stages=plan["num_stages"],
             matrix_instr_nonkdim=16,
@@ -16218,6 +16550,7 @@ def _wg_matmul(
             WARPS_M=plan["warps_m"],
             WARPS_N=plan["warps_n"],
             PREFETCH_NEXT=plan.get("prefetch_next", True),
+            ADD_BIAS=bias is not None,
             num_warps=plan["num_warps"],
             num_stages=1,
             matrix_instr_nonkdim=16,
@@ -16256,6 +16589,7 @@ def _wg_matmul(
                 ROW_WISE_EPILOGUE=plan.get("row_wise_epilogue", False),
                 WIDE_EPILOGUE=plan.get("wide_epilogue", False),
                 PGR2_LATE_READ_COUNT=plan.get("pgr2_late_read_count", 0),
+                ADD_BIAS=bias is not None,
                 K160_WINNER=plan.get("k160_winner", False),
                 num_warps=plan["num_warps"],
                 num_stages=1,
@@ -16290,6 +16624,7 @@ def _wg_matmul(
                 a,
                 b,
                 workspace,
+                workspace,
                 m,
                 n,
                 k,
@@ -16297,6 +16632,8 @@ def _wg_matmul(
                 a.stride(1),
                 b.stride(0),
                 b.stride(1),
+                0,
+                0,
                 workspace.stride(0),
                 workspace.stride(1),
             )
@@ -16313,6 +16650,7 @@ def _wg_matmul(
                 WARPS_N=plan["warps_n"],
                 DIRECT_TO_LDS=plan.get("direct_to_lds", False),
                 DIRECT_CHUNK=plan.get("direct_chunk", 32),
+                ADD_BIAS=bias is not None,
                 num_warps=plan["num_warps"],
                 num_stages=1,
                 matrix_instr_nonkdim=32,
@@ -16346,6 +16684,7 @@ def _wg_matmul(
             LOOP_UNROLL_FACTOR=plan.get("loop_unroll_factor", 1),
             SPLIT_K=_split_k,
             PAIR_BALANCED_SPLIT_K=pair_balanced_split_k,
+            ADD_BIAS=bias is not None and _split_k == 1,
             XCD_GROUP_SIZE=plan.get("xcd_group_size", 1),
             EXACT_LDS=plan.get("exact_lds", False),
             DOT_MODE=plan.get("dot_mode", "persistent"),
@@ -16372,19 +16711,19 @@ def _wg_matmul(
             rbm, rbn = _reduce_tile
             _reduce_k_kernel[(triton.cdiv(m, rbm), triton.cdiv(n, rbn))](
                 workspace,
-                out,
+                bias if bias is not None else out,
                 out,
                 m,
                 n,
-                0,
-                0,
+                bias.stride(0) if bias is not None else 0,
+                bias.stride(1) if bias is not None else 0,
                 out.stride(0),
                 out.stride(1),
                 SPLIT_K=_split_k,
                 BLOCK_SIZE_M=rbm,
                 BLOCK_SIZE_N=rbn,
                 OUTPUT_DTYPE=_TORCH_TO_TL[a.dtype],
-                ADD_BIAS=False,
+                ADD_BIAS=bias is not None,
                 num_warps=_reduce_warps,
             )
         return out
@@ -16785,6 +17124,7 @@ def _row_major_direct_remap(program, program_count, num_xcds: tl.constexpr, tile
 def _row_major_direct_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -16795,6 +17135,8 @@ def _row_major_direct_kernel(
     stride_bb,
     stride_bk,
     stride_bn,
+    stride_bias_m,
+    stride_bias_n,
     stride_cb,
     stride_cm,
     stride_cn,
@@ -16807,6 +17149,7 @@ def _row_major_direct_kernel(
     PROGRAM_COUNT: tl.constexpr,
     A_BASES: tl.constexpr,
     B_BASES: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Triple-buffered direct-to-LDS GEMM for dense row-major B."""
     k_tiles = tl.cdiv(K, BLOCK_K)
@@ -16892,15 +17235,26 @@ def _row_major_direct_kernel(
         )
 
     c_ptr += batch_id.to(tl.int64) * stride_cb
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    acc = _apply_fused_bias(
+        acc,
+        bias_ptr,
+        rows,
+        cols,
+        stride_bias_m,
+        stride_bias_n,
+        mask,
+        ADD_BIAS,
+    )
     offsets = c_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn
     tl.store(
         offsets,
         acc.to(c_ptr.dtype.element_ty),
-        mask=(rows[:, None] < M) & (cols[None, :] < N),
+        mask=mask,
     )
 
 
-def _launch_row_major_direct(a, b, out, plan):
+def _launch_row_major_direct(a, b, out, plan, bias=None):
     """Launch one validated dense row-major-B direct-to-LDS plan."""
     m, k = a.shape
     _, n = b.shape
@@ -16917,6 +17271,7 @@ def _launch_row_major_direct(a, b, out, plan):
     _row_major_direct_kernel[grid](
         a,
         b,
+        bias if bias is not None else out,
         out,
         m,
         n,
@@ -16927,12 +17282,15 @@ def _launch_row_major_direct(a, b, out, plan):
         0,
         b.stride(0),
         b.stride(1),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
         0,
         out.stride(0),
         out.stride(1),
         NUM_XCDS=1,
         TILES_PER_PROBLEM=tiles_per_problem,
         PROGRAM_COUNT=program_count,
+        ADD_BIAS=bias is not None,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
         num_stages=1,
         **plan,
@@ -17066,6 +17424,7 @@ _FP16_TUNED_SHAPE_CONFIGS = {
 def _short_k_register_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -17074,8 +17433,11 @@ def _short_k_register_kernel(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Direct-register GEMM for one masked K64 tile."""
     block_m: tl.constexpr = 64
@@ -17105,6 +17467,17 @@ def _short_k_register_kernel(
         other=0.0,
     )
     acc = tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    acc = _apply_fused_bias(
+        acc,
+        bias_ptr,
+        rows,
+        cols,
+        stride_bias_m,
+        stride_bias_n,
+        mask,
+        ADD_BIAS,
+    )
     output_ptrs = (c_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn)
     if M % block_m == 0 and N % block_n == 0:
         tl.store(output_ptrs, acc)
@@ -17112,11 +17485,11 @@ def _short_k_register_kernel(
         tl.store(
             output_ptrs,
             acc,
-            mask=(rows[:, None] < M) & (cols[None, :] < N),
+            mask=mask,
         )
 
 
-def _launch_short_k_register(a, b, *, out=None):
+def _launch_short_k_register(a, b, *, bias=None, out=None):
     """Launch the bounded one-K64 direct-register family."""
     m, k = a.shape
     b_k, n = b.shape
@@ -17128,6 +17501,7 @@ def _launch_short_k_register(a, b, *, out=None):
     _short_k_register_kernel[grid](
         a,
         b,
+        bias if bias is not None else out,
         out,
         m,
         n,
@@ -17136,8 +17510,11 @@ def _launch_short_k_register(a, b, *, out=None):
         a.stride(1),
         b.stride(0),
         b.stride(1),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
         out.stride(0),
         out.stride(1),
+        ADD_BIAS=bias is not None,
         num_warps=1,
         num_stages=1,
         matrix_instr_nonkdim=32,
@@ -17201,6 +17578,7 @@ def _register_kernel_impl(  # noqa: TR001
     CACHE_B_CG: tl.constexpr = False,
     PACK_B_PAIRS: tl.constexpr = False,
     B_PAIRS_PADDED: tl.constexpr = False,
+    OUTPUT_PRECISION_BIAS: tl.constexpr = False,
     XCD_CHUNK_SIZE: tl.constexpr = 4,
     USE_I64_A_OFFSETS: tl.constexpr = False,
     USE_I64_B_OFFSETS: tl.constexpr = False,
@@ -17287,13 +17665,23 @@ def _register_kernel_impl(  # noqa: TR001
     idx_n = cols[None, :]
     mask = (idx_m < M) & (idx_n < N)
     if ADD_BIAS:
-        bias_offsets = idx_m * stride_bias_m + idx_n * stride_bias_n
-        bias = tl.load(
-            bias_ptr + bias_offsets,
-            mask=mask,
-            eviction_policy="evict_last",
-        )
-        acc += bias.to(tl.float32)
+        epilogue_dtype: tl.constexpr = c_ptr.dtype.element_ty if OUTPUT_PRECISION_BIAS else tl.float32
+        if OUTPUT_PRECISION_BIAS:
+            acc = acc.to(epilogue_dtype)
+        if stride_bias_m == 0:
+            bias = tl.load(
+                bias_ptr + cols * stride_bias_n,
+                mask=cols < N,
+                eviction_policy="evict_last",
+            )[None, :]
+        else:
+            bias_offsets = idx_m * stride_bias_m + idx_n * stride_bias_n
+            bias = tl.load(
+                bias_ptr + bias_offsets,
+                mask=mask,
+                eviction_policy="evict_last",
+            )
+        acc += bias.to(epilogue_dtype)
     if tl.cdiv(M, BLOCK_M) * BLOCK_M * stride_cm + tl.cdiv(N, BLOCK_N) * BLOCK_N * stride_cn >= 1 << 30:
         output_offsets = idx_m.to(tl.int64) * stride_cm + idx_n.to(tl.int64) * stride_cn
     else:
@@ -17371,13 +17759,14 @@ def _register_i64_offsets(kernel_args, block_k):
     }
 
 
-def _fragmented_register_kernel_args(a, b, out):
+def _fragmented_register_kernel_args(a, b, bias, out):
     """Return arguments for computing ``(A @ B).T = B.T @ A.T``."""
     m, k = a.shape
     n = b.shape[1]
     return (
         b,
         a,
+        bias.T if bias is not None else out,
         out,
         n,
         m,
@@ -17386,6 +17775,8 @@ def _fragmented_register_kernel_args(a, b, out):
         b.stride(0),
         a.stride(1),
         a.stride(0),
+        bias.stride(1) if bias is not None else 0,
+        bias.stride(0) if bias is not None else 0,
         out.stride(1),
         out.stride(0),
     )
@@ -17401,6 +17792,7 @@ def _fragmented_register_launcher(
     _a_strides,
     _b_strides,
     _out_strides,
+    add_bias,
     plan_items,
 ):
     """Return one signature-exact launcher for a fragmented transposed tile."""
@@ -17414,9 +17806,9 @@ def _fragmented_register_launcher(
     compile_lock = threading.Lock()
     launcher = None
 
-    def run(a, b, out):
+    def run(a, b, bias, out):
         nonlocal launcher
-        kernel_args = _fragmented_register_kernel_args(a, b, out)
+        kernel_args = _fragmented_register_kernel_args(a, b, bias, out)
         if launcher is None:
             with compile_lock:
                 if launcher is None:
@@ -17424,6 +17816,7 @@ def _fragmented_register_launcher(
                         *kernel_args,
                         grid=grid,
                         M_HEAD=block_m - plan["M_TAIL"],
+                        ADD_BIAS=add_bias,
                         **plan,
                     )
                     launcher = compiled[grid]
@@ -17586,17 +17979,18 @@ def _remember_range_register_compiled(cache_key, compiled):
     cache[cache_key] = compiled
 
 
-def _launch_range_register_plan(a, b, *, config, out=None, _use_compiled_cache=None):
+def _launch_range_register_plan(a, b, *, bias=None, config, out=None, _use_compiled_cache=None):
     """Launch one unsplit register configuration from the supported range."""
     m, k = a.shape
     n = b.shape[1]
     if out is None:
         out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    bias_ptr = bias if bias is not None else out
     grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
     runtime_args = (
         a,
         b,
-        out,
+        bias_ptr,
         out,
         out,
         out,
@@ -17607,8 +18001,8 @@ def _launch_range_register_plan(a, b, *, config, out=None, _use_compiled_cache=N
         a.stride(1),
         b.stride(0),
         b.stride(1),
-        0,
-        0,
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
         out.stride(0),
         out.stride(1),
     )
@@ -17619,7 +18013,7 @@ def _launch_range_register_plan(a, b, *, config, out=None, _use_compiled_cache=N
         config["BLOCK_K"],
         config["GROUP_M"],
         config["NUM_XCDS"],
-        False,
+        bias is not None,
         False,
         False,
         launch_options.get("CACHE_A_CG", False),
@@ -17627,8 +18021,9 @@ def _launch_range_register_plan(a, b, *, config, out=None, _use_compiled_cache=N
         launch_options.get("PACK_B_PAIRS", False),
         launch_options.get("B_PAIRS_PADDED", False),
     )
-    use_compiled_cache = (_can_use_range_register_compiled_cache()
-                          if _use_compiled_cache is None else _use_compiled_cache)
+    use_compiled_cache = (
+        bias is None
+        and (_can_use_range_register_compiled_cache() if _use_compiled_cache is None else _use_compiled_cache))
     cache_key = None
     if use_compiled_cache:
         cache_key = _range_register_cache_key(a, b, out, config, launch_options)
@@ -17638,7 +18033,7 @@ def _launch_range_register_plan(a, b, *, config, out=None, _use_compiled_cache=N
             return out
     compiled = _register_kernel_impl[grid](
         *runtime_args,
-        ADD_BIAS=False,
+        ADD_BIAS=bias is not None,
         WRITE_STATS=False,
         IS_RMS_NORM=False,
         **_register_i64_offsets(runtime_args, config["BLOCK_K"]),
@@ -19148,26 +19543,42 @@ def a16w16_8wave(
 
     if SPLIT_K == 1 and not DEFER_EPILOGUE:
         if ADD_BIAS:
-            acc_tl += tl.load(
-                bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_left[None, :],
-                mask=m_top & n_left,
-                other=0.0,
-            ).to(tl.float32)
-            acc_bl += tl.load(
-                bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_left[None, :],
-                mask=m_bot & n_left,
-                other=0.0,
-            ).to(tl.float32)
-            acc_tr += tl.load(
-                bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_right[None, :],
-                mask=m_top & n_right,
-                other=0.0,
-            ).to(tl.float32)
-            acc_br += tl.load(
-                bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_right[None, :],
-                mask=m_bot & n_right,
-                other=0.0,
-            ).to(tl.float32)
+            if stride_bias_m == 0 and ((M >= 8192 and N <= 5120) or (M == 2048 and N == 40192)):
+                bias_left = tl.load(
+                    bias_ptr + stride_bias_n * offs_cn_left,
+                    mask=offs_cn_left < N,
+                    other=0.0,
+                ).to(tl.float32)[None, :]
+                bias_right = tl.load(
+                    bias_ptr + stride_bias_n * offs_cn_right,
+                    mask=offs_cn_right < N,
+                    other=0.0,
+                ).to(tl.float32)[None, :]
+                acc_tl += bias_left
+                acc_bl += bias_left
+                acc_tr += bias_right
+                acc_br += bias_right
+            else:
+                acc_tl += tl.load(
+                    bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_left[None, :],
+                    mask=m_top & n_left,
+                    other=0.0,
+                ).to(tl.float32)
+                acc_bl += tl.load(
+                    bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_left[None, :],
+                    mask=m_bot & n_left,
+                    other=0.0,
+                ).to(tl.float32)
+                acc_tr += tl.load(
+                    bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_right[None, :],
+                    mask=m_top & n_right,
+                    other=0.0,
+                ).to(tl.float32)
+                acc_br += tl.load(
+                    bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_right[None, :],
+                    mask=m_bot & n_right,
+                    other=0.0,
+                ).to(tl.float32)
 
         et = c_ptr.dtype.element_ty
         c_tl = acc_tl.to(et)
@@ -19622,6 +20033,7 @@ def _regular_wave_grid_kernel_args(a, b, out):
         a,
         b,
         out,
+        out,
         m,
         n,
         k,
@@ -19629,6 +20041,8 @@ def _regular_wave_grid_kernel_args(a, b, out):
         a.stride(1),
         b.stride(0),
         b.stride(1),
+        0,
+        0,
         out.stride(0),
         out.stride(1),
     )
@@ -19659,6 +20073,7 @@ def _regular_wave_grid_options(plan, split_k):
         "LOOP_UNROLL_FACTOR": plan.get("loop_unroll_factor", 1),
         "SPLIT_K": split_k,
         "PAIR_BALANCED_SPLIT_K": plan.get("pair_balanced_split_k", False),
+        "ADD_BIAS": False,
         "XCD_GROUP_SIZE": plan.get("xcd_group_size", 1),
         "EXACT_LDS": plan.get("exact_lds", False),
         "DOT_MODE": plan.get("dot_mode", "persistent"),
@@ -20467,6 +20882,7 @@ def _iw_a16w16_8wave(
     HAS_N_TAIL: tl.constexpr,
     PIN_OFFSET_LAYOUT: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
+    OUTPUT_PRECISION_BIAS: tl.constexpr,
     WARPS_M: tl.constexpr,
     WARPS_N: tl.constexpr,
     STORE_CACHE: tl.constexpr = "",
@@ -20870,26 +21286,49 @@ def _iw_a16w16_8wave(
 
     if SPLIT_K == 1 and not DEFER_EPILOGUE:
         if ADD_BIAS:
-            acc_tl += tl.load(
-                bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_left[None, :],
-                mask=m_top & n_left,
-                other=0.0,
-            ).to(tl.float32)
-            acc_bl += tl.load(
-                bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_left[None, :],
-                mask=m_bot & n_left,
-                other=0.0,
-            ).to(tl.float32)
-            acc_tr += tl.load(
-                bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_right[None, :],
-                mask=m_top & n_right,
-                other=0.0,
-            ).to(tl.float32)
-            acc_br += tl.load(
-                bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_right[None, :],
-                mask=m_bot & n_right,
-                other=0.0,
-            ).to(tl.float32)
+            use_output_precision_bias: tl.constexpr = OUTPUT_PRECISION_BIAS and WARPS_M * WARPS_N == 8
+            epilogue_dtype: tl.constexpr = c_ptr.dtype.element_ty if use_output_precision_bias else tl.float32
+            if use_output_precision_bias:
+                acc_tl = acc_tl.to(epilogue_dtype)
+                acc_bl = acc_bl.to(epilogue_dtype)
+                acc_tr = acc_tr.to(epilogue_dtype)
+                acc_br = acc_br.to(epilogue_dtype)
+            if stride_bias_m == 0 and ((M >= 8192 and N <= 5120) or (M == 2048 and N == 40192)):
+                bias_left = tl.load(
+                    bias_ptr + stride_bias_n * offs_cn_left,
+                    mask=offs_cn_left < N,
+                    other=0.0,
+                ).to(epilogue_dtype)[None, :]
+                bias_right = tl.load(
+                    bias_ptr + stride_bias_n * offs_cn_right,
+                    mask=offs_cn_right < N,
+                    other=0.0,
+                ).to(epilogue_dtype)[None, :]
+                acc_tl += bias_left
+                acc_bl += bias_left
+                acc_tr += bias_right
+                acc_br += bias_right
+            else:
+                acc_tl += tl.load(
+                    bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_left[None, :],
+                    mask=m_top & n_left,
+                    other=0.0,
+                ).to(epilogue_dtype)
+                acc_bl += tl.load(
+                    bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_left[None, :],
+                    mask=m_bot & n_left,
+                    other=0.0,
+                ).to(epilogue_dtype)
+                acc_tr += tl.load(
+                    bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_right[None, :],
+                    mask=m_top & n_right,
+                    other=0.0,
+                ).to(epilogue_dtype)
+                acc_br += tl.load(
+                    bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_right[None, :],
+                    mask=m_bot & n_right,
+                    other=0.0,
+                ).to(epilogue_dtype)
 
         # Direct store to C.
         et = c_ptr.dtype.element_ty
@@ -20984,6 +21423,7 @@ def _iw_a16w16_8wave(
 def _iw_matmul_full_tile(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     smem_a_top,
     smem_a_bot,
@@ -20996,6 +21436,8 @@ def _iw_matmul_full_tile(
     stride_ak,
     stride_bk,
     stride_bn,
+    stride_bias_m,
+    stride_bias_n,
     stride_cm,
     stride_cn,
     _iw_BLOCK_M: tl.constexpr,
@@ -21006,6 +21448,7 @@ def _iw_matmul_full_tile(
     M: tl.constexpr,
     N: tl.constexpr,
     c_layout: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Compute and store one complete output tile."""
     HALF_M: tl.constexpr = _iw_BLOCK_M // 2
@@ -21077,26 +21520,70 @@ def _iw_matmul_full_tile(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
             acc_tr = tl.dot(a_top, b_right, acc_tr)
             acc_br = tl.dot(a_bot, b_right, acc_br)
+    mask_tl = (offs_m_top[:, None] < M) & (offs_n_left[None, :] < N)
+    mask_bl = (offs_m_bot[:, None] < M) & (offs_n_left[None, :] < N)
+    mask_tr = (offs_m_top[:, None] < M) & (offs_n_right[None, :] < N)
+    mask_br = (offs_m_bot[:, None] < M) & (offs_n_right[None, :] < N)
+    acc_tl = _apply_fused_bias(
+        acc_tl,
+        bias_ptr,
+        offs_m_top,
+        offs_n_left,
+        stride_bias_m,
+        stride_bias_n,
+        mask_tl,
+        ADD_BIAS,
+    )
+    acc_bl = _apply_fused_bias(
+        acc_bl,
+        bias_ptr,
+        offs_m_bot,
+        offs_n_left,
+        stride_bias_m,
+        stride_bias_n,
+        mask_bl,
+        ADD_BIAS,
+    )
+    acc_tr = _apply_fused_bias(
+        acc_tr,
+        bias_ptr,
+        offs_m_top,
+        offs_n_right,
+        stride_bias_m,
+        stride_bias_n,
+        mask_tr,
+        ADD_BIAS,
+    )
+    acc_br = _apply_fused_bias(
+        acc_br,
+        bias_ptr,
+        offs_m_bot,
+        offs_n_right,
+        stride_bias_m,
+        stride_bias_n,
+        mask_br,
+        ADD_BIAS,
+    )
     et: tl.constexpr = c_ptr.dtype.element_ty
     tl.store(
         c_ptr + offs_m_top[:, None] * stride_cm + offs_n_left[None, :] * stride_cn,
         tlx.require_layout(acc_tl.to(et), c_layout),
-        mask=(offs_m_top[:, None] < M) & (offs_n_left[None, :] < N),
+        mask=mask_tl,
     )
     tl.store(
         c_ptr + offs_m_bot[:, None] * stride_cm + offs_n_left[None, :] * stride_cn,
         tlx.require_layout(acc_bl.to(et), c_layout),
-        mask=(offs_m_bot[:, None] < M) & (offs_n_left[None, :] < N),
+        mask=mask_bl,
     )
     tl.store(
         c_ptr + offs_m_top[:, None] * stride_cm + offs_n_right[None, :] * stride_cn,
         tlx.require_layout(acc_tr.to(et), c_layout),
-        mask=(offs_m_top[:, None] < M) & (offs_n_right[None, :] < N),
+        mask=mask_tr,
     )
     tl.store(
         c_ptr + offs_m_bot[:, None] * stride_cm + offs_n_right[None, :] * stride_cn,
         tlx.require_layout(acc_br.to(et), c_layout),
-        mask=(offs_m_bot[:, None] < M) & (offs_n_right[None, :] < N),
+        mask=mask_br,
     )
 
 
@@ -21128,7 +21615,12 @@ def _iw_wait_for_streamk_partial(locks_ptr, slot, ready_value):
 @triton.jit
 def _iw_reduce_and_store_streamk_quadrant(
     partials_ptr,
+    bias_ptr,
     c_ptrs,
+    rows,
+    cols,
+    stride_bias_m,
+    stride_bias_n,
     first_contributor,
     num_contributors: tl.constexpr,
     partial_off,
@@ -21136,6 +21628,7 @@ def _iw_reduce_and_store_streamk_quadrant(
     acc_layout: tl.constexpr,
     c_layout: tl.constexpr,
     mask,
+    ADD_BIAS: tl.constexpr,
 ):
     """Reduce one quadrant across a tile's contributors and store it."""
     acc = tlx.require_layout(
@@ -21155,6 +21648,16 @@ def _iw_reduce_and_store_streamk_quadrant(
             acc_layout,
             pin=False,
         )
+    acc = _apply_fused_bias(
+        acc,
+        bias_ptr,
+        rows,
+        cols,
+        stride_bias_m,
+        stride_bias_n,
+        mask,
+        ADD_BIAS,
+    )
     tl.store(
         c_ptrs,
         tlx.require_layout(acc.to(c_ptrs.dtype.element_ty), c_layout),
@@ -21166,6 +21669,7 @@ def _iw_reduce_and_store_streamk_quadrant(
 def _iw_streamk_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     partials_ptr,
     locks_ptr,
@@ -21177,6 +21681,8 @@ def _iw_streamk_kernel(
     stride_ak,
     stride_bk,
     stride_bn,
+    stride_bias_m,
+    stride_bias_n,
     stride_cm,
     stride_cn,
     _iw_BLOCK_M: tl.constexpr,
@@ -21195,6 +21701,7 @@ def _iw_streamk_kernel(
     K_PIPE_PAIRS: tl.constexpr,
     UNITS_PER_PROGRAM: tl.constexpr,
     REMAINDER_UNITS: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Persistent full tiles plus owner or distributed Stream-K fixup."""
     tl.static_assert(not HAS_STREAMK or partials_ptr.dtype.element_ty == tl.float32)
@@ -21238,6 +21745,7 @@ def _iw_streamk_kernel(
         _iw_matmul_full_tile(
             a_ptr,
             b_ptr,
+            bias_ptr,
             c_ptr,
             smem_a_top,
             smem_a_bot,
@@ -21250,6 +21758,8 @@ def _iw_streamk_kernel(
             stride_ak,
             stride_bk,
             stride_bn,
+            stride_bias_m,
+            stride_bias_n,
             stride_cm,
             stride_cn,
             _iw_BLOCK_M,
@@ -21260,6 +21770,7 @@ def _iw_streamk_kernel(
             M,
             N,
             C,
+            ADD_BIAS,
         )
     else:
         # General path for both persistent and generic Stream-K.
@@ -21277,6 +21788,7 @@ def _iw_streamk_kernel(
             _iw_matmul_full_tile(
                 a_ptr,
                 b_ptr,
+                bias_ptr,
                 c_ptr,
                 smem_a_top,
                 smem_a_bot,
@@ -21289,6 +21801,8 @@ def _iw_streamk_kernel(
                 stride_ak,
                 stride_bk,
                 stride_bn,
+                stride_bias_m,
+                stride_bias_n,
                 stride_cm,
                 stride_cn,
                 _iw_BLOCK_M,
@@ -21299,6 +21813,7 @@ def _iw_streamk_kernel(
                 M,
                 N,
                 C,
+                ADD_BIAS,
             )
     if not HAS_STREAMK:
         return
@@ -21380,7 +21895,12 @@ def _iw_streamk_kernel(
         if contributor_id == 0:
             _iw_reduce_and_store_streamk_quadrant(
                 partials_ptr,
+                bias_ptr,
                 c_ptr + tail_offs_m_top[:, None] * stride_cm + tail_offs_n_left[None, :] * stride_cn,
+                tail_offs_m_top,
+                tail_offs_n_left,
+                stride_bias_m,
+                stride_bias_n,
                 first_contributor,
                 contributors_per_tile,
                 partial_tl_off,
@@ -21388,11 +21908,17 @@ def _iw_streamk_kernel(
                 acc_layout,
                 C,
                 (tail_offs_m_top[:, None] < M) & (tail_offs_n_left[None, :] < N),
+                ADD_BIAS,
             )
         if contributor_id == bottom_left_owner:
             _iw_reduce_and_store_streamk_quadrant(
                 partials_ptr,
+                bias_ptr,
                 c_ptr + tail_offs_m_bot[:, None] * stride_cm + tail_offs_n_left[None, :] * stride_cn,
+                tail_offs_m_bot,
+                tail_offs_n_left,
+                stride_bias_m,
+                stride_bias_n,
                 first_contributor,
                 contributors_per_tile,
                 partial_bl_off,
@@ -21400,11 +21926,17 @@ def _iw_streamk_kernel(
                 acc_layout,
                 C,
                 (tail_offs_m_bot[:, None] < M) & (tail_offs_n_left[None, :] < N),
+                ADD_BIAS,
             )
         if contributor_id == top_right_owner:
             _iw_reduce_and_store_streamk_quadrant(
                 partials_ptr,
+                bias_ptr,
                 c_ptr + tail_offs_m_top[:, None] * stride_cm + tail_offs_n_right[None, :] * stride_cn,
+                tail_offs_m_top,
+                tail_offs_n_right,
+                stride_bias_m,
+                stride_bias_n,
                 first_contributor,
                 contributors_per_tile,
                 partial_tr_off,
@@ -21412,11 +21944,17 @@ def _iw_streamk_kernel(
                 acc_layout,
                 C,
                 (tail_offs_m_top[:, None] < M) & (tail_offs_n_right[None, :] < N),
+                ADD_BIAS,
             )
         if contributor_id == bottom_right_owner:
             _iw_reduce_and_store_streamk_quadrant(
                 partials_ptr,
+                bias_ptr,
                 c_ptr + tail_offs_m_bot[:, None] * stride_cm + tail_offs_n_right[None, :] * stride_cn,
+                tail_offs_m_bot,
+                tail_offs_n_right,
+                stride_bias_m,
+                stride_bias_n,
                 first_contributor,
                 contributors_per_tile,
                 partial_br_off,
@@ -21424,6 +21962,7 @@ def _iw_streamk_kernel(
                 acc_layout,
                 C,
                 (tail_offs_m_bot[:, None] < M) & (tail_offs_n_right[None, :] < N),
+                ADD_BIAS,
             )
     else:
         # Standard Stream-K fixup path: Divide remaining flattened pairs of K
@@ -21534,29 +22073,69 @@ def _iw_streamk_kernel(
                     )
                     covered_end += UNITS_PER_PROGRAM + (next_pid < REMAINDER_UNITS)
                     next_pid += 1
+                mask_tl = (tile_offs_m_top[:, None] < M) & (tile_offs_n_left[None, :] < N)
+                mask_bl = (tile_offs_m_bot[:, None] < M) & (tile_offs_n_left[None, :] < N)
+                mask_tr = (tile_offs_m_top[:, None] < M) & (tile_offs_n_right[None, :] < N)
+                mask_br = (tile_offs_m_bot[:, None] < M) & (tile_offs_n_right[None, :] < N)
+                acc_tl = _apply_fused_bias(
+                    acc_tl,
+                    bias_ptr,
+                    tile_offs_m_top,
+                    tile_offs_n_left,
+                    stride_bias_m,
+                    stride_bias_n,
+                    mask_tl,
+                    ADD_BIAS,
+                )
+                acc_bl = _apply_fused_bias(
+                    acc_bl,
+                    bias_ptr,
+                    tile_offs_m_bot,
+                    tile_offs_n_left,
+                    stride_bias_m,
+                    stride_bias_n,
+                    mask_bl,
+                    ADD_BIAS,
+                )
+                acc_tr = _apply_fused_bias(
+                    acc_tr,
+                    bias_ptr,
+                    tile_offs_m_top,
+                    tile_offs_n_right,
+                    stride_bias_m,
+                    stride_bias_n,
+                    mask_tr,
+                    ADD_BIAS,
+                )
+                acc_br = _apply_fused_bias(
+                    acc_br,
+                    bias_ptr,
+                    tile_offs_m_bot,
+                    tile_offs_n_right,
+                    stride_bias_m,
+                    stride_bias_n,
+                    mask_br,
+                    ADD_BIAS,
+                )
                 tl.store(
                     c_ptr + tile_offs_m_top[:, None] * stride_cm + tile_offs_n_left[None, :] * stride_cn,
                     tlx.require_layout(acc_tl.to(et), C),
-                    mask=(tile_offs_m_top[:, None] < M)
-                    & (tile_offs_n_left[None, :] < N),
+                    mask=mask_tl,
                 )
                 tl.store(
                     c_ptr + tile_offs_m_bot[:, None] * stride_cm + tile_offs_n_left[None, :] * stride_cn,
                     tlx.require_layout(acc_bl.to(et), C),
-                    mask=(tile_offs_m_bot[:, None] < M)
-                    & (tile_offs_n_left[None, :] < N),
+                    mask=mask_bl,
                 )
                 tl.store(
                     c_ptr + tile_offs_m_top[:, None] * stride_cm + tile_offs_n_right[None, :] * stride_cn,
                     tlx.require_layout(acc_tr.to(et), C),
-                    mask=(tile_offs_m_top[:, None] < M)
-                    & (tile_offs_n_right[None, :] < N),
+                    mask=mask_tr,
                 )
                 tl.store(
                     c_ptr + tile_offs_m_bot[:, None] * stride_cm + tile_offs_n_right[None, :] * stride_cn,
                     tlx.require_layout(acc_br.to(et), C),
-                    mask=(tile_offs_m_bot[:, None] < M)
-                    & (tile_offs_n_right[None, :] < N),
+                    mask=mask_br,
                 )
             start_unit = segment_end
 
@@ -21725,6 +22304,7 @@ def _iw_launch(
     REGCLASS_PRIORITY=False,
     MATRIX_INSTR_NONKDIM=16,
     STORE_CACHE="",
+    OUTPUT_PRECISION_BIAS=False,
 ):
     """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
     M, input_k = a.shape
@@ -21841,6 +22421,7 @@ def _iw_launch(
         HAS_N_TAIL=N % BN != 0,
         PIN_OFFSET_LAYOUT=K_LIMIT is not None,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
+        OUTPUT_PRECISION_BIAS=OUTPUT_PRECISION_BIAS,
         WARPS_M=warps_m,
         WARPS_N=warps_n,
         STORE_CACHE=STORE_CACHE,
@@ -21880,7 +22461,7 @@ def _iw_launch(
     return c
 
 
-def _iw_matmul(a, b, SPLIT_K=None, TILE=None, out=None):
+def _iw_matmul(a, b, SPLIT_K=None, TILE=None, bias=None, out=None):
     """C = A @ B. `a` is (M, K), `b` is (K, N).
 
     SPLIT_K partitions the K reduction across SPLIT_K programs per output tile
@@ -21897,7 +22478,7 @@ def _iw_matmul(a, b, SPLIT_K=None, TILE=None, out=None):
         N = b.shape[1]
         path, config = _iw_matmul_plan(M, N, K)
         if path == "register":
-            return _iw_launch_register(a, b, config=config, out=out)
+            return _iw_launch_register(a, b, bias=bias, config=config, out=out)
         block_m, block_n, split_k = config
         # For deep-K square tiles that remain data parallel, a six-row group
         # shortens operand-B reuse without creating a sparse Stream-K tail.
@@ -21909,6 +22490,7 @@ def _iw_matmul(a, b, SPLIT_K=None, TILE=None, out=None):
             return _iw_launch(
                 a,
                 b,
+                bias=bias,
                 out=out,
                 SPLIT_K=1,
                 TILE=(block_m, block_n),
@@ -21924,6 +22506,7 @@ def _iw_matmul(a, b, SPLIT_K=None, TILE=None, out=None):
             return _iw_launch(
                 a,
                 b,
+                bias=bias,
                 out=out,
                 SPLIT_K=split_k,
                 TILE=(block_m, block_n),
@@ -21939,21 +22522,22 @@ def _iw_matmul(a, b, SPLIT_K=None, TILE=None, out=None):
         return _iw_launch(
             a,
             b,
+            bias=bias,
             out=out,
             SPLIT_K=split_k,
             TILE=(block_m, block_n),
         )
-    return _iw_launch(a, b, out=out, SPLIT_K=SPLIT_K, TILE=TILE)
+    return _iw_launch(a, b, bias=bias, out=out, SPLIT_K=SPLIT_K, TILE=TILE)
 
 
-def _iw_ragged_n_matmul(a, b, out=None):
+def _iw_ragged_n_matmul(a, b, bias=None, out=None):
     """Compute a small N remainder with a narrower secondary launch."""
     M, K = a.shape
     _, N = b.shape
     main_n = N // _iw_BLOCK_N * _iw_BLOCK_N
     tail_n = N - main_n
     if main_n == 0 or tail_n == 0 or tail_n > _iw_BLOCK_N // 2:
-        return _iw_matmul(a, b, out=out)
+        return _iw_matmul(a, b, bias=bias, out=out)
     default_tail_n = 64 if tail_n <= 64 else 128
     tail_tile = tuple(
         int(value) for value in os.environ.get("TLX_TMP_RAGGED_TAIL_TILE", f"256x{default_tail_n}").split("x"))
@@ -21966,6 +22550,7 @@ def _iw_ragged_n_matmul(a, b, out=None):
     _iw_launch(
         a,
         b[:, :main_n],
+        bias=None if bias is None else bias[:, :main_n],
         out=c[:, :main_n],
         SPLIT_K=1,
         TILE=(_iw_BLOCK_M, _iw_BLOCK_N),
@@ -21975,6 +22560,7 @@ def _iw_ragged_n_matmul(a, b, out=None):
     _iw_launch(
         a,
         b[:, main_n:],
+        bias=None if bias is None else bias[:, main_n:],
         out=c[:, main_n:],
         SPLIT_K=1,
         TILE=tail_tile,
@@ -22026,6 +22612,7 @@ def _iw_streamk_mapping(M, N, K, block_m, block_n):
 def _iw_streamk_matmul(
     a,
     b,
+    bias=None,
     out=None,
     *,
     _group_size_m=None,
@@ -22040,8 +22627,11 @@ def _iw_streamk_matmul(
     # the AMD warp-pipeline pass cannot nest its waits in that region. The
     # data-centric kernel keeps the same pipeline inline for this case.
     if (not schedule["HAS_STREAMK"] and schedule["NUM_FULL_TILES"] > schedule["NUM_PROGRAMS"]):
-        return _iw_matmul(a, b, out=out)
+        return _iw_matmul(a, b, bias=bias, out=out)
     c = torch.empty((M, N), device=a.device, dtype=a.dtype) if out is None else out
+    if bias is not None:
+        assert bias.shape == (M, N)
+        assert bias.device == a.device and bias.dtype == a.dtype
     if schedule["HAS_STREAMK"]:
         partials = torch.empty((_iw_NUM_CU, BM, BN), device=a.device, dtype=torch.float32)
         # Owners may poll a contributor before that contributor starts.  Clear
@@ -22061,6 +22651,7 @@ def _iw_streamk_matmul(
     _iw_streamk_kernel[(schedule["NUM_PROGRAMS"], )](
         a,
         b,
+        bias if bias is not None else c,
         c,
         partials,
         locks,
@@ -22072,6 +22663,8 @@ def _iw_streamk_matmul(
         a.stride(1),
         b.stride(0),
         b.stride(1),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
         c.stride(0),
         c.stride(1),
         _iw_BLOCK_M=BM,
@@ -22080,6 +22673,7 @@ def _iw_streamk_matmul(
         _iw_NUM_XCDS=num_xcds,
         _iw_NUM_CU=_iw_NUM_CU,
         _iw_GROUP_SIZE_M=group_size_m,
+        ADD_BIAS=bias is not None,
         **schedule,
         num_warps=_iw_NUM_WARPS,
         num_stages=1,
@@ -22952,7 +23546,10 @@ def _compute_full_tile(
 @triton.jit
 def _global_store_output(
     c_ptr,
+    bias_ptr,
     acc,
+    stride_bias_m,
+    stride_bias_n,
     stride_cm,
     stride_cn,
     M: tl.constexpr,
@@ -22960,6 +23557,7 @@ def _global_store_output(
     has_m_tail: tl.constexpr,
     mma: tl.constexpr,
     tile_spec: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     block_m: tl.constexpr = tl.constexpr(tile_spec[0])
     block_n: tl.constexpr = tl.constexpr(tile_spec[1])
@@ -23004,13 +23602,25 @@ def _global_store_output(
                 dim=1,
             )
             value = tl.cat(lo, hi, dim=1)
+            rows = rm + mi * TILE
+            mask = rows[:, None] < M
+            value = _apply_fused_bias(
+                value,
+                bias_ptr,
+                rows,
+                rn_wide,
+                stride_bias_m,
+                stride_bias_n,
+                mask,
+                ADD_BIAS,
+            )
             value = tlx.require_layout(value.to(c_ptr.dtype.element_ty), _C_STORE_32X128_LAYOUT)
             tlx.assert_same_layout(value, _C_STORE_32X128_LAYOUT)
             if has_m_tail:
                 tl.store(
                     offsets,
                     value,
-                    mask=(rm + mi * TILE)[:, None] < M,
+                    mask=mask,
                 )
             else:
                 tl.store(offsets, value)
@@ -23026,14 +23636,27 @@ def _global_store_output(
                 mma,
                 pin=False,
             )
+            rows = rm + mi * TILE
+            cols = rn + (n_main_fragments + tail) * TILE
+            mask = rows[:, None] < M
+            value = _apply_fused_bias(
+                value,
+                bias_ptr,
+                rows,
+                cols,
+                stride_bias_m,
+                stride_bias_n,
+                mask,
+                ADD_BIAS,
+            )
             if has_m_tail:
                 tl.store(
                     offsets,
-                    value,
-                    mask=(rm + mi * TILE)[:, None] < M,
+                    value.to(c_ptr.dtype.element_ty),
+                    mask=mask,
                 )
             else:
-                tl.store(offsets, value)
+                tl.store(offsets, value.to(c_ptr.dtype.element_ty))
 
 
 @triton.jit
@@ -23074,11 +23697,14 @@ def _local_alloc_stage(
 def _persistent_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     stride_am: tl.constexpr,
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     M: tl.constexpr,
@@ -23086,6 +23712,7 @@ def _persistent_kernel(
     HAS_M_TAIL: tl.constexpr,
     TILE_SPEC: tl.constexpr,
     PIPELINE_SPEC: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
@@ -23173,7 +23800,10 @@ def _persistent_kernel(
         acc_tile = _commit_accumulators(acc_tile, mma, TILE_SPEC)
         _global_store_output(
             c_ptr,
+            bias_ptr,
             acc_tile,
+            stride_bias_m,
+            stride_bias_n,
             stride_cm,
             stride_cn,
             M,
@@ -23181,6 +23811,7 @@ def _persistent_kernel(
             HAS_M_TAIL,
             mma,
             TILE_SPEC,
+            ADD_BIAS,
         )
 
         if tile_offset + 1 < tiles_per_program:
@@ -23240,15 +23871,18 @@ def _persistent_supports(a, b):
     return a.dtype == b.dtype and _persistent_plan_for_shape(m, n, k, a.dtype) is not None
 
 
-def _launch_persistent_specialization(a, b, out, tile_spec, pipeline_spec):
+def _launch_persistent_specialization(a, b, out, tile_spec, pipeline_spec, bias=None):
     _persistent_kernel[(tile_spec[3], )](
         a,
         b,
+        bias if bias is not None else out,
         out,
         a.stride(0),
         a.stride(1),
         b.stride(0),
         b.stride(1),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
         out.stride(0),
         out.stride(1),
         M=a.shape[0],
@@ -23256,6 +23890,7 @@ def _launch_persistent_specialization(a, b, out, tile_spec, pipeline_spec):
         HAS_M_TAIL=a.shape[0] % tile_spec[0] != 0,
         TILE_SPEC=tile_spec,
         PIPELINE_SPEC=pipeline_spec,
+        ADD_BIAS=bias is not None,
         num_warps=4,
         num_stages=1,
         matrix_instr_nonkdim=16,
@@ -23266,7 +23901,7 @@ def _launch_persistent_specialization(a, b, out, tile_spec, pipeline_spec):
     )
 
 
-def _launch_persistent(a, b, out=None, specialization=None):
+def _launch_persistent(a, b, out=None, specialization=None, bias=None):
     """Run a compile-time gfx950 persistent GEMM specialization."""
     assert a.ndim == 2 and b.ndim == 2
     m, k = a.shape
@@ -23290,11 +23925,12 @@ def _launch_persistent(a, b, out=None, specialization=None):
         out,
         tile_spec,
         pipeline_spec,
+        bias,
     )
     return out
 
 
-def _launch_persistent_mtail_n160(a, b, out=None):
+def _launch_persistent_mtail_n160(a, b, out=None, bias=None):
     """Run the tuned N160 pipeline for one partial 224-row tile."""
     m, k = a.shape
     kb, n = b.shape
@@ -23308,6 +23944,7 @@ def _launch_persistent_mtail_n160(a, b, out=None):
         out,
         _MT224X160_MTAIL_TILE_SPEC,
         _MT224X160_MTAIL_PIPELINE_SPEC,
+        bias,
     )
     return out
 
@@ -23478,6 +24115,7 @@ def _local_split_u_direct_load_half(
 def _local_split_u_lds_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -23486,6 +24124,8 @@ def _local_split_u_lds_kernel(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     a_raw_layout: tl.constexpr,
@@ -23493,6 +24133,7 @@ def _local_split_u_lds_kernel(
     a_direct_layout: tl.constexpr,
     b_direct_layout: tl.constexpr,
     TILE_N: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Run the measured M7 LocalSplitU direct-to-LDS pipeline."""
     NUM_MACROS: tl.constexpr = K // 512
@@ -23633,10 +24274,21 @@ def _local_split_u_lds_kernel(
 
     rows = tl.arange(0, 16)
     cols = pid_n * TILE_N + tl.arange(0, TILE_N)
+    mask = rows[:, None] < M
+    result = _apply_fused_bias(
+        result,
+        bias_ptr,
+        rows,
+        cols,
+        stride_bias_m,
+        stride_bias_n,
+        mask,
+        ADD_BIAS,
+    )
     tl.store(
         c_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn,
         result.to(c_ptr.dtype.element_ty),
-        mask=rows[:, None] < M,
+        mask=mask,
     )
 
 
@@ -23677,6 +24329,7 @@ def _load_dot_operands(
 def _local_split_u_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -23685,6 +24338,8 @@ def _local_split_u_kernel(
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     TILE_M: tl.constexpr,
@@ -23692,6 +24347,7 @@ def _local_split_u_kernel(
     K_WIDTH: tl.constexpr,
     WAVE_K: tl.constexpr,
     LOCAL_SPLIT_U: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Compute one MxN tile by partitioning K across the CTA's waves."""
     MACRO_K: tl.constexpr = WAVE_K * LOCAL_SPLIT_U
@@ -23819,12 +24475,22 @@ def _local_split_u_kernel(
         ))
         result += tl.reshape(partial, (TILE_M, TILE_N))
 
+    mask = (output_rows[:, None] < M) & (output_cols[None, :] < N)
+    result = _apply_fused_bias(
+        result,
+        bias_ptr,
+        output_rows,
+        output_cols,
+        stride_bias_m,
+        stride_bias_n,
+        mask,
+        ADD_BIAS,
+    )
     output_ptrs = (c_ptr + output_rows[:, None] * stride_cm + output_cols[None, :] * stride_cn)
     tl.store(
         output_ptrs,
         result.to(c_ptr.dtype.element_ty),
-        mask=(output_rows[:, None] < M)
-        & (output_cols[None, :] < N),
+        mask=mask,
     )
 
 
@@ -23854,7 +24520,7 @@ def _uses_local_split_u_lds_for_shape(m, n, k):
     return (m, n, k) == (7, 8192, 2048)
 
 
-def _launch_validated(a, b, out, plan):
+def _launch_validated(a, b, out, plan, bias=None):
     """Launch a plan after operand and output validation has completed."""
     m, k = a.shape
     _, n = b.shape
@@ -23867,6 +24533,7 @@ def _launch_validated(a, b, out, plan):
         _local_split_u_lds_kernel[(triton.cdiv(n, tile_n), )](
             a,
             b,
+            bias if bias is not None else out,
             out,
             m,
             n,
@@ -23875,6 +24542,8 @@ def _launch_validated(a, b, out, plan):
             a.stride(1),
             b.stride(0),
             b.stride(1),
+            bias.stride(0) if bias is not None else 0,
+            bias.stride(1) if bias is not None else 0,
             out.stride(0),
             out.stride(1),
             _LOCAL_SPLIT_U_A_RAW_LAYOUT,
@@ -23882,6 +24551,7 @@ def _launch_validated(a, b, out, plan):
             _LOCAL_SPLIT_U_A_DIRECT_LAYOUT,
             b_direct_layout,
             TILE_N=tile_n,
+            ADD_BIAS=bias is not None,
             num_warps=local_split_u,
             num_stages=1,
             matrix_instr_nonkdim=16,
@@ -23891,6 +24561,7 @@ def _launch_validated(a, b, out, plan):
     _local_split_u_kernel[(triton.cdiv(n, tile_n), )](
         a,
         b,
+        bias if bias is not None else out,
         out,
         m,
         n,
@@ -23899,6 +24570,8 @@ def _launch_validated(a, b, out, plan):
         a.stride(1),
         b.stride(0),
         b.stride(1),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
         out.stride(0),
         out.stride(1),
         TILE_M=tile_m,
@@ -23906,6 +24579,7 @@ def _launch_validated(a, b, out, plan):
         K_WIDTH=k_width,
         WAVE_K=wave_k,
         LOCAL_SPLIT_U=local_split_u,
+        ADD_BIAS=bias is not None,
         num_warps=local_split_u,
         num_stages=1,
         matrix_instr_nonkdim=16,
@@ -23948,14 +24622,14 @@ def _valid_lds_split(k, split_k, element_size):
     return (split_size >= 2 * BLOCK_K and split_size * element_size % 16 == 0)
 
 
-def _launch_optimized_inter_wave(a, b, out, kind, plan=None):
+def _launch_optimized_inter_wave(a, b, out, kind, plan=None, bias=None):
     """Lazily enter the promoted inter-wave implementation family."""
     if kind == "streamk":
-        return _iw_streamk_matmul(a, b, out=out, **({} if plan is None else plan))
+        return _iw_streamk_matmul(a, b, bias=bias, out=out, **({} if plan is None else plan))
     if plan is not None:
-        return _iw_launch(a, b, out=out, **plan)
+        return _iw_launch(a, b, bias=bias, out=out, **plan)
     if kind == "ragged_n":
-        return _iw_ragged_n_matmul(a, b, out=out)
+        return _iw_ragged_n_matmul(a, b, bias=bias, out=out)
     if kind == "m192n256":
         m, k = a.shape
         n = b.shape[1]
@@ -23965,6 +24639,7 @@ def _launch_optimized_inter_wave(a, b, out, kind, plan=None):
         return _iw_launch(
             a,
             b,
+            bias=bias,
             out=out,
             TILE=(192, 256),
             SCHED_MFMA_PER_DWORDX4=4 if tall_short else 2,
@@ -23972,16 +24647,22 @@ def _launch_optimized_inter_wave(a, b, out, kind, plan=None):
             GROUP_M_OVERRIDE=16 if tall_short else None,
             NUM_XCDS_OVERRIDE=2 if wide_shallow or tall_short else None,
         )
-    return _iw_matmul(a, b, out=out)
+    return _iw_matmul(a, b, bias=bias, out=out)
 
 
-def _launch_hybrid_n160(a, b, out):
+def _launch_hybrid_n160(a, b, out, bias=None):
     """Split one sparse N wave into full N256 and persistent N160 launches."""
     main_n = b.shape[1] - 160 * _NUM_CU
-    _iw_matmul(a, b[:, :main_n], out=out[:, :main_n])
+    _iw_matmul(
+        a,
+        b[:, :main_n],
+        bias=None if bias is None else bias[:, :main_n],
+        out=out[:, :main_n],
+    )
     _launch_persistent_mtail_n160(
         a,
         b[:, main_n:],
+        bias=None if bias is None else bias[:, main_n:],
         out=out[:, main_n:],
     )
     return out
@@ -25268,7 +25949,7 @@ def supports(a, b):
     return _dispatch_for(a, b) is not None
 
 
-def _launch_fragmented_register(a, b, out, plan):
+def _launch_fragmented_register(a, b, out, plan, bias=None):
     m, k = a.shape
     n = b.shape[1]
     return _fragmented_register_launcher(
@@ -25280,13 +25961,14 @@ def _launch_fragmented_register(a, b, out, plan):
         a.stride(),
         b.stride(),
         out.stride(),
+        bias is not None,
         tuple(sorted(plan.items())),
-    )(a, b, out)
+    )(a, b, bias, out)
 
 
-def _launch_production_wave_grid(a, b, out, plan):
+def _launch_production_wave_grid(a, b, out, plan, bias=None):
     shape = (a.shape[0], b.shape[1], a.shape[1])
-    if (shape == (2_496, 22_528, 160) and a.stride() == (160, 1) and b.stride() == (1, 160)
+    if (bias is None and shape == (2_496, 22_528, 160) and a.stride() == (160, 1) and b.stride() == (1, 160)
             and out.stride() == (22_528, 1)):
         plan = _wg_regular_wave_grid_plan(
             5,
@@ -25310,11 +25992,12 @@ def _launch_production_wave_grid(a, b, out, plan):
             dot_mode="persistent",
         )
         plan["k160_winner"] = True
-    can_use_compiled = (shape in _PRODUCTION_COMPILED_WAVE_GRID_SHAPES and plan.get("kind") == "regular_mi16_wave_grid"
-                        and not plan.get("streamk_tail_split", 0) and not plan.get("persistent_program_count", 0)
-                        and a.data_ptr() % 16 == 0 and b.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0)
+    can_use_compiled = (bias is None and shape in _PRODUCTION_COMPILED_WAVE_GRID_SHAPES
+                        and plan.get("kind") == "regular_mi16_wave_grid" and not plan.get("streamk_tail_split", 0)
+                        and not plan.get("persistent_program_count", 0) and a.data_ptr() % 16 == 0
+                        and b.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0)
     if not can_use_compiled:
-        return _launch_wave_grid(a, b, out=out, _candidate_plan=plan)
+        return _launch_wave_grid(a, b, bias=bias, out=out, _candidate_plan=plan)
     return _production_wave_grid_launcher(
         a.device.index,
         a.dtype,
@@ -25326,47 +26009,50 @@ def _launch_production_wave_grid(a, b, out, plan):
     )(a, b, out)
 
 
-def _launch_dispatch(a, b, out, dispatch):
+def _launch_dispatch(a, b, out, dispatch, bias=None):
     path, plan = dispatch
     if path == "cached_b_lds":
-        return _launch_cached_b(a, b, out, plan)
+        return _launch_cached_b(a, b, out, plan, bias=bias)
     if path == "short_k_register":
-        return _launch_short_k_register(a, b, out=out)
+        return _launch_short_k_register(a, b, bias=bias, out=out)
     if path == "row_major_direct":
-        return _launch_row_major_direct(a, b, out, plan)
+        return _launch_row_major_direct(a, b, out, plan, bias=bias)
     if path == "hybrid_n160":
-        return _launch_hybrid_n160(a, b, out)
+        return _launch_hybrid_n160(a, b, out, bias=bias)
     if path in ("inter_wave", "streamk", "ragged_n", "m192n256"):
-        return _launch_optimized_inter_wave(a, b, out, path, plan)
+        return _launch_optimized_inter_wave(a, b, out, path, plan, bias=bias)
     if path == "transposed_wave_grid":
         _launch_production_wave_grid(
             b.T,
             a.T,
             out.T,
             plan,
+            bias=None if bias is None else bias.T,
         )
         return out
     if path == "transposed_register":
         _launch_register_plan(
             b.T,
             a.T,
+            bias=None if bias is None else bias.T,
             config=plan,
             out=out.T,
             _validated=True,
         )
         return out
     if path == "fragmented_register":
-        return _launch_fragmented_register(a, b, out, plan)
+        return _launch_fragmented_register(a, b, out, plan, bias=bias)
     if path == "wave_grid":
-        return _launch_production_wave_grid(a, b, out, plan)
+        return _launch_production_wave_grid(a, b, out, plan, bias=bias)
     if path == "persistent":
-        return _launch_persistent(a, b, out=out)
+        return _launch_persistent(a, b, out=out, bias=bias)
     if path == "range_register":
-        return _launch_range_register_plan(a, b, config=plan, out=out)
+        return _launch_range_register_plan(a, b, bias=bias, config=plan, out=out)
     if path == "register":
         return _launch_register_plan(
             a,
             b,
+            bias=bias,
             config=plan,
             out=out,
             _validated=True,
@@ -25376,11 +26062,12 @@ def _launch_dispatch(a, b, out, dispatch):
         return _launch_lds(
             a,
             b,
+            bias=bias,
             SPLIT_K=split_k,
             TILE=(block_m, block_n),
             out=out,
         )
-    return _launch_validated(a, b, out, plan)
+    return _launch_validated(a, b, out, plan, bias=bias)
 
 
 _WAVE_GRID_COMPILED_CACHE = {}
