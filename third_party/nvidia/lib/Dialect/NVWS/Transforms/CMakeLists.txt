@@ -7,6 +7,10 @@ add_triton_library(NVWSTransforms
   LowerWarpGroup.cpp
   MetaToNVWSConvert.cpp
   InsertAref.cpp
+  InsertSemas.cpp
+  InsertSemasAccessDag.cpp
+  InsertSemasEmitIR.cpp
+  InsertSemasSyncDag.cpp
   Utilities.cpp
   AssignStagePhase.cpp
   InsertTmemAref.cpp

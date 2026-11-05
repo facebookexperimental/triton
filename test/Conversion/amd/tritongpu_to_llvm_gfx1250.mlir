@@ -253,9 +253,9 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
   // A broadcast CTA basis makes the layout non-square. The runtime row still
   // selects a 2-row piece per CTA, whose partition rotates the bases.
   // GFX1250-LABEL: dynamic_subslice_partitioned_clustered
-  // GFX1250: [[NPART:%.*]] = llvm.mlir.constant(2 : i32)
   // GFX1250: [[PIECE:%.*]] = llvm.mlir.constant(2 : i32)
   // GFX1250: [[INDEX:%.*]] = llvm.udiv %arg0, [[PIECE]]
+  // GFX1250: [[NPART:%.*]] = llvm.mlir.constant(2 : i32)
   // GFX1250: llvm.urem [[INDEX]], [[NPART]]
   // GFX1250-COUNT-2: llvm.extractelement {{.*}} vector<2x!llvm.ptr<3>>
   tt.func private @dynamic_subslice_partitioned_clustered(%row: i32) -> !ttg.memdesc<2x16xf16, #partitioned, #smem, mutable, 16x16> {

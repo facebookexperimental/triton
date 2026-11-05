@@ -71,15 +71,13 @@ struct SetMinimumSharedMemory
 
 namespace mlir::triton::nvidia_gpu {
 
-static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
-                                              RankedTensorType dstTy,
-                                              TargetInfoBase &targetInfo) {
-  auto *ctx = srcTy.getContext();
-  auto srcLayout = triton::gpu::toLinearLayout(srcTy);
-  auto dstLayout = triton::gpu::toLinearLayout(dstTy);
+static unsigned
+getNumScratchElemsSwizzledCvt(LinearLayout srcLayout, LinearLayout dstLayout,
+                              int32_t bitwidth, int32_t nBlocks,
+                              const TargetInfoBase &targetInfo) {
+  auto *ctx = srcLayout.getInDimNames().begin()->getContext();
   srcLayout = actionRemoveBroadcastedRegs(srcLayout).apply(srcLayout);
   dstLayout = actionRemoveBroadcastedRegs(dstLayout).apply(dstLayout);
-  auto bitwidth = getBitwidth(srcTy);
   auto kBlock = StringAttr::get(ctx, "block");
   bool crossCTA =
       !dstLayout.invertAndCompose(srcLayout).isTrivialOver({kBlock});
@@ -90,8 +88,38 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
   // The smem has the same CGA layout as srcLayout, so use that instead.
   // Remove the number of elements duplicated in the CGA layout.
-  auto nBlocks = product(triton::gpu::getCTASplitNum(srcTy.getEncoding()));
   return smem.getTotalOutDimSize() / (reps * nBlocks);
+}
+
+static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
+                                              RankedTensorType dstTy,
+                                              TargetInfoBase &targetInfo) {
+  return getNumScratchElemsSwizzledCvt(
+      triton::gpu::toLinearLayout(srcTy), triton::gpu::toLinearLayout(dstTy),
+      getBitwidth(srcTy),
+      product(triton::gpu::getCTASplitNum(srcTy.getEncoding())), targetInfo);
+}
+
+std::optional<ProductSlabTransfer>
+getProductSlabTransfer(RankedTensorType srcTy, RankedTensorType dstTy,
+                       const TargetInfoBase &targetInfo) {
+  auto plan = getProductConversionPlan(srcTy, dstTy);
+  if (!plan || plan->transport != ProductConversionTransport::Shared)
+    return std::nullopt;
+  auto kReg = StringAttr::get(srcTy.getContext(), "register");
+  auto src = triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
+  auto dst = triton::gpu::toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg);
+  auto slabs = getProductSharedSlabs(src, dst);
+  if (!slabs)
+    return std::nullopt;
+  int32_t numSlabs =
+      src.getInDimSize(kReg) / slabs->sourceTile.getInDimSize(kReg);
+  auto bitwidth = getBitwidth(srcTy);
+  unsigned elems = getNumScratchElemsSwizzledCvt(
+      slabs->sourceTile, slabs->destinationTile, bitwidth,
+      product(triton::gpu::getCTASplitNum(srcTy.getEncoding())), targetInfo);
+  return ProductSlabTransfer{std::move(*slabs), numSlabs,
+                             numSlabs * elems * bitwidth / 8};
 }
 
 std::function<unsigned(Operation *)>
@@ -100,15 +128,10 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
     if (auto cvtOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
       auto srcTy = cvtOp.getSrc().getType();
       auto dstTy = cvtOp.getType();
-      if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
-        // Use modular physical-cover sizing.
-        if (!cvtNeedsSharedMemory(cvtOp)) {
-          return 0;
-        }
-        auto elems = mlir::triton::getNumScratchElemsSwizzledCvt(srcTy, dstTy);
-        // Modular sub-byte values occupy one byte in shared memory.
-        return elems * std::max<unsigned>(getBitwidth(srcTy), 8) / 8;
-      }
+      if (auto slabs = getProductSlabTransfer(srcTy, dstTy, targetInfo))
+        return slabs->scratchBytes;
+      if (auto bytes = getProductConversionScratchBytes(cvtOp))
+        return *bytes;
       if (!cvtNeedsSharedMemory(cvtOp))
         return 0;
       // In cuda we always swizzle

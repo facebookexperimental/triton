@@ -1,6 +1,9 @@
 # NPOT (non-power-of-2) language tests, gated on TRITON_ALLOW_NPOT=1 (else they skip).
-# A TTIR pass pads each NPOT tensor to the next power of two before TTGIR, keeping pad
-# lanes out of memory and live results; an op it cannot pad fails to compile with an error.
+# The NPOT tensors connected through their ops (a connected component of the def-use graph) keep
+# their shape if their ops lower a Product layout, each memory access keeps padding's vector and
+# the connected component takes fewer slots in sum; a TTIR pass pads every other NPOT tensor or fails.
+
+import re
 
 import pytest
 import torch
@@ -36,8 +39,7 @@ def _rel_err(actual, ref, eps=1e-6):
 @requires_npot
 @pytest.mark.parametrize("size", [33, 48, 127, 768, 1023, 1536])
 def test_npot_arange(size):
-    """arange + store over an NPOT extent: a padded make_range and a store
-    masked to the live lanes."""
+    """arange + store over an NPOT extent."""
 
     @triton.jit
     def kernel(Out, N: tl.constexpr):
@@ -71,10 +73,10 @@ def test_npot_elementwise(size):
 
 @requires_gpu
 @requires_npot
-@pytest.mark.parametrize("size", [48, 96, 192, 768])
+@pytest.mark.parametrize("size", [48, 96])
 def test_npot_copy_one_warp(size):
-    """The copy runs padded: no NPOT tensor reaches TTGIR, and the masked store
-    leaves the canary past `size` untouched."""
+    """The pad pass pads the copy (96 would lose padded's vector width), and
+    the store leaves the canary past `size` untouched."""
 
     @triton.jit
     def kernel(X, Out, N: tl.constexpr):
@@ -86,6 +88,115 @@ def test_npot_copy_one_warp(size):
     h = kernel[(1, )](x, out, N=size, num_warps=1)
     assert f"tensor<{size}x" not in h.asm["ttgir"]
     assert torch.equal(out[:size], x) and bool((out[size:] == -1.0).all()), f"size={size}"
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N, num_warps", [(768, 1), (3072, 4), (8448, 1)])
+@pytest.mark.parametrize("op", ["load_store", "make_range", "splat", "elementwise"])
+def test_npot_op_class(op, N, num_warps):
+    """Each op class keeps its NPOT shape and matches torch and, bitwise, its
+    padded twin, whose scan is a pad boundary."""
+
+    @triton.jit
+    def kernel(X, S, Out, Scan, N: tl.constexpr, OP: tl.constexpr, SCAN: tl.constexpr):
+        i = tl.arange(0, N)
+        if OP == "load_store":
+            v = tl.load(X + i, mask=i % 3 != 0, other=-1.0)
+        elif OP == "make_range":
+            v = i.to(tl.float32)
+        elif OP == "splat":
+            v = tl.zeros([N], tl.float32) + tl.load(S)
+        else:
+            x = tl.load(X + i)
+            v = tl.where(x > 0, tl.exp(x), x.to(tl.int32).to(tl.float32))
+        tl.store(Out + i, v)
+        if SCAN:
+            tl.store(Scan + i, tl.cumsum(v, 0))
+
+    x, s = torch.randn(N, device="cuda"), torch.randn(1, device="cuda")
+    i = torch.arange(N, device="cuda")
+    ref = {
+        "load_store": torch.where(i % 3 != 0, x, -1.0),
+        "make_range": i.float(),
+        "splat": s.expand(N),
+        "elementwise": torch.where(x > 0, x.exp(),
+                                   x.int().float()),
+    }[op]
+    outs = []
+    for scan in (False, True):
+        out, cum = torch.empty_like(x), torch.empty_like(x)
+        h = kernel[(1, )](x, s, out, cum, N=N, OP=op, SCAN=scan, num_warps=num_warps)
+        assert (f"tensor<{N}x" in h.asm["ttgir"]) != scan
+        outs.append(out)
+    assert torch.equal(outs[0], outs[1]) and _rel_err(outs[0], ref) < 1e-5, f"{op} N={N}"
+
+
+@requires_gpu
+@requires_npot
+def test_npot_coalesced_copy():
+    """An exact 768-element one-warp copy loads with the 1024 control's 128-bit
+    vector width, the odd 3 outermost."""
+
+    @triton.jit
+    def kernel(X, Out, N: tl.constexpr):
+        i = tl.arange(0, N)
+        tl.store(Out + i, tl.load(X + i))
+
+    def widths(h):
+        if is_hip():
+            return set(re.findall(r"(?:global|buffer)_load_dword\w*", h.asm["amdgcn"]))
+        return set(re.findall(r"ld\.global\S*", h.asm["ptx"]))
+
+    x, y = torch.randn(768, device="cuda"), torch.randn(1024, device="cuda")
+    out = torch.empty_like(x)
+    h = kernel[(1, )](x, out, N=768, num_warps=1)
+    control = kernel[(1, )](y, torch.empty_like(y), N=1024, num_warps=1)
+    assert "tensor<768x" in h.asm["ttgir"]
+    assert widths(h) == widths(control) and all(re.search(r"(v4\.b32|dwordx4)$", w) for w in widths(h))
+    assert torch.equal(out, x)
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("offset", [1, 0])
+def test_npot_unaligned_copy(offset):
+    """x[1:] is only 4-byte aligned, so padding's 512 copy loads v1 too and the
+    384 copy over 128 threads, in fewer slots, keeps its shape. The aligned
+    control pads: padding loads v4 where 384 gets v1."""
+
+    @triton.jit
+    def kernel(X, Out, N: tl.constexpr):
+        i = tl.arange(0, N)
+        tl.store(Out + i, tl.load(X + i))
+
+    x, out = torch.randn(385, device="cuda"), torch.full((385, ), -1.0, device="cuda")
+    warps = 128 // triton.runtime.driver.active.get_current_target().warp_size
+    h = kernel[(1, )](x[offset:], out[offset:], N=384, num_warps=warps)
+    ref = torch.full_like(out, -1.0)
+    ref[offset:offset + 384] = x[offset:offset + 384]
+    assert ("tensor<384x" in h.asm["ttgir"]) == (offset == 1)
+    assert torch.equal(out, ref), f"offset={offset}"
+
+
+@requires_gpu
+@requires_npot
+def test_npot_padded_meets_exact():
+    """The sum of a padded 48-element load is splat into a 768-element connected
+    component that keeps its shape."""
+
+    @triton.jit
+    def kernel(X, Y, Out, M: tl.constexpr, N: tl.constexpr):
+        s = tl.sum(tl.load(X + tl.arange(0, M)))
+        i = tl.arange(0, N)
+        tl.store(Out + i, tl.load(Y + i) * s)
+
+    x = torch.randn(48, device="cuda")
+    y = torch.randn(768, device="cuda")
+    out = torch.empty(768, device="cuda")
+    h = kernel[(1, )](x, y, out, M=48, N=768, num_warps=1)
+    assert "tensor<64x" in h.asm["ttgir"] and "tensor<768x" in h.asm["ttgir"]
+    assert _rel_err(out, y * x.sum()) < 1e-5
 
 
 @requires_gpu
@@ -103,6 +214,30 @@ def test_npot_copy_2d(M, N):
     out = torch.empty(M, N, device="cuda")
     kernel[(1, )](x, out, M=M, N=N)
     assert _rel_err(out, x) < 1e-6, f"M={M},N={N}"
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("M, N, trans", [(96, 64, False), (64, 96, False), (96, 64, True), (64, 64, False)])
+def test_npot_tile(M, N, trans):
+    """A 2-D tile addressed through expand_dims and broadcast keeps its NPOT
+    shape on four warps, also through a transpose. (64, 64) is the pow2 control."""
+
+    @triton.jit
+    def kernel(X, Out, M: tl.constexpr, N: tl.constexpr, TRANS: tl.constexpr):
+        m = tl.arange(0, M)
+        n = tl.arange(0, N)
+        x = tl.load(X + m[:, None] * N + n[None, :])
+        if TRANS:
+            tl.store(Out + n[:, None] * M + m[None, :], tl.trans(x))
+        else:
+            tl.store(Out + m[:, None] * N + n[None, :], x)
+
+    x = torch.randn(M, N, device="cuda")
+    out = torch.empty(N, M, device="cuda") if trans else torch.empty_like(x)
+    h = kernel[(1, )](x, out, M=M, N=N, TRANS=trans, num_warps=4)
+    assert f"tensor<{M}x{N}x" in h.asm["ttgir"]
+    assert torch.equal(out, x.T if trans else x), f"M={M},N={N},trans={trans}"
 
 
 @requires_gpu
@@ -276,9 +411,11 @@ def test_npot_reverse_scan(op, N):
 
 @requires_gpu
 @requires_npot
-@pytest.mark.parametrize("N", [96, 128])
-def test_npot_histogram(N):
-    """Pad lanes load 0, a bin-0 canary; the live mask keeps them uncounted."""
+@pytest.mark.parametrize("N, num_warps, kept", [(768, 1, False), (96, 4, False), (128, 4, True)])
+def test_npot_histogram(N, num_warps, kept):
+    """Padded, as histogram does not yet take a Product layout: pad lanes load
+    0, a bin-0 canary; the live mask keeps them uncounted. N=128 is the pow2
+    control."""
 
     @triton.jit
     def kernel(X, Out, N: tl.constexpr, B: tl.constexpr):
@@ -286,26 +423,51 @@ def test_npot_histogram(N):
 
     x = torch.randint(1, 16, (N, ), device="cuda", dtype=torch.int32)
     out = torch.empty(16, device="cuda", dtype=torch.int32)
-    kernel[(1, )](x, out, N=N, B=16)
+    h = kernel[(1, )](x, out, N=N, B=16, num_warps=num_warps)
+    assert (f"tensor<{N}x" in h.asm["ttgir"]) == kept
     assert torch.equal(out, torch.bincount(x, minlength=16).to(torch.int32))
 
 
 @requires_gpu
 @requires_npot
-@pytest.mark.parametrize("N", [96, 128])
-def test_npot_gather(N):
-    """Reverse a vector with tl.gather; idx = N-1-i is negative in the pad lanes,
-    which gather index 0 instead."""
+@pytest.mark.parametrize("N, num_warps, kept", [(768, 1, True), (96, 4, False)])
+def test_npot_loop_carried(N, num_warps, kept):
+    """A loop-carried sum keeps its NPOT shape unless the pad rule pads it."""
+
+    @triton.jit
+    def kernel(X, Out, T: tl.constexpr, N: tl.constexpr):
+        i = tl.arange(0, N)
+        acc = tl.zeros([N], dtype=tl.int32)
+        for t in range(T):
+            acc += tl.load(X + t * N + i)
+        tl.store(Out + i, acc)
+
+    x = torch.randint(-1000, 1000, (4, N), device="cuda", dtype=torch.int32)
+    out = torch.empty(N, device="cuda", dtype=torch.int32)
+    h = kernel[(1, )](x, out, T=4, N=N, num_warps=num_warps)
+    assert (f"tensor<{N}x" in h.asm["ttgir"]) == kept
+    assert torch.equal(out, x.sum(0, dtype=torch.int32))
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N, num_warps, kept", [(768, 1, True), (96, 4, False), (128, 4, True)])
+def test_npot_gather(N, num_warps, kept):
+    """Reverse a vector with tl.gather: exact at 768 on one warp, padded at 96
+    on four, where idx = N-1-i is negative in the pad lanes, which gather index
+    0 instead. N=128 is the pow2 control."""
 
     @triton.jit
     def kernel(X, Out, N: tl.constexpr):
         i = tl.arange(0, N)
         tl.store(Out + i, tl.gather(tl.load(X + i), N - 1 - i, 0))
 
-    x = torch.full((128, ), float("nan"), device="cuda")
+    P = triton.next_power_of_2(N)
+    x = torch.full((P, ), float("nan"), device="cuda")
     x[:N] = torch.randn(N, device="cuda")
-    out = torch.full((128, ), -1.0, device="cuda")
-    kernel[(1, )](x, out, N=N)
+    out = torch.full((P, ), -1.0, device="cuda")
+    h = kernel[(1, )](x, out, N=N, num_warps=num_warps)
+    assert (f"tensor<{N}x" in h.asm["ttgir"]) == kept
     assert torch.equal(out[:N], x[:N].flip(0)) and bool((out[N:] == -1.0).all())
 
 

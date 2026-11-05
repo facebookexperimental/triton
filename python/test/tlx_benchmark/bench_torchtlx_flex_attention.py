@@ -54,7 +54,7 @@ def document_reference(tensors, seq, batch):
     return torch.cat(pieces, dim=2)
 
 
-def inputs(mod, seq, batch=8, heads=16, dim=128, dtype=torch.bfloat16):
+def inputs(mod, seq, batch=8, heads=16, dim=128, dtype=torch.bfloat16, *, q_len=None, block_size=128):
     torch.manual_seed(42)
     score_mod = None
     mask_mod = None
@@ -86,18 +86,20 @@ def inputs(mod, seq, batch=8, heads=16, dim=128, dtype=torch.bfloat16):
             return (docs[m] == docs[n]) & (m - offsets[docs[m]] >= n - offsets[docs[n]])
 
         shape = (1, heads, batch * seq, dim)
+    q_shape = (*shape[:2], shape[2] if q_len is None else q_len, dim)
     block_mask = None
     if mask_mod is not None:
         with config.patch({"triton.tlx_mode": None}):
-            block_mask = torch.compile(create_block_mask)(mask_mod, 1, 1, shape[2], shape[2], device="cuda")
-    q, k, v = [torch.rand(shape, device="cuda", dtype=dtype) for _ in range(3)]
+            block_mask = torch.compile(create_block_mask)(mask_mod, 1, 1, q_shape[2], shape[2], device="cuda",
+                                                          BLOCK_SIZE=block_size)
+    q, k, v = [torch.rand(s, device="cuda", dtype=dtype) for s in (q_shape, shape, shape)]
     return (q, k, v), score_mod, block_mask
 
 
-def compile_arm(tensors, score_mod, block_mask, mode, out):
+def compile_arm(tensors, score_mod, block_mask, mode, out, *, kernel_options=None):
 
     def fn(q, k, v):
-        return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
+        return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask, kernel_options=kernel_options)
 
     from torch._inductor.codecache import PyCodeCache
     modules = []
@@ -191,7 +193,7 @@ def flex_adapter():
         return meta
 
     with (
-            mock.patch.object(triton_heuristics, "tlx_only_cuda_options", lambda: ["ctas_per_cga"]),
+            mock.patch.object(triton_heuristics, "tlx_only_cuda_options", lambda: ["ctas_per_cga"], create=True),
             mock.patch.object(triton_heuristics.CachingAutotuner, "_create_compile_meta", compile_meta),
             config.patch({"inductor_choices_class": TLXInductorChoices, "compile_threads": 1}),
     ):

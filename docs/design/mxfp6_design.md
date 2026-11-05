@@ -276,6 +276,12 @@ in packed bytes end to end:
   are converted to byte coordinates in `smemLoad`, with `fp6Trans` handling
   the case where the packed dim is the transposed one. The smem base keeps
   its 16-byte alignment (offsets computed in 128-bit units).
+- **Instruction K form (NVIDIA)**: the padded shared-memory format
+  (`.b6x16_p32`) only has a K=32 instruction form, so a padded operand
+  forces `mmaSizeK = 32`. A Gluon/TLX MMA tile with a larger block K is
+  issued as blockK / 32 K=32 instructions chained under the one op's
+  commit/barrier, not as a single wider instruction; dense FP6 keeps
+  the K=64 form.
 - **AMD MFMA** (`packedKBase`): `kBase * 3 / 4` with a `kBase % 4 == 0`
   assert.
 - **AMD WMMA** (`packedKDim`): `kInstrSize * 3 / 4` with the same assert.

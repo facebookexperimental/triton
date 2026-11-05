@@ -782,9 +782,11 @@ static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
     if (col & holeMask)
       continue;
     auto desc = loader->smemLoad(0, logicalCol, rewriter, loc);
+    if (failed(desc))
+      return failure();
     auto tmemAddr =
         b.add(b.ptrtoint(i32_ty, baseDst), b.i32_val(col * bitwidth / 32));
-    createTcgen05Cp(rewriter, loc, tmemAddr, desc, pred, atom, twoCTAs);
+    createTcgen05Cp(rewriter, loc, tmemAddr, *desc, pred, atom, twoCTAs);
     logicalCol += instrShape[1];
   }
   return success();

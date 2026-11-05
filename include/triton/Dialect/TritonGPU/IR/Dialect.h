@@ -197,6 +197,12 @@ bool isGenericLinearEncoding(Attribute attr);
 // input digits. No other encoding parses other radices.
 bool isRadix2Encoding(Attribute layout);
 
+// Whether `op` lowers a Product layout: it is elementwise or declares
+// ProductLayoutOpInterface. The verifier admits a Product layout only on these
+// ops, and the NPOT pad pass keeps a connected component's shape only if all
+// its ops are.
+bool isProductLayoutOp(Operation *op);
+
 // Create a GenericLinearEncoding if the source isGenericLinearEncoding, and a
 // LinearEncoding otherwise.
 Attribute inferEncodingFromLinearLayout(MLIRContext *ctx, LinearLayout ll,
@@ -444,11 +450,36 @@ inline bool isExpensiveView(Type srcType, Type dstType) {
                          tensorDstType.getShape(), tensorDstType.getEncoding());
 }
 
+// True iff the reshape moves elements through shared memory: an NPOT source
+// whose result is not its register regroup.
+bool isNpotSharedReshape(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
+                         ArrayRef<int64_t> dstShape, Attribute dstEncoding);
+inline bool isNpotSharedReshape(RankedTensorType srcType,
+                                RankedTensorType dstType) {
+  return isNpotSharedReshape(srcType.getShape(), srcType.getEncoding(),
+                             dstType.getShape(), dstType.getEncoding());
+}
+
 // Return a blocked encoding where the shape is distributed contiguously amongst
 // the threads, warps, CTAs with 1 element per threads.
 triton::gpu::BlockedEncodingAttr
 getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
                           int numWarps, int threadsPerWarp, int numCTAs);
+
+// Under TRITON_ALLOW_NPOT, an NPOT `shape`'s Product layout with `vector`
+// elements along order[0] (default the last dim) and odd digits slowest. Fails
+// if pow2 or CTAs > 1.
+FailureOr<LinearEncodingAttr>
+getProductEncoding(MLIRContext *context, ArrayRef<int64_t> shape, int numWarps,
+                   int threadsPerWarp, int numCTAs, unsigned vector = 1,
+                   ArrayRef<unsigned> order = {});
+
+// The widest pow2 vector up to the pow2 `vector` along order[0] whose Product
+// layout of `shape` holds no more registers than the converter's layout (no
+// vector); `vector` unchanged if `shape` has no Product layout.
+unsigned getProductVector(MLIRContext *context, ArrayRef<int64_t> shape,
+                          unsigned vector, ArrayRef<unsigned> order,
+                          int numWarps, int threadsPerWarp);
 
 // Dump information about which threads/registers contain each of the tensor
 // elements.

@@ -238,11 +238,17 @@ struct SplitOpConversion : public ConvertOpToLLVMPattern<SplitOp> {
 struct ReshapeOpConversion : public ConvertOpToLLVMPattern<ReshapeOp> {
   using OpAdaptor = typename ReshapeOp::Adaptor;
   explicit ReshapeOpConversion(LLVMTypeConverter &typeConverter,
+                               const TargetInfoBase &targetInfo,
                                PatternBenefit benefit = patternBenefitDefault)
-      : ConvertOpToLLVMPattern<ReshapeOp>(typeConverter, benefit) {}
+      : ConvertOpToLLVMPattern<ReshapeOp>(typeConverter, benefit),
+        targetInfo(targetInfo) {}
   LogicalResult
   matchAndRewrite(ReshapeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (isNpotSharedReshape(op.getSrc().getType(), op.getType())) {
+      rewriter.replaceOp(op, lowerThroughSharedMemory(op, adaptor, rewriter));
+      return success();
+    }
     assert(!isExpensiveView(op.getSrc().getType(), op.getType()));
     Location loc = op.getLoc();
     auto resultTy = cast<RankedTensorType>(op.getType());
@@ -254,6 +260,49 @@ struct ReshapeOpConversion : public ConvertOpToLLVMPattern<ReshapeOp> {
     rewriter.replaceOp(op, ret);
     return success();
   }
+
+private:
+  // Scratch holds getBitwidth(srcTy) bits per element: pointers as i64 and i1
+  // as i8.
+  Value lowerThroughSharedMemory(ReshapeOp op, OpAdaptor adaptor,
+                                 ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    MLIRContext *ctx = op.getContext();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto kReg = str_attr("register");
+    RankedTensorType srcTy = op.getSrc().getType();
+    RankedTensorType dstTy = op.getType();
+    Type elemTy = getTypeConverter()->convertType(srcTy.getElementType());
+    bool isPtr = isa<LLVM::LLVMPointerType>(elemTy);
+    Type storageTy = isPtr                                ? i64_ty
+                     : elemTy.getIntOrFloatBitWidth() < 8 ? i8_ty
+                                                          : elemTy;
+    SmallVector<Value> vals =
+        unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+    for (Value &val : vals) {
+      if (isPtr)
+        val = b.ptrtoint(storageTy, val);
+      else if (storageTy != elemTy)
+        val = b.zext(storageTy, val);
+    }
+    LinearLayout srcLayout =
+        toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
+    vals = transferProductThroughSharedMemory(
+        loc, rewriter, targetInfo, srcLayout,
+        toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg), vals, storageTy,
+        LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op),
+        srcLayout.getFreeVariableMasks(), /*blockScope=*/true);
+    for (Value &val : vals) {
+      if (isPtr)
+        val = b.inttoptr(elemTy, val);
+      else if (storageTy != elemTy)
+        val = b.trunc(elemTy, val);
+    }
+    return packUniqueTensorElements(loc, getTypeConverter(), vals, rewriter,
+                                    dstTy);
+  }
+
+  const TargetInfoBase &targetInfo;
 };
 struct ExpandDimsOpConversion : public ConvertOpToLLVMPattern<ExpandDimsOp> {
   using OpAdaptor = typename ExpandDimsOp::Adaptor;
@@ -562,8 +611,8 @@ struct MemDescDynamicSubsliceOpConversion
       auto shapePerCTA = getShapePerCTA(part, allocShape);
       unsigned dim = part.getPartitionDim();
       int64_t pieceSize = shapePerCTA[dim] / part.getNumLogicalPieces();
-      Value shift = b.urem(b.udiv(layoutOffsets[dim], b.i32_val(pieceSize)),
-                           b.i32_val(part.getNumPartitions()));
+      Value pieceIndex = b.udiv(layoutOffsets[dim], b.i32_val(pieceSize));
+      Value shift = b.urem(pieceIndex, b.i32_val(part.getNumPartitions()));
       Value vector = LLVM::buildBasePtrVector(loc, rewriter, newBases);
       for (unsigned i = 0; i < newBases.size(); ++i)
         newBases[i] = b.extract_element(vector, b.xor_(shift, b.i32_val(i)));
@@ -607,8 +656,8 @@ struct MemDescReinterpretOpConversion
 
 void mlir::triton::populateViewOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    PatternBenefit benefit) {
-  patterns.add<ReshapeOpConversion>(typeConverter, benefit);
+    const TargetInfoBase &targetInfo, PatternBenefit benefit) {
+  patterns.add<ReshapeOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<ExpandDimsOpConversion>(typeConverter, benefit);
   patterns.add<SplatOpConversion>(typeConverter, benefit);
   patterns.add<UnsplatOpConversion>(typeConverter, benefit);

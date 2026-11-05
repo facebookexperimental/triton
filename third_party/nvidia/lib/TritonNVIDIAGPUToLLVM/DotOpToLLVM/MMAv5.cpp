@@ -6,6 +6,7 @@
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "llvm/ADT/StringSwitch.h"
 
 #include <array>
@@ -31,8 +32,13 @@ public:
     // We take the full layout even when it is a subview
     // We'll just iterate the real shape when calling tmemLoad tho
     unsigned storageElementBitWidth = memTy.getElementTypeBitWidth();
+    // FP6 codes are carried in i8 TMEM storage (the scaled MMA verifier
+    // requires i8 LHS storage), while the operand format is 6 bits wide.
+    // The 8 % 6 != 0 mismatch is expected: packing is group-based
+    // (4 values per 3 bytes), handled by the x3/4 conversion in tmemLoad.
+    bool isFp6 = storageElementBitWidth == 8 && logicalElementBitWidth == 6;
     assert(logicalElementBitWidth > 0 &&
-           storageElementBitWidth % logicalElementBitWidth == 0 &&
+           (isFp6 || storageElementBitWidth % logicalElementBitWidth == 0) &&
            "logical element bit width must divide TMEM storage bit width");
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     Value address = tb.ptrtoint(i32_ty, tmemBase);
@@ -42,25 +48,47 @@ public:
                                 logicalElementBitWidth);
   }
 
-  MemDescOperand tmemLoad(int a, int b, ConversionPatternRewriter &rewriter,
-                          Location loc) const {
+  FailureOr<MemDescOperand> tmemLoad(int a, int b,
+                                     ConversionPatternRewriter &rewriter,
+                                     Location loc) const {
     // MMAv5 supplies a logical K coordinate, while byte-backed FP4 memdescs
     // use packed K coordinates. This applies to both dense and fp4Padded FP4;
     // the memdesc layout handles any additional physical padding.
-    unsigned packingFactor = storageElementBitWidth / logicalElementBitWidth;
-    assert(b % packingFactor == 0 &&
-           "logical K coordinate must be aligned to packed storage");
-    b /= packingFactor;
+    if (storageElementBitWidth == 8 && logicalElementBitWidth == 6) {
+      // Scope: TMEM holds dense-packed i8 codes, so the x3/4 conversion
+      // below is the whole story. The padded .b6x16_p32 container is an
+      // SMEM-only format that tcgen05.mma reads directly from shared
+      // memory; it never stages through TMEM, so no pad-quarter enters
+      // this coordinate math.
+      // fp6 packs groups of 16 values per 12 bytes; b steps by 4 values
+      // within a group for the x3/4 byte conversion.
+      if (b % 4 != 0)
+        return mlir::emitError(loc)
+               << "fp6 TMEM K coordinate " << b
+               << " is not a multiple of 4, so it cannot be converted to "
+               << "packed bytes (x3/4)";
+      b = b * 3 / 4;
+    } else {
+      unsigned packingFactor = storageElementBitWidth / logicalElementBitWidth;
+      if (b % packingFactor != 0)
+        return mlir::emitError(loc)
+               << "logical K coordinate " << b
+               << " is not aligned to the packed storage factor "
+               << packingFactor;
+      b /= packingFactor;
+    }
     auto dims = to_vector(ll.getInDimNames());
     auto rowCol = ll.apply({{dims[0], a}, {dims[1], b}});
     int row = rowCol[0].second;
     int col = rowCol[1].second * storageElementBitWidth / 32;
     int offset = col | (row << 16);
-    return {address, offset};
+    return MemDescOperand{address, offset};
   }
 
-  MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,
-                         Location loc, int kSize = 0) const override {
+  FailureOr<MemDescOperand> memLoad(int a, int b,
+                                    ConversionPatternRewriter &rewriter,
+                                    Location loc,
+                                    int kSize = 0) const override {
     return tmemLoad(a, b, rewriter, loc);
   }
 
@@ -648,14 +676,22 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
   std::unique_ptr<DotOpMmaMemLoader> aLoader;
   bool transA = false;
   auto isFp4a = op.numBitsPerElementA == 4;
+  // Dense vs padded FP6 is keyed on the encoding, not inferred from
+  // mmaSizeK alone: the scaled caller forces mmaSizeK=32 for padded
+  // operands, but a hand-written or future caller that reaches here
+  // with a padded encoding and K=64 must still take the padded path
+  // by construction. Dense K=32 keeps the byte-coordinate path.
+  bool aFp6Padded = ttng::isFp6Padded(aTensorTy.getEncoding());
+  auto isFp6a = op.numBitsPerElementA == 6 && !aFp6Padded && op.mmaSizeK == 64;
   if (aInTmem) {
     aLoader =
         std::make_unique<DotOpMmaV5TmemLoader>(DotOpMmaV5TmemLoader::build(
-            loc, rewriter, aTensorTy, baseA, op.numBitsPerElementA));
+            loc, rewriter, aTensorTy, baseA,
+            op.numBitsPerElementA == 6 && !isFp6a ? 8 : op.numBitsPerElementA));
   } else {
-    auto loader =
-        DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
-                                  aOperandShape, 0, 5, lessRegMMA, isFp4a);
+    auto loader = DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
+                                            aOperandShape, 0, 5, lessRegMMA,
+                                            isFp4a, std::nullopt, isFp6a);
     if (failed(loader)) {
       return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
                                   "operand A in shared memory ")
@@ -667,8 +703,11 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
   }
 
   auto isFp4b = op.numBitsPerElementB == 4;
-  auto bLoader = DotOpMmaSmemLoader::build(
-      loc, rewriter, bTensorTy, baseB, bOperandShape, 1, 5, lessRegMMA, isFp4b);
+  bool bFp6Padded = ttng::isFp6Padded(bTensorTy.getEncoding());
+  auto isFp6b = op.numBitsPerElementB == 6 && !bFp6Padded && op.mmaSizeK == 64;
+  auto bLoader =
+      DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB, bOperandShape,
+                                1, 5, lessRegMMA, isFp4b, std::nullopt, isFp6b);
   if (failed(bLoader)) {
     return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
                                 "operand B in shared memory ")
@@ -762,14 +801,16 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
     if (collectorA)
       reuse.a = explicitReuseA;
     auto [m, n, k] = indices;
-    MemDescOperand accAddress =
+    auto accAddress =
         dLoader.tmemLoad(m * mmaSizeM, n * mmaSizeN, rewriter, loc);
-    MemDescOperand a = aLoader->memLoad(m * aOperandShape[0], op.getKOffset(k),
-                                        rewriter, loc, op.getKSize(k));
-    Value b = bLoader->smemLoad(op.getKOffset(k), n * bOperandShape[1],
-                                rewriter, loc, op.getKSize(k));
+    auto a = aLoader->memLoad(m * aOperandShape[0], op.getKOffset(k), rewriter,
+                              loc, op.getKSize(k));
+    auto b = bLoader->smemLoad(op.getKOffset(k), n * bOperandShape[1], rewriter,
+                               loc, op.getKSize(k));
+    if (failed(accAddress) || failed(a) || failed(b))
+      return failure();
     Value useInitAcc = k == 0 ? useDFlag : tb.i1_val(1);
-    createGen5MMA(rewriter, loc, op.kind, a, b, accAddress, elect,
+    createGen5MMA(rewriter, loc, op.kind, *a, *b, *accAddress, elect,
                   op.getInstOperands(desc, m, n, k), useInitAcc, twoCTAs,
                   reuse);
     previous = indices;
@@ -956,6 +997,9 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
 
   dot.numBitsPerElementA = getFormatBitSize(op.getAType());
   dot.numBitsPerElementB = getFormatBitSize(op.getBType());
+  if (ttng::isFp6Padded(aTensorTy.getEncoding()) ||
+      ttng::isFp6Padded(bTensorTy.getEncoding()))
+    dot.mmaSizeK = 32;
 
   TritonLLVMOpBuilder tb(loc, rewriter);
   Value baseScaleA = tb.ptrtoint(i32_ty, adaptor.getAScale());

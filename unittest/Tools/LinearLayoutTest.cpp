@@ -1642,6 +1642,51 @@ TEST_F(ProductCarrierTest, ReshapeInsAndRemoveZeroBasesKeepProduct) {
             ll);
 }
 
+TEST_F(ProductCarrierTest, FreeVariableMasksFreeNonOwningDigits) {
+  // Digit 1 repeats digit 0's binary part and digit 3 is a zero odd digit;
+  // digit 2 owns the odd coordinates.
+  EXPECT_EQ(product({{1}, {1}, {2}, {0}}, {2, 2, 3, 3}, {{S("dim"), 6}})
+                .getFreeVariableMasks()
+                .lookup(S("register")),
+            0b1010);
+}
+
+TEST_F(ProductCarrierTest, MultiplyPlacesOddPartOnTop) {
+  auto kReg = S("register"), kOut = S("out");
+  // Inner's odd digit moves above outer's binary digits.
+  EXPECT_EQ(exactIdentity1D(6, kReg, kOut) *
+                LinearLayout::identity1D(4, kReg, kOut),
+            product({{1}, {8}, {2}, {4}}, {2, 3, 2, 2}, {{kOut, 24}}));
+  EXPECT_EQ(LinearLayout::identity1D(2, kReg, kOut) *
+                exactIdentity1D(6, kReg, kOut),
+            exactIdentity1D(12, kReg, kOut));
+}
+
+TEST_F(ProductCarrierTest, MultiplyRejectsTwoProductFactorsOnOneOutput) {
+  auto kReg = S("register"), kOut = S("out");
+  EXPECT_DEATH(
+      (void)(exactIdentity1D(3, kReg, kOut) * exactIdentity1D(5, kReg, kOut)),
+      "each odd part needs one non-binary digit");
+}
+
+TEST_F(ProductCarrierTest, Apply) {
+  LinearLayout six = exactIdentity1D(6, S("register"), S("dim"));
+  for (int32_t i = 0; i < 24; ++i)
+    EXPECT_EQ(six.apply({{S("register"), i}}).front().second, i % 6) << i;
+  // A Binary output beside a Product output keeps XOR arithmetic.
+  LinearLayout twoDims =
+      six * LinearLayout::identity1D(4, S("lane"), S("other"));
+  for (int32_t lane = 0; lane < 4; ++lane)
+    EXPECT_THAT(twoDims.apply({{S("register"), 5}, {S("lane"), lane}}),
+                ElementsAre(Pair(S("dim"), 5), Pair(S("other"), lane)));
+  // Odd coefficient 2 is a unit mod 3: digit 2 wraps to odd coordinate 1.
+  EXPECT_EQ(product({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
+                .apply({{S("register"), 4}})
+                .front()
+                .second,
+            2);
+}
+
 } // anonymous namespace
 } // namespace mlir::triton
 

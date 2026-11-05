@@ -1631,4 +1631,19 @@ void ModuleAxisInfoAnalysis::update(CallOpInterface callOp,
   }
 }
 
+unsigned getAxisInfoVector(const AxisInfo &info, Type ptrType,
+                           ArrayRef<int64_t> shape, unsigned dim,
+                           int64_t threads, unsigned maxBits) {
+  unsigned bits = getPointeeBitWidth(ptrType);
+  uint64_t aligned =
+      std::max<int64_t>(info.getDivisibility(dim) / std::max(bits / 8, 1u), 1);
+  uint64_t perThread =
+      std::max<int64_t>(ShapedType::getNumElements(shape) / threads, 1);
+  // A run of contiguous elements can be NPOT, and must hold whole vectors.
+  uint64_t contiguity = std::min<int64_t>(info.getContiguity(dim), shape[dim]);
+  return std::min<uint64_t>({aligned, maxBits / bits,
+                             llvm::bit_floor(perThread),
+                             uint64_t(1) << llvm::countr_zero(contiguity)});
+}
+
 } // namespace mlir::triton

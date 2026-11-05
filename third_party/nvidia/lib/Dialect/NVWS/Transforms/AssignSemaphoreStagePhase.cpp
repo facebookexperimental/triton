@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "AssignSemaphoreStagePhase.h"
 #include "Utilities.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -1115,11 +1116,20 @@ struct AssignStagePhase {
   //   - nvws.semaphore.buffer / nvws.semaphore.release
   //   - scf.for when the token is passed through iter_args
   //   - scf.yield when the token is yielded out of a region
-  std::optional<AccessKind>
-  classifyFirstAccessAfterAcquireOp(Value trackedToken, Block *block,
-                                    SemaphoreAcquireOp acquireOp) {
+  std::optional<AccessKind> classifyFirstAccessAfterAcquireOp(
+      Value trackedToken, Block *block, SemaphoreAcquireOp acquireOp,
+      DenseSet<std::pair<Value, Block *>> &visiting) {
     if (!block || !trackedToken)
       return {};
+
+    // A conditional may pass the token through without accessing its buffer,
+    // and a surrounding loop can carry it back to the same conditional. Such
+    // a cycle supplies no new first-access fact. Stop this path, while still
+    // considering the other branch and the loop's exit continuation.
+    auto state = std::make_pair(trackedToken, block);
+    if (!visiting.insert(state).second)
+      return {};
+    llvm::scope_exit guard([&] { visiting.erase(state); });
 
     // Pick the earliest token event visible in this block. A real token user
     // is either in this block directly, or nested under an if/for region
@@ -1133,11 +1143,11 @@ struct AssignStagePhase {
       // The token is used in one or both branches. Follow both branch-local
       // continuations and merge the first access they prove.
       auto thenAccess = classifyFirstAccessAfterAcquireOp(
-          trackedToken, ifOp.thenBlock(), acquireOp);
-      auto elseAccess = ifOp.elseBlock()
-                            ? classifyFirstAccessAfterAcquireOp(
-                                  trackedToken, ifOp.elseBlock(), acquireOp)
-                            : std::nullopt;
+          trackedToken, ifOp.thenBlock(), acquireOp, visiting);
+      auto elseAccess = ifOp.elseBlock() ? classifyFirstAccessAfterAcquireOp(
+                                               trackedToken, ifOp.elseBlock(),
+                                               acquireOp, visiting)
+                                         : std::nullopt;
       return mergeBranchAccess(thenAccess, elseAccess);
     } else if (auto forOp = dyn_cast<scf::ForOp>(eventOp)) {
       // The token is loop-carried. Remap it to the body iter arg and let the
@@ -1147,7 +1157,7 @@ struct AssignStagePhase {
       if (auto pos = findValuePosInRange(forOp.getInitArgs(), trackedToken))
         bodyToken = forOp.getRegionIterArgs()[*pos];
       return classifyFirstAccessAfterAcquireOp(bodyToken, forOp.getBody(),
-                                               acquireOp);
+                                               acquireOp, visiting);
     } else if (auto bufferOp = getTrackedBufferOp(eventOp, {trackedToken})) {
       std::optional<AccessKind> merged;
       for (Value result : bufferOp->getResults()) {
@@ -1181,7 +1191,7 @@ struct AssignStagePhase {
         // Yielded token from an if-region continues as the matching
         // if-result.
         return classifyFirstAccessAfterAcquireOp(parentToken, ifOp->getBlock(),
-                                                 acquireOp);
+                                                 acquireOp, visiting);
       } else if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
         // Yielded token from a loop body may be observed on the next
         // iteration and/or after the loop through the for-result; both
@@ -1196,10 +1206,10 @@ struct AssignStagePhase {
           }
         }
         assert(nextToken && "token not found in yield");
-        auto nextAccess =
-            classifyFirstAccessAfterAcquireOp(nextToken, block, acquireOp);
+        auto nextAccess = classifyFirstAccessAfterAcquireOp(
+            nextToken, block, acquireOp, visiting);
         auto exitAccess = classifyFirstAccessAfterAcquireOp(
-            parentToken, forOp->getBlock(), acquireOp);
+            parentToken, forOp->getBlock(), acquireOp, visiting);
         return mergeContinuationAccess(nextAccess, exitAccess);
       }
     }
@@ -1208,8 +1218,9 @@ struct AssignStagePhase {
   }
 
   bool isFirstUseFreshWriteAfterAcquire(SemaphoreAcquireOp acquireOp) {
+    DenseSet<std::pair<Value, Block *>> visiting;
     auto access = classifyFirstAccessAfterAcquireOp(
-        acquireOp.getToken(), acquireOp->getBlock(), acquireOp);
+        acquireOp.getToken(), acquireOp->getBlock(), acquireOp, visiting);
     return access && *access == AccessKind::Store;
   }
 
@@ -2098,6 +2109,12 @@ LogicalResult assignStagePhase(triton::FuncOp funcOp) {
 // ----------------------------------------------------------------------------
 
 } // anonymous namespace
+
+bool nvws_semas::isFirstUseFreshWriteAfterAcquire(SemaphoreAcquireOp acquireOp,
+                                                  ArrayRef<Value> semaphores) {
+  return AssignStagePhase(semaphores)
+      .isFirstUseFreshWriteAfterAcquire(acquireOp);
+}
 
 class NVWSAssignSemaphoreStagePhase
     : public impl::NVWSAssignSemaphoreStagePhaseBase<
