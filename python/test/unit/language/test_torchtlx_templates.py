@@ -3879,7 +3879,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                             mock.patch.object(
                                 flex_attention_templates,
                                 "current_target",
-                                return_value=type("Target", (), {"num_sms": 256})(),
+                                return_value=type("Target", (), {"num_sms": 256, "key": "sm100"})(),
                             ),
                             mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_eligible",
                                               return_value=True),
@@ -3911,6 +3911,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                 choices = []
                 with (
                         config.patch({"triton.tlx_mode": "force", "max_autotune": False}),
+                        mock.patch.object(flex_attention_templates, "current_target",
+                                          return_value=mock.Mock(key="gfx950")),
                         mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
                         mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
                 ):
@@ -3942,6 +3944,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                 choices = []
                 with (
                         config.patch({"triton.tlx_mode": "force", "max_autotune": max_autotune}),
+                        mock.patch.object(flex_attention_templates, "current_target",
+                                          return_value=mock.Mock(key="gfx950")),
                         mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
                         mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
                 ):
@@ -4376,7 +4380,7 @@ class TestBlackwellFlexAttentionChoices(TestCase):
 
         registration = TestFlexAttentionChoiceRegistration
         qkv = [registration._Node([2, 8, rows, 128], dtype) for rows, dtype in zip((q_len, 512, 512), dtypes)]
-        target = type("Target", (), {"num_sms": 148, "is_blackwell": is_blackwell})()
+        target = type("Target", (), {"key": "sm100", "num_sms": 148, "is_blackwell": is_blackwell})()
         choices = []
         with (
                 config.patch({"triton.tlx_mode": "force"}),

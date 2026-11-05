@@ -1179,6 +1179,24 @@ def test_none_skips_every_cold_pass(monkeypatch):
     assert not any(cold for _, cold in seen)
 
 
+def test_prepared_graph_compile_time_reaches_verdict(monkeypatch):
+    from types import SimpleNamespace
+    import torch
+    from _harness import driver
+
+    compile_stat = CompileStat(t_cold_s=121.0, n_compiles=1, cap_s=120.0)
+    bench = SimpleNamespace(prepare=lambda case, space: driver.Prepared(lambda: None, compile_stat=compile_stat))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(driver, "measure", lambda *a, **kw: summarize([1.0]))
+    monkeypatch.setattr(driver, "host_overhead_us", lambda fn: 0.0)
+    monkeypatch.setattr(driver, "cold_compile",
+                        lambda *a, **kw: pytest.fail("must not time a graph replay as compilation"))
+    result = driver.run_case(bench, _case(), space="heuristic", cold=False)
+    assert result.t_cold_s == compile_stat.t_cold_s
+    assert result.status == Status.PIP
+
+
 def test_an_explicit_mode_overrides_the_ops_own(monkeypatch):
     seen = _cold_flags(_FakeBench(cold_compile="first"), monkeypatch, mode="all")
     assert all(cold for _, cold in seen)
@@ -1696,3 +1714,18 @@ def test_gfx1250_governor_does_not_guess_clock_or_power_policy(monkeypatch):
     governor._govern_amd(governor.device)
     assert not calls
     assert governor.skipped
+
+
+def test_gfx1250_attention_focus_cases_share_production_shapes(monkeypatch):
+    from _harness import driver
+    import bench_flash_attn as standalone
+    import bench_torchtlx_flex_attention as flex
+    from triton.tlx.ops.kernels.flash_attn._shapes import GFX1250_PRODUCTION
+
+    monkeypatch.setattr(driver, "arch", lambda: "gfx1250")
+    expected = {(s.batch, s.heads, s.context, s.head_dim) for s in GFX1250_PRODUCTION}
+    for bench in (standalone, flex):
+        cases = bench.cases()
+        assert {case.shape[:4] for case in cases} == expected
+        assert {case.dtype for case in cases} == {"float16", "bfloat16"}
+        assert {case.direction for case in cases} == {"fwd"}
