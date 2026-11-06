@@ -495,6 +495,12 @@ unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
                              unsigned vector, ArrayRef<unsigned> order,
                              int numWarps, int threadsPerWarp);
 
+// Registers per shared access of a mixed-radix `regLayout`: leading register
+// digits at consecutive offsets through the pow2 `toOffset`, at most 128 bits,
+// cut until every run starts aligned.
+int32_t getMixedRadixSharedRun(const LinearLayout &regLayout,
+                               const LinearLayout &toOffset, unsigned bitwidth);
+
 // Dump information about which threads/registers contain each of the tensor
 // elements.
 void dumpLayout(RankedTensorType tensorType);
