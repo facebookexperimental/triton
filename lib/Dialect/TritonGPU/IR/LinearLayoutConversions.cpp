@@ -1075,7 +1075,9 @@ NvidiaMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   return combineCtaCgaWithShape(ctaLayout, getCGALayout(), shape);
 }
 
-bool NvidiaMmaEncodingAttr::hasMixedRadixLayout() const { return isHopper(); }
+bool NvidiaMmaEncodingAttr::hasMixedRadixLayout() const {
+  return isAmpere() || isHopper();
+}
 
 LinearLayout
 NvidiaMmaEncodingAttr::dotOperandToLinearLayout(Attribute dotOp,

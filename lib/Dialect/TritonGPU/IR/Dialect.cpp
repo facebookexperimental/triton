@@ -753,10 +753,22 @@ SmallVector<unsigned> getMmaV2WarpsPerCTA(ArrayRef<int64_t> shape,
   SmallVector<int64_t> reps = {ceil(shape[0], int64_t{16}),
                                ceil(shape[1], int64_t{8})};
   SmallVector<unsigned> warps = {1, 1};
+  // Under TRITON_ALLOW_NPOT, warps stay on each dim's two-part where one fits,
+  // so an NPOT dim's odd part repeats in registers.
+  bool npot = triton::tools::isNpotAllowed() &&
+              !llvm::all_of(shape, llvm::isPowerOf2_64);
+  auto fits = [&](int dim, int64_t tile) {
+    return !npot ||
+           warps[dim] * 2 * tile <=
+               LinearLayout::twoPartOf(static_cast<int32_t>(shape[dim]));
+  };
   // Balance repetitions to reduce register pressure, breaking ties toward M
   // because the lhs instruction tile uses more registers than the rhs.
   while (product(warps) < numWarps) {
-    if (reps[0] >= reps[1]) {
+    bool onM = reps[0] >= reps[1];
+    if (fits(0, 16) != fits(1, 8))
+      onM = fits(0, 16);
+    if (onM) {
       warps[0] *= 2;
       if (reps[0] != 1)
         reps[0] /= 2;
