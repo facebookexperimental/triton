@@ -12,6 +12,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -163,16 +164,6 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
   }
 }
 
-SmallVector<unsigned, 4>
-getOrderFromContiguity(const SmallVector<int64_t> &arr) {
-  SmallVector<unsigned, 4> ret(arr.size());
-  std::iota(ret.begin(), ret.end(), 0);
-  std::reverse(ret.begin(), ret.end());
-  std::stable_sort(ret.begin(), ret.end(),
-                   [&](unsigned x, unsigned y) { return arr[x] > arr[y]; });
-  return ret;
-}
-
 Value getMemAccessPtr(Operation *op) {
   if (auto ld = dyn_cast<triton::LoadOp>(op))
     return ld.getPtr();
@@ -194,9 +185,13 @@ unsigned getElementBitWidth(RankedTensorType type) {
 }
 
 static std::optional<unsigned>
-getAtomicWriteElementsPerThreadCap(Operation *op) {
-  if (isa<triton::AtomicLoadOp, triton::AtomicStoreOp>(op))
-    return 1;
+getAtomicElementsPerThreadCap(Operation *op, unsigned bitWidth) {
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+  if (isa<triton::AtomicLoadOp, triton::AtomicStoreOp>(op)) {
+    auto targetInfo = TargetInfoBase::fromModuleOp(moduleOp);
+    return targetInfo ? targetInfo->getMaxAtomicLoadStoreVectorSize(bitWidth)
+                      : 1;
+  }
   if (isa<triton::AtomicCASOp>(op))
     return 1;
 
@@ -208,8 +203,6 @@ getAtomicWriteElementsPerThreadCap(Operation *op) {
   if (elemTy.isInteger() || elemTy.isF64())
     return 1;
 
-  auto moduleOp = op->getParentOfType<ModuleOp>();
-
   if (moduleOp && getAMDArch(moduleOp)) {
     unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
     return std::max(1u, 32u / elemBitwidth);
@@ -218,10 +211,8 @@ getAtomicWriteElementsPerThreadCap(Operation *op) {
   if (atomicRmw.getAtomicRmwOp() != RMWOp::FADD)
     return std::nullopt;
 
-  auto targetAttr =
-      moduleOp ? moduleOp->getAttrOfType<StringAttr>(ttg::AttrTargetName)
-               : nullptr;
-  if (!targetAttr || !targetAttr.getValue().starts_with("cuda:"))
+  auto targetInfo = TargetInfoBase::fromModuleOp(moduleOp);
+  if (!targetInfo || !targetInfo->isCuda())
     return std::nullopt;
 
   int computeCapability = getNVIDIAComputeCapability(moduleOp);
@@ -239,15 +230,12 @@ static unsigned getMaxElementsPerThread(Operation *op, unsigned maxVecBits) {
   Value val = getMemAccessPtr(op);
   auto ty = cast<RankedTensorType>(val.getType());
   unsigned elemNumBits = getElementBitWidth(ty);
-  unsigned maxElementsPerThread = maxVecBits / elemNumBits;
   // Some atomic lowerings are narrower than a plain store. TTGIR currently
   // exposes the target architecture but not the PTX version, so we only cap
   // cases that are unambiguous from the available target metadata and the
   // current backend lowering.
-  if (auto atomicCap = getAtomicWriteElementsPerThreadCap(op)) {
-    maxElementsPerThread = std::min(maxElementsPerThread, *atomicCap);
-  }
-  return maxElementsPerThread;
+  return getAtomicElementsPerThreadCap(op, elemNumBits)
+      .value_or(maxVecBits / elemNumBits);
 }
 
 static bool hasDotOperandLayoutUser(Operation *op) {
@@ -705,7 +693,7 @@ static bool isSingleValue(Value value) {
   return true;
 }
 
-Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
+static Attribute inferSrcEncodingAtAnyShape(Operation *op, Attribute encoding) {
   if (isa<triton::ScanOp>(op)) {
     // Scan only supports blocked encoding at the moment.
     if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
@@ -718,7 +706,7 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
   if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::SameLoadStoreOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::Elementwise>() ||
-      isa<scf::WhileOp, scf::YieldOp, scf::ConditionOp,
+      isa<triton::BroadcastOp, scf::WhileOp, scf::YieldOp, scf::ConditionOp,
           nvidia_gpu::WarpGroupDotWaitOp>(op)) {
     return encoding;
   }
@@ -743,7 +731,7 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
   return {};
 }
 
-Attribute inferDstEncoding(Operation *op, Attribute encoding) {
+static Attribute inferDstEncodingAtAnyShape(Operation *op, Attribute encoding) {
   if (isa<triton::ScanOp>(op)) {
     if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
       return {};
@@ -754,8 +742,8 @@ Attribute inferDstEncoding(Operation *op, Attribute encoding) {
   if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::SameLoadStoreOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::Elementwise>() ||
-      isa<scf::WhileOp, scf::ForOp, scf::YieldOp, scf::ConditionOp,
-          nvidia_gpu::WarpGroupDotWaitOp>(op))
+      isa<triton::BroadcastOp, scf::WhileOp, scf::ForOp, scf::YieldOp,
+          scf::ConditionOp, nvidia_gpu::WarpGroupDotWaitOp>(op))
     return encoding;
   if (auto reduceOp = dyn_cast<triton::ReduceOp>(op))
     return inferDstEncoding(reduceOp, encoding);
@@ -775,6 +763,33 @@ Attribute inferDstEncoding(Operation *op, Attribute encoding) {
     return inferDstEncoding(fp4ToFp, encoding);
 
   return {};
+}
+
+// RLC can carry a mixed-radix encoding through a reduce onto another extent,
+// e.g. a broadcast, where it isn't exact. Inferring none there keeps the
+// convert.
+static Attribute ifExactLayoutAt(Operation *op, Attribute encoding,
+                                 ValueRange values) {
+  if (!encoding || isa<scf::WhileOp, scf::ForOp, scf::YieldOp, scf::ConditionOp,
+                       nvidia_gpu::WarpGroupDotWaitOp>(op))
+    return encoding;
+  for (Value value : values)
+    if (auto type = dyn_cast<RankedTensorType>(value.getType()))
+      if (!triton::gpu::hasExactLayoutAt(type.cloneWithEncoding(encoding)))
+        return {};
+  return encoding;
+}
+
+Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
+  Attribute srcEncoding = inferSrcEncodingAtAnyShape(op, encoding);
+  if (auto gather = dyn_cast<triton::GatherOp>(op))
+    return ifExactLayoutAt(op, srcEncoding, gather.getIndices());
+  return ifExactLayoutAt(op, srcEncoding, op->getOperands());
+}
+
+Attribute inferDstEncoding(Operation *op, Attribute encoding) {
+  return ifExactLayoutAt(op, inferDstEncodingAtAnyShape(op, encoding),
+                         op->getResults());
 }
 
 bool isExpensiveLoadOrStore(Operation *op) {

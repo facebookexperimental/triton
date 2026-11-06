@@ -403,13 +403,13 @@ public:
                         bool requireSurjective);
 
   // Same, with explicit input radices (one per basis); empty means all 2.
-  // This constructor and its tryCreate admit any positive out-dim size, even
+  // This constructor and its tryCreate allow any positive out-dim size, even
   // with empty radices.
   explicit LinearLayout(BasesT bases, RadicesT inputRadices,
                         ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                         bool requireSurjective);
 
-  // A Product output splits each basis at its size's power-of-two factor:
+  // A mixed-radix output splits each basis at its size's power-of-two factor:
   // `binary` XORs in for a nonzero digit and `odd` is added digit times.
   struct BasisContribution {
     int32_t binary;
@@ -462,8 +462,8 @@ public:
       ArrayRef<std::pair<StringAttr, int32_t>> outDims, bool requireSurjective);
 
   bool isSurjective() const {
-    if (hasNonBinaryCarrier())
-      return rank == getProductCodomainRank();
+    if (hasNonPow2OutDim())
+      return rank == getMixedRadixCodomainRank();
     return rank == getTotalOutDimSizeLog2();
   }
   bool isInjective() const { return rank == getTotalInDimSizeLog2(); }
@@ -496,7 +496,7 @@ public:
   // False for a non-binary input digit or a non-Binary output: the radix-2
   // algorithms below assert it.
   bool isRadix2() const;
-  bool hasNonBinaryCarrier() const {
+  bool hasNonPow2OutDim() const {
     return !llvm::all_of(llvm::make_second_range(outDims), [](int32_t size) {
       return llvm::isPowerOf2_32(size);
     });
@@ -871,21 +871,21 @@ private:
                NoCheckInvariants);
 
   [[nodiscard]] std::optional<std::string>
-  checkInvariants(bool requireSurjective, bool allowProductSizes);
+  checkInvariants(bool requireSurjective, bool allowMixedRadixSizes);
   [[nodiscard]] std::optional<std::string> checkInputRadices() const;
-  [[nodiscard]] std::optional<std::string> checkProductCarriers() const;
-  // A Product output (any size but a power of 2) XORs bases below the size's
-  // largest power-of-two factor and adds the odd part above it.
-  bool isProductOutDim(StringAttr outDim) const {
+  [[nodiscard]] std::optional<std::string> checkMixedRadixOutDims() const;
+  // A mixed-radix output (any size but a power of 2) XORs bases below the
+  // size's largest power-of-two factor and adds the odd part above it.
+  bool isMixedRadixOutDim(StringAttr outDim) const {
     return !llvm::isPowerOf2_32(getOutDimSize(outDim));
   }
-  // The rank of a layout that passed checkProductCarriers: the binary part's
+  // The rank of a layout that passed checkMixedRadixOutDims: the binary part's
   // plus one per non-binary digit, which owns one odd coordinate or is zero.
-  int32_t getProductRank() const;
+  int32_t getMixedRadixRank() const;
 
-  // Binary output bits plus one odd coordinate per Product output.
-  int32_t getProductCodomainRank() const;
-  // The GF(2) layout of the binary parts: Product outputs keep their
+  // Binary output bits plus one odd coordinate per mixed-radix output.
+  int32_t getMixedRadixCodomainRank() const;
+  // The GF(2) layout of the binary parts: mixed-radix outputs keep their
   // power-of-two factor (checked non-binary digits have no binary part).
   LinearLayout binaryPart() const;
 };

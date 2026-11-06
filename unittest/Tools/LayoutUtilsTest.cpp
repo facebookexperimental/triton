@@ -1,5 +1,5 @@
 #include "triton/Tools/LayoutUtils.h"
-#include "unittest/Tools/ProductLayouts.h"
+#include "unittest/Tools/MixedRadixLayouts.h"
 #include "unittest/Util/ScopedAllowNpot.h"
 
 #include "mlir/Support/LLVM.h"
@@ -83,7 +83,7 @@ TEST_F(LayoutUtilsTest, MixedRadixHelpersKeepRadices) {
               ::testing::ElementsAre(0, 3));
 }
 
-TEST_F(LayoutUtilsTest, EnsureLayoutNotSmallerThanNpotCover) {
+TEST_F(LayoutUtilsTest, EnsureLayoutNotSmallerThanNpotPow2AllocShape) {
   auto layout = LinearLayout::identity1D(64, S("register"), S("dim0"));
 #ifndef NDEBUG
   // Without the flag an NPOT extent still aborts.
@@ -91,7 +91,7 @@ TEST_F(LayoutUtilsTest, EnsureLayoutNotSmallerThanNpotCover) {
                "isPowerOf2_32");
 #endif
   ScopedAllowNpot npot;
-  // 192 / 64 floors to 3; the layout grows to the cover 256 instead.
+  // 192 / 64 floors to 3; the layout grows to the pow2 alloc shape 256 instead.
   EXPECT_EQ(ensureLayoutNotSmallerThan(layout, {{S("dim0"), 192}}),
             LinearLayout::identity1D(256, S("register"), S("dim0")));
 }
@@ -165,8 +165,8 @@ TEST_F(LayoutUtilsTest, GetRepsWithSubsetOfOutputDims) {
 }
 
 TEST_F(LayoutUtilsTest, LogicalOutputCoverageDistinguishesJointCoverage) {
-  // 11 radix-2 digits on a 64x64 cover; the coupled digit reaches dim0 = 32
-  // and dim1 = 32 only together, so the 33x48 box is not covered.
+  // 11 radix-2 digits on a 64x64 pow2 alloc shape; the coupled digit reaches
+  // dim0 = 32 and dim1 = 32 only together, so the 33x48 box is not covered.
   LinearLayout layout({{S("register"),
                         {{1, 0},
                          {2, 0},
@@ -207,7 +207,7 @@ TEST_F(LayoutUtilsTest, LogicalOutputCoverageNeedsOwnedOddCoordinate) {
 }
 
 // A transpose moves each out dim's size and digits with its coordinate.
-TEST_F(LayoutUtilsTest, TransposeKeepsProductRadices) {
+TEST_F(LayoutUtilsTest, TransposeKeepsMixedRadices) {
   auto reg = S("register"), lane = S("lane"), dim0 = S("dim0");
   auto dim1 = S("dim1");
   auto layout =
@@ -232,6 +232,7 @@ TEST_F(LayoutUtilsTest, TryReshapeLayoutRegroupsWholeDigits) {
   ASSERT_TRUE(flat.has_value());
   EXPECT_EQ(flat->apply({{reg, 2}, {lane, 5}, {S("warp"), 0}}),
             (SmallVector<std::pair<StringAttr, int32_t>>{{dim0, 69}}));
+  EXPECT_EQ(reshapeLayout(&ctx, rows, {96}), *flat);
   EXPECT_EQ(tryReshapeLayout(&ctx, *flat, {3, 32}), rows);
   auto pow2 = LinearLayout::identity1D(4, reg, dim0) *
               LinearLayout::identity1D(32, lane, S("dim1"));
@@ -251,7 +252,7 @@ TEST_F(LayoutUtilsTest, TryReshapeLayoutRejectsSplitDigits) {
           .has_value());
 }
 
-TEST_F(LayoutUtilsTest, ProductConversionScopeIsExact) {
+TEST_F(LayoutUtilsTest, MixedRadixConversionScopeIsExact) {
   auto reg = S("register"), lane = S("lane"), warp = S("warp");
   auto block = S("block"), dim0 = S("dim0"), dim1 = S("dim1");
   auto dim2 = S("dim2");
@@ -260,15 +261,15 @@ TEST_F(LayoutUtilsTest, ProductConversionScopeIsExact) {
                       LinearLayout::zeros1D(1, lane, dim0) *
                       LinearLayout::zeros1D(1, warp, dim0) *
                       LinearLayout::zeros1D(1, block, dim0);
-  EXPECT_EQ(classifyProductConversionScope(registerOnly, registerOnly, {6}),
-            ProductConversionScope::Register);
+  EXPECT_EQ(classifyMixedRadixConversionScope(registerOnly, registerOnly, {6}),
+            MixedRadixConversionScope::Register);
 
   auto laneSrc =
       makeRegLaneLayout(ctx, {{1, 0}}, {3}, {{0, 1}, {0, 2}, {0, 4}}, {}, 3);
   auto laneDst =
       makeRegLaneLayout(ctx, {{1, 0}}, {3}, {{0, 4}, {0, 2}, {0, 1}}, {}, 3);
-  EXPECT_EQ(classifyProductConversionScope(laneSrc, laneDst, {3, 8}),
-            ProductConversionScope::Warp);
+  EXPECT_EQ(classifyMixedRadixConversionScope(laneSrc, laneDst, {3, 8}),
+            MixedRadixConversionScope::Warp);
 
   auto blockSrc = exactIdentity1D(3, reg, dim0) *
                   LinearLayout::identity1D(2, lane, dim1) *
@@ -279,8 +280,8 @@ TEST_F(LayoutUtilsTest, ProductConversionScopeIsExact) {
        LinearLayout::identity1D(2, warp, dim1) *
        LinearLayout::zeros1D(1, block, dim0))
           .transposeOuts({dim0, dim1, dim2});
-  EXPECT_EQ(classifyProductConversionScope(blockSrc, blockDst, {3, 2, 2}),
-            ProductConversionScope::Block);
+  EXPECT_EQ(classifyMixedRadixConversionScope(blockSrc, blockDst, {3, 2, 2}),
+            MixedRadixConversionScope::Block);
 
   // An odd digit owned by warps on either side crosses warps.
   auto oddWarp = LinearLayout::zeros1D(1, reg, dim0) *
@@ -291,28 +292,29 @@ TEST_F(LayoutUtilsTest, ProductConversionScopeIsExact) {
                      LinearLayout::zeros1D(1, lane, dim0) *
                      LinearLayout::zeros1D(1, warp, dim0) *
                      LinearLayout::zeros1D(1, block, dim0);
-  EXPECT_EQ(classifyProductConversionScope(oddWarp, oddRegister, {3}),
-            ProductConversionScope::Block);
-  EXPECT_EQ(classifyProductConversionScope(oddRegister, oddWarp, {3}),
-            ProductConversionScope::Block);
+  EXPECT_EQ(classifyMixedRadixConversionScope(oddWarp, oddRegister, {3}),
+            MixedRadixConversionScope::Block);
+  EXPECT_EQ(classifyMixedRadixConversionScope(oddRegister, oddWarp, {3}),
+            MixedRadixConversionScope::Block);
 
   auto pow2Src = LinearLayout::identity1D(2, lane, dim0) *
                  LinearLayout::identity1D(2, lane, dim1);
   auto pow2Dst = (LinearLayout::identity1D(2, lane, dim1) *
                   LinearLayout::identity1D(2, lane, dim0))
                      .transposeOuts({dim0, dim1});
-  EXPECT_EQ(classifyProductConversionScope(pow2Src, pow2Dst, {2, 2}),
-            ProductConversionScope::Warp);
+  EXPECT_EQ(classifyMixedRadixConversionScope(pow2Src, pow2Dst, {2, 2}),
+            MixedRadixConversionScope::Warp);
 }
 
-TEST_F(LayoutUtilsTest, ProductConversionScopeHonorsLogicalBoundsAndReplicas) {
+TEST_F(LayoutUtilsTest,
+       MixedRadixConversionScopeHonorsLogicalBoundsAndReplicas) {
   auto lane = S("lane");
   auto source = exactIdentity1D(6, S("register"), S("dim0")) *
                 LinearLayout::zeros1D(1, lane, S("dim0")) *
                 LinearLayout::zeros1D(1, S("warp"), S("dim0")) *
                 LinearLayout::zeros1D(1, S("block"), S("dim0"));
-  EXPECT_EQ(classifyProductConversionScope(source, source, {5}),
-            ProductConversionScope::Register);
+  EXPECT_EQ(classifyMixedRadixConversionScope(source, source, {5}),
+            MixedRadixConversionScope::Register);
 
   // Every destination replica needs the value, so a lane replica is Warp.
   auto bases = source.getBases();
@@ -321,26 +323,26 @@ TEST_F(LayoutUtilsTest, ProductConversionScopeHonorsLogicalBoundsAndReplicas) {
   radices[lane].push_back(2);
   LinearLayout replicated(std::move(bases), std::move(radices),
                           source.getOutDims(), /*requireSurjective=*/true);
-  EXPECT_EQ(classifyProductConversionScope(source, replicated, {5}),
-            ProductConversionScope::Warp);
+  EXPECT_EQ(classifyMixedRadixConversionScope(source, replicated, {5}),
+            MixedRadixConversionScope::Warp);
 
   // dim1 bit 2 moves from a register to a lane but is in bounds only at 8.
   auto src =
       makeRegLaneLayout(ctx, {{0, 4}, {1, 0}}, {2, 3}, {{0, 1}, {0, 2}}, {}, 3);
   auto dst =
       makeRegLaneLayout(ctx, {{1, 0}}, {3}, {{0, 1}, {0, 2}, {0, 4}}, {}, 3);
-  EXPECT_EQ(classifyProductConversionScope(src, dst, {3, 4}),
-            ProductConversionScope::Register);
-  EXPECT_EQ(classifyProductConversionScope(src, dst, {3, 8}),
-            ProductConversionScope::Warp);
+  EXPECT_EQ(classifyMixedRadixConversionScope(src, dst, {3, 4}),
+            MixedRadixConversionScope::Register);
+  EXPECT_EQ(classifyMixedRadixConversionScope(src, dst, {3, 8}),
+            MixedRadixConversionScope::Warp);
 }
 
-TEST_F(LayoutUtilsTest, ProductInputMapAppliesClosedForm) {
+TEST_F(LayoutUtilsTest, MixedRadixInputMapAppliesClosedForm) {
   auto reg = S("register"), lane = S("lane");
   // The register and lane maps L with a(registerOrder(L(x))) == b(x).
   auto expectMap = [&](const LinearLayout &a, const LinearLayout &b,
                        const Bases &registerMap, const Bases &laneMap) {
-    auto map = mapProductConversionInputs(a, b);
+    auto map = mapMixedRadixConversionInputs(a, b);
     ASSERT_TRUE(map);
     EXPECT_EQ(map->registerMap.getBases().lookup(reg), registerMap);
     EXPECT_EQ(map->laneMap.getBases().lookup(lane), laneMap);
@@ -361,7 +363,7 @@ TEST_F(LayoutUtilsTest, ProductInputMapAppliesClosedForm) {
     expectMap(a, b, {{2}}, {{1}, {2}, {4}});
     expectMap(b, a, {{3}}, {{1}, {2}, {4}});
     EXPECT_TRUE(
-        mapProductConversionInputs(a, b)->registerMap.hasNonBinaryCarrier());
+        mapMixedRadixConversionInputs(a, b)->registerMap.hasNonPow2OutDim());
   }
   {
     // b's free lane 0 takes a's kernel vector (lane 2).
@@ -387,12 +389,12 @@ TEST_F(LayoutUtilsTest, ProductInputMapAppliesClosedForm) {
     auto binary =
         makeRegLaneLayout(ctx, {{1, 0}, {2, 0}}, {2, 2}, lanes, {}, 4);
     expectMap(binary, binary, {{1}, {2}}, {{1}, {2}, {4}});
-    EXPECT_FALSE(mapProductConversionInputs(binary, binary)
-                     ->registerMap.hasNonBinaryCarrier());
+    EXPECT_FALSE(mapMixedRadixConversionInputs(binary, binary)
+                     ->registerMap.hasNonPow2OutDim());
   }
 }
 
-TEST_F(LayoutUtilsTest, ProductInputMapRejectsNonBijections) {
+TEST_F(LayoutUtilsTest, MixedRadixInputMapRejectsNonBijections) {
   {
     // b's register bit is a's lane bit: not separable per input dim.
     SCOPED_TRACE("coupled register and lane");
@@ -400,7 +402,7 @@ TEST_F(LayoutUtilsTest, ProductInputMapRejectsNonBijections) {
                                {}, 3);
     auto b = makeRegLaneLayout(ctx, {{0, 2}, {1, 0}}, {2, 3}, {{0, 1}, {0, 4}},
                                {}, 3);
-    EXPECT_FALSE(mapProductConversionInputs(a, b));
+    EXPECT_FALSE(mapMixedRadixConversionInputs(a, b));
   }
   auto reg = S("register"), lane = S("lane"), warp = S("warp");
   auto dim0 = S("dim0"), dim1 = S("dim1"), dim2 = S("dim2");
@@ -415,7 +417,7 @@ TEST_F(LayoutUtilsTest, ProductInputMapRejectsNonBijections) {
                       LinearLayout::identity1D(4, lane, dim1) *
                       LinearLayout::zeros1D(1, lane, dim1, 2);
     for (const LinearLayout *b : {&wider, &reordered, &fewerLanes})
-      EXPECT_FALSE(mapProductConversionInputs(a, *b));
+      EXPECT_FALSE(mapMixedRadixConversionInputs(a, *b));
   }
   {
     SCOPED_TRACE("b broadcasts a lane bit that a uses");
@@ -424,7 +426,7 @@ TEST_F(LayoutUtilsTest, ProductInputMapRejectsNonBijections) {
     auto b = exactIdentity1D(3, reg, dim0) *
              LinearLayout::identity1D(2, lane, dim1) *
              LinearLayout::zeros1D(2, lane, dim1, 2);
-    EXPECT_FALSE(mapProductConversionInputs(a, b));
+    EXPECT_FALSE(mapMixedRadixConversionInputs(a, b));
   }
   {
     SCOPED_TRACE("warps swap");
@@ -436,7 +438,7 @@ TEST_F(LayoutUtilsTest, ProductInputMapRejectsNonBijections) {
              LinearLayout::identity1D(2, lane, dim1) *
              LinearLayout::identity1D(2, warp, dim2) *
              LinearLayout::identity1D(2, warp, dim1);
-    EXPECT_FALSE(mapProductConversionInputs(a, b));
+    EXPECT_FALSE(mapMixedRadixConversionInputs(a, b));
   }
   {
     SCOPED_TRACE("odd digit in warps");
@@ -447,13 +449,13 @@ TEST_F(LayoutUtilsTest, ProductInputMapRejectsNonBijections) {
           .transposeOuts({dim0, dim1, dim2});
     };
     EXPECT_FALSE(
-        mapProductConversionInputs(make(dim0, dim1), make(dim1, dim0)));
+        mapMixedRadixConversionInputs(make(dim0, dim1), make(dim1, dim0)));
     // Identical too, with the odd warp digit past the register digits.
     auto same = (exactIdentity1D(3, reg, dim0) *
                  LinearLayout::identity1D(2, lane, dim2) *
                  exactIdentity1D(6, warp, dim1))
                     .transposeOuts({dim0, dim1, dim2});
-    EXPECT_FALSE(mapProductConversionInputs(same, same));
+    EXPECT_FALSE(mapMixedRadixConversionInputs(same, same));
   }
 }
 

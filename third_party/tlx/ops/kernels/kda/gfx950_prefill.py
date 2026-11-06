@@ -182,7 +182,8 @@ def _prepare_chunk_kernel(
     local_chunk = tl.load(ChunkIndices + chunk * 2 + 1).to(tl.int32)
     begin = tl.load(CuSeqLens + sequence).to(tl.int32)
     token0 = local_chunk * BT
-    rows_left = tl.load(CuSeqLens + sequence + 1).to(tl.int32) - begin - token0
+    # At most BT, so the row limits below stay in int32 however long the sequence.
+    rows_left = tl.minimum(tl.load(CuSeqLens + sequence + 1).to(tl.int32) - begin - token0, BT)
 
     mb: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
                                            warps_per_cta=[NW, 1, 1])
@@ -206,12 +207,13 @@ def _prepare_chunk_kernel(
     # Masks are rebuilt from offsets in each layout (row < rows_left exactly
     # when offset < rows_left * H * D): uTLX cannot move i1 tensors via LDS.
     # Inputs keep their token strides (split views of a packed qkv); outputs
-    # are dense [T, H, D].
-    tile_base = ((begin + token0) * H + head) * D
+    # are dense [T, H, D]. Token bases are int64: [T, H, D] passes 2**31
+    # elements at T = 2**24 / H.
+    start = (begin + token0).to(tl.int64)
+    tile_base = (start * H + head) * D
     tile_limit = rows_left * (H * D)
     tile_offsets = tlx.require_layout(row * (H * D) + chan, mf)
     tile_mask = tile_offsets < tile_limit
-    start = (begin + token0).to(tl.int64)
     q_offsets = tlx.require_layout(row * STRIDE_Q + chan, mf)
     k_offsets = tlx.require_layout(row * STRIDE_K + chan, mf)
     v_offsets = tlx.require_layout(row * STRIDE_V + chan, mf)
@@ -444,6 +446,7 @@ def _copy_walk_chunk(
     slot,
     key_base,
     value_base,
+    aqk_base,
     decay_base,
     token0,
     length,
@@ -465,20 +468,22 @@ def _copy_walk_chunk(
     """
     rows_left = copy_rows[:, None] < length - token0
     key_mask = rows_left & (keys[None, :] < K)
-    key_offsets = key_base + (token0 + copy_rows[:, None]) * H * K + keys[None, :]
-    w = tlx.async_load(W + key_offsets, tlx.local_view(w_buffers, slot), mask=key_mask)
-    kg = tlx.async_load(Kg + key_offsets, tlx.local_view(kg_buffers, slot), mask=key_mask)
+    token = token0.to(tl.int64)
+    key_start = key_base + token * (H * K)
+    key_offsets = copy_rows[:, None] * (H * K) + keys[None, :]
+    w = tlx.async_load(W + key_start + key_offsets, tlx.local_view(w_buffers, slot), mask=key_mask)
+    kg = tlx.async_load(Kg + key_start + key_offsets, tlx.local_view(kg_buffers, slot), mask=key_mask)
     u = tlx.async_load(
-        U + value_base + token0 * H * V + u_offsets,
+        U + (value_base + token * (H * V)) + u_offsets,
         tlx.local_view(u_buffers, slot),
         mask=rows_left & (u_columns[None, :] < V),
     )
     decay = tlx.async_load(Decay + decay_base + (token0 // BT) * H * K + keys, tlx.local_view(decay_buffers, slot),
                            mask=keys < K)
     if WRITE_OUTPUT:
-        q = tlx.async_load(Qg + key_offsets, tlx.local_view(q_buffers, slot), mask=key_mask)
+        q = tlx.async_load(Qg + key_start + key_offsets, tlx.local_view(q_buffers, slot), mask=key_mask)
         a = tlx.async_load(
-            Aqk + token0 * H * BT + a_offsets,
+            Aqk + (aqk_base + token * (H * BT)) + a_offsets,
             tlx.local_view(a_buffers, slot),
             mask=rows_left & (copy_rows[None, :] < BT),
         )
@@ -563,13 +568,15 @@ def _walk_chunks(
     state = tlx.require_layout(state, mma, pin=False)
     values = value_block * BV + tl.arange(0, BV)
     keys = tl.arange(0, K)
-    key_base = (begin * H + head) * K
-    value_base = (begin * H + head) * V
+    # int64 bases into the [T, H, *] intermediates and output; offsets within a chunk stay int32.
+    key_base = (begin.to(tl.int64) * H + head) * K
+    value_base = (begin.to(tl.int64) * H + head) * V
+    aqk_base = (begin.to(tl.int64) * H + head) * BT
     decay_base = _decay_row(begin, sequence, head, H, K, BT)
     copy_rows = tl.arange(0, BT)
     u_offsets = copy_rows[:, None] * H * V + values[None, :]
     a_columns = tl.arange(0, BT)
-    a_offsets = (copy_rows[:, None] * H + head) * BT + a_columns[None, :] + begin * H * BT
+    a_offsets = copy_rows[:, None] * (H * BT) + a_columns[None, :]
     # Transposed reads (w, u) want a 4-element pad; kg's plain b-operand
     # reads want 16.
     w_buffers = tlx.local_alloc((BT, K), tl.bfloat16, 2, layout=_ring_layout(BT, K, 4))
@@ -601,6 +608,7 @@ def _walk_chunks(
         0,
         key_base,
         value_base,
+        aqk_base,
         decay_base,
         chunk_lo * BT,
         length,
@@ -637,6 +645,7 @@ def _walk_chunks(
             1 - slot,
             key_base,
             value_base,
+            aqk_base,
             decay_base,
             token0 + BT,
             length,
@@ -679,9 +688,9 @@ def _walk_chunks(
             out = tlx.require_layout(tl.dot(a1, tlx.require_layout(tl.trans(v1), out_b_op), acc=out), out_mma)
             tlx.buffer_store(
                 out.to(Output.dtype.element_ty),
-                Output + value_base + token0 * H * V,
+                Output + (value_base + token0.to(tl.int64) * (H * V)),
                 out_offsets,
-                mask=out_offsets < (length - token0) * H * V,
+                mask=out_offsets < tl.minimum(length - token0, BT) * (H * V),
             )
 
         decay = tlx.local_load(tlx.local_view(decay_buffers, slot), token=ready)
@@ -1069,9 +1078,17 @@ def kda_paged_prefill(
 
 
 def _token_rows(x, total_tokens, heads):
-    """A [T, H, D] (or [T, H]) view of x that keeps its token stride; copies only if a head is not dense."""
+    """A [T, H, D] (or [T, H]) view of x that keeps its token stride, or a contiguous copy.
+
+    `_prepare_chunk_kernel` masks a chunk's rows as offset < rows * stride and
+    loads the chunk through one buffer resource of 2**31 - 2 bytes. That takes
+    dense heads, a token stride of at least a head's width, and CHUNK_SIZE
+    tokens within the resource.
+    """
     rows = x.reshape(total_tokens, heads, -1)
-    if rows.stride(2) != 1 or rows.stride(1) != rows.shape[2]:
+    width, stride = rows.shape[2], rows.stride(0)
+    if (rows.stride(2) != 1 or rows.stride(1) != width or stride < width
+            or CHUNK_SIZE * stride * rows.element_size() > 2**31 - 2):
         rows = rows.contiguous()
     return rows if x.numel() != total_tokens * heads else rows[..., 0]
 

@@ -1,8 +1,9 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s | env TRITON_ALLOW_NPOT=1 triton-opt | FileCheck %s
 
-// Product layouts verify without flattening outputs: each digit owns one output
-// coordinate (a radix-2 digit one bit, an odd digit Z/m with a unit coefficient).
-// No flag-off leg: flag off ignores the keys and the bases-only parse aborts.
+// Mixed-radix layouts verify without flattening outputs: each digit owns one
+// output coordinate (a radix-2 digit one bit, an odd digit Z/m with a unit
+// coefficient). No flag-off leg: flag off ignores the keys and the bases-only
+// parse aborts.
 
 // CHECK{LITERAL}: #linear = #ttg.linear<{register = [[1, 0], [0, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], warp = [], block = [], inputRadices = {register = [3, 2], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [3, 64]}>
 // CHECK{LITERAL}: #linear1 = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [64, 3]}>

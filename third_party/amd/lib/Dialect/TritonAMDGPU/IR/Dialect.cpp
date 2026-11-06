@@ -137,7 +137,7 @@ Attribute unwrapPinnedTDMLayout(Attribute layout) {
 LogicalResult verifyTDMLayoutConsistency(Operation *op,
                                          triton::TensorDescType descTy,
                                          gpu::MemDescType smemTy) {
-  if (failed(gpu::verifyNpotCoverOperands(op)))
+  if (failed(gpu::verifyNpotPow2AllocViewOperands(op)))
     return failure();
   Attribute descLayout = unwrapPinnedTDMLayout(descTy.getSharedLayout());
   if (!descLayout)

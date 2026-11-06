@@ -13,7 +13,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
-#include "unittest/Tools/ProductLayouts.h"
+#include "unittest/Tools/MixedRadixLayouts.h"
 #include "unittest/Util/ScopedAllowNpot.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Signals.h"
@@ -130,7 +130,6 @@ protected:
 /*static*/ MLIRContext InferLayoutTest::ctx;
 
 void testReshape(RankedTensorType srcTy, RankedTensorType dstTy,
-                 std::optional<BlockedEncodingAttr> expectedDstEnc,
                  DialectInferLayoutInterface *inferLayout,
                  bool longErrors = true) {
 
@@ -220,13 +219,8 @@ TEST_P(InferReshapeOpEncodingTest, DoIt) {
   if (!dst)
     FAIL() << "Could not parse destination type: " << dstTyStr;
 
-  std::optional<BlockedEncodingAttr> expectedDstEnc;
-  if (auto dstEnc = cast<RankedTensorType>(dst).getEncoding()) {
-    expectedDstEnc = cast<BlockedEncodingAttr>(dstEnc);
-  }
-
   testReshape(cast<RankedTensorType>(src), cast<RankedTensorType>(dst),
-              expectedDstEnc, inferLayout, /*longErrors=*/true);
+              inferLayout, /*longErrors=*/true);
 }
 
 // A testcase of {a, b, c} means:
@@ -300,7 +294,7 @@ INSTANTIATE_TEST_SUITE_P(
          R"(T<16x2xf32, #B<{spt=[1,2], tpw=[32,1], wpc=[2,1], ord=[1,0]}>>)"},
 
         {R"(T<2x1x2xf32, #B<{spt=[2,1,1], tpw=[2,1,2], wpc=[4,1,8], ord=[2,1,0]}>>)",
-         R"(T<2x2xf32,   #B<{spt=[2,1],   tpw=[2,2],   wpc=[4,8],   ord=[1,0]}>>)"},
+         R"(T<2x2xf32, #ttg.slice<{dim = 1, parent = #B<{spt=[2,1,1], tpw=[2,1,2], wpc=[4,1,8], ord=[2,1,0]}>}>>)"},
     })));
 
 class Fp4ToFpOpTest : public ::testing::Test {
@@ -612,9 +606,9 @@ static uint32_t evalLowered(Value v, ArrayRef<uint32_t> args) {
       });
 }
 
-// The lowered apply() matches the host apply() on every input. In the Product
-// layout dim0 = 12 and the radix-3 digit adds 2 to the odd part, so the sum
-// wraps; the radix-2 control takes the shift-concatenated path.
+// The lowered apply() matches the host apply() on every input. In the
+// mixed-radix layout dim0 = 12 and the radix-3 digit adds 2 to the odd part, so
+// the sum wraps; the radix-2 control takes the shift-concatenated path.
 TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
   ctx.getOrLoadDialect<LLVM::LLVMDialect>();
   auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
@@ -631,10 +625,10 @@ TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
   LinearLayout radix2(bases, outDims, /*requireSurjective=*/true);
   bases[reg][0] = {8, 0};
   outDims[0].second = 12;
-  LinearLayout product(bases, radices, outDims, /*requireSurjective=*/true);
+  LinearLayout mixedRadix(bases, radices, outDims, /*requireSurjective=*/true);
   Location loc = UnknownLoc::get(&ctx);
   Type i32 = IntegerType::get(&ctx, 32);
-  for (const LinearLayout &layout : {mixed, product, radix2}) {
+  for (const LinearLayout &layout : {mixed, mixedRadix, radix2}) {
     OwningOpRef<ModuleOp> module = ModuleOp::create(loc);
     IRRewriter rewriter(&ctx);
     rewriter.setInsertionPointToStart(module->getBody());
@@ -657,7 +651,7 @@ TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
 }
 
 // Register counts multiply digit radices, and a run ends at the odd digit.
-TEST_F(LinearEncodingTest, ProductCountsUseRadices) {
+TEST_F(LinearEncodingTest, MixedRadixCountsUseRadices) {
   auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
   LinearLayout::BasesT bases;
   bases[s("register")] = {{1, 0}, {2, 0}};
@@ -673,7 +667,8 @@ TEST_F(LinearEncodingTest, ProductCountsUseRadices) {
                       /*requireSurjective=*/true);
   auto linear = LinearEncodingAttr::get(&ctx, layout);
   EXPECT_EQ(linear.getContigPerThread(), SmallVector<unsigned>({2, 1}));
-  // The interface getSizePerThread() asserts in getCGALayout on Product.
+  // The interface getSizePerThread() asserts in getCGALayout on a mixed-radix
+  // layout.
   EXPECT_EQ(LinearEncodingTrait::getSizePerThread(layout, {1, 1}),
             SmallVector<unsigned>({6, 1}));
   auto pow2 = LinearLayout::identity1D(4, s("register"), s("dim0")) *
@@ -761,12 +756,12 @@ TEST_F(LinearEncodingTest, NpotReshapeKeepsRegisters) {
 
 // Each NPOT dim, in dim order, adds one odd register digit to the blocked
 // default of the power-of-two parts.
-TEST_F(LinearEncodingTest, ProductEncoding) {
+TEST_F(LinearEncodingTest, MixedRadixEncoding) {
   auto S = [&](StringRef name) { return StringAttr::get(&ctx, name); };
   ScopedAllowNpot npot;
-  auto product = getProductEncoding(&ctx, {3, 96}, /*numWarps=*/4,
-                                    /*threadsPerWarp=*/32, /*numCTAs=*/1);
-  ASSERT_TRUE(succeeded(product));
+  auto mixedRadix = getMixedRadixEncoding(&ctx, {3, 96}, /*numWarps=*/4,
+                                          /*threadsPerWarp=*/32, /*numCTAs=*/1);
+  ASSERT_TRUE(succeeded(mixedRadix));
   LinearLayout::BasesT bases;
   bases[S("register")] = {{1, 0}, {0, 32}};
   bases[S("lane")] = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}};
@@ -777,21 +772,22 @@ TEST_F(LinearEncodingTest, ProductEncoding) {
   radices[S("lane")] = {2, 2, 2, 2, 2};
   radices[S("warp")] = {2, 2};
   radices[S("block")] = {};
-  EXPECT_EQ(product->getLinearLayout(),
+  EXPECT_EQ(mixedRadix->getLinearLayout(),
             LinearLayout(bases, radices, {{S("dim0"), 3}, {S("dim1"), 96}},
                          /*requireSurjective=*/false));
   // Control: a power-of-two shape keeps the blocked default.
-  EXPECT_TRUE(failed(getProductEncoding(&ctx, {4, 32}, 4, 32, 1)));
-  // The verifier rejects a Product layout across CTAs.
-  EXPECT_TRUE(failed(getProductEncoding(&ctx, {3, 96}, 4, 32, 2)));
+  EXPECT_TRUE(failed(getMixedRadixEncoding(&ctx, {4, 32}, 4, 32, 1)));
+  // The verifier rejects a mixed-radix layout across CTAs.
+  EXPECT_TRUE(failed(getMixedRadixEncoding(&ctx, {3, 96}, 4, 32, 2)));
   ScopedAllowNpot unset(nullptr);
-  EXPECT_TRUE(failed(getProductEncoding(&ctx, {3, 96}, 4, 32, 1)));
+  EXPECT_TRUE(failed(getMixedRadixEncoding(&ctx, {3, 96}, 4, 32, 1)));
 }
 
 // The pad pass compares the widest vector first: `request` is the padded
-// side's f32 vector, kept only if the Product layout needs no more registers.
-// On a tie it compares slots (registers x lanes x warps) of both sides.
-TEST_F(LinearEncodingTest, ProductSlots) {
+// side's f32 vector, kept only if the mixed-radix layout needs no more
+// registers. On a tie it compares the total in-dim size (registers x lanes x
+// warps) of both sides.
+TEST_F(LinearEncodingTest, MixedRadixTotalInDimSize) {
   ScopedAllowNpot npot;
   struct Case {
     SmallVector<int64_t> shape;
@@ -805,11 +801,12 @@ TEST_F(LinearEncodingTest, ProductSlots) {
       return static_cast<int64_t>(llvm::PowerOf2Ceil(size));
     });
     unsigned vector =
-        getProductVector(&ctx, c.shape, c.request, {}, c.numWarps, 32);
+        getMixedRadixVector(&ctx, c.shape, c.request, {}, c.numWarps, 32);
     EXPECT_EQ(vector, c.vector);
-    auto product = getProductEncoding(&ctx, c.shape, c.numWarps, 32, 1, vector);
-    ASSERT_TRUE(succeeded(product));
-    EXPECT_EQ(product->getLinearLayout().getTotalInDimSize(), c.exact);
+    auto mixedRadix =
+        getMixedRadixEncoding(&ctx, c.shape, c.numWarps, 32, 1, vector);
+    ASSERT_TRUE(succeeded(mixedRadix));
+    EXPECT_EQ(mixedRadix->getLinearLayout().getTotalInDimSize(), c.exact);
     EXPECT_EQ(getDefaultBlockedEncoding(&ctx, pow2, c.numWarps, 32, 1)
                   .toLinearLayout(pow2)
                   .getTotalInDimSize(),

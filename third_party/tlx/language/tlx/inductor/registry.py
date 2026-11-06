@@ -208,6 +208,8 @@ def _is_gfx950() -> bool:
 
 def _is_gfx942() -> bool:
     """Whether the live device is MI300X/CDNA3."""
+    if not torch.version.hip:
+        return False
     return current_target().is_gfx942
 
 

@@ -940,6 +940,52 @@ static bool flowsPreservingEncodingToValue(Value root, Value target) {
   return false;
 }
 
+// Upstream #11759 lets a broadcast result carry a concrete layout where the
+// frontend then inserts an unrealized_conversion_cast to satisfy a pinned
+// elementwise op's same-type constraint (e.g. blocked -> no_verify<mfma> on
+// an accumulator scale). convert_to_ttgpuir has no materialization callback
+// that produces or consumes the TLX wrapper, so the cast survives conversion
+// and fails the pass manager. Replace such casts with an opaque
+// ttg.require_layout: it survives conversion as the durable boundary that
+// tlx-resolve-placeholder-layouts strips (making both sides concrete) before
+// tlx-finalize-user-layouts lowers it to a convert_layout. Casts with a null
+// side keep today's behavior (the converter materializes unencoded sources
+// freely); only concrete-vs-wrapper pairs are bridged.
+static bool replaceWrapperSpanningCasts(ModuleOp mod) {
+  SmallVector<Operation *> casts;
+  mod.walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "builtin.unrealized_conversion_cast")
+      return;
+    if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+      return;
+    auto srcType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto dstType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (!srcType || !dstType || srcType == dstType)
+      return;
+    if (srcType.getShape() != dstType.getShape() ||
+        srcType.getElementType() != dstType.getElementType())
+      return;
+    Attribute srcEnc = srcType.getEncoding();
+    Attribute dstEnc = dstType.getEncoding();
+    if (!srcEnc || !dstEnc)
+      return;
+    if (!isPlaceholderEncoding(srcEnc) && !isPlaceholderEncoding(dstEnc))
+      return;
+    casts.push_back(op);
+  });
+  if (casts.empty())
+    return false;
+  OpBuilder builder(mod.getContext());
+  for (Operation *op : casts) {
+    builder.setInsertionPoint(op);
+    Value boundary = ttg::RequireLayoutOp::create(
+        builder, op->getLoc(), op->getResult(0).getType(), op->getOperand(0));
+    op->getResult(0).replaceAllUsesWith(boundary);
+    op->erase();
+  }
+  return true;
+}
+
 static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
   bool conflict = false;
   SymbolTableCollection symbolTables;
@@ -1043,6 +1089,12 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
                     "limit");
       return failure();
     }
+
+    // Frontend-inserted wrapper-spanning casts cannot survive
+    // convert_to_ttgpuir (see replaceWrapperSpanningCasts); replace them
+    // before any handler reads through them. Runs every iteration because a
+    // null side can acquire a concrete layout mid-fixpoint.
+    changed |= replaceWrapperSpanningCasts(mod);
 
     // A helper can establish a pin internally and return it without receiving
     // any pinned argument. The frontend still gives that helper and its call
@@ -1154,13 +1206,51 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
         if (enc) {
           for (Value v : op->getResults())
             changed |= retypeWithEncoding(v, enc);
+          // Upstream #11759 lets a broadcast result carry a concrete layout
+          // that differs from a pinned sibling (e.g. a blocked broadcast
+          // chain feeding an op pinned to no_verify<mfma>). Retyping such a
+          // sibling to the placeholder would lie about its physical data
+          // distribution and forge a wrapper boundary the TTIR->TTGIR
+          // converter cannot materialize. When the physical layouts coincide
+          // (a wrapper-only difference, matching #11759's projection-equality
+          // rule) the retype is free and stays; otherwise bridge the use with
+          // an opaque ttg.require_layout, which survives conversion and is
+          // resolved later (stripped by tlx-resolve-placeholder-layouts, then
+          // lowered to a real convert_layout).
+          Attribute innerEnc = getEffectiveEncoding(enc);
           bool isSelect = isa<arith::SelectOp>(op);
           for (auto en : llvm::enumerate(op->getOperands())) {
+            Value operand = en.value();
             // arith.select's condition (operand 0) must carry the encoding too,
             // but its producer may be un-retypeable (e.g. a tt.call mask), so
             // force a require_layout bridge for it.
             bool isSelectCond = isSelect && en.index() == 0;
-            bridgeOrRetype(en.value(), enc, op, en.index(), isSelectCond);
+            if (auto operandTy =
+                    dyn_cast<RankedTensorType>(operand.getType())) {
+              Attribute operandEnc = operandTy.getEncoding();
+              if (operandEnc && !isPlaceholderEncoding(operandEnc)) {
+                Attribute operandInner = getEffectiveEncoding(operandEnc);
+                bool samePhysical =
+                    innerEnc && operandInner &&
+                    isa_and_nonnull<ttg::DistributedEncodingTrait>(
+                        operandInner) &&
+                    isa_and_nonnull<ttg::DistributedEncodingTrait>(innerEnc) &&
+                    haveSamePhysicalLayout(
+                        operandTy.cloneWithEncoding(operandInner),
+                        operandTy.cloneWithEncoding(innerEnc));
+                if (!samePhysical) {
+                  OpBuilder b(op);
+                  auto bridgeTy = RankedTensorType::get(
+                      operandTy.getShape(), operandTy.getElementType(), enc);
+                  Value bridge = ttg::RequireLayoutOp::create(
+                      b, op->getLoc(), bridgeTy, operand);
+                  op->setOperand(en.index(), bridge);
+                  changed = true;
+                  continue;
+                }
+              }
+            }
+            bridgeOrRetype(operand, enc, op, en.index(), isSelectCond);
           }
           return;
         }

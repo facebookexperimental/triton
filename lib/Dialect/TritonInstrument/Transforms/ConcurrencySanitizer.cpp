@@ -408,9 +408,9 @@ void initializeAllocation(ImplicitLocOpBuilder &b, Value alloc) {
 
 bool canInitializeAllocation(Value alloc) {
   auto allocType = cast<ttg::MemDescType>(alloc.getType());
-  // A tensor cannot hold the NPOT tile of a shared physical cover.
+  // A tensor cannot hold the NPOT tile of a shared pow2 alloc view.
   if (!isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace()))
-    return !ttg::isNpotPhysicalCover(allocType);
+    return !ttg::isNpotPow2AllocView(allocType);
   unsigned numWarps = ttg::lookupNumWarps(alloc.getDefiningOp());
   // There is no default tcgen05.ld/st layout for an NPOT TMEM tile, so, as for
   // a warp count that is not a multiple of 4, the allocation is not poisoned.
@@ -1464,13 +1464,13 @@ private:
 
       if (memType == MemType::SHARED_MEM) {
         if (effect.sharedKind == ttg::SharedKind::Async) {
-          funcBuilder.createVerifyProxyAccessCall(b, bufferMask, baseThread,
-                                                  effect.operandName, pred, op,
-                                                  effectCTAs);
+          funcBuilder.createVerifyProxyAccessCall(
+              b, bufferMask, baseThread, effect.rw == RW::Write,
+              effect.operandName, pred, op, effectCTAs);
         } else {
-          funcBuilder.createSetProxyAccessCall(b, bufferMask, baseThread, pred,
-                                               op, readCTAs,
-                                               materialized.bufferIndex);
+          funcBuilder.createSetProxyAccessCall(
+              b, bufferMask, baseThread, effect.rw == RW::Write, pred, op,
+              readCTAs, materialized.bufferIndex);
         }
       }
       if (effect.rw == RW::Read) {

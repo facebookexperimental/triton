@@ -52,6 +52,8 @@ createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
 
 namespace mlir::triton {
 
+class ModuleAxisInfoAnalysis;
+
 // The address of the descriptor's logical origin in its memory space.
 Value getMemDescAddress(RewriterBase &rewriter, Location loc,
                         const LLVMTypeConverter *typeConverter,
@@ -359,7 +361,7 @@ constexpr int kGlobalScratchBufferOffset = -2;
 constexpr int kSharedMemoryOffset = -3;
 
 // Defined in triton/Analysis/Utility.h.
-struct ProductSharedTiling;
+struct MixedRadixSharedTiling;
 
 namespace triton {
 
@@ -405,7 +407,7 @@ SmallVector<Value> transferProductThroughSharedMemory(
     bool blockScope,
     std::optional<std::pair<Value, Value>> distributedCoordinates =
         std::nullopt,
-    const ProductSharedTiling *tiling = nullptr);
+    const MixedRadixSharedTiling *tiling = nullptr);
 
 // Takes two values that may be boolean, or null to represent constant True.
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b);
@@ -819,6 +821,12 @@ Value packLLVector(Location loc, ValueRange vals, RewriterBase &rewriter);
 std::optional<LLVM::AtomicBinOp> matchAtomicOp(RMWOp atomicOp);
 
 std::optional<LLVM::AtomicOrdering> getMemoryOrdering(MemSemantic memOrdering);
+
+/// Choose a legal atomic load/store width using pointer alignment/contiguity
+/// and mask constancy.
+unsigned getAtomicLoadStoreVectorSize(Value ptr, Value mask,
+                                      ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                      const TargetInfoBase &targetInfo);
 
 /// Emit `bodyBuilder` inline when `pred` is null. Otherwise, emit it only when
 /// `pred` is true and merge its results with `falseValues` in a continuation

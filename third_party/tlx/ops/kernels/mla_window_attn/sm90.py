@@ -40,9 +40,9 @@ LOG2E = 1.4426950408889634
 @functools.cache
 def _ptxas_before_13():
     """Whether Triton's ptxas predates 13; CUDA 12.4's, which production lowering bundles, needs `SPLIT_KV_DESC`."""
-    from triton.backends.nvidia.compiler import get_ptxas_version
+    from triton.backends.nvidia.compiler import get_ptxas_version_for_arch
 
-    m = re.search(r"release (\d+)\.(\d+)", get_ptxas_version(90))
+    m = re.search(r"release (\d+)\.(\d+)", get_ptxas_version_for_arch(90))
     return m is None or int(m.group(1)) < 13
 
 
