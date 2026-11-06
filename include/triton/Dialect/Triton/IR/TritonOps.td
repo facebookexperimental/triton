@@ -832,7 +832,9 @@ def TT_ReduceReturnOp : TT_Op<"reduce.return", [HasParent<"ReduceOp">, Pure,
 def TT_ScanOp
     : TT_Op<"scan", [Pure, SameOperandsAndResultEncoding,
                      SameOperandsAndResultShape, SingleBlock,
-                     DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+                     DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                     DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                         ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "Associative scan using generic combination algorithm";
   let arguments = (ins Variadic<TT_Tensor>:$srcs, I32Attr:$axis,
       BoolAttr:$reverse, OptionalAttr<StrAttr>:$reduction_ordering);
@@ -847,6 +849,11 @@ def TT_ScanOp
   let extraClassDeclaration = [{
       llvm::SmallVector<RankedTensorType> getInputTypes();
       llvm::SmallVector<Type> getElementTypes();
+      // Per dim, the extent a thread's contiguous registers, then its lanes and
+      // warps cover when they step through it as a blocked layout's do, else
+      // std::nullopt.
+      static std::optional<llvm::SmallVector<unsigned>>
+      getBlockedTile(const ::mlir::triton::LinearLayout &layout);
     }];
 }
 

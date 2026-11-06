@@ -175,6 +175,8 @@ public:
   unsigned getNumOperands() { return scanOp.getNumOperands(); }
   SmallVector<Type> getElementTypes() { return srcElementTypes; }
   SmallVector<unsigned> getOrder() { return order; }
+  // The source register of each blocked index; empty for a Blocked source.
+  ArrayRef<unsigned> getBlockedToSrc() { return blockedToSrc; }
   Region &getCombineOp();
 
 private:
@@ -184,6 +186,7 @@ private:
   llvm::ArrayRef<int64_t> srcShape;
   SmallVector<Type> srcElementTypes;
   SmallVector<unsigned> order;
+  SmallVector<unsigned> blockedToSrc;
 };
 
 // Helper class for lowering `tt.gather` operations. This class shares lowering
