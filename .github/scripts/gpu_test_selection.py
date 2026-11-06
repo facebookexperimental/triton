@@ -559,7 +559,10 @@ def select_kernel_tests(paths, repo, tritonbench=()):
                             r")\b") if matchers.op_names else None
     affected = set(buckets["test"])
     for rel in iter_scan_files(repo):
-        source = (repo / rel).read_text(encoding="utf-8")
+        try:
+            source = (repo / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return full
         try:
             ast.parse(source)
         except SyntaxError:
@@ -594,13 +597,16 @@ def cpu_ineligible_reason(paths, repo, spec):
     expected = set(spec["files"]) | {"python/test/gluon/" + name for name in spec["gluon_skip_files"]}
     if actual != expected:
         return "The Gluon test inventory differs from the audited CPU group."
-    tree = ast.parse((directory / "conftest.py").read_text())
-    settings = {
-        n.targets[0].id: ast.literal_eval(n.value)
-        for n in tree.body
-        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
-        and n.targets[0].id in ("_VERSION_SKEW_FILES", "_KNOWN_FAIL_SUBSTRINGS")
-    }
+    try:
+        tree = ast.parse((directory / "conftest.py").read_text())
+        settings = {
+            n.targets[0].id: ast.literal_eval(n.value)
+            for n in tree.body
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id in ("_VERSION_SKEW_FILES", "_KNOWN_FAIL_SUBSTRINGS")
+        }
+    except (OSError, SyntaxError, ValueError, UnicodeError):
+        return "Gluon's CPU audit policy could not be read."
     ignores = [
         n.value
         for n in tree.body

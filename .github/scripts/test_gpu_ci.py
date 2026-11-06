@@ -523,3 +523,30 @@ def test_run_summary_explains_actual_placement(paths, offload, placement, gpu_jo
         assert f"`{name}`" in summary
     assert "does not introduce these exclusions" in summary
     assert "not a new skip decision" in summary
+
+
+def test_unreadable_kernel_test_retains_full_coverage(tmp_path):
+    from gpu_test_selection import select_kernel_tests
+    path = tmp_path / "python/test/unit/language/test_tlx_unreadable.py"
+    path.parent.mkdir(parents=True)
+    path.symlink_to("missing-source.py")
+    plan = select_kernel_tests(["third_party/tlx/tutorials/changed.py"], tmp_path)
+    assert plan["kernel_only"] is False
+    assert plan["correctness_mode"] == "all"
+
+
+@pytest.mark.parametrize("policy", [None, "def broken(", "_VERSION_SKEW_FILES = unknown"])
+def test_unreadable_gluon_audit_only_blocks_gluon_cpu_placement(tmp_path, policy):
+    from gpu_test_selection import SUITES, cpu_ineligible_reason
+    suites = json.loads(SUITES.read_text())
+    spec = suites["cpu"]["gluon"]
+    directory = tmp_path / "python/test/gluon"
+    directory.mkdir(parents=True)
+    for path in spec["files"]:
+        (tmp_path / path).write_text("")
+    for name in spec["gluon_skip_files"]:
+        (directory / name).write_text("")
+    if policy is not None:
+        (directory / "conftest.py").write_text(policy)
+    assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, spec) is not None
+    assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, suites["cpu"]["codegen"]) is None

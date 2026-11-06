@@ -224,7 +224,7 @@ function renderLit(l){
 
 let OPEN=null;
 function renderMain(m,l,branch){
-  const platforms=["H100","B200","MI350","CPU"];
+  const platforms=["H100","B200","MI350","CPU"].filter(g=>m.gpus[g]);
   if(OPEN===null||OPEN.branch!==branch)OPEN=Object.fromEntries(platforms.map(g=>[g,m.gpus[g].verdict==="new"||m.gpus[g].verdict==="known"]).concat([["branch",branch]]));
   $("m-build").innerHTML=m.build?`<div class="banner"><b class="bad">✕ Build failed</b> at ${sha(m.build.sha)} ${pr(m.build.pr)} ${who(m.build.author)}, ${ago(m.build.t)}: ${esc(m.build.step)}. No GPU tests ran on this push; each GPU's verdict is from its last result.</div>`:"";
   const all=k=>platforms.flatMap(g=>m.gpus[g][k]);
@@ -271,7 +271,7 @@ function renderMain(m,l,branch){
       return `<td${i?"":` class="latest"`}>${link(st,label==="LIT"?c.lit:c.gpu,div)}</td>`}).join("")+"</tr>";
   $("m-grid").innerHTML="<tr><th></th>"+P.map((c,i)=>{const n=prOf(c);return `<th${i?"":` class="latest"`}>${i?"":"Latest<br>"}<a href="https://github.com/facebookexperimental/triton/commit/${esc(c.sha)}" data-tip="${esc(tip(c))}">${n?"#"+esc(n):esc(c.sha.slice(0,7))}</a><br><span class="muted">T+${hrs(c)}h</span></th>`}).join("")+"</tr>"+
     group("GPU Tests","gpu-tests.yml")+["H100","B200","MI350"].map(g=>row(g,m.gpus[g],c=>c.gpu?c.gpu.cells[g]:"na",c=>c.gpu&&c.gpu.since&&c.gpu.since[g])+(OPEN[g]?steps(g):"")).join("")+
-    group("CPU compiler tests","gpu-tests.yml")+row("CPU",m.gpus.CPU,c=>c.gpu?c.gpu.cells.CPU:"na",c=>c.gpu&&c.gpu.since&&c.gpu.since.CPU)+(OPEN.CPU?steps("CPU"):"")+
+    (m.gpus.CPU?group("CPU compiler tests","gpu-tests.yml")+row("CPU",m.gpus.CPU,c=>c.gpu?c.gpu.cells.CPU:"na",c=>c.gpu&&c.gpu.since&&c.gpu.since.CPU)+(OPEN.CPU?steps("CPU"):""):"")+
     group("LIT Tests","compiler.yml")+(l?row("LIT",l,c=>c.lit?c.lit.cell:"na",c=>c.lit&&c.lit.since):`<tr><td class="gl">LIT</td><td colspan="${P.length}" class="muted" style="font-size:12px">runs on pushes to main only, not on ${esc(branch)}</td></tr>`);
   for(const td of $("m-grid").querySelectorAll("td[data-g]"))td.onclick=()=>{OPEN[td.dataset.g]=!OPEN[td.dataset.g];renderMain(m,l,branch)};
   const lit=l||{new:[],known:[]};
