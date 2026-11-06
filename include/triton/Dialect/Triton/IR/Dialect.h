@@ -161,6 +161,32 @@ public:
                       function_ref<InFlightDiagnostic()> emitError) const = 0;
 };
 
+// Implemented by the dialect of a target's MMA ops. The pad pass and the
+// target's lowering ask the one whose prefix matches ttg.target.
+class NpotTargetLegality : public DialectInterface::Base<NpotTargetLegality> {
+public:
+  NpotTargetLegality(Dialect *dialect) : Base(dialect) {}
+
+  // The ttg.target prefix, e.g. "cuda" or "hip".
+  virtual StringRef getTargetPrefix() const = 0;
+
+  // Why `dot` can't be exact on `target` with `numWarps` warps, or
+  // std::nullopt. `layout` is the mixed-radix layout of the dot's first NPOT
+  // operand.
+  virtual std::optional<std::string>
+  getDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
+                          StringRef target, int numWarps) const = 0;
+};
+
+// The ttg.target of `op`'s module, or "" if it has none.
+StringRef getModuleTarget(Operation *op);
+
+// Why the NpotTargetLegality matching `target` rejects `layout`, or
+// std::nullopt; without one the dot isn't supported.
+std::optional<std::string>
+getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
+                            StringRef target, int numWarps);
+
 // Descriptor gather and scatter have restrictions on the tile sizes.
 LogicalResult verifyGatherScatterResultType(Operation *op,
                                             ShapedType resultType,

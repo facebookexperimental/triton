@@ -704,6 +704,7 @@ def TT_GetNumProgramsOp : TT_Op<"get_num_programs", [Pure]> {
 def TT_DotOp
     : TT_Op<"dot", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,
                     DeclareOpInterfaceMethods<DotOpInterface>,
+                    MixedRadixLayoutTrait,
                     TypesMatchWith<"result's type matches accumulator's type",
                                    "d", "c", "$_self">]> {
   let summary = "dot";
@@ -743,6 +744,7 @@ def TT_DotScaledOp
             [Pure, AttrSizedOperandSegments,
              DeclareOpInterfaceMethods<DotOpInterface, ["verifyDims",
                                                         "verifyOutputDims"]>,
+             MixedRadixLayoutTrait,
              TypesMatchWith<"result's type matches accumulator's type", "d",
                             "c", "$_self">]> {
   let summary = "dot_scaled";
