@@ -614,6 +614,40 @@ def MaskedStoreOp : TT_AMDGPU_Op<"masked_store", []> {
 }
 
 //===----------------------------------------------------------------------===//
+// PackedDot2Op
+//===----------------------------------------------------------------------===//
+
+def PackedDot2Op
+    : TT_AMDGPU_Op<"packed_dot2",
+                   [Pure, Elementwise, SameOperandsAndResultShape,
+                    SameOperandsAndResultEncoding]> {
+  let summary = "Compute an FP32 dot product of two packed FP16 or BF16 pairs";
+
+  let description = [{
+    Interpret each i32 element of `lhs` and `rhs` as two packed values of
+    `input_type` and compute
+    `lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc` in FP32.
+
+    FP16 lowers to `llvm.amdgcn.fdot2`; BF16 lowers to
+    `llvm.amdgcn.fdot2.f32.bf16`. LLVM therefore retains the DOT instruction
+    semantics needed by AMDGPU scheduling and hazard recognition.
+  }];
+
+  let arguments = (ins RankedTensorOf<[I32]>:$lhs,
+                       RankedTensorOf<[I32]>:$rhs,
+                       RankedTensorOf<[F32]>:$acc,
+                       TypeAttr:$input_type);
+  let results = (outs RankedTensorOf<[F32]>:$result);
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs `,` $acc attr-dict
+        `:` type($lhs) `,` type($rhs) `,` type($acc) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // ScaledUpcastFp4Op
 //===----------------------------------------------------------------------===//
 
