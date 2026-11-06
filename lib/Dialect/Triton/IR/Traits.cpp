@@ -99,8 +99,7 @@ LogicalResult OpTrait::impl::verifySameResultsType(Operation *op) {
 }
 
 LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
-  static const bool allowNpot =
-      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+  static const bool allowNpot = mlir::triton::tools::isNpotAllowed();
   for (auto opType : op->getOperandTypes()) {
     if (auto tensorType = dyn_cast<RankedTensorType>(opType)) {
       int64_t numElements = 1;
