@@ -32,6 +32,11 @@ gfx950_flex_attention_template = _make_flex_template(
     load_tlx_template("gfx950_flex_attention") + load_flex_template("utilities"),
 )
 
+gfx1250_flex_attention_template = _make_flex_template(
+    "tlx_gfx1250_flex_attention",
+    load_tlx_template("gfx1250_flex_attention") + load_flex_template("utilities"),
+)
+
 
 @SymbolicGridFn
 def sm90_flex_attention_bwd_grid(batch_size, q_heads, num_queries, d_model, kv_heads, num_key_value, meta):
@@ -47,12 +52,7 @@ sm90_flex_attention_backward_template = _make_flex_template(
 )
 
 
-#: Arches offered the gfx950 flex-attention template.
-#:
-#: Unlike the warp-pipe GEMM templates, this one is gated to exactly the arch
-#: it was tuned on. The body is portable across CDNA in principle, but gfx942
-#: (MI300X) and gfx1250 (MI450X) each need their own pass -- MFMA tile shape,
-#: LDS budget and num_warps all differ -- so add them here once that lands.
+# gfx942 still needs its own template; gfx1250 uses a separate forward template.
 _AMD_FLEX_ARCHES = frozenset({"gfx950"})
 
 
@@ -102,9 +102,7 @@ def append_tlx_flex(
 ):
     """Add TLX forward flex-attention template choices to ``choices``.
 
-    Dispatches on the target, mirroring ``mm_templates.append_tlx``: arches in
-    ``_AMD_FLEX_ARCHES`` go to :func:`_append_tlx_flex_amd`, everything else to
-    :func:`_append_tlx_flex_nvidia`.
+    Selects the gfx950, gfx1250, or NVIDIA template for the current target.
 
     Gated by ``config.triton.tlx_mode``:
       - None (disabled): no-op.
@@ -129,9 +127,10 @@ def append_tlx_flex(
     query, logsumexp, max_scores = input_nodes[0], input_nodes[3], input_nodes[4]
     mutated_inputs = [logsumexp, max_scores]
 
-    appender = (
-        _append_tlx_flex_amd if _use_amd_flex_template() else _append_tlx_flex_nvidia
-    )
+    if current_target().is_gfx1250:
+        appender = _append_tlx_flex_gfx1250
+    else:
+        appender = _append_tlx_flex_amd if _use_amd_flex_template() else _append_tlx_flex_nvidia
     appender(
         tlx_choices, configs, input_nodes, subgraphs, layout,
         original_kernel_options, sparse_q_block_size, sparse_kv_block_size,
@@ -452,6 +451,66 @@ def _append_tlx_flex_amd(
             if (fit(conf.block_m, base["SPARSE_Q_BLOCK_SIZE"]) == conf.block_m
                     and fit(conf.block_n, base["SPARSE_KV_BLOCK_SIZE"]) == conf.block_n):
                 append(conf.block_m, conf.block_n, num_warps=min(8, max(1, conf.block_m // 32)))
+
+
+def _append_tlx_flex_gfx1250(choices, configs, input_nodes, subgraphs, layout, original_kernel_options,
+                             sparse_q_block_size, sparse_kv_block_size, query, mutated_inputs):
+    import sympy
+    import triton
+    from torch._inductor import config
+    from torch._inductor.virtualized import V
+    from triton.tlx.ops.kernels.flash_attn.gfx1250 import _CONFIGS, heuristic_config
+
+    tensors = input_nodes[:3]
+    if any(t.get_dtype() not in (torch.float16, torch.bfloat16) for t in tensors):
+        return
+    if any(t.get_dtype() != query.get_dtype() or t.get_size()[-1] != 128 or t.get_stride()[-1] != 1 for t in tensors):
+        return
+    if any(not isinstance(stride, (int, sympy.Integer)) or stride <= 0 for t in tensors for stride in t.get_stride()):
+        return
+    base = original_kernel_options.copy()
+    for name in list(base):
+        if name.startswith("fwd_"):
+            base[name[4:]] = base.pop(name)
+        elif name.startswith("bwd_"):
+            base.pop(name)
+    base.update(USE_TMA=False, SPARSE_Q_BLOCK_SIZE=sparse_q_block_size, SPARSE_KV_BLOCK_SIZE=sparse_kv_block_size)
+    batch, heads, sq, _ = query.get_size()
+    sk = input_nodes[1].get_size()[2]
+    static_shape = all(isinstance(size, (int, sympy.Integer)) for size in (batch, heads, sq, sk))
+    base["USE_FIXED_REFERENCE"] = isinstance(sk, (int, sympy.Integer)) and sk >= 512
+    if static_shape:
+        hints = tuple(map(int, (batch, heads, sq, sk)))
+    else:
+        sizevars = V.graph.sizevars
+        hint = getattr(sizevars, "optimization_hint", None) or sizevars.size_hint
+        hints = tuple(hint(size, fallback=1) for size in (batch, heads, sq, sk))
+    preferred = heuristic_config(*hints, current_target().num_cus)
+    if hints[2] <= 32:
+        preferred = _CONFIGS[0]
+    candidates = [preferred, *_CONFIGS] if config.max_autotune else [preferred]
+    seen = set()
+    for candidate in candidates:
+        block_m = base.get("BLOCK_M", candidate.kwargs["BLOCK_M"])
+        block_n = base.get("BLOCK_N", candidate.kwargs["BLOCK_N"])
+        if block_m not in (32, 64, 128, 256) or block_n not in (32, 64, 128):
+            continue
+        while "BLOCK_M" not in base and block_m >= 32 and sparse_q_block_size % block_m:
+            block_m //= 2
+        while "BLOCK_N" not in base and block_n >= 32 and sparse_kv_block_size % block_n:
+            block_n //= 2
+        if min(block_m, block_n, sparse_q_block_size, sparse_kv_block_size) < 32:
+            continue
+        if sparse_q_block_size % block_m or sparse_kv_block_size % block_n or (block_m, block_n) in seen:
+            continue
+        if static_shape and "BLOCK_M" not in base and block_m > max(32, triton.next_power_of_2(int(sq))):
+            continue
+        seen.add((block_m, block_n))
+        opts = dict(base, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=2 if block_m == 32 else 4, num_stages=1,
+                    waves_per_eu=1)
+        gfx1250_flex_attention_template.maybe_append_choice(choices=choices, input_nodes=input_nodes, layout=layout,
+                                                            subgraphs=subgraphs, mutated_inputs=mutated_inputs,
+                                                            call_sizes=query.get_size(), **opts)
 
 
 _SM90_HEAD_DIMS = (64, 80, 96, 128)

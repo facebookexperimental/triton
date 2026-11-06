@@ -477,6 +477,7 @@ ARCH_BY_PART = {
     "GB300": "sm100",
     "B200": "sm100",
     "H100": "sm90",
+    "MI450X": "gfx1250",
     "MI350X": "gfx950",
     "MI355X": "gfx950",
     "MI300X": "gfx942",
@@ -492,6 +493,7 @@ class Device:
     #: "Unique ID"; None when rocminfo could not be matched.
     uuid: Optional[str] = None
     memory_used_mib: float = 0.0
+    gpu_arch: Optional[str] = None
 
     @property
     def visibility_env(self) -> str:
@@ -523,6 +525,8 @@ class Device:
 
     @property
     def arch(self) -> Optional[str]:
+        if self.gpu_arch is not None:
+            return self.gpu_arch
         for part, key in ARCH_BY_PART.items():
             if part.lower() in self.name.lower().replace(" ", ""):
                 return key
@@ -565,7 +569,7 @@ def list_devices() -> list[Device]:
         used_col, bus_col = col.get("VRAM Total Used Memory (B)"), col.get("PCI Bus")
         if used_col is None:
             return []
-        rocr = _rocr_uuids()
+        rocr = _rocr_agents()
         found = []
         for line in lines[1:]:
             f = [x.strip() for x in line.split(",")]
@@ -574,8 +578,8 @@ def list_devices() -> list[Device]:
                 continue
             bus = f[bus_col] if bus_col is not None and len(f) > bus_col else None
             used = _num(f[used_col])
-            uuid = rocr.get(_pci_bus_number(bus))
-            found.append(Device(AMD, int(idx), _amd_name(int(idx)), uuid, (used or 0.0) / 1024 / 1024))
+            uuid, gpu_arch = rocr.get(_pci_bus_number(bus), (None, None))
+            found.append(Device(AMD, int(idx), _amd_name(int(idx)), uuid, (used or 0.0) / 1024 / 1024, gpu_arch))
         return found
     return []
 
@@ -596,29 +600,34 @@ def _rocminfo() -> Optional[str]:
     return out.stdout
 
 
-def _rocr_uuids() -> dict[int, str]:
-    """ROCr GPU agent UUIDs by PCI bus number.
+def _rocr_agents() -> dict[int, tuple[Optional[str], Optional[str]]]:
+    """ROCr UUID and architecture by PCI bus, before HIP context creation.
 
-    rocm-smi numbers cards in a different order from ROCr (and HIP), so the PCI
-    bus is the key that joins the two tools. rocminfo's BDFID is
-    bus << 8 | device << 3 | function.
+    rocm-smi and ROCr/HIP can number GPUs differently; PCI bus joins the tools.
+    rocminfo's BDFID encodes bus << 8 | device << 3 | function.
     """
-    found: dict[int, str] = {}
-    uuid = bdf = None
+    found = {}
+    uuid = bdf = arch = None
     gpu = False
     for line in (_rocminfo() or "").splitlines():
         line = line.strip()
         if re.match(r"Agent \d+", line):
-            uuid, bdf, gpu = None, None, False
+            uuid = bdf = arch = None
+            gpu = False
+        elif line.startswith("Name:"):
+            name = line.split()[-1]
+            if re.fullmatch(r"gfx[0-9a-f]+", name):
+                arch = name
         elif line.startswith("Uuid:"):
-            uuid = line.split()[-1]
+            value = line.split()[-1]
+            # ROCr rejects the "GPU-XX" placeholder reported without a UUID.
+            uuid = value if re.fullmatch(r"GPU-[0-9a-fA-F]+", value) else None
         elif line.startswith("BDFID:"):
             bdf = line.split()[-1]
         elif line.startswith("Device Type:"):
             gpu = line.split()[-1] == "GPU"
-        # A GPU without a UUID reports the placeholder "GPU-XX", which ROCr rejects.
-        if gpu and uuid and re.fullmatch(r"GPU-[0-9a-fA-F]+", uuid) and bdf and bdf.isdigit():
-            found[int(bdf) >> 8] = uuid
+        if gpu and bdf and bdf.isdigit():
+            found[int(bdf) >> 8] = (uuid, arch)
     return found
 
 
@@ -713,6 +722,9 @@ class Governor(contextlib.AbstractContextManager):
             self._restore.append(["nvidia-smi", "-rgc", "-i", str(d.index)])
 
     def _govern_amd(self, d: Device):
+        if d.arch == "gfx1250":
+            self.skipped.append("gfx1250 clock/power policy is not calibrated")
+            return
         target = d.power_target_w or 500
         if self._sudo(["rocm-smi", "-d", str(d.index), "--setperfdeterminism", str(AMD_DETERMINISM_MHZ)]):
             self.applied.append(f"perf determinism {AMD_DETERMINISM_MHZ} MHz")
