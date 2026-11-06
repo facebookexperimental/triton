@@ -9,6 +9,7 @@ void populateTritonAMDGPUToLLVMPatterns(LLVMTypeConverter &typeConverter,
   populateExtractSliceOpToLLVMPatterns(typeConverter, patterns, benefit);
   populateInThreadTransposeOpToTTGPatterns(patterns, benefit);
   populateConcatOpToLLVMPatterns(typeConverter, patterns, benefit);
+  populatePackedDot2OpToLLVMPatterns(typeConverter, patterns, benefit);
   populateScaledUpcastOpToLLVMPatterns(typeConverter, patterns, targetInfo,
                                        benefit);
   populateScaledDowncastOpToLLVMPatterns(typeConverter, patterns, targetInfo,

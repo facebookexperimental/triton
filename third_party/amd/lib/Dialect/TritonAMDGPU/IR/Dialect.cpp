@@ -1001,6 +1001,13 @@ Attribute ScaledUpcastFp8Op::inferSrcEncoding(unsigned opIdx,
   return dstEnc;
 }
 
+LogicalResult PackedDot2Op::verify() {
+  Type inputType = getInputType();
+  if (!inputType.isF16() && !inputType.isBF16())
+    return emitError() << "input_type must be f16 or bf16, got " << inputType;
+  return success();
+}
+
 LogicalResult ScaledDowncastFp8Op::verify() {
   RankedTensorType inputTy = getInput().getType();
   RankedTensorType outputTy = getOutput().getType();

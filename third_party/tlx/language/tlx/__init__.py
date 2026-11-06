@@ -78,6 +78,7 @@ from .mem_ops import (
 )
 from .mma_ops import (
     amd_dot,
+    amd_packed_dot2,
     amd_mfma_commit,
     amd_register_class_anchor,
     amd_register_resident,
@@ -182,6 +183,7 @@ __all__ = [
     "storage_kind",
     "layout",
     "amd_dot",
+    "amd_packed_dot2",
     "amd_mfma_commit",
     "amd_register_class_anchor",
     "amd_register_resident",

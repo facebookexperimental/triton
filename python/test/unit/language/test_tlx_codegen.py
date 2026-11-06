@@ -786,6 +786,60 @@ def compile_for_gfx942(fn, signature, constexprs):
 
 
 @triton.jit
+def _amd_packed_dot2_rejects_fp32_kernel(lhs_ptr, rhs_ptr, output_ptr):
+    offsets = tl.arange(0, 64)
+    lhs = tl.load(lhs_ptr + offsets)
+    rhs = tl.load(rhs_ptr + offsets)
+    result = tlx.amd_packed_dot2(lhs, rhs, tl.zeros((64, ), tl.float32), input_dtype=tl.bfloat16)
+    tl.store(output_ptr + offsets, result)
+
+
+def test_amd_packed_dot2_rejects_unpacked_inputs():
+    with pytest.raises(CompilationError, match="lhs and rhs must contain packed input pairs as uint32"):
+        compile_for_gfx950(
+            _amd_packed_dot2_rejects_fp32_kernel,
+            signature={"lhs_ptr": "*fp32", "rhs_ptr": "*fp32", "output_ptr": "*fp32"},
+            constexprs={},
+        )
+
+
+@triton.jit
+def _amd_packed_dot2_target_kernel(lhs_ptr, rhs_ptr, output_ptr, INPUT_DTYPE: tl.constexpr):
+    offsets = tl.arange(0, 64)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    result = tlx.amd_packed_dot2(lhs, rhs, tl.zeros((64, ), tl.float32), input_dtype=INPUT_DTYPE)
+    tl.store(output_ptr + offsets, result)
+
+
+def test_amd_packed_dot2_rejects_gfx942():
+    with pytest.raises(CompilationError, match="currently requires gfx950"):
+        compile_for_gfx942(
+            _amd_packed_dot2_target_kernel,
+            signature={"lhs_ptr": "*i32", "rhs_ptr": "*i32", "output_ptr": "*fp32", "INPUT_DTYPE": "constexpr"},
+            constexprs={"INPUT_DTYPE": tl.bfloat16},
+        )
+
+
+@triton.jit
+def _amd_packed_dot2_rejects_dtype_kernel(lhs_ptr, rhs_ptr, output_ptr):
+    offsets = tl.arange(0, 64)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    result = tlx.amd_packed_dot2(lhs, rhs, tl.zeros((64, ), tl.float32), input_dtype=tl.float32)
+    tl.store(output_ptr + offsets, result)
+
+
+def test_amd_packed_dot2_rejects_unsupported_input_dtype():
+    with pytest.raises(CompilationError, match="input_dtype must be tl.float16 or tl.bfloat16"):
+        compile_for_gfx950(
+            _amd_packed_dot2_rejects_dtype_kernel,
+            signature={"lhs_ptr": "*i32", "rhs_ptr": "*i32", "output_ptr": "*fp32"},
+            constexprs={},
+        )
+
+
+@triton.jit
 def _amd_dot_register_class_kernel(a_ptr, b_ptr, c_ptr, REGISTER_CLASS: tl.constexpr):
     offs_m = tl.arange(0, 64)
     offs_n = tl.arange(0, 64)

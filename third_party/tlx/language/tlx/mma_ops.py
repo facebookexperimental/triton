@@ -5,6 +5,34 @@ from .utility import cuda_parse_arch
 
 
 @tl.builtin
+def amd_packed_dot2(lhs, rhs, acc, input_dtype: tl.constexpr, _semantic=None):
+    """Compute one FP32 dot product from each pair of packed FP16 or BF16 inputs.
+
+    Every ``uint32`` element of ``lhs`` and ``rhs`` contains two values
+    of ``input_dtype``, which must be ``tl.float16`` or ``tl.bfloat16``.
+    The result is ``lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc`` in FP32.
+    Inputs, accumulator, and result have the same tensor shape and layout.
+
+    This emits the matching LLVM AMDGPU fdot2 intrinsic rather than inline
+    assembly, so the backend retains the DOT dependency and hazard semantics.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_packed_dot2 is only supported on AMD (HIP) backends")
+    arch = _semantic.builder.options.arch.split(":", 1)[0]
+    assert arch == "gfx950", f"tlx.amd_packed_dot2 currently requires gfx950, got arch={arch}"
+    input_dtype = tl._unwrap_if_constexpr(input_dtype)
+    assert input_dtype in (tl.float16, tl.bfloat16), f"input_dtype must be tl.float16 or tl.bfloat16, got {input_dtype}"
+    for name, value in (("lhs", lhs), ("rhs", rhs), ("acc", acc)):
+        assert isinstance(value, tl.tensor) and value.type.is_block(), f"{name} must be a distributed tensor"
+    assert lhs.dtype == tl.uint32 and rhs.dtype == tl.uint32, "lhs and rhs must contain packed input pairs as uint32"
+    assert acc.dtype == tl.float32, "acc must be an FP32 tensor"
+    assert lhs.shape == rhs.shape == acc.shape, "lhs, rhs, and acc must have the same shape"
+    handle = _semantic.builder.create_amd_packed_dot2(lhs.handle, rhs.handle, acc.handle,
+                                                      input_dtype.to_ir(_semantic.builder))
+    return tl.tensor(handle, tl.block_type(tl.float32, lhs.shape))
+
+
+@tl.builtin
 def extract_slice(source, shape, offsets, _semantic=None):
     """Extract an aligned register slice without cross-thread movement.
 
