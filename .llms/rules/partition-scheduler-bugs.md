@@ -315,6 +315,13 @@
 - **Fix**: `dotOp->getResult(0).replaceAllUsesExcept(ifOp->getResult(0), yield)` -- redirect external uses to the scf.if result but leave the then-yield forwarding the dot's own result. Mirrors `PartitionLoopPeeling.cpp`'s `mask.replaceUsesWithIf(..., use.getOwner() != thenYield)`.
 - **Lit test**: `ws_pipeline_predicate_warp_group_dot.mlir` (new) -- a Hopper `ttng.warp_group_dot` whose result is loop-carried, driven through `-tritongpu-pipeline` under `TRITON_USE_META_WS=1` so epilogue peeling predicates the dot. Checks the predicated dot's then-block yields the dot result (`scf.yield %[[DOT]]`), not the scf.if result. Verified discriminating: without the fix the module fails verification with `operand #0 does not dominate this use` and FileCheck gets no input.
 
+### 43. CLC persistent GEMM with a single K tile fails warp specialization (2026-11-06, fixed)
+- **Symptom**: `handleOperandD: MMA operation is not inside a scf.for loop` for a CLC (or atomic-counter) persistent autoWS GEMM with `K == BLOCK_K`. Static persistent is fine.
+- **Root cause**: the one-trip K loop folds away, so the MMA sits directly in the warp-specialized `scf.while` tile loop. `handleOperandD` required an `scf.for`; the TMEM planner only allocated TMEM inside innermost `scf.for` loops (no `buffer.id` -> `doCodePartition` assert); `getLastOpInBlock` asserted an `scf.for` parent. `OptimizeAccumulatorInit` also skipped MMAs outside an `scf.for`, so the zero init stayed a per-tile `tmem_store`.
+- **Fix**: accept the warp-specialized `scf.while` (after region) in `handleOperandD` and as an innermost TMEM-planner loop (only when it holds the MMA directly and has no nested loop); `getLastOpInBlock` uses the ops' block; fold a constant-zero accumulator into `use_acc = false` outside loops too.
+- **Follow-up**: the accumulator stays `buffer.copy = 1` under the while (bug #37's multi-buffering is `scf.for`-only), which serializes MMA and epilogue across tiles; revisit together with cross-tile pipelining of the while.
+- **Tests**: `ws_clc_single_k_tile.mlir`, `accumulator-init.mlir` (`@zero_init_in_while`, `@zero_init_no_loop`, `@nonzero_init_no_loop`).
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
