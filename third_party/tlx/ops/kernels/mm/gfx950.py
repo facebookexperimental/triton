@@ -17413,7 +17413,9 @@ def _gemv_packed_dot2_kernel(a_ptr, b_ptr, out_ptr, N, K, STRIDE_BN, STRIDE_CN, 
     else:
         weights = tl.load(b_ptr.to(tl.pointer_type(tl.uint32)) + offsets_b, mask=mask_b, other=0)
     products = tl.inline_asm_elementwise(
-        "v_dot2_f32_bf16 $0, $1, $2, 0;",
+        # WORKAROUND: LLVM does not treat inline asm as a DOT, so it omits the three wait states a different VALU
+        # needs before reading or overwriting a DOT result.
+        "v_dot2_f32_bf16 $0, $1, $2, 0\n s_nop 2",
         constraints="=v,v,v",
         args=[weights, a[None, :]],
         dtype=tl.float32,
