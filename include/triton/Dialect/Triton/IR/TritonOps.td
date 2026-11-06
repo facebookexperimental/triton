@@ -1072,7 +1072,7 @@ def TT_MakeTensorDescOp
     : TT_Op<"make_tensor_descriptor", [AttrSizedOperandSegments,
                                        DeclareOpInterfaceMethods<
                                            MemoryEffectsOpInterface>,
-]> {
+                                       MixedRadixLayoutTrait]> {
   let summary = "Make a tensor descriptor type with meta information of the "
                 "parent tensor and block size";
 
@@ -1318,7 +1318,10 @@ def ReturnOp
 }
 
 def TT_DescriptorLoadOp
-    : TT_Op<"descriptor_load", [TT_DescriptorLoadLikeOpInterface]> {
+    : TT_Op<"descriptor_load",
+            [TT_DescriptorLoadLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "Load from descriptor";
   let description = [{
     This operation will be lowered to Nvidia TMA load operation on targets supporting it.
@@ -1341,7 +1344,10 @@ def TT_DescriptorLoadOp
 }
 
 def TT_DescriptorStoreOp
-    : TT_Op<"descriptor_store", [TT_DescriptorStoreLikeOpInterface]> {
+    : TT_Op<"descriptor_store",
+            [TT_DescriptorStoreLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "store value based on descriptor";
   let description = [{
     This operation will be lowered to Nvidia TMA store operation on targets supporting it.
@@ -1365,7 +1371,10 @@ def TT_DescriptorStoreOp
 }
 
 def TT_DescriptorReduceOp
-    : TT_Op<"descriptor_reduce", [TT_DescriptorStoreLikeOpInterface]> {
+    : TT_Op<"descriptor_reduce",
+            [TT_DescriptorStoreLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "performs a reducing store operation based on a descriptor";
   let description = [{
     This operation will be lowered to Nvidia TMA store operation on targets supporting it.
@@ -1385,7 +1394,10 @@ def TT_DescriptorReduceOp
 }
 
 def TT_DescriptorGatherOp
-    : TT_Op<"descriptor_gather", [TT_DescriptorLoadLikeOpInterface]> {
+    : TT_Op<"descriptor_gather",
+            [TT_DescriptorLoadLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "gather multiple rows from a descriptor into a single tensor";
   let description = [{
     The `tt.descriptor_gather` op will be lowered to NVIDIA TMA
@@ -1410,7 +1422,10 @@ def TT_DescriptorGatherOp
 }
 
 def TT_DescriptorScatterOp
-    : TT_Op<"descriptor_scatter", [TT_DescriptorStoreLikeOpInterface]> {
+    : TT_Op<"descriptor_scatter",
+            [TT_DescriptorStoreLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "scatter multiple rows to a descriptor from a single tensor";
   let description = [{
     The `tt.descriptor_scatter` op will be lowered to NVIDIA TMA

@@ -1940,6 +1940,15 @@ struct AmdNpotTargetLegality : public tt::NpotTargetLegality {
                                 StringRef target) const override {
     return ("NPOT async copy is not yet supported on " + target).str();
   }
+  std::optional<std::string>
+  getDescriptorUnsupportedReason(Operation *, const tt::LinearLayout &,
+                                 StringRef target) const override {
+    return ("NPOT tensor descriptor is not yet supported on " + target).str();
+  }
+  bool keepsDescriptorVector(RankedTensorType,
+                             RankedTensorType) const override {
+    return false;
+  }
 };
 } // namespace
 
