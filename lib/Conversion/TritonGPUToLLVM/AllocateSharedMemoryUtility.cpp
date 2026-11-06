@@ -150,15 +150,15 @@ static bool isNpotSharedCover(Type type) {
 LogicalResult verifyNpotTypesSupported(ModuleOp mod) {
   if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
     return success();
-  bool rejected = false;
+  bool unsupported = false;
   mod.walk([&](Operation *op) {
     if (llvm::any_of(op->getOperandTypes(), isNpotSharedCover) ||
         llvm::any_of(op->getResultTypes(), isNpotSharedCover)) {
       op->emitError() << "NPOT shared memory descriptors are not yet supported";
-      rejected = true;
+      unsupported = true;
     }
   });
-  return failure(rejected);
+  return failure(unsupported);
 }
 
 } // namespace mlir::triton::gpu

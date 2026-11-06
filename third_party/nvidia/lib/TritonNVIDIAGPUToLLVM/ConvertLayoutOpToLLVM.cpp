@@ -36,12 +36,13 @@ struct ConvertLayoutOpSwizzlingConversion
     auto dstTy = op.getType();
     auto *ctx = op.getContext();
 
-    // Modular layouts use the generic conversion path, except odd slabs.
+    // Modular layouts use the generic conversion path, except odd tiles.
     if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
-      auto slabs = nvidia_gpu::getProductSlabTransfer(srcTy, dstTy, targetInfo);
-      if (!slabs)
+      auto tiles =
+          nvidia_gpu::getMixedRadixTileTransfer(srcTy, dstTy, targetInfo);
+      if (!tiles)
         return failure();
-      return transferProductSlabs(op, adaptor, *slabs, rewriter);
+      return transferMixedRadixTiles(op, adaptor, *tiles, rewriter);
     }
 
     LinearLayout conversion = minimalCvtLayout(srcTy, dstTy);
@@ -71,12 +72,13 @@ struct ConvertLayoutOpSwizzlingConversion
     return failure();
   }
 
-  // `inVals` holds `numSlabs` transfers of `srcLayout` back to back.
+  // `inVals` holds `numTiles` transfers of `srcLayout` back to back.
   SmallVector<Value> transferWithinBlockSwizzling(
       Location loc, ConversionPatternRewriter &rewriter,
       const LinearLayout &srcLayout, const LinearLayout &dstLayout,
       ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
-      Operation *sourceOp, int32_t numSlabs = 1) const {
+      Operation *sourceOp, int32_t numTiles = 1,
+      int32_t tilesPerRound = 1) const {
     auto *ctx = rewriter.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     // We handle transformations recursively as they all need a preprocessing
@@ -90,7 +92,7 @@ struct ConvertLayoutOpSwizzlingConversion
       }));
       auto outVals = transferWithinBlockSwizzling(
           loc, rewriter, srcLayout, dstLayout, newInVals, llvmElemTyPtr,
-          smemBase, sourceOp, numSlabs);
+          smemBase, sourceOp, numTiles, tilesPerRound);
       for (auto &v : outVals) {
         v = b.inttoptr(llvmElemTy, v);
       }
@@ -105,7 +107,7 @@ struct ConvertLayoutOpSwizzlingConversion
           inVals, [&](Value v) { return b.zext(i8ElemTy, v).getResult(); }));
       auto outVals = transferWithinBlockSwizzling(
           loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase,
-          sourceOp, numSlabs);
+          sourceOp, numTiles, tilesPerRound);
       for (auto &v : outVals) {
         v = b.trunc(llvmElemTy, v);
       }
@@ -140,10 +142,10 @@ struct ConvertLayoutOpSwizzlingConversion
         regPermForDivide(totalStoreCvt, reps, /*left=*/false).value();
     totalStoreCvt = permStore.apply(totalStoreCvt);
     SmallVector<Value> permutedInVals;
-    int32_t slabSize = inVals.size() / numSlabs;
-    for (int32_t slab = 0; slab < numSlabs; ++slab)
+    int32_t valsPerTile = inVals.size() / numTiles;
+    for (int32_t tile = 0; tile < numTiles; ++tile)
       llvm::append_range(permutedInVals, permStore.apply(inVals.slice(
-                                             slab * slabSize, slabSize)));
+                                             tile * valsPerTile, valsPerTile)));
     auto permLoad =
         regPermForDivide(totalLoadCvt, reps, /*left=*/false).value();
     totalLoadCvt = permLoad.apply(totalLoadCvt);
@@ -173,7 +175,7 @@ struct ConvertLayoutOpSwizzlingConversion
 
     auto tileSize = storeCvt.getInDimSize(kReg);
 
-    assert(permutedInVals.size() == tileSize * nReps * numSlabs);
+    assert(permutedInVals.size() == tileSize * nReps * numTiles);
     SmallVector<Value> outVals;
     auto affineOffset = b.i32_val(0);
     auto maskSpanAffineOffset = 0;
@@ -194,23 +196,28 @@ struct ConvertLayoutOpSwizzlingConversion
       return cvt.sublayout(inDims, outDims);
     };
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-    // Each rep is one phase that moves that rep of every slab, at disjoint
-    // offsets.
+    // Each rep of a round is one store/bar/load of that rep of the round's
+    // tiles, at disjoint offsets.
     int32_t tileElems = storeCvt.getTotalOutDimSize() / nBlock;
-    auto slabBase = [&](int32_t slab) {
-      return slab == 0 ? smemBase
+    auto tileBase = [&](int32_t tile) {
+      tile %= tilesPerRound;
+      return tile == 0 ? smemBase
                        : b.gep(smemBase.getType(), llvmElemTy, smemBase,
-                               b.i32_val(slab * tileElems));
+                               b.i32_val(tile * tileElems));
     };
-    SmallVector<SmallVector<Value>> slabOutVals(numSlabs);
-    for (int i = 0; i < nReps; ++i) {
+    SmallVector<SmallVector<Value>> outValsByTile(numTiles);
+    int32_t numRounds = llvm::divideCeil(numTiles, tilesPerRound);
+    for (int i = 0; i < nReps * numRounds; ++i) {
       if (i > 0)
         emitBarrier();
-      for (int32_t slab = 0; slab < numSlabs; ++slab) {
+      int32_t rep = i % nReps, first = i / nReps * tilesPerRound;
+      auto roundTiles =
+          llvm::seq<int32_t>(first, std::min(numTiles, first + tilesPerRound));
+      for (int32_t tile : roundTiles) {
         auto tileInVals =
             to_vector(ArrayRef(permutedInVals)
-                          .slice((slab * nReps + i) * tileSize, tileSize));
-        Value base = slabBase(slab);
+                          .slice((tile * nReps + rep) * tileSize, tileSize));
+        Value base = tileBase(tile);
         // Store
         // idxSrc 0: st.shared, idxSrc 1: stmatrix, idxSrc 2: stmatrix.trans
         if (idxSrc == 0) {
@@ -231,8 +238,8 @@ struct ConvertLayoutOpSwizzlingConversion
         }
       }
       emitBarrier();
-      for (int32_t slab = 0; slab < numSlabs; ++slab) {
-        Value base = slabBase(slab);
+      for (int32_t tile : roundTiles) {
+        Value base = tileBase(tile);
         // Load
         SmallVector<Value> tileOutVals;
         // idxDst 0: ld.shared, idxDst 1: ldmatrix, idxDst 2: ldmatrix.trans
@@ -252,21 +259,21 @@ struct ConvertLayoutOpSwizzlingConversion
               maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
           assert(succeeded(result));
         }
-        llvm::append_range(slabOutVals[slab], tileOutVals);
+        llvm::append_range(outValsByTile[tile], tileOutVals);
       }
     }
 
     // Undo the permLoad used to divideRight
-    for (auto &vals : slabOutVals)
+    for (auto &vals : outValsByTile)
       llvm::append_range(outVals, permLoad.inverse().apply(vals));
     return outVals;
   }
 
-  // Moves each odd slab of a Product conversion as one pow2 transfer.
+  // Moves each odd tile of a mixed-radix conversion as one pow2 transfer.
   LogicalResult
-  transferProductSlabs(ConvertLayoutOp op, OpAdaptor adaptor,
-                       const nvidia_gpu::ProductSlabTransfer &transfer,
-                       ConversionPatternRewriter &rewriter) const {
+  transferMixedRadixTiles(ConvertLayoutOp op, OpAdaptor adaptor,
+                          const nvidia_gpu::MixedRadixTileTransfer &transfer,
+                          ConversionPatternRewriter &rewriter) const {
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
     auto kReg = str_attr("register");
@@ -275,31 +282,31 @@ struct ConvertLayoutOpSwizzlingConversion
     auto src = toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
     auto dst = toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg);
     auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
-    const ProductSharedTiling &slabs = transfer.slabs;
-    SmallVector<Value> slabVals;
-    for (int32_t slab = 0; slab < transfer.numSlabs; ++slab)
-      for (int32_t reg : getSlabRegisters(src, slabs.sourceDigits, slab))
-        slabVals.push_back(inVals[reg]);
-    auto slabOutVals = transferWithinBlockSwizzling(
-        loc, rewriter, slabs.sourceTile, slabs.destinationTile, slabVals,
+    const MixedRadixSharedTiling &tiles = transfer.tiles;
+    SmallVector<Value> tileVals;
+    for (int32_t tile = 0; tile < transfer.numTiles; ++tile)
+      for (int32_t reg : getTileRegisters(src, tiles.sourceDigits, tile))
+        tileVals.push_back(inVals[reg]);
+    auto outValsByTile = transferWithinBlockSwizzling(
+        loc, rewriter, tiles.sourceTile, tiles.destinationTile, tileVals,
         getTypeConverter()->convertType(srcTy.getElementType()),
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op), op,
-        transfer.numSlabs);
+        transfer.numTiles, transfer.tilesPerRound);
     SmallVector<Value> outVals(dst.getInDimSize(kReg));
-    auto next = slabOutVals.begin();
-    for (int32_t slab = 0; slab < transfer.numSlabs; ++slab)
-      for (int32_t reg : getSlabRegisters(dst, slabs.destinationDigits, slab))
+    auto next = outValsByTile.begin();
+    for (int32_t tile = 0; tile < transfer.numTiles; ++tile)
+      for (int32_t reg : getTileRegisters(dst, tiles.destinationDigits, tile))
         outVals[reg] = *next++;
     rewriter.replaceOp(op, packUniqueTensorElements(loc, getTypeConverter(),
                                                     outVals, rewriter, dstTy));
     return success();
   }
 
-  // The registers of `layout` whose `digits` hold slab `slab`'s values,
+  // The registers of `layout` whose `digits` hold the values of `tile`,
   // digits[0] fastest, in register order.
-  static SmallVector<int32_t> getSlabRegisters(const LinearLayout &layout,
+  static SmallVector<int32_t> getTileRegisters(const LinearLayout &layout,
                                                ArrayRef<int32_t> digits,
-                                               int32_t slab) {
+                                               int32_t tile) {
     auto kReg = StringAttr::get(layout.getInDimNames().begin()->getContext(),
                                 "register");
     ArrayRef<int32_t> radices = layout.getInputRadices(kReg);
@@ -309,13 +316,13 @@ struct ConvertLayoutOpSwizzlingConversion
       for (int32_t rest = reg, digit = 0; digit < int32_t(radices.size());
            rest /= radices[digit++])
         values.push_back(rest % radices[digit]);
-      int32_t rest = slab;
-      bool inSlab = true;
+      int32_t rest = tile;
+      bool inTile = true;
       for (int32_t digit : digits) {
-        inSlab &= values[digit] == rest % radices[digit];
+        inTile &= values[digit] == rest % radices[digit];
         rest /= radices[digit];
       }
-      if (inSlab)
+      if (inTile)
         registers.push_back(reg);
     }
     return registers;

@@ -56,7 +56,8 @@ LinearLayout toLinearLayout(TensorOrMemDesc type);
 LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout);
 
 // Under TRITON_ALLOW_NPOT, `shape` with every NPOT extent rounded up to a power
-// of two; NPOT layouts are built on this cover. Without the flag, `shape`.
+// of two; NPOT layouts are built on this pow2 alloc shape. Without the flag,
+// `shape`.
 SmallVector<int64_t> getNpotCoverShape(ArrayRef<int64_t> shape);
 
 // Returns true if the layouts differ only in the order of their register
