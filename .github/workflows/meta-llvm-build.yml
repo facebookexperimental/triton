@@ -1,0 +1,380 @@
+name: Meta LLVM Build
+run-name: ${{ inputs.kind }} LLVM ${{ inputs.llvm_sha }} build ${{ inputs.build_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_sha:
+        description: Full LLVM commit SHA to package
+        required: true
+        type: string
+      build_number:
+        description: Packaging revision for this LLVM commit
+        required: true
+        default: '1'
+        type: string
+      kind:
+        description: LLVM SDK to build
+        required: true
+        default: core
+        type: choice
+        options: [core, amd]
+      publish:
+        description: Publish immutable GitHub Release assets
+        default: true
+        type: boolean
+  workflow_call:
+    inputs:
+      llvm_sha:
+        required: true
+        type: string
+      build_number:
+        default: '1'
+        type: string
+      kind:
+        default: core
+        type: string
+      publish:
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: triton-llvm-bundles-${{ inputs.kind }}-${{ inputs.llvm_sha }}-${{ inputs.build_number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve LLVM revision
+    runs-on: ubuntu-24.04
+    outputs:
+      llvm_sha: ${{ steps.revision.outputs.llvm_sha }}
+      llvm_tree: ${{ steps.revision.outputs.llvm_tree }}
+      short_sha: ${{ steps.revision.outputs.short_sha }}
+      prefix: ${{ steps.revision.outputs.prefix }}
+      platforms: ${{ steps.missing.outputs.platforms }}
+      repairs: ${{ steps.missing.outputs.repairs }}
+      source_needed: ${{ steps.missing.outputs.source_needed }}
+      source_json: ${{ steps.source.outputs.content }}
+      llvm_build_info: ${{ steps.build_call.outputs.llvm_build_info }}
+      matrix_exclude: ${{ steps.build_call.outputs.matrix_exclude }}
+    steps:
+      - name: Validate LLVM commit
+        env:
+          LLVM_REF: ${{ inputs.llvm_sha }}
+        shell: bash
+        run: '[[ "$LLVM_REF" =~ ^[0-9a-f]{40}$ ]]'
+
+      - name: Resolve commit
+        id: revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLVM_REF: ${{ inputs.llvm_sha }}
+          KIND: ${{ inputs.kind }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        shell: bash
+        run: |
+          case "$KIND" in
+            core) prefix=llvm ;;
+            amd) prefix=amd-llvm ;;
+            *) echo 'kind must be core or amd' >&2; exit 1 ;;
+          esac
+          [[ "$BUILD_NUMBER" =~ ^(0|[1-9][0-9]*)$ ]]
+          commit="$(gh api "repos/facebookexperimental/llvm-project/git/commits/${LLVM_REF}")"
+          llvm_sha="$(jq -r '.sha' <<< "$commit")"
+          [[ "$llvm_sha" == "$LLVM_REF" ]]
+          {
+            echo "llvm_sha=${llvm_sha}"
+            echo "llvm_tree=$(jq -r '.tree.sha' <<< "$commit")"
+            echo "short_sha=${llvm_sha:0:8}"
+            echo "prefix=${prefix}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Define LLVM source provenance
+        id: source
+        env:
+          KIND: ${{ inputs.kind }}
+          LLVM_SHA: ${{ steps.revision.outputs.llvm_sha }}
+          LLVM_TREE: ${{ steps.revision.outputs.llvm_tree }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        shell: python
+        run: |
+          import hashlib, json, os
+          source = {
+              "schema_version": 1,
+              "kind": os.environ["KIND"],
+              "llvm_repository": "facebookexperimental/llvm-project",
+              "llvm_sha": os.environ["LLVM_SHA"],
+              "llvm_tree": os.environ["LLVM_TREE"],
+              "build_number": int(os.environ["BUILD_NUMBER"]),
+          }
+          content = json.dumps(source, sort_keys=True, separators=(",", ":"))
+          digest = hashlib.sha256((content + "\n").encode()).hexdigest()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"content={content}\n")
+              output.write(f"digest=sha256:{digest}\n")
+
+      - name: Checkout build workflow
+        uses: actions/checkout@v6.0.2
+        with:
+          path: .llvm-workflow
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/workflows
+
+      - name: Set up workflow parser Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install workflow parser
+        run: python3 -m pip install PyYAML
+
+      - name: Read upstream platform matrix
+        id: recipe
+        shell: python
+        run: |
+          import json, os, yaml
+          with open('.llvm-workflow/.github/workflows/llvm-build.yml') as source:
+              workflow = yaml.safe_load(source)
+          configs = workflow['jobs']['build']['strategy']['matrix']['config']
+          linux = [config for config in configs if config['target-os'] in ('ubuntu', 'almalinux')]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('configs=' + json.dumps(linux) + '\n')
+              output.write('all_configs=' + json.dumps(configs) + '\n')
+
+      - name: Select missing platforms
+        id: missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PREFIX: ${{ steps.revision.outputs.prefix }}
+          SHORT_SHA: ${{ steps.revision.outputs.short_sha }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          SOURCE_DIGEST: ${{ steps.source.outputs.digest }}
+          BUILD_CONFIGS: ${{ steps.recipe.outputs.configs }}
+        shell: bash
+        run: |
+          if ! assets="$(gh api "repos/${GH_REPO}/releases/tags/${PREFIX}-${SHORT_SHA}-${BUILD_NUMBER}" --jq '.assets' 2>/dev/null)"; then
+            assets='[]'
+          fi
+          jq -e 'all(.[]; .digest != null)' <<< "$assets" >/dev/null || {
+            echo 'Published assets are missing GitHub digests' >&2
+            exit 1
+          }
+          existing_source="$(jq -r '.[] | select(.name == "llvm-source.json") | .digest' <<< "$assets")"
+          if [[ -n "$existing_source" ]]; then
+            [[ "$existing_source" == "$SOURCE_DIGEST" ]] || {
+              echo 'Existing LLVM source provenance differs' >&2
+              exit 1
+            }
+          fi
+          echo "source_needed=$([[ -z "$existing_source" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          plan="$(jq -cn --argjson assets "$assets" --argjson configs "$BUILD_CONFIGS" --arg p "$PREFIX" --arg s "$SHORT_SHA" --arg n "$BUILD_NUMBER" '
+            $configs
+            | map(. as $config
+                  | ("\($p)-\($s)-\(.["target-os"])-\(.arch)-\($n).tar.gz") as $name
+                  | {config: $config, name: $name, asset: ([$assets[] | select(.name == $name)] | first)}) as $platforms
+            | {platforms: [$platforms[] | select(.asset == null) | .config],
+               repairs: [$platforms[] | select(.asset != null) | .name as $name
+                         | select(any($assets[]; .name == $name + ".sha256") | not)
+                         | {name: .name, digest: .asset.digest}]}')"
+          echo "platforms=$(jq -c '.platforms' <<< "$plan")" >> "$GITHUB_OUTPUT"
+          echo "repairs=$(jq -c '.repairs' <<< "$plan")" >> "$GITHUB_OUTPUT"
+
+      - name: Define worker inputs
+        id: build_call
+        env:
+          LLVM_SHA: ${{ steps.revision.outputs.llvm_sha }}
+          PREFIX: ${{ steps.revision.outputs.prefix }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          ALL_CONFIGS: ${{ steps.recipe.outputs.all_configs }}
+          PLATFORMS: ${{ steps.missing.outputs.platforms }}
+        shell: python
+        run: |
+          import json, os
+          platforms = json.loads(os.environ['PLATFORMS'])
+          exclude = [{'package': os.environ['PREFIX'], 'config': config}
+                     for config in json.loads(os.environ['ALL_CONFIGS']) if config not in platforms]
+          info = {'repository': 'facebookexperimental/llvm-project',
+                  'llvm_hash': os.environ['LLVM_SHA'], 'build_number': int(os.environ['BUILD_NUMBER'])}
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('llvm_build_info=' + json.dumps(info) + '\n')
+              output.write('matrix_exclude=' + json.dumps(exclude) + '\n')
+
+  build:
+    name: Build ${{ needs.prepare.outputs.short_sha }}
+    needs: prepare
+    if: needs.prepare.outputs.platforms != '[]'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/llvm-build.yml
+    with:
+      package: ${{ needs.prepare.outputs.prefix }}
+      llvm_build_info: ${{ needs.prepare.outputs.llvm_build_info }}
+      matrix_exclude: ${{ needs.prepare.outputs.matrix_exclude }}
+      ninja_args: -j4
+      cmake_args: ${{ inputs.kind == 'amd' && '-DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF' || '' }}
+
+  validate:
+    name: Validate ${{ matrix.config['target-os'] }}-${{ matrix.config.arch }} SDK
+    needs: [prepare, build]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.platforms != '[]' }}
+    runs-on: ${{ matrix.config.runs_on }}
+    container: ${{ matrix.config.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJSON(needs.prepare.outputs.platforms) }}
+    env:
+      LLVM_PACKAGE: ${{ needs.prepare.outputs.prefix }}
+      LLVM_INSTALL_DIR: ${{ needs.prepare.outputs.prefix }}-${{ needs.prepare.outputs.short_sha }}-${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}-${{ inputs.build_number }}
+    steps:
+      - name: Install validation toolchain on AlmaLinux
+        if: matrix.config.target-os == 'almalinux'
+        run: |
+          dnf install --assumeyes llvm-toolset-20.1.8 python38-pip git tar gzip
+          alternatives --set python3 /usr/bin/python3.8
+
+      - name: Checkout SDK checks
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Install validation toolchain on Ubuntu
+        if: matrix.config.target-os == 'ubuntu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+
+      - name: Set up validation Python
+        if: matrix.config.target-os == 'ubuntu'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install consumer build tools
+        run: python3 -m pip install cmake ninja
+
+      - name: Download SDK
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ needs.prepare.outputs.prefix }}-${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}
+          path: dist
+
+      - name: Check relocated SDK consumer
+        shell: bash
+        run: |
+          cd dist
+          tar xzf "${LLVM_INSTALL_DIR}.tar.gz"
+          bash "$GITHUB_WORKSPACE/.github/scripts/validate_llvm_sdk.sh"
+          sha256sum "${LLVM_INSTALL_DIR}.tar.gz" > "${LLVM_INSTALL_DIR}.tar.gz.sha256"
+
+      - name: Upload validated bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: validated-${{ needs.prepare.outputs.prefix }}-${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}
+          path: dist/*.tar.gz*
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [prepare, build, validate]
+    if: ${{ inputs.publish && !cancelled() && needs.prepare.result == 'success' && (needs.prepare.outputs.platforms != '[]' || needs.prepare.outputs.repairs != '[]' || needs.prepare.outputs.source_needed == 'true') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download bundles
+        if: needs.prepare.outputs.platforms != '[]'
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: validated-${{ needs.prepare.outputs.prefix }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LLVM_SHA: ${{ needs.prepare.outputs.llvm_sha }}
+          SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+          PREFIX: ${{ needs.prepare.outputs.prefix }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          REPAIRS: ${{ needs.prepare.outputs.repairs }}
+          PLATFORMS: ${{ needs.prepare.outputs.platforms }}
+          SOURCE_JSON: ${{ needs.prepare.outputs.source_json }}
+          TRITON_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          mkdir -p dist
+          while IFS=$'\t' read -r name digest; do
+            printf '%s  %s\n' "${digest#sha256:}" "$name" > "dist/${name}.sha256"
+          done < <(jq -r '.[] | [.name, .digest] | @tsv' <<< "$REPAIRS")
+          shopt -s nullglob
+          sidecars=(dist/*.tar.gz.sha256)
+          ((${#sidecars[@]} > 0)) || [[ "$PLATFORMS" == '[]' ]]
+          printf '%s\n' "$SOURCE_JSON" > dist/llvm-source.json
+          tag="${PREFIX}-${SHORT_SHA}-${BUILD_NUMBER}"
+          exists=false
+          existing_assets='[]'
+          if gh release view "$tag" >/dev/null 2>&1; then
+            exists=true
+            existing_assets="$(gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq '.assets')"
+          fi
+          for sidecar in "${sidecars[@]}"; do
+            archive="${sidecar%.sha256}"
+            name="${archive##*/}"
+            if [[ -f "$archive" ]]; then
+              (cd dist && sha256sum --check "${sidecar##*/}")
+            fi
+            if jq -e --arg name "$name" 'any(.[]; .name == $name)' <<< "$existing_assets" >/dev/null; then
+              digest="$(jq -r --arg name "$name" '.[] | select(.name == $name) | .digest // empty' <<< "$existing_assets")"
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              printf '%s  %s\n' "${digest#sha256:}" "$name" > "$sidecar"
+            else
+              test -f "$archive"
+            fi
+            checksum_name="${sidecar##*/}"
+            existing="$(jq -r --arg name "$checksum_name" '.[] | select(.name == $name) | .digest // empty' <<< "$existing_assets")"
+            if [[ -n "$existing" ]]; then
+              [[ "$existing" == "sha256:$(sha256sum "$sidecar" | cut -d ' ' -f 1)" ]] || {
+                echo "Existing immutable checksum differs: ${checksum_name}" >&2
+                exit 1
+              }
+            elif jq -e --arg name "$checksum_name" 'any(.[]; .name == $name)' <<< "$existing_assets" >/dev/null; then
+              echo "Missing GitHub digest: ${checksum_name}" >&2
+              exit 1
+            fi
+          done
+          existing_source="$(jq -r '.[] | select(.name == "llvm-source.json") | .digest // empty' <<< "$existing_assets")"
+          if jq -e 'any(.[]; .name == "llvm-source.json")' <<< "$existing_assets" >/dev/null; then
+            [[ "$existing_source" == "sha256:$(sha256sum dist/llvm-source.json | cut -d ' ' -f 1)" ]] || {
+              echo 'Existing immutable LLVM provenance differs' >&2
+              exit 1
+            }
+          fi
+          if [[ "$exists" == false ]]; then
+            gh release create "$tag" --target "$TRITON_SHA" --latest=false \
+              --title "${PREFIX} for Triton (${SHORT_SHA}, build ${BUILD_NUMBER})" \
+              --notes "Prebuilt LLVM SDKs for Triton from ${LLVM_SHA}."
+          fi
+          if [[ -z "$existing_source" ]]; then
+            gh release upload "$tag" dist/llvm-source.json
+          fi
+          for sidecar in "${sidecars[@]}"; do
+            for file in "${sidecar%.sha256}" "$sidecar"; do
+              name="${file##*/}"
+              if jq -e --arg name "$name" 'any(.[]; .name == $name)' <<< "$existing_assets" >/dev/null; then
+                echo "Keeping existing immutable asset ${name}"
+              else
+                gh release upload "$tag" "$file"
+              fi
+            done
+          done
+          gh release view "$tag" --json url --jq '.url'
