@@ -1701,6 +1701,10 @@ triton::gpu::maybeLinearToCGAEncodingAttr(const LinearLayout &layout) {
   auto kBlock = StringAttr::get(ctx, "block");
   assert(llvm::is_contained(inDims, kBlock) &&
          "layout must have a 'block' dim");
+  // A mixed-radix layout's odd digits don't factor; over one CTA its CGA layout
+  // is trivial.
+  if (!layout.isRadix2() && layout.getInDimSize(kBlock) == 1)
+    return CGAEncodingAttr::get1CTALayout(ctx, layout.getNumOutDims());
 
   auto cgaLogicalShape =
       basesPerDimImpl(layout.getBases(), kBlock, layout.getNumOutDims());

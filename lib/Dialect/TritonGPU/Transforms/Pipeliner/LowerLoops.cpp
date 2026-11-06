@@ -464,7 +464,8 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         // 4 bytes)
         canUseAsyncCp =
             isa<tt::LoadOp>(op) &&
-            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis);
+            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis) &&
+            canPipelineInSharedMemory(cast<tt::LoadOp>(op));
         int copyVecBytes = getCopyVecBytes(
             cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
 
