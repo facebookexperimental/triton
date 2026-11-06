@@ -234,7 +234,7 @@ class distributed_type(block_type):
         layout = _unwrap_if_constexpr(layout)
         shape = _unwrap_if_constexpr(shape)
         super().__init__(element_ty, shape)
-        # TRITON_ALLOW_NPOT admits NPOT shapes only on layout-less tensors.
+        # TRITON_ALLOW_NPOT allows NPOT shapes only on layout-less tensors.
         for i, d in enumerate(self.shape):
             if not is_power_of_two(d):
                 raise ValueError(f"Shape element {i} must be a power of 2")

@@ -483,10 +483,11 @@ LogicalResult ConvertLayoutOp::verify() {
   if (!getForceWarpShuffle())
     return success();
 
-  if (auto plan = getProductConversionPlan(getSrc().getType(), getType())) {
-    if (plan->transport == ProductConversionTransport::Shared)
-      return emitOpError("NPOT Product conversion through shared memory is not "
-                         "yet supported with force_warp_shuffle");
+  if (auto plan = getMixedRadixConversionPlan(getSrc().getType(), getType())) {
+    if (plan->transfer == MixedRadixConversionTransfer::Shared)
+      return emitOpError(
+          "NPOT mixed-radix conversion through shared memory is not "
+          "yet supported with force_warp_shuffle");
     return success();
   }
   auto conversion = minimalCvtLayout(getSrc().getType(), getType());

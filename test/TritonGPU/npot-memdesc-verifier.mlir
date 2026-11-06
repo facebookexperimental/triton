@@ -13,42 +13,42 @@
 
 !tmem_npot = !ttg.memdesc<128x96xf32, #tmem, #tmem_space, mutable, 128x128>
 !tmem_multibuffer = !ttg.memdesc<3x128x96xf32, #tmem, #tmem_space, mutable, 3x128x128>
-!tmem_scales_cover = !ttg.memdesc<128x6xi8, #ttng.tensor_memory_scales_encoding<>, #tmem_space, mutable, 128x8>
+!tmem_scales_pow2_alloc = !ttg.memdesc<128x6xi8, #ttng.tensor_memory_scales_encoding<>, #tmem_space, mutable, 128x8>
 // Power-of-two control: a compact TMEM allocation verifies.
 !tmem_pot_compact = !ttg.memdesc<128x128xf32, #tmem_n32, #tmem_space, mutable>
-// Compact NPOT swizzled and NVMMA allocations hold their own cover.
+// Compact NPOT swizzled and NVMMA allocations hold their own pow2 alloc shape.
 !shared_npot = !ttg.memdesc<8x192xi8, #shared, #smem, mutable>
 !nvmma_npot = !ttg.memdesc<128x192xf16, #nvmma, #smem, mutable>
-!shared_cover = !ttg.memdesc<8x48xi8, #shared, #smem, mutable, 8x64>
-// A larger allocation holds the cover.
+!shared_pow2_alloc = !ttg.memdesc<8x48xi8, #shared, #smem, mutable, 8x64>
+// A larger allocation holds the pow2 alloc shape.
 !shared_overallocated = !ttg.memdesc<8x48xi8, #shared, #smem, mutable, 8x128>
-// A leading-NPOT allocation reserves its power-of-two cover.
+// A leading-NPOT allocation reserves its pow2 alloc shape.
 !shared_leading_npot = !ttg.memdesc<3x48xi8, #shared, #smem, mutable, 3x64>
-!shared_leading_cover = !ttg.memdesc<3x48xi8, #shared, #smem, mutable, 4x64>
-!nvmma_native_cover = !ttg.memdesc<128x48xi8, #nvmma_i8, #smem, mutable, 128x128>
-// A shared_linear cover is the layout's own extent.
-!shared_linear_cover = !ttg.memdesc<8x48xi8, #sl, #smem, mutable, 8x64>
+!shared_leading_pow2_alloc = !ttg.memdesc<3x48xi8, #shared, #smem, mutable, 4x64>
+!nvmma_native_pow2_alloc = !ttg.memdesc<128x48xi8, #nvmma_i8, #smem, mutable, 128x128>
+// A shared_linear pow2 alloc shape is the layout's own extent.
+!shared_linear_pow2_alloc = !ttg.memdesc<8x48xi8, #sl, #smem, mutable, 8x64>
 !nvmma_runtime_view = !ttg.memdesc<128x48xi8, #nvmma_i8, #smem, mutable, 3x128x128>
 
 module {
-  tt.func @alloc_physical_covers() {
+  tt.func @alloc_pow2_alloc_views() {
     %0 = ttng.tmem_alloc : () -> !tmem_npot
     %1 = ttng.tmem_alloc : () -> !tmem_multibuffer
     %5 = ttg.local_alloc : () -> !shared_npot
     %6 = ttg.local_alloc : () -> !nvmma_npot
-    %7 = ttg.local_alloc : () -> !shared_cover
+    %7 = ttg.local_alloc : () -> !shared_pow2_alloc
     %8 = ttg.local_alloc : () -> !shared_leading_npot
-    %11 = ttg.local_alloc : () -> !nvmma_native_cover
+    %11 = ttg.local_alloc : () -> !nvmma_native_pow2_alloc
     %12 = ttng.tmem_alloc : () -> !tmem_pot_compact
-    %13 = ttg.local_alloc : () -> !shared_leading_cover
+    %13 = ttg.local_alloc : () -> !shared_leading_pow2_alloc
     %14 = ttg.local_alloc : () -> !shared_overallocated
-    %15 = ttg.local_alloc : () -> !shared_linear_cover
-    %16 = ttng.tmem_alloc : () -> !tmem_scales_cover
+    %15 = ttg.local_alloc : () -> !shared_linear_pow2_alloc
+    %16 = ttng.tmem_alloc : () -> !tmem_scales_pow2_alloc
     tt.return
   }
 
-  // Subviews that pass the power-of-two shape test are not NPOT physical
-  // covers: with TRITON_ALLOW_NPOT set they keep the upstream view contract.
+  // Subviews that pass the power-of-two shape test are not NPOT pow2 alloc
+  // views: with TRITON_ALLOW_NPOT set they keep the upstream view contract.
   tt.func @pot_subviews_keep_upstream_contract() {
     %tmem = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #tmem_space, mutable>
     %tmem_view = ttng.tmem_subslice %tmem {offset = 64 : i32}
@@ -61,9 +61,9 @@ module {
     tt.return
   }
 
-  // ALLOC-LABEL: tt.func @runtime_enlarged_cover
+  // ALLOC-LABEL: tt.func @runtime_enlarged_pow2_alloc
   // ALLOC-SAME: !ttg.memdesc<128x48xi8, #{{.*}}, #smem, mutable, 3x128x128>
-  tt.func @runtime_enlarged_cover(%view: !nvmma_runtime_view) {
+  tt.func @runtime_enlarged_pow2_alloc(%view: !nvmma_runtime_view) {
     tt.return
   }
 }

@@ -1,6 +1,6 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -verify-diagnostics
 
-// A width some tcgen05 form can issue is admitted; its consumer checks the form.
+// A width some tcgen05 form can issue is accepted; its consumer checks the form.
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   tt.func @subslice_n96(%c: !ttg.memdesc<128x192xf32, #tmem, #ttng.tensor_memory, mutable, 128x256>) {

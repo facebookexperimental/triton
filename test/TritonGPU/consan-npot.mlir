@@ -2,7 +2,8 @@
 // RUN: env -u TRITON_ALLOW_NPOT not triton-opt %s -split-input-file -allow-unregistered-dialect -tritoninstrument-prepare-consan-captures="target=nvidia" -tritoninstrument-concurrency-sanitizer -o /dev/null 2>&1 | FileCheck %s --check-prefix=OFF
 
 // There is no default tcgen05.ld/st layout for an NPOT TMEM tile, so ConSan
-// does not poison a TMEM cover. With the flag off the verifier rejects it.
+// does not poison a TMEM pow2 alloc shape. With the flag off the verifier
+// rejects it.
 
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 // CHECK-LABEL: @tmem_cover

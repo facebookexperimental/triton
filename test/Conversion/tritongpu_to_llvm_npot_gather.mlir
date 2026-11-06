@@ -2,8 +2,8 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -tritongpu-optimize-thread-locality | FileCheck %s --check-prefix=LOCAL
 
 #p = #ttg.linear<{register = [[32, 0], [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [], block = [], inputRadices = {register = [3, 2, 2, 2, 2, 2, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96, 64]}>
-// A Product gather goes through shared memory with no warp shuffles, and the
-// thread-locality pass keeps its layout.
+// A mixed-radix gather goes through shared memory with no warp shuffles, and
+// the thread-locality pass keeps its layout.
 // CHECK: ttg.shared = 24576 : i32
 // CHECK-LABEL: llvm.func @gather_96x64
 // CHECK-NOT: nvvm.shfl.sync
