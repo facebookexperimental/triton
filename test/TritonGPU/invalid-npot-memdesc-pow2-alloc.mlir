@@ -4,7 +4,7 @@
 #tmem_space = #ttng.tensor_memory
 module attributes {"ttg.num-ctas" = 2 : i32} {
   tt.func @multi_cta_pow2_alloc_view() {
-    // expected-error @+1 {{NPOT memdesc physical cover with multiple CTAs is not yet supported}}
+    // expected-error @+1 {{NPOT memdesc pow2 alloc view with multiple CTAs is not yet supported}}
     %0 = ttng.tmem_alloc : () -> !ttg.memdesc<256x96xf32, #tmem, #tmem_space, mutable, 256x128>
     tt.return
   }
@@ -51,7 +51,7 @@ module {
 #smem = #ttg.shared_memory
 module {
   tt.func @rank_three_pow2_alloc() {
-    // expected-error @+1 {{NPOT memdesc physical cover with a layout rank other than 2 is not yet supported}}
+    // expected-error @+1 {{NPOT memdesc pow2 alloc view with a layout rank other than 2 is not yet supported}}
     %0 = ttg.local_alloc : () -> !ttg.memdesc<2x8x48xi8, #shared, #smem, mutable, 2x8x64>
     tt.return
   }
@@ -93,7 +93,7 @@ module {
 #shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
 #smem = #ttg.shared_memory
 // A view of fewer buffers than its allocation.
-// expected-error @below {{NPOT memdesc allocation that does not match the encoding's physical cover is not yet supported}}
+// expected-error @below {{NPOT memdesc allocation that does not match the encoding's pow2 alloc shape is not yet supported}}
 !buffer_prefix_mismatch = !ttg.memdesc<2x8x48xi8, #shared, #smem, mutable, 3x8x64>
 module {
 }
@@ -105,7 +105,7 @@ module {
 // Upstream getAllocationShapePerCTA rounds a swizzled_shared tile up to its
 // 4x64 pow2 alloc shape but not an amd_rotating one, so this 3x64 allocation is
 // too small.
-// expected-error @below {{NPOT memdesc allocation that does not match the encoding's physical cover is not yet supported}}
+// expected-error @below {{NPOT memdesc allocation that does not match the encoding's pow2 alloc shape is not yet supported}}
 !leading_npot_unpadded = !ttg.memdesc<3x48xi8, #rotating, #smem, mutable, 3x64>
 module {
 }
@@ -115,7 +115,7 @@ module {
 #rotating = #ttg.amd_rotating_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
 #smem = #ttg.shared_memory
 // The same holds for a compact allocation.
-// expected-error @below {{NPOT memdesc allocation that does not match the encoding's physical cover is not yet supported}}
+// expected-error @below {{NPOT memdesc allocation that does not match the encoding's pow2 alloc shape is not yet supported}}
 !compact_unpadded = !ttg.memdesc<64x96xi8, #rotating, #smem, mutable>
 module {
 }
@@ -135,7 +135,7 @@ module {
 #nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
 #smem = #ttg.shared_memory
 // The 4x128 pow2 alloc shape is smaller than the 8x128 NVMMA core tile.
-// expected-error @below {{NPOT memdesc allocation that does not match the encoding's physical cover is not yet supported}}
+// expected-error @below {{NPOT memdesc allocation that does not match the encoding's pow2 alloc shape is not yet supported}}
 !nvmma_pow2_alloc_below_core_tile = !ttg.memdesc<3x96xi8, #nvmma, #smem, mutable, 3x128>
 module {
 }
