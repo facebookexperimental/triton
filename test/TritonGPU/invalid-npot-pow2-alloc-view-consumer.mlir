@@ -9,7 +9,7 @@
 module {
   // OFF: shape must have power-of-2 and non-zero dimensions; got 64, 40
   tt.func @reinterpret_shared_pow2_alloc(%a: !ttg.memdesc<64x40xf16, #shared, #smem, mutable, 64x64>) {
-    // expected-error @+1 {{'ttg.memdesc_reinterpret' op NPOT memdesc physical cover view on this consumer is not yet supported}}
+    // expected-error @+1 {{'ttg.memdesc_reinterpret' op NPOT memdesc pow2 alloc view on this consumer is not yet supported}}
     %0 = ttg.memdesc_reinterpret %a : !ttg.memdesc<64x40xf16, #shared, #smem, mutable, 64x64> -> !ttg.memdesc<32x64xf16, #shared, #smem, mutable>
     tt.return
   }

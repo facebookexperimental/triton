@@ -80,13 +80,13 @@ buildCoalescedProductEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis,
   auto type = cast<RankedTensorType>(ptr.getType());
   AxisInfo &info = *axisInfoAnalysis.getAxisInfo(ptr);
   SmallVector<unsigned> order = getOrderFromContiguity(info.getContiguity());
-  unsigned vector =
-      getProductVector(ctx, type.getShape(),
-                       getAxisInfoVector(info, type, type.getShape(), order[0],
-                                         numWarps * threadsPerWarp, maxVecBits),
-                       order, numWarps, threadsPerWarp);
-  return getProductEncoding(ctx, type.getShape(), numWarps, threadsPerWarp,
-                            /*numCTAs=*/1, vector, order);
+  unsigned vector = getMixedRadixVector(
+      ctx, type.getShape(),
+      getAxisInfoVector(info, type, type.getShape(), order[0],
+                        numWarps * threadsPerWarp, maxVecBits),
+      order, numWarps, threadsPerWarp);
+  return getMixedRadixEncoding(ctx, type.getShape(), numWarps, threadsPerWarp,
+                               /*numCTAs=*/1, vector, order);
 }
 
 struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {

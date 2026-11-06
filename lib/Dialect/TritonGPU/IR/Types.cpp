@@ -134,14 +134,14 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     // Every layout dimension must be a power of 2; only a leading pipeline
     // dimension and a shared buffer's first dimension may have another
     // positive size.
-    if (isNpotPhysicalCover(encoding, shape))
+    if (isNpotPow2AllocView(encoding, shape))
       npotCoverAllocShape = allocShape;
     else if (!hasPow2MemDescLayoutShape(encoding, shape))
       return emitError()
              << "shape must have power-of-2 and non-zero dimensions; got "
              << shape;
     // A shared allocation with an NPOT tile is laid out and sized as its
-    // power-of-two cover, which verifyNpotPhysicalCover checks it holds.
+    // power-of-two cover, which verifyNpotPow2AllocView checks it holds.
     if (!(npotCoverAllocShape && isa<SharedEncodingTrait>(encoding)) &&
         !hasPow2MemDescLayoutShape(encoding, allocShape))
       return emitError()
@@ -314,7 +314,7 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   }
 
   if (npotCoverAllocShape)
-    return verifyNpotPhysicalCover(emitError, encoding, shape,
+    return verifyNpotPow2AllocView(emitError, encoding, shape,
                                    *npotCoverAllocShape);
   return success();
 }

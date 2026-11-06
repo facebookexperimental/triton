@@ -1306,7 +1306,7 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
   if (auto distributed = dyn_cast<DistributedEncodingTrait>(layout)) {
     result = distributed.toLinearLayout(shape);
   } else {
-    SmallVector<int64_t> coverShape = getNpotCoverShape(shape);
+    SmallVector<int64_t> coverShape = getNpotPow2AllocShape(shape);
     assert(llvm::all_of(coverShape,
                         [](int64_t dim) {
                           return llvm::isPowerOf2_32(dim) && dim >= 1;
@@ -1344,7 +1344,8 @@ LinearLayout toLinearLayout(MemDescType type) {
     auto ll = toLinearLayout(allocShape, type.getEncoding());
     auto outDims = llvm::to_vector(ll.getOutDimNames());
     // Trim the shape
-    for (auto [dim, size] : llvm::zip_equal(outDims, getNpotCoverShape(shape)))
+    for (auto [dim, size] :
+         llvm::zip_equal(outDims, getNpotPow2AllocShape(shape)))
       ll = ll.resizeOutDim(dim, size);
 
     auto kCol = StringAttr::get(type.getContext(), "col");
@@ -1381,7 +1382,7 @@ LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout) {
                                                                    layout);
 }
 
-SmallVector<int64_t> getNpotCoverShape(ArrayRef<int64_t> shape) {
+SmallVector<int64_t> getNpotPow2AllocShape(ArrayRef<int64_t> shape) {
   SmallVector<int64_t> cover(shape);
   if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
     return cover;
@@ -1483,7 +1484,8 @@ LinearLayout combineCtaCgaWithShape(LinearLayout ctaLayout,
   SmallVector<StringAttr> outDimNames = standardOutDimNames(ctx, rank);
 
   llvm::SmallDenseMap<StringAttr, int64_t> labeledShape;
-  for (auto [dim, size] : llvm::zip(outDimNames, getNpotCoverShape(shape))) {
+  for (auto [dim, size] :
+       llvm::zip(outDimNames, getNpotPow2AllocShape(shape))) {
     labeledShape[dim] = size;
   }
 
