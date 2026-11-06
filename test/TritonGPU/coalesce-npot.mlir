@@ -1,8 +1,8 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -convert-triton-to-tritongpu='target=cuda:90 num-warps=4' -tritongpu-coalesce -tritongpu-remove-layout-conversions -allocate-shared-memory-nv=compute-capability=90 -convert-triton-gpu-to-llvm=compute-capability=90 | FileCheck %s --check-prefix=W4
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -convert-triton-to-tritongpu='target=cuda:90 num-warps=1' -tritongpu-coalesce -tritongpu-remove-layout-conversions -allocate-shared-memory-nv=compute-capability=90 -convert-triton-gpu-to-llvm=compute-capability=90 | FileCheck %s --check-prefix=W1
 
-// A Product load takes its power-of-two control's vector: the [96, 64] tile at
-// four warps and 384 at one warp both load v4, as [128, 64] and 512 do.
+// A mixed-radix load takes its power-of-two control's vector: the [96, 64] tile
+// at four warps and 384 at one warp both load v4, as [128, 64] and 512 do.
 // W4-LABEL: @copy_96x64
 // W4-COUNT-12: llvm.inline_asm {{.*}}ld.global.v4.b32
 // W4-NOT: llvm.load {{.*}} !llvm.ptr<1>

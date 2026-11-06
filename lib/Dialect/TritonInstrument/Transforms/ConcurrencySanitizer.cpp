@@ -408,7 +408,7 @@ void initializeAllocation(ImplicitLocOpBuilder &b, Value alloc) {
 
 bool canInitializeAllocation(Value alloc) {
   auto allocType = cast<ttg::MemDescType>(alloc.getType());
-  // A tensor cannot hold the NPOT tile of a shared physical cover.
+  // A tensor cannot hold the NPOT tile of a shared pow2 alloc view.
   if (!isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace()))
     return !ttg::isNpotPhysicalCover(allocType);
   unsigned numWarps = ttg::lookupNumWarps(alloc.getDefiningOp());

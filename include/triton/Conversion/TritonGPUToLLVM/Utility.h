@@ -361,7 +361,7 @@ constexpr int kGlobalScratchBufferOffset = -2;
 constexpr int kSharedMemoryOffset = -3;
 
 // Defined in triton/Analysis/Utility.h.
-struct ProductSharedTiling;
+struct MixedRadixSharedTiling;
 
 namespace triton {
 
@@ -407,7 +407,7 @@ SmallVector<Value> transferProductThroughSharedMemory(
     bool blockScope,
     std::optional<std::pair<Value, Value>> distributedCoordinates =
         std::nullopt,
-    const ProductSharedTiling *tiling = nullptr);
+    const MixedRadixSharedTiling *tiling = nullptr);
 
 // Takes two values that may be boolean, or null to represent constant True.
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b);

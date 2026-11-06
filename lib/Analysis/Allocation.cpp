@@ -128,7 +128,7 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   if (auto cvtLayout = dyn_cast<gpu::ConvertLayoutOp>(op)) {
     auto srcTy = cvtLayout.getSrc().getType();
     auto dstTy = cvtLayout.getType();
-    if (auto bytes = getProductConversionScratchBytes(cvtLayout))
+    if (auto bytes = getMixedRadixConversionScratchBytes(cvtLayout))
       return *bytes;
     if (!cvtNeedsSharedMemory(cvtLayout))
       return 0;

@@ -725,8 +725,9 @@ private:
     }
 
     ReduceOpHelper helper(op);
+    // Packing pairs registers 2k and 2k+1, so digit 0 must have radix 2.
     auto vectorizeKind =
-        enableTreeReduction
+        enableTreeReduction && layout.getInputRadix(kReg, 0) == 2
             ? helper.getInThreadVectorizeOpKind(
                   axisPack, targetInfo.supportBitwidth16Elementwise(),
                   targetInfo.supportBitwidth32Elementwise())

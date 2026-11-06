@@ -731,8 +731,8 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
     state.addTypes(dstTy);
     Operation *hypotheticalOp = Operation::create(state);
     auto cvt = cast<ConvertLayoutOp>(hypotheticalOp);
-    // A Product convert is sized by its plan, as the allocator sizes it.
-    if (auto bytes = getProductConversionScratchBytes(cvt)) {
+    // A mixed-radix convert is sized by its plan, as the allocator sizes it.
+    if (auto bytes = getMixedRadixConversionScratchBytes(cvt)) {
       hypotheticalOp->destroy();
       cost += *bytes;
       continue;

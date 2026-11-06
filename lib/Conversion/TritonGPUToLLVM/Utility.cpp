@@ -443,7 +443,7 @@ SmallVector<Value> transferProductThroughSharedMemory(
     const llvm::MapVector<StringAttr, int32_t> &srcFreeVariableMasks,
     bool blockScope,
     std::optional<std::pair<Value, Value>> distributedCoordinates,
-    const ProductSharedTiling *tiling) {
+    const MixedRadixSharedTiling *tiling) {
   Value laneId, warpId;
   std::tie(laneId, warpId) = distributedCoordinates
                                  ? *distributedCoordinates
@@ -534,7 +534,8 @@ applyMixedRadixLayout(TritonLLVMOpBuilder &b, const LinearLayout &layout,
           quotient = b.lshr(idx, b.i32_val(llvm::Log2_32(weight)));
         else if (weight > 1)
           quotient = b.udiv(idx, b.i32_val(weight));
-        // XOR is exact: checkProductCarriers rejects odd radix-2 contributions.
+        // XOR is exact: checkMixedRadixOutDims rejects odd radix-2
+        // contributions.
         if (radix == 2) {
           Value isZero = b.icmp_eq(b.and_(quotient, b.i32_val(1)), zero);
           for (auto [binary, value] : llvm::zip(binaries, basis)) {
