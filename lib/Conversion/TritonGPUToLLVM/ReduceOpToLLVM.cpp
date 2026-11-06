@@ -643,7 +643,8 @@ private:
       for (int idx : group)
         groupValues.push_back(srcValues[idx]);
 
-      auto vectorizeKind = enableTreeReduction
+      // Packing pairs neighbours, so an odd group stays scalar.
+      auto vectorizeKind = enableTreeReduction && groupValues.size() % 2 == 0
                                ? helper.getInThreadVectorizeOpKind(
                                      groupValues.size(),
                                      targetInfo.supportBitwidth16Elementwise(),
@@ -723,8 +724,9 @@ private:
     }
 
     ReduceOpHelper helper(op);
+    // Packing pairs registers 2k and 2k+1, so digit 0 must have radix 2.
     auto vectorizeKind =
-        enableTreeReduction
+        enableTreeReduction && layout.getInputRadix(kReg, 0) == 2
             ? helper.getInThreadVectorizeOpKind(
                   axisPack, targetInfo.supportBitwidth16Elementwise(),
                   targetInfo.supportBitwidth32Elementwise())
@@ -1084,10 +1086,13 @@ private:
     Value laneId = b.urem(threadId, warpSize);
     Value zero = b.i32_val(0);
 
-    unsigned elemsPerThread = std::max<unsigned>(elems / numThreads, 1);
+    unsigned elemsPerThread = llvm::divideCeil(elems, numThreads);
     Value threadIsNeeded = b.icmp_slt(threadId, b.i32_val(elems));
     Value readOffset = threadId;
     for (unsigned round = 0; round < elemsPerThread; ++round) {
+      // An NPOT scratch ends in a partial round.
+      if (round > 0 && round == elemsPerThread - 1 && elems % numThreads)
+        threadIsNeeded = b.icmp_slt(readOffset, b.i32_val(elems));
       SmallVector<Value> acc(op.getNumOperands());
       for (unsigned i = 0; i < op.getNumOperands(); ++i) {
         auto elemTy = getElementType(op, i);

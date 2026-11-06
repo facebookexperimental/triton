@@ -1,6 +1,6 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -tritonamdgpu-schedule-loops=num_stages=2 -tritonamdgpu-pipeline -canonicalize | FileCheck --enable-var-scope %s
 
-// The stream pipeliner shares the load filter: an NPOT Product load is not
+// The stream pipeliner shares the load filter: an NPOT mixed-radix load is not
 // scheduled, while the power-of-two control is.
 
 #p192 = #ttg.linear<{register = [[64]], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>

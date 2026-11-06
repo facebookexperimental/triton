@@ -1,8 +1,8 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -convert-triton-to-tritongpu='target=cuda:90 num-warps=4' -tritongpu-remove-layout-conversions | FileCheck %s
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -convert-triton-to-tritongpu='target=cuda:90 num-warps=4' -tritongpu-remove-layout-conversions -allocate-shared-memory-nv='compute-capability=90' -convert-triton-gpu-to-llvm='compute-capability=90' | FileCheck %s --check-prefix=LLVM
 
-// The tile takes the [96, 64] Product layout and each thread owns 48 elements,
-// where padding to [128, 64] would give it 64.
+// The tile takes the [96, 64] mixed-radix layout and each thread owns 48
+// elements, where padding to [128, 64] would give it 64.
 // CHECK: #linear = #ttg.linear<{{.*}}outDimSizes = [96, 64]}>
 // CHECK-LABEL: @tile_96x64
 // CHECK-NOT: ttg.convert_layout

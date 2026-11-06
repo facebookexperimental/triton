@@ -1,5 +1,5 @@
-#ifndef TRITON_UNITTEST_TOOLS_PRODUCTLAYOUTS_H
-#define TRITON_UNITTEST_TOOLS_PRODUCTLAYOUTS_H
+#ifndef TRITON_UNITTEST_TOOLS_MIXEDRADIXLAYOUTS_H
+#define TRITON_UNITTEST_TOOLS_MIXEDRADIXLAYOUTS_H
 
 #include "triton/Tools/LinearLayout.h"
 
@@ -22,7 +22,8 @@ inline LinearLayout exactIdentity1D(int32_t size, StringAttr in,
                       /*requireSurjective=*/true);
 }
 
-// register and lane inputs onto {dim0, dim1 = 8}; dim0 is Product unless pow2.
+// register and lane inputs onto {dim0, dim1 = 8}; dim0 is mixed-radix unless
+// pow2.
 inline LinearLayout
 makeRegLaneLayout(MLIRContext &ctx,
                   std::vector<std::vector<int32_t>> registerBases,
@@ -45,4 +46,4 @@ makeRegLaneLayout(MLIRContext &ctx,
 
 } // namespace mlir::triton
 
-#endif // TRITON_UNITTEST_TOOLS_PRODUCTLAYOUTS_H
+#endif // TRITON_UNITTEST_TOOLS_MIXEDRADIXLAYOUTS_H
