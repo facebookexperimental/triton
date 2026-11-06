@@ -19,6 +19,13 @@ on:
       - include/triton/Tools/LLVMOptions.h
       - lib/Tools/LLVMOptions.cpp
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      package: {type: string, default: ''}
+      llvm_build_info: {type: string, default: ''}
+      matrix_exclude: {type: string, default: '[]'}
+      ninja_args: {type: string, default: ''}
+      cmake_args: {type: string, default: ''}
 
 env:
   SCCACHE_DIR: ${{ github.workspace }}/sccache
@@ -44,13 +51,16 @@ jobs:
         EVENT_NAME: ${{ github.event_name }}
         BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        CALL_PACKAGE: ${{ inputs.package }}
       run: |
         python3 - <<'PYTHON'
         import json
         import os
         import subprocess
 
-        if os.environ["EVENT_NAME"] == "workflow_dispatch":
+        if os.environ["CALL_PACKAGE"]:
+            packages = [os.environ["CALL_PACKAGE"]]
+        elif os.environ["EVENT_NAME"] == "workflow_dispatch":
             packages = ["llvm", "amd-codegen"]
         else:
             changed = subprocess.check_output([
@@ -81,6 +91,7 @@ jobs:
       fail-fast: true
       matrix:
         package: ${{ fromJson(needs.prepare.outputs.packages) }}
+        exclude: ${{ fromJSON(inputs.matrix_exclude || '[]') }}
         config:
         - {runner: 'Ubuntu 22.04', runs_on: 'ubuntu-22.04', target-os: 'ubuntu', arch: 'x64'}
         - {runner: 'Ubuntu 22.04 ARM64', runs_on: 'ubuntu-22.04-arm', target-os: 'ubuntu', arch: 'arm64'}
@@ -97,6 +108,20 @@ jobs:
       uses: actions/checkout@v6
       with:
         path: llvm-build
+
+    - name: Override LLVM build manifest
+      if: inputs.llvm_build_info != ''
+      shell: bash
+      env:
+        LLVM_BUILD_INFO: ${{ inputs.llvm_build_info }}
+        PACKAGE: ${{ matrix.package }}
+      run: |
+        if [[ "$PACKAGE" == "llvm" ]]; then
+          manifest=llvm-build/cmake/llvm-build-info.json
+        else
+          manifest=llvm-build/cmake/amd-llvm-build-info.json
+        fi
+        printf '%s\n' "$LLVM_BUILD_INFO" > "$manifest"
 
     - name: Fetch LLVM Build Metadata
       shell: bash
@@ -148,8 +173,14 @@ jobs:
           echo "llvm_sdk_dir=${{ github.workspace }}/llvm-project/install" >> "$GITHUB_ENV"
         fi
 
+    - name: Use SDK installation directory
+      if: inputs.llvm_build_info != ''
+      shell: bash
+      run: echo "llvm_sdk_dir=$llvm_install_dir" >> "$GITHUB_ENV"
+
     - name: Check for Existing LLVM Build
       id: llvm-build
+      if: inputs.llvm_build_info == ''
       shell: bash
       run: |
         # The public artifact store is shared across PR refs, unlike GitHub Actions caches.
@@ -228,6 +259,9 @@ jobs:
 
     - name: Configure, Build, Test, and Install LLVM (Ubuntu, CentOS, and macOS)
       if: ${{ steps.llvm-build.outputs.exists != 'true' && (matrix.config.target-os == 'ubuntu' || matrix.config.target-os == 'almalinux' || matrix.config.target-os == 'macos') }}
+      env:
+        NINJA_ARGS: ${{ inputs.ninja_args }}
+        EXTRA_CMAKE_ARGS: ${{ inputs.cmake_args }}
       run: >
         cmake -GNinja -Bllvm-project/build
         -DCMAKE_BUILD_TYPE=Release
@@ -250,10 +284,10 @@ jobs:
         -DLLVM_LINK_LLVM_DYLIB=OFF
         -DLLVM_ENABLE_ZSTD=OFF
         -DLLVM_ENABLE_LZMA=OFF
-        $extra_cmake_flags
+        $extra_cmake_flags ${EXTRA_CMAKE_ARGS:-}
         llvm-project/llvm
 
-        ninja -C llvm-project/build ${{ env.llvm_build_targets }}
+        ninja -C llvm-project/build ${{ env.llvm_build_targets }} ${NINJA_ARGS:-}
 
     - name: Configure, Build, Test, and Install LLVM (Windows)
       if: ${{ steps.llvm-build.outputs.exists != 'true' && matrix.config.target-os == 'windows' }}
