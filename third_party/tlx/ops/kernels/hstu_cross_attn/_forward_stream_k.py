@@ -43,7 +43,7 @@ PIPE_STAGES = 4
 # Fixed cost of a q tile, in KV blocks, when the cost space charges one (see `_phantom`).
 PHANTOM_BLOCKS = 3
 LOG2E: tl.constexpr = tl.constexpr(1.4426950408889634)
-EAGER_PROBABILITY_FRAGMENTS = 5
+EAGER_PROBABILITY_FRAGMENTS: tl.constexpr = tl.constexpr(5)
 _VGPR_ONLY = (("amdgpu-agpr-alloc", "0,0"), )
 
 
