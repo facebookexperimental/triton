@@ -71,11 +71,13 @@ jobs:
         uses: actions/checkout@v6.0.2
         with:
           repository: facebookexperimental/llvm-project
+          path: llvm-source
           persist-credentials: false
           ref: ${{ inputs.llvm_sha }}
 
       - name: Resolve commit
         id: revision
+        working-directory: llvm-source
         env:
           KIND: ${{ inputs.kind }}
           BUILD_NUMBER: ${{ inputs.build_number }}
