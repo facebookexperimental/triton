@@ -435,6 +435,14 @@ StringRef getModuleTarget(Operation *op) {
   return target ? target.getValue() : StringRef();
 }
 
+std::optional<std::string>
+getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout) {
+  StringRef target = getModuleTarget(copy);
+  if (auto *legality = lookupNpotTargetLegality(copy->getContext(), target))
+    return legality->getAsyncCopyUnsupportedReason(copy, layout, target);
+  return std::string("NPOT async copy is not yet supported without a target");
+}
+
 //-- DotScaledOp --
 bool DotScaledOp::verifyDims() {
   auto aShape = this->getA().getType().getShape();
