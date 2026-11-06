@@ -38,6 +38,12 @@ public:
       if (!isa<triton::nvidia_gpu::TMEMLoadOp>(user) &&
           !isa<triton::nvidia_gpu::MMAv5OpInterface>(user))
         return failure();
+      // Upstream #11887: only an MMA writing this tile as its accumulator
+      // overwrites the init; an MMA reading it as operand A keeps the init.
+      if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user)) {
+        if (mma.getAccumulator() != op.getResult())
+          return failure();
+      }
     }
     // Walk the token chain from the alloc. The init is dead iff the first
     // accessor unconditionally overwrites the whole tile and every other

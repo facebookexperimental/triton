@@ -474,3 +474,21 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.com
     tt.return %outer : tensor<256xi32, #blocked2>
   }
 }
+
+// -----
+
+#src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 0, parent = #parent}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // The broadcast source is not a slice, so expand_dims cannot move before it.
+  // CHECK-LABEL: @expand_dims_after_broadcast_layout_change
+  // CHECK: %[[B:.*]] = tt.broadcast
+  // CHECK: %[[E:.*]] = tt.expand_dims %[[B]]
+  // CHECK: tt.return %[[E]]
+  tt.func @expand_dims_after_broadcast_layout_change(%arg: tensor<1xi32, #src>) -> tensor<1x32xi32, #parent> {
+    %0 = tt.broadcast %arg : tensor<1xi32, #src> -> tensor<32xi32, #slice>
+    %1 = tt.expand_dims %0 {axis = 0 : i32} : tensor<32xi32, #slice> -> tensor<1x32xi32, #parent>
+    tt.return %1 : tensor<1x32xi32, #parent>
+  }
+}

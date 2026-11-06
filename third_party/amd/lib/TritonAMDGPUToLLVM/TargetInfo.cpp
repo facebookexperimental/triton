@@ -6,10 +6,17 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 using mlir::LLVM::AMD::DppCtrl;
 using mlir::triton::amdgpu::ISAFamily;
 namespace mlir::triton::AMD {
+
+void registerTargetInfo() {
+  TargetInfoBase::registerFactory("hip", [](ModuleOp moduleOp) {
+    return std::make_unique<TargetInfo>(getAMDArch(moduleOp));
+  });
+}
 
 namespace {
 template <typename T>
@@ -215,6 +222,37 @@ StringRef TargetInfo::getAtomicSyncScope(MemSyncScope scope) const {
   llvm_unreachable("unknown memory synchronization scope");
 }
 
+Value TargetInfo::loadRelaxed(RewriterBase &rewriter, Location loc, Value ptr,
+                              Type valueTy, Value pred,
+                              MemSyncScope scope) const {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto results =
+      emitPredicated(rewriter, loc, pred, ValueRange{b.undef(valueTy)}, [&] {
+        unsigned alignment = valueTy.getIntOrFloatBitWidth() / 8;
+        Value loaded = LLVM::LoadOp::create(
+            rewriter, loc, valueTy, ptr, alignment, /*isVolatile=*/false,
+            /*isNonTemporal=*/false, /*isInvariant=*/false,
+            /*isInvariantGroup=*/false, LLVM::AtomicOrdering::monotonic,
+            getAtomicSyncScope(scope));
+        return SmallVector<Value>{loaded};
+      });
+  return results.front();
+}
+
+void TargetInfo::storeRelaxed(RewriterBase &rewriter, Location loc, Value ptr,
+                              Value value, Value pred,
+                              MemSyncScope scope) const {
+  emitPredicated(rewriter, loc, pred, ValueRange{}, [&] {
+    unsigned alignment = value.getType().getIntOrFloatBitWidth() / 8;
+    LLVM::StoreOp::create(rewriter, loc, value, ptr, alignment,
+                          /*isVolatile=*/false, /*isNonTemporal=*/false,
+                          /*isInvariantGroup=*/false,
+                          LLVM::AtomicOrdering::monotonic,
+                          getAtomicSyncScope(scope));
+    return SmallVector<Value>{};
+  });
+}
+
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          triton::gpu::AddrSpace targets) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -252,6 +290,12 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
     llvm::report_fatal_error("AMDGPU does not support barrier-based "
                              "synchronization for remote stores");
   }
+  if (isa<LLVM::LLVMPointerType>(getElementTypeOrSelf(val.getType()))) {
+    Type storeTy = i64_ty;
+    if (auto vecTy = dyn_cast<VectorType>(val.getType()))
+      storeTy = vecTy.clone(i64_ty);
+    val = TritonLLVMOpBuilder(loc, rewriter).ptrtoint(storeTy, val);
+  }
   mlir::LLVM::AMD::llStore(rewriter, loc, ptr, val, pred);
 }
 
@@ -269,6 +313,14 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   if (ctaId) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
+  }
+  if (isa<LLVM::LLVMPointerType>(getElementTypeOrSelf(elemTy))) {
+    Type loadTy = i64_ty;
+    if (auto vecTy = dyn_cast<VectorType>(elemTy))
+      loadTy = vecTy.clone(i64_ty);
+    Value result =
+        loadDShared(rewriter, loc, ptr, ctaId, loadTy, pred, localLoadOp);
+    return TritonLLVMOpBuilder(loc, rewriter).inttoptr(elemTy, result);
   }
   Value falseVal = LLVM::ConstantOp::create(rewriter, loc, elemTy,
                                             rewriter.getZeroAttr(elemTy));
@@ -598,10 +650,10 @@ bool TargetInfo::warpReduceInnerTree(RewriterBase &rewriter, Location loc,
   return true;
 }
 
-bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
-                            SmallVector<Value> &acc, triton::ReduceOp op,
-                            unsigned numLaneToReduce,
-                            unsigned interleave) const {
+bool TargetInfo::warpReduce(
+    RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+    triton::ReduceOp op, unsigned numLaneToReduce, unsigned interleave,
+    std::optional<unsigned> /*broadcastLaneIdMask*/) const {
   // A defined reduction ordering (currently only "inner_tree") requires a
   // fixed, layout-invariant reduction tree so the result is bitwise-identical
   // across num_warps / BLOCK_SIZE. Emit it via the dedicated count-up path; the

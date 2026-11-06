@@ -12,6 +12,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -194,9 +195,13 @@ unsigned getElementBitWidth(RankedTensorType type) {
 }
 
 static std::optional<unsigned>
-getAtomicWriteElementsPerThreadCap(Operation *op) {
-  if (isa<triton::AtomicLoadOp, triton::AtomicStoreOp>(op))
-    return 1;
+getAtomicElementsPerThreadCap(Operation *op, unsigned bitWidth) {
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+  if (isa<triton::AtomicLoadOp, triton::AtomicStoreOp>(op)) {
+    auto targetInfo = TargetInfoBase::fromModuleOp(moduleOp);
+    return targetInfo ? targetInfo->getMaxAtomicLoadStoreVectorSize(bitWidth)
+                      : 1;
+  }
   if (isa<triton::AtomicCASOp>(op))
     return 1;
 
@@ -208,8 +213,6 @@ getAtomicWriteElementsPerThreadCap(Operation *op) {
   if (elemTy.isInteger() || elemTy.isF64())
     return 1;
 
-  auto moduleOp = op->getParentOfType<ModuleOp>();
-
   if (moduleOp && getAMDArch(moduleOp)) {
     unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
     return std::max(1u, 32u / elemBitwidth);
@@ -218,10 +221,8 @@ getAtomicWriteElementsPerThreadCap(Operation *op) {
   if (atomicRmw.getAtomicRmwOp() != RMWOp::FADD)
     return std::nullopt;
 
-  auto targetAttr =
-      moduleOp ? moduleOp->getAttrOfType<StringAttr>(ttg::AttrTargetName)
-               : nullptr;
-  if (!targetAttr || !targetAttr.getValue().starts_with("cuda:"))
+  auto targetInfo = TargetInfoBase::fromModuleOp(moduleOp);
+  if (!targetInfo || !targetInfo->isCuda())
     return std::nullopt;
 
   int computeCapability = getNVIDIAComputeCapability(moduleOp);
@@ -239,15 +240,12 @@ static unsigned getMaxElementsPerThread(Operation *op, unsigned maxVecBits) {
   Value val = getMemAccessPtr(op);
   auto ty = cast<RankedTensorType>(val.getType());
   unsigned elemNumBits = getElementBitWidth(ty);
-  unsigned maxElementsPerThread = maxVecBits / elemNumBits;
   // Some atomic lowerings are narrower than a plain store. TTGIR currently
   // exposes the target architecture but not the PTX version, so we only cap
   // cases that are unambiguous from the available target metadata and the
   // current backend lowering.
-  if (auto atomicCap = getAtomicWriteElementsPerThreadCap(op)) {
-    maxElementsPerThread = std::min(maxElementsPerThread, *atomicCap);
-  }
-  return maxElementsPerThread;
+  return getAtomicElementsPerThreadCap(op, elemNumBits)
+      .value_or(maxVecBits / elemNumBits);
 }
 
 static bool hasDotOperandLayoutUser(Operation *op) {
@@ -718,7 +716,7 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
   if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::SameLoadStoreOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::Elementwise>() ||
-      isa<scf::WhileOp, scf::YieldOp, scf::ConditionOp,
+      isa<triton::BroadcastOp, scf::WhileOp, scf::YieldOp, scf::ConditionOp,
           nvidia_gpu::WarpGroupDotWaitOp>(op)) {
     return encoding;
   }
@@ -754,8 +752,8 @@ Attribute inferDstEncoding(Operation *op, Attribute encoding) {
   if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::SameLoadStoreOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::Elementwise>() ||
-      isa<scf::WhileOp, scf::ForOp, scf::YieldOp, scf::ConditionOp,
-          nvidia_gpu::WarpGroupDotWaitOp>(op))
+      isa<triton::BroadcastOp, scf::WhileOp, scf::ForOp, scf::YieldOp,
+          scf::ConditionOp, nvidia_gpu::WarpGroupDotWaitOp>(op))
     return encoding;
   if (auto reduceOp = dyn_cast<triton::ReduceOp>(op))
     return inferDstEncoding(reduceOp, encoding);
