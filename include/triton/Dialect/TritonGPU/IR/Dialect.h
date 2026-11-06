@@ -212,6 +212,12 @@ bool hasExactNpotLayout(RankedTensorType type);
 // only if all its ops are.
 bool isMixedRadixLayoutOp(OperationName op);
 
+// Under TRITON_ALLOW_NPOT, whether an MMAv3 instrShape's N may be NPOT: its odd
+// part repeats in registers, which is wgmma's order only while one warpgroup
+// spans N.
+bool isMmaV3NpotNLegal(ArrayRef<unsigned> warpsPerCTA,
+                       ArrayRef<unsigned> instrShape);
+
 // Why the verifier rejects an exact mixed-radix layout among `types` on an op
 // named `name`, if it does; a pass can ask before creating the op.
 std::optional<std::string> getNpotLayoutUnsupportedReason(OperationName name,

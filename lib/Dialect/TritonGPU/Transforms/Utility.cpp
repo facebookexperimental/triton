@@ -20,6 +20,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
@@ -104,6 +105,12 @@ bool containsPinnedEncoding(Attribute encoding) {
   return pinned;
 }
 
+bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps) {
+  int64_t split = numWarps / 4;
+  return triton::tools::isNpotAllowed() && split > 1 &&
+         !llvm::isPowerOf2_64(shape[0]) && shape[0] % (64 * split) != 0;
+}
+
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
                                                 Type eltType, int numWarps) {
@@ -140,6 +147,8 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     unsigned m = 16;
     unsigned mWarps = std::max<unsigned>(shape[0] / m, 1);
     unsigned nWarps = std::max<unsigned>(numWarps / mWarps, 1);
+    if (hasMmaV3WarpgroupsOnN(shape, numWarps))
+      nWarps = numWarps / 4;
     unsigned maxN = std::max<unsigned>(shape[1] / nWarps, 8);
     for (auto n : validN) {
       if (shape[1] % n == 0 && n <= maxN) {

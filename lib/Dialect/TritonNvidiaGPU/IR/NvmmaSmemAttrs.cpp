@@ -59,7 +59,10 @@ std::optional<NvmmaSmemAttrs> getNvmmaSmemAttrs(ttg::MemDescType memTy) {
   if (auto nvmma = dyn_cast<ttg::NVMMASharedEncodingAttr>(memTy.getEncoding()))
     return NvmmaSmemAttrs{nvmma.getSwizzlingByteWidth(), nvmma.getTransposed(),
                           nvmma.getFp4Padded()};
+  return getMmaOperandSmemAttrs(memTy);
+}
 
+std::optional<NvmmaSmemAttrs> getMmaOperandSmemAttrs(ttg::MemDescType memTy) {
   auto ll = ttg::toLinearLayout(memTy).pseudoinvert();
   unsigned bitwidth = memTy.getElementType().getIntOrFloatBitWidth();
   auto attrsAndCandidate = getNvmmaSmemAttrs(ll, bitwidth);
