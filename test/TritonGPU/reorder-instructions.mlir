@@ -156,3 +156,100 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32}
     tt.return
   }
 }
+
+// -----
+
+// With a register cap, an unpipelined loop issues both global loads before
+// its first shared store.
+// CHECK-LABEL: sink_loop_allocs_below_loads
+//       CHECK: scf.for
+//  CHECK-NEXT:   %[[A:.+]] = tt.load
+//  CHECK-NEXT:   %[[B:.+]] = tt.load
+//  CHECK-NEXT:   %[[AS:.+]] = ttg.local_alloc %[[A]]
+//  CHECK-NEXT:   %[[BS:.+]] = ttg.local_alloc %[[B]]
+//  CHECK-NEXT:   ttng.warp_group_dot %[[AS]], %[[BS]]
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.maxnreg" = 128 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @sink_loop_allocs_below_loads(%a: tensor<64x64x!tt.ptr<f16>, #blocked>, %b: tensor<64x64x!tt.ptr<f16>, #blocked1>, %n: i32) -> tensor<64x64xf32, #mma> {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #mma>
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %cst) -> (tensor<64x64xf32, #mma>) : i32 {
+      %A = tt.load %a : tensor<64x64x!tt.ptr<f16>, #blocked>
+      %AS = ttg.local_alloc %A : (tensor<64x64xf16, #blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
+      %B = tt.load %b : tensor<64x64x!tt.ptr<f16>, #blocked1>
+      %BS = ttg.local_alloc %B : (tensor<64x64xf16, #blocked1>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
+      %d = ttng.warp_group_dot %AS, %BS, %acc : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x64xf16, #shared, #smem> -> tensor<64x64xf32, #mma>
+      scf.yield %d : tensor<64x64xf32, #mma>
+    }
+    tt.return %r : tensor<64x64xf32, #mma>
+  }
+}
+
+// -----
+
+// Without a register cap, the same loop keeps each alloc after its load.
+// CHECK-LABEL: no_sink_loop_allocs_without_maxnreg
+//       CHECK: scf.for
+//  CHECK-NEXT:   %[[A:.+]] = tt.load
+//  CHECK-NEXT:   ttg.local_alloc %[[A]]
+//  CHECK-NEXT:   %[[B:.+]] = tt.load
+//  CHECK-NEXT:   ttg.local_alloc %[[B]]
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @no_sink_loop_allocs_without_maxnreg(%a: tensor<64x64x!tt.ptr<f16>, #blocked>, %b: tensor<64x64x!tt.ptr<f16>, #blocked1>, %n: i32) -> tensor<64x64xf32, #mma> {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #mma>
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %cst) -> (tensor<64x64xf32, #mma>) : i32 {
+      %A = tt.load %a : tensor<64x64x!tt.ptr<f16>, #blocked>
+      %AS = ttg.local_alloc %A : (tensor<64x64xf16, #blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
+      %B = tt.load %b : tensor<64x64x!tt.ptr<f16>, #blocked1>
+      %BS = ttg.local_alloc %B : (tensor<64x64xf16, #blocked1>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
+      %d = ttng.warp_group_dot %AS, %BS, %acc : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x64xf16, #shared, #smem> -> tensor<64x64xf32, #mma>
+      scf.yield %d : tensor<64x64xf32, #mma>
+    }
+    tt.return %r : tensor<64x64xf32, #mma>
+  }
+}
+
+// -----
+
+// An alloc used before the second load stays after its own load.
+// CHECK-LABEL: no_sink_loop_alloc_used_before_load
+//       CHECK: scf.for
+//  CHECK-NEXT:   %[[A:.+]] = tt.load
+//  CHECK-NEXT:   %[[AS:.+]] = ttg.local_alloc %[[A]]
+//  CHECK-NEXT:   ttng.warp_group_dot %[[AS]]
+//  CHECK-NEXT:   %[[B:.+]] = tt.load
+//  CHECK-NEXT:   ttg.local_alloc %[[B]]
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.maxnreg" = 128 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @no_sink_loop_alloc_used_before_load(%a: tensor<64x64x!tt.ptr<f16>, #blocked>, %b: tensor<64x64x!tt.ptr<f16>, #blocked1>, %bs0: !ttg.memdesc<64x64xf16, #shared, #smem>, %n: i32) -> tensor<64x64xf32, #mma> {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #mma>
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %cst) -> (tensor<64x64xf32, #mma>) : i32 {
+      %A = tt.load %a : tensor<64x64x!tt.ptr<f16>, #blocked>
+      %AS = ttg.local_alloc %A : (tensor<64x64xf16, #blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
+      %d0 = ttng.warp_group_dot %AS, %bs0, %acc : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x64xf16, #shared, #smem> -> tensor<64x64xf32, #mma>
+      %B = tt.load %b : tensor<64x64x!tt.ptr<f16>, #blocked1>
+      %BS = ttg.local_alloc %B : (tensor<64x64xf16, #blocked1>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
+      %d1 = ttng.warp_group_dot %AS, %BS, %d0 : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x64xf16, #shared, #smem> -> tensor<64x64xf32, #mma>
+      scf.yield %d1 : tensor<64x64xf32, #mma>
+    }
+    tt.return %r : tensor<64x64xf32, #mma>
+  }
+}
