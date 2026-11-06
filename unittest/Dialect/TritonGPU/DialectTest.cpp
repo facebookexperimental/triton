@@ -759,8 +759,8 @@ TEST_F(LinearEncodingTest, NpotReshapeKeepsRegisters) {
 TEST_F(LinearEncodingTest, MixedRadixEncoding) {
   auto S = [&](StringRef name) { return StringAttr::get(&ctx, name); };
   ScopedAllowNpot npot;
-  auto mixedRadix = getProductEncoding(&ctx, {3, 96}, /*numWarps=*/4,
-                                       /*threadsPerWarp=*/32, /*numCTAs=*/1);
+  auto mixedRadix = getMixedRadixEncoding(&ctx, {3, 96}, /*numWarps=*/4,
+                                          /*threadsPerWarp=*/32, /*numCTAs=*/1);
   ASSERT_TRUE(succeeded(mixedRadix));
   LinearLayout::BasesT bases;
   bases[S("register")] = {{1, 0}, {0, 32}};
@@ -776,11 +776,11 @@ TEST_F(LinearEncodingTest, MixedRadixEncoding) {
             LinearLayout(bases, radices, {{S("dim0"), 3}, {S("dim1"), 96}},
                          /*requireSurjective=*/false));
   // Control: a power-of-two shape keeps the blocked default.
-  EXPECT_TRUE(failed(getProductEncoding(&ctx, {4, 32}, 4, 32, 1)));
+  EXPECT_TRUE(failed(getMixedRadixEncoding(&ctx, {4, 32}, 4, 32, 1)));
   // The verifier rejects a mixed-radix layout across CTAs.
-  EXPECT_TRUE(failed(getProductEncoding(&ctx, {3, 96}, 4, 32, 2)));
+  EXPECT_TRUE(failed(getMixedRadixEncoding(&ctx, {3, 96}, 4, 32, 2)));
   ScopedAllowNpot unset(nullptr);
-  EXPECT_TRUE(failed(getProductEncoding(&ctx, {3, 96}, 4, 32, 1)));
+  EXPECT_TRUE(failed(getMixedRadixEncoding(&ctx, {3, 96}, 4, 32, 1)));
 }
 
 // The pad pass compares the widest vector first: `request` is the padded
@@ -801,10 +801,10 @@ TEST_F(LinearEncodingTest, MixedRadixTotalInDimSize) {
       return static_cast<int64_t>(llvm::PowerOf2Ceil(size));
     });
     unsigned vector =
-        getProductVector(&ctx, c.shape, c.request, {}, c.numWarps, 32);
+        getMixedRadixVector(&ctx, c.shape, c.request, {}, c.numWarps, 32);
     EXPECT_EQ(vector, c.vector);
     auto mixedRadix =
-        getProductEncoding(&ctx, c.shape, c.numWarps, 32, 1, vector);
+        getMixedRadixEncoding(&ctx, c.shape, c.numWarps, 32, 1, vector);
     ASSERT_TRUE(succeeded(mixedRadix));
     EXPECT_EQ(mixedRadix->getLinearLayout().getTotalInDimSize(), c.exact);
     EXPECT_EQ(getDefaultBlockedEncoding(&ctx, pow2, c.numWarps, 32, 1)

@@ -129,6 +129,12 @@ template <typename ConcreteType>
 struct AxisInfoPassthroughTrait
     : public TraitBase<ConcreteType, AxisInfoPassthroughTrait> {};
 
+// This trait marks an op whose lowering takes every exact NPOT mixed-radix
+// layout.
+template <typename ConcreteType>
+struct MixedRadixLayoutTrait
+    : public TraitBase<ConcreteType, MixedRadixLayoutTrait> {};
+
 } // namespace OpTrait
 } // namespace mlir
 
