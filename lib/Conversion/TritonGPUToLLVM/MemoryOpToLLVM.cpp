@@ -226,10 +226,13 @@ public:
       int32_t run = getMixedRadixSharedRun(regLayout, toOffset,
                                            llvmElemTy.getIntOrFloatBitWidth());
       auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+      // The verifier allows views on pow2 subslice extents only, so XOR is ADD.
+      Value origin = smemObj.getShmemOffset(loc, rewriter, memDescTy);
       SmallVector<Value> outVals;
       forEachMixedRadixSharedRun(
           loc, rewriter, regLayout, toOffset, run,
           [&](int32_t, Value offset, auto) {
+            offset = b.xor_(offset, origin);
             Value ptr = b.gep(ptrTy, llvmElemTy, smemObj.getBase(), offset);
             Value vec = b.load(vec_ty(llvmElemTy, run), ptr);
             llvm::append_range(outVals, unpackLLVector(loc, vec, rewriter));
