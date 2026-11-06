@@ -3589,7 +3589,7 @@ def _flash_attn_forward(q, k, v, sm_scale, causal, space):
     """Run the differentiable forward and return output plus natural-log LSE."""
     _validate_public_flash_attn_backward_inputs(q, k, v, sm_scale, causal)
     lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
-    config = {} if space == "full" else {"USE_DIRECT_LOAD": False}
+    config = {} if space in ("full", "heuristic") else {"USE_DIRECT_LOAD": False}
     return flash_attn_cluster_pipeline(
         q,
         k,
@@ -3605,7 +3605,7 @@ def _flash_attn_forward(q, k, v, sm_scale, causal, space):
 
 def _flash_attn_inference(q, k, v, sm_scale, causal, space):
     """Run the original forward path when no backward state is required."""
-    config = {} if space == "full" else {"USE_DIRECT_LOAD": False}
+    config = {} if space in ("full", "heuristic") else {"USE_DIRECT_LOAD": False}
     return flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=causal, **config)
 
 
@@ -3663,9 +3663,9 @@ class _attention(torch.autograd.Function):
         return dq, dk, dv, None, None, None
 
 
-def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
+def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="heuristic"):
     """Differentiable BF16 D64/D128 attention over ``(B, H, N, D)``."""
-    if space not in ("full", "smoke"):
+    if space not in ("heuristic", "full", "smoke"):
         raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space!r}")
     _validate_public_flash_attn_inputs(q, k, v, causal)
     if sm_scale is None:
