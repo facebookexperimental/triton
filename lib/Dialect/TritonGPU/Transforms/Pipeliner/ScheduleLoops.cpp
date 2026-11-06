@@ -1014,7 +1014,7 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
       savedMMASchedule;
   if (hasAnnotations) {
     for (auto &op : forOp.getBody()->without_terminator()) {
-      if (isa<ttng::MMAv5OpInterface>(&op) && schedule.count(&op)) {
+      if (isa<ttng::MMAv5OpInterface>(&op) && schedule.contains(&op)) {
         auto [stage, cluster] = schedule[&op];
         savedMMASchedule.push_back({&op, stage, cluster});
       }
