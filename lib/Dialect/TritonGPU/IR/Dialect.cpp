@@ -51,7 +51,7 @@ static bool hasSingleDigitProductBases(const LinearLayout &ll,
 bool hasPowerOfTwoBases(const LinearLayout &ll) {
   // flattenOuts needs power-of-two output sizes; a Product layout is checked
   // per digit instead.
-  if (ll.hasNonBinaryCarrier())
+  if (ll.hasNonPow2OutDim())
     return llvm::all_of(ll.getInDimNames(), [&](StringAttr inDim) {
       return hasSingleDigitProductBases(ll, inDim);
     });
@@ -82,7 +82,7 @@ static bool hasSingleDigitProductBases(const LinearLayout &ll,
 bool isPermutationMatrixLayout(const LinearLayout &ll) {
   // flattenOuts requires power-of-two output sizes, so Product layouts take
   // the per-output single-digit test instead.
-  if (ll.hasNonBinaryCarrier()) {
+  if (ll.hasNonPow2OutDim()) {
     LinearLayout flattened = ll.flattenIns();
     auto inDim = *flattened.getInDimNames().begin();
     LinearLayout withoutBroadcast = flattened.removeZeroBasesAlongDim(inDim);
@@ -271,7 +271,7 @@ bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
                      ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
   auto llSrc = toLinearLayout(srcShape, srcEncoding);
   // An NPOT view keeps its registers only as the regrouped source.
-  if (llSrc.hasNonBinaryCarrier())
+  if (llSrc.hasNonPow2OutDim())
     return isNpotSharedReshape(srcShape, srcEncoding, dstShape, dstEncoding);
   auto llDst = toLinearLayout(dstShape, dstEncoding);
   // In case there are replicated value we need to make sure the new and old
@@ -289,7 +289,7 @@ bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
 bool isNpotSharedReshape(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
                          ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
   auto src = toLinearLayout(srcShape, srcEncoding);
-  return src.hasNonBinaryCarrier() &&
+  return src.hasNonPow2OutDim() &&
          tryReshapeLayout(srcEncoding.getContext(), src, dstShape) !=
              toLinearLayout(dstShape, dstEncoding);
 }
@@ -981,7 +981,7 @@ getProductEncoding(MLIRContext *context, ArrayRef<int64_t> shape, int numWarps,
     layout *= LinearLayout(std::move(bases), std::move(radices),
                            {{dims[dim], odd}}, /*requireSurjective=*/true);
   }
-  if (!hasProductConversionInputDims(layout))
+  if (!hasMixedRadixConversionInputDims(layout))
     return failure();
   return LinearEncodingAttr::get(context, std::move(layout));
 }
@@ -1880,9 +1880,10 @@ static FailureOr<LinearLayout> realizeProductLayout(const LinearLayout &ll,
 LinearLayout LinearEncodingTrait::toLinearLayout(const LinearLayout &ll,
                                                  ArrayRef<unsigned> repOrder,
                                                  ArrayRef<int64_t> shape) {
-  if (ll.hasNonBinaryCarrier()) {
+  if (ll.hasNonPow2OutDim()) {
     auto realized = realizeProductLayout(ll, repOrder, shape);
-    assert(succeeded(realized) && "Product layout does not realize at shape");
+    assert(succeeded(realized) &&
+           "mixed-radix layout does not realize at shape");
     return *realized;
   }
   auto result = ll;
@@ -4178,7 +4179,7 @@ struct TritonGPUInferLayoutInterface
     auto srcTy = RankedTensorType::get(srcShape, fp32Type, srcEnc);
     // An NPOT reshape is inferred as the one that keeps every register.
     LinearLayout src = toLinearLayout(srcTy);
-    if (src.hasNonBinaryCarrier()) {
+    if (src.hasNonPow2OutDim()) {
       if (auto dst = tryReshapeLayout(ctx, src, dstShape)) {
         dstEnc = inferEncodingFromLinearLayout(ctx, std::move(*dst), srcEnc);
         return success();
@@ -4436,7 +4437,7 @@ getExactNpotLayout(RankedTensorType type,
                    function_ref<InFlightDiagnostic()> emitError = {}) {
   auto reject = [&](StringRef what) -> FailureOr<LinearLayout> {
     if (emitError)
-      emitError() << "NPOT Product layout with " << what
+      emitError() << "NPOT mixed-radix layout with " << what
                   << " is not yet supported";
     return failure();
   };
@@ -4451,7 +4452,7 @@ getExactNpotLayout(RankedTensorType type,
     layout = slice.getParent();
   }
   auto linear = dyn_cast<LinearEncodingAttr>(layout);
-  if (!linear || !linear.getLinearLayout().hasNonBinaryCarrier())
+  if (!linear || !linear.getLinearLayout().hasNonPow2OutDim())
     return failure();
   const LinearLayout &encoded = linear.getLinearLayout();
   for (StringAttr inDim : encoded.getInDimNames())
@@ -5050,9 +5051,9 @@ static LogicalResult verifyExactNpotLayouts(Operation *op) {
         (!hasExactNpotLayout(srcTy) || !hasExactNpotLayout(dstTy)))
       return op->emitError("NPOT conversion to or from a non-Product layout is "
                            "not yet supported");
-    auto plan = getProductConversionPlan(srcTy, dstTy);
+    auto plan = getMixedRadixConversionPlan(srcTy, dstTy);
     if (plan && !plan->supported())
-      return op->emitError(*plan->rejection);
+      return op->emitError(*plan->unsupportedReason);
   }
   SmallVector<Type> types(op->getOperandTypes());
   llvm::append_range(types, op->getResultTypes());
@@ -5068,11 +5069,11 @@ static LogicalResult verifyExactNpotLayouts(Operation *op) {
     if (failed(ll) || isa<ConvertLayoutOp>(op))
       continue;
     if (!isProductLayoutOp(op))
-      return op->emitError("NPOT Product layout is not yet supported on ")
+      return op->emitError("NPOT mixed-radix layout is not yet supported on ")
              << op->getName();
-    if (!hasProductConversionInputDims(*ll))
+    if (!hasMixedRadixConversionInputDims(*ll))
       return op->emitError(
-          "NPOT Product layout across CTAs is not yet supported");
+          "NPOT mixed-radix layout across CTAs is not yet supported");
   }
   return success();
 }
