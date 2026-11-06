@@ -183,6 +183,29 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         });
   }
 
+  // Upstream #11759 relaxed broadcast layouts: the result may differ from the
+  // source when no data moves between threads/registers (projection
+  // equality). Strip TLX wrappers on both sides so wrapper asymmetry alone
+  // never rejects an otherwise valid pair, then defer to the underlying
+  // source encoding's dialect check to preserve the upstream intent exactly.
+  // Pairs with no concrete source dialect (or a TLX-owned inner encoding)
+  // cannot delegate without recursing here, so they keep strict equality.
+  LogicalResult
+  verifyBroadcastOpEncoding(RankedTensorType srcType,
+                            RankedTensorType dstType) const override {
+    Attribute srcEnc = getEffectiveEncoding(srcType.getEncoding());
+    Attribute dstEnc = getEffectiveEncoding(dstType.getEncoding());
+    const triton::DialectInferLayoutInterface *delegate =
+        getInferLayoutInterfaceFor(srcEnc);
+    if (!delegate || delegate == this)
+      return success(srcType.getEncoding() == dstType.getEncoding());
+    return delegate->verifyBroadcastOpEncoding(
+        RankedTensorType::get(srcType.getShape(), srcType.getElementType(),
+                              srcEnc),
+        RankedTensorType::get(dstType.getShape(), dstType.getElementType(),
+                              dstEnc));
+  }
+
   LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                                    Attribute retEncoding,
                                    std::optional<Location> loc) const override {
@@ -331,8 +354,7 @@ LogicalResult mlir::triton::tlx::NoVerifyLayoutAttr::verify(
     return emitError()
            << "no-verify layout must wrap a distributed tensor layout";
   }
-  if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
-      !ttg::isRadix2Encoding(layout))
+  if (triton::tools::isNpotAllowed() && !ttg::isRadix2Encoding(layout))
     return emitError() << "NPOT mixed-radix layout is not yet supported in a "
                           "TLX layout wrapper";
   return success();
@@ -411,8 +433,7 @@ LogicalResult mlir::triton::tlx::UserLayoutAttr::verify(
       !isa<ttg::SharedEncodingTrait>(layout))
     return emitError()
            << "user layout must wrap a distributed or shared layout";
-  if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
-      !ttg::isRadix2Encoding(layout))
+  if (triton::tools::isNpotAllowed() && !ttg::isRadix2Encoding(layout))
     return emitError() << "NPOT mixed-radix layout is not yet supported in a "
                           "TLX layout wrapper";
   return success();

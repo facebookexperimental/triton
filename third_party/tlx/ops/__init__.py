@@ -6,6 +6,9 @@
     from triton.tlx.ops import addmm as tlx_addmm
     c = tlx_addmm(bias, a, b)
 
+    from triton.tlx.ops import addmm_mul_add
+    out = addmm_mul_add(bias, a, b, x0, res)
+
 This module is the API contract; everything under it is private -- reaching into
 `triton.tlx.ops.kernels.*` is not supported. Exactly one implementation ships
 per (op, arch), so there is no `variant=` argument, and architecture never
@@ -116,11 +119,11 @@ from ._normalization import (
 )
 
 __all__ = [
-    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn",
-    "flash_attn_mxfp8", "flash_attn_varlen", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
-    "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
-    "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "addmm_mul_add",
+    "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "rmsnorm_cat", "swiglu_ffn",
+    "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
+    "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
+    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -597,6 +600,41 @@ def addmm(input, a, b, *, out=None, space=None):
     check_backward(spec, input, a, b)
     _check_enforced("addmm", spec, invariance)
     return fn(input, a, b, out=out, space=space_name)
+
+
+def addmm_mul_add(bias, a, b, x0, res=None, *, out=None, space="heuristic"):
+    """Fused ``x0 * (bias + a @ b) + res`` (``res`` defaults to ``x0``).
+
+    The cross layer of a low-rank DCN: ``a`` is ``(M, K)``, ``b`` is
+    ``(K, N)`` (``linear.weight.t()`` for an ``nn.Linear``), ``bias`` is
+    ``(N,)`` or ``None``, and ``x0``, ``res`` and ``out`` are ``(M, N)``.
+    ``out`` may alias ``x0`` or ``res``. The linear output is rounded to the
+    input dtype before the mul/add, as in the unfused sequence. fp16/bf16,
+    forward-only.
+    """
+    space_name, invariance = _normalize_space_arg("addmm_mul_add", space)
+    if space_name not in ("heuristic", "full"):
+        raise InvalidInput(f"tlx.ops.addmm_mul_add does not provide space={space_name!r}")
+    fn, spec = impl_for("addmm_mul_add", device=a.device)
+    check_inputs(spec, dtype=a.dtype)
+    check_backward(spec, bias, a, b, x0, res)
+    _check_enforced("addmm_mul_add", spec, invariance)
+    return fn(bias, a, b, x0, res, out=out, space=space_name)
+
+
+def addmm_mul_add_launch(bias, a, b, x0, res=None, *, out):
+    """The heuristic launch of ``addmm_mul_add`` as ``(kernel, grid, args, kwargs)``.
+
+    For callers that must launch the Triton kernel themselves, e.g. a
+    ``torch.library.triton_op`` that runs ``wrap_triton(kernel)[grid](*args,
+    **kwargs)`` so that AOTInductor compiles it into the exported artifact.
+    Same operands and result as ``addmm_mul_add(..., out=out)``; ``out`` is
+    required. Works on fake tensors with a symbolic M.
+    """
+    fn, spec = impl_for("addmm_mul_add_launch", device=a.device)
+    check_inputs(spec, dtype=a.dtype)
+    check_backward(spec, bias, a, b, x0, res)
+    return fn(bias, a, b, x0, res, out=out)
 
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, space=None):

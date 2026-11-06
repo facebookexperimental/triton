@@ -1,7 +1,7 @@
 # NPOT (non-power-of-2) language tests, gated on TRITON_ALLOW_NPOT=1 (else they skip).
 # The NPOT tensors connected through their ops (a connected component of the def-use graph) keep
-# their shape if their ops lower a Product layout, each memory access keeps padding's vector and
-# the connected component takes fewer slots in sum; a TTIR pass pads every other NPOT tensor or fails.
+# their shape if their ops lower a mixed-radix layout, each memory access keeps padding's vector and
+# the connected component takes a smaller total in-dim size in sum; a TTIR pass pads every other NPOT tensor or fails.
 
 import re
 
@@ -96,7 +96,7 @@ def test_npot_copy_one_warp(size):
 @pytest.mark.parametrize("op", ["load_store", "make_range", "splat", "elementwise"])
 def test_npot_op_class(op, N, num_warps):
     """Each op class keeps its NPOT shape and matches torch and, bitwise, its
-    padded twin, whose scan is a pad boundary."""
+    padded counterpart, whose scan is where the padded tensor's pad elements begin."""
 
     @triton.jit
     def kernel(X, S, Out, Scan, N: tl.constexpr, OP: tl.constexpr, SCAN: tl.constexpr):
@@ -162,7 +162,7 @@ def test_npot_coalesced_copy():
 @pytest.mark.parametrize("offset", [1, 0])
 def test_npot_unaligned_copy(offset):
     """x[1:] is only 4-byte aligned, so padding's 512 copy loads v1 too and the
-    384 copy over 128 threads, in fewer slots, keeps its shape. The aligned
+    384 copy over 128 threads, in a smaller total in-dim size, keeps its shape. The aligned
     control pads: padding loads v4 where 384 gets v1."""
 
     @triton.jit
@@ -413,7 +413,7 @@ def test_npot_reverse_scan(op, N):
 @requires_npot
 @pytest.mark.parametrize("N, num_warps, kept", [(768, 1, False), (96, 4, False), (128, 4, True)])
 def test_npot_histogram(N, num_warps, kept):
-    """Padded, as histogram does not yet take a Product layout: pad lanes load
+    """Padded, as histogram does not yet take a mixed-radix layout: pad lanes load
     0, a bin-0 canary; the live mask keeps them uncounted. N=128 is the pow2
     control."""
 
@@ -652,3 +652,26 @@ def test_npot_reduce_no_pad_value_rejected(N):
     with pytest.raises(RuntimeError,
                        match="'tt.reduce' op over an NPOT axis with a combiner that has no pad value is unsupported"):
         kernel[(1, )](x, out, N=N)
+
+
+@requires_gpu
+@requires_npot
+def test_npot_reduce_no_pad_value_exact():
+    """The [32, 96] counterpart keeps its shape on four warps, so no pad element enters
+    the reduce and a combiner without a pad value compiles."""
+
+    @triton.jit
+    def sub(a, b):
+        return a - b
+
+    @triton.jit
+    def kernel(X, Out):
+        m = tl.arange(0, 32)
+        x = tl.load(X + m[:, None] * 96 + tl.arange(0, 96)[None, :])
+        tl.store(Out + m, tl.reduce(x, 1, sub))
+
+    x = torch.zeros(32, 96, device="cuda")
+    out = torch.ones(32, device="cuda")
+    h = kernel[(1, )](x, out, num_warps=4)
+    assert "tensor<32x96x" in h.asm["ttgir"]
+    assert torch.equal(out, torch.zeros_like(out))

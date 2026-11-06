@@ -152,9 +152,17 @@ jobs:
             exit 1
           fi
 
-          echo "llvm=$(sha256sum "$llvm_file" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          llvm_files=("$llvm_file")
+          if [[ -f cmake/meta-llvm-info.json ]]; then
+            llvm_files+=(cmake/meta-llvm-info.json)
+          fi
+          echo "llvm=$(cat "${llvm_files[@]}" | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
           if [[ -f "$amd_file" ]]; then
-            echo "amd=$(sha256sum "$amd_file" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+            amd_files=("$amd_file")
+            if [[ -f cmake/meta-amd-llvm-info.json ]]; then
+              amd_files+=(cmake/meta-amd-llvm-info.json)
+            fi
+            echo "amd=$(cat "${amd_files[@]}" | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
           else
             echo "amd=none" >> "$GITHUB_OUTPUT"
           fi

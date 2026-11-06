@@ -25,6 +25,12 @@ COOPERATIVE_CONFIGS = (
     (256, 128, 3, 3),
     (128, 128, 6, 5),
     (128, 64, 8, 2),
+    # 64-row tiles: one consumer warpgroup.
+    (64, 64, 8, 1),
+    (64, 128, 6, 1),
+    (64, 256, 4, 1),
+    (64, 64, 8, 3),
+    (64, 128, 6, 2),
 )
 
 
@@ -161,6 +167,52 @@ def test_full_space_prune_fills_the_gpu(M, N, K):
         assert kw["SPLIT_K"] == 1 or work <= num_sms
     best = max(sm90._mn_tiles(M, N, c.kwargs["BM"], c.kwargs["BN"]) * c.kwargs["SPLIT_K"] for c in configs)
     assert best > num_sms // 2
+
+
+# Sub-wave merge-net shapes: 128x128 tiles leave SMs idle, so the full space
+# offers single-consumer 64-row tiles (BK 128) next to split-K and lets
+# autotune choose (704x512x8192: 64x64 whole-K 23.6 us, 128x128 split-K 24.5,
+# cuBLAS 28.9; 608x512x20992: split-K 46.2, 64x64 56.9, cuBLAS 43.6).
+@pytest.mark.parametrize("M, N, K", [(608, 512, 20992), (704, 512, 8192), (706, 288, 2048), (706, 128, 3536)])
+def test_prune_offers_64_row_tiles_on_sub_wave_shapes(M, N, K):
+    configs = sm90._prune_full_configs(sm90.CONFIGS(), {"M": M, "N": N, "K": K})
+    small = [c.kwargs for c in configs if c.kwargs["BM"] == 64]
+    assert small and all(kw["NUM_MMA_GROUPS"] == 1 and kw["BK"] == 128 for kw in small)
+    assert any(kw["SPLIT_K"] == 1 for kw in small)
+
+
+def test_prune_drops_64_row_tiles_on_full_shapes():
+    configs = sm90._prune_full_configs(sm90.CONFIGS(), {"M": 4096, "N": 4096, "K": 4096})
+    assert configs and all(c.kwargs["BM"] != 64 for c in configs)
+
+
+@pytest.mark.parametrize("M, N, K", [(608, 512, 4096), (704, 1024, 2048)])
+def test_full_space_on_sub_wave_shapes(M, N, K):
+    from triton.tlx.ops import mm as tlx_mm
+
+    a, b = _inputs(M=M, N=N, K=K)
+    sm90._tuned.cache_clear()
+    _assert_close(tlx_mm(a, b, space="full"), torch.matmul(a, b))
+
+
+@pytest.mark.parametrize("block_n, num_stages, split_k", [(64, 6, 1), (64, 5, 3), (128, 4, 1), (128, 3, 2)])
+def test_single_consumer_bk128_config(block_n, num_stages, split_k):
+    from triton.tlx.ops import mm as tlx_mm
+
+    # The 64-row tiles the full space offers: one consumer warpgroup, BK 128.
+    a, b = _inputs(M=706, N=520, K=128 * (7 if split_k == 1 else 41))
+    conf = sm90._config(64, block_n, num_stages, 1, split_k, block_k=128)
+    original = sm90.CONFIGS
+    sm90.CONFIGS = lambda: [conf]
+    sm90._FORCE_PATH = "ws"
+    sm90._tuned.cache_clear()
+    try:
+        actual = tlx_mm(a, b, space="full")
+    finally:
+        sm90.CONFIGS = original
+        sm90._FORCE_PATH = None
+        sm90._tuned.cache_clear()
+    _assert_close(actual, torch.matmul(a, b))
 
 
 @pytest.mark.parametrize("M, N, K, group_size_m", [(706, 2560, 2560, 8), (706, 2560, 20992, 8),

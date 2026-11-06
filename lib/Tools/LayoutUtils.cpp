@@ -28,9 +28,9 @@ std::optional<SmallVector<int32_t>> getBinaryOffsets(const LinearLayout &a,
   return offsets;
 }
 
-// The radix-2 digits of a Binary or Product layout as GF(2) columns in in-dim
-// and digit order. A column in the span of earlier columns is free, as in
-// getFreeVariableMasks, and its kernel vector touches only earlier pivots.
+// The radix-2 digits of a Binary or mixed-radix layout as GF(2) columns in
+// in-dim and digit order. A column in the span of earlier columns is free, as
+// in getFreeVariableMasks, and its kernel vector touches only earlier pivots.
 struct BinaryColumns {
   SmallVector<std::pair<StringAttr, int32_t>> digits;
   SmallVector<uint64_t> images;
@@ -192,9 +192,9 @@ bool coversAllLogicalOutputs(const LinearLayout &layout,
 }
 
 std::optional<LinearLayout>
-alignProductConversionOutDims(const LinearLayout &srcLayout,
-                              const LinearLayout &dstLayout,
-                              ArrayRef<int64_t> logicalShape) {
+alignMixedRadixConversionOutDims(const LinearLayout &srcLayout,
+                                 const LinearLayout &dstLayout,
+                                 ArrayRef<int64_t> logicalShape) {
   auto outDims = to_vector(srcLayout.getOutDimNames());
   if (outDims.size() != logicalShape.size() ||
       dstLayout.getNumOutDims() != srcLayout.getNumOutDims())
@@ -209,21 +209,21 @@ alignProductConversionOutDims(const LinearLayout &srcLayout,
   return dstLayout.transposeOuts(outDims);
 }
 
-bool hasProductConversionInputDims(const LinearLayout &layout) {
+bool hasMixedRadixConversionInputDims(const LinearLayout &layout) {
   return llvm::all_of(layout.getInDimNames(), [&](StringAttr dim) {
     return isRegisterOrLane(dim) || dim == "warp" ||
            (dim == "block" && layout.getInDimSize(dim) == 1);
   });
 }
 
-ProductConversionScope
-classifyProductConversionScope(const LinearLayout &srcLayout,
-                               const LinearLayout &dstLayout,
-                               ArrayRef<int64_t> logicalShape) {
+MixedRadixConversionScope
+classifyMixedRadixConversionScope(const LinearLayout &srcLayout,
+                                  const LinearLayout &dstLayout,
+                                  ArrayRef<int64_t> logicalShape) {
   auto offsets = getBinaryOffsets(srcLayout, dstLayout);
   if (!offsets || hasOddOutsideRegister(srcLayout) ||
       hasOddOutsideRegister(dstLayout))
-    return ProductConversionScope::Block;
+    return MixedRadixConversionScope::Block;
   // Coverage bounds the columns, so both exist.
   auto src = *getBinaryColumns(srcLayout, *offsets);
   auto dst = *getBinaryColumns(dstLayout, *offsets);
@@ -245,13 +245,13 @@ classifyProductConversionScope(const LinearLayout &srcLayout,
     }
     return laneAndWarp;
   };
-  ProductConversionScope scope = ProductConversionScope::Register;
+  MixedRadixConversionScope scope = MixedRadixConversionScope::Register;
   auto widen = [&](Owner source, Owner destination) {
     if (source.second != destination.second)
-      scope = ProductConversionScope::Block;
+      scope = MixedRadixConversionScope::Block;
     else if (source.first != destination.first &&
-             scope == ProductConversionScope::Register)
-      scope = ProductConversionScope::Warp;
+             scope == MixedRadixConversionScope::Register)
+      scope = MixedRadixConversionScope::Warp;
   };
   for (uint64_t kernel : dst.kernels)
     widen({0, 0}, owner(dst, kernel));
@@ -272,8 +272,8 @@ classifyProductConversionScope(const LinearLayout &srcLayout,
   return scope;
 }
 
-std::optional<ProductConversionInputMap>
-mapProductConversionInputs(const LinearLayout &a, const LinearLayout &b) {
+std::optional<MixedRadixConversionInputMap>
+mapMixedRadixConversionInputs(const LinearLayout &a, const LinearLayout &b) {
   auto inDims = to_vector(b.getInDimNames());
   auto registerDim = llvm::find(inDims, "register");
   auto laneDim = llvm::find(inDims, "lane");
@@ -367,7 +367,7 @@ mapProductConversionInputs(const LinearLayout &a, const LinearLayout &b) {
       dimBases.push_back({value});
     inputRadices[dim].assign(radices.begin(), radices.end());
     // Surjective onto an equal-size input: a bijection. Two odd register
-    // digits share one odd part, which the Product checks reject.
+    // digits share one odd part, which the mixed-radix checks reject.
     return LinearLayout::tryCreate(std::move(bases), std::move(inputRadices),
                                    {{dim, a.getInDimSize(dim)}},
                                    /*requireSurjective=*/true);
@@ -388,7 +388,7 @@ mapProductConversionInputs(const LinearLayout &a, const LinearLayout &b) {
                 [](int32_t radix) { return radix != 2; });
   for (int32_t radix : radices)
     action.push_back(radix == 2 ? binary++ : odd++);
-  return ProductConversionInputMap{
+  return MixedRadixConversionInputMap{
       std::move(*registerMap), std::move(*laneMap),
       ColumnAction(action, kReg, radices.size(), oddLastRadices)};
 }
@@ -467,10 +467,10 @@ LinearLayout invertAndComposeLocal(const LinearLayout &A, const LinearLayout &B,
                       /*requireSurjective=*/false);
 }
 
-// Under TRITON_ALLOW_NPOT an NPOT extent is held by its pow2 cover; the
+// Under TRITON_ALLOW_NPOT an NPOT extent is held by its pow2 alloc shape; the
 // coordinates past the extent are dead.
-static int64_t getCoverSize(int64_t size) {
-  if (!mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+static int64_t getPow2AllocSize(int64_t size) {
+  if (!mlir::triton::tools::isNpotAllowed())
     return size;
   return llvm::PowerOf2Ceil(size);
 }
@@ -491,7 +491,7 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
   for (auto outDim : llvm::enumerate(layout.getOutDimNames())) {
     auto outDimName = outDim.value();
     int32_t actualSize = layout.getOutDimSize(outDimName);
-    int32_t desiredSize = getCoverSize(shape.lookup(outDimName));
+    int32_t desiredSize = getPow2AllocSize(shape.lookup(outDimName));
     if (actualSize <= desiredSize) {
       continue;
     }
@@ -544,7 +544,7 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
   auto outDims = layout.getOutDims();
   for (auto &[outDim, outDimSize] : outDims) {
     outDimSize =
-        std::min<int32_t>(outDimSize, getCoverSize(shape.lookup(outDim)));
+        std::min<int32_t>(outDimSize, getPow2AllocSize(shape.lookup(outDim)));
   }
 
   return LinearLayout(std::move(bases), std::move(radices), std::move(outDims),
@@ -572,7 +572,7 @@ LinearLayout ensureLayoutNotSmallerThan(
   LinearLayout ret = layout;
   for (StringAttr outDimName : layout.getOutDimNames()) {
     int32_t actualSize = layout.getOutDimSize(outDimName);
-    int32_t desiredSize = getCoverSize(shape.lookup(outDimName));
+    int32_t desiredSize = getPow2AllocSize(shape.lookup(outDimName));
     assert(actualSize > desiredSize || desiredSize % actualSize == 0);
     ret *= LinearLayout::identity1D(desiredSize / actualSize, kDim, outDimName);
     assert(ret.getOutDimSize(outDimName) >= desiredSize);
@@ -1005,6 +1005,12 @@ SmallVector<StringAttr> supremum(const SmallVector<StringAttr> &x,
 
 LinearLayout reshapeLayout(MLIRContext *ctx, LinearLayout layout,
                            ArrayRef<int64_t> shape) {
+  // reshapeOuts needs pow2 out dims.
+  if (layout.hasNonPow2OutDim()) {
+    std::optional<LinearLayout> reshaped = tryReshapeLayout(ctx, layout, shape);
+    assert(reshaped && "the reshape splits a non-pow2 index digit");
+    return *reshaped;
+  }
   int rank = shape.size();
   auto srcOutDims = to_vector(layout.getOutDimNames());
   std::reverse(srcOutDims.begin(), srcOutDims.end());

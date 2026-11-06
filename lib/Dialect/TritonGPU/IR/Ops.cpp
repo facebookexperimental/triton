@@ -483,10 +483,11 @@ LogicalResult ConvertLayoutOp::verify() {
   if (!getForceWarpShuffle())
     return success();
 
-  if (auto plan = getProductConversionPlan(getSrc().getType(), getType())) {
-    if (plan->transport == ProductConversionTransport::Shared)
-      return emitOpError("NPOT Product conversion through shared memory is not "
-                         "yet supported with force_warp_shuffle");
+  if (auto plan = getMixedRadixConversionPlan(getSrc().getType(), getType())) {
+    if (plan->transfer == MixedRadixConversionTransfer::Shared)
+      return emitOpError(
+          "NPOT mixed-radix conversion through shared memory is not "
+          "yet supported with force_warp_shuffle");
     return success();
   }
   auto conversion = minimalCvtLayout(getSrc().getType(), getType());
@@ -829,8 +830,9 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 
   Attribute dstEncoding;
   if (Attribute srcEnc = srcTy.getEncoding()) {
-    if (!llvm::equal(getNpotCoverShape(srcTy.getShape()), srcTy.getShape()) ||
-        !llvm::equal(getNpotCoverShape(dstShape), dstShape))
+    if (!llvm::equal(getNpotPow2AllocShape(srcTy.getShape()),
+                     srcTy.getShape()) ||
+        !llvm::equal(getNpotPow2AllocShape(dstShape), dstShape))
       return emitOptionalError(loc, "NPOT reshape is not yet supported");
     if (failed(inferMemDescReshapeOpEncoding(srcTy.getShape(), srcEnc, dstShape,
                                              dstEncoding)))
@@ -850,7 +852,7 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 }
 
 LogicalResult MemDescReinterpretOp::verify() {
-  if (failed(verifyNpotCoverOperands(*this)))
+  if (failed(verifyNpotPow2AllocViewOperands(*this)))
     return failure();
   auto srcTy = getSrc().getType();
   auto dstTy = getType();
@@ -1094,7 +1096,7 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 }
 
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy) {
-  if (dstTy.getShape() != dstTy.getAllocShape() && !isNpotPhysicalCover(dstTy))
+  if (dstTy.getShape() != dstTy.getAllocShape() && !isNpotPow2AllocView(dstTy))
     return op->emitOpError("result shape and its alloc shape must match");
 
   if (!src) {
@@ -1469,7 +1471,7 @@ LogicalResult MemDescIndexOp::verify() {
 
   auto layoutAllocShape =
       dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding());
-  bool hasPhysicalCover = isNpotPhysicalCover(srcTy);
+  bool hasPhysicalCover = isNpotPow2AllocView(srcTy);
   if (layoutAllocShape != layoutShape && !hasPhysicalCover) {
     return emitError(
         "We only support memdesc_index of a multibuffer-prefix subview");

@@ -14,7 +14,7 @@ namespace mlir::triton::AMD {
 
 unsigned getConvertLayoutScratchInBytes(gpu::ConvertLayoutOp op,
                                         TargetInfoBase &targetInfo) {
-  if (auto bytes = getProductConversionScratchBytes(op))
+  if (auto bytes = getMixedRadixConversionScratchBytes(op))
     return *bytes;
   if (!cvtNeedsSharedMemory(op))
     return 0;
@@ -30,27 +30,6 @@ unsigned getConvertLayoutScratchInBytes(gpu::ConvertLayoutOp op,
   unsigned elems = getNumScratchElemsSwizzledCvt(srcLayout, dstLayout, bitwidth,
                                                  numBanks, srcTile, dstTile);
   return elems * bitwidth / 8;
-}
-
-static unsigned getBufferAtomicScratchSizeInBytes(Operation *op) {
-  Value result = op->getResult(0);
-  if (result.use_empty())
-    return 0;
-  auto tensorTy = dyn_cast<RankedTensorType>(result.getType());
-  if (!tensorTy)
-    return 0;
-  auto freeVariableMasks = gpu::toLinearLayout(tensorTy).getFreeVariableMasks();
-  bool hasBroadcast = llvm::any_of(freeVariableMasks, [](auto mask) {
-    return mask.first.getValue() != "register" && mask.second != 0;
-  });
-  if (!hasBroadcast)
-    return 0;
-  auto smemShape = convertType<unsigned>(gpu::getShapePerCTA(tensorTy));
-  auto elems = getNumScratchElements(smemShape);
-  if (elems == 0)
-    return 0;
-  auto elemTy = tensorTy.getElementType();
-  return elems * std::max<int>(8, elemTy.getIntOrFloatBitWidth()) / 8;
 }
 
 unsigned AMDAllocationAnalysisScratchSizeFn(Operation *op,
@@ -94,7 +73,7 @@ unsigned AMDAllocationAnalysisScratchSizeFn(Operation *op,
   }
 
   if (isa<amdgpu::BufferAtomicCASOp, amdgpu::BufferAtomicRMWOp>(op))
-    return getBufferAtomicScratchSizeInBytes(op);
+    return getAtomicResultScratchSize(op->getResult(0));
 
   return defaultAllocationAnalysisScratchSizeFn(op);
 }

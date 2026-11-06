@@ -412,7 +412,11 @@ struct TritonBroadcastPattern
     : public OpConversionPattern<triton::BroadcastOp> {
   using OpConversionPattern::OpConversionPattern;
 
-  // This creates a tensor with the new shape but the argument's layout
+  // This creates a tensor with the new shape but the argument's layout.
+  // Upstream #11759 allows the result encoding to differ from the source; when
+  // the original result carries its own encoding (e.g. a TLX-forged
+  // no_verify_layout pin), preserve it instead of forcing the source encoding
+  // so downstream encoding-uniform consumers see the layout they expect.
   LogicalResult
   matchAndRewrite(BroadcastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -432,11 +436,44 @@ struct TritonBroadcastPattern
           adaptor.getAttributes());
       return success();
     }
-    Type retType = op.getType().cloneWithEncoding(srcEncoding);
-    // Type retType = this->getTypeConverter()->convertType(op.getType());
-    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
-                      op, retType, adaptor.getOperands()),
-                  adaptor.getAttributes());
+    auto origResultType = cast<RankedTensorType>(op.getType());
+    Attribute resultEncoding = origResultType.getEncoding();
+    // Byte-identical fast path: no result encoding or already matching.
+    if (!resultEncoding || resultEncoding == srcEncoding) {
+      Type retType = op.getType().cloneWithEncoding(srcEncoding);
+      // Type retType = this->getTypeConverter()->convertType(op.getType());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, retType, adaptor.getOperands()),
+                    adaptor.getAttributes());
+      return success();
+    }
+    // Preserve E2 on the result. Target materialization only bridges
+    // desired-vs-remapped operand types; it does not reconcile an op's operand
+    // encoding with its result encoding. Free (projection-equal) pairs stay
+    // convert-free: the broadcast itself carries the layout change and passes
+    // verification. Non-free pairs broadcast uniformly in E1, then convert the
+    // result E1->E2 at the result shape, so E2 always meets its own shape.
+    // ConvertLayoutOp accepts TLX wrapper encodings (its verifier only checks
+    // forceWarpShuffle).
+    auto retType = origResultType.cloneWithEncoding(resultEncoding);
+    auto *iface = srcEncoding.getDialect()
+                      .getRegisteredInterface<DialectInferLayoutInterface>();
+    bool isFree = false;
+    if (iface && succeeded(iface->verifyBroadcastOpEncoding(srcType, retType)))
+      isFree = true;
+    if (isFree) {
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, retType, adaptor.getOperands()),
+                    adaptor.getAttributes());
+      return success();
+    }
+    auto tmpType = origResultType.cloneWithEncoding(srcEncoding);
+    auto bcast = triton::BroadcastOp::create(rewriter, op.getLoc(), tmpType,
+                                             adaptor.getOperands());
+    addNamedAttrs(bcast, adaptor.getAttributes());
+    auto cvt = triton::gpu::ConvertLayoutOp::create(rewriter, op.getLoc(),
+                                                    retType, bcast.getResult());
+    rewriter.replaceOp(op, cvt.getResult());
     return success();
   }
 };

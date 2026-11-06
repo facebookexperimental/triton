@@ -730,6 +730,29 @@ FOCUS_SUITES = (
         ),
     ),
     FocusSuite(
+        # Muse Spark dense projections: BF16 A[M, K] times contiguous W[N, K].T.
+        name="gfx950_4",
+        op="mm",
+        shapes=(
+            MMShape(1, 2304, 8192, (8192, 1), (1, 8192), "bf16"),
+            MMShape(27, 2304, 8192, (8192, 1), (1, 8192), "bf16"),
+            MMShape(1920, 2304, 8192, (8192, 1), (1, 8192), "bf16"),
+            MMShape(3840, 2304, 8192, (8192, 1), (1, 8192), "bf16"),
+            MMShape(1, 8192, 1024, (1024, 1), (1, 1024), "bf16"),
+            MMShape(27, 8192, 1024, (1024, 1), (1, 1024), "bf16"),
+            MMShape(1920, 8192, 1024, (1024, 1), (1, 1024), "bf16"),
+            MMShape(3840, 8192, 1024, (1024, 1), (1, 1024), "bf16"),
+            MMShape(1, 4096, 8192, (8192, 1), (1, 8192), "bf16"),
+            MMShape(27, 4096, 8192, (8192, 1), (1, 8192), "bf16"),
+            MMShape(1920, 4096, 8192, (8192, 1), (1, 8192), "bf16"),
+            MMShape(3840, 4096, 8192, (8192, 1), (1, 8192), "bf16"),
+            MMShape(1, 8192, 4096, (4096, 1), (1, 4096), "bf16"),
+            MMShape(27, 8192, 4096, (4096, 1), (1, 4096), "bf16"),
+            MMShape(1920, 8192, 4096, (4096, 1), (1, 4096), "bf16"),
+            MMShape(3840, 8192, 4096, (4096, 1), (1, 4096), "bf16"),
+        ),
+    ),
+    FocusSuite(
         name="gfx942_2",
         op="mm",
         includes=("gfx950_2", ),
@@ -742,7 +765,7 @@ FOCUS_SUITES = (
     FocusSuite(
         name="gfx950_all",
         op="mm",
-        includes=("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_addmm"),
+        includes=("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_addmm", "gfx950_4"),
     ),
 )
 
@@ -756,9 +779,7 @@ FOCUS = FocusRegistry("mm", FOCUS_SUITES, DEFAULT_SUITES)
 
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 SM90_FOCUS = FOCUS.shapes("sm90")
-# sm90_1 is tuned and tested for Hopper; Blackwell does not run it.
-SM100_CORRECTNESS_SHAPES = tuple(shape for shape in CORRECTNESS_SHAPES
-                                 if shape not in frozenset(FOCUS.resolved_shapes("sm90_1")))
+SM100_CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.shapes("sm100"))))
 
 
 def operand(rows, cols, strides, dtype, device="cuda"):
