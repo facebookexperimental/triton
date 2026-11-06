@@ -243,7 +243,8 @@ def TTG_AsyncCopyGlobalToLocalOp
 
 // Allocate shared memory
 def TTG_LocalAllocOp : TTG_Op<"local_alloc", [DeclareOpInterfaceMethods<
-                                                 MemoryEffectsOpInterface>]> {
+                                                 MemoryEffectsOpInterface>,
+                                             MixedRadixLayoutTrait]> {
   let summary = "allocate tensor";
   let description = [{
     This operation allocates buffer in shared memory and return a descriptor

@@ -137,9 +137,32 @@ struct LocalAllocOpConversion
       auto regLayout =
           toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
       auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
-      if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj,
-                                 inVals, typeConverter, rewriter,
-                                 targetInfo))) {
+      if (!regLayout.isRadix2()) {
+        // A mixed-radix layout's odd digits add rather than XOR, so it doesn't
+        // compose with the shared layout: store each run contiguous there.
+        auto b = TritonLLVMOpBuilder(loc, rewriter);
+        LinearLayout toOffset =
+            toLinearLayoutIgnoringPadding(memDescTy).pseudoinvert();
+        int32_t run = getMixedRadixSharedRun(
+            regLayout, toOffset, llvmElemTy.getIntOrFloatBitWidth());
+        auto masks = regLayout.getFreeVariableMasks();
+        auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+        forEachMixedRadixSharedRun(
+            loc, rewriter, regLayout, toOffset, run,
+            [&](int32_t reg, Value offset, auto indices) {
+              Value value =
+                  run == 1 ? inVals[reg]
+                           : packLLVector(loc, ArrayRef(inVals).slice(reg, run),
+                                          rewriter);
+              targetInfo.storeShared(
+                  rewriter, loc,
+                  b.gep(ptrTy, llvmElemTy, smemObj.getBase(), offset), value,
+                  emitCanonicalLayoutOwnerPredicate(loc, rewriter, regLayout,
+                                                    indices, masks));
+            });
+      } else if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj,
+                                        inVals, typeConverter, rewriter,
+                                        targetInfo))) {
         return failure();
       }
     }

@@ -76,3 +76,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// B's mixed-radix registers copy asynchronously in 16-byte runs.
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [32, 0], [0, 32]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [64, 96]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @async_copy_64x96
+  // CHECK-COUNT-6: cp.async.cg.shared.global [ ${{.*}} + 0 ], [ ${{.*}} + 0 ], 0x10, 0x10;
+  // CHECK-NOT: cp.async.c
+  tt.func @async_copy_64x96(%pb: !tt.ptr<f16>) {
+    %sb = tt.splat %pb : !tt.ptr<f16> -> tensor<64x96x!tt.ptr<f16>, #linear>
+    %d = ttg.local_alloc : () -> !ttg.memdesc<64x96xf16, #shared1, #smem, mutable>
+    %t = ttg.async_copy_global_to_local %sb, %d {contiguity = 8 : i32} : tensor<64x96x!tt.ptr<f16>, #linear> -> <64x96xf16, #shared1, #smem, mutable>
+    tt.return
+  }
+}

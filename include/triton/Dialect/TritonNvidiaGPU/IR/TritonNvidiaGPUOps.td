@@ -450,6 +450,7 @@ def TTNG_WarpGroupDotOp
               [DeclareOpInterfaceMethods<InferTypeOpInterface>,
                DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
                DeclareOpInterfaceMethods<DotOpInterface>,
+               MixedRadixLayoutTrait,
                TypesMatchWith<"result's type matches accumulator's type", "d",
                               "c", "$_self">]> {
   let summary = "warp group dot";
@@ -482,6 +483,7 @@ def TTNG_WarpGroupDotOp
 def TTNG_WarpGroupDotWaitOp
     : TTNG_Op<"warp_group_dot_wait", [DeclareOpInterfaceMethods<
                                           InferTypeOpInterface>,
+                                      MixedRadixLayoutTrait,
                                       AllTypesMatch<["inputs", "outputs"]>]> {
   let summary = "warp group dot wait";
   let arguments = (ins Variadic<TTG_TensorOrMemDesc>:$inputs, I32Attr:$pendings,

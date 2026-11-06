@@ -1957,6 +1957,14 @@ bool triton::gpu::hasExactLayoutAt(RankedTensorType type) {
     fullShape.insert(fullShape.begin() + slice.getDim(), 1);
     encoding = slice.getParent();
   }
+  // An encoding that implements hasMixedRadixLayout builds its mixed-radix
+  // layout in toLinearLayout, which can fall back to a pow2 alloc shape (e.g.
+  // an MMA sliced to a unit dim), so ask the verifier's predicate.
+  auto distributed = dyn_cast<DistributedEncodingTrait>(encoding);
+  if (distributed && distributed.hasMixedRadixLayout() &&
+      triton::tools::isNpotAllowed())
+    return llvm::all_of(type.getShape(), llvm::isPowerOf2_64) ||
+           hasExactNpotLayout(type);
   auto linear = dyn_cast<LinearEncodingTrait>(encoding);
   if (!linear || !linear.getLinearLayout().hasNonPow2OutDim())
     return true;
@@ -2122,10 +2130,16 @@ void NvidiaMmaEncodingAttr::print(AsmPrinter &printer) const {
   printer << ", instrShape = [" << getInstrShape() << "]}>";
 }
 
+bool triton::gpu::isMmaV3NpotNLegal(ArrayRef<unsigned> warpsPerCTA,
+                                    ArrayRef<unsigned> instrShape) {
+  return triton::tools::isNpotAllowed() && instrShape[1] % 8 == 0 &&
+         warpsPerCTA[1] == 1;
+}
+
 LogicalResult
 NvidiaMmaEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                               unsigned versionMajor, unsigned,
-                              ArrayRef<unsigned>, CGAEncodingAttr,
+                              ArrayRef<unsigned> warpsPerCTA, CGAEncodingAttr,
                               ArrayRef<unsigned> instrShape) {
   // toLinearLayout turns the instruction M and N into identity1D repeat
   // counts, which must be powers of two.
@@ -2133,7 +2147,8 @@ NvidiaMmaEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
     return success();
   unsigned mIdx = versionMajor == 3 ? 0 : instrShape.size() - 2;
   if (!llvm::isPowerOf2_32(instrShape[mIdx]) ||
-      !llvm::isPowerOf2_32(instrShape[mIdx + 1]))
+      (!llvm::isPowerOf2_32(instrShape[mIdx + 1]) &&
+       !(versionMajor == 3 && isMmaV3NpotNLegal(warpsPerCTA, instrShape))))
     return emitError() << "NVIDIA MMA instrShape with an NPOT M or N is not "
                           "yet supported, got instrShape = ["
                        << instrShape << "]";
@@ -3797,6 +3812,10 @@ struct TritonGPUInferLayoutInterface
   inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                      Attribute retEncoding,
                      std::optional<Location> location) const override {
+    // A mixed-radix result's operands keep their layouts until
+    // accelerate-matmul picks the MMA's.
+    if (!isRadix2Encoding(retEncoding))
+      return success();
     auto mmaRetEncoding = mlir::dyn_cast<NvidiaMmaEncodingAttr>(retEncoding);
     if (mmaRetEncoding && mmaRetEncoding.isHopper()) {
       auto dotOpEnc = mlir::dyn_cast<DotOperandEncodingAttr>(operandEncoding);
@@ -4494,7 +4513,8 @@ struct TritonGPUInlineAsmInterface : public DialectInlineAsmInterface {
 
 // The layout of `type` if its encoding is a mixed-radix layout, or a slice of
 // one, that is exact: out sizes equal the shape, surjective, and no free odd
-// digit. Out-of-scope layouts are reported through `emitError` when given.
+// digit. Other encodings count once hasMixedRadixLayout opts them in.
+// Out-of-scope layouts are reported through `emitError` when given.
 static FailureOr<LinearLayout>
 getExactNpotLayout(RankedTensorType type,
                    function_ref<InFlightDiagnostic()> emitError = {}) {
@@ -4515,15 +4535,26 @@ getExactNpotLayout(RankedTensorType type,
     layout = slice.getParent();
   }
   auto linear = dyn_cast<LinearEncodingAttr>(layout);
-  if (!linear || !linear.getLinearLayout().hasNonPow2OutDim())
+  LinearLayout encoded;
+  if (linear) {
+    encoded = linear.getLinearLayout();
+  } else {
+    auto distributed = dyn_cast<DistributedEncodingTrait>(layout);
+    if (!distributed || !triton::tools::isNpotAllowed() ||
+        llvm::all_of(shape, llvm::isPowerOf2_64) ||
+        !distributed.hasMixedRadixLayout())
+      return failure();
+    encoded = distributed.toLinearLayout(shape);
+  }
+  if (!encoded.hasNonPow2OutDim())
     return failure();
-  const LinearLayout &encoded = linear.getLinearLayout();
   for (StringAttr inDim : encoded.getInDimNames())
     if (inDim != "register" &&
         llvm::any_of(encoded.getInputRadices(inDim),
                      [](int32_t radix) { return radix != 2; }))
       return reject(("a non-binary " + inDim.str() + " digit").c_str());
-  if (failed(buildMixedRadixLayout(encoded, linear.getRepOrder(), shape)))
+  if (linear &&
+      failed(buildMixedRadixLayout(encoded, linear.getRepOrder(), shape)))
     return failure();
   LinearLayout ll = toLinearLayout(type);
   if (!llvm::equal(ll.getOutDimSizes(), type.getShape()))

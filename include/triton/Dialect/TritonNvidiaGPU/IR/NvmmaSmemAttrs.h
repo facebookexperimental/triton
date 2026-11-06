@@ -21,4 +21,8 @@ getNvmmaSmemAttrs(const LinearLayout &nvmmaSmemLL, unsigned bitwidth);
 
 std::optional<NvmmaSmemAttrs> getNvmmaSmemAttrs(gpu::MemDescType memTy);
 
+// The attrs an MMA smem descriptor reads memTy with, matched from its layout
+// as the lowering does, even for an NVMMAShared encoding; nullopt if none.
+std::optional<NvmmaSmemAttrs> getMmaOperandSmemAttrs(gpu::MemDescType memTy);
+
 } // namespace mlir::triton::nvidia_gpu
