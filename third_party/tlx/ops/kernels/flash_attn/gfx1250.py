@@ -349,7 +349,7 @@ def _select_tile_sizes(batch, heads, seqlen_q, seqlen_k, head_size, compute_unit
         return 64, 128
     if seqlen_k < 512:
         return 128, 128
-    wide = seqlen_k >= 4096 and batch * heads * (seqlen_q // 256) >= compute_units
+    wide = seqlen_k >= 1024 and batch * heads * (seqlen_q // 256) >= compute_units
     return (256 if wide else 128), 64
 
 
