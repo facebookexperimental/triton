@@ -1719,7 +1719,7 @@ class CodeGenerator(ast.NodeVisitor):
     def visit_Call(self, node):
         fn = _unwrap_if_constexpr(self.visit(node.func))
         if not isinstance(fn, BoundJITMethod):
-            static_implementation = self.statically_implemented_functions.get(fn)
+            static_implementation = self._get_static_implementation(fn)
             if static_implementation is not None:
                 return static_implementation(self, node)
 
@@ -1913,15 +1913,29 @@ class CodeGenerator(ast.NodeVisitor):
 
         return ret
 
-    from ..experimental.gluon import language as ttgl
-
     statically_implemented_functions: Dict[object, Callable[[ast.Call], Any]] = {
         language.core.static_assert: execute_static_assert,
         language.core.static_print: static_executor(print),
-        ttgl.static_assert: execute_static_assert,
-        ttgl.static_print: static_executor(print),
         int: static_executor(int),
         len: static_executor(len),
+    }
+
+    def _get_static_implementation(self, fn):
+        impl = self.statically_implemented_functions.get(fn)
+        # Only Gluon kernels look up Gluon builtins, so plain Triton compiles
+        # never import Gluon.
+        if impl is None and self.is_gluon:
+            impl = _gluon_static_implementations().get(fn)
+        return impl
+
+
+@functools.cache
+def _gluon_static_implementations() -> Dict[object, Callable[[ast.Call], Any]]:
+    from ..experimental.gluon import language as ttgl
+
+    return {
+        ttgl.static_assert: CodeGenerator.execute_static_assert,
+        ttgl.static_print: CodeGenerator.static_executor(print),
     }
 
 

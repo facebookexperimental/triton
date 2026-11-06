@@ -4558,6 +4558,9 @@ struct TritonGPUVerifyTensorLayoutInterface
   LogicalResult verifyTensorLayout(
       Attribute layout, RankedTensorType rankedTy, Operation *op,
       function_ref<InFlightDiagnostic()> makeErr) const override {
+    mlir::OpTrait::impl::layoutVerifyStats.checkCalls++;
+    mlir::OpTrait::impl::ScopedNs timer{
+        mlir::OpTrait::impl::layoutVerifyStats.checkNs};
     if (failed(verifyTensorRank(layout, rankedTy, makeErr)) ||
         failed(verifyCTAs(layout, op, makeErr)))
       return failure();
