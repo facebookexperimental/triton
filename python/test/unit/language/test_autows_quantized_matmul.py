@@ -195,16 +195,17 @@ def test_autows_quantized_matmul_tma(data_kind, scale_kind, vec_size, a_type, b_
         torch.testing.assert_close(ref, c, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize(("data_kind", "elem_type"), [("mxfp8", "e5m2"), ("mxfp4", "e2m1")])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-def test_autows_quantized_matmul_tma_2cta(device):
-    """MXFP8 scaled matmul on a 2-CTA (cta_group::2) collective MMA.
+def test_autows_quantized_matmul_tma_2cta(data_kind, elem_type, device):
+    """MX scaled matmul on a 2-CTA (cta_group::2) collective MMA.
 
     Launched with ctas_per_cga=(2, 1, 1), so each CTA is its own program and the
     pair cooperates only through the collective MMA. M is sized to two BLOCK_M
     tiles so the grid is an exact multiple of the cluster and adjacent programs
     pair up along M, matching how the compiler splits the B operand.
     """
-    if not hasattr(torch, "float8_e5m2"):
+    if data_kind == "mxfp8" and not hasattr(torch, "float8_e5m2"):
         pytest.skip("MXFP8 inputs require torch.float8_e5m2")
 
     with triton.knobs.nvidia.scope():
@@ -217,10 +218,11 @@ def test_autows_quantized_matmul_tma_2cta(device):
         rep_m = BLOCK_M // 128
         rep_n = BLOCK_N // 128
         rep_k = BLOCK_K // vec_size // 4
+        pack_factor = 2 if data_kind == "mxfp4" else 1
 
         torch.manual_seed(42)
-        a, a_ref = _make_quantized_input("mxfp8", (M, K), device)
-        b, b_ref = _make_quantized_input("mxfp8", (N, K), device)
+        a, a_ref = _make_quantized_input(data_kind, (M, K), device)
+        b, b_ref = _make_quantized_input(data_kind, (N, K), device)
         # Nonuniform scales: the compiler splits B across the CTA pair but keeps
         # the B scale full width, so a wrong N-half or K-group in the scale
         # addressing must change the result. Unit scales cannot show that.
@@ -233,8 +235,8 @@ def test_autows_quantized_matmul_tma_2cta(device):
 
         triton.set_allocator(alloc_fn)
 
-        a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
-        b_desc = TensorDescriptor.from_tensor(b, [BLOCK_N, BLOCK_K])
+        a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K // pack_factor])
+        b_desc = TensorDescriptor.from_tensor(b, [BLOCK_N, BLOCK_K // pack_factor])
         c_desc = TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
         a_scale_desc = TensorDescriptor.from_tensor(scale_a, [1, rep_m, rep_k, 2, 256])
         b_scale_desc = TensorDescriptor.from_tensor(scale_b, [1, rep_n, rep_k, 2, 256])
@@ -258,9 +260,9 @@ def test_autows_quantized_matmul_tma_2cta(device):
             rep_m,
             rep_n,
             rep_k,
-            "e5m2",
-            "e5m2",
-            1,
+            elem_type,
+            elem_type,
+            pack_factor,
             NUM_STAGES=2,
             TWO_CTAS=True,
             num_warps=4,
