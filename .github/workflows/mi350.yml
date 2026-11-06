@@ -226,7 +226,6 @@ jobs:
           packages: numpy pytest expecttest
       - name: Check AMD GPU
         id: gpu_health
-        if: steps.gluon.outputs.run == 'true'
         # A runner whose GPU stopped responding fails here instead of hanging a later step.
         timeout-minutes: 4
         run: timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
