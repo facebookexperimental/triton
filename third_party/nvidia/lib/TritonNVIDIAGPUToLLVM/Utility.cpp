@@ -60,8 +60,9 @@ static Value shuffleCommon(Location loc, RewriterBase &rewriter, Value val,
 
 Value shuffleXor(Location loc, RewriterBase &rewriter, Value val, int i) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-  return shuffleCommon(loc, rewriter, val, b.i32_val(i), NVVM::ShflKind::bfly,
-                       b.i32_val(0x1f));
+  Value offset = b.i32_val(i);
+  Value clamp = b.i32_val(0x1f);
+  return shuffleCommon(loc, rewriter, val, offset, NVVM::ShflKind::bfly, clamp);
 }
 
 Value shuffleUp(Location loc, RewriterBase &rewriter, Value val, int i) {
