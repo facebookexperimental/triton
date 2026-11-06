@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   select:
-    runs-on: ubuntu-24.04
+    runs-on: 32-core-ubuntu
     outputs:
       requests: ${{ steps.requests.outputs.requests }}
     steps:
