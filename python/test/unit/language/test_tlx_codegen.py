@@ -8270,10 +8270,22 @@ def test_attention_backward_partitioned_lds_assembly(shape, packed_dq):
     lines = Path(gfx1250_bwd.__file__).read_text().splitlines()
     seed_line = next(i for i, line in enumerate(lines, 1) if "tlx.local_store(tlx.local_view(dsb, (step_start" in line)
     locations = re.findall(r"!(\d+) = !DILocation\(line: " + str(seed_line) + r",", llir)
-    bases = set()
-    for line in llir.splitlines():
-        if any(re.search(r"!dbg !" + location + r"\b", line) for location in locations):
-            bases.update(int(value) for value in re.findall(r"@global_smem, i32 (\d+)", line))
+    seed = [
+        line for line in llir.splitlines() if any(
+            re.search(r"!dbg !" + location + r"\b", line) for location in locations)
+    ]
+    bases = {int(value) for line in seed for value in re.findall(r"@global_smem, i32 (\d+)", line)}
+    if not bases:
+        # LLVM may fold the two piece pointers into one GEP:
+        # @global_smem + piece * stride + offset, where piece is a single lane bit.
+        defs = dict(re.findall(r"^\s*(%\d+) = (.*?), !dbg !\d+$", "\n".join(seed), re.M))
+        smem, piece_offset = re.search(r"(%\d+) = getelementptr i8, ptr addrspace\(3\) @global_smem, i32 (%\d+)",
+                                       "\n".join(seed)).groups()
+        piece, stride = re.fullmatch(r"mul nuw nsw i32 (%\d+), (\d+)", defs[piece_offset]).groups()
+        masked, shift = re.fullmatch(r"lshr exact i32 (%\d+), (\d+)", defs[piece]).groups()
+        assert re.fullmatch(r"and i32 %\d+, " + str(1 << int(shift)), defs[masked])
+        offset = int(re.search(r"ptr addrspace\(3\) " + smem + r", i32 (\d+)", "\n".join(seed))[1])
+        bases = {offset, offset + int(stride)}
     assert len(bases) == 2
     piece_bytes = 3 * config.block_m * (config.block_n // 2) * 2 * 528 // 512
     partitions = [set(range(base // 65536, (base + piece_bytes - 1) // 65536 + 1)) for base in sorted(bases)]
@@ -8556,7 +8568,7 @@ def test_attention_backward_occ1_war_flags_default_off():
     assert not config.occ1_load_after_dk
 
 
-@pytest.mark.parametrize("shape,expected_drains", [((16, 16, 16, 16384), 32), ((8, 64, 8, 8192), 33)])
+@pytest.mark.parametrize("shape,expected_drains", [((16, 16, 16, 16384), 30), ((8, 64, 8, 8192), 30)])
 @pytest.mark.parametrize("packed_dq", [False, True])
 def test_attention_backward_occ1_war_drain_assembly(shape, expected_drains, packed_dq):
     import dataclasses
