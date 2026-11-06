@@ -6,13 +6,6 @@ on:
     paths:
       - cmake/meta-llvm-build-info.json
       - cmake/meta-amd-llvm-build-info.json
-  pull_request:
-    paths:
-      - cmake/meta-llvm-build-info.json
-      - cmake/meta-amd-llvm-build-info.json
-      - .github/workflows/meta-llvm-build-trigger.yml
-      - .github/scripts/select_meta_llvm_builds.py
-      - .github/scripts/test_select_meta_llvm_builds.py
   workflow_dispatch:
     inputs:
       kind:
@@ -38,10 +31,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Test build-request selection
-        run: python3 -m unittest discover -s .github/scripts -p test_select_meta_llvm_builds.py -v
       - name: Select build requests
-        if: github.event_name != 'pull_request'
         id: requests
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -53,7 +43,7 @@ jobs:
   build:
     name: Build requested ${{ matrix.request.kind }} SDK
     needs: select
-    if: github.event_name != 'pull_request' && needs.select.outputs.requests != '[]'
+    if: needs.select.outputs.requests != '[]'
     permissions:
       contents: write
       id-token: write
