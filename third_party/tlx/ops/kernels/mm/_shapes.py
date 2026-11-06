@@ -756,9 +756,7 @@ FOCUS = FocusRegistry("mm", FOCUS_SUITES, DEFAULT_SUITES)
 
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 SM90_FOCUS = FOCUS.shapes("sm90")
-# sm90_1 is tuned and tested for Hopper; Blackwell does not run it.
-SM100_CORRECTNESS_SHAPES = tuple(shape for shape in CORRECTNESS_SHAPES
-                                 if shape not in frozenset(FOCUS.resolved_shapes("sm90_1")))
+SM100_CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.shapes("sm100"))))
 
 
 def operand(rows, cols, strides, dtype, device="cuda"):
