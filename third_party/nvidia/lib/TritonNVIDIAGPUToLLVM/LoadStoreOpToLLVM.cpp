@@ -2097,10 +2097,12 @@ static LogicalResult iterateGatherScatterIndices(
   // `xCoordsLayout` maps the register ID into dim0. Tile dim1 by adding a new
   // dimension representing the TMA message ID.
   assert(innerBlockSize % numMessagesPerRow == 0);
-  assert(llvm::isPowerOf2_32(numMessagesPerRow));
   unsigned msgSize = innerBlockSize / numMessagesPerRow;
-  LinearLayout msgToCol =
-      LinearLayout::strided1D(numMessagesPerRow, msgSize, kMsg, kDim1);
+  // An NPOT row is whole boxes (getNpotTMAUnsupportedReason) of the pow2 alloc
+  // shape that the shared layout spans, so plan the pow2 alloc shape's messages
+  // and issue the first numMessagesPerRow.
+  LinearLayout msgToCol = LinearLayout::strided1D(
+      llvm::PowerOf2Ceil(numMessagesPerRow), msgSize, kMsg, kDim1);
   LinearLayout msgToOffset =
       getMsgToPackedOffsetLayout(smemType, ttg::TMAMode::Tiled);
   LinearLayout msgLayout = xCoordsLayout * msgToCol;
@@ -2109,7 +2111,7 @@ static LogicalResult iterateGatherScatterIndices(
     basis.back() = msgToOffset.getBasis(kBlock, bit, kDim1);
   auto msgOutDims = msgLayout.getOutDims();
   msgOutDims[msgLayout.getOutDimIndex(kDim1)].second =
-      smemType.getShape().back();
+      llvm::PowerOf2Ceil(smemType.getShape().back());
   msgLayout = LinearLayout(std::move(msgBases), msgOutDims,
                            /*requireSurjective=*/false);
 

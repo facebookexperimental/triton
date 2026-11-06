@@ -1213,10 +1213,6 @@ static LogicalResult verifyAsyncTMAGatherScatterOp(Operation *op,
            << blockType;
   if (failed(verifyGatherScatterResultType(op, memDescType, indicesType)))
     return failure();
-  // Gather/scatter lowering still splits a row into a pow2 message count.
-  if (triton::tools::isNpotAllowed() &&
-      !llvm::all_of(getShapePerCTA(memDescType), llvm::isPowerOf2_64))
-    return op->emitOpError("NPOT TMA gather/scatter tile is not yet supported");
 
   if (memDescType.getShape()[1] != blockType.getShape()[1])
     return op->emitOpError("result tensor number of columns must match block (")
