@@ -1935,6 +1935,11 @@ struct AmdNpotTargetLegality : public tt::NpotTargetLegality {
                                                      int) const override {
     return ("NPOT dot is not yet supported on " + target).str();
   }
+  std::optional<std::string>
+  getAsyncCopyUnsupportedReason(Operation *, const tt::LinearLayout &,
+                                StringRef target) const override {
+    return ("NPOT async copy is not yet supported on " + target).str();
+  }
 };
 } // namespace
 

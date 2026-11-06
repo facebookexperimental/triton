@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/OperationSupport.h"
@@ -1014,6 +1015,47 @@ unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
   while (vector > 1 && registers(vector, order) > allowed)
     vector /= 2;
   return vector;
+}
+
+int32_t getMixedRadixSharedRun(const LinearLayout &regLayout,
+                               const LinearLayout &toOffset,
+                               unsigned bitwidth) {
+  MLIRContext *ctx = (*regLayout.getInDimNames().begin()).getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  auto kOffset = StringAttr::get(ctx, "offset");
+  auto offsetOf = [&](ArrayRef<int32_t> coords) {
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    for (auto [dim, coord] : llvm::zip(regLayout.getOutDimNames(), coords))
+      ins.push_back({dim, coord});
+    return std::vector<int32_t>{toOffset.apply(ins)[0].second};
+  };
+  // Odd digits add, so vectorise the pow2 map from the leading radix-2
+  // register digits, and from every other binary part and odd-part bit (which
+  // must keep a vector aligned), to offsets.
+  std::vector<std::vector<int32_t>> leading, rest;
+  int32_t numLeading = regLayout.getNumLeadingRadix2Digits(kReg);
+  for (int32_t pos = 0; pos < numLeading; ++pos)
+    leading.push_back(offsetOf(regLayout.getBasis(kReg, pos)));
+  for (StringAttr inDim : regLayout.getInDimNames())
+    for (int32_t pos = inDim == kReg ? numLeading : 0;
+         pos < static_cast<int32_t>(regLayout.getInputRadices(inDim).size());
+         ++pos) {
+      SmallVector<int32_t> binary;
+      for (StringAttr outDim : regLayout.getOutDimNames())
+        binary.push_back(
+            regLayout.getBasisContribution(inDim, pos, outDim).binary);
+      rest.push_back(offsetOf(binary));
+    }
+  for (auto [i, size] : llvm::enumerate(regLayout.getOutDimSizes()))
+    for (int32_t bit = LinearLayout::twoPartOf(size); bit < size; bit *= 2) {
+      SmallVector<int32_t> coords(regLayout.getNumOutDims(), 0);
+      coords[i] = bit;
+      rest.push_back(offsetOf(coords));
+    }
+  LinearLayout cvt({{kReg, leading}, {StringAttr::get(ctx, "rest"), rest}},
+                   {{kOffset, toOffset.getOutDimSize(kOffset)}},
+                   /*requireSurjective=*/false);
+  return largestVectorisation(ctx, cvt, bitwidth, 128 / bitwidth).first;
 }
 
 static LogicalResult tryJoinOnAxis(MLIRContext *ctx, const LinearLayout &inLl,
@@ -5121,14 +5163,14 @@ template <typename... OpTs> static bool isAnyOf(OperationName name) {
 }
 
 bool triton::gpu::isMixedRadixLayoutOp(OperationName op) {
-  // Upstream ops: a constant lowers per element, control flow forwards values,
-  // and a conversion cast only retypes one.
+  // Upstream ops: constants and poison lower per element, control flow
+  // forwards values, a conversion cast only retypes one.
   return op.hasTrait<OpTrait::Elementwise>() ||
          op.hasTrait<OpTrait::MixedRadixLayoutTrait>() ||
          op.hasInterface<triton::MixedRadixLayoutOpInterface>() ||
          isAnyOf<arith::ConstantOp, scf::ForOp, scf::IfOp, scf::WhileOp,
                  scf::YieldOp, scf::ConditionOp, cf::BranchOp, cf::CondBranchOp,
-                 UnrealizedConversionCastOp>(op);
+                 ub::PoisonOp, UnrealizedConversionCastOp>(op);
 }
 
 std::optional<std::string>
