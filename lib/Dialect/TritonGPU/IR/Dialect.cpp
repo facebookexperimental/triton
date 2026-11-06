@@ -5034,6 +5034,11 @@ bool triton::gpu::isRadix2Encoding(Attribute layout) {
   return !layout.walk(interruptOnMixedRadix).wasInterrupted();
 }
 
+bool triton::gpu::isProductLayoutOp(Operation *op) {
+  return op->hasTrait<OpTrait::Elementwise>() ||
+         isa<triton::ProductLayoutOpInterface>(op);
+}
+
 // Checks every exact Product value `op` uses or defines. A convert is admitted
 // iff its plan is supported.
 static LogicalResult verifyExactNpotLayouts(Operation *op) {
@@ -5062,8 +5067,7 @@ static LogicalResult verifyExactNpotLayouts(Operation *op) {
       ll = getExactNpotLayout(tensorTy);
     if (failed(ll) || isa<ConvertLayoutOp>(op))
       continue;
-    if (!op->hasTrait<OpTrait::Elementwise>() &&
-        !isa<triton::ProductLayoutOpInterface>(op))
+    if (!isProductLayoutOp(op))
       return op->emitError("NPOT Product layout is not yet supported on ")
              << op->getName();
     if (!hasProductConversionInputDims(*ll))

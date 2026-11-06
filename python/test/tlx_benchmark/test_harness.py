@@ -819,6 +819,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.mla_window_attn._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.norm._cat_shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.mm._shapes": {
+            "sm90": ("sm90_baseline", "sm90_1"),
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),
             "gfx942": ("gfx942_all", ),
@@ -829,13 +830,15 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     for module_name, defaults in expected.items():
         registry = importlib.import_module(module_name).FOCUS
         assert dict(registry.defaults) == defaults
-        assert all(pattern.fullmatch(suite.name) for suite in registry.suites)
+        assert all(suite.name == "sm90_baseline" or (module_name == "triton.tlx.ops.kernels.mm._shapes"
+                                                     and suite.name == "gfx950_addmm") or pattern.fullmatch(suite.name)
+                   for suite in registry.suites)
 
     mm = importlib.import_module("triton.tlx.ops.kernels.mm._shapes").FOCUS
     assert mm.suite("gfx942_2").includes == ("gfx950_2", )
     assert mm.resolved_shapes("gfx942_2") == mm.resolved_shapes("gfx950_2")
     assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2")
-    assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3")
+    assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_addmm", "gfx950_4")
 
     addmm = importlib.import_module("triton.tlx.ops.kernels.addmm._shapes").FOCUS
     assert addmm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2", "gfx942_3")

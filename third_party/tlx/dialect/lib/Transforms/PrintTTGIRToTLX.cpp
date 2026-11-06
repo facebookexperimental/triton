@@ -1531,6 +1531,10 @@ printTaskBody(Region &region, llvm::raw_ostream &os,
 }
 
 // Print warp_specialize operation in TLX async_tasks format
+// The most registers setmaxnreg can give a task, and the most tlx.async_task
+// accepts.
+constexpr int32_t kMaxTaskRegisters = 256;
+
 void printWarpSpecialize(
     Operation *op, llvm::raw_ostream &os,
     const llvm::StringMap<StringRef> &opNameMap,
@@ -1545,6 +1549,27 @@ void printWarpSpecialize(
   SmallVector<Value> wsOperands;
   for (Value operand : op->getOperands()) {
     wsOperands.push_back(operand);
+  }
+
+  // AllocateWarpGroups runs before this printer and resolves the requested
+  // counts, where -1 asks for an even share of what the other tasks leave,
+  // into actualRegisters (default region first). Print those final counts;
+  // the frontend takes registers for all non-default tasks or none, so a
+  // request that still holds -1 prints none. Lowering clamps every count to
+  // kMaxTaskRegisters, so a default share above it is what the default task
+  // gets without asking and stays unprinted, and a partition's is clamped.
+  std::optional<int32_t> defaultRegs;
+  std::optional<ArrayRef<int32_t>> partRegs;
+  if (auto actual = op->getAttrOfType<DenseI32ArrayAttr>("actualRegisters")) {
+    if (actual[0] <= kMaxTaskRegisters)
+      defaultRegs = actual[0];
+    partRegs = actual.asArrayRef().drop_front();
+  } else if (auto requested =
+                 op->getAttrOfType<DenseI32ArrayAttr>("requestedRegisters");
+             requested && !llvm::is_contained(requested.asArrayRef(), -1)) {
+    partRegs = requested.asArrayRef();
+    if (auto def = op->getAttrOfType<IntegerAttr>("defaultRequestedRegisters"))
+      defaultRegs = def.getInt();
   }
 
   unsigned regionIdx = 0;
@@ -1564,7 +1589,10 @@ void printWarpSpecialize(
       // Print indentation and "with tlx.async_task("default"):"
       for (unsigned i = 0; i < indent + 1; ++i)
         os << "  ";
-      os << "with tlx.async_task(\"default\"):\n";
+      os << "with tlx.async_task(\"default\"";
+      if (defaultRegs)
+        os << ", registers=" << *defaultRegs;
+      os << "):\n";
 
       // Print region contents with extra indentation and substitution map
       printTaskBody(region, os, opNameMap, allocInfoMap, skippedOps, indent + 2,
@@ -1582,10 +1610,6 @@ void printWarpSpecialize(
             if (auto nwAttr =
                     op->getAttrOfType<DenseI32ArrayAttr>("partitionNumWarps"))
               partNumWarps = nwAttr.asArrayRef();
-            std::optional<ArrayRef<int32_t>> partRegs;
-            if (auto regAttr =
-                    op->getAttrOfType<DenseI32ArrayAttr>("requestedRegisters"))
-              partRegs = regAttr.asArrayRef();
             for (Region &partitionRegion : innerOp.getRegions()) {
               // Skip empty partitions (only contain skipped ops)
               if (!regionHasMeaningfulOps(partitionRegion, allocInfoMap,
@@ -1615,7 +1639,8 @@ void printWarpSpecialize(
               else
                 os << "num_warps=1";
               if (partRegs && partitionIdx < partRegs->size())
-                os << ", registers=" << (*partRegs)[partitionIdx];
+                os << ", registers="
+                   << std::min((*partRegs)[partitionIdx], kMaxTaskRegisters);
               os << "):\n";
 
               // Print partition contents

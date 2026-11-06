@@ -6,6 +6,7 @@
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "llvm/ADT/StringSwitch.h"
 
 #include <array>
@@ -675,11 +676,18 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
   std::unique_ptr<DotOpMmaMemLoader> aLoader;
   bool transA = false;
   auto isFp4a = op.numBitsPerElementA == 4;
-  auto isFp6a = op.numBitsPerElementA == 6;
+  // Dense vs padded FP6 is keyed on the encoding, not inferred from
+  // mmaSizeK alone: the scaled caller forces mmaSizeK=32 for padded
+  // operands, but a hand-written or future caller that reaches here
+  // with a padded encoding and K=64 must still take the padded path
+  // by construction. Dense K=32 keeps the byte-coordinate path.
+  bool aFp6Padded = ttng::isFp6Padded(aTensorTy.getEncoding());
+  auto isFp6a = op.numBitsPerElementA == 6 && !aFp6Padded && op.mmaSizeK == 64;
   if (aInTmem) {
     aLoader =
         std::make_unique<DotOpMmaV5TmemLoader>(DotOpMmaV5TmemLoader::build(
-            loc, rewriter, aTensorTy, baseA, op.numBitsPerElementA));
+            loc, rewriter, aTensorTy, baseA,
+            op.numBitsPerElementA == 6 && !isFp6a ? 8 : op.numBitsPerElementA));
   } else {
     auto loader = DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
                                             aOperandShape, 0, 5, lessRegMMA,
@@ -695,7 +703,8 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
   }
 
   auto isFp4b = op.numBitsPerElementB == 4;
-  auto isFp6b = op.numBitsPerElementB == 6;
+  bool bFp6Padded = ttng::isFp6Padded(bTensorTy.getEncoding());
+  auto isFp6b = op.numBitsPerElementB == 6 && !bFp6Padded && op.mmaSizeK == 64;
   auto bLoader =
       DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB, bOperandShape,
                                 1, 5, lessRegMMA, isFp4b, std::nullopt, isFp6b);
@@ -988,6 +997,9 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
 
   dot.numBitsPerElementA = getFormatBitSize(op.getAType());
   dot.numBitsPerElementB = getFormatBitSize(op.getBType());
+  if (ttng::isFp6Padded(aTensorTy.getEncoding()) ||
+      ttng::isFp6Padded(bTensorTy.getEncoding()))
+    dot.mmaSizeK = 32;
 
   TritonLLVMOpBuilder tb(loc, rewriter);
   Value baseScaleA = tb.ptrtoint(i32_ty, adaptor.getAScale());

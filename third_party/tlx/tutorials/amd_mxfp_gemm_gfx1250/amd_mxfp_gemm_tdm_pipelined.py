@@ -2394,7 +2394,8 @@ _OUT_DTYPES = {"fp32": torch.float32, "fp16": torch.float16}
 # Compile options for every mxgemm_tdm_pipelined_kernel launch. gfx1250's
 # va_vdst anti-hints raise VGPR pressure; with BK256 FP8 B tiles they push the
 # kernel past the register file and into scratch spills.
-PIPELINED_COMPILE_OPTIONS = {"va_vdst_anti_hints": False}
+# WORKAROUND: LLVM's MFMA anti-hints (llvm/llvm-project#218075) put scratch accesses in the steady K loop.
+PIPELINED_COMPILE_OPTIONS = {"va_vdst_anti_hints": False, "llvm_cl_opts": (("amdgpu-anti-hints", "false"), )}
 
 
 def mxgemm_tdm_pipelined(

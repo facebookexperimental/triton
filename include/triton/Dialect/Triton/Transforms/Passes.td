@@ -192,16 +192,31 @@ def TritonNpotPad : Pass<"triton-npot-pad", "mlir::ModuleOp"> {
   let summary = "Pad NPOT tensors to the next power of two";
   let description = [{
     Runs only under TRITON_ALLOW_NPOT, just before ConvertTritonToTritonGPU.
-    Every tensor dim that is not a power of two is widened to the next power of
-    two, and pad lanes are kept away from memory and from live results. An op
-    the pass cannot pad fails to compile with an error and leaves the IR
-    unchanged.
+    It finds the NPOT tensors connected through their ops (a connected component
+    of the def-use graph). A connected component keeps its shape when every
+    op in it lowers a Product layout and every value's Product layout, the one
+    ConvertTritonToTritonGPU gives it under the same options, keeps its padded
+    shape's global vector and wastes fewer slots (registers x lanes x warps)
+    than the default Blocked layout of its padded shape. In every other
+    connected component, each tensor dim that is not a power of two is widened
+    to the next power of two, and pad lanes are kept away from memory and from
+    live results. An op the pass cannot pad fails to compile with an error and
+    leaves the IR unchanged.
   }];
 
   let dependentDialects = [
     "mlir::triton::TritonDialect",
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::arith::ArithDialect"
+  ];
+
+  let options = [
+    Option<"numWarps", "num-warps", "int32_t", /*default*/"4",
+           "number of warps">,
+    Option<"threadsPerWarp", "threads-per-warp", "int32_t", /*default*/"32",
+           "number of threads per warp">,
+    Option<"numCTAs", "num-ctas", "int32_t", /*default*/"1",
+           "number of ctas in a cga">
   ];
 }
 

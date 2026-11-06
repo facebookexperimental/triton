@@ -45,6 +45,17 @@ runs:
       uses: astral-sh/setup-uv@v6
       with:
         enable-cache: false
+    - name: Ensure C compiler
+      # Triton JIT-compiles its driver shim at runtime, so every GPU test job
+      # needs a system C compiler. The runner image normally provides one;
+      # install it when a redeployed image does not (#4751).
+      shell: bash
+      run: |
+        if command -v gcc >/dev/null || command -v clang >/dev/null || command -v cc >/dev/null; then
+          exit 0
+        fi
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc
     - name: Provide the venv
       shell: bash
       env:
