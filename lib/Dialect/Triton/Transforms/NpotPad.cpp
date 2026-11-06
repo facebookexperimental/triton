@@ -149,7 +149,7 @@ static bool hasPaddedLowering(Operation *op) {
 class ExactComponents {
 public:
   ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp, int numCTAs,
-                  StringRef target);
+                  StringRef target, int nonKDim);
   bool contains(Value v) const {
     return !paddedComponents.contains(components.getLeaderValue(v));
   }
@@ -164,7 +164,7 @@ private:
 };
 
 ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
-                                 int numCTAs, StringRef target) {
+                                 int numCTAs, StringRef target, int nonKDim) {
   mod.walk([&](Operation *op) {
     SmallVector<Value> values = npotValues(op);
     for (Value v : values)
@@ -302,7 +302,7 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     std::optional<std::string> reason =
         isa<DotOpInterface>(op)
             ? getNpotDotUnsupportedReason(op, exact->getLinearLayout(), target,
-                                          numWarps)
+                                          numWarps, nonKDim)
         : isa<DescriptorOpInterface>(op)
             ? getNpotDescriptorUnsupportedReason(op, exact->getLinearLayout(),
                                                  target)
@@ -711,7 +711,8 @@ struct NpotPadPass : impl::TritonNpotPadBase<NpotPadPass> {
   // Checks every op before changing any, so an error leaves the IR unchanged.
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    ExactComponents exact(mod, numWarps, threadsPerWarp, numCTAs, target);
+    ExactComponents exact(mod, numWarps, threadsPerWarp, numCTAs, target,
+                          matrixInstructionSize);
     Padder padder;
     if (mod.walk([&](Operation *op) {
              return WalkResult(exact.contains(op) ? success()

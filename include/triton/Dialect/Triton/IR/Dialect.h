@@ -172,10 +172,12 @@ public:
 
   // Why `dot` can't be exact on `target` with `numWarps` warps, or
   // std::nullopt. `layout` is the mixed-radix layout of the dot's first NPOT
-  // operand.
+  // operand; `nonKDim` is the MMA M/N size the target's dot pass enforces, 0
+  // if none.
   virtual std::optional<std::string>
   getDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
-                          StringRef target, int numWarps) const = 0;
+                          StringRef target, int numWarps,
+                          int nonKDim) const = 0;
 
   // Why a global-to-shared async `copy` of mixed-radix `layout` can't lower on
   // `target`, or std::nullopt.
@@ -198,11 +200,11 @@ public:
 // The ttg.target of `op`'s module, or "" if it has none.
 StringRef getModuleTarget(Operation *op);
 
-// Why the NpotTargetLegality matching `target` rejects `layout`, or
-// std::nullopt; without one the dot isn't supported.
+// Why the NpotTargetLegality matching `target` rejects `layout` at `nonKDim`,
+// or std::nullopt; without one the dot isn't supported.
 std::optional<std::string>
 getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
-                            StringRef target, int numWarps);
+                            StringRef target, int numWarps, int nonKDim);
 
 // The same for a global-to-shared async `copy` of mixed-radix `layout`.
 std::optional<std::string>

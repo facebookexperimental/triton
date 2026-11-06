@@ -1507,7 +1507,7 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   StringRef getTargetPrefix() const override { return "cuda"; }
   std::optional<std::string>
   getDotUnsupportedReason(Operation *op, const LinearLayout &, StringRef target,
-                          int numWarps) const override {
+                          int numWarps, int) const override {
     // Exact only where BlockedToMMA picks wgmma or mma.sync alone; f64 takes
     // FMA on some targets.
     auto dot = dyn_cast<DotOp>(op);

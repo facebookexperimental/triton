@@ -8,7 +8,7 @@
 // The AMD dialect loads with its backend, so the HIP RUN adds an AMD pass.
 // CHECK-LABEL: @dot_n96
 // CHECK: tt.dot {{.*}} -> tensor<128x128xf32>
-// HIP: remark: NPOT dot is not yet supported on hip:gfx950
+// HIP: remark: NPOT dot is not yet supported on MFMA except at a 2-D dot's K
 // NONE: remark: NPOT dot is not yet supported without an MMA target
 // ConvertTritonToTritonGPU, not the pad pass, sets the module attrs.
 // ATTRS: module {

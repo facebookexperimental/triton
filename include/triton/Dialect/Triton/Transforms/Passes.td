@@ -223,7 +223,10 @@ def TritonNpotPad : Pass<"triton-npot-pad", "mlir::ModuleOp"> {
     Option<"numCTAs", "num-ctas", "int32_t", /*default*/"1",
            "number of ctas in a cga">,
     Option<"target", "target", "std::string", /*default*/"\"\"",
-           "the ttg.target ConvertTritonToTritonGPU will set">
+           "the ttg.target ConvertTritonToTritonGPU will set">,
+    Option<"matrixInstructionSize", "matrix-instruction-size", "int32_t",
+           /*default*/"0",
+           "the MMA M/N size the target's dot pass enforces, 0 if none">
   ];
 }
 
