@@ -1647,3 +1647,17 @@ unsigned getAxisInfoVector(const AxisInfo &info, Type ptrType,
 }
 
 } // namespace mlir::triton
+
+namespace mlir {
+
+SmallVector<unsigned, 4>
+getOrderFromContiguity(const SmallVector<int64_t> &arr) {
+  SmallVector<unsigned, 4> ret(arr.size());
+  std::iota(ret.begin(), ret.end(), 0);
+  std::reverse(ret.begin(), ret.end());
+  std::stable_sort(ret.begin(), ret.end(),
+                   [&](unsigned x, unsigned y) { return arr[x] > arr[y]; });
+  return ret;
+}
+
+} // namespace mlir
