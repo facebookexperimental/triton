@@ -5056,15 +5056,35 @@ template <typename... OpTs> static bool isAnyOf(OperationName name) {
   return ((name.getTypeID() == TypeID::get<OpTs>()) || ...);
 }
 
-bool triton::gpu::isMixedRadixLayoutOp(Operation *op) {
+bool triton::gpu::isMixedRadixLayoutOp(OperationName op) {
   // Upstream ops: a constant lowers per element, control flow forwards values,
   // and a conversion cast only retypes one.
-  return op->hasTrait<OpTrait::Elementwise>() ||
-         op->hasTrait<OpTrait::MixedRadixLayoutTrait>() ||
-         isa<triton::MixedRadixLayoutOpInterface>(op) ||
+  return op.hasTrait<OpTrait::Elementwise>() ||
+         op.hasTrait<OpTrait::MixedRadixLayoutTrait>() ||
+         op.hasInterface<triton::MixedRadixLayoutOpInterface>() ||
          isAnyOf<arith::ConstantOp, scf::ForOp, scf::IfOp, scf::WhileOp,
                  scf::YieldOp, scf::ConditionOp, cf::BranchOp, cf::CondBranchOp,
-                 UnrealizedConversionCastOp>(op->getName());
+                 UnrealizedConversionCastOp>(op);
+}
+
+std::optional<std::string>
+triton::gpu::getNpotLayoutUnsupportedReason(OperationName name,
+                                            TypeRange types) {
+  for (Type type : types) {
+    auto tensorTy = dyn_cast<RankedTensorType>(type);
+    FailureOr<LinearLayout> ll = failure();
+    if (tensorTy)
+      ll = getExactNpotLayout(tensorTy);
+    if (failed(ll))
+      continue;
+    if (!isMixedRadixLayoutOp(name))
+      return "NPOT mixed-radix layout is not yet supported on " +
+             name.getStringRef().str();
+    if (!hasMixedRadixConversionInputDims(*ll))
+      return std::string(
+          "NPOT mixed-radix layout across CTAs is not yet supported");
+  }
+  return std::nullopt;
 }
 
 // Checks every exact mixed-radix value `op` uses or defines. A convert is
@@ -5089,20 +5109,10 @@ static LogicalResult verifyExactNpotLayouts(Operation *op) {
   for (Region &region : op->getRegions())
     if (!region.empty())
       llvm::append_range(types, region.front().getArgumentTypes());
-  for (Type type : types) {
-    auto tensorTy = dyn_cast<RankedTensorType>(type);
-    FailureOr<LinearLayout> ll = failure();
-    if (tensorTy)
-      ll = getExactNpotLayout(tensorTy);
-    if (failed(ll) || isa<ConvertLayoutOp>(op))
-      continue;
-    if (!isMixedRadixLayoutOp(op))
-      return op->emitError("NPOT mixed-radix layout is not yet supported on ")
-             << op->getName();
-    if (!hasMixedRadixConversionInputDims(*ll))
-      return op->emitError(
-          "NPOT mixed-radix layout across CTAs is not yet supported");
-  }
+  if (!isa<ConvertLayoutOp>(op))
+    if (std::optional<std::string> reason =
+            getNpotLayoutUnsupportedReason(op->getName(), types))
+      return op->emitError(*reason);
   auto mixedRadix = dyn_cast<triton::MixedRadixLayoutOpInterface>(op);
   auto srcTy = mixedRadix && op->getNumOperands()
                    ? dyn_cast<RankedTensorType>(op->getOperand(0).getType())
