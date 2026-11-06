@@ -754,15 +754,18 @@ public:
         versionMajor, retShapePerCTA, oldAType.getElementType(), numWarps);
     auto bitwidth = oldRetType.getElementType().getIntOrFloatBitWidth();
     unsigned colStride = 32 / bitwidth;
+    // An NPOT N accumulates in TMEM blocks of its pow2 alloc shape; tcgen05
+    // still writes only N columns.
+    int64_t instrN = instrShape[1];
     Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-        context, instrShape[0], instrShape[1], colStride, CGALayout, useTwoCTAs,
-        tmemCTAMode);
+        context, instrShape[0], getNpotPow2AllocShape(instrN)[0], colStride,
+        CGALayout, useTwoCTAs, tmemCTAMode);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     MemDescType accMemDescType =
         MemDescType::get(oldRetType.getShape(), oldRetType.getElementType(),
-                         accEncoding, tensorMemorySpace,
-                         /*mutableMemory=*/true);
+                         accEncoding, tensorMemorySpace, /*mutableMemory=*/true,
+                         getNpotPow2AllocShape(oldRetType.getShape()));
     auto newDistributedEncoding =
         nvidia_gpu::getDefaultLayoutForTmemLdSt(accMemDescType, numWarps);
     auto newAccType = oldRetType.cloneWithEncoding(newDistributedEncoding);
@@ -1275,6 +1278,19 @@ public:
 };
 
 namespace {
+// Whether the lowering's descriptor match finds a core-matrix form for the B
+// memdesc the MMA patterns alloc, with dim `fast` contiguous.
+bool hasCoreMatrixForm(RankedTensorType bTy, unsigned fast) {
+  MLIRContext *ctx = bTy.getContext();
+  auto enc = NVMMASharedEncodingAttr::get(
+      ctx, bTy.getShape(), {fast, 1 - fast},
+      CGAEncodingAttr::get1CTALayout(ctx, bTy.getRank()), bTy.getElementType(),
+      /*fp4Padded=*/false);
+  auto memTy = MemDescType::get(bTy.getShape(), bTy.getElementType(), enc,
+                                SharedMemorySpaceAttr::get(ctx));
+  return nvidia_gpu::getMmaOperandSmemAttrs(memTy).has_value();
+}
+
 // Why BlockedToMMA can't issue `dot` exactly on wgmma, or std::nullopt. Its
 // warps must sit on each dim's power-of-two part, as the mixed-radix layout
 // puts them; then exact issues no more atoms per warp than padded.
@@ -1305,20 +1321,11 @@ std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
                            warps[dim], instrShape[dim], dim, twoPart)
           .str();
   }
-  // Ask the lowering's descriptor match about the B memdesc BlockedToMMA
-  // allocs. B's order isn't known yet: take the N-major order of a row-major
-  // load unless the dtype forces K-major.
-  RankedTensorType bTy = dot.getB().getType();
+  // B's order isn't known yet: take the N-major order of a row-major load
+  // unless the dtype forces K-major.
   Type elemTy = dot.getA().getType().getElementType();
-  unsigned fast = elemTy.isF16() || elemTy.isBF16() ? 1 : 0;
-  MLIRContext *ctx = dot.getContext();
-  auto enc = NVMMASharedEncodingAttr::get(
-      ctx, bTy.getShape(), {fast, 1 - fast},
-      CGAEncodingAttr::get1CTALayout(ctx, bTy.getRank()), bTy.getElementType(),
-      /*fp4Padded=*/false);
-  auto memTy = MemDescType::get(bTy.getShape(), bTy.getElementType(), enc,
-                                SharedMemorySpaceAttr::get(ctx));
-  if (!nvidia_gpu::getMmaOperandSmemAttrs(memTy))
+  if (!hasCoreMatrixForm(dot.getB().getType(),
+                         elemTy.isF16() || elemTy.isBF16() ? 1 : 0))
     return llvm::formatv("NPOT wgmma N {0} is not yet supported: B's shared "
                          "layout has no core-matrix form",
                          shape[1])
@@ -1326,8 +1333,9 @@ std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
   return std::nullopt;
 }
 
-// Asks the TCGen5MMAOp verifier's rule about the tiles BlockedToMMAv5 issues.
-// B's order isn't known yet: take the stricter MN-major form.
+// Asks the TCGen5MMAOp verifier's rule about the tiles BlockedToMMAv5 issues,
+// then the lowering's descriptor match about the B memdesc it allocs. B's order
+// isn't known yet: take the stricter MN-major form, which f32 can't take.
 std::optional<std::string>
 getTcgen05UnsupportedReason(DotOp dot, nvidia_gpu::Tcgen05Kind kind,
                             int numWarps) {
@@ -1339,7 +1347,12 @@ getTcgen05UnsupportedReason(DotOp dot, nvidia_gpu::Tcgen05Kind kind,
           instrShape[0], instrShape[1], shape,
           dot.getA().getType().getShape().back()))
     return reason;
-  return std::string("NPOT MMAv5 accumulator N is not yet supported");
+  if (!hasCoreMatrixForm(dot.getB().getType(), elemTy.isF32() ? 0 : 1))
+    return llvm::formatv("NPOT MMAv5 N {0} is not yet supported: B's shared "
+                         "layout has no core-matrix form",
+                         shape[1])
+        .str();
+  return std::nullopt;
 }
 
 struct NvidiaNpotTargetLegality : public NpotTargetLegality {

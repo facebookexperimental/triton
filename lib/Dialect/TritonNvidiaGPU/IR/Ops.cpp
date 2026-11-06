@@ -1678,6 +1678,9 @@ std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
     return std::string("NPOT MMAv5 K is not yet supported");
   if (!llvm::isPowerOf2_64(ctaShape[0]))
     return std::string("NPOT MMAv5 M is not yet supported");
+  // The NPOT TMEM ld/st plan covers blockM=128 only.
+  if (blockM == 64 && !llvm::isPowerOf2_64(ctaShape[1]))
+    return std::string("NPOT MMAv5 N with blockM=64 is not yet supported");
   unsigned n = std::min<unsigned>(blockN, ctaShape[1]);
   if (auto reason = getTcgen05IllegalShapeReason(kind, aInTmem, bMNMajor,
                                                  twoCTAs, blockM, n))
