@@ -438,6 +438,20 @@ private:
           continue;
         }
 
+        // A 2-CTA tcgen05.alloc writes the TMEM base address into this slot in
+        // both CTAs of the pair. Warp-specialized kernels have no cluster sync
+        // before the alloc, so the peer CTA's write is not ordered with this
+        // CTA's other shared memory uses. The slot must not alias any other
+        // scratch, before or after the alloc (e.g. TMA descriptor staging).
+        if (auto globalAlloc = dyn_cast<ttng::TCGen5GlobalAllocOp>(op)) {
+          if (globalAlloc.getTwoCtas()) {
+            bufferRange.insert(
+                {buffer,
+                 Interval(size_t(), std::numeric_limits<size_t>::max())});
+            continue;
+          }
+        }
+
         // Any scratch memory's live range is the current operation's live
         // range.
         bufferRange.insert(
