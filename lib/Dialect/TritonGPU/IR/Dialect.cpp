@@ -4552,6 +4552,16 @@ static bool hasExactNpotLayout(RankedTensorType type) {
          succeeded(getExactNpotLayout(type));
 }
 
+FailureOr<LinearLayout>
+mlir::triton::gpu::getExactNpotOperandLayout(Operation *op) {
+  for (Type type : op->getOperandTypes())
+    if (auto tensorTy = dyn_cast<RankedTensorType>(type))
+      if (FailureOr<LinearLayout> ll = getExactNpotLayout(tensorTy);
+          succeeded(ll))
+        return ll;
+  return failure();
+}
+
 struct TritonGPUVerifyTensorLayoutInterface
     : public triton::DialectVerifyTensorLayoutInterface {
   using DialectVerifyTensorLayoutInterface::DialectVerifyTensorLayoutInterface;

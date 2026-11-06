@@ -410,6 +410,31 @@ LogicalResult DotOp::verify() {
                                                      bEncoding);
 }
 
+// The NpotTargetLegality whose prefix matches `target`, or nullptr.
+static const NpotTargetLegality *lookupNpotTargetLegality(MLIRContext *ctx,
+                                                          StringRef target) {
+  for (Dialect *dialect : ctx->getLoadedDialects()) {
+    auto *legality = dyn_cast<NpotTargetLegality>(dialect);
+    if (legality && target.split(':').first == legality->getTargetPrefix())
+      return legality;
+  }
+  return nullptr;
+}
+
+std::optional<std::string>
+getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
+                            StringRef target, int numWarps) {
+  if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
+    return legality->getDotUnsupportedReason(dot, layout, target, numWarps);
+  return std::string("NPOT dot is not yet supported without an MMA target");
+}
+
+StringRef getModuleTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  auto target = mod ? mod->getAttrOfType<StringAttr>("ttg.target") : nullptr;
+  return target ? target.getValue() : StringRef();
+}
+
 //-- DotScaledOp --
 bool DotScaledOp::verifyDims() {
   auto aShape = this->getA().getType().getShape();
