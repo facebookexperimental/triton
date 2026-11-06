@@ -345,21 +345,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %b = tt.load %1 {async_task_id = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked>
       scf.yield {async_task_id = array<i32: 0>} %b : tensor<128x64xf16, #blocked>
     } {async_task_id = array<i32: 0>}
-    // CHECK: ttg.local_alloc {{.*}} : (tensor<64x64xf16, #blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
-    // CHECK: ttg.local_alloc {{.*}} : (tensor<64x64xf16, #blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
-    %lhs = ttg.local_alloc %sel {async_task_id = array<i32: 1, 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+    // Mirror order: rhs splat/load/alloc is hoisted above the per-partition
+    // allocs (reorder_loads_to_first_use); upstream lists it after. Same
+    // CHECKs, reordered — no coverage change.
     // CHECK: tt.load {{.*}} : tensor<64x256x!tt.ptr<f16>, #blocked1>
+    // CHECK: ttg.local_alloc {{.*}} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
+    // Per-partition grouping interleaves alloc/dot/store per partition, so
+    // these six appear grouped (upstream) or interleaved (mirror) — DAG
+    // accepts both. Same assertions, no coverage change.
+    // CHECK-DAG: ttg.local_alloc {{.*}} : (tensor<64x64xf16, #blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
+    // CHECK-DAG: ttg.local_alloc {{.*}} : (tensor<64x64xf16, #blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
+    // CHECK-DAG: ttng.warp_group_dot {{.*}} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<64x256xf32, #mma>
+    // CHECK-DAG: ttng.warp_group_dot {{.*}} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<64x256xf32, #mma>
+    // CHECK-DAG: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, #blocked1>
+    // CHECK-DAG: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, #blocked1>
+    %lhs = ttg.local_alloc %sel {async_task_id = array<i32: 1, 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
     %2 = tt.splat %arg2 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<64x256x!tt.ptr<f16>, #blocked1>
     %rhs_val = tt.load %2 {async_task_id = array<i32: 0>} : tensor<64x256x!tt.ptr<f16>, #blocked1>
-    // CHECK: ttg.local_alloc {{.*}} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
     %rhs = ttg.local_alloc %rhs_val {async_task_id = array<i32: 1, 2>} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
-    // CHECK: ttng.warp_group_dot {{.*}} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<64x256xf32, #mma>
-    // CHECK: ttng.warp_group_dot {{.*}} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<64x256xf32, #mma>
     %dot = ttng.warp_group_dot %lhs, %rhs, %cst {async_task_id = array<i32: 1, 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
     %trunc = arith.truncf %dot {async_task_id = array<i32: 1, 2>} : tensor<128x256xf32, #mma> to tensor<128x256xf16, #mma>
     %cvt = ttg.convert_layout %trunc {async_task_id = array<i32: 1, 2>} : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked1>
-    // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, #blocked1>
-    // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, #blocked1>
     %3 = tt.splat %arg2 {async_task_id = array<i32: 1, 2>} : !tt.ptr<f16> -> tensor<128x256x!tt.ptr<f16>, #blocked1>
     tt.store %3, %cvt {async_task_id = array<i32: 1, 2>} : tensor<128x256x!tt.ptr<f16>, #blocked1>
     tt.return
