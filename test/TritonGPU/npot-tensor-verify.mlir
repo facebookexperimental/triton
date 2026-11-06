@@ -189,20 +189,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Nor may a register be broadcast: #pr broadcasts its third register digit.
-#pr = #ttg.linear<{register = [[0, 1], [0, 2], [0, 0], [0, 32]], lane = [[0, 4], [0, 8], [0, 16], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = [], inputRadices = {register = [2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [16, 96]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func @mixed_radix_atomic_broadcast_register(%p: !tt.ptr<i32>) {
-    %pr = tt.splat %p : !tt.ptr<i32> -> tensor<16x96x!tt.ptr<i32>, #pr>
-    %vr = arith.constant dense<1> : tensor<16x96xi32, #pr>
-    // expected-error @+1 {{NPOT mixed-radix layout with broadcast registers is not yet supported on an atomic}}
-    %a = tt.atomic_rmw add, relaxed, gpu, %pr, %vr : (tensor<16x96x!tt.ptr<i32>, #pr>, tensor<16x96xi32, #pr>) -> tensor<16x96xi32, #pr>
-    tt.return
-  }
-}
-
-// -----
-
 // Constants, carried values, print, assert and histogram take a mixed-radix
 // layout.
 #p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>

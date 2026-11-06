@@ -236,17 +236,14 @@ LogicalResult AtomicStoreOp::verify() {
   return verifyAtomicLoadStoreType(getOperation(), getPtr().getType());
 }
 
-// AMD issues an atomic once per broadcast register copy, and a used result
-// with duplicates is broadcast back through pow2-only shared-memory algebra.
+// A used result with duplicates is broadcast back through pow2-only
+// shared-memory algebra.
 static std::optional<std::string>
 getAtomicMixedRadixUnsupportedReason(Operation *op,
                                      const LinearLayout &layout) {
-  auto masks = layout.getFreeVariableMasks();
-  if (masks.lookup(StringAttr::get(op->getContext(), "register")))
-    return "NPOT mixed-radix layout with broadcast registers is not yet "
-           "supported on an atomic";
   if (!op->getResult(0).use_empty() &&
-      llvm::any_of(masks, [](auto mask) { return mask.second != 0; }))
+      llvm::any_of(layout.getFreeVariableMasks(),
+                   [](auto mask) { return mask.second != 0; }))
     return "NPOT mixed-radix layout with broadcast elements is not yet "
            "supported on an atomic whose result is used";
   return std::nullopt;
