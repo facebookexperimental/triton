@@ -8490,6 +8490,11 @@ def _attn_bwd_dq_native_tail_quarter_inplace_convert_kernel(
     DQ_TAIL_ACC,
 ):
     tl.static_assert(N % (4 * BLOCK_M) == 0)
+    # In-place ownership: each CTA owns one [BLOCK_M, D] row tile of one
+    # (batch, head). The native swizzle permutes elements only within a
+    # 16-row group, so a CTA reads and writes only its own rows. Within a CTA,
+    # every native load completes before the workgroup barrier and every store
+    # follows it. The tail accumulator is a separate buffer that is only read.
     if tl.program_id(0) * BLOCK_M < N * 3 // 4:
         _attn_bwd_dq_native_optimized_convert_impl(DQ_ACC, DQ, N, D, BLOCK_M, INPLACE=True)
     else:
