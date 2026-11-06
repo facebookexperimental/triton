@@ -1370,8 +1370,17 @@ std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
 // warps must sit on each dim's power-of-two part, and the ldmatrix lowering
 // must cut each NPOT operand into pow2 chunks.
 std::optional<std::string> getMmaV2UnsupportedReason(DotOp dot, int numWarps) {
-  if (!llvm::isPowerOf2_64(dot.getA().getType().getShape().back()))
-    return std::string("NPOT K is not yet supported on mma.sync");
+  // An operand tile is 8 kWidths of K, with BlockedToMMA's kWidth.
+  int64_t k = dot.getA().getType().getShape().back();
+  int64_t atomK = 8 * std::max(32 / std::min(computeOrigBitWidth(dot.getA()),
+                                             computeOrigBitWidth(dot.getB())),
+                               1);
+  int64_t kTwoPart = LinearLayout::twoPartOf(static_cast<int32_t>(k));
+  if (kTwoPart % atomK != 0)
+    return llvm::formatv("NPOT dot is not yet supported on mma.sync with K "
+                         "{0}, whose power-of-two part {1} is less than k{2}",
+                         k, kTwoPart, atomK)
+        .str();
   ArrayRef<int64_t> shape = dot.getType().getShape();
   auto instrShape = mmaVersionToInstrShape(
       2, shape, dot.getA().getType().getElementType(), numWarps);
