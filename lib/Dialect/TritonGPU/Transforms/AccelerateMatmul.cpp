@@ -200,6 +200,24 @@ getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
   return LocalAllocOp::create(rewriter, arg.getLoc(), newType, arg);
 }
 
+// Transform2CTALoads gives each CTA its half of B only when B traces to a
+// descriptor load (or, for a plain MMA, a split of one); with any other B
+// both CTAs would supply the first half of N.
+static bool canSplitTwoCTAOperandB(Operation *dotOp, Value bAlloc,
+                                   bool isScaled) {
+  if (succeeded(traceTwoCTABLoad(bAlloc)))
+    return true;
+  auto alloc = bAlloc.getDefiningOp<LocalAllocOp>();
+  auto split = alloc && alloc.getSrc() ? alloc.getSrc().getDefiningOp<SplitOp>()
+                                       : SplitOp();
+  if (!isScaled && split && getTwoCTASplitBLoad(split))
+    return true;
+  dotOp->emitWarning() << "two_ctas=True requires B to be loaded through a "
+                          "tensor descriptor. Falling back to 1-CTA "
+                       << (isScaled ? "scaled MMA." : "MMA.");
+  return false;
+}
+
 static bool isTmemCopyCompatibleScale(RankedTensorType argType,
                                       bool usesTMAload) {
   assert(argType.getEncoding() && "unexpected tensor type");
@@ -740,6 +758,10 @@ public:
     bool allowTranspose = !dotOp.getA().getType().getElementType().isF32();
     a = getSharedMemoryMMAOperand(a, rewriter, 0, allowTranspose);
     b = getSharedMemoryMMAOperand(b, rewriter, 1, allowTranspose);
+    if (useTwoCTAs && !canSplitTwoCTAOperandB(dotOp, b, /*isScaled=*/false)) {
+      useTwoCTAs = false;
+      tmemCTAMode = triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT;
+    }
     MLIRContext *context = dotOp->getContext();
     auto instrShape = mmaVersionToInstrShape(
         versionMajor, retShapePerCTA, oldAType.getElementType(), numWarps);
@@ -1029,7 +1051,7 @@ public:
                "cluster-dim-x is "
             << clusterDims[0] << ". Falling back to 1-CTA scaled MMA.";
       } else {
-        useTwoCTAs = true;
+        useTwoCTAs = canSplitTwoCTAOperandB(dotOp, b, /*isScaled=*/true);
       }
     }
 
