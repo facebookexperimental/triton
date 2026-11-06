@@ -601,7 +601,11 @@ def _rocminfo() -> Optional[str]:
 
 
 def _rocr_agents() -> dict[int, tuple[Optional[str], Optional[str]]]:
-    """ROCr UUID and architecture by PCI bus, before HIP context creation."""
+    """ROCr UUID and architecture by PCI bus, before HIP context creation.
+
+    rocm-smi and ROCr/HIP can number GPUs differently; PCI bus joins the tools.
+    rocminfo's BDFID encodes bus << 8 | device << 3 | function.
+    """
     found = {}
     uuid = bdf = arch = None
     gpu = False
@@ -616,6 +620,7 @@ def _rocr_agents() -> dict[int, tuple[Optional[str], Optional[str]]]:
                 arch = name
         elif line.startswith("Uuid:"):
             value = line.split()[-1]
+            # ROCr rejects the "GPU-XX" placeholder reported without a UUID.
             uuid = value if re.fullmatch(r"GPU-[0-9a-fA-F]+", value) else None
         elif line.startswith("BDFID:"):
             bdf = line.split()[-1]

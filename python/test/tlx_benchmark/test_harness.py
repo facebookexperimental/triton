@@ -796,7 +796,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         },
         "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
-            "gfx1250": ("gfx1250_1", ),
+            "gfx1250": ("sm90_1", "gfx950_all"),
             "sm90": ("sm90_1", ),
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),

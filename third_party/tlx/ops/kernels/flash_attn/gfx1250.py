@@ -1,4 +1,9 @@
-"""gfx1250 TDM/WMMA attention with device-side online-softmax recovery."""
+"""gfx1250 TDM/WMMA attention with device-side online-softmax recovery.
+
+The fast path fixes the softmax reference at the first K tile and defers the
+denominator reduction. Workgroups with unsafe normalization or accumulation
+replay the attention using online softmax before the launch completes.
+"""
 
 import math
 
@@ -305,14 +310,14 @@ def _online_replay(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, 
                     stride_on, SM_SCALE, SEQLEN_Q, SEQLEN_K, BLOCK_M, BLOCK_N, HEAD_SZ, False, QUERY_TILES_FIRST)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BATCH", "NUM_HEADS"])
 def attn_fwd_tdm_pipelined_kernel(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz,
                                   stride_kh, stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk,
                                   stride_oz, stride_oh, stride_om, stride_on, SM_SCALE: tl.constexpr,
                                   SEQLEN_Q: tl.constexpr, SEQLEN_K: tl.constexpr, BLOCK_M: tl.constexpr,
                                   BLOCK_N: tl.constexpr, HEAD_SZ: tl.constexpr,
                                   USE_FIXED_REFERENCE: tl.constexpr = False, QUERY_TILES_FIRST: tl.constexpr = False,
-                                  BATCH: tl.constexpr = 1, NUM_HEADS: tl.constexpr = 1):
+                                  BATCH=1, NUM_HEADS=1):
     if USE_FIXED_REFERENCE:
         retry = _attention_pass(q_ptr, k_ptr, v_ptr, o_ptr, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz,
                                 stride_kh, stride_kn, stride_kk, stride_vz, stride_vh, stride_vn, stride_vk, stride_oz,
@@ -424,7 +429,10 @@ def _validate_inputs(q, k, v, causal, sm_scale, space):
 
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="heuristic"):
-    """Dense noncausal D128 MHA; output has the input shape and dtype."""
+    """Dense noncausal D128 MHA; output has the input shape and dtype.
+
+    Both "heuristic" and "smoke" select one configuration without autotuning.
+    """
     sm_scale = q.shape[-1]**-0.5 if sm_scale is None and q.ndim == 4 else sm_scale
     _validate_inputs(q, k, v, causal, sm_scale, space)
     batch, heads, sq, dim = q.shape

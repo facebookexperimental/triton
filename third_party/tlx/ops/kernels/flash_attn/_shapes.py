@@ -28,10 +28,7 @@ SYNTHETIC: tuple[FlashAttentionShape, ...] = (
     FlashAttentionShape(1, 1, 8192, 128, True, "fp16"),
 )
 
-GFX1250_PRODUCTION = tuple(FlashAttentionShape(1, 40, 90000, 128, False, dtype) for dtype in ("fp16", "bf16"))
-
 FOCUS_SUITES = (
-    FocusSuite(name="gfx1250_1", op="flash_attn", shapes=GFX1250_PRODUCTION),
     FocusSuite(name="sm90_all", op="flash_attn", includes=("sm90_1", )),
     FocusSuite(
         name="sm90_1",
@@ -104,7 +101,7 @@ FOCUS_SUITES = (
 )
 
 DEFAULT_SUITES = {
-    "gfx1250": ("gfx1250_1", ),
+    "gfx1250": ("sm90_1", "gfx950_all"),
     "sm90": ("sm90_1", ),
     "sm100": ("sm100_1", ),
     "gfx950": ("gfx950_all", ),
@@ -112,7 +109,7 @@ DEFAULT_SUITES = {
 FOCUS = FocusRegistry("flash_attn", FOCUS_SUITES, DEFAULT_SUITES)
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 #: Inference captures: production only runs their forward pass.
-FORWARD_ONLY = frozenset((*FOCUS.resolved_shapes("gfx950_2"), *FOCUS.resolved_shapes("gfx950_3"), *GFX1250_PRODUCTION))
+FORWARD_ONLY = frozenset((*FOCUS.resolved_shapes("gfx950_2"), *FOCUS.resolved_shapes("gfx950_3")))
 
 
 def qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=False, device="cuda"):

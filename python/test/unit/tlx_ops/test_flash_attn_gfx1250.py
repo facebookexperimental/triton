@@ -22,6 +22,10 @@ from triton.tlx.ops.kernels.flash_attn import gfx1250 as _gfx1250_attention
                                                        ])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gfx1250_attn_fwd_tdm_pipelined(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
+    _check_attention(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype)
+
+
+def _check_attention(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
     torch.manual_seed(0)
     D = 128
     q = torch.randn((BATCH, H, SEQLEN_Q, D), device=triton.runtime.driver.active.get_active_torch_device(), dtype=dtype)
@@ -164,7 +168,20 @@ def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, seqlen_k, block_m
 @pytest.mark.parametrize("shape", [shape for shape in CORRECTNESS_SHAPES if shape.head_dim == 128 and not shape.causal])
 def test_flash_attn_shared_shapes(shape):
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[shape.dtype]
-    test_gfx1250_attn_fwd_tdm_pipelined(shape.batch, shape.heads, shape.context, shape.context, dtype)
+    _check_attention(shape.batch, shape.heads, shape.context, shape.context, dtype)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+def test_flash_attn_batch_head_changes_reuse_kernel(monkeypatch):
+    compiled = []
+    monkeypatch.setattr(triton.knobs.compilation, "listener", lambda **kwargs: compiled.append(kwargs["src"]))
+    for batch, heads in ((1, 3), (2, 3), (3, 5)):
+        q, k, v = [torch.randn((batch, heads, 769, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+        flash_attn(q, k, v)
+        if batch == 1:
+            first_call = len(compiled)
+        else:
+            assert len(compiled) == first_call
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

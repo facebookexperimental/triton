@@ -603,7 +603,8 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space=None):
     """Fused BHSD attention with architecture-specific dtype and shape support.
 
     gfx1250 supports noncausal D128 FP16/BF16 inference, including cross attention.
-    Its default space is "heuristic"; other backends retain "full".
+    Its default space is "heuristic"; "smoke" selects the same configuration.
+    sm90, sm100, and gfx950 support backward and retain the "full" default.
     `sm_scale` defaults to `HEAD_DIM ** -0.5`.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
