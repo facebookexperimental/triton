@@ -1435,7 +1435,8 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                                     EXCHANGE_LDS=EXCHANGE_LDS, xpmem=xpmem, xdsmem=xdsmem, xdssmem=xdssmem)
         dk = tile_values[0]
         dv = tile_values[1]
-    if LSE_SPLIT and not COMMON_PREP and PREP_N == 0 and D == 128 and BM == 64 and BN == 64 and (
+    # Without DK the accumulator stays zero; skip pinning it.
+    if DK is not None and LSE_SPLIT and not COMMON_PREP and PREP_N == 0 and D == 128 and BM == 64 and BN == 64 and (
         (not CAUSAL and WARPS_N == 2) or (CAUSAL and WARPS_N == 1)):
         dk = _guard_kv_scores(dk, export_mma, PACK32=True)
     out = base + keys[:, None] * D + d[None, :]
