@@ -20,11 +20,13 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/FormatVariadic.h"
 
 namespace mlir {
 namespace triton {
@@ -40,9 +42,9 @@ static bool isUnsupportedMMAv5Int8Dot(int computeCapability, DotOp op) {
   return aElemTy.isInteger(8) && bElemTy.isInteger(8);
 }
 
-// Get the highest version supported for the hardware and the dot.
-static int getMMAVersionSafe(int computeCapability, DotOp op) {
-  // List supported mma version in order of preference.
+// List supported mma version in order of preference.
+static SmallVector<int> getMMAVersionsSupported(int computeCapability,
+                                                DotOp op) {
   SmallVector<int> versionsSupported;
   if (computeCapability < 75) {
     versionsSupported = {1};
@@ -62,7 +64,12 @@ static int getMMAVersionSafe(int computeCapability, DotOp op) {
   } else {
     assert(false && "computeCapability not supported");
   }
-  for (int baseVersion : versionsSupported) {
+  return versionsSupported;
+}
+
+// Get the highest version supported for the hardware and the dot.
+static int getMMAVersionSafe(int computeCapability, DotOp op) {
+  for (int baseVersion : getMMAVersionsSupported(computeCapability, op)) {
     if (supportMMA(op, baseVersion))
       return baseVersion;
     if (baseVersion == 3) {
@@ -133,6 +140,8 @@ warpsPerTileV3(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
         return isa<mlir::triton::DotOpInterface>(op);
       }) != slices.end())
     return {(unsigned)numWarps, 1};
+  if (hasMmaV3WarpgroupsOnN(shape, numWarps))
+    return {4, (unsigned)numWarps / 4};
 
   // For MMAv3, the smallest indivisible unit of warp shape is (4, 1).
   SmallVector<unsigned, 2> ret = {4, 1};
@@ -893,6 +902,55 @@ public:
   }
 };
 
+// Whether ScaledBlockedToMMAv5 lowers `dotOp` to tcgen05 rather than leaving
+// it to the decompose pattern.
+static bool isTcgen05ScaledDot(DotScaledOp dotOp, int computeCapability,
+                               int numWarps) {
+  if (dotOp.getAScale() == nullptr || dotOp.getBScale() == nullptr)
+    return false;
+  auto retShapePerCTA = getShapePerCTA(dotOp.getType());
+  if (computeCapability < 100 || computeCapability >= 120)
+    return false;
+  if (numWarps != 4 && numWarps != 8)
+    return false;
+  if (retShapePerCTA[0] < 128 || retShapePerCTA[1] < 16)
+    return false;
+  // fp6 (groups of 16 values per 12 bytes) cannot tile the tcgen05 K
+  // dimension today; route it to the decompose (upcast) path instead
+  // of native MMAv5.
+  if (isMXFP6ScaleType(dotOp.getAElemType()) ||
+      isMXFP6ScaleType(dotOp.getBElemType()))
+    return false;
+  bool isAFP4 = dotOp.getAElemType() == ScaleDotElemType::E2M1;
+  bool isFp4MMA = isAFP4 && dotOp.getBElemType() == ScaleDotElemType::E2M1;
+  // An MN-packed fp4 A is packed along M, so its last dim is already K.
+  auto blockK = dotOp.getA().getType().getShape().back() *
+                (isAFP4 && dotOp.getLhsKPack() ? 2 : 1);
+  bool hasMNMajorFp4Operand =
+      isFp4MMA && (!dotOp.getLhsKPack() || !dotOp.getRhsKPack());
+  auto aScaleType = dotOp.getAScale().getType();
+  auto bScaleType = dotOp.getBScale().getType();
+  auto aScaleElemType = aScaleType.getElementType();
+  auto bScaleElemType = bScaleType.getElementType();
+  auto isBlock16Scale = [blockK](RankedTensorType scaleType) {
+    return scaleType.getShape().back() * 16 == blockK;
+  };
+  bool hasUE4M3Scale = isa<Float8E4M3FNType>(aScaleElemType) ||
+                       isa<Float8E4M3FNType>(bScaleElemType);
+  bool hasUE5M3Scale =
+      (aScaleElemType.isInteger(8) && isBlock16Scale(aScaleType)) ||
+      (bScaleElemType.isInteger(8) && isBlock16Scale(bScaleType));
+  // UE5M3 scales are native only on sm107; sm100/sm103 trap, so decompose.
+  if (hasUE5M3Scale &&
+      !nvidia_gpu::TargetFeatures(computeCapability).supportsUE5M3Tcgen05MMA())
+    return false;
+  // mxf4nvf4 supports UE4M3/UE5M3 scales but not MN-major operands, while
+  // the mxf8f6f4 fallback for MN-major FP4 only supports E8M0 scales.
+  if (hasMNMajorFp4Operand && (hasUE4M3Scale || hasUE5M3Scale))
+    return false;
+  return true;
+}
+
 class ScaledBlockedToMMAv5
     : public mlir::OpRewritePattern<triton::DotScaledOp> {
   int computeCapability;
@@ -911,27 +969,13 @@ public:
         mlir::isa<NvidiaMmaEncodingAttr>(oldRetType.getEncoding()))
       return failure();
 
-    if (dotOp.getAScale() == nullptr || dotOp.getBScale() == nullptr) {
+    int numWarps = lookupNumWarps(dotOp);
+    if (!isTcgen05ScaledDot(dotOp, computeCapability, numWarps))
       return failure();
-    }
 
     // get MMA encoding for the given number of warps
     auto retShapePerCTA = getShapePerCTA(oldRetType);
-    int numWarps = lookupNumWarps(dotOp);
     auto CGALayout = getCGALayout(oldRetType.getEncoding());
-    if (computeCapability < 100 || computeCapability >= 120)
-      return failure();
-    if (numWarps != 4 && numWarps != 8)
-      return failure();
-    if (retShapePerCTA[0] < 128 || retShapePerCTA[1] < 16)
-      return failure();
-    // fp6 (groups of 16 values per 12 bytes) cannot tile the tcgen05 K
-    // dimension today; route it to the decompose (upcast) path instead
-    // of native MMAv5.
-    if (isMXFP6ScaleType(dotOp.getAElemType()) ||
-        isMXFP6ScaleType(dotOp.getBElemType())) {
-      return rewriter.notifyMatchFailure(dotOp, "fp6 uses decompose upcast");
-    }
     Location loc = dotOp.getLoc();
     // operands
     Value a = dotOp.getA();
@@ -966,26 +1010,6 @@ public:
     auto blockM = dotOp.getA().getType().getShape()[0];
     bool hasMNMajorFp4Operand =
         isFp4MMA && (!dotOp.getLhsKPack() || !dotOp.getRhsKPack());
-    auto aScaleType = dotOp.getAScale().getType();
-    auto bScaleType = dotOp.getBScale().getType();
-    auto aScaleElemType = aScaleType.getElementType();
-    auto bScaleElemType = bScaleType.getElementType();
-    auto isBlock16Scale = [blockK](RankedTensorType scaleType) {
-      return scaleType.getShape().back() * 16 == blockK;
-    };
-    bool hasUE4M3Scale = isa<Float8E4M3FNType>(aScaleElemType) ||
-                         isa<Float8E4M3FNType>(bScaleElemType);
-    bool hasUE5M3Scale =
-        (aScaleElemType.isInteger(8) && isBlock16Scale(aScaleType)) ||
-        (bScaleElemType.isInteger(8) && isBlock16Scale(bScaleType));
-    // UE5M3 scales are native only on sm107; sm100/sm103 trap, so decompose.
-    if (hasUE5M3Scale && !nvidia_gpu::TargetFeatures(computeCapability)
-                              .supportsUE5M3Tcgen05MMA())
-      return failure();
-    // mxf4nvf4 supports UE4M3/UE5M3 scales but not MN-major operands, while
-    // the mxf8f6f4 fallback for MN-major FP4 only supports E8M0 scales.
-    if (hasMNMajorFp4Operand && (hasUE4M3Scale || hasUE5M3Scale))
-      return failure();
     // mxf4 does not support MN-major operands, so mxfp4 x mxfp4 falls back to
     // mxf8f6f4 if either operand is not K-packed. The mxf8f6f4 shared-memory
     // packing format requires padding for every fp4 operand, even if the
@@ -1249,6 +1273,88 @@ public:
     decomposeMixedModeDotOp(m, computeCapability);
   }
 };
+
+namespace {
+// Why BlockedToMMA can't issue `dot` exactly on wgmma, or std::nullopt. Its
+// warps must sit on each dim's power-of-two part, as the mixed-radix layout
+// puts them; then exact issues no more atoms per warp than padded.
+std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
+  if (!llvm::isPowerOf2_64(dot.getA().getType().getShape().back()))
+    return std::string("NPOT K is not yet supported on wgmma");
+  ArrayRef<int64_t> shape = dot.getType().getShape();
+  auto instrShape = mmaVersionToInstrShape(
+      3, shape, dot.getA().getType().getElementType(), numWarps);
+  SmallVector<unsigned> warps =
+      to_vector(warpsPerTileV3(dot, shape, numWarps, instrShape));
+  if (!llvm::isPowerOf2_32(instrShape[1]) &&
+      !isMmaV3NpotNLegal(warps, instrShape))
+    return llvm::formatv(
+               "NPOT wgmma N {0} is not yet supported with {1} warpgroups on N",
+               instrShape[1], warps[1])
+        .str();
+  for (auto [dim, size] : llvm::enumerate(shape)) {
+    int64_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(size));
+    if (twoPart % (warps[dim] * LinearLayout::twoPartOf(instrShape[dim])) != 0)
+      return llvm::formatv("NPOT dot is not yet supported with {0} warps of "
+                           "{1} on dim {2}, whose power-of-two part is {3}",
+                           warps[dim], instrShape[dim], dim, twoPart)
+          .str();
+  }
+  // Ask the lowering's descriptor match about the B memdesc BlockedToMMA
+  // allocs. B's order isn't known yet: take the N-major order of a row-major
+  // load unless the dtype forces K-major.
+  RankedTensorType bTy = dot.getB().getType();
+  Type elemTy = dot.getA().getType().getElementType();
+  unsigned fast = elemTy.isF16() || elemTy.isBF16() ? 1 : 0;
+  MLIRContext *ctx = dot.getContext();
+  auto enc = NVMMASharedEncodingAttr::get(
+      ctx, bTy.getShape(), {fast, 1 - fast},
+      CGAEncodingAttr::get1CTALayout(ctx, bTy.getRank()), bTy.getElementType(),
+      /*fp4Padded=*/false);
+  auto memTy = MemDescType::get(bTy.getShape(), bTy.getElementType(), enc,
+                                SharedMemorySpaceAttr::get(ctx));
+  if (!nvidia_gpu::getMmaOperandSmemAttrs(memTy))
+    return llvm::formatv("NPOT wgmma N {0} is not yet supported: B's shared "
+                         "layout has no core-matrix form",
+                         shape[1])
+        .str();
+  return std::nullopt;
+}
+
+struct NvidiaNpotTargetLegality : public NpotTargetLegality {
+  using NpotTargetLegality::NpotTargetLegality;
+  StringRef getTargetPrefix() const override { return "cuda"; }
+  std::optional<std::string>
+  getDotUnsupportedReason(Operation *op, const LinearLayout &, StringRef target,
+                          int numWarps) const override {
+    // Exact only where BlockedToMMA picks wgmma; f64 takes FMA on some
+    // targets.
+    auto dot = dyn_cast<DotOp>(op);
+    int computeCapability = 0;
+    target.split(':').second.getAsInteger(10, computeCapability);
+    if (dot && computeCapability >= 80 &&
+        !dot.getA().getType().getElementType().isF64()) {
+      SmallVector<int> versions =
+          getMMAVersionsSupported(computeCapability, dot);
+      if (versions == SmallVector<int>{3, 2} && supportMMA(dot, 3, numWarps))
+        return getMmaUnsupportedReason(dot, numWarps);
+    }
+    return ("NPOT dot is not yet supported on " + target).str();
+  }
+  std::optional<std::string>
+  getAsyncCopyUnsupportedReason(Operation *, const LinearLayout &,
+                                StringRef) const override {
+    return std::nullopt;
+  }
+};
+} // namespace
+
+void registerNpotTargetLegality(DialectRegistry &registry) {
+  registry.addExtension(
+      +[](MLIRContext *, nvidia_gpu::TritonNvidiaGPUDialect *dialect) {
+        dialect->addInterfaces<NvidiaNpotTargetLegality>();
+      });
+}
 
 } // namespace gpu
 } // namespace triton

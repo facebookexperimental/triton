@@ -410,7 +410,7 @@ bool canInitializeAllocation(Value alloc) {
   auto allocType = cast<ttg::MemDescType>(alloc.getType());
   // A tensor cannot hold the NPOT tile of a shared pow2 alloc view.
   if (!isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace()))
-    return !ttg::isNpotPhysicalCover(allocType);
+    return !ttg::isNpotPow2AllocView(allocType);
   unsigned numWarps = ttg::lookupNumWarps(alloc.getDefiningOp());
   // There is no default tcgen05.ld/st layout for an NPOT TMEM tile, so, as for
   // a warp count that is not a multiple of 4, the allocation is not poisoned.
