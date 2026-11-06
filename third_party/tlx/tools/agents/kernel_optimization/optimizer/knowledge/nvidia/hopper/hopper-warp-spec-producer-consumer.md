@@ -29,7 +29,9 @@ Warp specialization requires a persistent kernel: a single 1D grid with `for til
 
 ## Size The Consumer Register Budget
 
-Pick the consumer `registers=` value from this table (Hopper warp-spec FA / GEMM):
+Choose how to size registers from the compiler version first. Triton 3.8 and older cannot set the default partition's budget explicitly, so the consumer budget there comes from the table below. On anything newer (Beta), never leave the default partition on leftover registers: set `num_regs=` explicitly on every partition, the default included, and calculate the values directly as described after the table.
+
+Pick the consumer `num_regs=` value from this table (Hopper warp-spec FA / GEMM, Triton 3.8 and older):
 
 | Family | Single consumer (`replicate=1`) | Pingpong consumer (`replicate=2`) |
 |---|---|---|
@@ -37,10 +39,10 @@ Pick the consumer `registers=` value from this table (Hopper warp-spec FA / GEMM
 | GEMM (GEMM-WS) | 232 | 232 |
 
 ```python
-with tlx.async_task(num_warps=4, replicate=2, registers=232):
+with tlx.async_task(num_warps=4, replicate=2, num_regs=232):
 ```
 
-Sanity-check the table against a per-thread lower bound — normalize warpgroup-wide accumulator storage by the consumer thread count before comparing with the per-thread `registers=` budget:
+Sanity-check the table against a per-thread lower bound — normalize warpgroup-wide accumulator storage by the consumer thread count before comparing with the per-thread `num_regs=` budget:
 
 ```
 per_thread_regs ~= (BLOCK_M_SPLIT * HEAD_DIM * acc_regs) / (consumer_num_warps * 32) + per_thread_softmax_overhead
@@ -48,7 +50,32 @@ per_thread_regs ~= (BLOCK_M_SPLIT * HEAD_DIM * acc_regs) / (consumer_num_warps *
 
 where `BLOCK_M_SPLIT = BLOCK_M / replicate`, `acc_regs` is 1 for fp32 (0.5 for fp16/bf16), and per-thread softmax overhead is ~16/24/40 regs for HEAD_DIM 64/128/256. If this lower bound exceeds the table default, the default under-budgets the consumer — raise it and audit for exotic accumulator dtype or softmax overhead. If the bound sits below the default, the default stands (it is a cap, not a prediction).
 
-Skip silently when the consumer `tlx.async_task` already carries an explicit `registers=` value; re-emitting a default over it is a no-op at best and an override at worst. The keyword is `registers=N`, not `num_regs=N`.
+Skip silently when the consumer `tlx.async_task` already carries an explicit `num_regs=` value; re-emitting a default over it is a no-op at best and an override at worst. Use the canonical keyword `num_regs=N` (`registers=N` is accepted as a compatibility alias).
+
+On Beta (newer than Triton 3.8), skip the table and calculate every partition's `num_regs=` directly:
+
+1. Start from full utilization of the register budget: give each explicit partition its calculated requirement, then assign the default partition the remainder of the per-CTA budget instead of accepting whatever is left over implicitly. State the arithmetic in the candidate so the split is auditable.
+2. Check the result in NCU before accepting it: read register spills and achieved occupancy together with the kernel's desired usage. If the kernel spills, trade registers back from the partition with slack; if it does not spill and occupancy leaves SMs idle, consider whether the freed budget lets an additional kernel run concurrently, and only keep the split when that concurrency is real.
+3. Persistent kernels are the exception: a statically persistent kernel already owns its SMs for the launch lifetime, so do not tune its register split for occupancy without a broader context (what else runs on the device, and whether concurrent kernels are even expected). Non-persistent kernels should tune for occupancy: their CTAs come and go, so headroom left on the table is occupancy another kernel could have used.
+
+## Partition Warps Around The Default Task
+
+Declare exactly one `tlx.async_task("default")`: it owns warps `[0, N)` with `N` = the `num_warps` from the kernel's autotune `triton.Config`. Explicit partitions add warps on top of the default, so always place the task that scales with warp count in the default — in this scaffold, the consumer — and size every explicit partition from its ops' warp minimums:
+
+- WGMMA: at least 4 warps (one warpgroup, 128 threads) per dot group.
+- TMA descriptor issue: 1 warp (single-thread issue; elect one thread).
+
+```python
+with tlx.async_tasks():  # num_warps=4 in the autotune config
+    with tlx.async_task("default"):  # consumer: 4 warps (one WGMMA group)
+        ...
+    with tlx.async_task(num_warps=1):  # producer: TMA issue only
+        ...
+```
+
+The default partition is always at least 4 warps: keep the autotune `num_warps` at or above the default task's minimum (a WGMMA default needs 4).
+
+Duplicate the default role with `replicate=N` on the default task: codegen keeps one default region and materializes N-1 additional partitions, each using the kernel config's `num_warps`, preserving `async_task_replica_id()` semantics. Reserve separate task bodies for roles that genuinely differ — do not copy the default body into explicit `async_task(num_warps=4)` blocks just to replicate it.
 
 ## Check The SMEM Precondition Before Rewriting
 
@@ -75,7 +102,7 @@ Scoping rules (violations are compile errors or silent corruption):
 - `tlx.local_alloc`, `tlx.alloc_barriers`, and constexprs go at kernel scope BEFORE `tlx.async_tasks()`.
 - Producer and consumer iterate tiles in identical order.
 
-The producer (default task) waits empty `phase ^ 1`, expects bytes, and issues `tlx.async_descriptor_load` per operand; the consumer waits full `phase`, computes, and arrives empty. Do not introduce TMA into a kernel that uses pointer loads — keep `tl.load` + `tlx.local_store` + `tlx.fence("async_shared")` + `barrier_arrive`.
+The producer waits empty `phase ^ 1`, expects bytes, and issues `tlx.async_descriptor_load` per operand; the consumer waits full `phase`, computes, and arrives empty. Do not introduce TMA into a kernel that uses pointer loads — keep `tl.load` + `tlx.local_store` + `tlx.fence("async_shared")` + `barrier_arrive`.
 
 ## Track Phase With Monotonic Counters
 
@@ -96,6 +123,8 @@ Producer and consumer advance identical counters. Resetting phase per tile deadl
 - SMEM overflow: shape stored into a buffer allocated for another shape.
 - Wrong results: producer/consumer tile-order mismatch.
 - Sharp regression at bit-exact output on a compute-saturated baseline: the gate misjudged — revert.
+- Undersized default: autotune `num_warps` below 4 starves a WGMMA default — raise `num_warps` to at least one warpgroup.
+- Copying the default body into explicit warp-group tasks to replicate it: duplicated work and lost `async_task_replica_id()` semantics — use `replicate=N` on the default task instead.
 
 ## Validate The Rewrite
 
