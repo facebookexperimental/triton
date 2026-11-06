@@ -277,7 +277,12 @@ def select_config(n, b=None, hq=None, hk=None, *, num_cus=None, packed_dq=True):
 
 
 def _compiler_options(config, n=None):
-    options = dict(num_warps=config.num_warps, num_stages=1, enable_fp_fusion=True, waves_per_eu=config.waves_per_eu)
+    # WORKAROUND: LLVM's MFMA anti-hints (llvm/llvm-project#218075) make the OCC1 kernels spill.
+    options = dict(num_warps=config.num_warps, num_stages=1, enable_fp_fusion=True, waves_per_eu=config.waves_per_eu,
+                   llvm_cl_opts=(("amdgpu-anti-hints", "false"), ))
+    if not config.occ1:
+        # WORKAROUND: the default gfx1250 scheduler spills one dV accumulator tile at 8 waves.
+        options["llvm_cl_opts"] += (("amdgpu-sched-strategy", "max-ilp"), )
     for name in ("sink_insts_to_avoid_spills", "reverse_local_assignment", "regclass_priority_trumps_globalness"):
         value = getattr(config, name)
         options[name] = config.regalloc if value is None else value
@@ -809,6 +814,9 @@ def _delayed_bwd_kernel(
             dq1 = _wmma(ds_band, k1, dq1, ORDERED)
         _dq_atomic(tl.cat(dq0, dq1, dim=1), DQA, step_stop - 1, SM_SCALE if PACKED_DQ else 1.0, 32, dq_mma, PACKED_DQ,
                    False, True, True)
+        # Keep the last dQ atomic's address math next to it; interleaving it
+        # with the dK/dV stores below keeps its lane base live at the VGPR peak.
+        tlx.amd_sched_barrier(0)
         dk = tl.cat(tl.cat(tl.cat(dks[0], dks[1], dim=0), tl.cat(dks[2], dks[3], dim=0), dim=1),
                     tl.cat(tl.cat(dks[4], dks[5], dim=0), tl.cat(dks[6], dks[7], dim=0), dim=1), dim=1)
         dv = tl.cat(tl.cat(tl.cat(dvs[0], dvs[1], dim=0), tl.cat(dvs[2], dvs[3], dim=0), dim=1),
