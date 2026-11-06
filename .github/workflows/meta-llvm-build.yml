@@ -67,18 +67,11 @@ jobs:
         shell: bash
         run: '[[ "$LLVM_REF" =~ ^[0-9a-f]{40}$ ]]'
 
-      - name: Checkout requested LLVM revision
-        uses: actions/checkout@v6.0.2
-        with:
-          repository: facebookexperimental/llvm-project
-          path: llvm-source
-          persist-credentials: false
-          ref: ${{ inputs.llvm_sha }}
-
       - name: Resolve commit
         id: revision
-        working-directory: llvm-source
         env:
+          GH_TOKEN: ${{ github.token }}
+          LLVM_REF: ${{ inputs.llvm_sha }}
           KIND: ${{ inputs.kind }}
           BUILD_NUMBER: ${{ inputs.build_number }}
         shell: bash
@@ -89,10 +82,12 @@ jobs:
             *) echo 'kind must be core or amd' >&2; exit 1 ;;
           esac
           [[ "$BUILD_NUMBER" =~ ^(0|[1-9][0-9]*)$ ]]
-          llvm_sha="$(git rev-parse HEAD)"
+          commit="$(gh api "repos/facebookexperimental/llvm-project/git/commits/${LLVM_REF}")"
+          llvm_sha="$(jq -r '.sha' <<< "$commit")"
+          [[ "$llvm_sha" == "$LLVM_REF" ]]
           {
             echo "llvm_sha=${llvm_sha}"
-            echo "llvm_tree=$(git rev-parse HEAD^{tree})"
+            echo "llvm_tree=$(jq -r '.tree.sha' <<< "$commit")"
             echo "short_sha=${llvm_sha:0:8}"
             echo "prefix=${prefix}"
           } >> "$GITHUB_OUTPUT"
