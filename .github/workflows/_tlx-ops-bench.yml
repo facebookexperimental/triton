@@ -88,6 +88,10 @@ jobs:
           wheel-url: ${{ inputs.wheel_url }}
           wheel-filename: ${{ inputs.wheel_filename }}
           wheel-sha256: ${{ inputs.wheel_sha256 }}
+      - name: Install shared benchmark harness
+        run: |
+          python -m pip install tabulate packaging
+          python python/test/tlx_benchmark/install_tritonbench.py
       - name: Run tlx.ops perf suite
         id: run_bench
         timeout-minutes: 120

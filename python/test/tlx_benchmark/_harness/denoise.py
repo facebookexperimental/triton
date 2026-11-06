@@ -705,117 +705,33 @@ def _amd_numa_node(index: int) -> Optional[int]:
     return None
 
 
-class Governor(contextlib.AbstractContextManager):
+def _management_index(device: Device) -> Optional[int]:
+    """The nvidia-smi/rocm-smi index `denoise.sh` governs; None if a sysfs-only GPU has no PCI match."""
+    if device.pci_bus is None:
+        return device.index
+    rows = (_rocm(["--showbus", "--csv"]) or "").splitlines()
+    fields = [line.split(",") for line in rows[1:]]
+    return next(
+        (int(f[0][4:])
+         for f in fields
+         if len(f) == 2 and f[0].startswith("card") and f[0][4:].isdigit() and f[1].strip().lower() == device.pci_bus),
+        None)
 
-    def __init__(self, device: Optional[Device], enable: bool = True):
-        self.device = device
-        self.enable = enable
-        self.applied: list[str] = []
-        self.skipped: list[str] = []
-        self._restore: list[list[str]] = []
-        self._affinity: Optional[set] = None
 
-    def _sudo(self, args: list[str]) -> bool:
-        try:
-            done = subprocess.run(["sudo", "-n", *args], capture_output=True, text=True, timeout=60)
-        except (subprocess.SubprocessError, OSError):
-            return False
-        return done.returncode == 0
+def ensure_denoised(device, argv=None):
+    """Restart the CLI under the canonical shell denoiser before CUDA initializes."""
+    import pathlib
+    import sys
 
-    def _govern_nvidia(self, d: Device):
-        state = gpu_state(d.uuid)
-        if self._sudo(["nvidia-smi", "-i", str(d.index), "-pm", "1"]):
-            self.applied.append("persistence mode")
-        else:
-            self.skipped.append("persistence mode (needs passwordless sudo)")
-            return  # no sudo: the rest will fail the same way
-
-        target = d.power_target_w
-        cap = state.max_power_limit_w
-        if target and cap:
-            watts = min(target, cap)
-            if self._sudo(["nvidia-smi", "-i", str(d.index), f"--power-limit={watts}"]):
-                self.applied.append(f"power cap {watts:.0f} W")
-                if state.power_limit_w:
-                    self._restore.append(["nvidia-smi", "-i", str(d.index), f"--power-limit={state.power_limit_w}"])
-
-        if state.max_sm_clock_mhz and self._sudo(
-            ["nvidia-smi", "-lgc", str(int(state.max_sm_clock_mhz)), "-i",
-             str(d.index)]):
-            # Measured on B200: this changes nothing for compute-bound work,
-            # which is power-governed well below the cap. Applied anyway because
-            # it does bind for smaller kernels, and recorded so the artifact is
-            # honest about what was attempted.
-            self.applied.append(f"clock lock {state.max_sm_clock_mhz:.0f} MHz")
-            self._restore.append(["nvidia-smi", "-rgc", "-i", str(d.index)])
-
-    def _govern_amd(self, d: Device):
-        index = d.index
-        if d.pci_bus is not None:
-            rows = (_rocm(["--showbus", "--csv"]) or "").splitlines()
-            fields = [line.split(",") for line in rows[1:]]
-            index = next(
-                (int(f[0][4:])
-                 for f in fields
-                 if len(f) == 2 and f[0].startswith("card") and f[0][4:].isdigit() and f[1].strip().lower() == d.pci_bus
-                 ), None)
-            if index is None:
-                self.skipped.append("AMD clock and power governing (management GPU mapping unavailable)")
-                return
-        target = d.power_target_w or 500
-        if self._sudo(["rocm-smi", "-d", str(index), "--setperfdeterminism", str(AMD_DETERMINISM_MHZ)]):
-            self.applied.append(f"perf determinism {AMD_DETERMINISM_MHZ} MHz")
-            self._restore.append(["rocm-smi", "-d", str(index), "--resetperfdeterminism"])
-        else:
-            self.skipped.append("perf determinism (needs passwordless sudo)")
-        if self._sudo(["rocm-smi", "-d", str(index), "--setpoweroverdrive", str(target)]):
-            self.applied.append(f"power cap {target} W")
-            self._restore.append(["rocm-smi", "-d", str(index), "--resetpoweroverdrive"])
-
-    def _bind_numa(self, d: Device):
-        if d.pci_bus is not None:
-            try:
-                node = int((Path(_PCI_DEVICES) / d.pci_bus / "numa_node").read_text())
-                node = node if node >= 0 else None
-            except (OSError, ValueError):
-                node = None
-        else:
-            node = _amd_numa_node(d.index) if d.vendor == AMD else numa_node(d.uuid)
-        if node is None:
-            self.skipped.append("NUMA binding (GPU-local node unknown)")
-            return
-        try:
-            with open(f"/sys/devices/system/node/node{node}/cpulist") as fh:
-                local = parse_cpulist(fh.read())
-            self._affinity = set(os.sched_getaffinity(0))
-            os.sched_setaffinity(0, local)
-        except (OSError, ValueError, AttributeError):
-            self.skipped.append(f"NUMA binding to node {node}")
-            return
-        # CPU affinity only; memory follows by first-touch, which is enough
-        # because every allocation here happens after this point.
-        self.applied.append(f"NUMA node {node} ({len(local)} CPUs)")
-
-    def __enter__(self):
-        if not self.enable or self.device is None:
-            self.skipped.append("all governing (disabled or no GPU)")
-            return self
-        if self.device.vendor == NVIDIA:
-            self._govern_nvidia(self.device)
-        else:
-            self._govern_amd(self.device)
-        self._bind_numa(self.device)
-        return self
-
-    def __exit__(self, *exc):
-        for args in reversed(self._restore):
-            self._sudo(args)
-        if self._affinity:
-            try:
-                os.sched_setaffinity(0, self._affinity)
-            except OSError:
-                pass
-        return False
-
-    def to_dict(self) -> dict:
-        return {"applied": list(self.applied), "skipped": list(self.skipped)}
+    if device is None or os.environ.get("TLX_DENOISED"):
+        return
+    script = pathlib.Path(__file__).resolve().parents[4] / "third_party/tlx/denoise.sh"
+    index = _management_index(device)
+    if index is None:
+        print("  denoise: SKIPPED (management GPU mapping unavailable)")
+        return
+    env = dict(os.environ)
+    env.pop("ROCR_VISIBLE_DEVICES", None)
+    env["HIP_VISIBLE_DEVICES" if device.vendor == AMD else "CUDA_VISIBLE_DEVICES"] = str(index)
+    args = sys.argv[1:] if argv is None else argv
+    os.execve("/bin/bash", ["bash", str(script), sys.executable, sys.argv[0], *args], env)

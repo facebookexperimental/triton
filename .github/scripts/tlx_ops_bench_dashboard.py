@@ -104,13 +104,14 @@ def summarize(args):
             "dtype": DTYPES.get(r["case"]["dtype"], r["case"]["dtype"]),
             "status": r["status"],
             "speedup": r.get("speedup"),
-            "tlx_tflops": (r.get("tlx") or {}).get("mean"),
-            "ref_tflops": (r.get("ref") or {}).get("mean"),
+            "tlx_tflops": (r.get("tlx") or {}).get("p50" if env.get("statistic") == "p50_latency" else "mean"),
+            "ref_tflops": (r.get("ref") or {}).get("p50" if env.get("statistic") == "p50_latency" else "mean"),
             "notes": r.get("notes", []),
         } for r in artifact["results"]]
         op = artifact["results"][0]["case"]["op"]
         ops[op] = {
-            "ref": env.get("ref"), "space": env.get("space"), "cold_compile": env.get("cold_compile"), "cases": cases
+            "ref": env.get("ref"), "space": env.get("space"), "cold_compile": env.get("cold_compile"), "statistic":
+            env.get("statistic", "mean_throughput"), "timing_scope": env.get("timing_scope"), "cases": cases
         }
     bench_ops = {f"test_op_perf[{script.removesuffix('.py')}]": op for op, script in BENCH_SCRIPT.items()}
     for path in sorted(glob.glob(os.path.join(args.dir, "**", "*.xml"), recursive=True)):
@@ -137,8 +138,10 @@ def summarize(args):
         "runtime": f"CUDA {env['cuda']}" if env.get("cuda") else (f"ROCm {rocm.group(1)}" if rocm else None),
         "triton": env.get("triton"),
         "governed": (env.get("governed") or {}).get("applied", []),
-        "timing": {k: env.get(k)
-                   for k in ("latency_mode", "replicates")},
+        "timing": {
+            k: env.get(k)
+            for k in ("latency_mode", "replicates", "statistic", "timing_scope", "warmup_iters", "sample_count")
+        },
         "ops": ops,
     }
     with open(args.out, "w") as fh:
@@ -314,7 +317,7 @@ def events(nights):
     """
     platform = nights[-1]["platform"]
     cases = [{name: {c["key"]: c for c in op["cases"]} for name, op in n["ops"].items()} for n in nights]
-    timed = lambda c: bool(c and c["status"] in MEASURED and c.get("tlx_tflops"))
+    timed = lambda c: bool(c and c["status"] in ("ok", "pip") and c.get("tlx_tflops"))
     out = []
     for i, night in enumerate(nights):
         entry = {
@@ -343,6 +346,15 @@ def events(nights):
                 entry["suite"][op] = suite
             if not both:
                 entry["breaks"].append(op)
+            old_policy = before["ops"].get(op, {}).get("statistic", "mean_throughput")
+            policy = night["ops"].get(op, {}).get("statistic", "mean_throughput")
+            old_scope = before["ops"].get(op, {}).get("timing_scope")
+            scope = night["ops"].get(op, {}).get("timing_scope")
+            if old_policy != policy or old_scope != scope:
+                entry["breaks"].append(op)
+                continue
+            if nxt is not None and nights[i + 1]["ops"][op].get("statistic", "mean_throughput") != policy:
+                nxt = None
             slower, faster = [], []
             for k in both:
                 x, y = a[k], b[k]

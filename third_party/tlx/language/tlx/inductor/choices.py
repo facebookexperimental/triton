@@ -178,11 +178,9 @@ class TLXInductorChoices(InductorChoices):
         kwarg_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> list[KernelTemplateChoice]:
         if config.triton.tlx_mode == "force":
-            tlx_choices = [
+            return [
                 c for uid, gen in template_choices.items() if "tlx_" in uid for c in gen
             ]
-            if tlx_choices:
-                return tlx_choices
 
         return super()._finalize_template_configs(
             template_choices, kernel_inputs, templates, op_name, kwarg_overrides

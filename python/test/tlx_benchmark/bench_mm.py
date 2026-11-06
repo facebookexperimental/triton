@@ -8,11 +8,11 @@ import sys
 import torch
 
 from triton.tlx.ops.kernels.mm._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, MMShape, flops, label, operand
+from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, MMShape, label
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from _harness import Case, Prepared, close_enough, driver  # noqa: E402
+from _harness import Case, driver  # noqa: E402
 
 OP = "mm"
 REF_NAME = "torch.matmul (hipBLASLt)" if torch.version.hip is not None else "torch.matmul"
@@ -102,30 +102,6 @@ def cases(synthetic: bool = False, suites=None) -> list[Case]:
             label=label(*entry),
         ) for entry in shapes(synthetic, suites)
     ]
-
-
-def prepare(case: Case, space: str) -> Prepared:
-    from triton.tlx.ops import mm as tlx_mm
-
-    if torch.version.hip is not None:
-        # Pin the production AMD matmul backend instead of inheriting a process-
-        # global preference that could silently switch the reference to rocBLAS.
-        torch.backends.cuda.preferred_blas_library("hipblaslt")
-
-    M, N, K, a_strides, b_strides = case.shape
-    dtype = getattr(torch, case.dtype)
-    a, b = operand(M, K, a_strides, dtype), operand(K, N, b_strides, dtype)
-    tlx_out = torch.empty((M, N), device=a.device, dtype=dtype)
-    ref_out = torch.empty_like(tlx_out)
-
-    tlx_fn = lambda: tlx_mm(a, b, out=tlx_out, space=space)  # noqa: E731
-    ref_fn = lambda: torch.matmul(a, b, out=ref_out)  # noqa: E731
-    return Prepared(
-        tlx_fn=tlx_fn,
-        ref_fn=ref_fn,
-        flop_count=flops(M, N, K),
-        check=lambda: close_enough(tlx_fn(), ref_fn(), REL_PRECISION[case.dtype]),
-    )
 
 
 supported, default_json, run, main = driver.bind(sys.modules[__name__])
