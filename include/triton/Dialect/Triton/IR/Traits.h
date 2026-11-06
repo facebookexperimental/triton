@@ -6,6 +6,9 @@
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Support/LogicalResult.h"
 #include "triton/Dialect/Triton/IR/Types.h"
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 
 namespace mlir {
 namespace OpTrait {
@@ -35,6 +38,34 @@ LogicalResult verifySameLoadStoreOperandsShape(Operation *op);
 
 LogicalResult verifySameLoadStoreOperandsAndResultShape(Operation *op);
 
+// NOT FOR COMMIT: counts and times the tensor-layout verifier, printed at exit.
+struct LayoutVerifyStats {
+  std::atomic<uint64_t> traitCalls{0}, traitNs{0}, checkCalls{0}, checkNs{0};
+  std::atomic<uint64_t> llCalls{0}, llNs{0};
+  ~LayoutVerifyStats() {
+    if (traitCalls)
+      fprintf(stderr,
+              "[layout-verify] verifyTensorLayouts: %llu calls, %.3f ms; "
+              "TritonGPU verifyTensorLayout: %llu calls, %.3f ms; "
+              "toLinearLayout: %llu calls, %.3f ms\n",
+              (unsigned long long)traitCalls.load(), traitNs.load() / 1e6,
+              (unsigned long long)checkCalls.load(), checkNs.load() / 1e6,
+              (unsigned long long)llCalls.load(), llNs.load() / 1e6);
+  }
+};
+inline LayoutVerifyStats layoutVerifyStats;
+
+struct ScopedNs {
+  std::atomic<uint64_t> &ns;
+  std::chrono::steady_clock::time_point start =
+      std::chrono::steady_clock::now();
+  ~ScopedNs() {
+    ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count();
+  }
+};
+
 } // namespace impl
 
 template <class ConcreteType>
@@ -52,6 +83,8 @@ class VerifyTensorLayoutsTrait
     : public TraitBase<ConcreteType, VerifyTensorLayoutsTrait> {
 public:
   static LogicalResult verifyTrait(Operation *op) {
+    impl::layoutVerifyStats.traitCalls++;
+    impl::ScopedNs timer{impl::layoutVerifyStats.traitNs};
     return impl::verifyTensorLayouts(op);
   }
 };

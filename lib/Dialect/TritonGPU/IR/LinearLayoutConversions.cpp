@@ -1376,6 +1376,9 @@ LinearLayout toLinearLayout(TensorOrMemDesc type) {
 // If you call this with a SharedMemoryEncodingAttr, you should call it
 // with the allocShape as the shape, otherwise the layout will be incorrect!
 LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout) {
+  mlir::OpTrait::impl::layoutVerifyStats.llCalls++;
+  mlir::OpTrait::impl::ScopedNs timer{
+      mlir::OpTrait::impl::layoutVerifyStats.llNs};
   auto *ctx = layout.getContext();
   return ctx->getLoadedDialect<TritonGPUDialect>()->toLinearLayout(shape,
                                                                    layout);
