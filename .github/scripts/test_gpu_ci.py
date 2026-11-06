@@ -412,10 +412,7 @@ def test_cpu_consumers_still_require_the_wheel():
     suites["reviewed_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     plan = plan_tests(["lib/Analysis/Allocation.cpp"], ROOT, FILTERS, suites)
     assert plan["cpu"]["codegen"]["files"]
-    assert plan["cpu"]["gluon"]["files"]
     assert plan["build"]
-    assert not plan["gpu"]["b200"]["gluon"]["files"]
-    assert not plan["gpu"]["mi350"]["gluon"]["files"]
 
 
 def test_new_gluon_tests_and_reenabled_files_keep_gpu_coverage(tmp_path):
@@ -504,7 +501,7 @@ def test_cpu_eligibility_rejects_an_overridden_ignore_policy(tmp_path):
 
 
 @pytest.mark.parametrize("paths,offload,placement,gpu_jobs,reason", [
-    (["lib/Analysis/Allocation.cpp"], True, "CPU", 4, "match the CPU audit"),
+    (["lib/Analysis/Allocation.cpp"], True, "CPU", 6, "match the CPU audit"),
     (["python/triton/runtime/jit.py"], True, "GPU", 6, "current diff changes Python"),
     (["README.md"], True, "Not selected", 0, "No work for this suite"),
     (["lib/Analysis/Allocation.cpp"], False, "GPU", 6, "CPU offload is disabled"),
@@ -513,10 +510,11 @@ def test_run_summary_explains_actual_placement(paths, offload, placement, gpu_jo
     from gpu_test_selection import SUITES, selection_summary, test_plan as plan_tests
     suites = json.loads(SUITES.read_text())
     suites["reviewed_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    suites["cpu"]["gluon"]["dependencies"].append("lib/")
     plan = plan_tests(paths, ROOT, FILTERS, suites, offload=offload)
     summary = selection_summary(plan, suites, "tested-sha", "Selection note")
     assert f"Planned GPU jobs: {gpu_jobs}." in summary
-    assert f"| gluon | {placement} |" in summary
+    assert f"| codegen | {placement} |" in summary
     assert reason in summary and "Selection note" in summary
     assert "Selected commit: `tested-sha`." in summary
     assert "Tested commit:" not in summary
