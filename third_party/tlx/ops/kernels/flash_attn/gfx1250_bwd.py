@@ -278,6 +278,9 @@ def select_config(n, b=None, hq=None, hk=None, *, num_cus=None, packed_dq=True):
 
 def _compiler_options(config, n=None):
     options = dict(num_warps=config.num_warps, num_stages=1, enable_fp_fusion=True, waves_per_eu=config.waves_per_eu)
+    if config.occ1:
+        # WORKAROUND: the pinned AMD LLVM's anti-hints make this kernel spill over 3 KB per lane to scratch.
+        options["llvm_cl_opts"] = (("amdgpu-anti-hints", "false"), )
     for name in ("sink_insts_to_avoid_spills", "reverse_local_assignment", "regclass_priority_trumps_globalness"):
         value = getattr(config, name)
         options[name] = config.regalloc if value is None else value
