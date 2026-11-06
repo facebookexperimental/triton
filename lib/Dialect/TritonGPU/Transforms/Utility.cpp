@@ -693,12 +693,23 @@ static bool isSingleValue(Value value) {
   return true;
 }
 
+// Besides Blocked, tt.scan lowers in place the mixed-radix layouts it allows;
+// any other layout keeps its convert.
+static bool isScanEncoding(triton::ScanOp scan, Attribute encoding) {
+  if (isa<triton::gpu::BlockedEncodingAttr>(encoding))
+    return true;
+  auto type = cast<RankedTensorType>(scan.getOperand(0).getType())
+                  .cloneWithEncoding(encoding);
+  return !triton::gpu::isRadix2Encoding(encoding) &&
+         triton::gpu::hasExactLayoutAt(type) &&
+         !scan.getMixedRadixUnsupportedReason(
+             triton::gpu::toLinearLayout(type));
+}
+
 static Attribute inferSrcEncodingAtAnyShape(Operation *op, Attribute encoding) {
-  if (isa<triton::ScanOp>(op)) {
-    // Scan only supports blocked encoding at the moment.
-    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+  if (auto scan = dyn_cast<triton::ScanOp>(op))
+    if (!isScanEncoding(scan, encoding))
       return {};
-  }
 
   if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
@@ -732,10 +743,9 @@ static Attribute inferSrcEncodingAtAnyShape(Operation *op, Attribute encoding) {
 }
 
 static Attribute inferDstEncodingAtAnyShape(Operation *op, Attribute encoding) {
-  if (isa<triton::ScanOp>(op)) {
-    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+  if (auto scan = dyn_cast<triton::ScanOp>(op))
+    if (!isScanEncoding(scan, encoding))
       return {};
-  }
   if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
 
