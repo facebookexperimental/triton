@@ -1725,32 +1725,38 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   } else if (isa<DescriptorLoadOp, DescriptorStoreOp>(op)) {
     SmallVector<int64_t> shape;
     Value coordVal;
+    unsigned coordOperandIdx;
     if (auto loadOp = dyn_cast<DescriptorLoadOp>(op)) {
       sliceOp(loadOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
       coordVal = loadOp.getIndices()[dim];
+      coordOperandIdx = loadOp.getIndicesMutable()[dim].getOperandNumber();
       shape = getShape(loadOp.getResult());
     } else if (auto storeOp = dyn_cast<DescriptorStoreOp>(op)) {
       sliceOp(storeOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
       coordVal = storeOp.getIndices()[dim];
+      coordOperandIdx = storeOp.getIndicesMutable()[dim].getOperandNumber();
       shape = getShape(storeOp.getSrc());
-    }
-    auto newCoordVal = coordVal;
-    if (offset) {
-      if (auto *defOp = coordVal.getDefiningOp())
-        builder.setInsertionPointAfter(defOp);
-      else
-        builder.setInsertionPoint(op);
-      Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
-      newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
-          op->getLoc(), coordVal, offsetVal);
-      mappings.map(coordVal, newCoordVal);
-      reverseMappings.map(newCoordVal, coordVal);
     }
 
     newOp = cloneAndSetResultType(op);
+    if (offset) {
+      // Set the shifted coordinate on the cloned op only. Mapping coordVal
+      // would leak the offset into every later op cloned for this partition
+      // (e.g. pointer indices built from the same scalar, whose make_range is
+      // already sliced) and into the other index of this op if it shares the
+      // same SSA value.
+      if (auto *defOp = coordVal.getDefiningOp())
+        builder.setInsertionPointAfter(defOp);
+      else
+        builder.setInsertionPoint(newOp);
+      Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
+      Value newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
+          op->getLoc(), coordVal, offsetVal);
+      newOp->setOperand(coordOperandIdx, newCoordVal);
+    }
     if (isa<DescriptorLoadOp>(op)) {
       // map load result
       auto v = op->getResult(0);
