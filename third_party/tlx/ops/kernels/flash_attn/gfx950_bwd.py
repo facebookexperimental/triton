@@ -5215,6 +5215,11 @@ def _uses_fused_dq_preprocess(shape, causal):
     return causal and shape in ((16, 64, 8, 1024, 128), (16, 16, 16, 4096, 128), (16, 16, 16, 16384, 128))
 
 
+def _disables_mfma_anti_hints(shape, causal):
+    # WORKAROUND: LLVM's MFMA anti-hints (llvm/llvm-project#218075) make these causal MHA kernels spill VGPRs.
+    return causal and shape in ((16, 16, 16, 4096, 128), (16, 16, 16, 16384, 128))
+
+
 def _is_causal_mha1k_owner_dispatch(shape, causal, dispatch):
     return (causal and shape == (16, 16, 16, 1024, 128) and dispatch.split_q == 1
             and dispatch.main_entry is _attn_bwd_dkdv_dq_d128_gqa_folded_kernel)
@@ -10443,6 +10448,8 @@ def _run_bwd_d128_gqa_optimized(
                 (hk, triton.cdiv(n_ctx, dispatch.block_n), batch * split_q))
     if dispatch.disable_unclustered_high_rp_reschedule:
         main_kwargs["disable_unclustered_high_rp_reschedule"] = True
+    if _disables_mfma_anti_hints((batch, hq, hk, n_ctx, head_dim), causal):
+        main_kwargs["llvm_cl_opts"] = (("amdgpu-anti-hints", "false"), )
     dispatch.main_entry[grid](
         q,
         k,
@@ -10597,12 +10604,12 @@ def _allocate_dq_tail_accumulator(q, dispatch):
 
 def _run_bwd_d128_gqa(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, causal, split_q=None, dq_tail_acc=None):
     dispatch = _select_d128_interleaved_dispatch(q.shape, k.shape, causal, split_q=split_q)
-    if dispatch.convert_entry is _attn_bwd_dq_native_tail_quarter_inplace_convert_kernel:
-        _validate_dq_tail_accumulator(q, dq_tail_acc)
     expected_shape = _d128_dq_accumulator_shape(q, dispatch)
     if (tuple(dq_acc.shape) != expected_shape or dq_acc.dtype != q.dtype or dq_acc.device != q.device
             or not dq_acc.is_contiguous()):
         raise ValueError("dQ accumulator shape, dtype, device, or strides do not match dispatch")
+    if dispatch.convert_entry is _attn_bwd_dq_native_tail_quarter_inplace_convert_kernel:
+        _validate_dq_tail_accumulator(q, dq_tail_acc)
     if dispatch.main_entry in (_attn_bwd_dkdv_dq_d128_gqa_optimized_kernel, _attn_bwd_dkdv_dq_d128_gqa_folded_kernel,
                                _attn_bwd_dkdv_dq_d128_gqa_bm32_kernel):
         return _run_bwd_d128_gqa_optimized(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, causal,
