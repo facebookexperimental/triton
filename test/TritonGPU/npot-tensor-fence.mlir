@@ -68,7 +68,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 #p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  // expected-error @+1 {{NPOT Product layout is not yet supported on tt.func}}
+  // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.func}}
   tt.func @product_arg(%x: tensor<96xf32, #p96>) {
     // OFF: [[@LINE+1]]:10: error: Operand 0 {{.*}} has an invalid layout: Layout has shape 96, but the tensor it's attached to has shape 96 which is not a power of two.
     %c = ttg.convert_layout %x : tensor<96xf32, #p96> -> tensor<96xf32, #p96>
@@ -83,7 +83,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @product_scan() {
     %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
-    // expected-error @+1 {{NPOT Product layout is not yet supported on tt.scan}}
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.scan}}
     %s = "tt.scan"(%r) <{axis = 0 : i32, reverse = false}> ({
     ^bb0(%a: i32, %b: i32):
       %t = arith.addi %a, %b : i32
@@ -125,7 +125,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.print ": " {hex = false, isSigned = array<i32: 1>} : %x : tensor<96xi32, #p96>
     %pos = arith.cmpi sge, %x, %r : tensor<96xi32, #p96>
     tt.assert %pos, "x >= r" : tensor<96xi1, #p96>
-    // expected-error @+1 {{NPOT Product layout is not yet supported on tt.histogram}}
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.histogram}}
     %h = tt.histogram %x : tensor<96xi32, #p96> -> tensor<16xi32, #b>
     cf.br ^bb2
   ^bb2:
@@ -202,7 +202,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #w96 = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16]], warp = [[32]], block = [], inputRadices = {register = [], lane = [2, 2, 2, 2, 2], warp = [3], block = []}, outDimSizes = [96]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 3 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @product_odd_warp() {
-    // expected-error @+1 {{NPOT Product layout with a non-binary warp digit is not yet supported}}
+    // expected-error @+1 {{NPOT mixed-radix layout with a non-binary warp digit is not yet supported}}
     %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #w96>
     tt.return
   }
@@ -214,7 +214,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 3 : i32, ttg.targ
 #big = #ttg.linear<{register = [[8]], lane = [[1], [2], [4], [0], [0]], warp = [], block = [], inputRadices = {register = [65537], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [524296]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @product_odd_part_above_65535() {
-    // expected-error @+1 {{NPOT Product layout with an odd part above 65535 is not yet supported}}
+    // expected-error @+1 {{NPOT mixed-radix layout with an odd part above 65535 is not yet supported}}
     %r = tt.make_range {end = 524296 : i32, start = 0 : i32} : tensor<524296xi32, #big>
     tt.return
   }
@@ -225,7 +225,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [[0]], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = [2]}, outDimSizes = [96]}>
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @product_two_ctas() {
-    // expected-error @+1 {{NPOT Product layout across CTAs is not yet supported}}
+    // expected-error @+1 {{NPOT mixed-radix layout across CTAs is not yet supported}}
     %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
     tt.return
   }
@@ -239,7 +239,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @product_to_cross_cta() {
     %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
-    // expected-error @+1 {{NPOT Product conversion with a non-singleton block input in the destination layout is not yet supported}}
+    // expected-error @+1 {{NPOT mixed-radix conversion with a non-singleton block input in the destination layout is not yet supported}}
     %c = ttg.convert_layout %r : tensor<96xi32, #p96> -> tensor<96xi32, #q96>
     tt.return
   }
@@ -266,7 +266,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @product_shared_force_warp_shuffle() {
     %r = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #src>
-    // expected-error @+1 {{NPOT Product conversion through shared memory is not yet supported with force_warp_shuffle}}
+    // expected-error @+1 {{NPOT mixed-radix conversion through shared memory is not yet supported with force_warp_shuffle}}
     %c = ttg.convert_layout %r {force_warp_shuffle} : tensor<192xi32, #src> -> tensor<192xi32, #dst>
     tt.return
   }

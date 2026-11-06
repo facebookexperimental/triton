@@ -1,10 +1,10 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad='num-warps=4' -verify-diagnostics | FileCheck %s
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad='num-warps=8' -verify-diagnostics | FileCheck %s --check-prefix=W8
 
-// The matmul index idiom: the N-248 index values ride the B/C tiles, so tiles
-// alone decide the connected component and it stays exact at 4 warps. At 8
-// warps the B tile's standalone charge doubles and the connected component
-// pads.
+// The matmul index idiom: the N-248 index values take the B/C tiles' layout, so
+// tiles alone decide the connected component and it stays exact at 4 warps. At
+// 8 warps the B tile's total in-dim size on its own doubles and the connected
+// component pads.
 // CHECK-LABEL: @matmul_index_248
 // W8-LABEL: @matmul_index_248
 module {

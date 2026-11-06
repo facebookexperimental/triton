@@ -116,7 +116,7 @@ LinearLayout::tryCreate(BasesT bases,
                         bool requireSurjective) {
   LinearLayout ll(std::move(bases), outDims, NoCheckInvariants{});
   std::optional<std::string> error =
-      ll.checkInvariants(requireSurjective, /*allowProductSizes=*/false);
+      ll.checkInvariants(requireSurjective, /*allowMixedRadixSizes=*/false);
   if (error) {
     return std::nullopt;
   }
@@ -130,7 +130,7 @@ LinearLayout::tryCreate(BasesT bases, RadicesT inputRadices,
   LinearLayout ll(std::move(bases), std::move(inputRadices), outDims,
                   NoCheckInvariants{});
   std::optional<std::string> error =
-      ll.checkInvariants(requireSurjective, /*allowProductSizes=*/true);
+      ll.checkInvariants(requireSurjective, /*allowMixedRadixSizes=*/true);
   if (error) {
     if (diagnostic)
       *diagnostic = *error;
@@ -172,8 +172,8 @@ LinearLayout::LinearLayout(BasesT bases, ArrayRef<StringAttr> outDimNames)
     }
   }
 
-  std::optional<std::string> error =
-      checkInvariants(/*requireSurjective=*/true, /*allowProductSizes=*/false);
+  std::optional<std::string> error = checkInvariants(
+      /*requireSurjective=*/true, /*allowMixedRadixSizes=*/false);
   if (error.has_value()) {
     llvm::report_fatal_error(StringRef(*error));
   }
@@ -184,7 +184,7 @@ LinearLayout::LinearLayout(BasesT bases,
                            bool requireSurjective)
     : LinearLayout(std::move(bases), outDims, NoCheckInvariants{}) {
   std::optional<std::string> error =
-      checkInvariants(requireSurjective, /*allowProductSizes=*/false);
+      checkInvariants(requireSurjective, /*allowMixedRadixSizes=*/false);
   if (error.has_value()) {
     llvm::report_fatal_error(StringRef(*error));
   }
@@ -196,7 +196,7 @@ LinearLayout::LinearLayout(BasesT bases, RadicesT inputRadices,
     : LinearLayout(std::move(bases), std::move(inputRadices), outDims,
                    NoCheckInvariants{}) {
   std::optional<std::string> error =
-      checkInvariants(requireSurjective, /*allowProductSizes=*/true);
+      checkInvariants(requireSurjective, /*allowMixedRadixSizes=*/true);
   if (error.has_value()) {
     llvm::report_fatal_error(StringRef(*error));
   }
@@ -210,7 +210,7 @@ LinearLayout::BasisContribution
 LinearLayout::getBasisContribution(StringAttr inDim, int32_t pos,
                                    StringAttr outDim) const {
   int32_t basis = getBasis(inDim, pos, outDim);
-  if (isProductOutDim(outDim)) {
+  if (isMixedRadixOutDim(outDim)) {
     int32_t twoPart = twoPartOf(getOutDimSize(outDim));
     return {basis % twoPart, basis / twoPart};
   }
@@ -234,10 +234,10 @@ LinearLayout LinearLayout::binaryPart() const {
                       /*requireSurjective=*/false);
 }
 
-int32_t LinearLayout::getProductCodomainRank() const {
+int32_t LinearLayout::getMixedRadixCodomainRank() const {
   int32_t result = 0;
   for (auto [outDim, size] : outDims) {
-    if (isProductOutDim(outDim))
+    if (isMixedRadixOutDim(outDim))
       result += llvm::countr_zero(static_cast<uint32_t>(size)) + 1;
     else
       result += llvm::Log2_32(size);
@@ -245,7 +245,7 @@ int32_t LinearLayout::getProductCodomainRank() const {
   return result;
 }
 
-std::optional<std::string> LinearLayout::checkProductCarriers() const {
+std::optional<std::string> LinearLayout::checkMixedRadixOutDims() const {
   // Radix-2 digits touch only binary parts, and each odd part has at most one
   // non-binary digit, which permutes it.
   SmallVector<StringAttr> outDimNames = llvm::to_vector(getOutDimNames());
@@ -258,13 +258,13 @@ std::optional<std::string> LinearLayout::checkProductCarriers() const {
         auto [binary, odd] = getBasisContribution(inDim, digit, outDim);
         if (radix == 2) {
           if (odd != 0)
-            return "invalid radix-2 digit: it has an odd Product "
+            return "invalid radix-2 digit: it has an odd mixed-radix "
                    "contribution:" +
                    toString();
           continue;
         }
         if (binary != 0)
-          return "invalid non-binary digit: it has a binary Product "
+          return "invalid non-binary digit: it has a binary mixed-radix "
                  "contribution:" +
                  toString();
         if (odd == 0)
@@ -284,7 +284,7 @@ std::optional<std::string> LinearLayout::checkProductCarriers() const {
   return std::nullopt;
 }
 
-int32_t LinearLayout::getProductRank() const {
+int32_t LinearLayout::getMixedRadixRank() const {
   int32_t ownedOddCoordinates = 0;
   for (const auto &[inDim, inDimBases] : bases) {
     for (auto [digit, basis] : llvm::enumerate(inDimBases)) {
@@ -297,7 +297,8 @@ int32_t LinearLayout::getProductRank() const {
 }
 
 std::optional<std::string>
-LinearLayout::checkInvariants(bool requireSurjective, bool allowProductSizes) {
+LinearLayout::checkInvariants(bool requireSurjective,
+                              bool allowMixedRadixSizes) {
   // Check that basis values are non-negative.
   for (const auto &[inDim, inDimBases] : bases) {
     for (const auto &basis : inDimBases) {
@@ -325,12 +326,12 @@ LinearLayout::checkInvariants(bool requireSurjective, bool allowProductSizes) {
 
   // Check that the out-dim sizes are powers of 2. The radices constructor and
   // its tryCreate allow any positive size, even with empty radices; a size
-  // that is not a power of 2 makes a Product output.
+  // that is not a power of 2 makes a mixed-radix output.
   for (const auto &[outDim, size] : outDims) {
-    if (allowProductSizes ? size <= 0 : !llvm::isPowerOf2_32(size)) {
+    if (allowMixedRadixSizes ? size <= 0 : !llvm::isPowerOf2_32(size)) {
       return "Invalid out-dim size " + std::to_string(size) + " for out-dim '" +
              outDim.str() + "'.  Out-dim sizes must be " +
-             (allowProductSizes ? "positive" : "powers of 2") + ".\n";
+             (allowMixedRadixSizes ? "positive" : "powers of 2") + ".\n";
     }
   }
 
@@ -361,10 +362,10 @@ LinearLayout::checkInvariants(bool requireSurjective, bool allowProductSizes) {
   // the rank of our matrix using Gaussian elimination, which runs in O(n^3)
   // for an n x n matrix.  Our matrix size is sum(inDimSizeLog2) x
   // sum(outDimSizeLog2), so this should be plenty fast.
-  if (hasNonBinaryCarrier()) {
-    if (std::optional<std::string> error = checkProductCarriers())
+  if (hasNonPow2OutDim()) {
+    if (std::optional<std::string> error = checkMixedRadixOutDims())
       return error;
-    this->rank = getProductRank();
+    this->rank = getMixedRadixRank();
   } else {
     this->rank =
         getMatrixRank(getMatrix(*this), /*numRows=*/getTotalOutDimSizeLog2(),
@@ -455,7 +456,7 @@ int32_t LinearLayout::getTotalInDimSize() const {
 }
 
 bool LinearLayout::isRadix2() const {
-  return !hasNonBinaryCarrier() &&
+  return !hasNonPow2OutDim() &&
          llvm::all_of(inputRadices, [](const auto &dimAndRadices) {
            return llvm::all_of(dimAndRadices.second,
                                [](int32_t radix) { return radix == 2; });
@@ -480,7 +481,7 @@ std::optional<std::string> LinearLayout::checkInputRadices() const {
       if (radix != 2 &&
           llvm::any_of(llvm::zip(basis, getOutDimNames()), [&](auto entry) {
             return std::get<0>(entry) != 0 &&
-                   !isProductOutDim(std::get<1>(entry));
+                   !isMixedRadixOutDim(std::get<1>(entry));
           }))
         return "invalid input digit of radix " + std::to_string(radix) +
                " in in-dim '" + inDim.str() +
@@ -528,7 +529,7 @@ int32_t LinearLayout::getTotalOutDimSizeLog2() const {
 }
 
 int32_t LinearLayout::getNumConsecutiveInOut() const {
-  assert(!hasNonBinaryCarrier());
+  assert(!hasNonPow2OutDim());
   if (bases.empty() || getNumOutDims() == 0)
     return 1;
   // Count how many of the initial bases for the first in-dim are
@@ -1015,8 +1016,8 @@ LinearLayout operator*(LinearLayout inner, LinearLayout outer) {
       auto [outDimName, outDimSize] = outDimNameAndSize;
       int32_t innerSize =
           inner.hasOutDim(outDimName) ? inner.getOutDimSize(outDimName) : 1;
-      // On a Product output, outer digits land above inner's binary part and
-      // inner's odd part moves above them.
+      // On a mixed-radix output, outer digits land above inner's binary part
+      // and inner's odd part moves above them.
       int32_t innerTwoPart = LinearLayout::twoPartOf(innerSize);
       if (inner.hasInDim(inDimName) && inner.hasOutDim(outDimName)) {
         for (int i = 0; i < inner.getInDimSizeLog2(inDimName); i++) {
@@ -1478,7 +1479,7 @@ LinearLayout LinearLayout::squeezeOuts(StringAttr dim) const {
 
 llvm::MapVector<StringAttr, int32_t>
 LinearLayout::getFreeVariableMasks() const {
-  if (hasNonBinaryCarrier()) {
+  if (hasNonPow2OutDim()) {
     // Mask bits are digit positions. The binary part frees radix-2 digits and
     // zero non-binary digits; a digit owning an odd coordinate is not free.
     llvm::MapVector<StringAttr, int32_t> ret =
@@ -1607,7 +1608,8 @@ bool LinearLayout::equalIgnoringOutDimSizes(const LinearLayout &other) const {
   }
   if (!llvm::equal(inputRadices, other.inputRadices))
     return false;
-  // A Product output reads its bases against its size's power-of-two factor.
+  // A mixed-radix output reads its bases against its size's power-of-two
+  // factor.
   return llvm::all_of(llvm::zip(outDims, other.outDims), [](auto dims) {
     int32_t size = std::get<0>(dims).second;
     int32_t otherSize = std::get<1>(dims).second;
@@ -1667,7 +1669,10 @@ std::string LinearLayout::toString() const {
 
 LinearLayout ColumnAction::apply(const LinearLayout &layout) const {
   assert(layout.hasInDim(inDim));
-  assert(isRadix2() && layout.isRadix2());
+  assert((isRadix2()
+              ? layout.getNumLeadingRadix2Digits(inDim) == inSizeLog2
+              : llvm::equal(inputRadices, layout.getInputRadices(inDim))) &&
+         "Layout has different radices than the ColumnAction");
   assert(layout.getInDimSizeLog2(inDim) == inSizeLog2 &&
          "Layout has a different size than the ColumnAction");
   if (m_isIdentity) {
@@ -1675,19 +1680,24 @@ LinearLayout ColumnAction::apply(const LinearLayout &layout) const {
   }
 
   auto bases = layout.getBases();
+  auto radices = layout.getInputRadices();
   const auto &basesInDim = bases[inDim];
+  const auto &radicesInDim = radices[inDim];
   std::vector<std::vector<int32_t>> newBases;
+  std::vector<int32_t> newRadices;
   newBases.reserve(action.size());
   for (size_t a : action) {
     newBases.push_back(basesInDim[a]);
+    newRadices.push_back(radicesInDim[a]);
   }
   bases[inDim] = std::move(newBases);
+  radices[inDim] = std::move(newRadices);
 
   SmallVector<std::pair<StringAttr, int32_t>> outDims;
   for (auto outDim : layout.getOutDimNames()) {
     outDims.emplace_back(outDim, layout.getOutDimSize(outDim));
   }
-  return LinearLayout(std::move(bases), std::move(outDims),
+  return LinearLayout(std::move(bases), std::move(radices), std::move(outDims),
                       /*requireSurjective=*/false);
 }
 
@@ -1744,12 +1754,15 @@ ColumnAction ColumnAction::leftCompose(const ColumnAction &other) const {
 }
 
 ColumnAction ColumnAction::inverse() const {
-  assert(isRadix2());
   auto invPerm = SmallVector<size_t>(action.size());
   for (size_t i = 0; i < action.size(); i++) {
     invPerm[action[i]] = i;
   }
-  return ColumnAction(invPerm, inDim, inSizeLog2);
+  // The inverse acts on the permuted digits, so it takes their radices.
+  SmallVector<int32_t> invRadices;
+  for (size_t a : inputRadices.empty() ? ArrayRef<size_t>() : action)
+    invRadices.push_back(inputRadices[a]);
+  return ColumnAction(invPerm, inDim, inSizeLog2, invRadices);
 }
 
 std::string ColumnAction::toString() const {
