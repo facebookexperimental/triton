@@ -19,7 +19,6 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.language.core import _aggregate as aggregate
 from triton.language.extra.libdevice import fast_dividef
 from triton.runtime import driver
 
@@ -44,6 +43,7 @@ PIPE_STAGES = 4
 # Fixed cost of a q tile, in KV blocks, when the cost space charges one (see `_phantom`).
 PHANTOM_BLOCKS = 3
 LOG2E: tl.constexpr = tl.constexpr(1.4426950408889634)
+EAGER_PROBABILITY_FRAGMENTS = 5
 _VGPR_ONLY = (("amdgpu-agpr-alloc", "0,0"), )
 
 
@@ -123,9 +123,14 @@ def _qk_pieces(q, kt):
 # while the full-tile multiply shrinks to one multiply per row.
 
 
-@aggregate
+@triton.aggregate
 class LazySoftmaxFragments:
-    """A score tile as eight N8 fragments, with a leading probability prefix."""
+    """Eight N8 fragments with a probability prefix and a deferred score suffix.
+
+    The first ``EAGER_PROBABILITY_FRAGMENTS`` fields are probabilities. The
+    remaining fields are still score fragments and are completed by
+    ``_finish_probability_fragments`` in the next pipeline stage.
+    """
     f0: tl.tensor
     f1: tl.tensor
     f2: tl.tensor
@@ -146,8 +151,8 @@ def _maybe_exp_fragment(x, m_i, QK_SCALE: tl.constexpr, FORM_PROBABILITY: tl.con
 
 
 @triton.jit
-def _vec1_lazy_exp_fragments(state, qk, QK_SCALE: tl.constexpr, NUM_PROB_FRAGMENTS: tl.constexpr):
-    """Split the score tile and form probabilities for its leading fragments."""
+def _start_probability_fragments(state, qk, QK_SCALE: tl.constexpr, NUM_PROB_FRAGMENTS: tl.constexpr):
+    """Form the leading probability fragments and carry the remaining score fragments unexponentiated."""
     qk = tlx.require_layout(qk, _mma(), pin=True)
     qk_a, qk_b, qk_c, qk_d = _chunks(qk)
     qk_0, qk_1 = _split_cols(qk_a)
@@ -168,23 +173,24 @@ def _vec1_lazy_exp_fragments(state, qk, QK_SCALE: tl.constexpr, NUM_PROB_FRAGMEN
 
 
 @triton.jit
-def _vec2_lazy_split(state, fr, QK_SCALE: tl.constexpr, out_dtype: tl.constexpr, NUM_PROB_FRAGMENTS: tl.constexpr):
+def _finish_probability_fragments(state, probability_carry, QK_SCALE: tl.constexpr, out_dtype: tl.constexpr,
+                                  NUM_PROB_FRAGMENTS: tl.constexpr):
     """Finish deferred probabilities, cast the tile, and update its row sum."""
     m_i = tlx.release_layout(state.m_i)[:, None]
-    p_0 = _maybe_exp_fragment(fr.f0, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 0)
-    p_1 = _maybe_exp_fragment(fr.f1, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 1)
-    p_2 = _maybe_exp_fragment(fr.f2, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 2)
-    p_3 = _maybe_exp_fragment(fr.f3, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 3)
-    p_4 = _maybe_exp_fragment(fr.f4, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 4)
-    p_5 = _maybe_exp_fragment(fr.f5, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 5)
-    p_6 = _maybe_exp_fragment(fr.f6, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 6)
-    p_7 = _maybe_exp_fragment(fr.f7, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 7)
+    p_0 = _maybe_exp_fragment(probability_carry.f0, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 0)
+    p_1 = _maybe_exp_fragment(probability_carry.f1, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 1)
+    p_2 = _maybe_exp_fragment(probability_carry.f2, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 2)
+    p_3 = _maybe_exp_fragment(probability_carry.f3, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 3)
+    p_4 = _maybe_exp_fragment(probability_carry.f4, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 4)
+    p_5 = _maybe_exp_fragment(probability_carry.f5, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 5)
+    p_6 = _maybe_exp_fragment(probability_carry.f6, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 6)
+    p_7 = _maybe_exp_fragment(probability_carry.f7, m_i, QK_SCALE, NUM_PROB_FRAGMENTS <= 7)
     p = _unchunk(_concat_cols(p_0, p_1), _concat_cols(p_2, p_3), _concat_cols(p_4, p_5), _concat_cols(p_6, p_7))
     return SoftmaxState(state.acc, state.l_i + tl.sum(p, 1), state.m_i), p.to(out_dtype)
 
 
 @triton.jit
-def _vec1_lazy_max(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
+def _update_softmax_max(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
     if QK_SCALE > 0:
         m_ij = SoftmaxState._row_max(qk) * QK_SCALE
     else:
@@ -196,14 +202,15 @@ def _vec1_lazy_max(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.cons
 
 
 @triton.jit
-def _vec1_lazy_split(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
-    state, score_delta, advance = _vec1_lazy_max(state, qk, QK_SCALE, RESCALE_THRESHOLD)
-    return state, _vec1_lazy_exp_fragments(state, qk, QK_SCALE, 5), score_delta, advance
+def _start_softmax_tile(state, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
+    state, score_delta, advance = _update_softmax_max(state, qk, QK_SCALE, RESCALE_THRESHOLD)
+    return state, _start_probability_fragments(state, qk, QK_SCALE, EAGER_PROBABILITY_FRAGMENTS), score_delta, advance
 
 
 @triton.jit
-def _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
-    """`_attn_dot_pv_vec1_lazy` (BM256, split VEC1) with the cheaper row max."""
+def _pv_and_start_probability_fragments(state, p_dot, v_dot, qk, QK_SCALE: tl.constexpr,
+                                        RESCALE_THRESHOLD: tl.constexpr):
+    """Compute PV while starting the probability carry for the current QK tile."""
     tl.static_assert(state.acc.shape[0] == 256)
     mma: tl.constexpr = _mma()
     p_dot = tlx.require_layout(p_dot, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
@@ -218,12 +225,12 @@ def _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE: tl.constexpr, RESC
     v2 = tlx.extract_slice(v_dot, [16, v_dot.shape[1]], [32, 0])
     v3 = tlx.extract_slice(v_dot, [16, v_dot.shape[1]], [48, 0])
     acc = tl.dot(p0, v0, acc)
-    max_state, score_delta, advance = _vec1_lazy_max(state, qk, QK_SCALE, RESCALE_THRESHOLD)
+    max_state, score_delta, advance = _update_softmax_max(state, qk, QK_SCALE, RESCALE_THRESHOLD)
     acc = tl.dot(p1, v1, acc)
     acc = tl.dot(p2, v2, acc)
     acc = tl.dot(p3, v3, acc)
     state = SoftmaxState(acc, state.l_i, max_state.m_i)
-    return state, _vec1_lazy_exp_fragments(state, qk, QK_SCALE, 5), score_delta, advance
+    return state, _start_probability_fragments(state, qk, QK_SCALE, EAGER_PROBABILITY_FRAGMENTS), score_delta, advance
 
 
 @triton.jit
@@ -233,11 +240,12 @@ def _anchor_vgpr(x):
 
 
 @triton.jit
-def _anchor_probability_fragments(fr):
-    """Anchor the probabilities formed in a PV stage, so LLVM cannot sink them, as loop-carried values, past the
-    rescale branch into the next stage."""
-    return LazySoftmaxFragments(_anchor_vgpr(fr.f0), _anchor_vgpr(fr.f1), _anchor_vgpr(fr.f2), _anchor_vgpr(fr.f3),
-                                _anchor_vgpr(fr.f4), fr.f5, fr.f6, fr.f7)
+def _anchor_probability_carry(probability_carry):
+    """Keep the computed probability prefix in this pipeline stage."""
+    return LazySoftmaxFragments(_anchor_vgpr(probability_carry.f0), _anchor_vgpr(probability_carry.f1),
+                                _anchor_vgpr(probability_carry.f2), _anchor_vgpr(probability_carry.f3),
+                                _anchor_vgpr(probability_carry.f4), probability_carry.f5, probability_carry.f6,
+                                probability_carry.f7)
 
 
 @triton.jit
@@ -250,39 +258,46 @@ def _schedule_softmax_mfma_valu(SYNC_ID: tl.constexpr):
 
 
 @triton.jit
-def _softmax_lazy_pipeline_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn, stride_vn,
-                                QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr,
+def _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
+                                stride_vn, QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr,
                                 NEXT_SLOT: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
-    """`_attn_inner_pipelined_lazy_step` (split VEC1, PV-woven VEC1) with the cheaper row max, and fp32 row sums
-    for fp16 as well as bf16."""
+    """One steady-state QK/PV step with the probability carry one block behind QK."""
+    # dot1: compute the next QK and finish the deferred probability fragments from the prior QK.
     with tlx.warp_pipeline_stage("dot1"):
         qk = _qk_pieces(q, kt_dot)
-        state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
+        state, probability_tile = _finish_probability_fragments(state, probability_carry, QK_SCALE, q.dtype,
+                                                                EAGER_PROBABILITY_FRAGMENTS)
         _schedule_softmax_mfma_valu(1)
     tlx.async_load_wait_group(1)
+    # mem1: read V for the completed probability tile and prefetch the next K tile.
     with tlx.warp_pipeline_stage("mem1"):
         v_dot = tlx.local_load(tlx.local_view(v_buf, CUR_SLOT), relaxed=True)
         tok_k = tlx.async_load(k_ptrs + (block_n + 3) * BLOCK_N * stride_kn, tlx.local_view(k_buf, NEXT_SLOT))
         tlx.async_load_commit_group([tok_k])
+    # dot2: compute PV for the prior QK while starting the probability carry for qk_tile.
     with tlx.warp_pipeline_stage("dot2"):
-        state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
-        p_c = _anchor_probability_fragments(p_c)
+        state, probability_carry, score_delta, max_advance = _pv_and_start_probability_fragments(
+            state, probability_tile, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+        probability_carry = _anchor_probability_carry(probability_carry)
         _schedule_softmax_mfma_valu(2)
     tlx.async_load_wait_group(1)
+    # mem2: prepare the next K/V operands and rescale the running softmax state.
     with tlx.warp_pipeline_stage("mem2"):
         kt_dot = _kt_pieces(k_buf, CUR_SLOT)
         tok_v = tlx.async_load(v_ptrs + (block_n + 2) * BLOCK_N * stride_vn, tlx.local_view(v_buf, CUR_SLOT))
         tlx.async_load_commit_group([tok_v])
-        state = state.rescale_lazy(delta_c, advance_c)
-    return state, p_c, kt_dot
+        state = state.rescale_lazy(score_delta, max_advance)
+    return state, probability_carry, kt_dot
 
 
 @triton.jit
 def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_kn, stride_vn,
                        QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
-    """Lazy-rescale pipeline over `n_blocks` (>= PIPE_STAGES, odd) unmasked KV blocks, with Q's copy the oldest
-    outstanding group. Returns the state and Q."""
-    # A commit group is every copy issued since the previous commit, whatever tokens it is given.
+    """Lazy-rescale pipeline over an odd `n_blocks` (at least three) of unmasked KV blocks.
+
+    The caller uses ``PIPE_STAGES`` as the threshold for entering this path; an
+    even block count is rounded down to the preceding odd count.
+    """
     tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k0])
     tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0))
@@ -294,7 +309,7 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     q = tlx.local_load(tlx.local_view(q_buf, 0), token=wait0)
     kt0 = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 0)), token=wait0, relaxed=True)
     qk = tl.dot(q, kt0)
-    state, p_c, _, _ = _vec1_lazy_split(state, qk, QK_SCALE, RESCALE_THRESHOLD)
+    state, probability_carry, _, _ = _start_softmax_tile(state, qk, QK_SCALE, RESCALE_THRESHOLD)
     # The first frame starts from an empty accumulator, so its correction is a zero denominator.
     state = SoftmaxState(state.acc, tl.zeros([q.shape[0]], tl.float32), state.m_i)
     tl.debug_barrier()
@@ -308,20 +323,24 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     # Pairs keep both ring slots static.
     for pair_idx in tl.range(0, (n_blocks - 3) // 2, num_stages=1):
         block_n = pair_idx * 2
-        state, p_c, kt_dot = _softmax_lazy_pipeline_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf,
-                                                         stride_kn, stride_vn, QK_SCALE, BLOCK_N, 0, 1,
-                                                         RESCALE_THRESHOLD)
-        state, p_c, kt_dot = _softmax_lazy_pipeline_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n + 1, k_buf,
-                                                         v_buf, stride_kn, stride_vn, QK_SCALE, BLOCK_N, 1, 0,
-                                                         RESCALE_THRESHOLD)
+        state, probability_carry, kt_dot = _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs,
+                                                                       v_ptrs, block_n, k_buf, v_buf, stride_kn,
+                                                                       stride_vn, QK_SCALE, BLOCK_N, 0, 1,
+                                                                       RESCALE_THRESHOLD)
+        state, probability_carry, kt_dot = _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs,
+                                                                       v_ptrs, block_n + 1, k_buf, v_buf, stride_kn,
+                                                                       stride_vn, QK_SCALE, BLOCK_N, 1, 0,
+                                                                       RESCALE_THRESHOLD)
     # Drain the last three blocks without further prefetches.
     nm1 = n_blocks - 1
     qk = _qk_pieces(q, kt_dot)
     tlx.async_load_wait_group(2)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
-    state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
-    state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
-    state = state.rescale_lazy(delta_c, advance_c)
+    state, probability_tile = _finish_probability_fragments(state, probability_carry, QK_SCALE, q.dtype,
+                                                            EAGER_PROBABILITY_FRAGMENTS)
+    state, probability_carry, score_delta, max_advance = _pv_and_start_probability_fragments(
+        state, probability_tile, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+    state = state.rescale_lazy(score_delta, max_advance)
     _attn_war_barrier(False)
     tok_vlast = tlx.async_load(v_ptrs + nm1 * BLOCK_N * stride_vn, tlx.local_view(v_buf, 0))
     tlx.async_load_commit_group([tok_vlast])
@@ -331,14 +350,17 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     qk = tl.dot(q, kt_dot)
     tlx.async_load_wait_group(1)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 1), relaxed=True)
-    state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
-    state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
-    state = state.rescale_lazy(delta_c, advance_c)
+    state, probability_tile = _finish_probability_fragments(state, probability_carry, QK_SCALE, q.dtype,
+                                                            EAGER_PROBABILITY_FRAGMENTS)
+    state, probability_carry, score_delta, max_advance = _pv_and_start_probability_fragments(
+        state, probability_tile, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+    state = state.rescale_lazy(score_delta, max_advance)
 
     tlx.async_load_wait_group(0)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
-    state, p_dot = _vec2_lazy_split(state, p_c, QK_SCALE, q.dtype, 5)
-    acc = _attn_dot_pv_mfma(state.acc, p_dot, v_dot)
+    state, probability_tile = _finish_probability_fragments(state, probability_carry, QK_SCALE, q.dtype,
+                                                            EAGER_PROBABILITY_FRAGMENTS)
+    acc = _attn_dot_pv_mfma(state.acc, probability_tile, v_dot)
     return SoftmaxState(acc, state.l_i, state.m_i), q
 
 
@@ -439,8 +461,8 @@ def _unchunk(a, b, c, d):
 
 
 @triton.jit
-def _qk_silu(q, kt, h, ALPHA: tl.constexpr):
-    """`_qk_pieces(q, kt)` and `_silu(h)` (as `q.dtype`), woven."""
+def _qk_and_finish_silu_fragment(q, kt, deferred_score, ALPHA: tl.constexpr):
+    """Compute the next QK tile while finishing the deferred SiLU fragment."""
     NEG_LOG2E: tl.constexpr = -LOG2E
     mma: tl.constexpr = _mma()
     q = tlx.require_layout(q, tlx.dot_operand_layout(0, mma, k_width=8), pin=False)
@@ -452,7 +474,7 @@ def _qk_silu(q, kt, h, ALPHA: tl.constexpr):
     q5 = tlx.extract_slice(q, [q.shape[0], 16], [0, 80])
     q6 = tlx.extract_slice(q, [q.shape[0], 16], [0, 96])
     q7 = tlx.extract_slice(q, [q.shape[0], 16], [0, 112])
-    ha, hb, hc, hd = _chunks(h)
+    ha, hb, hc, hd = _chunks(deferred_score)
     a = tlx.zeros((q.shape[0], 32), tl.float32, layout=mma)
     b = tlx.zeros((q.shape[0], 32), tl.float32, layout=mma)
     a = _mfma(q0, kt[0], a)
@@ -506,22 +528,21 @@ def _qk_silu(q, kt, h, ALPHA: tl.constexpr):
 
 
 @triton.jit
-def _pv_silu(acc, p_dot, v, h, ALPHA: tl.constexpr):
-    """`_attn_dot_pv_mfma(acc, p_dot, v)` from `_v_pieces` (each D32 tile's K16 steps in order, bit for bit) and
-    `_silu(h)` (as `p_dot.dtype`), woven."""
+def _pv_and_start_silu_fragment(acc, probability_tile, v, score_fragment, ALPHA: tl.constexpr):
+    """Compute PV while starting the SiLU fragment for the current QK tile."""
     NEG_LOG2E: tl.constexpr = -LOG2E
     mma: tl.constexpr = _mma()
-    p_dot = tlx.require_layout(p_dot, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
+    probability_tile = tlx.require_layout(probability_tile, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
     acc = tlx.require_layout(acc, mma, pin=False)
-    p0 = tlx.extract_slice(p_dot, [p_dot.shape[0], 16], [0, 0])
-    p1 = tlx.extract_slice(p_dot, [p_dot.shape[0], 16], [0, 16])
-    p2 = tlx.extract_slice(p_dot, [p_dot.shape[0], 16], [0, 32])
-    p3 = tlx.extract_slice(p_dot, [p_dot.shape[0], 16], [0, 48])
+    p0 = tlx.extract_slice(probability_tile, [probability_tile.shape[0], 16], [0, 0])
+    p1 = tlx.extract_slice(probability_tile, [probability_tile.shape[0], 16], [0, 16])
+    p2 = tlx.extract_slice(probability_tile, [probability_tile.shape[0], 16], [0, 32])
+    p3 = tlx.extract_slice(probability_tile, [probability_tile.shape[0], 16], [0, 48])
     c0 = tlx.extract_slice(acc, [acc.shape[0], 32], [0, 0])
     c1 = tlx.extract_slice(acc, [acc.shape[0], 32], [0, 32])
     c2 = tlx.extract_slice(acc, [acc.shape[0], 32], [0, 64])
     c3 = tlx.extract_slice(acc, [acc.shape[0], 32], [0, 96])
-    ha, hb, hc, hd = _chunks(h)
+    ha, hb, hc, hd = _chunks(score_fragment)
     c0 = _mfma(p0, v[0], c0)
     ea = tl.math.exp2(ha)
     tlx.amd_sched_barrier(0)
@@ -541,13 +562,13 @@ def _pv_silu(acc, p_dot, v, h, ALPHA: tl.constexpr):
     rb = fast_dividef(1.0, db)
     tlx.amd_sched_barrier(0)
     c2 = _mfma(p1, v[6], c2)
-    pa = (ha * ra).to(p_dot.dtype)
+    pa = (ha * ra).to(probability_tile.dtype)
     tlx.amd_sched_barrier(0)
     c3 = _mfma(p1, v[7], c3)
     ec = tl.math.exp2(hc)
     tlx.amd_sched_barrier(0)
     c0 = _mfma(p2, v[8], c0)
-    pb = (hb * rb).to(p_dot.dtype)
+    pb = (hb * rb).to(probability_tile.dtype)
     tlx.amd_sched_barrier(0)
     c1 = _mfma(p2, v[9], c1)
     ed = tl.math.exp2(hd)
@@ -565,33 +586,39 @@ def _pv_silu(acc, p_dot, v, h, ALPHA: tl.constexpr):
     rd = fast_dividef(1.0, dd)
     tlx.amd_sched_barrier(0)
     c2 = _mfma(p3, v[14], c2)
-    pc = (hc * rc).to(p_dot.dtype)
+    pc = (hc * rc).to(probability_tile.dtype)
     tlx.amd_sched_barrier(0)
     c3 = _mfma(p3, v[15], c3)
-    pd = (hd * rd).to(p_dot.dtype)
+    pd = (hd * rd).to(probability_tile.dtype)
     return _unchunk(c0, c1, c2, c3), _unchunk(pa, pb, pc, pd)
 
 
 @triton.jit
-def _silu_step(acc, p_lo, qk_hi, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn, stride_vn,
-               ALPHA: tl.constexpr, BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr, NEXT_SLOT: tl.constexpr):
+def _silu_pipeline_step(acc, probability_carry, qk_hi, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
+                        stride_vn, ALPHA: tl.constexpr, BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr,
+                        NEXT_SLOT: tl.constexpr):
+    """Compute QK and PV in steady state, finishing the prior SiLU tile while starting the next one."""
+    # dot1: compute the next QK tile and finish the deferred score fragment.
     with tlx.warp_pipeline_stage("dot1"):
-        qk, p_hi = _qk_silu(q, kt_dot, qk_hi, ALPHA)
+        qk_tile, probability_fragment = _qk_and_finish_silu_fragment(q, kt_dot, qk_hi, ALPHA)
     tlx.async_load_wait_group(1)
+    # mem1: assemble the complete probability tile and read V for its PV operation.
     with tlx.warp_pipeline_stage("mem1"):
-        p_dot = _concat_cols(p_lo, p_hi)
+        probability_tile = _concat_cols(probability_carry, probability_fragment)
         v_dot = _v_pieces(v_buf, CUR_SLOT)
         tok_k = tlx.async_load(k_ptrs + (block_n + 3) * BLOCK_N * stride_kn, tlx.local_view(k_buf, NEXT_SLOT))
         tlx.async_load_commit_group([tok_k])
+    # dot2: compute PV for the prior QK while starting SiLU for the current QK.
     with tlx.warp_pipeline_stage("dot2"):
-        qk_lo, qk_hi = _split_cols(qk)
-        acc, p_lo = _pv_silu(acc, p_dot, v_dot, qk_lo, ALPHA)
+        qk_lo, qk_hi = _split_cols(qk_tile)
+        acc, probability_carry = _pv_and_start_silu_fragment(acc, probability_tile, v_dot, qk_lo, ALPHA)
     tlx.async_load_wait_group(1)
+    # mem2: prepare the next K/V operands.
     with tlx.warp_pipeline_stage("mem2"):
         kt_dot = _kt_pieces(k_buf, CUR_SLOT)
         tok_v = tlx.async_load(v_ptrs + (block_n + 2) * BLOCK_N * stride_vn, tlx.local_view(v_buf, CUR_SLOT))
         tlx.async_load_commit_group([tok_v])
-    return acc, p_lo, qk_hi, kt_dot
+    return acc, probability_carry, qk_hi, kt_dot
 
 
 @triton.jit
@@ -611,7 +638,7 @@ def _silu_pipelined(acc, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_k
     kt0 = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 0)), token=wait0, relaxed=True)
     qk = tl.dot(q, kt0)
     qk_lo, qk_hi = _split_cols(qk)
-    p_lo = _silu(qk_lo).to(q.dtype)
+    probability_carry = _silu(qk_lo).to(q.dtype)
     tl.debug_barrier()
     tok_k2 = tlx.async_load(k_ptrs + 2 * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k2])
@@ -622,17 +649,19 @@ def _silu_pipelined(acc, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_k
 
     for pair_idx in tl.range(0, (n_blocks - 3) // 2, num_stages=1):
         block_n = pair_idx * 2
-        acc, p_lo, qk_hi, kt_dot = _silu_step(acc, p_lo, qk_hi, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf,
-                                              stride_kn, stride_vn, ALPHA, BLOCK_N, 0, 1)
-        acc, p_lo, qk_hi, kt_dot = _silu_step(acc, p_lo, qk_hi, q, kt_dot, k_ptrs, v_ptrs, block_n + 1, k_buf, v_buf,
-                                              stride_kn, stride_vn, ALPHA, BLOCK_N, 1, 0)
-    p_c = _concat_cols(p_lo, _silu(qk_hi).to(q.dtype))
+        acc, probability_carry, qk_hi, kt_dot = _silu_pipeline_step(acc, probability_carry, qk_hi, q, kt_dot, k_ptrs,
+                                                                    v_ptrs, block_n, k_buf, v_buf, stride_kn, stride_vn,
+                                                                    ALPHA, BLOCK_N, 0, 1)
+        acc, probability_carry, qk_hi, kt_dot = _silu_pipeline_step(acc, probability_carry, qk_hi, q, kt_dot, k_ptrs,
+                                                                    v_ptrs, block_n + 1, k_buf, v_buf, stride_kn,
+                                                                    stride_vn, ALPHA, BLOCK_N, 1, 0)
+    probability_tile = _concat_cols(probability_carry, _silu(qk_hi).to(q.dtype))
     nm1 = n_blocks - 1
     qk = _qk_pieces(q, kt_dot)
     tlx.async_load_wait_group(2)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
-    acc = _attn_dot_pv_mfma(acc, p_c, v_dot)
-    p_c = _silu(qk)
+    acc = _attn_dot_pv_mfma(acc, probability_tile, v_dot)
+    probability_carry = _silu(qk)
     _attn_war_barrier(False)
     tok_vlast = tlx.async_load(v_ptrs + nm1 * BLOCK_N * stride_vn, tlx.local_view(v_buf, 0))
     tlx.async_load_commit_group([tok_vlast])
@@ -642,12 +671,12 @@ def _silu_pipelined(acc, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_k
     qk = tl.dot(q, kt_dot)
     tlx.async_load_wait_group(1)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 1), relaxed=True)
-    acc = _attn_dot_pv_mfma(acc, p_c.to(q.dtype), v_dot)
-    p_c = _silu(qk)
+    acc = _attn_dot_pv_mfma(acc, probability_carry.to(q.dtype), v_dot)
+    probability_carry = _silu(qk)
 
     tlx.async_load_wait_group(0)
     v_dot = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
-    return _attn_dot_pv_mfma(acc, p_c.to(q.dtype), v_dot), q
+    return _attn_dot_pv_mfma(acc, probability_carry.to(q.dtype), v_dot), q
 
 
 @triton.jit
@@ -786,7 +815,6 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
     row_ok = (start_m + local_m) < seq_len_q
     row0 = (seq_start_q + start_m).to(tl.int64)
     q_ptrs = Q + row0 * stride_qm + off_h * stride_qh + (local_m[:, None] * stride_qm + offs_d[None, :])
-    # Copied straight to LDS: a register load needs a relayout through LDS anyway, and its staging registers spill.
     if start_m + BLOCK_M <= seq_len_q:
         tok_q = tlx.async_load(q_ptrs, tlx.local_view(q_buf, 0), cache_modifier=".cg")
         tlx.async_load_commit_group([tok_q])
