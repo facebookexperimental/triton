@@ -172,6 +172,22 @@ CATALOG: tuple[OpSpec, ...] = (
         default_space="full",
     ),
     OpSpec(
+        op="addmm_mul_add",
+        arch="sm90",
+        variant="tma_ws",
+        impl="triton.tlx.ops.kernels.fused.addmm_mul_add.sm90:addmm_mul_add",
+        dtypes=_FP16,
+        requires=frozenset({"tma"}),
+    ),
+    OpSpec(
+        op="addmm_mul_add_launch",
+        arch="sm90",
+        variant="tma_ws",
+        impl="triton.tlx.ops.kernels.fused.addmm_mul_add.sm90:addmm_mul_add_launch",
+        dtypes=_FP16,
+        requires=frozenset({"tma"}),
+    ),
+    OpSpec(
         op="addmm",
         arch="sm100",
         variant="tma_ws",

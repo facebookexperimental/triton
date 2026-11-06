@@ -11,7 +11,7 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-`{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
+`{op}` is one of `norm`, `mm`, `addmm_mul_add`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
 `kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`.
 
@@ -51,6 +51,7 @@ options:
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
 | `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
+| `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
 | `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `bmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
