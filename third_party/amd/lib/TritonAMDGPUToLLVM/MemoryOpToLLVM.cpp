@@ -496,6 +496,8 @@ public:
       return failure();
 
     auto dstLL = triton::gpu::toLinearLayout(dstTy);
+    if (!dstLL.isRadix2())
+      return failure();
     LinearLayout sharedLL = triton::gpu::toLinearLayoutIgnoringPadding(srcTy);
 
     if constexpr (isPackedTransposed) {

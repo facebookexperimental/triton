@@ -202,6 +202,9 @@ bool isRadix2Encoding(Attribute layout);
 // shape must divide.
 bool hasExactLayoutAt(RankedTensorType type);
 
+// Whether `type` has an NPOT shape and an exact mixed-radix layout.
+bool hasExactNpotLayout(RankedTensorType type);
+
 // Whether `op` lowers a mixed-radix layout: it is elementwise, carries
 // MixedRadixLayoutTrait or MixedRadixLayoutOpInterface, or is an upstream
 // constant, control-flow or cast op. The verifier allows a mixed-radix layout
