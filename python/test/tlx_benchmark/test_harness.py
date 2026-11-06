@@ -991,6 +991,30 @@ def test_space_resolves_to_each_ops_own_default(monkeypatch):
     assert driver.resolve_space(importlib.import_module("bench_mm"), "full") == "full"
 
 
+@pytest.mark.parametrize("arch", ["gfx1250", "gfx950", "sm90", "sm100"])
+@pytest.mark.parametrize("space", ["heuristic", "full"])
+def test_attention_benchmark_follows_catalog_default(monkeypatch, arch, space):
+    import dataclasses
+
+    import bench_flash_attn as bench
+    from triton.tlx.ops import _catalog
+
+    key = (bench.OP, arch)
+    monkeypatch.setitem(_catalog._BY_KEY, key, dataclasses.replace(_catalog.spec_for(*key), default_space=space))
+    monkeypatch.setattr(bench.driver, "arch", lambda: arch)
+    monkeypatch.setattr(_catalog, "_load", lambda impl: pytest.fail("reading a default must not import a kernel"))
+    assert bench.driver.resolve_space(bench, None) == space
+    assert bench.driver.resolve_space(bench, "full") == "full"
+
+
+def test_attention_suite_listing_needs_no_supported_gpu(monkeypatch, capsys):
+    import bench_flash_attn as bench
+
+    monkeypatch.setattr(bench.driver, "arch", lambda: None)
+    assert bench.main(["--list-suites"]) == 0
+    assert "sm90_1" in capsys.readouterr().out
+
+
 def test_bind_returns_the_four_entry_points_bound_to_the_module():
     import importlib
 

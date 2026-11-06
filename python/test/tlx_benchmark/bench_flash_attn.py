@@ -25,7 +25,9 @@ REF_NAME = "torch.nn.functional.scaled_dot_product_attention"
 
 
 def default_space():
-    return "heuristic" if driver.arch() == "gfx1250" else "full"
+    from triton.tlx.ops._catalog import spec_for
+
+    return spec_for(OP, driver.arch()).default_space
 
 
 #: Which SDPA kernel torch would dispatch. Earns a column because the headline
