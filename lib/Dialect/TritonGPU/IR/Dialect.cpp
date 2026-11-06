@@ -4588,7 +4588,7 @@ getExactNpotLayout(RankedTensorType type,
   return ll;
 }
 
-static bool hasExactNpotLayout(RankedTensorType type) {
+bool triton::gpu::hasExactNpotLayout(RankedTensorType type) {
   return llvm::any_of(type.getShape(),
                       [](int64_t d) { return !llvm::isPowerOf2_64(d); }) &&
          succeeded(getExactNpotLayout(type));
@@ -5219,13 +5219,15 @@ static LogicalResult verifyExactNpotLayouts(Operation *op) {
     if (std::optional<std::string> reason =
             getNpotLayoutUnsupportedReason(op->getName(), types))
       return op->emitError(*reason);
+  // A mixed-radix op's NPOT dim may be only on its result.
   auto mixedRadix = dyn_cast<triton::MixedRadixLayoutOpInterface>(op);
-  auto srcTy = mixedRadix && op->getNumOperands()
-                   ? dyn_cast<RankedTensorType>(op->getOperand(0).getType())
-                   : nullptr;
   FailureOr<LinearLayout> ll = failure();
-  if (srcTy)
-    ll = getExactNpotLayout(srcTy);
+  for (Type type :
+       ArrayRef(types).take_front(op->getNumOperands() + op->getNumResults())) {
+    auto srcTy = mixedRadix ? dyn_cast<RankedTensorType>(type) : nullptr;
+    if (srcTy && succeeded(ll = getExactNpotLayout(srcTy)))
+      break;
+  }
   if (succeeded(ll))
     if (std::optional<std::string> reason =
             mixedRadix.getMixedRadixUnsupportedReason(*ll))

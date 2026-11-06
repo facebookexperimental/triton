@@ -473,7 +473,8 @@ def TTG_MemDescReinterpretOp
   let hasVerifier = 1;
 }
 
-def TTG_LocalLoadOp : TTG_Op<"local_load", [LocalLoadTrait]> {
+def TTG_LocalLoadOp
+    : TTG_Op<"local_load", [LocalLoadTrait, MixedRadixLayoutTrait]> {
   let summary = "Load a buffer from local memory into a distributed tensor";
 
   let description = [{
