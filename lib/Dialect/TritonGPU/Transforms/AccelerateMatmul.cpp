@@ -1326,6 +1326,22 @@ std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
   return std::nullopt;
 }
 
+// Asks the TCGen5MMAOp verifier's rule about the tiles BlockedToMMAv5 issues.
+// B's order isn't known yet: take the stricter MN-major form.
+std::optional<std::string>
+getTcgen05UnsupportedReason(DotOp dot, nvidia_gpu::Tcgen05Kind kind,
+                            int numWarps) {
+  Type elemTy = dot.getA().getType().getElementType();
+  ArrayRef<int64_t> shape = dot.getType().getShape();
+  auto instrShape = mmaVersionToInstrShape(5, shape, elemTy, numWarps);
+  if (auto reason = nvidia_gpu::getNpotMMAv5TileUnsupportedReason(
+          kind, /*aInTmem=*/false, /*bMNMajor=*/true, dot.getTwoCtas(),
+          instrShape[0], instrShape[1], shape,
+          dot.getA().getType().getShape().back()))
+    return reason;
+  return std::string("NPOT MMAv5 accumulator N is not yet supported");
+}
+
 struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   using NpotTargetLegality::NpotTargetLegality;
   StringRef getTargetPrefix() const override { return "cuda"; }
@@ -1343,6 +1359,10 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
           getMMAVersionsSupported(computeCapability, dot);
       if (versions == SmallVector<int>{3, 2} && supportMMA(dot, 3, numWarps))
         return getMmaUnsupportedReason(dot, numWarps);
+      if (versions == SmallVector<int>{5, 2} && supportMMA(dot, 5, numWarps))
+        if (auto kind = nvidia_gpu::getTcgen05Kind(
+                dot.getA().getType().getElementType()))
+          return getTcgen05UnsupportedReason(dot, *kind, numWarps);
     }
     return ("NPOT dot is not yet supported on " + target).str();
   }

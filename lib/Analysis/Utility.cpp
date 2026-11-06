@@ -1579,9 +1579,12 @@ bool supportMMA(triton::DotOp op, int version,
     RankedTensorType typeA = op.getA().getType();
     int k = typeA.getShape().back();
     auto retType = op.getType();
-    auto retShapePerCTA = getShapePerCTA(retType);
+    // The target dot-legality query asks before layouts and ttg.num-warps
+    // exist, on one CTA.
+    auto retShapePerCTA = retType.getEncoding() ? getShapePerCTA(retType)
+                                                : to_vector(retType.getShape());
     auto rank = retShapePerCTA.size();
-    int numWarps = lookupNumWarps(op);
+    int numWarps = knownNumWarps ? *knownNumWarps : lookupNumWarps(op);
     // Allow int8 * int8 -> int32 for MMAv5, reject other integer combinations
     if (aElemTy.isInteger() || bElemTy.isInteger() ||
         retType.getElementType().isInteger()) {
