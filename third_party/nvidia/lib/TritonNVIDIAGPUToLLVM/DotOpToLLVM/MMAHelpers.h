@@ -261,10 +261,11 @@ public:
     }
     Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x7FFF));
     // Split the descriptor add into independent 32-bit low/high words so
-    // no 64-bit carry chain is needed (upstream #11329): currDesc.descriptor
-    // is static, so its high word folds to a constant.
-    Value low = tb.add(tb.i32_val(uint32_t(currDesc.descriptor)), addrMasked);
-    Value high = tb.i32_val(currDesc.descriptor >> 32);
+    // no 64-bit carry chain is needed (upstream #11329): the descriptor bits
+    // are static, so the high word folds to a constant.
+    uint64_t descBits = std::bit_cast<uint64_t>(currDesc);
+    Value low = tb.add(tb.i32_val(uint32_t(descBits)), addrMasked);
+    Value high = tb.i32_val(descBits >> 32);
     Value descWords = packLLVector(loc, {low, high}, rewriter);
     Value result = tb.bitcast(descWords, i64_ty);
     if (useAbsolute) {
