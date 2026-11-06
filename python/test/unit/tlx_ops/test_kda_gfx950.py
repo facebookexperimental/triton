@@ -228,6 +228,127 @@ def test_kda_paged_prefill_state_pool(lengths):
     torch.testing.assert_close(backing[:, 0], other_half, atol=0, rtol=0)
 
 
+def _skip_without_free_memory(gib):
+    torch.cuda.empty_cache()
+    free = torch.cuda.mem_get_info(DEVICE)[0]
+    if free < gib * 2**30:
+        pytest.skip(f"needs {gib} GiB of free device memory, {free / 2**30:.1f} GiB free")
+
+
+def _check_kda_prefill_pieces(q, k, v, g, beta, lengths, initial_state, **kwargs):
+    """Each sequence's output and final state match the sequence rerun in pieces.
+
+    Pieces of 2**17 tokens keep every offset below 2**31, also at token stride
+    3 * 32 * 128, that of split views of a 32-head packed qkv.
+    """
+    piece = 2**17
+    cu_seqlens = torch.tensor([0, *accumulate(lengths)], device=DEVICE, dtype=torch.int64)
+    output, final_state = kda_paged_prefill(q, k, v, g, beta, initial_state=initial_state, cu_seqlens=cu_seqlens,
+                                            **kwargs)
+    for sequence, (begin, end) in enumerate(pairwise(cu_seqlens.tolist())):
+        state = initial_state[sequence:sequence + 1]
+        for lo in range(begin, end, piece):
+            hi = min(end, lo + piece)
+            piece_cu_seqlens = torch.tensor([0, hi - lo], device=DEVICE, dtype=torch.int64)
+            piece_output, state = kda_paged_prefill(q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], g[:, lo:hi], beta[:, lo:hi],
+                                                    initial_state=state, cu_seqlens=piece_cu_seqlens, **kwargs)
+            torch.testing.assert_close(output[:, lo:hi], piece_output, atol=8e-3, rtol=3e-2)
+        torch.testing.assert_close(final_state[sequence:sequence + 1], state, atol=8e-3, rtol=3e-2)
+
+
+@pytest.mark.parametrize("lengths", [[65536] * 7 + [65600], [524352]], ids=["packed", "single"])
+def test_kda_paged_prefill_offsets_past_int32(lengths):
+    """[T, 32, 128] intermediates and output pass 2**31 elements: T passes 2**24 / 32 = 524288.
+
+    The inputs are overlapping views, token t of head h reading row t + h, so
+    only the op's own buffers take full size, about 24 GB.
+    """
+    _skip_without_free_memory(32)
+    heads, dim = 32, 128
+    total_tokens = sum(lengths)
+    rows = total_tokens + heads - 1
+    torch.manual_seed(67)
+
+    def overlapping(base):
+        return base.as_strided((1, total_tokens, heads, dim), (0, dim, dim, 1))
+
+    def normalized_rows():
+        return torch.nn.functional.normalize(torch.randn(rows, dim, device=DEVICE), dim=-1).to(torch.bfloat16)
+
+    q, k = overlapping(normalized_rows()), overlapping(normalized_rows())
+    v = overlapping(torch.randn(rows, dim, device=DEVICE, dtype=torch.bfloat16))
+    g = overlapping(-torch.nn.functional.softplus(torch.randn(rows, dim, device=DEVICE)))
+    beta = torch.sigmoid(torch.randn(1, total_tokens, heads, device=DEVICE))
+    initial_state = 0.1 * torch.randn(len(lengths), heads, dim, dim, device=DEVICE)
+    _check_kda_prefill_pieces(q, k, v, g, beta, lengths, initial_state, scale=dim**-0.5)
+
+
+def test_kda_paged_prefill_strided_inputs_past_int32():
+    """One sequence of split views of a 32-head packed qkv, whose token stride is 3 * 32 * 128.
+
+    Its input offsets pass 2**31 while 174763 or more of its tokens are left.
+    About 15 GB.
+    """
+    _skip_without_free_memory(24)
+    lengths, heads = [196608], 32
+    torch.manual_seed(71)
+    q, k, v, g, beta, A_log, dt_bias = _raw_kda_inputs(lengths, heads)
+    initial_state = 0.1 * torch.randn(len(lengths), heads, 128, 128, device=DEVICE)
+    _check_kda_prefill_pieces(q, k, v, g, beta, lengths, initial_state, scale=128**-0.5, A_log=A_log, dt_bias=dt_bias,
+                              lower_bound=-5.0, beta_is_raw=True)
+
+
+def _assert_matches_contiguous_inputs(q, k, v, g, beta, lengths):
+    """The op gives exactly what it gives for contiguous copies of these inputs."""
+    initial_state = 0.1 * torch.randn(len(lengths), q.shape[2], 128, 128, device=DEVICE)
+    cu_seqlens = torch.tensor([0, *accumulate(lengths)], device=DEVICE, dtype=torch.int64)
+    kwargs = dict(scale=128**-0.5, initial_state=initial_state, cu_seqlens=cu_seqlens)
+    actual = kda_paged_prefill(q, k, v, g, beta, **kwargs)
+    expected = kda_paged_prefill(*(x.contiguous() for x in (q, k, v, g, beta)), **kwargs)
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("token_stride", [0, 64], ids=["broadcast", "overlapping"])
+def test_kda_paged_prefill_token_stride_below_head_dim(token_stride):
+    """Token strides below the head dim: 0 repeats one token, 64 overlaps neighboring tokens."""
+    lengths, heads, dim = [100, 28, 192], 2, 128
+    total_tokens = sum(lengths)
+    size = (total_tokens - 1) * token_stride + heads * dim
+    torch.manual_seed(73)
+
+    def tokens(base):
+        return base.as_strided((1, total_tokens, heads, dim), (0, token_stride, dim, 1))
+
+    # About unit norm per head vector, as for l2-normalized q and k.
+    q = tokens((0.088 * torch.randn(size, device=DEVICE)).to(torch.bfloat16))
+    k = tokens((0.088 * torch.randn(size, device=DEVICE)).to(torch.bfloat16))
+    v = tokens(torch.randn(size, device=DEVICE, dtype=torch.bfloat16))
+    g = tokens(-torch.nn.functional.softplus(torch.randn(size, device=DEVICE)))
+    beta = torch.sigmoid(torch.randn(1, 1 if token_stride == 0 else total_tokens, heads, device=DEVICE))
+    _assert_matches_contiguous_inputs(q, k, v, g, beta.expand(1, total_tokens, heads), lengths)
+
+
+@pytest.mark.parametrize("token_stride", [2**24 + 2**20, 2**25])
+def test_kda_paged_prefill_token_stride_past_buffer_range(token_stride):
+    """q tokens so far apart that a chunk passes a buffer resource's 2**31 - 2 bytes; up to 4.3 GB.
+
+    At 2**24 + 2**20 only the chunk's last tokens lie past it; at 2**25 the
+    mask limit, 64 * stride, also passes 2**31.
+    """
+    _skip_without_free_memory(8)
+    tokens, heads, dim = 64, 1, 128
+    torch.manual_seed(79)
+    q = torch.empty((tokens - 1) * token_stride + dim, device=DEVICE, dtype=torch.bfloat16)
+    q = q.as_strided((1, tokens, heads, dim), (0, token_stride, dim, 1))
+    q.copy_(_normalized_kda_input(q.shape))
+    k = _normalized_kda_input(q.shape)
+    v = torch.randn(q.shape, device=DEVICE, dtype=torch.bfloat16)
+    g = -torch.nn.functional.softplus(torch.randn(q.shape, device=DEVICE))
+    beta = torch.sigmoid(torch.randn(1, tokens, heads, device=DEVICE))
+    _assert_matches_contiguous_inputs(q, k, v, g, beta, [tokens])
+
+
 @pytest.mark.parametrize("total_tokens,sequences,heads,key_dim,value_dim,dtype_name", PREFILL_CORRECTNESS_SHAPES)
 def test_kda_paged_prefill_shape_suites_run(total_tokens, sequences, heads, key_dim, value_dim, dtype_name):
     assert dtype_name == "bf16"
