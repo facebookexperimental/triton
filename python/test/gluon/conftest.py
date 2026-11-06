@@ -34,6 +34,7 @@ _VERSION_SKEW_FILES = {
     "test_lowerings.py",
     "test_consan.py",
 }
+collect_ignore = sorted(_VERSION_SKEW_FILES)
 
 # Individual frontend/layout cases that don't pass on the pinned build:
 #  - nv_tma_descriptor_{load,store} and amd mfma/wmma_scaled emit IR that
@@ -51,15 +52,11 @@ _KNOWN_FAIL_SUBSTRINGS = (
     "test_layout_format_view.py::test_format_view_kernel",
 )
 
-_SKEW_REASON = (
-    "fbtriton: Gluon frontend pinned older than these upstream-synced tests "
-    "(pointer load/store distributed-layout support missing). Unskip after the "
-    "Gluon frontend re-sync -- TODO(gluon-ci)."
-)
-_KNOWN_FAIL_REASON = (
-    "fbtriton: known-failing on the pinned Gluon build (per-target golden / "
-    "create_lds_barrier_wait binding / block_type layout skew) -- TODO(gluon-ci)."
-)
+_SKEW_REASON = ("fbtriton: Gluon frontend pinned older than these upstream-synced tests "
+                "(pointer load/store distributed-layout support missing). Unskip after the "
+                "Gluon frontend re-sync -- TODO(gluon-ci).")
+_KNOWN_FAIL_REASON = ("fbtriton: known-failing on the pinned Gluon build (per-target golden / "
+                      "create_lds_barrier_wait binding / block_type layout skew) -- TODO(gluon-ci).")
 
 
 def pytest_collection_modifyitems(config, items):

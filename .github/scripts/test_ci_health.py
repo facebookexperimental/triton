@@ -1,5 +1,10 @@
 import base64
 import json
+import re
+from pathlib import Path
+
+import pytest
+import yaml
 
 import ci_health as ch
 
@@ -79,6 +84,133 @@ def collect(tmp_path, runs, jobs=JOBS, since="2026-10-12T00:00:00Z", now=NOW, lo
     api, text = fake_api(runs, jobs, remaining, pulls), fake_text(logs or {})
     state = ch.collect(str(tmp_path), since, now, api=api, text=text, get=get)
     return state, api, text
+
+
+def workflow_test_jobs(workflow="gpu-tests.yml"):
+    root = Path(__file__).resolve().parents[2]
+    parent = yaml.load((root / ".github/workflows" / workflow).read_text(), Loader=yaml.BaseLoader)
+    found = []
+    for key, job in parent["jobs"].items():
+        if "uses" in job:
+            children = yaml.load((root / job["uses"]).read_text(), Loader=yaml.BaseLoader)["jobs"]
+            platforms = job.get("strategy", {}).get("matrix", {}).get("platform", [None])
+            candidates = []
+            for platform in platforms:
+                prefix = f"{key} ({platform})" if platform else key
+                for name, child in children.items():
+                    name = child.get("name", name)
+                    if platform:
+                        name = name.replace("${{ inputs.platform }}", platform)
+                    candidates.append((f"{prefix} / {name}", child))
+        else:
+            candidates = [(job.get("name", key), job)]
+        for name, child in candidates:
+            if child.get("if") in ("${{ false }}", "false"):
+                continue
+            tests = [
+                step["name"]
+                for step in child.get("steps", [])
+                if step.get("name", "").startswith("Run ") or step.get("uses") == "./.github/actions/run-selected-tests"
+                or "run_selected_tests.py" in step.get("run", "") or "check-triton-lit-tests" in step.get("run", "")
+                or re.search(r"(?m)^\s*(?:python\S*\s+-m\s+)?pytest\b", step.get("run", ""))
+            ]
+            if tests:
+                found.append((name, child["runs-on"], tests))
+    return found
+
+
+@pytest.mark.parametrize("name,label,steps", workflow_test_jobs())
+def test_workflow_test_jobs_reach_dashboard_health(tmp_path, name, label, steps):
+    rules = ch.rules
+    platform = rules.test_platform_of({"wf": "gpu-tests.yml"}, {"name": name})
+    assert platform is not None, f"Dashboard does not recognize test job {name}"
+    for step in steps:
+        assert rules.group_of(step) is not None, f"Dashboard does not recognize test step {name}: {step}"
+    test_steps = [{
+        "name": step, "conclusion": "failure", "number": i + 1, "started_at": f"2026-10-12T01:01:{i * 10:02d}Z",
+        "completed_at": f"2026-10-12T01:01:{i * 10 + 9:02d}Z"
+    } for i, step in enumerate(steps)]
+    j = gh_job(20, name, "failure", test_steps)
+    j["labels"] = [label]
+    text = "".join(
+        f"2026-10-12T01:01:{i * 10 + 5:02d}Z FAILED test_contract.py::test_signal_{i} - AssertionError: signal\n"
+        for i in range(len(steps)))
+    collect(
+        tmp_path,
+        {"gpu-tests.yml": [gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", event="push", head_branch="main")]},
+        {1: [j]}, logs={20: text})
+    stored = ch.load_runs(str(tmp_path))[1]
+    assert rules.run_outcome(stored) == "test"
+    view = rules.main_view([stored], NOW)
+    assert len(view["gpus"][platform]["new"]) == len(steps)
+    assert view["pushes"][0]["cells"][platform] == "new"
+    assert len(view["steps"][platform]) == len(steps)
+    assert all(row["cells"] == ["new"] for row in view["steps"][platform])
+    assert {item["step"] for item in view["gpus"][platform]["new"]} == set(steps)
+    assert rules.gpu_minutes(stored) == (0 if platform == "CPU" else 5)
+    pr = rules.pr_view([{**stored, "event": "pull_request", "pr": 1}], NOW, rules.main_view([], NOW))[0]
+    assert pr["result"] == "tests" and pr["n_failed"] == len(steps)
+    assert platform in pr["gpus"]
+    out = tmp_path / "site"
+    ch.render(str(tmp_path), str(out), bench_dir=str(tmp_path / "bench"))
+    data = json.loads((out / "data.json").read_text())
+    assert data["branches"]["main"]["main"]["gpus"][platform]["new"]
+    assert "CPU compiler tests" in (out / "index.html").read_text()
+
+
+@pytest.mark.parametrize("workflow", ["gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml"])
+def test_nightly_workflow_jobs_are_visible_to_dashboard(workflow):
+    jobs = workflow_test_jobs(workflow)
+    assert jobs
+    for name, _, steps in jobs:
+        platform = ch.rules.test_platform_of({"wf": workflow}, {"name": name})
+        assert platform in ch.rules.GPUS, f"Dashboard does not recognize {workflow}: {name}"
+        assert all(ch.rules.group_of(step) for step in steps), (workflow, name, steps)
+
+
+def test_compiler_workflow_job_reaches_lit_dashboard():
+    jobs = workflow_test_jobs(ch.rules.LIT_WF)
+    assert len(jobs) == 1
+    name, _, steps = jobs[0]
+    assert name == ch.rules.LIT_JOB and steps
+    j = gh_job(1, name, "failure", [{"name": steps[0], "conclusion": "failure", "failures": [{"id": "lit-test"}]}])
+    assert ch.rules.lit_result({"jobs": [j]}) == ("fail", [{"id": "lit-test"}])
+
+
+def test_dashboard_contract_runs_when_its_inputs_change():
+    root = Path(__file__).resolve().parents[2]
+    workflow = yaml.load((root / ".github/workflows/ci-health.yml").read_text(), Loader=yaml.BaseLoader)
+    paths = workflow["on"]["pull_request"]["paths"]
+    import fnmatch
+    inputs = [
+        ".github/workflows/gpu-tests.yml", ".github/scripts/gpu_test_selection.py", ".github/gpu-test-suites.json",
+        ".github/actions/run-selected-tests/action.yml"
+    ]
+    inputs += [
+        ".github/workflows/" + name for name in (*ch.rules.GPU_WORKFLOWS, *ch.rules.GPU_RUN_WORKFLOWS, ch.rules.LIT_WF,
+                                                 "tritonbench.yml", "_tlx-ops-bench.yml")
+    ]
+    for path in inputs:
+        assert any(fnmatch.fnmatch(path, pattern) for pattern in paths), f"CI does not test dashboard changes to {path}"
+
+
+def test_selector_output_remains_readable_by_dashboard(tmp_path):
+    import os
+    import sys
+    from gpu_test_selection import REPO_ROOT
+    event, output = tmp_path / "event.json", tmp_path / "outputs"
+    event.write_text("{}")
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / ".github/scripts/gpu_test_selection.py")], cwd=REPO_ROOT, env=os.environ | {
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary")
+        }, capture_output=True, text=True, check=True)
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    selected = ch.logs.parse_selection(proc.stdout)
+    assert selected is not None, "Dashboard cannot parse the selector's real output"
+    for key in ("h100", "b200", "mi350", "build", "cpu"):
+        assert selected[key] == (outputs[key] == "true")
+    assert selected["fallback"] is False
 
 
 def test_collect_stores_completed_runs_with_jobs_and_keeps_cursor_at_running(tmp_path):
