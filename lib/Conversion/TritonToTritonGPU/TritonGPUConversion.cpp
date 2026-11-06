@@ -34,8 +34,9 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
     if (tensorType.getEncoding())
       return tensorType;
     ArrayRef<int64_t> shape = tensorType.getShape();
-    if (auto product = getProductEncoding(this->context, shape, this->numWarps,
-                                          this->threadsPerWarp, this->numCTAs);
+    if (auto product =
+            getMixedRadixEncoding(this->context, shape, this->numWarps,
+                                  this->threadsPerWarp, this->numCTAs);
         succeeded(product))
       return tensorType.cloneWithEncoding(*product);
     triton::gpu::BlockedEncodingAttr encoding =

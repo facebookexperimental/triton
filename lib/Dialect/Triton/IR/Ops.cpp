@@ -11,6 +11,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Tools/LinearLayout.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -834,6 +835,20 @@ llvm::SmallVector<Type> ReduceOp::getElementTypes() {
 bool ReduceOp::hasDefinedOrdering() {
   auto attr = getReductionOrderingAttr();
   return attr && attr.getValue() != "unordered";
+}
+
+std::optional<std::string>
+ReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  auto ordering = getReductionOrderingAttr();
+  if (ordering && ordering.getValue() == "inner_tree")
+    return "NPOT mixed-radix layout is not yet supported on an inner_tree "
+           "reduce";
+  auto kWarp = StringAttr::get(getContext(), "warp");
+  for (const auto &basis : layout.getBases().lookup(kWarp))
+    if (basis[getAxis()] != 0)
+      return "NPOT mixed-radix layout with warps on the reduce axis is not yet "
+             "supported";
+  return std::nullopt;
 }
 
 //-- ScanOp --

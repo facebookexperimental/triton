@@ -187,14 +187,27 @@ def AtomicOpInterface : OpInterface<"AtomicOpInterface"> {
   ];
 }
 
-def ProductLayoutOpInterface : OpInterface<"ProductLayoutOpInterface"> {
+def MixedRadixLayoutOpInterface : OpInterface<"MixedRadixLayoutOpInterface"> {
   let description = [{
-    Marks an op whose lowering implements the exact plan for NPOT Product
-    layouts. Under TRITON_ALLOW_NPOT the verifier admits an exact Product layout
-    only on these ops and on elementwise ops.
+    An op whose lowering takes an exact NPOT mixed-radix layout unless
+    getMixedRadixUnsupportedReason names a reason. Ops that take every exact
+    layout carry MixedRadixLayoutTrait instead.
   }];
 
   let cppNamespace = "::mlir::triton";
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns why the lowering can't yet take `layout`, the mixed-radix layout
+        of the first operand, or std::nullopt. The pad pass pads the connected
+        component of such an op and the verifier emits the reason.
+      }],
+      /*retType=*/"std::optional<std::string>",
+      /*methodName=*/"getMixedRadixUnsupportedReason",
+      /*args=*/(ins "const ::mlir::triton::LinearLayout &":$layout)
+    >
+  ];
 }
 
 

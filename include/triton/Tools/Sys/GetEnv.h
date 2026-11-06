@@ -163,6 +163,10 @@ inline bool getBoolEnv(const std::string &env) {
   return str == "on" || str == "true" || str == "1";
 }
 
+// Whether TRITON_ALLOW_NPOT (knobs.language.allow_npot) opts in to NPOT shapes;
+// every C++ check reads it here.
+inline bool isNpotAllowed() { return getBoolEnv("TRITON_ALLOW_NPOT"); }
+
 inline std::optional<bool> isEnvValueBool(std::string str) {
   std::transform(str.begin(), str.end(), str.begin(),
                  [](unsigned char c) { return std::tolower(c); });
