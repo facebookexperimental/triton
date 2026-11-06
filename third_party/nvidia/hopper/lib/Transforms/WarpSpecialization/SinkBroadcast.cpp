@@ -5,6 +5,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -213,10 +214,16 @@ class NVGPUSinkBroadcastPass
 public:
   void runOnOperation() override {
     SmallVector<Operation *> candidates;
-    getOperation()->walk([&](Operation *op) {
-      if (!getSinkableBroadcastChains(op).empty()) {
-        candidates.push_back(op);
-      }
+    getOperation()->walk([&](triton::FuncOp funcOp) {
+      // Only functions AutoWS will warp-specialize; sinking reorders the
+      // schedule of an ordinary software-pipelined loop for no benefit.
+      if (!triton::isMetaWarpSpecializedFunc(funcOp))
+        return;
+      funcOp->walk([&](Operation *op) {
+        if (!getSinkableBroadcastChains(op).empty()) {
+          candidates.push_back(op);
+        }
+      });
     });
 
     for (Operation *op : candidates) {

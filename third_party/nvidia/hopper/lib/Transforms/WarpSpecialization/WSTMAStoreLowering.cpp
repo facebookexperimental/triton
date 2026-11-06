@@ -178,11 +178,19 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
 struct NVGPUWSTMAStoreLoweringPass
     : public impl::NVGPUWSTMAStoreLoweringBase<NVGPUWSTMAStoreLoweringPass> {
+  using NVGPUWSTMAStoreLoweringBase::NVGPUWSTMAStoreLoweringBase;
+
   void runOnOperation() override {
     auto mod = getOperation();
     if (!mod->hasAttr("ttg.early_tma_store_lowering"))
       return;
-    mod->walk([&](triton::FuncOp funcOp) { doTMAStoreLowering(funcOp); });
+    mod->walk([&](triton::FuncOp funcOp) {
+      // On the Meta AutoWS path the early lowering serves AutoWS, which
+      // partitions the stores; a function it will not warp-specialize keeps
+      // its stores for the regular software pipeliner.
+      if (!onlyWarpSpecialized || triton::isMetaWarpSpecializedFunc(funcOp))
+        doTMAStoreLowering(funcOp);
+    });
   }
 };
 

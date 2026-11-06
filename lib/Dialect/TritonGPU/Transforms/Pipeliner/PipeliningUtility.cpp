@@ -13,6 +13,8 @@
 #include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Partitioning.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionLoopPeeling.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -975,4 +977,35 @@ bool triton::isLoopTripCountKnownPositive(scf::ForOp loop,
       return true;
   }
   return false;
+}
+
+// FB Change: Meta AutoWS warp-specialization predicates.
+bool mlir::triton::requestsMetaWarpSpecialization(Operation *op) {
+  return op->getAttrOfType<DenseI32ArrayAttr>(ttg::kAsyncTaskIdAttrName) ||
+         op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName) ||
+         (isa<scf::ForOp, scf::WhileOp>(op) &&
+          op->hasAttr(kWarpSpecializeAttrName));
+}
+
+static bool containsMetaWarpSpecializationRequest(Operation *root) {
+  return root
+      ->walk([](Operation *op) {
+        return triton::requestsMetaWarpSpecialization(op)
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+bool mlir::triton::isMetaWarpSpecializedFunc(triton::FuncOp funcOp) {
+  return containsMetaWarpSpecializationRequest(funcOp);
+}
+
+bool mlir::triton::isMetaWarpSpecializedLoop(scf::ForOp forOp) {
+  for (Operation *op = forOp->getParentOp(); op; op = op->getParentOp()) {
+    if (op->hasAttr(kWarpSpecializeAttrName) ||
+        isa<ttg::WarpSpecializeOp, ttg::WarpSpecializePartitionsOp>(op))
+      return true;
+  }
+  return containsMetaWarpSpecializationRequest(forOp);
 }

@@ -1034,7 +1034,8 @@ class CUDABackend(BaseBackend):
             if knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            nvidia.passes.hopper.add_tma_store_lowering(pm)
+            # Hopper lowers TMA stores early in every function, AutoWS or not.
+            nvidia.passes.hopper.add_tma_store_lowering(pm, False)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_sink_broadcast(pm)
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
@@ -1134,7 +1135,7 @@ class CUDABackend(BaseBackend):
                     passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
-                nvidia.passes.hopper.add_tma_store_lowering(pm)
+                nvidia.passes.hopper.add_tma_store_lowering(pm, True)
                 nvidia.passes.hopper.add_sink_broadcast(pm)
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)

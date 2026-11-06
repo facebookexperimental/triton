@@ -234,6 +234,12 @@ def NVGPUWSTMAStoreLowering
     to the scheduler and can later be hoisted by buffer allocation.
   }];
 
+  let options = [
+    Option<"onlyWarpSpecialized", "only-warp-specialized", "bool",
+           /*default*/"false",
+           "Only lower stores in functions Meta AutoWS warp-specializes">
+  ];
+
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
