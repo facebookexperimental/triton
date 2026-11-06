@@ -444,7 +444,8 @@ def _append_tlx_flex_amd(
         )
 
     block_m = fit(128, base["SPARSE_Q_BLOCK_SIZE"])
-    block_n = fit(64, base["SPARSE_KV_BLOCK_SIZE"])
+    # 128-wide KV tiles are faster for heads up to 64 and slower at 128.
+    block_n = fit(128 if head_dim <= 64 else 64, base["SPARSE_KV_BLOCK_SIZE"])
     if block_m and block_n:
         append(block_m, block_n, num_warps=4, waves_per_eu=0, matrix_instr_nonkdim=min(32, block_m, block_n), kpack=1)
     if config.max_autotune:

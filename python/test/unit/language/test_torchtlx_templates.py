@@ -3906,8 +3906,10 @@ class TestFlexAttentionChoiceRegistration(TestCase):
 
         stock = self._forward_config()
         stock.block_m, stock.block_n = 32, 32
-        for sparse_q, sparse_kv, expected in ((128, 128, (128, 64)), (64, 32, (64, 32))):
-            with self.subTest(sparse_q=sparse_q, sparse_kv=sparse_kv):
+        cases = ((128, 128, 128, (128, 64)), (128, 64, 32, (64, 32)), (64, 128, 128, (128, 128)),
+                 (32, 128, 128, (128, 128)), (64, 64, 32, (64, 32)))
+        for head_dim, sparse_q, sparse_kv, expected in cases:
+            with self.subTest(head_dim=head_dim, sparse_q=sparse_q, sparse_kv=sparse_kv):
                 choices = []
                 with (
                         config.patch({"triton.tlx_mode": "force", "max_autotune": False}),
@@ -3917,7 +3919,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     flex_attention_templates.append_tlx_flex(
                         choices,
                         [stock, self._forward_config()],
-                        self._forward_inputs(),
+                        self._forward_inputs(head_dim=head_dim),
                         [object(), object()],
                         object(),
                         {},
