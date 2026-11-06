@@ -572,6 +572,8 @@ def test_arch_matches_the_part():
     assert Device(NVIDIA, 0, "NVIDIA GB200").arch == "sm100"
     assert Device(AMD, 0, "MI350X").arch == "gfx950"
     assert Device(AMD, 0, "MI355X").arch == "gfx950"
+    assert Device(AMD, 0, "MI450X").arch == "gfx1250"
+    assert Device(AMD, 0, "MI455X").arch == "gfx1250"
 
 
 def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypatch):
@@ -805,6 +807,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_1", ),
+            "gfx1250": ("gfx1250_1", ),
         },
         "triton.tlx.ops.kernels.flash_attn_varlen._shapes": {
             "gfx950": ("gfx950_1", ),
@@ -870,6 +873,7 @@ def test_flash_attn_mxfp8_gfx950_benchmark_supports_backward(monkeypatch):
 
     assert directions("gfx950") == {"fwd", "bwd"}
     assert directions("sm100") == {"fwd", "bwd"}
+    assert directions("gfx1250") == {"fwd"}
 
 
 def test_hstu_cross_attn_benchmark_times_inference_shapes_forward_only(monkeypatch):
