@@ -409,6 +409,7 @@ void init_triton_amd(py::module_ &m) {
     // registry.insert<mlir::ROCDL::ROCDLDialect>();
     mlir::registerROCDLDialectTranslation(registry);
     mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
+    mlir::triton::amdgpu::registerNpotTargetLegality(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });

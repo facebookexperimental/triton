@@ -5,6 +5,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/TypeSwitch.h" // required by `Types.cpp.inc`
 
 using namespace mlir;
@@ -112,9 +113,9 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   auto layoutEncoding = dyn_cast_if_present<LayoutEncodingTrait>(encoding);
   if (!layoutEncoding && !isDummyTMEM)
     return emitError() << encoding << " is not a valid encoding";
-  // A physical cover's allocation is verified once the checks below accept
+  // A pow2 alloc view's allocation is verified once the checks below accept
   // it; the TMEM checks drop its pipelining dimension.
-  std::optional<ArrayRef<int64_t>> npotCoverAllocShape;
+  std::optional<ArrayRef<int64_t>> npotPow2AllocShape;
   if (!isDummyTMEM) {
     auto rank = layoutEncoding.getRank();
     if (isa<nvidia_gpu::TensorMemoryEncodingAttr>(encoding)) {
@@ -134,15 +135,15 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     // Every layout dimension must be a power of 2; only a leading pipeline
     // dimension and a shared buffer's first dimension may have another
     // positive size.
-    if (isNpotPhysicalCover(encoding, shape))
-      npotCoverAllocShape = allocShape;
+    if (isNpotPow2AllocView(encoding, shape))
+      npotPow2AllocShape = allocShape;
     else if (!hasPow2MemDescLayoutShape(encoding, shape))
       return emitError()
              << "shape must have power-of-2 and non-zero dimensions; got "
              << shape;
     // A shared allocation with an NPOT tile is laid out and sized as its
-    // power-of-two cover, which verifyNpotPhysicalCover checks it holds.
-    if (!(npotCoverAllocShape && isa<SharedEncodingTrait>(encoding)) &&
+    // pow2 alloc shape, which verifyNpotPow2AllocView checks it holds.
+    if (!(npotPow2AllocShape && isa<SharedEncodingTrait>(encoding)) &&
         !hasPow2MemDescLayoutShape(encoding, allocShape))
       return emitError()
              << "alloc shape must have power-of-2 and non-zero dimensions; got "
@@ -295,7 +296,12 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     }
   } else if (auto enc = dyn_cast<NVMMASharedEncodingAttr>(encoding)) {
     SmallVector<int64_t> shapePerCTA(getShapePerCTA(enc, allocShape));
-    auto blockShape = dropPipeliningDim(ArrayRef(shapePerCTA), enc);
+    SmallVector<int64_t> blockShape(
+        dropPipeliningDim(ArrayRef(shapePerCTA), enc));
+    // Under TRITON_ALLOW_NPOT an NPOT tile is laid out and sized as its pow2
+    // alloc shape, so the swizzle must fit the pow2 alloc shape.
+    if (triton::tools::isNpotAllowed())
+      blockShape = getNpotPow2AllocShape(blockShape);
     if (failed(getTMABlockShape(blockShape, enc.getElementBitWidth(),
                                 enc.getSwizzlingByteWidth(), enc.getFp4Padded(),
                                 enc.getTransposed(), /*packedSize=*/false,
@@ -313,9 +319,9 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     }
   }
 
-  if (npotCoverAllocShape)
-    return verifyNpotPhysicalCover(emitError, encoding, shape,
-                                   *npotCoverAllocShape);
+  if (npotPow2AllocShape)
+    return verifyNpotPow2AllocView(emitError, encoding, shape,
+                                   *npotPow2AllocShape);
   return success();
 }
 

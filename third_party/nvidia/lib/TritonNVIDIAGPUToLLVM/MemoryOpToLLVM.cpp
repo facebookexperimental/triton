@@ -13,6 +13,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
 #include "triton/Tools/LayoutUtils.h"
 namespace {
 
@@ -82,7 +83,8 @@ LogicalResult lowerLdStMatrix(
   auto *ctx = loc.getContext();
   assert(regLayout.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
          "expected register broadcasting to be removed by the caller");
-  if (isa<PaddedSharedEncodingAttr>(memDescType.getEncoding())) {
+  if (isa<PaddedSharedEncodingAttr>(memDescType.getEncoding()) ||
+      !regLayout.isRadix2()) {
     return failure();
   }
   if (SharedMemoryObject::getMaskSpanOffsetsAndBlocks(memDescType).second !=
@@ -113,6 +115,45 @@ LogicalResult lowerLdStMatrix(
   return failure();
 }
 
+// Each chunk is a pow2 view of the pow2 alloc shape, so it loads as a padded
+// operand's view does: ldmatrix, else the radix-2 path.
+void lowerPow2Chunks(Location loc, const nvidia_gpu::Pow2Chunks &chunks,
+                     MemDescType memDescType, SmallVector<Value> &vals,
+                     const SharedMemoryObject &smemObj, Operation *op,
+                     ConversionPatternRewriter &rewriter,
+                     const NVIDIA::TargetInfo &targetInfo,
+                     const LLVMTypeConverter *typeConverter) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  ArrayRef<int64_t> allocShape = memDescType.getAllocShape();
+  size_t rank = chunks.starts.front().size();
+  SmallVector<int64_t> chunkAlloc(allocShape.drop_back(rank));
+  llvm::append_range(chunkAlloc,
+                     getNpotPow2AllocShape(allocShape.take_back(rank)));
+  auto chunkTy = MemDescType::get(
+      llvm::to_vector_of<int64_t>(chunks.layout.getOutDimSizes()),
+      memDescType.getElementType(), memDescType.getEncoding(),
+      memDescType.getMemorySpace(), memDescType.getMutableMemory(), chunkAlloc);
+  Type llvmElemTy = typeConverter->convertType(memDescType.getElementType());
+  for (ArrayRef<int32_t> start : chunks.starts) {
+    SmallVector<Value> offsets = smemObj.getOffsets();
+    for (auto [offset, s] :
+         llvm::zip(MutableArrayRef(offsets).take_back(rank), start))
+      offset = b.add(offset, b.i32_val(s));
+    SharedMemoryObject chunkObj(smemObj.getBase(), smemObj.getBaseElemType(),
+                                offsets);
+    SmallVector<Value> chunkVals;
+    if (failed(lowerLdStMatrix(loc, chunks.layout, chunkTy, chunkVals, chunkObj,
+                               rewriter, targetInfo, typeConverter)))
+      chunkVals = lowerLocalLdSt(
+          loc, loc.getContext(),
+          invertAndComposeLocal(toLinearLayoutIgnoringPadding(chunkTy),
+                                chunks.layout,
+                                {StringAttr::get(loc.getContext(), "block")}),
+          {}, llvmElemTy, chunkTy, chunkObj, rewriter, targetInfo, op);
+    llvm::append_range(vals, chunkVals);
+  }
+}
+
 struct LocalLoadOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::LocalLoadOp> {
 public:
@@ -141,6 +182,17 @@ public:
     auto result =
         lowerLdStMatrix(op.getLoc(), regLayout, memDescType, values, smemObj,
                         rewriter, targetInfo, getTypeConverter());
+    auto dot = dyn_cast<DotOperandEncodingAttr>(dstTy.getEncoding());
+    auto mma = dot ? dyn_cast<NvidiaMmaEncodingAttr>(dot.getParent()) : nullptr;
+    std::optional<nvidia_gpu::Pow2Chunks> chunks;
+    // A transposed operand loads in its pre-trans layout, not a dot operand.
+    bool ampere = mma ? mma.isAmpere() : targetInfo.getComputeCapability() < 90;
+    if (!regLayout.isRadix2() && ampere &&
+        (chunks = nvidia_gpu::getPow2Chunks(regLayout))) {
+      lowerPow2Chunks(op.getLoc(), *chunks, memDescType, values, smemObj, op,
+                      rewriter, targetInfo, getTypeConverter());
+      result = success();
+    }
     if (failed(result)) {
       return failure();
     }

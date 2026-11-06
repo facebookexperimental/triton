@@ -147,8 +147,14 @@ public:
       auto outDims = to_vector(mmaLl.getOutDimNames());
       auto kWarp = str_attr("warp");
       // Map from warps into the MN dimension
-      auto mmaWarps = mmaLl.sublayout({kWarp}, {outDims[MNdim]}) *
-                      LinearLayout::identity1D(1, kWarp, outDims[1 - MNdim]);
+      auto mmaWarps = mmaLl.sublayout({kWarp}, {outDims[MNdim]});
+      // A mixed-radix layout's warps sit on its binary part, inside the pow2
+      // alloc shape.
+      if (!mmaWarps.isRadix2())
+        mmaWarps = LinearLayout(
+            mmaWarps.getBases(),
+            {{outDims[MNdim], ll.getInDimSize(outDims[MNdim])}}, false);
+      mmaWarps *= LinearLayout::identity1D(1, kWarp, outDims[1 - MNdim]);
       // Map from warps to offsets in bitwidth elements
       auto warpToOffset = mmaWarps.compose(ll);
       // Map from warps to offsets in 128b elements

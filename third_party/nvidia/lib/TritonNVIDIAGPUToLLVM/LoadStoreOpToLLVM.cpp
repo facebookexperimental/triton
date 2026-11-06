@@ -1111,6 +1111,13 @@ struct AsyncCopyGlobalToLocalOpConversion
     if (failed(verifyDetailedCachePolicySupport(op, *cachePolicy,
                                                 computeCapability)))
       return failure();
+    // The target's NpotTargetLegality rejects mixed-radix copies it can't
+    // lower.
+    if (FailureOr<LinearLayout> ll = triton::gpu::getExactNpotOperandLayout(op);
+        succeeded(ll))
+      if (std::optional<std::string> reason =
+              triton::getNpotAsyncCopyUnsupportedReason(op, *ll))
+        return op.emitError(*reason);
     auto ctx = getContext();
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -1238,6 +1245,15 @@ struct AsyncCopyGlobalToLocalOpConversion
     maxVec = std::max(maxVec, op.getContiguity());
     // The maximum vector size is 128 bits on NVIDIA GPUs.
     maxVec = std::min(maxVec, 128 / resElemTy.getIntOrFloatBitWidth());
+    // A mixed-radix layout's odd digits add rather than XOR, so it doesn't
+    // compose with the shared layout: copy each run that is contiguous there.
+    std::optional<LinearLayout> toOffset;
+    if (!srcLayout.isRadix2()) {
+      toOffset = ttg::toLinearLayout(dstTy).pseudoinvert();
+      maxVec = std::min<unsigned>(
+          maxVec, ttg::getMixedRadixSharedRun(
+                      srcLayout, *toOffset, resElemTy.getIntOrFloatBitWidth()));
+    }
 
     int vecBytes = maxVec * resElemTy.getIntOrFloatBitWidth() / 8;
     if (vecBytes < 4) {
@@ -1315,6 +1331,18 @@ struct AsyncCopyGlobalToLocalOpConversion
     // %dst
     auto smemObj =
         getSharedMemoryObjectFromStruct(loc, llDst, resElemTy, rewriter);
+    if (toOffset) {
+      auto smemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+      ttg::forEachMixedRadixSharedRun(
+          loc, rewriter, srcLayout, *toOffset, maxVec,
+          [&](int32_t reg, Value offset, auto) {
+            emitCpAsync(rewriter, loc, vals,
+                        b.gep(smemPtrTy, resElemTy, smemObj.getBase(), offset),
+                        reg, vec_ty(resElemTy, maxVec), Value());
+          });
+      rewriter.replaceOp(op, b.i32_val(0));
+      return success();
+    }
     auto smemLayout = ttg::toLinearLayout(dstTy);
     auto cvt = srcLayout.invertAndCompose(smemLayout);
     if (!cvt.isTrivialOver({str_attr("block")})) {
@@ -1350,9 +1378,31 @@ static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty,
   auto outDimNames = standardOutDimNames(ctx, rank);
   LinearLayout msgToOffset;
   for (int dim = 0; dim < rank; ++dim) {
-    msgToOffset *=
-        LinearLayout::strided1D(shapePerCTA[dim] / blockShape[dim],
-                                blockShape[dim], kMsg, outDimNames[dim]);
+    int64_t box = blockShape[dim];
+    int32_t numMsgs = shapePerCTA[dim] / box;
+    int32_t twoPart = LinearLayout::twoPartOf(numMsgs);
+    // getNpotTMAUnsupportedReason allows an NPOT box only as the whole extent,
+    // and an odd message count as one more mixed-radix digit of stride
+    // twoPart * box.
+    if (llvm::isPowerOf2_64(box)) {
+      msgToOffset *=
+          LinearLayout::strided1D(twoPart, box, kMsg, outDimNames[dim]);
+    } else {
+      LinearLayout::BasesT oneMsg;
+      oneMsg[kMsg] = {};
+      msgToOffset *= LinearLayout(std::move(oneMsg), LinearLayout::RadicesT(),
+                                  {{outDimNames[dim], box}},
+                                  /*requireSurjective=*/false);
+    }
+    if (numMsgs != twoPart) {
+      LinearLayout::BasesT bases;
+      bases[kMsg] = {{1}};
+      LinearLayout::RadicesT radices;
+      radices[kMsg] = {numMsgs / twoPart};
+      msgToOffset *= LinearLayout(std::move(bases), std::move(radices),
+                                  {{outDimNames[dim], numMsgs / twoPart}},
+                                  /*requireSurjective=*/true);
+    }
   }
   auto cgaLayout = getCGALayout(ty.getEncoding());
   // The memdesc shape rank may exceed the encoding's CGALayout rank (the
@@ -1386,6 +1436,21 @@ getMsgToUnpackedOffsetLayout(const LinearLayout &packedLayout,
   // Multiply to offset by 2 in the last dimension
   auto unpackLayout = LinearLayout::zeros1D(1, kMsg, kLastDim, 2);
   return unpackLayout * packedLayout;
+}
+
+// A mixed-radix plan's odd message-index digit adds rather than XORs, so it
+// doesn't compose with the shared layout: `msgToShared` is then the layout's
+// inverse, applied to the message's coordinates.
+static SmallVector<std::pair<StringAttr, Value>>
+applyMsgToShared(Location loc, RewriterBase &rewriter,
+                 const LinearLayout &msgToShared,
+                 const LinearLayout *mixedRadixPlan, Value msg, Value ctaId) {
+  auto ctx = rewriter.getContext();
+  SmallVector<std::pair<StringAttr, Value>> ins = {{str_attr("msg"), msg},
+                                                   {str_attr("block"), ctaId}};
+  if (mixedRadixPlan)
+    ins = applyLinearLayout(loc, rewriter, *mixedRadixPlan, ins);
+  return applyLinearLayout(loc, rewriter, msgToShared, ins);
 }
 
 struct AsyncTMACopyGlobalToLocalOpConversion
@@ -1455,8 +1520,11 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto kBlock = str_attr("block");
     auto msgToPackedOffset = getMsgToPackedOffsetLayout(smemTy, tmaMode);
     auto smemLayout = ttg::toLinearLayout(smemTy);
+    bool mixedRadixPlan = !msgToPackedOffset.isRadix2();
     auto msgToShared =
-        invertAndComposeLocal(smemLayout, msgToPackedOffset, {kBlock});
+        mixedRadixPlan
+            ? smemLayout.pseudoinvert()
+            : invertAndComposeLocal(smemLayout, msgToPackedOffset, {kBlock});
     auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, smemTy);
 
     auto kMsg = str_attr("msg");
@@ -1509,8 +1577,9 @@ struct AsyncTMACopyGlobalToLocalOpConversion
           b.and_(pred, b.icmp_ult(id, b.i32_val(numWarpsToCopy * warpSize)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;
       Value copyIdxVal = b.add(warpID, b.i32_val(copyIdx));
-      auto sharedAddress = applyLinearLayout(
-          loc, rewriter, msgToShared, {{kMsg, copyIdxVal}, {kBlock, ctaId}});
+      auto sharedAddress = applyMsgToShared(
+          loc, rewriter, msgToShared,
+          mixedRadixPlan ? &msgToPackedOffset : nullptr, copyIdxVal, ctaId);
       Value shMemOffset;
       Value layoutBlock;
       for (auto [name, value] : sharedAddress) {
@@ -1771,7 +1840,10 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
   auto msgToPackedOffset =
       getMsgToPackedOffsetLayout(srcTy, ttg::TMAMode::Tiled);
   auto smemLayout = ttg::toLinearLayout(srcTy);
-  auto msgToShared = msgToPackedOffset.invertAndCompose(smemLayout);
+  bool mixedRadixPlan = !msgToPackedOffset.isRadix2();
+  auto msgToShared = mixedRadixPlan
+                         ? smemLayout.pseudoinvert()
+                         : msgToPackedOffset.invertAndCompose(smemLayout);
   auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, srcTy);
 
   auto ctx = op->getContext();
@@ -1799,8 +1871,9 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
     Type elemPtrTy = ptr_ty(rewriter.getContext(), 3);
     Value copyIdxVal = b.add(warpID, b.i32_val(copyIdx));
     Value shMemOffset =
-        applyLinearLayout(loc, rewriter, msgToShared,
-                          {{kMsg, copyIdxVal}, {kBlock, ctaId}})[0]
+        applyMsgToShared(loc, rewriter, msgToShared,
+                         mixedRadixPlan ? &msgToPackedOffset : nullptr,
+                         copyIdxVal, ctaId)[0]
             .second;
     Value shMemPtr = b.gep(elemPtrTy, llvmElemTy, dstBase, shMemOffset);
     SmallVector<PTXBuilder::Operand *> operands = {
@@ -2024,10 +2097,12 @@ static LogicalResult iterateGatherScatterIndices(
   // `xCoordsLayout` maps the register ID into dim0. Tile dim1 by adding a new
   // dimension representing the TMA message ID.
   assert(innerBlockSize % numMessagesPerRow == 0);
-  assert(llvm::isPowerOf2_32(numMessagesPerRow));
   unsigned msgSize = innerBlockSize / numMessagesPerRow;
-  LinearLayout msgToCol =
-      LinearLayout::strided1D(numMessagesPerRow, msgSize, kMsg, kDim1);
+  // An NPOT row is whole boxes (getNpotTMAUnsupportedReason) of the pow2 alloc
+  // shape that the shared layout spans, so plan the pow2 alloc shape's messages
+  // and issue the first numMessagesPerRow.
+  LinearLayout msgToCol = LinearLayout::strided1D(
+      llvm::PowerOf2Ceil(numMessagesPerRow), msgSize, kMsg, kDim1);
   LinearLayout msgToOffset =
       getMsgToPackedOffsetLayout(smemType, ttg::TMAMode::Tiled);
   LinearLayout msgLayout = xCoordsLayout * msgToCol;
@@ -2036,7 +2111,7 @@ static LogicalResult iterateGatherScatterIndices(
     basis.back() = msgToOffset.getBasis(kBlock, bit, kDim1);
   auto msgOutDims = msgLayout.getOutDims();
   msgOutDims[msgLayout.getOutDimIndex(kDim1)].second =
-      smemType.getShape().back();
+      llvm::PowerOf2Ceil(smemType.getShape().back());
   msgLayout = LinearLayout(std::move(msgBases), msgOutDims,
                            /*requireSurjective=*/false);
 

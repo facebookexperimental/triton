@@ -1,16 +1,16 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -tritonamdgpu-schedule-loops=num_stages=2 -tritonamdgpu-pipeline -canonicalize | FileCheck --enable-var-scope %s
 
-// The stream pipeliner shares the load filter: an NPOT Product load is not
+// The stream pipeliner shares the load filter: an NPOT mixed-radix load is not
 // scheduled, while the power-of-two control is.
 
 #p192 = #ttg.linear<{register = [[64]], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
 module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK-LABEL: @product_load_not_pipelined
+  // CHECK-LABEL: @mixed_radix_load_not_pipelined
   // CHECK-NOT: tt.load
   // CHECK: scf.for
   // CHECK-NEXT: tt.load
   // CHECK-NEXT: tt.store
-  tt.func public @product_load_not_pipelined(%p: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %q: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %n: i32) {
+  tt.func public @mixed_radix_load_not_pipelined(%p: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %q: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %n: i32) {
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
     %r = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #p192>

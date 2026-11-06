@@ -1,5 +1,5 @@
 // With the flag on, verifyMemDescLayout rejects a CTA split of an NPOT shared
-// extent: the layout is built on the power-of-two cover. With the flag off the
+// extent: the layout is built on the pow2 alloc shape. With the flag off the
 // allocations verify, as before this diff.
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt --split-input-file %s --verify-diagnostics
 // RUN: env -u TRITON_ALLOW_NPOT triton-opt --split-input-file %s | FileCheck %s --check-prefix=OFF
@@ -34,8 +34,8 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
-// 4 CTAs split the 24 rows evenly, but the 32-row cover gives each CTA 8 rows,
-// not 6.
+// 4 CTAs split the 24 rows evenly, but the 32-row pow2 alloc shape gives each
+// CTA 8 rows, not 6.
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0], [2, 0]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
@@ -50,7 +50,8 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
-// The 4-row cover of extent 3 is split 4 ways, so nothing broadcasts.
+// The 4-row pow2 alloc shape of extent 3 is split 4 ways, so nothing
+// broadcasts.
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0], [2, 0]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {

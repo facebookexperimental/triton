@@ -359,7 +359,7 @@ constexpr int kGlobalScratchBufferOffset = -2;
 constexpr int kSharedMemoryOffset = -3;
 
 // Defined in triton/Analysis/Utility.h.
-struct ProductSharedTiling;
+struct MixedRadixSharedTiling;
 
 namespace triton {
 
@@ -387,17 +387,25 @@ Value emitRedundantThreadPredicate(
     const TargetInfoBase &targetInfo);
 
 // True iff every free-variable digit of `indices` is 0 (mixed radix), so each
-// output of `layout` has one canonical owner.
+// output of `layout` is held by one thread.
 Value emitCanonicalLayoutOwnerPredicate(
     Location loc, RewriterBase &rewriter, const LinearLayout &layout,
     ArrayRef<std::pair<StringAttr, Value>> indices,
     const llvm::MapVector<StringAttr, int32_t> &freeVariableMasks);
 
-// Moves Product `inVals` from `srcLayout` to `dstLayout` through scratch at
-// `smemBase`: each element is stored once, by its canonical owner, then every
-// destination register loads its element. Runs of registers are vectorized.
-// A `tiling` repeats this per tile in one tile of scratch.
-SmallVector<Value> transferProductThroughSharedMemory(
+// Calls `access` per `run` registers of a mixed-radix `regLayout` with the
+// first register, its offset through `toOffset` (the shared layout's
+// pseudoinverse) and the hardware indices that reach it.
+void forEachMixedRadixSharedRun(
+    Location loc, RewriterBase &rewriter, const LinearLayout &regLayout,
+    const LinearLayout &toOffset, int32_t run,
+    function_ref<void(int32_t, Value, ArrayRef<std::pair<StringAttr, Value>>)>
+        access);
+
+// Moves mixed-radix `inVals` from `srcLayout` to `dstLayout` via scratch at
+// `smemBase`: its thread stores each element once, then each destination
+// register loads it, in vector runs. A `tiling` reuses one scratch tile.
+SmallVector<Value> transferMixedRadixThroughSharedMemory(
     Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     const LinearLayout &srcLayout, const LinearLayout &dstLayout,
     ArrayRef<Value> inVals, Type elemTy, Value smemBase,
@@ -405,7 +413,7 @@ SmallVector<Value> transferProductThroughSharedMemory(
     bool blockScope,
     std::optional<std::pair<Value, Value>> distributedCoordinates =
         std::nullopt,
-    const ProductSharedTiling *tiling = nullptr);
+    const MixedRadixSharedTiling *tiling = nullptr);
 
 // Takes two values that may be boolean, or null to represent constant True.
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b);

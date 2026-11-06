@@ -46,8 +46,8 @@ struct ConvertLayoutOpConversion
 
     auto kRegister = str_attr("register");
 
-    if (auto plan = getProductConversionPlan(srcTy, dstTy))
-      return lowerProductConversion(op, *plan, adaptor, rewriter);
+    if (auto plan = getMixedRadixConversionPlan(srcTy, dstTy))
+      return lowerMixedRadixConversion(op, *plan, adaptor, rewriter);
     auto srcLayout = toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
     auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
     LinearLayout conversion = minimalCvtLayout(srcLayout, dstLayout);
@@ -96,10 +96,9 @@ struct ConvertLayoutOpConversion
     return success();
   }
 
-  LogicalResult
-  lowerProductConversion(ConvertLayoutOp op, const ProductConversionPlan &plan,
-                         OpAdaptor adaptor,
-                         ConversionPatternRewriter &rewriter) const {
+  LogicalResult lowerMixedRadixConversion(
+      ConvertLayoutOp op, const MixedRadixConversionPlan &plan,
+      OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const {
     assert(plan.supported() && "the verifier rejects unsupported plans");
     auto loc = op.getLoc();
     auto kRegister = StringAttr::get(op.getContext(), "register");
@@ -107,12 +106,12 @@ struct ConvertLayoutOpConversion
     auto srcLayout = toLinearLayout(op.getSrc().getType())
                          .removeZeroBasesAlongDim(kRegister);
     auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
-    if (plan.transport == ProductConversionTransport::Shared) {
+    if (plan.transfer == MixedRadixConversionTransfer::Shared) {
       transferSwizzlingLocalMem(op, adaptor.getSrc(), srcLayout, dstLayout,
                                 rewriter, &plan);
       return success();
     }
-    if (plan.transport == ProductConversionTransport::Warp)
+    if (plan.transfer == MixedRadixConversionTransfer::Warp)
       return transferWithinWarp(op, srcLayout, dstLayout, adaptor, rewriter,
                                 &plan);
     auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
@@ -134,7 +133,7 @@ struct ConvertLayoutOpConversion
       ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
       Operation *sourceOp,
       std::optional<std::pair<Value, Value>> distributedCoordinates,
-      const ProductConversionPlan *plan) const {
+      const MixedRadixConversionPlan *plan) const {
     auto *ctx = rewriter.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     // We handle transformations recursively as they all need a preprocessing
@@ -172,10 +171,10 @@ struct ConvertLayoutOpConversion
 
     // The owner predicate handles broadcast source registers.
     if (plan)
-      return transferProductThroughSharedMemory(
+      return transferMixedRadixThroughSharedMemory(
           loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, llvmElemTy,
           smemBase, plan->sourceFreeVariableMasks,
-          plan->scope == triton::ProductConversionScope::Block,
+          plan->scope == triton::MixedRadixConversionScope::Block,
           distributedCoordinates,
           plan->sharedTiling ? &*plan->sharedTiling : nullptr);
 
@@ -296,7 +295,7 @@ struct ConvertLayoutOpConversion
   void transferSwizzlingLocalMem(
       ConvertLayoutOp op, Value src, const LinearLayout &srcLayout,
       const LinearLayout &dstLayout, ConversionPatternRewriter &rewriter,
-      const ProductConversionPlan *plan = nullptr) const {
+      const MixedRadixConversionPlan *plan = nullptr) const {
     auto loc = op.getLoc();
     auto srcTy = op.getSrc().getType();
     auto dstTy = op.getType();
@@ -329,7 +328,7 @@ struct ConvertLayoutOpConversion
   transferWithinWarp(ConvertLayoutOp op, const LinearLayout &srcLayout,
                      const LinearLayout &dstLayout, OpAdaptor adaptor,
                      ConversionPatternRewriter &rewriter,
-                     const ProductConversionPlan *plan = nullptr) const {
+                     const MixedRadixConversionPlan *plan = nullptr) const {
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -455,7 +454,7 @@ struct ConvertLayoutOpConversion
       outVals = std::move(unpackedVals);
     }
 
-    // A Product plan's pReg output is in destinationRegisterOrder's input
+    // A mixed-radix plan's pReg output is in destinationRegisterOrder's input
     // order.
     if (plan)
       outVals = plan->destinationRegisterOrder->apply(outVals);

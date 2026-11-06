@@ -483,10 +483,11 @@ LogicalResult ConvertLayoutOp::verify() {
   if (!getForceWarpShuffle())
     return success();
 
-  if (auto plan = getProductConversionPlan(getSrc().getType(), getType())) {
-    if (plan->transport == ProductConversionTransport::Shared)
-      return emitOpError("NPOT Product conversion through shared memory is not "
-                         "yet supported with force_warp_shuffle");
+  if (auto plan = getMixedRadixConversionPlan(getSrc().getType(), getType())) {
+    if (plan->transfer == MixedRadixConversionTransfer::Shared)
+      return emitOpError(
+          "NPOT mixed-radix conversion through shared memory is not "
+          "yet supported with force_warp_shuffle");
     return success();
   }
   auto conversion = minimalCvtLayout(getSrc().getType(), getType());
@@ -829,8 +830,9 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 
   Attribute dstEncoding;
   if (Attribute srcEnc = srcTy.getEncoding()) {
-    if (!llvm::equal(getNpotCoverShape(srcTy.getShape()), srcTy.getShape()) ||
-        !llvm::equal(getNpotCoverShape(dstShape), dstShape))
+    if (!llvm::equal(getNpotPow2AllocShape(srcTy.getShape()),
+                     srcTy.getShape()) ||
+        !llvm::equal(getNpotPow2AllocShape(dstShape), dstShape))
       return emitOptionalError(loc, "NPOT reshape is not yet supported");
     if (failed(inferMemDescReshapeOpEncoding(srcTy.getShape(), srcEnc, dstShape,
                                              dstEncoding)))
@@ -850,7 +852,7 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 }
 
 LogicalResult MemDescReinterpretOp::verify() {
-  if (failed(verifyNpotCoverOperands(*this)))
+  if (failed(verifyNpotPow2AllocViewOperands(*this)))
     return failure();
   auto srcTy = getSrc().getType();
   auto dstTy = getType();
@@ -1094,7 +1096,7 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 }
 
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy) {
-  if (dstTy.getShape() != dstTy.getAllocShape() && !isNpotPhysicalCover(dstTy))
+  if (dstTy.getShape() != dstTy.getAllocShape() && !isNpotPow2AllocView(dstTy))
     return op->emitOpError("result shape and its alloc shape must match");
 
   if (!src) {
@@ -1224,11 +1226,36 @@ LogicalResult AsyncRemoteShmemStoreOp::verify() {
   return success();
 }
 
+// Mixed-radix lowerings address runs through the buffer's pow2 alloc layout, so
+// it must have no padding or partitions. A local_load XORs in a view's origin,
+// which adds only on pow2 subslice extents; an async copy runs from the base.
+static std::optional<std::string>
+getMixedRadixBufferUnsupportedReason(MemDescType type, bool pow2Views) {
+  Attribute enc = type.getEncoding();
+  auto shape = dropPipeliningDim(type.getShape(), enc);
+  auto allocShape = dropPipeliningDim(type.getAllocShape(), enc);
+  if (isa<PaddedSharedEncodingAttr, PartitionedSharedEncodingAttr>(enc) ||
+      (shape != allocShape && !pow2Views))
+    return std::string("NPOT mixed-radix access to a padded, partitioned or "
+                       "partial buffer is not yet supported");
+  for (auto [size, allocSize] : llvm::zip_equal(shape, allocShape))
+    if (size != allocSize && !llvm::isPowerOf2_64(size))
+      return std::string(
+          "NPOT mixed-radix access to a view with an NPOT subslice "
+          "extent is not yet supported");
+  return std::nullopt;
+}
+
 // LocalLoadOp
 LogicalResult LocalLoadOp::verify() {
   if (failed(verifySharedMemoryRank(*this, getType(), getSrc().getType(),
                                     "result")))
     return failure();
+  if (hasExactNpotLayout(getType()))
+    if (std::optional<std::string> reason =
+            getMixedRadixBufferUnsupportedReason(getSrc().getType(),
+                                                 /*pow2Views=*/true))
+      return emitError(*reason);
   return verifyMemoryOpTypes(*this, getSrc().getType(), getType());
 }
 
@@ -1426,6 +1453,11 @@ LogicalResult AsyncCopyGlobalToLocalOp::verify() {
       return emitOpError("non-bulk mode requires src to be a ranked tensor of "
                          "pointers");
   }
+  if (succeeded(getExactNpotOperandLayout(*this)))
+    if (std::optional<std::string> reason =
+            getMixedRadixBufferUnsupportedReason(getResult().getType(),
+                                                 /*pow2Views=*/false))
+      return emitError(*reason);
   return success();
 }
 
@@ -1469,8 +1501,8 @@ LogicalResult MemDescIndexOp::verify() {
 
   auto layoutAllocShape =
       dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding());
-  bool hasPhysicalCover = isNpotPhysicalCover(srcTy);
-  if (layoutAllocShape != layoutShape && !hasPhysicalCover) {
+  bool hasPow2AllocView = isNpotPow2AllocView(srcTy);
+  if (layoutAllocShape != layoutShape && !hasPow2AllocView) {
     return emitError(
         "We only support memdesc_index of a multibuffer-prefix subview");
   }
@@ -1486,7 +1518,7 @@ LogicalResult MemDescIndexOp::verify() {
   }
 
   if (dstTy.getAllocShape() !=
-      (hasPhysicalCover ? layoutAllocShape : dstTy.getShape())) {
+      (hasPow2AllocView ? layoutAllocShape : dstTy.getShape())) {
     return emitError("alloc shape must match shape for the result");
   }
 

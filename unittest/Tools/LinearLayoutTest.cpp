@@ -1425,7 +1425,6 @@ TEST_F(MixedRadixTest, PreconditionAsserts) {
   EXPECT_DEATH((void)ColumnAction::identity(S("register"), 2).apply(ll),
                "isRadix2");
   EXPECT_DEATH((void)action.apply(pow2), "isRadix2");
-  EXPECT_DEATH((void)action.inverse(), "isRadix2");
   EXPECT_DEATH((void)action.leftCompose(action), "isRadix2");
   // concatOuts needs equal radices, reshapeIns whole digits, and
   // ColumnAction::apply one value per index.
@@ -1467,7 +1466,7 @@ TEST_F(MixedRadixTest, ReshapeInsCutsAtDigitBoundaries) {
   EXPECT_EQ(flat.reshapeIns({{S("register"), 6}, {S("lane"), 2}}), mixed());
 }
 
-TEST_F(MixedRadixTest, ProductConcatenatesDigits) {
+TEST_F(MixedRadixTest, MixedRadixConcatenatesDigits) {
   auto reg2 = LinearLayout::identity1D(2, S("register"), S("dim1"));
   EXPECT_THAT((mixed() * reg2).getInputRadices(S("register")),
               ElementsAre(3, 2, 2));
@@ -1519,13 +1518,16 @@ TEST_F(MixedRadixTest, ColumnActionApplyValues) {
               ElementsAre(0, 3, 1, 4, 2, 5));
   EXPECT_THAT(ids(ColumnAction({1}, S("register"), 2, {3, 2}).apply(values)),
               ElementsAre(0, 3));
+  ColumnAction swap({1, 0}, S("register"), 2, {3, 2});
+  EXPECT_THAT(ids(swap.inverse().apply(swap.apply(values))),
+              ElementsAre(0, 1, 2, 3, 4, 5));
 }
 
-class ProductCarrierTest : public LinearLayoutTest {
+class MixedRadixLayoutTest : public LinearLayoutTest {
 protected:
-  LinearLayout product(std::vector<std::vector<int32_t>> regBases,
-                       std::vector<int32_t> regRadices,
-                       ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
+  LinearLayout mixedRadix(std::vector<std::vector<int32_t>> regBases,
+                          std::vector<int32_t> regRadices,
+                          ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
     BasesT bases;
     bases[S("register")] = std::move(regBases);
     LinearLayout::RadicesT radices;
@@ -1551,17 +1553,17 @@ protected:
   }
 };
 
-TEST_F(ProductCarrierTest, InvariantsReject) {
+TEST_F(MixedRadixLayoutTest, InvariantsReject) {
   auto build = [&](std::vector<std::vector<int32_t>> regBases,
                    std::vector<int32_t> regRadices,
                    ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
-    (void)product(std::move(regBases), std::move(regRadices), outDims);
+    (void)mixedRadix(std::move(regBases), std::move(regRadices), outDims);
   };
   EXPECT_DEATH(build({}, {}, {{S("x"), 0}}), "Out-dim sizes must be positive");
   EXPECT_DEATH(build({{3}}, {2}, {{S("x"), 6}}),
-               "invalid radix-2 digit: it has an odd Product");
+               "invalid radix-2 digit: it has an odd mixed-radix");
   EXPECT_DEATH(build({{3}}, {3}, {{S("x"), 6}}),
-               "invalid non-binary digit: it has a binary Product");
+               "invalid non-binary digit: it has a binary mixed-radix");
   EXPECT_DEATH(build({{2, 1}}, {3}, {{S("x"), 6}, {S("y"), 2}}),
                "invalid input digit of radix 3 in in-dim 'register': its "
                "basis must be zero on Binary outputs");
@@ -1573,7 +1575,7 @@ TEST_F(ProductCarrierTest, InvariantsReject) {
   EXPECT_DEATH(build({{6}}, {9}, {{S("x"), 18}}), unsupported);
 }
 
-TEST_F(ProductCarrierTest, OnlyRadicesAdmitProductSizes) {
+TEST_F(MixedRadixLayoutTest, OnlyRadicesAllowMixedRadixSizes) {
   BasesT bases;
   bases[S("register")] = {{1}};
   LinearLayout::RadicesT radices;
@@ -1585,45 +1587,45 @@ TEST_F(ProductCarrierTest, OnlyRadicesAdmitProductSizes) {
                "Out-dim sizes must be powers of 2");
 }
 
-TEST_F(ProductCarrierTest, SublayoutWithoutInDimsKeepsProductSize) {
-  // No in-dims leave an empty radices map, which still admits the size.
+TEST_F(MixedRadixLayoutTest, SublayoutWithoutInDimsKeepsMixedRadixSize) {
+  // No in-dims leave an empty radices map, which still allows the size.
   LinearLayout sub =
-      product({{1}}, {2}, {{S("dim"), 6}}).sublayout({}, {S("dim")});
+      mixedRadix({{1}}, {2}, {{S("dim"), 6}}).sublayout({}, {S("dim")});
   EXPECT_EQ(sub.getOutDimSize(S("dim")), 6);
 }
 
-TEST_F(ProductCarrierTest, RankCountsOwnedOddCoordinates) {
+TEST_F(MixedRadixLayoutTest, RankCountsOwnedOddCoordinates) {
   // Odd part 5: the codomain rank is countr_zero(20) + 1, below Log2(20).
   LinearLayout twenty = exactIdentity1D(20, S("register"), S("dim"));
   EXPECT_TRUE(twenty.isSurjective());
   EXPECT_TRUE(twenty.isInjective());
   EXPECT_EQ(twenty.getTotalOutDimSize(), 20);
-  LinearLayout productBit = product({{1}}, {2}, {{S("dim"), 6}});
-  EXPECT_FALSE(productBit.isSurjective());
-  // A Product output alone keeps a layout off the radix-2 algorithms.
-  EXPECT_FALSE(productBit.isRadix2());
+  LinearLayout mixedRadixBit = mixedRadix({{1}}, {2}, {{S("dim"), 6}});
+  EXPECT_FALSE(mixedRadixBit.isSurjective());
+  // A mixed-radix output alone keeps a layout off the radix-2 algorithms.
+  EXPECT_FALSE(mixedRadixBit.isRadix2());
   // A zero radix-2 digit after the odd digit: registers 0 and 6 collide.
   EXPECT_FALSE(
-      product({{1}, {2}, {0}}, {2, 3, 2}, {{S("dim"), 6}}).isInjective());
+      mixedRadix({{1}, {2}, {0}}, {2, 3, 2}, {{S("dim"), 6}}).isInjective());
   // A broadcast non-binary digit adds no rank.
   EXPECT_TRUE(
-      product({{1}, {2}, {0}}, {2, 3, 3}, {{S("dim"), 6}}).isSurjective());
+      mixedRadix({{1}, {2}, {0}}, {2, 3, 3}, {{S("dim"), 6}}).isSurjective());
   // Odd coefficient 4: basis 16 is above the Log2(20) binary rows.
   EXPECT_TRUE(
-      product({{1}, {2}, {16}}, {2, 2, 5}, {{S("dim"), 20}}).isSurjective());
+      mixedRadix({{1}, {2}, {16}}, {2, 2, 5}, {{S("dim"), 20}}).isSurjective());
 }
 
-TEST_F(ProductCarrierTest, EqualIgnoringOutDimSizesComparesTwoParts) {
+TEST_F(MixedRadixLayoutTest, EqualIgnoringOutDimSizesComparesTwoParts) {
   // Basis 4 is odd coordinate 2 at size 6 and odd coordinate 1 at size 12.
-  EXPECT_FALSE(product({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
+  EXPECT_FALSE(mixedRadix({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
                    .equalIgnoringOutDimSizes(
-                       product({{1}, {4}}, {2, 3}, {{S("dim"), 12}})));
+                       mixedRadix({{1}, {4}}, {2, 3}, {{S("dim"), 12}})));
   EXPECT_TRUE(
-      product({{1}}, {2}, {{S("dim"), 6}})
-          .equalIgnoringOutDimSizes(product({{1}}, {2}, {{S("dim"), 10}})));
+      mixedRadix({{1}}, {2}, {{S("dim"), 6}})
+          .equalIgnoringOutDimSizes(mixedRadix({{1}}, {2}, {{S("dim"), 10}})));
 }
 
-TEST_F(ProductCarrierTest, ReshapeInsAndRemoveZeroBasesKeepProduct) {
+TEST_F(MixedRadixLayoutTest, ReshapeInsAndRemoveZeroBasesKeepMixedRadix) {
   BasesT bases;
   LinearLayout::RadicesT radices;
   bases[S("register")] = {{1, 0}, {2, 0}};
@@ -1642,45 +1644,45 @@ TEST_F(ProductCarrierTest, ReshapeInsAndRemoveZeroBasesKeepProduct) {
             ll);
 }
 
-TEST_F(ProductCarrierTest, FreeVariableMasksFreeNonOwningDigits) {
+TEST_F(MixedRadixLayoutTest, FreeVariableMasksFreeNonOwningDigits) {
   // Digit 1 repeats digit 0's binary part and digit 3 is a zero odd digit;
   // digit 2 owns the odd coordinates.
-  EXPECT_EQ(product({{1}, {1}, {2}, {0}}, {2, 2, 3, 3}, {{S("dim"), 6}})
+  EXPECT_EQ(mixedRadix({{1}, {1}, {2}, {0}}, {2, 2, 3, 3}, {{S("dim"), 6}})
                 .getFreeVariableMasks()
                 .lookup(S("register")),
             0b1010);
 }
 
-TEST_F(ProductCarrierTest, MultiplyPlacesOddPartOnTop) {
+TEST_F(MixedRadixLayoutTest, MultiplyPlacesOddPartOnTop) {
   auto kReg = S("register"), kOut = S("out");
   // Inner's odd digit moves above outer's binary digits.
   EXPECT_EQ(exactIdentity1D(6, kReg, kOut) *
                 LinearLayout::identity1D(4, kReg, kOut),
-            product({{1}, {8}, {2}, {4}}, {2, 3, 2, 2}, {{kOut, 24}}));
+            mixedRadix({{1}, {8}, {2}, {4}}, {2, 3, 2, 2}, {{kOut, 24}}));
   EXPECT_EQ(LinearLayout::identity1D(2, kReg, kOut) *
                 exactIdentity1D(6, kReg, kOut),
             exactIdentity1D(12, kReg, kOut));
 }
 
-TEST_F(ProductCarrierTest, MultiplyRejectsTwoProductFactorsOnOneOutput) {
+TEST_F(MixedRadixLayoutTest, MultiplyRejectsTwoMixedRadixFactorsOnOneOutput) {
   auto kReg = S("register"), kOut = S("out");
   EXPECT_DEATH(
       (void)(exactIdentity1D(3, kReg, kOut) * exactIdentity1D(5, kReg, kOut)),
       "each odd part needs one non-binary digit");
 }
 
-TEST_F(ProductCarrierTest, Apply) {
+TEST_F(MixedRadixLayoutTest, Apply) {
   LinearLayout six = exactIdentity1D(6, S("register"), S("dim"));
   for (int32_t i = 0; i < 24; ++i)
     EXPECT_EQ(six.apply({{S("register"), i}}).front().second, i % 6) << i;
-  // A Binary output beside a Product output keeps XOR arithmetic.
+  // A Binary output beside a mixed-radix output keeps XOR arithmetic.
   LinearLayout twoDims =
       six * LinearLayout::identity1D(4, S("lane"), S("other"));
   for (int32_t lane = 0; lane < 4; ++lane)
     EXPECT_THAT(twoDims.apply({{S("register"), 5}, {S("lane"), lane}}),
                 ElementsAre(Pair(S("dim"), 5), Pair(S("other"), lane)));
   // Odd coefficient 2 is a unit mod 3: digit 2 wraps to odd coordinate 1.
-  EXPECT_EQ(product({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
+  EXPECT_EQ(mixedRadix({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
                 .apply({{S("register"), 4}})
                 .front()
                 .second,

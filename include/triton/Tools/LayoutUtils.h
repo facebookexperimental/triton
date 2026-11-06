@@ -11,7 +11,7 @@ namespace mlir::triton {
 bool coversAllLogicalOutputs(const LinearLayout &layout,
                              ArrayRef<int64_t> logicalShape);
 
-enum class ProductConversionScope {
+enum class MixedRadixConversionScope {
   Register,
   Warp,
   Block,
@@ -21,25 +21,25 @@ enum class ProductConversionScope {
 // unless the source out dims are dim0, dim1, ... of `logicalShape`'s rank and
 // the destination has the same out-dim names.
 std::optional<LinearLayout>
-alignProductConversionOutDims(const LinearLayout &srcLayout,
-                              const LinearLayout &dstLayout,
-                              ArrayRef<int64_t> logicalShape);
+alignMixedRadixConversionOutDims(const LinearLayout &srcLayout,
+                                 const LinearLayout &dstLayout,
+                                 ArrayRef<int64_t> logicalShape);
 
 // Whether every input dimension is register, lane, warp or a singleton block.
-bool hasProductConversionInputDims(const LinearLayout &layout);
+bool hasMixedRadixConversionInputDims(const LinearLayout &layout);
 
-// The narrowest scope holding every canonical source owner and in-bounds
-// destination replica; Block if a non-radix-2 digit lies outside registers.
-// Requires planProductLayoutConversion's preflight to pass.
-ProductConversionScope
-classifyProductConversionScope(const LinearLayout &srcLayout,
-                               const LinearLayout &dstLayout,
-                               ArrayRef<int64_t> logicalShape);
+// The narrowest scope holding every source thread that holds unique data and
+// in-bounds destination replica; Block if a non-radix-2 digit lies outside
+// registers. Requires planMixedRadixLayoutConversion's preflight to pass.
+MixedRadixConversionScope
+classifyMixedRadixConversionScope(const LinearLayout &srcLayout,
+                                  const LinearLayout &dstLayout,
+                                  ArrayRef<int64_t> logicalShape);
 
 // Maps L with a(registerOrder(L(x))) == b(x). L's register output puts a's
-// radix-2 register digits first and its odd digit last, as a Product out dim
-// needs; registerOrder takes that order to a's flat register order.
-struct ProductConversionInputMap {
+// radix-2 register digits first and its odd digit last, as a mixed-radix out
+// dim needs; registerOrder takes that order to a's flat register order.
+struct MixedRadixConversionInputMap {
   LinearLayout registerMap;
   LinearLayout laneMap;
   ColumnAction registerOrder;
@@ -48,8 +48,8 @@ struct ProductConversionInputMap {
 // Closed form; std::nullopt when a and b differ in outs or in dims, have
 // non-radix-2 digits outside registers or L would move another dim, and for
 // some register/lane bijections too (T294601128).
-std::optional<ProductConversionInputMap>
-mapProductConversionInputs(const LinearLayout &a, const LinearLayout &b);
+std::optional<MixedRadixConversionInputMap>
+mapMixedRadixConversionInputs(const LinearLayout &a, const LinearLayout &b);
 
 // Is the sublayout defined from dimNames to dimNames the identity?
 // In particular, is the input and  output size in these dimensions
@@ -220,8 +220,9 @@ SmallVector<StringAttr> supremum(const SmallVector<StringAttr> &x,
 LinearLayout reshapeLayout(MLIRContext *ctx, LinearLayout layout,
                            ArrayRef<int64_t> shape);
 
-// reshapeLayout for NPOT outputs: each new dim must take whole digits of the
-// row-major index, binary digits first and its odd digit last; else nullopt.
+// reshapeLayout returning nullopt, not asserting, when a mixed-radix layout
+// can't be regrouped: each new dim must take whole digits of the row-major
+// index, binary digits first and its odd digit last.
 std::optional<LinearLayout> tryReshapeLayout(MLIRContext *ctx,
                                              const LinearLayout &layout,
                                              ArrayRef<int64_t> shape);

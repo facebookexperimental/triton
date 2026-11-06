@@ -4,6 +4,8 @@
 #include <numeric>
 #include <utility>
 
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/OperationSupport.h"
@@ -45,15 +47,15 @@ namespace mlir {
 namespace triton {
 namespace gpu {
 
-static bool hasSingleDigitProductBases(const LinearLayout &ll,
-                                       StringAttr inDim);
+static bool hasSingleDigitMixedRadixBases(const LinearLayout &ll,
+                                          StringAttr inDim);
 
 bool hasPowerOfTwoBases(const LinearLayout &ll) {
-  // flattenOuts needs power-of-two output sizes; a Product layout is checked
-  // per digit instead.
-  if (ll.hasNonBinaryCarrier())
+  // flattenOuts needs power-of-two output sizes; a mixed-radix layout is
+  // checked per digit instead.
+  if (ll.hasNonPow2OutDim())
     return llvm::all_of(ll.getInDimNames(), [&](StringAttr inDim) {
-      return hasSingleDigitProductBases(ll, inDim);
+      return hasSingleDigitMixedRadixBases(ll, inDim);
     });
   LinearLayout flattened = ll.flattenIns().flattenOuts();
   auto inDim = *flattened.getInDimNames().begin();
@@ -63,11 +65,11 @@ bool hasPowerOfTwoBases(const LinearLayout &ll) {
       [](const auto &basis) { return llvm::isPowerOf2_32(basis.front()); });
 }
 
-// A Product layout is a mixed-radix permutation when every radix-2 digit sets
+// A mixed-radix layout is a digit permutation when every radix-2 digit sets
 // one output bit; checkInvariants makes each non-binary digit the unit owner of
 // one odd part, with no binary part.
-static bool hasSingleDigitProductBases(const LinearLayout &ll,
-                                       StringAttr inDim) {
+static bool hasSingleDigitMixedRadixBases(const LinearLayout &ll,
+                                          StringAttr inDim) {
   for (int32_t digit = 0; digit < ll.getInDimSizeLog2(inDim); ++digit) {
     int32_t bits = 0;
     for (StringAttr outDim : ll.getOutDimNames())
@@ -80,14 +82,14 @@ static bool hasSingleDigitProductBases(const LinearLayout &ll,
 }
 
 bool isPermutationMatrixLayout(const LinearLayout &ll) {
-  // flattenOuts requires power-of-two output sizes, so Product layouts take
+  // flattenOuts requires power-of-two output sizes, so mixed-radix layouts take
   // the per-output single-digit test instead.
-  if (ll.hasNonBinaryCarrier()) {
+  if (ll.hasNonPow2OutDim()) {
     LinearLayout flattened = ll.flattenIns();
     auto inDim = *flattened.getInDimNames().begin();
     LinearLayout withoutBroadcast = flattened.removeZeroBasesAlongDim(inDim);
     return withoutBroadcast.isInvertible() &&
-           hasSingleDigitProductBases(withoutBroadcast, inDim);
+           hasSingleDigitMixedRadixBases(withoutBroadcast, inDim);
   }
   if (!hasPowerOfTwoBases(ll))
     return false;
@@ -271,7 +273,7 @@ bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
                      ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
   auto llSrc = toLinearLayout(srcShape, srcEncoding);
   // An NPOT view keeps its registers only as the regrouped source.
-  if (llSrc.hasNonBinaryCarrier())
+  if (llSrc.hasNonPow2OutDim())
     return isNpotSharedReshape(srcShape, srcEncoding, dstShape, dstEncoding);
   auto llDst = toLinearLayout(dstShape, dstEncoding);
   // In case there are replicated value we need to make sure the new and old
@@ -289,7 +291,7 @@ bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
 bool isNpotSharedReshape(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
                          ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
   auto src = toLinearLayout(srcShape, srcEncoding);
-  return src.hasNonBinaryCarrier() &&
+  return src.hasNonPow2OutDim() &&
          tryReshapeLayout(srcEncoding.getContext(), src, dstShape) !=
              toLinearLayout(dstShape, dstEncoding);
 }
@@ -599,8 +601,7 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
   if (packedAxis)
     shape[*packedAxis] *= 2;
   // Flag off keeps upstream's allocation size (no pow2 rounding).
-  static const bool allowNpot =
-      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+  static const bool allowNpot = mlir::triton::tools::isNpotAllowed();
   if (allowNpot &&
       (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout))) {
     unsigned tileRank = getCGALayout(layout).getRank();
@@ -624,7 +625,7 @@ SmallVector<int64_t> getAllocationShapePerCTA(Type type) {
                                   tensorType.getShape());
 }
 
-// The layout of an NPOT extent is built on its power-of-two cover, so a CTA
+// The layout of an NPOT extent is built on its pow2 alloc shape, so a CTA
 // split of that extent would not give each CTA getShapePerCTA rows. After
 // MemDescType::verify only a shared first dimension can be NPOT.
 static bool hasNpotSharedCtaSplit(Attribute layout,
@@ -636,15 +637,15 @@ static bool hasNpotSharedCtaSplit(Attribute layout,
   });
 }
 
-bool isNpotPhysicalCover(MemDescType memDescTy) {
-  return isNpotPhysicalCover(memDescTy.getEncoding(), memDescTy.getShape());
+bool isNpotPow2AllocView(MemDescType memDescTy) {
+  return isNpotPow2AllocView(memDescTy.getEncoding(), memDescTy.getShape());
 }
 
-LogicalResult verifyNpotCoverOperands(Operation *op) {
+LogicalResult verifyNpotPow2AllocViewOperands(Operation *op) {
   for (Value operand : op->getOperands())
     if (auto type = dyn_cast<MemDescType>(operand.getType());
-        type && isNpotPhysicalCover(type))
-      return op->emitOpError("NPOT memdesc physical cover view on this "
+        type && isNpotPow2AllocView(type))
+      return op->emitOpError("NPOT memdesc pow2 alloc view on this "
                              "consumer is not yet supported");
   return success();
 }
@@ -656,16 +657,15 @@ bool hasPow2MemDescLayoutShape(Attribute layout, ArrayRef<int64_t> shape) {
   return llvm::all_of(layoutShape, llvm::isPowerOf2_64);
 }
 
-bool isNpotPhysicalCover(Attribute layout, ArrayRef<int64_t> shape) {
-  // A register encoding has no allocation to cover.
-  return triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
-         isa<LayoutEncodingTrait>(layout) &&
+bool isNpotPow2AllocView(Attribute layout, ArrayRef<int64_t> shape) {
+  // A register encoding has no pow2 alloc view.
+  return triton::tools::isNpotAllowed() && isa<LayoutEncodingTrait>(layout) &&
          !isa<DistributedEncodingTrait>(layout) &&
          !hasPow2MemDescLayoutShape(layout, shape);
 }
 
 LogicalResult
-verifyNpotPhysicalCover(function_ref<InFlightDiagnostic()> emitError,
+verifyNpotPow2AllocView(function_ref<InFlightDiagnostic()> emitError,
                         Attribute layout, ArrayRef<int64_t> shape,
                         ArrayRef<int64_t> allocShape) {
   auto reject = [&](StringRef diagnostic) -> LogicalResult {
@@ -676,21 +676,22 @@ verifyNpotPhysicalCover(function_ref<InFlightDiagnostic()> emitError,
                   "ranks is not yet supported");
   const unsigned rank = cast<LayoutEncodingTrait>(layout).getRank();
   if (rank != 2)
-    return reject("NPOT memdesc physical cover with a layout rank other than 2 "
-                  "is not yet supported");
+    return reject(
+        "NPOT memdesc pow2 alloc view with a layout rank other than 2 "
+        "is not yet supported");
   if (getNumCTAs(layout) != 1)
     return reject(
-        "NPOT memdesc physical cover with multiple CTAs is not yet supported");
+        "NPOT memdesc pow2 alloc view with multiple CTAs is not yet supported");
   ArrayRef<int64_t> shapePrefix = shape.drop_back(rank);
   ArrayRef<int64_t> allocPrefix = allocShape.drop_back(rank);
   // The view's layout is its allocation's, which is built on the allocation's
-  // power-of-two cover; a TMEM allocation is already a power of two.
+  // pow2 alloc shape; a TMEM allocation is already a power of two.
   if (!std::equal(shapePrefix.begin(), shapePrefix.end(),
                   allocPrefix.end() - shapePrefix.size()) ||
       (isa<SharedEncodingTrait>(layout) &&
-       !holdsNpotSharedCover(layout, allocShape)))
+       !holdsNpotPow2AllocShape(layout, allocShape)))
     return reject("NPOT memdesc allocation that does not match the encoding's "
-                  "physical cover is not yet supported");
+                  "pow2 alloc shape is not yet supported");
   return success();
 }
 
@@ -726,20 +727,21 @@ int64_t getAllocationElems(Attribute encoding, ArrayRef<int64_t> shape,
   return elems;
 }
 
-bool holdsNpotSharedCover(Attribute encoding, ArrayRef<int64_t> allocShape) {
+bool holdsNpotPow2AllocShape(Attribute encoding, ArrayRef<int64_t> allocShape) {
   auto tile = dropPipeliningDim(allocShape, encoding);
-  SmallVector<int64_t> cover(allocShape);
-  llvm::copy(getNpotCoverShape(tile), cover.end() - tile.size());
-  if (llvm::equal(cover, allocShape))
+  SmallVector<int64_t> pow2Shape(allocShape);
+  llvm::copy(getNpotPow2AllocShape(tile), pow2Shape.end() - tile.size());
+  if (llvm::equal(pow2Shape, allocShape))
     return true;
-  // An NVMMA cover smaller than its TMA block or core tile has no layout.
+  // An NVMMA pow2 alloc shape smaller than its TMA block or core tile has no
+  // layout.
   if (auto nvmma = dyn_cast<NVMMASharedEncodingAttr>(encoding);
       nvmma && failed(nvmmaSharedToLinearLayout(
-                   getNpotCoverShape(tile), nvmma, TMAMode::Tiled,
+                   getNpotPow2AllocShape(tile), nvmma, TMAMode::Tiled,
                    /*disableSwizzle=*/false, /*emitErrors=*/false)))
     return false;
   return getAllocationElems(encoding, allocShape) >=
-         getAllocationElems(encoding, cover);
+         getAllocationElems(encoding, pow2Shape);
 }
 
 SmallVector<unsigned> getMmaV2WarpsPerCTA(ArrayRef<int64_t> shape,
@@ -751,10 +753,22 @@ SmallVector<unsigned> getMmaV2WarpsPerCTA(ArrayRef<int64_t> shape,
   SmallVector<int64_t> reps = {ceil(shape[0], int64_t{16}),
                                ceil(shape[1], int64_t{8})};
   SmallVector<unsigned> warps = {1, 1};
+  // Under TRITON_ALLOW_NPOT, warps stay on each dim's two-part where one fits,
+  // so an NPOT dim's odd part repeats in registers.
+  bool npot = triton::tools::isNpotAllowed() &&
+              !llvm::all_of(shape, llvm::isPowerOf2_64);
+  auto fits = [&](int dim, int64_t tile) {
+    return !npot ||
+           warps[dim] * 2 * tile <=
+               LinearLayout::twoPartOf(static_cast<int32_t>(shape[dim]));
+  };
   // Balance repetitions to reduce register pressure, breaking ties toward M
   // because the lhs instruction tile uses more registers than the rhs.
   while (product(warps) < numWarps) {
-    if (reps[0] >= reps[1]) {
+    bool onM = reps[0] >= reps[1];
+    if (fits(0, 16) != fits(1, 8))
+      onM = fits(0, 16);
+    if (onM) {
       warps[0] *= 2;
       if (reps[0] != 1)
         reps[0] /= 2;
@@ -949,10 +963,10 @@ getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
 }
 
 FailureOr<LinearEncodingAttr>
-getProductEncoding(MLIRContext *context, ArrayRef<int64_t> shape, int numWarps,
-                   int threadsPerWarp, int numCTAs, unsigned vector,
-                   ArrayRef<unsigned> order) {
-  if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") ||
+getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
+                      int numWarps, int threadsPerWarp, int numCTAs,
+                      unsigned vector, ArrayRef<unsigned> order) {
+  if (!triton::tools::isNpotAllowed() ||
       llvm::all_of(shape, llvm::isPowerOf2_64))
     return failure();
   auto twoParts = llvm::map_to_vector(shape, [](int64_t size) -> int64_t {
@@ -981,31 +995,73 @@ getProductEncoding(MLIRContext *context, ArrayRef<int64_t> shape, int numWarps,
     layout *= LinearLayout(std::move(bases), std::move(radices),
                            {{dims[dim], odd}}, /*requireSurjective=*/true);
   }
-  if (!hasProductConversionInputDims(layout))
+  if (!hasMixedRadixConversionInputDims(layout))
     return failure();
   return LinearEncodingAttr::get(context, std::move(layout));
 }
 
-unsigned getProductVector(MLIRContext *context, ArrayRef<int64_t> shape,
-                          unsigned vector, ArrayRef<unsigned> order,
-                          int numWarps, int threadsPerWarp) {
+unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
+                             unsigned vector, ArrayRef<unsigned> order,
+                             int numWarps, int threadsPerWarp) {
   assert(llvm::isPowerOf2_32(vector) && "vector must be a power of two");
   auto kRegister = StringAttr::get(context, "register");
   auto registers =
       [&](unsigned v,
           ArrayRef<unsigned> vectorOrder) -> std::optional<int32_t> {
-    auto product = getProductEncoding(context, shape, numWarps, threadsPerWarp,
-                                      /*numCTAs=*/1, v, vectorOrder);
-    if (failed(product))
+    auto mixedRadix =
+        getMixedRadixEncoding(context, shape, numWarps, threadsPerWarp,
+                              /*numCTAs=*/1, v, vectorOrder);
+    if (failed(mixedRadix))
       return std::nullopt;
-    return product->getLinearLayout().getInDimSize(kRegister);
+    return mixedRadix->getLinearLayout().getInDimSize(kRegister);
   };
-  std::optional<int32_t> admitted = registers(1, {});
-  if (!admitted)
+  std::optional<int32_t> allowed = registers(1, {});
+  if (!allowed)
     return vector;
-  while (vector > 1 && registers(vector, order) > admitted)
+  while (vector > 1 && registers(vector, order) > allowed)
     vector /= 2;
   return vector;
+}
+
+int32_t getMixedRadixSharedRun(const LinearLayout &regLayout,
+                               const LinearLayout &toOffset,
+                               unsigned bitwidth) {
+  MLIRContext *ctx = (*regLayout.getInDimNames().begin()).getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  auto kOffset = StringAttr::get(ctx, "offset");
+  auto offsetOf = [&](ArrayRef<int32_t> coords) {
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    for (auto [dim, coord] : llvm::zip(regLayout.getOutDimNames(), coords))
+      ins.push_back({dim, coord});
+    return std::vector<int32_t>{toOffset.apply(ins)[0].second};
+  };
+  // Odd digits add, so vectorise the pow2 map from the leading radix-2
+  // register digits, and from every other binary part and odd-part bit (which
+  // must keep a vector aligned), to offsets.
+  std::vector<std::vector<int32_t>> leading, rest;
+  int32_t numLeading = regLayout.getNumLeadingRadix2Digits(kReg);
+  for (int32_t pos = 0; pos < numLeading; ++pos)
+    leading.push_back(offsetOf(regLayout.getBasis(kReg, pos)));
+  for (StringAttr inDim : regLayout.getInDimNames())
+    for (int32_t pos = inDim == kReg ? numLeading : 0;
+         pos < static_cast<int32_t>(regLayout.getInputRadices(inDim).size());
+         ++pos) {
+      SmallVector<int32_t> binary;
+      for (StringAttr outDim : regLayout.getOutDimNames())
+        binary.push_back(
+            regLayout.getBasisContribution(inDim, pos, outDim).binary);
+      rest.push_back(offsetOf(binary));
+    }
+  for (auto [i, size] : llvm::enumerate(regLayout.getOutDimSizes()))
+    for (int32_t bit = LinearLayout::twoPartOf(size); bit < size; bit *= 2) {
+      SmallVector<int32_t> coords(regLayout.getNumOutDims(), 0);
+      coords[i] = bit;
+      rest.push_back(offsetOf(coords));
+    }
+  LinearLayout cvt({{kReg, leading}, {StringAttr::get(ctx, "rest"), rest}},
+                   {{kOffset, toOffset.getOutDimSize(kOffset)}},
+                   /*requireSurjective=*/false);
+  return largestVectorisation(ctx, cvt, bitwidth, 128 / bitwidth).first;
 }
 
 static LogicalResult tryJoinOnAxis(MLIRContext *ctx, const LinearLayout &inLl,
@@ -1230,8 +1286,7 @@ std::optional<LinearLayout> parseLinearLayout(const DictionaryAttr &dict,
 
   Attribute radicesRaw = dict.get("inputRadices");
   Attribute outDimSizesRaw = dict.get("outDimSizes");
-  if ((radicesRaw || outDimSizesRaw) &&
-      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT")) {
+  if ((radicesRaw || outDimSizesRaw) && mlir::triton::tools::isNpotAllowed()) {
     // Explicit metadata is read only under the flag; otherwise the keys are
     // ignored and the bases-only constructor below reads the layout exactly
     // as before metadata existed (including its abort on rejected bases).
@@ -1658,6 +1713,10 @@ triton::gpu::maybeLinearToCGAEncodingAttr(const LinearLayout &layout) {
   auto kBlock = StringAttr::get(ctx, "block");
   assert(llvm::is_contained(inDims, kBlock) &&
          "layout must have a 'block' dim");
+  // A mixed-radix layout's odd digits don't factor; over one CTA its CGA layout
+  // is trivial.
+  if (!layout.isRadix2() && layout.getInDimSize(kBlock) == 1)
+    return CGAEncodingAttr::get1CTALayout(ctx, layout.getNumOutDims());
 
   auto cgaLogicalShape =
       basesPerDimImpl(layout.getBases(), kBlock, layout.getNumOutDims());
@@ -1792,12 +1851,12 @@ CGAEncodingAttr LinearEncodingTrait::getCGALayout(const LinearLayout &ll) {
   return linearToCGAEncodingAttr(ll);
 }
 
-// Realizes a Product layout at `shape` as ensureLayoutNotSmallerThan and
+// Builds a mixed-radix layout at `shape` as ensureLayoutNotSmallerThan and
 // ensureLayoutNotLargerThan(broadcastRegisters=false) do for a binary one, but
 // fails where they would assert. An out dim already at its extent is kept.
-static FailureOr<LinearLayout> realizeProductLayout(const LinearLayout &ll,
-                                                    ArrayRef<unsigned> repOrder,
-                                                    ArrayRef<int64_t> shape) {
+static FailureOr<LinearLayout>
+buildMixedRadixLayout(const LinearLayout &ll, ArrayRef<unsigned> repOrder,
+                      ArrayRef<int64_t> shape) {
   if (ll.getNumOutDims() != shape.size() || repOrder.size() != shape.size())
     return failure();
   MLIRContext *ctx = ll.getOutDimNames().begin()->getContext();
@@ -1814,12 +1873,12 @@ static FailureOr<LinearLayout> realizeProductLayout(const LinearLayout &ll,
   LinearLayout result = ll.transposeOuts(permutedDims);
   for (StringAttr outDim : permutedDims) {
     int64_t actual = result.getOutDimSize(outDim);
-    int64_t cover = llvm::PowerOf2Ceil(namedShape[outDim]);
-    if (actual == namedShape[outDim] || actual >= cover)
+    int64_t pow2Size = llvm::PowerOf2Ceil(namedShape[outDim]);
+    if (actual == namedShape[outDim] || actual >= pow2Size)
       continue;
-    if (cover % actual != 0)
+    if (pow2Size % actual != 0)
       return failure();
-    result *= LinearLayout::identity1D(cover / actual, kRegister, outDim);
+    result *= LinearLayout::identity1D(pow2Size / actual, kRegister, outDim);
   }
 
   auto bases = result.getBases();
@@ -1828,10 +1887,10 @@ static FailureOr<LinearLayout> realizeProductLayout(const LinearLayout &ll,
   llvm::SmallSet<int, 8> droppedRegisters;
   for (auto [outIdx, outDim] : llvm::enumerate(outDims)) {
     int64_t actual = outDim.second;
-    int64_t cover = llvm::PowerOf2Ceil(namedShape[outDim.first]);
-    if (actual <= cover)
+    int64_t pow2Size = llvm::PowerOf2Ceil(namedShape[outDim.first]);
+    if (actual <= pow2Size)
       continue;
-    if (actual % cover != 0)
+    if (actual % pow2Size != 0)
       return failure();
     // <inDim, basisIdx, outValue>, from the largest value to the smallest.
     SmallVector<std::tuple<StringAttr, int, int32_t>> sortedBases;
@@ -1846,7 +1905,7 @@ static FailureOr<LinearLayout> realizeProductLayout(const LinearLayout &ll,
     llvm::stable_sort(sortedBases, [](auto a, auto b) {
       return std::get<2>(a) > std::get<2>(b);
     });
-    for (size_t i = 0; i < sortedBases.size() && actual > cover;) {
+    for (size_t i = 0; i < sortedBases.size() && actual > pow2Size;) {
       int32_t outValue = std::get<2>(sortedBases[i]);
       for (; i < sortedBases.size() && std::get<2>(sortedBases[i]) == outValue;
            ++i) {
@@ -1858,7 +1917,7 @@ static FailureOr<LinearLayout> realizeProductLayout(const LinearLayout &ll,
       }
       actual >>= 1;
     }
-    outDim.second = cover;
+    outDim.second = pow2Size;
   }
   std::vector<std::vector<int32_t>> keptBases;
   std::vector<int32_t> keptRadices;
@@ -1870,20 +1929,22 @@ static FailureOr<LinearLayout> realizeProductLayout(const LinearLayout &ll,
   }
   bases[kRegister] = std::move(keptBases);
   radices[kRegister] = std::move(keptRadices);
-  auto realized = LinearLayout::tryCreate(std::move(bases), std::move(radices),
-                                          outDims, /*requireSurjective=*/false);
-  if (!realized)
+  auto builtLayout =
+      LinearLayout::tryCreate(std::move(bases), std::move(radices), outDims,
+                              /*requireSurjective=*/false);
+  if (!builtLayout)
     return failure();
-  return realized->transposeOuts(canonicalDims);
+  return builtLayout->transposeOuts(canonicalDims);
 }
 
 LinearLayout LinearEncodingTrait::toLinearLayout(const LinearLayout &ll,
                                                  ArrayRef<unsigned> repOrder,
                                                  ArrayRef<int64_t> shape) {
-  if (ll.hasNonBinaryCarrier()) {
-    auto realized = realizeProductLayout(ll, repOrder, shape);
-    assert(succeeded(realized) && "Product layout does not realize at shape");
-    return *realized;
+  if (ll.hasNonPow2OutDim()) {
+    auto builtLayout = buildMixedRadixLayout(ll, repOrder, shape);
+    assert(succeeded(builtLayout) &&
+           "mixed-radix layout is not exact at shape");
+    return *builtLayout;
   }
   auto result = ll;
   auto canonicalDims = llvm::to_vector(ll.getOutDimNames());
@@ -1899,6 +1960,29 @@ LinearLayout LinearEncodingTrait::toLinearLayout(const LinearLayout &ll,
                                      /*broadcastRegisters=*/false);
   result = result.transposeOuts(canonicalDims);
   return result;
+}
+
+bool triton::gpu::hasExactLayoutAt(RankedTensorType type) {
+  Attribute encoding = type.getEncoding();
+  SmallVector<int64_t> fullShape(type.getShape());
+  while (auto slice = dyn_cast<SliceEncodingAttr>(encoding)) {
+    fullShape.insert(fullShape.begin() + slice.getDim(), 1);
+    encoding = slice.getParent();
+  }
+  // An encoding that implements hasMixedRadixLayout builds its mixed-radix
+  // layout in toLinearLayout, which can fall back to a pow2 alloc shape (e.g.
+  // an MMA sliced to a unit dim), so ask the verifier's predicate.
+  auto distributed = dyn_cast<DistributedEncodingTrait>(encoding);
+  if (distributed && distributed.hasMixedRadixLayout() &&
+      triton::tools::isNpotAllowed())
+    return llvm::all_of(type.getShape(), llvm::isPowerOf2_64) ||
+           hasExactNpotLayout(type);
+  auto linear = dyn_cast<LinearEncodingTrait>(encoding);
+  if (!linear || !linear.getLinearLayout().hasNonPow2OutDim())
+    return true;
+  return succeeded(buildMixedRadixLayout(
+      linear.getLinearLayout(),
+      cast<DistributedEncodingTrait>(encoding).getRepOrder(), fullShape));
 }
 
 SmallVector<unsigned>
@@ -2058,10 +2142,20 @@ void NvidiaMmaEncodingAttr::print(AsmPrinter &printer) const {
   printer << ", instrShape = [" << getInstrShape() << "]}>";
 }
 
+bool triton::gpu::isMmaV3NpotNLegal(ArrayRef<unsigned> warpsPerCTA,
+                                    ArrayRef<unsigned> instrShape) {
+  return triton::tools::isNpotAllowed() && instrShape[1] % 8 == 0 &&
+         warpsPerCTA[1] == 1;
+}
+
+bool triton::gpu::isMmaV3NpotKLegal(int64_t k, unsigned atomK) {
+  return LinearLayout::twoPartOf(static_cast<int32_t>(k)) % atomK == 0;
+}
+
 LogicalResult
 NvidiaMmaEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                               unsigned versionMajor, unsigned,
-                              ArrayRef<unsigned>, CGAEncodingAttr,
+                              ArrayRef<unsigned> warpsPerCTA, CGAEncodingAttr,
                               ArrayRef<unsigned> instrShape) {
   // toLinearLayout turns the instruction M and N into identity1D repeat
   // counts, which must be powers of two.
@@ -2069,7 +2163,8 @@ NvidiaMmaEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
     return success();
   unsigned mIdx = versionMajor == 3 ? 0 : instrShape.size() - 2;
   if (!llvm::isPowerOf2_32(instrShape[mIdx]) ||
-      !llvm::isPowerOf2_32(instrShape[mIdx + 1]))
+      (!llvm::isPowerOf2_32(instrShape[mIdx + 1]) &&
+       !(versionMajor == 3 && isMmaV3NpotNLegal(warpsPerCTA, instrShape))))
     return emitError() << "NVIDIA MMA instrShape with an NPOT M or N is not "
                           "yet supported, got instrShape = ["
                        << instrShape << "]";
@@ -3733,6 +3828,10 @@ struct TritonGPUInferLayoutInterface
   inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                      Attribute retEncoding,
                      std::optional<Location> location) const override {
+    // A mixed-radix dot's operands keep their layouts until accelerate-matmul
+    // picks the MMA's.
+    if (!isRadix2Encoding(retEncoding) || !isRadix2Encoding(operandEncoding))
+      return success();
     auto mmaRetEncoding = mlir::dyn_cast<NvidiaMmaEncodingAttr>(retEncoding);
     if (mmaRetEncoding && mmaRetEncoding.isHopper()) {
       auto dotOpEnc = mlir::dyn_cast<DotOperandEncodingAttr>(operandEncoding);
@@ -4178,7 +4277,7 @@ struct TritonGPUInferLayoutInterface
     auto srcTy = RankedTensorType::get(srcShape, fp32Type, srcEnc);
     // An NPOT reshape is inferred as the one that keeps every register.
     LinearLayout src = toLinearLayout(srcTy);
-    if (src.hasNonBinaryCarrier()) {
+    if (src.hasNonPow2OutDim()) {
       if (auto dst = tryReshapeLayout(ctx, src, dstShape)) {
         dstEnc = inferEncodingFromLinearLayout(ctx, std::move(*dst), srcEnc);
         return success();
@@ -4428,15 +4527,16 @@ struct TritonGPUInlineAsmInterface : public DialectInlineAsmInterface {
   }
 };
 
-// The layout of `type` if its encoding is a Product layout, or a slice of one,
-// that realizes exactly: out sizes equal the shape, surjective, and no free odd
-// digit. Out-of-scope layouts are reported through `emitError` when given.
+// The layout of `type` if its encoding is a mixed-radix layout, or a slice of
+// one, that is exact: out sizes equal the shape, surjective, and no free odd
+// digit. Other encodings count once hasMixedRadixLayout opts them in.
+// Out-of-scope layouts are reported through `emitError` when given.
 static FailureOr<LinearLayout>
 getExactNpotLayout(RankedTensorType type,
                    function_ref<InFlightDiagnostic()> emitError = {}) {
   auto reject = [&](StringRef what) -> FailureOr<LinearLayout> {
     if (emitError)
-      emitError() << "NPOT Product layout with " << what
+      emitError() << "NPOT mixed-radix layout with " << what
                   << " is not yet supported";
     return failure();
   };
@@ -4451,15 +4551,26 @@ getExactNpotLayout(RankedTensorType type,
     layout = slice.getParent();
   }
   auto linear = dyn_cast<LinearEncodingAttr>(layout);
-  if (!linear || !linear.getLinearLayout().hasNonBinaryCarrier())
+  LinearLayout encoded;
+  if (linear) {
+    encoded = linear.getLinearLayout();
+  } else {
+    auto distributed = dyn_cast<DistributedEncodingTrait>(layout);
+    if (!distributed || !triton::tools::isNpotAllowed() ||
+        llvm::all_of(shape, llvm::isPowerOf2_64) ||
+        !distributed.hasMixedRadixLayout())
+      return failure();
+    encoded = distributed.toLinearLayout(shape);
+  }
+  if (!encoded.hasNonPow2OutDim())
     return failure();
-  const LinearLayout &encoded = linear.getLinearLayout();
   for (StringAttr inDim : encoded.getInDimNames())
     if (inDim != "register" &&
         llvm::any_of(encoded.getInputRadices(inDim),
                      [](int32_t radix) { return radix != 2; }))
       return reject(("a non-binary " + inDim.str() + " digit").c_str());
-  if (failed(realizeProductLayout(encoded, linear.getRepOrder(), shape)))
+  if (linear &&
+      failed(buildMixedRadixLayout(encoded, linear.getRepOrder(), shape)))
     return failure();
   LinearLayout ll = toLinearLayout(type);
   if (!llvm::equal(ll.getOutDimSizes(), type.getShape()))
@@ -4477,10 +4588,20 @@ getExactNpotLayout(RankedTensorType type,
   return ll;
 }
 
-static bool hasExactNpotLayout(RankedTensorType type) {
+bool triton::gpu::hasExactNpotLayout(RankedTensorType type) {
   return llvm::any_of(type.getShape(),
                       [](int64_t d) { return !llvm::isPowerOf2_64(d); }) &&
          succeeded(getExactNpotLayout(type));
+}
+
+FailureOr<LinearLayout>
+mlir::triton::gpu::getExactNpotOperandLayout(Operation *op) {
+  for (Type type : op->getOperandTypes())
+    if (auto tensorTy = dyn_cast<RankedTensorType>(type))
+      if (FailureOr<LinearLayout> ll = getExactNpotLayout(tensorTy);
+          succeeded(ll))
+        return ll;
+  return failure();
 }
 
 struct TritonGPUVerifyTensorLayoutInterface
@@ -4619,7 +4740,7 @@ struct TritonGPUVerifyTensorLayoutInterface
         failed(verifyCTAs(layout, op, makeErr)))
       return failure();
 
-    if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT") &&
+    if (triton::tools::isNpotAllowed() &&
         hasNpotSharedCtaSplit(
             layout, dropPipeliningDim(memDescTy.getAllocShape(), layout)))
       return makeErr()
@@ -5034,25 +5155,56 @@ bool triton::gpu::isRadix2Encoding(Attribute layout) {
   return !layout.walk(interruptOnMixedRadix).wasInterrupted();
 }
 
-bool triton::gpu::isProductLayoutOp(Operation *op) {
-  return op->hasTrait<OpTrait::Elementwise>() ||
-         isa<triton::ProductLayoutOpInterface>(op);
+template <typename... OpTs> static bool isAnyOf(OperationName name) {
+  return ((name.getTypeID() == TypeID::get<OpTs>()) || ...);
 }
 
-// Checks every exact Product value `op` uses or defines. A convert is admitted
-// iff its plan is supported.
+bool triton::gpu::isMixedRadixLayoutOp(OperationName op) {
+  // Upstream ops: constants and poison lower per element, control flow
+  // forwards values, a conversion cast only retypes one.
+  return op.hasTrait<OpTrait::Elementwise>() ||
+         op.hasTrait<OpTrait::MixedRadixLayoutTrait>() ||
+         op.hasInterface<triton::MixedRadixLayoutOpInterface>() ||
+         isAnyOf<arith::ConstantOp, scf::ForOp, scf::IfOp, scf::WhileOp,
+                 scf::YieldOp, scf::ConditionOp, cf::BranchOp, cf::CondBranchOp,
+                 ub::PoisonOp, UnrealizedConversionCastOp>(op);
+}
+
+std::optional<std::string>
+triton::gpu::getNpotLayoutUnsupportedReason(OperationName name,
+                                            TypeRange types) {
+  for (Type type : types) {
+    auto tensorTy = dyn_cast<RankedTensorType>(type);
+    FailureOr<LinearLayout> ll = failure();
+    if (tensorTy)
+      ll = getExactNpotLayout(tensorTy);
+    if (failed(ll))
+      continue;
+    if (!isMixedRadixLayoutOp(name))
+      return "NPOT mixed-radix layout is not yet supported on " +
+             name.getStringRef().str();
+    if (!hasMixedRadixConversionInputDims(*ll))
+      return std::string(
+          "NPOT mixed-radix layout across CTAs is not yet supported");
+  }
+  return std::nullopt;
+}
+
+// Checks every exact mixed-radix value `op` uses or defines. A convert is
+// accepted iff its plan is supported.
 static LogicalResult verifyExactNpotLayouts(Operation *op) {
   if (auto cvt = dyn_cast<ConvertLayoutOp>(op)) {
     RankedTensorType srcTy = cvt.getSrc().getType(), dstTy = cvt.getType();
     // Planning builds both layouts, and toLinearLayout can assert at an NPOT
-    // shape on anything but an exact Product layout.
+    // shape on anything but an exact mixed-radix layout.
     if ((hasNpotShape(srcTy) || hasNpotShape(dstTy)) &&
         (!hasExactNpotLayout(srcTy) || !hasExactNpotLayout(dstTy)))
-      return op->emitError("NPOT conversion to or from a non-Product layout is "
-                           "not yet supported");
-    auto plan = getProductConversionPlan(srcTy, dstTy);
+      return op->emitError(
+          "NPOT conversion to or from a non-mixed-radix layout is "
+          "not yet supported");
+    auto plan = getMixedRadixConversionPlan(srcTy, dstTy);
     if (plan && !plan->supported())
-      return op->emitError(*plan->rejection);
+      return op->emitError(*plan->unsupportedReason);
   }
   SmallVector<Type> types(op->getOperandTypes());
   llvm::append_range(types, op->getResultTypes());
@@ -5060,25 +5212,28 @@ static LogicalResult verifyExactNpotLayouts(Operation *op) {
   for (Region &region : op->getRegions())
     if (!region.empty())
       llvm::append_range(types, region.front().getArgumentTypes());
-  for (Type type : types) {
-    auto tensorTy = dyn_cast<RankedTensorType>(type);
-    FailureOr<LinearLayout> ll = failure();
-    if (tensorTy)
-      ll = getExactNpotLayout(tensorTy);
-    if (failed(ll) || isa<ConvertLayoutOp>(op))
-      continue;
-    if (!isProductLayoutOp(op))
-      return op->emitError("NPOT Product layout is not yet supported on ")
-             << op->getName();
-    if (!hasProductConversionInputDims(*ll))
-      return op->emitError(
-          "NPOT Product layout across CTAs is not yet supported");
+  if (!isa<ConvertLayoutOp>(op))
+    if (std::optional<std::string> reason =
+            getNpotLayoutUnsupportedReason(op->getName(), types))
+      return op->emitError(*reason);
+  // A mixed-radix op's NPOT dim may be only on its result.
+  auto mixedRadix = dyn_cast<triton::MixedRadixLayoutOpInterface>(op);
+  FailureOr<LinearLayout> ll = failure();
+  for (Type type :
+       ArrayRef(types).take_front(op->getNumOperands() + op->getNumResults())) {
+    auto srcTy = mixedRadix ? dyn_cast<RankedTensorType>(type) : nullptr;
+    if (srcTy && succeeded(ll = getExactNpotLayout(srcTy)))
+      break;
   }
+  if (succeeded(ll))
+    if (std::optional<std::string> reason =
+            mixedRadix.getMixedRadixUnsupportedReason(*ll))
+      return op->emitError(*reason);
   return success();
 }
 
-// Under TRITON_ALLOW_NPOT only TTIR tensors and exact Product layouts may be
-// NPOT or mixed-radix. Op traits miss block arguments and ops without
+// Under TRITON_ALLOW_NPOT only TTIR tensors and exact mixed-radix layouts may
+// be NPOT or mixed-radix. Op traits miss block arguments and ops without
 // TensorSizeTrait, so check every value under ttg.num-warps.
 static LogicalResult verifyEncodedTensorSizes(Operation *root) {
   auto isNpotEncoded = [](Type type, int64_t &numElements) {
@@ -5156,7 +5311,7 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
            << " which is expected only on `module` or `tt.func` ops";
   }
   if (attr.getName() == AttrNumWarpsName && isa<ModuleOp, FuncOp>(op) &&
-      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+      mlir::triton::tools::isNpotAllowed())
     return verifyEncodedTensorSizes(op);
 
   return success();

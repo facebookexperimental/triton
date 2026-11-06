@@ -464,7 +464,8 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         // 4 bytes)
         canUseAsyncCp =
             isa<tt::LoadOp>(op) &&
-            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis);
+            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis) &&
+            canPipelineInSharedMemory(cast<tt::LoadOp>(op));
         int copyVecBytes = getCopyVecBytes(
             cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
 
@@ -679,10 +680,11 @@ Operation *hoistBufferOutOfLoop(scf::ForOp forOp, Operation *op,
     return nullptr;
   OpBuilderForStage builder(op->getLoc(), forOp, schedule);
   auto allocType = dyn_cast<MemDescType>(op->getResult(0).getType());
+  // Keep the alloc shape: an NPOT tile's buffer is its pow2 alloc shape.
   auto newType = triton::gpu::MemDescType::get(
       allocType.getShape(), allocType.getElementType(), allocType.getEncoding(),
       allocType.getMemorySpace(),
-      /*mutableMemory=*/true);
+      /*mutableMemory=*/true, allocType.getAllocShape());
   auto newAlloc = builder.clone(*op);
   newAlloc->getResult(0).setType(newType);
   builder.setStageCluster(schedule[op]);

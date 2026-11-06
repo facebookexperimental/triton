@@ -19,6 +19,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
@@ -103,6 +104,12 @@ bool containsPinnedEncoding(Attribute encoding) {
   return pinned;
 }
 
+bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps) {
+  int64_t split = numWarps / 4;
+  return triton::tools::isNpotAllowed() && split > 1 &&
+         !llvm::isPowerOf2_64(shape[0]) && shape[0] % (64 * split) != 0;
+}
+
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
                                                 Type eltType, int numWarps) {
@@ -139,6 +146,8 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     unsigned m = 16;
     unsigned mWarps = std::max<unsigned>(shape[0] / m, 1);
     unsigned nWarps = std::max<unsigned>(numWarps / mWarps, 1);
+    if (hasMmaV3WarpgroupsOnN(shape, numWarps))
+      nWarps = numWarps / 4;
     unsigned maxN = std::max<unsigned>(shape[1] / nWarps, 8);
     for (auto n : validN) {
       if (shape[1] % n == 0 && n <= maxN) {
@@ -161,16 +170,6 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     assert(false && "version not supported");
     return {0, 0};
   }
-}
-
-SmallVector<unsigned, 4>
-getOrderFromContiguity(const SmallVector<int64_t> &arr) {
-  SmallVector<unsigned, 4> ret(arr.size());
-  std::iota(ret.begin(), ret.end(), 0);
-  std::reverse(ret.begin(), ret.end());
-  std::stable_sort(ret.begin(), ret.end(),
-                   [&](unsigned x, unsigned y) { return arr[x] > arr[y]; });
-  return ret;
 }
 
 Value getMemAccessPtr(Operation *op) {
@@ -705,12 +704,23 @@ static bool isSingleValue(Value value) {
   return true;
 }
 
-Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
-  if (isa<triton::ScanOp>(op)) {
-    // Scan only supports blocked encoding at the moment.
-    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+// Besides Blocked, tt.scan lowers in place the mixed-radix layouts it allows;
+// any other layout keeps its convert.
+static bool isScanEncoding(triton::ScanOp scan, Attribute encoding) {
+  if (isa<triton::gpu::BlockedEncodingAttr>(encoding))
+    return true;
+  auto type = cast<RankedTensorType>(scan.getOperand(0).getType())
+                  .cloneWithEncoding(encoding);
+  return !triton::gpu::isRadix2Encoding(encoding) &&
+         triton::gpu::hasExactLayoutAt(type) &&
+         !scan.getMixedRadixUnsupportedReason(
+             triton::gpu::toLinearLayout(type));
+}
+
+static Attribute inferSrcEncodingAtAnyShape(Operation *op, Attribute encoding) {
+  if (auto scan = dyn_cast<triton::ScanOp>(op))
+    if (!isScanEncoding(scan, encoding))
       return {};
-  }
 
   if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
@@ -743,11 +753,10 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
   return {};
 }
 
-Attribute inferDstEncoding(Operation *op, Attribute encoding) {
-  if (isa<triton::ScanOp>(op)) {
-    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+static Attribute inferDstEncodingAtAnyShape(Operation *op, Attribute encoding) {
+  if (auto scan = dyn_cast<triton::ScanOp>(op))
+    if (!isScanEncoding(scan, encoding))
       return {};
-  }
   if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
 
@@ -775,6 +784,33 @@ Attribute inferDstEncoding(Operation *op, Attribute encoding) {
     return inferDstEncoding(fp4ToFp, encoding);
 
   return {};
+}
+
+// RLC can carry a mixed-radix encoding through a reduce onto another extent,
+// e.g. a broadcast, where it isn't exact. Inferring none there keeps the
+// convert.
+static Attribute ifExactLayoutAt(Operation *op, Attribute encoding,
+                                 ValueRange values) {
+  if (!encoding || isa<scf::WhileOp, scf::ForOp, scf::YieldOp, scf::ConditionOp,
+                       nvidia_gpu::WarpGroupDotWaitOp>(op))
+    return encoding;
+  for (Value value : values)
+    if (auto type = dyn_cast<RankedTensorType>(value.getType()))
+      if (!triton::gpu::hasExactLayoutAt(type.cloneWithEncoding(encoding)))
+        return {};
+  return encoding;
+}
+
+Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
+  Attribute srcEncoding = inferSrcEncodingAtAnyShape(op, encoding);
+  if (auto gather = dyn_cast<triton::GatherOp>(op))
+    return ifExactLayoutAt(op, srcEncoding, gather.getIndices());
+  return ifExactLayoutAt(op, srcEncoding, op->getOperands());
+}
+
+Attribute inferDstEncoding(Operation *op, Attribute encoding) {
+  return ifExactLayoutAt(op, inferDstEncodingAtAnyShape(op, encoding),
+                         op->getResults());
 }
 
 bool isExpensiveLoadOrStore(Operation *op) {

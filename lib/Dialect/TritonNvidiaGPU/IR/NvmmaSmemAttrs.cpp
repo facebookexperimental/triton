@@ -59,13 +59,59 @@ std::optional<NvmmaSmemAttrs> getNvmmaSmemAttrs(ttg::MemDescType memTy) {
   if (auto nvmma = dyn_cast<ttg::NVMMASharedEncodingAttr>(memTy.getEncoding()))
     return NvmmaSmemAttrs{nvmma.getSwizzlingByteWidth(), nvmma.getTransposed(),
                           nvmma.getFp4Padded()};
+  return getMmaOperandSmemAttrs(memTy);
+}
 
+std::optional<NvmmaSmemAttrs> getMmaOperandSmemAttrs(ttg::MemDescType memTy) {
   auto ll = ttg::toLinearLayout(memTy).pseudoinvert();
   unsigned bitwidth = memTy.getElementType().getIntOrFloatBitWidth();
   auto attrsAndCandidate = getNvmmaSmemAttrs(ll, bitwidth);
   if (!attrsAndCandidate)
     return std::nullopt;
   return attrsAndCandidate->first;
+}
+
+std::optional<Pow2Chunks> getPow2Chunks(const LinearLayout &regLayout) {
+  auto kReg = StringAttr::get(regLayout.getInDimNames().begin()->getContext(),
+                              "register");
+  int32_t numBinary = regLayout.getNumLeadingRadix2Digits(kReg);
+  auto bases = regLayout.getBases();
+  bases[kReg].resize(numBinary);
+  SmallVector<std::pair<StringAttr, int32_t>> box;
+  for (auto [d, dim] : llvm::enumerate(regLayout.getOutDimNames())) {
+    int32_t bits = 0;
+    for (const auto &inBases : llvm::make_second_range(bases))
+      for (const auto &basis : inBases)
+        bits |= basis[d];
+    box.push_back({dim, static_cast<int32_t>(llvm::NextPowerOf2(bits))});
+    if (box.back().second >
+        LinearLayout::twoPartOf(regLayout.getOutDimSize(dim)))
+      return std::nullopt;
+  }
+  for (StringAttr inDim : regLayout.getInDimNames())
+    if (inDim != kReg &&
+        !llvm::all_of(regLayout.getInputRadices(inDim),
+                      [](int32_t radix) { return radix == 2; }))
+      return std::nullopt;
+  auto layout = LinearLayout::tryCreate(std::move(bases), box,
+                                        /*requireSurjective=*/true);
+  if (!layout)
+    return std::nullopt;
+  Pow2Chunks chunks{std::move(*layout), {}};
+  for (int32_t reg = 0; reg < regLayout.getInDimSize(kReg);
+       reg += 1 << numBinary) {
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    for (StringAttr inDim : regLayout.getInDimNames())
+      ins.push_back({inDim, inDim == kReg ? reg : 0});
+    // A start off its box's alignment would overlap the box bits it XORs.
+    auto &start = chunks.starts.emplace_back();
+    for (auto [d, out] : llvm::enumerate(regLayout.apply(ins))) {
+      if (out.second % box[d].second != 0)
+        return std::nullopt;
+      start.push_back(out.second);
+    }
+  }
+  return chunks;
 }
 
 } // namespace mlir::triton::nvidia_gpu

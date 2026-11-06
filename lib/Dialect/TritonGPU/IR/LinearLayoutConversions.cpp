@@ -683,10 +683,30 @@ AMDMfmaEncodingAttr::dotOperandToLinearLayout(Attribute dotOp,
     kTileSize *= 16;
   }
 
-  // If shape K is larger than the tile size, repeat the tile
-  // along the K dimension.
-  if (kSize > kTileSize) {
-    tileLayout *= LinearLayout::identity1D(kSize / kTileSize, kRegister, dimK);
+  // Under TRITON_ALLOW_NPOT, an NPOT K whose two-part holds whole tiles
+  // repeats its odd part in registers after the binary repeats, so the K rep
+  // index stays linear for the MFMA lowering.
+  int32_t kTwoPart = LinearLayout::twoPartOf(kSize);
+  bool mixedRadixK =
+      triton::tools::isNpotAllowed() && rank == 2 && kTwoPart != kSize &&
+      kTwoPart % kTileSize == 0 && llvm::isPowerOf2_64(shape[nonKDimIndex]) &&
+      mfmaLayout.getCGALayout().getLinearLayout().getInDimSize(S("block")) == 1;
+  if (mixedRadixK) {
+    tileLayout *=
+        LinearLayout::identity1D(kTwoPart / kTileSize, kRegister, dimK);
+    int32_t odd = kSize / kTwoPart;
+    LinearLayout::BasesT bases;
+    bases[kRegister] = {{1}};
+    LinearLayout::RadicesT radices;
+    radices[kRegister] = {odd};
+    tileLayout *= LinearLayout(std::move(bases), std::move(radices),
+                               {{dimK, odd}}, /*requireSurjective=*/true);
+  } else if (kSize > kTileSize) {
+    // If shape K is larger than the tile size, repeat the tile
+    // along the K dimension.
+    tileLayout *= LinearLayout::identity1D(
+        static_cast<int32_t>(llvm::PowerOf2Ceil(kSize)) / kTileSize, kRegister,
+        dimK);
   }
 
   // Follow the tiles per warp property, repeat the tile layout
@@ -700,6 +720,25 @@ AMDMfmaEncodingAttr::dotOperandToLinearLayout(Attribute dotOp,
     // dimension, which appears at the last.
     tileLayout *= LinearLayout::identity1D(1, kRegister, outDimNames[order[2]]);
     tileLayout *= LinearLayout::identity1D(1, kLane, outDimNames[order[2]]);
+  }
+
+  if (mixedRadixK) {
+    // Warps broadcast along K, as the crop below does for pow2 K; the non-K
+    // dim is pow2 and keeps the pow2 padding.
+    LinearLayout ctaLayout =
+        tileLayout * broadcastedDotOperandLayout(ctx, warpsPerCTA, warpOrder,
+                                                 kDimIndex, kWarp)
+                         .transposeOuts({dimK, dimNonK});
+    int64_t nonKSize = shape[nonKDimIndex];
+    if (ctaLayout.getOutDimSize(dimNonK) < nonKSize)
+      ctaLayout *= LinearLayout::identity1D(
+          nonKSize / ctaLayout.getOutDimSize(dimNonK), kRegister, dimNonK);
+    ctaLayout = ensureLayoutNotLargerThan(ctaLayout,
+                                          {{dimK, kSize}, {dimNonK, nonKSize}});
+    LinearLayout cgaLayout =
+        mfmaLayout.getCGALayout().getLinearLayout().transposeOuts(
+            {dimK, dimNonK});
+    return (ctaLayout * cgaLayout).transposeOuts(outDimNames);
   }
 
   LinearLayout warpLayout = identityStandardND(kWarp, warpsPerCTA, warpOrder);
@@ -993,6 +1032,54 @@ LinearLayout nvidiaMmaTile(MLIRContext *ctx, ArrayRef<unsigned> tileShape,
   return ctaLayout;
 }
 
+// Under TRITON_ALLOW_NPOT, one CTA's layout at an NPOT `shape`: each dim's odd
+// part repeats in registers right after its binary repeats, in `repOrder`, so
+// the MMA rep index stays linear.
+static std::optional<LinearLayout>
+getMixedRadixRepeat(LinearLayout tile, CGAEncodingAttr cga,
+                    ArrayRef<int64_t> shape, ArrayRef<unsigned> repOrder) {
+  MLIRContext *ctx = cga.getContext();
+  LinearLayout cgaLayout = cga.getLinearLayout();
+  if (!triton::tools::isNpotAllowed() ||
+      llvm::all_of(shape, llvm::isPowerOf2_64) ||
+      cgaLayout.getInDimSize(S("block")) != 1)
+    return std::nullopt;
+  SmallVector<StringAttr> dims = standardOutDimNames(ctx, shape.size());
+  // As in buildMixedRadixLayout, a two-part below the tile keeps the registers
+  // that fit. Only a unit dim broadcasts lanes and warps, as in pow2; elsewhere
+  // that would duplicate MMA rows, so keep the pow2 alloc shape.
+  llvm::SmallDenseMap<StringAttr, int64_t> unitFit, fit;
+  for (auto [dim, size] : llvm::zip(dims, shape)) {
+    int64_t tileSize = tile.getOutDimSize(dim);
+    unitFit[dim] = size == 1 ? 1 : tileSize;
+    fit[dim] = std::min<int64_t>(
+        LinearLayout::twoPartOf(static_cast<int32_t>(size)), tileSize);
+  }
+  tile = ensureLayoutNotLargerThan(tile, unitFit, /*broadcastRegisters=*/false);
+  LinearLayout fitted =
+      ensureLayoutNotLargerThan(tile, fit, /*broadcastRegisters=*/false);
+  for (StringAttr inDim : {S("lane"), S("warp")})
+    if (fitted.getBases().lookup(inDim) != tile.getBases().lookup(inDim))
+      return std::nullopt;
+  tile = std::move(fitted);
+  for (unsigned dim : repOrder) {
+    int32_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(shape[dim]));
+    tile *= LinearLayout::identity1D(twoPart / tile.getOutDimSize(dims[dim]),
+                                     S("register"), dims[dim]);
+    int32_t odd = static_cast<int32_t>(shape[dim]) / twoPart;
+    if (odd == 1)
+      continue;
+    LinearLayout::BasesT bases;
+    bases[S("register")] = {{1}};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = {odd};
+    tile *= LinearLayout(std::move(bases), std::move(radices),
+                         {{dims[dim], odd}}, /*requireSurjective=*/true);
+  }
+  cgaLayout = cgaLayout.transposeOuts(llvm::to_vector(tile.getOutDimNames()));
+  return (tile * cgaLayout).transposeOuts(dims);
+}
+
 LinearLayout
 NvidiaMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   auto ctx = getContext();
@@ -1006,7 +1093,11 @@ NvidiaMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   } else {
     assert(isHopper());
     auto instrShapeMNK = getInstrShape();
-    tileShape = SmallVector<unsigned>({instrShapeMNK[0], instrShapeMNK[1]});
+    // An NPOT N's odd part repeats in registers (getMixedRadixRepeat), which is
+    // the order of wgmma's accumulator.
+    tileShape = SmallVector<unsigned>(
+        {instrShapeMNK[0],
+         static_cast<unsigned>(LinearLayout::twoPartOf(instrShapeMNK[1]))});
   }
   // nvidiamma layout always assumes kWidth = 2
   constexpr auto kWidth = 2;
@@ -1017,7 +1108,14 @@ NvidiaMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   ctaLayout *= identityStandardND(S("warp"), getWarpsPerCTA(), warpOrder)
                    .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
 
+  if (auto mixedRadix =
+          getMixedRadixRepeat(ctaLayout, getCGALayout(), shape, getRepOrder()))
+    return *mixedRadix;
   return combineCtaCgaWithShape(ctaLayout, getCGALayout(), shape);
+}
+
+bool NvidiaMmaEncodingAttr::hasMixedRadixLayout() const {
+  return isAmpere() || isHopper();
 }
 
 LinearLayout
@@ -1053,7 +1151,17 @@ NvidiaMmaEncodingAttr::dotOperandToLinearLayout(Attribute dotOp,
                                            kDim, S("warp"))
                    .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
 
+  if (auto mixedRadix = getMixedRadixRepeat(ctaLayout, dot.getCGALayout(),
+                                            shape, dot.getRepOrder()))
+    return *mixedRadix;
   return combineCtaCgaWithShape(ctaLayout, dot.getCGALayout(), shape);
+}
+
+bool DotOperandEncodingAttr::hasMixedRadixLayout() const {
+  if (isa<AMDMfmaEncodingAttr>(getParent()))
+    return true;
+  auto mma = dyn_cast<NvidiaMmaEncodingAttr>(getParent());
+  return mma && mma.hasMixedRadixLayout();
 }
 
 LinearLayout
@@ -1306,20 +1414,20 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
   if (auto distributed = dyn_cast<DistributedEncodingTrait>(layout)) {
     result = distributed.toLinearLayout(shape);
   } else {
-    SmallVector<int64_t> coverShape = getNpotCoverShape(shape);
-    assert(llvm::all_of(coverShape,
+    SmallVector<int64_t> pow2AllocShape = getNpotPow2AllocShape(shape);
+    assert(llvm::all_of(pow2AllocShape,
                         [](int64_t dim) {
                           return llvm::isPowerOf2_32(dim) && dim >= 1;
                         }) &&
            "shape must be a postive power of 2");
     if (auto shared = dyn_cast<SharedEncodingTrait>(layout)) {
-      result = shared.toLinearLayout(coverShape);
+      result = shared.toLinearLayout(pow2AllocShape);
     } else if (auto tensorMemoryEncoding =
                    dyn_cast<TensorMemoryEncodingAttr>(layout)) {
-      result = tensorMemoryToLinearLayout(coverShape, tensorMemoryEncoding);
+      result = tensorMemoryToLinearLayout(pow2AllocShape, tensorMemoryEncoding);
     } else if (auto tensorMemoryScalesEncoding =
                    dyn_cast<TensorMemoryScalesEncodingAttr>(layout)) {
-      result = tensorMemoryScalesToLinearLayout(coverShape,
+      result = tensorMemoryScalesToLinearLayout(pow2AllocShape,
                                                 tensorMemoryScalesEncoding);
     } else {
       assert(0 && "unknown layout");
@@ -1344,7 +1452,8 @@ LinearLayout toLinearLayout(MemDescType type) {
     auto ll = toLinearLayout(allocShape, type.getEncoding());
     auto outDims = llvm::to_vector(ll.getOutDimNames());
     // Trim the shape
-    for (auto [dim, size] : llvm::zip_equal(outDims, getNpotCoverShape(shape)))
+    for (auto [dim, size] :
+         llvm::zip_equal(outDims, getNpotPow2AllocShape(shape)))
       ll = ll.resizeOutDim(dim, size);
 
     auto kCol = StringAttr::get(type.getContext(), "col");
@@ -1381,14 +1490,14 @@ LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout) {
                                                                    layout);
 }
 
-SmallVector<int64_t> getNpotCoverShape(ArrayRef<int64_t> shape) {
-  SmallVector<int64_t> cover(shape);
-  if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
-    return cover;
-  for (int64_t &extent : cover)
+SmallVector<int64_t> getNpotPow2AllocShape(ArrayRef<int64_t> shape) {
+  SmallVector<int64_t> pow2Shape(shape);
+  if (!triton::tools::isNpotAllowed())
+    return pow2Shape;
+  for (int64_t &extent : pow2Shape)
     if (extent > 0)
       extent = static_cast<int64_t>(llvm::PowerOf2Ceil(extent));
-  return cover;
+  return pow2Shape;
 }
 
 bool isLayoutEquivalentIgnoringRegisterOrder(const LinearLayout &lhs,
@@ -1483,7 +1592,8 @@ LinearLayout combineCtaCgaWithShape(LinearLayout ctaLayout,
   SmallVector<StringAttr> outDimNames = standardOutDimNames(ctx, rank);
 
   llvm::SmallDenseMap<StringAttr, int64_t> labeledShape;
-  for (auto [dim, size] : llvm::zip(outDimNames, getNpotCoverShape(shape))) {
+  for (auto [dim, size] :
+       llvm::zip(outDimNames, getNpotPow2AllocShape(shape))) {
     labeledShape[dim] = size;
   }
 
