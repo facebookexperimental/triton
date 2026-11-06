@@ -1716,16 +1716,46 @@ def test_gfx1250_governor_does_not_guess_clock_or_power_policy(monkeypatch):
     assert governor.skipped
 
 
-def test_gfx1250_attention_focus_cases_share_production_shapes(monkeypatch):
+def test_gfx1250_attention_focus_cases_share_workload_suites(monkeypatch):
     from _harness import driver
     import bench_flash_attn as standalone
     import bench_torchtlx_flex_attention as flex
-    from triton.tlx.ops.kernels.flash_attn._shapes import GFX1250_PRODUCTION
+    from triton.tlx.ops.kernels.flash_attn._shapes import FOCUS
 
     monkeypatch.setattr(driver, "arch", lambda: "gfx1250")
-    expected = {(s.batch, s.heads, s.context, s.head_dim) for s in GFX1250_PRODUCTION}
+    expected = {(s.batch, s.heads, s.context, s.head_dim)
+                for s in FOCUS.shapes("gfx1250")
+                if s.head_dim == 128 and not s.causal}
     for bench in (standalone, flex):
         cases = bench.cases()
         assert {case.shape[:4] for case in cases} == expected
         assert {case.dtype for case in cases} == {"float16", "bfloat16"}
         assert {case.direction for case in cases} == {"fwd"}
+
+
+@pytest.mark.parametrize("arch", ["gfx1250", "gfx950", "sm100"])
+def test_flex_first_use_cost_is_measured_on_every_arch(monkeypatch, tmp_path, arch):
+    import contextlib
+    import torch
+    import bench_torchtlx_flex_attention as flex
+    from _harness import driver
+
+    tensor = torch.zeros((1, 2, 128, 128))
+    measured = []
+
+    def measure_first_use(fn):
+        fn()
+        measured.append(True)
+        return CompileStat(t_cold_s=2.0)
+
+    monkeypatch.setattr(driver, "arch", lambda: arch)
+    monkeypatch.setattr(flex, "ARTIFACT_DIR", tmp_path)
+    monkeypatch.setattr(flex, "flex_adapter", contextlib.nullcontext)
+    monkeypatch.setattr(flex, "inputs", lambda *a, **kw: ((tensor, tensor, tensor), None, None))
+    monkeypatch.setattr(flex, "compile_arm", lambda *a, **kw: (lambda: tensor, tensor))
+    monkeypatch.setattr(flex, "cold_compile", measure_first_use)
+    case = Case(flex.OP, arch, "float16", (1, 2, 128, 128, "noop"))
+    prepared = flex.prepare(case, "heuristic")
+    assert measured == [True]
+    assert prepared.compile_stat.t_cold_s == 2.0
+    assert prepared.extra["cold_start_scope"] == "inductor_graph_compile_and_capture"

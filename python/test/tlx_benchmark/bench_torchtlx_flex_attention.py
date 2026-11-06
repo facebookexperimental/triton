@@ -1,4 +1,4 @@
-"""TorchTLX FlexAttention forward comparison with max_autotune disabled."""
+"""TorchTLX FlexAttention prefill throughput and first-use graph compilation/capture cost."""
 from __future__ import annotations
 
 import argparse
@@ -21,11 +21,11 @@ from torch._inductor import config
 from torch._inductor.utils import run_and_get_code
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
-from triton.tlx.ops.kernels.flash_attn._shapes import GFX1250_PRODUCTION
+from triton.tlx.ops.kernels.flash_attn._shapes import FOCUS as FLASH_ATTN_FOCUS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _harness import Case, Prepared, driver  # noqa: E402
+from _harness import Case, Prepared, cold_compile, driver  # noqa: E402
 
 OP = "flex_attention_torchtlx"
 REF_NAME = "torch.compile flex_attention (TLX off)"
@@ -98,6 +98,7 @@ def inputs(mod, seq, batch=8, heads=16, dim=128, dtype=torch.bfloat16, *, q_len=
 
 
 def compile_arm(tensors, score_mod, block_mask, mode, out, *, kernel_options=None, max_autotune=False):
+    kernel_options = {"FORCE_USE_FLEX_ATTENTION": True, **(kernel_options or {})}
 
     def fn(q, k, v):
         return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask, kernel_options=kernel_options)
@@ -219,13 +220,16 @@ SHAPE_SUITES = FocusRegistry(
         FocusSuite("builtin", OP, includes=MODS),
         FocusSuite("fp16", OP,
                    tuple(FlexAttentionShape(8, 16, 2**i, 128, mod, "float16") for mod in MODS for i in range(7, 15))),
+    ) + tuple(
         FocusSuite(
-            "gfx1250_1", OP,
+            suite.name, OP,
             tuple(
                 FlexAttentionShape(s.batch, s.heads, s.context, s.head_dim, "noop",
-                                   {"bf16": "bfloat16", "fp16": "float16"}[s.dtype]) for s in GFX1250_PRODUCTION)),
-    ),
-    {"gfx950": ("builtin", ), "sm100": ("builtin", ), "gfx1250": ("gfx1250_1", )},
+                                   {"bf16": "bfloat16", "fp16": "float16"}[s.dtype])
+                for s in suite.shapes
+                if s.head_dim == 128 and not s.causal), suite.includes)
+        for suite in FLASH_ATTN_FOCUS.suites),
+    {"gfx950": ("builtin", ), "sm100": ("builtin", ), "gfx1250": FLASH_ATTN_FOCUS.defaults["gfx1250"]},
 )
 SYNTHETIC = tuple(FlexAttentionShape(1, 2, seq, dim, mod) for mod in MODS for seq, dim in ((128, 64), (256, 128)))
 
@@ -262,22 +266,21 @@ def prepare(case, space):
                                                 dtype=getattr(torch, entry.dtype))
         name = case.key.replace("/", "_")
         ref, ref_result = compile_arm(tensors, score_mod, block_mask, None, root / f"{name}.stock.py")
-        compile_stat = None
-        if driver.arch() == "gfx1250":
-            import time
-            from _harness import CompileStat, fresh_triton_cache
-            from _harness.compile import _Counters
-            with fresh_triton_cache(), _Counters() as counters:
-                started = time.perf_counter()
-                tlx, result = compile_arm(tensors, score_mod, block_mask, "force", root / f"{name}.tlx.py",
-                                          max_autotune=space == "full")
-                torch.cuda.synchronize()
-                compile_stat = CompileStat(time.perf_counter() - started, counters.compiles, counters.configs or None)
-        else:
-            tlx, result = compile_arm(tensors, score_mod, block_mask, "force", root / f"{name}.tlx.py")
+        prepared = []
+
+        def first_use():
+            prepared.append(
+                compile_arm(tensors, score_mod, block_mask, "force", root / f"{name}.tlx.py",
+                            max_autotune=space == "full"))
+
+        compile_stat = cold_compile(first_use)
+        tlx, result = prepared.pop()
     reference = document_reference(tensors, entry.seq, entry.batch) if entry.mod == "document_mask" else ref_result
     stock_accuracy, _ = _accuracy(ref_result, reference)
-    extra = {"stock_accuracy": stock_accuracy, "max_abs_error": (result.float() - reference.float()).abs().max().item()}
+    extra = {
+        "stock_accuracy": stock_accuracy, "max_abs_error": (result.float() - reference.float()).abs().max().item(),
+        "cold_start_scope": "inductor_graph_compile_and_capture"
+    }
     if not stock_accuracy:
         # An inaccurate stock result cannot support a performance ratio.
         ref = None

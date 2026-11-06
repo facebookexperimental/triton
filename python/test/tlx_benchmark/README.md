@@ -212,6 +212,11 @@ configs -- which per case is most of the suite's runtime, spent re-answering a
 question that is not per-shape. Those ops sample it instead: one case per
 direction, the rest report `-` and are not gated on compile.
 
+For TorchTLX FlexAttention, first use includes Inductor graph compilation and
+CUDA graph capture on every architecture. This happens during preparation;
+the adapter reports that cost instead of timing a graph replay as compilation.
+Artifacts identify it as `cold_start_scope=inductor_graph_compile_and_capture`.
+
 `--cold-compile {all,first,none}` overrides. `all` is the honest per-case
 reading and what to use when compile time is what you are investigating.
 

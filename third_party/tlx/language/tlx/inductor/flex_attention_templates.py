@@ -52,7 +52,7 @@ sm90_flex_attention_backward_template = _make_flex_template(
 )
 
 
-#: gfx950 and gfx1250 use separate forward templates.
+# gfx942 still needs its own template; gfx1250 uses a separate forward template.
 _AMD_FLEX_ARCHES = frozenset({"gfx950"})
 
 
@@ -127,7 +127,7 @@ def append_tlx_flex(
     query, logsumexp, max_scores = input_nodes[0], input_nodes[3], input_nodes[4]
     mutated_inputs = [logsumexp, max_scores]
 
-    if current_target().key == "gfx1250":
+    if current_target().is_gfx1250:
         appender = _append_tlx_flex_gfx1250
     else:
         appender = _append_tlx_flex_amd if _use_amd_flex_template() else _append_tlx_flex_nvidia
@@ -458,6 +458,7 @@ def _append_tlx_flex_gfx1250(choices, configs, input_nodes, subgraphs, layout, o
     import sympy
     import triton
     from torch._inductor import config
+    from torch._inductor.virtualized import V
     from triton.tlx.ops.kernels.flash_attn.gfx1250 import _CONFIGS, heuristic_config
 
     tensors = input_nodes[:3]
@@ -477,10 +478,15 @@ def _append_tlx_flex_gfx1250(choices, configs, input_nodes, subgraphs, layout, o
     batch, heads, sq, _ = query.get_size()
     sk = input_nodes[1].get_size()[2]
     static_shape = all(isinstance(size, (int, sympy.Integer)) for size in (batch, heads, sq, sk))
-    base["USE_FIXED_REFERENCE"] = static_shape and sk >= 512
-    preferred = heuristic_config(int(batch), int(heads), int(sq), int(sk),
-                                 current_target().num_cus) if static_shape else _CONFIGS[1]
-    if static_shape and sq <= 32:
+    base["USE_FIXED_REFERENCE"] = isinstance(sk, (int, sympy.Integer)) and sk >= 512
+    if static_shape:
+        hints = tuple(map(int, (batch, heads, sq, sk)))
+    else:
+        sizevars = V.graph.sizevars
+        hint = getattr(sizevars, "optimization_hint", None) or sizevars.size_hint
+        hints = tuple(hint(size, fallback=1) for size in (batch, heads, sq, sk))
+    preferred = heuristic_config(*hints, current_target().num_cus)
+    if hints[2] <= 32:
         preferred = _CONFIGS[0]
     candidates = [preferred, *_CONFIGS] if config.max_autotune else [preferred]
     seen = set()
