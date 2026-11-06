@@ -27,6 +27,7 @@
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
@@ -121,14 +122,6 @@ static Attribute shrinkSwizzleForShape(Attribute layout,
       nvmma.getFp4Padded(), nvmma.getCGALayout(), nvmma.getFp6Padded());
 }
 
-struct BLoadTrace {
-  tt::DescriptorLoadOp descLoad;
-  ttg::LocalAllocOp localAlloc;
-  ttg::MemDescTransOp memDescTrans;
-  tt::TransOp trans;
-  unsigned splitDim = 1;
-};
-
 // Descriptor loads may drop leading unit block dimensions from their tensor
 // result.  BMM uses this to keep one rank-3 [B, K, N] descriptor while feeding
 // the rank-2 [K, N] tile expected by dot.  Map the MMA/result dimension back
@@ -149,52 +142,6 @@ static FailureOr<unsigned> mapResultDimToDescriptor(tt::TensorDescType descType,
   if (!llvm::equal(blockShape.drop_front(rankDelta), resultShape))
     return failure();
   return rankDelta + resultDim;
-}
-
-// Trace B operand from MMA back through LocalAllocOp and cheap layout/view ops
-// to find the DescriptorLoadOp. When B is transposed, either before allocation
-// with tt.trans or after allocation with ttg.memdesc_trans, split the
-// descriptor dimension that becomes the MMA N dimension after transpose.
-static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
-  ttg::MemDescTransOp memDescTrans;
-  unsigned splitDim = 1;
-  if (auto transOp = bMemDesc.getDefiningOp<ttg::MemDescTransOp>()) {
-    memDescTrans = transOp;
-    if (memDescTrans.getOrder().size() != 2)
-      return failure();
-    // MMA B's N dimension is result dimension 1. Map it back to the source
-    // descriptor/local_alloc dimension through the memdesc transpose order.
-    splitDim = memDescTrans.getOrder()[1];
-    bMemDesc = memDescTrans.getSrc();
-  }
-
-  auto localAlloc = bMemDesc.getDefiningOp<ttg::LocalAllocOp>();
-  if (!localAlloc)
-    return failure();
-
-  Value tensor = localAlloc.getSrc();
-  // Skip convert_layout ops.
-  while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
-    tensor = cvt.getSrc();
-
-  tt::TransOp trans;
-  if (auto transOp = tensor.getDefiningOp<tt::TransOp>()) {
-    trans = transOp;
-    if (trans.getOrder().size() != 2)
-      return failure();
-    // MMA B's N dimension is result dimension 1. Map it back to the
-    // descriptor-load source dimension through the transpose order.
-    splitDim = trans.getOrder()[splitDim];
-    tensor = trans.getSrc();
-    while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
-      tensor = cvt.getSrc();
-  }
-
-  auto descLoad = tensor.getDefiningOp<tt::DescriptorLoadOp>();
-  if (!descLoad)
-    return failure();
-
-  return BLoadTrace{descLoad, localAlloc, memDescTrans, trans, splitDim};
 }
 
 struct Transform2CTALoads
@@ -309,16 +256,11 @@ struct Transform2CTALoads
         rhsMMA.getB() != rhsAlloc.getResult())
       return failure();
 
-    auto trans = split.getSrc().getDefiningOp<tt::TransOp>();
-    if (!trans || trans.getOrder().size() != 3 || trans.getOrder()[0] != 1 ||
-        trans.getOrder()[1] != 2 || trans.getOrder()[2] != 0)
-      return failure();
-    auto reshape = trans.getSrc().getDefiningOp<tt::ReshapeOp>();
-    if (!reshape)
-      return failure();
-    auto descLoad = reshape.getSrc().getDefiningOp<tt::DescriptorLoadOp>();
+    auto descLoad = tt::getTwoCTASplitBLoad(split);
     if (!descLoad)
       return failure();
+    auto trans = split.getSrc().getDefiningOp<tt::TransOp>();
+    auto reshape = trans.getSrc().getDefiningOp<tt::ReshapeOp>();
 
     auto descType = originalDescTypes.lookup(descLoad.getDesc());
     auto loadType = dyn_cast<RankedTensorType>(descLoad.getType());
@@ -448,7 +390,7 @@ struct Transform2CTALoads
     if (!b)
       return failure();
     // Trace B operand back to DescriptorLoadOp.
-    FailureOr<BLoadTrace> trace = traceToDescriptorLoad(b);
+    FailureOr<tt::TwoCTABLoadTrace> trace = tt::traceTwoCTABLoad(b);
     if (failed(trace))
       return failure();
     auto descLoad = trace->descLoad;

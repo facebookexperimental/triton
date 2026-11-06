@@ -476,6 +476,24 @@ SmallVector<Value> getTiedArgs(Operation *op, int resultIdx);
 // Get a boolean if the Value is an arith::ConstantOp
 std::optional<bool> getBoolFromConstant(Value cst);
 
+// The descriptor load a 2-CTA MMA's B operand comes from. Transform2CTALoads
+// splits `splitDim`, the load dimension that becomes the MMA N dimension.
+struct TwoCTABLoadTrace {
+  DescriptorLoadOp descLoad;
+  gpu::LocalAllocOp localAlloc;
+  gpu::MemDescTransOp memDescTrans;
+  TransOp trans;
+  unsigned splitDim = 1;
+};
+
+// Trace B back through local_alloc, cheap layout/view ops and an optional
+// tt.trans or ttg.memdesc_trans to its descriptor load.
+FailureOr<TwoCTABLoadTrace> traceTwoCTABLoad(Value bMemDesc);
+
+// Return the descriptor load of a source-level split of one B tile
+// (descriptor_load -> reshape -> trans [1, 2, 0] -> split), or null.
+DescriptorLoadOp getTwoCTASplitBLoad(SplitOp split);
+
 } // namespace mlir::triton
 
 #endif // TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_

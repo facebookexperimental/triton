@@ -2260,4 +2260,57 @@ std::optional<bool> getBoolFromConstant(Value cst) {
   return std::nullopt;
 }
 
+FailureOr<TwoCTABLoadTrace> traceTwoCTABLoad(Value bMemDesc) {
+  ttg::MemDescTransOp memDescTrans;
+  unsigned splitDim = 1;
+  if (auto transOp = bMemDesc.getDefiningOp<ttg::MemDescTransOp>()) {
+    memDescTrans = transOp;
+    if (memDescTrans.getOrder().size() != 2)
+      return failure();
+    // MMA B's N dimension is result dimension 1. Map it back to the source
+    // descriptor/local_alloc dimension through the memdesc transpose order.
+    splitDim = memDescTrans.getOrder()[1];
+    bMemDesc = memDescTrans.getSrc();
+  }
+
+  auto localAlloc = bMemDesc.getDefiningOp<ttg::LocalAllocOp>();
+  if (!localAlloc)
+    return failure();
+
+  Value tensor = localAlloc.getSrc();
+  // Skip convert_layout ops.
+  while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
+    tensor = cvt.getSrc();
+
+  tt::TransOp trans;
+  if (auto transOp = tensor.getDefiningOp<tt::TransOp>()) {
+    trans = transOp;
+    if (trans.getOrder().size() != 2)
+      return failure();
+    // MMA B's N dimension is result dimension 1. Map it back to the
+    // descriptor-load source dimension through the transpose order.
+    splitDim = trans.getOrder()[splitDim];
+    tensor = trans.getSrc();
+    while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
+      tensor = cvt.getSrc();
+  }
+
+  auto descLoad = tensor.getDefiningOp<tt::DescriptorLoadOp>();
+  if (!descLoad)
+    return failure();
+
+  return TwoCTABLoadTrace{descLoad, localAlloc, memDescTrans, trans, splitDim};
+}
+
+DescriptorLoadOp getTwoCTASplitBLoad(SplitOp split) {
+  auto trans = split.getSrc().getDefiningOp<tt::TransOp>();
+  if (!trans || trans.getOrder().size() != 3 || trans.getOrder()[0] != 1 ||
+      trans.getOrder()[1] != 2 || trans.getOrder()[2] != 0)
+    return {};
+  auto reshape = trans.getSrc().getDefiningOp<tt::ReshapeOp>();
+  if (!reshape)
+    return {};
+  return reshape.getSrc().getDefiningOp<tt::DescriptorLoadOp>();
+}
+
 } // namespace mlir::triton
