@@ -488,6 +488,13 @@ def _add_bias(acc, bias_vec, ADD_BIAS: tl.constexpr, ALONG_ROWS: tl.constexpr):
 
 
 @triton.jit
+def _wait_for_prior_grid():
+    """Under programmatic dependent launch, block until the previous kernel on
+    the stream has finished and its writes are visible; a no-op otherwise."""
+    tl.inline_asm_elementwise("griddepcontrol.wait; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
 def _reduce_split_k_kernel(workspace_ptr, c_ptr, bias_ptr, M, N, ROWS_PER_SPLIT, stride_bias, SPLIT_K: tl.constexpr,
                            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, OUTPUT_DTYPE: tl.constexpr,
                            ADD_BIAS: tl.constexpr):
@@ -495,10 +502,12 @@ def _reduce_split_k_kernel(workspace_ptr, c_ptr, bias_ptr, M, N, ROWS_PER_SPLIT,
     offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     offs = offs_m[:, None] * N + offs_n[None, :]
+    # The bias is not written by the GEMM, so it loads before the wait.
+    bias_vec = _bias_vec(bias_ptr, tl.program_id(1) * BLOCK_N, N, stride_bias, BLOCK_N, ADD_BIAS)
+    _wait_for_prior_grid()
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for s in tl.static_range(SPLIT_K):
         acc += tl.load(workspace_ptr + s * ROWS_PER_SPLIT * N + offs, mask=mask, other=0.0)
-    bias_vec = _bias_vec(bias_ptr, tl.program_id(1) * BLOCK_N, N, stride_bias, BLOCK_N, ADD_BIAS)
     acc = _add_bias(acc, bias_vec, ADD_BIAS, False)
     tl.store(c_ptr + offs, acc.to(OUTPUT_DTYPE), mask=mask)
 
@@ -518,6 +527,10 @@ def _reduce_split_k(workspace, c, M, N, split_k, bias=None, stride_bias=0):
         BLOCK_N=block_n,
         OUTPUT_DTYPE=_TORCH_TO_TL[c.dtype],
         ADD_BIAS=bias is not None,
+        # Programmatic dependent launch: the reducer is staged while the GEMM
+        # runs and waits on it in-kernel, hiding the launch gap (~1 us on H100,
+        # 608x512x20992), as cuBLAS's splitKreduce does.
+        launch_pdl=True,
     )
 
 
