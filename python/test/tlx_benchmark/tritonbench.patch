@@ -1,0 +1,1288 @@
+diff --git a/tritonbench/components/do_bench/gpu_events.py b/tritonbench/components/do_bench/gpu_events.py
+--- a/tritonbench/components/do_bench/gpu_events.py
++++ b/tritonbench/components/do_bench/gpu_events.py
+@@ -1,4 +1,5 @@
+-import threading
++import contextlib
++import logging
+ import time
+ from functools import lru_cache
+ from typing import Any, Callable, Optional
+@@ -7,13 +8,20 @@
+ import triton
+ import triton.language as tl
+ from tritonbench.utils.constants import DEFAULT_N_REP, DEFAULT_N_WARMUP
+-from tritonbench.utils.cudagraph_utils import CudaGraphConfig, CudaGraphError
+-from tritonbench.utils.env_utils import get_current_device, get_device_module, is_hip
++from tritonbench.utils.cudagraph_utils import CudaGraphConfig
++from tritonbench.utils.env_utils import (
++    get_current_device,
++    get_device_module,
++    get_graph_cls,
++    is_hip,
++)
+
+ from .common import summarize_statistics
+ from .utils import resolve_warmup_and_rep
+
+-AMD_SLEEP_NS_PER_ITERATION = 3870
++logger = logging.getLogger(__name__)
++
++AMD_SLEEP_NS_PER_ITERATION = tl.constexpr(3870)
+
+ # Duration of one sleep_xpu pause. A tl.constexpr because @triton.jit code may
+ # only read constexpr globals.
+@@ -342,12 +350,11 @@
+                 device_type=device_type,
+             )
+
+-            # Benchmark
+-            fn(n_repeat)
+-
+-        # Unblock the stream to allow the benchmark to run
+-        with device_module.stream(unblocking_stream):
+-            _unblock_stream(signal_buffer=signal_buffer, signal=signal)
++            try:
++                fn(n_repeat)
++            finally:
++                with device_module.stream(unblocking_stream):
++                    _unblock_stream(signal_buffer=signal_buffer, signal=signal)
+
+         # Wait for the events to complete
+         device_module.synchronize()
+@@ -369,229 +376,253 @@
+     return n_repeat
+
+
++class _EventSamples(list):
++    def __init__(self, values, timing_scope):
++        super().__init__(values)
++        self.timing_scope = timing_scope
++
++
++@lru_cache(maxsize=None)
++def _supports_timed_graph_events(device_type, device_index):
++    device_module = get_device_module()
++    stream = device_module.Stream()
++    graph = get_graph_cls()()
++    tensor = torch.zeros(1, device=get_current_device())
++    start, end = (
++        device_module.Event(enable_timing=True, external=True) for _ in range(2)
++    )
++    try:
++        with device_module.graph(graph, stream=stream):
++            start.record()
++            tensor.zero_()
++            end.record()
++        graph.replay()
++        device_module.synchronize()
++        start.elapsed_time(end)
++        return True
++    except RuntimeError as error:
++        if not any(
++            message in str(error).lower()
++            for message in (
++                "invalid argument",
++                "invalid resource handle",
++                "not supported",
++            )
++        ):
++            raise
++        logger.warning(
++            "This runtime cannot time events inside graph capture; "
++            "graph latency includes GPU graph dispatch."
++        )
++        return False
++    finally:
++        graph.reset()
++
++
++@contextlib.contextmanager
++def _replay_callable(fn, prepare_call, config, device_module, enabled):
++    if not enabled:
++        yield fn
++        return
++    graph = config.get_graph()
++    prepare_call()
++    try:
++        with device_module.graph(graph, stream=config.get_stream()):
++            fn()
++        device_module.synchronize()
++        yield graph.replay
++    finally:
++        config.reset_graph()
++
++
++def _sample_graph_calls(fn, prepare_call, count, config, device_module, blocking_args):
++    stream = config.get_stream()
++    graph = config.get_graph()
++    start, end = (
++        device_module.Event(enable_timing=True, external=True) for _ in range(2)
++    )
++    try:
++        prepare_call()
++        with device_module.graph(graph, stream=stream):
++            start.record()
++            fn()
++            end.record()
++
++        def replay(_):
++            prepare_call()
++            graph.replay()
++
++        times = []
++        for _ in range(count):
++            _bench_with_stream_blocking(
++                replay,
++                compute_stream=stream,
++                n_repeat=1,
++                **blocking_args,
++            )
++            times.append(start.elapsed_time(end))
++        return times
++    finally:
++        config.reset_graph()
++
++
+ def do_bench_events(
+     fn,
+-    warmup,
+-    rep,
++    warmup=None,
++    rep=None,
+     return_mode="all",
+     grad_to_none=None,
+     use_cudagraph=False,
+     skip_cache_clearing=False,
+     cudagraph_config: Optional[CudaGraphConfig] = None,
++    warmup_iters: Optional[int] = None,
++    sample_count: Optional[int] = None,
+ ):
+-    """Measure GPU kernel execution time using GPU events.
++    """Collect per-call device latencies behind a GPU stream gate.
+
+-    This method profiles the function and extracts the actual GPU kernel execution
+-    time by summing up all CUDA kernel durations (excluding overlaps) from the profiler trace.
+-
+-    Args:
+-        fn: Function to benchmark
+-        warmup: Target warmup time in milliseconds (matches triton.testing.do_bench)
+-        rep: Target total measurement time in milliseconds (matches triton.testing.do_bench)
+-        return_mode: "all" for list of measurements, other modes for single values
+-        grad_to_none: Tensors whose gradients should be cleared before each measurement
+-        use_cudagraph: Whether to use CUDA graphs for benchmarking
+-
+-    Returns:
+-        List of measured kernel times in milliseconds (if return_mode="all") or single value.
++    ``warmup`` and ``rep`` are milliseconds. Explicit iteration counts take
++    precedence over duration-based sampling. Cache clearing is outside each
++    event pair. Graph timing records the events inside the captured calls.
+     """
+-    fn_only_bench = grad_to_none is None and skip_cache_clearing
++    if warmup_iters is not None and warmup_iters < 0:
++        raise ValueError("warmup_iters must be nonnegative")
++    if sample_count is not None and sample_count < 1:
++        raise ValueError("sample_count must be positive")
+     device = get_current_device()
+     device_module = get_device_module(device)
+-    if use_cudagraph:
+-        assert fn_only_bench, (
+-            "CUDA graphs only support grad_to_none=None and skip_cache_clearing=True"
+-        )
+-        assert cudagraph_config is not None
+-        compute_stream = cudagraph_config.get_stream()
+-    else:
+-        compute_stream = device_module.current_stream()
+-
+-    # Backend used to pick the in-kernel sleep instruction while the stream is
+-    # blocked ("hip", "cuda", "xpu", or anything else to busy-poll).
++    compute_stream = device_module.current_stream()
+     device_type = "hip" if is_hip() else device
+-
+-    # Get cache for L2 cache clearing
+     cache = (
+         triton.runtime.driver.active.get_empty_cache_for_benchmark()
+         if not skip_cache_clearing
+         else None
+     )
+
+-    clear_cache_fn = cache.zero_ if not skip_cache_clearing else lambda *args: None
+-    if grad_to_none is not None:
+-
+-        def grad_to_none_fn():
+-            for x in grad_to_none:
+-                x.grad = None
+-    else:
+-        grad_to_none_fn = lambda *args: None
++    def prepare_call():
++        if grad_to_none is not None:
++            for tensor in grad_to_none:
++                tensor.grad = None
++        if cache is not None:
++            cache.zero_()
+
+-    # Setup buffer, and stream for blocking/unblocking the stream
+-    signal = 1
+     signal_buffer, timeout_buffer, unblocking_stream = _setup_stream_blocking(
+-        signal, device_type=device_type
++        1, device_type=device_type
+     )
++    if warmup_iters is None or sample_count is None:
++        start, end = (device_module.Event(enable_timing=True) for _ in range(2))
+
+-    # Initial time events
+-    time_events = [device_module.Event(enable_timing=True) for _ in range(2)]
+-
+-    # Estimate number of iterations based on target rep time
+-    if fn_only_bench:
+-
+-        def _bench_loop_fn(n_repeat: int):
+-            time_events[0].record()
+-            for _ in range(n_repeat):
+-                fn()
+-            time_events[1].record()
+-    else:
+-
+-        def _bench_loop_fn(n_repeat: int):
+-            time_events[0].record()
+-            for _ in range(n_repeat):
+-                grad_to_none_fn()
++        def estimate_loop(count):
++            start.record()
++            for _ in range(count):
+                 fn()
+-            time_events[1].record()
+-
+-    n_repeat = _bench_with_stream_blocking(
+-        _bench_loop_fn,
+-        compute_stream,
+-        unblocking_stream,
+-        signal_buffer,
+-        timeout_buffer,
+-        signal,
+-        n_repeat=10,
+-        device_type=device_type,
+-    )
+-    device_module.synchronize()
+-
+-    estimate_ms = time_events[0].elapsed_time(time_events[1]) / n_repeat
+-    warmup, rep = resolve_warmup_and_rep(warmup, rep, estimate_ms)
+-
+-    # Calculate number of warmup iterations based on target rep time
+-    if estimate_ms == 0:
+-        n_warmup = DEFAULT_N_WARMUP  # Default if function is very fast
+-    else:
+-        n_warmup = max(1, int(warmup / estimate_ms))
++            end.record()
++
++        count = _bench_with_stream_blocking(
++            estimate_loop,
++            compute_stream,
++            unblocking_stream,
++            signal_buffer,
++            timeout_buffer,
++            1,
++            10,
++            device_type,
++        )
++        estimate_ms = start.elapsed_time(end) / count
++        warmup, rep = resolve_warmup_and_rep(warmup, rep, estimate_ms)
++        if warmup_iters is None:
++            warmup_iters = (
++                max(1, int(warmup / estimate_ms)) if estimate_ms else DEFAULT_N_WARMUP
++            )
++        if sample_count is None:
++            sample_count = (
++                max(10, int(rep / estimate_ms)) if estimate_ms else DEFAULT_N_REP
++            )
+
+-    # Regular mode warmup
+-    for _ in range(n_warmup):
+-        grad_to_none_fn()
+-        clear_cache_fn()
++    for _ in range(warmup_iters):
++        prepare_call()
+         fn()
++    device_module.synchronize()
+
+-    # Calculate number of iterations based on target rep time
+-    if estimate_ms == 0:
+-        n_repeat = DEFAULT_N_REP  # Default if function is very fast
+-    else:
+-        # Run at least 10 iterations to get a reasonable estimate
+-        n_repeat = max(10, int(rep / estimate_ms))
+-
+-    if not fn_only_bench:
+-        additional_num_events = n_repeat * 2 - len(time_events)
+-        time_events += [
+-            device_module.Event(enable_timing=True)
+-            for _ in range(additional_num_events)
+-        ]
+-
+-    # Run the benchmark
+-    if use_cudagraph:
+-        # Need to keep the rep count low for cudagraphs. So, we break the graph
+-        # into smaller chunks and replay many times otherwise the replay might
+-        # get stuck.
+-        max_num_kernels = 512
+-        num_kernels = cudagraph_config.get_num_kernels(fn)
+-        n_cudagraph_repeat = min(max(max_num_kernels // num_kernels, 1), n_repeat)
+-
+-        n_replay = max(n_repeat // n_cudagraph_repeat, 1)
+-        device_module.synchronize()
+-
+-        # Capture cudagraph
+-        fn_graph = cudagraph_config.get_graph()
+-        with device_module.graph(fn_graph, stream=cudagraph_config.get_stream()):
+-            for _ in range(n_cudagraph_repeat):
+-                fn()
+-        device_module.synchronize()
+-
+-        def run_replay(event):
+-            try:
+-                with device_module.stream(cudagraph_config.get_stream()):
+-                    fn_graph.replay()
+-                device_module.synchronize()
+-                event.set()
+-            except Exception as e:
+-                print(f"An error occurred during CudaGraph replay: {e}", flush=True)
+-
+-        # Warm up CudaGraph replay in another thread
+-        replay_event = threading.Event()
+-        thread = threading.Thread(target=run_replay, args=(replay_event,))
+-        thread.start()
+-
+-        # Wait for the replay for 10 seconds
+-        is_done = replay_event.wait(10)
+-        if not is_done:
+-            # An attempt to send an interrupt to the replay thread by deleting
+-            # the graph when the replay is stuck or there is an error.  This is
+-            # unsafe and not gauranteed to work
+-            try:
+-                print("CudaGraph replay failed. Destroying graph", flush=True)
+-                cudagraph_config.reset_graph()
+-                thread.join()
+-                device_module.synchronize()
+-                print("CudaGraph replay thread cleanly terminated", flush=True)
+-            except Exception as e:
+-                # Raise
+-                raise CudaGraphError("CudaGraph capturing error: {}".format(e))
+-        else:
+-            thread.join()
+-
+-        def _bench_loop_fn(n_replay: int):
+-            time_events[0].record()
+-            for i in range(n_replay):
+-                fn_graph.replay()
+-            time_events[1].record()
+-
+-    elif fn_only_bench:
+-
+-        def _bench_loop_fn(n_repeat: int):
+-            time_events[0].record()
+-            for i in range(n_repeat):
+-                fn()
+-            time_events[1].record()
+-    else:
+-
+-        def _bench_loop_fn(n_repeat: int):
+-            for i in range(n_repeat):
+-                grad_to_none_fn()
+-                clear_cache_fn()
+-                time_events[i * 2].record()
+-                fn()
+-                time_events[i * 2 + 1].record()
+-
+-    n_repeat = _bench_with_stream_blocking(
+-        _bench_loop_fn,
+-        compute_stream,
+-        unblocking_stream,
+-        signal_buffer,
+-        timeout_buffer,
+-        signal,
+-        n_repeat if not use_cudagraph else n_replay,
++    if use_cudagraph and cudagraph_config is None:
++        raise ValueError("CUDA graph timing requires cudagraph_config")
++    blocking_args = dict(
++        unblocking_stream=unblocking_stream,
++        signal_buffer=signal_buffer,
++        timeout_buffer=timeout_buffer,
++        signal=1,
+         device_type=device_type,
+     )
+-
+-    if use_cudagraph:
+-        n_repeat = n_repeat * n_cudagraph_repeat
+-        # Delete graph
+-        cudagraph_config.reset_graph()
+-
+-    if fn_only_bench:
+-        kernel_time = time_events[0].elapsed_time(time_events[1]) / n_repeat
+-        assert kernel_time > 0, "Failed to run the benchmark since the kernel time is 0"
+-        all_kernel_times = [kernel_time] * n_repeat
+-    else:
+-        all_kernel_times = [
+-            time_events[i * 2].elapsed_time(time_events[i * 2 + 1])
+-            for i in range(n_repeat)
+-        ]
+-    times = torch.tensor(all_kernel_times, dtype=torch.float)
+-    return summarize_statistics(times, quantiles=None, return_mode=return_mode)
++    graph_kernel_events = use_cudagraph and _supports_timed_graph_events(
++        device_type, device_module.current_device()
++    )
++    graph_replay_events = use_cudagraph and not graph_kernel_events
++    times = []
++    batch_limit = min(sample_count, 500)
++    failed_batches = 0
++    with _replay_callable(
++        fn, prepare_call, cudagraph_config, device_module, graph_replay_events
++    ) as measured_fn:
++        while len(times) < sample_count:
++            remaining = min(batch_limit, sample_count - len(times))
++            if graph_kernel_events:
++                samples = _sample_graph_calls(
++                    fn,
++                    prepare_call,
++                    remaining,
++                    cudagraph_config,
++                    device_module,
++                    blocking_args,
++                )
++                if any(value <= 0 for value in samples):
++                    raise RuntimeError(
++                        "GPU event timing returned a nonpositive latency"
++                    )
++                times.extend(samples)
++                continue
++            certified = [True]
++            events = [
++                (
++                    device_module.Event(enable_timing=True),
++                    device_module.Event(enable_timing=True),
++                )
++                for _ in range(remaining)
++            ]
++
++            def sample_loop(count):
++                certified[0] = True
++                for start, end in events[:count]:
++                    prepare_call()
++                    start.record()
++                    measured_fn()
++                    end.record()
++                    if start.query():
++                        certified[0] = False
++
++            count = _bench_with_stream_blocking(
++                sample_loop,
++                compute_stream,
++                unblocking_stream,
++                signal_buffer,
++                timeout_buffer,
++                1,
++                remaining,
++                device_type,
++            )
++            if not certified[0]:
++                failed_batches += 1
++                if failed_batches >= 4 and count == 1:
++                    raise RuntimeError(
++                        "GPU event call could not be queued before execution"
++                    )
++                batch_limit = max(1, count // 2)
++                continue
++            failed_batches = 0
++            samples = [start.elapsed_time(end) for start, end in events[:count]]
++            if any(value <= 0 for value in samples):
++                raise RuntimeError("GPU event timing returned a nonpositive latency")
++            times.extend(samples)
++    if return_mode == "all":
++        return _EventSamples(times, "graph_replay" if graph_replay_events else "kernel")
++    return summarize_statistics(
++        torch.tensor(times), quantiles=None, return_mode=return_mode
++    )
+diff --git a/tritonbench/components/do_bench/run.py b/tritonbench/components/do_bench/run.py
+--- a/tritonbench/components/do_bench/run.py
++++ b/tritonbench/components/do_bench/run.py
+@@ -61,7 +61,11 @@
+     times: List[float]
+
+     def __init__(self, times, remove_outliers=True):
+-        self.times = self._remove_outliers_iqr(times) if remove_outliers else times
++        self.timing_scope = getattr(times, "timing_scope", "unspecified")
++        self.raw_times = list(times)
++        self.times = (
++            self._remove_outliers_iqr(times) if remove_outliers else list(times)
++        )
+
+     def __str__(self):
+         """By default, use p50"""
+@@ -106,6 +110,19 @@
+     def p50(self):
+         return statistics.median_low(self.times)
+
++    @property
++    def cv(self):
++        return statistics.pstdev(self.times) / statistics.mean(self.times)
++
++    @property
++    def raw_cv(self):
++        return statistics.pstdev(self.raw_times) / statistics.mean(self.raw_times)
++
++    def percentile(self, quantile):
++        import math
++
++        return sorted(self.times)[max(0, math.ceil(quantile * len(self.times)) - 1)]
++
+     @property
+     def min(self):
+         return min(self.times)
+@@ -167,8 +184,8 @@
+         return float(self.to_str())
+
+     def scale(self, scale):
+-        for i in range(len(self.times)):
+-            self.times[i] /= scale
++        self.times = [value / scale for value in self.times]
++        self.raw_times = [value / scale for value in self.raw_times]
+
+
+ def _do_bench_inductor(fn, warmup, rep, return_mode="all", grad_to_none=None):
+@@ -743,6 +760,8 @@
+     entropy_min_warmup_samples: int = 20,
+     cudagraph_config: Optional[CudaGraphConfig] = None,
+     remove_outliers: bool = True,
++    warmup_iters: Optional[int] = None,
++    sample_count: Optional[int] = None,
+ ) -> Optional[Latency]:
+     """Wrapper to triton's do_bench to gain latency.
+
+@@ -837,7 +856,7 @@
+                     ),
+                     remove_outliers=remove_outliers,
+                 )
+-        elif repcnt:
++        elif repcnt and latency_measure_mode != "gpu_events":
+             # benchmark using repcnt
+             from .power import do_bench_power
+
+@@ -864,6 +883,8 @@
+                     skip_cache_clearing=skip_cache_clearing,
+                     use_cudagraph=use_cuda_graphs,
+                     cudagraph_config=cudagraph_config,
++                    warmup_iters=warmup_iters,
++                    sample_count=sample_count if sample_count is not None else repcnt,
+                 ),
+                 remove_outliers=remove_outliers,
+             )
+diff --git a/tritonbench/data/loader.py b/tritonbench/data/loader.py
+--- a/tritonbench/data/loader.py
++++ b/tritonbench/data/loader.py
+@@ -210,7 +210,24 @@
+         raise ValueError(f"--suite is not supported for TritonBench op {op_name!r}")
+
+     shapes_module = importlib.import_module(f"triton.tlx.ops.kernels.{tlx_op}._shapes")
+-    shapes = shapes_module.FOCUS.resolved_shapes(suite)
++    shapes = shapes_module.FOCUS.shapes(None, suite.split(","))
++    return get_tlx_inputs(tritonbench_op, shapes)
++
++
++def get_tlx_inputs(tritonbench_op, shapes):
++    op_name = tritonbench_op.name
++    tlx_op = {
++        "gemm": "mm",
++        "addmm": "addmm",
++        "bmm": "bmm",
++        "flash_attention": "flash_attn",
++        "grouped_gemm": "grouped_gemm",
++        "flex_attention": "flex_attention",
++        "tlx_flash_attention_varlen": "flash_attn_varlen",
++    }[op_name]
++    shapes_module = importlib.import_module(f"triton.tlx.ops.kernels.{tlx_op}._shapes")
++    if op_name == "flash_attention" and tritonbench_op.mode.value == "bwd":
++        shapes = [shape for shape in shapes if shape not in shapes_module.FORWARD_ONLY]
+     tritonbench_op._tlx_contracts = [shape._asdict() for shape in shapes]
+     if op_name == "flex_attention":
+         return lambda: (tritonbench_op._build_sm90_input(shape) for shape in shapes)
+@@ -233,6 +250,23 @@
+                 yield (*tensors, lens_q, lens_k, shape.causal)
+
+         return varlen_inputs
++    if op_name == "flash_attention":
++
++        def attention_inputs():
++            import torch
++
++            for shape in shapes:
++                tritonbench_op.causal = shape.causal
++                tritonbench_op.sm_scale = shape.head_dim**-0.5
++                dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[shape.dtype]
++                yield shapes_module.qkv(
++                    *shape[:4],
++                    dtype,
++                    device=tritonbench_op.device,
++                    requires_grad=tritonbench_op.mode.value in ("bwd", "fwd_bwd"),
++                )
++
++        return attention_inputs
+     if op_name in ("gemm", "addmm"):
+
+         def canonical_inputs():
+diff --git a/tritonbench/operator_loader/aten/op_loader.py b/tritonbench/operator_loader/aten/op_loader.py
+--- a/tritonbench/operator_loader/aten/op_loader.py
++++ b/tritonbench/operator_loader/aten/op_loader.py
+@@ -4,7 +4,6 @@
+ from typing import Dict, Generator, List, Optional
+
+ import torch
+-import yaml
+ from tritonbench.utils.triton_op import BenchmarkOperator, register_benchmark
+
+ # The config file defines available ATen operators and their corresponding input shapes.
+@@ -40,6 +39,8 @@
+     """
+     Return the default input for the given aten op name.
+     """
++    import yaml
++
+     with open(ATEN_CONFIG_YAML, "r") as f:
+         config = yaml.safe_load(f)
+     return config[aten_op_name]
+@@ -75,6 +76,8 @@
+     """
+     Load all ATen operators from the config file.
+     """
++    import yaml
++
+     with open(ATEN_CONFIG_YAML, "r") as f:
+         config = yaml.safe_load(f)
+     return config
+diff --git a/tritonbench/operators/addmm/operator.py b/tritonbench/operators/addmm/operator.py
+--- a/tritonbench/operators/addmm/operator.py
++++ b/tritonbench/operators/addmm/operator.py
+@@ -12,6 +12,7 @@
+     has_tlx_op,
+     has_torch_tlx,
+     install_torch_tlx,
++    torch_tlx_cache_options,
+     torch_tlx_choice_filter,
+ )
+
+@@ -247,7 +248,7 @@
+                 "max_autotune": False,
+                 "max_autotune_gemm": False,
+                 "autotune_fallback_to_aten": False,
+-                "force_disable_caches": True,
++                **torch_tlx_cache_options(),
+                 "triton.tlx_mode": self.tb_args.torch_tlx_mode or "force",
+                 **torch_tlx_choice_filter(self.tb_args),
+             },
+@@ -256,6 +257,12 @@
+             compiled(a, mat1, mat2)
+         except Exception as e:
+             if _no_valid_choices(e):
++                if self.tb_args.torch_tlx_mode != "allow":
++                    raise NotImplementedError(
++                        f"Missing forced TorchTLX addmm choice for "
++                        f"M={mat1.shape[0]}, N={mat2.shape[1]}, K={mat1.shape[1]}, "
++                        f"dtype={mat1.dtype}"
++                    ) from e
+                 return None
+             raise
+         return lambda: compiled(a, mat1, mat2)
+diff --git a/tritonbench/operators/flash_attention/operator.py b/tritonbench/operators/flash_attention/operator.py
+--- a/tritonbench/operators/flash_attention/operator.py
++++ b/tritonbench/operators/flash_attention/operator.py
+@@ -329,7 +329,7 @@
+         super().__init__(tb_args, extra_args)
+         args = parse_op_args(self.extra_args)
+         self.BATCH = args.batch
+-        self.tlx_space = args.tlx_space
++        self.tlx_space = self.tb_args.tlx_space or args.tlx_space
+         self.SEQ_LEN = args.seq_len
+         self.SEQ_LEN_KV = (
+             args.seq_len_kv if args.seq_len_kv is not None else args.seq_len
+diff --git a/tritonbench/operators/gemm/operator.py b/tritonbench/operators/gemm/operator.py
+--- a/tritonbench/operators/gemm/operator.py
++++ b/tritonbench/operators/gemm/operator.py
+@@ -27,6 +27,7 @@
+     has_torch_tlx,
+     install_torch_tlx,
+     torch_tlx_choice_filter,
++    torch_tlx_cache_options,
+ )
+
+ if has_tlx():
+@@ -436,7 +437,7 @@
+             "max_autotune": False,
+             "max_autotune_gemm": False,
+             "autotune_num_choices_displayed": self.inductor_autotune_num_choices_displayed,
+-            "force_disable_caches": True,
++            **torch_tlx_cache_options(),
+             "triton.tlx_mode": self.tb_args.torch_tlx_mode or "allow",
+             **torch_tlx_choice_filter(self.tb_args),
+         }
+diff --git a/tritonbench/operators/op.py b/tritonbench/operators/op.py
+--- a/tritonbench/operators/op.py
++++ b/tritonbench/operators/op.py
+@@ -3,7 +3,6 @@
+ import pathlib
+ from typing import Dict, List
+
+-import yaml
+ from tritonbench.utils.path_utils import add_path, SUBMODULE_PATH
+
+ OPBENCH_DIR = "operators"
+@@ -62,6 +61,8 @@
+     def is_fbcode() -> bool:
+         return not hasattr(torch.version, "git_version")
+
++    import yaml
++
+     triton_ops = {}
+     for custom_triton_yaml in custom_triton_yamls:
+         with open(custom_triton_yaml, "r") as fp:
+diff --git a/tritonbench/utils/parser.py b/tritonbench/utils/parser.py
+--- a/tritonbench/utils/parser.py
++++ b/tritonbench/utils/parser.py
+@@ -14,6 +14,15 @@
+
+ def get_parser(args=None):
+     parser = argparse.ArgumentParser(allow_abbrev=False)
++    parser.add_argument(
++        "--cold-compile",
++        choices=("all", "first", "none"),
++        default="all",
++        help="Frequency of fresh-cache first-call timing",
++    )
++    parser.add_argument(
++        "--tlx-l2", action="store_true", help="Use the shared TLX L1 accuracy contract"
++    )
+     parser.add_argument(
+         "--op",
+         type=str,
+@@ -83,6 +92,18 @@
+         default=None,
+         help="Target measurement time in ms for each benchmark run. Default: auto by estimated kernel latency.",
+     )
++    parser.add_argument(
++        "--warmup-iters",
++        type=int,
++        default=None,
++        help="GPU-event warmup iterations; overrides --warmup.",
++    )
++    parser.add_argument(
++        "--sample-count",
++        type=int,
++        default=None,
++        help="GPU-event samples; overrides --rep and --repcnt.",
++    )
+     parser.add_argument(
+         "--autotune-warmup",
+         type=int,
+diff --git a/tritonbench/utils/tlx_benchmark.py b/tritonbench/utils/tlx_benchmark.py
+--- a/tritonbench/utils/tlx_benchmark.py
++++ b/tritonbench/utils/tlx_benchmark.py
+@@ -12,6 +12,8 @@
+ import torch
+ import torch._inductor.config as inductor_config
+
++from tritonbench.utils.tlx_l2 import check_accuracy as check_accuracy
++
+ logger: logging.Logger = logging.getLogger(__name__)
+
+ # Every Inductor output module imports tlx; only TLX kernels call into it.
+@@ -31,49 +33,6 @@
+             self.op._tlx_kernel_inputs.add(self.op._cur_input_id)
+
+
+-def check_accuracy(op, fn, baseline_fn):
+-    from torch.utils._pytree import tree_flatten
+-
+-    try:
+-        actual = fn()
+-        if op.mode.value == "bwd":
+-            actual = op._clone_gradients(actual, mode="BWD")
+-        reference = baseline_fn()
+-        if op.name == "tlx_flash_attention_varlen":
+-            reference = op._varlen_unpad(reference)
+-        if op.mode.value == "bwd":
+-            reference = op._clone_gradients(reference, mode="BWD")
+-        got, got_spec = tree_flatten(actual)
+-        ref, ref_spec = tree_flatten(reference)
+-        assert got_spec == ref_spec
+-        assert any(isinstance(t, torch.Tensor) for t in got)
+-        for output, expected in zip(got, ref):
+-            if output is None or expected is None:
+-                assert output is None and expected is None
+-                continue
+-            assert torch.isfinite(output).all() and torch.isfinite(expected).all()
+-            rel = (
+-                0.05
+-                if op.name == "addmm"
+-                else (0.008 if expected.dtype == torch.bfloat16 else 0.001)
+-            )
+-            if op.tb_args.bitwise:
+-                assert torch.equal(output, expected)
+-            else:
+-                requested_rtol, requested_atol = op._tlx_requested_tolerances
+-                rtol = rel if requested_rtol is None else requested_rtol
+-                atol = (
+-                    rel * expected.abs().max().item()
+-                    if requested_atol is None
+-                    else requested_atol
+-                )
+-                torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+-        return True
+-    except AssertionError as error:
+-        logger.warning("TLX L1 accuracy check failed: %s", error)
+-        return False
+-
+-
+ def _record_compilation(op, **event):
+     op._tlx_evidence.append(
+         {
+diff --git a/tritonbench/utils/tlx_l2.py b/tritonbench/utils/tlx_l2.py
+new file mode 100644
+--- /dev/null
++++ b/tritonbench/utils/tlx_l2.py
+@@ -0,0 +1,176 @@
++"""Shared policy and in-process operator runner for TLX L2 benchmarks."""
++
++from __future__ import annotations
++
++import contextlib
++import importlib
++import logging
++import os
++import statistics
++import tempfile
++import time
++
++WARMUP_ITERS = 100
++SAMPLE_COUNT = 500
++MAX_CV = 0.03
++logger = logging.getLogger(__name__)
++
++
++def apply_defaults(args):
++    args = list(args)
++    defaults = {
++        "--latency-measure-mode": "gpu_events",
++        "--tlx-space": "heuristic",
++        "--torch-tlx-mode": "force",
++        "--warmup-iters": str(WARMUP_ITERS),
++        "--sample-count": str(SAMPLE_COUNT),
++        "--metrics": "latency,tflops,speedup,accuracy,latency_stats,noisy,host_us,cold_compile_ms",
++    }
++    for flag, value in defaults.items():
++        if not any(arg == flag or arg.startswith(flag + "=") for arg in args):
++            args.extend((flag, value))
++    if "--tlx-l2" not in args:
++        args.append("--tlx-l2")
++    return args
++
++
++def latency_stats(latency):
++    return {
++        "timing_scope": latency.timing_scope,
++        "p50_ms": latency.p50,
++        "p90_ms": latency.percentile(0.90),
++        "p99_ms": latency.percentile(0.99),
++        "cv": latency.cv,
++        "raw_cv": latency.raw_cv,
++        "raw_min_ms": min(latency.raw_times),
++        "raw_max_ms": max(latency.raw_times),
++        "n_raw": len(latency.raw_times),
++        "n_kept": len(latency.times),
++    }
++
++
++def noisy(latency):
++    return max(latency.cv, latency.raw_cv) > MAX_CV
++
++
++def host_overhead_us(fn, iterations=100):
++    import torch
++
++    torch.cuda.synchronize()
++    samples = []
++    for _ in range(iterations):
++        torch.cuda.synchronize()
++        start = time.perf_counter_ns()
++        fn()
++        samples.append((time.perf_counter_ns() - start) / 1000)
++    torch.cuda.synchronize()
++    return statistics.median(samples)
++
++
++@contextlib.contextmanager
++def cold_cache(enabled):
++    import triton
++
++    if not enabled:
++        yield
++        return
++    previous = triton.knobs.cache.dir
++    previous_compile = triton.knobs.compilation.always_compile
++    previous_env = os.environ.get("TRITON_CACHE_DIR")
++    with tempfile.TemporaryDirectory(prefix="tritonbench-cold-") as cache:
++        triton.knobs.cache.dir = cache
++        triton.knobs.compilation.always_compile = True
++        os.environ["TRITON_CACHE_DIR"] = cache
++        try:
++            yield
++        finally:
++            triton.knobs.cache.dir = previous
++            triton.knobs.compilation.always_compile = previous_compile
++            if previous_env is None:
++                os.environ.pop("TRITON_CACHE_DIR", None)
++            else:
++                os.environ["TRITON_CACHE_DIR"] = previous_env
++
++
++def run_operator(
++    op_name, provider, reference, shapes, direction="fwd", *, cudagraph=False, cold=True
++):
++    """Run existing providers on explicit canonical shapes, preserving order."""
++    from tritonbench.data.loader import get_tlx_inputs
++    from tritonbench.utils.parser import get_parser
++
++    args = apply_defaults(
++        [
++            "--op",
++            op_name,
++            "--only",
++            f"{reference},{provider}",
++            "--baseline",
++            reference,
++            "--mode",
++            direction,
++            "--force",
++            "--keep-going",
++            "--metrics",
++            "latency,tflops,accuracy,host_us,cold_compile_ms,latency_stats",
++        ]
++    )
++    if cudagraph:
++        args.append("--cudagraph")
++    tb_args, extra = get_parser(args).parse_known_args(args)
++    tb_args.cold_compile = cold
++    cls = importlib.import_module(f"tritonbench.operators.{op_name}").Operator
++
++    class ExplicitShapes(cls):
++        __module__ = cls.__module__
++
++        def get_input_iter(self):
++            return get_tlx_inputs(self, shapes)()
++
++    operator = ExplicitShapes(tb_args, extra)
++    operator.run()
++    return operator.output.result
++
++
++def check_accuracy(op, fn, baseline_fn):
++    import torch
++    from torch.utils._pytree import tree_flatten
++
++    try:
++        actual = fn()
++        if op.mode.value == "bwd":
++            actual = op._clone_gradients(actual, mode="BWD")
++        reference = baseline_fn()
++        if op.name == "tlx_flash_attention_varlen":
++            reference = op._varlen_unpad(reference)
++        if op.mode.value == "bwd":
++            reference = op._clone_gradients(reference, mode="BWD")
++        got, got_spec = tree_flatten(actual)
++        ref, ref_spec = tree_flatten(reference)
++        assert got_spec == ref_spec
++        assert any(isinstance(t, torch.Tensor) for t in got)
++        for output, expected in zip(got, ref):
++            if output is None or expected is None:
++                assert output is None and expected is None
++                continue
++            assert torch.isfinite(output).all() and torch.isfinite(expected).all()
++            rel = (
++                0.05
++                if op.name == "addmm"
++                else (0.008 if expected.dtype == torch.bfloat16 else 0.001)
++            )
++            if op.tb_args.bitwise:
++                assert torch.equal(output, expected)
++            else:
++                requested_rtol, requested_atol = op._tlx_requested_tolerances
++                rtol = rel if requested_rtol is None else requested_rtol
++                atol = (
++                    rel * expected.abs().max().item()
++                    if requested_atol is None
++                    else requested_atol
++                )
++                torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
++        return True
++    except AssertionError as error:
++        logger.warning("TLX L1 accuracy check failed: %s", error)
++        return False
+diff --git a/tritonbench/utils/triton_op.py b/tritonbench/utils/triton_op.py
+--- a/tritonbench/utils/triton_op.py
++++ b/tritonbench/utils/triton_op.py
+@@ -22,7 +22,6 @@
+ from pathlib import Path
+ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Type, Union
+
+-import psutil
+ import tabulate
+ import torch
+ from torch.utils._pytree import tree_map
+@@ -61,7 +60,6 @@
+     resolve_warmup_and_rep,
+ )
+ from tritonbench.components.export import export_data
+-from tritonbench.components.power import PowerManagerTask
+ from tritonbench.data import get_input_loader, get_tlx_suite_loader
+ from tritonbench.utils.constants import (
+     DEFAULT_N_REP,
+@@ -251,9 +249,9 @@
+     PATH_PREFIX = "tritonbench.operators."
+     # We have a separate operator loader for aten operator benchmark.
+     PATH_PREFIX_LOADER = "tritonbench.operator_loader."
+-    assert PATH_PREFIX in module_path or PATH_PREFIX_LOADER in module_path, (
+-        f"We rely on module path prefix to identify operator name. Expected {PATH_PREFIX}<operator_name>, get {module_path}."
+-    )
++    assert (
++        PATH_PREFIX in module_path or PATH_PREFIX_LOADER in module_path
++    ), f"We rely on module path prefix to identify operator name. Expected {PATH_PREFIX}<operator_name>, get {module_path}."
+     if PATH_PREFIX_LOADER in module_path:
+         suffix = module_path.partition(PATH_PREFIX_LOADER)[2]
+         suffix = suffix.partition(".")[2]
+@@ -270,6 +268,10 @@
+     latency: Optional[Latency] = None
+     # tflops
+     tflops: Optional[float] = None
++    host_us: Optional[float] = None
++    cold_compile_ms: Optional[float] = None
++    latency_stats: Optional[Dict[str, Any]] = None
++    noisy: Optional[bool] = None
+     # speedup over baseline
+     speedup: Optional[float] = None
+     # accuracy over baseline (only for baseline comparison)
+@@ -644,9 +646,9 @@
+             metrics_dict = asdict(y_vals)
+         if metric_name in metrics_dict:
+             return metrics_dict[metric_name]
+-        assert metric_name in metrics_dict["extra_metrics"], (
+-            f"Metric {metric_name} could not be found."
+-        )
++        assert (
++            metric_name in metrics_dict["extra_metrics"]
++        ), f"Metric {metric_name} could not be found."
+         return metrics_dict["extra_metrics"][metric_name]
+
+     def _get_result_dict(self):
+@@ -870,9 +872,9 @@
+         elif self.tb_args.mode == "fwd_no_grad":
+             self.mode = Mode.FWD_NO_GRAD
+         else:
+-            assert self.tb_args.mode == "bwd", (
+-                "We only accept test modes: fwd, bwd, fwd_bwd, or fwd_no_grad."
+-            )
++            assert (
++                self.tb_args.mode == "bwd"
++            ), "We only accept test modes: fwd, bwd, fwd_bwd, or fwd_no_grad."
+             self.mode = Mode.BWD
+         self.requires_grad = not (self.mode == Mode.FWD_NO_GRAD)
+         self.device = tb_args.device
+@@ -928,6 +930,8 @@
+                 import torch._inductor.config as inductor_config
+
+                 inductor_config.triton.tlx_mode = None
++        self._tlx_shared_l2 = getattr(tb_args, "tlx_l2", False)
++        self._tlx_requested_tolerances = tb_args.rtol, tb_args.atol
+         self._tlx_l2 = (
+             bool(getattr(tb_args, "suite", None))
+             and tb_args.suite.startswith("sm90")
+@@ -1116,16 +1120,16 @@
+             setattr(fwd_fn, "_name", bm_func_name)
+             return fwd_fn
+         elif self.mode == Mode.BWD:
+-            assert not backend.fwd_only, (
+-                f"Backend {bm_func_name} does not support backward pass."
+-            )
++            assert (
++                not backend.fwd_only
++            ), f"Backend {bm_func_name} does not support backward pass."
+             bwd_fn = self.get_bwd_fn(fwd_fn)
+             setattr(bwd_fn, "_name", bm_func_name)
+             return bwd_fn
+         elif self.mode == Mode.FWD_BWD:
+-            assert not backend.fwd_only, (
+-                f"Backend {bm_func_name} does not support backward pass."
+-            )
++            assert (
++                not backend.fwd_only
++            ), f"Backend {bm_func_name} does not support backward pass."
+             bwd_fn = self.get_bwd_fn(fwd_fn)
+
+             # FWD_BWD returns (forward_output, grad_tensors_after_backward)
+@@ -1208,6 +1212,8 @@
+         """Benchmarking the operator and returning its metrics."""
+         metrics: list[tuple[Any, dict[str, BenchmarkOperatorMetrics]]] = []
+         if self.tb_args.power_chart:
++            from tritonbench.components.power import PowerManagerTask
++
+             if PowerManagerTask is None:
+                 raise RuntimeError(
+                     "power_chart requires a CUDA-capable GPU with pynvml support"
+@@ -1243,6 +1249,8 @@
+                 if self.reset_dynamo:
+                     torch._dynamo.reset()
+                 x_val = self.get_x_val(self.example_inputs)
++                if self._tlx_shared_l2 and hasattr(self, "_tlx_contracts"):
++                    x_val = f"{input_id}: {self._tlx_contracts[input_id]}"
+                 x_val_label = REGISTERED_X_VALS.get(self.name, "x_val")
+                 table = tabulate.tabulate(
+                     [[x_val]], headers=[x_val_label], tablefmt="simple"
+@@ -1938,8 +1946,8 @@
+
+         tree_map(_poison, _probe)
+         del _probe
+-        if self._tlx_l2:
+-            from tritonbench.utils.tlx_benchmark import check_accuracy
++        if self._tlx_l2 or self._tlx_shared_l2:
++            from tritonbench.utils.tlx_l2 import check_accuracy
+
+             return check_accuracy(self, fn, baseline_fn)
+         try:
+@@ -2159,7 +2167,9 @@
+             entropy_window_size=getattr(self.tb_args, "entropy_window_size", 299),
+             entropy_max_samples=getattr(self.tb_args, "entropy_max_samples", 10000),
+             cudagraph_config=self.cudagraph_config,
+-            remove_outliers=True,
++            remove_outliers=not ab_test_mode,
++            warmup_iters=getattr(self.tb_args, "warmup_iters", None),
++            sample_count=getattr(self.tb_args, "sample_count", None),
+         )
+
+     def _do_bench(
+@@ -2178,9 +2188,9 @@
+                 self.required_metrics
+             )
+             for metric_name in required_custom_metrics:
+-                assert metric_name not in BUILTIN_METRICS, (
+-                    "Metric name {metric_name} is built-in and should be OVERRIDDEN_METRICS. Please report a bug."
+-                )
++                assert (
++                    metric_name not in BUILTIN_METRICS
++                ), "Metric name {metric_name} is built-in and should be OVERRIDDEN_METRICS. Please report a bug."
+                 extra_metrics[metric_name] = None
+             return extra_metrics
+
+@@ -2191,10 +2201,29 @@
+             extra_metrics=_init_extra_metrics(),
+         )
+         try:
+-            with TimerContext() as setup_timer:
++            from tritonbench.utils.tlx_l2 import (
++                cold_cache,
++                host_overhead_us,
++                latency_stats,
++                noisy,
++            )
++
++            cold_mode = getattr(self.tb_args, "cold_compile", "all")
++            cold = "cold_compile_ms" in self.required_metrics and cold_mode not in (
++                False,
++                "none",
++            )
++            if cold_mode == "first":
++                cold = cold and input_id == self._input_ids[0]
++            with cold_cache(cold), TimerContext() as setup_timer:
+                 fn = self._get_bm_func(fn_name)
++                if cold:
++                    fn()
++                    get_device_module().synchronize()
+                 if "setup_time" in self.required_metrics:
+                     get_device_module().synchronize()
++            if cold:
++                metrics.cold_compile_ms = setup_timer.elapsed_ms
+             if "setup_time" in self.required_metrics:
+                 metrics.setup_time = setup_timer.elapsed_ms
+             if "first_call_time" in self.required_metrics:
+@@ -2207,9 +2236,14 @@
+                 self.baseline_fns[fn_name] = fn
+                 if self.baseline_fn is None:
+                     self.baseline_fn = fn
+-            if {"latency", "tflops", "gbps", "speedup", "compile_time"} & set(
+-                self.required_metrics
+-            ):
++            if {
++                "latency",
++                "tflops",
++                "gbps",
++                "speedup",
++                "compile_time",
++                "latency_stats",
++            } & set(self.required_metrics):
+                 if self.cudagraph_config is not None:
+                     self.cudagraph_config.num_inputs_per_iter = (
+                         self.get_num_inputs_per_iter(self.example_inputs)
+@@ -2217,6 +2251,10 @@
+                 metrics.latency = self._measure_latency(fn, warmup, rep, repcnt)
+                 if metrics.latency is not None:
+                     metrics.latency.scale(self.get_latency_scale(self.example_inputs))
++                    metrics.latency_stats = latency_stats(metrics.latency)
++                    metrics.noisy = noisy(metrics.latency)
++            if "host_us" in self.required_metrics:
++                metrics.host_us = host_overhead_us(fn)
+             if {
+                 "gpu_peak_mem",
+                 "gpu_mem_footprint_compression_ratio",
+@@ -2601,6 +2639,8 @@
+         ):
+             gpu_peak_mem = device_module.max_memory_allocated() / 10**9
+         if "cpu_peak_mem" in required_metrics:
++            import psutil
++
+             total = psutil.virtual_memory().total
+             percentage = psutil.Process(os.getpid()).memory_percent()
+             cpu_peak_mem = percentage * total / 10**9
+@@ -2892,14 +2932,14 @@
+             if is_mtia()
+             else get_device_name(self.device)
+         )
+-        assert device_name in rooflines, (
+-            f"{device_name} is not supported in HW roofline specs."
+-        )
++        assert (
++            device_name in rooflines
++        ), f"{device_name} is not supported in HW roofline specs."
+         rooflines = rooflines[device_name]
+         if self.is_compute_bound:
+-            assert self.tb_args.precision in rooflines, (
+-                f"{self.tb_args.precision} is not supported by {device_name}."
+-            )
++            assert (
++                self.tb_args.precision in rooflines
++            ), f"{self.tb_args.precision} is not supported by {device_name}."
+             return rooflines[self.tb_args.precision]
+         return rooflines
+
+diff --git a/tritonbench/utils/triton_utils.py b/tritonbench/utils/triton_utils.py
+--- a/tritonbench/utils/triton_utils.py
++++ b/tritonbench/utils/triton_utils.py
+@@ -95,3 +95,15 @@
+     import triton.language as tl
+
+     return hasattr(getattr(tl, "tools", None), "experimental_descriptor")
++
++
++def torch_tlx_cache_options() -> dict:
++    """Disable cache reuse across forced and reference compiles on both torch builds."""
++    import torch._inductor
++
++    options = set(torch._inductor.list_options())
++    if "force_disable_caches" in options:
++        return {"force_disable_caches": True}
++    return {name: False for name in (
++        "fx_graph_cache", "fx_graph_remote_cache", "autotune_local_cache", "autotune_remote_cache"
++    ) if name in options}

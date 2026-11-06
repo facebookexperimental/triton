@@ -5,10 +5,8 @@ def pytest_addoption(parser):
     group = parser.getgroup("tlx-benchmark")
     # Not --device: python/test/conftest.py already takes it for the backend name.
     group.addoption("--gpu", default="auto", help="GPU index, or 'auto' (default) for the least-used one")
-    group.addoption(
-        "--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
-        help="autotune search space; the default is each op's own (mm: heuristic, hstu_cross_attn: "
-        "curated, everything else: full), and measuring anything else measures a path users do not take")
+    group.addoption("--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
+                    help="autotune space; migrated providers require heuristic, legacy providers use their op default")
     group.addoption("--head", type=int, default=None, metavar="N",
                     help="only the first N cases per direction, for a quick look")
     group.addoption("--synthetic", action="store_true",
@@ -20,30 +18,24 @@ def pytest_addoption(parser):
                     help="legacy timing selector; kernel-performance measurements always use verified GPU events")
     group.addoption(
         "--cold-compile", choices=("all", "first", "none"), default=None, dest="cold_compile",
-        help="how often to time a first call on a fresh cache; the default is each op's own "
-        "(mm: all, everything else: first, since their cold pass compiles a full autotune space)")
+        help="fresh-cache first-call frequency; migrated providers default to all, legacy providers use their op default"
+    )
     group.addoption("--json", default=None, help="machine-readable artifact (default: bench module's)")
+
+
+def pytest_sessionstart(session):
+    from _harness.denoise import ensure_denoised, select_device
+
+    ensure_denoised(select_device(session.config.getoption("--gpu")))
 
 
 @pytest.fixture(scope="session")
 def governor(pytestconfig):
-    """The GPU pick and governing `driver.main` does for one script, held for the session.
-
-    Has to run before the first CUDA call: the visibility variable is read once at
-    context creation, and the bench modules are imported only inside the tests.
-    """
     from _harness import driver
-    from _harness.denoise import Governor, select_device
+    from _harness.denoise import select_device
 
     device = select_device(pytestconfig.getoption("--gpu"))
     driver.select(device)
     if device is not None:
-        if not device.pin():
-            print(f"\ndevice: gpu{device.index} has no known UUID; not pinning it")
-        print(f"\ndevice: gpu{device.index} {device.name} ({device.memory_used_mib:.0f} MiB in use)")
-    with Governor(device) as gov:
-        for step in gov.applied:
-            print(f"  denoise: {step}")
-        for step in gov.skipped:
-            print(f"  denoise: SKIPPED {step}")
-        yield gov
+        device.pin()
+    return None

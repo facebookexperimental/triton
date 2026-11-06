@@ -3,6 +3,8 @@
 # There's a whole presentation about stable benchmarking here:
 # https://developer.download.nvidia.com/video/gputechconf/gtc/2019/presentation/s9956-best-practices-when-benchmarking-cuda-applications_V2.pdf
 
+export TLX_DENOISED=1
+
 # Detect GPU vendor
 if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
     GPU_VENDOR="nvidia"

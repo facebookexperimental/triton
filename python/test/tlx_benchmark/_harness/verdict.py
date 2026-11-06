@@ -32,15 +32,16 @@ def judge(
     correct: Optional[bool] = None,
     accuracy_note: str = "",
     floor_tflops: Optional[float] = None,
+    speedup: Optional[float] = None,
+    max_cv: float = MAX_CV,
 ) -> Result:
-    # Precedence is the README's order: error, pip, noisy, ok. pip ahead of noisy is
-    # deliberate -- a shape that is slow AND jittery is the one most worth seeing, and
-    # noisy does not fail the run. MI300X 512x4096x1024 was 0.512x at CV 4.7%.
     # Compile is checked before latency: it is a separate cold pass, so the window's
     # CV says nothing about it.
     result = Result(case=case, tlx=tlx, ref=ref, tlx_host_us=tlx_host_us, ref_host_us=None)
     # Throughput, so TLX is the numerator; >1 still means TLX is faster.
-    if ref is not None and ref.mean and tlx.mean:
+    if speedup is not None:
+        result.speedup = speedup
+    elif ref is not None and ref.mean and tlx.mean:
         result.speedup = tlx.mean / ref.mean
 
     if compile_stat is not None:
@@ -61,11 +62,14 @@ def judge(
                             (f" ({compile_stat.n_configs} configs benchmarked)" if compile_stat.n_configs else ""))
         return result
 
+    if max(tlx.cv, ref.cv if ref is not None else 0) > max_cv:
+        result.status = Status.NOISY
+        result.notes.append(f"provider CV over the {max_cv * 100:.0f}% limit; no perf verdict claimed")
+        return result
+
     if result.speedup is not None and result.speedup < MIN_SPEEDUP:
         result.status = Status.PIP
         result.notes.append(f"speedup {result.speedup:.3f}x is under the {MIN_SPEEDUP:g}x floor")
-        if tlx.cv > MAX_CV:  # still worth saying the number is soft
-            result.notes.append(f"CV {tlx.cv * 100:.1f}% is also over the {MAX_CV * 100:.0f}% limit")
         return result
 
     # The gate for an op with no runnable reference. Without it such an op can
@@ -75,14 +79,6 @@ def judge(
     if ref is None and floor_tflops and tlx.mean < floor_tflops:
         result.status = Status.PIP
         result.notes.append(f"{tlx.mean:.0f} TFLOP/s is under the {floor_tflops:.0f} TFLOP/s floor")
-        if tlx.cv > MAX_CV:
-            result.notes.append(f"CV {tlx.cv * 100:.1f}% is also over the {MAX_CV * 100:.0f}% limit")
-        return result
-
-    if tlx.cv > MAX_CV:
-        result.status = Status.NOISY
-        result.notes.append(f"CV {tlx.cv * 100:.1f}% over the {MAX_CV * 100:.0f}% limit "
-                            f"across {tlx.n_kept} samples; no perf verdict claimed")
         return result
 
     if result.speedup is not None:
