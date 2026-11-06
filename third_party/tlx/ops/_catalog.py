@@ -358,6 +358,7 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma"}),
         supports_backward=True,
+        default_space="full",
     ),
     OpSpec(
         op="flash_attn",
@@ -369,6 +370,7 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma", "tmem"}),
         supports_backward=True,
+        default_space="full",
     ),
     OpSpec(
         op="flash_attn",
@@ -380,6 +382,16 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset(),
         supports_backward=True,
+        default_space="full",
+    ),
+    OpSpec(
+        op="flash_attn",
+        arch="gfx1250",
+        variant="tdm_pipelined",
+        impl="triton.tlx.ops.kernels.flash_attn.gfx1250:flash_attn",
+        invariant_vocab=_ATTN_DIMS,
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
     ),
     OpSpec(
         op="prepare_flash_attn_varlen_backward",
@@ -609,12 +621,18 @@ def any_enforces_invariance(op: str) -> bool:
     return any(spec.op == op and spec.enforces_invariance for spec in CATALOG)
 
 
-@functools.lru_cache(maxsize=None)
-def _impl_for_arch(op: str, arch: str) -> tuple[Callable[..., Any], OpSpec]:
+def spec_for(op: str, arch: str) -> OpSpec:
+    """Read registered metadata without importing a kernel."""
     spec = _BY_KEY.get((op, arch))
     if spec is None:
         available = ", ".join(_arches_for(op)) or "(nothing yet)"
         raise UnsupportedOp(f"tlx.ops.{op} has no implementation for arch={arch!r}. Available on: {available}")
+    return spec
+
+
+@functools.lru_cache(maxsize=None)
+def _impl_for_arch(op: str, arch: str) -> tuple[Callable[..., Any], OpSpec]:
+    spec = spec_for(op, arch)
     return _load(spec.impl), spec
 
 

@@ -101,14 +101,14 @@ FOCUS_SUITES = (
 )
 
 DEFAULT_SUITES = {
+    "gfx1250": ("sm90_1", "gfx950_all"),
     "sm90": ("sm90_1", ),
     "sm100": ("sm100_1", ),
     "gfx950": ("gfx950_all", ),
 }
 FOCUS = FocusRegistry("flash_attn", FOCUS_SUITES, DEFAULT_SUITES)
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
-#: Inference captures: production never runs their backward, and no backend's
-#: backward accepts their sequence lengths, so the perf suite times the forward.
+#: Inference captures: production only runs their forward pass.
 FORWARD_ONLY = frozenset((*FOCUS.resolved_shapes("gfx950_2"), *FOCUS.resolved_shapes("gfx950_3")))
 
 
