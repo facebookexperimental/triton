@@ -470,7 +470,7 @@ LinearLayout invertAndComposeLocal(const LinearLayout &A, const LinearLayout &B,
 // Under TRITON_ALLOW_NPOT an NPOT extent is held by its pow2 alloc shape; the
 // coordinates past the extent are dead.
 static int64_t getPow2AllocSize(int64_t size) {
-  if (!mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+  if (!mlir::triton::tools::isNpotAllowed())
     return size;
   return llvm::PowerOf2Ceil(size);
 }
