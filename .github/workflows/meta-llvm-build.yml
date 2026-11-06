@@ -38,6 +38,9 @@ on:
         default: true
         type: boolean
 
+env:
+  LLVM_RELEASE_TAG: meta-llvm
+
 permissions:
   contents: read
 
@@ -58,6 +61,7 @@ jobs:
       repairs: ${{ steps.missing.outputs.repairs }}
       source_needed: ${{ steps.missing.outputs.source_needed }}
       source_json: ${{ steps.source.outputs.content }}
+      source_name: ${{ steps.revision.outputs.source_name }}
       llvm_build_info: ${{ steps.build_call.outputs.llvm_build_info }}
       matrix_exclude: ${{ steps.build_call.outputs.matrix_exclude }}
     steps:
@@ -90,6 +94,7 @@ jobs:
             echo "llvm_tree=$(jq -r '.tree.sha' <<< "$commit")"
             echo "short_sha=${llvm_sha:0:8}"
             echo "prefix=${prefix}"
+            echo "source_name=${prefix}-${llvm_sha:0:8}-${BUILD_NUMBER}.source.json"
           } >> "$GITHUB_OUTPUT"
 
       - name: Define LLVM source provenance
@@ -154,17 +159,20 @@ jobs:
           SHORT_SHA: ${{ steps.revision.outputs.short_sha }}
           BUILD_NUMBER: ${{ inputs.build_number }}
           SOURCE_DIGEST: ${{ steps.source.outputs.digest }}
+          SOURCE_NAME: ${{ steps.revision.outputs.source_name }}
           BUILD_CONFIGS: ${{ steps.recipe.outputs.configs }}
         shell: bash
         run: |
-          if ! assets="$(gh api "repos/${GH_REPO}/releases/tags/${PREFIX}-${SHORT_SHA}-${BUILD_NUMBER}" --jq '.assets' 2>/dev/null)"; then
+          if release_id="$(gh api "repos/${GH_REPO}/releases/tags/${LLVM_RELEASE_TAG}" --jq '.id' 2>/dev/null)"; then
+            assets="$(gh api "repos/${GH_REPO}/releases/${release_id}/assets?per_page=100" --paginate --slurp | jq -c 'add')"
+          else
             assets='[]'
           fi
           jq -e 'all(.[]; .digest != null)' <<< "$assets" >/dev/null || {
             echo 'Published assets are missing GitHub digests' >&2
             exit 1
           }
-          existing_source="$(jq -r '.[] | select(.name == "llvm-source.json") | .digest' <<< "$assets")"
+          existing_source="$(jq -r --arg name "$SOURCE_NAME" '.[] | select(.name == $name) | .digest' <<< "$assets")"
           if [[ -n "$existing_source" ]]; then
             [[ "$existing_source" == "$SOURCE_DIGEST" ]] || {
               echo 'Existing LLVM source provenance differs' >&2
@@ -317,6 +325,7 @@ jobs:
           REPAIRS: ${{ needs.prepare.outputs.repairs }}
           PLATFORMS: ${{ needs.prepare.outputs.platforms }}
           SOURCE_JSON: ${{ needs.prepare.outputs.source_json }}
+          SOURCE_NAME: ${{ needs.prepare.outputs.source_name }}
           TRITON_SHA: ${{ github.sha }}
         shell: bash
         run: |
@@ -327,13 +336,14 @@ jobs:
           shopt -s nullglob
           sidecars=(dist/*.tar.gz.sha256)
           ((${#sidecars[@]} > 0)) || [[ "$PLATFORMS" == '[]' ]]
-          printf '%s\n' "$SOURCE_JSON" > dist/llvm-source.json
-          tag="${PREFIX}-${SHORT_SHA}-${BUILD_NUMBER}"
+          printf '%s\n' "$SOURCE_JSON" > "dist/$SOURCE_NAME"
+          tag="$LLVM_RELEASE_TAG"
           exists=false
           existing_assets='[]'
           if gh release view "$tag" >/dev/null 2>&1; then
             exists=true
-            existing_assets="$(gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq '.assets')"
+            release_id="$(gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq '.id')"
+            existing_assets="$(gh api "repos/${GH_REPO}/releases/${release_id}/assets?per_page=100" --paginate --slurp | jq -c 'add')"
           fi
           for sidecar in "${sidecars[@]}"; do
             archive="${sidecar%.sha256}"
@@ -360,20 +370,21 @@ jobs:
               exit 1
             fi
           done
-          existing_source="$(jq -r '.[] | select(.name == "llvm-source.json") | .digest // empty' <<< "$existing_assets")"
-          if jq -e 'any(.[]; .name == "llvm-source.json")' <<< "$existing_assets" >/dev/null; then
-            [[ "$existing_source" == "sha256:$(sha256sum dist/llvm-source.json | cut -d ' ' -f 1)" ]] || {
+          existing_source="$(jq -r --arg name "$SOURCE_NAME" '.[] | select(.name == $name) | .digest // empty' <<< "$existing_assets")"
+          if jq -e --arg name "$SOURCE_NAME" 'any(.[]; .name == $name)' <<< "$existing_assets" >/dev/null; then
+            [[ "$existing_source" == "sha256:$(sha256sum "dist/$SOURCE_NAME" | cut -d ' ' -f 1)" ]] || {
               echo 'Existing immutable LLVM provenance differs' >&2
               exit 1
             }
           fi
           if [[ "$exists" == false ]]; then
             gh release create "$tag" --target "$TRITON_SHA" --latest=false \
-              --title "${PREFIX} for Triton (${SHORT_SHA}, build ${BUILD_NUMBER})" \
-              --notes "Prebuilt LLVM SDKs for Triton from ${LLVM_SHA}."
+              --title "fbtriton LLVM SDKs" \
+              --notes "Immutable core and AMD LLVM SDK bundles for fbtriton." \
+              || gh release view "$tag" >/dev/null
           fi
           if [[ -z "$existing_source" ]]; then
-            gh release upload "$tag" dist/llvm-source.json
+            gh release upload "$tag" "dist/$SOURCE_NAME"
           fi
           for sidecar in "${sidecars[@]}"; do
             for file in "${sidecar%.sha256}" "$sidecar"; do
