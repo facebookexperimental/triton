@@ -1060,8 +1060,6 @@ void scheduleLoops(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
   if (loops.empty())
     return;
   for (auto forOp : loops) {
-    // FB Change: as in assignLatencies, only warp-specialized loops get the
-    // Meta-WS schedule; other loops are software-pipelined as without the knob.
     scheduleLoop(forOp, opLatency, defaultNumStages,
                  useMetaWS && isMetaWarpSpecializedLoop(forOp));
   }
