@@ -85,7 +85,7 @@ public:
     auto kReg = StringAttr::get(ctx, "register");
     auto ll = toLinearLayout(rtType);
     // pseudoinvert needs radix-2 inputs and power-of-two outputs.
-    if (ll.hasNonBinaryCarrier())
+    if (ll.hasNonPow2OutDim())
       return resultVals;
     ll = ll.removeZeroBasesAlongDim(kReg);
     auto dims = to_vector(ll.getOutDimNames());

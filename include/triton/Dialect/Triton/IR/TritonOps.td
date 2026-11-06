@@ -204,7 +204,7 @@ def TT_LoadOp
     : TT_Op<"load",
             [SameLoadStoreOperandsAndResultShape,
              SameLoadStoreOperandsAndResultEncoding, AttrSizedOperandSegments,
-             ProductLayoutOpInterface,
+             MixedRadixLayoutTrait,
              DeclareOpInterfaceMethods<PredicatedOpInterface>,
              DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
              DeclareOpInterfaceMethods<InferTypeOpInterface>,
@@ -252,7 +252,7 @@ def TT_LoadOp
 def TT_StoreOp
     : TT_Op<
           "store", [SameLoadStoreOperandsShape, SameLoadStoreOperandsEncoding,
-                    ProductLayoutOpInterface,
+                    MixedRadixLayoutTrait,
                     DeclareOpInterfaceMethods<PredicatedOpInterface>,
                     TypesMatchWith<"value type matches ptr type", "ptr",
                                    "value", "getPointeeType($_self)">,
@@ -409,6 +409,8 @@ def TT_AtomicRMWOp
             [AtomicOpInterface, SameOperandsAndResultShape,
              SameOperandsAndResultEncoding,
              DeclareOpInterfaceMethods<PredicatedOpInterface>,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<
@@ -442,6 +444,8 @@ def TT_AtomicCASOp
     : TT_Op<"atomic_cas",
             [AtomicOpInterface, SameOperandsAndResultShape,
              SameOperandsAndResultEncoding,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>,
              TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
@@ -479,7 +483,7 @@ def TT_AtomicCASOp
 //
 def TT_SplatOp : TT_Op<"splat", [Pure, SameOperandsAndResultElementType,
                                  SameOperandsAndResultEncoding,
-                                 ProductLayoutOpInterface]> {
+                                 MixedRadixLayoutTrait]> {
   let summary = "splat";
 
   let arguments = (ins TT_Type:$src);
@@ -506,7 +510,7 @@ def TT_ExpandDimsOp
     : TT_Op<"expand_dims", [Pure,
                             DeclareOpInterfaceMethods<InferTypeOpInterface>,
                             SameOperandsAndResultElementType,
-                            ProductLayoutOpInterface]> {
+                            MixedRadixLayoutTrait]> {
   let summary = "expand_dims";
 
   let arguments = (ins TT_Tensor:$src, I32Attr:$axis);
@@ -520,7 +524,7 @@ def TT_ExpandDimsOp
 }
 
 def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType,
-                                     ProductLayoutOpInterface]> {
+                                     MixedRadixLayoutTrait]> {
   let summary = "reinterpret a tensor to a different shape. It may change "
                 "elements order if the attribute is set.";
   let description = [{
@@ -551,7 +555,7 @@ def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType,
 
 def TT_BroadcastOp : TT_Op<"broadcast", [Pure, SameOperandsAndResultElementType,
                                          SameOperandsAndResultEncoding,
-                                         ProductLayoutOpInterface]> {
+                                         MixedRadixLayoutTrait]> {
   let summary = "broadcast a tensor";
 
   let description = [{
@@ -615,7 +619,7 @@ def TT_SplitOp : TT_Op<"split", [
 def TT_TransOp : TT_Op<"trans", [Pure, TransposeOpInterface,
                                  InferTensorTypeOpWithLayoutEquivalence,
                                  SameOperandsAndResultElementType,
-                                 ProductLayoutOpInterface]> {
+                                 MixedRadixLayoutTrait]> {
 
   let summary = "rearrange the dimensions of a tensor";
   let description = [{
@@ -700,6 +704,7 @@ def TT_GetNumProgramsOp : TT_Op<"get_num_programs", [Pure]> {
 def TT_DotOp
     : TT_Op<"dot", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,
                     DeclareOpInterfaceMethods<DotOpInterface>,
+                    MixedRadixLayoutTrait,
                     TypesMatchWith<"result's type matches accumulator's type",
                                    "d", "c", "$_self">]> {
   let summary = "dot";
@@ -739,6 +744,7 @@ def TT_DotScaledOp
             [Pure, AttrSizedOperandSegments,
              DeclareOpInterfaceMethods<DotOpInterface, ["verifyDims",
                                                         "verifyOutputDims"]>,
+             MixedRadixLayoutTrait,
              TypesMatchWith<"result's type matches accumulator's type", "d",
                             "c", "$_self">]> {
   let summary = "dot_scaled";
@@ -792,7 +798,9 @@ def TT_DotScaledOp
 def TT_ReduceOp
     : TT_Op<"reduce", [Pure, SameOperandsShape, SameOperandsEncoding,
                        SingleBlock,
-                       DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+                       DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                       DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                           ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "Reduction using generic combination algorithm";
   let arguments = (ins Variadic<TT_Tensor>:$srcs, I32Attr:$axis,
       OptionalAttr<StrAttr>:$reduction_ordering);
@@ -828,7 +836,9 @@ def TT_ReduceReturnOp : TT_Op<"reduce.return", [HasParent<"ReduceOp">, Pure,
 def TT_ScanOp
     : TT_Op<"scan", [Pure, SameOperandsAndResultEncoding,
                      SameOperandsAndResultShape, SingleBlock,
-                     DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+                     DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                     DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                         ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "Associative scan using generic combination algorithm";
   let arguments = (ins Variadic<TT_Tensor>:$srcs, I32Attr:$axis,
       BoolAttr:$reverse, OptionalAttr<StrAttr>:$reduction_ordering);
@@ -843,6 +853,11 @@ def TT_ScanOp
   let extraClassDeclaration = [{
       llvm::SmallVector<RankedTensorType> getInputTypes();
       llvm::SmallVector<Type> getElementTypes();
+      // Per dim, the extent a thread's contiguous registers, then its lanes and
+      // warps cover when they step through it as a blocked layout's do, else
+      // std::nullopt.
+      static std::optional<llvm::SmallVector<unsigned>>
+      getBlockedTile(const ::mlir::triton::LinearLayout &layout);
     }];
 }
 
@@ -908,7 +923,7 @@ def TT_ExternElementwiseOp
 //
 // Make Range Op
 //
-def TT_MakeRangeOp : TT_Op<"make_range", [Pure, ProductLayoutOpInterface]> {
+def TT_MakeRangeOp : TT_Op<"make_range", [Pure, MixedRadixLayoutTrait]> {
   let summary = "make range";
 
   let description = [{
@@ -968,7 +983,8 @@ def TT_HistogramOp
                           TypesMatchWith<"mask type matches src type", "src",
                                          "mask", "getI1SameShape($_self)",
                                          "($_op.getOperands().size() <= 1) || "
-                                         "std::equal_to<>()">]> {
+                                         "std::equal_to<>()">,
+                          MixedRadixLayoutTrait]> {
   let summary = "return a histogram of the inputs.";
   let description = [{
     Return the histogram of the input tensor. The number of bins is equal to
@@ -990,7 +1006,7 @@ def TT_HistogramOp
 //
 def TT_GatherOp
     : TT_Op<"gather", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,
-                       ProductLayoutOpInterface]> {
+                       MixedRadixLayoutTrait]> {
   let summary = "local gather operation";
   let description = [{
     Gather elements from the input tensor using the indices tensor along a
@@ -1022,7 +1038,7 @@ def TT_GatherOp
 //
 def TT_PrintOp : TT_Op<"print", [SameVariadicOperandSize,
                                  MemoryEffects<[MemWrite<GlobalMemory>]>,
-                                 ProductLayoutOpInterface]> {
+                                 MixedRadixLayoutTrait]> {
   let arguments = (ins StrAttr:$prefix, BoolAttr:$hex,
       Variadic<AnyTypeOf<[TT_Type]>>:$args, DenseI32ArrayAttr:$isSigned);
   let summary = "Device-side print, as in CUDA for debugging";
@@ -1039,7 +1055,7 @@ def TT_PrintOp : TT_Op<"print", [SameVariadicOperandSize,
 // Assert Op
 //
 def TT_AssertOp : TT_Op<"assert", [MemoryEffects<[MemWrite<GlobalMemory>]>,
-                                   ProductLayoutOpInterface]> {
+                                   MixedRadixLayoutTrait]> {
   let summary = "Device-side assert, as in CUDA for correctness checking";
   let description = [{
     `tt.assert` takes a condition tensor and a message string.

@@ -73,7 +73,7 @@ uint64_t getAllocationOffset(ttng::TMEMAllocOp op) {
 // An NPOT view is the leading box of its power-of-two cover: each NPOT extent
 // takes ceil(log2) bits of the inverse. Flag off, the cover is the shape.
 bool hasNpotLayoutExtent(ArrayRef<int64_t> layoutShape) {
-  return !llvm::equal(ttg::getNpotCoverShape(layoutShape), layoutShape);
+  return !llvm::equal(ttg::getNpotPow2AllocShape(layoutShape), layoutShape);
 }
 
 uint32_t applySharedPadding(uint32_t byteOffset, ttg::MemDescType ty) {

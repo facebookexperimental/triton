@@ -324,23 +324,47 @@ Value emitCanonicalLayoutOwnerPredicate(
   return canonical;
 }
 
-// Elements per shared access on `dim`: the leading radix-2 register digits
-// stepping `dim` by 1, 2, 4, ..., cut to 16 bytes. Permutation layouts need no
-// other cut.
-static int32_t getSharedRunLength(const LinearLayout &layout, int32_t dim,
-                                  unsigned bitwidth) {
-  auto kReg =
-      StringAttr::get(layout.getInDimNames().begin()->getContext(), "register");
-  int32_t numDigits = layout.getNumLeadingRadix2Digits(kReg);
-  int32_t steps = 0;
-  while (steps < numDigits && (1 << steps) < 128 / int32_t(bitwidth) &&
-         layout.getBasis(kReg, steps)[dim] == 1 << steps)
-    ++steps;
-  return 1 << steps;
+void forEachMixedRadixSharedRun(
+    Location loc, RewriterBase &rewriter, const LinearLayout &regLayout,
+    const LinearLayout &toOffset, int32_t run,
+    function_ref<void(int32_t, Value, ArrayRef<std::pair<StringAttr, Value>>)>
+        access) {
+  MLIRContext *ctx = rewriter.getContext();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto kReg = str_attr("register");
+  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+  for (int32_t reg = 0; reg < regLayout.getInDimSize(kReg); reg += run) {
+    SmallVector<std::pair<StringAttr, Value>> indices;
+    for (StringAttr dim : regLayout.getInDimNames())
+      indices.push_back({dim, dim == kReg               ? b.i32_val(reg)
+                              : dim == str_attr("lane") ? laneId
+                              : dim == str_attr("warp") ? warpId
+                                                        : b.i32_val(0)});
+    Value offset = applyLinearLayout(
+                       loc, rewriter, toOffset,
+                       applyLinearLayout(loc, rewriter, regLayout, indices))[0]
+                       .second;
+    access(reg, offset, indices);
+  }
 }
 
-// One store, sync, load round of transferProductThroughSharedMemory.
-static SmallVector<Value> transferProductTile(
+// Elements per shared access on `dim` when it is a tile's fastest dim.
+static int32_t getSharedRunLength(const LinearLayout &layout, int32_t dim,
+                                  unsigned bitwidth) {
+  auto kOffset =
+      StringAttr::get(layout.getInDimNames().begin()->getContext(), "offset");
+  auto toOffset = LinearLayout::empty();
+  for (auto [i, outDim] : llvm::enumerate(layout.getOutDimNames())) {
+    int32_t size = llvm::PowerOf2Ceil(layout.getOutDimSize(outDim));
+    toOffset *= static_cast<int32_t>(i) == dim
+                    ? LinearLayout::identity1D(size, outDim, kOffset)
+                    : LinearLayout::zeros1D(size, outDim, kOffset);
+  }
+  return getMixedRadixSharedRun(layout, toOffset, bitwidth);
+}
+
+// One store, sync, load round of transferMixedRadixThroughSharedMemory.
+static SmallVector<Value> transferMixedRadixTile(
     Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     const LinearLayout &srcLayout, const LinearLayout &dstLayout,
     ArrayRef<Value> inVals, Type elemTy, Value smemBase,
@@ -434,22 +458,23 @@ static SmallVector<Value> transferProductTile(
   return outVals;
 }
 
-SmallVector<Value> transferProductThroughSharedMemory(
+// Mixed-radix offsets aren't XOR-linear, so lowerLdStShared can't take them.
+SmallVector<Value> transferMixedRadixThroughSharedMemory(
     Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     const LinearLayout &srcLayout, const LinearLayout &dstLayout,
     ArrayRef<Value> inVals, Type elemTy, Value smemBase,
     const llvm::MapVector<StringAttr, int32_t> &srcFreeVariableMasks,
     bool blockScope,
     std::optional<std::pair<Value, Value>> distributedCoordinates,
-    const ProductSharedTiling *tiling) {
+    const MixedRadixSharedTiling *tiling) {
   Value laneId, warpId;
   std::tie(laneId, warpId) = distributedCoordinates
                                  ? *distributedCoordinates
                                  : getLaneAndWarpId(rewriter, loc);
   if (!tiling)
-    return transferProductTile(loc, rewriter, targetInfo, srcLayout, dstLayout,
-                               inVals, elemTy, smemBase, srcFreeVariableMasks,
-                               blockScope, laneId, warpId);
+    return transferMixedRadixTile(
+        loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, elemTy,
+        smemBase, srcFreeVariableMasks, blockScope, laneId, warpId);
   auto kReg = StringAttr::get(rewriter.getContext(), "register");
   // Digit weights, and each tile register's register with the tiled digits 0.
   auto tileRegisters = [&](const LinearLayout &layout, ArrayRef<int32_t> tiled,
@@ -493,7 +518,7 @@ SmallVector<Value> transferProductThroughSharedMemory(
     SmallVector<Value> tileVals;
     for (int32_t reg : srcRegisters)
       tileVals.push_back(inVals[srcBase + reg]);
-    tileVals = transferProductTile(
+    tileVals = transferMixedRadixTile(
         loc, rewriter, targetInfo, tiling->sourceTile, tiling->destinationTile,
         tileVals, elemTy, smemBase, tileMasks, blockScope, laneId, warpId);
     for (auto [reg, value] : llvm::zip_equal(dstRegisters, tileVals))
@@ -532,7 +557,8 @@ applyMixedRadixLayout(TritonLLVMOpBuilder &b, const LinearLayout &layout,
           quotient = b.lshr(idx, b.i32_val(llvm::Log2_32(weight)));
         else if (weight > 1)
           quotient = b.udiv(idx, b.i32_val(weight));
-        // XOR is exact: checkProductCarriers rejects odd radix-2 contributions.
+        // XOR is exact: checkMixedRadixOutDims rejects odd radix-2
+        // contributions.
         if (radix == 2) {
           Value isZero = b.icmp_eq(b.and_(quotient, b.i32_val(1)), zero);
           for (auto [binary, value] : llvm::zip(binaries, basis)) {
@@ -824,8 +850,8 @@ applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
     SmallVector<std::pair<StringAttr, Value>> combinedIndices;
     for (auto [base, regIdx] : llvm::zip(baseIndices, regIndices)) {
       assert(base.first == regIdx.first);
-      // A Product index is binary + twoPart * odd: XOR the binary part, then
-      // add the odd part modulo the size.
+      // A mixed-radix index is binary + twoPart * odd: XOR the binary part,
+      // then add the odd part modulo the size.
       int32_t size = layout.getOutDimSize(base.first);
       int32_t twoPart = LinearLayout::twoPartOf(size);
       Value combined = b.xor_(base.second, b.i32_val(regIdx.second % twoPart));
