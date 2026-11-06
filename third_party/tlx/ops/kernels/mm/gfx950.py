@@ -17742,6 +17742,140 @@ def _load_paired_strided_b(b_ptr, rows, cols, k: tl.constexpr, n: tl.constexpr, 
 
 
 @triton.jit
+def _register_matmul_core(
+    a_ptr,
+    b_ptr,
+    b2_ptr,
+    rows,
+    cols,
+    row_mask,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    k_start,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    MASK_ROWS: tl.constexpr = False,
+    DUAL_B: tl.constexpr = False,
+    CACHE_A_CG: tl.constexpr = False,
+    CACHE_B_CG: tl.constexpr = False,
+    CACHE_B_TAIL_CG: tl.constexpr = False,
+    PACK_B_PAIRS: tl.constexpr = False,
+    B_PAIRS_PADDED: tl.constexpr = False,
+    USE_I64_A_OFFSETS: tl.constexpr = False,
+    USE_I64_B_OFFSETS: tl.constexpr = False,
+):
+    """Shared FP32 register core for dense MM and routed expert projections.
+
+    Callers supply valid coordinates and any dense-only alignment hints. K is
+    the reduction length starting at k_start; masked rows are zero-filled.
+    DUAL_B shares A loads for gate/up and returns separate FP32 accumulators.
+    """
+    tl.static_assert(not DUAL_B or not PACK_B_PAIRS)
+    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
+    a_rows = rows.to(tl.int64) if USE_I64_A_OFFSETS else rows
+    a_cols = offs_k.to(tl.int64) if USE_I64_A_OFFSETS else offs_k
+    b_rows = offs_k.to(tl.int64) if USE_I64_B_OFFSETS else offs_k
+    b_cols = cols.to(tl.int64) if USE_I64_B_OFFSETS else cols
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if DUAL_B:
+        acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    full_k_tiles: tl.constexpr = K // BLOCK_K
+    for k_idx in range(0, full_k_tiles):
+        k = k_start + k_idx * BLOCK_K
+        a_ptrs = a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
+        b_ptrs = b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
+        if MASK_ROWS:
+            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0,
+                        cache_modifier=".cg" if CACHE_A_CG else "")
+        elif CACHE_A_CG:
+            a = tl.load(a_ptrs, cache_modifier=".cg")
+        else:
+            a = tl.load(a_ptrs)
+        if PACK_B_PAIRS:
+            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
+        elif CACHE_B_CG:
+            b = tl.load(b_ptrs, cache_modifier=".cg")
+        else:
+            b = tl.load(b_ptrs)
+        acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+        if DUAL_B:
+            b2_ptrs = b2_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
+            b2 = tl.load(b2_ptrs, cache_modifier=".cg" if CACHE_B_CG else "")
+            acc2 += tl.dot(a, b2, allow_tf32=False, out_dtype=tl.float32)
+    if K % BLOCK_K != 0:
+        k = k_start + full_k_tiles * BLOCK_K
+        k_mask = offs_k < K - full_k_tiles * BLOCK_K
+        a_ptrs = a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
+        b_ptrs = b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
+        if MASK_ROWS:
+            a = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+        else:
+            a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+        if PACK_B_PAIRS:
+            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_TAIL_CG, B_PAIRS_PADDED)
+        elif CACHE_B_TAIL_CG:
+            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0, cache_modifier=".cg")
+        else:
+            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+        acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+        if DUAL_B:
+            b2_ptrs = b2_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
+            b2 = tl.load(b2_ptrs, mask=k_mask[:, None], other=0.0,
+                         cache_modifier=".cg" if CACHE_B_TAIL_CG else "")
+            acc2 += tl.dot(a, b2, allow_tf32=False, out_dtype=tl.float32)
+    if DUAL_B:
+        return acc, acc2
+    return acc, acc
+
+
+@triton.jit
+# Triton TR001: the full-space launcher measures explicit split-register plans.
+def _split_register_kernel(  # noqa: TR001
+    a_ptr, b_ptr, workspace_ptr,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, stride_bn: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr, NUM_XCDS: tl.constexpr, SPLIT_K: tl.constexpr,
+    USE_I64_A_OFFSETS: tl.constexpr = False, USE_I64_B_OFFSETS: tl.constexpr = False,
+):
+    tl.static_assert(workspace_ptr.dtype.element_ty == tl.float32)
+    tl.static_assert(SPLIT_K > 1 and K % SPLIT_K == 0)
+    pid = tl.program_id(0).to(tl.int32)
+    split_id = tl.program_id(1).to(tl.int32)
+    grid_m: tl.constexpr = tl.cdiv(M, BLOCK_M)
+    grid_n: tl.constexpr = tl.cdiv(N, BLOCK_N)
+    if NUM_XCDS != 1:
+        aligned: tl.constexpr = grid_m * grid_n // (NUM_XCDS * 4) * (NUM_XCDS * 4)
+        if pid < aligned:
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            pid = local_pid // 4 * NUM_XCDS * 4 + xcd * 4 + local_pid % 4
+    width: tl.constexpr = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + pid % group_size
+    pid_n = pid % width // group_size
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
+    valid_rows = tl.where(rows < M, rows, 0)
+    valid_cols = tl.where(cols < N, cols, 0)
+    ks: tl.constexpr = K // SPLIT_K
+    acc, _ = _register_matmul_core(
+        a_ptr, b_ptr, b_ptr, valid_rows, valid_cols, rows < M, N, ks, split_id * ks,
+        stride_am, stride_ak, stride_bk, stride_bn, BLOCK_M, BLOCK_N, BLOCK_K,
+        MASK_ROWS=True, USE_I64_A_OFFSETS=USE_I64_A_OFFSETS, USE_I64_B_OFFSETS=USE_I64_B_OFFSETS,
+    )
+    offsets = split_id * M * N + rows[:, None] * N + cols[None, :]
+    tl.store(workspace_ptr + offsets, acc, mask=(rows[:, None] < M) & (cols[None, :] < N))
+
+
+@triton.jit
 # Triton TR001: callers select either a measured fixed plan or an autotuned one.
 def _register_kernel_impl(  # noqa: TR001
     a_ptr,
@@ -17803,56 +17937,25 @@ def _register_kernel_impl(  # noqa: TR001
     input_cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
     offs_m = (input_rows if M % BLOCK_M == 0 else tl.where(input_rows < M, input_rows, 0))
     offs_n = (input_cols if N % BLOCK_N == 0 else tl.where(input_cols < N, input_cols, 0))
-    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_bk > 0)
     tl.assume(stride_bn > 0)
     reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
     reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
-    if USE_I64_A_OFFSETS:
-        a_rows = reg_m.to(tl.int64)
-        a_cols = offs_k.to(tl.int64)
-    else:
-        a_rows = reg_m
-        a_cols = offs_k
-    if USE_I64_B_OFFSETS:
-        b_rows = offs_k.to(tl.int64)
-        b_cols = reg_n.to(tl.int64)
-    else:
-        b_rows = offs_k
-        b_cols = reg_n
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    full_k_tiles: tl.constexpr = K // BLOCK_K
-    for k_idx in range(0, full_k_tiles):
-        k = k_idx * BLOCK_K
-        a_ptrs = (a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak)
-        b_ptrs = (b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn)
-        if (CACHE_A_CG or (M == 25600 and N == 256 and K == 256) or (M == 56768 and N == 128 and K == 64)
-                or (M == 65462 and N == 128 and K == 96)):
-            a = tl.load(a_ptrs, cache_modifier=".cg")
-        else:
-            a = tl.load(a_ptrs)
-        if PACK_B_PAIRS:
-            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
-        elif (CACHE_B_CG or (M == 128 and N == 2688 and K == 4416) or (M == 128 and N == 3456 and K == 2560)):
-            b = tl.load(b_ptrs, cache_modifier=".cg")
-        else:
-            b = tl.load(b_ptrs)
-        acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
-    if K % BLOCK_K != 0:
-        k = full_k_tiles * BLOCK_K
-        k_mask = offs_k < K - k
-        a_ptrs = (a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak)
-        b_ptrs = (b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn)
-        a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
-        if PACK_B_PAIRS:
-            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
-        elif CACHE_B_CG or (M == 128 and N == 2688 and K == 4416):
-            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0, cache_modifier=".cg")
-        else:
-            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
-        acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+    full_a_cg: tl.constexpr = (CACHE_A_CG or (M == 25600 and N == 256 and K == 256)
+                              or (M == 56768 and N == 128 and K == 64)
+                              or (M == 65462 and N == 128 and K == 96))
+    full_b_cg: tl.constexpr = CACHE_B_CG or (not PACK_B_PAIRS and (
+        (M == 128 and N == 2688 and K == 4416) or (M == 128 and N == 3456 and K == 2560)))
+    tail_b_cg: tl.constexpr = CACHE_B_CG or (not PACK_B_PAIRS and (M == 128 and N == 2688 and K == 4416))
+    acc, _ = _register_matmul_core(
+        a_ptr, b_ptr, b_ptr, reg_m, reg_n, True, N, K, 0,
+        stride_am, stride_ak, stride_bk, stride_bn, BLOCK_M, BLOCK_N, BLOCK_K,
+        CACHE_A_CG=full_a_cg, CACHE_B_CG=full_b_cg, CACHE_B_TAIL_CG=tail_b_cg,
+        PACK_B_PAIRS=PACK_B_PAIRS, B_PAIRS_PADDED=B_PAIRS_PADDED,
+        USE_I64_A_OFFSETS=USE_I64_A_OFFSETS, USE_I64_B_OFFSETS=USE_I64_B_OFFSETS,
+    )
 
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
     cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
@@ -18678,6 +18781,9 @@ def _launch_range_autotuned(a, b, out, candidates):
     if selected is None:
         executable = []
         for dispatch in candidates:
+            if (dispatch[0] == "split_register" or dispatch[0] == "lds" and dispatch[1][2] > 1) and _needs_i64_offsets(out):
+                # The shared FP32 finalizer forms signed-i32 output offsets.
+                continue
             if dispatch[0] == "range_register" and dispatch[1].get("PACK_B_PAIRS", False) and b.data_ptr() % 4:
                 continue
             if dispatch[0] == "range_register" and dispatch[1].get("B_PAIRS_PADDED",
@@ -20381,6 +20487,46 @@ def _reduce_k_kernel(workspace_ptr, bias_ptr, c_ptr, M, N, stride_bias_m, stride
         acc += bias.to(tl.float32)
     output_offsets = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(c_ptr + output_offsets, acc.to(OUTPUT_DTYPE), mask=mask)
+
+
+def _launch_split_register_plan(a, b, *, config, out=None, workspace=None):
+    """Compute plain low-M TN GEMM with FP32 partials and one final conversion."""
+    problem = _problem_for(a, b)
+    if (problem is None or a.dtype != torch.bfloat16 or not a.is_contiguous() or not b.T.is_contiguous()
+            or not 0 < problem[0] <= 32 or min(*a.stride(), *b.stride()) <= 0):
+        raise InvalidInput("split-register requires positive-stride, contiguous BF16 TN with 1 <= M <= 32")
+    m, n, k = problem
+    split_k = config["SPLIT_K"]
+    if split_k <= 1 or k % split_k or k // split_k < 32 or n <= 0:
+        raise InvalidInput("split-register requires positive N and equal K slices of at least 32 elements")
+    if out is None:
+        out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    if (not isinstance(out, torch.Tensor) or out.shape != (m, n) or out.dtype != a.dtype
+            or out.device != a.device or min(out.stride()) <= 0 or _needs_i64_offsets(out)):
+        raise InvalidInput("split-register output must match inputs and fit the FP32 reducer's signed-i32 offsets")
+    shape = (split_k * m, n)
+    if _needs_i64_offsets(torch.empty(shape, device="meta", dtype=torch.float32)):
+        raise InvalidInput("split-register FP32 workspace exceeds signed-i32 offsets")
+    if workspace is None:
+        workspace = torch.empty(shape, device=a.device, dtype=torch.float32)
+    elif (not isinstance(workspace, torch.Tensor) or workspace.shape != shape or workspace.dtype != torch.float32
+          or workspace.device != a.device or not workspace.is_contiguous()):
+        raise InvalidInput("split-register workspace must be contiguous device FP32 with shape (SPLIT_K * M, N)")
+    ks = k // split_k
+    k_extent = (split_k - 1) * ks + triton.cdiv(ks, config["BLOCK_K"]) * config["BLOCK_K"]
+    grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), split_k)
+    _split_register_kernel[grid](
+        a, b, workspace, m, n, k, *a.stride(), *b.stride(),
+        USE_I64_A_OFFSETS=(m - 1) * a.stride(0) + (k_extent - 1) * a.stride(1) >= 1 << 31,
+        USE_I64_B_OFFSETS=(k_extent - 1) * b.stride(0) + (n - 1) * b.stride(1) >= 1 << 31,
+        **dict(config), **_register_launch_options(m, n, k, config),
+    )
+    _reduce_k_kernel[(triton.cdiv(m, 32), triton.cdiv(n, 32))](
+        workspace, out, out, m, n, 0, 0, *out.stride(),
+        SPLIT_K=split_k, BLOCK_SIZE_M=32, BLOCK_SIZE_N=32,
+        OUTPUT_DTYPE=tl.bfloat16, ADD_BIAS=False, num_warps=4,
+    )
+    return out
 
 
 _PRODUCTION_COMPILED_WAVE_GRID_SHAPES = frozenset({
@@ -25397,6 +25543,8 @@ def _range_candidate_is_sequential(path, plan, fixed):
     """Return whether a range-family candidate uses the fixed K schedule."""
     if path in ("short_k_register", "register", "range_register"):
         return True
+    if path == "split_register":
+        return plan["SPLIT_K"] == fixed
     if path == "lds":
         return plan[2] == fixed
     if path in ("wave_grid", "transposed_wave_grid"):
@@ -26541,6 +26689,51 @@ def _launch_production_wave_grid(a, b, out, plan, bias=None):
     )(a, b, out)
 
 
+@lru_cache(maxsize=64)
+def _full_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides):
+    """Include dense TN tiling and K-splitting plans only in measured full search."""
+    candidates = list(_range_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides))
+    if (dtype != torch.bfloat16 or not 0 < m <= 4096 or not 128 <= k <= 8192
+            or n < 128 or n % 128 or k % 128 or a_strides != (k, 1) or b_strides != (1, k)
+            or not _offsets_fit_signed_i32(m, n, k, element_size, a_strides, b_strides)):
+        return tuple(candidates)
+
+    # Reuse the register oracle; the range selector alone excludes long-K TN.
+    for config in _REGISTER_CONFIGS:
+        bm, bk = config.kwargs["BLOCK_M"], config.kwargs["BLOCK_K"]
+        if bk < 32 or (m <= 32 and bm > 64) or (m > 128 and bm < 128):
+            continue
+        plan = MappingProxyType(dict(config.kwargs, num_warps=config.num_warps, num_stages=config.num_stages))
+        dispatch = ("range_register", plan)
+        if dispatch not in candidates:
+            candidates.append(dispatch)
+    for bm, bn in TILE_CANDIDATES:
+        grid_mn = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+        for split_k in (1, 2, 4, 8):
+            if (not _valid_lds_split(k, split_k, element_size)
+                    or split_k > 1 and (grid_mn >= _NUM_CU or split_k * m * n * 4 >= 1 << 31)):
+                continue
+            dispatch = ("lds", (bm, bn, split_k))
+            if dispatch not in candidates:
+                candidates.append(dispatch)
+    if m <= 32:
+        for bm in (16, 32):
+            for bn in (32, 64, 128):
+                grid_mn = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+                for bk in (128, 256):
+                    for split_k in (2, 4, 8):
+                        if (k % split_k or k // split_k < 4 * bk
+                                or not _NUM_CU // 2 <= grid_mn * split_k <= 2 * _NUM_CU):
+                            continue
+                        for stages in (2, 3):
+                            if (bm + bn) * bk * element_size * (stages - 1) > 64 * 1024:
+                                continue
+                            warps = 2 if bm == 16 and bn <= 64 else 4
+                            plan = _fixed_register_plan(bm, bn, bk, 4, 1, warps, stages)
+                            candidates.append(("split_register", MappingProxyType(dict(plan, SPLIT_K=split_k))))
+    return tuple(candidates)
+
+
 def _launch_dispatch(a, b, out, dispatch, bias=None):
     path, plan = dispatch
     if bias is not None and path in ("gemv", "split_register"):
@@ -26586,6 +26779,8 @@ def _launch_dispatch(a, b, out, dispatch, bias=None):
         return _launch_persistent(a, b, out=out, bias=bias)
     if path == "range_register":
         return _launch_range_register_plan(a, b, bias=bias, config=plan, out=out)
+    if path == "split_register":
+        return _launch_split_register_plan(a, b, config=plan, out=out)
     if path == "register":
         return _launch_register_plan(
             a,
@@ -26765,7 +26960,7 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
             # The full space must not lose to the heuristic, so the heuristic plan
             # is a candidate too. It leads the list because an unstable autotune
             # winner falls back to index 0.
-            candidates = _range_dispatch_candidates(m, n, k, a.dtype, a.element_size(), a.stride(), b.stride())
+            candidates = _full_dispatch_candidates(m, n, k, a.dtype, a.element_size(), a.stride(), b.stride())
             if dispatch is not None:
                 candidates = [dispatch] + [c for c in candidates if c != dispatch]
             if len(candidates) == 1:
@@ -26819,6 +27014,8 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
         return _launch_persistent(a, b, out=out)
     if path == "range_register":
         return _launch_range_register_plan(a, b, config=plan, out=out, _use_compiled_cache=use_compiled_cache)
+    if path == "split_register":
+        return _launch_split_register_plan(a, b, config=plan, out=out)
     if path == "register":
         return _launch_register_plan(
             a,
