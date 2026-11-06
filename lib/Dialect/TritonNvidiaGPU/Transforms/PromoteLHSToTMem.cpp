@@ -146,6 +146,19 @@ public:
         lhs.getType().getShape(), lhs.getType().getElementType(), aTMemEncoding,
         tensorMemorySpace,
         /*mutableMemory=*/false);
+    // The accumulator and the promoted A are both live at the MMA, so they
+    // must fit in TMEM together. Otherwise keep A in SMEM rather than produce
+    // a kernel that fails the TMEM capacity check at launch.
+    // Rubin (sm_107) has 576 columns, matching the launch check.
+    auto target = tcGen5MMAOp->template getParentOfType<ModuleOp>()
+                      ->template getAttrOfType<StringAttr>(
+                          ttg::AttrTargetName);
+    unsigned maxTmemCols =
+        target && target.getValue() == "cuda:107" ? 576 : 512;
+    unsigned accCols = getTmemAllocSizes(tcGen5MMAOp.getD().getType()).numCols;
+    unsigned lhsCols = getTmemAllocSizes(lhsMemDescType).numCols;
+    if (accCols + lhsCols > maxTmemCols)
+      return failure();
     bool layoutTmemCompatible =
         isDistributedLayoutTMemCompatible(tcGen5MMAOp, srcType, lhsMemDescType);
     Attribute newLayout = srcLayout;
