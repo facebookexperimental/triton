@@ -735,6 +735,10 @@ LinearLayout LinearLayout::resizeInDim(StringAttr inDim,
 
 LinearLayout LinearLayout::resizeOutDim(StringAttr outDim,
                                         int32_t newSize) const {
+  // An NPOT out dim resized to its own size, as a broadcast verifies, is
+  // unchanged.
+  if (!llvm::isPowerOf2_32(newSize) && newSize == getOutDimSize(outDim))
+    return *this;
   assert(llvm::isPowerOf2_32(newSize));
   assert(newSize <= getOutDimSize(outDim));
   auto newBases = bases;
