@@ -253,12 +253,13 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
     RankedTensorType origType = op.getType();
     auto origShape = origType.getShape();
     auto typeConverter = getTypeConverter<TritonGPUTypeConverter>();
-    // A mixed-radix result keeps the converter's layout and its operands keep
-    // theirs: only an MMA has an NPOT operand layout, and accelerate-matmul
-    // picks it.
+    // A mixed-radix dot (NPOT M, N or K) keeps the converter's layouts: only an
+    // MMA has an NPOT operand layout, and accelerate-matmul picks it.
     auto mixedRadixTy =
         cast<RankedTensorType>(typeConverter->convertType(origType));
-    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding()) ||
+        !triton::gpu::isRadix2Encoding(
+            cast<RankedTensorType>(adaptor.getA().getType()).getEncoding())) {
       Value c = triton::gpu::ConvertLayoutOp::create(
           rewriter, op.getLoc(), mixedRadixTy, adaptor.getC());
       addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
