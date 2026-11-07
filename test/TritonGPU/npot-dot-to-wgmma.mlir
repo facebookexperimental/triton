@@ -50,3 +50,20 @@ tt.func @aregs_m192(%pa: !tt.ptr<f16>, %pb: !tt.ptr<f16>, %pc: !tt.ptr<f32>) {
   tt.store %sc, %d : tensor<192x128x!tt.ptr<f32>>
   tt.return
 }
+
+// -----
+
+// K96's operands keep their layouts until accelerate-matmul allocs them.
+// CHECK-LABEL: @dot_k96
+// CHECK: ttng.warp_group_dot {{.*}} : !ttg.memdesc<128x96xf16, {{.*}}> * !ttg.memdesc<96x128xf16, {{.*}}> -> tensor<128x128xf32, #mma>
+tt.func @dot_k96(%pa: !tt.ptr<f16>, %pb: !tt.ptr<f16>, %pc: !tt.ptr<f32>) {
+  %sa = tt.splat %pa : !tt.ptr<f16> -> tensor<128x96x!tt.ptr<f16>>
+  %a = tt.load %sa : tensor<128x96x!tt.ptr<f16>>
+  %sb = tt.splat %pb : !tt.ptr<f16> -> tensor<96x128x!tt.ptr<f16>>
+  %b = tt.load %sb : tensor<96x128x!tt.ptr<f16>>
+  %c = arith.constant dense<0.0> : tensor<128x128xf32>
+  %d = tt.dot %a, %b, %c : tensor<128x96xf16> * tensor<96x128xf16> -> tensor<128x128xf32>
+  %sc = tt.splat %pc : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>
+  tt.store %sc, %d : tensor<128x128x!tt.ptr<f32>>
+  tt.return
+}

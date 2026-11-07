@@ -218,6 +218,10 @@ bool isMixedRadixLayoutOp(OperationName op);
 bool isMmaV3NpotNLegal(ArrayRef<unsigned> warpsPerCTA,
                        ArrayRef<unsigned> instrShape);
 
+// Whether wgmma's k atoms sit on K's power-of-two part, as its warps do on M
+// and N; otherwise an NPOT K's last atom reads past K.
+bool isMmaV3NpotKLegal(int64_t k, unsigned atomK);
+
 // Why the verifier rejects an exact mixed-radix layout among `types` on an op
 // named `name`, if it does; a pass can ask before creating the op.
 std::optional<std::string> getNpotLayoutUnsupportedReason(OperationName name,
