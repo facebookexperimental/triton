@@ -895,6 +895,142 @@ bool canCoalesceWriteIntoSharedMemory(MLIRContext *ctx,
   return divideLeft(srcToSharedLayout, coalescedLayout).has_value();
 }
 
+FailureOr<LinearLayout> splitDirectToLdsCopy(
+    const LinearLayout &srcLayout, const LinearLayout &sharedLayout,
+    SmallVectorImpl<int32_t> &slabOffsets, std::string &reason) {
+  MLIRContext *ctx = (*sharedLayout.getInDimNames().begin()).getContext();
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  StringAttr kOffset = StringAttr::get(ctx, "offset");
+  SmallVector<SmallVector<int32_t>> srcSlabs, sharedSlabs;
+  FailureOr<LinearLayout> srcBin =
+      triton::gpu::splitOddOuterDigits(srcLayout, kReg, srcSlabs);
+  FailureOr<LinearLayout> sharedBin =
+      triton::gpu::splitOddOuterDigits(sharedLayout, kOffset, sharedSlabs);
+  if (failed(srcBin) || failed(sharedBin)) {
+    reason = "its odd digits are not the outermost registers and offsets";
+    return failure();
+  }
+  auto outDims = to_vector(srcBin->getOutDimNames());
+  for (StringAttr dim : outDims) {
+    if (srcBin->getOutDimSize(dim) > sharedBin->getOutDimSize(dim)) {
+      reason = "a register slab is larger than a shared slab";
+      return failure();
+    }
+  }
+  if (!sharedBin->isSurjective()) {
+    reason = "its shared slab is not surjective";
+    return failure();
+  }
+  LinearLayout cvt = srcBin->invertAndCompose(*sharedBin);
+  SmallVector<int32_t> srcSpan(outDims.size(), 0);
+  for (const auto &[inDim, inDimBases] : srcBin->getBases())
+    for (const auto &basis : inDimBases)
+      for (auto [i, value] : llvm::enumerate(basis))
+        srcSpan[i] |= value;
+  int32_t cvtSpan = 0;
+  for (const auto &[inDim, inDimBases] : cvt.getBases())
+    for (const auto &basis : inDimBases)
+      cvtSpan |= basis[cvt.getOutDimIndex(kOffset)];
+
+  // A slab o fits when its origin is a shared slab origin plus a binary
+  // offset whose bits miss those of every address inside the slab.
+  LinearLayout inverse = sharedBin->pseudoinvert();
+  int32_t slabSize = sharedBin->getInDimSize(kOffset);
+  SmallVector<int32_t> offsets;
+  for (ArrayRef<int32_t> origin : srcSlabs) {
+    std::optional<int32_t> slabOffset;
+    for (auto [o, sharedOrigin] : llvm::enumerate(sharedSlabs)) {
+      SmallVector<std::pair<StringAttr, int32_t>> rest;
+      for (auto [i, dim] : llvm::enumerate(outDims)) {
+        int32_t r = origin[i] - sharedOrigin[sharedLayout.getOutDimIndex(dim)];
+        if (r < 0 || r >= sharedBin->getOutDimSize(dim) || (r & srcSpan[i]))
+          break;
+        rest.push_back({dim, r});
+      }
+      if (rest.size() != outDims.size())
+        continue;
+      SmallVector<std::pair<StringAttr, int32_t>> ins;
+      for (auto [dim, value] : inverse.apply(rest))
+        ins.push_back({dim, dim == kOffset ? value : 0});
+      int32_t off = ins[inverse.getOutDimIndex(kOffset)].second;
+      auto image = sharedBin->apply(ins);
+      bool fits = (off & cvtSpan) == 0;
+      for (auto [dim, value] : rest)
+        fits &= image[sharedBin->getOutDimIndex(dim)].second == value;
+      if (!fits)
+        continue;
+      slabOffset = slabSize * static_cast<int32_t>(o) + off;
+      break;
+    }
+    if (!slabOffset) {
+      reason = "a register slab does not start a shared slab";
+      return failure();
+    }
+    offsets.push_back(*slabOffset);
+  }
+  slabOffsets.assign(offsets.begin(), offsets.end());
+  return cvt;
+}
+
+std::optional<std::string> getNpotDirectToLdsUnsupportedReason(
+    const triton::AMD::TargetInfo &targetInfo, const LinearLayout &srcLayout,
+    unsigned elemBitWidth, Attribute dstEnc, ArrayRef<int64_t> dstAllocShape,
+    unsigned &vectorSize) {
+  MLIRContext *ctx = dstEnc.getContext();
+  auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(dstEnc);
+  LinearLayout sharedLayout =
+      paddedEnc ? paddedEnc.getLinearComponent()
+                : triton::gpu::toLinearLayout(dstAllocShape, dstEnc);
+  SmallVector<int32_t> slabOffsets;
+  std::string reason;
+  FailureOr<LinearLayout> cvt =
+      splitDirectToLdsCopy(srcLayout, sharedLayout, slabOffsets, reason);
+  if (failed(cvt))
+    return reason;
+  // Swizzling moves source pointers between lanes, so each slab has to start
+  // where its unswizzled slab does.
+  auto swizzledEnc = dyn_cast<triton::gpu::SwizzledSharedEncodingAttr>(dstEnc);
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1) {
+    auto flatEnc = triton::gpu::SwizzledSharedEncodingAttr::get(
+        ctx, swizzledEnc.getVec(), 1, 1, swizzledEnc.getOrder(),
+        swizzledEnc.getCGALayout());
+    SmallVector<int32_t> flatOffsets;
+    cvt = splitDirectToLdsCopy(
+        srcLayout, triton::gpu::toLinearLayout(dstAllocShape, flatEnc),
+        flatOffsets, reason);
+    if (failed(cvt))
+      return reason;
+    if (flatOffsets != slabOffsets)
+      return std::string("a swizzled slab starts away from its flat slab");
+  }
+  unsigned vec = vectorSize;
+  if (paddedEnc)
+    vec = std::min(vec, paddedEnc.getMinInterval() /
+                            (targetInfo.supportsDirectToLdsScatter()
+                                 ? 1
+                                 : targetInfo.getWarpSize()));
+  unsigned contig = cvt->getNumConsecutiveInOut();
+  if (fitToValidDirectToLdsVecSize(vec, elemBitWidth, targetInfo) == 0 ||
+      vec < contig)
+    return "its loads are narrower than its " + std::to_string(contig) +
+           "-element LDS run";
+  if (!targetInfo.supportsDirectToLdsLoadBitWidth(contig * elemBitWidth))
+    return "its " + std::to_string(contig * elemBitWidth) +
+           "-bit LDS run is not a direct-to-LDS load width";
+  if (!canCoalesceWriteIntoSharedMemory(ctx, *cvt, targetInfo.getWarpSize()))
+    return std::string("its lanes do not write contiguous LDS");
+  auto shifts = getPaddedSharedShifts(dstEnc, elemBitWidth,
+                                      /*offsetInBytes=*/true);
+  for (int32_t offset : slabOffsets) {
+    uint32_t bytes = applyPadding(offset * elemBitWidth / 8, shifts);
+    if (bytes % 16 != 0)
+      return "a slab starts at LDS byte " + std::to_string(bytes) +
+             ", which is not 16-byte aligned";
+  }
+  vectorSize = contig;
+  return std::nullopt;
+}
+
 // On architectures supporting scattering into LDS we are only constraint by the
 // minimal vector size. On architectures not support scattering, e.g. gfx9,
 // direct to LDS loads do not support per lane shared offsets. We need to ensure
@@ -912,6 +1048,12 @@ bool canCoalesceWriteIntoSharedMemory(MLIRContext *ctx,
 bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
                         RankedTensorType srcTy, Attribute dstEnc,
                         ArrayRef<int64_t> dstAllocShape, unsigned &vectorSize) {
+  LinearLayout srcLayout = triton::gpu::toLinearLayout(srcTy);
+  if (!srcLayout.isRadix2())
+    return !getNpotDirectToLdsUnsupportedReason(
+        targetInfo, srcLayout, tt::getPointeeBitWidth(srcTy), dstEnc,
+        dstAllocShape, vectorSize);
+
   // For padded encodings restrict vec by the min interval
   auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(dstEnc);
   if (paddedEnc) {
@@ -937,7 +1079,6 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
     return true;
 
   // Compute the blocked -> shared linear layout to check preconditions
-  LinearLayout srcLayout = triton::gpu::toLinearLayout(srcTy);
   LinearLayout sharedLayout;
   if (paddedEnc) {
     sharedLayout = paddedEnc.getLinearComponent();
