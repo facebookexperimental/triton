@@ -534,8 +534,8 @@ applyMixedRadixLayout(TritonLLVMOpBuilder &b, const LinearLayout &layout,
           quotient = b.lshr(idx, b.i32_val(llvm::Log2_32(weight)));
         else if (weight > 1)
           quotient = b.udiv(idx, b.i32_val(weight));
-        // XOR is exact: checkMixedRadixOutDims rejects odd radix-2
-        // contributions.
+        // XOR is exact: in odd-part form, radix-2 digits have no odd
+        // contribution.
         if (radix == 2) {
           Value isZero = b.icmp_eq(b.and_(quotient, b.i32_val(1)), zero);
           for (auto [binary, value] : llvm::zip(binaries, basis)) {
@@ -575,6 +575,79 @@ applyMixedRadixLayout(TritonLLVMOpBuilder &b, const LinearLayout &layout,
   return outIndices;
 }
 
+// Applies a layout with a general offset table: each out dim XORs its radix-2
+// digits outside the table and adds the table entry, as mul/add when the table
+// is affine in its digits and as a select chain otherwise.
+static SmallVector<std::pair<StringAttr, Value>>
+applyTableLayout(TritonLLVMOpBuilder &b, const LinearLayout &layout,
+                 ArrayRef<std::pair<StringAttr, Value>> ins) {
+  Value zero = b.i32_val(0);
+  DenseMap<std::pair<StringAttr, int32_t>, Value> digitValues;
+  auto digitValue = [&](StringAttr inDim, int32_t pos) {
+    Value &value = digitValues[{inDim, pos}];
+    if (value)
+      return value;
+    ArrayRef<int32_t> radices = layout.getInputRadices(inDim);
+    int64_t weight = 1;
+    for (int32_t radix : radices.take_front(pos))
+      weight *= radix;
+    Value quotient =
+        llvm::find_if(ins, [&](auto in) { return in.first == inDim; })->second;
+    if (llvm::isPowerOf2_64(weight) && weight > 1)
+      quotient = b.lshr(quotient, b.i32_val(llvm::Log2_64(weight)));
+    else if (weight > 1)
+      quotient = b.udiv(quotient, b.i32_val(weight));
+    if (radices[pos] == 2)
+      value = b.and_(quotient, b.i32_val(1));
+    else
+      value = b.urem(quotient, b.i32_val(radices[pos]));
+    return value;
+  };
+  SmallVector<std::pair<StringAttr, Value>> outIndices;
+  for (StringAttr outDim : layout.getOutDimNames()) {
+    ArrayRef<std::pair<StringAttr, int32_t>> table =
+        layout.getTableDigits(outDim);
+    Value index = zero;
+    for (auto [inDim, idx] : ins) {
+      for (int32_t pos = 0, e = layout.getInDimSizeLog2(inDim); pos < e;
+           ++pos) {
+        int32_t value = layout.getBasis(inDim, pos, outDim);
+        if (value == 0 || llvm::is_contained(table, std::pair(inDim, pos)))
+          continue;
+        Value isZero = b.icmp_eq(digitValue(inDim, pos), zero);
+        index = b.xor_(index, b.select(isZero, zero, b.i32_val(value)));
+      }
+    }
+    ArrayRef<int32_t> offsets = layout.getTableOffsets(outDim);
+    SmallVector<int64_t> weights = {1};
+    for (auto [inDim, pos] : table)
+      weights.push_back(weights.back() * layout.getInputRadix(inDim, pos));
+    bool affine =
+        llvm::all_of(llvm::seq<int64_t>(0, offsets.size()), [&](int64_t t) {
+          int64_t sum = 0;
+          for (size_t d = 0; d < table.size(); ++d)
+            sum += t / weights[d] % (weights[d + 1] / weights[d]) *
+                   offsets[weights[d]];
+          return sum == offsets[t];
+        });
+    Value entry = zero, flat = zero;
+    for (auto [d, digit] : llvm::enumerate(table)) {
+      Value value = digitValue(digit.first, digit.second);
+      int64_t scale = affine ? offsets[weights[d]] : weights[d];
+      if (scale != 0)
+        flat = b.add(flat, scale == 1 ? value : b.mul(value, b.i32_val(scale)));
+    }
+    if (affine)
+      entry = flat;
+    for (size_t t = 1; !affine && t < offsets.size(); ++t)
+      if (offsets[t] != 0)
+        entry = b.select(b.icmp_eq(flat, b.i32_val(t)), b.i32_val(offsets[t]),
+                         entry);
+    outIndices.push_back({outDim, table.empty() ? index : b.add(index, entry)});
+  }
+  return outIndices;
+}
+
 SmallVector<std::pair<StringAttr, Value>>
 applyLinearLayout(Location loc, RewriterBase &rewriter,
                   const LinearLayout &layout,
@@ -586,6 +659,8 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   if (layout.getNumOutDims() == 0) {
     return {};
   }
+  if (!layout.hasOddPartForm())
+    return applyTableLayout(b, layout, indices);
 
   // This function can emit a lot of MLIR code, which ultimately makes
   // compilation slow.  (We think this shouldn't be the case -- it's not *that*
