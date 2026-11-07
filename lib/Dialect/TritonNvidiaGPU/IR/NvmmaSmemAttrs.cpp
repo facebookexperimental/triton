@@ -149,8 +149,8 @@ std::optional<NvmmaSmemAttrs> getMmaOperandSmemAttrs(ttg::MemDescType memTy) {
   return attrsAndCandidate->first;
 }
 
-bool isMmaV3BTilingLegal(const NvmmaSmemAttrs &attrs, unsigned bitwidth,
-                         unsigned instrN, int64_t n) {
+bool isMmaBTilingLegal(const NvmmaSmemAttrs &attrs, unsigned bitwidth,
+                       unsigned instrN, int64_t n) {
   if (attrs.transposed)
     return true;
   int64_t pattern = std::max(attrs.swizzlingByteWidth, 16u) * 8 / bitwidth;
@@ -158,6 +158,24 @@ bool isMmaV3BTilingLegal(const NvmmaSmemAttrs &attrs, unsigned bitwidth,
     if (start % pattern != 0 && start % pattern + instrN > pattern)
       return false;
   return true;
+}
+
+unsigned getTcgen05InstrN(Tcgen05Kind kind, bool aInTmem,
+                          std::optional<NvmmaSmemAttrs> bAttrs, bool twoCTAs,
+                          unsigned blockM, unsigned maxN, int64_t n,
+                          unsigned bitwidth) {
+  unsigned instrN = std::min<int64_t>(maxN, n);
+  // The scale lowering reads B's scales per TMEM block of N.
+  if (llvm::isPowerOf2_64(n) || kind == Tcgen05Kind::BlockScaled)
+    return instrN;
+  bool bMNMajor = !bAttrs || !bAttrs->transposed;
+  for (unsigned c = instrN / 8 * 8; c >= 8; c -= 8)
+    if (n % c == 0 &&
+        !getTcgen05IllegalShapeReason(kind, aInTmem, bMNMajor, twoCTAs, blockM,
+                                      c) &&
+        (!bAttrs || isMmaBTilingLegal(*bAttrs, bitwidth, c, n)))
+      return c;
+  return instrN;
 }
 
 } // namespace mlir::triton::nvidia_gpu
