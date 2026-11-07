@@ -389,12 +389,14 @@ def amd_scheduled_mfma_scaled(
     b_scale,
     a_format: tl.constexpr,
     b_format: tl.constexpr,
+    accumulator_role: tl.constexpr = "transient",
+    accumulator_register_class: tl.constexpr = None,
     initialize: tl.constexpr = False,
     a_scale_selector: tl.constexpr = None,
     b_scale_selector: tl.constexpr = None,
     _semantic=None,
 ):
-    """Update native CDNA4 scaled-MFMA fragments from packed FP6 operands.
+    """Update native CDNA4 scaled-MFMA fragments.
 
     Scaled twin of :func:`amd_scheduled_mfma` for microscaling formats: ``a`` and ``b`` are
     i8 tensors with logical-value shapes (per lane, the first 24 of every
@@ -405,18 +407,25 @@ def amd_scheduled_mfma_scaled(
     [N, logicalK/32] in MFMA scale layout order. ``a_format``/``b_format`` are
     ``"e2m3"`` or ``"e3m2"``. Lowers to native ``v_mfma_scale_f32_*_f8f6f4``
     ROCDL intrinsics in K-major, N-major, M-minor order with one SSA chain
-    per output fragment. Transient only: use :func:`amd_mfma_commit` for
-    explicit completion boundaries, as with ``amd_scheduled_mfma``.
+    per output fragment. Typed FP8 operands additionally support persistent
+    accumulator chains and explicit AGPR or VGPR placement.
     """
     a_format = tl._unwrap_if_constexpr(a_format)
     b_format = tl._unwrap_if_constexpr(b_format)
     initialize = tl._unwrap_if_constexpr(initialize)
+    accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
+    accumulator_register_class = tl._unwrap_if_constexpr(
+        accumulator_register_class)
     a_scale_selector = tl._unwrap_if_constexpr(a_scale_selector)
     b_scale_selector = tl._unwrap_if_constexpr(b_scale_selector)
     _formats = ("e4m3", "e5m2", "e2m3", "e3m2", "e2m1")
     assert a_format in _formats, f"a_format must be one of {_formats}, got {a_format!r}"
     assert b_format in _formats, f"b_format must be one of {_formats}, got {b_format!r}"
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
+    assert accumulator_role in ("transient", "persistent"), \
+        'accumulator_role must be "transient" or "persistent"'
+    assert accumulator_register_class in (None, "agpr", "vgpr"), \
+        'accumulator_register_class must be None, "agpr", or "vgpr"'
     packed_scales = a_scale.dtype in (tl.int32, tl.uint32)
     assert packed_scales == (b_scale.dtype in (tl.int32, tl.uint32)), \
         "scale operands must use matching packing"
@@ -437,8 +446,8 @@ def amd_scheduled_mfma_scaled(
         a_format,
         b_format,
         "none",
-        "transient",
-        "auto",
+        accumulator_role,
+        "auto" if accumulator_register_class is None else accumulator_register_class,
         initialize,
         -1 if a_scale_selector is None else a_scale_selector,
         -1 if b_scale_selector is None else b_scale_selector,
