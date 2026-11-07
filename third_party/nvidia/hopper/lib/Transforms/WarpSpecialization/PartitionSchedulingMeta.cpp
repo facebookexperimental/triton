@@ -3076,11 +3076,11 @@ void PartitionSchedulingMeta::runOnOperation() {
         });
         if (storePartition) {
           // Atomics are left alone: a tile-claim atomic must keep the full
-          // partition union (or make autoWS bail out).
-          getLoopBodyRegion(loop).walk([&](StoreOp store) {
-            if (isa<RankedTensorType>(store.getPtr().getType()))
-              tryScheduleOp(storePartition, store);
-          });
+          // partition union (or make autoWS bail out). Scalar stores (e.g. a
+          // per-tile flag) are scheduled too; left unscheduled they are
+          // dropped.
+          getLoopBodyRegion(loop).walk(
+              [&](StoreOp store) { tryScheduleOp(storePartition, store); });
         }
       }
 
