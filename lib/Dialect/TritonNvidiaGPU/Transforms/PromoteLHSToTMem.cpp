@@ -134,9 +134,13 @@ public:
       return failure();
     }
     const unsigned colStride = 1;
+    // An NPOT K sits in TMEM blocks of its pow2 alloc shape, like an NPOT N
+    // accumulator.
+    SmallVector<int64_t> lhsPow2AllocShape =
+        ttg::getNpotPow2AllocShape(lhs.getType().getShape());
     auto aTMemEncoding = TensorMemoryEncodingAttr::get(
-        context, accTMemEncoding.getBlockM(), lhs.getType().getShape()[1],
-        colStride, cgaLayout, accTMemEncoding.getTwoCTAs(),
+        context, accTMemEncoding.getBlockM(), lhsPow2AllocShape[1], colStride,
+        cgaLayout, accTMemEncoding.getTwoCTAs(),
         accTMemEncoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS
             ? TensorMemoryCTAMode::TwoCTA_LHS
             : accTMemEncoding.getCtaMode());
@@ -145,7 +149,7 @@ public:
     ttg::MemDescType lhsMemDescType = ttg::MemDescType::get(
         lhs.getType().getShape(), lhs.getType().getElementType(), aTMemEncoding,
         tensorMemorySpace,
-        /*mutableMemory=*/false);
+        /*mutableMemory=*/false, lhsPow2AllocShape);
     bool layoutTmemCompatible =
         isDistributedLayoutTMemCompatible(tcGen5MMAOp, srcType, lhsMemDescType);
     Attribute newLayout = srcLayout;
