@@ -49,16 +49,15 @@ tt.func @dot_n96(%pa: !tt.ptr<bf16>, %pb: !tt.ptr<bf16>) {
 
 // -----
 
-// fp8 at K=192 takes the scaled f8f6f4 MFMA, which has no NPOT K yet.
+// fp8 at K=192 issues three f8f6f4 MFMAs from exact operands.
 // CHECK-LABEL: @dot_k192_fp8
-// CHECK: tt.dot {{.*}} : tensor<128x256xf8E4M3FN> * tensor<256x128xf8E4M3FN> ->
+// CHECK: tt.dot {{.*}} : tensor<128x192xf8E4M3FN> * tensor<192x128xf8E4M3FN> ->
 tt.func @dot_k192_fp8(%pa: !tt.ptr<f8E4M3FN>, %pb: !tt.ptr<f8E4M3FN>) {
   %sa = tt.splat %pa : !tt.ptr<f8E4M3FN> -> tensor<128x192x!tt.ptr<f8E4M3FN>>
   %a = tt.load %sa : tensor<128x192x!tt.ptr<f8E4M3FN>>
   %sb = tt.splat %pb : !tt.ptr<f8E4M3FN> -> tensor<192x128x!tt.ptr<f8E4M3FN>>
   %b = tt.load %sb : tensor<192x128x!tt.ptr<f8E4M3FN>>
   %c = arith.constant dense<0.0> : tensor<128x128xf32>
-  // expected-remark @+1 {{NPOT dot is not yet supported on rocdl.mfma.scale.f32.32x32x64.f8f6f4}}
   %d = tt.dot %a, %b, %c : tensor<128x192xf8E4M3FN> * tensor<192x128xf8E4M3FN> -> tensor<128x128xf32>
   tt.return
 }
