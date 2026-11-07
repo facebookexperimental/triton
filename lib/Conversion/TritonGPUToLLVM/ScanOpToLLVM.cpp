@@ -685,6 +685,10 @@ ScanOpConversion::emitFastScan(triton::ScanOp op, triton::ScanOpAdaptor adaptor,
   unsigned nElems = triton::gpu::getUniqueElemsPerThread(
       cast<RankedTensorType>(op.getOperands()[0].getType()));
   auto srcValues = unpackInputs(loc, op, adaptor, rewriter, nElems);
+  ArrayRef<unsigned> blockedToSrc = helper.getBlockedToSrc();
+  if (!blockedToSrc.empty())
+    srcValues = llvm::map_to_vector(
+        blockedToSrc, [&](unsigned src) { return srcValues[src]; });
 
   auto ordering = op.getReductionOrderingAttr();
   bool innerTree = ordering && ordering.getValue() == "inner_tree";
@@ -772,6 +776,12 @@ ScanOpConversion::emitFastScan(triton::ScanOp op, triton::ScanOpAdaptor adaptor,
         flipSrcValues(loc, op, rewriter, targetInfo, srcValues, iWarpSize);
   }
 
+  if (!blockedToSrc.empty()) {
+    SmallVector<SmallVector<Value>> srcOrder(srcValues.size());
+    for (auto [blocked, src] : llvm::enumerate(blockedToSrc))
+      srcOrder[src] = srcValues[blocked];
+    srcValues = std::move(srcOrder);
+  }
   auto valuesTransposed = transpose(srcValues);
   for (unsigned i = 0; i < op.getNumOperands(); ++i) {
     results[i] =
