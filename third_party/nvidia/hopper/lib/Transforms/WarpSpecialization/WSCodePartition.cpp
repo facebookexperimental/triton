@@ -5623,6 +5623,30 @@ static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
   return success();
 }
 
+// Returns a register (tensor) value that feeds consumer ops in different
+// task sets through separate channels in one block, e.g. a bias row loaded
+// once and used by both data-partition halves' accumulator initializers.
+// createBuffer gives such a group a single reload in one consumer task, which
+// is not supported; callers fall back to a non-WS kernel instead.
+Value findTensorChannelWithMixedConsumerTasks(triton::FuncOp funcOp) {
+  SmallVector<std::unique_ptr<Channel>> channelsOrigin;
+  collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
+  for (size_t i = 0; i < channelsOrigin.size(); ++i) {
+    Channel *a = channelsOrigin[i].get();
+    Value src = a->getSrcOperand();
+    if (!isa<RankedTensorType>(src.getType()))
+      continue;
+    for (size_t j = i + 1; j < channelsOrigin.size(); ++j) {
+      Channel *b = channelsOrigin[j].get();
+      if (b->getSrcOperand() == src &&
+          b->getDstOp()->getBlock() == a->getDstOp()->getBlock() &&
+          b->relation.second != a->relation.second)
+        return src;
+    }
+  }
+  return Value();
+}
+
 LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
@@ -5646,6 +5670,11 @@ LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
     channels.push_back(c.get());
   }
   if (!channels.empty()) {
+    if (Value src = findTensorChannelWithMixedConsumerTasks(funcOp)) {
+      return src.getDefiningOp()->emitError(
+          "autoWS: a register value feeding consumers in different tasks "
+          "through separate channels is not supported");
+    }
     // Step 2: Reorder ops based on channel information.
     reorderEpilogOps(channels, funcOp);
 
