@@ -843,11 +843,6 @@ ReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
   if (ordering && ordering.getValue() == "inner_tree")
     return "NPOT mixed-radix layout is not yet supported on an inner_tree "
            "reduce";
-  auto kWarp = StringAttr::get(getContext(), "warp");
-  for (const auto &basis : layout.getBases().lookup(kWarp))
-    if (basis[getAxis()] != 0)
-      return "NPOT mixed-radix layout with warps on the reduce axis is not yet "
-             "supported";
   return std::nullopt;
 }
 
