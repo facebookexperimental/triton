@@ -133,10 +133,26 @@ public:
     if (isFp4Padded(lhs.getType().getEncoding())) {
       return failure();
     }
+    // The K=96 lowering takes A from shared memory; A in TMEM is not yet
+    // implemented (T296112607).
+    if constexpr (std::is_same_v<MMAOpTy, TCGen5MMAScaledOp>) {
+      auto mod = tcGen5MMAOp->template getParentOfType<ModuleOp>();
+      if (tcGen5MMAOp.getAType() == ScaleDotElemType::E2M1 &&
+          tcGen5MMAOp.getBType() == ScaleDotElemType::E2M1 &&
+          mod->hasAttr(ttg::AttrTargetName) &&
+          getTcgen05InstrK(
+              4, accTMemEncoding.getBlockM(), tcGen5MMAOp.getBlockK(), false,
+              TargetFeatures::fromModuleOp(mod).supportsK96Tcgen05MMA()) == 96)
+        return failure();
+    }
     const unsigned colStride = 1;
+    // An NPOT K sits in TMEM blocks of its pow2 alloc shape, like an NPOT N
+    // accumulator.
+    SmallVector<int64_t> lhsPow2AllocShape =
+        ttg::getNpotPow2AllocShape(lhs.getType().getShape());
     auto aTMemEncoding = TensorMemoryEncodingAttr::get(
-        context, accTMemEncoding.getBlockM(), lhs.getType().getShape()[1],
-        colStride, cgaLayout, accTMemEncoding.getTwoCTAs(),
+        context, accTMemEncoding.getBlockM(), lhsPow2AllocShape[1], colStride,
+        cgaLayout, accTMemEncoding.getTwoCTAs(),
         accTMemEncoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS
             ? TensorMemoryCTAMode::TwoCTA_LHS
             : accTMemEncoding.getCtaMode());
@@ -145,7 +161,7 @@ public:
     ttg::MemDescType lhsMemDescType = ttg::MemDescType::get(
         lhs.getType().getShape(), lhs.getType().getElementType(), aTMemEncoding,
         tensorMemorySpace,
-        /*mutableMemory=*/false);
+        /*mutableMemory=*/false, lhsPow2AllocShape);
     bool layoutTmemCompatible =
         isDistributedLayoutTMemCompatible(tcGen5MMAOp, srcType, lhsMemDescType);
     Attribute newLayout = srcLayout;

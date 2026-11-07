@@ -363,13 +363,13 @@ tt.func @reduce_32x96(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt
 
 // -----
 
-// At four warps [128, 80] puts its warps on 128, so a reduce along 128 has an
-// unsupported reason and pads; along 80 it keeps its shape.
+// At four warps [128, 80] puts its warps on 128; a reduce along either dim
+// keeps its shape.
 // W4-LABEL: @reduce_128x80
 tt.func @reduce_128x80(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
   // W4: tt.load %{{.*}} : tensor<128x80x!tt.ptr<f32>>
   // W4: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
-  // W4: tt.load %{{.*}}, %{{.*}} : tensor<128x128x!tt.ptr<f32>>
+  // W4: tt.load %{{.*}} : tensor<128x80x!tt.ptr<f32>>
   // W4: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
   %r = tt.make_range {end = 10240 : i32, start = 0 : i32} : tensor<10240xi32>
   %i = tt.reshape %r : tensor<10240xi32> -> tensor<128x80xi32>
@@ -399,5 +399,72 @@ tt.func @reduce_128x80(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !t
   %ep = tt.splat %dst : !tt.ptr<f32> -> tensor<80x!tt.ptr<f32>>
   %e = tt.addptr %ep, %n : tensor<80x!tt.ptr<f32>>, tensor<80xi32>
   tt.store %e, %t : tensor<80x!tt.ptr<f32>>
+  tt.return
+}
+
+// -----
+
+// A scan lowers a mixed-radix layout along either dim of [96, 80], though the
+// radix-3 digit on 96 is not most-major.
+// W4-LABEL: @scan_96x80
+tt.func @scan_96x80(%src: !tt.ptr<i32> {tt.divisibility = 16 : i32}) {
+  // W4: "tt.scan"(%{{.*}}) <{axis = 1 : i32, reverse = false}>
+  // W4: }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
+  // W4: "tt.scan"(%{{.*}}) <{axis = 0 : i32, reverse = false}>
+  // W4: }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
+  %r = tt.make_range {end = 7680 : i32, start = 0 : i32} : tensor<7680xi32>
+  %i = tt.reshape %r : tensor<7680xi32> -> tensor<96x80xi32>
+  %sp = tt.splat %src : !tt.ptr<i32> -> tensor<96x80x!tt.ptr<i32>>
+  %p = tt.addptr %sp, %i : tensor<96x80x!tt.ptr<i32>>, tensor<96x80xi32>
+  %x = tt.load %p : tensor<96x80x!tt.ptr<i32>>
+  %s = "tt.scan"(%x) <{axis = 1 : i32, reverse = false}> ({
+  ^bb0(%a: i32, %b: i32):
+    %c = arith.addi %a, %b : i32
+    tt.scan.return %c : i32
+  }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
+  tt.store %p, %s : tensor<96x80x!tt.ptr<i32>>
+  %r2 = tt.make_range {end = 7680 : i32, start = 0 : i32} : tensor<7680xi32>
+  %i2 = tt.reshape %r2 : tensor<7680xi32> -> tensor<96x80xi32>
+  %sp2 = tt.splat %src : !tt.ptr<i32> -> tensor<96x80x!tt.ptr<i32>>
+  %p2 = tt.addptr %sp2, %i2 : tensor<96x80x!tt.ptr<i32>>, tensor<96x80xi32>
+  %y = tt.load %p2 : tensor<96x80x!tt.ptr<i32>>
+  %t = "tt.scan"(%y) <{axis = 0 : i32, reverse = false}> ({
+  ^bb0(%a: i32, %b: i32):
+    %c = arith.addi %a, %b : i32
+    tt.scan.return %c : i32
+  }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
+  tt.store %p2, %t : tensor<96x80x!tt.ptr<i32>>
+  tt.return
+}
+
+// -----
+
+// An atomic keeps a mixed-radix layout, but at four warps a [96] one
+// broadcasts, so its connected component pads once its result is used.
+// W4-LABEL: @atomic_96_result_used
+tt.func @atomic_96_result_used(%dst: !tt.ptr<i32>) {
+  // W4: tt.atomic_rmw add, relaxed, gpu, %{{.*}}, %{{.*}} : (tensor<96x!tt.ptr<i32>>
+  // W4: tt.atomic_rmw add, relaxed, gpu, %{{.*}}, %{{.*}}, %{{.*}} : (tensor<128x!tt.ptr<i32>>
+  %r = tt.make_range {end = 3072 : i32, start = 0 : i32} : tensor<3072xi32>
+  %x = tt.reshape %r : tensor<3072xi32> -> tensor<96x32xi32>
+  %s = "tt.reduce"(%x) <{axis = 1 : i32}> ({
+  ^bb0(%a: i32, %b: i32):
+    %c = arith.addi %a, %b : i32
+    tt.reduce.return %c : i32
+  }) : (tensor<96x32xi32>) -> tensor<96xi32>
+  %dp = tt.splat %dst : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
+  %q = tt.addptr %dp, %s : tensor<96x!tt.ptr<i32>>, tensor<96xi32>
+  %u = tt.atomic_rmw add, relaxed, gpu, %q, %s : (tensor<96x!tt.ptr<i32>>, tensor<96xi32>) -> tensor<96xi32>
+  %r2 = tt.make_range {end = 3072 : i32, start = 0 : i32} : tensor<3072xi32>
+  %x2 = tt.reshape %r2 : tensor<3072xi32> -> tensor<96x32xi32>
+  %t = "tt.reduce"(%x2) <{axis = 1 : i32}> ({
+  ^bb0(%a: i32, %b: i32):
+    %c = arith.addi %a, %b : i32
+    tt.reduce.return %c : i32
+  }) : (tensor<96x32xi32>) -> tensor<96xi32>
+  %dp2 = tt.splat %dst : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
+  %q2 = tt.addptr %dp2, %t : tensor<96x!tt.ptr<i32>>, tensor<96xi32>
+  %v = tt.atomic_rmw add, relaxed, gpu, %q2, %t : (tensor<96x!tt.ptr<i32>>, tensor<96xi32>) -> tensor<96xi32>
+  tt.store %q2, %v : tensor<96x!tt.ptr<i32>>
   tt.return
 }
