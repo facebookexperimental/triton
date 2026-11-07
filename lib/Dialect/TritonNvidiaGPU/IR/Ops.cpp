@@ -2438,6 +2438,11 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
   // Skip verification for placeholder layouts - they will be resolved later
   if (isa<triton::tlx::DummyRegisterLayoutAttr>(type.getEncoding()))
     return success();
+  // An NPOT tensor has only the chunked plan, so report why it doesn't apply.
+  if (!llvm::all_of(type.getShape(), llvm::isPowerOf2_64))
+    return success(succeeded(
+        computeTMemLdStEncodingInfo(type, memdesc, getContextualMaxNReg(op),
+                                    [op] { return op->emitOpError(); })));
 
   if (isDistributedLayoutTMemCompatible(op, type, memdesc))
     return success();
