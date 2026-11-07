@@ -979,7 +979,8 @@ def TT_HistogramOp
                           TypesMatchWith<"mask type matches src type", "src",
                                          "mask", "getI1SameShape($_self)",
                                          "($_op.getOperands().size() <= 1) || "
-                                         "std::equal_to<>()">]> {
+                                         "std::equal_to<>()">,
+                          MixedRadixLayoutTrait]> {
   let summary = "return a histogram of the inputs.";
   let description = [{
     Return the histogram of the input tensor. The number of bins is equal to
