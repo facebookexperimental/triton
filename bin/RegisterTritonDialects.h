@@ -214,4 +214,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::triton::gluon::GluonDialect, mlir::triton::tlx::TLXDialect>();
 
   mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
+  mlir::triton::gpu::registerNpotTargetLegality(registry);
+  mlir::triton::amdgpu::registerNpotTargetLegality(registry);
 }
