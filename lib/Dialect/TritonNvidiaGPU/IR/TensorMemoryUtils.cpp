@@ -270,10 +270,110 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
   return info;
 }
 
+FailureOr<MemDescType>
+getNpotTMemChunkType(MemDescType memTy,
+                     std::function<InFlightDiagnostic()> emitError) {
+  ArrayRef<int64_t> shape = memTy.getShape().take_back(2);
+  auto enc = dyn_cast<TensorMemoryEncodingAttr>(memTy.getEncoding());
+  // blockM=64 keeps NPOT N off: its unused TMEM columns per warp are unproven.
+  if (!llvm::isPowerOf2_64(shape[0]) || !enc || enc.getBlockM() != 128 ||
+      enc.getCtaMode() != TensorMemoryCTAMode::DEFAULT ||
+      enc.getCGALayout().getCTASplitNum()[1] != 1) {
+    if (emitError)
+      emitError() << "NPOT TMEM load/store is not yet supported for " << memTy;
+    return failure();
+  }
+  int64_t c = LinearLayout::twoPartOf(shape[1]);
+  return MemDescType::get({shape[0], c}, memTy.getElementType(), enc,
+                          memTy.getMemorySpace(), memTy.getMutableMemory(),
+                          memTy.getAllocShape());
+}
+
 FailureOr<TMemLdStEncodingInfo>
 computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
                             int maxnreg,
                             std::function<InFlightDiagnostic()> emitError) {
+  // An NPOT N = c * q (q odd) takes the plan of its pow2 chunk of c columns,
+  // and the outermost register digit, of radix q, steps reps across chunks.
+  if (!llvm::all_of(regTy.getShape(), llvm::isPowerOf2_64)) {
+    auto chunkTy = getNpotTMemChunkType(memTy, emitError);
+    if (failed(chunkTy))
+      return failure();
+    auto *ctx = regTy.getContext();
+    auto kReg = StringAttr::get(ctx, "register");
+    LinearLayout regLayout = toLinearLayout(regTy);
+    auto dims = to_vector(regLayout.getOutDimNames());
+    int64_t m = regTy.getDimSize(0), c = chunkTy->getDimSize(1);
+    int32_t q = regTy.getDimSize(1) / c;
+    int32_t numBinary = regLayout.getNumLeadingRadix2Digits(kReg);
+    auto bases = regLayout.getBases();
+    bases[kReg].resize(numBinary);
+    auto chunkLayout =
+        LinearLayout::tryCreate(std::move(bases), {{dims[0], m}, {dims[1], c}},
+                                /*requireSurjective=*/false);
+    int32_t odd = 0;
+    // A general offset table hides the odd digit's step from its basis.
+    if (regLayout.hasOddPartForm() && chunkLayout &&
+        regTy.getShape() == memTy.getShape().take_back(2) &&
+        regLayout.getInDimSizeLog2(kReg) == numBinary + 1 &&
+        regLayout.getInDimSize(kReg) == q << numBinary)
+      odd = regLayout.getBasisContribution(kReg, numBinary, dims[1]).odd;
+    if (odd == 0) {
+      if (emitError)
+        emitError() << "NPOT TMEM load/store is not yet supported for register "
+                       "layout "
+                    << regLayout.toString();
+      return failure();
+    }
+    auto chunkRegTy = RankedTensorType::get(
+        {m, c}, regTy.getElementType(),
+        LinearEncodingAttr::get(ctx, std::move(*chunkLayout)));
+    auto info =
+        computeTMemLdStEncodingInfo(chunkRegTy, *chunkTy, maxnreg, emitError);
+    if (failed(info))
+      return failure();
+    // Register block k is chunk k * odd mod q. Its memory column offset adds to
+    // the chunk's own columns, which can pass q chunk widths (M blocks), so the
+    // offsets go in a table, bounded by q chunk extents.
+    int32_t numDigits = info->reps.getInDimSizeLog2(kReg);
+    auto kCol = StringAttr::get(ctx, "col");
+    auto repsBases = info->reps.getBases();
+    auto radices = info->reps.getInputRadices();
+    auto outDims = info->reps.getOutDims();
+    repsBases[kReg].push_back({0, 0});
+    radices[kReg].push_back(q);
+    outDims[1].second *= q;
+    llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>
+        tableDigits;
+    llvm::MapVector<StringAttr, std::vector<int32_t>> tableOffsets;
+    tableDigits[kCol] = {{kReg, numDigits}};
+    for (int32_t k = 0; k < q; ++k)
+      tableOffsets[kCol].push_back(getTMemSubSliceOffset(
+          memTy, int32_t(k * odd % q * c), memTy.getRank() - 1));
+    std::string diagnostic;
+    auto reps = LinearLayout::tryCreate(
+        std::move(repsBases), std::move(radices), outDims,
+        std::move(tableDigits), std::move(tableOffsets),
+        /*requireSurjective=*/false, &diagnostic);
+    if (!reps) {
+      if (emitError)
+        emitError() << "NPOT TMEM load/store is not yet supported: "
+                    << diagnostic;
+      return failure();
+    }
+    info->reps = std::move(*reps);
+    SmallVector<size_t> action;
+    for (const auto &basis :
+         info->perm.apply(LinearLayout::identity1D(1 << numDigits, kReg, kReg))
+             .getBases()
+             .lookup(kReg))
+      action.push_back(llvm::Log2_32(basis[0]));
+    action.push_back(numDigits);
+    SmallVector<int32_t> permRadices(numDigits, 2);
+    permRadices.push_back(q);
+    info->perm = ColumnAction(action, kReg, numDigits + 1, permRadices);
+    return info;
+  }
   auto memLayout = toLinearLayout(memTy);
   auto regLayout = toLinearLayout(regTy);
   auto *ctx = regTy.getContext();
@@ -446,6 +546,11 @@ getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
 bool supportsTMemLoadReduce(RankedTensorType regTy, MemDescType memTy,
                             int maxnreg,
                             std::function<InFlightDiagnostic()> emitError) {
+  if (!llvm::all_of(regTy.getShape(), llvm::isPowerOf2_64)) {
+    if (emitError)
+      emitError() << "NPOT tmem_load reduction is not yet supported";
+    return false;
+  }
   auto encodingInfo = computeTMemLdStEncodingInfo(regTy, memTy, maxnreg);
   if (failed(encodingInfo)) {
     if (emitError)
