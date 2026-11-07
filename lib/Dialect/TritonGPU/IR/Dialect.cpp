@@ -69,6 +69,8 @@ bool hasPowerOfTwoBases(const LinearLayout &ll) {
 // one odd part, with no binary part.
 static bool hasSingleDigitMixedRadixBases(const LinearLayout &ll,
                                           StringAttr inDim) {
+  if (!ll.hasOddPartForm())
+    return false;
   for (int32_t digit = 0; digit < ll.getInDimSizeLog2(inDim); ++digit) {
     int32_t bits = 0;
     for (StringAttr outDim : ll.getOutDimNames())
