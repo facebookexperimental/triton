@@ -1,6 +1,7 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad=target=cuda:100 -convert-triton-to-tritongpu="target=cuda:100 num-warps=4" -tritongpu-coalesce -tritongpu-accelerate-matmul -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-pipeline 2>/dev/null | FileCheck %s --check-prefix=PIPE
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad=target=cuda:100 -verify-diagnostics | FileCheck %s
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad=target=cuda:100 -convert-triton-to-tritongpu="target=cuda:100 num-warps=4" -tritongpu-accelerate-matmul 2>/dev/null | FileCheck %s --check-prefix=TC
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad=target=cuda:103 -convert-triton-to-tritongpu="target=cuda:103 num-warps=4" -tritongpu-accelerate-matmul 2>/dev/null | FileCheck %s --check-prefix=TC103
 
 // tcgen05 MN-major fp8 needs N%16, so N=88 pads to a tcgen05 tile, not FMA.
 // CHECK-LABEL: @dot_f8_128x88
@@ -199,6 +200,50 @@ tt.func @dot_f16_k24(%pa: !tt.ptr<f16>, %pd: !tt.ptr<f32>) {
   %c = arith.constant dense<0.0> : tensor<128x128xf32>
   // expected-remark @+1 {{NPOT MMAv5 K=24 is unsupported: tcgen05.mma takes K in steps of 16}}
   %d = tt.dot %a, %b, %c : tensor<128x24xf16> * tensor<24x128xf16> -> tensor<128x128xf32>
+  %sd = tt.splat %pd : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>
+  tt.store %sd, %d : tensor<128x128x!tt.ptr<f32>>
+  tt.return
+}
+
+// -----
+
+// FP4 K=96 is one tcgen05.mma on sm_103a (SW64 operands, 128x8 pow2-alloc
+// scales).
+// CHECK-LABEL: @dot_scaled_nvfp4_k96
+// CHECK: tt.dot_scaled {{.*}} : tensor<128x64xi8>, tensor<128x8xf8E4M3FN> * tensor<64x128xi8>, tensor<128x8xf8E4M3FN> -> tensor<128x128xf32>
+// The previous split's label keeps the alias search inside this module.
+// TC103-LABEL: @dot_f16_k24
+// TC103-DAG: #[[$SW64:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+// TC103-LABEL: @dot_scaled_nvfp4_k96
+// TC103: ttng.tc_gen5_mma_scaled {{.*}} : !ttg.memdesc<128x48xi8, #[[$SW64]], {{.*}}, !ttg.memdesc<128x6xf8E4M3FN, {{.*}}, #ttng.tensor_memory, 128x8>, !ttg.memdesc<128x6xf8E4M3FN,
+tt.func @dot_scaled_nvfp4_k96(%pa: !tt.ptr<i8>, %ps: !tt.ptr<f8E4M3FN>, %pd: !tt.ptr<f32>) {
+  %sa = tt.splat %pa : !tt.ptr<i8> -> tensor<128x48x!tt.ptr<i8>>
+  %a = tt.load %sa : tensor<128x48x!tt.ptr<i8>>
+  %b = arith.constant dense<17> : tensor<48x128xi8>
+  %ss = tt.splat %ps : !tt.ptr<f8E4M3FN> -> tensor<128x6x!tt.ptr<f8E4M3FN>>
+  %s = tt.load %ss : tensor<128x6x!tt.ptr<f8E4M3FN>>
+  %c = arith.constant dense<0.0> : tensor<128x128xf32>
+  // expected-remark @+1 {{NPOT MMAv5 K=96 is unsupported: tcgen05.mma takes K in steps of 64}}
+  %d = tt.dot_scaled %a scale %s, %b scale %s, %c lhs = e2m1 rhs = e2m1 {fastMath = false} : tensor<128x48xi8>, tensor<128x6xf8E4M3FN> * tensor<48x128xi8>, tensor<128x6xf8E4M3FN> -> tensor<128x128xf32>
+  %sd = tt.splat %pd : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>
+  tt.store %sd, %d : tensor<128x128x!tt.ptr<f32>>
+  tt.return
+}
+
+// -----
+
+// fp6 dot_scaled decomposes off tcgen05, so an NPOT K pads.
+// CHECK-LABEL: @dot_scaled_fp6_k96
+// CHECK: tt.dot_scaled {{.*}} : tensor<128x128xi8>, tensor<128x4xi8> * tensor<128x128xi8>, tensor<128x4xi8> -> tensor<128x128xf32>
+tt.func @dot_scaled_fp6_k96(%pa: !tt.ptr<i8>, %ps: !tt.ptr<i8>, %pd: !tt.ptr<f32>) {
+  %sa = tt.splat %pa : !tt.ptr<i8> -> tensor<128x96x!tt.ptr<i8>>
+  %a = tt.load %sa : tensor<128x96x!tt.ptr<i8>>
+  %b = arith.constant dense<17> : tensor<96x128xi8>
+  %ss = tt.splat %ps : !tt.ptr<i8> -> tensor<128x3x!tt.ptr<i8>>
+  %s = tt.load %ss : tensor<128x3x!tt.ptr<i8>>
+  %c = arith.constant dense<0.0> : tensor<128x128xf32>
+  // expected-remark @+1 {{NPOT dot_scaled is not yet supported off tcgen05}}
+  %d = tt.dot_scaled %a scale %s, %b scale %s, %c lhs = e2m3 rhs = e2m3 {fastMath = false} : tensor<128x96xi8>, tensor<128x3xi8> * tensor<96x128xi8>, tensor<128x3xi8> -> tensor<128x128xf32>
   %sd = tt.splat %pd : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>
   tt.store %sd, %d : tensor<128x128x!tt.ptr<f32>>
   tt.return
