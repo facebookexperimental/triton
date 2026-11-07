@@ -131,11 +131,19 @@ SmallVector<Value> npotValues(Operation *op) {
   return values;
 }
 
+// Padding needs a mask to keep a pad lane's side effect from landing. An atomic
+// without a predicate can't be masked, so selection keeps its connected
+// component exact where it can.
+static bool hasPaddedLowering(Operation *op) {
+  return !(isa<AtomicOpInterface>(op) && !isa<PredicatedOpInterface>(op));
+}
+
 // Groups the NPOT tensors connected through their ops (a connected component
 // of the def-use graph). A connected component keeps its shape iff its ops
-// lower a mixed-radix layout without an unsupported reason, each access keeps
-// its padded vector, and its mixed-radix layouts take a smaller total in-dim
-// size in sum than its padded Blocked layouts.
+// lower a mixed-radix layout without an unsupported reason and, unless one has
+// no padded lowering, each access keeps its padded vector and its mixed-radix
+// layouts take a smaller total in-dim size in sum than its padded Blocked
+// layouts.
 class ExactComponents {
 public:
   ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp, int numCTAs);
@@ -271,14 +279,18 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                .has_value();
   };
   DenseMap<Value, std::pair<int64_t, int64_t>> totalInDimSizes;
-  DenseSet<Value> seen;
+  DenseSet<Value> seen, slower, unpaddable;
   mod.walk([&](Operation *op) {
     SmallVector<Value> values = npotValues(op);
     if (values.empty())
       return;
     Value leader = components.getLeaderValue(values.front());
-    if (!gpu::isMixedRadixLayoutOp(op) || !keepsVector(op) || rejects(op))
+    if (!gpu::isMixedRadixLayoutOp(op->getName()) || rejects(op))
       paddedComponents.insert(leader);
+    else if (!keepsVector(op))
+      slower.insert(leader);
+    if (!hasPaddedLowering(op))
+      unpaddable.insert(leader);
     for (Value v : values)
       if (seen.insert(v).second &&
           !addTotalInDimSizes(v, totalInDimSizes[leader]))
@@ -289,6 +301,9 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   // less.
   for (auto &[leader, sum] : totalInDimSizes)
     if (sum.first >= sum.second)
+      slower.insert(leader);
+  for (Value leader : slower)
+    if (!unpaddable.contains(leader))
       paddedComponents.insert(leader);
 }
 
@@ -500,6 +515,8 @@ LogicalResult Padder::accept(Operation *op) {
       }))
     return op->emitOpError("on an NPOT pointer-to-tensor, descriptor, memory "
                            "descriptor or encoded tensor is unsupported");
+  if (!hasPaddedLowering(op))
+    return op->emitOpError("on an NPOT tensor is unsupported");
 
   // Lanewise ops and control flow are only retyped.
   if (op->hasTrait<OpTrait::Elementwise>()) {
