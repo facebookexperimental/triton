@@ -465,6 +465,26 @@ static LinearLayout broadcastedDotOperandLayout(MLIRContext *ctx,
   return layout;
 }
 
+// Repeats `layout` in registers along `dim` up to `size`: binary repeats up to
+// its two-part, then its odd part, so the rep index along `dim` stays linear.
+static LinearLayout repeatMixedRadix(LinearLayout layout, StringAttr dim,
+                                     int32_t size) {
+  MLIRContext *ctx = dim.getContext();
+  int32_t twoPart = LinearLayout::twoPartOf(size);
+  if (layout.getOutDimSize(dim) < twoPart)
+    layout *= LinearLayout::identity1D(twoPart / layout.getOutDimSize(dim),
+                                       S("register"), dim);
+  int32_t odd = size / twoPart;
+  if (odd == 1)
+    return layout;
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{1}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {odd};
+  return layout * LinearLayout(std::move(bases), std::move(radices),
+                               {{dim, odd}}, /*requireSurjective=*/true);
+}
+
 LinearLayout
 AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   int rank = shape.size();
@@ -683,10 +703,26 @@ AMDMfmaEncodingAttr::dotOperandToLinearLayout(Attribute dotOp,
     kTileSize *= 16;
   }
 
-  // If shape K is larger than the tile size, repeat the tile
-  // along the K dimension.
-  if (kSize > kTileSize) {
-    tileLayout *= LinearLayout::identity1D(kSize / kTileSize, kRegister, dimK);
+  // Under TRITON_ALLOW_NPOT, an NPOT K or non-K whose two-part holds whole
+  // tiles (and warps) repeats its odd part in registers after its binary
+  // repeats, so the MFMA lowering's rep indices stay linear.
+  int32_t kTwoPart = LinearLayout::twoPartOf(kSize);
+  int32_t nonKSize = shape[nonKDimIndex];
+  int32_t nonKCover = nonKDim * tilePerWarpNonK * warpsPerCTA[nonKDimIndex];
+  bool mixedRadix =
+      triton::tools::isNpotAllowed() && rank == 2 &&
+      !llvm::all_of(shape, llvm::isPowerOf2_64) && kTwoPart % kTileSize == 0 &&
+      (llvm::isPowerOf2_32(nonKSize) ||
+       LinearLayout::twoPartOf(nonKSize) % nonKCover == 0) &&
+      mfmaLayout.getCGALayout().getLinearLayout().getInDimSize(S("block")) == 1;
+  if (mixedRadix) {
+    tileLayout = repeatMixedRadix(std::move(tileLayout), dimK, kSize);
+  } else if (kSize > kTileSize) {
+    // If shape K is larger than the tile size, repeat the tile
+    // along the K dimension.
+    tileLayout *= LinearLayout::identity1D(
+        static_cast<int32_t>(llvm::PowerOf2Ceil(kSize)) / kTileSize, kRegister,
+        dimK);
   }
 
   // Follow the tiles per warp property, repeat the tile layout
@@ -700,6 +736,22 @@ AMDMfmaEncodingAttr::dotOperandToLinearLayout(Attribute dotOp,
     // dimension, which appears at the last.
     tileLayout *= LinearLayout::identity1D(1, kRegister, outDimNames[order[2]]);
     tileLayout *= LinearLayout::identity1D(1, kLane, outDimNames[order[2]]);
+  }
+
+  if (mixedRadix) {
+    // Warps broadcast along K, as the crop below does for pow2 K; the non-K
+    // repeats follow the warps, as in pow2.
+    LinearLayout ctaLayout =
+        tileLayout * broadcastedDotOperandLayout(ctx, warpsPerCTA, warpOrder,
+                                                 kDimIndex, kWarp)
+                         .transposeOuts({dimK, dimNonK});
+    ctaLayout = repeatMixedRadix(std::move(ctaLayout), dimNonK, nonKSize);
+    ctaLayout = ensureLayoutNotLargerThan(ctaLayout,
+                                          {{dimK, kSize}, {dimNonK, nonKSize}});
+    LinearLayout cgaLayout =
+        mfmaLayout.getCGALayout().getLinearLayout().transposeOuts(
+            {dimK, dimNonK});
+    return (ctaLayout * cgaLayout).transposeOuts(outDimNames);
   }
 
   LinearLayout warpLayout = identityStandardND(kWarp, warpsPerCTA, warpOrder);
@@ -1023,20 +1075,9 @@ getMixedRadixRepeat(LinearLayout tile, CGAEncodingAttr cga,
     if (fitted.getBases().lookup(inDim) != tile.getBases().lookup(inDim))
       return std::nullopt;
   tile = std::move(fitted);
-  for (unsigned dim : repOrder) {
-    int32_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(shape[dim]));
-    tile *= LinearLayout::identity1D(twoPart / tile.getOutDimSize(dims[dim]),
-                                     S("register"), dims[dim]);
-    int32_t odd = static_cast<int32_t>(shape[dim]) / twoPart;
-    if (odd == 1)
-      continue;
-    LinearLayout::BasesT bases;
-    bases[S("register")] = {{1}};
-    LinearLayout::RadicesT radices;
-    radices[S("register")] = {odd};
-    tile *= LinearLayout(std::move(bases), std::move(radices),
-                         {{dims[dim], odd}}, /*requireSurjective=*/true);
-  }
+  for (unsigned dim : repOrder)
+    tile = repeatMixedRadix(std::move(tile), dims[dim],
+                            static_cast<int32_t>(shape[dim]));
   cgaLayout = cgaLayout.transposeOuts(llvm::to_vector(tile.getOutDimNames()));
   return (tile * cgaLayout).transposeOuts(dims);
 }
@@ -1119,6 +1160,8 @@ NvidiaMmaEncodingAttr::dotOperandToLinearLayout(Attribute dotOp,
 }
 
 bool DotOperandEncodingAttr::hasMixedRadixLayout() const {
+  if (isa<AMDMfmaEncodingAttr>(getParent()))
+    return true;
   auto mma = dyn_cast<NvidiaMmaEncodingAttr>(getParent());
   return mma && mma.hasMixedRadixLayout();
 }
