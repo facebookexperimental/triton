@@ -171,15 +171,34 @@ tt.func @dot_f16_192x128(%pa: !tt.ptr<f16>, %pd: !tt.ptr<f32>) {
 
 // -----
 
+// A K in whole tcgen05.mma K steps stays exact.
 // CHECK-LABEL: @dot_f16_k96
-// CHECK: tt.dot {{.*}} : tensor<128x128xf16> * tensor<128x128xf16> -> tensor<128x128xf32>
+// CHECK: tt.dot {{.*}} : tensor<128x96xf16> * tensor<96x128xf16> -> tensor<128x128xf32>
+// TC-LABEL: @dot_f16_k96
+// TC: ttng.tc_gen5_mma {{.*}} : !ttg.memdesc<128x96xf16, {{.*}}, !ttg.memdesc<96x128xf16,
+// TC-NOT: tt.dot
 tt.func @dot_f16_k96(%pa: !tt.ptr<f16>, %pd: !tt.ptr<f32>) {
   %sa = tt.splat %pa : !tt.ptr<f16> -> tensor<128x96x!tt.ptr<f16>>
   %a = tt.load %sa : tensor<128x96x!tt.ptr<f16>>
   %b = arith.constant dense<1.0> : tensor<96x128xf16>
   %c = arith.constant dense<0.0> : tensor<128x128xf32>
-  // expected-remark @+1 {{NPOT MMAv5 K is not yet supported}}
   %d = tt.dot %a, %b, %c : tensor<128x96xf16> * tensor<96x128xf16> -> tensor<128x128xf32>
+  %sd = tt.splat %pd : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>
+  tt.store %sd, %d : tensor<128x128x!tt.ptr<f32>>
+  tt.return
+}
+
+// -----
+
+// CHECK-LABEL: @dot_f16_k24
+// CHECK: tt.dot {{.*}} : tensor<128x32xf16> * tensor<32x128xf16> -> tensor<128x128xf32>
+tt.func @dot_f16_k24(%pa: !tt.ptr<f16>, %pd: !tt.ptr<f32>) {
+  %sa = tt.splat %pa : !tt.ptr<f16> -> tensor<128x24x!tt.ptr<f16>>
+  %a = tt.load %sa : tensor<128x24x!tt.ptr<f16>>
+  %b = arith.constant dense<1.0> : tensor<24x128xf16>
+  %c = arith.constant dense<0.0> : tensor<128x128xf32>
+  // expected-remark @+1 {{NPOT MMAv5 K=24 is unsupported: tcgen05.mma takes K in steps of 16}}
+  %d = tt.dot %a, %b, %c : tensor<128x24xf16> * tensor<24x128xf16> -> tensor<128x128xf32>
   %sd = tt.splat %pd : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>
   tt.store %sd, %d : tensor<128x128x!tt.ptr<f32>>
   tt.return
