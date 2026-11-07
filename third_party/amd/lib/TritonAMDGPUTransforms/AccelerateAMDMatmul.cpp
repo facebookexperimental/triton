@@ -13,6 +13,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/DecomposeScaledBlocked.h"
 #include "triton/Dialect/TritonGPU/Transforms/LayoutPropagationUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -1924,5 +1925,62 @@ struct TritonAMDGPUAccelerateMatmulPass
     decomposeMixedModeDotOp(m);
   }
 };
+
+namespace {
+struct AmdNpotTargetLegality : public tt::NpotTargetLegality {
+  using NpotTargetLegality::NpotTargetLegality;
+  StringRef getTargetPrefix() const override { return "hip"; }
+  std::optional<std::string> getDotUnsupportedReason(Operation *,
+                                                     const tt::LinearLayout &,
+                                                     StringRef target,
+                                                     int) const override {
+    return ("NPOT dot is not yet supported on " + target).str();
+  }
+  std::optional<std::string>
+  getAsyncCopyUnsupportedReason(Operation *copy, const tt::LinearLayout &layout,
+                                StringRef target) const override {
+    ttg::MemDescType dstTy;
+    if (auto asyncCopy = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(copy))
+      dstTy = asyncCopy.getResult().getType();
+    else if (auto bufferLoad =
+                 dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(copy))
+      dstTy = bufferLoad.getDest().getType();
+    else if (auto load = dyn_cast<tt::LoadOp>(copy)) {
+      // A load to pipeline copies into the encoding the pipeliner picks.
+      auto ty = cast<RankedTensorType>(load.getType());
+      dstTy = ttg::MemDescType::get(
+          ty.getShape(), ty.getElementType(), tt::getSharedEncoding(load),
+          ttg::SharedMemorySpaceAttr::get(load.getContext()));
+    } else
+      return ("NPOT async copy is not yet supported on " + target).str();
+    triton::AMD::TargetInfo targetInfo(target.split(':').second);
+    unsigned elemBitWidth = dstTy.getElementTypeBitWidth();
+    unsigned vectorSize = std::max(128u / elemBitWidth, 1u);
+    if (std::optional<std::string> reason =
+            LLVM::AMD::getNpotDirectToLdsUnsupportedReason(
+                targetInfo, layout, elemBitWidth, dstTy.getEncoding(),
+                dstTy.getAllocShape(), vectorSize))
+      return ("NPOT async copy is not supported on " + target + ": " + *reason)
+          .str();
+    return std::nullopt;
+  }
+  std::optional<std::string>
+  getDescriptorUnsupportedReason(Operation *, const tt::LinearLayout &,
+                                 StringRef target) const override {
+    return ("NPOT tensor descriptor is not yet supported on " + target).str();
+  }
+  bool keepsDescriptorVector(RankedTensorType,
+                             RankedTensorType) const override {
+    return false;
+  }
+};
+} // namespace
+
+void triton::amdgpu::registerNpotTargetLegality(DialectRegistry &registry) {
+  registry.addExtension(
+      +[](MLIRContext *, triton::amdgpu::TritonAMDGPUDialect *dialect) {
+        dialect->addInterfaces<AmdNpotTargetLegality>();
+      });
+}
 
 } // namespace mlir

@@ -236,6 +236,29 @@ LogicalResult AtomicStoreOp::verify() {
   return verifyAtomicLoadStoreType(getOperation(), getPtr().getType());
 }
 
+// A used result with duplicates is broadcast back through pow2-only
+// shared-memory algebra.
+static std::optional<std::string>
+getAtomicMixedRadixUnsupportedReason(Operation *op,
+                                     const LinearLayout &layout) {
+  if (!op->getResult(0).use_empty() &&
+      llvm::any_of(layout.getFreeVariableMasks(),
+                   [](auto mask) { return mask.second != 0; }))
+    return "NPOT mixed-radix layout with broadcast elements is not yet "
+           "supported on an atomic whose result is used";
+  return std::nullopt;
+}
+
+std::optional<std::string>
+AtomicRMWOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getAtomicMixedRadixUnsupportedReason(*this, layout);
+}
+
+std::optional<std::string>
+AtomicCASOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getAtomicMixedRadixUnsupportedReason(*this, layout);
+}
+
 LogicalResult AtomicPollOp::verify() {
   if (getSem() != MemSemantic::ACQUIRE && getSem() != MemSemantic::RELAXED)
     return emitOpError("only supports acquire and relaxed semantics");
@@ -385,6 +408,54 @@ LogicalResult DotOp::verify() {
   auto interface = cast<DialectInferLayoutInterface>(&dialect);
   return interface->verifyDotOpEncodingCompatibility(getOperation(), aEncoding,
                                                      bEncoding);
+}
+
+// The NpotTargetLegality whose prefix matches `target`, or nullptr.
+static const NpotTargetLegality *lookupNpotTargetLegality(MLIRContext *ctx,
+                                                          StringRef target) {
+  for (Dialect *dialect : ctx->getLoadedDialects()) {
+    auto *legality = dyn_cast<NpotTargetLegality>(dialect);
+    if (legality && target.split(':').first == legality->getTargetPrefix())
+      return legality;
+  }
+  return nullptr;
+}
+
+std::optional<std::string>
+getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
+                            StringRef target, int numWarps) {
+  if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
+    return legality->getDotUnsupportedReason(dot, layout, target, numWarps);
+  return std::string("NPOT dot is not yet supported without an MMA target");
+}
+
+StringRef getModuleTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  auto target = mod ? mod->getAttrOfType<StringAttr>("ttg.target") : nullptr;
+  return target ? target.getValue() : StringRef();
+}
+
+std::optional<std::string>
+getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout) {
+  StringRef target = getModuleTarget(copy);
+  if (auto *legality = lookupNpotTargetLegality(copy->getContext(), target))
+    return legality->getAsyncCopyUnsupportedReason(copy, layout, target);
+  return std::string("NPOT async copy is not yet supported without a target");
+}
+
+std::optional<std::string>
+getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                   StringRef target) {
+  if (auto *legality = lookupNpotTargetLegality(op->getContext(), target))
+    return legality->getDescriptorUnsupportedReason(op, layout, target);
+  return std::string(
+      "NPOT tensor descriptor is not yet supported without a target");
+}
+
+bool targetKeepsDescriptorVector(Operation *op, RankedTensorType tile,
+                                 RankedTensorType padded, StringRef target) {
+  auto *legality = lookupNpotTargetLegality(op->getContext(), target);
+  return legality && legality->keepsDescriptorVector(tile, padded);
 }
 
 //-- DotScaledOp --
@@ -843,11 +914,6 @@ ReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
   if (ordering && ordering.getValue() == "inner_tree")
     return "NPOT mixed-radix layout is not yet supported on an inner_tree "
            "reduce";
-  auto kWarp = StringAttr::get(getContext(), "warp");
-  for (const auto &basis : layout.getBases().lookup(kWarp))
-    if (basis[getAxis()] != 0)
-      return "NPOT mixed-radix layout with warps on the reduce axis is not yet "
-             "supported";
   return std::nullopt;
 }
 
@@ -891,6 +957,58 @@ llvm::SmallVector<RankedTensorType> ScanOp::getInputTypes() {
 
 llvm::SmallVector<Type> ScanOp::getElementTypes() {
   return getElementTypesImpl(this->getOperands());
+}
+
+// Walks bases: LinearEncodingAttr's per-dim counts lose the order checked here.
+std::optional<SmallVector<unsigned>>
+ScanOp::getBlockedTile(const LinearLayout &layout) {
+  // A general offset table hides its digits' steps from the bases.
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
+  MLIRContext *ctx = layout.getOutDimNames().begin()->getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  LinearLayout ll = layout.removeZeroBasesAlongDim(kReg);
+  auto nonZero = [](int32_t b) { return b != 0; };
+  SmallVector<unsigned> tile(ll.getNumOutDims(), 1);
+  // A thread's contiguous run, as LinearEncodingAttr::getContigPerThread.
+  const auto &regs = ll.getBases().lookup(kReg);
+  int runDim = -1;
+  for (const auto &basis :
+       ArrayRef(regs).take_front(ll.getNumLeadingRadix2Digits(kReg))) {
+    unsigned dim = llvm::find_if(basis, nonZero) - basis.begin();
+    if (llvm::count_if(basis, nonZero) != 1 || basis[dim] != tile[dim] ||
+        (int(dim) != runDim && tile[dim] != 1))
+      break;
+    runDim = dim;
+    tile[dim] *= 2;
+  }
+  for (const char *inDim : {"lane", "warp"}) {
+    SmallVector<int> last(tile.size(), -1);
+    const auto &bases = ll.getBases().lookup(StringAttr::get(ctx, inDim));
+    for (auto [pos, basis] : llvm::enumerate(bases)) {
+      auto count = llvm::count_if(basis, nonZero);
+      if (count == 0)
+        continue;
+      unsigned dim = llvm::find_if(basis, nonZero) - basis.begin();
+      if (count != 1 || basis[dim] != tile[dim] ||
+          (last[dim] >= 0 && last[dim] + 1 != int(pos)))
+        return std::nullopt;
+      last[dim] = pos;
+      tile[dim] *= 2;
+    }
+  }
+  return tile;
+}
+
+std::optional<std::string>
+ScanOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  auto ordering = getReductionOrderingAttr();
+  if (ordering && ordering.getValue() == "inner_tree")
+    return "NPOT mixed-radix layout is not yet supported on an inner_tree scan";
+  if (!getBlockedTile(layout))
+    return "NPOT mixed-radix layout is not yet supported on a scan whose lanes "
+           "or warps are not blocked";
+  return std::nullopt;
 }
 
 //-- MapElementwiseOp
@@ -2220,6 +2338,36 @@ LogicalResult DescriptorStoreOp::verify() {
 LogicalResult DescriptorReduceOp::verify() {
   return verifyDescriptorLoadStoreOp(*this, getDesc().getType(),
                                      getSrc().getType());
+}
+
+std::optional<std::string>
+DescriptorLoadOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorStoreOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorGatherOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string> DescriptorScatterOp::getMixedRadixUnsupportedReason(
+    const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
 }
 
 } // namespace triton
