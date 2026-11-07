@@ -565,6 +565,7 @@ def test_fast_automatic_runs_are_pr_only():
     (["python/triton/runtime/jit.py"], {"h100", "b200", "mi350"}),
     ([".github/fast-test-suites.json"], {"h100", "b200", "mi350"}),
     ([".github/actions/setup-test-env/action.yml"], {"h100", "b200", "mi350"}),
+    ([".github/actions/install-torchao/action.yml"], {"h100", "b200", "mi350"}),
     (None, {"h100", "b200", "mi350"}),
 ])
 def test_fast_suites_preserve_affected_platform_routing(paths, expected):
@@ -685,23 +686,24 @@ def fast_fixture_run(tmp_path, source, environment=None, separate_baseline=False
     import sys
     (tmp_path / "test_sample.py").write_text(source)
     plan = {
-        "baseline": ["test_sample.py::test_baseline"], "touched": [{"file": "test_sample.py", "k": ""}], "unmapped": [],
-        "limited": []
+        "platform": "b200", "baseline": ["test_sample.py::test_baseline"], "touched":
+        [{"file": "test_sample.py", "k": ""}], "unmapped": [], "limited": []
     }
     if separate_baseline:
         (tmp_path / "test_base.py").write_text("def test_baseline():\n    assert True\n")
         plan["baseline"] = ["test_base.py::test_baseline"]
     junit = tmp_path / "result.xml"
-    result = subprocess.run([
-        sys.executable, "-c", "import json,sys; from pathlib import Path; from fast_tests import run_plan; "
-        "run_plan(json.loads(sys.argv[1]), Path(sys.argv[2]), sys.argv[3])",
-        json.dumps(plan),
-        str(tmp_path),
-        str(junit)
-    ], env=os.environ | {
-        "PYTHONPATH": str(ROOT / ".github/scripts"), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONDONTWRITEBYTECODE":
-        "1"
-    } | (environment or {}), capture_output=True, text=True)
+    result = subprocess.run(
+        [
+            sys.executable, "-c", "import json,sys; from pathlib import Path; from fast_tests import run_plan; "
+            "run_plan(json.loads(sys.argv[1]), Path(sys.argv[2]), sys.argv[3])",
+            json.dumps(plan),
+            str(tmp_path),
+            str(junit)
+        ], env=os.environ | {
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"), "PYTHONPATH": str(ROOT / ".github/scripts"),
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONDONTWRITEBYTECODE": "1"
+        } | (environment or {}), capture_output=True, text=True)
     manifest = json.loads(junit.with_suffix(".selection.json").read_text())
     return result, manifest
 
@@ -731,6 +733,12 @@ class TestNested:
         *manifest["baseline"], "test_sample.py::test_touched[1]", "test_sample.py::TestNested::test_expected[1]"
     ]
     assert len(manifest["exclusions"]) == 2
+    summary = (tmp_path / "summary.md").read_text()
+    assert "test_sample.py::test_baseline[0] | both | pass |" in summary
+    assert "test_sample.py::test_touched[0] | touched | skipped |" in summary
+    assert "test_sample.py::test_touched[1] | touched | pass |" in summary
+    assert "test_sample.py::test_touched[2] | touched | not executed |" in summary
+    assert "JUnit seconds" in summary
     verify_manifests([manifest])
 
 
@@ -747,6 +755,11 @@ def test_touched(value):
     assert manifest["functions"]["test_sample.py::test_touched"]["status"] == "failed"
     assert manifest["functions"]["test_sample.py::test_touched"]["attempts"] == 1
     assert "test_sample.py::test_touched[1]" not in manifest["selected"]
+    summary = (tmp_path / "summary.md").read_text()
+    assert "Run failed:" in summary
+    assert "test_sample.py::test_touched[0] | touched | fail |" in summary
+    assert "test_sample.py::test_touched[1] | touched | not executed |" in summary
+    assert "test_sample.py::test_touched[1] | touched | pass |" not in summary
 
 
 @pytest.mark.parametrize("baseline_skip", [False, True])
@@ -785,6 +798,28 @@ def test_touched(value):
     with pytest.raises(ValueError):
         verify_manifests([manifest])
     assert "test_sample.py::test_touched" not in manifest["selected"]
+    summary = (tmp_path / "summary.md").read_text()
+    assert "test_sample.py::test_touched[0] | touched | skipped |" in summary
+    assert "required runtime dependency unavailable" in summary
+    assert "runtime_unavailable" in summary if cases == 1 else "limit_reached" in summary
+    import os
+    import sys
+    needs = {
+        "select": {
+            "outputs":
+            {platform: "true" if platform == "b200" else "false"
+             for platform in ("h100", "b200", "mi350", "cpu")}
+        }
+    }
+    verified = subprocess.run(
+        [sys.executable,
+         str(ROOT / ".github/scripts/fast_tests.py"), "verify", "--evidence",
+         str(tmp_path)],
+        env=os.environ | {"NEEDS": json.dumps(needs), "GITHUB_STEP_SUMMARY": str(tmp_path / "aggregate.md")},
+        capture_output=True, text=True)
+    assert verified.returncode != 0
+    assert "Aggregate fast correctness coverage failed" in (tmp_path / "aggregate.md").read_text()
+    assert "test_touched" in (tmp_path / "aggregate.md").read_text()
 
 
 def test_fast_platform_exclusions_require_actual_coverage_elsewhere(tmp_path):

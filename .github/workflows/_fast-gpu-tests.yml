@@ -46,6 +46,7 @@ jobs:
         uses: ./.github/actions/install-torchao
         with:
           platform: ${{ inputs.platform }}
+          defer-verification: "true"
       - name: Install CUDA headers for AOTInductor
         if: inputs.platform == 'h100'
         run: |
@@ -58,6 +59,8 @@ jobs:
           wheel-url: ${{ inputs.wheel_url }}
           wheel-filename: ${{ inputs.wheel_filename }}
           wheel-sha256: ${{ inputs.wheel_sha256 }}
+      - name: Verify torchao after Triton installation
+        run: python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run fast correctness tests
         env:
           PLATFORM: ${{ inputs.platform }}
