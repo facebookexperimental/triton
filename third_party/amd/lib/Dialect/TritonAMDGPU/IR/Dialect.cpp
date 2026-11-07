@@ -1719,6 +1719,23 @@ LogicalResult ScheduledMfmaScaledOp::verify() {
   if (!isScaledFormat(getBFormat()))
     return emitOpError("b_format must be one of \"e4m3\", \"e5m2\", \"e2m3\", "
                        "\"e3m2\", \"e2m1\"");
+  auto aScaleTy = getAScale().getType();
+  auto bScaleTy = getBScale().getType();
+  bool packedScales = aScaleTy.getElementType().isInteger(32);
+  if (packedScales != bScaleTy.getElementType().isInteger(32))
+    return emitOpError(
+        "scale operands must use matching i8 or packed i32 storage");
+  auto aSelector = getAScaleSelectorAttr();
+  auto bSelector = getBScaleSelectorAttr();
+  if (packedScales) {
+    if (!aSelector || !bSelector || aSelector.getInt() < 0 ||
+        aSelector.getInt() > 3 || bSelector.getInt() < 0 ||
+        bSelector.getInt() > 3)
+      return emitOpError(
+          "packed i32 scales require both byte selectors in [0, 3]");
+  } else if (aSelector || bSelector) {
+    return emitOpError("i8 scales do not accept packed byte selectors");
+  }
   if (getAccumulatorRole() != "transient")
     return emitOpError(
         "accumulator_role must be \"transient\": persistent scaled MFMA "
@@ -1823,19 +1840,37 @@ LogicalResult ScheduledMfmaScaledOp::verify() {
     return emitOpError(
         "accumulator ownership does not match the native MFMA grid");
 
-  auto aScaleTy = getAScale().getType();
-  auto bScaleTy = getBScale().getType();
   int64_t scaleK = logicalK / 32;
   if (aScaleTy.getRank() != 2 || bScaleTy.getRank() != 2 ||
-      !aScaleTy.getElementType().isInteger(8) ||
-      !bScaleTy.getElementType().isInteger(8))
-    return emitOpError("requires rank-2 i8 E8M0 scale tensors");
-  if (aScaleTy.getShape() != ArrayRef<int64_t>({aTy.getShape()[0], scaleK}) ||
-      bScaleTy.getShape() != ArrayRef<int64_t>({bTy.getShape()[1], scaleK}))
+      (!packedScales && (!aScaleTy.getElementType().isInteger(8) ||
+                         !bScaleTy.getElementType().isInteger(8))))
+    return emitOpError("requires rank-2 i8 or packed i32 E8M0 scale tensors");
+  if (!packedScales &&
+      (aScaleTy.getShape() != ArrayRef<int64_t>({aTy.getShape()[0], scaleK}) ||
+       bScaleTy.getShape() != ArrayRef<int64_t>({bTy.getShape()[1], scaleK})))
     return emitOpError(
         "scale shapes must be [M, logicalK/32] and [N, logicalK/32]");
   // Conversion assumes the MFMA scale layout register order (non-K tiles,
   // then K steps): one scale byte per tile-step per lane.
+  if (packedScales) {
+    bool fp8 = (getAFormat() == "e4m3" || getAFormat() == "e5m2") &&
+               (getBFormat() == "e4m3" || getBFormat() == "e5m2");
+    if (!fp8 || instrShape != ArrayRef<unsigned>({32, 32, 64}) ||
+        (steps != 1 && steps != 2) || repM != 1 || repN != 1)
+      return emitOpError(
+          "packed i32 scales require one or two native FP8 32x32x64 steps "
+          "and one output fragment per wave");
+    int64_t maxBaseSelector = steps == 2 ? 1 : 3;
+    if (aSelector.getInt() > maxBaseSelector ||
+        bSelector.getInt() > maxBaseSelector)
+      return emitOpError(
+          "packed i32 scale selectors must leave two bytes for each K64 "
+          "step in the chain");
+    if (ttg::getTotalElemsPerThread(aScaleTy) != 1 ||
+        ttg::getTotalElemsPerThread(bScaleTy) != 1)
+      return emitOpError("packed i32 scales require one dword per lane");
+    return success();
+  }
   if (ttg::getTotalElemsPerThread(aScaleTy) != repM * steps ||
       ttg::getTotalElemsPerThread(bScaleTy) != repN * steps)
     return emitOpError(
