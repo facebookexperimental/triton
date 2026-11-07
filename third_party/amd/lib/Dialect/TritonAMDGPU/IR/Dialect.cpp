@@ -1845,8 +1845,11 @@ LogicalResult ScheduledMfmaScaledOp::verify() {
       (!packedScales && (!aScaleTy.getElementType().isInteger(8) ||
                          !bScaleTy.getElementType().isInteger(8))))
     return emitOpError("requires rank-2 i8 or packed i32 E8M0 scale tensors");
-  if (aScaleTy.getShape() != ArrayRef<int64_t>({aTy.getShape()[0], scaleK}) ||
-      bScaleTy.getShape() != ArrayRef<int64_t>({bTy.getShape()[1], scaleK}))
+  if (!packedScales &&
+      (aScaleTy.getShape() !=
+           ArrayRef<int64_t>({aTy.getShape()[0], scaleK}) ||
+       bScaleTy.getShape() !=
+           ArrayRef<int64_t>({bTy.getShape()[1], scaleK})))
     return emitOpError(
         "scale shapes must be [M, logicalK/32] and [N, logicalK/32]");
   // Conversion assumes the MFMA scale layout register order (non-K tiles,
@@ -1854,11 +1857,17 @@ LogicalResult ScheduledMfmaScaledOp::verify() {
   if (packedScales) {
     bool fp8 = (getAFormat() == "e4m3" || getAFormat() == "e5m2") &&
                (getBFormat() == "e4m3" || getBFormat() == "e5m2");
-    if (!fp8 || instrShape != ArrayRef<unsigned>({32, 32, 64}) || steps != 1 ||
-        repM != 1 || repN != 1)
+    if (!fp8 || instrShape != ArrayRef<unsigned>({32, 32, 64}) ||
+        (steps != 1 && steps != 2) || repM != 1 || repN != 1)
       return emitOpError(
-          "packed i32 scales require one native FP8 32x32x64 step and one "
-          "output fragment per wave");
+          "packed i32 scales require one or two native FP8 32x32x64 steps "
+          "and one output fragment per wave");
+    int64_t maxBaseSelector = steps == 2 ? 1 : 3;
+    if (aSelector.getInt() > maxBaseSelector ||
+        bSelector.getInt() > maxBaseSelector)
+      return emitOpError(
+          "packed i32 scale selectors must leave two bytes for each K64 "
+          "step in the chain");
     if (ttg::getTotalElemsPerThread(aScaleTy) != 1 ||
         ttg::getTotalElemsPerThread(bScaleTy) != 1)
       return emitOpError("packed i32 scales require one dword per lane");
