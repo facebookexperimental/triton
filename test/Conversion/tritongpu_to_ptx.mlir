@@ -398,9 +398,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
   }
 
   // CHECK-LABEL: bf16_to_fp8_rtne_intermediate(
-  // SM80: mov.u32 fp8_min, 0x38003800;
-  // SM80: mov.u32 fp8_max, 0x57e057e0;
-  // SM80: prmt.b32 sign, sign0, sign1, 0x7531;
+  // #11924 routes bf16->e5m2 on SM80 through an f16 intermediate plus the
+  // new software PTX sequence (no fp8_min/fp8_max prologue anymore).
+  // SM80: cvt.f32.bf16
+  // SM80: cvt.rn.f16x2.f32
+  // SM80: min.f16x2
+  // SM80: prmt.b32 {{.*}}, {{.*}}, {{.*}}, 0x7531;
   // SM90: cvt.rn.satfinite.e5m2x2.f32
   // SM100: cvt.rn.satfinite.e5m2x2.f32
   tt.func public @bf16_to_fp8_rtne_intermediate(%out: tensor<256x!tt.ptr<f8E5M2>, #blocked>, %arg: tensor<256xbf16, #blocked>) {
