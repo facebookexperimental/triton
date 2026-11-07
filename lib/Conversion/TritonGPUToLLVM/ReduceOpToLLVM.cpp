@@ -761,9 +761,13 @@ private:
     Region &combineRegion =
         vectorCombineRegion ? *vectorCombineRegion : op.getCombineOp();
 
-    Operation &combinerOp = combineRegion.front().front();
+    Operation *combinerOp = vectorCombineRegion
+                                ? &vectorCombineRegion->front().front()
+                                : op.getSingleCombiner();
     unsigned arity =
-        enableTreeReduction ? targetInfo.getReductionTreeArity(&combinerOp) : 1;
+        !enableTreeReduction
+            ? 1
+            : (combinerOp ? targetInfo.getReductionTreeArity(combinerOp) : 2);
     // Chunk only long scalar fadd folds: several register-contiguous spans can
     // otherwise form a high-pressure dependency chain. With one or two spans,
     // there is no repeated cross-span fold to break. Keep other combiners flat
