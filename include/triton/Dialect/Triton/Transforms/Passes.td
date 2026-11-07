@@ -194,14 +194,16 @@ def TritonNpotPad : Pass<"triton-npot-pad", "mlir::ModuleOp"> {
     Runs only under TRITON_ALLOW_NPOT, just before ConvertTritonToTritonGPU.
     It finds the NPOT tensors connected through their ops (a connected component
     of the def-use graph). A connected component keeps its shape when every
-    op in it lowers a Product layout and every value's Product layout, the one
-    ConvertTritonToTritonGPU gives it under the same options, keeps its padded
-    shape's global vector and wastes fewer slots (registers x lanes x warps)
-    than the default Blocked layout of its padded shape. In every other
-    connected component, each tensor dim that is not a power of two is widened
-    to the next power of two, and pad lanes are kept away from memory and from
-    live results. An op the pass cannot pad fails to compile with an error and
-    leaves the IR unchanged.
+    op in it lowers a mixed-radix layout and every value's mixed-radix layout,
+    the one ConvertTritonToTritonGPU gives it under the same options, keeps its
+    padded shape's global vector and wastes less total in-dim size (registers x
+    lanes x warps) than the default Blocked layout of its padded shape. In every
+    other connected component, each tensor dim that is not a power of two is
+    widened to the next power of two, and pad lanes are kept away from memory
+    and from live results. An op the pass cannot pad fails to compile with an
+    error and leaves the IR unchanged. A connected component holding
+    tt.atomic_cas, which has no padded lowering, keeps its shape whenever every
+    op in it lowers a mixed-radix layout.
   }];
 
   let dependentDialects = [
