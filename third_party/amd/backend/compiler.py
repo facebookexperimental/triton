@@ -770,7 +770,7 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         if knobs.language.allow_npot:
-            passes.ttir.add_npot_pad(pm, options.num_warps, options.warp_size, options.num_ctas)
+            passes.ttir.add_npot_pad(pm, options.num_warps, options.warp_size, options.num_ctas, f"hip:{options.arch}")
         passes.ttir.add_convert_to_ttgpuir(
             pm,
             f"hip:{options.arch}",
