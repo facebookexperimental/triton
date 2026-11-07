@@ -111,6 +111,23 @@ std::optional<std::string>
 getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
                              bool twoCTAs, unsigned m, unsigned n);
 
+// The tcgen05 kind that issues an MMA on `t` operands.
+std::optional<Tcgen05Kind> getTcgen05Kind(Type t);
+
+// The K of one unscaled tcgen05.mma: 32 bytes, or 64 for 8-bit operands with
+// 2x fp8 at blockM=128 when 64 divides `k`.
+unsigned getTcgen05InstrK(unsigned bitwidth, unsigned blockM, int64_t k,
+                          bool supports2xFp8);
+
+// Why an NPOT per-CTA accumulator tile can't be issued as tcgen05 tiles of
+// blockM x min(blockN, N) x instruction K, or nullopt if it can. NPOT M, NPOT N
+// at blockM=64 and block-scaled NPOT K aren't lowered.
+std::optional<std::string>
+getNpotMMAv5TileUnsupportedReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
+                                  bool twoCTAs, unsigned blockM,
+                                  unsigned blockN, ArrayRef<int64_t> ctaShape,
+                                  int64_t k, unsigned bitwidth);
+
 // Returns the required ordering of repeated TMEM scale blocks for one
 // tcgen05 scaled-MMA operand.
 TensorMemoryScalesBlockRepOrder getTensorMemoryScalesBlockRepOrder(

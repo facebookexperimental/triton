@@ -140,8 +140,8 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
       return emitError()
              << "shape must have power-of-2 and non-zero dimensions; got "
              << shape;
-    // A shared allocation with an NPOT tile is laid out and sized as its
-    // power-of-two cover, which verifyNpotPow2AllocView checks it holds.
+    // A shared allocation with an NPOT tile is laid out on its power-of-two
+    // cover, whose footprint verifyNpotPow2AllocView checks it holds.
     if (!(npotCoverAllocShape && isa<SharedEncodingTrait>(encoding)) &&
         !hasPow2MemDescLayoutShape(encoding, allocShape))
       return emitError()
@@ -204,6 +204,14 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
              << "shared-memory element type bit width must be a multiple of 8; "
                 "got "
              << bitwidth;
+    // Its layout is cut to the cover shape, which keeps whole digits only at
+    // power-of-two extents.
+    if (isa<SharedLinearEncodingAttr>(encoding) &&
+        !llvm::all_of(getNpotPow2AllocShape(dropPipeliningDim(allocShape, enc)),
+                      llvm::isPowerOf2_64))
+      return emitError() << "shared linear encoding needs power-of-two layout "
+                            "dimensions; got "
+                         << allocShape;
   } else if (auto enc = dyn_cast<nvidia_gpu::TensorMemoryScalesEncodingAttr>(
                  encoding)) {
     if (memorySpace != nvidia_gpu::TensorMemorySpaceAttr::get(ctx)) {
