@@ -164,7 +164,8 @@ static Value
 getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
                           bool allowTranspose, bool isMMAv5Fp4Padded = false,
                           bool forceTranspose = false,
-                          Operation *op = nullptr /*only for diagnostic*/) {
+                          Operation *op = nullptr /*only for diagnostic*/,
+                          bool pow2AllocSwizzle = false) {
   OpBuilder::InsertionGuard g(rewriter);
   Value arg = v;
   while (auto cvtOp = arg.getDefiningOp<ConvertLayoutOp>())
@@ -200,8 +201,13 @@ getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
   Attribute SharedMemorySpace =
       SharedMemorySpaceAttr::get(argType.getContext());
   auto CGALayout = getCGALayout(argType.getEncoding());
+  // An NPOT allocation is laid out as its pow2 alloc shape, whose rows can hold
+  // a K=96 step that the NPOT rows would split.
+  SmallVector<int64_t> swizzleShape(argType.getShape());
+  if (pow2AllocSwizzle)
+    swizzleShape = getNpotPow2AllocShape(swizzleShape);
   auto newLayout = NVMMASharedEncodingAttr::get(
-      argType.getContext(), argType.getShape(), newOrder, CGALayout,
+      argType.getContext(), swizzleShape, newOrder, CGALayout,
       argType.getElementType(), isMMAv5Fp4Padded);
   auto newType = MemDescType::get(argType.getShape(), argType.getElementType(),
                                   newLayout, SharedMemorySpace);
@@ -361,10 +367,11 @@ static Value createTmemScaleOperand(Value tensor, Attribute tmemEncoding,
                                     Attribute tensorMemorySpace, int numWarps,
                                     Location loc, PatternRewriter &rewriter) {
   auto tensorType = cast<RankedTensorType>(tensor.getType());
+  // An NPOT K's 3 or 6 scale columns sit in the pow2 alloc shape's allocation.
   auto tmemType =
       MemDescType::get(tensorType.getShape(), tensorType.getElementType(),
-                       tmemEncoding, tensorMemorySpace,
-                       /*mutableMemory=*/false);
+                       tmemEncoding, tensorMemorySpace, /*mutableMemory=*/false,
+                       getNpotPow2AllocShape(tensorType.getShape()));
   auto tmemLayout = nvidia_gpu::getDefaultLayoutForTmemLdSt(tmemType, numWarps);
   auto stagedType = tensorType.cloneWithEncoding(tmemLayout);
   Value converted = ConvertLayoutOp::create(rewriter, loc, stagedType, tensor);
@@ -962,7 +969,10 @@ static bool isTcgen05ScaledDot(DotScaledOp dotOp, int computeCapability,
                                int numWarps) {
   if (dotOp.getAScale() == nullptr || dotOp.getBScale() == nullptr)
     return false;
-  auto retShapePerCTA = getShapePerCTA(dotOp.getType());
+  // The pad pass asks before layouts are assigned.
+  RankedTensorType retType = dotOp.getType();
+  auto retShapePerCTA = retType.getEncoding() ? getShapePerCTA(retType)
+                                              : to_vector(retType.getShape());
   if (computeCapability < 100 || computeCapability >= 120)
     return false;
   if (numWarps != 4 && numWarps != 8)
@@ -1077,18 +1087,23 @@ public:
         (IsBMixedPrecFp4 &&
          (requiresFp4Padding || blockK == 32 || !dotOp.getRhsKPack()));
 
+    bool k96 = isFp4MMA && !hasMNMajorFp4Operand &&
+               nvidia_gpu::getTcgen05InstrK(
+                   4, 128, blockK, false,
+                   nvidia_gpu::TargetFeatures(computeCapability)
+                       .supportsK96Tcgen05MMA()) == 96;
     // For mixed-precision fp4 operands, set allowTranspose = false, to force
     // the packed axis, K, to be contiguous in SMEM
     a = getSharedMemoryMMAOperand(a, rewriter, 0,
                                   /*allowTranspose=*/!isAFP4,
                                   /*isMMAv5Fp4Padded=*/isMMAv5Fp4PaddedLhs,
                                   /*forceTranspose=*/!dotOp.getLhsKPack(),
-                                  dotOp);
+                                  dotOp, /*pow2AllocSwizzle=*/k96);
     b = getSharedMemoryMMAOperand(b, rewriter, 1,
                                   /*allowTranspose=*/!isBFP4,
                                   /*isMMAv5Fp4Padded=*/isMMAv5Fp4PaddedRhs,
                                   /*forceTranspose=*/!dotOp.getRhsKPack(),
-                                  dotOp);
+                                  dotOp, /*pow2AllocSwizzle=*/k96);
 
     MLIRContext *context = dotOp->getContext();
     unsigned m = 128;
@@ -1412,6 +1427,30 @@ getTcgen05UnsupportedReason(DotOp dot, nvidia_gpu::Tcgen05Kind kind,
   return std::nullopt;
 }
 
+// The same rule for the tile ScaledBlockedToMMAv5 issues at blockM=128: an FP4
+// kind for E2M1 x E2M1, else mxf8f6f4 with B's order not yet known.
+std::optional<std::string>
+getTcgen05ScaledUnsupportedReason(DotScaledOp dot, int computeCapability,
+                                  int numWarps) {
+  ArrayRef<int64_t> shape = dot.getType().getShape();
+  TypedValue<RankedTensorType> aScale = dot.getAScale();
+  bool isAFP4 = dot.getAElemType() == ScaleDotElemType::E2M1;
+  bool fp4 = isAFP4 && dot.getBElemType() == ScaleDotElemType::E2M1;
+  int64_t k = dot.getA().getType().getShape().back() * (isAFP4 ? 2 : 1);
+  // The pattern pads an MN-packed FP4 operand, and UE5M3 (block16 i8) A
+  // scales aren't issued exact yet.
+  if (!isTcgen05ScaledDot(dot, computeCapability, numWarps) ||
+      !dot.getLhsKPack() || !dot.getRhsKPack() ||
+      (aScale.getType().getElementType().isInteger(8) &&
+       aScale.getType().getShape().back() * 16 == k))
+    return std::string("NPOT dot_scaled is not yet supported off tcgen05");
+  return nvidia_gpu::getNpotMMAv5TileUnsupportedReason(
+      nvidia_gpu::Tcgen05Kind::BlockScaled, /*aInTmem=*/false,
+      /*bMNMajor=*/!fp4, dot.getTwoCtas(), 128,
+      std::min<int64_t>(shape[1], 256), shape, k, fp4 ? 4 : 8,
+      nvidia_gpu::TargetFeatures(computeCapability).supportsK96Tcgen05MMA());
+}
+
 struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   using NpotTargetLegality::NpotTargetLegality;
   StringRef getTargetPrefix() const override { return "cuda"; }
@@ -1434,6 +1473,10 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
                 dot.getA().getType().getElementType()))
           return getTcgen05UnsupportedReason(dot, *kind, numWarps);
     }
+    auto scaled = dyn_cast<DotScaledOp>(op);
+    if (scaled && computeCapability >= 100 && computeCapability < 120)
+      return getTcgen05ScaledUnsupportedReason(scaled, computeCapability,
+                                               numWarps);
     return ("NPOT dot is not yet supported on " + target).str();
   }
   std::optional<std::string>
