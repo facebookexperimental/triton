@@ -1180,15 +1180,18 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
     packed K layout needs a radix-3 repeat for FP6 that landed
     LinearLayout cannot express yet, so v1 uses this padded form; each
     lane feeds the packed bytes (8/6/4 x i32) per step through kWidth=8
-    dot-operand windows. `a_scale` and
-    `b_scale` hold one E8M0 byte per 32 logical values: shapes are
-    [M, logicalK/32] and [N, logicalK/32] in i8 storage.
+    dot-operand windows. `a_scale` and `b_scale` normally hold one E8M0 byte
+    per 32 logical values: shapes are [M, logicalK/32] and [N, logicalK/32]
+    in i8 storage. A single native FP8 step may instead consume one packed
+    i32 scale word per lane. In that form, `a_scale_selector` and
+    `b_scale_selector` select the first E8M0 byte passed to the instruction
+    without extracting it first. A two-step K128 chain reuses the word and
+    adds two to each selector for its second K64 instruction.
 
-    Only the transient contract is supported today: `accumulator_role` must
-    be "transient", `resident_operand` must be "none", and
-    `accumulator_register_class` must be "auto"; persistent scaled chains
-    and their register pinning are not modeled yet. Completion is
-    represented separately by `mfma_commit`, as in `scheduled_mfma`:
+    Packed-storage I8 operands use the transient contract. Typed FP8 dot
+    operands also support persistent accumulator chains and explicit AGPR or
+    VGPR placement, matching `scheduled_mfma`. Completion is represented
+    separately by `mfma_commit`:
     `mfma_commit` accepts the scaled 16x16x128 and 32x32x64 accumulator
     layouts (and live scaled i8 dot operands) and applies the modeled
     scaled drain wait at the boundary.
@@ -1200,7 +1203,8 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
       TT_Tensor:$a_scale, TT_Tensor:$b_scale, StrAttr:$a_format,
       StrAttr:$b_format, StrAttr:$resident_operand,
       StrAttr:$accumulator_role, StrAttr:$accumulator_register_class,
-      BoolAttr:$initialize);
+      BoolAttr:$initialize, OptionalAttr<I32Attr>:$a_scale_selector,
+      OptionalAttr<I32Attr>:$b_scale_selector);
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{

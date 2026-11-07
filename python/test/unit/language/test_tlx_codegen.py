@@ -1987,6 +1987,33 @@ def _extract_slice_kernel(x_ptr, y_ptr):
 
 
 @triton.jit
+def _concat_fragments(low, high):
+    return tlx.amd_concat((low, high), [16, 64])
+
+
+@triton.jit
+def _amd_concat_kernel(x_ptr, y_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    cols = tl.arange(0, 32)
+    low = tl.load(x_ptr + rows[:, None] * 64 + cols[None, :])
+    high = tl.load(x_ptr + rows[:, None] * 64 + cols[None, :] + 32)
+    low = tlx.require_layout(low, dot0)
+    high = tlx.require_layout(high, dot0)
+    values = _concat_fragments(low, high)
+    out_cols = tl.arange(0, 64)
+    out_ptrs = y_ptr + rows[:, None] * 64 + out_cols[None, :]
+    out_ptrs = tlx.require_layout(out_ptrs, dot0, pin=False)
+    tl.store(out_ptrs, values)
+
+
+@triton.jit
 def _rematerialized_range_kernel(x_ptr, y_ptr):
     load_rows = tlx.rematerialized_range(0, 64, identity=0)
     load_cols = tlx.rematerialized_range(0, 64, identity=1)
@@ -4106,6 +4133,17 @@ def test_extract_slice_compiles_gfx950():
         constexprs={},
     )
     assert "amdg.extract_slice" in compiled.asm["ttir"]
+    assert "amdgcn" in compiled.asm
+
+
+def test_amd_concat_compiles_across_helper_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_concat_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
+        constexprs={},
+    )
+    concat_ir = next(line for line in compiled.asm["ttir"].splitlines() if "amdg.concat" in line)
+    assert ", #" in concat_ir.split("->", 1)[1]
     assert "amdgcn" in compiled.asm
 
 
