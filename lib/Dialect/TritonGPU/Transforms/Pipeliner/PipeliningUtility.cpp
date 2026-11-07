@@ -21,6 +21,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <queue>
@@ -979,6 +980,7 @@ bool triton::isLoopTripCountKnownPositive(scf::ForOp loop,
   return false;
 }
 
+// FB Change: Meta AutoWS warp-specialization predicates.
 bool mlir::triton::requestsMetaWarpSpecialization(Operation *op) {
   return op->getAttrOfType<DenseI32ArrayAttr>(ttg::kAsyncTaskIdAttrName) ||
          op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName) ||
@@ -1000,11 +1002,23 @@ bool mlir::triton::isMetaWarpSpecializedFunc(triton::FuncOp funcOp) {
   return containsMetaWarpSpecializationRequest(funcOp);
 }
 
-bool mlir::triton::isMetaWarpSpecializedLoop(scf::ForOp forOp) {
-  for (Operation *op = forOp->getParentOp(); op; op = op->getParentOp()) {
-    if (op->hasAttr(kWarpSpecializeAttrName) ||
-        isa<ttg::WarpSpecializeOp, ttg::WarpSpecializePartitionsOp>(op))
-      return true;
-  }
-  return containsMetaWarpSpecializationRequest(forOp);
+bool mlir::triton::requestsMetaWarpSpecialization(ModuleOp mod) {
+  return mod
+      ->walk([](Operation *op) {
+        return isa<ttg::WarpSpecializeOp>(op) ||
+                       triton::requestsMetaWarpSpecialization(op)
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+bool mlir::triton::isMetaWSEnabled(Operation *op) {
+  auto mod = dyn_cast<ModuleOp>(op);
+  if (!mod)
+    mod = op->getParentOfType<ModuleOp>();
+  if (mod)
+    if (auto attr = mod->getAttrOfType<BoolAttr>("ttg.use_meta_ws"))
+      return attr.getValue();
+  return triton::tools::getBoolEnv("TRITON_USE_META_WS");
 }

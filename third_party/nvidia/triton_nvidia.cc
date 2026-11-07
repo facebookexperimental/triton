@@ -8,6 +8,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/IR/Constants.h"
@@ -291,8 +292,8 @@ void init_triton_hopper_passes(py::module_ &m) {
                             bool, int, bool, int, bool);
   ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
                             mlir::createNVGPUWSDataPartition, int);
-  ADD_PASS_OPTION_WRAPPER_1("add_tma_store_lowering",
-                            mlir::createNVGPUWSTMAStoreLowering, bool);
+  ADD_PASS_WRAPPER_0("add_tma_store_lowering",
+                     mlir::createNVGPUWSTMAStoreLowering);
   ADD_PASS_WRAPPER_0("add_sink_broadcast", mlir::createNVGPUSinkBroadcast);
   ADD_PASS_WRAPPER_0("add_tma_store_token_wait_lowering",
                      mlir::createNVGPUTMAStoreTokenWaitLowering);
@@ -391,6 +392,10 @@ void init_triton_nvidia(py::module_ &m) {
     mlir::registerNVVMDialectTranslation(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
+  });
+
+  m.def("requests_warp_specialization", [](mlir::ModuleOp &mod) {
+    return mlir::triton::requestsMetaWarpSpecialization(mod);
   });
 
   // TODO: could be done in python if we had a generic interface to set metadata

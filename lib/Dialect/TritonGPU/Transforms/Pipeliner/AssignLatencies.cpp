@@ -411,12 +411,7 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
     AssignLoadLatencies(forOp, numStages, opLatency).run();
-    // Meta-WS latencies (e.g. zero latency for loop-carried MMA results) assume
-    // the loop's producers and consumers end up in separate partitions; other
-    // loops keep the regular software-pipeline latencies.
-    AssignMMALatencies(forOp, opLatency,
-                       useMetaWS && isMetaWarpSpecializedLoop(forOp))
-        .run();
+    AssignMMALatencies(forOp, opLatency, useMetaWS).run();
   }
   serializeLatencies(moduleOp, opLatency);
 }

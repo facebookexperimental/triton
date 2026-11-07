@@ -211,6 +211,7 @@ void removePipeliningAttributes(ModuleOp moduleOp);
 // dominate it, proves nothing about the trip count.
 bool isLoopTripCountKnownPositive(scf::ForOp loop, DominanceInfo &domInfo);
 
+// FB Change: Meta AutoWS warp-specialization predicates.
 // Whether `op` asks Meta AutoWS to warp-specialize it: a loop marked
 // tt.warp_specialize, or an op already assigned to a partition.
 bool requestsMetaWarpSpecialization(Operation *op);
@@ -219,12 +220,14 @@ bool requestsMetaWarpSpecialization(Operation *op);
 // requests warp specialization. The hopper warpspec pass skips other functions.
 bool isMetaWarpSpecializedFunc(triton::FuncOp funcOp);
 
-// Whether Meta AutoWS warp-specializes this loop: it or an op in it requests
-// warp specialization, an enclosing op carries tt.warp_specialize, or it sits
-// inside a warp_specialize region. TRITON_USE_META_WS is a global knob; the
-// Meta-WS latency and scheduling choices only suit loops it actually
-// specializes.
-bool isMetaWarpSpecializedLoop(scf::ForOp forOp);
+// Whether the module requests Meta AutoWS or is already warp-specialized (e.g.
+// TLX ttg.warp_specialize regions). With TRITON_USE_META_WS on, a module that is
+// neither compiles as with the knob off.
+bool requestsMetaWarpSpecialization(ModuleOp mod);
+
+// Whether `op`'s module compiles with Meta AutoWS: the module's ttg.use_meta_ws
+// attribute, which make_ttgir sets per module, else TRITON_USE_META_WS.
+bool isMetaWSEnabled(Operation *op);
 } // namespace triton
 } // namespace mlir
 
