@@ -27,7 +27,16 @@ struct TMemLdStEncodingInfo {
   bool unpacked = false;
   unsigned vec = 1;
   bool padding = false;
+  // An NPOT K of scales moves as its pow2 alloc shape: entry r is the register
+  // that holds padded register r, or -1 past K.
+  SmallVector<int32_t> npotPaddedRegs;
 };
+
+// The pow2 column chunk that an NPOT TMEM view of N = c * q (q odd) moves q
+// times, or failure (with the reason) if that plan doesn't cover `memTy`.
+FailureOr<gpu::MemDescType>
+getNpotTMemChunkType(gpu::MemDescType memTy,
+                     std::function<InFlightDiagnostic()> emitError = {});
 
 FailureOr<TMemLdStEncodingInfo>
 computeTMemLdStEncodingInfo(RankedTensorType regTy, gpu::MemDescType memTy,

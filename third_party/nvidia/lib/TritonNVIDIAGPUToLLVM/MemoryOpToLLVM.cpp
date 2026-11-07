@@ -13,6 +13,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
 #include "triton/Tools/LayoutUtils.h"
 namespace {
 
@@ -82,7 +83,8 @@ LogicalResult lowerLdStMatrix(
   auto *ctx = loc.getContext();
   assert(regLayout.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
          "expected register broadcasting to be removed by the caller");
-  if (isa<PaddedSharedEncodingAttr>(memDescType.getEncoding())) {
+  if (isa<PaddedSharedEncodingAttr>(memDescType.getEncoding()) ||
+      !regLayout.isRadix2()) {
     return failure();
   }
   if (SharedMemoryObject::getMaskSpanOffsetsAndBlocks(memDescType).second !=
@@ -113,6 +115,150 @@ LogicalResult lowerLdStMatrix(
   return failure();
 }
 
+// A pow2 region of a mixed-radix buffer at a region-aligned start: the start's
+// offset and the region's own shared layout, if the region's offsets are that
+// offset plus a bijective radix-2 map.
+static std::optional<std::pair<int32_t, LinearLayout>>
+getMixedRadixRegionLayout(const LinearLayout &toOffset, ArrayRef<int32_t> start,
+                          ArrayRef<int64_t> region) {
+  MLIRContext *ctx = (*toOffset.getInDimNames().begin()).getContext();
+  auto dims = llvm::to_vector(toOffset.getInDimNames());
+  auto offsetAt = [&](ArrayRef<int32_t> coords) {
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    for (auto [dim, s, c] : llvm::zip_equal(dims, start, coords))
+      ins.push_back({dim, s + c});
+    return toOffset.apply(ins)[0].second;
+  };
+  int32_t base = offsetAt(SmallVector<int32_t>(region.size(), 0));
+  int32_t numel = product(region);
+  std::vector<std::pair<StringAttr, std::vector<std::vector<int32_t>>>> bases;
+  for (auto [d, dim] : llvm::enumerate(dims)) {
+    std::vector<std::vector<int32_t>> dimBases;
+    for (int32_t bit = 1; bit < region[d]; bit *= 2) {
+      SmallVector<int32_t> coords(region.size(), 0);
+      coords[d] = bit;
+      int32_t delta = offsetAt(coords) - base;
+      if (delta < 0 || delta >= numel)
+        return std::nullopt;
+      dimBases.push_back({delta, 0});
+    }
+    bases.push_back({dim, std::move(dimBases)});
+  }
+  LinearLayout toRegionOffset(bases,
+                              {{StringAttr::get(ctx, "offset"), numel},
+                               {StringAttr::get(ctx, "block"), 1}},
+                              /*requireSurjective=*/false);
+  if (!toRegionOffset.isInvertible())
+    return std::nullopt;
+  for (int32_t i = 0; i < numel; ++i) {
+    SmallVector<int32_t> coords;
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    int32_t rest = i;
+    for (auto [dim, size] : llvm::zip_equal(dims, region)) {
+      coords.push_back(rest % size);
+      ins.push_back({dim, coords.back()});
+      rest /= size;
+    }
+    if (offsetAt(coords) - base != toRegionOffset.apply(ins)[0].second)
+      return std::nullopt;
+  }
+  return std::make_pair(base, toRegionOffset.invert());
+}
+
+// Each chunk is a pow2 view of a pow2 region of the buffer, so it loads as a
+// padded operand's view does: ldmatrix, else the radix-2 path.
+LogicalResult lowerPow2Chunks(Location loc,
+                              const nvidia_gpu::Pow2Chunks &chunks,
+                              MemDescType memDescType, SmallVector<Value> &vals,
+                              const SharedMemoryObject &smemObj, Operation *op,
+                              ConversionPatternRewriter &rewriter,
+                              const NVIDIA::TargetInfo &targetInfo,
+                              const LLVMTypeConverter *typeConverter) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  MLIRContext *ctx = loc.getContext();
+  ArrayRef<int64_t> allocShape = memDescType.getAllocShape();
+  size_t rank = chunks.starts.front().size();
+  auto getChunkTy = [&](Attribute encoding, ArrayRef<int64_t> region) {
+    SmallVector<int64_t> chunkAlloc(allocShape.drop_back(rank));
+    llvm::append_range(chunkAlloc, region);
+    return MemDescType::get(
+        llvm::to_vector_of<int64_t>(chunks.layout.getOutDimSizes()),
+        memDescType.getElementType(), encoding, memDescType.getMemorySpace(),
+        memDescType.getMutableMemory(), chunkAlloc);
+  };
+  // A radix-2 buffer is one region. A dense allocation's panels sit rows x
+  // width apart, not at the cover's row stride, so a mixed-radix one is viewed
+  // a pow2 block at a time.
+  Attribute encoding = memDescType.getEncoding();
+  SmallVector<int64_t> region;
+  std::optional<LinearLayout> toOffset;
+  if (isa<PaddedSharedEncodingAttr>(encoding)) {
+    region = getNpotPow2AllocShape(allocShape.take_back(rank));
+  } else {
+    LinearLayout memLayout = toLinearLayout(memDescType);
+    for (int32_t size : memLayout.getOutDimSizes())
+      region.push_back(memLayout.isRadix2() ? size
+                                            : LinearLayout::twoPartOf(size));
+    if (memLayout.isRadix2())
+      encoding = SharedLinearEncodingAttr::get(
+          ctx, std::move(memLayout),
+          cast<SharedEncodingTrait>(encoding).getAlignment());
+    else
+      toOffset = memLayout.pseudoinvert();
+  }
+  // Each chunk's region offset, region type and start within the region.
+  SmallVector<std::tuple<int32_t, MemDescType, SmallVector<int32_t>>> views;
+  std::map<SmallVector<int32_t>, std::pair<int32_t, MemDescType>> regions;
+  for (ArrayRef<int32_t> start : chunks.starts) {
+    if (!toOffset) {
+      views.push_back(
+          {0, getChunkTy(encoding, region), llvm::to_vector(start)});
+      continue;
+    }
+    SmallVector<int32_t> regionStart, inner;
+    for (auto [s, size] : llvm::zip_equal(start, region)) {
+      regionStart.push_back(s - s % size);
+      inner.push_back(s % size);
+    }
+    auto it = regions.find(regionStart);
+    if (it == regions.end()) {
+      auto view = getMixedRadixRegionLayout(*toOffset, regionStart, region);
+      if (!view)
+        return failure();
+      int32_t alignment = llvm::MinAlign(
+          cast<SharedEncodingTrait>(encoding).getAlignment(),
+          view->first * memDescType.getElementTypeBitWidth() / 8);
+      auto regionTy = getChunkTy(SharedLinearEncodingAttr::get(
+                                     ctx, std::move(view->second), alignment),
+                                 region);
+      it = regions.insert({regionStart, {view->first, regionTy}}).first;
+    }
+    views.push_back({it->second.first, it->second.second, inner});
+  }
+  Type llvmElemTy = typeConverter->convertType(memDescType.getElementType());
+  for (auto &[regionOffset, chunkTy, start] : views) {
+    Value base = smemObj.getBase();
+    if (regionOffset != 0)
+      base = b.gep(base.getType(), smemObj.getBaseElemType(), base,
+                   b.i32_val(regionOffset));
+    SmallVector<Value> offsets = smemObj.getOffsets();
+    for (auto [offset, s] :
+         llvm::zip(MutableArrayRef(offsets).take_back(rank), start))
+      offset = b.add(offset, b.i32_val(s));
+    SharedMemoryObject chunkObj(base, smemObj.getBaseElemType(), offsets);
+    SmallVector<Value> chunkVals;
+    if (failed(lowerLdStMatrix(loc, chunks.layout, chunkTy, chunkVals, chunkObj,
+                               rewriter, targetInfo, typeConverter)))
+      chunkVals = lowerLocalLdSt(
+          loc, ctx,
+          invertAndComposeLocal(toLinearLayoutIgnoringPadding(chunkTy),
+                                chunks.layout, {StringAttr::get(ctx, "block")}),
+          {}, llvmElemTy, chunkTy, chunkObj, rewriter, targetInfo, op);
+    llvm::append_range(vals, chunkVals);
+  }
+  return success();
+}
+
 struct LocalLoadOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::LocalLoadOp> {
 public:
@@ -141,6 +287,17 @@ public:
     auto result =
         lowerLdStMatrix(op.getLoc(), regLayout, memDescType, values, smemObj,
                         rewriter, targetInfo, getTypeConverter());
+    auto dot = dyn_cast<DotOperandEncodingAttr>(dstTy.getEncoding());
+    auto mma = dot ? dyn_cast<NvidiaMmaEncodingAttr>(dot.getParent()) : nullptr;
+    std::optional<nvidia_gpu::Pow2Chunks> chunks;
+    // A transposed operand loads in its pre-trans layout, not a dot operand.
+    bool ampere = mma ? mma.isAmpere() : targetInfo.getComputeCapability() < 90;
+    if (!regLayout.isRadix2() && ampere &&
+        (chunks = nvidia_gpu::getPow2Chunks(regLayout))) {
+      result =
+          lowerPow2Chunks(op.getLoc(), *chunks, memDescType, values, smemObj,
+                          op, rewriter, targetInfo, getTypeConverter());
+    }
     if (failed(result)) {
       return failure();
     }
