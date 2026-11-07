@@ -549,6 +549,15 @@ LogicalResult WarpGroupDotOp::verify() {
     return emitOpError("WGMMA result M dimension must be divisible by 64");
   if (retShapePerCTA[1] % 8 != 0)
     return emitOpError("WGMMA result N dimension must be divisible by 8");
+  unsigned instrN = nvmmaEnc.getInstrShape()[1];
+  if (!llvm::isPowerOf2_32(instrN)) {
+    MemDescType bTy = getB().getType();
+    std::optional<NvmmaSmemAttrs> attrs = getMmaOperandSmemAttrs(bTy);
+    if (attrs && !isMmaV3BTilingLegal(*attrs, bTy.getElementTypeBitWidth(),
+                                      instrN, retShapePerCTA[1]))
+      return emitOpError("WGMMA B operand has an n")
+             << instrN << " tile that starts inside a swizzle pattern";
+  }
 
   // Verify MMA version is supported for operands.
   int mmaVersion = nvmmaEnc.getVersionMajor();
