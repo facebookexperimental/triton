@@ -1,6 +1,6 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -verify-diagnostics
 
-// Legal NPOT N, unscaled and scaled; the pow2 N128 MMA is the control.
+// Legal NPOT N; the pow2 N128 MMA is the control. Block-scaled NPOT N isn't.
 #a = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #b = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #a8 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
@@ -20,6 +20,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
                  %p: i1) {
     ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>, !ttg.memdesc<64x96xf16, #b, #ttg.shared_memory, 64x128>, !ttg.memdesc<128x96xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
     ttng.tc_gen5_mma %a, %b128, %c128, %p, %p : !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>, !ttg.memdesc<64x128xf16, #b, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    // expected-error @+1 {{NPOT MMAv5 block-scaled N is not yet supported}}
     ttng.tc_gen5_mma_scaled %a8, %b8, %c, %sa, %sb, %p, %p lhs = e4m3 rhs = e4m3 : !ttg.memdesc<128x64xf8E4M3FN, #a8, #ttg.shared_memory>, !ttg.memdesc<64x96xf8E4M3FN, #b8, #ttg.shared_memory, 64x128>, !ttg.memdesc<128x96xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>, !ttg.memdesc<128x2xi8, #scales, #ttng.tensor_memory>, !ttg.memdesc<96x2xi8, #scales, #ttng.tensor_memory, 128x2>
     tt.return
   }
@@ -183,6 +184,37 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
                    %p: i1) {
     // expected-error @+1 {{NPOT MMAv5 N with blockM=64 is not yet supported}}
     ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<64x64xf16, #a, #ttg.shared_memory>, !ttg.memdesc<64x96xf16, #b, #ttg.shared_memory, 64x128>, !ttg.memdesc<64x96xf32, #tmem, #ttng.tensor_memory, mutable, 64x128>
+    tt.return
+  }
+}
+
+// -----
+
+// FP4 K=96 is one tcgen05.mma on sm_103a if each operand swizzle row holds it.
+#a = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#a32 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+#b = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#scales = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103"} {
+  tt.func @k96(%a: !ttg.memdesc<128x48xi8, #a, #ttg.shared_memory>, %a32: !ttg.memdesc<128x48xi8, #a32, #ttg.shared_memory>, %b: !ttg.memdesc<48x128xi8, #b, #ttg.shared_memory>, %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, %s: !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>, %p: i1) {
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %s, %s, %p, %p lhs = e2m1 rhs = e2m1 : !ttg.memdesc<128x48xi8, #a, #ttg.shared_memory>, !ttg.memdesc<48x128xi8, #b, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>, !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>
+    // expected-error @+1 {{NPOT MMAv5 K=96 is not yet supported with an operand swizzle row narrower than K}}
+    ttng.tc_gen5_mma_scaled %a32, %b, %c, %s, %s, %p, %p lhs = e2m1 rhs = e2m1 : !ttg.memdesc<128x48xi8, #a32, #ttg.shared_memory>, !ttg.memdesc<48x128xi8, #b, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>, !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>
+    tt.return
+  }
+}
+
+// -----
+
+#a = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#b = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#scales = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @k96_sm100(%a: !ttg.memdesc<128x48xi8, #a, #ttg.shared_memory>, %b: !ttg.memdesc<48x128xi8, #b, #ttg.shared_memory>, %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, %s: !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>, %p: i1) {
+    // expected-error @+1 {{NPOT MMAv5 K=96 is unsupported: tcgen05.mma takes K in steps of 64}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %s, %s, %p, %p lhs = e2m1 rhs = e2m1 : !ttg.memdesc<128x48xi8, #a, #ttg.shared_memory>, !ttg.memdesc<48x128xi8, #b, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>, !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>
     tt.return
   }
 }
