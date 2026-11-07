@@ -1,4 +1,4 @@
-// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -tritongpu-remove-layout-conversions | FileCheck %s
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -tritongpu-remove-layout-conversions | FileCheck %s
 
 // #p96 isn't exact at 64x192, nor #p192 at 64x96 (96 and 256, 192 and 128
 // don't divide), so RLC must keep a convert between the reduce and the broadcast.
@@ -86,6 +86,77 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     }) : (tensor<1024xf32, #d1024>) -> tensor<1024xf32, #d1024>
     %c = ttg.convert_layout %s : tensor<1024xf32, #d1024> -> tensor<1024xf32, #c1024>
     tt.store %pc, %c : tensor<1024x!tt.ptr<f32>, #c1024>
+    tt.return
+  }
+}
+
+// -----
+
+// slice<0, #mma> is exact at 96 (the unit dim broadcasts #mma's M lanes and
+// warps, as in pow2), so RLC does the column sum in #mma like the pow2 control.
+#linear = #ttg.linear<{register = [[4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 32]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [[1, 0], [2, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 96, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @colsum_mma_v3
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: %[[D:.*]] = ttng.warp_group_dot
+  // CHECK: "tt.reduce"(%[[D]])
+  // CHECK: -> tensor<96xf32, #ttg.slice<{dim = 0, parent = #mma}>>
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: tt.return
+  tt.func public @colsum_mma_v3(%a: !ttg.memdesc<128x64xf16, #shared, #smem>, %b: !ttg.memdesc<64x96xf16, #shared1, #smem>, %pc: !tt.ptr<f32>) {
+    %c = arith.constant dense<0.0> : tensor<128x96xf32, #mma>
+    %d = ttng.warp_group_dot %a, %b, %c : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x96xf16, #shared1, #smem> -> tensor<128x96xf32, #mma>
+    %e = ttg.convert_layout %d : tensor<128x96xf32, #mma> -> tensor<128x96xf32, #linear>
+    %s = "tt.reduce"(%e) <{axis = 0 : i32}> ({
+    ^bb0(%x: f32, %y: f32):
+      %z = arith.addf %x, %y : f32
+      tt.reduce.return %z : f32
+    }) : (tensor<128x96xf32, #linear>) -> tensor<96xf32, #ttg.slice<{dim = 0, parent = #linear}>>
+    %se = tt.expand_dims %s {axis = 0 : i32} : tensor<96xf32, #ttg.slice<{dim = 0, parent = #linear}>> -> tensor<1x96xf32, #linear>
+    %sb = tt.broadcast %se : tensor<1x96xf32, #linear> -> tensor<128x96xf32, #linear>
+    %q = arith.divf %e, %sb : tensor<128x96xf32, #linear>
+    %o = ttg.convert_layout %q : tensor<128x96xf32, #linear> -> tensor<128x96xf32, #mma>
+    %pp = tt.splat %pc : !tt.ptr<f32> -> tensor<128x96x!tt.ptr<f32>, #mma>
+    tt.store %pp, %o : tensor<128x96x!tt.ptr<f32>, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// Pow2 control: the same column sum at 128x128.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 128, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @colsum_mma_v3_pow2
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: %[[D:.*]] = ttng.warp_group_dot
+  // CHECK: "tt.reduce"(%[[D]])
+  // CHECK: -> tensor<128xf32, #ttg.slice<{dim = 0, parent = #mma}>>
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: tt.return
+  tt.func public @colsum_mma_v3_pow2(%a: !ttg.memdesc<128x64xf16, #shared, #smem>, %b: !ttg.memdesc<64x128xf16, #shared1, #smem>, %pc: !tt.ptr<f32>) {
+    %c = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %d = ttng.warp_group_dot %a, %b, %c : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared1, #smem> -> tensor<128x128xf32, #mma>
+    %e = ttg.convert_layout %d : tensor<128x128xf32, #mma> -> tensor<128x128xf32, #blocked>
+    %s = "tt.reduce"(%e) <{axis = 0 : i32}> ({
+    ^bb0(%x: f32, %y: f32):
+      %z = arith.addf %x, %y : f32
+      tt.reduce.return %z : f32
+    }) : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %se = tt.expand_dims %s {axis = 0 : i32} : tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xf32, #blocked>
+    %sb = tt.broadcast %se : tensor<1x128xf32, #blocked> -> tensor<128x128xf32, #blocked>
+    %q = arith.divf %e, %sb : tensor<128x128xf32, #blocked>
+    %o = ttg.convert_layout %q : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #mma>
+    %pp = tt.splat %pc : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>, #mma>
+    tt.store %pp, %o : tensor<128x128x!tt.ptr<f32>, #mma>
     tt.return
   }
 }
