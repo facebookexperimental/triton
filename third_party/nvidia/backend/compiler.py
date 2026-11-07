@@ -255,7 +255,7 @@ class CUDAOptions:
     ir_override: Optional[str] = (
         None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
     )
-    enable_fp_fusion: bool = False
+    enable_fp_fusion: bool = True
     sched4reg: bool = False
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
