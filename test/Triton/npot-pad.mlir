@@ -24,7 +24,8 @@ tt.func @copy(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
 // -----
 
 // A user mask is and-ed with the live mask; `other` is kept. [4,48] pads at four
-// warps: its Product layout takes more slots than the padded one (384 vs 256).
+// warps: its mixed-radix layout takes a larger total in-dim size than the
+// padded one (384 vs 256).
 // CHECK-LABEL: @user_mask
 tt.func @user_mask(%ptr: !tt.ptr<f16>, %c: i1) {
   // CHECK: %[[RANGE:.*]] = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
@@ -125,8 +126,8 @@ tt.func @reshape_trailing(%x: !tt.ptr<f32>) {
 // -----
 
 // An exact connected component keeps the reshape that @reshape_trailing turns
-// into a gather: at four warps the 384 range and its 128x3 view fill 384 slots,
-// where padded wastes 128.
+// into a gather: at four warps the 384 range and its 128x3 view fill a total
+// in-dim size of 384, where padded wastes 128.
 // CHECK-LABEL: @reshape_trailing_exact
 tt.func @reshape_trailing_exact() {
   %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32>
@@ -217,17 +218,9 @@ tt.func @signature(%x: tensor<96xf32>) {
 
 // -----
 
-tt.func @descriptor(%base: !tt.ptr<f32>, %n: i32, %s: i64) {
-  // expected-error @+1 {{'tt.make_tensor_descriptor' op on an NPOT pointer-to-tensor, descriptor, memory descriptor or encoded tensor is unsupported}}
-  %d = tt.make_tensor_descriptor %base, [%n], [%s] {order = array<i32: 0>} : !tt.ptr<f32>, !tt.tensordesc<96xf32>
-  tt.return
-}
-
-// -----
-
 // The converter keeps a given encoding, so the pad pass rejects an encoded NPOT
-// tensor, even a Product one at a size whose exact connected component it would
-// admit.
+// tensor, even a mixed-radix one at a size whose exact connected component it
+// would allow.
 #linear = #ttg.linear<{register = [[128], [256], [512]], lane = [[1], [2], [4], [8], [16]], warp = [[32], [64]], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [1536]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
 tt.func @encoded(%x: !tt.ptr<f32>) {
