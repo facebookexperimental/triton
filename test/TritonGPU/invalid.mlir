@@ -487,6 +487,15 @@ tt.func public @memdesc_reinterpret_oversized_shared_linear(%arg0: !ttg.memdesc<
 
 // -----
 
+#shared_linear_rows = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [1, 0], [2, 0]]}, alignment = 16>
+#smem = #ttg.shared_memory
+// expected-error @+1 {{shared linear encoding needs power-of-two layout dimensions}}
+tt.func public @shared_linear_npot_rows(%arg0: !ttg.memdesc<3x4xf16, #shared_linear_rows, #smem>) {
+    tt.return
+}
+
+// -----
+
 #shared_split = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0]]}>
 #shared_broadcast = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 0]]}>
 #smem = #ttg.shared_memory
