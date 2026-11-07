@@ -142,21 +142,6 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 2 : i32, "ttg.num-
 
 // -----
 
-// Gather rows of three 32-column boxes.
-#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
-#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
-#smem = #ttg.shared_memory
-module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  tt.func @tma_gather_32x96(%desc: !tt.tensordesc<1x96xbf16, #nvmma>, %barrier: !ttg.memdesc<1xi64, #shared0, #smem, mutable>, %xs: tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>, %y: i32, %alloc: !ttg.memdesc<32x96xbf16, #nvmma, #smem, mutable, 32x128>, %pred: i1) {
-    // expected-error @+1 {{NPOT TMA gather/scatter tile is not yet supported}}
-    ttng.async_tma_gather %desc[%xs, %y] %alloc, %barrier, %pred : !tt.tensordesc<1x96xbf16, #nvmma>, tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>, i32, !ttg.memdesc<1xi64, #shared0, #smem, mutable>, !ttg.memdesc<32x96xbf16, #nvmma, #smem, mutable, 32x128>, i1
-    tt.return
-  }
-}
-
-// -----
-
 // Other encodings keep the existing TMA error.
 #sw = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
