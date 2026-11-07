@@ -555,6 +555,7 @@ struct DotConversion {
   int numBitsPerElementA;
   int numBitsPerElementB;
   StringRef kind;
+  ttng::Tcgen05Kind tcgen05Kind;
   GetInstOperandsFn getInstOperands;
 };
 
@@ -636,6 +637,12 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
   unsigned mmaSizeM = tensorMemAttr.getBlockM();
   // Account for subslices
   unsigned mmaSizeN = std::min<unsigned>(tensorMemAttr.getBlockN(), N);
+  // An NPOT N is issued in the tiles its verifier admitted.
+  if (!llvm::isPowerOf2_32(N))
+    mmaSizeN = ttng::getTcgen05InstrN(
+        op.tcgen05Kind, aInTmem, ttng::getMmaOperandSmemAttrs(bTensorTy),
+        twoCTAs, mmaSizeM, tensorMemAttr.getBlockN(), N,
+        bTensorTy.getElementTypeBitWidth());
   // Checked in the verifier
   assert(mmaSizeN <= 256 &&
          "The maximum size of an MMA instruction is 128x256");
@@ -855,22 +862,15 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
   }
 
   dot.blockK = aTensorTy.getDimSize(1);
-  dot.mmaSizeK = 256 / aTensorTy.getElementTypeBitWidth();
-
   auto tensorMemAttr =
       cast<ttng::TensorMemoryEncodingAttr>(dTensorTy.getEncoding());
-  unsigned mmaSizeM = tensorMemAttr.getBlockM();
-
-  // 2xfp8 requires M = 128 for 1CTA or 256 for 2CTA, which corresponds to
-  // the condition mmaSizeM == 128 here
-  if (targetFeatures.supports2xFp8Tcgen05MMA() &&
-      aTensorTy.getElementTypeBitWidth() == 8 &&
-      aTensorTy.getDimSize(1) >= 64 && mmaSizeM == 128) {
-    dot.mmaSizeK = 64;
-  }
+  dot.mmaSizeK = ttng::getTcgen05InstrK(
+      aTensorTy.getElementTypeBitWidth(), tensorMemAttr.getBlockM(), dot.blockK,
+      targetFeatures.supports2xFp8Tcgen05MMA());
 
   dot.numBitsPerElementA = aTensorTy.getElementTypeBitWidth();
   dot.numBitsPerElementB = bTensorTy.getElementTypeBitWidth();
+  dot.tcgen05Kind = *ttng::getTcgen05Kind(srcElementTy);
 
   dot.getInstOperands = [&](const DotConversion::InstDesc &desc, int, int,
                             int) -> MMAInstOperands {
@@ -979,8 +979,10 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
   unsigned mmaSizeN = tensorMemAttr.getBlockN();
 
   dot.blockK = blockK; // K is not split across CTAs
+  dot.tcgen05Kind = ttng::Tcgen05Kind::BlockScaled;
 
   bool hasFp4PaddedOperand = isFp4Padded(aTensorTy) || isFp4Padded(bTensorTy);
+  unsigned instN = std::min<unsigned>(mmaSizeN, getShapePerCTA(dTensorTy)[1]);
 
   if (!targetFeatures.supports4xFp4Tcgen05MMA() || hasFp4PaddedOperand ||
       // M = 64 for 1CTA or 128 for 2CTA not supported for 2xfp8 / 4xfp4
@@ -989,10 +991,12 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
       // which requires a special unpacked layout for scales B in TMEM
       // (currently undocumented). tensorMemoryScalesToLinearLayout and lowering
       // of tcgen05.cp need to be updated for this.
-      (mxfpInstKind == mxfpKind::mxf4nvf4 && mmaSizeN < 128)) {
+      (mxfpInstKind == mxfpKind::mxf4nvf4 && instN < 128)) {
     dot.mmaSizeK = opKindIsMXFP4 ? 64 : 32;
   } else {
-    dot.mmaSizeK = opKindIsMXFP4 ? std::min(blockK, 128) : std::min(blockK, 64);
+    // The wide K must divide an NPOT K, or the last MMA reads past K.
+    int wideK = opKindIsMXFP4 ? 128 : 64;
+    dot.mmaSizeK = blockK % wideK == 0 ? wideK : std::min(blockK, wideK / 2);
   }
 
   dot.numBitsPerElementA = getFormatBitSize(op.getAType());
@@ -1006,19 +1010,35 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
   Value baseScaleB = tb.ptrtoint(i32_ty, adaptor.getBScale());
   bool twoCTAs = ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
   SmallVector<Value> commitDescs = op.getCompletionDescs();
-  unsigned instN = std::min<unsigned>(mmaSizeN, getShapePerCTA(dTensorTy)[1]);
+  // An NPOT K that 96 divides is issued in K=96 steps, as the verifier allows.
+  bool npotK96 =
+      opKindIsMXFP4 && !hasFp4PaddedOperand &&
+      ttng::getTcgen05InstrK(4, mmaSizeM, blockK, false,
+                             targetFeatures.supportsK96Tcgen05MMA()) == 96;
+  // K96 reads consecutive scale words with a fixed hardware stride.
+  // Repeated MN tiles or subviews must not interleave unrelated words.
+  auto hasScaleStride = [](Value scale, unsigned stride) {
+    auto type = cast<MemDescType>(scale.getType());
+    return type.getShape().back() <= 4 ||
+           ttng::getTMemSubSliceOffset(type, 4, 1) == stride;
+  };
   bool useK96 =
-      targetFeatures.supportsK96Tcgen05MMA() && twoCTAs && mmaSizeM == 128 &&
-      opKindIsMXFP4 && !hasFp4PaddedOperand && blockK % 256 == 0 &&
+      targetFeatures.supportsK96Tcgen05MMA() && mmaSizeM == 128 &&
+      opKindIsMXFP4 && !hasFp4PaddedOperand &&
       isa<SharedMemorySpaceAttr>(aTensorTy.getMemorySpace()) &&
-      ttng::getNvmmaSmemAttrs(aTensorTy)->swizzlingByteWidth == 128 &&
-      ttng::getNvmmaSmemAttrs(bTensorTy)->swizzlingByteWidth == 128 &&
-      // K96 reads consecutive scale words with a fixed hardware stride.
-      // Repeated MN tiles or subviews must not interleave unrelated words.
-      ttng::getTMemSubSliceOffset(op.getAScale().getType(), 4, 1) == 4 &&
-      ttng::getTMemSubSliceOffset(op.getBScale().getType(), 4, 1) ==
-          std::max(2u, instN / 32);
-  if (useK96) {
+      (npotK96 ||
+       (twoCTAs && blockK % 256 == 0 &&
+        ttng::getNvmmaSmemAttrs(aTensorTy)->swizzlingByteWidth == 128 &&
+        ttng::getNvmmaSmemAttrs(bTensorTy)->swizzlingByteWidth == 128)) &&
+      hasScaleStride(op.getAScale(), 4) &&
+      hasScaleStride(op.getBScale(), std::max(2u, instN / 32));
+  if (npotK96 && !useK96)
+    return emitError(loc, "NPOT MMAv5 K=96 is not yet supported for scales "
+                          "whose words are not at the hardware stride");
+  if (npotK96) {
+    for (int offset = 0; offset <= blockK; offset += 96)
+      dot.kOffsets.push_back(offset);
+  } else if (useK96) {
     // K96 tiles must come in pairs to leave a K64-aligned remainder.
     int numK96 = 2 * (blockK / 192);
     int numK64 = (blockK % 192) / 64;
@@ -1058,7 +1078,8 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
                                            numRepKWords);
     int offsetA = scaleIdxA * numColPerScaleBlockA;
     int offsetB = scaleIdxB * numColPerScaleBlockB;
-    if (useK96) {
+    // An NPOT K's scales cover a pow2 K, so words come from their layout.
+    if (useK96 || !llvm::isPowerOf2_32(blockK)) {
       offsetA =
           ttng::getTMemSubSliceOffset(op.getAScale().getType(),
                                       m * desc.mmaSizeM, 0) +
