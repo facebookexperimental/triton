@@ -589,7 +589,8 @@ def test_fast_pr_selects_corresponding_critical_tests(path, platform, targets):
     suites = json.loads(SUITES.read_text())
     selected, plans = fast_plan([path], ROOT, FILTERS, suites, True)
     assert {key for key in FILTERS if selected[key]} == {platform}
-    assert plans[platform] == targets
+    assert plans[platform]["baseline"] == suites[platform]
+    assert any(group["file"] == targets[0].split("::", 1)[0] for group in plans[platform]["touched"])
 
 
 @pytest.mark.parametrize("paths,narrow", [
@@ -607,7 +608,7 @@ def test_fast_shared_unknown_and_manual_changes_retain_critical_coverage(paths, 
     from fast_tests import fast_plan, SUITES
     suites = json.loads(SUITES.read_text())
     selected, plans = fast_plan(paths, ROOT, FILTERS, suites, narrow)
-    assert selected["b200"] and plans["b200"] == suites["b200"]
+    assert selected["b200"] and plans["b200"]["baseline"] == suites["b200"]
 
 
 @pytest.mark.parametrize("content", [
@@ -630,3 +631,190 @@ def test_fast_suite_accepts_passing_parameterized_evidence(tmp_path):
     path.write_text('<testsuites><testsuite><testcase classname="tests.smoke" name="test_required[fp16]"/> '
                     '<testcase classname="tests.smoke" name="test_required[bf16]"/></testsuite></testsuites>')
     assert verify_evidence(["tests/smoke.py::test_required"], path) == 2
+
+
+@pytest.mark.parametrize("kernel,platform", [
+    ("third_party/tlx/ops/kernels/flash_attn_mxfp8/gfx950_train.py", "mi350"),
+    ("third_party/tlx/ops/kernels/flash_attn_mxfp8/sm100.py", "b200"),
+])
+def test_fast_baseline_unions_touched_tests_outside_the_baseline(kernel, platform):
+    from fast_tests import fast_plan, SUITES
+    suites = json.loads(SUITES.read_text())
+    _, plans = fast_plan([kernel], ROOT, FILTERS, suites, True)
+    plan = plans[platform]
+    file = f"python/test/unit/tlx_ops/test_flash_attn_mxfp8_{'gfx950' if platform == 'mi350' else 'sm100'}.py"
+    assert all(target.split("::", 1)[0] != file for target in suites[platform])
+    assert plan["baseline"] == suites[platform]
+    assert {group["file"] for group in plan["touched"]} == {file, "python/test/unit/tlx_ops/test_invariance_api.py"}
+    _, mixed = fast_plan(["lib/Analysis/Allocation.cpp", kernel], ROOT, FILTERS, suites, True)
+    assert mixed[platform]["touched"] == plan["touched"]
+    assert all(mixed[key]["baseline"] == suites[key] for key in FILTERS)
+
+
+def test_fast_shared_kernel_mapping_uses_its_supported_platform():
+    from fast_tests import fast_plan, SUITES
+    suites = json.loads(SUITES.read_text())
+    _, plans = fast_plan(["third_party/tlx/ops/kernels/bmm/gfx950_torch.py"], ROOT, FILTERS, suites, True)
+    assert all(not plans[platform]["unmapped"] for platform in FILTERS)
+    assert any(group["file"].endswith("test_torchtlx_bmm_gfx950.py") for group in plans["mi350"]["touched"])
+    assert not plans["h100"]["touched"] and not plans["b200"]["touched"]
+
+
+def test_fast_shared_data_deleted_and_helper_inputs_keep_baseline(tmp_path):
+    from fast_tests import fast_plan
+    directory = tmp_path / "python/test/unit"
+    directory.mkdir(parents=True)
+    (directory / "test_new.py").write_text("def test_op():\n    assert True\n")
+    (directory / "test_perf.py").write_text("import argparse\nparser = argparse.ArgumentParser()\n")
+    suites = {"b200": ["test_base.py::test_baseline"], "cpu": []}
+    paths = [
+        "third_party/tlx/ops/_catalog.py", "third_party/tlx/ops/kernels/mm/_shapes.py", "python/test/unit/test_old.py",
+        "python/test/unit/test_perf.py", "python/test/unit/test_new.py"
+    ]
+    _, plans = fast_plan(paths, tmp_path, {"b200": ["**"]}, suites, True)
+    assert plans["b200"]["baseline"] == suites["b200"]
+    assert plans["b200"]["touched"] == [{"file": "python/test/unit/test_new.py", "k": ""}]
+    reasons = {item["path"]: item["reason"] for item in plans["b200"]["limited"]}
+    assert reasons["python/test/unit/test_old.py"] == "deleted test input"
+    assert reasons["python/test/unit/test_perf.py"] == "no pytest functions"
+    assert not plans["b200"]["unmapped"]
+
+
+def fast_fixture_run(tmp_path, source, environment=None, separate_baseline=False):
+    import os
+    import sys
+    (tmp_path / "test_sample.py").write_text(source)
+    plan = {
+        "baseline": ["test_sample.py::test_baseline"], "touched": [{"file": "test_sample.py", "k": ""}], "unmapped": [],
+        "limited": []
+    }
+    if separate_baseline:
+        (tmp_path / "test_base.py").write_text("def test_baseline():\n    assert True\n")
+        plan["baseline"] = ["test_base.py::test_baseline"]
+    junit = tmp_path / "result.xml"
+    result = subprocess.run([
+        sys.executable, "-c", "import json,sys; from pathlib import Path; from fast_tests import run_plan; "
+        "run_plan(json.loads(sys.argv[1]), Path(sys.argv[2]), sys.argv[3])",
+        json.dumps(plan),
+        str(tmp_path),
+        str(junit)
+    ], env=os.environ | {
+        "PYTHONPATH": str(ROOT / ".github/scripts"), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONDONTWRITEBYTECODE":
+        "1"
+    } | (environment or {}), capture_output=True, text=True)
+    manifest = json.loads(junit.with_suffix(".selection.json").read_text())
+    return result, manifest
+
+
+def test_fast_representatives_try_compatible_cases_without_removing_baseline(tmp_path):
+    from fast_tests import verify_manifests
+    result, manifest = fast_fixture_run(
+        tmp_path, '''import pytest
+@pytest.mark.parametrize("value", [0, 1])
+def test_baseline(value):
+    assert value in (0, 1)
+@pytest.mark.parametrize("value", [0, 1, 2])
+def test_touched(value):
+    if value == 0:
+        pytest.skip("incompatible parameter")
+    assert value > 0
+class TestNested:
+    @pytest.mark.parametrize("value", [0, 1])
+    def test_expected(self, value):
+        if value == 0:
+            pytest.xfail("unsupported parameter")
+        assert value == 1
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert manifest["baseline"] == ["test_sample.py::test_baseline[0]", "test_sample.py::test_baseline[1]"]
+    assert manifest["selected"] == [
+        *manifest["baseline"], "test_sample.py::test_touched[1]", "test_sample.py::TestNested::test_expected[1]"
+    ]
+    assert len(manifest["exclusions"]) == 2
+    verify_manifests([manifest])
+
+
+def test_fast_failure_cannot_be_replaced_by_a_passing_parameter(tmp_path):
+    result, manifest = fast_fixture_run(
+        tmp_path, '''import pytest
+def test_baseline():
+    assert True
+@pytest.mark.parametrize("value", [0, 1])
+def test_touched(value):
+    assert value == 1
+''')
+    assert result.returncode != 0
+    assert manifest["functions"]["test_sample.py::test_touched"]["status"] == "failed"
+    assert manifest["functions"]["test_sample.py::test_touched"]["attempts"] == 1
+    assert "test_sample.py::test_touched[1]" not in manifest["selected"]
+
+
+@pytest.mark.parametrize("baseline_skip", [False, True])
+def test_fast_skips_never_count_as_required_coverage(tmp_path, baseline_skip):
+    from fast_tests import verify_manifests
+    source = '''import pytest
+def test_baseline():
+    %s
+@pytest.mark.skipif(True, reason="unsupported platform")
+def test_touched():
+    assert True
+''' % ('pytest.skip("baseline cannot skip")' if baseline_skip else 'assert True')
+    result, manifest = fast_fixture_run(tmp_path, source)
+    if baseline_skip:
+        assert result.returncode != 0
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert manifest["functions"]["test_sample.py::test_touched"]["status"] == "excluded"
+        assert manifest["functions"]["test_sample.py::test_touched"]["reason"] == "unsupported platform"
+        verify_manifests([manifest])
+    assert "test_sample.py::test_touched" not in manifest["selected"]
+
+
+@pytest.mark.parametrize("cases", [1, 40])
+def test_fast_runtime_unavailability_is_not_a_declared_exclusion(tmp_path, cases):
+    from fast_tests import verify_manifests
+    result, manifest = fast_fixture_run(
+        tmp_path, '''import pytest
+def test_baseline():
+    assert True
+@pytest.mark.parametrize("value", range(%d))
+def test_touched(value):
+    pytest.skip("required runtime dependency unavailable")
+''' % cases)
+    assert result.returncode == 0, result.stdout + result.stderr
+    with pytest.raises(ValueError):
+        verify_manifests([manifest])
+    assert "test_sample.py::test_touched" not in manifest["selected"]
+
+
+def test_fast_platform_exclusions_require_actual_coverage_elsewhere(tmp_path):
+    from fast_tests import verify_manifests
+    source = '''import os
+import pytest
+@pytest.mark.skipif(os.environ["SUPPORTED"] == "no", reason="requires supported hardware")
+def test_touched():
+    assert True
+'''
+    manifests = []
+    for supported in ("no", "yes"):
+        result, manifest = fast_fixture_run(tmp_path, source, {"SUPPORTED": supported}, separate_baseline=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        manifests.append(manifest)
+    with pytest.raises(ValueError, match="lack passing coverage"):
+        verify_manifests(manifests[:1])
+    verify_manifests(manifests)
+
+
+@pytest.mark.parametrize("test_body", [
+    "def test_touched():\n    assert True\n",
+    "import unittest\nclass DownloadTest(unittest.TestCase):\n    def test_touched(self):\n        assert True\n",
+])
+def test_fast_collection_cannot_silently_remove_a_touched_function(tmp_path, test_body):
+    from fast_tests import verify_manifests
+    (tmp_path / "conftest.py").write_text('''def pytest_collection_modifyitems(items):
+    items[:] = [item for item in items if item.name != "test_touched"]
+''')
+    result, manifest = fast_fixture_run(tmp_path, "def test_baseline():\n    assert True\n" + test_body)
+    assert result.returncode == 0, result.stdout + result.stderr
+    with pytest.raises(ValueError, match="test_touched"):
+        verify_manifests([manifest])
