@@ -171,7 +171,7 @@ struct ConvertLayoutOpConversion
 
     // The owner predicate handles broadcast source registers.
     if (plan)
-      return transferProductThroughSharedMemory(
+      return transferMixedRadixThroughSharedMemory(
           loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, llvmElemTy,
           smemBase, plan->sourceFreeVariableMasks,
           plan->scope == triton::MixedRadixConversionScope::Block,
