@@ -205,6 +205,20 @@ void init_triton_tlx_ir(py::module_ &m) {
              return self.create<amdgpu::ExtractSliceOp>(resultType, source,
                                                         offsetsAttr);
            })
+      .def("create_amd_concat",
+           [](TritonOpBuilder &self, std::vector<Value> sources,
+              std::vector<int64_t> shape) -> Value {
+             if (sources.empty())
+               throw std::runtime_error(
+                   "amd_concat: at least one source is required");
+             auto sourceType = cast<RankedTensorType>(sources.front().getType());
+             if (shape.size() != static_cast<size_t>(sourceType.getRank()))
+               throw std::runtime_error(
+                   "amd_concat: result shape must match source rank");
+             auto resultType = RankedTensorType::get(
+                 shape, sourceType.getElementType(), sourceType.getEncoding());
+             return self.create<amdgpu::ConcatOp>(resultType, sources);
+           })
       .def("create_amd_rematerialized_range",
            [](TritonOpBuilder &self, int32_t start, int32_t end,
               int32_t identity, Value placement) -> Value {
