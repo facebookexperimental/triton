@@ -24,6 +24,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #define DEBUG_TYPE "ttg-utility"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -109,6 +110,21 @@ bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps) {
   int64_t split = numWarps / 4;
   return triton::tools::isNpotAllowed() && split > 1 &&
          !llvm::isPowerOf2_64(shape[0]) && shape[0] % (64 * split) != 0;
+}
+
+std::optional<std::string>
+getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
+                                  ArrayRef<unsigned> warps,
+                                  ArrayRef<unsigned> instrShape) {
+  for (auto [dim, size] : llvm::enumerate(shape)) {
+    int64_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(size));
+    if (twoPart % (warps[dim] * LinearLayout::twoPartOf(instrShape[dim])) != 0)
+      return llvm::formatv("NPOT dot is not yet supported with {0} warps of "
+                           "{1} on dim {2}, whose power-of-two part is {3}",
+                           warps[dim], instrShape[dim], dim, twoPart)
+          .str();
+  }
+  return std::nullopt;
 }
 
 SmallVector<unsigned, 3>
