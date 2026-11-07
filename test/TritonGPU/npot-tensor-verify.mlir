@@ -174,8 +174,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Constants, carried values, print and assert take a mixed-radix layout;
-// histogram does not yet.
+// Constants, carried values, print, assert and histogram take a mixed-radix
+// layout.
 #p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
 #b = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
@@ -204,7 +204,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.print ": " {hex = false, isSigned = array<i32: 1>} : %x : tensor<96xi32, #p96>
     %pos = arith.cmpi sge, %x, %r : tensor<96xi32, #p96>
     tt.assert %pos, "x >= r" : tensor<96xi1, #p96>
-    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.histogram}}
     %h = tt.histogram %x : tensor<96xi32, #p96> -> tensor<16xi32, #b>
     cf.br ^bb2
   ^bb2:
