@@ -10,11 +10,17 @@ persistent programs, group-M 8, 16-workgroup clusters in a 4x4 tile layout
 with multicast inputs and a cluster barrier every eight K blocks, and chunked
 XCD remapping of whole clusters (eight XCDs, chunk two).
 
-- mx8xmx8 (FP8 E4M3 B) uses BK128 with cross-tile prefetch and overlaps each
-  next tile's first K step with the C epilogue. Below K=16384 it uses three
-  input stages and three dedicated C slots (six with FP16 output), and from
-  K=8192 unrolls the steady loop by the ring depth. From K=16384 it uses four
-  input stages and two C slots.
+- mx8xmx8 (FP8 E4M3 B) uses BK128 with cross-tile prefetch. With FP32
+  output below K=16384 it uses three input stages and three dedicated C
+  slots, overlaps each next tile's first K step with the C epilogue, and from
+  K=8192 unrolls the steady loop by the ring depth. With FP16 output up to
+  K=16384 it uses four input stages, two C slots, the static unrolled loop,
+  the overlapped first K step, one split workgroup barrier per K step
+  (--merged-handoff-barrier), and tests the cluster rendezvous only in the
+  unrolled steps that can reach it (--static-cluster-steps). Otherwise
+  (FP32 from K=16384, FP16 at K=32768) it uses four stages and two C slots.
+  --scale-layout wave256 packs its scales so each wave reads both 128-row
+  quadrants' scales with one LDS load.
 - mx8xmx4 (FP4 E2M1 B) uses BK256 with three input stages, stages C in
   retired A stages, and uses split cluster barriers and early C stores.
 
@@ -36,9 +42,12 @@ VARIANT_DTYPES_B = {"mx8xmx8": "float8_e4m3", "mx8xmx4": "float4"}
 OUT_DTYPES = ("fp32", "fp16")
 GRID_CLUSTER_LAYOUTS = {"2x2": (2, 2), "4x2": (4, 2), "2x4": (2, 4), "4x4": (4, 4), "8x2": (8, 2), "2x8": (2, 8)}
 # MX8xMX8 defaults by K: static slot unroll from STATIC_SLOT_UNROLL_MIN_K,
-# and a four-stage ring with two C slots from FOUR_BUFFER_MIN_K.
+# and a four-stage ring with two C slots from FOUR_BUFFER_MIN_K. FP16 output
+# up to MERGED_FP16_MAX_K uses the four-stage static loop with the merged
+# handoff barrier instead.
 STATIC_SLOT_UNROLL_MIN_K = 8192
 FOUR_BUFFER_MIN_K = 16384
+MERGED_FP16_MAX_K = 16384
 DEFAULT_OUTPUT_C_SLOTS = {"fp32": 3, "fp16": 6}
 RESULT_RE = re.compile(r"execution time:\s*([0-9.eE+-]+)\s*ms,\s*([0-9.eE+-]+)\s*TFLOPS")
 
@@ -59,6 +68,9 @@ def _variant_args(args, dtype_b, out_dtype):
     resolved.out_dtype = out_dtype
     fp4 = dtype_b == "float4"
     resolved.block_k = 256 if fp4 else 128
+    if fp4:
+        # wave256 scales are defined for the A8W8 BK128 tile only.
+        resolved.scale_layout = "block128"
     if resolved.cross_tile_prefetch is None:
         resolved.cross_tile_prefetch = not fp4
     cluster_barriers = resolved.cluster_size > 1 and resolved.cluster_barrier_interval > 0
@@ -73,10 +85,22 @@ def _case_args(args, case):
     """Resolve the input ring, C slots, static unroll, and overlap peel for one case."""
     resolved = argparse.Namespace(**vars(args))
     k = case[2]
+    resolved.merged_handoff_barrier = bool(args.merged_handoff_barrier)
+    resolved.static_cluster_steps = bool(args.static_cluster_steps)
     if args.block_k == 256:
         resolved.num_buffers = args.num_buffers or 3
         resolved.static_slot_unroll = bool(args.static_slot_unroll)
         resolved.overlap_peel = bool(args.overlap_peel)
+        return resolved
+    if (args.out_dtype == "fp16" and args.num_buffers is None and args.output_c_slots is None
+            and args.static_slot_unroll is None and args.merged_handoff_barrier is not False and k // args.block_k > 4
+            and k <= MERGED_FP16_MAX_K):
+        resolved.num_buffers = 4
+        resolved.static_slot_unroll = True
+        resolved.merged_handoff_barrier = True
+        resolved.output_c_slots = 2
+        resolved.overlap_peel = args.overlap_peel is not False and args.cross_tile_prefetch
+        resolved.static_cluster_steps = args.static_cluster_steps is not False
         return resolved
     resolved.num_buffers = args.num_buffers or (4 if k >= FOUR_BUFFER_MIN_K else 3)
     three_stage = resolved.num_buffers == 3
@@ -150,6 +174,12 @@ def _command(args, case, dtype_b):
         command.append("--static_slot_unroll")
     if args.overlap_peel:
         command.append("--overlap_peel")
+    if args.merged_handoff_barrier:
+        command.append("--merged_handoff_barrier")
+    if args.static_cluster_steps:
+        command.append("--static_cluster_steps")
+    if args.scale_layout != "block128":
+        command.extend(["--scale_layout", args.scale_layout])
     if args.output_c_slots is not None:
         command.extend(["--output_c_slots", str(args.output_c_slots)])
     if args.out_dtype != "fp32":
@@ -187,6 +217,18 @@ def parse_benchmark_args(argv=None):
         "--overlap-peel", action=argparse.BooleanOptionalAction, default=None,
         help="overlap each next tile's first K step with the C epilogue (default: three-stage "
         "MX8xMX8)")
+    parser.add_argument(
+        "--merged-handoff-barrier", action=argparse.BooleanOptionalAction, default=None,
+        help="four-stage static loop with one split workgroup barrier per K step (default: FP16 MX8xMX8 up to "
+        f"K={MERGED_FP16_MAX_K})")
+    parser.add_argument(
+        "--static-cluster-steps", action=argparse.BooleanOptionalAction, default=None,
+        help="test the cluster rendezvous only in unrolled steps that can reach it (default: with the merged "
+        "handoff barrier)")
+    parser.add_argument(
+        "--scale-layout", choices=("block128", "wave256"), default="block128",
+        help="MX8xMX8 preshuffled scale format: wave256 reads both 128-row quadrants' scales with one LDS load "
+        "(MX8xMX4 keeps block128)")
     parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
                         help="prefetch next-tile inputs during the K tail (default: MX8xMX8)")
     parser.add_argument("--split-cluster-barrier", action=argparse.BooleanOptionalAction, default=None,
@@ -285,10 +327,11 @@ def main(argv=None):
             dict(variant=variant, dtype_a="float8_e4m3", dtype_b=dtype_b, out_dtype=run_args.out_dtype, M=case[0],
                  N=case[1], K=case[2], block_k=run_args.block_k, num_buffers=run_args.num_buffers,
                  output_c_slots=run_args.output_c_slots, static_slot_unroll=run_args.static_slot_unroll,
-                 overlap_peel=run_args.overlap_peel, cross_tile_prefetch=run_args.cross_tile_prefetch,
-                 split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
-                 group_m=run_args.group_m, cluster_size=run_args.cluster_size, cluster_layout=run_args.cluster_layout,
-                 cluster_barrier_interval=run_args.cluster_barrier_interval,
+                 overlap_peel=run_args.overlap_peel, merged_handoff_barrier=run_args.merged_handoff_barrier,
+                 static_cluster_steps=run_args.static_cluster_steps, scale_layout=run_args.scale_layout,
+                 cross_tile_prefetch=run_args.cross_tile_prefetch, split_cluster_barrier=run_args.split_cluster_barrier,
+                 early_c_stores=run_args.early_c_stores, group_m=run_args.group_m, cluster_size=run_args.cluster_size,
+                 cluster_layout=run_args.cluster_layout, cluster_barrier_interval=run_args.cluster_barrier_interval,
                  cluster_multicast=run_args.cluster_multicast, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
                  xcd_chunk=run_args.xcd_chunk, num_programs=run_args.num_programs,
                  benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters,

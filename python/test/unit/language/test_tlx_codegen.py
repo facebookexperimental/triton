@@ -7538,9 +7538,9 @@ def _strip_tdm_hazard_waits(asm):
                            and re.match(r"\s*tensor_(?:load_to|store_from)_lds\b", following)))
 
 
-def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constants):
+def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, c_type="*fp32", **constants):
     kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
-    signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr="*fp32", a_scale="*u8",
+    signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr=c_type, a_scale="*u8",
                      b_scale="*u8")
     # Match bench.py's aligned, sub-2GB tensors and specialize the dimensions
     # and strides so the persistent kernel can fold descriptor/tile setup.
@@ -7597,6 +7597,44 @@ def test_gfx1250_mxgemm_static_slot_unroll_keeps_operands_in_place(cluster_size,
     body = min(steady, key=len)
     assert body.count("tensor_load_to_lds") == 3 * 2
     assert not re.search(r"\bv_(?:dual_)?mov_b(?:32|64)\b", body)
+
+
+@pytest.mark.parametrize("scale_wave256", [False, True])
+@pytest.mark.parametrize("cluster_size", [1, 16])
+def test_gfx1250_mxgemm_merged_handoff_barrier_splits_step_barrier(cluster_size, scale_wave256):
+    # The FP16 bench schedule: four static stages, two C slots, the overlap
+    # peel, and one split workgroup barrier per K step.
+    grid = cluster_size == 16
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 4, 128, c_type="*fp16", K=8192, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=8 if grid else 1,
+                                                  CLUSTER_LAYOUT="4x4" if grid else "linear",
+                                                  XCD_REMAP_MODE=2 if grid else 0, STATIC_SLOT_UNROLL=True,
+                                                  OUTPUT_C_SLOTS=2, OVERLAP_PEEL=True, MERGED_HANDOFF_BARRIER=True,
+                                                  STATIC_CLUSTER_STEPS=grid, SCALE_WAVE256=scale_wave256)
+    asm = compiled.asm["amdgcn"]
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert compiled.metadata.shared <= 320 * 1024
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    bodies = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            bodies.append(lines[labels[branch[1]]:i])
+    steady = [body for body in bodies if sum("v_wmma_scale_f32_16x16x128_f8f6f4" in inst for inst in body) == 4 * 64]
+    assert steady
+    body = min(steady, key=len)
+    # One signal/wait pair per unrolled step and no other workgroup barrier:
+    # relaxed operand reads leave Membar nothing to add around the refills.
+    assert sum(re.match(r"\s+s_barrier_signal -1\b", inst) is not None for inst in body) == 4
+    assert sum(re.match(r"\s+s_barrier_wait -1\b", inst) is not None for inst in body) == 4
+    assert not any(re.match(r"\s+s_barrier\b(?!_)", inst) for inst in body)
+    reads = [match[1] for inst in body if (match := re.match(r"\s+(ds_load\w*)", inst))]
+    if scale_wave256:
+        # Each operand's scales for both quadrants come from one b128 read.
+        assert set(reads) == {"ds_load_b128"}
+    else:
+        assert "ds_load_2addr_b32" in reads
 
 
 @pytest.mark.parametrize("dtype_b,num_buffers,block_k", [

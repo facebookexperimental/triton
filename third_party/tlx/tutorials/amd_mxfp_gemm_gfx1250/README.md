@@ -67,8 +67,8 @@ share inputs.
 
 **A8W8 options.**
 
-- `STATIC_SLOT_UNROLL` unrolls the three-stage steady loop by the ring
-  depth, so every step reads a loop-invariant LDS slot and operand
+- `STATIC_SLOT_UNROLL` unrolls the three- or four-stage steady loop by the
+  ring depth, so every step reads a loop-invariant LDS slot and operand
   addresses leave the loop. Each tile's first step is peeled so its WMMAs
   read zero accumulators as an inline constant. The A and B slots are then
   split into 64-row pieces that alternate between two LDS partitions,
@@ -83,6 +83,26 @@ share inputs.
   reads.
 - A four-stage ring uses two smaller C slots (64x64 for FP32, 64x128 for
   FP16) and a grouped operand prefetch.
+- `MERGED_HANDOFF_BARRIER` (four-stage static loop) replaces the K step's
+  two workgroup barriers with one, split around register-only work. Each
+  step reads both second halves of its slot during the C00 WMMAs, waits for
+  its share of the next stage, signals (`tlx.named_barrier_arrive`, which
+  lowers to `s_barrier_signal`), runs the C01 WMMAs, waits
+  (`tlx.named_barrier_wait`, `s_barrier_wait`), then refills the slot and
+  reads the next stage across the C10 and C11 WMMAs. The one rendezvous
+  orders the slot's last reads before its refill and publishes the next
+  stage to every wave, so the operand reads are relaxed and Membar adds no
+  barriers of its own.
+- `STATIC_CLUSTER_STEPS` drops the run-time cluster-rendezvous test from the
+  unrolled steps that can never refill a rendezvous stage.
+- `SCALE_LAYOUT="wave256"` uses a second preshuffled scale format
+  (`pack_scale(x, layout="wave256")`): one row per 256 M/N rows, ordered per
+  K128 step as `[row bit 5][row % 32][row bit 7][row bit 6][4 K]`, so each
+  lane's 16 bytes are the four scale dwords its wave needs for both 128-row
+  quadrants. The merged step reads each operand's scales with one
+  `ds_load_b128` and splits the quadrants in registers; the other schedules
+  read one quadrant per `ds_load_b64`. The default `block128` format stores
+  one row per 128 rows.
 
 **A8W4 options.** `SPLIT_CLUSTER_BARRIER` signals the periodic cluster
 rendezvous before independent matrix work and waits just before the
@@ -95,7 +115,8 @@ input slots hold twice the rows at the same pitch.
 ## Requirements
 
 The persistent kernel requires FP8 E4M3 A with A scales, transposed B
-(`[N, K]`), scales preshuffled with `pack_scale`, partial TDM fusion, and
+(`[N, K]`), scales preshuffled with `pack_scale` (`wave256` only for A8W8
+BK128), partial TDM fusion, and
 full 256x256 output tiles with at least `NUM_BUFFERS` K blocks. A8W8 uses
 two to four BK128 stages; A8W4 uses three BK256 stages (FP8 B with BK256
 uses two). Clustering requires GROUP_SIZE_M 4 or 8, full M groups, and a
@@ -119,11 +140,13 @@ output, with this configuration:
 | Setting | `mx8xmx8` (A8W8) | `mx8xmx4` (A8W4) |
 | --- | --- | --- |
 | B format, BK | FP8 E4M3, 128 | FP4 E2M1, 256 |
-| Input ring | 3 stages; 4 stages for K >= 16384 | 3 stages |
-| C staging | 3 dedicated slots (6 for FP16); 2 with four stages | retired A stages |
+| Input ring | FP32: 3 stages, 4 for K >= 16384; FP16: 4 stages | 3 stages |
+| C staging | FP32: 3 dedicated slots, 2 with four stages; FP16: 2 slots | retired A stages |
 | Cross-tile prefetch | on | off |
-| Static slot unroll | three stages with K >= 8192 | off |
-| Overlap peel | three stages | off |
+| Static slot unroll | FP32: three stages with K >= 8192; FP16: K <= 16384 | off |
+| Merged handoff barrier, static cluster steps | FP16 with K <= 16384 | off |
+| Overlap peel | FP32: three stages; FP16: K <= 16384 | off |
+| Scale layout | block128 (`--scale-layout wave256` to change) | block128 |
 | Split cluster barrier, early C stores | off | on |
 | Clusters | 16 workgroups, 4x4 layout, multicast, barrier every 8 K blocks | same |
 | Program order | group-M 8, chunked XCD remap (8 XCDs, chunk 2) | same |
