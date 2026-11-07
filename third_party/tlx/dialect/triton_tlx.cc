@@ -261,27 +261,39 @@ void init_triton_tlx_ir(py::module_ &m) {
                  accumulatorRoleAttr, accumulatorRegisterClassAttr,
                  initializeAttr);
            })
-      .def("create_amd_scheduled_mfma_scaled",
-           [](TritonOpBuilder &self, Value a, Value b, Value acc, Value aScale,
-              Value bScale, const std::string &aFormat,
-              const std::string &bFormat, const std::string &residentOperand,
-              const std::string &accumulatorRole,
-              const std::string &accumulatorRegisterClass,
-              bool initialize) -> Value {
-             auto aFormatAttr = self.getBuilder().getStringAttr(aFormat);
-             auto bFormatAttr = self.getBuilder().getStringAttr(bFormat);
-             auto residentOperandAttr =
-                 self.getBuilder().getStringAttr(residentOperand);
-             auto accumulatorRoleAttr =
-                 self.getBuilder().getStringAttr(accumulatorRole);
-             auto accumulatorRegisterClassAttr =
-                 self.getBuilder().getStringAttr(accumulatorRegisterClass);
-             auto initializeAttr = self.getBuilder().getBoolAttr(initialize);
-             return self.create<amdgpu::ScheduledMfmaScaledOp>(
-                 acc.getType(), a, b, acc, aScale, bScale, aFormatAttr,
-                 bFormatAttr, residentOperandAttr, accumulatorRoleAttr,
-                 accumulatorRegisterClassAttr, initializeAttr);
-           })
+      .def(
+          "create_amd_scheduled_mfma_scaled",
+          [](TritonOpBuilder &self, Value a, Value b, Value acc, Value aScale,
+             Value bScale, const std::string &aFormat,
+             const std::string &bFormat, const std::string &residentOperand,
+             const std::string &accumulatorRole,
+             const std::string &accumulatorRegisterClass, bool initialize,
+             int64_t aScaleSelector, int64_t bScaleSelector) -> Value {
+            auto aFormatAttr = self.getBuilder().getStringAttr(aFormat);
+            auto bFormatAttr = self.getBuilder().getStringAttr(bFormat);
+            auto residentOperandAttr =
+                self.getBuilder().getStringAttr(residentOperand);
+            auto accumulatorRoleAttr =
+                self.getBuilder().getStringAttr(accumulatorRole);
+            auto accumulatorRegisterClassAttr =
+                self.getBuilder().getStringAttr(accumulatorRegisterClass);
+            auto initializeAttr = self.getBuilder().getBoolAttr(initialize);
+            auto selectorAttr = [&](int64_t selector) -> IntegerAttr {
+              return selector < 0
+                         ? IntegerAttr()
+                         : self.getBuilder().getI32IntegerAttr(selector);
+            };
+            return self.create<amdgpu::ScheduledMfmaScaledOp>(
+                acc.getType(), a, b, acc, aScale, bScale, aFormatAttr,
+                bFormatAttr, residentOperandAttr, accumulatorRoleAttr,
+                accumulatorRegisterClassAttr, initializeAttr,
+                selectorAttr(aScaleSelector), selectorAttr(bScaleSelector));
+          },
+          py::arg("a"), py::arg("b"), py::arg("acc"), py::arg("a_scale"),
+          py::arg("b_scale"), py::arg("a_format"), py::arg("b_format"),
+          py::arg("resident_operand"), py::arg("accumulator_role"),
+          py::arg("accumulator_register_class"), py::arg("initialize"),
+          py::arg("a_scale_selector") = -1, py::arg("b_scale_selector") = -1)
       .def(
           "create_require_layout",
           [](TritonOpBuilder &self, Value &v, Attribute &encoding, bool pin,
