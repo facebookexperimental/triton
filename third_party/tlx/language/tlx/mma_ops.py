@@ -33,6 +33,30 @@ def amd_packed_dot2(lhs, rhs, acc, input_dtype: tl.constexpr, _semantic=None):
 
 
 @tl.builtin
+def amd_concat(sources, shape, _semantic=None):
+    """Concatenate register fragments without cross-thread movement."""
+    sources = tuple(sources)
+    assert sources, "sources must not be empty"
+    assert all(isinstance(source, tl.tensor) for source in sources), "every source must be a tensor"
+    shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+    source_shape = [tl._unwrap_if_constexpr(dim) for dim in sources[0].shape]
+    assert len(shape) == len(source_shape), f"shape must have rank {len(source_shape)}, got {len(shape)}"
+    assert all(isinstance(dim, int) and dim > 0 for dim in shape), "shape must contain positive constexpr integers"
+    assert all(
+        list(source.shape) == list(sources[0].shape) and source.dtype == sources[0].dtype
+        for source in sources[1:]), "sources must have identical shapes and dtypes"
+    source_elements = 1
+    result_elements = 1
+    for source_dim, result_dim in zip(source_shape, shape):
+        assert result_dim % source_dim == 0, "every result dimension must be a multiple of the source dimension"
+        source_elements *= source_dim
+        result_elements *= result_dim
+    assert result_elements == len(sources) * source_elements, "result shape must contain every source exactly once"
+    handle = _semantic.builder.create_amd_concat([source.handle for source in sources], shape)
+    return tl.tensor(handle, tl.block_type(sources[0].dtype, shape))
+
+
+@tl.builtin
 def extract_slice(source, shape, offsets, _semantic=None):
     """Extract an aligned register slice without cross-thread movement.
 
@@ -368,6 +392,8 @@ def amd_scheduled_mfma_scaled(
     a_format: tl.constexpr,
     b_format: tl.constexpr,
     initialize: tl.constexpr = False,
+    a_scale_selector: tl.constexpr = None,
+    b_scale_selector: tl.constexpr = None,
     _semantic=None,
 ):
     """Update native CDNA4 scaled-MFMA fragments from packed FP6 operands.
@@ -387,10 +413,23 @@ def amd_scheduled_mfma_scaled(
     a_format = tl._unwrap_if_constexpr(a_format)
     b_format = tl._unwrap_if_constexpr(b_format)
     initialize = tl._unwrap_if_constexpr(initialize)
+    a_scale_selector = tl._unwrap_if_constexpr(a_scale_selector)
+    b_scale_selector = tl._unwrap_if_constexpr(b_scale_selector)
     _formats = ("e4m3", "e5m2", "e2m3", "e3m2", "e2m1")
     assert a_format in _formats, f"a_format must be one of {_formats}, got {a_format!r}"
     assert b_format in _formats, f"b_format must be one of {_formats}, got {b_format!r}"
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
+    packed_scales = a_scale.dtype in (tl.int32, tl.uint32)
+    assert packed_scales == (b_scale.dtype in (tl.int32, tl.uint32)), \
+        "scale operands must use matching packing"
+    if packed_scales:
+        selectors = (a_scale_selector, b_scale_selector)
+        assert all(isinstance(selector, int) and not isinstance(selector, bool)
+                   and 0 <= selector <= 3 for selector in selectors), \
+            "packed i32 scales require selectors in [0, 3]"
+    else:
+        assert a_scale_selector is None and b_scale_selector is None, \
+            "i8 scales do not accept packed byte selectors"
     handle = _semantic.builder.create_amd_scheduled_mfma_scaled(
         a.handle,
         b.handle,
@@ -403,6 +442,8 @@ def amd_scheduled_mfma_scaled(
         "transient",
         "auto",
         initialize,
+        -1 if a_scale_selector is None else a_scale_selector,
+        -1 if b_scale_selector is None else b_scale_selector,
     )
     return tl.tensor(handle, acc.type)
 
