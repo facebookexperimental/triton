@@ -1,0 +1,67 @@
+name: Fast GPU correctness worker
+on:
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      plan:
+        required: true
+        type: string
+      wheel_url:
+        required: true
+        type: string
+      wheel_filename:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    runs-on: ${{ fromJSON('{"h100":"linux-gcp-h100","b200":"nvidia-dgx-b200","mi350":"linux-fb-triton-mi350-1"}')[inputs.platform] }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Set up test environment
+        uses: ./.github/actions/setup-test-env
+        with:
+          venv: ${{ inputs.platform != 'mi350' && '/workspace/uv_venvs/meta-triton' || '' }}
+          backend: ${{ inputs.platform == 'mi350' && 'rocm' || 'cuda' }}
+          arch: gfx950
+          packages: numpy pytest expecttest
+      - name: Check GPU linker cache
+        if: inputs.platform == 'h100'
+        run: sudo ldconfig
+      - name: Check GPU
+        timeout-minutes: 4
+        run: timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
+      - name: Install torchao
+        if: inputs.platform != 'mi350'
+        uses: ./.github/actions/install-torchao
+        with:
+          platform: ${{ inputs.platform }}
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
+      - name: Run fast correctness tests
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          FAST_TARGETS: ${{ inputs.plan }}
+        run: python .github/scripts/fast_tests.py run --platform "$PLATFORM" --junit /tmp/fast-correctness.xml
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-${{ inputs.platform }}-test-results
+          path: /tmp/fast-correctness.xml
+          if-no-files-found: ignore

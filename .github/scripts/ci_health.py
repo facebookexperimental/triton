@@ -70,7 +70,8 @@ STUCK_DAYS = 7
 #: Workflows collected. Since #3875, gpu-tests.yml calls mi350/b200/h100.yml as reusable workflows;
 #: gpu-tests-nightly.yml runs the slow suites (TritonBench) once a day.
 #: compiler.yml runs LIT on every PR too; only its push runs are collected.
-COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml", rules.LIT_WF)
+COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml", rules.LIT_WF,
+           rules.FAST_WF)
 FORK = "facebookexperimental/llvm-project"
 #: Fork branch each tracked branch's cmake/meta-llvm-info.json follows, as in meta-llvm-update.yml.
 FORK_BRANCHES = {"main": "triton_beta", "release/3.8.x": "triton_3.8.x"}
