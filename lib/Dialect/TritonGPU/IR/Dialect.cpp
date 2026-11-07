@@ -3465,6 +3465,15 @@ AMDMfmaEncodingAttr::getRepForOperand(ArrayRef<int64_t> operandShape,
   auto rank = operandShape.size();
   auto warpsPerCTA = getWarpsPerCTA();
   auto tilesPerWarp = getTilesPerWarp();
+  // The dot legality admits an NPOT M or N only in whole tiles of its warps,
+  // so its floor below is exact.
+  unsigned nonK = rank - 2 + opIdx;
+  assert((llvm::isPowerOf2_64(operandShape[nonK]) ||
+          operandShape[nonK] % (operandTileShape[opIdx] * tilesPerWarp[nonK] *
+                                warpsPerCTA[nonK]) ==
+              0) &&
+         "NPOT dot operand not in whole tiles");
+  (void)nonK;
 
   int numRepBatch =
       rank == 3 ? std::max<int64_t>(1, operandShape[0] / warpsPerCTA[0]) : 1;

@@ -81,7 +81,7 @@ struct ScaledDotOpConversion
       if (std::optional<std::string> reason =
               triton::getNpotDotUnsupportedReason(
                   op, *ll, triton::getModuleTarget(op),
-                  triton::gpu::lookupNumWarps(op)))
+                  triton::gpu::lookupNumWarps(op), /*nonKDim=*/0))
         return op.emitError(*reason);
     auto dType = op.getD().getType();
     auto dEncoding = dType.getEncoding();

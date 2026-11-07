@@ -969,8 +969,8 @@ TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixK) {
   EXPECT_EQ(toLinearLayout({64, 128}, a), pow2);
 }
 
-// An MFMA operand's NPOT non-K dim repeats its odd part in registers after
-// its binary repeats, so its first 32 columns keep the pow2 layout.
+// An MFMA result's or operand's NPOT N repeats its odd part in registers
+// after its binary repeats, so its first 32 columns keep the pow2 layout.
 TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixN) {
   LinearLayout::BasesT bases;
   bases[S("register")] = {{1}};
@@ -981,10 +981,13 @@ TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixN) {
   auto mfma32 = mfma(4, {4, 1}, {32, 32, 16}, /*isTransposed=*/true);
   auto b = mfmaDotOp(mfma32, 1, 8);
   LinearLayout pow2B = toLinearLayout({64, 32}, b);
+  LinearLayout pow2C = toLinearLayout({128, 32}, mfma32);
   ScopedAllowNpot npot;
   EXPECT_EQ(toLinearLayout({64, 160}, b), pow2B * odd);
+  EXPECT_EQ(toLinearLayout({128, 160}, mfma32), pow2C * odd);
   // Control: a pow2 shape keeps its layout.
   EXPECT_EQ(toLinearLayout({64, 32}, b), pow2B);
+  EXPECT_EQ(toLinearLayout({128, 32}, mfma32), pow2C);
 }
 
 TEST_F(LinearLayoutConversionsTest, MMAv3_64x16) {

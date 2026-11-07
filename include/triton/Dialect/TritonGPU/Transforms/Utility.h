@@ -14,6 +14,7 @@
 #include <functional>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <utility>
 
 namespace mlir {
@@ -52,6 +53,13 @@ mmaVersionToInstrShape(int version, const ArrayRef<int64_t> &shape, Type type,
 // Under TRITON_ALLOW_NPOT, whether MMAv3's warpgroups go on N: splitting an
 // NPOT M would leave a warpgroup a share that is not a multiple of 64.
 bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps);
+
+// Why `warps` of `instrShape` can't sit on each dim's power-of-two part, as
+// the mixed-radix layout puts them, or std::nullopt.
+std::optional<std::string>
+getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
+                                  ArrayRef<unsigned> warps,
+                                  ArrayRef<unsigned> instrShape);
 
 // Return the operand used to access the memory in the operation
 Value getMemAccessPtr(Operation *op);

@@ -485,6 +485,10 @@ static LinearLayout repeatMixedRadix(LinearLayout layout, StringAttr dim,
                                {{dim, odd}}, /*requireSurjective=*/true);
 }
 
+static std::optional<LinearLayout>
+getMixedRadixRepeat(LinearLayout tile, CGAEncodingAttr cga,
+                    ArrayRef<int64_t> shape, ArrayRef<unsigned> repOrder);
+
 LinearLayout
 AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   int rank = shape.size();
@@ -584,6 +588,14 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   tileLayout *= LinearLayout::identity1D(tilesPerWarpN, kRegister, dimN);
   tileLayout *= LinearLayout::identity1D(warpsPerCTAN, kWarp, dimN);
 
+  // An NPOT dim's odd part repeats right after its binary repeats, N before M,
+  // which is the order the dot lowering walks the MFMA tiles in.
+  if (!hasBatchDim && hasUnitTilesPerWarp())
+    if (auto mixedRadix = getMixedRadixRepeat(
+            tileLayout * LinearLayout::identity1D(warpsPerCTAM, kWarp, dimM),
+            getCGALayout(), shape, getRepOrder()))
+      return *mixedRadix;
+
   // At this point, the layout is defined across the N dimension within a CTA
   // tile. Instead of switching to the M dimension now, we continue extending
   // the layout along the remaining N dimension, and only then proceed along M,
@@ -591,8 +603,10 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   // If the N dimension is not large enough to span multiple CTA tiles (i.e.,
   // the first argument is 0), an empty layout is created, so this identity
   // layout will not introduce any new registers.
-  tileLayout *= LinearLayout::identity1D(
-      shape[nIndex] / (nDim * warpsPerCTAN * tilesPerWarpN), kRegister, dimN);
+  tileLayout *=
+      LinearLayout::identity1D(getNpotPow2AllocShape(shape)[nIndex] /
+                                   (nDim * warpsPerCTAN * tilesPerWarpN),
+                               kRegister, dimN);
   tileLayout *= LinearLayout::identity1D(tilesPerWarpM, kRegister, dimM);
 
   // Finally, extend the layout across warps in the M dimension.
@@ -1119,6 +1133,8 @@ NvidiaMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 bool NvidiaMmaEncodingAttr::hasMixedRadixLayout() const {
   return isAmpere() || isHopper();
 }
+
+bool AMDMfmaEncodingAttr::hasMixedRadixLayout() const { return true; }
 
 LinearLayout
 NvidiaMmaEncodingAttr::dotOperandToLinearLayout(Attribute dotOp,
@@ -1917,6 +1933,9 @@ chooseMfmaLikeStoreLayout(RankedTensorType valType) {
   bool isMfma16 = mnkDim[0] == 16 && mnkDim[1] == 16;
 
   auto valShape = valType.getShape();
+  // The swap below is built from identity layouts on a pow2 shape.
+  if (!llvm::all_of(valShape, llvm::isPowerOf2_64))
+    return {};
   // For mfma16x16, to use in-wavefront swap, we need to make sure the tiles
   // used are in one wavefront if there are multiple tiles, which means
   // warpsPerCTA = [numWarps, 1] and at least two tiles along the N dim. For
