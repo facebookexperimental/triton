@@ -874,6 +874,59 @@ TEST_F(LinearLayoutConversionsTest, MMAv3_NpotMixedRadix) {
   EXPECT_EQ(aRegs.toLinearLayout({128, 64}), pow2);
 }
 
+TEST_F(LinearLayoutConversionsTest, MMAv2_NpotWarpsOnTwoPart) {
+  EXPECT_EQ(getMmaV2WarpsPerCTA({96, 32}, 8), SmallVector<unsigned>({4, 2}));
+  ScopedAllowNpot npot;
+  // M's two-part 32 holds 2 warps of 16 rows, so the rest go on N.
+  EXPECT_EQ(getMmaV2WarpsPerCTA({96, 32}, 8), SmallVector<unsigned>({2, 4}));
+  // Control: a pow2 shape keeps its split.
+  EXPECT_EQ(getMmaV2WarpsPerCTA({128, 128}, 8), SmallVector<unsigned>({2, 4}));
+}
+
+// Each NPOT dim repeats its odd part in registers after its binary repeats,
+// in rep order, as the MMAv2 lowering indexes them.
+TEST_F(LinearLayoutConversionsTest, MMAv2_NpotMixedRadix) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim0,
+                        int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = warps;
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2};
+    radices[S("warp")] = std::vector<int32_t>(warps.size(), 2);
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto acc = mma(2, 0, {16, 8}, {2, 2});
+  LinearLayout pow2 = acc.toLinearLayout({128, 128});
+  ScopedAllowNpot npot;
+  std::vector<std::vector<int32_t>> accLanes = {
+      {0, 2}, {0, 4}, {1, 0}, {2, 0}, {4, 0}};
+  EXPECT_EQ(toLinearLayout({128, 96}, acc),
+            mixedRadix({{0, 1}, {8, 0}, {0, 16}, {0, 32}, {32, 0}, {64, 0}},
+                       {2, 2, 2, 3, 2, 2}, accLanes, {{0, 8}, {16, 0}}, 128,
+                       96));
+  EXPECT_EQ(toLinearLayout({48, 96}, mma(2, 0, {16, 8}, {1, 4})),
+            mixedRadix({{0, 1}, {8, 0}, {0, 32}, {16, 0}}, {2, 2, 3, 3},
+                       accLanes, {{0, 8}, {0, 16}}, 48, 96));
+  // B repeats over K first, then over N's two-part and odd part.
+  EXPECT_EQ(toLinearLayout({64, 96}, dot(acc, 1, 2)),
+            mixedRadix({{1, 0}, {8, 0}, {16, 0}, {32, 0}, {0, 16}, {0, 32}},
+                       {2, 2, 2, 2, 2, 3},
+                       {{2, 0}, {4, 0}, {0, 1}, {0, 2}, {0, 4}},
+                       {{0, 8}, {0, 0}}, 64, 96));
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(acc.toLinearLayout({128, 128}), pow2);
+}
+
 TEST_F(LinearLayoutConversionsTest, MMAv3_64x16) {
   SmallVector<SmallVector<unsigned>, 2> instrShapes = {{16, 16, 8}, {16, 8, 8}};
   for (auto instrShape : instrShapes) {
