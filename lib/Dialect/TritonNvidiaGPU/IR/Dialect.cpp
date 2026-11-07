@@ -381,6 +381,26 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
          "numWarps must be a power of 2 and >= 4");
   assert(atom != TMemAccessAtom::I16x32bx2 &&
          "This layout is inferred sometimes for the 32x32b atom");
+  // NPOT N: the pow2 chunk's layout times the odd part as the outermost
+  // register digit, the form computeTMemLdStEncodingInfo lowers.
+  int64_t n = memType.getShape().back();
+  FailureOr<gpu::MemDescType> chunkTy = failure();
+  if (!llvm::isPowerOf2_64(n))
+    chunkTy = getNpotTMemChunkType(memType);
+  if (succeeded(chunkTy)) {
+    auto chunk = getDistributedLayoutForTmemLdSt(*chunkTy, atom, numWarps);
+    if (!chunk)
+      return std::nullopt;
+    auto kReg = StringAttr::get(memType.getContext(), "register");
+    int32_t odd = n / chunkTy->getShape().back();
+    LinearLayout::BasesT bases;
+    bases[kReg] = {{1}};
+    LinearLayout::RadicesT radices;
+    radices[kReg] = {odd};
+    auto dims = to_vector(chunk->getOutDimNames());
+    return *chunk * LinearLayout(std::move(bases), std::move(radices),
+                                 {{dims[1], odd}}, /*requireSurjective=*/true);
+  }
   auto ll = toLinearLayout(memType);
   auto bitwidth = memType.getElementTypeBitWidth();
   return getDistributedLayoutForTmemLdSt(ll, atom, numWarps, bitwidth);
@@ -432,7 +452,8 @@ getTmemLoadLayoutSplitLongM(RankedTensorType tensorType, MemDescType memType,
       std::swap(bases[kWarp][2], bases[kLane][4]);
       return LinearEncodingAttr::get(
           tensorType.getContext(),
-          LinearLayout(std::move(bases), ret.getOutDims(), ret.isSurjective()));
+          LinearLayout(std::move(bases), ret.getInputRadices(),
+                       ret.getOutDims(), ret.isSurjective()));
     }
   }
   return std::nullopt;

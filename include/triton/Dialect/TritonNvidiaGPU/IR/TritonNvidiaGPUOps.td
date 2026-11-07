@@ -450,6 +450,7 @@ def TTNG_WarpGroupDotOp
               [DeclareOpInterfaceMethods<InferTypeOpInterface>,
                DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
                DeclareOpInterfaceMethods<DotOpInterface>,
+               MixedRadixLayoutTrait,
                TypesMatchWith<"result's type matches accumulator's type", "d",
                               "c", "$_self">]> {
   let summary = "warp group dot";
@@ -482,6 +483,7 @@ def TTNG_WarpGroupDotOp
 def TTNG_WarpGroupDotWaitOp
     : TTNG_Op<"warp_group_dot_wait", [DeclareOpInterfaceMethods<
                                           InferTypeOpInterface>,
+                                      MixedRadixLayoutTrait,
                                       AllTypesMatch<["inputs", "outputs"]>]> {
   let summary = "warp group dot wait";
   let arguments = (ins Variadic<TTG_TensorOrMemDesc>:$inputs, I32Attr:$pendings,
@@ -1368,7 +1370,8 @@ def TTNG_TMEMWaitOp : TTNG_Op<"tmem_wait"> {
   let assemblyFormat = "$kind attr-dict";
 }
 
-def TTNG_TMEMLoadOp : TTNG_Op<"tmem_load", [AttrSizedResultSegments]> {
+def TTNG_TMEMLoadOp : TTNG_Op<"tmem_load", [AttrSizedResultSegments,
+                                            MixedRadixLayoutTrait]> {
   let summary = "Load a buffer from tensor memory into a distributed tensor";
 
   let description = [{
@@ -1468,7 +1471,8 @@ def TTNG_TMEMLoadOp : TTNG_Op<"tmem_load", [AttrSizedResultSegments]> {
 
 def TTNG_TMEMStoreOp
     : TTNG_Op<
-          "tmem_store", [DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
+          "tmem_store", [DeclareOpInterfaceMethods<PredicatedOpInterface>,
+                         MixedRadixLayoutTrait]> {
   let summary = "Store a distributed tensor into a buffer in tensor memory";
   let hasCanonicalizeMethod = 1;
 
@@ -1497,7 +1501,8 @@ def TTNG_TMEMStoreOp
 
 def TTNG_TMEMAllocOp
     : TTNG_Op<
-          "tmem_alloc", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+          "tmem_alloc", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                         MixedRadixLayoutTrait]> {
   let summary = "allocate tensor memory";
   let description = [{
     This operation allocates a buffer in tensor memory and returns a descriptor
