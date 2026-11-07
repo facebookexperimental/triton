@@ -128,6 +128,82 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// #mma1 and #mma are the same layout at 64x192, so the accumulator convert is
+// free and RLC keeps the epilogue in #mma (as the pow2 control does) instead of
+// moving it to #linear.
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [32, 0], [0, 64]], lane = [[0, 8], [0, 16], [0, 32], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [64, 192]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
+#mma1 = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 192, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @identical_mma_epilogue
+  // CHECK: %[[A:.*]] = ttg.convert_layout %{{.*}} : tensor<64x192xf32, #mma1> -> tensor<64x192xf32, #mma>
+  // CHECK: %[[Q:.*]] = arith.divf %[[A]], %{{.*}} : tensor<64x192xf32, #mma>
+  // CHECK: %[[H:.*]] = arith.truncf %[[Q]] : tensor<64x192xf32, #mma> to tensor<64x192xf16, #mma>
+  // CHECK: ttg.convert_layout %[[H]] : tensor<64x192xf16, #mma> -> tensor<64x192xf16, #linear>
+  tt.func public @identical_mma_epilogue(%a: !ttg.memdesc<64x64xf16, #shared, #smem>, %b: !ttg.memdesc<64x64xf16, #shared1, #smem>, %v: !ttg.memdesc<64x192xf16, #shared1, #smem>, %po: !tt.ptr<f16>) {
+    %z = arith.constant dense<0.0> : tensor<64x64xf32, #mma>
+    %z1 = arith.constant dense<0.0> : tensor<64x192xf32, #mma1>
+    %s = ttng.warp_group_dot %a, %b, %z : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x64xf16, #shared1, #smem> -> tensor<64x64xf32, #mma>
+    %acc = ttng.warp_group_dot %a, %v, %z1 : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x192xf16, #shared1, #smem> -> tensor<64x192xf32, #mma1>
+    %l = "tt.reduce"(%s) <{axis = 1 : i32}> ({
+    ^bb0(%x: f32, %y: f32):
+      %r = arith.addf %x, %y : f32
+      tt.reduce.return %r : f32
+    }) : (tensor<64x64xf32, #mma>) -> tensor<64xf32, #ttg.slice<{dim = 1, parent = #mma}>>
+    %le = tt.expand_dims %l {axis = 1 : i32} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #mma}>> -> tensor<64x1xf32, #mma>
+    %lc = ttg.convert_layout %le : tensor<64x1xf32, #mma> -> tensor<64x1xf32, #mma1>
+    %lb = tt.broadcast %lc : tensor<64x1xf32, #mma1> -> tensor<64x192xf32, #mma1>
+    %q = arith.divf %acc, %lb : tensor<64x192xf32, #mma1>
+    %h = arith.truncf %q : tensor<64x192xf32, #mma1> to tensor<64x192xf16, #mma1>
+    %o = ttg.convert_layout %h : tensor<64x192xf16, #mma1> -> tensor<64x192xf16, #linear>
+    %pp = tt.splat %po : !tt.ptr<f16> -> tensor<64x192x!tt.ptr<f16>, #linear>
+    tt.store %pp, %o : tensor<64x192x!tt.ptr<f16>, #linear>
+    tt.return
+  }
+}
+
+// -----
+
+// Pow2 control: the same epilogue at 64x256.
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
+#mma1 = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 256, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @pow2_mma_epilogue
+  // CHECK: %[[A:.*]] = ttg.convert_layout %{{.*}} : tensor<64x256xf32, #mma1> -> tensor<64x256xf32, #mma>
+  // CHECK: %[[Q:.*]] = arith.divf %[[A]], %{{.*}} : tensor<64x256xf32, #mma>
+  // CHECK: %[[H:.*]] = arith.truncf %[[Q]] : tensor<64x256xf32, #mma> to tensor<64x256xf16, #mma>
+  // CHECK: ttg.convert_layout %[[H]] : tensor<64x256xf16, #mma> -> tensor<64x256xf16, #blocked>
+  tt.func public @pow2_mma_epilogue(%a: !ttg.memdesc<64x64xf16, #shared, #smem>, %b: !ttg.memdesc<64x64xf16, #shared1, #smem>, %v: !ttg.memdesc<64x256xf16, #shared1, #smem>, %po: !tt.ptr<f16>) {
+    %z = arith.constant dense<0.0> : tensor<64x64xf32, #mma>
+    %z1 = arith.constant dense<0.0> : tensor<64x256xf32, #mma1>
+    %s = ttng.warp_group_dot %a, %b, %z : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x64xf16, #shared1, #smem> -> tensor<64x64xf32, #mma>
+    %acc = ttng.warp_group_dot %a, %v, %z1 : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared1, #smem> -> tensor<64x256xf32, #mma1>
+    %l = "tt.reduce"(%s) <{axis = 1 : i32}> ({
+    ^bb0(%x: f32, %y: f32):
+      %r = arith.addf %x, %y : f32
+      tt.reduce.return %r : f32
+    }) : (tensor<64x64xf32, #mma>) -> tensor<64xf32, #ttg.slice<{dim = 1, parent = #mma}>>
+    %le = tt.expand_dims %l {axis = 1 : i32} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #mma}>> -> tensor<64x1xf32, #mma>
+    %lc = ttg.convert_layout %le : tensor<64x1xf32, #mma> -> tensor<64x1xf32, #mma1>
+    %lb = tt.broadcast %lc : tensor<64x1xf32, #mma1> -> tensor<64x256xf32, #mma1>
+    %q = arith.divf %acc, %lb : tensor<64x256xf32, #mma1>
+    %h = arith.truncf %q : tensor<64x256xf32, #mma1> to tensor<64x256xf16, #mma1>
+    %o = ttg.convert_layout %h : tensor<64x256xf16, #mma1> -> tensor<64x256xf16, #blocked>
+    %pp = tt.splat %po : !tt.ptr<f16> -> tensor<64x256x!tt.ptr<f16>, #blocked>
+    tt.store %pp, %o : tensor<64x256x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // Pow2 control: the same column sum at 128x128.
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 128, 16]}>
