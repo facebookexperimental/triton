@@ -180,6 +180,12 @@ public:
   virtual std::optional<std::string>
   getDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
                           StringRef target, int numWarps) const = 0;
+
+  // Why a global-to-shared async `copy` of mixed-radix `layout` can't lower on
+  // `target`, or std::nullopt.
+  virtual std::optional<std::string>
+  getAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout,
+                                StringRef target) const = 0;
 };
 
 // The ttg.target of `op`'s module, or "" if it has none.
@@ -190,6 +196,10 @@ StringRef getModuleTarget(Operation *op);
 std::optional<std::string>
 getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
                             StringRef target, int numWarps);
+
+// The same for a global-to-shared async `copy` of mixed-radix `layout`.
+std::optional<std::string>
+getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout);
 
 // Descriptor gather and scatter have restrictions on the tile sizes.
 LogicalResult verifyGatherScatterResultType(Operation *op,
