@@ -82,7 +82,8 @@ LogicalResult lowerLdStMatrix(
   auto *ctx = loc.getContext();
   assert(regLayout.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
          "expected register broadcasting to be removed by the caller");
-  if (isa<PaddedSharedEncodingAttr>(memDescType.getEncoding())) {
+  if (isa<PaddedSharedEncodingAttr>(memDescType.getEncoding()) ||
+      !regLayout.isRadix2()) {
     return failure();
   }
   if (SharedMemoryObject::getMaskSpanOffsetsAndBlocks(memDescType).second !=
