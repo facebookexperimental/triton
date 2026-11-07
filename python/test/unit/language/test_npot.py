@@ -526,28 +526,26 @@ def test_npot_gather(N, num_warps, kept):
 @pytest.mark.parametrize("N", [96, 128])
 def test_npot_atomics(N):
     """atomic_add masks the pad lanes, so the canary past N is untouched;
-    atomic_cas has no mask and fails to compile with an error at N=96."""
+    eight programs race an atomic_cas on each [32, N] element and one wins."""
 
     @triton.jit
     def add(Z, N: tl.constexpr):
         tl.atomic_add(Z + tl.arange(0, N), 1.0)
 
     @triton.jit
-    def cas(Z, N: tl.constexpr):
-        i = tl.arange(0, N)
-        tl.atomic_cas(Z + i, i, i + 1)
+    def cas(Z, W, N: tl.constexpr):
+        i = tl.reshape(tl.arange(0, 32 * N), (32, N))
+        old = tl.atomic_cas(Z + i, i * 0, i * 0 + tl.program_id(0) + 1)
+        tl.atomic_add(W + i, (old == 0).to(tl.int32))
 
     z = torch.zeros(128, device="cuda")
     z[N:] = -1.0
     add[(1, )](z, N=N)
     assert bool((z[:N] == 1.0).all()) and bool((z[N:] == -1.0).all())
-    c = torch.arange(N, device="cuda", dtype=torch.int32)
-    if N == 96:
-        with pytest.raises(RuntimeError, match="'tt.atomic_cas' op on an NPOT tensor is unsupported"):
-            cas[(1, )](c, N=N)
-    else:
-        cas[(1, )](c, N=N)
-        assert torch.equal(c, torch.arange(1, N + 1, device="cuda", dtype=torch.int32))
+    c = torch.zeros(32 * N, device="cuda", dtype=torch.int32)
+    w = torch.zeros(32 * N, device="cuda", dtype=torch.int32)
+    cas[(8, )](c, w, N=N)
+    assert bool((w == 1).all()) and bool(((c >= 1) & (c <= 8)).all())
 
 
 @requires_gpu
