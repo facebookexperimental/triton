@@ -550,3 +550,83 @@ def test_unreadable_gluon_audit_only_blocks_gluon_cpu_placement(tmp_path, policy
         (directory / "conftest.py").write_text(policy)
     assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, spec) is not None
     assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, suites["cpu"]["codegen"]) is None
+
+
+def test_fast_automatic_runs_are_pr_only():
+    workflow = yaml.load((ROOT / ".github/workflows/fast-gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
+    assert set(workflow["on"]) == {"pull_request", "workflow_dispatch"}
+
+
+@pytest.mark.parametrize("paths,expected", [
+    (["README.md"], set()),
+    (["test/Conversion/reduce.mlir"], set()),
+    (["third_party/tlx/ops/kernels/mm/sm100.py"], {"b200"}),
+    (["third_party/amd/backend/compiler.py"], {"mi350"}),
+    (["python/triton/runtime/jit.py"], {"h100", "b200", "mi350"}),
+    ([".github/fast-test-suites.json"], {"h100", "b200", "mi350"}),
+    ([".github/actions/setup-test-env/action.yml"], {"h100", "b200", "mi350"}),
+    (None, {"h100", "b200", "mi350"}),
+])
+def test_fast_suites_preserve_affected_platform_routing(paths, expected):
+    from fast_tests import select
+    selected = select(paths, FILTERS)
+    assert {key for key in FILTERS if selected[key]} == expected
+    assert selected["cpu"] == selected["build"] == bool(expected)
+
+
+@pytest.mark.parametrize("path,platform,targets", [
+    ("python/test/unit/tlx_ops/test_flash_attn_gfx950.py", "mi350",
+     ["python/test/unit/tlx_ops/test_flash_attn_gfx950.py::test_flash_attn_gfx950_forward_and_backward"]),
+    ("third_party/tlx/tutorials/blackwell_gemm_clc.py", "b200",
+     ["third_party/tlx/tutorials/testing/test_correctness.py::test_blackwell_gemm_clc"]),
+    ("python/test/unit/tlx_ops/test_mm_sm100.py", "b200", [
+        "python/test/unit/tlx_ops/test_mm_sm100.py::test_kernel_legacy_positional_launch_matches_reference",
+        "python/test/unit/tlx_ops/test_mm_sm100.py::test_npot_block_n_matches_reference"
+    ]),
+])
+def test_fast_pr_selects_corresponding_critical_tests(path, platform, targets):
+    from fast_tests import fast_plan, SUITES
+    suites = json.loads(SUITES.read_text())
+    selected, plans = fast_plan([path], ROOT, FILTERS, suites, True)
+    assert {key for key in FILTERS if selected[key]} == {platform}
+    assert plans[platform] == targets
+
+
+@pytest.mark.parametrize("paths,narrow", [
+    (["python/triton/runtime/jit.py"], True),
+    (["python/test/unit/tlx_ops/conftest.py"], True),
+    (["python/test/unit/tlx_ops/test_addmm_sm100.py"], True),
+    ([
+        "third_party/tlx/tutorials/testing/test_correctness_autows.py",
+        "third_party/tlx/tutorials/blackwell_gemm_clc.py"
+    ], True),
+    (["python/test/unit/tlx_ops/test_addmm_sm100.py", "third_party/tlx/tutorials/blackwell_gemm_clc.py"], True),
+    (["python/test/unit/tlx_ops/test_flash_attn_sm100.py"], False),
+])
+def test_fast_shared_unknown_and_manual_changes_retain_critical_coverage(paths, narrow):
+    from fast_tests import fast_plan, SUITES
+    suites = json.loads(SUITES.read_text())
+    selected, plans = fast_plan(paths, ROOT, FILTERS, suites, narrow)
+    assert selected["b200"] and plans["b200"] == suites["b200"]
+
+
+@pytest.mark.parametrize("content", [
+    '<testsuite/>',
+    '<testsuite><testcase classname="tests.smoke" name="test_other"/></testsuite>',
+    '<testsuite><testcase classname="tests.smoke" name="test_required"><skipped/></testcase></testsuite>',
+    '<testsuite><testcase classname="tests.smoke" name="test_required"><failure/></testcase></testsuite>',
+])
+def test_fast_suite_requires_executed_passing_evidence(tmp_path, content):
+    from fast_tests import verify_evidence
+    path = tmp_path / "results.xml"
+    path.write_text(content)
+    with pytest.raises(ValueError):
+        verify_evidence(["tests/smoke.py::test_required"], path)
+
+
+def test_fast_suite_accepts_passing_parameterized_evidence(tmp_path):
+    from fast_tests import verify_evidence
+    path = tmp_path / "results.xml"
+    path.write_text('<testsuites><testsuite><testcase classname="tests.smoke" name="test_required[fp16]"/> '
+                    '<testcase classname="tests.smoke" name="test_required[bf16]"/></testsuite></testsuites>')
+    assert verify_evidence(["tests/smoke.py::test_required"], path) == 2

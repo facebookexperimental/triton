@@ -36,6 +36,7 @@ BUMP_PREFIX = "scratch/meta-llvm-bump/"
 
 #: Step name -> test group. A step with a group is a test step; any other step is setup.
 GROUPS = [
+    (r"^Run fast correctness tests$", "Fast correctness"),
     (r"^Run TLX (core|unit) tests$", "TLX core"),  # MI350 called it "unit" until its rename
     (r"^Run TLX tutorial correctness tests$", "Tutorial correctness"),
     (r"^Run (device-agnostic TLX codegen|codegen) tests$", "TLX codegen"),
@@ -60,7 +61,7 @@ JOB_GROUPS = [
 INFRA_STEP = re.compile(
     r"set up job|checkout|download prebuilt|install triton|upload wheel|build wheel|setup tritonbench|"
     r"authenticate|azure|aws|restore ccache|tune nvidia|check amd gpu|fail if the build job|"
-    r"select kernel-affected|set up test environment|set up CPU environment|set up Python|"
+    r"select kernel-affected|set up test environment|set up CPU environment|set up Python|check GPU|"
     r"install prebuilt triton|resolve tritonbench ref|install tritonbench dependencies", re.I)
 
 
@@ -140,7 +141,8 @@ WAIT_GRACE_MIN = 2
 #: Workflows whose runs hold GPU jobs.
 #: The TLX ops perf bench, run on each GPU after every nightly release ("b200 / bench").
 BENCH_WF = "nightly-tlx-ops-bench.yml"
-GPU_RUN_WORKFLOWS = ("gpu-tests.yml", "gpu-tests-nightly.yml", BENCH_WF)
+FAST_WF = "fast-gpu-tests.yml"
+GPU_RUN_WORKFLOWS = ("gpu-tests.yml", "gpu-tests-nightly.yml", BENCH_WF, FAST_WF)
 #: Compiler LIT Tests: one job builds Triton and runs lit; it triggers on pushes to main only.
 LIT_WF = "compiler.yml"
 LIT_JOB = "LIT Tests"
@@ -167,7 +169,8 @@ def _gpu_jobs(run):
 
 
 def test_platform_of(run, job):
-    if run.get("wf") == "gpu-tests.yml" and job["name"] == CPU_JOB:
+    if ((run.get("wf") == "gpu-tests.yml" and job["name"] == CPU_JOB)
+            or (run.get("wf") == FAST_WF and job["name"] == "CPU fast correctness")):
         return "CPU"
     return gpu_of(run, job)
 
@@ -175,7 +178,7 @@ def test_platform_of(run, job):
 def _test_jobs(run):
     return [(test_platform_of(run, job), job)
             for job in run.get("jobs") or []
-            if test_platform_of(run, job) and (job["name"] == CPU_JOB or gpu_job(job))]
+            if test_platform_of(run, job) and (test_platform_of(run, job) == "CPU" or gpu_job(job))]
 
 
 def gpu_minutes(run):

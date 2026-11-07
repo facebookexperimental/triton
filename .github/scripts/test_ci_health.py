@@ -177,6 +177,51 @@ def test_compiler_workflow_job_reaches_lit_dashboard():
     assert ch.rules.lit_result({"jobs": [j]}) == ("fail", [{"id": "lit-test"}])
 
 
+def test_lit_cache_preserves_compiler_and_full_test_coverage():
+    import shlex
+    root = Path(__file__).resolve().parents[2]
+    workflow = yaml.load((root / ".github/workflows/compiler.yml").read_text(), Loader=yaml.BaseLoader)
+    job = workflow["jobs"]["lit-tests"]
+    steps = {step["name"]: step for step in job["steps"]}
+    run = steps["Build and run LIT tests"]["run"]
+    configure = shlex.split(run)
+    assert "-DTRITON_CODEGEN_BACKENDS=nvidia;amd;cpu" in configure
+    assert "-DTRITON_BUILD_UT=OFF" in configure
+    assert "-DLLVM_EXTERNAL_LIT=$(which lit)" in configure
+    assert not any(arg.startswith(("-DCMAKE_C_COMPILER=", "-DCMAKE_CXX_COMPILER=")) for arg in configure)
+    assert not {"CC", "CXX"} & job.get("env", {}).keys()
+    assert "ninja -C build check-triton-lit-tests" in run
+    assert "set -o pipefail" in run
+    assert job["env"]["CCACHE_DIR"].endswith("/triton-lit-ccache")
+    assert steps["Restore LIT ccache"]["with"]["path"] == steps["Save LIT ccache"]["with"][
+        "path"] == "${{ env.CCACHE_DIR }}"
+
+
+def test_fast_workflow_preserves_dashboard_and_gpu_usage_contract(tmp_path):
+    workflow = ch.rules.FAST_WF
+    workers = workflow_test_jobs(workflow)
+    assert len(workers) == 4
+    for name, label, steps in workers:
+        platform = ch.rules.test_platform_of({"wf": workflow}, {"name": name})
+        assert platform in ch.rules.TEST_PLATFORMS
+        assert all(ch.rules.group_of(step) for step in steps)
+        item = gh_job(1, name, "failure", [{
+            "name": steps[0], "conclusion": "failure", "number": 1, "started_at": "2026-10-12T01:01:00Z",
+            "completed_at": "2026-10-12T01:04:00Z"
+        }])
+        item["labels"] = ["ubuntu-latest" if platform == "CPU" else platform]
+        stored = ch._record(gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", event="push", head_branch="main"),
+                            workflow)
+        stored["jobs"] = ch._jobs([{"jobs": [item]}])
+        ch._attach_failures(stored["jobs"],
+                            fake_text({1: "2026-10-12T01:02:00Z FAILED smoke.py::test_required - AssertionError: x"}),
+                            workflow)
+        assert ch.rules.run_outcome(stored) == "test"
+        assert ch.rules.gpu_minutes(stored) == (0 if platform == "CPU" else 5)
+        assert ch.rules.main_view([stored], NOW) == ch.rules.main_view([], NOW)
+        assert ch.rules.pr_view([stored], NOW, ch.rules.main_view([], NOW)) == []
+
+
 def test_dashboard_contract_runs_when_its_inputs_change():
     root = Path(__file__).resolve().parents[2]
     workflow = yaml.load((root / ".github/workflows/ci-health.yml").read_text(), Loader=yaml.BaseLoader)
@@ -184,7 +229,8 @@ def test_dashboard_contract_runs_when_its_inputs_change():
     import fnmatch
     inputs = [
         ".github/workflows/gpu-tests.yml", ".github/scripts/gpu_test_selection.py", ".github/gpu-test-suites.json",
-        ".github/actions/run-selected-tests/action.yml"
+        ".github/actions/run-selected-tests/action.yml", ".github/scripts/test_gpu_ci.py",
+        ".github/scripts/test_kernel_test_selection.py", ".github/scripts/wheel_cache.py"
     ]
     inputs += [
         ".github/workflows/" + name for name in (*ch.rules.GPU_WORKFLOWS, *ch.rules.GPU_RUN_WORKFLOWS, ch.rules.LIT_WF,
@@ -237,7 +283,7 @@ def test_collect_lists_gpu_nightly_and_lit_push_runs_only(tmp_path):
     assert {c.split("/workflows/")[1].split("/")[0]
             for c in listed} == {
                 "gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml", "nightly-fbtriton.yml",
-                "compiler.yml"
+                "compiler.yml", "fast-gpu-tests.yml"
             }
     assert [c for c in listed if "/compiler.yml/" in c][0].endswith("&event=push&per_page=100")
 

@@ -26,7 +26,14 @@ on:
       - '.github/scripts/test_ci_health_rules.py'
       - '.github/scripts/test_ci_health_logs.py'
       - '.github/scripts/test_runner_health.py'
+      - '.github/scripts/test_gpu_ci.py'
+      - '.github/scripts/test_kernel_test_selection.py'
+      - '.github/scripts/wheel_cache.py'
       - '.github/scripts/gpu_test_selection.py'
+      - '.github/scripts/fast_tests.py'
+      - '.github/fast-test-suites.json'
+      - '.github/workflows/fast-gpu-tests.yml'
+      - '.github/workflows/_fast-gpu-tests.yml'
       - '.github/gpu-test-paths.json'
       - '.github/gpu-test-suites.json'
       - '.github/scripts/run_selected_tests.py'
@@ -62,11 +69,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python3 -m pip install pytest PyYAML
+      - run: python3 -m pip install pytest PyYAML boto3
       # Also checks that every test step in the GPU workflows maps to a dashboard group.
       - name: Run dashboard tests
         working-directory: .github/scripts
-        run: python3 -m pytest -s --tb=short test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py test_runner_health.py test_meta_llvm_bump.py
+        run: python3 -m pytest -s --tb=short test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py test_runner_health.py test_meta_llvm_bump.py test_gpu_ci.py test_kernel_test_selection.py
 
   collect:
     if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'
