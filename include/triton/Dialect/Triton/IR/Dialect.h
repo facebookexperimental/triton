@@ -186,6 +186,17 @@ public:
   virtual std::optional<std::string>
   getAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout,
                                 StringRef target) const = 0;
+
+  // Why tensor descriptor `op` can't move its tile, of mixed-radix `layout`, on
+  // `target`, or std::nullopt.
+  virtual std::optional<std::string>
+  getDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                 StringRef target) const = 0;
+
+  // Whether an exact descriptor `tile` moves in no more and no narrower
+  // messages than its `padded` tile.
+  virtual bool keepsDescriptorVector(RankedTensorType tile,
+                                     RankedTensorType padded) const = 0;
 };
 
 // The ttg.target of `op`'s module, or "" if it has none.
@@ -200,6 +211,16 @@ getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
 // The same for a global-to-shared async `copy` of mixed-radix `layout`.
 std::optional<std::string>
 getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout);
+
+// The same for a tensor descriptor op on `target`.
+std::optional<std::string>
+getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                   StringRef target);
+
+// Whether descriptor `op` on `target` keeps the vector of its exact `tile`;
+// false without a target.
+bool targetKeepsDescriptorVector(Operation *op, RankedTensorType tile,
+                                 RankedTensorType padded, StringRef target);
 
 // Descriptor gather and scatter have restrictions on the tile sizes.
 LogicalResult verifyGatherScatterResultType(Operation *op,
