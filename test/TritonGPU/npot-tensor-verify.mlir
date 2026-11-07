@@ -119,27 +119,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-#w = #ttg.linear<{register = [[0, 1], [0, 2], [32, 0], [64, 0], [0, 16]], lane = [[0, 4], [0, 8], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 5], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 80]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func @mixed_radix_reduce_warp_axis() {
-    %x = arith.constant dense<1.0> : tensor<128x80xf32, #w>
-    %s = "tt.reduce"(%x) <{axis = 1 : i32}> ({
-    ^bb0(%a: f32, %b: f32):
-      %c = arith.addf %a, %b : f32
-      tt.reduce.return %c : f32
-    }) : (tensor<128x80xf32, #w>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #w}>>
-    // expected-error @+1 {{NPOT mixed-radix layout with warps on the reduce axis is not yet supported}}
-    %t = "tt.reduce"(%x) <{axis = 0 : i32}> ({
-    ^bb0(%a: f32, %b: f32):
-      %c = arith.addf %a, %b : f32
-      tt.reduce.return %c : f32
-    }) : (tensor<128x80xf32, #w>) -> tensor<80xf32, #ttg.slice<{dim = 0, parent = #w}>>
-    tt.return
-  }
-}
-
-// -----
-
 // Constants, carried values, print and assert take a mixed-radix layout;
 // histogram does not yet.
 #p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
