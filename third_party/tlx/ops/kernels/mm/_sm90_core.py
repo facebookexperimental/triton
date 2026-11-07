@@ -146,31 +146,33 @@ def _run_producer(M, N, K, a_desc, b_desc, a, b, bars_empty_a, bars_full_a, bars
                 tlx.async_descriptor_load(b_tail2_desc, tlx.local_view(b_tail2, buf),
                                           [offset_bn + BN + N_TAIL, offset_k], full_b)
 
-            a_1_index = buf + NUM_STAGES
-            empty_a_1 = tlx.local_view(bars_empty_a, a_1_index)
-            full_a_1 = tlx.local_view(bars_full_a, a_1_index)
-            tlx.barrier_wait(empty_a_1, phase)
-            tlx.barrier_expect_bytes(
-                full_a_1,
-                block_m_split * BK * tlx.size_of(tlx.dtype_of(a_desc)),
-            )
-            data_a_1 = tlx.local_view(a, a_1_index)
-            if A_ROW_MAJOR:
-                tlx.async_descriptor_load(
-                    a_desc,
-                    data_a_1,
-                    [offset_am + block_m_split, offset_k],
+            # The second consumer's A tile; a 64-row tile has a single consumer.
+            if NUM_MMA_GROUPS == 2:
+                a_1_index = buf + NUM_STAGES
+                empty_a_1 = tlx.local_view(bars_empty_a, a_1_index)
+                full_a_1 = tlx.local_view(bars_full_a, a_1_index)
+                tlx.barrier_wait(empty_a_1, phase)
+                tlx.barrier_expect_bytes(
                     full_a_1,
-                    eviction_policy=A_EVICTION,
+                    block_m_split * BK * tlx.size_of(tlx.dtype_of(a_desc)),
                 )
-            else:
-                tlx.async_descriptor_load(
-                    a_desc,
-                    data_a_1,
-                    [offset_k, offset_am + block_m_split],
-                    full_a_1,
-                    eviction_policy=A_EVICTION,
-                )
+                data_a_1 = tlx.local_view(a, a_1_index)
+                if A_ROW_MAJOR:
+                    tlx.async_descriptor_load(
+                        a_desc,
+                        data_a_1,
+                        [offset_am + block_m_split, offset_k],
+                        full_a_1,
+                        eviction_policy=A_EVICTION,
+                    )
+                else:
+                    tlx.async_descriptor_load(
+                        a_desc,
+                        data_a_1,
+                        [offset_k, offset_am + block_m_split],
+                        full_a_1,
+                        eviction_policy=A_EVICTION,
+                    )
 
             phase = phase ^ (buf == NUM_STAGES - 1)
             buf = (buf + 1) % NUM_STAGES

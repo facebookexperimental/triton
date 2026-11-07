@@ -130,7 +130,7 @@ SELECTION = re.compile(r"GPU selection for \S+: (\{.*\})")
 
 
 def parse_selection(log_text):
-    """What gpu_test_selection.py chose for a run: {h100, b200, mi350, build, fallback}, or None if not found.
+    """What gpu_test_selection.py chose for a run: {h100, b200, mi350, build, cpu?, fallback}, or None if not found.
     fallback is True when the changed paths were unavailable and every suite ran."""
     found = None
     for line in log_text.splitlines():
@@ -138,5 +138,6 @@ def parse_selection(log_text):
         if m:
             found = {k: v is True for k, v in ast.literal_eval(m.group(1)).items()}
     if found is not None:
-        found["fallback"] = "Cannot determine changed paths" in log_text
+        found["fallback"] = any(message in log_text
+                                for message in ("Cannot determine changed paths", "Cannot select tests"))
     return found

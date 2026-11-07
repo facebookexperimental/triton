@@ -1081,6 +1081,16 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, uint32_t variant) {
              self.create<ROCDL::IglpOpt>(variant);
            })
+      .def("create_amd_packed_dot2",
+           [](TritonOpBuilder &self, Value lhs, Value rhs, Value acc,
+              Type inputType) -> Value {
+             auto lhsType = cast<RankedTensorType>(lhs.getType());
+             auto resultType = RankedTensorType::get(
+                 lhsType.getShape(), self.getBuilder().getF32Type(),
+                 lhsType.getEncoding());
+             return self.create<amdgpu::PackedDot2Op>(resultType, lhs, rhs, acc,
+                                                      TypeAttr::get(inputType));
+           })
       .def("create_warp_vote",
            [](TritonOpBuilder &self, Value pred,
               const std::string &kind) -> mlir::Value {

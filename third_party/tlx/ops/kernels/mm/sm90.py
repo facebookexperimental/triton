@@ -116,7 +116,10 @@ def _workspace_rows_per_split(M, block_m):
     return triton.cdiv(M, block_m) * block_m
 
 
-def _config(block_m, block_n, num_stages, group_size_m=8, split_k=1, block_k=64, swap_ab=False):
+def _config(block_m, block_n, num_stages, group_size_m=8, split_k=1, block_k=64, swap_ab=False, num_mma_groups=None):
+    # One consumer warpgroup per 64 rows: a 64-row tile has a single consumer.
+    if num_mma_groups is None:
+        num_mma_groups = 1 if block_m == 64 else 2
     return triton.Config(
         {
             "BM": block_m,
@@ -124,7 +127,7 @@ def _config(block_m, block_n, num_stages, group_size_m=8, split_k=1, block_k=64,
             "BK": block_k,
             "GROUP_SIZE_M": group_size_m,
             "NUM_STAGES": num_stages,
-            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_GROUPS": num_mma_groups,
             "EPILOGUE_SUBTILE": not swap_ab and _is_pow2(block_n),
             "SPLIT_K": split_k,
             "SWAP_AB": swap_ab,
@@ -153,11 +156,16 @@ def _fits_smem(block_m, block_n, num_stages, split_k, block_k=64, swap_ab=False)
 
 
 _TILES = (
-    # (BM, BN, ring depths)
-    (128, 256, (3, 4)),
-    (256, 128, (3, 4)),
-    (128, 128, (4, 6)),
-    (128, 64, (6, 8)),
+    # (BM, BN, BK, ring depths)
+    (128, 256, 64, (3, 4)),
+    (256, 128, 64, (3, 4)),
+    (128, 128, 64, (4, 6)),
+    (128, 64, 64, (6, 8)),
+    # One consumer warpgroup, for shapes that leave SMs idle with 128-row tiles.
+    # It keeps a single WGMMA in flight, so a 64-wide K step leaves it waiting
+    # on barriers; 128 halves that (704x512x8192: 23.6 vs 31.1 us, cuBLAS 28.9).
+    (64, 128, 128, (3, 4)),
+    (64, 64, 128, (5, 6)),
 )
 
 
@@ -167,15 +175,15 @@ def _full_configs():
     # Split-K variants are generated per tile; the shape prune keeps the ones
     # that fill the GPU.
     configs = []
-    for block_m, block_n, depths in _TILES:
+    for block_m, block_n, block_k, depths in _TILES:
         for split_k in (1, ) + _SPLIT_K_CHOICES:
             for num_stages in depths:
                 # The fp32 split-K epilogue doubles its SMEM; drop to the
                 # deepest ring that still fits rather than skipping the tile.
-                while num_stages > 2 and not _fits_smem(block_m, block_n, num_stages, split_k):
+                while num_stages > 2 and not _fits_smem(block_m, block_n, num_stages, split_k, block_k):
                     num_stages -= 1
                 for group_size_m in ((1, 8) if split_k == 1 else (1, )):
-                    configs.append(_config(block_m, block_n, num_stages, group_size_m, split_k))
+                    configs.append(_config(block_m, block_n, num_stages, group_size_m, split_k, block_k))
     # The SMEM clamp can collapse two depths into one; keep the first.
     unique = {}
     for c in configs + _npot_configs():
@@ -219,13 +227,13 @@ def _mn_tiles(M, N, block_m, block_n):
 
 def _keep_config(c, M, N, K, num_sms):
     kw = c.kwargs
-    bm, bn, split_k = kw["BM"], kw["BN"], kw["SPLIT_K"]
-    if not _fits_smem(bm, bn, kw["NUM_STAGES"], split_k):
+    bm, bn, bk, split_k = kw["BM"], kw["BN"], kw["BK"], kw["SPLIT_K"]
+    if not _fits_smem(bm, bn, kw["NUM_STAGES"], split_k, bk):
         return False
     if bn > 128 and N <= 128:
         return False
     # Smaller tiles only pay off when bigger ones leave SMs idle.
-    if bn == 64 and _mn_tiles(M, N, 128, 128) >= num_sms:
+    if (bn == 64 or bm == 64) and _mn_tiles(M, N, 128, 128) >= num_sms:
         return False
     # Past two waves of 128x256 tiles the wide tile wins, except where N <= 256
     # spans one wide tile: there 128x128 halves the B panel each CTA streams and
@@ -235,7 +243,7 @@ def _keep_config(c, M, N, K, num_sms):
         return False
     if split_k > 1:
         mn_tiles = _mn_tiles(M, N, bm, bn)
-        if mn_tiles * split_k > num_sms or not _split_k_valid(K, split_k):
+        if mn_tiles * split_k > num_sms or not _split_k_valid(K, split_k, bk):
             return False
     return True
 
@@ -257,13 +265,16 @@ def _keep_npot(kept, M, N, K, num_sms, b_row_major):
         return pow2
     if not pow2:
         return npot
-    best_pow2 = min(_per_sm_work(c, M, N, K, num_sms) for c in pow2)
+    # Single-consumer tiles do less per-SM work at lower efficiency; the NPOT
+    # margins below were fitted against the two-consumer tiles.
+    cooperative = [c for c in pow2 if c.kwargs["NUM_MMA_GROUPS"] == 2] or pow2
+    best_pow2 = min(_per_sm_work(c, M, N, K, num_sms) for c in cooperative)
     # A 128x128 cooperative tile is SMEM-bandwidth bound (each consumer re-reads
     # B), and a two-piece 192 tile does more math per byte, so it wins even at
     # equal per-SM work (706x8192x2560: 44.6 vs 46.3 us). Against wider tiles
     # an NPOT tile must cut per-SM work by 3%.
     wide = any(c.kwargs["BM"] * c.kwargs["BN"] > 128 * 128
-               for c in pow2
+               for c in cooperative
                if _per_sm_work(c, M, N, K, num_sms) == best_pow2)
     margin = 0.97 if wide else 1.0
     winners = sorted({c.kwargs["BN"]
@@ -299,8 +310,8 @@ def _prune_full_configs(configs, nargs, **kwargs):
     if N <= 512:
         kept = [c for c in kept if c.kwargs["GROUP_SIZE_M"] == 1] or kept
     return kept or [
-        c for c in configs if _split_k_valid(K, c.kwargs["SPLIT_K"]) and _is_pow2(c.kwargs["BN"])
-        and _fits_smem(c.kwargs["BM"], c.kwargs["BN"], c.kwargs["NUM_STAGES"], c.kwargs["SPLIT_K"])
+        c for c in configs if _split_k_valid(K, c.kwargs["SPLIT_K"], c.kwargs["BK"]) and _is_pow2(c.kwargs["BN"])
+        and _fits_smem(c.kwargs["BM"], c.kwargs["BN"], c.kwargs["NUM_STAGES"], c.kwargs["SPLIT_K"], c.kwargs["BK"])
     ]
 
 
@@ -477,6 +488,13 @@ def _add_bias(acc, bias_vec, ADD_BIAS: tl.constexpr, ALONG_ROWS: tl.constexpr):
 
 
 @triton.jit
+def _wait_for_prior_grid():
+    """Under programmatic dependent launch, block until the previous kernel on
+    the stream has finished and its writes are visible; a no-op otherwise."""
+    tl.inline_asm_elementwise("griddepcontrol.wait; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
 def _reduce_split_k_kernel(workspace_ptr, c_ptr, bias_ptr, M, N, ROWS_PER_SPLIT, stride_bias, SPLIT_K: tl.constexpr,
                            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, OUTPUT_DTYPE: tl.constexpr,
                            ADD_BIAS: tl.constexpr):
@@ -484,10 +502,12 @@ def _reduce_split_k_kernel(workspace_ptr, c_ptr, bias_ptr, M, N, ROWS_PER_SPLIT,
     offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     offs = offs_m[:, None] * N + offs_n[None, :]
+    # The bias is not written by the GEMM, so it loads before the wait.
+    bias_vec = _bias_vec(bias_ptr, tl.program_id(1) * BLOCK_N, N, stride_bias, BLOCK_N, ADD_BIAS)
+    _wait_for_prior_grid()
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for s in tl.static_range(SPLIT_K):
         acc += tl.load(workspace_ptr + s * ROWS_PER_SPLIT * N + offs, mask=mask, other=0.0)
-    bias_vec = _bias_vec(bias_ptr, tl.program_id(1) * BLOCK_N, N, stride_bias, BLOCK_N, ADD_BIAS)
     acc = _add_bias(acc, bias_vec, ADD_BIAS, False)
     tl.store(c_ptr + offs, acc.to(OUTPUT_DTYPE), mask=mask)
 
@@ -507,6 +527,10 @@ def _reduce_split_k(workspace, c, M, N, split_k, bias=None, stride_bias=0):
         BLOCK_N=block_n,
         OUTPUT_DTYPE=_TORCH_TO_TL[c.dtype],
         ADD_BIAS=bias is not None,
+        # Programmatic dependent launch: the reducer is staged while the GEMM
+        # runs and waits on it in-kernel, hiding the launch gap (~1 us on H100,
+        # 608x512x20992), as cuBLAS's splitKreduce does.
+        launch_pdl=True,
     )
 
 
@@ -691,7 +715,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                 N_TAIL2,
             )
 
-        with tlx.async_task(num_warps=4, replicate=2, registers=232):
+        with tlx.async_task(num_warps=4, replicate=NUM_MMA_GROUPS, registers=232):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BM)
             num_pid_n = tl.cdiv(N, BN)

@@ -64,6 +64,67 @@
         y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
     ```
 
+## AMD packed dot2
+
+> `tlx.amd_packed_dot2` currently requires **[gfx950]**.
+
+```python
+tlx.amd_packed_dot2(lhs, rhs, acc, input_dtype)
+```
+
+Compute one two-element floating-point dot product for every packed register
+element:
+
+```text
+result = lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc
+```
+
+`lhs` and `rhs` are block tensors of `tl.uint32`. Each element stores two
+adjacent 16-bit inputs: bits 0–15 hold element 0 and bits 16–31 hold element 1.
+Because the storage type does not describe the packed values,
+`input_dtype` is required and must be `tl.float16` or `tl.bfloat16`.
+`acc` is an FP32 block tensor. All three operands must have identical shapes;
+the result is an FP32 tensor with that same shape and resolved layout.
+
+| Argument | Contract |
+|----------|----------|
+| `lhs`, `rhs` | Same-shaped `tl.uint32` block tensors containing packed pairs |
+| `acc` | FP32 block tensor with the same shape as `lhs` and `rhs` |
+| `input_dtype` | Required constexpr: `tl.float16` or `tl.bfloat16` |
+
+The operation is register-level and does not broadcast operands. Broadcast
+before the call when one packed input is shared:
+
+```python
+pairs = tl.arange(0, BLOCK_K // 2)
+a = tl.load(a_ptr.to(tl.pointer_type(tl.uint32)) + pairs)
+b = tl.load(b_ptr.to(tl.pointer_type(tl.uint32)) + offsets)
+a = tl.broadcast_to(a[None, :], b.shape)
+
+products = tlx.amd_packed_dot2(
+    b,
+    a,
+    tl.zeros(b.shape, tl.float32),
+    input_dtype=tl.bfloat16,
+)
+result = tl.sum(products, axis=1)
+```
+
+The lowering preserves the operation as an LLVM-visible DOT:
+
+| `input_dtype` | LLVM intrinsic |
+|-----------------|----------------|
+| `tl.float16` | `llvm.amdgcn.fdot2` |
+| `tl.bfloat16` | `llvm.amdgcn.fdot2.f32.bf16` |
+
+LLVM therefore tracks the DOT's register dependencies and inserts wait states
+only when the schedule requires them. Do not wrap this operation in inline
+assembly or add a handwritten `s_nop`.
+
+This is an intra-lane packed arithmetic operation. It is distinct from
+`tlx.amd_dot`, which computes a matrix product through MFMA instructions and
+uses distributed matrix/dot-operand layouts.
+
 ## Rubin packed x4 arithmetic
 
 > `tlx.packed_add4`, `tlx.packed_sub4`, `tlx.packed_mul4`, and `tlx.packed_fma4` require **[sm107+]**.
