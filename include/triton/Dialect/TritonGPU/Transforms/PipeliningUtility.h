@@ -101,9 +101,9 @@ int getCopyVecBytes(RankedTensorType registerTy,
 bool canBeConvertedToAsyncLoad(
     triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
 
-// getSharedEncoding and getCopyVecBytes need a radix-2 register layout; NPOT
-// Product loads are not yet supported in shared memory.
-bool hasRadix2Layout(triton::LoadOp load);
+// Whether every op that pipelining `load` through shared memory creates, an
+// async copy and a local_load, lowers its layout on its target.
+bool canPipelineInSharedMemory(triton::LoadOp load);
 
 // Serialize the latencies of the operations in the loops into the latency
 // attribute.
