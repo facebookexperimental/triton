@@ -89,12 +89,13 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   addDynamicallyLegalOp<triton::DotOp>([](triton::DotOp dotOp) -> bool {
     // A mixed-radix dot's operands wait for accelerate-matmul.
     Attribute dEncoding = dotOp.getType().getEncoding();
-    if (dEncoding && !triton::gpu::isRadix2Encoding(dEncoding))
-      return true;
     Attribute aEncoding =
         cast<RankedTensorType>(dotOp.getA().getType()).getEncoding();
     Attribute bEncoding =
         cast<RankedTensorType>(dotOp.getB().getType()).getEncoding();
+    if ((dEncoding && !triton::gpu::isRadix2Encoding(dEncoding)) ||
+        (aEncoding && !triton::gpu::isRadix2Encoding(aEncoding)))
+      return true;
     if (aEncoding && bEncoding &&
         isa<triton::gpu::DotOperandEncodingAttr>(
             triton::tlx::getEffectiveEncoding(aEncoding)) &&
