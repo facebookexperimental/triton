@@ -259,6 +259,123 @@ def test_selector_output_remains_readable_by_dashboard(tmp_path):
     assert selected["fallback"] is False
 
 
+def source_log(sha):
+    return ("2026-10-12T01:01:30Z [command]/usr/bin/git log -1 --format=%H\n"
+            f"2026-10-12T01:01:30Z {sha}\n")
+
+
+def checkout_job(jid, name):
+    return gh_job(
+        jid, name, steps=[{
+            "name": "Checkout", "conclusion": "success", "started_at": "2026-10-12T01:01:00Z", "completed_at":
+            "2026-10-12T01:02:00Z"
+        }])
+
+
+def test_collect_uses_same_attempt_checkout_evidence_for_both_workflows(tmp_path):
+    sha = "a46d2568f456948b74a7e8da5823cca07c3ac370"
+    raw = gh_run(1, "2026-10-12T01:00:00Z", pull_requests=[{"number": 4855}], run_attempt=1)
+    fast = {**raw, "id": 2}
+    jobs = {
+        1: [checkout_job(10, "select"), checkout_job(11, "build / build")], 2:
+        [checkout_job(20, "select"), checkout_job(21, "build / build")]
+    }
+    _, api, text = collect(tmp_path, {"gpu-tests.yml": [raw], ch.rules.FAST_WF: [fast]}, jobs,
+                           logs={jid: source_log(sha)
+                                 for jid in [10, 11, 20, 21]})
+    records = ch.load_runs(str(tmp_path))
+    for item in records.values():
+        assert item["pr"] == 4855 and item["tested_sha"] == sha and item["run_attempt"] == 1
+        assert {e["job"] for e in item["tested_sha_provenance"]} == {"select", "build / build"}
+    assert len(text.calls) == len(set(text.calls)) == 4
+    assert all("filter=latest" in call for call in api.calls if "/jobs?" in call)
+
+
+@pytest.mark.parametrize("only_failed", [True, False])
+def test_collect_refreshes_changed_attempt_without_erasing_history(tmp_path, only_failed):
+    sha = "ab" * 20
+    first = gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", run_attempt=1, pull_requests=[{"number": 4855}])
+    jobs = {
+        1:
+        [checkout_job(10, "select"),
+         checkout_job(11, "build / build"),
+         gh_job(12, "b200 / b200-tlx-test", "failure")]
+    }
+    logs = {
+        10: source_log(sha), 11: source_log(sha), 12:
+        "2026-10-12T01:02:00Z FAILED boundary.py::test_bitwise[False] - AssertionError: bitwise"
+    }
+    collect(tmp_path, {"gpu-tests.yml": [first]}, jobs, logs=logs)
+    retry = {**first, "run_attempt": 2, "conclusion": "success", "updated_at": "2026-10-12T04:00:00Z"}
+    prior_jobs = jobs[1]
+    jobs[1] = [checkout_job(20, "select"), checkout_job(21, "build / build"), gh_job(22, "b200 / b200-tlx-test")]
+    for item in jobs[1]:
+        item["run_attempt"] = 2
+    jobs[1][2]["steps"].insert(0, checkout_job(22, "worker")["steps"][0])
+    jobs[1] = prior_jobs + (jobs[1][2:] if only_failed else jobs[1])
+    _, api, _ = collect(
+        tmp_path, {"gpu-tests.yml": [retry]}, jobs, since=None, now="2026-10-12T05:00:00Z",
+        logs={10: source_log(sha), 11: source_log(sha), 20: source_log(sha), 21: source_log(sha), 22: source_log(sha)})
+    stored = ch.load_runs(str(tmp_path))[1]
+    assert stored["run_attempt"] == 2 and stored["conclusion"] == "success" and stored["tested_sha"] == sha
+    assert stored["attempts"][0]["run_attempt"] == 1 and stored["attempts"][0]["conclusion"] == "failure"
+    assert stored["attempts"][0]["jobs"][2]["steps"][0]["test_failures"][0]["id"].endswith("[False]")
+    assert any("filter=all" in call for call in api.calls if "/jobs?" in call)
+    assert len(stored["jobs"]) == 3 and stored["jobs"][2]["id"] == 22
+    assert any("created=>=2026-10-05T05:00:00Z" in call for call in api.calls if "/gpu-tests.yml/" in call)
+    _, api, _ = collect(tmp_path, {"gpu-tests.yml": [retry]}, jobs, since=None, now="2026-10-12T06:00:00Z")
+    assert not any("/jobs?" in call for call in api.calls)
+    assert len(ch.load_runs(str(tmp_path))[1]["attempts"]) == 1
+
+
+@pytest.mark.parametrize("wf", ["gpu-tests.yml", ch.rules.LIT_WF, ch.rules.BENCH_WF])
+def test_collect_preserves_completed_push_history_on_rerun(tmp_path, wf):
+    first = gh_run(1, "2026-10-12T01:00:00Z", event="push", run_attempt=1, head_branch="main")
+    collect(tmp_path, {wf: [first]})
+    original = ch.load_runs(str(tmp_path))[1]
+    retry = {**first, "run_attempt": 2, "conclusion": "failure"}
+    _, api, text = collect(tmp_path, {wf: [retry]}, since=None)
+    assert ch.load_runs(str(tmp_path))[1] == original
+    assert not any("/jobs?" in call for call in api.calls) and text.calls == []
+
+
+@pytest.mark.parametrize("readable", [True, False])
+def test_collect_enriches_recent_legacy_pr_once_with_cached_jobs(tmp_path, readable):
+    sha = "ab" * 20
+    raw = gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", pull_requests=[{"number": 4855}])
+    jobs = {
+        1: [
+            checkout_job(10, "select"),
+            checkout_job(11, "build / build"),
+            gh_job(12, "mi350 / mi350-tlx-test", "failure")
+        ]
+    }
+    logs = {
+        10: source_log(sha), 11: source_log(sha), 12:
+        "2026-10-12T01:02:00Z FAILED x.py::test_bitwise[False] - AssertionError: bitwise"
+    }
+    collect(tmp_path, {"gpu-tests.yml": [raw]}, jobs, logs=logs)
+    records = ch.load_runs(str(tmp_path))
+    legacy = records[1]
+    for key in ["tested_sha", "tested_sha_provenance", "provenance_version", "run_attempt"]:
+        legacy.pop(key, None)
+    for job in legacy["jobs"]:
+        job.pop("run_attempt", None)
+        for step in job["steps"]:
+            step.pop("test_failures", None)
+    prior = ch.rules.pr_view([legacy], NOW, ch.rules.main_view([], NOW))
+    ch.save_runs(str(tmp_path), records)
+    _, api, text = collect(tmp_path, {"gpu-tests.yml": [raw]}, jobs, since=None, logs=logs if readable else {})
+    updated = ch.load_runs(str(tmp_path))[1]
+    assert updated["provenance_version"] == 1
+    assert updated["tested_sha"] == (sha if readable else None)
+    assert ch.rules.pr_view([updated], NOW, ch.rules.main_view([], NOW)) == prior
+    assert not any("/jobs?" in call for call in api.calls)
+    assert len(text.calls) == 3
+    _, _, text = collect(tmp_path, {"gpu-tests.yml": [raw]}, jobs, since=None, logs=logs)
+    assert text.calls == []
+
+
 def test_collect_stores_completed_runs_with_jobs_and_keeps_cursor_at_running(tmp_path):
     runs = {
         "gpu-tests.yml": [gh_run(1, "2026-10-12T01:00:00Z"),
