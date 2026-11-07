@@ -297,11 +297,22 @@ void init_triton_tlx_ir(py::module_ &m) {
                          ? IntegerAttr()
                          : self.getBuilder().getI32IntegerAttr(selector);
             };
-            return self.create<amdgpu::ScheduledMfmaScaledOp>(
+            auto op = self.create<amdgpu::ScheduledMfmaScaledOp>(
                 acc.getType(), a, b, acc, aScale, bScale, aFormatAttr,
                 bFormatAttr, residentOperandAttr, accumulatorRoleAttr,
                 accumulatorRegisterClassAttr, initializeAttr,
                 selectorAttr(aScaleSelector), selectorAttr(bScaleSelector));
+            if (accumulatorRegisterClass != "auto" ||
+                accumulatorRole == "persistent") {
+              StringRef cdClass = accumulatorRegisterClass == "agpr" ||
+                                          (accumulatorRegisterClass == "auto" &&
+                                           accumulatorRole == "persistent")
+                                      ? "a"
+                                      : "v";
+              op->setAttr("amdg.cd_regclass",
+                          self.getBuilder().getStringAttr(cdClass));
+            }
+            return op.getResult();
           },
           py::arg("a"), py::arg("b"), py::arg("acc"), py::arg("a_scale"),
           py::arg("b_scale"), py::arg("a_format"), py::arg("b_format"),
