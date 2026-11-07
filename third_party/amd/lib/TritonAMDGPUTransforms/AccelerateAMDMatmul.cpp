@@ -1935,6 +1935,28 @@ struct AmdNpotTargetLegality : public tt::NpotTargetLegality {
                                                      int) const override {
     return ("NPOT dot is not yet supported on " + target).str();
   }
+  std::optional<std::string>
+  getAsyncCopyUnsupportedReason(Operation *copy, const tt::LinearLayout &layout,
+                                StringRef target) const override {
+    ttg::MemDescType dstTy;
+    if (auto asyncCopy = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(copy))
+      dstTy = asyncCopy.getResult().getType();
+    else if (auto bufferLoad =
+                 dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(copy))
+      dstTy = bufferLoad.getDest().getType();
+    else
+      return ("NPOT async copy is not yet supported on " + target).str();
+    triton::AMD::TargetInfo targetInfo(target.split(':').second);
+    unsigned elemBitWidth = dstTy.getElementTypeBitWidth();
+    unsigned vectorSize = std::max(128u / elemBitWidth, 1u);
+    if (std::optional<std::string> reason =
+            LLVM::AMD::getNpotDirectToLdsUnsupportedReason(
+                targetInfo, layout, elemBitWidth, dstTy.getEncoding(),
+                dstTy.getAllocShape(), vectorSize))
+      return ("NPOT async copy is not supported on " + target + ": " + *reason)
+          .str();
+    return std::nullopt;
+  }
 };
 } // namespace
 
