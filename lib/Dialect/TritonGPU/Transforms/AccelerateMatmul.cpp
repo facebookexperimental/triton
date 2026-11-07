@@ -1396,7 +1396,8 @@ getTcgen05UnsupportedReason(DotOp dot, nvidia_gpu::Tcgen05Kind kind,
   if (auto reason = nvidia_gpu::getNpotMMAv5TileUnsupportedReason(
           kind, /*aInTmem=*/false, /*bMNMajor=*/true, dot.getTwoCtas(),
           instrShape[0], instrShape[1], shape,
-          dot.getA().getType().getShape().back()))
+          dot.getA().getType().getShape().back(),
+          elemTy.getIntOrFloatBitWidth()))
     return reason;
   if (!hasCoreMatrixForm(dot.getB().getType(), elemTy.isF32() ? 0 : 1))
     return llvm::formatv("NPOT MMAv5 N {0} is not yet supported: B's shared "

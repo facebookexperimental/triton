@@ -1680,11 +1680,28 @@ getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
   return reason;
 }
 
-std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
-    Tcgen05Kind kind, bool aInTmem, bool bMNMajor, bool twoCTAs,
-    unsigned blockM, unsigned blockN, ArrayRef<int64_t> ctaShape, int64_t k) {
-  if (!llvm::isPowerOf2_64(k))
+unsigned getTcgen05InstrK(unsigned bitwidth, unsigned blockM, int64_t k,
+                          bool supports2xFp8) {
+  // 2xfp8 requires M = 128 for 1CTA or 256 for 2CTA, which corresponds to
+  // blockM == 128. Its K=64 must divide K, or the last MMA reads past K.
+  if (supports2xFp8 && bitwidth == 8 && blockM == 128 && k % 64 == 0)
+    return 64;
+  return 256 / bitwidth;
+}
+
+std::optional<std::string>
+getNpotMMAv5TileUnsupportedReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
+                                  bool twoCTAs, unsigned blockM,
+                                  unsigned blockN, ArrayRef<int64_t> ctaShape,
+                                  int64_t k, unsigned bitwidth) {
+  if (kind == Tcgen05Kind::BlockScaled && !llvm::isPowerOf2_64(k))
     return std::string("NPOT MMAv5 K is not yet supported");
+  // 2x fp8 is used only when 64 divides K, so the base instruction K decides.
+  unsigned instrK = getTcgen05InstrK(bitwidth, blockM, k, false);
+  if (kind != Tcgen05Kind::BlockScaled && k % instrK != 0)
+    return ("NPOT MMAv5 K=" + Twine(k) +
+            " is unsupported: tcgen05.mma takes K in steps of " + Twine(instrK))
+        .str();
   if (!llvm::isPowerOf2_64(ctaShape[0]))
     return std::string("NPOT MMAv5 M is not yet supported");
   // The NPOT TMEM ld/st plan covers blockM=128 only.
@@ -1717,7 +1734,8 @@ static LogicalResult verifyNpotMMAv5Tile(Operation *op, Tcgen05Kind kind,
   if (auto reason = getNpotMMAv5TileUnsupportedReason(
           kind, isa<TensorMemoryEncodingAttr>(a.getEncoding()),
           /*bMNMajor=*/!bAttrs || !bAttrs->transposed, twoCTAs,
-          dEnc.getBlockM(), dEnc.getBlockN(), ctaShape, k))
+          dEnc.getBlockM(), dEnc.getBlockN(), ctaShape, k,
+          a.getElementType().getIntOrFloatBitWidth()))
     return op->emitOpError(*reason);
   return success();
 }
