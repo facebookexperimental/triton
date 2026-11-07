@@ -600,9 +600,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %m = arith.muli %pid_m, %c128_i32 : i32
     %n = arith.muli %pid_n, %c128_i32 : i32
     %k_stride = arith.extsi %K : i32 to i64
-    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%k_stride, %c1_i64] : <i8>, <128x64xi8>
+    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%k_stride, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<128x64xi8>
     %n_stride = arith.extsi %N : i32 to i64
-    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%n_stride, %c1_i64] : <i8>, <64x128xi8>
+    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%n_stride, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<64x128xi8>
     %k_ceil = arith.addi %K, %c63_i32 : i32
     %num_k   = arith.divsi %k_ceil, %c64_i32 : i32
     %result:2 = scf.for %iv = %c0_i32 to %num_k step %c1_i32
