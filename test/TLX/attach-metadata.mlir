@@ -1,12 +1,12 @@
 
-// RUN: triton-opt -split-input-file -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:90 num-ctas=1 threads-per-warp=32})' %s| FileCheck %s
+// RUN: triton-opt -split-input-file -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:100 num-ctas=1 threads-per-warp=32})' %s| FileCheck %s
 
 // CHECK: module attributes {
 // CHECK-DAG: triton.skip_generic_pipeline
 // CHECK-DAG: tlx.has_tlx_ops = true
 // CHECK-DAG: "ttg.num-ctas" = 1
 // CHECK-DAG: "ttg.num-warps" = 8
-// CHECK-DAG: ttg.target = "cuda:90"
+// CHECK-DAG: ttg.target = "cuda:100"
 // CHECK-DAG: "ttg.threads-per-warp" = 32
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
 module {
@@ -58,7 +58,7 @@ module {
 // CHECK-DAG: tlx.has_explicit_local_mem_access = true
 // CHECK-DAG: "ttg.num-ctas" = 1
 // CHECK-DAG: "ttg.num-warps" = 8
-// CHECK-DAG: ttg.target = "cuda:90"
+// CHECK-DAG: ttg.target = "cuda:100"
 // CHECK-DAG: "ttg.threads-per-warp" = 32
 // CHECK-NOT: tlx.has_tlx_ops
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>

@@ -61,7 +61,8 @@ public:
   bool supportsI8Tcgen05MMA() const { return computeCapability == 100; }
   bool supportsTcgen05() const {
     int architectureFamily = computeCapability / 10;
-    return architectureFamily == 10 || architectureFamily == 11;
+    return architectureFamily == 10 || architectureFamily == 11 ||
+           architectureFamily == 12;
   }
   bool supportsExclusiveTMEMAlloc() const { return computeCapability == 107; }
   int getMaxTMEMColumns() const {
