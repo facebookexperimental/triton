@@ -394,6 +394,16 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
                                               ArrayRef<int64_t> shape);
 SmallVector<int64_t> getAllocationShapePerCTA(Type type);
 
+// Returns the layout of a rank-2 NPOT tile allocated without its pow2 cover:
+// the cover's layout when it maps [0, product(tile)) onto the tile, or, for
+// NPOT rows across whole panels, the cover's panels at stride rows * width.
+// Swizzled and rotating panels span the contiguous dim's pow2 part; a padded
+// tile gives its linear component. Otherwise sets `reason` and fails, and the
+// tile keeps its cover.
+FailureOr<LinearLayout> getNpotDenseSharedLayout(Attribute layout,
+                                                 ArrayRef<int64_t> tile,
+                                                 std::string *reason = nullptr);
+
 // Returns the layout-ranked suffix, dropping a leading pipelining dimension.
 template <typename T>
 ArrayRef<T> dropPipeliningDim(ArrayRef<T> shape, Attribute layout) {
@@ -411,7 +421,8 @@ int64_t getAllocationElems(Attribute layout, ArrayRef<int64_t> shape,
                            ArrayRef<int64_t> allocShape = {});
 
 // Returns whether a shared allocation holds the footprint of its layout, which
-// is built on allocShape rounded up to pow2.
+// is built on allocShape rounded up to pow2. A tile that
+// getNpotDenseSharedLayout accepts holds it exactly.
 bool holdsNpotPow2AllocShape(Attribute layout, ArrayRef<int64_t> allocShape);
 
 // MemDescType::verify's power-of-two test: every layout dimension but a leading
@@ -494,6 +505,12 @@ getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
 unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
                              unsigned vector, ArrayRef<unsigned> order,
                              int numWarps, int threadsPerWarp);
+
+// Registers per shared access of a mixed-radix `regLayout`: leading register
+// digits at consecutive offsets through the pow2 `toOffset`, at most 128 bits,
+// cut until every run starts aligned.
+int32_t getMixedRadixSharedRun(const LinearLayout &regLayout,
+                               const LinearLayout &toOffset, unsigned bitwidth);
 
 // Dump information about which threads/registers contain each of the tensor
 // elements.
