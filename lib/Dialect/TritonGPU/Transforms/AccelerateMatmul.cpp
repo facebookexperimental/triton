@@ -1275,6 +1275,11 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
                                                      int) const override {
     return ("NPOT dot is not yet supported on " + target).str();
   }
+  std::optional<std::string>
+  getAsyncCopyUnsupportedReason(Operation *, const LinearLayout &,
+                                StringRef) const override {
+    return std::nullopt;
+  }
 };
 } // namespace
 
