@@ -233,9 +233,25 @@ tt.func @atomic_rmw(%ptr: !tt.ptr<f32>) {
 
 // -----
 
+// A CAS has no padded lowering, so its connected component stays exact though
+// the total in-dim size would pad.
+// CHECK-LABEL: @atomic_cas
 tt.func @atomic_cas(%ptr: !tt.ptr<i32>) {
+  // CHECK: tt.atomic_cas {{.*}} -> tensor<96xi32>
   %p = tt.splat %ptr : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
   %v = arith.constant dense<1> : tensor<96xi32>
+  %r = tt.atomic_cas acq_rel, gpu, %p, %v, %v : (tensor<96x!tt.ptr<i32>>, tensor<96xi32>, tensor<96xi32>) -> tensor<96xi32>
+  tt.return
+}
+
+// -----
+
+// tt.join takes no mixed-radix layout, so the connected component pads and the
+// CAS is rejected.
+tt.func @atomic_cas_join(%ptr: !tt.ptr<i32>) {
+  %p = tt.splat %ptr : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
+  %v = arith.constant dense<1> : tensor<96xi32>
+  %j = tt.join %v, %v : tensor<96xi32> -> tensor<96x2xi32>
   // expected-error @+1 {{'tt.atomic_cas' op on an NPOT tensor is unsupported}}
   %r = tt.atomic_cas acq_rel, gpu, %p, %v, %v : (tensor<96x!tt.ptr<i32>>, tensor<96xi32>, tensor<96xi32>) -> tensor<96xi32>
   tt.return
