@@ -3,6 +3,7 @@
 #include "Utility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
+#include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/CGAEncodingAttr.h"
@@ -413,6 +414,12 @@ bool canBeConvertedToAsyncLoad(unsigned numBuffers, tt::LoadOp loadOp,
     auto regLayout = triton::gpu::toLinearLayout(srcTy);
     // It's the allocation so we trim the multibuffer dimension
     auto srcShape = srcTy.getShape();
+    if (!regLayout.isRadix2()) {
+      unsigned elemBitWidth = tt::getPointeeBitWidth(srcTy);
+      unsigned vecSize = std::max(128u / elemBitWidth, 1u);
+      return !LLVM::AMD::getNpotDirectToLdsUnsupportedReason(
+          targetInfo, regLayout, elemBitWidth, sharedEnc, srcShape, vecSize);
+    }
     triton::LinearLayout sharedLayout;
     auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
     if (paddedEnc) {
@@ -987,6 +994,18 @@ static void lowerLoop(scf::ForOp forOp,
                                   load, axisInfoAnalysis, targetFeatures,
                                   targetInfo, useAsyncCopy)
                                   .value_or(nullptr);
+        // local_store can't take a mixed-radix layout, so only an async copy
+        // can fill an NPOT stage; otherwise the load stays in registers.
+        auto loadOp = dyn_cast<tt::LoadOp>(load);
+        if (sharedEncoding && loadOp &&
+            ttg::getNpotLayoutUnsupportedReason(
+                OperationName(ttg::LocalStoreOp::getOperationName(),
+                              load->getContext()),
+                load->getResultTypes()) &&
+            !(useAsyncCopy &&
+              canBeConvertedToAsyncLoad(2, loadOp, sharedEncoding,
+                                        axisInfoAnalysis, targetInfo)))
+          sharedEncoding = nullptr;
         loadToInfo[load] = {sharedEncoding, distance, use};
         LDBG("Populate loadInfo with shared encoding: " << sharedEncoding);
       }
