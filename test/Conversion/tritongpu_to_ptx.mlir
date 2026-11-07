@@ -413,6 +413,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
     tt.store %out, %result : tensor<256x!tt.ptr<f8E5M2>, #blocked>
     tt.return
   }
+
+  // CHECK-LABEL: .visible .entry shuffle_i1_no_mask(
+  tt.func public @shuffle_i1_no_mask(%arg: tensor<64xi1, #narrow_src>, %out: tensor<64x!tt.ptr<i32>, #narrow_dst>) {
+    // CHECK: shfl.sync.idx.b32 [[VALUE:%r[0-9]+]],
+    // CHECK-NOT: and.b32
+    // CHECK: st.global.b32 {{.*}}, { [[VALUE]] };
+    %0 = ttg.convert_layout %arg : tensor<64xi1, #narrow_src> -> tensor<64xi1, #narrow_dst>
+    %1 = arith.extui %0 : tensor<64xi1, #narrow_dst> to tensor<64xi32, #narrow_dst>
+    tt.store %out, %1 : tensor<64x!tt.ptr<i32>, #narrow_dst>
+    tt.return
+  }
+  // CHECK-LABEL: .visible .entry shuffle_i16_no_mask(
+  tt.func public @shuffle_i16_no_mask(%arg: tensor<64xi16, #narrow_src>, %out: tensor<64x!tt.ptr<i32>, #narrow_dst>) {
+    // CHECK: shfl.sync.idx.b32 [[VALUE:%r[0-9]+]],
+    // CHECK-NOT: and.b32
+    // CHECK: st.global.b32 {{.*}}, { [[VALUE]] };
+    %0 = ttg.convert_layout %arg : tensor<64xi16, #narrow_src> -> tensor<64xi16, #narrow_dst>
+    %1 = arith.extui %0 : tensor<64xi16, #narrow_dst> to tensor<64xi32, #narrow_dst>
+    tt.store %out, %1 : tensor<64x!tt.ptr<i32>, #narrow_dst>
+    tt.return
+  }
 }
 
 //--- f64_bf16.mlir
@@ -443,27 +464,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %false = arith.constant false
     %packed = tt.extern_elementwise %hi, %lo, %false {libname = "", libpath = "", pure = true, symbol = "llvm.nvvm.ff.to.e2m1x2.rn.satfinite"} : (f32, f32, i1) -> i16
     tt.store %out, %packed : !tt.ptr<i16>
-    tt.return
-  }
-
-  // CHECK-LABEL: .visible .entry shuffle_i1_no_mask(
-  tt.func public @shuffle_i1_no_mask(%arg: tensor<64xi1, #narrow_src>, %out: tensor<64x!tt.ptr<i32>, #narrow_dst>) {
-    // CHECK: shfl.sync.idx.b32 [[VALUE:%r[0-9]+]],
-    // CHECK-NOT: and.b32
-    // CHECK: st.global.b32 {{.*}}, { [[VALUE]] };
-    %0 = ttg.convert_layout %arg : tensor<64xi1, #narrow_src> -> tensor<64xi1, #narrow_dst>
-    %1 = arith.extui %0 : tensor<64xi1, #narrow_dst> to tensor<64xi32, #narrow_dst>
-    tt.store %out, %1 : tensor<64x!tt.ptr<i32>, #narrow_dst>
-    tt.return
-  }
-  // CHECK-LABEL: .visible .entry shuffle_i16_no_mask(
-  tt.func public @shuffle_i16_no_mask(%arg: tensor<64xi16, #narrow_src>, %out: tensor<64x!tt.ptr<i32>, #narrow_dst>) {
-    // CHECK: shfl.sync.idx.b32 [[VALUE:%r[0-9]+]],
-    // CHECK-NOT: and.b32
-    // CHECK: st.global.b32 {{.*}}, { [[VALUE]] };
-    %0 = ttg.convert_layout %arg : tensor<64xi16, #narrow_src> -> tensor<64xi16, #narrow_dst>
-    %1 = arith.extui %0 : tensor<64xi16, #narrow_dst> to tensor<64xi32, #narrow_dst>
-    tt.store %out, %1 : tensor<64x!tt.ptr<i32>, #narrow_dst>
     tt.return
   }
 }

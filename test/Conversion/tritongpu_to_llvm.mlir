@@ -4155,7 +4155,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
   // CHECK-LABEL: @shared_i1_preserves_extension
   tt.func private @shared_i1_preserves_extension(%arg: tensor<64xi1, #src>) -> tensor<64xi1, #dst> {
     // CHECK: llvm.zext %{{.*}} : i1 to i8
-    // CHECK: llvm.store
+    // PTX88: llvm.inline_asm {{.*}}st.shared.b8
+    // PTX93: llvm.store {{.*}} vector<1xi8>
     // CHECK: llvm.load
     // CHECK: llvm.trunc %{{.*}} overflow<nuw> : i8 to i1
     %0 = ttg.convert_layout %arg : tensor<64xi1, #src> -> tensor<64xi1, #dst>
