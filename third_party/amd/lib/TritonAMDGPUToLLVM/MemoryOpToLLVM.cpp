@@ -2435,6 +2435,60 @@ void mlir::triton::AMD::finalizeScheduledMfmaLowering(
   }
 }
 
+/// Encodes the waitcnt value for AMDGPU architectures.
+///
+/// Note: This function duplicates the bitpacking logic from AMDGPU backend
+/// (llvm/lib/Target/AMDGPU/Utils/AMDGPUBaseInfo.h), as it's not accessible from
+/// llvm/include. The logic handles different encoding schemes across
+/// various GPU architecture versions (pre-gfx9 to gfx11).
+///
+/// The waitcnt encoding uses different bit positions for each counter
+/// based on the ISA version:
+/// - Vmcnt (vector memory counter): tracks pending vector memory operations
+/// - Expcnt (export counter): tracks pending export operations
+/// - Lgkmcnt (LDS/GDS/scalar memory counter): tracks pending LDS/GDS/scalar
+/// memory ops
+///
+/// Each architecture version has its own bit layout, Vmcnt, Expcnt and Lgkmcnt
+/// are decoded as follows:
+///     Vmcnt = Waitcnt[3:0]        (pre-gfx9)
+///     Vmcnt = Waitcnt[15:14,3:0]  (gfx9,10)
+///     Vmcnt = Waitcnt[15:10]      (gfx11)
+///     Expcnt = Waitcnt[6:4]       (pre-gfx11)
+///     Expcnt = Waitcnt[2:0]       (gfx11)
+///     Lgkmcnt = Waitcnt[11:8]     (pre-gfx10)
+///     Lgkmcnt = Waitcnt[13:8]     (gfx10)
+///     Lgkmcnt = Waitcnt[9:4]      (gfx11)
+static FailureOr<unsigned> encodeWaitcnt(llvm::AMDGPU::IsaVersion isaVersion,
+                                         unsigned vmcnt, unsigned lgkmcnt) {
+  if (isaVersion.Major == 9) {
+    vmcnt = std::min(63u, vmcnt);
+    unsigned expcnt = 0x7;
+    lgkmcnt = std::min(15u, lgkmcnt);
+    unsigned lowBits = vmcnt & 0xF;
+    unsigned highBits = (vmcnt >> 4) << 14;
+    unsigned otherCnts = (expcnt << 4) | (lgkmcnt << 8);
+    return lowBits | highBits | otherCnts;
+  }
+  if (isaVersion.Major == 10) {
+    vmcnt = std::min(63u, vmcnt);
+    unsigned expcnt = 0x7;
+    lgkmcnt = std::min(63u, lgkmcnt);
+    unsigned lowBits = vmcnt & 0xF;
+    unsigned highBits = (vmcnt >> 4) << 14;
+    unsigned otherCnts = (expcnt << 4) | (lgkmcnt << 8);
+    return lowBits | highBits | otherCnts;
+  }
+  if (isaVersion.Major == 11) {
+    vmcnt = std::min(63u, vmcnt);
+    unsigned expcnt = 0x7;
+    lgkmcnt = std::min(63u, lgkmcnt);
+    return (vmcnt << 10) | expcnt | (lgkmcnt << 4);
+  }
+  return failure();
+}
+
+
 struct MemoryCounterWaitOpConversion
     : public ConvertOpToLLVMPattern<amdgpu::MemoryCounterWaitOp> {
   MemoryCounterWaitOpConversion(const LLVMTypeConverter &converter,
