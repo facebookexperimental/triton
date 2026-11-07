@@ -185,8 +185,13 @@ struct TCGen5MMAScaleSharedToTmemConversion
                                 PatternRewriter &rewriter) const override {
     auto aScaleType = op.getAScale().getType();
     auto bScaleType = op.getBScale().getType();
-    if (aScaleType.getShape() != aScaleType.getAllocShape() ||
-        bScaleType.getShape() != bScaleType.getAllocShape()) {
+    // An NPOT scale in tensor memory is allocated as its pow2 alloc shape.
+    auto isSubview = [](ttg::MemDescType type) {
+      return type.getShape() != type.getAllocShape() &&
+             !(isa<TensorMemorySpaceAttr>(type.getMemorySpace()) &&
+               ttg::isNpotPow2AllocView(type));
+    };
+    if (isSubview(aScaleType) || isSubview(bScaleType)) {
       op.emitError("subviews NYI");
       return failure();
     }
