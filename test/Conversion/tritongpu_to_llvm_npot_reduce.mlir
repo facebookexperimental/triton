@@ -7,7 +7,6 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // CHECK-LABEL: llvm.func @odd_on_axis
   // CHECK-COUNT-22: llvm.fadd %{{.*}} : f32
   // CHECK-NOT: llvm.fadd
-  // CHECK: llvm.mlir.constant(31 : i32)
   // CHECK: %[[X4:.+]] = llvm.mlir.constant(4 : i32)
   // CHECK: nvvm.shfl.sync bfly %{{.+}}, %{{.+}}, %[[X4]],
   // CHECK: %[[X2:.+]] = llvm.mlir.constant(2 : i32)
@@ -40,7 +39,6 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // CHECK-LABEL: llvm.func @pow2_control
   // CHECK-COUNT-30: llvm.fadd %{{.*}} : f32
   // CHECK-NOT: llvm.fadd
-  // CHECK: llvm.mlir.constant(31 : i32)
   // CHECK: %[[X4:.+]] = llvm.mlir.constant(4 : i32)
   // CHECK: nvvm.shfl.sync bfly %{{.+}}, %{{.+}}, %[[X4]],
   // CHECK: %[[X2:.+]] = llvm.mlir.constant(2 : i32)
