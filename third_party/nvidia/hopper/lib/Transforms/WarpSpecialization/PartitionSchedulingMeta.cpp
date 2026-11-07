@@ -450,8 +450,8 @@ public:
         mmas, [](Operation *op) { return isa<ttng::MMAv5OpInterface>(op); });
   }
 
-  /// True when the WS loop has no MMA but contains an in-register reduction
-  /// (tt.reduce). This anchors the no-MMA reduction-kernel path (RMS norm,
+  /// True when the WS loop has no MMA (including a register tt.dot) but contains
+  /// an in-register reduction (tt.reduce). This anchors the no-MMA reduction-kernel path (RMS norm,
   /// LayerNorm, softmax-only) where there is neither an MMA nor a TMA-atomic
   /// reduce to drive a compute partition. Any triton::ReduceOp
   /// (tl.sum/max/min/argmax/...) counts; the walk covers nested loops.
@@ -460,6 +460,14 @@ public:
       return false;
     // Copy the lightweight op handle: walk() is non-const but this method is.
     LoopLikeOpInterface loop = mainLoop;
+    // A register tt.dot (mma.sync, e.g. BLOCK_M < 64) is still an MMA, just not
+    // one `mmas` tracks. The reduction layout would put the dot in the
+    // reduction partition but the loop carrying its accumulator in the epilogue
+    // partition, which then recomputes the dot from the load buffers without
+    // waiting on them.
+    if (loop->walk([](triton::DotOp) { return WalkResult::interrupt(); })
+            .wasInterrupted())
+      return false;
     return loop->walk([](triton::ReduceOp) { return WalkResult::interrupt(); })
         .wasInterrupted();
   }
@@ -1491,6 +1499,23 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   categorizer.categorize();
 
   LLVM_DEBUG(categorizer.printCategorizedOps(llvm::dbgs()));
+
+  // A register tt.dot with both a TMA reduce and a store in the epilogue: the
+  // reduction partition would take the dot and the K loop carrying its
+  // accumulator, while the epilogue ops that read the accumulator land in the
+  // epilogue partition, and code partitioning has no channel for that loop
+  // result. Leave the loop unspecialized; with no partitions the warp
+  // specialization pass bails out.
+  if (mmas.empty() &&
+      !categorizer.getOpsInCategory(OpCategory::TMAReduction).empty() &&
+      !categorizer.getOpsInCategory(OpCategory::EpilogueStore).empty() &&
+      mainLoop->walk([](triton::DotOp) { return WalkResult::interrupt(); })
+          .wasInterrupted()) {
+    LLVM_DEBUG(llvm::dbgs() << "[tritongpu-partition-scheduling] register "
+                               "tt.dot with a TMA reduce and a store: not "
+                               "specializing\n");
+    return std::nullopt;
+  }
 
   unsigned dataPartitionFactor = categorizer.getDataPartitionFactor();
   LLVM_DEBUG(
