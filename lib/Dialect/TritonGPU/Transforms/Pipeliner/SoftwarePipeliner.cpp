@@ -173,7 +173,7 @@ static void expandLoops(ModuleOp moduleOp) {
       hasWarpSpec = true;
     loops.push_back(forOp);
   });
-  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  auto metaWS = triton::isMetaWSEnabled(moduleOp);
   // The partition-type filter below exists to prune the loops that the extra
   // ScheduleLoops re-run re-staged. That re-run only happens on the 2-CTA path
   // (see CUDABackend.make_ttgir). On the 1-CTA path every partition loop still
@@ -346,7 +346,7 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
       return signalPassFailure();
 
     {
-      auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+      auto metaWS = triton::isMetaWSEnabled(getOperation());
       SmallVector<LoopLikeOpInterface> loops;
       bool hasWarpSpec = false;
       getOperation()->walk([&](scf::ForOp forOp) {

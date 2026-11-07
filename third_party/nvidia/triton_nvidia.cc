@@ -8,6 +8,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/IR/Constants.h"
@@ -391,6 +392,10 @@ void init_triton_nvidia(py::module_ &m) {
     mlir::registerNVVMDialectTranslation(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
+  });
+
+  m.def("requests_warp_specialization", [](mlir::ModuleOp &mod) {
+    return mlir::triton::requestsMetaWarpSpecialization(mod);
   });
 
   // TODO: could be done in python if we had a generic interface to set metadata
