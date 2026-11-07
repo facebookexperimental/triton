@@ -163,6 +163,7 @@ def TTG_AsyncCopyGlobalToLocalOp
              [GlobalToLocalCopyTrait,
               AttrSizedOperandSegments,
               DeclareOpInterfaceMethods<PredicatedOpInterface>,
+              MixedRadixLayoutTrait,
               OptionalTypesMatchWith<"infer mask type from src type", "src",
                                      "mask", "getI1SameShape($_self)">,
               OptionalTypesMatchWith<"infer other type from src type", "src",
@@ -472,7 +473,8 @@ def TTG_MemDescReinterpretOp
   let hasVerifier = 1;
 }
 
-def TTG_LocalLoadOp : TTG_Op<"local_load", [LocalLoadTrait]> {
+def TTG_LocalLoadOp
+    : TTG_Op<"local_load", [LocalLoadTrait, MixedRadixLayoutTrait]> {
   let summary = "Load a buffer from local memory into a distributed tensor";
 
   let description = [{
