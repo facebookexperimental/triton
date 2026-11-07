@@ -523,10 +523,13 @@ struct DotOpMFMAConversionHelper {
 
   /// Converts dot operand structure to value table and converts types
   /// appropriate for mfma instructions
+  /// With `kTailFill`, K ends inside the last kBase-element vector, which
+  /// takes that 8-bit fill past K.
   virtual ValueTable getValuesFromDotOperandLayoutStruct(
       Value value, int batch, int nonKRep, int kRepInKWidth, int kWidth,
       int kBase, RankedTensorType tensorType, Type type, bool allowXF32,
-      bool preserveBF16, bool isConstantScale = false) const {
+      bool preserveBF16, bool isConstantScale = false,
+      std::optional<int> kTailFill = std::nullopt) const {
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     auto elems = unpackTensorElements(loc, value, rewriter, tensorType);
     if (type.isF32() && allowXF32) {
@@ -537,7 +540,9 @@ struct DotOpMFMAConversionHelper {
                    ->getResult(0);
     }
     // number of kBase-element vectors
-    int numVecInKBase = kRepInKWidth * kWidth / kBase;
+    int numVecInKBase = kTailFill
+                            ? llvm::divideCeil(kRepInKWidth * kWidth, kBase)
+                            : kRepInKWidth * kWidth / kBase;
     if (numVecInKBase == 0) {
       numVecInKBase = 1;
       nonKRep /= kBase / (kRepInKWidth * kWidth);
@@ -547,6 +552,12 @@ struct DotOpMFMAConversionHelper {
 
     SmallVector<int64_t> strides =
         computeStrides({batch, nonKRep, numVecInKBase, kBase});
+    int64_t perRep = strides[1];
+    if (kTailFill) {
+      perRep = elems.size() / (batch * nonKRep);
+      strides[0] = nonKRep * perRep;
+      strides[1] = perRep;
+    }
     for (int b = 0; b < batch; ++b) {
       for (int nonK = 0; nonK < nonKRep; nonK++) {
         for (int kBaseVec = 0; kBaseVec < numVecInKBase; kBaseVec++) {
@@ -559,9 +570,11 @@ struct DotOpMFMAConversionHelper {
           Type ty = vec_ty(elemTy, kBase);
           Value rawElems = tb.undef(ty);
           for (int k = 0; k < kBase; ++k) {
-            auto index = linearize({b, nonK, kBaseVec, k}, strides);
-            rawElems =
-                tb.insert_element(ty, rawElems, elems[index], tb.i32_val(k));
+            Value elem =
+                kBaseVec * kBase + k < perRep
+                    ? elems[linearize({b, nonK, kBaseVec, k}, strides)]
+                    : tb.int_val(elemTy.getIntOrFloatBitWidth(), *kTailFill);
+            rawElems = tb.insert_element(ty, rawElems, elem, tb.i32_val(k));
           }
 
           // Step 2: process rawElems based on element type
@@ -752,9 +765,14 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     Value loadedBScale = adaptor.getBScale();
     Value loadedC = adaptor.getC();
 
+    // The target dot-legality query allows an NPOT K whose last MFMA is zero
+    // past K.
+    bool zeroKTail = !llvm::isPowerOf2_64(kDimOperandSize) &&
+                     kDimOperandSize % kDimInstrSize != 0;
     auto numRepM = repA[1];
     auto numRepN = repB[2];
-    auto numRepK = repA[2];
+    int64_t numRepK =
+        zeroKTail ? llvm::divideCeil(kDimOperandSize, kDimInstrSize) : repA[2];
     auto numRepB = repA[0];
     assert(repA[0] == repB[0]);
 
@@ -779,14 +797,16 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     int aNonKPackedVals = scaleAKBase / akPackedVals;
     int bNonKPackedVals = scaleBKBase / bkPackedVals;
 
+    std::optional<int> kTailFill =
+        zeroKTail ? std::make_optional(0) : std::nullopt;
     auto operandA = getValuesFromDotOperandLayoutStruct(
         loadedA, numRepB, numRepM, numRepK, aKWidth, aKBase, aTensorTy,
         aTensorTy.getElementType(), allowXF32,
-        /*preserveBF16=*/false);
+        /*preserveBF16=*/false, /*isConstantScale=*/false, kTailFill);
     auto operandB = getValuesFromDotOperandLayoutStruct(
         loadedB, numRepB, numRepN, numRepK, bKWidth, bKBase, bTensorTy,
         bTensorTy.getElementType(), allowXF32,
-        /*preserveBF16=*/false);
+        /*preserveBF16=*/false, /*isConstantScale=*/false, kTailFill);
 
     // Scales have the same replica distributions as their corresponding
     // operands.
@@ -911,8 +931,10 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
             // Pin D right after this pass's MFMAs.
             acc = pinRegClass(acc, cdPins->d);
             acc = reduceSubBlocks(subBlocks, acc);
+            // A zero tail duplicates no K, so the sum needs no scaling.
             adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
-                                  kDimInstrSize, kDimOperandSize, elemsPerVec);
+                                  zeroKTail ? kDimOperandSize : kDimInstrSize,
+                                  kDimOperandSize, elemsPerVec);
           }
         }
       }
