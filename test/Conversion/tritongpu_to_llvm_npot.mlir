@@ -498,6 +498,31 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 96, 16]}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [16, 0], [32, 0], [64, 0], [0, 32]], lane = [[0, 4], [0, 8], [0, 16], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A split-K wgmma epilogue: the pow2 alloc shape's (128x128) scratch holds
+  // one 128x32 tile, so the three tiles move in three rounds.
+  // CHECK: module attributes {{.*}}ttg.shared = 16384 : i32
+  // CHECK-LABEL: llvm.func @odd_tiles_three_rounds
+  // CHECK-COUNT-8: llvm.store {{.*}} : vector<4xi32>, !llvm.ptr<3>
+  // CHECK-NEXT: nvvm.barrier
+  // CHECK-COUNT-8: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xi32>
+  // CHECK-COUNT-4: nvvm.barrier
+  // CHECK-COUNT-8: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xi32>
+  // CHECK-NOT: {{nvvm.barrier|ptr<3>}}
+  // CHECK: llvm.return
+  tt.func public @odd_tiles_three_rounds(%p: !tt.ptr<f32>, %f: f32) {
+    %v = tt.splat %f : f32 -> tensor<128x96xf32, #mma>
+    %c = ttg.convert_layout %v : tensor<128x96xf32, #mma> -> tensor<128x96xf32, #dst>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<128x96x!tt.ptr<f32>, #dst>
+    tt.store %d, %c : tensor<128x96x!tt.ptr<f32>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
 #a = #ttg.linear<{register = [[0, 32], [1, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [3, 64]}>
 #b = #ttg.linear<{register = [[32, 0], [0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [64, 3]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
