@@ -575,8 +575,12 @@ unsigned getMemDescSize(ttg::MemDescType ty) {
                       ~getInputBasisMask(allocation, offsetDim, logicalDims);
   uint64_t viewSpan =
       (getOutputBasisMask(view, logicalDims, offsetDim) | zeroMask) + 1;
-  return ((stages - 1) * allocation.getInDimSize(offsetDim) + viewSpan) *
-         elSize;
+  // A densely mapped NPOT tile is allocated without the rest of its cover.
+  uint64_t stageElems = allocation.getInDimSize(offsetDim);
+  if (hasNpotLayoutExtent(allocShape) &&
+      succeeded(ttg::getNpotDenseSharedLayout(encoding, allocShape)))
+    stageElems = product(allocShape);
+  return ((stages - 1) * stageElems + std::min(viewSpan, stageElems)) * elSize;
 }
 
 BufferRegionView
