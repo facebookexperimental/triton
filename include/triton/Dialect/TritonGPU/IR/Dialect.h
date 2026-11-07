@@ -477,6 +477,9 @@ triton::gpu::BlockedEncodingAttr
 getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
                           int numWarps, int threadsPerWarp, int numCTAs);
 
+// The layout of `op`'s first operand with an exact mixed-radix layout.
+FailureOr<LinearLayout> getExactNpotOperandLayout(Operation *op);
+
 // Under TRITON_ALLOW_NPOT, an NPOT `shape`'s mixed-radix layout with `vector`
 // elements along order[0] (default the last dim) and odd digits slowest. Fails
 // if pow2 or CTAs > 1.
