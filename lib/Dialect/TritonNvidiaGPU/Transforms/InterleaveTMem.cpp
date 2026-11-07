@@ -256,6 +256,14 @@ bool isKnownSMemBase(Value value) {
 }
 
 bool smemMayAlias(Value a, Value b) {
+  // A cluster-shared view (e.g. a peer CTA's barrier from
+  // map_to_remote_buffer) is not resolved here; assume it may alias.
+  auto isSMem = [](Value v) {
+    return isa<ttg::SharedMemorySpaceAttr>(
+        cast<ttg::MemDescType>(v.getType()).getMemorySpace());
+  };
+  if (!isSMem(a) || !isSMem(b))
+    return true;
   Value aBase = findSMemBase(a);
   Value bBase = findSMemBase(b);
   if (aBase == bBase)
