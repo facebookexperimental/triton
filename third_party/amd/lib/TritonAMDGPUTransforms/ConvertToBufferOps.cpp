@@ -213,6 +213,13 @@ Value getBlockStride(Location loc, Value offset, PatternRewriter &rewriter) {
   return nullptr;
 }
 
+// Leave an atomic global when the buffer op's verifier would reject its layout.
+template <typename BufferOp> static bool bufferOpRejects(Operation *op) {
+  OperationName name(BufferOp::getOperationName(), op->getContext());
+  return ttg::getNpotLayoutUnsupportedReason(name, op->getResultTypes())
+      .has_value();
+}
+
 // Buffer ops take Optional<I32> stride. getBlockStride walks the offset chain
 // and returns the splat's scalar source, which may be i64 when the kernel uses
 // i64 indices (e.g. row * stride + col with stride in i64).
@@ -261,6 +268,8 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
     if (!canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       return rewriter.notifyMatchFailure(op, "canUseBufferOps check failed");
     }
+    if (bufferOpRejects<triton::amdgpu::BufferAtomicCASOp>(op))
+      return rewriter.notifyMatchFailure(op, "layout rejected by buffer op");
 
     switch (scope) {
     case MemSyncScope::GPU:
@@ -361,6 +370,8 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
     if (!canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       return rewriter.notifyMatchFailure(op, "canUseBufferOps check failed");
     }
+    if (bufferOpRejects<triton::amdgpu::BufferAtomicRMWOp>(op))
+      return rewriter.notifyMatchFailure(op, "layout rejected by buffer op");
 
     // 2. Check the scope. We support GPU and CTA for now (SYSTEM scope is not
     // supported yet)
