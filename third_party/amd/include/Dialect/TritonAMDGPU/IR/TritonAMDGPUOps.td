@@ -1184,8 +1184,9 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
     per 32 logical values: shapes are [M, logicalK/32] and [N, logicalK/32]
     in i8 storage. A single native FP8 step may instead consume one packed
     i32 scale word per lane. In that form, `a_scale_selector` and
-    `b_scale_selector` select the E8M0 byte passed to the instruction without
-    extracting it first.
+    `b_scale_selector` select the first E8M0 byte passed to the instruction
+    without extracting it first. A two-step K128 chain reuses the word and
+    adds two to each selector for its second K64 instruction.
 
     Only the transient contract is supported today: `accumulator_role` must
     be "transient", `resident_operand` must be "none", and
