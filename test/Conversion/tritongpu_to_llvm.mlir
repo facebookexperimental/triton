@@ -4041,7 +4041,10 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
   // CHECK-LABEL: @bf16_to_fp8e5_rtne
   // CHECK: llvm.fpext
-  // CHECK: cvt.rn.f16.f32
+  // Mirror lowers the f32->f16 intermediate through llvm.fptrunc.round
+  // (convertFpTrunc), not upstream's cvt.rn.f16.f32 inline PTX.
+  // CHECK: llvm.mlir.metadata_as_value #llvm.md_string<"round.tonearest">
+  // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
   // CHECK: llvm.inline_asm {{.*}}min.f16x2
   // CHECK-SAME: prmt.b32 $0, a0, a1, 0x7531;
   // CHECK: llvm.return
