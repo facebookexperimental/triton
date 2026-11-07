@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_hopper_or_newer, is_blackwell
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 import triton.language.extra.tlx as tlx
 
 
@@ -51,6 +53,25 @@ def test_cluster_dims(device):
     assert kernel.metadata.ctas_per_cga == (2, 1, 1)
     assert ('"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32'
             in k.asm["ttgir"])
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell")
+def test_gluon_cluster_dims(device):
+    # A ctas_per_cga launch gets its cluster shape only from the kernel's
+    # .reqnctapercluster, so the Gluon pipeline must set the cluster-dim attributes too.
+
+    @gluon.jit
+    def cluster_size_kernel(out_ptr):
+        size = gl.inline_asm_elementwise("mov.u32 $0, %cluster_nctarank;", "=r", [], dtype=gl.int32, is_pure=True,
+                                         pack=1)
+        gl.store(out_ptr + gl.program_id(0), size)
+
+    out = torch.full((4, ), -1, device=device, dtype=torch.int32)
+    k = cluster_size_kernel[(4, )](out, ctas_per_cga=(2, 1, 1))
+    assert ('"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32'
+            in k.asm["ttgir"])
+    assert ".reqnctapercluster 2, 1, 1" in k.asm["ptx"]
+    assert torch.all(out == 2)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")
