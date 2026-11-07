@@ -1112,6 +1112,12 @@ class CUDABackend(BaseBackend):
 
     def gluon_to_ttgir(self, src, metadata, options, capability):
         mod = src
+        if options.ctas_per_cga is not None:
+            # As in make_ttgir: the ttg.cluster-dim-* attributes become the kernel's
+            # .reqnctapercluster, which is the only cluster shape a ctas_per_cga launch
+            # gets (the launcher sets no cluster attribute for num_ctas == 1).
+            for axis, dim in zip("xyz", options.cluster_dims):
+                mod.set_attr(f"ttg.cluster-dim-{axis}", ir.builder(mod.context).get_int32_attr(dim))
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
 
