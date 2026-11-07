@@ -203,12 +203,15 @@ def TritonNpotPad : Pass<"triton-npot-pad", "mlir::ModuleOp"> {
     and from live results. An op the pass cannot pad fails to compile with an
     error and leaves the IR unchanged. A connected component holding
     tt.atomic_cas, which has no padded lowering, keeps its shape whenever every
-    op in it lowers a mixed-radix layout.
+    op in it lowers a mixed-radix layout. A dot asks the target's dialect
+    whether it can be exact and remarks why not.
   }];
 
+  // TTNG holds cuda's NpotTargetLegality; the AMD backend loads its own.
   let dependentDialects = [
     "mlir::triton::TritonDialect",
     "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
     "mlir::arith::ArithDialect"
   ];
 
@@ -218,7 +221,9 @@ def TritonNpotPad : Pass<"triton-npot-pad", "mlir::ModuleOp"> {
     Option<"threadsPerWarp", "threads-per-warp", "int32_t", /*default*/"32",
            "number of threads per warp">,
     Option<"numCTAs", "num-ctas", "int32_t", /*default*/"1",
-           "number of ctas in a cga">
+           "number of ctas in a cga">,
+    Option<"target", "target", "std::string", /*default*/"\"\"",
+           "the ttg.target ConvertTritonToTritonGPU will set">
   ];
 }
 
