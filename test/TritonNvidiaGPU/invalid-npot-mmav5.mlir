@@ -79,29 +79,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #b = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  tt.func @i8_n40(%a: !ttg.memdesc<128x64xi8, #a, #ttg.shared_memory>,
-                  %b: !ttg.memdesc<64x40xi8, #b, #ttg.shared_memory, 64x64>,
-                  %c: !ttg.memdesc<128x40xi32, #tmem, #ttng.tensor_memory, mutable, 128x64>,
+  tt.func @i8_n36(%a: !ttg.memdesc<128x64xi8, #a, #ttg.shared_memory>,
+                  %b: !ttg.memdesc<64x36xi8, #b, #ttg.shared_memory, 64x64>,
+                  %c: !ttg.memdesc<128x36xi32, #tmem, #ttng.tensor_memory, mutable, 128x64>,
                   %p: i1) {
-    // expected-error @+1 {{NPOT MMAv5 shape 128x40 is unsupported: tcgen05.mma kind i8 SS K-major B cta_group::1 per-CTA M=128 requires N to be a multiple of 16}}
-    ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x64xi8, #a, #ttg.shared_memory>, !ttg.memdesc<64x40xi8, #b, #ttg.shared_memory, 64x64>, !ttg.memdesc<128x40xi32, #tmem, #ttng.tensor_memory, mutable, 128x64>
+    // expected-error @+1 {{NPOT MMAv5 shape 128x36 is unsupported: tcgen05.mma kind i8 SS K-major B cta_group::1 per-CTA M=128 requires N to be a multiple of 16}}
+    ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x64xi8, #a, #ttg.shared_memory>, !ttg.memdesc<64x36xi8, #b, #ttg.shared_memory, 64x64>, !ttg.memdesc<128x36xi32, #tmem, #ttng.tensor_memory, mutable, 128x64>
     tt.return
   }
 }
 
 // -----
 
-// blockN 256 leaves a 128-column tail of N384.
+// No multiple of 8 divides N300, so blockN 256 leaves a 44-column tail.
 #a = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #b = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:100"} {
-  tt.func @ragged_n384(%a: !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>,
-                       %b: !ttg.memdesc<64x384xf16, #b, #ttg.shared_memory, 64x512>,
-                       %c: !ttg.memdesc<128x384xf32, #tmem, #ttng.tensor_memory, mutable, 128x512>,
+  tt.func @ragged_n300(%a: !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<64x300xf16, #b, #ttg.shared_memory, 64x512>,
+                       %c: !ttg.memdesc<128x300xf32, #tmem, #ttng.tensor_memory, mutable, 128x512>,
                        %p: i1) {
     // expected-error @+1 {{NPOT MMAv5 N that is not a multiple of the instruction N is not yet supported}}
-    ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>, !ttg.memdesc<64x384xf16, #b, #ttg.shared_memory, 64x512>, !ttg.memdesc<128x384xf32, #tmem, #ttng.tensor_memory, mutable, 128x512>
+    ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>, !ttg.memdesc<64x300xf16, #b, #ttg.shared_memory, 64x512>, !ttg.memdesc<128x300xf32, #tmem, #ttng.tensor_memory, mutable, 128x512>
     tt.return
   }
 }
@@ -167,6 +167,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
                        %p: i1) {
     // expected-error @+1 {{NPOT MMAv5 K is not yet supported}}
     ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x40xf16, #a, #ttg.shared_memory>, !ttg.memdesc<40x128xf16, #b, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#a = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#b = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @m64_n96(%a: !ttg.memdesc<64x64xf16, #a, #ttg.shared_memory>,
+                   %b: !ttg.memdesc<64x96xf16, #b, #ttg.shared_memory, 64x128>,
+                   %c: !ttg.memdesc<64x96xf32, #tmem, #ttng.tensor_memory, mutable, 64x128>,
+                   %p: i1) {
+    // expected-error @+1 {{NPOT MMAv5 N with blockM=64 is not yet supported}}
+    ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<64x64xf16, #a, #ttg.shared_memory>, !ttg.memdesc<64x96xf16, #b, #ttg.shared_memory, 64x128>, !ttg.memdesc<64x96xf32, #tmem, #ttng.tensor_memory, mutable, 64x128>
     tt.return
   }
 }

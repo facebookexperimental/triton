@@ -227,8 +227,8 @@ getMmaV3InstrShape(ArrayRef<int64_t> shape, Type elemTy, RankedTensorType bTy,
                    std::optional<nvidia_gpu::NvmmaSmemAttrs> attrs,
                    int numWarps) {
   auto isLegalN = [&](unsigned n) {
-    return nvidia_gpu::isMmaV3BTilingLegal(*attrs, bTy.getElementTypeBitWidth(),
-                                           n, shape[1]);
+    return nvidia_gpu::isMmaBTilingLegal(*attrs, bTy.getElementTypeBitWidth(),
+                                         n, shape[1]);
   };
   function_ref<bool(unsigned)> filter;
   if (attrs && !llvm::isPowerOf2_64(shape[1]))
@@ -798,15 +798,25 @@ public:
         versionMajor, retShapePerCTA, oldAType.getElementType(), numWarps);
     auto bitwidth = oldRetType.getElementType().getIntOrFloatBitWidth();
     unsigned colStride = 32 / bitwidth;
+    // An NPOT N is issued in tiles the descriptor can read B in, each
+    // accumulating in a TMEM block of its pow2 alloc shape.
+    int64_t instrN = instrShape[1];
+    auto kind = nvidia_gpu::getTcgen05Kind(oldAType.getElementType());
+    if (!llvm::isPowerOf2_64(retShapePerCTA[1]) && kind)
+      instrN = nvidia_gpu::getTcgen05InstrN(
+          *kind, /*aInTmem=*/false,
+          nvidia_gpu::getMmaOperandSmemAttrs(cast<MemDescType>(b.getType())),
+          useTwoCTAs, instrShape[0], instrShape[1], retShapePerCTA[1],
+          oldBType.getElementTypeBitWidth());
     Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-        context, instrShape[0], instrShape[1], colStride, CGALayout, useTwoCTAs,
-        tmemCTAMode);
+        context, instrShape[0], getNpotPow2AllocShape(instrN)[0], colStride,
+        CGALayout, useTwoCTAs, tmemCTAMode);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     MemDescType accMemDescType =
         MemDescType::get(oldRetType.getShape(), oldRetType.getElementType(),
-                         accEncoding, tensorMemorySpace,
-                         /*mutableMemory=*/true);
+                         accEncoding, tensorMemorySpace, /*mutableMemory=*/true,
+                         getNpotPow2AllocShape(oldRetType.getShape()));
     auto newDistributedEncoding =
         nvidia_gpu::getDefaultLayoutForTmemLdSt(accMemDescType, numWarps);
     auto newAccType = oldRetType.cloneWithEncoding(newDistributedEncoding);
@@ -1363,8 +1373,8 @@ std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
                          "layout has no core-matrix form",
                          shape[1])
         .str();
-  if (!nvidia_gpu::isMmaV3BTilingLegal(*attrs, bTy.getElementTypeBitWidth(),
-                                       instrShape[1], shape[1]))
+  if (!nvidia_gpu::isMmaBTilingLegal(*attrs, bTy.getElementTypeBitWidth(),
+                                     instrShape[1], shape[1]))
     return llvm::formatv("NPOT wgmma N {0} is not yet supported: an n{1} tile "
                          "of B starts inside a swizzle pattern",
                          shape[1], instrShape[1])
@@ -1372,20 +1382,33 @@ std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
   return std::nullopt;
 }
 
-// Asks the TCGen5MMAOp verifier's rule about the tiles BlockedToMMAv5 issues.
-// B's order isn't known yet: take the stricter MN-major form.
+// Asks the TCGen5MMAOp verifier's rule about the tiles BlockedToMMAv5 issues,
+// then the lowering's descriptor match about the B memdesc it allocs. B's order
+// isn't known yet: take the stricter MN-major form, which f32 can't take.
 std::optional<std::string>
 getTcgen05UnsupportedReason(DotOp dot, nvidia_gpu::Tcgen05Kind kind,
                             int numWarps) {
   Type elemTy = dot.getA().getType().getElementType();
   ArrayRef<int64_t> shape = dot.getType().getShape();
+  RankedTensorType bTy = dot.getB().getType();
+  unsigned fast = elemTy.isF32() ? 0 : 1;
+  std::optional<nvidia_gpu::NvmmaSmemAttrs> bAttrs = getMmaV3BSmemAttrs(
+      bTy, {fast, 1 - fast},
+      CGAEncodingAttr::get1CTALayout(dot.getContext(), bTy.getRank()));
   auto instrShape = mmaVersionToInstrShape(5, shape, elemTy, numWarps);
+  unsigned instrN = nvidia_gpu::getTcgen05InstrN(
+      kind, /*aInTmem=*/false, bAttrs, dot.getTwoCtas(), instrShape[0],
+      instrShape[1], shape[1], bTy.getElementTypeBitWidth());
   if (auto reason = nvidia_gpu::getNpotMMAv5TileUnsupportedReason(
           kind, /*aInTmem=*/false, /*bMNMajor=*/true, dot.getTwoCtas(),
-          instrShape[0], instrShape[1], shape,
-          dot.getA().getType().getShape().back()))
+          instrShape[0], instrN, shape, dot.getA().getType().getShape().back()))
     return reason;
-  return std::string("NPOT MMAv5 accumulator N is not yet supported");
+  if (!bAttrs)
+    return llvm::formatv("NPOT MMAv5 N {0} is not yet supported: B's shared "
+                         "layout has no core-matrix form",
+                         shape[1])
+        .str();
+  return std::nullopt;
 }
 
 struct NvidiaNpotTargetLegality : public NpotTargetLegality {
