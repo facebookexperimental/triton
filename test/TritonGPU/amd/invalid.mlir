@@ -2647,3 +2647,44 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+module {
+  tt.func @concat_unencoded(%a: tensor<16x32xbf16>, %b: tensor<16x32xbf16>) {
+    %result = amdg.concat %a, %b : tensor<16x32xbf16>, tensor<16x32xbf16> -> tensor<16x64xbf16>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @concat_unencoded_result(%a: tensor<16x32xbf16, #blocked>, %b: tensor<16x32xbf16, #blocked>) {
+    // expected-error @+1 {{sources and result must both have an encoding, or neither}}
+    %result = amdg.concat %a, %b : tensor<16x32xbf16, #blocked>, tensor<16x32xbf16, #blocked> -> tensor<16x64xbf16>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @concat_unencoded_sources(%a: tensor<16x32xbf16>, %b: tensor<16x32xbf16>) {
+    // expected-error @+1 {{sources and result must both have an encoding, or neither}}
+    %result = amdg.concat %a, %b : tensor<16x32xbf16>, tensor<16x32xbf16> -> tensor<16x64xbf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @concat_unencoded_wrong_tile_count(%a: tensor<16x32xbf16>, %b: tensor<16x32xbf16>) {
+    // expected-error @+1 {{Number of source tiles}}
+    %result = amdg.concat %a, %b : tensor<16x32xbf16>, tensor<16x32xbf16> -> tensor<16x128xbf16>
+    tt.return
+  }
+}

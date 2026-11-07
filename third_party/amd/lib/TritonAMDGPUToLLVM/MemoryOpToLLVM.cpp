@@ -2119,6 +2119,12 @@ public:
     auto aTy = cast<RankedTensorType>(op.getA().getType());
     auto bTy = cast<RankedTensorType>(op.getB().getType());
     auto accTy = cast<RankedTensorType>(op.getAcc().getType());
+    if (!aTy.getElementType().isInteger(8))
+      return rewriter.notifyMatchFailure(
+          op, "typed operands use the scaled-dot scheduled lowering");
+    bool packedScales = cast<RankedTensorType>(op.getAScale().getType())
+                            .getElementType()
+                            .isInteger(32);
     auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
     if (failed(verifyMfmaVersionMatchesTarget(op, mfma,
                                               targetInfo.getISAFamily())))
@@ -2167,6 +2173,11 @@ public:
     auto packScales = [&](Value value, RankedTensorType ty,
                           int64_t repNonK) -> FailureOr<SmallVector<Value>> {
       SmallVector<Value> elems = unpackTensorElements(loc, value, rewriter, ty);
+      if (packedScales) {
+        if (elems.size() != 1)
+          return failure();
+        return elems;
+      }
       if (elems.size() != static_cast<size_t>(repNonK * steps))
         return failure();
       SmallVector<Value> scales;
@@ -2230,13 +2241,18 @@ public:
         for (int64_t m = 0; m < repM; ++m) {
           Value operandA = (*maybeA)[m * steps + step];
           Value operandB = (*maybeB)[n * steps + step];
-          Value scaleA = (*maybeAScale)[m * steps + step];
-          Value scaleB = (*maybeBScale)[n * steps + step];
+          Value scaleA = (*maybeAScale)[packedScales ? 0 : m * steps + step];
+          Value scaleB = (*maybeBScale)[packedScales ? 0 : n * steps + step];
+          int32_t opSelA =
+              packedScales ? op.getAScaleSelectorAttr().getInt() + 2 * step : 0;
+          int32_t opSelB =
+              packedScales ? op.getBScaleSelectorAttr().getInt() + 2 * step : 0;
           int32_t cbsz = matrixFormatCode(op.getAFormat());
           int32_t blgp = matrixFormatCode(op.getBFormat());
           if (mfma.getIsTransposed()) {
             std::swap(operandA, operandB);
             std::swap(scaleA, scaleB);
+            std::swap(opSelA, opSelB);
             std::swap(cbsz, blgp);
           }
           OperationState loweredOp(loc, intrinsicName);
@@ -2253,8 +2269,8 @@ public:
                                  ROCDL::MatrixFormatAttr::get(
                                      rewriter.getContext(),
                                      static_cast<ROCDL::MatrixFormat>(blgp)));
-          loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(0));
-          loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(0));
+          loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(opSelA));
+          loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(opSelB));
           updated[m * repN + n] = rewriter.create(loweredOp)->getResult(0);
         }
       }
