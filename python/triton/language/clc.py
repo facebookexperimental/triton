@@ -10,6 +10,11 @@ over its tile. This module exposes a minimal, opaque scheduler:
         ... compute ...
         sched = sched.advance()          # fetch the next tile
 
+``tl.clc_tile_scheduler(num_stealing_ctas=N)`` lets only the first N CTAs steal
+(e.g. N = SM count minus the SMs a concurrent NCCL kernel needs); the others run
+their launched tile and exit, so at most N SMs stay occupied for more than one
+tile at a time.
+
 The scheduler carries the *decoded* tile: an ``is_valid`` predicate and the
 (x, y, z) program-id coordinates. The initial tile is simply this CTA's
 ``program_id`` (with ``is_valid = True``); every later tile comes from a single
@@ -23,7 +28,6 @@ unified tile schedulers (all share the ``is_valid`` / ``tile_id`` / ``advance``
 API); it is re-exported here, and ``clc_tile_scheduler`` remains as the
 convenience factory.
 """
-import triton.language.core as tl
 from triton.language.core import builtin
 from triton.language.schedule import ClcTileScheduler
 
@@ -31,17 +35,15 @@ __all__ = ["clc_tile_scheduler", "ClcTileScheduler"]
 
 
 @builtin
-def clc_tile_scheduler(_semantic=None):
+def clc_tile_scheduler(num_stealing_ctas=None, _semantic=None):
     """Create a CLC tile scheduler for a dynamic persistent kernel (Blackwell).
 
     Seeds the scheduler with this CTA's own statically-launched tile
     (``program_id`` with ``is_valid = True``); subsequent tiles are fetched via
     CLC work-stealing in ``advance``.
+
+    ``num_stealing_ctas`` (constexpr int) limits work-stealing to the first that
+    many CTAs (whole clusters); the rest run one tile and exit. See
+    ``ClcTileScheduler``.
     """
-    b = _semantic.builder
-    return ClcTileScheduler(
-        tl.tensor(b.get_int1(True), tl.int1),
-        tl.tensor(b.create_get_program_id(0), tl.int32),
-        tl.tensor(b.create_get_program_id(1), tl.int32),
-        tl.tensor(b.create_get_program_id(2), tl.int32),
-    )
+    return ClcTileScheduler.initialize(None, None, None, num_stealing_ctas, _semantic=_semantic)

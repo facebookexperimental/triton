@@ -1963,12 +1963,17 @@ void init_triton_ir(py::module_ &m) {
       // decoded next tile {isValid, x, y, z}. The initial tile needs no op
       // (just program_id + true). A later lowering pass materializes the
       // response buffer + mbarrier, splits the fetch into an (overlap-hoisted)
-      // issue + wait + decode, and infers the phase.
-      .def("create_clc_advance",
-           [](TritonOpBuilder &self) -> std::vector<Value> {
-             auto op = self.create<ttng::CLCAdvanceOp>();
-             return {op.getIsValid(), op.getX(), op.getY(), op.getZ()};
-           })
+      // issue + wait + decode, and infers the phase. An optional i1 `steal`
+      // predicate disables the fetch (isValid = false) for CTAs that must not
+      // work-steal.
+      .def(
+          "create_clc_advance",
+          [](TritonOpBuilder &self,
+             std::optional<Value> steal) -> std::vector<Value> {
+            auto op = self.create<ttng::CLCAdvanceOp>(steal.value_or(Value()));
+            return {op.getIsValid(), op.getX(), op.getY(), op.getZ()};
+          },
+          (py::arg("steal").none() = py::none()))
       .def("create_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &c, InputPrecision inputPrecision,
