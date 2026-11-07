@@ -409,6 +409,8 @@ def TT_AtomicRMWOp
             [AtomicOpInterface, SameOperandsAndResultShape,
              SameOperandsAndResultEncoding,
              DeclareOpInterfaceMethods<PredicatedOpInterface>,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<
@@ -442,6 +444,8 @@ def TT_AtomicCASOp
     : TT_Op<"atomic_cas",
             [AtomicOpInterface, SameOperandsAndResultShape,
              SameOperandsAndResultEncoding,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>,
              TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
