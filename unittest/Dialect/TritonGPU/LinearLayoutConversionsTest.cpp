@@ -990,6 +990,54 @@ TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixN) {
   EXPECT_EQ(toLinearLayout({128, 32}, mfma32), pow2C);
 }
 
+// An NPOT scale K puts its odd part in the last K register digit, and lanes
+// past its two-part broadcast: a zero K tail MFMA k reads registers 2k, 2k + 1.
+TEST_F(LinearLayoutConversionsTest, ScaledMfmaScale_NpotK) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = std::move(warps);
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2, 2};
+    radices[S("warp")] = {2, 2};
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), 128}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto scale = [&](int opIdx, int64_t k, unsigned mDim) {
+    return chooseScaledMfmaScaleLayout(&ctx, opIdx, {128, k}, mDim, {1, 1},
+                                       {2, 2});
+  };
+  LinearLayout pow2 = scale(0, 4, 32);
+  ScopedAllowNpot npot;
+  EXPECT_EQ(scale(0, 3, 32),
+            mixedRadix({{0, 1}, {64, 0}}, {3, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 0}},
+                       {{0, 0}, {32, 0}}, 3));
+  EXPECT_EQ(scale(1, 3, 32),
+            mixedRadix({{0, 1}, {64, 0}}, {3, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 0}},
+                       {{32, 0}, {0, 0}}, 3));
+  EXPECT_EQ(scale(0, 6, 16),
+            mixedRadix({{0, 2}, {32, 0}, {64, 0}}, {3, 2, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 1}, {0, 0}},
+                       {{0, 0}, {16, 0}}, 6));
+  // When the MFMA K divides K, MFMA k reads register k.
+  EXPECT_EQ(scale(0, 6, 32),
+            mixedRadix({{0, 2}, {64, 0}}, {3, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 1}},
+                       {{0, 0}, {32, 0}}, 6));
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(scale(0, 4, 32), pow2);
+}
+
 TEST_F(LinearLayoutConversionsTest, MMAv3_64x16) {
   SmallVector<SmallVector<unsigned>, 2> instrShapes = {{16, 16, 8}, {16, 8, 8}};
   for (auto instrShape : instrShapes) {

@@ -1909,6 +1909,46 @@ LinearLayout chooseScaledMfmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,
                                         ? SmallVector<unsigned>{0, 1}
                                         : SmallVector<unsigned>{1, 0};
 
+  int32_t kTwoPart = LinearLayout::twoPartOf(kSize);
+  int64_t mnSize = dotOperandShape[0];
+  if (triton::tools::isNpotAllowed() && rank == 2 && kTwoPart != kSize &&
+      2 * kTwoPart >= threadsInKDim && llvm::isPowerOf2_64(mnSize)) {
+    // Under TRITON_ALLOW_NPOT, an NPOT scale K puts its odd part in the last K
+    // register digit, and lane K bits past its two-part broadcast: a zero K
+    // tail MFMA reads two adjacent registers, one per half of the lanes.
+    LinearLayout::BasesT bases;
+    LinearLayout::RadicesT radices;
+    auto addBasis = [&](StringAttr inDim, int32_t k, int32_t mn,
+                        int32_t radix = 2) {
+      bases[inDim].push_back({k, mn});
+      radices[inDim].push_back(radix);
+    };
+    for (int32_t elem = threadsInKDim; elem < kTwoPart; elem *= 2)
+      addBasis(kRegister, elem, 0);
+    addBasis(kRegister, kTwoPart, 0, kSize / kTwoPart);
+    for (int32_t elem = mfmaMDim; elem < tilePerWarpMN * mfmaMDim; elem *= 2)
+      addBasis(kRegister, 0, elem);
+    for (const std::vector<int32_t> &base : laneBase)
+      addBasis(kLane, base[0] < kTwoPart ? base[0] : 0, base[1]);
+    StringAttr dimMN = outDimNames[0], dimK = outDimNames[1];
+    int32_t tileMN = tilePerWarpMN * mfmaMDim;
+    LinearLayout layout =
+        LinearLayout(std::move(bases), std::move(radices),
+                     {{dimK, kSize}, {dimMN, tileMN}},
+                     /*requireSurjective=*/true)
+            .transposeOuts(outDimNames) *
+        broadcastedDotOperandLayout(ctx, warpsPerCTANew, warpOrder,
+                                    /*kDim=*/1, kWarp)
+            .transposeOuts(outDimNames);
+    if (layout.getOutDimSize(dimMN) < mnSize)
+      layout *= LinearLayout::identity1D(mnSize / layout.getOutDimSize(dimMN),
+                                         kRegister, dimMN);
+    layout =
+        ensureLayoutNotLargerThan(layout, {{dimMN, mnSize}, {dimK, kSize}});
+    return (layout * CGAEncodingAttr::get1CTALayout(ctx, 2).getLinearLayout())
+        .transposeOuts(outDimNames);
+  }
+
   LinearLayout warpLayout =
       identityStandardND(kWarp, warpsPerCTANew, warpOrder);
   LinearLayout ctaLayout = tileLayout.transposeOuts(outDimNames) *

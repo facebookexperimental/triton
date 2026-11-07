@@ -84,6 +84,23 @@ tt.func @dot_k48_fp8(%pa: !tt.ptr<f8E4M3FN>, %pb: !tt.ptr<f8E4M3FN>, %pc: !tt.pt
   tt.return
 }
 
+// MXFP8 K=96 keeps its 128x3 scales exact for the same tail.
+// CHECK-LABEL: @mxfp8_k96
+// CHECK: tt.dot_scaled {{.*}} : tensor<128x96xf8E4M3FN, #ttg.dot_op<{opIdx = 0, parent = #mma{{.*}}, kWidth = 16}>>, tensor<128x3xi8, #linear{{[0-9]*}}> *
+tt.func @mxfp8_k96(%pa: !tt.ptr<f8E4M3FN>, %pb: !tt.ptr<f8E4M3FN>, %ps: !tt.ptr<i8>, %pc: !tt.ptr<f32>) {
+  %sa = tt.splat %pa : !tt.ptr<f8E4M3FN> -> tensor<128x96x!tt.ptr<f8E4M3FN>>
+  %a = tt.load %sa : tensor<128x96x!tt.ptr<f8E4M3FN>>
+  %sb = tt.splat %pb : !tt.ptr<f8E4M3FN> -> tensor<96x128x!tt.ptr<f8E4M3FN>>
+  %b = tt.load %sb : tensor<96x128x!tt.ptr<f8E4M3FN>>
+  %ss = tt.splat %ps : !tt.ptr<i8> -> tensor<128x3x!tt.ptr<i8>>
+  %s = tt.load %ss : tensor<128x3x!tt.ptr<i8>>
+  %c = arith.constant dense<0.0> : tensor<128x128xf32>
+  %d = tt.dot_scaled %a scale %s, %b scale %s, %c lhs = e4m3 rhs = e4m3 {fastMath = false} : tensor<128x96xf8E4M3FN>, tensor<128x3xi8> * tensor<96x128xf8E4M3FN>, tensor<128x3xi8> -> tensor<128x128xf32>
+  %sc = tt.splat %pc : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>
+  tt.store %sc, %d : tensor<128x128x!tt.ptr<f32>>
+  tt.return
+}
+
 // Control: a pow2 K still gets the require_layout anchors.
 // INSERT-LABEL: @dot_k128
 // INSERT-COUNT-2: tlx.require_layout
