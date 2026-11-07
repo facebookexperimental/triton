@@ -610,6 +610,103 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     }
   }
 
+  // A barrierful wait in a CLC while (separate_epilogue_store: the staging
+  // ring is filled by another partition and the wait's arrive hands the slot
+  // back) cannot use a planned pending count, so it would sit right after its
+  // store and serialize every TMA store. There is no software-pipeline
+  // schedule for the while either, so rotate it in program order within the
+  // iteration: move the wait (and with it the slot release) to just before the
+  // first wait_barrier guarding the K-th later TMA store, the earliest store
+  // that can reuse its slot. Waits whose K-th later store is in the next
+  // iteration move to just after the iteration's last TMA store, so the tail
+  // stores overlap each other. The lowering derives the pending count from
+  // program order.
+  DenseMap<Block *, Operation *> lastTailWait;
+  for (ttng::TMAStoreTokenWaitOp waitOp : straightLineWaits) {
+    auto whileOp = dyn_cast<scf::WhileOp>(waitOp->getParentOp());
+    if (!whileOp || waitOp->getBlock() != whileOp.getAfterBody() ||
+        (waitOp.getBarriers().empty() && waitOp.getNvwsTokens().empty()))
+      continue;
+    auto rotateBy = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
+    if (!rotateBy || rotateBy.getInt() <= 1)
+      continue;
+    Operation *tmaStore = waitOp.getToken().getDefiningOp();
+    if (!tmaStore || !isTMAStoreLikeOp(tmaStore) ||
+        tmaStore->getBlock() != waitOp->getBlock())
+      continue;
+    Block *body = waitOp->getBlock();
+    SmallVector<Operation *> stores;
+    for (Operation &op : *body)
+      if (isTMAStoreLikeOp(&op))
+        stores.push_back(&op);
+    // Every TMA store in the body must be at the top level of the body;
+    // nested ones would be miscounted.
+    bool nestedStore = false;
+    for (Operation &op : *body)
+      if (op.getNumRegions() != 0)
+        op.walk([&](Operation *nested) {
+          if (nested != &op && isTMAStoreLikeOp(nested))
+            nestedStore = true;
+        });
+    if (nestedStore)
+      continue;
+    // The slot of this store is reused at the earliest by the K-th later TMA
+    // store (the stores into its own ring are a subsequence of all stores),
+    // which is also where the scf.for path releases it.
+    auto *it = llvm::find(stores, tmaStore);
+    size_t idx = std::distance(stores.begin(), it);
+    size_t targetIdx = idx + rotateBy.getInt();
+    Operation *target = targetIdx < stores.size() ? stores[targetIdx] : nullptr;
+    Operation *prevStore = target ? stores[targetIdx - 1] : nullptr;
+    Operation *insertBefore = nullptr;
+    if (target) {
+      // The other partition refills a slot behind a wait_barrier between the
+      // previous store and the store reading it. Release the slot before the
+      // first wait_barrier there; releasing earlier than strictly needed is
+      // always safe because the wait already covers this store. Without such
+      // a wait_barrier the guard is somewhere else, so leave the wait alone.
+      for (Operation *op = prevStore->getNextNode(); op != target;
+           op = op->getNextNode()) {
+        if (isa<ttng::WaitBarrierOp>(op)) {
+          insertBefore = op;
+          break;
+        }
+      }
+      if (!insertBefore) {
+        LDBG("no wait_barrier guards the TMA store reusing the slot in CLC "
+             "loop at "
+             << whileOp.getLoc() << "; leaving TMA store wait unchanged");
+        continue;
+      }
+    } else {
+      // Keep the tail waits in their original relative order: each goes
+      // right after the previous tail wait (waits are visited in program
+      // order), the first right after the last store, but never above the
+      // definitions of its own operands (e.g. its barrier view).
+      Operation *prevTail = lastTailWait.lookup(body);
+      Operation *anchor = prevTail ? prevTail : stores.back();
+      for (Value operand : waitOp->getOperands())
+        if (Operation *def = operand.getDefiningOp())
+          if (def->getBlock() == body && anchor->isBeforeInBlock(def))
+            anchor = def;
+      insertBefore = anchor->getNextNode();
+    }
+    if (insertBefore == waitOp.getOperation()) {
+      waitOp->removeAttr(kCanRotateByBufferCount);
+      if (!target)
+        lastTailWait[body] = waitOp;
+      continue;
+    }
+    if (!insertBefore || insertBefore->isBeforeInBlock(waitOp))
+      continue;
+    if (!operandsDominate(waitOp, insertBefore))
+      continue;
+    if (!target)
+      lastTailWait[body] = waitOp;
+    waitOp->moveBefore(insertBefore);
+    waitOp->removeAttr(kCanRotateByBufferCount);
+  }
+
   // CLC epilogues live directly in an scf.while rather than an scf.for. Their
   // planned K-slot waits overlap stores across scheduler iterations, so drain
   // each issuing task's queue when the persistent loop exits.
