@@ -13,6 +13,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/DecomposeScaledBlocked.h"
 #include "triton/Dialect/TritonGPU/Transforms/LayoutPropagationUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -1944,7 +1945,13 @@ struct AmdNpotTargetLegality : public tt::NpotTargetLegality {
     else if (auto bufferLoad =
                  dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(copy))
       dstTy = bufferLoad.getDest().getType();
-    else
+    else if (auto load = dyn_cast<tt::LoadOp>(copy)) {
+      // A load to pipeline copies into the encoding the pipeliner picks.
+      auto ty = cast<RankedTensorType>(load.getType());
+      dstTy = ttg::MemDescType::get(
+          ty.getShape(), ty.getElementType(), tt::getSharedEncoding(load),
+          ttg::SharedMemorySpaceAttr::get(load.getContext()));
+    } else
       return ("NPOT async copy is not yet supported on " + target).str();
     triton::AMD::TargetInfo targetInfo(target.split(':').second);
     unsigned elemBitWidth = dstTy.getElementTypeBitWidth();
