@@ -553,8 +553,8 @@ LogicalResult WarpGroupDotOp::verify() {
   if (!llvm::isPowerOf2_32(instrN)) {
     MemDescType bTy = getB().getType();
     std::optional<NvmmaSmemAttrs> attrs = getMmaOperandSmemAttrs(bTy);
-    if (attrs && !isMmaV3BTilingLegal(*attrs, bTy.getElementTypeBitWidth(),
-                                      instrN, retShapePerCTA[1]))
+    if (attrs && !isMmaBTilingLegal(*attrs, bTy.getElementTypeBitWidth(),
+                                    instrN, retShapePerCTA[1]))
       return emitOpError("WGMMA B operand has an n")
              << instrN << " tile that starts inside a swizzle pattern";
   }
@@ -1687,6 +1687,9 @@ std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
     return std::string("NPOT MMAv5 K is not yet supported");
   if (!llvm::isPowerOf2_64(ctaShape[0]))
     return std::string("NPOT MMAv5 M is not yet supported");
+  // The NPOT TMEM ld/st plan covers blockM=128 only.
+  if (blockM == 64 && !llvm::isPowerOf2_64(ctaShape[1]))
+    return std::string("NPOT MMAv5 N with blockM=64 is not yet supported");
   unsigned n = std::min<unsigned>(blockN, ctaShape[1]);
   if (auto reason = getTcgen05IllegalShapeReason(kind, aInTmem, bMNMajor,
                                                  twoCTAs, blockM, n))
@@ -1710,11 +1713,14 @@ static LogicalResult verifyNpotMMAv5Tile(Operation *op, Tcgen05Kind kind,
       llvm::isPowerOf2_64(k))
     return success();
   auto bAttrs = getNvmmaSmemAttrs(b);
+  bool aInTmem = isa<TensorMemoryEncodingAttr>(a.getEncoding());
   bool twoCTAs = getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
+  unsigned instrN = getTcgen05InstrN(
+      kind, aInTmem, getMmaOperandSmemAttrs(b), twoCTAs, dEnc.getBlockM(),
+      dEnc.getBlockN(), ctaShape[1], b.getElementTypeBitWidth());
   if (auto reason = getNpotMMAv5TileUnsupportedReason(
-          kind, isa<TensorMemoryEncodingAttr>(a.getEncoding()),
-          /*bMNMajor=*/!bAttrs || !bAttrs->transposed, twoCTAs,
-          dEnc.getBlockM(), dEnc.getBlockN(), ctaShape, k))
+          kind, aInTmem, /*bMNMajor=*/!bAttrs || !bAttrs->transposed, twoCTAs,
+          dEnc.getBlockM(), instrN, ctaShape, k))
     return op->emitOpError(*reason);
   return success();
 }
