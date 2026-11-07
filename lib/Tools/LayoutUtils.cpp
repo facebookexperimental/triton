@@ -61,6 +61,8 @@ struct BinaryColumns {
 
 std::optional<BinaryColumns> getBinaryColumns(const LinearLayout &layout,
                                               ArrayRef<int32_t> offsets) {
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
   BinaryColumns columns;
   for (StringAttr inDim : layout.getInDimNames()) {
     for (auto [pos, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
@@ -101,6 +103,8 @@ struct OddOwner {
 // Returns nullopt if some odd digit owns no coordinate (a zero digit).
 std::optional<SmallVector<std::optional<OddOwner>>>
 getOddOwners(const LinearLayout &layout) {
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
   SmallVector<std::optional<OddOwner>> owners(layout.getNumOutDims());
   for (StringAttr inDim : layout.getInDimNames()) {
     for (auto [pos, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
@@ -730,7 +734,26 @@ LinearLayout renameLinearLayoutDims(
     StringAttr renamed = outRenames.lookup(outDim);
     outDims.push_back({renamed ? renamed : outDim, size});
   }
+  if (layout.hasOddPartForm())
+    return LinearLayout(std::move(bases), std::move(radices), outDims,
+                        /*requireSurjective=*/layout.isSurjective());
+  // A general offset table is keyed by dim names, so it is renamed with them.
+  llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>
+      digits;
+  llvm::MapVector<StringAttr, std::vector<int32_t>> offsets;
+  for (StringAttr outDim : layout.getOutDimNames()) {
+    if (layout.getTableDigits(outDim).empty())
+      continue;
+    StringAttr renamed = outRenames.lookup(outDim);
+    renamed = renamed ? renamed : outDim;
+    for (auto [inDim, pos] : layout.getTableDigits(outDim)) {
+      StringAttr inRenamed = inRenames.lookup(inDim);
+      digits[renamed].push_back({inRenamed ? inRenamed : inDim, pos});
+    }
+    offsets[renamed] = layout.getTableOffsets(outDim).vec();
+  }
   return LinearLayout(std::move(bases), std::move(radices), outDims,
+                      std::move(digits), std::move(offsets),
                       /*requireSurjective=*/layout.isSurjective());
 }
 
@@ -1049,6 +1072,8 @@ IndexDigits getIndexDigits(ArrayRef<int64_t> shape) {
 std::optional<LinearLayout> tryReshapeLayout(MLIRContext *ctx,
                                              const LinearLayout &layout,
                                              ArrayRef<int64_t> shape) {
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
   auto srcDims = to_vector(layout.getOutDimNames());
   SmallVector<int64_t> srcShape;
   for (StringAttr dim : srcDims)
