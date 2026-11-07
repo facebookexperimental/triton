@@ -115,7 +115,8 @@ getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
 std::optional<Tcgen05Kind> getTcgen05Kind(Type t);
 
 // Why an NPOT per-CTA accumulator tile can't be issued as tcgen05 tiles of
-// blockM x min(blockN, N), or nullopt if it can. NPOT M and K aren't lowered.
+// blockM x min(blockN, N), or nullopt if it can. NPOT M and K, and NPOT N at
+// blockM=64, aren't lowered.
 std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
     Tcgen05Kind kind, bool aInTmem, bool bMNMajor, bool twoCTAs,
     unsigned blockM, unsigned blockN, ArrayRef<int64_t> ctaShape, int64_t k);
