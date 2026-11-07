@@ -236,3 +236,58 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A unit M dim keeps #mma exact at 1x96, as at pow2, so RLC rematerializes
+// the mask in #mma rather than converting it.
+#p96 = #ttg.linear<{register = [[4, 0], [8, 0], [16, 0], [32, 0], [0, 32]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [[1, 0], [2, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [64, 96]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @mask_onto_mma
+  // CHECK: tt.make_range {{.*}} : tensor<96xi32, #ttg.slice<{dim = 0, parent = #[[MMA:mma]]}>>
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: arith.select %{{.*}} : tensor<64x96xi1, #[[MMA]]>, tensor<64x96xf32, #[[MMA]]>
+  tt.func public @mask_onto_mma(%p: !tt.ptr<f32>, %n: i32) {
+    %pp = tt.splat %p : !tt.ptr<f32> -> tensor<64x96x!tt.ptr<f32>, #mma>
+    %acc = tt.load %pp : tensor<64x96x!tt.ptr<f32>, #mma>
+    %ninf = arith.constant dense<0xFF800000> : tensor<64x96xf32, #p96>
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #ttg.slice<{dim = 0, parent = #p96}>>
+    %e = tt.expand_dims %r {axis = 0 : i32} : tensor<96xi32, #ttg.slice<{dim = 0, parent = #p96}>> -> tensor<1x96xi32, #p96>
+    %ns = tt.splat %n : i32 -> tensor<1x96xi32, #p96>
+    %m = arith.cmpi slt, %e, %ns : tensor<1x96xi32, #p96>
+    %mb = tt.broadcast %m : tensor<1x96xi1, #p96> -> tensor<64x96xi1, #p96>
+    %mc = ttg.convert_layout %mb : tensor<64x96xi1, #p96> -> tensor<64x96xi1, #mma>
+    %nc = ttg.convert_layout %ninf : tensor<64x96xf32, #p96> -> tensor<64x96xf32, #mma>
+    %s = arith.select %mc, %acc, %nc : tensor<64x96xi1, #mma>, tensor<64x96xf32, #mma>
+    tt.store %pp, %s : tensor<64x96x!tt.ptr<f32>, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// Control: at pow2 #mma is exact at 1x128, so the mask rematerializes in #mma.
+#bl = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @mask_onto_mma_pow2
+  // CHECK: tt.make_range {{.*}} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #[[MMA:mma]]}>>
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: arith.select %{{.*}} : tensor<64x128xi1, #[[MMA]]>, tensor<64x128xf32, #[[MMA]]>
+  tt.func public @mask_onto_mma_pow2(%p: !tt.ptr<f32>, %n: i32) {
+    %pp = tt.splat %p : !tt.ptr<f32> -> tensor<64x128x!tt.ptr<f32>, #mma>
+    %acc = tt.load %pp : tensor<64x128x!tt.ptr<f32>, #mma>
+    %ninf = arith.constant dense<0xFF800000> : tensor<64x128xf32, #bl>
+    %r = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #bl}>>
+    %e = tt.expand_dims %r {axis = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #bl}>> -> tensor<1x128xi32, #bl>
+    %ns = tt.splat %n : i32 -> tensor<1x128xi32, #bl>
+    %m = arith.cmpi slt, %e, %ns : tensor<1x128xi32, #bl>
+    %mb = tt.broadcast %m : tensor<1x128xi1, #bl> -> tensor<64x128xi1, #bl>
+    %mc = ttg.convert_layout %mb : tensor<64x128xi1, #bl> -> tensor<64x128xi1, #mma>
+    %nc = ttg.convert_layout %ninf : tensor<64x128xf32, #bl> -> tensor<64x128xf32, #mma>
+    %s = arith.select %mc, %acc, %nc : tensor<64x128xi1, #mma>, tensor<64x128xf32, #mma>
+    tt.store %pp, %s : tensor<64x128x!tt.ptr<f32>, #mma>
+    tt.return
+  }
+}
