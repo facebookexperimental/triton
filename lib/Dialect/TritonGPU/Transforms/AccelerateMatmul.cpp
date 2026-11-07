@@ -1323,8 +1323,6 @@ namespace {
 // warps must sit on each dim's power-of-two part, as the mixed-radix layout
 // puts them; then exact issues no more atoms per warp than padded.
 std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
-  if (!llvm::isPowerOf2_64(dot.getA().getType().getShape().back()))
-    return std::string("NPOT K is not yet supported on wgmma");
   ArrayRef<int64_t> shape = dot.getType().getShape();
   // B's order isn't known yet: take the N-major order of a row-major load
   // unless the dtype forces K-major.
@@ -1335,6 +1333,13 @@ std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
       bTy, {fast, 1 - fast},
       CGAEncodingAttr::get1CTALayout(dot.getContext(), bTy.getRank()));
   auto instrShape = getMmaV3InstrShape(shape, elemTy, bTy, attrs, numWarps);
+  int64_t k = dot.getA().getType().getShape().back();
+  if (!isMmaV3NpotKLegal(k, instrShape[2]))
+    return llvm::formatv("NPOT dot is not yet supported on wgmma with K {0}, "
+                         "whose power-of-two part {1} is less than k{2}",
+                         k, LinearLayout::twoPartOf(static_cast<int32_t>(k)),
+                         instrShape[2])
+        .str();
   SmallVector<unsigned> warps =
       to_vector(warpsPerTileV3(dot, shape, numWarps, instrShape));
   if (!llvm::isPowerOf2_32(instrShape[1]) &&
