@@ -1101,6 +1101,14 @@ LogicalResult ConcatOp::verify() {
     return emitError()
            << "Element types of sources and destination must match.";
 
+  auto srcEncoding = srcType.getEncoding();
+  auto dstEncoding = dstType.getEncoding();
+  if (!srcEncoding != !dstEncoding)
+    return emitError(
+        "sources and result must both have an encoding, or neither");
+  if (!srcEncoding)
+    return success();
+
   auto linearLayoutSrc = triton::gpu::toLinearLayout(srcType);
   auto linearLayoutDst = triton::gpu::toLinearLayout(dstType);
   auto ctx = srcType.getContext();
@@ -1846,10 +1854,8 @@ LogicalResult ScheduledMfmaScaledOp::verify() {
                          !bScaleTy.getElementType().isInteger(8))))
     return emitOpError("requires rank-2 i8 or packed i32 E8M0 scale tensors");
   if (!packedScales &&
-      (aScaleTy.getShape() !=
-           ArrayRef<int64_t>({aTy.getShape()[0], scaleK}) ||
-       bScaleTy.getShape() !=
-           ArrayRef<int64_t>({bTy.getShape()[1], scaleK})))
+      (aScaleTy.getShape() != ArrayRef<int64_t>({aTy.getShape()[0], scaleK}) ||
+       bScaleTy.getShape() != ArrayRef<int64_t>({bTy.getShape()[1], scaleK})))
     return emitOpError(
         "scale shapes must be [M, logicalK/32] and [N, logicalK/32]");
   // Conversion assumes the MFMA scale layout register order (non-K tiles,
