@@ -96,7 +96,7 @@ def test_npot_copy_one_warp(size):
 @pytest.mark.parametrize("op", ["load_store", "make_range", "splat", "elementwise"])
 def test_npot_op_class(op, N, num_warps):
     """Each op class keeps its NPOT shape and matches torch and, bitwise, its
-    padded counterpart, whose scan is where the padded tensor's pad elements begin."""
+    padded counterpart, whose inner_tree scan is where the padded tensor's pad elements begin."""
 
     @triton.jit
     def kernel(X, S, Out, Scan, N: tl.constexpr, OP: tl.constexpr, SCAN: tl.constexpr):
@@ -112,7 +112,7 @@ def test_npot_op_class(op, N, num_warps):
             v = tl.where(x > 0, tl.exp(x), x.to(tl.int32).to(tl.float32))
         tl.store(Out + i, v)
         if SCAN:
-            tl.store(Scan + i, tl.cumsum(v, 0))
+            tl.store(Scan + i, tl.cumsum(v, 0, reduction_ordering=tl.ReductionOrdering.INNER_TREE))
 
     x, s = torch.randn(N, device="cuda"), torch.randn(1, device="cuda")
     i = torch.arange(N, device="cuda")
@@ -411,11 +411,61 @@ def test_npot_reverse_scan(op, N):
 
 @requires_gpu
 @requires_npot
-@pytest.mark.parametrize("N, num_warps, kept", [(768, 1, False), (96, 4, False), (128, 4, True)])
+@pytest.mark.parametrize("M, N, axis, num_warps, op", [
+    (96, 80, 1, 4, "cumsum"),
+    (96, 80, 1, 4, "reverse"),
+    (96, 80, 1, 4, "argmax"),
+    (96, 80, 0, 4, "cumsum"),
+    (96, 80, 0, 4, "argmax"),
+    (64, 192, 0, 8, "cumsum"),
+    (64, 192, 0, 8, "reverse"),
+    (32, 128, 1, 4, "cumsum"),
+])
+def test_npot_scan(M, N, axis, num_warps, op):
+    """A scan keeps a mixed-radix layout and matches torch: [96, 80] along both dims, [64, 192] carrying across
+    eight warps, argmax as a two-operand scan, [32, 128] as the pow2 control. Vector first: a shape stays
+    only if its pow2 part gives each thread the 16-byte vector padding proves."""
+
+    @triton.jit
+    def _argmax(a, i, b, j):
+        return tl.where(b > a, b, a), tl.where(b > a, j, i)
+
+    @triton.jit
+    def kernel(X, Out, Idx, M: tl.constexpr, N: tl.constexpr, AXIS: tl.constexpr, OP: tl.constexpr):
+        off = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+        x = tl.load(X + off)
+        if OP == "cumsum":
+            y = tl.cumsum(x, AXIS)
+        elif OP == "reverse":
+            y = tl.cumsum(x, AXIS, reverse=True)
+        else:
+            y, i = tl.associative_scan((x, off), AXIS, _argmax)
+            tl.store(Idx + off, i)
+        tl.store(Out + off, y)
+
+    torch.manual_seed(0)
+    x = torch.randperm(M * N, device="cuda", dtype=torch.int32).view(M, N) - M * N // 2
+    out, idx = torch.empty_like(x), torch.zeros_like(x)
+    h = kernel[(1, )](x, out, idx, M=M, N=N, AXIS=axis, OP=op, num_warps=num_warps)
+    threads = num_warps * triton.runtime.driver.active.get_current_target().warp_size
+    assert (f"tensor<{M}x{N}x" in h.asm["ttgir"]) == ((M & -M) * (N & -N) >= threads * 4)
+    if op == "argmax":
+        ref = x.cummax(axis)
+        off = torch.arange(M * N, device="cuda", dtype=torch.int32).view(M, N)
+        assert torch.equal(out, ref.values) and torch.equal(idx, off.gather(axis, ref.indices))
+    else:
+        flip = x.flip(axis) if op == "reverse" else x
+        ref = flip.cumsum(axis, dtype=torch.int32)
+        assert torch.equal(out, ref.flip(axis) if op == "reverse" else ref)
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("N, num_warps, kept", [(768, 1, True), (96, 4, False), (128, 4, True)])
 def test_npot_histogram(N, num_warps, kept):
-    """Padded, as histogram does not yet take a mixed-radix layout: pad lanes load
-    0, a bin-0 canary; the live mask keeps them uncounted. N=128 is the pow2
-    control."""
+    """[768] on one warp keeps its shape. [96] on four warps pads: pad lanes
+    load 0, a bin-0 canary, and the live mask keeps them uncounted. N=128 is
+    the pow2 control."""
 
     @triton.jit
     def kernel(X, Out, N: tl.constexpr, B: tl.constexpr):

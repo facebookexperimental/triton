@@ -78,18 +78,73 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 
-// An op that does not declare MixedRadixLayoutOpInterface keeps the named
-// reject.
+// An op without MixedRadixLayoutTrait or MixedRadixLayoutOpInterface is
+// rejected.
 #p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func @mixed_radix_scan() {
+  tt.func @mixed_radix_map_elementwise() {
     %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
-    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.scan}}
-    %s = "tt.scan"(%r) <{axis = 0 : i32, reverse = false}> ({
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.map_elementwise}}
+    %m = "tt.map_elementwise"(%r) <{pack = 1 : i32}> ({
+    ^bb0(%a: i32):
+      tt.map_elementwise.return %a : i32
+    }) : (tensor<96xi32, #p96>) -> tensor<96xi32, #p96>
+    tt.return
+  }
+}
+
+// -----
+
+// A scan takes a mixed-radix layout unless it names why its lowering can't yet.
+// [96, 80] appends radix 3 on 96, then radix 5 on 80.
+#q = #ttg.linear<{register = [[0, 1], [0, 2], [32, 0], [0, 16]], lane = [[0, 4], [0, 8], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 3, 5], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [96, 80]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_scan() {
+    %x = arith.constant dense<1> : tensor<96x80xi32, #q>
+    %s = "tt.scan"(%x) <{axis = 1 : i32, reverse = false}> ({
     ^bb0(%a: i32, %b: i32):
       %t = arith.addi %a, %b : i32
       tt.scan.return %t : i32
-    }) : (tensor<96xi32, #p96>) -> tensor<96xi32, #p96>
+    }) : (tensor<96x80xi32, #q>) -> tensor<96x80xi32, #q>
+    %u = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%a: i32, %b: i32):
+      %t = arith.addi %a, %b : i32
+      tt.scan.return %t : i32
+    }) : (tensor<96x80xi32, #q>) -> tensor<96x80xi32, #q>
+    tt.return
+  }
+}
+
+// -----
+
+// #q with its second lane bit moved to dim 0: dim 1's lanes are no longer
+// consecutive, so its lanes don't step as a blocked layout's do.
+#qi = #ttg.linear<{register = [[0, 1], [0, 2], [32, 0], [0, 16]], lane = [[0, 4], [1, 0], [0, 8], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 3, 5], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [96, 80]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_scan_unblocked_lanes() {
+    %x = arith.constant dense<1> : tensor<96x80xi32, #qi>
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on a scan whose lanes or warps are not blocked}}
+    %s = "tt.scan"(%x) <{axis = 1 : i32, reverse = false}> ({
+    ^bb0(%a: i32, %b: i32):
+      %t = arith.addi %a, %b : i32
+      tt.scan.return %t : i32
+    }) : (tensor<96x80xi32, #qi>) -> tensor<96x80xi32, #qi>
+    tt.return
+  }
+}
+
+// -----
+
+#q = #ttg.linear<{register = [[0, 1], [0, 2], [32, 0], [0, 16]], lane = [[0, 4], [0, 8], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 3, 5], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [96, 80]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_scan_inner_tree() {
+    %x = arith.constant dense<1> : tensor<96x80xi32, #q>
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on an inner_tree scan}}
+    %v = "tt.scan"(%x) <{axis = 1 : i32, reverse = false, reduction_ordering = "inner_tree"}> ({
+    ^bb0(%a: i32, %b: i32):
+      %t = arith.addi %a, %b : i32
+      tt.scan.return %t : i32
+    }) : (tensor<96x80xi32, #q>) -> tensor<96x80xi32, #q>
     tt.return
   }
 }
@@ -119,29 +174,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-#w = #ttg.linear<{register = [[0, 1], [0, 2], [32, 0], [64, 0], [0, 16]], lane = [[0, 4], [0, 8], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 5], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 80]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func @mixed_radix_reduce_warp_axis() {
-    %x = arith.constant dense<1.0> : tensor<128x80xf32, #w>
-    %s = "tt.reduce"(%x) <{axis = 1 : i32}> ({
-    ^bb0(%a: f32, %b: f32):
-      %c = arith.addf %a, %b : f32
-      tt.reduce.return %c : f32
-    }) : (tensor<128x80xf32, #w>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #w}>>
-    // expected-error @+1 {{NPOT mixed-radix layout with warps on the reduce axis is not yet supported}}
-    %t = "tt.reduce"(%x) <{axis = 0 : i32}> ({
-    ^bb0(%a: f32, %b: f32):
-      %c = arith.addf %a, %b : f32
-      tt.reduce.return %c : f32
-    }) : (tensor<128x80xf32, #w>) -> tensor<80xf32, #ttg.slice<{dim = 0, parent = #w}>>
-    tt.return
-  }
-}
-
-// -----
-
-// Constants, carried values, print and assert take a mixed-radix layout;
-// histogram does not yet.
+// Constants, carried values, print, assert and histogram take a mixed-radix
+// layout.
 #p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
 #b = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
@@ -170,7 +204,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.print ": " {hex = false, isSigned = array<i32: 1>} : %x : tensor<96xi32, #p96>
     %pos = arith.cmpi sge, %x, %r : tensor<96xi32, #p96>
     tt.assert %pos, "x >= r" : tensor<96xi1, #p96>
-    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on tt.histogram}}
     %h = tt.histogram %x : tensor<96xi32, #p96> -> tensor<16xi32, #b>
     cf.br ^bb2
   ^bb2:
