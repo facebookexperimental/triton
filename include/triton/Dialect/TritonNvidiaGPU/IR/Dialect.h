@@ -127,6 +127,11 @@ std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
     unsigned blockM, unsigned blockN, ArrayRef<int64_t> ctaShape, int64_t k,
     unsigned bitwidth, bool supportsK96 = false);
 
+// Why TMA can't copy NPOT tile `ty` as whole getTMABlockShape boxes, or nullopt
+// if it can. An all-pow2 tile always can.
+std::optional<std::string> getNpotTMAUnsupportedReason(gpu::MemDescType ty,
+                                                       gpu::TMAMode mode);
+
 // Returns the required ordering of repeated TMEM scale blocks for one
 // tcgen05 scaled-MMA operand.
 TensorMemoryScalesBlockRepOrder getTensorMemoryScalesBlockRepOrder(
