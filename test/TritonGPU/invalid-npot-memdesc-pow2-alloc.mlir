@@ -100,23 +100,25 @@ module {
 
 // -----
 
-#rotating = #ttg.amd_rotating_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#sw = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#part = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #sw}>
 #smem = #ttg.shared_memory
 // Upstream getAllocationShapePerCTA rounds a swizzled_shared tile up to its
-// 4x64 pow2 alloc shape but not an amd_rotating one, so this 3x64 allocation is
+// 4x64 pow2 alloc shape but not a partitioned one, so this 3x64 allocation is
 // too small.
 // expected-error @below {{NPOT memdesc allocation that does not match the encoding's pow2 alloc shape is not yet supported}}
-!leading_npot_unpadded = !ttg.memdesc<3x48xi8, #rotating, #smem, mutable, 3x64>
+!leading_npot_unpadded = !ttg.memdesc<3x48xi8, #part, #smem, mutable, 3x64>
 module {
 }
 
 // -----
 
-#rotating = #ttg.amd_rotating_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#sw = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#part = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #sw}>
 #smem = #ttg.shared_memory
 // The same holds for a compact allocation.
 // expected-error @below {{NPOT memdesc allocation that does not match the encoding's pow2 alloc shape is not yet supported}}
-!compact_unpadded = !ttg.memdesc<64x96xi8, #rotating, #smem, mutable>
+!compact_unpadded = !ttg.memdesc<64x96xi8, #part, #smem, mutable>
 module {
 }
 
