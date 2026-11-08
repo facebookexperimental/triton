@@ -443,6 +443,15 @@ getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout) {
   return std::string("NPOT async copy is not yet supported without a target");
 }
 
+std::optional<std::string>
+getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                   StringRef target) {
+  if (auto *legality = lookupNpotTargetLegality(op->getContext(), target))
+    return legality->getDescriptorUnsupportedReason(op, layout, target);
+  return std::string(
+      "NPOT tensor descriptor is not yet supported without a target");
+}
+
 //-- DotScaledOp --
 bool DotScaledOp::verifyDims() {
   auto aShape = this->getA().getType().getShape();
@@ -2323,6 +2332,36 @@ LogicalResult DescriptorStoreOp::verify() {
 LogicalResult DescriptorReduceOp::verify() {
   return verifyDescriptorLoadStoreOp(*this, getDesc().getType(),
                                      getSrc().getType());
+}
+
+std::optional<std::string>
+DescriptorLoadOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorStoreOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorGatherOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string> DescriptorScatterOp::getMixedRadixUnsupportedReason(
+    const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
 }
 
 } // namespace triton
