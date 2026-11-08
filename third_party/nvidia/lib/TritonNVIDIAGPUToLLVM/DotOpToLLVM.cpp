@@ -44,6 +44,14 @@ struct ScaledDotOpConversion
   LogicalResult
   matchAndRewrite(triton::DotScaledOp op, triton::DotScaledOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // The target's NpotTargetLegality rejects exact NPOT dots it can't lower.
+    if (FailureOr<LinearLayout> ll = triton::gpu::getExactNpotOperandLayout(op);
+        succeeded(ll))
+      if (std::optional<std::string> reason =
+              triton::getNpotDotUnsupportedReason(
+                  op, *ll, triton::getModuleTarget(op),
+                  triton::gpu::lookupNumWarps(op)))
+        return op.emitError(*reason);
     auto rty = cast<RankedTensorType>(op.getResult().getType());
     if (!isPermutationMatrixLayout(
             toLinearLayout(rty.getShape(), rty.getEncoding())))
