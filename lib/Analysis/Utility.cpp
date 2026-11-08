@@ -1606,7 +1606,8 @@ unsigned getNumScratchElements(ArrayRef<unsigned> shape) {
   return product<unsigned>(shape);
 }
 
-bool supportMMA(triton::DotOp op, int version) {
+bool supportMMA(triton::DotOp op, int version,
+                std::optional<int> knownNumWarps) {
   // Refer to mma section for the data type supported by Volta and Hopper
   // Tensor Core in
   // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-884-f16
@@ -1659,9 +1660,12 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    auto retShapePerCTA = getShapePerCTA(retType);
+    // The target dot-legality query asks before layouts and ttg.num-warps
+    // exist, on one CTA.
+    auto retShapePerCTA = retType.getEncoding() ? getShapePerCTA(retType)
+                                                : to_vector(retType.getShape());
     auto rank = retShapePerCTA.size();
-    int numWarps = lookupNumWarps(op);
+    int numWarps = knownNumWarps ? *knownNumWarps : lookupNumWarps(op);
     // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.
     if (rank == 3)
       return false;
