@@ -76,6 +76,17 @@ bool hasNpotLayoutExtent(ArrayRef<int64_t> layoutShape) {
   return !llvm::equal(ttg::getNpotPow2AllocShape(layoutShape), layoutShape);
 }
 
+// Flag on, the allocator gives a dense NPOT tile exactly product(tile)
+// elements; a radix-2 dense layout keeps the bit-walk regions exact.
+bool isNpotDenseAllocation(ttg::MemDescType ty) {
+  auto tile = ttg::dropPipeliningDim(ty.getAllocShape(), ty.getEncoding());
+  if (!hasNpotLayoutExtent(tile))
+    return false;
+  FailureOr<triton::LinearLayout> dense =
+      ttg::getNpotDenseSharedLayout(ty.getEncoding(), tile);
+  return succeeded(dense) && dense->isRadix2();
+}
+
 uint32_t applySharedPadding(uint32_t byteOffset, ttg::MemDescType ty) {
   auto padded = ttg::getPaddedEncoding(ty.getEncoding());
   if (!padded)
@@ -274,8 +285,14 @@ MemDescFootprint getMemDescAddresses(
 uint32_t getMemDescStorageOffset(ttg::MemDescType ty, unsigned index) {
   if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace()))
     return index * ttng::getTmemAllocSizes(ty).numCols;
-  uint64_t stageElems = ttg::getAllocationElems(ty.getEncoding(), ty.getShape(),
-                                                ty.getAllocShape());
+  // A dense allocation's pages are strided as memdesc_index lowers them.
+  uint64_t stageElems =
+      isNpotDenseAllocation(ty)
+          ? ttg::getAllocationElems(
+                ty.getEncoding(),
+                ttg::dropPipeliningDim(ty.getAllocShape(), ty.getEncoding()))
+          : ttg::getAllocationElems(ty.getEncoding(), ty.getShape(),
+                                    ty.getAllocShape());
   uint64_t elementSize = getIntOrFloatOrPtrBitWidth(ty.getElementType()) / 8;
   uint64_t byteOffset = static_cast<uint64_t>(index) * stageElems * elementSize;
   uint64_t offset = applySharedPadding(byteOffset, ty);
@@ -301,7 +318,8 @@ bool reachesNPOTLinearLayoutAssert(Type type) {
       ttg::isPaddedEncoding(encoding))
     return false;
   return !llvm::all_of(ttg::dropPipeliningDim(ty.getAllocShape(), encoding),
-                       llvm::isPowerOf2_64);
+                       llvm::isPowerOf2_64) &&
+         !isNpotDenseAllocation(ty);
 }
 
 struct MemDescSubsliceOffsets {
@@ -575,8 +593,12 @@ unsigned getMemDescSize(ttg::MemDescType ty) {
                       ~getInputBasisMask(allocation, offsetDim, logicalDims);
   uint64_t viewSpan =
       (getOutputBasisMask(view, logicalDims, offsetDim) | zeroMask) + 1;
-  return ((stages - 1) * allocation.getInDimSize(offsetDim) + viewSpan) *
-         elSize;
+  // A densely mapped NPOT tile is allocated without the rest of its cover.
+  uint64_t stageElems = allocation.getInDimSize(offsetDim);
+  if (hasNpotLayoutExtent(allocShape) &&
+      succeeded(ttg::getNpotDenseSharedLayout(encoding, allocShape)))
+    stageElems = product(allocShape);
+  return ((stages - 1) * stageElems + std::min(viewSpan, stageElems)) * elSize;
 }
 
 BufferRegionView

@@ -302,9 +302,27 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
       ModuleAxisInfoAnalysis &axisAnalysisPass)
       : LoadStoreConversionBase(targetInfo, axisAnalysisPass) {}
 
+  // The register-to-offset layout of each slab of a direct-to-LDS copy, and
+  // the LDS element each slab starts at; a radix-2 copy is one slab.
+  FailureOr<LinearLayout>
+  getDirectToLdsCvt(Location loc, const LinearLayout &regLayout,
+                    const LinearLayout &sharedLayout,
+                    SmallVectorImpl<int32_t> &slabOffsets) const {
+    if (regLayout.isRadix2() && sharedLayout.isRadix2()) {
+      slabOffsets.assign(1, 0);
+      return regLayout.invertAndCompose(sharedLayout);
+    }
+    std::string reason;
+    FailureOr<LinearLayout> cvt = LLVM::AMD::splitDirectToLdsCopy(
+        regLayout, sharedLayout, slabOffsets, reason);
+    if (failed(cvt))
+      emitError(loc, "NPOT async copy is not supported: " + reason);
+    return cvt;
+  }
+
   // For each load emit the computation to get the lane id offset which holds
   // the source pointers/offsets we need to store to shared memory
-  SmallVector<Value>
+  FailureOr<SmallVector<Value>>
   emitSwizzledLaneOffsets(RewriterBase &rewriter, Operation *op,
                           RankedTensorType srcTy, MemDescType swizzledTy,
                           MemDescType flatTy, Value llDst, Type resElemTy,
@@ -318,8 +336,20 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
     auto sharedSwizz = triton::gpu::toLinearLayout(swizzledTy);
     auto sharedFlat = triton::gpu::toLinearLayout(flatTy);
 
-    auto regToSharedSwizzled = regLayout.invertAndCompose(sharedSwizz);
-    auto regToSharedFlat = regLayout.invertAndCompose(sharedFlat);
+    SmallVector<int32_t> swizzledSlabs, flatSlabs;
+    FailureOr<LinearLayout> maybeSwizzled =
+        getDirectToLdsCvt(loc, regLayout, sharedSwizz, swizzledSlabs);
+    if (failed(maybeSwizzled))
+      return failure();
+    FailureOr<LinearLayout> maybeFlat =
+        getDirectToLdsCvt(loc, regLayout, sharedFlat, flatSlabs);
+    if (failed(maybeFlat))
+      return failure();
+    if (swizzledSlabs != flatSlabs)
+      return emitError(loc, "NPOT async copy is not supported: a swizzled "
+                            "slab starts away from its flat slab");
+    const LinearLayout &regToSharedSwizzled = *maybeSwizzled;
+    const LinearLayout &regToSharedFlat = *maybeFlat;
 
     MLIRContext *ctx = rewriter.getContext();
     StringAttr kBlock = str_attr("block");
@@ -391,10 +421,12 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
       // other
       if (!otherElems.empty())
         packedArr = b.insert_val(packedArr, otherElems[i], 2);
-      // swizzleOffset are per vec so we need to duplicate values vec times
-      auto swizzleOffset = swizzledLaneOffsets.empty()
-                               ? b.i32_val(0)
-                               : swizzledLaneOffsets[i / vec];
+      // swizzleOffset are per vec so we need to duplicate values vec times;
+      // every odd register value repeats the same offsets.
+      auto swizzleOffset =
+          swizzledLaneOffsets.empty()
+              ? b.i32_val(0)
+              : swizzledLaneOffsets[(i / vec) % swizzledLaneOffsets.size()];
       packedArr = b.insert_val(packedArr, swizzleOffset, 3);
 
       loadVals.push_back(packedArr);
@@ -462,10 +494,6 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
 
     // Build global to shared layout and remove broadcasted registers
     auto globalLayout = triton::gpu::toLinearLayout(globalTy);
-    auto removeBroadcast = actionRemoveBroadcastedRegs(globalLayout);
-    globalLayout = removeBroadcast.apply(globalLayout);
-    vals = removeBroadcast.apply(vals);
-
     LinearLayout sharedLayout;
     if (auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(
             sharedTy.getEncoding())) {
@@ -473,6 +501,34 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
     } else {
       sharedLayout = triton::gpu::toLinearLayout(sharedTy);
     }
+    auto maskSpanAffineOffset =
+        SharedMemoryObject::getMaskSpanOffsets(sharedTy);
+
+    // A mixed-radix copy is one radix-2 copy per odd register value o,
+    // starting at LDS element slabOffsets[o].
+    SmallVector<int32_t> slabOffsets = {0};
+    if (!globalLayout.isRadix2() || !sharedLayout.isRadix2()) {
+      if (!isLoad)
+        return emitError(loc, "NPOT async store from LDS is not supported");
+      SmallVector<SmallVector<int32_t>> globalSlabs, sharedSlabs;
+      FailureOr<LinearLayout> globalBin = triton::gpu::splitOddOuterDigits(
+          globalLayout, str_attr("register"), globalSlabs);
+      FailureOr<LinearLayout> sharedBin = triton::gpu::splitOddOuterDigits(
+          sharedLayout, str_attr("offset"), sharedSlabs);
+      if (failed(getDirectToLdsCvt(loc, globalLayout, sharedLayout,
+                                   slabOffsets)) ||
+          failed(globalBin) || failed(sharedBin))
+        return failure();
+      if (llvm::any_of(slabOffsets, [&](int32_t offset) {
+            return offset & maskSpanAffineOffset;
+          }))
+        return emitError(loc, "NPOT async copy is not supported: a slab "
+                              "start overlaps the subview offset");
+      globalLayout = *globalBin;
+      sharedLayout = *sharedBin;
+    }
+    auto removeBroadcast = actionRemoveBroadcastedRegs(globalLayout);
+    globalLayout = removeBroadcast.apply(globalLayout);
     auto cvt = globalLayout.invertAndCompose(sharedLayout);
     if (!cvt.isTrivialOver({str_attr("block")})) {
       return emitError(loc, isLoad ? "direct to lds loads do not support "
@@ -492,8 +548,6 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, llShared,
                                                          resElemTy, rewriter);
     auto affineOffset = smemObj.getShmemOffset(loc, rewriter, sharedTy);
-    auto maskSpanAffineOffset =
-        SharedMemoryObject::getMaskSpanOffsets(sharedTy);
 
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
 
@@ -515,11 +569,23 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
       laneId = b.i32_val(0);
     }
 
-    SmallVector<Value> smemBases = {smemObj.getBase()};
-    lowerLdSt(loc, ctx, cvt, vals, resElemTy, smemBases, paddingShifts,
-              affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
-              /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
-              vec, lowerInstForwardMulticastMask);
+    unsigned slabRegs = vals.size() / slabOffsets.size();
+    unsigned elemBytes = sharedTy.getElementTypeBitWidth() / 8;
+    for (auto [o, slabOffset] : llvm::enumerate(slabOffsets)) {
+      Value base = smemObj.getBase();
+      if (slabOffset != 0)
+        base = b.gep(
+            base.getType(), i8_ty, base,
+            b.i32_val(applyPadding(slabOffset * elemBytes, paddingShifts)));
+      SmallVector<Value> smemBases = {base};
+      lowerLdSt(
+          loc, ctx, cvt,
+          removeBroadcast.apply(ArrayRef(vals).slice(o * slabRegs, slabRegs)),
+          resElemTy, smemBases, paddingShifts, affineOffset,
+          maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+          /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo, vec,
+          lowerInstForwardMulticastMask);
+    }
     return success();
   }
 
@@ -786,6 +852,11 @@ struct BufferLoadToLocalOpConversion
   LogicalResult
   matchAndRewrite(triton::amdgpu::BufferLoadToLocalOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (FailureOr<LinearLayout> ll = triton::gpu::getExactNpotOperandLayout(op);
+        succeeded(ll))
+      if (std::optional<std::string> reason =
+              triton::getNpotAsyncCopyUnsupportedReason(op, *ll))
+        return op.emitError(*reason);
     auto cacheModifier = LLVM::AMD::getCacheModifier(op.getCachePolicyAttr());
     if (failed(cacheModifier)) {
       op.emitOpError("target cache policy is not supported on AMD targets");
@@ -868,8 +939,11 @@ struct BufferLoadToLocalOpConversion
           maybeSwizzledEnc.getOrder(), maybeSwizzledEnc.getCGALayout());
       flatDstTy = MemDescType::get(dstTy.getShape(), dstTy.getElementType(),
                                    flatSharedEnc, dstTy.getMemorySpace());
-      swizzledLaneOffsets = emitSwizzledLaneOffsets(
+      FailureOr<SmallVector<Value>> laneOffsets = emitSwizzledLaneOffsets(
           rewriter, op, ptrType, dstTy, flatDstTy, llDst, resElemTy, vec);
+      if (failed(laneOffsets))
+        return failure();
+      swizzledLaneOffsets = std::move(*laneOffsets);
     }
 
     auto offsetTy = offsetElems[0].getType();
@@ -978,6 +1052,13 @@ struct AsyncCopyGlobalToLocalOpConversion
   LogicalResult
   matchAndRewrite(triton::gpu::AsyncCopyGlobalToLocalOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // The target's NpotTargetLegality rejects mixed-radix copies it can't
+    // lower.
+    if (FailureOr<LinearLayout> ll = triton::gpu::getExactNpotOperandLayout(op);
+        succeeded(ll))
+      if (std::optional<std::string> reason =
+              triton::getNpotAsyncCopyUnsupportedReason(op, *ll))
+        return op.emitError(*reason);
     if (op.getIsVolatile())
       return failure();
     auto cacheModifier = LLVM::AMD::getCacheModifier(op.getCachePolicyAttr());
@@ -1039,8 +1120,11 @@ struct AsyncCopyGlobalToLocalOpConversion
           maybeSwizzledEnc.getOrder(), maybeSwizzledEnc.getCGALayout());
       flatDstTy = MemDescType::get(dstTy.getShape(), dstTy.getElementType(),
                                    flatSharedEnc, dstTy.getMemorySpace());
-      swizzledLaneOffsets = emitSwizzledLaneOffsets(
+      FailureOr<SmallVector<Value>> laneOffsets = emitSwizzledLaneOffsets(
           rewriter, op, srcTy, dstTy, flatDstTy, llDst, resElemTy, vec);
+      if (failed(laneOffsets))
+        return failure();
+      swizzledLaneOffsets = std::move(*laneOffsets);
     }
 
     Type srcPtrTy = srcElems[0].getType();
