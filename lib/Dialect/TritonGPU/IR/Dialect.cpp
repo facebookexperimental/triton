@@ -2300,6 +2300,10 @@ bool triton::gpu::isMmaV3NpotNLegal(ArrayRef<unsigned> warpsPerCTA,
          warpsPerCTA[1] == 1;
 }
 
+bool triton::gpu::isMmaV3NpotKLegal(int64_t k, unsigned atomK) {
+  return LinearLayout::twoPartOf(static_cast<int32_t>(k)) % atomK == 0;
+}
+
 LogicalResult
 NvidiaMmaEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                               unsigned versionMajor, unsigned,
@@ -3976,9 +3980,9 @@ struct TritonGPUInferLayoutInterface
   inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                      Attribute retEncoding,
                      std::optional<Location> location) const override {
-    // A mixed-radix result's operands keep their layouts until
-    // accelerate-matmul picks the MMA's.
-    if (!isRadix2Encoding(retEncoding))
+    // A mixed-radix dot's operands keep their layouts until accelerate-matmul
+    // picks the MMA's.
+    if (!isRadix2Encoding(retEncoding) || !isRadix2Encoding(operandEncoding))
       return success();
     auto mmaRetEncoding = mlir::dyn_cast<NvidiaMmaEncodingAttr>(retEncoding);
     if (mmaRetEncoding && mmaRetEncoding.isHopper()) {
