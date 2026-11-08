@@ -17,6 +17,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/DecomposeScaledBlocked.h"
+#include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -1453,6 +1454,15 @@ getTcgen05ScaledUnsupportedReason(DotScaledOp dot, int computeCapability,
       nvidia_gpu::TargetFeatures(computeCapability).supportsK96Tcgen05MMA());
 }
 
+NVMMASharedEncodingAttr getDefaultTMALayout(RankedTensorType tile) {
+  MLIRContext *ctx = tile.getContext();
+  unsigned rank = tile.getRank();
+  return NVMMASharedEncodingAttr::get(
+      ctx, tile.getShape(), getMatrixOrder(rank, /*rowMajor=*/true),
+      CGAEncodingAttr::get1CTALayout(ctx, rank), tile.getElementType(),
+      /*fp4Padded=*/false);
+}
+
 struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   using NpotTargetLegality::NpotTargetLegality;
   StringRef getTargetPrefix() const override { return "cuda"; }
@@ -1495,6 +1505,31 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   getAsyncCopyUnsupportedReason(Operation *, const LinearLayout &,
                                 StringRef) const override {
     return std::nullopt;
+  }
+  // TMA moves the tile through shared memory on the descriptor's layout, the
+  // default NVMMA one until OptimizeDescriptorEncoding sets it.
+  std::optional<std::string>
+  getDescriptorUnsupportedReason(Operation *op, const LinearLayout &,
+                                 StringRef) const override {
+    auto store = dyn_cast<DescriptorStoreLikeOpInterface>(op);
+    auto tile = cast<RankedTensorType>(store ? store.getSrc().getType()
+                                             : op->getResult(0).getType());
+    // async_tma_gather/scatter take pow2 x offsets.
+    if (isa<DescriptorGatherOp, DescriptorScatterOp>(op) &&
+        !llvm::isPowerOf2_64(tile.getDimSize(0)))
+      return std::string("NPOT TMA gather/scatter rows are not yet supported");
+    MLIRContext *ctx = op->getContext();
+    Attribute layout =
+        cast<DescriptorOpInterface>(op).getDesc().getType().getSharedLayout();
+    if (layout)
+      layout =
+          updateEncodingForShape(op, cast<SharedEncodingTrait>(layout), tile);
+    else
+      layout = getDefaultTMALayout(tile);
+    auto memDesc = MemDescType::get(tile.getShape(), tile.getElementType(),
+                                    layout, SharedMemorySpaceAttr::get(ctx),
+                                    /*mutableMemory=*/true);
+    return nvidia_gpu::getNpotTMAUnsupportedReason(memDesc, TMAMode::Tiled);
   }
 };
 } // namespace
