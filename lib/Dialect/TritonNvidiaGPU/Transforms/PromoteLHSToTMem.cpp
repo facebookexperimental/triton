@@ -133,6 +133,18 @@ public:
     if (isFp4Padded(lhs.getType().getEncoding())) {
       return failure();
     }
+    // The K=96 lowering takes A from shared memory; A in TMEM is not yet
+    // implemented (T296112607).
+    if constexpr (std::is_same_v<MMAOpTy, TCGen5MMAScaledOp>) {
+      auto mod = tcGen5MMAOp->template getParentOfType<ModuleOp>();
+      if (tcGen5MMAOp.getAType() == ScaleDotElemType::E2M1 &&
+          tcGen5MMAOp.getBType() == ScaleDotElemType::E2M1 &&
+          mod->hasAttr(ttg::AttrTargetName) &&
+          getTcgen05InstrK(
+              4, accTMemEncoding.getBlockM(), tcGen5MMAOp.getBlockK(), false,
+              TargetFeatures::fromModuleOp(mod).supportsK96Tcgen05MMA()) == 96)
+        return failure();
+    }
     const unsigned colStride = 1;
     // An NPOT K sits in TMEM blocks of its pow2 alloc shape, like an NPOT N
     // accumulator.
