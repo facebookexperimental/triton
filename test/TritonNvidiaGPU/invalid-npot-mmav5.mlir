@@ -132,7 +132,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
                %b: !ttg.memdesc<40x128xf16, #b, #ttg.shared_memory>,
                %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
                %p: i1) {
-    // expected-error @+1 {{NPOT MMAv5 K is not yet supported}}
+    // expected-error @+1 {{NPOT MMAv5 K=40 is unsupported: tcgen05.mma takes K in steps of 16}}
     ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x40xf16, #a, #ttg.shared_memory, 128x64>, !ttg.memdesc<40x128xf16, #b, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
@@ -165,7 +165,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
                        %b: !ttg.memdesc<40x128xf16, #b, #ttg.shared_memory>,
                        %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
                        %p: i1) {
-    // expected-error @+1 {{NPOT MMAv5 K is not yet supported}}
+    // expected-error @+1 {{NPOT MMAv5 K=40 is unsupported: tcgen05.mma takes K in steps of 16}}
     ttng.tc_gen5_mma %a, %b, %c, %p, %p : !ttg.memdesc<128x40xf16, #a, #ttg.shared_memory>, !ttg.memdesc<40x128xf16, #b, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
