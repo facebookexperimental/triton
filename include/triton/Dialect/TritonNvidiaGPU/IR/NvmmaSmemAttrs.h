@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LinearLayout.h"
 
 namespace mlir::triton::nvidia_gpu {
@@ -32,10 +33,18 @@ getNvmmaDescriptorLayout(const LinearLayout &ll, unsigned bitwidth,
 // as the lowering does, even for an NVMMAShared encoding; nullopt if none.
 std::optional<NvmmaSmemAttrs> getMmaOperandSmemAttrs(gpu::MemDescType memTy);
 
-// Whether wgmma can read a [K, n] B with these attrs in tiles of instrN
-// columns. An N-major descriptor's swizzle pattern starts at its address, so
-// a tile may start inside a pattern only if it also ends there.
-bool isMmaV3BTilingLegal(const NvmmaSmemAttrs &attrs, unsigned bitwidth,
-                         unsigned instrN, int64_t n);
+// Whether wgmma or tcgen05 can read a [K, n] B with these attrs in tiles of
+// instrN columns. An N-major descriptor's swizzle pattern starts at its
+// address, so a tile may start inside a pattern only if it also ends there.
+bool isMmaBTilingLegal(const NvmmaSmemAttrs &attrs, unsigned bitwidth,
+                       unsigned instrN, int64_t n);
+
+// The N of each tcgen05.mma for a per-CTA N of n: min(maxN, n), or for an
+// unscaled NPOT n the largest N up to maxN that tiles n, that tcgen05 can
+// issue and that B, if its attrs are known, can be read in.
+unsigned getTcgen05InstrN(Tcgen05Kind kind, bool aInTmem,
+                          std::optional<NvmmaSmemAttrs> bAttrs, bool twoCTAs,
+                          unsigned blockM, unsigned maxN, int64_t n,
+                          unsigned bitwidth);
 
 } // namespace mlir::triton::nvidia_gpu
