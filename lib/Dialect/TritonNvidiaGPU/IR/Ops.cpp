@@ -1108,9 +1108,60 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
   }
   if (nvmma.getTransposed())
     return op->emitOpError("TMA descriptor layout must not be transposed");
-  if (triton::tools::isNpotAllowed() && !hasPow2TMAMessages(memDesc))
-    return op->emitOpError("NPOT TMA tile is not yet supported");
+  if (!triton::tools::isNpotAllowed())
+    return success();
+  TMAMode mode =
+      isa<TensorDescIm2ColType>(desc) ? TMAMode::Im2Col : TMAMode::Tiled;
+  if (auto reason = getNpotTMAUnsupportedReason(memDesc, mode))
+    return op->emitOpError(*reason);
   return success();
+}
+
+// A box lands densely in shared memory (PTX ISA 5.5.7). getTMABlockShape caps
+// each box dim at 256 and sets a swizzled inner box to the swizzle span, so
+// those cuTensorMapEncodeTiled boxDim rules (cuda.h) hold by construction.
+std::optional<std::string> getNpotTMAUnsupportedReason(MemDescType ty,
+                                                       TMAMode mode) {
+  SmallVector<int64_t> shape = getShapePerCTA(ty);
+  if (llvm::all_of(shape, llvm::isPowerOf2_64))
+    return std::nullopt;
+  auto nvmma = dyn_cast<NVMMASharedEncodingAttr>(ty.getEncoding());
+  if (!nvmma || nvmma.getTransposed() || nvmma.getFp4Padded() ||
+      mode != TMAMode::Tiled)
+    return "NPOT TMA tile needs a tiled, untransposed, unpadded NVMMA layout";
+  auto kBlock = StringAttr::get(ty.getContext(), "block");
+  if (nvmma.getCGALayout().getLinearLayout().getInDimSize(kBlock) != 1)
+    return "NPOT TMA tile across CTAs is not yet supported";
+  auto boxOf = [&](ArrayRef<int64_t> tile) {
+    return triton::gpu::getTMABlockShape(
+        tile, nvmma.getElementBitWidth(), nvmma.getSwizzlingByteWidth(),
+        /*fp4Padded=*/false, /*isTransposed=*/false, /*packedSize=*/true,
+        /*emitError=*/nullptr, mode);
+  };
+  auto pow2Shape =
+      getNpotPow2AllocShape(dropPipeliningDim(ty.getAllocShape(), nvmma));
+  auto box = boxOf(shape);
+  auto pow2AllocBox = boxOf(pow2Shape);
+  if (failed(box) || failed(pow2AllocBox) ||
+      failed(nvmmaSharedToLinearLayout(pow2Shape, nvmma, mode,
+                                       /*disableSwizzle=*/false,
+                                       /*emitErrors=*/false)))
+    return "NPOT TMA tile has no NVMMA shared layout";
+  for (auto [dim, extent, size, pow2AllocSize] :
+       llvm::enumerate(shape, *box, *pow2AllocBox)) {
+    // PTX ISA 5.5.3.1: the whole box is copied, so boxes must tile the extent.
+    if (extent % size != 0)
+      return ("NPOT TMA box " + Twine(size) + " does not divide extent " +
+              Twine(extent))
+          .str();
+    // Below dim 0, a box narrower than the layout's would change its pitch.
+    if (dim != 0 && size != pow2AllocSize)
+      return "NPOT TMA box pitch differs from its shared layout";
+  }
+  // cuTensorMapEncodeTiled (cuda.h): the inner box spans a multiple of 16 B.
+  if (box->back() * nvmma.getElementBitWidth() % 128 != 0)
+    return "NPOT TMA box inner dimension is not a multiple of 16 bytes";
+  return std::nullopt;
 }
 
 static LogicalResult verifyAsyncTMALoadOp(Operation *op,
@@ -1171,6 +1222,10 @@ static LogicalResult verifyAsyncTMAGatherScatterOp(Operation *op,
            << blockType;
   if (failed(verifyGatherScatterResultType(op, memDescType, indicesType)))
     return failure();
+  // Gather/scatter lowering still splits a row into a pow2 message count.
+  if (triton::tools::isNpotAllowed() &&
+      !llvm::all_of(getShapePerCTA(memDescType), llvm::isPowerOf2_64))
+    return op->emitOpError("NPOT TMA gather/scatter tile is not yet supported");
 
   if (memDescType.getShape()[1] != blockType.getShape()[1])
     return op->emitOpError("result tensor number of columns must match block (")
