@@ -135,10 +135,11 @@ SmallVector<Value> npotValues(Operation *op) {
 }
 
 // Padding needs a mask to keep a pad lane's side effect from landing. An atomic
-// without a predicate can't be masked, so selection keeps its connected
-// component exact where it can.
+// without a predicate can't be masked, nor can a TMA store's box, so selection
+// keeps its connected component exact where it can.
 static bool hasPaddedLowering(Operation *op) {
-  return !(isa<AtomicOpInterface>(op) && !isa<PredicatedOpInterface>(op));
+  return !(isa<AtomicOpInterface>(op) && !isa<PredicatedOpInterface>(op)) &&
+         !isa<DescriptorStoreLikeOpInterface>(op);
 }
 
 // Groups the NPOT tensors connected through their ops (a connected component
@@ -230,6 +231,8 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   // mixed-radix and Blocked layouts to sum; false if v cannot take a
   // mixed-radix layout.
   auto addTotalInDimSizes = [&](Value v, std::pair<int64_t, int64_t> &sum) {
+    if (auto desc = dyn_cast<TensorDescType>(v.getType()))
+      return !desc.getSharedLayout();
     auto type = dyn_cast<RankedTensorType>(v.getType());
     if (!type || type.getEncoding())
       return false;
@@ -280,6 +283,8 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     auto mixedRadix = dyn_cast<MixedRadixLayoutOpInterface>(op);
     RankedTensorType type;
     for (Type t : op->getOperandTypes()) {
+      if (auto desc = dyn_cast<TensorDescType>(t))
+        t = desc.getBlockType();
       type = mixedRadix || isa<DotOpInterface>(op)
                  ? dyn_cast<RankedTensorType>(t)
                  : nullptr;
@@ -293,14 +298,17 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                                          threadsPerWarp, numCTAs);
     if (failed(exact))
       return std::nullopt;
+    if (isa<DescriptorOpInterface>(op))
+      return getNpotDescriptorUnsupportedReason(op, exact->getLinearLayout(),
+                                                target);
     if (!isa<DotOpInterface>(op))
       return mixedRadix.getMixedRadixUnsupportedReason(
           exact->getLinearLayout());
     return getNpotDotUnsupportedReason(op, exact->getLinearLayout(), target,
                                        numWarps);
   };
-  // A padded connected component with a dot remarks why it pads, once: the
-  // dot's target reason, else the first other reason.
+  // A dot or a descriptor remarks its target reason; else a padded connected
+  // component with a dot remarks the first reason it pads, once.
   using Reasons = llvm::MapVector<Value, std::pair<Operation *, std::string>>;
   Reasons padReasons, slowReasons;
   auto pad = [&](Value leader, Operation *op, std::string reason) {
@@ -323,7 +331,7 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
           llvm::formatv("NPOT mixed-radix layout is not yet supported on {0}",
                         op->getName()));
     } else if (std::optional<std::string> reason = rejects(op)) {
-      if (isa<DotOpInterface>(op)) {
+      if (isa<DotOpInterface, DescriptorOpInterface>(op)) {
         op->emitRemark(*reason);
         remarked.insert(leader);
       }
@@ -370,6 +378,7 @@ private:
   void fill(OpOperand &operand, RankedTensorType orig, TypedAttr value);
   void padLanes(Operation *op, RankedTensorType orig, unsigned axis,
                 ArrayRef<TypedAttr> identities);
+  void storeThroughPointers(DescriptorStoreOp store, RankedTensorType orig);
 
   SmallVector<std::function<void()>> fixups;
   DenseMap<std::pair<Region *, Type>, Value> liveCache;
@@ -470,6 +479,52 @@ void Padder::padLanes(Operation *op, RankedTensorType orig, unsigned axis,
   }
 }
 
+// A pad lane, or a coordinate outside the descriptor's shape (which TMA would
+// clip), stores nothing.
+void Padder::storeThroughPointers(DescriptorStoreOp store,
+                                  RankedTensorType orig) {
+  auto desc = store.getDesc().getDefiningOp<MakeTensorDescOp>();
+  OpBuilder b(store);
+  Location loc = store.getLoc();
+  RankedTensorType type = store.getSrc().getType();
+  int rank = type.getRank();
+  auto grow = [&](Value row, int d) -> Value {
+    for (int k = 0; k < rank; ++k)
+      if (k != d)
+        row = ExpandDimsOp::create(b, loc, row, k);
+    auto to = cast<RankedTensorType>(row.getType()).clone(type.getShape());
+    return row.getType() == to ? row : BroadcastOp::create(b, loc, to, row);
+  };
+  Value ptr = SplatOp::create(b, loc, type.clone(desc.getBase().getType()),
+                              desc.getBase());
+  Value mask = live(store, orig);
+  for (auto [d, index] : llvm::enumerate(store.getIndices())) {
+    auto rowTy = RankedTensorType::get({type.getDimSize(d)}, b.getI32Type());
+    auto row64Ty = rowTy.clone(b.getI64Type());
+    Value c = arith::AddIOp::create(
+        b, loc, MakeRangeOp::create(b, loc, rowTy, 0, type.getDimSize(d)),
+        SplatOp::create(b, loc, rowTy, index));
+    Value zero = arith::ConstantOp::create(
+        b, loc, DenseElementsAttr::get(rowTy, b.getI32IntegerAttr(0)));
+    Value in = arith::AndIOp::create(
+        b, loc,
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sge, c, zero),
+        arith::CmpIOp::create(
+            b, loc, arith::CmpIPredicate::slt, c,
+            SplatOp::create(b, loc, rowTy, desc.getShape()[d])));
+    in = grow(in, d);
+    mask = mask ? arith::AndIOp::create(b, loc, mask, in).getResult() : in;
+    Value offset = arith::MulIOp::create(
+        b, loc, arith::ExtSIOp::create(b, loc, row64Ty, c),
+        SplatOp::create(b, loc, row64Ty, desc.getStrides()[d]));
+    ptr = AddPtrOp::create(b, loc, ptr.getType(), ptr, grow(offset, d));
+  }
+  StoreOp::create(b, loc, ptr, store.getSrc(), mask);
+  store.erase();
+  if (desc->use_empty())
+    desc.erase();
+}
+
 // A result that combines only its own pair of block args (k and n+k) is
 // independent of the others, so each source pads with its own identity. Empty
 // unless every result has one.
@@ -562,11 +617,24 @@ LogicalResult Padder::accept(Operation *op) {
   if (!llvm::any_of(types, touchesNpot))
     return success();
   if (llvm::any_of(types, [](Type type) {
-        auto tensor = dyn_cast<RankedTensorType>(type);
+        auto desc = dyn_cast<TensorDescType>(type);
+        auto tensor = desc && !desc.getSharedLayout()
+                          ? desc.getBlockType()
+                          : dyn_cast<RankedTensorType>(type);
         return touchesNpot(type) && !(tensor && !tensor.getEncoding());
       }))
     return op->emitOpError("on an NPOT pointer-to-tensor, descriptor, memory "
                            "descriptor or encoded tensor is unsupported");
+  // A padded TMA box would write its pad lanes in bounds, so the store moves to
+  // pointers.
+  if (auto store = dyn_cast<DescriptorStoreOp>(op);
+      store && store.getReduceKind() == DescriptorReduceKind::NONE &&
+      store.getDesc().getDefiningOp<MakeTensorDescOp>()) {
+    RankedTensorType orig = store.getSrc().getType();
+    fixups.push_back(
+        [this, store, orig] { storeThroughPointers(store, orig); });
+    return success();
+  }
   if (!hasPaddedLowering(op))
     return op->emitOpError("on an NPOT tensor is unsupported");
 
@@ -579,6 +647,10 @@ LogicalResult Padder::accept(Operation *op) {
   }
   if (isa<SplatOp, BroadcastOp, ExpandDimsOp, TransOp, JoinOp, SplitOp,
           RegionBranchOpInterface, RegionBranchTerminatorOpInterface>(op))
+    return success();
+  // A padded box reads past the tile only into pad lanes, and TMA fills the
+  // part out of bounds.
+  if (isa<MakeTensorDescOp, DescriptorLoadOp, DescriptorGatherOp>(op))
     return success();
   if (auto range = dyn_cast<MakeRangeOp>(op)) {
     int64_t end =
@@ -695,9 +767,14 @@ LogicalResult Padder::accept(Operation *op) {
 
 void Padder::apply(ModuleOp mod, const ExactComponents &exact) {
   auto retype = [&](Value value) {
-    if (auto type = dyn_cast<RankedTensorType>(value.getType());
-        type && isNpot(type.getShape()) && !exact.contains(value))
+    if (!touchesNpot(value.getType()) || exact.contains(value))
+      return;
+    if (auto type = dyn_cast<RankedTensorType>(value.getType()))
       value.setType(padded(type));
+    else if (auto desc = dyn_cast<TensorDescType>(value.getType()))
+      value.setType(TensorDescType::get(padded(desc.getBlockType()).getShape(),
+                                        desc.getElementType(),
+                                        desc.getSharedLayout()));
   };
   mod.walk([&](Operation *op) {
     llvm::for_each(op->getResults(), retype);
