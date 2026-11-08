@@ -650,6 +650,48 @@ TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
   }
 }
 
+// The padding table P(off) = off + 4 * (off / 64) is affine in its digits,
+// so it lowers to one mul per table digit next to the binary digits' selects.
+TEST_F(LinearEncodingTest, LoweredApplyAddsAffineTable) {
+  ctx.getOrLoadDialect<LLVM::LLVMDialect>();
+  auto off = StringAttr::get(&ctx, "offset");
+  LinearLayout::BasesT bases;
+  LinearLayout::RadicesT radices;
+  llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>
+      digits;
+  llvm::MapVector<StringAttr, std::vector<int32_t>> offsets;
+  for (int32_t i = 0; i < 13; ++i) {
+    bases[off].push_back({i < 6 ? 1 << i : 0});
+    radices[off].push_back(2);
+    if (i >= 6)
+      digits[off].push_back({off, i});
+  }
+  for (int32_t hi = 0; hi < 128; ++hi)
+    offsets[off].push_back(68 * hi);
+  LinearLayout padded(bases, radices, {{off, 8704}}, digits, offsets,
+                      /*requireSurjective=*/false);
+  Location loc = UnknownLoc::get(&ctx);
+  Type i32 = IntegerType::get(&ctx, 32);
+  OwningOpRef<ModuleOp> module = ModuleOp::create(loc);
+  IRRewriter rewriter(&ctx);
+  rewriter.setInsertionPointToStart(module->getBody());
+  auto fn = LLVM::LLVMFuncOp::create(rewriter, loc, "apply",
+                                     LLVM::LLVMFunctionType::get(i32, {i32}));
+  Block *entry = fn.addEntryBlock(rewriter);
+  rewriter.setInsertionPointToStart(entry);
+  auto lowered =
+      applyLinearLayout(loc, rewriter, padded, {{off, entry->getArgument(0)}});
+  for (uint32_t x = 0; x < 8192; ++x)
+    EXPECT_EQ(evalLowered(lowered[0].second, {x}), x + 4 * (x / 64));
+  int32_t selects = 0, muls = 0;
+  fn.walk([&](Operation *op) {
+    selects += isa<LLVM::SelectOp>(op);
+    muls += isa<LLVM::MulOp>(op);
+  });
+  EXPECT_EQ(selects, 6);
+  EXPECT_EQ(muls, 7);
+}
+
 // Register counts multiply digit radices, and a run ends at the odd digit.
 TEST_F(LinearEncodingTest, MixedRadixCountsUseRadices) {
   auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
