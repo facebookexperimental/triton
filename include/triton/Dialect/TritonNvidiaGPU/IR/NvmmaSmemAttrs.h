@@ -47,4 +47,13 @@ unsigned getTcgen05InstrN(Tcgen05Kind kind, bool aInTmem,
                           unsigned blockM, unsigned maxN, int64_t n,
                           unsigned bitwidth);
 
+// A mixed-radix register layout cut at its odd register digits into pow2 boxes
+// at box-aligned starts. The ldmatrix lowering and the mma.sync legality both
+// ask it, so an accepted dot's operands load each box as a pow2 view.
+struct Pow2Chunks {
+  LinearLayout layout;
+  SmallVector<SmallVector<int32_t>> starts;
+};
+std::optional<Pow2Chunks> getPow2Chunks(const LinearLayout &regLayout);
+
 } // namespace mlir::triton::nvidia_gpu
