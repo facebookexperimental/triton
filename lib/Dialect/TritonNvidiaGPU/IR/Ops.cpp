@@ -1681,27 +1681,30 @@ getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
 }
 
 unsigned getTcgen05InstrK(unsigned bitwidth, unsigned blockM, int64_t k,
-                          bool supports2xFp8) {
+                          bool supports2xFp8, bool supportsK96) {
   // 2xfp8 requires M = 128 for 1CTA or 256 for 2CTA, which corresponds to
   // blockM == 128. Its K=64 must divide K, or the last MMA reads past K.
   if (supports2xFp8 && bitwidth == 8 && blockM == 128 && k % 64 == 0)
     return 64;
+  // Only an NPOT K is a multiple of 96, so pow2 K keeps its K=64 tiling.
+  if (supportsK96 && bitwidth == 4 && k % 96 == 0)
+    return 96;
   return 256 / bitwidth;
 }
 
-std::optional<std::string>
-getNpotMMAv5TileUnsupportedReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
-                                  bool twoCTAs, unsigned blockM,
-                                  unsigned blockN, ArrayRef<int64_t> ctaShape,
-                                  int64_t k, unsigned bitwidth) {
-  if (kind == Tcgen05Kind::BlockScaled && !llvm::isPowerOf2_64(k))
-    return std::string("NPOT MMAv5 K is not yet supported");
+std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
+    Tcgen05Kind kind, bool aInTmem, bool bMNMajor, bool twoCTAs,
+    unsigned blockM, unsigned blockN, ArrayRef<int64_t> ctaShape, int64_t k,
+    unsigned bitwidth, bool supportsK96) {
   // 2x fp8 is used only when 64 divides K, so the base instruction K decides.
-  unsigned instrK = getTcgen05InstrK(bitwidth, blockM, k, false);
-  if (kind != Tcgen05Kind::BlockScaled && k % instrK != 0)
+  unsigned instrK = getTcgen05InstrK(bitwidth, blockM, k, false, supportsK96);
+  if (k % instrK != 0)
     return ("NPOT MMAv5 K=" + Twine(k) +
             " is unsupported: tcgen05.mma takes K in steps of " + Twine(instrK))
         .str();
+  if (instrK == 96 && (aInTmem || blockM != 128))
+    return std::string("NPOT MMAv5 K=96 is not yet supported with A in tensor "
+                       "memory or blockM=64");
   if (!llvm::isPowerOf2_64(ctaShape[0]))
     return std::string("NPOT MMAv5 M is not yet supported");
   // The NPOT TMEM ld/st plan covers blockM=128 only.
@@ -1716,13 +1719,23 @@ getNpotMMAv5TileUnsupportedReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
   if (ctaShape[1] % n != 0)
     return std::string("NPOT MMAv5 N that is not a multiple of the "
                        "instruction N is not yet supported");
+  // An ISA-legal block-scaled N also needs the NPOT TMEM plan for B's scales.
+  if (kind == Tcgen05Kind::BlockScaled && !llvm::isPowerOf2_64(ctaShape[1])) {
+    if (auto reason = getNpotTMemScalesUnsupportedReason(
+            ctaShape[1], llvm::isPowerOf2_64(k), !twoCTAs))
+      return ("NPOT MMAv5 block-scaled N=" + Twine(ctaShape[1]) +
+              " is not yet supported: " + *reason)
+          .str();
+  }
   return std::nullopt;
 }
 
 // NPOT memdesc shapes only verify under TRITON_ALLOW_NPOT, so POT is untouched.
 static LogicalResult verifyNpotMMAv5Tile(Operation *op, Tcgen05Kind kind,
                                          MemDescType a, MemDescType b,
-                                         MemDescType d, int64_t k) {
+                                         MemDescType d, int64_t k,
+                                         unsigned bitwidth,
+                                         bool supportsK96 = false) {
   auto dEnc = cast<TensorMemoryEncodingAttr>(d.getEncoding());
   auto ctaShape =
       getShapePerCTA(dEnc.getCGALayout().getCTASplitNum(), d.getShape());
@@ -1737,9 +1750,20 @@ static LogicalResult verifyNpotMMAv5Tile(Operation *op, Tcgen05Kind kind,
       dEnc.getBlockN(), ctaShape[1], b.getElementTypeBitWidth());
   if (auto reason = getNpotMMAv5TileUnsupportedReason(
           kind, aInTmem, /*bMNMajor=*/!bAttrs || !bAttrs->transposed, twoCTAs,
-          dEnc.getBlockM(), instrN, ctaShape, k,
-          a.getElementType().getIntOrFloatBitWidth()))
+          dEnc.getBlockM(), instrN, ctaShape, k, bitwidth, supportsK96))
     return op->emitOpError(*reason);
+  // A K=96 step reads 48 bytes of each row: a 64-byte swizzle row holds only
+  // K=96, while 128-byte rows continue across sectors in absolute mode.
+  auto splitsK96 = [&](MemDescType operand) {
+    auto attrs = getNvmmaSmemAttrs(operand);
+    return !attrs || (attrs->swizzlingByteWidth != 128 &&
+                      k > 2 * attrs->swizzlingByteWidth);
+  };
+  if (getTcgen05InstrK(bitwidth, dEnc.getBlockM(), k, false, supportsK96) ==
+          96 &&
+      (splitsK96(a) || splitsK96(b)))
+    return op->emitOpError("NPOT MMAv5 K=96 is not yet supported with an "
+                           "operand swizzle row narrower than K");
   return success();
 }
 
@@ -1865,9 +1889,10 @@ LogicalResult TCGen5MMAOp::verify() {
   // }
   // }
 
-  return verifyNpotMMAv5Tile(*this, *getTcgen05Kind(atype), getA().getType(),
-                             getB().getType(), retType,
-                             getA().getType().getDimSize(1));
+  return verifyNpotMMAv5Tile(
+      *this, *getTcgen05Kind(atype), getA().getType(), getB().getType(),
+      retType, getA().getType().getDimSize(1),
+      getA().getType().getElementType().getIntOrFloatBitWidth());
 }
 
 void TCGen5MMAOp::getEffects(
@@ -2195,6 +2220,7 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   auto bScaleType = cast<MemDescType>(getBScale().getType());
   int64_t k = getBlockK();
   int64_t minK = 32;
+  bool fp4Padded = false;
   if (getAType() == ScaleDotElemType::E2M1 &&
       getBType() == ScaleDotElemType::E2M1) {
     // Match getMXFPKind in MMAv5.cpp: only mxf8f6f4 supports transpose.
@@ -2213,6 +2239,7 @@ LogicalResult TCGen5MMAScaledOp::verify() {
     if (transposed && (isUE4M3 || isUE5M3))
       return emitOpError("mxf4nvf4 does not support transposed operands");
     minK = transposed ? 32 : 64;
+    fp4Padded = (aAttrs && aAttrs->fp4Padded) || (bAttrs && bAttrs->fp4Padded);
   }
   if (k < minK)
     return emitOpError("K dimension must be at least ")
@@ -2254,8 +2281,15 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   if (failed(verifyScaleEncoding(aScaleType, /*isA=*/true)) ||
       failed(verifyScaleEncoding(bScaleType, /*isA=*/false)))
     return failure();
+  // The FP4 kinds (minK 64) step K in 4-bit units; unpadded they take K=96
+  // where the target has it.
+  auto mod = (*this)->getParentOfType<ModuleOp>();
+  bool supportsK96 =
+      minK == 64 && mod->hasAttr(gpu::AttrTargetName) &&
+      TargetFeatures::fromModuleOp(mod).supportsK96Tcgen05MMA() && !fp4Padded;
   return verifyNpotMMAv5Tile(*this, Tcgen05Kind::BlockScaled, getA().getType(),
-                             getB().getType(), getD().getType(), getBlockK());
+                             getB().getType(), getD().getType(), getBlockK(),
+                             minK == 64 ? 4 : 8, supportsK96);
 }
 
 void TCGen5MMAScaledOp::getEffects(
