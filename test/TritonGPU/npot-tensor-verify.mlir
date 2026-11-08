@@ -57,6 +57,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     %a = tt.addptr %s, %r : tensor<96x!tt.ptr<f32>, #p96>, tensor<96xi32, #p96>
     %v = tt.load %a : tensor<96x!tt.ptr<f32>, #p96>
     %w = arith.addf %v, %v : tensor<96xf32, #p96>
+    %u = ub.poison : tensor<96xf32, #p96>
     %c = ttg.convert_layout %w : tensor<96xf32, #p96> -> tensor<96xf32, #q96>
     %b = ttg.convert_layout %a : tensor<96x!tt.ptr<f32>, #p96> -> tensor<96x!tt.ptr<f32>, #q96>
     tt.store %b, %c : tensor<96x!tt.ptr<f32>, #q96>

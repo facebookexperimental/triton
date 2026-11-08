@@ -125,6 +125,20 @@ bool canCoalesceWriteIntoSharedMemory(MLIRContext *ctx,
                                       const LinearLayout &srcToSharedLayout,
                                       unsigned threadsPerWarp);
 
+// Splits a direct-to-LDS copy of |srcLayout| into |sharedLayout| into one
+// radix-2 copy per odd register value o, written from element
+// |slabOffsets|[o]; returns that copy's register-to-offset layout.
+FailureOr<LinearLayout> splitDirectToLdsCopy(
+    const LinearLayout &srcLayout, const LinearLayout &sharedLayout,
+    SmallVectorImpl<int32_t> &slabOffsets, std::string &reason);
+
+// Returns why a mixed-radix |srcLayout| cannot be loaded directly into
+// |dstEnc|, else sets |vectorSize| as canLoadDirectToLDS does.
+std::optional<std::string> getNpotDirectToLdsUnsupportedReason(
+    const triton::AMD::TargetInfo &targetInfo, const LinearLayout &srcLayout,
+    unsigned elemBitWidth, Attribute dstEnc, ArrayRef<int64_t> dstAllocShape,
+    unsigned &vectorSize);
+
 // Returns true if we can load directly from global |srcTy| to shared memory
 // |dstEnc| for the given target.
 // This function expects the caller to pass in |vectorSize| as the vector size
