@@ -78,14 +78,14 @@ tt.func @dot_192x24(%pa: !tt.ptr<f16>) {
 
 // -----
 
+// K's power-of-two part, 32, holds whole k16 atoms.
 // W8-LABEL: @dot_k96
-// W8: tt.dot {{.*}} : tensor<128x128xf16> * tensor<128x128xf16>
+// W8: tt.dot {{.*}} : tensor<128x96xf16> * tensor<96x128xf16>
 tt.func @dot_k96(%pa: !tt.ptr<f16>) {
   %sa = tt.splat %pa : !tt.ptr<f16> -> tensor<128x96x!tt.ptr<f16>>
   %a = tt.load %sa : tensor<128x96x!tt.ptr<f16>>
   %b = arith.constant dense<1.0> : tensor<96x128xf16>
   %c = arith.constant dense<0.0> : tensor<128x128xf32>
-  // expected-remark @+1 {{NPOT K is not yet supported on wgmma}}
   %d = tt.dot %a, %b, %c : tensor<128x96xf16> * tensor<96x128xf16> -> tensor<128x128xf32>
   tt.return
 }
@@ -156,5 +156,19 @@ tt.func @dot_128x96_load(%pb: !tt.ptr<f16> {tt.divisibility = 16 : i32}) {
   %b = tt.load %ptr : tensor<64x96x!tt.ptr<f16>>
   %c = arith.constant dense<0.0> : tensor<128x96xf32>
   %d = tt.dot %a, %b, %c : tensor<128x64xf16> * tensor<64x96xf16> -> tensor<128x96xf32>
+  tt.return
+}
+
+// -----
+
+// W8-LABEL: @dot_k48_i8
+// W8: tt.dot {{.*}} : tensor<128x64xi8> * tensor<64x128xi8>
+tt.func @dot_k48_i8(%pa: !tt.ptr<i8>) {
+  %sa = tt.splat %pa : !tt.ptr<i8> -> tensor<128x48x!tt.ptr<i8>>
+  %a = tt.load %sa : tensor<128x48x!tt.ptr<i8>>
+  %b = arith.constant dense<1> : tensor<48x128xi8>
+  %c = arith.constant dense<0> : tensor<128x128xi32>
+  // expected-remark @+1 {{NPOT dot is not yet supported on wgmma with K 48, whose power-of-two part 16 is less than k32}}
+  %d = tt.dot %a, %b, %c : tensor<128x48xi8> * tensor<48x128xi8> -> tensor<128x128xi32>
   tt.return
 }
