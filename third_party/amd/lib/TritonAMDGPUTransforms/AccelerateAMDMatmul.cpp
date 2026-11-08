@@ -1925,4 +1925,24 @@ struct TritonAMDGPUAccelerateMatmulPass
   }
 };
 
+namespace {
+struct AmdNpotTargetLegality : public tt::NpotTargetLegality {
+  using NpotTargetLegality::NpotTargetLegality;
+  StringRef getTargetPrefix() const override { return "hip"; }
+  std::optional<std::string> getDotUnsupportedReason(Operation *,
+                                                     const tt::LinearLayout &,
+                                                     StringRef target,
+                                                     int) const override {
+    return ("NPOT dot is not yet supported on " + target).str();
+  }
+};
+} // namespace
+
+void triton::amdgpu::registerNpotTargetLegality(DialectRegistry &registry) {
+  registry.addExtension(
+      +[](MLIRContext *, triton::amdgpu::TritonAMDGPUDialect *dialect) {
+        dialect->addInterfaces<AmdNpotTargetLegality>();
+      });
+}
+
 } // namespace mlir

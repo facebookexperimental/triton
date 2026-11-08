@@ -200,8 +200,8 @@ def MixedRadixLayoutOpInterface : OpInterface<"MixedRadixLayoutOpInterface"> {
     InterfaceMethod<
       /*desc=*/[{
         Returns why the lowering can't yet take `layout`, the mixed-radix layout
-        of the first operand, or std::nullopt. The pad pass pads the connected
-        component of such an op and the verifier emits the reason.
+        of the first NPOT operand, or std::nullopt. The pad pass pads the
+        connected component of such an op and the verifier emits the reason.
       }],
       /*retType=*/"std::optional<std::string>",
       /*methodName=*/"getMixedRadixUnsupportedReason",
