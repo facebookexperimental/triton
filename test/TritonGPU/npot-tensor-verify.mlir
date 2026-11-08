@@ -365,3 +365,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#p = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [32, 0], [64, 0], [0, 32]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
+#s8 = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_pow2_alloc_view(%d: !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x128>) {
+    // expected-error @+1 {{NPOT mixed-radix access to a padded, partitioned or partial buffer is not yet supported}}
+    %v = ttg.local_load %d : !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x128> -> tensor<128x96xf16, #p>
+    tt.return
+  }
+}
