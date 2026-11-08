@@ -373,7 +373,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @mixed_radix_pow2_alloc_view(%d: !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x128>) {
-    // expected-error @+1 {{NPOT mixed-radix access to a padded, partitioned or partial buffer is not yet supported}}
+    // expected-error @+1 {{NPOT mixed-radix access to a view with an NPOT subslice extent is not yet supported}}
     %v = ttg.local_load %d : !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x128> -> tensor<128x96xf16, #p>
     tt.return
   }
