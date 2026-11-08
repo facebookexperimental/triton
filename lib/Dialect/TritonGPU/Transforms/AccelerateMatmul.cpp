@@ -92,6 +92,22 @@ static int getMMAVersionSafe(int computeCapability, DotOp op) {
   return 0;
 }
 
+// The other dots of the same rank that share a slice with `dotOp` in its
+// region.
+static SmallVector<Operation *> getChainedDots(DotOpInterface dotOp) {
+  auto rank = cast<RankedTensorType>(dotOp.getD().getType()).getRank();
+  auto filter = [&dotOp](Operation *op) {
+    return op->getParentRegion() == dotOp->getParentRegion() &&
+           !isa<TransOp>(op);
+  };
+  SmallVector<Operation *> dots;
+  for (Operation *op : mlir::getSlice(dotOp, {filter}, {filter}))
+    if (isa<DotOp, DotScaledOp>(op) && op != dotOp &&
+        cast<RankedTensorType>(op->getResult(0).getType()).getRank() == rank)
+      dots.push_back(op);
+  return dots;
+}
+
 SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
                                      const ArrayRef<int64_t> shape,
                                      int numWarps) {
@@ -100,24 +116,14 @@ SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
   if (rank == 3)
     return getMmaV2WarpsPerCTA(shape, numWarps);
 
-  auto filter = [&dotOp](Operation *op) {
-    return op->getParentRegion() == dotOp->getParentRegion() &&
-           !isa<TransOp>(op);
-  };
-  auto slices = mlir::getSlice(dotOp, {filter}, {filter});
   bool hasChainedDot = false;
-  for (Operation *op : slices) {
-    if (isa<DotOp, DotScaledOp>(op) && (op != dotOp)) {
-      auto resTy = cast<RankedTensorType>(op->getResult(0).getType());
-      if (resTy.getRank() != rank) {
-        continue;
-      }
-      if (auto mmaEncoding =
-              dyn_cast<NvidiaMmaEncodingAttr>(resTy.getEncoding())) {
-        return to_vector(mmaEncoding.getWarpsPerCTA());
-      }
-      hasChainedDot = true;
+  for (Operation *op : getChainedDots(dotOp)) {
+    auto resTy = cast<RankedTensorType>(op->getResult(0).getType());
+    if (auto mmaEncoding =
+            dyn_cast_or_null<NvidiaMmaEncodingAttr>(resTy.getEncoding())) {
+      return to_vector(mmaEncoding.getWarpsPerCTA());
     }
+    hasChainedDot = true;
   }
   if (hasChainedDot) {
     if (shape[0] >= shape[1]) {
@@ -1347,6 +1353,23 @@ public:
 };
 
 namespace {
+// Why `warps` of `instrShape` can't sit on each dim's power-of-two part, as
+// the mixed-radix layout puts them, or std::nullopt.
+std::optional<std::string>
+getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
+                                  ArrayRef<unsigned> warps,
+                                  ArrayRef<unsigned> instrShape) {
+  for (auto [dim, size] : llvm::enumerate(shape)) {
+    int64_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(size));
+    if (twoPart % (warps[dim] * LinearLayout::twoPartOf(instrShape[dim])) != 0)
+      return llvm::formatv("NPOT dot is not yet supported with {0} warps of "
+                           "{1} on dim {2}, whose power-of-two part is {3}",
+                           warps[dim], instrShape[dim], dim, twoPart)
+          .str();
+  }
+  return std::nullopt;
+}
+
 // Why BlockedToMMA can't issue `dot` exactly on wgmma, or std::nullopt. Its
 // warps must sit on each dim's power-of-two part, as the mixed-radix layout
 // puts them; then exact issues no more atoms per warp than padded.
@@ -1376,14 +1399,8 @@ std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
                "NPOT wgmma N {0} is not yet supported with {1} warpgroups on N",
                instrShape[1], warps[1])
         .str();
-  for (auto [dim, size] : llvm::enumerate(shape)) {
-    int64_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(size));
-    if (twoPart % (warps[dim] * LinearLayout::twoPartOf(instrShape[dim])) != 0)
-      return llvm::formatv("NPOT dot is not yet supported with {0} warps of "
-                           "{1} on dim {2}, whose power-of-two part is {3}",
-                           warps[dim], instrShape[dim], dim, twoPart)
-          .str();
-  }
+  if (auto reason = getWarpPlacementUnsupportedReason(shape, warps, instrShape))
+    return reason;
   // Ask the lowering's descriptor match about the B memdesc BlockedToMMA
   // allocs.
   if (!attrs)
@@ -1397,6 +1414,61 @@ std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
                          "of B starts inside a swizzle pattern",
                          shape[1], instrShape[1])
         .str();
+  return std::nullopt;
+}
+
+// Why BlockedToMMA can't issue `dot` exactly on mma.sync, or std::nullopt. Its
+// warps must sit on each dim's power-of-two part, and the ldmatrix lowering
+// must cut each NPOT operand into pow2 chunks.
+std::optional<std::string> getMmaV2UnsupportedReason(DotOp dot, int numWarps) {
+  if (!llvm::isPowerOf2_64(dot.getA().getType().getShape().back()))
+    return std::string("NPOT K is not yet supported on mma.sync");
+  ArrayRef<int64_t> shape = dot.getType().getShape();
+  auto instrShape = mmaVersionToInstrShape(
+      2, shape, dot.getA().getType().getElementType(), numWarps);
+  // accelerate-matmul converts a chain's last dot first, from its own shape,
+  // and the other dots copy its warps.
+  DotOpInterface producer = dot;
+  for (Operation *op : getChainedDots(dot))
+    if (op->getBlock() == producer->getBlock() && producer->isBeforeInBlock(op))
+      producer = cast<DotOpInterface>(op);
+  SmallVector<unsigned> warps = warpsPerTileV2(
+      producer, cast<RankedTensorType>(producer.getD().getType()).getShape(),
+      numWarps);
+  // Keep padded's warp placement: warps moved off an NPOT dim leave its odd
+  // part in every warp (all of B per warp, whole-tile epilogue scratch).
+  SmallVector<int64_t> padShape;
+  for (int64_t s : cast<RankedTensorType>(producer.getD().getType()).getShape())
+    padShape.push_back(llvm::PowerOf2Ceil(s));
+  SmallVector<unsigned> padWarps = warpsPerTileV2(producer, padShape, numWarps);
+  if (warps != padWarps)
+    return llvm::formatv("NPOT dot is not yet supported on mma.sync with warps "
+                         "{0}x{1}, where padded places them {2}x{3}",
+                         warps[0], warps.back(), padWarps[0], padWarps.back())
+        .str();
+  if (auto reason = getWarpPlacementUnsupportedReason(shape, warps, instrShape))
+    return reason;
+  // The operand encodings BlockedToMMA builds.
+  MLIRContext *ctx = dot.getContext();
+  auto mma = NvidiaMmaEncodingAttr::get(
+      ctx, 2, 0, warps, CGAEncodingAttr::get1CTALayout(ctx, shape.size()),
+      instrShape);
+  Type minType =
+      IntegerType::get(ctx, std::min(computeOrigBitWidth(dot.getA()),
+                                     computeOrigBitWidth(dot.getB())));
+  for (auto [opIdx, operand] :
+       llvm::enumerate(dot->getOperands().take_front(2))) {
+    auto enc = DotOperandEncodingAttr::get(ctx, opIdx, mma, minType);
+    LinearLayout layout =
+        toLinearLayout(
+            cast<RankedTensorType>(operand.getType()).cloneWithEncoding(enc))
+            .removeZeroBasesAlongDim(StringAttr::get(ctx, "register"));
+    if (!layout.isRadix2() && !nvidia_gpu::getPow2Chunks(layout))
+      return llvm::formatv("NPOT mma.sync operand {0} is not yet supported: "
+                           "its layout has no power-of-two chunks",
+                           opIdx)
+          .str();
+  }
   return std::nullopt;
 }
 
@@ -1469,8 +1541,8 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   std::optional<std::string>
   getDotUnsupportedReason(Operation *op, const LinearLayout &, StringRef target,
                           int numWarps) const override {
-    // Exact only where BlockedToMMA picks wgmma; f64 takes FMA on some
-    // targets.
+    // Exact only where BlockedToMMA picks wgmma or mma.sync alone; f64 takes
+    // FMA on some targets.
     auto dot = dyn_cast<DotOp>(op);
     int computeCapability = 0;
     target.split(':').second.getAsInteger(10, computeCapability);
@@ -1494,6 +1566,8 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
                     Twine(shape[1]) + " is unsupported: " + *reason)
                 .str();
         }
+      if (versions == SmallVector<int>{2} && supportMMA(dot, 2))
+        return getMmaV2UnsupportedReason(dot, numWarps);
     }
     auto scaled = dyn_cast<DotScaledOp>(op);
     if (scaled && computeCapability >= 100 && computeCapability < 120)
