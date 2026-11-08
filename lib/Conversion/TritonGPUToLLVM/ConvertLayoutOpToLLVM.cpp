@@ -169,14 +169,29 @@ struct ConvertLayoutOpConversion
       return outVals;
     }
 
-    // The owner predicate handles broadcast source registers.
-    if (plan)
-      return transferProductThroughSharedMemory(
+    // The owner predicate handles broadcast source registers. A transpose
+    // moves its odd tiles on the swizzled pow2 path, which keeps a vector on
+    // both sides.
+    if (plan) {
+      bool blockScope = plan->scope == triton::MixedRadixConversionScope::Block;
+      if (auto tiles = getMixedRadixTransposeTiles(
+              srcLayout, dstLayout, llvmElemTy.getIntOrFloatBitWidth()))
+        return transferMixedRadixThroughSharedMemory(
+            loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, llvmElemTy,
+            smemBase, plan->sourceFreeVariableMasks, blockScope,
+            distributedCoordinates, &*tiles,
+            [&](const LinearLayout &src, const LinearLayout &dst,
+                ArrayRef<Value> vals) {
+              return transferSwizzlingLocalMemImpl(
+                  loc, rewriter, src, dst, vals, llvmElemTy, smemBase, sourceOp,
+                  distributedCoordinates, /*plan=*/nullptr);
+            });
+      return transferMixedRadixThroughSharedMemory(
           loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, llvmElemTy,
-          smemBase, plan->sourceFreeVariableMasks,
-          plan->scope == triton::MixedRadixConversionScope::Block,
+          smemBase, plan->sourceFreeVariableMasks, blockScope,
           distributedCoordinates,
           plan->sharedTiling ? &*plan->sharedTiling : nullptr);
+    }
 
     // Remove broadcasting in src
     auto removeBroadcastSrc = actionRemoveBroadcastedRegs(srcLayout);
