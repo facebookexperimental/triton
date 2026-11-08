@@ -1226,11 +1226,28 @@ LogicalResult AsyncRemoteShmemStoreOp::verify() {
   return success();
 }
 
+// Mixed-radix lowerings address runs through the buffer's pow2 alloc layout
+// from its base, so they need a whole buffer without padding or partitions.
+static std::optional<std::string>
+getMixedRadixBufferUnsupportedReason(MemDescType type) {
+  Attribute enc = type.getEncoding();
+  if (isa<PaddedSharedEncodingAttr, PartitionedSharedEncodingAttr>(enc) ||
+      dropPipeliningDim(type.getAllocShape(), enc) !=
+          dropPipeliningDim(type.getShape(), enc))
+    return std::string("NPOT mixed-radix access to a padded, partitioned or "
+                       "partial buffer is not yet supported");
+  return std::nullopt;
+}
+
 // LocalLoadOp
 LogicalResult LocalLoadOp::verify() {
   if (failed(verifySharedMemoryRank(*this, getType(), getSrc().getType(),
                                     "result")))
     return failure();
+  if (hasExactNpotLayout(getType()))
+    if (std::optional<std::string> reason =
+            getMixedRadixBufferUnsupportedReason(getSrc().getType()))
+      return emitError(*reason);
   return verifyMemoryOpTypes(*this, getSrc().getType(), getType());
 }
 
@@ -1428,17 +1445,10 @@ LogicalResult AsyncCopyGlobalToLocalOp::verify() {
       return emitOpError("non-bulk mode requires src to be a ranked tensor of "
                          "pointers");
   }
-  // The lowering writes mixed-radix runs through the buffer's pow2 alloc layout
-  // from its base, so it needs a whole buffer without padding or partitions.
-  if (succeeded(getExactNpotOperandLayout(*this))) {
-    MemDescType dstTy = getResult().getType();
-    Attribute enc = dstTy.getEncoding();
-    if (isa<PaddedSharedEncodingAttr, PartitionedSharedEncodingAttr>(enc) ||
-        dropPipeliningDim(dstTy.getAllocShape(), enc) !=
-            dropPipeliningDim(dstTy.getShape(), enc))
-      return emitError("NPOT mixed-radix access to a padded, partitioned or "
-                       "partial buffer is not yet supported");
-  }
+  if (succeeded(getExactNpotOperandLayout(*this)))
+    if (std::optional<std::string> reason =
+            getMixedRadixBufferUnsupportedReason(getResult().getType()))
+      return emitError(*reason);
   return success();
 }
 
