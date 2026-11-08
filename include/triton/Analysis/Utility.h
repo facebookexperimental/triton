@@ -374,7 +374,8 @@ unsigned getNumScratchElements(ArrayRef<unsigned> shape);
 
 bool supportWMMA(triton::DotOp op);
 
-bool supportMMA(triton::DotOp op, int version);
+bool supportMMA(triton::DotOp op, int version,
+                std::optional<int> knownNumWarps = std::nullopt);
 
 bool supportMMA(triton::DotOpInterface op, int version);
 
