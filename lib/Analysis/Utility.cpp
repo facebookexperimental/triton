@@ -1717,6 +1717,15 @@ static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
   if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
     return false;
   }
+  // Identical MMA layouts alias no bases, so the convert is a no-op, as at
+  // pow2.
+  if (isa<triton::gpu::NvidiaMmaEncodingAttr>(srcTy.getEncoding()) &&
+      isa<triton::gpu::NvidiaMmaEncodingAttr>(dstTy.getEncoding()) &&
+      triton::gpu::hasExactNpotLayout(srcTy) &&
+      triton::gpu::hasExactNpotLayout(dstTy) &&
+      toLinearLayout(srcTy) == toLinearLayout(dstTy)) {
+    return false;
+  }
   auto hasMmaFamily = [](Attribute enc) {
     if (isa<triton::gpu::NvidiaMmaEncodingAttr>(enc)) {
       return true;
