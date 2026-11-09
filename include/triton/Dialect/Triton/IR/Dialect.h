@@ -186,6 +186,12 @@ public:
   virtual std::optional<std::string>
   getAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout,
                                 StringRef target) const = 0;
+
+  // Why tensor descriptor `op` can't move its tile, of mixed-radix `layout`, on
+  // `target`, or std::nullopt.
+  virtual std::optional<std::string>
+  getDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                 StringRef target) const = 0;
 };
 
 // The ttg.target of `op`'s module, or "" if it has none.
@@ -200,6 +206,11 @@ getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
 // The same for a global-to-shared async `copy` of mixed-radix `layout`.
 std::optional<std::string>
 getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout);
+
+// The same for a tensor descriptor op on `target`.
+std::optional<std::string>
+getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                   StringRef target);
 
 // Descriptor gather and scatter have restrictions on the tile sizes.
 LogicalResult verifyGatherScatterResultType(Operation *op,
