@@ -120,6 +120,7 @@ tt.func @dot_pow2(%a: tensor<128x64xbf16>, %b: tensor<64x128xbf16>, %pc: !tt.ptr
 
 // At nonKDim 16, two warps fit N=96's power-of-two part 32.
 // CHECK{LITERAL}: #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
+// CHECK{LITERAL}: #mma1 = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 128], isTransposed = true}>
 // CHECK-LABEL: @dot_n96
 // CHECK: tt.dot {{.*}} -> tensor<128x96xf32, #mma>
 tt.func @dot_n96(%a: tensor<128x64xbf16>, %pb: !tt.ptr<bf16>, %pc: !tt.ptr<f32>) {
@@ -127,6 +128,19 @@ tt.func @dot_n96(%a: tensor<128x64xbf16>, %pb: !tt.ptr<bf16>, %pc: !tt.ptr<f32>)
   %b = tt.load %sb : tensor<64x96x!tt.ptr<bf16>>
   %c = arith.constant dense<0.0> : tensor<128x96xf32>
   %d = tt.dot %a, %b, %c : tensor<128x64xbf16> * tensor<64x96xbf16> -> tensor<128x96xf32>
+  %sc = tt.splat %pc : !tt.ptr<f32> -> tensor<128x96x!tt.ptr<f32>>
+  tt.store %sc, %d : tensor<128x96x!tt.ptr<f32>>
+  tt.return
+}
+
+// An fp8 dot at an NPOT N takes the f8f6f4 MFMA under the same rule.
+// CHECK-LABEL: @fp8_n96
+// CHECK: tt.dot_scaled {{.*}} -> tensor<128x96xf32, #mma1>
+tt.func @fp8_n96(%a: tensor<128x128xf8E4M3FN>, %pb: !tt.ptr<f8E4M3FN>, %pc: !tt.ptr<f32>) {
+  %sb = tt.splat %pb : !tt.ptr<f8E4M3FN> -> tensor<128x96x!tt.ptr<f8E4M3FN>>
+  %b = tt.load %sb : tensor<128x96x!tt.ptr<f8E4M3FN>>
+  %c = arith.constant dense<0.0> : tensor<128x96xf32>
+  %d = tt.dot %a, %b, %c : tensor<128x128xf8E4M3FN> * tensor<128x96xf8E4M3FN> -> tensor<128x96xf32>
   %sc = tt.splat %pc : !tt.ptr<f32> -> tensor<128x96x!tt.ptr<f32>>
   tt.store %sc, %d : tensor<128x96x!tt.ptr<f32>>
   tt.return

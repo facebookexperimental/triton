@@ -75,13 +75,17 @@ struct ScaledDotOpConversion
   LogicalResult
   matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // The target's NpotTargetLegality rejects exact NPOT dots it can't lower.
+    // The target's NpotTargetLegality rejects exact NPOT dots it can't lower,
+    // at the M/N size their MFMA encoding fixed.
+    auto mfma =
+        dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(op.getType().getEncoding());
     if (FailureOr<LinearLayout> ll = triton::gpu::getExactNpotOperandLayout(op);
         succeeded(ll))
       if (std::optional<std::string> reason =
               triton::getNpotDotUnsupportedReason(
                   op, *ll, triton::getModuleTarget(op),
-                  triton::gpu::lookupNumWarps(op), /*nonKDim=*/0))
+                  triton::gpu::lookupNumWarps(op),
+                  mfma ? mfma.getInstrShape()[0] : 0))
         return op.emitError(*reason);
     auto dType = op.getD().getType();
     auto dEncoding = dType.getEncoding();
