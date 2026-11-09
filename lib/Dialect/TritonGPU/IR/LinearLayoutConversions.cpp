@@ -1297,7 +1297,7 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
                                               Attribute layout) {
   CacheKey key{std::vector<int64_t>(shape.begin(), shape.end()), layout};
   if (auto result = llCache.get(key)) {
-    return *result;
+    return std::move(*result);
   }
 
   // Layouts are distributed or shared in triton core
