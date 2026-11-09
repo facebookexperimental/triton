@@ -268,7 +268,7 @@ def _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs, v_p
         state, probability_tile = _finish_probability_fragments(state, probability_carry, QK_SCALE, q.dtype,
                                                                 EAGER_PROBABILITY_FRAGMENTS)
         _schedule_softmax_mfma_valu(1)
-    tlx.async_load_wait_group(1)
+    #tlx.async_load_wait_group(1)
     # mem1: read V for the completed probability tile and prefetch the next K tile.
     with tlx.warp_pipeline_stage("mem1"):
         v_dot = tlx.local_load(tlx.local_view(v_buf, CUR_SLOT), relaxed=True)
@@ -280,13 +280,14 @@ def _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs, v_p
             state, probability_tile, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
         probability_carry = _anchor_probability_carry(probability_carry)
         _schedule_softmax_mfma_valu(2)
-    tlx.async_load_wait_group(1)
+    tlx.async_load_wait_group(2)
     # mem2: prepare the next K/V operands and rescale the running softmax state.
     with tlx.warp_pipeline_stage("mem2"):
         kt_dot = _kt_pieces(k_buf, CUR_SLOT)
         tok_v = tlx.async_load(v_ptrs + (block_n + 2) * BLOCK_N * stride_vn, tlx.local_view(v_buf, CUR_SLOT))
         tlx.async_load_commit_group([tok_v])
         state = state.rescale_lazy(score_delta, max_advance)
+    tlx.async_load_wait_group(2)
     return state, probability_carry, kt_dot
 
 
@@ -300,10 +301,10 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     """
     tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k0])
-    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0))
-    tlx.async_load_commit_group([tok_v0])
     tok_k1 = tlx.async_load(k_ptrs + BLOCK_N * stride_kn, tlx.local_view(k_buf, 1))
     tlx.async_load_commit_group([tok_k1])
+    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0))
+    tlx.async_load_commit_group([tok_v0])
 
     wait0 = tlx.async_load_wait_group(2)
     q = tlx.local_load(tlx.local_view(q_buf, 0), token=wait0)
@@ -315,10 +316,11 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     tl.debug_barrier()
     tok_k2 = tlx.async_load(k_ptrs + 2 * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k2])
-    wait1 = tlx.async_load_wait_group(1)
+    wait1 = tlx.async_load_wait_group(2)
     kt_dot = _kt_pieces(k_buf, 1, wait1)
     tok_v1 = tlx.async_load(v_ptrs + BLOCK_N * stride_vn, tlx.local_view(v_buf, 1))
     tlx.async_load_commit_group([tok_v1])
+    tlx.async_load_wait_group(2)
 
     # Pairs keep both ring slots static.
     for pair_idx in tl.range(0, (n_blocks - 3) // 2, num_stages=1):
