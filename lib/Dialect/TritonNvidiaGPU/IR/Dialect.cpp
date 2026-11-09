@@ -381,25 +381,26 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
          "numWarps must be a power of 2 and >= 4");
   assert(atom != TMemAccessAtom::I16x32bx2 &&
          "This layout is inferred sometimes for the 32x32b atom");
-  // NPOT N: the pow2 chunk's layout times the odd part as the outermost
-  // register digit, the form computeTMemLdStEncodingInfo lowers.
-  int64_t n = memType.getShape().back();
+  // NPOT N (or scale MN): the pow2 chunk's layout times the odd part as the
+  // outermost register digit, the form computeTMemLdStEncodingInfo lowers.
+  auto shape = memType.getShape().take_back(2);
   FailureOr<gpu::MemDescType> chunkTy = failure();
-  if (!llvm::isPowerOf2_64(n))
+  if (!llvm::all_of(shape, llvm::isPowerOf2_64))
     chunkTy = getNpotTMemChunkType(memType);
   if (succeeded(chunkTy)) {
     auto chunk = getDistributedLayoutForTmemLdSt(*chunkTy, atom, numWarps);
     if (!chunk)
       return std::nullopt;
     auto kReg = StringAttr::get(memType.getContext(), "register");
-    int32_t odd = n / chunkTy->getShape().back();
+    int d = chunkTy->getShape()[0] == shape[0] ? 1 : 0;
+    int32_t odd = shape[d] / chunkTy->getShape()[d];
     LinearLayout::BasesT bases;
     bases[kReg] = {{1}};
     LinearLayout::RadicesT radices;
     radices[kReg] = {odd};
     auto dims = to_vector(chunk->getOutDimNames());
     return *chunk * LinearLayout(std::move(bases), std::move(radices),
-                                 {{dims[1], odd}}, /*requireSurjective=*/true);
+                                 {{dims[d], odd}}, /*requireSurjective=*/true);
   }
   auto ll = toLinearLayout(memType);
   auto bitwidth = memType.getElementTypeBitWidth();
