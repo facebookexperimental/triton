@@ -378,3 +378,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// An MMAv2 layout at an NPOT shape is an exact mixed-radix layout, so its dot
+// verifies.
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [2, 2], instrShape = [16, 8]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mma_v2_128x96() {
+    %a = arith.constant dense<1.0> : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
+    %b = arith.constant dense<1.0> : tensor<64x96xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>
+    %c = arith.constant dense<0.0> : tensor<128x96xf32, #mma>
+    %d = tt.dot %a, %b, %c : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * tensor<64x96xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<128x96xf32, #mma>
+    // Control: the pow2 dot verifies.
+    %b2 = arith.constant dense<1.0> : tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>
+    %c2 = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %d2 = tt.dot %a, %b2, %c2 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
