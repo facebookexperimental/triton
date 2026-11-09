@@ -393,8 +393,11 @@ struct Transform2CTALoads
     auto origEncoding = cast<ttg::BlockedEncodingAttr>(loadType.getEncoding());
     auto newEncoding =
         getCompatibleEncoding(origEncoding, newBlockShape, splitDim, ctx);
+    // A ui8 (packed fp4) descriptor loads into an i8 tensor, so the tensor and
+    // memdesc types keep the load's element type, not the descriptor's.
+    auto resultElemType = loadType.getElementType();
     auto halfResultType =
-        RankedTensorType::get(newBlockShape, elemType, newEncoding);
+        RankedTensorType::get(newBlockShape, resultElemType, newEncoding);
     auto newDescLoad =
         tt::DescriptorLoadOp::create(builder, loc, halfResultType, newDesc,
                                      newIndices, descLoad.getCachePolicyAttr());
@@ -404,8 +407,8 @@ struct Transform2CTALoads
     auto fullMemDescEncoding =
         shrinkSwizzleForShape(lhsType.getEncoding(), newBlockShape);
     auto fullMemDescType = ttg::MemDescType::get(
-        newBlockShape, elemType, fullMemDescEncoding, lhsType.getMemorySpace(),
-        lhsType.getMutableMemory());
+        newBlockShape, resultElemType, fullMemDescEncoding,
+        lhsType.getMemorySpace(), lhsType.getMutableMemory());
     auto fullAlloc = ttg::LocalAllocOp::create(
         builder, lhsAlloc.getLoc(), fullMemDescType, newDescLoad.getResult());
 
@@ -413,8 +416,8 @@ struct Transform2CTALoads
                                      newBlockShape.end());
     slicedShape[0] /= 2;
     auto slicedType = ttg::MemDescType::get(
-        slicedShape, elemType, fullMemDescEncoding, lhsType.getMemorySpace(),
-        lhsType.getMutableMemory(), newBlockShape);
+        slicedShape, resultElemType, fullMemDescEncoding,
+        lhsType.getMemorySpace(), lhsType.getMutableMemory(), newBlockShape);
     SmallVector<int32_t> lhsOffsets = {0, 0};
     SmallVector<int32_t> rhsOffsets = {static_cast<int32_t>(slicedShape[0]), 0};
     Value lhsSlice = ttg::MemDescSubsliceOp::create(
@@ -546,8 +549,11 @@ struct Transform2CTALoads
     newResultShape[splitDim] = halfN;
     auto newEncoding =
         getCompatibleEncoding(origEncoding, newResultShape, splitDim, ctx);
+    // As in transformSplitBLoad: keep the load's element type, not the
+    // descriptor's (a ui8 descriptor loads into an i8 tensor).
+    auto resultElemType = origResultType.getElementType();
     auto halfResultType =
-        RankedTensorType::get(newResultShape, elemType, newEncoding);
+        RankedTensorType::get(newResultShape, resultElemType, newEncoding);
 
     auto newDescLoad =
         tt::DescriptorLoadOp::create(builder, loc, halfResultType, newDesc,
@@ -571,7 +577,7 @@ struct Transform2CTALoads
     auto newMemDescEncoding = shrinkSwizzleForShape(
         origMemDescType.getEncoding(), allocSrcType.getShape());
     auto newMemDescType = ttg::MemDescType::get(
-        allocSrcType.getShape(), elemType, newMemDescEncoding,
+        allocSrcType.getShape(), resultElemType, newMemDescEncoding,
         origMemDescType.getMemorySpace(), origMemDescType.getMutableMemory());
 
     builder.setInsertionPoint(localAlloc);
