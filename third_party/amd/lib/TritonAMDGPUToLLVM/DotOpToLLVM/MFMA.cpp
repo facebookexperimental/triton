@@ -775,6 +775,13 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
         zeroKTail ? llvm::divideCeil(kDimOperandSize, kDimInstrSize) : repA[2];
     auto numRepB = repA[0];
     assert(repA[0] == repB[0]);
+    // An NPOT scale K takes the scale layout's NPOT branch, whose registers the
+    // power-of-two packing below cannot index.
+    bool npotScale =
+        existBothScales &&
+        !llvm::isPowerOf2_64(
+            cast<RankedTensorType>(aScale.getType()).getShape().back());
+    int perMfma = zeroKTail ? 2 : 1;
 
     // Scaled MFMA instructions expect scale operands as 32-bit values,
     // even though each individual scale is only 8 bits. To reduce register
@@ -784,14 +791,20 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     // continue along the non-K dimension.
     // TODO: Support opSel selection for constant scales stored in SGPRs.
     const int scaleAKBase =
-        isAScaleConstant ? 1 : std::min(4, static_cast<int>(numRepK * numRepM));
+        isAScaleConstant || npotScale
+            ? 1
+            : std::min(4, static_cast<int>(numRepK * numRepM));
     const int scaleBKBase =
-        isBScaleConstant ? 1 : std::min(4, static_cast<int>(numRepK * numRepN));
+        isBScaleConstant || npotScale
+            ? 1
+            : std::min(4, static_cast<int>(numRepK * numRepN));
 
-    int akPackedVals =
-        isAScaleConstant ? 1 : std::min(4, static_cast<int>(numRepK));
-    int bkPackedVals =
-        isBScaleConstant ? 1 : std::min(4, static_cast<int>(numRepK));
+    int akPackedVals = isAScaleConstant || npotScale
+                           ? 1
+                           : std::min(4, static_cast<int>(numRepK));
+    int bkPackedVals = isBScaleConstant || npotScale
+                           ? 1
+                           : std::min(4, static_cast<int>(numRepK));
 
     assert(scaleAKBase % akPackedVals == 0 && scaleBKBase % bkPackedVals == 0);
     int aNonKPackedVals = scaleAKBase / akPackedVals;
@@ -812,7 +825,31 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     // operands.
     ValueTable operandAScale;
     ValueTable operandBScale;
-    if (existBothScales) {
+    if (npotScale) {
+      // 4 scales per i32: MFMA k reads byte k * perMfma. A zero tail reads 2
+      // per MFMA, the second for lanes 32-63, and pads past K with 127 (1.0),
+      // since E8M0 0xFF is NaN.
+      auto aScaleTensorTy = cast<RankedTensorType>(aScale.getType());
+      operandAScale = getValuesFromDotOperandLayoutStruct(
+          loadedAScale, numRepB, numRepM, numRepK * perMfma, scaleKWidth,
+          /*kBase=*/4, aScaleTensorTy, aScaleTensorTy.getElementType(),
+          allowXF32, /*preserveBF16=*/false, isAScaleConstant,
+          /*kTailFill=*/127);
+      auto bScaleTensorTy = cast<RankedTensorType>(bScale.getType());
+      operandBScale = getValuesFromDotOperandLayoutStruct(
+          loadedBScale, numRepB, numRepN, numRepK * perMfma, scaleKWidth,
+          /*kBase=*/4, bScaleTensorTy, bScaleTensorTy.getElementType(),
+          allowXF32, /*preserveBF16=*/false, isBScaleConstant,
+          /*kTailFill=*/127);
+      if (perMfma == 2) {
+        auto tb = TritonLLVMOpBuilder(loc, rewriter);
+        Value shift = tb.shl(tb.lshr(getLaneId(rewriter, loc), tb.i32_val(5)),
+                             tb.i32_val(3));
+        for (ValueTable *scales : {&operandAScale, &operandBScale})
+          for (auto &[key, packed] : *scales)
+            packed = tb.lshr(packed, shift);
+      }
+    } else if (existBothScales) {
       auto aScaleTensorTy = cast<RankedTensorType>(aScale.getType());
       operandAScale = getValuesFromDotOperandLayoutStruct(
           loadedAScale, numRepB, numRepM, numRepK, scaleKWidth, scaleAKBase,
@@ -896,6 +933,10 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
                 int nScale = n / bNonKPackedVals;
                 opSelA = (m * numRepK + k) % (aNonKPackedVals * akPackedVals);
                 opSelB = (n * numRepK + k) % (bNonKPackedVals * bkPackedVals);
+                if (npotScale) {
+                  akScale = bkScale = k * perMfma / 4;
+                  opSelA = opSelB = k * perMfma % 4;
+                }
 
                 if (mfmaLayout.getIsTransposed()) {
                   acc = generateScaledMFMAOp(
