@@ -89,6 +89,39 @@ public:
     return minOpIt != users.end() ? *minOpIt : nullptr;
   }
 
+  // Sink each alloc(load) in the loop body below the last global load before
+  // the allocs' first use, so that all of the loop's global loads issue
+  // before its first shared store and their latencies overlap.
+  void sinkLoopAllocsBelowLoads(scf::ForOp forOp) {
+    Block *body = forOp.getBody();
+    SmallVector<LocalAllocOp> allocs;
+    Operation *firstUse = nullptr;
+    for (auto alloc : body->getOps<LocalAllocOp>()) {
+      if (!alloc.getSrc() || !alloc.getSrc().getDefiningOp<triton::LoadOp>())
+        continue;
+      allocs.push_back(alloc);
+      Operation *use = getFirstUse(alloc);
+      if (use && (!firstUse || use->isBeforeInBlock(firstUse)))
+        firstUse = use;
+    }
+    Operation *lastLoad = nullptr;
+    for (Operation &op : *body) {
+      if (&op == firstUse)
+        break;
+      if (isa<triton::LoadOp>(op))
+        lastLoad = &op;
+    }
+    if (allocs.empty() || !lastLoad)
+      return;
+    Operation *insertPoint = lastLoad;
+    for (LocalAllocOp alloc : allocs) {
+      if (!alloc->isBeforeInBlock(lastLoad))
+        continue;
+      alloc->moveAfter(insertPoint);
+      insertPoint = alloc;
+    }
+  }
+
   void runOnOperation() override {
     ModuleOp m = getOperation();
     mlir::DominanceInfo dom(m);
@@ -134,6 +167,11 @@ public:
         return;
       moveAfter(op, argOp);
     });
+    // Only under a register cap: without one, ptxas can pay for the overlapped
+    // loads' extra live registers with occupancy, which costs more than the
+    // overlap gains.
+    if (m->hasAttr(AttrMaxRegistersName))
+      m.walk([&](scf::ForOp forOp) { sinkLoopAllocsBelowLoads(forOp); });
     // Move transpositions just after their definition
     opToMove.clear();
     m.walk([&](triton::TransposeOpInterface op) {
