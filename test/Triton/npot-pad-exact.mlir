@@ -401,3 +401,38 @@ tt.func @reduce_128x80(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !t
   tt.store %e, %t : tensor<80x!tt.ptr<f32>>
   tt.return
 }
+
+// -----
+
+// A scan lowers a mixed-radix layout along either dim of [96, 80], though the
+// radix-3 digit on 96 is not most-major.
+// W4-LABEL: @scan_96x80
+tt.func @scan_96x80(%src: !tt.ptr<i32> {tt.divisibility = 16 : i32}) {
+  // W4: "tt.scan"(%{{.*}}) <{axis = 1 : i32, reverse = false}>
+  // W4: }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
+  // W4: "tt.scan"(%{{.*}}) <{axis = 0 : i32, reverse = false}>
+  // W4: }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
+  %r = tt.make_range {end = 7680 : i32, start = 0 : i32} : tensor<7680xi32>
+  %i = tt.reshape %r : tensor<7680xi32> -> tensor<96x80xi32>
+  %sp = tt.splat %src : !tt.ptr<i32> -> tensor<96x80x!tt.ptr<i32>>
+  %p = tt.addptr %sp, %i : tensor<96x80x!tt.ptr<i32>>, tensor<96x80xi32>
+  %x = tt.load %p : tensor<96x80x!tt.ptr<i32>>
+  %s = "tt.scan"(%x) <{axis = 1 : i32, reverse = false}> ({
+  ^bb0(%a: i32, %b: i32):
+    %c = arith.addi %a, %b : i32
+    tt.scan.return %c : i32
+  }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
+  tt.store %p, %s : tensor<96x80x!tt.ptr<i32>>
+  %r2 = tt.make_range {end = 7680 : i32, start = 0 : i32} : tensor<7680xi32>
+  %i2 = tt.reshape %r2 : tensor<7680xi32> -> tensor<96x80xi32>
+  %sp2 = tt.splat %src : !tt.ptr<i32> -> tensor<96x80x!tt.ptr<i32>>
+  %p2 = tt.addptr %sp2, %i2 : tensor<96x80x!tt.ptr<i32>>, tensor<96x80xi32>
+  %y = tt.load %p2 : tensor<96x80x!tt.ptr<i32>>
+  %t = "tt.scan"(%y) <{axis = 0 : i32, reverse = false}> ({
+  ^bb0(%a: i32, %b: i32):
+    %c = arith.addi %a, %b : i32
+    tt.scan.return %c : i32
+  }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
+  tt.store %p2, %t : tensor<96x80x!tt.ptr<i32>>
+  tt.return
+}
