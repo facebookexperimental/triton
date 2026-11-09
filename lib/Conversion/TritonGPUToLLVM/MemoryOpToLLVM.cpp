@@ -195,6 +195,26 @@ public:
     auto regLayout =
         toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
     auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
+    // A mixed-radix layout's odd digits add rather than XOR, so it doesn't
+    // compose with the shared layout: load each run that is contiguous there.
+    if (!regLayout.isRadix2()) {
+      auto b = TritonLLVMOpBuilder(loc, rewriter);
+      LinearLayout toOffset = sharedLayout.pseudoinvert();
+      int32_t run = getMixedRadixSharedRun(regLayout, toOffset,
+                                           llvmElemTy.getIntOrFloatBitWidth());
+      auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+      SmallVector<Value> outVals;
+      forEachMixedRadixSharedRun(
+          loc, rewriter, regLayout, toOffset, run,
+          [&](int32_t, Value offset, auto) {
+            Value ptr = b.gep(ptrTy, llvmElemTy, smemObj.getBase(), offset);
+            Value vec = b.load(vec_ty(llvmElemTy, run), ptr);
+            llvm::append_range(outVals, unpackLLVector(loc, vec, rewriter));
+          });
+      rewriter.replaceOp(op, packUniqueTensorElements(
+                                 loc, typeConverter, outVals, rewriter, regTy));
+      return success();
+    }
     auto kBlock = str_attr("block");
     auto cvt = invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
 
