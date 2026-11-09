@@ -927,6 +927,66 @@ TEST_F(LinearLayoutConversionsTest, MMAv2_NpotMixedRadix) {
   EXPECT_EQ(acc.toLinearLayout({128, 128}), pow2);
 }
 
+// An MFMA operand's NPOT K repeats its odd part in registers after the binary
+// K repeats, so the K rep index stays linear.
+TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixK) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim0,
+                        int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = std::move(warps);
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = {2, 2, 2, 2, 3};
+    radices[S("lane")] = {2, 2, 2, 2, 2, 2};
+    radices[S("warp")] = {2, 2};
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto mfma32 = mfma(4, {2, 2}, {32, 32, 16}, /*isTransposed=*/true);
+  auto a = mfmaDotOp(mfma32, 0, 8), b = mfmaDotOp(mfma32, 1, 8);
+  LinearLayout pow2 = toLinearLayout({64, 128}, a);
+  ScopedAllowNpot npot;
+  EXPECT_EQ(toLinearLayout({64, 96}, a),
+            mixedRadix({{0, 1}, {0, 2}, {0, 4}, {0, 16}, {0, 32}},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 8}},
+                       {{0, 0}, {32, 0}}, 64, 96));
+  EXPECT_EQ(toLinearLayout({96, 64}, b),
+            mixedRadix({{1, 0}, {2, 0}, {4, 0}, {16, 0}, {32, 0}},
+                       {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {8, 0}},
+                       {{0, 32}, {0, 0}}, 96, 64));
+  // K=48's two-part 16 is below mfma16's 32-wide K tile: pow2 alloc shape.
+  auto mfma16 = mfma(4, {2, 2}, {16, 16, 32}, /*isTransposed=*/true);
+  EXPECT_EQ(toLinearLayout({64, 48}, mfmaDotOp(mfma16, 0, 8))
+                .getOutDimSize(S("dim1")),
+            64);
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(toLinearLayout({64, 128}, a), pow2);
+}
+
+// An MFMA operand's NPOT non-K dim repeats its odd part in registers after
+// its binary repeats, so its first 32 columns keep the pow2 layout.
+TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixN) {
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{1}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {5};
+  LinearLayout odd(std::move(bases), std::move(radices), {{S("dim1"), 5}},
+                   /*requireSurjective=*/true);
+  auto mfma32 = mfma(4, {4, 1}, {32, 32, 16}, /*isTransposed=*/true);
+  auto b = mfmaDotOp(mfma32, 1, 8);
+  LinearLayout pow2B = toLinearLayout({64, 32}, b);
+  ScopedAllowNpot npot;
+  EXPECT_EQ(toLinearLayout({64, 160}, b), pow2B * odd);
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(toLinearLayout({64, 32}, b), pow2B);
+}
+
 TEST_F(LinearLayoutConversionsTest, MMAv3_64x16) {
   SmallVector<SmallVector<unsigned>, 2> instrShapes = {{16, 16, 8}, {16, 8, 8}};
   for (auto instrShape : instrShapes) {
