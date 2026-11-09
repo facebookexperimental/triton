@@ -785,6 +785,60 @@ def compile_for_gfx942(fn, signature, constexprs):
 
 
 @triton.jit
+def _amd_packed_dot2_rejects_fp32_kernel(lhs_ptr, rhs_ptr, output_ptr):
+    offsets = tl.arange(0, 64)
+    lhs = tl.load(lhs_ptr + offsets)
+    rhs = tl.load(rhs_ptr + offsets)
+    result = tlx.amd_packed_dot2(lhs, rhs, tl.zeros((64, ), tl.float32), input_dtype=tl.bfloat16)
+    tl.store(output_ptr + offsets, result)
+
+
+def test_amd_packed_dot2_rejects_unpacked_inputs():
+    with pytest.raises(CompilationError, match="lhs and rhs must contain packed input pairs as uint32"):
+        compile_for_gfx950(
+            _amd_packed_dot2_rejects_fp32_kernel,
+            signature={"lhs_ptr": "*fp32", "rhs_ptr": "*fp32", "output_ptr": "*fp32"},
+            constexprs={},
+        )
+
+
+@triton.jit
+def _amd_packed_dot2_target_kernel(lhs_ptr, rhs_ptr, output_ptr, INPUT_DTYPE: tl.constexpr):
+    offsets = tl.arange(0, 64)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    result = tlx.amd_packed_dot2(lhs, rhs, tl.zeros((64, ), tl.float32), input_dtype=INPUT_DTYPE)
+    tl.store(output_ptr + offsets, result)
+
+
+def test_amd_packed_dot2_rejects_gfx942():
+    with pytest.raises(CompilationError, match="currently requires gfx950"):
+        compile_for_gfx942(
+            _amd_packed_dot2_target_kernel,
+            signature={"lhs_ptr": "*i32", "rhs_ptr": "*i32", "output_ptr": "*fp32", "INPUT_DTYPE": "constexpr"},
+            constexprs={"INPUT_DTYPE": tl.bfloat16},
+        )
+
+
+@triton.jit
+def _amd_packed_dot2_rejects_dtype_kernel(lhs_ptr, rhs_ptr, output_ptr):
+    offsets = tl.arange(0, 64)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    result = tlx.amd_packed_dot2(lhs, rhs, tl.zeros((64, ), tl.float32), input_dtype=tl.float32)
+    tl.store(output_ptr + offsets, result)
+
+
+def test_amd_packed_dot2_rejects_unsupported_input_dtype():
+    with pytest.raises(CompilationError, match="input_dtype must be tl.float16 or tl.bfloat16"):
+        compile_for_gfx950(
+            _amd_packed_dot2_rejects_dtype_kernel,
+            signature={"lhs_ptr": "*i32", "rhs_ptr": "*i32", "output_ptr": "*fp32"},
+            constexprs={},
+        )
+
+
+@triton.jit
 def _amd_dot_register_class_kernel(a_ptr, b_ptr, c_ptr, REGISTER_CLASS: tl.constexpr):
     offs_m = tl.arange(0, 64)
     offs_n = tl.arange(0, 64)
@@ -1929,6 +1983,33 @@ def _extract_slice_kernel(x_ptr, y_ptr):
     out_ptrs = y_ptr + rows[:, None] * 32 + band_cols[None, :]
     out_ptrs = tlx.require_layout(out_ptrs, dot0, pin=False)
     tl.store(out_ptrs, band)
+
+
+@triton.jit
+def _concat_fragments(low, high):
+    return tlx.amd_concat((low, high), [16, 64])
+
+
+@triton.jit
+def _amd_concat_kernel(x_ptr, y_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    cols = tl.arange(0, 32)
+    low = tl.load(x_ptr + rows[:, None] * 64 + cols[None, :])
+    high = tl.load(x_ptr + rows[:, None] * 64 + cols[None, :] + 32)
+    low = tlx.require_layout(low, dot0)
+    high = tlx.require_layout(high, dot0)
+    values = _concat_fragments(low, high)
+    out_cols = tl.arange(0, 64)
+    out_ptrs = y_ptr + rows[:, None] * 64 + out_cols[None, :]
+    out_ptrs = tlx.require_layout(out_ptrs, dot0, pin=False)
+    tl.store(out_ptrs, values)
 
 
 @triton.jit
@@ -4051,6 +4132,17 @@ def test_extract_slice_compiles_gfx950():
         constexprs={},
     )
     assert "amdg.extract_slice" in compiled.asm["ttir"]
+    assert "amdgcn" in compiled.asm
+
+
+def test_amd_concat_compiles_across_helper_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_concat_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
+        constexprs={},
+    )
+    concat_ir = next(line for line in compiled.asm["ttir"].splitlines() if "amdg.concat" in line)
+    assert ", #" in concat_ir.split("->", 1)[1]
     assert "amdgcn" in compiled.asm
 
 

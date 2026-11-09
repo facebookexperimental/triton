@@ -37,8 +37,9 @@ Ops with no heuristic yet -- flash_attn on sm90/sm100/gfx950, flash_attn_mxfp8, 
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can offer a
-fast first call. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
-configs are measurably faster; pass `space="heuristic"` for a fast first call.
+fast first call. `mm_mxfp8` and `mm_mxfp6` have heuristics but default to "full" because
+their tuned configs are measurably faster; pass `space="heuristic"` for a fast
+first call.
 `hstu_cross_attn` on gfx950 defaults to "curated": at head dims 64 and 128 it
 tunes eight forward configs picked from its 144-config "full" grid, which come
 within a few percent of it; other head dims tune the whole grid.
@@ -119,9 +120,9 @@ from ._normalization import (
 )
 
 __all__ = [
-    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "addmm_mul_add",
-    "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "rmsnorm_cat", "swiglu_ffn",
-    "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
+    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "addmm",
+    "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "rmsnorm_cat",
+    "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
     "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
     "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
@@ -365,6 +366,91 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     check_backward(spec, *tensors, out)
     _check_enforced("mm_mxfp8", spec, invariance)
     return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space_name)
+
+
+def _check_mm_mxfp6_scales(a_scale, b_scale, *, M, N, K, sf_layout):
+    if sf_layout == "natural":
+        expected_a, expected_b = (M, K // 32), (N, K // 32)
+        if a_scale.shape != expected_a or b_scale.shape != expected_b:
+            raise InvalidInput("tlx.ops.mm_mxfp6 natural scales must have exact shapes "
+                               f"a_scale={expected_a}, b_scale={expected_b}; got "
+                               f"a_scale={tuple(a_scale.shape)}, b_scale={tuple(b_scale.shape)}")
+        return
+    if sf_layout != "cublas_blocked":
+        raise InvalidInput("tlx.ops.mm_mxfp6 sf_layout must be 'natural' or 'cublas_blocked'; "
+                           f"got {sf_layout!r}")
+    # M, N and K are 128-aligned, so the 128x4 atoms need no padding.
+    if a_scale.numel() != M * K // 32 or b_scale.numel() != N * K // 32:
+        raise InvalidInput("tlx.ops.mm_mxfp6 cublas_blocked scales must contain exactly "
+                           f"{M * K // 32} a-scale and {N * K // 32} b-scale bytes; "
+                           f"got {a_scale.numel()} and {b_scale.numel()}")
+
+
+def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+    """``a @ b.T`` over pre-quantized MXFP6 inputs, returning BF16 ``[M, N]``.
+
+    ``a`` is contiguous dense-packed E2M3 ``[M, K]`` and ``b`` is contiguous
+    dense-packed E3M2 ``[N, K]`` (K-major, as for a linear weight), both uint8
+    with groups of 16 codes per 12 bytes LSB-first and the K dim padded to
+    the unpacked width; M, N and K must be multiples of 128. The format
+    pairing is fixed (E2M3 A x E3M2 B) to the validated ``mxf8f6f4``
+    configuration; other pairings are not exposed yet. Each run of 32
+    values along K
+    has one E8M0 scale. ``sf_layout="natural"`` takes ``[M, K // 32]`` and
+    ``[N, K // 32]`` scales; ``"cublas_blocked"`` takes the swizzled byte
+    layout returned by torchao's ``MXTensor.to_mx(..., is_swizzled_scales=True)``.
+    Quantize with torchao (``elem_dtype="fp6_e2m3"`` / ``"fp6_e3m2"``), shift
+    its unpacked codes down (``qdata >> 2``), and dense-pack. A supplied
+    ``out`` is returned by identity. Forward-only.
+
+    ``space`` defaults to "full" (autotune; the first call per shape compiles
+    and benchmarks the pruned space). "heuristic" launches one shape-picked
+    config without autotuning.
+    """
+    import torch
+
+    tensors = (a, a_scale, b, b_scale)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects tensor inputs")
+    if a.ndim != 2 or b.ndim != 2:
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects rank-2 a and b; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    M, K = a.shape
+    N, b_k = b.shape
+    if b_k != K:
+        raise InvalidInput("tlx.ops.mm_mxfp6 reduction dimensions must match; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    if min(M, N, K) <= 0 or M % 128 or N % 128 or K % 128:
+        raise InvalidInput("tlx.ops.mm_mxfp6 requires positive M, N and K divisible by 128; "
+                           f"got M={M}, N={N}, K={K}")
+    if a.dtype != torch.uint8 or b.dtype != torch.uint8:
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects dense-packed uint8 a and b; "
+                           f"got a.dtype={a.dtype}, b.dtype={b.dtype}")
+    if a_scale.dtype != torch.float8_e8m0fnu or b_scale.dtype != torch.float8_e8m0fnu:
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects E8M0 a_scale and b_scale; "
+                           f"got a_scale.dtype={a_scale.dtype}, b_scale.dtype={b_scale.dtype}")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects all inputs to be contiguous")
+    if a.device.type != "cuda" or any(tensor.device != a.device for tensor in tensors[1:]):
+        raise InvalidInput("tlx.ops.mm_mxfp6 expects all inputs on the same CUDA device; "
+                           f"got {[tensor.device for tensor in tensors]}")
+    _check_mm_mxfp6_scales(a_scale, b_scale, M=M, N=N, K=K, sf_layout=sf_layout)
+    if out is not None:
+        if not isinstance(out, torch.Tensor):
+            raise InvalidInput("tlx.ops.mm_mxfp6 expects out to be a tensor or None")
+        if out.shape != (M, N) or out.dtype != torch.bfloat16 or out.device != a.device or not out.is_contiguous():
+            raise InvalidInput("tlx.ops.mm_mxfp6 out must be contiguous BF16 [M, N] on a's device; "
+                               f"got shape={tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
+        if any(torch._C._overlaps(out, tensor) for tensor in tensors):
+            raise InvalidInput("tlx.ops.mm_mxfp6 out must not overlap any input")
+    if space not in ("heuristic", "full"):
+        raise InvalidInput(f"tlx.ops.mm_mxfp6 does not provide space={space!r}")
+
+    fn, spec = impl_for("mm_mxfp6", device=a.device)
+    tma_tensors = tensors if out is None else (*tensors, out)
+    check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
+    check_backward(spec, *tensors, out)
+    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space)
 
 
 def grouped_gemm(group_a, group_b, *, space=None):
@@ -757,15 +843,19 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
     """Differentiable MXFP8 attention over contiguous BF16 Q/K/V.
 
     Inputs have identical [batch, heads, sequence, 128] shapes with sequence
-    lengths divisible by 256. Both architectures return BF16 gradients.
-    Both architectures use 32x32 Q/K blocks. On gfx950, calls where autograd
-    records Q, K or V use a training forward with hardware exp2 that saves
-    separate row maxima and log2 normalization terms, the statistics backward
-    recomputes P from. Other calls use the faster inference ping-pong kernel
-    (non-causal, and causal at sequence lengths divisible by 512), whose
+    lengths divisible by 256. Blackwell and gfx950 return BF16 gradients;
+    gfx1250 is forward only. Backward computes gradients only for inputs with
+    ``requires_grad=True``. It skips unrequested gradient outputs and operations
+    used only by those gradients, including quantization used only by them.
+    All three use 32x32 Q/K blocks. On gfx950, calls
+    where autograd records Q, K or V use a training forward with hardware exp2
+    that saves separate row maxima and log2 normalization terms, the statistics
+    backward recomputes P from. Other calls use the faster inference ping-pong
+    kernel (non-causal, and causal at sequence lengths divisible by 512), whose
     approximate exp2 makes its output differ from the training forward by
     about 0.04 relative RMS, less than either differs from BF16 attention.
-    See the kernel module for the recipes.
+    gfx1250 quantizes as Blackwell does and, like gfx950's ping-pong kernel,
+    computes P with an approximate exp2. See the kernel module for the recipes.
     ``p_expcast=True`` (Blackwell only) encodes the forward probabilities with
     ExpCast-FP8 instead of exp2 (see kernels/flash_attn_mxfp8/sm100.py).
     """

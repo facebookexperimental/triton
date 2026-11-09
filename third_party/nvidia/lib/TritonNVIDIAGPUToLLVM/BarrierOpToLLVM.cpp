@@ -28,13 +28,14 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
-#include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/MathExtras.h"
 
 #include "Utility.h"
@@ -608,7 +609,7 @@ struct ArriveBarrierOpConversion
         emitArrive(barrierPtr, mask);
       } else if (op.isMulticast()) {
         uint32_t broadcastMask = op.getMulticastCTA();
-        Value ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+        Value ctaId = triton::nvgpu::ClusterCTAIdOp::create(rewriter, loc);
         Value classBase =
             b.and_(ctaId, b.i32_val(static_cast<int32_t>(~broadcastMask)));
         auto remotePtrTy = LLVM::LLVMPointerType::get(getContext(), 7);
@@ -993,30 +994,26 @@ struct CLCGetProgramIdOpConversion
 
     auto loc = op.getLoc();
 
-    const char *dimName = [&] {
-      switch (op.getDim()) {
-      case ProgramIDDim::X:
-        return "x";
-      case ProgramIDDim::Y:
-        return "y";
-      case ProgramIDDim::Z:
-        return "z";
-      }
-      llvm::llvm_unreachable_internal("Invalid program id dim");
-    }();
-
-    auto ptxAsm = ("clusterlaunchcontrol.query_cancel.get_first_ctaid::" +
-                   llvm::Twine(dimName) + ".b32.b128 $0, $1;")
-                      .str();
-
-    PTXBuilder ptxBuilder;
-    auto &clcOp = *ptxBuilder.create(ptxAsm);
-    auto *resultOp = ptxBuilder.newOperand("=r");
-    auto *clcResultOp = ptxBuilder.newOperand(adaptor.getClcResult(), "q");
-    clcOp({resultOp, clcResultOp}, /*onlyAttachMLIRArgs=*/true);
-
-    Value result =
-        ptxBuilder.launch(rewriter, loc, i32_ty, /*hasSideEffects=*/false);
+    using namespace llvm::Intrinsic;
+    constexpr std::pair<ID, int> queries[] = {
+        {nvvm_clusterlaunchcontrol_query_cancel_get_first_ctaid_x,
+         kMaxGriddimx},
+        {nvvm_clusterlaunchcontrol_query_cancel_get_first_ctaid_y,
+         kMaxGriddimy},
+        {nvvm_clusterlaunchcontrol_query_cancel_get_first_ctaid_z,
+         kMaxGriddimz}};
+    auto [intrinsic, maxGridDim] = queries[static_cast<unsigned>(op.getDim())];
+    auto call = LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, llvm::Intrinsic::getName(intrinsic), op.getType(),
+        adaptor.getClcResult());
+    // A successful cancellation returns a raw CTA coordinate in [0,
+    // maxGridDim).
+    auto range =
+        LLVM::ConstantRangeAttr::get(rewriter.getContext(), 32, 0, maxGridDim);
+    auto resultAttrs = rewriter.getDictionaryAttr(
+        rewriter.getNamedAttr(LLVM::LLVMDialect::getRangeAttrName(), range));
+    call.setResAttrsAttr(rewriter.getArrayAttr(resultAttrs));
+    Value result = call.getResult(0);
 
     PhysicalClusterInfo cluster = getPhysicalClusterInfo(op);
     if (cluster.hasPerCTAProgramIds) {

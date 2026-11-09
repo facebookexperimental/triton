@@ -53,6 +53,38 @@ def attach_failures(job, log_text, normalize_ids=True):
             if start and end and start <= ts <= end and i not in seen:
                 seen[i] = msg
         s["failures"] = [{"id": i, "msg": m} for i, m in seen.items()] or [{"id": f"{key}/{s['name']}", "msg": ""}]
+        # Keep exact pytest verdicts separately from the legacy job/step fallback.
+        evidence = {}
+        for line in log_text.splitlines():
+            match = SUMMARY.match(ANSI.sub("", line).rstrip())
+            if match and start and end:
+                ts = _iso(match.group(1))
+                if start <= t(ts).replace(microsecond=0) <= end:
+                    item = {
+                        "id": match.group(3), "kind": match.group(2).lower(), "msg": (match.group(4) or "").strip(),
+                        "t": ts
+                    }
+                    evidence.setdefault((item["id"], item["kind"]), item)
+        s["test_failures"] = list(evidence.values())
+
+
+def checkout_sha(job, log_text):
+    """The source checkout's logged HEAD, not the build-tooling checkout or the PR tip."""
+    windows = [(t(s["started_at"]), t(s["completed_at"])) for s in job["steps"] if (
+        s["name"] == "Checkout" or "actions/checkout@" in s["name"]) and s.get("started_at") and s.get("completed_at")]
+    found, expect = set(), False
+    for line in log_text.splitlines():
+        line = ANSI.sub("", line).rstrip()
+        stamp, _, message = line.partition(" ")
+        if not stamp.endswith("Z"):
+            expect = False
+            continue
+        if expect and re.fullmatch(r"[0-9a-f]{40}", message):
+            sec = t(_iso(stamp)).replace(microsecond=0)
+            if any(start <= sec <= end for start, end in windows):
+                found.add(message)
+        expect = bool(re.search(r"\[command\].*\bgit log -1 --format=%H$", message))
+    return next(iter(found)) if len(found) == 1 else None
 
 
 #: pytest --durations prints a "===== slowest N durations =====" header, then "<seconds>s <phase> <nodeid>" lines.
@@ -130,7 +162,7 @@ SELECTION = re.compile(r"GPU selection for \S+: (\{.*\})")
 
 
 def parse_selection(log_text):
-    """What gpu_test_selection.py chose for a run: {h100, b200, mi350, build, fallback}, or None if not found.
+    """What gpu_test_selection.py chose for a run: {h100, b200, mi350, build, cpu?, fallback}, or None if not found.
     fallback is True when the changed paths were unavailable and every suite ran."""
     found = None
     for line in log_text.splitlines():
@@ -138,5 +170,6 @@ def parse_selection(log_text):
         if m:
             found = {k: v is True for k, v in ast.literal_eval(m.group(1)).items()}
     if found is not None:
-        found["fallback"] = "Cannot determine changed paths" in log_text
+        found["fallback"] = any(message in log_text
+                                for message in ("Cannot determine changed paths", "Cannot select tests"))
     return found

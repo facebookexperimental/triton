@@ -1297,7 +1297,7 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
                                               Attribute layout) {
   CacheKey key{std::vector<int64_t>(shape.begin(), shape.end()), layout};
   if (auto result = llCache.get(key)) {
-    return *result;
+    return std::move(*result);
   }
 
   // Layouts are distributed or shared in triton core
@@ -1313,7 +1313,12 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
                         }) &&
            "shape must be a postive power of 2");
     if (auto shared = dyn_cast<SharedEncodingTrait>(layout)) {
-      result = shared.toLinearLayout(coverShape);
+      FailureOr<LinearLayout> dense = failure();
+      // A padded layout has no linear layout, dense or not.
+      if (shape.size() == 2 && !llvm::equal(shape, coverShape) &&
+          !isa<PaddedSharedEncodingAttr>(layout))
+        dense = getNpotDenseSharedLayout(layout, shape);
+      result = succeeded(dense) ? *dense : shared.toLinearLayout(coverShape);
     } else if (auto tensorMemoryEncoding =
                    dyn_cast<TensorMemoryEncodingAttr>(layout)) {
       result = tensorMemoryToLinearLayout(coverShape, tensorMemoryEncoding);

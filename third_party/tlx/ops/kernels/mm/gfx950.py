@@ -17412,16 +17412,8 @@ def _gemv_packed_dot2_kernel(a_ptr, b_ptr, out_ptr, N, K, STRIDE_BN, STRIDE_CN, 
         weights = tl.load(b_ptr.to(tl.pointer_type(tl.uint32)) + offsets_b, mask=mask_b, other=0, cache_modifier=".cg")
     else:
         weights = tl.load(b_ptr.to(tl.pointer_type(tl.uint32)) + offsets_b, mask=mask_b, other=0)
-    products = tl.inline_asm_elementwise(
-        # WORKAROUND: LLVM does not treat inline asm as a DOT, so it omits the three wait states a different VALU
-        # needs before reading or overwriting a DOT result.
-        "v_dot2_f32_bf16 $0, $1, $2, 0\n s_nop 2",
-        constraints="=v,v,v",
-        args=[weights, a[None, :]],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    a_pairs = tl.broadcast_to(a[None, :], weights.shape)
+    products = tlx.amd_packed_dot2(weights, a_pairs, tl.zeros(weights.shape, tl.float32), input_dtype=tl.bfloat16)
     result = tl.sum(products, axis=1)
     offsets = cols.to(tl.int64) * STRIDE_CN
     tl.store(out_ptr + offsets, result, mask=cols < N if HAS_N_TAIL else True)
@@ -17742,6 +17734,156 @@ def _load_paired_strided_b(b_ptr, rows, cols, k: tl.constexpr, n: tl.constexpr, 
 
 
 @triton.jit
+def _register_matmul_core(
+    a_ptr,
+    b_ptr,
+    b2_ptr,
+    rows,
+    cols,
+    row_mask,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    k_start,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    MASK_ROWS: tl.constexpr = False,
+    DUAL_B: tl.constexpr = False,
+    CACHE_A_CG: tl.constexpr = False,
+    CACHE_B_CG: tl.constexpr = False,
+    CACHE_B_TAIL_CG: tl.constexpr = False,
+    PACK_B_PAIRS: tl.constexpr = False,
+    B_PAIRS_PADDED: tl.constexpr = False,
+    USE_I64_A_OFFSETS: tl.constexpr = False,
+    USE_I64_B_OFFSETS: tl.constexpr = False,
+    RUNTIME_K: tl.constexpr = False,
+    runtime_k_length=None,
+    ACCUMULATE_IN_DOT: tl.constexpr = False,
+):
+    """Shared FP32 register core for dense MM and routed expert projections.
+
+    Callers supply valid coordinates and any dense-only alignment hints. K is
+    the reduction length starting at k_start; masked rows are zero-filled.
+    DUAL_B shares A loads for gate/up and returns separate FP32 accumulators.
+    RUNTIME_K derives the loop trip count and tail from ``runtime_k_length``
+    instead of the ``K`` sentinel (opt-in; the static path is unchanged).
+    ACCUMULATE_IN_DOT carries the accumulator into ``tl.dot`` instead of
+    adding a separately computed dot (opt-in; the default stays dot+add).
+    """
+    tl.static_assert(not DUAL_B or not PACK_B_PAIRS)
+    tl.static_assert(not RUNTIME_K or not PACK_B_PAIRS)
+    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
+    a_rows = rows.to(tl.int64) if USE_I64_A_OFFSETS else rows
+    a_cols = offs_k.to(tl.int64) if USE_I64_A_OFFSETS else offs_k
+    b_rows = offs_k.to(tl.int64) if USE_I64_B_OFFSETS else offs_k
+    b_cols = cols.to(tl.int64) if USE_I64_B_OFFSETS else cols
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if DUAL_B:
+        acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # One conditional selects the tile/tail extents; one shared loop and one
+    # shared masked tail follow. The static path keeps constexpr extents (so
+    # unrolling and dead-tail elimination are unchanged); the opt-in runtime
+    # path derives them from ``runtime_k_length``. All recipe branches below
+    # are constexpr conditions, so default callers see identical code.
+    if RUNTIME_K:
+        tl.static_assert(runtime_k_length is not None)
+        full_k_tiles = runtime_k_length // BLOCK_K
+        tail_extent = runtime_k_length - full_k_tiles * BLOCK_K
+    else:
+        full_k_tiles: tl.constexpr = K // BLOCK_K
+        tail_extent: tl.constexpr = K - full_k_tiles * BLOCK_K
+    for k_idx in range(0, full_k_tiles):
+        k = k_start + k_idx * BLOCK_K
+        a_ptrs = a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
+        b_ptrs = b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
+        if MASK_ROWS:
+            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0, cache_modifier=".cg" if CACHE_A_CG else "")
+        elif CACHE_A_CG:
+            a = tl.load(a_ptrs, cache_modifier=".cg")
+        else:
+            a = tl.load(a_ptrs)
+        if PACK_B_PAIRS:
+            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
+        elif CACHE_B_CG:
+            b = tl.load(b_ptrs, cache_modifier=".cg")
+        else:
+            b = tl.load(b_ptrs)
+        if ACCUMULATE_IN_DOT:
+            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+        else:
+            acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+        if DUAL_B:
+            b2_ptrs = b2_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
+            b2 = tl.load(b2_ptrs, cache_modifier=".cg" if CACHE_B_CG else "")
+            if ACCUMULATE_IN_DOT:
+                acc2 = tl.dot(a, b2, acc2, allow_tf32=False, out_dtype=tl.float32)
+            else:
+                acc2 += tl.dot(a, b2, allow_tf32=False, out_dtype=tl.float32)
+    if tail_extent > 0:
+        k = k_start + full_k_tiles * BLOCK_K
+        k_mask = offs_k < tail_extent
+        a_ptrs = a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
+        b_ptrs = b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
+        if MASK_ROWS:
+            a = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+        else:
+            a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+        if PACK_B_PAIRS:
+            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_TAIL_CG, B_PAIRS_PADDED)
+        elif CACHE_B_TAIL_CG:
+            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0, cache_modifier=".cg")
+        else:
+            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+        if ACCUMULATE_IN_DOT:
+            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+        else:
+            acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+        if DUAL_B:
+            b2_ptrs = b2_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
+            b2 = tl.load(b2_ptrs, mask=k_mask[:, None], other=0.0, cache_modifier=".cg" if CACHE_B_TAIL_CG else "")
+            if ACCUMULATE_IN_DOT:
+                acc2 = tl.dot(a, b2, acc2, allow_tf32=False, out_dtype=tl.float32)
+            else:
+                acc2 += tl.dot(a, b2, allow_tf32=False, out_dtype=tl.float32)
+    if DUAL_B:
+        return acc, acc2
+    return acc, acc
+
+
+def _normalize_split_register_plan(config):
+    """Return the canonical ``split_register`` plan for a raw config mapping.
+
+    Legacy ``split_register`` plans carry only the compute geometry and route
+    through ``GROUP_M=1``/``NUM_XCDS=1`` with a cached B stream, the default
+    fused-dot carry recipe and tree reduction. Former ``split_k_register``
+    plans additionally fix ``GROUP_M=4``/``NUM_XCDS=1`` with an uncached B
+    stream, the dot+add recipe and serial reduction. ``K_TAIL`` defaults to
+    ``"forbid"``; callers opt into ``"mask"`` explicitly.
+    """
+    plan = dict(config)
+    plan.setdefault("GROUP_M", 1)
+    plan.setdefault("NUM_XCDS", 1)
+    plan.setdefault("CACHE_B", True)
+    plan.setdefault("ACCUMULATE_IN_DOT", True)
+    plan.setdefault("SERIAL_REDUCE", False)
+    plan.setdefault("K_TAIL", "forbid")
+    return MappingProxyType(plan)
+
+
+def _split_register_recipe_key(plan):
+    """Return the dedup key for normalized split-register recipes."""
+    return (plan["BLOCK_M"], plan["BLOCK_N"], plan["BLOCK_K"], plan["SPLIT_K"], plan["GROUP_M"], plan["NUM_XCDS"],
+            plan["num_warps"], plan["num_stages"], plan.get("matrix_instr_nonkdim",
+                                                            16), plan.get("waves_per_eu", 0), plan.get("kpack", 1),
+            plan.get("regclass_priority_trumps_globalness",
+                     True), plan["CACHE_B"], plan["ACCUMULATE_IN_DOT"], plan["SERIAL_REDUCE"], plan["K_TAIL"])
+
+
+@triton.jit
 # Triton TR001: callers select either a measured fixed plan or an autotuned one.
 def _register_kernel_impl(  # noqa: TR001
     a_ptr,
@@ -17803,56 +17945,42 @@ def _register_kernel_impl(  # noqa: TR001
     input_cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
     offs_m = (input_rows if M % BLOCK_M == 0 else tl.where(input_rows < M, input_rows, 0))
     offs_n = (input_cols if N % BLOCK_N == 0 else tl.where(input_cols < N, input_cols, 0))
-    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_bk > 0)
     tl.assume(stride_bn > 0)
     reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
     reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
-    if USE_I64_A_OFFSETS:
-        a_rows = reg_m.to(tl.int64)
-        a_cols = offs_k.to(tl.int64)
-    else:
-        a_rows = reg_m
-        a_cols = offs_k
-    if USE_I64_B_OFFSETS:
-        b_rows = offs_k.to(tl.int64)
-        b_cols = reg_n.to(tl.int64)
-    else:
-        b_rows = offs_k
-        b_cols = reg_n
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    full_k_tiles: tl.constexpr = K // BLOCK_K
-    for k_idx in range(0, full_k_tiles):
-        k = k_idx * BLOCK_K
-        a_ptrs = (a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak)
-        b_ptrs = (b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn)
-        if (CACHE_A_CG or (M == 25600 and N == 256 and K == 256) or (M == 56768 and N == 128 and K == 64)
-                or (M == 65462 and N == 128 and K == 96)):
-            a = tl.load(a_ptrs, cache_modifier=".cg")
-        else:
-            a = tl.load(a_ptrs)
-        if PACK_B_PAIRS:
-            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
-        elif (CACHE_B_CG or (M == 128 and N == 2688 and K == 4416) or (M == 128 and N == 3456 and K == 2560)):
-            b = tl.load(b_ptrs, cache_modifier=".cg")
-        else:
-            b = tl.load(b_ptrs)
-        acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
-    if K % BLOCK_K != 0:
-        k = full_k_tiles * BLOCK_K
-        k_mask = offs_k < K - k
-        a_ptrs = (a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak)
-        b_ptrs = (b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn)
-        a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
-        if PACK_B_PAIRS:
-            b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
-        elif CACHE_B_CG or (M == 128 and N == 2688 and K == 4416):
-            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0, cache_modifier=".cg")
-        else:
-            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
-        acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+    full_a_cg: tl.constexpr = (CACHE_A_CG or (M == 25600 and N == 256 and K == 256)
+                               or (M == 56768 and N == 128 and K == 64) or (M == 65462 and N == 128 and K == 96))
+    full_b_cg: tl.constexpr = CACHE_B_CG or (not PACK_B_PAIRS and ((M == 128 and N == 2688 and K == 4416) or
+                                                                   (M == 128 and N == 3456 and K == 2560)))
+    tail_b_cg: tl.constexpr = CACHE_B_CG or (not PACK_B_PAIRS and (M == 128 and N == 2688 and K == 4416))
+    acc, _ = _register_matmul_core(
+        a_ptr,
+        b_ptr,
+        b_ptr,
+        reg_m,
+        reg_n,
+        True,
+        N,
+        K,
+        0,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        CACHE_A_CG=full_a_cg,
+        CACHE_B_CG=full_b_cg,
+        CACHE_B_TAIL_CG=tail_b_cg,
+        PACK_B_PAIRS=PACK_B_PAIRS,
+        B_PAIRS_PADDED=B_PAIRS_PADDED,
+        USE_I64_A_OFFSETS=USE_I64_A_OFFSETS,
+        USE_I64_B_OFFSETS=USE_I64_B_OFFSETS,
+    )
 
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
     cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
@@ -18322,12 +18450,12 @@ def _offsets_fit_signed_i32(m, n, k, element_size, a_strides, b_strides):
     return max_offset * element_size < 2**31
 
 
-_BF16_M27_QKV_SPLIT_REGISTER_PLAN = MappingProxyType({
+_BF16_M27_QKV_SPLIT_REGISTER_PLAN = _normalize_split_register_plan({
     "BLOCK_M": 32,
-    "BLOCK_N": 64,
+    "BLOCK_N": 32,
     "BLOCK_K": 64,
     "SPLIT_K": 8,
-    "num_warps": 4,
+    "num_warps": 2,
     "num_stages": 3,
     "matrix_instr_nonkdim": 16,
     "waves_per_eu": 0,
@@ -18352,50 +18480,102 @@ def _split_register_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
-    ONE_M_TILE: tl.constexpr = False,
+    GROUP_M: tl.constexpr = 1,
+    NUM_XCDS: tl.constexpr = 1,
     FULL_N_TILE: tl.constexpr = False,
     VALID_M_ROWS: tl.constexpr = 0,
     PIPE_ITERS: tl.constexpr = 0,
+    ACCUMULATE_IN_DOT: tl.constexpr = True,
+    CACHE_B_CG: tl.constexpr = True,
+    MASK_TAIL: tl.constexpr = False,
+    USE_I64_A_OFFSETS: tl.constexpr = False,
+    USE_I64_B_OFFSETS: tl.constexpr = False,
 ):
-    """Write contiguous FP32 K-partition slabs for one regular output grid."""
+    """Write contiguous FP32 K-partition slabs for one regular output grid.
+
+    The grid is flattened ``(grid_mn, SPLIT_K)``; ``GROUP_M``/``NUM_XCDS``
+    recover the dense output grouping (both default to the identity mapping).
+    The K reduction runs through the shared register core on its runtime-K
+    path so ``M``/``N``/``K`` stay runtime specialization arguments. The
+    default ``ACCUMULATE_IN_DOT=True`` recipe preserves the legacy fused-dot
+    carry; ``ACCUMULATE_IN_DOT=False`` selects the dot+add recipe instead.
+    ``MASK_TAIL`` relaxes the equal-slice divisibility hints for the explicit
+    masked-tail policy; the default strict path keeps them.
+    """
     tl.static_assert(VALID_M_ROWS >= 0 and VALID_M_ROWS <= BLOCK_M)
     tl.static_assert(PIPE_ITERS == 0 or PIPE_ITERS == 16)
     tl.assume(M > 0)
     tl.assume(N > 0)
     tl.assume(K > 0)
-    tl.assume(K % (SPLIT_K * BLOCK_K) == 0)
-    if ONE_M_TILE:
-        pid_m = 0
-        pid_n = tl.program_id(0).to(tl.int32)
-        split = tl.program_id(1).to(tl.int32)
-    else:
-        pid_m = tl.program_id(0).to(tl.int32)
-        pid_n = tl.program_id(1).to(tl.int32)
-        split = tl.program_id(2).to(tl.int32)
+    tl.assume(SPLIT_K > 1)
+    if not MASK_TAIL:
+        tl.assume(K % SPLIT_K == 0)
+    pid = tl.program_id(0).to(tl.int32)
+    split = tl.program_id(1).to(tl.int32)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    grid_mn = grid_m * grid_n
+    if NUM_XCDS != 1:
+        aligned = (grid_mn // (NUM_XCDS * 4)) * (NUM_XCDS * 4)
+        if pid < aligned:
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            pid = local_pid // 4 * NUM_XCDS * 4 + xcd * 4 + local_pid % 4
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + pid % group_size
+    pid_n = pid % width // group_size
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rows = tl.max_contiguous(tl.multiple_of(rows, BLOCK_M), BLOCK_M)
     cols = tl.max_contiguous(tl.multiple_of(cols, BLOCK_N), BLOCK_N)
-    input_rows = tl.where(rows < VALID_M_ROWS, rows, 0) if VALID_M_ROWS else tl.where(rows < M, rows, 0)
+    valid_m = VALID_M_ROWS if VALID_M_ROWS else M
+    input_rows = tl.where(rows < valid_m, rows, 0)
     input_cols = cols if FULL_N_TILE else tl.where(cols < N, cols, 0)
-    rk = tl.arange(0, BLOCK_K)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     if PIPE_ITERS:
         split_k_size = PIPE_ITERS * BLOCK_K
-        k_tiles = PIPE_ITERS
+        slice_len = PIPE_ITERS * BLOCK_K
         stride_am = PIPE_ITERS * SPLIT_K * BLOCK_K
         stride_bn = PIPE_ITERS * SPLIT_K * BLOCK_K
     else:
-        split_k_size = tl.multiple_of(K // SPLIT_K, BLOCK_K)
-        k_tiles = K // (SPLIT_K * BLOCK_K)
-        tl.assume(k_tiles >= 4)
-    for index in range(0, k_tiles):
-        k = split * split_k_size + index * BLOCK_K
-        a = tl.load(a_ptr + input_rows[:, None] * stride_am + (k + rk[None, :]) * stride_ak)
-        b = tl.load(b_ptr + (k + rk[:, None]) * stride_bk + input_cols[None, :] * stride_bn, cache_modifier=".cg")
-        acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+        slice_len = K // SPLIT_K
+        if MASK_TAIL:
+            # The explicit masked-tail policy allows equal slices of at least
+            # 32 elements with a BLOCK_K tail; the runtime-K masked tail
+            # covers the remainder.
+            split_k_size = slice_len
+        else:
+            split_k_size = tl.multiple_of(slice_len, BLOCK_K)
+            tl.assume(slice_len // BLOCK_K >= 1)
+    acc, _ = _register_matmul_core(
+        a_ptr,
+        b_ptr,
+        b_ptr,
+        input_rows,
+        input_cols,
+        input_rows < valid_m,
+        BLOCK_N,
+        BLOCK_K,
+        split * split_k_size,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        MASK_ROWS=True,
+        CACHE_B_CG=CACHE_B_CG,
+        CACHE_B_TAIL_CG=CACHE_B_CG,
+        RUNTIME_K=True,
+        runtime_k_length=slice_len,
+        ACCUMULATE_IN_DOT=ACCUMULATE_IN_DOT,
+        USE_I64_A_OFFSETS=USE_I64_A_OFFSETS,
+        USE_I64_B_OFFSETS=USE_I64_B_OFFSETS,
+    )
     offsets = split * M * N + rows[:, None] * N + cols[None, :]
-    mask = rows[:, None] < VALID_M_ROWS if VALID_M_ROWS else rows[:, None] < M
+    mask = rows[:, None] < valid_m
     if not FULL_N_TILE:
         mask = mask & (cols[None, :] < N)
     tl.store(partials_ptr + offsets, acc, mask=mask)
@@ -18415,8 +18595,13 @@ def _split_register_reduce_kernel(
     DENSE_C: tl.constexpr = False,
     GRID_N: tl.constexpr = 0,
     VALID_M_ROWS: tl.constexpr = 0,
+    SERIAL_REDUCE: tl.constexpr = False,
 ):
-    """Reduce FP32 partition slabs into a strided output tensor."""
+    """Reduce FP32 partition slabs into a strided output tensor.
+
+    The default tree recipe sums all slabs at once; ``SERIAL_REDUCE=True``
+    preserves the former shared-core serial accumulation order instead.
+    """
     tl.static_assert(GRID_N == 0 or GRID_N == 72)
     if GRID_N:
         tl.static_assert(DENSE_C and VALID_M_ROWS > 0 and VALID_M_ROWS <= BLOCK_M)
@@ -18426,32 +18611,121 @@ def _split_register_reduce_kernel(
         stride_cn = 1
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    splits = tl.arange(0, SPLIT_K)
-    offsets = splits[:, None, None] * M * N + rows[None, :, None] * N + cols[None, None, :]
-    values = tl.load(partials_ptr + offsets, mask=(rows[None, :, None] < M) & (cols[None, None, :] < N), other=0)
-    result = tl.sum(values, axis=0)
+    out_mask = (rows[:, None] < M) & (cols[None, :] < N)
+    if SERIAL_REDUCE:
+        result = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for s in range(0, SPLIT_K):
+            offsets = s * M * N + rows[:, None] * N + cols[None, :]
+            values = tl.load(partials_ptr + offsets, mask=out_mask, other=0.0)
+            result += values.to(tl.float32)
+    else:
+        splits = tl.arange(0, SPLIT_K)
+        offsets = splits[:, None, None] * M * N + rows[None, :, None] * N + cols[None, None, :]
+        values = tl.load(partials_ptr + offsets, mask=(rows[None, :, None] < M) & (cols[None, None, :] < N), other=0)
+        result = tl.sum(values, axis=0)
     tl.store(out_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn, result.to(out_ptr.dtype.element_ty),
-             mask=(rows[:, None] < M) & (cols[None, :] < N))
+             mask=out_mask)
 
 
-def _launch_split_register(a, b, out, plan, *, fallback_plan=None):
+# Plan keys consumed by the host launcher; everything else in a plan mapping
+# is forwarded to the Triton launch (compiler options such as ``kpack``).
+_SPLIT_REGISTER_HOST_KEYS = frozenset({
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_K",
+    "SPLIT_K",
+    "GROUP_M",
+    "NUM_XCDS",
+    "CACHE_B",
+    "ACCUMULATE_IN_DOT",
+    "SERIAL_REDUCE",
+    "K_TAIL",
+    "num_warps",
+    "num_stages",
+})
+
+
+def _launch_split_register(a, b, out, plan, *, fallback_plan=None, workspace=None):
+    """Launch the canonical register Split-K route with FP32 partials.
+
+    ``plan`` carries the compute geometry plus the normalized routing fields
+    ``GROUP_M`` (default 1), ``NUM_XCDS`` (default 1), ``CACHE_B`` (default
+    True), ``ACCUMULATE_IN_DOT`` (default True), ``SERIAL_REDUCE`` (default
+    False) and the explicit ``K_TAIL`` policy (``"forbid"`` by default). A
+    caller may provide ``workspace`` either as the canonical ``(SPLIT_K, M,
+    N)`` FP32 tensor or as the flattened ``(SPLIT_K * M, N)`` view; both
+    alias the same linear storage.
+
+    ``"forbid"`` preserves the legacy strict geometry: unaligned operands or
+    slices that are not block-aligned multiples of at least ``4 * BLOCK_K``
+    fall back to the range-register route. ``"mask"`` is the explicit new
+    policy for equal slices of at least 32 elements whose ``BLOCK_K`` tail
+    the runtime-K masked tail covers. Unequal slices fall back under the
+    legacy policy and are rejected under the explicit masked policy.
+    """
     m, k = a.shape
     n = b.shape[1]
-    if (a.data_ptr() % 16 or b.data_ptr() % 16 or k % (plan["SPLIT_K"] * plan["BLOCK_K"])
-            or k < 4 * plan["SPLIT_K"] * plan["BLOCK_K"]):
+    split_k = plan["SPLIT_K"]
+    block_k = plan["BLOCK_K"]
+    tail_policy = plan.get("K_TAIL", "forbid")
+    if tail_policy not in ("forbid", "mask"):
+        raise InvalidInput("split-register K_TAIL policy must be 'forbid' or 'mask'")
+    if (split_k <= 1 or a.dtype not in (torch.float16, torch.bfloat16) or b.dtype != a.dtype or min(m, n, k) <= 0
+            or min(*a.stride(), *b.stride()) <= 0):
+        raise InvalidInput("split-register requires FP16/BF16 TN operands with positive strides")
+    if out.shape != (m, n) or out.dtype != a.dtype or out.device != a.device or min(out.stride()) <= 0:
+        raise InvalidInput("split-register output must match inputs with positive strides")
+    if _needs_i64_offsets(out):
+        raise InvalidInput("split-register output exceeds the FP32 reducer's signed-i32 offsets")
+    slice_len, tail = divmod(k, split_k)
+    if tail_policy == "mask":
+        if tail:
+            raise InvalidInput("split-register requires equal K slices")
+        if slice_len < 32:
+            raise InvalidInput("split-register requires K slices of at least 32 elements")
+    elif (tail or a.data_ptr() % 16 or b.data_ptr() % 16 or slice_len < 4 * block_k or slice_len % block_k):
         if fallback_plan is None:
             fallback_plan = dict(_fixed_register_plan(32, 16, 512, 4, 8, 2, 3), CACHE_B_CG=True,
                                  regclass_priority_trumps_globalness=False)
         return _launch_range_register_plan(a, b, out=out, config=fallback_plan)
-    partials = torch.empty((plan["SPLIT_K"], m, n), device=a.device, dtype=torch.float32)
-    one_m_tile = m <= plan["BLOCK_M"]
-    full_n_tile = n % plan["BLOCK_N"] == 0
-    grid = ((triton.cdiv(n, plan["BLOCK_N"]), plan["SPLIT_K"]) if one_m_tile else
-            (triton.cdiv(m, plan["BLOCK_M"]), triton.cdiv(n, plan["BLOCK_N"]), plan["SPLIT_K"]))
-    _split_register_kernel[grid](
-        a, b, partials, m, n, k, *a.stride(), *b.stride(), ONE_M_TILE=one_m_tile, FULL_N_TILE=full_n_tile,
-        VALID_M_ROWS=m if one_m_tile else 0, PIPE_ITERS=16 if
-        (k == 16 * plan["SPLIT_K"] * plan["BLOCK_K"] and a.stride() == (k, 1) and b.stride() == (1, k)) else 0, **plan)
+    # The FP32 workspace holds one (M, N) slab per split; validate the total
+    # offset bound before allocating, as the original shared-core route did.
+    if _needs_i64_offsets(torch.empty((split_k, m, n), device="meta", dtype=torch.float32)):
+        raise InvalidInput("split-register FP32 workspace exceeds signed-i32 offsets")
+    group_m = plan.get("GROUP_M", 1)
+    num_xcds = plan.get("NUM_XCDS", 1)
+    cache_b = plan.get("CACHE_B", True)
+    accumulate_in_dot = plan.get("ACCUMULATE_IN_DOT", True)
+    serial_reduce = plan.get("SERIAL_REDUCE", False)
+    block_m = plan["BLOCK_M"]
+    block_n = plan["BLOCK_N"]
+    if workspace is None:
+        partials = torch.empty((split_k, m, n), device=a.device, dtype=torch.float32)
+    else:
+        if (not isinstance(workspace, torch.Tensor) or workspace.dtype != torch.float32 or workspace.device != a.device
+                or not workspace.is_contiguous() or workspace.shape not in ((split_k, m, n), (split_k * m, n))):
+            raise InvalidInput("split-register workspace must be contiguous device FP32 "
+                               "with shape (SPLIT_K, M, N) or (SPLIT_K * M, N)")
+        partials = workspace if workspace.shape == (split_k * m, n) else workspace.reshape(split_k * m, n)
+    full_n_tile = n % block_n == 0
+    grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n), split_k)
+    # The runtime-K kernel stays strictly inside the operand's K extent; the
+    # masked BLOCK_K tail lanes count, as in ``_register_i64_offsets``.
+    k_extent = (split_k - 1) * slice_len + (slice_len + block_k - 1) // block_k * block_k
+    use_i64_a = (m - 1) * a.stride(0) + (k_extent - 1) * a.stride(1) >= 1 << 31
+    use_i64_b = (k_extent - 1) * b.stride(0) + (n - 1) * b.stride(1) >= 1 << 31
+    pipe_iters = (16 if (k == 16 * split_k * block_k and a.stride() == (k, 1) and b.stride() == (1, k)) else 0)
+    launch_options = dict(_register_launch_options(m, n, k, plan))
+    for key, value in plan.items():
+        if key not in _SPLIT_REGISTER_HOST_KEYS:
+            launch_options[key] = value
+    _split_register_kernel[grid](a, b, partials, m, n, k, *a.stride(), *b.stride(), BLOCK_M=block_m, BLOCK_N=block_n,
+                                 BLOCK_K=block_k, SPLIT_K=split_k, GROUP_M=group_m, NUM_XCDS=num_xcds,
+                                 FULL_N_TILE=full_n_tile, VALID_M_ROWS=m if m <= block_m else 0, PIPE_ITERS=pipe_iters,
+                                 ACCUMULATE_IN_DOT=accumulate_in_dot, CACHE_B_CG=cache_b,
+                                 MASK_TAIL=tail_policy == "mask", USE_I64_A_OFFSETS=use_i64_a,
+                                 USE_I64_B_OFFSETS=use_i64_b, num_warps=plan["num_warps"],
+                                 num_stages=plan["num_stages"], **launch_options)
     reduce_kwargs = {}
     if m <= 32 and n == 72 * 32 and out.stride() == (n, 1):
         reduce_kwargs = dict(DENSE_C=True, GRID_N=72)
@@ -18461,10 +18735,11 @@ def _launch_split_register(a, b, out, plan, *, fallback_plan=None):
         m,
         n,
         *out.stride(),
-        SPLIT_K=plan["SPLIT_K"],
+        SPLIT_K=split_k,
         BLOCK_M=32,
         BLOCK_N=32,
         VALID_M_ROWS=m if m <= 32 else 0,
+        SERIAL_REDUCE=serial_reduce,
         num_warps=4,
         num_stages=1,
         **reduce_kwargs,
@@ -18678,6 +18953,10 @@ def _launch_range_autotuned(a, b, out, candidates):
     if selected is None:
         executable = []
         for dispatch in candidates:
+            if (dispatch[0] == "split_register"
+                    or dispatch[0] == "lds" and dispatch[1][2] > 1) and _needs_i64_offsets(out):
+                # The shared FP32 finalizer forms signed-i32 output offsets.
+                continue
             if dispatch[0] == "range_register" and dispatch[1].get("PACK_B_PAIRS", False) and b.data_ptr() % 4:
                 continue
             if dispatch[0] == "range_register" and dispatch[1].get("B_PAIRS_PADDED",
@@ -18696,7 +18975,9 @@ def _launch_range_autotuned(a, b, out, candidates):
         m, k = a.shape
         column_candidates = (_column_major_range_candidates(m, b.shape[1], k, a.dtype, a.element_size(), a.stride(),
                                                             b.stride()) if use_cache and m > 128 else ())
-        if column_candidates:
+        use_paired_graphs = use_cache and (bool(column_candidates) or _supports_dense_tn_full_search(
+            m, b.shape[1], k, a.dtype, a.element_size(), a.stride(), b.stride()))
+        if use_paired_graphs:
             graphs = []
             with torch.cuda.device(a.device):
                 for dispatch in executable:
@@ -25397,6 +25678,8 @@ def _range_candidate_is_sequential(path, plan, fixed):
     """Return whether a range-family candidate uses the fixed K schedule."""
     if path in ("short_k_register", "register", "range_register"):
         return True
+    if path == "split_register":
+        return plan["SPLIT_K"] == fixed
     if path == "lds":
         return plan[2] == fixed
     if path in ("wave_grid", "transposed_wave_grid"):
@@ -26541,12 +26824,82 @@ def _launch_production_wave_grid(a, b, out, plan, bias=None):
     )(a, b, out)
 
 
+def _supports_dense_tn_full_search(m, n, k, dtype, element_size, a_strides, b_strides):
+    return (dtype == torch.bfloat16 and 0 < m <= 4096 and 128 <= k <= 8192 and n >= 128 and n % 128 == 0
+            and k % 128 == 0 and a_strides == (k, 1) and b_strides == (1, k)
+            and _offsets_fit_signed_i32(m, n, k, element_size, a_strides, b_strides))
+
+
+@lru_cache(maxsize=64)
+def _full_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides):
+    """Include dense TN tiling and K-splitting plans only in measured full search.
+
+    The first uncached full-space launch compiles and benchmarks this catalog.
+    Warm GEMM timing excludes that shape-dependent latency and workspace peak.
+    """
+    candidates = list(_range_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides))
+    if not _supports_dense_tn_full_search(m, n, k, dtype, element_size, a_strides, b_strides):
+        return tuple(candidates)
+
+    if m in (1, 27) and (n, k) == (8192, 1024):
+        # Retain the measured hot plan alongside the cache-policy-tuned family.
+        plan = MappingProxyType(dict(_BF16_M27_REGISTER_CONFIGS[(n, k)], CACHE_B_CG=False, waves_per_eu=2))
+        dispatch = ("range_register", plan)
+        if dispatch not in candidates:
+            candidates.append(dispatch)
+
+    # Reuse the register oracle; the range selector alone excludes long-K TN.
+    for config in _REGISTER_CONFIGS:
+        bm, bk = config.kwargs["BLOCK_M"], config.kwargs["BLOCK_K"]
+        if bk < 32 or (m <= 32 and bm > 64) or (m > 128 and bm < 128):
+            continue
+        plan = MappingProxyType(dict(config.kwargs, num_warps=config.num_warps, num_stages=config.num_stages))
+        dispatch = ("range_register", plan)
+        if dispatch not in candidates:
+            candidates.append(dispatch)
+    for bm, bn in TILE_CANDIDATES:
+        grid_mn = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+        for split_k in (1, 2, 4, 8):
+            if (not _valid_lds_split(k, split_k, element_size)
+                    or split_k > 1 and (grid_mn >= _NUM_CU or split_k * m * n * 4 >= 1 << 31)):
+                continue
+            dispatch = ("lds", (bm, bn, split_k))
+            if dispatch not in candidates:
+                candidates.append(dispatch)
+    if m <= 32:
+        seen_keys = {
+            _split_register_recipe_key(_normalize_split_register_plan(dict(plan, SPLIT_K=plan.get("SPLIT_K", 1))))
+            for path, plan in candidates
+            if path == "split_register" and isinstance(plan, MappingProxyType | dict)
+        }
+        for bm in (16, 32):
+            for bn in (32, 64, 128):
+                grid_mn = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+                for bk in (128, 256):
+                    for split_k in (2, 4, 8):
+                        if (k % split_k or k // split_k < 4 * bk
+                                or not _NUM_CU // 2 <= grid_mn * split_k <= 2 * _NUM_CU):
+                            continue
+                        for stages in (2, 3):
+                            if (bm + bn) * bk * element_size * (stages - 1) > 64 * 1024:
+                                continue
+                            warps = 2 if bm == 16 and bn <= 64 else 4
+                            plan = _normalize_split_register_plan(
+                                dict(_fixed_register_plan(bm, bn, bk, 4, 1, warps, stages), SPLIT_K=split_k, GROUP_M=4,
+                                     NUM_XCDS=1, CACHE_B=False, ACCUMULATE_IN_DOT=False, SERIAL_REDUCE=True))
+                            if _split_register_recipe_key(plan) in seen_keys:
+                                continue
+                            seen_keys.add(_split_register_recipe_key(plan))
+                            candidates.append(("split_register", plan))
+    return tuple(candidates)
+
+
 def _launch_dispatch(a, b, out, dispatch, bias=None):
     path, plan = dispatch
     if bias is not None and path in ("gemv", "split_register"):
         return _launch_register(a, b, bias=bias, out=out)
     if path == "split_register":
-        return _launch_split_register(a, b, out, plan)
+        return _launch_split_register(a, b, out, _normalize_split_register_plan(plan))
     if path == "gemv":
         return _launch_gemv(a, b, out, plan)
     if path == "cached_b_lds":
@@ -26656,12 +27009,21 @@ def matmul(a, b, out=None):
     return _launch_dispatch(a, b, out, dispatch)
 
 
+# Twice gfx950's 256 MiB MALL, so each cold sample starts with operands in DRAM.
+_COLD_RECHECK_FLUSH_BYTES = 512 << 20
+# Absorbs cold-call timing noise; larger cold regressions reject the winner.
+_COLD_RECHECK_TOLERANCE = 1.03
+
+
 def _range_winner_is_stable(a, b, out, candidates, timings, winner, use_cache):
     m, k = a.shape
     column_candidates = (_column_major_range_candidates(m, b.shape[1], k, a.dtype, a.element_size(), a.stride(),
                                                         b.stride()) if use_cache and m > 128 else ())
+    dense_tn_full_search = use_cache and _supports_dense_tn_full_search(m, b.shape[1], k, a.dtype, a.element_size(),
+                                                                        a.stride(), b.stride())
+    use_paired_graphs = use_cache and (bool(column_candidates) or dense_tn_full_search)
     if max(timings[winner]) >= min(timings[0]):
-        if not column_candidates:
+        if not use_paired_graphs:
             return False
         if (sorted(timings[winner])[len(timings[winner]) // 2] >= sorted(timings[0])[len(timings[0]) // 2]):
             return False
@@ -26670,7 +27032,7 @@ def _range_winner_is_stable(a, b, out, candidates, timings, winner, use_cache):
     import torch
 
     estimated_ms = max(sorted(timings[index])[len(timings[index]) // 2] for index in (0, winner))
-    repeats = 64 if column_candidates else max(1, min(64, int(10 / max(estimated_ms, 1e-6))))
+    repeats = 64 if use_paired_graphs else max(1, min(64, int(10 / max(estimated_ms, 1e-6))))
     graphs = []
     with torch.cuda.device(a.device):
         for index in (0, winner):
@@ -26679,7 +27041,8 @@ def _range_winner_is_stable(a, b, out, candidates, timings, winner, use_cache):
                 for _ in range(repeats):
                     _launch_dispatch(a, b, out, candidates[index])
             graphs.append(graph)
-        for _ in range(3):
+        # Large dense graphs need more warm-up after capture before paired verification.
+        for _ in range(9 if dense_tn_full_search and m > 128 else 3):
             for graph in graphs:
                 graph.replay()
         torch.cuda.synchronize()
@@ -26694,7 +27057,36 @@ def _range_winner_is_stable(a, b, out, candidates, timings, winner, use_cache):
                 end.synchronize()
                 samples[index].append(start.elapsed_time(end) / repeats)
     medians = [[sorted(values[offset:offset + 3])[1] for offset in range(0, 9, 3)] for values in samples]
-    return max(medians[1]) < min(medians[0])
+    if max(medians[1]) >= min(medians[0]):
+        return False
+    # Hot graphs keep the operands cache-resident, so a winner that streams B
+    # without .cg can win hot yet lose badly once B has to come from DRAM.
+    try:
+        flush = torch.empty(_COLD_RECHECK_FLUSH_BYTES, device=a.device, dtype=torch.uint8)
+    except torch.cuda.OutOfMemoryError:
+        return False
+    with torch.cuda.device(a.device):
+        graphs = []
+        for index in (0, winner):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                _launch_dispatch(a, b, out, candidates[index])
+            graph.replay()
+            graphs.append(graph)
+        torch.cuda.synchronize()
+        cold = [[], []]
+        for round_index in range(9):
+            for index in (round_index % 2, (round_index + 1) % 2):
+                flush.fill_(round_index)
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                graphs[index].replay()
+                end.record()
+                end.synchronize()
+                cold[index].append(start.elapsed_time(end))
+    del flush
+    return sorted(cold[1])[4] <= sorted(cold[0])[4] * _COLD_RECHECK_TOLERANCE
 
 
 def mm(a, b, *, out=None, space="heuristic", invariance=None):
@@ -26762,12 +27154,20 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
                 invariance=invariance,
             )
         if space == "full":
-            # The full space must not lose to the heuristic, so the heuristic plan
-            # is a candidate too. It leads the list because an unstable autotune
-            # winner falls back to index 0.
-            candidates = _range_dispatch_candidates(m, n, k, a.dtype, a.element_size(), a.stride(), b.stride())
+            # Keep the heuristic in full search and retain the measured hot
+            # incumbent when an overlapping winner fails the paired recheck.
+            candidates = _full_dispatch_candidates(m, n, k, a.dtype, a.element_size(), a.stride(), b.stride())
             if dispatch is not None:
                 candidates = [dispatch] + [c for c in candidates if c != dispatch]
+            if out.is_contiguous() and _supports_dense_tn_full_search(m, n, k, a.dtype, a.element_size(), a.stride(),
+                                                                      b.stride()):
+                incumbent = None
+                if (m, n, k) == (1920, 4096, 8192):
+                    incumbent = ("lds", (256, 256, 2))
+                elif (m, n, k) == (1920, 8192, 4096):
+                    incumbent = ("lds", (256, 256, 1))
+                if incumbent is not None:
+                    candidates = [incumbent] + [c for c in candidates if c != incumbent]
             if len(candidates) == 1:
                 dispatch = candidates[0]
             elif candidates:
@@ -26781,7 +27181,7 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
     # inputs, and another Python call is material for the small-M kernels.
     path, plan = dispatch
     if path == "split_register":
-        return _launch_split_register(a, b, out, plan)
+        return _launch_split_register(a, b, out, _normalize_split_register_plan(plan))
     if path == "gemv":
         return _launch_gemv(a, b, out, plan)
     if path == "cached_b_lds":

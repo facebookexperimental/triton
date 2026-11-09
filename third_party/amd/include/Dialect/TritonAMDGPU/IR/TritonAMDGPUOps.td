@@ -347,6 +347,7 @@ def BufferLoadToLocalOp
           "buffer_load_to_local",
           [GlobalToLocalCopyTrait, AttrSizedOperandSegments, BufferOpInterface,
            DeclareOpInterfaceMethods<PredicatedOpInterface>,
+           MixedRadixLayoutTrait,
            TypesMatchWith<"dest element type matches pointee type of ptr",
                           "dest", "ptr", "$_self",
                           "::mlir::triton::elementTypeMatchesPointee">,
@@ -611,6 +612,40 @@ def MaskedStoreOp : TT_AMDGPU_Op<"masked_store", []> {
     (`forceNoAlias` $forceNoAlias^)?
     attr-dict `:` type(operands)
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// PackedDot2Op
+//===----------------------------------------------------------------------===//
+
+def PackedDot2Op
+    : TT_AMDGPU_Op<"packed_dot2",
+                   [Pure, Elementwise, SameOperandsAndResultShape,
+                    SameOperandsAndResultEncoding]> {
+  let summary = "Compute an FP32 dot product of two packed FP16 or BF16 pairs";
+
+  let description = [{
+    Interpret each i32 element of `lhs` and `rhs` as two packed values of
+    `input_type` and compute
+    `lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc` in FP32.
+
+    FP16 lowers to `llvm.amdgcn.fdot2`; BF16 lowers to
+    `llvm.amdgcn.fdot2.f32.bf16`. LLVM therefore retains the DOT instruction
+    semantics needed by AMDGPU scheduling and hazard recognition.
+  }];
+
+  let arguments = (ins RankedTensorOf<[I32]>:$lhs,
+                       RankedTensorOf<[I32]>:$rhs,
+                       RankedTensorOf<[F32]>:$acc,
+                       TypeAttr:$input_type);
+  let results = (outs RankedTensorOf<[F32]>:$result);
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs `,` $acc attr-dict
+        `:` type($lhs) `,` type($rhs) `,` type($acc) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1146,9 +1181,13 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
     packed K layout needs a radix-3 repeat for FP6 that landed
     LinearLayout cannot express yet, so v1 uses this padded form; each
     lane feeds the packed bytes (8/6/4 x i32) per step through kWidth=8
-    dot-operand windows. `a_scale` and
-    `b_scale` hold one E8M0 byte per 32 logical values: shapes are
-    [M, logicalK/32] and [N, logicalK/32] in i8 storage.
+    dot-operand windows. `a_scale` and `b_scale` normally hold one E8M0 byte
+    per 32 logical values: shapes are [M, logicalK/32] and [N, logicalK/32]
+    in i8 storage. A single native FP8 step may instead consume one packed
+    i32 scale word per lane. In that form, `a_scale_selector` and
+    `b_scale_selector` select the first E8M0 byte passed to the instruction
+    without extracting it first. A two-step K128 chain reuses the word and
+    adds two to each selector for its second K64 instruction.
 
     Only the transient contract is supported today: `accumulator_role` must
     be "transient", `resident_operand` must be "none", and
@@ -1166,7 +1205,8 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
       TT_Tensor:$a_scale, TT_Tensor:$b_scale, StrAttr:$a_format,
       StrAttr:$b_format, StrAttr:$resident_operand,
       StrAttr:$accumulator_role, StrAttr:$accumulator_register_class,
-      BoolAttr:$initialize);
+      BoolAttr:$initialize, OptionalAttr<I32Attr>:$a_scale_selector,
+      OptionalAttr<I32Attr>:$b_scale_selector);
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{

@@ -39,8 +39,13 @@ GFX950_1 = FocusSuite(
     op="flash_attn_mxfp8",
     shapes=SM100_1.shapes,
 )
-FOCUS_SUITES = (SM100_1, GFX950_1)
-DEFAULT_SUITES = {"sm100": ("sm100_1", ), "gfx950": ("gfx950_1", )}
+GFX1250_1 = FocusSuite(
+    name="gfx1250_1",
+    op="flash_attn_mxfp8",
+    shapes=SM100_1.shapes,
+)
+FOCUS_SUITES = (SM100_1, GFX950_1, GFX1250_1)
+DEFAULT_SUITES = {"sm100": ("sm100_1", ), "gfx950": ("gfx950_1", ), "gfx1250": ("gfx1250_1", )}
 FOCUS = FocusRegistry("flash_attn_mxfp8", FOCUS_SUITES, DEFAULT_SUITES)
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 

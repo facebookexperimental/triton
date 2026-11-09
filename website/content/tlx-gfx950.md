@@ -106,6 +106,7 @@ register staging.
 
 | Builtin | Purpose |
 |---|---|
+| `amd_packed_dot2` | Intra-lane FP32 dot of packed FP16/BF16 pairs; LLVM owns dependency waits |
 | `dot_scaled` | Scaled dot with optional tile schedule |
 | `amd_scheduled_mfma` | Native MFMA fragment chains with residency control |
 | `amd_mfma_commit` | Wave-local MFMA completion boundary |
@@ -144,5 +145,8 @@ register staging.
 - `amd_scheduled_mfma` distinguishes transient vs persistent accumulator
   chains; persistent dV stays in AGPRs while dK stays in VGPRs in the
   tuned backward paths.
+- `amd_packed_dot2` requires same-shaped `uint32` packed inputs and an FP32
+  accumulator. Pass `input_dtype=tl.float16` or `tl.bfloat16`; see
+  [other operations](utilities.html#amd-packed-dot2) for the full contract.
 - TDM descriptor ops (`async_amd_descriptor_*`) are gfx1250+, not gfx950;
   see [TLX on gfx1250](tlx-gfx1250.html).

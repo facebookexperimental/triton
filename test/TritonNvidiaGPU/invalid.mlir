@@ -11,6 +11,34 @@ module {
 
 // -----
 
+// twoCTAs with omitted/empty CGALayout is valid in fbtriton (single-CTA
+// degenerate: ctas_per_cga with num_ctas==1 keeps an empty block axis), so
+// these parse cleanly instead of erroring as upstream #11894 expects. Kept as
+// no-abort regressions for #11815: an unguarded getBasis would crash here.
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1, twoCTAs = true>
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1, CGALayout = [], twoCTAs = true>
+
+// -----
+
+// expected-error @below {{twoCTAs layout with a CTA shard requires the first CGALayout block basis to be [1, 0]}}
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1, CGALayout = [[0, 1]], twoCTAs = true>
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @tcgen05_unsupported_target() {
+    // expected-error @below {{'ttng.tmem_alloc' op requires tcgen05 support}}
+    %0 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory>
+    tt.return
+  }
+}
+
+// -----
+
 // A descriptor's logical K must cover complete MMA instructions, even if its
 // backing allocation is larger.
 #shared_a = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>

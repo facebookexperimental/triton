@@ -351,7 +351,7 @@ findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer, Operation *before,
     if (&op == beforeInBody)
       break;
     auto localStore = dyn_cast<ttg::LocalStoreOp>(&op);
-    if (!localStore || !schedule.count(&op))
+    if (!localStore || !schedule.contains(&op))
       continue;
     if (!memDescMayAlias(localStore.getDst(), buffer))
       continue;
@@ -484,7 +484,7 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
       Operation *candidate = &*revIt;
       if (candidate == stopOp)
         return nullptr;
-      if (isa<ttng::WaitBarrierOp>(candidate) && schedule.count(candidate))
+      if (isa<ttng::WaitBarrierOp>(candidate) && schedule.contains(candidate))
         return candidate;
     }
     return nullptr;
@@ -503,7 +503,7 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
     Operation *candidate = &*revIt;
     if (isTMAStoreLikeOp(candidate))
       return nullptr;
-    if (isa<ttng::WaitBarrierOp>(candidate) && schedule.count(candidate))
+    if (isa<ttng::WaitBarrierOp>(candidate) && schedule.contains(candidate))
       return candidate;
   }
 
@@ -686,7 +686,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
         continue;
 
       // The defining op must be in the schedule for the LinearizedIterator.
-      if (!schedule.count(tmaStore))
+      if (!schedule.contains(tmaStore))
         continue;
 
       // Walk the linearized schedule from the TMA store, counting K

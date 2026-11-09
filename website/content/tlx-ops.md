@@ -38,10 +38,13 @@ Implemented today:
 mm/sm100.py
 mm_bias_grad/sm100.py
 mm_mxfp8/sm100.py
+mm_mxfp6/sm100.py
+mm_mxfp6/gfx950.py
 flash_attn/sm100.py
 flash_attn/gfx950.py
 flash_attn_mxfp8/sm100.py
 flash_attn_mxfp8/gfx950.py
+flash_attn_mxfp8/gfx1250.py
 flash_attn_varlen/gfx950.py
 hstu_attn/sm100.py
 hstu_cross_attn/gfx950.py
@@ -55,10 +58,11 @@ kernels/
     mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
     mm_bias_grad/         sm100.py
     mm_mxfp8/             sm100.py
+    mm_mxfp6/             sm100.py  gfx950.py
     addmm/                gfx942.py
     bmm/                  gfx942.py
     flash_attn/           sm90.py  sm100.py  gfx950.py  (fwd + bwd)
-    flash_attn_mxfp8/     sm100.py  gfx950.py           (fwd + bwd)
+    flash_attn_mxfp8/     sm100.py  gfx950.py  gfx1250.py  (fwd + bwd; gfx1250 forward only)
     flash_attn_varlen/    gfx950.py                     (forward only)
     hstu_attn/            sm100.py  gfx942.py
                           _util.py  _stubs.py  _reference.py
@@ -277,6 +281,40 @@ from `tutorials/blackwell_gemm_ws_mxfp8.py`.
   launches one shape-picked config without autotuning.
 - A supplied `out` must be contiguous, non-overlapping BF16 `[M, N]` on
   `a.device` and is returned by identity.
+
+## MXFP6 GEMM
+
+```python
+out = triton.tlx.ops.mm_mxfp6(a, a_scale, b, b_scale, out=None, sf_layout="natural", space="full")
+```
+
+Computes `a @ b.T` from contiguous dense-packed E2M3 `a` `[M, K]` and E3M2 `b`
+`[N, K]` (uint8, groups of 16 codes per 12 bytes LSB-first, K padded
+to the unpacked width) with one E8M0 scale per 32 K values, returning contiguous BF16 `[M, N]`.
+`M`, `N` and `K` must be multiples of 128. This is a forward-only operation
+with one registered backend: on SM100 it is mirrored from
+`kernels/mm_mxfp8/sm100.py` with the `mxf8f6f4` MMA kind. A gfx950
+decompose backend exists in `kernels/mm_mxfp6/gfx950.py` but is not
+registered yet (numerics are not correct at this revision), so MI350
+callers get `UnsupportedOp` instead of silent wrong results.
+
+- `sf_layout="natural"`: `a_scale` is `[M, K // 32]` and `b_scale` is
+  `[N, K // 32]`; they are packed into the blocked layout on every call.
+- `sf_layout="cublas_blocked"`: scales are already in the cuBLAS 128x4 atom
+  layout, e.g. torchao's `MXTensor.to_mx(..., is_swizzled_scales=True).scale`,
+  and must contain exactly `M * K // 32` and `N * K // 32` bytes.
+- `space="full"` (default) autotunes over 1-/2-CTA, split-K, overlapped-
+  accumulator and pipeline-depth configs; the first call per shape compiles and
+  benchmarks the pruned space. When all of B fits in shared memory next to at
+  least four A stages (small N and K), it also tries a B-resident family: B is
+  loaded once per CTA, each tile computes a whole 128 x N row so A is read from
+  DRAM once, and the epilogue uses async TMA stores. `space="heuristic"`
+  launches one shape-picked config without autotuning.
+- A supplied `out` must be contiguous, non-overlapping BF16 `[M, N]` on
+  `a.device` and is returned by identity.
+- Quantize with torchao (`elem_dtype="fp6_e2m3"` / `"fp6_e3m2"`), shift its
+  unpacked codes down (`qdata >> 2`), and dense-pack; torchao emits unpacked
+  codes, not the dense triples the kernel consumes.
 
 ## MXFP8 grouped GEMM
 

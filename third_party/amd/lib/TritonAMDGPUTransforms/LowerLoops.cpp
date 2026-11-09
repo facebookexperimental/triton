@@ -3,6 +3,7 @@
 #include "Utility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
+#include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/CGAEncodingAttr.h"
@@ -413,6 +414,12 @@ bool canBeConvertedToAsyncLoad(unsigned numBuffers, tt::LoadOp loadOp,
     auto regLayout = triton::gpu::toLinearLayout(srcTy);
     // It's the allocation so we trim the multibuffer dimension
     auto srcShape = srcTy.getShape();
+    if (!regLayout.isRadix2()) {
+      unsigned elemBitWidth = tt::getPointeeBitWidth(srcTy);
+      unsigned vecSize = std::max(128u / elemBitWidth, 1u);
+      return !LLVM::AMD::getNpotDirectToLdsUnsupportedReason(
+          targetInfo, regLayout, elemBitWidth, sharedEnc, srcShape, vecSize);
+    }
     triton::LinearLayout sharedLayout;
     auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
     if (paddedEnc) {
@@ -659,6 +666,16 @@ LogicalResult initSchedule(int maxDist, Stages &stages, int numStages,
     asyncWaitCluster = 1;
     globalLoadCluster = 2;
     localLoadCluster = 3;
+    localStoreCluster = 4;
+  }
+
+  // TDM copy reordering to improve latency hiding.
+  bool tdmReorder = hasTDMLoad && hasScaledDot && !waitAtTail;
+  if (tdmReorder) {
+    globalLoadCluster = 0; // all TDM copies first
+    asyncWaitCluster = 1;  // single wait after the copies
+    localLoadCluster = 2;  // local_loads after the wait
+    computeCluster = 3;    // dot_scaled last
     localStoreCluster = 4;
   }
 

@@ -77,7 +77,9 @@ from .mem_ops import (
     update_tensor_descriptor,
 )
 from .mma_ops import (
+    amd_concat,
     amd_dot,
+    amd_packed_dot2,
     amd_mfma_commit,
     amd_register_class_anchor,
     amd_register_resident,
@@ -181,7 +183,9 @@ __all__ = [
     "nv_mma_shared_layout_encoding",
     "storage_kind",
     "layout",
+    "amd_concat",
     "amd_dot",
+    "amd_packed_dot2",
     "amd_mfma_commit",
     "amd_register_class_anchor",
     "amd_register_resident",

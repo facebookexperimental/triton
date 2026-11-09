@@ -645,7 +645,8 @@ private:
       for (int idx : group)
         groupValues.push_back(srcValues[idx]);
 
-      auto vectorizeKind = enableTreeReduction
+      // Packing pairs neighbours, so an odd group stays scalar.
+      auto vectorizeKind = enableTreeReduction && groupValues.size() % 2 == 0
                                ? helper.getInThreadVectorizeOpKind(
                                      groupValues.size(),
                                      targetInfo.supportBitwidth16Elementwise(),
@@ -761,9 +762,13 @@ private:
     Region &combineRegion =
         vectorCombineRegion ? *vectorCombineRegion : op.getCombineOp();
 
-    Operation &combinerOp = combineRegion.front().front();
+    Operation *combinerOp = vectorCombineRegion
+                                ? &vectorCombineRegion->front().front()
+                                : op.getSingleCombiner();
     unsigned arity =
-        enableTreeReduction ? targetInfo.getReductionTreeArity(&combinerOp) : 1;
+        !enableTreeReduction
+            ? 1
+            : (combinerOp ? targetInfo.getReductionTreeArity(combinerOp) : 2);
     // Chunk only long scalar fadd folds: several register-contiguous spans can
     // otherwise form a high-pressure dependency chain. With one or two spans,
     // there is no repeated cross-span fold to break. Keep other combiners flat
@@ -1096,10 +1101,13 @@ private:
     Value laneId = b.urem(threadId, warpSize);
     Value zero = b.i32_val(0);
 
-    unsigned elemsPerThread = std::max<unsigned>(elems / numThreads, 1);
+    unsigned elemsPerThread = llvm::divideCeil(elems, numThreads);
     Value threadIsNeeded = b.icmp_slt(threadId, b.i32_val(elems));
     Value readOffset = threadId;
     for (unsigned round = 0; round < elemsPerThread; ++round) {
+      // An NPOT scratch ends in a partial round.
+      if (round > 0 && round == elemsPerThread - 1 && elems % numThreads)
+        threadIsNeeded = b.icmp_slt(readOffset, b.i32_val(elems));
       SmallVector<Value> acc(op.getNumOperands());
       for (unsigned i = 0; i < op.getNumOperands(); ++i) {
         auto elemTy = getElementType(op, i);

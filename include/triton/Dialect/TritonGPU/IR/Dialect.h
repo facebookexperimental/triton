@@ -202,12 +202,20 @@ bool isRadix2Encoding(Attribute layout);
 // shape must divide.
 bool hasExactLayoutAt(RankedTensorType type);
 
+// Whether `type` has an NPOT shape and an exact mixed-radix layout.
+bool hasExactNpotLayout(RankedTensorType type);
+
 // Whether `op` lowers a mixed-radix layout: it is elementwise, carries
 // MixedRadixLayoutTrait or MixedRadixLayoutOpInterface, or is an upstream
 // constant, control-flow or cast op. The verifier allows a mixed-radix layout
 // only on these ops, and the NPOT pad pass keeps a connected component's shape
 // only if all its ops are.
-bool isMixedRadixLayoutOp(Operation *op);
+bool isMixedRadixLayoutOp(OperationName op);
+
+// Why the verifier rejects an exact mixed-radix layout among `types` on an op
+// named `name`, if it does; a pass can ask before creating the op.
+std::optional<std::string> getNpotLayoutUnsupportedReason(OperationName name,
+                                                          TypeRange types);
 
 // Create a GenericLinearEncoding if the source isGenericLinearEncoding, and a
 // LinearEncoding otherwise.
@@ -389,6 +397,16 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
                                               ArrayRef<int64_t> shape);
 SmallVector<int64_t> getAllocationShapePerCTA(Type type);
 
+// Returns the layout of a rank-2 NPOT tile allocated without its pow2 cover:
+// the cover's layout when it maps [0, product(tile)) onto the tile, or, for
+// NPOT rows across whole panels, the cover's panels at stride rows * width.
+// Swizzled and rotating panels span the contiguous dim's pow2 part; a padded
+// tile gives its linear component. Otherwise sets `reason` and fails, and the
+// tile keeps its cover.
+FailureOr<LinearLayout> getNpotDenseSharedLayout(Attribute layout,
+                                                 ArrayRef<int64_t> tile,
+                                                 std::string *reason = nullptr);
+
 // Returns the layout-ranked suffix, dropping a leading pipelining dimension.
 template <typename T>
 ArrayRef<T> dropPipeliningDim(ArrayRef<T> shape, Attribute layout) {
@@ -406,7 +424,8 @@ int64_t getAllocationElems(Attribute layout, ArrayRef<int64_t> shape,
                            ArrayRef<int64_t> allocShape = {});
 
 // Returns whether a shared allocation holds the footprint of its layout, which
-// is built on allocShape rounded up to pow2.
+// is built on allocShape rounded up to pow2. A tile that
+// getNpotDenseSharedLayout accepts holds it exactly.
 bool holdsNpotPow2AllocShape(Attribute layout, ArrayRef<int64_t> allocShape);
 
 // MemDescType::verify's power-of-two test: every layout dimension but a leading
@@ -472,6 +491,9 @@ triton::gpu::BlockedEncodingAttr
 getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
                           int numWarps, int threadsPerWarp, int numCTAs);
 
+// The layout of `op`'s first operand with an exact mixed-radix layout.
+FailureOr<LinearLayout> getExactNpotOperandLayout(Operation *op);
+
 // Under TRITON_ALLOW_NPOT, an NPOT `shape`'s mixed-radix layout with `vector`
 // elements along order[0] (default the last dim) and odd digits slowest. Fails
 // if pow2 or CTAs > 1.
@@ -486,6 +508,12 @@ getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
 unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
                              unsigned vector, ArrayRef<unsigned> order,
                              int numWarps, int threadsPerWarp);
+
+// Registers per shared access of a mixed-radix `regLayout`: leading register
+// digits at consecutive offsets through the pow2 `toOffset`, at most 128 bits,
+// cut until every run starts aligned.
+int32_t getMixedRadixSharedRun(const LinearLayout &regLayout,
+                               const LinearLayout &toOffset, unsigned bitwidth);
 
 // Dump information about which threads/registers contain each of the tensor
 // elements.
