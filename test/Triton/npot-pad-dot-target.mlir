@@ -56,3 +56,20 @@ module attributes {ttg.target = "cuda:90"} {
     tt.return
   }
 }
+
+// -----
+
+// The target names why a descriptor pads; cuda keeps it exact.
+// CHECK-LABEL: @descriptor_64x96
+// CHECK: tt.descriptor_load {{.*}} -> tensor<64x96xf16>
+// HIP: remark: NPOT tensor descriptor is not yet supported on hip:gfx950
+// NONE: remark: NPOT tensor descriptor is not yet supported without a target
+tt.func @descriptor_64x96(%a: !tt.ptr<f16>, %c: !tt.ptr<f16>, %m: i32, %n: i32, %s: i64) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i64
+  %da = tt.make_tensor_descriptor %a, [%m, %n], [%s, %c1] : !tt.ptr<f16>, !tt.tensordesc<64x96xf16>
+  %x = tt.descriptor_load %da[%c0, %c0] : !tt.tensordesc<64x96xf16> -> tensor<64x96xf16>
+  %sc = tt.splat %c : !tt.ptr<f16> -> tensor<64x96x!tt.ptr<f16>>
+  tt.store %sc, %x : tensor<64x96x!tt.ptr<f16>>
+  tt.return
+}
