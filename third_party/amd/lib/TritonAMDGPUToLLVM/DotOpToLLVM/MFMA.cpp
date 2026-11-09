@@ -654,8 +654,52 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     return rewriter.create(loweredOp)->getResult(0);
   }
 
+  // Dense-pack 32 FP6 codes per lane into 24 bytes (code i at bits
+  // [6i, 6i+6), LSB first, matching host packing): vec<8xi32> -> vec<6xi32>.
+  Value packFp6Operand(Value codes) const {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value bytes = b.bitcast(codes, vec_ty(i8_ty, 32));
+    SmallVector<Value> words(6, b.i32_val(0));
+    for (int i = 0; i < 32; ++i) {
+      Value code = LLVM::ZExtOp::create(
+          rewriter, loc, i32_ty, b.extract_element(i8_ty, bytes, b.i32_val(i)));
+      int bitPos = i * 6;
+      int word = bitPos / 32;
+      int shift = bitPos % 32;
+      Value shifted =
+          LLVM::ShlOp::create(rewriter, loc, code, b.i32_val(shift));
+      words[word] = LLVM::OrOp::create(rewriter, loc, words[word], shifted);
+      if (shift > 26) {
+        Value hi =
+            LLVM::LShrOp::create(rewriter, loc, code, b.i32_val(32 - shift));
+        words[word + 1] =
+            LLVM::OrOp::create(rewriter, loc, words[word + 1], hi);
+      }
+    }
+    auto wordTy = vec_ty(i32_ty, 6);
+    Value packed = b.undef(wordTy);
+    for (int w = 0; w < 6; ++w)
+      packed = b.insert_element(wordTy, packed, words[w], b.i32_val(w));
+    return packed;
+  }
+
   LogicalResult convertScaledDot(DotScaledOp op,
                                  DotScaledOpAdaptor adaptor) const {
+    // FP6 lowers natively only for whole 16x16x128/32x32x64 steps;
+    // NPOT must decompose earlier - fail cleanly, never crash.
+    if (isMXFP6ScaleType(op.getAElemType()) ||
+        isMXFP6ScaleType(op.getBElemType())) {
+      ArrayRef<unsigned> instr = mfmaLayout.getInstrShape();
+      int64_t logicalK =
+          cast<RankedTensorType>(op.getA().getType()).getShape().back();
+      bool wholeSteps = (instr[2] == 128 || instr[2] == 64) &&
+                        logicalK % static_cast<int64_t>(instr[2]) == 0;
+      if (!wholeSteps)
+        return op.emitError(
+            "native ScaledMFMA for FP6 packed-K only supports whole "
+            "16x16x128 or 32x32x64 steps yet; decompose the scaled dot "
+            "before LLVM lowering");
+    }
     // Check if this dot has come with priority set by setprio.
     auto setPrioOp = dyn_cast_or_null<ROCDL::SetPrioOp>(op->getPrevNode());
 
@@ -733,8 +777,12 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     unsigned aKBase = *aKBaseOr;
     unsigned bKBase = *bKBaseOr;
 
-    int aKWidth = aKBase;
-    int bKWidth = bKBase;
+    // FP6 layout chunks hold 32 codes per lane; the x3/4 packed width
+    // (24 bytes) is produced by packFp6Operand after extraction.
+    int aKWidth = isMXFP6ScaleType(aElemType) ? static_cast<int>(kBase)
+                                              : static_cast<int>(aKBase);
+    int bKWidth = isMXFP6ScaleType(bElemType) ? static_cast<int>(kBase)
+                                              : static_cast<int>(bKBase);
 
     const auto kDimInstrSize = mfmaLayout.getInstrShapeForOperand(aKBase, 0)[1];
 
@@ -780,13 +828,23 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     int bNonKPackedVals = scaleBKBase / bkPackedVals;
 
     auto operandA = getValuesFromDotOperandLayoutStruct(
-        loadedA, numRepB, numRepM, numRepK, aKWidth, aKBase, aTensorTy,
-        aTensorTy.getElementType(), allowXF32,
+        loadedA, numRepB, numRepM, numRepK, aKWidth,
+        isMXFP6ScaleType(aElemType) ? static_cast<int>(kBase)
+                                    : static_cast<int>(aKBase),
+        aTensorTy, aTensorTy.getElementType(), allowXF32,
         /*preserveBF16=*/false);
     auto operandB = getValuesFromDotOperandLayoutStruct(
-        loadedB, numRepB, numRepN, numRepK, bKWidth, bKBase, bTensorTy,
-        bTensorTy.getElementType(), allowXF32,
+        loadedB, numRepB, numRepN, numRepK, bKWidth,
+        isMXFP6ScaleType(bElemType) ? static_cast<int>(kBase)
+                                    : static_cast<int>(bKBase),
+        bTensorTy, bTensorTy.getElementType(), allowXF32,
         /*preserveBF16=*/false);
+    if (isMXFP6ScaleType(aElemType))
+      for (auto &[key, val] : operandA)
+        val = packFp6Operand(val);
+    if (isMXFP6ScaleType(bElemType))
+      for (auto &[key, val] : operandB)
+        val = packFp6Operand(val);
 
     // Scales have the same replica distributions as their corresponding
     // operands.
