@@ -243,6 +243,20 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm_mxfp6",
+        arch="sm100",
+        variant="ws_mxfp6",
+        impl="triton.tlx.ops.kernels.mm_mxfp6.sm100:mm_mxfp6",
+        dtypes=frozenset({"uint8"}),
+        # Row strides are 128-aligned by the M/N/K contract; only the bases vary.
+        accepts=lambda d: all(ptr % (32 if i in (0, 2) else 16) == 0 for i, ptr in enumerate(d["base_ptrs"])),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    # No gfx950 mm_mxfp6 entry yet: the decompose backend in
+    # kernels/mm_mxfp6/gfx950.py is not numerically correct at this
+    # revision, so MI350 callers get UnsupportedOp instead of silent
+    # wrong results. Register it once the fixing diff lands.
+    OpSpec(
         op="grouped_gemm_mxfp8",
         arch="sm100",
         variant="ws_persistent_mxfp8",
