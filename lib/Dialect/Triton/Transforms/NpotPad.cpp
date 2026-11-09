@@ -1,4 +1,5 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
@@ -151,7 +152,8 @@ static bool hasPaddedLowering(Operation *op) {
 class ExactComponents {
 public:
   ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp, int numCTAs,
-                  StringRef target);
+                  StringRef target, int nonKDim, int numStages,
+                  bool useAsyncCopy);
   bool contains(Value v) const {
     return !paddedComponents.contains(components.getLeaderValue(v));
   }
@@ -166,7 +168,8 @@ private:
 };
 
 ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
-                                 int numCTAs, StringRef target) {
+                                 int numCTAs, StringRef target, int nonKDim,
+                                 int numStages, bool useAsyncCopy) {
   mod.walk([&](Operation *op) {
     SmallVector<Value> values = npotValues(op);
     for (Value v : values)
@@ -278,6 +281,44 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                          op->getName(), exactVector, pow2Vector)
         .str();
   };
+  // The pipeliner copies a dot's operands to LDS in the order and vector
+  // Coalesce gives their loads: the last dim fastest and 128 bits unless
+  // AxisInfo proves otherwise. Only loads in a multi-stage loop are copied.
+  auto slowDot = [&](Operation *op) -> std::optional<std::string> {
+    auto dot = dyn_cast<DotOpInterface>(op);
+    if (!dot)
+      return std::nullopt;
+    SmallVector<NpotDotOperandAccess, 2> operands;
+    for (Value operand : {dot.getA(), dot.getB()}) {
+      auto type = cast<RankedTensorType>(operand.getType());
+      NpotDotOperandAccess &access = operands.emplace_back();
+      access.order =
+          llvm::to_vector(llvm::reverse(llvm::seq<unsigned>(type.getRank())));
+      access.vector = std::max(128u / type.getElementTypeBitWidth(), 1u);
+      access.asyncStages = 0;
+      auto load = operand.getDefiningOp<LoadOp>();
+      if (!load)
+        continue;
+      if (auto forOp = load->getParentOfType<scf::ForOp>()) {
+        IntegerAttr stages =
+            TritonDialect::getLoaded(forOp)->getNumStagesAttrHelper().getAttr(
+                forOp);
+        int64_t loopStages = stages ? stages.getInt() : numStages;
+        if (useAsyncCopy && loopStages > 1)
+          access.asyncStages = loopStages;
+      }
+      if (!axisInfo)
+        axisInfo.emplace(mod);
+      const AxisInfo &info = *axisInfo->getAxisInfo(load.getPtr());
+      access.order =
+          llvm::to_vector(getOrderFromContiguity(info.getContiguity()));
+      access.vector = getAxisInfoVector(info, load.getPtr().getType(),
+                                        type.getShape(), access.order[0],
+                                        int64_t(numWarps) * threadsPerWarp);
+    }
+    return getNpotDotSlowReason(op, operands, numWarps, threadsPerWarp, nonKDim,
+                                target);
+  };
   // A mixed-radix op's NPOT dim may be on any operand, e.g. a dot's B.
   auto rejects = [&](Operation *op) -> std::optional<std::string> {
     auto mixedRadix = dyn_cast<MixedRadixLayoutOpInterface>(op);
@@ -305,7 +346,7 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
       return mixedRadix.getMixedRadixUnsupportedReason(
           exact->getLinearLayout());
     return getNpotDotUnsupportedReason(op, exact->getLinearLayout(), target,
-                                       numWarps);
+                                       numWarps, nonKDim);
   };
   // A dot or a descriptor remarks its target reason; else a padded connected
   // component with a dot remarks the first reason it pads, once.
@@ -337,6 +378,8 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
       }
       pad(leader, op, *reason);
     } else if (std::optional<std::string> reason = losesVector(op)) {
+      slowReasons.try_emplace(leader, op, *reason);
+    } else if (std::optional<std::string> reason = slowDot(op)) {
       slowReasons.try_emplace(leader, op, *reason);
     }
     if (!hasPaddedLowering(op))
@@ -794,7 +837,8 @@ struct NpotPadPass : impl::TritonNpotPadBase<NpotPadPass> {
   // Checks every op before changing any, so an error leaves the IR unchanged.
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    ExactComponents exact(mod, numWarps, threadsPerWarp, numCTAs, target);
+    ExactComponents exact(mod, numWarps, threadsPerWarp, numCTAs, target,
+                          matrixInstructionSize, numStages, useAsyncCopy);
     Padder padder;
     if (mod.walk([&](Operation *op) {
              return WalkResult(exact.contains(op) ? success()

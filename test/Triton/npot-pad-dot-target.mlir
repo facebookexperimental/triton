@@ -1,14 +1,16 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad=target=cuda:75 -verify-diagnostics | FileCheck %s
-// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad=target=hip:gfx950 -tritonamdgpu-schedule-loops -o /dev/null 2>&1 | FileCheck %s --check-prefix=HIP
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad="target=hip:gfx950 matrix-instruction-size=32 num-warps=8" -tritonamdgpu-schedule-loops -o /dev/null 2>&1 | FileCheck %s --check-prefix=HIP
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad -o /dev/null 2>&1 | FileCheck %s --check-prefix=NONE
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad=target=cuda:90 2>/dev/null | FileCheck %s --check-prefix=ATTRS
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad=target=cuda:90 -convert-triton-to-tritongpu=target=cuda:90 2>/dev/null | FileCheck %s --check-prefix=TTG
 
 // The target's dialect names why the dot pads. Its NPOT dim is on operand B.
-// The AMD dialect loads with its backend, so the HIP RUN adds an AMD pass.
+// The AMD dialect loads with its backend, so the HIP RUN adds an AMD pass. It
+// sets the size and 8 warps: an unset size takes the 16x16 MFMA that tiles
+// N=96, and 4 warps of 32 all fit on M=128.
 // CHECK-LABEL: @dot_n96
 // CHECK: tt.dot {{.*}} -> tensor<128x128xf32>
-// HIP: remark: NPOT dot is not yet supported on hip:gfx950
+// HIP: remark: NPOT dot is not yet supported with 4 warps of 32 on dim 1, whose power-of-two part is 32
 // NONE: remark: NPOT dot is not yet supported without an MMA target
 // ConvertTritonToTritonGPU, not the pad pass, sets the module attrs.
 // ATTRS: module {

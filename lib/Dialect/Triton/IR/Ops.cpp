@@ -423,10 +423,21 @@ static const NpotTargetLegality *lookupNpotTargetLegality(MLIRContext *ctx,
 
 std::optional<std::string>
 getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
-                            StringRef target, int numWarps) {
+                            StringRef target, int numWarps, int nonKDim) {
   if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
-    return legality->getDotUnsupportedReason(dot, layout, target, numWarps);
+    return legality->getDotUnsupportedReason(dot, layout, target, numWarps,
+                                             nonKDim);
   return std::string("NPOT dot is not yet supported without an MMA target");
+}
+
+std::optional<std::string>
+getNpotDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
+                     int numWarps, int threadsPerWarp, int nonKDim,
+                     StringRef target) {
+  if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
+    return legality->getDotSlowReason(dot, operands, numWarps, threadsPerWarp,
+                                      nonKDim, target);
+  return std::nullopt;
 }
 
 StringRef getModuleTarget(Operation *op) {
