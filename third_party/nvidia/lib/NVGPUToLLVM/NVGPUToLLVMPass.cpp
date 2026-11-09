@@ -728,6 +728,32 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
   }
 }
 
+// Every TMEM access creates its own warp_id, and its shfl.sync uniform hint is
+// convergent, so LLVM never hoists it: each loop iteration recomputes tid ->
+// warp id -> shfl on the latency path right after the barrier wait that guards
+// the access. warp_id is pure and constant per partition, so compute it once at
+// the entry of its partition (or function) instead.
+void hoistWarpIds(ModuleOp mod) {
+  SmallVector<ttg::WarpIdOp> warpIds;
+  mod.walk([&](ttg::WarpIdOp op) { warpIds.push_back(op); });
+  DenseMap<std::pair<Block *, unsigned>, ttg::WarpIdOp> canonical;
+  for (ttg::WarpIdOp op : warpIds) {
+    Region *region = op->getParentRegion();
+    while (!isa<FunctionOpInterface, ttg::WarpSpecializePartitionsOp,
+                ttg::WarpSpecializeOp>(region->getParentOp()))
+      region = region->getParentRegion();
+    Block *entry = &region->front();
+    auto [it, inserted] =
+        canonical.try_emplace({entry, unsigned(op.getOmitUniformHint())}, op);
+    if (inserted) {
+      op->moveBefore(entry, entry->begin());
+    } else {
+      op.replaceAllUsesWith(it->second.getResult());
+      op->erase();
+    }
+  }
+}
+
 } // anonymous namespace
 
 class ConvertNVGPUToLLVM
@@ -741,6 +767,7 @@ public:
     ModuleOp mod = getOperation();
     RewritePatternSet patterns(context);
 
+    hoistWarpIds(mod);
     patterns.add<ClusterCTAIdOpPattern, WGMMAOpPattern, LoadAcquireOpPattern,
                  WGMMAWaitGroupOpPattern, WarpIdOpPattern>(context);
 
