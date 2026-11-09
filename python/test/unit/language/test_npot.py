@@ -461,11 +461,11 @@ def test_npot_scan(M, N, axis, num_warps, op):
 
 @requires_gpu
 @requires_npot
-@pytest.mark.parametrize("N, num_warps, kept", [(768, 1, False), (96, 4, False), (128, 4, True)])
+@pytest.mark.parametrize("N, num_warps, kept", [(768, 1, True), (96, 4, False), (128, 4, True)])
 def test_npot_histogram(N, num_warps, kept):
-    """Padded, as histogram does not yet take a mixed-radix layout: pad lanes load
-    0, a bin-0 canary; the live mask keeps them uncounted. N=128 is the pow2
-    control."""
+    """[768] on one warp keeps its shape. [96] on four warps pads: pad lanes
+    load 0, a bin-0 canary, and the live mask keeps them uncounted. N=128 is
+    the pow2 control."""
 
     @triton.jit
     def kernel(X, Out, N: tl.constexpr, B: tl.constexpr):
