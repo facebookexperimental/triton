@@ -347,6 +347,7 @@ def BufferLoadToLocalOp
           "buffer_load_to_local",
           [GlobalToLocalCopyTrait, AttrSizedOperandSegments, BufferOpInterface,
            DeclareOpInterfaceMethods<PredicatedOpInterface>,
+           MixedRadixLayoutTrait,
            TypesMatchWith<"dest element type matches pointee type of ptr",
                           "dest", "ptr", "$_self",
                           "::mlir::triton::elementTypeMatchesPointee">,

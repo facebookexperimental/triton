@@ -259,6 +259,16 @@ std::optional<MixedRadixSharedTiling>
 getMixedRadixSharedTiles(const triton::LinearLayout &src,
                          const triton::LinearLayout &dst);
 
+// Elements per shared access on `dim` when it is a tile's fastest dim.
+int32_t getMixedRadixSharedRunLength(const triton::LinearLayout &layout,
+                                     int32_t dim, unsigned bitwidth);
+
+// The odd tiles of a Shared transfer that transposes: each side has a vector
+// but no dim keeps one on both, so a single shared order leaves a side scalar.
+std::optional<MixedRadixSharedTiling>
+getMixedRadixTransposeTiles(const triton::LinearLayout &src,
+                            const triton::LinearLayout &dst, unsigned bitwidth);
+
 // The pow2 padding of a mixed-radix `layout`: each digit of odd radix r becomes
 // ceil(log2 r) binary digits, so each out dim pads to its next power of two.
 triton::LinearLayout padMixedRadixLayout(const triton::LinearLayout &layout);
