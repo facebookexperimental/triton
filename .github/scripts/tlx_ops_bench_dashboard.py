@@ -318,6 +318,8 @@ def events(nights):
     platform = nights[-1]["platform"]
     cases = [{name: {c["key"]: c for c in op["cases"]} for name, op in n["ops"].items()} for n in nights]
     timed = lambda c: bool(c and c["status"] in ("ok", "pip") and c.get("tlx_tflops"))
+    # A change of statistic, timing scope or reference is a discontinuity, not a perf delta.
+    policy = lambda n: (n.get("statistic", "mean_throughput"), n.get("timing_scope"), n.get("ref"))
     out = []
     for i, night in enumerate(nights):
         entry = {
@@ -346,14 +348,12 @@ def events(nights):
                 entry["suite"][op] = suite
             if not both:
                 entry["breaks"].append(op)
-            old_policy = before["ops"].get(op, {}).get("statistic", "mean_throughput")
-            policy = night["ops"].get(op, {}).get("statistic", "mean_throughput")
-            old_scope = before["ops"].get(op, {}).get("timing_scope")
-            scope = night["ops"].get(op, {}).get("timing_scope")
-            if old_policy != policy or old_scope != scope:
-                entry["breaks"].append(op)
+            current = policy(night["ops"].get(op, {}))
+            if policy(before["ops"].get(op, {})) != current:
+                if both:
+                    entry["breaks"].append(op)
                 continue
-            if nxt is not None and nights[i + 1]["ops"][op].get("statistic", "mean_throughput") != policy:
+            if nxt is not None and policy(nights[i + 1]["ops"].get(op, {})) != current:
                 nxt = None
             slower, faster = [], []
             for k in both:

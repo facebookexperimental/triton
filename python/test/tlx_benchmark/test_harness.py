@@ -283,6 +283,7 @@ def test_noisy_prevents_a_speed_verdict_on_a_slow_shape():
     assert r.speedup < MIN_SPEEDUP
     # The softness of the number is still reported, just not as the verdict.
     assert any("CV" in n for n in r.notes)
+    assert any("under the" in n and "floor" in n for n in r.notes)
 
 
 def test_noisy_decides_only_among_cases_that_are_otherwise_fine():
@@ -1061,6 +1062,35 @@ def test_space_resolves_to_each_ops_own_default():
     assert driver.resolve_space(importlib.import_module("bench_mm"), "full") == "full"
 
 
+def test_flash_attn_default_space_is_accepted_on_every_arch():
+    from triton.tlx.ops._catalog import CATALOG
+
+    defaults = {s.arch: s.default_space for s in CATALOG if s.op == "flash_attn"}
+    assert defaults == {"sm90": "full", "sm100": "full", "gfx950": "heuristic"}
+
+
+@pytest.mark.parametrize("arch", ("sm90", "sm100"))
+def test_nvidia_flash_attn_accepts_the_l2_heuristic_space(arch, monkeypatch):
+    import importlib
+
+    impl = importlib.import_module(f"triton.tlx.ops.kernels.flash_attn.{arch}")
+    monkeypatch.setattr(impl, "_SPACE", getattr(impl, "_SPACE", None), raising=False)
+
+    class Reached(Exception):
+        pass
+
+    class Tensor:
+
+        @property
+        def shape(self):
+            raise Reached
+
+    with pytest.raises(Reached):
+        impl.flash_attn(Tensor(), Tensor(), Tensor(), space="heuristic")
+    with pytest.raises(ValueError, match="space must be"):
+        impl.flash_attn(Tensor(), Tensor(), Tensor(), space="unknown")
+
+
 def test_bind_returns_the_four_entry_points_bound_to_the_module():
     import importlib
 
@@ -1264,7 +1294,8 @@ def test_mm_still_times_every_case_and_the_full_space_ops_do_not():
     # mm's cold pass is under a second at heuristic space, so sampling it would
     # drop information for no saving.
     assert driver.resolve_cold_compile(importlib.import_module("bench_mm"), None) == "all"
-    assert driver.resolve_cold_compile(importlib.import_module("bench_flash_attn"), None) == "all"
+    for name in ("bench_flash_attn", "bench_torchtlx_mm", "bench_torchtlx_addmm"):
+        assert driver.resolve_cold_compile(importlib.import_module(name), None) == "all"
     for name in ("bench_hstu_attn", "bench_kda"):
         assert driver.resolve_cold_compile(importlib.import_module(name), None) == "first"
 
@@ -1750,7 +1781,8 @@ def test_latency_scaling_applies_to_raw_and_filtered_samples():
     assert latency.raw_times == latency.times == [.5, 1., 1.5]
 
 
-def test_dashboard_does_not_report_a_statistic_change_as_a_regression(monkeypatch):
+@pytest.mark.parametrize("change", ({"statistic": "p50_latency"}, {"ref": "aten_matmul"}))
+def test_dashboard_does_not_report_a_policy_change_as_a_regression(monkeypatch, change):
     import importlib.util
     import pathlib
 
@@ -1766,7 +1798,7 @@ def test_dashboard_does_not_report_a_statistic_change_as_a_regression(monkeypatc
         },
         {
             "date": "20261105", "platform": "mi350", "sha": "b" * 40, "ops":
-            {"mm": {"statistic": "p50_latency", "cases": [{"key": "mm/fwd/shape", "status": "ok", "tlx_tflops": 60}]}}
+            {"mm": {**change, "cases": [{"key": "mm/fwd/shape", "status": "ok", "tlx_tflops": 60}]}}
         },
     ]
     event = dashboard.events(nights)[1]

@@ -90,9 +90,9 @@ def run(bench, cases, shapes, cold_mode="none", cudagraph=False):
                      case.shape[2] if op_name in ("gemm", "addmm") else bench.flops(*case.shape, direction))
             results[case.key] = result(case, rows[i][1], reference, provider, flops,
                                        getattr(bench, "COMPILE_CAP_S", 120))
-    if op_name == "flash_attention":
-        for value in results.values():
-            value.extra["ref_backend"] = "flash"
+    if hasattr(bench, "ref_backend"):
+        for case in cases:
+            results[case.key].extra["ref_backend"] = bench.ref_backend(case)
     return [results[case.key] for case in cases]
 
 

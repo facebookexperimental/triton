@@ -27,9 +27,6 @@ from _harness import Case, driver  # noqa: E402
 OP = "mm_torchtlx"
 REF_NAME = "torch.mm"
 DEFAULT_SPACE = "heuristic"
-#: Inductor's own caches survive `fresh_triton_cache`, so a cold pass here would
-#: not be a cold pass. Compile time for this provider needs its own mechanism.
-COLD_COMPILE = "none"
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 

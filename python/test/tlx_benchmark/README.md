@@ -20,9 +20,11 @@ tritonbench providers in process. Their policy is heuristic space, GPU events,
 100 warmup iterations and 500 actual samples. Speedup is reference p50 latency
 divided by TLX p50 latency. The reference for TorchTLX is now eager ATen.
 Either provider's raw or filtered latency CV above 3% produces `noisy` before a
-speed verdict. Latency p50/p90/p99 and raw/filtered CV are recorded in `extra`;
+speed verdict; a noisy row under the speedup floor still notes that speedup. Latency p50/p90/p99 and raw/filtered CV are recorded in `extra`;
 existing throughput fields retain their units and the JSON schema stays at 4.
-The dashboard marks the change from mean throughput to p50 latency.
+The dashboard marks the change from mean throughput to p50 latency, and any change of reference.
+NVIDIA `flash_attn` has no tuned heuristic yet: at `heuristic`, sm90 runs its single
+per-head-dim config and sm100 tunes the `smoke` subset.
 
 `--cudagraph` records events inside captured calls, keeping graph replay overhead and cache clearing outside the measured intervals.
 Runtimes without timed external graph events (including fbcode ROCm 7.0) instead time each graph replay; `timing_scope=graph_replay` records that GPU graph dispatch is included. Eager runs report `timing_scope=kernel`.

@@ -22,7 +22,6 @@ from _harness import Case, driver  # noqa: E402
 OP = "addmm_torchtlx"
 REF_NAME = "torch.addmm"
 DEFAULT_SPACE = "heuristic"
-COLD_COMPILE = "none"
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 REL_PRECISION = {"float16": 2e-2, "bfloat16": 2e-2}

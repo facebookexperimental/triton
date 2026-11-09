@@ -33,8 +33,10 @@ accumulates tens of GB of autotune workspaces; at "heuristic" the same call is
 under a second. Pass `space="heuristic"` explicitly for a fast first call. The
 gfx950 implementation currently provides only `"heuristic"`.
 
-`flash_attn` on gfx950 defaults to "heuristic".
-Ops with no heuristic yet -- flash_attn on NVIDIA, flash_attn_mxfp8, hstu_attn,
+`flash_attn` on gfx950 defaults to "heuristic". On NVIDIA it defaults to "full"
+and accepts "heuristic": sm90 runs its single per-head-dim config, and sm100
+tunes the "smoke" subset until it has a real `heuristic_config`.
+Ops with no heuristic yet -- flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can offer a

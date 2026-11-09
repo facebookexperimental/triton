@@ -13,7 +13,7 @@ import sys
 import torch
 
 from triton.tlx.ops.kernels.flash_attn._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.flash_attn._shapes import FORWARD_ONLY, SYNTHETIC, label
+from triton.tlx.ops.kernels.flash_attn._shapes import FORWARD_ONLY, SYNTHETIC, label, qkv
 from triton.tlx.ops.kernels.flash_attn._shapes import flops as flops
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -27,11 +27,6 @@ DEFAULT_SPACE = "heuristic"
 #: speedup is unreadable without it: 1.4x over `math` is a broken benchmark,
 #: 1.4x over cuDNN is a result.
 EXTRA_COLUMNS = (("ref bknd", "ref_backend"), )
-
-#: One fresh-cache first call per direction, not per case: the cold pass
-#: compiles this op's whole autotune space, and "does a first call take too
-#: long" is not a per-shape question.
-COLD_COMPILE = "first"
 
 #: A full autotune on a cold cache is minutes, not seconds. The default 120s cap
 #: is calibrated for mm's heuristic path and would fail every case here on
@@ -65,6 +60,31 @@ def cases(synthetic: bool = False, suites=None) -> list[Case]:
         for entry in shapes(synthetic, suites)
         for direction in (("fwd", ) if entry in FORWARD_ONLY else DIRECTIONS)
     ]
+
+
+def ref_backend(case: Case) -> str:
+    """Which kernel `scaled_dot_product_attention` would pick for this case.
+
+    A capability probe in the dispatcher's own preference order, not a trace of
+    the call -- torch exposes no "which one did you just run".
+    """
+    from torch.backends.cuda import (SDPAParams, can_use_cudnn_attention, can_use_efficient_attention,
+                                     can_use_flash_attention)
+
+    Z, H, N_CTX, HEAD_DIM, causal = case.shape
+    q, k, v = qkv(Z, H, N_CTX, HEAD_DIM, getattr(torch, case.dtype), requires_grad=case.direction == "bwd")
+    params = SDPAParams(q, k, v, None, 0.0, causal, False)
+    for name, usable, enabled in (
+        ("cudnn", can_use_cudnn_attention, torch.backends.cuda.cudnn_sdp_enabled),
+        ("flash", can_use_flash_attention, torch.backends.cuda.flash_sdp_enabled),
+        ("efficient", can_use_efficient_attention, torch.backends.cuda.mem_efficient_sdp_enabled),
+    ):
+        try:
+            if enabled() and usable(params, False):
+                return name
+        except RuntimeError:  # a probe may reject the params outright
+            continue
+    return "math"
 
 
 supported, default_json, run, main = driver.bind(sys.modules[__name__])

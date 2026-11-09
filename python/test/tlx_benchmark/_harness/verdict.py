@@ -65,6 +65,9 @@ def judge(
     if max(tlx.cv, ref.cv if ref is not None else 0) > max_cv:
         result.status = Status.NOISY
         result.notes.append(f"provider CV over the {max_cv * 100:.0f}% limit; no perf verdict claimed")
+        # Slow and jittery is the shape most worth seeing; noisy alone does not fail the run.
+        if result.speedup is not None and result.speedup < MIN_SPEEDUP:
+            result.notes.append(f"speedup {result.speedup:.3f}x is also under the {MIN_SPEEDUP:g}x floor")
         return result
 
     if result.speedup is not None and result.speedup < MIN_SPEEDUP:

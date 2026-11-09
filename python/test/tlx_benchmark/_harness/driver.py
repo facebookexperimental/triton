@@ -349,9 +349,7 @@ COLD_COMPILE_MODES = ("all", "first", "none")
 
 
 def resolve_cold_compile(bench, mode: Optional[str]) -> str:
-    from .tritonbench import PROVIDERS
-
-    mode = mode or ("all" if bench.OP in PROVIDERS else getattr(bench, "COLD_COMPILE", "all"))
+    mode = mode or getattr(bench, "COLD_COMPILE", "all")
     if mode not in COLD_COMPILE_MODES:
         raise ValueError(f"cold_compile must be one of {COLD_COMPILE_MODES}, got {mode!r}")
     return mode
