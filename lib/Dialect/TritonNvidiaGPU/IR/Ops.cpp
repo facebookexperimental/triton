@@ -1689,8 +1689,25 @@ getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
   return reason;
 }
 
-// Allows an NPOT per-CTA tile only if the tcgen05 form is ISA-legal and the
-// instruction N divides the accumulator; NPOT M and K are not lowered yet.
+std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
+    Tcgen05Kind kind, bool aInTmem, bool bMNMajor, bool twoCTAs,
+    unsigned blockM, unsigned blockN, ArrayRef<int64_t> ctaShape, int64_t k) {
+  if (!llvm::isPowerOf2_64(k))
+    return std::string("NPOT MMAv5 K is not yet supported");
+  if (!llvm::isPowerOf2_64(ctaShape[0]))
+    return std::string("NPOT MMAv5 M is not yet supported");
+  unsigned n = std::min<unsigned>(blockN, ctaShape[1]);
+  if (auto reason = getTcgen05IllegalShapeReason(kind, aInTmem, bMNMajor,
+                                                 twoCTAs, blockM, n))
+    return ("NPOT MMAv5 shape " + Twine(blockM) + "x" + Twine(n) +
+            " is unsupported: " + *reason)
+        .str();
+  if (ctaShape[1] % n != 0)
+    return std::string("NPOT MMAv5 N that is not a multiple of the "
+                       "instruction N is not yet supported");
+  return std::nullopt;
+}
+
 // NPOT memdesc shapes only verify under TRITON_ALLOW_NPOT, so POT is untouched.
 static LogicalResult verifyNpotMMAv5Tile(Operation *op, Tcgen05Kind kind,
                                          MemDescType a, MemDescType b,
@@ -1701,27 +1718,17 @@ static LogicalResult verifyNpotMMAv5Tile(Operation *op, Tcgen05Kind kind,
   if (llvm::isPowerOf2_64(ctaShape[0]) && llvm::isPowerOf2_64(ctaShape[1]) &&
       llvm::isPowerOf2_64(k))
     return success();
-  if (!llvm::isPowerOf2_64(k))
-    return op->emitOpError("NPOT MMAv5 K is not yet supported");
-  if (!llvm::isPowerOf2_64(ctaShape[0]))
-    return op->emitOpError("NPOT MMAv5 M is not yet supported");
-  unsigned n = std::min<unsigned>(dEnc.getBlockN(), ctaShape[1]);
   auto bAttrs = getNvmmaSmemAttrs(b);
   bool twoCTAs = getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
-  if (auto reason = getTcgen05IllegalShapeReason(
+  if (auto reason = getNpotMMAv5TileUnsupportedReason(
           kind, isa<TensorMemoryEncodingAttr>(a.getEncoding()),
           /*bMNMajor=*/!bAttrs || !bAttrs->transposed, twoCTAs,
-          dEnc.getBlockM(), n))
-    return op->emitOpError("NPOT MMAv5 shape ")
-           << dEnc.getBlockM() << "x" << n << " is unsupported: " << *reason;
-  if (ctaShape[1] % n != 0)
-    return op->emitOpError("NPOT MMAv5 N that is not a multiple of the "
-                           "instruction N is not yet supported");
+          dEnc.getBlockM(), dEnc.getBlockN(), ctaShape, k))
+    return op->emitOpError(*reason);
   return success();
 }
 
-// The tcgen05 kind that issues an MMA on `t` operands.
-static std::optional<Tcgen05Kind> getTcgen05Kind(Type t) {
+std::optional<Tcgen05Kind> getTcgen05Kind(Type t) {
   auto kind = getMMAv5DTypeKindAndAcc(t);
   if (!kind)
     return std::nullopt;
