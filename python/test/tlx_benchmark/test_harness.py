@@ -1744,6 +1744,7 @@ def test_a_case_that_breaks_the_gpu_is_reported_once_and_ends_the_run(monkeypatc
 
 
 def test_migrated_artifact_keeps_throughput_units_and_p50_speedup():
+    pytest.importorskip("tritonbench.utils.tlx_l2", reason="needs the tritonbench installed by install_tritonbench.py")
     from tritonbench.components.do_bench import Latency
     from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
     from _harness.tritonbench import result
@@ -1760,6 +1761,7 @@ def test_migrated_artifact_keeps_throughput_units_and_p50_speedup():
 
 
 def test_raw_outlier_is_noisy_even_if_filtered_latency_is_steady():
+    pytest.importorskip("tritonbench.utils.tlx_l2", reason="needs the tritonbench installed by install_tritonbench.py")
     from tritonbench.components.do_bench import Latency
     from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
     from _harness.tritonbench import result
@@ -1774,6 +1776,7 @@ def test_raw_outlier_is_noisy_even_if_filtered_latency_is_steady():
 
 
 def test_latency_scaling_applies_to_raw_and_filtered_samples():
+    pytest.importorskip("tritonbench.utils.tlx_l2", reason="needs the tritonbench installed by install_tritonbench.py")
     from tritonbench.components.do_bench import Latency
 
     latency = Latency([1., 2., 3.], remove_outliers=False)
@@ -1807,6 +1810,7 @@ def test_dashboard_does_not_report_a_policy_change_as_a_regression(monkeypatch, 
 
 
 def test_latency_preserves_graph_timing_scope():
+    pytest.importorskip("tritonbench.utils.tlx_l2", reason="needs the tritonbench installed by install_tritonbench.py")
     from tritonbench.components.do_bench.gpu_events import _EventSamples
     from tritonbench.components.do_bench.run import Latency
     from tritonbench.utils.tlx_l2 import latency_stats
