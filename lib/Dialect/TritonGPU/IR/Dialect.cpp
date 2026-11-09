@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/OperationSupport.h"
@@ -69,6 +70,8 @@ bool hasPowerOfTwoBases(const LinearLayout &ll) {
 // one odd part, with no binary part.
 static bool hasSingleDigitMixedRadixBases(const LinearLayout &ll,
                                           StringAttr inDim) {
+  if (!ll.hasOddPartForm())
+    return false;
   for (int32_t digit = 0; digit < ll.getInDimSizeLog2(inDim); ++digit) {
     int32_t bits = 0;
     for (StringAttr outDim : ll.getOutDimNames())
@@ -584,6 +587,148 @@ SmallVector<int64_t> getShapePerCTA(Attribute layout, ArrayRef<int64_t> shape) {
   return getShapePerCTA(getCTASplitNum(layout), shape);
 }
 
+FailureOr<LinearLayout> getNpotDenseSharedLayout(Attribute layout,
+                                                 ArrayRef<int64_t> tile,
+                                                 std::string *reason) {
+  auto fail = [&](StringRef why) -> FailureOr<LinearLayout> {
+    if (reason)
+      *reason = why.str();
+    return failure();
+  };
+  auto nvmma = dyn_cast<NVMMASharedEncodingAttr>(layout);
+  auto swizzled = dyn_cast<SwizzledSharedEncodingAttr>(layout);
+  auto rotating = dyn_cast<AMDRotatingSharedEncodingAttr>(layout);
+  auto padded = dyn_cast<PaddedSharedEncodingAttr>(layout);
+  if (!nvmma && !swizzled && !rotating && !padded)
+    return fail("not an NVMMA, swizzled, rotating or padded shared encoding");
+  if (tile.size() != 2 || getNumCTAs(layout) != 1)
+    return fail("not a single-CTA rank-2 tile");
+  if (nvmma && nvmma.getFp4Padded())
+    return fail("padded FP4 tiles keep the pow2 cover");
+  MLIRContext *ctx = layout.getContext();
+  auto kOffset = StringAttr::get(ctx, "offset");
+  if (padded) {
+    // Padding is added after the layout, so an odd digit o of stride S adds
+    // o * S_pad exactly when S is a multiple of every interval.
+    const LinearLayout &ll = padded.getLinearComponent();
+    if (!llvm::equal(ll.getOutDimSizes(), tile) ||
+        ll.getTotalInDimSize() != product(tile))
+      return fail("the linear component does not map onto the tile");
+    int64_t stride = 1;
+    for (int32_t radix : ll.getInputRadices(kOffset)) {
+      if (radix != 2)
+        break;
+      stride *= 2;
+    }
+    if (stride != product(tile) &&
+        stride % *llvm::max_element(padded.getIntervals()) != 0)
+      return fail("an odd offset digit is not on a padding interval");
+    return ll;
+  }
+  SmallVector<unsigned> order =
+      getOrder(cast<SharedEncodingTrait>(layout), tile);
+  unsigned colDim = order[0], rowDim = order[1];
+  int64_t rows = tile[rowDim], cols = tile[colDim];
+  if (rows < 8)
+    return fail("fewer than 8 rows");
+  SmallVector<int64_t> cover = {int64_t(llvm::PowerOf2Ceil(tile[0])),
+                                int64_t(llvm::PowerOf2Ceil(tile[1]))};
+  auto kRow = StringAttr::get(ctx, "dim" + Twine(rowDim));
+  auto kCol = StringAttr::get(ctx, "dim" + Twine(colDim));
+  int64_t width = cover[colDim];
+  LinearLayout ll = LinearLayout::empty();
+  if (nvmma) {
+    unsigned bits = nvmma.getElementBitWidth();
+    unsigned swizzle = nvmma.getSwizzlingByteWidth();
+    auto block = getTMABlockShape(cover, bits, swizzle, /*fp4Padded=*/false,
+                                  nvmma.getTransposed(), /*packedSize=*/true,
+                                  /*emitError=*/nullptr, TMAMode::Tiled);
+    auto coverLayout = nvmmaSharedToLinearLayout(cover, nvmma, TMAMode::Tiled,
+                                                 /*disableSwizzle=*/false,
+                                                 /*emitErrors=*/false);
+    if (failed(block) || failed(coverLayout))
+      return fail("the pow2 cover has no NVMMA layout");
+    width = (*block)[colDim];
+    ll = *coverLayout;
+    // Each panel of NPOT rows starts on a swizzle atom.
+    if (!llvm::isPowerOf2_64(rows) && cols > width && rows % 8 != 0)
+      return fail("NPOT rows across panels are not a multiple of 8");
+    // Every panel and every pipeline stage must start on a swizzle atom.
+    if (rows * width * bits / 8 % (8 * std::max(16u, swizzle)) != 0)
+      return fail("the panel stride is not a multiple of the swizzle atom");
+  } else {
+    // A swizzle inside one pow2 panel lets the odd panels go outermost.
+    width = cols & -cols;
+    unsigned vec = swizzled ? swizzled.getVec() : rotating.getVec();
+    unsigned maxPhase =
+        swizzled ? swizzled.getMaxPhase() : rotating.getMaxPhase();
+    if (width != cols && vec * maxPhase > width)
+      return fail("the swizzle is wider than the pow2 part of the "
+                  "contiguous dim");
+    SmallVector<int64_t> panel(cover);
+    panel[colDim] = width;
+    ll = swizzled ? swizzled.toLinearLayout(panel)
+                  : rotating.toLinearLayout(panel);
+    ll *= LinearLayout::identity1D(cover[colDim] / width, kOffset, kCol);
+  }
+  if (cols % width != 0)
+    return fail("the contiguous dim is not a whole number of panels");
+  int64_t rowGroup = rows & -rows;
+  // The cover is dense on the tile when its offsets run over a rowGroup x
+  // width box, then over whole row groups, then over whole panels.
+  int boxBits = llvm::Log2_64(rowGroup * width);
+  int rowBits = llvm::Log2_64(cover[rowDim] / rowGroup);
+  int panelBits = llvm::Log2_64(cover[colDim] / width);
+  bool dense = ll.getInDimSizeLog2(kOffset) == boxBits + rowBits + panelBits;
+  for (int i = 0; dense && i < ll.getInDimSizeLog2(kOffset); ++i) {
+    int64_t row = ll.getBasis(kOffset, i, kRow);
+    int64_t col = ll.getBasis(kOffset, i, kCol);
+    if (i < boxBits)
+      dense = row < rowGroup && col < width;
+    else if (i < boxBits + rowBits)
+      dense = row == rowGroup << (i - boxBits) && col < width;
+    else
+      dense = row == 0 && col == width << (i - boxBits - rowBits);
+  }
+  if (!dense)
+    return fail("the pow2 layout does not keep rows and panels outermost");
+  int64_t panels = cols / width, panelGroup = panels & -panels;
+  if (rowGroup == rows || panels == 1)
+    return ll;
+  // NPOT rows across panels keep the cover's box, swizzle included. The rows
+  // above it and the panels become digits, so panel p starts at p*rows*width,
+  // and those rows must not swizzle.
+  for (int i = boxBits; i < boxBits + rowBits; ++i)
+    if (ll.getBasis(kOffset, i, kCol) != 0)
+      return fail("the swizzle period exceeds the NPOT row group");
+  LinearLayout::BasesT bases;
+  LinearLayout::RadicesT radices;
+  auto &offsets = bases[kOffset];
+  auto &offsetRadices = radices[kOffset];
+  auto addDigit = [&](int32_t radix, int32_t row, int32_t col) {
+    std::vector<int32_t> basis(2);
+    basis[ll.getOutDimIndex(kRow)] = row;
+    basis[ll.getOutDimIndex(kCol)] = col;
+    offsets.push_back(basis);
+    offsetRadices.push_back(radix);
+  };
+  for (int i = 0; i < boxBits; ++i)
+    addDigit(2, ll.getBasis(kOffset, i, kRow), ll.getBasis(kOffset, i, kCol));
+  addDigit(rows / rowGroup, rowGroup, 0);
+  for (int64_t panel = 1; panel < panelGroup; panel *= 2)
+    addDigit(2, 0, width * panel);
+  if (panels != panelGroup)
+    addDigit(panels / panelGroup, 0, width * panelGroup);
+  auto kBlock = StringAttr::get(ctx, "block");
+  bases[kBlock] = {};
+  radices[kBlock] = {};
+  SmallVector<std::pair<StringAttr, int32_t>> outDims;
+  for (StringAttr dim : ll.getOutDimNames())
+    outDims.push_back({dim, dim == kRow ? rows : cols});
+  return LinearLayout(std::move(bases), std::move(radices), outDims,
+                      /*requireSurjective=*/true);
+}
+
 SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
                                               ArrayRef<int64_t> shapeLogical) {
   SmallVector<int64_t> shape(shapeLogical);
@@ -602,12 +747,18 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
   // Flag off keeps upstream's allocation size (no pow2 rounding).
   static const bool allowNpot = mlir::triton::tools::isNpotAllowed();
   if (allowNpot &&
-      (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout))) {
+      (sharedMMALayout ||
+       isa<SwizzledSharedEncodingAttr, AMDRotatingSharedEncodingAttr,
+           PaddedSharedEncodingAttr>(layout))) {
     unsigned tileRank = getCGALayout(layout).getRank();
     size_t firstTileDim = shape.size() > tileRank ? shape.size() - tileRank : 0;
-    for (size_t i = firstTileDim; i < shape.size(); ++i) {
-      if (!llvm::isPowerOf2_64(shape[i]))
-        shape[i] = llvm::NextPowerOf2(shape[i]);
+    auto tile = ArrayRef(shape).drop_front(firstTileDim);
+    if (llvm::all_of(tile, llvm::isPowerOf2_64) ||
+        failed(getNpotDenseSharedLayout(layout, tile))) {
+      for (size_t i = firstTileDim; i < shape.size(); ++i) {
+        if (!llvm::isPowerOf2_64(shape[i]))
+          shape[i] = llvm::NextPowerOf2(shape[i]);
+      }
     }
   }
   return getShapePerCTA(layout, shape);
@@ -730,7 +881,8 @@ bool holdsNpotPow2AllocShape(Attribute encoding, ArrayRef<int64_t> allocShape) {
   auto tile = dropPipeliningDim(allocShape, encoding);
   SmallVector<int64_t> pow2Shape(allocShape);
   llvm::copy(getNpotPow2AllocShape(tile), pow2Shape.end() - tile.size());
-  if (llvm::equal(pow2Shape, allocShape))
+  if (llvm::equal(pow2Shape, allocShape) ||
+      succeeded(getNpotDenseSharedLayout(encoding, tile)))
     return true;
   // An NVMMA pow2 alloc shape smaller than its TMA block or core tile has no
   // layout.
@@ -1014,6 +1166,52 @@ unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
   while (vector > 1 && registers(vector, order) > allowed)
     vector /= 2;
   return vector;
+}
+
+int32_t getMixedRadixSharedRun(const LinearLayout &regLayout,
+                               const LinearLayout &toOffset,
+                               unsigned bitwidth) {
+  // A general offset table has no per-digit binary part to vectorise.
+  if (!regLayout.hasOddPartForm())
+    return 1;
+  MLIRContext *ctx = (*regLayout.getInDimNames().begin()).getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  auto kOffset = StringAttr::get(ctx, "offset");
+  auto offsetOf = [&](ArrayRef<int32_t> coords) {
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    for (auto [dim, coord] : llvm::zip(regLayout.getOutDimNames(), coords))
+      ins.push_back({dim, coord});
+    return std::vector<int32_t>{toOffset.apply(ins)[0].second};
+  };
+  // Odd digits add, so vectorise the pow2 map from the leading radix-2
+  // register digits, and from every other binary part and odd-part bit (which
+  // must keep a vector aligned), to offsets.
+  std::vector<std::vector<int32_t>> leading, rest;
+  int32_t numLeading = regLayout.getNumLeadingRadix2Digits(kReg);
+  for (int32_t pos = 0; pos < numLeading; ++pos)
+    leading.push_back(offsetOf(regLayout.getBasis(kReg, pos)));
+  for (StringAttr inDim : regLayout.getInDimNames())
+    for (int32_t pos = inDim == kReg ? numLeading : 0;
+         pos < static_cast<int32_t>(regLayout.getInputRadices(inDim).size());
+         ++pos) {
+      SmallVector<int32_t> binary;
+      for (StringAttr outDim : regLayout.getOutDimNames())
+        binary.push_back(
+            regLayout.getBasisContribution(inDim, pos, outDim).binary);
+      rest.push_back(offsetOf(binary));
+    }
+  for (auto [i, size] : llvm::enumerate(regLayout.getOutDimSizes()))
+    for (int32_t bit = LinearLayout::twoPartOf(size); bit < size; bit *= 2) {
+      SmallVector<int32_t> coords(regLayout.getNumOutDims(), 0);
+      coords[i] = bit;
+      rest.push_back(offsetOf(coords));
+    }
+  // A dense allocation has an NPOT offset size; the run map only needs a pow2
+  // range covering it.
+  int32_t offsetSize = llvm::PowerOf2Ceil(toOffset.getOutDimSize(kOffset));
+  LinearLayout cvt({{kReg, leading}, {StringAttr::get(ctx, "rest"), rest}},
+                   {{kOffset, offsetSize}}, /*requireSurjective=*/false);
+  return largestVectorisation(ctx, cvt, bitwidth, 128 / bitwidth).first;
 }
 
 static LogicalResult tryJoinOnAxis(MLIRContext *ctx, const LinearLayout &inLl,
@@ -1665,6 +1863,10 @@ triton::gpu::maybeLinearToCGAEncodingAttr(const LinearLayout &layout) {
   auto kBlock = StringAttr::get(ctx, "block");
   assert(llvm::is_contained(inDims, kBlock) &&
          "layout must have a 'block' dim");
+  // A mixed-radix layout's odd digits don't factor; over one CTA its CGA layout
+  // is trivial.
+  if (!layout.isRadix2() && layout.getInDimSize(kBlock) == 1)
+    return CGAEncodingAttr::get1CTALayout(ctx, layout.getNumOutDims());
 
   auto cgaLogicalShape =
       basesPerDimImpl(layout.getBases(), kBlock, layout.getNumOutDims());
@@ -4546,10 +4748,20 @@ getExactNpotLayout(RankedTensorType type,
   return ll;
 }
 
-static bool hasExactNpotLayout(RankedTensorType type) {
+bool triton::gpu::hasExactNpotLayout(RankedTensorType type) {
   return llvm::any_of(type.getShape(),
                       [](int64_t d) { return !llvm::isPowerOf2_64(d); }) &&
          succeeded(getExactNpotLayout(type));
+}
+
+FailureOr<LinearLayout>
+mlir::triton::gpu::getExactNpotOperandLayout(Operation *op) {
+  for (Type type : op->getOperandTypes())
+    if (auto tensorTy = dyn_cast<RankedTensorType>(type))
+      if (FailureOr<LinearLayout> ll = getExactNpotLayout(tensorTy);
+          succeeded(ll))
+        return ll;
+  return failure();
 }
 
 struct TritonGPUVerifyTensorLayoutInterface
@@ -5110,15 +5322,35 @@ template <typename... OpTs> static bool isAnyOf(OperationName name) {
   return ((name.getTypeID() == TypeID::get<OpTs>()) || ...);
 }
 
-bool triton::gpu::isMixedRadixLayoutOp(Operation *op) {
-  // Upstream ops: a constant lowers per element, control flow forwards values,
-  // and a conversion cast only retypes one.
-  return op->hasTrait<OpTrait::Elementwise>() ||
-         op->hasTrait<OpTrait::MixedRadixLayoutTrait>() ||
-         isa<triton::MixedRadixLayoutOpInterface>(op) ||
+bool triton::gpu::isMixedRadixLayoutOp(OperationName op) {
+  // Upstream ops: constants and poison lower per element, control flow
+  // forwards values, a conversion cast only retypes one.
+  return op.hasTrait<OpTrait::Elementwise>() ||
+         op.hasTrait<OpTrait::MixedRadixLayoutTrait>() ||
+         op.hasInterface<triton::MixedRadixLayoutOpInterface>() ||
          isAnyOf<arith::ConstantOp, scf::ForOp, scf::IfOp, scf::WhileOp,
                  scf::YieldOp, scf::ConditionOp, cf::BranchOp, cf::CondBranchOp,
-                 UnrealizedConversionCastOp>(op->getName());
+                 ub::PoisonOp, UnrealizedConversionCastOp>(op);
+}
+
+std::optional<std::string>
+triton::gpu::getNpotLayoutUnsupportedReason(OperationName name,
+                                            TypeRange types) {
+  for (Type type : types) {
+    auto tensorTy = dyn_cast<RankedTensorType>(type);
+    FailureOr<LinearLayout> ll = failure();
+    if (tensorTy)
+      ll = getExactNpotLayout(tensorTy);
+    if (failed(ll))
+      continue;
+    if (!isMixedRadixLayoutOp(name))
+      return "NPOT mixed-radix layout is not yet supported on " +
+             name.getStringRef().str();
+    if (!hasMixedRadixConversionInputDims(*ll))
+      return std::string(
+          "NPOT mixed-radix layout across CTAs is not yet supported");
+  }
+  return std::nullopt;
 }
 
 // Checks every exact mixed-radix value `op` uses or defines. A convert is
@@ -5143,27 +5375,19 @@ static LogicalResult verifyExactNpotLayouts(Operation *op) {
   for (Region &region : op->getRegions())
     if (!region.empty())
       llvm::append_range(types, region.front().getArgumentTypes());
-  for (Type type : types) {
-    auto tensorTy = dyn_cast<RankedTensorType>(type);
-    FailureOr<LinearLayout> ll = failure();
-    if (tensorTy)
-      ll = getExactNpotLayout(tensorTy);
-    if (failed(ll) || isa<ConvertLayoutOp>(op))
-      continue;
-    if (!isMixedRadixLayoutOp(op))
-      return op->emitError("NPOT mixed-radix layout is not yet supported on ")
-             << op->getName();
-    if (!hasMixedRadixConversionInputDims(*ll))
-      return op->emitError(
-          "NPOT mixed-radix layout across CTAs is not yet supported");
-  }
+  if (!isa<ConvertLayoutOp>(op))
+    if (std::optional<std::string> reason =
+            getNpotLayoutUnsupportedReason(op->getName(), types))
+      return op->emitError(*reason);
+  // A mixed-radix op's NPOT dim may be only on its result.
   auto mixedRadix = dyn_cast<triton::MixedRadixLayoutOpInterface>(op);
-  auto srcTy = mixedRadix && op->getNumOperands()
-                   ? dyn_cast<RankedTensorType>(op->getOperand(0).getType())
-                   : nullptr;
   FailureOr<LinearLayout> ll = failure();
-  if (srcTy)
-    ll = getExactNpotLayout(srcTy);
+  for (Type type :
+       ArrayRef(types).take_front(op->getNumOperands() + op->getNumResults())) {
+    auto srcTy = mixedRadix ? dyn_cast<RankedTensorType>(type) : nullptr;
+    if (srcTy && succeeded(ll = getExactNpotLayout(srcTy)))
+      break;
+  }
   if (succeeded(ll))
     if (std::optional<std::string> reason =
             mixedRadix.getMixedRadixUnsupportedReason(*ll))

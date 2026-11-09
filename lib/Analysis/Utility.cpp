@@ -532,6 +532,44 @@ ColumnAction ReduceOpHelper::moveAxisBasesToFront(const LinearLayout &layout,
                       layout.getInputRadices(kReg));
 }
 
+// The scan indexes registers as a blocked layout does: elements, then blocks,
+// each in `order`. Map each blocked index to its mixed-radix source register,
+// or return empty if ScanOp::getBlockedTile rejects the layout.
+static SmallVector<unsigned> computeBlockedToSrc(LinearEncodingAttr encoding,
+                                                 ArrayRef<int64_t> shape,
+                                                 ArrayRef<unsigned> order) {
+  const LinearLayout &ll = encoding.getLinearLayout();
+  std::optional<SmallVector<unsigned>> tile = ScanOp::getBlockedTile(ll);
+  if (!tile)
+    return {};
+  auto kReg = StringAttr::get(encoding.getContext(), "register");
+  SmallVector<unsigned> contig = encoding.getContigPerThread();
+  unsigned numElems = product(contig);
+  unsigned numRegs = ll.getInDimSize(kReg);
+  SmallVector<unsigned> blockedToSrc(numRegs, numRegs);
+  for (unsigned reg = 0; reg < numRegs; ++reg) {
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    for (StringAttr inDim : ll.getInDimNames())
+      ins.push_back({inDim, inDim == kReg ? reg : 0});
+    auto coords = ll.apply(ins);
+    unsigned elem = 0, block = 0, elemStride = 1, blockStride = 1;
+    for (unsigned dim : order) {
+      unsigned coord = coords[dim].second, extent = (*tile)[dim];
+      if (coord % extent >= contig[dim])
+        return {};
+      elem += coord % extent * elemStride;
+      block += coord / extent * blockStride;
+      elemStride *= contig[dim];
+      blockStride *= ceil<unsigned>(shape[dim], extent);
+    }
+    unsigned index = elem + numElems * block;
+    if (index >= numRegs || blockedToSrc[index] != numRegs)
+      return {};
+    blockedToSrc[index] = reg;
+  }
+  return blockedToSrc;
+}
+
 ScanLoweringHelper::ScanLoweringHelper(triton::ScanOp op) : scanOp(op) {
   auto firstTy = cast<RankedTensorType>(op.getOperands()[0].getType());
   srcShape = firstTy.getShape();
@@ -555,6 +593,8 @@ ScanLoweringHelper::ScanLoweringHelper(triton::ScanOp op) : scanOp(op) {
   } else {
     order = srcEncoding.getOrder();
   }
+  if (srcEncoding.getLinearLayout().hasNonPow2OutDim())
+    blockedToSrc = computeBlockedToSrc(srcEncoding, srcShape, order);
 
   for (const auto &t : op.getInputTypes()) {
     if (t.getShape() != srcShape) {
@@ -628,7 +668,7 @@ unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
 bool ScanLoweringHelper::isSupported() {
   // TODO: Support the following cases:
   // 1. Scan on non-blocking encodings
-  if (!isa<BlockedEncodingAttr>(legacyEncoding))
+  if (!isa<BlockedEncodingAttr>(legacyEncoding) && blockedToSrc.empty())
     return false;
   return true;
 }
@@ -939,6 +979,8 @@ MixedRadixConversionPlan MixedRadixConversionPlan::factored(
 // Like the pow2 reps, it keeps the leading digits that vectorize `outDim`.
 static int32_t findTileDigit(const LinearLayout &layout, StringAttr outDim,
                              int32_t bit) {
+  if (!layout.hasOddPartForm())
+    return -1;
   bool odd = bit == 0;
   int32_t size = layout.getOutDimSize(outDim);
   int32_t twoPart = LinearLayout::twoPartOf(size);
@@ -1071,6 +1113,40 @@ getMixedRadixSharedTiles(const LinearLayout &src, const LinearLayout &dst) {
       return std::nullopt;
   if (tiles.sourceDigits.empty() || !tiles.sourceTile.isRadix2() ||
       !tiles.destinationTile.isRadix2())
+    return std::nullopt;
+  return tiles;
+}
+
+int32_t getMixedRadixSharedRunLength(const LinearLayout &layout, int32_t dim,
+                                     unsigned bitwidth) {
+  auto kOffset =
+      StringAttr::get(layout.getInDimNames().begin()->getContext(), "offset");
+  auto toOffset = LinearLayout::empty();
+  for (auto [i, outDim] : llvm::enumerate(layout.getOutDimNames())) {
+    int32_t size = llvm::PowerOf2Ceil(layout.getOutDimSize(outDim));
+    toOffset *= static_cast<int32_t>(i) == dim
+                    ? LinearLayout::identity1D(size, outDim, kOffset)
+                    : LinearLayout::zeros1D(size, outDim, kOffset);
+  }
+  return getMixedRadixSharedRun(layout, toOffset, bitwidth);
+}
+
+std::optional<MixedRadixSharedTiling>
+getMixedRadixTransposeTiles(const LinearLayout &src, const LinearLayout &dst,
+                            unsigned bitwidth) {
+  auto tiles = getMixedRadixSharedTiles(src, dst);
+  if (!tiles)
+    return std::nullopt;
+  bool srcVector = false, dstVector = false;
+  for (int32_t dim = 0; dim < src.getNumOutDims(); ++dim) {
+    int32_t srcRun = getMixedRadixSharedRunLength(src, dim, bitwidth);
+    int32_t dstRun = getMixedRadixSharedRunLength(dst, dim, bitwidth);
+    if (srcRun > 1 && dstRun > 1)
+      return std::nullopt;
+    srcVector |= srcRun > 1;
+    dstVector |= dstRun > 1;
+  }
+  if (!srcVector || !dstVector)
     return std::nullopt;
   return tiles;
 }

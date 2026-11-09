@@ -505,6 +505,19 @@ static LogicalResult reconcileEncodingUniformOps(ModuleOp mod, bool &changed) {
   if (traitConflict)
     return failure();
 
+  SmallVector<triton::amdgpu::ConcatOp> concats;
+  mod.walk([&](triton::amdgpu::ConcatOp op) { concats.push_back(op); });
+  for (auto op : concats) {
+    if (op.getSources().empty() || op.getType().getEncoding())
+      continue;
+    auto sourceTy = cast<RankedTensorType>(op.getSources().front().getType());
+    if (!isa_and_nonnull<ttg::DistributedEncodingTrait>(sourceTy.getEncoding()))
+      continue;
+    op.getResult().setType(
+        op.getType().cloneWithEncoding(sourceTy.getEncoding()));
+    changed = true;
+  }
+
   // A constant-scale FP8 downcast is elementwise: its input and result share
   // one encoding. The op carries no same-encoding trait because a scale
   // operand, when present, has its own compact layout.
@@ -1545,16 +1558,17 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
           return;
         }
       }
-      // tt.call to a @triton.jit helper carrying a pinned placeholder argument.
-      // Specialize the encoding-stripped callee signature, then let the
-      // fixpoint re-infer its body and synchronize its return/call result
-      // types. The original pin remains authoritative across the function
-      // boundary.
+      // tt.call to a @triton.jit helper carrying a pinned placeholder or a
+      // concrete require_layout anchor. Specialize the encoding-stripped
+      // callee signature, then let the fixpoint re-infer its body and
+      // synchronize its return/call result types. The original pin remains
+      // authoritative across the function boundary.
       if (auto callOp = dyn_cast<::mlir::triton::CallOp>(op)) {
         Attribute enc;
         for (Value a : callOp.getOperands())
           if (auto t = dyn_cast<RankedTensorType>(a.getType()))
-            if (isPlaceholderEncoding(t.getEncoding())) {
+            if (isPlaceholderEncoding(t.getEncoding()) ||
+                concreteLayoutAnchors.contains(a)) {
               enc = t.getEncoding();
               break;
             }
@@ -1586,9 +1600,11 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
             callee.getFunctionType().getInputs().end());
         bool inputsChanged = false;
         for (unsigned i = 0; i < callOp.getNumOperands(); ++i) {
-          Type at = callOp.getOperand(i).getType();
+          Value operand = callOp.getOperand(i);
+          Type at = operand.getType();
           auto rt = dyn_cast<RankedTensorType>(at);
-          if (!rt || !isPlaceholderEncoding(rt.getEncoding()))
+          if (!rt || (!isPlaceholderEncoding(rt.getEncoding()) &&
+                      !concreteLayoutAnchors.contains(operand)))
             continue;
           if (i < newInputs.size() && newInputs[i] != at) {
             newInputs[i] = at;
