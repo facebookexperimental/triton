@@ -20,11 +20,13 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/FormatVariadic.h"
 
 namespace mlir {
 namespace triton {
@@ -40,9 +42,9 @@ static bool isUnsupportedMMAv5Int8Dot(int computeCapability, DotOp op) {
   return aElemTy.isInteger(8) && bElemTy.isInteger(8);
 }
 
-// Get the highest version supported for the hardware and the dot.
-static int getMMAVersionSafe(int computeCapability, DotOp op) {
-  // List supported mma version in order of preference.
+// List supported mma version in order of preference.
+static SmallVector<int> getMMAVersionsSupported(int computeCapability,
+                                                DotOp op) {
   SmallVector<int> versionsSupported;
   if (computeCapability < 75) {
     versionsSupported = {1};
@@ -62,7 +64,12 @@ static int getMMAVersionSafe(int computeCapability, DotOp op) {
   } else {
     assert(false && "computeCapability not supported");
   }
-  for (int baseVersion : versionsSupported) {
+  return versionsSupported;
+}
+
+// Get the highest version supported for the hardware and the dot.
+static int getMMAVersionSafe(int computeCapability, DotOp op) {
+  for (int baseVersion : getMMAVersionsSupported(computeCapability, op)) {
     if (supportMMA(op, baseVersion))
       return baseVersion;
     if (baseVersion == 3) {
@@ -133,6 +140,8 @@ warpsPerTileV3(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
         return isa<mlir::triton::DotOpInterface>(op);
       }) != slices.end())
     return {(unsigned)numWarps, 1};
+  if (hasMmaV3WarpgroupsOnN(shape, numWarps))
+    return {4, (unsigned)numWarps / 4};
 
   // For MMAv3, the smallest indivisible unit of warp shape is (4, 1).
   SmallVector<unsigned, 2> ret = {4, 1};
@@ -198,6 +207,33 @@ getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
                                   newLayout, SharedMemorySpace);
   rewriter.setInsertionPointAfterValue(arg);
   return LocalAllocOp::create(rewriter, arg.getLoc(), newType, arg);
+}
+
+static std::optional<nvidia_gpu::NvmmaSmemAttrs>
+getMmaV3BSmemAttrs(RankedTensorType bTy, ArrayRef<unsigned> order,
+                   CGAEncodingAttr cga) {
+  MLIRContext *ctx = bTy.getContext();
+  auto enc = NVMMASharedEncodingAttr::get(ctx, bTy.getShape(), order, cga,
+                                          bTy.getElementType(),
+                                          /*fp4Padded=*/false);
+  auto memTy = MemDescType::get(bTy.getShape(), bTy.getElementType(), enc,
+                                SharedMemorySpaceAttr::get(ctx));
+  return nvidia_gpu::getMmaOperandSmemAttrs(memTy);
+}
+
+// An NPOT N takes the largest n whose tiles of B the descriptor can address.
+static SmallVector<unsigned, 3>
+getMmaV3InstrShape(ArrayRef<int64_t> shape, Type elemTy, RankedTensorType bTy,
+                   std::optional<nvidia_gpu::NvmmaSmemAttrs> attrs,
+                   int numWarps) {
+  auto isLegalN = [&](unsigned n) {
+    return nvidia_gpu::isMmaV3BTilingLegal(*attrs, bTy.getElementTypeBitWidth(),
+                                           n, shape[1]);
+  };
+  function_ref<bool(unsigned)> filter;
+  if (attrs && !llvm::isPowerOf2_64(shape[1]))
+    filter = isLegalN;
+  return mmaVersionToInstrShape(3, shape, elemTy, numWarps, filter);
 }
 
 static bool isTmemCopyCompatibleScale(RankedTensorType argType,
@@ -457,8 +493,25 @@ static MMAEncodingResult createMMAEncodingForDot(DotOpInterface dotOp,
 
   auto CGALayout = getCGALayout(oldRetType.getEncoding());
   auto retShapePerCTA = getShapePerCTA(oldRetType);
-  auto instrShape = mmaVersionToInstrShape(versionMajor, retShapePerCTA,
-                                           oldAType.getElementType(), numWarps);
+  SmallVector<unsigned, 3> instrShape;
+  if (versionMajor == 3 && !llvm::isPowerOf2_64(retShapePerCTA[1])) {
+    // B's alloc, as getSharedMemoryMMAOperand will make it.
+    Value b = dotOp.getB();
+    while (auto cvtOp = b.getDefiningOp<ConvertLayoutOp>())
+      b = cvtOp.getSrc();
+    auto bTy = cast<RankedTensorType>(b.getType());
+    Type elemTy = oldAType.getElementType();
+    SmallVector<unsigned> order = getOrderForMemory(bTy);
+    if (!elemTy.isF16() && !elemTy.isBF16())
+      order = {0, 1};
+    instrShape = getMmaV3InstrShape(
+        retShapePerCTA, elemTy, bTy,
+        getMmaV3BSmemAttrs(bTy, order, getCGALayout(bTy.getEncoding())),
+        numWarps);
+  } else {
+    instrShape = mmaVersionToInstrShape(versionMajor, retShapePerCTA,
+                                        oldAType.getElementType(), numWarps);
+  }
   auto warpsPerTile = getWarpsPerTile(dotOp, retShapePerCTA, versionMajor,
                                       numWarps, instrShape);
 
@@ -1266,13 +1319,72 @@ public:
 };
 
 namespace {
+// Why BlockedToMMA can't issue `dot` exactly on wgmma, or std::nullopt. Its
+// warps must sit on each dim's power-of-two part, as the mixed-radix layout
+// puts them; then exact issues no more atoms per warp than padded.
+std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
+  if (!llvm::isPowerOf2_64(dot.getA().getType().getShape().back()))
+    return std::string("NPOT K is not yet supported on wgmma");
+  ArrayRef<int64_t> shape = dot.getType().getShape();
+  // B's order isn't known yet: take the N-major order of a row-major load
+  // unless the dtype forces K-major.
+  RankedTensorType bTy = dot.getB().getType();
+  Type elemTy = dot.getA().getType().getElementType();
+  unsigned fast = elemTy.isF16() || elemTy.isBF16() ? 1 : 0;
+  std::optional<nvidia_gpu::NvmmaSmemAttrs> attrs = getMmaV3BSmemAttrs(
+      bTy, {fast, 1 - fast},
+      CGAEncodingAttr::get1CTALayout(dot.getContext(), bTy.getRank()));
+  auto instrShape = getMmaV3InstrShape(shape, elemTy, bTy, attrs, numWarps);
+  SmallVector<unsigned> warps =
+      to_vector(warpsPerTileV3(dot, shape, numWarps, instrShape));
+  if (!llvm::isPowerOf2_32(instrShape[1]) &&
+      !isMmaV3NpotNLegal(warps, instrShape))
+    return llvm::formatv(
+               "NPOT wgmma N {0} is not yet supported with {1} warpgroups on N",
+               instrShape[1], warps[1])
+        .str();
+  for (auto [dim, size] : llvm::enumerate(shape)) {
+    int64_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(size));
+    if (twoPart % (warps[dim] * LinearLayout::twoPartOf(instrShape[dim])) != 0)
+      return llvm::formatv("NPOT dot is not yet supported with {0} warps of "
+                           "{1} on dim {2}, whose power-of-two part is {3}",
+                           warps[dim], instrShape[dim], dim, twoPart)
+          .str();
+  }
+  // Ask the lowering's descriptor match about the B memdesc BlockedToMMA
+  // allocs.
+  if (!attrs)
+    return llvm::formatv("NPOT wgmma N {0} is not yet supported: B's shared "
+                         "layout has no core-matrix form",
+                         shape[1])
+        .str();
+  if (!nvidia_gpu::isMmaV3BTilingLegal(*attrs, bTy.getElementTypeBitWidth(),
+                                       instrShape[1], shape[1]))
+    return llvm::formatv("NPOT wgmma N {0} is not yet supported: an n{1} tile "
+                         "of B starts inside a swizzle pattern",
+                         shape[1], instrShape[1])
+        .str();
+  return std::nullopt;
+}
+
 struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   using NpotTargetLegality::NpotTargetLegality;
   StringRef getTargetPrefix() const override { return "cuda"; }
-  std::optional<std::string> getDotUnsupportedReason(Operation *,
-                                                     const LinearLayout &,
-                                                     StringRef target,
-                                                     int) const override {
+  std::optional<std::string>
+  getDotUnsupportedReason(Operation *op, const LinearLayout &, StringRef target,
+                          int numWarps) const override {
+    // Exact only where BlockedToMMA picks wgmma; f64 takes FMA on some
+    // targets.
+    auto dot = dyn_cast<DotOp>(op);
+    int computeCapability = 0;
+    target.split(':').second.getAsInteger(10, computeCapability);
+    if (dot && computeCapability >= 80 &&
+        !dot.getA().getType().getElementType().isF64()) {
+      SmallVector<int> versions =
+          getMMAVersionsSupported(computeCapability, dot);
+      if (versions == SmallVector<int>{3, 2} && supportMMA(dot, 3, numWarps))
+        return getMmaUnsupportedReason(dot, numWarps);
+    }
     return ("NPOT dot is not yet supported on " + target).str();
   }
   std::optional<std::string>

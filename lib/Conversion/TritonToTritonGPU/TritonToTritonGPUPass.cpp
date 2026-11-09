@@ -182,16 +182,16 @@ struct TritonExpandDimsPattern
     Attribute _argEncoding = argType.getEncoding();
     if (!_argEncoding)
       return failure();
-    // A Product result keeps the converter's layout and the operand takes its
-    // slice, as below.
-    auto productTy =
+    // A mixed-radix result keeps the converter's layout and the operand takes
+    // its slice, as below.
+    auto mixedRadixTy =
         cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
-    if (!triton::gpu::isRadix2Encoding(productTy.getEncoding())) {
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
       auto sliceTy =
           argType.cloneWithEncoding(triton::gpu::SliceEncodingAttr::get(
               getContext(), op.getAxis(),
               cast<triton::gpu::DistributedEncodingTrait>(
-                  productTy.getEncoding())));
+                  mixedRadixTy.getEncoding())));
       auto src = triton::gpu::ConvertLayoutOp::create(
           rewriter, op.getLoc(), sliceTy, adaptor.getSrc());
       addNamedAttrs(rewriter.replaceOpWithNewOp<triton::ExpandDimsOp>(
@@ -253,6 +253,21 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
     RankedTensorType origType = op.getType();
     auto origShape = origType.getShape();
     auto typeConverter = getTypeConverter<TritonGPUTypeConverter>();
+    // A mixed-radix result keeps the converter's layout and its operands keep
+    // theirs: only an MMA has an NPOT operand layout, and accelerate-matmul
+    // picks it.
+    auto mixedRadixTy =
+        cast<RankedTensorType>(typeConverter->convertType(origType));
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
+      Value c = triton::gpu::ConvertLayoutOp::create(
+          rewriter, op.getLoc(), mixedRadixTy, adaptor.getC());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
+                        op, mixedRadixTy, adaptor.getA(), adaptor.getB(), c,
+                        adaptor.getInputPrecision(),
+                        adaptor.getMaxNumImpreciseAcc(), op.getTwoCtas()),
+                    adaptor.getAttributes());
+      return success();
+    }
     int numWarps = typeConverter->getNumWarps();
     int threadsPerWarp = typeConverter->getThreadsPerWarp();
     int numCTAs = typeConverter->getNumCTAs();
@@ -424,16 +439,18 @@ struct TritonBroadcastPattern
     auto srcEncoding = srcType.getEncoding();
     if (!srcEncoding)
       return failure();
-    // A Product result takes the converter's layout, and so does the operand.
-    auto productTy =
+    // A mixed-radix result takes the converter's layout, and so does the
+    // operand.
+    auto mixedRadixTy =
         cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
-    if (!triton::gpu::isRadix2Encoding(productTy.getEncoding())) {
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
       auto src = triton::gpu::ConvertLayoutOp::create(
           rewriter, op.getLoc(),
-          srcType.cloneWithEncoding(productTy.getEncoding()), adaptor.getSrc());
-      addNamedAttrs(
-          rewriter.replaceOpWithNewOp<triton::BroadcastOp>(op, productTy, src),
-          adaptor.getAttributes());
+          srcType.cloneWithEncoding(mixedRadixTy.getEncoding()),
+          adaptor.getSrc());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, mixedRadixTy, src),
+                    adaptor.getAttributes());
       return success();
     }
     auto origResultType = cast<RankedTensorType>(op.getType());
