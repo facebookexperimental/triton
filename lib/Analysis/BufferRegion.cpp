@@ -70,10 +70,22 @@ uint64_t getAllocationOffset(ttng::TMEMAllocOp op) {
   return colOffset | (rowOffset << 16);
 }
 
-// An NPOT view is the leading box of its power-of-two cover: each NPOT extent
-// takes ceil(log2) bits of the inverse. Flag off, the cover is the shape.
+// An NPOT view is the leading box of its pow2 alloc shape: each NPOT extent
+// takes ceil(log2) bits of the inverse. Flag off, the pow2 alloc shape is the
+// shape.
 bool hasNpotLayoutExtent(ArrayRef<int64_t> layoutShape) {
   return !llvm::equal(ttg::getNpotPow2AllocShape(layoutShape), layoutShape);
+}
+
+// Flag on, the allocator places an NPOT tile on the pow2 alloc shape that its
+// layout is built on, so the tile's views have exact regions.
+bool isNpotPow2Allocation(ttg::MemDescType ty) {
+  auto tile = ttg::dropPipeliningDim(ty.getAllocShape(), ty.getEncoding());
+  SmallVector<int64_t> physical =
+      ttg::getAllocationShapePerCTA(ty.getEncoding(), tile);
+  return !llvm::all_of(tile, llvm::isPowerOf2_64) &&
+         llvm::all_of(physical, llvm::isPowerOf2_64) &&
+         llvm::equal(physical, ttg::getNpotPow2AllocShape(tile));
 }
 
 // Flag on, the allocator gives a dense NPOT tile exactly product(tile)
@@ -159,8 +171,8 @@ MemDescFootprint getMemDescAddresses(
   ArrayRef<int64_t> shape = ty.getShape();
   uint64_t numPoints = product(shape);
   bool npotView = hasNpotLayoutExtent(shape);
-  // An NPOT view walks the Gray code of its cover and keeps only the points
-  // whose coordinates lie inside the logical box.
+  // An NPOT view walks the Gray code of its pow2 alloc shape and keeps only the
+  // points whose coordinates lie inside the logical box.
   auto isInsideBox = [&](uint64_t index) {
     uint64_t gray = index ^ (index >> 1);
     for (int64_t dimSize : shape) {
@@ -285,9 +297,10 @@ MemDescFootprint getMemDescAddresses(
 uint32_t getMemDescStorageOffset(ttg::MemDescType ty, unsigned index) {
   if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace()))
     return index * ttng::getTmemAllocSizes(ty).numCols;
-  // A dense allocation's pages are strided as memdesc_index lowers them.
+  // A pow2 or dense allocation's pages are strided as memdesc_index lowers
+  // them.
   uint64_t stageElems =
-      isNpotDenseAllocation(ty)
+      isNpotPow2Allocation(ty) || isNpotDenseAllocation(ty)
           ? ttg::getAllocationElems(
                 ty.getEncoding(),
                 ttg::dropPipeliningDim(ty.getAllocShape(), ty.getEncoding()))
@@ -319,7 +332,7 @@ bool reachesNPOTLinearLayoutAssert(Type type) {
     return false;
   return !llvm::all_of(ttg::dropPipeliningDim(ty.getAllocShape(), encoding),
                        llvm::isPowerOf2_64) &&
-         !isNpotDenseAllocation(ty);
+         !isNpotPow2Allocation(ty) && !isNpotDenseAllocation(ty);
 }
 
 struct MemDescSubsliceOffsets {
