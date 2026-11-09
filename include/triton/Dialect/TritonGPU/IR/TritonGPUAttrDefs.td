@@ -1050,6 +1050,7 @@ w2 w2 w3 w3
 
     // Check if tilesPerWarp is 1 in every dimension.
     bool hasUnitTilesPerWarp() const;
+    bool hasMixedRadixLayout() const;
 
     // Returns a swizzled shared layout matching this MFMA layout for the
     // dot operand at the given |operandIdx| with |operandShape|.
