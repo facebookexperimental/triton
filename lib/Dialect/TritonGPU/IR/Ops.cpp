@@ -1428,6 +1428,17 @@ LogicalResult AsyncCopyGlobalToLocalOp::verify() {
       return emitOpError("non-bulk mode requires src to be a ranked tensor of "
                          "pointers");
   }
+  // The lowering writes mixed-radix runs through the buffer's pow2 alloc layout
+  // from its base, so it needs a whole buffer without padding or partitions.
+  if (succeeded(getExactNpotOperandLayout(*this))) {
+    MemDescType dstTy = getResult().getType();
+    Attribute enc = dstTy.getEncoding();
+    if (isa<PaddedSharedEncodingAttr, PartitionedSharedEncodingAttr>(enc) ||
+        dropPipeliningDim(dstTy.getAllocShape(), enc) !=
+            dropPipeliningDim(dstTy.getShape(), enc))
+      return emitError("NPOT mixed-radix access to a padded, partitioned or "
+                       "partial buffer is not yet supported");
+  }
   return success();
 }
 
@@ -1471,8 +1482,8 @@ LogicalResult MemDescIndexOp::verify() {
 
   auto layoutAllocShape =
       dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding());
-  bool hasPhysicalCover = isNpotPow2AllocView(srcTy);
-  if (layoutAllocShape != layoutShape && !hasPhysicalCover) {
+  bool hasPow2AllocView = isNpotPow2AllocView(srcTy);
+  if (layoutAllocShape != layoutShape && !hasPow2AllocView) {
     return emitError(
         "We only support memdesc_index of a multibuffer-prefix subview");
   }
@@ -1488,7 +1499,7 @@ LogicalResult MemDescIndexOp::verify() {
   }
 
   if (dstTy.getAllocShape() !=
-      (hasPhysicalCover ? layoutAllocShape : dstTy.getShape())) {
+      (hasPow2AllocView ? layoutAllocShape : dstTy.getShape())) {
     return emitError("alloc shape must match shape for the result");
   }
 
