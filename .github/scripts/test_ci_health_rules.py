@@ -82,6 +82,68 @@ def fail_comparison(item, kind="failed"):
     return item
 
 
+def test_ordered_parent_exposes_fast_pass_before_full_and_retains_failure():
+    fast = comparison_run(1, r.FAST_WF)
+    fast['jobs'][-1]['completed_at'] = stamp(2)
+    full = comparison_run(1)
+    parent = {**fast, 'status': 'in_progress', 'conclusion': None, 'updated_at': stamp(8)}
+    pending = [{**j, 'name': 'full / ' + j['name'], 'conclusion': None, 'completed_at': None} for j in full['jobs'][1:]]
+    parent['jobs'] = fast['jobs'] + pending
+    assert r.fast_result(parent) == 'passed'
+    projected = list(r.comparison_runs([parent]))
+    assert projected[0]['updated_at'] == stamp(2)
+    view = r.fast_full_view([parent], stamp(9))
+    assert view['counts']['pending'] == 1 and view['fast_attempts'] == view['full_attempts'] == 1
+    assert view['comparable'] == 0
+    failed = fail_comparison(full)
+    parent.update(status='completed', conclusion='failure', updated_at=stamp(10))
+    parent['jobs'] = fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in failed['jobs'][1:]]
+    assert r.fast_result(parent) == 'passed'
+    view = r.fast_full_view([parent], stamp(11))
+    assert view['counts']['test'] == view['comparable'] == 1 and view['rate'] == 1
+    assert view['records'][0]['gaps'][0]['fast']['id'] == view['records'][0]['gaps'][0]['full']['id'] == 1
+    assert r.pr_view([parent], stamp(11), r.main_view([], stamp(11)))[0]['result'] == 'test'
+    failed_snapshot = {**parent}
+    retry_full = comparison_run(1)
+    parent['attempts'] = [failed_snapshot]
+    parent['run_attempt'] = 2
+    parent['jobs'] = fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in retry_full['jobs'][1:]]
+    parent['conclusion'] = 'success'
+    assert r.pr_view([parent], stamp(11), r.main_view([], stamp(11)))[0]['result'] == 'passed'
+    assert r.fast_full_view([parent], stamp(11))['counts']['test'] == 1
+
+
+def test_ordered_cancellation_preserves_only_completed_fast_signal():
+    fast = comparison_run(1, r.FAST_WF)
+    cancelled = {**fast, 'status': 'completed', 'conclusion': 'cancelled', 'jobs': fast['jobs'][:-1]}
+    assert r.fast_result(cancelled) == 'cancelled'
+    cancelled['jobs'] = fast['jobs']
+    assert r.fast_result(cancelled) == 'passed'
+
+
+def test_partial_physical_jobs_do_not_report_known_idle_time():
+    parent = comparison_run(1, r.FAST_WF)
+    parent.update(status='in_progress', conclusion=None)
+    parent['jobs'][1].update(conclusion=None, completed_at=None)
+    occupancy = r.occupancy_view([parent], stamp(3))
+    last = r.concurrency_view([parent], stamp(3))['hours'][-1]
+    assert last['MI350']['peak'] is None
+    end = r.t(occupancy['t0']) + r.dt.timedelta(minutes=len(occupancy['gpus']['MI350']['run']) * r.OCC_CELL_MIN)
+    assert end <= r.t(parent['created_at'])
+
+
+def test_ordered_resources_count_physical_jobs_once_and_exclude_cpu():
+    fast, full = comparison_run(1, r.FAST_WF), comparison_run(1)
+    parent = {**fast, 'jobs': fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in full['jobs'][1:]]}
+    parent['jobs'].append(job('full / Compiler tests on CPU', step(CODEGEN, 'success'), label='ubuntu-latest'))
+    assert r.gpu_minutes(parent) == r.gpu_minutes(fast) + r.gpu_minutes(full) == 20
+    assert [g for g, _ in r._test_jobs(parent)] == ['MI350', 'MI350', 'CPU']
+    assert r.job_key('full / mi350 / mi350-tlx-test') == 'mi350-tlx-test'
+    views = list(r.comparison_runs([parent]))
+    assert len(views) == 2 and all(v['id'] == parent['id'] for v in views)
+    assert r.fast_full_view([parent, parent], stamp(11))['comparable'] == 1
+
+
 def test_fast_full_pairs_only_the_same_pr_and_actual_checkout():
     fast = comparison_run(1, r.FAST_WF)
     full = fail_comparison(comparison_run(2))

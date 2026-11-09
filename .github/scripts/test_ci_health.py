@@ -199,7 +199,7 @@ def test_lit_cache_preserves_compiler_and_full_test_coverage():
 
 def test_fast_workflow_preserves_dashboard_and_gpu_usage_contract(tmp_path):
     workflow = ch.rules.FAST_WF
-    workers = workflow_test_jobs(workflow)
+    workers = [job for job in workflow_test_jobs(workflow) if not job[0].startswith('full / ')]
     assert len(workers) == 4
     for name, label, steps in workers:
         platform = ch.rules.test_platform_of({"wf": workflow}, {"name": name})
@@ -270,6 +270,40 @@ def checkout_job(jid, name):
             "name": "Checkout", "conclusion": "success", "started_at": "2026-10-12T01:01:00Z", "completed_at":
             "2026-10-12T01:02:00Z"
         }])
+
+
+def test_collect_hydrates_running_fast_parent_and_preserves_source_evidence(tmp_path):
+    sha = 'ab' * 20
+    raw = gh_run(1, '2026-10-12T01:00:00Z', status='in_progress', conclusion=None, pull_requests=[{'number': 4855}])
+    jobs = [
+        checkout_job(10, 'select'),
+        checkout_job(11, 'build / build'),
+        checkout_job(12, 'full / select'),
+        gh_job(13, 'Fast correctness'),
+        gh_job(14, 'full / mi350 / mi350-tlx-test', conclusion=None)
+    ]
+    jobs[3]['labels'] = ['ubuntu-latest']
+    jobs[4]['completed_at'] = None
+    _, api, _ = collect(tmp_path, {ch.rules.FAST_WF: [raw]}, {1: jobs}, logs={i: source_log(sha) for i in (10, 11, 12)})
+    record = ch.load_runs(str(tmp_path))[1]
+    assert record['status'] == 'in_progress' and len(record['jobs']) == 5
+    assert record['tested_sha'] == sha and len(record['tested_sha_provenance']) == 2
+    assert record['stage_provenance']['gpu-tests.yml']['sha'] == sha
+    assert any('/runs/1/jobs?' in call for call in api.calls)
+
+
+def test_ordered_stage_source_identity_does_not_borrow_missing_full_logs():
+    sha = 'ab' * 20
+    record = ch._record(gh_run(1, '2026-10-12T01:00:00Z'), ch.rules.FAST_WF)
+    jobs = ch._jobs(
+        [{'jobs': [checkout_job(10, 'select'),
+                   checkout_job(11, 'build / build'),
+                   checkout_job(12, 'full / select')]}])
+    record['jobs'] = jobs
+    ch._tested_revision(record, jobs, fake_text({10: source_log(sha), 11: source_log(sha)}))
+    assert record['tested_sha'] == sha
+    assert ch.rules.stage_runs(record)[1]['tested_sha'] is None
+    assert ch.rules.stage_runs(record)[0]['tested_sha'] == sha
 
 
 def test_collect_uses_same_attempt_checkout_evidence_for_both_workflows(tmp_path):

@@ -339,8 +339,8 @@ def test_aggregate_gate_rejects_failed_build_and_selected_tests(results, selecte
     needs["cpu-tests"] = {"result": "skipped"}
     for platform in ("b200", "mi350"):
         needs[platform] = {"result": "skipped"}
-    result = subprocess.run([sys.executable, "-c", script], env=os.environ | {"NEEDS": json.dumps(needs)},
-                            capture_output=True)
+    result = subprocess.run([sys.executable, "-c", script],
+                            env=os.environ | {"NEEDS": json.dumps(needs), "EVENT_NAME": "push"}, capture_output=True)
     assert (result.returncode == 0) == success, result.stderr.decode()
 
 
@@ -354,7 +354,7 @@ def test_workflows_share_one_build_and_pin_all_checkouts():
     for platform in FILTERS:
         caller = parent["jobs"][platform]
         assert caller["needs"] == ["select", "build"]
-        assert caller["with"]["wheel_url"] == "${{ needs.build.outputs.wheel_url }}"
+        assert caller["with"]["wheel_url"] == "${{ inputs.wheel_url || needs.build.outputs.wheel_url }}"
         child = workflow(platform)
         assert set(child["on"]) == {"workflow_call"}
         assert "concurrency" not in child
@@ -550,6 +550,72 @@ def test_unreadable_gluon_audit_only_blocks_gluon_cpu_placement(tmp_path, policy
         (directory / "conftest.py").write_text(policy)
     assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, spec) is not None
     assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, suites["cpu"]["codegen"]) is None
+
+
+def workflow_condition(expression, context):
+    import re
+    expression = expression.removeprefix('${{').removesuffix('}}').strip()
+    has_status = 'cancelled()' in expression or 'always()' in expression
+    if not has_status and any(value != 'success' for key, value in context.items() if key.endswith('.result')):
+        return False
+    expression = expression.replace('!cancelled()', str(not context.get('cancelled', False)))
+    expression = expression.replace('always()', 'True').replace('&&', ' and ').replace('||', ' or ')
+    expression = re.sub(r'(github\.event_name|(?:needs|steps)\.[\w-]+\.(?:result|outputs\.[\w]+))',
+                        lambda match: repr(context[match.group()]), expression)
+    return eval(expression, {'__builtins__': {}}, {})
+
+
+@pytest.mark.parametrize('gate', ['success', 'failure', 'cancelled', 'skipped'])
+def test_pr_full_allocation_requires_the_verified_fast_gate(gate):
+    fast = yaml.load((ROOT / '.github/workflows/fast-gpu-tests.yml').read_text(), Loader=yaml.BaseLoader)
+    full = yaml.load((ROOT / '.github/workflows/gpu-tests.yml').read_text(), Loader=yaml.BaseLoader)
+    call = fast['jobs']['full']
+    assert call['uses'] == './.github/workflows/gpu-tests.yml'
+    assert fast['jobs']['result']['name'] == 'Fast correctness'
+    context = {'github.event_name': 'pull_request', 'needs.result.result': gate, 'needs.build.result': 'skipped'}
+    assert workflow_condition(call['if'], context) == (gate == 'success')
+    assert not workflow_condition(call['if'], context | {'cancelled': True})
+    assert not workflow_condition(call['if'], context | {'github.event_name': 'workflow_dispatch'})
+    assert 'pull_request' not in full['on'] and {'push', 'schedule', 'workflow_dispatch'} <= set(full['on'])
+    for key in ('commit', 'wheel_url', 'wheel_filename', 'wheel_sha256'):
+        assert call['with'][key] == '${{ needs.build.outputs.' + key + ' }}'
+    assert not workflow_condition(
+        full['jobs']['build']['if'],
+        {'github.event_name': 'pull_request', 'needs.select.outputs.build': 'true', 'needs.select.result': 'success'})
+    for platform in ('h100', 'b200', 'mi350', 'cpu'):
+        worker = full['jobs']['cpu-tests' if platform == 'cpu' else platform]
+        context = {
+            'github.event_name': 'pull_request', 'needs.select.result': 'success', 'needs.build.result': 'skipped',
+            f'needs.select.outputs.{platform}': 'true'
+        }
+        assert workflow_condition(worker['if'], context)
+        assert not workflow_condition(worker['if'], context | {'needs.select.result': 'failure'})
+        assert not workflow_condition(worker['if'], context | {'cancelled': True})
+        assert not workflow_condition(worker['if'], context | {f'needs.select.outputs.{platform}': 'false'})
+
+
+@pytest.mark.parametrize('fork,url,valid', [(False, 'https://example.org/w.whl', True), (False, '', False),
+                                            (True, '', True)])
+def test_shared_full_wheel_validates_source_and_fork_artifact_identity(fork, url, valid):
+    import os
+    import sys
+    full = yaml.load((ROOT / '.github/workflows/gpu-tests.yml').read_text(), Loader=yaml.BaseLoader)
+    step = next(s for s in full['jobs']['select']['steps'] if s.get('name') == 'Validate shared wheel source')
+    source = step['run'].split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+    env = os.environ | {
+        'COMMIT': 'a' * 40, 'EXPECTED': 'a' * 40, 'WHEEL_URL': url, 'WHEEL_FILENAME': 'fbtriton.whl', 'WHEEL_SHA256':
+        'b' * 64, 'IS_FORK_PR': str(fork).lower()
+    }
+
+    def run(extra):
+        return subprocess.run([sys.executable, '-c', source], env=env | extra, capture_output=True).returncode
+
+    assert (run({}) == 0) == valid
+    assert run({'COMMIT': 'c' * 40}) != 0
+    assert run({'WHEEL_SHA256': ''}) != 0
+    assert run({'WHEEL_FILENAME': ''}) != 0
+    assert not workflow_condition(step['if'],
+                                  {'github.event_name': 'pull_request', 'steps.select.outputs.build': 'false'})
 
 
 def test_fast_automatic_runs_are_pr_only():
