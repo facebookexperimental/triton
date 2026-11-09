@@ -363,13 +363,13 @@ tt.func @reduce_32x96(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt
 
 // -----
 
-// At four warps [128, 80] puts its warps on 128, so a reduce along 128 has an
-// unsupported reason and pads; along 80 it keeps its shape.
+// At four warps [128, 80] puts its warps on 128; a reduce along either dim
+// keeps its shape.
 // W4-LABEL: @reduce_128x80
 tt.func @reduce_128x80(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
   // W4: tt.load %{{.*}} : tensor<128x80x!tt.ptr<f32>>
   // W4: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
-  // W4: tt.load %{{.*}}, %{{.*}} : tensor<128x128x!tt.ptr<f32>>
+  // W4: tt.load %{{.*}} : tensor<128x80x!tt.ptr<f32>>
   // W4: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
   %r = tt.make_range {end = 10240 : i32, start = 0 : i32} : tensor<10240xi32>
   %i = tt.reshape %r : tensor<10240xi32> -> tensor<128x80xi32>
