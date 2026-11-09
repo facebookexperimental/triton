@@ -893,6 +893,55 @@ public:
   }
 };
 
+// Whether ScaledBlockedToMMAv5 lowers `dotOp` to tcgen05 rather than leaving
+// it to the decompose pattern.
+static bool isTcgen05ScaledDot(DotScaledOp dotOp, int computeCapability,
+                               int numWarps) {
+  if (dotOp.getAScale() == nullptr || dotOp.getBScale() == nullptr)
+    return false;
+  auto retShapePerCTA = getShapePerCTA(dotOp.getType());
+  if (computeCapability < 100 || computeCapability >= 120)
+    return false;
+  if (numWarps != 4 && numWarps != 8)
+    return false;
+  if (retShapePerCTA[0] < 128 || retShapePerCTA[1] < 16)
+    return false;
+  // fp6 (groups of 16 values per 12 bytes) cannot tile the tcgen05 K
+  // dimension today; route it to the decompose (upcast) path instead
+  // of native MMAv5.
+  if (isMXFP6ScaleType(dotOp.getAElemType()) ||
+      isMXFP6ScaleType(dotOp.getBElemType()))
+    return false;
+  bool isAFP4 = dotOp.getAElemType() == ScaleDotElemType::E2M1;
+  bool isFp4MMA = isAFP4 && dotOp.getBElemType() == ScaleDotElemType::E2M1;
+  // An MN-packed fp4 A is packed along M, so its last dim is already K.
+  auto blockK = dotOp.getA().getType().getShape().back() *
+                (isAFP4 && dotOp.getLhsKPack() ? 2 : 1);
+  bool hasMNMajorFp4Operand =
+      isFp4MMA && (!dotOp.getLhsKPack() || !dotOp.getRhsKPack());
+  auto aScaleType = dotOp.getAScale().getType();
+  auto bScaleType = dotOp.getBScale().getType();
+  auto aScaleElemType = aScaleType.getElementType();
+  auto bScaleElemType = bScaleType.getElementType();
+  auto isBlock16Scale = [blockK](RankedTensorType scaleType) {
+    return scaleType.getShape().back() * 16 == blockK;
+  };
+  bool hasUE4M3Scale = isa<Float8E4M3FNType>(aScaleElemType) ||
+                       isa<Float8E4M3FNType>(bScaleElemType);
+  bool hasUE5M3Scale =
+      (aScaleElemType.isInteger(8) && isBlock16Scale(aScaleType)) ||
+      (bScaleElemType.isInteger(8) && isBlock16Scale(bScaleType));
+  // UE5M3 scales are native only on sm107; sm100/sm103 trap, so decompose.
+  if (hasUE5M3Scale &&
+      !nvidia_gpu::TargetFeatures(computeCapability).supportsUE5M3Tcgen05MMA())
+    return false;
+  // mxf4nvf4 supports UE4M3/UE5M3 scales but not MN-major operands, while
+  // the mxf8f6f4 fallback for MN-major FP4 only supports E8M0 scales.
+  if (hasMNMajorFp4Operand && (hasUE4M3Scale || hasUE5M3Scale))
+    return false;
+  return true;
+}
+
 class ScaledBlockedToMMAv5
     : public mlir::OpRewritePattern<triton::DotScaledOp> {
   int computeCapability;
@@ -911,27 +960,13 @@ public:
         mlir::isa<NvidiaMmaEncodingAttr>(oldRetType.getEncoding()))
       return failure();
 
-    if (dotOp.getAScale() == nullptr || dotOp.getBScale() == nullptr) {
+    int numWarps = lookupNumWarps(dotOp);
+    if (!isTcgen05ScaledDot(dotOp, computeCapability, numWarps))
       return failure();
-    }
 
     // get MMA encoding for the given number of warps
     auto retShapePerCTA = getShapePerCTA(oldRetType);
-    int numWarps = lookupNumWarps(dotOp);
     auto CGALayout = getCGALayout(oldRetType.getEncoding());
-    if (computeCapability < 100 || computeCapability >= 120)
-      return failure();
-    if (numWarps != 4 && numWarps != 8)
-      return failure();
-    if (retShapePerCTA[0] < 128 || retShapePerCTA[1] < 16)
-      return failure();
-    // fp6 (groups of 16 values per 12 bytes) cannot tile the tcgen05 K
-    // dimension today; route it to the decompose (upcast) path instead
-    // of native MMAv5.
-    if (isMXFP6ScaleType(dotOp.getAElemType()) ||
-        isMXFP6ScaleType(dotOp.getBElemType())) {
-      return rewriter.notifyMatchFailure(dotOp, "fp6 uses decompose upcast");
-    }
     Location loc = dotOp.getLoc();
     // operands
     Value a = dotOp.getA();
@@ -966,26 +1001,6 @@ public:
     auto blockM = dotOp.getA().getType().getShape()[0];
     bool hasMNMajorFp4Operand =
         isFp4MMA && (!dotOp.getLhsKPack() || !dotOp.getRhsKPack());
-    auto aScaleType = dotOp.getAScale().getType();
-    auto bScaleType = dotOp.getBScale().getType();
-    auto aScaleElemType = aScaleType.getElementType();
-    auto bScaleElemType = bScaleType.getElementType();
-    auto isBlock16Scale = [blockK](RankedTensorType scaleType) {
-      return scaleType.getShape().back() * 16 == blockK;
-    };
-    bool hasUE4M3Scale = isa<Float8E4M3FNType>(aScaleElemType) ||
-                         isa<Float8E4M3FNType>(bScaleElemType);
-    bool hasUE5M3Scale =
-        (aScaleElemType.isInteger(8) && isBlock16Scale(aScaleType)) ||
-        (bScaleElemType.isInteger(8) && isBlock16Scale(bScaleType));
-    // UE5M3 scales are native only on sm107; sm100/sm103 trap, so decompose.
-    if (hasUE5M3Scale && !nvidia_gpu::TargetFeatures(computeCapability)
-                              .supportsUE5M3Tcgen05MMA())
-      return failure();
-    // mxf4nvf4 supports UE4M3/UE5M3 scales but not MN-major operands, while
-    // the mxf8f6f4 fallback for MN-major FP4 only supports E8M0 scales.
-    if (hasMNMajorFp4Operand && (hasUE4M3Scale || hasUE5M3Scale))
-      return failure();
     // mxf4 does not support MN-major operands, so mxfp4 x mxfp4 falls back to
     // mxf8f6f4 if either operand is not K-packed. The mxf8f6f4 shared-memory
     // packing format requires padding for every fp4 operand, even if the
@@ -1249,6 +1264,26 @@ public:
     decomposeMixedModeDotOp(m, computeCapability);
   }
 };
+
+namespace {
+struct NvidiaNpotTargetLegality : public NpotTargetLegality {
+  using NpotTargetLegality::NpotTargetLegality;
+  StringRef getTargetPrefix() const override { return "cuda"; }
+  std::optional<std::string> getDotUnsupportedReason(Operation *,
+                                                     const LinearLayout &,
+                                                     StringRef target,
+                                                     int) const override {
+    return ("NPOT dot is not yet supported on " + target).str();
+  }
+};
+} // namespace
+
+void registerNpotTargetLegality(DialectRegistry &registry) {
+  registry.addExtension(
+      +[](MLIRContext *, nvidia_gpu::TritonNvidiaGPUDialect *dialect) {
+        dialect->addInterfaces<NvidiaNpotTargetLegality>();
+      });
+}
 
 } // namespace gpu
 } // namespace triton
