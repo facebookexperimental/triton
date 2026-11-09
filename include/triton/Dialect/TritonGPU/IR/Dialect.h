@@ -207,7 +207,12 @@ bool hasExactLayoutAt(RankedTensorType type);
 // constant, control-flow or cast op. The verifier allows a mixed-radix layout
 // only on these ops, and the NPOT pad pass keeps a connected component's shape
 // only if all its ops are.
-bool isMixedRadixLayoutOp(Operation *op);
+bool isMixedRadixLayoutOp(OperationName op);
+
+// Why the verifier rejects an exact mixed-radix layout among `types` on an op
+// named `name`, if it does; a pass can ask before creating the op.
+std::optional<std::string> getNpotLayoutUnsupportedReason(OperationName name,
+                                                          TypeRange types);
 
 // Create a GenericLinearEncoding if the source isGenericLinearEncoding, and a
 // LinearEncoding otherwise.
