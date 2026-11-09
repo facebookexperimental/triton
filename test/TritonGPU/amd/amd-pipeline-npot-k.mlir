@@ -53,17 +53,32 @@ tt.func @dot_k96(%pa: !tt.ptr<bf16>, %pb: !tt.ptr<bf16>, %pc: !tt.ptr<f32>) {
   tt.return
 }
 
-// fp8 K=96 pads: its pow2-padded K's f8f6f4 MFMA has kDim 64.
+// fp8 K=96 stays exact on two f8f6f4 MFMAs of its pow2-padded K, the last zero
+// past K. K=48's operands can't lay out that tail, so it pads.
 // CHECK-LABEL: @dot_k96_fp8
-// CHECK: tt.dot_scaled {{.*}} : tensor<128x128xf8E4M3FN, #ttg.dot_op<{opIdx = 0, parent = #mma{{.*}}, kWidth = 16}>>
+// CHECK: tt.dot_scaled {{.*}} : tensor<128x96xf8E4M3FN, #ttg.dot_op<{opIdx = 0, parent = #mma{{.*}}, kWidth = 16}>>
 tt.func @dot_k96_fp8(%pa: !tt.ptr<f8E4M3FN>, %pb: !tt.ptr<f8E4M3FN>, %pc: !tt.ptr<f32>) {
   %sa = tt.splat %pa : !tt.ptr<f8E4M3FN> -> tensor<128x96x!tt.ptr<f8E4M3FN>>
   %a = tt.load %sa : tensor<128x96x!tt.ptr<f8E4M3FN>>
   %sb = tt.splat %pb : !tt.ptr<f8E4M3FN> -> tensor<96x128x!tt.ptr<f8E4M3FN>>
   %b = tt.load %sb : tensor<96x128x!tt.ptr<f8E4M3FN>>
   %c = arith.constant dense<0.0> : tensor<128x128xf32>
-  // expected-remark @+1 {{the pow2-padded K's MFMA (rocdl.mfma.scale.f32.32x32x64.f8f6f4, kDim 64) doesn't divide K=96}}
   %d = tt.dot %a, %b, %c : tensor<128x96xf8E4M3FN> * tensor<96x128xf8E4M3FN> -> tensor<128x128xf32>
+  %sc = tt.splat %pc : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>
+  tt.store %sc, %d : tensor<128x128x!tt.ptr<f32>>
+  tt.return
+}
+
+// CHECK-LABEL: @dot_k48_fp8
+// CHECK: tt.dot_scaled {{.*}} : tensor<128x64xf8E4M3FN, #ttg.dot_op<{opIdx = 0, parent = #mma{{.*}}, kWidth = 16}>>
+tt.func @dot_k48_fp8(%pa: !tt.ptr<f8E4M3FN>, %pb: !tt.ptr<f8E4M3FN>, %pc: !tt.ptr<f32>) {
+  %sa = tt.splat %pa : !tt.ptr<f8E4M3FN> -> tensor<128x48x!tt.ptr<f8E4M3FN>>
+  %a = tt.load %sa : tensor<128x48x!tt.ptr<f8E4M3FN>>
+  %sb = tt.splat %pb : !tt.ptr<f8E4M3FN> -> tensor<48x128x!tt.ptr<f8E4M3FN>>
+  %b = tt.load %sb : tensor<48x128x!tt.ptr<f8E4M3FN>>
+  %c = arith.constant dense<0.0> : tensor<128x128xf32>
+  // expected-remark @+1 {{NPOT dot is not yet supported on rocdl.mfma.scale.f32.32x32x64.f8f6f4: operand 0 has no exact layout}}
+  %d = tt.dot %a, %b, %c : tensor<128x48xf8E4M3FN> * tensor<48x128xf8E4M3FN> -> tensor<128x128xf32>
   %sc = tt.splat %pc : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>
   tt.store %sc, %d : tensor<128x128x!tt.ptr<f32>>
   tt.return
