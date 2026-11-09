@@ -1964,6 +1964,11 @@ struct AmdNpotTargetLegality : public tt::NpotTargetLegality {
           .str();
     return std::nullopt;
   }
+  std::optional<std::string>
+  getDescriptorUnsupportedReason(Operation *, const tt::LinearLayout &,
+                                 StringRef target) const override {
+    return ("NPOT tensor descriptor is not yet supported on " + target).str();
+  }
 };
 } // namespace
 
