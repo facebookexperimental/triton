@@ -1353,23 +1353,6 @@ public:
 };
 
 namespace {
-// Why `warps` of `instrShape` can't sit on each dim's power-of-two part, as
-// the mixed-radix layout puts them, or std::nullopt.
-std::optional<std::string>
-getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
-                                  ArrayRef<unsigned> warps,
-                                  ArrayRef<unsigned> instrShape) {
-  for (auto [dim, size] : llvm::enumerate(shape)) {
-    int64_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(size));
-    if (twoPart % (warps[dim] * LinearLayout::twoPartOf(instrShape[dim])) != 0)
-      return llvm::formatv("NPOT dot is not yet supported with {0} warps of "
-                           "{1} on dim {2}, whose power-of-two part is {3}",
-                           warps[dim], instrShape[dim], dim, twoPart)
-          .str();
-  }
-  return std::nullopt;
-}
-
 // Why BlockedToMMA can't issue `dot` exactly on wgmma, or std::nullopt. Its
 // warps must sit on each dim's power-of-two part, as the mixed-radix layout
 // puts them; then exact issues no more atoms per warp than padded.
@@ -1549,7 +1532,7 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   StringRef getTargetPrefix() const override { return "cuda"; }
   std::optional<std::string>
   getDotUnsupportedReason(Operation *op, const LinearLayout &, StringRef target,
-                          int numWarps) const override {
+                          int numWarps, int) const override {
     // Exact only where BlockedToMMA picks wgmma or mma.sync alone; f64 takes
     // FMA on some targets.
     auto dot = dyn_cast<DotOp>(op);

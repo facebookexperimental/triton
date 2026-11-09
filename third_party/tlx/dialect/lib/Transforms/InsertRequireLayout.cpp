@@ -784,6 +784,14 @@ static void materializeTensorRequireLayout(tt::DotOp dotOp,
   auto dstType = dyn_cast<RankedTensorType>(cvt.getType());
   if (!dstType || !isSupportedDotConstraintEncoding(dstType.getEncoding()))
     return;
+  // The verifier accepted this convert's NPOT plan but rejects the same exact
+  // mixed-radix layouts on a require_layout, so keep the convert.
+  Type types[] = {cvt.getSrc().getType(), dstType};
+  if (ttg::getNpotLayoutUnsupportedReason(
+          OperationName(tlx::RequireLayoutOp::getOperationName(),
+                        dotOp.getContext()),
+          types))
+    return;
 
   builder.setInsertionPoint(cvt);
   auto requireOp = tlx::RequireLayoutOp::create(builder, cvt.getLoc(),

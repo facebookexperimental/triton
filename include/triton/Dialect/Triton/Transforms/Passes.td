@@ -223,7 +223,14 @@ def TritonNpotPad : Pass<"triton-npot-pad", "mlir::ModuleOp"> {
     Option<"numCTAs", "num-ctas", "int32_t", /*default*/"1",
            "number of ctas in a cga">,
     Option<"target", "target", "std::string", /*default*/"\"\"",
-           "the ttg.target ConvertTritonToTritonGPU will set">
+           "the ttg.target ConvertTritonToTritonGPU will set">,
+    Option<"matrixInstructionSize", "matrix-instruction-size", "int32_t",
+           /*default*/"0",
+           "the MMA M/N size the target's dot pass enforces, 0 if none">,
+    Option<"numStages", "num-stages", "int32_t", /*default*/"1",
+           "the pipeliner's stage count for loops without tt.num_stages">,
+    Option<"useAsyncCopy", "use-async-copy", "bool", /*default*/"false",
+           "whether the target's pipeliner may copy loads to shared memory">
   ];
 }
 
