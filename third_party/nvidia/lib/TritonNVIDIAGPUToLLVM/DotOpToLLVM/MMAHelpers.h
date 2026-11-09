@@ -142,13 +142,25 @@ public:
     smemBase = b.ptrtoint(i32_ty, smemBase);
     Value baseSrcb128 = b.lshr(smemBase, b.i32_val(4));
 
-    if (mmaVersion == 3) {
+    if (mmaVersion == 3 && !ll.isRadix2()) {
+      auto warpGroupOffsetb128 = getMixedRadixWarpGroupOffsetb128(
+          loc, rewriter, ll, bitwidth, *mmaTy, MNdim);
+      if (failed(warpGroupOffsetb128))
+        return failure();
+      baseSrcb128 = b.add(baseSrcb128, *warpGroupOffsetb128);
+    } else if (mmaVersion == 3) {
       auto mmaLl = gpu::toLinearLayout(mmaTy.value());
       auto outDims = to_vector(mmaLl.getOutDimNames());
       auto kWarp = str_attr("warp");
       // Map from warps into the MN dimension
-      auto mmaWarps = mmaLl.sublayout({kWarp}, {outDims[MNdim]}) *
-                      LinearLayout::identity1D(1, kWarp, outDims[1 - MNdim]);
+      auto mmaWarps = mmaLl.sublayout({kWarp}, {outDims[MNdim]});
+      // A mixed-radix layout's warps sit on its binary part, inside the pow2
+      // alloc shape.
+      if (!mmaWarps.isRadix2())
+        mmaWarps = LinearLayout(
+            mmaWarps.getBases(),
+            {{outDims[MNdim], ll.getInDimSize(outDims[MNdim])}}, false);
+      mmaWarps *= LinearLayout::identity1D(1, kWarp, outDims[1 - MNdim]);
       // Map from warps to offsets in bitwidth elements
       auto warpToOffset = mmaWarps.compose(ll);
       // Map from warps to offsets in 128b elements
@@ -184,8 +196,12 @@ public:
              << inDims[0].second << ", " << inDims[1].second << "]";
     }
 
-    auto desc =
-        getDescriptor(loc, ll, instrShapeBytes, bitwidth, MNdim, mmaVersion);
+    auto descLL =
+        nvidia_gpu::getNvmmaDescriptorLayout(ll, bitwidth, instrShapeBytes);
+    if (!descLL)
+      return failure();
+    auto desc = getDescriptor(loc, *descLL, instrShapeBytes, bitwidth, MNdim,
+                              mmaVersion);
     if (failed(desc))
       return failure();
 
@@ -300,6 +316,63 @@ private:
   bool lessRegMMA = false;
   bool isFp6 = false;
   bool fp6Trans = false;
+
+  // A dense NPOT layout's strides add rather than XOR, so each warpgroup's
+  // offset is the sum of its warp bits' offsets. Core-matrix-aligned warpgroup
+  // origins keep every tile offset within a warpgroup additive too.
+  static FailureOr<Value>
+  getMixedRadixWarpGroupOffsetb128(Location loc, RewriterBase &rewriter,
+                                   const LinearLayout &ll, int bitwidth,
+                                   RankedTensorType mmaTy, unsigned MNdim) {
+    auto *ctx = rewriter.getContext();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto kWarp = str_attr("warp");
+    auto kOffset = str_attr("offset");
+    auto descLL = nvidia_gpu::getNvmmaDescriptorLayout(ll, bitwidth);
+    auto attrsAndTile = descLL
+                            ? nvidia_gpu::getNvmmaSmemAttrs(*descLL, bitwidth)
+                            : std::nullopt;
+    if (!attrsAndTile)
+      return failure();
+    auto dims = to_vector(ll.getInDimNames());
+    int32_t tile = attrsAndTile->second.getInDimSize(dims[MNdim]);
+    auto mmaLl = gpu::toLinearLayout(mmaTy);
+    SmallVector<std::pair<StringAttr, int32_t>> mmaIns;
+    for (StringAttr inDim : mmaLl.getInDimNames())
+      mmaIns.push_back({inDim, 0});
+    auto warpIt =
+        llvm::find_if(mmaIns, [&](auto in) { return in.first == kWarp; });
+    auto offsetOf = [&](int32_t warp, int32_t &offset) {
+      warpIt->second = warp;
+      int32_t coord = mmaLl.apply(mmaIns)[MNdim].second;
+      SmallVector<std::pair<StringAttr, int32_t>> ins = {{dims[0], 0},
+                                                         {dims[1], 0}};
+      ins[MNdim].second = coord;
+      offset = ll.apply(ins)[ll.getOutDimIndex(kOffset)].second;
+      return coord % tile == 0 && offset * bitwidth % 128 == 0;
+    };
+    int32_t numWarpGroups = mmaLl.getInDimSize(kWarp) / 4;
+    SmallVector<int32_t> bitOffsets;
+    for (int32_t g = 1; g < numWarpGroups; g *= 2)
+      if (!offsetOf(4 * g, bitOffsets.emplace_back()))
+        return failure();
+    for (int32_t g = 0; g < numWarpGroups; ++g) {
+      int32_t offset, sum = 0;
+      for (auto [i, bitOffset] : llvm::enumerate(bitOffsets))
+        if (g >> i & 1)
+          sum += bitOffset;
+      if (!offsetOf(4 * g, offset) || offset != sum)
+        return failure();
+    }
+    Value warpId = mlir::triton::gpu::WarpIdOp::create(rewriter, loc);
+    Value offsetb128 = b.i32_val(0);
+    for (auto [i, bitOffset] : llvm::enumerate(bitOffsets)) {
+      Value bit = b.and_(b.lshr(warpId, b.i32_val(2 + i)), b.i32_val(1));
+      offsetb128 =
+          b.add(offsetb128, b.mul(bit, b.i32_val(bitOffset * bitwidth / 128)));
+    }
+    return offsetb128;
+  }
 
   static FailureOr<MMASMEMDescriptor>
   getDescriptor(Location loc, const LinearLayout &ll,

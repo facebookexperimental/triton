@@ -11,7 +11,9 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/EquivalenceClasses.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton {
@@ -247,14 +249,14 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   // Vector first, per the spec: a load or store must keep the vector AxisInfo
   // proves for its padded pointer along the dim Coalesce vectorizes.
   std::optional<ModuleAxisInfoAnalysis> axisInfo;
-  auto keepsVector = [&](Operation *op) {
+  auto losesVector = [&](Operation *op) -> std::optional<std::string> {
     Value ptr =
         llvm::TypeSwitch<Operation *, Value>(op)
             .Case<LoadOp, StoreOp>([](auto access) { return access.getPtr(); })
             .Default(Value());
     auto type = ptr ? dyn_cast<RankedTensorType>(ptr.getType()) : nullptr;
     if (!type || !isNpot(type.getShape()))
-      return true;
+      return std::nullopt;
     if (!axisInfo)
       axisInfo.emplace(mod);
     const AxisInfo &info = *axisInfo->getAxisInfo(ptr);
@@ -264,13 +266,17 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                                             order[0], threads);
     unsigned vector =
         getAxisInfoVector(info, type, type.getShape(), order[0], threads);
-    return gpu::getMixedRadixVector(ctx, type.getShape(), vector, order,
-                                    numWarps, threadsPerWarp) >= pow2Vector;
+    unsigned exactVector = gpu::getMixedRadixVector(
+        ctx, type.getShape(), vector, order, numWarps, threadsPerWarp);
+    if (exactVector >= pow2Vector)
+      return std::nullopt;
+    return llvm::formatv("NPOT {0} pads: its exact vector is {1} elements, {2} "
+                         "on the pow2 tile",
+                         op->getName(), exactVector, pow2Vector)
+        .str();
   };
-  // A mixed-radix op's NPOT dim may be on any operand, e.g. a dot's B. A dot's
-  // reason depends on the target, so it remarks why its connected component
-  // pads.
-  auto rejects = [&](Operation *op) {
+  // A mixed-radix op's NPOT dim may be on any operand, e.g. a dot's B.
+  auto rejects = [&](Operation *op) -> std::optional<std::string> {
     auto mixedRadix = dyn_cast<MixedRadixLayoutOpInterface>(op);
     RankedTensorType type;
     for (Type t : op->getOperandTypes()) {
@@ -286,43 +292,71 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
       exact = gpu::getMixedRadixEncoding(ctx, type.getShape(), numWarps,
                                          threadsPerWarp, numCTAs);
     if (failed(exact))
-      return false;
+      return std::nullopt;
     if (!isa<DotOpInterface>(op))
-      return mixedRadix.getMixedRadixUnsupportedReason(exact->getLinearLayout())
-          .has_value();
-    std::optional<std::string> reason = getNpotDotUnsupportedReason(
-        op, exact->getLinearLayout(), target, numWarps);
-    if (reason)
-      op->emitRemark(*reason);
-    return reason.has_value();
+      return mixedRadix.getMixedRadixUnsupportedReason(
+          exact->getLinearLayout());
+    return getNpotDotUnsupportedReason(op, exact->getLinearLayout(), target,
+                                       numWarps);
+  };
+  // A padded connected component with a dot remarks why it pads, once: the
+  // dot's target reason, else the first other reason.
+  using Reasons = llvm::MapVector<Value, std::pair<Operation *, std::string>>;
+  Reasons padReasons, slowReasons;
+  auto pad = [&](Value leader, Operation *op, std::string reason) {
+    paddedComponents.insert(leader);
+    padReasons.try_emplace(leader, op, std::move(reason));
   };
   DenseMap<Value, std::pair<int64_t, int64_t>> totalInDimSizes;
-  DenseSet<Value> seen, slower, unpaddable;
+  DenseMap<Value, Operation *> firstOps;
+  DenseSet<Value> seen, dots, remarked, unpaddable;
   mod.walk([&](Operation *op) {
     SmallVector<Value> values = npotValues(op);
     if (values.empty())
       return;
     Value leader = components.getLeaderValue(values.front());
-    if (!gpu::isMixedRadixLayoutOp(op->getName()) || rejects(op))
-      paddedComponents.insert(leader);
-    else if (!keepsVector(op))
-      slower.insert(leader);
+    firstOps.try_emplace(leader, op);
+    if (isa<DotOpInterface>(op))
+      dots.insert(leader);
+    if (!gpu::isMixedRadixLayoutOp(op->getName())) {
+      pad(leader, op,
+          llvm::formatv("NPOT mixed-radix layout is not yet supported on {0}",
+                        op->getName()));
+    } else if (std::optional<std::string> reason = rejects(op)) {
+      if (isa<DotOpInterface>(op)) {
+        op->emitRemark(*reason);
+        remarked.insert(leader);
+      }
+      pad(leader, op, *reason);
+    } else if (std::optional<std::string> reason = losesVector(op)) {
+      slowReasons.try_emplace(leader, op, *reason);
+    }
     if (!hasPaddedLowering(op))
       unpaddable.insert(leader);
     for (Value v : values)
       if (seen.insert(v).second &&
           !addTotalInDimSizes(v, totalInDimSizes[leader]))
-        paddedComponents.insert(leader);
+        pad(leader, op,
+            llvm::formatv(
+                "NPOT mixed-radix layout is not yet supported for {0}",
+                v.getType()));
   });
   // Summed over the connected component: a thin index value may take a larger
   // total in-dim size than its padded layout while the tile it addresses takes
   // less.
   for (auto &[leader, sum] : totalInDimSizes)
     if (sum.first >= sum.second)
-      slower.insert(leader);
-  for (Value leader : slower)
+      slowReasons.try_emplace(
+          leader, firstOps.lookup(leader),
+          llvm::formatv("NPOT tensors pad: their mixed-radix layouts take {0} "
+                        "registers x lanes x warps, their pow2 layouts {1}",
+                        sum.first, sum.second));
+  for (auto &[leader, reason] : slowReasons)
     if (!unpaddable.contains(leader))
-      paddedComponents.insert(leader);
+      pad(leader, reason.first, reason.second);
+  for (auto &[leader, reason] : padReasons)
+    if (dots.contains(leader) && !remarked.contains(leader))
+      reason.first->emitRemark(reason.second);
 }
 
 class Padder {
