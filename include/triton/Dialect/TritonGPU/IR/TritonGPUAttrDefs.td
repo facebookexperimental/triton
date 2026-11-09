@@ -840,7 +840,7 @@ for
       // (the modular LinearLayout). Flooring a pow2 is a no-op, so pow2 shapes
       // are byte-identical.
       static const bool allowNpot =
-          mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+          mlir::triton::tools::isNpotAllowed();
       auto pow2Floor = [&](unsigned x) -> unsigned {
         return allowNpot ? (1u << llvm::Log2_32(std::max<unsigned>(x, 1))) : x;
       };
@@ -1356,6 +1356,7 @@ For example, the matrix L corresponding to blockTileSize=[32,16] is:
     bool isTuring() const;
     bool isAmpere() const;
     bool isHopper() const;
+    bool hasMixedRadixLayout() const;
 
     SmallVector<int64_t> getRepForOperand(ArrayRef<int64_t> shape,
                                           int bitwidth, int kWidth,
@@ -1469,7 +1470,9 @@ vecIdx (index of the element in the quad; this is always along the k-dim)
 
   let assemblyFormat = "`<` `{` struct(params) `}` `>`";
   let genVerifyDecl = 1;
-  let extraClassDeclaration = extraDistributedDeclaration;
+  let extraClassDeclaration = extraDistributedDeclaration#[{
+    bool hasMixedRadixLayout() const;
+  }];
 }
 
 def TTG_SharedMemorySpace : AttrDef<TritonGPU_Dialect, "SharedMemorySpace"> {
