@@ -4,6 +4,13 @@
 // don't divide), so RLC must keep a convert between the reduce and the broadcast.
 #p192 = #ttg.linear<{register = [[2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 64]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [[0, 32], [1, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [64, 192]}>
 #p96 = #ttg.linear<{register = [[4, 0], [8, 0], [16, 0], [32, 0], [0, 32]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [[1, 0], [2, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [64, 96]}>
+// 1536 = 3 x 512: the load's coalesced #c1536 is a mixed-radix layout tt.scan
+// allows, so RLC scans on it in place. The pow2 control #c1024 is not Blocked,
+// so the converts around its scan stay.
+#c1536 = #ttg.linear<{register = [[1], [2], [512]], lane = [[4], [8], [16], [32], [64]], warp = [[128], [256]], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [1536]}>
+#d1536 = #ttg.linear<{register = [[128], [256], [512]], lane = [[1], [2], [4], [8], [16]], warp = [[32], [64]], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [1536]}>
+#c1024 = #ttg.linear<{register = [[1], [2], [512]], lane = [[4], [8], [16], [32], [64]], warp = [[128], [256]], block = []}>
+#d1024 = #ttg.linear<{register = [[128], [256], [512]], lane = [[1], [2], [4], [8], [16]], warp = [[32], [64]], block = []}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @forward_onto_broadcast
   // CHECK: %[[R:.*]] = "tt.reduce"
@@ -41,6 +48,44 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %e = tt.expand_dims %c {axis = 1 : i32} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #p192}>> -> tensor<64x1xf32, #p192>
     %b = tt.broadcast %e : tensor<64x1xf32, #p192> -> tensor<64x192xf32, #p192>
     tt.store %pb, %b : tensor<64x192x!tt.ptr<f32>, #p192>
+    tt.return
+  }
+
+  // CHECK-LABEL: @scan_coalesced_mixed_radix
+  // CHECK: tt.load %{{.*}} : tensor<1536x!tt.ptr<f32>, #[[C:linear[0-9]*]]>
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: }) : (tensor<1536xf32, #[[C]]>) -> tensor<1536xf32, #[[C]]>
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: tt.return
+  tt.func public @scan_coalesced_mixed_radix(%p: !tt.ptr<f32>) {
+    %pc = tt.splat %p : !tt.ptr<f32> -> tensor<1536x!tt.ptr<f32>, #c1536>
+    %a = tt.load %pc : tensor<1536x!tt.ptr<f32>, #c1536>
+    %b = ttg.convert_layout %a : tensor<1536xf32, #c1536> -> tensor<1536xf32, #d1536>
+    %s = "tt.scan"(%b) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%x: f32, %y: f32):
+      %t = arith.addf %x, %y : f32
+      tt.scan.return %t : f32
+    }) : (tensor<1536xf32, #d1536>) -> tensor<1536xf32, #d1536>
+    %c = ttg.convert_layout %s : tensor<1536xf32, #d1536> -> tensor<1536xf32, #c1536>
+    tt.store %pc, %c : tensor<1536x!tt.ptr<f32>, #c1536>
+    tt.return
+  }
+
+  // CHECK-LABEL: @scan_pow2_control
+  // CHECK: ttg.convert_layout %{{.*}} : tensor<1024xf32, #[[C:linear[0-9]*]]> -> tensor<1024xf32, #[[D:linear[0-9]*]]>
+  // CHECK: }) : (tensor<1024xf32, #[[D]]>) -> tensor<1024xf32, #[[D]]>
+  // CHECK: ttg.convert_layout %{{.*}} : tensor<1024xf32, #[[D]]> -> tensor<1024xf32, #[[C]]>
+  tt.func public @scan_pow2_control(%p: !tt.ptr<f32>) {
+    %pc = tt.splat %p : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #c1024>
+    %a = tt.load %pc : tensor<1024x!tt.ptr<f32>, #c1024>
+    %b = ttg.convert_layout %a : tensor<1024xf32, #c1024> -> tensor<1024xf32, #d1024>
+    %s = "tt.scan"(%b) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%x: f32, %y: f32):
+      %t = arith.addf %x, %y : f32
+      tt.scan.return %t : f32
+    }) : (tensor<1024xf32, #d1024>) -> tensor<1024xf32, #d1024>
+    %c = ttg.convert_layout %s : tensor<1024xf32, #d1024> -> tensor<1024xf32, #c1024>
+    tt.store %pc, %c : tensor<1024x!tt.ptr<f32>, #c1024>
     tt.return
   }
 }
