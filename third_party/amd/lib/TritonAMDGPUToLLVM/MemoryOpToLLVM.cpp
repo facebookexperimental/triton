@@ -2238,12 +2238,12 @@ public:
         for (int64_t m = 0; m < repM; ++m) {
           Value operandA = (*maybeA)[m * steps + step];
           Value operandB = (*maybeB)[n * steps + step];
-          Value scaleA = (*maybeAScale)[m * steps + step];
-          Value scaleB = (*maybeBScale)[n * steps + step];
+          Value scaleA = (*maybeAScale)[packedScales ? 0 : m * steps + step];
+          Value scaleB = (*maybeBScale)[packedScales ? 0 : n * steps + step];
           int32_t opSelA =
-              packedScales ? op.getAScaleSelectorAttr().getInt() : 0;
+              packedScales ? op.getAScaleSelectorAttr().getInt() + 2 * step : 0;
           int32_t opSelB =
-              packedScales ? op.getBScaleSelectorAttr().getInt() : 0;
+              packedScales ? op.getBScaleSelectorAttr().getInt() + 2 * step : 0;
           int32_t cbsz = matrixFormatCode(op.getAFormat());
           int32_t blgp = matrixFormatCode(op.getBFormat());
           if (mfma.getIsTransposed()) {
