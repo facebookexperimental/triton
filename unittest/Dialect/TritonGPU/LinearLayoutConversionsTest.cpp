@@ -183,16 +183,16 @@ TEST_F(LinearLayoutConversionsTest, SimpleBlocked) {
                           {S("dim0")}));
 }
 
-TEST_F(LinearLayoutConversionsTest, NpotMemoryLayoutsUsePow2Cover) {
+TEST_F(LinearLayoutConversionsTest, NpotMemoryLayoutsUsePow2AllocShape) {
   ScopedAllowNpot npot;
-  // A shared layout of an NPOT shape is built on its pow2 cover.
+  // A shared layout of an NPOT shape is built on its pow2 alloc shape.
   auto swizzled = shared(4, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
-  LinearLayout cover = toLinearLayout({128, 64}, swizzled);
-  EXPECT_EQ(toLinearLayout({96, 64}, swizzled), cover);
-  // An NPOT subview of a shared_linear allocation keeps that cover.
+  LinearLayout padded = toLinearLayout({128, 64}, swizzled);
+  EXPECT_EQ(toLinearLayout({96, 64}, swizzled), padded);
+  // An NPOT subview of a shared_linear allocation keeps that pow2 alloc shape.
   auto sharedLinear =
-      SharedLinearEncodingAttr::get(&ctx, cover, /*layoutAlignment=*/16);
-  EXPECT_EQ(toLinearLayout({96, 64}, sharedLinear), cover);
+      SharedLinearEncodingAttr::get(&ctx, padded, /*layoutAlignment=*/16);
+  EXPECT_EQ(toLinearLayout({96, 64}, sharedLinear), padded);
 }
 
 // Whether the tile's layout maps exactly offsets [0, R*C) onto the tile.
@@ -824,6 +824,54 @@ TEST_F(LinearLayoutConversionsTest, MMAv2_Small3D) {
                     {S("block"), {{0, 0, 0}, {0, 64, 0}, {0, 0, 0}, {0, 0, 0}}},
                 },
                 {S("dim0"), S("dim1"), S("dim2")}));
+}
+
+// Each NPOT dim repeats its odd part in registers after its binary repeats,
+// in rep order: N's for wgmma's accumulator, M's for an A in registers.
+TEST_F(LinearLayoutConversionsTest, MMAv3_NpotMixedRadix) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim0,
+                        int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = warps;
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2};
+    radices[S("warp")] = std::vector<int32_t>(warps.size(), 2);
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto aRegs = dot(mma(3, 0, {16, 128, 16}, {4, 1}), 0, 2);
+  LinearLayout pow2 = aRegs.toLinearLayout({128, 64});
+  ScopedAllowNpot npot;
+  auto acc = mma(3, 0, {16, 96, 16}, {4, 1});
+  std::vector<std::vector<int32_t>> lanes = {
+      {0, 2}, {0, 4}, {1, 0}, {2, 0}, {4, 0}};
+  EXPECT_EQ(toLinearLayout({128, 96}, acc),
+            mixedRadix({{0, 1}, {8, 0}, {0, 8}, {0, 16}, {0, 32}, {64, 0}},
+                       {2, 2, 2, 2, 3, 2}, lanes, {{16, 0}, {32, 0}}, 128, 96));
+  // A repeats over K first, then over M's odd part.
+  EXPECT_EQ(toLinearLayout({192, 64}, aRegs),
+            mixedRadix({{0, 1}, {8, 0}, {0, 8}, {0, 16}, {0, 32}, {64, 0}},
+                       {2, 2, 2, 2, 2, 3}, lanes, {{16, 0}, {32, 0}}, 192, 64));
+  // N=192's two-part is below instrN 128's tile, which keeps the registers that
+  // fit, so it is instrN 192's layout.
+  EXPECT_EQ(toLinearLayout({64, 192}, mma(3, 0, {16, 128, 16}, {4, 1})),
+            toLinearLayout({64, 192}, mma(3, 0, {16, 192, 16}, {4, 1})));
+  // M's two-part is below the 8-warp tile, and broadcasting warps on M would
+  // repeat rows, so the layout keeps its pow2 alloc shape.
+  EXPECT_EQ(toLinearLayout({192, 128}, mma(3, 0, {16, 128, 16}, {8, 1}))
+                .getOutDimSize(S("dim0")),
+            256);
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(aRegs.toLinearLayout({128, 64}), pow2);
 }
 
 TEST_F(LinearLayoutConversionsTest, MMAv3_64x16) {
@@ -2961,7 +3009,7 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlocked) {
                          {S("dim0")}));
 }
 
-TEST_F(LinearLayoutConversionsTest, SliceOfBlockedUsesNpotCover) {
+TEST_F(LinearLayoutConversionsTest, SliceOfBlockedUsesNpotPow2AllocShape) {
   auto parent = blocked({1, 4}, {4, 8}, {4, 1}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
 #ifndef NDEBUG
   // Without the flag an NPOT extent still aborts.
