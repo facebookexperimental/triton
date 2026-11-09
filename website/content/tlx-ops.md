@@ -42,6 +42,7 @@ flash_attn/sm100.py
 flash_attn/gfx950.py
 flash_attn_mxfp8/sm100.py
 flash_attn_mxfp8/gfx950.py
+flash_attn_mxfp8/gfx1250.py
 flash_attn_varlen/gfx950.py
 hstu_attn/sm100.py
 hstu_cross_attn/gfx950.py
@@ -58,7 +59,7 @@ kernels/
     addmm/                gfx942.py
     bmm/                  gfx942.py
     flash_attn/           sm90.py  sm100.py  gfx950.py  (fwd + bwd)
-    flash_attn_mxfp8/     sm100.py  gfx950.py           (fwd + bwd)
+    flash_attn_mxfp8/     sm100.py  gfx950.py  gfx1250.py  (fwd + bwd; gfx1250 forward only)
     flash_attn_varlen/    gfx950.py                     (forward only)
     hstu_attn/            sm100.py  gfx942.py
                           _util.py  _stubs.py  _reference.py

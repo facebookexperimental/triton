@@ -480,6 +480,8 @@ ARCH_BY_PART = {
     "MI350X": "gfx950",
     "MI355X": "gfx950",
     "MI300X": "gfx942",
+    "MI450X": "gfx1250",
+    "MI455X": "gfx1250",
 }
 
 
@@ -627,7 +629,8 @@ def _amd_name(index: int) -> str:
     blob = info.lower()
     for marker, part in (("0x74a0", "MI300X"), ("0x74a1", "MI300X"), ("mi300", "MI300X"), ("gfx942", "MI300X"),
                          ("0x75a1", "MI355X"), ("0x75a3", "MI355X"), ("mi355", "MI355X"), ("0x75a0", "MI350X"),
-                         ("mi350", "MI350X"), ("gfx950", "MI350X")):
+                         ("mi350", "MI350X"), ("gfx950", "MI350X"), ("0x75c8", "MI450X"), ("mi455", "MI455X"),
+                         ("gfx1250", "MI450X")):
         if marker in blob:
             return part
     return f"AMD GPU {index}"
