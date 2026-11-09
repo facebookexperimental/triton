@@ -1520,7 +1520,8 @@ class CUDABackend(BaseBackend):
         return self._ptxas_compile(src, opt, capability)
 
     def _ptxas_compile(self, src, opt, capability, apply_controls=None):
-        ptxas = get_ptxas(self.target.arch).path
+        ptxas_tool = get_ptxas(self.target.arch)
+        ptxas = ptxas_tool.path
         with (
                 tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fsrc,
                 tempfile.NamedTemporaryFile(delete=False, mode="r", suffix=".log") as flog,
@@ -1555,7 +1556,8 @@ class CUDABackend(BaseBackend):
                 ptx_extra_options += ["--opt-level", "1"]
 
             # Add --regAllocOptLevel=2 to work around ptxas 13.x bug
-            reg_alloc = ["--regAllocOptLevel=2"]
+            major, _ = map(int, ptxas_tool.version.split("."))
+            reg_alloc = ["--regAllocOptLevel=2"] if major >= 13 else []
 
             # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX hash hits
             # the ACF store, append --apply-controls (version check + lookup live in the helper).
