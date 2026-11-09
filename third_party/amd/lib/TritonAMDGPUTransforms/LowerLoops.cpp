@@ -1004,6 +1004,18 @@ static void lowerLoop(scf::ForOp forOp,
                                   load, axisInfoAnalysis, targetFeatures,
                                   targetInfo, useAsyncCopy)
                                   .value_or(nullptr);
+        // local_store can't take a mixed-radix layout, so only an async copy
+        // can fill an NPOT stage; otherwise the load stays in registers.
+        auto loadOp = dyn_cast<tt::LoadOp>(load);
+        if (sharedEncoding && loadOp &&
+            ttg::getNpotLayoutUnsupportedReason(
+                OperationName(ttg::LocalStoreOp::getOperationName(),
+                              load->getContext()),
+                load->getResultTypes()) &&
+            !(useAsyncCopy &&
+              canBeConvertedToAsyncLoad(2, loadOp, sharedEncoding,
+                                        axisInfoAnalysis, targetInfo)))
+          sharedEncoding = nullptr;
         loadToInfo[load] = {sharedEncoding, distance, use};
         LDBG("Populate loadInfo with shared encoding: " << sharedEncoding);
       }
