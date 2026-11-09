@@ -485,6 +485,25 @@ lowerTMemLdStFromTypes(
       computeTMemLdStEncodingInfo(regTy, memTy, maxnreg, diag);
   if (failed(encodingInfoOr))
     return failure();
+  ArrayRef<int32_t> paddedRegs = encodingInfoOr->npotPaddedRegs;
+  if (!paddedRegs.empty()) {
+    SmallVector<Value> paddedVals;
+    for (int32_t r : vals.empty() ? ArrayRef<int32_t>() : paddedRegs)
+      paddedVals.push_back(
+          r < 0 ? LLVM::ZeroOp::create(rewriter, loc, llvmElemTy) : vals[r]);
+    auto result =
+        lowerTMemLdStFromInfo(loc, rewriter, *encodingInfoOr, pred, llvmElemTy,
+                              paddedVals, tmemBase, redOp, useAbs, useNaN);
+    if (vals.empty() && !result.first.empty()) {
+      SmallVector<Value> outVals(
+          llvm::count_if(paddedRegs, [](int32_t r) { return r >= 0; }));
+      for (auto [paddedReg, r] : llvm::enumerate(paddedRegs))
+        if (r >= 0)
+          outVals[r] = result.first[paddedReg];
+      result.first = std::move(outVals);
+    }
+    return result;
+  }
   return lowerTMemLdStFromInfo(loc, rewriter, *encodingInfoOr, pred, llvmElemTy,
                                vals, tmemBase, redOp, useAbs, useNaN);
 }
